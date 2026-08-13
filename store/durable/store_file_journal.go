@@ -405,6 +405,57 @@ func recoveryJournalCapacityBytesFor(
 	return (capacity + sector - 1) / sector * sector
 }
 
+// recoveryJournalInitialDocumentBytes keeps the synchronous journal's initial
+// reservation proportional to its ordinary inline acknowledgement cadence.
+// A larger configured document is an admission bound, not evidence that every
+// store will write one; the sync lane grows its crash-safe preallocation before
+// the first such record reaches the point of no return. Buffered per-mutation
+// group commit retains its construction-time worst-document reservation because
+// its journal Sync may run outside the collection writer while later records
+// are admitted.
+func recoveryJournalInitialDocumentBytes(
+	durability DurabilityMode,
+	inlineValueBytes, maxDocumentBytes int,
+) int {
+	if durability == DurabilitySync {
+		return inlineValueBytes
+	}
+	return maxDocumentBytes
+}
+
+// growSyncJournalForRecordLocked grows only for a single record that cannot
+// fit even in an empty current journal. Ordinary capacity pressure still takes
+// the established checkpoint/recycle path, preserving the bounded replay and
+// fold cadence instead of letting small records expand the journal to its cap.
+// The caller holds writer and has not reached the mutation's point of no return.
+func (c *Collection) growSyncJournalForRecordLocked(recordBytes int) error {
+	if !c.syncJournalLane() || recordBytes <= 0 ||
+		uint64(recordBytes) <= c.journal.Header().Capacity {
+		return nil
+	}
+	header := c.journal.Header()
+	inline := storeio.RecoveryRecordPaddedSize(
+		header.SectorSize,
+		c.options.MaxKeyBytes,
+		c.options.InlineValueBytes,
+	)
+	if inline <= 0 || uint64(recordBytes) > recoveryJournalMaxCapacityBytes {
+		return storeio.ErrRecoveryJournalFull
+	}
+	cursor := c.journal.Cursor()
+	if cursor != 0 {
+		// Preserve the existing checkpoint/recycle cadence. The caller folds the
+		// live prefix first, then retries growth for this one oversized record in
+		// an empty journal instead of retaining prefix+record amplification.
+		return nil
+	}
+	minimum := uint64(recordBytes)
+	if uint64(inline) <= recoveryJournalMaxCapacityBytes-minimum {
+		minimum += uint64(inline)
+	}
+	return c.journal.GrowCapacity(minimum, c.journalPowerSafe)
+}
+
 // recoveryJournalHeaderFor builds the header identity and geometry for a store
 // paired at baseGeneration.
 func recoveryJournalHeaderFor(
@@ -1296,10 +1347,38 @@ func (c *Collection) ensurePrimaryBatchJournalRoom(
 	if c.journal.FitsBatch(entries) {
 		return nil
 	}
+	if c.syncJournalLane() {
+		plan, err := c.journal.PrepareBatch(entries)
+		if err != nil {
+			return err
+		}
+		if err := c.growSyncJournalForRecordLocked(
+			plan.PaddedSize(),
+		); err != nil {
+			return err
+		}
+		if c.journal.PreparedBatchFits(plan) {
+			return nil
+		}
+	}
 	if err := c.checkpointBufferedLocked(); err != nil {
 		return err
 	}
 	c.automaticCheckpoints.Add(1)
+	if c.syncJournalLane() && !c.journal.FitsBatch(entries) {
+		plan, err := c.journal.PrepareBatch(entries)
+		if err != nil {
+			return err
+		}
+		if err := c.growSyncJournalForRecordLocked(
+			plan.PaddedSize(),
+		); err != nil {
+			return err
+		}
+		if !c.journal.PreparedBatchFits(plan) {
+			return storeio.ErrRecoveryJournalFull
+		}
+	}
 	return nil
 }
 

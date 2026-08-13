@@ -245,9 +245,10 @@ type RecoveryJournalHeader struct {
 	BaseGeneration uint64
 	BaseSequence   uint64
 	Capacity       uint64
-	// RecycleCount is strictly monotonic across recycles. Recovery selects the
-	// valid header slot with the highest count, so a torn recycle to one slot
-	// leaves the previous slot as the recovery point.
+	// RecycleCount is strictly monotonic across header publications (recycle or
+	// compatible capacity growth). Recovery selects the valid header slot with
+	// the highest count, so a torn publication leaves the previous slot as the
+	// recovery point.
 	RecycleCount uint64
 }
 
@@ -1167,8 +1168,8 @@ type RecoveryJournal struct {
 	cursor uint64
 	// nextSequence is the sequence the next appended record will carry.
 	nextSequence uint64
-	// headerSlot is the alternating slot the live header occupies. Recycle
-	// writes the opposite slot and flips this after its sync succeeds.
+	// headerSlot is the alternating slot the live header occupies. Recycle and
+	// GrowCapacity write the opposite slot and flip this after sync succeeds.
 	headerSlot uint32
 	scratch    []byte
 	// journalSync and journalDataSync are injected so a fault seam can wrap the
@@ -1181,9 +1182,10 @@ type RecoveryJournal struct {
 
 // CreateRecoveryJournal preallocates a fresh journal file, writes its header,
 // and syncs both. capacity is the record-region byte budget; it is rounded up
-// to a whole sector. The file is preallocated to header+capacity so no later
-// append ever extends it and thus never commits filesystem metadata under an
-// acknowledgement sync.
+// to a whole sector. The file is preallocated to header+capacity so no append
+// extends it or commits filesystem metadata under an acknowledgement sync.
+// GrowCapacity may explicitly reserve and publish a larger geometry before a
+// later append reaches its point of no return.
 func CreateRecoveryJournal(
 	file *os.File, h RecoveryJournalHeader,
 ) (*RecoveryJournal, error) {
@@ -1410,6 +1412,71 @@ func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
 	}
 	end, ok := checkedSizeAdd(rj.cursor, uint64(padded), ^uint64(0))
 	return ok && end <= rj.header.Capacity
+}
+
+// GrowCapacity raises the preallocated record-region capacity to at least
+// minimum. It never shrinks the journal and never changes the live record
+// cursor, sequence, base generation, or record grammar.
+//
+// Growth is published with the same alternating-header discipline as Recycle:
+// the new file tail is reserved first, then the opposite header slot names it,
+// and only a successful sync commits the larger geometry to this manager. A
+// crash or error before the header write leaves the previous header
+// authoritative. If a header or sync error still persists the new candidate,
+// that candidate is also safe because preallocation completed before it could
+// name the extension. Existing readers already accept any
+// sector-aligned capacity through RecoveryJournalMaxCapacityBytes, so this is
+// a compatible geometry change rather than a format revision.
+//
+// powerSafe selects the same sync strength as Recycle. Callers grow before a
+// mutation's point of no return, so allocation or header failures reject that
+// mutation without consuming cursor or sequence state.
+func (rj *RecoveryJournal) GrowCapacity(
+	minimum uint64,
+	powerSafe bool,
+) error {
+	if rj == nil || rj.file == nil {
+		return fmt.Errorf("%w: nil recovery journal", ErrInvalidWrite)
+	}
+	if minimum <= rj.header.Capacity {
+		return nil
+	}
+	sector := uint64(rj.header.SectorSize)
+	if sector == 0 || minimum > RecoveryJournalMaxCapacityBytes {
+		return fmt.Errorf("%w: journal growth capacity", ErrInvalidWrite)
+	}
+	if remainder := minimum % sector; remainder != 0 {
+		var ok bool
+		minimum, ok = checkedSizeAdd(
+			minimum,
+			sector-remainder,
+			RecoveryJournalMaxCapacityBytes,
+		)
+		if !ok {
+			return fmt.Errorf("%w: journal growth capacity", ErrInvalidWrite)
+		}
+	}
+	total := int64(recoveryJournalRegionStart) + int64(minimum)
+	if err := recoveryJournalPreallocate(rj.file, total); err != nil {
+		return err
+	}
+	next := rj.header
+	next.Capacity = minimum
+	next.RecycleCount++
+	slot := rj.headerSlot ^ 1
+	if err := rj.writeHeader(slot, next); err != nil {
+		return err
+	}
+	sync := rj.journalSync
+	if powerSafe {
+		sync = rj.journalDataSync
+	}
+	if err := sync(rj.file); err != nil {
+		return err
+	}
+	rj.header = next
+	rj.headerSlot = slot
+	return nil
 }
 
 // FitsBatch reports whether one batch record carrying entries would fit in the

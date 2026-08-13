@@ -527,15 +527,37 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 func (c *Collection) ensureSyncJournalMutationRoomLocked(
 	valueLen int,
 ) (checkpointed bool, err error) {
-	if !c.syncJournalLane() || c.journal.Fits(
-		c.options.MaxKeyBytes, max(c.options.InlineValueBytes, valueLen),
-	) {
+	if !c.syncJournalLane() {
+		return false, nil
+	}
+	valueBytes := max(c.options.InlineValueBytes, valueLen)
+	if c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
+		return false, nil
+	}
+	recordBytes := storeio.RecoveryRecordPaddedSize(
+		c.journal.Header().SectorSize,
+		c.options.MaxKeyBytes,
+		valueBytes,
+	)
+	if err := c.growSyncJournalForRecordLocked(recordBytes); err != nil {
+		return false, err
+	}
+	if c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
 		return false, nil
 	}
 	if err := c.checkpointBufferedLocked(); err != nil {
 		return false, err
 	}
 	c.automaticCheckpoints.Add(1)
+	if c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
+		return true, nil
+	}
+	if err := c.growSyncJournalForRecordLocked(recordBytes); err != nil {
+		return true, err
+	}
+	if !c.journal.Fits(c.options.MaxKeyBytes, valueBytes) {
+		return true, storeio.ErrRecoveryJournalFull
+	}
 	return true, nil
 }
 
