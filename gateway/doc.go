@@ -13,9 +13,12 @@
 // Distributed queries accept SQL and typed parameters, not caller-authored
 // routing facts. Each immutable snapshot owns a compact sorted table directory
 // and a bounded generation-local prepared-plan cache. The shared SQL routing
-// compiler derives shard constraints, merge ordering, and global limits; query
-// shapes without a proven cross-shard merge or colocation rule fail before any
-// shard is contacted.
+// compiler derives shard constraints, merge ordering, global limits, and
+// algebraic aggregate state. A bounded property-aware memo optimizer costs the
+// physical fan-out against compact statistics pinned to the same generation;
+// it selects gather, ordered merge-gather, or exact aggregate finalization.
+// Query shapes without a proven cross-shard operator or colocation rule fail
+// before any shard is contacted.
 //
 // The client reuses both shardservice's length-prefixed codec and a bounded set
 // of persistent net.Conns: one synchronous request/response round-trip per

@@ -282,6 +282,9 @@ embedded facade:
 - a stateless routing gateway (`gateway`) that pins one immutable catalog
   generation, reloads a strictly newer valid catalog after stale refusals, and
   dispatches bounded, leader-only, explicitly read-only queries to the shards;
+- a bounded Cascades-style optimizer core (`planner`) with memoized rules,
+  required physical properties, distributed exchanges, multidimensional costs,
+  compact generation-pinned statistics, and deterministic planning metrics;
 - the frozen placement scalar and tuple codec (`distribution`) used as
   cross-shard routing identity; and
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
@@ -315,6 +318,7 @@ resharding. It is unreleased and unstable like the rest of VibeDB. The
 Read the design before relying on any of it:
 
 - [Distributed sharding](docs/design/distributed-sharding.md)
+- [Query planner](docs/design/query-planner.md)
 - [Vitess-compatible routing](docs/design/vitess-compatible-routing.md)
 - [Placement tuple format](docs/design/distribution-tuple-format.md)
 

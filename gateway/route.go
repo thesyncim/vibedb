@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"context"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 // The route glue: it turns one pinned snapshot generation plus a bound key into
@@ -35,6 +38,10 @@ type plan struct {
 	calls        []shardCall
 	order        []OrderKey
 	limit        int
+	aggregates   []sqlast.AggKind
+	aggHeaders   []string
+	physical     *queryplanner.Plan
+	planning     queryplanner.OptimizerStatistics
 }
 
 // routerPool hands each routing call its own distribution.Router. The Router
@@ -60,6 +67,10 @@ func (rp *routerPool) put(r *distribution.Router) { rp.pool.Put(r) }
 // into the per-shard request. A missing distribution, a rejected route, or an
 // unresolvable endpoint fails closed with a typed error.
 func (e *Executor) route(snap *Snapshot, q *Query, bound *BoundPlan, p Profile) (*plan, error) {
+	return e.routeContext(context.Background(), snap, q, bound, p)
+}
+
+func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, bound *BoundPlan, p Profile) (*plan, error) {
 	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
 		return nil, &CatalogError{Reason: "distributed plan does not belong to the pinned catalog generation"}
 	}
@@ -102,6 +113,10 @@ func (e *Executor) route(snap *Snapshot, q *Query, bound *BoundPlan, p Profile) 
 		}
 	}
 
+	physical, planning, err := optimizeDistributedPlan(ctx, snap, bound, route, p)
+	if err != nil {
+		return nil, err
+	}
 	return &plan{
 		kind:         route.Kind,
 		distribution: route.Distribution,
@@ -111,6 +126,10 @@ func (e *Executor) route(snap *Snapshot, q *Query, bound *BoundPlan, p Profile) 
 		calls:        calls,
 		order:        bound.order,
 		limit:        bound.limit,
+		aggregates:   bound.aggregates,
+		aggHeaders:   bound.aggHeaders,
+		physical:     physical,
+		planning:     planning,
 	}, nil
 }
 

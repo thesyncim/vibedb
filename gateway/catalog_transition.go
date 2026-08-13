@@ -213,6 +213,7 @@ func snapshotWithCatalogLineage(
 		plannerIndexPaths:         snapshot.plannerIndexPaths,
 		plannerIndexSpans:         snapshot.plannerIndexSpans,
 		plannerIndexStrings:       snapshot.plannerIndexStrings,
+		statistics:                snapshot.statistics,
 		indexLineage:              snapshot.indexLineage,
 		shardLineage:              snapshot.shardLineage,
 		indexIDHighWater:          indexHighWater,

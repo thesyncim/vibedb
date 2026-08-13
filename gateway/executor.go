@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
@@ -138,6 +139,25 @@ type Result struct {
 	ShardsFanned  int
 	Retries       int
 	ScatterReason ScatterReason
+
+	// PlanFingerprint and Planning expose deterministic physical-plan identity
+	// and bounded search/space counters without retaining the memo or AST.
+	PlanFingerprint string
+	Planning        queryplanner.OptimizerStatistics
+}
+
+// Explanation is a no-dispatch distributed physical plan. It includes the
+// selected topology shape, multidimensional cost, and bounded search/space
+// counters. PhysicalPlan contains operator/private IDs, never SQL literals.
+type Explanation struct {
+	PhysicalPlan    string
+	PlanFingerprint string
+	Cost            queryplanner.Cost
+	Planning        queryplanner.OptimizerStatistics
+	RouteKind       distribution.RouteKind
+	Generation      uint64
+	Shards          int
+	ScatterReason   ScatterReason
 }
 
 // Query routes and dispatches q, retrying against a refreshed generation when a
@@ -150,13 +170,9 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	args := make([]any, len(q.Params))
-	for i := range q.Params {
-		if !q.Params[i].Valid() {
-			return nil, fmt.Errorf("%w: parameter %d has invalid kind %d",
-				ErrPlanParameters, i+1, q.Params[i].Kind)
-		}
-		args[i] = q.Params[i].RuntimeValue()
+	args, err := queryRuntimeArgs(q.Params)
+	if err != nil {
+		return nil, err
 	}
 	profile := e.profileFor(q.Class)
 
@@ -174,7 +190,7 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		pl, err := e.route(snap, &q, bound, profile)
+		pl, err := e.routeContext(ctx, snap, &q, bound, profile)
 		if err != nil {
 			return nil, err
 		}
@@ -187,6 +203,8 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 			res.ShardsFanned = len(pl.calls)
 			res.Retries = attempt
 			res.ScatterReason = pl.scatter
+			res.PlanFingerprint = pl.physical.Fingerprint()
+			res.Planning = pl.planning
 			return res, nil
 		}
 		if isStaleErr(err) && attempt < e.maxRetry {
@@ -196,6 +214,59 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		}
 		return nil, err
 	}
+}
+
+// Explain plans q against the currently pinned generation without opening a
+// shard connection. It applies the same parameter binding, route admission,
+// statistics, rules, objective, and memory limits as Query.
+func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	args, err := queryRuntimeArgs(q.Params)
+	if err != nil {
+		return nil, err
+	}
+	snap, err := e.pin(ctx, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := snap.Prepare(ctx, q.SQL)
+	if err != nil {
+		return nil, err
+	}
+	bound, err := prepared.Bind(args)
+	if err != nil {
+		return nil, err
+	}
+	physical, err := e.routeContext(ctx, snap, &q, bound, e.profileFor(q.Class))
+	if err != nil {
+		return nil, err
+	}
+	return &Explanation{
+		PhysicalPlan: physical.physical.String(), PlanFingerprint: physical.physical.Fingerprint(),
+		Cost: physical.physical.Cost, Planning: physical.planning,
+		RouteKind: physical.kind, Generation: physical.generation,
+		Shards: len(physical.calls), ScatterReason: physical.scatter,
+	}, nil
+}
+
+func queryRuntimeArgs(params []shardservice.Param) ([]any, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	args := make([]any, len(params))
+	for i := range params {
+		if !params[i].Valid() {
+			return nil, fmt.Errorf("%w: parameter %d has invalid kind %d",
+				ErrPlanParameters, i+1, params[i].Kind)
+		}
+		args[i] = params[i].RuntimeValue()
+	}
+	return args, nil
 }
 
 // profileFor returns the operational profile for class, falling back to the
@@ -252,6 +323,9 @@ func isStaleErr(err error) bool {
 func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, error) {
 	switch len(pl.calls) {
 	case 0:
+		if len(pl.aggregates) != 0 {
+			return emptyAggregateResult(pl), nil
+		}
 		return &Result{Kind: shardservice.ResponseRows}, nil
 	case 1:
 		return e.single(ctx, pl.calls[0], p)
@@ -354,12 +428,34 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 		return nil, firstErr
 	}
 
-	columns, rows, err := mergeRows(results, pl.order, pl.limit)
+	var columns []shardservice.Column
+	var rows [][]shardservice.Cell
+	var err error
+	if len(pl.aggregates) != 0 {
+		columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
+	} else {
+		columns, rows, err = mergeRows(results, pl.order, pl.limit)
+	}
 	if err != nil {
 		return nil, err
 	}
 	e.metrics.observeResult(totalRows, totalBytes)
 	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: rows}, nil
+}
+
+func emptyAggregateResult(pl *plan) *Result {
+	const oidJSON int32 = 114
+	columns := make([]shardservice.Column, len(pl.aggregates))
+	row := make([]shardservice.Cell, len(pl.aggregates))
+	for i := range pl.aggregates {
+		columns[i] = shardservice.Column{Name: pl.aggHeaders[i], TypeOID: oidJSON}
+		if pl.aggregates[i] == sqlast.AggCount {
+			row[i].Bytes = []byte("0")
+		} else {
+			row[i].Null = true
+		}
+	}
+	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: [][]shardservice.Cell{row}}
 }
 
 // checkAggregate reports ErrResultLimit when the running row or byte total

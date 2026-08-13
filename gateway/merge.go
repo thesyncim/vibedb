@@ -5,11 +5,13 @@ import (
 	"container/heap"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
 
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 // The shard-result merge: a single-shard route streams through unchanged; a
@@ -51,6 +53,10 @@ var ErrMergeColumn = errors.New("gateway: order key column is out of range for t
 // match the other responses. Merging such data would silently shift values
 // into the wrong output columns.
 var ErrMergeSchema = errors.New("gateway: shard result schemas do not match")
+
+// ErrMergeAggregate reports a malformed or non-algebraic shard aggregate
+// state. The gateway fails closed rather than treating partial states as rows.
+var ErrMergeAggregate = errors.New("gateway: shard aggregate states cannot be merged")
 
 // scalar kinds, ordered to match the local executor's cross-type total order.
 const (
@@ -221,24 +227,9 @@ func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit in
 	if len(results) == 0 {
 		return nil, nil, nil
 	}
-	columns := results[0].Columns
-	for _, resp := range results {
-		if resp == nil || resp.Kind != shardservice.ResponseRows {
-			return nil, nil, ErrUnmergeableResult
-		}
-		if len(resp.Columns) != len(columns) {
-			return nil, nil, ErrMergeSchema
-		}
-		for i := range columns {
-			if resp.Columns[i] != columns[i] {
-				return nil, nil, ErrMergeSchema
-			}
-		}
-		for _, row := range resp.Rows {
-			if len(row) != len(columns) {
-				return nil, nil, ErrMergeSchema
-			}
-		}
+	columns, err := validateRowResults(results)
+	if err != nil {
+		return nil, nil, err
 	}
 	if len(order) == 0 {
 		return columns, concatRows(results, limit), nil
@@ -248,6 +239,206 @@ func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit in
 		return nil, nil, err
 	}
 	return columns, rows, nil
+}
+
+func validateRowResults(results []*shardservice.ShardResponse) ([]shardservice.Column, error) {
+	if len(results) == 0 || results[0] == nil {
+		return nil, ErrUnmergeableResult
+	}
+	columns := results[0].Columns
+	for _, resp := range results {
+		if resp == nil || resp.Kind != shardservice.ResponseRows {
+			return nil, ErrUnmergeableResult
+		}
+		if len(resp.Columns) != len(columns) {
+			return nil, ErrMergeSchema
+		}
+		for i := range columns {
+			if resp.Columns[i] != columns[i] {
+				return nil, ErrMergeSchema
+			}
+		}
+		for _, row := range resp.Rows {
+			if len(row) != len(columns) {
+				return nil, ErrMergeSchema
+			}
+		}
+	}
+	return columns, nil
+}
+
+// mergeAggregateRows combines one shard-local row per target. COUNT and SUM
+// use exact arithmetic; MIN/MAX preserve an exact contributing shard spelling.
+func mergeAggregateRows(
+	results []*shardservice.ShardResponse,
+	kinds []sqlast.AggKind,
+	maxBytes uint64,
+) ([]shardservice.Column, [][]shardservice.Cell, error) {
+	columns, err := validateRowResults(results)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(columns) != len(kinds) {
+		return nil, nil, ErrMergeSchema
+	}
+	for _, response := range results {
+		if len(response.Rows) != 1 {
+			return nil, nil, fmt.Errorf("%w: shard returned %d aggregate rows, want one", ErrMergeAggregate, len(response.Rows))
+		}
+	}
+	row := make([]shardservice.Cell, len(kinds))
+	for column, kind := range kinds {
+		cells := make([]shardservice.Cell, len(results))
+		for shard := range results {
+			cells[shard] = results[shard].Rows[0][column]
+		}
+		switch kind {
+		case sqlast.AggCount:
+			row[column], err = mergeCounts(cells, maxBytes)
+		case sqlast.AggSum:
+			row[column], err = mergeSums(cells, maxBytes)
+		case sqlast.AggMin:
+			row[column], err = mergeExtrema(cells, false)
+		case sqlast.AggMax:
+			row[column], err = mergeExtrema(cells, true)
+		default:
+			err = fmt.Errorf("%w: aggregate %s has no combiner", ErrMergeAggregate, kind)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return columns, [][]shardservice.Cell{row}, nil
+}
+
+func mergeCounts(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
+	var total big.Int
+	for _, cell := range cells {
+		if cell.Null {
+			return shardservice.Cell{}, fmt.Errorf("%w: COUNT state is null", ErrMergeAggregate)
+		}
+		var count big.Int
+		if _, ok := count.SetString(string(bytes.TrimSpace(cell.Bytes)), 10); !ok || count.Sign() < 0 {
+			return shardservice.Cell{}, fmt.Errorf("%w: COUNT state %q is not a non-negative integer", ErrMergeAggregate, cell.Bytes)
+		}
+		total.Add(&total, &count)
+	}
+	spelling := total.String()
+	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
+		return shardservice.Cell{}, fmt.Errorf("%w: COUNT state exceeds aggregate byte cap", ErrMergeAggregate)
+	}
+	return shardservice.Cell{Bytes: []byte(spelling)}, nil
+}
+
+func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
+	var total big.Rat
+	hasValue := false
+	for _, cell := range cells {
+		if cell.Null {
+			continue
+		}
+		value, ok := new(big.Rat).SetString(string(bytes.TrimSpace(cell.Bytes)))
+		if !ok {
+			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
+		}
+		total.Add(&total, value)
+		hasValue = true
+	}
+	if !hasValue {
+		return shardservice.Cell{Null: true}, nil
+	}
+	spelling, err := exactDecimalString(&total, maxBytes)
+	if err != nil {
+		return shardservice.Cell{}, err
+	}
+	return shardservice.Cell{Bytes: []byte(spelling)}, nil
+}
+
+func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, error) {
+	var chosen shardservice.Cell
+	hasValue := false
+	for _, cell := range cells {
+		if cell.Null {
+			continue
+		}
+		candidate := classifyCell(cell)
+		if candidate.kind != ckNumber {
+			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
+		}
+		if !hasValue {
+			chosen, hasValue = cell, true
+			continue
+		}
+		comparison := compareCells(candidate, classifyCell(chosen))
+		if (maximum && comparison > 0) || (!maximum && comparison < 0) {
+			chosen = cell
+		}
+	}
+	if !hasValue {
+		return shardservice.Cell{Null: true}, nil
+	}
+	return chosen, nil
+}
+
+func exactDecimalString(value *big.Rat, maxBytes uint64) (string, error) {
+	denominator := new(big.Int).Set(value.Denom())
+	twos, fives := 0, 0
+	for denominator.Bit(0) == 0 {
+		denominator.Rsh(denominator, 1)
+		twos++
+	}
+	five := big.NewInt(5)
+	var remainder big.Int
+	for {
+		remainder.Mod(denominator, five)
+		if remainder.Sign() != 0 {
+			break
+		}
+		denominator.Quo(denominator, five)
+		fives++
+	}
+	if denominator.Cmp(big.NewInt(1)) != 0 {
+		return "", fmt.Errorf("%w: SUM state is not a finite decimal", ErrMergeAggregate)
+	}
+	scale := max(twos, fives)
+	coefficient := new(big.Int).Set(value.Num())
+	if twos < scale {
+		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(scale-twos)), nil))
+	}
+	if fives < scale {
+		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(5), big.NewInt(int64(scale-fives)), nil))
+	}
+	negative := coefficient.Sign() < 0
+	coefficient.Abs(coefficient)
+	digits := coefficient.String()
+	needed := len(digits)
+	if scale >= len(digits) {
+		needed = scale + 2
+	} else if scale != 0 {
+		needed++
+	}
+	if negative {
+		needed++
+	}
+	if maxBytes != 0 && uint64(needed) > maxBytes {
+		return "", fmt.Errorf("%w: SUM state exceeds aggregate byte cap", ErrMergeAggregate)
+	}
+	if scale == 0 {
+		if negative && digits != "0" {
+			return "-" + digits, nil
+		}
+		return digits, nil
+	}
+	if scale >= len(digits) {
+		digits = strings.Repeat("0", scale-len(digits)+1) + digits
+	}
+	point := len(digits) - scale
+	digits = digits[:point] + "." + digits[point:]
+	digits = strings.TrimRight(strings.TrimRight(digits, "0"), ".")
+	if negative && digits != "0" {
+		digits = "-" + digits
+	}
+	return digits, nil
 }
 
 // concatRows appends every shard's rows in target order, trimming at a positive

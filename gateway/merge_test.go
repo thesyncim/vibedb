@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 // cell builds a non-null result cell over already-encoded JSON bytes.
@@ -170,5 +171,63 @@ func TestMergeRejectsBadOrderColumn(t *testing.T) {
 	_, _, err := mergeRows([]*shardservice.ShardResponse{rowsOf("1"), rowsOf("2")}, []OrderKey{{Column: 5}}, 0)
 	if !errors.Is(err, ErrMergeColumn) {
 		t.Fatalf("err = %v, want errors.Is ErrMergeColumn", err)
+	}
+}
+
+func aggregateResponse(values ...shardservice.Cell) *shardservice.ShardResponse {
+	columns := make([]shardservice.Column, len(values))
+	for i := range columns {
+		columns[i] = shardservice.Column{Name: []string{"count", "sum", "min", "max"}[i]}
+	}
+	return &shardservice.ShardResponse{
+		Kind: shardservice.ResponseRows, Columns: columns,
+		Rows: [][]shardservice.Cell{values},
+	}
+}
+
+func TestMergeAggregateRowsExact(t *testing.T) {
+	results := []*shardservice.ShardResponse{
+		aggregateResponse(cell("2"), cell("1.25"), cell("1"), cell("4")),
+		aggregateResponse(cell("3"), cell("2.75"), cell("-2"), cell("9")),
+		aggregateResponse(cell("5"), nullCell(), cell("0"), cell("7")),
+	}
+	columns, rows, err := mergeAggregateRows(results, []sqlast.AggKind{
+		sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 4 || len(rows) != 1 || len(rows[0]) != 4 {
+		t.Fatalf("shape = %d columns, %v rows", len(columns), rows)
+	}
+	want := []string{"10", "4", "-2", "9"}
+	for i := range want {
+		if got := string(rows[0][i].Bytes); got != want[i] || rows[0][i].Null {
+			t.Fatalf("column %d = %q/null=%v, want %q", i, got, rows[0][i].Null, want[i])
+		}
+	}
+}
+
+func TestMergeAggregateNullAndMalformedStates(t *testing.T) {
+	nulls := []*shardservice.ShardResponse{
+		aggregateResponse(cell("1"), nullCell(), nullCell(), nullCell()),
+		aggregateResponse(cell("2"), nullCell(), nullCell(), nullCell()),
+	}
+	_, rows, err := mergeAggregateRows(nulls, []sqlast.AggKind{
+		sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < 4; i++ {
+		if !rows[0][i].Null {
+			t.Fatalf("aggregate %d = %+v, want NULL", i, rows[0][i])
+		}
+	}
+
+	bad := aggregateResponse(cell("1"))
+	bad.Rows = append(bad.Rows, []shardservice.Cell{cell("2")})
+	if _, _, err := mergeAggregateRows([]*shardservice.ShardResponse{bad}, []sqlast.AggKind{sqlast.AggCount}, 1024); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("malformed aggregate error = %v", err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func routeBoundPlan(t *testing.T, plan *BoundPlan) distribution.Route {
@@ -88,10 +89,10 @@ func TestPreparedPlanLiteralParameterParity(t *testing.T) {
 	}
 }
 
-// TestPreparedPlanRejectsIncorrectCrossShardSemantics proves the planner never
-// treats local shard aggregates as a valid global result. A single-shard
-// aggregate remains legal because it needs no distributed combiner.
-func TestPreparedPlanRejectsIncorrectCrossShardSemantics(t *testing.T) {
+// TestPreparedPlanDistributedAggregateBoundary proves algebraic aggregates get
+// an exact final combiner while aggregate expressions without merge state still
+// fail before dispatch.
+func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	snap := testSnapshot(t, 1)
 
 	scatter, err := snap.Prepare(context.Background(), `SELECT COUNT(*) FROM messages`)
@@ -103,8 +104,11 @@ func TestPreparedPlanRejectsIncorrectCrossShardSemantics(t *testing.T) {
 		t.Fatalf("Bind scatter aggregate: %v", err)
 	}
 	scatterRoute := routeBoundPlan(t, scatterBound)
-	if !errors.Is(scatterBound.ValidateRoute(scatterRoute), ErrDistributedPlanUnsupported) {
-		t.Fatalf("scatter aggregate validation = %v, want unsupported", scatterBound.ValidateRoute(scatterRoute))
+	if err := scatterBound.ValidateRoute(scatterRoute); err != nil {
+		t.Fatalf("scatter COUNT validation: %v", err)
+	}
+	if len(scatterBound.aggregates) != 1 || scatterBound.aggregates[0] != sqlast.AggCount {
+		t.Fatalf("aggregate program = %v, want COUNT", scatterBound.aggregates)
 	}
 
 	single, err := snap.Prepare(context.Background(),
@@ -130,6 +134,33 @@ func TestPreparedPlanRejectsIncorrectCrossShardSemantics(t *testing.T) {
 	}
 	if err := scalarBound.ValidateRoute(routeBoundPlan(t, scalarBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
 		t.Fatalf("scalar aggregate validation = %v, want unsupported", err)
+	}
+
+	avg, err := snap.Prepare(context.Background(), `SELECT AVG(n) FROM messages`)
+	if err != nil {
+		t.Fatalf("Prepare AVG: %v", err)
+	}
+	avgBound, err := avg.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind AVG: %v", err)
+	}
+	if err := avgBound.ValidateRoute(routeBoundPlan(t, avgBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("AVG validation = %v, want unsupported until SUM+COUNT projection", err)
+	}
+
+	emptyAVG, err := snap.Prepare(context.Background(),
+		`SELECT AVG(n) FROM messages WHERE tenant_id = 'a' AND tenant_id = 'b'`)
+	if err != nil {
+		t.Fatalf("Prepare empty AVG: %v", err)
+	}
+	emptyAVGBound, err := emptyAVG.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind empty AVG: %v", err)
+	}
+	if route := routeBoundPlan(t, emptyAVGBound); route.Kind != distribution.RouteEmpty {
+		t.Fatalf("empty AVG route = %s", route.Kind)
+	} else if err := emptyAVGBound.ValidateRoute(route); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("empty AVG validation = %v, want refusal rather than erased aggregate row", err)
 	}
 }
 

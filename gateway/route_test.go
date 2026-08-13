@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -13,6 +14,36 @@ import (
 func newRouteExecutor(t *testing.T, snap *Snapshot) *Executor {
 	t.Helper()
 	return NewExecutor(NewClient(nil), NewCatalogHolder(snap), Options{})
+}
+
+func TestExplainDistributedPhysicalPlanWithoutDispatch(t *testing.T) {
+	snapshot := testSnapshot(t, 1)
+	executor := newRouteExecutor(t, snapshot)
+	explanation, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT n FROM messages ORDER BY n`, Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explanation.RouteKind != distribution.RouteScatter || explanation.Shards != 2 ||
+		!strings.HasPrefix(explanation.PhysicalPlan, "merge-gather") ||
+		!strings.Contains(explanation.PhysicalPlan, "remote-query") {
+		t.Fatalf("explanation = %+v\n%s", explanation, explanation.PhysicalPlan)
+	}
+	if explanation.PlanFingerprint == "" || explanation.Planning.Memo.Groups != 1 ||
+		explanation.Planning.PhysicalAlternatives != 1 {
+		t.Fatalf("planning diagnostics = %+v", explanation.Planning)
+	}
+
+	aggregate, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT COUNT(*) FROM messages`, Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(aggregate.PhysicalPlan, "final-aggregate") {
+		t.Fatalf("aggregate physical plan:\n%s", aggregate.PhysicalPlan)
+	}
 }
 
 func routeSQL(t *testing.T, e *Executor, snap *Snapshot, sql string, class OperationClass) (*plan, error) {

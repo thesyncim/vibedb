@@ -580,23 +580,53 @@ func TestE2EPerShardMaxRowsPropagated(t *testing.T) {
 	}
 }
 
-// TestE2EScatterAggregateRejectedBeforeDispatch proves the planner does not
-// mistake per-shard aggregate rows for a globally correct aggregate. Until a
-// distributed aggregate merge is available, the unsafe shape fails closed
-// before opening any shard connection.
-func TestE2EScatterAggregateRejectedBeforeDispatch(t *testing.T) {
+// TestE2EScatterAggregateFinalization proves shard-local aggregate states are
+// finalized once at the gateway instead of being mistaken for result rows.
+func TestE2EScatterAggregateFinalization(t *testing.T) {
 	c := newE2ECluster(t)
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
 
-	_, err := e.Query(context.Background(), Query{
+	result, err := e.Query(context.Background(), Query{
 		SQL:   `SELECT COUNT(*) FROM messages`,
 		Class: ClassBatch,
 	})
-	if !errors.Is(err, ErrDistributedPlanUnsupported) {
-		t.Fatalf("err = %v, want errors.Is ErrDistributedPlanUnsupported", err)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if got := decodeInts(t, result.Rows); !equalInts(got, []int64{8}) {
+		t.Fatalf("global COUNT = %v, want [8]", got)
+	}
+	if got := c.dialer.totalDials(); got != 4 {
+		t.Fatalf("total dials = %d, want one per shard", got)
+	}
+	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 ||
+		result.Planning.PhysicalAlternatives != 2 {
+		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
+	}
+}
+
+func TestE2EEmptyRouteAggregateIdentity(t *testing.T) {
+	c := newE2ECluster(t)
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	result, err := e.Query(context.Background(), Query{
+		SQL: `SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages ` +
+			`WHERE tenant_id = 'a' AND tenant_id = 'b'`,
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 4 ||
+		string(result.Rows[0][0].Bytes) != "0" {
+		t.Fatalf("empty aggregate row = %+v", result.Rows)
+	}
+	for i := 1; i < 4; i++ {
+		if !result.Rows[0][i].Null {
+			t.Fatalf("empty aggregate column %d = %+v, want NULL", i, result.Rows[0][i])
+		}
 	}
 	if got := c.dialer.totalDials(); got != 0 {
-		t.Fatalf("total dials = %d, want 0 (unsafe aggregate dispatches nowhere)", got)
+		t.Fatalf("empty aggregate opened %d shard connections", got)
 	}
 }
 

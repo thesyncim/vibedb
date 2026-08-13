@@ -62,8 +62,11 @@ type PreparedPlan struct {
 	constraints  *sqldriver.ConstraintProgram
 	order        []OrderKey
 	limit        *sqlast.Operand
+	aggregates   []sqlast.AggKind
+	aggHeaders   []string
 	params       int
 	alwaysReason string
+	emptyReason  string
 	multiReason  string
 }
 
@@ -78,10 +81,13 @@ type BoundPlan struct {
 	constraints  distribution.BoundConstraints
 	order        []OrderKey
 	limit        int
+	aggregates   []sqlast.AggKind
+	aggHeaders   []string
 
 	spec         distribution.DistributionSpec
 	manifest     *distribution.Manifest
 	alwaysReason string
+	emptyReason  string
 	multiReason  string
 }
 
@@ -238,9 +244,11 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	}
 
 	plan.order, plan.multiReason = planOrder(selectStmt, plan.multiReason)
+	plan.aggregates, plan.aggHeaders, plan.multiReason = planDistributedAggregates(selectStmt, plan.multiReason)
 	plan.limit = selectStmt.Limit
 	plan.alwaysReason = allRouteSemanticBoundary(selectStmt, plan.alwaysReason)
-	plan.multiReason = multiShardSemanticBoundary(selectStmt, plan.multiReason)
+	plan.multiReason = multiShardSemanticBoundary(selectStmt, plan.multiReason, len(plan.aggregates) != 0)
+	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0, plan.multiReason)
 	if cacheable {
 		return s.cachePreparedPlan(sqlText, hash, plan), nil
 	}
@@ -272,8 +280,9 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 		generation: p.generation, table: p.table,
 		distribution: p.distribution, constraints: constraints,
 		order: p.order, limit: limit,
+		aggregates: p.aggregates, aggHeaders: p.aggHeaders,
 		spec: p.spec, manifest: p.manifest,
-		alwaysReason: p.alwaysReason, multiReason: p.multiReason,
+		alwaysReason: p.alwaysReason, emptyReason: p.emptyReason, multiReason: p.multiReason,
 	}, nil
 }
 
@@ -288,12 +297,47 @@ func (p *BoundPlan) ValidateRoute(route distribution.Route) error {
 		return &PlanError{Table: p.table, Reason: p.alwaysReason, cause: ErrDistributedPlanUnsupported}
 	}
 	if len(route.Targets) == 0 {
+		if p.emptyReason != "" {
+			return &PlanError{Table: p.table, Reason: p.emptyReason, cause: ErrDistributedPlanUnsupported}
+		}
 		return nil
 	}
 	if len(route.Targets) <= 1 || p.multiReason == "" {
 		return nil
 	}
 	return &PlanError{Table: p.table, Reason: p.multiReason, cause: ErrDistributedPlanUnsupported}
+}
+
+// emptyRouteSemanticBoundary separates route pruning from SQL cardinality.
+// Ordinary scans over no shards are empty, but a global aggregate can still
+// produce one row. Only the exact algebraic aggregate shape handled by
+// emptyAggregateResult may use that shortcut; every other aggregate shape
+// fails closed instead of letting an empty physical route erase SQL semantics.
+func emptyRouteSemanticBoundary(
+	stmt *sqlast.SelectStmt,
+	aggregateSupported bool,
+	multiReason string,
+) string {
+	if stmt == nil || !selectHasAggregate(stmt) {
+		return ""
+	}
+	if aggregateSupported && !stmt.Distinct && len(stmt.GroupBy) == 0 && stmt.Having == nil &&
+		len(stmt.Windows) == 0 && stmt.Offset == nil && stmt.Limit == nil {
+		return ""
+	}
+	if multiReason != "" {
+		return multiReason
+	}
+	return "aggregate over an empty route requires coordinator evaluation"
+}
+
+func selectHasAggregate(stmt *sqlast.SelectStmt) bool {
+	for i := range stmt.Columns {
+		if stmt.Columns[i].Agg != sqlast.AggNone || scalarHasAggregate(stmt.Columns[i].Scalar) {
+			return true
+		}
+	}
+	return false
 }
 
 // joinProvesColocation accepts a newly joined physical relation only when each
@@ -369,7 +413,7 @@ func samePlanPath(a, b *sqlast.PathExpr) bool {
 	return true
 }
 
-func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string) string {
+func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string, aggregateSupported bool) string {
 	switch {
 	case stmt.Distinct:
 		return firstPlanReason(reason, "DISTINCT requires a bounded global deduplicator")
@@ -381,6 +425,11 @@ func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string) string {
 		return firstPlanReason(reason, "window functions require global partition planning")
 	case stmt.Offset != nil:
 		return firstPlanReason(reason, "OFFSET requires distributed top-k rewriting")
+	case aggregateSupported && stmt.Limit != nil:
+		return firstPlanReason(reason, "aggregate LIMIT requires coordinator-side rewriting")
+	}
+	if aggregateSupported {
+		return reason
 	}
 	for i := range stmt.Columns {
 		if stmt.Columns[i].Agg != sqlast.AggNone {
@@ -394,6 +443,59 @@ func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string) string {
 		}
 	}
 	return reason
+}
+
+// planDistributedAggregates recognizes the algebraic aggregate subset whose
+// shard-local states can be merged exactly without rewriting the SQL fragment:
+// COUNT by addition, SUM by exact-decimal addition, and MIN/MAX by exact value
+// comparison. AVG needs SUM+COUNT state and remains refused until fragment SQL
+// projection is available.
+func planDistributedAggregates(
+	stmt *sqlast.SelectStmt,
+	reason string,
+) ([]sqlast.AggKind, []string, string) {
+	if stmt == nil || len(stmt.Columns) == 0 {
+		return nil, nil, reason
+	}
+	kinds := make([]sqlast.AggKind, len(stmt.Columns))
+	headers := make([]string, len(stmt.Columns))
+	for i := range stmt.Columns {
+		column := &stmt.Columns[i]
+		if column.Scalar != nil {
+			if scalarHasAggregate(column.Scalar) {
+				return nil, nil, firstPlanReason(reason,
+					"scalar aggregates require an algebraic expression combiner")
+			}
+			return nil, nil, reason
+		}
+		switch column.Agg {
+		case sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax:
+			kinds[i] = column.Agg
+		case sqlast.AggAvg:
+			return nil, nil, firstPlanReason(reason,
+				"AVG requires shard-local SUM and COUNT state")
+		case sqlast.AggNone:
+			return nil, nil, reason
+		default:
+			return nil, nil, firstPlanReason(reason, "aggregate has no distributed combiner")
+		}
+		headers[i] = distributedAggregateHeader(column)
+	}
+	return kinds, headers, reason
+}
+
+func distributedAggregateHeader(column *sqlast.ResultColumn) string {
+	if column.Alias != "" {
+		return column.Alias
+	}
+	if column.Agg == sqlast.AggCount && column.Path == nil {
+		return "count(*)"
+	}
+	spec := ""
+	if column.Path != nil {
+		spec = string(column.Path.AppendSpec(nil))
+	}
+	return strings.ToLower(column.Agg.String()) + "(" + spec + ")"
 }
 
 func scalarHasAggregate(expr *sqlast.ScalarExpr) bool {
