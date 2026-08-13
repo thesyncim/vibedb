@@ -155,6 +155,23 @@ func TestCanonicalStatisticStringMatchesJSONEncoding(t *testing.T) {
 	if _, err := AppendCanonicalStatisticString(nil, string([]byte{0xff})); err == nil {
 		t.Fatal("invalid UTF-8 statistic string was accepted")
 	}
+	for _, test := range []struct {
+		left, right string
+		want        int
+	}{
+		{"&", "<", -1},
+		{"line\n", "line\r", -1},
+		{"café", "caff", 1},
+		{"😀", "😀", 0},
+	} {
+		left, _ := CanonicalStatisticString(test.left)
+		right, _ := CanonicalStatisticString(test.right)
+		got, err := CompareCanonicalScalarJSON(left, right)
+		if err != nil || got != test.want {
+			t.Fatalf("canonical string comparison %q/%q = %d, %v; want %d",
+				left, right, got, err, test.want)
+		}
+	}
 }
 
 func TestCanonicalStatisticNumberValidation(t *testing.T) {
@@ -197,6 +214,10 @@ func FuzzCanonicalScalarJSON(f *testing.F) {
 		if second != canonical {
 			t.Fatalf("canonicalization is not idempotent: %q then %q", canonical, second)
 		}
+		comparison, err := CompareCanonicalScalarJSON(canonical, canonical)
+		if err != nil || comparison != 0 {
+			t.Fatalf("canonical self-comparison %q = %d, %v", canonical, comparison, err)
+		}
 	})
 }
 
@@ -212,6 +233,10 @@ func FuzzCanonicalStatisticNumber(f *testing.F) {
 		second, err := CanonicalStatisticNumber(canonical)
 		if err != nil || second != canonical {
 			t.Fatalf("number canonicalization is not idempotent: %q then %q, %v", canonical, second, err)
+		}
+		comparison, err := CompareCanonicalScalarJSON(canonical, canonical)
+		if err != nil || comparison != 0 {
+			t.Fatalf("canonical number self-comparison %q = %d, %v", canonical, comparison, err)
 		}
 	})
 }
@@ -474,5 +499,64 @@ func BenchmarkStatisticsHeavyHitterLookup1KValues(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		_ = column.EqualitySelectivity(`"tenant-0512"`)
+	}
+}
+
+func BenchmarkStatisticsHistogramLookup1KBuckets(b *testing.B) {
+	buckets := make([]HistogramBucket, 1024)
+	for i := range buckets {
+		buckets[i] = HistogramBucket{
+			Upper: fmt.Sprintf("%d", i), Frequency: float64(i+1) / 1024, Distinct: float64(i + 1),
+		}
+	}
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(1_000_000), RowBytes: ExactEstimate(128),
+		Columns: []ColumnStatistics{{
+			Path: "/timestamp", Distinct: ExactEstimate(1024), Histogram: buckets,
+		}},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	upper, err := CanonicalStatisticNumber("512")
+	if err != nil {
+		b.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	column, _ := table.Column("/timestamp")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = column.LessThanSelectivityEstimate(upper, true)
+	}
+}
+
+func BenchmarkStatisticsStringHistogramLookup1KBuckets(b *testing.B) {
+	buckets := make([]HistogramBucket, 1024)
+	for i := range buckets {
+		buckets[i] = HistogramBucket{
+			Upper:     fmt.Sprintf(`"tenant-%04d"`, i),
+			Frequency: float64(i+1) / 1024, Distinct: float64(i + 1),
+		}
+	}
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(1_000_000), RowBytes: ExactEstimate(128),
+		Columns: []ColumnStatistics{{
+			Path: "/tenant", Distinct: ExactEstimate(1024), Histogram: buckets,
+		}},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	upper, err := CanonicalStatisticString("tenant-0512")
+	if err != nil {
+		b.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	column, _ := table.Column("/tenant")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = column.LessThanSelectivityEstimate(upper, true)
 	}
 }

@@ -169,8 +169,11 @@ hitters avoid the uniformity error for skewed equality predicates; their
 canonical values are sorted, their total mass is stored in the otherwise spare
 bytes of the 64-byte column record, and lookup switches from a tiny linear run
 to binary search above eight values. Sparse
-equi-depth cumulative histograms support later range selectivity without a
-slice header or allocation per column. Estimates carry central value, lower and
+equi-depth cumulative histograms use exact scalar-order binary search for range
+selectivity without a slice header or allocation per column. Canonical number
+comparison orders exponent text and coefficients directly, and canonical string
+comparison decodes escapes incrementally, so neither path allocates or expands
+huge exponents. Estimates carry central value, lower and
 upper bounds, and confidence in the hot compact form; lower bound and confidence
 use float32 slots so both 64-byte directory shapes remain unchanged. Lower
 bounds use an absolute encoding at ordinary magnitudes and a scale-free
@@ -222,6 +225,8 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,872 bytes / 28 allocations including construction | 352 owned memo bytes |
 | add the same scan shape to 1,024 distinct groups | about 0.17 ms | 804 KB / 54 allocations including construction | 2,048 bounded index references |
 | selected-partition + skew estimate for one routed predicate | about 70 ns | 0 | request-local 256-byte scalar scratch |
+| numeric range estimate in a 1,024-bucket histogram | about 0.35 µs | 0 | shared 24-byte buckets |
+| string range estimate in a 1,024-bucket histogram | about 0.53 µs | 0 | shared 24-byte buckets |
 | build and validate that 1,024-table catalog | about 0.71 ms | 3.10 MB / 13,347 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.

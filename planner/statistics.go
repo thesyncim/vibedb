@@ -620,9 +620,11 @@ func canonicalJSONNumber(value string) (string, error) {
 }
 
 type canonicalStatisticNumber struct {
-	negative bool
-	digits   string
-	exponent big.Int
+	negative    bool
+	coefficient string
+	digitCount  int
+	dot         int
+	exponent    string
 }
 
 func parseCanonicalStatisticNumber(value string) (canonicalStatisticNumber, error) {
@@ -631,27 +633,70 @@ func parseCanonicalStatisticNumber(value string) (canonicalStatisticNumber, erro
 		result.negative = true
 		value = value[1:]
 	}
-	exponent := "0"
+	result.exponent = "0"
 	if index := strings.IndexByte(value, 'e'); index >= 0 {
-		exponent = value[index+1:]
+		result.exponent = value[index+1:]
 		value = value[:index]
 	}
-	result.digits = strings.Replace(value, ".", "", 1)
-	if result.digits == "" {
+	if err := validateCanonicalInteger(result.exponent); err != nil {
+		return canonicalStatisticNumber{}, fmt.Errorf("canonical number exponent: %w", err)
+	}
+	result.coefficient = value
+	result.dot = strings.IndexByte(value, '.')
+	result.digitCount = len(value)
+	if result.dot >= 0 {
+		result.digitCount--
+		if result.dot != 1 || len(value) < 3 {
+			return canonicalStatisticNumber{}, errors.New("canonical number has an invalid decimal point")
+		}
+	}
+	if result.digitCount == 0 {
 		return canonicalStatisticNumber{}, errors.New("canonical number has no digits")
 	}
-	for _, digit := range result.digits {
+	for index, digit := range value {
+		if index == result.dot {
+			continue
+		}
 		if digit < '0' || digit > '9' {
 			return canonicalStatisticNumber{}, errors.New("canonical number has a non-digit coefficient")
 		}
 	}
-	if _, ok := result.exponent.SetString(exponent, 10); !ok {
-		return canonicalStatisticNumber{}, errors.New("canonical number has an invalid exponent")
+	if result.digitCount > 1 && (value[0] == '0' || value[len(value)-1] == '0') {
+		return canonicalStatisticNumber{}, errors.New("canonical number has a non-normalized coefficient")
 	}
-	if result.digits == "0" {
+	if result.digitCount == 1 && value[0] == '0' {
 		result.negative = false
 	}
 	return result, nil
+}
+
+func validateCanonicalInteger(value string) error {
+	if value == "" {
+		return errors.New("integer is empty")
+	}
+	start := 0
+	if value[0] == '-' {
+		start = 1
+		if start == len(value) {
+			return errors.New("integer has no digits")
+		}
+	}
+	if len(value)-start > 1 && value[start] == '0' {
+		return errors.New("integer has a leading zero")
+	}
+	for index := start; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return errors.New("integer has a non-digit")
+		}
+	}
+	return nil
+}
+
+func (n canonicalStatisticNumber) digit(index int) byte {
+	if n.dot >= 0 && index >= n.dot {
+		index++
+	}
+	return n.coefficient[index]
 }
 
 // CompareCanonicalScalarJSON compares two outputs of [CanonicalScalarJSON]
@@ -680,16 +725,118 @@ func CompareCanonicalScalarJSON(left, right string) (int, error) {
 	case ckStatisticNumber:
 		return compareCanonicalStatisticNumbers(left, right)
 	case ckStatisticString:
-		var leftString, rightString string
-		if err := json.Unmarshal([]byte(left), &leftString); err != nil {
-			return 0, err
-		}
-		if err := json.Unmarshal([]byte(right), &rightString); err != nil {
-			return 0, err
-		}
-		return strings.Compare(leftString, rightString), nil
+		return compareCanonicalStatisticStrings(left, right)
 	default:
 		return 0, errors.New("unknown canonical statistic scalar kind")
+	}
+}
+
+type canonicalStringCursor struct {
+	value string
+	index int
+}
+
+func compareCanonicalStatisticStrings(left, right string) (int, error) {
+	if len(left) < 2 || left[0] != '"' || left[len(left)-1] != '"' ||
+		len(right) < 2 || right[0] != '"' || right[len(right)-1] != '"' {
+		return 0, errors.New("canonical string is not quoted")
+	}
+	a := canonicalStringCursor{value: left, index: 1}
+	b := canonicalStringCursor{value: right, index: 1}
+	for {
+		leftRune, leftOK, err := a.next()
+		if err != nil {
+			return 0, err
+		}
+		rightRune, rightOK, err := b.next()
+		if err != nil {
+			return 0, err
+		}
+		if !leftOK || !rightOK {
+			if leftOK {
+				return 1, nil
+			}
+			if rightOK {
+				return -1, nil
+			}
+			return 0, nil
+		}
+		if leftRune < rightRune {
+			return -1, nil
+		}
+		if leftRune > rightRune {
+			return 1, nil
+		}
+	}
+}
+
+func (c *canonicalStringCursor) next() (rune, bool, error) {
+	end := len(c.value) - 1
+	if c.index >= end {
+		return 0, false, nil
+	}
+	char := c.value[c.index]
+	if char != '\\' {
+		if char < 0x20 || char == '"' {
+			return 0, false, errors.New("canonical string contains an unescaped character")
+		}
+		runeValue, width := utf8.DecodeRuneInString(c.value[c.index:end])
+		if runeValue == utf8.RuneError && width == 1 {
+			return 0, false, errors.New("canonical string contains invalid UTF-8")
+		}
+		c.index += width
+		return runeValue, true, nil
+	}
+	if c.index+1 >= end {
+		return 0, false, errors.New("canonical string has a truncated escape")
+	}
+	escape := c.value[c.index+1]
+	c.index += 2
+	switch escape {
+	case '"', '\\', '/':
+		return rune(escape), true, nil
+	case 'b':
+		return '\b', true, nil
+	case 'f':
+		return '\f', true, nil
+	case 'n':
+		return '\n', true, nil
+	case 'r':
+		return '\r', true, nil
+	case 't':
+		return '\t', true, nil
+	case 'u':
+		if c.index+4 > end {
+			return 0, false, errors.New("canonical string has a truncated Unicode escape")
+		}
+		var runeValue rune
+		for offset := 0; offset < 4; offset++ {
+			nibble, ok := hexNibble(c.value[c.index+offset])
+			if !ok {
+				return 0, false, errors.New("canonical string has an invalid Unicode escape")
+			}
+			runeValue = runeValue<<4 | rune(nibble)
+		}
+		c.index += 4
+		if runeValue >= 0xd800 && runeValue <= 0xdfff {
+			return 0, false, errors.New("canonical string contains a surrogate escape")
+		}
+		return runeValue, true, nil
+	default:
+		return 0, false, errors.New("canonical string has an invalid escape")
+	}
+}
+
+func hexNibble(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
 	}
 }
 
@@ -730,16 +877,16 @@ func compareCanonicalStatisticNumbers(left, right string) (int, error) {
 		}
 		return 1, nil
 	}
-	comparison := a.exponent.Cmp(&b.exponent)
+	comparison := compareCanonicalInteger(a.exponent, b.exponent)
 	if comparison == 0 {
-		width := max(len(a.digits), len(b.digits))
+		width := max(a.digitCount, b.digitCount)
 		for i := 0; i < width; i++ {
 			leftDigit, rightDigit := byte('0'), byte('0')
-			if i < len(a.digits) {
-				leftDigit = a.digits[i]
+			if i < a.digitCount {
+				leftDigit = a.digit(i)
 			}
-			if i < len(b.digits) {
-				rightDigit = b.digits[i]
+			if i < b.digitCount {
+				rightDigit = b.digit(i)
 			}
 			if leftDigit < rightDigit {
 				comparison = -1
@@ -757,6 +904,33 @@ func compareCanonicalStatisticNumbers(left, right string) (int, error) {
 	return comparison, nil
 }
 
+func compareCanonicalInteger(left, right string) int {
+	leftNegative := left[0] == '-'
+	rightNegative := right[0] == '-'
+	if leftNegative != rightNegative {
+		if leftNegative {
+			return -1
+		}
+		return 1
+	}
+	leftDigits, rightDigits := left, right
+	if leftNegative {
+		leftDigits, rightDigits = left[1:], right[1:]
+	}
+	comparison := 0
+	if len(leftDigits) < len(rightDigits) {
+		comparison = -1
+	} else if len(leftDigits) > len(rightDigits) {
+		comparison = 1
+	} else {
+		comparison = strings.Compare(leftDigits, rightDigits)
+	}
+	if leftNegative {
+		return -comparison
+	}
+	return comparison
+}
+
 // CanonicalNumberFitsDecimalBytes reports whether materializing canonical as
 // a plain finite decimal is conservatively bounded by maxBytes. It rejects a
 // huge positive or negative exponent using only exponent-sized arithmetic.
@@ -768,17 +942,21 @@ func CanonicalNumberFitsDecimalBytes(canonical string, maxBytes uint64) bool {
 	if err != nil {
 		return false
 	}
-	digits := big.NewInt(int64(len(number.digits)))
+	digits := big.NewInt(int64(number.digitCount))
+	var exponent big.Int
+	if _, ok := exponent.SetString(number.exponent, 10); !ok {
+		return false
+	}
 	var needed big.Int
-	if number.exponent.Sign() >= 0 {
+	if exponent.Sign() >= 0 {
 		digitsMinusOne := new(big.Int).Sub(new(big.Int).Set(digits), big.NewInt(1))
-		if number.exponent.Cmp(digitsMinusOne) >= 0 {
-			needed.Add(&number.exponent, big.NewInt(1))
+		if exponent.Cmp(digitsMinusOne) >= 0 {
+			needed.Add(&exponent, big.NewInt(1))
 		} else {
 			needed.Add(digits, big.NewInt(1)) // decimal point inside the coefficient
 		}
 	} else {
-		needed.Neg(&number.exponent)
+		needed.Neg(&exponent)
 		needed.Add(&needed, digits)
 		needed.Add(&needed, big.NewInt(1)) // leading "0."
 	}
@@ -1123,24 +1301,38 @@ func (s ColumnStatistic) LessThanSelectivityEstimate(canonicalUpper string, incl
 	if entry.histCount == 0 {
 		return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
 	}
-	previous := 0.0
-	for i := uint32(0); i < entry.histCount; i++ {
-		bucket := s.catalog.histogram[entry.histBase+i]
+	lo, hi := uint32(0), entry.histCount
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		bucket := s.catalog.histogram[entry.histBase+mid]
 		comparison, err := CompareCanonicalScalarJSON(s.catalog.string(bucket.upper), canonicalUpper)
 		if err != nil {
 			return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
 		}
-		if comparison >= 0 {
-			value := (previous + bucket.frequency) / 2
-			if comparison == 0 && inclusive {
-				value = bucket.frequency
-			}
-			return Estimate{
-				Value: value, Lower: previous, Upper: bucket.frequency,
-				Confidence: float64(entry.distinct.confidence),
-			}.Normalize(value)
+		if comparison < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
-		previous = bucket.frequency
+	}
+	previous := 0.0
+	if lo != 0 {
+		previous = s.catalog.histogram[entry.histBase+lo-1].frequency
+	}
+	if lo < entry.histCount {
+		bucket := s.catalog.histogram[entry.histBase+lo]
+		comparison, err := CompareCanonicalScalarJSON(s.catalog.string(bucket.upper), canonicalUpper)
+		if err != nil {
+			return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
+		}
+		value := (previous + bucket.frequency) / 2
+		if comparison == 0 && inclusive {
+			value = bucket.frequency
+		}
+		return Estimate{
+			Value: value, Lower: previous, Upper: bucket.frequency,
+			Confidence: float64(entry.distinct.confidence),
+		}.Normalize(value)
 	}
 	nonNull := max(previous, 1-float64(entry.nullFraction))
 	return Estimate{
