@@ -23,6 +23,10 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
+	if handled, journalCreated, journalErr :=
+		c.tryPrimaryJournalAdmissionPut(key, src); handled {
+		return journalCreated, journalErr
+	}
 	handled, concurrentCreated, concurrentErr :=
 		c.tryConcurrentPrimaryPut(key, src)
 	if handled {
@@ -69,6 +73,10 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	if c == nil {
 		return false, ErrClosed
+	}
+	if handled, journalDeleted, journalErr :=
+		c.tryPrimaryJournalAdmissionDelete(key); handled {
+		return journalDeleted, journalErr
 	}
 	handled, concurrentDeleted, concurrentErr :=
 		c.tryConcurrentPrimaryDelete(key)
@@ -796,6 +804,10 @@ func (c *Collection) Stats() Stats {
 	retired := c.reclaimer.Stats()
 	overlay := c.primaryUnifiedOverlay.stats()
 	concurrentPrimaryScratch := c.primaryConcurrentContexts.capacityBytes()
+	concurrentPrimaryScratch += c.primaryJournalContexts.capacityBytes()
+	if c.primaryJournalAdmission != nil {
+		concurrentPrimaryScratch += uint64(unsafe.Sizeof(*c.primaryJournalAdmission))
+	}
 	if c.primaryConcurrentStripes != nil {
 		concurrentPrimaryScratch += uint64(unsafe.Sizeof(*c.primaryConcurrentStripes))
 		concurrentPrimaryScratch += uint64(unsafe.Sizeof(c.primaryOverlayPublish))

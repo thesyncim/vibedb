@@ -275,6 +275,7 @@ func newCollectionResources(
 		return nil, err
 	}
 	concurrentContexts := newPrimaryConcurrentContextPool(options)
+	journalContexts := newPrimaryJournalAdmissionContextPool(options)
 	var concurrentStripes *[primaryConcurrentStripeCount]primaryConcurrentStripe
 	if concurrentContexts != nil {
 		concurrentStripes = new(
@@ -352,6 +353,10 @@ func newCollectionResources(
 		),
 		primaryConcurrentContexts: concurrentContexts,
 		primaryConcurrentStripes:  concurrentStripes,
+		primaryJournalContexts:    journalContexts,
+	}
+	if journalContexts != nil {
+		collection.primaryJournalAdmission = newPrimaryJournalAdmission()
 	}
 	if options.MaterializationDamageGranule != 0 {
 		imageArenaBytes := options.MaxPageSize + options.PageSize

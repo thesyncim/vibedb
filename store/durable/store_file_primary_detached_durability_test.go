@@ -164,25 +164,63 @@ func TestPrimaryDetachedPublishedDurabilityParityAndCloseWait(t *testing.T) {
 	detachedKey := []byte(detachedKeys[31])
 	detachedCreated, continuation, applyErr :=
 		detached.putPrimaryWithSplitDetached(detachedKey, raw)
+	detachedOwned := continuation.pending()
+	t.Cleanup(func() {
+		if detachedOwned {
+			_ = detached.awaitPrimaryMutationDurability(continuation, applyErr)
+		}
+	})
 	if continuation.kind != primaryMutationDurabilityPublished ||
 		continuation.target == 0 {
 		t.Fatalf("detached physical continuation = %+v", continuation)
 	}
-	if published := detached.committer.PublishedGeneration(); published < continuation.target {
+	published := detached.committer.PublishedGeneration()
+	if published < continuation.target {
 		t.Fatalf("published generation %d < target %d", published, continuation.target)
+	}
+	if durable := detached.committer.DurableGeneration(); durable > published {
+		t.Fatalf("durable generation %d > published %d", durable, published)
+	}
+	detachedErr := detached.awaitPrimaryMutationDurability(
+		continuation, applyErr,
+	)
+	detachedOwned = false
+	if durable := detached.committer.DurableGeneration(); durable < continuation.target {
+		t.Fatalf("durable generation %d < target %d", durable, continuation.target)
 	}
 	if got, found, err := detached.AppendRaw(nil, detachedKey); err != nil ||
 		!found || string(got) != `{"n":11,"published":true}` {
-		t.Fatalf("visible detached value = (%s,%v,%v)", got, found, err)
+		t.Fatalf("durable detached value = (%s,%v,%v)", got, found, err)
+	}
+	if immediateCreated != detachedCreated ||
+		!samePrimaryDetachedError(immediateErr, detachedErr) {
+		t.Fatalf(
+			"physical Put immediate=(%v,%v) detached=(%v,%v)",
+			immediateCreated, immediateErr, detachedCreated, detachedErr,
+		)
 	}
 
+	closeCollection, closeKeys := openChainFence("detached-published-close.vibe")
+	_, closeContinuation, closeApplyErr :=
+		closeCollection.putPrimaryWithSplitDetached([]byte(closeKeys[32]), raw)
+	closeOwned := closeContinuation.pending()
+	t.Cleanup(func() {
+		if closeOwned {
+			_ = closeCollection.awaitPrimaryMutationDurability(
+				closeContinuation, closeApplyErr,
+			)
+		}
+	})
+	if closeContinuation.kind != primaryMutationDurabilityPublished {
+		t.Fatalf("detached Close continuation = %+v", closeContinuation)
+	}
 	closeDone := make(chan error, 1)
-	go func() { closeDone <- detached.Close() }()
+	go func() { closeDone <- closeCollection.Close() }()
 	deadline := time.Now().Add(concurrentPrimaryTestTimeout)
 	for {
-		detached.writer.Lock()
-		closed := detached.closed
-		detached.writer.Unlock()
+		closeCollection.writer.Lock()
+		closed := closeCollection.closed
+		closeCollection.writer.Unlock()
 		if closed {
 			break
 		}
@@ -196,11 +234,12 @@ func TestPrimaryDetachedPublishedDurabilityParityAndCloseWait(t *testing.T) {
 		t.Fatalf("Close passed physical durability continuation: %v", err)
 	default:
 	}
-	detachedErr := detached.awaitPrimaryMutationDurability(
-		continuation, applyErr,
+	closeErr := closeCollection.awaitPrimaryMutationDurability(
+		closeContinuation, closeApplyErr,
 	)
-	if durable := detached.committer.DurableGeneration(); durable < continuation.target {
-		t.Fatalf("durable generation %d < target %d", durable, continuation.target)
+	closeOwned = false
+	if closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	select {
 	case err := <-closeDone:
@@ -209,13 +248,6 @@ func TestPrimaryDetachedPublishedDurabilityParityAndCloseWait(t *testing.T) {
 		}
 	case <-time.After(concurrentPrimaryTestTimeout):
 		t.Fatal("Close remained blocked after physical continuation Done")
-	}
-	if immediateCreated != detachedCreated ||
-		!samePrimaryDetachedError(immediateErr, detachedErr) {
-		t.Fatalf(
-			"physical Put immediate=(%v,%v) detached=(%v,%v)",
-			immediateCreated, immediateErr, detachedCreated, detachedErr,
-		)
 	}
 }
 

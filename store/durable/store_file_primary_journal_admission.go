@@ -30,16 +30,37 @@ const (
 	primaryJournalAdmissionCohortRole
 )
 
-// primaryJournalAdmissionRequest is deliberately only an identity in phase 1.
-// The integration phase will embed the borrowed key, prepared canonical value,
-// provisional validation result, and caller-owned result signal. The state
-// engine retains only pointers, so request lifetime remains owned by the
-// blocked caller.
+type primaryJournalAdmissionSignal struct {
+	done   bool
+	role   primaryJournalAdmissionRole
+	ticket primaryJournalAdmissionTicket
+}
+
+type primaryJournalAdmissionResult struct {
+	created      bool
+	deleted      bool
+	err          error
+	continuation primaryMutationDurabilityContinuation
+}
+
+// primaryJournalAdmissionRequest is one context-bound follower. key and raw
+// remain borrowed from the blocked public caller. canonical remains owned by
+// context until Apply consumes it; the caller releases that context before
+// awaiting the returned durability continuation. The engine retains only
+// pointers and never interprets payload fields.
 type primaryJournalAdmissionRequest struct {
-	// ordinal is assigned by the future caller-side request preparation. The
-	// state engine does not interpret it; retaining a non-zero-sized request also
-	// gives every caller an unambiguous pointer identity.
-	ordinal uint64
+	ordinal      uint64
+	kind         primaryMutationKind
+	key          []byte
+	raw          []byte
+	rawLength    int
+	canonical    []byte
+	preflightErr error
+	prepared     bool
+	context      *primaryConcurrentContext
+	result       primaryJournalAdmissionResult
+	signal       primaryJournalAdmissionSignal
+	signaled     bool
 }
 
 // primaryJournalAdmissionObservation is a possibly stale lock-free phase
@@ -125,8 +146,10 @@ func (d *primaryJournalAdmissionDrain) detached() []*primaryJournalAdmissionRequ
 // arrive while it works accumulate in queue; a cohort leader owns the immutable
 // detached batch while later arrivals continue to use queue.
 //
-// No method waits, starts a goroutine, yields, sleeps, signals a channel, or
-// allocates. Callers carry every returned baton.
+// Admission transitions never start a goroutine, yield, sleep, signal a
+// channel, or allocate. Prepared followers may wait on the embedded condition;
+// callers carry every applying baton and one transition wakes its complete
+// fixed signal batch once.
 type primaryJournalAdmission struct {
 	mu sync.Mutex
 
@@ -145,6 +168,127 @@ type primaryJournalAdmission struct {
 	preparedPilot bool
 	activeLeader  *primaryJournalAdmissionRequest
 	activeRole    primaryJournalAdmissionRole
+	wake          sync.Cond
+
+	// Requests are indexed by the equally bounded context pool. A slot cannot
+	// be rebound until its caller consumes the final signal and returns context.
+	requests [primaryJournalAdmissionLimit]primaryJournalAdmissionRequest
+}
+
+func newPrimaryJournalAdmission() *primaryJournalAdmission {
+	a := new(primaryJournalAdmission)
+	a.wake.L = &a.mu
+	for index := range a.requests {
+		a.requests[index].ordinal = uint64(index + 1)
+	}
+	return a
+}
+
+func (a *primaryJournalAdmission) bindRequest(
+	context *primaryConcurrentContext,
+) *primaryJournalAdmissionRequest {
+	if a == nil || context == nil {
+		return nil
+	}
+	slot := int(context.poolSlot)
+	if slot < 0 || slot >= len(a.requests) {
+		panic("vibedb: invalid recovery-journal admission context")
+	}
+	request := &a.requests[slot]
+	if request.signaled {
+		panic("vibedb: stale recovery-journal admission signal")
+	}
+	ordinal := request.ordinal
+	*request = primaryJournalAdmissionRequest{
+		ordinal: ordinal, context: context,
+	}
+	return request
+}
+
+func (a *primaryJournalAdmission) waitSignal(
+	request *primaryJournalAdmissionRequest,
+) primaryJournalAdmissionSignal {
+	if a == nil || request == nil {
+		return primaryJournalAdmissionSignal{done: true}
+	}
+	a.mu.Lock()
+	for !request.signaled {
+		a.wake.Wait()
+	}
+	signal := request.signal
+	request.signal = primaryJournalAdmissionSignal{}
+	request.signaled = false
+	a.mu.Unlock()
+	return signal
+}
+
+// publishTransition publishes one complete state transition with one mutex
+// acquisition and one Broadcast. self already carries its result/baton and is
+// omitted. No callback, writer work, context release, or durability wait runs
+// under admission.mu.
+func (a *primaryJournalAdmission) publishTransition(
+	completed []*primaryJournalAdmissionRequest,
+	self, leader *primaryJournalAdmissionRequest,
+	leaderSignal primaryJournalAdmissionSignal,
+) {
+	if a == nil || len(completed) == 0 && leader == nil {
+		return
+	}
+	a.mu.Lock()
+	published := false
+	for _, request := range completed {
+		if request == self {
+			continue
+		}
+		if request == nil || request == leader || request.signaled {
+			a.mu.Unlock()
+			panic("vibedb: duplicate recovery-journal admission signal")
+		}
+		request.signal = primaryJournalAdmissionSignal{done: true}
+		request.signaled = true
+		published = true
+	}
+	if leader != nil && leader != self {
+		if leader.signaled {
+			a.mu.Unlock()
+			panic("vibedb: duplicate recovery-journal admission leader signal")
+		}
+		leader.signal = leaderSignal
+		leader.signaled = true
+		published = true
+	}
+	if published {
+		a.wake.Broadcast()
+	}
+	a.mu.Unlock()
+}
+
+func (r *primaryJournalAdmissionRequest) preparedInput() primaryPreparedPutInput {
+	if r == nil {
+		return primaryPreparedPutInput{}
+	}
+	return primaryPreparedPutInput{
+		raw: r.raw, rawLength: r.rawLength, canonical: r.canonical,
+		preflightErr: r.preflightErr, prepared: r.prepared,
+	}
+}
+
+func (r *primaryJournalAdmissionRequest) resetPayload() {
+	if r == nil {
+		return
+	}
+	r.kind = 0
+	r.key = nil
+	r.raw = nil
+	r.rawLength = 0
+	r.canonical = nil
+	r.preflightErr = nil
+	r.prepared = false
+	r.context = nil
+	r.result = primaryJournalAdmissionResult{}
+	if r.signaled || r.signal != (primaryJournalAdmissionSignal{}) {
+		panic("vibedb: reset signaled recovery-journal admission request")
+	}
 }
 
 func packPrimaryJournalAdmissionWord(

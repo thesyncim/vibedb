@@ -208,6 +208,10 @@ func (c *Collection) Close() error {
 		return result
 	}
 	c.closed = true
+	var journalAdmissionDrain primaryJournalAdmissionDrain
+	if c.primaryJournalAdmission != nil {
+		journalAdmissionDrain = c.primaryJournalAdmission.closeAndDrain()
+	}
 	// Close reader admission before releasing writer so every later fast-path
 	// read is diverted to an already-closed lease registry. Existing readers
 	// drain normally and keep final teardown retryable.
@@ -216,7 +220,11 @@ func (c *Collection) Close() error {
 	if c.primaryConcurrentContexts != nil {
 		c.primaryConcurrentContexts.close()
 	}
+	if c.primaryJournalContexts != nil {
+		c.primaryJournalContexts.close()
+	}
 	c.writer.Unlock()
+	c.closePrimaryJournalAdmissionPassive(journalAdmissionDrain)
 	if c.mutationCombiner != nil {
 		for _, request := range c.mutationCombiner.stop() {
 			request.err = ErrClosed
@@ -226,6 +234,9 @@ func (c *Collection) Close() error {
 	c.mutationWait.Wait()
 	if c.primaryConcurrentContexts != nil {
 		c.primaryConcurrentContexts.waitDrained()
+	}
+	if c.primaryJournalContexts != nil {
+		c.primaryJournalContexts.waitDrained()
 	}
 	// DurabilitySync publishers release the construction lock before their
 	// durability wait so independent writers can share one device commit.
