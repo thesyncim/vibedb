@@ -1181,18 +1181,71 @@ func (v *CompactPrimaryStripeView) rowShape(row int) int {
 	if v == nil || row < 0 || row >= v.rows {
 		return -1
 	}
+	// A shape-identical stripe has the canonical zero-bit shape code. It is the
+	// overwhelmingly common layout for table- and log-like collections, and it
+	// does not need to enter the general bit reservoir just to recover zero.
+	if v.shapeCount == 1 && len(v.overflow) == 0 {
+		return 0
+	}
 	return int(compactReadBits(v.shapeCodes, row*v.shapeWidth, v.shapeWidth))
 }
 
 func (v *CompactPrimaryStripeView) shapeOrdinal(row, shape int) int {
+	// With one shape and no overflow, every preceding row contributes exactly
+	// one to that shape's ordinal. Avoid rescanning the row's restart block;
+	// unlike a stored rank cache this costs no resident or durable bytes.
+	if v.shapeCount == 1 && len(v.overflow) == 0 {
+		return row
+	}
 	block := row / compactStreamRestart
 	ordinal := int(binary.LittleEndian.Uint16(v.rankTable[(block*v.shapeCount+shape)*2:]))
+	if v.shapeWidth == 2 {
+		return ordinal + compactCountTwoBitShapePrefix(
+			v.shapeCodes, block*compactStreamRestart, row%compactStreamRestart, shape,
+		)
+	}
 	for at := block * compactStreamRestart; at < row; at++ {
 		if v.rowShape(at) == shape {
 			ordinal++
 		}
 	}
 	return ordinal
+}
+
+// compactCountTwoBitShapePrefix counts one shape in a prefix that starts at a
+// 64-row restart boundary. Two-bit codes are the common two-to-four-shape
+// layout; comparing all four codes in each byte avoids up to 63 independent
+// compactReadBits calls on every random point read.
+func compactCountTwoBitShapePrefix(
+	codes []byte,
+	startRow, count, shape int,
+) int {
+	if count <= 0 {
+		return 0
+	}
+	packed := codes[startRow/4:]
+	target := byte(shape) * 0x55
+	matched := 0
+	whole := count / 4
+	if whole >= 8 {
+		const lanes = uint64(0x5555555555555555)
+		different := binary.LittleEndian.Uint64(packed) ^ uint64(shape)*lanes
+		matched += bits.OnesCount64(^(different | different>>1) & lanes)
+		packed = packed[8:]
+		whole -= 8
+	}
+	for _, value := range packed[:whole] {
+		different := value ^ target
+		matched += bits.OnesCount8(^(different | different>>1) & 0x55)
+	}
+	if trailing := count & 3; trailing != 0 {
+		mask := byte(1<<uint(trailing*2)) - 1
+		different := (packed[whole] ^ target) & mask
+		matched += bits.OnesCount8(
+			^(different | different>>1) & 0x55 & mask,
+		)
+	}
+	return matched
 }
 
 func (v *CompactPrimaryStripeView) Len() int {
@@ -1341,6 +1394,9 @@ func (v *CompactPrimaryStripeView) AppendKey(dst []byte, row int) ([]byte, bool)
 func (v *CompactPrimaryStripeView) AppendValue(dst []byte, row int) ([]byte, bool) {
 	if v == nil || row < 0 || row >= v.rows || v.IsOverflow(row) {
 		return dst, false
+	}
+	if v.shapeCount == 1 && len(v.overflow) == 0 {
+		return v.appendValueOrdinal(dst, row, 0, row)
 	}
 	shape := v.rowShape(row)
 	return v.appendValueOrdinal(dst, row, shape, v.shapeOrdinal(row, shape))
