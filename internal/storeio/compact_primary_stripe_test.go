@@ -2,6 +2,8 @@ package storeio
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/benchcorpus"
@@ -684,6 +686,42 @@ func TestCompactPrimaryStripeWarmPointAllocations(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("point allocations=%v want 0", allocs)
+	}
+}
+
+func TestCompactPrimaryShapeOrdinalPackedTwoBit(t *testing.T) {
+	const rows = 257
+	for _, shapes := range []int{3, 4} {
+		t.Run(fmt.Sprintf("shapes-%d", shapes), func(t *testing.T) {
+			view := CompactPrimaryStripeView{
+				rows: rows, shapeCount: shapes, shapeWidth: 2,
+				shapeCodes: make([]byte, (rows*2+7)/8),
+				rankTable: make([]byte,
+					((rows+compactStreamRestart-1)/compactStreamRestart)*shapes*2),
+			}
+			ranks := make([]uint16, shapes)
+			for row := range rows {
+				if row%compactStreamRestart == 0 {
+					checkpoint := row / compactStreamRestart
+					for shape := range ranks {
+						binary.LittleEndian.PutUint16(
+							view.rankTable[(checkpoint*shapes+shape)*2:], ranks[shape],
+						)
+					}
+				}
+				shape := (row*7 + row/5) % shapes
+				compactPutBits(view.shapeCodes, row*2, 2, uint64(shape))
+				ranks[shape]++
+			}
+			clear(ranks)
+			for row := range rows {
+				shape := view.rowShape(row)
+				if got, want := view.shapeOrdinal(row, shape), int(ranks[shape]); got != want {
+					t.Fatalf("row %d shape %d ordinal = %d, want %d", row, shape, got, want)
+				}
+				ranks[shape]++
+			}
+		})
 	}
 }
 
