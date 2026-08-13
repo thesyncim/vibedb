@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"testing"
 	"unsafe"
 )
@@ -109,6 +110,22 @@ func TestCanonicalStatisticScalars(t *testing.T) {
 	if err != nil || comparison <= 0 {
 		t.Fatalf("huge canonical number comparison = %d, %v", comparison, err)
 	}
+	for _, test := range []struct {
+		left, right string
+		want        int
+	}{
+		{"0", "1e-1000000000", -1},
+		{"0", "-1e-1000000000", 1},
+		{"1e-1000000000", "0", 1},
+		{"-1e-1000000000", "0", -1},
+		{"0", "0", 0},
+	} {
+		got, err := CompareCanonicalScalarJSON(test.left, test.right)
+		if err != nil || got != test.want {
+			t.Fatalf("CompareCanonicalScalarJSON(%q, %q) = %d, %v; want %d",
+				test.left, test.right, got, err, test.want)
+		}
+	}
 	if CanonicalNumberFitsDecimalBytes("1e1000000000", 1024) {
 		t.Fatal("huge canonical number passed decimal materialization admission")
 	}
@@ -192,6 +209,39 @@ func TestCanonicalStatisticNumberValidation(t *testing.T) {
 	}
 	if canonical, err := CanonicalScalarJSON(" \n\t5.0\r "); err != nil || canonical != "5" {
 		t.Fatalf("JSON whitespace canonicalization = %q, %v", canonical, err)
+	}
+}
+
+func TestCanonicalNumberComparisonMatchesExactRationals(t *testing.T) {
+	spellings := []string{
+		"-1000", "-10.5", "-1", "-0.001", "-1e-100", "0",
+		"1e-100", "0.001", "1", "1.0001", "10.5", "1000", "1e100",
+	}
+	canonical := make([]string, len(spellings))
+	rationals := make([]*big.Rat, len(spellings))
+	for i, spelling := range spellings {
+		var err error
+		canonical[i], err = CanonicalStatisticNumber(spelling)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rationals[i] = new(big.Rat)
+		if _, ok := rationals[i].SetString(spelling); !ok {
+			t.Fatalf("big.Rat rejected test spelling %q", spelling)
+		}
+	}
+	for left := range canonical {
+		for right := range canonical {
+			got, err := CompareCanonicalScalarJSON(canonical[left], canonical[right])
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := rationals[left].Cmp(rationals[right])
+			if got != want {
+				t.Fatalf("compare %q (%s) with %q (%s) = %d, want %d",
+					spellings[left], canonical[left], spellings[right], canonical[right], got, want)
+			}
+		}
 	}
 }
 

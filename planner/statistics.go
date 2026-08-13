@@ -871,6 +871,23 @@ func compareCanonicalStatisticNumbers(left, right string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	aZero := a.digitCount == 1 && a.coefficient[0] == '0'
+	bZero := b.digitCount == 1 && b.coefficient[0] == '0'
+	if aZero || bZero {
+		if aZero && bZero {
+			return 0, nil
+		}
+		if aZero {
+			if b.negative {
+				return 1, nil
+			}
+			return -1, nil
+		}
+		if a.negative {
+			return -1, nil
+		}
+		return 1, nil
+	}
 	if a.negative != b.negative {
 		if a.negative {
 			return -1, nil
