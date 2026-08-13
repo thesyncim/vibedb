@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -20,6 +21,8 @@ import (
 // equivalent. The ownership refusals reuse the distribution sentinels
 // (ErrNotShardOwner, ErrOwnershipEpoch, ErrRoutingVersion) instead.
 var (
+	// ErrClientClosed reports an operation attempted after [Client.Close].
+	ErrClientClosed = errors.New("gateway: shard client is closed")
 	// ErrShardDeadlineExceeded reports a shard whose execution budget elapsed.
 	ErrShardDeadlineExceeded = errors.New("gateway: shard deadline exceeded")
 	// ErrResultLimit reports a result that exceeded the request's row or byte cap.
@@ -106,21 +109,97 @@ func shardError(resp *shardservice.ShardResponse) *ShardError {
 // honor the context's deadline and cancellation while dialing.
 type DialFunc func(ctx context.Context, address string) (net.Conn, error)
 
-// Client is a thin, stateless shard client: one synchronous request/response
-// round-trip per call over a connection it dials fresh and closes. It holds no
-// per-connection state and is safe for concurrent use.
-type Client struct {
-	dial DialFunc
+// Defaults for the client's bounded idle connection pool. The limits retain
+// enough warm sessions for the built-in fan-out profiles without allowing
+// catalog churn or a large endpoint set to retain an unbounded number of file
+// descriptors and shard-side Sessions.
+const (
+	DefaultMaxIdleConnections            = 64
+	DefaultMaxIdleConnectionsPerEndpoint = 8
+	DefaultIdleConnectionTimeout         = 90 * time.Second
+)
+
+// ClientOptions configure a [Client]. The zero value enables bounded connection
+// reuse with conservative defaults. DisableConnectionReuse restores one dial
+// and close per request, primarily for diagnostics and benchmarks.
+type ClientOptions struct {
+	// MaxIdleConnections caps retained connections across every endpoint. Zero
+	// selects DefaultMaxIdleConnections.
+	MaxIdleConnections int
+	// MaxIdleConnectionsPerEndpoint caps retained connections for one address.
+	// Zero selects DefaultMaxIdleConnectionsPerEndpoint. Values above the total
+	// cap are clamped to the total cap.
+	MaxIdleConnectionsPerEndpoint int
+	// IdleConnectionTimeout bounds how long a returned connection may be reused.
+	// Zero selects DefaultIdleConnectionTimeout; a negative value disables age
+	// expiry. Expired connections are closed lazily without a reaper goroutine.
+	IdleConnectionTimeout time.Duration
+	// DisableConnectionReuse closes every connection after one round-trip.
+	DisableConnectionReuse bool
 }
 
-// NewClient returns a client that opens connections with dial. A nil dial
-// selects a default TCP dialer, so a production caller passes nil and a test
-// passes a net.Pipe dialer wired to an in-process shardservice.Server.
+// idleShardConn is one exclusively owned connection waiting for another call.
+// Connections are removed from the pool before use, so the shard protocol
+// remains strictly request/response even when Client.Do runs concurrently.
+type idleShardConn struct {
+	conn       net.Conn
+	returnedAt time.Time
+}
+
+// Client is a thin shard client: one synchronous request/response round-trip
+// per call over a bounded pool of persistent shard connections. It retains no
+// authoritative or transactional state and is safe for concurrent use.
+type Client struct {
+	dial        DialFunc
+	idleTimeout time.Duration
+	maxIdle     int
+	maxPerAddr  int
+	now         func() time.Time
+
+	mu     sync.Mutex
+	idle   map[string][]idleShardConn
+	nidle  int
+	closed bool
+}
+
+// NewClient returns a client with the default bounded connection pool. A nil
+// dial selects TCP, so a production caller passes nil and a test may pass a
+// net.Pipe dialer wired to an in-process shardservice.Server.
 func NewClient(dial DialFunc) *Client {
+	return NewClientWithOptions(dial, ClientOptions{})
+}
+
+// NewClientWithOptions returns a client with explicit pooling options.
+func NewClientWithOptions(dial DialFunc, opts ClientOptions) *Client {
 	if dial == nil {
 		dial = tcpDial
 	}
-	return &Client{dial: dial}
+	if opts.MaxIdleConnections <= 0 {
+		opts.MaxIdleConnections = DefaultMaxIdleConnections
+	}
+	if opts.MaxIdleConnectionsPerEndpoint <= 0 {
+		opts.MaxIdleConnectionsPerEndpoint = DefaultMaxIdleConnectionsPerEndpoint
+	}
+	if opts.MaxIdleConnectionsPerEndpoint > opts.MaxIdleConnections {
+		opts.MaxIdleConnectionsPerEndpoint = opts.MaxIdleConnections
+	}
+	if opts.IdleConnectionTimeout == 0 {
+		opts.IdleConnectionTimeout = DefaultIdleConnectionTimeout
+	} else if opts.IdleConnectionTimeout < 0 {
+		opts.IdleConnectionTimeout = 0
+	}
+	if opts.DisableConnectionReuse {
+		opts.MaxIdleConnections = 0
+		opts.MaxIdleConnectionsPerEndpoint = 0
+	}
+	return &Client{
+		dial:        dial,
+		idleTimeout: opts.IdleConnectionTimeout,
+		maxIdle:     opts.MaxIdleConnections,
+		maxPerAddr:  opts.MaxIdleConnectionsPerEndpoint,
+		now:         time.Now,
+		idle:        make(map[string][]idleShardConn),
+	}
 }
 
 // tcpDial is the default connector: one TCP connection honoring the context.
@@ -129,10 +208,12 @@ func tcpDial(ctx context.Context, address string) (net.Conn, error) {
 	return d.DialContext(ctx, "tcp", address)
 }
 
-// Do dials address, sends req, reads one reply, and closes the connection. A
-// shard error frame becomes a typed *ShardError; a rows or completion frame is
-// returned as the response. It respects ctx's deadline and cancellation for both
-// the dial and the round-trip.
+// Do borrows or dials an exclusive connection to address, sends req, reads one
+// reply, and returns a healthy connection to the bounded idle pool. A shard
+// error frame is a complete, stream-aligned response and therefore also leaves
+// the connection reusable. Transport, framing, validation, and cancellation
+// failures close it. Do respects ctx's deadline and cancellation for both the
+// dial and the round-trip.
 func (c *Client) Do(ctx context.Context, address string, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -140,12 +221,172 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 	if err := validateRequestPosition(req); err != nil {
 		return nil, err
 	}
-	conn, err := c.dial(ctx, address)
+	conn, err := c.take(address)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = conn.Close() }()
-	return RoundTrip(ctx, conn, req)
+	if conn == nil {
+		conn, err = c.dial(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+	}
+	resp, err := RoundTrip(ctx, conn, req)
+	if ctx.Err() == nil && roundTripKeepsStream(err) {
+		c.put(address, conn)
+	} else {
+		_ = conn.Close()
+	}
+	return resp, err
+}
+
+// roundTripKeepsStream reports errors produced only after a whole response
+// frame was decoded. Typed shard errors and client-side logical-position proof
+// refusals do not desynchronize the connection; every other error is treated as
+// a transport failure and the connection is discarded.
+func roundTripKeepsStream(err error) bool {
+	if err == nil {
+		return true
+	}
+	var shardErr *ShardError
+	return errors.As(err, &shardErr)
+}
+
+// take removes one connection from address's idle stack. Expired connections
+// are closed outside the mutex and the search continues. A nil connection with
+// a nil error tells Do to dial.
+func (c *Client) take(address string) (net.Conn, error) {
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, ErrClientClosed
+		}
+		list := c.idle[address]
+		if len(list) == 0 {
+			c.mu.Unlock()
+			return nil, nil
+		}
+		last := len(list) - 1
+		idle := list[last]
+		list[last] = idleShardConn{}
+		list = list[:last]
+		c.nidle--
+		if len(list) == 0 {
+			delete(c.idle, address)
+		} else {
+			c.idle[address] = list
+		}
+		timeout := c.idleTimeout
+		now := c.now
+		c.mu.Unlock()
+
+		if timeout > 0 && now().Sub(idle.returnedAt) >= timeout {
+			_ = idle.conn.Close()
+			continue
+		}
+		return idle.conn, nil
+	}
+}
+
+// put returns one healthy connection to the pool. At either bound it replaces
+// the oldest matching idle connection, keeping the warm set biased toward the
+// endpoints serving current traffic rather than letting removed catalog
+// endpoints occupy the pool until process exit. Closing happens outside the
+// mutex because arbitrary net.Conn implementations may block in Close.
+func (c *Client) put(address string, conn net.Conn) {
+	c.mu.Lock()
+	if c.closed || c.maxIdle == 0 || c.maxPerAddr == 0 {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	var evicted net.Conn
+	if len(c.idle[address]) >= c.maxPerAddr {
+		evicted = c.removeOldestAtLocked(address)
+	} else if c.nidle >= c.maxIdle {
+		evicted = c.removeOldestLocked()
+	}
+	c.idle[address] = append(c.idle[address], idleShardConn{
+		conn:       conn,
+		returnedAt: c.now(),
+	})
+	c.nidle++
+	c.mu.Unlock()
+	if evicted != nil {
+		_ = evicted.Close()
+	}
+}
+
+// removeOldestAtLocked removes address's oldest idle connection. Each address
+// list is append-ordered by return time and borrowed newest-first.
+func (c *Client) removeOldestAtLocked(address string) net.Conn {
+	list := c.idle[address]
+	if len(list) == 0 {
+		return nil
+	}
+	oldest := list[0].conn
+	if len(list) == 1 {
+		delete(c.idle, address)
+	} else {
+		copy(list, list[1:])
+		list[len(list)-1] = idleShardConn{}
+		c.idle[address] = list[:len(list)-1]
+	}
+	c.nidle--
+	return oldest
+}
+
+// removeOldestLocked removes the globally oldest idle connection. The scan is
+// bounded by maxIdle and runs only when the total pool is already full.
+func (c *Client) removeOldestLocked() net.Conn {
+	var (
+		oldestAddress string
+		oldestTime    time.Time
+		found         bool
+	)
+	for address, list := range c.idle {
+		if len(list) == 0 {
+			continue
+		}
+		if !found || list[0].returnedAt.Before(oldestTime) {
+			oldestAddress = address
+			oldestTime = list[0].returnedAt
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	return c.removeOldestAtLocked(oldestAddress)
+}
+
+// Close permanently closes the client and every idle connection. Connections
+// already borrowed by Do are closed instead of being pooled when they return.
+// Close is idempotent; it does not cancel in-flight round-trips, whose contexts
+// remain the caller's cancellation mechanism.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	conns := make([]net.Conn, 0, c.nidle)
+	for address, list := range c.idle {
+		for _, idle := range list {
+			conns = append(conns, idle.conn)
+		}
+		delete(c.idle, address)
+	}
+	c.nidle = 0
+	c.mu.Unlock()
+
+	var err error
+	for _, conn := range conns {
+		err = errors.Join(err, conn.Close())
+	}
+	return err
 }
 
 // RoundTrip performs one request/response exchange over a caller-provided
