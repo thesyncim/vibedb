@@ -109,12 +109,17 @@ Cost is a vector:
 startup, CPU, IO bytes/work, network bytes/work, peak memory
 ```
 
-CPU, IO, network, and startup compose additively. Peak memory composes with
-`max`, avoiding the common error of summing memory that is not simultaneously
-live. A workload objective supplies weights and a hard memory limit. The
-gateway defaults make network movement more expensive than IO and IO more
-expensive than CPU; a future workload class can replace those weights without
-changing rules.
+CPU, IO, network, and startup compose additively by default. Sequential peak
+memory composes with `max`, avoiding the error of summing memory that is not
+simultaneously live. A physical model can implement the optional
+`CostComposer` contract for a pipelined, concurrent, or bushy operator and
+compose its critical path and simultaneously live child memory explicitly.
+Every local, composed, and enforcer cost is revalidated, so finite inputs that
+overflow during composition fail with `ErrInvalidCost` instead of masquerading
+as memory rejection or no plan. A workload objective supplies weights and a
+hard memory limit. The gateway defaults make network movement more expensive
+than IO and IO more expensive than CPU; a future workload class can replace
+those weights without changing rules.
 
 Search has independent hard limits for groups, expressions, rule applications,
 physical alternatives, property states, enforcer-chain steps, recursion depth,
@@ -193,7 +198,7 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
 | heavy-hitter lookup among 1,024 skew values | about 29 ns | 0 | 16-byte directory entry plus one interned scalar |
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
-| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,816 bytes / 31 allocations including construction | 352 owned memo bytes |
+| fresh memo/rules/property search, two physical alternatives | about 1.3 µs | 3,816 bytes / 31 allocations including construction | 352 owned memo bytes |
 | build and validate that 1,024-table catalog | about 0.71 ms | 3.10 MB / 13,347 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.

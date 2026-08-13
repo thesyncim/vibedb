@@ -3,6 +3,7 @@ package planner
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"unsafe"
 )
@@ -20,6 +21,53 @@ type testModel struct {
 type unaryDepthModel struct{}
 
 type repeatedDeadChildModel struct{}
+
+type compositionTestModel struct {
+	costs map[PrivateID]Cost
+}
+
+type concurrentCompositionTestModel struct {
+	compositionTestModel
+}
+
+func (m compositionTestModel) IsPhysical(expr Expression) bool { return expr.Op == OpRemoteQuery }
+func (m compositionTestModel) ChildPropertyAlternatives(
+	_ *Memo, _ GroupID, _ ExprID, expr Expression, _ PhysicalProperties,
+) ([][]PhysicalProperties, error) {
+	if len(expr.Children) == 0 {
+		return [][]PhysicalProperties{nil}, nil
+	}
+	required := PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}
+	return [][]PhysicalProperties{{required}}, nil
+}
+func (m compositionTestModel) Provided(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, _ []*Plan,
+) (PhysicalProperties, error) {
+	return PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}, nil
+}
+func (m compositionTestModel) LocalCost(
+	_ *Memo, _ GroupID, _ ExprID, expr Expression, _ []*Plan,
+) (Cost, error) {
+	return m.costs[expr.Private], nil
+}
+func (m compositionTestModel) Enforcers(
+	_ *Memo, _ GroupID, _, _ PhysicalProperties,
+) ([]EnforcerChain, error) {
+	return nil, nil
+}
+
+func (m concurrentCompositionTestModel) ComposeCost(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, local Cost, children []*Plan,
+) (Cost, error) {
+	cost := local
+	memory := local.Memory
+	for _, child := range children {
+		cost = cost.Plus(child.Cost)
+		memory += child.Cost.Memory
+	}
+	cost.Memory = memory
+	return cost, nil
+}
 
 func (repeatedDeadChildModel) IsPhysical(expr Expression) bool {
 	return expr.Op == OpRemoteQuery || expr.Op == OpTableScan
@@ -579,6 +627,82 @@ func TestOptimizerRejectsInvalidObjective(t *testing.T) {
 	}
 	if _, err := optimizer.Optimize(t.Context(), root, PhysicalProperties{}); !errors.Is(err, ErrInvalidObjective) {
 		t.Fatalf("Optimize error = %v, want ErrInvalidObjective", err)
+	}
+}
+
+func TestModelCanComposeConcurrentChildMemory(t *testing.T) {
+	buildMemo := func() (*Memo, GroupID) {
+		memo := NewMemo(Limits{})
+		leaf, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(leaf, Expression{Op: OpRemoteQuery, Private: 1})
+		root, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(root, Expression{
+			Op: OpRemoteQuery, Private: 2, Children: []GroupID{leaf},
+		})
+		return memo, root
+	}
+	base := compositionTestModel{costs: map[PrivateID]Cost{
+		1: {Memory: 80},
+		2: {Memory: 30},
+	}}
+	required := PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}
+	memo, root := buildMemo()
+	sequential, err := (&Optimizer{
+		Memo: memo, Model: base, Objective: Objective{CPUWeight: 1, MaxMemory: 100},
+	}).Optimize(t.Context(), root, required)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sequential.Cost.Memory != 80 {
+		t.Fatalf("default sequential memory = %v, want 80", sequential.Cost.Memory)
+	}
+
+	memo, root = buildMemo()
+	optimizer := &Optimizer{
+		Memo: memo, Model: concurrentCompositionTestModel{compositionTestModel: base},
+		Objective: Objective{CPUWeight: 1, MaxMemory: 100},
+	}
+	if _, err := optimizer.Optimize(t.Context(), root, required); !errors.Is(err, ErrNoPlan) {
+		t.Fatalf("concurrent Optimize error = %v, want ErrNoPlan", err)
+	}
+	if optimizer.Statistics().MemoryRejected != 1 {
+		t.Fatalf("concurrent memory statistics = %+v", optimizer.Statistics())
+	}
+}
+
+func TestOptimizerRejectsCostCompositionOverflow(t *testing.T) {
+	memo := NewMemo(Limits{})
+	leaf, _ := memo.NewGroup(LogicalProperties{})
+	_, _, _ = memo.Add(leaf, Expression{Op: OpRemoteQuery, Private: 1})
+	root, _ := memo.NewGroup(LogicalProperties{})
+	_, _, _ = memo.Add(root, Expression{Op: OpRemoteQuery, Private: 2, Children: []GroupID{leaf}})
+	model := compositionTestModel{costs: map[PrivateID]Cost{
+		1: {CPU: math.MaxFloat64},
+		2: {CPU: math.MaxFloat64},
+	}}
+	_, err := (&Optimizer{Memo: memo, Model: model}).Optimize(t.Context(), root,
+		PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}})
+	if !errors.Is(err, ErrInvalidCost) {
+		t.Fatalf("Optimize error = %v, want ErrInvalidCost", err)
+	}
+}
+
+func TestOptimizerRejectsEnforcerCostOverflow(t *testing.T) {
+	memo := NewMemo(Limits{})
+	root, _ := memo.NewGroup(LogicalProperties{})
+	_, _, _ = memo.Add(root, Expression{Op: OpTableScan, Private: 1})
+	required := PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}
+	model := testModel{
+		physical: map[PrivateID]testPhysical{1: {
+			properties: PhysicalProperties{Distribution: Distribution{Kind: DistributionRandom}},
+			cost:       Cost{CPU: math.MaxFloat64},
+		}},
+		enforcers: []EnforcerChain{{{
+			Op: OpGather, Provided: required, Cost: Cost{CPU: math.MaxFloat64},
+		}}},
+	}
+	if _, err := (&Optimizer{Memo: memo, Model: model}).Optimize(t.Context(), root, required); !errors.Is(err, ErrInvalidCost) {
+		t.Fatalf("Optimize error = %v, want ErrInvalidCost", err)
 	}
 }
 

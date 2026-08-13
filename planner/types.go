@@ -448,6 +448,8 @@ func finiteNonNegative(v float64) bool {
 }
 
 // Plus composes sequential/operator costs without double-counting peak memory.
+// A physical model uses CostComposer when children are concurrently live or
+// other dimensions follow an operator-specific critical path.
 func (c Cost) Plus(other Cost) Cost {
 	return Cost{
 		Startup: c.Startup + other.Startup,

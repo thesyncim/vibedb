@@ -43,6 +43,14 @@ type Model interface {
 	Enforcers(*Memo, GroupID, PhysicalProperties, PhysicalProperties) ([]EnforcerChain, error)
 }
 
+// CostComposer is an optional Model extension for operators whose children are
+// live concurrently or whose latency/resource composition is not sequential.
+// Without it, the optimizer combines LocalCost and child costs with [Cost.Plus].
+// ComposeCost must include local and every child cost exactly once.
+type CostComposer interface {
+	ComposeCost(*Memo, GroupID, ExprID, Expression, Cost, []*Plan) (Cost, error)
+}
+
 // Plan is one immutable winning physical tree.
 type Plan struct {
 	Group       GroupID
@@ -102,12 +110,13 @@ type Optimizer struct {
 	Model     Model
 	Objective Objective
 
-	cache  map[bestKey][]bestEntry
-	active map[bestKey][]PhysicalProperties
-	plans  uint32
-	ctx    context.Context
-	stats  OptimizerStatistics
-	depth  uint32
+	cache    map[bestKey][]bestEntry
+	active   map[bestKey][]PhysicalProperties
+	plans    uint32
+	ctx      context.Context
+	stats    OptimizerStatistics
+	depth    uint32
+	composer CostComposer
 	// exploredMemo makes rule exploration a one-time transition while allowing
 	// this optimizer to search the sealed memo for multiple root requirements.
 	exploredMemo  *Memo
@@ -193,6 +202,7 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 	}
 	o.cache = make(map[bestKey][]bestEntry)
 	o.active = make(map[bestKey][]PhysicalProperties)
+	o.composer, _ = o.Model.(CostComposer)
 	o.depth = 0
 	plan, err := o.optimizeGroup(root, required)
 	if err != nil {
@@ -338,8 +348,18 @@ func (o *Optimizer) buildCandidate(
 		return nil, fmt.Errorf("%w: %s returned %+v", ErrInvalidCost, expr.Op, local)
 	}
 	cost := local
-	for _, child := range children {
-		cost = cost.Plus(child.Cost)
+	if o.composer != nil {
+		cost, err = o.composer.ComposeCost(o.Memo, group, id, expr, local, children)
+		if err != nil {
+			return nil, fmt.Errorf("planner: compose cost for %s: %w", expr.Op, err)
+		}
+	} else {
+		for _, child := range children {
+			cost = cost.Plus(child.Cost)
+		}
+	}
+	if !cost.valid() {
+		return nil, fmt.Errorf("%w: composed %s returned %+v", ErrInvalidCost, expr.Op, cost)
 	}
 	if err := o.reservePlanNode(planPayloadBytes(len(expr.Children), len(children), provided)); err != nil {
 		return nil, err
@@ -392,11 +412,15 @@ func (o *Optimizer) buildCandidate(
 				return nil, err
 			}
 			enforcerExpr := Expression{Op: step.Op, Private: step.Private, Children: []GroupID{group}}
+			composedCost := candidate.Cost.Plus(step.Cost)
+			if !composedCost.valid() {
+				return nil, fmt.Errorf("%w: enforcer %s produced %+v", ErrInvalidCost, step.Op, composedCost)
+			}
 			candidate = &Plan{
 				Group: group, Expr: NoExpr,
 				Expression: enforcerExpr,
 				Children:   []*Plan{candidate}, Provided: clonePhysicalProperties(step.Provided),
-				Cost: candidate.Cost.Plus(step.Cost),
+				Cost: composedCost,
 			}
 			candidate.fingerprint = planFingerprint(candidate)
 		}
