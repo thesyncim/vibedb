@@ -56,6 +56,7 @@ type PreparedPlan struct {
 
 	generation   uint64
 	table        string
+	tables       []string
 	distribution distribution.DistributionName
 	spec         distribution.DistributionSpec
 	manifest     *distribution.Manifest
@@ -77,6 +78,7 @@ type PreparedPlan struct {
 type BoundPlan struct {
 	generation   uint64
 	table        string
+	tables       []string
 	distribution distribution.DistributionName
 	constraints  distribution.BoundConstraints
 	order        []OrderKey
@@ -194,6 +196,7 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		}
 	}
 	plan.table = selectStmt.From[0].Name
+	plan.tables = append(plan.tables, plan.table)
 	placement, spec, manifest, ok := s.plannerTableFor(plan.table)
 	if !ok {
 		return nil, &PlanError{
@@ -231,6 +234,7 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 				cause: ErrDistributedPlanUnsupported,
 			}
 		}
+		plan.tables = append(plan.tables, relation.Name)
 		placements[i] = joined
 		if relation.Join != sqlast.JoinInner && relation.Join != sqlast.JoinLeft {
 			plan.alwaysReason = firstPlanReason(plan.alwaysReason,
@@ -278,6 +282,7 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	}
 	return &BoundPlan{
 		generation: p.generation, table: p.table,
+		tables:       p.tables,
 		distribution: p.distribution, constraints: constraints,
 		order: p.order, limit: limit,
 		aggregates: p.aggregates, aggHeaders: p.aggHeaders,

@@ -191,6 +191,15 @@ intervals. Multiple key predicates use exponential backoff: the strongest is
 applied fully and each additional selectivity receives a successively smaller
 exponent, avoiding an unjustified full-independence assumption.
 
+Prepared colocated joins retain every physical relation in source order.
+Distributed costing sums per-table selected rows and bytes rather than pricing
+only the driving scan, and keeps result cardinality/width separate from scan
+work. Colocation proves placement but not uniqueness; absent join-correlation
+statistics, joined row upper bounds therefore expand conservatively by product
+(with a floor of one for LEFT-join preservation). Cost arithmetic saturates at
+the largest finite float so valid extreme statistics remain conservative and
+cannot turn into an infinity-shaped invalid plan by multiplication alone.
+
 Catalog save/load persists the cold statistics descriptors. Runtime feedback
 must be collected separately, validated, and published as a newer immutable
 generation. Mutating statistics under a cached plan would make planning

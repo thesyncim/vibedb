@@ -19,6 +19,7 @@ type distributedPrivate struct {
 	targets    int
 	shards     int
 	scanRows   float64
+	scanBytes  float64
 	outputRows float64
 	rowBytes   float64
 	order      []OrderKey
@@ -102,15 +103,16 @@ func (m *distributedCostModel) LocalCost(
 		return queryplanner.Cost{
 			Startup: float64(metadata.targets),
 			CPU:     metadata.scanRows,
-			IO:      metadata.scanRows * metadata.rowBytes,
-			Memory:  min(metadata.scanRows*metadata.rowBytes, 1<<20),
+			IO:      metadata.scanBytes,
+			Memory:  min(metadata.scanBytes, 1<<20),
 		}, nil
 	case queryplanner.OpFinalAggregate:
 		rows := max(1, float64(metadata.targets))
 		width := max(16, metadata.rowBytes)
 		return queryplanner.Cost{
-			CPU: rows * float64(len(metadata.aggregates)), Network: rows * width,
-			Memory: width * float64(len(metadata.aggregates)),
+			CPU:     boundedProduct(rows, float64(len(metadata.aggregates))),
+			Network: boundedProduct(rows, width),
+			Memory:  boundedProduct(width, float64(len(metadata.aggregates))),
 		}, nil
 	default:
 		return queryplanner.Cost{}, fmt.Errorf("unknown physical operator %s", expr.Op)
@@ -141,9 +143,9 @@ func (m *distributedCostModel) Enforcers(
 					Distribution: required.Distribution, Ordering: required.Ordering,
 				},
 				Cost: queryplanner.Cost{
-					CPU:     rows * math.Log2(max(2, float64(provided.Distribution.Partitions))),
-					Network: rows * width,
-					Memory:  width * max(1, float64(provided.Distribution.Partitions)),
+					CPU:     boundedProduct(rows, math.Log2(max(2, float64(provided.Distribution.Partitions)))),
+					Network: boundedProduct(rows, width),
+					Memory:  boundedProduct(width, max(1, float64(provided.Distribution.Partitions))),
 				},
 			}}}, nil
 		}
@@ -152,7 +154,7 @@ func (m *distributedCostModel) Enforcers(
 			Provided: queryplanner.PhysicalProperties{
 				Distribution: required.Distribution,
 			},
-			Cost: queryplanner.Cost{CPU: rows, Network: rows * width, Memory: width},
+			Cost: queryplanner.Cost{CPU: rows, Network: boundedProduct(rows, width), Memory: width},
 		}
 		if len(required.Ordering) == 0 {
 			return []queryplanner.EnforcerChain{{gather}}, nil
@@ -163,7 +165,7 @@ func (m *distributedCostModel) Enforcers(
 				Distribution: required.Distribution, Ordering: required.Ordering,
 			},
 			Cost: queryplanner.Cost{
-				CPU: rows * math.Log2(max(2, rows)), Memory: rows * width,
+				CPU: boundedProduct(rows, math.Log2(max(2, rows))), Memory: boundedProduct(rows, width),
 			},
 		}
 		return []queryplanner.EnforcerChain{{gather, sort}}, nil
@@ -176,7 +178,7 @@ func (m *distributedCostModel) Enforcers(
 				Distribution: provided.Distribution, Ordering: required.Ordering,
 			},
 			Cost: queryplanner.Cost{
-				CPU: rows * math.Log2(max(2, rows)), Memory: rows * width,
+				CPU: boundedProduct(rows, math.Log2(max(2, rows))), Memory: boundedProduct(rows, width),
 			},
 		}}}, nil
 	}
@@ -221,10 +223,10 @@ func optimizeDistributedPlan(
 	profile Profile,
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	const privateID queryplanner.PrivateID = 1
-	scanRows, outputRows, rowBytes := distributedEstimates(snap, bound, route)
+	scanRows, scanBytes, outputRows, rowBytes := distributedEstimates(snap, bound, route)
 	metadata := distributedPrivate{
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
-		scanRows: scanRows, outputRows: outputRows, rowBytes: rowBytes,
+		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates,
 	}
 	if bound.limit > 0 && len(bound.aggregates) == 0 {
@@ -310,54 +312,60 @@ func distributedEstimates(
 	snap *Snapshot,
 	bound *BoundPlan,
 	route distribution.Route,
-) (scanRows, outputRows, rowBytes float64) {
-	rowBytes = 128
+) (scanRows, scanBytes, outputRows, rowBytes float64) {
+	tableCount := len(bound.tables)
+	if tableCount == 0 {
+		tableCount = 1
+	}
+	var (
+		drivingRows       float64
+		drivingTableRows  float64
+		joinExpansion     = 1.0
+		drivingStatistics TableStatistic
+		hasDrivingStats   bool
+	)
+	for tableIndex := 0; tableIndex < tableCount; tableIndex++ {
+		table := bound.table
+		if len(bound.tables) != 0 {
+			table = bound.tables[tableIndex]
+		}
+		selectedRows, tableRows, width, statistics, hasStatistics :=
+			routedTableEstimates(snap, table, route)
+		scanRows = boundedAdd(scanRows, selectedRows)
+		scanBytes = boundedAdd(scanBytes, boundedProduct(selectedRows, width))
+		rowBytes = boundedAdd(rowBytes, width)
+		if tableIndex == 0 {
+			drivingRows, drivingTableRows = selectedRows, tableRows
+			drivingStatistics, hasDrivingStats = statistics, hasStatistics
+		} else {
+			// Colocation proves where a join executes, not uniqueness. Without
+			// published join-key correlation, product cardinality is the safe
+			// upper bound; max(1, rows) also preserves LEFT-join output.
+			joinExpansion = boundedProduct(joinExpansion, max(1, selectedRows))
+		}
+	}
+	rowBytes = max(1, rowBytes)
 	if len(route.Targets) == 0 {
-		if statistics, ok := snap.Statistics(bound.table); ok {
-			rowBytes = max(1, statistics.RowBytes().Normalize(rowBytes).Upper)
-		}
-		return 0, 0, rowBytes
+		return 0, 0, 0, rowBytes
 	}
-	scanRows = 1000 * float64(len(route.Targets))
-	outputRows = scanRows
-	statistics, ok := snap.Statistics(bound.table)
-	if !ok {
-		return scanRows, outputRows, rowBytes
+	outputRows = boundedProduct(drivingRows, joinExpansion)
+	if !hasDrivingStats {
+		return scanRows, scanBytes, outputRows, rowBytes
 	}
-	tableRows := statistics.Rows().Normalize(scanRows).Upper
-	rowBytes = statistics.RowBytes().Normalize(rowBytes).Upper
-	partitionRows, completePartitions := 0.0, true
-	for _, target := range route.Targets {
-		estimate, exists := statistics.PartitionRows(string(target.Shard))
-		if !exists {
-			completePartitions = false
-			break
-		}
-		partitionRows += estimate.Normalize(tableRows).Upper
-	}
-	if completePartitions {
-		scanRows = min(tableRows, partitionRows)
-	} else {
-		// A whole-table upper bound cannot be divided by shard count under skew.
-		// Without every selected partition estimate, retain the conservative
-		// table bound rather than assuming uniform placement.
-		scanRows = tableRows
-	}
-	outputRows = scanRows
 
 	placement, _, _, placed := snap.plannerTableFor(bound.table)
 	if !placed {
-		return max(0, scanRows), max(0, outputRows), max(1, rowBytes)
+		return scanRows, scanBytes, outputRows, rowBytes
 	}
 	selectivities := make([]float64, 0, len(bound.constraints))
 	for ordinal, domain := range bound.constraints {
 		if domain.Kind == distribution.DomainEmpty {
-			return max(0, scanRows), 0, max(1, rowBytes)
+			return scanRows, scanBytes, 0, rowBytes
 		}
 		if domain.Kind != distribution.DomainFinite || ordinal >= len(placement.Columns) {
 			continue
 		}
-		column, exists := statistics.Column(placement.Columns[ordinal])
+		column, exists := drivingStatistics.Column(placement.Columns[ordinal])
 		if !exists {
 			continue
 		}
@@ -384,9 +392,61 @@ func distributedEstimates(
 			combined *= math.Pow(selectivity, exponent)
 			exponent *= .5
 		}
-		outputRows = min(scanRows, tableRows*combined)
+		drivingOutput := min(drivingRows, boundedProduct(drivingTableRows, combined))
+		outputRows = boundedProduct(drivingOutput, joinExpansion)
 	}
-	return max(0, scanRows), max(0, outputRows), max(1, rowBytes)
+	return scanRows, scanBytes, outputRows, rowBytes
+}
+
+func routedTableEstimates(
+	snap *Snapshot,
+	table string,
+	route distribution.Route,
+) (selectedRows, tableRows, rowBytes float64, statistics TableStatistic, ok bool) {
+	fallbackRows := boundedProduct(1000, float64(len(route.Targets)))
+	rowBytes = 128
+	statistics, ok = snap.Statistics(table)
+	if !ok {
+		return fallbackRows, fallbackRows, rowBytes, TableStatistic{}, false
+	}
+	tableRows = statistics.Rows().Normalize(fallbackRows).Upper
+	rowBytes = max(1, statistics.RowBytes().Normalize(rowBytes).Upper)
+	if len(route.Targets) == 0 {
+		return 0, tableRows, rowBytes, statistics, true
+	}
+	partitionRows, completePartitions := 0.0, true
+	for _, target := range route.Targets {
+		estimate, exists := statistics.PartitionRows(string(target.Shard))
+		if !exists {
+			completePartitions = false
+			break
+		}
+		partitionRows = boundedAdd(partitionRows, estimate.Normalize(tableRows).Upper)
+	}
+	if completePartitions {
+		selectedRows = min(tableRows, partitionRows)
+	} else {
+		// A whole-table upper bound cannot be divided by shard count under skew.
+		selectedRows = tableRows
+	}
+	return selectedRows, tableRows, rowBytes, statistics, true
+}
+
+func boundedAdd(left, right float64) float64 {
+	if left >= math.MaxFloat64-right {
+		return math.MaxFloat64
+	}
+	return left + right
+}
+
+func boundedProduct(left, right float64) float64 {
+	if left == 0 || right == 0 {
+		return 0
+	}
+	if left >= math.MaxFloat64/right {
+		return math.MaxFloat64
+	}
+	return left * right
 }
 
 func boundStatisticScalar(value distribution.Scalar) (string, bool) {
