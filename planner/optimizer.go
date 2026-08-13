@@ -110,13 +110,15 @@ type Optimizer struct {
 	Model     Model
 	Objective Objective
 
-	cache    map[bestKey][]bestEntry
-	active   map[bestKey][]PhysicalProperties
-	plans    uint32
-	ctx      context.Context
-	stats    OptimizerStatistics
-	depth    uint32
-	composer CostComposer
+	cache         map[bestKey]uint32
+	cacheEntries  []bestEntry
+	active        map[bestKey]uint32
+	activeEntries []activeEntry
+	plans         uint32
+	ctx           context.Context
+	stats         OptimizerStatistics
+	depth         uint32
+	composer      CostComposer
 	// exploredMemo makes rule exploration a one-time transition while allowing
 	// this optimizer to search the sealed memo for multiple root requirements.
 	exploredMemo  *Memo
@@ -156,7 +158,15 @@ type bestKey struct {
 type bestEntry struct {
 	required PhysicalProperties
 	plan     *Plan
+	next     uint32
 }
+
+type activeEntry struct {
+	required PhysicalProperties
+	next     uint32
+}
+
+const noPropertyEntry = ^uint32(0)
 
 // Optimize explores rules, then returns the cheapest plan satisfying required.
 func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required PhysicalProperties) (*Plan, error) {
@@ -200,8 +210,12 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 	if !o.Objective.valid() {
 		return nil, ErrInvalidObjective
 	}
-	o.cache = make(map[bestKey][]bestEntry)
-	o.active = make(map[bestKey][]PhysicalProperties)
+	o.cache = make(map[bestKey]uint32)
+	clear(o.cacheEntries)
+	o.cacheEntries = o.cacheEntries[:0]
+	o.active = make(map[bestKey]uint32)
+	clear(o.activeEntries)
+	o.activeEntries = o.activeEntries[:0]
 	o.composer, _ = o.Model.(CostComposer)
 	o.depth = 0
 	plan, err := o.optimizeGroup(root, required)
@@ -221,8 +235,9 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 	if err := o.ctx.Err(); err != nil {
 		return nil, err
 	}
-	key := bestKey{group: group, hash: required.hash()}
-	for _, entry := range o.cache[key] {
+	key := bestKey{group: group, hash: required.hash(o.Memo.indexSalt)}
+	for index, exists := o.cache[key]; exists; {
+		entry := o.cacheEntries[index]
 		if entry.required.Equal(required) {
 			o.stats.PropertyCacheHits++
 			if entry.plan == nil {
@@ -230,11 +245,20 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 			}
 			return entry.plan, nil
 		}
+		if entry.next == noPropertyEntry {
+			break
+		}
+		index = entry.next
 	}
-	for _, active := range o.active[key] {
-		if active.Equal(required) {
+	for index, exists := o.active[key]; exists; {
+		active := o.activeEntries[index]
+		if active.required.Equal(required) {
 			return nil, fmt.Errorf("%w: cyclic dependency at group %d requiring %s", ErrInvalidMemo, group, required.String())
 		}
+		if active.next == noPropertyEntry {
+			break
+		}
+		index = active.next
 	}
 	if o.stats.PropertyStates >= o.Memo.limits.MaxPropertyStates {
 		return nil, fmt.Errorf("%w: property states reached %d", ErrSearchBudget, o.Memo.limits.MaxPropertyStates)
@@ -247,15 +271,24 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 		return nil, err
 	}
 	o.stats.PropertyStates++
-	o.active[key] = append(o.active[key], clonePhysicalProperties(required))
+	activeNext := noPropertyEntry
+	if head, exists := o.active[key]; exists {
+		activeNext = head
+	}
+	activeIndex := uint32(len(o.activeEntries))
+	o.activeEntries = append(o.activeEntries, activeEntry{
+		required: clonePhysicalProperties(required), next: activeNext,
+	})
+	o.active[key] = activeIndex
 	defer func() {
-		values := o.active[key]
-		values = values[:len(values)-1]
-		if len(values) == 0 {
+		entry := o.activeEntries[activeIndex]
+		if entry.next == noPropertyEntry {
 			delete(o.active, key)
 		} else {
-			o.active[key] = values
+			o.active[key] = entry.next
 		}
+		o.activeEntries[activeIndex] = activeEntry{}
+		o.activeEntries = o.activeEntries[:activeIndex]
 	}()
 
 	var best *Plan
@@ -313,13 +346,24 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 		}
 	}
 	if best == nil {
-		o.cache[key] = append(o.cache[key], bestEntry{required: clonePhysicalProperties(required)})
-		o.stats.PropertyCacheEntries++
+		o.addCacheEntry(key, required, nil)
 		return nil, noPlanFor(group, required)
 	}
-	o.cache[key] = append(o.cache[key], bestEntry{required: clonePhysicalProperties(required), plan: best})
-	o.stats.PropertyCacheEntries++
+	o.addCacheEntry(key, required, best)
 	return best, nil
+}
+
+func (o *Optimizer) addCacheEntry(key bestKey, required PhysicalProperties, plan *Plan) {
+	next := noPropertyEntry
+	if head, exists := o.cache[key]; exists {
+		next = head
+	}
+	index := uint32(len(o.cacheEntries))
+	o.cacheEntries = append(o.cacheEntries, bestEntry{
+		required: clonePhysicalProperties(required), plan: plan, next: next,
+	})
+	o.cache[key] = index
+	o.stats.PropertyCacheEntries++
 }
 
 func noPlanFor(group GroupID, required PhysicalProperties) error {
@@ -495,7 +539,7 @@ func (o *Optimizer) reservePlanNode(bytes uint64, ok bool) error {
 func propertyStatePayloadBytes(required PhysicalProperties) (uint64, bool) {
 	// One active property and one completed cache entry can coexist while a
 	// recursive state unwinds. Charge both records and both owned runs.
-	total := uint64(unsafe.Sizeof(PhysicalProperties{})) + uint64(unsafe.Sizeof(bestEntry{}))
+	total := uint64(unsafe.Sizeof(activeEntry{})) + uint64(unsafe.Sizeof(bestEntry{}))
 	var ok bool
 	if total, ok = addMemoRun(total, len(required.Distribution.Keys), unsafe.Sizeof(ColumnID(0))); !ok {
 		return 0, false

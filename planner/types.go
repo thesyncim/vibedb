@@ -350,19 +350,20 @@ func distributionSatisfies(provided, required Distribution) bool {
 	return slices.Equal(provided.Keys, required.Keys)
 }
 
-func (p PhysicalProperties) hash() uint64 {
-	h := hashByte(fnv64Offset, byte(p.Distribution.Kind))
-	h = hashUint32(h, p.Distribution.Partitions)
+func (p PhysicalProperties) hash(salt uint64) uint64 {
+	h := indexHashAdd(salt^3, salt, uint64(p.Distribution.Kind))
+	h = indexHashAdd(h, salt, uint64(p.Distribution.Partitions))
+	h = indexHashAdd(h, salt, uint64(len(p.Distribution.Keys)))
 	for _, key := range p.Distribution.Keys {
-		h = hashUint32(h, uint32(key))
+		h = indexHashAdd(h, salt, uint64(key))
 	}
-	h = hashByte(h, 0xff)
+	h = indexHashAdd(h, salt, uint64(len(p.Ordering)))
 	for _, term := range p.Ordering {
-		h = hashUint32(h, uint32(term.Column))
-		h = hashByte(h, byte(term.Direction))
-		h = hashByte(h, boolByte(term.NullsFirst))
+		h = indexHashAdd(h, salt, uint64(term.Column))
+		h = indexHashAdd(h, salt, uint64(term.Direction))
+		h = indexHashAdd(h, salt, uint64(boolByte(term.NullsFirst)))
 	}
-	return h
+	return indexHashFinish(h)
 }
 
 const (
@@ -372,13 +373,6 @@ const (
 
 func hashByte(hash uint64, value byte) uint64 {
 	return (hash ^ uint64(value)) * fnv64Prime
-}
-
-func hashUint32(hash uint64, value uint32) uint64 {
-	hash = hashByte(hash, byte(value>>24))
-	hash = hashByte(hash, byte(value>>16))
-	hash = hashByte(hash, byte(value>>8))
-	return hashByte(hash, byte(value))
 }
 
 func boolByte(value bool) byte {

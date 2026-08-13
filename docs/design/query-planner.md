@@ -139,6 +139,9 @@ checked during exploration and top-down search. Exceeding a limit returns a
 typed error; the optimizer never silently publishes the best plan observed
 before truncation. Positive and negative property results are memoized, so an
 impossible child requirement is not recomputed for every parent alternative.
+Winner and active-cycle records live in flat linked arenas behind salted map
+heads, avoiding a heap slice per property hash while exact property comparison
+remains the collision authority.
 
 `OptimizerStatistics` reports memo groups, expressions, expression-index
 references, rule applications, accounted payload bytes, owned slice-capacity bytes, physical alternatives,
@@ -222,7 +225,7 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
 | heavy-hitter lookup among 1,024 skew values | about 29 ns | 0 | 16-byte directory entry plus one interned scalar |
 | per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
-| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,872 bytes / 28 allocations including construction | 352 owned memo bytes |
+| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,600 bytes / 28 allocations including construction | 352 owned memo bytes |
 | add the same scan shape to 1,024 distinct groups | about 0.17 ms | 804 KB / 54 allocations including construction | 2,048 bounded index references |
 | selected-partition + skew estimate for one routed predicate | about 70 ns | 0 | request-local 256-byte scalar scratch |
 | numeric range estimate in a 1,024-bucket histogram | about 0.35 µs | 0 | shared 24-byte buckets |
