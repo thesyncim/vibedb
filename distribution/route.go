@@ -31,7 +31,8 @@ func (k RouteKind) String() string {
 	}
 }
 
-// Role is the endpoint role a target addresses. Version 1 selects leaders only.
+// Role is the endpoint role a target addresses. The current contract selects
+// leaders only.
 type Role uint8
 
 const (

@@ -692,11 +692,12 @@ type TableDefinition struct {
 //
 // # What a declared primary key does here
 //
-// Every path the PRIMARY KEY names becomes a required, non-null field of the
-// compiled schema, constrained to the types the column list declared for it, or
-// to the scalars if it declared none. That much is enforced on every write, by
-// the store's own schema validation, and a document missing a key path is
-// rejected with the schema's error.
+// With a declared column list, every path the PRIMARY KEY names becomes a
+// required, non-null field of the compiled schema, constrained to the declared
+// type or to the scalars when that path has no matching column. With no column
+// list, `CREATE TABLE t (PRIMARY KEY (p))` is the compact schemaless spelling:
+// Schema stays nil while PrimaryKey still carries p to the storage adapter,
+// which must validate and derive the physical scalar key on every mutation.
 //
 // This lowering does not choose a physical key codec. PrimaryKey is carried out
 // so the storage adapter can derive a stable physical key from the declared
@@ -709,7 +710,10 @@ func (d *DMLStatement) LowerTable() (TableDefinition, error) {
 	}
 	stmt := d.tree.CreateTable
 	def := TableDefinition{Name: stmt.Table, IfNotExists: stmt.IfNotExists}
-	if len(stmt.Columns) == 0 && len(stmt.PrimaryKey) == 0 {
+	if len(stmt.Columns) == 0 {
+		for _, key := range stmt.PrimaryKey {
+			def.PrimaryKey = append(def.PrimaryKey, key.Spec())
+		}
 		return def, nil
 	}
 	var spec []byte
@@ -724,10 +728,8 @@ func (d *DMLStatement) LowerTable() (TableDefinition, error) {
 			Required: column.Required,
 		})
 	}
-	// A key path with no column declaration still gets a field, because the one
-	// thing a declared key does enforce is that it is there. Constraining it to
-	// the scalars rather than to anything is what makes "a key is derived from a
-	// scalar" true of the documents even before the derivation exists.
+	// In a declared schema, a key path with no matching column still gets a
+	// required scalar field. The no-column schemaless case returned above.
 	for _, key := range stmt.PrimaryKey {
 		start := len(spec)
 		spec = key.AppendPointer(spec)

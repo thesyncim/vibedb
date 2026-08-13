@@ -240,6 +240,9 @@ func (c *conn) execMutationCoreContext(
 	args []any,
 	prepared *stmt,
 ) (sqldriver.Result, error) {
+	if err := c.requireDirectWriteAllowed(); err != nil {
+		return nil, err
+	}
 	ctx = withCooperativeCancellation(ctx, c.exec.Options.Cancel)
 	d := c.db
 	if statement.Kind() == query.DDLCreateIndex {
@@ -486,6 +489,10 @@ func (d *database) createIndexContext(
 		d.mu.Unlock()
 		return nil, sqldriver.ErrBadConn
 	}
+	if d.catalog.ReplicatedShardStore != nil {
+		d.mu.Unlock()
+		return nil, ErrDirectWriteFenced
+	}
 	if err := d.settleCatalogLocked(); err != nil {
 		d.mu.Unlock()
 		return nil, err
@@ -651,6 +658,9 @@ func (d *database) createIndexLockedContext(
 	ctx context.Context,
 	statement *query.DMLStatement,
 ) (sqldriver.Result, error) {
+	if d.catalog.ReplicatedShardStore != nil {
+		return nil, ErrDirectWriteFenced
+	}
 	if err := d.validateViewTableTargetLocked(statement.Tree()); err != nil {
 		return nil, err
 	}
@@ -1191,6 +1201,9 @@ func (c *conn) mutationReturningCoreContext(
 	prepared *stmt,
 ) (query.Cursor, error) {
 	var cursor query.Cursor
+	if err := c.requireDirectWriteAllowed(); err != nil {
+		return cursor, err
+	}
 	d := c.db
 	if err := lockContext(ctx, &d.mu); err != nil {
 		return cursor, err

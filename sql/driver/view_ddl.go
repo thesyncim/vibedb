@@ -73,6 +73,9 @@ func (c *conn) execViewDDL(
 	ctx context.Context,
 	prepared *preparedViewDDL,
 ) (sqldriver.Result, error) {
+	if err := c.requireDirectWriteAllowed(); err != nil {
+		return nil, err
+	}
 	ctx = withCooperativeCancellation(ctx, c.exec.Options.Cancel)
 	if prepared == nil {
 		return nil, fmt.Errorf("vibedb: missing prepared view DDL")

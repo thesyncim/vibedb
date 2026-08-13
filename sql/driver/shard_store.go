@@ -207,12 +207,21 @@ const (
 	shardStoreOpenGeneric shardStoreOpenMode = iota
 	shardStoreOpenInitialize
 	shardStoreOpenExisting
+	shardStoreOpenReplicatedExisting
+	shardStoreOpenReplicatedSettlement
+	shardStoreOpenReplicatedApplyExisting
+	shardStoreOpenReplicatedApplySettlement
 )
 
 type shardStoreOpenPolicy struct {
-	mode            shardStoreOpenMode
-	expected        ShardStoreBinding
-	persistIdentity func(*database) (bool, error)
+	mode                        shardStoreOpenMode
+	expected                    ShardStoreBinding
+	expectedReplicated          ReplicatedShardStoreIdentity
+	expectedReplicatedLogID     [16]byte
+	expectedReplicatedUserTable string
+	expectedReplicatedApply     ReplicatedApplyIdentity
+	expectedReplicatedOptions   ReplicatedApplyOptions
+	persistIdentity             func(*database) (bool, error)
 }
 
 // InitializeShardStore explicitly binds a genuinely new SQL storage root and
@@ -293,6 +302,12 @@ func (d *Database) ShardStoreIdentity() (ShardStoreIdentity, error) {
 	if core.closed {
 		return ShardStoreIdentity{}, ErrDatabaseClosed
 	}
+	if core.catalog.ReplicatedShardStore != nil {
+		return ShardStoreIdentity{}, fmt.Errorf(
+			"vibedb: inspect local shard identity for replicated root %s: %w",
+			core.path, ErrDirectWriteFenced,
+		)
+	}
 	if core.catalog.ShardStore == nil {
 		return ShardStoreIdentity{}, &ShardStoreError{
 			Op: "inspect", Path: core.path, Err: ErrShardStoreUnbound,
@@ -369,6 +384,12 @@ func (d *Database) claimShardStoreServing(
 	defer core.mu.Unlock()
 	if core.closed {
 		return nil, ErrDatabaseClosed
+	}
+	if core.catalog.ReplicatedShardStore != nil {
+		return nil, fmt.Errorf(
+			"vibedb: claim local shard serving for replicated root %s: %w",
+			core.path, ErrDirectWriteFenced,
+		)
 	}
 	if core.catalog.ShardStore == nil {
 		return nil, &ShardStoreError{

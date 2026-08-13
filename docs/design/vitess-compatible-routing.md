@@ -184,12 +184,12 @@ type TablePlacement struct {
 
 `Columns` contains canonical top-level schema column names in significant order.
 
-Version 1 placement scalars are deliberately small:
+The current placement scalar set is deliberately small:
 
 - exact `Number`;
 - `String`.
 
-Version 1 rejects:
+The current contract rejects:
 
 - `Bool`;
 - timestamps, because Vibedb has no separate stable timestamp scalar contract;
@@ -226,7 +226,7 @@ PRIMARY KEY (id)
 Per-shard uniqueness would otherwise silently cease to be global uniqueness.
 
 The invariant is checked when placement is bound in PR 2. The current dialect
-does not support `ALTER TABLE` or `ON CONFLICT`, so version 1 does not need
+does not support `ALTER TABLE` or `ON CONFLICT`, so the current contract does not need
 in-place placement mutation or distributed upsert semantics.
 
 ### Placement metadata lifecycle
@@ -504,9 +504,9 @@ It has two roles:
 Each Vitess-compatible mapper consumes columns according to its pinned upstream
 input contract.
 
-### Version 1 scalar set
+### Placement scalar set
 
-Version 1 admits only:
+The current contract admits only:
 
 ```text
 String
@@ -547,7 +547,7 @@ Negative zero canonicalizes to zero:
 `internal/orderedkey` is the implementation substrate to study, but its current
 format is not automatically frozen as placement identity. PR 1a must either:
 
-- extract a minimal placement-specific `tuple/v1` snapshot; or
+- extract a minimal placement-specific tuple codec; or
 - fork the relevant exact-number/string encoding into a frozen package.
 
 Local ordered-index or store-format evolution must never silently change
@@ -562,7 +562,7 @@ type TupleCodec interface {
 ```
 
 Strings use binary UTF-8 bytes with an unambiguous framing/escaping contract.
-There is no collation behavior in placement version 1.
+There is no collation behavior in current placement.
 
 ### Deduplication identity
 
@@ -631,7 +631,7 @@ The SQL planner owns a `ConstraintProgram` that may reference:
 - runtime values;
 - join-fed membership sets.
 
-The program is bound as late as practical before routing. Version 1 may scatter
+The program is bound as late as practical before routing. The current contract may scatter
 when a join-fed set is not yet available, but the API permits route-after-bind
 later without redesign.
 
@@ -854,13 +854,13 @@ primary or unique key contains every shard-key column.
 
 - every row supplies every shard-key column;
 - all rows are mapped before dispatch;
-- version 1 accepts only a single physical target shard;
+- the current contract accepts only a single physical target shard;
 - cross-shard multi-row inserts return `ErrCrossShardWrite`;
 - no participant receives work before preflight completes.
 
 ### Deletes
 
-A delete must resolve to exactly one physical shard in version 1. Unknown,
+A delete must resolve to exactly one physical shard. Unknown,
 targeted multi-shard, and scatter deletes fail before dispatch.
 
 Because every primary key contains the shard key, a complete primary-key
@@ -1166,7 +1166,7 @@ Long-term options are:
 - maintain a separately distributed lookup index;
 - add a lookup-routing service with explicit consistency semantics.
 
-Reserve the abstraction without implementing it in version 1:
+Reserve the abstraction without implementing it in the current contract:
 
 ```go
 type LookupRouter interface {
@@ -1387,7 +1387,7 @@ For every supported mapping:
 
 - multi-row inserts never partially dispatch across shards;
 - shard-key assignments are rejected statically;
-- delete/update never fan out in version 1;
+- delete/update never fan out in the current contract;
 - all cross-shard write errors happen before participant publication.
 
 ### Replica/session properties
@@ -1502,7 +1502,7 @@ Never:
 - introduce Raft, networking, Vitess, or topology before the permitting PR;
 - serialize execution plans onto the wire;
 - weaken consistency or scatter admission silently;
-- split one SQL write across shards in version 1;
+- split one SQL write across shards in the current contract;
 - claim 100+ TB readiness from scale-model tests.
 
 A golden-vector mismatch is a stop condition. The implementation or the design
@@ -1561,7 +1561,7 @@ go test -count=1 -race -timeout=25m ./...
 
 Targeted fuzz smoke commands and benchmarks are additional, not replacements.
 
-### PR 1a — Frozen placement scalars and tuple codec v1
+### PR 1a — Frozen placement scalars and tuple codec
 
 #### Goal
 
@@ -1581,7 +1581,7 @@ placement encoding; do not freeze unrelated local index/store formats.
 
 #### Pre-resolved semantics
 
-Version 1 admits only:
+The current contract admits only:
 
 ```text
 String
@@ -1595,15 +1595,17 @@ Rules:
 - `5`, `5.0`, `5e0`, and `50e-1` encode identically;
 - `-0` encodes identically to `0`;
 - `Bool`, timestamp, `Any`, object, array, and nested values are rejected;
-- tuple version is explicit;
-- committed golden vectors are immutable compatibility artifacts.
+- the current tuple codec identifier is explicit;
+- committed golden vectors pin placement identity for the current unreleased
+  build and change only in one coordinated codec, digest, fixture, and design
+  update.
 
 #### Deliverables
 
 - closed placement `Scalar`;
 - canonical scalar encoding;
 - canonical ordered tuple encoding;
-- tuple version 1;
+- the current tuple codec;
 - zero-allocation append APIs where correctness permits;
 - golden vectors and fuzz tests;
 - written format specification sufficient for an independent implementation.
@@ -2049,7 +2051,7 @@ Rejected. It violates typed equality and creates wrong-shard risks.
 
 Rejected. Consistency changes require explicit policy.
 
-### Permit cross-shard writes in version 1
+### Permit cross-shard writes in the current contract
 
 Rejected. Partial publication and recovery semantics require a separate design.
 
@@ -2070,11 +2072,11 @@ This design incorporates the following review findings:
 - Numeric spelling wrong-shard risk:
   requires the same exact canonical number decomposition as Vibedb equality.
 - `internal/orderedkey` evolution risk:
-  requires a frozen placement-specific v1 snapshot/fork.
+  requires the dedicated placement-specific codec.
 - Numeric-cast Vindex ambiguity:
   specifies lossless admitted integer conversion only.
 - String collation ambiguity:
-  fixes v1 equality/placement to binary UTF-8.
+  fixes current equality/placement to binary UTF-8.
 - `uint64`/Vitess byte-string mismatch:
   defines fixed `[8]byte` points and an explicit maximum end sentinel.
 - Nonexistent table/column IDs:
@@ -2115,7 +2117,7 @@ A second, agent-readiness-focused review pass produced:
 - PR 5a for a retained logical change stream, with the recovery journal
   explicitly excluded;
 - the split of PR 1 into 1a frozen bytes, 1b keyspace/manifests, and 1c routing;
-- the pre-resolved v1 scalar set of String + exact Number and fixed `-0 == 0`;
+- the pre-resolved scalar set of String + exact Number and fixed `-0 == 0`;
 - explicit points alongside ranges;
 - ordinal hot-path domains instead of string maps;
 - one admission enum and truth table instead of separate scatter/overflow
@@ -2139,7 +2141,7 @@ A second, agent-readiness-focused review pass produced:
 This design is accepted when reviewers agree that:
 
 1. placement scalar/tuple bytes are frozen and reviewed separately in PR 1a;
-2. version 1 admits only binary UTF-8 strings and exact numbers;
+2. the current contract admits only binary UTF-8 strings and exact numbers;
 3. negative zero and spelling-equivalent numbers follow Vibedb equality;
 4. compatible mappers pin their own input serialization;
 5. destinations contain explicit points and ranges;
@@ -2169,5 +2171,5 @@ required amendments above are folded into `docs/design/distributed-sharding.md`
 directly. A paste-ready execution prompt for PR 1a lives at
 `docs/design/pr1a-execution-prompt.md`.
 
-Implementation begins with **PR 1a — Frozen placement scalars and tuple codec
-v1** and proceeds through the PR ladder above.
+Implementation begins with **PR 1a — Frozen placement scalars and tuple
+codec** and proceeds through the PR ladder above.

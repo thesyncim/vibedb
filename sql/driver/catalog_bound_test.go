@@ -105,6 +105,57 @@ func TestCatalogSizePreflightCoversIndentedEncoding(t *testing.T) {
 	}
 }
 
+func TestCatalogSizePreflightAccountsForPlacementShardKey(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "catalog-placement-bound")
+	claim, _, err := database.OpenReplicatedApply(
+		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = claim.Close()
+		_ = database.Close()
+	}()
+
+	core := database.connector.db
+	core.mu.RLock()
+	raw, err := json.Marshal(core.catalog)
+	core.mu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog catalogFile
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	baseBound, err := catalogSizeUpperBound(catalog)
+	if err != nil {
+		t.Fatalf("base catalog bound: %v", err)
+	}
+	primary := "/" + strings.Repeat("x", 4096)
+	catalog.ReplicatedShardStore.UserPrimaryKey = primary
+	catalog.Tables[catalog.ReplicatedShardStore.UserTable].PrimaryKey = primary
+	catalog.ReplicatedApply.Placement.ShardKey = primary
+	catalog.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
+		*catalog.ReplicatedShardStore, catalog.ReplicatedApply.Placement,
+	)
+	bound, err := catalogSizeUpperBound(catalog)
+	if err != nil {
+		t.Fatalf("catalog bound: %v", err)
+	}
+	encoded, err := json.Marshal(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > bound {
+		t.Fatalf("catalog encoding = %d bytes, bound %d", len(encoded), bound)
+	}
+	if delta, want := bound-baseBound, 3*(encodedJSONStringBytes(primary)-encodedJSONStringBytes("/id")); delta != want {
+		t.Fatalf("placement catalog bound delta = %d, want %d", delta, want)
+	}
+}
+
 func boundedCatalogTableMeta(materialized bool) *tableMeta {
 	return &tableMeta{
 		PrimaryKey: "/id",

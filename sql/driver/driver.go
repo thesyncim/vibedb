@@ -195,6 +195,7 @@ func (c *dbConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 	c.refs++
 	return &conn{
 		db: c.db, owner: c,
+		directWritesFenced: c.db.catalog.ReplicatedShardStore != nil,
 		exec: query.Exec{Options: query.ExecOptions{
 			Workers: driverQueryWorkers,
 		}},
@@ -268,6 +269,10 @@ type conn struct {
 	tx             *tx
 	closed         bool
 	owner          *dbConnector
+	// directWritesFenced is immutable for this connection. Bind holds the
+	// connector lock and requires refs==0, so Connect either precedes bind and
+	// makes it return Busy, or observes the durable replicated binding here.
+	directWritesFenced bool
 	// routing is the per-connection Router used by the cluster facade's write
 	// preflight. It is created on first placed write and stays nil for the
 	// default single-store path.
@@ -617,6 +622,11 @@ func (c *conn) BeginTx(ctx context.Context, options sqldriver.TxOptions) (sqldri
 	if c.tx != nil {
 		return nil, errors.New("vibedb: this connection already has an open transaction")
 	}
+	if !options.ReadOnly {
+		if err := c.requireDirectWriteAllowed(); err != nil {
+			return nil, err
+		}
+	}
 	transaction, err := c.beginTx(ctx, options)
 	if err != nil {
 		return nil, err
@@ -684,6 +694,13 @@ func (c *conn) usable(ctx context.Context) error {
 		return sqldriver.ErrBadConn
 	}
 	return ctx.Err()
+}
+
+func (c *conn) requireDirectWriteAllowed() error {
+	if c != nil && c.directWritesFenced {
+		return ErrDirectWriteFenced
+	}
+	return nil
 }
 
 func (c *conn) values(args []sqldriver.NamedValue) ([]any, error) {

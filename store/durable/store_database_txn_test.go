@@ -104,6 +104,44 @@ func putTxnPair(t testing.TB, batch *DatabaseBatch, left, right string) error {
 	return nil
 }
 
+func TestTxnLogValidateCollectionsIsReadOnlyAndFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
+	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
+	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	if err := log.ValidateCollections([]NamedCollection{a, b}); err != nil {
+		t.Fatalf("ValidateCollections: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, txnMarkerFilename)); !os.IsNotExist(err) {
+		t.Fatalf("read-only validation minted a decision log: %v", err)
+	}
+
+	foreignDir := t.TempDir()
+	foreign := openTxnNamedCollection(t, foreignDir, "foreign", txnTestOptions())
+	if err := log.ValidateCollections([]NamedCollection{a, foreign}); !errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+		t.Fatalf("foreign participant error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, txnMarkerFilename)); !os.IsNotExist(err) {
+		t.Fatalf("failed validation minted a decision log: %v", err)
+	}
+	if err := b.Collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.ValidateCollections([]NamedCollection{a, b}); !errors.Is(err, ErrTxnParticipant) {
+		t.Fatalf("closed participant error = %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.ValidateCollections([]NamedCollection{a}); err == nil {
+		t.Fatal("closed transaction log passed validation")
+	}
+}
+
 func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
 	t.Run("retarget after open", func(t *testing.T) {
 		dirA := t.TempDir()

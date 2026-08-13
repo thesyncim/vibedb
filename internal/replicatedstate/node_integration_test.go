@@ -1,0 +1,112 @@
+package replicatedstate
+
+import (
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftsim"
+	"github.com/thesyncim/vibedb/internal/replication"
+	pb "go.etcd.io/raft/v3/raftpb"
+)
+
+func driveReplicatedStateNode(t testing.TB, node *raftmodel.Node) {
+	t.Helper()
+	for {
+		has, err := node.HasReady()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has {
+			return
+		}
+		captured, err := node.CaptureReady()
+		if err != nil || !captured {
+			t.Fatalf("CaptureReady = %v,%v", captured, err)
+		}
+		if err := node.PersistReady(); err != nil {
+			t.Fatalf("PersistReady: %v", err)
+		}
+		if err := node.DrainMessages(func(*pb.Message) error { return nil }); err != nil {
+			t.Fatalf("DrainMessages: %v", err)
+		}
+		if err := node.InstallSnapshot(); err != nil {
+			t.Fatalf("InstallSnapshot: %v", err)
+		}
+		if err := node.ApplyCommitted(); err != nil {
+			t.Fatalf("ApplyCommitted: %v", err)
+		}
+		if _, err := node.RecordReadStates(); err != nil {
+			t.Fatalf("RecordReadStates: %v", err)
+		}
+		if err := node.AdvanceReady(); err != nil {
+			t.Fatalf("AdvanceReady: %v", err)
+		}
+	}
+}
+
+func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
+	fixture := newMachineFixture(t)
+	stable, err := raftsim.NewMemoryStore([]uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := stable.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine, err := Open(
+		fixture.binding, bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := raftmodel.NewNode(1, 1, stable, machine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	driveReplicatedStateNode(t, node)
+	command := testCommand(fixture.binding, 1, replication.Mutation{
+		Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`),
+	})
+	if err := node.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	driveReplicatedStateNode(t, node)
+	before := machine.Published()
+	if before.Applied <= 1 || machine.state.CompletionCount != 1 {
+		t.Fatalf("publication before restart=%+v state=%+v", before, machine.state)
+	}
+	first, err := machine.LookupCompletion(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(
+		fixture.binding, bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := raftmodel.NewNode(1, 2, stable, reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driveReplicatedStateNode(t, restarted)
+	after := reopened.Published()
+	if after.Applied != before.Applied || after.LogicalDigest != before.LogicalDigest ||
+		reopened.state.CompletionCount != 1 {
+		t.Fatalf("restart replayed publication: before=%+v after=%+v state=%+v", before, after, reopened.state)
+	}
+	second, err := reopened.LookupCompletion(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.AppliedSequence != first.AppliedSequence || string(second.Bytes) != string(first.Bytes) {
+		t.Fatalf("restart rewrote completion: before=%+v after=%+v", first, second)
+	}
+}

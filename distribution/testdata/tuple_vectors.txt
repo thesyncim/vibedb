@@ -1,16 +1,15 @@
-# Frozen placement scalar/tuple codec v1 golden vectors.
+# Placement scalar/tuple codec golden vectors.
 #
-# THIS FILE IS AN IMMUTABLE COMPATIBILITY ARTIFACT, not a scratch fixture.
-# Every byte string here is placement identity: two callers on the same
-# tuple version must reach the same shard for the same logical value, forever.
-# If TestTupleV1GoldenVectors (../golden_vectors_test.go) fails, the
-# implementation regressed or someone tried to widen the byte format — that is
+# THIS FILE PINS THE CURRENT UNRELEASED FORMAT; it is not a scratch fixture.
+# Every byte string here is placement identity within one build contract.
+# If TestTupleGoldenVectors (../golden_vectors_test.go) fails, the
+# implementation changed or someone tried to widen the byte format — that is
 # a stop condition requiring design review (see docs/design/
 # vitess-compatible-routing.md, PR 1a "Stop conditions" and "Acceptance
 # gate"). Do NOT edit a hex value to make a failing test pass, and do not
 # delete a vector to dodge a mismatch. Adding new vectors for new coverage is
-# fine; changing an existing hex value is a frozen-format break and needs its
-# own design review and a new tuple version.
+# fine; changing an existing hex value requires one coordinated update of the
+# codec, placement digests, persisted fixtures, and design contract.
 #
 # Grammar
 # -------
@@ -37,7 +36,7 @@
 # tuple's <hex>, which is what "self-delimiting, no terminator" means in
 # practice.
 #
-# Every value below was produced once by distribution.V1 itself (freezing is
+# Every value below was produced once by distribution.CurrentTupleCodec itself (freezing is
 # defined as "what the reviewed, oracle-cross-checked implementation emits
 # today"); the equivalence/distinctness relationships were additionally
 # cross-checked against query package's independent exact-decimal oracle

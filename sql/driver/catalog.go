@@ -47,11 +47,13 @@ const maxCatalogTables = 128
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
-	Version         int                   `json:"version"`
-	Tables          map[string]*tableMeta `json:"tables"`
-	Views           map[string]*viewMeta  `json:"views,omitempty"`
-	ShardStore      *ShardStoreIdentity   `json:"shard_store,omitempty"`
-	ShardStoreFence *ShardStoreFence      `json:"shard_store_fence,omitempty"`
+	Version              int                           `json:"version"`
+	Tables               map[string]*tableMeta         `json:"tables"`
+	Views                map[string]*viewMeta          `json:"views,omitempty"`
+	ShardStore           *ShardStoreIdentity           `json:"shard_store,omitempty"`
+	ShardStoreFence      *ShardStoreFence              `json:"shard_store_fence,omitempty"`
+	ReplicatedShardStore *ReplicatedShardStoreIdentity `json:"replicated_shard_store,omitempty"`
+	ReplicatedApply      *replicatedApplyMeta          `json:"replicated_apply,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -203,6 +205,13 @@ type database struct {
 	// this writer-owning catalog. Its coordinates are also checked against the
 	// durable ShardStoreFence before the pointer is installed.
 	servingClaim *ShardStoreServingClaim
+	// replicatedApplyCollection is the catalog-owned, non-SQL-visible system
+	// participant paired atomically with the sole replicated user table. It is
+	// opened through txnDecisions and closed before txnLog, exactly like catalog
+	// tables, but never enters the SQL namespace or layout epoch.
+	replicatedApplyFile       *os.File
+	replicatedApplyCollection *durable.Collection
+	replicatedApplyClaim      *ReplicatedApply
 }
 
 func (d *database) advanceLayoutEpochLocked() {
@@ -297,6 +306,12 @@ func openDatabaseWithShardStorePolicy(
 			}
 		}
 	case shardStoreOpenInitialize:
+		if d.catalog.ReplicatedShardStore != nil {
+			return nil, fmt.Errorf(
+				"vibedb: initialize local shard store %s: %w",
+				absolute, ErrDirectWriteFenced,
+			)
+		}
 		if d.catalog.ShardStore != nil &&
 			d.catalog.ShardStore.Binding() != shardPolicy.expected {
 			return nil, &ShardStoreError{
@@ -335,12 +350,75 @@ func openDatabaseWithShardStorePolicy(
 				Err: ErrShardStoreUnbound,
 			}
 		}
+		if d.catalog.ReplicatedShardStore != nil {
+			return nil, fmt.Errorf(
+				"vibedb: open local shard store %s: %w",
+				absolute, ErrDirectWriteFenced,
+			)
+		}
 		if d.catalog.ShardStore.Binding() != shardPolicy.expected {
 			return nil, &ShardStoreError{
 				Op: "open", Path: absolute, Expected: shardPolicy.expected,
 				Actual: *d.catalog.ShardStore,
 				Err:    ErrShardStoreIdentityMismatch,
 			}
+		}
+	case shardStoreOpenReplicatedExisting:
+		if !exists || d.catalog.ReplicatedShardStore == nil {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreUnbound, absolute,
+			)
+		}
+		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
+			)
+		}
+		if d.catalog.ReplicatedApply != nil {
+			return nil, fmt.Errorf(
+				"%w: activated root requires exact replicated apply identity",
+				ErrReplicatedApplyMismatch,
+			)
+		}
+	case shardStoreOpenReplicatedSettlement:
+		if !exists || d.catalog.ReplicatedShardStore == nil {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreUnbound, absolute,
+			)
+		}
+		actual := d.catalog.ReplicatedShardStore
+		if actual.Binding != shardPolicy.expectedReplicated.Binding ||
+			actual.LogID != shardPolicy.expectedReplicatedLogID ||
+			actual.UserTable != shardPolicy.expectedReplicatedUserTable {
+			return nil, fmt.Errorf(
+				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
+			)
+		}
+		if d.catalog.ReplicatedApply != nil {
+			return nil, fmt.Errorf(
+				"%w: activated root requires replicated apply settlement",
+				ErrReplicatedApplyMismatch,
+			)
+		}
+	case shardStoreOpenReplicatedApplyExisting:
+		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
+			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
+		}
+		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated ||
+			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
+			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
+		}
+	case shardStoreOpenReplicatedApplySettlement:
+		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
+			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
+		}
+		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated ||
+			!replicatedApplyMetaMatchesOptions(
+				d.catalog.ReplicatedApply,
+				*d.catalog.ReplicatedShardStore,
+				shardPolicy.expectedReplicatedOptions,
+			) {
+			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
 		}
 	default:
 		return nil, errors.New("vibedb: invalid shard store open policy")
@@ -454,6 +532,16 @@ func openDatabaseWithShardStorePolicy(
 		paths[dataPath] = name
 		d.tables[name] = t
 	}
+	if apply := d.catalog.ReplicatedApply; apply != nil {
+		path := d.replicatedApplyPath(apply)
+		if previous, duplicate := paths[path]; duplicate {
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog storage %q aliases replicated apply storage %q",
+				previous, filepath.Base(path),
+			)
+		}
+		paths[path] = "replicated apply"
+	}
 	for name, meta := range d.catalog.Views {
 		if err := validateCatalogViewMeta(name, meta); err != nil {
 			return nil, err
@@ -472,6 +560,9 @@ func openDatabaseWithShardStorePolicy(
 	// passed strict decoding and semantic validation. An unpublished replacement
 	// can leave a unique orphan after a crash; no live catalog entry can name it.
 	if err := d.recoverOrphanedTableStorage(paths); err != nil {
+		return nil, err
+	}
+	if err := d.openReplicatedApplyCollectionLocked(); err != nil {
 		return nil, err
 	}
 	for name, t := range d.tables {
@@ -503,6 +594,12 @@ func openDatabaseWithShardStorePolicy(
 			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
 		}
 		t.file, t.collection = file, collection
+		if d.catalog.ReplicatedShardStore != nil {
+			// Replicated mode freezes the complete physical table profile. It
+			// must never adopt or mirror a durable layout that the bound catalog
+			// did not name.
+			continue
+		}
 		if !meta.Materialized {
 			// A table's unique storage identity is catalog-owned before its first
 			// mutation. First materialization publishes and fences the complete
@@ -523,6 +620,11 @@ func openDatabaseWithShardStorePolicy(
 		}
 		if changed {
 			d.catalogWritePending = true
+		}
+	}
+	if d.catalog.ReplicatedShardStore != nil {
+		if err := validateOpenedReplicatedCatalog(d); err != nil {
+			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
 	}
 	if d.catalogWritePending {
@@ -758,7 +860,10 @@ func schemaMetaFrom(schema *store.Schema) *schemaMeta {
 
 func validatePrimarySchema(primaryKey string, schema *store.Schema) error {
 	if schema == nil {
-		return errors.New("the persisted schema is absent")
+		// Schema-free JSON tables still have a driver-owned physical primary
+		// key. documentKey validates that the pointer exists and resolves to a
+		// scalar on every mutation; a durable document schema is optional.
+		return nil
 	}
 	definition := schema.Definition()
 	if definition.Root != store.SchemaObject {
@@ -1177,6 +1282,11 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			)
 		}
 	}
+	if err := validateReplicatedCatalog(catalog); err != nil {
+		return maxCatalogBytes + 1, fmt.Errorf(
+			"vibedb: invalid replicated shard store identity: %w", err,
+		)
+	}
 	if err := checkCatalogTableCount(len(catalog.Tables)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
@@ -1200,6 +1310,23 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	}
 	if catalog.ShardStoreFence != nil {
 		if !add(256) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ReplicatedShardStore != nil {
+		r := catalog.ReplicatedShardStore
+		if !add(encodedJSONStringBytes(r.Binding.Distribution) +
+			encodedJSONStringBytes(r.Binding.Shard) +
+			encodedJSONStringBytes(r.UserTable) +
+			encodedJSONStringBytes(r.UserStorage) +
+			encodedJSONStringBytes(r.UserPrimaryKey) + 4096) {
+			return size, catalogSizeError(size)
+		}
+	}
+	if catalog.ReplicatedApply != nil {
+		apply := catalog.ReplicatedApply
+		placementBytes := encodedJSONStringBytes(apply.Placement.ShardKey)
+		if !add(encodedJSONStringBytes(apply.Storage) + placementBytes + 2048) {
 			return size, catalogSizeError(size)
 		}
 	}
@@ -1366,6 +1493,9 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	if err := d.settleCatalogLocked(); err != nil {
 		return nil, err
 	}
+	if d.catalog.ReplicatedShardStore != nil {
+		return nil, ErrDirectWriteFenced
+	}
 	t, ok := d.tables[name]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrTableNotFound, name)
@@ -1450,30 +1580,37 @@ func (d *database) reopenTableWithTransactionsLocked(
 	options durable.Options,
 ) (*os.File, *durable.Collection, error) {
 	if collection != nil {
-		if err, completed := d.collectionCloseState(collection); err != nil || !completed {
-			return nil, nil, errors.Join(err, fmt.Errorf(
-				"vibedb: close table before transaction reopen: completed=%v", completed,
-			))
+		closeErr, completed := d.collectionCloseState(collection)
+		if !completed {
+			return nil, nil, errors.Join(closeErr, fmt.Errorf(
+				"vibedb: close table before transaction reopen: completed=false",
+			), d.retainUnpublishedStorageLocked(collection, file, path))
 		}
 		collection = nil
+		if closeErr != nil {
+			return nil, nil, errors.Join(closeErr,
+				d.discardUnpublishedStorageLocked(nil, file, path))
+		}
 	}
 	if file != nil {
 		if err := file.Close(); err != nil {
-			return nil, nil, err
+			return nil, nil, errors.Join(err,
+				d.discardUnpublishedStorageLocked(nil, file, path))
 		}
 		file = nil
 	}
 	finalFile, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(err,
+			d.discardUnpublishedStorageLocked(nil, nil, path))
 	}
 	options.Indexes = nil
 	finalCollection, err := durable.OpenWithTransactions(
 		finalFile, options, d.txnDecisions,
 	)
 	if err != nil {
-		_ = finalFile.Close()
-		return nil, nil, err
+		return nil, nil, errors.Join(err,
+			d.discardUnpublishedStorageLocked(nil, finalFile, path))
 	}
 	return finalFile, finalCollection, nil
 }
@@ -1545,6 +1682,15 @@ func (d *database) closeWithPolicy(terminal bool) error {
 	}
 	d.closed = true
 	retryable := false
+	if d.replicatedApplyCollection != nil {
+		closeErr, completed := d.collectionCloseState(d.replicatedApplyCollection)
+		result = errors.Join(result, closeErr)
+		if completed {
+			d.replicatedApplyCollection = nil
+		} else {
+			retryable = true
+		}
+	}
 	for _, t := range d.tables {
 		if t.collection != nil {
 			closeErr, completed := d.collectionCloseState(t.collection)
@@ -1573,6 +1719,10 @@ func (d *database) closeWithPolicy(terminal bool) error {
 		// attempt: invalidating its descriptor or dropping the last Go owner while
 		// engine teardown is incomplete would violate the collection lifecycle.
 		return result
+	}
+	if d.replicatedApplyFile != nil {
+		result = errors.Join(result, d.replicatedApplyFile.Close())
+		d.replicatedApplyFile = nil
 	}
 	for _, t := range d.tables {
 		if t.file != nil {

@@ -1,0 +1,916 @@
+package driver
+
+import (
+	"context"
+	stdsql "database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/store/durable"
+)
+
+func testReplicatedBinding(seed byte) ReplicatedShardStoreBinding {
+	id := func(offset byte) [16]byte {
+		var value [16]byte
+		value[0] = seed + offset
+		value[15] = seed ^ offset ^ 0xa5
+		return value
+	}
+	return ReplicatedShardStoreBinding{
+		ClusterID: id(1), ClusterIncarnation: id(2),
+		TopologyRecoveryEpoch: 3,
+		Distribution:          "accounts",
+		Shard:                 "shard-7",
+		AllocationGeneration:  5,
+		ShardIncarnation:      id(3),
+		GroupID:               id(4),
+		MemberID:              9,
+		StoreID:               id(5),
+		Authority: ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: 11,
+			ProtectionEpoch:        13,
+			OwnershipEpoch:         17,
+			SchemaGeneration:       19,
+			RoutingVersion:         23,
+			RouteGeneration:        29,
+		},
+	}
+}
+
+func prepareReplicatedTestRoot(
+	t testing.TB,
+	name string,
+	materialize bool,
+) (string, *Database, ReplicatedShardStoreBinding, ShardStoreIdentity) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name+".vdb")
+	binding := testReplicatedBinding(31)
+	database, err := InitializeShardStore(path, ShardStoreBinding{
+		Distribution:         distribution.DistributionName(binding.Distribution),
+		Shard:                distribution.ShardID(binding.Shard),
+		AllocationGeneration: distribution.ShardAllocationGeneration(binding.AllocationGeneration),
+	})
+	if err != nil {
+		t.Fatalf("InitializeShardStore: %v", err)
+	}
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := testRuntimeExec(session, `CREATE TABLE docs (PRIMARY KEY (id))`, nil); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if materialize {
+		if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"probe"}`)}); err != nil {
+			t.Fatalf("materialize INSERT: %v", err)
+		}
+		if err := testRuntimeExec(session, `DELETE FROM docs WHERE id = ?`, []any{"probe"}); err != nil {
+			t.Fatalf("materialize DELETE: %v", err)
+		}
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("close preparation session: %v", err)
+	}
+	local, err := database.ShardStoreIdentity()
+	if err != nil {
+		t.Fatalf("ShardStoreIdentity: %v", err)
+	}
+	return path, database, binding, local
+}
+
+func testRuntimeExec(session *Session, statement string, values []any) error {
+	prepared, err := session.Prepare(context.Background(), statement)
+	if err == nil {
+		_, err = prepared.Exec(context.Background(), values)
+	}
+	if prepared != nil {
+		err = errors.Join(err, prepared.Close())
+	}
+	return err
+}
+
+func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
+	path, database, binding, local := prepareReplicatedTestRoot(t, "bound", false)
+	identity, err := database.BindReplicatedShardStore(binding, "docs")
+	if err != nil {
+		t.Fatalf("BindReplicatedShardStore: %v", err)
+	}
+	if identity.Format != ReplicatedShardStoreFormat || identity.LogID != local.LogID ||
+		identity.Binding != binding || identity.UserTable != "docs" ||
+		len(identity.UserStorage) != storageIdentityBytes*2 || identity.UserPrimaryKey != "/id" {
+		t.Fatalf("bound identity = %+v, local = %+v", identity, local)
+	}
+	if retried, err := database.BindReplicatedShardStore(binding, "docs"); err != nil || retried != identity {
+		t.Fatalf("exact bind retry = %+v, %v; want %+v", retried, err, identity)
+	}
+	if got, err := database.RequireReplicatedShardStore(identity); err != nil || got != identity {
+		t.Fatalf("RequireReplicatedShardStore = %+v, %v", got, err)
+	}
+	if _, err := database.ShardStoreIdentity(); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("legacy ShardStoreIdentity = %v, want direct fence", err)
+	}
+	if _, err := database.RequireShardStore(local.Binding()); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("legacy RequireShardStore = %v, want direct fence", err)
+	}
+	if _, err := database.ClaimShardStoreServing(local.Binding(), ShardStoreFence{
+		OwnershipEpoch: 1, RoutingVersion: 1,
+	}); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("legacy ClaimShardStoreServing = %v, want direct fence", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close bound root: %v", err)
+	}
+
+	if _, err := Open(path); !errors.Is(err, ErrShardStoreIdentityMismatch) {
+		t.Fatalf("generic Open = %v, want shard identity mismatch", err)
+	}
+	if _, err := OpenShardStore(path, local.Binding()); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("OpenShardStore = %v, want direct fence", err)
+	}
+	if _, err := InitializeShardStore(path, local.Binding()); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("InitializeShardStore retry = %v, want direct fence", err)
+	}
+
+	mismatches := []struct {
+		name   string
+		mutate func(*ReplicatedShardStoreIdentity)
+	}{
+		{"sql_log_id", func(i *ReplicatedShardStoreIdentity) { i.LogID[0] ^= 0x40 }},
+		{"wal_store_id", func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0] ^= 0x40 }},
+		{"authority", func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.RouteGeneration++ }},
+		{"storage", func(i *ReplicatedShardStoreIdentity) {
+			if i.UserStorage[0] == '0' {
+				i.UserStorage = "1" + i.UserStorage[1:]
+			} else {
+				i.UserStorage = "0" + i.UserStorage[1:]
+			}
+		}},
+		{"primary", func(i *ReplicatedShardStoreIdentity) { i.UserPrimaryKey = "/other" }},
+		{"limits", func(i *ReplicatedShardStoreIdentity) { i.UserLimits.MaxBatchBytes-- }},
+	}
+	for _, test := range mismatches {
+		t.Run("mismatch_"+test.name, func(t *testing.T) {
+			expected := identity
+			test.mutate(&expected)
+			if _, err := OpenReplicatedShardStore(path, expected); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+				t.Fatalf("OpenReplicatedShardStore = %v, want identity mismatch", err)
+			}
+		})
+	}
+
+	reopened, err := OpenReplicatedShardStore(path, identity)
+	if err != nil {
+		t.Fatalf("OpenReplicatedShardStore exact: %v", err)
+	}
+	// Model a trusted replicated apply below the SQL surface, then prove reopen
+	// validates the frozen profile without incorrectly requiring the table to
+	// remain empty forever.
+	if _, err := reopened.connector.db.tables["docs"].collection.Put(
+		[]byte("applied"), []byte(`{"id":"applied"}`),
+	); err != nil {
+		t.Fatalf("trusted test apply: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close after trusted test apply: %v", err)
+	}
+	reopened, err = OpenReplicatedShardStore(path, identity)
+	if err != nil {
+		t.Fatalf("reopen replicated root with rows: %v", err)
+	}
+	defer reopened.Close()
+	session, err := reopened.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("NewSession replicated: %v", err)
+	}
+	defer session.Close()
+
+	selectRows, err := session.Prepare(context.Background(), `SELECT COUNT(*) FROM docs`)
+	if err != nil {
+		t.Fatalf("prepare replicated read: %v", err)
+	}
+	cursor, err := selectRows.Query(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("replicated read: %v", err)
+	}
+	if !cursor.Next() {
+		t.Fatal("replicated read returned no row")
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := selectRows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	writes := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"insert", `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"a"}`)}},
+		{"update", `UPDATE docs SET "$doc" = ? WHERE id = ?`, []any{[]byte(`{"id":"a"}`), "a"}},
+		{"delete", `DELETE FROM docs WHERE id = ?`, []any{"a"}},
+		{"create_table", `CREATE TABLE other (PRIMARY KEY (id))`, nil},
+		{"drop_table", `DROP TABLE docs`, nil},
+		{"truncate", `TRUNCATE docs`, nil},
+		{"create_index", `CREATE INDEX by_id ON docs (id)`, nil},
+		{"drop_index", `DROP INDEX IF EXISTS by_id ON docs`, nil},
+		{"create_view", `CREATE VIEW selected AS SELECT id FROM docs`, nil},
+		{"drop_view", `DROP VIEW IF EXISTS selected`, nil},
+	}
+	for _, write := range writes {
+		t.Run("fence_"+write.name, func(t *testing.T) {
+			if err := testRuntimeExec(session, write.sql, write.args); !errors.Is(err, ErrDirectWriteFenced) {
+				t.Fatalf("%s = %v, want direct fence", write.sql, err)
+			}
+		})
+	}
+	returning, err := session.Prepare(context.Background(), `INSERT INTO docs VALUES (?) RETURNING id`)
+	if err != nil {
+		t.Fatalf("prepare RETURNING: %v", err)
+	}
+	if _, err := returning.Query(context.Background(), []any{[]byte(`{"id":"returning"}`)}); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("INSERT RETURNING = %v, want direct fence", err)
+	}
+	_ = returning.Close()
+	// EXPLAIN accepts query expressions only; mutations cannot enter its
+	// recursive ANALYZE path. The allowed control below proves that recursive
+	// read execution remains available in replicated mode.
+	analyze, err := session.Prepare(context.Background(),
+		`EXPLAIN ANALYZE SELECT id FROM docs`)
+	if err != nil {
+		t.Fatalf("prepare EXPLAIN ANALYZE read: %v", err)
+	}
+	analyzeRows, err := analyze.Query(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("EXPLAIN ANALYZE read: %v", err)
+	}
+	if !analyzeRows.Next() {
+		t.Fatal("EXPLAIN ANALYZE read returned no plan row")
+	}
+	_ = analyzeRows.Close()
+	_ = analyze.Close()
+	explain, err := session.Prepare(context.Background(), `EXPLAIN SELECT id FROM docs`)
+	if err != nil {
+		t.Fatalf("prepare plain EXPLAIN read: %v", err)
+	}
+	explainRows, err := explain.Query(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("plain EXPLAIN read: %v", err)
+	}
+	if !explainRows.Next() {
+		t.Fatal("plain EXPLAIN read returned no plan row")
+	}
+	_ = explainRows.Close()
+	_ = explain.Close()
+
+	if err := session.Begin(context.Background(), TxOptions{}); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("read-write Begin = %v, want direct fence", err)
+	}
+	if err := session.Begin(context.Background(), TxOptions{ReadOnly: true}); err != nil {
+		t.Fatalf("read-only Begin: %v", err)
+	}
+	if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"tx"}`)}); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("read-only transaction mutation = %v, want direct fence", err)
+	}
+	if err := session.Rollback(context.Background()); err != nil {
+		t.Fatalf("rollback read-only transaction: %v", err)
+	}
+	for _, isolation := range []struct {
+		name  string
+		level IsolationLevel
+	}{
+		{"read_committed", IsolationReadCommitted},
+		{"repeatable_read", IsolationRepeatableRead},
+		{"snapshot", IsolationSnapshot},
+		{"serializable", IsolationSerializable},
+	} {
+		t.Run("typed_read_only_"+isolation.name, func(t *testing.T) {
+			if err := session.Begin(context.Background(), TxOptions{
+				ReadOnly: true, Isolation: isolation.level,
+			}); err != nil {
+				t.Fatalf("Begin: %v", err)
+			}
+			read, err := session.Prepare(context.Background(), `SELECT COUNT(*) FROM docs`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := read.Query(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !rows.Next() {
+				t.Fatal("read-only transaction returned no row")
+			}
+			_ = rows.Close()
+			_ = read.Close()
+			if err := session.Commit(context.Background()); err != nil {
+				t.Fatalf("clean Commit: %v", err)
+			}
+		})
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// database/sql and its prepared-statement/transaction adapters retain the
+	// same typed fence; the runtime checks above are not a privileged path.
+	sqlDB := stdsql.OpenDB(reopened.connector)
+	if _, err := sqlDB.ExecContext(context.Background(),
+		`INSERT INTO docs VALUES (?)`, []byte(`{"id":"database-sql"}`),
+	); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("database/sql Exec = %v, want direct fence", err)
+	}
+	preparedSQL, err := sqlDB.PrepareContext(context.Background(),
+		`INSERT INTO docs VALUES (?)`)
+	if err != nil {
+		t.Fatalf("database/sql Prepare: %v", err)
+	}
+	if _, err := preparedSQL.ExecContext(context.Background(), []byte(`{"id":"prepared"}`)); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("database/sql prepared Exec = %v, want direct fence", err)
+	}
+	_ = preparedSQL.Close()
+	if _, err := sqlDB.BeginTx(context.Background(), nil); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("database/sql read-write Begin = %v, want direct fence", err)
+	}
+	readOnly, err := sqlDB.BeginTx(context.Background(), &stdsql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("database/sql read-only Begin: %v", err)
+	}
+	var count int64
+	if err := readOnly.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatalf("database/sql read-only SELECT: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("database/sql read-only count = %d, want 1", count)
+	}
+	if err := readOnly.Commit(); err != nil {
+		t.Fatalf("database/sql read-only Commit: %v", err)
+	}
+	for _, isolation := range []struct {
+		name  string
+		level stdsql.IsolationLevel
+	}{
+		{"read_committed", stdsql.LevelReadCommitted},
+		{"repeatable_read", stdsql.LevelRepeatableRead},
+		{"serializable", stdsql.LevelSerializable},
+	} {
+		t.Run("database_sql_read_only_"+isolation.name, func(t *testing.T) {
+			tx, err := sqlDB.BeginTx(context.Background(), &stdsql.TxOptions{
+				ReadOnly: true, Isolation: isolation.level,
+			})
+			if err != nil {
+				t.Fatalf("BeginTx: %v", err)
+			}
+			var got int64
+			if err := tx.QueryRowContext(context.Background(),
+				`SELECT COUNT(*) FROM docs`).Scan(&got); err != nil {
+				t.Fatalf("SELECT: %v", err)
+			}
+			if got != 1 {
+				t.Fatalf("count = %d, want 1", got)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("clean Commit: %v", err)
+			}
+		})
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
+	t.Run("definite", func(t *testing.T) {
+		_, db, binding, _ := prepareReplicatedTestRoot(t, "definite", false)
+		defer db.Close()
+		injected := errors.New("definite bind publication failure")
+		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
+			return false, injected
+		})
+		if !errors.Is(err, injected) || identity != (ReplicatedShardStoreIdentity{}) {
+			t.Fatalf("definite bind = %+v, %v", identity, err)
+		}
+		if _, err := db.ReplicatedShardStoreIdentity(); !errors.Is(err, ErrReplicatedShardStoreUnbound) {
+			t.Fatalf("identity after definite failure = %v", err)
+		}
+		session, err := db.NewSession(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"still-local"}`)}); err != nil {
+			t.Fatalf("local write after definite failure: %v", err)
+		}
+	})
+
+	t.Run("unknown_hook_same_process_exact_retry", func(t *testing.T) {
+		_, db, binding, _ := prepareReplicatedTestRoot(t, "unknown-hook", false)
+		defer db.Close()
+		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
+			return false, durable.ErrCommitOutcomeUnknown
+		})
+		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || identity == (ReplicatedShardStoreIdentity{}) {
+			t.Fatalf("unknown hook bind = %+v, %v", identity, err)
+		}
+		retried, err := db.BindReplicatedShardStore(binding, "docs")
+		if err != nil || retried != identity {
+			t.Fatalf("unknown hook exact retry = %+v, %v; want %+v", retried, err, identity)
+		}
+	})
+
+	t.Run("rename_then_directory_fence_unknown", func(t *testing.T) {
+		path, database, binding, local := prepareReplicatedTestRoot(t, "unknown", true)
+		injected := errors.New("directory fence failure")
+		core := database.connector.db
+		core.syncDir = func(string) error { return injected }
+		identity, err := database.BindReplicatedShardStore(binding, "docs")
+		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, injected) ||
+			identity == (ReplicatedShardStoreIdentity{}) {
+			t.Fatalf("unknown bind = %+v, %v", identity, err)
+		}
+		core.syncDir = nil
+		if err := database.Close(); err != nil {
+			t.Fatalf("close unknown-outcome root: %v", err)
+		}
+		wrongLogID := local.LogID
+		wrongLogID[0] ^= 0x80
+		if _, _, err := OpenReplicatedShardStoreForSettlement(
+			path, binding, wrongLogID, "docs",
+		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			t.Fatalf("settlement with wrong retained LogID = %v", err)
+		}
+		if _, _, err := OpenReplicatedShardStoreForSettlement(
+			path, binding, local.LogID, "other",
+		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			t.Fatalf("settlement with wrong intended table = %v", err)
+		}
+		wrongBinding := binding
+		wrongBinding.Authority.SchemaGeneration++
+		if _, _, err := OpenReplicatedShardStoreForSettlement(
+			path, wrongBinding, local.LogID, "docs",
+		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			t.Fatalf("settlement with wrong WAL binding = %v", err)
+		}
+		recoveryCalls := 0
+		if _, err := openDatabaseWithShardStorePolicy(path, func(string) error {
+			recoveryCalls++
+			return errors.New("recovery must not run")
+		}, shardStoreOpenPolicy{
+			mode:                        shardStoreOpenReplicatedSettlement,
+			expectedReplicated:          ReplicatedShardStoreIdentity{Binding: wrongBinding},
+			expectedReplicatedLogID:     local.LogID,
+			expectedReplicatedUserTable: "docs",
+		}); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			t.Fatalf("private wrong-binding settlement = %v", err)
+		}
+		if recoveryCalls != 0 {
+			t.Fatalf("wrong settlement identity reached %d recovery fence(s)", recoveryCalls)
+		}
+		reopened, settled, err := OpenReplicatedShardStoreForSettlement(
+			path, binding, local.LogID, "docs",
+		)
+		if err != nil {
+			t.Fatalf("settlement reopen without full return identity: %v", err)
+		}
+		if settled != identity {
+			t.Fatalf("settled identity = %+v, want proposed %+v", settled, identity)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
+	t.Run("schemaful_preflight_has_no_materialization_side_effect", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "schema.vdb")
+		binding := testReplicatedBinding(41)
+		database, err := InitializeShardStore(path, ShardStoreBinding{
+			Distribution:         distribution.DistributionName(binding.Distribution),
+			Shard:                distribution.ShardID(binding.Shard),
+			AllocationGeneration: distribution.ShardAllocationGeneration(binding.AllocationGeneration),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer database.Close()
+		session, _ := database.NewSession(context.Background())
+		if err := testRuntimeExec(session, `CREATE TABLE docs (id STRING PRIMARY KEY)`, nil); err != nil {
+			t.Fatal(err)
+		}
+		_ = session.Close()
+		if database.connector.db.tables["docs"].collection != nil {
+			t.Fatal("test table unexpectedly materialized")
+		}
+		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+			t.Fatalf("schemaful bind = %v", err)
+		}
+		if database.connector.db.tables["docs"].collection != nil {
+			t.Fatal("rejected bind materialized schemaful table")
+		}
+	})
+
+	t.Run("nonempty", func(t *testing.T) {
+		_, database, binding, _ := prepareReplicatedTestRoot(t, "nonempty", false)
+		defer database.Close()
+		session, _ := database.NewSession(context.Background())
+		if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"occupied"}`)}); err != nil {
+			t.Fatal(err)
+		}
+		_ = session.Close()
+		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+			t.Fatalf("nonempty bind = %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, *Session)
+	}{
+		{"multiple_tables", func(t *testing.T, session *Session) {
+			if err := testRuntimeExec(session, `CREATE TABLE other (PRIMARY KEY (id))`, nil); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"index", func(t *testing.T, session *Session) {
+			if err := testRuntimeExec(session, `CREATE INDEX by_id ON docs (id)`, nil); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"view", func(t *testing.T, session *Session) {
+			if err := testRuntimeExec(session, `CREATE VIEW selected AS SELECT id FROM docs`, nil); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, database, binding, _ := prepareReplicatedTestRoot(t, test.name, false)
+			defer database.Close()
+			session, err := database.NewSession(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, session)
+			if err := session.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+				t.Fatalf("bind with %s = %v, want profile error", test.name, err)
+			}
+		})
+	}
+
+	t.Run("prior_local_serving_fence", func(t *testing.T) {
+		_, database, binding, local := prepareReplicatedTestRoot(t, "served", false)
+		defer database.Close()
+		claim, err := database.ClaimShardStoreServing(local.Binding(), ShardStoreFence{
+			OwnershipEpoch: 1, RoutingVersion: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := claim.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreBusy) {
+			t.Fatalf("bind after local serving = %v, want Busy", err)
+		}
+	})
+
+	t.Run("connect_race", func(t *testing.T) {
+		_, database, binding, _ := prepareReplicatedTestRoot(t, "race", false)
+		defer database.Close()
+		type bindResult struct {
+			identity ReplicatedShardStoreIdentity
+			err      error
+		}
+		connectResult := make(chan struct {
+			session *Session
+			err     error
+		}, 1)
+		bindResults := make(chan bindResult, 1)
+		database.connector.mu.Lock()
+		go func() {
+			session, err := database.NewSession(context.Background())
+			connectResult <- struct {
+				session *Session
+				err     error
+			}{session, err}
+		}()
+		go func() {
+			identity, err := database.BindReplicatedShardStore(binding, "docs")
+			bindResults <- bindResult{identity, err}
+		}()
+		database.connector.mu.Unlock()
+		connected := <-connectResult
+		bound := <-bindResults
+		if connected.err != nil {
+			t.Fatalf("racing Connect: %v", connected.err)
+		}
+		if bound.err == nil {
+			if !connected.session.conn.directWritesFenced {
+				t.Fatal("bind-first connection did not inherit direct-write fence")
+			}
+			if err := testRuntimeExec(connected.session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"race"}`)}); !errors.Is(err, ErrDirectWriteFenced) {
+				t.Fatalf("bind-first racing session write = %v", err)
+			}
+		} else {
+			if !errors.Is(bound.err, ErrReplicatedShardStoreBusy) {
+				t.Fatalf("session-first bind = %v, want Busy", bound.err)
+			}
+			if connected.session.conn.directWritesFenced {
+				t.Fatal("session-first connection unexpectedly fenced before bind")
+			}
+		}
+		if err := connected.session.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if bound.err != nil {
+			if _, err := database.BindReplicatedShardStore(binding, "docs"); err != nil {
+				t.Fatalf("bind after racing session close: %v", err)
+			}
+		}
+	})
+}
+
+func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
+	identity := ReplicatedShardStoreIdentity{
+		Format:    ReplicatedShardStoreFormat,
+		Binding:   testReplicatedBinding(77),
+		LogID:     [16]byte{0xab, 1},
+		UserTable: "docs", UserStorage: strings.Repeat("a", storageIdentityBytes*2),
+		UserPrimaryKey: "/id",
+		UserLimits: ReplicatedShardStoreLimits{
+			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
+			MaxBatchDocuments: 64, MaxBatchBytes: 16 << 20,
+		},
+	}
+	raw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, new(ReplicatedShardStoreIdentity)); err != nil {
+		t.Fatalf("valid decode: %v", err)
+	}
+	cases := map[string][]byte{
+		"unknown":         append([]byte(`{"unknown":1,`), raw[1:]...),
+		"duplicate":       []byte(strings.Replace(string(raw), `"format":1`, `"format":1,"format":1`, 1)),
+		"missing":         []byte(strings.Replace(string(raw), `"format":1,`, ``, 1)),
+		"null":            []byte(`null`),
+		"uppercase_hex":   []byte(strings.Replace(string(raw), `"log_id":"ab`, `"log_id":"AB`, 1)),
+		"binding_unknown": []byte(strings.Replace(string(raw), `"binding":{`, `"binding":{"unknown":1,`, 1)),
+		"authority_duplicate": []byte(strings.Replace(string(raw),
+			`"authority":{"active_policy_generation":11`,
+			`"authority":{"active_policy_generation":11,"active_policy_generation":11`, 1)),
+		"limits_unknown": []byte(strings.Replace(string(raw), `"user_limits":{`, `"user_limits":{"unknown":1,`, 1)),
+	}
+	for name, image := range cases {
+		t.Run(name, func(t *testing.T) {
+			var decoded ReplicatedShardStoreIdentity
+			if err := json.Unmarshal(image, &decoded); err == nil {
+				t.Fatalf("accepted noncanonical image: %s", image)
+			}
+		})
+	}
+	reserved := identity.Binding
+	reserved.MemberID = ^uint64(0)
+	if err := validateReplicatedShardStoreBinding(reserved); err == nil {
+		t.Fatal("accepted reserved local-message member id")
+	}
+}
+
+func TestReplicatedCatalogStrictRootAndProfileDecode(t *testing.T) {
+	mutations := []struct {
+		name string
+		edit func(string) string
+		want error
+	}{
+		{"unknown_root", func(raw string) string { return `{"unknown":1,` + raw[1:] }, nil},
+		{"duplicate_root", func(raw string) string {
+			return strings.Replace(raw, `"version": 0`, `"version": 0,
+  "version": 0`, 1)
+		}, nil},
+		{"profile_primary", func(raw string) string {
+			return strings.Replace(raw, `"user_primary_key": "/id"`, `"user_primary_key": "/other"`, 1)
+		}, ErrReplicatedShardStoreProfile},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			path, database, binding, _ := prepareReplicatedTestRoot(t, mutation.name, false)
+			identity, err := database.BindReplicatedShardStore(binding, "docs")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := mutation.edit(string(raw))
+			if changed == string(raw) {
+				t.Fatal("catalog mutation pattern did not match")
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err = OpenReplicatedShardStore(path, identity)
+			if err == nil {
+				t.Fatal("corrupt catalog opened")
+			}
+			if mutation.want != nil && !errors.Is(err, mutation.want) {
+				t.Fatalf("corrupt catalog = %v, want %v", err, mutation.want)
+			}
+		})
+	}
+}
+
+func TestPrimaryOnlySQLTableHasSchemaFreeDurableProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema-free.vdb")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testRuntimeExec(session, `CREATE TABLE docs (PRIMARY KEY (id))`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if table := database.connector.db.tables["docs"]; table == nil || table.schema != nil || table.meta.Schema != nil {
+		t.Fatalf("primary-only table durable schema = %+v", table)
+	}
+	for _, document := range []string{`{"value":1}`, `{"id":null}`, `{"id":{}}`} {
+		if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(document)}); err == nil {
+			t.Fatalf("primary-only table accepted invalid key document %s", document)
+		}
+	}
+	if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"valid","extra":true}`)}); err != nil {
+		t.Fatalf("schema-free primary table rejected flexible document: %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if table := reopened.connector.db.tables["docs"]; table.schema != nil || table.collection.HasSchema() {
+		t.Fatal("schema-free primary table reopened with a durable schema")
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicatedDirtyCommitDefense(t *testing.T) {
+	_, database, _, _ := prepareReplicatedTestRoot(t, "dirty-commit", true)
+	defer database.Close()
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := session.Begin(context.Background(), TxOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := testRuntimeExec(session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"staged"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	session.conn.directWritesFenced = true
+	if err := session.Commit(context.Background()); !errors.Is(err, ErrDirectWriteFenced) {
+		t.Fatalf("dirty Commit = %v, want direct fence", err)
+	}
+	session.conn.directWritesFenced = false
+	if got := database.connector.db.tables["docs"].collection.Len(); got != 0 {
+		t.Fatalf("dirty fenced Commit published %d rows", got)
+	}
+}
+
+func TestReplicatedSeparatelyPreparedRootRequiresRetainedSQLIdentity(t *testing.T) {
+	binding := testReplicatedBinding(91)
+	bindRoot := func(name string) (string, ReplicatedShardStoreIdentity) {
+		path := filepath.Join(t.TempDir(), name+".vdb")
+		database, err := InitializeShardStore(path, ShardStoreBinding{
+			Distribution:         distribution.DistributionName(binding.Distribution),
+			Shard:                distribution.ShardID(binding.Shard),
+			AllocationGeneration: distribution.ShardAllocationGeneration(binding.AllocationGeneration),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, sessionErr := database.NewSession(context.Background())
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		if err := testRuntimeExec(session, `CREATE TABLE docs (PRIMARY KEY (id))`, nil); err != nil {
+			t.Fatal(err)
+		}
+		_ = session.Close()
+		identity, err := database.BindReplicatedShardStore(binding, "docs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return path, identity
+	}
+	firstPath, first := bindRoot("first")
+	secondPath, second := bindRoot("second")
+	if first.LogID == second.LogID && first.UserStorage == second.UserStorage {
+		t.Fatal("separately prepared roots unexpectedly share both SQL identities")
+	}
+	if _, err := OpenReplicatedShardStore(secondPath, first); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		t.Fatalf("second root under first identity = %v", err)
+	}
+	opened, err := OpenReplicatedShardStore(firstPath, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err = OpenReplicatedShardStore(secondPath, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicatedBindingAcceptsByteIdenticalSQLRootCopy(t *testing.T) {
+	path, database, binding, _ := prepareReplicatedTestRoot(t, "original", false)
+	identity, err := database.BindReplicatedShardStore(binding, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clonePath := filepath.Join(t.TempDir(), "clone.vdb")
+	copyReplicatedTestPath(t, path, clonePath)
+	copyReplicatedTestPath(t, path+".tables", clonePath+".tables")
+
+	clone, err := OpenReplicatedShardStore(clonePath, identity)
+	if err != nil {
+		t.Fatalf("exact byte-copied SQL root was distinguishable: %v", err)
+	}
+	if err := clone.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func copyReplicatedTestPath(t testing.TB, source, destination string) {
+	t.Helper()
+	info, err := os.Lstat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IsDir() {
+		if err := os.Mkdir(destination, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			copyReplicatedTestPath(t,
+				filepath.Join(source, entry.Name()),
+				filepath.Join(destination, entry.Name()),
+			)
+		}
+		return
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("copy fixture %s is not a regular file", source)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		_ = input.Close()
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(output, input)
+	copyErr = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+}

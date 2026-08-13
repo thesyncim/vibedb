@@ -1004,6 +1004,11 @@ func (t *tx) execMutationCore(
 	if t.done {
 		return nil, errors.New("vibedb: transaction is finished")
 	}
+	// Replicated mode takes precedence over read-only and DDL classification so
+	// every direct DML/DDL/RETURNING attempt has one typed refusal.
+	if err := t.conn.requireDirectWriteAllowed(); err != nil {
+		return nil, err
+	}
 	if t.readOnly {
 		return nil, ErrReadOnlyTransaction
 	}
@@ -1876,6 +1881,9 @@ func (t *tx) Commit() error {
 	dirtyNames := t.dirtyTableNames()
 	if len(dirtyNames) == 0 {
 		return nil
+	}
+	if err := t.conn.requireDirectWriteAllowed(); err != nil {
+		return err
 	}
 	t.releaseSnapshots()
 

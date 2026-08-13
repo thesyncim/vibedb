@@ -143,7 +143,7 @@ func (m *NativeMapper) Admits(prefixLen int, values []Scalar) error {
 	}
 	var buf [64]byte
 	for i := range values {
-		if _, err := appendScalarV1(buf[:0], values[i]); err != nil {
+		if _, err := appendScalar(buf[:0], values[i]); err != nil {
 			return &ShardValueError{Reason: "value is not an encodable placement scalar"}
 		}
 	}
@@ -220,7 +220,7 @@ func (m *NativeMapper) mapToPoint(values []Scalar) (KeyspacePoint, bool, error) 
 	var p KeyspacePoint
 	var buf [64]byte
 	for i := range values {
-		b, err := appendScalarV1(buf[:0], values[i])
+		b, err := appendScalar(buf[:0], values[i])
 		if err != nil {
 			return KeyspacePoint{}, false, &ShardValueError{Reason: "value is not an encodable placement scalar"}
 		}

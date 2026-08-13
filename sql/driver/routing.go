@@ -33,7 +33,7 @@ type placementBinding struct {
 // cluster configuration, reporting false when the table is unplaced. It compiles
 // one shard-key pointer per placement column and selects the frozen native
 // mapper for the distribution's arity. The zero-value RoutePolicy is fail-closed
-// (targeted routes only), the correct default for version 1 single-shard writes.
+// (targeted routes only), the correct default for current single-shard writes.
 func newPlacementBinding(cfg distribution.ClusterConfig, table string) (*placementBinding, bool, error) {
 	placement, ok := cfg.Placement(table)
 	if !ok {
@@ -530,9 +530,8 @@ func (s *insertPreflightState) add(
 // insertPreflight routes every row of an insert to its physical shard, mapping
 // all rows before any dispatch, and returns the single target route. Rows that
 // do not all resolve to the same one shard return ErrCrossShardWrite; no row is
-// dispatched, matching version 1's single-target-shard rule.
-func insertPreflight(binding *placementBinding, router *distribution.Router, documents [][]byte) (distribution.Route, error) {
-	_ = router // retained for source compatibility; full placed keys route directly.
+// dispatched, matching the current single-target-shard rule.
+func insertPreflight(binding *placementBinding, documents [][]byte) (distribution.Route, error) {
 	var state insertPreflightState
 	for idx, document := range documents {
 		if err := state.add(binding, document, idx); err != nil {
@@ -551,7 +550,7 @@ func insertPreflight(binding *placementBinding, router *distribution.Router, doc
 }
 
 // singleShardRoute binds a placed update or delete predicate and requires it to
-// resolve to exactly one physical shard, as version 1 demands. A RouteEmpty (no
+// resolve to exactly one physical shard. A RouteEmpty (no
 // matching rows) is accepted as a no-op. An unknown, targeted multi-shard, or
 // scatter route returns ErrScatterWrite before any dispatch.
 func singleShardRoute(prog *constraintProgram, router *distribution.Router, args []any) (distribution.Route, error) {

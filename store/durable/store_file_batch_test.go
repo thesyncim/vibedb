@@ -39,6 +39,50 @@ func openBatchCollection(t *testing.T, options Options) (*Collection, *os.File) 
 	return collection, file
 }
 
+func TestCollectionHasSchemaReportsSealedDefinition(t *testing.T) {
+	if (*Collection)(nil).HasSchema() {
+		t.Fatal("nil collection reports a schema")
+	}
+	plain, _ := openBatchCollection(t, testBatchOptions(2))
+	if plain.HasSchema() {
+		t.Fatal("schema-free collection reports a schema")
+	}
+	options := testBatchOptions(2)
+	options.Collection.Schema = testDurableStoreSchema(t)
+	withSchema, _ := openBatchCollection(t, options)
+	if !withSchema.HasSchema() {
+		t.Fatal("schema-bound collection reports no schema")
+	}
+}
+
+func TestCollectionReplicationCapabilitiesReportSealedDefinition(t *testing.T) {
+	if (*Collection)(nil).HasIndexes() ||
+		(*Collection)(nil).HasSynchronousDurability() {
+		t.Fatal("nil collection reports a replication-safe capability")
+	}
+	plain, _ := openBatchCollection(t, testBatchOptions(2))
+	if plain.HasIndexes() || !plain.HasSynchronousDurability() {
+		t.Fatalf("plain capabilities = indexes:%v synchronous:%v",
+			plain.HasIndexes(), plain.HasSynchronousDurability())
+	}
+
+	indexedOptions := testBatchOptions(2)
+	indexedOptions.Indexes = []store.IndexDefinition{{
+		Name: "by_v", Paths: []string{"/v"},
+	}}
+	indexed, _ := openBatchCollection(t, indexedOptions)
+	if !indexed.HasIndexes() {
+		t.Fatal("indexed collection reports no indexes")
+	}
+
+	asyncOptions := testBatchOptions(2)
+	asyncOptions.Durability = DurabilityAsyncVisible
+	async, _ := openBatchCollection(t, asyncOptions)
+	if async.HasSynchronousDurability() {
+		t.Fatal("asynchronous collection reports synchronous durability")
+	}
+}
+
 // TestCollectionUpdateMaintainsIndexedPrimaryAtomically pins the public batch
 // contract for indexed collections: primary rows and exact postings move in one
 // publication, while a snapshot retained before the batch keeps the old pair.

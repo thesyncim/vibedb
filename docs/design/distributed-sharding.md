@@ -1,7 +1,8 @@
 # Distributed sharding and replication
 
-**Status:** future design; contract and qualification plan only. No network
-routing, replica protocol, distributed ownership, or cross-shard guarantee is
+**Status:** future serving design. A bounded non-serving in-process Raft member
+runtime and Multi-Raft host exist, but no network transport, client routing,
+serving replica protocol, distributed ownership, or cross-shard guarantee is
 implemented today.
 
 **Idea:** place independent durable collections behind stateless routers, give
@@ -23,7 +24,13 @@ writer authority, and adds optional failover, by replicating each shard with
 one embedded Raft group, multiplexed by a Multi-Raft scheduler, using a pinned
 and audited version of [`etcd-io/raft`](https://github.com/etcd-io/raft); Raft
 is the chosen implementation, not a hard prerequisite for sharding or for
-running a shard leader-only. A shard may instead run leader-only under a
+running a shard leader-only. A one-range deployment registers one Runtime and
+one group in the same Host path used at larger scale. Range splits create
+additional independent groups; they do not extend one global consensus log
+across independently writable ranges. The bounded Host schedules only runnable
+groups and a dormant range can be removed to reclaim its slot, while topology
+authorization and split generation fencing remain later serving contracts. A
+shard may instead run leader-only under a
 statically configured ownership epoch and no replication protocol at all (see
 [Ownership, fencing, and failover](#ownership-fencing-and-failover)), and adopt
 Raft later without a placement or routing change. Vibedb implements the
@@ -1803,23 +1810,41 @@ range workflows, and Phase 6 adds autonomous protection and placement.
 
 ### Phase 0 — contract and deterministic model
 
-Status: the prose contract exists; the executable specification and simulator
-are not implemented.
+Status: the first executable foundation is implemented. The pinned core,
+synchronous `Ready` driver, pure command/completion codecs, bounded logical
+store/state machine, canonical trace, and RF1/RF3 crash/network simulator are
+present. Protection-policy transitions, range workflows, topology revision
+refinement, snapshot/WAL behavior, exhaustive history generation, and the full
+gate below remain open; Phase 0 is therefore not complete.
 
 - Freeze the terms, failure model, acknowledgement point, and unsupported
   operations.
 - Select, pin, license-audit, and threat-model one production Raft core. Record
-  every configuration option and unsupported extension.
+  every configuration option and unsupported extension. **Done for the core
+  selection and configuration:** see [Raft core selection and threat
+  model](raft-core-selection.md); executable integration qualification remains
+  part of this phase's gate.
 - Build an executable model of the integration boundary: `Ready` persistence,
   outbound messages, committed apply/publication, `ReadIndex`, snapshots,
   configuration changes, active/pending protection policy, verifier
   certificates, `OperationEpoch`, completion GC, range fences, and topology
   revisions.
+  **Foundation present:** `Ready`, outbound-message, committed-entry,
+  publication, `ReadIndex`, configuration, crash/restart, and logical snapshot
+  ports are executable. Configuration context/topology authorization,
+  duplicate command re-proposal, frozen completion-table integration, verified
+  snapshot data, and the policy/range/topology portions remain open.
 - Build a seeded deterministic simulator that runs the production state
   machine model, storage adapter, transport, timers, and workflow model under
   process, network, disk, clock, and topology faults. Each later phase plugs
   its production components into the same harness and adds trace-refinement
   checks.
+  **Foundation present:** event order, logical time, scenario identity,
+  message loss/duplication/reordering, partitions, logical disk outcomes, and
+  process restart are byte-replayable from a complete canonical trace around
+  the actual pinned core. Deterministic RNG and queue primitives exist, but a
+  package-level seed-to-trace runner, physical WAL/snapshot faults, and
+  production component refinement remain follow-ups.
 - Prove or model-check one leader per term, committed-entry retention,
   configuration quorum overlap, range-fence exclusivity, profile contracts,
   and linearizable current reads.
@@ -1830,8 +1855,9 @@ termination only under the declared liveness assumptions: an eventually
 synchronous healed network, fair scheduling, bounded healthy-disk I/O, no
 continuing configuration or range change, and one stable quorum for the
 required interval. Every simulator failure is exactly replayable from its
-seed. Later implementation phases must show that production traces refine the
-model at the named protocol boundaries.
+complete trace; seed-only regeneration remains an open Phase-0 gate. Later
+implementation phases must show that production traces refine the model at the
+named protocol boundaries.
 
 ### Phase 1 — durable Raft substrate
 
@@ -2202,11 +2228,12 @@ coordination disappear.
 
 ## References and precedent
 
-These sources inform the architecture. `etcd-io/raft` is the selected
-protocol-core dependency candidate; the papers are not invitations to create
-another consensus implementation. Adaptive replication, placement, and repair
-all have close prior art, so this design claims only a proposed combination,
-not "the first," without a formal literature and patent review:
+These sources inform the architecture. `etcd-io/raft` is the selected and
+[pinned protocol-core dependency](raft-core-selection.md); the papers are not
+invitations to create another consensus implementation. Adaptive replication,
+placement, and repair all have close prior art, so this design claims only a
+proposed combination, not "the first," without a formal literature and patent
+review:
 
 - [PacificA](https://www.microsoft.com/en-us/research/wp-content/uploads/2008/02/tr-2008-25.pdf)
   describes a primary/backup replicated log coordinated by an external

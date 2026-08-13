@@ -1,20 +1,19 @@
-# Placement scalar and tuple codec — wire format, version 1
+# Placement scalar and tuple codec
 
-This document specifies the byte format `distribution.V1` (`TupleVersion1`)
+This document specifies the byte format `distribution.CurrentTupleCodec`
 produces, precisely enough that an independent implementation can reproduce
-byte-for-byte identical output from the same logical input. The Go source
-under `distribution/` (`scalar.go`, `tuple.go`, `decimal.go`) is the
-authoritative implementation; this document and the committed golden vectors
-at `distribution/testdata/tuple_v1_vectors.txt` are the portable
-specification of what that implementation must keep producing.
+byte-for-byte identical output from the same logical input. The Go source under
+`distribution/` (`scalar.go`, `tuple.go`, `decimal.go`) is the authoritative
+implementation; this document and the committed golden vectors at
+`distribution/testdata/tuple_vectors.txt` are the portable specification of
+what that implementation must keep producing.
 
 This format is placement identity: two callers that reach the same encoded
-bytes for the same shard key must resolve to the same shard, forever, across
-processes, languages, and time. **Version 1 is frozen.** A change to any rule
-below is not a bug fix to this format — it is a new tuple version, with its
-own tag space, its own golden vectors, and its own design review. See
-`docs/design/vitess-compatible-routing.md`, PR 1a, for the change-control
-rules this freeze operates under.
+bytes for the same shard key must resolve to the same shard across processes
+and languages. The repository is unreleased and accepts one current contract.
+A change to any rule below must update the implementation, every dependent
+placement artifact, these golden vectors, and the design review together. See
+`docs/design/vitess-compatible-routing.md`, PR 1a, for the change-control rules.
 
 ## Scope
 
@@ -26,7 +25,7 @@ Two scalar kinds exist, and no others:
 | Number | an exact decimal value, free of float64 rounding |
 
 `Bool`, timestamp, `Any`, object, array, and nested/composite values are not
-part of version 1's scalar domain and have no encoding here.
+part of the scalar domain and have no encoding here.
 
 A **tuple** is an ordered, fixed-arity sequence of scalars — one per
 shard-key column, in column-declaration order.
@@ -37,7 +36,7 @@ shard-key column, in column-declaration order.
 | --- | --- |
 | `distribution/scalar.go` | `Scalar`, `ScalarKind`, `NewString`, `NewNumber` — the closed constructor surface |
 | `distribution/decimal.go` | JSON number spelling validation and canonical decomposition (frozen fork, no shared code with `query/decimal.go`) |
-| `distribution/tuple.go` | `TupleCodec`, `V1`, the tag/form bytes this document specifies, and the actual `Append*` logic |
+| `distribution/tuple.go` | `TupleCodec`, `CurrentTupleCodec`, the tag/form bytes this document specifies, and the actual `Append*` logic |
 | `distribution/errors.go` | `InvalidNumberError`, `UnsupportedScalarError` |
 
 ## Framing principle
@@ -68,15 +67,13 @@ at an arbitrary interior offset does *not* give you.
 
 The empty tuple (zero scalars) encodes to the empty byte string.
 
-## Tuple version is out-of-band
+## Tuple codec identity is out-of-band
 
-`TupleVersion` (a `uint32`, currently `TupleVersion1 = 1`) is never embedded
-inside the encoded bytes. It travels beside the bytes as explicit metadata
-(for example, alongside a stored `TablePlacement`) and is part of what makes
-two encoded byte strings comparable at all — bytes produced under different
-tuple versions are never compared to each other by this format, and a decoder
-(should one ever be built) must be told the version out of band before it can
-interpret a byte string.
+`TupleVersion` (a `uint32`, with the only accepted value named
+`CurrentTupleVersion`) is never embedded inside the encoded bytes. It travels
+beside the bytes as explicit metadata, for example alongside a stored
+`TablePlacement`, and must match the current codec before those bytes can be
+compared or interpreted. Only the current codec is accepted.
 
 ## Uvarint
 
@@ -97,10 +94,9 @@ two bytes `0xAC 0x02`.
 | `0x02` | Number scalar |
 
 `0x00` is reserved specifically so that a zero-filled buffer, or a
-short/truncated read that starts mid-record, is never misinterpreted as a
-valid version-1 scalar tag. (Version 1 ships no decoder — see "Non-goals"
-below — so this property is currently only defensive, not exercised by
-shipped code.)
+short/truncated read that starts mid-record, is never misinterpreted as a valid
+scalar tag. No decoder ships today—see "Non-goals" below—so this property is
+currently defensive rather than exercised by shipped code.
 
 ## String encoding
 
@@ -242,8 +238,8 @@ tuple_bytes = concat(scalar_bytes(v) for v in values)
 No arity byte, no total-length prefix, no separator. This is safe because of
 the framing principle above: every scalar's own encoding tells a reader
 exactly how many bytes it occupies, so scalars can be concatenated and later
-split apart unambiguously by whoever holds the version-1 layout rules
-(present or future), even though version 1 ships no such splitting code.
+split apart unambiguously by whoever holds the current layout rules, even
+though no such splitting code ships today.
 
 Two tuples of the same arity, column type sequence, and equal per-column
 values (under the equivalence classes above) produce byte-identical
@@ -258,14 +254,14 @@ length prefixes as `"a"`+`"bc"` even though the flattened payload bytes
 
 ## Non-goals and what this format does not guarantee
 
-- **No decoder ships in version 1.** Nothing above should be read as "there
+- **No decoder ships.** Nothing above should be read as "there
   is a `Decode` function" — there is not, by design (see PR 1a in
   `docs/design/vitess-compatible-routing.md`). The format is specified as
   self-delimiting because that is what makes tuple concatenation safe, not
   because a decoder exists today.
 - **Byte-equality is the only comparison this format defines.** It does not
   define an ordering between two Number or String encodings; a byte-lexical
-  comparison of two version-1 tuples is not claimed to match numeric or
+  comparison of two tuples is not claimed to match numeric or
   collated ordering. (Contrast with `internal/orderedkey`, which is a
   separate, order-preserving format for a different purpose and is
   explicitly not reused here — see "Provenance" below.)
@@ -284,15 +280,15 @@ The Number canonicalization algorithm (weight/digit decomposition, the
 prefix/middle/fill/tail representation of an arbitrary-precision weight
 magnitude) is an independent fork of the equivalent logic in
 `query/decimal.go` and `query/groupkey.go`, kept deliberately separate so
-that this frozen wire format cannot be perturbed by future changes to that
+that this placement format cannot be perturbed by future changes to that
 package's comparison or group-key logic. `distribution/decimal.go` imports
 nothing from `query` or `internal/orderedkey`.
 
 ## Conformance
 
-`distribution/testdata/tuple_v1_vectors.txt` is the committed, immutable
-golden-vector fixture for this format; `distribution/golden_vectors_test.go`
-loads it and checks every vector byte-for-byte against `distribution.V1`. A
+`distribution/testdata/tuple_vectors.txt` is the committed golden-vector
+fixture for this format; `distribution/golden_vectors_test.go` loads it and
+checks every vector byte-for-byte against `distribution.CurrentTupleCodec`. A
 mismatch there means either this document/implementation regressed, or the
 fixture was miscopied — either way, per the fixture's own header, it is a
 stop condition for design review, not something to patch by editing the

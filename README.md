@@ -316,7 +316,7 @@ Read the design before relying on any of it:
 
 - [Distributed sharding](docs/design/distributed-sharding.md)
 - [Vitess-compatible routing](docs/design/vitess-compatible-routing.md)
-- [Placement tuple format v1](docs/design/distribution-tuple-format-v1.md)
+- [Placement tuple format](docs/design/distribution-tuple-format.md)
 
 ## Performance
 

@@ -1,10 +1,10 @@
 package distribution
 
-// FuzzScalarEncoding drives the frozen v1 codec with arbitrary strings used
+// FuzzScalarEncoding drives the current codec with arbitrary strings used
 // two ways: as raw String scalar bytes (which NewString always accepts) and
 // as a candidate Number spelling (which NewNumber may reject). There is no
 // decoder to round-trip through — the design deliberately ships no Decode
-// API for version 1 — so the invariants checked here are the ones that
+// API, so the invariants checked here are the ones that
 // actually hold without one:
 //
 //   - neither constructor nor AppendScalar/AppendTuple ever panics;
@@ -56,11 +56,11 @@ func FuzzScalarEncoding(f *testing.F) {
 		if str.Kind() != KindString {
 			t.Fatalf("NewString(%q).Kind() = %v, want KindString", raw, str.Kind())
 		}
-		strBytes1, err := V1.AppendScalar(nil, str)
+		strBytes1, err := CurrentTupleCodec.AppendScalar(nil, str)
 		if err != nil {
 			t.Fatalf("AppendScalar(String(%q)) returned an error: %v", raw, err)
 		}
-		strBytes2, err := V1.AppendScalar(nil, str)
+		strBytes2, err := CurrentTupleCodec.AppendScalar(nil, str)
 		if err != nil || !bytes.Equal(strBytes1, strBytes2) {
 			t.Fatalf("AppendScalar(String(%q)) is nondeterministic: %x vs %x (err=%v)", raw, strBytes1, strBytes2, err)
 		}
@@ -79,11 +79,11 @@ func FuzzScalarEncoding(f *testing.F) {
 			}
 			return
 		}
-		numBytes1, err := V1.AppendScalar(nil, num)
+		numBytes1, err := CurrentTupleCodec.AppendScalar(nil, num)
 		if err != nil {
 			t.Fatalf("AppendScalar(Number(%q)) returned an error for a validated number: %v", numCandidate, err)
 		}
-		numBytes2, err := V1.AppendScalar(nil, num)
+		numBytes2, err := CurrentTupleCodec.AppendScalar(nil, num)
 		if err != nil || !bytes.Equal(numBytes1, numBytes2) {
 			t.Fatalf("AppendScalar(Number(%q)) is nondeterministic: %x vs %x (err=%v)", numCandidate, numBytes1, numBytes2, err)
 		}
@@ -93,7 +93,7 @@ func FuzzScalarEncoding(f *testing.F) {
 
 		// Self-delimiting framing: a 2-scalar tuple must be exactly the
 		// concatenation of each scalar's own encoding, in both orders.
-		tupleAB, err := V1.AppendTuple(nil, []Scalar{str, num})
+		tupleAB, err := CurrentTupleCodec.AppendTuple(nil, []Scalar{str, num})
 		if err != nil {
 			t.Fatalf("AppendTuple([String, Number]): %v", err)
 		}
@@ -102,7 +102,7 @@ func FuzzScalarEncoding(f *testing.F) {
 			t.Fatalf("AppendTuple([String(%q), Number(%q)]) = %x, want concatenation %x", raw, numCandidate, tupleAB, wantAB)
 		}
 
-		tupleBA, err := V1.AppendTuple(nil, []Scalar{num, str})
+		tupleBA, err := CurrentTupleCodec.AppendTuple(nil, []Scalar{num, str})
 		if err != nil {
 			t.Fatalf("AppendTuple([Number, String]): %v", err)
 		}
