@@ -113,14 +113,19 @@ expensive than CPU; a future workload class can replace those weights without
 changing rules.
 
 Search has independent hard limits for groups, expressions, rule applications,
-and physical alternatives. Cancellation is checked during exploration and
-top-down search. Exceeding a limit returns a typed error; the optimizer never
-silently publishes the best plan observed before truncation.
+physical alternatives, recursion depth, and deterministic memo payload bytes. The byte limit
+covers memo records, child edges, column identities, and unique-key runs, so a
+single wide expression cannot bypass the cardinality limits; Go map buckets and
+allocator slack remain indirectly bounded by the count limits. Cancellation is
+checked during exploration and top-down search. Exceeding a limit returns a
+typed error; the optimizer never silently publishes the best plan observed
+before truncation.
 
 `OptimizerStatistics` reports memo groups, expressions, rule applications,
-owned memo bytes, physical alternatives, property-cache hits, enforcer plans,
-memory rejections, and peak search depth. It deliberately excludes a clock;
-benchmarks time `Optimize` at the call boundary.
+accounted payload bytes, owned slice-capacity bytes, physical alternatives,
+property-cache hits, enforcer plans, memory rejections, and peak search depth.
+It deliberately excludes a clock; benchmarks time `Optimize` at the call
+boundary.
 
 ## Statistics
 
@@ -136,6 +141,7 @@ The compact representation is sparse and flat:
 | observed column | 64 bytes: path, NDV uncertainty, null rate, average width, skew/histogram runs |
 | most-common value | 16 bytes in a shared flat run |
 | histogram bucket | 24 bytes in a shared flat run |
+| optional physical partition | 40 bytes: table/shard identity and uncertain row count |
 | strings/scalars | one interned byte arena |
 
 Tables and columns are sorted and use allocation-free binary search. Heavy
@@ -145,7 +151,17 @@ slice header or allocation per column. Estimates carry central value, lower and
 upper bounds, and confidence in the hot compact form; lower bound and confidence
 use float32 slots so both 64-byte directory shapes remain unchanged. The
 distributed cost model uses the upper row and width bounds. Missing table
-statistics use conservative defaults.
+statistics use conservative defaults. JSON scalar statistics are canonicalized
+at publication, including exact numeric spelling variants, so `5`, `5.0`, and
+`50e-1` share one skew key.
+
+Optional per-shard row estimates prevent a targeted route from assuming rows
+are uniformly distributed. When every selected shard has an estimate, their
+upper bounds are summed; otherwise costing falls back to the whole-table upper
+bound. Shard-key equality and `IN` predicates consume heavy hitters and NDV
+intervals. Multiple key predicates use exponential backoff: the strongest is
+applied fully and each additional selectivity receives a successively smaller
+exponent, avoiding an unjustified full-independence assumption.
 
 Catalog save/load persists the cold statistics descriptors. Runtime feedback
 must be collected separately, validated, and published as a newer immutable
@@ -161,8 +177,9 @@ Go 1.26/Apple M4 Max baseline (not a cross-system performance claim) is:
 | --- | ---: | ---: | ---: |
 | table + column + heavy-hitter lookup, one table | about 14 ns | 0 | — |
 | same lookup in a 1,024-table catalog | about 36 ns | 0 | 154 bytes/table for one observed column and one heavy hitter |
-| fresh memo/rules/property search, two physical alternatives | about 1.6 µs | 4,296 bytes / 66 allocations including construction | 344 owned memo bytes |
-| build and validate that 1,024-table catalog | about 0.58 ms | cold publication path | compact result measured separately |
+| per-shard lookup in a 1,024-partition catalog | about 66 ns | 0 | 50 bytes/partition |
+| fresh memo/rules/property search, two physical alternatives | about 1.2 µs | 3,832 bytes / 33 allocations including construction | 352 owned memo bytes |
+| build and validate that 1,024-table catalog | about 1.2 ms | 5.77 MB / 25,644 allocations on the cold publication path | compact result measured separately |
 
 Run `go test ./planner -run '^$' -bench . -benchmem` on the target hardware.
 The scaled catalog benchmark separates the generation-publication build cost

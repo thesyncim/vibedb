@@ -48,6 +48,8 @@ func TestCompareCells(t *testing.T) {
 		{"int_equal_decimal_spelling", cell("1"), cell("1.0"), 0},
 		{"decimal", cell("1.5"), cell("1.25"), 1},
 		{"exact_beyond_float64", cell("9007199254740992"), cell("9007199254740993"), -1},
+		{"huge_exponent", cell("1e1000000000"), cell("9e999999999"), 1},
+		{"huge_negative_exponent", cell("1e-1000000000"), cell("9e-999999999"), -1},
 		{"negative", cell("-5"), cell("3"), -1},
 		{"null_before_number", nullCell(), cell("0"), -1},
 		{"explicit_null_equals_null_cell", nullCell(), cell("null"), 0},
@@ -229,5 +231,25 @@ func TestMergeAggregateNullAndMalformedStates(t *testing.T) {
 	bad.Rows = append(bad.Rows, []shardservice.Cell{cell("2")})
 	if _, _, err := mergeAggregateRows([]*shardservice.ShardResponse{bad}, []sqlast.AggKind{sqlast.AggCount}, 1024); !errors.Is(err, ErrMergeAggregate) {
 		t.Fatalf("malformed aggregate error = %v", err)
+	}
+	malformedExtrema := []*shardservice.ShardResponse{
+		aggregateResponse(cell("1"), cell("1"), cell("number-ish"), cell("1")),
+	}
+	if _, _, err := mergeAggregateRows(malformedExtrema, []sqlast.AggKind{
+		sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}, 1024); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("malformed extrema error = %v, want ErrMergeAggregate", err)
+	}
+}
+
+func TestMergeSumRejectsExponentExpansionBeforeBigArithmetic(t *testing.T) {
+	results := []*shardservice.ShardResponse{
+		aggregateResponse(cell("1"), cell("1e1000000000")),
+		aggregateResponse(cell("1"), cell("-1e1000000000")),
+	}
+	_, _, err := mergeAggregateRows(results,
+		[]sqlast.AggKind{sqlast.AggCount, sqlast.AggSum}, 1024)
+	if !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("merge error = %v, want ErrMergeAggregate", err)
 	}
 }

@@ -3,7 +3,6 @@ package planner
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"slices"
 	"unsafe"
 )
@@ -23,6 +22,11 @@ type Limits struct {
 	MaxExpressions      uint32
 	MaxRuleApplications uint32
 	MaxPlans            uint32
+	MaxSearchDepth      uint32
+	// MaxMemoPayloadBytes bounds deterministic memo-owned records and slice
+	// elements. Runtime map buckets and allocator capacity are bounded
+	// indirectly by the cardinality limits and reported separately where stable.
+	MaxMemoPayloadBytes uint64
 }
 
 func (l Limits) withDefaults() Limits {
@@ -38,28 +42,37 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxPlans == 0 {
 		l.MaxPlans = 65536
 	}
+	if l.MaxSearchDepth == 0 {
+		l.MaxSearchDepth = 1024
+	}
+	if l.MaxMemoPayloadBytes == 0 {
+		l.MaxMemoPayloadBytes = 64 << 20
+	}
 	return l
 }
 
 type memoGroup struct {
-	logical     LogicalProperties
-	expressions []ExprID
+	logical         LogicalProperties
+	firstExpression ExprID
+	lastExpression  ExprID
+	expressionCount uint32
 }
 
 type memoExpression struct {
 	group GroupID
 	expr  Expression
+	next  ExprID
 }
 
 // Memo compactly stores equivalent relational expressions. It is mutable only
 // during one optimization and is not safe for concurrent use.
 type Memo struct {
-	limits      Limits
-	groups      []memoGroup
-	expressions []memoExpression
-	byHash      map[uint64][]ExprID
-	interned    map[uint64][]ExprID
-	ruleApps    uint32
+	limits       Limits
+	groups       []memoGroup
+	expressions  []memoExpression
+	byHash       map[uint64][]ExprID
+	ruleApps     uint32
+	payloadBytes uint64
 }
 
 // MemoStatistics reports bounded optimizer state. RetainedBytes covers the
@@ -70,6 +83,7 @@ type MemoStatistics struct {
 	Groups           uint32
 	Expressions      uint32
 	RuleApplications uint32
+	PayloadBytes     uint64
 	RetainedBytes    uint64
 }
 
@@ -80,13 +94,12 @@ func (m *Memo) Statistics() MemoStatistics {
 	}
 	stats := MemoStatistics{
 		Groups: uint32(len(m.groups)), Expressions: uint32(len(m.expressions)),
-		RuleApplications: m.ruleApps,
+		RuleApplications: m.ruleApps, PayloadBytes: m.payloadBytes,
 		RetainedBytes: uint64(cap(m.groups))*uint64(unsafe.Sizeof(memoGroup{})) +
 			uint64(cap(m.expressions))*uint64(unsafe.Sizeof(memoExpression{})),
 	}
 	for i := range m.groups {
 		group := &m.groups[i]
-		stats.RetainedBytes += uint64(cap(group.expressions)) * uint64(unsafe.Sizeof(ExprID(0)))
 		stats.RetainedBytes += uint64(cap(group.logical.Columns)) * uint64(unsafe.Sizeof(ColumnID(0)))
 		stats.RetainedBytes += uint64(cap(group.logical.UniqueKeys)) * uint64(unsafe.Sizeof([]ColumnID(nil)))
 		for _, key := range group.logical.UniqueKeys {
@@ -102,7 +115,6 @@ func (m *Memo) Statistics() MemoStatistics {
 func NewMemo(limits Limits) *Memo {
 	return &Memo{
 		limits: limits.withDefaults(), byHash: make(map[uint64][]ExprID),
-		interned: make(map[uint64][]ExprID),
 	}
 }
 
@@ -114,8 +126,16 @@ func (m *Memo) NewGroup(logical LogicalProperties) (GroupID, error) {
 	if uint64(len(m.groups)) >= uint64(m.limits.MaxGroups) {
 		return NoGroup, fmt.Errorf("%w: groups reached %d", ErrSearchBudget, m.limits.MaxGroups)
 	}
+	payload, ok := groupPayloadBytes(logical)
+	if !ok || m.payloadBytes > m.limits.MaxMemoPayloadBytes ||
+		payload > m.limits.MaxMemoPayloadBytes-m.payloadBytes {
+		return NoGroup, fmt.Errorf("%w: memo payload exceeds %d bytes", ErrSearchBudget, m.limits.MaxMemoPayloadBytes)
+	}
 	group := GroupID(len(m.groups))
-	m.groups = append(m.groups, memoGroup{logical: cloneLogicalProperties(logical)})
+	m.groups = append(m.groups, memoGroup{
+		logical: cloneLogicalProperties(logical), firstExpression: NoExpr, lastExpression: NoExpr,
+	})
+	m.payloadBytes += payload
 	return group, nil
 }
 
@@ -125,8 +145,8 @@ func (m *Memo) Intern(expr Expression, logical LogicalProperties) (GroupID, Expr
 	if m == nil {
 		return NoGroup, NoExpr, ErrInvalidMemo
 	}
-	hash := expressionHash(NoGroup, expr)
-	for _, id := range m.interned[hash] {
+	hash := expressionHash(expr)
+	for _, id := range m.byHash[hash] {
 		record := m.expressions[id]
 		if expressionEqual(record.expr, expr) && logicalEqual(m.groups[record.group].logical, logical) {
 			return record.group, id, nil
@@ -151,7 +171,7 @@ func (m *Memo) Intern(expr Expression, logical LogicalProperties) (GroupID, Expr
 	if err != nil {
 		// Add validates and checks its budget before mutation. Rolling back the
 		// last group keeps Intern atomic if those invariants ever change.
-		m.groups = m.groups[:len(m.groups)-1]
+		m.rollbackLastGroup()
 		return NoGroup, NoExpr, err
 	}
 	return group, id, err
@@ -168,7 +188,7 @@ func (m *Memo) Add(group GroupID, expr Expression) (id ExprID, added bool, err e
 			return NoExpr, false, fmt.Errorf("%w: expression child group %d does not exist", ErrInvalidMemo, child)
 		}
 	}
-	hash := expressionHash(group, expr)
+	hash := expressionHash(expr)
 	for _, candidate := range m.byHash[hash] {
 		record := m.expressions[candidate]
 		if record.group == group && expressionEqual(record.expr, expr) {
@@ -178,13 +198,70 @@ func (m *Memo) Add(group GroupID, expr Expression) (id ExprID, added bool, err e
 	if uint64(len(m.expressions)) >= uint64(m.limits.MaxExpressions) {
 		return NoExpr, false, fmt.Errorf("%w: expressions reached %d", ErrSearchBudget, m.limits.MaxExpressions)
 	}
+	payload, ok := expressionPayloadBytes(expr)
+	if !ok || m.payloadBytes > m.limits.MaxMemoPayloadBytes ||
+		payload > m.limits.MaxMemoPayloadBytes-m.payloadBytes {
+		return NoExpr, false, fmt.Errorf("%w: memo payload exceeds %d bytes", ErrSearchBudget, m.limits.MaxMemoPayloadBytes)
+	}
 	id = ExprID(len(m.expressions))
-	m.expressions = append(m.expressions, memoExpression{group: group, expr: cloneExpression(expr)})
-	m.groups[group].expressions = append(m.groups[group].expressions, id)
+	m.expressions = append(m.expressions, memoExpression{group: group, expr: cloneExpression(expr), next: NoExpr})
+	owner := &m.groups[group]
+	if owner.firstExpression == NoExpr {
+		owner.firstExpression = id
+	} else {
+		m.expressions[owner.lastExpression].next = id
+	}
+	owner.lastExpression = id
+	owner.expressionCount++
 	m.byHash[hash] = append(m.byHash[hash], id)
-	internHash := expressionHash(NoGroup, expr)
-	m.interned[internHash] = append(m.interned[internHash], id)
+	m.payloadBytes += payload
 	return id, true, nil
+}
+
+func (m *Memo) rollbackLastGroup() {
+	if m == nil || len(m.groups) == 0 {
+		return
+	}
+	last := &m.groups[len(m.groups)-1]
+	payload, ok := groupPayloadBytes(last.logical)
+	if !ok || payload > m.payloadBytes {
+		panic("planner: corrupt memo payload accounting")
+	}
+	m.payloadBytes -= payload
+	m.groups = m.groups[:len(m.groups)-1]
+}
+
+func groupPayloadBytes(logical LogicalProperties) (uint64, bool) {
+	total := uint64(unsafe.Sizeof(memoGroup{}))
+	var ok bool
+	if total, ok = addMemoRun(total, len(logical.Columns), unsafe.Sizeof(ColumnID(0))); !ok {
+		return 0, false
+	}
+	if total, ok = addMemoRun(total, len(logical.UniqueKeys), unsafe.Sizeof([]ColumnID(nil))); !ok {
+		return 0, false
+	}
+	for _, key := range logical.UniqueKeys {
+		if total, ok = addMemoRun(total, len(key), unsafe.Sizeof(ColumnID(0))); !ok {
+			return 0, false
+		}
+	}
+	return total, true
+}
+
+func expressionPayloadBytes(expr Expression) (uint64, bool) {
+	total := uint64(unsafe.Sizeof(memoExpression{}))
+	return addMemoRun(total, len(expr.Children), unsafe.Sizeof(GroupID(0)))
+}
+
+func addMemoRun(total uint64, count int, elementBytes uintptr) (uint64, bool) {
+	if count < 0 || elementBytes == 0 || uint64(count) > ^uint64(0)/uint64(elementBytes) {
+		return 0, false
+	}
+	run := uint64(count) * uint64(elementBytes)
+	if run > ^uint64(0)-total {
+		return 0, false
+	}
+	return total + run, true
 }
 
 // GroupCount and ExpressionCount expose bounded search-state cardinalities.
@@ -229,22 +306,28 @@ func (m *Memo) Expressions(group GroupID) []ExprID {
 	if m == nil || int(group) >= len(m.groups) {
 		return nil
 	}
-	return slices.Clone(m.groups[group].expressions)
+	record := &m.groups[group]
+	if record.expressionCount == 0 {
+		return nil
+	}
+	out := make([]ExprID, 0, record.expressionCount)
+	for id := record.firstExpression; id != NoExpr; id = m.expressions[id].next {
+		out = append(out, id)
+	}
+	return out
 }
 
 func expressionEqual(a, b Expression) bool {
 	return a.Op == b.Op && a.Private == b.Private && slices.Equal(a.Children, b.Children)
 }
 
-func expressionHash(group GroupID, expr Expression) uint64 {
-	h := fnv.New64a()
-	appendUint32Hash(h, uint32(group))
-	appendUint32Hash(h, uint32(expr.Op))
-	appendUint32Hash(h, uint32(expr.Private))
+func expressionHash(expr Expression) uint64 {
+	h := hashUint32(fnv64Offset, uint32(expr.Op))
+	h = hashUint32(h, uint32(expr.Private))
 	for _, child := range expr.Children {
-		appendUint32Hash(h, uint32(child))
+		h = hashUint32(h, uint32(child))
 	}
-	return h.Sum64()
+	return h
 }
 
 func logicalEqual(a, b LogicalProperties) bool {

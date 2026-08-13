@@ -1,13 +1,17 @@
 package planner
 
 import (
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
 )
+
+// ErrInvalidPhysicalProperties reports a malformed required or provided
+// distribution/order contract.
+var ErrInvalidPhysicalProperties = errors.New("planner: invalid physical properties")
 
 // GroupID identifies an equivalence class in a Memo.
 type GroupID uint32
@@ -262,6 +266,52 @@ type PhysicalProperties struct {
 	Ordering     []OrderingColumn
 }
 
+// Validate rejects property shapes whose meaning would be ambiguous to search
+// or satisfaction checks.
+func (p PhysicalProperties) Validate() error {
+	switch p.Distribution.Kind {
+	case DistributionAny:
+		if len(p.Distribution.Keys) != 0 || p.Distribution.Partitions != 0 {
+			return fmt.Errorf("%w: any distribution cannot carry keys or a partition count", ErrInvalidPhysicalProperties)
+		}
+	case DistributionSingleton:
+		if len(p.Distribution.Keys) != 0 || p.Distribution.Partitions > 1 {
+			return fmt.Errorf("%w: singleton distribution has keys or more than one partition", ErrInvalidPhysicalProperties)
+		}
+	case DistributionRandom, DistributionReplicated:
+		if len(p.Distribution.Keys) != 0 {
+			return fmt.Errorf("%w: %s distribution cannot carry keys", ErrInvalidPhysicalProperties, p.Distribution.Kind)
+		}
+	case DistributionHash, DistributionRange:
+		if len(p.Distribution.Keys) == 0 {
+			return fmt.Errorf("%w: %s distribution requires at least one key", ErrInvalidPhysicalProperties, p.Distribution.Kind)
+		}
+		for i, key := range p.Distribution.Keys {
+			if slices.Contains(p.Distribution.Keys[:i], key) {
+				return fmt.Errorf("%w: %s distribution repeats key c%d", ErrInvalidPhysicalProperties, p.Distribution.Kind, key)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: unknown distribution kind %d", ErrInvalidPhysicalProperties, p.Distribution.Kind)
+	}
+	for _, term := range p.Ordering {
+		if term.Direction != Ascending && term.Direction != Descending {
+			return fmt.Errorf("%w: ordering for c%d has direction %d", ErrInvalidPhysicalProperties, term.Column, term.Direction)
+		}
+	}
+	return nil
+}
+
+func (p PhysicalProperties) validateProvided() error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if p.Distribution.Kind == DistributionAny {
+		return fmt.Errorf("%w: a physical expression must provide a concrete distribution", ErrInvalidPhysicalProperties)
+	}
+	return nil
+}
+
 func clonePhysicalProperties(p PhysicalProperties) PhysicalProperties {
 	p.Distribution.Keys = slices.Clone(p.Distribution.Keys)
 	p.Ordering = slices.Clone(p.Ordering)
@@ -301,26 +351,34 @@ func distributionSatisfies(provided, required Distribution) bool {
 }
 
 func (p PhysicalProperties) hash() uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte{byte(p.Distribution.Kind)})
-	appendUint32Hash(h, p.Distribution.Partitions)
+	h := hashByte(fnv64Offset, byte(p.Distribution.Kind))
+	h = hashUint32(h, p.Distribution.Partitions)
 	for _, key := range p.Distribution.Keys {
-		appendUint32Hash(h, uint32(key))
+		h = hashUint32(h, uint32(key))
 	}
-	_, _ = h.Write([]byte{0xff})
+	h = hashByte(h, 0xff)
 	for _, term := range p.Ordering {
-		appendUint32Hash(h, uint32(term.Column))
-		_, _ = h.Write([]byte{byte(term.Direction), boolByte(term.NullsFirst)})
+		h = hashUint32(h, uint32(term.Column))
+		h = hashByte(h, byte(term.Direction))
+		h = hashByte(h, boolByte(term.NullsFirst))
 	}
-	return h.Sum64()
+	return h
 }
 
-type byteWriter interface{ Write([]byte) (int, error) }
+const (
+	fnv64Offset = uint64(14695981039346656037)
+	fnv64Prime  = uint64(1099511628211)
+)
 
-func appendUint32Hash(h byteWriter, value uint32) {
-	var b [4]byte
-	b[0], b[1], b[2], b[3] = byte(value>>24), byte(value>>16), byte(value>>8), byte(value)
-	_, _ = h.Write(b[:])
+func hashByte(hash uint64, value byte) uint64 {
+	return (hash ^ uint64(value)) * fnv64Prime
+}
+
+func hashUint32(hash uint64, value uint32) uint64 {
+	hash = hashByte(hash, byte(value>>24))
+	hash = hashByte(hash, byte(value>>16))
+	hash = hashByte(hash, byte(value>>8))
+	return hashByte(hash, byte(value))
 }
 
 func boolByte(value bool) byte {

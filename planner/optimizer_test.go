@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"unsafe"
 )
 
 type testPhysical struct {
@@ -14,6 +15,35 @@ type testPhysical struct {
 type testModel struct {
 	physical  map[PrivateID]testPhysical
 	enforcers []EnforcerChain
+}
+
+type unaryDepthModel struct{}
+
+func (unaryDepthModel) IsPhysical(expr Expression) bool { return expr.Op == OpRemoteQuery }
+func (unaryDepthModel) ChildPropertyAlternatives(
+	_ *Memo, _ GroupID, _ ExprID, expr Expression, _ PhysicalProperties,
+) ([][]PhysicalProperties, error) {
+	if len(expr.Children) == 0 {
+		return [][]PhysicalProperties{nil}, nil
+	}
+	return [][]PhysicalProperties{{{
+		Distribution: Distribution{Kind: DistributionSingleton},
+	}}}, nil
+}
+func (unaryDepthModel) Provided(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, _ []*Plan,
+) (PhysicalProperties, error) {
+	return PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}}, nil
+}
+func (unaryDepthModel) LocalCost(
+	_ *Memo, _ GroupID, _ ExprID, _ Expression, _ []*Plan,
+) (Cost, error) {
+	return Cost{}, nil
+}
+func (unaryDepthModel) Enforcers(
+	_ *Memo, _ GroupID, _, _ PhysicalProperties,
+) ([]EnforcerChain, error) {
+	return nil, nil
 }
 
 func (m testModel) IsPhysical(expr Expression) bool {
@@ -198,6 +228,82 @@ func TestMemoGroupCreationIsAtomic(t *testing.T) {
 	}
 }
 
+func TestMemoPayloadBudget(t *testing.T) {
+	memo := NewMemo(Limits{MaxMemoPayloadBytes: 1})
+	if _, err := memo.NewGroup(LogicalProperties{Columns: []ColumnID{1}}); !errors.Is(err, ErrSearchBudget) {
+		t.Fatalf("NewGroup error = %v, want ErrSearchBudget", err)
+	}
+	if memo.GroupCount() != 0 || memo.Statistics().PayloadBytes != 0 {
+		t.Fatalf("rejected group changed memo statistics: %+v", memo.Statistics())
+	}
+
+	memo = NewMemo(Limits{MaxMemoPayloadBytes: 1024})
+	group, err := memo.NewGroup(LogicalProperties{Columns: []ColumnID{1, 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := memo.Statistics().PayloadBytes
+	memo.limits.MaxMemoPayloadBytes = before + uint64(unsafe.Sizeof(memoExpression{})) - 1
+	if _, _, err := memo.Add(group, Expression{Op: OpLogicalScan}); !errors.Is(err, ErrSearchBudget) {
+		t.Fatalf("Add error = %v, want ErrSearchBudget", err)
+	}
+	if got := memo.Statistics().PayloadBytes; got != before || memo.ExpressionCount() != 0 {
+		t.Fatalf("rejected expression changed memo: bytes=%d expressions=%d", got, memo.ExpressionCount())
+	}
+}
+
+func TestRulePhasesReachLogicalFixedPointBeforeImplementation(t *testing.T) {
+	memo := NewMemo(Limits{})
+	group, _ := memo.NewGroup(LogicalProperties{})
+	_, _, _ = memo.Add(group, Expression{Op: OpLogicalScan})
+	hasOperator := func(m *Memo, group GroupID, operator Operator) bool {
+		for id := m.groups[group].firstExpression; id != NoExpr; id = m.expressions[id].next {
+			if m.expression(id).expr.Op == operator {
+				return true
+			}
+		}
+		return false
+	}
+	rules := []Rule{
+		FuncRule{
+			RuleName: "explore-scan-to-filter", RulePhase: ExplorePhase,
+			MatchFunc: func(_ *Memo, _ GroupID, _ ExprID, expr Expression) bool {
+				return expr.Op == OpLogicalScan
+			},
+			ApplyFunc: func(call *RuleCall) error {
+				_, _, err := call.Yield(Expression{Op: OpLogicalFilter})
+				return err
+			},
+		},
+		FuncRule{
+			RuleName: "explore-filter-to-project", RulePhase: ExplorePhase,
+			MatchFunc: func(_ *Memo, _ GroupID, _ ExprID, expr Expression) bool {
+				return expr.Op == OpLogicalFilter
+			},
+			ApplyFunc: func(call *RuleCall) error {
+				_, _, err := call.Yield(Expression{Op: OpLogicalProject})
+				return err
+			},
+		},
+		FuncRule{
+			RuleName: "implement-scan-after-exploration", RulePhase: ImplementPhase,
+			MatchFunc: func(m *Memo, group GroupID, _ ExprID, expr Expression) bool {
+				return expr.Op == OpLogicalScan && hasOperator(m, group, OpLogicalProject)
+			},
+			ApplyFunc: func(call *RuleCall) error {
+				_, _, err := call.Yield(Expression{Op: OpTableScan})
+				return err
+			},
+		},
+	}
+	if err := memo.Explore(t.Context(), rules); err != nil {
+		t.Fatal(err)
+	}
+	if !hasOperator(memo, group, OpTableScan) {
+		t.Fatal("implementation ran before exploration reached a fixed point")
+	}
+}
+
 func TestMemoInternReusesExpressionAddedDirectly(t *testing.T) {
 	memo := NewMemo(Limits{})
 	logical := LogicalProperties{Rows: ExactEstimate(3)}
@@ -239,6 +345,19 @@ func TestPlannerBudgetsAndCancellation(t *testing.T) {
 			t.Fatalf("Explore error = %v, want context.Canceled", err)
 		}
 	})
+
+	t.Run("search depth", func(t *testing.T) {
+		memo := NewMemo(Limits{MaxSearchDepth: 1})
+		leaf, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(leaf, Expression{Op: OpRemoteQuery})
+		root, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(root, Expression{Op: OpRemoteQuery, Children: []GroupID{leaf}})
+		_, err := (&Optimizer{Memo: memo, Model: unaryDepthModel{}}).Optimize(t.Context(), root,
+			PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}})
+		if !errors.Is(err, ErrSearchBudget) {
+			t.Fatalf("Optimize error = %v, want ErrSearchBudget", err)
+		}
+	})
 }
 
 func TestPhysicalPropertySatisfaction(t *testing.T) {
@@ -256,6 +375,28 @@ func TestPhysicalPropertySatisfaction(t *testing.T) {
 		Distribution: Distribution{Kind: DistributionHash, Keys: []ColumnID{2, 1}},
 	}) {
 		t.Fatal("hash key order was treated as interchangeable")
+	}
+}
+
+func TestPhysicalPropertyValidation(t *testing.T) {
+	tests := []PhysicalProperties{
+		{Distribution: Distribution{Kind: DistributionAny, Partitions: 1}},
+		{Distribution: Distribution{Kind: DistributionSingleton, Keys: []ColumnID{1}}},
+		{Distribution: Distribution{Kind: DistributionHash}},
+		{Distribution: Distribution{Kind: DistributionRange, Keys: []ColumnID{1, 1}}},
+		{Distribution: Distribution{Kind: DistributionRandom}, Ordering: []OrderingColumn{{Direction: 99}}},
+	}
+	for _, properties := range tests {
+		if err := properties.Validate(); !errors.Is(err, ErrInvalidPhysicalProperties) {
+			t.Fatalf("Validate(%+v) error = %v", properties, err)
+		}
+	}
+	valid := PhysicalProperties{
+		Distribution: Distribution{Kind: DistributionHash, Keys: []ColumnID{1, 2}, Partitions: 16},
+		Ordering:     []OrderingColumn{{Column: 3, Direction: Descending}},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid properties rejected: %v", err)
 	}
 }
 
@@ -291,6 +432,45 @@ func TestOptimizerBoundsEnforcerAlternatives(t *testing.T) {
 	}
 	if _, err := (&Optimizer{Memo: memo, Model: model}).Optimize(t.Context(), root, required); !errors.Is(err, ErrSearchBudget) {
 		t.Fatalf("Optimize error = %v, want ErrSearchBudget", err)
+	}
+}
+
+func TestPlanWinnerIndependentOfEnforcerOrder(t *testing.T) {
+	optimize := func(enforcers []EnforcerChain) *Plan {
+		memo := NewMemo(Limits{})
+		root, _ := memo.NewGroup(LogicalProperties{})
+		_, _, _ = memo.Add(root, Expression{Op: OpTableScan, Private: 1})
+		model := testModel{
+			physical: map[PrivateID]testPhysical{1: {
+				properties: PhysicalProperties{Distribution: Distribution{Kind: DistributionRandom}},
+			}},
+			enforcers: enforcers,
+		}
+		plan, err := (&Optimizer{Memo: memo, Model: model}).Optimize(t.Context(), root,
+			PhysicalProperties{Distribution: Distribution{Kind: DistributionSingleton}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plan
+	}
+	first := EnforcerChain{{
+		Op: OpGather,
+		Provided: PhysicalProperties{
+			Distribution: Distribution{Kind: DistributionSingleton},
+			Ordering:     []OrderingColumn{{Column: 1}},
+		},
+	}}
+	second := EnforcerChain{{
+		Op: OpGather,
+		Provided: PhysicalProperties{
+			Distribution: Distribution{Kind: DistributionSingleton},
+			Ordering:     []OrderingColumn{{Column: 2}},
+		},
+	}}
+	forward := optimize([]EnforcerChain{first, second})
+	reverse := optimize([]EnforcerChain{second, first})
+	if forward.Fingerprint() != reverse.Fingerprint() || !forward.Provided.Equal(reverse.Provided) {
+		t.Fatalf("winner follows enforcer order:\nforward=%s\nreverse=%s", forward, reverse)
 	}
 }
 

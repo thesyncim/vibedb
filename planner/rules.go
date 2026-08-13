@@ -55,7 +55,7 @@ func (c *RuleCall) NewGroup(logical LogicalProperties, expr Expression) (GroupID
 	}
 	id, _, err := c.memo.Add(group, expr)
 	if err != nil {
-		c.memo.groups = c.memo.groups[:len(c.memo.groups)-1]
+		c.memo.rollbackLastGroup()
 		return NoGroup, NoExpr, err
 	}
 	return group, id, err
@@ -97,6 +97,14 @@ func (m *Memo) Explore(ctx context.Context, rules []Rule) error {
 		if ordered[i] == nil || ordered[i].Name() == "" {
 			return errors.New("planner: every rule requires a name")
 		}
+		if ordered[i].Phase() != ExplorePhase && ordered[i].Phase() != ImplementPhase {
+			return fmt.Errorf("planner: rule %q has invalid phase %d", ordered[i].Name(), ordered[i].Phase())
+		}
+		for previous := 0; previous < i; previous++ {
+			if ordered[previous].Name() == ordered[i].Name() {
+				return fmt.Errorf("planner: duplicate rule %q", ordered[i].Name())
+			}
+		}
 	}
 	slices.SortStableFunc(ordered, func(a, b Rule) int {
 		if a.Phase() != b.Phase() {
@@ -113,30 +121,33 @@ func (m *Memo) Explore(ctx context.Context, rules []Rule) error {
 		}
 		return 0
 	})
-	for i := 1; i < len(ordered); i++ {
-		if ordered[i-1].Name() == ordered[i].Name() {
-			return fmt.Errorf("planner: duplicate rule %q", ordered[i].Name())
-		}
-	}
-	for cursor := 0; cursor < len(m.expressions); cursor++ {
-		if cursor&63 == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
+	// Reach an exploration fixed point before any implementation rule runs.
+	// Otherwise an implementation rule attached to an earlier expression can
+	// miss a logical equivalent yielded later in the same group.
+	for _, phase := range [...]RulePhase{ExplorePhase, ImplementPhase} {
+		for cursor := 0; cursor < len(m.expressions); cursor++ {
+			if cursor&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
-		}
-		record := m.expressions[cursor]
-		for _, rule := range ordered {
-			id := ExprID(cursor)
-			if !rule.Match(m, record.group, id, record.expr) {
-				continue
-			}
-			if m.ruleApps >= m.limits.MaxRuleApplications {
-				return fmt.Errorf("%w: rule applications reached %d", ErrSearchBudget, m.limits.MaxRuleApplications)
-			}
-			m.ruleApps++
-			call := &RuleCall{memo: m, group: record.group, id: id, expr: record.expr}
-			if err := rule.Apply(call); err != nil {
-				return fmt.Errorf("planner: rule %s: %w", rule.Name(), err)
+			record := m.expressions[cursor]
+			for _, rule := range ordered {
+				if rule.Phase() != phase {
+					continue
+				}
+				id := ExprID(cursor)
+				if !rule.Match(m, record.group, id, record.expr) {
+					continue
+				}
+				if m.ruleApps >= m.limits.MaxRuleApplications {
+					return fmt.Errorf("%w: rule applications reached %d", ErrSearchBudget, m.limits.MaxRuleApplications)
+				}
+				m.ruleApps++
+				call := &RuleCall{memo: m, group: record.group, id: id, expr: record.expr}
+				if err := rule.Apply(call); err != nil {
+					return fmt.Errorf("planner: rule %s: %w", rule.Name(), err)
+				}
 			}
 		}
 	}

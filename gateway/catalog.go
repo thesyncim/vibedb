@@ -165,10 +165,35 @@ func NewSnapshotWithPlannerMetadata(
 	}
 	cloned := cloneConfig(config)
 	planner := buildPlannerTables(cloned)
+	var activePartitions map[distribution.DistributionName]map[string]struct{}
+	if len(statistics) != 0 {
+		activePartitions = make(map[distribution.DistributionName]map[string]struct{}, len(cloned.Manifests))
+		for _, manifest := range cloned.Manifests {
+			partitions := make(map[string]struct{}, manifest.ShardCount())
+			for shardIndex := 0; shardIndex < manifest.ShardCount(); shardIndex++ {
+				metadata, _ := manifest.ShardMetadataAt(shardIndex)
+				partitions[string(metadata.ID)] = struct{}{}
+			}
+			activePartitions[manifest.Distribution()] = partitions
+		}
+	}
 	for i := range statistics {
-		if _, ok := cloned.Placement(statistics[i].Table); !ok {
+		placement, ok := cloned.Placement(statistics[i].Table)
+		if !ok {
 			return nil, &CatalogError{Reason: fmt.Sprintf(
 				"statistics table %q has no placement", statistics[i].Table)}
+		}
+		partitions, ok := activePartitions[placement.Distribution]
+		if !ok {
+			return nil, &CatalogError{Reason: fmt.Sprintf(
+				"statistics table %q has no routing manifest", statistics[i].Table)}
+		}
+		for _, partition := range statistics[i].Partitions {
+			if _, found := partitions[partition.Partition]; !found {
+				return nil, &CatalogError{Reason: fmt.Sprintf(
+					"statistics table %q partition %q is not active in distribution %q",
+					statistics[i].Table, partition.Partition, placement.Distribution)}
+			}
 		}
 	}
 	statisticsCatalog, err := queryplanner.NewStatisticsCatalog(generation, statistics)

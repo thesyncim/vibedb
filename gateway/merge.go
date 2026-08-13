@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
@@ -153,17 +154,20 @@ func compareCells(a, b cellValue) int {
 	}
 }
 
-// compareNumberSpelling compares two JSON number spellings by exact decimal
-// value via math/big, never by rounding through float64, so equal decimals of
-// any spelling compare equal. A spelling big.Rat cannot parse falls back to a
-// lexical compare, which cannot occur for validated JSON numbers.
+// compareNumberSpelling compares two JSON numbers without expanding their
+// decimal exponents. A short hostile value such as 1e1000000000 therefore has
+// work proportional to its spelling rather than its mathematical magnitude.
 func compareNumberSpelling(a, b string) int {
-	ra, oka := new(big.Rat).SetString(a)
-	rb, okb := new(big.Rat).SetString(b)
-	if oka && okb {
-		return ra.Cmp(rb)
+	ca, erra := queryplanner.CanonicalScalarJSON(a)
+	cb, errb := queryplanner.CanonicalScalarJSON(b)
+	if erra != nil || errb != nil {
+		return strings.Compare(a, b)
 	}
-	return strings.Compare(a, b)
+	comparison, err := queryplanner.CompareCanonicalScalarJSON(ca, cb)
+	if err != nil {
+		return strings.Compare(a, b)
+	}
+	return comparison
 }
 
 // shardRun is one shard's already-ordered rows plus the decoded sort keys of
@@ -337,7 +341,12 @@ func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, e
 		if cell.Null {
 			continue
 		}
-		value, ok := new(big.Rat).SetString(string(bytes.TrimSpace(cell.Bytes)))
+		spelling := string(bytes.TrimSpace(cell.Bytes))
+		canonical, canonicalErr := queryplanner.CanonicalScalarJSON(spelling)
+		if canonicalErr != nil || !queryplanner.CanonicalNumberFitsDecimalBytes(canonical, maxBytes) {
+			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q exceeds exact numeric admission", ErrMergeAggregate, cell.Bytes)
+		}
+		value, ok := new(big.Rat).SetString(canonical)
 		if !ok {
 			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
 		}
@@ -356,6 +365,7 @@ func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, e
 
 func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, error) {
 	var chosen shardservice.Cell
+	chosenCanonical := ""
 	hasValue := false
 	for _, cell := range cells {
 		if cell.Null {
@@ -365,13 +375,20 @@ func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, e
 		if candidate.kind != ckNumber {
 			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
 		}
+		canonical, err := queryplanner.CanonicalScalarJSON(string(bytes.TrimSpace(cell.Bytes)))
+		if err != nil || len(canonical) == 0 || canonical[0] == '"' || canonical == "true" || canonical == "false" || canonical == "null" {
+			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not an exact JSON number", ErrMergeAggregate, cell.Bytes)
+		}
 		if !hasValue {
-			chosen, hasValue = cell, true
+			chosen, chosenCanonical, hasValue = cell, canonical, true
 			continue
 		}
-		comparison := compareCells(candidate, classifyCell(chosen))
+		comparison, err := queryplanner.CompareCanonicalScalarJSON(canonical, chosenCanonical)
+		if err != nil {
+			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state comparison: %v", ErrMergeAggregate, err)
+		}
 		if (maximum && comparison > 0) || (!maximum && comparison < 0) {
-			chosen = cell
+			chosen, chosenCanonical = cell, canonical
 		}
 	}
 	if !hasValue {

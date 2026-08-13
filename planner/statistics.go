@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 	"unsafe"
@@ -19,10 +21,19 @@ var ErrInvalidStatistics = errors.New("planner: invalid statistics")
 // bound for latency-sensitive queries. Columns are sparse: unobserved columns
 // consume no directory entry.
 type TableStatistics struct {
-	Table    string             `json:"table"`
-	Rows     Estimate           `json:"rows"`
-	RowBytes Estimate           `json:"row_bytes"`
-	Columns  []ColumnStatistics `json:"columns,omitempty"`
+	Table      string                `json:"table"`
+	Rows       Estimate              `json:"rows"`
+	RowBytes   Estimate              `json:"row_bytes"`
+	Columns    []ColumnStatistics    `json:"columns,omitempty"`
+	Partitions []PartitionStatistics `json:"partitions,omitempty"`
+}
+
+// PartitionStatistics is an optional topology-pinned row estimate for one
+// physical partition/shard. A distributed cost model can sum selected
+// partitions without assuming table rows are uniformly distributed.
+type PartitionStatistics struct {
+	Partition string   `json:"partition"`
+	Rows      Estimate `json:"rows"`
 }
 
 // ColumnStatistics contains the selectivity facts with the highest practical
@@ -115,6 +126,15 @@ type compactHistogramBucket struct {
 	distinct  float64
 }
 
+// compactPartitionStatistic is a 40-byte composite-keyed row estimate. It is
+// global rather than linked from the 64-byte table record, preserving that hot
+// directory shape for catalogs that do not publish per-partition statistics.
+type compactPartitionStatistic struct {
+	table     statisticStringRef
+	partition statisticStringRef
+	rows      compactEstimate
+}
+
 // StatisticsCatalog is an immutable, compact statistics snapshot. Lookups are
 // binary searches over sorted flat directories and allocate nothing. It can be
 // pinned to the same generation as routing metadata without putting mutable
@@ -125,6 +145,7 @@ type StatisticsCatalog struct {
 	columns    []compactColumnStatistic
 	common     []compactValueFrequency
 	histogram  []compactHistogramBucket
+	partitions []compactPartitionStatistic
 	arena      string
 }
 
@@ -138,9 +159,11 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 		return catalog, nil
 	}
 	stringBytes := uint64(0)
-	columnCount, commonCount, histogramCount := uint64(0), uint64(0), uint64(0)
+	columnCount, commonCount, histogramCount, partitionCount := uint64(0), uint64(0), uint64(0), uint64(0)
 	for i := range ordered {
 		table := &ordered[i]
+		table.Columns = slices.Clone(table.Columns)
+		table.Partitions = slices.Clone(table.Partitions)
 		if table.Table == "" || !utf8.ValidString(table.Table) {
 			return nil, statisticsError(table.Table, "table name is empty or invalid UTF-8")
 		}
@@ -157,6 +180,22 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 		columnCount += uint64(len(table.Columns))
 		for j := range table.Columns {
 			column := &table.Columns[j]
+			column.MostCommon = slices.Clone(column.MostCommon)
+			column.Histogram = slices.Clone(column.Histogram)
+			for valueIndex := range column.MostCommon {
+				canonical, err := CanonicalScalarJSON(column.MostCommon[valueIndex].Value)
+				if err != nil {
+					return nil, statisticsError(table.Table, column.Path+": heavy hitter: "+err.Error())
+				}
+				column.MostCommon[valueIndex].Value = canonical
+			}
+			for bucketIndex := range column.Histogram {
+				canonical, err := CanonicalScalarJSON(column.Histogram[bucketIndex].Upper)
+				if err != nil {
+					return nil, statisticsError(table.Table, column.Path+": histogram: "+err.Error())
+				}
+				column.Histogram[bucketIndex].Upper = canonical
+			}
 			stringBytes += uint64(len(column.Path))
 			commonCount += uint64(len(column.MostCommon))
 			histogramCount += uint64(len(column.Histogram))
@@ -167,15 +206,34 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 				stringBytes += uint64(len(bucket.Upper))
 			}
 		}
+		slices.SortFunc(table.Partitions, func(a, b PartitionStatistics) int {
+			return strings.Compare(a.Partition, b.Partition)
+		})
+		partitionCount += uint64(len(table.Partitions))
+		for partitionIndex := range table.Partitions {
+			partition := &table.Partitions[partitionIndex]
+			if partition.Partition == "" || !utf8.ValidString(partition.Partition) {
+				return nil, statisticsError(table.Table, "partition name is empty or invalid UTF-8")
+			}
+			if partitionIndex != 0 && table.Partitions[partitionIndex-1].Partition == partition.Partition {
+				return nil, statisticsError(table.Table, "duplicate partition "+partition.Partition)
+			}
+			if err := validateEstimate(partition.Rows, "partition row count"); err != nil {
+				return nil, statisticsError(table.Table, partition.Partition+": "+err.Error())
+			}
+			stringBytes += uint64(len(partition.Partition))
+		}
 	}
 	maxUint32 := uint64(^uint32(0))
-	if columnCount > maxUint32 || commonCount > maxUint32 || histogramCount > maxUint32 || stringBytes > maxUint32 {
+	if columnCount > maxUint32 || commonCount > maxUint32 || histogramCount > maxUint32 ||
+		partitionCount > maxUint32 || stringBytes > maxUint32 {
 		return nil, fmt.Errorf("%w: compact statistics capacity exceeded", ErrInvalidStatistics)
 	}
 	catalog.tables = make([]compactTableStatistic, 0, len(ordered))
 	catalog.columns = make([]compactColumnStatistic, 0, int(columnCount))
 	catalog.common = make([]compactValueFrequency, 0, int(commonCount))
 	catalog.histogram = make([]compactHistogramBucket, 0, int(histogramCount))
+	catalog.partitions = make([]compactPartitionStatistic, 0, int(partitionCount))
 	var arena strings.Builder
 	arena.Grow(int(stringBytes))
 	interned := make(map[string]statisticStringRef)
@@ -196,6 +254,13 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 			name: intern(table.Table), rows: newCompactEstimate(table.Rows, 1000),
 			rowBytes:   newCompactEstimate(table.RowBytes, 128),
 			columnBase: uint32(len(catalog.columns)), columnCount: uint32(len(columns)),
+		}
+		for partitionIndex := range table.Partitions {
+			partition := &table.Partitions[partitionIndex]
+			catalog.partitions = append(catalog.partitions, compactPartitionStatistic{
+				table: tableEntry.name, partition: intern(partition.Partition),
+				rows: newCompactEstimate(partition.Rows, 0),
+			})
 		}
 		for columnIndex := range columns {
 			column := &columns[columnIndex]
@@ -246,7 +311,7 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 	commonTotal := 0.0
 	seen := make(map[string]struct{}, len(column.MostCommon))
 	for _, value := range column.MostCommon {
-		if err := validateStatisticScalar(value.Value); err != nil {
+		if _, err := CanonicalScalarJSON(value.Value); err != nil {
 			return statisticsError(table, column.Path+": heavy hitter: "+err.Error())
 		}
 		if _, duplicate := seen[value.Value]; duplicate {
@@ -262,8 +327,9 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 		return statisticsError(table, column.Path+": heavy hitters exceed non-null frequency")
 	}
 	previousFrequency, previousDistinct := 0.0, 0.0
+	previousUpper := ""
 	for _, bucket := range column.Histogram {
-		if err := validateStatisticScalar(bucket.Upper); err != nil {
+		if _, err := CanonicalScalarJSON(bucket.Upper); err != nil {
 			return statisticsError(table, column.Path+": histogram: "+err.Error())
 		}
 		if !finiteFraction(bucket.Frequency) || bucket.Frequency <= previousFrequency {
@@ -272,7 +338,14 @@ func validateColumnStatistic(table string, columns []ColumnStatistics, index int
 		if !finiteNonNegative(bucket.Distinct) || bucket.Distinct < previousDistinct {
 			return statisticsError(table, column.Path+": histogram distinct counts regress")
 		}
+		if previousUpper != "" {
+			comparison, err := CompareCanonicalScalarJSON(previousUpper, bucket.Upper)
+			if err != nil || comparison >= 0 {
+				return statisticsError(table, column.Path+": histogram upper bounds are not increasing")
+			}
+		}
 		previousFrequency, previousDistinct = bucket.Frequency, bucket.Distinct
+		previousUpper = bucket.Upper
 	}
 	if previousFrequency > 1-column.NullFraction+1e-6 {
 		return statisticsError(table, column.Path+": histogram exceeds non-null frequency")
@@ -297,26 +370,252 @@ func finiteFraction(value float64) bool {
 	return finiteNonNegative(value) && value <= 1
 }
 
-func validateStatisticScalar(value string) error {
+// CanonicalScalarJSON validates one JSON scalar and returns a stable spelling.
+// Equal numbers share one normalized scientific representation and strings use
+// encoding/json's canonical escaping. Catalog publication uses this before
+// duplicate detection, so spelling variants cannot create duplicate skew keys.
+func CanonicalScalarJSON(value string) (string, error) {
 	if value == "" || !utf8.ValidString(value) {
-		return errors.New("value is empty or invalid UTF-8")
+		return "", errors.New("value is empty or invalid UTF-8")
 	}
 	var decoded any
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.UseNumber()
 	if err := decoder.Decode(&decoded); err != nil {
-		return fmt.Errorf("value %q is not JSON: %w", value, err)
+		return "", fmt.Errorf("value %q is not JSON: %w", value, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("value %q has trailing JSON", value)
+		return "", fmt.Errorf("value %q has trailing JSON", value)
 	}
-	switch decoded.(type) {
-	case nil, bool, json.Number, string:
-		return nil
+	switch scalar := decoded.(type) {
+	case nil:
+		return "null", nil
+	case bool:
+		return strconv.FormatBool(scalar), nil
+	case json.Number:
+		return canonicalJSONNumber(string(scalar))
+	case string:
+		encoded, err := json.Marshal(scalar)
+		return string(encoded), err
 	default:
-		return fmt.Errorf("value %q is not a scalar", value)
+		return "", fmt.Errorf("value %q is not a scalar", value)
 	}
+}
+
+func canonicalJSONNumber(value string) (string, error) {
+	negative := len(value) != 0 && value[0] == '-'
+	if negative {
+		value = value[1:]
+	}
+	mantissa, exponentText := value, "0"
+	if index := strings.IndexAny(value, "eE"); index >= 0 {
+		mantissa, exponentText = value[:index], value[index+1:]
+	}
+	var exponent big.Int
+	if _, ok := exponent.SetString(exponentText, 10); !ok {
+		return "", errors.New("number has an invalid exponent")
+	}
+	fractionDigits := 0
+	if point := strings.IndexByte(mantissa, '.'); point >= 0 {
+		fractionDigits = len(mantissa) - point - 1
+		mantissa = mantissa[:point] + mantissa[point+1:]
+	}
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		return "0", nil
+	}
+	exponent.Sub(&exponent, big.NewInt(int64(fractionDigits)))
+	trimmed := len(digits) - len(strings.TrimRight(digits, "0"))
+	if trimmed != 0 {
+		digits = digits[:len(digits)-trimmed]
+		exponent.Add(&exponent, big.NewInt(int64(trimmed)))
+	}
+	exponent.Add(&exponent, big.NewInt(int64(len(digits)-1)))
+	var out strings.Builder
+	out.Grow(len(digits) + len(exponent.String()) + 3)
+	if negative {
+		out.WriteByte('-')
+	}
+	out.WriteByte(digits[0])
+	if len(digits) > 1 {
+		out.WriteByte('.')
+		out.WriteString(digits[1:])
+	}
+	if exponent.Sign() != 0 {
+		out.WriteByte('e')
+		out.WriteString(exponent.String())
+	}
+	return out.String(), nil
+}
+
+type canonicalStatisticNumber struct {
+	negative bool
+	digits   string
+	exponent big.Int
+}
+
+func parseCanonicalStatisticNumber(value string) (canonicalStatisticNumber, error) {
+	result := canonicalStatisticNumber{}
+	if len(value) != 0 && value[0] == '-' {
+		result.negative = true
+		value = value[1:]
+	}
+	exponent := "0"
+	if index := strings.IndexByte(value, 'e'); index >= 0 {
+		exponent = value[index+1:]
+		value = value[:index]
+	}
+	result.digits = strings.Replace(value, ".", "", 1)
+	if result.digits == "" {
+		return canonicalStatisticNumber{}, errors.New("canonical number has no digits")
+	}
+	for _, digit := range result.digits {
+		if digit < '0' || digit > '9' {
+			return canonicalStatisticNumber{}, errors.New("canonical number has a non-digit coefficient")
+		}
+	}
+	if _, ok := result.exponent.SetString(exponent, 10); !ok {
+		return canonicalStatisticNumber{}, errors.New("canonical number has an invalid exponent")
+	}
+	if result.digits == "0" {
+		result.negative = false
+	}
+	return result, nil
+}
+
+// CompareCanonicalScalarJSON compares two outputs of [CanonicalScalarJSON]
+// under null < bool < number < string. Exact number comparison is proportional
+// to the spelling length and never expands a decimal exponent.
+func CompareCanonicalScalarJSON(left, right string) (int, error) {
+	leftKind, err := canonicalStatisticKind(left)
+	if err != nil {
+		return 0, err
+	}
+	rightKind, err := canonicalStatisticKind(right)
+	if err != nil {
+		return 0, err
+	}
+	if leftKind != rightKind {
+		if leftKind < rightKind {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	switch leftKind {
+	case ckStatisticNull:
+		return 0, nil
+	case ckStatisticBool:
+		return strings.Compare(left, right), nil
+	case ckStatisticNumber:
+		return compareCanonicalStatisticNumbers(left, right)
+	case ckStatisticString:
+		var leftString, rightString string
+		if err := json.Unmarshal([]byte(left), &leftString); err != nil {
+			return 0, err
+		}
+		if err := json.Unmarshal([]byte(right), &rightString); err != nil {
+			return 0, err
+		}
+		return strings.Compare(leftString, rightString), nil
+	default:
+		return 0, errors.New("unknown canonical statistic scalar kind")
+	}
+}
+
+const (
+	ckStatisticNull = iota
+	ckStatisticBool
+	ckStatisticNumber
+	ckStatisticString
+)
+
+func canonicalStatisticKind(value string) (int, error) {
+	switch {
+	case value == "null":
+		return ckStatisticNull, nil
+	case value == "false" || value == "true":
+		return ckStatisticBool, nil
+	case len(value) != 0 && value[0] == '"':
+		return ckStatisticString, nil
+	case len(value) != 0:
+		return ckStatisticNumber, nil
+	default:
+		return 0, errors.New("empty canonical statistic scalar")
+	}
+}
+
+func compareCanonicalStatisticNumbers(left, right string) (int, error) {
+	a, err := parseCanonicalStatisticNumber(left)
+	if err != nil {
+		return 0, err
+	}
+	b, err := parseCanonicalStatisticNumber(right)
+	if err != nil {
+		return 0, err
+	}
+	if a.negative != b.negative {
+		if a.negative {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	comparison := a.exponent.Cmp(&b.exponent)
+	if comparison == 0 {
+		width := max(len(a.digits), len(b.digits))
+		for i := 0; i < width; i++ {
+			leftDigit, rightDigit := byte('0'), byte('0')
+			if i < len(a.digits) {
+				leftDigit = a.digits[i]
+			}
+			if i < len(b.digits) {
+				rightDigit = b.digits[i]
+			}
+			if leftDigit < rightDigit {
+				comparison = -1
+				break
+			}
+			if leftDigit > rightDigit {
+				comparison = 1
+				break
+			}
+		}
+	}
+	if a.negative {
+		comparison = -comparison
+	}
+	return comparison, nil
+}
+
+// CanonicalNumberFitsDecimalBytes reports whether materializing canonical as
+// a plain finite decimal is conservatively bounded by maxBytes. It rejects a
+// huge positive or negative exponent using only exponent-sized arithmetic.
+func CanonicalNumberFitsDecimalBytes(canonical string, maxBytes uint64) bool {
+	if maxBytes == 0 {
+		return true
+	}
+	number, err := parseCanonicalStatisticNumber(canonical)
+	if err != nil {
+		return false
+	}
+	digits := big.NewInt(int64(len(number.digits)))
+	var needed big.Int
+	if number.exponent.Sign() >= 0 {
+		digitsMinusOne := new(big.Int).Sub(new(big.Int).Set(digits), big.NewInt(1))
+		if number.exponent.Cmp(digitsMinusOne) >= 0 {
+			needed.Add(&number.exponent, big.NewInt(1))
+		} else {
+			needed.Add(digits, big.NewInt(1)) // decimal point inside the coefficient
+		}
+	} else {
+		needed.Neg(&number.exponent)
+		needed.Add(&needed, digits)
+		needed.Add(&needed, big.NewInt(1)) // leading "0."
+	}
+	if number.negative {
+		needed.Add(&needed, big.NewInt(1))
+	}
+	return needed.Cmp(new(big.Int).SetUint64(maxBytes)) <= 0
 }
 
 func statisticsError(table, reason string) error {
@@ -340,12 +639,24 @@ func (c *StatisticsCatalog) Descriptors() []TableStatistics {
 		return nil
 	}
 	out := make([]TableStatistics, len(c.tables))
+	partitionCursor := 0
 	for tableIndex := range c.tables {
 		table := c.tables[tableIndex]
 		descriptor := &out[tableIndex]
 		descriptor.Table = strings.Clone(c.string(table.name))
 		descriptor.Rows = table.rows.public()
 		descriptor.RowBytes = table.rowBytes.public()
+		partitionStart := partitionCursor
+		for partitionCursor < len(c.partitions) && c.partitions[partitionCursor].table == table.name {
+			partitionCursor++
+		}
+		descriptor.Partitions = make([]PartitionStatistics, partitionCursor-partitionStart)
+		for i := partitionStart; i < partitionCursor; i++ {
+			partition := c.partitions[i]
+			descriptor.Partitions[i-partitionStart] = PartitionStatistics{
+				Partition: strings.Clone(c.string(partition.partition)), Rows: partition.rows.public(),
+			}
+		}
 		descriptor.Columns = make([]ColumnStatistics, table.columnCount)
 		for columnOffset := uint32(0); columnOffset < table.columnCount; columnOffset++ {
 			entry := c.columns[table.columnBase+columnOffset]
@@ -384,6 +695,7 @@ func (c *StatisticsCatalog) RetainedBytes() uint64 {
 		uint64(cap(c.columns))*uint64(unsafe.Sizeof(compactColumnStatistic{})) +
 		uint64(cap(c.common))*uint64(unsafe.Sizeof(compactValueFrequency{})) +
 		uint64(cap(c.histogram))*uint64(unsafe.Sizeof(compactHistogramBucket{})) +
+		uint64(cap(c.partitions))*uint64(unsafe.Sizeof(compactPartitionStatistic{})) +
 		uint64(len(c.arena))
 }
 
@@ -431,6 +743,35 @@ func (s TableStatistic) RowBytes() Estimate {
 		return Estimate{}
 	}
 	return s.catalog.tables[s.index].rowBytes.public()
+}
+
+// PartitionRows returns the immutable row estimate for one physical partition.
+// The composite table/partition binary search allocates nothing.
+func (s TableStatistic) PartitionRows(partition string) (Estimate, bool) {
+	if s.catalog == nil || int(s.index) >= len(s.catalog.tables) {
+		return Estimate{}, false
+	}
+	tableName := s.catalog.string(s.catalog.tables[s.index].name)
+	lo, hi := 0, len(s.catalog.partitions)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		entry := s.catalog.partitions[mid]
+		entryTable := s.catalog.string(entry.table)
+		if entryTable < tableName ||
+			(entryTable == tableName && s.catalog.string(entry.partition) < partition) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(s.catalog.partitions) {
+		return Estimate{}, false
+	}
+	entry := s.catalog.partitions[lo]
+	if s.catalog.string(entry.table) != tableName || s.catalog.string(entry.partition) != partition {
+		return Estimate{}, false
+	}
+	return entry.rows.public(), true
 }
 
 func (s TableStatistic) Column(path string) (ColumnStatistic, bool) {
@@ -495,20 +836,82 @@ func (s ColumnStatistic) AvgValueBytes() float64 {
 // exactly when present and distributes the remaining non-null mass over the
 // remaining distinct values otherwise.
 func (s ColumnStatistic) EqualitySelectivity(canonicalScalar string) float64 {
+	return s.EqualitySelectivityEstimate(canonicalScalar).Value
+}
+
+// EqualitySelectivityEstimate returns a risk-aware selectivity interval. Tail
+// bounds use the NDV interval inversely: a smaller possible NDV means a larger
+// possible equality result. canonicalScalar must be the output of
+// [CanonicalScalarJSON]; keeping canonicalization off this hot lookup preserves
+// its zero-allocation contract.
+func (s ColumnStatistic) EqualitySelectivityEstimate(canonicalScalar string) Estimate {
 	if s.catalog == nil || int(s.index) >= len(s.catalog.columns) {
-		return 0.1
+		return Estimate{Value: 0.1, Lower: 0, Upper: 1, Confidence: 0}
 	}
 	entry := s.catalog.columns[s.index]
 	commonTotal := 0.0
 	for i := uint32(0); i < entry.commonCount; i++ {
 		value := s.catalog.common[entry.commonBase+i]
 		if s.catalog.string(value.value) == canonicalScalar {
-			return value.frequency
+			return Estimate{
+				Value: value.frequency, Lower: value.frequency, Upper: value.frequency,
+				Confidence: float64(entry.distinct.confidence),
+			}
 		}
 		commonTotal += value.frequency
 	}
-	distinct := max(1, entry.distinct.value-float64(entry.commonCount))
-	return max(0, 1-float64(entry.nullFraction)-commonTotal) / distinct
+	tail := max(0, 1-float64(entry.nullFraction)-commonTotal)
+	common := float64(entry.commonCount)
+	valueDistinct := max(1, entry.distinct.value-common)
+	upperDistinct := max(1, entry.distinct.upper-common)
+	lowerDistinct := float64(entry.distinct.lower) - common
+	upper := tail
+	if lowerDistinct > 1 {
+		upper = tail / lowerDistinct
+	}
+	return Estimate{
+		Value:      min(1, tail/valueDistinct),
+		Lower:      min(1, tail/upperDistinct),
+		Upper:      min(1, upper),
+		Confidence: float64(entry.distinct.confidence),
+	}.Normalize(0.1)
+}
+
+// LessThanSelectivityEstimate estimates path < upper (or <= upper when
+// inclusive) from cumulative equi-depth buckets. The returned interval spans
+// the containing bucket because no within-bucket distribution is invented.
+func (s ColumnStatistic) LessThanSelectivityEstimate(canonicalUpper string, inclusive bool) Estimate {
+	if s.catalog == nil || int(s.index) >= len(s.catalog.columns) {
+		return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
+	}
+	entry := s.catalog.columns[s.index]
+	if entry.histCount == 0 {
+		return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
+	}
+	previous := 0.0
+	for i := uint32(0); i < entry.histCount; i++ {
+		bucket := s.catalog.histogram[entry.histBase+i]
+		comparison, err := CompareCanonicalScalarJSON(s.catalog.string(bucket.upper), canonicalUpper)
+		if err != nil {
+			return Estimate{Value: 1.0 / 3, Lower: 0, Upper: 1, Confidence: 0}
+		}
+		if comparison >= 0 {
+			value := (previous + bucket.frequency) / 2
+			if comparison == 0 && inclusive {
+				value = bucket.frequency
+			}
+			return Estimate{
+				Value: value, Lower: previous, Upper: bucket.frequency,
+				Confidence: float64(entry.distinct.confidence),
+			}.Normalize(value)
+		}
+		previous = bucket.frequency
+	}
+	nonNull := max(previous, 1-float64(entry.nullFraction))
+	return Estimate{
+		Value: (previous + nonNull) / 2, Lower: previous, Upper: nonNull,
+		Confidence: float64(entry.distinct.confidence),
+	}.Normalize(nonNull)
 }
 
 func (c *StatisticsCatalog) string(ref statisticStringRef) string {

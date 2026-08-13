@@ -13,6 +13,10 @@ func testStatistics(t testing.TB) *StatisticsCatalog {
 		{
 			Table: "events", Rows: Estimate{Value: 1_000_000, Lower: 900_000, Upper: 1_100_000, Confidence: .95},
 			RowBytes: Estimate{Value: 128, Lower: 64, Upper: 256, Confidence: .9},
+			Partitions: []PartitionStatistics{
+				{Partition: "s0", Rows: Estimate{Value: 400_000, Upper: 450_000, Confidence: .9}},
+				{Partition: "s1", Rows: Estimate{Value: 600_000, Upper: 650_000, Confidence: .9}},
+			},
 			Columns: []ColumnStatistics{
 				{
 					Path: "/tenant", Distinct: Estimate{Value: 1000, Upper: 1200, Confidence: .9},
@@ -42,6 +46,9 @@ func TestStatisticsCatalogCompactLookupAndRoundTrip(t *testing.T) {
 		table.Rows().Upper != 1_100_000 {
 		t.Fatalf("table = %+v/%v", table, ok)
 	}
+	if partition, ok := table.PartitionRows("s1"); !ok || partition.Value != 600_000 || partition.Upper != 650_000 {
+		t.Fatalf("partition s1 = %+v/%v", partition, ok)
+	}
 	column, ok := table.Column("/tenant")
 	if !ok {
 		t.Fatal("column lookup missed")
@@ -52,12 +59,22 @@ func TestStatisticsCatalogCompactLookupAndRoundTrip(t *testing.T) {
 	if got := column.EqualitySelectivity(`"other"`); got <= 0 || got >= .001 {
 		t.Fatalf("tail selectivity = %v, want a small positive estimate", got)
 	}
+	if estimate := column.EqualitySelectivityEstimate(`"other"`); estimate.Lower > estimate.Value || estimate.Value > estimate.Upper || estimate.Confidence <= 0 {
+		t.Fatalf("tail selectivity interval = %+v", estimate)
+	}
+	if estimate := column.LessThanSelectivityEstimate(`"m"`, true); estimate.Value != .45 || estimate.Lower != 0 || estimate.Upper != .45 {
+		t.Fatalf("inclusive histogram boundary = %+v", estimate)
+	}
+	if estimate := column.LessThanSelectivityEstimate(`"t"`, false); estimate.Lower != .45 || estimate.Upper != .9 || estimate.Value <= estimate.Lower || estimate.Value >= estimate.Upper {
+		t.Fatalf("within-bucket histogram interval = %+v", estimate)
+	}
 	descriptors := catalog.Descriptors()
 	roundTrip, err := NewStatisticsCatalog(9, descriptors)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := roundTrip.Descriptors(); len(got) != 1 || got[0].Rows.Lower != 900_000 ||
+		len(got[0].Partitions) != 2 || got[0].Partitions[1].Partition != "s1" ||
 		len(got[0].Columns) != 1 ||
 		len(got[0].Columns[0].MostCommon) != 1 || len(got[0].Columns[0].Histogram) != 2 {
 		t.Fatalf("round trip = %+v", got)
@@ -69,6 +86,72 @@ func TestStatisticsCatalogCompactLookupAndRoundTrip(t *testing.T) {
 	}); allocs != 0 {
 		t.Fatalf("statistics lookup allocations = %v, want 0", allocs)
 	}
+}
+
+func TestCanonicalStatisticScalars(t *testing.T) {
+	numbers := []string{"5", "5.0", "50e-1", "0.5e1"}
+	for _, number := range numbers {
+		canonical, err := CanonicalScalarJSON(number)
+		if err != nil {
+			t.Fatalf("CanonicalScalarJSON(%q): %v", number, err)
+		}
+		if canonical != "5" {
+			t.Fatalf("CanonicalScalarJSON(%q) = %q, want 5", number, canonical)
+		}
+	}
+	canonical, err := CanonicalScalarJSON(`"\u003c"`)
+	if err != nil || canonical != `"\u003c"` {
+		t.Fatalf("canonical escaped string = %q, %v", canonical, err)
+	}
+	comparison, err := CompareCanonicalScalarJSON("1e1000000000", "9e999999999")
+	if err != nil || comparison <= 0 {
+		t.Fatalf("huge canonical number comparison = %d, %v", comparison, err)
+	}
+	if CanonicalNumberFitsDecimalBytes("1e1000000000", 1024) {
+		t.Fatal("huge canonical number passed decimal materialization admission")
+	}
+	if !CanonicalNumberFitsDecimalBytes("1", 1) || CanonicalNumberFitsDecimalBytes("-1", 1) ||
+		!CanonicalNumberFitsDecimalBytes("1e-2", 4) {
+		t.Fatal("exact decimal byte admission rejected or accepted a boundary incorrectly")
+	}
+
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "t", Rows: ExactEstimate(10), RowBytes: ExactEstimate(8),
+		Columns: []ColumnStatistics{{
+			Path: "/n", Distinct: ExactEstimate(2),
+			MostCommon: []ValueFrequency{{Value: "5.0", Frequency: .4}},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, _ := catalog.Table("t")
+	column, _ := table.Column("/n")
+	if got := column.EqualitySelectivity("5"); got != .4 {
+		t.Fatalf("canonical numeric heavy hitter selectivity = %v, want .4", got)
+	}
+}
+
+func FuzzCanonicalScalarJSON(f *testing.F) {
+	for _, seed := range []string{
+		`0`, `-0`, `5.0`, `50e-1`, `1e1000000000`, `1e-1000000000`,
+		`true`, `null`, `"text"`, `"\u003c"`, `{}`, `1 trailing`,
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, value string) {
+		canonical, err := CanonicalScalarJSON(value)
+		if err != nil {
+			return
+		}
+		second, err := CanonicalScalarJSON(canonical)
+		if err != nil {
+			t.Fatalf("canonical output %q is invalid: %v", canonical, err)
+		}
+		if second != canonical {
+			t.Fatalf("canonicalization is not idempotent: %q then %q", canonical, second)
+		}
+	})
 }
 
 func TestStatisticsCatalogSpaceShape(t *testing.T) {
@@ -84,9 +167,12 @@ func TestStatisticsCatalogSpaceShape(t *testing.T) {
 	if got := unsafe.Sizeof(compactHistogramBucket{}); got != 24 {
 		t.Fatalf("compact histogram bucket = %d bytes, want 24", got)
 	}
+	if got := unsafe.Sizeof(compactPartitionStatistic{}); got != 40 {
+		t.Fatalf("compact partition statistic = %d bytes, want 40", got)
+	}
 	catalog := testStatistics(t)
-	if got := catalog.RetainedBytes(); got > 256 {
-		t.Fatalf("retained bytes = %d, want <= 256 for one table/column/skew profile", got)
+	if got := catalog.RetainedBytes(); got > 384 {
+		t.Fatalf("retained bytes = %d, want <= 384 for one table/column/skew/partition profile", got)
 	}
 }
 
@@ -107,10 +193,21 @@ func TestStatisticsValidation(t *testing.T) {
 		{"container heavy hitter", func(s *TableStatistics) {
 			s.Columns[0].MostCommon = []ValueFrequency{{Value: `{}`, Frequency: .1}}
 		}},
+		{"equivalent heavy hitters", func(s *TableStatistics) {
+			s.Columns[0].MostCommon = []ValueFrequency{
+				{Value: `5`, Frequency: .1}, {Value: `5.0`, Frequency: .1},
+			}
+		}},
 		{"regressed histogram", func(s *TableStatistics) {
 			s.Columns[0].Histogram = []HistogramBucket{
 				{Upper: `1`, Frequency: .7, Distinct: 2},
 				{Upper: `2`, Frequency: .6, Distinct: 3},
+			}
+		}},
+		{"unordered histogram bounds", func(s *TableStatistics) {
+			s.Columns[0].Histogram = []HistogramBucket{
+				{Upper: `2`, Frequency: .4, Distinct: 1},
+				{Upper: `1`, Frequency: .8, Distinct: 2},
 			}
 		}},
 	}
@@ -177,4 +274,27 @@ func BenchmarkStatisticsCatalogBuild1KTables(b *testing.B) {
 		}
 		_ = catalog
 	}
+}
+
+func BenchmarkPartitionStatisticsLookup1KPartitions(b *testing.B) {
+	partitions := make([]PartitionStatistics, 1024)
+	for i := range partitions {
+		partitions[i] = PartitionStatistics{
+			Partition: fmt.Sprintf("shard-%04d", i), Rows: ExactEstimate(float64(1_000 + i)),
+		}
+	}
+	catalog, err := NewStatisticsCatalog(1, []TableStatistics{{
+		Table: "events", Rows: ExactEstimate(2_000_000), RowBytes: ExactEstimate(128),
+		Partitions: partitions,
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	table, _ := catalog.Table("events")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = table.PartitionRows("shard-0512")
+	}
+	b.ReportMetric(float64(catalog.RetainedBytes())/1024, "retained-B/partition")
 }

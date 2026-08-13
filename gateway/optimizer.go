@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
+	"strconv"
 
 	"github.com/thesyncim/vibedb/distribution"
 	queryplanner "github.com/thesyncim/vibedb/planner"
@@ -219,14 +221,15 @@ func optimizeDistributedPlan(
 	profile Profile,
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	const privateID queryplanner.PrivateID = 1
-	rows, rowBytes := distributedEstimates(snap, bound, route)
+	scanRows, outputRows, rowBytes := distributedEstimates(snap, bound, route)
 	metadata := distributedPrivate{
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
-		scanRows: rows, outputRows: rows, rowBytes: rowBytes,
+		scanRows: scanRows, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates,
 	}
 	if bound.limit > 0 && len(bound.aggregates) == 0 {
-		metadata.outputRows = min(rows, float64(bound.limit*max(1, len(route.Targets))))
+		metadata.outputRows = min(outputRows,
+			float64(bound.limit)*float64(max(1, len(route.Targets))))
 	}
 	if len(bound.aggregates) != 0 {
 		metadata.outputRows = float64(len(route.Targets))
@@ -303,15 +306,100 @@ func optimizeDistributedPlan(
 	return plan, optimizer.Statistics(), err
 }
 
-func distributedEstimates(snap *Snapshot, bound *BoundPlan, route distribution.Route) (rows, rowBytes float64) {
-	rows, rowBytes = 1000*float64(max(1, len(route.Targets))), 128
+func distributedEstimates(
+	snap *Snapshot,
+	bound *BoundPlan,
+	route distribution.Route,
+) (scanRows, outputRows, rowBytes float64) {
+	rowBytes = 128
+	if len(route.Targets) == 0 {
+		if statistics, ok := snap.Statistics(bound.table); ok {
+			rowBytes = max(1, statistics.RowBytes().Normalize(rowBytes).Upper)
+		}
+		return 0, 0, rowBytes
+	}
+	scanRows = 1000 * float64(len(route.Targets))
+	outputRows = scanRows
 	statistics, ok := snap.Statistics(bound.table)
 	if !ok {
-		return rows, rowBytes
+		return scanRows, outputRows, rowBytes
 	}
-	rows = statistics.Rows().Normalize(rows).Upper
+	tableRows := statistics.Rows().Normalize(scanRows).Upper
 	rowBytes = statistics.RowBytes().Normalize(rowBytes).Upper
-	shards := max(1, bound.manifest.ShardCount())
-	rows *= float64(len(route.Targets)) / float64(shards)
-	return max(0, rows), max(1, rowBytes)
+	partitionRows, completePartitions := 0.0, true
+	for _, target := range route.Targets {
+		estimate, exists := statistics.PartitionRows(string(target.Shard))
+		if !exists {
+			completePartitions = false
+			break
+		}
+		partitionRows += estimate.Normalize(tableRows).Upper
+	}
+	if completePartitions {
+		scanRows = min(tableRows, partitionRows)
+	} else {
+		// A whole-table upper bound cannot be divided by shard count under skew.
+		// Without every selected partition estimate, retain the conservative
+		// table bound rather than assuming uniform placement.
+		scanRows = tableRows
+	}
+	outputRows = scanRows
+
+	placement, _, _, placed := snap.plannerTableFor(bound.table)
+	if !placed {
+		return max(0, scanRows), max(0, outputRows), max(1, rowBytes)
+	}
+	selectivities := make([]float64, 0, len(bound.constraints))
+	for ordinal, domain := range bound.constraints {
+		if domain.Kind == distribution.DomainEmpty {
+			return max(0, scanRows), 0, max(1, rowBytes)
+		}
+		if domain.Kind != distribution.DomainFinite || ordinal >= len(placement.Columns) {
+			continue
+		}
+		column, exists := statistics.Column(placement.Columns[ordinal])
+		if !exists {
+			continue
+		}
+		selectivity := 0.0
+		complete := true
+		for _, value := range domain.Values {
+			canonical, valid := boundStatisticScalar(value)
+			if !valid {
+				complete = false
+				break
+			}
+			selectivity += column.EqualitySelectivityEstimate(canonical).Upper
+		}
+		if complete {
+			selectivities = append(selectivities, min(1, selectivity))
+		}
+	}
+	if len(selectivities) != 0 {
+		// Exponential backoff applies the strongest predicate fully and reduces
+		// the independence assumption for each additional key correlation.
+		slices.Sort(selectivities)
+		combined, exponent := 1.0, 1.0
+		for _, selectivity := range selectivities {
+			combined *= math.Pow(selectivity, exponent)
+			exponent *= .5
+		}
+		outputRows = min(scanRows, tableRows*combined)
+	}
+	return max(0, scanRows), max(0, outputRows), max(1, rowBytes)
+}
+
+func boundStatisticScalar(value distribution.Scalar) (string, bool) {
+	var encoded string
+	switch value.Kind() {
+	case distribution.KindString:
+		raw, _ := value.StringValue()
+		encoded = strconv.Quote(raw)
+	case distribution.KindNumber:
+		encoded, _ = value.NumberSpelling()
+	default:
+		return "", false
+	}
+	canonical, err := queryplanner.CanonicalScalarJSON(encoded)
+	return canonical, err == nil
 }

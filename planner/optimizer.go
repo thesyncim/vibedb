@@ -140,6 +140,9 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := required.Validate(); err != nil {
+		return nil, err
+	}
 	o.stats = OptimizerStatistics{}
 	o.plans = 0
 	defer func() {
@@ -165,6 +168,9 @@ func (o *Optimizer) Optimize(ctx context.Context, root GroupID, required Physica
 }
 
 func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*Plan, error) {
+	if o.depth >= o.Memo.limits.MaxSearchDepth {
+		return nil, fmt.Errorf("%w: search depth reached %d", ErrSearchBudget, o.Memo.limits.MaxSearchDepth)
+	}
 	o.depth++
 	o.stats.PeakSearchDepth = max(o.stats.PeakSearchDepth, o.depth)
 	defer func() { o.depth-- }()
@@ -195,7 +201,7 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 	}()
 
 	var best *Plan
-	for _, id := range o.Memo.groups[group].expressions {
+	for id := o.Memo.groups[group].firstExpression; id != NoExpr; id = o.Memo.expressions[id].next {
 		record := o.Memo.expression(id)
 		if !o.Model.IsPhysical(record.expr) {
 			continue
@@ -217,6 +223,11 @@ func (o *Optimizer) optimizeGroup(group GroupID, required PhysicalProperties) (*
 			if len(childRequired) != len(record.expr.Children) {
 				return nil, fmt.Errorf("%w: %s has %d children but model returned %d requirements",
 					ErrInvalidMemo, record.expr.Op, len(record.expr.Children), len(childRequired))
+			}
+			for _, properties := range childRequired {
+				if err := properties.Validate(); err != nil {
+					return nil, fmt.Errorf("planner: child requirement for %s: %w", record.expr.Op, err)
+				}
 			}
 			children := make([]*Plan, len(record.expr.Children))
 			eligible := true
@@ -261,6 +272,9 @@ func (o *Optimizer) buildCandidate(
 	if err != nil {
 		return nil, fmt.Errorf("planner: properties for %s: %w", expr.Op, err)
 	}
+	if err := provided.validateProvided(); err != nil {
+		return nil, fmt.Errorf("planner: properties for %s: %w", expr.Op, err)
+	}
 	local, err := o.Model.LocalCost(o.Memo, group, id, expr, children)
 	if err != nil {
 		return nil, fmt.Errorf("planner: cost for %s: %w", expr.Op, err)
@@ -303,6 +317,9 @@ func (o *Optimizer) buildCandidate(
 		for _, step := range chain {
 			if step.Op == OpInvalid || !step.Cost.valid() {
 				return nil, fmt.Errorf("%w: invalid enforcer for group %d", ErrInvalidCost, group)
+			}
+			if err := step.Provided.validateProvided(); err != nil {
+				return nil, fmt.Errorf("planner: enforcer properties for group %d: %w", group, err)
 			}
 			candidate = &Plan{
 				Group: group, Expr: NoExpr,
@@ -352,19 +369,35 @@ func betterPlan(candidate, current *Plan, objective Objective) bool {
 }
 
 func planFingerprint(p *Plan) string {
-	var b strings.Builder
-	b.WriteString(strconv.FormatUint(uint64(p.Expression.Op), 10))
-	b.WriteByte(':')
-	b.WriteString(strconv.FormatUint(uint64(p.Expression.Private), 10))
-	b.WriteByte('[')
+	b := make([]byte, 0, 64)
+	b = strconv.AppendUint(b, uint64(p.Expression.Op), 10)
+	b = append(b, ':')
+	b = strconv.AppendUint(b, uint64(p.Expression.Private), 10)
+	b = append(b, '{')
+	b = strconv.AppendUint(b, uint64(p.Provided.Distribution.Kind), 10)
+	b = append(b, '/')
+	b = strconv.AppendUint(b, uint64(p.Provided.Distribution.Partitions), 10)
+	b = append(b, ':')
+	for _, key := range p.Provided.Distribution.Keys {
+		b = strconv.AppendUint(b, uint64(key), 10)
+		b = append(b, ',')
+	}
+	b = append(b, '|')
+	for _, term := range p.Provided.Ordering {
+		b = strconv.AppendUint(b, uint64(term.Column), 10)
+		b = append(b, '/')
+		b = strconv.AppendUint(b, uint64(term.Direction), 10)
+		b = append(b, '/', boolByte(term.NullsFirst), ',')
+	}
+	b = append(b, '}', '[')
 	for i, child := range p.Children {
 		if i != 0 {
-			b.WriteByte(',')
+			b = append(b, ',')
 		}
-		b.WriteString(child.fingerprint)
+		b = append(b, child.fingerprint...)
 	}
-	b.WriteByte(']')
-	return b.String()
+	b = append(b, ']')
+	return string(b)
 }
 
 // Score reports a plan's objective score.
