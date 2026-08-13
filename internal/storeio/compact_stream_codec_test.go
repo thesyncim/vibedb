@@ -262,7 +262,7 @@ func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
 	view := compactCodecRoundTrip(t, encoded, values)
 	var state compactStreamSequentialState
 	for row := range values {
-		got, valid := state.appendValue(nil, view, row)
+		got, valid := state.appendValue(nil, &view, row)
 		if !valid || !bytes.Equal(got, values[row]) {
 			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
 		}
@@ -303,7 +303,7 @@ func TestCompactAlphabetSequentialReservoirWidthsRestartsAndAllocations(t *testi
 				for at := range backing {
 					backing[at] = 0xff
 				}
-				got, valid := state.appendValue(backing[:0], view, row)
+				got, valid := state.appendValue(backing[:0], &view, row)
 				if !valid || !bytes.Equal(got, want) {
 					panic("packed alphabet sequential decode")
 				}

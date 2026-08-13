@@ -1165,7 +1165,7 @@ func admittedCompactStream(src []byte) (compactStreamView, bool) {
 	}, true
 }
 
-func (v compactStreamView) dictionaryEntry(id int) ([]byte, bool) {
+func (v *compactStreamView) dictionaryEntry(id int) ([]byte, bool) {
 	if id < 0 || id >= v.dictCount {
 		return nil, false
 	}
