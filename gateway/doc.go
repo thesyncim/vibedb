@@ -17,8 +17,9 @@
 // shapes without a proven cross-shard merge or colocation rule fail before any
 // shard is contacted.
 //
-// The client reuses the shardservice length-prefixed codec over an ordinary
-// net.Conn: one synchronous request/response round-trip per call. It maps a
+// The client reuses both shardservice's length-prefixed codec and a bounded set
+// of persistent net.Conns: one synchronous request/response round-trip per
+// exclusively borrowed connection. It maps a
 // shard's typed error frame back onto the distribution ownership sentinels and
 // onto gateway sentinels for deadline, resource-limit, read-only, unsupported
 // consistency, indeterminate-completion, and malformed refusals,

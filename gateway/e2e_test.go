@@ -237,7 +237,12 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 		man:     man,
 		mapper:  distribution.NewNativeMapper(1),
 		dialer:  dialer,
-		client:  NewClient(dialer.dial),
+		// Fan-out tests count physical dials as their dispatch oracle. Keep that
+		// transport diagnostic independent from the default client's reuse policy;
+		// client_pool_test.go covers pooling itself.
+		client: NewClientWithOptions(dialer.dial, ClientOptions{
+			DisableConnectionReuse: true,
+		}),
 	}
 
 	// Seed each shard through an uncounted dialer.
