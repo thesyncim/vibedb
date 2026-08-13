@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"testing"
 	"unsafe"
 
@@ -1025,6 +1026,337 @@ func TestCompactPrimaryScanDictionarySequentialParityAndBounds(t *testing.T) {
 	bad[1] = uint16(len(stream.dictData) + 1)
 	if _, ok := state.appendDictionary(got[:0], &stream, 0, bad); ok {
 		t.Fatal("dictionary scan accepted an out-of-range prepared boundary")
+	}
+}
+
+func compactPrimarySequentialDictionaryFixture(
+	cardinality, rows int,
+) (compactStreamView, []uint16, []int) {
+	width := bits.Len(uint(cardinality - 1))
+	ids := make([]int, rows)
+	exercised := make([]bool, cardinality)
+	for row := range rows {
+		ids[row] = (row*251 + row*row*17 + cardinality - 1) % cardinality
+		exercised[ids[row]] = true
+	}
+	directoryBacking := make([]byte, 2*cardinality+17)
+	for at := range directoryBacking {
+		directoryBacking[at] = 0xa5
+	}
+	directory := directoryBacking[:2*cardinality]
+	dictionaryBacking := make([]byte, 2*min(rows, cardinality)+17)
+	for at := range dictionaryBacking {
+		dictionaryBacking[at] = 0x5a
+	}
+	dictionary := dictionaryBacking[:0]
+	bounds := make([]uint16, cardinality+1)
+	for id := range cardinality {
+		if exercised[id] {
+			dictionary = append(dictionary, byte(id), byte(id>>8))
+		}
+		bounds[id+1] = uint16(len(dictionary))
+		binary.LittleEndian.PutUint16(directory[id*2:], uint16(len(dictionary)))
+	}
+
+	dataBytes := (rows*width + 7) / 8
+	dataBacking := make([]byte, dataBytes+17)
+	for at := range dataBacking {
+		dataBacking[at] = 0xff
+	}
+	data := dataBacking[:dataBytes]
+	clear(data)
+	for row := range rows {
+		compactPutBits(data, row*width, width, uint64(ids[row]))
+	}
+	// Keep the unused high bits and the backing capacity dirty. A sequential
+	// decoder must consume exactly count*width bits and never observe either.
+	if used := rows * width; used&7 != 0 {
+		data[len(data)-1] |= ^byte(uint16(1)<<uint(used&7) - 1)
+	}
+	return compactStreamView{
+		kind: compactStreamDictionary, width: uint8(width), count: rows,
+		dictCount: cardinality, dictDir: directory,
+		dictData: dictionary, data: data,
+	}, bounds, ids
+}
+
+func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
+	const rows = 2*compactStreamRestart + 1
+	for width := 0; width <= 16; width++ {
+		minimum := 1
+		maximum := 1
+		if width != 0 {
+			minimum = 1<<(width-1) + 1
+			maximum = 1 << width
+			if maximum > int(^uint16(0)) {
+				maximum = int(^uint16(0))
+			}
+		}
+		for _, cardinality := range []int{minimum, maximum} {
+			name := fmt.Sprintf("width=%d/cardinality=%d", width, cardinality)
+			t.Run(name, func(t *testing.T) {
+				stream, bounds, ids := compactPrimarySequentialDictionaryFixture(
+					cardinality, rows,
+				)
+				if err := stream.validate(); err != nil {
+					t.Fatalf("fixture is outside compact dictionary grammar: %v", err)
+				}
+				if got := bits.Len(uint(stream.dictCount - 1)); got != width {
+					t.Fatalf("fixture width=%d want=%d", got, width)
+				}
+				var state compactStreamSequentialState
+				var seenOffset [8]bool
+				dirty := make([]byte, 32)
+				for row, id := range ids {
+					seenOffset[row*width&7] = true
+					for at := range dirty {
+						dirty[at] = 0xcc
+					}
+					got, ok := state.appendDictionary(dirty[:0], &stream, row, bounds)
+					want, wantOK := stream.appendValue(nil, row)
+					if !ok || !wantOK || !bytes.Equal(got, want) ||
+						len(got) != 2 || int(binary.LittleEndian.Uint16(got)) != id {
+						t.Fatalf(
+							"row=%d offset=%d got=%x,%v want=%x,%v id=%d",
+							row, row*width&7, got, ok, want, wantOK, id,
+						)
+					}
+				}
+				for offset := range 8 {
+					mathematicallyReachable := false
+					for row := range 8 {
+						mathematicallyReachable = mathematicallyReachable ||
+							row*width&7 == offset
+					}
+					if seenOffset[offset] != mathematicallyReachable {
+						t.Fatalf(
+							"offset=%d seen=%v reachable=%v",
+							offset, seenOffset[offset], mathematicallyReachable,
+						)
+					}
+				}
+
+				// A retained state can serve random access without disturbing the
+				// next sequential ID, then a zero value restarts the traversal.
+				state = compactStreamSequentialState{}
+				for row := 0; row < 5; row++ {
+					if _, ok := state.appendDictionary(dirty[:0], &stream, row, bounds); !ok {
+						t.Fatalf("prefix row=%d", row)
+					}
+				}
+				snapshot := state
+				randomRow := compactStreamRestart + 3
+				got, ok := state.appendDictionary(dirty[:0], &stream, randomRow, bounds)
+				want, wantOK := stream.appendValue(nil, randomRow)
+				if !ok || !wantOK || !bytes.Equal(got, want) || state != snapshot {
+					t.Fatalf("random fallback changed sequential state: got=%+v want=%+v", state, snapshot)
+				}
+				if _, ok := state.appendDictionary(dirty[:0], &stream, 5, bounds); !ok {
+					t.Fatal("sequential decode did not resume after random fallback")
+				}
+				state = compactStreamSequentialState{}
+				for row := range rows {
+					got, ok := state.appendDictionary(dirty[:0], &stream, row, bounds)
+					if !ok || len(got) != 2 ||
+						int(binary.LittleEndian.Uint16(got)) != ids[row] {
+						t.Fatalf("restart row=%d got=%x ok=%v", row, got, ok)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCompactPrimaryScanDictionaryReservoirRejectsMalformedState(t *testing.T) {
+	stream, bounds, _ := compactPrimarySequentialDictionaryFixture(3, 3)
+	assertRejectedWithoutAdvance := func(
+		name string,
+		state compactStreamSequentialState,
+		view compactStreamView,
+		prepared []uint16,
+	) {
+		t.Helper()
+		dst := []byte{0xde, 0xad}
+		before := state
+		got, ok := state.appendDictionary(dst, &view, 0, prepared)
+		if ok || !bytes.Equal(got, dst) || state != before {
+			t.Fatalf("%s: got=%x ok=%v state=%+v want-state=%+v", name, got, ok, state, before)
+		}
+	}
+
+	invalidID := stream
+	invalidID.data = append([]byte(nil), stream.data...)
+	clear(invalidID.data)
+	compactPutBits(invalidID.data, 0, int(invalidID.width), uint64(invalidID.dictCount))
+	assertRejectedWithoutAdvance("dictionary id", compactStreamSequentialState{}, invalidID, bounds)
+
+	truncated := stream
+	truncated.data = truncated.data[:0]
+	assertRejectedWithoutAdvance("truncated data", compactStreamSequentialState{}, truncated, bounds)
+
+	tooWide := stream
+	tooWide.width = 17
+	assertRejectedWithoutAdvance("width", compactStreamSequentialState{}, tooWide, bounds)
+
+	decreasing := append([]uint16(nil), bounds...)
+	firstID := int(compactReadBits(stream.data, 0, int(stream.width)))
+	decreasing[firstID], decreasing[firstID+1] = 3, 2
+	assertRejectedWithoutAdvance("decreasing bounds", compactStreamSequentialState{}, stream, decreasing)
+
+	beyond := append([]uint16(nil), bounds...)
+	beyond[firstID+1] = uint16(len(stream.dictData) + 1)
+	assertRejectedWithoutAdvance("out-of-range bounds", compactStreamSequentialState{}, stream, beyond)
+
+	// A bounds failure after one width-2 ID must preserve the six carried
+	// bits, byte cursor, and next row so the same state can resume immediately.
+	width2, width2Bounds, _ := compactPrimarySequentialDictionaryFixture(3, 4)
+	var width2State compactStreamSequentialState
+	if _, ok := width2State.appendDictionary(nil, &width2, 0, width2Bounds); !ok ||
+		width2State.bit == 0 || width2State.value == 0 {
+		t.Fatalf("width-2 prefix state=%+v ok=%v", width2State, ok)
+	}
+	width2Snapshot := width2State
+	width2ID := int(compactReadBits(width2.data, int(width2.width), int(width2.width)))
+	badWidth2Bounds := append([]uint16(nil), width2Bounds...)
+	badWidth2Bounds[width2ID] = uint16(len(width2.dictData) + 1)
+	if _, ok := width2State.appendDictionary(nil, &width2, 1, badWidth2Bounds); ok ||
+		width2State != width2Snapshot {
+		t.Fatalf("width-2 bad bounds advanced state: got=%+v want=%+v", width2State, width2Snapshot)
+	}
+	if _, ok := width2State.appendDictionary(nil, &width2, 1, width2Bounds); !ok {
+		t.Fatal("width-2 state did not resume after bad bounds")
+	}
+
+	// Width 9 leaves seven bits of the next ID in the reservoir after row 0.
+	// Truncating before its refill byte must not discard that partial ID.
+	width9, width9Bounds, _ := compactPrimarySequentialDictionaryFixture(257, 3)
+	var width9State compactStreamSequentialState
+	if _, ok := width9State.appendDictionary(nil, &width9, 0, width9Bounds); !ok ||
+		width9State.bit != 7 || width9State.value == 0 {
+		t.Fatalf("width-9 prefix state=%+v ok=%v", width9State, ok)
+	}
+	width9Snapshot := width9State
+	truncatedWidth9 := width9
+	truncatedWidth9.data = truncatedWidth9.data[:width9State.cursor]
+	if _, ok := width9State.appendDictionary(nil, &truncatedWidth9, 1, width9Bounds); ok ||
+		width9State != width9Snapshot {
+		t.Fatalf("width-9 truncation advanced state: got=%+v want=%+v", width9State, width9Snapshot)
+	}
+	if _, ok := width9State.appendDictionary(nil, &width9, 1, width9Bounds); !ok {
+		t.Fatal("width-9 state did not resume after truncation")
+	}
+}
+
+func compactPrimaryScanSingleStreamView(
+	t *testing.T,
+	encoded compactStreamEncoding,
+	generation uint64,
+) CompactPrimaryStripeView {
+	t.Helper()
+	stream, err := encoded.appendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	static := []byte(`{"value":}`)
+	const holes = 1
+	templateBytes := 8 + (holes+1)*4 + len(static)
+	shapeData := make([]byte, compactPrimaryShapeHeader+templateBytes, compactPrimaryShapeHeader+templateBytes+len(stream))
+	binary.LittleEndian.PutUint32(shapeData, uint32(encoded.count))
+	binary.LittleEndian.PutUint16(shapeData[4:], holes)
+	binary.LittleEndian.PutUint32(shapeData[8:], uint32(templateBytes))
+	binary.LittleEndian.PutUint32(shapeData[12:], uint32(len(stream)))
+	template := shapeData[compactPrimaryShapeHeader:]
+	binary.LittleEndian.PutUint16(template, holes)
+	binary.LittleEndian.PutUint32(template[4:], uint32(len(static)))
+	binary.LittleEndian.PutUint32(template[8:], uint32(len(static)-1))
+	binary.LittleEndian.PutUint32(template[12:], uint32(len(static)))
+	copy(template[16:], static)
+	shapeData = append(shapeData, stream...)
+	shapeDir := make([]byte, 4)
+	binary.LittleEndian.PutUint32(shapeDir, uint32(len(shapeData)))
+	return CompactPrimaryStripeView{
+		header: CommonPrimaryLeafHeader{Bucket: 7, Generation: generation},
+		rows:   encoded.count, shapeCount: 1,
+		shapeDir: shapeDir, shapeData: shapeData,
+	}
+}
+
+func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
+	values := make([][]byte, 17)
+	spellings := [][]byte{[]byte(`"DE"`), []byte(`"PT"`), []byte(`"US"`)}
+	for row := range values {
+		values[row] = spellings[row%len(spellings)]
+	}
+	dictionary := compactPrimaryScanSingleStreamView(
+		t, encodeCompactDictionary(values), 1,
+	)
+	front := compactPrimaryScanSingleStreamView(t, encodeCompactFront(values), 2)
+	dictionaryAgain := compactPrimaryScanSingleStreamView(
+		t, encodeCompactDictionary(values), 3,
+	)
+
+	var decoder CompactPrimaryScanDecoder
+	decoder.prepare(&dictionary, 7)
+	plan := decoder.streamPlan[0]
+	if !decoder.supported || plan.dictionaryCount == 0 {
+		t.Fatal("initial dictionary stream was not planned")
+	}
+	first := int(plan.dictionaryFirst)
+	last := first + int(plan.dictionaryCount) + 1
+	for row := 0; row < 2; row++ {
+		if _, ok := decoder.streams[0].appendDictionary(
+			nil, &decoder.streamView[0], row, decoder.dictionary[first:last],
+		); !ok {
+			t.Fatalf("initial dictionary row=%d", row)
+		}
+	}
+	if decoder.streams[0].next != 2 {
+		t.Fatalf("initial dictionary state=%+v", decoder.streams[0])
+	}
+
+	decoder.prepare(&front, 7)
+	if !decoder.supported || decoder.streamView[0].kind != compactStreamFront ||
+		decoder.streamPlan[0] != (compactPrimaryScanStream{}) ||
+		decoder.streams[0] != (compactStreamSequentialState{}) {
+		t.Fatalf(
+			"front reprepare left dictionary state: plan=%+v state=%+v kind=%d",
+			decoder.streamPlan[0], decoder.streams[0], decoder.streamView[0].kind,
+		)
+	}
+
+	decoder.prepare(&dictionaryAgain, 7)
+	plan = decoder.streamPlan[0]
+	if !decoder.supported || plan.dictionaryCount == 0 ||
+		decoder.streams[0] != (compactStreamSequentialState{}) {
+		t.Fatalf("dictionary reprepare plan=%+v state=%+v", plan, decoder.streams[0])
+	}
+	first = int(plan.dictionaryFirst)
+	last = first + int(plan.dictionaryCount) + 1
+	got, ok := decoder.streams[0].appendDictionary(
+		nil, &decoder.streamView[0], 0, decoder.dictionary[first:last],
+	)
+	want, wantOK := decoder.streamView[0].appendValue(nil, 0)
+	if !ok || !wantOK || !bytes.Equal(got, want) {
+		t.Fatalf("dictionary after reprepare=%q,%v want=%q,%v", got, ok, want, wantOK)
+	}
+}
+
+func TestCompactPrimaryScanDictionaryReservoirZeroAlloc(t *testing.T) {
+	stream, bounds, ids := compactPrimarySequentialDictionaryFixture(65, 257)
+	dst := make([]byte, 0, 8)
+	decode := func() {
+		var state compactStreamSequentialState
+		for row, id := range ids {
+			got, ok := state.appendDictionary(dst[:0], &stream, row, bounds)
+			if !ok || len(got) != 2 ||
+				int(binary.LittleEndian.Uint16(got)) != id {
+				panic("dictionary reservoir parity")
+			}
+		}
+	}
+	decode()
+	if allocs := testing.AllocsPerRun(1_000, decode); allocs != 0 {
+		t.Fatalf("dictionary reservoir allocations=%v want 0", allocs)
 	}
 }
 

@@ -226,7 +226,33 @@ func (s *compactStreamSequentialState) appendDictionary(
 		row != s.next || len(bounds) != v.dictCount+1 {
 		return v.appendValue(dst, row)
 	}
-	id := int(compactReadBits(v.data, s.bit, int(v.width)))
+	width := int(v.width)
+	// Dictionary geometry admits widths 0..16. The stream has already passed
+	// the complete compact grammar, but keep this local gate so a malformed
+	// direct view cannot overflow the reservoir or index beyond its data.
+	if v.dictCount <= 0 || width > 16 {
+		return dst, false
+	}
+	// Carry unused little-endian ID bits between sequential rows instead of
+	// recomputing an absolute bit offset and crossing bytes from scratch. These
+	// fields are otherwise unused by dictionary streams, so the scan decoder's
+	// bounded footprint remains unchanged: value is the low-bit reservoir, bit
+	// is its available-bit count, and cursor is the next source byte.
+	reservoir := uint64(s.value)
+	available := s.bit
+	cursor := s.cursor
+	for available < width {
+		if cursor >= len(v.data) {
+			return dst, false
+		}
+		reservoir |= uint64(v.data[cursor]) << uint(available)
+		cursor++
+		available += 8
+	}
+	id := 0
+	if width != 0 {
+		id = int(reservoir & (uint64(1)<<uint(width) - 1))
+	}
 	if id < 0 || id >= v.dictCount {
 		return dst, false
 	}
@@ -234,7 +260,11 @@ func (s *compactStreamSequentialState) appendDictionary(
 	if end < start || end > len(v.dictData) {
 		return dst, false
 	}
-	s.bit += int(v.width)
+	reservoir >>= uint(width)
+	available -= width
+	s.value = int64(reservoir)
+	s.bit = available
+	s.cursor = cursor
 	s.next++
 	return append(dst, v.dictData[start:end]...), true
 }
