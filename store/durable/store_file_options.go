@@ -60,6 +60,9 @@ var (
 	// allocated enough of its sealed main-file ceiling for a requested write.
 	// EnsurePhysicalAllocation may advance that proof before the caller retries.
 	ErrPhysicalCapacity = storeio.ErrPhysicalCapacity
+	// ErrSealedJournalCapacity reports that a recovery journal or transaction
+	// marker cannot satisfy an exact immutable physical-capacity profile.
+	ErrSealedJournalCapacity = storeio.ErrSealedCapacityMismatch
 )
 
 // Backend selects the durable commit and speculative-read engines.
@@ -183,7 +186,13 @@ type Options struct {
 	// punch, reflink-clone, or otherwise change allocation on its main file; the
 	// cooperative writer lease cannot prevent those external mutations.
 	PhysicalCapacityBytes uint64
-	ResidentBytes         int64
+	// SealedRecoveryJournalBytes fixes the paired recovery journal's immutable,
+	// strictly allocated record-region capacity. It is Linux-only at create/open,
+	// requires DurabilitySync, and includes neither of the two 512-byte headers.
+	// A sealed journal never grows; pressure recycles its existing region or
+	// refuses a record that cannot fit in an empty region.
+	SealedRecoveryJournalBytes uint64
+	ResidentBytes              int64
 	// ReadConcurrency bounds portable positional-read workers.
 	ReadConcurrency int
 	// ReadQueueDepth bounds one native asynchronous read submission.
@@ -559,6 +568,15 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			)
 		}
 	}
+	if o.SealedRecoveryJournalBytes != 0 &&
+		(o.SealedRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes ||
+			o.SealedRecoveryJournalBytes%storeio.RecoveryJournalMinSectorSize != 0 ||
+			o.Durability != DurabilitySync) {
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"%w: sealed recovery journal requires synchronous durability and a bounded sector-aligned capacity",
+			ErrSealedJournalCapacity,
+		)
+	}
 	if o.MaxPageSize == 0 {
 		o.MaxPageSize = 64 << 10
 	}
@@ -617,6 +635,26 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"vibedb: collection MaxBatchBytes must hold one maximum document and every batch key",
 		)
+	}
+	if o.SealedRecoveryJournalBytes != 0 {
+		if o.MaxBatchBytes > math.MaxInt-storeio.RecoveryConditionalHeaderSize {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: conditional journal record bound overflows",
+				ErrSealedJournalCapacity,
+			)
+		}
+		required := storeio.RecoveryBatchRecordPaddedSizeForPayload(
+			storeio.RecoveryJournalMinSectorSize,
+			o.MaxBatchDocuments,
+			o.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+		)
+		if required <= 0 || uint64(required) > o.SealedRecoveryJournalBytes {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: largest conditional batch needs=%d capacity=%d",
+				ErrSealedJournalCapacity, required,
+				o.SealedRecoveryJournalBytes,
+			)
+		}
 	}
 	if o.Backend > BackendIOUring || o.ReadMode > ReadDirectRequire ||
 		o.WriteMode > WriteDirectRequire ||

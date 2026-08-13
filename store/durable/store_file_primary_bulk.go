@@ -432,7 +432,7 @@ func createFromPrimaryGraphRecords(
 						return normalized.primaryUnifiedOverlayBytes
 					}
 					return 0
-				}(),
+				}(), normalized.SealedRecoveryJournalBytes,
 			),
 		); err != nil {
 			_ = tx.Abort()

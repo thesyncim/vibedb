@@ -47,6 +47,10 @@ const (
 	// the file before decoding records.
 	TxnMarkerFormatVersion = uint32(1)
 
+	// txnMarkerFlagSealedCapacity marks Capacity as an immutable physical
+	// certificate. Every other bit in the current reserved flags word is invalid.
+	txnMarkerFlagSealedCapacity = uint32(1)
+
 	txnMarkerMagic       = "VTXNLOG\x00"
 	txnMarkerRecordMagic = uint32(0x304e5854) // "TXN0", little-endian.
 
@@ -125,6 +129,8 @@ type TxnMarkerHeader struct {
 	Epoch         uint64
 	BaseSequence  uint64
 	Capacity      uint64
+	// SealedCapacity requires an exact-size, strictly allocated marker file.
+	SealedCapacity bool
 	// RecycleCount is strictly monotonic across recycles. Open selects the
 	// valid header slot with the highest count.
 	RecycleCount uint64
@@ -138,10 +144,12 @@ type TxnParticipant struct {
 }
 
 // TxnMarkerOptions configures CreateTxnMarker / OpenTxnMarker. A zero Capacity
-// selects the package default at create time; Open ignores Capacity and trusts
-// the on-disk header (after the hard clamp).
+// selects the package default at unsealed create time. A non-zero open Capacity
+// is an exact assertion. SealedCapacity requires a non-zero, sector-aligned
+// Capacity and makes that geometry immutable.
 type TxnMarkerOptions struct {
-	Capacity uint64
+	Capacity       uint64
+	SealedCapacity bool
 }
 
 // TxnMarker is the single-writer file-backed manager for txn.vtm. It is not
@@ -167,6 +175,35 @@ type TxnMarker struct {
 	// barriers and appends; production wires the platform helpers.
 	markerSync func(*os.File) error
 	writeAt    func(p []byte, off int64) (int, error)
+}
+
+// TxnMarkerInspection is a read-only offline scan. It never proves physical
+// allocation and exposes no append, sync, recycle, or removal method.
+type TxnMarkerInspection struct {
+	marker *TxnMarker
+}
+
+func (i *TxnMarkerInspection) Header() TxnMarkerHeader {
+	if i == nil || i.marker == nil {
+		return TxnMarkerHeader{}
+	}
+	return i.marker.Header()
+}
+
+func (i *TxnMarkerInspection) Cursor() uint64 {
+	if i == nil || i.marker == nil {
+		return 0
+	}
+	return i.marker.Cursor()
+}
+
+func (i *TxnMarkerInspection) Close() error {
+	if i == nil || i.marker == nil {
+		return nil
+	}
+	err := i.marker.Close()
+	i.marker = nil
+	return err
 }
 
 // TxnDecisions is the scan of one open decision log: committed participant
@@ -375,6 +412,9 @@ func EncodeTxnMarkerHeader(dst []byte, h TxnMarkerHeader) ([]byte, error) {
 	binary.LittleEndian.PutUint64(sector[40:48], h.BaseSequence)
 	binary.LittleEndian.PutUint64(sector[48:56], h.Capacity)
 	binary.LittleEndian.PutUint64(sector[56:64], h.RecycleCount)
+	if h.SealedCapacity {
+		binary.LittleEndian.PutUint32(sector[64:68], txnMarkerFlagSealedCapacity)
+	}
 	checksum := PageChecksum(sector[:TxnMarkerHeaderSize-8])
 	binary.LittleEndian.PutUint32(sector[TxnMarkerHeaderSize-8:TxnMarkerHeaderSize-4], checksum)
 	binary.LittleEndian.PutUint32(sector[TxnMarkerHeaderSize-4:], ^checksum)
@@ -405,6 +445,14 @@ func DecodeTxnMarkerHeader(src []byte) (TxnMarkerHeader, error) {
 	h.BaseSequence = binary.LittleEndian.Uint64(src[40:48])
 	h.Capacity = binary.LittleEndian.Uint64(src[48:56])
 	h.RecycleCount = binary.LittleEndian.Uint64(src[56:64])
+	flags := binary.LittleEndian.Uint32(src[64:68])
+	if flags&^txnMarkerFlagSealedCapacity != 0 {
+		return TxnMarkerHeader{}, fmt.Errorf("%w: header flags", ErrTxnMarkerCorrupt)
+	}
+	if !allZero(src[68 : TxnMarkerHeaderSize-8]) {
+		return TxnMarkerHeader{}, fmt.Errorf("%w: header reserved bytes", ErrTxnMarkerCorrupt)
+	}
+	h.SealedCapacity = flags&txnMarkerFlagSealedCapacity != 0
 	if err := validateTxnMarkerHeader(h); err != nil {
 		return TxnMarkerHeader{}, err
 	}
@@ -678,22 +726,9 @@ func createTxnMarkerInRoot(
 			_ = root.Close()
 		}
 	}()
-	capacity := opts.Capacity
-	if capacity == 0 {
-		capacity = txnMarkerDefaultCapacityBytes
-	}
-	if capacity > TxnMarkerMaxCapacityBytes {
-		return nil, fmt.Errorf("%w: capacity", ErrTxnMarkerCorrupt)
-	}
-	sector := uint64(TxnMarkerMinSectorSize)
-	if remainder := capacity % sector; remainder != 0 {
-		rounded, ok := checkedSizeAdd(
-			capacity, sector-remainder, TxnMarkerMaxCapacityBytes,
-		)
-		if !ok {
-			return nil, fmt.Errorf("%w: capacity", ErrTxnMarkerCorrupt)
-		}
-		capacity = rounded
+	capacity, err := normalizeTxnMarkerOptionCapacity(opts, true)
+	if err != nil {
+		return nil, err
 	}
 
 	file, sourceDirInfo, err := openTxnMarkerEntry(
@@ -714,19 +749,34 @@ func createTxnMarkerInRoot(
 		return nil, err
 	}
 	header := TxnMarkerHeader{
-		FormatVersion: TxnMarkerFormatVersion,
-		MarkerID:      markerID,
-		Epoch:         1,
-		BaseSequence:  0,
-		Capacity:      capacity,
-		RecycleCount:  1,
+		FormatVersion:  TxnMarkerFormatVersion,
+		MarkerID:       markerID,
+		Epoch:          1,
+		BaseSequence:   0,
+		Capacity:       capacity,
+		SealedCapacity: opts.SealedCapacity,
+		RecycleCount:   1,
 	}
 	if err := validateTxnMarkerHeader(header); err != nil {
 		return nil, err
 	}
 
 	total := int64(txnMarkerRegionStart) + int64(capacity)
-	if err := txnMarkerPreallocate(file, total); err != nil {
+	if opts.SealedCapacity {
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return nil, statErr
+		}
+		if !info.Mode().IsRegular() || info.Size() != 0 {
+			return nil, fmt.Errorf(
+				"%w: sealed transaction marker create requires an empty regular file",
+				ErrSealedCapacityMismatch,
+			)
+		}
+		if err := StrictlyAllocateFile(file, total); err != nil {
+			return nil, fmt.Errorf("%w: strictly allocate transaction marker: %w", ErrSealedCapacityMismatch, err)
+		}
+	} else if err := txnMarkerPreallocate(file, total); err != nil {
 		return nil, err
 	}
 
@@ -745,6 +795,11 @@ func createTxnMarkerInRoot(
 	if err := runTxnMarkerCreateParentDirSync(root); err != nil {
 		return nil, err
 	}
+	if header.SealedCapacity {
+		if err := requireExactRegularFileSize(file, total); err != nil {
+			return nil, fmt.Errorf("%w: transaction marker after create sync: %w", ErrSealedCapacityMismatch, err)
+		}
+	}
 
 	m.headerSlot = 0
 	m.cursor = 0
@@ -758,7 +813,6 @@ func createTxnMarkerInRoot(
 // the greatest recycle count, scans the live record prefix into TxnDecisions,
 // and positions the append cursor at the first truncatable tail.
 func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecisions, error) {
-	_ = opts // Open trusts the on-disk header; options reserved for symmetry.
 	if path == "" {
 		return nil, nil, fmt.Errorf("%w: empty decision log path", ErrInvalidWrite)
 	}
@@ -773,6 +827,58 @@ func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecision
 	return openTxnMarkerInRoot(
 		root, path, filepath.Base(path), sourceDir, opts,
 	)
+}
+
+// InspectTxnMarker scans a decision log without changing or qualifying its
+// physical allocation. The returned inspection cannot mutate the marker.
+func InspectTxnMarker(
+	path string,
+) (*TxnMarkerInspection, *TxnDecisions, error) {
+	if path == "" {
+		return nil, nil, fmt.Errorf("%w: empty decision log path", ErrInvalidWrite)
+	}
+	sourceDir, err := canonicalTxnMarkerDir(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	root, err := os.OpenRoot(sourceDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, sourceDirInfo, err := openTxnMarkerEntry(
+		root, filepath.Base(path), os.O_RDONLY, 0,
+	)
+	if err != nil {
+		_ = root.Close()
+		return nil, nil, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = file.Close()
+			_ = root.Close()
+		}
+	}()
+	header, selected, err := selectTxnMarkerHeader(file)
+	if err != nil {
+		return nil, nil, err
+	}
+	if header.SealedCapacity {
+		total := int64(txnMarkerRegionStart) + int64(header.Capacity)
+		if err := requireExactRegularFileSize(file, total); err != nil {
+			return nil, nil, fmt.Errorf("%w: transaction marker inspection: %w", ErrSealedCapacityMismatch, err)
+		}
+	}
+	marker := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, header,
+	)
+	marker.headerSlot = uint32(selected)
+	decisions := &TxnDecisions{}
+	if err := marker.scanDecisions(decisions); err != nil {
+		return nil, nil, err
+	}
+	cleanup = false
+	return &TxnMarkerInspection{marker: marker}, decisions, nil
 }
 
 // OpenTxnMarkerAt opens name through a child handle of root. The returned
@@ -802,7 +908,11 @@ func openTxnMarkerInRoot(
 	sourceDir string,
 	opts TxnMarkerOptions,
 ) (*TxnMarker, *TxnDecisions, error) {
-	_ = opts // Open trusts the on-disk header; options reserved for symmetry.
+	expectedCapacity, err := normalizeTxnMarkerOptionCapacity(opts, false)
+	if err != nil {
+		_ = root.Close()
+		return nil, nil, err
+	}
 	file, sourceDirInfo, err := openTxnMarkerEntry(
 		root, name, os.O_RDWR, 0o600,
 	)
@@ -818,25 +928,39 @@ func openTxnMarkerInRoot(
 		}
 	}()
 
-	var slots [txnMarkerHeaderSlots][TxnMarkerHeaderSize]byte
-	selected := -1
-	var header TxnMarkerHeader
-	for slot := 0; slot < txnMarkerHeaderSlots; slot++ {
-		off := int64(slot) * TxnMarkerHeaderSize
-		if _, err := readFullAt(file, slots[slot][:], off); err != nil {
-			return nil, nil, err
-		}
-		h, err := DecodeTxnMarkerHeader(slots[slot][:])
-		if err != nil {
-			continue
-		}
-		if selected < 0 || h.RecycleCount > header.RecycleCount {
-			selected = slot
-			header = h
-		}
+	header, selected, err := selectTxnMarkerHeader(file)
+	if err != nil {
+		return nil, nil, err
 	}
-	if selected < 0 {
-		return nil, nil, ErrTxnMarkerNoValidHeader
+	if header.SealedCapacity != opts.SealedCapacity ||
+		expectedCapacity != 0 && header.Capacity != expectedCapacity {
+		return nil, nil, fmt.Errorf(
+			"%w: transaction marker expected=%d sealed=%t actual=%d sealed=%t",
+			ErrSealedCapacityMismatch, expectedCapacity, opts.SealedCapacity,
+			header.Capacity, header.SealedCapacity,
+		)
+	}
+	if header.SealedCapacity {
+		total := int64(txnMarkerRegionStart) + int64(header.Capacity)
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return nil, nil, statErr
+		}
+		if !info.Mode().IsRegular() || info.Size() != total {
+			return nil, nil, fmt.Errorf(
+				"%w: transaction marker size=%d want=%d",
+				ErrSealedCapacityMismatch, info.Size(), total,
+			)
+		}
+		if err := StrictlyAllocateFile(file, total); err != nil {
+			return nil, nil, fmt.Errorf("%w: reprove transaction marker: %w", ErrSealedCapacityMismatch, err)
+		}
+		if err := strictAllocationDataSync(file); err != nil {
+			return nil, nil, fmt.Errorf("%w: sync transaction marker allocation: %w", ErrSealedCapacityMismatch, err)
+		}
+		if err := requireExactRegularFileSize(file, total); err != nil {
+			return nil, nil, fmt.Errorf("%w: transaction marker after allocation sync: %w", ErrSealedCapacityMismatch, err)
+		}
 	}
 
 	m := newTxnMarkerManager(
@@ -849,6 +973,63 @@ func openTxnMarkerInRoot(
 	}
 	cleanup = false
 	return m, decisions, nil
+}
+
+func selectTxnMarkerHeader(file *os.File) (TxnMarkerHeader, int, error) {
+	var slots [txnMarkerHeaderSlots][TxnMarkerHeaderSize]byte
+	selected := -1
+	var header TxnMarkerHeader
+	for slot := 0; slot < txnMarkerHeaderSlots; slot++ {
+		off := int64(slot) * TxnMarkerHeaderSize
+		if _, err := readFullAt(file, slots[slot][:], off); err != nil {
+			return TxnMarkerHeader{}, -1, err
+		}
+		h, err := DecodeTxnMarkerHeader(slots[slot][:])
+		if err != nil {
+			continue
+		}
+		if selected < 0 || h.RecycleCount > header.RecycleCount {
+			selected = slot
+			header = h
+		}
+	}
+	if selected < 0 {
+		return TxnMarkerHeader{}, -1, ErrTxnMarkerNoValidHeader
+	}
+	return header, selected, nil
+}
+
+func normalizeTxnMarkerOptionCapacity(
+	opts TxnMarkerOptions,
+	creating bool,
+) (uint64, error) {
+	capacity := opts.Capacity
+	if opts.SealedCapacity && capacity == 0 {
+		return 0, fmt.Errorf("%w: sealed transaction marker requires an exact capacity", ErrSealedCapacityMismatch)
+	}
+	if capacity == 0 {
+		if creating {
+			return txnMarkerDefaultCapacityBytes, nil
+		}
+		return 0, nil
+	}
+	if capacity > TxnMarkerMaxCapacityBytes {
+		return 0, fmt.Errorf("%w: capacity", ErrTxnMarkerCorrupt)
+	}
+	sector := uint64(TxnMarkerMinSectorSize)
+	if remainder := capacity % sector; remainder != 0 {
+		if opts.SealedCapacity {
+			return 0, fmt.Errorf("%w: transaction marker capacity is not sector aligned", ErrSealedCapacityMismatch)
+		}
+		rounded, ok := checkedSizeAdd(
+			capacity, sector-remainder, TxnMarkerMaxCapacityBytes,
+		)
+		if !ok {
+			return 0, fmt.Errorf("%w: capacity", ErrTxnMarkerCorrupt)
+		}
+		capacity = rounded
+	}
+	return capacity, nil
 }
 
 func newTxnMarkerManager(

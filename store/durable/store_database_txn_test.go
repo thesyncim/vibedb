@@ -1107,6 +1107,57 @@ func TestDatabaseTxnMintFence(t *testing.T) {
 	})
 }
 
+func TestDatabaseTxnMintRetryRefencesExistingMarkerDirectoryEntry(t *testing.T) {
+	dir := t.TempDir()
+	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
+	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
+	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	productionFence := syncTxnLogMintResidueDirectory
+	defer func() { syncTxnLogMintResidueDirectory = productionFence }()
+	residueFences := 0
+	syncTxnLogMintResidueDirectory = func(root *os.Root) error {
+		residueFences++
+		return productionFence(root)
+	}
+	previousStageHook := databaseTxnAfterStageHook
+	defer func() { databaseTxnAfterStageHook = previousStageHook }()
+	databaseTxnAfterStageHook = func(_ int, _ string) error {
+		if residueFences != 1 {
+			return fmt.Errorf("staging began after %d residue directory fences", residueFences)
+		}
+		return nil
+	}
+
+	storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{
+		Phase: storeio.TxnMarkerFaultCreateParentDirSync,
+	})
+	defer storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+	update := func(batch *DatabaseBatch) error {
+		ab, _ := batch.Collection("a")
+		bb, _ := batch.Collection("b")
+		mustTxnPut(t, ab, "k", `{"n":1}`)
+		mustTxnPut(t, bb, "k", `{"n":1}`)
+		return nil
+	}
+	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), update); err == nil {
+		t.Fatal("first update survived parent-directory mint fence failure")
+	}
+	if residueFences != 0 {
+		t.Fatalf("initial failed mint ran %d residue fences", residueFences)
+	}
+	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), update); err != nil {
+		t.Fatalf("same-handle retry after directory fence failure: %v", err)
+	}
+	if residueFences != 1 {
+		t.Fatalf("same-handle retry directory fences = %d, want 1", residueFences)
+	}
+}
+
 func TestDatabaseTxnAllocationBudget(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())

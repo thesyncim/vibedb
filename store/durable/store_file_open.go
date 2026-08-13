@@ -157,6 +157,13 @@ func openCollection(
 	if err != nil {
 		return nil, err
 	}
+	if normalized.SealedRecoveryJournalBytes != 0 &&
+		root.JournalID == ([16]byte{}) {
+		return nil, fmt.Errorf(
+			"%w: sealed recovery-journal profile requires a rooted journal identity",
+			ErrSealedJournalCapacity,
+		)
+	}
 	// The ordered-primary root is mandatory in the sole current format.
 	if root.PrimaryRoot == (storeio.PageRef{}) {
 		return nil, fmt.Errorf(
@@ -422,7 +429,7 @@ func (c *Collection) createInitialState() error {
 					return c.options.primaryUnifiedOverlayBytes
 				}
 				return 0
-			}(),
+			}(), c.options.SealedRecoveryJournalBytes,
 		)
 		// Catalog-owned sync journals mint at the conditional format word so
 		// they may prepare kind-5 records without a later remint. Scalar-patch

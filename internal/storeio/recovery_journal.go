@@ -107,6 +107,11 @@ const (
 	// never coexists with conditional records under this format word.
 	RecoveryJournalFormatConditional = uint32(2)
 
+	// recoveryJournalFlagSealedCapacity marks Capacity as an immutable physical
+	// certificate. It occupies the current header's reserved flags word; every
+	// other bit remains invalid.
+	recoveryJournalFlagSealedCapacity = uint32(1)
+
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
 	// recoveryRecordKindDelete marks a key removal.
@@ -246,6 +251,9 @@ type RecoveryJournalHeader struct {
 	BaseGeneration uint64
 	BaseSequence   uint64
 	Capacity       uint64
+	// SealedCapacity requires an exact-size, strictly allocated journal file.
+	// The bit is immutable across recycle and disables capacity growth.
+	SealedCapacity bool
 	// RecycleCount is strictly monotonic across header publications (recycle or
 	// compatible capacity growth). Recovery selects the valid header slot with
 	// the highest count, so a torn publication leaves the previous slot as the
@@ -735,6 +743,9 @@ func EncodeRecoveryJournalHeader(dst []byte, h RecoveryJournalHeader) ([]byte, e
 	binary.LittleEndian.PutUint64(sector[64:72], h.BaseSequence)
 	binary.LittleEndian.PutUint64(sector[72:80], h.Capacity)
 	binary.LittleEndian.PutUint64(sector[80:88], h.RecycleCount)
+	if h.SealedCapacity {
+		binary.LittleEndian.PutUint32(sector[88:92], recoveryJournalFlagSealedCapacity)
+	}
 	checksum := PageChecksum(sector[:RecoveryJournalHeaderSize-8])
 	binary.LittleEndian.PutUint32(sector[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4], checksum)
 	binary.LittleEndian.PutUint32(sector[RecoveryJournalHeaderSize-4:], ^checksum)
@@ -772,6 +783,14 @@ func DecodeRecoveryJournalHeader(src []byte) (RecoveryJournalHeader, error) {
 	h.BaseSequence = binary.LittleEndian.Uint64(src[64:72])
 	h.Capacity = binary.LittleEndian.Uint64(src[72:80])
 	h.RecycleCount = binary.LittleEndian.Uint64(src[80:88])
+	flags := binary.LittleEndian.Uint32(src[88:92])
+	if flags&^recoveryJournalFlagSealedCapacity != 0 {
+		return RecoveryJournalHeader{}, fmt.Errorf("%w: header flags", ErrRecoveryJournalCorrupt)
+	}
+	if !allZero(src[92 : RecoveryJournalHeaderSize-8]) {
+		return RecoveryJournalHeader{}, fmt.Errorf("%w: header reserved bytes", ErrRecoveryJournalCorrupt)
+	}
+	h.SealedCapacity = flags&recoveryJournalFlagSealedCapacity != 0
 	if err := validateRecoveryJournalHeader(h); err != nil {
 		return RecoveryJournalHeader{}, err
 	}
@@ -1181,12 +1200,82 @@ type RecoveryJournal struct {
 	writeAt func(p []byte, off int64) (int, error)
 }
 
+// RecoveryJournalPairing is an external exact identity and recovery-epoch
+// assertion. Mutable open validates it immediately after header selection,
+// before allocation proof or record scanning.
+type RecoveryJournalPairing struct {
+	StoreID        [16]byte
+	JournalID      [16]byte
+	PageSize       uint32
+	RootGeneration uint64
+}
+
+// RecoveryJournalOpenOptions supplies external exact assertions. A zero
+// SealedCapacityBytes requires an ordinary unsealed journal. A non-zero value
+// requires the persisted sealed bit and an exact record-region byte match.
+// Pairing, when non-nil, is checked before either allocation proof or scan.
+type RecoveryJournalOpenOptions struct {
+	SealedCapacityBytes uint64
+	Pairing             *RecoveryJournalPairing
+}
+
+var recoveryJournalScanTail = func(journal *RecoveryJournal) error {
+	return journal.scanTail()
+}
+
+// RecoveryJournalInspection is a read-only offline scan. It never proves
+// physical allocation and exposes no append, sync, recycle, or growth method,
+// so it cannot be confused with a qualified mutable journal handle.
+type RecoveryJournalInspection struct {
+	journal *RecoveryJournal
+}
+
+func (i *RecoveryJournalInspection) Header() RecoveryJournalHeader {
+	if i == nil || i.journal == nil {
+		return RecoveryJournalHeader{}
+	}
+	return i.journal.Header()
+}
+
+func (i *RecoveryJournalInspection) Cursor() uint64 {
+	if i == nil || i.journal == nil {
+		return 0
+	}
+	return i.journal.Cursor()
+}
+
+func (i *RecoveryJournalInspection) BaseGeneration() uint64 {
+	if i == nil || i.journal == nil {
+		return 0
+	}
+	return i.journal.BaseGeneration()
+}
+
+func (i *RecoveryJournalInspection) Replay(
+	afterGeneration uint64,
+	apply func(RecoveryRecord) error,
+) error {
+	if i == nil || i.journal == nil {
+		return fmt.Errorf("%w: closed recovery journal inspection", ErrInvalidWrite)
+	}
+	return i.journal.Replay(afterGeneration, apply)
+}
+
+func (i *RecoveryJournalInspection) Close() error {
+	if i == nil || i.journal == nil {
+		return nil
+	}
+	err := i.journal.Close()
+	i.journal = nil
+	return err
+}
+
 // CreateRecoveryJournal preallocates a fresh journal file, writes its header,
 // and syncs both. capacity is the record-region byte budget; it is rounded up
 // to a whole sector. The file is preallocated to header+capacity so no append
 // extends it or commits filesystem metadata under an acknowledgement sync.
-// GrowCapacity may explicitly reserve and publish a larger geometry before a
-// later append reaches its point of no return.
+// An ordinary journal may explicitly GrowCapacity before a later append
+// reaches its point of no return. A sealed journal is immutable.
 func CreateRecoveryJournal(
 	file *os.File, h RecoveryJournalHeader,
 ) (*RecoveryJournal, error) {
@@ -1198,6 +1287,12 @@ func CreateRecoveryJournal(
 	}
 	sector := uint64(h.SectorSize)
 	if remainder := h.Capacity % sector; remainder != 0 {
+		if h.SealedCapacity {
+			return nil, fmt.Errorf(
+				"%w: sealed recovery journal capacity is not sector aligned",
+				ErrSealedCapacityMismatch,
+			)
+		}
 		rounded, ok := checkedSizeAdd(
 			h.Capacity,
 			sector-remainder,
@@ -1213,7 +1308,21 @@ func CreateRecoveryJournal(
 		return nil, err
 	}
 	total := int64(recoveryJournalRegionStart) + int64(h.Capacity)
-	if err := recoveryJournalPreallocate(file, total); err != nil {
+	if h.SealedCapacity {
+		info, err := file.Stat()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() || info.Size() != 0 {
+			return nil, fmt.Errorf(
+				"%w: sealed journal create requires an empty regular file",
+				ErrSealedCapacityMismatch,
+			)
+		}
+		if err := StrictlyAllocateFile(file, total); err != nil {
+			return nil, fmt.Errorf("%w: strictly allocate recovery journal: %w", ErrSealedCapacityMismatch, err)
+		}
+	} else if err := recoveryJournalPreallocate(file, total); err != nil {
 		return nil, err
 	}
 	rj := newRecoveryJournalManager(file, h)
@@ -1221,8 +1330,17 @@ func CreateRecoveryJournal(
 	if err := rj.writeHeader(0, rj.header); err != nil {
 		return nil, err
 	}
-	if err := rj.journalDataSync(file); err != nil {
+	syncFile := rj.journalDataSync
+	if h.SealedCapacity {
+		syncFile = strictAllocationDataSync
+	}
+	if err := syncFile(file); err != nil {
 		return nil, err
+	}
+	if h.SealedCapacity {
+		if err := requireExactRegularFileSize(file, total); err != nil {
+			return nil, fmt.Errorf("%w: recovery journal after create sync: %w", ErrSealedCapacityMismatch, err)
+		}
 	}
 	rj.cursor = 0
 	rj.nextSequence = h.BaseSequence + 1
@@ -1232,8 +1350,45 @@ func CreateRecoveryJournal(
 // OpenRecoveryJournal reads and validates the header of an existing journal
 // file, then scans the record region to re-derive the append cursor and next
 // sequence. Pairing against the store root is the caller's responsibility via
-// Pair; a bare Open only proves the header self-consistent.
+// Pair. A bare Open of a sealed journal also re-proves its self-described
+// immutable allocation; GrowCapacity remains unavailable on the returned
+// handle.
 func OpenRecoveryJournal(file *os.File) (*RecoveryJournal, error) {
+	return openRecoveryJournal(file, RecoveryJournalOpenOptions{}, true, false)
+}
+
+// InspectRecoveryJournal scans a journal through a read-only descriptor without
+// changing or qualifying its physical allocation. The returned inspection does
+// not expose mutable journal operations.
+func InspectRecoveryJournal(file *os.File) (*RecoveryJournalInspection, error) {
+	journal, err := openRecoveryJournal(file, RecoveryJournalOpenOptions{}, true, true)
+	if err != nil {
+		return nil, err
+	}
+	return &RecoveryJournalInspection{journal: journal}, nil
+}
+
+// OpenRecoveryJournalWithOptions selects and validates the authoritative
+// header before proving sealed allocation and before scanning any record byte.
+func OpenRecoveryJournalWithOptions(
+	file *os.File,
+	options RecoveryJournalOpenOptions,
+) (*RecoveryJournal, error) {
+	return openRecoveryJournal(file, options, false, false)
+}
+
+func openRecoveryJournal(
+	file *os.File,
+	options RecoveryJournalOpenOptions,
+	allowSelfDescribedSealed bool,
+	inspectionOnly bool,
+) (*RecoveryJournal, error) {
+	if file == nil {
+		return nil, fmt.Errorf("%w: nil recovery journal", ErrInvalidWrite)
+	}
+	if options.SealedCapacityBytes > RecoveryJournalMaxCapacityBytes {
+		return nil, fmt.Errorf("%w: recovery journal capacity", ErrSealedCapacityMismatch)
+	}
 	var slots [recoveryJournalHeaderSlots][RecoveryJournalHeaderSize]byte
 	selected := -1
 	var header RecoveryJournalHeader
@@ -1254,12 +1409,58 @@ func OpenRecoveryJournal(file *os.File) (*RecoveryJournal, error) {
 	if selected < 0 {
 		return nil, fmt.Errorf("%w: no valid header slot", ErrRecoveryJournalCorrupt)
 	}
+	if options.Pairing != nil {
+		if err := pairRecoveryJournalHeader(header, *options.Pairing); err != nil {
+			return nil, err
+		}
+	}
+	if (options.SealedCapacityBytes == 0 && header.SealedCapacity &&
+		!allowSelfDescribedSealed) ||
+		(options.SealedCapacityBytes != 0 &&
+			(!header.SealedCapacity || header.Capacity != options.SealedCapacityBytes)) {
+		return nil, fmt.Errorf(
+			"%w: recovery journal expected=%d actual=%d sealed=%t",
+			ErrSealedCapacityMismatch, options.SealedCapacityBytes,
+			header.Capacity, header.SealedCapacity,
+		)
+	}
+	if header.SealedCapacity {
+		total := int64(recoveryJournalRegionStart) + int64(header.Capacity)
+		if err := requireExactRegularFileSize(file, total); err != nil {
+			return nil, fmt.Errorf("%w: recovery journal: %w", ErrSealedCapacityMismatch, err)
+		}
+		if !inspectionOnly {
+			if err := StrictlyAllocateFile(file, total); err != nil {
+				return nil, fmt.Errorf("%w: reprove recovery journal: %w", ErrSealedCapacityMismatch, err)
+			}
+			if err := strictAllocationDataSync(file); err != nil {
+				return nil, fmt.Errorf("%w: sync recovery journal allocation: %w", ErrSealedCapacityMismatch, err)
+			}
+			if err := requireExactRegularFileSize(file, total); err != nil {
+				return nil, fmt.Errorf("%w: recovery journal after allocation sync: %w", ErrSealedCapacityMismatch, err)
+			}
+		}
+	}
 	rj := newRecoveryJournalManager(file, header)
 	rj.headerSlot = uint32(selected)
-	if err := rj.scanTail(); err != nil {
+	if err := recoveryJournalScanTail(rj); err != nil {
 		return nil, err
 	}
 	return rj, nil
+}
+
+func requireExactRegularFileSize(file *os.File, expected int64) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != expected {
+		return fmt.Errorf(
+			"file mode=%v size=%d want regular size=%d",
+			info.Mode(), info.Size(), expected,
+		)
+	}
+	return nil
 }
 
 func newRecoveryJournalManager(file *os.File, h RecoveryJournalHeader) *RecoveryJournal {
@@ -1283,13 +1484,24 @@ func (rj *RecoveryJournal) Header() RecoveryJournalHeader { return rj.header }
 func (rj *RecoveryJournal) Pair(
 	storeID, journalID [16]byte, pageSize uint32, rootGeneration uint64,
 ) error {
-	if rj.header.StoreID != storeID || rj.header.JournalID != journalID {
+	return pairRecoveryJournalHeader(rj.header, RecoveryJournalPairing{
+		StoreID: storeID, JournalID: journalID, PageSize: pageSize,
+		RootGeneration: rootGeneration,
+	})
+}
+
+func pairRecoveryJournalHeader(
+	header RecoveryJournalHeader,
+	pairing RecoveryJournalPairing,
+) error {
+	if header.StoreID != pairing.StoreID ||
+		header.JournalID != pairing.JournalID {
 		return ErrRecoveryJournalIdentity
 	}
-	if rj.header.PageSize != pageSize {
+	if header.PageSize != pairing.PageSize {
 		return ErrRecoveryJournalGeometry
 	}
-	if rj.header.BaseGeneration > rootGeneration {
+	if header.BaseGeneration > pairing.RootGeneration {
 		return ErrRecoveryJournalEpoch
 	}
 	return nil
@@ -1459,6 +1671,9 @@ func (rj *RecoveryJournal) GrowCapacity(
 ) error {
 	if rj == nil || rj.file == nil {
 		return fmt.Errorf("%w: nil recovery journal", ErrInvalidWrite)
+	}
+	if rj.header.SealedCapacity {
+		return fmt.Errorf("%w: recovery journal is sealed", ErrSealedCapacityMismatch)
 	}
 	if minimum <= rj.header.Capacity {
 		return nil

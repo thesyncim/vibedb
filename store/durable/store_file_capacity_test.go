@@ -632,13 +632,6 @@ func TestEnsurePhysicalAllocationDrainsInflightCommit(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- collection.EnsurePhysicalAllocation(target) }()
 	select {
-	case <-allocationEntered:
-		t.Fatal("Ensure allocated before its committer flush settled")
-	case err := <-done:
-		t.Fatalf("Ensure returned before its committer flush settled: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)

@@ -252,6 +252,7 @@ func (c *Collection) ensureOrdinaryBufferedRecoveryJournalLocked() error {
 		c.options.MaxKeyBytes, c.options.InlineValueBytes,
 		c.options.MaxDocumentBytes, durable.root.Generation,
 		c.options.primaryUnifiedOverlayBytes,
+		c.options.SealedRecoveryJournalBytes,
 	)
 	// Catalog-owned collections mint at the conditional format word so they
 	// may prepare kind-5 records. Scalar-patch (ordinary buffered delta) stays
@@ -464,13 +465,14 @@ func recoveryJournalHeaderFor(
 	pageSize uint32,
 	maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
 	baseGeneration uint64, deltaOverlayBytes int,
+	sealedCapacityBytes uint64,
 ) storeio.RecoveryJournalHeader {
 	sectorSize := uint32(storeio.RecoveryJournalMinSectorSize)
 	formatVersion := storeio.RecoveryJournalFormatLegacy
 	if deltaOverlayBytes > 0 {
 		formatVersion = storeio.RecoveryJournalFormatScalarPatch
 	}
-	return storeio.RecoveryJournalHeader{
+	header := storeio.RecoveryJournalHeader{
 		FormatVersion:  formatVersion,
 		StoreID:        storeID,
 		JournalID:      journalID,
@@ -483,6 +485,11 @@ func recoveryJournalHeaderFor(
 			deltaOverlayBytes,
 		),
 	}
+	if sealedCapacityBytes != 0 {
+		header.Capacity = sealedCapacityBytes
+		header.SealedCapacity = true
+	}
+	return header
 }
 
 // createSiblingRecoveryJournal preallocates and syncs a fresh journal file
@@ -542,15 +549,19 @@ func (c *Collection) openRecoveryJournalLocked(
 		}
 		return fmt.Errorf("vibedb: open recovery journal file: %w", err)
 	}
-	journal, err := storeio.OpenRecoveryJournal(file)
+	journal, err := storeio.OpenRecoveryJournalWithOptions(
+		file,
+		storeio.RecoveryJournalOpenOptions{
+			SealedCapacityBytes: c.options.SealedRecoveryJournalBytes,
+			Pairing: &storeio.RecoveryJournalPairing{
+				StoreID: c.storeID, JournalID: journalID,
+				PageSize:       uint32(c.options.PageSize),
+				RootGeneration: rootGeneration,
+			},
+		},
+	)
 	if err != nil {
 		_ = file.Close()
-		return err
-	}
-	if err := journal.Pair(
-		c.storeID, journalID, uint32(c.options.PageSize), rootGeneration,
-	); err != nil {
-		_ = journal.Close()
 		return err
 	}
 	if journal.Header().FormatVersion ==

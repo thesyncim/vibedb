@@ -117,7 +117,9 @@ func loadDatabaseTxnRecovery(
 
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		log.root, txnMarkerFilename,
-		storeio.TxnMarkerOptions{Capacity: options.Capacity},
+		storeio.TxnMarkerOptions{
+			Capacity: options.Capacity, SealedCapacity: options.SealedCapacity,
+		},
 	)
 	if err != nil {
 		if errors.Is(err, storeio.ErrTxnMarkerNoValidHeader) {
@@ -398,7 +400,9 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 	}
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		l.root, txnMarkerFilename,
-		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+		storeio.TxnMarkerOptions{
+			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -484,7 +488,7 @@ func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
 				ErrUnsupportedDatabaseLayout, base,
 			)
 		}
-		file, err := root.OpenFile(base, os.O_RDWR, 0)
+		file, err := root.OpenFile(base, os.O_RDONLY, 0)
 		if err != nil {
 			return false, err
 		}
@@ -522,7 +526,7 @@ func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
 func journalFileConditionalBinding(
 	path string,
 ) (holds bool, markerID [16]byte, epoch uint64, err error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	file, err := os.Open(path)
 	if err != nil {
 		return false, [16]byte{}, 0, err
 	}
@@ -533,12 +537,12 @@ func journalFileConditionalBinding(
 func journalConditionalBinding(
 	file *os.File,
 ) (holds bool, markerID [16]byte, epoch uint64, err error) {
-	journal, err := storeio.OpenRecoveryJournal(file)
+	journal, err := storeio.InspectRecoveryJournal(file)
 	if err != nil {
 		return false, [16]byte{}, 0, errors.Join(err, file.Close())
 	}
 	defer func() {
-		// RecoveryJournal owns and closes file after a successful open.
+		// RecoveryJournalInspection owns and closes file after a successful open.
 		err = errors.Join(err, journal.Close())
 	}()
 	if journal.Header().FormatVersion != storeio.RecoveryJournalFormatConditional ||

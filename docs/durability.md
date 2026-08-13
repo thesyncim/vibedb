@@ -55,6 +55,59 @@ locking cannot prevent an unrelated descriptor from violating this prerequisite.
 This certificate applies only to the collection main file. It makes no claim
 about a Raft log, recovery-journal suffix, or serving-layer reservation.
 
+## Sealed sidecar capacity
+
+The recovery journal and transaction decision log can independently carry an
+immutable physical-allocation certificate. For a synchronous collection,
+`Options.SealedRecoveryJournalBytes = N` requests an exact, sector-aligned
+record-region capacity of `N` bytes; the two 512-byte headers make the complete
+file exactly `1024 + N` bytes. Option normalization also requires the largest
+admitted conditional batch, including its envelope and per-entry overhead, to
+fit that region. The option is rejected for other durability lanes. On reopen,
+it is also rejected when the selected root has no journal identity.
+
+`TxnLogOptions{Capacity: N, SealedCapacity: true}` applies the same exact
+contract to `txn.vtm`. A sealed decision log requires a non-zero,
+sector-aligned `N`; it is minted lazily with the log and recycles within that
+fixed region. A profile-qualified durable open requires the caller's exact
+profile to match both the persisted seal bit and persisted capacity before any
+record scan. The paired recovery-journal path additionally checks store id,
+journal id, page size, and recovery epoch before allocation proof or scanning.
+Supplying ordinary zero options for an existing sealed sidecar is an error, as
+is supplying a sealed profile for an ordinary sidecar. The lower-level generic
+`OpenRecoveryJournal` can self-describe and reprove a persisted seal, but its
+immutable handle is not an externally qualified durable profile.
+
+The explicit `OpenTxnLog` and `RecoverDatabaseTransactions` APIs accept
+`TxnLogOptions`. `durable.Database` does not yet thread those options, so it
+cannot mint or reopen a sealed `txn.vtm`; this checkpoint makes no sealed
+transaction-log promise for that wrapper.
+
+Sealed create requires an empty regular file. On mutable open, an exact regular
+EOF of `1024 + N` is required before allocation proof begins. Linux then runs
+mode-zero `fallocate` across the complete prefix and
+`FALLOC_FL_UNSHARE_RANGE` across that same prefix, synchronizes the result, and
+checks exact EOF again before recovery scans records. Only
+`FALLOC_FL_UNSHARE_RANGE` returning `EOPNOTSUPP` on a descriptor proved by
+`fstatfs` to be ext4 is accepted. Other errors and filesystems fail closed;
+sealed sidecars have no truncate fallback and are unsupported on platforms
+without this proof. A sealed recovery journal is immutable and rejects
+`GrowCapacity`; pressure must be handled within the fixed region through the
+existing checkpoint/recycle path.
+
+Offline inspection is deliberately weaker. The read-only inspection APIs
+validate checksummed headers and exact apparent EOF, then scan without issuing
+allocation, unshare, repair, or synchronization calls. That can diagnose a
+sealed sidecar, but it does not qualify the file for a mutable recovery or a
+serving process.
+
+The certificate requires exclusive allocation ownership. No caller or external
+process may truncate, extend, punch holes, reflink-clone, or otherwise alter a
+sealed sidecar outside its owner. It covers only the recovery-journal or
+decision-log file named by the option. It does not create a SQL capacity
+identity, reserve main-file or Raft log/snapshot/range space, or certify a
+node or range to serve traffic.
+
 ## Checkpoint strengths
 
 `CheckpointStrength` applies only to buffered-visible `Flush` and `Close`,
@@ -310,14 +363,16 @@ fence instead.
 The journal has two independently checksummed 512-byte headers and a record
 region sized once before its identity can be published. Later appends are
 positional writes into that fixed region and never extend the file. The
-ordinary buffered format-v1 delta lane currently uses a fully sized 2.5 MiB
+ordinary buffered delta lane currently uses a fully sized 2.5 MiB
 record region with a foreground policy reserve of up to 512 KiB for the next
 carried suffix, leaving a 2 MiB qualified current append window. Exact batch
 fit remains authoritative: a wider current or future suffix takes the bounded
-physical checkpoint fallback. Linux normally allocates the complete region
-with `fallocate`; systems without that primitive set its full size once with
-truncate. Per-mutation journals retain their separate option-derived bounded
-capacity.
+physical checkpoint fallback. For ordinary unsealed sidecars only, Linux
+normally allocates the complete region with `fallocate` and falls back to
+setting its full size once with truncate when allocation is unsupported; other
+platforms set the size with truncate. Per-mutation journals retain their
+separate option-derived bounded capacity. Sealed sidecars instead follow the
+strict proof described above and never use truncate as an allocation proof.
 
 Journal format v0 admits legacy put/delete records and batches and remains
 writable as v0 after reopen. Format v1 is restricted to the ordinary buffered

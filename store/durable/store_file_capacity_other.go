@@ -3,12 +3,13 @@
 package durable
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-func strictlyAllocateFile(_ *os.File, _, _ int64) error {
-	return fmt.Errorf("strict main-file allocation is unsupported on this platform")
+func strictlyAllocateFile(file *os.File, _, target int64) error {
+	return storeio.StrictlyAllocateFile(file, target)
 }
 
 func strictlySyncAllocatedFile(file *os.File) error { return file.Sync() }

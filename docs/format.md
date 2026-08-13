@@ -204,9 +204,21 @@ sector-aligned, fixed-capacity record region. A header records its independent
 format version, store and journal ids, page and sector geometry, base generation
 and sequence, capacity, and monotonic recycle count under a CRC32C and its
 complement. Create sizes the complete file once before publishing its identity;
-later positional appends never extend it. Linux normally reserves the blocks
-with `fallocate` and falls back to a one-time truncate only where allocation is
-unsupported; other platforms set the complete size with truncate.
+later positional appends never extend it. For an ordinary unsealed journal,
+Linux normally reserves the blocks with `fallocate` and falls back to a one-time
+truncate only when that operation is unsupported; other platforms set the
+complete size with truncate. This truncate fallback is only a fixed-EOF
+optimization for ordinary sidecars. It is not a physical-allocation
+certificate.
+
+The current recovery-journal header assigns bytes `88:92` as its flags word.
+Bit 0 (`SealedCapacity`) says that the header's record-region `Capacity` is an
+immutable physical-allocation certificate. Bits 1 through 31 are reserved and
+bytes `92:504` are reserved; all must remain zero. A reader rejects the header
+if any reserved bit or byte is set. The
+complete sealed file length is exactly `1024 + Capacity`: both 512-byte headers
+are outside the record-region capacity. The flag and capacity are covered by
+the header checksum and survive header recycle.
 
 The current ordinary buffered-delta policy caps, and with the shipped overlay
 geometry selects, a 2.5 MiB record region. Its foreground admission guard keeps
@@ -284,10 +296,64 @@ the first multi-collection commit, fenced through parent-directory fsync before
 any prepare may reference its `MarkerID`. Offline pairing checks live in
 `cmd/vibedb-verify`.
 
+The current decision-log header assigns bytes `64:68` as its flags word. Bit 0
+(`SealedCapacity`) gives its record-region `Capacity` the same immutable
+physical-allocation meaning. Bits 1 through 31 are reserved zero; any set
+reserved bit, or any nonzero byte in the reserved `68:504` suffix, rejects the
+header before record replay. Its complete sealed file
+length is likewise exactly `1024 + Capacity`, with the two header sectors
+outside that capacity.
+
 The fixed materialization journal slots inside the primary file carry complete
 before-image sectors for qualified in-place canonical page updates. Recovery
 rolls back an incomplete materialization before selecting a root. Readers never
 consult either journal or the decision log.
+
+### Sealed sidecar allocation
+
+Sealing uses the current checksummed header flags above; it does not introduce
+an alternate container layout. Creation requires an empty regular file and an
+exact, sector-aligned capacity. It strictly allocates the complete absolute
+prefix `[0, 1024 + Capacity)`, publishes and synchronizes the header, and then
+requires the regular-file EOF to remain exactly that total. A sealed recovery
+journal cannot use `GrowCapacity`; its capacity is immutable even across
+recycle. A sealed decision log is recycled within the same immutable region.
+
+A profile-qualified durable open must supply an exact sealed profile: the
+recovery-journal option must equal the persisted record-region capacity, and
+the decision-log options must request `SealedCapacity` with the same exact
+capacity. A paired recovery-journal open checks the selected header's store
+id, journal id, page size, and recovery epoch before allocation proof or record
+scan. Generic mutable `OpenRecoveryJournal` can instead accept and reprove the
+self-described persisted seal, but its immutable handle is not
+external-profile qualification. After selecting the authoritative header,
+open rejects a short or long EOF before any allocation syscall or record scan.
+It then reproves the complete prefix, synchronizes that proof, checks exact EOF
+again, and only then scans records. It never repairs an EOF mismatch by
+truncating or extending the sidecar.
+
+Strict allocation is Linux-only. It first performs mode-zero
+`fallocate(fd, 0, 0, total)` over the complete prefix, repairing holes and
+establishing backing for every byte, then applies
+`FALLOC_FL_UNSHARE_RANGE` over that same prefix to privatize copy-on-write
+extents. An `EOPNOTSUPP` response to unshare is accepted only when `fstatfs` on
+that descriptor proves ext4, which has no writable reflink support. Every
+other filesystem or error fails closed; there is no truncate fallback for a
+sealed file. Platforms without this proof cannot create or mutably open a
+sealed sidecar.
+
+`InspectRecoveryJournal` and `InspectTxnMarker` are explicitly read-only. They
+validate the persisted header and exact apparent EOF before scanning, but do
+not allocate, unshare, synchronize, repair, or return a mutable handle. An
+inspection therefore does not qualify the file for mutable recovery or
+serving.
+
+The certificate assumes exclusive allocation ownership. Callers and unrelated
+processes must not truncate, extend, hole-punch, reflink-clone, or otherwise
+change either sealed sidecar outside its owning API. This is only a storage
+foundation for the recovery journal and transaction decision log. It defines
+no SQL capacity identity, reserves no Raft log, snapshot, or range capacity,
+and does not certify any node or range to serve traffic.
 
 ### Online block reclamation
 

@@ -59,9 +59,11 @@ var (
 )
 
 // TxnLogOptions configures OpenTxnLog. A zero Capacity selects the decision-log
-// package default at mint time.
+// package default at mint time. SealedCapacity requires a non-zero exact
+// Capacity and makes txn.vtm a Linux-only immutable physical allocation.
 type TxnLogOptions struct {
-	Capacity uint64
+	Capacity       uint64
+	SealedCapacity bool
 }
 
 // TxnLog owns one database directory's txn.vtm decision log: lazy mint under
@@ -128,6 +130,15 @@ func newTxnLogDirectory(
 	if dir == "" {
 		return nil, fmt.Errorf("vibedb: transaction log requires a directory")
 	}
+	if options.SealedCapacity &&
+		(options.Capacity == 0 ||
+			options.Capacity > storeio.TxnMarkerMaxCapacityBytes ||
+			options.Capacity%storeio.TxnMarkerMinSectorSize != 0) {
+		return nil, fmt.Errorf(
+			"%w: sealed transaction log requires an exact sector-aligned capacity",
+			ErrSealedJournalCapacity,
+		)
+	}
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -175,10 +186,14 @@ func syncTxnLogDirectory(root *os.Root) error {
 	return errors.Join(syncErr, closeErr)
 }
 
+var syncTxnLogMintResidueDirectory = syncTxnLogDirectory
+
 func (l *TxnLog) openExisting() error {
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		l.root, txnMarkerFilename,
-		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+		storeio.TxnMarkerOptions{
+			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
+		},
 	)
 	if err != nil {
 		return err
@@ -786,10 +801,18 @@ func (l *TxnLog) ensureMintedLocked() error {
 	}
 	marker, err := storeio.CreateTxnMarkerAt(
 		l.root, txnMarkerFilename,
-		storeio.TxnMarkerOptions{Capacity: l.opts.Capacity},
+		storeio.TxnMarkerOptions{
+			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
+		},
 	)
 	if err != nil {
 		if os.IsExist(err) {
+			// A prior mint may have completed both marker headers and the file
+			// fence but failed its parent-directory fence. Re-fence the existing
+			// namespace entry before accepting it on this still-live handle.
+			if syncErr := syncTxnLogMintResidueDirectory(l.root); syncErr != nil {
+				return syncErr
+			}
 			return l.openExisting()
 		}
 		return err

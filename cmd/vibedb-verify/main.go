@@ -141,10 +141,10 @@ type txnVerifyFinding struct {
 }
 
 type txnVerifyReport struct {
-	TxnLog     string
-	Decisions  int
-	Journals   int
-	Findings   []txnVerifyFinding
+	TxnLog    string
+	Decisions int
+	Journals  int
+	Findings  []txnVerifyFinding
 }
 
 func (r txnVerifyReport) OK() bool { return len(r.Findings) == 0 }
@@ -247,9 +247,7 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 		return report, nil
 	}
 
-	marker, decisions, openErr := storeio.OpenTxnMarker(
-		markerPath, storeio.TxnMarkerOptions{},
-	)
+	marker, decisions, openErr := storeio.InspectTxnMarker(markerPath)
 	if openErr != nil {
 		if len(conditionals) > 0 {
 			report.TxnLog = "unusable"
@@ -439,7 +437,7 @@ func scanJournalPairing(
 		return journalIdentity{}, nil, err
 	}
 	defer file.Close()
-	journal, err := storeio.OpenRecoveryJournal(file)
+	journal, err := storeio.InspectRecoveryJournal(file)
 	if err != nil {
 		return journalIdentity{}, nil, err
 	}
@@ -473,7 +471,7 @@ func scanJournalPairing(
 // txnMarkerTornTail reports whether the live record region contains non-zero
 // bytes past the scanned cursor — the offline signature of a truncatable torn
 // append that OpenTxnMarker leaves in place without mutating the file.
-func txnMarkerTornTail(path string, marker *storeio.TxnMarker) (int64, bool) {
+func txnMarkerTornTail(path string, marker *storeio.TxnMarkerInspection) (int64, bool) {
 	if marker == nil {
 		return 0, false
 	}
