@@ -2,9 +2,10 @@
 
 **Status:** the core, dependency revision, baseline configuration, synchronous
 driver, bounded logical store/state-machine model, replayable simulator,
-Phase 1a static-snapshot disk WAL, exact member runtime, and bounded in-process
-Multi-Raft host are executable. This is not a claim that production
-replication, failover, a serving/compacting Raft WAL, runtime snapshots, or a
+Phase 1a static-snapshot disk WAL, exact member runtime, bounded in-process
+Multi-Raft host, and static post-auth ordinary-message frame boundary are
+executable. This is not a claim that production replication, failover, a
+serving/compacting Raft WAL, runtime snapshots, peer authentication, or a
 network transport exists yet. Those claims remain
 gated by the [distributed delivery plan](distributed-sharding.md#delivery-plan).
 
@@ -239,6 +240,15 @@ claiming a production replicated store:
   goroutine, timer, or polling scan per idle group. It is an in-process outbox,
   not peer transport, and one synchronous slow operation can still block its
   caller.
+- `internal/rafttransport` owns a bounded immutable caller-supplied static
+  member/role/NodeID roster and one canonical ordinary-message frame. One
+  registry and future node-pair connection multiplex every range group. The
+  decoder checks full group lineage, replica-set roster digest, peer/member
+  routing, roles, flat protobuf shape, and exact bounds before allocation.
+  It accepts an already-authenticated NodeID; it does not implement TLS,
+  enrollment, sockets, reconnect, flow control, dynamic membership, or
+  snapshot transfer. Configuration entries are rejected while the roster is
+  static.
 
 The simulator's `MemoryStore` is an indivisible logical durability oracle, not
 an implementation template. It cannot represent torn sectors, fsync lies,

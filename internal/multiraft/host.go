@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -415,25 +416,51 @@ func (host *Host) EnqueueMessage(key raftmember.GroupKey, message *pb.Message) e
 	if err != nil {
 		return err
 	}
-	if message == nil || message.GetTo() != group.memberID || message.GetFrom() == 0 ||
-		message.GetFrom() == group.memberID || raft.IsLocalMsgTarget(message.GetFrom()) {
-		return errors.New("multiraft: message has invalid group route")
-	}
-	size, err := raftmember.MeasureOrdinaryMessage(message)
+	size, err := host.measureInbound(group, message)
 	if err != nil {
 		return err
 	}
 	if err := host.admitInput(group, int64(size)); err != nil {
 		return err
 	}
-	owned, _, err := raftmember.CloneOrdinaryMessage(message)
+	owned := proto.Clone(message).(*pb.Message)
+	host.enqueueOwnedMessage(group, owned, size)
+	return nil
+}
+
+// AdoptMessage validates and takes ownership of one already detached ordinary
+// peer message. Ownership transfers only when nil is returned. This avoids a
+// second maximum-size clone between a hostile-wire decoder and the serialized
+// Host ingress owner. The caller must not retain or mutate message after a
+// successful call.
+func (host *Host) AdoptMessage(key raftmember.GroupKey, message *pb.Message) error {
+	group, err := host.lookup(key)
 	if err != nil {
 		return err
 	}
-	group.messages.push(queuedMessage{message: owned, size: int64(size)})
+	size, err := host.measureInbound(group, message)
+	if err != nil {
+		return err
+	}
+	if err := host.admitInput(group, int64(size)); err != nil {
+		return err
+	}
+	host.enqueueOwnedMessage(group, message, size)
+	return nil
+}
+
+func (host *Host) measureInbound(group *groupState, message *pb.Message) (int, error) {
+	if message == nil || message.GetTo() != group.memberID || message.GetFrom() == 0 ||
+		message.GetFrom() == group.memberID || raft.IsLocalMsgTarget(message.GetFrom()) {
+		return 0, errors.New("multiraft: message has invalid group route")
+	}
+	return raftmember.MeasureOrdinaryMessage(message)
+}
+
+func (host *Host) enqueueOwnedMessage(group *groupState, message *pb.Message, size int) {
+	group.messages.push(queuedMessage{message: message, size: int64(size)})
 	host.chargeInput(group, int64(size))
 	host.wake(group)
-	return nil
 }
 
 // EnqueueProposal clones one bounded encoded command for later Runtime
