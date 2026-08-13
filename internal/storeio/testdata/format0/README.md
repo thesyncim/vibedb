@@ -13,5 +13,8 @@ STOREIO_FORMAT0_GOLDEN=empty_inline_superblock \
   go test ./internal/storeio -run '^TestFormat0PrintGolden$' -count=1 -v
 ```
 
+`sealed_inline_superblock` pins the non-zero main-file physical-capacity field
+and its enclosing inline-root checksum.
+
 Changing a fixture is an intentional on-disk format change and should be
 reviewed byte-for-byte.

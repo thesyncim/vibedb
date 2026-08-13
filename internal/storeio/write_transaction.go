@@ -2,17 +2,28 @@ package storeio
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
+
+// ErrPhysicalCapacity reports that a copy-on-write allocation would extend
+// past the caller's currently proven physical high-water mark. It is a typed,
+// retryable refusal: callers may strictly allocate more of a sealed file and
+// retry without changing logical state.
+var ErrPhysicalCapacity = errors.New("vibedb: Store physical capacity is unavailable")
 
 // WriteTransactionOptions binds one copy-on-write publication to its current
 // physical and logical allocation high-water marks.
 type WriteTransactionOptions struct {
-	StoreID       [16]byte
-	Generation    uint64
-	PageSize      uint32
-	FileEnd       uint64
-	NextLogicalID uint64
+	StoreID    [16]byte
+	Generation uint64
+	PageSize   uint32
+	FileEnd    uint64
+	// PhysicalHighWaterBytes is the currently proven physical allocation high-water.
+	// Zero preserves the elastic allocator. A non-zero value must be page
+	// aligned and may be smaller than the immutable file-format ceiling.
+	PhysicalHighWaterBytes uint64
+	NextLogicalID          uint64
 	// Reusable contains snapshot- and recovery-safe physical extents owned by
 	// the serialized caller. Allocate shrinks entries in place; Publish keeps
 	// those edits and Abort restores them from ReuseJournal.
@@ -209,6 +220,10 @@ func (t *WriteTransaction) Reset(
 	if committer == nil || options.StoreID == ([16]byte{}) || options.Generation == 0 ||
 		layoutErr != nil || options.FileEnd < layout.DataStart ||
 		options.FileEnd%uint64(options.PageSize) != 0 || options.FileEnd > maxSuperblockFileOffset ||
+		options.PhysicalHighWaterBytes != 0 &&
+			(options.PhysicalHighWaterBytes < options.FileEnd ||
+				options.PhysicalHighWaterBytes > maxSuperblockFileOffset ||
+				options.PhysicalHighWaterBytes%uint64(options.PageSize) != 0) ||
 		options.NextLogicalID == 0 {
 		return fmt.Errorf("%w: transaction identity, state, or bounds", ErrInvalidWrite)
 	}
@@ -258,6 +273,10 @@ func BeginHybridWriteTransaction(
 		patchWriteCount <= 0 ||
 		layoutErr != nil || options.FileEnd < layout.DataStart ||
 		options.FileEnd%uint64(options.PageSize) != 0 || options.FileEnd > maxSuperblockFileOffset ||
+		options.PhysicalHighWaterBytes != 0 &&
+			(options.PhysicalHighWaterBytes < options.FileEnd ||
+				options.PhysicalHighWaterBytes > maxSuperblockFileOffset ||
+				options.PhysicalHighWaterBytes%uint64(options.PageSize) != 0) ||
 		options.NextLogicalID == 0 {
 		return nil, fmt.Errorf("%w: transaction identity or bounds", ErrInvalidWrite)
 	}
@@ -547,6 +566,13 @@ func (t *WriteTransaction) allocatePhysical(length uint32) (uint64, bool, error)
 	}
 	if want > maxSuperblockFileOffset-t.fileEnd {
 		return 0, false, fmt.Errorf("%w: physical file exhausted", ErrInvalidWrite)
+	}
+	if t.options.PhysicalHighWaterBytes != 0 &&
+		want > t.options.PhysicalHighWaterBytes-t.fileEnd {
+		return 0, false, fmt.Errorf(
+			"%w: need=%d allocated=%d", ErrPhysicalCapacity,
+			t.fileEnd+want, t.options.PhysicalHighWaterBytes,
+		)
 	}
 	return t.fileEnd, false, nil
 }

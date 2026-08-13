@@ -801,13 +801,15 @@ func (c *Collection) Stats() Stats {
 		concurrentPrimaryScratch += uint64(unsafe.Sizeof(c.primaryOverlayPublish))
 	}
 	stats := Stats{
-		CapacityBytes:       cache.CapacityBytes + overlay.capacityBytes,
-		ResidentBytes:       cache.ResidentBytes + overlay.arenaBytes,
-		ReservedBytes:       cache.ReservedBytes + overlay.capacityBytes,
-		CommitCapacityBytes: c.committer.StagingCapacityBytes(),
-		PinnedPages:         cache.PinnedPages,
-		DirtyBytes:          cache.DirtyBytes + overlay.logicalDirtyBytes,
-		PageReads:           cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
+		CapacityBytes:          cache.CapacityBytes + overlay.capacityBytes,
+		PhysicalCapacityBytes:  c.options.PhysicalCapacityBytes,
+		PhysicalHighWaterBytes: c.physicalHighWater,
+		ResidentBytes:          cache.ResidentBytes + overlay.arenaBytes,
+		ReservedBytes:          cache.ReservedBytes + overlay.capacityBytes,
+		CommitCapacityBytes:    c.committer.StagingCapacityBytes(),
+		PinnedPages:            cache.PinnedPages,
+		DirtyBytes:             cache.DirtyBytes + overlay.logicalDirtyBytes,
+		PageReads:              cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
 		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
 		PrefetchQueued: cache.PrefetchQueued, PrefetchDropped: cache.PrefetchDropped,

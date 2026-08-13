@@ -677,6 +677,8 @@ func sameImmutableInlineConfiguration(
 	left, right InlineSuperblock,
 ) bool {
 	return left.State.MaxPageSize == right.State.MaxPageSize &&
+		left.State.PhysicalCapacityBytes ==
+			right.State.PhysicalCapacityBytes &&
 		left.State.MaxKeyBytes == right.State.MaxKeyBytes &&
 		left.State.InlineValueBytes == right.State.InlineValueBytes &&
 		left.State.MaxDocumentBytes == right.State.MaxDocumentBytes &&

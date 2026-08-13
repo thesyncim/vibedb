@@ -2,13 +2,73 @@ package durable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 )
+
+func TestCreateFromRecordsHonorsWriterLease(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records-locked.vibe")
+	owner, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	competitor, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competitor.Close()
+	if err := storeio.LockWriter(owner); err != nil {
+		t.Fatal(err)
+	}
+	defer storeio.UnlockWriter(owner)
+	_, err = CreateFromRecords([]PrimaryBulkRecord{{
+		Key: "locked", Value: []byte(`{"value":1}`),
+	}}, competitor, Options{Backend: BackendPortable, Durability: DurabilityAsyncVisible})
+	if !errors.Is(err, ErrWriterLocked) {
+		t.Fatalf("CreateFromRecords with held lease = %v, want %v", err, ErrWriterLocked)
+	}
+	info, err := owner.Stat()
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("held-lease bulk attempt changed file = (%d,%v)", info.Size(), err)
+	}
+}
+
+func TestCreateFromRecordsReportsWriterUnlockFailure(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "records-unlock-*.vibe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	previous := unlockCollectionWriter
+	unlockErr := errors.New("writer unlock failed")
+	unlocked := false
+	unlockCollectionWriter = func(file *os.File) error {
+		if !unlocked {
+			unlocked = true
+			return unlockErr
+		}
+		return storeio.UnlockWriter(file)
+	}
+	defer func() {
+		unlockCollectionWriter = previous
+		if unlocked {
+			_ = storeio.UnlockWriter(file)
+		}
+	}()
+	fileEnd, err := CreateFromRecords([]PrimaryBulkRecord{{
+		Key: "unlock", Value: []byte(`{"value":1}`),
+	}}, file, Options{Backend: BackendPortable, Durability: DurabilityAsyncVisible})
+	if fileEnd == 0 || !errors.Is(err, unlockErr) {
+		t.Fatalf("CreateFromRecords unlock failure = (%d,%v), want built file and joined error", fileEnd, err)
+	}
+}
 
 func TestCreateFromRecordsMatchesPrimaryCollectionBytes(t *testing.T) {
 	const count = 257

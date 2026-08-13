@@ -133,7 +133,8 @@ There is no separately allocated state-root page. The active prefix is:
 | 112:144 | ordered-primary root |
 | 144:160 | paired recovery-journal id |
 | 160:192 | exact-index root, or zero when no index exists |
-| 192:512 | reserved zero suffix |
+| 192:200 | immutable main-file physical-capacity ceiling, or zero for elastic allocation |
+| 200:512 | reserved zero suffix |
 
 The ordered-primary root is the sole document root. A mutable store cannot open
 without it. The only current option bits are schema binding and canonical

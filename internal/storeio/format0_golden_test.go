@@ -35,17 +35,25 @@ func format0EmptyState(generation uint64, pageSize uint32) StateRoot {
 }
 
 func format0InlineRoot(t *testing.T, generation uint64) []byte {
+	return format0InlineRootWithCapacity(t, generation, 0)
+}
+
+func format0InlineRootWithCapacity(
+	t *testing.T, generation, capacity uint64,
+) []byte {
 	t.Helper()
 	layout, err := MutableStoreLayout(format0PageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
+	state := format0EmptyState(generation, format0PageSize)
+	state.PhysicalCapacityBytes = capacity
 	root := InlineSuperblock{
 		StoreID:    format0StoreID,
 		Generation: generation,
 		FileEnd:    layout.DataStart,
 		PageSize:   format0PageSize,
-		State:      format0EmptyState(generation, format0PageSize),
+		State:      state,
 	}
 	dst := make([]byte, InlineSuperblockSize)
 	encoded, err := EncodeInlineSuperblock(dst, root)
@@ -310,6 +318,7 @@ func TestFormat0PrintGolden(t *testing.T) {
 	builders := map[string]func(*testing.T) []byte{
 		"mutable_prefix_4k":           format0MutablePrefix,
 		"empty_inline_superblock":     func(t *testing.T) []byte { return format0InlineRoot(t, 7) },
+		"sealed_inline_superblock":    func(t *testing.T) []byte { return format0InlineRootWithCapacity(t, 7, 1<<30) },
 		"posting_page":                format0PostingPage,
 		"materialization_max_patches": format0MaterializationMaxPatches,
 		"materialization_max_targets": format0MaterializationMaxTargets,
@@ -379,7 +388,9 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		"stateRootJournalIDEnd":            {stateRootJournalIDEnd, 160},
 		"stateRootExactIndexOffset":        {stateRootExactIndexOffset, 160},
 		"stateRootExactIndexEnd":           {stateRootExactIndexEnd, 192},
-		"stateRootReservedOffset":          {stateRootReservedOffset, 192},
+		"stateRootPhysicalCapacityOffset":  {stateRootPhysicalCapacityOffset, 192},
+		"stateRootPhysicalCapacityEnd":     {stateRootPhysicalCapacityEnd, 200},
+		"stateRootReservedOffset":          {stateRootReservedOffset, 200},
 		"PageRefSize":                      {PageRefSize, 32},
 		"InlineSuperblockSize":             {InlineSuperblockSize, 4096},
 		"InlineFreeDeltaCapacity":          {InlineFreeDeltaCapacity, 106},
@@ -495,6 +506,27 @@ func TestFormat0GoldenEmptyStateAndRoots(t *testing.T) {
 
 }
 
+func TestFormat0GoldenSealedInlineRoot(t *testing.T) {
+	inline := format0InlineRootWithCapacity(t, 7, 1<<30)
+	compareFormat0Golden(t, "sealed_inline_superblock", inline)
+	capacityAt := inlineSuperblockStateOffset + stateRootPhysicalCapacityOffset
+	if got := binary.LittleEndian.Uint64(
+		inline[capacityAt : capacityAt+8],
+	); got != 1<<30 {
+		t.Fatalf("sealed physical capacity = %d, want %d", got, uint64(1<<30))
+	}
+	decoded, err := DecodeInlineSuperblock(inline)
+	if err != nil || decoded.State.PhysicalCapacityBytes != 1<<30 {
+		t.Fatalf("sealed inline root = (%d,%v)", decoded.State.PhysicalCapacityBytes, err)
+	}
+	assertFormat0Zero(
+		t, inline,
+		inlineSuperblockStateOffset+stateRootReservedOffset,
+		inlineSuperblockStateEnd,
+	)
+	assertFormat0Checksum(t, inline, inlineSuperblockChecksumFrom)
+}
+
 func TestFormat0GoldenRepresentativePageKinds(t *testing.T) {
 	fixtures := []struct {
 		name string
@@ -603,6 +635,24 @@ func TestFormat0GoldensRejectCorruptionAndNonzeroVersions(t *testing.T) {
 	resealFormat0Inline(inline)
 	if _, err := DecodeInlineSuperblock(inline); !errors.Is(err, ErrSuperblockCorrupt) {
 		t.Fatalf("resealed embedded-state reserve = %v", err)
+	}
+	inline = append([]byte(nil), readFormat0Golden(t, "sealed_inline_superblock")...)
+	inline[inlineSuperblockStateOffset+stateRootPhysicalCapacityOffset] ^= 1
+	resealFormat0Inline(inline)
+	if _, err := DecodeInlineSuperblock(inline); !errors.Is(err, ErrSuperblockCorrupt) {
+		t.Fatalf("resealed invalid physical capacity = %v", err)
+	}
+	inline = append([]byte(nil), readFormat0Golden(t, "sealed_inline_superblock")...)
+	inline[inlineSuperblockStateOffset+stateRootJournalIDOffset] = 1
+	resealFormat0Inline(inline)
+	if _, err := DecodeInlineSuperblock(inline); !errors.Is(err, ErrSuperblockCorrupt) {
+		t.Fatalf("resealed sealed-root journal identity = %v", err)
+	}
+	inline = append([]byte(nil), readFormat0Golden(t, "sealed_inline_superblock")...)
+	inline[inlineSuperblockStateOffset+stateRootReservedOffset] ^= 1
+	resealFormat0Inline(inline)
+	if _, err := DecodeInlineSuperblock(inline); !errors.Is(err, ErrSuperblockCorrupt) {
+		t.Fatalf("resealed sealed-root reserve boundary = %v", err)
 	}
 	inline = append([]byte(nil), readFormat0Golden(t, "empty_inline_superblock")...)
 	inline[inlineFreeDeltaCountOffset+2] ^= 1

@@ -112,15 +112,33 @@ func openCollection(
 	if err != nil {
 		return nil, err
 	}
+	if bootstrap.PhysicalCapacityBytes != 0 &&
+		(options.Durability != DurabilityAsyncVisible || options.RecoveryJournal ||
+			options.MaterializationDamageGranule != 0 ||
+			bootstrap.MaterializationDamageGranule != 0) {
+		return nil, fmt.Errorf(
+			"%w: sealed physical capacity requires rooted DurabilityAsyncVisible without a recovery journal or canonical materialization",
+			ErrPhysicalCapacity,
+		)
+	}
 	if options.PageSize != 0 &&
 		options.PageSize != int(bootstrap.PageSize) ||
 		options.MaxPageSize != 0 &&
 			options.MaxPageSize != int(bootstrap.MaxPageSize) ||
 		options.MaterializationDamageGranule !=
-			int(bootstrap.MaterializationDamageGranule) {
+			int(bootstrap.MaterializationDamageGranule) ||
+		options.PhysicalCapacityBytes != 0 &&
+			options.PhysicalCapacityBytes != bootstrap.PhysicalCapacityBytes {
 		return nil, fmt.Errorf(
 			"vibedb: collection persisted geometry mismatch",
 		)
+	}
+	physicalHighWater, err := restorePhysicalAllocation(
+		file, bootstrap.FileEnd, bootstrap.PhysicalCapacityBytes,
+		uint64(bootstrap.PageSize),
+	)
+	if err != nil {
+		return nil, err
 	}
 	scratch := make([]byte, int(bootstrap.MaxPageSize))
 	recovery, err := storeio.RecoverMutableInlineStateRoot(
@@ -156,6 +174,7 @@ func openCollection(
 	if err != nil {
 		return nil, err
 	}
+	collection.physicalHighWater = physicalHighWater
 	// Catalog-owned opens set the flag before the journal is opened or
 	// recycled so a foreground reopen fold mints the conditional format word.
 	collection.journalCatalogOwned = cfg.catalogOwned
@@ -296,7 +315,18 @@ func (c *Collection) createInitialState() error {
 		return err
 	}
 	initialFileEnd := catalog.fileEnd
-	if err := c.file.Truncate(int64(initialFileEnd)); err != nil {
+	initialPhysicalEnd, err := initialCollectionPhysicalFileEnd(c.options)
+	if err != nil {
+		return err
+	}
+	if c.options.PhysicalCapacityBytes != 0 {
+		// Strictly provision the complete exact generation-one graph before the
+		// first catalog or root byte is written. Transaction staging below is
+		// memory-only until PublishInline.
+		if err := c.ensurePhysicalAllocationLocked(initialPhysicalEnd); err != nil {
+			return err
+		}
+	} else if err := c.file.Truncate(int64(initialFileEnd)); err != nil {
 		return err
 	}
 	if catalog.segments != 0 {
@@ -345,12 +375,13 @@ func (c *Collection) createInitialState() error {
 		StoreID: c.cacheStoreID(), Generation: 1, PageSize: uint32(c.options.PageSize),
 		NextLogicalID: tx.NextLogicalID(),
 		IndexCount:    uint32(len(c.options.indexes)), IndexCatalogHash: c.options.indexCatalogHash,
-		IndexMaxDepth:    uint32(max(c.options.Collection.IndexOptions.MaxDepth, 0)),
-		MaxKeyBytes:      uint32(c.options.MaxKeyBytes),
-		InlineValueBytes: uint32(c.options.InlineValueBytes),
-		MaxDocumentBytes: uint32(c.options.MaxDocumentBytes),
-		PrimaryRoot:      primaryRoot,
-		ExactIndexRoot:   exactIndexRoot,
+		IndexMaxDepth:         uint32(max(c.options.Collection.IndexOptions.MaxDepth, 0)),
+		MaxKeyBytes:           uint32(c.options.MaxKeyBytes),
+		InlineValueBytes:      uint32(c.options.InlineValueBytes),
+		MaxDocumentBytes:      uint32(c.options.MaxDocumentBytes),
+		PhysicalCapacityBytes: c.options.PhysicalCapacityBytes,
+		PrimaryRoot:           primaryRoot,
+		ExactIndexRoot:        exactIndexRoot,
 	}
 	root.Options = fileStoreCollectionOptionFlags(c.options.Collection)
 	if c.options.MaterializationDamageGranule != 0 {
@@ -405,6 +436,16 @@ func (c *Collection) createInitialState() error {
 			return err
 		}
 		root.JournalID = journalID
+	}
+	if c.options.PhysicalCapacityBytes != 0 &&
+		(tx.FileEnd() != initialPhysicalEnd ||
+			tx.FileEnd() > c.physicalHighWater) {
+		_ = tx.Abort()
+		return fmt.Errorf(
+			"%w: planned initial high-water=%d expected=%d allocated=%d",
+			ErrPhysicalCapacity, tx.FileEnd(), initialPhysicalEnd,
+			c.physicalHighWater,
+		)
 	}
 	inlineFree := storeio.NewInlineFreeDelta(storeio.PageRef{}, storeio.PageRef{})
 	if err := tx.PublishInline(root, inlineFree); err != nil {

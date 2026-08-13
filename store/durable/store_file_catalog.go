@@ -219,6 +219,8 @@ func normalizeOpenedFileStoreOptions(
 			supplied.InlineValueBytes != int(root.InlineValueBytes) ||
 		supplied.MaxDocumentBytes != 0 &&
 			supplied.MaxDocumentBytes != int(root.MaxDocumentBytes) ||
+		supplied.PhysicalCapacityBytes != 0 &&
+			supplied.PhysicalCapacityBytes != root.PhysicalCapacityBytes ||
 		supplied.Collection.IndexOptions.MaxDepth > 0 &&
 			supplied.Collection.IndexOptions.MaxDepth !=
 				int(root.IndexMaxDepth) {
@@ -240,6 +242,7 @@ func normalizeOpenedFileStoreOptions(
 	options.MaxKeyBytes = int(root.MaxKeyBytes)
 	options.InlineValueBytes = int(root.InlineValueBytes)
 	options.MaxDocumentBytes = int(root.MaxDocumentBytes)
+	options.PhysicalCapacityBytes = root.PhysicalCapacityBytes
 	options.Collection.IndexOptions.MaxDepth = int(root.IndexMaxDepth)
 	if options.Indexes == nil {
 		options.Indexes = make(

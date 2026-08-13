@@ -49,6 +49,10 @@ type Collection struct {
 	writerLocked bool
 	options      normalizedFileStoreOptions
 	storeID      [16]byte
+	// physicalHighWater is the complete page-aligned main-file prefix whose
+	// physical allocation has been strictly proved and synced. It is writer
+	// protected and remains zero for elastic collections.
+	physicalHighWater uint64
 
 	// writer is the collection-wide mutation gate. Ordinary mutation,
 	// checkpoint, structural, and lifecycle paths retain its exclusive side;
@@ -555,7 +559,12 @@ type Collection struct {
 // Every byte and queue counter corresponds to a configured finite budget.
 type Stats struct {
 	CapacityBytes uint64
-	ResidentBytes uint64
+	// PhysicalCapacityBytes is the immutable sealed main-file ceiling. Zero
+	// denotes elastic allocation. PhysicalHighWaterBytes is the strictly
+	// allocated and synced prefix currently available to rooted transactions.
+	PhysicalCapacityBytes  uint64
+	PhysicalHighWaterBytes uint64
+	ResidentBytes          uint64
 	// ReservedBytes is the cache arena actually owned by resident extents.
 	// It can exceed ResidentBytes when an exact on-disk extent occupies the
 	// next buddy size class in RAM, but never exceeds CapacityBytes.

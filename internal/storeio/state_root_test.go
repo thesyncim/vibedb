@@ -73,6 +73,7 @@ func decodeTestStateRootPayload(
 
 func TestStateRootPayloadRoundTrip(t *testing.T) {
 	want, fileEnd := testStateRoot(11)
+	want.PhysicalCapacityBytes = fileEnd + 16*uint64(testSuperblockPageSize)
 	page := make([]byte, testSuperblockPageSize)
 	encoded, err := encodeTestStateRootPayload(page, want, fileEnd)
 	if err != nil {
@@ -89,6 +90,54 @@ func TestStateRootPayloadRoundTrip(t *testing.T) {
 		if _, err := decodeTestStateRootPayload(encoded[:cut], want, fileEnd); !errors.Is(err, ErrStateRootCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrStateRootCorrupt)
 		}
+	}
+}
+
+func TestStateRootPhysicalCapacityValidation(t *testing.T) {
+	root, fileEnd := testStateRoot(11)
+	page := make([]byte, testSuperblockPageSize)
+	root.PhysicalCapacityBytes = fileEnd
+	encoded, err := encodeTestStateRootPayload(page, root, fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeTestStateRootPayload(encoded, root, fileEnd)
+	if err != nil || decoded.PhysicalCapacityBytes != fileEnd {
+		t.Fatalf("physical capacity round trip = (%d,%v), want %d", decoded.PhysicalCapacityBytes, err, fileEnd)
+	}
+	for name, capacity := range map[string]uint64{
+		"below file end": fileEnd - uint64(testSuperblockPageSize),
+		"unaligned":      fileEnd + 1,
+		"format bound":   uint64(maxSuperblockFileOffset) + uint64(testSuperblockPageSize),
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := root
+			invalid.PhysicalCapacityBytes = capacity
+			if _, err := encodeTestStateRootPayload(
+				page, invalid, fileEnd,
+			); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("capacity %d = %v, want %v", capacity, err, ErrInvalidWrite)
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*StateRoot){
+		"journal": func(root *StateRoot) {
+			root.JournalID[0] = 1
+		},
+		"canonical materialization": func(root *StateRoot) {
+			root.Options |= StateOptionCanonicalMaterialization
+			root.MaterializationDamageGranule = MaterializationJournalMinSectorSize
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := root
+			mutate(&invalid)
+			if _, err := encodeTestStateRootPayload(
+				page, invalid, fileEnd,
+			); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("sealed %s state = %v, want %v", name, err, ErrInvalidWrite)
+			}
+		})
 	}
 }
 

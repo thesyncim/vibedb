@@ -56,6 +56,10 @@ var (
 	// configured staging bound. Call Flush to checkpoint them, then retry the
 	// mutation; the rejected mutation was not made reader-visible.
 	ErrCheckpointRequired = storeio.ErrCheckpointRequired
+	// ErrPhysicalCapacity reports that a capped collection has not yet strictly
+	// allocated enough of its sealed main-file ceiling for a requested write.
+	// EnsurePhysicalAllocation may advance that proof before the caller retries.
+	ErrPhysicalCapacity = storeio.ErrPhysicalCapacity
 )
 
 // Backend selects the durable commit and speculative-read engines.
@@ -170,8 +174,16 @@ type Options struct {
 	PageSize int
 	// MaxPageSize bounds a leaf/overflow extent, which grows from PageSize up to
 	// this value (default 64 KiB). It must be a power-of-two multiple of PageSize.
-	MaxPageSize   int
-	ResidentBytes int64
+	MaxPageSize int
+	// PhysicalCapacityBytes seals the maximum main-file high-water. Zero keeps
+	// elastic growth. A non-zero value is immutable, page aligned, and does not
+	// eagerly allocate the whole ceiling; EnsurePhysicalAllocation grows the
+	// currently proven prefix monotonically when future work needs it. While a
+	// capped collection is open, no other descriptor or process may truncate,
+	// punch, reflink-clone, or otherwise change allocation on its main file; the
+	// cooperative writer lease cannot prevent those external mutations.
+	PhysicalCapacityBytes uint64
+	ResidentBytes         int64
 	// ReadConcurrency bounds portable positional-read workers.
 	ReadConcurrency int
 	// ReadQueueDepth bounds one native asynchronous read submission.
@@ -517,6 +529,35 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		// The ordered primary graph fixes the base page at 4096; leaf extents grow
 		// to MaxPageSize but every tree/root/metadata page is exactly one base page.
 		return normalizedFileStoreOptions{}, ErrUnsupportedPageSize
+	}
+	if o.PhysicalCapacityBytes != 0 &&
+		(o.PhysicalCapacityBytes > math.MaxInt64 ||
+			o.PhysicalCapacityBytes%uint64(o.PageSize) != 0) {
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"%w: PhysicalCapacityBytes must be page aligned and representable",
+			ErrPhysicalCapacity,
+		)
+	}
+	if o.PhysicalCapacityBytes != 0 {
+		layout, layoutErr := storeio.MutableStoreLayout(uint32(o.PageSize))
+		if layoutErr != nil || o.PhysicalCapacityBytes < layout.DataStart {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: PhysicalCapacityBytes is smaller than the Store prefix",
+				ErrPhysicalCapacity,
+			)
+		}
+		// Sealed capacity serves rooted copy-on-write only. Deferred
+		// canonical/journal acknowledgements can require more than one replay-time
+		// checkpoint window when an opener selects smaller runtime batch arenas;
+		// without a persisted physical-suffix certificate they are not safe to
+		// serve.
+		if o.Durability != DurabilityAsyncVisible || o.RecoveryJournal ||
+			o.MaterializationDamageGranule != 0 {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: sealed physical capacity requires rooted DurabilityAsyncVisible without a recovery journal or canonical materialization",
+				ErrPhysicalCapacity,
+			)
+		}
 	}
 	if o.MaxPageSize == 0 {
 		o.MaxPageSize = 64 << 10
@@ -964,7 +1005,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection ResidentBytes cannot retain one worst-case dirty transaction")
 	}
 	primaryUnifiedOverlayBytes := int(primaryOverlayTargetBytes)
-	return normalizedFileStoreOptions{
+	normalized := normalizedFileStoreOptions{
 		Options:                        o,
 		maxTransactionPages:            maxTransactionPages,
 		maxTransactionBytes:            maxTransactionBytes,
@@ -979,7 +1020,51 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		primaryUnifiedOverlayBuckets:     primaryOverlayBucketLimit,
 		primaryUnifiedOverlayDirtyBytes:  primaryOverlayDirtyBytes,
 		primaryUnifiedOverlayParentBytes: uint32(primaryOverlayParentBytes),
-	}, nil
+	}
+	if o.PhysicalCapacityBytes != 0 {
+		initial, initialErr := initialCollectionPhysicalFileEnd(normalized)
+		if initialErr != nil {
+			return normalizedFileStoreOptions{}, initialErr
+		}
+		if initial > o.PhysicalCapacityBytes {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: initial collection needs=%d ceiling=%d",
+				ErrPhysicalCapacity, initial, o.PhysicalCapacityBytes,
+			)
+		}
+	}
+	return normalized, nil
+}
+
+// initialCollectionPhysicalFileEnd is the exact generation-one high-water for
+// Create's empty ordered-primary graph. Keeping this derivation shared between
+// option preflight and creation prevents a too-small sealed ceiling from
+// touching the file before the builder discovers it cannot publish.
+func initialCollectionPhysicalFileEnd(
+	o normalizedFileStoreOptions,
+) (uint64, error) {
+	layout, err := storeio.MutableStoreLayout(uint32(o.PageSize))
+	if err != nil {
+		return 0, err
+	}
+	segments, ok := o.pageCatalog.SegmentCountFor(uint32(o.PageSize))
+	if !ok || segments < 0 {
+		return 0, fmt.Errorf(
+			"%w: cannot derive initial collection catalog geometry",
+			ErrPhysicalCapacity,
+		)
+	}
+	result := layout.DataStart + uint64(segments)*uint64(o.PageSize) +
+		uint64(storeio.CommonPrimaryLeafNarrowBytes) +
+		uint64(storeio.SegmentedTabletRouterAnchorPageBytes) +
+		uint64(storeio.GlobalTabletCatalogLocatorBytes) +
+		uint64(storeio.GlobalTabletCatalogTabletBytes) +
+		uint64(storeio.GlobalTabletCatalogNodeBytes) +
+		uint64(storeio.GlobalTabletCatalogRootBytes)
+	if len(o.indexes) != 0 {
+		result += uint64(o.PageSize) // empty exact-index root
+	}
+	return result, nil
 }
 
 // validateFilePageCatalogSchema preserves the public error category at the

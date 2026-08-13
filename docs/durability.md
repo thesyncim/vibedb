@@ -27,6 +27,34 @@ waits for or checkpoints the current reader-visible cut.
 `Close` rejects new work, drains or checkpoints accepted work, and releases
 resources; it does not close the caller's file.
 
+## Sealed main-file capacity
+
+`Options.PhysicalCapacityBytes` is an immutable ceiling for the collection's
+main file, not an eager reservation of the entire ceiling. A non-zero value is
+supported on Linux for rooted `DurabilityAsyncVisible` collections without a
+recovery journal or canonical materialization. Other durability lanes cannot
+be used because they may acknowledge deferred work whose exact rooted file
+advance was not sealed first; they are rejected before the file is changed.
+
+The collection tracks a smaller, monotone physical high-water. Create strictly
+allocates only the initial rooted graph. `EnsurePhysicalAllocation` drains the
+accepted committer cut, allocates every byte through a requested aligned
+high-water, privatizes reflinked extents, and synchronizes that allocation
+before writes may use it. Open repeats the complete-prefix proof and repairs
+supported punched holes before recovery. Capped collections do not hole-punch,
+so a certified prefix cannot later become sparse through online reclamation.
+Linux filesystems must support `FALLOC_FL_UNSHARE_RANGE`; ext4 is the narrow
+exception because it has no writable reflink support.
+
+The certificate assumes exclusive allocation ownership while the collection is
+open. Callers and other processes must not truncate, punch, reflink-clone
+(`FICLONE`), or otherwise change allocation on the main file outside collection
+APIs. The writer lease coordinates cooperating collection instances; advisory
+locking cannot prevent an unrelated descriptor from violating this prerequisite.
+
+This certificate applies only to the collection main file. It makes no claim
+about a Raft log, recovery-journal suffix, or serving-layer reservation.
+
 ## Checkpoint strengths
 
 `CheckpointStrength` applies only to buffered-visible `Flush` and `Close`,

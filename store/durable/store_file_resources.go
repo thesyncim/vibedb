@@ -287,6 +287,7 @@ func newCollectionResources(
 		options.freeFoldLimit
 	collection := &Collection{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
+		holePunchDisabled: options.PhysicalCapacityBytes != 0,
 		primaryUnifiedOverlay: newLazyPrimaryUnifiedOverlay(
 			options.primaryUnifiedOverlayBytes,
 			options.primaryUnifiedOverlayBuckets,
@@ -379,6 +380,12 @@ func (c *Collection) beginWriteTransaction(
 	maxPages int,
 	options storeio.WriteTransactionOptions,
 ) (*storeio.WriteTransaction, error) {
+	if c.options.PhysicalCapacityBytes != 0 {
+		// Callers cannot accidentally substitute the immutable ceiling. Live
+		// transactions receive only the prefix that strict allocation and sync
+		// have already certified.
+		options.PhysicalHighWaterBytes = c.physicalHighWater
+	}
 	if err := c.writeTransaction.Reset(
 		c.committer, c.cache, maxPages, options,
 	); err != nil {

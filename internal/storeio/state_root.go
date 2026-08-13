@@ -38,9 +38,15 @@ const (
 	// graph.
 	stateRootExactIndexOffset = stateRootJournalIDEnd
 	stateRootExactIndexEnd    = stateRootExactIndexOffset + PageRefSize
+	// stateRootPhysicalCapacityOffset carries the immutable maximum main-file
+	// high-water mark. Zero selects elastic allocation; a non-zero
+	// value is page aligned and bounds every physical reference the Store may
+	// ever publish.
+	stateRootPhysicalCapacityOffset = stateRootExactIndexEnd
+	stateRootPhysicalCapacityEnd    = stateRootPhysicalCapacityOffset + 8
 	// stateRootReservedOffset begins the zero-filled suffix described on
 	// StateRootPayloadSize.
-	stateRootReservedOffset = stateRootExactIndexEnd
+	stateRootReservedOffset = stateRootPhysicalCapacityEnd
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -129,6 +135,11 @@ type StateRoot struct {
 	// fails closed if that journal is missing or its header identity does not
 	// match both StoreID and this JournalID.
 	JournalID [16]byte
+	// PhysicalCapacityBytes is the immutable sealed main-file ceiling. It does
+	// not claim that the complete ceiling is allocated: the apparent file size,
+	// after strict platform proof, is the current allocation certificate. Zero
+	// selects elastic allocation.
+	PhysicalCapacityBytes uint64
 }
 
 // encodeStateRootPayload writes the identity-free StateRoot body shared by the
@@ -184,6 +195,10 @@ func encodeStateRootPayload(payload []byte, root StateRoot) {
 		payload[stateRootExactIndexOffset:stateRootExactIndexEnd],
 		root.ExactIndexRoot,
 	)
+	binary.LittleEndian.PutUint64(
+		payload[stateRootPhysicalCapacityOffset:stateRootPhysicalCapacityEnd],
+		root.PhysicalCapacityBytes,
+	)
 }
 
 // decodeStateRootPayload decodes the identity-free StateRoot body shared by
@@ -236,6 +251,9 @@ func decodeStateRootPayload(
 		),
 		ExactIndexRoot: decodePageRef(
 			payload[stateRootExactIndexOffset:stateRootExactIndexEnd],
+		),
+		PhysicalCapacityBytes: binary.LittleEndian.Uint64(
+			payload[stateRootPhysicalCapacityOffset:stateRootPhysicalCapacityEnd],
 		),
 	}
 	copy(root.JournalID[:], payload[stateRootJournalIDOffset:stateRootJournalIDEnd])
@@ -295,6 +313,19 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	}
 	if fileEnd < layout.DataStart || fileEnd > maxSuperblockFileOffset || fileEnd%pageSize != 0 {
 		return fmt.Errorf("%w: state file high-water mark", ErrInvalidWrite)
+	}
+	if root.PhysicalCapacityBytes != 0 &&
+		(root.PhysicalCapacityBytes < fileEnd ||
+			root.PhysicalCapacityBytes > maxSuperblockFileOffset ||
+			root.PhysicalCapacityBytes%pageSize != 0) {
+		return fmt.Errorf("%w: sealed physical capacity", ErrInvalidWrite)
+	}
+	if root.PhysicalCapacityBytes != 0 &&
+		(root.JournalID != ([16]byte{}) || materializationEnabled) {
+		return fmt.Errorf(
+			"%w: sealed physical capacity requires a rooted copy-on-write state",
+			ErrInvalidWrite,
+		)
 	}
 	hasCatalog := root.IndexCount != 0 || root.Options&StateOptionSchema != 0
 	hasExactCatalog := root.PageCatalogBytes != 0

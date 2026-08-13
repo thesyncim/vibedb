@@ -13,9 +13,11 @@ import (
 // identity; a zero PageCatalogBytes denotes the canonical empty catalog.
 type MutableInlineBootstrap struct {
 	StoreID                      [16]byte
+	FileEnd                      uint64
 	PageSize                     uint32
 	MaxPageSize                  uint32
 	MaterializationDamageGranule uint32
+	PhysicalCapacityBytes        uint64
 	PageCatalogHead              PageRef
 	PageCatalogDigest            [PageCatalogDigestSize]byte
 	PageCatalogBytes             uint32
@@ -109,9 +111,11 @@ func DiscoverMutableInlineBootstrap(
 func mutableInlineBootstrap(root InlineSuperblock) MutableInlineBootstrap {
 	return MutableInlineBootstrap{
 		StoreID:                      root.StoreID,
+		FileEnd:                      root.FileEnd,
 		PageSize:                     root.PageSize,
 		MaxPageSize:                  root.State.MaxPageSize,
 		MaterializationDamageGranule: root.State.MaterializationDamageGranule,
+		PhysicalCapacityBytes:        root.State.PhysicalCapacityBytes,
 		PageCatalogHead:              root.State.PageCatalogHead,
 		PageCatalogDigest:            root.State.PageCatalogDigest,
 		PageCatalogBytes:             root.State.PageCatalogBytes,

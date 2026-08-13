@@ -25,11 +25,8 @@ func TestDiscoverMutableInlineBootstrap(t *testing.T) {
 		t.Run(strconv.FormatUint(uint64(pageSize), 10), func(t *testing.T) {
 			file := openDiscoveryFixture(t)
 			root := discoveryInlineRoot(t, pageSize, 7, [16]byte{7})
-			root.State.Options |= StateOptionSchema |
-				StateOptionCanonicalMaterialization
+			root.State.Options |= StateOptionSchema
 			root.State.IndexCatalogHash = 1
-			root.State.MaterializationDamageGranule =
-				MaterializationJournalMinSectorSize
 			root.State.NextLogicalID = 3
 			root.State.PageCatalogHead = PageRef{
 				Offset: root.FileEnd, LogicalID: 2, Generation: 1,
@@ -40,16 +37,17 @@ func TestDiscoverMutableInlineBootstrap(t *testing.T) {
 			root.State.PageCatalogBytes =
 				PageCatalogCanonicalHeaderSize
 			root.FileEnd += uint64(pageSize)
+			root.State.PhysicalCapacityBytes = root.FileEnd + 32*uint64(pageSize)
 			writeDiscoveryRoot(t, file, root, 0)
 
 			got, err := DiscoverMutableInlineBootstrap(file)
 			want := MutableInlineBootstrap{
-				StoreID:  root.StoreID,
-				PageSize: pageSize, MaxPageSize: 64 << 10,
-				MaterializationDamageGranule: MaterializationJournalMinSectorSize,
-				PageCatalogHead:              root.State.PageCatalogHead,
-				PageCatalogDigest:            root.State.PageCatalogDigest,
-				PageCatalogBytes:             root.State.PageCatalogBytes,
+				StoreID: root.StoreID,
+				FileEnd: root.FileEnd, PageSize: pageSize, MaxPageSize: 64 << 10,
+				PhysicalCapacityBytes: root.State.PhysicalCapacityBytes,
+				PageCatalogHead:       root.State.PageCatalogHead,
+				PageCatalogDigest:     root.State.PageCatalogDigest,
+				PageCatalogBytes:      root.State.PageCatalogBytes,
 			}
 			if err != nil || got != want {
 				t.Fatalf(
@@ -58,6 +56,23 @@ func TestDiscoverMutableInlineBootstrap(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestDiscoverMutableInlineBootstrapMaterializationElastic(t *testing.T) {
+	file := openDiscoveryFixture(t)
+	root := discoveryInlineRoot(t, 4096, 7, [16]byte{8})
+	root.State.Options |= StateOptionCanonicalMaterialization
+	root.State.MaterializationDamageGranule =
+		MaterializationJournalMinSectorSize
+	writeDiscoveryRoot(t, file, root, 0)
+	got, err := DiscoverMutableInlineBootstrap(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaterializationDamageGranule != MaterializationJournalMinSectorSize ||
+		got.PhysicalCapacityBytes != 0 {
+		t.Fatalf("elastic materialization bootstrap = %+v", got)
 	}
 }
 
@@ -105,6 +120,9 @@ func TestDiscoverMutableInlineBootstrapRejectsImmutableConflicts(t *testing.T) {
 		{"index depth", func(root *InlineSuperblock) {
 			root.State.IndexMaxDepth = 17
 		}},
+		{"physical capacity", func(root *InlineSuperblock) {
+			root.State.PhysicalCapacityBytes = root.FileEnd + 65*uint64(root.PageSize)
+		}},
 	}
 	for _, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
@@ -132,6 +150,11 @@ func TestDiscoverMutableInlineBootstrapRejectsImmutableConflicts(t *testing.T) {
 				second.State.Options = first.State.Options
 				second.State.MaterializationDamageGranule =
 					first.State.MaterializationDamageGranule
+			}
+			if test.name == "physical capacity" {
+				capacity := first.FileEnd + 64*uint64(first.PageSize)
+				first.State.PhysicalCapacityBytes = capacity
+				second.State.PhysicalCapacityBytes = capacity
 			}
 			test.mutate(&second)
 			writeDiscoveryRoot(t, file, first, 0)

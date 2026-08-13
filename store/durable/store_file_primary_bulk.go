@@ -34,10 +34,18 @@ func CreateFromRecords(
 	input []PrimaryBulkRecord,
 	file *os.File,
 	options Options,
-) (int64, error) {
+) (fileEnd int64, err error) {
 	if file == nil {
 		return 0, fmt.Errorf("vibedb: CreateFromRecords requires a non-nil file")
 	}
+	if err := storeio.LockWriter(file); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if unlockErr := unlockCollectionWriter(file); unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return 0, err
@@ -108,12 +116,20 @@ func CreateFromPrimary(
 	collection *store.Collection,
 	file *os.File,
 	options Options,
-) (int64, error) {
+) (fileEnd int64, err error) {
 	if collection == nil || file == nil {
 		return 0, fmt.Errorf(
 			"vibedb: CreateFromPrimary requires non-nil collection and file",
 		)
 	}
+	if err := storeio.LockWriter(file); err != nil {
+		return 0, err
+	}
+	defer func() {
+		if unlockErr := unlockCollectionWriter(file); unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return 0, err
@@ -241,21 +257,6 @@ func createFromPrimaryGraphRecords(
 	if err != nil {
 		return 0, err
 	}
-	if err := file.Truncate(int64(catalog.fileEnd)); err != nil {
-		return 0, err
-	}
-	if catalog.segments != 0 {
-		scratch := make([]byte, normalized.PageSize)
-		if err := catalog.write(
-			file, catalog.fileEnd, catalog.nextID,
-			scratch,
-		); err != nil {
-			return 0, err
-		}
-		if err := file.Sync(); err != nil {
-			return 0, err
-		}
-	}
 
 	committer, err := storeio.NewCommitter(
 		file,
@@ -279,9 +280,10 @@ func createFromPrimaryGraphRecords(
 		committer, nil, pageCount,
 		storeio.WriteTransactionOptions{
 			StoreID: storeID, Generation: 1,
-			PageSize:      uint32(normalized.PageSize),
-			FileEnd:       catalog.fileEnd,
-			NextLogicalID: storeio.PrimaryFirstDynamicLogicalID,
+			PageSize:               uint32(normalized.PageSize),
+			FileEnd:                catalog.fileEnd,
+			PhysicalHighWaterBytes: normalized.PhysicalCapacityBytes,
+			NextLogicalID:          storeio.PrimaryFirstDynamicLogicalID,
 		},
 	)
 	if err != nil {
@@ -325,11 +327,12 @@ func createFromPrimaryGraphRecords(
 		IndexMaxDepth: uint32(max(
 			normalized.Collection.IndexOptions.MaxDepth, 0,
 		)),
-		MaxKeyBytes:      uint32(normalized.MaxKeyBytes),
-		InlineValueBytes: uint32(normalized.InlineValueBytes),
-		MaxDocumentBytes: uint32(normalized.MaxDocumentBytes),
-		PrimaryRoot:      primaryRoot,
-		ExactIndexRoot:   exactIndexRoot,
+		MaxKeyBytes:           uint32(normalized.MaxKeyBytes),
+		InlineValueBytes:      uint32(normalized.InlineValueBytes),
+		MaxDocumentBytes:      uint32(normalized.MaxDocumentBytes),
+		PhysicalCapacityBytes: normalized.PhysicalCapacityBytes,
+		PrimaryRoot:           primaryRoot,
+		ExactIndexRoot:        exactIndexRoot,
 	}
 	root.Options = fileStoreCollectionOptionFlags(normalized.Collection)
 	if normalized.MaterializationDamageGranule != 0 {
@@ -343,6 +346,58 @@ func createFromPrimaryGraphRecords(
 		_ = tx.Abort()
 		_ = committer.Close()
 		return 0, err
+	}
+	// Every graph and index page is staged only in committer memory up to this
+	// point. Provision the exact final main-file prefix before writing the
+	// catalog or allowing PublishInline to issue its first data write.
+	physicalEnd := tx.FileEnd()
+	if normalized.PhysicalCapacityBytes != 0 {
+		if physicalEnd > normalized.PhysicalCapacityBytes {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, fmt.Errorf(
+				"%w: bulk build needs=%d ceiling=%d",
+				ErrPhysicalCapacity, physicalEnd,
+				normalized.PhysicalCapacityBytes,
+			)
+		}
+		if err := fileStoreCapacityOps.allocate(
+			file, 0, int64(physicalEnd),
+		); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, fmt.Errorf(
+				"%w: strictly allocate bulk main file: %w",
+				ErrPhysicalCapacity, err,
+			)
+		}
+		if err := fileStoreCapacityOps.sync(file); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, fmt.Errorf(
+				"%w: sync strictly allocated bulk main file: %w",
+				ErrPhysicalCapacity, err,
+			)
+		}
+	} else if err := file.Truncate(int64(catalog.fileEnd)); err != nil {
+		_ = tx.Abort()
+		_ = committer.Close()
+		return 0, err
+	}
+	if catalog.segments != 0 {
+		scratch := make([]byte, normalized.PageSize)
+		if err := catalog.write(
+			file, catalog.fileEnd, catalog.nextID, scratch,
+		); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = tx.Abort()
+			_ = committer.Close()
+			return 0, err
+		}
 	}
 	// Mint the paired journal before the root that names it is published, so a
 	// crash after the root is durable finds the journal file present.
@@ -499,6 +554,7 @@ func primaryBulkStoreID(
 	writeUint64(uint64(options.PageSize))
 	writeUint64(uint64(options.MaxPageSize))
 	writeUint64(uint64(options.MaterializationDamageGranule))
+	writeUint64(options.PhysicalCapacityBytes)
 	writeUint64(uint64(max(options.Collection.IndexOptions.MaxDepth, 0)))
 	writeUint64(uint64(options.MaxKeyBytes))
 	writeUint64(uint64(options.InlineValueBytes))

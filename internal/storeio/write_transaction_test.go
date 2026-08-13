@@ -123,6 +123,35 @@ func TestWriteTransactionValidationAndAbort(t *testing.T) {
 	}
 }
 
+func TestWriteTransactionPhysicalHighWaterRefusesBeforeIdentityMutation(t *testing.T) {
+	committer, _, _ := newPortableCommitter(t, 4, 2)
+	defer committer.Close()
+	fileEnd := testMutableStoreDataStart(testSuperblockPageSize)
+	tx, err := BeginWriteTransaction(committer, nil, 2, WriteTransactionOptions{
+		StoreID: testStoreID, Generation: 1, PageSize: testSuperblockPageSize,
+		FileEnd: fileEnd, PhysicalHighWaterBytes: fileEnd + uint64(testSuperblockPageSize),
+		NextLogicalID: 19,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Abort()
+	page, err := tx.Allocate(PageIndexPosting, testSuperblockPageSize, 0)
+	if err != nil || page.Ref().Offset != fileEnd || tx.FileEnd() != fileEnd+uint64(testSuperblockPageSize) {
+		t.Fatalf("boundary allocation = (%+v,%v) fileEnd=%d", page.Ref(), err, tx.FileEnd())
+	}
+	beforeID := tx.NextLogicalID()
+	beforeEnd := tx.FileEnd()
+	if _, err := tx.Allocate(
+		PageIndexPosting, testSuperblockPageSize, 0,
+	); !errors.Is(err, ErrPhysicalCapacity) {
+		t.Fatalf("past high-water allocation = %v, want %v", err, ErrPhysicalCapacity)
+	}
+	if tx.NextLogicalID() != beforeID || tx.FileEnd() != beforeEnd {
+		t.Fatalf("refusal mutated transaction: id %d->%d end %d->%d", beforeID, tx.NextLogicalID(), beforeEnd, tx.FileEnd())
+	}
+}
+
 func TestWriteTransactionResetRequiresInactiveReceiver(t *testing.T) {
 	committer, _, _ := newPortableCommitter(t, 4, 2)
 	defer committer.Close()
