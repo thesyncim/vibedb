@@ -220,6 +220,13 @@ complete sealed file length is exactly `1024 + Capacity`: both 512-byte headers
 are outside the record-region capacity. The flag and capacity are covered by
 the header checksum and survive header recycle.
 
+The recovery-journal record-region hard ceiling is 16 MiB plus 17,408 bytes.
+That bound covers the current replicated SQL ceiling: a 16 MiB command budget,
+64 maximum-size 256-byte keys, conditional and per-entry framing, checksum
+trailer, and final 512-byte sector padding. It is an allocation/hostile-header
+clamp, not a promise that arbitrary larger durable collection options qualify
+for sealing.
+
 The current ordinary buffered-delta policy caps, and with the shipped overlay
 geometry selects, a 2.5 MiB record region. Its foreground admission guard keeps
 up to 512 KiB for one estimated future carried suffix, leaving the qualified
@@ -303,6 +310,10 @@ reserved bit, or any nonzero byte in the reserved `68:504` suffix, rejects the
 header before record replay. Its complete sealed file
 length is likewise exactly `1024 + Capacity`, with the two header sectors
 outside that capacity.
+
+The decision log retains an independent 16 MiB record-region hard ceiling. It
+does not inherit recovery-journal envelope overhead when that separate clamp
+changes.
 
 The fixed materialization journal slots inside the primary file carry complete
 before-image sectors for qualified in-place canonical page updates. Recovery

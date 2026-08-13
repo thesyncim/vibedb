@@ -425,13 +425,14 @@ func recoveryJournalInitialDocumentBytes(
 	return maxDocumentBytes
 }
 
-// growSyncJournalForRecordLocked grows only for a single record that cannot
-// fit even in an empty current journal. Ordinary capacity pressure still takes
-// the established checkpoint/recycle path, preserving the bounded replay and
-// fold cadence instead of letting small records expand the journal to its cap.
-// The caller holds writer and has not reached the mutation's point of no return.
-func (c *Collection) growSyncJournalForRecordLocked(recordBytes int) error {
-	if !c.syncJournalLane() || recordBytes <= 0 ||
+// growJournalForRecordLocked grows an ordinary mutable acknowledgement journal
+// only for a single record that cannot fit even when empty. Ordinary capacity
+// pressure still takes the established checkpoint/recycle path, preserving the
+// bounded replay and fold cadence instead of letting small records expand the
+// journal to its cap. Sealed journals reject growth themselves. The caller holds
+// writer and has not reached the mutation's point of no return.
+func (c *Collection) growJournalForRecordLocked(recordBytes int) error {
+	if !c.syncJournalLane() && !c.bufferedJournalAckLane() || recordBytes <= 0 ||
 		uint64(recordBytes) <= c.journal.Header().Capacity {
 		return nil
 	}
@@ -1137,7 +1138,17 @@ func (c *Collection) ensurePrimaryBatchConditionalJournalRoom(
 	if c.journalReplaying || !c.journalEnabled() {
 		return nil
 	}
-	if c.journal.FitsConditionalBatch(entries) {
+	plan, err := c.journal.PrepareConditionalBatch(entries)
+	if err != nil {
+		return err
+	}
+	if c.journal.PreparedBatchFits(plan) {
+		return nil
+	}
+	if err := c.growJournalForRecordLocked(plan.PaddedSize()); err != nil {
+		return err
+	}
+	if c.journal.PreparedBatchFits(plan) {
 		return nil
 	}
 	if err := c.checkpointBufferedLocked(); err != nil {
@@ -1146,6 +1157,16 @@ func (c *Collection) ensurePrimaryBatchConditionalJournalRoom(
 	c.automaticCheckpoints.Add(1)
 	if err := c.ensureConditionalJournalFormatLocked(); err != nil {
 		return err
+	}
+	plan, err = c.journal.PrepareConditionalBatch(entries)
+	if err != nil {
+		return err
+	}
+	if err := c.growJournalForRecordLocked(plan.PaddedSize()); err != nil {
+		return err
+	}
+	if !c.journal.PreparedBatchFits(plan) {
+		return storeio.ErrRecoveryJournalFull
 	}
 	return nil
 }
@@ -1381,14 +1402,25 @@ func (c *Collection) ensurePrimaryBatchJournalRoom(
 	if c.journal.FitsBatch(entries) {
 		return nil
 	}
+	if c.bufferedJournalAckLane() {
+		plan, err := c.journal.PrepareBatch(entries)
+		if err != nil {
+			return err
+		}
+		if uint64(plan.PaddedSize()) > c.journal.Header().Capacity {
+			// The buffered acknowledgement lane publishes before depositing its
+			// kind-3 record. An oversized record deliberately takes that deposit's
+			// physical-checkpoint fallback; pre-publish checkpoint/replan would
+			// repeat forever because this compact journal never grows for kind 3.
+			return nil
+		}
+	}
 	if c.syncJournalLane() {
 		plan, err := c.journal.PrepareBatch(entries)
 		if err != nil {
 			return err
 		}
-		if err := c.growSyncJournalForRecordLocked(
-			plan.PaddedSize(),
-		); err != nil {
+		if err := c.growJournalForRecordLocked(plan.PaddedSize()); err != nil {
 			return err
 		}
 		if c.journal.PreparedBatchFits(plan) {
@@ -1404,9 +1436,7 @@ func (c *Collection) ensurePrimaryBatchJournalRoom(
 		if err != nil {
 			return err
 		}
-		if err := c.growSyncJournalForRecordLocked(
-			plan.PaddedSize(),
-		); err != nil {
+		if err := c.growJournalForRecordLocked(plan.PaddedSize()); err != nil {
 			return err
 		}
 		if !c.journal.PreparedBatchFits(plan) {

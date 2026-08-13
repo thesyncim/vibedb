@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -25,6 +26,8 @@ const (
 	replicatedMaxKeyBytes          = 256
 	replicatedMaxDocumentBytes     = 4 << 20
 	replicatedMaxDistinctMutations = 64
+	replicatedMaxBatchBytes        = replication.MaxCommandBytes +
+		replicatedMaxDistinctMutations*replicatedMaxKeyBytes
 )
 
 var (
@@ -605,7 +608,7 @@ func validateReplicatedShardStoreLimits(l ReplicatedShardStoreLimits) error {
 	if l.MaxKeyBytes <= 0 || l.MaxKeyBytes > replicatedMaxKeyBytes ||
 		l.MaxDocumentBytes <= 0 || l.MaxDocumentBytes > replicatedMaxDocumentBytes ||
 		l.MaxBatchDocuments <= 0 || l.MaxBatchDocuments > replicatedMaxDistinctMutations ||
-		l.MaxBatchBytes <= 0 {
+		l.MaxBatchBytes <= 0 || l.MaxBatchBytes > replicatedMaxBatchBytes {
 		return fmt.Errorf("%w: user limits exceed replicated bounds", ErrReplicatedShardStoreProfile)
 	}
 	return nil

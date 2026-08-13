@@ -82,10 +82,13 @@ const (
 	// append cannot rewrite an already-synced earlier record.
 	RecoveryJournalMinSectorSize = 512
 	// RecoveryJournalMaxCapacityBytes is the authoritative upper bound for the
-	// preallocated record region and the buffer read by recovery. Keeping it in
-	// the format package makes a checksummed hostile header unable to request an
-	// unbounded allocation and keeps durable's creation clamp from drifting.
-	RecoveryJournalMaxCapacityBytes = uint64(16) << 20
+	// preallocated record region and the buffer read by recovery. Its extra bytes
+	// cover the current replicated SQL ceiling: a 16 MiB command budget, every
+	// maximum-size key across 64 mutations, conditional and per-entry framing,
+	// checksum trailer, and sector padding. Keeping the bound here makes a
+	// checksummed hostile header unable to request an unbounded allocation and
+	// keeps durable's creation clamp from drifting.
+	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 34*RecoveryJournalMinSectorSize
 
 	recoveryJournalMagic = "RJRNL00\x00"
 	recoveryRecordMagic  = uint32(0x304a5252) // "RRJ0", little-endian.

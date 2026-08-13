@@ -53,7 +53,7 @@ func prepareConditionalUnpublished(
 	if err := phaseWorkload(batch); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := coll.stagePrimaryBatchLocked(batch)
+	staged, err := coll.stagePrimaryBatchConditionalLocked(batch)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
@@ -197,8 +197,8 @@ func TestConditionalReplayUndecidedSkips(t *testing.T) {
 // epoch-behind kind-5 records against the decision-log epoch.
 func TestConditionalReplayEpochMismatchFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		recordEpoch  uint64
+		name          string
+		recordEpoch   uint64
 		decisionEpoch uint64
 	}{
 		{"epoch-ahead", 5, 4},

@@ -42,6 +42,22 @@ func TestSealedRecoveryJournalOptionRequiresCompleteConditionalRecord(t *testing
 	}
 }
 
+func TestSealedRecoveryJournalAdmitsReplicatedSQLCeiling(t *testing.T) {
+	options := syncPrimaryJournalTestOptions()
+	options.MaxBatchDocuments = 64
+	options.MaxBatchBytes = (16 << 20) + options.MaxBatchDocuments*256
+	options.SealedRecoveryJournalBytes = storeio.RecoveryJournalMaxCapacityBytes
+	if _, err := options.normalized(); err != nil {
+		t.Fatalf("replicated SQL ceiling profile: %v", err)
+	}
+
+	short := options
+	short.SealedRecoveryJournalBytes -= storeio.RecoveryJournalMinSectorSize
+	if _, err := short.normalized(); !errors.Is(err, ErrSealedJournalCapacity) {
+		t.Fatalf("one-sector-short ceiling profile = %v, want %v", err, ErrSealedJournalCapacity)
+	}
+}
+
 func TestSealedRecoveryJournalOpenRejectsRootWithoutJournalIdentity(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "async.vjc")
