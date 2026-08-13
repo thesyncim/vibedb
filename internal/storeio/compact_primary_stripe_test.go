@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/benchcorpus"
 	"github.com/thesyncim/vibejson"
@@ -925,6 +926,95 @@ func TestCompactPrimaryScanDecoderZeroHoleShape(t *testing.T) {
 	got, ok := decoder.appendValue(nil, &view, 7, 0, 0, 0)
 	if !ok || !bytes.Equal(got, static) {
 		t.Fatalf("zero-hole scan render = %q,%v want %q", got, ok, static)
+	}
+}
+
+func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
+	for _, high := range []bool{false, true} {
+		rows := 4096
+		if high {
+			// High-cardinality plans average roughly 960 rows per bounded leaf.
+			rows = 900
+		}
+		_, view, _ := compactPrimaryTestPage(t, rows, high)
+		bounds, largest := 0, 0
+		for shape := 0; shape < view.shapeCount; shape++ {
+			entry, ok := view.shapeEntry(shape)
+			if !ok {
+				t.Fatalf("high=%t shape=%d", high, shape)
+			}
+			streams := entry.streamRaw
+			for range entry.template.holes {
+				stream, ok := admittedCompactStream(streams)
+				if !ok {
+					t.Fatalf("high=%t shape=%d stream", high, shape)
+				}
+				if stream.kind == compactStreamDictionary {
+					largest = max(largest, stream.dictCount)
+					bounds += stream.dictCount + 1
+				}
+				streams = streams[stream.encoded:]
+			}
+		}
+		t.Logf(
+			"high=%t dictionary bounds=%d largest=%d decoder-bytes=%d",
+			high, bounds, largest, unsafe.Sizeof(CompactPrimaryScanDecoder{}),
+		)
+		size := unsafe.Sizeof(CompactPrimaryScanDecoder{})
+		if unsafe.Sizeof(uintptr(0)) == 8 && size != 30_672 {
+			t.Fatalf(
+				"64-bit scan decoder bytes=%d, want 30672 (published base was 29136)",
+				size,
+			)
+		}
+		if size > 31<<10 {
+			t.Fatalf("scan decoder bytes=%d exceed bounded 31 KiB footprint", size)
+		}
+		if bounds > compactPrimaryScanDictionaryBounds {
+			t.Fatalf(
+				"high=%t dictionary bounds=%d exceed plan=%d",
+				high, bounds, compactPrimaryScanDictionaryBounds,
+			)
+		}
+	}
+}
+
+func TestCompactPrimaryScanDictionarySequentialParityAndBounds(t *testing.T) {
+	values := make([][]byte, 257)
+	for row := range values {
+		values[row] = []byte([]string{`"PT"`, `"US"`, `"DE"`}[row%3])
+	}
+	stream := compactCodecRoundTrip(t, encodeCompactDictionary(values), values)
+	bounds := make([]uint16, stream.dictCount+1)
+	for id := 0; id < stream.dictCount; id++ {
+		bounds[id+1] = binary.LittleEndian.Uint16(stream.dictDir[id*2:])
+	}
+
+	var state compactStreamSequentialState
+	want := make([]byte, 0, 16)
+	got := make([]byte, 0, 16)
+	for row := range values {
+		var wantOK, gotOK bool
+		want, wantOK = stream.appendValue(want[:0], row)
+		got, gotOK = state.appendDictionary(got[:0], stream, row, bounds)
+		if !wantOK || !gotOK || !bytes.Equal(got, want) {
+			t.Fatalf("row %d dictionary scan = %q,%v want %q,%v", row, got, gotOK, want, wantOK)
+		}
+	}
+
+	// A non-sequential call keeps the complete admitted random-rank fallback.
+	state = compactStreamSequentialState{}
+	got, gotOK := state.appendDictionary(got[:0], stream, 73, bounds)
+	want, wantOK := stream.appendValue(want[:0], 73)
+	if !wantOK || !gotOK || !bytes.Equal(got, want) || state.next != 0 {
+		t.Fatalf("random fallback = %q,%v next=%d want %q,%v", got, gotOK, state.next, want, wantOK)
+	}
+
+	// Prepared bounds are trusted only after their local range is rechecked.
+	bad := append([]uint16(nil), bounds...)
+	bad[1] = uint16(len(stream.dictData) + 1)
+	if _, ok := state.appendDictionary(got[:0], stream, 0, bad); ok {
+		t.Fatal("dictionary scan accepted an out-of-range prepared boundary")
 	}
 }
 

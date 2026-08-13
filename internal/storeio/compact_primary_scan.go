@@ -9,6 +9,10 @@ const (
 	compactPrimaryScanShapes  = compactStreamRestart
 	compactPrimaryScanStreams = 128
 	compactPrimaryScanHoles   = 16
+	// Dictionary boundaries are decoded once per leaf into one shared bounded
+	// pool. A stream that would overflow the pool simply keeps the admitted
+	// random-rank decoder; other streams in the leaf still specialize.
+	compactPrimaryScanDictionaryBounds = 512
 )
 
 type compactPrimaryScanShape struct {
@@ -16,6 +20,11 @@ type compactPrimaryScanShape struct {
 	holes  uint16
 	ends   [compactPrimaryScanHoles + 1]uint32
 	static []byte
+}
+
+type compactPrimaryScanStream struct {
+	dictionaryFirst uint16
+	dictionaryCount uint16
 }
 
 type compactStreamSequentialState struct {
@@ -44,7 +53,9 @@ type CompactPrimaryScanDecoder struct {
 	supported  bool
 	shapes     [compactPrimaryScanShapes]compactPrimaryScanShape
 	streamView [compactPrimaryScanStreams]compactStreamView
+	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
 	streams    [compactPrimaryScanStreams]compactStreamSequentialState
+	dictionary [compactPrimaryScanDictionaryBounds]uint16
 	key        compactStreamView
 	keyState   compactStreamSequentialState
 	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
@@ -70,7 +81,9 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	if v.shapeCount > len(d.shapes) {
 		return
 	}
+	clear(d.streamPlan[:])
 	streamCount := 0
+	dictionaryCount := 0
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
 		if !ok || entry.template.holes > compactPrimaryScanHoles ||
@@ -94,6 +107,19 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				return
 			}
 			d.streamView[streamCount+hole] = stream
+			if stream.kind == compactStreamDictionary &&
+				stream.dictCount > 0 &&
+				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount {
+				plan := &d.streamPlan[streamCount+hole]
+				plan.dictionaryFirst = uint16(dictionaryCount)
+				plan.dictionaryCount = uint16(stream.dictCount)
+				d.dictionary[dictionaryCount] = 0
+				for id := 0; id < stream.dictCount; id++ {
+					d.dictionary[dictionaryCount+id+1] =
+						binary.LittleEndian.Uint16(stream.dictDir[id*2:])
+				}
+				dictionaryCount += stream.dictCount + 1
+			}
 			streamRaw = streamRaw[stream.encoded:]
 		}
 		if len(streamRaw) != 0 {
@@ -169,13 +195,45 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		stream := d.streamView[streamAt]
 		state := &d.streams[streamAt]
 		var ok bool
-		dst, ok = state.appendValue(dst, stream, ordinal)
+		plan := d.streamPlan[streamAt]
+		if plan.dictionaryCount != 0 {
+			first := int(plan.dictionaryFirst)
+			last := first + int(plan.dictionaryCount) + 1
+			dst, ok = state.appendDictionary(
+				dst, stream, ordinal, d.dictionary[first:last],
+			)
+		} else {
+			dst, ok = state.appendValue(dst, stream, ordinal)
+		}
 		if !ok {
 			return dst[:start], false
 		}
 	}
 	end := meta.ends[meta.holes]
 	return append(dst, meta.static[previous:end]...), true
+}
+
+func (s *compactStreamSequentialState) appendDictionary(
+	dst []byte,
+	v compactStreamView,
+	row int,
+	bounds []uint16,
+) ([]byte, bool) {
+	if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
+		row != s.next || len(bounds) != v.dictCount+1 {
+		return v.appendValue(dst, row)
+	}
+	id := int(compactReadBits(v.data, s.bit, int(v.width)))
+	if id < 0 || id >= v.dictCount {
+		return dst, false
+	}
+	start, end := int(bounds[id]), int(bounds[id+1])
+	if end < start || end > len(v.dictData) {
+		return dst, false
+	}
+	s.bit += int(v.width)
+	s.next++
+	return append(dst, v.dictData[start:end]...), true
 }
 
 func (s *compactStreamSequentialState) appendFrontKey(
