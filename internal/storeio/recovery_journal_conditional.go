@@ -413,7 +413,9 @@ func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if _, err := rj.writeAt(rj.scratch[:plan.padded], offset); err != nil {
+	if err := writeRecoveryJournalFull(
+		rj.writeAt, rj.scratch[:plan.padded], offset,
+	); err != nil {
 		return 0, err
 	}
 	rj.cursor = end

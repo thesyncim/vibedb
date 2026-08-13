@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -962,10 +963,12 @@ func TestRecoveryJournalTornTailTruncates(t *testing.T) {
 	appendPut(t, rj, 3, "k", "v")
 	appendPut(t, rj, 4, "k", "v")
 	fj.Program(JournalFaultPlan{Phase: JournalFaultTornAppend, AppendIndex: 3})
-	// The manager believes the torn append succeeded (a write the OS reported
-	// complete before power loss). Recovery must discover it torn.
-	if _, err := rj.Append(recoveryRecordKindPut, 5, []byte("k"), []byte("v")); err != nil {
-		t.Fatalf("torn append returned error: %v", err)
+	// A short,nil WriteAt is still a failed append. The manager must report it
+	// and leave its logical cursor on the torn bytes for recovery to truncate.
+	if _, err := rj.Append(
+		recoveryRecordKindPut, 5, []byte("k"), []byte("v"),
+	); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("torn append = %v, want io.ErrShortWrite", err)
 	}
 	if !fj.Faulted() {
 		t.Fatal("torn append fault did not fire")

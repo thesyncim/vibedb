@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"unsafe"
 )
@@ -1303,8 +1304,27 @@ func (rj *RecoveryJournal) writeHeader(slot uint32, header RecoveryJournalHeader
 		return err
 	}
 	off := int64(slot) * RecoveryJournalHeaderSize
-	if _, err := rj.writeAt(rj.scratch[:RecoveryJournalHeaderSize], off); err != nil {
+	if err := writeRecoveryJournalFull(
+		rj.writeAt, rj.scratch[:RecoveryJournalHeaderSize], off,
+	); err != nil {
 		return err
+	}
+	return nil
+}
+
+// writeRecoveryJournalFull preserves the journal's all-or-nothing cursor
+// contract when a faulty or unusual positional writer reports a short write
+// without an accompanying error. Callers advance in-memory header or record
+// state only after this helper succeeds.
+func writeRecoveryJournalFull(
+	writeAt func([]byte, int64) (int, error), p []byte, off int64,
+) error {
+	n, err := writeAt(p, off)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
@@ -1392,7 +1412,9 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if _, err := rj.writeAt(rj.scratch[:padded], offset); err != nil {
+	if err := writeRecoveryJournalFull(
+		rj.writeAt, rj.scratch[:padded], offset,
+	); err != nil {
 		return 0, err
 	}
 	rj.cursor += uint64(padded)
@@ -1571,7 +1593,9 @@ func (rj *RecoveryJournal) AppendPreparedBatch(
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if _, err := rj.writeAt(rj.scratch[:plan.padded], offset); err != nil {
+	if err := writeRecoveryJournalFull(
+		rj.writeAt, rj.scratch[:plan.padded], offset,
+	); err != nil {
 		return 0, err
 	}
 	rj.cursor = end
