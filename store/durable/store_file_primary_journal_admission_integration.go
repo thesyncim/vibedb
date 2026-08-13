@@ -16,7 +16,7 @@ var (
 	primaryJournalAdmissionInitialHandoffHook  func()
 	primaryJournalAdmissionRequestAppliedHook  func(*primaryJournalAdmissionRequest)
 	primaryJournalCohortBeforePrepareHook      func(int) error
-	primaryJournalCohortBeforeAppendHook       func(int)
+	primaryJournalCohortBeforeAppendHook       func(int) error
 	primaryJournalCohortAfterDepositHook       func(int, uint64)
 	primaryJournalCohortAfterCutHook           func(uint64)
 	primaryJournalCohortBeforePressureSealHook func(int)
@@ -476,13 +476,17 @@ func (c *Collection) publishPrimaryJournalAdmissionCohort(
 			outcome.resolved = index + 1
 			break
 		}
+		var appendErr error
 		if primaryJournalCohortBeforeAppendHook != nil {
-			primaryJournalCohortBeforeAppendHook(index)
+			appendErr = primaryJournalCohortBeforeAppendHook(index)
 		}
-		target, appendErr := c.journalConcurrentOverlayAppend(
-			storeio.RecoveryRecordKindPut, generation,
-			request.key, request.canonical,
-		)
+		var target uint64
+		if appendErr == nil {
+			target, appendErr = c.journalConcurrentOverlayAppend(
+				storeio.RecoveryRecordKindPut, generation,
+				request.key, request.canonical,
+			)
+		}
 		if appendErr != nil {
 			if errors.Is(appendErr, storeio.ErrRecoveryJournalFull) {
 				break

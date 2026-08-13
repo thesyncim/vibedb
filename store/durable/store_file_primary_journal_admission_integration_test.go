@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 type primaryJournalAdmissionMutationResult struct {
@@ -740,6 +742,397 @@ func TestPrimaryJournalAdmissionCohortSyncFailureIsUnknownForWholeFence(
 	}
 	if syncs := collection.Stats().JournalSyncs; syncs != 0 {
 		t.Fatalf("successful journal syncs = %d, want 0", syncs)
+	}
+}
+
+func TestPrimaryJournalAdmissionLargeImmutableBaseDeclinesWithoutScratchGrowth(
+	t *testing.T,
+) {
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityBufferedVisible, RecoveryJournal: true,
+		CheckpointStrength: CheckpointFilesystem,
+		InlineValueBytes:   storeio.CommonPrimaryLeafMaxExtentBytes,
+		MaxDocumentBytes:   storeio.CommonPrimaryLeafMaxExtentBytes,
+	}
+	builder, err := store.NewBuilder(store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	largeRaw := []byte(`{"v":"` +
+		strings.Repeat("x", primaryConcurrentRawScratchLimit+128) + `"}`)
+	rows := []struct {
+		key string
+		raw []byte
+	}{
+		{"large-base", largeRaw},
+		{"small-a", []byte(`{"v":"aa"}`)},
+		{"small-b", []byte(`{"v":"bb"}`)},
+		{"pilot", []byte(`{"v":"pp"}`)},
+	}
+	for _, row := range rows {
+		if err := builder.Append(row.key, row.raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	built, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := createPrimaryPointFile(t, built, options, "journal-large-base.vibe")
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = collection.Close() })
+	pool := collection.primaryJournalContexts
+	if pool == nil || pool.rawLimit != primaryConcurrentRawScratchLimit {
+		t.Fatalf("journal pool raw limit = %v", pool)
+	}
+
+	router := collection.primaryRouter.Load()
+	route, ok := router.Route([]byte("large-base"))
+	if !ok {
+		t.Fatal("large base route missing")
+	}
+	lease, err := router.AcquireLeaf(collection.cache, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, admitted := storeio.AdmittedCompactPrimaryStripe(
+		lease.Page(), collection.storeID, route.Bucket,
+	)
+	if !admitted {
+		lease.Release()
+		t.Fatal("large immutable base is not compact")
+	}
+	rank, found := leaf.FindKey([]byte("large-base"))
+	decoded, decodedOK := leaf.AppendValue(nil, rank)
+	stableSlot, slotOK := leaf.PostingSlot(rank)
+	lease.Release()
+	if !found || !decodedOK || !slotOK || len(decoded) <= pool.rawLimit {
+		t.Fatalf("large immutable base length = %d found=%t decoded=%t slot=%t, rawLimit=%d",
+			len(decoded), found, decodedOK, slotOK, pool.rawLimit)
+	}
+
+	// Warm exactly two preparation slots without changing the physical base.
+	firstContext := pool.acquire()
+	secondContext := pool.acquire()
+	if firstContext == nil || secondContext == nil {
+		t.Fatal("could not claim two journal preparation contexts")
+	}
+	pool.ensurePut(firstContext)
+	pool.ensurePut(secondContext)
+	pool.release(secondContext)
+	pool.release(firstContext)
+	if ready := bits.OnesCount64(pool.putReady.Load()); ready != 2 {
+		t.Fatalf("warmed journal slots = %d, want 2", ready)
+	}
+	var valueCaps [primaryConcurrentContextLimit]int
+	for index := range pool.contexts {
+		valueCaps[index] = cap(pool.contexts[index].value)
+	}
+	before := collection.Stats()
+
+	// Block the literal pilot after Apply, then install a smaller logical overlay
+	// value directly. No exclusive mutation can fold it before the detached
+	// follower cohort examines the still-large immutable leaf.
+	entered, release := blockPrimaryJournalAdmissionInitialApply(t)
+	pilotDone := make(chan error, 1)
+	go func() {
+		_, err := collection.Put([]byte("pilot"), []byte(`{"v":"qq"}`))
+		pilotDone <- err
+	}()
+	<-entered
+	logicalView, logicalOK := collection.writerLogicalView()
+	if !logicalOK || logicalView.state == nil {
+		t.Fatal("pilot logical view unavailable")
+	}
+	currentLarge := []byte(`{"v":"cc"}`)
+	seedGeneration := logicalView.generation + 1
+	prepared, err := collection.primaryUnifiedOverlay.prepareWithLeafReservation(
+		route.Bucket, route.Hash, seedGeneration,
+		[]byte("large-base"), currentLarge,
+		len(currentLarge)-len(decoded), 0,
+		primaryUnifiedOverlayPut, stableSlot, route.Ref.Length, true,
+		storeio.CommonPrimaryUnifiedScalarPatch{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection.primaryJournalCohortCutActive.Store(true)
+	collection.primaryUnifiedOverlay.publish(prepared)
+	collection.primaryUnifiedSeen = true
+	router.AdvanceGeneration(seedGeneration)
+	collection.pageValidator.advanceGeneration(seedGeneration)
+	seedCut, ok := packFileLogicalCut(seedGeneration, logicalView.delta)
+	if !ok {
+		t.Fatal("seed logical cut")
+	}
+	collection.logicalCut.Store(seedCut)
+	if current, disposition, _ := collection.primaryUnifiedOverlay.lookup(
+		route.Bucket, route.Hash, []byte("large-base"), seedGeneration,
+	); disposition != primaryUnifiedOverlayValue || !bytes.Equal(current, currentLarge) {
+		t.Fatalf("large base overlay shape = (%q,%d)", current, disposition)
+	}
+
+	keys := []string{"large-base", "small-a"}
+	values := [][]byte{[]byte(`{"v":"dd"}`), []byte(`{"v":"ac"}`)}
+	results := [2]chan primaryJournalAdmissionMutationResult{
+		make(chan primaryJournalAdmissionMutationResult, 1),
+		make(chan primaryJournalAdmissionMutationResult, 1),
+	}
+	for index := range 2 {
+		go func(index int) {
+			changed, err := collection.Put([]byte(keys[index]), values[index])
+			results[index] <- primaryJournalAdmissionMutationResult{changed, err}
+		}(index)
+		waitPrimaryJournalAdmissionQueueCount(
+			t, collection.primaryJournalAdmission, index+1,
+		)
+	}
+	release()
+	if err := <-pilotDone; err != nil {
+		t.Fatal(err)
+	}
+	for index := range 2 {
+		if result := <-results[index]; result.err != nil || result.changed {
+			t.Fatalf("fallback request %d = %+v", index, result)
+		}
+	}
+	after := collection.Stats()
+	if after.JournalCohortPublishGroups != before.JournalCohortPublishGroups {
+		t.Fatal("oversized immutable base entered cohort instead of mature fallback")
+	}
+	if after.ConcurrentPrimaryScratchBytes != before.ConcurrentPrimaryScratchBytes {
+		t.Fatalf("large-base fallback scratch grew %d -> %d",
+			before.ConcurrentPrimaryScratchBytes,
+			after.ConcurrentPrimaryScratchBytes)
+	}
+	if ready := bits.OnesCount64(pool.putReady.Load()); ready != 2 {
+		t.Fatalf("large-base fallback initialized %d slots, want plateau 2", ready)
+	}
+	for index := range pool.contexts {
+		if got := cap(pool.contexts[index].value); got != valueCaps[index] {
+			t.Fatalf("context %d value cap grew %d -> %d", index, valueCaps[index], got)
+		}
+	}
+	got, found, err := collection.AppendRaw(nil, []byte("large-base"))
+	if err != nil || !found || !bytes.Equal(got, []byte(`{"v":"dd"}`)) {
+		t.Fatalf("large-base mature fallback = (%q,%t,%v)", got, found, err)
+	}
+}
+
+func TestPrimaryJournalAdmissionCohortCrashImagesRecoverLegalPrefix(t *testing.T) {
+	const size = 3
+	type seamCase struct {
+		name        string
+		kind        string
+		index       int
+		exactPrefix int
+	}
+	var cases []seamCase
+	for index := range size {
+		cases = append(cases,
+			seamCase{fmt.Sprintf("before-append-%d", index), "before", index, 1 + index},
+			seamCase{fmt.Sprintf("after-deposit-%d", index), "deposit", index, 2 + index},
+		)
+	}
+	cases = append(cases, seamCase{"after-cut-before-add", "cut", 0, 1 + size})
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			options := Options{
+				Backend: BackendPortable, ResidentBytes: 32 << 20,
+				Durability: DurabilityBufferedVisible, RecoveryJournal: true,
+				CheckpointStrength: CheckpointFilesystem,
+			}
+			collection, keys, values := openPreparedPrimaryTestCollection(
+				t, "journal-cohort-crash-"+test.name+".vibe", options,
+			)
+			entered, releasePilot := blockPrimaryJournalAdmissionInitialApply(t)
+			seamEntered := make(chan struct{})
+			seamRelease := make(chan struct{})
+			var enteredOnce sync.Once
+			var releaseOnce sync.Once
+			block := func() {
+				enteredOnce.Do(func() { close(seamEntered) })
+				<-seamRelease
+			}
+			release := func() { releaseOnce.Do(func() { close(seamRelease) }) }
+			t.Cleanup(release)
+			switch test.kind {
+			case "before":
+				primaryJournalCohortBeforeAppendHook = func(index int) error {
+					if index == test.index {
+						block()
+					}
+					return nil
+				}
+			case "deposit":
+				primaryJournalCohortAfterDepositHook = func(index int, _ uint64) {
+					if index == test.index {
+						block()
+					}
+				}
+			case "cut":
+				primaryJournalCohortAfterCutHook = func(uint64) { block() }
+			default:
+				t.Fatalf("unknown seam kind %q", test.kind)
+			}
+
+			pilotKey := []byte(keys[len(keys)-1])
+			pilotValue := primaryJournalAdmissionEqualSizeValue(
+				values[len(values)-1], 'z',
+			)
+			pilotDone := make(chan error, 1)
+			go func() {
+				_, err := collection.Put(pilotKey, pilotValue)
+				pilotDone <- err
+			}()
+			<-entered
+			results := make([]chan error, size)
+			wants := make([][]byte, size)
+			for index := range size {
+				key := []byte(keys[index])
+				wants[index] = primaryJournalAdmissionEqualSizeValue(
+					values[index], byte('a'+index),
+				)
+				results[index] = make(chan error, 1)
+				go func(index int, key, value []byte) {
+					_, err := collection.Put(key, value)
+					results[index] <- err
+				}(index, key, wants[index])
+				waitPrimaryJournalAdmissionQueueCount(
+					t, collection.primaryJournalAdmission, index+1,
+				)
+			}
+			releasePilot()
+			select {
+			case <-seamEntered:
+			case <-time.After(concurrentPrimaryTestTimeout):
+				t.Fatal("cohort did not reach crash seam")
+			}
+			image := captureJournalImage(t, collection.file.Name())
+			release()
+			if err := <-pilotDone; err != nil {
+				t.Fatal(err)
+			}
+			for index := range size {
+				if err := <-results[index]; err != nil {
+					t.Fatalf("request %d completed after image: %v", index, err)
+				}
+			}
+
+			recovered := reopenJournalImage(t, options, image)
+			prefix := 0
+			seenOld := false
+			allKeys := append([]string{keys[len(keys)-1]}, keys[:size]...)
+			allOld := append([][]byte{values[len(values)-1]}, values[:size]...)
+			allNew := append([][]byte{pilotValue}, wants...)
+			for index, key := range allKeys {
+				got, found, err := recovered.AppendRaw(nil, []byte(key))
+				if err != nil || !found {
+					t.Fatalf("recovered %d = (%q,%t,%v)", index, got, found, err)
+				}
+				switch {
+				case bytes.Equal(got, allNew[index]):
+					if seenOld {
+						t.Fatalf("recovered hole: entry %d new after old prefix", index)
+					}
+					prefix++
+				case bytes.Equal(got, allOld[index]):
+					seenOld = true
+				default:
+					t.Fatalf("recovered entry %d = %q, want old %q or new %q",
+						index, got, allOld[index], allNew[index])
+				}
+			}
+			if prefix != test.exactPrefix {
+				t.Fatalf("recovered prefix = %d, want exact %d",
+					prefix, test.exactPrefix)
+			}
+		})
+	}
+}
+
+func TestPrimaryJournalAdmissionPreparedAppendPressureOverwritesUnpublishedSlot(
+	t *testing.T,
+) {
+	const size = 2
+	collection, keys, values := openPrimaryJournalAdmissionCohortCollection(
+		t, "journal-cohort-prepared-pressure.vibe",
+	)
+	entered, release := blockPrimaryJournalAdmissionInitialApply(t)
+	pilotDone := make(chan error, 1)
+	go func() {
+		_, err := collection.Put(
+			[]byte(keys[len(keys)-1]),
+			primaryJournalAdmissionEqualSizeValue(values[len(values)-1], 'z'),
+		)
+		pilotDone <- err
+	}()
+	<-entered
+	overlay := collection.primaryUnifiedOverlay
+	countBefore := overlay.count.Load()
+	usedBefore := overlay.used.Load()
+	var countAtHook, usedAtHook atomic.Uint32
+	var injected atomic.Bool
+	primaryJournalCohortBeforeAppendHook = func(index int) error {
+		if index == 0 && injected.CompareAndSwap(false, true) {
+			countAtHook.Store(overlay.count.Load())
+			usedAtHook.Store(overlay.used.Load())
+			return storeio.ErrRecoveryJournalFull
+		}
+		return nil
+	}
+	results := make([]chan primaryJournalAdmissionMutationResult, size)
+	wants := make([][]byte, size)
+	expectedBytes := uint32(0)
+	for index := range size {
+		key := []byte(keys[index])
+		wants[index] = primaryJournalAdmissionEqualSizeValue(
+			values[index], byte('a'+index),
+		)
+		expectedBytes += uint32(len(key) + len(wants[index]))
+		results[index] = make(chan primaryJournalAdmissionMutationResult, 1)
+		go func(index int, key, value []byte) {
+			changed, err := collection.Put(key, value)
+			results[index] <- primaryJournalAdmissionMutationResult{changed, err}
+		}(index, key, wants[index])
+		waitPrimaryJournalAdmissionQueueCount(
+			t, collection.primaryJournalAdmission, index+1,
+		)
+	}
+	release()
+	if err := <-pilotDone; err != nil {
+		t.Fatal(err)
+	}
+	for index := range size {
+		if result := <-results[index]; result.err != nil || result.changed {
+			t.Fatalf("pressure fallback %d = %+v", index, result)
+		}
+	}
+	if !injected.Load() {
+		t.Fatal("prepared append pressure seam did not fire")
+	}
+	if countAtHook.Load() != countBefore || usedAtHook.Load() != usedBefore {
+		t.Fatalf("unpublished prepare advanced state count %d->%d used %d->%d",
+			countBefore, countAtHook.Load(), usedBefore, usedAtHook.Load())
+	}
+	if got := overlay.count.Load() - countBefore; got != size {
+		t.Fatalf("fallback overlay records = %d, want %d without prepared gap", got, size)
+	}
+	if got := overlay.used.Load() - usedBefore; got != expectedBytes {
+		t.Fatalf("fallback arena bytes = %d, want %d overwrite", got, expectedBytes)
+	}
+	if groups := collection.Stats().JournalCohortPublishGroups; groups != 0 {
+		t.Fatalf("append-pressure cohort groups = %d, want 0", groups)
+	}
+	for index := range size {
+		got, found, err := collection.AppendRaw(nil, []byte(keys[index]))
+		if err != nil || !found || !bytes.Equal(got, wants[index]) {
+			t.Fatalf("fallback value %d = (%q,%t,%v)", index, got, found, err)
+		}
 	}
 }
 
