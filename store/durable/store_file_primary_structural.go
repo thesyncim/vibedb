@@ -996,6 +996,35 @@ func (c *Collection) putPrimaryWithSplit(
 	}
 }
 
+// putPrimaryPreparedWithSplit is the prepared-input twin of
+// putPrimaryWithSplit. Its retry and error contract deliberately stays
+// byte-for-byte parallel: the same canonical bytes survive every split retry,
+// while a preparation capacity decline enters the raw wrapper before this
+// loop.
+func (c *Collection) putPrimaryPreparedWithSplit(
+	key []byte, input primaryPreparedPutInput,
+) (created bool, err error) {
+	for attempt := 0; ; attempt++ {
+		created, err = c.putPrimaryPrepared(key, input)
+		if !errors.Is(err, ErrPrimaryLeafSplitRequired) {
+			if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+				return created, fmt.Errorf(
+					"put primary attempt %d without split signal: %w", attempt, err,
+				)
+			}
+			return created, err
+		}
+		if attempt >= primaryStructuralRetryLimit {
+			return false, err
+		}
+		if splitErr := c.splitPrimaryLeafForKey(key); splitErr != nil {
+			return false, errors.Join(
+				err, fmt.Errorf("split primary after attempt %d: %w", attempt, splitErr),
+			)
+		}
+	}
+}
+
 // splitPrimaryLeafForKey runs one split structural transaction for the leaf
 // routed by key under the single-writer lock, waiting for durability when
 // synchronous.

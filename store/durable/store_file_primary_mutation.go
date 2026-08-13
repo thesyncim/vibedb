@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // filePrimaryPendingParentLimit is the compile-time ceiling for one buffered
@@ -592,9 +593,51 @@ func (c *Collection) validatePrimarySchema(src []byte) error {
 	return schema.ValidateIndex(index)
 }
 
+// primaryPreparedPutInput retains both representations needed by a follower
+// admitted before it reaches the exclusive writer. raw is borrowed from the
+// blocked public caller; rawLength freezes its validation bound. canonical is
+// owned by that caller's bounded context until putPrimaryPrepared returns.
+//
+// prepared=false and document.ErrIndexFull are capacity declines, not document
+// errors: putPrimaryPrepared sends them through the unchanged raw path, which
+// owns an unbounded writer-private canonical workspace. Every other preflight
+// result stays provisional until putPrimaryInput has re-established the public
+// closed, persistence, key, and raw-document precedence under writer.
+type primaryPreparedPutInput struct {
+	raw          []byte
+	rawLength    int
+	canonical    []byte
+	preflightErr error
+	prepared     bool
+}
+
 func (c *Collection) putPrimary(
 	key []byte,
 	src []byte,
+) (created bool, err error) {
+	return c.putPrimaryInput(key, primaryPreparedPutInput{
+		raw: src, rawLength: len(src),
+	})
+}
+
+func (c *Collection) putPrimaryPrepared(
+	key []byte,
+	input primaryPreparedPutInput,
+) (created bool, err error) {
+	if !input.prepared ||
+		errors.Is(input.preflightErr, document.ErrIndexFull) ||
+		c.options.Collection.Schema != nil {
+		return c.putPrimary(key, input.raw)
+	}
+	return c.putPrimaryInput(key, input)
+}
+
+// putPrimaryInput is the one writer-owning Put body. The raw wrapper and a
+// prepared follower therefore share every mutation, journal, split signal,
+// telemetry, and durability-wait decision after canonical selection.
+func (c *Collection) putPrimaryInput(
+	key []byte,
+	input primaryPreparedPutInput,
 ) (created bool, err error) {
 	c.writer.Lock()
 	var generation uint64
@@ -630,10 +673,17 @@ func (c *Collection) putPrimary(
 		len(key) > storeio.CommonPrimaryLeafMaxKeyBytes {
 		return false, ErrKeyTooLarge
 	}
-	if len(src) == 0 ||
-		len(src) > c.options.MaxDocumentBytes {
+	if input.rawLength == 0 ||
+		input.rawLength > c.options.MaxDocumentBytes {
 		return false, ErrDocumentTooLarge
 	}
+	if input.rawLength != len(input.raw) {
+		// rawLength is frozen by the private preparer and must describe the
+		// caller-borrowed slice exactly. Fail closed after every public error
+		// precedence gate and before consulting prepared bytes.
+		return false, storeio.ErrInvalidWrite
+	}
+	src := input.raw
 	// A schemaless primary Put needs the structural index for canonical class-5
 	// bytes anyway. Build it once here: BuildIndex validates the document, and
 	// the canonical result then flows unchanged through overlay/COW, exact-index
@@ -642,7 +692,15 @@ func (c *Collection) putPrimary(
 	// index requires proving the schema's depth/hash options compatible with the
 	// canonical builder and is deliberately outside this fast-path change.
 	canonicalReady := c.options.Collection.Schema == nil
-	if canonicalReady {
+	if input.prepared {
+		if input.preflightErr != nil {
+			return false, input.preflightErr
+		}
+		if !canonicalReady || len(input.canonical) == 0 {
+			return false, storeio.ErrInvalidWrite
+		}
+		src = input.canonical
+	} else if canonicalReady {
 		src, err = c.canonicalPrimaryMutationValue(src)
 		if err != nil {
 			return false, err
