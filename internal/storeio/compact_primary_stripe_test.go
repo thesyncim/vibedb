@@ -1108,6 +1108,143 @@ func TestCompactPrimaryScanFixedPackedZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestPrimaryGraphCursorDecodedConsumePreservesScanState(t *testing.T) {
+	_, view, records := compactPrimaryTestPage(t, 1000, false)
+	// Exercise the stateful front-key decoder rather than this corpus's legal
+	// linear prefix-integer choice. Values retain the real three-shape compact
+	// corpus and all of its adaptive scalar codecs.
+	keys := make([][]byte, len(records))
+	for row := range records {
+		keys[row] = records[row].Key
+	}
+	view.key = compactCodecRoundTrip(t, encodeCompactFront(keys), keys)
+	if view.key.kind != compactStreamFront || view.shapeCount < 2 {
+		t.Fatalf("fixture key kind=%d shapes=%d", view.key.kind, view.shapeCount)
+	}
+	wantValues := make([][]byte, len(records))
+	for row := range records {
+		var err error
+		wantValues[row], err = vibejson.AppendCanonicalize(
+			nil, records[row].Value.Inline,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	skipped := make([]bool, len(records))
+	seenShape := make([]bool, view.shapeCount)
+	for row := range records {
+		shape := view.rowShape(row)
+		if shape >= 0 && shape < len(seenShape) && !seenShape[shape] {
+			skipped[row] = true
+			seenShape[shape] = true
+		}
+	}
+	if !skipped[0] {
+		t.Fatal("fixture does not consume the first base row")
+	}
+	for shape, seen := range seenShape {
+		if !seen {
+			t.Fatalf("fixture did not consume shape %d", shape)
+		}
+	}
+
+	type finalState struct {
+		lastRow    int
+		key        compactStreamSequentialState
+		keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
+		streams    [compactPrimaryScanStreams]compactStreamSequentialState
+		row        int
+		shapeBlock int
+		shapeSeen  [primaryGraphSequentialShapeSlots]uint8
+	}
+	run := func(consume []bool) finalState {
+		cursor := PrimaryGraphCursor{
+			leafBucket: view.header.Bucket,
+			leaf:       view, shapeBlock: -1,
+			spliceScratch: make([]byte, 0, 512),
+		}
+		var decoder CompactPrimaryScanDecoder
+		wantRow := -1
+		calls := 0
+		visit := func(key, value []byte) error {
+			calls++
+			if wantRow < 0 || !bytes.Equal(key, records[wantRow].Key) ||
+				!bytes.Equal(value, wantValues[wantRow]) {
+				return ErrCommonPrimaryLeafCorrupt
+			}
+			// Callback output is borrowed only for this call. Poisoning it must
+			// not alter the decoder's private front-key prefix or scalar state.
+			for at := range key {
+				key[at] = 0xff
+			}
+			for at := range value {
+				value[at] = 0xff
+			}
+			return nil
+		}
+		for cursor.row < len(records) {
+			row := cursor.row
+			if consume != nil && consume[row] {
+				if err := cursor.ConsumeCurrentLeafBaseDecoded(
+					&decoder, records[row].Key,
+				); err != nil {
+					t.Fatalf("consume row=%d: %v", row, err)
+				}
+				continue
+			}
+			wantRow, calls = row, 0
+			key, ref, err := cursor.visitCurrentLeafInlineUntil(
+				&decoder, row+1, visit,
+			)
+			if err != nil || key != nil || ref != (PageRef{}) || calls != 1 {
+				t.Fatalf(
+					"visit row=%d key=%q ref=%+v calls=%d err=%v",
+					row, key, ref, calls, err,
+				)
+			}
+		}
+		return finalState{
+			lastRow: decoder.lastRow,
+			key:     decoder.keyState, keyPrior: decoder.keyPrior,
+			streams: decoder.streams,
+			row:     cursor.row, shapeBlock: cursor.shapeBlock,
+			shapeSeen: cursor.shapeSeen,
+		}
+	}
+	control := run(nil)
+	if got := run(skipped); got != control {
+		t.Fatalf("decoded consume state drift\n got  %+v\n want %+v", got, control)
+	}
+
+	// A stale overlay certificate must fail before either cursor or decoder
+	// progress changes, so a caller cannot accidentally resume from split state.
+	cursor := PrimaryGraphCursor{
+		leafBucket: view.header.Bucket,
+		leaf:       view, shapeBlock: -1,
+		spliceScratch: []byte{0xa5, 0x5a},
+	}
+	var decoder CompactPrimaryScanDecoder
+	if err := cursor.ConsumeCurrentLeafBaseDecoded(
+		&decoder, []byte("stale-key"),
+	); err != ErrCommonPrimaryLeafCorrupt {
+		t.Fatalf("stale consume error=%v", err)
+	}
+	var zeroStreams [compactPrimaryScanStreams]compactStreamSequentialState
+	if cursor.row != 0 || cursor.shapeBlock != -1 ||
+		decoder.prepared || decoder.supported || decoder.bucket != 0 ||
+		decoder.generation != 0 || decoder.lastRow != 0 ||
+		decoder.keyState != (compactStreamSequentialState{}) ||
+		decoder.streams != zeroStreams ||
+		!bytes.Equal(cursor.spliceScratch, []byte{0xa5, 0x5a}) {
+		t.Fatalf(
+			"stale consume advanced cursor/decoder: row=%d block=%d decoder=%+v scratch=%x",
+			cursor.row, cursor.shapeBlock, decoder, cursor.spliceScratch,
+		)
+	}
+}
+
 // A zero-hole prepared shape is a constant canonical document. Compact pages
 // currently choose another legal encoding for that input, but the scan plan's
 // complete executor must still preserve this representation case rather than

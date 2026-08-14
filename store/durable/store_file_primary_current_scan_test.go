@@ -162,10 +162,10 @@ func TestBufferedUnifiedRangeRawCurrentBufferMergesOverlayInOrder(t *testing.T) 
 	oracle := bufferedCurrentScanOracle(fixture)
 
 	putBufferedCurrentScanRow(
-		t, collection, oracle, fixture.keys[10],
-		[]byte(`{"scan":"replacement","id":10}`), false,
+		t, collection, oracle, fixture.keys[0],
+		[]byte(`{"scan":"replacement","id":0}`), false,
 	)
-	deleteBufferedCurrentScanRow(t, collection, oracle, fixture.keys[20])
+	deleteBufferedCurrentScanRow(t, collection, oracle, fixture.keys[1])
 	putBufferedCurrentScanRow(
 		t, collection, oracle, "primary-key-000000010-current-insert",
 		[]byte(`{"scan":"insert"}`), true,

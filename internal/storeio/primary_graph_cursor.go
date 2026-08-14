@@ -348,6 +348,29 @@ func (c *PrimaryGraphCursor) VisitCurrentLeafInlineUntilDecoded(
 // VisitCurrentLeafInlineUntil and fails closed without advancing on a stale
 // key certificate.
 func (c *PrimaryGraphCursor) ConsumeCurrentLeafBase(expectedKey []byte) error {
+	return c.consumeCurrentLeafBase(nil, expectedKey)
+}
+
+// ConsumeCurrentLeafBaseDecoded is ConsumeCurrentLeafBase with the ordered
+// decoder kept in step with the consumed row. The old value is reconstructed
+// only into cursor-owned splice scratch and is never exposed to a callback.
+// This matters for overlay replacements and deletes: leaving one shape's
+// scalar streams behind would force every later row of that shape in the leaf
+// onto bounded random-rank decoding.
+func (c *PrimaryGraphCursor) ConsumeCurrentLeafBaseDecoded(
+	decoder *CompactPrimaryScanDecoder,
+	expectedKey []byte,
+) error {
+	if decoder == nil {
+		return ErrInvalidWrite
+	}
+	return c.consumeCurrentLeafBase(decoder, expectedKey)
+}
+
+func (c *PrimaryGraphCursor) consumeCurrentLeafBase(
+	decoder *CompactPrimaryScanDecoder,
+	expectedKey []byte,
+) error {
 	if c == nil || c.done || len(expectedKey) == 0 ||
 		len(c.lower) != 0 || len(c.upper) != 0 || len(c.prefix) != 0 {
 		return ErrInvalidWrite
@@ -360,12 +383,34 @@ func (c *PrimaryGraphCursor) ConsumeCurrentLeafBase(expectedKey []byte) error {
 	if !ok || !bytes.Equal(key, expectedKey) {
 		return ErrCommonPrimaryLeafCorrupt
 	}
+	// Keep the stale-key certificate above independent from decoder progress:
+	// failure must leave both the cursor and its caller-owned decoder at the
+	// same base row.
 	shape := c.leaf.rowShape(c.row)
 	if shape < 0 || shape >= c.leaf.shapeCount {
 		return ErrCommonPrimaryLeafCorrupt
 	}
-	if c.sequentialShapeOrdinal(c.row, shape) < 0 {
+	ordinal := c.sequentialShapeOrdinal(c.row, shape)
+	if ordinal < 0 {
 		return ErrCommonPrimaryLeafCorrupt
+	}
+	if decoder != nil {
+		// Once the row is fully certified, advance the sequential key state and
+		// prove that it names the same admitted key before advancing this shape's
+		// scalar streams.
+		c.spliceScratch, ok = decoder.appendKey(
+			c.spliceScratch[:0], &c.leaf, c.leafBucket, c.row,
+		)
+		if !ok || !bytes.Equal(c.spliceScratch, key) {
+			return ErrCommonPrimaryLeafCorrupt
+		}
+		c.spliceScratch, ok = decoder.appendValue(
+			c.spliceScratch[:0], &c.leaf, c.leafBucket,
+			c.row, shape, ordinal,
+		)
+		if !ok {
+			return ErrCommonPrimaryLeafCorrupt
+		}
 	}
 	c.row++
 	return nil

@@ -357,10 +357,15 @@ func (c *Collection) rangeRawCurrentAt(
 				)
 			}
 			if matchesBase {
-				if err = cursor.ConsumeCurrentLeafBase(key); err != nil {
+				cursor.AdoptSpliceScratch(scratch)
+				consumeErr := cursor.ConsumeCurrentLeafBaseDecoded(
+					&decoder, key,
+				)
+				scratch = cursor.ReleaseSpliceScratch()
+				if consumeErr != nil {
 					return scratch, fmt.Errorf(
 						"%w: consume overlay base bucket=%d rank=%d",
-						err, bucket, rank,
+						consumeErr, bucket, rank,
 					)
 				}
 				if record.kind == primaryUnifiedOverlayDelete {
