@@ -2487,17 +2487,10 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
 		)
 	}
-	if len(path.Segments) == 1 {
-		for i := range p.columns {
-			if p.columns[i].Alias == path.Segments[0].Key && p.columns[i].Scalar != nil {
-				return term, newFeatureNotSupportedError(
-					p.lx.src, term.Pos,
-					"ORDER BY cannot yet name a computed scalar output; it requires a post-scalar stable sort stage",
-				)
-			}
-		}
+	term.Path, term.Output, err = p.resolveOrderAlias(path)
+	if err != nil {
+		return term, err
 	}
-	term.Path, term.Output = p.resolveOrderAlias(path)
 	switch {
 	case p.acceptKeyword(kwAsc):
 	case p.acceptKeyword(kwDesc):
@@ -2522,29 +2515,37 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 // belong to. The path just parsed is dropped from the pending list — it is the
 // last entry, since nothing else has been parsed since — so resolution does not
 // later try to bind an identifier that turned out to be an alias.
-func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int) {
+func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int, error) {
 	last := len(p.pending) - 1
 	if last < 0 || p.pending[last].path != path {
-		return path, 0
+		return path, 0, nil
 	}
 	if p.pending[last].eligible || len(path.Segments) != 1 {
-		return path, 0
+		return path, 0, nil
 	}
 	name := path.Segments[0].Key
+	match := -1
 	for i := range p.columns {
 		if p.columns[i].Alias != name {
 			continue
 		}
-		p.pending = p.pending[:last]
-		if p.columns[i].Window != nil {
-			return nil, i + 1
+		if match >= 0 {
+			return nil, 0, newAmbiguousOutputError(p.lx.src, path.Pos, name)
 		}
-		if p.columns[i].Path != nil {
-			return p.columns[i].Path, 0
-		}
-		return path, 0
+		match = i
 	}
-	return path, 0
+	if match < 0 {
+		return path, 0, nil
+	}
+	p.pending = p.pending[:last]
+	column := &p.columns[match]
+	if column.Window != nil || column.Scalar != nil {
+		return nil, match + 1, nil
+	}
+	if column.Path != nil {
+		return column.Path, 0, nil
+	}
+	return path, 0, nil
 }
 
 func (p *Parser) parseLimitOffset() error {

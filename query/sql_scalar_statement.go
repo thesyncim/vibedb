@@ -108,6 +108,28 @@ type statementScalarValue struct {
 	exact bool
 }
 
+type statementScalarOrder struct {
+	start int32
+	end   int32
+	root  int32
+	desc  bool
+}
+
+type statementScalarOrderRow struct {
+	input   int
+	keyBase int
+}
+
+type statementScalarOrdered struct {
+	projectionEnd int
+	order         []statementScalarOrder
+	rows          []statementScalarOrderRow
+	scratch       []statementScalarOrderRow
+	values        []scalar
+	arena         []byte
+	cells         []Cell
+}
+
 // statementScalar is the cold prepared sidecar. It owns both the postorder
 // program and its single-consumer warmed storage; ordinary Statements retain
 // only the pre-existing nil nested pointer and never execute this code.
@@ -122,6 +144,7 @@ type statementScalar struct {
 	predicateNodes int
 	outputs        []int32
 	types          []ValueType
+	ordered        *statementScalarOrdered
 
 	values             []statementScalarValue
 	outputValues       []statementScalarValue
@@ -200,8 +223,23 @@ func (s *Statement) prepareScalar() error {
 		return err
 	}
 	runtime.predicateNodes = len(runtime.nodes)
+	postOrder := false
+	for i := range s.tree.OrderBy {
+		if s.tree.OrderBy[i].Output != 0 {
+			postOrder = true
+			break
+		}
+	}
+	var outputStarts []int32
+	if postOrder {
+		runtime.ordered = new(statementScalarOrdered)
+		outputStarts = make([]int32, 0, len(s.tree.Columns))
+	}
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
+		if postOrder {
+			outputStarts = append(outputStarts, int32(len(runtime.nodes)))
+		}
 		var root int32
 		var err error
 		if column.Scalar != nil {
@@ -214,6 +252,39 @@ func (s *Statement) prepareScalar() error {
 		}
 		runtime.outputs = append(runtime.outputs, root)
 		runtime.types = append(runtime.types, runtime.nodeType(root))
+	}
+	if postOrder {
+		runtime.ordered.projectionEnd = len(runtime.nodes)
+		for i := range s.tree.OrderBy {
+			term := &s.tree.OrderBy[i]
+			var start, end, root int32
+			if term.Output != 0 {
+				output := term.Output - 1
+				if output < 0 || output >= len(runtime.outputs) ||
+					s.tree.Columns[output].Scalar == nil {
+					return fmt.Errorf("query: malformed computed ORDER BY output %d", term.Output)
+				}
+				start, root = outputStarts[output], runtime.outputs[output]
+				end = int32(runtime.ordered.projectionEnd)
+				if output+1 < len(outputStarts) {
+					end = outputStarts[output+1]
+				}
+			} else {
+				if term.Path == nil {
+					return fmt.Errorf("query: malformed scalar ORDER BY path")
+				}
+				start = int32(len(runtime.nodes))
+				var err error
+				root, err = runtime.compileDependency(s, term.Path, sqlast.AggNone, term.Pos)
+				if err != nil {
+					return err
+				}
+				end = root + 1
+			}
+			runtime.ordered.order = append(runtime.ordered.order, statementScalarOrder{
+				start: start, end: end, root: root, desc: term.Desc,
+			})
+		}
 	}
 	if len(runtime.deps) == 0 && !runtime.hasSemanticAggregate() {
 		// One hidden payload-free projection requests source cardinality. The
@@ -774,6 +845,10 @@ func (r *statementScalar) resultDependencyColumns() int {
 func (r *statementScalar) clearValues() {
 	clear(r.values)
 	clear(r.outputValues)
+	if r.ordered != nil {
+		clear(r.ordered.values)
+		clear(r.ordered.cells)
+	}
 }
 
 var zeroNumberBytes = []byte("0")
@@ -1029,6 +1104,9 @@ func (r *statementScalar) execute(
 		return Cursor{}, err
 	}
 	defer frame.intermediate.release(scratchBytes)
+	if r.ordered != nil {
+		return r.executeOrdered(s, exec, frame, options, intermediateResource, inputRows)
+	}
 
 	// The first pass evaluates only the predicate prefix and determines the
 	// exact caller-visible cardinality before any output slice grows.
@@ -1184,6 +1262,382 @@ func (r *statementScalar) execute(
 	result.Columns = result.Columns[:len(r.outputs)]
 	result.RowCount = rows
 	return Cursor{st: s, res: result, cur: -1, left: -1}, nil
+}
+
+func (r *statementScalar) executeOrdered(
+	s *Statement,
+	exec *Exec,
+	frame *statementFrame,
+	options ExecOptions,
+	intermediateResource string,
+	inputRows int,
+) (Cursor, error) {
+	result := &exec.Result
+	ordered := r.ordered
+	if ordered == nil {
+		return Cursor{}, fmt.Errorf("query: missing scalar ORDER BY runtime")
+	}
+	if s.hasLimit && s.limit == 0 {
+		return r.publishEmptyOrdered(s, result, options, intermediateResource, frame)
+	}
+	ordered.rows = ordered.rows[:0]
+	ordered.values = ordered.values[:0]
+	ordered.arena = ordered.arena[:0]
+	orderCharge := int64(0)
+	defer func() { frame.intermediate.release(orderCharge) }()
+
+	perRow := saturatedBytes(
+		int64(unsafe.Sizeof(statementScalarOrderRow{})),
+		saturatedProduct(int64(len(ordered.order)), int64(unsafe.Sizeof(scalar{}))),
+	)
+	for row := 0; row < inputRows; row++ {
+		if err := cancellationCheckpoint(options.Cancel, row); err != nil {
+			return Cursor{}, err
+		}
+		r.evalArena = r.evalArena[:0]
+		predicateCharge := int64(0)
+		if err := r.evalNodes(
+			result, row, 0, r.predicateNodes, &r.evalArena,
+			&exec.Workspace.aggregateBudget, &frame.intermediate, &predicateCharge,
+			options.Cancel,
+		); err != nil {
+			frame.intermediate.release(predicateCharge)
+			return Cursor{}, err
+		}
+		keep := r.keep()
+		frame.intermediate.release(predicateCharge)
+		if !keep {
+			continue
+		}
+		if err := frame.intermediate.reserve("scalar ORDER BY rows", perRow); err != nil {
+			return Cursor{}, err
+		}
+		orderCharge = saturatedBytes(orderCharge, perRow)
+		keyBase := len(ordered.values)
+		for key := range ordered.order {
+			term := &ordered.order[key]
+			r.evalArena = r.evalArena[:0]
+			temporaryCharge := int64(0)
+			if err := r.evalNodes(
+				result, row, int(term.start), int(term.end), &r.evalArena,
+				&exec.Workspace.aggregateBudget, &frame.intermediate, &temporaryCharge,
+				options.Cancel,
+			); err != nil {
+				frame.intermediate.release(temporaryCharge)
+				return Cursor{}, err
+			}
+			value := r.values[term.root].value
+			ownedBytes := scalarOwnedBytes(value)
+			if err := frame.intermediate.reserve("scalar ORDER BY values", ownedBytes); err != nil {
+				frame.intermediate.release(temporaryCharge)
+				return Cursor{}, err
+			}
+			orderCharge = saturatedBytes(orderCharge, ownedBytes)
+			ordered.values = append(ordered.values, ownScalar(value, &ordered.arena))
+			frame.intermediate.release(temporaryCharge)
+		}
+		ordered.rows = append(ordered.rows, statementScalarOrderRow{
+			input: row, keyBase: keyBase,
+		})
+	}
+
+	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)); err != nil {
+		return Cursor{}, err
+	}
+	sortScratchBytes := saturatedProduct(
+		int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
+	)
+	if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
+		return Cursor{}, err
+	}
+	if err := ordered.sort(options.Cancel); err != nil {
+		frame.intermediate.release(sortScratchBytes)
+		return Cursor{}, err
+	}
+	frame.intermediate.release(sortScratchBytes)
+	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)+1); err != nil {
+		return Cursor{}, err
+	}
+
+	first := min(s.offset, len(ordered.rows))
+	last := len(ordered.rows)
+	if s.hasLimit {
+		last = first + min(s.limit, len(ordered.rows)-first)
+	}
+	selected := ordered.rows[first:last]
+	rows := len(selected)
+	if len(r.outputs) != 0 && rows > int(^uint(0)>>1)/len(r.outputs) {
+		return Cursor{}, &IntermediateBudgetError{
+			Resource: "scalar ordered output staging",
+			Bytes:    int64(^uint64(0) >> 1),
+			Limit:    frame.intermediate.limit,
+		}
+	}
+	cellCount := rows * len(r.outputs)
+	cellBytes := saturatedProduct(int64(cellCount), int64(unsafe.Sizeof(Cell{})))
+	if err := frame.intermediate.reserve("scalar ordered output staging", cellBytes); err != nil {
+		return Cursor{}, err
+	}
+	orderCharge = saturatedBytes(orderCharge, cellBytes)
+	ordered.cells = resize(ordered.cells, cellCount)
+
+	rowLimit, byteLimit, err := normalizeResultBudget(options)
+	if err != nil {
+		return Cursor{}, err
+	}
+	if intermediateResource != "" {
+		rowLimit = -1
+		byteLimit = frame.intermediate.remaining()
+	}
+	result.resultRowsLimit = rowLimit
+	result.resultBytesLimit = byteLimit
+	result.resultBytesUsed = 0
+	required, err := result.checkResultBudget(len(r.outputs), rows, 0)
+	if err != nil {
+		return Cursor{}, err
+	}
+	result.resultBytesUsed = required
+
+	r.resultArena = r.resultArena[:0]
+	for outRow := range selected {
+		if err := cancellationCheckpoint(options.Cancel, outRow); err != nil {
+			return Cursor{}, err
+		}
+		r.evalArena = r.evalArena[:0]
+		outputCharge := int64(0)
+		if err := r.evalNodes(
+			result, selected[outRow].input, r.predicateNodes, ordered.projectionEnd,
+			&r.evalArena, &exec.Workspace.aggregateBudget, &frame.intermediate,
+			&outputCharge, options.Cancel,
+		); err != nil {
+			frame.intermediate.release(outputCharge)
+			return Cursor{}, err
+		}
+		r.outputValues = resize(r.outputValues, len(r.outputs))
+		for output, root := range r.outputs {
+			r.outputValues[output] = r.values[root]
+		}
+		base := outRow * len(r.outputs)
+		for column := range r.outputs {
+			cell := r.resultCell(r.outputValues[column], &r.resultArena)
+			if err := result.admitResultCell(cell); err != nil {
+				frame.intermediate.release(outputCharge)
+				return Cursor{}, err
+			}
+			ordered.cells[base+column] = cell
+		}
+		frame.intermediate.release(outputCharge)
+	}
+
+	columns := max(len(r.outputs), len(result.Columns))
+	if cap(result.Columns) < columns {
+		result.Columns = append(result.Columns, make([]ResultColumn, columns-len(result.Columns))...)
+	} else {
+		result.Columns = result.Columns[:columns]
+	}
+	operations := 0
+	for column := range r.outputs {
+		cells := resize(result.Columns[column].Cells, rows)
+		for row := 0; row < rows; row++ {
+			if err := cancellationCheckpoint(options.Cancel, operations); err != nil {
+				return Cursor{}, err
+			}
+			operations++
+			cells[row] = ordered.cells[row*len(r.outputs)+column]
+		}
+		result.Columns[column].Cells = cells
+		result.Columns[column].Header = s.names[column]
+	}
+	if err := cancellationError(options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	for column := len(r.outputs); column < len(result.Columns); column++ {
+		cells := result.Columns[column].Cells
+		for row := range cells {
+			if err := cancellationCheckpoint(options.Cancel, operations); err != nil {
+				return Cursor{}, err
+			}
+			operations++
+			cells[row] = Cell{}
+		}
+		result.Columns[column] = ResultColumn{Cells: cells[:0]}
+	}
+	if err := cancellationError(options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	result.Columns = result.Columns[:len(r.outputs)]
+	result.RowCount = rows
+	return Cursor{st: s, res: result, cur: -1, left: -1}, nil
+}
+
+func (r *statementScalar) publishEmptyOrdered(
+	s *Statement,
+	result *Result,
+	options ExecOptions,
+	intermediateResource string,
+	frame *statementFrame,
+) (Cursor, error) {
+	if err := cancellationError(options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	rowLimit, byteLimit, err := normalizeResultBudget(options)
+	if err != nil {
+		return Cursor{}, err
+	}
+	if intermediateResource != "" {
+		rowLimit = -1
+		byteLimit = frame.intermediate.remaining()
+	}
+	result.resultRowsLimit = rowLimit
+	result.resultBytesLimit = byteLimit
+	result.resultBytesUsed = 0
+	required, err := result.checkResultBudget(len(r.outputs), 0, 0)
+	if err != nil {
+		return Cursor{}, err
+	}
+	result.resultBytesUsed = required
+	columns := max(len(r.outputs), len(result.Columns))
+	if cap(result.Columns) < columns {
+		result.Columns = append(result.Columns, make([]ResultColumn, columns-len(result.Columns))...)
+	} else {
+		result.Columns = result.Columns[:columns]
+	}
+	operations := 0
+	for column := range result.Columns {
+		cells := result.Columns[column].Cells
+		for row := range cells {
+			if err := cancellationCheckpoint(options.Cancel, operations); err != nil {
+				return Cursor{}, err
+			}
+			operations++
+			cells[row] = Cell{}
+		}
+		result.Columns[column] = ResultColumn{Cells: cells[:0]}
+		if column < len(r.outputs) {
+			result.Columns[column].Header = s.names[column]
+		}
+	}
+	if err := cancellationError(options.Cancel); err != nil {
+		return Cursor{}, err
+	}
+	result.Columns = result.Columns[:len(r.outputs)]
+	result.RowCount = 0
+	return Cursor{st: s, res: result, cur: -1, left: -1}, nil
+}
+
+func (o *statementScalarOrdered) compare(left, right statementScalarOrderRow) int {
+	for key := range o.order {
+		cmp := compareScalar(
+			o.values[left.keyBase+key],
+			o.values[right.keyBase+key],
+		)
+		if o.order[key].desc {
+			cmp = -cmp
+		}
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
+
+// sortOrderRows is a stable bottom-up merge sort with cancellation checks in
+// both the comparison and copy portions of every pass. The standard-library
+// stable sorter has no error/cancellation channel, which could otherwise make
+// an armed request wait through O(n log n) scalar comparisons.
+func (o *statementScalarOrdered) sort(cancel *CancelFlag) error {
+	rows := len(o.rows)
+	if rows < 2 {
+		return cancellationCheckpoint(cancel, 0)
+	}
+	o.scratch = resize(o.scratch, rows)
+	source, target := o.rows, o.scratch
+	operations := 0
+	for width := 1; width < rows; {
+		for low := 0; low < rows; low += 2 * width {
+			middle := min(low+width, rows)
+			high := min(low+2*width, rows)
+			left, right, write := low, middle, low
+			for left < middle && right < high {
+				if err := cancellationCheckpoint(cancel, operations); err != nil {
+					return err
+				}
+				operations++
+				if o.compare(source[left], source[right]) <= 0 {
+					target[write] = source[left]
+					left++
+				} else {
+					target[write] = source[right]
+					right++
+				}
+				write++
+			}
+			for left < middle {
+				if err := cancellationCheckpoint(cancel, operations); err != nil {
+					return err
+				}
+				operations++
+				target[write] = source[left]
+				left, write = left+1, write+1
+			}
+			for right < high {
+				if err := cancellationCheckpoint(cancel, operations); err != nil {
+					return err
+				}
+				operations++
+				target[write] = source[right]
+				right, write = right+1, write+1
+			}
+		}
+		source, target = target, source
+		if width > rows/2 {
+			width = rows
+		} else {
+			width *= 2
+		}
+	}
+	if len(source) != 0 && &source[0] != &o.rows[0] {
+		for i := range source {
+			if err := cancellationCheckpoint(cancel, operations+i); err != nil {
+				return err
+			}
+			o.rows[i] = source[i]
+		}
+	}
+	return nil
+}
+
+func scalarOwnedBytes(value scalar) int64 {
+	switch value.kind {
+	case kindNumber:
+		return int64(len(value.num))
+	case kindString:
+		return int64(len(value.sval))
+	case kindContainer:
+		return int64(len(value.raw))
+	default:
+		return 0
+	}
+}
+
+func ownScalar(value scalar, arena *[]byte) scalar {
+	switch value.kind {
+	case kindNumber:
+		start := len(*arena)
+		*arena = append(*arena, value.num...)
+		value.num = (*arena)[start:len(*arena):len(*arena)]
+		value.raw = value.num
+	case kindString:
+		start := len(*arena)
+		*arena = append(*arena, value.sval...)
+		value.sval = byteview.String((*arena)[start:len(*arena):len(*arena)])
+		value.raw = nil
+	case kindContainer:
+		start := len(*arena)
+		*arena = append(*arena, value.raw...)
+		value.raw = (*arena)[start:len(*arena):len(*arena)]
+	}
+	return value
 }
 
 func scalarExecutionScratchBytes(nodes, outputs int) int64 {

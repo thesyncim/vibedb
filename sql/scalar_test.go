@@ -101,7 +101,6 @@ func TestScalarMinusWildcardExponentAndUnaryGrammar(t *testing.T) {
 func TestScalarOrderByIsPreciselyRefused(t *testing.T) {
 	for _, source := range []string{
 		`SELECT a FROM docs ORDER BY a + 1`,
-		`SELECT a + 1 AS computed FROM docs ORDER BY computed`,
 		`SELECT a FROM docs ORDER BY -a`,
 	} {
 		_, err := Parse(source)
@@ -109,6 +108,37 @@ func TestScalarOrderByIsPreciselyRefused(t *testing.T) {
 		if !errors.As(err, &unsupported) || unsupported.Pos < strings.Index(source, "ORDER BY") {
 			t.Fatalf("%q error = %T %v", source, err, err)
 		}
+	}
+}
+
+func TestScalarOrderByOutputAliasAndAmbiguity(t *testing.T) {
+	statement, err := Parse(`SELECT a + 1 AS score, score FROM docs ORDER BY score DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statement.OrderBy) != 1 || statement.OrderBy[0].Path != nil ||
+		statement.OrderBy[0].Output != 1 || !statement.OrderBy[0].Desc {
+		t.Fatalf("computed alias ORDER BY = %#v", statement.OrderBy)
+	}
+
+	qualified, err := Parse(`SELECT a + 1 AS score FROM docs AS d ORDER BY d.score`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qualified.OrderBy[0].Output != 0 || qualified.OrderBy[0].Path == nil {
+		t.Fatalf("qualified input path was resolved as an output alias: %#v", qualified.OrderBy[0])
+	}
+	quoted, err := Parse(`SELECT a + 1 AS "Score" FROM docs ORDER BY "Score"`)
+	if err != nil || quoted.OrderBy[0].Output != 1 {
+		t.Fatalf("quoted computed alias ORDER BY = %#v, err=%v", quoted.OrderBy, err)
+	}
+
+	const duplicate = `SELECT a + 1 AS score, b + 1 AS score FROM docs ORDER BY score`
+	_, err = Parse(duplicate)
+	var ambiguous *AmbiguousOutputError
+	if !errors.As(err, &ambiguous) || ambiguous.Name != "score" ||
+		ambiguous.Pos != strings.LastIndex(duplicate, "score") {
+		t.Fatalf("duplicate output alias error = %T %+v", err, err)
 	}
 }
 

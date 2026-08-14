@@ -263,6 +263,9 @@ func (s *Statement) buildGroupBy() error {
 // is documented as a deviation rather than papered over, and NULLS FIRST and
 // NULLS LAST are refused by the parser instead of being silently ignored.
 func (s *Statement) buildOrderBy() error {
+	if scalar := s.scalarStatement(); scalar != nil && scalar.ordered != nil {
+		return nil
+	}
 	for i := range s.tree.OrderBy {
 		term := &s.tree.OrderBy[i]
 		dir := Asc

@@ -409,8 +409,18 @@ Projection expressions are lazy: WHERE filtering and final OFFSET/LIMIT row
 admission happen before a projected CAST or arithmetic expression is
 evaluated. A conversion or division error in a filtered or skipped row
 therefore does not fail the statement or consume retained CAST workspace.
-Prepared warm execution reuses that workspace and the covered CAST variants
-allocate no heap objects.
+`ORDER BY` may name the explicit alias of a computed SELECT expression. That
+form evaluates and owns its sort keys for every predicate-surviving row,
+performs one stable mixed path/computed-key sort, and only then applies
+OFFSET/LIMIT and the remaining projections. Consequently, with a positive
+LIMIT, an invalid sort key still fails even when the selected slice omits its
+row, while an unrelated projection error in an omitted row remains unobserved.
+LIMIT 0 short-circuits without evaluating predicates, keys, or projections,
+matching the existing scalar execution bound. Duplicate matching aliases are
+ambiguous (`42702`). Direct scalar expressions and output ordinals in ORDER BY
+remain positioned refusals; authors name the computed output instead.
+Prepared warm execution reuses the bounded intermediate workspace and the
+covered CAST and ordered-scalar variants allocate no heap objects.
 
 ## Set operations
 

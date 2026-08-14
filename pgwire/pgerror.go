@@ -446,6 +446,10 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 	if errors.As(err, &duplicateCTE) {
 		return newError(sqlstateDuplicateAlias, duplicateCTE.Msg)
 	}
+	var ambiguousOutput *sqlast.AmbiguousOutputError
+	if errors.As(err, &ambiguousOutput) {
+		return newError(sqlstateAmbiguousColumn, ambiguousOutput.Msg)
+	}
 	var cteAliasArity *sqlast.CTEColumnAliasArityError
 	if errors.As(err, &cteAliasArity) {
 		return newError(sqlstateInvalidColumnReference, cteAliasArity.Msg)
