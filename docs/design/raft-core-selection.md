@@ -1,13 +1,11 @@
 # Raft core selection and threat model
 
-**Status:** the core, dependency revision, baseline configuration, synchronous
-driver, bounded logical store/state-machine model, replayable simulator,
-Phase 1a static-snapshot disk WAL, exact member runtime, bounded in-process
-Multi-Raft host, and static post-auth ordinary-message frame boundary are
-executable. This is not a claim that production replication, failover, a
-serving/compacting Raft WAL, runtime snapshots, peer authentication, or a
-network transport exists yet. Those claims remain
-gated by the [distributed delivery plan](distributed-sharding.md#delivery-plan).
+**Status:** current non-serving Raft kernel. The pinned core, synchronous
+driver, bounded model/simulator, static-snapshot append-only WAL, exact member
+runtime, in-process Multi-Raft host, and post-authentication ordinary-message
+frame boundary are executable. There is no serving replication, failover,
+runtime snapshot or WAL compaction path, peer authentication, or network
+transport.
 
 ## Exact selection and provenance
 
@@ -72,7 +70,7 @@ behavior.
 | `Logger` | `nil` | Upstream installs its default logger; a later scheduler may install an audited per-group adapter without changing protocol behavior. |
 | `TraceLogger` | `nil` | Optional state tracing is disabled. Normal builds compile the hook as a no-op; a future trace adapter is a separately audited observability change. |
 | `DisableProposalForwarding` | `true` | Followers reject proposals. Routing, identity/fence validation, canonicalization, and admission occur at the current leader, with explicit retry after leadership changes. |
-| `DisableConfChangeValidation` | `false` | Retain upstream propose-time validation. The Phase-0 driver also admits a configuration proposal only at a fully applied predecessor and replays upstream `Changer` validation before proposal and apply; topology-bound context validation remains open. |
+| `DisableConfChangeValidation` | `false` | Retain upstream propose-time validation. The local driver also admits a configuration proposal only at a fully applied predecessor and replays upstream `Changer` validation before proposal and apply; topology-bound context validation remains open. |
 | `StepDownOnRemoval` | `true` | A removed or demoted leader immediately stops acting as leader. Request fencing remains independently mandatory. |
 
 All sizes are per Raft group. They prevent accidental unbounded queues but are
@@ -102,7 +100,8 @@ and byte envelope.
    independently of `Ready.MustSync`, while that flag controls the required
    entry/`HardState` sync barrier;
 2. only after the prerequisite persistent state is safe, release outbound
-   messages to the authenticated transport;
+   messages to the caller-supplied sink; a future serving layer must
+   authenticate the peer before forwarding them;
 3. install/apply a snapshot first, then apply its committed suffix entries in
    log order, atomically publishing the new root, applied index, exact
    `ConfState`, and durable completion before acknowledging a command;
@@ -146,8 +145,8 @@ Safety assumes:
 
 - a quorum does not permanently lose or equivocate about data already reported
   durable;
-- cryptographic member identity prevents an unauthorised process or restored
-  foreign store from speaking as a voter;
+- a future serving layer supplies cryptographic member identity so an
+  unauthorised process or restored foreign store cannot speak as a voter;
 - persistent storage obeys the append/truncate, atomicity, and sync results it
   reports, or the integration detects corruption and refuses to serve;
 - the command/state-machine apply function is deterministic; and
@@ -200,7 +199,7 @@ for `go1.26.4`. Vibedb supports the Go 1.26 patch line rather than forcing that
 preference on its main module; this initial qualification ran on `go1.26.0`,
 while CI's `1.26` selector tracks current patch releases.
 
-## Executable Phase-0 foundation
+## Current executable non-serving kernel
 
 Deliberately separate packages now make the contract testable without
 claiming a production replicated store:
@@ -224,7 +223,7 @@ claiming a production replicated store:
 - `internal/replication` freezes pure command and completion byte envelopes
   consumed by the replicated apply boundary. The codecs establish bounded
   canonical data, not a WAL, blob store, transport, or serving path.
-- `internal/raftstore` implements the Phase 1a identity-bound, encrypted,
+- `internal/raftstore` implements the identity-bound, encrypted,
   preallocated append-only `StableStore` and exact Ready retry boundary on
   Linux and macOS. It has a static bootstrap snapshot and no compaction,
   transport, serving path, or general anti-rollback witness; its full qualified
@@ -254,9 +253,9 @@ The simulator's `MemoryStore` is an indivisible logical durability oracle, not
 an implementation template. It cannot represent torn sectors, fsync lies,
 snapshot files, compaction, or recovery-journal interaction. Its purpose is to
 prove integration ordering and make each logical failure trace byte-exact.
-Phase 1a now exercises the same driver boundary against a crash-tested static-
-snapshot disk format; runtime snapshot/compaction and serving qualification
-remain later gates.
+The disk store exercises the same driver boundary against a crash-tested
+static-snapshot format. Runtime snapshots, compaction, and serving remain
+prohibited until their separate gates exist.
 
 Simulator proposal references and completion lookups are model-local. A
 `RespondProposal` event means that a live replica has found the exact reference

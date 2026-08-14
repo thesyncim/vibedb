@@ -1,10 +1,22 @@
 # Distributed sharding and replication
 
-**Status:** future serving design. A bounded non-serving in-process Raft member
-runtime, Multi-Raft host, and static post-auth ordinary-message frame/roster
-boundary exist, but no peer authenticator, network transport, client routing,
-serving replica protocol, distributed ownership, or cross-shard guarantee is
-implemented today.
+**Current state:** the server-only tier provides a locally fenced leader-only
+shard service, a stateless read-only routing gateway, immutable placement
+catalogs, bounded scatter admission, and an opt-in embedded single-shard
+placement facade. It does not provide replication, failover, follower reads,
+online movement, or cross-shard writes.
+
+The repository separately contains a non-serving Raft foundation: an
+append-only static-base WAL, a local replicated-apply state machine, an
+in-process bounded scheduler/outbox, and a post-authentication frame/roster
+validator. There is no peer authenticator, socket transport, runtime snapshot
+or WAL compaction path, dynamic membership controller, or client-facing
+replicated service. These internal packages are not wired into the shard or
+gateway commands.
+
+The remainder of this document separates the implemented leader-only boundary
+from the target replicated and online-resharding contracts. Future contracts
+are design requirements, not operator capabilities.
 
 **Idea:** place independent durable collections behind stateless routers, give
 each shard one fenced writer authority, and let an adaptive durability
@@ -34,12 +46,13 @@ authorization and split generation fencing remain later serving contracts. A
 shard may instead run leader-only under a
 statically configured ownership epoch and no replication protocol at all (see
 [Ownership, fencing, and failover](#ownership-fencing-and-failover)), and adopt
-Raft later without a placement or routing change. Vibedb implements the
-durable log, transport, snapshots, and state-machine integration, not another
-consensus algorithm. Do not claim CockroachDB's global transaction or snapshot
-contract until the separate gates for those features pass.
+Raft later without a placement or routing change. VibeDB uses upstream Raft
+and owns the surrounding integration. The current repository implements only
+the non-serving subset named above; network transport, runtime snapshots,
+replicated serving, and topology workflow remain absent. Do not infer
+CockroachDB's global transaction or snapshot contract from this design.
 
-The proposed systems contribution is **evidence-carrying elastic
+The target systems contribution is **evidence-carrying elastic
 durability**. A planner may optimize voter cardinality and placement, but a
 separate deterministic verifier must prove every acknowledgement quorum and
 stable/joint Raft configuration against the policy's arbitrary correlated
@@ -52,7 +65,7 @@ deliberately not novel. The research hypothesis is this composition of
 per-shard risk/cost optimization, proof-carrying configuration changes,
 independent verification, and explicit promise activation over unmodified
 Raft membership. It is not a priority claim. The controller must beat
-contract-matched fixed and adaptive baselines under the preregistered Phase 6
+contract-matched fixed and adaptive baselines under a preregistered release
 gate before any novelty or efficiency claim is made.
 
 Where a shard is Raft-replicated, its data Raft group is the only
@@ -1861,7 +1874,7 @@ termination only under the declared liveness assumptions: an eventually
 synchronous healed network, fair scheduling, bounded healthy-disk I/O, no
 continuing configuration or range change, and one stable quorum for the
 required interval. Every simulator failure is exactly replayable from its
-complete trace; seed-only regeneration remains an open Phase-0 gate. Later
+complete trace; seed-only regeneration remains an open qualification gate. Later
 implementation phases must show that production traces refine the model at the
 named protocol boundaries.
 

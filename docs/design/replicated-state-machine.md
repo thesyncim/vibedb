@@ -1,8 +1,8 @@
 # Replicated state machine
 
-Status: Phase 1b unserved apply contract.
+**Status:** current trusted local, non-serving replicated-apply boundary.
 
-This design defines the first production-refinable implementation of
+This design defines the implementation of
 `raftmodel.StateMachine`. It applies one bounded `replication.Command` to one
 durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
@@ -284,7 +284,7 @@ integration:
 - bounded capacity failures that occur before a committed entry can enter a
   serving system.
 
-Before serving, later phases must add all of:
+Serving remains prohibited until all of the following exist:
 
 1. the landed [SQL replicated binding](sql-replicated-binding.md) and
    [SQL replicated apply](sql-replicated-apply.md) provide the exact

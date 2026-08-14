@@ -1,6 +1,6 @@
 # Raft WAL
 
-Status: Phase 1a durable-storage contract.
+**Status:** current non-serving static-base Raft WAL.
 
 This design defines the first disk-backed implementation of
 `raftmodel.StableStore`. It provides bounded recovery, exact Ready retry,

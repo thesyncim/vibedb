@@ -244,7 +244,8 @@ blindly retrying.
 
 ## Important limitations
 
-- The project is unreleased; APIs and storage format version 0 are unstable.
+- The project is unreleased; APIs and on-disk grammars may change without a
+  compatibility migration.
 - DDL is atomic per statement but is not transactional.
 - Native read-write transactions are serializable. SQL and pgwire transactions
   default to Read Committed, with explicit Repeatable Read/Snapshot and
@@ -311,8 +312,24 @@ network: the `sql/driver` local-cluster facade (`OpenCluster` /
 shared `distribution` types against a single embedded store as a degenerate
 single-shard local cluster.
 
-This tier is leader-only: it has no replication, failover, or online
-resharding. It is unreleased and unstable like the rest of VibeDB. The
+The server tier is leader-only today. The repository also contains a bounded,
+non-serving Raft kernel, append-only WAL, local replicated-apply machine,
+in-process Multi-Raft scheduler, and post-authentication frame validator. Those
+internal packages are not wired into `vibedb-shard`, `vibedb-gateway`, a public
+API, or operator configuration, and they do not make the server tier highly
+available.
+
+| Server capability | Current state |
+| --- | --- |
+| Leader-only shard process | Available; one locally fenced store |
+| Stateless read-only gateway | Available; generation-pinned routing and bounded fan-out |
+| Embedded single-shard placement checks | Available through `OpenCluster` |
+| Peer enrollment, authentication, and network transport | Not available |
+| Replicated client writes and automatic failover | Not available |
+| Runtime Raft snapshots, WAL compaction, and dynamic membership | Not available |
+| Follower/session reads, online movement, and backup/PITR orchestration | Not available |
+
+The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.
 
 Read the design before relying on any of it:
@@ -325,8 +342,8 @@ Read the design before relying on any of it:
 ## Performance
 
 VibeDB is designed for compiled queries, reusable execution storage, bounded
-foreground work, and allocation-free warm paths. Competitive benchmarks,
-corpus definitions, raw results, and reproduction commands are checked into
+foreground work, and allocation-free warm paths. Published tables, artifact
+hashes, corpus definitions, methodology, and reproduction commands are kept in
 the repository rather than summarized as context-free headline numbers here:
 
 - [Performance guide](docs/performance.md)
