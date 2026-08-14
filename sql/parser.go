@@ -2620,7 +2620,7 @@ func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int, error) {
 	}
 	p.pending = p.pending[:last]
 	column := &p.columns[match]
-	if column.Window != nil || column.Scalar != nil {
+	if column.Window != nil || column.Scalar != nil || column.Agg != AggNone {
 		return nil, match + 1, nil
 	}
 	if column.Path != nil {

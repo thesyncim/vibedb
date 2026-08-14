@@ -409,9 +409,10 @@ Projection expressions are lazy: WHERE filtering and final OFFSET/LIMIT row
 admission happen before a projected CAST or arithmetic expression is
 evaluated. A conversion or division error in a filtered or skipped row
 therefore does not fail the statement or consume retained CAST workspace.
-`ORDER BY` may name the explicit alias of a computed SELECT expression or a
-positive one-based SELECT-list position. Positional keys cover ordinary paths,
-computed scalars, window outputs, and grouped aggregate outputs; wildcard
+`ORDER BY` may name the explicit alias of a computed or aggregate SELECT
+expression, or a positive one-based SELECT-list position. Positional keys
+cover ordinary paths, computed scalars, window outputs, and grouped aggregate
+outputs; wildcard
 projections remain a positioned refusal because their expanded width is known
 only from the prepared source schema. Deferred ordering evaluates and owns the
 sort keys for every predicate-surviving row, performs one stable mixed
@@ -430,7 +431,7 @@ For a grouped deferred order, HAVING filters every reduced group before sort
 keys are evaluated and before OFFSET/LIMIT select the result tail. A rejected
 group therefore cannot consume a limited slot, and an invalid computed sort
 key in a rejected group remains unobserved. Aggregate-output positions and
-computed output aliases both use this ordering.
+computed or aggregate output aliases all use this ordering.
 Prepared warm execution reuses the bounded intermediate workspace and the
 covered CAST and ordered-scalar variants allocate no heap objects.
 

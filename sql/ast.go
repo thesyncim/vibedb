@@ -607,10 +607,10 @@ type OrderTerm struct {
 	// been resolved to the path that alias projects.
 	Path *PathExpr
 	// Output is the one-based SELECT-list ordinal when ORDER BY names a deferred
-	// output alias (for example a window or computed scalar expression) or uses
-	// an explicit positional reference such as ORDER BY 2. Zero means Path is
-	// authoritative. A one-based encoding keeps the zero value compatible with
-	// every existing AST literal.
+	// output alias (for example a window, computed scalar, or aggregate
+	// expression) or uses an explicit positional reference such as ORDER BY 2.
+	// Zero means Path is authoritative. A one-based encoding keeps the zero
+	// value compatible with every existing AST literal.
 	Output int
 	// Scalar is a computed sort key. It is nil for the established path and
 	// output-alias forms. Output remains authoritative when non-zero.

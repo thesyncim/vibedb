@@ -518,6 +518,22 @@ func TestOrderByAliasResolvesToItsProjection(t *testing.T) {
 	}
 }
 
+func TestOrderByAggregateAliasResolvesToOutput(t *testing.T) {
+	stmt, err := Parse(`
+		SELECT team, SUM(score) AS total
+		FROM docs GROUP BY team ORDER BY total DESC`)
+	if err != nil {
+		t.Fatalf("Parse = %v, want success", err)
+	}
+	if got, want := dumpStmt(stmt),
+		`select path(0:team) sum(0:score) as total from docs group 0:team order output(1):desc`; got != want {
+		t.Fatalf("\n got %s\nwant %s", got, want)
+	}
+	if stmt.OrderBy[0].Output != 2 || stmt.OrderBy[0].Path != nil {
+		t.Fatalf("aggregate alias ORDER BY = %+v", stmt.OrderBy[0])
+	}
+}
+
 // TestOrderByPrefersAFieldOverAnAliasItDoesNotHave checks the negative half of
 // alias resolution: a sort key that matches no alias is an ordinary path.
 func TestOrderByFallsBackToAPath(t *testing.T) {

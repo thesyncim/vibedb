@@ -205,7 +205,7 @@ func TestSQLScalarOrderByHavingFiltersBeforeKeysAndTail(t *testing.T) {
 	// dependency columns.
 	statement, err := PrepareStatement(`
 		SELECT SUM(n) AS total FROM docs GROUP BY team
-		HAVING team <> 'y' ORDER BY 1 DESC LIMIT 1`)
+		HAVING team <> 'y' ORDER BY total DESC LIMIT 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,6 +454,31 @@ func TestSQLScalarOrderByGroupedAggregateAlias(t *testing.T) {
 			string(cursor.Cell(1).JSON()) != want[1] {
 			t.Fatalf("grouped ordered row %d != %v", row, want)
 		}
+	}
+}
+
+func TestSQLOrderByAggregateAliasDoesNotSortByItsArgument(t *testing.T) {
+	segment := mustSegment(t,
+		`{"n":1}`, `{"n":1}`, `{"n":1}`, `{"n":2}`,
+	)
+	statement, err := PrepareStatement(`
+		SELECT n, SUM(n) AS total FROM docs GROUP BY n ORDER BY total DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exec Exec
+	cursor, err := statement.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row, want := range [][2]string{{`1`, `3`}, {`2`, `2`}} {
+		if !cursor.Next() || string(cursor.Cell(0).JSON()) != want[0] ||
+			string(cursor.Cell(1).JSON()) != want[1] {
+			t.Fatalf("aggregate alias row %d != %v", row, want)
+		}
+	}
+	if cursor.Next() {
+		t.Fatal("aggregate alias returned an extra row")
 	}
 }
 
