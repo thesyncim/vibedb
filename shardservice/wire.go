@@ -28,11 +28,11 @@ type ReadPolicy uint8
 
 const (
 	// ReadStrong serves from the shard leader under its ownership/replication
-	// authority. It is the only policy PR 4a honors; the zero value is safe.
+	// authority. It is the only policy the current service honors; the zero value is safe.
 	ReadStrong ReadPolicy = iota
-	// ReadSession is reserved for read-your-writes replica reads; not served yet.
+	// ReadSession is reserved and refused; no session-read serving path exists.
 	ReadSession
-	// ReadStale is reserved for lagging replica reads; not served yet.
+	// ReadStale is reserved and refused; no stale-read serving path exists.
 	ReadStale
 )
 
@@ -199,14 +199,15 @@ type ShardRequest struct {
 	RoutingVersion distribution.RoutingVersion
 	// OwnershipEpoch is the caller's view of the shard's fencing epoch.
 	OwnershipEpoch distribution.OwnershipEpoch
-	// HasMinPosition selects MinPosition. Phase 0 carries and validates the field
-	// but rejects every present value until a replicated apply log exists; it
+	// HasMinPosition selects MinPosition. The current service carries and validates
+	// the field but rejects every present value because it has no serving replicated
+	// apply log; it
 	// never silently weakens the request to an ordinary strong read. When false,
 	// MinPosition must be zero so the optional has one canonical representation.
 	HasMinPosition bool
 	MinPosition    Position
 
-	// ReadPolicy selects the consistency contract; PR 4a honors only ReadStrong.
+	// ReadPolicy selects the consistency contract; the current service honors only ReadStrong.
 	ReadPolicy ReadPolicy
 	// ExecutionMode fences mutation authority. Its zero value is read-only;
 	// direct shard writers must opt into ExecutionReadWrite explicitly.
@@ -293,8 +294,8 @@ const (
 	// shard. A numerically larger index from another identity cannot satisfy it.
 	ErrorPositionIdentity
 	// ErrorPositionNotReached reports a valid, matching minimum above the
-	// serving replica's applied index. Phase 0 reserves this refusal for the
-	// replicated apply path; it is never guessed from local storage state.
+	// serving replica's applied index. The current service reserves this refusal
+	// for a replicated apply path; it is never guessed from local storage state.
 	ErrorPositionNotReached
 	// ErrorShardAllocation reports a stale physical allocation generation for
 	// an otherwise matching distribution and shard id.

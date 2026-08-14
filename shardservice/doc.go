@@ -1,4 +1,4 @@
-// Package shardservice implements the first deployable leader-only shard service:
+// Package shardservice implements the experimental leader-only shard service:
 // the request/response types a gateway and a shard exchange, a stdlib-only
 // length-prefixed codec for them, the static ownership admission gate a shard
 // applies before it parses or executes anything, and a [Server] that executes an
@@ -19,10 +19,9 @@
 // distributed gateway requests are always read-only.
 //
 // The wire also reserves bounded logical applied positions for session reads.
-// This leader-only phase has no replicated apply log: admission rejects every
+// The current service has no replicated apply log: admission rejects every
 // session read and every present minimum before SQL preparation, and successful
-// strong reads never claim a read position. A later replicated apply path must
-// supply the real log identity and applied-index proof before enabling them.
+// strong reads never claim a read position.
 //
 // NewServer durably claims nonzero ownership-epoch and routing-version
 // high-waters in the bound shard SQL catalog after validating its options. One
@@ -31,7 +30,7 @@
 // fence only: it is not a distributed lease or election and cannot revoke a
 // process serving a copied store.
 //
-// This package depends only on the standard library, vibedb's distribution and
-// query types, the sql/driver runtime, and durability error identity it carries
-// over the wire; it imports no network-RPC or serialization framework.
+// The package has no built-in transport authentication and the shipped command
+// accepts loopback listeners only. It provides no replication, election,
+// failover, follower read, online movement, or copied-store revocation.
 package shardservice

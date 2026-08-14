@@ -11,6 +11,5 @@
 // explicit RawNode.Campaign call and never drives follower or candidate Tick.
 // EventLeaderTick is admitted only while BasicStatus identifies the local node
 // as leader; leader heartbeat/check-quorum uses the fixed configured election
-// threshold. Recording or injecting full election-timeout choices and proving
-// production ticker liveness are later refinement gates.
+// threshold. It does not claim production ticker liveness.
 package raftsim

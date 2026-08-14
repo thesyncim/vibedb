@@ -12,8 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// The offline verify and salvage tools realise the "Verify and salvage, with
-// catalog-loss recovery as a stated property" item from the next-wave plan.
+// The offline verify and salvage tools provide read-only structural inspection
+// and catalog-loss recovery.
 //
 // Both are strictly read-only against their input. They deliberately do NOT
 // take the writer lock and do NOT apply the in-place materialization-journal

@@ -80,7 +80,7 @@ filesystems fail closed; truncation is not an allocation proof.
 
 ## Trusted apply activation
 
-The follow-on [SQL replicated apply](sql-replicated-apply.md) keeps this
+The [SQL replicated apply](sql-replicated-apply.md) activation keeps this
 write-once binding intact and adds a separate strict `replicated_apply` catalog
 member. That activation owns a hidden system collection and one opaque apply
 claim; it never exposes the collection, transaction log, or underlying state

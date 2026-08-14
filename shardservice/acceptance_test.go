@@ -14,7 +14,7 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-// The PR 4a acceptance gate, exercised end to end over a served connection. Each
+// The shard-service acceptance gate, exercised end to end over a served connection. Each
 // test names one gate criterion:
 //
 //   - (a) epoch admission: a request for the wrong shard or distribution, a stale

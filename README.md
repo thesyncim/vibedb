@@ -291,6 +291,10 @@ embedded facade:
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
   tier.
 
+Both commands are loopback-only. The gateway accepts newline-delimited JSON,
+not pgwire, and neither server protocol includes built-in transport
+authentication.
+
 Every shard catalog must be created explicitly with `vibedb-shard init`. Its
 write-once SQL catalog identity binds the distribution, shard ID, and
 topology-issued allocation generation to a random local LogID; `serve` opens
@@ -314,7 +318,8 @@ single-shard local cluster.
 
 The server tier is leader-only today. The repository also contains a bounded,
 non-serving Raft kernel, append-only WAL, local replicated-apply machine,
-in-process Multi-Raft scheduler, and post-authentication frame validator. Those
+in-process Multi-Raft scheduler, and a frame/roster validator that accepts a
+caller-supplied authenticated NodeID. Those
 internal packages are not wired into `vibedb-shard`, `vibedb-gateway`, a public
 API, or operator configuration, and they do not make the server tier highly
 available.
@@ -328,6 +333,7 @@ available.
 | Replicated client writes and automatic failover | Not available |
 | Runtime Raft snapshots, WAL compaction, and dynamic membership | Not available |
 | Follower/session reads, online movement, and backup/PITR orchestration | Not available |
+| Adaptive splitting | Shadow-only recommender; not wired to topology publication or data movement |
 
 The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.
@@ -336,7 +342,6 @@ Read the design before relying on any of it:
 
 - [Distributed sharding](docs/design/distributed-sharding.md)
 - [Query planner](docs/design/query-planner.md)
-- [Vitess-compatible routing](docs/design/vitess-compatible-routing.md)
 - [Placement tuple format](docs/design/distribution-tuple-format.md)
 
 ## Performance
@@ -351,6 +356,9 @@ the repository rather than summarized as context-free headline numbers here:
 - [Benchmark coverage matrix](bench/competitive/COVERAGE.md)
 
 ## Documentation
+
+Start with the [documentation index](docs/README.md) for user, operator, and
+engineering references.
 
 | Topic | Document |
 | --- | --- |

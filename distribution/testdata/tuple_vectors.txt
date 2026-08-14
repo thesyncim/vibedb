@@ -4,9 +4,9 @@
 # Every byte string here is placement identity within one build contract.
 # If TestTupleGoldenVectors (../golden_vectors_test.go) fails, the
 # implementation changed or someone tried to widen the byte format — that is
-# a stop condition requiring design review (see docs/design/
-# vitess-compatible-routing.md, PR 1a "Stop conditions" and "Acceptance
-# gate"). Do NOT edit a hex value to make a failing test pass, and do not
+# a stop condition requiring review against docs/design/
+# distribution-tuple-format.md and the codec source. Do NOT edit a hex value
+# to make a failing test pass, and do not
 # delete a vector to dodge a mismatch. Adding new vectors for new coverage is
 # fine; changing an existing hex value requires one coordinated update of the
 # codec, placement digests, persisted fixtures, and design contract.

@@ -15,7 +15,7 @@ None of these files licenses the repository as a whole.
 
 | Dependency | Pin, license, and treatment |
 | --- | --- |
-| `go.etcd.io/raft/v3` | `v3.7.0`, tag commit `b867cf13f6bc0dae21204302df97bc2355c3af55`, module sum `h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=`, Apache-2.0 (`LICENSE-ETCD-RAFT`). It is used unmodified as consensus protocol machinery whose transitions are deterministic for fixed internal timeout state and exact input order; upstream privately samples election jitter from `crypto/rand`. VibeDB is responsible for the surrounding scheduling, storage, transport, identity/admission, apply/publication, snapshots, encryption, and configuration safety. The repository currently implements a bounded non-serving scheduler, append-only static-base WAL, local apply boundary, and post-authentication frame validator; it does not implement peer authentication, network transport, runtime snapshots/compaction, or replicated serving. The exact settings, exclusions, and threat model are recorded in [`design/raft-core-selection.md`](design/raft-core-selection.md). |
+| `go.etcd.io/raft/v3` | `v3.7.0`, tag commit `b867cf13f6bc0dae21204302df97bc2355c3af55`, module sum `h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=`, Apache-2.0 (`LICENSE-ETCD-RAFT`). It is used unmodified as consensus protocol machinery whose transitions are deterministic for fixed internal timeout state and exact input order; upstream privately samples election jitter from `crypto/rand`. VibeDB is responsible for the surrounding scheduling, storage, transport, identity/admission, apply/publication, snapshots, encryption, and configuration safety. The repository currently implements a bounded non-serving scheduler, append-only static-base WAL, local apply boundary, and a frame/roster validator that accepts caller-supplied authenticated identity; it does not implement peer authentication, network transport, runtime snapshots/compaction, or replicated serving. The exact settings, exclusions, and threat model are recorded in [`design/raft-core-selection.md`](design/raft-core-selection.md). |
 | `google.golang.org/protobuf` | Direct runtime dependency of the local integration and the selected Raft core's sole runtime module dependency at `v1.36.11`, module sum `h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=`, BSD-3-Clause (`LICENSE-PROTOBUF`) plus the distributed additional IP rights grant (`PATENTS-PROTOBUF`). It supplies the generated Raft wire types and protobuf runtime; no protobuf source is copied or modified locally. |
 
 ## Algorithm ledger
@@ -36,4 +36,6 @@ Before adding externally derived material:
 2. add `Provenance: ID` at every adapted implementation site;
 3. include required upstream license and notice text;
 4. do not guess an origin or retain provenance for code no longer present; and
-5. update the eventual root `LICENSE` and `NOTICE` before release.
+5. add a root `LICENSE` and any required `NOTICE` before distributing the
+   repository as a licensed product; the dependency license files do not
+   license VibeDB itself.

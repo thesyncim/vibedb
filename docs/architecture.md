@@ -271,10 +271,9 @@ captured generation until that foreground fold. Deletes disappear from the
 logical view immediately but may remain as bounded delete records. Snapshots
 currently seal pending primary records before pinning their logical cut; they
 may retain a captured exact-index epoch, but do not retain a primary-overlay
-cut. Isolated random writes can rewrite page paths, and it shows in the
-synchronous lane, where a
-per-mutation durable acknowledgement currently trails SQLite. Writer batching,
-owned-frame in-place updates, bounded overlays, and the recovery-only journal
+cut. Isolated random writes can rewrite page paths and therefore pay bounded
+foreground structural work. Writer batching, owned-frame in-place updates,
+bounded overlays, and the recovery-only journal
 remain predictable because their capacities and fold work are fixed at open.
 
 ## Design map
@@ -288,21 +287,18 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Multi-table transactions](design/multi-table-transactions.md): conditional
   journal records, the `txn.vtm` decision log, and crash-atomic multi-collection
   commit.
-- [Parallel tablet writers](design/parallel-tablet-writers.md): the implemented
-  4,096 full-bucket stripe preparation lane and its remaining publication and
-  structural-concurrency work.
-- [Distributed sharding](design/distributed-sharding.md) and
-  [Vitess-compatible routing](design/vitess-compatible-routing.md): the
+- [Primary write concurrency](design/parallel-tablet-writers.md): the
+  implemented 4,096 full-bucket stripe preparation lane and its coordinated
+  fallbacks.
+- [Distributed server boundary](design/distributed-sharding.md): the
   separate, server-only distributed tier. Its routed leader-only shard
   execution (`shardservice`) and stateless routing gateway (`gateway`) exist
   today; both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
-  the embedded surface. Serving replication with authenticated transport,
-  failover, and online resharding across independent durable roots remain
-  future work.
-- [Unification](design/unification.md): the unified mutable collection and
-  its remaining performance gates.
+  the embedded surface. It also documents that `autosplit` is a shadow-only
+  unwired recommender and that serving replication, failover, and online
+  movement are absent.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and
   transactions.

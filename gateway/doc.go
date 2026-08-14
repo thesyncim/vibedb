@@ -29,11 +29,13 @@
 // so a caller matches a failure with errors.Is.
 //
 // [SessionVector] is a bounded immutable aggregate of per-shard logical
-// positions, but it is intentionally not attached to Query or Result yet. The
+// positions, but it is not attached to Query or Result. The
 // current catalog cannot prove position continuity across split/merge topology
 // changes; routing integration requires a layout-provenance fence and certified
 // lineage translation rather than dropping or numerically comparing positions.
 //
-// This package uses only repository-native routing, SQL, durability, and shard
-// wire types; it imports no network-RPC or serialization framework.
+// The current package is leader-only and read-only. It does not provide peer
+// authentication, replication, failover, online movement, or a topology
+// authority. The command front end is loopback-only newline-delimited JSON,
+// not pgwire.
 package gateway

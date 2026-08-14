@@ -72,7 +72,7 @@ random, cataloged storage identity. `DROP TABLE` followed by same-name
 `CREATE TABLE` can therefore publish the replacement immediately while an old
 snapshot continues reading the retired file. Reopen removes only unreferenced
 files in the driver's private, strictly recognized storage namespace; live and
-legacy catalog paths remain protected. Recovery work and simultaneously
+recognized catalog paths remain protected. Recovery work and simultaneously
 retired incarnations both have hard bounds.
 
 `TRUNCATE [TABLE] name` publishes a fresh empty storage incarnation with the
@@ -98,8 +98,9 @@ corruption instead of silently recreating an empty table.
 A separate catalog lock file holds a process-and-filesystem writer lease for
 the lifetime of the connector, so two independently opened handles cannot
 overwrite one another's schema or index changes from stale catalog copies. The
-current catalog format is version 0. Schemas and index definitions
-are recompiled and validated when the database is reopened. A catalog may hold
+driver accepts only the current unreleased catalog grammar and has no migration
+reader. Schemas and index definitions are recompiled and validated when the
+database is reopened. A catalog may hold
 at most 128 tables because this driver eagerly keeps one descriptor for every
 materialized table; the explicit ceiling leaves descriptor headroom for
 temporary publications, spill files, sockets, and the embedding application.
@@ -316,9 +317,9 @@ duplicate-resolved keys, and exact-index changes stage before one collection
 generation and one recovery-journal batch record. Pinned snapshots retain old
 durable or volatile overflow chains until their generation can be reclaimed.
 Admission, retirement-capacity, or journal failure cannot expose a partial
-logical batch; recovery replays the complete journal record or none of it. The
-warmed replacement benchmark currently reports the same one publication-state
-allocation for the inline control and mixed overflow cases; this is not a
+logical batch; recovery replays the complete journal record or none of it.
+Allocation tests require the inline control and mixed-overflow replacement
+paths to retain the same publication-state allocation count; this is not a
 zero-allocation `Collection.Update` claim.
 
 There is no caller-supplied physical-key row form. `VALUES` without a field list
@@ -555,8 +556,8 @@ Autocommit generalized joins receive that coherent durable catalog directly.
 Physical dependencies therefore stay on durable sources, and eligible operand
 subplans retain primary-point and exact-index execution instead of first being
 copied into an adapter catalog. A sole physical dependency hidden behind a CTE
-still drives `Statement.Collection()` and the direct durable source. The legacy
-single-clause physical INNER/LEFT one-key shape keeps its existing
+still drives `Statement.Collection()` and the direct durable source. The
+specialized single-clause physical INNER/LEFT one-key shape keeps its existing
 storage-aware, bounded heap fan-out path; the prepared-plan classifier chooses
 once and leaves that fast path unchanged. A statement without generalized
 joins has no join state and pays one nil pointer test at execution.
@@ -718,9 +719,8 @@ predicate subqueries inside the child remain positioned `0A000`. The same
 refusal applies to correlated scalar subqueries in the projection list,
 searched `CASE`, `HAVING`, or `ORDER BY`, and to every excluded child shape
 listed above. Predicate subqueries inside a correlated LATERAL `WHERE` or
-`HAVING` remain explicit positioned refusals: the APPLY slot frame is compiled
-once, but inherited expression correlation is not yet threaded into a nested
-predicate-subquery plan. LATERAL therefore does not silently reinterpret such
+`HAVING` are explicit positioned refusals because the nested predicate plan
+does not admit inherited expression correlation. LATERAL therefore does not silently reinterpret such
 references as local paths. Pgwire maps refusal to one positioned `0A000`
 ErrorResponse; positions count authored UTF-8 characters. A runtime `21000` or
 refusal inside an explicit transaction reports failed-transaction status until
@@ -982,7 +982,7 @@ An extended-protocol batch of non-DDL stored-row statements runs in one
 implicit transaction through Sync. A multi-statement simple Query without
 explicit transaction control does the same, so an error rolls back earlier
 writes in that message. Savepoint commands are admitted as non-terminal members
-of an explicit transaction block. Catalog DDL cannot yet participate in the
+of an explicit transaction block. Catalog DDL does not participate in the
 durable transaction overlay: CREATE TABLE and CREATE INDEX are atomic
 individually, must run outside an explicit transaction, and must be the only
 non-empty statement in a simple Query message and the only catalog execution

@@ -220,10 +220,10 @@ queue and consumes no scheduler-scan CPU while it has no message, proposal,
 explicit logical tick, campaign, or unfinished Ready work. The group still
 retains its ordinary runtime, memory, and WAL state. A dormant-group removal
 path closes and releases a retired range before reusing its bounded Host slot;
-topology authorization and generation fencing remain outside this kernel. A
-future production cadence must still deliver logical ticks efficiently (for
-example with a timer wheel); this kernel does not make election/heartbeat work
-free.
+topology authorization and generation fencing remain outside this kernel. No
+production cadence exists; a serving integration must deliver logical ticks
+efficiently (for example with a timer wheel). This kernel does not make
+election/heartbeat work free.
 
 Nor is the inequality a physical storage reservation. It closes the logical
 retained-completion-count bound only. The SQL system/user files still have
@@ -353,8 +353,8 @@ post-ack media corruption, malicious storage, and whole-file rollback.
 
 `RecoveredTornCurrentSlot` must be emitted as high-severity telemetry. The
 member should remain quarantined from serving and topology rejoin until an
-operator or later repair protocol validates the authoritative replica state.
-External generation witnesses, authenticated generation manifests, or a later
+operator or repair protocol validates the authoritative replica state.
+External generation witnesses, authenticated generation manifests, or a
 generation-compaction protocol are required to close this limitation.
 
 ## Writer and namespace fencing

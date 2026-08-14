@@ -1,7 +1,7 @@
 package distribution
 
 // The single-key write/lookup route is the promised hot path, so it gets the
-// same allocation-gated benchmark treatment as PR 1a's append APIs: one reused
+// same allocation-gated benchmark treatment as the append APIs: one reused
 // Router driving a fully bound single-column key must resolve to one shard
 // without allocating beyond Route's immutable Targets result. NativeMapper's
 // MapperInto extension reuses router stack scratch for its DestinationSet. All

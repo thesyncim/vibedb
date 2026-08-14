@@ -2,9 +2,8 @@ package distribution
 
 // AppendScalar and AppendTuple sit on the hot path of every write and every
 // point lookup that touches a sharded table, so both must run without
-// allocating once the caller's buffer has spare capacity — the "zero-
-// allocation append APIs where correctness permits" deliverable PR 1a
-// promises. Each benchmark reuses one buffer, which is how a caller is
+// allocating once the caller's buffer has spare capacity. Each benchmark
+// reuses one buffer, which is how a caller is
 // expected to drive this package, and TestZeroAllocation* pins the
 // allocation count as a regression gate rather than only reporting it.
 

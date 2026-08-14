@@ -666,7 +666,7 @@ func TestServerReservedReadPoliciesFailClosed(t *testing.T) {
 	}
 }
 
-// TestServerMinimumPositionRejectedBeforeSQL proves Phase 0 never executes a
+// TestServerMinimumPositionRejectedBeforeSQL proves the current service never executes a
 // statement when a minimum is present. The intentionally invalid SQL would be
 // classified MalformedRequest if preparation were reached.
 func TestServerMinimumPositionRejectedBeforeSQL(t *testing.T) {

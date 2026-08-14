@@ -12,8 +12,9 @@ This format is placement identity: two callers that reach the same encoded
 bytes for the same shard key must resolve to the same shard across processes
 and languages. The repository is unreleased and accepts one current contract.
 A change to any rule below must update the implementation, every dependent
-placement artifact, these golden vectors, and the design review together. See
-`docs/design/vitess-compatible-routing.md`, PR 1a, for the change-control rules.
+placement artifact, these golden vectors, and the current routing tests
+together. The repository carries one unreleased grammar and no compatibility
+decoder ladder.
 
 ## Scope
 
@@ -255,8 +256,7 @@ length prefixes as `"a"`+`"bc"` even though the flattened payload bytes
 ## Non-goals and what this format does not guarantee
 
 - **No decoder ships.** Nothing above should be read as "there
-  is a `Decode` function" — there is not, by design (see PR 1a in
-  `docs/design/vitess-compatible-routing.md`). The format is specified as
+  is a `Decode` function" — there is not. The format is specified as
   self-delimiting because that is what makes tuple concatenation safe, not
   because a decoder exists today.
 - **Byte-equality is the only comparison this format defines.** It does not

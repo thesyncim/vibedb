@@ -349,9 +349,8 @@ journal recycle (or has a durable retirement); root coverage alone does not
 release it.
 
 Cost: a K-participant commit performs K+1 fsyncs (K prepare syncs plus the
-decision sync) and holds K writers across them. Reducing that to one sync is a
-named follow-up (shared redo in the decision log); this pass keeps the
-K+1-sync protocol.
+decision sync) and holds K writers across them. The current protocol does not
+share participant redo in the decision log.
 
 | Lane | Multi-collection visibility | Crash promise | Acknowledgement |
 | --- | --- | --- | --- |

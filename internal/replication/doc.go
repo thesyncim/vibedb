@@ -2,7 +2,7 @@
 // and completion envelopes used at the replication boundary.
 //
 // The package deliberately contains no consensus, transport, persistence, or
-// apply implementation. A command is opaque data to a future consensus core;
+// apply implementation. A command is opaque data to the consensus core;
 // its term and log index belong to that core's entry envelope. A completion is
 // likewise only a bounded value format, not a completion table or blob store.
 //

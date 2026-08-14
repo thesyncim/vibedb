@@ -24,8 +24,9 @@ Raft Node for a range; `internal/multiraft.Host` schedules a bounded set of thos
 independent range groups. One range uses the same path with one group. Idle
 groups have no goroutine, timer, or scheduler scan after their initial probe,
 while no Ready, input, or logical tick is queued, but still retain their normal
-in-memory and durable state. A later cadence layer must still schedule Raft
-ticks efficiently. This is operation-count fairness between completed
+in-memory and durable state. No wall-clock cadence layer is implemented; a
+serving integration must schedule Raft ticks efficiently. This is
+operation-count fairness between completed
 synchronous steps, not latency,
 election-liveness, transport, or HA qualification.
 
@@ -79,16 +80,16 @@ RoutingVersion and RouteGeneration
 identity. Configuration application advances it to the configuration entry's
 Raft index. The other authority generations are static only because this
 unserved slice has no topology-command grammar yet; the state record keeps
-them distinct from immutable lineage so a later committed authority update can
-advance them without rebuilding the machine. In particular, a future serving
-contract must represent election term/leader authority explicitly rather than
+them distinct from immutable lineage so a committed authority update can
+advance them without rebuilding the machine. A serving contract must represent
+election term/leader authority explicitly rather than
 silently treating this pinned `OwnershipEpoch` as a forever-static lease.
 
 The SQL replicated binding now persists this full tuple beside the independent
 local SQL `LogID`; `LogID` remains neither the shared Raft `GroupID` nor a
 distributed serving lease. The `raftmember` adapter derives `MemberID` and
 `StoreID` from a live healthy WAL before opening trusted apply. Enrolled hosting
-`NodeID` and external lease/authority remain later serving gates. Those local
+`NodeID` enrollment and external lease/authority are absent serving gates. Those local
 coordinates fence one physical replica and do not belong in the portable
 logical snapshot, whose position is the shared
 `(ShardIncarnation, GroupID, AppliedSequence)` lineage.
@@ -194,11 +195,11 @@ deletes route the decoded ordered-key scalar. Points outside the exact
 half-open target range produce `ResultWrongShard`. Open and snapshot digesting
 route every extant row, so wrong-shard data cannot be legitimized by omission.
 Composite keys, placement changes, and proof tying a serving router decision to
-this exact range remain future command/topology work.
+this exact range are not represented by the current command grammar.
 
 The fixed current completions represent only this low-level unconditional
 mutation batch. `Command` carries no arbitrary SQL result, expected row
-revisions, read set, predicate, or multi-collection intent. A later SQL command
+revisions, read set, predicate, or multi-collection intent. A richer SQL command
 format is required before replicated SQL DML can preserve its existing
 transaction semantics.
 
@@ -255,16 +256,17 @@ That does not make those modes replicated automatically.
 This command is a blind, unconditional, single-collection write set. It can
 be ordered and deduplicated safely, but it cannot encode a state-dependent SQL
 predicate, read dependencies, per-key/tombstone revisions, a relation-level
-phantom fence, or a multi-table atomic intent. Replicated SQL writes must remain
-disabled until a later bounded command/result grammar carries those
-preconditions and the apply path updates durable conflict metadata.
+phantom fence, or a multi-table atomic intent. Replicated SQL writes remain
+disabled because the current command/result grammar does not carry those
+preconditions or update durable conflict metadata.
 
 Read-only local transactions may continue to use the existing engine. A
 distributed strong read additionally needs leader authority plus `ReadIndex`
 and a coherent machine snapshot at or beyond that index. Cross-shard
-Serializable remains a separate distributed concurrency-control phase.
+Serializable is unsupported because no distributed
+concurrency-control protocol exists.
 
-## Qualification and remaining gates
+## Qualification and serving exclusions
 
 The apply slice must retain the following qualification before any serving
 integration:
@@ -284,25 +286,20 @@ integration:
 - bounded capacity failures that occur before a committed entry can enter a
   serving system.
 
-Serving remains prohibited until all of the following exist:
+The existing [SQL replicated binding](sql-replicated-binding.md) and
+[SQL replicated apply](sql-replicated-apply.md) provide exact SQL/WAL identity,
+a persistent direct-write fence, a hidden atomic participant, and an opaque
+local apply claim. They deliberately grant no serving authority.
 
-1. the landed [SQL replicated binding](sql-replicated-binding.md) and
-   [SQL replicated apply](sql-replicated-apply.md) provide the exact
-   SQL/WAL identity, persistent direct-write fence, hidden atomic participant,
-   and opaque local apply claim, but deliberately grant no serving authority;
-2. an exact healthy, initialized SQL/WAL pair can now prove finite logical
-   completion-count headroom when the live binding matches, `C <= A-1`,
-   `A <= commit <= L`, the capacity format is exactly the current static
-   no-compaction profile, and sealed
-   `MaxEntries <= MaxCompletions`. This instantaneous check is not a lease.
-   Serving still requires physical system/user byte reservation and safe
-   completion GC; any runtime snapshot/compaction also requires a reconstructed
-   suffix reservation ledger because the static-base proof then expires;
-3. crash-atomic runtime snapshots and WAL generation compaction;
-4. the landed bounded in-process Multi-Raft host and static post-auth ordinary
-   frame/roster boundary still need NodeID enrollment, mutually authenticated
-   network I/O, shared per-peer flow control, snapshot transport, dynamic
-   membership reconciliation, and deadline/slow-disk isolation;
-5. leader-aware routing with a fenced range proof, applied-position tokens,
-   completion lookup, and `ReadIndex` reads; and
-6. a replicated SQL command grammar capable of the advertised isolation mode.
+Serving is prohibited because the current tree lacks:
+
+- physical system/user byte reservation and safe completion GC beyond the
+  instantaneous static-base logical headroom proof;
+- crash-atomic runtime snapshots, a reconstructed suffix-reservation ledger,
+  and WAL generation compaction;
+- peer enrollment, mutually authenticated network I/O, shared per-peer flow
+  control, snapshot transport, dynamic membership reconciliation, and
+  deadline/slow-disk isolation around the in-process host and frame validator;
+- leader-aware routing with a fenced range proof, applied-position tokens,
+  completion lookup, and `ReadIndex` reads; and
+- a replicated SQL command grammar capable of the advertised isolation mode.

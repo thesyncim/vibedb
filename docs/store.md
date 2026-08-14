@@ -623,7 +623,7 @@ counters do not include the Go heap or total process RSS.
 
 Bulk-built and opened immutable bases can use pointer-free external blocks, but
 the mutable key HAMT, recent index deltas, and chunk publication paths
-still use Go objects. The current in-memory collection therefore does not yet
+still use Go objects. The current in-memory collection therefore does not
 have a row-count-independent GC footprint. The durable collection bounds page
 payload residency, reusable extents, queues, and leases at open, but small
 catalogs and generation state remain ordinary Go objects.
@@ -647,43 +647,21 @@ for another.
 
 ## Current product boundaries
 
-The repository's embedded API has no replication, failover, backup manager,
-point-in-time restore, or cross-database transaction. Distributed execution now
-exists, but only as a separate, unreleased, server-only tier the embedded API
-does not expose: a leader-only shard service (`shardservice`) and a stateless
-routing gateway (`gateway`), run by the `cmd/vibedb-shard` and
-`cmd/vibedb-gateway` binaries. They route on the frozen placement scalar and
-tuple codec (`distribution`), which the opt-in single-shard `sql/driver`
-local-cluster facade (`OpenCluster`, no network) also uses and which is
-therefore reachable from the embedded surface. Gateway execution is
-fail-closed and read-only: mutations are rejected before dispatch, shard
-requests carry a safe-zero read-only intent, and stale routing refusals reload
-only a strictly newer valid catalog generation. A shard catalog is created
-explicitly and durably bound to its distribution, shard ID, topology allocation
-generation, and a random local LogID before table recovery; serving is
-open-existing only and generic SQL opens reject a bound shard catalog. A shard
-server must then claim nonzero ownership-epoch and routing-version coordinates.
-The SQL catalog persists each as an independent monotonic high-water before
-startup succeeds, and one in-process claim excludes a second server over that
-exact open store until `Server.Close` drains its connections. A definite
-pre-publication failure restores the prior in-memory high-water; an ambiguous
-publication returns no claim and retains the proposed high-water so a stale
-retry cannot serve. This fences accidental rebinding and local stale restarts,
-but is not a distributed lease or election: an old process using another store
-handle or a byte-for-byte copied store still requires an external replicated
-authority to revoke. The low-level claim also does not discover or drain
-Sessions a trusted caller opens directly on the same `Database`; callers must
-not share such a producer with a shard server, and must drain direct work before
-releasing a claim. The tier is itself leader-only — no replication, failover,
-or online resharding — and its design contract lives in
-[distributed sharding](design/distributed-sharding.md) and
-[Vitess-compatible routing](design/vitess-compatible-routing.md). The PostgreSQL
-protocol-v3 server can expose the typed SQL catalog directly;
-that path supports the documented DDL, DML, SELECT, prepared-statement, join,
-and transaction subset, including multi-table commits and savepoints. A nested
-integration module exercises pinned pgx v5 and lib/pq releases over loopback
-TCP in CI. That narrow evidence does not imply general PostgreSQL compatibility
-or catalog emulation.
+The embedded API has no replication, failover, backup manager, point-in-time
+restore, or cross-database transaction. The separate distributed tier is
+experimental, server-only, leader-only, and read-only. Its shard and gateway
+commands accept loopback listeners; the gateway speaks newline-delimited JSON,
+not pgwire, and neither server protocol supplies transport authentication.
+Local catalog high-water marks fence stale coordinates on one open store but
+are not a distributed lease, election, or copied-store revocation mechanism.
+
+The current component inventory, initialization commands, supported query
+shapes, and explicit HA/resharding exclusions are maintained in the
+[distributed server boundary](design/distributed-sharding.md). The PostgreSQL
+protocol-v3 server is a separate embedded SQL endpoint. It supports the
+documented DDL, DML, SELECT, prepared-statement, join, and transaction subset,
+including multi-table commits and savepoints, but does not provide general
+PostgreSQL catalog or ORM compatibility.
 
 The core provides two multi-collection catalogs:
 

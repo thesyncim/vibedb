@@ -23,20 +23,21 @@ var (
 	// shard. Its index is not comparable with this shard's log.
 	ErrPositionIdentity = errors.New("shardservice: logical position identity mismatch")
 	// ErrPositionNotReached reports a matching position above the serving
-	// replica's applied index. It is reserved until replicated apply exists.
+	// replica's applied index. The current non-replicated service never emits it.
 	ErrPositionNotReached = errors.New("shardservice: logical position has not been reached")
 )
 
 // Static ownership admission: the pure gate a shard applies to every request
 // before it parses or executes anything.
 //
-// PR 4a configures ownership statically. A shard owns exactly one (distribution,
-// shard) identity at one ownership epoch and one routing version. Admit compares
-// an incoming request's coordinates against that configuration and returns a
-// typed refusal, or nil to admit. It performs no I/O and executes no SQL.
+// The current service configures ownership statically. A shard owns exactly one
+// (distribution, shard) identity at one ownership epoch and one routing version.
+// Admit compares an incoming request's coordinates against that configuration
+// and returns a typed refusal, or nil to admit. It performs no I/O and executes
+// no SQL.
 
-// Ownership is a shard's statically configured identity. PR 4a assigns it at
-// startup; PR 5 advances the epoch during movement.
+// Ownership is a shard's statically configured startup identity. No online
+// movement path advances it.
 type Ownership struct {
 	Distribution         distribution.DistributionName
 	Shard                distribution.ShardID
@@ -78,8 +79,8 @@ func (e *AdmissionError) Response() *ShardResponse {
 //   - mismatched ownership epoch    -> ErrorOwnershipEpoch (ErrOwnershipEpoch)
 //   - malformed minimum position    -> ErrorMalformedRequest
 //   - mismatched position identity  -> ErrorPositionIdentity
-//   - any matching minimum position -> ErrorPositionUnsupported (Phase 0)
-//   - session read without minimum  -> ErrorPositionUnsupported (Phase 0)
+//   - any matching minimum position -> ErrorPositionUnsupported
+//   - session read without minimum  -> ErrorPositionUnsupported
 //   - unsupported stale read        -> ErrorUnsupportedReadPolicy
 func (o Ownership) Admit(req *ShardRequest) error {
 	if req == nil {

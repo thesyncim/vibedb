@@ -25,9 +25,9 @@ import (
 // a typed error frame — a not-owner/stale admission refusal, a malformed request,
 // a deadline, or a resource limit — never a panic.
 
-// pgOIDJSON is the type OID advertised for every result column. PR 4a carries
-// each cell as JSON text (the pgwire json DataRow model), so every column names
-// the JSON type; richer per-column OIDs are a gateway (PR 4b) concern.
+// pgOIDJSON is the type OID advertised for every result column. The shard wire
+// carries each cell as JSON text, so every column names the JSON type rather
+// than guessing a more specific type.
 const pgOIDJSON = 114
 
 // shardConn is one served connection: the socket and the single Session it owns.

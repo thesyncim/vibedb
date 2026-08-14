@@ -5,8 +5,7 @@
 No tagged release exists. Security fixes are made on `main`; consumers must
 upgrade to a fixing revision after reviewing it for their deployment.
 
-After releases begin, support policy will be stated per release. No support
-window is implied before then.
+No support window is implied while the project remains unreleased.
 
 ## Private reports
 

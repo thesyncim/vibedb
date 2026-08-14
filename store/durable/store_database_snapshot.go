@@ -673,7 +673,7 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 	}
 	defer hold.release()
 
-	// Phase 3 — pin every member's state and acquire its lease with every gate
+	// Final acquisition — pin every member's state and acquire its lease with every gate
 	// held at once, so the captured generations are a set that genuinely
 	// coexisted: no member could publish between the first pin and the last.
 	for i, source := range d.order {

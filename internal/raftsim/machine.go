@@ -38,9 +38,8 @@ type AppliedEntry struct {
 }
 
 // MemoryMachine is a crash-persistent deterministic model state machine. It
-// deliberately treats normal entry data as opaque; the frozen replication
-// command codec is tested independently until the production apply adapter is
-// implemented.
+// deliberately treats normal entry data as opaque; the production replication
+// command codec and apply adapter are tested independently.
 type MemoryMachine struct {
 	publication raftmodel.Publication
 	entries     []AppliedEntry
@@ -48,8 +47,8 @@ type MemoryMachine struct {
 	chain       [32]byte
 
 	// snapshotIdentity binds the exact canonical snapshot from which the
-	// machine's base publication was restored. Phase 0 does not model
-	// advancing application snapshots yet, but restart reconciliation must
+	// machine's base publication was restored. The simulator does not model
+	// advancing application snapshots, but restart reconciliation must
 	// still prove that an already-published base came from the same durable
 	// snapshot rather than merely sharing its index and ConfState.
 	snapshotIdentity [32]byte

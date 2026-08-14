@@ -2,14 +2,15 @@
 
 **Status:** current non-serving Raft kernel. The pinned core, synchronous
 driver, bounded model/simulator, static-snapshot append-only WAL, exact member
-runtime, in-process Multi-Raft host, and post-authentication ordinary-message
-frame boundary are executable. There is no serving replication, failover,
+runtime, in-process Multi-Raft host, and an ordinary-message frame/roster
+validator that accepts a caller-supplied authenticated NodeID are executable.
+There is no serving replication, failover,
 runtime snapshot or WAL compaction path, peer authentication, or network
 transport.
 
 ## Exact selection and provenance
 
-Vibedb uses the upstream [`etcd-io/raft`](https://github.com/etcd-io/raft)
+VibeDB uses the upstream [`etcd-io/raft`](https://github.com/etcd-io/raft)
 protocol core through module `go.etcd.io/raft/v3` at exactly `v3.7.0`:
 
 | Property | Pinned value |
@@ -30,8 +31,8 @@ The module's tag contains no `NOTICE` file. The local license is byte-for-byte
 the upstream `LICENSE` at the pinned tag. The protobuf runtime named above is
 imported directly by the integration and is also the core's only runtime module
 dependency; both of its distributed notice files are copied byte-for-byte.
-Test-only dependencies recorded in `go.sum` are not linked into Vibedb. The
-dependency is consumed unmodified; no upstream source is copied into Vibedb.
+Test-only dependencies recorded in `go.sum` are not linked into VibeDB. The
+dependency is consumed unmodified; no upstream source is copied into VibeDB.
 
 The selection is deliberately narrow. For a fixed internal election-timeout
 sample and exact input order, the core provides deterministic Raft state
@@ -44,7 +45,7 @@ The core does **not** provide durable storage, networking, peer authentication,
 authorization, encryption, proposal admission, command and completion
 encoding, state-machine apply/publication, snapshot files, placement policy,
 range fencing, or cross-shard transactions. Each omitted facility remains
-Vibedb's responsibility and has a separate gate.
+VibeDB's responsibility and has a separate gate.
 
 ## Audited configuration
 
@@ -67,9 +68,9 @@ behavior.
 | `CheckQuorum` | `true` | A leader that cannot confirm quorum activity steps down. This improves fail-closed behavior but is not a substitute for proposal fencing. |
 | `PreVote` | `true` | A returning partitioned member cannot increment terms before checking whether it could win. |
 | `ReadOnlyOption` | `ReadOnlySafe` | Linearizable `ReadIndex` confirms a quorum; it does not rely on a clock-drift bound or leader lease. |
-| `Logger` | `nil` | Upstream installs its default logger; a later scheduler may install an audited per-group adapter without changing protocol behavior. |
-| `TraceLogger` | `nil` | Optional state tracing is disabled. Normal builds compile the hook as a no-op; a future trace adapter is a separately audited observability change. |
-| `DisableProposalForwarding` | `true` | Followers reject proposals. Routing, identity/fence validation, canonicalization, and admission occur at the current leader, with explicit retry after leadership changes. |
+| `Logger` | `nil` | Upstream installs its default logger; no per-group adapter is installed. |
+| `TraceLogger` | `nil` | Optional state tracing is disabled. Normal builds compile the hook as a no-op. |
+| `DisableProposalForwarding` | `true` | Followers reject proposals. A future serving path must route, validate identity and fences, canonicalize, and admit at the current leader, with explicit retry after leadership changes. |
 | `DisableConfChangeValidation` | `false` | Retain upstream propose-time validation. The local driver also admits a configuration proposal only at a fully applied predecessor and replays upstream `Changer` validation before proposal and apply; topology-bound context validation remains open. |
 | `StepDownOnRemoval` | `true` | A removed or demoted leader immediately stops acting as leader. Request fencing remains independently mandatory. |
 
@@ -100,8 +101,8 @@ and byte envelope.
    independently of `Ready.MustSync`, while that flag controls the required
    entry/`HardState` sync barrier;
 2. only after the prerequisite persistent state is safe, release outbound
-   messages to the caller-supplied sink; a future serving layer must
-   authenticate the peer before forwarding them;
+   messages to the caller-supplied sink; no authenticator is included, so a
+   serving layer must authenticate the peer before forwarding them;
 3. install/apply a snapshot first, then apply its committed suffix entries in
    log order, atomically publishing the new root, applied index, exact
    `ConfState`, and durable completion before acknowledging a command;
@@ -145,7 +146,7 @@ Safety assumes:
 
 - a quorum does not permanently lose or equivocate about data already reported
   durable;
-- a future serving layer supplies cryptographic member identity so an
+- a serving layer must supply cryptographic member identity so an
   unauthorised process or restored foreign store cannot speak as a voter;
 - persistent storage obeys the append/truncate, atomicity, and sync results it
   reports, or the integration detects corruption and refuses to serve;
@@ -173,7 +174,7 @@ range state on every proposal and before publishing its result. Until the
 durable driver and simulator gates pass, no API may expose a Raft-derived term,
 commit sequence, HA acknowledgement, or linearizable distributed-read claim.
 
-## Unsupported extensions in the first qualified integration
+## Unsupported extensions
 
 - `AsyncStorageWrites` and its local append/apply message protocol;
 - lease-based reads and any clock-derived read fast path;
@@ -195,7 +196,7 @@ upstream changelog/source review, license comparison, deterministic and fault
 simulation, wire/storage compatibility review, and a freshly recorded pin.
 
 The module declares `go 1.26` and an upstream development-toolchain preference
-for `go1.26.4`. Vibedb supports the Go 1.26 patch line rather than forcing that
+for `go1.26.4`. VibeDB supports the Go 1.26 patch line rather than forcing that
 preference on its main module; this initial qualification ran on `go1.26.0`,
 while CI's `1.26` selector tracks current patch releases.
 
@@ -241,7 +242,8 @@ claiming a production replicated store:
   caller.
 - `internal/rafttransport` owns a bounded immutable caller-supplied static
   member/role/NodeID roster and one canonical ordinary-message frame. One
-  registry and future node-pair connection multiplex every range group. The
+  registry is designed for one node-pair connection to multiplex every range
+  group. The
   decoder checks full group lineage, replica-set roster digest, peer/member
   routing, roles, flat protobuf shape, and exact bounds before allocation.
   It accepts an already-authenticated NodeID; it does not implement TLS,
@@ -261,7 +263,7 @@ Simulator proposal references and completion lookups are model-local. A
 `RespondProposal` event means that a live replica has found the exact reference
 in its applied prefix after an explicit client retry; it may therefore succeed
 after process restart. This proves the acknowledgement cut for the logical
-model, but does not yet exercise the frozen production command fingerprint,
+model, but does not exercise the frozen production command fingerprint,
 completion codec, duplicate re-proposal path, retry-home routing, or completion
 GC. Static cluster scenarios also do not propose configuration entries. Driver
 tests exercise ordered configuration apply, while the simulator's prefix chain

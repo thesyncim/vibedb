@@ -2,9 +2,10 @@
 
 vibedb changes must preserve storage correctness, transaction isolation,
 durability, bounded memory, and format validation before improving a benchmark.
-The repository targets Go 1.26 and is unreleased. Format changes edit version
-0 in place, and every format or API break must leave the current tree
-internally consistent.
+The repository targets Go 1.26 and is unreleased. Format changes replace the
+current development grammar and its goldens in place; do not add compatibility
+readers. Every format or API break must leave the current tree internally
+consistent.
 
 ## Start focused
 
@@ -71,7 +72,7 @@ Add the smallest permanent test that proves the contract:
   tests where the API promises a warmed allocation boundary.
 
 A benchmark is not a correctness test. Keep a deterministic oracle beside each
-new measured phase.
+new measured path.
 
 ## Storage-format changes
 
@@ -115,10 +116,9 @@ Cross-engine figures have one authoritative home:
 commit, dirty state, machine, Go version, corpus variant, mode, and sampling
 method there.
 
-## Adding a research phase
+## Experimental changes
 
-A phase is a bounded experiment that may graduate into the sole production
-path. Add it in this order:
+An experiment may graduate into the sole production path. Add it in this order:
 
 1. State the idea, current status, and invariant it must preserve in one design
    document under `docs/design/`.
@@ -128,7 +128,7 @@ path. Add it in this order:
    `internal/storeio`, with differential and corruption tests.
 4. Record every measured number with commit, machine, input shape, repetition,
    and units. Keep projections labeled.
-5. Integrate reads first when the phase changes representation; stop if the
+5. Integrate reads first when the experiment changes representation; stop if the
    standing read gates fail.
 6. Integrate mutation and recovery paths, then run the crash, snapshot, churn,
    and whole-file matrices.
@@ -136,8 +136,8 @@ path. Add it in this order:
    permanent reader-visible fallback or overlay to rescue a failed gate.
 
 After a decision, rewrite the design record to describe only the current path
-and remaining work. Delete rejected experiment code, dead plans, and stale
-benchmark claims.
+and explicit product boundaries. Delete rejected experiment code, dead plans,
+and stale benchmark claims.
 
 ## Ownership and unsafe code
 
