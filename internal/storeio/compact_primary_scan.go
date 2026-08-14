@@ -431,6 +431,70 @@ func (s *compactStreamSequentialState) appendValue(
 	}
 	prefix := 0
 	switch v.kind {
+	case compactStreamFOR:
+		if row < 0 || row >= v.count || row != s.next {
+			return v.appendValue(dst, row)
+		}
+		if len(v.data) < 8 {
+			return dst, false
+		}
+		if v.width > 56 {
+			return v.appendValue(dst, row)
+		}
+		width := int(v.width)
+		data := v.data[8:]
+		reservoir := uint64(s.value)
+		available := s.bit
+		cursor := s.cursor
+		for available < width {
+			if cursor >= len(data) {
+				return dst, false
+			}
+			reservoir |= uint64(data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		offset := reservoir & (uint64(1)<<uint(width) - 1)
+		reservoir >>= uint(width)
+		available -= width
+		s.value = int64(reservoir)
+		s.bit = available
+		s.cursor = cursor
+		s.next++
+		base := int64(binary.LittleEndian.Uint64(v.data))
+		return AppendCanonicalInt(dst, base+int64(offset)), true
+	case compactStreamDate:
+		if row < 0 || row >= v.count || row != s.next {
+			return v.appendValue(dst, row)
+		}
+		if len(v.data) < 4 {
+			return dst, false
+		}
+		if v.width > 56 {
+			return v.appendValue(dst, row)
+		}
+		width := int(v.width)
+		data := v.data[4:]
+		reservoir := uint64(s.value)
+		available := s.bit
+		cursor := s.cursor
+		for available < width {
+			if cursor >= len(data) {
+				return dst, false
+			}
+			reservoir |= uint64(data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		offset := reservoir & (uint64(1)<<uint(width) - 1)
+		reservoir >>= uint(width)
+		available -= width
+		s.value = int64(reservoir)
+		s.bit = available
+		s.cursor = cursor
+		s.next++
+		base := int32(binary.LittleEndian.Uint32(v.data))
+		return appendCompactDate(dst, base+int32(offset)), true
 	case compactStreamDelta:
 	case compactStreamDeltaPack:
 	case compactStreamPrefixInt:

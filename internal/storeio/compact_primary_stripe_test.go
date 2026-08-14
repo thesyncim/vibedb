@@ -908,6 +908,206 @@ func TestCompactPrimaryScanDecoderMatchesRandomAccess(t *testing.T) {
 	}
 }
 
+func compactPrimaryFixedPackedScanView(
+	t testing.TB,
+	kind uint8,
+	width, count int,
+) compactStreamView {
+	t.Helper()
+	prefix := 8
+	if kind == compactStreamDate {
+		prefix = 4
+	}
+	packedBytes := (count*width + 7) / 8
+	backing := make([]byte, prefix+packedBytes+17)
+	for at := range backing {
+		backing[at] = 0xff
+	}
+	data := backing[:prefix+packedBytes]
+	clear(data)
+	switch kind {
+	case compactStreamFOR:
+		// Keep signed wraparound in the exercised grammar. The sequential path
+		// must perform the same uint64 -> int64 addition as random-rank decode.
+		base := int64(^uint64(0)>>1) - 7
+		binary.LittleEndian.PutUint64(data, uint64(base))
+	case compactStreamDate:
+		base, ok := compactDateOrdinal([]byte(`"2018-01-01"`))
+		if !ok {
+			t.Fatal("date base")
+		}
+		binary.LittleEndian.PutUint32(data, uint32(base))
+	default:
+		t.Fatalf("fixed packed kind=%d", kind)
+	}
+	mask := ^uint64(0)
+	if width < 64 {
+		mask = uint64(1)<<uint(width) - 1
+	}
+	for row := range count {
+		offset := (uint64(row)*0x9e3779b97f4a7c15 + uint64(row*row+17)) & mask
+		compactPutBits(data[prefix:], row*width, width, offset)
+	}
+	// Padding and the unused backing capacity remain dirty. Sequential decode
+	// must consume exactly count*width bits and never observe either region.
+	if used := count * width; used&7 != 0 {
+		data[len(data)-1] |= ^byte((uint16(1) << uint(used&7)) - 1)
+	}
+	view := compactStreamView{
+		kind: kind, width: uint8(width), count: count, data: data,
+	}
+	if err := view.validate(); err != nil {
+		t.Fatalf("kind=%d width=%d fixture: %v", kind, width, err)
+	}
+	return view
+}
+
+func TestCompactPrimaryScanFixedPackedSequentialParityAllWidths(t *testing.T) {
+	const rows = 2*compactStreamRestart + 1
+	tests := []struct {
+		name     string
+		kind     uint8
+		maxWidth int
+	}{
+		{
+			name: "FOR", kind: compactStreamFOR,
+			maxWidth: 64,
+		},
+		{
+			name: "date", kind: compactStreamDate,
+			// Wider admitted date streams cannot fit the 0000..9999 ordinal
+			// range even though the framing field itself is an uint8.
+			maxWidth: 21,
+		},
+	}
+	for _, test := range tests {
+		for width := range test.maxWidth + 1 {
+			t.Run(fmt.Sprintf("%s/width=%d", test.name, width), func(t *testing.T) {
+				view := compactPrimaryFixedPackedScanView(t, test.kind, width, rows)
+				var state compactStreamSequentialState
+				want := make([]byte, 0, 32)
+				got := make([]byte, 0, 32)
+				for row := range rows {
+					var wantOK, gotOK bool
+					want, wantOK = view.appendValue(want[:0], row)
+					got, gotOK = state.appendValue(got[:0], &view, row)
+					if !wantOK || !gotOK || !bytes.Equal(got, want) {
+						t.Fatalf(
+							"row=%d got=%q,%v want=%q,%v state=%+v",
+							row, got, gotOK, want, wantOK, state,
+						)
+					}
+					// Callback-owned output is not decoder state.
+					for at := range got {
+						got[at] = 0xff
+					}
+				}
+				if test.kind == compactStreamFOR && width > 56 {
+					if state != (compactStreamSequentialState{}) {
+						t.Fatalf("wide FOR advanced sequential state: %+v", state)
+					}
+				} else if state.next != rows {
+					t.Fatalf("sequential rows=%d want=%d", state.next, rows)
+				}
+			})
+		}
+	}
+}
+
+func TestCompactPrimaryScanFixedPackedFallbackAndRollback(t *testing.T) {
+	const rows = 2*compactStreamRestart + 1
+	for _, kind := range []uint8{compactStreamFOR, compactStreamDate} {
+		name := "FOR"
+		prefix := 8
+		if kind == compactStreamDate {
+			name = "date"
+			prefix = 4
+		}
+		t.Run(name, func(t *testing.T) {
+			view := compactPrimaryFixedPackedScanView(t, kind, 9, rows)
+			var state compactStreamSequentialState
+			dst := make([]byte, 0, 32)
+			for row := 0; row < 5; row++ {
+				var ok bool
+				dst, ok = state.appendValue(dst[:0], &view, row)
+				if !ok {
+					t.Fatalf("prefix row=%d", row)
+				}
+			}
+			snapshot := state
+			randomRow := compactStreamRestart + 3
+			got, gotOK := state.appendValue(dst[:0], &view, randomRow)
+			want, wantOK := view.appendValue(nil, randomRow)
+			if !gotOK || !wantOK || !bytes.Equal(got, want) || state != snapshot {
+				t.Fatalf(
+					"random fallback got=%q,%v want=%q,%v state=%+v snapshot=%+v",
+					got, gotOK, want, wantOK, state, snapshot,
+				)
+			}
+			if _, ok := state.appendValue(dst[:0], &view, 5); !ok {
+				t.Fatal("sequential decode did not resume after random fallback")
+			}
+
+			state = compactStreamSequentialState{}
+			if _, ok := state.appendValue(dst[:0], &view, 0); !ok ||
+				state.bit == 0 || state.cursor == 0 {
+				t.Fatalf("packed prefix state=%+v ok=%v", state, ok)
+			}
+			snapshot = state
+			truncated := view
+			truncated.data = truncated.data[:prefix+state.cursor]
+			marker := []byte{0xde, 0xad}
+			got, gotOK = state.appendValue(marker, &truncated, 1)
+			if gotOK || !bytes.Equal(got, marker) || state != snapshot {
+				t.Fatalf(
+					"truncated refill got=%x,%v state=%+v snapshot=%+v",
+					got, gotOK, state, snapshot,
+				)
+			}
+			if _, ok := state.appendValue(dst[:0], &view, 1); !ok {
+				t.Fatal("sequential decode did not resume after truncated refill")
+			}
+
+			short := view
+			short.data = short.data[:prefix-1]
+			state = compactStreamSequentialState{}
+			got, gotOK = state.appendValue(marker, &short, 0)
+			if gotOK || !bytes.Equal(got, marker) ||
+				state != (compactStreamSequentialState{}) {
+				t.Fatalf("short base got=%x,%v state=%+v", got, gotOK, state)
+			}
+		})
+	}
+}
+
+func TestCompactPrimaryScanFixedPackedZeroAlloc(t *testing.T) {
+	const rows = 2*compactStreamRestart + 1
+	for _, kind := range []uint8{compactStreamFOR, compactStreamDate} {
+		name := "FOR"
+		if kind == compactStreamDate {
+			name = "date"
+		}
+		t.Run(name, func(t *testing.T) {
+			view := compactPrimaryFixedPackedScanView(t, kind, 10, rows)
+			dst := make([]byte, 0, 32)
+			decode := func() {
+				var state compactStreamSequentialState
+				for row := range rows {
+					var ok bool
+					dst, ok = state.appendValue(dst[:0], &view, row)
+					if !ok {
+						panic("fixed packed sequential decode")
+					}
+				}
+			}
+			decode()
+			if allocs := testing.AllocsPerRun(1_000, decode); allocs != 0 {
+				t.Fatalf("allocations=%v want 0", allocs)
+			}
+		})
+	}
+}
+
 // A zero-hole prepared shape is a constant canonical document. Compact pages
 // currently choose another legal encoding for that input, but the scan plan's
 // complete executor must still preserve this representation case rather than
