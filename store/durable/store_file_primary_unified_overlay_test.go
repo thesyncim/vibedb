@@ -115,6 +115,141 @@ func TestPrimaryUnifiedOverlayStatsSeparateRetainedOccupancyFromDebt(t *testing.
 	}
 }
 
+func TestPrimaryUnifiedOverlaySparseRecycleClearsPublishedIndexes(t *testing.T) {
+	overlay := newTestPrimaryUnifiedOverlay(
+		64<<10, primaryUnifiedOverlayBuckets,
+	)
+	publish := func(
+		bucket storeio.BucketID,
+		hash, generation uint64,
+		key, value string,
+	) {
+		t.Helper()
+		prepared, err := overlay.prepareWithLeafBytes(
+			bucket, hash, generation, []byte(key), []byte(value),
+			0, 0, primaryUnifiedOverlayPut, uint8(generation), 4<<10,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		overlay.publish(prepared)
+	}
+
+	// Exercise both duplicate hash slots and distinct bucket-directory entries.
+	// A sparse recycle must clear every published lookup root without depending
+	// on a full-table sweep.
+	const firstHash = uint64(17)
+	publish(1, firstHash, 1, "first", "v1")
+	publish(2, firstHash+primaryUnifiedOverlayTable, 2, "second", "v2")
+	publish(1, firstHash, 3, "first", "v3")
+	retained := overlay.records[0]
+	overlay.markFolded(3, true)
+
+	if overlay.count.Load() != 0 || overlay.used.Load() != 0 ||
+		overlay.folded.Load() != 0 || overlay.bucketCount.Load() != 0 ||
+		overlay.dirtyBytes.Load() != 0 {
+		t.Fatalf("sparse recycle retained published state: %+v", overlay.stats())
+	}
+	if got := overlay.heads[firstHash&(primaryUnifiedOverlayTable-1)].Load(); got != 0 {
+		t.Fatalf("collision hash head = %d, want zero", got)
+	}
+	if overlay.records[0] != retained {
+		t.Fatal("sparse recycle cleared pointer-free record backing")
+	}
+	for i := range overlay.buckets {
+		bucket := &overlay.buckets[i]
+		if bucket.head.Load() != 0 || bucket.reservedBytes.Load() != 0 ||
+			bucket.fixedBytes.Load() != 0 || bucket.wideKeys.Load() != 0 ||
+			bucket.rawBytes.Load() != 0 || bucket.rows.Load() != 0 {
+			t.Fatalf("bucket %d retained sparse recycle state", i)
+		}
+		for slot := range bucket.insertSlots {
+			if bucket.insertSlots[slot].Load() != 0 {
+				t.Fatalf("bucket %d slot word %d retained state", i, slot)
+			}
+		}
+	}
+
+	// Reusing record zero and the same hash slot must not reconnect the stale
+	// collision chain or expose either old key.
+	publish(3, firstHash, 4, "third", "v4")
+	if value, disposition, _ := overlay.lookup(3, firstHash, []byte("third"), 4); disposition != primaryUnifiedOverlayValue || string(value) != "v4" {
+		t.Fatalf("post-recycle lookup = %q,%d", value, disposition)
+	}
+	for bucket, key := range map[storeio.BucketID][]byte{
+		1: []byte("first"), 2: []byte("second"),
+	} {
+		if _, disposition, _ := overlay.lookup(bucket, firstHash, key, 4); disposition != primaryUnifiedOverlayMissing {
+			t.Fatalf("stale lookup bucket %d = disposition %d", bucket, disposition)
+		}
+	}
+	overlay.markFolded(4, true)
+	key, value := []byte("allocation"), []byte("stable")
+	if allocs := testing.AllocsPerRun(100, func() {
+		prepared, err := overlay.prepareWithLeafBytes(
+			4, 29, 1, key, value, 0, 0,
+			primaryUnifiedOverlayPut, 1, 4<<10,
+		)
+		if err != nil {
+			panic(err)
+		}
+		overlay.publish(prepared)
+		overlay.markFolded(1, true)
+	}); allocs != 0 {
+		t.Fatalf("publish + sparse recycle allocated %.2f times", allocs)
+	}
+}
+
+func TestPrimaryUnifiedOverlayDenseRecycleClearsPublishedIndexes(t *testing.T) {
+	const records = primaryUnifiedOverlayRecords/4 + 1
+	overlay := newTestPrimaryUnifiedOverlay(
+		primaryUnifiedOverlayMax, primaryUnifiedOverlayBuckets,
+	)
+	key, value := []byte("k"), []byte("v")
+	var hashes [records]uint64
+	for index := range records {
+		hash := uint64(index+1) * 0x9e3779b97f4a7c15
+		hashes[index] = hash
+		prepared, err := overlay.prepareWithLeafBytes(
+			1, hash, uint64(index+1), key, value,
+			0, 0, primaryUnifiedOverlayPut, uint8(index), 4<<10,
+		)
+		if err != nil {
+			t.Fatalf("prepare record %d: %v", index, err)
+		}
+		overlay.publish(prepared)
+	}
+	retained := overlay.records[records/2]
+	overlay.markFolded(records, true)
+	if overlay.count.Load() != 0 || overlay.used.Load() != 0 ||
+		overlay.folded.Load() != 0 || overlay.bucketCount.Load() != 0 ||
+		overlay.dirtyBytes.Load() != 0 {
+		t.Fatalf("dense recycle retained published state: %+v", overlay.stats())
+	}
+	if overlay.records[records/2] != retained {
+		t.Fatal("dense recycle cleared pointer-free record backing")
+	}
+	for index, hash := range hashes {
+		if got := overlay.heads[hash&(primaryUnifiedOverlayTable-1)].Load(); got != 0 {
+			t.Fatalf("record %d hash head = %d, want zero", index, got)
+		}
+	}
+	prepared, err := overlay.prepareWithLeafBytes(
+		2, hashes[0], records+1, []byte("fresh"), value,
+		0, 0, primaryUnifiedOverlayPut, 1, 4<<10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay.publish(prepared)
+	got, disposition, _ := overlay.lookup(
+		2, hashes[0], []byte("fresh"), records+1,
+	)
+	if disposition != primaryUnifiedOverlayValue || !bytes.Equal(got, value) {
+		t.Fatalf("post-dense-recycle lookup = %q,%d", got, disposition)
+	}
+}
+
 // legacyLatestBucketRecordsKeyOracle retains the former key-deduplication walk
 // as a test-only differential oracle. It intentionally pays O(history*256);
 // production must use the slot-indexed implementation.

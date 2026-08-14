@@ -1259,6 +1259,9 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 	// per-bucket directory.
 	for i := range o.buckets {
 		bucket := &o.buckets[i]
+		if bucket.head.Load() == 0 {
+			continue
+		}
 		bucket.head.Store(0)
 		bucket.reservedBytes.Store(0)
 		bucket.fixedBytes.Store(0)
@@ -1274,11 +1277,23 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 	if !recycle {
 		return
 	}
-	for i := range o.heads {
-		o.heads[i].Store(0)
-	}
 	count := o.count.Load()
-	clear(o.records[:count])
+	// Only hash slots reached by a sparse record window can be nonzero. Avoid
+	// making a small CP64 recycle pay 65,536 unrelated atomic stores; above the
+	// measured locality crossover, retain the bounded sequential sweep rather
+	// than scattering one store per history record. Duplicate sparse slots are
+	// harmless. Records are pointer-free values overwritten completely before
+	// publication, so their stale bytes never need a bulk clear.
+	if count <= primaryUnifiedOverlayRecords/4 {
+		for i := range count {
+			record := &o.records[i]
+			o.heads[record.hash&(primaryUnifiedOverlayTable-1)].Store(0)
+		}
+	} else {
+		for i := range o.heads {
+			o.heads[i].Store(0)
+		}
+	}
 	o.count.Store(0)
 	o.used.Store(0)
 	o.folded.Store(0)
