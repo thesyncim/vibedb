@@ -28,9 +28,15 @@ func (s SourceIdentity) valid() bool {
 }
 
 // CapacitySet describes current, binary-child, and optional isolated-point
-// placements. Isolated is required before an IsolatePoint recommendation can
-// be actionable; a zero vector makes an observed hot point unsplittable.
+// placements for one exact observation window. Source and WindowSequence must
+// match the sketch: capacity projected for another shard incarnation or
+// collection window is stale evidence and is refused before planning.
+// Isolated is required before an IsolatePoint recommendation can be
+// actionable; a zero vector makes an observed hot point unsplittable.
 type CapacitySet struct {
+	Source         SourceIdentity
+	WindowSequence uint64
+
 	Current  CapacityVector
 	Left     CapacityVector
 	Right    CapacityVector
@@ -122,6 +128,10 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 	}
 	source := sketch.source
 	out.Source, out.WindowSequence = source, sketch.sequence
+	if capacities.Source != source || capacities.WindowSequence != sketch.sequence {
+		out.Reason = ReasonSourceMismatch
+		return out
+	}
 	if sketch.samples == 0 {
 		out.Reason = ReasonNoEvidence
 		return out

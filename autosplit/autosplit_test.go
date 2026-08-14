@@ -62,6 +62,11 @@ func TestSketchFixedSpaceAccountingAndDeterminism(t *testing.T) {
 	} else {
 		t.Logf("Tracker size = %d B", got)
 	}
+	if got := unsafe.Sizeof(CapacitySet{}); got > 320 {
+		t.Fatalf("CapacitySet size = %d B, want <= 320 B", got)
+	} else {
+		t.Logf("CapacitySet size = %d B", got)
+	}
 }
 
 func TestSketchRejectsIncompleteWindowFence(t *testing.T) {
@@ -222,6 +227,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 		CelebritySharePPM: 500_000,
 	}
 	capacities := CapacitySet{
+		Source: source, WindowSequence: 1,
 		Current: capFor(500, 40, 40), Left: capFor(1_000, 100, 100), Right: capFor(1_000, 100, 100),
 		Isolated: capFor(1_200, 120, 120),
 	}
@@ -235,6 +241,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 	assertChildrenCover(t, source.Range, rec)
 
 	defaultCapacities := CapacitySet{
+		Source: source, WindowSequence: 1,
 		Current: capFor(500, 40, 40), Left: capFor(900, 100, 100), Right: capFor(900, 100, 100),
 		Isolated: capFor(1_200, 120, 120),
 	}
@@ -255,7 +262,8 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 
 func TestRecommendDoesNotCallCrowdedBinHotKeyUnsplittable(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
-	sketch, _ := NewSketch(testSource(range_), 1)
+	source := testSource(range_)
+	sketch, _ := NewSketch(source, 1)
 	hot := testPoint(12345)
 	neighbor := testPoint(12445)
 	for range 70 {
@@ -269,6 +277,7 @@ func TestRecommendDoesNotCallCrowdedBinHotKeyUnsplittable(t *testing.T) {
 		CelebritySharePPM: 500_000,
 	}
 	capacities := CapacitySet{
+		Source: source, WindowSequence: 1,
 		Current: capFor(500, 100, 1), Left: capFor(2_000, 100, 1),
 		Right: capFor(2_000, 100, 1), Isolated: capFor(1_000, 100, 1),
 	}
@@ -314,6 +323,81 @@ func TestRecommendNoEvidenceRetainsSourceFence(t *testing.T) {
 	rec := Recommend(sketch, balancedCapacities(), DefaultPolicy())
 	if rec.Reason != ReasonNoEvidence || rec.Source != source || rec.WindowSequence != 1 {
 		t.Fatalf("empty recommendation = %+v, want source %+v", rec, source)
+	}
+}
+
+func TestRecommendRejectsCapacityFenceMismatchBeforePlanning(t *testing.T) {
+	sketch, source := balancedSketch(t)
+	matched := balancedCapacities()
+
+	mutations := []struct {
+		name   string
+		mutate func(*CapacitySet)
+	}{
+		{name: "zero", mutate: func(capacities *CapacitySet) { *capacities = CapacitySet{} }},
+		{name: "distribution", mutate: func(capacities *CapacitySet) { capacities.Source.Distribution = "other" }},
+		{name: "shard", mutate: func(capacities *CapacitySet) { capacities.Source.Shard = "other" }},
+		{name: "allocation", mutate: func(capacities *CapacitySet) { capacities.Source.AllocationGeneration++ }},
+		{name: "range", mutate: func(capacities *CapacitySet) { capacities.Source.Range.Start = testPoint(1) }},
+		{name: "routing", mutate: func(capacities *CapacitySet) { capacities.Source.RoutingVersion++ }},
+		{name: "ownership", mutate: func(capacities *CapacitySet) { capacities.Source.OwnershipEpoch++ }},
+		{name: "sequence", mutate: func(capacities *CapacitySet) { capacities.WindowSequence++ }},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			capacities := matched
+			test.mutate(&capacities)
+			rec := Recommend(sketch, capacities, Policy{
+				TriggerPressurePPM: 1, MinBenefitPPM: 1,
+			})
+			if rec.Source != source || rec.WindowSequence != 1 ||
+				rec.Kind != RecommendationNone || rec.Reason != ReasonSourceMismatch {
+				t.Fatalf("mismatch recommendation = %+v", rec)
+			}
+			if rec.BoundaryCount != 0 || rec.Boundaries != [2]distribution.KeyspacePoint{} ||
+				rec.HotPoint != (distribution.KeyspacePoint{}) || rec.CandidateBin != 0 ||
+				rec.CurrentPressurePPM != 0 || rec.PredictedPressurePPM != 0 ||
+				rec.BenefitPPM != 0 || rec.FanoutTaxPPM != 0 || rec.MigrationTaxPPM != 0 {
+				t.Fatalf("mismatch leaked decision state: %+v", rec)
+			}
+		})
+	}
+}
+
+func TestRecommendCapacityMismatchPrecedesEvidenceState(t *testing.T) {
+	source := testSource(balancedRange())
+	sketch, err := NewSketch(source, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sketch.overflow = true
+	capacities := balancedCapacities()
+	if rec := Recommend(sketch, capacities, DefaultPolicy()); rec.Reason != ReasonSourceMismatch || rec.Source != source || rec.WindowSequence != 9 {
+		t.Fatalf("mismatch precedence = %+v", rec)
+	}
+	if rec := Recommend(nil, capacities, DefaultPolicy()); rec.Reason != ReasonNoEvidence {
+		t.Fatalf("nil sketch reason = %v, want ReasonNoEvidence", rec.Reason)
+	}
+}
+
+func TestCapacityMismatchCannotSatisfyTrackerEvidence(t *testing.T) {
+	sketch, source := balancedSketch(t)
+	second := *sketch
+	second.sequence = 2
+	capacities := balancedCapacities()
+	mismatch := Recommend(&second, capacities, DefaultPolicy())
+	policy := TrackerPolicy{
+		WindowCount: 3, RequiredWindows: 3, TriggerPressurePPM: 1,
+	}
+	var tracker Tracker
+	if tracker.Observe(testBinaryRecommendation(source, 1, 32), policy) ||
+		tracker.Observe(mismatch, policy) ||
+		tracker.Observe(testBinaryRecommendation(source, 3, 32), policy) ||
+		tracker.Observe(testBinaryRecommendation(source, 4, 32), policy) {
+		t.Fatal("capacity mismatch advanced actionable tracker evidence")
+	}
+	if !tracker.Observe(testBinaryRecommendation(source, 5, 32), policy) {
+		t.Fatal("three subsequent valid windows did not qualify")
 	}
 }
 
@@ -609,6 +693,12 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}); got != 0 {
 		t.Fatalf("Recommend allocs = %v", got)
 	}
+	capacities.WindowSequence++
+	if got := testing.AllocsPerRun(1_000, func() {
+		_ = Recommend(sketch, capacities, policy)
+	}); got != 0 {
+		t.Fatalf("mismatched Recommend allocs = %v", got)
+	}
 	trackerPolicy := DefaultTrackerPolicy()
 	rec := testBinaryRecommendation(sketch.source, 1, 32)
 	var tracker Tracker
@@ -638,7 +728,10 @@ func balancedSketch(t testing.TB) (*Sketch, SourceIdentity) {
 
 func balancedCapacities() CapacitySet {
 	cap := capFor(320, 32, 320)
-	return CapacitySet{Current: cap, Left: cap, Right: cap, Isolated: cap}
+	return CapacitySet{
+		Source: testSource(balancedRange()), WindowSequence: 1,
+		Current: cap, Left: cap, Right: cap, Isolated: cap,
+	}
 }
 
 func capFor(write, requests, live uint64) CapacityVector {

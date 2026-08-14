@@ -31,6 +31,19 @@ func BenchmarkRecommend64Bins(b *testing.B) {
 	b.ReportMetric(float64(unsafe.Sizeof(Tracker{})), "tracker-B")
 }
 
+func BenchmarkRecommendSourceMismatch(b *testing.B) {
+	sketch, _ := balancedSketch(b)
+	capacities := balancedCapacities()
+	capacities.WindowSequence++
+	policy := Policy{TriggerPressurePPM: 1, MinBenefitPPM: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = Recommend(sketch, capacities, policy)
+	}
+	b.ReportMetric(float64(unsafe.Sizeof(CapacitySet{})), "capacity-set-B")
+}
+
 func balancedRange() distribution.KeyRange {
 	return distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
 }
