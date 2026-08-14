@@ -413,9 +413,9 @@ therefore does not fail the statement or consume retained CAST workspace.
 positive one-based SELECT-list position. Positional keys cover ordinary paths,
 computed scalars, window outputs, and grouped aggregate outputs; wildcard
 projections remain a positioned refusal because their expanded width is known
-only from the prepared source schema. Deferred outputs evaluate and own their
-sort keys for every predicate-surviving row,
-performs one stable mixed path/computed-key sort, and only then applies
+only from the prepared source schema. Deferred ordering evaluates and owns the
+sort keys for every predicate-surviving row, performs one stable mixed
+path/computed-key sort, and only then applies
 OFFSET/LIMIT and the remaining projections. Consequently, with a positive
 LIMIT, an invalid sort key still fails even when the selected slice omits its
 row, while an unrelated projection error in an omitted row remains unobserved.
@@ -426,9 +426,11 @@ aliases are ambiguous (`42702`), while non-positive, fractional, or
 out-of-range positions are invalid column references (`42P10`). Direct scalar
 expressions in ORDER BY
 remain positioned refusals; authors name the computed output or its position.
-An aggregate-output position is executable after grouping, but combining that
-post-output stage with HAVING remains refused until HAVING can filter every
-group before the stable sort and LIMIT/OFFSET.
+For a grouped deferred order, HAVING filters every reduced group before sort
+keys are evaluated and before OFFSET/LIMIT select the result tail. A rejected
+group therefore cannot consume a limited slot, and an invalid computed sort
+key in a rejected group remains unobserved. Aggregate-output positions and
+computed output aliases both use this ordering.
 Prepared warm execution reuses the bounded intermediate workspace and the
 covered CAST and ordered-scalar variants allocate no heap objects.
 

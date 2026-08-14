@@ -3,10 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
-
-	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func TestStatementScalarOrderedStableMergeAllLengths(t *testing.T) {
@@ -173,11 +170,14 @@ func TestSQLOrderByOutputPositionsAcrossPathScalarAndAggregate(t *testing.T) {
 
 	const havingSource = `SELECT team, SUM(n) FROM docs GROUP BY team ` +
 		`HAVING team = 'x' ORDER BY 2 DESC LIMIT 1`
-	_, err = PrepareStatement(havingSource)
-	var unsupported *sqlast.FeatureNotSupportedError
-	if !errors.As(err, &unsupported) || unsupported.Pos != strings.Index(havingSource, "2 DESC") ||
-		!strings.Contains(unsupported.Msg, "HAVING") {
-		t.Fatalf("aggregate ordinal/HAVING error = %T %+v", err, err)
+	having, err := PrepareStatement(havingSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = having.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil || !cursor.Next() || string(cursor.Cell(0).JSON()) != `"x"` ||
+		string(cursor.Cell(1).JSON()) != `5` || cursor.Next() {
+		t.Fatalf("aggregate ordinal/HAVING cursor=%+v err=%v", cursor, err)
 	}
 
 	counted, err := PrepareStatement(`SELECT DISTINCT COUNT(*) FROM docs ORDER BY 1`)
@@ -188,6 +188,177 @@ func TestSQLOrderByOutputPositionsAcrossPathScalarAndAggregate(t *testing.T) {
 	if err != nil || !cursor.Next() || string(cursor.Cell(0).JSON()) != `3` || cursor.Next() {
 		t.Fatalf("single aggregate ordinal cursor=%+v err=%v", cursor, err)
 	}
+}
+
+func TestSQLScalarOrderByHavingFiltersBeforeKeysAndTail(t *testing.T) {
+	segment := mustSegment(t,
+		`{"team":"x","n":2,"v":"2"}`,
+		`{"team":"y","n":100,"v":"bad"}`,
+		`{"team":"z","n":7,"v":"7"}`,
+		`{"team":"x","n":3,"v":"3"}`,
+	)
+	var exec Exec
+
+	// The rejected high group must not occupy LIMIT's only slot. The group
+	// key is intentionally hidden from the output, which also proves Cursor
+	// does not try to apply HAVING again after publication truncates hidden
+	// dependency columns.
+	statement, err := PrepareStatement(`
+		SELECT SUM(n) AS total FROM docs GROUP BY team
+		HAVING team <> 'y' ORDER BY 1 DESC LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := statement.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil || !cursor.Next() {
+		t.Fatalf("HAVING-before-tail cursor=%+v err=%v", cursor, err)
+	}
+	if got := string(cursor.Cell(0).JSON()); got != `7` || cursor.Next() {
+		t.Fatalf("HAVING-before-tail got=%s cursor=%+v", got, cursor)
+	}
+
+	// Scalar dependencies are deduplicated in first-use order, which need not
+	// equal authored SELECT ordinals. HAVING's direct aggregate must be mapped
+	// into that dependency namespace before it filters.
+	reordered, err := PrepareStatement(`
+		SELECT SUM(n) + 1 AS score, SUM(n) AS total, team
+		FROM docs GROUP BY team HAVING SUM(n) >= 5
+		ORDER BY score DESC OFFSET 1 LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = reordered.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil || !cursor.Next() || string(cursor.Cell(2).JSON()) != `"z"` ||
+		string(cursor.Cell(0).JSON()) != `8` || cursor.Next() {
+		t.Fatalf("reordered HAVING dependency cursor=%+v err=%v", cursor, err)
+	}
+
+	// Sort keys are eager only for groups that survive HAVING. The rejected y
+	// group carries a division-by-zero arm and must never evaluate it.
+	lazyKey, err := PrepareStatement(`
+		SELECT team, SUM(n), CASE WHEN team = 'y' THEN 1 / 0 ELSE SUM(n) END AS score
+		FROM docs GROUP BY team HAVING team <> 'y' ORDER BY score DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func() {
+		ordered, runErr := lazyKey.RunInto(&exec, FromSegment(segment), nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		for row, want := range []string{`"z"`, `"x"`} {
+			if !ordered.Next() {
+				t.Fatalf("HAVING lazy key missing row %d", row)
+			}
+			if got := string(ordered.Cell(0).JSON()); got != want {
+				t.Fatalf("HAVING lazy key row %d = %s, want %s", row, got, want)
+			}
+		}
+		if ordered.Next() {
+			t.Fatal("HAVING lazy key returned an extra row")
+		}
+	}
+	run()
+	warm := func() {
+		ordered, runErr := statement.RunInto(&exec, FromSegment(segment), nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		for ordered.Next() {
+		}
+	}
+	warm()
+	if allocs := testing.AllocsPerRun(100, warm); allocs != 0 {
+		t.Fatalf("warmed HAVING ordered stage allocated %.2f/run", allocs)
+	}
+
+	// A path retained only to validate a pruned CASE arm is promoted in place
+	// when HAVING needs it. The base result therefore carries one aggregate and
+	// one hidden key, never a duplicate semantic-only copy.
+	pruned, err := PrepareStatement(`
+		SELECT CASE WHEN TRUE THEN 1 ELSE team END AS key, SUM(n) AS total
+		FROM docs GROUP BY team HAVING team <> 'y' ORDER BY key, 2 DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(pruned.q.columns); got != 2 {
+		t.Fatalf("pruned CASE/HAVING base columns = %d, want 2", got)
+	}
+	cursor, err = pruned.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row, want := range []string{`7`, `5`} {
+		if !cursor.Next() || string(cursor.Cell(1).JSON()) != want {
+			t.Fatalf("pruned CASE/HAVING row %d != %s", row, want)
+		}
+	}
+
+	constant, err := PrepareStatement(`
+		SELECT 1 AS key FROM docs GROUP BY team HAVING team <> 'y' ORDER BY key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = constant.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for cursor.Next() {
+		rows++
+	}
+	if rows != 2 {
+		t.Fatalf("cardinality-only HAVING kept %d groups, want 2", rows)
+	}
+
+	parameterized, err := PrepareStatement(`
+		SELECT SUM(n) FROM docs GROUP BY team HAVING SUM(n) > ? ORDER BY 1 DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []any{int64(5)}
+	runParameterized := func() {
+		ordered, runErr := parameterized.RunInto(&exec, FromSegment(segment), args)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		for ordered.Next() {
+		}
+	}
+	runParameterized()
+	if allocs := testing.AllocsPerRun(100, runParameterized); allocs != 0 {
+		t.Fatalf("warmed parameterized HAVING order allocated %.2f/run", allocs)
+	}
+	exec.Options.IntermediateBytes = 1
+	if _, err := parameterized.RunInto(&exec, FromSegment(segment), args); !errors.Is(err, ErrIntermediateBudget) {
+		t.Fatalf("tiny HAVING ordered workspace = %T %v, want ErrIntermediateBudget", err, err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("HAVING workspace failure published %d rows", exec.Result.RowCount)
+	}
+	exec.Options.IntermediateBytes = 0
+	exec.Options.ResultBytes = 1
+	if _, err := parameterized.RunInto(&exec, FromSegment(segment), args); !errors.Is(err, ErrResultBudget) {
+		t.Fatalf("tiny HAVING ordered result = %T %v, want ErrResultBudget", err, err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("HAVING result failure published %d rows", exec.Result.RowCount)
+	}
+	exec.Options.ResultBytes = 0
+	runParameterized()
+
+	limitZero, err := PrepareStatement(`
+		SELECT SUM(n) FROM docs GROUP BY team HAVING SUM(n) > 0 ORDER BY 1 LIMIT 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancel CancelFlag
+	cancel.Cancel()
+	exec.Options.Cancel = &cancel
+	if _, err := limitZero.RunInto(&exec, FromSegment(segment), nil); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("prearmed HAVING/LIMIT 0 cancellation = %T %v, want ErrCanceled", err, err)
+	}
+	exec.Options.Cancel = nil
 }
 
 func TestSQLScalarOrderByEvaluatesKeysBeforeTailButProjectsLazily(t *testing.T) {

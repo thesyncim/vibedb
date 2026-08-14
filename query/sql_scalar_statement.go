@@ -123,6 +123,7 @@ type statementScalarOrderRow struct {
 type statementScalarOrdered struct {
 	projectionEnd int
 	order         []statementScalarOrder
+	having        *havingProgram
 	rows          []statementScalarOrderRow
 	scratch       []statementScalarOrderRow
 	values        []scalar
@@ -211,6 +212,7 @@ func (s *Statement) prepareScalar() error {
 	if !selectHasScalar(s.tree) && !selectNeedsPostScalarOrder(s.tree) {
 		return nil
 	}
+	postOrder := selectNeedsPostScalarOrder(s.tree)
 	if s.window() != nil {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
 			"computed scalar expressions over window statements require the post-window scalar stage")
@@ -220,7 +222,7 @@ func (s *Statement) prepareScalar() error {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
 			"SELECT DISTINCT over computed scalar expressions requires distinctness after scalar evaluation")
 	}
-	if s.tree.Having != nil {
+	if s.tree.Having != nil && !postOrder {
 		pos := firstScalarStatementPos(s.tree)
 		if !hasScalar {
 			for i := range s.tree.OrderBy {
@@ -250,16 +252,12 @@ func (s *Statement) prepareScalar() error {
 		return err
 	}
 	runtime.predicateNodes = len(runtime.nodes)
-	postOrder := false
-	for i := range s.tree.OrderBy {
-		if s.tree.OrderBy[i].Output != 0 {
-			postOrder = true
-			break
-		}
-	}
 	var outputStarts []int32
 	if postOrder {
 		runtime.ordered = new(statementScalarOrdered)
+		if s.tree.Having != nil {
+			runtime.ordered.having = new(havingProgram)
+		}
 		outputStarts = make([]int32, 0, len(s.tree.Columns))
 	}
 	for i := range s.tree.Columns {
@@ -1333,6 +1331,13 @@ func (r *statementScalar) executeOrdered(
 		keep := r.keep()
 		frame.intermediate.release(predicateCharge)
 		if !keep {
+			continue
+		}
+		// HAVING reads the already-reduced dependency result. It must reject
+		// groups before any deferred sort key is evaluated and before
+		// OFFSET/LIMIT select a tail; applying it from Cursor afterwards can
+		// otherwise discard the chosen row instead of admitting the next group.
+		if ordered.having != nil && !ordered.having.keep(result, row) {
 			continue
 		}
 		if err := frame.intermediate.reserve("scalar ORDER BY rows", perRow); err != nil {

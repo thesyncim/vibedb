@@ -292,23 +292,32 @@ func (s *Statement) buildHaving(args []any) error {
 	if s.tree.Having == nil {
 		return nil
 	}
-	root, err := s.compileHaving(s.tree.Having, args)
+	h := &s.having
+	if scalar := s.scalarStatement(); scalar != nil && scalar.ordered != nil &&
+		scalar.ordered.having != nil {
+		h = scalar.ordered.having
+		h.reset()
+	}
+	root, err := s.compileHaving(h, s.tree.Having, args)
 	if err != nil {
 		return err
 	}
-	s.having.root = root
-	s.having.active = true
+	h.root = root
+	h.active = true
 	return nil
 }
 
 // compileHaving lowers one HAVING node, returning its index in the program.
-func (s *Statement) compileHaving(e *sqlast.Expr, args []any) (int32, error) {
-	h := &s.having
+func (s *Statement) compileHaving(
+	h *havingProgram,
+	e *sqlast.Expr,
+	args []any,
+) (int32, error) {
 	switch e.Kind {
 	case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
 		base := len(h.stack)
 		for _, kid := range e.Kids {
-			idx, err := s.compileHaving(kid, args)
+			idx, err := s.compileHaving(h, kid, args)
 			if err != nil {
 				h.stack = h.stack[:base]
 				return 0, err
@@ -374,6 +383,49 @@ func (s *Statement) compileHaving(e *sqlast.Expr, args []any) (int32, error) {
 // havingColumn answers the result column a HAVING leaf reads, materializing a
 // hidden projection for an unprojected GROUP BY key.
 func (s *Statement) havingColumn(e *sqlast.Expr) (int, error) {
+	if scalar := s.scalarStatement(); scalar != nil {
+		// The cold scalar stage projects dependency columns rather than the
+		// authored SELECT list. Translate a HAVING leaf's selected-output
+		// ordinal back to that dependency namespace: scalar outputs can share a
+		// dependency or introduce it before the direct aggregate HAVING names.
+		if e.Column >= 0 {
+			if e.Column >= len(scalar.outputs) {
+				return 0, fmt.Errorf("query: HAVING output is outside the scalar projection")
+			}
+			root := scalar.outputs[e.Column]
+			if root < 0 || int(root) >= len(scalar.nodes) ||
+				scalar.nodes[root].kind != statementScalarDependency {
+				return 0, fmt.Errorf("query: HAVING output has no scalar dependency")
+			}
+			dependency := scalar.nodes[root].dependency
+			if dependency < 0 || int(dependency) >= len(scalar.deps) {
+				return 0, fmt.Errorf("query: HAVING output has an invalid scalar dependency")
+			}
+			return int(dependency), nil
+		}
+		if e.Agg != sqlast.AggNone {
+			return 0, fmt.Errorf("query: HAVING tests an aggregate the SELECT list does not compute")
+		}
+		spec := s.spec(e.Path)
+		physical := 0
+		grouped := len(s.tree.GroupBy) != 0
+		for i := range s.q.columns {
+			column := &s.q.columns[i]
+			if !column.cardinalityOnly && column.agg == aggNone && column.spec == spec {
+				// A statically unreachable CASE arm can already have registered
+				// this path for semantic validation only. HAVING makes it live;
+				// promote that exact column instead of appending a duplicate.
+				column.semanticOnly = false
+				return physical, nil
+			}
+			if column.semanticOnly || column.cardinalityOnly && grouped {
+				continue
+			}
+			physical++
+		}
+		s.q.columns = append(s.q.columns, Column{agg: aggNone, spec: spec, header: spec})
+		return physical, nil
+	}
 	if e.Column >= 0 {
 		return e.Column, nil
 	}
