@@ -1582,12 +1582,19 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 	return true, nil
 }
 
-// bufferedJournalDeltaPhysicalDrainNeeded reports whether another journal-only
-// checkpoint would leave too little bounded physical staging for the next
-// overlay fold. Journal durability may run arbitrarily far ahead of the rooted
-// durability floor, but the resources held by those device-silent roots may
-// not: committer descriptors, dirty cache frames, the free-log lineage they
-// fence, and the bounded redo region are all finite.
+type bufferedJournalDeltaDrainReason uint8
+
+const (
+	bufferedJournalDeltaDrainResource bufferedJournalDeltaDrainReason = 1 << iota
+	bufferedJournalDeltaDrainJournal
+)
+
+// bufferedJournalDeltaPhysicalDrainReason classifies why another journal-only
+// checkpoint would leave too little bounded staging for the next overlay fold.
+// Journal durability may run arbitrarily far ahead of the rooted durability
+// floor, but the resources held by those device-silent roots may not: committer
+// descriptors, dirty cache frames, the free-log lineage they fence, and the
+// bounded redo region are all finite.
 //
 // Half the descriptor arena, capped at 32 staged roots, is a deterministic
 // upper bound independent of page shape. The dirty-byte guard retains one
@@ -1596,21 +1603,22 @@ func (c *Collection) carryBufferedJournalDeltaBeforeFoldLocked() (
 // published cut and retries the intact overlay when the next fold cannot acquire
 // frames. Reserving two made a wider but still resident-bounded dirty-leaf
 // window force every cheap Flush onto the physical path.
-func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
+func (c *Collection) bufferedJournalDeltaPhysicalDrainReason(
 	pendingBytes int,
-) bool {
+) bufferedJournalDeltaDrainReason {
 	if !c.bufferedJournalDeltaLane() {
-		return false
+		return 0
 	}
+	var reason bufferedJournalDeltaDrainReason
 	queueLimit := min(
 		32, max(1, fileVisibilitySlots(c.options.QueueSlots)/2),
 	)
 	if c.committer.Stats().QueuedGenerations >= uint64(queueLimit) {
-		return true
+		reason |= bufferedJournalDeltaDrainResource
 	}
 	reserve := c.options.maxTransactionBytes
 	if c.cache.DirtyCapacityAvailable() < reserve {
-		return true
+		reason |= bufferedJournalDeltaDrainResource
 	}
 
 	// Budget this explicit Flush suffix plus one policy-sized future carry.
@@ -1629,12 +1637,42 @@ func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
 	header := c.journal.Header()
 	cursor := c.journal.Cursor()
 	if cursor > header.Capacity {
-		return true
+		return reason | bufferedJournalDeltaDrainJournal
 	}
 	remaining := header.Capacity - cursor
 	current := uint64(pendingBytes)
 	future := uint64(futureBytes)
-	return current > remaining || future > remaining-current
+	if current > remaining || future > remaining-current {
+		reason |= bufferedJournalDeltaDrainJournal
+	}
+	return reason
+}
+
+// bufferedJournalDeltaPhysicalDrainNeeded is the boolean form used by callers
+// and tests that do not need to distinguish finite staging from journal room.
+func (c *Collection) bufferedJournalDeltaPhysicalDrainNeeded(
+	pendingBytes int,
+) bool {
+	return c.bufferedJournalDeltaPhysicalDrainReason(pendingBytes) != 0
+}
+
+// drainBufferedJournalDeltaResourcesLocked releases an older staged root when
+// finite committer/cache resources are the only reason the current logical cut
+// cannot remain journal-only. The caller restarts delta planning after success:
+// recycling may have advanced both journal watermarks when the older root
+// covered LiveEndGeneration, or retained them when a newer suffix still exists.
+func (c *Collection) drainBufferedJournalDeltaResourcesLocked(
+	reason bufferedJournalDeltaDrainReason, alreadyDrained bool,
+) (bool, error) {
+	if reason != bufferedJournalDeltaDrainResource || alreadyDrained ||
+		c.committer.PublishedGeneration() <=
+			c.committer.DurableGeneration() {
+		return false, nil
+	}
+	if err := c.flushBufferedPublishedLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // drainBufferedJournalDeltaPhysicalLocked advances the physical durability and
@@ -1686,23 +1724,42 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		return true, ErrClosed
 	}
 	target := view.generation
+	resourceDrained := false
+
+restart:
 	durableAfter := c.journalDeltaGeneration.Load()
 	appendedAfter := c.journalDeltaAppendedGeneration.Load()
-	if target == durableAfter {
-		if appendedAfter != durableAfter {
-			return true, storeio.ErrGenerationOrder
-		}
-		if c.bufferedJournalDeltaPhysicalDrainNeeded(0) {
-			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
-		}
-		return true, nil
-	}
 	if target < durableAfter || target < appendedAfter ||
 		appendedAfter < durableAfter {
 		return true, storeio.ErrGenerationOrder
 	}
-	if c.bufferedJournalDeltaPhysicalDrainNeeded(0) {
+	reason := c.bufferedJournalDeltaPhysicalDrainReason(0)
+	// Resource relief is profitable only for a cut this lane can finish with a
+	// journal fence. An exceptional/structural cut must retain the old behavior:
+	// publish its current physical state first, then let one committer Flush
+	// coalesce that root with any older staged cut.
+	if target > durableAfter &&
+		!c.bufferedJournalDeltaStateEligible(appendedAfter) {
+		if reason != 0 {
+			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
+		}
+		return false, nil
+	}
+	if reason != 0 {
+		drained, drainErr := c.drainBufferedJournalDeltaResourcesLocked(
+			reason, resourceDrained,
+		)
+		if drainErr != nil {
+			return true, drainErr
+		}
+		if drained {
+			resourceDrained = true
+			goto restart
+		}
 		return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
+	}
+	if target == durableAfter {
+		return true, nil
 	}
 	// The cheap cut may coexist with resident exact-index deltas: recovery
 	// deterministically rebuilds them by replaying the same primary mutations.
@@ -1715,9 +1772,6 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 	// structural/COW publication newer than the appended watermark is not
 	// represented by checkpointEntries and must take the ordinary full
 	// checkpoint.
-	if !c.bufferedJournalDeltaStateEligible(appendedAfter) {
-		return false, nil
-	}
 	if target > appendedAfter {
 		entries, plan, complete, prepareErr :=
 			c.prepareBufferedJournalDeltaLocked(appendedAfter, target)
@@ -1727,7 +1781,20 @@ func (c *Collection) checkpointBufferedJournalDeltaLocked() (
 		if !complete {
 			return false, nil
 		}
-		if c.bufferedJournalDeltaPhysicalDrainNeeded(plan.PaddedSize()) {
+		reason = c.bufferedJournalDeltaPhysicalDrainReason(
+			plan.PaddedSize(),
+		)
+		if reason != 0 {
+			drained, drainErr := c.drainBufferedJournalDeltaResourcesLocked(
+				reason, resourceDrained,
+			)
+			if drainErr != nil {
+				return true, drainErr
+			}
+			if drained {
+				resourceDrained = true
+				goto restart
+			}
 			return true, c.drainBufferedJournalDeltaPhysicalLocked(target)
 		}
 		complete, appendErr := c.appendPreparedBufferedJournalDeltaLocked(

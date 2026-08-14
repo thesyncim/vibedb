@@ -868,9 +868,9 @@ func TestBufferedJournalDeltaCrashReplayAndClose(t *testing.T) {
 // TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds mirrors the mixed
 // workload's 64-mutation checkpoint cadence through one complete indexed row
 // overlay window. The full overlay is materialized into a staged physical root
-// without a device fence; the following scheduled checkpoint then consumes the
-// one-fold dirty reserve and drains the current cut instead of making a later
-// mutation pay for an automatic checkpoint.
+// without a device fence; the following scheduled checkpoint drains that older
+// root, restores one-fold dirty headroom, and journals its current suffix rather
+// than materializing and fencing the suffix a second time.
 func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 	const checkpointEvery = 64
 	const mutations = journalDeltaTestPressureMutations + checkpointEvery
@@ -929,9 +929,14 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 		wantRecordDelta := uint64(checkpointEvery)
 		wantPhysical := physicalBase
 		if scheduledDrain {
-			wantCheckpointDelta = 0
-			wantRecordDelta = 0
-			wantPhysical = target
+			if publishedBeforeFlush <= physicalBase ||
+				publishedBeforeFlush >= target {
+				t.Fatalf(
+					"scheduled drain staged generation = %d, want in (%d, %d)",
+					publishedBeforeFlush, physicalBase, target,
+				)
+			}
+			wantPhysical = publishedBeforeFlush
 		}
 		if after.JournalDeltaCheckpoints !=
 			before.JournalDeltaCheckpoints+wantCheckpointDelta {
@@ -960,6 +965,13 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 				baseline.AutomaticCheckpoints,
 				after.AutomaticCheckpoints)
 		}
+		if after.PrimaryOverlayCheckpointFolds !=
+			before.PrimaryOverlayCheckpointFolds {
+			t.Fatalf("Flush %d checkpoint-folded the current suffix: %d -> %d",
+				mutation/checkpointEvery,
+				before.PrimaryOverlayCheckpointFolds,
+				after.PrimaryOverlayCheckpointFolds)
+		}
 		if got := coll.committer.DurableGeneration(); got != wantPhysical {
 			t.Fatalf("Flush %d physical durable = %d, want %d",
 				mutation/checkpointEvery, got, wantPhysical)
@@ -970,6 +982,15 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 				mutation/checkpointEvery,
 				coll.DurableGeneration(),
 				coll.journalDeltaGeneration.Load(), target)
+		}
+		if scheduledDrain {
+			if available := coll.cache.DirtyCapacityAvailable(); available < coll.options.maxTransactionBytes {
+				t.Fatalf("scheduled drain dirty headroom = %d, want >= %d",
+					available, coll.options.maxTransactionBytes)
+			}
+			if got := coll.committer.Stats().QueuedGenerations; got != 0 {
+				t.Fatalf("scheduled drain queued generations = %d, want 0", got)
+			}
 		}
 
 	}
@@ -985,8 +1006,15 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 	}
 	if got, wantCheckpoints := finalStats.JournalDeltaCheckpoints-
 		baseline.JournalDeltaCheckpoints,
-		uint64(mutations/checkpointEvery-1); got != wantCheckpoints {
+		uint64(mutations/checkpointEvery); got != wantCheckpoints {
 		t.Fatalf("delta checkpoints = %d, want %d", got, wantCheckpoints)
+	}
+	if got := finalStats.PrimaryOverlayCheckpointFolds -
+		baseline.PrimaryOverlayCheckpointFolds; got != 0 {
+		t.Fatalf("primary overlay checkpoint folds = %d, want 0", got)
+	}
+	if finalStats.PrimaryOverlayReservedFoldBytes == 0 {
+		t.Fatal("resource drain discarded the current overlay suffix")
 	}
 
 	finalGeneration := coll.Generation()
@@ -1011,9 +1039,10 @@ func TestBufferedJournalDeltaContinuesAcrossDeviceSilentFolds(t *testing.T) {
 
 // TestBufferedJournalDeltaScheduledPhysicalDrain bounds the resource lag behind
 // journal durability. One device-silent fold consumes the deliberately
-// retained physical-fold reserve; the next explicit Flush must drain the current cut
-// physically instead of leaving a later mutation to force an automatic
-// checkpoint. Descriptor pressure can request the same drain independently.
+// retained physical-fold reserve; the next explicit Flush must fence that older
+// root, restore the reserve, and journal the current suffix instead of leaving a
+// later mutation to force an automatic checkpoint. Descriptor pressure can
+// request the same drain independently.
 func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 	const (
 		documents       = 320
@@ -1037,6 +1066,7 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 	}
 	keyString := templateHeavyOverlayKey(20)
 	key := []byte(keyString)
+	var stagedBeforeDrain uint64
 
 	for mutation := 1; mutation <= mutations; mutation++ {
 		group := 40 + mutation&1
@@ -1049,6 +1079,9 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 		if mutation%checkpointEvery != 0 {
 			continue
 		}
+		if mutation == mutations {
+			stagedBeforeDrain = coll.committer.PublishedGeneration()
+		}
 		if err := coll.Flush(); err != nil {
 			t.Fatalf("Flush %d: %v", mutation/checkpointEvery, err)
 		}
@@ -1056,6 +1089,10 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 
 	target := coll.Generation()
 	stats := coll.Stats()
+	if stagedBeforeDrain <= physicalBase || stagedBeforeDrain >= target {
+		t.Fatalf("staged generation = %d, want in (%d, %d)",
+			stagedBeforeDrain, physicalBase, target)
+	}
 	if stats.AutomaticCheckpoints != baseline.AutomaticCheckpoints {
 		t.Fatalf("scheduled drain counted as automatic: %d -> %d",
 			baseline.AutomaticCheckpoints, stats.AutomaticCheckpoints)
@@ -1066,10 +1103,9 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 			baseline.JournalDeltaFullFallbacks,
 			stats.JournalDeltaFullFallbacks)
 	}
-	if got := coll.committer.DurableGeneration(); got != target ||
-		got == physicalBase {
-		t.Fatalf("physical durable = %d, want current %d above base %d",
-			got, target, physicalBase)
+	if got := coll.committer.DurableGeneration(); got != stagedBeforeDrain {
+		t.Fatalf("physical durable = %d, want older staged cut %d below target %d",
+			got, stagedBeforeDrain, target)
 	}
 	if got := coll.committer.Stats().QueuedGenerations; got != 0 {
 		t.Fatalf("queued generations after scheduled drain = %d, want 0", got)
@@ -1085,9 +1121,20 @@ func TestBufferedJournalDeltaScheduledPhysicalDrain(t *testing.T) {
 	}
 	if got, wantCheckpoints := stats.JournalDeltaCheckpoints-
 		baseline.JournalDeltaCheckpoints,
-		uint64(mutations/checkpointEvery-1); got != wantCheckpoints {
+		uint64(mutations/checkpointEvery); got != wantCheckpoints {
 		t.Fatalf("journal delta checkpoints = %d, want %d",
 			got, wantCheckpoints)
+	}
+	if got := stats.PrimaryOverlayCheckpointFolds -
+		baseline.PrimaryOverlayCheckpointFolds; got != 0 {
+		t.Fatalf("current suffix checkpoint folds = %d, want 0", got)
+	}
+	if stats.PrimaryOverlayReservedFoldBytes == 0 {
+		t.Fatal("scheduled resource drain discarded the current overlay suffix")
+	}
+	if available := coll.cache.DirtyCapacityAvailable(); available < coll.options.maxTransactionBytes {
+		t.Fatalf("dirty headroom = %d, want >= %d",
+			available, coll.options.maxTransactionBytes)
 	}
 
 	crashImage := captureJournalImage(t, path)
@@ -1197,9 +1244,10 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 // scheduled Flush without syncing; the next scheduled Flush appends the rest
 // and fences both batches once. A crash may lose that unsynced carry and recover
 // the preceding scheduled cut, or retain its complete bytes and recover the
-// pressure cut. The next scheduled Flush consumes the one-fold physical
-// reserve; later journal checkpoints prove the watermarks remain consecutive
-// across that physical drain and journal recycle.
+// pressure cut. The next scheduled Flush consumes the one-fold physical reserve
+// by fencing the older staged cut, then journals its current suffix. Later
+// checkpoints prove the watermarks remain consecutive across that resource
+// drain and journal recycle.
 func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 	const (
 		documents             = 320
@@ -1242,11 +1290,13 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 		generation uint64
 	}
 	var (
-		durableBefore crashCut
-		carriedFirst  crashCut
-		durableAfter  crashCut
-		carryCuts     []uint64
-		lastSyncs     = fault.Syncs()
+		durableBefore  crashCut
+		carriedFirst   crashCut
+		durableAfter   crashCut
+		carryCuts      []uint64
+		lastSyncs      = fault.Syncs()
+		resourceRoot   uint64
+		resourceDrains int
 	)
 	previousCarryHook := recoveryJournalDeltaCarryHook
 	defer func() { recoveryJournalDeltaCarryHook = previousCarryHook }()
@@ -1280,11 +1330,20 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 
 		beforeSyncs := fault.Syncs()
 		target := coll.Generation()
+		reason := coll.bufferedJournalDeltaPhysicalDrainReason(0)
+		if reason == bufferedJournalDeltaDrainResource {
+			resourceRoot = coll.committer.PublishedGeneration()
+			if resourceRoot <= physicalBase || resourceRoot >= target {
+				t.Fatalf("scheduled resource root = %d, want in (%d, %d)",
+					resourceRoot, physicalBase, target)
+			}
+			resourceDrains++
+		}
 		if err := coll.Flush(); err != nil {
 			t.Fatalf("Flush %d: %v", mutation/checkpointEvery, err)
 		}
 		wantSyncs := 1
-		if mutation == durableAfterMutation {
+		if reason == bufferedJournalDeltaDrainResource {
 			wantSyncs = 2
 		}
 		if got := fault.Syncs(); got != beforeSyncs+wantSyncs {
@@ -1318,32 +1377,43 @@ func TestBufferedJournalDeltaNonAlignedPressureCarryCrashReplay(t *testing.T) {
 
 	if got, expected := carryCuts, []uint64{
 		baseGeneration + pressure,
+		baseGeneration + 2*pressure,
 	}; !slices.Equal(got, expected) {
 		t.Fatalf("carry generations = %v, want %v", got, expected)
 	}
+	if resourceDrains != 2 {
+		t.Fatalf("resource drains = %d, want 2", resourceDrains)
+	}
 	stats := coll.Stats()
 	if got := stats.PrimaryOverlayFolds -
-		baseline.PrimaryOverlayFolds; got != 1 {
-		t.Fatalf("overlay folds = %d, want 1", got)
+		baseline.PrimaryOverlayFolds; got != 2 {
+		t.Fatalf("overlay folds = %d, want 2", got)
 	}
 	if got := stats.JournalDeltaRecords -
-		baseline.JournalDeltaRecords; got != mutations-(durableAfterMutation-pressure) {
+		baseline.JournalDeltaRecords; got != mutations {
 		t.Fatalf("journal delta records = %d, want %d", got,
-			mutations-(durableAfterMutation-pressure))
+			mutations)
 	}
 	if got := stats.JournalDeltaCheckpoints -
-		baseline.JournalDeltaCheckpoints; got != mutations/checkpointEvery-1 {
+		baseline.JournalDeltaCheckpoints; got != mutations/checkpointEvery {
 		t.Fatalf("journal delta checkpoints = %d, want %d",
-			got, mutations/checkpointEvery-1)
+			got, mutations/checkpointEvery)
 	}
 	if stats.AutomaticCheckpoints != baseline.AutomaticCheckpoints ||
 		stats.JournalDeltaFullFallbacks != baseline.JournalDeltaFullFallbacks {
 		t.Fatalf("non-aligned carry forced persistence: before=%+v after=%+v",
 			baseline, stats)
 	}
-	wantPhysical := physicalBase + durableAfterMutation
-	if got := coll.committer.DurableGeneration(); got != wantPhysical {
-		t.Fatalf("physical durable = %d, want %d", got, wantPhysical)
+	if got := coll.committer.DurableGeneration(); got != resourceRoot {
+		t.Fatalf("physical durable = %d, want resource root %d", got, resourceRoot)
+	}
+	if got := stats.PrimaryOverlayCheckpointFolds -
+		baseline.PrimaryOverlayCheckpointFolds; got != 0 {
+		t.Fatalf("resource drain checkpoint folds = %d, want 0", got)
+	}
+	if available := coll.cache.DirtyCapacityAvailable(); available < coll.options.maxTransactionBytes {
+		t.Fatalf("resource drain dirty headroom = %d, want >= %d",
+			available, coll.options.maxTransactionBytes)
 	}
 
 	// Losing the unsynced append is legal buffered-visible behavior.
@@ -1840,13 +1910,94 @@ func TestBufferedJournalDeltaBarrierFailureOutcomeUnknownMayReplay(t *testing.T)
 	}
 }
 
+// TestBufferedJournalDeltaResourceDrainSuffixSyncFailureMayReplay crosses both
+// barriers in the resource-only drain. The older staged root and its recycle
+// fence succeed, then the current suffix is appended and its Sync fails. The
+// physical root and durable watermark therefore stop at the older cut, while
+// the appended target has an unknown crash outcome and poisons the collection.
+func TestBufferedJournalDeltaResourceDrainSuffixSyncFailureMayReplay(t *testing.T) {
+	options := journalDeltaTestOptions()
+	getFault, restoreFault := installJournalFaultSeam(t)
+	defer restoreFault()
+	coll := buildTemplateHeavyOverlayCollection(t, t.TempDir(), 320, options)
+	rootLazyBufferedJournal(t, coll)
+	fault := getFault()
+	if fault == nil {
+		t.Fatal("journal fault seam was not installed")
+	}
+	path := coll.file.Name()
+	keyString := templateHeavyOverlayKey(20)
+	key := []byte(keyString)
+	var finalRaw []byte
+	for mutation := 1; mutation <= journalDeltaTestPressureMutations+1; mutation++ {
+		finalRaw = journalDeltaGroupDoc(20, 40+mutation&1)
+		if created, err := coll.Put(key, finalRaw); err != nil || created {
+			t.Fatalf("Put %d = %v,%v", mutation, created, err)
+		}
+	}
+	target := coll.Generation()
+	stagedGeneration := coll.committer.PublishedGeneration()
+	if stagedGeneration != target-1 ||
+		coll.bufferedJournalDeltaPhysicalDrainReason(0) !=
+			bufferedJournalDeltaDrainResource {
+		t.Fatalf("staged/target/reason = %d/%d/%d, want target-1/target/resource",
+			stagedGeneration, target,
+			coll.bufferedJournalDeltaPhysicalDrainReason(0))
+	}
+
+	beforeAppends, beforeSyncs := fault.Appends(), fault.Syncs()
+	fault.Program(storeio.JournalFaultPlan{
+		Phase:     storeio.JournalFaultSyncError,
+		SyncIndex: beforeSyncs + 1,
+	})
+	flushErr := coll.Flush()
+	requireUnknownJournalOutcome(t, flushErr)
+	if !fault.Faulted() {
+		t.Fatal("programmed suffix sync fault never fired")
+	}
+	if got := fault.Appends(); got != beforeAppends+1 {
+		t.Fatalf("suffix appends = %d, want 1", got-beforeAppends)
+	}
+	if got := fault.Syncs(); got != beforeSyncs+2 {
+		t.Fatalf("resource/suffix syncs = %d, want 2", got-beforeSyncs)
+	}
+	if got := coll.committer.DurableGeneration(); got != stagedGeneration {
+		t.Fatalf("physical durable = %d, want staged %d", got, stagedGeneration)
+	}
+	if got := coll.journalDeltaGeneration.Load(); got != stagedGeneration {
+		t.Fatalf("journal durable = %d, want staged %d", got, stagedGeneration)
+	}
+	if got := coll.journalDeltaAppendedGeneration.Load(); got != target {
+		t.Fatalf("journal appended = %d, want target %d", got, target)
+	}
+	requireUnknownJournalOutcome(t, coll.PersistenceError())
+
+	image := captureJournalImage(t, path)
+	if err := coll.Close(); !errors.Is(err, flushErr) {
+		t.Fatalf("Close after poison = %v, want %v", err, flushErr)
+	}
+	recovered := reopenJournalImage(t, options, image)
+	if got := recovered.Generation(); got != target {
+		t.Fatalf("replayed generation = %d, want %d", got, target)
+	}
+	requireJournalKey(t, recovered, keyString, journalDeltaCanonical(t, finalRaw))
+	group := 40 + (journalDeltaTestPressureMutations+1)&1
+	got := primaryExactTestKeys(
+		t, recovered, "group", primaryExactTestNeedle(t, fmt.Sprintf("%d", group)),
+	)
+	if !slices.Equal(got, []string{keyString}) {
+		t.Fatalf("replayed exact index group=%d: got %v want [%s]",
+			group, got, keyString)
+	}
+}
+
 // TestBufferedJournalDeltaSyncFailureIsSticky proves the logical durable
 // watermark advances only after the journal barrier. Pressure first carries a
 // complete effective indexed-overlay window without syncing. The following
-// Flush takes the scheduled physical-drain path, whose first journal barrier
-// fails before the one-record suffix is admitted. Neither watermark reaches
-// the target, and every later
-// write/checkpoint/Close returns the same poison.
+// Flush takes the scheduled resource-drain path, whose first journal barrier
+// fails while recycling the now-durable older staged root and before the
+// one-record suffix is admitted. Neither watermark reaches the target, and
+// every later write/checkpoint/Close returns the same poison.
 func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	options := journalDeltaTestOptions()
 	getFault, restoreFault := installJournalFaultSeam(t)
@@ -1867,6 +2018,10 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	}
 	before := coll.journalDeltaGeneration.Load()
 	target := coll.Generation()
+	stagedGeneration := coll.committer.PublishedGeneration()
+	if stagedGeneration != target-1 {
+		t.Fatalf("staged generation = %d, want %d", stagedGeneration, target-1)
+	}
 	if got := coll.journalDeltaAppendedGeneration.Load(); got != target-1 {
 		t.Fatalf("pressure appended generation = %d, want %d", got, target-1)
 	}
@@ -1885,9 +2040,10 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	if flushErr == nil || !fault.Faulted() {
 		t.Fatalf("faulted delta Flush = %v, fired=%v", flushErr, fault.Faulted())
 	}
-	// This scheduled physical-drain path has already made target durable in the
-	// primary root; the fault is the following journal recycle barrier, not an
-	// append-then-sync acknowledgement. Its data outcome is therefore definite.
+	// The resource drain has made the older staged cut durable in the primary
+	// root; the fault is its following journal recycle barrier, not an
+	// append-then-sync acknowledgement. Its data outcome is therefore definite,
+	// while the current suffix remains unappended and unacknowledged.
 	if errors.Is(flushErr, ErrCommitOutcomeUnknown) {
 		t.Fatalf("post-root recycle failure misclassified as unknown: %v", flushErr)
 	}
@@ -1905,6 +2061,10 @@ func TestBufferedJournalDeltaSyncFailureIsSticky(t *testing.T) {
 	}
 	if got := coll.journalDeltaAppendedGeneration.Load(); got != target-1 {
 		t.Fatalf("failed barrier appended generation = %d, want %d", got, target-1)
+	}
+	if got := coll.committer.DurableGeneration(); got != stagedGeneration {
+		t.Fatalf("failed barrier physical durable = %d, want staged %d",
+			got, stagedGeneration)
 	}
 	if persistence := coll.PersistenceError(); !errors.Is(flushErr, persistence) {
 		t.Fatalf("PersistenceError=%v, Flush=%v", persistence, flushErr)
@@ -2280,8 +2440,9 @@ func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 		t.Fatalf("pressure issued %d journal sync(s), want 0",
 			got-beforeSyncs)
 	}
-	physicalDrainRequired :=
-		coll.bufferedJournalDeltaPhysicalDrainNeeded(0)
+	drainReason := coll.bufferedJournalDeltaPhysicalDrainReason(0)
+	physicalDrainRequired := drainReason != 0
+	stagedGeneration := coll.committer.PublishedGeneration()
 	firstCanonical := []byte(journalDeltaCanonical(t, first))
 	if got, found, err := coll.AppendRaw(nil, key); err != nil || !found ||
 		!bytes.Equal(got, firstCanonical) {
@@ -2294,6 +2455,9 @@ func TestBufferedJournalDeltaOverlayPressureCarriesUnsynced(t *testing.T) {
 	wantPhysical := before
 	if physicalDrainRequired {
 		wantPhysical = target
+		if drainReason == bufferedJournalDeltaDrainResource {
+			wantPhysical = stagedGeneration
+		}
 	}
 	if got := coll.committer.DurableGeneration(); got != wantPhysical {
 		t.Fatalf("pressure Flush physical durable = %d, want %d", got, wantPhysical)
