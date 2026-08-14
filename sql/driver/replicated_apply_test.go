@@ -52,10 +52,7 @@ func bindReplicatedApplyTestRoot(
 ) (string, *Database, ReplicatedShardStoreIdentity) {
 	t.Helper()
 	path, database, binding, _ := prepareReplicatedTestRoot(t, name, false)
-	identity, err := database.BindReplicatedShardStore(binding, "docs")
-	if err != nil {
-		t.Fatalf("BindReplicatedShardStore: %v", err)
-	}
+	identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	return path, database, identity
 }
 
@@ -258,7 +255,8 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if identity.Format != ReplicatedApplyFormat || identity.Storage == "" ||
 		identity.ValidationDigest == ([32]byte{}) || identity.Placement != options.Placement ||
 		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
-		identity.TxnLimits != options.TxnLimits || identity.MaxCompletions != options.MaxCompletions {
+		identity.TxnLimits != options.TxnLimits || identity.MaxCompletions != options.MaxCompletions ||
+		identity.Sidecars != canonicalReplicatedApplySidecars() {
 		t.Fatalf("apply identity = %+v", identity)
 	}
 	if got, err := claim.Identity(); err != nil || got != identity {
@@ -268,6 +266,9 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	core.mu.RLock()
 	hiddenPath := core.replicatedApplyPath(core.catalog.ReplicatedApply)
 	if core.catalog.ReplicatedApply == nil || core.replicatedApplyCollection == nil ||
+		core.catalog.ReplicatedApply.Sidecars != canonicalReplicatedApplySidecars() ||
+		core.replicatedApplyCollection.SealedRecoveryJournalBytes() !=
+			ReplicatedSystemRecoveryJournalBytes ||
 		len(core.catalog.Tables) != 1 || core.tables["docs"] == nil {
 		core.mu.RUnlock()
 		t.Fatal("activation did not retain one visible table plus hidden participant")
@@ -931,6 +932,15 @@ func TestReplicatedApplyPreflightAndPreRecoveryFences(t *testing.T) {
 				}
 				apply.Placement.Range.End.Max = false
 			}},
+			{"system journal sidecar", func(apply *ReplicatedApplyIdentity, _ *ReplicatedShardStoreIdentity) {
+				apply.Sidecars.SystemRecoveryJournalBytes--
+			}},
+			{"user journal sidecar", func(_ *ReplicatedApplyIdentity, base *ReplicatedShardStoreIdentity) {
+				base.Sidecars.UserRecoveryJournalBytes--
+			}},
+			{"transaction marker sidecar", func(_ *ReplicatedApplyIdentity, base *ReplicatedShardStoreIdentity) {
+				base.Sidecars.TransactionMarkerBytes++
+			}},
 			{"allocation generation", func(_ *ReplicatedApplyIdentity, base *ReplicatedShardStoreIdentity) {
 				base.Binding.AllocationGeneration++
 			}},
@@ -1113,10 +1123,14 @@ func TestReplicatedApplyIdentityStrictGrammar(t *testing.T) {
 		raw  []byte
 	}{
 		{"duplicate", bytes.Replace(raw, []byte(`{"format":`), []byte(`{"format":1,"format":`), 1)},
+		{"null_format", bytes.Replace(raw, []byte(`{"format":0`), []byte(`{"format":null`), 1)},
 		{"null_digest", bytes.Replace(raw, fields["validation_digest"], []byte("null"), 1)},
 		{"uppercase_digest", bytes.Replace(raw, fields["validation_digest"], bytes.ToUpper(fields["validation_digest"]), 1)},
 		{"null_placement", bytes.Replace(raw, fields["placement"], []byte("null"), 1)},
 		{"nested_duplicate", bytes.Replace(raw, []byte(`"placement":{"format":`), []byte(`"placement":{"format":1,"format":`), 1)},
+		{"nested_null_format", bytes.Replace(
+			raw, []byte(`"placement":{"format":0`), []byte(`"placement":{"format":null`), 1,
+		)},
 		{"nested_unknown", bytes.Replace(raw, []byte(`"range_end_max":true`), []byte(`"unknown":0,"range_end_max":true`), 1)},
 	}
 	missing := make(map[string]json.RawMessage, len(fields)-1)
@@ -1247,6 +1261,8 @@ func TestReplicatedApplyClaimConnectorLifetime(t *testing.T) {
 }
 
 func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing.T) {
+	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
+	defer restore()
 	_, database, base := bindReplicatedApplyTestRoot(t, "observer-unknown")
 	claim, _, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
@@ -1268,8 +1284,6 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 	})
 	clock := &database.connector.db.tables["docs"].conflicts
 	before := clock.observe()
-	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
-	defer restore()
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		t.Fatalf("decision-sync apply = %v, want unknown outcome", err)
 	}
@@ -1401,6 +1415,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 			MaxKeyBytes: 123, MaxDocumentBytes: 456,
 			MaxBatchDocuments: 7, MaxBatchBytes: 890,
 		},
+		Sidecars: canonicalReplicatedShardStoreSidecars(),
 	}
 	placement := ReplicatedPlacementProfile{
 		Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
@@ -1411,7 +1426,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "d336346fcf5512c29ec40bbb713d6fa7b7ce9228c3909ebad362cadbb0788c5f"
+	const wantDigest = "0561d23db26f2c8bd320819912c71aba1f9292c6c78dc3929c02ec55c11e4496"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -1479,12 +1494,13 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 				End:   distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x90}},
 			},
 		},
+		Sidecars: canonicalReplicatedApplySidecars(),
 	}
 	encoded, err := json.Marshal(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":1,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":1,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false}}`
+	const want = `{"format":0,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
 	if string(encoded) != want {
 		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
@@ -1495,6 +1511,57 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	var decoded ReplicatedApplyIdentity
 	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != identity {
 		t.Fatalf("identity round trip = %+v,%v", decoded, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		sidecar json.RawMessage
+		remove  bool
+	}{
+		{name: "missing", remove: true},
+		{name: "unknown", sidecar: json.RawMessage(`{"unknown":1,"system_recovery_journal_bytes":655872}`)},
+		{name: "nested_missing", sidecar: json.RawMessage(`{}`)},
+		{name: "mismatch", sidecar: json.RawMessage(`{"system_recovery_journal_bytes":655360}`)},
+	} {
+		t.Run("sidecars_"+test.name, func(t *testing.T) {
+			changed := make(map[string]json.RawMessage, len(fields))
+			for name, value := range fields {
+				changed[name] = bytes.Clone(value)
+			}
+			if test.remove {
+				delete(changed, "sidecars")
+			} else {
+				changed["sidecars"] = test.sidecar
+			}
+			raw, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(raw, new(ReplicatedApplyIdentity)); err == nil {
+				t.Fatalf("accepted noncanonical apply sidecars: %s", raw)
+			}
+		})
+	}
+	for name, raw := range map[string][]byte{
+		"format_null": bytes.Replace(
+			encoded, []byte(`{"format":0`), []byte(`{"format":null`), 1,
+		),
+		"placement_format_null": bytes.Replace(
+			encoded, []byte(`"placement":{"format":0`),
+			[]byte(`"placement":{"format":null`), 1,
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if bytes.Equal(raw, encoded) {
+				t.Fatal("format-null mutation did not match")
+			}
+			if err := json.Unmarshal(raw, new(ReplicatedApplyIdentity)); err == nil {
+				t.Fatalf("accepted null current-format sentinel: %s", raw)
+			}
+		})
 	}
 }
 

@@ -435,6 +435,16 @@ func reconcileDatabaseTxnAfterOpens(
 		}
 	}
 	if discharged && !holds && !directoryHolds {
+		if recovery.log != nil && recovery.log.opts.SealedCapacity {
+			// A sealed marker is part of the caller-qualified physical profile.
+			// Keep the already-proved file instead of unlinking and immediately
+			// reminting it on every exact open. Its discharged records are harmless;
+			// ordinary capacity pressure recycles them under the complete catalog.
+			recovery.log.commitMu.Lock()
+			recovery.log.undischarged = 0
+			recovery.log.commitMu.Unlock()
+			return nil
+		}
 		// L4: remove residue. Re-evaluate from the live opens; a crash around
 		// the unlink re-enters open and observes the same predicate.
 		if recovery.log != nil {

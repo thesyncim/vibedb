@@ -623,8 +623,7 @@ func validateRecoveryJournalGeometry(h RecoveryJournalHeader) error {
 	if !validPhysicalPageSize(h.PageSize) {
 		return fmt.Errorf("%w: page size", ErrRecoveryJournalCorrupt)
 	}
-	if h.SectorSize < RecoveryJournalMinSectorSize ||
-		h.SectorSize&(h.SectorSize-1) != 0 ||
+	if h.SectorSize != RecoveryJournalMinSectorSize ||
 		h.SectorSize > h.PageSize || h.PageSize%h.SectorSize != 0 {
 		return fmt.Errorf("%w: sector size", ErrRecoveryJournalCorrupt)
 	}

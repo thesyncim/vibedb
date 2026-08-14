@@ -72,12 +72,14 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	authority := testAuthorityProfile()
 	path, database, _ := prepareSQLRoot(t, walIdentity, "apply")
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind apply SQL root", err)
 	if err != nil {
 		t.Fatalf("BindPreparedSQL: %v", err)
 	}
 	claim, applyIdentity, err := OpenPreparedApply(
 		wal, database, authority, base, testApplyOptions(),
 	)
+	skipIfStrictAllocationUnsupported(t, "open prepared apply", err)
 	if err != nil {
 		t.Fatalf("OpenPreparedApply: %v", err)
 	}
@@ -114,6 +116,7 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	reopened, reopenedClaim, err := OpenBoundSQLWithApply(
 		path, wal, authority, base, applyIdentity,
 	)
+	skipIfStrictAllocationUnsupported(t, "reopen SQL root with apply", err)
 	if err != nil {
 		t.Fatalf("OpenBoundSQLWithApply: %v", err)
 	}
@@ -155,11 +158,13 @@ func TestOpenBoundSQLWithApplyForSettlementPropagatesPlacement(t *testing.T) {
 	authority := testAuthorityProfile()
 	path, database, _ := prepareSQLRoot(t, walIdentity, "apply-settlement")
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind settlement SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
 	claim, identity, err := OpenPreparedApply(wal, database, authority, base, options)
+	skipIfStrictAllocationUnsupported(t, "open settlement apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +178,7 @@ func TestOpenBoundSQLWithApplyForSettlementPropagatesPlacement(t *testing.T) {
 	reopened, reopenedClaim, settled, err := OpenBoundSQLWithApplyForSettlement(
 		path, wal, authority, base, options,
 	)
+	skipIfStrictAllocationUnsupported(t, "settle SQL root with apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}

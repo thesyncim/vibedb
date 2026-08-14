@@ -99,14 +99,12 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 		t.Fatalf("sealed empty-catalog recovery = %d collections, log %p",
 			len(collections), reopened)
 	}
-	// Empty-catalog reconciliation removes the discharged marker. Re-mint it
-	// with the exact profile before asserting that a different exact profile is
-	// rejected on open.
-	reopened.commitMu.Lock()
-	err = reopened.ensureMintedLocked()
-	reopened.commitMu.Unlock()
-	if err != nil {
-		requireSealedSidecarEnvironment(t, err)
+	// A sealed marker is part of the exact physical profile. Empty-catalog
+	// reconciliation retains the already-qualified file instead of unlinking it
+	// and forcing an identical remint on every open.
+	if reopened.marker == nil || !reopened.marker.Header().SealedCapacity ||
+		reopened.marker.Header().Capacity != capacity {
+		t.Fatalf("recovered sealed marker = %v", reopened.marker)
 	}
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
@@ -116,5 +114,63 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 		SealedCapacity: true,
 	}, nil); !errors.Is(err, ErrSealedJournalCapacity) {
 		t.Fatalf("wrong sealed marker recovery = %v, want mismatch", err)
+	}
+}
+
+func TestSealedTxnLogRetainsDischargedWindowUntilPressureRecycle(t *testing.T) {
+	const capacity = uint64(64 * storeio.TxnMarkerMinSectorSize)
+	dir := t.TempDir()
+	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true}
+	log, err := NewTxnLog(dir, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.EnsureMinted(); err != nil {
+		requireSealedSidecarEnvironment(t, err)
+	}
+	var storeID, journalID [16]byte
+	storeID[0], journalID[0] = 1, 2
+	if _, err := log.marker.AppendDecision(1, []storeio.TxnParticipant{{
+		StoreID: storeID, JournalID: journalID, PreparedGeneration: 2,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.marker.AppendRetirement(storeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	collections, reopened, err := OpenCollectionsWithTransactions(dir, options, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collections) != 0 || reopened.marker == nil ||
+		reopened.marker.Cursor() == 0 || reopened.undischarged != 0 {
+		t.Fatalf(
+			"discharged sealed recovery = collections %d marker %p cursor %d undischarged %d",
+			len(collections), reopened.marker, reopened.marker.Cursor(), reopened.undischarged,
+		)
+	}
+	beforeEpoch := reopened.marker.Header().Epoch
+	reopened.commitMu.Lock()
+	err = reopened.foldLaggardsAndRecycleLocked()
+	reopened.commitMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.marker.Cursor() != 0 ||
+		reopened.marker.Header().Epoch != beforeEpoch+1 {
+		t.Fatalf(
+			"pressure recycle = epoch %d cursor %d, want %d/0",
+			reopened.marker.Header().Epoch, reopened.marker.Cursor(), beforeEpoch+1,
+		)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

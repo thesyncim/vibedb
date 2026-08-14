@@ -59,12 +59,14 @@ func newRuntimeFixtureWithOptions(
 	_, database, _ := prepareSQLRoot(t, identity, "runtime")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind runtime SQL", err)
 	if err != nil {
 		t.Fatalf("bind runtime SQL: %v", err)
 	}
 	applyOptions := testApplyOptions()
 	applyOptions.MaxCompletions = uint64(options.MaxEntries)
 	apply, _, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
+	skipIfStrictAllocationUnsupported(t, "open runtime apply", err)
 	if err != nil {
 		t.Fatalf("open runtime apply: %v", err)
 	}
@@ -109,12 +111,14 @@ func TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation(t *testing.T) {
 	_, database, _ := prepareSQLRoot(t, identity, "runtime-owner")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind runtime owner SQL", err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	applyOptions := testApplyOptions()
 	applyOptions.MaxCompletions = uint64(options.MaxEntries)
 	apply, _, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
+	skipIfStrictAllocationUnsupported(t, "open runtime owner apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}

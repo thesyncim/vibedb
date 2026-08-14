@@ -27,14 +27,14 @@ const (
 	// ReplicatedApplyFormat is the current catalog-owned hidden apply-store
 	// profile. It is deliberately separate from the public SQL table catalog:
 	// the hidden collection is a state-machine participant, never a SQL relation.
-	ReplicatedApplyFormat uint16 = 1
+	ReplicatedApplyFormat uint16 = 0
 
 	// ReplicatedPlacementProfileFormat is the current exact key-to-shard
 	// validation profile. It is deliberately limited to the sole primary-key
 	// column.
-	ReplicatedPlacementProfileFormat uint16 = 1
+	ReplicatedPlacementProfileFormat uint16 = 0
 
-	replicatedApplyKeyProfile uint16 = 1
+	replicatedApplyKeyProfile uint16 = 0
 )
 
 var (
@@ -79,6 +79,7 @@ type ReplicatedApplyIdentity struct {
 	MaxCompletions    uint64
 	TxnLimits         durable.TxnLimits
 	Placement         ReplicatedPlacementProfile
+	Sidecars          ReplicatedApplySidecarProfile
 }
 
 // ReplicatedApplyCapacityProfile is the detached, constant-size apply cut used
@@ -122,6 +123,7 @@ type replicatedApplyMeta struct {
 	TxnMaxDocuments   int
 	TxnMaxBytes       int64
 	Placement         ReplicatedPlacementProfile
+	Sidecars          ReplicatedApplySidecarProfile
 }
 
 // OpenReplicatedShardStoreWithApply opens an activated root only when both the
@@ -224,23 +226,29 @@ func replicatedApplySystemLimits() ReplicatedShardStoreLimits {
 
 func replicatedApplyDurableOptions() durable.Options {
 	limits := replicatedApplySystemLimits()
+	sidecars := canonicalReplicatedApplySidecars()
 	return durable.Options{
-		Durability:        durable.DurabilitySync,
-		MaxKeyBytes:       limits.MaxKeyBytes,
-		MaxDocumentBytes:  limits.MaxDocumentBytes,
-		MaxBatchDocuments: limits.MaxBatchDocuments,
-		MaxBatchBytes:     limits.MaxBatchBytes,
+		Durability:                 durable.DurabilitySync,
+		MaxKeyBytes:                limits.MaxKeyBytes,
+		MaxDocumentBytes:           limits.MaxDocumentBytes,
+		MaxBatchDocuments:          limits.MaxBatchDocuments,
+		MaxBatchBytes:              limits.MaxBatchBytes,
+		SealedRecoveryJournalBytes: sidecars.SystemRecoveryJournalBytes,
 	}
 }
 
-func validateReplicatedApplyCollection(collection *durable.Collection) error {
+func validateReplicatedApplyCollection(
+	collection *durable.Collection,
+	sidecars ReplicatedApplySidecarProfile,
+) error {
 	limits := replicatedApplySystemLimits()
 	if collection == nil || collection.HasSchema() || collection.HasIndexes() ||
 		!collection.HasSynchronousDurability() || !collection.SupportsUpdate() ||
 		collection.MaxKeyBytes() != limits.MaxKeyBytes ||
 		collection.MaxDocumentBytes() != limits.MaxDocumentBytes ||
 		collection.MaxBatchDocuments() != limits.MaxBatchDocuments ||
-		collection.MaxBatchBytes() != limits.MaxBatchBytes {
+		collection.MaxBatchBytes() != limits.MaxBatchBytes ||
+		collection.SealedRecoveryJournalBytes() != sidecars.SystemRecoveryJournalBytes {
 		return fmt.Errorf("%w: hidden collection profile", ErrReplicatedApplyMismatch)
 	}
 	return nil
@@ -306,6 +314,20 @@ func (d *Database) openReplicatedApply(
 	if err := core.settleCatalogLocked(); err != nil {
 		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
 			"vibedb: settle SQL catalog before replicated apply: %w", err,
+		)
+	}
+	wantTxnOptions := durable.TxnLogOptions{
+		Capacity:       expected.Sidecars.TransactionMarkerBytes,
+		SealedCapacity: true,
+	}
+	if core.txnLog == nil || core.txnLog.Options() != wantTxnOptions {
+		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+			"%w: transaction-marker profile", ErrReplicatedApplyMismatch,
+		)
+	}
+	if err := core.txnLog.EnsureMinted(); err != nil {
+		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+			"vibedb: qualify replicated transaction marker: %w", err,
 		)
 	}
 
@@ -482,6 +504,10 @@ func (d *database) createReplicatedApplyStorageLocked(
 		return ReplicatedApplyIdentity{}, fmt.Errorf(
 			"vibedb: publish replicated apply storage: %w", err,
 		)
+	}
+	if err := validateReplicatedApplyCollection(collection, meta.Sidecars); err != nil {
+		return ReplicatedApplyIdentity{}, errors.Join(err,
+			d.discardUnpublishedStorageLocked(collection, file, path))
 	}
 	if err := d.txnLog.AdoptCollection(collection); err != nil {
 		return ReplicatedApplyIdentity{}, errors.Join(err,
@@ -941,6 +967,7 @@ func newReplicatedApplyMeta(
 		TxnMaxDocuments:   options.TxnLimits.MaxDocuments,
 		TxnMaxBytes:       options.TxnLimits.MaxBytes,
 		Placement:         ownedReplicatedPlacementProfile(options.Placement),
+		Sidecars:          canonicalReplicatedApplySidecars(),
 	}
 }
 
@@ -1039,6 +1066,7 @@ func (m replicatedApplyMeta) identity() ReplicatedApplyIdentity {
 		ValidationProfile: m.ValidationProfile, ValidationDigest: m.ValidationDigest,
 		SystemLimits: m.SystemLimits, MaxCompletions: m.MaxCompletions,
 		TxnLimits: m.options().TxnLimits, Placement: ownedReplicatedPlacementProfile(m.Placement),
+		Sidecars: m.Sidecars,
 	}
 }
 
@@ -1052,6 +1080,7 @@ func replicatedApplyMetaFromIdentity(identity ReplicatedApplyIdentity) replicate
 		TxnMaxDocuments:   identity.TxnLimits.MaxDocuments,
 		TxnMaxBytes:       identity.TxnLimits.MaxBytes,
 		Placement:         ownedReplicatedPlacementProfile(identity.Placement),
+		Sidecars:          identity.Sidecars,
 	}
 }
 
@@ -1086,6 +1115,9 @@ func validateReplicatedApplyMeta(
 	if m.SystemLimits != replicatedApplySystemLimits() {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
+	if err := validateReplicatedApplySidecarsForLimits(m.Sidecars, m.SystemLimits); err != nil {
+		return err
+	}
 	options := m.options()
 	if err := validateReplicatedApplyOptions(*identity, options); err != nil {
 		return err
@@ -1101,16 +1133,17 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	type encoded struct {
-		Format            uint16                     `json:"format"`
-		Storage           string                     `json:"storage"`
-		ValidationProfile uint8                      `json:"validation_profile"`
-		ValidationDigest  string                     `json:"validation_digest"`
-		SystemLimits      ReplicatedShardStoreLimits `json:"system_limits"`
-		MaxCompletions    uint64                     `json:"max_completions"`
-		TxnMaxCollections int                        `json:"txn_max_collections"`
-		TxnMaxDocuments   int                        `json:"txn_max_documents"`
-		TxnMaxBytes       int64                      `json:"txn_max_bytes"`
-		Placement         ReplicatedPlacementProfile `json:"placement"`
+		Format            uint16                        `json:"format"`
+		Storage           string                        `json:"storage"`
+		ValidationProfile uint8                         `json:"validation_profile"`
+		ValidationDigest  string                        `json:"validation_digest"`
+		SystemLimits      ReplicatedShardStoreLimits    `json:"system_limits"`
+		MaxCompletions    uint64                        `json:"max_completions"`
+		TxnMaxCollections int                           `json:"txn_max_collections"`
+		TxnMaxDocuments   int                           `json:"txn_max_documents"`
+		TxnMaxBytes       int64                         `json:"txn_max_bytes"`
+		Placement         ReplicatedPlacementProfile    `json:"placement"`
+		Sidecars          ReplicatedApplySidecarProfile `json:"sidecars"`
 	}
 	return json.Marshal(encoded{
 		Format: m.Format, Storage: m.Storage,
@@ -1122,6 +1155,7 @@ func (m replicatedApplyMeta) MarshalJSON() ([]byte, error) {
 		TxnMaxDocuments:   m.TxnMaxDocuments,
 		TxnMaxBytes:       m.TxnMaxBytes,
 		Placement:         m.Placement,
+		Sidecars:          m.Sidecars,
 	})
 }
 
@@ -1170,7 +1204,9 @@ func (profile *ReplicatedPlacementProfile) UnmarshalJSON(data []byte) error {
 		present[name] = true
 		switch name {
 		case "format":
-			return d.Decode(&decoded.Format)
+			return decodeRequiredCatalogUint16(
+				d, "replicated placement format", &decoded.Format,
+			)
 		case "shard_key":
 			return d.Decode(&decoded.ShardKey)
 		case "tuple_version":
@@ -1228,12 +1264,14 @@ func decodeReplicatedPlacementPoint(
 
 func (m *replicatedApplyMeta) UnmarshalJSON(data []byte) error {
 	var decoded replicatedApplyMeta
-	present := make(map[string]bool, 10)
+	present := make(map[string]bool, 11)
 	err := decodeCatalogObject(data, "replicated apply", func(name string, d *json.Decoder) error {
 		present[name] = true
 		switch name {
 		case "format":
-			return d.Decode(&decoded.Format)
+			return decodeRequiredCatalogUint16(
+				d, "replicated apply format", &decoded.Format,
+			)
 		case "storage":
 			return d.Decode(&decoded.Storage)
 		case "validation_profile":
@@ -1262,6 +1300,8 @@ func (m *replicatedApplyMeta) UnmarshalJSON(data []byte) error {
 			return d.Decode(&decoded.TxnMaxBytes)
 		case "placement":
 			return d.Decode(&decoded.Placement)
+		case "sidecars":
+			return d.Decode(&decoded.Sidecars)
 		default:
 			return unknownCatalogMember("replicated apply", name)
 		}
@@ -1272,7 +1312,7 @@ func (m *replicatedApplyMeta) UnmarshalJSON(data []byte) error {
 	for _, name := range []string{
 		"format", "storage", "validation_profile", "validation_digest",
 		"system_limits", "max_completions", "txn_max_collections",
-		"txn_max_documents", "txn_max_bytes", "placement",
+		"txn_max_documents", "txn_max_bytes", "placement", "sidecars",
 	} {
 		if !present[name] {
 			return fmt.Errorf("vibedb: replicated apply is missing member %q", name)

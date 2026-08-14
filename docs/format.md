@@ -3,8 +3,8 @@
 This document maps the one mutable format written by `store/durable` and
 decoded by `internal/storeio`. The codecs are the byte-level authority. All
 multi-byte integers are little-endian, all reserved bytes are zero, and all
-format-version fields inside the primary store file contain
-`DevelopmentFormatVersion == 0`. The separate recovery-journal and transaction-
+format sentinels inside the primary store file contain numeric `0`
+(`DevelopmentFormatVersion`). The separate recovery-journal and transaction-
 decision sidecars each use one current grammar. In both sidecar headers,
 `Format` is a corruption sentinel that must contain numeric `0`; every other
 value is rejected. StateRoot and the current primary layout are unchanged by
@@ -13,8 +13,12 @@ decision-log sidecar and kind-4 conditional journal records.
 
 The project is unreleased. A primary-file schema change replaces the current
 grammar and regenerates its golden images. There are no migration decoders,
-alternate primary-file development versions, or retired page layouts. The two
+alternate primary-file grammars, or retired page layouts. The two
 sidecar codecs likewise decode only the current grammars described here.
+
+The SQL catalog follows the same current-only rule. The `format` members of
+`replicated_shard_store`, `replicated_apply`, and its placement profile are
+numeric-zero corruption sentinels. Every other SQL catalog grammar is rejected.
 
 ## File layout
 
@@ -343,6 +347,30 @@ It then reproves the complete prefix, synchronizes that proof, checks exact EOF
 again, and only then scans records. It never repairs an EOF mismatch by
 truncating or extending the sidecar.
 
+The current replicated SQL catalog fixes three canonical record-region sizes:
+
+| Owner | Sidecar record region | Complete file |
+| --- | ---: | ---: |
+| base binding | user recovery journal: `16,794,624` | `16,795,648` |
+| base binding | transaction marker: `1,048,576` | `1,049,600` |
+| apply activation | system recovery journal: `655,872` | `656,896` |
+
+The complete file adds the two 512-byte headers (`1,024` bytes) to each record
+region. Bind accepts only a sole schema-free/index-free unmaterialized user
+table with no existing transaction marker. It creates a fresh sealed user
+storage incarnation; it never converts a materialized collection or ordinary
+sidecar in place. One catalog cut publishes the replacement table, the exact
+sidecar profile, and the complete replicated identity while `txn.vtm` remains
+absent. The sealed marker may be minted only after the catalog rename and its
+parent-directory durability fence succeed.
+
+The marker region holds 2,048 current 512-byte, two-participant decisions.
+
+Replicated exact open and settlement validate the numeric-zero SQL catalog
+grammar and all three persisted sidecar identities before namespace or
+transaction recovery, then pass the exact sealed capacities to durable open.
+An ordinary zero-option open is not a fallback for this profile.
+
 Strict allocation is Linux-only. It first performs mode-zero
 `fallocate(fd, 0, 0, total)` over the complete prefix, repairing holes and
 establishing backing for every byte, then applies
@@ -363,8 +391,9 @@ The certificate assumes exclusive allocation ownership. Callers and unrelated
 processes must not truncate, extend, hole-punch, reflink-clone, or otherwise
 change either sealed sidecar outside its owning API. This is only a storage
 foundation for the recovery journal and transaction decision log. It defines
-no SQL capacity identity, reserves no Raft log, snapshot, or range capacity,
-and does not certify any node or range to serve traffic.
+only the catalog-named SQL sidecar allocation identities above. It reserves no
+collection main-file, Raft log, snapshot, or range capacity, and does not
+certify any node or range to serve traffic.
 
 ### Online block reclamation
 

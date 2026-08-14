@@ -87,12 +87,33 @@ keeps a separate 16 MiB ceiling. These are allocation and hostile-header clamps;
 arbitrary larger durable collection options remain unsealable and fail option
 normalization.
 
+The one current numeric-zero replicated SQL catalog grammar fixes exact sealed
+record-region capacities rather than accepting caller-selected substitutes:
+
+| Catalog owner | Record region | Complete sidecar including headers |
+| --- | ---: | ---: |
+| base binding, user recovery journal | `16,794,624` | `16,795,648` |
+| base binding, transaction marker | `1,048,576` | `1,049,600` |
+| apply activation, system recovery journal | `655,872` | `656,896` |
+
+Bind requires a sole schema-free/index-free unmaterialized user table and an
+absent transaction marker. It creates a fresh sealed user-storage incarnation
+and publishes that replacement, the complete replicated identity, and the
+exact base sidecar profile in one catalog cut. It never converts an existing
+materialized collection, ordinary recovery journal, or marker in place. The
+sealed marker is minted only after the catalog rename and parent-directory
+durability fence succeed.
+
+Its 1 MiB record region holds 2,048 current 512-byte, two-participant
+decisions, avoiding a marker recycle/fold for each ordinary apply.
+
 `NewTxnLog` accepts `TxnLogOptions` only for a fresh catalog and refuses any
 pre-existing `txn.vtm`. Existing decision logs reopen only through
 `OpenCollectionsWithTransactions`, which requires the complete live collection
-catalog before replay or recycle. `durable.Database` does not yet thread sealed
-transaction-log options, so this checkpoint makes no sealed decision-log
-promise for that wrapper.
+catalog before replay or recycle. Replicated SQL exact open and settlement first
+validate the numeric-zero catalog grammar and persisted user/system/marker
+profiles, then pass all exact sealed options into collection and transaction
+recovery. Supplying ordinary zero options is not a fallback.
 
 Sealed create requires an empty regular file. On mutable open, an exact regular
 EOF of `1024 + N` is required before allocation proof begins. Linux then runs
@@ -115,9 +136,10 @@ serving process.
 The certificate requires exclusive allocation ownership. No caller or external
 process may truncate, extend, punch holes, reflink-clone, or otherwise alter a
 sealed sidecar outside its owner. It covers only the recovery-journal or
-decision-log file named by the option. It does not create a SQL capacity
-identity, reserve main-file or Raft log/snapshot/range space, or certify a
-node or range to serve traffic.
+decision-log file named by the option. For replicated SQL it proves only the
+catalog-named sidecar identities above; it does not reserve collection
+main-file or Raft log/snapshot/range space or certify a node or range to serve
+traffic.
 
 ## Checkpoint strengths
 

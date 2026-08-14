@@ -33,7 +33,7 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 		switch name {
 		case "version":
 			versionPresent = true
-			return decoder.Decode(&decoded.Version)
+			return decodeRequiredCatalogInt(decoder, "catalog version", &decoded.Version)
 		case "tables":
 			tablesPresent = true
 			var tables catalogTableMap
@@ -122,6 +122,38 @@ func (c *catalogFile) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func decodeRequiredCatalogInt(
+	decoder *json.Decoder,
+	label string,
+	dst *int,
+) error {
+	var value *int
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if value == nil {
+		return fmt.Errorf("vibedb: %s must not be null", label)
+	}
+	*dst = *value
+	return nil
+}
+
+func decodeRequiredCatalogUint16(
+	decoder *json.Decoder,
+	label string,
+	dst *uint16,
+) error {
+	var value *uint16
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if value == nil {
+		return fmt.Errorf("vibedb: %s must not be null", label)
+	}
+	*dst = *value
+	return nil
+}
+
 type catalogViewMap map[string]*viewMeta
 
 func (m *catalogViewMap) UnmarshalJSON(data []byte) error {
@@ -194,6 +226,8 @@ func (m *tableMeta) UnmarshalJSON(data []byte) error {
 			return decoder.Decode(&decoded.Storage)
 		case "materialized":
 			return decoder.Decode(&decoded.Materialized)
+		case "sealed_recovery_journal_bytes":
+			return decoder.Decode(&decoded.SealedRecoveryJournalBytes)
 		default:
 			return unknownCatalogMember("table metadata", name)
 		}

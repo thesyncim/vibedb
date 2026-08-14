@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,7 +21,7 @@ import (
 const (
 	// ReplicatedShardStoreFormat is the current write-once SQL catalog binding
 	// between a prepared local shard store and one replicated WAL/apply lineage.
-	ReplicatedShardStoreFormat uint16 = 1
+	ReplicatedShardStoreFormat uint16 = 0
 
 	replicatedMaxIdentityBytes     = 255
 	replicatedMaxKeyBytes          = 256
@@ -97,12 +98,16 @@ type ReplicatedShardStoreIdentity struct {
 	UserStorage    string
 	UserPrimaryKey string
 	UserLimits     ReplicatedShardStoreLimits
+	Sidecars       ReplicatedShardStoreSidecarProfile
 }
 
 // BindReplicatedShardStore permanently converts one opened, prepared local
 // shard root into replicated mode. It requires no live Sessions, exactly one
-// schema-free/index-free/view-free empty table, and no prior local serving
-// fence. An unmaterialized table is durably materialized empty before binding.
+// schema-free/index-free/view-free unmaterialized table, an absent transaction
+// marker, and no prior local serving fence. Bind creates a fresh sealed user
+// storage incarnation and publishes it with the complete identity in one
+// catalog cut; already-materialized or marker-bearing roots are rejected rather
+// than converted in place.
 // Before calling, the orchestrator must call ShardStoreIdentity and durably
 // retain its LogID together with binding and userTable; a crash after catalog
 // publication but before this method returns can then be settled through
@@ -126,6 +131,7 @@ func (d *Database) bindReplicatedShardStore(
 	if err := validateReplicatedUserTableName(userTable); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
+	sidecars := canonicalReplicatedShardStoreSidecars()
 	binding = ownedReplicatedShardStoreBinding(binding)
 	userTable = strings.Clone(userTable)
 	if d == nil || d.connector == nil {
@@ -152,7 +158,8 @@ func (d *Database) bindReplicatedShardStore(
 		return ReplicatedShardStoreIdentity{}, ErrDatabaseClosed
 	}
 	if current := core.catalog.ReplicatedShardStore; current != nil {
-		if current.Binding != binding || current.UserTable != userTable {
+		if current.Binding != binding || current.UserTable != userTable ||
+			current.Sidecars != sidecars {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: catalog is already bound", ErrReplicatedShardStoreIdentityMismatch,
 			)
@@ -160,6 +167,11 @@ func (d *Database) bindReplicatedShardStore(
 		if err := core.settleCatalogLocked(); err != nil {
 			return ownedReplicatedShardStoreIdentity(*current), fmt.Errorf(
 				"vibedb: settle replicated shard store binding: %w", err,
+			)
+		}
+		if err := core.txnLog.EnsureMinted(); err != nil {
+			return ownedReplicatedShardStoreIdentity(*current), fmt.Errorf(
+				"vibedb: qualify replicated transaction marker: %w", err,
 			)
 		}
 		return ownedReplicatedShardStoreIdentity(*current), nil
@@ -211,31 +223,104 @@ func (d *Database) bindReplicatedShardStore(
 	if err := validateReplicatedTableCatalogProfile(userTable, t); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if t.collection == nil {
-		var err error
-		t, err = core.materializeLocked(userTable, nil)
-		if err != nil {
-			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
-				"vibedb: materialize replicated user table %q: %w", userTable, err,
-			)
-		}
+	if t.collection != nil || t.file != nil || t.meta.Materialized {
+		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
+			"%w: user table %q must be unmaterialized",
+			ErrReplicatedShardStoreProfile, userTable,
+		)
 	}
-	identity, err := replicatedIdentityForTable(binding, local.LogID, userTable, t, true)
-	if err != nil {
+	if err := core.checkRetirementCapacityLocked(1); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if err := core.txnLog.ValidateCollections([]durable.NamedCollection{{
-		Name: userTable, Collection: t.collection,
-	}}); err != nil {
+	if core.txnLog == nil {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
-			"%w: transaction-log membership: %v", ErrReplicatedShardStoreProfile, err,
+			"%w: transaction log is unavailable", ErrReplicatedShardStoreProfile,
+		)
+	}
+	previousTxnOptions := core.txnLog.Options()
+	sealedTxnOptions := durable.TxnLogOptions{
+		Capacity: sidecars.TransactionMarkerBytes, SealedCapacity: true,
+	}
+	if err := core.txnLog.ReconfigureUnminted(sealedTxnOptions); err != nil {
+		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
+			"%w: transaction marker must be absent before bind: %w",
+			ErrReplicatedShardStoreProfile, err,
+		)
+	}
+	storage, err := core.newStorageIdentityLocked()
+	if err != nil {
+		return ReplicatedShardStoreIdentity{}, errors.Join(
+			err, core.txnLog.ReconfigureUnminted(previousTxnOptions),
+		)
+	}
+	meta := cloneTableMeta(t.meta)
+	meta.Storage = storage
+	meta.Materialized = false
+	meta.SealedRecoveryJournalBytes = sidecars.UserRecoveryJournalBytes
+	candidate := &table{meta: meta, schema: t.schema, primary: t.primary}
+	rollbackProfile := func(cause error) error {
+		return errors.Join(cause, core.txnLog.ReconfigureUnminted(previousTxnOptions))
+	}
+	if err := durable.ValidateOptions(durableOptions(candidate)); err != nil {
+		return ReplicatedShardStoreIdentity{}, rollbackProfile(fmt.Errorf(
+			"%w: sealed user storage options: %v",
+			ErrReplicatedShardStoreProfile, err,
+		))
+	}
+	if err := core.buildReplacementStorageLocked(
+		context.Background(), userTable, t, candidate, false,
+	); err != nil {
+		return ReplicatedShardStoreIdentity{}, rollbackProfile(err)
+	}
+	if err := core.txnLog.AdoptCollection(candidate.collection); err != nil {
+		return ReplicatedShardStoreIdentity{}, rollbackProfile(errors.Join(
+			err, core.discardTableStorageLocked(userTable, candidate),
+		))
+	}
+	rollbackCandidate := func(cause error) error {
+		detachErr := core.txnLog.DetachCollection(candidate.collection)
+		if detachErr != nil {
+			core.retired = append(core.retired, retiredTable{
+				name: userTable + " (unpublished replicated bind)",
+				path: core.tablePathForMeta(candidate.meta),
+				journal: durable.RecoveryJournalPath(
+					core.tablePathForMeta(candidate.meta),
+				),
+				file: candidate.file, collection: candidate.collection,
+			})
+			candidate.file = nil
+			candidate.collection = nil
+			return rollbackProfile(errors.Join(cause, detachErr))
+		}
+		return rollbackProfile(errors.Join(
+			cause, core.discardTableStorageLocked(userTable, candidate),
+		))
+	}
+	identity, err := replicatedIdentityForTable(
+		binding, local.LogID, userTable, candidate, sidecars, true,
+	)
+	if err != nil {
+		return ReplicatedShardStoreIdentity{}, rollbackCandidate(err)
+	}
+	if err := core.txnLog.ValidateCollections([]durable.NamedCollection{{
+		Name: userTable, Collection: candidate.collection,
+	}}); err != nil {
+		return ReplicatedShardStoreIdentity{}, rollbackCandidate(
+			fmt.Errorf(
+				"%w: transaction-log membership: %v",
+				ErrReplicatedShardStoreProfile, err,
+			),
 		)
 	}
 
 	previousPending := core.catalogWritePending
+	oldMeta := core.catalog.Tables[userTable]
 	stored := ownedReplicatedShardStoreIdentity(identity)
+	core.catalog.Tables[userTable] = meta
+	core.tables[userTable] = candidate
 	core.catalog.ReplicatedShardStore = &stored
 	core.catalogWritePending = true
+	core.advanceLayoutEpochLocked()
 	var published bool
 	if persist != nil {
 		published, err = persist(core)
@@ -247,8 +332,35 @@ func (d *Database) bindReplicatedShardStore(
 	}
 	if err != nil {
 		if !published && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+			core.catalog.Tables[userTable] = oldMeta
+			core.tables[userTable] = t
 			core.catalog.ReplicatedShardStore = nil
 			core.catalogWritePending = previousPending
+			core.advanceLayoutEpochLocked()
+			detachErr := core.txnLog.DetachCollection(candidate.collection)
+			if detachErr != nil {
+				core.retired = append(core.retired, retiredTable{
+					name: userTable + " (unpublished replicated bind)",
+					path: core.tablePathForMeta(candidate.meta),
+					journal: durable.RecoveryJournalPath(
+						core.tablePathForMeta(candidate.meta),
+					),
+					file: candidate.file, collection: candidate.collection,
+				})
+				candidate.file = nil
+				candidate.collection = nil
+				restoreErr := core.txnLog.ReconfigureUnminted(previousTxnOptions)
+				return ReplicatedShardStoreIdentity{}, errors.Join(
+					fmt.Errorf("vibedb: publish replicated shard store binding: %w", err),
+					detachErr, restoreErr,
+				)
+			}
+			cleanupErr := core.discardTableStorageLocked(userTable, candidate)
+			restoreErr := core.txnLog.ReconfigureUnminted(previousTxnOptions)
+			return ReplicatedShardStoreIdentity{}, errors.Join(
+				fmt.Errorf("vibedb: publish replicated shard store binding: %w", err),
+				cleanupErr, restoreErr,
+			)
 		} else if !published {
 			core.catalogWritePending = true
 		}
@@ -259,6 +371,11 @@ func (d *Database) bindReplicatedShardStore(
 			return ownedReplicatedShardStoreIdentity(identity), publicationErr
 		}
 		return ReplicatedShardStoreIdentity{}, publicationErr
+	}
+	if err := core.txnLog.EnsureMinted(); err != nil {
+		return ownedReplicatedShardStoreIdentity(identity), fmt.Errorf(
+			"vibedb: qualify replicated transaction marker: %w", err,
+		)
 	}
 	return ownedReplicatedShardStoreIdentity(identity), nil
 }
@@ -346,6 +463,7 @@ func OpenReplicatedShardStoreForSettlement(
 	if err := validateReplicatedUserTableName(userTable); err != nil {
 		return nil, ReplicatedShardStoreIdentity{}, err
 	}
+	sidecars := canonicalReplicatedShardStoreSidecars()
 	expected = ownedReplicatedShardStoreBinding(expected)
 	userTable = strings.Clone(userTable)
 	absolute, err := canonicalCatalogPath(path)
@@ -361,8 +479,10 @@ func OpenReplicatedShardStoreForSettlement(
 		return nil, ReplicatedShardStoreIdentity{}, err
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
-		mode:                        shardStoreOpenReplicatedSettlement,
-		expectedReplicated:          ReplicatedShardStoreIdentity{Binding: expected},
+		mode: shardStoreOpenReplicatedSettlement,
+		expectedReplicated: ReplicatedShardStoreIdentity{
+			Binding: expected, Sidecars: sidecars,
+		},
 		expectedReplicatedLogID:     expectedLogID,
 		expectedReplicatedUserTable: userTable,
 	})
@@ -422,15 +542,17 @@ func replicatedIdentityForTable(
 	logID [16]byte,
 	name string,
 	t *table,
+	sidecars ReplicatedShardStoreSidecarProfile,
 	requireEmpty bool,
 ) (ReplicatedShardStoreIdentity, error) {
 	if t == nil || t.meta == nil || t.collection == nil ||
 		t.schema != nil || t.meta.Schema != nil || len(t.meta.Indexes) != 0 ||
 		t.collection.HasSchema() || t.collection.HasIndexes() ||
 		!t.collection.HasSynchronousDurability() || !t.collection.SupportsUpdate() ||
+		t.collection.SealedRecoveryJournalBytes() != sidecars.UserRecoveryJournalBytes ||
 		!t.meta.Materialized || t.meta.Storage == "" {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
-			"%w: table %q must be materialized, schema-free, index-free, and synchronous",
+			"%w: table %q must be materialized, schema-free, index-free, synchronous, and exactly sealed",
 			ErrReplicatedShardStoreProfile, name,
 		)
 	}
@@ -453,6 +575,7 @@ func replicatedIdentityForTable(
 		UserStorage:    strings.Clone(t.meta.Storage),
 		UserPrimaryKey: strings.Clone(t.meta.PrimaryKey),
 		UserLimits:     limits,
+		Sidecars:       sidecars,
 	}
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
@@ -491,7 +614,8 @@ func validateReplicatedCatalog(catalog catalogFile) error {
 	meta := catalog.Tables[r.UserTable]
 	if meta == nil || meta.Schema != nil || len(meta.Indexes) != 0 ||
 		!meta.Materialized || meta.Storage == "" || meta.Storage != r.UserStorage ||
-		meta.PrimaryKey != r.UserPrimaryKey {
+		meta.PrimaryKey != r.UserPrimaryKey ||
+		meta.SealedRecoveryJournalBytes != r.Sidecars.UserRecoveryJournalBytes {
 		return fmt.Errorf("%w: durable user table metadata differs", ErrReplicatedShardStoreProfile)
 	}
 	normalized, err := durable.NormalizeOptions(durableOptions(&table{meta: meta}))
@@ -519,7 +643,9 @@ func validateOpenedReplicatedCatalog(d *database) error {
 	}
 	r := *d.catalog.ReplicatedShardStore
 	t := d.tables[r.UserTable]
-	actual, err := replicatedIdentityForTable(r.Binding, r.LogID, r.UserTable, t, false)
+	actual, err := replicatedIdentityForTable(
+		r.Binding, r.LogID, r.UserTable, t, r.Sidecars, false,
+	)
 	if err != nil {
 		return err
 	}
@@ -530,7 +656,9 @@ func validateOpenedReplicatedCatalog(d *database) error {
 		Name: r.UserTable, Collection: t.collection,
 	}}
 	if d.catalog.ReplicatedApply != nil {
-		if err := validateReplicatedApplyCollection(d.replicatedApplyCollection); err != nil {
+		if err := validateReplicatedApplyCollection(
+			d.replicatedApplyCollection, d.catalog.ReplicatedApply.Sidecars,
+		); err != nil {
 			return err
 		}
 		members = append(members, durable.NamedCollection{
@@ -540,6 +668,14 @@ func validateOpenedReplicatedCatalog(d *database) error {
 	}
 	if err := d.txnLog.ValidateCollections(members); err != nil {
 		return fmt.Errorf("%w: transaction-log membership: %v", ErrReplicatedShardStoreProfile, err)
+	}
+	if d.txnLog.Options() != (durable.TxnLogOptions{
+		Capacity: r.Sidecars.TransactionMarkerBytes, SealedCapacity: true,
+	}) {
+		return fmt.Errorf(
+			"%w: transaction-marker profile differs",
+			ErrReplicatedShardStoreProfile,
+		)
 	}
 	return nil
 }
@@ -599,6 +735,9 @@ func validateReplicatedShardStoreIdentity(i ReplicatedShardStoreIdentity) error 
 		return fmt.Errorf("%w: invalid user primary key", ErrReplicatedShardStoreProfile)
 	}
 	if err := validateReplicatedShardStoreLimits(i.UserLimits); err != nil {
+		return err
+	}
+	if err := validateReplicatedShardStoreSidecarsForLimits(i.Sidecars, i.UserLimits); err != nil {
 		return err
 	}
 	return nil
@@ -811,29 +950,33 @@ func (l *ReplicatedShardStoreLimits) UnmarshalJSON(data []byte) error {
 
 func (i ReplicatedShardStoreIdentity) MarshalJSON() ([]byte, error) {
 	type encoded struct {
-		Format         uint16                      `json:"format"`
-		Binding        ReplicatedShardStoreBinding `json:"binding"`
-		LogID          string                      `json:"log_id"`
-		UserTable      string                      `json:"user_table"`
-		UserStorage    string                      `json:"user_storage"`
-		UserPrimaryKey string                      `json:"user_primary_key"`
-		UserLimits     ReplicatedShardStoreLimits  `json:"user_limits"`
+		Format         uint16                             `json:"format"`
+		Binding        ReplicatedShardStoreBinding        `json:"binding"`
+		LogID          string                             `json:"log_id"`
+		UserTable      string                             `json:"user_table"`
+		UserStorage    string                             `json:"user_storage"`
+		UserPrimaryKey string                             `json:"user_primary_key"`
+		UserLimits     ReplicatedShardStoreLimits         `json:"user_limits"`
+		Sidecars       ReplicatedShardStoreSidecarProfile `json:"sidecars"`
 	}
 	return json.Marshal(encoded{
 		Format: i.Format, Binding: i.Binding, LogID: hex.EncodeToString(i.LogID[:]),
 		UserTable: i.UserTable, UserStorage: i.UserStorage,
 		UserPrimaryKey: i.UserPrimaryKey, UserLimits: i.UserLimits,
+		Sidecars: i.Sidecars,
 	})
 }
 
 func (i *ReplicatedShardStoreIdentity) UnmarshalJSON(data []byte) error {
 	var decoded ReplicatedShardStoreIdentity
-	present := make(map[string]bool, 7)
+	present := make(map[string]bool, 8)
 	err := decodeCatalogObject(data, "replicated shard store identity", func(name string, d *json.Decoder) error {
 		present[name] = true
 		switch name {
 		case "format":
-			return d.Decode(&decoded.Format)
+			return decodeRequiredCatalogUint16(
+				d, "replicated shard store format", &decoded.Format,
+			)
 		case "binding":
 			return d.Decode(&decoded.Binding)
 		case "log_id":
@@ -850,6 +993,8 @@ func (i *ReplicatedShardStoreIdentity) UnmarshalJSON(data []byte) error {
 			return d.Decode(&decoded.UserPrimaryKey)
 		case "user_limits":
 			return d.Decode(&decoded.UserLimits)
+		case "sidecars":
+			return d.Decode(&decoded.Sidecars)
 		default:
 			return unknownCatalogMember("replicated shard store identity", name)
 		}
@@ -857,7 +1002,7 @@ func (i *ReplicatedShardStoreIdentity) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{"format", "binding", "log_id", "user_table", "user_storage", "user_primary_key", "user_limits"} {
+	for _, name := range []string{"format", "binding", "log_id", "user_table", "user_storage", "user_primary_key", "user_limits", "sidecars"} {
 		if !present[name] {
 			return fmt.Errorf("vibedb: replicated shard store identity is missing member %q", name)
 		}

@@ -66,11 +66,12 @@ type viewMeta struct {
 }
 
 type tableMeta struct {
-	PrimaryKey   string      `json:"primary_key"`
-	Schema       *schemaMeta `json:"schema,omitempty"`
-	Indexes      []indexMeta `json:"indexes,omitempty"`
-	Storage      string      `json:"storage,omitempty"`
-	Materialized bool        `json:"materialized,omitempty"`
+	PrimaryKey                 string      `json:"primary_key"`
+	Schema                     *schemaMeta `json:"schema,omitempty"`
+	Indexes                    []indexMeta `json:"indexes,omitempty"`
+	Storage                    string      `json:"storage,omitempty"`
+	Materialized               bool        `json:"materialized,omitempty"`
+	SealedRecoveryJournalBytes uint64      `json:"sealed_recovery_journal_bytes,omitempty"`
 }
 
 type schemaMeta struct {
@@ -390,7 +391,8 @@ func openDatabaseWithShardStorePolicy(
 		actual := d.catalog.ReplicatedShardStore
 		if actual.Binding != shardPolicy.expectedReplicated.Binding ||
 			actual.LogID != shardPolicy.expectedReplicatedLogID ||
-			actual.UserTable != shardPolicy.expectedReplicatedUserTable {
+			actual.UserTable != shardPolicy.expectedReplicatedUserTable ||
+			actual.Sidecars != shardPolicy.expectedReplicated.Sidecars {
 			return nil, fmt.Errorf(
 				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
 			)
@@ -560,6 +562,11 @@ func openDatabaseWithShardStorePolicy(
 		if err := validateOpenedReplicatedCatalog(d); err != nil {
 			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
+		if err := d.txnLog.EnsureMinted(); err != nil {
+			return nil, fmt.Errorf(
+				"vibedb: qualify replicated transaction marker: %w", err,
+			)
+		}
 	}
 	if d.catalogWritePending {
 		if _, err := d.persistCatalogLocked(); err != nil {
@@ -676,8 +683,15 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			File: file, Options: options,
 		})
 	}
+	txnOptions := durable.TxnLogOptions{}
+	if replicated := d.catalog.ReplicatedShardStore; replicated != nil {
+		txnOptions = durable.TxnLogOptions{
+			Capacity:       replicated.Sidecars.TransactionMarkerBytes,
+			SealedCapacity: true,
+		}
+	}
 	collections, txnLog, err := durable.OpenCollectionsWithTransactions(
-		d.dataDir, durable.TxnLogOptions{}, requests,
+		d.dataDir, txnOptions, requests,
 	)
 	if err != nil {
 		return abortFiles(err)
@@ -701,7 +715,9 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		entry := opened[i]
 		collection := collections[i]
 		if entry.apply {
-			if err := validateReplicatedApplyCollection(collection); err != nil {
+			if err := validateReplicatedApplyCollection(
+				collection, d.catalog.ReplicatedApply.Sidecars,
+			); err != nil {
 				return err
 			}
 			continue
@@ -815,7 +831,8 @@ func durableOptions(t *table) durable.Options {
 		// SQL acknowledges a mutation only after its recovery record or root is
 		// durable. Replacement rebuilds use bounded WriteBatch chunks under this
 		// same contract; batching changes barrier count, not durability semantics.
-		Durability: durable.DurabilitySync,
+		Durability:                 durable.DurabilitySync,
+		SealedRecoveryJournalBytes: t.meta.SealedRecoveryJournalBytes,
 	}
 	for _, index := range t.meta.Indexes {
 		options.Indexes = append(options.Indexes, store.IndexDefinition{

@@ -157,6 +157,16 @@ func TestRecoveryJournalHeaderRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalCurrentGrammarRequiresExactSector(t *testing.T) {
+	header := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
+	header.SectorSize = 2 * RecoveryJournalMinSectorSize
+	if _, err := EncodeRecoveryJournalHeader(
+		make([]byte, RecoveryJournalHeaderSize), header,
+	); !errors.Is(err, ErrRecoveryJournalCorrupt) {
+		t.Fatalf("encode noncurrent sector = %v, want corruption", err)
+	}
+}
+
 func TestRecoveryJournalCurrentFormatAndNonCurrentDomainRejection(t *testing.T) {
 	header := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
 	header.RecycleCount = 3

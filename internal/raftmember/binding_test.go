@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -55,6 +56,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 
 	firstPath, firstDB, firstLocal := prepareSQLRoot(t, walIdentity, "first")
 	first, err := BindPreparedSQL(wal, firstDB, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind first SQL root", err)
 	if err != nil {
 		t.Fatalf("BindPreparedSQL(first): %v", err)
 	}
@@ -77,6 +79,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 	settledDB, settled, err := OpenBoundSQLForSettlement(
 		firstPath, wal, authority, firstLocal.LogID, "docs",
 	)
+	skipIfStrictAllocationUnsupported(t, "settle first SQL root", err)
 	if err != nil {
 		t.Fatalf("OpenBoundSQLForSettlement(first): %v", err)
 	}
@@ -91,6 +94,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 	}
 
 	reopened, err := OpenBoundSQL(firstPath, wal, authority, first)
+	skipIfStrictAllocationUnsupported(t, "reopen first SQL root", err)
 	if err != nil {
 		t.Fatalf("OpenBoundSQL(first): %v", err)
 	}
@@ -107,6 +111,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 	// intentionally outside what this identity comparison can distinguish.
 	secondPath, secondDB, secondLocal := prepareSQLRoot(t, walIdentity, "second")
 	second, err := BindPreparedSQL(wal, secondDB, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind second SQL root", err)
 	if err != nil {
 		t.Fatalf("BindPreparedSQL(second): %v", err)
 	}
@@ -136,6 +141,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 		)
 	}
 	secondReopened, err := OpenBoundSQL(secondPath, wal, authority, second)
+	skipIfStrictAllocationUnsupported(t, "reopen second SQL root", err)
 	if err != nil {
 		t.Fatalf("OpenBoundSQL(second exact identity): %v", err)
 	}
@@ -479,5 +485,12 @@ func assertPathAbsent(t testing.TB, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); err == nil || !os.IsNotExist(err) {
 		t.Fatalf("path %q exists or could not be classified after rejected open: %v", path, err)
+	}
+}
+
+func skipIfStrictAllocationUnsupported(t testing.TB, operation string, err error) {
+	t.Helper()
+	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
+		t.Skipf("%s requires strict physical allocation proof: %v", operation, err)
 	}
 }

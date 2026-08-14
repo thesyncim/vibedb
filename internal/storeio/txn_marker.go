@@ -417,6 +417,13 @@ func checkedTxnDecisionPaddedSize(participantCount int) (int, bool) {
 	return checkedTxnMarkerPadRaw(raw)
 }
 
+// TxnDecisionRecordPaddedSize returns the exact current record-region charge
+// for one transaction decision. A false result means the participant count is
+// outside the current grammar.
+func TxnDecisionRecordPaddedSize(participantCount int) (int, bool) {
+	return checkedTxnDecisionPaddedSize(participantCount)
+}
+
 func checkedTxnRetirementPaddedSize() (int, bool) {
 	raw := uint64(TxnMarkerRecordPrefixSize + TxnMarkerRecordTrailerSize)
 	return checkedTxnMarkerPadRaw(raw)

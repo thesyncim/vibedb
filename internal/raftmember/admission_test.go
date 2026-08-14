@@ -161,12 +161,14 @@ func TestValidateStaticNoGCCompletionCapacityAgainstLiveApply(t *testing.T) {
 			_, database, _ := prepareSQLRoot(t, walIdentity, "capacity")
 			authority := testAuthorityProfile()
 			base, err := BindPreparedSQL(wal, database, authority, "docs")
+			skipIfStrictAllocationUnsupported(t, "bind live capacity SQL root", err)
 			if err != nil {
 				t.Fatal(err)
 			}
 			options := testApplyOptions()
 			options.MaxCompletions = test.maxCompletions
 			claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
+			skipIfStrictAllocationUnsupported(t, "open live capacity apply", err)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -194,12 +196,14 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	_, database, _ := prepareSQLRoot(t, walIdentity, "capacity-cut")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind capacity-cut SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
 	options.MaxCompletions = uint64(testWALOptions().MaxEntries)
 	claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
+	skipIfStrictAllocationUnsupported(t, "open capacity-cut apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +292,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 	_, firstWAL, _, _ := createWAL(t, firstIdentity)
 	_, firstDB, _ := prepareSQLRoot(t, firstIdentity, "capacity-first")
 	firstBase, err := BindPreparedSQL(firstWAL, firstDB, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind first capacity SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,6 +301,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 	firstClaim, _, err := OpenPreparedApply(
 		firstWAL, firstDB, authority, firstBase, firstOptions,
 	)
+	skipIfStrictAllocationUnsupported(t, "open first capacity apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +310,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 	_, secondWAL, _, _ := createWAL(t, secondIdentity)
 	_, secondDB, _ := prepareSQLRoot(t, secondIdentity, "capacity-second")
 	secondBase, err := BindPreparedSQL(secondWAL, secondDB, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind second capacity SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +319,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 	secondClaim, _, err := OpenPreparedApply(
 		secondWAL, secondDB, authority, secondBase, secondOptions,
 	)
+	skipIfStrictAllocationUnsupported(t, "open second capacity apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,12 +347,14 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	sqlPath, database, _ := prepareSQLRoot(t, walIdentity, "capacity-restart")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind restart capacity SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
 	options.MaxCompletions = uint64(walOptions.MaxEntries)
 	claim, applyIdentity, err := OpenPreparedApply(wal, database, authority, base, options)
+	skipIfStrictAllocationUnsupported(t, "open restart capacity apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,6 +410,7 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	reopenedDB, reopenedClaim, err := OpenBoundSQLWithApply(
 		sqlPath, reopenedWAL, authority, base, applyIdentity,
 	)
+	skipIfStrictAllocationUnsupported(t, "reopen restart capacity apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,12 +444,14 @@ func TestValidateStaticNoGCCompletionCapacityRejectsUnavailableInputs(t *testing
 	_, database, _ := prepareSQLRoot(t, walIdentity, "capacity-closed")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind closed-input capacity SQL root", err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
 	options.MaxCompletions = uint64(testWALOptions().MaxEntries)
 	claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
+	skipIfStrictAllocationUnsupported(t, "open closed-input capacity apply", err)
 	if err != nil {
 		t.Fatal(err)
 	}

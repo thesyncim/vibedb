@@ -66,6 +66,22 @@ type TxnLogOptions struct {
 	SealedCapacity bool
 }
 
+// ValidateTxnLogOptions validates the transaction-marker geometry without
+// opening a directory or creating txn.vtm. Unsealed zero capacity retains the
+// storeio default; a sealed profile must name one exact supported geometry.
+func ValidateTxnLogOptions(options TxnLogOptions) error {
+	if options.SealedCapacity &&
+		(options.Capacity == 0 ||
+			options.Capacity > storeio.TxnMarkerMaxCapacityBytes ||
+			options.Capacity%storeio.TxnMarkerMinSectorSize != 0) {
+		return fmt.Errorf(
+			"%w: sealed transaction log requires an exact sector-aligned capacity",
+			ErrSealedJournalCapacity,
+		)
+	}
+	return nil
+}
+
 // TxnLog owns one database directory's txn.vtm decision log: lazy mint under
 // the L2 creation fence, decision append/sync, epoch recycle under pressure,
 // undischarged-decision accounting, and catalog-scope poison after a decision
@@ -133,14 +149,8 @@ func newTxnLogDirectory(
 	if dir == "" {
 		return nil, fmt.Errorf("vibedb: transaction log requires a directory")
 	}
-	if options.SealedCapacity &&
-		(options.Capacity == 0 ||
-			options.Capacity > storeio.TxnMarkerMaxCapacityBytes ||
-			options.Capacity%storeio.TxnMarkerMinSectorSize != 0) {
-		return nil, fmt.Errorf(
-			"%w: sealed transaction log requires an exact sector-aligned capacity",
-			ErrSealedJournalCapacity,
-		)
+	if err := ValidateTxnLogOptions(options); err != nil {
+		return nil, err
 	}
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
@@ -171,6 +181,87 @@ func newTxnLogDirectory(
 		registered: make(map[*Collection]struct{}),
 	}
 	return log, nil
+}
+
+// Options returns the retained transaction-marker profile. The returned value
+// is a snapshot; changing it does not reconfigure the log.
+func (l *TxnLog) Options() TxnLogOptions {
+	if l == nil {
+		return TxnLogOptions{}
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	return l.opts
+}
+
+// ReconfigureUnminted replaces the retained transaction-marker profile before
+// txn.vtm exists. It never opens or adopts an existing marker and performs no
+// durable writes. Every registered collection must still be the exact regular
+// entry in this log's pinned physical directory, and the directory must contain
+// no conditional recovery record that could depend on an earlier marker.
+func (l *TxnLog) ReconfigureUnminted(options TxnLogOptions) error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+
+	if err := ValidateTxnLogOptions(options); err != nil {
+		return err
+	}
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if l.marker != nil {
+		return ErrTransactionLogRecoveryRequired
+	}
+	if _, err := l.root.Lstat(txnMarkerFilename); err == nil {
+		return ErrTransactionLogRecoveryRequired
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	holds, err := directoryHoldsAnyConditional(l.root)
+	if err != nil {
+		return err
+	}
+	if holds {
+		return ErrTransactionLogMissing
+	}
+	l.opts = options
+	return nil
+}
+
+// EnsureMinted eagerly creates txn.vtm with the retained profile. The complete
+// registered catalog is re-proved against the pinned directory before create,
+// and the created or already-open marker is then re-proved against every
+// registered collection. A marker that races into existence is refused by the
+// same fail-closed O_EXCL fence used by commit.
+func (l *TxnLog) EnsureMinted() error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if err := l.ensureMintedLocked(); err != nil {
+		return err
+	}
+	return l.verifyMarkerDirectoryLocked()
 }
 
 func syncTxnLogDirectory(root *os.Root) error {
@@ -949,16 +1040,7 @@ func (l *TxnLog) ensureDecisionRoomLocked(participantCount int) error {
 }
 
 func txnDecisionRecordBytes(participantCount int) (int, bool) {
-	if participantCount <= 0 ||
-		participantCount > storeio.TxnMarkerMaxParticipants {
-		return 0, false
-	}
-	raw := storeio.TxnMarkerRecordPrefixSize +
-		storeio.TxnMarkerRecordTrailerSize +
-		participantCount*storeio.TxnParticipantSize
-	sector := storeio.TxnMarkerMinSectorSize
-	padded := (raw + sector - 1) / sector * sector
-	return padded, true
+	return storeio.TxnDecisionRecordPaddedSize(participantCount)
 }
 
 func (l *TxnLog) foldLaggardsAndRecycleLocked() error {

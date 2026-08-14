@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -17,6 +19,14 @@ import (
 )
 
 func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
+	if ReplicatedShardStoreFormat != 0 || ReplicatedApplyFormat != 0 ||
+		ReplicatedPlacementProfileFormat != 0 {
+		t.Fatalf(
+			"current replicated formats = shard %d, apply %d, placement %d; want zero sentinels",
+			ReplicatedShardStoreFormat, ReplicatedApplyFormat,
+			ReplicatedPlacementProfileFormat,
+		)
+	}
 	required := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		storeio.RecoveryJournalMinSectorSize,
 		replicatedMaxDistinctMutations,
@@ -26,6 +36,36 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		t.Fatalf(
 			"replicated batch ceiling record = %d, journal clamp = %d",
 			required, storeio.RecoveryJournalMaxCapacityBytes,
+		)
+	}
+	if got := canonicalReplicatedShardStoreSidecars(); got != (ReplicatedShardStoreSidecarProfile{
+		UserRecoveryJournalBytes: 16794624,
+		TransactionMarkerBytes:   1048576,
+	}) {
+		t.Fatalf("canonical base sidecars = %+v", got)
+	}
+	markerPadded, ok := storeio.TxnDecisionRecordPaddedSize(2)
+	if !ok {
+		t.Fatal("current marker grammar rejected two participants")
+	}
+	if markerPadded > int(ReplicatedTransactionMarkerBytes) ||
+		int(ReplicatedTransactionMarkerBytes)/markerPadded != 2048 {
+		t.Fatalf(
+			"two-participant decision = %d padded bytes, marker profile = %d; want 2048-decision window",
+			markerPadded, ReplicatedTransactionMarkerBytes,
+		)
+	}
+	systemLimits := replicatedApplySystemLimits()
+	systemRequired := storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		storeio.RecoveryJournalMinSectorSize,
+		systemLimits.MaxBatchDocuments,
+		systemLimits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+	)
+	if systemRequired != int(ReplicatedSystemRecoveryJournalBytes) ||
+		ReplicatedSystemRecoveryJournalBytes != 655872 {
+		t.Fatalf(
+			"system conditional record = %d, system profile = %d",
+			systemRequired, ReplicatedSystemRecoveryJournalBytes,
 		)
 	}
 	limits := ReplicatedShardStoreLimits{
@@ -40,6 +80,155 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 	limits.MaxBatchBytes++
 	if err := validateReplicatedShardStoreLimits(limits); !errors.Is(err, ErrReplicatedShardStoreProfile) {
 		t.Fatalf("replicated batch ceiling + 1 = %v, want profile error", err)
+	}
+}
+
+func skipReplicatedStrictAllocationUnsupported(
+	t testing.TB,
+	database *Database,
+	identity ReplicatedShardStoreIdentity,
+	err error,
+) {
+	t.Helper()
+	if !errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
+		return
+	}
+	if database == nil || database.connector == nil || database.connector.db == nil {
+		t.Fatalf("strict-allocation refusal lost the database owner: %v", err)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	table := core.tables["docs"]
+	invalid := identity != (ReplicatedShardStoreIdentity{}) ||
+		core.catalog.ReplicatedShardStore != nil || core.catalogWritePending ||
+		table == nil || table.meta.Materialized ||
+		table.meta.SealedRecoveryJournalBytes != 0 ||
+		table.collection != nil || table.file != nil ||
+		core.txnLog.Options() != (durable.TxnLogOptions{})
+	dataDir := core.dataDir
+	core.mu.RUnlock()
+	entries, readErr := os.ReadDir(dataDir)
+	_, markerErr := os.Stat(filepath.Join(dataDir, "txn.vtm"))
+	if invalid || readErr != nil || len(entries) != 0 || !os.IsNotExist(markerErr) {
+		t.Fatalf(
+			"strict-allocation refusal retained publication state: identity=%+v invalid=%t entries=%v read=%v marker=%v",
+			identity, invalid, entries, readErr, markerErr,
+		)
+	}
+	t.Skipf("sealed replicated sidecars require strict allocation support: %v", err)
+}
+
+func requireReplicatedShardStoreBind(
+	t testing.TB,
+	database *Database,
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+) ReplicatedShardStoreIdentity {
+	t.Helper()
+	identity, err := database.BindReplicatedShardStore(binding, userTable)
+	if userTable == "docs" {
+		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+	} else if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
+		t.Fatalf("strict-allocation helper only supports the canonical docs fixture: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("BindReplicatedShardStore: %v", err)
+	}
+	return identity
+}
+
+func TestReplicatedShardStoreSealedBindPlatformGatePrecedesPublication(t *testing.T) {
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "sealed-platform", false)
+	defer database.Close()
+	identity, err := database.BindReplicatedShardStore(binding, "docs")
+	if runtime.GOOS != "linux" {
+		if !errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
+			t.Fatalf("non-Linux sealed bind = %+v, %v; want strict-allocation unsupported", identity, err)
+		}
+		core := database.connector.db
+		core.mu.RLock()
+		defer core.mu.RUnlock()
+		if identity != (ReplicatedShardStoreIdentity{}) ||
+			core.catalog.ReplicatedShardStore != nil ||
+			core.catalog.Tables["docs"].Materialized ||
+			core.tables["docs"].collection != nil || core.tables["docs"].file != nil {
+			t.Fatalf("unsupported sealed bind published catalog or storage: %+v", identity)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("Linux sealed bind: %v", err)
+	}
+	if identity.Sidecars != canonicalReplicatedShardStoreSidecars() {
+		t.Fatalf("Linux sealed bind sidecars = %+v", identity.Sidecars)
+	}
+}
+
+func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
+	base := canonicalReplicatedShardStoreSidecars()
+	baseRaw, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantBase = `{"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`
+	if string(baseRaw) != wantBase {
+		t.Fatalf("base sidecar JSON = %s, want %s", baseRaw, wantBase)
+	}
+	var baseRoundTrip ReplicatedShardStoreSidecarProfile
+	if err := json.Unmarshal(baseRaw, &baseRoundTrip); err != nil || baseRoundTrip != base {
+		t.Fatalf("base sidecar round trip = %+v, %v", baseRoundTrip, err)
+	}
+	baseCases := map[string]string{
+		"missing_user":   `{"transaction_marker_bytes":1048576}`,
+		"missing_marker": `{"user_recovery_journal_bytes":16794624}`,
+		"unknown":        `{"unknown":1,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`,
+		"duplicate":      `{"user_recovery_journal_bytes":16794624,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`,
+		"wrong_user":     `{"user_recovery_journal_bytes":16794112,"transaction_marker_bytes":1048576}`,
+		"wrong_marker":   `{"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":512}`,
+		"null":           `null`,
+		"non_object":     `[]`,
+	}
+	for name, raw := range baseCases {
+		t.Run("base_"+name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(raw), new(ReplicatedShardStoreSidecarProfile)); err == nil {
+				t.Fatalf("accepted noncanonical base sidecars: %s", raw)
+			}
+		})
+	}
+	if _, err := json.Marshal(ReplicatedShardStoreSidecarProfile{}); err == nil {
+		t.Fatal("marshaled zero base sidecar profile")
+	}
+
+	apply := canonicalReplicatedApplySidecars()
+	applyRaw, err := json.Marshal(apply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantApply = `{"system_recovery_journal_bytes":655872}`
+	if string(applyRaw) != wantApply {
+		t.Fatalf("apply sidecar JSON = %s, want %s", applyRaw, wantApply)
+	}
+	var applyRoundTrip ReplicatedApplySidecarProfile
+	if err := json.Unmarshal(applyRaw, &applyRoundTrip); err != nil || applyRoundTrip != apply {
+		t.Fatalf("apply sidecar round trip = %+v, %v", applyRoundTrip, err)
+	}
+	applyCases := map[string]string{
+		"missing":    `{}`,
+		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":655872}`,
+		"duplicate":  `{"system_recovery_journal_bytes":655872,"system_recovery_journal_bytes":655872}`,
+		"wrong":      `{"system_recovery_journal_bytes":655360}`,
+		"null":       `null`,
+		"non_object": `[]`,
+	}
+	for name, raw := range applyCases {
+		t.Run("apply_"+name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(raw), new(ReplicatedApplySidecarProfile)); err == nil {
+				t.Fatalf("accepted noncanonical apply sidecars: %s", raw)
+			}
+		})
+	}
+	if _, err := json.Marshal(ReplicatedApplySidecarProfile{}); err == nil {
+		t.Fatal("marshaled zero apply sidecar profile")
 	}
 }
 
@@ -125,15 +314,28 @@ func testRuntimeExec(session *Session, statement string, values []any) error {
 
 func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 	path, database, binding, local := prepareReplicatedTestRoot(t, "bound", false)
-	identity, err := database.BindReplicatedShardStore(binding, "docs")
-	if err != nil {
-		t.Fatalf("BindReplicatedShardStore: %v", err)
-	}
+	identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	if identity.Format != ReplicatedShardStoreFormat || identity.LogID != local.LogID ||
 		identity.Binding != binding || identity.UserTable != "docs" ||
-		len(identity.UserStorage) != storageIdentityBytes*2 || identity.UserPrimaryKey != "/id" {
+		len(identity.UserStorage) != storageIdentityBytes*2 || identity.UserPrimaryKey != "/id" ||
+		identity.Sidecars != canonicalReplicatedShardStoreSidecars() {
 		t.Fatalf("bound identity = %+v, local = %+v", identity, local)
 	}
+	core := database.connector.db
+	core.mu.RLock()
+	boundTable := core.tables["docs"]
+	if boundTable == nil || !boundTable.meta.Materialized ||
+		boundTable.meta.Storage != identity.UserStorage ||
+		boundTable.meta.SealedRecoveryJournalBytes != ReplicatedUserRecoveryJournalBytes ||
+		boundTable.collection == nil ||
+		boundTable.collection.SealedRecoveryJournalBytes() != ReplicatedUserRecoveryJournalBytes ||
+		core.txnLog.Options() != (durable.TxnLogOptions{
+			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+		}) {
+		core.mu.RUnlock()
+		t.Fatalf("bound storage did not retain exact sealed sidecar profile")
+	}
+	core.mu.RUnlock()
 	if retried, err := database.BindReplicatedShardStore(binding, "docs"); err != nil || retried != identity {
 		t.Fatalf("exact bind retry = %+v, %v; want %+v", retried, err, identity)
 	}
@@ -168,26 +370,29 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 	mismatches := []struct {
 		name   string
 		mutate func(*ReplicatedShardStoreIdentity)
+		want   error
 	}{
-		{"sql_log_id", func(i *ReplicatedShardStoreIdentity) { i.LogID[0] ^= 0x40 }},
-		{"wal_store_id", func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0] ^= 0x40 }},
-		{"authority", func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.RouteGeneration++ }},
+		{"sql_log_id", func(i *ReplicatedShardStoreIdentity) { i.LogID[0] ^= 0x40 }, ErrReplicatedShardStoreIdentityMismatch},
+		{"wal_store_id", func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0] ^= 0x40 }, ErrReplicatedShardStoreIdentityMismatch},
+		{"authority", func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.RouteGeneration++ }, ErrReplicatedShardStoreIdentityMismatch},
 		{"storage", func(i *ReplicatedShardStoreIdentity) {
 			if i.UserStorage[0] == '0' {
 				i.UserStorage = "1" + i.UserStorage[1:]
 			} else {
 				i.UserStorage = "0" + i.UserStorage[1:]
 			}
-		}},
-		{"primary", func(i *ReplicatedShardStoreIdentity) { i.UserPrimaryKey = "/other" }},
-		{"limits", func(i *ReplicatedShardStoreIdentity) { i.UserLimits.MaxBatchBytes-- }},
+		}, ErrReplicatedShardStoreIdentityMismatch},
+		{"primary", func(i *ReplicatedShardStoreIdentity) { i.UserPrimaryKey = "/other" }, ErrReplicatedShardStoreIdentityMismatch},
+		{"limits", func(i *ReplicatedShardStoreIdentity) { i.UserLimits.MaxBatchBytes-- }, ErrReplicatedShardStoreIdentityMismatch},
+		{"user_journal", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.UserRecoveryJournalBytes-- }, ErrReplicatedShardStoreProfile},
+		{"transaction_marker", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.TransactionMarkerBytes++ }, ErrReplicatedShardStoreProfile},
 	}
 	for _, test := range mismatches {
 		t.Run("mismatch_"+test.name, func(t *testing.T) {
 			expected := identity
 			test.mutate(&expected)
-			if _, err := OpenReplicatedShardStore(path, expected); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
-				t.Fatalf("OpenReplicatedShardStore = %v, want identity mismatch", err)
+			if _, err := OpenReplicatedShardStore(path, expected); !errors.Is(err, test.want) {
+				t.Fatalf("OpenReplicatedShardStore = %v, want %v", err, test.want)
 			}
 		})
 	}
@@ -418,15 +623,45 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 	t.Run("definite", func(t *testing.T) {
 		_, db, binding, _ := prepareReplicatedTestRoot(t, "definite", false)
 		defer db.Close()
+		core := db.connector.db
+		core.mu.RLock()
+		priorTable := core.tables["docs"]
+		priorStorage := priorTable.meta.Storage
+		priorMarkerOptions := core.txnLog.Options()
+		priorEntries, readErr := os.ReadDir(core.dataDir)
+		core.mu.RUnlock()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
 		injected := errors.New("definite bind publication failure")
 		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
 			return false, injected
 		})
+		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
 		if !errors.Is(err, injected) || identity != (ReplicatedShardStoreIdentity{}) {
 			t.Fatalf("definite bind = %+v, %v", identity, err)
 		}
 		if _, err := db.ReplicatedShardStoreIdentity(); !errors.Is(err, ErrReplicatedShardStoreUnbound) {
 			t.Fatalf("identity after definite failure = %v", err)
+		}
+		core.mu.RLock()
+		afterTable := core.tables["docs"]
+		afterMarkerOptions := core.txnLog.Options()
+		published := core.catalog.ReplicatedShardStore
+		core.mu.RUnlock()
+		afterEntries, readErr := os.ReadDir(core.dataDir)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if afterMarkerOptions != priorMarkerOptions || published != nil ||
+			afterTable != priorTable || afterTable.meta.Storage != priorStorage ||
+			afterTable.meta.Materialized || afterTable.collection != nil || afterTable.file != nil ||
+			len(afterEntries) != len(priorEntries) {
+			t.Fatalf(
+				"definite rollback retained state: options=%+v want=%+v published=%+v table=%+v entries=%d want=%d",
+				afterMarkerOptions, priorMarkerOptions, published, afterTable,
+				len(afterEntries), len(priorEntries),
+			)
 		}
 		session, err := db.NewSession(context.Background())
 		if err != nil {
@@ -444,21 +679,48 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
 			return false, durable.ErrCommitOutcomeUnknown
 		})
+		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
 		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || identity == (ReplicatedShardStoreIdentity{}) {
 			t.Fatalf("unknown hook bind = %+v, %v", identity, err)
+		}
+		markerPath := filepath.Join(db.connector.db.dataDir, "txn.vtm")
+		if _, statErr := os.Stat(markerPath); !os.IsNotExist(statErr) {
+			t.Fatalf("unknown catalog outcome minted transaction marker: %v", statErr)
 		}
 		retried, err := db.BindReplicatedShardStore(binding, "docs")
 		if err != nil || retried != identity {
 			t.Fatalf("unknown hook exact retry = %+v, %v; want %+v", retried, err, identity)
 		}
+		markerInfo, err := os.Stat(markerPath)
+		if err != nil {
+			t.Fatalf("exact retry did not mint sealed transaction marker: %v", err)
+		}
+		wantMarkerSize := int64(2*storeio.TxnMarkerHeaderSize) +
+			int64(ReplicatedTransactionMarkerBytes)
+		if markerInfo.Size() != wantMarkerSize ||
+			db.connector.db.txnLog.Options() != (durable.TxnLogOptions{
+				Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+			}) {
+			t.Fatalf(
+				"exact retry marker = size %d options %+v; want size %d sealed profile",
+				markerInfo.Size(), db.connector.db.txnLog.Options(), wantMarkerSize,
+			)
+		}
 	})
 
 	t.Run("rename_then_directory_fence_unknown", func(t *testing.T) {
-		path, database, binding, local := prepareReplicatedTestRoot(t, "unknown", true)
+		path, database, binding, local := prepareReplicatedTestRoot(t, "unknown", false)
 		injected := errors.New("directory fence failure")
 		core := database.connector.db
-		core.syncDir = func(string) error { return injected }
+		catalogParent := filepath.Clean(filepath.Dir(path))
+		core.syncDir = func(candidate string) error {
+			if filepath.Clean(candidate) == catalogParent {
+				return injected
+			}
+			return syncDirectory(candidate)
+		}
 		identity, err := database.BindReplicatedShardStore(binding, "docs")
+		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
 		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, injected) ||
 			identity == (ReplicatedShardStoreIdentity{}) {
 			t.Fatalf("unknown bind = %+v, %v", identity, err)
@@ -516,6 +778,134 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 	})
 }
 
+func TestBindReplicatedShardStoreRejectsLivePreexistingMarker(t *testing.T) {
+	_, db, binding, _ := prepareReplicatedTestRoot(t, "preexisting-marker", false)
+	defer db.Close()
+	core := db.connector.db
+	priorTable := core.tables["docs"]
+	priorStorage := priorTable.meta.Storage
+	priorOptions := core.txnLog.Options()
+	if err := core.txnLog.EnsureMinted(); err != nil {
+		t.Fatalf("mint ordinary marker fixture: %v", err)
+	}
+	persistCalls := 0
+	identity, err := db.bindReplicatedShardStore(
+		binding, "docs", func(*database) (bool, error) {
+			persistCalls++
+			return true, nil
+		},
+	)
+	if identity != (ReplicatedShardStoreIdentity{}) ||
+		!errors.Is(err, ErrReplicatedShardStoreProfile) ||
+		!errors.Is(err, durable.ErrTransactionLogRecoveryRequired) {
+		t.Fatalf("bind with live ordinary marker = %+v, %v", identity, err)
+	}
+	if persistCalls != 0 || core.catalog.ReplicatedShardStore != nil ||
+		core.tables["docs"] != priorTable || priorTable.meta.Storage != priorStorage ||
+		priorTable.meta.Materialized || priorTable.collection != nil || priorTable.file != nil ||
+		core.txnLog.Options() != priorOptions {
+		t.Fatalf(
+			"live-marker refusal mutated state: persist=%d catalog=%+v table=%+v options=%+v",
+			persistCalls, core.catalog.ReplicatedShardStore, priorTable, core.txnLog.Options(),
+		)
+	}
+	if _, statErr := os.Stat(filepath.Join(core.dataDir, "txn.vtm")); statErr != nil {
+		t.Fatalf("live-marker refusal removed marker: %v", statErr)
+	}
+}
+
+func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
+	path, database, binding, local := prepareReplicatedTestRoot(t, "marker-mint-residue", false)
+	core := database.connector.db
+	storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{
+		Phase: storeio.TxnMarkerFaultCreateParentDirSync,
+	})
+	t.Cleanup(func() {
+		storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+	})
+
+	identity, err := database.BindReplicatedShardStore(binding, "docs")
+	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
+		if storeio.TxnMarkerCreateFaulted() {
+			t.Fatal("marker-create fault fired before unsupported sealed user storage rolled back")
+		}
+		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+	}
+	if identity == (ReplicatedShardStoreIdentity{}) || !errors.Is(err, syscall.EIO) ||
+		!storeio.TxnMarkerCreateFaulted() {
+		t.Fatalf("post-catalog marker mint fault = %+v, %v; fired=%t",
+			identity, err, storeio.TxnMarkerCreateFaulted())
+	}
+	markerPath := filepath.Join(core.dataDir, "txn.vtm")
+	markerInfo, statErr := os.Stat(markerPath)
+	if statErr != nil {
+		t.Fatalf("valid marker mint residue is absent: %v", statErr)
+	}
+	wantMarkerSize := int64(2*storeio.TxnMarkerHeaderSize) +
+		int64(ReplicatedTransactionMarkerBytes)
+	core.mu.RLock()
+	published := core.catalog.ReplicatedShardStore
+	table := core.tables["docs"]
+	publishedExactly := published != nil && *published == identity &&
+		table != nil && table.meta.Materialized &&
+		table.meta.Storage == identity.UserStorage &&
+		table.meta.SealedRecoveryJournalBytes == ReplicatedUserRecoveryJournalBytes &&
+		table.collection != nil &&
+		table.collection.SealedRecoveryJournalBytes() == ReplicatedUserRecoveryJournalBytes &&
+		core.txnLog.Options() == (durable.TxnLogOptions{
+			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+		})
+	core.mu.RUnlock()
+	if !publishedExactly || markerInfo.Size() != wantMarkerSize {
+		t.Fatalf(
+			"marker mint failure did not retain the exact published recovery identity: published=%+v size=%d want=%d",
+			published, markerInfo.Size(), wantMarkerSize,
+		)
+	}
+
+	storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+	if closeErr := database.Close(); closeErr != nil {
+		t.Fatalf("close after marker mint residue: %v", closeErr)
+	}
+	settled, settledIdentity, err := OpenReplicatedShardStoreForSettlement(
+		path, binding, local.LogID, "docs",
+	)
+	if err != nil || settledIdentity != identity {
+		if settled != nil {
+			_ = settled.Close()
+		}
+		t.Fatalf("settle valid marker mint residue = %+v, %v; want %+v",
+			settledIdentity, err, identity)
+	}
+	settledCore := settled.connector.db
+	if settledCore.txnLog.Options() != (durable.TxnLogOptions{
+		Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+	}) {
+		t.Fatalf("settled marker options = %+v", settledCore.txnLog.Options())
+	}
+	settledInfo, err := os.Stat(markerPath)
+	if err != nil || settledInfo.Size() != wantMarkerSize {
+		t.Fatalf("settled marker = %v, size %d; want %d",
+			err, func() int64 {
+				if settledInfo == nil {
+					return -1
+				}
+				return settledInfo.Size()
+			}(), wantMarkerSize)
+	}
+	if err := settled.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenReplicatedShardStore(path, identity)
+	if err != nil {
+		t.Fatalf("exact open after marker residue settlement: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 	t.Run("schemaful_preflight_has_no_materialization_side_effect", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "schema.vdb")
@@ -555,6 +945,18 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 		_ = session.Close()
 		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
 			t.Fatalf("nonempty bind = %v", err)
+		}
+	})
+
+	t.Run("materialized_empty", func(t *testing.T) {
+		_, database, binding, _ := prepareReplicatedTestRoot(t, "materialized-empty", true)
+		defer database.Close()
+		table := database.connector.db.tables["docs"]
+		if table == nil || table.collection == nil || table.collection.Len() != 0 {
+			t.Fatal("fixture is not an empty materialized table")
+		}
+		if _, err := database.BindReplicatedShardStore(binding, "docs"); !errors.Is(err, ErrReplicatedShardStoreProfile) {
+			t.Fatalf("empty materialized bind = %v, want profile error", err)
 		}
 	})
 
@@ -642,6 +1044,7 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 		if connected.err != nil {
 			t.Fatalf("racing Connect: %v", connected.err)
 		}
+		unsupported := errors.Is(bound.err, storeio.ErrStrictAllocationUnsupported)
 		if bound.err == nil {
 			if !connected.session.conn.directWritesFenced {
 				t.Fatal("bind-first connection did not inherit direct-write fence")
@@ -649,7 +1052,7 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 			if err := testRuntimeExec(connected.session, `INSERT INTO docs VALUES (?)`, []any{[]byte(`{"id":"race"}`)}); !errors.Is(err, ErrDirectWriteFenced) {
 				t.Fatalf("bind-first racing session write = %v", err)
 			}
-		} else {
+		} else if !unsupported {
 			if !errors.Is(bound.err, ErrReplicatedShardStoreBusy) {
 				t.Fatalf("session-first bind = %v, want Busy", bound.err)
 			}
@@ -660,10 +1063,11 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 		if err := connected.session.Close(); err != nil {
 			t.Fatal(err)
 		}
+		if unsupported {
+			t.Skipf("sealed replicated sidecars require strict allocation support: %v", bound.err)
+		}
 		if bound.err != nil {
-			if _, err := database.BindReplicatedShardStore(binding, "docs"); err != nil {
-				t.Fatalf("bind after racing session close: %v", err)
-			}
+			_ = requireReplicatedShardStoreBind(t, database, binding, "docs")
 		}
 	})
 }
@@ -676,9 +1080,10 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 		UserTable: "docs", UserStorage: strings.Repeat("a", storageIdentityBytes*2),
 		UserPrimaryKey: "/id",
 		UserLimits: ReplicatedShardStoreLimits{
-			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20,
-			MaxBatchDocuments: 64, MaxBatchBytes: 16 << 20,
+			MaxKeyBytes: replicatedMaxKeyBytes, MaxDocumentBytes: replicatedMaxDocumentBytes,
+			MaxBatchDocuments: replicatedMaxDistinctMutations, MaxBatchBytes: replicatedMaxBatchBytes,
 		},
+		Sidecars: canonicalReplicatedShardStoreSidecars(),
 	}
 	raw, err := json.Marshal(identity)
 	if err != nil {
@@ -687,17 +1092,36 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 	if err := json.Unmarshal(raw, new(ReplicatedShardStoreIdentity)); err != nil {
 		t.Fatalf("valid decode: %v", err)
 	}
+	var identityFields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &identityFields); err != nil {
+		t.Fatal(err)
+	}
+	delete(identityFields, "sidecars")
+	missingSidecars, err := json.Marshal(identityFields)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := map[string][]byte{
 		"unknown":         append([]byte(`{"unknown":1,`), raw[1:]...),
-		"duplicate":       []byte(strings.Replace(string(raw), `"format":1`, `"format":1,"format":1`, 1)),
-		"missing":         []byte(strings.Replace(string(raw), `"format":1,`, ``, 1)),
+		"duplicate":       []byte(strings.Replace(string(raw), `"format":0`, `"format":0,"format":0`, 1)),
+		"missing":         []byte(strings.Replace(string(raw), `"format":0,`, ``, 1)),
+		"null_format":     []byte(strings.Replace(string(raw), `"format":0`, `"format":null`, 1)),
 		"null":            []byte(`null`),
 		"uppercase_hex":   []byte(strings.Replace(string(raw), `"log_id":"ab`, `"log_id":"AB`, 1)),
 		"binding_unknown": []byte(strings.Replace(string(raw), `"binding":{`, `"binding":{"unknown":1,`, 1)),
 		"authority_duplicate": []byte(strings.Replace(string(raw),
 			`"authority":{"active_policy_generation":11`,
 			`"authority":{"active_policy_generation":11,"active_policy_generation":11`, 1)),
-		"limits_unknown": []byte(strings.Replace(string(raw), `"user_limits":{`, `"user_limits":{"unknown":1,`, 1)),
+		"limits_unknown":   []byte(strings.Replace(string(raw), `"user_limits":{`, `"user_limits":{"unknown":1,`, 1)),
+		"sidecars_unknown": []byte(strings.Replace(string(raw), `"sidecars":{`, `"sidecars":{"unknown":1,`, 1)),
+		"sidecars_missing_member": []byte(strings.Replace(
+			string(raw), `"transaction_marker_bytes":1048576`, `"unused":1048576`, 1,
+		)),
+		"sidecars_wrong_user_journal": []byte(strings.Replace(
+			string(raw), `"user_recovery_journal_bytes":16794624`,
+			`"user_recovery_journal_bytes":16794112`, 1,
+		)),
+		"sidecars_missing": missingSidecars,
 	}
 	for name, image := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -725,6 +1149,9 @@ func TestReplicatedCatalogStrictRootAndProfileDecode(t *testing.T) {
 			return strings.Replace(raw, `"version": 0`, `"version": 0,
   "version": 0`, 1)
 		}, nil},
+		{"null_version", func(raw string) string {
+			return strings.Replace(raw, `"version": 0`, `"version": null`, 1)
+		}, nil},
 		{"profile_primary", func(raw string) string {
 			return strings.Replace(raw, `"user_primary_key": "/id"`, `"user_primary_key": "/other"`, 1)
 		}, ErrReplicatedShardStoreProfile},
@@ -732,10 +1159,7 @@ func TestReplicatedCatalogStrictRootAndProfileDecode(t *testing.T) {
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
 			path, database, binding, _ := prepareReplicatedTestRoot(t, mutation.name, false)
-			identity, err := database.BindReplicatedShardStore(binding, "docs")
-			if err != nil {
-				t.Fatal(err)
-			}
+			identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
 			if err := database.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -847,10 +1271,7 @@ func TestReplicatedSeparatelyPreparedRootRequiresRetainedSQLIdentity(t *testing.
 			t.Fatal(err)
 		}
 		_ = session.Close()
-		identity, err := database.BindReplicatedShardStore(binding, "docs")
-		if err != nil {
-			t.Fatal(err)
-		}
+		identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
 		if err := database.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -882,10 +1303,7 @@ func TestReplicatedSeparatelyPreparedRootRequiresRetainedSQLIdentity(t *testing.
 
 func TestReplicatedBindingAcceptsByteIdenticalSQLRootCopy(t *testing.T) {
 	path, database, binding, _ := prepareReplicatedTestRoot(t, "original", false)
-	identity, err := database.BindReplicatedShardStore(binding, "docs")
-	if err != nil {
-		t.Fatal(err)
-	}
+	identity := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
