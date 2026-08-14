@@ -58,6 +58,10 @@ type Pulse struct {
 // fence a sketch to one exact ownership incarnation.
 var ErrInvalidSource = errors.New("autosplit: invalid source identity")
 
+// ErrInvalidSequence reports a zero observation-window sequence. Sequences are
+// positive and contiguous within one exact source incarnation.
+var ErrInvalidSequence = errors.New("autosplit: invalid window sequence")
+
 type loadBin [ResourceCount]uint32
 
 type heavyHitter struct {
@@ -77,11 +81,12 @@ type heavyHitter struct {
 // and querying all candidate boundaries costs O(BinCount). Eight deterministic
 // SpaceSaving entries retain exact hot-point candidates.
 type Sketch struct {
-	source SourceIdentity
-	bins   [BinCount]loadBin
-	total  [ResourceCount]uint64
-	cross  [BinCount + 1]int64
-	heavy  [HeavyHitterCount]heavyHitter
+	source   SourceIdentity
+	sequence uint64
+	bins     [BinCount]loadBin
+	total    [ResourceCount]uint64
+	cross    [BinCount + 1]int64
+	heavy    [HeavyHitterCount]heavyHitter
 
 	hotTotal  uint64
 	bounded   uint64
@@ -91,13 +96,16 @@ type Sketch struct {
 }
 
 // NewSketch returns an empty fixed-space sketch fenced to source's exact
-// distribution, shard, range, routing generation, and ownership epoch.
-func NewSketch(source SourceIdentity) (*Sketch, error) {
-	if source.Distribution == "" || source.Shard == "" ||
-		source.RoutingVersion == 0 || source.OwnershipEpoch == 0 || !source.Range.Valid() {
+// distribution, shard allocation, range, routing generation, ownership epoch,
+// and positive observation-window sequence.
+func NewSketch(source SourceIdentity, sequence uint64) (*Sketch, error) {
+	if !source.valid() {
 		return nil, ErrInvalidSource
 	}
-	return &Sketch{source: source}, nil
+	if sequence == 0 {
+		return nil, ErrInvalidSequence
+	}
+	return &Sketch{source: source, sequence: sequence}, nil
 }
 
 // Range reports the immutable source range represented by s.
@@ -122,12 +130,12 @@ func (s *Sketch) Samples() uint64 {
 func (s *Sketch) Overflow() bool { return s != nil && s.overflow }
 
 // Pulse returns a detached compact summary of this detailed window.
-func (s *Sketch) Pulse(sequence uint64) Pulse {
+func (s *Sketch) Pulse() Pulse {
 	if s == nil {
-		return Pulse{Sequence: sequence}
+		return Pulse{}
 	}
 	return Pulse{
-		Source: s.source, Sequence: sequence, Total: s.total,
+		Source: s.source, Sequence: s.sequence, Total: s.total,
 		Samples: s.samples, Bounded: s.bounded,
 		Unbounded: s.unbounded, Overflow: s.overflow,
 	}
@@ -252,13 +260,17 @@ func saturatingAdd64(a, b uint64, overflow *bool) uint64 {
 }
 
 func (s *Sketch) binFor(point distribution.KeyspacePoint) int {
-	start := pointUint64(s.source.Range.Start)
+	return binForRange(s.source.Range, point)
+}
+
+func binForRange(r distribution.KeyRange, point distribution.KeyspacePoint) int {
+	start := pointUint64(r.Start)
 	value := pointUint64(point)
 	delta := value - start
-	if s.source.Range.End.Max && start == 0 {
+	if r.End.Max && start == 0 {
 		return int(value >> 58)
 	}
-	width := rangeWidth(s.source.Range)
+	width := rangeWidth(r)
 	hi, lo := bits.Mul64(delta, BinCount)
 	q, _ := bits.Div64(hi, lo, width)
 	if q >= BinCount {
@@ -269,11 +281,15 @@ func (s *Sketch) binFor(point distribution.KeyspacePoint) int {
 
 // boundary returns the kth interior equal-width boundary, 1 <= k < BinCount.
 func (s *Sketch) boundary(k int) distribution.KeyspacePoint {
-	start := pointUint64(s.source.Range.Start)
-	if s.source.Range.End.Max && start == 0 {
+	return boundaryForRange(s.source.Range, k)
+}
+
+func boundaryForRange(r distribution.KeyRange, k int) distribution.KeyspacePoint {
+	start := pointUint64(r.Start)
+	if r.End.Max && start == 0 {
 		return uint64Point(uint64(k) << 58)
 	}
-	width := rangeWidth(s.source.Range)
+	width := rangeWidth(r)
 	hi, lo := bits.Mul64(width, uint64(k))
 	offset := hi<<58 | lo>>6 // exact floor(product / 64)
 	return uint64Point(start + offset)

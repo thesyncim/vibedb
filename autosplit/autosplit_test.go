@@ -1,6 +1,7 @@
 package autosplit
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"unsafe"
@@ -11,11 +12,11 @@ import (
 func TestSketchFixedSpaceAccountingAndDeterminism(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
 	source := testSource(range_)
-	a, err := NewSketch(source)
+	a, err := NewSketch(source, 17)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := NewSketch(source)
+	b, _ := NewSketch(source, 17)
 	load := LoadVector{ResourceWriteCPU: 11, ResourceRequests: 1, ResourceLiveBytes: 7}
 	for i := 0; i < 200; i++ {
 		point := testPoint(uint64(i%17) << 58)
@@ -31,7 +32,7 @@ func TestSketchFixedSpaceAccountingAndDeterminism(t *testing.T) {
 		a.total[ResourceLiveBytes] != 1400 {
 		t.Fatalf("accounting = samples %d total %+v", a.Samples(), a.total)
 	}
-	pulse := a.Pulse(17)
+	pulse := a.Pulse()
 	if pulse.Source != source || pulse.Sequence != 17 || pulse.Samples != a.Samples() ||
 		pulse.Total != a.total || pulse.Bounded != a.bounded {
 		t.Fatalf("pulse = %+v", pulse)
@@ -47,7 +48,7 @@ func TestSketchFixedSpaceAccountingAndDeterminism(t *testing.T) {
 	outsideRange := distribution.KeyRange{
 		Start: testPoint(10), End: distribution.KeyspaceEnd{Point: testPoint(20)},
 	}
-	outside, _ := NewSketch(testSource(outsideRange))
+	outside, _ := NewSketch(testSource(outsideRange), 1)
 	if outside.ObservePoint(testPoint(9), load, 1) {
 		t.Fatal("out-of-range point was accepted")
 	}
@@ -60,6 +61,17 @@ func TestSketchFixedSpaceAccountingAndDeterminism(t *testing.T) {
 		t.Fatalf("Tracker size = %d B, want <= 128 B", got)
 	} else {
 		t.Logf("Tracker size = %d B", got)
+	}
+}
+
+func TestSketchRejectsIncompleteWindowFence(t *testing.T) {
+	source := testSource(balancedRange())
+	if _, err := NewSketch(source, 0); !errors.Is(err, ErrInvalidSequence) {
+		t.Fatalf("zero sequence err = %v, want ErrInvalidSequence", err)
+	}
+	source.AllocationGeneration = 0
+	if _, err := NewSketch(source, 1); !errors.Is(err, ErrInvalidSource) {
+		t.Fatalf("zero allocation err = %v, want ErrInvalidSource", err)
 	}
 }
 
@@ -78,7 +90,7 @@ func TestRangeArithmeticAcrossNarrowAndMaxEndedRanges(t *testing.T) {
 			end.Point = testPoint(start + width)
 		}
 		range_ := distribution.KeyRange{Start: testPoint(start), End: end}
-		sketch, err := NewSketch(testSource(range_))
+		sketch, err := NewSketch(testSource(range_), 1)
 		if err != nil {
 			t.Fatalf("range %d: %v", i, err)
 		}
@@ -107,7 +119,7 @@ func TestRangeArithmeticAcrossNarrowAndMaxEndedRanges(t *testing.T) {
 }
 
 func TestObserveSpanUsesHalfOpenBoundarySemantics(t *testing.T) {
-	sketch, _ := NewSketch(testSource(distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}))
+	sketch, _ := NewSketch(testSource(distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}), 1)
 	start := testPoint(0)
 	end := distribution.KeyspaceEnd{Point: testPoint(uint64(32) << 58)}
 	if !sketch.ObserveSpan(start, end, 3) {
@@ -185,8 +197,11 @@ func TestRecommendChargesBoundedSpanFanout(t *testing.T) {
 
 func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
-	source := SourceIdentity{Distribution: "d", Shard: "s", Range: range_, RoutingVersion: 7, OwnershipEpoch: 9}
-	sketch, _ := NewSketch(source)
+	source := SourceIdentity{
+		Distribution: "d", Shard: "s", AllocationGeneration: 3,
+		Range: range_, RoutingVersion: 7, OwnershipEpoch: 9,
+	}
+	sketch, _ := NewSketch(source, 1)
 	hot := testPoint(12345)
 	neighbor := testPoint(12445)
 	for range 70 {
@@ -240,7 +255,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 
 func TestRecommendDoesNotCallCrowdedBinHotKeyUnsplittable(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
-	sketch, _ := NewSketch(testSource(range_))
+	sketch, _ := NewSketch(testSource(range_), 1)
 	hot := testPoint(12345)
 	neighbor := testPoint(12445)
 	for range 70 {
@@ -292,29 +307,28 @@ func TestRecommendRefusesOverflowAndRetainsSourceFence(t *testing.T) {
 
 func TestRecommendNoEvidenceRetainsSourceFence(t *testing.T) {
 	source := testSource(balancedRange())
-	sketch, err := NewSketch(source)
+	sketch, err := NewSketch(source, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := Recommend(sketch, balancedCapacities(), DefaultPolicy())
-	if rec.Reason != ReasonNoEvidence || rec.Source != source {
+	if rec.Reason != ReasonNoEvidence || rec.Source != source || rec.WindowSequence != 1 {
 		t.Fatalf("empty recommendation = %+v, want source %+v", rec, source)
 	}
 }
 
 func TestTrackerRequiresSustainedStableEvidenceAndAppliesCooldown(t *testing.T) {
 	policy := DefaultTrackerPolicy()
-	hot := Recommendation{
-		Source: testSource(balancedRange()),
-		Kind:   RecommendationBinarySplit, CandidateBin: 32,
-		CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
-	}
-	cold := Recommendation{Source: hot.Source, Kind: RecommendationNone, CurrentPressurePPM: 1_100_000}
+	hot := testBinaryRecommendation(testSource(balancedRange()), 1, 32)
 	var burst Tracker
 	if burst.Observe(hot, policy) {
 		t.Fatal("one-window burst qualified")
 	}
-	for range 7 {
+	for sequence := uint64(2); sequence <= 8; sequence++ {
+		cold := Recommendation{
+			Source: hot.Source, WindowSequence: sequence,
+			Kind: RecommendationNone, CurrentPressurePPM: 1_100_000,
+		}
 		if burst.Observe(cold, policy) {
 			t.Fatal("isolated burst qualified later")
 		}
@@ -322,14 +336,17 @@ func TestTrackerRequiresSustainedStableEvidenceAndAppliesCooldown(t *testing.T) 
 
 	var sustained Tracker
 	for i := 0; i < 7; i++ {
+		hot.WindowSequence = uint64(i + 1)
 		if sustained.Observe(hot, policy) {
 			t.Fatalf("qualified early at window %d", i+1)
 		}
 	}
+	hot.WindowSequence = 8
 	if !sustained.Observe(hot, policy) {
 		t.Fatal("eight stable hot windows did not qualify")
 	}
 	for i := 0; i < int(policy.CooldownWindows); i++ {
+		hot.WindowSequence++
 		if sustained.Observe(hot, policy) {
 			t.Fatalf("qualified during cooldown at window %d", i+1)
 		}
@@ -339,19 +356,19 @@ func TestTrackerRequiresSustainedStableEvidenceAndAppliesCooldown(t *testing.T) 
 func TestTrackerBoundaryDriftResetsEvidence(t *testing.T) {
 	policy := DefaultTrackerPolicy()
 	var tracker Tracker
-	rec := Recommendation{
-		Source: testSource(balancedRange()),
-		Kind:   RecommendationBinarySplit, CandidateBin: 10,
-		CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
-	}
-	for range 5 {
+	rec := testBinaryRecommendation(testSource(balancedRange()), 1, 10)
+	for sequence := uint64(1); sequence <= 5; sequence++ {
+		rec.WindowSequence = sequence
 		tracker.Observe(rec, policy)
 	}
 	rec.CandidateBin = 30
+	rec.Boundaries[0] = boundaryForRange(rec.Source.Range, 30)
+	rec.WindowSequence = 6
 	if tracker.Observe(rec, policy) {
 		t.Fatal("drifting candidate retained old evidence")
 	}
 	for i := 0; i < 6; i++ {
+		rec.WindowSequence++
 		if tracker.Observe(rec, policy) {
 			t.Fatalf("qualified before a complete post-drift window at %d", i)
 		}
@@ -360,22 +377,219 @@ func TestTrackerBoundaryDriftResetsEvidence(t *testing.T) {
 
 func TestTrackerResetsAcrossSourceFence(t *testing.T) {
 	policy := DefaultTrackerPolicy()
-	rec := Recommendation{
-		Source: testSource(balancedRange()), Kind: RecommendationBinarySplit,
-		CandidateBin: 32, CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
-	}
+	rec := testBinaryRecommendation(testSource(balancedRange()), 1, 32)
 	var tracker Tracker
-	for range 7 {
+	for sequence := uint64(1); sequence <= 7; sequence++ {
+		rec.WindowSequence = sequence
 		tracker.Observe(rec, policy)
 	}
 	rec.Source.OwnershipEpoch++
+	rec.WindowSequence = 1
 	if tracker.Observe(rec, policy) {
 		t.Fatal("new ownership epoch inherited old evidence")
 	}
 	for i := 0; i < 6; i++ {
+		rec.WindowSequence++
 		if tracker.Observe(rec, policy) {
 			t.Fatalf("new ownership epoch qualified early at %d", i)
 		}
+	}
+}
+
+func TestTrackerIgnoresReplayRegressionAndInvalidWindows(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	source := testSource(balancedRange())
+	rec := testBinaryRecommendation(source, 1, 32)
+	var tracker Tracker
+	if tracker.Observe(rec, policy) {
+		t.Fatal("first window qualified")
+	}
+	rec.WindowSequence = 2
+	if tracker.Observe(rec, policy) {
+		t.Fatal("second window qualified")
+	}
+
+	before := tracker
+	for _, invalid := range []Recommendation{
+		rec,
+		testBinaryRecommendation(source, 1, 32),
+		testBinaryRecommendation(source, 0, 32),
+	} {
+		if tracker.Observe(invalid, policy) {
+			t.Fatalf("ignored window qualified: %+v", invalid)
+		}
+		if tracker != before {
+			t.Fatalf("ignored window mutated tracker\n got: %+v\nwant: %+v", tracker, before)
+		}
+	}
+	invalidSource := testBinaryRecommendation(source, 3, 32)
+	invalidSource.Source.AllocationGeneration = 0
+	if tracker.Observe(invalidSource, policy) || tracker != before {
+		t.Fatalf("invalid source mutated tracker: %+v", tracker)
+	}
+}
+
+func TestTrackerSequenceGapStartsFreshEvidence(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	rec := testBinaryRecommendation(testSource(balancedRange()), 1, 32)
+	var tracker Tracker
+	for sequence := uint64(1); sequence <= 7; sequence++ {
+		rec.WindowSequence = sequence
+		if tracker.Observe(rec, policy) {
+			t.Fatalf("qualified before gap at %d", sequence)
+		}
+	}
+	rec.WindowSequence = 9
+	rec.CurrentPressurePPM = 1_200_000
+	if tracker.Observe(rec, policy) {
+		t.Fatal("gapped window inherited prior evidence")
+	}
+	if tracker.seen != 1 || tracker.lastSequence != 9 ||
+		tracker.fast != 1_200_000 || tracker.slow != 1_200_000 {
+		t.Fatalf("post-gap tracker = %+v, want one fresh window at sequence 9", tracker)
+	}
+	for sequence := uint64(10); sequence <= 15; sequence++ {
+		rec.WindowSequence = sequence
+		if tracker.Observe(rec, policy) {
+			t.Fatalf("qualified early after gap at %d", sequence)
+		}
+	}
+	rec.WindowSequence = 16
+	if !tracker.Observe(rec, policy) {
+		t.Fatal("eight contiguous post-gap windows did not qualify")
+	}
+}
+
+func TestTrackerRejectsMalformedActionableWindows(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	source := testSource(balancedRange())
+	var tracker Tracker
+	for sequence := uint64(1); sequence <= 16; sequence++ {
+		rec := testBinaryRecommendation(source, sequence, 32)
+		rec.Boundaries[0] = testPoint(7)
+		if tracker.Observe(rec, policy) {
+			t.Fatalf("malformed actionable window qualified at %d", sequence)
+		}
+	}
+	if tracker.history != 0 || tracker.stable {
+		t.Fatalf("malformed windows entered actionable history: %+v", tracker)
+	}
+}
+
+func TestTrackerEverySourceCoordinateStartsFresh(t *testing.T) {
+	base := testSource(balancedRange())
+	changes := []struct {
+		name   string
+		change func(*SourceIdentity)
+	}{
+		{"allocation", func(s *SourceIdentity) { s.AllocationGeneration++ }},
+		{"routing", func(s *SourceIdentity) { s.RoutingVersion++ }},
+		{"ownership", func(s *SourceIdentity) { s.OwnershipEpoch++ }},
+		{"range", func(s *SourceIdentity) {
+			s.Range.Start = testPoint(1)
+		}},
+	}
+	for _, test := range changes {
+		t.Run(test.name, func(t *testing.T) {
+			policy := DefaultTrackerPolicy()
+			var tracker Tracker
+			for sequence := uint64(1); sequence <= 7; sequence++ {
+				tracker.Observe(testBinaryRecommendation(base, sequence, 32), policy)
+			}
+			next := base
+			test.change(&next)
+			if tracker.Observe(testBinaryRecommendation(next, 1, 32), policy) {
+				t.Fatal("new source coordinate inherited old evidence")
+			}
+			if tracker.source != next || tracker.lastSequence != 1 || tracker.seen != 1 {
+				t.Fatalf("fresh tracker = %+v", tracker)
+			}
+		})
+	}
+}
+
+func TestTrackerSlowBoundaryWalkCannotQualify(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	source := testSource(balancedRange())
+	var tracker Tracker
+	for i := 0; i < int(policy.WindowCount); i++ {
+		rec := testBinaryRecommendation(source, uint64(i+1), uint8(10+i))
+		if tracker.Observe(rec, policy) {
+			t.Fatalf("one-bin boundary walk qualified at window %d", i+1)
+		}
+	}
+}
+
+func TestTrackerIsolationRequiresExactHotPoint(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	source := testSource(balancedRange())
+	hotA, hotB := testPoint(100), testPoint(101)
+	if binForRange(source.Range, hotA) != binForRange(source.Range, hotB) {
+		t.Fatal("test hot points must occupy the same compact bin")
+	}
+	var tracker Tracker
+	for sequence := uint64(1); sequence <= 5; sequence++ {
+		if tracker.Observe(testIsolateRecommendation(source, sequence, hotA), policy) {
+			t.Fatalf("first hot point qualified early at %d", sequence)
+		}
+	}
+	if tracker.Observe(testIsolateRecommendation(source, 6, hotB), policy) {
+		t.Fatal("different hot point inherited same-bin evidence")
+	}
+	for sequence := uint64(7); sequence <= 12; sequence++ {
+		if tracker.Observe(testIsolateRecommendation(source, sequence, hotB), policy) {
+			t.Fatalf("second hot point qualified early at %d", sequence)
+		}
+	}
+	if !tracker.Observe(testIsolateRecommendation(source, 13, hotB), policy) {
+		t.Fatal("eight exact hot-point windows did not qualify")
+	}
+}
+
+func TestTrackerSourceAllocationAndSequenceExhaustionFence(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	source := testSource(balancedRange())
+	var tracker Tracker
+	maxRec := testBinaryRecommendation(source, math.MaxUint64, 32)
+	if tracker.Observe(maxRec, policy) {
+		t.Fatal("first terminal-sequence window qualified")
+	}
+	before := tracker
+	if tracker.Observe(maxRec, policy) || tracker != before {
+		t.Fatal("terminal sequence replay mutated tracker")
+	}
+
+	source.AllocationGeneration++
+	rec := testBinaryRecommendation(source, 1, 32)
+	if tracker.Observe(rec, policy) {
+		t.Fatal("new allocation inherited terminal sequence evidence")
+	}
+	if tracker.source != source || tracker.lastSequence != 1 || tracker.seen != 1 {
+		t.Fatalf("new allocation tracker = %+v", tracker)
+	}
+}
+
+func TestTrackerGapPreservesCooldownAndReplayDoesNotAgeIt(t *testing.T) {
+	policy := DefaultTrackerPolicy()
+	rec := testBinaryRecommendation(testSource(balancedRange()), 1, 32)
+	var tracker Tracker
+	for sequence := uint64(1); sequence <= 8; sequence++ {
+		rec.WindowSequence = sequence
+		tracker.Observe(rec, policy)
+	}
+	if tracker.cooldown != policy.CooldownWindows {
+		t.Fatalf("cooldown = %d, want %d", tracker.cooldown, policy.CooldownWindows)
+	}
+	rec.WindowSequence = 10
+	if tracker.Observe(rec, policy) {
+		t.Fatal("gapped cooldown window qualified")
+	}
+	if tracker.cooldown != policy.CooldownWindows-1 {
+		t.Fatalf("gap cooldown = %d, want %d", tracker.cooldown, policy.CooldownWindows-1)
+	}
+	before := tracker
+	if tracker.Observe(rec, policy) || tracker != before {
+		t.Fatal("replayed cooldown window aged or mutated tracker")
 	}
 }
 
@@ -395,13 +609,22 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}); got != 0 {
 		t.Fatalf("Recommend allocs = %v", got)
 	}
+	trackerPolicy := DefaultTrackerPolicy()
+	rec := testBinaryRecommendation(sketch.source, 1, 32)
+	var tracker Tracker
+	if got := testing.AllocsPerRun(1_000, func() {
+		rec.WindowSequence++
+		_ = tracker.Observe(rec, trackerPolicy)
+	}); got != 0 {
+		t.Fatalf("Tracker.Observe allocs = %v", got)
+	}
 }
 
 func balancedSketch(t testing.TB) (*Sketch, SourceIdentity) {
 	t.Helper()
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
 	source := testSource(range_)
-	sketch, err := NewSketch(source)
+	sketch, err := NewSketch(source, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,8 +649,34 @@ func testPoint(value uint64) distribution.KeyspacePoint { return uint64Point(val
 
 func testSource(range_ distribution.KeyRange) SourceIdentity {
 	return SourceIdentity{
-		Distribution: "d", Shard: "s", Range: range_,
+		Distribution: "d", Shard: "s", AllocationGeneration: 1, Range: range_,
 		RoutingVersion: 1, OwnershipEpoch: 2,
+	}
+}
+
+func testBinaryRecommendation(source SourceIdentity, sequence uint64, bin uint8) Recommendation {
+	return Recommendation{
+		Source: source, WindowSequence: sequence,
+		Kind: RecommendationBinarySplit, Reason: ReasonNone,
+		Boundaries:    [2]distribution.KeyspacePoint{boundaryForRange(source.Range, int(bin))},
+		BoundaryCount: 1, CandidateBin: bin,
+		CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
+	}
+}
+
+func testIsolateRecommendation(
+	source SourceIdentity,
+	sequence uint64,
+	hot distribution.KeyspacePoint,
+) Recommendation {
+	var boundaries [2]distribution.KeyspacePoint
+	count := isolationBoundaries(source.Range, hot, &boundaries)
+	return Recommendation{
+		Source: source, WindowSequence: sequence,
+		Kind: RecommendationIsolatePoint, Reason: ReasonNone,
+		Boundaries: boundaries, BoundaryCount: count,
+		CandidateBin: uint8(binForRange(source.Range, hot)), HotPoint: hot,
+		CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
 	}
 }
 

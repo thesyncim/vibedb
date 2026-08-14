@@ -13,11 +13,18 @@ const PPM uint64 = 1_000_000
 // SourceIdentity fences a shadow recommendation to the exact serving range it
 // observed. A future workflow must compare every field before acting on it.
 type SourceIdentity struct {
-	Distribution   distribution.DistributionName
-	Shard          distribution.ShardID
-	Range          distribution.KeyRange
-	RoutingVersion distribution.RoutingVersion
-	OwnershipEpoch distribution.OwnershipEpoch
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	Range                distribution.KeyRange
+	RoutingVersion       distribution.RoutingVersion
+	OwnershipEpoch       distribution.OwnershipEpoch
+}
+
+func (s SourceIdentity) valid() bool {
+	return s.Distribution != "" && s.Shard != "" &&
+		s.AllocationGeneration != 0 && s.RoutingVersion != 0 &&
+		s.OwnershipEpoch != 0 && s.Range.Valid()
 }
 
 // CapacitySet describes current, binary-child, and optional isolated-point
@@ -86,9 +93,10 @@ const (
 // may carry one or two boundaries, producing two or three non-overlapping
 // children. UnsplittableHotKey carries HotPoint and no actionable boundary.
 type Recommendation struct {
-	Source SourceIdentity
-	Kind   RecommendationKind
-	Reason Reason
+	Source         SourceIdentity
+	WindowSequence uint64
+	Kind           RecommendationKind
+	Reason         Reason
 
 	Boundaries    [2]distribution.KeyspacePoint
 	BoundaryCount uint8
@@ -113,7 +121,7 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		return out
 	}
 	source := sketch.source
-	out.Source = source
+	out.Source, out.WindowSequence = source, sketch.sequence
 	if sketch.samples == 0 {
 		out.Reason = ReasonNoEvidence
 		return out

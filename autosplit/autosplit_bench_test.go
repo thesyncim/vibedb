@@ -8,7 +8,7 @@ import (
 )
 
 func BenchmarkSketchObservePoint(b *testing.B) {
-	sketch, _ := NewSketch(testSource(balancedRange()))
+	sketch, _ := NewSketch(testSource(balancedRange()), 1)
 	point := testPoint(0x7f00112233445566)
 	load := LoadVector{ResourceWriteCPU: 1, ResourceRequests: 1, ResourceLiveBytes: 1}
 	b.ReportAllocs()

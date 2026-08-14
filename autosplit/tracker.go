@@ -1,6 +1,10 @@
 package autosplit
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"github.com/thesyncim/vibedb/distribution"
+)
 
 // TrackerPolicy controls sustained-evidence admission. WindowCount is bounded
 // to 64; RequiredWindows qualifies that many of the last WindowCount windows.
@@ -25,17 +29,19 @@ func DefaultTrackerPolicy() TrackerPolicy {
 // Observe advances exactly one evidence window and reports whether a shadow
 // recommendation has qualified now.
 type Tracker struct {
-	source SourceIdentity
+	source       SourceIdentity
+	lastSequence uint64
 
 	history uint64
 	fast    uint64
 	slow    uint64
 
-	cooldown uint16
-	seen     uint8
-	lastBin  uint8
-	lastKind RecommendationKind
-	stable   bool
+	cooldown    uint16
+	seen        uint8
+	anchorBin   uint8
+	lastKind    RecommendationKind
+	stable      bool
+	anchorPoint distribution.KeyspacePoint
 }
 
 // Observe consumes one recommendation window. It applies fast (1/2) and slow
@@ -45,10 +51,33 @@ func (t *Tracker) Observe(rec Recommendation, policy TrackerPolicy) bool {
 		return false
 	}
 	policy = normalizeTrackerPolicy(policy)
+	if rec.WindowSequence == 0 || !rec.Source.valid() {
+		return false
+	}
 	if t.source != rec.Source {
 		// Never combine evidence across a routing generation, ownership epoch,
-		// range, shard, or distribution. Adopt the new source as a fresh window.
+		// allocation, range, shard, or distribution. Adopt the new source as a
+		// fresh window; its sequence belongs to a distinct incarnation.
 		*t = Tracker{source: rec.Source}
+	} else if t.lastSequence != 0 {
+		if rec.WindowSequence <= t.lastSequence {
+			// Replayed and regressed evidence cannot advance time, cool down, or
+			// alter the current qualification window.
+			return false
+		}
+		if rec.WindowSequence != t.lastSequence+1 {
+			// Sustained evidence means contiguous windows. A gap starts a new run,
+			// while retaining any active anti-flap cooldown conservatively.
+			t.resetEvidence()
+		}
+	}
+	t.lastSequence = rec.WindowSequence
+
+	qualifies := actionableRecommendation(rec)
+	if qualifies && t.stable && !t.sameTarget(rec, policy) {
+		// Drift is bounded against the first candidate in the sustained run, not
+		// merely the preceding window, so a boundary cannot walk cumulatively.
+		t.resetEvidence()
 	}
 	pressure := rec.CurrentPressurePPM
 	if t.seen == 0 {
@@ -58,20 +87,20 @@ func (t *Tracker) Observe(rec Recommendation, policy TrackerPolicy) bool {
 		t.slow = saturatingAdd(saturatingMul(t.slow, 7), pressure) / 8
 	}
 
-	qualifies := rec.Kind != RecommendationNone &&
-		rec.Kind != RecommendationUnsplittableHotKey &&
-		rec.BenefitPPM != 0
 	if qualifies {
-		if t.stable && (rec.Kind != t.lastKind || distance(rec.CandidateBin, t.lastBin) > policy.MaxBoundaryDrift) {
-			t.history, t.seen = 0, 0
+		if !t.stable {
+			t.anchorBin = rec.CandidateBin
+			t.anchorPoint = rec.HotPoint
+			t.lastKind, t.stable = rec.Kind, true
 		}
-		t.lastBin, t.lastKind, t.stable = rec.CandidateBin, rec.Kind, true
 	}
 
 	mask := uint64(1)<<policy.WindowCount - 1
 	t.history = (t.history << 1) & mask
 	if qualifies {
 		t.history |= 1
+	} else if t.history == 0 {
+		t.clearAnchor()
 	}
 	if t.seen < policy.WindowCount {
 		t.seen++
@@ -88,6 +117,57 @@ func (t *Tracker) Observe(rec Recommendation, policy TrackerPolicy) bool {
 	t.cooldown = policy.CooldownWindows
 	t.history, t.seen = 0, 0
 	return true
+}
+
+func (t *Tracker) resetEvidence() {
+	t.history = 0
+	t.fast = 0
+	t.slow = 0
+	t.seen = 0
+	t.clearAnchor()
+}
+
+func (t *Tracker) clearAnchor() {
+	t.anchorBin = 0
+	t.anchorPoint = distribution.KeyspacePoint{}
+	t.lastKind = RecommendationNone
+	t.stable = false
+}
+
+func (t *Tracker) sameTarget(rec Recommendation, policy TrackerPolicy) bool {
+	if rec.Kind != t.lastKind {
+		return false
+	}
+	switch rec.Kind {
+	case RecommendationBinarySplit:
+		return distance(rec.CandidateBin, t.anchorBin) <= policy.MaxBoundaryDrift
+	case RecommendationIsolatePoint:
+		return rec.HotPoint == t.anchorPoint
+	default:
+		return false
+	}
+}
+
+func actionableRecommendation(rec Recommendation) bool {
+	if rec.Reason != ReasonNone || rec.BenefitPPM == 0 {
+		return false
+	}
+	switch rec.Kind {
+	case RecommendationBinarySplit:
+		return rec.BoundaryCount == 1 && rec.CandidateBin > 0 &&
+			rec.CandidateBin < BinCount &&
+			rec.Boundaries[0] == boundaryForRange(rec.Source.Range, int(rec.CandidateBin))
+	case RecommendationIsolatePoint:
+		if !rec.Source.Range.Contains(rec.HotPoint) || rec.CandidateBin >= BinCount ||
+			int(rec.CandidateBin) != binForRange(rec.Source.Range, rec.HotPoint) {
+			return false
+		}
+		var boundaries [2]distribution.KeyspacePoint
+		count := isolationBoundaries(rec.Source.Range, rec.HotPoint, &boundaries)
+		return count != 0 && rec.BoundaryCount == count && rec.Boundaries == boundaries
+	default:
+		return false
+	}
 }
 
 // Pressures reports the current fast and slow fixed-point EWMAs.

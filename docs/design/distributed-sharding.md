@@ -1505,8 +1505,13 @@ current unavailability.
 A split requires a sustained threshold, a candidate boundary that improves the
 selected objective, sufficient destination capacity, and a cooldown since the
 last placement change. The planner estimates the increase in scatter queries
-before approving a boundary. Move and merge decisions use separate thresholds
-to prevent oscillation.
+before approving a boundary. Each evidence window is fenced to the exact shard
+allocation, routing version, ownership epoch, and a contiguous collector
+sequence: replayed or regressed windows are ignored and a missing window starts
+a fresh evidence run. Boundary drift is measured from the run's first candidate,
+and hot-point isolation requires the same exact point rather than merely the
+same histogram bin. Move and merge decisions use separate thresholds to prevent
+oscillation.
 
 One hot row, one hot tenant, and a raw-key sequential tail are reported as
 unsplittable rather than repeatedly resharded.
