@@ -170,19 +170,24 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	profile := e.profileFor(q.Class)
+	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	defer cancel()
 	args, err := queryRuntimeArgs(q.Params)
 	if err != nil {
 		return nil, err
 	}
-	profile := e.profileFor(q.Class)
 
 	var staleGen uint64
 	for attempt := 0; ; attempt++ {
-		snap, err := e.pin(ctx, attempt, staleGen)
+		if err := opctx.Err(); err != nil {
+			return nil, err
+		}
+		snap, err := e.pin(opctx, attempt, staleGen)
 		if err != nil {
 			return nil, err
 		}
-		prepared, err := snap.Prepare(ctx, q.SQL)
+		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
 			return nil, err
 		}
@@ -190,13 +195,13 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		pl, err := e.routeContext(ctx, snap, &q, bound, profile)
+		pl, err := e.routeContext(opctx, snap, &q, bound, profile)
 		if err != nil {
 			return nil, err
 		}
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
-		res, err := e.dispatch(ctx, pl, profile)
+		res, err := e.dispatch(opctx, pl, profile)
 		if err == nil {
 			res.RouteKind = pl.kind
 			res.Generation = pl.generation

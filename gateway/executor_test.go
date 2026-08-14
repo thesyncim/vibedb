@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -236,6 +237,60 @@ func TestExecutorStaleGenerationRetry(t *testing.T) {
 	}
 	if m := e.Metrics(); m.Retries != 1 {
 		t.Fatalf("metric retries = %d, want 1", m.Retries)
+	}
+}
+
+func TestExecutorGlobalDeadlineSpansRetryAndSingleRoute(t *testing.T) {
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	var dials int
+	client := NewClient(func(_ context.Context, _ string) (net.Conn, error) {
+		dials++
+		peer, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			if _, err := shardservice.DecodeRequest(server); err != nil {
+				return
+			}
+			if err := shardservice.EncodeResponse(server,
+				shardservice.NewErrorResponse(shardservice.ErrorRoutingVersion, "stale")); err != nil {
+				return
+			}
+			if _, err := shardservice.DecodeRequest(server); err != nil {
+				return
+			}
+			<-blocked
+		}()
+		return peer, nil
+	})
+	t.Cleanup(func() { _ = client.Close() })
+
+	profiles := DefaultProfiles()
+	interactive := profiles[ClassInteractive]
+	interactive.GlobalDeadline = 40 * time.Millisecond
+	interactive.PerShardDeadline = time.Second
+	profiles[ClassInteractive] = interactive
+	executor := NewExecutor(client, NewCatalogHolder(twoShardSnapshot(t, 1, 3)), Options{
+		Profiles:   profiles,
+		MaxRetries: 1,
+		Refresh: func(context.Context, uint64) (*Snapshot, error) {
+			return twoShardSnapshot(t, 2, 5), nil
+		},
+	})
+
+	started := time.Now()
+	_, err := executor.Query(context.Background(), Query{
+		SQL:   `SELECT n FROM messages WHERE tenant_id = 'a1'`,
+		Class: ClassInteractive,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("operation-wide 40ms deadline returned after %s", elapsed)
+	}
+	if dials != 1 {
+		t.Fatalf("stale connection was not reused for retry: dials = %d, want 1", dials)
 	}
 }
 
