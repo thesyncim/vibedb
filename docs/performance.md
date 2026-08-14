@@ -23,8 +23,15 @@ The old compact-default regression headline has reversed. At `8c11423`,
 single-client VibeDB is 1.26–1.47× Badger on YCSB-A, YCSB-B, YCSB-F, and churn;
 scan mix is the remaining exception at 0.93×. The 100% replacement lane rises
 from 237,524 ops/s at one client to 269,722 at 32 and remains 1.07× Badger at 32.
-Mixed churn does not share that scaling: it falls from 542,512.5 ops/s at one
-client to 127,940 at 32, only 0.24× Badger.
+Mixed churn shows the opposite client-count result: it falls from 542,512.5
+ops/s at one client to 127,940 at 32, only 0.24× Badger.
+
+Those client-count rows are not a pure same-trace scaling curve. At
+`clients=N`, each worker owns one disjoint contiguous corpus shard and uses an
+independently seeded Zipf stream within it, changing the aggregate hot set and
+key/leaf locality as `N` changes. Every engine receives the same deterministic
+per-shard traces at a fixed `N`, so the cross-engine ratios in each row remain
+fair.
 
 The optimization changed neither the storage format nor its retained footprint
 snapshot: immutable unified-bulk remains 0.973 MiB (low cardinality) and 6.609
@@ -288,6 +295,12 @@ cell is the median of ten run-level percentiles rather than a pooled quantile.
 
 Median total operations per second:
 
+At each fixed client count, every engine receives the same deterministic
+traces. Across client counts, `N` workers use `N` disjoint contiguous corpus
+shards and independently seeded per-shard Zipf streams. The cross-engine ratios
+are therefore comparable within a row, while one-to-`N` changes include a
+different aggregate hot set and locality rather than pure same-trace scaling.
+
 | workload | clients | vibedb | Badger | vibedb / Badger |
 | --- | ---: | ---: | ---: | ---: |
 | 100% replacement | 1 | **237,524** | 165,319.5 | **1.44×** |
@@ -305,11 +318,15 @@ Its current qualification lane is buffered-visible, schemaless, unindexed,
 and inline. Structural operations, overflow, split, and other unsupported
 cases retain exclusive fencing and fall back to the general path.
 
-Replacement throughput now scales modestly: +8.3% at eight clients and +13.6%
-at 32 relative to one client, remaining ahead of Badger. Mixed churn exposes an
+Observed replacement throughput is +8.3% at eight clients and +13.6% at 32
+relative to one client, remaining ahead of Badger. Mixed churn exposes an
 unresolved path: VibeDB falls to 37.1% and 23.6% of its one-client rate at 8 and
-32 clients while Badger scales up. Concurrent delete/restore work therefore
-remains a named follow-up; the replacement result is not generalized to it.
+32 clients while Badger rises. Internal counters identify contended bucket
+stripes and pressure folds whose cut includes a currently deleted row, forcing
+that leaf off the native replacement-patch path. The fixed 32-context pool is a
+memory bound, not an evidenced c32 throughput limit in this run. Concurrent
+delete/restore work therefore remains a named follow-up; the replacement result
+is not generalized to it.
 
 In the one-client replacement lane, VibeDB's post-workload image is 3.2 / 2.9
 MiB apparent / allocated versus Badger's 257.0 / 9.1 MiB. VibeDB's median Go

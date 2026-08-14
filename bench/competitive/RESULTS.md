@@ -45,11 +45,12 @@ This clean snapshot reverses the old compact-default regression headline.
 VibeDB is **1.26–1.47× Badger** on four of the five single-client mixed lanes;
 scan mix remains behind at **0.93×**. The checkpoint-tail regression is much
 smaller but not eliminated: VibeDB checkpoint p99 is 0.816–1.372 ms across the
-five lanes, still 8.74–13.45× Badger. The 100% replacement lane scales modestly
-and remains ahead at 32 clients, while mixed churn still loses throughput badly
-at 8 and 32 clients. The local CPU/scan gates were also rerun cleanly at the
-same commit. The older bulk-footprint and sustained-churn-disk sections were not
-rerun and retain explicit historical provenance below.
+five lanes, still 8.74–13.45× Badger. The 100% replacement lane has higher
+observed throughput and remains ahead at 32 clients, while mixed churn still
+loses throughput badly at 8 and 32 clients. The local CPU/scan gates were also
+rerun cleanly at the same commit. The older bulk-footprint and
+sustained-churn-disk sections were not rerun and retain explicit historical
+provenance below.
 
 ## Provenance and protocol
 
@@ -61,6 +62,12 @@ rerun and retain explicit historical provenance below.
   footprint; low cardinality unless a table says otherwise.
 - Throughput shape: 2,000 warmup operations, 20,000 measured operations,
   buffered-visible durability, and a CP64 acknowledged-mutation threshold.
+- Concurrent traces: at `clients=N`, each worker owns one disjoint contiguous
+  corpus shard and uses an independently seeded Zipf stream within that shard.
+  Every engine receives the same deterministic trace at a fixed `N`, so each
+  cross-engine row is comparable. Moving from one client to `N` clients also
+  changes the aggregate hot set and key/leaf locality, however, so it is not a
+  pure same-trace scaling curve.
 - Each throughput cell is the median of ten recorded repetitions. Engines run
   in isolated child processes, with deterministic Latin-square ordering and
   one unrecorded conditioning pass per engine.
@@ -126,7 +133,11 @@ VibeDB's ordered-scan p50/p99 is 2.431/2.692 ms versus Badger's 1.541/1.755 ms.
 
 Total operations per second, median of ten. `write` is 100% existing-key
 replacement; `churn` has the same 70/25/5 read/update/delete+restore mix as
-above. The leading engine per row is bold.
+above. At a fixed client count every engine receives the same deterministic
+per-shard traces, so the cross-engine ratios are fair. The client-count rows
+are not a pure same-trace scaling curve: `N` clients use `N` disjoint contiguous
+shards and independently seeded Zipf streams, expanding the aggregate hot set
+and changing key/leaf locality. The leading engine per row is bold.
 
 | workload | clients | vibedb | Badger | SQLite | Pebble | bbolt | vibedb / Badger |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -137,12 +148,16 @@ above. The leading engine per row is bold.
 | churn | 8 | 201,188 | **535,117.5** | 101,348.5 | 35,982 | 23,910.5 | 0.38× |
 | churn | 32 | 127,940 | **522,805.5** | 103,350 | 36,047 | 17,279.5 | 0.24× |
 
-Replacement throughput rises 8.3% at eight clients and 13.6% at 32 clients
-relative to one client; it stays 1.07× Badger at both larger counts. Mixed
-churn exposes a separate unresolved bottleneck: VibeDB falls to 37.1% and 23.6%
-of its one-client rate at 8 and 32 clients, while Badger scales up. The result is
-0.38× and 0.24× Badger. The replacement recovery must not be generalized to
-claim that concurrent delete/restore scaling is solved.
+Observed replacement throughput is 8.3% higher at eight clients and 13.6%
+higher at 32 clients than at one client; it stays 1.07× Badger at both larger
+counts. Mixed churn exposes a separate unresolved bottleneck: VibeDB falls to
+37.1% and 23.6% of its one-client rate at 8 and 32 clients, while Badger rises.
+The result is 0.38× and 0.24× Badger. Internal counters point to contended
+bucket stripes and pressure folds whose cut contains a currently deleted row,
+which makes that leaf leave the native replacement-patch path. The fixed
+32-context bound constrains retained scratch, but this c32 run does not identify
+context capacity as the bottleneck. The replacement recovery must not be
+generalized to claim that concurrent delete/restore scaling is solved.
 
 ### Write-lane resource envelope
 

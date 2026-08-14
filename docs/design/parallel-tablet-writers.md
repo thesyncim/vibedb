@@ -137,6 +137,12 @@ pressure-forced checkpoints occurred.
 The clean-root evidence, binary hashes, and eleven-TSV manifest are in the
 [competitive results](../../bench/competitive/RESULTS.md).
 
+At `clients=N`, each worker owns one disjoint contiguous corpus shard and uses
+an independently seeded Zipf stream within that shard. Every engine receives
+the same deterministic traces at a fixed `N`, so the cross-engine ratios below
+are fair. Changing `N` also changes the aggregate hot set and key/leaf locality,
+so the one-to-`N` columns are not a pure same-trace scaling curve.
+
 | Workload | Clients | VibeDB ops/s | Badger ops/s | VibeDB / Badger | VibeDB vs 1 client |
 |---|---:|---:|---:|---:|---:|
 | write | 1 | 237,524 | 165,319.5 | 1.44x | 1.00x |
@@ -146,14 +152,17 @@ The clean-root evidence, binary hashes, and eleven-TSV manifest are in the
 | churn | 8 | 201,188 | 535,117.5 | 0.38x | 0.37x |
 | churn | 32 | 127,940 | 522,805.5 | 0.24x | 0.24x |
 
-Replacement throughput now scales modestly: moving from one to eight clients
-adds 8.3%, and 32 clients are 13.6% above one client. VibeDB remains 1.07x
-ahead of Badger at both larger counts. Mixed churn is the counterexample: eight
-and 32 clients retain only 37.1% and 23.6% of the one-client VibeDB rate, while
-Badger scales up. The old `7fe6769` phase-one table predated compact primary
-storage and is retained in Git history rather than presented as current
-evidence. The shared visibility cut, fixed 32-context ceiling, checkpoint
-coordination, and delete/restore contention remain explicit limits.
+Observed replacement throughput at eight clients is 8.3% above one client,
+and 32 clients are 13.6% above one client. VibeDB remains 1.07x ahead of Badger
+at both larger counts. Mixed churn is the counterexample: eight and 32 clients
+retain only 37.1% and 23.6% of the one-client VibeDB rate, while Badger rises.
+The old `7fe6769` phase-one table predated compact primary storage and is
+retained in Git history rather than presented as current evidence. Current
+internal evidence points to contended bucket stripes and pressure folds whose
+cut contains a currently deleted row, forcing that leaf off the native
+replacement-patch path. The fixed 32-context pool remains a deliberate memory
+bound, but this c32 result does not identify context capacity as its throughput
+bottleneck.
 
 ## Next phases
 
