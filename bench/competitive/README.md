@@ -150,16 +150,24 @@ coarse power-of-16 ranges; exact count, sum, and maximum remain available.
 The output path is exclusive. Before publishing, every TSV must report all of
 the following:
 
-- `git-commit`, `mixed-build-vcs.revision`, and
-  `suite-build-vcs.revision` equal `$publication_commit`;
-- `git-dirty=false`, `mixed-build-vcs.modified=false`, and
-  `suite-build-vcs.modified=false`;
+- `git-commit=$publication_commit`, `git-dirty=false`, an empty `git-status`,
+  and `git-tracked-diff-sha256` equal to the SHA-256 of an empty byte stream;
+- identical nonempty `mixed-binary-sha256` and `suite-binary-sha256` values
+  across the full matrix, with those binary hashes and every TSV hash retained
+  in the results manifest;
 - the requested workload and client count, `repetitions=10`, and
   `conditioning=one discarded pass`;
 - `publishable-checkpoint-cadence=true`,
   `publishable-repetition-count=true`, and `publishable-suite=true`;
 - `maximum-forced-checkpoints=0`; and
 - ten samples in every published summary row.
+
+When Go emits `mixed-build-vcs.revision`, `suite-build-vcs.revision`, or the
+corresponding `vcs.modified` fields, they must also match the publication commit
+and report unmodified builds. The nested benchmark module may omit those fields
+because it replaces the repository root module. Their absence must be disclosed
+and must never be described as a clean binary stamp; the clean Git-root evidence
+and exact binary hashes above are then the publication identity.
 
 The tool records provenance but its `publishable-suite` field is not a
 substitute for these checks: cleanliness, the exact five-engine matrix, and a
@@ -181,12 +189,12 @@ go test ./store/durable \
 
 go test ./internal/storeio -run '^$' \
   -bench '^BenchmarkUnifiedLeafPlanStableCheckpointFold$' \
-  -benchmem -count=5 \
+  -benchmem -benchtime=1s -count=5 \
   | tee "$publication_dir/leaf-fold.txt"
 
 go test ./store/durable -run '^$' \
-  -bench '^(BenchmarkFilePrimaryOrderedScan|BenchmarkUnifiedCanonicalRenderLowCardinality|BenchmarkUnifiedCanonicalRenderHighCardinality|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStoreScanMasked)$' \
-  -benchmem -count=5 \
+  -bench '^(BenchmarkFilePrimaryOrderedScan|BenchmarkFilePrimaryOrderedScanAllBytes|BenchmarkUnifiedCanonicalRenderLowCardinality|BenchmarkUnifiedCanonicalRenderHighCardinality|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStoreScanMasked)$' \
+  -benchmem -benchtime=1s -count=5 \
   | tee "$publication_dir/scan.txt"
 )
 ```

@@ -1,70 +1,60 @@
 # Competitive results
 
-> **2026-08-10 focused development result (not a published-suite
-> replacement).** Five isolated 1-second runs of
-> `BenchmarkPointWriteSameSize/(vibedb|badger)/durability=buffered-visible`
-> measured a 7.295 µs VibeDB median and 7.821 µs Badger median on the Apple M4
-> Max. VibeDB is 6.7% lower-latency in this same-size replacement gate. Its
-> median allocation result was 339 B and 0 allocations versus Badger's 3,311 B
-> and 46 allocations. Before the compact column-patch change the VibeDB median
-> was 39.562 µs, making the focused engine path 5.42× faster. The
-> new byte-equivalence oracles compare single- and multi-shape column patches
-> against a complete compact rebuild, and an end-to-end harness test requires
-> the lane to engage rather than silently fall back. No storage-format or bulk
-> footprint bytes changed. A separate three-sample disjoint-bucket qualification
-> measured median replacement rates of 166.5k, 394.5k, and 718.5k ops/s at 1,
-> 8, and 32 clients, with zero allocations and no materialization or exclusive
-> fallbacks. The full mixed-workload tables below retain their
-> 2026-08-03 provenance until that complete protocol is regenerated.
+> **Clean published snapshot (2026-08-14).** The mixed-throughput and
+> concurrency tables were regenerated from engine commit
+> `8c1142322c96cfe8f99d04cd04683a5d827e6710` on an Apple M4 Max, with engines
+> run serially in isolated child processes.
+> Each of the eleven TSVs independently records that full Git commit,
+> `git-dirty=false`, an empty `git-status`, the empty tracked-diff SHA-256
+> `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, all
+> three publishability flags as `true`, and zero pressure-forced checkpoints.
+> The nested benchmark module does not carry Go `vcs.revision` or
+> `vcs.modified` build fields, so binary identity is pinned instead by exact
+> SHA-256: `b6e2b719d962787e42d0335d19a7d93c900c7fa162116c94a5a3c1d2115f8a18`
+> for `mixed` and
+> `856da49919a3cc65ac18944cfeb859c2bc91f0fe89c89f861f484adb95706bee`
+> for `mixedsuite`.
 
-> **Current published snapshot.** The mixed-throughput, concurrency, bulk
-> footprint, and CPU/scan-gate tables below were regenerated on 2026-08-03 from
-> engine commit `c1dea2b25d15d810efc85e65ad5f312f34b903e5` (branch `main`) on an
-> otherwise idle Apple M4 Max. Unlike the prior snapshot, these binaries were
-> **not** built from a clean tree: at regeneration the working tree carried
-> pending documentation and test changes **and one uncommitted non-test engine
-> change**, `store/durable/store_file_primary_mutation.go` (a three-line
-> `ErrPrimaryLeafSplitRequired` return on the primary mutation path; merged to
-> `main` as `aaa4dfa` after these measurements were taken). Every
-> regenerated binary therefore stamps `vcs.modified=true` and every suite TSV
-> records `git-dirty=true`; by rule 1 of the publishing rules these are
-> disclosed-dirty refresh measurements, not a clean-commit certified snapshot. An
-> artifact-verifiable clean control isolates that uncommitted change. Because Go
-> does not VCS-stamp linked-worktree builds, the control was built from a fresh
-> `git clone` checked out detached at `c1dea2b` (empty `git status --porcelain`,
-> no `store_file_primary_mutation.go` diff); both control binaries stamp
-> `vcs.revision=c1dea2b` and `vcs.modified=false`, certifying the clean build
-> independently of any runtime field. Run with those binaries, the control's
-> vibedb single-client YCSB-A median is 56,593.0 total-ops/s, 2.4% above the
-> dirty-tree published 55,256.5, and its Badger median is 266,553.5, 4.4% below
-> the published 278,694 — both within this lane's run-to-run variance. The
-> uncommitted change therefore does not materially move the published numbers,
-> and the regression below is attributable to committed
-> compact-primary-storage-default behavior, not to the uncommitted diff. That
-> control's own suite TSV still records `git-dirty=true` because the harness
-> resolves `git-root` from the process's runtime working directory — the shared
-> dirty main checkout — so that field describes the runtime environment, not the
-> certified build provenance the binaries' VCS stamp carries. The
-> "Disk under sustained churn" section was **not** re-run and retains its older
-> provenance, annotated in place.
+The local publication artifact directory was
+`/private/tmp/vibedb-publish-8c11423`. It is an ephemeral host path that is not
+checked into Git or available as a repository download. Its TSV manifest is:
 
-This snapshot supersedes and reverses the prior headline. The prior tables were
-stamped 2026-08-01 at clean commits `7fe6769` / `b5702bc`, which predate compact
-primary storage becoming the default (commit `55e1918`, 2026-08-02) and the
-subsequent optimization streak. Compact primary storage trades point- and
-update-path throughput for a dramatically smaller on-disk image. Measured at
-`c1dea2b`, single-client vibedb is now **0.20–0.30× Badger** on the update-heavy
-YCSB-A, YCSB-F, churn, and scan-mix workloads, and only the 95%-read YCSB-B lane
-remains ahead of Badger, at **1.13×**. In exchange the immutable unified-bulk
-image is **0.973 MiB** at low cardinality and **6.609 MiB** at high — smaller
-than the JSON corpus's own gzip-9 output. Both results are published as measured;
-the throughput regression is a named, accepted cost of the compact-storage and
-correctness work, not a defect to hide.
+| TSV basename | SHA-256 |
+| --- | --- |
+| `mixed-single-ycsb-a-c1.tsv` | `c1d412e5f58eb01204d50e8e884c9f52689be1d6458af4b3b46aea64e35b9418` |
+| `mixed-single-ycsb-b-c1.tsv` | `a67dad7aa59b093c1ca4dfd374445883ce785f2ff1dac051adc2ff00c8006ca7` |
+| `mixed-single-ycsb-f-c1.tsv` | `8babf0e1695d9fbfdb4115e8af5149a46ea332e9cad2ca2e532e91c208f4ed72` |
+| `mixed-single-churn-c1.tsv` | `b828beb463bee9d6a87609f66fcc55d91da80dfe5013d2130ba2e52220aafa4e` |
+| `mixed-single-scan-c1.tsv` | `be8e084d824c07a8bf0b4fe88cb8520bd91c45a8790646aae5295285b631baea` |
+| `mixed-concurrent-write-c1.tsv` | `f4b7609d902768b5e4391595410633a4df93967b3eb98b06188adecb52713caf` |
+| `mixed-concurrent-write-c8.tsv` | `7b0a342bef6a75d54cf40fd66c24ee7ff08bb843c2b10f9a238e8cc8594b3f93` |
+| `mixed-concurrent-write-c32.tsv` | `f5cb98fe01bddfddf8082af089176f6c3649ba7f8436107c6b3f543f80e468e1` |
+| `mixed-concurrent-churn-c1.tsv` | `04ab8d25419be83addcdf8d67f2f88bcab3adb7ae81704bd8a03454cc2eb153c` |
+| `mixed-concurrent-churn-c8.tsv` | `99391c09758ce12dae0377a6de2714dbc8819fe8497f0335fcb2b9a5d4c64805` |
+| `mixed-concurrent-churn-c32.tsv` | `89013a6f9fa8075893118a1c2f3b6b593c4d93088455f80f628029af3c9277d5` |
+
+The final clean micro-gate rerun retained these raw logs in the same local
+artifact directory; no `space.txt` footprint rerun is claimed:
+
+| raw micro-gate log | SHA-256 |
+| --- | --- |
+| `leaf-fold.txt` | `e3ca349ad81b9db70a6682633d302863e28e45095b94479107083526b9f7750f` |
+| `scan.txt` | `0c7e94b2f7425ec0f896bf61ace2dfd47d7a02b1853b178ebb4748d264b5b802` |
+
+This clean snapshot reverses the old compact-default regression headline.
+VibeDB is **1.26–1.47× Badger** on four of the five single-client mixed lanes;
+scan mix remains behind at **0.93×**. The checkpoint-tail regression is much
+smaller but not eliminated: VibeDB checkpoint p99 is 0.816–1.372 ms across the
+five lanes, still 8.74–13.45× Badger. The 100% replacement lane scales modestly
+and remains ahead at 32 clients, while mixed churn still loses throughput badly
+at 8 and 32 clients. The local CPU/scan gates were also rerun cleanly at the
+same commit. The older bulk-footprint and sustained-churn-disk sections were not
+rerun and retain explicit historical provenance below.
 
 ## Provenance and protocol
 
 - Machine: Apple M4 Max (16 logical CPUs, 64 GB), macOS / Darwin 25.3.0, APFS,
-  Go 1.26.5.
+  Go 1.26.0.
 - Competitors: bbolt 1.5.0, Badger 4.9.5, Pebble 1.1.5, modernc SQLite
   1.54.0.
 - Corpus: 10,000 documents for throughput and 100,000 for churn-disk and
@@ -78,10 +68,10 @@ correctness work, not a defect to hide.
   derived from the harness's exact byte columns.
 - Every suite records the commit, dirty bit, binary hash, effective options,
   corpus shape, engine order, repetitions, and pressure-forced checkpoints.
-  All regenerated suites report `maximum-forced-checkpoints=0` and the harness
-  fields `publishable-suite=true`, `publishable-checkpoint-cadence=true`, and
-  `publishable-repetition-count=true`; the single disqualifier from a *clean*
-  snapshot is `git-dirty=true` / `vcs.modified=true`, disclosed above.
+  All eleven suites report `maximum-forced-checkpoints=0`,
+  `publishable-suite=true`, `publishable-checkpoint-cadence=true`, and
+  `publishable-repetition-count=true`, as well as the clean Git-root evidence
+  and identical binary hashes listed above.
 - Correctness is checked outside timed intervals: corpus shape, operation
   trace, final key/value state, and complete consumption of returned scan
   bytes.
@@ -103,37 +93,34 @@ Total operations per second, median of ten. The leading engine per row is bold.
 
 | workload | vibedb | Badger | SQLite | Pebble | bbolt | vibedb / Badger |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| YCSB-A: 50% read, 50% update | 55,256.5 | **278,694** | 106,493.5 | 24,601 | 22,270.5 | 0.20× |
-| YCSB-B: 95% read, 5% update | **1,131,998.5** | 999,254 | 314,282.5 | 215,019 | 208,194.5 | **1.13×** |
-| YCSB-F: 50% read, 50% read-modify-write | 55,673 | **254,557** | 95,063 | 23,583.5 | 21,693 | 0.22× |
-| Churn: 70% read, 25% update, 5% delete+restore | 77,564 | **340,236** | 120,195.5 | 31,984 | 27,478.5 | 0.23× |
-| Scan mix: 79.9% read, 15% update, 5% delete+restore, 0.1% full scan | 73,749.5 | **248,360** | 112,273.5 | 43,804 | 39,230 | 0.30× |
+| YCSB-A: 50% read, 50% update | **374,293** | 296,759 | 98,928.5 | 25,975 | 21,623 | **1.26×** |
+| YCSB-B: 95% read, 5% update | **1,396,465.5** | 1,024,235.5 | 301,115.5 | 222,450 | 208,415 | **1.36×** |
+| YCSB-F: 50% read, 50% read-modify-write | **387,114** | 264,666 | 87,362 | 27,068.5 | 23,272.5 | **1.46×** |
+| Churn: 70% read, 25% update, 5% delete+restore | **563,800** | 383,864 | 127,748.5 | 35,623.5 | 30,745 | **1.47×** |
+| Scan mix: 79.9% read, 15% update, 5% delete+restore, 0.1% full scan | 255,356 | **274,536.5** | 113,481 | 46,365 | 40,163 | 0.93× |
 
-The read-dominated YCSB-B lane is the only one vibedb still leads: 1.13× Badger
-and 3.60× SQLite. On the four update-heavy lanes vibedb now trails Badger by
-3.3–5.0× and is also below SQLite on YCSB-A (0.52×) and YCSB-F (0.59×). The
-compact primary leaf must render and re-plan on the mutation path; the CPU-gate
-section quantifies the per-leaf render cost that this throughput regression
-tracks.
+VibeDB leads Badger by 26–47% on YCSB-A, YCSB-B, YCSB-F, and churn. Scan mix
+is the exception: its full ordered scan remains slower, leaving aggregate
+throughput 7% behind Badger even though its point mutations are fast.
 
 ### vibedb operation latency
 
 Median of the ten run-level percentiles, microseconds:
 
-| workload | operation p50 / p99 | checkpoint p50 / p99 |
+| workload | operation p50 / p95 / p99 | checkpoint p50 / p95 / p99 |
 | --- | ---: | ---: |
-| YCSB-A | read 0.167 / 1.25; update 5.0625 / 36.583 | 32.5835 / 18,555.0625 |
-| YCSB-B | read 0.125 / 1.042; update 5.167 / 197.312 | 199.417 / 891.312 |
-| YCSB-F | read 0.167 / 1.25; RMW 5.25 / 38.0415 | 34.041 / 18,600.2915 |
-| Churn | read 0.167 / 1.25; update 5.125 / 40.3745; delete+restore 8.9585 / 50.771 | 35.875 / 20,052.979 |
-| Scan mix | read 0.375 / 2.3125; update 5.417 / 41.5415; delete+restore 9.583 / 59.8125; ordered scan 5,338.375 / 5,697.3545 | 38.5835 / 19,238.4375 |
+| YCSB-A | read 0.167 / 1.0205 / 1.1665; update 2.3335 / 3.8335 / 31.792 | 30.167 / 169.604 / 1,226.625 |
+| YCSB-B | read 0.125 / 0.8955 / 1.0205; update 2.458 / 3.896 / 62.313 | 193.417 / 230.771 / 1,099.2915 |
+| YCSB-F | read 0.167 / 1.0205 / 1.166; RMW 2.583 / 4.5 / 33.437 | 31.271 / 283.271 / 815.6035 |
+| Churn | read 0.125 / 1 / 1.1455; update 2.416 / 4.3125 / 31.187; delete+restore 2.25 / 4.75 / 39.687 | 29.5 / 273.458 / 1,012.8335 |
+| Scan mix | read 0.208 / 1 / 1.166; update 2.417 / 4.3125 / 33.5415; delete+restore 2.375 / 5 / 46.375; ordered scan 2,430.833 / 2,579.583 / 2,691.667 | 33.4165 / 266.125 / 1,371.521 |
 
-Point-read p50 stays sub-microsecond, but update p50 rose to 5.06–5.42 µs (from 1.83–1.90 µs
-pre-compact) and the checkpoint p99 rose to 18.6–20.1 ms on the update-heavy
-lanes (from 40.6–44.8 µs). The compact checkpoint fold is the dominant new tail:
-folding a mutated compact stripe on the foreground checkpoint path is far more
-expensive than the prior in-place leaf write. YCSB-B, whose 5% update rate keeps
-checkpoints small, retains a sub-millisecond checkpoint p99 (891.312 µs).
+Point-read p50 remains 0.125–0.208 µs and update p50 is 2.3335–2.458 µs.
+Checkpoint p99 is now 0.816–1.372 ms, more than an order of magnitude below the
+stale snapshot, but Badger is still materially better at that tail: its five
+checkpoint-p99 medians are 81.8545–115.771 µs, making VibeDB 8.74–13.45× slower
+there. In scan mix,
+VibeDB's ordered-scan p50/p99 is 2.431/2.692 ms versus Badger's 1.541/1.755 ms.
 
 ## Concurrent replacement and churn
 
@@ -143,25 +130,44 @@ above. The leading engine per row is bold.
 
 | workload | clients | vibedb | Badger | SQLite | Pebble | bbolt | vibedb / Badger |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| write | 1 | 27,257 | **160,065** | 62,483 | 12,501 | 11,079 | 0.17× |
-| write | 8 | 25,202 | **225,019.5** | 50,881 | 13,356 | 11,668 | 0.11× |
-| write | 32 | 24,578.5 | **244,008.5** | 52,943.5 | 13,147 | 11,212 | 0.10× |
-| churn | 1 | 80,515.5 | **355,861** | 136,716.5 | 34,145.5 | 30,283 | 0.23× |
-| churn | 8 | 76,935.5 | **502,165** | 103,564.5 | 38,027 | 26,259 | 0.15× |
-| churn | 32 | 75,235 | **538,896.5** | 103,092 | 38,789.5 | 18,825.5 | 0.14× |
+| write | 1 | **237,524** | 165,319.5 | 56,455 | 13,067 | 11,157 | **1.44×** |
+| write | 8 | **257,265.5** | 239,677 | 50,095 | 13,356 | 10,993 | **1.07×** |
+| write | 32 | **269,722** | 252,644 | 46,708 | 13,332.5 | 10,800 | **1.07×** |
+| churn | 1 | **542,512.5** | 370,904.5 | 129,581 | 35,827.5 | 31,679 | **1.46×** |
+| churn | 8 | 201,188 | **535,117.5** | 101,348.5 | 35,982 | 23,910.5 | 0.38× |
+| churn | 32 | 127,940 | **522,805.5** | 103,350 | 36,047 | 17,279.5 | 0.24× |
 
-The concurrency picture also reversed. vibedb does not scale with client count
-in this lane: replacement throughput edges *down* from 27,257 to 24,578.5
-(1 → 32 clients) and churn from 80,515.5 to 75,235, because the compact
-mutation-and-fold path serializes on the foreground checkpoint. Badger scales up
-(write 1.52×, churn 1.51× from 1 to 32), so the vibedb / Badger ratio falls as
-clients rise. Restoring concurrent scaling on the compact mutation path is the
-named follow-up here.
+Replacement throughput rises 8.3% at eight clients and 13.6% at 32 clients
+relative to one client; it stays 1.07× Badger at both larger counts. Mixed
+churn exposes a separate unresolved bottleneck: VibeDB falls to 37.1% and 23.6%
+of its one-client rate at 8 and 32 clients, while Badger scales up. The result is
+0.38× and 0.24× Badger. The replacement recovery must not be generalized to
+claim that concurrent delete/restore scaling is solved.
+
+### Write-lane resource envelope
+
+These are medians from the 100% replacement, one-client TSV after the measured
+10,000-document workload. Disk cells are **apparent / allocated filesystem
+MiB**; `heap`, runtime-resident memory, and peak RSS have different scopes and
+must not be combined. This is not a replacement for the 100,000-document bulk
+or sustained-churn space tables below.
+
+| engine | disk MiB, apparent / allocated | heap / runtime MiB | peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| VibeDB | 3.2 / 2.9 | 45.6 / 55.7 | 51.9 |
+| Badger | 257.0 / 9.1 | 86.1 / 96.55 | 90.9 |
+| SQLite | 2.8 / 2.8 | 2.5 / 11.25 | 41.8 |
+| Pebble | 3.5 / 3.6 | 2.8 / 11.75 | 45.0 |
+| bbolt | 16.1 / 16.1 | 2.5 / 11.8 | 43.55 |
+
+VibeDB's apparent image is 80.3× smaller than Badger's in this lane and its
+allocated blocks are 3.14× smaller. It is 0.4 MiB larger than SQLite by
+apparent size while using 0.1 MiB more allocated blocks.
 
 ## Disk under sustained churn
 
-> **Not re-run in the 2026-08-03 pass.** The tables in this section retain their
-> 2026-08-01 provenance from clean commit
+> **Historical; not re-run in the 2026-08-14 pass.** The tables in this section
+> retain their 2026-08-01 provenance from clean commit
 > `7fe67691dd889a34951682d2522661c7741d8720`, which predates compact primary
 > storage becoming the default. The `cmd/churndisk` matrix (five engines × two
 > cardinalities × two profiles, each a sustained 200,000-mutation run) exceeds
@@ -169,14 +175,16 @@ named follow-up here.
 > below reflect the pre-compact-default online-churn representation, they are
 > **stale relative to the current default** and are kept only to avoid deleting
 > published data; treat every vibedb cell here as pending a compact-default
-> re-measurement. Partial vibedb-only churn-disk probes *were* re-run at
-> `c1dea2b` (saved in the raw logs; not published as table cells because the
-> cross-engine matrix was not re-run). They measure the current compact-default
-> online image well below these pre-compact rows — for example high-cardinality
+> re-measurement. Partial VibeDB-only churn-disk probes were run at
+> `c1dea2b` (saved in the old raw logs; not published as table cells because the
+> cross-engine matrix was not re-run). Those historical diagnostics measured a
+> compact-default online image well below these pre-compact rows — for example
+> high-cardinality
 > intrinsic online 22.376 / 18.168 MiB (23,462,912 / 19,050,496 bytes) versus the
 > 54.841 / 36.070 shown here, and low-cardinality online 5.497 / 5.426 MiB versus
 > 22.075 / 16.020 — so the retained vibedb numbers are conservative: they
-> understate, not overstate, the current default.
+> overstate its space use and understate its compactness; they are not current
+> cross-engine evidence.
 
 `cmd/churndisk` keeps 100,000 documents live through 200,000 acknowledged
 state changes. Eighty percent of random choices are one-change replacements;
@@ -213,11 +221,17 @@ same measurement as above.
 | Pebble, Snappy (median of 3) | 79.133 / 81.129 | 58.445 / 54.203 | 84.244 / 86.055 | 76.311 / 70.730 |
 | Badger, Snappy | 273.948 / 31.820 | 273.948 / 31.820 | 279.414 / 37.285 | 279.414 / 37.285 |
 
-These pre-compact online rows are retained for continuity only; the current
-default's online-churn image is expected to differ and is a named
-re-measurement.
+These pre-compact online rows are retained for continuity only. They do not
+support a present-tense space ranking for the current engine; a clean
+compact-default churn-disk matrix remains a separate publication requirement.
 
 ## Bulk footprint
+
+> **Retained exact-byte snapshot; not re-run in the 2026-08-14 pass.** These
+> cells retain their 2026-08-03 `c1dea2b` provenance and the disclosed-dirty
+> status of that older run. The subsequent performance work did not change the
+> storage format and byte-parity tests remain green, but that is not presented
+> as a new footprint measurement.
 
 The low- and high-cardinality corpora have identical shape and length:
 24,881,153 JSON bytes (23.729 MiB) plus 1,200,000 key bytes (1.144 MiB), or
@@ -266,31 +280,28 @@ point-put apparent image (11.821 MiB) exceeds the immutable unified-bulk image
 
 ## Current CPU and scan gates
 
-These five-sample Go microbenchmarks were re-run on 2026-08-03 at engine commit
-`c1dea2b` on the same host, except for the masked-scan row noted below. They are
-regression gates, not cross-engine database results.
+These five-sample, one-second Go microbenchmark medians were run from a fresh
+detached worktree at exact commit `8c11423`, with an empty Git status, on the
+same Apple M4 Max. They are local regression gates, not cross-engine database
+results. Every row reports 0 B and 0 allocations.
 
 | gate | median | allocation |
 | --- | ---: | ---: |
-| stable native checkpoint leaf fold | **1.826 µs** | 0 B, 0 allocs |
-| full render/replan/encode of that leaf | 248.532 µs | 0 B, 0 allocs |
-| ordered scan, 100k three-scalar documents | 117.4 ns/document | 0 B, 0 allocs |
-| full competitive scan, low cardinality | 328.6 ns/document | 0 B, 0 allocs |
-| full competitive scan, high cardinality | 471.5 ns/document | 0 B, 0 allocs |
-| masked scan, one occupied row per live posting tile | 631.5 ns/selected document | 0 B, 0 allocs |
+| stable native checkpoint leaf patch | **1.852 µs** | 0 B, 0 allocs |
+| generic render/plan/encode of that leaf | 255.438 µs | 0 B, 0 allocs |
+| ordered scan, 100k three-scalar documents, first byte | 75.63 ns/document | 0 B, 0 allocs |
+| ordered scan, same corpus, all bytes | 89.08 ns/document | 0 B, 0 allocs |
+| competitive canonical render, low cardinality | 160.7 ns/document | 0 B, 0 allocs |
+| competitive canonical render, high cardinality | 340.9 ns/document | 0 B, 0 allocs |
+| competitive all-byte scan, low cardinality | 235.2 ns/document | 0 B, 0 allocs |
+| competitive all-byte scan, high cardinality | 415.5 ns/document | 0 B, 0 allocs |
+| masked scan, one occupied row per live posting tile | 579.0 ns/selected document | 0 B, 0 allocs |
 
-The certified native fold is about 136× faster than full replanning
-(248.532 / 1.826 µs). The ordered-scan and full-competitive-scan gates regressed
-against their pre-compact 2026-08-01 values (23.49 → 117.4 ns/document ordered;
-91.57 / 94.21 → 328.6 / 471.5 ns/document competitive): reconstructing a compact
-leaf on the read path is the same cost that depresses the update-heavy
-throughput lanes. The masked-scan setup was repaired after compact stripes
-replaced the retired class-5 leaves it inspected. That row is the median of
-five 1-second samples run on 2026-08-10 at `387707c` plus the benchmark/test
-fix, with Go 1.26.0 on the same Apple M4 Max. Samples ranged from 626.3 to
-634.9 ns/selected document, with 0.2502 page pins per selected document, zero
-cache misses, and zero allocations. The prior 178.4 ns/selected-document figure
-is not carried forward because it predates compact primary storage.
+The native patch is about 137.9× faster than generic render/plan/encode. The
+competitive all-byte rows consume 248.8 returned bytes per document, equivalent
+to about 1.058 GB/s at low cardinality and 599 MB/s at high. The masked row
+records 0.2502 page pins per selected document and zero cache misses. The
+end-to-end scan-mix result above remains authoritative for the database ranking.
 
 ## Publishing rules
 
@@ -307,19 +318,21 @@ A replacement snapshot must:
 8. name the storage profile and effective compression for every disk row; and
 9. keep database results, microbenchmarks, and projections separate.
 
-This snapshot satisfies rules 2–9. It does not satisfy rule 1's clean-tree
-expectation: it was regenerated against a dirty working tree and every binary
-stamps `vcs.modified=true`. That deviation is disclosed at the top of this file
-and in every saved TSV's `git-status` meta field. The rationale and complete
-harness contract are in the [competitive benchmark guide](README.md).
+The 2026-08-14 timing refresh satisfies rules 1–5 and 9 for the sections it
+replaces. All eleven TSVs carry the same clean Git-root evidence and exact
+binary hashes. The nested benchmark module does not expose Go VCS build fields;
+their absence is not silently converted into a clean stamp. This pass is not a
+replacement footprint or churn-disk snapshot under rules 6–8; those older
+sections are explicitly excluded from the refresh and retain their own
+provenance. The complete harness contract is in the
+[competitive benchmark guide](README.md).
 
 ## Reproduction
 
-From `bench/competitive`. On a clean tree the binaries will stamp
-`vcs.modified=false`; the tables above were produced on a dirty tree, so a
-faithful reproduction of the *published* numbers must use commit `c1dea2b`, and a
-clean-commit re-run is the named follow-up before re-asserting any headline
-ratio.
+From `bench/competitive`, with the repository checked out at
+`8c1142322c96cfe8f99d04cd04683a5d827e6710`. Build and write artifacts outside
+the worktree. A faithful refresh requires all eleven complete five-engine TSVs;
+a diagnostic A/B pair or one workload cannot replace this snapshot.
 
 ```sh
 go test . \
@@ -327,20 +340,31 @@ go test . \
   -count=1 -timeout=60m
 go test ./cmd/... -count=1 -timeout=60m
 
-go build -trimpath -o /tmp/vibedb-mixed ./cmd/mixed
-go build -trimpath -o /tmp/vibedb-mixedsuite ./cmd/mixedsuite
+test -z "$(git status --porcelain=v1 --untracked-files=normal)"
+publication_commit=$(git rev-parse HEAD)
+publication_dir=$(mktemp -d /tmp/vibedb-publish.XXXXXX)
+publication_engines=vibedb,bbolt,badger,pebble,sqlite
 
-# Single-client matrix: run each workload separately.
-/tmp/vibedb-mixedsuite -mixed-bin=/tmp/vibedb-mixed \
-  -workload=<ycsb-a|ycsb-b|ycsb-f|churn|scan> -clients=1 \
-  -durability=buffered-visible -checkpoint-mutations=64 \
-  -repetitions=10 -output=<file.tsv>
+go build -trimpath -o "$publication_dir/mixed" ./cmd/mixed
+go build -trimpath -o "$publication_dir/mixedsuite" ./cmd/mixedsuite
 
-# Concurrent matrix: run each workload/client pair separately.
-/tmp/vibedb-mixedsuite -mixed-bin=/tmp/vibedb-mixed \
-  -workload=<write|churn> -clients=<1|8|32> \
-  -durability=buffered-visible -checkpoint-mutations=64 \
-  -repetitions=10 -output=<file.tsv>
+for workload in ycsb-a ycsb-b ycsb-f churn scan; do
+  "$publication_dir/mixedsuite" -mixed-bin="$publication_dir/mixed" \
+    -engines="$publication_engines" \
+    -workload="$workload" -durability=buffered-visible \
+    -clients=1 -checkpoint-mutations=64 -repetitions=10 \
+    -output="$publication_dir/mixed-single-${workload}-c1.tsv"
+done
+
+for workload in write churn; do
+  for clients in 1 8 32; do
+    "$publication_dir/mixedsuite" -mixed-bin="$publication_dir/mixed" \
+      -engines="$publication_engines" \
+      -workload="$workload" -durability=buffered-visible \
+      -clients="$clients" -checkpoint-mutations=64 -repetitions=10 \
+      -output="$publication_dir/mixed-concurrent-${workload}-c${clients}.tsv"
+  done
+done
 
 go build -trimpath -o /tmp/vibedb-churndisk ./cmd/churndisk
 go build -trimpath -o /tmp/vibedb-footprint ./cmd/footprint
@@ -352,5 +376,5 @@ go build -trimpath -o /tmp/vibedb-footprint ./cmd/footprint
 # vibedb point-put build image adds -putloop.
 ```
 
-Run timing lanes serially on an otherwise idle host. The exact micro-gate
-commands are listed in the [benchmark guide](README.md).
+Run timing lanes serially, without competing benchmark engines. The exact
+micro-gate commands are listed in the [benchmark guide](README.md).

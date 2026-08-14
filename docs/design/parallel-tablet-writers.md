@@ -1,7 +1,8 @@
 # Parallel primary writers
 
-**Status:** first phase implemented at commit `7fe6769` for the buffered-visible,
-schemaless, unindexed primary path.
+**Status:** first phase implemented at commit `7fe6769`; the current
+compact-default buffered-visible, schemaless, unindexed primary path was
+qualified at clean commit `8c11423`.
 
 The filename is historical. The implementation does not assign one writer token
 per tablet: it hashes the full routed `BucketID` (the leaf identity) into 4,096
@@ -127,27 +128,32 @@ The concurrent-primary tests exercise the boundaries above, including:
 - unsupported-shape fallback, bounded pressure retry, fixed scratch capacity,
   exhaustion wakeups, and unique context ownership under CAS stress.
 
-## Measured result at `7fe6769`
+## Current compact-default result at `8c11423`
 
-On an Apple M4 Max, the clean buffered-visible CP64 qualification used a 10,000
-document corpus, 2,000 warmup operations, 20,000 measured operations, and the
-median of 10 isolated repetitions. No forced checkpoint occurred.
+On an Apple M4 Max, the clean buffered-visible CP64 qualification ran engines
+serially and used a 10,000-document corpus, 2,000 warmup operations, 20,000
+measured operations, and the median of 10 isolated repetitions. No
+pressure-forced checkpoints occurred.
+The clean-root evidence, binary hashes, and eleven-TSV manifest are in the
+[competitive results](../../bench/competitive/RESULTS.md).
 
 | Workload | Clients | VibeDB ops/s | Badger ops/s | VibeDB / Badger | VibeDB vs 1 client |
 |---|---:|---:|---:|---:|---:|
-| write | 1 | 408,754 | 173,801 | 2.35x | 1.00x |
-| write | 8 | 623,981 | 249,858 | 2.50x | 1.53x |
-| write | 32 | 648,989 | 272,192 | 2.38x | 1.59x |
-| churn | 1 | 1,087,409 | 396,311 | 2.74x | 1.00x |
-| churn | 8 | 1,621,066 | 594,384 | 2.73x | 1.49x |
-| churn | 32 | 1,730,923 | 590,288 | 2.93x | 1.59x |
+| write | 1 | 237,524 | 165,319.5 | 1.44x | 1.00x |
+| write | 8 | 257,265.5 | 239,677 | 1.07x | 1.08x |
+| write | 32 | 269,722 | 252,644 | 1.07x | 1.14x |
+| churn | 1 | 542,512.5 | 370,904.5 | 1.46x | 1.00x |
+| churn | 8 | 201,188 | 535,117.5 | 0.38x | 0.37x |
+| churn | 32 | 127,940 | 522,805.5 | 0.24x | 0.24x |
 
-The honest scaling result is saturation after eight clients: moving from 8 to
-32 clients adds only 4.0% for write and 6.8% for churn. The phase removes the
-one-writer-per-tablet staging bottleneck and remains 2.38-2.93x ahead of Badger
-in these measured lanes, but it does not establish linear 32-writer scaling.
-The serialized publisher, shared visibility cut, fixed 32-context ceiling, and
-same-leaf/stripe contention are the explicit remaining limits.
+Replacement throughput now scales modestly: moving from one to eight clients
+adds 8.3%, and 32 clients are 13.6% above one client. VibeDB remains 1.07x
+ahead of Badger at both larger counts. Mixed churn is the counterexample: eight
+and 32 clients retain only 37.1% and 23.6% of the one-client VibeDB rate, while
+Badger scales up. The old `7fe6769` phase-one table predated compact primary
+storage and is retained in Git history rather than presented as current
+evidence. The shared visibility cut, fixed 32-context ceiling, checkpoint
+coordination, and delete/restore contention remain explicit limits.
 
 ## Next phases
 
@@ -161,9 +167,10 @@ same-leaf/stripe contention are the explicit remaining limits.
 3. **Structural paths:** parallelize safe route/preparation work for overflow,
    split, slot-exhaustion, and final-row deletion while retaining one exclusive
    topology change and page-retirement fence.
-4. **Publication scaling:** profile the 8-to-32 plateau, shorten or shard work
-   before the visibility cut where correctness permits, and only raise the
-   context cap when measurements show that retained scratch buys throughput.
+4. **Publication scaling:** isolate the concurrent churn collapse without
+   regressing the replacement lane, shorten or shard work before the visibility
+   cut where correctness permits, and only raise the context cap when
+   measurements show that retained scratch buys throughput.
 
 None of these extensions may weaken bounded memory, stable-slot identity,
 snapshot generations, crash semantics, or the exclusive checkpoint fence.
