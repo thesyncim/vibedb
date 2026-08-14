@@ -726,10 +726,7 @@ func (c *Collection) commitPrimaryStructural(
 	// transactions are amortized rare (one per full/empty leaf), so this device
 	// flush is not on the steady-state mutation path.
 	if c.deferredCanonicalLane() {
-		if flushErr := c.committer.Flush(); flushErr != nil {
-			return flushErr
-		}
-		c.cache.MarkDurable(c.committer.DurableGeneration())
+		return c.flushPublishedPhysicalLocked()
 	}
 	return nil
 }

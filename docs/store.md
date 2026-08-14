@@ -87,10 +87,11 @@ have authority to create, open, write, and synchronize that sibling, and must
 move, back up, or restore the primary and journal as one pair. Anonymous,
 unlinked, relative-name, and stale-name descriptors are rejected before the
 primary is mutated. Standalone open fails closed with a typed in-doubt error
-when the journal's live window holds an uncovered conditional (kind-5) record:
-the file participates in a database transaction and must be opened through its
-database directory. After the collection checkpoints past that record, the
-file is self-contained again.
+when the journal's live window holds any retained kind-4 `ConditionalBatch`,
+including one whose generation the selected root appears to cover: the file
+participates in a database transaction and must be opened through its database
+directory. A resolver-backed open must successfully fold and recycle that
+record before the file is self-contained again.
 
 `AdvancedOptions` contains the low-level engine configuration. One centralized
 validation pass rejects profile/engine durability conflicts, disk options in
@@ -370,37 +371,38 @@ Fresh and bulk-built ordinary buffered-visible stores initially have no
 recovery-journal sibling. The first valid mutation mints the bounded file in
 the foreground, and the first `Flush` or pressure checkpoint physically roots
 its identity. After that one-time transition, an eligible class-5-only `Flush`
-can persist the complete consecutive overlay interval as one format-v1 batch
-and one sync without rewriting the physical root. Compact entries cover
-existing-key integer, boolean, or null replacements; deletes and unqualified
-puts retain logical full redo. A structural publication, interval gap, exact
+can persist the complete consecutive overlay interval as one kind-5
+`DeltaBatch` and one sync without rewriting the physical root. Every entry is a
+complete logical put or delete. A structural publication, interval gap, exact
 capacity miss, or staging-pressure guard falls back to the bounded physical
 checkpoint. Journal creation and all checkpoints are synchronous foreground
 work; there is no background compaction task.
 
-The ordinary v1 delta journal's current shipped geometry preallocates a 2.5 MiB
+The ordinary delta journal's current shipped geometry preallocates a 2.5 MiB
 record region plus two 512-byte headers. The foreground guard keeps up to
 512 KiB for one estimated future carried suffix, leaving the qualified 2 MiB
-current append window. Linux normally reserves the complete region with
-`fallocate`; the unsupported fallback and other platforms set its full size
-once with truncate. Later acknowledgement writes are positional and never grow
-the file. Per-mutation acknowledgement journals use their own option-derived
-bounded capacity instead.
+current append window. Linux normally reserves the region with `fallocate`;
+the unsupported fallback and other platforms set its requested size with
+truncate. Positional record appends never extend the file. An ordinary
+unsealed per-mutation journal may explicitly preallocate and publish a bounded
+larger capacity before an oversized append's point of no return; a sealed
+journal has exact immutable capacity and rejects growth.
 
-Journal format v0 remains the put/delete grammar and stays v0 when reopened;
-current writers never place a scalar-patch kind into it. Format v1 is accepted
-only for the ordinary buffered-delta lane. Each compact patch records the old
-canonical span, new scalar spelling, and checksum of the expected complete
-canonical document. Recovery reconstructs that result and fails closed unless
-the checksum matches. Unknown versions, v1 entries in v0, malformed metadata,
-or reopening v1 under an incompatible durability lane also fail closed.
+The header `Format` field is a corruption sentinel and must contain numeric
+`0`. The current record kinds are 1 `Put`, 2 `Delete`, 3 `Batch`, 4
+`ConditionalBatch`, and 5 `DeltaBatch`. Kinds 1 through 4 are the atomic family:
+each represents one generation, with kinds 3 and 4 carrying an ordered atomic
+put/delete set. Kind 4 additionally binds a database decision. Kind 5 carries
+one put/delete entry per consecutive generation ending at the record
+generation. One unrecycled journal window is atomic or delta, never mixed.
 
-V1 batch entries represent consecutive generations ending at the batch target.
-If replay physically checkpoints a prefix under bounded pressure and crashes
-again, the next Open uses the selected root generation to skip exactly that
-durable prefix and resumes the suffix. It never reapplies a length-changing
-scalar patch. Legacy v0 batches keep their one-generation, replay-from-zero
-semantics. See [the recovery-journal design](design/recovery-journal.md) for the
+If delta replay physically checkpoints a prefix under bounded pressure and
+crashes again, the next Open uses the selected root generation to skip exactly
+that durable prefix and resumes the suffix. Every retained conditional is
+resolved, even when the selected root appears to cover it; commitment requires
+the exact `(StoreID, JournalID, PreparedGeneration)` decision participant tuple.
+The decision stays retained through a successful resolved fold and journal
+recycle. See [the recovery-journal design](design/recovery-journal.md) for the
 record and crash-window details.
 
 Recovery validates both superblocks and their roots and can fall back to the

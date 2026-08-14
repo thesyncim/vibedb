@@ -13,20 +13,17 @@ func TestRecoveryJournalRejectsShortNilWrites(t *testing.T) {
 		Value: []byte(`{"batch":true}`),
 	}}
 	tests := []struct {
-		name   string
-		format uint32
-		write  func(*testing.T, *RecoveryJournal) error
+		name  string
+		write func(*testing.T, *RecoveryJournal) error
 	}{
 		{
-			name:   "header",
-			format: RecoveryJournalFormatLegacy,
+			name: "header",
 			write: func(_ *testing.T, rj *RecoveryJournal) error {
 				return rj.writeHeader(rj.headerSlot^1, rj.header)
 			},
 		},
 		{
-			name:   "record",
-			format: RecoveryJournalFormatLegacy,
+			name: "record",
 			write: func(_ *testing.T, rj *RecoveryJournal) error {
 				_, err := rj.Append(
 					RecoveryRecordKindPut, 2, []byte("key"), []byte(`{"v":1}`),
@@ -35,8 +32,7 @@ func TestRecoveryJournalRejectsShortNilWrites(t *testing.T) {
 			},
 		},
 		{
-			name:   "prepared-batch",
-			format: RecoveryJournalFormatLegacy,
+			name: "prepared-batch",
 			write: func(t *testing.T, rj *RecoveryJournal) error {
 				plan, err := rj.PrepareBatch(entries)
 				if err != nil {
@@ -47,8 +43,18 @@ func TestRecoveryJournalRejectsShortNilWrites(t *testing.T) {
 			},
 		},
 		{
-			name:   "prepared-conditional-batch",
-			format: RecoveryJournalFormatConditional,
+			name: "prepared-delta-batch",
+			write: func(t *testing.T, rj *RecoveryJournal) error {
+				plan, err := rj.PrepareDeltaBatch(entries)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = rj.AppendPreparedDeltaBatch(2, entries, plan)
+				return err
+			},
+		},
+		{
+			name: "prepared-conditional-batch",
 			write: func(t *testing.T, rj *RecoveryJournal) error {
 				plan, err := rj.PrepareConditionalBatch(entries)
 				if err != nil {
@@ -64,7 +70,7 @@ func TestRecoveryJournalRejectsShortNilWrites(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			rj, _ := createTestJournalFormat(t, 8<<10, test.format)
+			rj, _ := createTestJournal(t, 8<<10)
 			defer rj.Close()
 			beforeCursor, beforeSequence := rj.Cursor(), rj.NextSequence()
 			rj.writeAt = func(p []byte, _ int64) (int, error) {

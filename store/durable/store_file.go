@@ -229,12 +229,6 @@ type Collection struct {
 	journalID        [16]byte
 	journalPowerSafe bool
 	journalReady     atomic.Bool
-	// journalCatalogOwned is set for collections opened through a database
-	// directory (or an equivalent caller-owned catalog). When set, journal mint
-	// and recycle write the conditional journal format word so the collection
-	// may prepare kind-5 records; standalone opens leave it false and keep the
-	// legacy/scalar-patch mint. It is internal wiring, never an Options field.
-	journalCatalogOwned bool
 	// journalReplaying suppresses journal appends while Open re-applies recovered
 	// records through the ordinary mutation path: those records are already
 	// durable, and the recycle that follows replay discards them regardless.

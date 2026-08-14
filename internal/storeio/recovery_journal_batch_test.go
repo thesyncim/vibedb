@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -13,19 +14,19 @@ import (
 func TestRecoveryBatchRecordRoundTrip(t *testing.T) {
 	rj, path := createTestJournal(t, 64<<10)
 
-	appendPut(t, rj, 5, "alpha", "one")
+	appendPut(t, rj, 2, "alpha", "one")
 	entries := []RecoveryBatchEntry{
 		{Kind: recoveryRecordKindPut, Key: []byte("k1"), Value: []byte(`{"a":1}`)},
 		{Kind: recoveryRecordKindDelete, Key: []byte("k2")},
 		{Kind: recoveryRecordKindPut, Key: []byte("k3"), Value: []byte(`{"c":3}`)},
 	}
-	if _, err := rj.AppendBatch(6, entries); err != nil {
+	if _, err := rj.AppendBatch(3, entries); err != nil {
 		t.Fatalf("append batch: %v", err)
 	}
 	if err := rj.Sync(false); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	appendPut(t, rj, 7, "omega", "last")
+	appendPut(t, rj, 4, "omega", "last")
 	_ = rj.Close()
 
 	rj = reopenTestJournal(t, path)
@@ -56,8 +57,8 @@ func TestRecoveryBatchRecordRoundTrip(t *testing.T) {
 		t.Fatalf("record 0 = %+v, want put alpha", recs[0])
 	}
 	batch := recs[1]
-	if batch.Kind != recoveryRecordKindBatch || batch.Generation != 6 {
-		t.Fatalf("record 1 = kind %d gen %d, want batch gen 6", batch.Kind, batch.Generation)
+	if batch.Kind != recoveryRecordKindBatch || batch.Generation != 3 {
+		t.Fatalf("record 1 = kind %d gen %d, want batch gen 3", batch.Kind, batch.Generation)
 	}
 	if batch.Sequence != recs[0].Sequence+1 {
 		t.Fatalf("batch sequence %d, want %d", batch.Sequence, recs[0].Sequence+1)
@@ -173,7 +174,10 @@ func TestRecoveryBatchRecordPaddedSizeAndFits(t *testing.T) {
 	small, _ := createTestJournal(t, uint64(RecoveryJournalMinSectorSize))
 	big := make([]RecoveryBatchEntry, 64)
 	for i := range big {
-		big[i] = RecoveryBatchEntry{Kind: recoveryRecordKindPut, Key: []byte("kkkkkkkk"), Value: make([]byte, 256)}
+		big[i] = RecoveryBatchEntry{
+			Kind: recoveryRecordKindPut,
+			Key:  []byte(fmt.Sprintf("key-%03d", i)), Value: make([]byte, 256),
+		}
 	}
 	if small.FitsBatch(big) {
 		t.Fatal("FitsBatch = true for an over-large batch, want false")

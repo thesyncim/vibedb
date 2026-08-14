@@ -210,16 +210,11 @@ func TestDatabaseTxnLinearizedModel(t *testing.T) {
 			setModel(model, name, key, doc)
 
 		case 5:
-			// Prepare append fault on B: definite abort; model unchanged.
+			// A prepare append failure is outcome-unknown in-process because the
+			// checksummed body may have landed without all padding. With no marker
+			// decision, reopen resolves it as aborted; the model stays unchanged.
 			before := cloneModel(model)
 			b, _ := db.Collection("b")
-			b.writer.Lock()
-			b.journalCatalogOwned = true
-			if err := b.ensureConditionalJournalFormatLocked(); err != nil {
-				b.writer.Unlock()
-				t.Fatalf("%s upgrade b: %v", label, err)
-			}
-			b.writer.Unlock()
 			fj := storeio.NewFaultJournal(b.journal)
 			fj.Program(storeio.JournalFaultPlan{
 				Phase: storeio.JournalFaultENOSPCAppend, AppendIndex: 0,
@@ -235,8 +230,8 @@ func TestDatabaseTxnLinearizedModel(t *testing.T) {
 			if err == nil {
 				t.Fatalf("%s: expected prepare failure", label)
 			}
-			if errors.Is(err, ErrCommitOutcomeUnknown) {
-				t.Fatalf("%s: prepare classified unknown: %v", label, err)
+			if !errors.Is(err, ErrCommitOutcomeUnknown) {
+				t.Fatalf("%s: prepare failure=%v want outcome unknown", label, err)
 			}
 			reopenFromImage(before, label+" prepare-fault")
 			model = before

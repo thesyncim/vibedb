@@ -440,15 +440,13 @@ func TestReplacementFileFenceFailureLeavesOldCatalogAuthoritative(t *testing.T) 
 	}
 }
 
-func TestLegacyCatalogPathReopensAndReplacementUpgradesIdentity(t *testing.T) {
+func TestCatalogRejectsEmptyStorageIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.vdb")
 	database, err := openDatabase(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepareIncarnationTable(t, database)
-	uniquePath := database.tablePath("docs")
-	legacyPath := database.legacyTablePath("docs")
 	if err := database.close(); err != nil {
 		t.Fatal(err)
 	}
@@ -468,43 +466,11 @@ func TestLegacyCatalogPathReopensAndReplacementUpgradesIdentity(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(uniquePath, legacyPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(
-		durable.RecoveryJournalPath(uniquePath),
-		durable.RecoveryJournalPath(legacyPath),
-	); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-
-	database, err = openDatabase(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if database.tables["docs"].meta.Storage != "" || database.tablePath("docs") != legacyPath {
-		t.Fatal("legacy deterministic table path was not preserved on reopen")
-	}
-	database.mu.Lock()
-	err = database.truncateTableStorageLockedContext(context.Background(), "docs")
-	upgraded := database.tables["docs"].meta.Storage
-	database.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if upgraded == "" {
-		t.Fatal("replacement did not upgrade the legacy storage identity")
-	}
-	if err := database.close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := openDatabase(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.close()
-	if reopened.tables["docs"].meta.Storage != upgraded {
-		t.Fatal("upgraded storage identity did not survive reopen")
+	if reopened, openErr := openDatabase(path); openErr == nil {
+		_ = reopened.close()
+		t.Fatal("catalog with empty storage identity reopened")
+	} else if !strings.Contains(openErr.Error(), "storage identity") {
+		t.Fatalf("open error = %v, want storage identity rejection", openErr)
 	}
 }
 
@@ -525,7 +491,6 @@ func TestOpenRemovesOnlyUnreferencedManagedStorage(t *testing.T) {
 	}
 	orphans := []string{
 		filepath.Join(path+".tables", orphanID+".vjc"),
-		filepath.Join(path+".tables", orphanID+".vjc.rjournal"),
 		filepath.Join(path+".tables", "."+orphanID+".vjc.tmp-crash"),
 	}
 	for _, orphan := range orphans {

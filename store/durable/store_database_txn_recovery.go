@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -23,6 +24,12 @@ var (
 	ErrTransactionLogMissing = errors.New(
 		"vibedb: collection journals hold conditional transaction records but the database's decision log is missing",
 	)
+	// ErrTransactionLogRecoveryRequired reports that txn.vtm already exists and
+	// may name participants outside the caller's current set. Existing decision
+	// logs may be opened only by a complete-catalog recovery operation.
+	ErrTransactionLogRecoveryRequired = errors.New(
+		"vibedb: existing transaction decision log requires complete catalog recovery",
+	)
 	// ErrTransactionLogDirectoryMismatch reports a decision log paired with a
 	// collection file from another directory. Transaction identities are scoped
 	// to one catalog directory and must never be reused across databases.
@@ -32,7 +39,7 @@ var (
 )
 
 // databaseTxnRecovery is the loaded decision-log state OpenDatabase and the
-// driver-facing recovery entry points share before per-collection opens.
+// complete-catalog caller-owned recovery path share before replay begins.
 type databaseTxnRecovery struct {
 	dir       string
 	log       *TxnLog
@@ -42,51 +49,239 @@ type databaseTxnRecovery struct {
 	absent bool
 }
 
-// RecoverDatabaseTransactions loads and validates dir's txn.vtm for a
-// caller-owned catalog (the SQL driver). The returned TxnLog is the handle the
-// caller later commits through; OpenWithTransactions consumes the decisions
-// for per-collection replay. When txn.vtm is absent the decisions pointer is
-// nil and the log is an unminted handle — the same lazy-mint seam
-// Database.Update uses.
-func RecoverDatabaseTransactions(
-	dir string, options TxnLogOptions,
-) (*storeio.TxnDecisions, *TxnLog, error) {
-	recovery, err := loadDatabaseTxnRecovery(dir, options)
+// TransactionCollectionOpen is one caller-owned collection descriptor and its
+// exact durable open profile. OpenCollectionsWithTransactions never closes
+// File, on success or error.
+type TransactionCollectionOpen struct {
+	File    *os.File
+	Options Options
+}
+
+// OpenCollectionsWithTransactions is the sole current recovery entry point for
+// a caller-owned catalog. It proves every descriptor belongs to dir, opens and
+// scan-validates the complete set without replay, validates every decision and
+// exact prepare binding across that set, then replays and reconciles as one
+// private phase. It returns collections in request order only after all phases
+// succeed. On error it resource-closes every constructed engine and the
+// transaction log without flushing or recycling an unreplayed journal; the
+// caller retains every File descriptor.
+func OpenCollectionsWithTransactions(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+) ([]*Collection, *TxnLog, error) {
+	if len(requests) > MaxSnapshotCollections {
+		return nil, nil, fmt.Errorf(
+			"%w: transaction catalog has %d collections, maximum %d",
+			ErrTxnTooLarge, len(requests), MaxSnapshotCollections,
+		)
+	}
+	log, err := newTxnLogDirectory(dir, txnOptions)
 	if err != nil {
 		return nil, nil, err
 	}
-	return recovery.decisions, recovery.log, nil
+	if err := validateTransactionCollectionRequests(log.rootInfo, requests); err != nil {
+		return nil, nil, errors.Join(err, log.Close())
+	}
+	// Request identity is now frozen against the pinned directory. Only after
+	// that non-mutating proof may marker recovery remove/fence a mint residue.
+	recovery, err := loadDatabaseTxnRecoveryFromLog(log, requests)
+	if err != nil {
+		return nil, nil, err
+	}
+	abort := func(collections []*Collection, cause error) (
+		[]*Collection, *TxnLog, error,
+	) {
+		cleanupErr := error(nil)
+		for i := len(collections) - 1; i >= 0; i-- {
+			if collections[i] != nil {
+				cleanupErr = errors.Join(
+					cleanupErr, collections[i].closeResources(),
+				)
+			}
+		}
+		if recovery.log != nil {
+			cleanupErr = errors.Join(cleanupErr, recovery.log.Close())
+			recovery.log = nil
+		}
+		return nil, nil, errors.Join(cause, cleanupErr)
+	}
+
+	collections := make([]*Collection, len(requests))
+	seenStores := make(map[[16]byte]int, len(requests))
+	for i := range requests {
+		cfg := collectionOpenConfig{deferJournalReplay: true}
+		if recovery.absent {
+			cfg.absentLog = true
+		} else {
+			cfg.decisions = recovery.decisions
+		}
+		collection, openErr := openCollection(
+			requests[i].File, requests[i].Options, cfg,
+		)
+		if openErr != nil {
+			return abort(collections[:i], openErr)
+		}
+		collections[i] = collection
+		if previous, duplicate := seenStores[collection.storeID]; duplicate {
+			return abort(collections[:i+1], fmt.Errorf(
+				"%w: requests %d and %d have duplicate StoreID %x",
+				ErrTxnParticipant, previous, i, collection.storeID,
+			))
+		}
+		seenStores[collection.storeID] = i
+	}
+	if err := preflightAndReplayDatabaseTxnRecovery(
+		recovery, collections,
+	); err != nil {
+		return abort(collections, err)
+	}
+	if err := reconcileDatabaseTxnAfterOpens(
+		recovery, collections,
+	); err != nil {
+		return abort(collections, err)
+	}
+	log = recovery.log
+	recovery.log = nil
+	return collections, log, nil
 }
 
-// OpenWithTransactions opens a collection file with catalog-owned journal
-// wiring and the decision resolver OpenDatabase uses. A nil txns pointer
-// selects the absent-log resolver (ErrTransactionLogMissing on every
-// uncovered kind-5 lookup). Standalone [Open] passes a nil resolver instead
-// and fails uncovered kind-5 with ErrCollectionInDoubt.
-func OpenWithTransactions(
-	file *os.File, options Options, txns *storeio.TxnDecisions,
-) (*Collection, error) {
-	if file == nil {
-		return nil, fmt.Errorf("vibedb: nil collection file")
-	}
-	if txns != nil {
-		matches, err := txns.MatchesFileDirectory(file)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"vibedb: prove collection transaction directory: %w", err,
+func validateTransactionCollectionRequests(
+	directory os.FileInfo, requests []TransactionCollectionOpen,
+) error {
+	infos := make([]os.FileInfo, len(requests))
+	seenPointers := make(map[*os.File]struct{}, len(requests))
+	for i := range requests {
+		file := requests[i].File
+		if file == nil {
+			return fmt.Errorf(
+				"%w: nil collection file at request %d", ErrTxnParticipant, i,
+			)
+		}
+		if _, duplicate := seenPointers[file]; duplicate {
+			return fmt.Errorf(
+				"%w: duplicate collection file at request %d", ErrTxnParticipant, i,
+			)
+		}
+		seenPointers[file] = struct{}{}
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf(
+				"%w: request %d is not a regular file", ErrTxnParticipant, i,
+			)
+		}
+		for previous := 0; previous < i; previous++ {
+			if os.SameFile(info, infos[previous]) {
+				return fmt.Errorf(
+					"%w: requests %d and %d name the same physical file",
+					ErrTxnParticipant, previous, i,
+				)
+			}
+		}
+		infos[i] = info
+		matches, matchErr := storeio.FileMatchesDirectory(
+			directory, file,
+		)
+		if matchErr != nil {
+			return fmt.Errorf(
+				"vibedb: prove collection transaction directory: %w", matchErr,
 			)
 		}
 		if !matches {
-			return nil, ErrTransactionLogDirectoryMismatch
+			return ErrTransactionLogDirectoryMismatch
 		}
 	}
-	cfg := collectionOpenConfig{catalogOwned: true}
-	if txns == nil {
-		cfg.absentLog = true
-	} else {
-		cfg.decisions = txns
+	return nil
+}
+
+// preflightAndReplayDatabaseTxnRecovery separates catalog recovery into a
+// read-only validation phase and a mutating replay phase. No member journal is
+// applied or recycled until every collection and every marker participant has
+// been validated against the complete opened catalog.
+func preflightAndReplayDatabaseTxnRecovery(
+	recovery *databaseTxnRecovery,
+	collections []*Collection,
+) error {
+	if recovery == nil {
+		return nil
 	}
-	return openCollection(file, options, cfg)
+	if recovery.decisions != nil {
+		if err := validateTxnDecisionParticipants(
+			recovery.decisions, collections,
+		); err != nil {
+			return err
+		}
+	}
+	for _, c := range collections {
+		if c == nil || !c.journalEnabled() {
+			continue
+		}
+		var resolve recoveryJournalDecisionResolver
+		var epoch uint64
+		if recovery.absent {
+			resolve = absentLogResolver()
+			if _, _, observedEpoch, err := journalConditionalIdentity(c.journal); err != nil {
+				return err
+			} else {
+				epoch = observedEpoch
+			}
+		} else {
+			resolve = participantBindingResolver(
+				recovery.decisions, c.storeID, c.journalID,
+			)
+			epoch = recovery.decisions.Epoch()
+		}
+		if err := c.preflightRecoveryJournalResolved(resolve, epoch); err != nil {
+			return err
+		}
+	}
+	for _, c := range collections {
+		if c == nil || !c.journalEnabled() {
+			continue
+		}
+		rootGeneration := c.committer.DurableGeneration()
+		var resolve recoveryJournalDecisionResolver
+		var epoch uint64
+		if recovery.absent {
+			resolve = absentLogResolver()
+			if _, _, observedEpoch, err := journalConditionalIdentity(c.journal); err != nil {
+				return err
+			} else {
+				epoch = observedEpoch
+			}
+		} else {
+			resolve = participantBindingResolver(
+				recovery.decisions, c.storeID, c.journalID,
+			)
+			epoch = recovery.decisions.Epoch()
+		}
+		if err := c.replayRecoveryJournalResolvedLocked(
+			rootGeneration, resolve, epoch,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func journalConditionalIdentity(
+	journal *storeio.RecoveryJournal,
+) (markerID [16]byte, txnID, epoch uint64, err error) {
+	if journal == nil || journal.Cursor() == 0 {
+		return markerID, 0, 0, nil
+	}
+	err = journal.Replay(journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
+		if rec.Kind == storeio.RecoveryRecordKindConditionalBatch {
+			markerID = rec.Conditional.MarkerID
+			txnID = rec.Conditional.TxnID
+			epoch = rec.Conditional.MarkerEpoch
+		}
+		return nil
+	})
+	return markerID, txnID, epoch, err
 }
 
 func loadDatabaseTxnRecovery(
@@ -96,6 +291,12 @@ func loadDatabaseTxnRecovery(
 	if err != nil {
 		return nil, err
 	}
+	return loadDatabaseTxnRecoveryFromLog(log, nil)
+}
+
+func loadDatabaseTxnRecoveryFromLog(
+	log *TxnLog, requests []TransactionCollectionOpen,
+) (*databaseTxnRecovery, error) {
 	recovery := &databaseTxnRecovery{dir: log.dir, log: log}
 
 	info, statErr := log.root.Lstat(txnMarkerFilename)
@@ -103,6 +304,18 @@ func loadDatabaseTxnRecovery(
 		if !os.IsNotExist(statErr) {
 			_ = log.Close()
 			return nil, statErr
+		}
+		holds, holdErr := directoryHoldsAnyConditional(log.root)
+		if holdErr == nil && !holds {
+			holds, holdErr = requestsHoldAnyConditional(requests)
+		}
+		if holdErr != nil {
+			_ = log.Close()
+			return nil, holdErr
+		}
+		if holds {
+			_ = log.Close()
+			return nil, ErrTransactionLogMissing
 		}
 		recovery.absent = true
 		return recovery, nil
@@ -118,12 +331,15 @@ func loadDatabaseTxnRecovery(
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		log.root, txnMarkerFilename,
 		storeio.TxnMarkerOptions{
-			Capacity: options.Capacity, SealedCapacity: options.SealedCapacity,
+			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity,
 		},
 	)
 	if err != nil {
 		if errors.Is(err, storeio.ErrTxnMarkerNoValidHeader) {
 			holds, holdErr := directoryHoldsAnyConditional(log.root)
+			if holdErr == nil && !holds {
+				holds, holdErr = requestsHoldAnyConditional(requests)
+			}
 			if holdErr != nil {
 				_ = log.Close()
 				return nil, holdErr
@@ -135,8 +351,8 @@ func loadDatabaseTxnRecovery(
 					ErrTransactionLogMissing, storeio.ErrTxnMarkerNoValidHeader,
 				)
 			}
-			// L2 mint residue: no journal references the file; remove and
-			// reopen as absent so the next commit can re-mint.
+			// L2 creation residue: no journal references the file; remove and
+			// reopen as absent so the next commit can create a fresh marker.
 			current, identityErr := log.root.Lstat(txnMarkerFilename)
 			if identityErr != nil || !current.Mode().IsRegular() ||
 				!os.SameFile(info, current) {
@@ -166,10 +382,13 @@ func loadDatabaseTxnRecovery(
 	}
 
 	log.marker = marker
-	log.nextTxnID = decisions.MaxTxnID() + 1
-	if log.nextTxnID == 0 {
-		log.nextTxnID = 1
+	if decisions.MaxTxnID() == ^uint64(0) {
+		_ = marker.Close()
+		log.marker = nil
+		_ = log.Close()
+		return nil, fmt.Errorf("%w: transaction id space exhausted", ErrTxnTooLarge)
 	}
+	log.nextTxnID = decisions.MaxTxnID() + 1
 	if decisions.MaxTxnID() != 0 {
 		log.undischarged = 1
 	}
@@ -200,12 +419,22 @@ func reconcileDatabaseTxnAfterOpens(
 		return err
 	}
 	discharged := txnDecisionsDischarged(recovery.decisions, collections)
-	holds := collectionsHoldConditional(
+	holds, err := collectionsHoldConditional(
 		collections,
 		recovery.decisions.MarkerID(),
 		recovery.decisions.Epoch(),
 	)
-	if discharged && !holds {
+	if err != nil {
+		return err
+	}
+	directoryHolds := false
+	if discharged && !holds && recovery.log != nil {
+		directoryHolds, err = directoryHoldsAnyConditional(recovery.log.root)
+		if err != nil {
+			return err
+		}
+	}
+	if discharged && !holds && !directoryHolds {
 		// L4: remove residue. Re-evaluate from the live opens; a crash around
 		// the unlink re-enters open and observes the same predicate.
 		if recovery.log != nil {
@@ -243,37 +472,103 @@ func validateTxnDecisionParticipants(
 		return nil
 	}
 	byStore := make(map[[16]byte]*Collection, len(collections))
+	preparesByStore := make(
+		map[[16]byte]map[conditionalPrepareIdentity]struct{}, len(collections),
+	)
 	for _, c := range collections {
+		if c == nil {
+			continue
+		}
 		byStore[c.storeID] = c
+		prepares, err := collectionConditionalPrepares(c)
+		if err != nil {
+			return err
+		}
+		preparesByStore[c.storeID] = prepares
 	}
 	markerID := decisions.MarkerID()
 	epoch := decisions.Epoch()
-	maxTxn := decisions.MaxTxnID()
-	for txnID := uint64(1); txnID <= maxTxn; txnID++ {
-		participants, ok := decisions.Lookup(markerID, epoch, txnID)
-		if !ok {
-			continue
-		}
+	var validationErr error
+	decisions.RangeDecisions(func(
+		txnID uint64, participants []storeio.TxnParticipant,
+	) bool {
 		for _, p := range participants {
 			if decisions.Retired(p.StoreID) {
 				continue
 			}
 			c, exists := byStore[p.StoreID]
 			if !exists {
-				return fmt.Errorf(
+				validationErr = fmt.Errorf(
 					"%w: store %x",
 					ErrTransactionParticipantMissing, p.StoreID,
 				)
+				return false
 			}
 			if c.journalID != p.JournalID {
-				return fmt.Errorf(
+				validationErr = fmt.Errorf(
 					"%w: journal identity mismatch for store %x",
 					ErrTransactionParticipantMissing, p.StoreID,
 				)
+				return false
+			}
+			// A selected root at PreparedGeneration is not consumption proof: a
+			// narrower replay may have checkpointed only a prefix while retaining
+			// the conditional record. Only an exact live prepare or a paired journal
+			// base advanced past it by a successful recycle proves recoverability.
+			if c.journal != nil &&
+				c.journal.BaseGeneration() >= p.PreparedGeneration {
+				continue
+			}
+			prepare := conditionalPrepareIdentity{
+				markerID: markerID, epoch: epoch, txnID: txnID,
+				generation: p.PreparedGeneration,
+			}
+			if _, exists := preparesByStore[p.StoreID][prepare]; !exists {
+				validationErr = fmt.Errorf(
+					"%w: store %x journal %x has neither a recycled base covering generation %d nor exact transaction %d prepare at that generation",
+					ErrTransactionParticipantMissing, p.StoreID, p.JournalID,
+					p.PreparedGeneration, txnID,
+				)
+				return false
 			}
 		}
+		return true
+	})
+	return validationErr
+}
+
+type conditionalPrepareIdentity struct {
+	markerID   [16]byte
+	epoch      uint64
+	txnID      uint64
+	generation uint64
+}
+
+func collectionConditionalPrepares(
+	c *Collection,
+) (map[conditionalPrepareIdentity]struct{}, error) {
+	prepares := make(map[conditionalPrepareIdentity]struct{})
+	if c == nil || c.journal == nil || c.journal.Cursor() == 0 {
+		return prepares, nil
 	}
-	return nil
+	err := c.journal.Replay(
+		c.journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
+			if rec.Kind != storeio.RecoveryRecordKindConditionalBatch {
+				return nil
+			}
+			prepares[conditionalPrepareIdentity{
+				markerID:   rec.Conditional.MarkerID,
+				epoch:      rec.Conditional.MarkerEpoch,
+				txnID:      rec.Conditional.TxnID,
+				generation: rec.Generation,
+			}] = struct{}{}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return prepares, nil
 }
 
 func txnDecisionsDischarged(
@@ -286,42 +581,45 @@ func txnDecisionsDischarged(
 	for _, c := range collections {
 		byStore[c.storeID] = c
 	}
-	markerID := decisions.MarkerID()
-	epoch := decisions.Epoch()
-	maxTxn := decisions.MaxTxnID()
-	for txnID := uint64(1); txnID <= maxTxn; txnID++ {
-		participants, ok := decisions.Lookup(markerID, epoch, txnID)
-		if !ok {
-			continue
-		}
+	discharged := true
+	decisions.RangeDecisions(func(
+		_ uint64, participants []storeio.TxnParticipant,
+	) bool {
 		for _, p := range participants {
 			if decisions.Retired(p.StoreID) {
 				continue
 			}
 			c, exists := byStore[p.StoreID]
 			if !exists {
+				discharged = false
 				return false
 			}
-			if c.Generation() < p.PreparedGeneration {
+			if c.journal == nil ||
+				c.journal.BaseGeneration() < p.PreparedGeneration {
+				discharged = false
 				return false
 			}
 		}
-	}
-	return true
+		return true
+	})
+	return discharged
 }
 
 func collectionsHoldConditional(
 	collections []*Collection, markerID [16]byte, epoch uint64,
-) bool {
+) (bool, error) {
 	for _, c := range collections {
 		c.writer.Lock()
-		holds := c.journalHoldsConditional(markerID, epoch)
+		holds, err := c.journalHoldsConditional(markerID, epoch)
 		c.writer.Unlock()
+		if err != nil {
+			return false, err
+		}
 		if holds {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func txnDecisionsNameStore(
@@ -330,21 +628,19 @@ func txnDecisionsNameStore(
 	if decisions == nil || decisions.Retired(storeID) {
 		return false
 	}
-	markerID := decisions.MarkerID()
-	epoch := decisions.Epoch()
-	maxTxn := decisions.MaxTxnID()
-	for txnID := uint64(1); txnID <= maxTxn; txnID++ {
-		participants, ok := decisions.Lookup(markerID, epoch, txnID)
-		if !ok {
-			continue
-		}
+	found := false
+	decisions.RangeDecisions(func(
+		_ uint64, participants []storeio.TxnParticipant,
+	) bool {
 		for _, p := range participants {
 			if p.StoreID == storeID {
-				return true
+				found = true
+				return false
 			}
 		}
-	}
-	return false
+		return true
+	})
+	return found
 }
 
 // retireCollectionBeforeDrop folds past live conditionals and appends a
@@ -357,36 +653,67 @@ func (d *Database) retireCollectionBeforeDrop(entry *databaseEntry) error {
 	}
 	log.commitMu.Lock()
 	defer log.commitMu.Unlock()
+	if log.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, log.poison)
+	}
 	if log.marker == nil {
 		return nil
 	}
 	header := log.marker.Header()
-	c := entry.collection
-	c.writer.Lock()
-	holds := c.journalHoldsConditional(header.MarkerID, header.Epoch)
-	var foldErr error
-	if holds {
-		foldErr = c.checkpointPastConditionalsLocked()
-	}
-	storeID := c.storeID
-	c.writer.Unlock()
-	if foldErr != nil {
-		return foldErr
-	}
-
 	decisions, err := rescanTxnLogMarker(log)
 	if err != nil {
 		return err
+	}
+	c := entry.collection
+	c.writer.Lock()
+	holds, holdsErr := c.journalHoldsConditional(header.MarkerID, header.Epoch)
+	var foldErr error
+	if holdsErr == nil && holds {
+		foldErr = c.checkpointPastConditionalsLocked(
+			participantBindingResolver(decisions, c.storeID, c.journalID),
+			decisions.Epoch(),
+		)
+	}
+	storeID := c.storeID
+	c.writer.Unlock()
+	if holdsErr != nil || foldErr != nil {
+		return errors.Join(holdsErr, foldErr)
 	}
 	named := txnDecisionsNameStore(decisions, storeID)
 	if !holds && !named && log.undischarged == 0 {
 		return nil
 	}
+	if !log.marker.FitsRetirement() {
+		// Capacity/sequence exhaustion is known before any append bytes are
+		// written. Discharge the complete registered catalog and recycle under
+		// the ordinary pressure protocol, then re-evaluate from the new epoch:
+		// the retirement is no longer needed once no old decision remains.
+		if err := log.foldLaggardsAndRecycleLocked(); err != nil {
+			return err
+		}
+		return nil
+	}
+	if databaseTxnBeforeRetirementAppendHook != nil {
+		databaseTxnBeforeRetirementAppendHook(log)
+	}
 	if _, err := log.marker.AppendRetirement(storeID); err != nil {
-		return err
+		if errors.Is(err, storeio.ErrTxnMarkerFull) {
+			return err
+		}
+		poisoned := journalCommitOutcomeUnknown(err)
+		log.poison = poisoned
+		for _, collection := range log.registeredCollections() {
+			_ = joinCatalogCommitOutcomeUnknown(collection, err)
+		}
+		return poisoned
 	}
 	if err := log.marker.Sync(); err != nil {
-		return err
+		poisoned := journalCommitOutcomeUnknown(err)
+		log.poison = poisoned
+		for _, collection := range log.registeredCollections() {
+			_ = joinCatalogCommitOutcomeUnknown(collection, err)
+		}
+		return poisoned
 	}
 	return nil
 }
@@ -436,30 +763,40 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 func participantBindingResolver(
 	decisions *storeio.TxnDecisions, storeID, journalID [16]byte,
 ) recoveryJournalDecisionResolver {
-	return func(markerID [16]byte, epoch, txnID uint64) (bool, error) {
+	return func(
+		markerID [16]byte, epoch, txnID, preparedGeneration uint64,
+	) (bool, error) {
+		if decisions == nil || markerID != decisions.MarkerID() ||
+			epoch != decisions.Epoch() {
+			return false, ErrTransactionParticipantBinding
+		}
 		participants, ok := decisions.Lookup(markerID, epoch, txnID)
 		if !ok {
 			return false, nil
 		}
 		for _, p := range participants {
-			if p.StoreID == storeID && p.JournalID == journalID {
+			if p.StoreID == storeID && p.JournalID == journalID &&
+				p.PreparedGeneration == preparedGeneration {
 				return true, nil
 			}
 		}
-		return false, nil
+		return false, ErrTransactionParticipantBinding
 	}
 }
 
 func absentLogResolver() recoveryJournalDecisionResolver {
-	return func([16]byte, uint64, uint64) (bool, error) {
+	return func([16]byte, uint64, uint64, uint64) (bool, error) {
 		return false, ErrTransactionLogMissing
 	}
 }
 
-// directoryHoldsAnyConditional reports whether any canonical collection
-// journal under root still holds a kind-5 record. Used for L2 mint-residue
-// policy before collections are opened; root keeps the scan in the same
-// physical directory whose marker was rejected.
+// directoryHoldsAnyConditional reports whether any stable recovery-journal
+// sidecar under root still holds a conditional record. Caller-owned catalogs
+// (notably SQL) use current opaque storage identities rather than
+// collectionname's encoded names. Arbitrary files that merely share the
+// journal suffix are outside the database namespace and must remain untouched.
+// Used for absent-marker and mint-residue policy before collections are opened;
+// root keeps the scan in the same physical directory whose marker was checked.
 func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
 	if root == nil {
 		return false, fmt.Errorf("vibedb: transaction recovery directory is not open")
@@ -475,7 +812,7 @@ func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
 	}
 	for _, item := range items {
 		base := item.Name()
-		if _, canonical := collectionname.DecodeJournal(base); !canonical {
+		if !databaseTxnRecoveryJournalName(base) {
 			continue
 		}
 		before, err := root.Lstat(base)
@@ -520,8 +857,57 @@ func directoryHoldsAnyConditional(root *os.Root) (bool, error) {
 	return false, nil
 }
 
+// databaseTxnRecoveryJournalName admits the two current database-owned journal
+// namespaces: reversible durable collection names and SQL's 32-byte opaque
+// storage identities encoded as 64 lowercase hexadecimal characters. It does
+// not claim arbitrary application sidecars ending in .rjournal.
+func databaseTxnRecoveryJournalName(base string) bool {
+	if _, canonical := collectionname.DecodeJournal(base); canonical {
+		return true
+	}
+	const sqlStorageIdentityHexLength = 64
+	const sqlJournalSuffix = collectionname.PrimarySuffix + collectionname.JournalSuffix
+	if !strings.HasSuffix(base, sqlJournalSuffix) {
+		return false
+	}
+	identity := strings.TrimSuffix(base, sqlJournalSuffix)
+	if len(identity) != sqlStorageIdentityHexLength {
+		return false
+	}
+	for i := range identity {
+		c := identity[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func requestsHoldAnyConditional(
+	requests []TransactionCollectionOpen,
+) (bool, error) {
+	for i := range requests {
+		if requests[i].File == nil {
+			continue
+		}
+		holds, _, _, err := journalFileConditionalBinding(
+			RecoveryJournalPath(requests[i].File.Name()),
+		)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if holds {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // journalFileConditionalBinding opens a journal file and reports whether its
-// live window holds any kind-5 record, returning one observed binding for the
+// live window holds any kind-4 record, returning one observed binding for the
 // absent-log epoch plumbing.
 func journalFileConditionalBinding(
 	path string,
@@ -545,8 +931,7 @@ func journalConditionalBinding(
 		// RecoveryJournalInspection owns and closes file after a successful open.
 		err = errors.Join(err, journal.Close())
 	}()
-	if journal.Header().FormatVersion != storeio.RecoveryJournalFormatConditional ||
-		journal.Cursor() == 0 {
+	if journal.Cursor() == 0 {
 		return false, [16]byte{}, 0, nil
 	}
 	err = journal.Replay(journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
@@ -560,7 +945,7 @@ func journalConditionalBinding(
 	return holds, markerID, epoch, err
 }
 
-// peekCollectionConditionalEpoch returns a kind-5 MarkerEpoch from the
+// peekCollectionConditionalEpoch returns a kind-4 MarkerEpoch from the
 // collection's paired journal, if any. Open uses it so the absent-log resolver
 // is reached for uncovered records (epoch checks run before the resolver).
 func peekCollectionConditionalEpoch(primaryPath string) (uint64, bool, error) {

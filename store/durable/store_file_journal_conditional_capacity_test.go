@@ -7,7 +7,7 @@ import (
 )
 
 // journalBatchAtCapacity builds an admitted 64-entry batch whose ordinary
-// kind-3 envelope ends exactly at capacity. The conditional kind-5 envelope for
+// kind-3 envelope ends exactly at capacity. The conditional kind-4 envelope for
 // the same entries is therefore one sector larger solely because of its fixed
 // conditional header.
 func journalBatchAtCapacity(
@@ -102,10 +102,6 @@ func TestConditionalJournalRoomGrowsAcknowledgementLanes(t *testing.T) {
 			if got := coll.bufferedJournalAckLane(); got != test.wantAck {
 				t.Fatalf("buffered journal ack lane=%v, want %v", got, test.wantAck)
 			}
-			coll.journalCatalogOwned = true
-			if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-				t.Fatalf("ensure conditional journal format: %v", err)
-			}
 			header := coll.journal.Header()
 			if header.SealedCapacity {
 				t.Fatal("ordinary acknowledgement journal is unexpectedly sealed")
@@ -128,7 +124,7 @@ func TestConditionalJournalRoomGrowsAcknowledgementLanes(t *testing.T) {
 				t.Fatal("ordinary kind-3 boundary batch does not fit")
 			}
 			if coll.journal.PreparedBatchFits(conditional) {
-				t.Fatal("conditional kind-5 boundary batch unexpectedly fits before growth")
+				t.Fatal("conditional kind-4 boundary batch unexpectedly fits before growth")
 			}
 			batch := coll.fileWriteBatch()
 			defer coll.releaseFileWriteBatch(batch)
@@ -246,8 +242,16 @@ func TestOrdinaryBufferedDeltaFullBatchFallsBackWithoutGrowth(t *testing.T) {
 		coll.writer.Unlock()
 		t.Fatalf("prepare full ordinary batch: %v", err)
 	}
+	// A current-format live window must start exactly one generation beyond
+	// its rooted base. Fill the bounded region with that next valid atomic
+	// record; the following collection mutation deliberately reuses the same
+	// prospective generation before the physical fallback recycles the window.
+	if got, want := coll.journal.BaseGeneration(), coll.Generation(); got != want {
+		coll.writer.Unlock()
+		t.Fatalf("journal base generation=%d, want collection generation %d", got, want)
+	}
 	if _, err := coll.journal.AppendPreparedBatch(
-		coll.Generation(), entries, plan,
+		coll.Generation()+1, entries, plan,
 	); err != nil {
 		coll.writer.Unlock()
 		t.Fatalf("append full ordinary batch: %v", err)

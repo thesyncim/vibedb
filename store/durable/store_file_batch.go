@@ -135,7 +135,7 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 	return nil
 }
 
-// appendRecovery records one already-validated legacy journal entry without
+// appendRecovery records one already-validated atomic journal entry without
 // consulting the caller-facing MaxBatchDocuments/MaxBatchBytes admission
 // policy. Those limits are process options and may be smaller on reopen than
 // when the acknowledged record was written; recovery must honor the durable

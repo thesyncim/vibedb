@@ -1,8 +1,6 @@
 package driver
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,10 +151,10 @@ func newCatalogLayoutEpoch(
 	return epoch
 }
 
-// retiredTable keeps the physical resources of a dropped or replaced table
-// incarnation alive until the durable collection can close. Existing SQL
-// cursors and transactions may still hold generation leases after the catalog
-// stops naming this storage identity.
+// retiredTable keeps the physical resources or unresolved namespace paths of a
+// dropped, replaced, or unpublished table incarnation until teardown and its
+// directory fence complete. Existing SQL cursors and transactions may still
+// hold generation leases after the catalog stops naming this storage identity.
 type retiredTable struct {
 	name         string
 	path         string
@@ -169,27 +167,30 @@ type retiredTable struct {
 }
 
 type database struct {
-	mu                   sync.RWMutex
-	path                 string
-	dataDir              string
-	lockFile             *os.File
-	syncDir              func(string) error
-	closeCollection      func(*durable.Collection) error
-	catalog              catalogFile
-	tables               map[string]*table
-	retired              []retiredTable
+	mu              sync.RWMutex
+	path            string
+	dataDir         string
+	lockFile        *os.File
+	syncDir         func(string) error
+	closeCollection func(*durable.Collection) error
+	catalog         catalogFile
+	tables          map[string]*table
+	retired         []retiredTable
+	// txnReattach contains authoritative catalog collections that were
+	// successfully detached for a tentative DDL cut but could not be re-adopted
+	// after that cut definitely failed. The collection remains owned by tables;
+	// this list is only a fail-closed registration barrier. Every later catalog
+	// or data mutation retries it before doing work.
+	txnReattach          []*durable.Collection
 	catalogWritePending  bool
 	catalogFencePending  bool
 	tableDirFencePending bool
 	closed               bool
 	closeDone            bool
-	// txnLog is the caller-owned decision log for multi-table commits, opened
-	// against dataDir after RecoverDatabaseTransactions and before per-table
-	// OpenWithTransactions. Nil only while open is incomplete.
+	// txnLog is the caller-owned decision log for multi-table commits. Initial
+	// recovery opens the complete hidden+user collection set as one private
+	// phase before this handle becomes reachable.
 	txnLog *durable.TxnLog
-	// txnDecisions is the open-time scan passed to OpenWithTransactions. It may
-	// be nil when txn.vtm is absent (L1 clean absence).
-	txnDecisions *storeio.TxnDecisions
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -460,16 +461,6 @@ func openDatabaseWithShardStorePolicy(
 	if err := d.ensureDataDir(); err != nil {
 		return nil, err
 	}
-	// Load txn.vtm before any table open so every participant's journal replay
-	// can resolve kind-5 records, and so stray conditionals are consumed before
-	// the log accepts a new commit.
-	decisions, txnLog, err := durable.RecoverDatabaseTransactions(
-		d.dataDir, durable.TxnLogOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	d.txnDecisions, d.txnLog = decisions, txnLog
 	if err := checkCatalogTableCount(len(d.catalog.Tables)); err != nil {
 		return nil, err
 	}
@@ -522,7 +513,7 @@ func openDatabaseWithShardStorePolicy(
 				"vibedb: SQL catalog table %q durable definition: %w",
 				name, optionsErr)
 		}
-		dataPath := d.tablePathForMeta(name, meta)
+		dataPath := d.tablePathForMeta(meta)
 		if previous, duplicate := paths[dataPath]; duplicate {
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog tables %q and %q share storage identity %q",
@@ -556,71 +547,14 @@ func openDatabaseWithShardStorePolicy(
 	if err := d.validateViewCatalog(); err != nil {
 		return nil, err
 	}
-	// Only mutate the private table directory after the complete catalog has
-	// passed strict decoding and semantic validation. An unpublished replacement
-	// can leave a unique orphan after a crash; no live catalog entry can name it.
+	if err := d.openCatalogCollectionsWithTransactionsLocked(); err != nil {
+		return nil, err
+	}
+	// Namespace cleanup follows complete transaction membership validation and
+	// recovery. Before that proof, a catalog-omitted path may still be an
+	// unretired decision participant and must not be deleted as an orphan.
 	if err := d.recoverOrphanedTableStorage(paths); err != nil {
 		return nil, err
-	}
-	if err := d.openReplicatedApplyCollectionLocked(); err != nil {
-		return nil, err
-	}
-	for name, t := range d.tables {
-		meta := t.meta
-		dataPath := d.tablePathForMeta(name, meta)
-		file, openErr := os.OpenFile(dataPath, os.O_RDWR, 0)
-		if os.IsNotExist(openErr) {
-			if meta.Materialized {
-				return nil, fmt.Errorf(
-					"vibedb: materialized SQL table %q is missing its data file",
-					name,
-				)
-			}
-			continue
-		}
-		if openErr != nil {
-			return nil, openErr
-		}
-		openOptions := durableOptions(t)
-		// The durable page catalog is the atomic authority for online indexes.
-		// Passing nil lets Open rehydrate its complete definition after a crash
-		// between durable publication and the SQL catalog mirror.
-		openOptions.Indexes = nil
-		collection, openErr := durable.OpenWithTransactions(
-			file, openOptions, d.txnDecisions,
-		)
-		if openErr != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("vibedb: open table %q: %w", name, openErr)
-		}
-		t.file, t.collection = file, collection
-		if d.catalog.ReplicatedShardStore != nil {
-			// Replicated mode freezes the complete physical table profile. It
-			// must never adopt or mirror a durable layout that the bound catalog
-			// did not name.
-			continue
-		}
-		if !meta.Materialized {
-			// A table's unique storage identity is catalog-owned before its first
-			// mutation. First materialization publishes and fences the complete
-			// durable store before the catalog mirror is advanced, so a crash in
-			// that window leaves a valid authoritative store paired with the old
-			// false flag. Successful durable recovery is the commit record: adopt
-			// the store and repair the lagging catalog rather than making the
-			// database permanently unreopenable.
-			meta.Materialized = true
-			d.catalogWritePending = true
-		}
-		changed, syncErr := syncTableIndexMeta(t)
-		if syncErr != nil {
-			return nil, fmt.Errorf(
-				"vibedb: read durable table %q index catalog: %w",
-				name, syncErr,
-			)
-		}
-		if changed {
-			d.catalogWritePending = true
-		}
 	}
 	if d.catalog.ReplicatedShardStore != nil {
 		if err := validateOpenedReplicatedCatalog(d); err != nil {
@@ -673,6 +607,122 @@ func (d *database) recoverVisibleNamespace() error {
 			"%w: recover SQL table namespace fence: %w",
 			durable.ErrCommitOutcomeUnknown, err,
 		)
+	}
+	return nil
+}
+
+type catalogCollectionOpen struct {
+	name  string
+	table *table
+	file  *os.File
+	apply bool
+}
+
+func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
+	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+1)
+	opened := make([]catalogCollectionOpen, 0, len(d.tables)+1)
+	abortFiles := func(cause error) error {
+		for i := range opened {
+			cause = errors.Join(cause, opened[i].file.Close())
+		}
+		return cause
+	}
+	if meta := d.catalog.ReplicatedApply; meta != nil {
+		path := d.replicatedApplyPath(meta)
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if os.IsNotExist(err) {
+			return fmt.Errorf(
+				"%w: hidden collection %s is missing",
+				ErrReplicatedApplyMismatch, path,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		opened = append(opened, catalogCollectionOpen{file: file, apply: true})
+		requests = append(requests, durable.TransactionCollectionOpen{
+			File: file, Options: replicatedApplyDurableOptions(),
+		})
+	}
+	names := make([]string, 0, len(d.tables))
+	for name := range d.tables {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		t := d.tables[name]
+		path := d.tablePathForMeta(t.meta)
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if os.IsNotExist(err) {
+			if t.meta.Materialized {
+				return abortFiles(fmt.Errorf(
+					"vibedb: materialized SQL table %q is missing its data file",
+					name,
+				))
+			}
+			continue
+		}
+		if err != nil {
+			return abortFiles(err)
+		}
+		options := durableOptions(t)
+		// The durable page catalog is authoritative after an interrupted online
+		// index publication. Nil rehydrates that complete durable definition.
+		options.Indexes = nil
+		opened = append(opened, catalogCollectionOpen{
+			name: name, table: t, file: file,
+		})
+		requests = append(requests, durable.TransactionCollectionOpen{
+			File: file, Options: options,
+		})
+	}
+	collections, txnLog, err := durable.OpenCollectionsWithTransactions(
+		d.dataDir, durable.TxnLogOptions{}, requests,
+	)
+	if err != nil {
+		return abortFiles(err)
+	}
+	// Transfer every successful batch-open resource before the first fallible
+	// profile or catalog-mirror validation. Failed-open teardown then owns the
+	// complete set and cannot leak a later collection or the transaction log.
+	for i := range opened {
+		entry := opened[i]
+		collection := collections[i]
+		if entry.apply {
+			d.replicatedApplyFile = entry.file
+			d.replicatedApplyCollection = collection
+			continue
+		}
+		entry.table.file = entry.file
+		entry.table.collection = collection
+	}
+	d.txnLog = txnLog
+	for i := range opened {
+		entry := opened[i]
+		collection := collections[i]
+		if entry.apply {
+			if err := validateReplicatedApplyCollection(collection); err != nil {
+				return err
+			}
+			continue
+		}
+		if d.catalog.ReplicatedShardStore != nil {
+			continue
+		}
+		if !entry.table.meta.Materialized {
+			entry.table.meta.Materialized = true
+			d.catalogWritePending = true
+		}
+		changed, syncErr := syncTableIndexMeta(entry.table)
+		if syncErr != nil {
+			return fmt.Errorf(
+				"vibedb: read durable table %q index catalog: %w",
+				entry.name, syncErr,
+			)
+		}
+		if changed {
+			d.catalogWritePending = true
+		}
 	}
 	return nil
 }
@@ -888,18 +938,14 @@ func validatePrimarySchema(primaryKey string, schema *store.Schema) error {
 	return fmt.Errorf("schema does not constrain primary-key path %q", primaryKey)
 }
 
-func (d *database) legacyTablePath(name string) string {
-	sum := sha256.Sum256([]byte(name))
-	return filepath.Join(d.dataDir, hex.EncodeToString(sum[:])+".vjc")
-}
-
-// tablePath preserves the historical helper contract for tests and internal
-// callers while resolving cataloged incarnations when one exists.
+// tablePath returns the cataloged storage incarnation. An absent table has no
+// current storage path; current catalogs never derive storage identity from a
+// SQL name.
 func (d *database) tablePath(name string) string {
 	if meta := d.catalog.Tables[name]; meta != nil {
-		return d.tablePathForMeta(name, meta)
+		return d.tablePathForMeta(meta)
 	}
-	return d.legacyTablePath(name)
+	return ""
 }
 
 func validateCatalogTableName(name string) error {
@@ -1066,6 +1112,9 @@ func (d *database) retryNamespaceFencesLocked() error {
 // publication, so a crash in this cleanup window leaves only an unreachable
 // orphan, not a catalog entry whose data file disappeared.
 func (d *database) settleDroppedTablesLocked() error {
+	if err := d.settleTxnReattachLocked(); err != nil {
+		return err
+	}
 	if len(d.retired) == 0 {
 		return nil
 	}
@@ -1084,6 +1133,17 @@ func (d *database) settleDroppedTablesLocked() error {
 	for i := range d.retired {
 		retired := &d.retired[i]
 		if retired.collection != nil {
+			// Normal DROP/replacement already detached before catalog publication.
+			// An unpublished candidate retained after a failed detach may still be
+			// registered; retry that ownership barrier before any Close/unlink.
+			if d.txnLog != nil {
+				if err := d.txnLog.DetachCollection(retired.collection); err != nil {
+					return retainFailure(i, fmt.Errorf(
+						"%w: detach retiring SQL table incarnation %q: %w",
+						durable.ErrCommitOutcomeUnknown, retired.name, err,
+					))
+				}
+			}
 			closeErr, completed := d.collectionCloseState(retired.collection)
 			if !completed {
 				if errors.Is(closeErr, storeio.ErrLeasesActive) {
@@ -1161,6 +1221,47 @@ func (d *database) settleDroppedTablesLocked() error {
 		remaining = kept
 	}
 	d.retired = remaining
+	return nil
+}
+
+func (d *database) retainTxnReattachLocked(collection *durable.Collection) {
+	if collection == nil {
+		return
+	}
+	for _, pending := range d.txnReattach {
+		if pending == collection {
+			return
+		}
+	}
+	d.txnReattach = append(d.txnReattach, collection)
+}
+
+// settleTxnReattachLocked restores transaction-log ownership for authoritative
+// collections detached by a catalog mutation that definitely did not publish.
+// Until this succeeds, allowing even an unrelated write could create decisions
+// whose poison/discharge scope omits a live catalog member.
+func (d *database) settleTxnReattachLocked() error {
+	if len(d.txnReattach) == 0 {
+		return nil
+	}
+	if d.txnLog == nil {
+		return fmt.Errorf(
+			"%w: transaction log is unavailable for %d pending collection registration(s)",
+			durable.ErrCommitOutcomeUnknown, len(d.txnReattach),
+		)
+	}
+	for len(d.txnReattach) != 0 {
+		collection := d.txnReattach[0]
+		if err := d.txnLog.AdoptCollection(collection); err != nil {
+			return fmt.Errorf(
+				"%w: restore authoritative collection transaction ownership: %w",
+				durable.ErrCommitOutcomeUnknown, err,
+			)
+		}
+		copy(d.txnReattach, d.txnReattach[1:])
+		d.txnReattach[len(d.txnReattach)-1] = nil
+		d.txnReattach = d.txnReattach[:len(d.txnReattach)-1]
+	}
 	return nil
 }
 
@@ -1550,14 +1651,9 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 	if err != nil {
 		return nil, fmt.Errorf("vibedb: publish first SQL table: %w", err)
 	}
-	// publishTableStorageLocked reopens with standalone Open. Reopen through
-	// the transaction resolver so catalog-owned journals mint and recycle at
-	// the conditional format word, matching OpenDatabase's wiring.
-	file, collection, err = d.reopenTableWithTransactionsLocked(
-		path, file, collection, durableOptions(t),
-	)
-	if err != nil {
-		return nil, err
+	if err := d.txnLog.AdoptCollection(collection); err != nil {
+		return nil, errors.Join(err,
+			d.discardUnpublishedStorageLocked(collection, file, path))
 	}
 	t.file, t.collection = file, collection
 	t.meta.Materialized = true
@@ -1571,48 +1667,6 @@ func (d *database) materializeLocked(name string, documents []seedDocument) (*ta
 		return t, err
 	}
 	return t, nil
-}
-
-func (d *database) reopenTableWithTransactionsLocked(
-	path string,
-	file *os.File,
-	collection *durable.Collection,
-	options durable.Options,
-) (*os.File, *durable.Collection, error) {
-	if collection != nil {
-		closeErr, completed := d.collectionCloseState(collection)
-		if !completed {
-			return nil, nil, errors.Join(closeErr, fmt.Errorf(
-				"vibedb: close table before transaction reopen: completed=false",
-			), d.retainUnpublishedStorageLocked(collection, file, path))
-		}
-		collection = nil
-		if closeErr != nil {
-			return nil, nil, errors.Join(closeErr,
-				d.discardUnpublishedStorageLocked(nil, file, path))
-		}
-	}
-	if file != nil {
-		if err := file.Close(); err != nil {
-			return nil, nil, errors.Join(err,
-				d.discardUnpublishedStorageLocked(nil, file, path))
-		}
-		file = nil
-	}
-	finalFile, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return nil, nil, errors.Join(err,
-			d.discardUnpublishedStorageLocked(nil, nil, path))
-	}
-	options.Indexes = nil
-	finalCollection, err := durable.OpenWithTransactions(
-		finalFile, options, d.txnDecisions,
-	)
-	if err != nil {
-		return nil, nil, errors.Join(err,
-			d.discardUnpublishedStorageLocked(nil, finalFile, path))
-	}
-	return finalFile, finalCollection, nil
 }
 
 // publishJournalSibling relocates a store file's recovery-journal sibling when
@@ -1753,7 +1807,6 @@ func (d *database) closeWithPolicy(terminal bool) error {
 	if d.txnLog != nil {
 		result = errors.Join(result, d.txnLog.Close())
 		d.txnLog = nil
-		d.txnDecisions = nil
 	}
 	if d.lockFile != nil {
 		result = errors.Join(result, storeio.UnlockWriter(d.lockFile))

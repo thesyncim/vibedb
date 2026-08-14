@@ -104,11 +104,33 @@ func putTxnPair(t testing.TB, batch *DatabaseBatch, left, right string) error {
 	return nil
 }
 
+func TestNewTxnLogRejectsExistingMarker(t *testing.T) {
+	dir := t.TempDir()
+	marker, err := storeio.CreateTxnMarker(
+		filepath.Join(dir, txnMarkerFilename), storeio.TxnMarkerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := NewTxnLog(dir, TxnLogOptions{})
+	if log != nil {
+		_ = log.Close()
+		t.Fatal("NewTxnLog returned an owner for an existing marker")
+	}
+	if !errors.Is(err, ErrTransactionLogRecoveryRequired) {
+		t.Fatalf("NewTxnLog existing marker = %v, want recovery required", err)
+	}
+}
+
 func TestTxnLogValidateCollectionsIsReadOnlyAndFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +174,7 @@ func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
 		if err := os.Symlink(dirA, link); err != nil {
 			t.Skipf("symlink unavailable: %v", err)
 		}
-		log, err := OpenTxnLog(link, TxnLogOptions{})
+		log, err := NewTxnLog(link, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +208,7 @@ func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
 		}
 		a := openTxnNamedCollection(t, link, "a", txnTestOptions())
 		b := openTxnNamedCollection(t, link, "b", txnTestOptions())
-		log, err := OpenTxnLog(link, TxnLogOptions{})
+		log, err := NewTxnLog(link, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -225,7 +247,7 @@ func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
 		dirB := t.TempDir()
 		a := openTxnNamedCollection(t, dirA, "a", txnTestOptions())
 		b := openTxnNamedCollection(t, dirB, "b", txnTestOptions())
-		log, err := OpenTxnLog(dirA, TxnLogOptions{})
+		log, err := NewTxnLog(dirA, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,7 +275,7 @@ func TestTxnLogRescanRejectsReplacedMarker(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,6 +328,70 @@ func TestDatabaseTxnCommitAfterRegisteredCollectionDrop(t *testing.T) {
 		return putTxnPair(t, batch, "a", "b")
 	}); err != nil {
 		t.Fatalf("commit after drop: %v", err)
+	}
+}
+
+func TestTxnLogDetachCollectionDischargesAndCanBeReadopted(t *testing.T) {
+	dir := t.TempDir()
+	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
+	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
+	members := []NamedCollection{a, b}
+	log, err := NewTxnLog(dir, TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+
+	if err := UpdateCollections(
+		log, members, defaultTxnLimits(),
+		func(batch *DatabaseBatch) error { return putTxnPair(t, batch, "a", "b") },
+	); err != nil {
+		t.Fatal(err)
+	}
+	if log.marker == nil || log.marker.Cursor() == 0 {
+		t.Fatal("multi-collection commit left no live decision")
+	}
+	beforeEpoch := log.marker.Header().Epoch
+	if err := log.DetachCollection(a.Collection); err != nil {
+		t.Fatalf("DetachCollection: %v", err)
+	}
+	if log.marker.Cursor() != 0 || log.marker.Header().Epoch != beforeEpoch+1 {
+		t.Fatalf(
+			"marker after detach = cursor %d epoch %d, want empty epoch %d",
+			log.marker.Cursor(), log.marker.Header().Epoch, beforeEpoch+1,
+		)
+	}
+	if a.Collection.journal.Cursor() != 0 {
+		t.Fatalf("detached collection journal cursor = %d, want 0",
+			a.Collection.journal.Cursor())
+	}
+	log.regMu.Lock()
+	_, stillRegistered := log.registered[a.Collection]
+	log.regMu.Unlock()
+	if stillRegistered {
+		t.Fatal("detached collection remains registered")
+	}
+
+	if err := log.AdoptCollection(a.Collection); err != nil {
+		t.Fatalf("readopt detached collection: %v", err)
+	}
+	if err := UpdateCollections(
+		log, members, defaultTxnLimits(),
+		func(batch *DatabaseBatch) error {
+			left, err := batch.Collection("a")
+			if err != nil {
+				return err
+			}
+			right, err := batch.Collection("b")
+			if err != nil {
+				return err
+			}
+			mustTxnPut(t, left, "after", `{"n":2}`)
+			mustTxnPut(t, right, "after", `{"n":2}`)
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("commit after readopt: %v", err)
 	}
 }
 
@@ -466,7 +552,7 @@ func TestDatabaseTxnLaneRefusals(t *testing.T) {
 			b := openTxnNamedCollection(t, dir, "b", tc.options)
 			beforeA := journalBytes(t, a.Collection)
 			beforeB := journalBytes(t, b.Collection)
-			log, err := OpenTxnLog(dir, TxnLogOptions{})
+			log, err := NewTxnLog(dir, TxnLogOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -533,7 +619,7 @@ func TestDatabaseTxnLaneRefusals(t *testing.T) {
 		if !collA.chainFenceSync() || !collB.chainFenceSync() {
 			t.Fatal("expected chain-fence sync lane after async→sync reopen")
 		}
-		log, err := OpenTxnLog(dir, TxnLogOptions{})
+		log, err := NewTxnLog(dir, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,7 +646,7 @@ func TestDatabaseTxnLaneRefusals(t *testing.T) {
 		o.RecoveryJournal = true
 		a := openTxnNamedCollection(t, dir, "a", o)
 		b := openTxnNamedCollection(t, dir, "b", o)
-		log, err := OpenTxnLog(dir, TxnLogOptions{})
+		log, err := NewTxnLog(dir, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -582,7 +668,7 @@ func TestDatabaseTxnBoundsRefusals(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +734,7 @@ func TestDatabaseTxnBoundsRefusals(t *testing.T) {
 		for i := range parts {
 			befores[i] = journalBytes(t, parts[i].Collection)
 		}
-		tinyLog, err := OpenTxnLog(tiny, TxnLogOptions{Capacity: 512})
+		tinyLog, err := NewTxnLog(tiny, TxnLogOptions{Capacity: 512})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -676,7 +762,7 @@ func TestDatabaseTxnZeroValueFailClosed(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -724,23 +810,11 @@ func TestDatabaseTxnStageUnwind(t *testing.T) {
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
 	c := openTxnNamedCollection(t, dir, "c", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	// Remint at the conditional format before capturing the baseline: the
-	// coordinator upgrades legacy journals before staging, and that remint is
-	// durable even when a later stage failure unwinds admitted frames.
-	for _, coll := range []*Collection{a.Collection, b.Collection, c.Collection} {
-		coll.writer.Lock()
-		coll.journalCatalogOwned = true
-		if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-			coll.writer.Unlock()
-			t.Fatalf("upgrade: %v", err)
-		}
-		coll.writer.Unlock()
-	}
 	before := [][]byte{
 		journalBytes(t, a.Collection),
 		journalBytes(t, b.Collection),
@@ -793,22 +867,12 @@ func TestDatabaseTxnPreparePoisonClassification(t *testing.T) {
 			dir := t.TempDir()
 			a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 			b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-			log, err := OpenTxnLog(dir, TxnLogOptions{})
+			log, err := NewTxnLog(dir, TxnLogOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = log.Close() })
 
-			// Upgrade b to the conditional journal format first so the fault
-			// seam wraps the journal prepare will append into (a remint after
-			// NewFaultJournal would replace the wrapped file).
-			b.Collection.writer.Lock()
-			b.Collection.journalCatalogOwned = true
-			if err := b.Collection.ensureConditionalJournalFormatLocked(); err != nil {
-				b.Collection.writer.Unlock()
-				t.Fatalf("upgrade: %v", err)
-			}
-			b.Collection.writer.Unlock()
 			fj := storeio.NewFaultJournal(b.Collection.journal)
 			if tc.phase == storeio.JournalFaultSyncError {
 				fj.Program(storeio.JournalFaultPlan{Phase: tc.phase, SyncIndex: 0})
@@ -827,20 +891,20 @@ func TestDatabaseTxnPreparePoisonClassification(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected prepare failure")
 			}
-			if errors.Is(err, ErrCommitOutcomeUnknown) {
-				t.Fatalf("prepare classified unknown: %v", err)
+			if !errors.Is(err, ErrCommitOutcomeUnknown) {
+				t.Fatalf("prepare failure = %v, want outcome unknown", err)
 			}
 			persistence := b.Collection.PersistenceError()
 			if persistence == nil {
 				t.Fatal("expected sticky persistence poison on failing member")
 			}
-			if errors.Is(persistence, ErrCommitOutcomeUnknown) {
-				t.Fatalf("sticky poison classified unknown: %v", persistence)
+			if !errors.Is(persistence, ErrCommitOutcomeUnknown) {
+				t.Fatalf("sticky poison = %v, want outcome unknown", persistence)
 			}
-			if _, err := b.Collection.Put([]byte("later"), []byte(`{"n":2}`)); err == nil {
-				t.Fatal("poisoned member accepted a later write")
-			} else if errors.Is(err, ErrCommitOutcomeUnknown) {
-				t.Fatalf("later write classified unknown: %v", err)
+			if _, err := b.Collection.Put(
+				[]byte("later"), []byte(`{"n":2}`),
+			); !errors.Is(err, ErrCommitOutcomeUnknown) {
+				t.Fatalf("poisoned member later write = %v, want outcome unknown", err)
 			}
 		})
 	}
@@ -889,7 +953,7 @@ func TestDatabaseTxnLifecycleSeam(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -917,7 +981,7 @@ func TestDatabaseTxnLifecycleSeam(t *testing.T) {
 		}
 		_ = db2.Close()
 	})
-	log2, err := OpenTxnLog(dir, TxnLogOptions{})
+	log2, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +1049,7 @@ func TestDatabaseTxnSingleMemberRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = idle.Close() })
-	log, err := OpenTxnLog(targetDir, TxnLogOptions{})
+	log, err := NewTxnLog(targetDir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1021,7 +1085,7 @@ func TestDatabaseTxnMintFence(t *testing.T) {
 			b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
 			beforeA := journalBytes(t, a.Collection)
 			beforeB := journalBytes(t, b.Collection)
-			log, err := OpenTxnLog(dir, TxnLogOptions{})
+			log, err := NewTxnLog(dir, TxnLogOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1061,20 +1125,9 @@ func TestDatabaseTxnMintFence(t *testing.T) {
 		dir := t.TempDir()
 		a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 		b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-		// Pre-upgrade so prepare's first journal append is the kind-5 record
-		// observed by the fault seam (not a format remint).
-		for _, coll := range []*Collection{a.Collection, b.Collection} {
-			coll.writer.Lock()
-			coll.journalCatalogOwned = true
-			if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-				coll.writer.Unlock()
-				t.Fatal(err)
-			}
-			coll.writer.Unlock()
-		}
 		fjA := storeio.NewFaultJournal(a.Collection.journal)
 		fjB := storeio.NewFaultJournal(b.Collection.journal)
-		log, err := OpenTxnLog(dir, TxnLogOptions{})
+		log, err := NewTxnLog(dir, TxnLogOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1107,36 +1160,33 @@ func TestDatabaseTxnMintFence(t *testing.T) {
 	})
 }
 
-func TestDatabaseTxnMintRetryRefencesExistingMarkerDirectoryEntry(t *testing.T) {
+func TestDatabaseTxnRacingMarkerCreatorIsNotAdopted(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer log.Close()
 
-	productionFence := syncTxnLogMintResidueDirectory
-	defer func() { syncTxnLogMintResidueDirectory = productionFence }()
-	residueFences := 0
-	syncTxnLogMintResidueDirectory = func(root *os.Root) error {
-		residueFences++
-		return productionFence(root)
-	}
 	previousStageHook := databaseTxnAfterStageHook
 	defer func() { databaseTxnAfterStageHook = previousStageHook }()
+	stages := 0
 	databaseTxnAfterStageHook = func(_ int, _ string) error {
-		if residueFences != 1 {
-			return fmt.Errorf("staging began after %d residue directory fences", residueFences)
-		}
+		stages++
 		return nil
 	}
 
-	storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{
-		Phase: storeio.TxnMarkerFaultCreateParentDirSync,
-	})
-	defer storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+	marker, err := storeio.CreateTxnMarker(
+		filepath.Join(dir, txnMarkerFilename), storeio.TxnMarkerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
 	update := func(batch *DatabaseBatch) error {
 		ab, _ := batch.Collection("a")
 		bb, _ := batch.Collection("b")
@@ -1144,17 +1194,32 @@ func TestDatabaseTxnMintRetryRefencesExistingMarkerDirectoryEntry(t *testing.T) 
 		mustTxnPut(t, bb, "k", `{"n":1}`)
 		return nil
 	}
-	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), update); err == nil {
-		t.Fatal("first update survived parent-directory mint fence failure")
+	if err := UpdateCollections(
+		log, []NamedCollection{a, b}, defaultTxnLimits(), update,
+	); !errors.Is(err, ErrTransactionLogRecoveryRequired) {
+		t.Fatalf("racing creator update = %v, want recovery required", err)
 	}
-	if residueFences != 0 {
-		t.Fatalf("initial failed mint ran %d residue fences", residueFences)
+	if stages != 0 {
+		t.Fatalf("racing creator reached %d participant stages", stages)
 	}
-	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), update); err != nil {
-		t.Fatalf("same-handle retry after directory fence failure: %v", err)
+	if log.marker != nil {
+		t.Fatal("fresh log adopted racing transaction marker")
 	}
-	if residueFences != 1 {
-		t.Fatalf("same-handle retry directory fences = %d, want 1", residueFences)
+	if err := UpdateCollections(
+		log, []NamedCollection{a, b}, defaultTxnLimits(), update,
+	); !errors.Is(err, ErrTransactionLogRecoveryRequired) {
+		t.Fatalf("poisoned retry = %v, want recovery required", err)
+	}
+	if stages != 0 {
+		t.Fatalf("retry after unknown mint reached %d participant stages", stages)
+	}
+	if replacement, err := NewTxnLog(
+		dir, TxnLogOptions{},
+	); !errors.Is(err, ErrTransactionLogRecoveryRequired) {
+		if replacement != nil {
+			_ = replacement.Close()
+		}
+		t.Fatalf("NewTxnLog over mint residue = %v, want recovery required", err)
 	}
 }
 
@@ -1162,7 +1227,7 @@ func TestDatabaseTxnAllocationBudget(t *testing.T) {
 	dir := t.TempDir()
 	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
 	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
-	log, err := OpenTxnLog(dir, TxnLogOptions{})
+	log, err := NewTxnLog(dir, TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

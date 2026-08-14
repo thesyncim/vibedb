@@ -31,12 +31,12 @@ func TestRecoveryJournalSealedCapacityHeaderBitIsStrict(t *testing.T) {
 	if !allZero(buf[92 : RecoveryJournalHeaderSize-8]) {
 		t.Fatal("recovery header reserved suffix is non-zero")
 	}
-	const recoveryPrefix = "524a524e4c30300000000000000200000102030405060708090a0b0c0d0e0f10404142434445464748494a4b4c4d4e4f0010000000020000010000000000000000000000000000000010000000000000010000000000000001000000"
+	const recoveryPrefix = "564a4f55524e414c00000000000200000102030405060708090a0b0c0d0e0f10404142434445464748494a4b4c4d4e4f0010000000020000010000000000000000000000000000000010000000000000010000000000000001000000"
 	if got := hex.EncodeToString(buf[:92]); got != recoveryPrefix {
 		t.Fatalf("recovery header prefix = %s, want %s", got, recoveryPrefix)
 	}
 	if got, want := binary.LittleEndian.Uint32(buf[RecoveryJournalHeaderSize-8:]),
-		uint32(0xd60f393d); got != want {
+		uint32(0xb5c955b0); got != want {
 		t.Fatalf("recovery header checksum = %#08x, want %#08x", got, want)
 	}
 	binary.LittleEndian.PutUint32(buf[88:92], recoveryJournalFlagSealedCapacity|2)
@@ -66,8 +66,8 @@ func TestTxnMarkerSealedCapacityHeaderBitIsStrict(t *testing.T) {
 	var markerID [16]byte
 	markerID[0] = 1
 	header := TxnMarkerHeader{
-		FormatVersion: TxnMarkerFormatVersion,
-		MarkerID:      markerID, Epoch: 1,
+		Format:   TxnMarkerFormat,
+		MarkerID: markerID, Epoch: 1,
 		Capacity:       8 * TxnMarkerMinSectorSize,
 		SealedCapacity: true,
 		RecycleCount:   1,
@@ -86,12 +86,12 @@ func TestTxnMarkerSealedCapacityHeaderBitIsStrict(t *testing.T) {
 	if !allZero(buf[68 : TxnMarkerHeaderSize-8]) {
 		t.Fatal("marker header reserved suffix is non-zero")
 	}
-	const markerPrefix = "5654584e4c4f4700010000000002000001000000000000000000000000000000010000000000000000000000000000000010000000000000010000000000000001000000"
+	const markerPrefix = "5654584e4d524b00000000000002000001000000000000000000000000000000010000000000000000000000000000000010000000000000010000000000000001000000"
 	if got := hex.EncodeToString(buf[:68]); got != markerPrefix {
 		t.Fatalf("marker header prefix = %s, want %s", got, markerPrefix)
 	}
 	if got, want := binary.LittleEndian.Uint32(buf[TxnMarkerHeaderSize-8:]),
-		uint32(0x7261d8b7); got != want {
+		uint32(0x939043cc); got != want {
 		t.Fatalf("marker header checksum = %#08x, want %#08x", got, want)
 	}
 	binary.LittleEndian.PutUint32(buf[64:68], txnMarkerFlagSealedCapacity|2)

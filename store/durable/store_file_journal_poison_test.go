@@ -204,11 +204,14 @@ func TestSyncPrimaryBatchJournalSyncFailureOutcomeUnknownMayReplay(t *testing.T)
 	}
 }
 
-// TestSyncPrimaryJournalAppendFailureOutcomeIsDefinite guards the other side
-// of the classification boundary. A journal append failure occurs before any
-// durability barrier and leaves no valid replay record, for either record
-// shape, so it poisons the lane while remaining a definite failed commit.
-func TestSyncPrimaryJournalAppendFailureOutcomeIsDefinite(t *testing.T) {
+// TestSyncPrimaryJournalAppendFailureOutcomeUnknown covers the positional-write
+// ambiguity for both synchronous record shapes. Even before an explicit sync,
+// an append error cannot prove rejection: the complete checksummed body may
+// have landed before unwritten padding. The lane must therefore retain both
+// ErrCommitOutcomeUnknown and the device error. This fault seam rejects the
+// write completely, so the captured image exercises the admissible no-replay
+// side of that unknown outcome.
+func TestSyncPrimaryJournalAppendFailureOutcomeUnknown(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		run  func(*Collection, [2][]byte, [2][]byte) error
@@ -255,12 +258,12 @@ func TestSyncPrimaryJournalAppendFailureOutcomeIsDefinite(t *testing.T) {
 			if !errors.Is(commitErr, syscall.ENOSPC) {
 				t.Fatalf("append failure = %v, want root cause ENOSPC", commitErr)
 			}
-			if errors.Is(commitErr, ErrCommitOutcomeUnknown) {
-				t.Fatalf("pre-sync append failure misclassified as unknown: %v", commitErr)
+			if !errors.Is(commitErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("append failure = %v, want ErrCommitOutcomeUnknown", commitErr)
 			}
 			if persistenceErr := coll.PersistenceError(); !errors.Is(persistenceErr, syscall.ENOSPC) ||
-				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) {
-				t.Fatalf("sticky append poison = %v, want definite ENOSPC", persistenceErr)
+				!errors.Is(persistenceErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("sticky append poison = %v, want unknown+ENOSPC", persistenceErr)
 			}
 			for i := 0; i < tc.rows; i++ {
 				if got, found, readErr := coll.AppendRaw(nil, keys[i]); readErr != nil || found {

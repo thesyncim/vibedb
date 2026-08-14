@@ -1072,10 +1072,7 @@ catalogAddsName:
 	c.inlineFree = nextInline
 
 	if c.deferredCanonicalLane() {
-		if err := c.committer.Flush(); err != nil {
-			return err
-		}
-		c.cache.MarkDurable(c.committer.DurableGeneration())
+		return c.flushPublishedPhysicalLocked()
 	}
 	return nil
 }

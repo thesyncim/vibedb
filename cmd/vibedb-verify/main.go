@@ -285,12 +285,9 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 
 	markerID := decisions.MarkerID()
 	epoch := decisions.Epoch()
-	maxTxn := decisions.MaxTxnID()
-	for txnID := uint64(1); txnID <= maxTxn; txnID++ {
-		participants, ok := decisions.Lookup(markerID, epoch, txnID)
-		if !ok {
-			continue
-		}
+	decisions.RangeDecisions(func(
+		txnID uint64, participants []storeio.TxnParticipant,
+	) bool {
 		report.Decisions++
 		for _, p := range participants {
 			if decisions.Retired(p.StoreID) {
@@ -337,7 +334,8 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 				})
 			}
 		}
-	}
+		return true
+	})
 
 	for _, cond := range conditionals {
 		if cond.MarkerID != markerID || cond.MarkerEpoch != epoch {
@@ -446,8 +444,7 @@ func scanJournalPairing(
 	id := journalIdentity{
 		StoreID: header.StoreID, JournalID: header.JournalID, Path: path,
 	}
-	if header.FormatVersion != storeio.RecoveryJournalFormatConditional ||
-		journal.Cursor() == 0 {
+	if journal.Cursor() == 0 {
 		return id, nil, nil
 	}
 	var conds []conditionalRecord

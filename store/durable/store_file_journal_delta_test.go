@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -469,10 +470,9 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 		t.Fatalf("ordinary delta append window = %d, want %d",
 			got, uint64(2)<<20)
 	}
-	if ordinaryHeader.FormatVersion !=
-		storeio.RecoveryJournalFormatScalarPatch {
-		t.Fatalf("ordinary delta journal format = %d, want scalar-patch",
-			ordinaryHeader.FormatVersion)
+	if ordinaryHeader.Format != storeio.RecoveryJournalFormat {
+		t.Fatalf("ordinary delta journal format = %d, want current",
+			ordinaryHeader.Format)
 	}
 
 	ackOptions := journalDeltaTestOptions()
@@ -492,9 +492,9 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 			got, wantAckCapacity, completeOverlayBatch,
 		)
 	}
-	if ackHeader.FormatVersion != storeio.RecoveryJournalFormatLegacy {
-		t.Fatalf("per-mutation journal format = %d, want legacy",
-			ackHeader.FormatVersion)
+	if ackHeader.Format != storeio.RecoveryJournalFormat {
+		t.Fatalf("per-mutation journal format = %d, want current",
+			ackHeader.Format)
 	}
 }
 
@@ -1695,10 +1695,10 @@ func TestBufferedJournalDeltaSnapshotKeepsPhysicalBase(t *testing.T) {
 }
 
 // TestBufferedJournalDeltaCarryAppendFailureIsSticky fails the unsynced carry
-// attempted at overlay pressure. The full old window remains reader-visible,
-// neither journal watermark advances, and the device error poisons every later
-// mutation/checkpoint/Close. The crash image still exposes only the original
-// physical generation because ENOSPC wrote no batch bytes.
+// attempted at overlay pressure. Even this injected ENOSPC may follow a raw
+// checksummed body write on a real device, so its outcome is unknown and it
+// poisons every later mutation/checkpoint/Close. The deterministic fault writes
+// no bytes, leaving this particular crash image at the original generation.
 func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 	const documents = 320
 	options := journalDeltaTestOptions()
@@ -1739,8 +1739,9 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 		t.Fatalf("faulted carry Put = %v, fired=%v",
 			carryErr, fault.Faulted())
 	}
-	if errors.Is(carryErr, ErrCommitOutcomeUnknown) {
-		t.Fatalf("pre-sync delta append failure misclassified as unknown: %v", carryErr)
+	if !errors.Is(carryErr, ErrCommitOutcomeUnknown) ||
+		!errors.Is(carryErr, syscall.ENOSPC) {
+		t.Fatalf("delta append failure = %v, want unknown+ENOSPC", carryErr)
 	}
 	if got := fault.Appends(); got != beforeAppends+1 {
 		t.Fatalf("carry append attempts = %d, want 1", got-beforeAppends)
@@ -1762,7 +1763,8 @@ func TestBufferedJournalDeltaCarryAppendFailureIsSticky(t *testing.T) {
 		t.Fatalf("failed carry folded/checkpointed overlay: before=%+v after=%+v",
 			beforeStats, got)
 	}
-	if persistence := coll.PersistenceError(); persistence == nil || !errors.Is(carryErr, persistence) {
+	if persistence := coll.PersistenceError(); !errors.Is(persistence, ErrCommitOutcomeUnknown) ||
+		!errors.Is(persistence, syscall.ENOSPC) || !errors.Is(carryErr, persistence) {
 		t.Fatalf("PersistenceError=%v, carry=%v", persistence, carryErr)
 	}
 	image := captureJournalImage(t, path)
@@ -2357,15 +2359,36 @@ func TestBufferedJournalDeltaStructuralSplitPhysicallyFolds(t *testing.T) {
 	if coll.Stats().PrimaryLeafSplits == 0 {
 		t.Fatal("fixture did not trigger a structural split")
 	}
+	// The split itself is a rooted structural transaction. Its publication must
+	// already be physically fenced and the journal rebased before the triggering
+	// Put retries against the new topology. That retry is the next logical
+	// generation and may legitimately remain as one overlay delta.
+	splitGeneration := coll.committer.DurableGeneration()
 	target := coll.Generation()
+	if splitGeneration == 0 || splitGeneration >= target {
+		t.Fatalf(
+			"split/rooted and retried generations = %d/%d, want rooted < logical",
+			splitGeneration, target,
+		)
+	}
+	if got := coll.journal.BaseGeneration(); got != splitGeneration {
+		t.Fatalf("journal base after split = %d, want rooted %d", got, splitGeneration)
+	}
+	if coll.Stats().JournalDeltaCheckpoints != beforeDelta {
+		t.Fatal("structural split itself was acknowledged as an overlay delta")
+	}
 	if err := coll.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if coll.Stats().JournalDeltaCheckpoints != beforeDelta {
-		t.Fatal("structural split was acknowledged as an overlay delta")
+	if got := coll.Stats().JournalDeltaCheckpoints; got != beforeDelta+1 {
+		t.Fatalf(
+			"retried Put delta checkpoints = %d, want %d", got, beforeDelta+1,
+		)
 	}
-	if coll.committer.DurableGeneration() != target {
-		t.Fatalf("split physical durable=%d want %d",
-			coll.committer.DurableGeneration(), target)
+	if got := coll.committer.DurableGeneration(); got != splitGeneration {
+		t.Fatalf("physical generation after delta Flush = %d, want split %d", got, splitGeneration)
+	}
+	if got := coll.journalDeltaGeneration.Load(); got != target {
+		t.Fatalf("delta durable generation = %d, want retried Put %d", got, target)
 	}
 }

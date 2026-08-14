@@ -1,9 +1,11 @@
 package durable
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
@@ -49,33 +51,66 @@ func collectionFilename(t testing.TB, name string) string {
 	return filename
 }
 
-func testTxnDecisionsInDir(
-	t testing.TB, dir string,
-) *storeio.TxnDecisions {
+func openTransactionCatalogForTest(
+	t testing.TB, dir string, options Options, names ...string,
+) ([]*Collection, *TxnLog) {
 	t.Helper()
-	path := filepath.Join(dir, txnMarkerFilename)
-	marker, err := storeio.CreateTxnMarker(path, storeio.TxnMarkerOptions{})
+	files := make([]*os.File, 0, len(names))
+	requests := make([]TransactionCollectionOpen, 0, len(names))
+	for _, name := range names {
+		file, err := os.OpenFile(
+			filepath.Join(dir, collectionFilename(t, name)), os.O_RDWR, 0,
+		)
+		if err != nil {
+			for _, opened := range files {
+				_ = opened.Close()
+			}
+			t.Fatal(err)
+		}
+		files = append(files, file)
+		requests = append(requests, TransactionCollectionOpen{
+			File: file, Options: options,
+		})
+	}
+	collections, log, err := OpenCollectionsWithTransactions(
+		dir, TxnLogOptions{}, requests,
+	)
 	if err != nil {
-		t.Fatal(err)
+		for _, file := range files {
+			_ = file.Close()
+		}
+		t.Fatalf("OpenCollectionsWithTransactions: %v", err)
 	}
-	if err := marker.Close(); err != nil {
-		t.Fatal(err)
-	}
-	opened, decisions, err := storeio.OpenTxnMarker(path, storeio.TxnMarkerOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = opened.Close() })
-	return decisions
+	t.Cleanup(func() {
+		for _, collection := range collections {
+			_ = collection.Close()
+		}
+		if log != nil {
+			_ = log.Close()
+		}
+		for _, file := range files {
+			_ = file.Close()
+		}
+	})
+	return collections, log
 }
 
-func testTxnDecisions(t testing.TB) *storeio.TxnDecisions {
-	t.Helper()
-	return testTxnDecisionsInDir(t, t.TempDir())
-}
-
-func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
-	decisions := testTxnDecisions(t)
+func TestOpenCollectionsWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
+	txnDir := t.TempDir()
+	openOne := func(dir string, file *os.File) error {
+		collections, log, err := OpenCollectionsWithTransactions(
+			dir, TxnLogOptions{}, []TransactionCollectionOpen{{
+				File: file, Options: Options{},
+			}},
+		)
+		for _, collection := range collections {
+			_ = collection.Close()
+		}
+		if log != nil {
+			_ = log.Close()
+		}
+		return err
+	}
 
 	t.Run("different directory", func(t *testing.T) {
 		file, err := os.Create(filepath.Join(t.TempDir(), "collection.vdb"))
@@ -83,7 +118,7 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer file.Close()
-		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+		if err := openOne(txnDir, file); !errors.Is(
 			err, ErrTransactionLogDirectoryMismatch,
 		) {
 			t.Fatalf("different directory error = %v, want directory mismatch", err)
@@ -108,7 +143,7 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 		if err := os.Remove(link); err != nil {
 			t.Fatal(err)
 		}
-		_, err = OpenWithTransactions(file, Options{}, decisions)
+		err = openOne(txnDir, file)
 		if err == nil || errors.Is(err, ErrTransactionLogDirectoryMismatch) {
 			t.Fatalf("unresolved directory error = %v, want resolution failure", err)
 		}
@@ -117,7 +152,6 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 	t.Run("retargeted symlink", func(t *testing.T) {
 		dirA := t.TempDir()
 		dirB := t.TempDir()
-		decisions := testTxnDecisionsInDir(t, dirB)
 		const name = "collection.vdb"
 		if err := os.WriteFile(filepath.Join(dirA, name), []byte("a"), 0o600); err != nil {
 			t.Fatal(err)
@@ -140,7 +174,7 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 		if err := os.Symlink(dirB, link); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+		if err := openOne(dirB, file); !errors.Is(
 			err, ErrTransactionLogDirectoryMismatch,
 		) {
 			t.Fatalf("retargeted directory error = %v, want directory mismatch", err)
@@ -148,7 +182,7 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 	})
 
 	t.Run("leaf symlink", func(t *testing.T) {
-		dir := decisions.SourceDir()
+		dir := t.TempDir()
 		realPath := filepath.Join(dir, "real-collection.vdb")
 		if err := os.WriteFile(realPath, nil, 0o600); err != nil {
 			t.Fatal(err)
@@ -162,7 +196,7 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer file.Close()
-		if _, err := OpenWithTransactions(file, Options{}, decisions); !errors.Is(
+		if err := openOne(dir, file); !errors.Is(
 			err, ErrTransactionLogDirectoryMismatch,
 		) {
 			t.Fatalf("leaf symlink error = %v, want directory mismatch", err)
@@ -170,9 +204,48 @@ func TestOpenWithTransactionsDirectoryIdentityFailsClosed(t *testing.T) {
 	})
 }
 
+func TestOpenCollectionsWithTransactionsAbsentMarkerFindsOrphanSQLConditional(
+	t *testing.T,
+) {
+	source, sourceFile, sourcePath := openCatalogOwnedSyncCollection(t)
+	prepareConditionalUnpublished(
+		t, source, conditionalMarkerID(0xd0), 1, 1,
+	)
+	_, journalBytes := captureStoreJournal(t, sourcePath)
+	_ = source.Close()
+	_ = sourceFile.Close()
+
+	dir := t.TempDir()
+	orphan := filepath.Join(
+		dir, strings.Repeat("e0", 32)+".vjc.rjournal",
+	)
+	if err := os.WriteFile(orphan, journalBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	collections, log, err := OpenCollectionsWithTransactions(
+		dir, TxnLogOptions{}, nil,
+	)
+	for _, collection := range collections {
+		_ = collection.Close()
+	}
+	if log != nil {
+		_ = log.Close()
+	}
+	if !errors.Is(err, ErrTransactionLogMissing) {
+		t.Fatalf("absent marker with SQL-style conditional = %v, want missing log", err)
+	}
+	after, readErr := os.ReadFile(orphan)
+	if readErr != nil {
+		t.Fatalf("orphan conditional was removed: %v", readErr)
+	}
+	if !bytes.Equal(after, journalBytes) {
+		t.Fatal("failed absent-marker open changed orphan conditional bytes")
+	}
+}
+
 // cloneDatabaseDir copies every regular file in src to a fresh temp directory.
 // Crash-image tests use this before Database.Close, which checkpoints and
-// recycles journals and would otherwise discard unpublished kind-5 records.
+// recycles journals and would otherwise discard unpublished kind-4 records.
 func cloneDatabaseDir(t testing.TB, src string) string {
 	t.Helper()
 	dst := t.TempDir()
@@ -201,10 +274,6 @@ func prepareUnpublishedOn(
 	t.Helper()
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("ensure conditional: %v", err)
-	}
 	batch := coll.fileWriteBatch()
 	defer coll.releaseFileWriteBatch(batch)
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
@@ -312,7 +381,7 @@ func TestDatabaseTxnReconcileCommittedRollForward(t *testing.T) {
 	}
 }
 
-// prepareMaybePublish prepares a kind-5 record. When publish is true it also
+// prepareMaybePublish prepares a kind-4 record. When publish is true it also
 // publishes and checkpoints past the conditional (W4: this participant's root
 // already covers the decision); otherwise it unwinds memory and leaves the
 // durable prepare in the journal (W3).
@@ -323,10 +392,6 @@ func prepareMaybePublish(
 	t.Helper()
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("ensure conditional: %v", err)
-	}
 	batch := coll.fileWriteBatch()
 	defer coll.releaseFileWriteBatch(batch)
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
@@ -354,7 +419,9 @@ func prepareMaybePublish(
 	coll.publishPrimaryBatchGateHeld(staged)
 	coll.snapshotGate.Unlock()
 	staged.live = false
-	if err := coll.checkpointPastConditionalsLocked(); err != nil {
+	if err := coll.checkpointPastConditionalsLocked(
+		resolveAllConditionals(true), epoch,
+	); err != nil {
 		t.Fatalf("checkpoint past conditionals: %v", err)
 	}
 	return coll.state.Load().root.Generation
@@ -386,7 +453,9 @@ func TestDatabaseTxnReconcilePresumedAbort(t *testing.T) {
 			t.Fatalf("%s: presumed-abort applied prepared key", name)
 		}
 		coll.writer.Lock()
-		holds := coll.journalHoldsConditional(header.MarkerID, header.Epoch)
+		holds := journalHoldsConditionalForTest(
+			t, coll, header.MarkerID, header.Epoch,
+		)
 		coll.writer.Unlock()
 		if holds {
 			t.Fatalf("%s: stray conditional survived reopen", name)
@@ -485,7 +554,9 @@ func TestDatabaseTxnDropBarrierRetiresFirst(t *testing.T) {
 		t.Fatal("expected attached txn log")
 	}
 	b2.writer.Lock()
-	if err := b2.checkpointPastConditionalsLocked(); err != nil {
+	if err := b2.checkpointPastConditionalsLocked(
+		resolveAllConditionals(true), log.marker.Header().Epoch,
+	); err != nil {
 		b2.writer.Unlock()
 		t.Fatal(err)
 	}
@@ -555,7 +626,9 @@ func TestDatabaseTxnStandaloneOpenInDoubt(t *testing.T) {
 		t.Fatal("missing a")
 	}
 	coll.writer.Lock()
-	holds := coll.journalHoldsConditional(header.MarkerID, header.Epoch)
+	holds := journalHoldsConditionalForTest(
+		t, coll, header.MarkerID, header.Epoch,
+	)
 	cursor := coll.journal.Cursor()
 	coll.writer.Unlock()
 	if holds || cursor != 0 {
@@ -643,7 +716,8 @@ func TestDatabaseTxnDecisionLogMissing(t *testing.T) {
 		t.Fatalf("OpenDatabase err=%v want ErrTransactionLogMissing", err)
 	}
 
-	// Covered-only variant: advance root past the kind-5, delete log, open clean.
+	// Covered-only variant: even a root past the retained kind-4 cannot prove its
+	// decision. Deleting the log must still fail closed before journal mutation.
 	db2, a2, _ := openTxnDBWithAB(t)
 	path2 := filepath.Join(db2.Dir(), txnMarkerFilename)
 	marker2, err := storeio.CreateTxnMarker(path2, storeio.TxnMarkerOptions{})
@@ -660,27 +734,21 @@ func TestDatabaseTxnDecisionLogMissing(t *testing.T) {
 	}
 	advanceDurableRootWithoutRecycle(t, a2)
 	a2.writer.Lock()
-	holds := a2.journalHoldsConditional(header2.MarkerID, header2.Epoch)
+	holds := journalHoldsConditionalForTest(
+		t, a2, header2.MarkerID, header2.Epoch,
+	)
 	a2.writer.Unlock()
 	if !holds {
-		t.Fatal("expected covered kind-5 retained")
+		t.Fatal("expected covered kind-4 retained")
 	}
 	img2 := cloneDatabaseDir(t, db2.Dir())
 	_ = db2.Close()
 	if err := os.Remove(filepath.Join(img2, txnMarkerFilename)); err != nil {
 		t.Fatal(err)
 	}
-	reopened := reopenTxnDatabase(t, img2)
-	coll, ok := reopened.Collection("a")
-	if !ok {
-		t.Fatal("missing a")
-	}
-	coll.writer.Lock()
-	holds = coll.journalHoldsConditional(header2.MarkerID, header2.Epoch)
-	cursor := coll.journal.Cursor()
-	coll.writer.Unlock()
-	if holds || cursor != 0 {
-		t.Fatalf("covered-only absent log left window holds=%v cursor=%d", holds, cursor)
+	_, err = OpenDatabase(img2, DatabaseOptions{Options: txnTestOptions()})
+	if !errors.Is(err, ErrTransactionLogMissing) {
+		t.Fatalf("covered conditional without log = %v, want missing log", err)
 	}
 }
 
@@ -746,7 +814,7 @@ func TestDatabaseTxnMintResidueOpen(t *testing.T) {
 	}
 	_ = reopened.Close()
 
-	// Same headerless file beside a journal holding a kind-5 → fail closed.
+	// Same headerless file beside a journal holding a kind-4 → fail closed.
 	db2, a2, _ := openTxnDBWithAB(t)
 	_ = prepareUnpublishedOn(t, a2, conditionalMarkerID(1), 1, 1, "k", `{"n":1}`)
 	img := cloneDatabaseDir(t, db2.Dir())
@@ -816,7 +884,7 @@ func TestDatabaseTxnRecoverySecondCrash(t *testing.T) {
 		t.Fatal("expected mid-replay failure")
 	}
 	if !interrupted {
-		t.Fatal("mid-replay hook did not fire on kind-5")
+		t.Fatal("mid-replay hook did not fire on kind-4")
 	}
 
 	recoveryJournalReplayBatchEntryHook = nil
@@ -857,7 +925,7 @@ func TestDatabaseTxnLogLifecycleOpenCloseReopen(t *testing.T) {
 		t.Fatalf("reopened Update: %v", err)
 	}
 	if lookupDatabaseTxnLog(reopened) == nil {
-		t.Fatal("expected TxnLog after remint commit")
+		t.Fatal("expected TxnLog after fresh marker commit")
 	}
 }
 
@@ -878,7 +946,9 @@ func TestDatabaseTxnStrayConsumptionAtOpen(t *testing.T) {
 	reopened := reopenTxnDatabase(t, img)
 	coll, _ := reopened.Collection("a")
 	coll.writer.Lock()
-	holds := coll.journalHoldsConditional(header.MarkerID, header.Epoch)
+	holds := journalHoldsConditionalForTest(
+		t, coll, header.MarkerID, header.Epoch,
+	)
 	coll.writer.Unlock()
 	if holds {
 		t.Fatal("stray conditional survived open fold")
@@ -894,39 +964,23 @@ func TestDatabaseTxnStrayConsumptionAtOpen(t *testing.T) {
 	}
 }
 
-// TestRecoverDatabaseTransactionsAndOpenWithTransactions exercises the
-// driver-facing composition.
-func TestRecoverDatabaseTransactionsAndOpenWithTransactions(t *testing.T) {
+// TestOpenCollectionsWithTransactions exercises the caller-owned catalog
+// recovery entry point over the complete collection set.
+func TestOpenCollectionsWithTransactions(t *testing.T) {
 	db, _, _ := openTxnDBWithAB(t)
 	mustTxnUpdate2(t, db, "k", `{"n":1}`, "k", `{"n":1}`)
 	img := cloneDatabaseDir(t, db.Dir())
 	_ = db.Close()
 
-	decisions, log, err := RecoverDatabaseTransactions(img, TxnLogOptions{})
-	if err != nil {
-		t.Fatal(err)
+	collections, log := openTransactionCatalogForTest(
+		t, img, txnTestOptions(), "a", "b",
+	)
+	if log == nil {
+		t.Fatal("expected transaction log owner")
 	}
-	defer log.Close()
-	if decisions == nil {
-		t.Fatal("expected decisions after committed multi-collection close")
-	}
-
-	primaryA := filepath.Join(img, collectionFilename(t, "a"))
-	file, err := os.OpenFile(primaryA, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	coll, err := OpenWithTransactions(file, txnTestOptions(), decisions)
-	if err != nil {
-		t.Fatalf("OpenWithTransactions: %v", err)
-	}
-	defer coll.Close()
+	coll := collections[0]
 	doc, found := collectionDoc(t, coll, "k")
 	if !found || doc != `{"n":1}` {
 		t.Fatalf("doc=%q found=%v", doc, found)
-	}
-	if !coll.journalCatalogOwned {
-		t.Fatal("OpenWithTransactions left journalCatalogOwned false")
 	}
 }

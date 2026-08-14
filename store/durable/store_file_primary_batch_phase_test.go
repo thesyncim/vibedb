@@ -38,7 +38,7 @@ func phaseExpectedContent() map[string]string {
 
 // TestPrimaryBatchPhaseSplitByteIdenticalFrozenContract pins that Collection.Update
 // on every supported lane still produces kind-3 (or ordinary delta) journal
-// records — never kind-5 — and the same logical end state. Journal/store file
+// records — never kind-4 — and the same logical end state. Journal/store file
 // identities are random per CreateFromPrimary, so the frozen proof is the
 // decoded record grammar plus a second Update on a cloned image matching
 // byte-for-byte after normalizing away only the live append cursor region is
@@ -94,7 +94,7 @@ func TestPrimaryBatchPhaseSplitByteIdenticalFrozenContract(t *testing.T) {
 				t.Fatalf("Close: %v", err)
 			}
 			_ = file.Close()
-			// Reopen and confirm content stable (no kind-5 / no in-doubt).
+			// Reopen and confirm content stable (no kind-4 / no in-doubt).
 			file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 			if err != nil {
 				t.Fatal(err)
@@ -153,14 +153,14 @@ func assertJournalHasKind3BatchOnly(t *testing.T, journalBytes []byte, storePath
 		t.Fatalf("OpenRecoveryJournal: %v", err)
 	}
 	defer rj.Close()
-	if rj.Header().FormatVersion == storeio.RecoveryJournalFormatConditional {
-		t.Fatal("single-collection Update must not mint conditional journal format")
+	if rj.Header().Format != storeio.RecoveryJournalFormat {
+		t.Fatalf("journal format = %d, want current", rj.Header().Format)
 	}
 	sawBatch := false
 	if err := rj.Replay(rj.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
 		switch rec.Kind {
 		case storeio.RecoveryRecordKindConditionalBatch:
-			t.Fatalf("unexpected kind-5 conditional batch in single-collection journal")
+			t.Fatalf("unexpected kind-4 conditional batch in single-collection journal")
 		case storeio.RecoveryRecordKindBatch:
 			sawBatch = true
 			if rec.Conditional != (storeio.RecoveryConditionalHeader{}) {
@@ -249,10 +249,11 @@ func TestPrimaryBatchPhaseUnwindOnPrepareFailure(t *testing.T) {
 	}
 }
 
-// TestPrimaryBatchPhasePrepareFailureClassification proves both an injected
-// append error and an injected sync error poison with plain persistence
-// failure — never ErrCommitOutcomeUnknown.
-func TestPrimaryBatchPhasePrepareFailureClassification(t *testing.T) {
+// TestPrimaryBatchPhasePrepareFailureOutcomeUnknown proves both an injected
+// append error and an injected sync error poison the collection and report an
+// unknown outcome. Either failure can leave a complete authenticated prepare
+// visible after reopen, so callers must reconcile rather than retry in place.
+func TestPrimaryBatchPhasePrepareFailureOutcomeUnknown(t *testing.T) {
 	cases := []struct {
 		name  string
 		phase storeio.JournalFaultPhase
@@ -269,14 +270,6 @@ func TestPrimaryBatchPhasePrepareFailureClassification(t *testing.T) {
 			coll, file, _ := openPrimaryBatchStore(t, options)
 			defer file.Close()
 			defer coll.Close()
-
-			coll.writer.Lock()
-			coll.journalCatalogOwned = true
-			if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-				coll.writer.Unlock()
-				t.Fatalf("upgrade format: %v", err)
-			}
-			coll.writer.Unlock()
 
 			fj := get()
 			if fj == nil {
@@ -318,15 +311,15 @@ func TestPrimaryBatchPhasePrepareFailureClassification(t *testing.T) {
 			if prepErr == nil {
 				t.Fatal("prepare succeeded, want injected failure")
 			}
-			if errors.Is(prepErr, ErrCommitOutcomeUnknown) {
-				t.Fatalf("prepare error classified unknown: %v", prepErr)
+			if !errors.Is(prepErr, ErrCommitOutcomeUnknown) {
+				t.Fatalf("prepare error = %v, want unknown outcome", prepErr)
 			}
 			persistence := coll.PersistenceError()
 			if persistence == nil {
 				t.Fatal("expected sticky persistence poison")
 			}
-			if errors.Is(persistence, ErrCommitOutcomeUnknown) {
-				t.Fatalf("sticky poison classified unknown: %v", persistence)
+			if !errors.Is(persistence, ErrCommitOutcomeUnknown) {
+				t.Fatalf("sticky poison = %v, want unknown outcome", persistence)
 			}
 			if !fj.Faulted() {
 				t.Fatal("programmed fault never fired")

@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Conditional batch records (kind 5) are the prepare half of a multi-collection
+// Conditional batch records (kind 4) are the prepare half of a multi-collection
 // commit. On the wire they reuse the kind-3 batch envelope and entry grammar —
 // one sequence, one generation, one CRC32C plus complement, sector-padded —
 // with a 32-byte conditional header prefixed to the entry body:
@@ -20,12 +20,9 @@ import (
 // decision. Torn-tail truncation, strict sequence validation, and recycle
 // behavior are inherited from the ordinary journal manager unchanged.
 //
-// The conditional journal format word (RecoveryJournalFormatConditional) is the
-// gate: a legacy or scalar-patch reader rejects the header before record
-// decode, and a kind-5 record inside a legacy or scalar-patch journal fails
-// closed. Conditional journals accept record kinds 1, 2, 3, and 5; scalar-patch
-// entries (kind 4) remain scalar-patch-format-only and never coexist with
-// conditional records under this format word.
+// Kind 4 is the authenticated grammar discriminator. The current journal
+// container admits it alongside ordinary atomic and delta records, while its
+// body remains restricted to put/delete entries.
 
 func recoveryConditionalHeaderValid(h RecoveryConditionalHeader) bool {
 	return h.MarkerID != ([16]byte{}) && h.MarkerEpoch != 0 && h.TxnID != 0
@@ -67,7 +64,7 @@ func prepareRecoveryConditionalBatch(
 	sectorSize uint32, entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, bool) {
 	if !recoveryBatchEntriesAllowed(
-		RecoveryJournalFormatConditional, entries,
+		recoveryRecordKindConditionalBatch, entries,
 	) {
 		return RecoveryBatchPlan{}, false
 	}
@@ -82,11 +79,11 @@ func prepareRecoveryConditionalBatch(
 		return RecoveryBatchPlan{}, false
 	}
 	return RecoveryBatchPlan{
-		formatVersion: RecoveryJournalFormatConditional,
-		sectorSize:    sectorSize,
-		entryCount:    len(entries),
-		bodyLen:       body,
-		padded:        padded,
+		recordKind: recoveryRecordKindConditionalBatch,
+		sectorSize: sectorSize,
+		entryCount: len(entries),
+		bodyLen:    body,
+		padded:     padded,
 	}, true
 }
 
@@ -100,8 +97,9 @@ func encodeRecoveryConditionalBatchRecordPrepared(
 	if !recoveryConditionalHeaderValid(rec.Conditional) {
 		return 0, fmt.Errorf("%w: conditional header", ErrInvalidWrite)
 	}
-	if plan.formatVersion != RecoveryJournalFormatConditional ||
-		!plan.validFor(sectorSize, len(rec.Entries)) {
+	if !plan.validForKind(
+		recoveryRecordKindConditionalBatch, sectorSize, len(rec.Entries),
+	) {
 		return 0, fmt.Errorf("%w: conditional batch plan", ErrInvalidWrite)
 	}
 	if len(dst) < plan.padded {
@@ -135,12 +133,6 @@ func encodeRecoveryConditionalBatchRecordPrepared(
 			entry.Kind != recoveryRecordKindDelete {
 			return 0, fmt.Errorf(
 				"%w: conditional batch entry kind", ErrInvalidWrite,
-			)
-		}
-		if entry.ScalarPatch != (RecoveryScalarPatchMetadata{}) {
-			return 0, fmt.Errorf(
-				"%w: scalar-patch metadata in conditional batch",
-				ErrInvalidWrite,
 			)
 		}
 		if len(entry.Key) == 0 ||
@@ -183,7 +175,7 @@ func encodeRecoveryConditionalBatchRecordPrepared(
 	return plan.padded, nil
 }
 
-// decodeRecoveryConditionalBatchRecord validates one kind-5 record at the start
+// decodeRecoveryConditionalBatchRecord validates one kind-4 record at the start
 // of src. Framing, checksum, and sequence failures are truncatable; a
 // checksum-authenticated semantic failure (zero conditional identity, illegal
 // entry kind, body mismatch) is hard.
@@ -194,14 +186,9 @@ func decodeRecoveryConditionalBatchRecord(
 	generation := binary.LittleEndian.Uint64(src[16:24])
 	entryCount := binary.LittleEndian.Uint32(src[24:28])
 	bodyLen := binary.LittleEndian.Uint32(src[28:32])
-	if sequence != expectedSequence || generation == 0 || entryCount == 0 {
+	if sequence != expectedSequence && sequence != 0 {
 		return RecoveryRecord{}, 0, recoveryJournalTailError(
-			"conditional batch sequence or framing",
-		)
-	}
-	if uint64(bodyLen) < RecoveryConditionalHeaderSize {
-		return RecoveryRecord{}, 0, recoveryJournalTailError(
-			"conditional batch body shorter than header",
+			"conditional batch sequence",
 		)
 	}
 	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(bodyLen)
@@ -214,8 +201,20 @@ func decodeRecoveryConditionalBatchRecord(
 	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
 	if stored != checksum ||
 		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
+		if recoveryStandaloneLayoutAuthenticated(src) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"conditional kind authenticates standalone layout",
+			)
+		}
 		return RecoveryRecord{}, 0, recoveryJournalTailError(
 			"conditional batch checksum",
+		)
+	}
+	if sequence == 0 || generation == 0 || entryCount == 0 ||
+		binary.LittleEndian.Uint16(src[6:8]) != 0 ||
+		uint64(bodyLen) < RecoveryConditionalHeaderSize {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid conditional batch framing",
 		)
 	}
 	conditional, ok := decodeRecoveryConditionalHeader(
@@ -290,13 +289,17 @@ func decodeRecoveryConditionalBatchRecord(
 			"checksum-valid padded conditional batch length",
 		)
 	}
-	return RecoveryRecord{
+	rec := RecoveryRecord{
 		Sequence:    sequence,
 		Generation:  generation,
 		Kind:        recoveryRecordKindConditionalBatch,
 		Entries:     entries,
 		Conditional: conditional,
-	}, padded, nil
+	}
+	if err := validateRecoveryRecord(rec); err != nil {
+		return RecoveryRecord{}, 0, err
+	}
+	return rec, padded, nil
 }
 
 // RecoveryConditionalBatchRecordPaddedSize returns the on-disk byte cost of one
@@ -314,17 +317,11 @@ func RecoveryConditionalBatchRecordPaddedSize(
 }
 
 // PrepareConditionalBatch validates and sizes one conditional batch without
-// allocating. The opaque plan is bound to the conditional format word; it can
+// allocating. The opaque plan is bound to the conditional record kind; it can
 // be reused for the capacity decision, append, and accounting.
 func (rj *RecoveryJournal) PrepareConditionalBatch(
 	entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, error) {
-	if rj.header.FormatVersion != RecoveryJournalFormatConditional {
-		return RecoveryBatchPlan{}, fmt.Errorf(
-			"%w: conditional batch requires conditional journal format",
-			ErrInvalidWrite,
-		)
-	}
 	plan, ok := prepareRecoveryConditionalBatch(rj.header.SectorSize, entries)
 	if !ok {
 		return RecoveryBatchPlan{}, fmt.Errorf(
@@ -344,7 +341,7 @@ func (rj *RecoveryJournal) FitsConditionalBatch(entries []RecoveryBatchEntry) bo
 	return rj.PreparedBatchFits(plan)
 }
 
-// AppendConditionalBatch writes one kind-5 conditional batch record at the
+// AppendConditionalBatch writes one kind-4 conditional batch record at the
 // cursor and advances it, consuming a single sequence number. Like AppendBatch
 // it never extends the file — a record that would overrun capacity returns
 // ErrRecoveryJournalFull — and it does not sync: the caller issues the lane's
@@ -376,14 +373,11 @@ func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
 	entries []RecoveryBatchEntry,
 	plan RecoveryBatchPlan,
 ) (uint64, error) {
-	if rj.header.FormatVersion != RecoveryJournalFormatConditional {
-		return 0, fmt.Errorf(
-			"%w: conditional batch requires conditional journal format",
-			ErrInvalidWrite,
-		)
+	if rj.nextSequence == 0 {
+		return 0, ErrRecoveryJournalFull
 	}
-	if !plan.validForFormat(
-		RecoveryJournalFormatConditional, rj.header.SectorSize, len(entries),
+	if !plan.validForKind(
+		recoveryRecordKindConditionalBatch, rj.header.SectorSize, len(entries),
 	) {
 		return 0, fmt.Errorf("%w: conditional batch plan", ErrInvalidWrite)
 	}
@@ -407,6 +401,11 @@ func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
 			TxnID:       txnID,
 		},
 	}
+	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+		rj.validateAppendRecord(rec)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := encodeRecoveryConditionalBatchRecordPrepared(
 		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
 	); err != nil {
@@ -419,6 +418,11 @@ func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
 		return 0, err
 	}
 	rj.cursor = end
+	rj.family = nextFamily
+	rj.deltaEndGeneration = nextDeltaEnd
+	rj.atomicLastGeneration = nextAtomicGeneration
+	rj.atomicLastKind = nextAtomicKind
+	rj.conditionalChain = nextConditional
 	sequence := rj.nextSequence
 	rj.nextSequence++
 	return sequence, nil

@@ -15,7 +15,7 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-func TestRecoveryJournalLegacyBatchIgnoresSmallerReopenByteBound(t *testing.T) {
+func TestRecoveryJournalAtomicBatchIgnoresSmallerReopenByteBound(t *testing.T) {
 	options := syncPrimaryJournalTestOptions()
 	options.MaxKeyBytes = 8
 	options.InlineValueBytes = 256
@@ -49,9 +49,9 @@ func TestRecoveryJournalLegacyBatchIgnoresSmallerReopenByteBound(t *testing.T) {
 	_ = coll.Close()
 	_ = file.Close()
 	if captured == nil {
-		t.Fatal("did not capture legacy batch")
+		t.Fatal("did not capture atomic batch")
 	}
-	crashPath := filepath.Join(t.TempDir(), "legacy-smaller-byte-bound.vibe")
+	crashPath := filepath.Join(t.TempDir(), "atomic-smaller-byte-bound.vibe")
 	if err := os.WriteFile(crashPath, captured.store, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -80,12 +80,12 @@ func TestRecoveryJournalLegacyBatchIgnoresSmallerReopenByteBound(t *testing.T) {
 	}
 }
 
-// TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash stays on the legacy
-// one-generation journal grammar used by synchronous Update. Recovery publishes
+// TestRecoveryJournalAtomicIndexedDeleteBatchSecondCrash exercises the current
+// one-generation kind-3 grammar used by synchronous Update. Recovery publishes
 // a pure-delete batch atomically, checkpoints it, and is interrupted before
 // recycle; the next Open must re-consume the now-no-op batch, preserve the
 // negative exact postings, and finally empty the journal.
-func TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash(t *testing.T) {
+func TestRecoveryJournalAtomicIndexedDeleteBatchSecondCrash(t *testing.T) {
 	options := syncPrimaryJournalTestOptions()
 	options.Indexes = []store.IndexDefinition{
 		{Name: "number", Paths: []string{"/i"}},
@@ -96,7 +96,7 @@ func TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash(t *testing.T) {
 		"keep":     []byte(`{"i":3,"v":"keep"}`),
 	}
 	coll := buildIndexedPrimaryFile(
-		t, t.TempDir(), "legacy-delete-batch-*", docs, options,
+		t, t.TempDir(), "atomic-delete-batch-*", docs, options,
 	)
 	path := coll.file.Name()
 	var captured *journalCrashImage
@@ -124,7 +124,7 @@ func TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	crashPath := filepath.Join(t.TempDir(), "legacy-delete-second-crash.vibe")
+	crashPath := filepath.Join(t.TempDir(), "atomic-delete-second-crash.vibe")
 	if err := os.WriteFile(crashPath, captured.store, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	secondCrash := errors.New("test: crash after atomic legacy delete replay")
+	secondCrash := errors.New("test: crash after atomic delete replay")
 	previousReplay := recoveryJournalReplayBatchEntryHook
 	defer func() {
 		recoveryJournalPostSyncHook = previousPostSync
@@ -207,7 +207,7 @@ func TestRecoveryJournalLegacyIndexedDeleteBatchSecondCrash(t *testing.T) {
 	}
 }
 
-func legacyRecoveryDispersedValue(row int, state string) []byte {
+func recoveryDispersedValue(row int, state string) []byte {
 	padding := make([]byte, 1700)
 	for at := range padding {
 		padding[at] = byte('a' + (row*31+at*17+(row^(at>>3)))%26)
@@ -217,13 +217,14 @@ func legacyRecoveryDispersedValue(row int, state string) []byte {
 	))
 }
 
-// TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry proves that a
-// durable legacy batch is not constrained by the next process's batch-admission
+// TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry proves that a
+// durable current kind-3 batch is not constrained by the next process's
+// batch-admission
 // arenas. The acknowledged batch spans more leaves than that process can retain
 // as deferred parents, so private recovery must make bounded forward progress
 // through pressure checkpoints while retaining the original journal until every
 // replacement and exact posting is durable.
-func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T) {
+func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T) {
 	const sourceRows = 8192
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = 256
@@ -235,7 +236,7 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	reopenOptions := options
 	reopenOptions.MaxBatchDocuments = 1
 	reopenOptions.MaxBatchBytes = 0
-	// Remove the class-5 overlay window as well as shrinking the caller batch
+	// Remove the row-overlay window as well as shrinking the caller batch
 	// arenas. Recovery must not inherit the process geometry that acknowledged
 	// the record.
 	var reopenGeometry normalizedFileStoreOptions
@@ -264,10 +265,10 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	documents := make(map[string][]byte, sourceRows)
 	for row := range sourceRows {
 		documents[fmt.Sprintf("row-%05d", row)] =
-			legacyRecoveryDispersedValue(row, "old")
+			recoveryDispersedValue(row, "old")
 	}
 	coll := buildIndexedPrimaryFile(
-		t, t.TempDir(), "legacy-dispersed-*", documents, options,
+		t, t.TempDir(), "atomic-dispersed-*", documents, options,
 	)
 	path := coll.file.Name()
 
@@ -305,7 +306,7 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		for _, row := range selected {
 			if err := batch.Put(
 				[]byte(fmt.Sprintf("row-%05d", row)),
-				legacyRecoveryDispersedValue(row, "new"),
+				recoveryDispersedValue(row, "new"),
 			); err != nil {
 				return err
 			}
@@ -323,7 +324,7 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 		t.Fatal(err)
 	}
 
-	crashPath := filepath.Join(t.TempDir(), "legacy-dispersed-recovery.vibe")
+	crashPath := filepath.Join(t.TempDir(), "atomic-dispersed-recovery.vibe")
 	if err := os.WriteFile(crashPath, captured.store, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +387,7 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	for i, row := range selected {
 		wantNew[i] = fmt.Sprintf("row-%05d", row)
 		wantValue, canonicalErr := vibejson.AppendCanonicalize(
-			nil, legacyRecoveryDispersedValue(row, "new"),
+			nil, recoveryDispersedValue(row, "new"),
 		)
 		if canonicalErr != nil {
 			t.Fatal(canonicalErr)
@@ -443,7 +444,7 @@ func TestRecoveryJournalLegacyDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	}
 }
 
-func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) {
+func TestRecoveryJournalDeltaReplaySecondCrashSkipsDurablePrefix(t *testing.T) {
 	options := concurrentPrimaryTestOptions()
 	fixture := openConcurrentPrimaryTestFixture(t, 512, options)
 	same, _ := concurrentPrimaryTestTargets(t, fixture)
@@ -502,7 +503,7 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	crashPath := filepath.Join(t.TempDir(), "scalar-second-crash.vibe")
+	crashPath := filepath.Join(t.TempDir(), "delta-second-crash.vibe")
 	if err := os.WriteFile(crashPath, image.store, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -510,9 +511,9 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	// The compact development format journals complete canonical values. Pin the
-	// consecutive batch so replay after a prefix checkpoint remains idempotent
-	// without retaining the removed class-5 scalar-patch compatibility lane.
+	// The current kind-5 delta grammar journals complete canonical values and a
+	// consecutive generation interval. Pin both so replay after a prefix
+	// checkpoint remains idempotent.
 	journalFile, err := os.Open(crashPath + ".rjournal")
 	if err != nil {
 		t.Fatal(err)
@@ -522,17 +523,17 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		_ = journalFile.Close()
 		t.Fatal(err)
 	}
-	if journal.Header().FormatVersion != storeio.RecoveryJournalFormatScalarPatch {
-		t.Fatalf("journal format = %d, want v1", journal.Header().FormatVersion)
+	if journal.Header().Format != storeio.RecoveryJournalFormat {
+		t.Fatalf("journal format = %d, want current", journal.Header().Format)
 	}
 	checkedBatch := false
 	if err := journal.Replay(baseGeneration, func(rec storeio.RecoveryRecord) error {
-		if rec.Kind != storeio.RecoveryRecordKindBatch || len(rec.Entries) != 2 ||
+		if rec.Kind != storeio.RecoveryRecordKindDeltaBatch || len(rec.Entries) != 2 ||
 			rec.Entries[0].Kind != storeio.RecoveryRecordKindPut ||
 			rec.Entries[1].Kind != storeio.RecoveryRecordKindPut ||
 			!bytes.Equal(rec.Entries[0].Value, want[0]) ||
 			!bytes.Equal(rec.Entries[1].Value, want[1]) {
-			return fmt.Errorf("unexpected scalar replay batch: %#v", rec)
+			return fmt.Errorf("unexpected delta replay batch: %#v", rec)
 		}
 		checkedBatch = true
 		return nil
@@ -544,7 +545,7 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		t.Fatal(err)
 	}
 	if !checkedBatch {
-		t.Fatal("v1 scalar batch was not present")
+		t.Fatal("current delta batch was not present")
 	}
 
 	secondCrash := errors.New("test: crash after durable replay prefix")
@@ -560,7 +561,7 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 		}
 		hookCalls++
 		// Force the same physical checkpoint bounded staging pressure may take
-		// between replayed entries. journalReplaying keeps the v1 batch intact.
+		// between replayed entries. journalReplaying keeps the delta batch intact.
 		coll.writer.Lock()
 		checkpointErr := coll.checkpointBufferedLocked()
 		prefixGeneration = coll.committer.DurableGeneration()
@@ -617,16 +618,15 @@ func TestRecoveryJournalScalarReplaySecondCrashSkipsDurablePrefix(t *testing.T) 
 	}
 }
 
-func TestRecoveryJournalScalarFormatRejectsRuntimeLaneChange(t *testing.T) {
+func TestRecoveryJournalCurrentFormatAdmitsRuntimeLaneChange(t *testing.T) {
 	options := journalDeltaTestOptions()
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), 128, options,
 	)
 	rootLazyBufferedJournal(t, coll)
 	path := coll.file.Name()
-	if got := coll.journal.Header().FormatVersion; got !=
-		storeio.RecoveryJournalFormatScalarPatch {
-		t.Fatalf("journal format = %d, want scalar-patch", got)
+	if got := coll.journal.Header().Format; got != storeio.RecoveryJournalFormat {
+		t.Fatalf("journal format = %d, want current", got)
 	}
 	if err := coll.Close(); err != nil {
 		t.Fatal(err)
@@ -656,34 +656,40 @@ func TestRecoveryJournalScalarFormatRejectsRuntimeLaneChange(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, openErr := Open(file, reopenOptions)
-			_ = file.Close()
-			if !errors.Is(openErr, storeio.ErrRecoveryJournalGeometry) {
-				t.Fatalf("Open = %v, want recovery-journal geometry error", openErr)
+			reopened, openErr := Open(file, reopenOptions)
+			if openErr != nil {
+				_ = file.Close()
+				t.Fatalf("Open current grammar after lane change: %v", openErr)
+			}
+			if got := reopened.journal.Header().Format; got != storeio.RecoveryJournalFormat {
+				_ = reopened.Close()
+				_ = file.Close()
+				t.Fatalf("reopened journal format = %d, want current", got)
+			}
+			if err := reopened.Close(); err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
 }
 
-func TestRecoveryJournalScalarFormatReplaySkipsDurableBatchPrefix(t *testing.T) {
+func TestRecoveryJournalDeltaReplayStartSkipsDurablePrefix(t *testing.T) {
 	record := storeio.RecoveryRecord{
 		Generation: 104,
-		Kind:       storeio.RecoveryRecordKindBatch,
+		Kind:       storeio.RecoveryRecordKindDeltaBatch,
 		Entries: []storeio.RecoveryBatchEntry{
-			{
-				Kind:  storeio.RecoveryRecordKindScalarPatch,
-				Key:   []byte("scalar"),
-				Value: []byte("10"),
-			},
+			{Kind: storeio.RecoveryRecordKindPut, Key: []byte("full-0")},
 			{Kind: storeio.RecoveryRecordKindPut, Key: []byte("full-a")},
 			{Kind: storeio.RecoveryRecordKindDelete, Key: []byte("gone")},
 			{Kind: storeio.RecoveryRecordKindPut, Key: []byte("full-b")},
 		},
 	}
 
-	start, err := recoveryJournalBatchReplayStart(
-		storeio.RecoveryJournalFormatScalarPatch, record, 102,
-	)
+	start, err := recoveryJournalDeltaReplayStart(record, 102)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,27 +697,27 @@ func TestRecoveryJournalScalarFormatReplaySkipsDurableBatchPrefix(t *testing.T) 
 		t.Fatalf("replay start = %d, want mixed-entry suffix at index 2", start)
 	}
 
-	// Legacy batches retain their one-generation atomic grammar even if the same
-	// target/count numbers would look like a partially covered delta interval.
-	start, err = recoveryJournalBatchReplayStart(
-		storeio.RecoveryJournalFormatLegacy, record, 102,
-	)
-	if err != nil || start != 0 {
-		t.Fatalf("legacy replay start = %d, %v; want 0, nil", start, err)
+	// A kind-3 batch is one atomic generation and must never enter delta-prefix
+	// arithmetic, even when its target/count happen to describe an interval.
+	record.Kind = storeio.RecoveryRecordKindBatch
+	if _, err := recoveryJournalDeltaReplayStart(
+		record, 102,
+	); !errors.Is(err, storeio.ErrRecoveryJournalRecord) {
+		t.Fatalf("atomic batch delta-prefix check = %v, want record error", err)
 	}
 }
 
-func TestRecoveryJournalScalarFormatReplayRejectsGenerationUnderflow(t *testing.T) {
+func TestRecoveryJournalDeltaReplayStartRejectsGenerationUnderflow(t *testing.T) {
 	record := storeio.RecoveryRecord{
 		Generation: 1,
-		Kind:       storeio.RecoveryRecordKindBatch,
+		Kind:       storeio.RecoveryRecordKindDeltaBatch,
 		Entries: []storeio.RecoveryBatchEntry{
 			{Kind: storeio.RecoveryRecordKindPut, Key: []byte("a")},
 			{Kind: storeio.RecoveryRecordKindPut, Key: []byte("b")},
 		},
 	}
-	if _, err := recoveryJournalBatchReplayStart(
-		storeio.RecoveryJournalFormatScalarPatch, record, 0,
+	if _, err := recoveryJournalDeltaReplayStart(
+		record, 0,
 	); !errors.Is(err, storeio.ErrRecoveryJournalRecord) {
 		t.Fatalf("generation underflow = %v, want journal-record error", err)
 	}

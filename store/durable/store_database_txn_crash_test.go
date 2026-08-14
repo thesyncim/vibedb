@@ -15,25 +15,12 @@ import (
 
 // Multi-collection crash matrix (design doc "Crash matrix" / walkthrough
 // windows W1–W9, A1, R1, E1, and the publish-vs-cut race). Reopen oracles go
-// through OpenDatabase; one path also exercises the driver-facing
-// RecoverDatabaseTransactions + OpenWithTransactions composition.
+// through OpenDatabase; selected paths also exercise the caller-owned complete
+// catalog recovery entry point.
 //
-// Named tests that already live in the T5 recovery suite
+// Named tests that already live in the recovery suite
 // (RecoverySecondCrash, StandaloneOpenInDoubt, DecisionLogMissing) are not
 // redefined here — same package, same contractual names.
-
-func upgradeConditionalJournals(t *testing.T, colls ...*Collection) {
-	t.Helper()
-	for _, coll := range colls {
-		coll.writer.Lock()
-		coll.journalCatalogOwned = true
-		if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-			coll.writer.Unlock()
-			t.Fatalf("ensure conditional: %v", err)
-		}
-		coll.writer.Unlock()
-	}
-}
 
 func mintEmptyTxnMarker(t *testing.T, dir string) storeio.TxnMarkerHeader {
 	t.Helper()
@@ -93,7 +80,7 @@ func assertNoConditional(
 ) {
 	t.Helper()
 	coll.writer.Lock()
-	holds := coll.journalHoldsConditional(markerID, epoch)
+	holds := journalHoldsConditionalForTest(t, coll, markerID, epoch)
 	coll.writer.Unlock()
 	if holds {
 		t.Fatal("conditional survived reopen fold")
@@ -117,13 +104,11 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 		coll, _ := reopened.Collection("a")
 		assertNoConditional(t, coll, header.MarkerID, header.Epoch)
 
-		// Live path: B's prepare is dropped (absent on disk); no decision.
-		// DropAppend returns success to the writer but leaves no record bytes,
-		// so capture immediately after the definite prepare-path reject from a
-		// subsequent ENOSPC on the same member is the W1b cover — here use
-		// ENOSPC so the coordinator aborts before the decision.
+		// Live path: B's prepare append reports ENOSPC. Positional append errors
+		// are outcome-unknown because a complete checksummed logical record may
+		// have landed before sector padding failed. No decision exists, so reopen
+		// still resolves the transaction as aborted.
 		db2, a2, b2 := openTxnDBWithAB(t)
-		upgradeConditionalJournals(t, a2, b2)
 		ctrl2 := newTxnFaultController(t, "a", "b")
 		ctrl2.AttachOpenJournals(map[string]*Collection{"a": a2, "b": b2})
 		ctrl2.ProgramJournal("b", storeio.JournalFaultPlan{
@@ -139,8 +124,8 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected prepare-subset fault")
 		}
-		if errors.Is(err, ErrCommitOutcomeUnknown) {
-			t.Fatalf("prepare-subset classified unknown: %v", err)
+		if !errors.Is(err, ErrCommitOutcomeUnknown) {
+			t.Fatalf("prepare-subset = %v, want outcome unknown", err)
 		}
 		img2 := ctrl2.Capture("w1-b-prepare-absent", db2.Dir())
 		_ = db2.Close()
@@ -167,13 +152,9 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 					assertReopenOutcome(t, img, []string{"a", "b"}, true, `{"n":1}`)
 					// Driver-facing composition once. After a clean close the
 					// discharged log may already have been removed (L4).
-					_, log, err := RecoverDatabaseTransactions(img, TxnLogOptions{})
-					if err != nil {
-						t.Fatal(err)
-					}
-					if log != nil {
-						_ = log.Close()
-					}
+					openTransactionCatalogForTest(
+						t, img, txnTestOptions(), "a", "b",
+					)
 					return
 				}
 				db, a, b := openTxnDBWithAB(t)
@@ -212,7 +193,8 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 }
 
 // TestDatabaseTxnPrepareFailureAborts is W1b: prepare append and sync seams
-// poison with the plain persistence error and return a definite reject.
+// poison with an unknown outcome. With no decision, reopen resolves any
+// checksum-valid prepare that may have landed as aborted.
 func TestDatabaseTxnPrepareFailureAborts(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -224,7 +206,6 @@ func TestDatabaseTxnPrepareFailureAborts(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			db, a, b := openTxnDBWithAB(t)
-			upgradeConditionalJournals(t, a, b)
 			ctrl := newTxnFaultController(t, "a", "b")
 			ctrl.AttachOpenJournals(map[string]*Collection{"a": a, "b": b})
 			if tc.phase == storeio.JournalFaultSyncError {
@@ -246,15 +227,15 @@ func TestDatabaseTxnPrepareFailureAborts(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected prepare failure")
 			}
-			if errors.Is(err, ErrCommitOutcomeUnknown) {
-				t.Fatalf("prepare classified unknown: %v", err)
+			if !errors.Is(err, ErrCommitOutcomeUnknown) {
+				t.Fatalf("prepare failure = %v, want outcome unknown", err)
 			}
 			persistence := b.PersistenceError()
 			if persistence == nil {
 				t.Fatal("expected sticky persistence poison on failing member")
 			}
-			if errors.Is(persistence, ErrCommitOutcomeUnknown) {
-				t.Fatalf("sticky poison classified unknown: %v", persistence)
+			if !errors.Is(persistence, ErrCommitOutcomeUnknown) {
+				t.Fatalf("sticky poison = %v, want outcome unknown", persistence)
 			}
 			img := ctrl.Capture("w1b-"+tc.name, db.Dir())
 			_ = db.Close()
@@ -338,7 +319,6 @@ func TestDatabaseTxnDecisionTornTail(t *testing.T) {
 	// success, so the coordinator may publish in memory; the crash image on
 	// disk still has a torn decision and must reopen all-aborted.
 	db3, a3, b3 := openTxnDBWithAB(t)
-	upgradeConditionalJournals(t, a3, b3)
 	ctrl := newTxnFaultController(t, "a", "b")
 	ctrl.AttachOpenJournals(map[string]*Collection{"a": a3, "b": b3})
 	prevMint := databaseTxnAfterMintHook
@@ -422,7 +402,6 @@ func TestDatabaseTxnParticipantJournalMissing(t *testing.T) {
 // poison, reopen resolves all-or-nothing (append landed → committed).
 func TestDatabaseTxnDecisionSyncFailurePoisonsCatalog(t *testing.T) {
 	db, a, b := openTxnDBWithAB(t)
-	upgradeConditionalJournals(t, a, b)
 	ctrl := newTxnFaultController(t, "a", "b")
 	ctrl.AttachOpenJournals(map[string]*Collection{"a": a, "b": b})
 	prevMint := databaseTxnAfterMintHook
@@ -495,7 +474,7 @@ func TestDatabaseTxnDecisionDirectoryFence(t *testing.T) {
 	_ = db.Close()
 
 	// Reopen clean: no conditionals, no torn commit. Marker may be absent or
-	// no-valid-header residue (both re-mintable under L2).
+	// no-valid-header residue (both permit a fresh marker under L2).
 	reopened := reopenTxnDatabase(t, img)
 	assertAbortedNames(t, reopened, "a", "b")
 	if err := reopened.Update(func(batch *DatabaseBatch) error {
@@ -505,7 +484,7 @@ func TestDatabaseTxnDecisionDirectoryFence(t *testing.T) {
 		mustTxnPut(t, bb, "k", `{"n":1}`)
 		return nil
 	}); err != nil {
-		t.Fatalf("remint commit after fence residue: %v", err)
+		t.Fatalf("fresh-marker commit after fence residue: %v", err)
 	}
 }
 
@@ -542,7 +521,9 @@ func TestDatabaseTxnDropParticipantRetiresFirst(t *testing.T) {
 		t.Fatal("expected attached txn log")
 	}
 	b2.writer.Lock()
-	if err := b2.checkpointPastConditionalsLocked(); err != nil {
+	if err := b2.checkpointPastConditionalsLocked(
+		resolveAllConditionals(true), log.marker.Header().Epoch,
+	); err != nil {
 		b2.writer.Unlock()
 		t.Fatal(err)
 	}
@@ -570,8 +551,14 @@ func TestDatabaseTxnDropParticipantRetiresFirst(t *testing.T) {
 	// Crash image: checkpoint past conditionals done, retirement not yet.
 	db4, _, b4 := openTxnDBWithAB(t)
 	mustTxnUpdate2(t, db4, "k", `{"n":3}`, "k", `{"n":3}`)
+	log4 := lookupDatabaseTxnLog(db4)
+	if log4 == nil || log4.marker == nil {
+		t.Fatal("expected attached txn log")
+	}
 	b4.writer.Lock()
-	if err := b4.checkpointPastConditionalsLocked(); err != nil {
+	if err := b4.checkpointPastConditionalsLocked(
+		resolveAllConditionals(true), log4.marker.Header().Epoch,
+	); err != nil {
 		b4.writer.Unlock()
 		t.Fatal(err)
 	}
@@ -607,21 +594,10 @@ func TestDatabaseTxnMaterializationRollbackOrder(t *testing.T) {
 	// Driver-facing composition on the same torn-capsule image.
 	img2 := cloneDatabaseDir(t, img)
 	tearMaterializationSlot(t, filepath.Join(img2, collectionFilename(t, "a")))
-	decisions, log, err := RecoverDatabaseTransactions(img2, TxnLogOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer log.Close()
-	file, err := os.OpenFile(filepath.Join(img2, collectionFilename(t, "a")), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	coll, err := OpenWithTransactions(file, txnTestOptions(), decisions)
-	if err != nil {
-		t.Fatalf("OpenWithTransactions: %v", err)
-	}
-	defer coll.Close()
+	collections, _ := openTransactionCatalogForTest(
+		t, img2, txnTestOptions(), "a", "b",
+	)
+	coll := collections[0]
 	doc, found := collectionDoc(t, coll, "k")
 	if !found || doc != `{"n":1}` {
 		t.Fatalf("doc=%q found=%v", doc, found)
@@ -633,7 +609,7 @@ func TestDatabaseTxnAbortedGenerationAliasing(t *testing.T) {
 	db, a, b := openTxnDBWithAB(t)
 	header := mintEmptyTxnMarker(t, db.Dir())
 	_ = prepareUnpublishedOn(t, a, header.MarkerID, header.Epoch, 1, "abort", `{"n":0}`)
-	// kind-3 at the same generation on A after the aborted kind-5.
+	// kind-3 at the same generation on A after the aborted kind-4.
 	if err := a.Update(func(batch *WriteBatch) error {
 		return batch.Put([]byte("k"), []byte(`{"n":1}`))
 	}); err != nil {
@@ -654,7 +630,7 @@ func TestDatabaseTxnAbortedGenerationAliasing(t *testing.T) {
 		t.Fatalf("a kind-3 missing: %q,%v", doc, found)
 	}
 	if _, found := collectionDoc(t, collA, "abort"); found {
-		t.Fatal("aborted kind-5 key applied")
+		t.Fatal("aborted kind-4 key applied")
 	}
 	assertNoConditional(t, collA, header.MarkerID, header.Epoch)
 	// Second reopen idempotent.
@@ -671,9 +647,8 @@ func TestDatabaseTxnAbortedGenerationAliasing(t *testing.T) {
 // TestDatabaseTxnStrayConditionalTxnIDReuse is R1.
 func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 	t.Run("stray-consumed", func(t *testing.T) {
-		// Decision append failure leaves stray undecided kind-5 for txn N.
+		// Decision append failure leaves stray undecided kind-4 for txn N.
 		db, a, b := openTxnDBWithAB(t)
-		upgradeConditionalJournals(t, a, b)
 		ctrl := newTxnFaultController(t, "a", "b")
 		ctrl.AttachOpenJournals(map[string]*Collection{"a": a, "b": b})
 		prevMint := databaseTxnAfterMintHook
@@ -695,6 +670,9 @@ func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 		})
 		if err == nil {
 			t.Fatal("expected decision append failure")
+		}
+		if !errors.Is(err, ErrCommitOutcomeUnknown) {
+			t.Fatalf("decision append failure = %v, want outcome unknown", err)
 		}
 		if ctrl.log == nil || ctrl.log.marker == nil {
 			t.Fatal("expected minted marker after prepare")
@@ -722,8 +700,9 @@ func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 	})
 
 	t.Run("adversarial-txnid-reuse", func(t *testing.T) {
-		// Stray undecided kind-5 for txn N on A, plus a durable decision that
-		// reuses TxnID N naming only B — participant binding must skip A's stray.
+		// Stray undecided kind-4 for txn N on A, plus a durable decision that
+		// reuses TxnID N naming only B. Exact prepare binding rejects the catalog
+		// before replay; it must not consume either participant journal.
 		db, a, b := openTxnDBWithAB(t)
 		header := mintEmptyTxnMarker(t, db.Dir())
 		const txnID = uint64(9)
@@ -735,17 +714,37 @@ func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 		img := cloneDatabaseDir(t, db.Dir())
 		_ = db.Close()
 
-		reopened := reopenTxnDatabase(t, img)
-		collA, _ := reopened.Collection("a")
-		collB, _ := reopened.Collection("b")
-		if _, found := collectionDoc(t, collA, "stray"); found {
-			t.Fatal("stray applied under reused TxnID")
+		journalA := RecoveryJournalPath(
+			filepath.Join(img, collectionFilename(t, "a")),
+		)
+		journalB := RecoveryJournalPath(
+			filepath.Join(img, collectionFilename(t, "b")),
+		)
+		beforeA, err := os.ReadFile(journalA)
+		if err != nil {
+			t.Fatal(err)
 		}
-		doc, found := collectionDoc(t, collB, "k")
-		if !found || doc != `{"n":1}` {
-			t.Fatalf("reused decision outcome on b: %q,%v", doc, found)
+		beforeB, err := os.ReadFile(journalB)
+		if err != nil {
+			t.Fatal(err)
 		}
-		assertNoConditional(t, collA, header.MarkerID, header.Epoch)
+		_, openErr := OpenDatabase(
+			img, DatabaseOptions{Options: txnTestOptions()},
+		)
+		if !errors.Is(openErr, ErrTransactionParticipantBinding) {
+			t.Fatalf("reused transaction id open = %v, want binding error", openErr)
+		}
+		afterA, err := os.ReadFile(journalA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterB, err := os.ReadFile(journalB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(beforeA, afterA) || !bytes.Equal(beforeB, afterB) {
+			t.Fatal("binding failure changed a participant journal")
+		}
 	})
 }
 

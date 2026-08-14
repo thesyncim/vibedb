@@ -585,10 +585,9 @@ func seedNativeCapabilityCollection(t *testing.T, collection *Collection) {
 			t.Fatal(err)
 		}
 	}
-	// Create mints a legacy journal for DurabilitySync / buffered-journal.
-	// Flush folds the seed window and, for catalog-owned collections, remints
-	// at the conditional format word so the later Database.Update prepare can
-	// stage against an empty conditional journal.
+	// Create mints the current journal grammar for DurabilitySync /
+	// buffered-journal. Flush folds the seed window so the later
+	// Database.Update prepare stages against an empty journal.
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
 	}

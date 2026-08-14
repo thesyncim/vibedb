@@ -39,11 +39,12 @@ Verified against the tree, because each of these is load-bearing:
   and epoch, failing closed on mismatch
   (`store/durable/store_database.go:86-116`,
   `internal/storeio/recovery_journal.go`).
-- A batch journal record already carries a complete, CRC-sealed logical redo
-  group: one sequence, one generation, all-or-nothing admission
-  (`docs/design/recovery-journal.md`; `internal/storeio/recovery_journal.go`
-  kinds Put=1, Delete=2, Batch=3, ScalarPatch=4; formats v0 and v1 gated by a
-  header word older binaries require to be zero).
+- A batch journal record carries a complete, CRC-sealed logical redo group.
+  The current kinds are Put=1, Delete=2, Batch=3, ConditionalBatch=4, and
+  DeltaBatch=5. Put/Delete/Batch/ConditionalBatch are the one-generation atomic
+  family; DeltaBatch is the consecutive-generation family, and one unrecycled
+  window never mixes the two (`docs/design/recovery-journal.md`;
+  `internal/storeio/recovery_journal.go`).
 - The multi-collection read cut acquires every collection writer, then every
   publication gate, in one process-global order, and holds every gate at once
   while leasing; the deadlock argument is written down
@@ -73,7 +74,7 @@ because two of them are defensible.
 
 **Chosen: two-phase commit over the existing per-collection recovery
 journals, decided by one database-scoped marker record.** Each participant
-durably prepares a version-gated *conditional* batch record in its own
+durably prepares a kind-4 *conditional* batch record in its own
 journal; one decision record in a database-scoped transaction log is then
 appended and synced — that single sync is the sole atomic commit point; then
 every participant publishes under all publication gates held at once.
@@ -82,19 +83,17 @@ every participant publishes under all publication gates held at once.
 RocksDB column-family shape: the commit record carries every participant's
 redo; one append, one sync). It is the better steady-state machine — one sync
 per commit regardless of participant count, no prepared-undecided states —
-and it is the named perf follow-up. It is not the v1 vehicle because it
+and it is the named perf follow-up. It is not the chosen vehicle because it
 breaks the property `store_database.go:95-105` calls out as the point of the
 layout: a collection file plus its own journal stops being self-describing
 (committed redo would live only in the shared journal until each collection
 checkpoints past it), which forces a durable enrollment mark in the StateRoot,
-a permanent fail-closed rule for standalone `Open`, format-0 golden
+a permanent fail-closed rule for standalone `Open`, primary-format golden
 regeneration, a log-before-root rule threaded through every root-writing
 path, and cross-collection recycle coupling in which one lagging collection
 pins other collections' redo bytes. The chosen design keeps every one of
 those surfaces untouched and confines the new machinery to the coordinator,
-one new sidecar file, and one new journal record kind. The decision-log
-format below deliberately leaves room for a future record kind that carries
-redo, so the follow-up is an additive format change, not a second migration.
+one new sidecar file, and the conditional journal record.
 
 **Rejected outright:**
 
@@ -103,27 +102,29 @@ redo, so the follow-up is an additive format change, not a second migration.
   recovery, and SQLite's own documentation enumerates the filesystems where it
   breaks.
 - Single-file relayout (all collections under one root): "a different storage
-  engine, not a catalog over this one" (`store_database.go:98-102`). Format-0
-  instability keeps it available later; not this pass.
+  engine, not a catalog over this one" (`store_database.go:98-102`). The
+  unreleased primary grammar can still be replaced later; not this pass.
 
 ## On-disk artifacts
 
 The primary file format is untouched. `DevelopmentFormatVersion` stays 0, the
-StateRoot layout does not change, `stateRootReservedOffset` stays at 192, and
-the `testdata/format0` golden images remain byte-identical. Everything new
-rides on the two surfaces built for gated evolution: the recovery journal's
-own format word and a new sidecar file.
+StateRoot layout does not change, its existing physical-capacity field remains
+at bytes `192:200`, the reserved suffix still begins at 200, and the primary
+golden images remain byte-identical. The transaction machinery uses the current
+recovery-journal grammar and the new sidecar file.
 
-### Recovery journal conditional format: the conditional batch record
+### Recovery journal conditional batch record
 
-`internal/storeio` gains journal format word
-`RecoveryJournalFormatConditional` (numeric 2) and record kind 5
-(*conditional batch*). The primary store format stays at
-`DevelopmentFormatVersion == 0`; this is another gated journal grammar on the
-existing format-word surface, not a product or store “v2”. A kind-5 record is
-a kind-3 batch record — same entry grammar, same one-generation rule, same
-single CRC32C plus complement, same sector padding — whose body is prefixed
-by a 32-byte conditional header:
+The primary store format stays at `DevelopmentFormatVersion == 0`. The current
+recovery-journal header uses numeric `Format == 0` solely as a corruption
+sentinel. Its current record kinds are Put=1, Delete=2, Batch=3,
+ConditionalBatch=4, and DeltaBatch=5. Kinds 1 through 4 are the atomic family;
+kind 5 is the consecutive-generation delta family, and one unrecycled window
+never mixes the two.
+
+A kind-4 conditional batch uses the same ordered put/delete entry grammar,
+one-generation rule, CRC32C plus complement, and sector padding as kind 3. Its
+body is prefixed by a 32-byte conditional header:
 
 ```
 MarkerID    [16]byte   identity of the transaction decision log
@@ -131,56 +132,36 @@ MarkerEpoch uint64     decision-log epoch the record was written under
 TxnID       uint64     transaction identity, unique within the epoch
 ```
 
-The header format word gates it exactly as the scalar-patch format word gates
-kind 4: a legacy or scalar-patch binary rejects a conditional-format journal
-before decoding, and a kind-5 record inside a legacy/scalar-patch journal
-fails closed. A catalog-owned collection's journal is minted at the
-conditional format word; a collection whose journal is still legacy or
-scalar-patch takes one bounded foreground checkpoint (which recycles the
-header) before it may join a transaction.
+Replay semantics for kind 4, stated as invariants:
 
-Replay semantics for kind 5, stated as invariants:
-
-- A kind-5 record replays **iff** a decision resolver reports its
-  `(MarkerID, MarkerEpoch, TxnID)` committed **and** that decision names this
-  collection's `(StoreID, JournalID)` among its participants. A decision
-  binds exactly the journals it prepared into, so a stray record in a journal
-  the deciding transaction never touched can never resolve committed —
-  whatever identifiers a later transaction reuses. Same-epoch with no
-  decision, or a decision that does not name this collection: presumed
-  abort, skipped. Epoch differing from the decision log's current epoch in
-  either direction: fail closed (a recycled log never coexists with live
-  old-epoch records; see recycle rule below). The resolver is consulted only
-  for records the selected root does not cover: a covered kind-5 cannot
-  change the recovered state and is consumed without resolution on every
-  open path. When the database directory holds no decision log at all, the
-  epoch-relative rules have no referent and resolution is governed instead
-  by the absent-log invariants L1–L4 (Recovery below); an uncovered kind-5
-  with no log fails the whole open closed.
-- Kind-5 records are excluded from the strictly-newer-generation replay rule.
-  An aborted conditional at generation G+1 never advanced the collection's
-  generation, so a later applied record may legitimately reuse G+1. Sequence
-  monotonicity remains the framing authority; a committed kind-5 applies iff
-  its generation exceeds the selected root's, then the existing
-  covered-suffix rule applies as for legacy batches.
-- Every decoded kind-5 record — applied or skipped — counts as consumed by
-  replay, forcing the existing post-replay fold-plus-recycle even when
-  nothing else was applied. This is the rule legacy replay already applies
-  to ambiguous no-op batches (`store/durable/store_file_journal.go:717-721`);
-  without it the `applied == 0` short-circuit (`:763-768`) would leave an
-  all-skipped window unrecycled and a stray conditional would survive
-  reopen. No conditional record outlives its collection's reopen — under a
-  nil resolver too: a covered kind-5 that permits standalone open is
-  consumed by the same fold, restoring full self-containment at the first
-  successful standalone open. The cost, named per the correctness-first
-  directive: one bounded foreground checkpoint on reopen of a window that
-  held only skipped conditionals.
+- Every retained conditional is resolved, including a record whose generation
+  the selected root appears to cover. Root coverage can reflect an interrupted
+  private sequential replay of only part of a batch, so it is not independent
+  proof that the conditional was completely applied. A database open resolves
+  all conditionals before mutating any participant.
+- A record resolves committed only when the decision resolver matches
+  `(MarkerID, MarkerEpoch, TxnID)` and finds the exact participant tuple
+  `(StoreID, JournalID, PreparedGeneration)`, with `PreparedGeneration` equal
+  to the record generation. A decision that exists but lacks this exact tuple
+  is a binding error and fails closed. A transaction with no decision in the
+  current marker epoch is presumed aborted and skipped. Marker identity or
+  epoch disagreement fails closed.
+- An aborted conditional does not advance the collection's logical generation,
+  so the immediately following atomic record may legitimately reuse that
+  prepared generation. Sequence monotonicity remains the framing authority;
+  the resolved outcomes determine the logical generation chain.
+- Every decoded conditional — applied or skipped — forces the final resolved
+  fold and `RecycleResolved`. A failure during resolution, replay, the fold, or
+  recycle leaves the record intact. The decision log is retained until every
+  participant has crossed this successful boundary (or has a durable
+  retirement).
 - Replay without a resolver — standalone `durable.Open` / `vibedb.OpenFile` —
-  fails closed with a typed error when the live window holds any kind-5
-  record the root does not cover: the file participates in a database
-  transaction and must be opened through its database directory. The refusal
-  is transient by construction: once the collection checkpoints past the
-  record, the file is self-contained again.
+  fails closed with the typed in-doubt error for any retained conditional,
+  including root-covered records. The file becomes self-contained again only
+  after a resolver-backed open successfully folds and recycles the window.
+- If the database directory holds no decision log, the absent-log invariants
+  L1–L4 below apply. Any retained conditional makes that absence fail closed;
+  an empty conditional-free live window opens normally.
 
 ### The transaction decision log
 
@@ -192,21 +173,21 @@ collection filename (no `c-` prefix). The file is minted lazily, at the head
 of the first multi-collection commit, and the mint is fenced: file creation,
 both header sectors, region preallocation, file sync, and the
 parent-directory fsync all complete before any participant journal may
-append a kind-5 record that references the minted `MarkerID` (invariant L2
+append a kind-4 record that references the minted `MarkerID` (invariant L2
 under Recovery; a mint failure is a definite abort with nothing journaled).
 A conditional record therefore exists only under a durably linked decision
-log — "journals hold kind-5, log absent" is unreachable by crash, which is
+log — "journals hold conditionals, log absent" is unreachable by crash, which is
 what lets recovery fail closed on that state instead of guessing (L3). The
-container follows the recovery journal's discipline exactly: two alternating, independently checksummed 512-byte
-header sectors, a bounded preallocated record region sized once, positional
-sector-aligned appends, strict sequence validation, torn-tail truncation at
-the first invalid record, and recovery selecting the valid header with the
-greater recycle count.
+container follows the recovery journal's discipline exactly: two alternating,
+independently checksummed 512-byte header sectors, a bounded preallocated record
+region, positional sector-aligned appends, strict sequence validation, torn-
+tail truncation at the first invalid record, and recovery selecting the valid
+header with the greater recycle count.
 
-Header fields: its own format version (gated; nonzero rejects under older
-grammars), `MarkerID [16]byte` minted at creation, `Epoch uint64`,
-`BaseSequence uint64`, capacity, recycle count, checksum. Two record kinds,
-each sealed by CRC32C plus complement and padded to the append sector:
+Header fields: numeric-zero `Format` corruption sentinel, `MarkerID [16]byte`
+minted at creation, `Epoch uint64`, `BaseSequence uint64`, capacity, recycle
+count, sealed-capacity flag, checksum. Two record kinds are each sealed by
+CRC32C plus complement and padded to the append sector:
 
 ```
 kind 1  decision            sequence (the database commit sequence, DCSN)
@@ -229,12 +210,15 @@ interaction); it lets recovery distinguish a legitimately dropped participant
 from a lost one.
 
 **Recycle rule.** The log recycles by bumping `Epoch`, and recycling is legal
-only when no participant journal's live window still holds a kind-5 record of
-the current epoch. Log-region pressure therefore forces bounded foreground
-checkpoints of lagging participants — the existing pressure-checkpoint idiom;
-no background work is introduced anywhere in this design. Because the rule is
-absolute, replay can treat any epoch mismatch as corruption and fail closed,
-which is what makes the presumed-abort resolution sound.
+only when no participant journal's live window still holds a kind-4 record of
+the current epoch and every recorded decision is discharged: each exact
+participant has successfully completed its resolved fold and journal recycle,
+or carries a durable retirement. A selected root at the prepared generation is
+not enough. Log-region pressure therefore forces bounded foreground checkpoints
+of lagging participants — the existing pressure-checkpoint idiom; no background
+work is introduced anywhere in this design. Because the rule is absolute,
+replay can treat any epoch mismatch as corruption and fail closed, which is
+what makes the presumed-abort resolution sound.
 
 One tampering window is accepted and named rather than closed: a same-epoch
 log restored to an earlier content prefix is epoch-invisible, so replay
@@ -253,13 +237,12 @@ aborted and undecided transactions never write a decision, so their stray
 conditional records are invisible to the seed, and a reused
 `(MarkerID, Epoch, TxnID)` triple could otherwise resurrect an aborted
 record as committed after a later crash. Two replay invariants above close
-that window structurally, not probabilistically: strays are consumed at
-reopen — and a prepare can only be appended to an open, hence stray-free,
-journal — and a decision binds exactly its named participants, so a stray in
-a journal the deciding transaction never touched can never resolve
-committed. Both open paths order all participant opens (which consume
-strays) before the transaction log accepts its first commit. Crash row R1
-and a dedicated fuzz seed pin this window.
+that window structurally, not probabilistically: strays are consumed by a
+successful resolver-backed reopen before another prepare can be appended, and
+a decision binds the exact store identity, journal identity, and prepared
+generation. Both open paths order all participant opens before the transaction
+log accepts its first commit. Crash row R1 and a dedicated fuzz seed pin this
+window.
 
 ## The commit protocol
 
@@ -287,27 +270,18 @@ driver's `db.mu`; a facade commit mutex for native):
    after the log's mint fence has completed (invariant L2): a lazily minted
    log finishes creation through parent-directory fsync before this step
    begins, and a mint failure is a definite abort with nothing journaled.
-   Append and sync one kind-5 conditional record per participant, in that
+   Append and sync one kind-4 conditional record per participant, in that
    participant's own journal, on its own lane machinery. The sync-journal
    lane appends and syncs before anything is visible, as its contract
    requires. Buffered-journal lanes append through their deposit machinery
    and then force a covering sync in place — for a multi-collection commit,
    durability precedes visibility on every supported lane. An append or sync
-   failure poisons that collection with the plain persistence poison — the
-   classification a kind-3 *append* failure carries today (`poisonJournal`;
-   the `store_file_journal.go:90-93` comment records that only the kind-3
-   post-append sync escalates further) — so the append-or-sync-is-terminal,
-   die-don't-retry rule of `docs/durability.md` "Persistence failures" is
-   not weakened by this protocol — and either is a definite abort of the
-   whole transaction: the
-   decision was never attempted, so the unknown window has not opened. The
-   two classifications are compatible: the transaction's outcome is definite
-   while the collection handle carries the sticky persistence failure. One
-   pinned implementation trap: the existing journal fence classifies a
-   post-append sync failure as `ErrCommitOutcomeUnknown`
-   (`poisonJournalCommitOutcomeUnknown`); a prepare sync failure must poison
-   with the plain persistence error instead, because a conditional record
-   without a decision cannot have committed. Stray synced conditional
+   failure is terminal and poisons that collection. A positional append may
+   report a short/error result after the complete checksummed body reached the
+   page cache; a sync may likewise have persisted it. Both therefore report
+   `ErrCommitOutcomeUnknown` for the prepare attempt even though no transaction
+   decision was appended. Reopen resolves the retained conditional as abort
+   when no matching decision exists. Stray synced conditional
    records from an aborted attempt are contained rather than assumed away:
    replay presumes abort, consumes them at the collection's next reopen, and
    the participant binding keeps any later TxnID reuse from resurrecting
@@ -316,9 +290,10 @@ driver's `db.mu`; a facade commit mutex for native):
 4. **Decide.** Append the decision record and cross one power-safe sync.
    **This sync is the sole atomic commit point.** The protocol invariant is
    that the decision sync strictly follows every participant sync, so a
-   durable decision implies durable participant redo. Append failure:
-   definite abort. Sync failure: `ErrCommitOutcomeUnknown` at database scope
-   (below).
+   durable decision implies durable participant redo. Capacity and validation
+   are preflighted definite refusals. Any unexpected decision append or sync
+   failure is `ErrCommitOutcomeUnknown` at database scope because a complete
+   checksummed decision may still be selected on reopen.
 5. **Publish.** Acquire every participant's publication gate write side in
    the same global order, flip every router pointer and file state across all
    participants, release gates then writers LIFO. Because the read cut
@@ -337,26 +312,29 @@ numbers.
 
 ### Recovery
 
-`OpenDatabase` — and the SQL driver's open path, via an exported
-reconciliation entry point plus a resolver-accepting open variant — gains one
-pass:
+`OpenDatabase` and the SQL driver both use one complete-catalog recovery pass;
+caller-owned catalogs enter through `OpenCollectionsWithTransactions`, which
+does not expose any collection until the whole set has passed preflight:
 
-1. Load `txn.vtm` if present: newest valid header, scan decisions and
-   retirements, truncate the torn tail. Build the decision table. When the
+1. Load `txn.vtm` if present: newest semantically valid header, scan decisions
+   and retirements, truncate the torn tail. A checksum-invalid torn alternate
+   header may fall back; checksum-authenticated semantic damage fails closed
+   instead of resurrecting an older epoch. Build the decision table. When the
    file is absent, the open is governed completely by the absent-log
    invariants L1–L4 below — absence is the common state, not a corruption
    state, and it never resolves by guesswork.
 2. Open each collection with the resolver plumbed into journal replay.
-   Kind-5 records resolve as specified above. In-flight qualified
+   Every retained kind-4 record resolves as specified above. In-flight qualified
    materialization rolls back before any replay, unchanged.
 3. Fail closed, database-wide, when a durable decision names a participant
    whose file or journal is missing or mismatched — unless a
    participant-retired record covers that StoreID. A committed transaction
    with an unrecoverable participant is a hard error, never a silent partial
    commit.
-4. After every participant's root durably covers every decided record, the
-   log is recyclable; recovery may complete it or leave it to commit-path
-   pressure.
+4. After every exact participant has successfully completed its resolved fold
+   and journal recycle (or a durable retirement names it), the decision is
+   discharged. The log is recyclable only after every decision is discharged
+   and no current-epoch conditional remains.
 
 Recovery is idempotent under a second crash: replay ends in the existing
 checkpoint-plus-recycle per collection, decided records re-resolve
@@ -370,27 +348,29 @@ epoch-relative replay rules above have no referent without a log. Four
 invariants define the absent state completely; each carries a named test.
 
 - **L1 — clean absence.** No `txn.vtm` and no collection journal whose live
-  window holds a kind-5 record: the database opens exactly as it does today,
+  window holds a kind-4 record: the database opens exactly as it does today,
   no transaction machinery engaged. Fresh directories, databases whose whole
   history is single-collection commits, and — by L2 — every pure crash image
   with an absent log land here. Test: `TestDatabaseTxnAbsentLogCleanOpen`.
 - **L2 — the mint fence.** The mint (file creation, both header sectors,
   region preallocation, file sync, parent-directory fsync) completes before
-  any prepare may reference the minted `MarkerID`. Corollary: a kind-5
+  any prepare may reference the minted `MarkerID`. Corollary: a kind-4
   record exists in a journal only if the log's directory entry is durable,
-  so no pure crash produces "kind-5 present, log absent". A crash during the
+  so no pure crash produces "conditional present, log absent". A crash during
+  the
   mint itself leaves either no directory entry (L1) or a file with no valid
-  header that no journal references — mint residue, removed and re-minted on
-  next use, never a fail-closed state. A log with no valid header sector
-  *while some journal holds a kind-5* is impossible by crash (both headers
+  header that no journal references — mint residue, durably removed so a later
+  commit can create a fresh log, never a fail-closed state. A log with no valid
+  header sector
+  *while some journal holds a kind-4* is impossible by crash (both headers
   sync before the fence, and every later header rewrite alternates sectors)
   and fails closed as tampering. Test:
   `TestDatabaseTxnDecisionDirectoryFence` asserts both halves — a torn-away
   directory entry implies zero conditional records anywhere, and reopen is
   clean.
 - **L3 — fail closed on impossible absence.** No `txn.vtm` while some
-  collection journal's live window holds a kind-5 record the selected root
-  does not cover: `OpenDatabase` fails closed database-wide with
+  collection journal's live window holds any retained kind-4 record:
+  `OpenDatabase` fails closed database-wide with
   `ErrTransactionLogMissing`. By L2 the state is unreachable by crash; it
   implies out-of-band deletion or a partial restore, and presuming abort
   here would silently roll back commits that may have been acknowledged —
@@ -402,17 +382,17 @@ invariants define the absent state completely; each carries a named test.
   under it was ever acknowledged — the decision sync strictly follows the
   fence — so aborting could lose nothing acknowledged. L2 is pinned exactly
   so the design never has to accept the silent-rollback window that default
-  opens for out-of-band deletion.) Covered kind-5 records do not trigger L3:
-  they cannot change the recovered state and are consumed by the reopen
-  fold, as under a nil resolver. Test: `TestDatabaseTxnDecisionLogMissing` —
-  the uncovered variant fails with the typed error; the covered-only variant
-  opens clean with the window consumed.
+  opens for out-of-band deletion.) Root-covered conditionals also trigger L3:
+  root coverage does not prove complete batch consumption, and there is no
+  resolver to establish the outcome. Test: `TestDatabaseTxnDecisionLogMissing`
+  exercises retained conditional records and expects the typed error.
 - **L4 — removal legality and idempotence.** Recovery removes `txn.vtm` as
-  residue only when no collection journal's live window holds any kind-5
+  residue only when no collection journal's live window holds any kind-4
   record of its `MarkerID` and every decision it holds is discharged (each
-  named participant's durable root covers its prepared generation, or a
-  retirement record covers the StoreID). The predicate is re-evaluated from
-  disk on every open, so a crash before, during, or after the removal
+  named participant's journal base proves successful resolved recycle past its
+  prepared generation, or a retirement record covers the StoreID). The
+  predicate is re-evaluated from disk on every open, so a crash before, during,
+  or after the removal
   re-enters L4 or L1 with the identical outcome; recovery never removes the
   log in any other state. Out-of-band deletion *during* recovery does not
   disturb the running pass — the decision table is already in memory — and
@@ -428,20 +408,20 @@ instant.
 | # | Window | Recovered outcome | Why |
 | --- | --- | --- | --- |
 | W1 | A's prepare durable, B's absent or torn | abort both | no decision exists; A's conditional is undecided, presumed abort |
-| W1b | B's prepare append or sync fails live | definite abort; B poisoned with the plain persistence error, never unknown-outcome | decision never attempted; die-don't-retry unchanged |
+| W1b | B's prepare append or sync fails live | `ErrCommitOutcomeUnknown` for the attempt; B poisoned; reopen aborts every prepare when no decision exists | a complete checksummed conditional may have landed despite the write/sync error |
 | W2 | all prepares durable, decision absent or torn at any byte prefix | abort all | torn decision truncates; presumed abort everywhere |
-| W3 | decision durable, crash before any or all publishes | roll all forward | publish is memory-only; replay applies each committed kind-5 |
-| W4 | decision durable, A checkpointed past it, B not | complete B | A's root covers its record (generation filter skips); B replays |
+| W3 | decision durable, crash before any or all publishes | roll all forward | publish is memory-only; replay resolves and applies each committed kind-4 |
+| W4 | decision durable, A successfully resolved, folded, and recycled past its prepare, B not | complete B | A's journal base proves its participant discharged; B still resolves and replays |
 | W5 | decision durable, B's journal missing or mismatched | fail closed database-wide | identity/geometry/epoch family, extended; no retirement record for B |
-| W6 | decision sync errors live | `ErrCommitOutcomeUnknown`, catalog poisoned; reopen resolves all-or-nothing | the decision either passed its CRC or did not; there is no third state |
-| W7 | crash with `txn.vtm`'s directory entry not durable | treated as absent; nothing to abort — no journal can hold a kind-5 under an un-fenced marker (L2) | the mint fence completes before the first prepare; a surviving entry is a valid-empty log or headerless mint residue, both re-mintable; database directory is contractually un-renamed |
+| W6 | decision append or sync errors live | `ErrCommitOutcomeUnknown`, catalog poisoned; reopen resolves all-or-nothing | a complete checksummed decision may have landed despite the reported write/sync error |
+| W7 | crash with `txn.vtm`'s directory entry not durable | treated as absent; nothing to abort — no journal can hold a kind-4 under an un-fenced marker (L2) | the mint fence completes before the first prepare; a surviving entry is a valid-empty log or headerless mint residue, both removable before a later mint; database directory is contractually un-renamed |
 | W8 | participant dropped, crash around the drop | consistent either way | drop folds the collection past its conditionals, appends and syncs a retirement, then deletes with today's ordered fences |
 | W9 | in-flight materialization on a participant | materialization rolls back first, then the decision applies | existing recovery ordering, unchanged |
-| A1 | aborted conditional at G+1, later applied record at G+1 | conditional skipped, later record applied | kind-5 excluded from the generation rule; sequence order is authoritative |
-| R1 | txn N aborts leaving a stray synced conditional; reopen; a later transaction mints TxnID N again and its decision goes durable; crash before publish | the old aborted record never applies | strays are consumed at the collection's reopen before any new prepare can reach its journal; a decision resolves only records in journals it names |
+| A1 | aborted conditional at G+1, later applied record at G+1 | conditional skipped, later record applied | the resolved atomic chain lets the next record reuse an aborted prepare's generation; sequence order remains authoritative |
+| R1 | txn N aborts leaving a stray synced conditional; resolver-backed reopen; a later transaction mints TxnID N again and its decision goes durable; crash before publish | the old aborted record never applies | the reopen folds and recycles the stray before any new prepare, and a decision binds StoreID, JournalID, and PreparedGeneration exactly |
 | S2 | crash during recovery replay, reopen again | identical outcome | idempotent roll-forward; log recycled only when no window needs it |
 | E1 | restored older log beside newer journals (or the reverse) | fail closed | absolute epoch rule |
-| E2 | `txn.vtm` deleted or torn away out-of-band while any journal holds an uncovered kind-5 | fail closed database-wide: `ErrTransactionLogMissing` | unreachable by crash under L2; presumed abort would silently roll back acknowledged commits (L3) |
+| E2 | `txn.vtm` deleted or torn away out-of-band while any journal holds a retained kind-4 | fail closed database-wide: `ErrTransactionLogMissing` | unreachable by crash under L2; presumed abort would silently roll back acknowledged commits (L3), and root coverage is not resolution proof |
 
 ## Semantics
 
@@ -531,8 +511,8 @@ typed refusal with nothing staged, journaled, or published.
 Buffered-volatile is refused rather than documented-weaker because
 independent per-collection checkpoints could tear a transaction across files
 after a crash — a new failure mode, not the lane's existing loss window —
-and because interleaving full conditional batches with the v1 delta-interval
-grammar is exactly the kind of interaction v1 should not attempt. The facade
+and because one unrecycled recovery-journal window cannot mix conditional
+atomic records with the delta family. The facade
 Buffered profile maps to buffered-visible publication, so native
 multi-collection transactions on that profile are a typed refusal in this
 pass. That is a real capability gap on one of the three profiles; it is
@@ -544,21 +524,23 @@ integration, or the shared-journal follow-up), neither in scope here.
 The clause below goes into `docs/durability.md` verbatim when the
 implementation lands:
 
-> A multi-collection COMMIT has exactly one unknown-outcome window: the
-> decision record's sync. If that sync reports an error, COMMIT returns
-> `ErrCommitOutcomeUnknown`, every collection handle under the catalog
-> refuses further writes with the sticky persistence failure, and only
-> closing and reopening the database resolves the outcome. The unknown
-> outcome is atomic: reopen reveals either every participating collection's
-> writes or none of them. There is no crash, error, or recovery in which one
-> participant's writes survive without the others'.
+> A multi-collection COMMIT has exactly one window where commit versus abort is
+> unknown: an unexpected decision-record append or sync failure. COMMIT returns
+> `ErrCommitOutcomeUnknown`, every collection handle under the catalog refuses
+> further writes with the sticky persistence failure, and only closing and
+> reopening the database resolves the outcome. Prepare append/sync failures use
+> the same error classification because their journal side effect may exist,
+> but no decision was attempted, so recovery deterministically aborts them. A
+> decision-stage unknown outcome is atomic: reopen reveals either every
+> participating collection's writes or none of them. There is no crash, error,
+> or recovery in which one participant's writes survive without the others'.
 
-Poison widens from collection to catalog scope for the fsync-failure-
-literature reason: a half-poisoned catalog could otherwise commit collection
-B after collection A's outcome went unknown. Prepare append and sync
-failures are definite aborts carrying the plain persistence poison, so the
-unknown window is strictly narrower than the single-collection story, and
-the docs say so. Guidance follows FoundationDB's
+Poison widens from collection to catalog scope once decision append begins: a
+half-poisoned catalog could otherwise commit collection B after collection A's
+outcome went unknown. Prepare append and sync failures poison the affected
+collection and report unknown for that attempt; absent a matching decision,
+reopen deterministically resolves those prepares as abort. Guidance follows
+FoundationDB's
 discipline: mint operation identities outside the retry loop; after reopen,
 probe any one participant key of the transaction — its presence decides the
 whole transaction.
@@ -662,16 +644,18 @@ func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) // existing
 // TxnLog owns txn.vtm: lazy mint, decision append/sync, retirement,
 // epoch recycle, pressure, catalog-scope poison.
 type TxnLog struct{ /* unexported */ }
-func OpenTxnLog(dir string, options TxnLogOptions) (*TxnLog, error)
+func NewTxnLog(dir string, options TxnLogOptions) (*TxnLog, error)
+func (l *TxnLog) AdoptCollection(collection *Collection) error
+func (l *TxnLog) DetachCollection(collection *Collection) error
 func (l *TxnLog) Close() error
 
 type TxnLimits struct{ MaxCollections, MaxDocuments int; MaxBytes int64 }
 
-// Recovery composition for caller-owned catalogs (the SQL driver). The
-// returned TxnLog is the same handle the caller later commits through; the
-// pair keeps one open, one scan, one epoch authority.
-func RecoverDatabaseTransactions(dir string, options TxnLogOptions) (*TxnDecisions, *TxnLog, error)
-func OpenWithTransactions(file *os.File, options Options, txns *TxnDecisions) (*Collection, error)
+// Recovery for caller-owned catalogs (the SQL driver). The complete request
+// set is validated privately before any collection is returned or journal is
+// replayed/recycled. The returned order matches requests.
+func OpenCollectionsWithTransactions(dir string, options TxnLogOptions,
+    requests []TransactionCollectionOpen) ([]*Collection, *TxnLog, error)
 
 var (
     ErrDatabaseTransactionUnsupportedLane = errors.New(
@@ -761,7 +745,7 @@ is all-committed, all-aborted, or fail-closed — never a torn subset.
 | Test | Window |
 | --- | --- |
 | TestDatabaseTxnCrashMatrix/prepare-subset | W1 |
-| TestDatabaseTxnPrepareFailureAborts (append and sync seams; asserts plain-persistence poison, never unknown-outcome) | W1b |
+| TestDatabaseTxnPrepareFailureAborts (append and sync seams; asserts outcome-unknown poison and deterministic abort on reopen) | W1b |
 | TestDatabaseTxnDecisionTornTail (exhaustive byte-prefix sweep) | W2 |
 | TestDatabaseTxnCrashMatrix/post-decision | W3 |
 | TestDatabaseTxnCrashMatrix/partial-checkpoint | W4 |
@@ -774,7 +758,7 @@ is all-committed, all-aborted, or fail-closed — never a torn subset.
 | TestDatabaseTxnStrayConditionalTxnIDReuse | R1 |
 | TestDatabaseTxnRecoverySecondCrash | S2 |
 | TestDatabaseTxnDecisionEpochMismatch | E1 |
-| TestDatabaseTxnDecisionLogMissing (uncovered fails typed; covered-only opens clean, consumed) | E2 / L3 |
+| TestDatabaseTxnDecisionLogMissing (every retained conditional fails typed, including root-covered) | E2 / L3 |
 | TestDatabaseTxnStandaloneOpenInDoubt | standalone fail-closed |
 | TestDatabaseTxnPublishExcludesSnapshotCut (with -race) | publish vs read cut |
 
@@ -803,7 +787,7 @@ and reopen is clean).
 ### Merge-blocking gates
 
 1. The existing suite passes with zero modifications to existing
-   single-collection crash and golden tests; `testdata/format0` images are
+   single-collection crash and golden tests; the primary golden images are
    byte-identical.
 2. Single-collection `Collection.Update` and single-table SQL commits produce
    byte-identical journal output to baseline, pinned by test.
@@ -835,8 +819,7 @@ file ownership, and per-task test obligations.
 - **Transactional DDL** — flagged adjacent (catalog mutations through the
   decision log); `ErrDDLInTransaction` stands.
 - **Single-sync multi-collection commit** (shared redo in the decision log) —
-  the perf follow-up, justified only by measured K+1-sync numbers; the
-  decision-log format reserves room for it as an additive record kind.
+  the perf follow-up, justified only by measured K+1-sync numbers.
 - **Certified secondary/range Serializable dependencies** — a future
   concurrency refinement over the safe relation-coarse fallback; it requires
   index/range change certificates that cannot miss phantoms.
@@ -848,8 +831,8 @@ file ownership, and per-task test obligations.
 - **Cross-database and distributed transactions** — a different track; the
   decision log is deliberately not a public two-phase-commit surface, and
   `MarkerID` is a local identity, not a cluster one.
-- **Single-file root-of-roots relayout** — rejected this pass; format-0
-  instability keeps it available if the decision-log design disappoints.
+- **Single-file root-of-roots relayout** — rejected this pass; the unreleased
+  primary grammar can still be replaced if the decision-log design disappoints.
 - **Bench-gate integration** for transaction latency — lands with the
   bench-gate work on the main branch; this pass ships allocation pins and
   informational numbers only.
@@ -860,8 +843,8 @@ Honest disagreements this design resolves by decision, not by proof:
 
 1. **K+1 syncs versus one.** The shared-redo design is strictly better at
    steady state and strictly riskier to land first. If the bench numbers make
-   K+1 unacceptable, the follow-up becomes a second format evolution — an
-   accepted cost, mitigated by the reserved record kind.
+   K+1 unacceptable, the follow-up must define and qualify its own current
+   grammar when it lands.
 2. **Buffered-profile natives.** Refusing native multi-collection
    transactions on the Buffered profile is a visible capability gap on one of
    three profiles. Both remedies are real work and both are deferred.

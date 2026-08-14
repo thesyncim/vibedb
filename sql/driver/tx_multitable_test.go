@@ -3,6 +3,7 @@ package driver
 import (
 	stdsql "database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -93,6 +94,149 @@ func TestMultiTableTransactionCommitRollbackAndConflict(t *testing.T) {
 	}
 	assertTableField(t, db, "a", "1", "v", "blocked")
 	assertTableField(t, db, "b", "1", "v", "b")
+}
+
+func TestCommittedMultiTableTransactionDropReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.vdb")
+	db, err := stdsql.Open("vibedb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE a (PRIMARY KEY (id))`,
+		`CREATE TABLE b (PRIMARY KEY (id))`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitSQLTxnPair(t, db, "a", "b", "committed")
+	if _, err := db.Exec(`DROP TABLE a`); err != nil {
+		t.Fatalf("DROP after multi-table commit: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = stdsql.Open("vibedb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	assertTableCount(t, db, "b", 1)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM a`).Scan(new(int)); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("dropped participant after reopen = %v, want ErrTableNotFound", err)
+	}
+}
+
+func TestMultiTableCommitAfterDDLCollectionReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "drop", ddl: `DROP TABLE c`},
+		{name: "truncate replacement", ddl: `TRUNCATE TABLE c`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openTestDB(t)
+			for _, ddl := range []string{
+				`CREATE TABLE a (PRIMARY KEY (id))`,
+				`CREATE TABLE b (PRIMARY KEY (id))`,
+				`CREATE TABLE c (PRIMARY KEY (id))`,
+			} {
+				if _, err := db.Exec(ddl); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.Exec(`INSERT INTO c VALUES (?)`, `{"id":"seed"}`); err != nil {
+				t.Fatal(err)
+			}
+			commitSQLTxnPair(t, db, "a", "b", "before-ddl")
+			if _, err := db.Exec(test.ddl); err != nil {
+				t.Fatalf("%s: %v", test.ddl, err)
+			}
+			commitSQLTxnPair(t, db, "a", "b", "after-ddl")
+			assertTableCount(t, db, "a", 2)
+			assertTableCount(t, db, "b", 2)
+		})
+	}
+}
+
+func TestDDLTransactionLogRegistrationRollsBackOnDefiniteCatalogFailure(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "drop", ddl: `DROP TABLE c`},
+		{name: "truncate replacement", ddl: `TRUNCATE TABLE c`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "catalog.vdb")
+			database, err := openDatabase(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db := stdsql.OpenDB(&dbConnector{db: database})
+			t.Cleanup(func() { _ = db.Close() })
+			for _, ddl := range []string{
+				`CREATE TABLE a (PRIMARY KEY (id))`,
+				`CREATE TABLE b (PRIMARY KEY (id))`,
+				`CREATE TABLE c (PRIMARY KEY (id))`,
+			} {
+				if _, err := db.Exec(ddl); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.Exec(`INSERT INTO c VALUES (?)`, `{"id":"keep"}`); err != nil {
+				t.Fatal(err)
+			}
+			commitSQLTxnPair(t, db, "a", "b", "before-failure")
+
+			database.mu.Lock()
+			originalPath := database.path
+			database.path = filepath.Join(t.TempDir(), "missing", "catalog.vdb")
+			database.mu.Unlock()
+			_, ddlErr := db.Exec(test.ddl)
+			database.mu.Lock()
+			database.path = originalPath
+			rolledBack := database.tables["c"].collection
+			database.mu.Unlock()
+			if ddlErr == nil || errors.Is(ddlErr, durable.ErrCommitOutcomeUnknown) {
+				t.Fatalf("definitely unpublished %s = %v", test.ddl, ddlErr)
+			}
+			if !txnLogHasCollection(database.txnLog, rolledBack) {
+				t.Fatal("definite catalog failure did not re-register old collection")
+			}
+			assertTableCount(t, db, "c", 1)
+			commitSQLTxnPair(t, db, "a", "b", "after-failure")
+			assertTableCount(t, db, "a", 2)
+			assertTableCount(t, db, "b", 2)
+		})
+	}
+}
+
+func commitSQLTxnPair(
+	t *testing.T, db *stdsql.DB, left, right, id string,
+) {
+	t.Helper()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := fmt.Sprintf(`{"id":%q}`, id)
+	if _, err := tx.Exec(`INSERT INTO `+left+` VALUES (?)`, document); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO `+right+` VALUES (?)`, document); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMultiTableTransactionTooLarge(t *testing.T) {
@@ -288,7 +432,7 @@ func TestSingleTableCommitDoesNotEngageDecisionLog(t *testing.T) {
 	}
 	// The journal region is preallocated, so length is stable; content must
 	// still change, and the decision log must stay unminted — the single-table
-	// path is Collection.Update / kind-3, not UpdateCollections / kind-5.
+	// path is Collection.Update / kind-3, not UpdateCollections / kind-4.
 	if string(after) == string(before) {
 		t.Fatal("single-table commit left journal contents unchanged")
 	}
@@ -378,4 +522,17 @@ func readSoleJournal(t *testing.T, dir string) []byte {
 func txnLogMarker(log *durable.TxnLog) *storeio.TxnMarker {
 	v := reflect.ValueOf(log).Elem().FieldByName("marker")
 	return *(**storeio.TxnMarker)(unsafe.Pointer(v.UnsafeAddr()))
+}
+
+func txnLogHasCollection(
+	log *durable.TxnLog, collection *durable.Collection,
+) bool {
+	v := reflect.ValueOf(log).Elem().FieldByName("collections")
+	collections := *(*[]*durable.Collection)(unsafe.Pointer(v.UnsafeAddr()))
+	for _, registered := range collections {
+		if registered == collection {
+			return true
+		}
+	}
+	return false
 }

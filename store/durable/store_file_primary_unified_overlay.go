@@ -1194,25 +1194,13 @@ func (o *primaryUnifiedOverlay) checkpointEntries(
 	dst []storeio.RecoveryBatchEntry,
 	afterGeneration, targetGeneration uint64,
 ) (entries []storeio.RecoveryBatchEntry, complete bool, err error) {
-	return o.checkpointEntriesMode(
-		dst, afterGeneration, targetGeneration, false,
-	)
-}
-
-// checkpointEntriesMode retains the format switch for recovery compatibility,
-// but currently emits complete Put values. Compact fold certificates are
-// relative to the immutable routed leaf, whereas journal entries replay
-// sequentially against the preceding logical value. Reusing a base-relative
-// certificate after another same-key overlay mutation would splice the wrong
-// preimage. A future compact redo lane must mint and validate separate
-// predecessor-relative metadata.
-func (o *primaryUnifiedOverlay) checkpointEntriesMode(
-	dst []storeio.RecoveryBatchEntry,
-	afterGeneration, targetGeneration uint64,
-	compactScalarPatches bool,
-) (entries []storeio.RecoveryBatchEntry, complete bool, err error) {
+	// Compact fold certificates are
+	// relative to the immutable routed leaf, whereas journal entries replay
+	// sequentially against the preceding logical value. Reusing a base-relative
+	// certificate after another same-key overlay mutation would splice the wrong
+	// preimage, so the current journal delta always emits complete Put/Delete
+	// entries.
 	dst = dst[:0]
-	_ = compactScalarPatches
 	if o == nil || targetGeneration <= afterGeneration {
 		return dst, targetGeneration == afterGeneration, nil
 	}
@@ -1543,6 +1531,9 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 			storeio.CommonPrimaryLeafMaxExtentBytes-storeio.PageHeaderSize-storeio.PageTrailerSize {
 		return false, false, false, nil
 	}
+	if state.root.Generation >= fileLogicalCutGenerationMask {
+		return false, false, false, storeio.ErrGenerationOrder
+	}
 	generation := state.root.Generation + 1
 	prepared, err := overlay.prepare(
 		route.Bucket, route.Hash, generation, key, canonical,
@@ -1687,6 +1678,9 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 		return false, false, false, nil
 	}
 	becomesEmpty := stripe.Len()+pendingRows-1 == 0
+	if state.root.Generation >= fileLogicalCutGenerationMask {
+		return false, false, false, storeio.ErrGenerationOrder
+	}
 	generation := state.root.Generation + 1
 	prepared, err := overlay.prepare(
 		route.Bucket, route.Hash, generation, key, nil,

@@ -229,7 +229,8 @@ func TestRecoveryJournalGroupCommitSharesSync(t *testing.T) {
 
 // TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison pins both
 // races between an out-of-writer group fence and a later append failure. The
-// append's ENOSPC remains the collection's first, definite sticky diagnostic.
+// append's ENOSPC remains the collection's first sticky diagnostic, classified
+// outcome-unknown because a raw checksummed record body may already have landed.
 // A ticket already captured by the fence waits for and receives that fence's
 // independent result: success if Sync succeeds, unknown+EIO if Sync fails.
 func TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison(t *testing.T) {
@@ -282,15 +283,13 @@ func TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison(t *testin
 			})
 			failedKey := []byte("definite-append-failure")
 			_, appendErr := coll.Put(failedKey, journalValue(302))
-			if appendErr == nil || !errors.Is(appendErr, syscall.ENOSPC) {
-				t.Fatalf("later append error = %v, want ENOSPC", appendErr)
+			if !errors.Is(appendErr, ErrCommitOutcomeUnknown) ||
+				!errors.Is(appendErr, syscall.ENOSPC) {
+				t.Fatalf("later append error = %v, want unknown+ENOSPC", appendErr)
 			}
-			if errors.Is(appendErr, ErrCommitOutcomeUnknown) {
-				t.Fatalf("definite append error misclassified as unknown: %v", appendErr)
-			}
-			if persistenceErr := coll.PersistenceError(); !errors.Is(persistenceErr, syscall.ENOSPC) ||
-				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) {
-				t.Fatalf("first sticky poison = %v, want definite ENOSPC", persistenceErr)
+			if persistenceErr := coll.PersistenceError(); !errors.Is(persistenceErr, ErrCommitOutcomeUnknown) ||
+				!errors.Is(persistenceErr, syscall.ENOSPC) {
+				t.Fatalf("first sticky poison = %v, want unknown+ENOSPC", persistenceErr)
 			}
 
 			// g.fail broadcasts, but a captured ticket must not consume that
@@ -332,10 +331,10 @@ func TestRecoveryJournalGroupTicketCoverageBeatsConcurrentAppendPoison(t *testin
 			// The collection-wide diagnostic remains first-failure-wins even when
 			// the covered waiter carries the independent sync failure.
 			persistenceErr := coll.PersistenceError()
-			if !errors.Is(persistenceErr, syscall.ENOSPC) ||
-				errors.Is(persistenceErr, ErrCommitOutcomeUnknown) ||
+			if !errors.Is(persistenceErr, ErrCommitOutcomeUnknown) ||
+				!errors.Is(persistenceErr, syscall.ENOSPC) ||
 				errors.Is(persistenceErr, syscall.EIO) {
-				t.Fatalf("sticky poison after fence = %v, want only definite ENOSPC",
+				t.Fatalf("sticky poison after fence = %v, want unknown+ENOSPC",
 					persistenceErr)
 			}
 			if _, laterErr := coll.Put([]byte("after-poison"), journalValue(303)); !errors.Is(laterErr, appendErr) {

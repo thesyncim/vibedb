@@ -43,7 +43,7 @@ func TestOpenRejectsForeignTransactionDirectoryWithoutMutation(t *testing.T) {
 	dirA, dirB := t.TempDir(), t.TempDir()
 	system := createTargetAt(t, dirA, "system", durable.Options{})
 	user := createTargetAt(t, dirB, "user", durable.Options{})
-	log, err := durable.OpenTxnLog(dirA, durable.TxnLogOptions{})
+	log, err := durable.NewTxnLog(dirA, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestOpenRejectsSyncReopenedChainFence(t *testing.T) {
 	}
 	user := targetOf(collection)
 	system := createTargetAt(t, dir, "system", durable.Options{})
-	log, err := durable.OpenTxnLog(dir, durable.TxnLogOptions{})
+	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	system := createTargetAt(t, dir, "system", durable.Options{})
 	user := createTargetAt(t, dir, "user", durable.Options{MaxBatchBytes: math.MaxInt})
-	log, err := durable.OpenTxnLog(dir, durable.TxnLogOptions{})
+	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

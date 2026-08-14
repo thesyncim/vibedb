@@ -39,9 +39,8 @@ type txnCrashImage struct {
 
 // newTxnFaultController installs the multi-collection fault controller for
 // collections named in names. Journals are wrapped when each collection next
-// opens or remints a recovery journal; for already-open collections the
-// caller must call AttachOpenJournals after upgrading them to the conditional
-// format.
+// opens a recovery journal; callers can wrap already-open journals with
+// AttachOpenJournals.
 func newTxnFaultController(t *testing.T, names ...string) *txnFaultController {
 	t.Helper()
 	c := &txnFaultController{
@@ -56,7 +55,7 @@ func newTxnFaultController(t *testing.T, names ...string) *txnFaultController {
 	recoveryJournalFaultHook = func(rj *storeio.RecoveryJournal) {
 		fj := storeio.NewFaultJournal(rj)
 		c.mu.Lock()
-		// Bind to the first still-nil slot so Open-time remints still wrap.
+		// Bind to the first still-nil slot opened by the fixture.
 		for _, name := range names {
 			if c.journals[name] == nil {
 				c.journals[name] = fj
@@ -98,8 +97,8 @@ func newTxnFaultController(t *testing.T, names ...string) *txnFaultController {
 	return c
 }
 
-// AttachOpenJournals wraps already-open collection journals. Call after
-// ensureConditionalJournalFormatLocked so prepare appends hit the seam.
+// AttachOpenJournals wraps already-open collection journals so prepare appends
+// hit the seam.
 func (c *txnFaultController) AttachOpenJournals(named map[string]*Collection) {
 	c.t.Helper()
 	c.mu.Lock()
@@ -214,7 +213,7 @@ func assertReopenOutcome(
 	if err != nil {
 		t.Fatalf("OpenDatabase(%s): %v", img, err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	defer db.Close()
 	for _, name := range names {
 		coll, ok := db.Collection(name)
 		if !ok {

@@ -4,18 +4,17 @@ This document maps the one mutable format written by `store/durable` and
 decoded by `internal/storeio`. The codecs are the byte-level authority. All
 multi-byte integers are little-endian, all reserved bytes are zero, and all
 format-version fields inside the primary store file contain
-`DevelopmentFormatVersion == 0`. The separate recovery-journal sibling has its
-own explicitly gated format field; its supported format words 0, 1, and
-`RecoveryJournalFormatConditional` (numeric 2) are described below. StateRoot
-and the format-0 primary layout are unchanged by multi-collection transactions;
-new on-disk surface is confined to the journal format word and the `txn.vtm`
-decision-log sidecar.
+`DevelopmentFormatVersion == 0`. The separate recovery-journal and transaction-
+decision sidecars each use one current grammar. In both sidecar headers,
+`Format` is a corruption sentinel that must contain numeric `0`; every other
+value is rejected. StateRoot and the current primary layout are unchanged by
+multi-collection transactions; their new on-disk surface is the `txn.vtm`
+decision-log sidecar and kind-4 conditional journal records.
 
-The project is unreleased. A primary-file schema change edits format 0 in place
-and regenerates the format-0 golden images. There are no migration decoders,
-alternate primary-file development versions, or retired page layouts. Recovery
-journal v0 compatibility is an explicit record-grammar contract, not a primary
-store migration decoder.
+The project is unreleased. A primary-file schema change replaces the current
+grammar and regenerates its golden images. There are no migration decoders,
+alternate primary-file development versions, or retired page layouts. The two
+sidecar codecs likewise decode only the current grammars described here.
 
 ## File layout
 
@@ -55,7 +54,7 @@ store.
 | 40:48 | allocated file end |
 | 72:88 | store id |
 | 96:608 | embedded 512-byte `StateRoot` payload |
-| 608:4088 | version-0 inline free-set delta and reserved zero space |
+| 608:4088 | current inline free-set delta and reserved zero space |
 | 4088:4096 | CRC32C and its complement |
 
 Bytes after the 4096-byte record up to `PageSize` are zero. The inline free run
@@ -169,7 +168,7 @@ and its referencing leaf in one generation.
 
 ## Exact indexes
 
-`StateRoot.ExactIndexRoot` names one version-0 `PagePrimaryExactRoot`. Its
+`StateRoot.ExactIndexRoot` names one current `PagePrimaryExactRoot`. Its
 records are ordered by physical index id and contain a leaf count plus a
 `PagePrimaryExactCatalog` reference. Logical aliases share one physical record.
 
@@ -200,16 +199,24 @@ publishes its identity in `StateRoot.JournalID`; a journal-only checkpoint is
 forbidden before that root is durable. Readers never consult it.
 
 The journal starts with two alternating 512-byte header sectors followed by a
-sector-aligned, fixed-capacity record region. A header records its independent
-format version, store and journal ids, page and sector geometry, base generation
-and sequence, capacity, and monotonic recycle count under a CRC32C and its
-complement. Create sizes the complete file once before publishing its identity;
-later positional appends never extend it. For an ordinary unsealed journal,
-Linux normally reserves the blocks with `fallocate` and falls back to a one-time
-truncate only when that operation is unsupported; other platforms set the
-complete size with truncate. This truncate fallback is only a fixed-EOF
-optimization for ordinary sidecars. It is not a physical-allocation
-certificate.
+sector-aligned, bounded record region. A header records `Format == 0`, store and
+journal ids, page and sector geometry, base generation and sequence, capacity,
+monotonic recycle count, and flags under a CRC32C and its complement. Creation
+allocates the initial region before publishing its identity; positional record
+appends never extend it. An ordinary unsealed acknowledgement journal may grow
+within the hard ceiling before an oversized record's point of no return. Growth
+preallocates the extension, publishes its capacity through the alternate
+header, and synchronizes that header before the new geometry becomes
+authoritative. Linux normally uses `fallocate` and falls back to truncate only
+when allocation is unsupported; other platforms set the requested size with
+truncate. That fallback establishes an ordinary sidecar's EOF, not a physical-
+allocation certificate.
+
+Header selection may ignore an all-zero or checksum-invalid torn alternate
+slot. A checksum-authenticated slot whose domain, geometry, flags, reserved
+bytes, or other semantics are invalid is hard corruption and blocks fallback
+to an older slot. The same rule applies to `txn.vtm`; it prevents an older
+capacity, base, or marker epoch from hiding acknowledged records.
 
 The current recovery-journal header assigns bytes `88:92` as its flags word.
 Bit 0 (`SealedCapacity`) says that the header's record-region `Capacity` is an
@@ -234,44 +241,34 @@ up to 512 KiB for one estimated future carried suffix, leaving the qualified
 than another on-disk region: an exact current batch that does not fit, or a
 future suffix wider than the reserve, takes the physical checkpoint path. The
 two 512-byte headers are additional to the record-region capacity. Per-mutation
-v0 journals retain their option-derived bounded capacity rather than inheriting
-the 2.5 MiB delta policy.
+acknowledgement journals use their option-derived bounded capacity rather than
+inheriting the 2.5 MiB delta policy.
 
-Every record begins with the 32-byte `RRJ0` prefix and ends with a CRC32C and
-its complement, then zero padding to the 512-byte damage granule. The prefix
-carries kind, reserved zero bytes, sequence, generation, and either key/value
-lengths or batch entry-count/body-length. One checksum covers the complete
-ordered batch, so a torn batch is not partially admitted.
+Every record begins with a 32-byte prefix and ends with a CRC32C and its
+complement, then zero padding to the 512-byte damage granule. The prefix carries
+kind, reserved-zero bytes, sequence, generation, and either key/value lengths
+or batch entry-count/body-length. One checksum covers the complete ordered
+batch, so a torn batch is not partially admitted.
 
-The header gates three record grammars:
+The current top-level record kinds are:
 
-- format v0 is the legacy put/delete grammar. Batch entries are full put or
-  delete operations that all belong to the batch's single generation;
-- format v1 extends batches with compact scalar-patch entries for the ordinary
-  buffered delta lane. A scalar patch stores the key, new canonical integer,
-  boolean, or null spelling, a 16-bit canonical byte offset, an 8-bit old
-  spelling length, one reserved-zero byte, and the expected CRC32C of the
-  complete resulting canonical document. It is emitted only when smaller than
-  carrying that complete document. Scalar patch is never valid as a standalone
-  record kind;
-- format word `RecoveryJournalFormatConditional` (numeric 2) — the conditional
-  journal format — admits kinds 1, 2, 3, and 5 and rejects scalar-patch kind 4.
-  Kind 5 (*conditional batch*) is a kind-3 batch whose body is prefixed by a
-  32-byte conditional header: `MarkerID [16]byte`, `MarkerEpoch uint64`,
-  `TxnID uint64`. One CRC32C plus complement covers the envelope, conditional
-  header, and entries; the record is zero-padded to the 512-byte append sector
-  exactly as kind 3. Catalog-owned journals mint at this format word; a legacy
-  or scalar-patch journal on a catalog-owned collection takes one bounded
-  foreground checkpoint (recycling the header) before it may prepare a
-  conditional record.
+| Value | Kind | Generation grammar |
+| ---: | --- | --- |
+| 1 | `Put` | one logical generation |
+| 2 | `Delete` | one logical generation |
+| 3 | `Batch` | one atomic generation of ordered put/delete entries |
+| 4 | `ConditionalBatch` | one decision-bound atomic generation of ordered put/delete entries |
+| 5 | `DeltaBatch` | one put/delete entry per consecutive generation, ending at the record generation |
 
-Opening a v0 journal preserves the v0 grammar for later appends; it is not
-silently upgraded. A scalar-patch kind authenticated inside v0, a kind-5
-record inside a v0 or v1 journal, an unknown format, malformed metadata, or an
-attempt to use a v1 journal with another runtime durability lane fails closed.
-Each gated format word occupies a field that older binaries required to hold a
-known value, so they reject an unrecognized word before interpreting its
-entry kinds.
+Kind 4 prefixes the batch entries with `MarkerID [16]byte`,
+`MarkerEpoch uint64`, and `TxnID uint64`; the record CRC covers that header and
+every entry. Kind 5 carries only complete logical put/delete entries. An
+authenticated live window is either the atomic family (kinds 1 through 4) or
+the delta family (kind 5), never both. Atomic records form a one-generation
+chain from the header base, with same-generation reuse allowed immediately
+after a conditional that may abort. Delta records form one contiguous interval
+from the header base. Any other kind, mixed family, invalid generation chain,
+or nonzero header `Format` fails closed.
 
 ### Transaction decision log
 
@@ -279,16 +276,15 @@ One sidecar per database directory, reserved name `txn.vtm`, lives beside the
 collection files in a `durable.Database` directory or the SQL driver's
 `<catalog>.tables/` directory. It is not a decodable collection filename. The
 primary `StateRoot` layout and `DevelopmentFormatVersion == 0` remain
-unchanged; the decision log is a sibling container, not a primary-format
-revision.
+unchanged; the decision log is a sibling container.
 
 The container follows the recovery journal's discipline: two alternating,
 independently checksummed 512-byte header sectors, a bounded preallocated
 record region, positional sector-aligned appends, strict sequence validation,
-and torn-tail truncation. Header fields include its own gated format version,
-`MarkerID [16]byte` minted at creation, `Epoch uint64`, `BaseSequence uint64`,
-capacity, recycle count, and checksum. Two record kinds, each sealed by CRC32C
-plus complement and padded to the append sector:
+and torn-tail truncation. Header fields include the numeric-zero `Format`
+sentinel, `MarkerID [16]byte` minted at creation, `Epoch uint64`,
+`BaseSequence uint64`, capacity, recycle count, flags, and checksum. Two record
+kinds are each sealed by CRC32C plus complement and padded to the append sector:
 
 - kind 1 `decision`: sequence (database commit sequence), `TxnID`, participant
   count, and per-participant `{StoreID, JournalID, PreparedGeneration}`;
@@ -296,12 +292,16 @@ plus complement and padded to the append sector:
   `DropCollection` checkpoints the collection past every conditional record.
 
 A decision is the durable fact that transaction `TxnID` committed naming those
-participants. Replay applies a kind-5 journal record only when a decision
-resolver reports that triple committed and the decision names this
-collection's `(StoreID, JournalID)`. The log is minted lazily at the head of
-the first multi-collection commit, fenced through parent-directory fsync before
-any prepare may reference its `MarkerID`. Offline pairing checks live in
-`cmd/vibedb-verify`.
+participants. Every retained kind-4 journal record is resolved, including one
+whose generation the selected root appears to cover. A committed resolution
+requires the decision marker identity and epoch to match and an exact
+participant tuple `(StoreID, JournalID, PreparedGeneration)`, with the prepared
+generation equal to the journal record generation. The log is minted lazily at
+the head of the first multi-collection commit and fenced through parent-
+directory fsync before any prepare may reference its `MarkerID`. A decision is
+retained until every named participant has successfully completed its resolved
+fold and journal recycle (or has a durable retirement). Offline pairing checks
+live in `cmd/vibedb-verify`.
 
 The current decision-log header assigns bytes `64:68` as its flags word. Bit 0
 (`SealedCapacity`) gives its record-region `Capacity` the same immutable
@@ -336,7 +336,7 @@ the decision-log options must request `SealedCapacity` with the same exact
 capacity. A paired recovery-journal open checks the selected header's store
 id, journal id, page size, and recovery epoch before allocation proof or record
 scan. Generic mutable `OpenRecoveryJournal` can instead accept and reprove the
-self-described persisted seal, but its immutable handle is not
+self-described persisted seal, but that capacity-immutable mutable handle is not
 external-profile qualification. After selecting the authoritative header,
 open rejects a short or long EOF before any allocation syscall or record scan.
 It then reproves the complete prefix, synchronizes that proof, checks exact EOF
@@ -420,25 +420,25 @@ materialization instead synchronizes a before-image journal, overwrites and
 synchronizes changed sectors, and finally publishes the alternate root.
 
 Recovery validates checksums, complements, reserved bytes, store identities,
-generation relationships, all graph references, catalog digests, exact-index
-postings, and allocator disjointness. For a v1 scalar patch it first reconstructs
-the complete canonical result and requires the recorded result checksum before
-calling the ordinary mutation path. V1 delta entries name one consecutive
-generation each, ending at the batch generation. If bounded replay pressure
-physically checkpoints a prefix and recovery is interrupted again, the next
-open derives and skips exactly the prefix already covered by the selected root;
-legacy v0 batches retain their one-generation replay-from-entry-zero rule.
-Recovery fails closed on any disagreement.
+generation relationships, journal record families, all graph references,
+catalog digests, exact-index postings, and allocator disjointness. Kind-5 delta
+entries name one consecutive generation each, ending at the batch generation.
+If bounded replay pressure physically checkpoints a prefix and recovery is
+interrupted again, the next open derives and skips exactly the prefix already
+covered by the selected root. Kinds 3 and 4 remain one-generation atomic
+batches; retained conditionals are resolved against their exact decision
+participant tuple before a resolved fold and recycle can consume them. Recovery
+fails closed on any disagreement.
 
 ## Verification and golden images
 
 `durable.Verify` performs offline graph and allocator checks without mutating
-the input. `durable.Salvage` and `durable.Repack` write fresh version-0 stores;
+the input. `durable.Salvage` and `durable.Repack` write fresh current stores;
 they do not copy old page layouts.
 
-`internal/storeio/testdata/format0` contains the canonical golden images for
-the current schema. `format0_golden_test.go` regenerates and compares them and
-asserts that every stored version field is zero. Malformed-input tests cover
+The storeio golden-image fixtures contain the canonical bytes for the current
+schema. Their generator tests regenerate and compare them, and assert that
+every stored format sentinel is zero. Malformed-input tests cover
 checksum, reserved-byte, bound, identity, routing, and graph-consistency
 failures.
 

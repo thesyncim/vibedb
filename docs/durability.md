@@ -71,12 +71,14 @@ contract to `txn.vtm`. A sealed decision log requires a non-zero,
 sector-aligned `N`; it is minted lazily with the log and recycles within that
 fixed region. A profile-qualified durable open requires the caller's exact
 profile to match both the persisted seal bit and persisted capacity before any
-record scan. The paired recovery-journal path additionally checks store id,
-journal id, page size, and recovery epoch before allocation proof or scanning.
+record scan. Its header `Format` field, like the recovery journal's, is solely a
+numeric-zero corruption sentinel. The paired recovery-journal path additionally
+checks store id, journal id, page size, and recovery epoch before allocation
+proof or scanning.
 Supplying ordinary zero options for an existing sealed sidecar is an error, as
 is supplying a sealed profile for an ordinary sidecar. The lower-level generic
 `OpenRecoveryJournal` can self-describe and reprove a persisted seal, but its
-immutable handle is not an externally qualified durable profile.
+capacity-immutable handle is not an externally qualified durable profile.
 
 The recovery-journal hard ceiling is 16 MiB plus 17,408 bytes, enough for the
 current replicated SQL profile's 16 MiB command budget, 64 maximum-size keys,
@@ -85,10 +87,12 @@ keeps a separate 16 MiB ceiling. These are allocation and hostile-header clamps;
 arbitrary larger durable collection options remain unsealable and fail option
 normalization.
 
-The explicit `OpenTxnLog` and `RecoverDatabaseTransactions` APIs accept
-`TxnLogOptions`. `durable.Database` does not yet thread those options, so it
-cannot mint or reopen a sealed `txn.vtm`; this checkpoint makes no sealed
-transaction-log promise for that wrapper.
+`NewTxnLog` accepts `TxnLogOptions` only for a fresh catalog and refuses any
+pre-existing `txn.vtm`. Existing decision logs reopen only through
+`OpenCollectionsWithTransactions`, which requires the complete live collection
+catalog before replay or recycle. `durable.Database` does not yet thread sealed
+transaction-log options, so this checkpoint makes no sealed decision-log
+promise for that wrapper.
 
 Sealed create requires an empty regular file. On mutable open, an exact regular
 EOF of `1024 + N` is required before allocation proof begins. Linux then runs
@@ -185,10 +189,8 @@ barrier, root write, and final barrier path.
 - Before `Flush`: the durable file names the previous checkpoint. All later
   acknowledged mutations may disappear after process or machine failure.
 - An ordinary class-5 update/delete cut can complete `Flush` by appending the
-  entire consecutive generation interval as one format-v1 recovery-journal
-  batch and syncing it once. Eligible existing-key replacements carry only a
-  compact scalar patch plus the checksum of the complete expected result;
-  deletes and unqualified replacements retain full logical redo. Before that
+  entire consecutive generation interval as one kind-5 `DeltaBatch` and syncing
+  it once. Every entry carries a complete logical put or delete. Before that
   sync recovery ignores the tail; after it, recovery replays the exact cut over
   the previous physical root.
 - A structural mutation, incomplete delta interval, journal or overlay
@@ -288,11 +290,12 @@ generation. Close the collection and reopen the file; do not retry the logical
 mutation against the poisoned live handle.
 
 Multi-collection prepare append and prepare sync failures use the same
-append-or-sync-is-terminal, die-don't-retry rule: they poison the failing
-collection with the plain persistence error and abort the transaction
-definitely. They do not open the unknown-outcome window. Only a decision-record
-sync failure escalates to `ErrCommitOutcomeUnknown`, and that poison widens to
-every collection under the catalog (see below).
+append-or-sync-is-terminal, die-don't-retry rule. A complete checksummed record
+can reach the page cache despite a short/error result, and a failed sync can
+still persist it, so both report `ErrCommitOutcomeUnknown` for the attempt and
+poison the failing collection. With no matching decision, reopen resolves the
+conditional as abort. An unexpected decision append or sync failure widens the
+unknown-outcome poison to every collection under the catalog (see below).
 
 ## Database transactions
 
@@ -304,17 +307,24 @@ catalog commits through the database transaction protocol:
 1. Validate bounds and per-participant conflicts; refuse before staging.
 2. Stage every participant under writers held in the process-global snapshot
    order. Any failure unwinds all staged work; nothing is journaled.
-3. Prepare: append and sync one conditional batch record (recovery-journal
-   format word `RecoveryJournalFormatConditional`, kind 5) in each
+3. Prepare: append and sync one kind-4 `ConditionalBatch` record in each
    participant's own journal. An append or sync failure poisons that
-   collection with the plain persistence error and aborts the whole
-   transaction definitely — the decision was never attempted.
+   collection and reports unknown for the attempt; reopen resolves it as abort
+   if no exact decision exists.
 4. Decide: append the decision record to the database decision log
    (`txn.vtm`) and cross one power-safe sync. **That sync is the sole atomic
-   commit point.** Append failure is a definite abort. Sync failure is the
-   unknown-outcome window below.
+   commit point.** Capacity and validation are definite preflight refusals;
+   unexpected append or sync failures are the unknown-outcome window below.
 5. Publish: flip every participant's publication gate in the same global
    order so no multi-collection read cut observes a partial set.
+
+Recovery resolves every retained conditional, including one whose generation
+the selected root appears to cover. A committed decision must bind the exact
+`(StoreID, JournalID, PreparedGeneration)` tuple, with the prepared generation
+equal to the conditional record generation. The decision remains available
+until every participant has successfully completed its resolved fold and
+journal recycle (or has a durable retirement); root coverage alone does not
+release it.
 
 Cost: a K-participant commit performs K+1 fsyncs (K prepare syncs plus the
 decision sync) and holds K writers across them. Reducing that to one sync is a
@@ -333,14 +343,16 @@ The facade Buffered profile maps to buffered-visible publication, so native
 multi-collection transactions on that profile are a typed refusal in this
 pass.
 
-> A multi-collection COMMIT has exactly one unknown-outcome window: the
-> decision record's sync. If that sync reports an error, COMMIT returns
-> `ErrCommitOutcomeUnknown`, every collection handle under the catalog
-> refuses further writes with the sticky persistence failure, and only
-> closing and reopening the database resolves the outcome. The unknown
-> outcome is atomic: reopen reveals either every participating collection's
-> writes or none of them. There is no crash, error, or recovery in which one
-> participant's writes survive without the others'.
+> A multi-collection COMMIT has exactly one window where commit versus abort is
+> unknown: an unexpected decision-record append or sync failure. COMMIT returns
+> `ErrCommitOutcomeUnknown`, every collection handle under the catalog refuses
+> further writes with the sticky persistence failure, and only closing and
+> reopening the database resolves the outcome. Prepare append/sync failures use
+> the same error classification because their journal side effect may exist,
+> but without an exact decision recovery deterministically aborts them. A
+> decision-stage unknown outcome is atomic: reopen reveals either every
+> participating collection's writes or none of them. There is no crash, error,
+> or recovery in which one participant's writes survive without the others'.
 
 Catalog-scope poison is intentional: a half-poisoned catalog could otherwise
 commit collection B after collection A's outcome went unknown. After reopen,
@@ -367,45 +379,46 @@ a missing or mismatched sibling. A synchronous store whose root names no
 journal (created async-visible, reopened sync) acknowledges through the chain
 fence instead.
 
-The journal has two independently checksummed 512-byte headers and a record
-region sized once before its identity can be published. Later appends are
-positional writes into that fixed region and never extend the file. The
-ordinary buffered delta lane currently uses a fully sized 2.5 MiB
-record region with a foreground policy reserve of up to 512 KiB for the next
-carried suffix, leaving a 2 MiB qualified current append window. Exact batch
-fit remains authoritative: a wider current or future suffix takes the bounded
-physical checkpoint fallback. For ordinary unsealed sidecars only, Linux
-normally allocates the complete region with `fallocate` and falls back to
-setting its full size once with truncate when allocation is unsupported; other
-platforms set the size with truncate. Per-mutation journals retain their
-separate option-derived bounded capacity. Sealed sidecars instead follow the
-strict proof described above and never use truncate as an allocation proof.
+The journal has two independently checksummed 512-byte headers and a bounded
+record region. The header's `Format` field is a corruption sentinel that must
+contain numeric `0`; every other value is rejected. The initial region is
+allocated before its identity can be published, and positional record appends
+never extend it. An ordinary unsealed acknowledgement journal may explicitly
+grow within the hard ceiling before an oversized append's point of no return;
+the extension is preallocated before the alternate header publishes it. The
+selector ignores only uninitialized or checksum-invalid torn slots. Any
+checksum-authenticated invalid header is hard corruption, so an older
+capacity/base or decision-log epoch can never hide acknowledged records. The
+ordinary buffered delta lane currently selects a 2.5 MiB region with a policy
+reserve of up to 512 KiB for the next carried suffix, leaving a 2 MiB qualified
+current append window. Exact fit remains authoritative: a wider current or
+future suffix takes the bounded physical checkpoint fallback. Per-mutation
+journals use their separate option-derived bounded capacity. Sealed sidecars
+instead follow the strict immutable-capacity proof above, reject growth, and
+never use truncate as an allocation proof.
 
-Journal format v0 admits legacy put/delete records and batches and remains
-writable as v0 after reopen. Format v1 is restricted to the ordinary buffered
-delta lane and additionally admits compact scalar patches inside batches. The
-patch names the old scalar span and carries the new canonical integer, boolean,
-or null spelling plus a checksum of the complete expected canonical document.
-Replay reconstructs that whole result and fails closed unless its checksum
-matches. Catalog-owned collections mint journals at format word
-`RecoveryJournalFormatConditional` (numeric 2), which admits kinds 1, 2, 3,
-and 5 (conditional batch) and rejects scalar-patch kind 4. Kind 5 carries the
-same batch grammar as kind 3, prefixed by a 32-byte conditional header binding
-the record to the database decision log. Current code rejects unknown versions,
-scalar-patch entries in v0, a v1 journal reopened under the per-mutation or
-synchronous lane, and kind 5 inside a legacy or scalar-patch journal; older
-binaries reject a nonzero format word they do not know before decoding.
+The one current record grammar assigns kinds 1 `Put`, 2 `Delete`, 3 `Batch`,
+4 `ConditionalBatch`, and 5 `DeltaBatch`. Put, Delete, and Batch are the atomic
+family: each advances one generation, and Batch contains one atomic ordered set
+of put/delete entries. ConditionalBatch is the same one-generation atomic
+family with a decision binding prefix (`MarkerID`, `MarkerEpoch`, `TxnID`).
+DeltaBatch contains one complete logical put/delete entry per consecutive
+generation ending at the record generation. One unrecycled window is either
+atomic or delta, never mixed; appends refuse a family change and recovery treats
+one as corruption.
 
-A v1 batch contains one entry for every consecutive logical generation ending
-at its record generation. If replay is forced to checkpoint a prefix under
-bounded staging pressure and is interrupted again, the next open derives the
-covered prefix from the selected physical root and resumes at the first
-uncovered entry. It does not reapply a length-changing scalar patch. V0 batches
-keep their original atomic grammar—all entries share one generation and replay
-starts at entry zero. Conditional batches (kind 5) apply only when the decision
-log reports the transaction committed and names this collection among its
-participants; undecided same-epoch records are presumed aborted and skipped.
-See [the design][journal] and [format.md](format.md) for the complete framing,
-failure, and group-commit details.
+If replay of a delta window checkpoints a prefix under bounded staging pressure
+and is interrupted again, the next open derives the covered prefix from the
+selected physical root and resumes at the first uncovered entry. Atomic and
+conditional batches remain one-generation groups. Every retained conditional
+is resolved even when the selected root appears to cover its generation. A
+commit requires exact marker identity and epoch plus the participant tuple
+`(StoreID, JournalID, PreparedGeneration)` matching the record; a current-epoch
+transaction with no decision is presumed aborted, while binding or epoch
+disagreement fails closed. Standalone open cannot resolve a retained
+conditional and returns the typed in-doubt error. The final resolved fold must
+succeed before journal recycle can consume the window, so the decision log is
+retained until that boundary. See [the design][journal] and
+[format.md](format.md) for complete framing, failure, and group-commit details.
 
 [journal]: design/recovery-journal.md

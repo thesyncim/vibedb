@@ -116,7 +116,7 @@ func TestDiscardTableStorageRetainsOwnershipUntilCloseCompletes(t *testing.T) {
 	}
 	candidate := &table{meta: meta}
 	database := &database{dataDir: directory}
-	path := database.tablePathForMeta("docs", meta)
+	path := database.tablePathForMeta(meta)
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func prepareUnmaterializedPublicationTable(
 	table := database.tables["docs"]
 	var finalPath string
 	if table != nil {
-		finalPath = database.tablePathForMeta("docs", table.meta)
+		finalPath = database.tablePathForMeta(table.meta)
 	}
 	database.mu.Unlock()
 	statement.Release()
@@ -349,7 +349,7 @@ func buildClosedPublicationCandidate(
 	table *table,
 ) (string, string) {
 	t.Helper()
-	finalPath := database.tablePathForMeta("docs", table.meta)
+	finalPath := database.tablePathForMeta(table.meta)
 	file, err := createPublishableTableTemp(
 		database.dataDir, "."+filepath.Base(finalPath)+".tmp-",
 	)

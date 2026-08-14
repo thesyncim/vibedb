@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -190,13 +191,14 @@ func TestVerifyDatabaseTornDecision(t *testing.T) {
 	})
 	aStore, aJournal, _ := readStoreJournalIDs(t, collectionPath(t, dir, "a"))
 	bStore, bJournal, _ := readStoreJournalIDs(t, collectionPath(t, dir, "b"))
-	// Torn append writes a prefix and returns success; reopen truncates the
-	// scan at the incomplete record — that residue is what verify reports.
+	// Torn append writes a prefix and reports the short write. The checksummed
+	// record is incomplete, so inspection retains that residue as the distinct
+	// torn-decision diagnostic.
 	if _, err := marker.AppendDecision(99, []storeio.TxnParticipant{
 		{StoreID: aStore, JournalID: aJournal, PreparedGeneration: 2},
 		{StoreID: bStore, JournalID: bJournal, PreparedGeneration: 2},
-	}); err != nil {
-		t.Fatalf("torn AppendDecision: %v", err)
+	}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("torn AppendDecision = %v, want io.ErrShortWrite", err)
 	}
 	if !fm.Faulted() {
 		t.Fatal("torn append fault did not fire")
@@ -247,7 +249,7 @@ func TestVerifyDatabaseMissingParticipant(t *testing.T) {
 	}
 }
 
-// TestVerifyDatabaseEpochMismatch plants a kind-5 record whose MarkerEpoch
+// TestVerifyDatabaseEpochMismatch plants a kind-4 record whose MarkerEpoch
 // disagrees with txn.vtm and expects epoch_mismatch.
 func TestVerifyDatabaseEpochMismatch(t *testing.T) {
 	db, dir := openVerifyTestDB(t, "a", "b")
@@ -405,8 +407,8 @@ func TestVerifyDatabaseDistinctDiagnostics(t *testing.T) {
 		aStore, aJournal, _ := readStoreJournalIDs(t, collectionPath(t, dir, "a"))
 		if _, err := marker.AppendDecision(99, []storeio.TxnParticipant{{
 			StoreID: aStore, JournalID: aJournal, PreparedGeneration: 2,
-		}}); err != nil {
-			t.Fatal(err)
+		}}); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("torn AppendDecision = %v, want io.ErrShortWrite", err)
 		}
 		if !fm.Faulted() {
 			t.Fatal("torn append fault did not fire")

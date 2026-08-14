@@ -24,9 +24,7 @@ const (
 
 func validateStorageIdentity(identity string) error {
 	if identity == "" {
-		// Catalog version 0 derived the path from the SQL table name. Empty is
-		// therefore the explicit, backward-compatible legacy representation.
-		return nil
+		return errors.New("identity is empty")
 	}
 	if len(identity) != storageIdentityBytes*2 {
 		return fmt.Errorf(
@@ -42,11 +40,11 @@ func validateStorageIdentity(identity string) error {
 	return nil
 }
 
-func (d *database) tablePathForMeta(name string, meta *tableMeta) string {
-	if meta != nil && meta.Storage != "" {
-		return filepath.Join(d.dataDir, meta.Storage+".vjc")
+func (d *database) tablePathForMeta(meta *tableMeta) string {
+	if meta == nil || meta.Storage == "" {
+		return ""
 	}
-	return d.legacyTablePath(name)
+	return filepath.Join(d.dataDir, meta.Storage+".vjc")
 }
 
 func (d *database) newStorageIdentityLocked() (string, error) {
@@ -82,8 +80,8 @@ func (d *database) storagePathInUseLocked(path string) bool {
 	if d.catalog.ReplicatedApply != nil && d.replicatedApplyPath(d.catalog.ReplicatedApply) == path {
 		return true
 	}
-	for name, meta := range d.catalog.Tables {
-		if d.tablePathForMeta(name, meta) == path {
+	for _, meta := range d.catalog.Tables {
+		if d.tablePathForMeta(meta) == path {
 			return true
 		}
 	}
@@ -356,8 +354,55 @@ func (d *database) replaceTableStorageLockedContext(
 		return errors.Join(err, d.discardTableStorageLocked(name, candidate))
 	}
 
+	detachedOld := false
+	adoptedCandidate := false
+	if old.collection != nil {
+		if d.txnLog == nil {
+			return errors.Join(
+				errors.New("vibedb: database transaction log is not open"),
+				d.discardTableStorageLocked(name, candidate),
+			)
+		}
+		if err := d.txnLog.DetachCollection(old.collection); err != nil {
+			return errors.Join(
+				fmt.Errorf(
+					"vibedb: detach replaced table %q from transaction log: %w",
+					name, err,
+				),
+				d.discardTableStorageLocked(name, candidate),
+			)
+		}
+		detachedOld = true
+		if candidate.collection == nil {
+			adoptErr := d.txnLog.AdoptCollection(old.collection)
+			if adoptErr != nil {
+				d.retainTxnReattachLocked(old.collection)
+			}
+			return errors.Join(
+				errors.New("vibedb: replacement table has no durable collection"),
+				adoptErr,
+				d.discardTableStorageLocked(name, candidate),
+			)
+		}
+		if err := d.txnLog.AdoptCollection(candidate.collection); err != nil {
+			adoptErr := d.txnLog.AdoptCollection(old.collection)
+			if adoptErr != nil {
+				d.retainTxnReattachLocked(old.collection)
+			}
+			return errors.Join(
+				fmt.Errorf(
+					"vibedb: attach replacement table %q to transaction log: %w",
+					name, err,
+				),
+				adoptErr,
+				d.discardTableStorageLocked(name, candidate),
+			)
+		}
+		adoptedCandidate = true
+	}
+
 	oldMeta := d.catalog.Tables[name]
-	oldPath := d.tablePathForMeta(name, oldMeta)
+	oldPath := d.tablePathForMeta(oldMeta)
 	previousPending := d.catalogWritePending
 	retiredBefore := len(d.retired)
 	d.catalog.Tables[name] = meta
@@ -375,7 +420,40 @@ func (d *database) replaceTableStorageLockedContext(
 		d.tables[name] = old
 		d.retired = d.retired[:retiredBefore]
 		d.catalogWritePending = previousPending
-		return errors.Join(persistErr, d.discardTableStorageLocked(name, candidate))
+		var candidateDetachErr error
+		if adoptedCandidate {
+			candidateDetachErr = d.txnLog.DetachCollection(candidate.collection)
+		}
+		var oldAdoptErr error
+		if detachedOld {
+			oldAdoptErr = d.txnLog.AdoptCollection(old.collection)
+			if oldAdoptErr != nil {
+				d.retainTxnReattachLocked(old.collection)
+			}
+		}
+		if candidateDetachErr != nil {
+			// A failed detach keeps the candidate registered by contract. Preserve
+			// its complete resource/path ownership in the retirement registry;
+			// closing or unlinking it here would strand a stale TxnLog handle. A
+			// later catalog settlement or terminal close can retry cleanup after
+			// transaction-log recovery has become possible.
+			d.retired = append(d.retired, retiredTable{
+				name: name + " (unpublished replacement)",
+				path: d.tablePathForMeta(candidate.meta),
+				journal: durable.RecoveryJournalPath(
+					d.tablePathForMeta(candidate.meta),
+				),
+				file: candidate.file, collection: candidate.collection,
+			})
+			candidate.file = nil
+			candidate.collection = nil
+			return errors.Join(persistErr, candidateDetachErr, oldAdoptErr)
+		}
+		return errors.Join(
+			persistErr,
+			oldAdoptErr,
+			d.discardTableStorageLocked(name, candidate),
+		)
 	}
 	// The new incarnation remains authoritative on success and on a catalog
 	// publication with unknown durability outcome.
@@ -407,7 +485,7 @@ func (d *database) buildReplacementStorageLocked(
 	if err := d.ensureDataDir(); err != nil {
 		return err
 	}
-	path := d.tablePathForMeta(name, candidate.meta)
+	path := d.tablePathForMeta(candidate.meta)
 	file, err := createPublishableTableTemp(
 		d.dataDir, "."+filepath.Base(path)+".tmp-",
 	)
@@ -590,7 +668,7 @@ func (d *database) discardTableStorageLocked(name string, t *table) error {
 	if t == nil || (t.collection == nil && t.file == nil) {
 		return nil
 	}
-	path := d.tablePathForMeta(name, t.meta)
+	path := d.tablePathForMeta(t.meta)
 	err := d.discardUnpublishedStorageLocked(t.collection, t.file, path)
 	t.collection = nil
 	t.file = nil
@@ -617,6 +695,7 @@ func (d *database) discardUnpublishedStorageLocked(
 		result = errors.Join(result, file.Close())
 	}
 	removed := false
+	removeFailed := false
 	seen := make(map[string]struct{}, len(paths)*2)
 	for _, path := range paths {
 		for _, candidate := range []string{path, durable.RecoveryJournalPath(path)} {
@@ -626,6 +705,7 @@ func (d *database) discardUnpublishedStorageLocked(
 			seen[candidate] = struct{}{}
 			if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
 				result = errors.Join(result, err)
+				removeFailed = true
 			} else if err == nil {
 				removed = true
 			}
@@ -642,7 +722,40 @@ func (d *database) discardUnpublishedStorageLocked(
 			d.tableDirFencePending = false
 		}
 	}
+	if removeFailed {
+		// Close completion ends engine and descriptor ownership, but it does not
+		// end ownership of names that could not be unlinked. Keep those names in
+		// the same bounded retirement slot that callers reserve before creating an
+		// unpublished store. Catalog settlement must drain this entry before a
+		// later mutation can allocate another candidate.
+		result = errors.Join(result, d.retainUnpublishedNamespaceLocked(paths...))
+	}
 	return result
+}
+
+func (d *database) retainUnpublishedNamespaceLocked(paths ...string) error {
+	if len(paths) == 0 || len(paths) > 2 {
+		return errors.New("vibedb: invalid unpublished storage cleanup path count")
+	}
+	entry := retiredTable{
+		name: "unpublished SQL storage", path: paths[0],
+		journal: durable.RecoveryJournalPath(paths[0]),
+	}
+	if len(paths) == 2 {
+		entry.extraPath = paths[1]
+		entry.extraJournal = durable.RecoveryJournalPath(paths[1])
+	}
+	d.retired = append(d.retired, entry)
+	if len(d.retired) > maxRetiredTables {
+		// Production callers pre-reserve this slot. Preserve the only retry
+		// ownership record if an internal caller violates that invariant, while
+		// ensuring every later catalog mutation fails at the typed bound.
+		return ErrTooManyRetiredTables
+	}
+	return fmt.Errorf(
+		"%w: unpublished SQL storage namespace cleanup is pending retry",
+		durable.ErrCommitOutcomeUnknown,
+	)
 }
 
 // retainUnpublishedStorageLocked transfers a candidate whose engine teardown

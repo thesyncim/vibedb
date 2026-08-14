@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
 // Multi-collection durable reads.
@@ -236,9 +237,6 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if err := validateDatabaseLayout(root, items); err != nil {
 		return nil, err
 	}
-	if err := removeOrphanRecoveryJournals(dir, items); err != nil {
-		return nil, err
-	}
 	txnRecovery, err := loadDatabaseTxnRecovery(dir, TxnLogOptions{})
 	if err != nil {
 		return nil, err
@@ -256,26 +254,21 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 		name, encoded := collectionname.Decode(base)
 		if !encoded {
 			if strings.HasSuffix(base, collectionFileSuffix) {
-				_ = d.Close()
-				if txnRecovery.log != nil {
-					_ = txnRecovery.log.Close()
-				}
-				return nil, fmt.Errorf(
+				return nil, abortDatabaseOpen(d, txnRecovery, fmt.Errorf(
 					"%w: %q; recreate the unreleased database",
 					ErrUnsupportedDatabaseLayout, base,
-				)
+				))
 			}
 			continue
 		}
 		file, openErr := openCatalogPrimary(root, base)
 		if openErr != nil {
-			_ = d.Close()
-			if txnRecovery.log != nil {
-				_ = txnRecovery.log.Close()
-			}
-			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
+			return nil, abortDatabaseOpen(d, txnRecovery, fmt.Errorf(
+				"vibedb: durable collection %q: %w", name, openErr,
+			))
 		}
-		cfg := collectionOpenConfig{catalogOwned: true}
+		cfg := collectionOpenConfig{}
+		cfg.deferJournalReplay = true
 		if txnRecovery.absent {
 			cfg.absentLog = true
 		} else {
@@ -284,23 +277,30 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 		collection, openErr := openCollection(file, options.Options, cfg)
 		if openErr != nil {
 			_ = file.Close()
-			_ = d.Close()
-			if txnRecovery.log != nil {
-				_ = txnRecovery.log.Close()
-			}
-			return nil, fmt.Errorf("vibedb: durable collection %q: %w", name, openErr)
+			return nil, abortDatabaseOpen(d, txnRecovery, fmt.Errorf(
+				"vibedb: durable collection %q: %w", name, openErr,
+			))
 		}
 		d.collections[name] = &databaseEntry{
 			name: name, filename: base, collection: collection, file: file,
 		}
 		opened = append(opened, collection)
 	}
+	if err := validateOrphanRecoveryJournals(
+		root, items, txnRecovery.decisions,
+	); err != nil {
+		return nil, abortDatabaseOpen(d, txnRecovery, err)
+	}
+	if err := preflightAndReplayDatabaseTxnRecovery(
+		txnRecovery, opened,
+	); err != nil {
+		return nil, abortDatabaseOpen(d, txnRecovery, err)
+	}
 	if err := reconcileDatabaseTxnAfterOpens(txnRecovery, opened); err != nil {
-		_ = d.Close()
-		if txnRecovery.log != nil {
-			_ = txnRecovery.log.Close()
-		}
-		return nil, err
+		return nil, abortDatabaseOpen(d, txnRecovery, err)
+	}
+	if err := removeOrphanRecoveryJournals(dir, items); err != nil {
+		return nil, abortDatabaseOpen(d, txnRecovery, err)
 	}
 	// Attach only when txn.vtm still exists after reconciliation. Lazy mint on
 	// the first Database.Update stands otherwise. Collection opens (and their
@@ -312,6 +312,39 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	}
 	d.reorder()
 	return d, nil
+}
+
+// abortDatabaseOpen releases construction-owned resources without invoking
+// Collection.Close. A deferred-open collection may still hold unreplayed
+// journal evidence; the public close path is allowed to checkpoint and recycle
+// that evidence and therefore must never run before catalog recovery succeeds.
+func abortDatabaseOpen(
+	d *Database, recovery *databaseTxnRecovery, cause error,
+) error {
+	cleanupErr := error(nil)
+	if d != nil {
+		for _, entry := range d.collections {
+			if entry == nil {
+				continue
+			}
+			if entry.collection != nil {
+				cleanupErr = errors.Join(
+					cleanupErr, entry.collection.closeResources(),
+				)
+			}
+			if entry.file != nil {
+				cleanupErr = errors.Join(cleanupErr, entry.file.Close())
+			}
+		}
+		d.collections = nil
+		d.order = nil
+		d.snapshotOrder = nil
+	}
+	if recovery != nil && recovery.log != nil {
+		cleanupErr = errors.Join(cleanupErr, recovery.log.Close())
+		recovery.log = nil
+	}
+	return errors.Join(cause, cleanupErr)
 }
 
 // validateDatabaseLayout runs before orphan cleanup so an aliased primary can
@@ -439,7 +472,7 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 		}
 		return nil, err
 	}
-	collection, err := createCollection(file, options, true)
+	collection, err := createCollection(file, options)
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
@@ -700,6 +733,55 @@ func (e *databaseEntry) close() error {
 // primary-first Drop: a canonical journal whose encoded primary is absent. It
 // never scans collection contents and never touches arbitrary *.rjournal
 // files. All removals share one parent-directory durability fence.
+func validateOrphanRecoveryJournals(
+	root *os.Root, items []os.DirEntry, decisions *storeio.TxnDecisions,
+) error {
+	present := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		present[item.Name()] = struct{}{}
+	}
+	for _, item := range items {
+		base := item.Name()
+		if _, canonical := collectionname.DecodeJournal(base); !canonical {
+			continue
+		}
+		primary := strings.TrimSuffix(base, collectionname.JournalSuffix)
+		if _, exists := present[primary]; exists {
+			continue
+		}
+		file, err := root.OpenFile(base, os.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		inspection, err := storeio.InspectRecoveryJournal(file)
+		if err != nil {
+			return errors.Join(err, file.Close())
+		}
+		holds := false
+		replayErr := inspection.Replay(
+			inspection.BaseGeneration(),
+			func(rec storeio.RecoveryRecord) error {
+				if rec.Kind == storeio.RecoveryRecordKindConditionalBatch {
+					holds = true
+				}
+				return nil
+			},
+		)
+		header := inspection.Header()
+		closeErr := inspection.Close()
+		if replayErr != nil || closeErr != nil {
+			return errors.Join(replayErr, closeErr)
+		}
+		if holds && (decisions == nil || !decisions.Retired(header.StoreID)) {
+			return fmt.Errorf(
+				"%w: orphan journal %q for store %x retains a conditional prepare without participant retirement",
+				ErrTransactionParticipantMissing, base, header.StoreID,
+			)
+		}
+	}
+	return nil
+}
+
 func removeOrphanRecoveryJournals(dir string, items []os.DirEntry) error {
 	present := make(map[string]struct{}, len(items))
 	for _, item := range items {

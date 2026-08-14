@@ -26,8 +26,8 @@ func TestVerifierSealedSidecarInspectionIsReadOnly(t *testing.T) {
 	var storeID, journalID [16]byte
 	storeID[0], journalID[0] = 1, 2
 	journal, err := storeio.CreateRecoveryJournal(journalFile, storeio.RecoveryJournalHeader{
-		FormatVersion: storeio.RecoveryJournalFormatConditional,
-		StoreID:       storeID, JournalID: journalID,
+		Format:  storeio.RecoveryJournalFormat,
+		StoreID: storeID, JournalID: journalID,
 		PageSize: 4096, SectorSize: storeio.RecoveryJournalMinSectorSize,
 		BaseGeneration: 1,
 		Capacity:       8 * storeio.RecoveryJournalMinSectorSize,

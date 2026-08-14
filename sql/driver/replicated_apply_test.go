@@ -725,8 +725,9 @@ func TestReplicatedApplyActivationPublicationSettlement(t *testing.T) {
 	t.Run("definite cleanup", func(t *testing.T) {
 		_, db, base := bindReplicatedApplyTestRoot(t, "definite-apply")
 		options := testReplicatedApplyOptions()
+		bootstrap := testReplicatedApplyBootstrap()
 		claim, identity, err := db.openReplicatedApply(
-			base, testReplicatedApplyBootstrap(), options,
+			base, bootstrap, options,
 			func(*database) (bool, error) {
 				return false, errors.New("injected definite catalog failure")
 			},
@@ -742,6 +743,39 @@ func TestReplicatedApplyActivationPublicationSettlement(t *testing.T) {
 			t.Fatal("definite failure retained a published apply descriptor or handle")
 		}
 		core.mu.RUnlock()
+
+		// The failed candidate was adopted into the catalog-scoped transaction
+		// log before descriptor persistence. Definite failure must detach it before
+		// discard so a later candidate can be adopted and its first cross-store
+		// transaction can commit without stale registration or poison.
+		claim, identity, err = db.OpenReplicatedApply(base, bootstrap, options)
+		if err != nil || claim == nil || identity.Storage == "" {
+			t.Fatalf("activation after definite cleanup = %p,%+v,%v", claim, identity, err)
+		}
+		if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+			t.Fatalf("install bootstrap after definite cleanup: %v", err)
+		}
+		document := []byte(`{"id":"after-definite-failure","n":1}`)
+		key := testReplicatedApplyKey(t, db, document)
+		command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+			Kind: replication.MutationPut, Key: key, Value: document,
+		})
+		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
+			t.Fatalf("transaction after definite cleanup: %v", err)
+		}
+		if got := completionResultCode(t, claim, command); got != replicatedstate.ResultApplied {
+			t.Fatalf("transaction result after definite cleanup = %d, want applied", got)
+		}
+		stored, found, readErr := core.tables["docs"].collection.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(stored, document) {
+			t.Fatalf(
+				"row after definite cleanup = %q,%v,%v, want %s",
+				stored, found, readErr, document,
+			)
+		}
+		if err := claim.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -775,49 +809,37 @@ func TestReplicatedApplyActivationPublicationSettlement(t *testing.T) {
 	})
 }
 
-func TestReplicatedApplyRetainsIncompleteReopenOwnership(t *testing.T) {
-	_, database, base := bindReplicatedApplyTestRoot(t, "retry-close")
+func TestReplicatedApplyActivationAdoptsWithoutReopen(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "adopt-without-reopen")
 	core := database.connector.db
-	injected := errors.New("injected incomplete final-store close")
 	closeCalls := 0
+	var temporary *durable.Collection
 	core.closeCollection = func(collection *durable.Collection) error {
 		closeCalls++
-		if closeCalls == 2 {
-			return injected
+		if closeCalls != 1 {
+			return errors.New("activation closed a post-publication hidden collection")
 		}
+		temporary = collection
 		return collection.Close()
 	}
 	claim, identity, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
-	if claim != nil || identity != (ReplicatedApplyIdentity{}) || !errors.Is(err, injected) {
-		t.Fatalf("activation with retryable close = %p,%+v,%v", claim, identity, err)
+	if err != nil || claim == nil || identity.Storage == "" {
+		t.Fatalf("activation = %p,%+v,%v", claim, identity, err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("activation close calls = %d, want one temporary close", closeCalls)
 	}
 	core.mu.RLock()
-	if len(core.retired) != 1 || core.retired[0].collection == nil ||
-		core.retired[0].file == nil || core.catalog.ReplicatedApply != nil {
+	if core.replicatedApplyCollection == nil || core.replicatedApplyFile == nil ||
+		core.replicatedApplyCollection == temporary ||
+		core.catalog.ReplicatedApply == nil || len(core.retired) != 0 {
 		core.mu.RUnlock()
-		t.Fatalf("incomplete reopen ownership = %+v", core.retired)
+		t.Fatal("activation did not directly adopt the published hidden collection")
 	}
-	retainedPath := core.retired[0].path
-	retainedFile := core.retired[0].file
 	core.mu.RUnlock()
-	if _, err := retainedFile.Stat(); err != nil {
-		t.Fatalf("retained descriptor: %v", err)
-	}
-	if _, err := os.Stat(retainedPath); err != nil {
-		t.Fatalf("retained final path: %v", err)
-	}
 	core.closeCollection = nil
-	claim, identity, err = database.OpenReplicatedApply(
-		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
-	)
-	if err != nil || claim == nil || identity.Storage == "" {
-		t.Fatalf("activation after close retry = %p,%+v,%v", claim, identity, err)
-	}
-	if _, err := os.Stat(retainedPath); !os.IsNotExist(err) {
-		t.Fatalf("retired unpublished path remains: %v", err)
-	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}

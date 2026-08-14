@@ -67,7 +67,7 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 	const capacity = uint64(64 * storeio.TxnMarkerMinSectorSize)
 	dir := t.TempDir()
 	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true}
-	log, err := OpenTxnLog(dir, options)
+	log, err := NewTxnLog(dir, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,23 +84,37 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := RecoverDatabaseTransactions(dir, TxnLogOptions{}); !errors.Is(err, ErrSealedJournalCapacity) {
+	if _, _, err := OpenCollectionsWithTransactions(
+		dir, TxnLogOptions{}, nil,
+	); !errors.Is(err, ErrSealedJournalCapacity) {
 		t.Fatalf("unqualified sealed marker recovery = %v, want mismatch", err)
 	}
-	decisions, reopened, err := RecoverDatabaseTransactions(dir, options)
+	collections, reopened, err := OpenCollectionsWithTransactions(
+		dir, options, nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decisions == nil {
-		t.Fatal("sealed marker recovery returned nil decisions")
+	if len(collections) != 0 || reopened == nil {
+		t.Fatalf("sealed empty-catalog recovery = %d collections, log %p",
+			len(collections), reopened)
 	}
-	if err := reopened.Close(); err != nil {
+	// Empty-catalog reconciliation removes the discharged marker. Re-mint it
+	// with the exact profile before asserting that a different exact profile is
+	// rejected on open.
+	reopened.commitMu.Lock()
+	err = reopened.ensureMintedLocked()
+	reopened.commitMu.Unlock()
+	if err != nil {
+		requireSealedSidecarEnvironment(t, err)
+	}
+	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := RecoverDatabaseTransactions(dir, TxnLogOptions{
+	if _, _, err := OpenCollectionsWithTransactions(dir, TxnLogOptions{
 		Capacity:       capacity + storeio.TxnMarkerMinSectorSize,
 		SealedCapacity: true,
-	}); !errors.Is(err, ErrSealedJournalCapacity) {
+	}, nil); !errors.Is(err, ErrSealedJournalCapacity) {
 		t.Fatalf("wrong sealed marker recovery = %v, want mismatch", err)
 	}
 }

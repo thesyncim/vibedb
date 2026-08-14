@@ -55,7 +55,7 @@ func newMachineFixture(t testing.TB) machineFixture {
 	system := openCollection("system")
 	system = systemTargetOf(system.Collection)
 	user := openCollection("user")
-	log, err := durable.OpenTxnLog(dir, durable.TxnLogOptions{})
+	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,25 +349,39 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 	if err := fixture.log.Close(); err != nil {
 		t.Fatal(err)
 	}
-	decisions, log, err := durable.RecoverDatabaseTransactions(fixture.dir, durable.TxnLogOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = log.Close() })
-	open := func(name string) CollectionTarget {
+	files := make([]*os.File, 0, 2)
+	requests := make([]durable.TransactionCollectionOpen, 0, 2)
+	for _, name := range []string{"system", "user"} {
 		file, err := os.OpenFile(filepath.Join(fixture.dir, name+".vdb"), os.O_RDWR, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = file.Close() })
-		collection, err := durable.OpenWithTransactions(file, durable.Options{}, decisions)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = collection.Close() })
-		return targetOf(collection)
+		files = append(files, file)
+		requests = append(requests, durable.TransactionCollectionOpen{
+			File: file, Options: durable.Options{},
+		})
 	}
-	system, user := open("system"), open("user")
+	collections, log, err := durable.OpenCollectionsWithTransactions(
+		fixture.dir, durable.TxnLogOptions{}, requests,
+	)
+	if err != nil {
+		for _, file := range files {
+			_ = file.Close()
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, collection := range collections {
+			_ = collection.Close()
+		}
+		if log != nil {
+			_ = log.Close()
+		}
+		for _, file := range files {
+			_ = file.Close()
+		}
+	})
+	system, user := targetOf(collections[0]), targetOf(collections[1])
 	system = systemTargetOf(system.Collection)
 	reopened, err := Open(
 		fixture.binding, fixture.bootstrap, system, UserCollection{Name: "docs", Target: user},

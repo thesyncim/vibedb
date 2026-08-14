@@ -2,7 +2,6 @@ package durable
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,33 +17,25 @@ func conditionalMarkerID(seed byte) [16]byte {
 	return id
 }
 
-// openCatalogOwnedSyncCollection opens a sync-journal collection and marks it
-// catalog-owned so prepare may remint at the conditional journal format.
+// openCatalogOwnedSyncCollection opens a sync-journal collection in the sole
+// current grammar, which directly admits conditional records.
 func openCatalogOwnedSyncCollection(t *testing.T) (*Collection, *os.File, string) {
 	t.Helper()
 	options := syncPrimaryJournalTestOptions()
 	coll, file, path := openPrimaryBatchStore(t, options)
-	coll.writer.Lock()
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		coll.writer.Unlock()
-		t.Fatalf("ensure conditional format: %v", err)
+	if coll.journal.Header().Format != storeio.RecoveryJournalFormat {
+		t.Fatalf("format=%d, want current", coll.journal.Header().Format)
 	}
-	if coll.journal.Header().FormatVersion !=
-		storeio.RecoveryJournalFormatConditional {
-		coll.writer.Unlock()
-		t.Fatalf("format=%d, want conditional", coll.journal.Header().FormatVersion)
-	}
-	coll.writer.Unlock()
 	return coll, file, path
 }
 
-// prepareConditionalUnpublished stages and force-syncs a kind-5 record, then
+// prepareConditionalUnpublished stages and force-syncs a kind-4 record, then
 // fully unwinds so memory stays at the pre-prepare root while the journal holds
-// the durable conditional batch. Returns the marker binding used.
+// the durable conditional batch. It returns the prepared generation carried by
+// the record and matched by the decision resolver.
 func prepareConditionalUnpublished(
 	t *testing.T, coll *Collection, markerID [16]byte, epoch, txnID uint64,
-) {
+) uint64 {
 	t.Helper()
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
@@ -67,6 +58,7 @@ func prepareConditionalUnpublished(
 		t.Fatalf("prepare: %v", err)
 	}
 	coll.unwindStagedPrimaryBatch(&staged)
+	return staged.generation
 }
 
 func captureStoreJournal(t *testing.T, path string) (store, journal []byte) {
@@ -110,6 +102,23 @@ func installReplayResolver(
 	t.Cleanup(func() { recoveryJournalReplayResolverHook = prev })
 }
 
+func journalHoldsConditionalForTest(
+	t testing.TB, coll *Collection, markerID [16]byte, epoch uint64,
+) bool {
+	t.Helper()
+	holds, err := coll.journalHoldsConditional(markerID, epoch)
+	if err != nil {
+		t.Fatalf("journalHoldsConditional: %v", err)
+	}
+	return holds
+}
+
+func resolveAllConditionals(committed bool) recoveryJournalDecisionResolver {
+	return func([16]byte, uint64, uint64, uint64) (bool, error) {
+		return committed, nil
+	}
+}
+
 func reopenSync(t *testing.T, path string) (*Collection, *os.File) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
@@ -125,19 +134,24 @@ func reopenSync(t *testing.T, path string) (*Collection, *os.File) {
 }
 
 // TestConditionalReplayCommittedApplies proves a resolver that reports the
-// prepared triple committed applies the kind-5 batch on reopen.
+// prepared tuple committed applies the kind-4 batch on reopen.
 func TestConditionalReplayCommittedApplies(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
 	markerID := conditionalMarkerID(1)
 	const epoch, txnID = uint64(3), uint64(11)
-	prepareConditionalUnpublished(t, coll, markerID, epoch, txnID)
+	preparedGeneration := prepareConditionalUnpublished(
+		t, coll, markerID, epoch, txnID,
+	)
 	storeBytes, journalBytes := captureStoreJournal(t, path)
 	_ = coll.Close()
 	_ = file.Close()
 
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-	installReplayResolver(t, func(id [16]byte, ep, txn uint64) (bool, error) {
-		return id == markerID && ep == epoch && txn == txnID, nil
+	installReplayResolver(t, func(
+		id [16]byte, ep, txn, generation uint64,
+	) (bool, error) {
+		return id == markerID && ep == epoch && txn == txnID &&
+			generation == preparedGeneration, nil
 	}, epoch)
 
 	reopened, rfile := reopenSync(t, img)
@@ -152,7 +166,7 @@ func TestConditionalReplayCommittedApplies(t *testing.T) {
 	}
 }
 
-// TestConditionalReplayUndecidedSkips proves same-epoch undecided kind-5 is
+// TestConditionalReplayUndecidedSkips proves same-epoch undecided kind-4 is
 // presumed abort: reopen leaves pre-prepare content and consumes the window.
 func TestConditionalReplayUndecidedSkips(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
@@ -165,7 +179,7 @@ func TestConditionalReplayUndecidedSkips(t *testing.T) {
 	_ = file.Close()
 
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-	installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
+	installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
 		return false, nil
 	}, epoch)
 
@@ -181,20 +195,20 @@ func TestConditionalReplayUndecidedSkips(t *testing.T) {
 	for k := range phaseExpectedContent() {
 		if _, ok := before[k]; !ok {
 			if _, present := got[k]; present {
-				t.Fatalf("undecided kind-5 applied key %q", k)
+				t.Fatalf("undecided kind-4 applied key %q", k)
 			}
 		}
 	}
 	reopened.writer.Lock()
-	holds := reopened.journalHoldsConditional(markerID, epoch)
+	holds := journalHoldsConditionalForTest(t, reopened, markerID, epoch)
 	reopened.writer.Unlock()
 	if holds {
-		t.Fatal("skipped kind-5 survived reopen without fold/recycle")
+		t.Fatal("skipped kind-4 survived reopen without fold/recycle")
 	}
 }
 
 // TestConditionalReplayEpochMismatchFailsClosed covers epoch-ahead and
-// epoch-behind kind-5 records against the decision-log epoch.
+// epoch-behind kind-4 records against the decision-log epoch.
 func TestConditionalReplayEpochMismatchFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -213,7 +227,7 @@ func TestConditionalReplayEpochMismatchFailsClosed(t *testing.T) {
 			_ = file.Close()
 
 			img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-			installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
+			installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
 				t.Fatal("resolver must not run on epoch mismatch")
 				return false, nil
 			}, tc.decisionEpoch)
@@ -232,7 +246,7 @@ func TestConditionalReplayEpochMismatchFailsClosed(t *testing.T) {
 }
 
 // TestConditionalReplayStandaloneUncoveredInDoubt proves Open with a nil
-// resolver fails closed when the live window holds an uncovered kind-5.
+// resolver fails closed when the live window holds an uncovered kind-4.
 func TestConditionalReplayStandaloneUncoveredInDoubt(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
 	prepareConditionalUnpublished(t, coll, conditionalMarkerID(4), 1, 1)
@@ -254,7 +268,7 @@ func TestConditionalReplayStandaloneUncoveredInDoubt(t *testing.T) {
 
 // advanceDurableRootWithoutRecycle checkpoints while journalReplaying is set so
 // the durable root advances but the live journal window is retained. Used to
-// build covered kind-5 images (record generation ≤ root, still in the window).
+// build covered kind-4 images (record generation ≤ root, still in the window).
 func advanceDurableRootWithoutRecycle(t *testing.T, coll *Collection) {
 	t.Helper()
 	coll.writer.Lock()
@@ -267,16 +281,16 @@ func advanceDurableRootWithoutRecycle(t *testing.T, coll *Collection) {
 	}
 }
 
-// TestConditionalReplayCoveredConsumedNilResolver proves a covered kind-5
-// (root generation ≥ record generation) is consumed without consulting a
-// resolver, including the standalone nil-resolver Open path.
-func TestConditionalReplayCoveredConsumedNilResolver(t *testing.T) {
+// TestConditionalReplayCoveredStillResolved proves a covered kind-4 is still
+// resolved. The root may contain only a sequential replay prefix, so coverage
+// alone cannot establish whether the complete conditional batch committed.
+func TestConditionalReplayCoveredStillResolved(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
 	markerID := conditionalMarkerID(5)
 	const epoch = uint64(1)
 	prepareConditionalUnpublished(t, coll, markerID, epoch, 42)
 	// Publish a later kind-3 at the same generation so the durable root can
-	// advance past the kind-5 while the journal still holds it.
+	// advance past the kind-4 while the journal still holds it.
 	if err := coll.Update(func(batch *WriteBatch) error {
 		return batch.Put([]byte("cover"), []byte(`{"v":1}`))
 	}); err != nil {
@@ -285,9 +299,9 @@ func TestConditionalReplayCoveredConsumedNilResolver(t *testing.T) {
 	advanceDurableRootWithoutRecycle(t, coll)
 	coll.writer.Lock()
 	rootGen := coll.state.Load().root.Generation
-	if !coll.journalHoldsConditional(markerID, epoch) {
+	if !journalHoldsConditionalForTest(t, coll, markerID, epoch) {
 		coll.writer.Unlock()
-		t.Fatal("expected covered kind-5 retained in journal")
+		t.Fatal("expected covered kind-4 retained in journal")
 	}
 	coll.writer.Unlock()
 	storeBytes, journalBytes := captureStoreJournal(t, path)
@@ -296,19 +310,19 @@ func TestConditionalReplayCoveredConsumedNilResolver(t *testing.T) {
 
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
 	resolverCalls := 0
-	installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
+	installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
 		resolverCalls++
-		return false, fmt.Errorf("resolver must not be consulted for covered kind-5")
+		return false, nil
 	}, epoch)
 
 	reopened, rfile := reopenSync(t, img)
 	defer rfile.Close()
 	defer reopened.Close()
-	if resolverCalls != 0 {
-		t.Fatalf("covered kind-5 invoked resolver %d times", resolverCalls)
+	if resolverCalls != 1 {
+		t.Fatalf("covered kind-4 invoked resolver %d times, want 1", resolverCalls)
 	}
 	reopened.writer.Lock()
-	holds := reopened.journalHoldsConditional(markerID, epoch)
+	holds := journalHoldsConditionalForTest(t, reopened, markerID, epoch)
 	cursor := reopened.journal.Cursor()
 	gotRoot := reopened.state.Load().root.Generation
 	reopened.writer.Unlock()
@@ -316,25 +330,25 @@ func TestConditionalReplayCoveredConsumedNilResolver(t *testing.T) {
 		t.Fatalf("reopened root=%d, want ≥ %d", gotRoot, rootGen)
 	}
 	if holds {
-		t.Fatal("covered kind-5 still present after reopen fold")
+		t.Fatal("covered kind-4 still present after reopen fold")
 	}
 	if cursor != 0 {
 		t.Fatalf("journal cursor=%d after covered consume, want 0", cursor)
 	}
 
-	// Standalone nil-resolver path: same covered image must Open clean.
+	// Standalone nil-resolver path: the same covered image remains in doubt.
 	img2 := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
 	prev := recoveryJournalReplayResolverHook
 	recoveryJournalReplayResolverHook = nil
-	standalone, sfile := reopenSync(t, img2)
+	sfile, err := os.OpenFile(img2, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, openErr := Open(sfile, syncPrimaryJournalTestOptions())
 	recoveryJournalReplayResolverHook = prev
 	defer sfile.Close()
-	defer standalone.Close()
-	standalone.writer.Lock()
-	holds = standalone.journalHoldsConditional(markerID, epoch)
-	standalone.writer.Unlock()
-	if holds {
-		t.Fatal("standalone open left covered kind-5 in place")
+	if !errors.Is(openErr, ErrCollectionInDoubt) {
+		t.Fatalf("standalone covered open = %v, want ErrCollectionInDoubt", openErr)
 	}
 }
 
@@ -354,8 +368,10 @@ func TestConditionalReplayParticipantBindingSkips(t *testing.T) {
 	// Closure answers committed only when the decision names this collection.
 	// Here the decision exists for the triple but omits this participant.
 	thisJournalID := [16]byte{}
-	installReplayResolver(t, func(id [16]byte, ep, txn uint64) (bool, error) {
-		if id != markerID || ep != epoch || txn != txnID {
+	installReplayResolver(t, func(
+		id [16]byte, ep, txn, generation uint64,
+	) (bool, error) {
+		if id != markerID || ep != epoch || txn != txnID || generation == 0 {
 			return false, nil
 		}
 		// Participant binding: decision does not name this journal.
@@ -392,7 +408,7 @@ func TestConditionalReplayResolverErrorFailsClosed(t *testing.T) {
 
 	sentinel := errors.New("vibedb: test transaction log missing")
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-	installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
+	installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
 		return false, sentinel
 	}, 1)
 
@@ -407,10 +423,9 @@ func TestConditionalReplayResolverErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// TestConditionalReplayCoveredNeverInvokesResolver is the tripwire form of the
-// covered-consume contract: a resolver that fails the test if called stays
-// uncalled when the selected root already covers the kind-5 generation.
-func TestConditionalReplayCoveredNeverInvokesResolver(t *testing.T) {
+// TestConditionalReplayCoveredInvokesResolver is the direct tripwire form of
+// the covered-resolution contract.
+func TestConditionalReplayCoveredInvokesResolver(t *testing.T) {
 	coll, file, _ := openCatalogOwnedSyncCollection(t)
 	defer file.Close()
 	defer coll.Close()
@@ -428,9 +443,10 @@ func TestConditionalReplayCoveredNeverInvokesResolver(t *testing.T) {
 	coll.writer.Lock()
 	rootGen := coll.state.Load().root.Generation
 	coll.writer.Unlock()
+	resolverCalls := 0
 	resolve := recoveryJournalDecisionResolver(
-		func([16]byte, uint64, uint64) (bool, error) {
-			t.Fatal("covered kind-5 consulted resolver")
+		func([16]byte, uint64, uint64, uint64) (bool, error) {
+			resolverCalls++
 			return false, nil
 		},
 	)
@@ -440,16 +456,19 @@ func TestConditionalReplayCoveredNeverInvokesResolver(t *testing.T) {
 	); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
+	if resolverCalls != 1 {
+		t.Fatalf("covered resolver calls = %d, want 1", resolverCalls)
+	}
 	coll.writer.Lock()
-	holds := coll.journalHoldsConditional(markerID, epoch)
+	holds := journalHoldsConditionalForTest(t, coll, markerID, epoch)
 	coll.writer.Unlock()
 	if holds {
-		t.Fatal("covered kind-5 not consumed")
+		t.Fatal("covered kind-4 not consumed")
 	}
 }
 
 // TestConditionalStrayConsumptionFoldRecycle proves a window of only skipped
-// undecided kind-5 records is folded and recycled; a second reopen replays
+// undecided kind-4 records is folded and recycled; a second reopen replays
 // nothing and performs no further fold.
 func TestConditionalStrayConsumptionFoldRecycle(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
@@ -461,15 +480,15 @@ func TestConditionalStrayConsumptionFoldRecycle(t *testing.T) {
 	_ = file.Close()
 
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-	installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
+	installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
 		return false, nil
 	}, epoch)
 
 	first, f1 := reopenSync(t, img)
 	first.writer.Lock()
-	if first.journalHoldsConditional(markerID, epoch) {
+	if journalHoldsConditionalForTest(t, first, markerID, epoch) {
 		first.writer.Unlock()
-		t.Fatal("stray kind-5 survived first reopen")
+		t.Fatal("stray kind-4 survived first reopen")
 	}
 	if first.journal.Cursor() != 0 {
 		first.writer.Unlock()
@@ -493,13 +512,13 @@ func TestConditionalStrayConsumptionFoldRecycle(t *testing.T) {
 	// Clean reopen with empty journal must not force another fold checkpoint
 	// beyond Close's own persistence boundary accounting; cursor staying zero
 	// and no conditional held is the contract.
-	if second.journalHoldsConditional(markerID, epoch) {
+	if journalHoldsConditionalForTest(t, second, markerID, epoch) {
 		t.Fatal("conditional reappeared on second reopen")
 	}
 	_ = checkpoints
 }
 
-// TestConditionalAbortedGenerationAliasing proves an aborted kind-5 at G+1
+// TestConditionalAbortedGenerationAliasing proves an aborted kind-4 at G+1
 // followed by an applied kind-3 at G+1 replays only the kind-3; second replay
 // is idempotent.
 func TestConditionalAbortedGenerationAliasing(t *testing.T) {
@@ -509,7 +528,7 @@ func TestConditionalAbortedGenerationAliasing(t *testing.T) {
 	prepareConditionalUnpublished(t, coll, markerID, epoch, 1)
 
 	// Single-collection Update reuses G+1 (aborted conditional never advanced
-	// the published generation) and appends a kind-3 batch after the kind-5.
+	// the published generation) and appends a kind-3 batch after the kind-4.
 	if err := coll.Update(func(batch *WriteBatch) error {
 		return batch.Put([]byte("alias"), []byte(`{"v":"kind3"}`))
 	}); err != nil {
@@ -520,8 +539,8 @@ func TestConditionalAbortedGenerationAliasing(t *testing.T) {
 	_ = file.Close()
 
 	img := writeStoreJournal(t, t.TempDir(), storeBytes, journalBytes)
-	installReplayResolver(t, func([16]byte, uint64, uint64) (bool, error) {
-		return false, nil // aborted / undecided kind-5
+	installReplayResolver(t, func([16]byte, uint64, uint64, uint64) (bool, error) {
+		return false, nil // aborted / undecided kind-4
 	}, epoch)
 
 	verify := func(label string) {
@@ -535,9 +554,9 @@ func TestConditionalAbortedGenerationAliasing(t *testing.T) {
 		}
 		for k := range phaseExpectedContent() {
 			if _, ok := got[k]; ok && k != "seed" {
-				// phase keys must not appear from the aborted kind-5
+				// phase keys must not appear from the aborted kind-4
 				if k == "a" || k == "b" || k == "c" {
-					t.Fatalf("%s: aborted kind-5 key %q present", label, k)
+					t.Fatalf("%s: aborted kind-4 key %q present", label, k)
 				}
 			}
 		}
@@ -560,103 +579,26 @@ func TestConditionalAccessorsFoldPastWindow(t *testing.T) {
 
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
-	if !coll.journalHoldsConditional(markerID, epoch) {
+	if !journalHoldsConditionalForTest(t, coll, markerID, epoch) {
 		t.Fatal("expected journalHoldsConditional true after prepare")
 	}
-	if coll.journalHoldsConditional(markerID, epoch+1) {
+	if journalHoldsConditionalForTest(t, coll, markerID, epoch+1) {
 		t.Fatal("holdsConditional matched wrong epoch")
 	}
 	before := coll.automaticCheckpoints.Load()
-	if err := coll.checkpointPastConditionalsLocked(); err != nil {
+	if err := coll.checkpointPastConditionalsLocked(
+		resolveAllConditionals(false), epoch,
+	); err != nil {
 		t.Fatalf("checkpointPastConditionalsLocked: %v", err)
 	}
 	if coll.automaticCheckpoints.Load() != before+1 {
 		t.Fatalf("fold not foreground-bounded to one checkpoint: before=%d after=%d",
 			before, coll.automaticCheckpoints.Load())
 	}
-	if coll.journalHoldsConditional(markerID, epoch) {
+	if journalHoldsConditionalForTest(t, coll, markerID, epoch) {
 		t.Fatal("journalHoldsConditional still true after fold")
 	}
 	if coll.journal.Cursor() != 0 {
 		t.Fatalf("cursor=%d after fold, want 0", coll.journal.Cursor())
-	}
-}
-
-// TestConditionalLegacyToConditionalUpgradeOnce proves a catalog-owned legacy
-// journal remints at the conditional format through exactly one bounded
-// foreground checkpoint when the live window is non-empty.
-func TestConditionalLegacyToConditionalUpgradeOnce(t *testing.T) {
-	options := syncPrimaryJournalTestOptions()
-	coll, file, _ := openPrimaryBatchStore(t, options)
-	defer file.Close()
-	defer coll.Close()
-
-	if err := coll.Update(phaseWorkload); err != nil {
-		t.Fatalf("seed Update: %v", err)
-	}
-	coll.writer.Lock()
-	defer coll.writer.Unlock()
-	if coll.journal.Header().FormatVersion !=
-		storeio.RecoveryJournalFormatLegacy {
-		t.Fatalf("pre-upgrade format=%d, want legacy",
-			coll.journal.Header().FormatVersion)
-	}
-	if coll.journal.Cursor() == 0 {
-		t.Fatal("expected non-empty live window before upgrade")
-	}
-	coll.journalCatalogOwned = true
-	before := coll.automaticCheckpoints.Load()
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("upgrade: %v", err)
-	}
-	if coll.journal.Header().FormatVersion !=
-		storeio.RecoveryJournalFormatConditional {
-		t.Fatalf("post-upgrade format=%d, want conditional",
-			coll.journal.Header().FormatVersion)
-	}
-	if coll.automaticCheckpoints.Load() != before+1 {
-		t.Fatalf("upgrade checkpoints=%d→%d, want exactly one",
-			before, coll.automaticCheckpoints.Load())
-	}
-	// Second ensure is a no-op: already conditional, no further checkpoint.
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("second ensure: %v", err)
-	}
-	if coll.automaticCheckpoints.Load() != before+1 {
-		t.Fatalf("second ensure took another checkpoint")
-	}
-}
-
-// TestConditionalPrepareRefusesScalarPatchJournal pins the defensive typed
-// error when conditional prepare is reached on a scalar-patch journal.
-func TestConditionalPrepareRefusesScalarPatchJournal(t *testing.T) {
-	options := journalTestOptions(CheckpointPowerSafe)
-	options.RecoveryJournal = false // ordinary buffered delta → scalar-patch
-	coll, file, _ := openPrimaryBatchStore(t, options)
-	defer file.Close()
-	defer coll.Close()
-
-	// Force the ordinary buffered delta journal to exist at scalar-patch format.
-	if _, err := coll.Put([]byte("x"), []byte(`{"v":1}`)); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if err := coll.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	coll.writer.Lock()
-	defer coll.writer.Unlock()
-	if !coll.journalEnabled() {
-		t.Fatal("expected scalar-patch journal after Flush")
-	}
-	if coll.journal.Header().FormatVersion !=
-		storeio.RecoveryJournalFormatScalarPatch {
-		t.Fatalf("format=%d, want scalar-patch",
-			coll.journal.Header().FormatVersion)
-	}
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); !errors.Is(
-		err, ErrConditionalPrepareUnsupportedJournal,
-	) {
-		t.Fatalf("ensure err=%v, want ErrConditionalPrepareUnsupportedJournal", err)
 	}
 }

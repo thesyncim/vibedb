@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -43,20 +44,20 @@ import (
 //     ordinary-filesystem lane). Acknowledgement returns after that single sync.
 //
 // Recovery selects the newest valid store root, opens the paired journal, and
-// replays every record whose generation is newer than that root's generation
-// through the ordinary mutation path, stopping at the first framing-invalid
-// record. A torn or reordered tail therefore truncates and never corrupts: the
-// root and its graph were never touched before their own two-phase publication.
+// validates the complete live window before replay. Record-kind semantics then
+// decide which covered prefix can be skipped. A torn or reordered append tail
+// truncates before its incomplete record; checksum-authenticated semantic
+// failures stop recovery.
 //
-// A batch record (recoveryRecordKindBatch) is the group-commit form of the same
-// protocol: one sequence, one generation, and an ordered list of put, delete,
-// or compact scalar-patch entries, all under a single CRC and made durable by
-// one append plus one sync.
-// Because the whole record is framed by that one CRC, a torn append fails
-// validation and replay truncates before it, so recovery replays either every
-// entry of the group or none — the atomicity a multi-document Update needs, and
-// the primitive a future group of independent acknowledgements sharing one sync
-// builds on.
+// An atomic batch record (recoveryRecordKindBatch) is the group-commit form of
+// the same protocol: one sequence, one generation, and an ordered list of put
+// or delete entries, all under a single CRC and made durable by one append plus
+// one sync. A delta batch (recoveryRecordKindDeltaBatch) instead carries one
+// put/delete entry per consecutive generation.
+// Because the whole record is framed by that one CRC, append recovery admits
+// the complete logical record or truncates before it. Applying an admitted
+// record may checkpoint in bounded prefixes during private recovery; the live
+// journal remains until the full record is consumed.
 const (
 	// RecoveryJournalHeaderSize is one full damage-granule-aligned header
 	// sector. The header is rewritten only on create and on recycle, never per
@@ -90,25 +91,14 @@ const (
 	// keeps durable's creation clamp from drifting.
 	RecoveryJournalMaxCapacityBytes = (uint64(16) << 20) + 34*RecoveryJournalMinSectorSize
 
-	recoveryJournalMagic = "RJRNL00\x00"
-	recoveryRecordMagic  = uint32(0x304a5252) // "RRJ0", little-endian.
+	// RecoveryJournalFormat is the sole admitted recovery-journal grammar.
+	RecoveryJournalFormat = uint32(0)
 
-	// RecoveryJournalFormatLegacy is the original put/delete batch format. Its
-	// zero value preserves every pre-feature header byte and keeps callers that
-	// do not opt in safely on the legacy grammar.
-	RecoveryJournalFormatLegacy = uint32(0)
-	// RecoveryJournalFormatScalarPatch admits compact scalar-patch batch entries.
-	// The feature version occupies the header's former DevelopmentFormatVersion
-	// word, so an older binary's existing version==0 check rejects the journal
-	// before it can misinterpret kind 4.
-	RecoveryJournalFormatScalarPatch = uint32(1)
-	// RecoveryJournalFormatConditional admits conditional batch records (kind 5)
-	// used by multi-collection prepare. It occupies the same header format word
-	// older binaries require to hold a known value, so a legacy or scalar-patch
-	// reader rejects the journal before any record decode. Scalar-patch entries
-	// (kind 4) remain scalar-patch-format-only: the ordinary buffered delta lane
-	// never coexists with conditional records under this format word.
-	RecoveryJournalFormatConditional = uint32(2)
+	// The header and record domains are covered by their enclosing checksums.
+	// Any checksum-authenticated non-current record domain is hard semantic
+	// corruption rather than a truncatable tail.
+	recoveryJournalMagic = "VJOURNAL"
+	recoveryRecordMagic  = uint32(0x44455256) // "VRED", little-endian.
 
 	// recoveryJournalFlagSealedCapacity marks Capacity as an immutable physical
 	// certificate. It occupies the current header's reserved flags word; every
@@ -121,37 +111,32 @@ const (
 	recoveryRecordKindDelete = uint16(2)
 	// recoveryRecordKindBatch marks a group-commit record: a single sequence and
 	// generation covering an ordered list of logical mutation entries, framed by
-	// one CRC. It is the group-commit primitive — the whole record is durable after
-	// one sync, and a torn append fails framing so recovery replays either every
-	// entry or none. A multi-document Update rides it; a future group of
-	// independent acknowledgements sharing one sync is the same record with
-	// unrelated entries.
+	// one CRC. The whole logical record is durable after one sync, and a torn
+	// append is rejected before any entry is admitted for replay.
 	recoveryRecordKindBatch = uint16(3)
-	// recoveryRecordKindScalarPatch marks a compact existing-key replacement
-	// carried only as an entry inside a batch record. Its Value is the new
-	// canonical integer, bool, or null spelling; ScalarPatch identifies the old
-	// spelling in the canonical document and seals the expected complete result.
-	// It is deliberately not a top-level record kind.
-	recoveryRecordKindScalarPatch = uint16(4)
 	// recoveryRecordKindConditionalBatch marks a prepare-time batch whose body is
 	// the ordinary batch entry grammar prefixed by a 32-byte conditional header
 	// (MarkerID, MarkerEpoch, TxnID). One sequence, one generation, one CRC —
 	// identical framing discipline to kind 3. Decide-time resolution is not this
 	// package's job; decode surfaces the conditional header to the replay caller.
-	recoveryRecordKindConditionalBatch = uint16(5)
+	recoveryRecordKindConditionalBatch = uint16(4)
+	// recoveryRecordKindDeltaBatch marks an ordinary buffered-journal delta. Its
+	// entries represent consecutive logical generations ending at the record's
+	// Generation. A distinct authenticated top-level kind keeps those replay
+	// semantics separate from the one-generation atomic batch grammar.
+	recoveryRecordKindDeltaBatch = uint16(5)
 
 	// RecoveryRecordKindPut, RecoveryRecordKindDelete, RecoveryRecordKindBatch,
-	// RecoveryRecordKindScalarPatch, and RecoveryRecordKindConditionalBatch are
-	// the exported record kinds a store passes to Append/AppendBatch/
-	// AppendConditionalBatch and matches on during Replay. ScalarPatch is
-	// batch-entry-only; EncodeRecoveryRecord and DecodeRecoveryRecord reject it as
-	// a standalone record. ConditionalBatch is top-level and conditional-format-
-	// only.
+	// RecoveryRecordKindConditionalBatch, and RecoveryRecordKindDeltaBatch are
+	// the exported record kinds a store passes to append operations and matches
+	// on during Replay. Batch is one atomic generation, DeltaBatch is a
+	// consecutive-generation put/delete sequence, and ConditionalBatch is one
+	// conditional atomic generation.
 	RecoveryRecordKindPut              = recoveryRecordKindPut
 	RecoveryRecordKindDelete           = recoveryRecordKindDelete
 	RecoveryRecordKindBatch            = recoveryRecordKindBatch
-	RecoveryRecordKindScalarPatch      = recoveryRecordKindScalarPatch
 	RecoveryRecordKindConditionalBatch = recoveryRecordKindConditionalBatch
+	RecoveryRecordKindDeltaBatch       = recoveryRecordKindDeltaBatch
 
 	// RecoveryBatchEntryHeaderSize is the fixed per-entry framing inside a batch
 	// record that precedes the entry's variable key and value bytes:
@@ -160,14 +145,6 @@ const (
 	// RecoveryConditionalHeaderSize is the fixed wire prefix of a conditional
 	// batch body: MarkerID (16) + MarkerEpoch (8) + TxnID (8).
 	RecoveryConditionalHeaderSize = 32
-	// RecoveryScalarPatchMetadataSize is the fixed wire framing inserted after a
-	// scalar-patch entry header and before its key and new scalar bytes. Byte 3 is
-	// reserved zero, keeping the checksum naturally aligned while making future
-	// format damage fail closed.
-	RecoveryScalarPatchMetadataSize = 8
-	// recoveryScalarPatchMaxCanonicalBytes is the widest scalar the compact lane
-	// accepts: a sign plus CanonicalIntMaxDigits. Bool and null are shorter.
-	recoveryScalarPatchMaxCanonicalBytes = CanonicalIntMaxDigits + 1
 )
 
 // RecoveryRecordPaddedSize returns the on-disk byte cost of one record whose key
@@ -216,8 +193,8 @@ var (
 	ErrRecoveryJournalRecord = errors.New("vibedb: invalid recovery journal record")
 	// errRecoveryJournalTruncatableTail distinguishes damage consistent with an
 	// incomplete/reordered append from a checksum-authenticated semantic error.
-	// Both still match ErrRecoveryJournalRecord for API compatibility; only this
-	// private marker may be swallowed by scanTail and Replay.
+	// Both match ErrRecoveryJournalRecord; only this private marker may be
+	// swallowed by scanTail and Replay.
 	errRecoveryJournalTruncatableTail = errors.New("vibedb: truncatable recovery journal tail")
 )
 
@@ -232,21 +209,15 @@ func recoveryJournalSemanticError(reason string) error {
 	return fmt.Errorf("%w: semantic: %s", ErrRecoveryJournalRecord, reason)
 }
 
-func recoveryJournalFormatSupported(formatVersion uint32) bool {
-	return formatVersion == RecoveryJournalFormatLegacy ||
-		formatVersion == RecoveryJournalFormatScalarPatch ||
-		formatVersion == RecoveryJournalFormatConditional
-}
-
 // RecoveryJournalHeader is the pointer-free format, identity, and geometry of
-// one journal file. FormatVersion gates the record grammar before scanning;
+// one journal file. Format gates the record grammar before scanning;
 // BaseGeneration is the store root generation the current live region builds
 // upon, and recovery replays only records strictly newer than it.
 // BaseSequence anchors monotonic-sequence validation so stale bytes left in the
 // preallocated region after a recycle can never be mistaken for live records —
 // the first live record must carry exactly BaseSequence+1.
 type RecoveryJournalHeader struct {
-	FormatVersion  uint32
+	Format         uint32
 	StoreID        [16]byte
 	JournalID      [16]byte
 	PageSize       uint32
@@ -258,9 +229,9 @@ type RecoveryJournalHeader struct {
 	// The bit is immutable across recycle and disables capacity growth.
 	SealedCapacity bool
 	// RecycleCount is strictly monotonic across header publications (recycle or
-	// compatible capacity growth). Recovery selects the valid header slot with
-	// the highest count, so a torn publication leaves the previous slot as the
-	// recovery point.
+	// capacity growth). Recovery selects the semantically valid header slot with
+	// the highest count. A checksum-invalid torn publication may fall back; a
+	// checksum-authenticated semantic error fails closed.
 	RecycleCount uint64
 }
 
@@ -294,35 +265,13 @@ type RecoveryRecord struct {
 	Conditional RecoveryConditionalHeader
 }
 
-// RecoveryScalarPatchMetadata is the pointer-free certificate carried by one
-// RecoveryRecordKindScalarPatch batch entry. CanonicalOffset and
-// OldScalarLength select the spelling to replace in the pre-patch canonical
-// document. ExpectedResultChecksum is PageChecksum over the complete canonical
-// document after replacement, so recovery can reject a stale key, wrong base,
-// or damaged patch without materializing a second journal payload.
-//
-// Its wire representation is fixed at RecoveryScalarPatchMetadataSize bytes;
-// the encoder does not serialize Go struct padding.
-type RecoveryScalarPatchMetadata struct {
-	CanonicalOffset        uint16
-	OldScalarLength        uint8
-	ExpectedResultChecksum uint32
-}
-
-var (
-	_ [RecoveryScalarPatchMetadataSize - int(unsafe.Sizeof(RecoveryScalarPatchMetadata{}))]byte
-	_ [int(unsafe.Sizeof(RecoveryScalarPatchMetadata{})) - RecoveryScalarPatchMetadataSize]byte
-)
-
-// RecoveryBatchEntry is one put, delete, or compact scalar replacement inside
-// a batch record. Key and Value borrow the decode buffer, exactly like
-// RecoveryRecord's own fields. For RecoveryRecordKindScalarPatch, Value is only
-// the new canonical scalar spelling and ScalarPatch carries its patch metadata.
+// RecoveryBatchEntry is one put or delete inside an atomic, conditional, or
+// delta batch. Key and Value borrow the decode buffer, exactly like
+// RecoveryRecord's own fields.
 type RecoveryBatchEntry struct {
-	Kind        uint16
-	Key         []byte
-	Value       []byte
-	ScalarPatch RecoveryScalarPatchMetadata
+	Kind  uint16
+	Key   []byte
+	Value []byte
 }
 
 // recoveryRecordPadded returns the sector-padded on-disk size of a record whose
@@ -381,99 +330,39 @@ func checkedRecoveryRecordPadded(
 	return checkedRecoveryPadRaw(sectorSize, raw)
 }
 
-func recoveryScalarPatchValueValid(value []byte) bool {
-	switch len(value) {
-	case 4:
-		if value[0] == 't' && value[1] == 'r' &&
-			value[2] == 'u' && value[3] == 'e' {
-			return true
-		}
-		if value[0] == 'n' && value[1] == 'u' &&
-			value[2] == 'l' && value[3] == 'l' {
-			return true
-		}
-	case 5:
-		if value[0] == 'f' && value[1] == 'a' && value[2] == 'l' &&
-			value[3] == 's' && value[4] == 'e' {
-			return true
-		}
-	}
-	_, integer := CanonicalIntValue(value)
-	return integer
-}
-
-func recoveryScalarPatchValid(
-	metadata RecoveryScalarPatchMetadata, value []byte,
-) bool {
-	oldLength := uint32(metadata.OldScalarLength)
-	if oldLength == 0 ||
-		oldLength > recoveryScalarPatchMaxCanonicalBytes ||
-		len(value) == 0 || len(value) > recoveryScalarPatchMaxCanonicalBytes ||
-		!recoveryScalarPatchValueValid(value) {
-		return false
-	}
-	// A uint16 offset can address a byte anywhere in one 64-KiB canonical
-	// document. Both the removed and inserted spellings must end within that
-	// same representable window; recovery can then use ordinary int slicing
-	// without an offset-plus-length wrap or an ambiguous widened coordinate.
-	const canonicalWindow = uint32(1) << 16
-	offset := uint32(metadata.CanonicalOffset)
-	return offset+oldLength <= canonicalWindow &&
-		offset+uint32(len(value)) <= canonicalWindow
-}
-
-func recoveryBatchEntryMetadataSize(
-	entry RecoveryBatchEntry,
-) (uint64, bool) {
-	switch entry.Kind {
-	case recoveryRecordKindPut, recoveryRecordKindDelete:
-		if entry.ScalarPatch != (RecoveryScalarPatchMetadata{}) {
-			return 0, false
-		}
-		return 0, true
-	case recoveryRecordKindScalarPatch:
-		if !recoveryScalarPatchValid(entry.ScalarPatch, entry.Value) {
-			return 0, false
-		}
-		return RecoveryScalarPatchMetadataSize, true
-	default:
-		return 0, false
-	}
-}
-
 func recoveryBatchEntriesAllowed(
-	formatVersion uint32, entries []RecoveryBatchEntry,
+	recordKind uint16, entries []RecoveryBatchEntry,
 ) bool {
-	if !recoveryJournalFormatSupported(formatVersion) {
+	if recordKind != recoveryRecordKindBatch &&
+		recordKind != recoveryRecordKindDeltaBatch &&
+		recordKind != recoveryRecordKindConditionalBatch {
 		return false
 	}
 	for i := range entries {
-		switch entries[i].Kind {
-		case recoveryRecordKindPut, recoveryRecordKindDelete:
-			if entries[i].ScalarPatch != (RecoveryScalarPatchMetadata{}) {
-				return false
-			}
-		case recoveryRecordKindScalarPatch:
-			// Scalar-patch remains the scalar-patch format's lane only. The
-			// conditional journal format never coexists with it.
-			if formatVersion != RecoveryJournalFormatScalarPatch {
-				return false
-			}
-		default:
+		if !recoveryBatchEntryKindAllowed(recordKind, entries[i].Kind) {
+			return false
+		}
+		if recordKind != recoveryRecordKindDeltaBatch && i != 0 &&
+			bytes.Compare(entries[i-1].Key, entries[i].Key) >= 0 {
 			return false
 		}
 	}
 	return true
 }
 
-func checkedRecoveryBatchBodyAdd(
-	body, keyLen, valueLen uint64,
-) (uint64, bool) {
-	return checkedRecoveryBatchBodyAddMetadata(body, 0, keyLen, valueLen)
+func recoveryBatchEntryKindAllowed(recordKind, entryKind uint16) bool {
+	switch recordKind {
+	case recoveryRecordKindBatch, recoveryRecordKindConditionalBatch,
+		recoveryRecordKindDeltaBatch:
+		return entryKind == recoveryRecordKindPut ||
+			entryKind == recoveryRecordKindDelete
+	default:
+		return false
+	}
 }
 
-func checkedRecoveryBatchBodyAddMetadata(
-	body, metadataBytes, keyLen, valueLen uint64,
+func checkedRecoveryBatchBodyAdd(
+	body, keyLen, valueLen uint64,
 ) (uint64, bool) {
 	wireLimit := uint64(^uint32(0))
 	if keyLen == 0 || keyLen > wireLimit || valueLen > wireLimit {
@@ -482,10 +371,6 @@ func checkedRecoveryBatchBodyAddMetadata(
 	next, ok := checkedSizeAdd(
 		body, RecoveryBatchEntryHeaderSize, wireLimit,
 	)
-	if !ok {
-		return 0, false
-	}
-	next, ok = checkedSizeAdd(next, metadataBytes, wireLimit)
 	if !ok {
 		return 0, false
 	}
@@ -506,14 +391,13 @@ func checkedRecoveryBatchBodyLen(
 	}
 	var body uint64
 	for i := range entries {
-		metadataBytes, valid := recoveryBatchEntryMetadataSize(entries[i])
-		if !valid {
+		if entries[i].Kind != recoveryRecordKindPut &&
+			entries[i].Kind != recoveryRecordKindDelete {
 			return 0, false
 		}
 		var ok bool
-		body, ok = checkedRecoveryBatchBodyAddMetadata(
+		body, ok = checkedRecoveryBatchBodyAdd(
 			body,
-			metadataBytes,
 			uint64(len(entries[i].Key)),
 			uint64(len(entries[i].Value)),
 		)
@@ -527,6 +411,9 @@ func checkedRecoveryBatchBodyLen(
 func checkedRecoveryBatchRecordPaddedSize(
 	sectorSize uint32, entries []RecoveryBatchEntry,
 ) (int, bool) {
+	if !recoveryBatchEntriesAllowed(recoveryRecordKindBatch, entries) {
+		return 0, false
+	}
 	body, ok := checkedRecoveryBatchBodyLen(entries)
 	if !ok {
 		return 0, false
@@ -551,16 +438,16 @@ func checkedRecoveryBatchRecordPaddedSizeForBody(
 // RecoveryBatchPlan is an opaque, allocation-free sizing result for one batch
 // record. Preparing once lets a caller use the same validated layout for its
 // capacity decision, append, and byte accounting instead of rescanning every
-// entry at each step. A plan is bound to the journal feature version that
-// prepared it, preventing a scalar-enabled plan from crossing into a legacy
-// journal. Its fields are deliberately private: only this package can mint a
-// layout accepted by AppendPreparedBatch.
+// entry at each step. A plan is bound to the authenticated top-level record
+// kind that prepared it, preventing a consecutive-generation delta plan from
+// crossing into a one-generation atomic append. Its fields are deliberately
+// private: only this package can mint an accepted layout.
 type RecoveryBatchPlan struct {
-	formatVersion uint32
-	sectorSize    uint32
-	entryCount    int
-	bodyLen       uint64
-	padded        int
+	recordKind uint16
+	sectorSize uint32
+	entryCount int
+	bodyLen    uint64
+	padded     int
 }
 
 // PaddedSize returns the exact sector-padded bytes the prepared batch consumes.
@@ -569,15 +456,23 @@ func (p RecoveryBatchPlan) PaddedSize() int { return p.padded }
 func prepareRecoveryBatch(
 	sectorSize uint32, entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, bool) {
-	return prepareRecoveryBatchForFormat(
-		RecoveryJournalFormatScalarPatch, sectorSize, entries,
+	return prepareRecoveryBatchForKind(
+		recoveryRecordKindBatch, sectorSize, entries,
 	)
 }
 
-func prepareRecoveryBatchForFormat(
-	formatVersion, sectorSize uint32, entries []RecoveryBatchEntry,
+func prepareRecoveryDeltaBatch(
+	sectorSize uint32, entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, bool) {
-	if !recoveryBatchEntriesAllowed(formatVersion, entries) {
+	return prepareRecoveryBatchForKind(
+		recoveryRecordKindDeltaBatch, sectorSize, entries,
+	)
+}
+
+func prepareRecoveryBatchForKind(
+	recordKind uint16, sectorSize uint32, entries []RecoveryBatchEntry,
+) (RecoveryBatchPlan, bool) {
+	if !recoveryBatchEntriesAllowed(recordKind, entries) {
 		return RecoveryBatchPlan{}, false
 	}
 	body, ok := checkedRecoveryBatchBodyLen(entries)
@@ -591,18 +486,20 @@ func prepareRecoveryBatchForFormat(
 		return RecoveryBatchPlan{}, false
 	}
 	return RecoveryBatchPlan{
-		formatVersion: formatVersion,
-		sectorSize:    sectorSize,
-		entryCount:    len(entries),
-		bodyLen:       body,
-		padded:        padded,
+		recordKind: recordKind,
+		sectorSize: sectorSize,
+		entryCount: len(entries),
+		bodyLen:    body,
+		padded:     padded,
 	}, true
 }
 
 func (p RecoveryBatchPlan) validFor(
 	sectorSize uint32, entryCount int,
 ) bool {
-	if !recoveryJournalFormatSupported(p.formatVersion) ||
+	if (p.recordKind != recoveryRecordKindBatch &&
+		p.recordKind != recoveryRecordKindDeltaBatch &&
+		p.recordKind != recoveryRecordKindConditionalBatch) ||
 		p.sectorSize != sectorSize || p.entryCount != entryCount ||
 		p.entryCount <= 0 || p.bodyLen > uint64(^uint32(0)) ||
 		p.padded <= 0 {
@@ -614,10 +511,10 @@ func (p RecoveryBatchPlan) validFor(
 	return ok && padded == p.padded
 }
 
-func (p RecoveryBatchPlan) validForFormat(
-	formatVersion, sectorSize uint32, entryCount int,
+func (p RecoveryBatchPlan) validForKind(
+	recordKind uint16, sectorSize uint32, entryCount int,
 ) bool {
-	return p.formatVersion == formatVersion &&
+	return p.recordKind == recordKind &&
 		p.validFor(sectorSize, entryCount)
 }
 
@@ -643,13 +540,22 @@ func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEnt
 	return padded
 }
 
+// RecoveryDeltaBatchRecordPaddedSize returns the on-disk byte cost of one
+// consecutive-generation put/delete delta batch.
+func RecoveryDeltaBatchRecordPaddedSize(
+	sectorSize uint32, entries []RecoveryBatchEntry,
+) int {
+	plan, ok := prepareRecoveryDeltaBatch(sectorSize, entries)
+	if !ok {
+		return maxIntValue
+	}
+	return plan.padded
+}
+
 // RecoveryBatchRecordPaddedSizeForPayload returns the exact padded record size
 // for a batch with entryCount fixed entry headers and totalPayloadBytes bytes
-// after those headers. For legacy put/delete entries that payload is key+value;
-// callers estimating metadata-bearing entry kinds must add their metadata bytes
-// themselves. Consequently this is not an upper bound for scalar-patch batches
-// when passed only their key+value arena size. Invalid or unrepresentable inputs
-// saturate at the largest int.
+// after those headers. That payload is the sum of key and value bytes. Invalid
+// or unrepresentable inputs saturate at the largest int.
 func RecoveryBatchRecordPaddedSizeForPayload(
 	sectorSize uint32, entryCount, totalPayloadBytes int,
 ) int {
@@ -690,8 +596,8 @@ func RecoveryBatchRecordPaddedSizeForPayload(
 // validateRecoveryJournalHeader enforces the geometry invariants every header
 // must satisfy regardless of provenance.
 func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {
-	if !recoveryJournalFormatSupported(h.FormatVersion) {
-		return fmt.Errorf("%w: format version", ErrRecoveryJournalCorrupt)
+	if h.Format != RecoveryJournalFormat {
+		return fmt.Errorf("%w: format", ErrRecoveryJournalCorrupt)
 	}
 	if h.StoreID == ([16]byte{}) || h.JournalID == ([16]byte{}) {
 		return fmt.Errorf("%w: zero identity", ErrRecoveryJournalCorrupt)
@@ -736,7 +642,7 @@ func EncodeRecoveryJournalHeader(dst []byte, h RecoveryJournalHeader) ([]byte, e
 	sector := dst[:RecoveryJournalHeaderSize]
 	clear(sector)
 	copy(sector[0:8], recoveryJournalMagic)
-	binary.LittleEndian.PutUint32(sector[8:12], h.FormatVersion)
+	binary.LittleEndian.PutUint32(sector[8:12], h.Format)
 	binary.LittleEndian.PutUint32(sector[12:16], RecoveryJournalHeaderSize)
 	copy(sector[16:32], h.StoreID[:])
 	copy(sector[32:48], h.JournalID[:])
@@ -772,12 +678,12 @@ func DecodeRecoveryJournalHeader(src []byte) (RecoveryJournalHeader, error) {
 		PageChecksum(src[:RecoveryJournalHeaderSize-8]) != checksum {
 		return RecoveryJournalHeader{}, fmt.Errorf("%w: checksum", ErrRecoveryJournalCorrupt)
 	}
-	formatVersion := binary.LittleEndian.Uint32(src[8:12])
-	if !recoveryJournalFormatSupported(formatVersion) ||
+	format := binary.LittleEndian.Uint32(src[8:12])
+	if format != RecoveryJournalFormat ||
 		binary.LittleEndian.Uint32(src[12:16]) != RecoveryJournalHeaderSize {
-		return RecoveryJournalHeader{}, fmt.Errorf("%w: version or header size", ErrRecoveryJournalCorrupt)
+		return RecoveryJournalHeader{}, fmt.Errorf("%w: format or header size", ErrRecoveryJournalCorrupt)
 	}
-	h := RecoveryJournalHeader{FormatVersion: formatVersion}
+	h := RecoveryJournalHeader{Format: format}
 	copy(h.StoreID[:], src[16:32])
 	copy(h.JournalID[:], src[32:48])
 	h.PageSize = binary.LittleEndian.Uint32(src[48:52])
@@ -798,6 +704,23 @@ func DecodeRecoveryJournalHeader(src []byte) (RecoveryJournalHeader, error) {
 		return RecoveryJournalHeader{}, err
 	}
 	return h, nil
+}
+
+// recoveryJournalHeaderAuthenticated reports whether a complete header sector
+// carries a self-consistent checksum and complement. Header selection may
+// ignore an uninitialized or torn alternate slot, but it must never fall back
+// past a checksum-authenticated semantic error: doing so could select an older
+// capacity/base and hide records acknowledged under the newer header.
+func recoveryJournalHeaderAuthenticated(src []byte) bool {
+	if len(src) < RecoveryJournalHeaderSize {
+		return false
+	}
+	src = src[:RecoveryJournalHeaderSize]
+	checksum := binary.LittleEndian.Uint32(
+		src[RecoveryJournalHeaderSize-8 : RecoveryJournalHeaderSize-4],
+	)
+	return binary.LittleEndian.Uint32(src[RecoveryJournalHeaderSize-4:]) == ^checksum &&
+		PageChecksum(src[:RecoveryJournalHeaderSize-8]) == checksum
 }
 
 // EncodeRecoveryRecord writes one sector-padded record into dst and returns the
@@ -843,28 +766,6 @@ func EncodeRecoveryRecord(
 	return padded, nil
 }
 
-func encodeRecoveryScalarPatchMetadata(
-	dst []byte, metadata RecoveryScalarPatchMetadata,
-) {
-	binary.LittleEndian.PutUint16(dst[0:2], metadata.CanonicalOffset)
-	dst[2] = metadata.OldScalarLength
-	// dst[3] is reserved zero; the enclosing batch buffer was cleared.
-	binary.LittleEndian.PutUint32(dst[4:8], metadata.ExpectedResultChecksum)
-}
-
-func decodeRecoveryScalarPatchMetadata(
-	src []byte,
-) (RecoveryScalarPatchMetadata, bool) {
-	if len(src) < RecoveryScalarPatchMetadataSize || src[3] != 0 {
-		return RecoveryScalarPatchMetadata{}, false
-	}
-	return RecoveryScalarPatchMetadata{
-		CanonicalOffset:        binary.LittleEndian.Uint16(src[0:2]),
-		OldScalarLength:        src[2],
-		ExpectedResultChecksum: binary.LittleEndian.Uint32(src[4:8]),
-	}, true
-}
-
 func encodeRecoveryBatchRecordPrepared(
 	dst []byte, sectorSize uint32, rec RecoveryRecord,
 	plan RecoveryBatchPlan,
@@ -872,8 +773,15 @@ func encodeRecoveryBatchRecordPrepared(
 	if rec.Sequence == 0 || rec.Generation == 0 {
 		return 0, fmt.Errorf("%w: zero sequence or generation", ErrInvalidWrite)
 	}
-	if !plan.validFor(sectorSize, len(rec.Entries)) {
+	if rec.Kind != recoveryRecordKindBatch &&
+		rec.Kind != recoveryRecordKindDeltaBatch ||
+		!plan.validForKind(rec.Kind, sectorSize, len(rec.Entries)) ||
+		!recoveryBatchEntriesAllowed(rec.Kind, rec.Entries) {
 		return 0, fmt.Errorf("%w: batch plan", ErrInvalidWrite)
+	}
+	if rec.Kind == recoveryRecordKindDeltaBatch &&
+		rec.Generation < uint64(len(rec.Entries)) {
+		return 0, fmt.Errorf("%w: delta batch generation range", ErrInvalidWrite)
 	}
 	if len(dst) < plan.padded {
 		return 0, fmt.Errorf("%w: batch record buffer has %d bytes, need %d",
@@ -882,7 +790,7 @@ func encodeRecoveryBatchRecordPrepared(
 	buf := dst[:plan.padded]
 	clear(buf)
 	binary.LittleEndian.PutUint32(buf[0:4], recoveryRecordMagic)
-	binary.LittleEndian.PutUint16(buf[4:6], recoveryRecordKindBatch)
+	binary.LittleEndian.PutUint16(buf[4:6], rec.Kind)
 	// buf[6:8] reserved zero.
 	binary.LittleEndian.PutUint64(buf[8:16], rec.Sequence)
 	binary.LittleEndian.PutUint64(buf[16:24], rec.Generation)
@@ -892,26 +800,12 @@ func encodeRecoveryBatchRecordPrepared(
 	bodyEnd := cursor + plan.bodyLen
 	for i := range rec.Entries {
 		entry := rec.Entries[i]
-		if entry.Kind == recoveryRecordKindScalarPatch &&
-			plan.formatVersion != RecoveryJournalFormatScalarPatch {
-			return 0, fmt.Errorf(
-				"%w: scalar-patch entry outside scalar-patch journal",
-				ErrInvalidWrite,
-			)
-		}
-		metadataBytes, valid := recoveryBatchEntryMetadataSize(entry)
-		if !valid {
-			return 0, fmt.Errorf(
-				"%w: batch entry kind or scalar-patch metadata",
-				ErrInvalidWrite,
-			)
-		}
 		if len(entry.Key) == 0 ||
 			uint64(len(entry.Key)) > uint64(^uint32(0)) ||
 			uint64(len(entry.Value)) > uint64(^uint32(0)) {
 			return 0, fmt.Errorf("%w: batch entry key or value length", ErrInvalidWrite)
 		}
-		entryEnd := cursor + RecoveryBatchEntryHeaderSize + metadataBytes +
+		entryEnd := cursor + RecoveryBatchEntryHeaderSize +
 			uint64(len(entry.Key)) + uint64(len(entry.Value))
 		if entryEnd > bodyEnd {
 			return 0, fmt.Errorf("%w: batch plan no longer matches entries", ErrInvalidWrite)
@@ -921,13 +815,6 @@ func encodeRecoveryBatchRecordPrepared(
 		binary.LittleEndian.PutUint32(buf[cursor+4:cursor+8], uint32(len(entry.Key)))
 		binary.LittleEndian.PutUint32(buf[cursor+8:cursor+12], uint32(len(entry.Value)))
 		cursor += RecoveryBatchEntryHeaderSize
-		if entry.Kind == recoveryRecordKindScalarPatch {
-			encodeRecoveryScalarPatchMetadata(
-				buf[cursor:cursor+RecoveryScalarPatchMetadataSize],
-				entry.ScalarPatch,
-			)
-			cursor += RecoveryScalarPatchMetadataSize
-		}
 		cursor += uint64(copy(buf[cursor:], entry.Key))
 		cursor += uint64(copy(buf[cursor:], entry.Value))
 	}
@@ -949,18 +836,29 @@ func encodeRecoveryBatchRecordPrepared(
 func DecodeRecoveryRecord(
 	src []byte, sectorSize uint32, expectedSequence uint64,
 ) (RecoveryRecord, int, error) {
+	if expectedSequence == 0 {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"record sequence space exhausted",
+		)
+	}
 	if len(src) < RecoveryJournalRecordPrefixSize+RecoveryJournalRecordTrailerSize {
 		return RecoveryRecord{}, 0, recoveryJournalTailError("short record")
 	}
-	if binary.LittleEndian.Uint32(src[0:4]) != recoveryRecordMagic {
+	magic := binary.LittleEndian.Uint32(src[0:4])
+	if magic != recoveryRecordMagic {
+		if recoveryRecordHasAuthenticatedCurrentLayout(src) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"checksum-valid non-current record domain",
+			)
+		}
 		return RecoveryRecord{}, 0, recoveryJournalTailError("magic")
 	}
 	kind := binary.LittleEndian.Uint16(src[4:6])
-	if binary.LittleEndian.Uint16(src[6:8]) != 0 {
-		return RecoveryRecord{}, 0, recoveryJournalTailError("reserved")
-	}
-	if kind == recoveryRecordKindBatch {
-		return decodeRecoveryBatchRecord(src, sectorSize, expectedSequence)
+	if kind == recoveryRecordKindBatch ||
+		kind == recoveryRecordKindDeltaBatch {
+		return decodeRecoveryBatchRecord(
+			src, sectorSize, expectedSequence, kind,
+		)
 	}
 	if kind == recoveryRecordKindConditionalBatch {
 		return decodeRecoveryConditionalBatchRecord(
@@ -968,12 +866,18 @@ func DecodeRecoveryRecord(
 		)
 	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
+	if sequence != expectedSequence && sequence != 0 {
+		return RecoveryRecord{}, 0, recoveryJournalTailError("sequence")
+	}
+	if kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete &&
+		recoveryRecordHasAuthenticatedCurrentLayout(src) {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid unknown record kind",
+		)
+	}
 	generation := binary.LittleEndian.Uint64(src[16:24])
 	keyLen := binary.LittleEndian.Uint32(src[24:28])
 	valueLen := binary.LittleEndian.Uint32(src[28:32])
-	if sequence != expectedSequence || generation == 0 || keyLen == 0 {
-		return RecoveryRecord{}, 0, recoveryJournalTailError("sequence or framing")
-	}
 	keyStart := uint64(RecoveryJournalRecordPrefixSize)
 	valueStart := keyStart + uint64(keyLen)
 	bodyEnd := valueStart + uint64(valueLen)
@@ -984,7 +888,18 @@ func DecodeRecoveryRecord(
 	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
 	if stored != checksum ||
 		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
+		if recoveryBatchLayoutAuthenticated(src) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"standalone kind authenticates batch layout",
+			)
+		}
 		return RecoveryRecord{}, 0, recoveryJournalTailError("checksum")
+	}
+	if sequence == 0 || generation == 0 || keyLen == 0 ||
+		binary.LittleEndian.Uint16(src[6:8]) != 0 {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid standalone record framing",
+		)
 	}
 	if kind != recoveryRecordKindPut && kind != recoveryRecordKindDelete {
 		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
@@ -1009,20 +924,70 @@ func DecodeRecoveryRecord(
 	return rec, padded, nil
 }
 
+// recoveryRecordHasAuthenticatedCurrentLayout distinguishes arbitrary/torn
+// tail bytes from a complete checksummed current record whose authenticated
+// kind word was forged or corrupted. Silently truncating the latter could omit
+// an acknowledged mutation. The layouts are bounded by their own u32 framing;
+// this helper authenticates only and leaves semantic validation to the decoder
+// selected by the actual kind.
+func recoveryRecordHasAuthenticatedCurrentLayout(src []byte) bool {
+	return recoveryStandaloneLayoutAuthenticated(src) ||
+		recoveryBatchLayoutAuthenticated(src)
+}
+
+func recoveryRecordChecksumValidAt(src []byte, bodyEnd uint64) bool {
+	if len(src) < RecoveryJournalRecordPrefixSize+RecoveryJournalRecordTrailerSize {
+		return false
+	}
+	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
+		return false
+	}
+	checksum := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
+	return binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) == ^checksum &&
+		PageChecksum(src[:bodyEnd]) == checksum
+}
+
+func recoveryStandaloneLayoutAuthenticated(src []byte) bool {
+	if len(src) < RecoveryJournalRecordPrefixSize+RecoveryJournalRecordTrailerSize {
+		return false
+	}
+	// Standalone Put/Delete layout.
+	standaloneEnd := uint64(RecoveryJournalRecordPrefixSize) +
+		uint64(binary.LittleEndian.Uint32(src[24:28])) +
+		uint64(binary.LittleEndian.Uint32(src[28:32]))
+	return recoveryRecordChecksumValidAt(src, standaloneEnd)
+}
+
+func recoveryBatchLayoutAuthenticated(src []byte) bool {
+	if len(src) < RecoveryJournalRecordPrefixSize+RecoveryJournalRecordTrailerSize {
+		return false
+	}
+	// Batch, DeltaBatch, and ConditionalBatch share the bodyLen word.
+	batchEnd := uint64(RecoveryJournalRecordPrefixSize) +
+		uint64(binary.LittleEndian.Uint32(src[28:32]))
+	return recoveryRecordChecksumValidAt(src, batchEnd)
+}
+
 // decodeRecoveryBatchRecord validates one batch record at the start of src. The
-// single CRC over the prefix and every framed entry is what gives the batch its
-// all-or-nothing recovery: a torn append damages the record's own tail, the CRC
-// fails, and replay truncates before it — so no entry of a half-appended batch
-// is ever replayed, and every entry of a fully-synced one is.
+// single CRC over the prefix and every framed entry makes append admission
+// all-or-nothing: a torn append damages the record's own tail, the CRC fails,
+// and replay truncates before any entry from that record is admitted.
 func decodeRecoveryBatchRecord(
 	src []byte, sectorSize uint32, expectedSequence uint64,
+	recordKind uint16,
 ) (RecoveryRecord, int, error) {
+	if recordKind != recoveryRecordKindBatch &&
+		recordKind != recoveryRecordKindDeltaBatch {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"unsupported batch record kind",
+		)
+	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
 	generation := binary.LittleEndian.Uint64(src[16:24])
 	entryCount := binary.LittleEndian.Uint32(src[24:28])
 	bodyLen := binary.LittleEndian.Uint32(src[28:32])
-	if sequence != expectedSequence || generation == 0 || entryCount == 0 {
-		return RecoveryRecord{}, 0, recoveryJournalTailError("batch sequence or framing")
+	if sequence != expectedSequence && sequence != 0 {
+		return RecoveryRecord{}, 0, recoveryJournalTailError("batch sequence")
 	}
 	bodyEnd := uint64(RecoveryJournalRecordPrefixSize) + uint64(bodyLen)
 	if bodyEnd+RecoveryJournalRecordTrailerSize > uint64(len(src)) {
@@ -1032,7 +997,18 @@ func decodeRecoveryBatchRecord(
 	stored := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
 	if stored != checksum ||
 		binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum {
+		if recoveryStandaloneLayoutAuthenticated(src) {
+			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+				"batch kind authenticates standalone layout",
+			)
+		}
 		return RecoveryRecord{}, 0, recoveryJournalTailError("batch checksum")
+	}
+	if sequence == 0 || generation == 0 || entryCount == 0 ||
+		binary.LittleEndian.Uint16(src[6:8]) != 0 {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid batch framing",
+		)
 	}
 	// Every entry has a fixed header and a non-empty key. Prove the peer-chosen
 	// count fits both the framed body and native slice capacity before make;
@@ -1059,9 +1035,7 @@ func decodeRecoveryBatchRecord(
 		}
 		entryKind := binary.LittleEndian.Uint16(src[cursor : cursor+2])
 		if binary.LittleEndian.Uint16(src[cursor+2:cursor+4]) != 0 ||
-			(entryKind != recoveryRecordKindPut &&
-				entryKind != recoveryRecordKindDelete &&
-				entryKind != recoveryRecordKindScalarPatch) {
+			!recoveryBatchEntryKindAllowed(recordKind, entryKind) {
 			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
 				"checksum-valid batch entry kind or reserved",
 			)
@@ -1074,25 +1048,6 @@ func decodeRecoveryBatchRecord(
 			)
 		}
 		payloadStart := cursor + RecoveryBatchEntryHeaderSize
-		var scalarPatch RecoveryScalarPatchMetadata
-		if entryKind == recoveryRecordKindScalarPatch {
-			metadataEnd := payloadStart + RecoveryScalarPatchMetadataSize
-			if metadataEnd > bodyEnd {
-				return RecoveryRecord{}, 0, recoveryJournalSemanticError(
-					"checksum-valid scalar-patch metadata overruns body",
-				)
-			}
-			var metadataOK bool
-			scalarPatch, metadataOK = decodeRecoveryScalarPatchMetadata(
-				src[payloadStart:metadataEnd],
-			)
-			if !metadataOK {
-				return RecoveryRecord{}, 0, recoveryJournalSemanticError(
-					"checksum-valid scalar-patch metadata",
-				)
-			}
-			payloadStart = metadataEnd
-		}
 		keyStart := payloadStart
 		valueStart := keyStart + keyLen
 		entryEnd := valueStart + valueLen
@@ -1101,24 +1056,22 @@ func decodeRecoveryBatchRecord(
 				"checksum-valid batch entry overruns body",
 			)
 		}
-		value := src[valueStart:entryEnd]
-		if entryKind == recoveryRecordKindScalarPatch &&
-			!recoveryScalarPatchValid(scalarPatch, value) {
-			return RecoveryRecord{}, 0, recoveryJournalSemanticError(
-				"checksum-valid scalar-patch bounds or value",
-			)
-		}
 		entries = append(entries, RecoveryBatchEntry{
-			Kind:        entryKind,
-			Key:         src[keyStart:valueStart],
-			Value:       value,
-			ScalarPatch: scalarPatch,
+			Kind:  entryKind,
+			Key:   src[keyStart:valueStart],
+			Value: src[valueStart:entryEnd],
 		})
 		cursor = entryEnd
 	}
 	if cursor != bodyEnd {
 		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
 			"checksum-valid batch body length mismatch",
+		)
+	}
+	if recordKind == recoveryRecordKindDeltaBatch &&
+		generation < uint64(entryCount) {
+		return RecoveryRecord{}, 0, recoveryJournalSemanticError(
+			"checksum-valid delta batch generation range",
 		)
 	}
 	padded, ok := checkedRecoveryPadRaw(
@@ -1132,50 +1085,205 @@ func decodeRecoveryBatchRecord(
 	rec := RecoveryRecord{
 		Sequence:   sequence,
 		Generation: generation,
-		Kind:       recoveryRecordKindBatch,
+		Kind:       recordKind,
 		Entries:    entries,
+	}
+	if err := validateRecoveryRecord(rec); err != nil {
+		return RecoveryRecord{}, 0, err
 	}
 	return rec, padded, nil
 }
 
-func validateRecoveryRecordForFormat(
-	formatVersion uint32, rec RecoveryRecord,
-) error {
-	if !recoveryJournalFormatSupported(formatVersion) {
-		return recoveryJournalSemanticError("unsupported journal format version")
-	}
+func validateRecoveryRecord(rec RecoveryRecord) error {
 	switch rec.Kind {
 	case recoveryRecordKindPut, recoveryRecordKindDelete:
 		return nil
 	case recoveryRecordKindBatch:
+		if !recoveryBatchEntriesAllowed(rec.Kind, rec.Entries) {
+			return recoveryJournalSemanticError(
+				"atomic batch entries are not canonical unique-key order",
+			)
+		}
+		return nil
+	case recoveryRecordKindDeltaBatch:
+		if len(rec.Entries) == 0 ||
+			rec.Generation < uint64(len(rec.Entries)) {
+			return recoveryJournalSemanticError(
+				"invalid delta-batch generation range",
+			)
+		}
 		for i := range rec.Entries {
-			if rec.Entries[i].Kind != recoveryRecordKindScalarPatch {
-				continue
-			}
-			if formatVersion != RecoveryJournalFormatScalarPatch {
+			if rec.Entries[i].Kind != recoveryRecordKindPut &&
+				rec.Entries[i].Kind != recoveryRecordKindDelete {
 				return recoveryJournalSemanticError(
-					"scalar-patch entry outside scalar-patch journal",
+					"unsupported delta-batch entry",
 				)
 			}
 		}
 		return nil
 	case recoveryRecordKindConditionalBatch:
-		if formatVersion != RecoveryJournalFormatConditional {
+		if !recoveryBatchEntriesAllowed(rec.Kind, rec.Entries) {
 			return recoveryJournalSemanticError(
-				"conditional-batch record outside conditional journal",
+				"conditional batch entries are not canonical unique-key order",
 			)
-		}
-		for i := range rec.Entries {
-			if rec.Entries[i].Kind == recoveryRecordKindScalarPatch {
-				return recoveryJournalSemanticError(
-					"scalar-patch entry in conditional journal",
-				)
-			}
 		}
 		return nil
 	default:
 		return recoveryJournalSemanticError("unsupported record kind")
 	}
+}
+
+type recoveryRecordFamily uint8
+
+const (
+	recoveryRecordFamilyEmpty recoveryRecordFamily = iota
+	recoveryRecordFamilyAtomic
+	recoveryRecordFamilyDelta
+)
+
+type recoveryConditionalChain struct {
+	markerID [16]byte
+	epoch    uint64
+	lastTxn  uint64
+	set      bool
+}
+
+func (chain recoveryConditionalChain) advance(
+	rec RecoveryRecord,
+) (recoveryConditionalChain, error) {
+	if rec.Kind != recoveryRecordKindConditionalBatch {
+		return chain, nil
+	}
+	if !chain.set {
+		return recoveryConditionalChain{
+			markerID: rec.Conditional.MarkerID,
+			epoch:    rec.Conditional.MarkerEpoch,
+			lastTxn:  rec.Conditional.TxnID,
+			set:      true,
+		}, nil
+	}
+	if rec.Conditional.MarkerID != chain.markerID ||
+		rec.Conditional.MarkerEpoch != chain.epoch ||
+		rec.Conditional.TxnID <= chain.lastTxn {
+		return recoveryConditionalChain{}, recoveryJournalSemanticError(
+			"conditional records do not share one marker epoch and increasing transaction ids",
+		)
+	}
+	chain.lastTxn = rec.Conditional.TxnID
+	return chain, nil
+}
+
+func recoveryRecordFamilyForKind(kind uint16) (recoveryRecordFamily, bool) {
+	switch kind {
+	case recoveryRecordKindPut, recoveryRecordKindDelete,
+		recoveryRecordKindBatch, recoveryRecordKindConditionalBatch:
+		return recoveryRecordFamilyAtomic, true
+	case recoveryRecordKindDeltaBatch:
+		return recoveryRecordFamilyDelta, true
+	default:
+		return recoveryRecordFamilyEmpty, false
+	}
+}
+
+func recoveryRecordBuildsAfterBase(rec RecoveryRecord, baseGeneration uint64) bool {
+	if rec.Kind != recoveryRecordKindDeltaBatch {
+		return rec.Generation > baseGeneration
+	}
+	count := uint64(len(rec.Entries))
+	return count != 0 && rec.Generation >= count &&
+		rec.Generation-count >= baseGeneration
+}
+
+func nextRecoveryRecordFamily(
+	current recoveryRecordFamily, kind uint16,
+) (recoveryRecordFamily, bool) {
+	next, ok := recoveryRecordFamilyForKind(kind)
+	if !ok || current != recoveryRecordFamilyEmpty && current != next {
+		return recoveryRecordFamilyEmpty, false
+	}
+	return next, true
+}
+
+func validateRecoveryRecordInWindow(
+	rec RecoveryRecord,
+	baseGeneration uint64,
+	current recoveryRecordFamily,
+	deltaEndGeneration uint64,
+	atomicLastGeneration uint64,
+	atomicLastKind uint16,
+) (recoveryRecordFamily, uint64, uint64, uint16, error) {
+	if !recoveryRecordBuildsAfterBase(rec, baseGeneration) {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryJournalSemanticError(
+			"record generation does not build beyond journal base",
+		)
+	}
+	next, ok := nextRecoveryRecordFamily(current, rec.Kind)
+	if !ok {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryJournalSemanticError(
+			"mixed recovery-record families in one live window",
+		)
+	}
+	if next == recoveryRecordFamilyAtomic {
+		valid := false
+		if current == recoveryRecordFamilyEmpty {
+			valid = baseGeneration != ^uint64(0) &&
+				rec.Generation == baseGeneration+1
+		} else if rec.Generation == atomicLastGeneration {
+			// A conditional prepare may abort without publishing its generation;
+			// the immediately following record may therefore reuse it.
+			valid = atomicLastKind == recoveryRecordKindConditionalBatch
+		} else {
+			valid = atomicLastGeneration != ^uint64(0) &&
+				rec.Generation == atomicLastGeneration+1
+		}
+		if !valid {
+			return recoveryRecordFamilyEmpty, 0, 0, 0,
+				recoveryJournalSemanticError(
+					"atomic records do not form a valid generation chain",
+				)
+		}
+		return next, deltaEndGeneration, rec.Generation, rec.Kind, nil
+	}
+	chainEnd := baseGeneration
+	if current == recoveryRecordFamilyDelta {
+		chainEnd = deltaEndGeneration
+	}
+	count := uint64(len(rec.Entries))
+	firstGeneration := rec.Generation - count + 1
+	if chainEnd == ^uint64(0) || firstGeneration != chainEnd+1 {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryJournalSemanticError(
+			"delta batches do not form one contiguous generation chain",
+		)
+	}
+	return next, rec.Generation, atomicLastGeneration, atomicLastKind, nil
+}
+
+func (rj *RecoveryJournal) validateAppendRecord(
+	rec RecoveryRecord,
+) (recoveryRecordFamily, uint64, uint64, uint16, recoveryConditionalChain, error) {
+	if err := validateRecoveryRecord(rec); err != nil ||
+		!recoveryRecordBuildsAfterBase(rec, rj.header.BaseGeneration) {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryConditionalChain{}, fmt.Errorf(
+			"%w: record does not build beyond journal base", ErrInvalidWrite,
+		)
+	}
+	next, deltaEnd, atomicLastGeneration, atomicLastKind, err :=
+		validateRecoveryRecordInWindow(
+			rec, rj.header.BaseGeneration, rj.family, rj.deltaEndGeneration,
+			rj.atomicLastGeneration, rj.atomicLastKind,
+		)
+	if err != nil {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryConditionalChain{}, fmt.Errorf(
+			"%w: invalid recovery-record window: %v", ErrInvalidWrite, err,
+		)
+	}
+	conditional, err := rj.conditionalChain.advance(rec)
+	if err != nil {
+		return recoveryRecordFamilyEmpty, 0, 0, 0, recoveryConditionalChain{}, fmt.Errorf(
+			"%w: invalid conditional chain: %v", ErrInvalidWrite, err,
+		)
+	}
+	return next, deltaEnd, atomicLastGeneration, atomicLastKind, conditional, nil
 }
 
 // RecoveryJournal is the single-writer file-backed manager. It is owned by the
@@ -1184,6 +1292,17 @@ func validateRecoveryRecordForFormat(
 type RecoveryJournal struct {
 	file   *os.File
 	header RecoveryJournalHeader
+	// family is derived exclusively from authenticated live record kinds. One
+	// unrecycled window is either atomic (kinds 1/2/3/4) or delta (kind 5), never
+	// both; Recycle resets it with the window.
+	family recoveryRecordFamily
+	// deltaEndGeneration is the authenticated end of the current contiguous
+	// kind-5 chain. It advances only after a successful append and resets to the
+	// new base on recycle.
+	deltaEndGeneration   uint64
+	atomicLastGeneration uint64
+	atomicLastKind       uint16
+	conditionalChain     recoveryConditionalChain
 	// cursor is the in-memory byte offset within the record region (0-based
 	// from the region start) where the next record will be appended. It is
 	// derived by scanning on Open and reset to zero on Recycle; it is never
@@ -1402,7 +1521,19 @@ func openRecoveryJournal(
 		}
 		h, err := DecodeRecoveryJournalHeader(slots[slot][:])
 		if err != nil {
+			if recoveryJournalHeaderAuthenticated(slots[slot][:]) {
+				return nil, fmt.Errorf(
+					"%w: authenticated invalid header slot %d: %v",
+					ErrRecoveryJournalCorrupt, slot, err,
+				)
+			}
 			continue
+		}
+		if selected >= 0 && h.RecycleCount == header.RecycleCount && h != header {
+			return nil, fmt.Errorf(
+				"%w: conflicting equal-count header slots",
+				ErrRecoveryJournalCorrupt,
+			)
 		}
 		if selected < 0 || h.RecycleCount > header.RecycleCount {
 			selected = slot
@@ -1527,10 +1658,11 @@ func (rj *RecoveryJournal) writeHeader(slot uint32, header RecoveryJournalHeader
 	return nil
 }
 
-// writeRecoveryJournalFull preserves the journal's all-or-nothing cursor
-// contract when a faulty or unusual positional writer reports a short write
-// without an accompanying error. Callers advance in-memory header or record
-// state only after this helper succeeds.
+// writeRecoveryJournalFull preserves the journal manager's all-or-nothing
+// in-memory cursor contract when a positional writer reports a short write.
+// It cannot prove a definite on-disk rejection: a record's complete
+// checksummed body can precede unwritten sector padding, so durable callers
+// classify unexpected append errors as outcome-unknown.
 func writeRecoveryJournalFull(
 	writeAt func([]byte, int64) (int, error), p []byte, off int64,
 ) error {
@@ -1552,6 +1684,18 @@ func writeRecoveryJournalFull(
 func (rj *RecoveryJournal) scanTail() error {
 	rj.cursor = 0
 	rj.nextSequence = rj.header.BaseSequence + 1
+	rj.family = recoveryRecordFamilyEmpty
+	rj.deltaEndGeneration = rj.header.BaseGeneration
+	rj.atomicLastGeneration = 0
+	rj.atomicLastKind = 0
+	rj.conditionalChain = recoveryConditionalChain{}
+	// BaseSequence at the terminal value describes a clean, readable journal
+	// whose sequence space is exhausted. Recycle deliberately leaves stale
+	// record bytes in place, so an exhausted header must not inspect those bytes
+	// as though sequence zero could begin another live window.
+	if rj.nextSequence == 0 {
+		return nil
+	}
 	// A fresh or fully recycled journal begins with a zeroed preallocated
 	// region. Bad magic is already the format's authoritative truncatable-tail
 	// marker, so prove that case from the first word before materializing the
@@ -1562,7 +1706,7 @@ func (rj *RecoveryJournal) scanTail() error {
 	); err != nil {
 		return err
 	}
-	if binary.LittleEndian.Uint32(rj.scratch[:4]) != recoveryRecordMagic {
+	if binary.LittleEndian.Uint32(rj.scratch[:4]) == 0 {
 		return nil
 	}
 	region := make([]byte, rj.header.Capacity)
@@ -1571,6 +1715,11 @@ func (rj *RecoveryJournal) scanTail() error {
 	}
 	cursor := uint64(0)
 	sequence := rj.header.BaseSequence + 1
+	family := recoveryRecordFamilyEmpty
+	deltaEndGeneration := rj.header.BaseGeneration
+	var atomicLastGeneration uint64
+	var atomicLastKind uint16
+	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
 		rec, padded, err := DecodeRecoveryRecord(
 			region[cursor:], rj.header.SectorSize, sequence,
@@ -1581,9 +1730,19 @@ func (rj *RecoveryJournal) scanTail() error {
 			}
 			return err
 		}
-		if err := validateRecoveryRecordForFormat(
-			rj.header.FormatVersion, rec,
-		); err != nil {
+		if err := validateRecoveryRecord(rec); err != nil {
+			return err
+		}
+		family, deltaEndGeneration, atomicLastGeneration, atomicLastKind, err =
+			validateRecoveryRecordInWindow(
+				rec, rj.header.BaseGeneration, family, deltaEndGeneration,
+				atomicLastGeneration, atomicLastKind,
+			)
+		if err != nil {
+			return err
+		}
+		conditionalChain, err = conditionalChain.advance(rec)
+		if err != nil {
 			return err
 		}
 		if cursor+uint64(padded) > rj.header.Capacity {
@@ -1591,9 +1750,17 @@ func (rj *RecoveryJournal) scanTail() error {
 		}
 		cursor += uint64(padded)
 		sequence++
+		if sequence == 0 {
+			break
+		}
 	}
 	rj.cursor = cursor
 	rj.nextSequence = sequence
+	rj.family = family
+	rj.deltaEndGeneration = deltaEndGeneration
+	rj.atomicLastGeneration = atomicLastGeneration
+	rj.atomicLastKind = atomicLastKind
+	rj.conditionalChain = conditionalChain
 	return nil
 }
 
@@ -1603,12 +1770,20 @@ func (rj *RecoveryJournal) scanTail() error {
 // sync; the caller issues the lane's sync exactly once after the append so a
 // group of appends can share one fence.
 func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []byte) (uint64, error) {
+	if rj.nextSequence == 0 {
+		return 0, ErrRecoveryJournalFull
+	}
 	rec := RecoveryRecord{
 		Sequence:   rj.nextSequence,
 		Generation: generation,
 		Kind:       kind,
 		Key:        key,
 		Value:      value,
+	}
+	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+		rj.validateAppendRecord(rec)
+	if err != nil {
+		return 0, err
 	}
 	padded, ok := checkedRecoveryRecordPadded(
 		rj.header.SectorSize, len(key), len(value),
@@ -1633,6 +1808,11 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 		return 0, err
 	}
 	rj.cursor += uint64(padded)
+	rj.family = nextFamily
+	rj.deltaEndGeneration = nextDeltaEnd
+	rj.atomicLastGeneration = nextAtomicGeneration
+	rj.atomicLastKind = nextAtomicKind
+	rj.conditionalChain = nextConditional
 	sequence := rj.nextSequence
 	rj.nextSequence++
 	return sequence, nil
@@ -1641,6 +1821,9 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 // Fits reports whether a record of the given key and value lengths would fit in
 // the remaining preallocated capacity without a recycle.
 func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
+	if rj.nextSequence == 0 {
+		return false
+	}
 	padded, ok := checkedRecoveryRecordPadded(
 		rj.header.SectorSize, keyLen, valueLen,
 	)
@@ -1662,8 +1845,7 @@ func (rj *RecoveryJournal) Fits(keyLen, valueLen int) bool {
 // authoritative. If a header or sync error still persists the new candidate,
 // that candidate is also safe because preallocation completed before it could
 // name the extension. Existing readers already accept any
-// sector-aligned capacity through RecoveryJournalMaxCapacityBytes, so this is
-// a compatible geometry change rather than a format revision.
+// sector-aligned capacity through RecoveryJournalMaxCapacityBytes.
 //
 // powerSafe selects the same sync strength as Recycle. Callers grow before a
 // mutation's point of no return, so allocation or header failures reject that
@@ -1737,9 +1919,7 @@ func (rj *RecoveryJournal) FitsBatch(entries []RecoveryBatchEntry) bool {
 func (rj *RecoveryJournal) PrepareBatch(
 	entries []RecoveryBatchEntry,
 ) (RecoveryBatchPlan, error) {
-	plan, ok := prepareRecoveryBatchForFormat(
-		rj.header.FormatVersion, rj.header.SectorSize, entries,
-	)
+	plan, ok := prepareRecoveryBatch(rj.header.SectorSize, entries)
 	if !ok {
 		return RecoveryBatchPlan{}, fmt.Errorf(
 			"%w: batch record length", ErrInvalidWrite,
@@ -1748,12 +1928,38 @@ func (rj *RecoveryJournal) PrepareBatch(
 	return plan, nil
 }
 
+// FitsDeltaBatch reports whether one consecutive-generation delta batch would
+// fit in the remaining preallocated capacity without a recycle.
+func (rj *RecoveryJournal) FitsDeltaBatch(entries []RecoveryBatchEntry) bool {
+	plan, err := rj.PrepareDeltaBatch(entries)
+	if err != nil {
+		return false
+	}
+	return rj.PreparedBatchFits(plan)
+}
+
+// PrepareDeltaBatch validates and sizes one authenticated delta batch without
+// allocating. The returned plan is bound to RecoveryRecordKindDeltaBatch and
+// cannot be used by an atomic or conditional append.
+func (rj *RecoveryJournal) PrepareDeltaBatch(
+	entries []RecoveryBatchEntry,
+) (RecoveryBatchPlan, error) {
+	plan, ok := prepareRecoveryDeltaBatch(rj.header.SectorSize, entries)
+	if !ok {
+		return RecoveryBatchPlan{}, fmt.Errorf(
+			"%w: delta batch record length", ErrInvalidWrite,
+		)
+	}
+	return plan, nil
+}
+
 // PreparedBatchFits reports whether a prepared batch fits at the current
 // cursor. A plan minted for another journal geometry fails closed.
 func (rj *RecoveryJournal) PreparedBatchFits(plan RecoveryBatchPlan) bool {
-	if !plan.validForFormat(
-		rj.header.FormatVersion, rj.header.SectorSize, plan.entryCount,
-	) {
+	if rj.nextSequence == 0 {
+		return false
+	}
+	if !plan.validFor(rj.header.SectorSize, plan.entryCount) {
 		return false
 	}
 	end, ok := checkedSizeAdd(
@@ -1785,8 +1991,45 @@ func (rj *RecoveryJournal) AppendPreparedBatch(
 	generation uint64, entries []RecoveryBatchEntry,
 	plan RecoveryBatchPlan,
 ) (uint64, error) {
-	if !plan.validForFormat(
-		rj.header.FormatVersion, rj.header.SectorSize, len(entries),
+	return rj.appendPreparedBatch(
+		recoveryRecordKindBatch, generation, entries, plan,
+	)
+}
+
+// AppendDeltaBatch appends one consecutive-generation delta batch. The record's
+// generation is the final generation represented by its ordered entries.
+func (rj *RecoveryJournal) AppendDeltaBatch(
+	generation uint64, entries []RecoveryBatchEntry,
+) (uint64, error) {
+	plan, err := rj.PrepareDeltaBatch(entries)
+	if err != nil {
+		return 0, err
+	}
+	return rj.AppendPreparedDeltaBatch(generation, entries, plan)
+}
+
+// AppendPreparedDeltaBatch appends a delta batch using a plan returned by
+// PrepareDeltaBatch.
+func (rj *RecoveryJournal) AppendPreparedDeltaBatch(
+	generation uint64, entries []RecoveryBatchEntry,
+	plan RecoveryBatchPlan,
+) (uint64, error) {
+	return rj.appendPreparedBatch(
+		recoveryRecordKindDeltaBatch, generation, entries, plan,
+	)
+}
+
+func (rj *RecoveryJournal) appendPreparedBatch(
+	recordKind uint16,
+	generation uint64,
+	entries []RecoveryBatchEntry,
+	plan RecoveryBatchPlan,
+) (uint64, error) {
+	if rj.nextSequence == 0 {
+		return 0, ErrRecoveryJournalFull
+	}
+	if !plan.validForKind(
+		recordKind, rj.header.SectorSize, len(entries),
 	) {
 		return 0, fmt.Errorf("%w: batch plan", ErrInvalidWrite)
 	}
@@ -1802,8 +2045,13 @@ func (rj *RecoveryJournal) AppendPreparedBatch(
 	rec := RecoveryRecord{
 		Sequence:   rj.nextSequence,
 		Generation: generation,
-		Kind:       recoveryRecordKindBatch,
+		Kind:       recordKind,
 		Entries:    entries,
+	}
+	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+		rj.validateAppendRecord(rec)
+	if err != nil {
+		return 0, err
 	}
 	if _, err := encodeRecoveryBatchRecordPrepared(
 		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
@@ -1817,6 +2065,11 @@ func (rj *RecoveryJournal) AppendPreparedBatch(
 		return 0, err
 	}
 	rj.cursor = end
+	rj.family = nextFamily
+	rj.deltaEndGeneration = nextDeltaEnd
+	rj.atomicLastGeneration = nextAtomicGeneration
+	rj.atomicLastKind = nextAtomicKind
+	rj.conditionalChain = nextConditional
 	sequence := rj.nextSequence
 	rj.nextSequence++
 	return sequence, nil
@@ -1853,11 +2106,104 @@ func (rj *RecoveryJournal) Recycle(
 	if baseGeneration < rj.header.BaseGeneration {
 		return fmt.Errorf("%w: recycle base generation regressed", ErrGenerationOrder)
 	}
+	if rj.cursor != 0 && baseGeneration < rj.LiveEndGeneration() {
+		return fmt.Errorf(
+			"%w: recycle generation %d does not cover live journal end %d",
+			ErrGenerationOrder, baseGeneration, rj.LiveEndGeneration(),
+		)
+	}
+	return rj.recycleHeader(baseGeneration, powerSafe)
+}
+
+// RecoveryConditionalResolver supplies the durable outcome of one
+// authenticated conditional record while RecycleResolved proves that a
+// physical root may discard the live window.
+type RecoveryConditionalResolver func(
+	header RecoveryConditionalHeader, generation uint64,
+) (committed bool, err error)
+
+// RecycleResolved advances the journal head after proving the physical root
+// covers every effective record. Nonconditional and delta records must end at
+// or below baseGeneration. A conditional above baseGeneration is discardable
+// only when resolve proves it aborted; a committed conditional must be covered
+// by the physical root. The complete proof runs before either header is
+// written, so a resolver or semantic failure leaves the journal unchanged.
+func (rj *RecoveryJournal) RecycleResolved(
+	baseGeneration uint64,
+	powerSafe bool,
+	resolve RecoveryConditionalResolver,
+) error {
+	if baseGeneration < rj.header.BaseGeneration {
+		return fmt.Errorf("%w: recycle base generation regressed", ErrGenerationOrder)
+	}
+	if rj.cursor != 0 {
+		logicalGeneration := rj.header.BaseGeneration
+		if err := rj.Replay(
+			rj.header.BaseGeneration, func(rec RecoveryRecord) error {
+				if rec.Kind == recoveryRecordKindDeltaBatch {
+					if rec.Generation > baseGeneration {
+						return fmt.Errorf(
+							"%w: recycle generation %d does not cover delta end %d",
+							ErrGenerationOrder, baseGeneration, rec.Generation,
+						)
+					}
+					return nil
+				}
+				if logicalGeneration == ^uint64(0) ||
+					rec.Generation != logicalGeneration+1 {
+					return recoveryJournalSemanticError(
+						"resolved atomic records do not form one logical generation chain",
+					)
+				}
+				if rec.Kind != recoveryRecordKindConditionalBatch {
+					logicalGeneration = rec.Generation
+					if logicalGeneration > baseGeneration {
+						return fmt.Errorf(
+							"%w: recycle generation %d does not cover atomic generation %d",
+							ErrGenerationOrder, baseGeneration, logicalGeneration,
+						)
+					}
+					return nil
+				}
+				if resolve == nil {
+					return fmt.Errorf(
+						"%w: conditional recycle requires a resolver",
+						ErrInvalidWrite,
+					)
+				}
+				committed, err := resolve(rec.Conditional, rec.Generation)
+				if err != nil {
+					return err
+				}
+				if committed {
+					logicalGeneration = rec.Generation
+					if logicalGeneration > baseGeneration {
+						return fmt.Errorf(
+							"%w: committed conditional generation %d is not covered by recycle generation %d",
+							ErrGenerationOrder, logicalGeneration, baseGeneration,
+						)
+					}
+				}
+				return nil
+			},
+		); err != nil {
+			return err
+		}
+	}
+	return rj.recycleHeader(baseGeneration, powerSafe)
+}
+
+func (rj *RecoveryJournal) recycleHeader(
+	baseGeneration uint64, powerSafe bool,
+) error {
 	// Stage the advanced header and commit it to memory only after the write and
-	// its sync both succeed. A failed recycle then leaves the manager describing
-	// exactly what is on the device — the old base still guards the < check
-	// above, the cursor still appends after the live records — instead of a
-	// half-applied header whose in-memory base has moved past the durable one.
+	// its sync both succeed. On failure the live manager deliberately retains the
+	// old base and cursor, but the opposite header may already be observable or
+	// durable. Durable callers therefore poison the handle and require reopen to
+	// select the authoritative slot before any later append.
+	if rj.header.RecycleCount == ^uint64(0) {
+		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
+	}
 	next := rj.header
 	next.BaseGeneration = baseGeneration
 	next.BaseSequence = rj.nextSequence - 1
@@ -1876,11 +2222,32 @@ func (rj *RecoveryJournal) Recycle(
 	rj.header = next
 	rj.headerSlot = slot
 	rj.cursor = 0
+	rj.family = recoveryRecordFamilyEmpty
+	rj.deltaEndGeneration = baseGeneration
+	rj.atomicLastGeneration = 0
+	rj.atomicLastKind = 0
+	rj.conditionalChain = recoveryConditionalChain{}
 	return nil
 }
 
 // BaseGeneration reports the generation the current live region builds upon.
 func (rj *RecoveryJournal) BaseGeneration() uint64 { return rj.header.BaseGeneration }
+
+// LiveEndGeneration reports the greatest generation described by the current
+// authenticated live window. An empty window ends at BaseGeneration. Recycle
+// may discard a nonempty window only when its new base covers this value.
+func (rj *RecoveryJournal) LiveEndGeneration() uint64 {
+	if rj == nil || rj.cursor == 0 {
+		if rj == nil {
+			return 0
+		}
+		return rj.header.BaseGeneration
+	}
+	if rj.family == recoveryRecordFamilyDelta {
+		return rj.deltaEndGeneration
+	}
+	return rj.atomicLastGeneration
+}
 
 // NextSequence reports the sequence the next appended record will carry.
 func (rj *RecoveryJournal) NextSequence() uint64 { return rj.nextSequence }
@@ -1895,12 +2262,20 @@ func (rj *RecoveryJournal) Cursor() uint64 { return rj.cursor }
 // returns nil. A checksum-valid semantic error is not a truncation: it returns
 // ErrRecoveryJournalRecord and fails recovery closed. fn's error aborts replay.
 func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord) error) error {
+	if rj.header.BaseSequence == ^uint64(0) {
+		return nil
+	}
 	region := make([]byte, rj.header.Capacity)
 	if _, err := readFullAt(rj.file, region, recoveryJournalRegionStart); err != nil {
 		return err
 	}
 	cursor := uint64(0)
 	sequence := rj.header.BaseSequence + 1
+	family := recoveryRecordFamilyEmpty
+	deltaEndGeneration := rj.header.BaseGeneration
+	var atomicLastGeneration uint64
+	var atomicLastKind uint16
+	conditionalChain := recoveryConditionalChain{}
 	for cursor < rj.header.Capacity {
 		rec, padded, err := DecodeRecoveryRecord(
 			region[cursor:], rj.header.SectorSize, sequence,
@@ -1913,9 +2288,19 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 			}
 			return err
 		}
-		if err := validateRecoveryRecordForFormat(
-			rj.header.FormatVersion, rec,
-		); err != nil {
+		if err := validateRecoveryRecord(rec); err != nil {
+			return err
+		}
+		family, deltaEndGeneration, atomicLastGeneration, atomicLastKind, err =
+			validateRecoveryRecordInWindow(
+				rec, rj.header.BaseGeneration, family, deltaEndGeneration,
+				atomicLastGeneration, atomicLastKind,
+			)
+		if err != nil {
+			return err
+		}
+		conditionalChain, err = conditionalChain.advance(rec)
+		if err != nil {
 			return err
 		}
 		if cursor+uint64(padded) > rj.header.Capacity {
@@ -1928,6 +2313,9 @@ func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord)
 		}
 		cursor += uint64(padded)
 		sequence++
+		if sequence == 0 {
+			break
+		}
 	}
 	return nil
 }

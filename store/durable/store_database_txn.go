@@ -14,7 +14,7 @@ import (
 // Multi-collection durable write.
 //
 // UpdateCollections is the caller-owned write dual of SnapshotCollections:
-// stage every dirty participant, prepare a kind-5 conditional record in each
+// stage every dirty participant, prepare a kind-4 conditional record in each
 // journal, append and sync one decision record (the sole atomic commit point),
 // then publish under every snapshotGate held at once. Database.Update wraps the
 // same protocol over the catalog.
@@ -58,7 +58,7 @@ var (
 	)
 )
 
-// TxnLogOptions configures OpenTxnLog. A zero Capacity selects the decision-log
+// TxnLogOptions configures transaction-log construction and recovery. A zero Capacity selects the decision-log
 // package default at mint time. SealedCapacity requires a non-zero exact
 // Capacity and makes txn.vtm a Linux-only immutable physical allocation.
 type TxnLogOptions struct {
@@ -85,7 +85,7 @@ type TxnLog struct {
 	// scan's MaxTxnID (or 1 for a fresh mint).
 	nextTxnID uint64
 	// undischarged counts decisions whose participant journals may still hold
-	// matching kind-5 records. Recycle is legal only when this is zero and no
+	// matching kind-4 records. Recycle is legal only when this is zero and no
 	// registered journal holds a current-epoch conditional.
 	undischarged int
 	poison       error
@@ -95,31 +95,34 @@ type TxnLog struct {
 	collections []*Collection
 }
 
-// OpenTxnLog opens dir's decision log, lazily leaving txn.vtm unminted when
-// absent. The mint fence runs at the head of the first K ≥ 2 commit.
-func OpenTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
+// NewTxnLog constructs an unminted decision-log owner for a fresh catalog.
+// Any pre-existing txn.vtm is refused: only OpenCollectionsWithTransactions
+// may reopen a marker because decision-log recycle requires the complete live
+// participant catalog. The mint fence runs at the head of the first K ≥ 2
+// commit.
+func NewTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
 	log, err := newTxnLogDirectory(dir, options)
 	if err != nil {
 		return nil, err
 	}
-	info, err := log.root.Lstat(txnMarkerFilename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return log, nil
-		}
+	if _, err := log.root.Lstat(txnMarkerFilename); err == nil {
+		_ = log.Close()
+		return nil, ErrTransactionLogRecoveryRequired
+	} else if !os.IsNotExist(err) {
 		_ = log.Close()
 		return nil, err
 	}
-	if !info.Mode().IsRegular() {
+	holds, err := directoryHoldsAnyConditional(log.root)
+	if err != nil {
+		_ = log.Close()
+		return nil, err
+	}
+	if holds {
 		_ = log.Close()
 		return nil, fmt.Errorf(
-			"%w: %q is not a regular non-symlink file",
-			ErrUnsupportedDatabaseLayout, txnMarkerFilename,
+			"%w: fresh transaction log directory retains conditional records",
+			ErrTransactionLogMissing,
 		)
-	}
-	if err := log.openExisting(); err != nil {
-		_ = log.Close()
-		return nil, err
 	}
 	return log, nil
 }
@@ -186,37 +189,6 @@ func syncTxnLogDirectory(root *os.Root) error {
 	return errors.Join(syncErr, closeErr)
 }
 
-var syncTxnLogMintResidueDirectory = syncTxnLogDirectory
-
-func (l *TxnLog) openExisting() error {
-	marker, decisions, err := storeio.OpenTxnMarkerAt(
-		l.root, txnMarkerFilename,
-		storeio.TxnMarkerOptions{
-			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
-		},
-	)
-	if err != nil {
-		return err
-	}
-	l.marker = marker
-	l.nextTxnID = decisions.MaxTxnID() + 1
-	if l.nextTxnID == 0 {
-		l.nextTxnID = 1
-	}
-	// Open cannot prove discharge without per-collection roots; treat every
-	// scanned decision as undischarged until a pressure fold or T5's
-	// reconciliation clears them. An empty scan leaves undischarged at zero.
-	if decisions != nil {
-		// MaxDCSN counts every record (decision + retirement). Seed a lower
-		// bound from MaxTxnID presence: each decided txn is one undischarged
-		// unit until folded. Exact membership is rebuilt on first pressure fold.
-		if decisions.MaxTxnID() != 0 {
-			l.undischarged = 1
-		}
-	}
-	return nil
-}
-
 // Close closes the underlying decision-log file when present.
 func (l *TxnLog) Close() error {
 	if l == nil {
@@ -258,6 +230,14 @@ func (l *TxnLog) ValidateCollections(members []NamedCollection) error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	return l.validateCollectionsLocked(ordered)
+}
+
+// validateCollectionsLocked performs ValidateCollections' live-handle and
+// directory proof while commitMu is held. Commit admission uses it before
+// adding caller-supplied handles to the persistent catalog registry, so a
+// definite invalid-member refusal cannot brick all later commits.
+func (l *TxnLog) validateCollectionsLocked(ordered []NamedCollection) error {
 	if l.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
 	}
@@ -336,6 +316,43 @@ func (l *TxnLog) registerCollection(c *Collection) {
 	l.registerCollectionLocked(c)
 }
 
+// AdoptCollection attaches a freshly published collection to an already-open
+// catalog transaction log. It is intentionally not a recovery API: the
+// collection must have an empty paired journal. The proof and registration run
+// under the log commit fence, so the handle cannot be admitted concurrently
+// with a decision append.
+func (l *TxnLog) AdoptCollection(c *Collection) error {
+	if l == nil || c == nil {
+		return fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	c.writer.Lock()
+	defer c.writer.Unlock()
+	if c.closed || c.file == nil || !databaseTxnLaneSupported(c) {
+		return fmt.Errorf("%w: collection is not transaction-capable", ErrTxnParticipant)
+	}
+	if !c.journalEnabled() || c.journal.Cursor() != 0 {
+		return fmt.Errorf(
+			"%w: adopted collection journal is not empty", ErrTxnParticipant,
+		)
+	}
+	matches, err := storeio.FileMatchesDirectory(l.rootInfo, c.file)
+	if err != nil {
+		return fmt.Errorf(
+			"vibedb: prove adopted collection transaction directory: %w", err,
+		)
+	}
+	if !matches {
+		return ErrTransactionLogDirectoryMismatch
+	}
+	l.registerCollectionLocked(c)
+	return nil
+}
+
 func (l *TxnLog) registerCollectionLocked(c *Collection) {
 	if c == nil {
 		return
@@ -349,12 +366,78 @@ func (l *TxnLog) registerCollectionLocked(c *Collection) {
 	l.collections = append(l.collections, c)
 }
 
+// DetachCollection removes one live collection from this log's catalog scope.
+// If the current marker contains decisions, detach first folds every registered
+// participant past its current-epoch conditionals and recycles the marker to an
+// empty epoch. It then checkpoints the target's remaining ordinary journal
+// window so the exact handle can be passed back to [TxnLog.AdoptCollection] if
+// the caller's catalog mutation definitely did not publish.
+//
+// The complete discharge and unregister run under commitMu. On error the
+// collection remains registered; callers must not close or unlink it. The
+// caller must keep the collection out of concurrent UpdateCollections member
+// sets until the catalog mutation publishes or AdoptCollection rolls it back,
+// because a commit automatically registers every supplied member.
+func (l *TxnLog) DetachCollection(c *Collection) error {
+	if l == nil || c == nil {
+		return fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+
+	l.regMu.Lock()
+	_, registered := l.registered[c]
+	l.regMu.Unlock()
+	if !registered {
+		return nil
+	}
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	// A failed decision append can leave durable conditional prepares while the
+	// marker cursor remains zero. Cursor position therefore cannot prove there
+	// is nothing to resolve; rescan and discharge every registered journal
+	// whenever a marker exists before detaching catalog ownership.
+	if l.marker != nil {
+		if err := l.foldLaggardsAndRecycleLocked(); err != nil {
+			return err
+		}
+	}
+
+	// A marker recycle consumes every conditional window, but the target may
+	// still hold a later ordinary atomic/delta window. Empty that window too so
+	// rollback can use AdoptCollection's deliberately strict empty-journal seam.
+	c.writer.Lock()
+	var checkpointErr error
+	if c.closed || c.file == nil || !databaseTxnLaneSupported(c) {
+		checkpointErr = fmt.Errorf(
+			"%w: collection is not transaction-capable", ErrTxnParticipant,
+		)
+	} else if c.journalEnabled() && c.journal.Cursor() != 0 {
+		checkpointErr = c.checkpointPastConditionalsLocked(nil, 0)
+	}
+	c.writer.Unlock()
+	if checkpointErr != nil {
+		return checkpointErr
+	}
+
+	l.unregisterCollectionLocked(c)
+	return nil
+}
+
 func (l *TxnLog) unregisterCollection(c *Collection) {
 	if l == nil || c == nil {
 		return
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	l.unregisterCollectionLocked(c)
+}
+
+func (l *TxnLog) unregisterCollectionLocked(c *Collection) {
 	l.regMu.Lock()
 	defer l.regMu.Unlock()
 	if _, ok := l.registered[c]; !ok {
@@ -575,8 +658,10 @@ func databaseTxnLaneSupported(c *Collection) bool {
 
 // Test hooks. Production leaves them nil.
 var (
-	databaseTxnAfterMintHook  func(l *TxnLog)
-	databaseTxnAfterStageHook func(index int, name string) error
+	databaseTxnAfterMintHook              func(l *TxnLog)
+	databaseTxnAfterStageHook             func(index int, name string) error
+	databaseTxnBeforeMarkerRecycleHook    func(l *TxnLog)
+	databaseTxnBeforeRetirementAppendHook func(l *TxnLog)
 )
 
 func (l *TxnLog) commitMulti(
@@ -586,6 +671,9 @@ func (l *TxnLog) commitMulti(
 ) (err error) {
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if err := l.validateCollectionsLocked(members); err != nil {
+		return err
+	}
 	for _, member := range members {
 		l.registerCollectionLocked(member.Collection)
 	}
@@ -642,16 +730,9 @@ func (l *TxnLog) commitMulti(
 				"%w: %s", ErrDatabaseTransactionUnsupportedLane, nameOf[c],
 			)
 		}
-		// Catalog-owned journals mint/recycle at the conditional format word.
-		// T5 wires this at open; until then the coordinator sets it under the
-		// writer for every multi-collection participant.
-		c.journalCatalogOwned = true
-		// Upgrade legacy journals BEFORE staging: ensureConditionalJournalFormat
-		// cannot remint once a staged batch holds admitted frames over a
-		// non-empty legacy window.
-		if err := c.ensureConditionalJournalFormatLocked(); err != nil {
-			return err
-		}
+	}
+	if l.nextTxnID == ^uint64(0) {
+		return fmt.Errorf("%w: transaction id space exhausted", ErrTxnTooLarge)
 	}
 
 	staged := make([]stagedPrimaryBatch, len(order))
@@ -709,7 +790,17 @@ func (l *TxnLog) commitMulti(
 		if errors.Is(appendErr, storeio.ErrTxnMarkerFull) {
 			return fmt.Errorf("%w: decision log full", ErrTxnTooLarge)
 		}
-		return appendErr
+		// A positional write can report a short/error result after the raw
+		// checksummed decision body reached the page cache. Padding is not part of
+		// the authenticated record, so reopen may still observe a committed
+		// decision. Treat every unexpected append failure as catalog-wide unknown
+		// outcome; only the fully preflighted capacity refusal is definite.
+		poisoned := journalCommitOutcomeUnknown(appendErr)
+		l.poison = poisoned
+		for _, c := range l.registeredCollections() {
+			_ = joinCatalogCommitOutcomeUnknown(c, appendErr)
+		}
+		return poisoned
 	}
 	if syncErr := l.marker.Sync(); syncErr != nil {
 		poisoned := journalCommitOutcomeUnknown(syncErr)
@@ -807,13 +898,15 @@ func (l *TxnLog) ensureMintedLocked() error {
 	)
 	if err != nil {
 		if os.IsExist(err) {
-			// A prior mint may have completed both marker headers and the file
-			// fence but failed its parent-directory fence. Re-fence the existing
-			// namespace entry before accepting it on this still-live handle.
-			if syncErr := syncTxnLogMintResidueDirectory(l.root); syncErr != nil {
-				return syncErr
-			}
-			return l.openExisting()
+			// Absence at NewTxnLog is not an ownership lease. A racing creator or
+			// an earlier unknown mint outcome may own this entry and may later name
+			// participants unknown to this handle. Never adopt it here.
+			refusal := fmt.Errorf(
+				"%w: transaction marker appeared before mint",
+				ErrTransactionLogRecoveryRequired,
+			)
+			l.poison = refusal
+			return refusal
 		}
 		return err
 	}
@@ -835,6 +928,11 @@ func (l *TxnLog) ensureDecisionRoomLocked(participantCount int) error {
 	}
 	if l.marker == nil {
 		return fmt.Errorf("vibedb: decision log mint missing before capacity check")
+	}
+	if l.marker.NextSequence() == 0 {
+		return fmt.Errorf(
+			"%w: decision-log sequence space exhausted", ErrTxnTooLarge,
+		)
 	}
 	if l.marker.Cursor()+uint64(padded) <= l.marker.Header().Capacity {
 		return nil
@@ -865,30 +963,70 @@ func txnDecisionRecordBytes(participantCount int) (int, bool) {
 
 func (l *TxnLog) foldLaggardsAndRecycleLocked() error {
 	header := l.marker.Header()
+	decisions, err := rescanTxnLogMarker(l)
+	if err != nil {
+		return err
+	}
 	for _, c := range l.registeredCollections() {
 		c.writer.Lock()
-		holds := c.journalHoldsConditional(header.MarkerID, header.Epoch)
+		holds, holdsErr := c.journalHoldsConditional(header.MarkerID, header.Epoch)
 		var foldErr error
-		if holds {
-			foldErr = c.checkpointPastConditionalsLocked()
+		if holdsErr == nil && holds {
+			foldErr = c.checkpointPastConditionalsLocked(
+				participantBindingResolver(decisions, c.storeID, c.journalID),
+				decisions.Epoch(),
+			)
 		}
 		c.writer.Unlock()
-		if foldErr != nil {
-			return foldErr
+		if holdsErr != nil || foldErr != nil {
+			return errors.Join(holdsErr, foldErr)
 		}
 	}
 	for _, c := range l.registeredCollections() {
 		c.writer.Lock()
-		holds := c.journalHoldsConditional(header.MarkerID, header.Epoch)
+		holds, holdsErr := c.journalHoldsConditional(header.MarkerID, header.Epoch)
 		c.writer.Unlock()
+		if holdsErr != nil {
+			return holdsErr
+		}
 		if holds {
 			return fmt.Errorf(
 				"vibedb: decision log recycle blocked by conditional records",
 			)
 		}
 	}
+	// The registered catalog is complete for transaction recovery, but retired
+	// or crash-orphaned sidecars can intentionally remain until their namespace
+	// cleanup fence succeeds. Never recycle away the only decisions that can
+	// resolve such a conditional. Cleanup may remove the sidecar and a later
+	// reopen/recycle will re-evaluate this same directory-wide predicate.
+	directoryHolds, err := directoryHoldsAnyConditional(l.root)
+	if err != nil {
+		return err
+	}
+	if directoryHolds {
+		return fmt.Errorf(
+			"vibedb: decision log recycle blocked by an unregistered conditional journal",
+		)
+	}
+	if databaseTxnBeforeMarkerRecycleHook != nil {
+		databaseTxnBeforeMarkerRecycleHook(l)
+	}
+	if recycleErr := l.marker.Recycle(header.Epoch + 1); recycleErr != nil {
+		// A recycle header write or sync may already have published the next
+		// epoch even though the in-memory marker deliberately retains the old
+		// header. No later decision may be appended through that stale view.
+		// Treat every recycle failure as an unknown catalog-wide outcome and
+		// require a complete reopen/reconciliation before further work.
+		poisoned := journalCommitOutcomeUnknown(recycleErr)
+		l.poison = poisoned
+		for _, c := range l.registeredCollections() {
+			_ = joinCatalogCommitOutcomeUnknown(c, recycleErr)
+		}
+		return poisoned
+	}
 	l.undischarged = 0
-	return l.marker.Recycle(header.Epoch + 1)
+	return nil
 }
 
 // Update is the catalog-owned convenience form of UpdateCollections. It holds
@@ -921,10 +1059,9 @@ func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 	return UpdateCollections(log, members, defaultTxnLimits(), fn)
 }
 
-// Interim Database↔TxnLog registry. T5, which owns store_database.go, wires
-// attach into OpenDatabase and detach-plus-Close into Database.Close, and may
-// migrate this map to a Database struct field (these seams then become thin
-// wrappers). Until then Database.Update lazily mints and attaches.
+// Database↔TxnLog registry. Database open installs the complete recovered log,
+// Update lazily constructs a fresh log only for a new catalog, and Close
+// removes and closes the owned handle.
 var (
 	databaseTxnRegistryMu sync.Mutex
 	databaseTxnRegistry   = map[*Database]*TxnLog{}
@@ -965,7 +1102,7 @@ func ensureDatabaseTxnLog(d *Database) (*TxnLog, error) {
 	if l := databaseTxnRegistry[d]; l != nil {
 		return l, nil
 	}
-	l, err := OpenTxnLog(d.dir, TxnLogOptions{})
+	l, err := NewTxnLog(d.dir, TxnLogOptions{})
 	if err != nil {
 		return nil, err
 	}

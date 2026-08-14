@@ -8,27 +8,29 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// collectionOpenConfig threads catalog ownership and the decision resolver
-// into the shared open path. Standalone Open leaves every field zero.
+// collectionOpenConfig threads the decision resolver into the shared open path.
+// Standalone Open leaves every field zero.
 type collectionOpenConfig struct {
-	catalogOwned bool
-	decisions    *storeio.TxnDecisions
+	decisions *storeio.TxnDecisions
+	// deferJournalReplay leaves an already paired and scan-validated journal
+	// unopened for mutation until a catalog-wide transaction preflight succeeds.
+	// OpenDatabase owns the returned private collection and runs phase two before
+	// publishing the Database.
+	deferJournalReplay bool
 	// absentLog selects the L1/L3 resolver that returns ErrTransactionLogMissing
-	// for every uncovered kind-5 lookup. Used when the database directory has
-	// no txn.vtm (or when OpenWithTransactions is called with a nil decisions
-	// pointer). Mutually exclusive with a non-nil decisions pointer.
+	// for every retained kind-4 lookup. Used when the database directory has
+	// no txn.vtm. Mutually exclusive with a non-nil decisions pointer.
 	absentLog bool
 }
 
-// Create initializes an empty durable collection in file and fences its
-// first root before returning. Standalone creates leave journalCatalogOwned
-// false so the journal mints at the lane's ordinary format word.
+// Create initializes an empty durable collection in file and fences its first
+// root before returning.
 func Create(file *os.File, options Options) (*Collection, error) {
-	return createCollection(file, options, false)
+	return createCollection(file, options)
 }
 
 func createCollection(
-	file *os.File, options Options, catalogOwned bool,
+	file *os.File, options Options,
 ) (*Collection, error) {
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
@@ -68,7 +70,6 @@ func createCollection(
 	if err != nil {
 		return nil, err
 	}
-	collection.journalCatalogOwned = catalogOwned
 	collection.writerLocked = true
 	locked = false
 	if err := collection.createInitialState(); err != nil {
@@ -83,12 +84,11 @@ func createCollection(
 // empty read cache. It does not scan keys, documents, or postings.
 //
 // Standalone Open passes a nil decision resolver into journal replay. An
-// uncovered kind-5 conditional batch in the live journal window fails closed
+// kind-4 conditional batch in the live journal window fails closed
 // with ErrCollectionInDoubt: the file participates in a database transaction
-// and must be opened through its database directory (or OpenWithTransactions).
-// The refusal is transient — once the collection checkpoints past the record
-// the file is self-contained again. Covered kind-5 records are consumed
-// without resolution and do not refuse standalone open.
+// and must be opened through its complete database-directory recovery batch.
+// The refusal is transient — a resolver-backed open folds and recycles every
+// conditional record, including one whose generation the selected root covers.
 func Open(file *os.File, options Options) (*Collection, error) {
 	return openCollection(file, options, collectionOpenConfig{})
 }
@@ -182,9 +182,6 @@ func openCollection(
 		return nil, err
 	}
 	collection.physicalHighWater = physicalHighWater
-	// Catalog-owned opens set the flag before the journal is opened or
-	// recycled so a foreground reopen fold mints the conditional format word.
-	collection.journalCatalogOwned = cfg.catalogOwned
 	collection.writerLocked = true
 	locked = false
 	if err := collection.committer.InitializeRecovery(
@@ -240,6 +237,9 @@ func openCollection(
 			_ = collection.closeResources()
 			return nil, err
 		}
+		if cfg.deferJournalReplay {
+			return collection, nil
+		}
 		// Catalog-owned opens thread an explicit resolver. Standalone Open
 		// goes through replayRecoveryJournalLocked so the test resolver hook
 		// (and nil-resolver ErrCollectionInDoubt) remain the single path.
@@ -287,7 +287,7 @@ func collectionOpenResolver(
 		}
 		return absentLogResolver(), epoch, nil
 	}
-	// Standalone Open: nil resolver → ErrCollectionInDoubt on uncovered kind-5.
+	// Standalone Open: nil resolver → ErrCollectionInDoubt on retained kind-4.
 	return nil, 0, nil
 }
 
@@ -431,13 +431,6 @@ func (c *Collection) createInitialState() error {
 				return 0
 			}(), c.options.SealedRecoveryJournalBytes,
 		)
-		// Catalog-owned sync journals mint at the conditional format word so
-		// they may prepare kind-5 records without a later remint. Scalar-patch
-		// headers (ordinary buffered delta) keep their own format word.
-		if c.journalCatalogOwned &&
-			header.FormatVersion == storeio.RecoveryJournalFormatLegacy {
-			header.FormatVersion = storeio.RecoveryJournalFormatConditional
-		}
 		if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
 			_ = tx.Abort()
 			return err

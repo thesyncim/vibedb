@@ -3,6 +3,8 @@ package storeio
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,8 +47,8 @@ func txnMarkerFuzzSeedTornDecision(t testing.TB) []byte {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	fm := NewFaultTxnMarker(m)
 	fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultTornAppend, AppendIndex: 0})
-	if _, err := m.AppendDecision(3, testTxnParticipants(2)); err != nil {
-		t.Fatalf("torn AppendDecision: %v", err)
+	if _, err := m.AppendDecision(3, testTxnParticipants(2)); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("torn AppendDecision = %v, want io.ErrShortWrite", err)
 	}
 	if err := m.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -67,7 +69,7 @@ func txnMarkerFuzzSeedWrongCRC(t testing.TB) []byte {
 	return data
 }
 
-func txnMarkerFuzzSeedOldFormatVersion(t testing.TB) []byte {
+func txnMarkerFuzzSeedNonCurrentDomain(t testing.TB) []byte {
 	t.Helper()
 	data := txnMarkerFuzzSeedEmpty(t)
 	for slot := 0; slot < txnMarkerHeaderSlots; slot++ {
@@ -75,7 +77,7 @@ func txnMarkerFuzzSeedOldFormatVersion(t testing.TB) []byte {
 		if len(data) < off+TxnMarkerHeaderSize {
 			break
 		}
-		binary.LittleEndian.PutUint32(data[off+8:off+12], 0)
+		copy(data[off:off+8], "NOTMARK!")
 		sum := PageChecksum(data[off : off+TxnMarkerHeaderSize-8])
 		binary.LittleEndian.PutUint32(
 			data[off+TxnMarkerHeaderSize-8:off+TxnMarkerHeaderSize-4], sum,
@@ -92,7 +94,7 @@ func FuzzTxnMarkerOpen(f *testing.F) {
 	f.Add(txnMarkerFuzzSeedOneDecision(f))
 	f.Add(txnMarkerFuzzSeedTornDecision(f))
 	f.Add(txnMarkerFuzzSeedWrongCRC(f))
-	f.Add(txnMarkerFuzzSeedOldFormatVersion(f))
+	f.Add(txnMarkerFuzzSeedNonCurrentDomain(f))
 	f.Add([]byte{})
 	f.Add(bytes.Repeat([]byte{0}, TxnMarkerHeaderSize))
 

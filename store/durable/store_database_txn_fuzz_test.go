@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,10 +160,6 @@ func txnFuzzPrepareUnpublished(
 	t.Helper()
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("ensure conditional: %v", err)
-	}
 	batch := coll.fileWriteBatch()
 	defer coll.releaseFileWriteBatch(batch)
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
@@ -193,10 +190,6 @@ func txnFuzzPrepareMaybePublish(
 	t.Helper()
 	coll.writer.Lock()
 	defer coll.writer.Unlock()
-	coll.journalCatalogOwned = true
-	if err := coll.ensureConditionalJournalFormatLocked(); err != nil {
-		t.Fatalf("ensure conditional: %v", err)
-	}
 	batch := coll.fileWriteBatch()
 	defer coll.releaseFileWriteBatch(batch)
 	if err := batch.Put([]byte(key), []byte(doc)); err != nil {
@@ -224,7 +217,9 @@ func txnFuzzPrepareMaybePublish(
 	coll.publishPrimaryBatchGateHeld(staged)
 	coll.snapshotGate.Unlock()
 	staged.live = false
-	if err := coll.checkpointPastConditionalsLocked(); err != nil {
+	if err := coll.checkpointPastConditionalsLocked(
+		resolveAllConditionals(true), epoch,
+	); err != nil {
 		t.Fatalf("checkpoint past conditionals: %v", err)
 	}
 	return coll.state.Load().root.Generation
@@ -302,8 +297,8 @@ func txnFuzzSeedTornDecision(t testing.TB) []byte {
 	if _, err := marker.AppendDecision(txnID, []storeio.TxnParticipant{
 		{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
-	}); err != nil {
-		t.Fatal(err)
+	}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("torn decision append = %v, want short write", err)
 	}
 	_ = marker.Close()
 	img := cloneDatabaseDir(t, db.Dir())

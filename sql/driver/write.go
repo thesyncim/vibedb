@@ -356,10 +356,23 @@ func (d *database) dropTableLockedContext(
 			return nil, err
 		}
 	}
+	detached := false
+	if t.collection != nil {
+		if d.txnLog == nil {
+			return nil, errors.New("vibedb: database transaction log is not open")
+		}
+		if err := d.txnLog.DetachCollection(t.collection); err != nil {
+			return nil, fmt.Errorf(
+				"vibedb: detach dropped table %q from transaction log: %w",
+				name, err,
+			)
+		}
+		detached = true
+	}
 	previousPending := d.catalogWritePending
 	retiredBefore := len(d.retired)
 	meta := d.catalog.Tables[name]
-	storagePath := d.tablePathForMeta(name, meta)
+	storagePath := d.tablePathForMeta(meta)
 	delete(d.catalog.Tables, name)
 	delete(d.tables, name)
 	if retire {
@@ -376,6 +389,13 @@ func (d *database) dropTableLockedContext(
 			d.tables[name] = t
 			d.retired = d.retired[:retiredBefore]
 			d.catalogWritePending = previousPending
+			if detached {
+				adoptErr := d.txnLog.AdoptCollection(t.collection)
+				if adoptErr != nil {
+					d.retainTxnReattachLocked(t.collection)
+				}
+				err = errors.Join(err, adoptErr)
+			}
 		} else {
 			d.advanceLayoutEpochLocked()
 		}

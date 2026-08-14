@@ -94,17 +94,19 @@ func TestSealedTxnLogOptionsRejectAbsentMarkerEagerly(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			if log, err := OpenTxnLog(dir, tc.opts); !errors.Is(err, ErrSealedJournalCapacity) {
+			if log, err := NewTxnLog(dir, tc.opts); !errors.Is(err, ErrSealedJournalCapacity) {
 				if log != nil {
 					_ = log.Close()
 				}
-				t.Fatalf("OpenTxnLog invalid absent profile = %v, want mismatch", err)
+				t.Fatalf("NewTxnLog invalid absent profile = %v, want mismatch", err)
 			}
-			if _, log, err := RecoverDatabaseTransactions(dir, tc.opts); !errors.Is(err, ErrSealedJournalCapacity) {
+			if _, log, err := OpenCollectionsWithTransactions(
+				dir, tc.opts, nil,
+			); !errors.Is(err, ErrSealedJournalCapacity) {
 				if log != nil {
 					_ = log.Close()
 				}
-				t.Fatalf("RecoverDatabaseTransactions invalid absent profile = %v, want mismatch", err)
+				t.Fatalf("OpenCollectionsWithTransactions invalid absent profile = %v, want mismatch", err)
 			}
 			if _, err := os.Stat(filepath.Join(dir, txnMarkerFilename)); !os.IsNotExist(err) {
 				t.Fatalf("invalid strict options minted txn.vtm: %v", err)

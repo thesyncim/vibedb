@@ -59,7 +59,7 @@ type primaryBatchLeaf struct {
 // stagedPrimaryBatch is the opaque product of stagePrimaryBatchLocked: dirty
 // frames and exact-index prep are admitted but not reader-visible. The single-
 // collection Update path fences with a kind-3 journal record before publish;
-// multi-collection commit (T4) fences with a kind-5 conditional record via
+// multi-collection commit (T4) fences with a kind-4 conditional record via
 // preparePrimaryBatchConditionalLocked, then publishes under externally held
 // snapshot gates.
 type stagedPrimaryBatch struct {
@@ -178,7 +178,7 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 // stagePrimaryBatchLocked materializes any pending overlay, plans and builds
 // every touched leaf, reserves capacity, and admits overflow chains plus leaf
 // frames. It stops before any journal fence: the caller chooses kind-3
-// (single-collection Update) or kind-5 (conditional prepare). The writer must
+// (single-collection Update) or kind-4 (conditional prepare). The writer must
 // already be held. On success with live == true the returned unwind clears
 // every admitted frame; call it on any failure before publish. On a no-op
 // batch (absent deletes only) live is false and unwind is a no-op.
@@ -189,7 +189,7 @@ func (c *Collection) stagePrimaryBatchLocked(
 }
 
 // stagePrimaryBatchConditionalLocked stages a multi-collection participant
-// after reserving room for its larger kind-5 conditional journal record. The
+// after reserving room for its larger kind-4 conditional journal record. The
 // ordinary buffered single-collection lane keeps its compact kind-3 journal
 // policy and physical-checkpoint fallback.
 func (c *Collection) stagePrimaryBatchConditionalLocked(
@@ -305,15 +305,16 @@ func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
 	staged.live = false
 }
 
-// preparePrimaryBatchConditionalLocked appends one kind-5 conditional batch
+// preparePrimaryBatchConditionalLocked appends one kind-4 conditional batch
 // record for a previously staged batch. forceSync makes the append durable in
 // place; multi-collection commit always passes true so every supported lane
-// fences before the decision record. Append and sync failures both poison with
-// plain poisonJournal — a conditional record without a decision cannot have
-// committed, so ErrCommitOutcomeUnknown is reserved for the decision sync.
-// Conditional staging has already reserved the exact kind-5 bytes before any
+// fences before the decision record. An append may report failure after its
+// complete checksummed body reached the page cache, and a sync failure may have
+// made that body durable. Both poison with ErrCommitOutcomeUnknown: recovery can
+// observe the prepare even though the transaction itself remains unresolved.
+// Conditional staging has already reserved the exact kind-4 bytes before any
 // frame admission. This phase therefore only rechecks that immutable plan and
-// appends it; it must never checkpoint, remint, or grow after dirty frames have
+// appends it; it must never checkpoint or grow after dirty frames have
 // been admitted. The writer must already be held.
 func (c *Collection) preparePrimaryBatchConditionalLocked(
 	staged *stagedPrimaryBatch,
@@ -333,12 +334,6 @@ func (c *Collection) preparePrimaryBatchConditionalLocked(
 			ErrConditionalPrepareUnsupportedJournal,
 		)
 	}
-	if format := c.journal.Header().FormatVersion; format != storeio.RecoveryJournalFormatConditional {
-		return fmt.Errorf(
-			"%w: journal format %d",
-			ErrConditionalPrepareUnsupportedJournal, format,
-		)
-	}
 	plan, err := c.journal.PrepareConditionalBatch(c.batchJournalEntries)
 	if err != nil {
 		return err
@@ -350,11 +345,11 @@ func (c *Collection) preparePrimaryBatchConditionalLocked(
 		staged.generation, markerID, markerEpoch, txnID,
 		c.batchJournalEntries, plan,
 	); err != nil {
-		return c.poisonJournal(err)
+		return c.poisonJournalCommitOutcomeUnknown(err)
 	}
 	if forceSync {
 		if err := c.journal.Sync(c.journalPowerSafe); err != nil {
-			return c.poisonJournal(err)
+			return c.poisonJournalCommitOutcomeUnknown(err)
 		}
 	}
 	c.journalAcks.Add(1)
@@ -481,6 +476,15 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			Kind: kind, Key: key, Value: journalValue,
 		})
 	}
+	// Atomic and conditional journal batches use a canonical strict key order.
+	// WriteBatch has already deduplicated keys, and final-key mutations commute,
+	// so this changes neither the published state nor generation semantics.
+	slices.SortFunc(
+		c.batchJournalEntries,
+		func(a, b storeio.RecoveryBatchEntry) int {
+			return bytes.Compare(a.Key, b.Key)
+		},
+	)
 	// The WriteBatch already deduplicated keys. Sort by the full stable bucket
 	// identity and key, then form leaf ranges in one pass. This avoids the old
 	// O(batch*touched-leaves) linear leaf lookup for dispersed batches and turns

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -81,7 +82,7 @@ func replayConditionalAll(
 	return out
 }
 
-// TestRecoveryConditionalBatchFramingGolden pins the kind-5 wire layout: the
+// TestRecoveryConditionalBatchFramingGolden pins the kind-4 wire layout: the
 // 32-byte envelope, the conditional header offsets, entry framing, and CRC
 // coverage over envelope + conditional header + entries.
 func TestRecoveryConditionalBatchFramingGolden(t *testing.T) {
@@ -216,195 +217,15 @@ func TestRecoveryConditionalBatchFramingGolden(t *testing.T) {
 	}
 }
 
-// TestRecoveryConditionalBatchVersionGating proves the format-word gate and
-// the mutual exclusion of kind 5 with legacy/scalar-patch journals, and of
-// scalar-patch entries with the conditional format.
-func TestRecoveryConditionalBatchVersionGating(t *testing.T) {
+// TestRecoveryJournalCurrentRecordKinds proves that the authenticated top-level
+// record kind carries the atomic, delta, and conditional semantics within the
+// sole current journal container.
+func TestRecoveryJournalCurrentRecordKinds(t *testing.T) {
 	entries := testConditionalEntries()
 	conditional := testConditionalHeader(t)
 
-	for _, formatVersion := range []uint32{
-		RecoveryJournalFormatLegacy,
-		RecoveryJournalFormatScalarPatch,
-	} {
-		t.Run(formatName(formatVersion)+"-rejects-kind5-append", func(t *testing.T) {
-			rj, _ := createTestJournalFormat(t, 8<<10, formatVersion)
-			defer rj.Close()
-			beforeCursor, beforeSequence := rj.Cursor(), rj.NextSequence()
-			if _, err := rj.AppendConditionalBatch(
-				2, conditional.MarkerID, conditional.MarkerEpoch,
-				conditional.TxnID, entries,
-			); !errors.Is(err, ErrInvalidWrite) {
-				t.Fatalf("AppendConditionalBatch = %v, want invalid write", err)
-			}
-			if rj.Cursor() != beforeCursor || rj.NextSequence() != beforeSequence {
-				t.Fatalf("rejection advanced cursor/sequence")
-			}
-		})
-	}
-
-	// A kind-5 record planted in a legacy journal fails closed on open/replay.
-	t.Run("legacy-open-rejects-kind5-bytes", func(t *testing.T) {
-		rj, path := createTestJournalFormat(
-			t, 8<<10, RecoveryJournalFormatLegacy,
-		)
-		plan, ok := prepareRecoveryConditionalBatch(
-			rj.header.SectorSize, entries,
-		)
-		if !ok {
-			t.Fatal("prepare")
-		}
-		encoded := make([]byte, plan.PaddedSize())
-		if _, err := encodeRecoveryConditionalBatchRecordPrepared(
-			encoded, rj.header.SectorSize,
-			RecoveryRecord{
-				Sequence:    1,
-				Generation:  2,
-				Kind:        RecoveryRecordKindConditionalBatch,
-				Entries:     entries,
-				Conditional: conditional,
-			},
-			plan,
-		); err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		if _, err := rj.writeAt(
-			encoded, recoveryJournalRegionStart,
-		); err != nil {
-			t.Fatalf("plant kind-5: %v", err)
-		}
-		if err := rj.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		file, err := os.OpenFile(path, os.O_RDWR, 0o600)
-		if err != nil {
-			t.Fatalf("reopen: %v", err)
-		}
-		defer file.Close()
-		if _, err := OpenRecoveryJournal(file); !errors.Is(
-			err, ErrRecoveryJournalRecord,
-		) || errors.Is(err, errRecoveryJournalTruncatableTail) {
-			t.Fatalf("Open legacy+kind5 = %v, want hard record error", err)
-		}
-		header := rjHeaderFromFile(t, file)
-		if header.FormatVersion != RecoveryJournalFormatLegacy {
-			t.Fatalf("planted under format %d, want legacy", header.FormatVersion)
-		}
-		manager := newRecoveryJournalManager(file, header)
-		if err := manager.Replay(1, func(RecoveryRecord) error {
-			t.Fatal("kind-5 reached replay under legacy header")
-			return nil
-		}); !errors.Is(err, ErrRecoveryJournalRecord) ||
-			errors.Is(err, errRecoveryJournalTruncatableTail) {
-			t.Fatalf("Replay legacy+kind5 = %v, want hard record error", err)
-		}
-	})
-
-	// Scalar-patch-era binaries know only formats 0 and 1. Format word 2 is
-	// outside that set, so their open path rejects the header before decode.
-	t.Run("conditional-header-rejected-by-scalar-patch-gate", func(t *testing.T) {
-		header := testJournalHeader(t, 8*RecoveryJournalMinSectorSize)
-		header.FormatVersion = RecoveryJournalFormatConditional
-		header.RecycleCount = 1
-		encoded := make([]byte, RecoveryJournalHeaderSize)
-		if _, err := EncodeRecoveryJournalHeader(encoded, header); err != nil {
-			t.Fatalf("EncodeRecoveryJournalHeader: %v", err)
-		}
-		formatWord := binary.LittleEndian.Uint32(encoded[8:12])
-		if formatWord != RecoveryJournalFormatConditional {
-			t.Fatalf("format word = %d, want %d",
-				formatWord, RecoveryJournalFormatConditional)
-		}
-		// Exact predicate an older scalar-patch binary applies.
-		if formatWord == RecoveryJournalFormatLegacy ||
-			formatWord == RecoveryJournalFormatScalarPatch {
-			t.Fatal("conditional format collides with a pre-conditional gate value")
-		}
-		supportedByScalarPatchBinary := formatWord == RecoveryJournalFormatLegacy ||
-			formatWord == RecoveryJournalFormatScalarPatch
-		if supportedByScalarPatchBinary {
-			t.Fatal("scalar-patch-era gate accepted conditional format word")
-		}
-	})
-
-	// A scalar-patch entry inside a conditional journal fails closed.
-	t.Run("conditional-journal-rejects-scalar-patch", func(t *testing.T) {
-		rj, _ := createTestJournalFormat(
-			t, 8<<10, RecoveryJournalFormatConditional,
-		)
-		defer rj.Close()
-		scalar := []RecoveryBatchEntry{{
-			Kind:  RecoveryRecordKindScalarPatch,
-			Key:   []byte("account:1"),
-			Value: []byte("7"),
-			ScalarPatch: RecoveryScalarPatchMetadata{
-				CanonicalOffset:        12,
-				OldScalarLength:        1,
-				ExpectedResultChecksum: 0x10203040,
-			},
-		}}
-		if _, err := rj.PrepareBatch(scalar); !errors.Is(err, ErrInvalidWrite) {
-			t.Fatalf("PrepareBatch(scalar) = %v, want invalid write", err)
-		}
-		if _, err := rj.AppendBatch(2, scalar); !errors.Is(err, ErrInvalidWrite) {
-			t.Fatalf("AppendBatch(scalar) = %v, want invalid write", err)
-		}
-		if _, err := rj.AppendConditionalBatch(
-			2, conditional.MarkerID, conditional.MarkerEpoch,
-			conditional.TxnID, scalar,
-		); !errors.Is(err, ErrInvalidWrite) {
-			t.Fatalf("AppendConditionalBatch(scalar) = %v, want invalid write", err)
-		}
-
-		// Plant a checksum-valid kind-3 scalar-patch batch under a conditional
-		// header: open/replay must fail closed, not apply the patch.
-		scalarRJ, path := createTestJournalFormat(
-			t, 8<<10, RecoveryJournalFormatScalarPatch,
-		)
-		if _, err := scalarRJ.AppendBatch(2, scalar); err != nil {
-			t.Fatalf("seed scalar batch: %v", err)
-		}
-		if err := scalarRJ.Sync(false); err != nil {
-			t.Fatalf("Sync: %v", err)
-		}
-		if err := scalarRJ.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-		file, err := os.OpenFile(path, os.O_RDWR, 0o600)
-		if err != nil {
-			t.Fatalf("open for rewrite: %v", err)
-		}
-		headerBytes := make([]byte, RecoveryJournalHeaderSize)
-		if _, err := file.ReadAt(headerBytes, 0); err != nil {
-			t.Fatalf("read header: %v", err)
-		}
-		binary.LittleEndian.PutUint32(
-			headerBytes[8:12], RecoveryJournalFormatConditional,
-		)
-		checksum := PageChecksum(headerBytes[:RecoveryJournalHeaderSize-8])
-		binary.LittleEndian.PutUint32(
-			headerBytes[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4],
-			checksum,
-		)
-		binary.LittleEndian.PutUint32(
-			headerBytes[RecoveryJournalHeaderSize-4:], ^checksum,
-		)
-		if _, err := file.WriteAt(headerBytes, 0); err != nil {
-			t.Fatalf("rewrite header: %v", err)
-		}
-		if _, err := OpenRecoveryJournal(file); !errors.Is(
-			err, ErrRecoveryJournalRecord,
-		) || errors.Is(err, errRecoveryJournalTruncatableTail) {
-			t.Fatalf("Open conditional+scalar = %v, want hard record error", err)
-		}
-		_ = file.Close()
-	})
-
-	// Happy path: conditional journal accepts kinds 1/2/3/5.
-	t.Run("conditional-journal-accepts-mixed-kinds", func(t *testing.T) {
-		rj, path := createTestJournalFormat(
-			t, 64<<10, RecoveryJournalFormatConditional,
-		)
+	t.Run("atomic-family", func(t *testing.T) {
+		rj, path := createTestJournal(t, 64<<10)
 		if _, err := rj.Append(
 			RecoveryRecordKindPut, 2, []byte("solo"), []byte("v"),
 		); err != nil {
@@ -430,9 +251,8 @@ func TestRecoveryConditionalBatchVersionGating(t *testing.T) {
 		}
 		rj = reopenTestJournal(t, path)
 		defer rj.Close()
-		if rj.Header().FormatVersion != RecoveryJournalFormatConditional {
-			t.Fatalf("reopened format = %d, want conditional",
-				rj.Header().FormatVersion)
+		if rj.Header().Format != RecoveryJournalFormat {
+			t.Fatalf("reopened format = %d, want current", rj.Header().Format)
 		}
 		recs := replayConditionalAll(t, rj, 1)
 		if len(recs) != 3 {
@@ -441,49 +261,93 @@ func TestRecoveryConditionalBatchVersionGating(t *testing.T) {
 		if recs[0].Kind != RecoveryRecordKindPut ||
 			recs[1].Kind != RecoveryRecordKindBatch ||
 			recs[2].Kind != RecoveryRecordKindConditionalBatch {
-			t.Fatalf("kinds = %d,%d,%d", recs[0].Kind, recs[1].Kind, recs[2].Kind)
+			t.Fatalf("kinds = %d,%d,%d",
+				recs[0].Kind, recs[1].Kind, recs[2].Kind)
 		}
 		if recs[2].Conditional != conditional || len(recs[2].Entries) != 3 {
 			t.Fatalf("conditional record = %+v", recs[2])
 		}
 	})
-}
 
-func formatName(formatVersion uint32) string {
-	switch formatVersion {
-	case RecoveryJournalFormatLegacy:
-		return "legacy"
-	case RecoveryJournalFormatScalarPatch:
-		return "scalar-patch"
-	case RecoveryJournalFormatConditional:
-		return "conditional"
-	default:
-		return "unknown"
-	}
-}
+	t.Run("family-transitions-reject-before-write", func(t *testing.T) {
+		deltaEntries := []RecoveryBatchEntry{{
+			Kind: RecoveryRecordKindPut, Key: []byte("d"), Value: []byte("1"),
+		}}
+		for _, test := range []struct {
+			name  string
+			first func(*RecoveryJournal) error
+			next  func(*RecoveryJournal) error
+		}{
+			{
+				name: "atomic-to-delta",
+				first: func(rj *RecoveryJournal) error {
+					_, err := rj.Append(RecoveryRecordKindPut, 2, []byte("a"), []byte("1"))
+					return err
+				},
+				next: func(rj *RecoveryJournal) error {
+					_, err := rj.AppendDeltaBatch(3, deltaEntries)
+					return err
+				},
+			},
+			{
+				name: "delta-to-atomic",
+				first: func(rj *RecoveryJournal) error {
+					_, err := rj.AppendDeltaBatch(2, deltaEntries)
+					return err
+				},
+				next: func(rj *RecoveryJournal) error {
+					_, err := rj.Append(RecoveryRecordKindPut, 3, []byte("a"), []byte("1"))
+					return err
+				},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				rj, _ := createTestJournal(t, 64<<10)
+				defer rj.Close()
+				if err := test.first(rj); err != nil {
+					t.Fatal(err)
+				}
+				cursor, sequence := rj.Cursor(), rj.NextSequence()
+				if err := test.next(rj); !errors.Is(err, ErrInvalidWrite) {
+					t.Fatalf("transition = %v, want invalid write", err)
+				}
+				if rj.Cursor() != cursor || rj.NextSequence() != sequence {
+					t.Fatalf("rejected transition advanced cursor/sequence")
+				}
+			})
+		}
+	})
 
-func rjHeaderFromFile(t *testing.T, file *os.File) RecoveryJournalHeader {
-	t.Helper()
-	buf := make([]byte, RecoveryJournalHeaderSize)
-	if _, err := file.ReadAt(buf, 0); err != nil {
-		t.Fatalf("read header: %v", err)
-	}
-	h, err := DecodeRecoveryJournalHeader(buf)
-	if err != nil {
-		t.Fatalf("decode header: %v", err)
-	}
-	return h
+	t.Run("delta-chain-gap-overlap-and-reorder-reject-before-write", func(t *testing.T) {
+		entries := []RecoveryBatchEntry{{
+			Kind: RecoveryRecordKindPut, Key: []byte("d"), Value: []byte("1"),
+		}}
+		for _, generation := range []uint64{4, 2, 1} {
+			t.Run(fmt.Sprint(generation), func(t *testing.T) {
+				rj, _ := createTestJournal(t, 64<<10)
+				defer rj.Close()
+				if _, err := rj.AppendDeltaBatch(2, entries); err != nil {
+					t.Fatal(err)
+				}
+				cursor, sequence := rj.Cursor(), rj.NextSequence()
+				if _, err := rj.AppendDeltaBatch(generation, entries); !errors.Is(err, ErrInvalidWrite) {
+					t.Fatalf("generation %d = %v, want invalid write", generation, err)
+				}
+				if rj.Cursor() != cursor || rj.NextSequence() != sequence {
+					t.Fatal("rejected delta chain advanced cursor/sequence")
+				}
+			})
+		}
+	})
 }
 
 // TestRecoveryConditionalBatchTornTailPrefixSweep proves every byte prefix of a
-// journal ending in a kind-5 record either decodes a strict complete-record
+// journal ending in a kind-4 record either decodes a strict complete-record
 // prefix or truncates; never a partial conditional record.
 func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 	entries := testConditionalEntries()
 	conditional := testConditionalHeader(t)
-	rj, path := createTestJournalFormat(
-		t, 64<<10, RecoveryJournalFormatConditional,
-	)
+	rj, path := createTestJournal(t, 64<<10)
 	if _, err := rj.Append(
 		RecoveryRecordKindPut, 2, []byte("survivor"), []byte("kept"),
 	); err != nil {
@@ -500,7 +364,7 @@ func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	completeSize := rj.Cursor()
-	kind5Size := completeSize - cursorBefore
+	conditionalSize := completeSize - cursorBefore
 	if err := rj.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -511,9 +375,9 @@ func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 	}
 	recordOff := recoveryJournalRegionStart + int(cursorBefore)
 	recordEnd := recoveryJournalRegionStart + int(completeSize)
-	if recordEnd > len(full) || uint64(kind5Size) == 0 {
-		t.Fatalf("record span [%d,%d) kind5=%d file=%d",
-			recordOff, recordEnd, kind5Size, len(full))
+	if recordEnd > len(full) || uint64(conditionalSize) == 0 {
+		t.Fatalf("record span [%d,%d) conditional=%d file=%d",
+			recordOff, recordEnd, conditionalSize, len(full))
 	}
 
 	// Encode-level sweep: every prefix shorter than the CRC-sealed payload
@@ -556,7 +420,7 @@ func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 		record, RecoveryJournalMinSectorSize, 2,
 	)
 	if err != nil {
-		t.Fatalf("full kind-5 decode: %v", err)
+		t.Fatalf("full kind-4 decode: %v", err)
 	}
 	if padded != len(record) ||
 		rec.Kind != RecoveryRecordKindConditionalBatch ||
@@ -566,7 +430,7 @@ func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 	}
 
 	// File-level sweep: keep the preallocated file length and rewrite only the
-	// kind-5 span so Open can still read the capacity region. Prefixes short of
+	// kind-4 span so Open can still read the capacity region. Prefixes short of
 	// the CRC seal truncate before the conditional record; at or past the seal
 	// the record replays whole — never a partial entry list.
 	for n := 0; n <= len(record); n++ {
@@ -631,16 +495,13 @@ func TestRecoveryConditionalBatchTornTailPrefixSweep(t *testing.T) {
 	}
 }
 
-// TestRecoveryConditionalBatchRecycleDropsStaleSequence proves stale kind-5
+// TestRecoveryConditionalBatchRecycleDropsStaleSequence proves stale kind-4
 // bytes left after recycle are not decodable as live under the new base
 // sequence anchor.
 func TestRecoveryConditionalBatchRecycleDropsStaleSequence(t *testing.T) {
 	entries := testConditionalEntries()
 	conditional := testConditionalHeader(t)
-	rj, path := createTestJournalFormat(
-		t, 16*RecoveryJournalMinSectorSize,
-		RecoveryJournalFormatConditional,
-	)
+	rj, path := createTestJournal(t, 16*RecoveryJournalMinSectorSize)
 	if _, err := rj.AppendConditionalBatch(
 		2, conditional.MarkerID, conditional.MarkerEpoch,
 		conditional.TxnID, entries,
@@ -690,20 +551,96 @@ func TestRecoveryConditionalBatchRecycleDropsStaleSequence(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalRecycleResolvedDropsOnlyProvenAbort(t *testing.T) {
+	entries := testConditionalEntries()[:1]
+	conditional := testConditionalHeader(t)
+
+	t.Run("aborted", func(t *testing.T) {
+		rj, _ := createTestJournal(t, 8*RecoveryJournalMinSectorSize)
+		defer rj.Close()
+		if _, err := rj.AppendConditionalBatch(
+			2, conditional.MarkerID, conditional.MarkerEpoch,
+			conditional.TxnID, entries,
+		); err != nil {
+			t.Fatalf("AppendConditionalBatch: %v", err)
+		}
+		if err := rj.Sync(false); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+
+		beforeCursor := rj.Cursor()
+		beforeCount := rj.Header().RecycleCount
+		if err := rj.Recycle(1, false); !errors.Is(err, ErrGenerationOrder) {
+			t.Fatalf("ordinary Recycle of abort-only tail = %v, want %v", err, ErrGenerationOrder)
+		}
+		resolveCalls := 0
+		err := rj.RecycleResolved(
+			1, false,
+			func(got RecoveryConditionalHeader, generation uint64) (bool, error) {
+				resolveCalls++
+				if got != conditional || generation != 2 {
+					t.Fatalf("resolved conditional = %+v @ %d, want %+v @ 2", got, generation, conditional)
+				}
+				return false, nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("RecycleResolved aborted tail: %v", err)
+		}
+		if resolveCalls != 1 {
+			t.Fatalf("resolver calls = %d, want 1", resolveCalls)
+		}
+		if rj.BaseGeneration() != 1 || rj.Cursor() != 0 ||
+			rj.LiveEndGeneration() != 1 ||
+			rj.Header().RecycleCount != beforeCount+1 {
+			t.Fatalf(
+				"resolved recycle state: base=%d cursor=%d live-end=%d count=%d (before cursor/count %d/%d)",
+				rj.BaseGeneration(), rj.Cursor(), rj.LiveEndGeneration(),
+				rj.Header().RecycleCount, beforeCursor, beforeCount,
+			)
+		}
+	})
+
+	t.Run("committed-not-covered", func(t *testing.T) {
+		rj, _ := createTestJournal(t, 8*RecoveryJournalMinSectorSize)
+		defer rj.Close()
+		if _, err := rj.AppendConditionalBatch(
+			2, conditional.MarkerID, conditional.MarkerEpoch,
+			conditional.TxnID, entries,
+		); err != nil {
+			t.Fatalf("AppendConditionalBatch: %v", err)
+		}
+		beforeCursor := rj.Cursor()
+		beforeCount := rj.Header().RecycleCount
+		err := rj.RecycleResolved(
+			1, false,
+			func(RecoveryConditionalHeader, uint64) (bool, error) {
+				return true, nil
+			},
+		)
+		if !errors.Is(err, ErrGenerationOrder) {
+			t.Fatalf("RecycleResolved uncovered commit = %v, want %v", err, ErrGenerationOrder)
+		}
+		if rj.BaseGeneration() != 1 || rj.Cursor() != beforeCursor ||
+			rj.Header().RecycleCount != beforeCount {
+			t.Fatalf(
+				"refused resolved recycle changed state: base=%d cursor=%d count=%d",
+				rj.BaseGeneration(), rj.Cursor(), rj.Header().RecycleCount,
+			)
+		}
+	})
+}
+
 // TestRecoveryConditionalBatchAppendAllocationsMatchBatch proves appending a
-// kind-5 record allocates within the same budget as an equivalent kind-3 batch
+// kind-4 record allocates within the same budget as an equivalent kind-3 batch
 // on a warm scratch buffer.
 func TestRecoveryConditionalBatchAppendAllocationsMatchBatch(t *testing.T) {
 	entries := testConditionalEntries()
 	conditional := testConditionalHeader(t)
 
-	batchRJ, _ := createTestJournalFormat(
-		t, 1<<20, RecoveryJournalFormatConditional,
-	)
+	batchRJ, _ := createTestJournal(t, 1<<20)
 	defer batchRJ.Close()
-	condRJ, _ := createTestJournalFormat(
-		t, 1<<20, RecoveryJournalFormatConditional,
-	)
+	condRJ, _ := createTestJournal(t, 1<<20)
 	defer condRJ.Close()
 	batchRJ.writeAt = func(p []byte, _ int64) (int, error) { return len(p), nil }
 	condRJ.writeAt = func(p []byte, _ int64) (int, error) { return len(p), nil }
@@ -723,6 +660,10 @@ func TestRecoveryConditionalBatchAppendAllocationsMatchBatch(t *testing.T) {
 	batchAllocs := testing.AllocsPerRun(50, func() {
 		batchRJ.cursor = 0
 		batchRJ.nextSequence = 1
+		batchRJ.family = recoveryRecordFamilyEmpty
+		batchRJ.atomicLastGeneration = 0
+		batchRJ.atomicLastKind = 0
+		batchRJ.conditionalChain = recoveryConditionalChain{}
 		_, batchErr = batchRJ.AppendBatch(2, entries)
 	})
 	if batchErr != nil {
@@ -731,6 +672,10 @@ func TestRecoveryConditionalBatchAppendAllocationsMatchBatch(t *testing.T) {
 	condAllocs := testing.AllocsPerRun(50, func() {
 		condRJ.cursor = 0
 		condRJ.nextSequence = 1
+		condRJ.family = recoveryRecordFamilyEmpty
+		condRJ.atomicLastGeneration = 0
+		condRJ.atomicLastKind = 0
+		condRJ.conditionalChain = recoveryConditionalChain{}
 		_, condErr = condRJ.AppendConditionalBatch(
 			2, conditional.MarkerID, conditional.MarkerEpoch,
 			conditional.TxnID, entries,

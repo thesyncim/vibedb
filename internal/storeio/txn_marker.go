@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -23,9 +24,9 @@ import (
 // fsync have all completed. A failure anywhere in that sequence is a typed
 // error and leaves no usable marker — reopen finds the path absent, a
 // valid-empty log, or ErrTxnMarkerNoValidHeader. Policy over that residue
-// (re-mint versus fail-closed) belongs to the durable layer, not this package.
+// (fresh creation versus fail-closed) belongs to the durable layer, not this package.
 //
-// Recycle legality ("no participant journal still holds current-epoch kind-5
+// Recycle legality ("no participant journal still holds current-epoch kind-4
 // records") is also the caller's rule; this package only provides Recycle.
 const (
 	// TxnMarkerHeaderSize is one damage-granule-aligned header sector.
@@ -44,17 +45,15 @@ const (
 	// txnMarkerDefaultCapacityBytes is the create-time default record region.
 	txnMarkerDefaultCapacityBytes = uint64(1) << 20
 
-	// TxnMarkerFormatVersion is the only admitted decision-log grammar. It is
-	// nonzero so a hypothetical reader that required a zero format word rejects
-	// the file before decoding records.
-	TxnMarkerFormatVersion = uint32(1)
+	// TxnMarkerFormat is the sole admitted decision-log grammar.
+	TxnMarkerFormat = uint32(0)
 
 	// txnMarkerFlagSealedCapacity marks Capacity as an immutable physical
 	// certificate. Every other bit in the current reserved flags word is invalid.
 	txnMarkerFlagSealedCapacity = uint32(1)
 
-	txnMarkerMagic       = "VTXNLOG\x00"
-	txnMarkerRecordMagic = uint32(0x304e5854) // "TXN0", little-endian.
+	txnMarkerMagic       = "VTXNMRK\x00"
+	txnMarkerRecordMagic = uint32(0x524d5456) // "VTMR", little-endian.
 
 	// TxnMarkerRecordKindDecision is a committed multi-collection transaction.
 	TxnMarkerRecordKindDecision = uint16(1)
@@ -80,9 +79,10 @@ var (
 	// geometry is invalid.
 	ErrTxnMarkerCorrupt = errors.New("vibedb: corrupt transaction decision log header")
 	// ErrTxnMarkerNoValidHeader reports a file whose header slots are all
-	// invalid. The durable layer treats this as re-mintable mint residue when
-	// no journal holds conditional records, and as fail-closed tampering
-	// otherwise — that policy is not this package's.
+	// uninitialized or checksum-invalid. A checksum-authenticated semantic error
+	// is ErrTxnMarkerCorrupt instead. The durable layer treats no-valid-header as
+	// removable creation residue when no journal holds conditional records, and
+	// as fail-closed tampering otherwise — that policy is not this package's.
 	ErrTxnMarkerNoValidHeader = errors.New("vibedb: transaction decision log has no valid header")
 	// ErrTxnMarkerFull reports that the next record does not fit the
 	// preallocated capacity.
@@ -122,19 +122,20 @@ func txnMarkerSemanticError(reason string) error {
 }
 
 // TxnMarkerHeader is the pointer-free identity and geometry of one decision
-// log. FormatVersion gates the record grammar; BaseSequence anchors monotonic
+// log. Format gates the record grammar; BaseSequence anchors monotonic
 // sequence validation so stale bytes left after a recycle can never be
 // mistaken for live records.
 type TxnMarkerHeader struct {
-	FormatVersion uint32
-	MarkerID      [16]byte
-	Epoch         uint64
-	BaseSequence  uint64
-	Capacity      uint64
+	Format       uint32
+	MarkerID     [16]byte
+	Epoch        uint64
+	BaseSequence uint64
+	Capacity     uint64
 	// SealedCapacity requires an exact-size, strictly allocated marker file.
 	SealedCapacity bool
 	// RecycleCount is strictly monotonic across recycles. Open selects the
-	// valid header slot with the highest count.
+	// semantically valid header slot with the highest count. A checksum-invalid
+	// torn publication may fall back; authenticated semantic damage fails closed.
 	RecycleCount uint64
 }
 
@@ -170,6 +171,11 @@ type TxnMarker struct {
 	cursor uint64
 	// nextSequence is the DCSN the next appended record will carry.
 	nextSequence uint64
+	// lastTxnID is the greatest decision TxnID in the current epoch. Decision
+	// records are strictly increasing in DCSN order; retirement records do not
+	// reset it.
+	lastTxnID uint64
+	retired   map[[16]byte]struct{}
 	// headerSlot is the alternating slot the live header occupies.
 	headerSlot uint32
 	scratch    []byte
@@ -217,9 +223,26 @@ type TxnDecisions struct {
 	markerID      [16]byte
 	epoch         uint64
 	decisions     map[uint64][]TxnParticipant
+	decisionIDs   []uint64
 	retired       map[[16]byte]struct{}
 	maxTxnID      uint64
 	maxDCSN       uint64
+}
+
+// RangeDecisions visits committed decisions in authenticated record order.
+// Each participant slice is a defensive copy. Returning false stops iteration.
+func (d *TxnDecisions) RangeDecisions(
+	visit func(txnID uint64, participants []TxnParticipant) bool,
+) {
+	if d == nil || visit == nil {
+		return
+	}
+	for _, txnID := range d.decisionIDs {
+		participants := append([]TxnParticipant(nil), d.decisions[txnID]...)
+		if !visit(txnID, participants) {
+			return
+		}
+	}
 }
 
 // SourceDir returns the canonical directory name captured when the decision
@@ -352,11 +375,14 @@ func (d *TxnDecisions) Retired(storeID [16]byte) bool {
 }
 
 func validateTxnMarkerHeader(h TxnMarkerHeader) error {
-	if h.FormatVersion != TxnMarkerFormatVersion {
-		return fmt.Errorf("%w: format version", ErrTxnMarkerCorrupt)
+	if h.Format != TxnMarkerFormat {
+		return fmt.Errorf("%w: format", ErrTxnMarkerCorrupt)
 	}
 	if h.MarkerID == ([16]byte{}) {
 		return fmt.Errorf("%w: zero marker identity", ErrTxnMarkerCorrupt)
+	}
+	if h.Epoch == 0 {
+		return fmt.Errorf("%w: zero epoch", ErrTxnMarkerCorrupt)
 	}
 	if h.Capacity == 0 ||
 		h.Capacity > TxnMarkerMaxCapacityBytes ||
@@ -407,7 +433,7 @@ func EncodeTxnMarkerHeader(dst []byte, h TxnMarkerHeader) ([]byte, error) {
 	sector := dst[:TxnMarkerHeaderSize]
 	clear(sector)
 	copy(sector[0:8], txnMarkerMagic)
-	binary.LittleEndian.PutUint32(sector[8:12], h.FormatVersion)
+	binary.LittleEndian.PutUint32(sector[8:12], h.Format)
 	binary.LittleEndian.PutUint32(sector[12:16], TxnMarkerHeaderSize)
 	copy(sector[16:32], h.MarkerID[:])
 	binary.LittleEndian.PutUint64(sector[32:40], h.Epoch)
@@ -437,11 +463,11 @@ func DecodeTxnMarkerHeader(src []byte) (TxnMarkerHeader, error) {
 		PageChecksum(src[:TxnMarkerHeaderSize-8]) != checksum {
 		return TxnMarkerHeader{}, fmt.Errorf("%w: checksum", ErrTxnMarkerCorrupt)
 	}
-	if binary.LittleEndian.Uint32(src[8:12]) != TxnMarkerFormatVersion ||
+	if binary.LittleEndian.Uint32(src[8:12]) != TxnMarkerFormat ||
 		binary.LittleEndian.Uint32(src[12:16]) != TxnMarkerHeaderSize {
-		return TxnMarkerHeader{}, fmt.Errorf("%w: version or header size", ErrTxnMarkerCorrupt)
+		return TxnMarkerHeader{}, fmt.Errorf("%w: format or header size", ErrTxnMarkerCorrupt)
 	}
-	h := TxnMarkerHeader{FormatVersion: TxnMarkerFormatVersion}
+	h := TxnMarkerHeader{Format: TxnMarkerFormat}
 	copy(h.MarkerID[:], src[16:32])
 	h.Epoch = binary.LittleEndian.Uint64(src[32:40])
 	h.BaseSequence = binary.LittleEndian.Uint64(src[40:48])
@@ -461,6 +487,22 @@ func DecodeTxnMarkerHeader(src []byte) (TxnMarkerHeader, error) {
 	return h, nil
 }
 
+// txnMarkerHeaderAuthenticated is the marker counterpart to
+// recoveryJournalHeaderAuthenticated. A checksum-valid slot is an
+// authoritative semantic statement even when its fields are invalid, so
+// selection must fail closed instead of resurrecting an older epoch.
+func txnMarkerHeaderAuthenticated(src []byte) bool {
+	if len(src) < TxnMarkerHeaderSize {
+		return false
+	}
+	src = src[:TxnMarkerHeaderSize]
+	checksum := binary.LittleEndian.Uint32(
+		src[TxnMarkerHeaderSize-8 : TxnMarkerHeaderSize-4],
+	)
+	return binary.LittleEndian.Uint32(src[TxnMarkerHeaderSize-4:]) == ^checksum &&
+		PageChecksum(src[:TxnMarkerHeaderSize-8]) == checksum
+}
+
 func validateTxnParticipants(participants []TxnParticipant) error {
 	if len(participants) == 0 || len(participants) > TxnMarkerMaxParticipants {
 		return fmt.Errorf("%w: participant count", ErrInvalidWrite)
@@ -470,6 +512,12 @@ func validateTxnParticipants(participants []TxnParticipant) error {
 			participants[i].JournalID == ([16]byte{}) ||
 			participants[i].PreparedGeneration == 0 {
 			return fmt.Errorf("%w: participant identity or generation", ErrInvalidWrite)
+		}
+		for previous := 0; previous < i; previous++ {
+			if participants[previous].StoreID == participants[i].StoreID ||
+				participants[previous].JournalID == participants[i].JournalID {
+				return fmt.Errorf("%w: duplicate participant identity", ErrInvalidWrite)
+			}
 		}
 	}
 	return nil
@@ -563,28 +611,108 @@ type txnMarkerRecord struct {
 func decodeTxnMarkerRecord(
 	src []byte, expectedSequence uint64,
 ) (txnMarkerRecord, int, error) {
+	if expectedSequence == 0 {
+		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+			"record sequence space exhausted",
+		)
+	}
 	if len(src) < TxnMarkerRecordPrefixSize+TxnMarkerRecordTrailerSize {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("short record")
 	}
-	if binary.LittleEndian.Uint32(src[0:4]) != txnMarkerRecordMagic {
+	magic := binary.LittleEndian.Uint32(src[0:4])
+	if magic != txnMarkerRecordMagic {
+		if txnMarkerRecordHasAuthenticatedKnownLayout(src) {
+			return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+				"checksum-valid non-current record domain",
+			)
+		}
 		return txnMarkerRecord{}, 0, txnMarkerTailError("magic")
 	}
 	kind := binary.LittleEndian.Uint16(src[4:6])
-	if binary.LittleEndian.Uint16(src[6:8]) != 0 {
-		return txnMarkerRecord{}, 0, txnMarkerTailError("reserved")
-	}
 	sequence := binary.LittleEndian.Uint64(src[8:16])
-	if sequence != expectedSequence {
+	if sequence != expectedSequence && sequence != 0 {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("sequence")
 	}
 	switch kind {
 	case TxnMarkerRecordKindDecision:
-		return decodeTxnDecisionRecord(src, sequence)
+		rec, padded, err := decodeTxnDecisionRecord(src, sequence)
+		if err == nil {
+			return rec, padded, nil
+		}
+		if errors.Is(err, errTxnMarkerTruncatableTail) &&
+			txnMarkerRecordHasAuthenticatedRetirementLayout(src) {
+			return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+				"decision kind authenticates retirement layout",
+			)
+		}
+		return txnMarkerRecord{}, 0, err
 	case TxnMarkerRecordKindRetirement:
-		return decodeTxnRetirementRecord(src, sequence)
+		rec, padded, err := decodeTxnRetirementRecord(src, sequence)
+		if err == nil {
+			return rec, padded, nil
+		}
+		if errors.Is(err, errTxnMarkerTruncatableTail) &&
+			txnMarkerRecordHasAuthenticatedDecisionLayout(src) {
+			return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+				"retirement kind authenticates decision layout",
+			)
+		}
+		return txnMarkerRecord{}, 0, err
 	default:
+		if txnMarkerRecordHasAuthenticatedKnownLayout(src) {
+			return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+				"checksum-valid unknown record kind",
+			)
+		}
 		return txnMarkerRecord{}, 0, txnMarkerTailError("kind")
 	}
+}
+
+// txnMarkerRecordHasAuthenticatedKnownLayout distinguishes a torn/stale tail
+// with an arbitrary kind word from a complete checksummed current record whose
+// kind was corrupted or forged. The latter is semantic corruption: silently
+// truncating it could omit a durable commit decision. Both admitted record
+// layouts are bounded and share the current prefix/trailer checksum grammar.
+func txnMarkerRecordHasAuthenticatedKnownLayout(src []byte) bool {
+	if len(src) < TxnMarkerRecordPrefixSize+TxnMarkerRecordTrailerSize {
+		return false
+	}
+	return txnMarkerRecordHasAuthenticatedRetirementLayout(src) ||
+		txnMarkerRecordHasAuthenticatedDecisionLayout(src)
+}
+
+func txnMarkerChecksumValidAt(src []byte, bodyEnd uint64) bool {
+	if bodyEnd+TxnMarkerRecordTrailerSize > uint64(len(src)) {
+		return false
+	}
+	checksum := binary.LittleEndian.Uint32(src[bodyEnd : bodyEnd+4])
+	return binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) == ^checksum &&
+		PageChecksum(src[:bodyEnd]) == checksum
+}
+
+func txnMarkerRecordHasAuthenticatedRetirementLayout(src []byte) bool {
+	return len(src) >= TxnMarkerRecordPrefixSize+TxnMarkerRecordTrailerSize &&
+		txnMarkerChecksumValidAt(src, TxnMarkerRecordPrefixSize)
+}
+
+func txnMarkerRecordHasAuthenticatedDecisionLayout(src []byte) bool {
+	if len(src) < TxnMarkerRecordPrefixSize+TxnMarkerRecordTrailerSize {
+		return false
+	}
+	participantCount := binary.LittleEndian.Uint32(src[24:28])
+	if participantCount == 0 {
+		return false
+	}
+	body, ok := checkedSizeMul(
+		uint64(participantCount), TxnParticipantSize, uint64(maxIntValue),
+	)
+	if !ok {
+		return false
+	}
+	bodyEnd, ok := checkedSizeAdd(
+		TxnMarkerRecordPrefixSize, body, uint64(maxIntValue),
+	)
+	return ok && txnMarkerChecksumValidAt(src, bodyEnd)
 }
 
 func decodeTxnDecisionRecord(
@@ -592,13 +720,6 @@ func decodeTxnDecisionRecord(
 ) (txnMarkerRecord, int, error) {
 	txnID := binary.LittleEndian.Uint64(src[16:24])
 	participantCount := binary.LittleEndian.Uint32(src[24:28])
-	if binary.LittleEndian.Uint32(src[28:32]) != 0 {
-		return txnMarkerRecord{}, 0, txnMarkerTailError("reserved")
-	}
-	if txnID == 0 || participantCount == 0 ||
-		participantCount > TxnMarkerMaxParticipants {
-		return txnMarkerRecord{}, 0, txnMarkerTailError("decision framing")
-	}
 	body, ok := checkedSizeMul(
 		uint64(participantCount), TxnParticipantSize, uint64(maxIntValue),
 	)
@@ -618,6 +739,14 @@ func decodeTxnDecisionRecord(
 	if binary.LittleEndian.Uint32(src[bodyEnd+4:bodyEnd+8]) != ^checksum ||
 		PageChecksum(src[:bodyEnd]) != checksum {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("checksum")
+	}
+	if sequence == 0 || txnID == 0 || participantCount == 0 ||
+		participantCount > TxnMarkerMaxParticipants ||
+		binary.LittleEndian.Uint16(src[6:8]) != 0 ||
+		binary.LittleEndian.Uint32(src[28:32]) != 0 {
+		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+			"checksum-valid decision framing",
+		)
 	}
 	padded, ok := checkedTxnMarkerPadRaw(crcEnd)
 	if !ok || len(src) < padded {
@@ -640,6 +769,11 @@ func decodeTxnDecisionRecord(
 		}
 		cursor += TxnParticipantSize
 	}
+	if err := validateTxnParticipants(participants); err != nil {
+		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+			"checksum-valid duplicate participant identity",
+		)
+	}
 	return txnMarkerRecord{
 		Sequence:     sequence,
 		Kind:         TxnMarkerRecordKindDecision,
@@ -661,6 +795,11 @@ func decodeTxnRetirementRecord(
 	) != ^checksum ||
 		PageChecksum(src[:TxnMarkerRecordPrefixSize]) != checksum {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("checksum")
+	}
+	if sequence == 0 || binary.LittleEndian.Uint16(src[6:8]) != 0 {
+		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
+			"checksum-valid retirement framing",
+		)
 	}
 	padded, ok := checkedTxnRetirementPaddedSize()
 	if !ok || len(src) < padded {
@@ -751,7 +890,7 @@ func createTxnMarkerInRoot(
 		return nil, err
 	}
 	header := TxnMarkerHeader{
-		FormatVersion:  TxnMarkerFormatVersion,
+		Format:         TxnMarkerFormat,
 		MarkerID:       markerID,
 		Epoch:          1,
 		BaseSequence:   0,
@@ -811,9 +950,11 @@ func createTxnMarkerInRoot(
 	return m, nil
 }
 
-// OpenTxnMarker opens an existing decision log, selects the valid header with
-// the greatest recycle count, scans the live record prefix into TxnDecisions,
-// and positions the append cursor at the first truncatable tail.
+// OpenTxnMarker opens an existing decision log, selects the semantically valid
+// header with the greatest recycle count, scans the live record prefix into
+// TxnDecisions, and positions the append cursor at the first truncatable tail.
+// A checksum-authenticated invalid header slot fails closed rather than falling
+// back to an older epoch.
 func OpenTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, *TxnDecisions, error) {
 	if path == "" {
 		return nil, nil, fmt.Errorf("%w: empty decision log path", ErrInvalidWrite)
@@ -988,7 +1129,19 @@ func selectTxnMarkerHeader(file *os.File) (TxnMarkerHeader, int, error) {
 		}
 		h, err := DecodeTxnMarkerHeader(slots[slot][:])
 		if err != nil {
+			if txnMarkerHeaderAuthenticated(slots[slot][:]) {
+				return TxnMarkerHeader{}, -1, fmt.Errorf(
+					"%w: authenticated invalid header slot %d: %v",
+					ErrTxnMarkerCorrupt, slot, err,
+				)
+			}
 			continue
+		}
+		if selected >= 0 && h.RecycleCount == header.RecycleCount && h != header {
+			return TxnMarkerHeader{}, -1, fmt.Errorf(
+				"%w: conflicting equal-count header slots",
+				ErrTxnMarkerCorrupt,
+			)
 		}
 		if selected < 0 || h.RecycleCount > header.RecycleCount {
 			selected = slot
@@ -1178,13 +1331,42 @@ func (m *TxnMarker) NextSequence() uint64 { return m.nextSequence }
 // Cursor reports the in-region byte offset of the next append.
 func (m *TxnMarker) Cursor() uint64 { return m.cursor }
 
+// FitsRetirement reports whether one participant-retirement record can consume
+// the next sequence and fit at the current cursor without recycling. It is a
+// pure preflight used by catalog drop barriers so ordinary pressure remains a
+// definite capacity condition rather than being misclassified as a failed
+// positional append.
+func (m *TxnMarker) FitsRetirement() bool {
+	if m == nil || m.nextSequence == 0 {
+		return false
+	}
+	padded, ok := checkedTxnRetirementPaddedSize()
+	if !ok {
+		return false
+	}
+	end, ok := checkedSizeAdd(m.cursor, uint64(padded), ^uint64(0))
+	return ok && end <= m.header.Capacity
+}
+
 func (m *TxnMarker) writeHeader(slot uint32, header TxnMarkerHeader) error {
 	if _, err := EncodeTxnMarkerHeader(m.scratch, header); err != nil {
 		return err
 	}
 	off := int64(slot) * TxnMarkerHeaderSize
-	if _, err := m.writeAt(m.scratch[:TxnMarkerHeaderSize], off); err != nil {
+	return writeTxnMarkerFull(
+		m.writeAt, m.scratch[:TxnMarkerHeaderSize], off,
+	)
+}
+
+func writeTxnMarkerFull(
+	writeAt func([]byte, int64) (int, error), p []byte, off int64,
+) error {
+	n, err := writeAt(p, off)
+	if err != nil {
 		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
@@ -1205,6 +1387,12 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 		markerID:      m.header.MarkerID,
 		epoch:         m.header.Epoch,
 	}
+	// A terminal BaseSequence is a valid exhausted log. Recycle leaves the old
+	// record bytes intact, and sequence zero is never a legal successor, so do
+	// not reinterpret stale current-magic bytes after exhaustion.
+	if m.nextSequence == 0 {
+		return nil
+	}
 
 	// Empty / fully recycled logs begin with a zeroed region. Bad magic is the
 	// authoritative truncatable-tail marker, so prove that from the first word
@@ -1214,7 +1402,7 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 	); err != nil {
 		return err
 	}
-	if binary.LittleEndian.Uint32(m.scratch[:4]) != txnMarkerRecordMagic {
+	if binary.LittleEndian.Uint32(m.scratch[:4]) == 0 {
 		return nil
 	}
 
@@ -1224,6 +1412,7 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 	}
 	cursor := uint64(0)
 	sequence := m.header.BaseSequence + 1
+	lastTxnID := uint64(0)
 	for cursor < m.header.Capacity {
 		rec, padded, err := decodeTxnMarkerRecord(region[cursor:], sequence)
 		if err != nil {
@@ -1237,8 +1426,20 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 		}
 		switch rec.Kind {
 		case TxnMarkerRecordKindDecision:
+			if rec.TxnID <= lastTxnID {
+				return txnMarkerSemanticError(
+					"decision txn ids are not strictly increasing",
+				)
+			}
 			if dst.decisions == nil {
 				dst.decisions = make(map[uint64][]TxnParticipant)
+			}
+			for _, participant := range rec.Participants {
+				if _, retired := dst.retired[participant.StoreID]; retired {
+					return txnMarkerSemanticError(
+						"decision names an already-retired participant",
+					)
+				}
 			}
 			if _, exists := dst.decisions[rec.TxnID]; exists {
 				return txnMarkerSemanticError("duplicate txn id")
@@ -1246,12 +1447,15 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 			participants := make([]TxnParticipant, len(rec.Participants))
 			copy(participants, rec.Participants)
 			dst.decisions[rec.TxnID] = participants
-			if rec.TxnID > dst.maxTxnID {
-				dst.maxTxnID = rec.TxnID
-			}
+			dst.decisionIDs = append(dst.decisionIDs, rec.TxnID)
+			dst.maxTxnID = rec.TxnID
+			lastTxnID = rec.TxnID
 		case TxnMarkerRecordKindRetirement:
 			if dst.retired == nil {
 				dst.retired = make(map[[16]byte]struct{})
+			}
+			if _, exists := dst.retired[rec.StoreID]; exists {
+				return txnMarkerSemanticError("duplicate participant retirement")
 			}
 			dst.retired[rec.StoreID] = struct{}{}
 		default:
@@ -1262,9 +1466,17 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 		}
 		cursor += uint64(padded)
 		sequence++
+		if sequence == 0 {
+			break
+		}
 	}
 	m.cursor = cursor
 	m.nextSequence = sequence
+	m.lastTxnID = lastTxnID
+	m.retired = make(map[[16]byte]struct{}, len(dst.retired))
+	for storeID := range dst.retired {
+		m.retired[storeID] = struct{}{}
+	}
 	return nil
 }
 
@@ -1273,8 +1485,18 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 func (m *TxnMarker) AppendDecision(
 	txnID uint64, participants []TxnParticipant,
 ) (uint64, error) {
-	if txnID == 0 {
-		return 0, fmt.Errorf("%w: zero txn id", ErrInvalidWrite)
+	if m.nextSequence == 0 {
+		return 0, ErrTxnMarkerFull
+	}
+	if txnID == 0 || txnID <= m.lastTxnID || txnID == ^uint64(0) {
+		return 0, fmt.Errorf("%w: txn id is not a usable strict successor", ErrInvalidWrite)
+	}
+	for _, participant := range participants {
+		if _, retired := m.retired[participant.StoreID]; retired {
+			return 0, fmt.Errorf(
+				"%w: decision names an already-retired participant", ErrInvalidWrite,
+			)
+		}
 	}
 	padded, ok := checkedTxnDecisionPaddedSize(len(participants))
 	if !ok {
@@ -1293,18 +1515,25 @@ func (m *TxnMarker) AppendDecision(
 		return 0, err
 	}
 	offset := int64(txnMarkerRegionStart) + int64(m.cursor)
-	if _, err := m.writeAt(m.scratch[:padded], offset); err != nil {
+	if err := writeTxnMarkerFull(m.writeAt, m.scratch[:padded], offset); err != nil {
 		return 0, err
 	}
 	m.cursor = end
 	sequence := m.nextSequence
 	m.nextSequence++
+	m.lastTxnID = txnID
 	return sequence, nil
 }
 
 // AppendRetirement appends one participant-retired record and returns its
 // assigned DCSN. It does not sync.
 func (m *TxnMarker) AppendRetirement(storeID [16]byte) (uint64, error) {
+	if m.nextSequence == 0 {
+		return 0, ErrTxnMarkerFull
+	}
+	if _, retired := m.retired[storeID]; retired {
+		return 0, fmt.Errorf("%w: duplicate participant retirement", ErrInvalidWrite)
+	}
 	padded, ok := checkedTxnRetirementPaddedSize()
 	if !ok {
 		return 0, fmt.Errorf("%w: retirement record length", ErrInvalidWrite)
@@ -1322,12 +1551,16 @@ func (m *TxnMarker) AppendRetirement(storeID [16]byte) (uint64, error) {
 		return 0, err
 	}
 	offset := int64(txnMarkerRegionStart) + int64(m.cursor)
-	if _, err := m.writeAt(m.scratch[:padded], offset); err != nil {
+	if err := writeTxnMarkerFull(m.writeAt, m.scratch[:padded], offset); err != nil {
 		return 0, err
 	}
 	m.cursor = end
 	sequence := m.nextSequence
 	m.nextSequence++
+	if m.retired == nil {
+		m.retired = make(map[[16]byte]struct{})
+	}
+	m.retired[storeID] = struct{}{}
 	return sequence, nil
 }
 
@@ -1361,6 +1594,8 @@ func (m *TxnMarker) Recycle(newEpoch uint64) error {
 	m.header = next
 	m.headerSlot = slot
 	m.cursor = 0
+	m.lastTxnID = 0
+	m.retired = nil
 	return nil
 }
 

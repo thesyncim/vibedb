@@ -1528,7 +1528,7 @@ func (c *Collection) cowPrimaryMutation(
 	err error,
 ) {
 	generation := state.root.Generation + 1
-	if generation == 0 {
+	if generation == 0 || generation >= uint64(1)<<48 {
 		return storeio.PageRef{}, false, false,
 			storeio.ErrGenerationOrder
 	}

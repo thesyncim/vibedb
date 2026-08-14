@@ -31,9 +31,9 @@ func TestPrimaryUnifiedCheckpointEntriesKeepFullRedoForBaseRelativeCertificate(t
 			t.Fatal("compact replacement dropped its scalar-patch certificate")
 		}
 		entries, complete, err :=
-			coll.primaryUnifiedOverlay.checkpointEntriesMode(
+			coll.primaryUnifiedOverlay.checkpointEntries(
 				make([]storeio.RecoveryBatchEntry, 0, 1),
-				baseGeneration, coll.Generation(), true,
+				baseGeneration, coll.Generation(),
 			)
 		if err != nil || !complete || len(entries) != 1 ||
 			entries[0].Kind != storeio.RecoveryRecordKindPut ||
@@ -74,14 +74,13 @@ func TestPrimaryUnifiedCheckpointEntriesKeepFullRedoForBaseRelativeCertificate(t
 			t.Fatal("document scalar dropped its compact admission certificate")
 		}
 		entries, complete, err :=
-			fixture.collection.primaryUnifiedOverlay.checkpointEntriesMode(
+			fixture.collection.primaryUnifiedOverlay.checkpointEntries(
 				make([]storeio.RecoveryBatchEntry, 0, 1),
-				baseGeneration, fixture.collection.Generation(), true,
+				baseGeneration, fixture.collection.Generation(),
 			)
 		if err != nil || !complete || len(entries) != 1 ||
 			entries[0].Kind != storeio.RecoveryRecordKindPut ||
-			!bytes.Equal(entries[0].Value, updated) ||
-			entries[0].ScalarPatch != (storeio.RecoveryScalarPatchMetadata{}) {
+			!bytes.Equal(entries[0].Value, updated) {
 			t.Fatalf("checkpoint entries = %#v complete=%v err=%v",
 				entries, complete, err)
 		}
@@ -132,17 +131,16 @@ func TestPrimaryUnifiedCheckpointEntriesDoNotReplayBaseRelativePatchOnPredecesso
 		}
 	}
 	entries, complete, err :=
-		fixture.collection.primaryUnifiedOverlay.checkpointEntriesMode(
+		fixture.collection.primaryUnifiedOverlay.checkpointEntries(
 			make([]storeio.RecoveryBatchEntry, 0, 2),
-			baseGeneration, fixture.collection.Generation(), true,
+			baseGeneration, fixture.collection.Generation(),
 		)
 	if err != nil || !complete || len(entries) != 2 {
 		t.Fatalf("checkpoint entries = %d complete=%v err=%v", len(entries), complete, err)
 	}
 	for index, want := range [][]byte{first, second} {
 		if entries[index].Kind != storeio.RecoveryRecordKindPut ||
-			!bytes.Equal(entries[index].Value, want) ||
-			entries[index].ScalarPatch != (storeio.RecoveryScalarPatchMetadata{}) {
+			!bytes.Equal(entries[index].Value, want) {
 			t.Fatalf("entry %d = %#v, want full Put %q", index, entries[index], want)
 		}
 	}

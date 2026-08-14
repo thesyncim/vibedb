@@ -3,6 +3,7 @@ package storeio
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -47,12 +48,12 @@ func TestTxnMarkerHeaderRoundTrip(t *testing.T) {
 		markerID[i] = byte(i + 1)
 	}
 	h := TxnMarkerHeader{
-		FormatVersion: TxnMarkerFormatVersion,
-		MarkerID:      markerID,
-		Epoch:         3,
-		BaseSequence:  7,
-		Capacity:      8 * TxnMarkerMinSectorSize,
-		RecycleCount:  2,
+		Format:       TxnMarkerFormat,
+		MarkerID:     markerID,
+		Epoch:        3,
+		BaseSequence: 7,
+		Capacity:     8 * TxnMarkerMinSectorSize,
+		RecycleCount: 2,
 	}
 	buf := make([]byte, TxnMarkerHeaderSize)
 	if _, err := EncodeTxnMarkerHeader(buf, h); err != nil {
@@ -70,7 +71,7 @@ func TestTxnMarkerHeaderRoundTrip(t *testing.T) {
 		apply func([]byte)
 	}{
 		{"magic", func(b []byte) { b[0] ^= 0xff }},
-		{"version", func(b []byte) { b[8] ^= 0xff }},
+		{"format", func(b []byte) { b[8] ^= 0xff }},
 		{"checksum", func(b []byte) { b[TxnMarkerHeaderSize-8] ^= 0x01 }},
 		{"identity", func(b []byte) { b[16] ^= 0xff }},
 		{"recyclecount", func(b []byte) {
@@ -93,7 +94,7 @@ func TestTxnMarkerHeaderRoundTrip(t *testing.T) {
 func TestTxnMarkerCreateOpenEmpty(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	header := m.Header()
-	if header.FormatVersion != TxnMarkerFormatVersion ||
+	if header.Format != TxnMarkerFormat ||
 		header.Epoch != 1 || header.RecycleCount != 1 ||
 		header.MarkerID == ([16]byte{}) {
 		t.Fatalf("created header = %+v", header)
@@ -187,6 +188,69 @@ func TestTxnMarkerDecisionRetirementRoundTrip(t *testing.T) {
 	}
 	if dcsn2 != 3 {
 		t.Fatalf("second dcsn = %d, want 3", dcsn2)
+	}
+}
+
+func TestTxnMarkerShortWriteDoesNotAdvanceAppendState(t *testing.T) {
+	m, _ := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+	defer m.Close()
+	beforeCursor := m.Cursor()
+	beforeSequence := m.NextSequence()
+	beforeTxnID := m.lastTxnID
+	writeAt := m.writeAt
+	m.writeAt = func(p []byte, _ int64) (int, error) {
+		return len(p) - 1, nil
+	}
+	if _, err := m.AppendDecision(
+		17, testTxnParticipants(1),
+	); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short AppendDecision = %v, want io.ErrShortWrite", err)
+	}
+	if m.Cursor() != beforeCursor || m.NextSequence() != beforeSequence ||
+		m.lastTxnID != beforeTxnID {
+		t.Fatalf(
+			"short write advanced marker: cursor %d->%d sequence %d->%d txn %d->%d",
+			beforeCursor, m.Cursor(), beforeSequence, m.NextSequence(),
+			beforeTxnID, m.lastTxnID,
+		)
+	}
+
+	// The failed ID remains a valid strict successor; retrying it through the
+	// real writer must consume the original sequence exactly once.
+	m.writeAt = writeAt
+	dcsn, err := m.AppendDecision(17, testTxnParticipants(1))
+	if err != nil || dcsn != beforeSequence {
+		t.Fatalf("retry AppendDecision = dcsn %d, err %v", dcsn, err)
+	}
+}
+
+func TestTxnDecisionsRangeSparseTxnIDs(t *testing.T) {
+	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+	const sparseTxnID = uint64(1) << 60
+	for _, txnID := range []uint64{7, sparseTxnID} {
+		if _, err := m.AppendDecision(txnID, testTxnParticipants(1)); err != nil {
+			t.Fatalf("AppendDecision(%d): %v", txnID, err)
+		}
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m, decisions := reopenTestTxnMarker(t, path)
+	defer m.Close()
+	var got []uint64
+	decisions.RangeDecisions(func(txnID uint64, participants []TxnParticipant) bool {
+		if len(participants) != 1 {
+			t.Fatalf("txn %d participants = %d, want 1", txnID, len(participants))
+		}
+		got = append(got, txnID)
+		return true
+	})
+	if len(got) != 2 || got[0] != 7 || got[1] != sparseTxnID {
+		t.Fatalf("sparse decision iteration = %v", got)
 	}
 }
 
@@ -303,8 +367,31 @@ func TestTxnMarkerTornTailBytePrefixSweep(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	for size := txnMarkerRegionStart; size <= int(info.Size()); size++ {
-		prefixPath := filepath.Join(t.TempDir(), "prefix.vtm")
+	firstPadded, ok := checkedTxnDecisionPaddedSize(2)
+	if !ok {
+		t.Fatal("first decision size")
+	}
+	secondPadded, ok := checkedTxnDecisionPaddedSize(3)
+	if !ok {
+		t.Fatal("second decision size")
+	}
+	durableEnd := txnMarkerRegionStart + firstPadded + secondPadded
+	if durableEnd > int(info.Size()) {
+		t.Fatalf("durable record end %d exceeds file size %d", durableEnd, info.Size())
+	}
+	// Every byte through the actual record window is semantically distinct. The
+	// remainder of the preallocated region is all zero padding, so one full-size
+	// endpoint covers every longer prefix without creating hundreds of thousands
+	// of equivalent files.
+	sizes := make([]int, 0, durableEnd-txnMarkerRegionStart+2)
+	for size := txnMarkerRegionStart; size <= durableEnd; size++ {
+		sizes = append(sizes, size)
+	}
+	if durableEnd != int(info.Size()) {
+		sizes = append(sizes, int(info.Size()))
+	}
+	prefixPath := filepath.Join(t.TempDir(), "prefix.vtm")
+	for _, size := range sizes {
 		if err := os.WriteFile(prefixPath, full[:size], 0o600); err != nil {
 			t.Fatalf("write prefix %d: %v", size, err)
 		}
@@ -327,11 +414,6 @@ func TestTxnMarkerTornTailBytePrefixSweep(t *testing.T) {
 			t.Fatalf("prefix %d decoded past durable end: max dcsn=%d", size, decisions.MaxDCSN())
 		}
 		if _, ok := decisions.Lookup(opened.Header().MarkerID, opened.Header().Epoch, 2); ok {
-			firstPadded, ok := checkedTxnDecisionPaddedSize(2)
-			if !ok {
-				opened.Close()
-				t.Fatal("first decision size")
-			}
 			secondLogical := TxnMarkerRecordPrefixSize +
 				3*TxnParticipantSize + TxnMarkerRecordTrailerSize
 			need := txnMarkerRegionStart + firstPadded + secondLogical
@@ -360,7 +442,7 @@ func TestTxnMarkerHostileCapacityClamp(t *testing.T) {
 	buf := make([]byte, TxnMarkerHeaderSize)
 	clear(buf)
 	copy(buf[0:8], txnMarkerMagic)
-	binary.LittleEndian.PutUint32(buf[8:12], hostile.FormatVersion)
+	binary.LittleEndian.PutUint32(buf[8:12], hostile.Format)
 	binary.LittleEndian.PutUint32(buf[12:16], TxnMarkerHeaderSize)
 	copy(buf[16:32], hostile.MarkerID[:])
 	binary.LittleEndian.PutUint64(buf[32:40], hostile.Epoch)
@@ -381,8 +463,8 @@ func TestTxnMarkerHostileCapacityClamp(t *testing.T) {
 	if _, err := DecodeTxnMarkerHeader(buf); !errors.Is(err, ErrTxnMarkerCorrupt) {
 		t.Fatalf("decode hostile capacity = %v, want corrupt", err)
 	}
-	if _, _, err := OpenTxnMarker(path, TxnMarkerOptions{}); !errors.Is(err, ErrTxnMarkerNoValidHeader) {
-		t.Fatalf("Open hostile capacity = %v, want no-valid-header", err)
+	if _, _, err := OpenTxnMarker(path, TxnMarkerOptions{}); !errors.Is(err, ErrTxnMarkerCorrupt) {
+		t.Fatalf("Open hostile capacity = %v, want corrupt", err)
 	}
 }
 
@@ -409,11 +491,20 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 			t.Fatalf("Sync: %v", err)
 		}
 		fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultTornAppend, AppendIndex: 1})
-		if _, err := m.AppendDecision(2, testTxnParticipants(1)); err != nil {
-			t.Fatalf("torn append returned error: %v", err)
+		beforeCursor, beforeSequence, beforeTxnID :=
+			m.Cursor(), m.NextSequence(), m.lastTxnID
+		if _, err := m.AppendDecision(
+			2, testTxnParticipants(1),
+		); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("torn append = %v, want io.ErrShortWrite", err)
 		}
 		if !fm.Faulted() {
 			t.Fatal("torn append fault did not fire")
+		}
+		if m.Cursor() != beforeCursor || m.NextSequence() != beforeSequence ||
+			m.lastTxnID != beforeTxnID {
+			t.Fatalf("torn append advanced state: cursor=%d sequence=%d txn=%d",
+				m.Cursor(), m.NextSequence(), m.lastTxnID)
 		}
 		if err := m.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
