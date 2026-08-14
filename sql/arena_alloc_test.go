@@ -43,8 +43,11 @@ func TestWarmParseIsAllocationFree(t *testing.T) {
 			`SELECT * FROM inner_cte` +
 			`) SELECT * FROM outer_cte`},
 		{"grouped aggregate", benchGrouped},
+		{"output positions", `SELECT id, score + 1 FROM documents ORDER BY 2 DESC, 1`},
 		{"containment and membership", benchRich},
 		{"set expression", benchSetExpression},
+		{"set output positions", `SELECT id, score FROM active UNION ALL ` +
+			`SELECT id, score FROM archive ORDER BY 2 DESC, 1`},
 		{"lateral set expression", `SELECT a.id, d.id FROM accounts a LEFT JOIN LATERAL (` +
 			`SELECT id FROM items i WHERE i.owner = a.id UNION ALL ` +
 			`SELECT id FROM archived j WHERE j.owner = a.id` +

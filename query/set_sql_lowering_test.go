@@ -56,7 +56,7 @@ func TestSQLSetLoweringScopedTailsAndAbsoluteParameters(t *testing.T) {
 	statement, err := PrepareStatement(
 		`(SELECT v AS value FROM set_left WHERE v >= ? ORDER BY value DESC LIMIT ?) ` +
 			`UNION ALL SELECT v FROM set_right WHERE v <= ? ` +
-			`ORDER BY value DESC LIMIT ? OFFSET ?`,
+			`ORDER BY 1 DESC LIMIT ? OFFSET ?`,
 	)
 	if err != nil {
 		t.Fatal(err)

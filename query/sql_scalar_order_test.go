@@ -3,7 +3,10 @@ package query
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func TestStatementScalarOrderedStableMergeAllLengths(t *testing.T) {
@@ -93,6 +96,97 @@ func TestSQLScalarOrderByComputedAliasMixedKeysStableAndTail(t *testing.T) {
 		if !cursor.Next() || string(cursor.Cell(0).JSON()) != want {
 			t.Fatalf("stable row %d != %s", row, want)
 		}
+	}
+}
+
+func TestSQLOrderByOutputPositionsAcrossPathScalarAndAggregate(t *testing.T) {
+	segment := mustSegment(t,
+		`{"id":"a","team":"x","n":2}`,
+		`{"id":"b","team":"y","n":4}`,
+		`{"id":"c","team":"x","n":3}`,
+	)
+	var exec Exec
+
+	path, err := PrepareStatement(`SELECT id, n FROM docs ORDER BY 2 DESC, 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := path.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row, want := range []string{`"b"`, `"c"`, `"a"`} {
+		if !cursor.Next() || string(cursor.Cell(0).JSON()) != want {
+			t.Fatalf("path ordinal row %d != %s", row, want)
+		}
+	}
+	if cursor.Next() {
+		t.Fatal("path ordinal returned an extra row")
+	}
+
+	scalarStatement, err := PrepareStatement(`
+		SELECT id, n * 2 FROM docs ORDER BY 2 DESC, 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = scalarStatement.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row, want := range [][2]string{{`"b"`, `8`}, {`"c"`, `6`}, {`"a"`, `4`}} {
+		if !cursor.Next() || string(cursor.Cell(0).JSON()) != want[0] ||
+			string(cursor.Cell(1).JSON()) != want[1] {
+			t.Fatalf("scalar ordinal row %d != %v", row, want)
+		}
+	}
+
+	aggregate, err := PrepareStatement(`
+		SELECT team, SUM(n) FROM docs GROUP BY team ORDER BY 2 DESC, 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = aggregate.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row, want := range [][2]string{{`"x"`, `5`}, {`"y"`, `4`}} {
+		if !cursor.Next() || string(cursor.Cell(0).JSON()) != want[0] ||
+			string(cursor.Cell(1).JSON()) != want[1] {
+			t.Fatalf("aggregate ordinal row %d != %v", row, want)
+		}
+	}
+	if cursor.Next() {
+		t.Fatal("aggregate ordinal returned an extra row")
+	}
+	runAggregate := func() {
+		ordered, runErr := aggregate.RunInto(&exec, FromSegment(segment), nil)
+		if runErr != nil {
+			panic(runErr)
+		}
+		for ordered.Next() {
+		}
+	}
+	runAggregate()
+	if allocs := testing.AllocsPerRun(100, runAggregate); allocs != 0 {
+		t.Fatalf("warmed aggregate ordinal allocated %.2f/run", allocs)
+	}
+
+	const havingSource = `SELECT team, SUM(n) FROM docs GROUP BY team ` +
+		`HAVING team = 'x' ORDER BY 2 DESC LIMIT 1`
+	_, err = PrepareStatement(havingSource)
+	var unsupported *sqlast.FeatureNotSupportedError
+	if !errors.As(err, &unsupported) || unsupported.Pos != strings.Index(havingSource, "2 DESC") ||
+		!strings.Contains(unsupported.Msg, "HAVING") {
+		t.Fatalf("aggregate ordinal/HAVING error = %T %+v", err, err)
+	}
+
+	counted, err := PrepareStatement(`SELECT DISTINCT COUNT(*) FROM docs ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = counted.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil || !cursor.Next() || string(cursor.Cell(0).JSON()) != `3` || cursor.Next() {
+		t.Fatalf("single aggregate ordinal cursor=%+v err=%v", cursor, err)
 	}
 }
 

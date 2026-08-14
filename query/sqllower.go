@@ -268,11 +268,27 @@ func (s *Statement) buildOrderBy() error {
 	}
 	for i := range s.tree.OrderBy {
 		term := &s.tree.OrderBy[i]
+		path := term.Path
+		if term.Output != 0 {
+			output := term.Output - 1
+			if output < 0 || output >= len(s.tree.Columns) {
+				return fmt.Errorf("query: ORDER BY output is outside the SELECT list")
+			}
+			column := &s.tree.Columns[output]
+			if column.Path == nil || column.Scalar != nil ||
+				column.Window != nil || column.Agg != sqlast.AggNone {
+				return fmt.Errorf("query: ORDER BY output requires a missing post-output stage")
+			}
+			path = column.Path
+		}
+		if path == nil {
+			return fmt.Errorf("query: malformed ORDER BY path")
+		}
 		dir := Asc
 		if term.Desc {
 			dir = Desc
 		}
-		s.q.orderBy = append(s.q.orderBy, orderSpec{path: s.spec(term.Path), dir: dir})
+		s.q.orderBy = append(s.q.orderBy, orderSpec{path: s.spec(path), dir: dir})
 	}
 	return nil
 }

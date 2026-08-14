@@ -938,50 +938,88 @@ func (s *setExpressionParser) parseOrderTerm(
 	first *SelectStmt,
 ) (SetOrderTerm, error) {
 	term := SetOrderTerm{Pos: s.tok.pos}
-	if s.tok.kind == tokNumber {
-		return term, s.errHere(
-			"set ORDER BY does not accept an output position; name a first-operand output",
-		)
-	}
-	if s.tok.kind != tokIdent && s.tok.kind != tokQuotedIdent {
-		return term, s.errHere("expected a first-operand output name in set ORDER BY")
-	}
-	if s.tok.kind == tokIdent && reserved(s.tok.kw) {
-		return term, s.errHere("expected an output name; quote a reserved word")
-	}
-	name := s.owner.internToken(s.tok)
-	s.advance()
-	if s.tok.kind == tokDot || s.tok.kind == tokLBracket {
-		return term, s.errHere(
-			"set ORDER BY is scoped to completed output names, not operand input paths; alias the first operand output and order by that alias",
-		)
-	}
-	match := -1
-	deferredOutput := false
-	for column := range first.Columns {
-		candidate, deferred := s.outputName(first, &first.Columns[column])
-		if deferred {
-			deferredOutput = true
-			continue
-		}
-		if candidate != name {
-			continue
-		}
-		if match >= 0 {
-			return term, s.owner.errfAt(
-				term.Pos, "set ORDER BY output name %q is ambiguous; give the first operand unique aliases", name,
+	if s.tok.kind == tokMinus {
+		s.advance()
+		if s.tok.kind == tokNumber {
+			return term, newInvalidOrderPositionError(
+				s.owner.lx.src, term.Pos, "-"+s.tok.text, len(first.Columns),
 			)
 		}
-		match = column
-	}
-	if match < 0 && !deferredOutput {
-		return term, s.owner.errfAt(
-			term.Pos, "set ORDER BY name %q is not an output of the syntactic first operand", name,
+		return term, newFeatureNotSupportedError(
+			s.owner.lx.src, term.Pos,
+			"computed scalar expressions in set ORDER BY are not supported",
 		)
 	}
-	term.Name = name
-	if !deferredOutput {
-		term.Output = match + 1
+	if s.tok.kind == tokNumber {
+		text := s.tok.text
+		position, err := strconv.ParseUint(text, 10, 63)
+		if err != nil || position == 0 {
+			return term, newInvalidOrderPositionError(
+				s.owner.lx.src, term.Pos, text, len(first.Columns),
+			)
+		}
+		for i := range first.Columns {
+			if path := first.Columns[i].Path; path != nil && len(path.Segments) == 0 {
+				return term, newFeatureNotSupportedError(
+					s.owner.lx.src, term.Pos,
+					"set ORDER BY output positions cannot bind a wildcard whose expanded result width is known only at prepare time",
+				)
+			}
+		}
+		if position > uint64(len(first.Columns)) {
+			return term, newInvalidOrderPositionError(
+				s.owner.lx.src, term.Pos, text, len(first.Columns),
+			)
+		}
+		term.Output = int(position)
+		s.advance()
+		if scalarContinues(s.tok) {
+			return term, newFeatureNotSupportedError(
+				s.owner.lx.src, s.tok.pos,
+				"computed scalar expressions in set ORDER BY are not supported; a numeric position must stand alone",
+			)
+		}
+	} else {
+		if s.tok.kind != tokIdent && s.tok.kind != tokQuotedIdent {
+			return term, s.errHere("expected a first-operand output name in set ORDER BY")
+		}
+		if s.tok.kind == tokIdent && reserved(s.tok.kw) {
+			return term, s.errHere("expected an output name; quote a reserved word")
+		}
+		name := s.owner.internToken(s.tok)
+		s.advance()
+		if s.tok.kind == tokDot || s.tok.kind == tokLBracket {
+			return term, s.errHere(
+				"set ORDER BY is scoped to completed output names, not operand input paths; alias the first operand output and order by that alias",
+			)
+		}
+		match := -1
+		deferredOutput := false
+		for column := range first.Columns {
+			candidate, deferred := s.outputName(first, &first.Columns[column])
+			if deferred {
+				deferredOutput = true
+				continue
+			}
+			if candidate != name {
+				continue
+			}
+			if match >= 0 {
+				return term, s.owner.errfAt(
+					term.Pos, "set ORDER BY output name %q is ambiguous; give the first operand unique aliases", name,
+				)
+			}
+			match = column
+		}
+		if match < 0 && !deferredOutput {
+			return term, s.owner.errfAt(
+				term.Pos, "set ORDER BY name %q is not an output of the syntactic first operand", name,
+			)
+		}
+		term.Name = name
+		if !deferredOutput {
+			term.Output = match + 1
+		}
 	}
 	if s.tok.kind == tokIdent && s.tok.kw == kwAsc {
 		s.advance()

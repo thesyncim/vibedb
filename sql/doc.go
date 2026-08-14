@@ -429,8 +429,10 @@
 // RIGHT/FULL LATERAL, JOIN LATERAL ... USING, and subqueries in the SELECT list;
 // NATURAL joins and comma-separated FROM items; data-modifying common table
 // expressions; searched CASE predicate families beyond boolean truth,
-// comparisons, IS NULL, AND, OR, and NOT; scalar functions; ORDER BY
-// and GROUP BY over output positions or aggregates.
+// comparisons, IS NULL, AND, OR, and NOT; scalar functions; direct computed
+// ORDER BY expressions; GROUP BY over output positions or aggregates; and
+// ORDER BY aggregate-output positions when HAVING also requires a pre-sort
+// group filter.
 //
 // The mutation and definition grammar refuses, each by name: a nested INSERT
 // column list, generated keys, INSERT ... SELECT, DEFAULT VALUES, ON CONFLICT

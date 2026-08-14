@@ -175,6 +175,23 @@ func selectHasScalar(tree *sqlast.SelectStmt) bool {
 	return exprHasScalar(tree.Where)
 }
 
+func selectNeedsPostScalarOrder(tree *sqlast.SelectStmt) bool {
+	if tree == nil || selectHasWindows(tree) {
+		return false
+	}
+	for i := range tree.OrderBy {
+		output := tree.OrderBy[i].Output - 1
+		if output < 0 || output >= len(tree.Columns) {
+			continue
+		}
+		column := &tree.Columns[output]
+		if column.Scalar != nil || column.Agg != sqlast.AggNone {
+			return true
+		}
+	}
+	return false
+}
+
 func exprHasScalar(expr *sqlast.Expr) bool {
 	if expr == nil {
 		return false
@@ -191,20 +208,30 @@ func exprHasScalar(expr *sqlast.Expr) bool {
 }
 
 func (s *Statement) prepareScalar() error {
-	if !selectHasScalar(s.tree) {
+	if !selectHasScalar(s.tree) && !selectNeedsPostScalarOrder(s.tree) {
 		return nil
 	}
 	if s.window() != nil {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
 			"computed scalar expressions over window statements require the post-window scalar stage")
 	}
-	if s.tree.Distinct {
+	hasScalar := selectHasScalar(s.tree)
+	if s.tree.Distinct && hasScalar {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
 			"SELECT DISTINCT over computed scalar expressions requires distinctness after scalar evaluation")
 	}
 	if s.tree.Having != nil {
-		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
-			"computed scalar SELECT expressions with HAVING require one post-reduction scalar/HAVING stage")
+		pos := firstScalarStatementPos(s.tree)
+		if !hasScalar {
+			for i := range s.tree.OrderBy {
+				if s.tree.OrderBy[i].Output != 0 {
+					pos = s.tree.OrderBy[i].Pos
+					break
+				}
+			}
+		}
+		return sqlast.NewFeatureNotSupportedError(s.text, pos,
+			"HAVING must filter every group before a post-output stable ORDER BY stage can apply LIMIT/OFFSET")
 	}
 	if exprHasScalar(s.tree.Where) && (len(s.tree.GroupBy) != 0 || selectHasAggregate(s.tree)) {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarExprPos(s.tree.Where),
@@ -260,9 +287,8 @@ func (s *Statement) prepareScalar() error {
 			var start, end, root int32
 			if term.Output != 0 {
 				output := term.Output - 1
-				if output < 0 || output >= len(runtime.outputs) ||
-					s.tree.Columns[output].Scalar == nil {
-					return fmt.Errorf("query: malformed computed ORDER BY output %d", term.Output)
+				if output < 0 || output >= len(runtime.outputs) {
+					return fmt.Errorf("query: malformed ORDER BY output %d", term.Output)
 				}
 				start, root = outputStarts[output], runtime.outputs[output]
 				end = int32(runtime.ordered.projectionEnd)

@@ -146,6 +146,47 @@ func TestSetExpressionFirstOperandOwnsOutputNames(t *testing.T) {
 	}
 }
 
+func TestSetExpressionOrderByOutputPositions(t *testing.T) {
+	statement := parseSetForTest(t,
+		`SELECT a, b FROM left_side UNION ALL SELECT x, y FROM right_side ORDER BY 2 DESC, 1`)
+	order := statement.Set.Tail.OrderBy
+	if len(order) != 2 || order[0].Output != 2 || !order[0].Desc ||
+		order[1].Output != 1 || order[1].Desc {
+		t.Fatalf("set positional ORDER BY = %+v", order)
+	}
+	for _, source := range []string{
+		`SELECT a FROM one UNION ALL SELECT b FROM two ORDER BY -1`,
+		`SELECT a FROM one UNION ALL SELECT b FROM two ORDER BY 0`,
+		`SELECT a FROM one UNION ALL SELECT b FROM two ORDER BY 2`,
+		`SELECT a FROM one UNION ALL SELECT b FROM two ORDER BY 1.5`,
+	} {
+		_, err := Parse(source)
+		var invalid *InvalidOrderPositionError
+		if !errors.As(err, &invalid) || invalid.Outputs != 1 {
+			t.Fatalf("%q error = %T %+v", source, err, err)
+		}
+	}
+	var unsupported *FeatureNotSupportedError
+	for _, source := range []string{
+		`SELECT * FROM one UNION ALL SELECT * FROM two ORDER BY 1`,
+		`TABLE one UNION ALL TABLE two ORDER BY 1`,
+	} {
+		_, err := Parse(source)
+		if !errors.As(err, &unsupported) || !strings.Contains(unsupported.Msg, "wildcard") {
+			t.Fatalf("deferred set ordinal %q error = %T %v", source, err, err)
+		}
+	}
+	_, err := Parse(`SELECT * FROM one UNION ALL SELECT * FROM two ORDER BY 0`)
+	var invalidWildcard *InvalidOrderPositionError
+	if !errors.As(err, &invalidWildcard) {
+		t.Fatalf("invalid deferred set ordinal precedence = %T %v", err, err)
+	}
+	_, err = Parse(`SELECT a FROM one UNION ALL SELECT b FROM two ORDER BY 1 + 0`)
+	if !errors.As(err, &unsupported) || !strings.Contains(unsupported.Msg, "must stand alone") {
+		t.Fatalf("set numeric ORDER expression error = %T %v", err, err)
+	}
+}
+
 func TestSetExpressionNestedPositionsCTEVisibilityAndParamBase(t *testing.T) {
 	const source = `SELECT id FROM outer_table WHERE tenant = ? AND id IN (` +
 		`SELECT "café" AS id FROM live UNION ALL SELECT id FROM archive WHERE tenant = ?)`

@@ -409,16 +409,26 @@ Projection expressions are lazy: WHERE filtering and final OFFSET/LIMIT row
 admission happen before a projected CAST or arithmetic expression is
 evaluated. A conversion or division error in a filtered or skipped row
 therefore does not fail the statement or consume retained CAST workspace.
-`ORDER BY` may name the explicit alias of a computed SELECT expression. That
-form evaluates and owns its sort keys for every predicate-surviving row,
+`ORDER BY` may name the explicit alias of a computed SELECT expression or a
+positive one-based SELECT-list position. Positional keys cover ordinary paths,
+computed scalars, window outputs, and grouped aggregate outputs; wildcard
+projections remain a positioned refusal because their expanded width is known
+only from the prepared source schema. Deferred outputs evaluate and own their
+sort keys for every predicate-surviving row,
 performs one stable mixed path/computed-key sort, and only then applies
 OFFSET/LIMIT and the remaining projections. Consequently, with a positive
 LIMIT, an invalid sort key still fails even when the selected slice omits its
 row, while an unrelated projection error in an omitted row remains unobserved.
-LIMIT 0 short-circuits without evaluating predicates, keys, or projections,
-matching the existing scalar execution bound. Duplicate matching aliases are
-ambiguous (`42702`). Direct scalar expressions and output ordinals in ORDER BY
-remain positioned refusals; authors name the computed output instead.
+LIMIT 0 short-circuits the post-output scalar stage without evaluating its
+keys or projections, matching the existing scalar execution bound while any
+required base scan/grouping still obeys its own semantics. Duplicate matching
+aliases are ambiguous (`42702`), while non-positive, fractional, or
+out-of-range positions are invalid column references (`42P10`). Direct scalar
+expressions in ORDER BY
+remain positioned refusals; authors name the computed output or its position.
+An aggregate-output position is executable after grouping, but combining that
+post-output stage with HAVING remains refused until HAVING can filter every
+group before the stable sort and LIMIT/OFFSET.
 Prepared warm execution reuses the bounded intermediate workspace and the
 covered CAST and ordered-scalar variants allocate no heap objects.
 
@@ -428,7 +438,9 @@ covered CAST and ordered-scalar variants allocate no heap objects.
 `SELECT`, `VALUES`, and `TABLE` leaves. `INTERSECT` binds more tightly than
 `UNION` and `EXCEPT`; parentheses retain authored grouping and give an operand
 its own ORDER BY/LIMIT/OFFSET. A final tail names outputs from the syntactic
-first operand, whose names and ordinal schema also describe the result.
+first operand or uses a positive output position; the first operand's names
+and ordinal schema also describe the result. A deferred wildcard width cannot
+bind a positional tail at parse time and is refused rather than guessed.
 
 All operands must have equal width. Multiset multiplicity, SQL NULL equality
 for row identity, exact decimal values, and container spellings are preserved.
@@ -464,8 +476,8 @@ state and the covered paths allocate no heap objects.
 Window `FILTER`, DISTINCT window aggregates, null-treatment modifiers such as
 `IGNORE NULLS`, arbitrary scalar arguments or keys, and window expressions
 outside the SELECT list are not part of this SQL slice; final ORDER BY may name
-the output alias of a SELECT-list window. A correlated window key inside
-LATERAL and a window in a recursive CTE term remain positioned refusals.
+the output alias or position of a SELECT-list window. A correlated window key
+inside LATERAL and a window in a recursive CTE term remain positioned refusals.
 
 Primary-key equality and membership use point reads. Eligible exact predicates
 use posting masks and document rechecks. Predicates without a usable access path

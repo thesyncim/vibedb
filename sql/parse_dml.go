@@ -948,7 +948,7 @@ func (p *Parser) parseDMLWhere(clause string) error {
 		}
 		p.out.Where = where
 	}
-	if err := p.parseOrderBy(); err != nil {
+	if err := p.parseOrderBy(false); err != nil {
 		return err
 	}
 	if err := p.parseLimitOffset(); err != nil {

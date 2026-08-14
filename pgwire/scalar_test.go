@@ -21,6 +21,19 @@ func TestScalarOrderByAmbiguousOutputSQLState(t *testing.T) {
 	}
 }
 
+func TestOrderByInvalidOutputPositionSQLState(t *testing.T) {
+	const source = `SELECT id FROM users ORDER BY 2`
+	_, err := sqlast.Parse(source)
+	if err == nil {
+		t.Fatal("out-of-range ORDER BY position parsed")
+	}
+	pg := asPGErrorIn(err, source)
+	if pg.code != sqlstateInvalidColumnReference ||
+		pg.position != strings.LastIndex(source, "2")+1 {
+		t.Fatalf("invalid ORDER BY position => code=%s position=%d: %v", pg.code, pg.position, err)
+	}
+}
+
 func TestScalarSQLStateMappingAndUTF8Position(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -98,5 +111,21 @@ func TestScalarComputedOutputAliasOrdersBeforeLimit(t *testing.T) {
 		string(rows[1][0]) != "6" || string(rows[1][1]) != "3.1e1" ||
 		string(rows[2][0]) != "1" || string(rows[2][1]) != "3.1e1" {
 		t.Fatalf("computed alias ordered rows = %q", rows)
+	}
+}
+
+func TestOrderByOutputPositionOrdersBeforeLimit(t *testing.T) {
+	c := connect(t)
+	messages := c.query(`
+		SELECT id, age + 1
+		FROM users ORDER BY 2 DESC, 1 DESC LIMIT 3`)
+	if has(messages, msgErrorResponse) {
+		t.Fatalf("positional ORDER BY failed: %s", tags(messages))
+	}
+	rows := rowsOf(t, messages)
+	if len(rows) != 3 || string(rows[0][0]) != "5" || string(rows[0][1]) != "4.6e1" ||
+		string(rows[1][0]) != "6" || string(rows[1][1]) != "3.1e1" ||
+		string(rows[2][0]) != "1" || string(rows[2][1]) != "3.1e1" {
+		t.Fatalf("positional ordered rows = %q", rows)
 	}
 }

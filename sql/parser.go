@@ -773,7 +773,7 @@ func (p *Parser) parseStatement() error {
 	if err := p.parseWindowClause(); err != nil {
 		return err
 	}
-	if err := p.parseOrderBy(); err != nil {
+	if err := p.parseOrderBy(true); err != nil {
 		return err
 	}
 	if err := p.parseLimitOffset(); err != nil {
@@ -2440,15 +2440,25 @@ func (p *Parser) parseGroupBy() error {
 	}
 }
 
-func (p *Parser) parseOrderBy() error {
+func (p *Parser) parseOrderBy(allowOutputPosition bool) error {
 	if !p.acceptKeyword(kwOrder) {
 		return nil
 	}
 	if err := p.expectKeyword(kwBy, "BY after ORDER"); err != nil {
 		return err
 	}
+	deferredKnown := false
+	deferredOutputArity := false
 	for {
-		term, err := p.parseOrderTerm()
+		if allowOutputPosition && p.tok.kind == tokNumber && !deferredKnown {
+			var err error
+			deferredOutputArity, err = p.selectOutputArityDeferred()
+			if err != nil {
+				return err
+			}
+			deferredKnown = true
+		}
+		term, err := p.parseOrderTerm(allowOutputPosition, deferredOutputArity)
 		if err != nil {
 			return err
 		}
@@ -2464,32 +2474,76 @@ func (p *Parser) parseOrderBy() error {
 	}
 }
 
-func (p *Parser) parseOrderTerm() (OrderTerm, error) {
+func (p *Parser) parseOrderTerm(
+	allowOutputPosition bool,
+	deferredOutputArity bool,
+) (OrderTerm, error) {
 	term := OrderTerm{Pos: p.tok.pos}
+	if allowOutputPosition && p.tok.kind == tokMinus {
+		p.advance()
+		if p.tok.kind == tokNumber {
+			return term, newInvalidOrderPositionError(
+				p.lx.src, term.Pos, "-"+p.tok.text, len(p.columns),
+			)
+		}
+		return term, newFeatureNotSupportedError(
+			p.lx.src, term.Pos,
+			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
+		)
+	}
 	if p.tok.kind == tokNumber {
-		return term, p.errHere("ORDER BY does not accept an output position; name the path or the output alias")
-	}
-	if p.tok.kind == tokPlus || p.tok.kind == tokMinus || p.tok.kind == tokLParen ||
-		p.atKeyword(kwCase) || p.atKeyword(kwCast) {
-		return term, newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
-		)
-	}
-	path, err := p.parseKeyPath(
-		"ORDER BY cannot sort by an aggregate: the engine orders groups by their key, not by their reduction")
-	if err != nil {
-		return term, err
-	}
-	if scalarContinues(p.tok) {
-		return term, newFeatureNotSupportedError(
-			p.lx.src, p.tok.pos,
-			"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
-		)
-	}
-	term.Path, term.Output, err = p.resolveOrderAlias(path)
-	if err != nil {
-		return term, err
+		if !allowOutputPosition {
+			return term, p.errHere("ORDER BY does not accept an output position in a mutation; name the input path")
+		}
+		text := p.tok.text
+		position, err := strconv.ParseUint(text, 10, 63)
+		if err != nil || position == 0 {
+			return term, newInvalidOrderPositionError(
+				p.lx.src, p.tok.pos, text, len(p.columns),
+			)
+		}
+		if deferredOutputArity {
+			return term, newFeatureNotSupportedError(
+				p.lx.src, term.Pos,
+				"ORDER BY output positions cannot bind a wildcard whose expanded SELECT-list width is known only at prepare time",
+			)
+		}
+		if position > uint64(len(p.columns)) {
+			return term, newInvalidOrderPositionError(
+				p.lx.src, p.tok.pos, text, len(p.columns),
+			)
+		}
+		term.Output = int(position)
+		p.advance()
+		if scalarContinues(p.tok) {
+			return term, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"computed scalar expressions in ORDER BY require a post-scalar stable sort stage; a numeric position must stand alone",
+			)
+		}
+	} else {
+		if p.tok.kind == tokPlus || p.tok.kind == tokMinus || p.tok.kind == tokLParen ||
+			p.atKeyword(kwCase) || p.atKeyword(kwCast) {
+			return term, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
+			)
+		}
+		path, err := p.parseKeyPath(
+			"ORDER BY cannot sort by an aggregate: the engine orders groups by their key, not by their reduction")
+		if err != nil {
+			return term, err
+		}
+		if scalarContinues(p.tok) {
+			return term, newFeatureNotSupportedError(
+				p.lx.src, p.tok.pos,
+				"computed scalar expressions in ORDER BY require a post-scalar stable sort stage",
+			)
+		}
+		term.Path, term.Output, err = p.resolveOrderAlias(path)
+		if err != nil {
+			return term, err
+		}
 	}
 	switch {
 	case p.acceptKeyword(kwAsc):
@@ -2503,6 +2557,33 @@ func (p *Parser) parseOrderTerm() (OrderTerm, error) {
 		return term, p.errHere("COLLATE is not supported: strings compare by decoded content")
 	}
 	return term, nil
+}
+
+func (p *Parser) selectOutputArityDeferred() (bool, error) {
+	for i := range p.columns {
+		if err := p.checkCancellation(); err != nil {
+			return false, err
+		}
+		if p.orderOutputArityDeferred(&p.columns[i]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (p *Parser) orderOutputArityDeferred(column *ResultColumn) bool {
+	if column == nil || column.Path == nil || column.Agg != AggNone {
+		return false
+	}
+	if len(column.Path.Segments) == 0 {
+		return true
+	}
+	for i := range p.pending {
+		if p.pending[i].path == column.Path {
+			return p.pending[i].star
+		}
+	}
+	return false
 }
 
 // resolveOrderAlias replaces a sort key that names an output alias with the

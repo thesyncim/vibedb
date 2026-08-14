@@ -97,18 +97,18 @@ func TestSQLWindowDefaultFrameIncludesPeers(t *testing.T) {
 				PARTITION BY team ORDER BY score
 				GROUPS BETWEEN CURRENT ROW AND CURRENT ROW
 			) AS peer_total
-		FROM events ORDER BY id`)
+		FROM events ORDER BY 2 DESC, 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer statement.Release()
 	got := runStatement(t, statement, FromDatabase(database.Snapshot(), "events"))
 	wantRows := strings.Join([]string{
+		`4:"c"|3:35|3:35|3:35|3:5|`,
 		`4:"a"|3:30|3:35|3:10|3:30|`,
 		`4:"b"|3:30|3:35|3:30|3:30|`,
-		`4:"c"|3:35|3:35|3:35|3:5|`,
-		`4:"d"|3:7|3:10|3:7|3:7|`,
 		`4:"e"|3:10|3:10|3:10|3:3|`,
+		`4:"d"|3:7|3:10|3:7|3:7|`,
 	}, "\n")
 	if rows := strings.TrimSpace(strings.SplitN(got, "\n", 2)[1]); rows != wantRows {
 		t.Fatalf("rows:\n%s\nwant:\n%s", rows, wantRows)

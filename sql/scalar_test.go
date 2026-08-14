@@ -142,6 +142,72 @@ func TestScalarOrderByOutputAliasAndAmbiguity(t *testing.T) {
 	}
 }
 
+func TestOrderByOutputPositionsAndBounds(t *testing.T) {
+	statement, err := Parse(`SELECT a, b + 1 AS score FROM docs ORDER BY 2 DESC, 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statement.OrderBy) != 2 || statement.OrderBy[0].Output != 2 ||
+		!statement.OrderBy[0].Desc || statement.OrderBy[1].Output != 1 ||
+		statement.OrderBy[1].Desc {
+		t.Fatalf("positional ORDER BY = %#v", statement.OrderBy)
+	}
+	quoted, err := Parse(`SELECT a, b AS "1", c AS x, d AS x FROM docs ORDER BY 1, "1"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quoted.OrderBy) != 2 || quoted.OrderBy[0].Output != 1 ||
+		quoted.OrderBy[1].Output != 0 || quoted.OrderBy[1].Path != quoted.Columns[1].Path {
+		t.Fatalf("numeric/quoted alias precedence = %#v", quoted.OrderBy)
+	}
+
+	for _, source := range []string{
+		`SELECT a FROM docs ORDER BY -1`,
+		`SELECT a FROM docs ORDER BY 0`,
+		`SELECT a FROM docs ORDER BY 2`,
+		`SELECT a FROM docs ORDER BY 1.0`,
+		`SELECT a FROM docs ORDER BY 999999999999999999999999999`,
+	} {
+		_, err := Parse(source)
+		var invalid *InvalidOrderPositionError
+		if !errors.As(err, &invalid) || invalid.Pos != strings.Index(source, "ORDER BY")+len("ORDER BY ") ||
+			invalid.Outputs != 1 {
+			t.Fatalf("%q error = %T %+v", source, err, err)
+		}
+	}
+
+	for _, source := range []string{
+		`UPDATE docs SET "$doc" = ? ORDER BY 1 LIMIT 1`,
+		`DELETE FROM docs ORDER BY 1 LIMIT 1`,
+	} {
+		_, err := ParseStatement(source)
+		if err == nil || !strings.Contains(err.Error(), "mutation") {
+			t.Fatalf("mutation ordinal %q error = %v", source, err)
+		}
+	}
+	for _, source := range []string{
+		`SELECT * FROM docs ORDER BY 1`,
+		`SELECT d.* FROM docs AS d ORDER BY 1`,
+	} {
+		_, err := Parse(source)
+		var unsupported *FeatureNotSupportedError
+		if !errors.As(err, &unsupported) || !strings.Contains(unsupported.Msg, "wildcard") {
+			t.Fatalf("wildcard ordinal %q error = %T %v", source, err, err)
+		}
+	}
+	_, err = Parse(`SELECT * FROM docs ORDER BY 0`)
+	var invalidWildcard *InvalidOrderPositionError
+	if !errors.As(err, &invalidWildcard) {
+		t.Fatalf("invalid wildcard ordinal precedence = %T %v", err, err)
+	}
+	_, err = Parse(`SELECT a FROM docs ORDER BY 1 + 0`)
+	var unsupportedExpression *FeatureNotSupportedError
+	if !errors.As(err, &unsupportedExpression) ||
+		!strings.Contains(unsupportedExpression.Msg, "must stand alone") {
+		t.Fatalf("numeric ORDER expression error = %T %v", err, err)
+	}
+}
+
 func TestScalarFormerRefusalsProduceExplicitAST(t *testing.T) {
 	for _, source := range []string{
 		`SELECT a FROM t WHERE 1 = 1`,
