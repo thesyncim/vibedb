@@ -747,8 +747,11 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		leafLease.Release()
 		return false, false, nil
 	}
-	leaf, ok := storeio.AdmittedCompactPrimaryStripe(
-		page, c.storeID, route.Bucket,
+	// AcquireLeaf returned a checksum- and identity-admitted cache lease. Recheck
+	// the compact grammar against that immutable lease without hashing the whole
+	// stripe again on every replacement.
+	leaf, ok := storeio.AdmittedCachedCompactPrimaryStripe(
+		leafLease.Header(), leafLease.Payload(), c.storeID, route.Bucket,
 	)
 	if !ok {
 		leafLease.Release()
@@ -1029,8 +1032,10 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		leafLease.Release()
 		return false, false, nil
 	}
-	leaf, ok := storeio.AdmittedCompactPrimaryStripe(
-		page, c.storeID, route.Bucket,
+	// The cache lease already authenticated the complete page; repeat only the
+	// compact grammar and logical-identity checks needed by this mutation.
+	leaf, ok := storeio.AdmittedCachedCompactPrimaryStripe(
+		leafLease.Header(), leafLease.Payload(), c.storeID, route.Bucket,
 	)
 	if !ok {
 		leafLease.Release()
