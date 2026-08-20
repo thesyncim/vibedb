@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/sha256"
 	"testing"
 	"time"
 
@@ -40,7 +39,9 @@ func stageRecoveryTransaction(
 		if err != nil {
 			t.Fatal(err)
 		}
-		participant.digest = sha256.Sum256(participant.mutation)
+		participant.digest = distributedtxn.ParticipantDigest(
+			participant.bucketBits, participant.scopes, participant.mutation,
+		)
 		request := participant.call.req
 		refs[i] = distributedtxn.ParticipantRef{
 			Distribution: []byte(request.Distribution), Shard: []byte(request.Shard),
@@ -78,7 +79,8 @@ func stageRecoveryTransaction(
 			CoordinatorAllocation:     uint64(coordinator.call.req.AllocationGeneration),
 			CoordinatorRoutingVersion: uint64(coordinator.call.req.RoutingVersion),
 			CoordinatorOwnershipEpoch: uint64(coordinator.call.req.OwnershipEpoch),
-			MutationDigest:            participant.digest, Mutation: participant.mutation,
+			BucketBits:                participant.bucketBits, IntentScopes: participant.scopes,
+			MutationDigest: participant.digest, Mutation: participant.mutation,
 		})
 		if err != nil {
 			t.Fatal(err)

@@ -4,6 +4,7 @@
 package distributedtxn
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -13,9 +14,11 @@ import (
 const (
 	FormatVersion             = 1
 	MaxParticipants           = 64
+	MaxIntentScopes           = 256
 	MaxShardIdentityBytes     = 255
 	MaxMutationBytes          = 16 << 20
 	MaxCoordinatorRecordBytes = 32 << 10
+	MaxParticipantRecordBytes = MaxMutationBytes + MaxIntentScopes*8 + 1024
 )
 
 var (
@@ -30,6 +33,72 @@ var (
 
 type ID [16]byte
 type Digest [32]byte
+
+// IntentScope is one half-open virtual-bucket interval [Start, End). Scopes in
+// a participant are sorted, disjoint, and coalesced before encoding.
+type IntentScope struct {
+	Start uint32
+	End   uint32
+}
+
+// ValidateIntentScopes enforces the canonical sorted interval form.
+func ValidateIntentScopes(scopes []IntentScope, bucketBits uint8) bool {
+	if len(scopes) == 0 {
+		return bucketBits == 0
+	}
+	if len(scopes) > MaxIntentScopes ||
+		bucketBits < 8 || bucketBits > 24 {
+		return false
+	}
+	limit := uint32(1) << bucketBits
+	for i := range scopes {
+		if scopes[i].Start >= scopes[i].End || scopes[i].End > limit ||
+			(i != 0 && scopes[i-1].End >= scopes[i].Start) {
+			return false
+		}
+	}
+	return true
+}
+
+// IntentScopesOverlap reports whether two canonical sorted scope sets touch
+// the same bucket. Different bucket widths must be treated as conflicting by
+// the caller because their coordinates are not comparable.
+func IntentScopesOverlap(a, b []IntentScope) bool {
+	for i, j := 0, 0; i < len(a) && j < len(b); {
+		if a[i].End <= b[j].Start {
+			i++
+			continue
+		}
+		if b[j].End <= a[i].Start {
+			j++
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// ParticipantDigest binds the exact mutation bytes to their visibility scope.
+// A retry cannot retain the same SQL digest while widening or narrowing the
+// buckets it blocks.
+func ParticipantDigest(bucketBits uint8, scopes []IntentScope, mutation []byte) Digest {
+	hash := sha256.New()
+	domain := [5]byte{'V', 'P', 'D', '1', bucketBits}
+	_, _ = hash.Write(domain[:])
+	var encoded [8]byte
+	var count [2]byte
+	binary.LittleEndian.PutUint16(count[:], uint16(len(scopes)))
+	_, _ = hash.Write(count[:])
+	for i := range scopes {
+		binary.LittleEndian.PutUint32(encoded[:4], scopes[i].Start)
+		binary.LittleEndian.PutUint32(encoded[4:8], scopes[i].End)
+		_, _ = hash.Write(encoded[:])
+	}
+	_, _ = hash.Write(mutation)
+	var digest Digest
+	_ = hash.Sum(digest[:0])
+	return digest
+}
 
 func (id ID) IsZero() bool { return id == ID{} }
 
@@ -239,19 +308,21 @@ type ParticipantRecord struct {
 	CoordinatorAllocation     uint64
 	CoordinatorRoutingVersion uint64
 	CoordinatorOwnershipEpoch uint64
+	BucketBits                uint8
+	IntentScopes              []IntentScope
 	MutationDigest            Digest
 	Mutation                  []byte
 }
 
-const participantHeaderBytes = 116
+const participantHeaderBytes = 120
 
 func AppendParticipant(dst []byte, record ParticipantRecord) ([]byte, error) {
 	if err := validateParticipant(record); err != nil {
 		return dst, err
 	}
 	total := participantHeaderBytes + len(record.CoordinatorDistribution) +
-		len(record.CoordinatorShard) + len(record.Mutation) + 4
-	if len(record.Mutation) > MaxMutationBytes || total > MaxMutationBytes+512 {
+		len(record.CoordinatorShard) + len(record.IntentScopes)*8 + len(record.Mutation) + 4
+	if len(record.Mutation) > MaxMutationBytes || total > MaxParticipantRecordBytes {
 		return dst, ErrTooLarge
 	}
 	start := len(dst)
@@ -272,18 +343,38 @@ func AppendParticipant(dst []byte, record ParticipantRecord) ([]byte, error) {
 	copy(out[68:100], record.MutationDigest[:])
 	binary.LittleEndian.PutUint64(out[100:108], record.CoordinatorRoutingVersion)
 	binary.LittleEndian.PutUint64(out[108:116], record.CoordinatorOwnershipEpoch)
+	out[116] = record.BucketBits
+	binary.LittleEndian.PutUint16(out[118:120], uint16(len(record.IntentScopes)))
 	cursor := participantHeaderBytes
 	copy(out[cursor:], record.CoordinatorDistribution)
 	cursor += len(record.CoordinatorDistribution)
 	copy(out[cursor:], record.CoordinatorShard)
 	cursor += len(record.CoordinatorShard)
+	for i := range record.IntentScopes {
+		binary.LittleEndian.PutUint32(out[cursor:cursor+4], record.IntentScopes[i].Start)
+		binary.LittleEndian.PutUint32(out[cursor+4:cursor+8], record.IntentScopes[i].End)
+		cursor += 8
+	}
 	copy(out[cursor:], record.Mutation)
 	binary.LittleEndian.PutUint32(out[total-4:], crc32.Checksum(out[:total-4], castagnoli))
 	return dst, nil
 }
 
 func OpenParticipant(src []byte) (ParticipantRecord, error) {
-	if len(src) < participantHeaderBytes+4 || len(src) > MaxMutationBytes+512 ||
+	if len(src) < participantHeaderBytes+4 {
+		return ParticipantRecord{}, ErrCorrupt
+	}
+	count := int(binary.LittleEndian.Uint16(src[118:120]))
+	if count > MaxIntentScopes {
+		return ParticipantRecord{}, ErrCorrupt
+	}
+	return OpenParticipantInto(src, make([]IntentScope, count))
+}
+
+// OpenParticipantInto decodes using caller-owned scope storage. Apply,
+// admission, and codec validation keep a fixed arena and allocate nothing.
+func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, error) {
+	if len(src) < participantHeaderBytes+4 || len(src) > MaxParticipantRecordBytes ||
 		!equal4(src[:4], participantMagic) || !checksumOK(src) {
 		return ParticipantRecord{}, ErrCorrupt
 	}
@@ -293,8 +384,10 @@ func OpenParticipant(src []byte) (ParticipantRecord, error) {
 	distributionLen := int(src[6])
 	shardLen := int(src[7])
 	mutationLen := int(binary.LittleEndian.Uint32(src[48:52]))
+	scopeCount := int(binary.LittleEndian.Uint16(src[118:120]))
 	if distributionLen == 0 || shardLen == 0 || mutationLen > MaxMutationBytes ||
-		participantHeaderBytes+distributionLen+shardLen+mutationLen+4 != len(src) {
+		scopeCount > MaxIntentScopes || cap(scopes) < scopeCount ||
+		participantHeaderBytes+distributionLen+shardLen+scopeCount*8+mutationLen+4 != len(src) {
 		return ParticipantRecord{}, ErrCorrupt
 	}
 	record := ParticipantRecord{
@@ -305,6 +398,7 @@ func OpenParticipant(src []byte) (ParticipantRecord, error) {
 		CoordinatorAllocation:     binary.LittleEndian.Uint64(src[40:48]),
 		CoordinatorRoutingVersion: binary.LittleEndian.Uint64(src[100:108]),
 		CoordinatorOwnershipEpoch: binary.LittleEndian.Uint64(src[108:116]),
+		BucketBits:                src[116],
 	}
 	copy(record.ID[:], src[52:68])
 	copy(record.MutationDigest[:], src[68:100])
@@ -313,6 +407,16 @@ func OpenParticipant(src []byte) (ParticipantRecord, error) {
 	cursor += distributionLen
 	record.CoordinatorShard = src[cursor : cursor+shardLen]
 	cursor += shardLen
+	if scopeCount != 0 {
+		record.IntentScopes = scopes[:scopeCount]
+		for i := range record.IntentScopes {
+			record.IntentScopes[i] = IntentScope{
+				Start: binary.LittleEndian.Uint32(src[cursor : cursor+4]),
+				End:   binary.LittleEndian.Uint32(src[cursor+4 : cursor+8]),
+			}
+			cursor += 8
+		}
+	}
 	record.Mutation = src[cursor : cursor+mutationLen]
 	if err := validateParticipant(record); err != nil {
 		return ParticipantRecord{}, ErrCorrupt
@@ -350,6 +454,7 @@ func validateParticipant(record ParticipantRecord) error {
 		record.RoutingVersion == 0 || record.AllocationGeneration == 0 ||
 		record.OwnershipEpoch == 0 || record.CoordinatorAllocation == 0 ||
 		record.CoordinatorRoutingVersion == 0 || record.CoordinatorOwnershipEpoch == 0 ||
+		!ValidateIntentScopes(record.IntentScopes, record.BucketBits) ||
 		len(record.CoordinatorDistribution) == 0 || len(record.CoordinatorDistribution) > MaxShardIdentityBytes ||
 		!utf8.Valid(record.CoordinatorDistribution) || len(record.CoordinatorShard) == 0 ||
 		len(record.CoordinatorShard) > MaxShardIdentityBytes || !utf8.Valid(record.CoordinatorShard) ||

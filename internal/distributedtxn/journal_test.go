@@ -2,10 +2,12 @@ package distributedtxn
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func journalID(seed byte) ID {
@@ -195,6 +197,67 @@ func TestJournalMissingParticipantAbortFencesLateStage(t *testing.T) {
 	}
 	if _, err := j.StageParticipant(late); !errors.Is(err, ErrJournalConflict) {
 		t.Fatalf("late stage after restart = %v, want ErrJournalConflict", err)
+	}
+}
+
+func TestJournalScopesAllowDisjointParticipantsAndTraffic(t *testing.T) {
+	j, err := OpenJournal(filepath.Join(t.TempDir(), "transactions.vtj"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	stage := func(id ID, scope IntentScope) error {
+		mutation := []byte("scoped")
+		raw, err := AppendParticipant(nil, ParticipantRecord{
+			ID: id, State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
+			AllocationGeneration: 4, OwnershipEpoch: 7,
+			CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-40"),
+			CoordinatorAllocation: 4, CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 7,
+			BucketBits: 8, IntentScopes: []IntentScope{scope},
+			MutationDigest: journalDigest(id[0] + 40), Mutation: mutation,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = j.StageParticipant(raw)
+		return err
+	}
+	first, second, overlapping := journalID(81), journalID(82), journalID(83)
+	if err := stage(first, IntentScope{Start: 10, End: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage(second, IntentScope{Start: 20, End: 22}); err != nil {
+		t.Fatalf("disjoint participant: %v", err)
+	}
+	if err := stage(overlapping, IntentScope{Start: 11, End: 13}); !errors.Is(err, ErrJournalBusy) {
+		t.Fatalf("overlapping participant = %v, want ErrJournalBusy", err)
+	}
+	if err := j.WaitNoParticipantBarrier(
+		context.Background(), 8, []IntentScope{{Start: 30, End: 31}},
+	); err != nil {
+		t.Fatalf("disjoint traffic: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- j.WaitNoParticipantBarrier(
+			waitCtx, 8, []IntentScope{{Start: 10, End: 11}},
+		)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("overlapping traffic returned before release: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, err := j.AbortParticipant(first, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("released traffic: %v", err)
+	}
+	if _, err := j.AbortParticipant(second, 1); err != nil {
+		t.Fatal(err)
 	}
 }
 

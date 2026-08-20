@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	cryptorand "crypto/rand"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +68,8 @@ func (e *CommittedTransactionError) Unwrap() []error {
 type transactionParticipant struct {
 	call       shardCall
 	statements []shardservice.MutationStatement
+	bucketBits uint8
+	scopes     []distributedtxn.IntentScope
 	mutation   []byte
 	digest     distributedtxn.Digest
 	record     []byte
@@ -159,14 +160,21 @@ func (e *Executor) planTransaction(
 			}
 		}
 		if participantIndex < 0 {
-			participants = append(participants, transactionParticipant{call: *call})
+			participants = append(participants, transactionParticipant{
+				call: *call, bucketBits: call.req.BucketBits,
+				scopes: call.req.AccessScopes,
+			})
 			participantIndex = len(participants) - 1
 			if len(participants) > distributedtxn.MaxParticipants {
 				return nil, ErrTransactionParticipantLimit
 			}
 		}
-		participants[participantIndex].statements = append(
-			participants[participantIndex].statements,
+		participant := &participants[participantIndex]
+		if len(participant.statements) != 0 {
+			mergeParticipantScopes(participant, call.req.BucketBits, call.req.AccessScopes)
+		}
+		participant.statements = append(
+			participant.statements,
 			shardservice.MutationStatement{SQL: query.SQL, Params: query.Params},
 		)
 	}
@@ -186,6 +194,24 @@ func (e *Executor) planTransaction(
 		return 0
 	})
 	return participants, nil
+}
+
+func mergeParticipantScopes(
+	participant *transactionParticipant,
+	bucketBits uint8,
+	scopes []distributedtxn.IntentScope,
+) {
+	if participant.bucketBits == 0 || bucketBits == 0 || participant.bucketBits != bucketBits {
+		participant.bucketBits = 0
+		participant.scopes = nil
+		return
+	}
+	participant.scopes = append(participant.scopes, scopes...)
+	participant.scopes = coalesceIntentScopes(participant.scopes)
+	if len(participant.scopes) > distributedtxn.MaxIntentScopes {
+		participant.bucketBits = 0
+		participant.scopes = nil
+	}
 }
 
 func sameTransactionTarget(a, b *shardservice.ShardRequest) bool {
@@ -212,7 +238,9 @@ func (e *Executor) executeTransaction(
 		if err != nil {
 			return nil, err
 		}
-		participant.digest = sha256.Sum256(participant.mutation)
+		participant.digest = distributedtxn.ParticipantDigest(
+			participant.bucketBits, participant.scopes, participant.mutation,
+		)
 		request := participant.call.req
 		refs[i] = distributedtxn.ParticipantRef{
 			Distribution: []byte(request.Distribution), Shard: []byte(request.Shard),
@@ -267,7 +295,8 @@ func (e *Executor) executeTransaction(
 			CoordinatorAllocation:     uint64(coordinator.call.req.AllocationGeneration),
 			CoordinatorRoutingVersion: uint64(coordinator.call.req.RoutingVersion),
 			CoordinatorOwnershipEpoch: uint64(coordinator.call.req.OwnershipEpoch),
-			MutationDigest:            participant.digest, Mutation: participant.mutation,
+			BucketBits:                participant.bucketBits, IntentScopes: participant.scopes,
+			MutationDigest: participant.digest, Mutation: participant.mutation,
 		})
 		if err != nil {
 			abortErr := e.abortTransaction(ctx, id, coordinator, participants, profile)

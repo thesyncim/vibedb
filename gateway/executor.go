@@ -369,6 +369,7 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 	if err != nil {
 		return nil, kind, ScatterNone, err
 	}
+	bucketBits, accessScopes := writeAccessScopes(bound, targets[0])
 	call := &shardCall{
 		target:  targets[0],
 		address: addr,
@@ -385,6 +386,8 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 			Deadline:             p.PerShardDeadline,
 			MaxRows:              p.PerShardRows,
 			MaxResultBytes:       p.PerShardBytes,
+			BucketBits:           bucketBits,
+			AccessScopes:         accessScopes,
 		},
 	}
 	return call, kind, ScatterNone, nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -56,13 +57,15 @@ func TestParticipantRoundTripAndExactSize(t *testing.T) {
 		ID: testID(), State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
 		AllocationGeneration: 2, OwnershipEpoch: 3, CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-80"),
 		CoordinatorAllocation: 2, CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 3,
+		BucketBits: 8, IntentScopes: []IntentScope{{Start: 1, End: 3}, {Start: 5, End: 6}},
 		MutationDigest: sha256.Sum256(mutation), Mutation: mutation,
 	}
 	encoded, err := AppendParticipant(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := participantHeaderBytes + len(record.CoordinatorDistribution) + len(record.CoordinatorShard) + len(mutation) + 4
+	want := participantHeaderBytes + len(record.CoordinatorDistribution) + len(record.CoordinatorShard) +
+		len(record.IntentScopes)*8 + len(mutation) + 4
 	if len(encoded) != want {
 		t.Fatalf("size = %d, want %d", len(encoded), want)
 	}
@@ -71,7 +74,8 @@ func TestParticipantRoundTripAndExactSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.ID != record.ID || got.MutationDigest != record.MutationDigest ||
-		!bytes.Equal(got.Mutation, mutation) || !bytes.Equal(got.CoordinatorShard, []byte("-80")) {
+		!bytes.Equal(got.Mutation, mutation) || !bytes.Equal(got.CoordinatorShard, []byte("-80")) ||
+		!slices.Equal(got.IntentScopes, record.IntentScopes) {
 		t.Fatalf("round trip = %+v", got)
 	}
 	offset := bytes.Index(encoded, mutation)
@@ -140,5 +144,48 @@ func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
 		if _, err := OpenCoordinatorInto(encoded, participantsScratch); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkParticipantCodecScopes(b *testing.B) {
+	mutation := []byte("compact-mutation-batch")
+	record := ParticipantRecord{
+		ID: testID(), State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
+		AllocationGeneration: 2, OwnershipEpoch: 3,
+		CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-80"),
+		CoordinatorAllocation: 2, CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 3,
+		BucketBits: 20, IntentScopes: []IntentScope{
+			{Start: 17, End: 18}, {Start: 91, End: 92},
+			{Start: 700, End: 702}, {Start: 9000, End: 9001},
+		},
+		MutationDigest: sha256.Sum256(mutation), Mutation: mutation,
+	}
+	dst := make([]byte, 0, 1024)
+	var scopes [MaxIntentScopes]IntentScope
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		encoded, err := AppendParticipant(dst[:0], record)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := OpenParticipantInto(encoded, scopes[:]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParticipantDigestScopes(b *testing.B) {
+	mutation := make([]byte, 1024)
+	scopes := []IntentScope{{Start: 17, End: 18}, {Start: 91, End: 92}, {Start: 700, End: 702}}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(mutation)))
+	b.ResetTimer()
+	var digest Digest
+	for range b.N {
+		digest = ParticipantDigest(20, scopes, mutation)
+	}
+	if digest == (Digest{}) {
+		b.Fatal("zero digest")
 	}
 }

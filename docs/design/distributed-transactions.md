@@ -27,7 +27,9 @@ One transaction carries:
   decision exists.
 
 Transaction identity, participant digest, and ownership coordinates are exact
-match fences. Reusing an ID with different bytes is corruption, not a retry.
+match fences. The participant digest covers both the compact mutation batch and
+its canonical virtual-bucket scope. Reusing an ID with different bytes or a
+different visibility interval is corruption, not a retry.
 Split, merge, or ownership movement cannot translate an in-flight transaction;
 the old allocation remains responsible until resolution.
 
@@ -119,7 +121,7 @@ Initial production bounds:
 | mutation bytes per participant | 16 MiB wire-frame bound |
 | active transactions per shard | 4,096 |
 | coordinator record | 52 bytes + 60 bytes/participant + distribution/shard identities |
-| participant fixed metadata | 120 bytes + coordinator identities + mutation |
+| participant fixed metadata | 124 bytes + coordinator identities + 8 bytes/scope + mutation |
 
 ## Implementation status
 
@@ -134,10 +136,12 @@ without executing the SQL mutation twice. End-to-end tests cover cross-shard,
 multi-table, and prepare-failure rollback.
 
 Automatic background redrive is enabled for coordinator allocations retained
-in the current catalog. Key/range-scoped barriers are not enabled yet; ordinary
-traffic currently waits behind the one active participant permitted on its
-shard. The common read-timestamp contract is also still pending. Their
-integration order is specified in
+in the current catalog. Participant records carry up to 256 sorted, coalesced
+virtual-bucket intervals. The shard journal keeps a cache-friendly sorted
+non-overlapping interval index: disjoint transactions may prepare concurrently,
+and scoped ordinary traffic waits only on an intersecting interval. An absent
+scope remains the fail-safe whole-shard form. The common read-timestamp contract
+is still pending. Its integration order is specified in
 [Distributed system target](distributed-system.md).
 
 ## Latency and throughput

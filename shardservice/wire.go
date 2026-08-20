@@ -325,6 +325,12 @@ type ShardRequest struct {
 	// default.
 	MaxRows uint64
 
+	// BucketBits and AccessScopes optionally declare the canonical virtual
+	// buckets touched by ordinary gateway traffic. The absent zero form means
+	// whole shard and remains fail-safe for direct clients.
+	BucketBits   uint8
+	AccessScopes []distributedtxn.IntentScope
+
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
 	Transaction TransactionRequest

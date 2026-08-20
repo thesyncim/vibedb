@@ -89,6 +89,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 	calls := make([]shardCall, len(route.Targets))
 	for i := range route.Targets {
 		t := route.Targets[i]
+		bucketBits, accessScopes := readAccessScopes(bound, t)
 		addr, err := snap.Address(t.Endpoint)
 		if err != nil {
 			return nil, err
@@ -109,6 +110,8 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 				Deadline:             p.PerShardDeadline,
 				MaxRows:              p.PerShardRows,
 				MaxResultBytes:       p.PerShardBytes,
+				BucketBits:           bucketBits,
+				AccessScopes:         accessScopes,
 			},
 		}
 	}

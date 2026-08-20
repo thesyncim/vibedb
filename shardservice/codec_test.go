@@ -118,6 +118,17 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "scoped_access",
+			req: &ShardRequest{
+				SQL:          "SELECT n FROM messages WHERE tenant_id = ?",
+				Params:       []Param{StringParam("acme")},
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				BucketBits:   20,
+				AccessScopes: []distributedtxn.IntentScope{{Start: 17, End: 18}, {Start: 99, End: 101}},
+			},
+		},
+		{
 			name: "stage_participant",
 			req: &ShardRequest{
 				Distribution: "tenant_data", Shard: "40-80",

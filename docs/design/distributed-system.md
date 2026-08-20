@@ -68,10 +68,12 @@ participant in parallel, and uses the transaction protocol in
 same raw 128-bit identity. Recovery owns participant resolution and cleanup;
 transport failure never becomes a new mutation.
 
-Concurrency barriers are scoped to canonical point keys or half-open key
-ranges. A transaction may block an intersecting operation, but must not stop an
-entire shard. Admission bounds active intents, participants, retained bytes,
-range count, and recovery work.
+Concurrency barriers are currently scoped to sorted half-open virtual-bucket
+intervals. A transaction blocks an intersecting operation without stopping an
+entire shard; absent scope metadata deliberately falls back to a whole-shard
+barrier. A future row-key refinement can narrow hot buckets further without
+changing participant identity. Admission bounds active intents, participants,
+retained bytes, range count, and recovery work.
 
 Read-only fan-out pins one catalog generation and one read timestamp. Each
 participant waits until its applied/closed timestamp covers that cut. A

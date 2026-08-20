@@ -2,7 +2,6 @@ package shardservice
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -122,7 +121,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		return c.transaction(req)
 	}
 	barrierCtx, barrierCancel := c.server.requestContext(req)
-	err := c.server.journal.WaitNoParticipantBarrier(barrierCtx)
+	err := c.server.journal.WaitNoParticipantBarrier(
+		barrierCtx, req.BucketBits, req.AccessScopes,
+	)
 	barrierCancel()
 	if err != nil {
 		return classifyError(err)
@@ -136,7 +137,7 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 // transaction boundary; accepting them earlier would permit partial commit.
 func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	if req.SQL != "" || len(req.Params) != 0 {
+	if req.SQL != "" || len(req.Params) != 0 || len(req.AccessScopes) != 0 || req.BucketBits != 0 {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: a transaction command cannot also carry SQL or parameters")
 	}
@@ -171,7 +172,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		}
 		status, err = c.server.journal.StageCoordinator(tx.Record)
 	case TransactionStageParticipant:
-		record, openErr := distributedtxn.OpenParticipant(tx.Record)
+		var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
+		record, openErr := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
 		if openErr != nil {
 			return transactionError(openErr)
 		}
@@ -369,11 +371,18 @@ func (c *shardConn) prepareParticipant(req *ShardRequest) *ShardResponse {
 }
 
 func (c *shardConn) participantBatch(id distributedtxn.ID) (MutationBatch, error) {
-	record, err := c.server.journal.Participant(id)
+	raw, err := c.server.journal.ParticipantStage(id)
 	if err != nil {
 		return MutationBatch{}, err
 	}
-	if sha256.Sum256(record.Mutation) != record.MutationDigest {
+	var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
+	record, err := distributedtxn.OpenParticipantInto(raw, scopes[:])
+	if err != nil {
+		return MutationBatch{}, err
+	}
+	if distributedtxn.ParticipantDigest(
+		record.BucketBits, record.IntentScopes, record.Mutation,
+	) != record.MutationDigest {
 		return MutationBatch{}, distributedtxn.ErrCorrupt
 	}
 	return OpenMutationBatch(record.Mutation)

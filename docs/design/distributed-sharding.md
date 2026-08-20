@@ -100,6 +100,11 @@ pins one catalog generation, resolves the relevant immutable manifest, routes
 to leader endpoints, applies per-shard and operation-wide deadlines, and merges
 within configured result, memory, fan-out, and concurrency limits.
 
+Gateway requests also carry canonical virtual-bucket access intervals. Durable
+transaction participants bind those intervals into their mutation digest, and
+the shard's sorted interval index blocks only overlapping traffic. Direct
+requests with no interval remain whole-shard scoped and therefore fail safe.
+
 Currently executable distributed shapes include:
 
 - projection and filters that can be lowered for shard-local execution;

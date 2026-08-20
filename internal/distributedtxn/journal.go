@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 )
 
@@ -54,8 +55,16 @@ type Status struct {
 }
 
 type journalRecord struct {
-	status Status
-	stage  []byte
+	status     Status
+	stage      []byte
+	bucketBits uint8
+	scopes     []IntentScope
+}
+
+type barrierScope struct {
+	start uint32
+	end   uint32
+	id    ID
 }
 
 // Journal is one shard-local, append-only transaction journal. Stage payloads
@@ -63,14 +72,17 @@ type journalRecord struct {
 // is published only after fsync succeeds, and a sync failure poisons the handle
 // so callers must reopen and resolve the durable outcome from recovery.
 type Journal struct {
-	mu           sync.RWMutex
-	file         *os.File
-	coordinators map[ID]*journalRecord
-	participants map[ID]*journalRecord
-	sticky       error
-	closed       bool
-	barriers     int
-	barrierDone  chan struct{}
+	mu             sync.RWMutex
+	file           *os.File
+	coordinators   map[ID]*journalRecord
+	participants   map[ID]*journalRecord
+	sticky         error
+	closed         bool
+	barriers       int
+	globalBarriers int
+	barrierBits    uint8
+	barrierIndex   []barrierScope
+	barrierChanged chan struct{}
 }
 
 // OpenJournal opens or creates path, recovers every checksummed entry, and
@@ -98,11 +110,9 @@ func OpenJournal(path string) (*Journal, error) {
 			return nil, err
 		}
 	}
-	barrierDone := make(chan struct{})
-	close(barrierDone)
 	j := &Journal{
 		file: file, coordinators: make(map[ID]*journalRecord),
-		participants: make(map[ID]*journalRecord), barrierDone: barrierDone,
+		participants: make(map[ID]*journalRecord), barrierChanged: make(chan struct{}),
 	}
 	if err := j.recover(); err != nil {
 		_ = file.Close()
@@ -132,7 +142,7 @@ func (j *Journal) recover() error {
 		}
 		payloadBytes := int64(binary.LittleEndian.Uint32(header[8:12]))
 		entryBytes := int64(journalEntryHeaderBytes) + payloadBytes + 4
-		if payloadBytes < 0 || payloadBytes > MaxMutationBytes+512 {
+		if payloadBytes < 0 || payloadBytes > MaxParticipantRecordBytes {
 			return ErrTooLarge
 		}
 		if entryBytes > remaining {
@@ -184,7 +194,8 @@ func (j *Journal) replayEntry(entry []byte) error {
 		}
 		return j.replayCoordinatorStage(payload, record)
 	case journalParticipantStage:
-		record, err := OpenParticipant(payload)
+		var scopes [MaxIntentScopes]IntentScope
+		record, err := OpenParticipantInto(payload, scopes[:])
 		if err != nil || record.ID != id || record.Revision != revision || byte(record.State) != state {
 			return ErrCorrupt
 		}
@@ -250,9 +261,10 @@ func (j *Journal) replayParticipantStage(raw []byte, record ParticipantRecord) e
 	j.participants[record.ID] = &journalRecord{
 		status: Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
 			ParticipantState: record.State, MutationDigest: record.MutationDigest},
-		stage: bytes.Clone(raw),
+		stage: bytes.Clone(raw), bucketBits: record.BucketBits,
+		scopes: append([]IntentScope(nil), record.IntentScopes...),
 	}
-	j.addBarrierLocked()
+	j.addBarrierLocked(record.ID, record.BucketBits, record.IntentScopes)
 	return nil
 }
 
@@ -276,26 +288,57 @@ func (j *Journal) replayParticipantTransition(id ID, revision uint64, next Parti
 	record.status.Revision = revision
 	record.status.ParticipantState = next
 	if next == ParticipantAborted || next == ParticipantReleased {
-		j.removeBarrierLocked()
+		j.removeBarrierLocked(id)
 	}
 	return nil
 }
 
-func (j *Journal) addBarrierLocked() {
-	if j.barriers == 0 {
-		j.barrierDone = make(chan struct{})
-	}
+func (j *Journal) addBarrierLocked(id ID, bucketBits uint8, scopes []IntentScope) {
 	j.barriers++
+	if len(scopes) == 0 {
+		j.globalBarriers++
+		return
+	}
+	j.barrierBits = bucketBits
+	for i := range scopes {
+		position := sort.Search(len(j.barrierIndex), func(index int) bool {
+			return j.barrierIndex[index].start >= scopes[i].Start
+		})
+		j.barrierIndex = append(j.barrierIndex, barrierScope{})
+		copy(j.barrierIndex[position+1:], j.barrierIndex[position:])
+		j.barrierIndex[position] = barrierScope{
+			start: scopes[i].Start, end: scopes[i].End, id: id,
+		}
+	}
 }
 
-func (j *Journal) removeBarrierLocked() {
+func (j *Journal) removeBarrierLocked(id ID) {
 	if j.barriers <= 0 {
 		return
 	}
-	j.barriers--
-	if j.barriers == 0 {
-		close(j.barrierDone)
+	record := j.participants[id]
+	if record != nil && len(record.scopes) == 0 {
+		if j.globalBarriers > 0 {
+			j.globalBarriers--
+		}
+	} else {
+		write := 0
+		for i := range j.barrierIndex {
+			if j.barrierIndex[i].id == id {
+				continue
+			}
+			j.barrierIndex[write] = j.barrierIndex[i]
+			write++
+		}
+		clear(j.barrierIndex[write:])
+		j.barrierIndex = j.barrierIndex[:write]
+		if len(j.barrierIndex) == 0 {
+			j.barrierBits = 0
+		}
 	}
+	j.barriers--
+	close(j.barrierChanged)
+	j.barrierChanged = make(chan struct{})
 }
 
 func (j *Journal) writeEntryLocked(kind journalEntryKind, state byte, revision uint64, id ID, payload []byte) error {
@@ -352,7 +395,8 @@ func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
 }
 
 func (j *Journal) StageParticipant(raw []byte) (Status, error) {
-	record, err := OpenParticipant(raw)
+	var scopes [MaxIntentScopes]IntentScope
+	record, err := OpenParticipantInto(raw, scopes[:])
 	if err != nil || record.State != ParticipantStaged {
 		return Status{}, errors.Join(ErrCorrupt, err)
 	}
@@ -364,11 +408,9 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 		}
 		return Status{}, ErrJournalConflict
 	}
-	// The current visibility barrier is shard-wide, so admitting a second
-	// distributed participant would let two dry-run/commit sequences observe the
-	// same pre-commit state. Fail fast instead of waiting or deadlocking across
-	// shards. Scoped intents replace this conservative exclusion later.
-	if j.barriers != 0 {
+	// Overlapping participants fail fast instead of waiting and forming a
+	// cross-shard deadlock. Disjoint bucket intervals may prepare concurrently.
+	if j.scopeConflictLocked(record.BucketBits, record.IntentScopes) {
 		return Status{}, ErrJournalBusy
 	}
 	if err := j.writeEntryLocked(journalParticipantStage, byte(record.State), record.Revision, record.ID, raw); err != nil {
@@ -376,8 +418,11 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 	}
 	status := Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
 		ParticipantState: record.State, MutationDigest: record.MutationDigest}
-	j.participants[record.ID] = &journalRecord{status: status, stage: bytes.Clone(raw)}
-	j.addBarrierLocked()
+	j.participants[record.ID] = &journalRecord{
+		status: status, stage: bytes.Clone(raw),
+		bucketBits: record.BucketBits, scopes: append([]IntentScope(nil), record.IntentScopes...),
+	}
+	j.addBarrierLocked(record.ID, record.BucketBits, record.IntentScopes)
 	return status, nil
 }
 
@@ -459,7 +504,7 @@ func (j *Journal) TransitionParticipant(id ID, expected uint64, next Participant
 	record.status.Revision++
 	record.status.ParticipantState = next
 	if next == ParticipantAborted || next == ParticipantReleased {
-		j.removeBarrierLocked()
+		j.removeBarrierLocked(id)
 	}
 	return record.status, nil
 }
@@ -501,27 +546,54 @@ func (j *Journal) AbortParticipant(id ID, expected uint64) (Status, error) {
 	}
 	record.status.Revision++
 	record.status.ParticipantState = ParticipantAborted
-	j.removeBarrierLocked()
+	j.removeBarrierLocked(id)
 	return record.status, nil
 }
 
-// WaitNoParticipantBarrier waits until every staged participant is aborted or
-// released. Transaction commands bypass this gate so recovery can always make
-// progress. The channel fast path allocates nothing.
-func (j *Journal) WaitNoParticipantBarrier(ctx context.Context) error {
-	j.mu.RLock()
-	if j.closed {
+// WaitNoParticipantBarrier waits only for active participant scopes that
+// intersect access. An absent access scope is the fail-safe whole-shard form.
+// Transaction commands bypass this gate so recovery can always make progress.
+func (j *Journal) WaitNoParticipantBarrier(
+	ctx context.Context,
+	bucketBits uint8,
+	access []IntentScope,
+) error {
+	for {
+		j.mu.RLock()
+		if j.closed {
+			j.mu.RUnlock()
+			return ErrJournalClosed
+		}
+		if !j.scopeConflictLocked(bucketBits, access) {
+			j.mu.RUnlock()
+			return nil
+		}
+		changed := j.barrierChanged
 		j.mu.RUnlock()
-		return ErrJournalClosed
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	done := j.barrierDone
-	j.mu.RUnlock()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+}
+
+func (j *Journal) scopeConflictLocked(bucketBits uint8, access []IntentScope) bool {
+	if j.barriers == 0 {
+		return false
 	}
+	if j.globalBarriers != 0 || len(access) == 0 || bucketBits != j.barrierBits {
+		return true
+	}
+	for i := range access {
+		position := sort.Search(len(j.barrierIndex), func(index int) bool {
+			return j.barrierIndex[index].end > access[i].Start
+		})
+		if position < len(j.barrierIndex) && j.barrierIndex[position].start < access[i].End {
+			return true
+		}
+	}
+	return false
 }
 
 // Participant returns a decoded immutable view of the stage payload. Its byte
@@ -612,5 +684,6 @@ func (j *Journal) Close() error {
 		return nil
 	}
 	j.closed = true
+	close(j.barrierChanged)
 	return j.file.Close()
 }

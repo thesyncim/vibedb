@@ -32,6 +32,7 @@ const (
 	// transactionMarker makes the optional trailing envelope unambiguous while
 	// leaving every ordinary frame byte-for-byte unchanged.
 	transactionMarker = 0xd7
+	accessScopeMarker = 0xd8
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -410,7 +411,8 @@ func validateTransactionRequest(tx TransactionRequest) error {
 			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
 			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 		} else {
-			_, err = distributedtxn.OpenParticipant(tx.Record)
+			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
+			_, err = distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
 		}
 		if err != nil {
 			return errors.Join(errBadTransaction, err)
@@ -467,7 +469,8 @@ func validateTransactionReply(tx TransactionReply) error {
 			return errBadTransaction
 		}
 		if len(tx.Record) != 0 {
-			record, err := distributedtxn.OpenParticipant(tx.Record)
+			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
+			record, err := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
@@ -567,6 +570,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if err := validateTransactionRequest(req.Transaction); err != nil {
 		return err
 	}
+	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
+		return errBadTransaction
+	}
 
 	var e encbuf
 	e.u8(wireVersion)
@@ -606,6 +612,15 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	}
 	if err := e.position(req.HasMinPosition, req.MinPosition); err != nil {
 		return err
+	}
+	if len(req.AccessScopes) != 0 {
+		e.u8(accessScopeMarker)
+		e.u8(req.BucketBits)
+		e.u32(uint32(len(req.AccessScopes)))
+		for i := range req.AccessScopes {
+			e.u32(req.AccessScopes[i].Start)
+			e.u32(req.AccessScopes[i].End)
+		}
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
@@ -681,6 +696,20 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	req.HasMinPosition, req.MinPosition, err = d.position()
 	if err != nil {
 		return nil, err
+	}
+	if len(d.b) != 0 && d.b[0] == accessScopeMarker {
+		d.u8()
+		req.BucketBits = d.u8()
+		count := d.count(8, distributedtxn.MaxIntentScopes)
+		if count != 0 {
+			req.AccessScopes = make([]distributedtxn.IntentScope, count)
+			for i := range req.AccessScopes {
+				req.AccessScopes[i] = distributedtxn.IntentScope{Start: d.u32(), End: d.u32()}
+			}
+		}
+		if d.bad() || !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
+			return nil, errBadTransaction
+		}
 	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()

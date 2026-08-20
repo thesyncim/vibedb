@@ -39,8 +39,9 @@
 // ExecBatch prepares every statement against one pinned generation and runs a
 // bounded fixed-participant transaction across tables and shards. Coordinator
 // and participant state is durable on shards; bounded scanning and redrive let
-// any gateway recover current-catalog coordinators. Key-range-scoped intents,
-// replicated serving, peer authentication, failover,
+// any gateway recover current-catalog coordinators. Virtual-bucket-scoped
+// intents allow disjoint traffic to proceed; finer row-key intents, replicated
+// serving, peer authentication, failover,
 // online movement, and a topology authority are not yet provided. The command
 // front end is loopback-only newline-delimited JSON, not pgwire.
 package gateway

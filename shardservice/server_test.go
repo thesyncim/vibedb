@@ -1,7 +1,6 @@
 package shardservice
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -251,7 +250,7 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	if err != nil {
 		t.Fatalf("AppendMutationBatch: %v", err)
 	}
-	digest := sha256.Sum256(mutation)
+	digest := distributedtxn.ParticipantDigest(0, nil, mutation)
 	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
 		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
@@ -345,6 +344,89 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	if query.Kind != ResponseRows || len(query.Rows) != 1 ||
 		cellText(t, query, 0, 0) != `"published"` || cellText(t, query, 0, 1) != "7" {
 		t.Fatalf("published row = %+v", query)
+	}
+}
+
+func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+	exec(t, conn, ownedRequest(
+		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+		StringParam("visible"), StringParam("row"), NumberParam("1"),
+	))
+	owner := testOwner()
+	id := testTransactionID(91)
+	mutation, err := AppendMutationBatch(nil, []MutationStatement{{
+		SQL: `DELETE FROM docs WHERE id = ?`, Params: []Param{StringParam("other")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := []distributedtxn.IntentScope{{Start: 10, End: 11}}
+	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
+		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+		RoutingVersion: uint64(owner.RoutingVersion), AllocationGeneration: uint64(owner.AllocationGeneration),
+		OwnershipEpoch:          uint64(owner.Epoch),
+		CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation:     uint64(owner.AllocationGeneration),
+		CoordinatorRoutingVersion: uint64(owner.RoutingVersion), CoordinatorOwnershipEpoch: uint64(owner.Epoch),
+		BucketBits: 8, IntentScopes: scopes,
+		MutationDigest: distributedtxn.ParticipantDigest(8, scopes, mutation), Mutation: mutation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := ownedRequest("")
+	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	exec(t, conn, stage)
+
+	disjoint := ownedRequest(`SELECT n FROM docs WHERE id = ?`, StringParam("visible"))
+	disjoint.BucketBits = 8
+	disjoint.AccessScopes = []distributedtxn.IntentScope{{Start: 20, End: 21}}
+	if response := exec(t, conn, disjoint); response.Kind != ResponseRows || len(response.Rows) != 1 {
+		t.Fatalf("disjoint read = %+v", response)
+	}
+
+	blockedConn := dial(t, srv)
+	blocked := make(chan *ShardResponse, 1)
+	blockedErr := make(chan error, 1)
+	go func() {
+		request := ownedRequest(`SELECT n FROM docs WHERE id = ?`, StringParam("visible"))
+		request.BucketBits = 8
+		request.AccessScopes = []distributedtxn.IntentScope{{Start: 10, End: 11}}
+		if err := EncodeRequest(blockedConn, request); err != nil {
+			blockedErr <- err
+			return
+		}
+		response, err := DecodeResponse(blockedConn)
+		if err != nil {
+			blockedErr <- err
+			return
+		}
+		blocked <- response
+	}()
+	select {
+	case response := <-blocked:
+		t.Fatalf("intersecting read crossed intent: %+v", response)
+	case err := <-blockedErr:
+		t.Fatalf("intersecting read failed early: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	abort := ownedRequest("")
+	abort.Transaction = TransactionRequest{
+		Operation: TransactionAbortParticipant, ID: id, Revision: 1,
+	}
+	exec(t, conn, abort)
+	select {
+	case response := <-blocked:
+		if response.Kind != ResponseRows || len(response.Rows) != 1 {
+			t.Fatalf("released read = %+v", response)
+		}
+	case err := <-blockedErr:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("intersecting read did not resume after abort")
 	}
 }
 
