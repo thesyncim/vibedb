@@ -144,6 +144,20 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "primary_candidates",
+			req: &ShardRequest{
+				SQL:          `SELECT id FROM messages WHERE email = ?`,
+				Params:       []Param{StringParam("a@example.com")},
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				BucketBits: 20, AccessScopes: []distributedtxn.IntentScope{{Start: 31, End: 32}},
+				ReadFenceID: testTransactionID(52),
+				PrimaryKeyRead: PrimaryKeyReadRequest{
+					PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}, {1, 'b'}},
+				},
+			},
+		},
+		{
 			name: "stage_participant",
 			req: &ShardRequest{
 				Distribution: "tenant_data", Shard: "40-80",
@@ -214,6 +228,15 @@ func TestRequestRoundTrip(t *testing.T) {
 				!bytes.Equal(got.GlobalIndexLookup.Relation, tc.req.GlobalIndexLookup.Relation) ||
 				!bytes.Equal(got.GlobalIndexLookup.KeyTuple, tc.req.GlobalIndexLookup.KeyTuple) {
 				t.Errorf("GlobalIndexLookup = %+v, want %+v", got.GlobalIndexLookup, tc.req.GlobalIndexLookup)
+			}
+			if !bytes.Equal(got.PrimaryKeyRead.PrimaryPath, tc.req.PrimaryKeyRead.PrimaryPath) ||
+				len(got.PrimaryKeyRead.Keys) != len(tc.req.PrimaryKeyRead.Keys) {
+				t.Fatalf("PrimaryKeyRead = %+v, want %+v", got.PrimaryKeyRead, tc.req.PrimaryKeyRead)
+			}
+			for i := range got.PrimaryKeyRead.Keys {
+				if !bytes.Equal(got.PrimaryKeyRead.Keys[i], tc.req.PrimaryKeyRead.Keys[i]) {
+					t.Errorf("PrimaryKeyRead.Keys[%d] = %x, want %x", i, got.PrimaryKeyRead.Keys[i], tc.req.PrimaryKeyRead.Keys[i])
+				}
 			}
 		})
 	}
@@ -694,6 +717,29 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadGlobalIndexLookup,
+		},
+		{
+			name: "candidate_keys_without_sql",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "candidate_keys_not_strictly_sorted",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: `SELECT id FROM messages`,
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'b'}, {1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
 		},
 		{
 			name: "row_arity_mismatch",

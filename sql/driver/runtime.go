@@ -605,6 +605,35 @@ func (p *Prepared) QueryInto(
 	values []any,
 	dst *Cursor,
 ) error {
+	return p.queryInto(ctx, values, nil, nil, dst)
+}
+
+// QueryCandidateKeysInto executes the original SELECT over an exact set of
+// native primary storage keys. It is the distributed-index handoff: candidate
+// keys replace only the physical table scan, while the prepared predicate,
+// projection, aggregation, order, and limit remain authoritative. Keys borrow
+// caller storage until this method returns; an empty set is rejected so nil
+// retains one unambiguous meaning at the internal execution boundary.
+func (p *Prepared) QueryCandidateKeysInto(
+	ctx context.Context,
+	values []any,
+	primaryPath []byte,
+	keys [][]byte,
+	dst *Cursor,
+) error {
+	if len(primaryPath) == 0 || len(keys) == 0 {
+		return p.fail(errors.New("vibedb: candidate-key query requires at least one key"))
+	}
+	return p.queryInto(ctx, values, primaryPath, keys, dst)
+}
+
+func (p *Prepared) queryInto(
+	ctx context.Context,
+	values []any,
+	primaryPath []byte,
+	keys [][]byte,
+	dst *Cursor,
+) error {
 	if err := p.usable(); err != nil {
 		return p.fail(err)
 	}
@@ -634,7 +663,7 @@ func (p *Prepared) QueryInto(
 		clear(args)
 		return p.fail(err)
 	}
-	rowset, err := p.statement.queryRows(ctx, args)
+	rowset, err := p.statement.queryRowsCandidates(ctx, args, primaryPath, keys)
 	err = scope.finish(err)
 	if err != nil {
 		return p.fail(err)

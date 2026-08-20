@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/shardservice"
 )
 
 func globalIndexCatalog(t testing.TB) (distribution.ClusterConfig, map[distribution.EndpointID]string) {
@@ -50,6 +52,7 @@ func testGlobalIndexDescriptor() IndexDescriptor {
 		IndexID: 51, Incarnation: 2, Table: "messages", Name: "by_email",
 		Relation: "messages_email_index", Paths: []string{"/email"},
 		LocatorPaths: []string{"/tenant_id", "/id"},
+		PrimaryPath:  "/id",
 		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
 	}
 }
@@ -105,6 +108,15 @@ func TestGlobalIndexMetadataPersistenceAndFences(t *testing.T) {
 	if holder.PublishNewer(next) {
 		t.Fatal("same global index incarnation changed locator order")
 	}
+	changed = testGlobalIndexDescriptor()
+	changed.PrimaryPath = "/tenant_id"
+	next, err = NewSnapshotWithIndexes(config, endpoints, 10, []IndexDescriptor{changed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder.PublishNewer(next) {
+		t.Fatal("same global index incarnation changed primary locator identity")
+	}
 
 	changed = testGlobalIndexDescriptor()
 	changed.Relation = "messages"
@@ -115,6 +127,11 @@ func TestGlobalIndexMetadataPersistenceAndFences(t *testing.T) {
 	changed.LocatorPaths = []string{"/id"}
 	if _, err := NewSnapshotWithIndexes(config, endpoints, 10, []IndexDescriptor{changed}); err == nil {
 		t.Fatal("global locator missing base placement path succeeded")
+	}
+	changed = testGlobalIndexDescriptor()
+	changed.PrimaryPath = ""
+	if _, err := NewSnapshotWithIndexes(config, endpoints, 10, []IndexDescriptor{changed}); err == nil {
+		t.Fatal("global locator without a certified primary path succeeded")
 	}
 	changed = testGlobalIndexDescriptor()
 	changed.Flags |= IndexLocal
@@ -258,8 +275,12 @@ func TestGlobalIndexRoutesLookupKeyAndReturnedLocator(t *testing.T) {
 	}
 	if locatorRoute.BaseTarget.Shard == "" || locatorRoute.BaseAddress == "" ||
 		locatorRoute.BaseScope.End != locatorRoute.BaseScope.Start+1 ||
-		len(locatorRoute.LocatorTuple) == 0 {
+		len(locatorRoute.LocatorTuple) == 0 || len(locatorRoute.BasePrimaryKey) == 0 {
 		t.Fatalf("locator route = %+v", locatorRoute)
+	}
+	wantPrimary, ok := orderedkey.AppendString(nil, []byte("message-9"), orderedkey.Ascending)
+	if !ok || !bytes.Equal(locatorRoute.BasePrimaryKey, wantPrimary) {
+		t.Fatalf("base primary key = %x, want %x", locatorRoute.BasePrimaryKey, wantPrimary)
 	}
 	documentRoute, err := program.RouteDocument(
 		[]byte(`{"tenant_id":"tenant-7","id":"message-9","email":"a@example.com"}`),
@@ -281,6 +302,43 @@ func TestGlobalIndexRoutesLookupKeyAndReturnedLocator(t *testing.T) {
 		}
 	}); allocations != 0 {
 		t.Fatalf("warm global-index lookup routing allocations = %v, want 0", allocations)
+	}
+}
+
+func TestGlobalIndexBaseCallsCarrySortedNativePrimaryCandidates(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := snapshot.CompileGlobalIndex("messages", "by_email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := shardservice.RowsResponse(
+		[]shardservice.Column{{Name: "locator"}},
+		[][]shardservice.Cell{
+			{{Bytes: []byte(`["tenant-7","message-z"]`)}},
+			{{Bytes: []byte(`["tenant-7","message-a"]`)}},
+		},
+	)
+	calls, _, err := globalIndexBaseCalls(program, response, &Query{
+		SQL:    `SELECT id FROM messages WHERE email = ?`,
+		Params: []shardservice.Param{shardservice.StringParam("a@example.com")},
+	}, DefaultProfiles()[ClassBatch])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || string(calls[0].req.PrimaryKeyRead.PrimaryPath) != "/id" ||
+		len(calls[0].req.PrimaryKeyRead.Keys) != 2 ||
+		bytes.Compare(calls[0].req.PrimaryKeyRead.Keys[0], calls[0].req.PrimaryKeyRead.Keys[1]) >= 0 {
+		t.Fatalf("base candidate calls = %+v", calls)
+	}
+	want, _ := orderedkey.AppendString(nil, []byte("message-a"), orderedkey.Ascending)
+	if !bytes.Equal(calls[0].req.PrimaryKeyRead.Keys[0], want) {
+		t.Fatalf("first candidate = %x, want %x", calls[0].req.PrimaryKeyRead.Keys[0], want)
 	}
 }
 

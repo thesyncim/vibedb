@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -36,6 +37,7 @@ type GlobalIndexProgram struct {
 	locatorPointers []vibejson.CompiledPointer
 	baseOrdinals    [distribution.KeyspaceWidth]uint8
 	baseArity       uint8
+	primary         uint8
 }
 
 // GlobalIndexWorkspace owns reusable document-tape, scalar, decoded-string,
@@ -48,6 +50,7 @@ type GlobalIndexWorkspace struct {
 	baseScalars  [distribution.KeyspaceWidth]distribution.Scalar
 	keyTuple     []byte
 	locatorTuple []byte
+	primaryKey   []byte
 	entryKey     []byte
 	locatorValue []byte
 }
@@ -64,6 +67,10 @@ type GlobalIndexRoute struct {
 	// the entry payload. It preserves exact numbers and decodes back to the
 	// locator tuple without base64 or a binary-to-text space tax.
 	LocatorValue []byte
+	// BasePrimaryKey is the base relation's native ordered storage key. It is
+	// certified by the descriptor's PrimaryPath and lets the owner evaluate the
+	// original SQL over exact candidates instead of scanning its local shard.
+	BasePrimaryKey []byte
 
 	IndexPoint      distribution.KeyspacePoint
 	IndexTarget     distribution.Target
@@ -124,6 +131,7 @@ func (s *Snapshot) CompileGlobalIndex(table, name string) (GlobalIndexProgram, e
 		keyPointers:     s.plannerGlobalIndexPointers[keyBase:locatorBase],
 		locatorPointers: s.plannerGlobalIndexPointers[locatorBase : locatorBase+uint32(pointerProgram.locatorCount)],
 		baseArity:       uint8(len(basePlacement.Columns)),
+		primary:         pointerProgram.primary,
 	}
 	for i, path := range basePlacement.Columns {
 		found := false
@@ -327,14 +335,20 @@ func (p GlobalIndexProgram) RouteLocatorValue(
 	if err != nil {
 		return GlobalIndexRoute{}, fmt.Errorf("%w: encode locator: %v", ErrGlobalIndexDocument, err)
 	}
+	workspace.primaryKey, err = appendGlobalIndexPrimaryKey(
+		workspace.primaryKey[:0], locator[p.primary],
+	)
+	if err != nil {
+		return GlobalIndexRoute{}, err
+	}
 	owner, err := p.resolveBaseOwner(locator, workspace)
 	if err != nil {
 		return GlobalIndexRoute{}, err
 	}
 	return GlobalIndexRoute{
 		Index: p.metadata, LocatorTuple: workspace.locatorTuple,
-		LocatorValue: value,
-		BasePoint:    owner.point, BaseTarget: owner.target,
+		LocatorValue: value, BasePrimaryKey: workspace.primaryKey,
+		BasePoint: owner.point, BaseTarget: owner.target,
 		BaseAddress: owner.address, BaseBucketBits: owner.bits,
 		BaseScope: owner.scope,
 	}, nil
@@ -355,6 +369,12 @@ func (p GlobalIndexProgram) routeScalars(
 	)
 	if err != nil {
 		return GlobalIndexRoute{}, fmt.Errorf("%w: encode locator: %v", ErrGlobalIndexDocument, err)
+	}
+	workspace.primaryKey, err = appendGlobalIndexPrimaryKey(
+		workspace.primaryKey[:0], locator[p.primary],
+	)
+	if err != nil {
+		return GlobalIndexRoute{}, err
 	}
 	workspace.entryKey = append(workspace.entryKey[:0], workspace.keyTuple...)
 	if p.metadata.Flags&IndexUnique == 0 {
@@ -381,13 +401,35 @@ func (p GlobalIndexProgram) routeScalars(
 		Index:    p.metadata,
 		KeyTuple: workspace.keyTuple, LocatorTuple: workspace.locatorTuple,
 		EntryKey: workspace.entryKey, LocatorValue: workspace.locatorValue,
-		IndexPoint: indexOwner.point, IndexTarget: indexOwner.target,
+		BasePrimaryKey: workspace.primaryKey,
+		IndexPoint:     indexOwner.point, IndexTarget: indexOwner.target,
 		IndexAddress: indexOwner.address, IndexBucketBits: indexOwner.bits,
 		IndexScope: indexOwner.scope,
 		BasePoint:  baseOwner.point, BaseTarget: baseOwner.target,
 		BaseAddress: baseOwner.address, BaseBucketBits: baseOwner.bits,
 		BaseScope: baseOwner.scope,
 	}, nil
+}
+
+func appendGlobalIndexPrimaryKey(
+	dst []byte,
+	value distribution.Scalar,
+) ([]byte, error) {
+	switch value.Kind() {
+	case distribution.KindString:
+		text, _ := value.StringValue()
+		key, ok := orderedkey.AppendString(dst, byteview.Bytes(text), orderedkey.Ascending)
+		if ok {
+			return key, nil
+		}
+	case distribution.KindNumber:
+		number, _ := value.NumberSpelling()
+		key, ok := orderedkey.AppendNumber(dst, byteview.Bytes(number), orderedkey.Ascending)
+		if ok {
+			return key, nil
+		}
+	}
+	return dst, fmt.Errorf("%w: primary locator is not an encodable scalar", ErrGlobalIndexDocument)
 }
 
 func (p GlobalIndexProgram) resolveIndexOwner(

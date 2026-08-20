@@ -86,6 +86,36 @@ type GlobalIndexLookupRequest struct {
 	Unique       bool
 }
 
+// PrimaryKeyReadRequest replaces an ordinary SQL table scan with an exact,
+// strictly ordered native-primary candidate set. PrimaryPath fences the
+// gateway descriptor against the shard's live SQL catalog before any row is
+// read. The zero value is absent; all slices borrow the request frame.
+type PrimaryKeyReadRequest struct {
+	PrimaryPath []byte
+	Keys        [][]byte
+}
+
+func (r PrimaryKeyReadRequest) present() bool {
+	return len(r.PrimaryPath) != 0 || len(r.Keys) != 0
+}
+
+func (r PrimaryKeyReadRequest) canonical() bool {
+	if !r.present() {
+		return len(r.PrimaryPath) == 0 && len(r.Keys) == 0
+	}
+	if len(r.PrimaryPath) == 0 || len(r.PrimaryPath) > 1<<16-1 ||
+		!utf8.Valid(r.PrimaryPath) || len(r.Keys) == 0 {
+		return false
+	}
+	for i := range r.Keys {
+		if len(r.Keys[i]) == 0 || len(r.Keys[i]) > maxFrameBody ||
+			(i != 0 && bytes.Compare(r.Keys[i-1], r.Keys[i]) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r GlobalIndexLookupRequest) present() bool {
 	return r.IndexID != 0
 }
@@ -370,6 +400,11 @@ type ShardRequest struct {
 	// GlobalIndexLookup selects the raw global-index access path. It may carry a
 	// read fence and scoped bucket admission, but never SQL or a transaction.
 	GlobalIndexLookup GlobalIndexLookupRequest
+	// PrimaryKeyRead narrows an ordinary read-only SQL request to exact native
+	// primary storage keys. The shard still evaluates the original predicate,
+	// projection, aggregation, order, and limit over those rows; the keys only
+	// replace its physical scan source.
+	PrimaryKeyRead PrimaryKeyReadRequest
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.

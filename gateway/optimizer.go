@@ -232,7 +232,7 @@ func optimizeDistributedPlan(
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	return optimizeDistributedAccessPlan(
 		ctx, snap, bound, route, profile,
-		queryplanner.OpLogicalRemoteQuery, queryplanner.OpRemoteQuery, false,
+		queryplanner.OpLogicalRemoteQuery, queryplanner.OpRemoteQuery, false, -1,
 	)
 }
 
@@ -242,10 +242,11 @@ func optimizeGlobalIndexPlan(
 	bound *BoundPlan,
 	route distribution.Route,
 	profile Profile,
+	candidateRows int,
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	return optimizeDistributedAccessPlan(
 		ctx, snap, bound, route, profile,
-		queryplanner.OpLogicalScan, queryplanner.OpIndexScan, true,
+		queryplanner.OpLogicalScan, queryplanner.OpIndexScan, true, candidateRows,
 	)
 }
 
@@ -258,9 +259,15 @@ func optimizeDistributedAccessPlan(
 	logicalAccess queryplanner.Operator,
 	physicalAccess queryplanner.Operator,
 	indexLookup bool,
+	candidateRows int,
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	const privateID queryplanner.PrivateID = 1
 	scanRows, scanBytes, outputRows, rowBytes := distributedEstimates(snap, bound, route)
+	if indexLookup && candidateRows >= 0 {
+		scanRows = float64(candidateRows)
+		scanBytes = boundedProduct(scanRows, max(1, rowBytes))
+		outputRows = min(outputRows, scanRows)
+	}
 	metadata := distributedPrivate{
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,

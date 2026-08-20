@@ -120,6 +120,13 @@ func samePlannerIndexDefinition(
 			return false
 		}
 	}
+	if a.flags()&IndexGlobal != 0 {
+		aProgram, aOK := aSnapshot.globalIndexPointerProgram(aOrdinal)
+		bProgram, bOK := bSnapshot.globalIndexPointerProgram(bOrdinal)
+		if !aOK || !bOK || aProgram.primary != bProgram.primary {
+			return false
+		}
+	}
 	return true
 }
 

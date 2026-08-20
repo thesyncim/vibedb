@@ -873,6 +873,7 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 		IndexID: 91, Incarnation: 1, Table: "messages", Name: "by_n",
 		Relation: "messages_by_n", Paths: []string{"/n"},
 		LocatorPaths: []string{"/tenant_id"},
+		PrimaryPath:  "/tenant_id",
 		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
 	}})
 	if err != nil {

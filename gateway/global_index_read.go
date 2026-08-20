@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"errors"
@@ -19,10 +20,11 @@ import (
 var ErrGlobalIndexResult = errors.New("gateway: malformed global-index lookup result")
 
 type globalIndexExecution struct {
-	result       *Result
-	baseTargets  []distribution.Target
-	shardsFanned int
-	routeKind    distribution.RouteKind
+	result        *Result
+	baseTargets   []distribution.Target
+	shardsFanned  int
+	routeKind     distribution.RouteKind
+	candidateRows int
 }
 
 func useGlobalIndexRead(bound *BoundPlan) bool {
@@ -196,6 +198,7 @@ func (e *Executor) queryGlobalIndex(
 			}
 			return globalIndexExecution{
 				result: result, shardsFanned: 1, routeKind: distribution.RouteSingle,
+				candidateRows: 0,
 			}, nil
 		}
 
@@ -232,7 +235,7 @@ func (e *Executor) queryGlobalIndex(
 		}
 		return globalIndexExecution{
 			result: result, baseTargets: targets, shardsFanned: len(baseCalls) + 1,
-			routeKind: baseKind,
+			routeKind: baseKind, candidateRows: len(response.Rows),
 		}, nil
 	}
 }
@@ -312,8 +315,13 @@ func globalIndexBaseCalls(
 		len(response.Columns) != 1 || response.Columns[0].Name != "locator" {
 		return nil, nil, ErrGlobalIndexResult
 	}
-	calls := make([]shardCall, 0, min(len(response.Rows), program.baseManifest.ShardCount()))
-	positions := make(map[distribution.ShardID]int, cap(calls))
+	type baseGroup struct {
+		call  shardCall
+		arena []byte
+		ends  []int
+	}
+	groups := make([]baseGroup, 0, min(len(response.Rows), program.baseManifest.ShardCount()))
+	positions := make(map[distribution.ShardID]int, cap(groups))
 	var workspace GlobalIndexWorkspace
 	for rowOrdinal := range response.Rows {
 		row := response.Rows[rowOrdinal]
@@ -326,9 +334,9 @@ func globalIndexBaseCalls(
 		}
 		position, found := positions[route.BaseTarget.Shard]
 		if !found {
-			position = len(calls)
+			position = len(groups)
 			positions[route.BaseTarget.Shard] = position
-			calls = append(calls, shardCall{
+			groups = append(groups, baseGroup{call: shardCall{
 				target: route.BaseTarget, address: route.BaseAddress,
 				req: &shardservice.ShardRequest{
 					SQL: query.SQL, Params: query.Params,
@@ -343,20 +351,39 @@ func globalIndexBaseCalls(
 					MaxRows:              profile.PerShardRows, MaxResultBytes: profile.PerShardBytes,
 					BucketBits: route.BaseBucketBits,
 				},
-			})
+			}})
 		}
-		calls[position].req.AccessScopes = append(
-			calls[position].req.AccessScopes, route.BaseScope,
+		group := &groups[position]
+		group.call.req.AccessScopes = append(
+			group.call.req.AccessScopes, route.BaseScope,
 		)
+		group.arena = append(group.arena, route.BasePrimaryKey...)
+		group.ends = append(group.ends, len(group.arena))
 	}
-	for i := range calls {
-		call := &calls[i]
+	calls := make([]shardCall, len(groups))
+	for i := range groups {
+		group := &groups[i]
+		call := &group.call
 		call.req.AccessScopes = coalesceIntentScopes(call.req.AccessScopes)
 		if len(call.req.AccessScopes) > distributedtxn.MaxIntentScopes {
 			call.req.BucketBits, call.req.AccessScopes = wholeShardAccessScope(
 				program.baseManifest, call.target, call.req.BucketBits,
 			)
 		}
+		call.req.PrimaryKeyRead.PrimaryPath = byteview.Bytes(
+			program.metadata.LocatorPaths[program.primary],
+		)
+		call.req.PrimaryKeyRead.Keys = make([][]byte, len(group.ends))
+		start := 0
+		for key := range group.ends {
+			end := group.ends[key]
+			call.req.PrimaryKeyRead.Keys[key] = group.arena[start:end:end]
+			start = end
+		}
+		slices.SortFunc(call.req.PrimaryKeyRead.Keys, func(a, b []byte) int {
+			return bytes.Compare(a, b)
+		})
+		calls[i] = *call
 	}
 	slices.SortFunc(calls, func(a, b shardCall) int {
 		if a.target.Shard < b.target.Shard {

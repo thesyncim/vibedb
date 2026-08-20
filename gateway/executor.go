@@ -213,7 +213,7 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 					RoutingVersion: bound.manifest.Version(), Targets: execution.baseTargets,
 				}
 				physical, planning, planErr := optimizeGlobalIndexPlan(
-					opctx, snap, bound, route, profile,
+					opctx, snap, bound, route, profile, execution.candidateRows,
 				)
 				if planErr != nil {
 					return nil, planErr
@@ -594,8 +594,15 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 			return nil, admissionErr
 		}
 		route.Kind = baseKind
+		candidateRows := -1
+		if bound.globalEmpty {
+			candidateRows = 0
+		} else if bound.globalIndex != nil &&
+			bound.globalIndex.program.metadata.Flags&IndexUnique != 0 {
+			candidateRows = 1
+		}
 		physical, planning, planErr := optimizeGlobalIndexPlan(
-			ctx, snap, bound, route, profile,
+			ctx, snap, bound, route, profile, candidateRows,
 		)
 		if planErr != nil {
 			return nil, planErr

@@ -119,9 +119,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
 	if req.Transaction.Operation != TransactionNone {
-		if req.GlobalIndexLookup.present() {
+		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() {
 			return NewErrorResponse(ErrorMalformedRequest,
-				"shardservice: a transaction command cannot carry a global-index lookup")
+				"shardservice: a transaction command cannot carry an index read envelope")
 		}
 		return c.transaction(req)
 	}
@@ -188,6 +188,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
 	allowAccess := tx.Operation == TransactionAcquireReadFence
 	if req.SQL != "" || len(req.Params) != 0 || req.GlobalIndexLookup.present() ||
+		req.PrimaryKeyRead.present() ||
 		(!allowAccess && len(req.AccessScopes) != 0) ||
 		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
@@ -315,7 +316,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 	lookup := req.GlobalIndexLookup
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" ||
-		len(req.Params) != 0 || !lookup.canonical() {
+		len(req.Params) != 0 || req.PrimaryKeyRead.present() || !lookup.canonical() {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: invalid global-index lookup request")
 	}
@@ -674,7 +675,7 @@ func (c *shardConn) execute(req *ShardRequest) *ShardResponse {
 
 	args := runtimeArgs(req.Params)
 	if prep.ReturnsRows() {
-		return c.executeQuery(ctx, prep, args)
+		return c.executeQuery(ctx, prep, args, req.PrimaryKeyRead)
 	}
 	return c.executeExec(ctx, prep, args)
 }
@@ -686,6 +687,7 @@ func (c *shardConn) executeQuery(
 	ctx context.Context,
 	prep *sqldriver.Prepared,
 	args []any,
+	primaryRead PrimaryKeyReadRequest,
 ) *ShardResponse {
 	// A SELECT is one statement-level snapshot. The SQL runtime defaults to
 	// Read Committed, which refreshes the committed base before each statement;
@@ -707,14 +709,24 @@ func (c *shardConn) executeQuery(
 		defer c.sess.Rollback(context.Background())
 	}
 
-	cur, err := prep.Query(ctx, args)
+	var (
+		cur sqldriver.Cursor
+		err error
+	)
+	if primaryRead.present() {
+		err = prep.QueryCandidateKeysInto(
+			ctx, args, primaryRead.PrimaryPath, primaryRead.Keys, &cur,
+		)
+	} else {
+		err = prep.QueryInto(ctx, args, &cur)
+	}
 	if err != nil {
 		return classifyError(err)
 	}
 	defer cur.Close()
 
 	cols := responseColumns(prep)
-	rows := collectRows(cur, len(cols))
+	rows := collectRows(&cur, len(cols))
 	return RowsResponse(cols, rows)
 }
 

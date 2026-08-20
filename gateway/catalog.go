@@ -672,6 +672,7 @@ type persistedIndex struct {
 	Relation     string         `json:"relation,omitempty"`
 	Paths        []string       `json:"paths"`
 	LocatorPaths []string       `json:"locator_paths,omitempty"`
+	PrimaryPath  string         `json:"primary_path,omitempty"`
 	Flags        IndexFlags     `json:"flags"`
 	Lifecycle    IndexLifecycle `json:"lifecycle"`
 }
@@ -732,19 +733,23 @@ func toPersisted(s *Snapshot) persistedCatalog {
 		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
 		span := s.plannerIndexSpans[tableOrdinal]
 		for i := uint32(0); i < span.count; i++ {
-			metadata := s.indexMetadata(table, span.first+i)
+			ordinal := span.first + i
+			metadata := s.indexMetadata(table, ordinal)
 			paths := make([]string, metadata.PathCount)
 			copy(paths, metadata.Paths[:metadata.PathCount])
 			locators := make([]string, metadata.LocatorCount)
 			copy(locators, metadata.LocatorPaths[:metadata.LocatorCount])
 			relation := ""
+			primaryPath := ""
 			if metadata.Global() {
 				relation = metadata.Relation
+				program, _ := s.globalIndexPointerProgram(ordinal)
+				primaryPath = metadata.LocatorPaths[program.primary]
 			}
 			pc.Indexes = append(pc.Indexes, persistedIndex{
 				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
 				Table: metadata.Table, Name: metadata.Name, Relation: relation,
-				Paths: paths, LocatorPaths: locators,
+				Paths: paths, LocatorPaths: locators, PrimaryPath: primaryPath,
 				Flags: metadata.Flags, Lifecycle: metadata.Lifecycle,
 			})
 		}
@@ -1231,7 +1236,8 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 			IndexID: index.IndexID, Incarnation: index.Incarnation,
 			Table: index.Table, Name: index.Name, Relation: index.Relation,
 			Paths: slices.Clone(index.Paths), LocatorPaths: slices.Clone(index.LocatorPaths),
-			Flags: index.Flags, Lifecycle: index.Lifecycle,
+			PrimaryPath: index.PrimaryPath,
+			Flags:       index.Flags, Lifecycle: index.Lifecycle,
 		}
 	}
 	return config, endpoints, indexes, slices.Clone(pc.Statistics), nil

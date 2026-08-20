@@ -61,8 +61,10 @@ type IndexDescriptor struct {
 	Relation string
 	Paths    []string
 	// LocatorPaths identify the base row carried by a global entry. They must
-	// include every base placement path so locators can be grouped by owner.
+	// include every base placement path so locators can be grouped by owner and
+	// PrimaryPath so the owner can use its native primary-key point lane.
 	LocatorPaths []string
+	PrimaryPath  string
 	Flags        IndexFlags
 	Lifecycle    IndexLifecycle
 }
@@ -360,7 +362,8 @@ type plannerGlobalIndexProgram struct {
 	pointerBase  uint32
 	keyCount     uint8
 	locatorCount uint8
-	_            uint16
+	primary      uint8
+	_            uint8
 }
 
 const plannerGlobalIndexProgramBytes = unsafe.Sizeof(plannerGlobalIndexProgram{})
@@ -474,6 +477,10 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 				return plannerIndexBuild{}, indexCatalogError(d,
 					"local index must not carry base locator paths")
 			}
+			if d.PrimaryPath != "" {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"local index must not name a base primary-key path")
+			}
 		} else {
 			if err := validateIndexCatalogName("relation", d.Relation); err != nil {
 				return plannerIndexBuild{}, indexCatalogError(d, err.Error())
@@ -507,6 +514,10 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 					return plannerIndexBuild{}, indexCatalogError(d,
 						fmt.Sprintf("global locator does not contain base shard-key path %q", shardPath))
 				}
+			}
+			if d.PrimaryPath == "" || !slices.Contains(d.LocatorPaths, d.PrimaryPath) {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"global locator does not contain its primary-key path")
 			}
 		}
 		pathCount += uint64(len(d.Paths) + len(d.LocatorPaths))
@@ -627,10 +638,12 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		}
 		build.indexes[i] = entry
 		if d.Flags&IndexGlobal != 0 {
+			primary := slices.Index(d.LocatorPaths, d.PrimaryPath)
 			build.relations[i] = placementOrdinals[d.Relation]
 			build.globalPrograms = append(build.globalPrograms, plannerGlobalIndexProgram{
 				ordinal: uint32(i), pointerBase: uint32(len(build.globalPointerRefs)),
 				keyCount: uint8(len(d.Paths)), locatorCount: uint8(len(d.LocatorPaths)),
+				primary: uint8(primary),
 			})
 			build.globalPointerRefs = append(
 				build.globalPointerRefs, build.paths[entry.pathBase:pathBase]...,

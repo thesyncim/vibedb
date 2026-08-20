@@ -35,6 +35,7 @@ const (
 	accessScopeMarker       = 0xd8
 	readFenceMarker         = 0xd9
 	globalIndexLookupMarker = 0xda
+	primaryKeyReadMarker    = 0xdb
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -96,6 +97,10 @@ var errBadTransaction = errors.New("shardservice: frame carries an invalid trans
 // errBadGlobalIndexLookup reports a non-canonical raw lookup envelope or an
 // attempt to combine that read-only lane with SQL or a transaction command.
 var errBadGlobalIndexLookup = errors.New("shardservice: frame carries an invalid global-index lookup")
+
+// errBadPrimaryKeyRead reports a non-canonical primary-key candidate envelope
+// or an attempt to combine it with a non-read-only SQL lane.
+var errBadPrimaryKeyRead = errors.New("shardservice: frame carries invalid primary-key candidates")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -579,19 +584,35 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.GlobalIndexLookup.canonical() {
 		return errBadGlobalIndexLookup
 	}
+	if len(req.PrimaryKeyRead.Keys) > maxParams {
+		return errFieldTooLarge
+	}
+	if !req.PrimaryKeyRead.canonical() {
+		return errBadPrimaryKeyRead
+	}
+	primaryReadBytes := uint64(1 + 4 + len(req.PrimaryKeyRead.PrimaryPath) + 4)
+	for i := range req.PrimaryKeyRead.Keys {
+		primaryReadBytes += uint64(4 + len(req.PrimaryKeyRead.Keys[i]))
+		if primaryReadBytes > maxFrameBody {
+			return errFieldTooLarge
+		}
+	}
 	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
 		return errBadTransaction
 	}
 	if req.Transaction.Operation != TransactionNone &&
-		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present()) {
+		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present()) {
 		if req.GlobalIndexLookup.present() {
 			return errBadGlobalIndexLookup
 		}
 		return errBadTransaction
 	}
 	if req.GlobalIndexLookup.present() &&
-		(req.SQL != "" || len(req.Params) != 0 || req.ExecutionMode != ExecutionReadOnly) {
+		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return errBadGlobalIndexLookup
+	}
+	if req.PrimaryKeyRead.present() && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly) {
+		return errBadPrimaryKeyRead
 	}
 
 	var e encbuf
@@ -658,6 +679,14 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 			e.u8(1)
 		} else {
 			e.u8(0)
+		}
+	}
+	if req.PrimaryKeyRead.present() {
+		e.u8(primaryKeyReadMarker)
+		e.bytes(req.PrimaryKeyRead.PrimaryPath)
+		e.u32(uint32(len(req.PrimaryKeyRead.Keys)))
+		for i := range req.PrimaryKeyRead.Keys {
+			e.bytes(req.PrimaryKeyRead.Keys[i])
 		}
 	}
 	if req.Transaction.Operation != TransactionNone {
@@ -772,6 +801,23 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadGlobalIndexLookup
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == primaryKeyReadMarker {
+		d.u8()
+		req.PrimaryKeyRead.PrimaryPath = d.slice()
+		count := d.count(4, maxParams)
+		if count != 0 {
+			req.PrimaryKeyRead.Keys = make([][]byte, count)
+			for i := range req.PrimaryKeyRead.Keys {
+				req.PrimaryKeyRead.Keys[i] = d.slice()
+				if len(req.PrimaryKeyRead.Keys[i]) == 0 {
+					return nil, errBadPrimaryKeyRead
+				}
+			}
+		}
+		if d.bad() || !req.PrimaryKeyRead.canonical() {
+			return nil, errBadPrimaryKeyRead
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
@@ -780,7 +826,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		}
 	}
 	if req.Transaction.Operation != TransactionNone &&
-		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present()) {
+		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present()) {
 		if req.GlobalIndexLookup.present() {
 			return nil, errBadGlobalIndexLookup
 		}
@@ -796,8 +842,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		return nil, errBadEnum
 	}
 	if req.GlobalIndexLookup.present() &&
-		(req.SQL != "" || len(req.Params) != 0 || req.ExecutionMode != ExecutionReadOnly) {
+		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.ExecutionMode != ExecutionReadOnly) {
 		return nil, errBadGlobalIndexLookup
+	}
+	if req.PrimaryKeyRead.present() && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly) {
+		return nil, errBadPrimaryKeyRead
 	}
 	return req, nil
 }

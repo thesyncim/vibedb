@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	sqldriver "database/sql/driver"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 type stmt struct {
@@ -165,7 +167,17 @@ func (s *stmt) QueryContext(
 // idle session never pins caller values. Runtime callers copy interface headers
 // into conn.args before arriving here.
 func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
+	return s.queryRowsCandidates(ctx, args, nil, nil)
+}
+
+func (s *stmt) queryRowsCandidates(
+	ctx context.Context,
+	args []any,
+	primaryPath []byte,
+	candidateKeys [][]byte,
+) (*rows, error) {
 	defer clear(args)
+	candidateRead := candidateKeys != nil
 	if s.closed {
 		return nil, errors.New("vibedb: statement is closed")
 	}
@@ -185,6 +197,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return nil, err
 	}
 	if s.explain {
+		if candidateRead {
+			return nil, errors.New("vibedb: candidate keys cannot execute EXPLAIN")
+		}
 		if s.analyze {
 			return s.analyzeRows(ctx, args)
 		}
@@ -210,6 +225,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	var err error
 	if s.mutation != nil {
+		if candidateRead {
+			return nil, errors.New("vibedb: candidate keys require a read-only SELECT")
+		}
 		if err := s.conn.requireDirectWriteAllowed(); err != nil {
 			return nil, err
 		}
@@ -235,6 +253,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	// this branch has no physical relation, so it cannot divert a stored-row
 	// query or its transaction snapshot.
 	if sourceIndependentStatement(s.query) {
+		if candidateRead {
+			return nil, errors.New("vibedb: candidate keys require one physical table")
+		}
 		if s.conn.tx != nil && s.views != nil && len(s.views.dependencies) != 0 {
 			if err := s.conn.tx.refreshStatementCut(
 				ctx, "", nil, s.views.dependencies,
@@ -263,6 +284,9 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 			return nil, err
 		}
 		if s.transactionRequiresCatalogSource() {
+			if candidateRead {
+				return nil, errors.New("vibedb: candidate keys do not support catalog joins")
+			}
 			source, err := s.conn.materializeTransactionJoinSource(
 				ctx, s.conn.tx, s.query.Collection(), s.dependencies)
 			if err != nil {
@@ -282,21 +306,34 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		if !ok {
 			return nil, s.missingDependency(s.query.Collection(), true)
 		}
+		if candidateRead && !bytes.Equal(primaryPath, byteview.Bytes(state.primaryKey)) {
+			return nil, errors.New("vibedb: candidate primary path does not match the live table")
+		}
 		var source query.Source
 		pointPredicate := s.pointPredicate
-		pointRead := s.pointCandidate && s.pointPath == state.primaryKey
+		pointRead := candidateRead || s.pointCandidate && s.pointPath == state.primaryKey
 		if pointRead && s.conn.tx.isolation == IsolationSerializable {
-			_, pointRead = s.conn.tx.serializablePointQuery(s)
+			if !candidateRead {
+				_, pointRead = s.conn.tx.serializablePointQuery(s)
+			}
 		}
 		if pointRead {
-			keys, keyErr := s.conn.bindPointPredicateKeys(
-				pointPredicate, args, state.limits.MaxKeyBytes)
+			var keys []string
+			var keyErr error
+			if candidateRead {
+				keys, keyErr = s.conn.borrowPointCandidateKeys(
+					candidateKeys, state.limits.MaxKeyBytes,
+				)
+			} else {
+				keys, keyErr = s.conn.bindPointPredicateKeys(
+					pointPredicate, args, state.limits.MaxKeyBytes)
+			}
 			if keyErr != nil {
 				return nil, keyErr
 			}
 			s.conn.tx.trackSerializablePointReads(state, keys)
 			source, err = s.conn.pointTransactionSource(ctx, state, keys)
-			if errors.Is(err, errPointMaterializationTooLarge) {
+			if !candidateRead && errors.Is(err, errPointMaterializationTooLarge) {
 				source, err = s.conn.tx.querySource(s.query.Collection())
 			}
 		} else {
@@ -323,6 +360,10 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		return nil, err
 	}
 	if s.requiresCatalogSource() {
+		if candidateRead {
+			s.conn.db.mu.RUnlock()
+			return nil, errors.New("vibedb: candidate keys do not support catalog joins")
+		}
 		catalog, snapshotErr := s.snapshotCatalogDependenciesLocked(ctx)
 		s.conn.db.mu.RUnlock()
 		if snapshotErr != nil {
@@ -377,25 +418,37 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 		s.conn.db.mu.RUnlock()
 		return nil, s.missingDependency(s.query.Collection(), false)
 	}
+	if candidateRead && !bytes.Equal(primaryPath, byteview.Bytes(t.meta.PrimaryKey)) {
+		s.conn.db.mu.RUnlock()
+		return nil, errors.New("vibedb: candidate primary path does not match the live table")
+	}
 	var (
 		source   query.Source
 		snapshot *durable.Snapshot
 	)
 	pointPredicate := s.pointPredicate
-	if s.pointCandidate && s.pointPath == t.meta.PrimaryKey {
+	if candidateRead || s.pointCandidate && s.pointPath == t.meta.PrimaryKey {
 		limits, limitErr := tableMutationLimits(t)
 		if limitErr != nil {
 			err = limitErr
 		} else {
-			keys, keyErr := s.conn.bindPointPredicateKeys(
-				pointPredicate, args, limits.MaxKeyBytes)
+			var keys []string
+			var keyErr error
+			if candidateRead {
+				keys, keyErr = s.conn.borrowPointCandidateKeys(
+					candidateKeys, limits.MaxKeyBytes,
+				)
+			} else {
+				keys, keyErr = s.conn.bindPointPredicateKeys(
+					pointPredicate, args, limits.MaxKeyBytes)
+			}
 			if keyErr != nil {
 				err = keyErr
 			} else if t.collection == nil {
 				source = query.FromSnapshot(store.Snapshot{})
 			} else {
 				source, err = s.conn.pointCollectionSource(ctx, t.collection, keys)
-				if errors.Is(err, errPointMaterializationTooLarge) {
+				if !candidateRead && errors.Is(err, errPointMaterializationTooLarge) {
 					snapshot, err = t.collection.Snapshot()
 					if err == nil {
 						source = query.FromFile(snapshot)
@@ -430,6 +483,25 @@ func (s *stmt) queryRows(ctx context.Context, args []any) (*rows, error) {
 	}
 	s.conn.open = true
 	return s.conn.resetRows(s, cursor, snapshot), nil
+}
+
+func (c *conn) borrowPointCandidateKeys(
+	encoded [][]byte,
+	maxKeyBytes int,
+) ([]string, error) {
+	clear(c.pointKeys)
+	c.pointKeys = c.pointKeys[:0]
+	for i := range encoded {
+		key := encoded[i]
+		if len(key) == 0 || len(key) > maxKeyBytes ||
+			(i != 0 && bytes.Compare(encoded[i-1], key) >= 0) {
+			clear(c.pointKeys)
+			c.pointKeys = c.pointKeys[:0]
+			return nil, fmt.Errorf("vibedb: candidate primary key %d is not canonical", i)
+		}
+		c.pointKeys = append(c.pointKeys, byteview.String(key))
+	}
+	return c.pointKeys, nil
 }
 
 // analyzeRows deliberately re-enters the existing normal query path. This
