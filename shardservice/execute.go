@@ -15,6 +15,7 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // One connection's request lifecycle: read a frame, admit it, and on success pin
@@ -118,6 +119,10 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
 	if req.Transaction.Operation != TransactionNone {
+		if req.GlobalIndexLookup.present() {
+			return NewErrorResponse(ErrorMalformedRequest,
+				"shardservice: a transaction command cannot carry a global-index lookup")
+		}
 		return c.transaction(req)
 	}
 	if req.ExecutionMode == ExecutionReadWrite {
@@ -169,6 +174,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 			return transactionError(distributedtxn.ErrJournalConflict)
 		}
 	}
+	if req.GlobalIndexLookup.present() {
+		return c.executeGlobalIndexLookup(req)
+	}
 	return c.execute(req)
 }
 
@@ -179,7 +187,8 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
 	allowAccess := tx.Operation == TransactionAcquireReadFence
-	if req.SQL != "" || len(req.Params) != 0 || (!allowAccess && len(req.AccessScopes) != 0) ||
+	if req.SQL != "" || len(req.Params) != 0 || req.GlobalIndexLookup.present() ||
+		(!allowAccess && len(req.AccessScopes) != 0) ||
 		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: a transaction command cannot also carry SQL or parameters")
@@ -296,6 +305,44 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		return transactionError(err)
 	}
 	return transactionStatusResponse(status)
+}
+
+// executeGlobalIndexLookup serves the raw index lane after ordinary ownership,
+// participant-barrier, scoped-intent, and optional coherent-read-fence
+// admission. The driver pins exactly one relation snapshot and performs either
+// one point lookup or one prefix-seek scan; no SQL parsing or JSON re-encoding
+// occurs on this path.
+func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
+	lookup := req.GlobalIndexLookup
+	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" ||
+		len(req.Params) != 0 || !lookup.canonical() {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: invalid global-index lookup request")
+	}
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	maxRows, maxBytes := c.server.resultLimits(req)
+	capacity := maxRows
+	if capacity < 0 || capacity > 256 {
+		capacity = 16
+	}
+	rows := make([][]Cell, 0, capacity)
+	err := c.sess.LookupGlobalIndex(
+		ctx, byteview.String(lookup.Relation), lookup.IndexID,
+		lookup.Incarnation, lookup.KeyTuple, lookup.LocatorCount,
+		lookup.Unique, maxRows, maxBytes,
+		func(locator []byte) error {
+			owned := append([]byte(nil), locator...)
+			rows = append(rows, []Cell{{Bytes: owned}})
+			return nil
+		},
+	)
+	if err != nil {
+		return classifyError(err)
+	}
+	return RowsResponse(
+		[]Column{{Name: "locator", TypeOID: pgOIDJSON}}, rows,
+	)
 }
 
 func (c *shardConn) lookupCoordinator(id distributedtxn.ID) *ShardResponse {
@@ -789,6 +836,7 @@ func classifyError(err error) *ShardResponse {
 		errors.Is(err, query.ErrCanceled):
 		return NewErrorResponse(ErrorDeadlineExceeded, err.Error())
 	case errors.Is(err, query.ErrResultBudget),
+		errors.Is(err, sqldriver.ErrGlobalIndexLookupTooLarge),
 		errors.Is(err, query.ErrIntermediateBudget),
 		errors.Is(err, query.ErrWorkBudget),
 		errors.Is(err, query.ErrSpillBudget),

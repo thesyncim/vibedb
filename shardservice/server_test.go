@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -585,6 +586,57 @@ func TestServerExecuteLifecycle(t *testing.T) {
 	}
 	if got := cellText(t, sel, 1, 2); got != `9` {
 		t.Fatalf("row 1 n = %s, want 9", got)
+	}
+}
+
+func TestServerGlobalIndexLookupUsesRawBoundedLane(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(`CREATE TABLE messages_by_email (PRIMARY KEY (id))`))
+
+	ctx := context.Background()
+	session, err := srv.db.NewSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	key := []byte{1, 5, 'a', '@', 'b'}
+	locator := []byte(`["tenant-7",7]`)
+	if err := session.Begin(ctx, sqldriver.TxOptions{Isolation: sqldriver.IsolationSerializable}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.ApplyGlobalIndexMutation(
+		ctx, "messages_by_email", 17, 3, key, locator, 2, true, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	lookup := ownedRequest("")
+	lookup.ExecutionMode = ExecutionReadOnly
+	lookup.GlobalIndexLookup = GlobalIndexLookupRequest{
+		Relation: []byte("messages_by_email"), IndexID: 17, Incarnation: 3,
+		KeyTuple: key, LocatorCount: 2, Unique: true,
+	}
+	response := exec(t, conn, lookup)
+	if len(response.Columns) != 1 || response.Columns[0].Name != "locator" ||
+		response.Columns[0].TypeOID != pgOIDJSON || len(response.Rows) != 1 ||
+		string(response.Rows[0][0].Bytes) != string(locator) {
+		t.Fatalf("global index lookup = %+v, want locator %s", response, locator)
+	}
+
+	lookup.MaxResultBytes = 1
+	tooLarge := roundTrip(t, conn, lookup)
+	if tooLarge.Kind != ResponseError || tooLarge.ErrorKind != ErrorResourceLimit {
+		t.Fatalf("bounded global index lookup = %+v, want resource limit", tooLarge)
+	}
+	lookup.MaxResultBytes = 0
+	lookup.GlobalIndexLookup.Incarnation++
+	stale := roundTrip(t, conn, lookup)
+	if stale.Kind != ResponseError || stale.ErrorKind != ErrorMalformedRequest {
+		t.Fatalf("stale global index lookup = %+v, want fenced refusal", stale)
 	}
 }
 

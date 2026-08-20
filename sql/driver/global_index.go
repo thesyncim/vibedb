@@ -3,6 +3,7 @@ package driver
 import (
 	"bytes"
 	"context"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
 	"strconv"
@@ -24,9 +25,21 @@ var (
 	// ErrGlobalIndexRelation reports a physical relation that is not suitable
 	// for raw canonical index keys and compact locator-array documents.
 	ErrGlobalIndexRelation = errors.New("vibedb: invalid global index relation")
+	// ErrGlobalIndexLookupTooLarge reports a raw index lookup that crossed its
+	// caller-supplied row or locator-byte cap. Results are never truncated:
+	// callers either observe the complete key prefix or retry with a larger cap.
+	ErrGlobalIndexLookupTooLarge = errors.New("vibedb: global index lookup exceeds result bound")
 )
 
 const globalIndexMarkerKey = "\x00"
+
+func appendGlobalIndexMarker(dst []byte, indexID, incarnation uint64) []byte {
+	dst = append(dst, '[')
+	dst = strconv.AppendUint(dst, indexID, 10)
+	dst = append(dst, ',')
+	dst = strconv.AppendUint(dst, incarnation, 10)
+	return append(dst, ']')
+}
 
 // ApplyGlobalIndexMutation stages one byte-native global-index entry in the
 // active SQL transaction. The caller has already admitted the containing
@@ -80,12 +93,7 @@ func (s *Session) ApplyGlobalIndexMutation(
 	}
 
 	var markerStorage [43]byte
-	marker := markerStorage[:0]
-	marker = append(marker, '[')
-	marker = strconv.AppendUint(marker, indexID, 10)
-	marker = append(marker, ',')
-	marker = strconv.AppendUint(marker, incarnation, 10)
-	marker = append(marker, ']')
+	marker := appendGlobalIndexMarker(markerStorage[:0], indexID, incarnation)
 
 	stagedStorage := [2]stagedTxMutation{}
 	staged := stagedStorage[:0]
@@ -167,6 +175,131 @@ func (s *Session) ApplyGlobalIndexMutation(
 	}
 	tx.applyResolvedMutations(state, staged)
 	return true, nil
+}
+
+// LookupGlobalIndex reads one complete key from a gateway-maintained global
+// index relation at a single durable snapshot. A unique index performs one
+// point probe. A non-unique index seeks to keyTuple in the ordered primary
+// graph and visits only its contiguous locator suffix range.
+//
+// Each locator passed to visit borrows snapshot or session scratch and is valid
+// only until visit returns. maxRows and maxBytes are hard result bounds; -1 is
+// the explicit unlimited value. A bound crossing fails the whole lookup rather
+// than returning an ambiguous truncated locator set.
+func (s *Session) LookupGlobalIndex(
+	ctx context.Context,
+	relation string,
+	indexID, incarnation uint64,
+	keyTuple []byte,
+	locatorCount uint8,
+	unique bool,
+	maxRows int,
+	maxBytes int64,
+	visit func(locator []byte) error,
+) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if s.state != SessionIdle {
+		return ErrTransactionActive
+	}
+	if relation == "" || indexID == 0 || incarnation == 0 ||
+		len(keyTuple) == 0 || keyTuple[0] == 0 ||
+		locatorCount == 0 || locatorCount > 8 ||
+		maxRows < -1 || maxBytes < -1 || visit == nil {
+		return ErrGlobalIndexRelation
+	}
+
+	core := s.conn.db
+	if err := rlockContext(ctx, &core.mu); err != nil {
+		return err
+	}
+	table := core.tables[relation]
+	if core.closed {
+		core.mu.RUnlock()
+		return sqldriver.ErrBadConn
+	}
+	if table == nil {
+		core.mu.RUnlock()
+		return fmt.Errorf("%w: %q", ErrTableNotFound, relation)
+	}
+	if table.schema != nil || len(table.meta.Indexes) != 0 || table.collection == nil {
+		core.mu.RUnlock()
+		return fmt.Errorf(
+			"%w: relation %q must be schemaless and locally unindexed",
+			ErrGlobalIndexRelation, relation,
+		)
+	}
+	limits, limitsErr := tableMutationLimits(table)
+	if limitsErr != nil {
+		core.mu.RUnlock()
+		return limitsErr
+	}
+	if len(keyTuple) > limits.MaxKeyBytes {
+		core.mu.RUnlock()
+		return durable.ErrKeyTooLarge
+	}
+	snapshot, snapshotErr := table.collection.Snapshot()
+	core.mu.RUnlock()
+	if snapshotErr != nil {
+		return snapshotErr
+	}
+	defer snapshot.Close()
+
+	var markerStorage [43]byte
+	marker := appendGlobalIndexMarker(markerStorage[:0], indexID, incarnation)
+	scratch, found, err := snapshot.AppendRaw(s.conn.pointRaw[:0], []byte(globalIndexMarkerKey))
+	if err != nil {
+		s.conn.pointRaw = scratch[:0]
+		return err
+	}
+	if !found || !bytes.Equal(scratch, marker) {
+		s.conn.pointRaw = scratch[:0]
+		return fmt.Errorf("%w: relation %q", ErrGlobalIndexFence, relation)
+	}
+	s.conn.pointRaw = scratch[:0]
+
+	rows := 0
+	var resultBytes int64
+	emit := func(locator []byte) error {
+		if rows&63 == 0 {
+			if checkpointErr := contextCheckpoint(ctx); checkpointErr != nil {
+				return checkpointErr
+			}
+		}
+		if err := validateGlobalIndexLocator(locator, locatorCount); err != nil {
+			return err
+		}
+		if maxRows != -1 && rows >= maxRows {
+			return fmt.Errorf(
+				"%w: rows exceed %d", ErrGlobalIndexLookupTooLarge, maxRows,
+			)
+		}
+		locatorBytes := int64(len(locator))
+		if maxBytes != -1 && locatorBytes > maxBytes-resultBytes {
+			return fmt.Errorf(
+				"%w: locator bytes exceed %d", ErrGlobalIndexLookupTooLarge, maxBytes,
+			)
+		}
+		if err := visit(locator); err != nil {
+			return err
+		}
+		rows++
+		resultBytes += locatorBytes
+		return nil
+	}
+
+	if unique {
+		scratch, found, err = snapshot.AppendRaw(s.conn.pointRaw[:0], keyTuple)
+		if err == nil && found {
+			err = emit(scratch)
+		}
+		s.conn.pointRaw = scratch[:0]
+		return err
+	}
+	return snapshot.RangePrefixRaw(keyTuple, func(_ []byte, locator []byte) error {
+		return emit(locator)
+	})
 }
 
 func admitGlobalIndexStaged(

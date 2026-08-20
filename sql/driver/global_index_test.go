@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -34,6 +35,93 @@ func openGlobalIndexTestSession(t *testing.T) (*Database, *Session) {
 		_ = database.Close()
 	})
 	return database, session
+}
+
+func TestGlobalIndexLookupPointPrefixFenceAndBounds(t *testing.T) {
+	_, session := openGlobalIndexTestSession(t)
+	ctx := context.Background()
+	key := []byte{1, 5, 'a', '@', 'b'}
+	uniqueValue := []byte(`["tenant-7",7]`)
+
+	if err := session.Begin(ctx, TxOptions{Isolation: IsolationSerializable}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.ApplyGlobalIndexMutation(
+		ctx, "messages_by_email", 17, 3, key, uniqueValue, 2, true, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var got [][]byte
+	collect := func(locator []byte) error {
+		got = append(got, append([]byte(nil), locator...))
+		return nil
+	}
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, key, 2, true, 8, 1024, collect,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !bytes.Equal(got[0], uniqueValue) {
+		t.Fatalf("unique lookup = %q, want %q", got, uniqueValue)
+	}
+	got = got[:0]
+	missing := append(append([]byte(nil), key...), 99)
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, missing, 2, true, 8, 1024, collect,
+	); err != nil || len(got) != 0 {
+		t.Fatalf("missing unique lookup = %q,%v", got, err)
+	}
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 4, key, 2, true, 8, 1024, collect,
+	); !errors.Is(err, ErrGlobalIndexFence) {
+		t.Fatalf("stale lookup = %v, want incarnation fence", err)
+	}
+
+	prefix := []byte{1, 3, 'n', 'o', 'n'}
+	values := [][]byte{[]byte(`["a",1]`), []byte(`["b",2]`), []byte(`["c",3]`)}
+	if err := session.Begin(ctx, TxOptions{Isolation: IsolationSerializable}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range values {
+		entry := append(append([]byte(nil), prefix...), byte(i+1))
+		if _, err := session.ApplyGlobalIndexMutation(
+			ctx, "messages_by_email", 17, 3, entry, values[i], 2, false, false,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got = got[:0]
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, prefix, 2, false, 8, 1024, collect,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(values) {
+		t.Fatalf("prefix lookup rows = %d, want %d", len(got), len(values))
+	}
+	for i := range values {
+		if !bytes.Equal(got[i], values[i]) {
+			t.Fatalf("prefix locator %d = %s, want %s", i, got[i], values[i])
+		}
+	}
+	got = got[:0]
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, prefix, 2, false, 2, 1024, collect,
+	); !errors.Is(err, ErrGlobalIndexLookupTooLarge) {
+		t.Fatalf("row bound = %v, want lookup-too-large", err)
+	}
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, prefix, 2, false, 8, 1, collect,
+	); !errors.Is(err, ErrGlobalIndexLookupTooLarge) {
+		t.Fatalf("byte bound = %v, want lookup-too-large", err)
+	}
 }
 
 func globalIndexEntry(t *testing.T, session *Session, key []byte) ([]byte, bool) {

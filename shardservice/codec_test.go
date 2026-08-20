@@ -130,6 +130,20 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "global_index_lookup",
+			req: &ShardRequest{
+				Distribution: "messages_by_email", Shard: "40-80",
+				AllocationGeneration: 6, RoutingVersion: 42, OwnershipEpoch: 9,
+				BucketBits: 20, AccessScopes: []distributedtxn.IntentScope{{Start: 31, End: 32}},
+				ReadFenceID: testTransactionID(51),
+				GlobalIndexLookup: GlobalIndexLookupRequest{
+					Relation: []byte("messages_by_email_17"), IndexID: 17,
+					Incarnation: 3, KeyTuple: []byte{1, 5, 'a', '@', 'b'},
+					LocatorCount: 2, Unique: true,
+				},
+			},
+		},
+		{
 			name: "stage_participant",
 			req: &ShardRequest{
 				Distribution: "tenant_data", Shard: "40-80",
@@ -192,6 +206,14 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if got.ReadFenceID != tc.req.ReadFenceID {
 				t.Errorf("ReadFenceID = %x, want %x", got.ReadFenceID, tc.req.ReadFenceID)
+			}
+			if got.GlobalIndexLookup.IndexID != tc.req.GlobalIndexLookup.IndexID ||
+				got.GlobalIndexLookup.Incarnation != tc.req.GlobalIndexLookup.Incarnation ||
+				got.GlobalIndexLookup.LocatorCount != tc.req.GlobalIndexLookup.LocatorCount ||
+				got.GlobalIndexLookup.Unique != tc.req.GlobalIndexLookup.Unique ||
+				!bytes.Equal(got.GlobalIndexLookup.Relation, tc.req.GlobalIndexLookup.Relation) ||
+				!bytes.Equal(got.GlobalIndexLookup.KeyTuple, tc.req.GlobalIndexLookup.KeyTuple) {
+				t.Errorf("GlobalIndexLookup = %+v, want %+v", got.GlobalIndexLookup, tc.req.GlobalIndexLookup)
 			}
 		})
 	}
@@ -647,6 +669,31 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadTransaction,
+		},
+		{
+			name: "global_index_lookup_with_sql",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: "SELECT 1",
+					GlobalIndexLookup: GlobalIndexLookupRequest{
+						Relation: []byte("idx"), IndexID: 1, Incarnation: 1,
+						KeyTuple: []byte{1}, LocatorCount: 1,
+					},
+				})
+			},
+			want: errBadGlobalIndexLookup,
+		},
+		{
+			name: "malformed_global_index_lookup",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					GlobalIndexLookup: GlobalIndexLookupRequest{
+						Relation: []byte("idx"), IndexID: 1, Incarnation: 1,
+						KeyTuple: []byte{0}, LocatorCount: 1,
+					},
+				})
+			},
+			want: errBadGlobalIndexLookup,
 		},
 		{
 			name: "row_arity_mismatch",

@@ -69,6 +69,38 @@ type TransactionRequest struct {
 	Record    []byte
 }
 
+// GlobalIndexLookupRequest is the optional byte-native lookup envelope for a
+// gateway-maintained global index relation. Relation and KeyTuple borrow the
+// request frame. Unique selects an exact point lookup; non-unique lookup seeks
+// directly to KeyTuple and visits its contiguous locator-key prefix.
+//
+// The zero value is absent. An admitted lookup is read-only and mutually
+// exclusive with SQL, parameters, and transaction commands. IndexID plus
+// Incarnation fence delayed requests against physical relation reuse.
+type GlobalIndexLookupRequest struct {
+	Relation     []byte
+	IndexID      uint64
+	Incarnation  uint64
+	KeyTuple     []byte
+	LocatorCount uint8
+	Unique       bool
+}
+
+func (r GlobalIndexLookupRequest) present() bool {
+	return r.IndexID != 0
+}
+
+func (r GlobalIndexLookupRequest) canonical() bool {
+	if !r.present() {
+		return len(r.Relation) == 0 && r.Incarnation == 0 &&
+			len(r.KeyTuple) == 0 && r.LocatorCount == 0 && !r.Unique
+	}
+	return len(r.Relation) != 0 && len(r.Relation) <= 1<<16-1 &&
+		utf8.Valid(r.Relation) && bytes.IndexByte(r.Relation, 0) < 0 && r.Incarnation != 0 &&
+		len(r.KeyTuple) != 0 && r.KeyTuple[0] != 0 &&
+		r.LocatorCount != 0 && r.LocatorCount <= 8
+}
+
 // TransactionRole discriminates the state returned by a transaction reply.
 type TransactionRole uint8
 
@@ -335,6 +367,9 @@ type ShardRequest struct {
 	// ReadFenceID authorizes a read against an active short-lived coherent-cut
 	// fence. It is absent on ordinary single-shard reads and every write.
 	ReadFenceID distributedtxn.ID
+	// GlobalIndexLookup selects the raw global-index access path. It may carry a
+	// read fence and scoped bucket admission, but never SQL or a transaction.
+	GlobalIndexLookup GlobalIndexLookupRequest
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.

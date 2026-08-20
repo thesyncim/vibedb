@@ -31,9 +31,10 @@ const (
 
 	// transactionMarker makes the optional trailing envelope unambiguous while
 	// leaving every ordinary frame byte-for-byte unchanged.
-	transactionMarker = 0xd7
-	accessScopeMarker = 0xd8
-	readFenceMarker   = 0xd9
+	transactionMarker       = 0xd7
+	accessScopeMarker       = 0xd8
+	readFenceMarker         = 0xd9
+	globalIndexLookupMarker = 0xda
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -91,6 +92,10 @@ var errBadParam = errors.New("shardservice: frame carries an invalid parameter p
 // errBadTransaction reports a non-canonical command, a corrupt durable stage
 // record, or a reply whose role and typed state disagree.
 var errBadTransaction = errors.New("shardservice: frame carries an invalid transaction envelope")
+
+// errBadGlobalIndexLookup reports a non-canonical raw lookup envelope or an
+// attempt to combine that read-only lane with SQL or a transaction command.
+var errBadGlobalIndexLookup = errors.New("shardservice: frame carries an invalid global-index lookup")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -571,11 +576,22 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if err := validateTransactionRequest(req.Transaction); err != nil {
 		return err
 	}
+	if !req.GlobalIndexLookup.canonical() {
+		return errBadGlobalIndexLookup
+	}
 	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
 		return errBadTransaction
 	}
-	if req.Transaction.Operation != TransactionNone && !req.ReadFenceID.IsZero() {
+	if req.Transaction.Operation != TransactionNone &&
+		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present()) {
+		if req.GlobalIndexLookup.present() {
+			return errBadGlobalIndexLookup
+		}
 		return errBadTransaction
+	}
+	if req.GlobalIndexLookup.present() &&
+		(req.SQL != "" || len(req.Params) != 0 || req.ExecutionMode != ExecutionReadOnly) {
+		return errBadGlobalIndexLookup
 	}
 
 	var e encbuf
@@ -629,6 +645,20 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.ReadFenceID.IsZero() {
 		e.u8(readFenceMarker)
 		e.fixed16(req.ReadFenceID)
+	}
+	if req.GlobalIndexLookup.present() {
+		lookup := req.GlobalIndexLookup
+		e.u8(globalIndexLookupMarker)
+		e.bytes(lookup.Relation)
+		e.u64(lookup.IndexID)
+		e.u64(lookup.Incarnation)
+		e.bytes(lookup.KeyTuple)
+		e.u8(lookup.LocatorCount)
+		if lookup.Unique {
+			e.u8(1)
+		} else {
+			e.u8(0)
+		}
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
@@ -726,6 +756,22 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadTransaction
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == globalIndexLookupMarker {
+		d.u8()
+		req.GlobalIndexLookup.Relation = d.slice()
+		req.GlobalIndexLookup.IndexID = d.u64()
+		req.GlobalIndexLookup.Incarnation = d.u64()
+		req.GlobalIndexLookup.KeyTuple = d.slice()
+		req.GlobalIndexLookup.LocatorCount = d.u8()
+		unique := d.u8()
+		if unique > 1 {
+			return nil, errBadEnum
+		}
+		req.GlobalIndexLookup.Unique = unique == 1
+		if d.bad() || !req.GlobalIndexLookup.canonical() {
+			return nil, errBadGlobalIndexLookup
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
@@ -733,7 +779,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, err
 		}
 	}
-	if req.Transaction.Operation != TransactionNone && !req.ReadFenceID.IsZero() {
+	if req.Transaction.Operation != TransactionNone &&
+		(!req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present()) {
+		if req.GlobalIndexLookup.present() {
+			return nil, errBadGlobalIndexLookup
+		}
 		return nil, errBadTransaction
 	}
 	if err := d.end(); err != nil {
@@ -744,6 +794,10 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	}
 	if !mode.valid() {
 		return nil, errBadEnum
+	}
+	if req.GlobalIndexLookup.present() &&
+		(req.SQL != "" || len(req.Params) != 0 || req.ExecutionMode != ExecutionReadOnly) {
+		return nil, errBadGlobalIndexLookup
 	}
 	return req, nil
 }

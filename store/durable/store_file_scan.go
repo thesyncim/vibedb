@@ -487,6 +487,44 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
 }
 
+// RangePrefixRaw visits only live rows whose bytewise key starts with prefix,
+// in the same lexical order as RangeRaw. The primary graph seeks directly to
+// the prefix floor and stops at its lexical successor; it never filters a full
+// collection scan. Key and value lifetimes match RangeRaw.
+func (s *Snapshot) RangePrefixRaw(
+	prefix []byte,
+	fn func(key, value []byte) error,
+) error {
+	if s == nil || s.collection == nil || s.state == nil {
+		return ErrClosed
+	}
+	if fn == nil {
+		return nil
+	}
+	if len(prefix) == 0 {
+		return s.RangeRaw(fn)
+	}
+	return s.rangePrimaryGraph(nil, nil, prefix, fn)
+}
+
+// RangePrefixRawBuffer is RangePrefixRaw with caller-owned overflow storage.
+// Reusing the returned slice keeps warmed prefix scans allocation-free.
+func (s *Snapshot) RangePrefixRawBuffer(
+	prefix, scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return scratch, ErrClosed
+	}
+	if fn == nil {
+		return scratch, nil
+	}
+	if len(prefix) == 0 {
+		return s.RangeRawBuffer(scratch, fn)
+	}
+	return s.rangePrimaryGraphBuffer(nil, nil, prefix, scratch, fn)
+}
+
 // rangePrimaryGraph is the ordered-primary scan core. lower is inclusive,
 // upper is exclusive, and a non-empty prefix additionally bounds the result.
 func (s *Snapshot) rangePrimaryGraph(
