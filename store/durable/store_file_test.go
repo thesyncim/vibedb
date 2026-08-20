@@ -1039,6 +1039,84 @@ func TestFileSnapshotRangeAfterRawSeeksExclusiveCursor(t *testing.T) {
 	}
 }
 
+func TestFileSnapshotRangeBoundsRawSeeksBothBounds(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-fs-range-bounds-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err := Create(file, testFileStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+	for _, key := range []string{"a", "c", "e", "g", "i"} {
+		if _, err := collection.Put([]byte(key), []byte(`{"id":"`+key+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	for _, tc := range []struct {
+		lower, upper string
+		exclusive    bool
+		want         string
+	}{
+		{"", "", false, "a,c,e,g,i"},
+		{"c", "i", false, "c,e,g"},
+		{"c", "i", true, "e,g"},
+		{"d", "h", false, "e,g"},
+		{"i", "c", false, ""},
+	} {
+		var keys []string
+		if err := snapshot.RangeBoundsRaw(
+			[]byte(tc.lower), []byte(tc.upper), tc.exclusive,
+			func(key, _ []byte) error {
+				keys = append(keys, string(key))
+				return nil
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(keys, ","); got != tc.want {
+			t.Fatalf(
+				"RangeBoundsRaw(%q,%q,%t) = %q, want %q",
+				tc.lower, tc.upper, tc.exclusive, got, tc.want,
+			)
+		}
+	}
+
+	scratch := make([]byte, 0, 64)
+	lower, upper := []byte("c"), []byte("i")
+	visited := 0
+	visit := func(_, value []byte) error {
+		visited += len(value)
+		return nil
+	}
+	scratch, err = snapshot.RangeBoundsRawBuffer(
+		lower, upper, scratch, true, visit,
+	)
+	if err != nil || visited == 0 {
+		t.Fatalf("warm bounded range = %d,%v", visited, err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		visited = 0
+		var runErr error
+		scratch, runErr = snapshot.RangeBoundsRawBuffer(
+			lower, upper, scratch[:0], true, visit,
+		)
+		if runErr != nil || visited == 0 {
+			panic("bounded range failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeBoundsRawBuffer allocated %.2f times, want 0", allocs)
+	}
+}
+
 func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-index-alloc-*")
 	if err != nil {
@@ -1191,6 +1269,31 @@ func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("warmed RangeMasksRawBuffer allocated %.2f times, want 0", allocs)
+	}
+	lower, upper := []byte("k03"), []byte("k07")
+	var boundedKeys []string
+	scratch, err = snapshot.RangeMasksBoundsRawBuffer(
+		masks, lower, upper, scratch[:0], false,
+		func(key, _ []byte) error {
+			boundedKeys = append(boundedKeys, string(key))
+			return nil
+		},
+	)
+	if err != nil || strings.Join(boundedKeys, ",") != "k03,k04,k05,k06" {
+		t.Fatalf("masked bounded range = %v,%v", boundedKeys, err)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		visitBytes = 0
+		var runErr error
+		scratch, runErr = snapshot.RangeMasksBoundsRawBuffer(
+			masks, lower, upper, scratch[:0], false, visit,
+		)
+		if runErr != nil || visitBytes == 0 {
+			panic("masked bounded range failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeMasksBoundsRawBuffer allocated %.2f times, want 0", allocs)
 	}
 	if err := snapshot.RangeMasksRaw(masks, visit); err != nil {
 		t.Fatal(err)

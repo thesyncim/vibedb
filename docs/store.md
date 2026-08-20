@@ -479,6 +479,15 @@ retirement capacity is exhausted.
 never returns a borrowed cache page. Query execution and range scans use the
 same lease.
 
+Prepared SQL point predicates materialize only exact native primary candidates.
+Prepared `<`, `<=`, `>`, `>=`, and `BETWEEN` predicates on the primary path bind
+directly into the same canonical ordered-key bytes and seek the durable primary
+graph at both endpoints. The bounded cursor skips excluded leaves before JSON
+reconstruction, while the ordinary compiled SQL predicate still rechecks every
+visited row. Inclusive endpoints, contradictory bounds, NULL, and oversized
+legal operands therefore change physical work only. Warm bound binding and
+bounded overflow scans retain caller/connection scratch and allocate nothing.
+
 Retirements are generation ordered. A pinned snapshot check is constant in the
 pending retired-extent count, and eligible drains are proportional only to the
 bounded number of extents reclaimed. Closing old snapshots promptly still

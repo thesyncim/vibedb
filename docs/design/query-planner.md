@@ -80,6 +80,13 @@ Executable multi-shard shapes are:
   `LIMIT`; and
 - exact global `COUNT`, `SUM`, `MIN`, and `MAX` finalization.
 
+Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
+ordered-key bounds and seek the durable primary graph before document decoding.
+The query engine retains its compiled predicate as the correctness authority,
+then applies filter-first extraction and late projection over only the visited
+span. Exact-index candidate masks and covering aggregates remain separate
+adaptive paths; no range metadata is duplicated into another format.
+
 `SUM` uses exact rational arithmetic and emits a finite canonical JSON decimal.
 `MIN` and `MAX` compare exact values and preserve a contributing spelling.
 Every shard aggregate must return exactly one row with the expected schema.
@@ -90,7 +97,10 @@ The gateway refuses:
   multi-shard route;
 - derived, CTE, or predicate-subquery plans that read another physical source;
 - non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
-- every distributed write.
+- unsupported single-statement scatter writes. Explicit bounded write batches
+  may partition into a fixed participant set and commit through the durable
+  coordinator protocol; the one-shard `Exec` lane remains the lower-latency
+  path.
 
 The generic memo includes additional operator identities for testing and
 composition, but the gateway must reject any plan whose execution

@@ -25,6 +25,7 @@ type stmt struct {
 	pointPredicate     *sqlast.Expr
 	pointPath          string
 	pointCandidate     bool
+	primaryRange       *primaryRangeProgram
 	primaryPoint       bool
 	serialPointSafe    bool
 	serialMutationSafe bool
@@ -98,6 +99,7 @@ func (s *stmt) Close() error {
 	s.pointPredicate = nil
 	s.pointPath = ""
 	s.pointCandidate = false
+	s.primaryRange = nil
 	s.primaryPoint = false
 	s.serialPointSafe = false
 	s.serialMutationSafe = false
@@ -456,6 +458,34 @@ func (s *stmt) queryRowsCandidates(
 				}
 			}
 		}
+	} else if s.primaryRange != nil && s.primaryRange.path == t.meta.PrimaryKey {
+		limits, limitErr := tableMutationLimits(t)
+		if limitErr != nil {
+			err = limitErr
+		} else {
+			bounds, eligible, empty, bindErr := s.conn.bindPrimaryRangeProgram(
+				s.primaryRange, args, limits.MaxKeyBytes,
+			)
+			switch {
+			case bindErr != nil:
+				err = bindErr
+			case empty || t.collection == nil:
+				source = query.FromSnapshot(store.Snapshot{})
+			case !eligible:
+				snapshot, err = t.collection.Snapshot()
+				if err == nil {
+					source = query.FromFile(snapshot)
+				}
+			default:
+				snapshot, err = t.collection.Snapshot()
+				if err == nil {
+					s.conn.fileRange.Bind(
+						bounds.lower, bounds.upper, bounds.lowerExclusive,
+					)
+					source = query.FromFileRange(snapshot, &s.conn.fileRange)
+				}
+			}
+		}
 	} else if t.collection == nil {
 		source = query.FromSnapshot(store.Snapshot{})
 	} else {
@@ -572,6 +602,9 @@ func analyzeAccessPath(
 	if primaryPoint && pointSource {
 		return "primary-key-point"
 	}
+	if stats.PrimaryRangeBounded {
+		return "primary-key-range"
+	}
 	if stats.IndexBounded {
 		return "exact-index"
 	}
@@ -620,6 +653,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
 		}
 		options.PrimaryPoint = s.pointCandidate && s.pointPath == state.primaryKey
+		options.PrimaryRange = s.primaryRange != nil && s.primaryRange.path == state.primaryKey
 		return options, contextCheckpoint(ctx)
 	}
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
@@ -631,6 +665,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		return query.ExplainOptions{}, s.missingDependency(collection, false)
 	}
 	options.PrimaryPoint = s.pointCandidate && s.pointPath == t.meta.PrimaryKey
+	options.PrimaryRange = s.primaryRange != nil && s.primaryRange.path == t.meta.PrimaryKey
 	if t.collection == nil {
 		s.conn.db.mu.RUnlock()
 		return options, contextCheckpoint(ctx)

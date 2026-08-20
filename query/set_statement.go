@@ -525,6 +525,7 @@ func mergeSetStatementStats(dst *ExecStats, src ExecStats) {
 	dst.BufferedBytes = max(dst.BufferedBytes, src.BufferedBytes)
 	dst.SpillRuns = saturatedSetStatementUint64(dst.SpillRuns, src.SpillRuns)
 	dst.SpilledBytes = saturatedBytes(dst.SpilledBytes, src.SpilledBytes)
+	dst.PrimaryRangeBounded = dst.PrimaryRangeBounded || src.PrimaryRangeBounded
 	dst.IndexBounded = dst.IndexBounded || src.IndexBounded
 	dst.IndexLookups = saturatedSetStatementInt(dst.IndexLookups, src.IndexLookups)
 	dst.IndexPostingPages = saturatedSetStatementInt(dst.IndexPostingPages, src.IndexPostingPages)

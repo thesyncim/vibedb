@@ -534,6 +534,59 @@ func (s *Snapshot) RangeAfterRawBuffer(
 	})
 }
 
+// RangeBoundsRaw visits live rows between native ordered-primary bounds.
+// lower is inclusive unless lowerExclusive is true; upper is always exclusive.
+// A nil bound is unbounded. The primary graph seeks directly to lower and stops
+// at upper, so excluded leaves and rows are never decoded. The callback still
+// receives borrowed bytes with the same lifetime and order as [Snapshot.RangeRaw].
+func (s *Snapshot) RangeBoundsRaw(
+	lower, upper []byte,
+	lowerExclusive bool,
+	fn func(key, value []byte) error,
+) error {
+	if s == nil || s.collection == nil || s.state == nil {
+		return ErrClosed
+	}
+	if fn == nil || len(lower) != 0 && len(upper) != 0 && bytes.Compare(lower, upper) >= 0 {
+		return nil
+	}
+	if len(lower) == 0 && len(upper) == 0 {
+		return s.RangeRaw(fn)
+	}
+	lower = s.exclusiveRangeLower(lower, lowerExclusive)
+	return s.rangePrimaryGraph(lower, upper, nil, fn)
+}
+
+// RangeBoundsRawBuffer is [Snapshot.RangeBoundsRaw] with caller-owned overflow
+// reconstruction storage. Reusing the returned slice keeps warmed bounded scans
+// allocation-free.
+func (s *Snapshot) RangeBoundsRawBuffer(
+	lower, upper, scratch []byte,
+	lowerExclusive bool,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return scratch, ErrClosed
+	}
+	if fn == nil || len(lower) != 0 && len(upper) != 0 && bytes.Compare(lower, upper) >= 0 {
+		return scratch, nil
+	}
+	if len(lower) == 0 && len(upper) == 0 {
+		return s.RangeRawBuffer(scratch, fn)
+	}
+	lower = s.exclusiveRangeLower(lower, lowerExclusive)
+	return s.rangePrimaryGraphBuffer(lower, upper, nil, scratch, fn)
+}
+
+func (s *Snapshot) exclusiveRangeLower(lower []byte, exclusive bool) []byte {
+	if !exclusive || len(lower) == 0 {
+		return lower
+	}
+	s.rangeLowerScratch = append(s.rangeLowerScratch[:0], lower...)
+	s.rangeLowerScratch = append(s.rangeLowerScratch, 0)
+	return s.rangeLowerScratch
+}
+
 // RangePrefixRaw visits only live rows whose bytewise key starts with prefix,
 // in the same lexical order as RangeRaw. The primary graph seeks directly to
 // the prefix floor and stops at its lexical successor; it never filters a full
@@ -672,7 +725,7 @@ func (s *Snapshot) RangeMasksRaw(masks []store.Mask, fn func(key, value []byte) 
 		return nil
 	}
 	scratch, err := s.rangePrimaryMasks(
-		masks, s.scanSpliceScratch,
+		masks, nil, nil, false, s.scanSpliceScratch,
 		func(_ store.Location, key, value []byte) error {
 			return fn(key, value)
 		},
@@ -692,10 +745,33 @@ func (s *Snapshot) RangeMasksRawBuffer(masks []store.Mask, scratch []byte, fn fu
 		return scratch, nil
 	}
 	return s.rangePrimaryMasks(
-		masks, scratch,
+		masks, nil, nil, false, scratch,
 		func(_ store.Location, key, value []byte) error {
 			return fn(key, value)
 		},
+	)
+}
+
+// RangeMasksBoundsRawBuffer intersects stable-slot masks with native ordered-
+// primary bounds before handing a row to the caller. lower is inclusive unless
+// lowerExclusive is true; upper is exclusive. Whole candidate leaves beyond
+// upper or provably below lower are skipped, and an out-of-line value whose key
+// is outside the span is never reconstructed.
+func (s *Snapshot) RangeMasksBoundsRawBuffer(
+	masks []store.Mask,
+	lower, upper, scratch []byte,
+	lowerExclusive bool,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return scratch, ErrClosed
+	}
+	if fn == nil || len(lower) != 0 && len(upper) != 0 && bytes.Compare(lower, upper) >= 0 {
+		return scratch, nil
+	}
+	return s.rangePrimaryMasks(
+		masks, lower, upper, lowerExclusive, scratch,
+		func(_ store.Location, key, value []byte) error { return fn(key, value) },
 	)
 }
 
@@ -719,7 +795,7 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 	if fn == nil {
 		return scratch, nil
 	}
-	return s.rangePrimaryMasks(masks, scratch, fn)
+	return s.rangePrimaryMasks(masks, nil, nil, false, scratch, fn)
 }
 
 // rangePrimaryMasks materializes selected rows from the snapshot-rooted primary
@@ -735,6 +811,8 @@ func (s *Snapshot) RangeMasksRawRowsBuffer(
 // map, so a mask that names a dead or absent slot fails closed.
 func (s *Snapshot) rangePrimaryMasks(
 	masks []store.Mask,
+	lower, upper []byte,
+	lowerExclusive bool,
 	scratch []byte,
 	fn func(row store.Location, key, value []byte) error,
 ) ([]byte, error) {
@@ -836,6 +914,13 @@ func (s *Snapshot) rangePrimaryMasks(
 	rooted := false
 	for groupAt := range s.maskGroups {
 		group := &s.maskGroups[groupAt]
+		if len(upper) != 0 && bytes.Compare(group.floor, upper) >= 0 {
+			break
+		}
+		if len(lower) != 0 && groupAt+1 < len(s.maskGroups) &&
+			bytes.Compare(s.maskGroups[groupAt+1].floor, lower) <= 0 {
+			continue
+		}
 		var (
 			page  []byte
 			lease storeio.PageLease
@@ -876,13 +961,17 @@ func (s *Snapshot) rangePrimaryMasks(
 		if state.root.Generation > state.root.PrimaryRoot.Generation &&
 			s.collection.primaryUnifiedOverlay.pendingBucket(group.bucket) {
 			scratch, err = s.rangePrimaryOverlayMaskedLeaf(
-				page, group.bucket, bounds, group.selected, scratch, fn,
+				page, group.bucket, bounds, group.selected,
+				lower, upper, lowerExclusive, scratch, fn,
 			)
 		} else {
 			scratch, err = storeio.VisitPrimaryLeafSelectedPostingRows(
 				page, state.root.StoreID, group.bucket, bounds,
 				group.selected, scratch,
 				func(slot uint8, key, raw []byte, overflow bool) error {
+					if !rawKeyWithinBounds(key, lower, upper, lowerExclusive) {
+						return nil
+					}
 					quadrant := slot >> 6
 					value := raw
 					if overflow {
@@ -924,6 +1013,8 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 	bucket storeio.BucketID,
 	bounds storeio.CommonPrimaryLeafBounds,
 	selected [4]uint64,
+	lower, upper []byte,
+	lowerExclusive bool,
 	scratch []byte,
 	fn func(row store.Location, key, value []byte) error,
 ) ([]byte, error) {
@@ -951,6 +1042,9 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 		if selected[quadrant]&(uint64(1)<<uint(slot&63)) == 0 {
 			return nil
 		}
+		if !rawKeyWithinBounds(key, lower, upper, lowerExclusive) {
+			return nil
+		}
 		return fn(store.Location{
 			Chunk: uint32(bucket)<<2 | uint32(quadrant),
 			Slot:  slot & 63,
@@ -969,7 +1063,9 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 				return scratch, storeio.ErrCommonPrimaryLeafCorrupt
 			}
 			scratch = baseValue
-			if overflow {
+			if overflow && rawKeyWithinBounds(
+				baseKey, lower, upper, lowerExclusive,
+			) {
 				resolved, resolveErr := s.collection.appendPrimaryOverflowValue(
 					s.overflowScanValue[:0],
 					storeio.DecodePrimaryOverflowRef(baseValue), bounds,
@@ -1032,4 +1128,14 @@ func (s *Snapshot) rangePrimaryOverlayMaskedLeaf(
 		}
 	}
 	return scratch, nil
+}
+
+func rawKeyWithinBounds(key, lower, upper []byte, lowerExclusive bool) bool {
+	if len(lower) != 0 {
+		order := bytes.Compare(key, lower)
+		if order < 0 || order == 0 && lowerExclusive {
+			return false
+		}
+	}
+	return len(upper) == 0 || bytes.Compare(key, upper) < 0
 }

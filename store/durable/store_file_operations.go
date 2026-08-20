@@ -155,6 +155,10 @@ type Snapshot struct {
 	// forever. The mask scan already threads its reconstruction buffer through
 	// caller-owned scratch; this gives the full scan the same retention.
 	scanSpliceScratch []byte
+	// rangeLowerScratch holds the immediate lexical successor of an exclusive
+	// lower bound. Retaining it avoids a wrapper callback and boxed captures
+	// while preserving allocation-free warmed bounded scans.
+	rangeLowerScratch []byte
 	// maskGroups retains the bucket-to-floor routing plan for exact-index mask
 	// scans. Reuse keeps warmed sparse probes allocation-free while sorting by
 	// lexical floor preserves the same callback order as RangeRaw even after a

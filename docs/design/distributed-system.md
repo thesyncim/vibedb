@@ -115,9 +115,12 @@ participants in the same durable fixed-set transaction; UPDATE/DELETE capture
 canonical old documents and validate the exact selected primary set inside the
 serializable base participant. Index entries use canonical binary tuple keys
 and compact scalar-array locators, with one shard-local ID/incarnation marker
-instead of repeating that fence in every value. READY equality lookup is
-byte-native, groups locators by base owner, and fetches exact native primary
-keys rather than rescanning predicates.
+instead of repeating that fence in every value. READY finite equality domains
+expand under a hard Cartesian bound, group sorted locator keys by independent
+index owner, pin one snapshot and send one request per index shard, then group
+the returned locators by base owner and fetch exact native primary keys rather
+than rescanning predicates. The index stores locator-only projection values,
+not duplicated base documents.
 
 An online build has one monotone incarnation and the following catalog states:
 
@@ -245,12 +248,16 @@ cluster does not fork into named protocol generations.
    scoped intents, and coherent leader-only vector cuts are present; replicated
    MVCC/closed timestamps replace the read-fence bridge when serving Raft is
    wired.
-4. **In progress:** independently sharded global-index CRUD, exact lookup,
-   resumable online-build data plane, and local generation drains are present;
-   cluster-wide build orchestration, locator projections, and row-group data
-   skipping are next.
-5. **Pending:** vectorized multi-stage exchange, lazy materialization,
-   pushdown, parallel hash joins, spill, and parallel replica scheduling.
+4. **In progress:** independently sharded global-index CRUD, batched finite-key
+   locator projections, exact grouped base fetch, resumable online-build data
+   plane, local generation drains, and native primary-range skipping are
+   present; cluster-wide build orchestration and persisted non-primary row-group
+   summaries are next.
+5. **Partly serving:** shard-local execution already has bounded parallel
+   batches, filter-first/lazy projection, exact-index pushdown, covering
+   aggregates, adaptive joins, and spill. Distributed vectorized stage
+   exchange, runtime filters across exchanges, and parallel replica scheduling
+   remain pending.
 6. **Pending:** wire the existing Raft foundation into serving, enable
    movement, and add disaggregated immutable snapshot/cold-data caching.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and

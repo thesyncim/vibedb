@@ -256,6 +256,7 @@ type conn struct {
 	pointKeyRaw    []byte
 	pointKeyEnds   []int
 	pointKeys      []string
+	fileRange      query.FileRangeSource
 	matchKeys      []string
 	insertSeeds    []seedDocument
 	insertKeyRaw   []byte
@@ -525,6 +526,9 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 				}
 				if t != nil {
 					s.pointPredicate = s.query.DrivingPredicate()
+					s.primaryRange = compilePrimaryRangeProgram(
+						s.pointPredicate, t.meta.PrimaryKey,
+					)
 					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
 						s.pointPredicate,
 					)

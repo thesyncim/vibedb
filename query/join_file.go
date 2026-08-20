@@ -525,7 +525,7 @@ func (p *plan) runFileJoinedBatched(
 	if n.batchBytes > batchShare {
 		n.batchBytes = batchShare
 	}
-	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, n, stats)
+	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, nil, n, stats)
 	e.Result, e.Stats = result, stats
 	if err != nil {
 		return err

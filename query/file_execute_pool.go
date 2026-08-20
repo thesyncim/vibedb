@@ -102,18 +102,19 @@ type filePool struct {
 // Every field is read-only to them except segments, whose element at index i is
 // written only by worker i.
 type fileJob struct {
-	p        *plan
-	snapshot *durable.Snapshot
-	overlay  FileOverlay
-	masks    []store.Mask
-	overflow *[]byte
-	slots    []fileSlot
-	spaces   []Workspace
-	segments []*store.Segment
-	arenas   []fileArenaSet
-	opts     normalizedFileOptions
-	budget   *aggregateBudget
-	cancel   *CancelFlag
+	p         *plan
+	snapshot  *durable.Snapshot
+	overlay   FileOverlay
+	masks     []store.Mask
+	scanRange *FileRangeSource
+	overflow  *[]byte
+	slots     []fileSlot
+	spaces    []Workspace
+	segments  []*store.Segment
+	arenas    []fileArenaSet
+	opts      normalizedFileOptions
+	budget    *aggregateBudget
+	cancel    *CancelFlag
 	// active is how many workers this execution woke. The pool's goroutines are
 	// a high-water mark, so the scanner must send exactly this many
 	// end-of-stream sentinels — one per worker actually woken, not one per
@@ -345,6 +346,16 @@ func (pool *filePool) runScan(
 	pool.scanState = fileScanState{batch: takeFileBatch(job.slots, 0, 0)}
 	var err error
 	switch {
+	case job.scanRange != nil && job.masks != nil:
+		*job.overflow, err = job.snapshot.RangeMasksBoundsRawBuffer(
+			job.masks, job.scanRange.lower, job.scanRange.upper,
+			(*job.overflow)[:0], job.scanRange.lowerExclusive, row,
+		)
+	case job.scanRange != nil:
+		*job.overflow, err = job.snapshot.RangeBoundsRawBuffer(
+			job.scanRange.lower, job.scanRange.upper, (*job.overflow)[:0],
+			job.scanRange.lowerExclusive, row,
+		)
 	case job.overlay != nil && job.masks != nil:
 		*job.overflow, err = job.snapshot.RangeMasksRawBuffer(
 			job.masks, (*job.overflow)[:0], overlayCandidate,

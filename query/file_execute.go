@@ -369,6 +369,7 @@ type ExecStats struct {
 	BufferedBytes        int64
 	SpillRuns            uint64
 	SpilledBytes         int64
+	PrimaryRangeBounded  bool
 	IndexBounded         bool
 	IndexLookups         int
 	IndexPostingPages    int
@@ -507,7 +508,12 @@ func normalizeFileOptions(opts ExecOptions) (normalizedFileOptions, error) {
 // nothing. Materialized cells own their bytes and stay valid after the snapshot
 // is closed, until e is reused or released. The snapshot stays owned by the
 // caller.
-func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.DatabaseSnapshot) error {
+func (p *plan) runFileInto(
+	e *Exec,
+	snapshot *durable.Snapshot,
+	catalog durable.DatabaseSnapshot,
+	rangeSource *FileRangeSource,
+) error {
 	e.Result.fileData = e.Result.fileData[:0]
 	e.Stats = ExecStats{}
 	if err := e.Workspace.checkCanceled(); err != nil {
@@ -521,6 +527,15 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		return fmt.Errorf("query: FromFile was given a nil snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: snapshot.Len()}
+	if rangeSource != nil {
+		stats.PrimaryRangeBounded = true
+		result, boundedStats, runErr := p.runFileSnapshotBatched(
+			e, snapshot, nil, rangeSource, n, stats,
+		)
+		boundedStats.CandidateRows = boundedStats.RowsScanned
+		e.Result, e.Stats = result, boundedStats
+		return runErr
+	}
 	if len(p.joins) != 0 || len(p.marks) != 0 {
 		// The direct dispatchers below answer straight out of the persistent
 		// index or a covering projection, without ever evaluating the compiled
@@ -575,7 +590,7 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		}
 		return directErr
 	}
-	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, n, stats)
+	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, nil, n, stats)
 	e.Result, e.Stats = result, stats
 	return err
 }
@@ -609,7 +624,7 @@ func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay F
 		return fmt.Errorf("query: FileOverlay LenDelta underflows the base snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: uint64(rows)}
-	result, stats, err := p.runFileSnapshotBatched(e, snapshot, overlay, n, stats)
+	result, stats, err := p.runFileSnapshotBatched(e, snapshot, overlay, nil, n, stats)
 	e.Result, e.Stats = result, stats
 	return err
 }
@@ -621,6 +636,7 @@ func (p *plan) runFileSnapshotBatched(
 	e *Exec,
 	snapshot *durable.Snapshot,
 	overlay FileOverlay,
+	rangeSource *FileRangeSource,
 	n normalizedFileOptions,
 	base ExecStats,
 ) (result Result, stats ExecStats, err error) {
@@ -754,7 +770,8 @@ func (p *plan) runFileSnapshotBatched(
 	}
 	pool.start(fileJob{
 		p: p, snapshot: snapshot, overlay: overlay, masks: candidateMasks,
-		overflow: &e.file.overflow, slots: slots,
+		scanRange: rangeSource,
+		overflow:  &e.file.overflow, slots: slots,
 		spaces: e.file.workers, segments: e.file.segments,
 		arenas: e.file.arenas, opts: n, active: n.workers,
 		budget: &e.Workspace.aggregateBudget, cancel: e.Options.Cancel,
