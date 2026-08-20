@@ -83,6 +83,14 @@ coordinator restart scan only their bounded active-transaction index, rebuild
 visibility barriers before serving requests, and redrive monotone transitions.
 No recovery path scans user rows.
 
+The shard protocol exposes a raw-ID active-coordinator cursor. Coordinator
+lookup/scan returns the immutable checksummed participant vector, and an
+explicit participant-record read lets a fresh gateway verify the retained
+mutation digest before redrive. Missing participants are durably fenced with an
+`ABORTED` tombstone before an expired staging coordinator is retired, so a late
+original gateway cannot install an orphan intent. The gateway command performs
+an initial scan and repeats bounded recovery passes while it serves.
+
 An unavailable coordinator makes participants unavailable only for operations
 intersecting their visibility barrier; it never guesses abort or exposes a
 partial commit. A future replicated coordinator applies the same record through
@@ -125,10 +133,11 @@ bounded parallelism. Apply retries return the retained affected-row count
 without executing the SQL mutation twice. End-to-end tests cover cross-shard,
 multi-table, and prepare-failure rollback.
 
-Automatic background redrive and key/range-scoped barriers are not enabled yet;
-ordinary traffic currently waits behind any active participant on its shard.
-The common read-timestamp contract is also still pending. Their integration
-order is specified in
+Automatic background redrive is enabled for coordinator allocations retained
+in the current catalog. Key/range-scoped barriers are not enabled yet; ordinary
+traffic currently waits behind the one active participant permitted on its
+shard. The common read-timestamp contract is also still pending. Their
+integration order is specified in
 [Distributed system target](distributed-system.md).
 
 ## Latency and throughput

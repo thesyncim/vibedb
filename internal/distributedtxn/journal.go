@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -30,6 +31,7 @@ const (
 	journalParticipantStage
 	journalCoordinatorTransition
 	journalParticipantTransition
+	journalParticipantFence
 )
 
 type RecordRole uint8
@@ -197,9 +199,24 @@ func (j *Journal) replayEntry(entry []byte) error {
 			return ErrCorrupt
 		}
 		return j.replayParticipantTransition(id, revision, ParticipantState(state))
+	case journalParticipantFence:
+		if len(payload) != 0 || ParticipantState(state) != ParticipantAborted || revision != 2 {
+			return ErrCorrupt
+		}
+		return j.replayParticipantFence(id)
 	default:
 		return ErrUnsupported
 	}
+}
+
+func (j *Journal) replayParticipantFence(id ID) error {
+	if id.IsZero() || j.participants[id] != nil {
+		return ErrCorrupt
+	}
+	j.participants[id] = &journalRecord{status: Status{
+		Role: RoleParticipant, ID: id, Revision: 2, ParticipantState: ParticipantAborted,
+	}}
+	return nil
 }
 
 func (j *Journal) replayCoordinatorStage(raw []byte, record CoordinatorRecord) error {
@@ -447,6 +464,47 @@ func (j *Journal) TransitionParticipant(id ID, expected uint64, next Participant
 	return record.status, nil
 }
 
+// AbortParticipant aborts an existing staged/prepared participant or durably
+// installs an ABORTED tombstone for a missing initial revision. The tombstone
+// fences a delayed StageParticipant after recovery has chosen abort.
+func (j *Journal) AbortParticipant(id ID, expected uint64) (Status, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	record := j.participants[id]
+	if record == nil {
+		if id.IsZero() || expected != 1 {
+			return Status{}, ErrJournalNotFound
+		}
+		if err := j.writeEntryLocked(
+			journalParticipantFence, byte(ParticipantAborted), expected+1, id, nil,
+		); err != nil {
+			return Status{}, err
+		}
+		status := Status{
+			Role: RoleParticipant, ID: id, Revision: expected + 1,
+			ParticipantState: ParticipantAborted,
+		}
+		j.participants[id] = &journalRecord{status: status}
+		return status, nil
+	}
+	if record.status.Revision == expected+1 && record.status.ParticipantState == ParticipantAborted {
+		return record.status, nil
+	}
+	if record.status.Revision != expected ||
+		!record.status.ParticipantState.CanTransitionTo(ParticipantAborted) {
+		return Status{}, ErrJournalConflict
+	}
+	if err := j.writeEntryLocked(
+		journalParticipantTransition, byte(ParticipantAborted), expected+1, id, nil,
+	); err != nil {
+		return Status{}, err
+	}
+	record.status.Revision++
+	record.status.ParticipantState = ParticipantAborted
+	j.removeBarrierLocked()
+	return record.status, nil
+}
+
 // WaitNoParticipantBarrier waits until every staged participant is aborted or
 // released. Transaction commands bypass this gate so recovery can always make
 // progress. The channel fast path allocates nothing.
@@ -478,6 +536,20 @@ func (j *Journal) Participant(id ID) (ParticipantRecord, error) {
 	return OpenParticipant(record.stage)
 }
 
+// ParticipantStage returns the immutable checksummed participant stage bytes.
+func (j *Journal) ParticipantStage(id ID) ([]byte, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	record := j.participants[id]
+	if record == nil {
+		return nil, ErrJournalNotFound
+	}
+	if len(record.stage) == 0 {
+		return nil, nil
+	}
+	return record.stage, nil
+}
+
 // Coordinator returns a decoded immutable view of the coordinator stage
 // payload. Participant slices alias journal-owned storage and remain valid
 // until Close.
@@ -489,6 +561,45 @@ func (j *Journal) Coordinator(id ID) (CoordinatorRecord, error) {
 		return CoordinatorRecord{}, ErrJournalNotFound
 	}
 	return OpenCoordinator(record.stage)
+}
+
+// CoordinatorStage returns the immutable checksummed stage bytes for id. The
+// returned slice aliases journal-owned memory and remains valid until Close.
+func (j *Journal) CoordinatorStage(id ID) ([]byte, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	record := j.coordinators[id]
+	if record == nil {
+		return nil, ErrJournalNotFound
+	}
+	return record.stage, nil
+}
+
+// NextCoordinator returns the smallest non-retired coordinator identity after
+// the exclusive cursor. It scans the bounded active index without allocating;
+// recovery is cold-path work and does not impose a sorted structure on stage
+// or status hot paths.
+func (j *Journal) NextCoordinator(after ID) (Status, []byte, bool) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	var (
+		selected ID
+		found    bool
+	)
+	for id, record := range j.coordinators {
+		if record.status.CoordinatorState == CoordinatorRetired ||
+			slices.Compare(id[:], after[:]) <= 0 {
+			continue
+		}
+		if !found || slices.Compare(id[:], selected[:]) < 0 {
+			selected, found = id, true
+		}
+	}
+	if !found {
+		return Status{}, nil, false
+	}
+	record := j.coordinators[selected]
+	return record.status, record.stage, true
 }
 
 func (j *Journal) Close() error {

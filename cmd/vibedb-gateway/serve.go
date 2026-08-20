@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -167,6 +168,14 @@ func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, 
 // listener and drains in-flight connections. It returns nil on a signaled
 // shutdown and the accept error otherwise.
 func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor, logf func(string, ...any)) error {
+	go exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
+		if err != nil {
+			logf("gateway: transaction recovery: %v", err)
+		}
+		if len(results) != 0 {
+			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
+		}
+	})
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
 	go func() {

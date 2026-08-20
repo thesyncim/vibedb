@@ -327,7 +327,7 @@ available.
 | Server capability | Current state |
 | --- | --- |
 | Leader-only shard process | Available; one locally fenced store |
-| Stateless gateway | Available; generation-pinned read fan-out, single-shard fast writes, and synchronous fixed-participant atomic write batches; automatic recovery remains pending |
+| Stateless gateway | Available; generation-pinned read fan-out, single-shard fast writes, fixed-participant atomic write batches, and bounded durable coordinator redrive |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |

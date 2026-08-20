@@ -38,8 +38,9 @@
 // write path keeps Exec as the single-statement/single-shard fast lane.
 // ExecBatch prepares every statement against one pinned generation and runs a
 // bounded fixed-participant transaction across tables and shards. Coordinator
-// and participant state is durable on shards; automatic background recovery,
-// key-range-scoped intents, replicated serving, peer authentication, failover,
+// and participant state is durable on shards; bounded scanning and redrive let
+// any gateway recover current-catalog coordinators. Key-range-scoped intents,
+// replicated serving, peer authentication, failover,
 // online movement, and a topology authority are not yet provided. The command
 // front end is loopback-only newline-delimited JSON, not pgwire.
 package gateway

@@ -486,6 +486,13 @@ func (e *Executor) abortTransaction(
 		)
 		response, err := e.transactionRoundTrip(ctx, participant.call.address, lookup, profile)
 		if errors.Is(err, ErrTransactionNotFound) {
+			abort := transactionRequest(
+				participant.call.req, profile, shardservice.TransactionAbortParticipant,
+				id, transactionInitialRevision, nil,
+			)
+			_, participantErrors[i] = e.transactionRoundTrip(
+				ctx, participant.call.address, abort, profile,
+			)
 			continue
 		}
 		if err != nil {

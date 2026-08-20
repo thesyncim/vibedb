@@ -247,7 +247,7 @@ func TestResponseRoundTrip(t *testing.T) {
 			if got.Kind != tc.resp.Kind {
 				t.Errorf("Kind = %v, want %v", got.Kind, tc.resp.Kind)
 			}
-			if got.Transaction != tc.resp.Transaction {
+			if !got.Transaction.Equal(tc.resp.Transaction) {
 				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.resp.Transaction)
 			}
 		})

@@ -179,13 +179,13 @@ func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 	// A lost stage response is retried byte-for-byte and resolves to the same
 	// durable state without another journal entry.
 	second := exec(t, conn, stage)
-	if second.Transaction != first.Transaction {
+	if !second.Transaction.Equal(first.Transaction) {
 		t.Fatalf("duplicate stage = %+v, want %+v", second.Transaction, first.Transaction)
 	}
 	lookup := ownedRequest("")
 	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
 	observed := exec(t, conn, lookup)
-	if observed.Transaction != first.Transaction {
+	if !observed.Transaction.Equal(first.Transaction) {
 		t.Fatalf("lookup = %+v, want %+v", observed.Transaction, first.Transaction)
 	}
 }
@@ -233,7 +233,7 @@ func TestTransactionStageSurvivesShardRestart(t *testing.T) {
 	conn = dial(t, srv)
 	lookup := ownedRequest("")
 	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
-	if got := exec(t, conn, lookup).Transaction; got != want {
+	if got := exec(t, conn, lookup).Transaction; !got.Equal(want) {
 		t.Fatalf("recovered transaction = %+v, want %+v", got, want)
 	}
 }
@@ -289,7 +289,7 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	// A response-lost retry resolves the retained SQL-atomic outcome and cannot
 	// execute the INSERT a second time.
 	retried := exec(t, conn, apply)
-	if retried.RowsAffected != 1 || retried.Transaction != applied.Transaction {
+	if retried.RowsAffected != 1 || !retried.Transaction.Equal(applied.Transaction) {
 		t.Fatalf("retried apply = %+v, want %+v", retried, applied)
 	}
 	blockedConn := dial(t, srv)
@@ -327,11 +327,11 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	lookup := ownedRequest("")
 	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
 	if retained := exec(t, conn, lookup); retained.RowsAffected != 1 ||
-		retained.Transaction != released.Transaction {
+		!retained.Transaction.Equal(released.Transaction) {
 		t.Fatalf("released lookup = %+v, want transaction %+v", retained, released.Transaction)
 	}
 	if afterRelease := exec(t, conn, apply); afterRelease.RowsAffected != 1 ||
-		afterRelease.Transaction != released.Transaction {
+		!afterRelease.Transaction.Equal(released.Transaction) {
 		t.Fatalf("apply retry after release = %+v, want retained release", afterRelease)
 	}
 	var query *ShardResponse

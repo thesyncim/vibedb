@@ -19,7 +19,7 @@ shard.
 | `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol |
-| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out/result merging, a single-shard write fast path, and synchronous multi-table/cross-shard `ExecBatch` coordination |
+| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, and periodic durable coordinator redrive |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
 

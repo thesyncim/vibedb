@@ -417,11 +417,17 @@ func validateTransactionRequest(tx TransactionRequest) error {
 		}
 		return nil
 	}
+	if tx.Operation == TransactionScanCoordinator {
+		if tx.Revision != 0 || len(tx.Record) != 0 {
+			return errBadTransaction
+		}
+		return nil
+	}
 	if tx.ID.IsZero() || len(tx.Record) != 0 {
 		return errBadTransaction
 	}
 	lookup := tx.Operation == TransactionLookupCoordinator ||
-		tx.Operation == TransactionLookupParticipant
+		tx.Operation == TransactionLookupParticipant || tx.Operation == TransactionReadParticipant
 	if (lookup && tx.Revision != 0) || (!lookup && tx.Revision == 0) {
 		return errBadTransaction
 	}
@@ -432,7 +438,7 @@ func validateTransactionReply(tx TransactionReply) error {
 	if tx.Role == TransactionRoleNone {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid {
+			tx.ParticipantState != distributedtxn.ParticipantInvalid || len(tx.Record) != 0 {
 			return errBadTransaction
 		}
 		return nil
@@ -447,11 +453,24 @@ func validateTransactionReply(tx TransactionReply) error {
 			tx.ParticipantState != distributedtxn.ParticipantInvalid {
 			return errBadTransaction
 		}
+		if len(tx.Record) != 0 {
+			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+			if err != nil || record.ID != tx.ID {
+				return errors.Join(errBadTransaction, err)
+			}
+		}
 	case TransactionRoleParticipant:
 		if tx.ParticipantState < distributedtxn.ParticipantStaged ||
 			tx.ParticipantState > distributedtxn.ParticipantReleased ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
+		}
+		if len(tx.Record) != 0 {
+			record, err := distributedtxn.OpenParticipant(tx.Record)
+			if err != nil || record.ID != tx.ID {
+				return errors.Join(errBadTransaction, err)
+			}
 		}
 	default:
 		return errBadEnum
@@ -501,6 +520,7 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	} else {
 		e.u8(uint8(tx.ParticipantState))
 	}
+	e.bytes(tx.Record)
 }
 
 func decodeTransactionReply(d *deccur) (TransactionReply, error) {
@@ -516,6 +536,7 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	} else if tx.Role == TransactionRoleParticipant {
 		tx.ParticipantState = distributedtxn.ParticipantState(state)
 	}
+	tx.Record = d.slice()
 	if d.bad() {
 		return TransactionReply{}, d.why
 	}

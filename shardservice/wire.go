@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"bytes"
 	"time"
 	"unicode/utf8"
 
@@ -43,10 +44,12 @@ const (
 	TransactionRetireCoordinator
 	TransactionReleaseParticipant
 	TransactionPrepareParticipant
+	TransactionScanCoordinator
+	TransactionReadParticipant
 )
 
 func (op TransactionOperation) valid() bool {
-	return op >= TransactionStageCoordinator && op <= TransactionPrepareParticipant
+	return op >= TransactionStageCoordinator && op <= TransactionReadParticipant
 }
 
 func (op TransactionOperation) stages() bool {
@@ -81,6 +84,16 @@ type TransactionReply struct {
 	Revision         uint64
 	CoordinatorState distributedtxn.CoordinatorState
 	ParticipantState distributedtxn.ParticipantState
+	// Record optionally carries the immutable coordinator stage record on lookup
+	// and scan replies so recovery can reconstruct the fixed participant set.
+	Record []byte
+}
+
+// Equal compares the fixed state and optional byte-native recovery record.
+func (r TransactionReply) Equal(other TransactionReply) bool {
+	return r.Role == other.Role && r.ID == other.ID && r.Revision == other.Revision &&
+		r.CoordinatorState == other.CoordinatorState &&
+		r.ParticipantState == other.ParticipantState && bytes.Equal(r.Record, other.Record)
 }
 
 // ReadPolicy selects the consistency contract a read is served under. The enum

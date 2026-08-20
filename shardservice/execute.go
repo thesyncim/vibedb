@@ -142,6 +142,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	}
 	if tx.Operation != TransactionLookupCoordinator &&
 		tx.Operation != TransactionLookupParticipant &&
+		tx.Operation != TransactionReadParticipant &&
+		tx.Operation != TransactionScanCoordinator &&
 		req.ExecutionMode != ExecutionReadWrite {
 		return NewErrorResponse(ErrorReadOnly,
 			"shardservice: a transaction mutation requires read-write execution authority")
@@ -180,13 +182,13 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		}
 		status, err = c.server.journal.StageParticipant(tx.Record)
 	case TransactionLookupCoordinator:
-		var ok bool
-		status, ok = c.server.journal.CoordinatorStatus(tx.ID)
-		if !ok {
-			err = distributedtxn.ErrJournalNotFound
-		}
+		return c.lookupCoordinator(tx.ID)
+	case TransactionScanCoordinator:
+		return c.scanCoordinator(tx.ID)
 	case TransactionLookupParticipant:
 		return c.lookupParticipant(tx.ID)
+	case TransactionReadParticipant:
+		return c.readParticipant(tx.ID)
 	case TransactionPrepareParticipant:
 		return c.prepareParticipant(req)
 	case TransactionApplyParticipant:
@@ -200,9 +202,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			tx.ID, tx.Revision, distributedtxn.CoordinatorAborted,
 		)
 	case TransactionAbortParticipant:
-		status, err = c.server.journal.TransitionParticipant(
-			tx.ID, tx.Revision, distributedtxn.ParticipantAborted,
-		)
+		status, err = c.server.journal.AbortParticipant(tx.ID, tx.Revision)
 	case TransactionReleaseParticipant:
 		status, err = c.server.journal.TransitionParticipant(
 			tx.ID, tx.Revision, distributedtxn.ParticipantReleased,
@@ -219,6 +219,30 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		return transactionError(err)
 	}
 	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) lookupCoordinator(id distributedtxn.ID) *ShardResponse {
+	status, ok := c.server.journal.CoordinatorStatus(id)
+	if !ok {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	record, err := c.server.journal.CoordinatorStage(id)
+	if err != nil {
+		return transactionError(err)
+	}
+	response := transactionStatusResponse(status)
+	response.Transaction.Record = record
+	return response
+}
+
+func (c *shardConn) scanCoordinator(after distributedtxn.ID) *ShardResponse {
+	status, record, ok := c.server.journal.NextCoordinator(after)
+	if !ok {
+		return CompletionResponse(0)
+	}
+	response := transactionStatusResponse(status)
+	response.Transaction.Record = record
+	return response
 }
 
 func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
@@ -250,6 +274,19 @@ func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
 		return resp
 	}
 	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) readParticipant(id distributedtxn.ID) *ShardResponse {
+	response := c.lookupParticipant(id)
+	if response.Kind == ResponseError {
+		return response
+	}
+	record, err := c.server.journal.ParticipantStage(id)
+	if err != nil {
+		return transactionError(err)
+	}
+	response.Transaction.Record = record
+	return response
 }
 
 func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {

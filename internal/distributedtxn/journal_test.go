@@ -167,6 +167,37 @@ func TestJournalRefusesConcurrentShardWideParticipants(t *testing.T) {
 	}
 }
 
+func TestJournalMissingParticipantAbortFencesLateStage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.vtj")
+	id := journalID(61)
+	j, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aborted, err := j.AbortParticipant(id, 1)
+	if err != nil || aborted.ParticipantState != ParticipantAborted || aborted.Revision != 2 {
+		t.Fatalf("abort tombstone = %+v, %v", aborted, err)
+	}
+	late := journalParticipant(t, id, []byte("late"))
+	if _, err := j.StageParticipant(late); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("late stage = %v, want ErrJournalConflict", err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if status, ok := j.ParticipantStatus(id); !ok || status.ParticipantState != ParticipantAborted {
+		t.Fatalf("recovered fence = %+v,%v", status, ok)
+	}
+	if _, err := j.StageParticipant(late); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("late stage after restart = %v, want ErrJournalConflict", err)
+	}
+}
+
 func TestJournalDropsTornFinalEntry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "transactions.vtj")
 	j, err := OpenJournal(path)
