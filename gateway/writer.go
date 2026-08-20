@@ -219,10 +219,10 @@ func (s *Snapshot) prepareGlobalIndexWrites(
 	}
 	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
 		metadata, _ := indexes.At(ordinal)
-		if !metadata.Global() || !metadata.Ready() {
+		if !metadata.Global() {
 			continue
 		}
-		program, err := s.CompileGlobalIndex(plan.table, metadata.Name)
+		program, err := s.compileGlobalIndex(plan.table, metadata.Name, false)
 		if err != nil {
 			return err
 		}

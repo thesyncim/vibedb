@@ -119,7 +119,7 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
 	if req.Transaction.Operation != TransactionNone {
-		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture {
+		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() {
 			return NewErrorResponse(ErrorMalformedRequest,
 				"shardservice: a transaction command cannot carry an index read envelope")
 		}
@@ -180,6 +180,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 	if req.MutationCapture {
 		return c.executeMutationCapture(req)
 	}
+	if req.DocumentScan.present() {
+		return c.executeDocumentScan(req)
+	}
 	return c.execute(req)
 }
 
@@ -191,7 +194,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
 	allowAccess := tx.Operation == TransactionAcquireReadFence
 	if req.SQL != "" || len(req.Params) != 0 || req.GlobalIndexLookup.present() ||
-		req.PrimaryKeyRead.present() || req.MutationCapture ||
+		req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() ||
 		(!allowAccess && len(req.AccessScopes) != 0) ||
 		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
@@ -319,7 +322,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 	lookup := req.GlobalIndexLookup
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" ||
-		len(req.Params) != 0 || req.PrimaryKeyRead.present() || !lookup.canonical() {
+		len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.MutationCapture ||
+		req.DocumentScan.present() || !lookup.canonical() {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: invalid global-index lookup request")
 	}
@@ -357,7 +361,7 @@ var errMutationCaptureLimit = errors.New("shardservice: mutation capture exceeds
 func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL == "" ||
 		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
-		!req.ReadFenceID.IsZero() || !req.MutationCapture {
+		req.DocumentScan.present() || !req.ReadFenceID.IsZero() || !req.MutationCapture {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: invalid mutation capture request")
 	}
@@ -409,6 +413,48 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 		{Name: "primary_key", TypeOID: pgOIDJSON},
 		{Name: "document", TypeOID: pgOIDJSON},
 	}, rows)
+}
+
+func (c *shardConn) executeDocumentScan(req *ShardRequest) *ShardResponse {
+	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" || len(req.Params) != 0 ||
+		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture ||
+		!req.ReadFenceID.IsZero() || !req.DocumentScan.canonical() ||
+		req.MaxRows == 0 || req.MaxResultBytes == 0 {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: invalid bounded document scan request")
+	}
+	maxRows, maxBytes := c.server.resultLimits(req)
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	capacity := maxRows
+	if capacity > 256 {
+		capacity = 256
+	}
+	rows := make([][]Cell, 0, capacity)
+	next, complete, err := c.sess.ScanDocumentsAfter(
+		ctx, byteview.String(req.DocumentScan.Relation), req.DocumentScan.After,
+		maxRows, maxBytes, func(key, document []byte) error {
+			rows = append(rows, []Cell{
+				{Bytes: append([]byte(nil), key...)},
+				{Bytes: append([]byte(nil), document...)},
+			})
+			return nil
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sqldriver.ErrDocumentScanPageTooSmall) {
+			return NewErrorResponse(ErrorResourceLimit, err.Error())
+		}
+		return classifyError(err)
+	}
+	resp := RowsResponse([]Column{
+		{Name: "primary_key", TypeOID: pgOIDJSON},
+		{Name: "document", TypeOID: pgOIDJSON},
+	}, rows)
+	resp.DocumentScan = DocumentScanReply{
+		Present: true, Complete: complete, Next: next,
+	}
+	return resp
 }
 
 func (c *shardConn) lookupCoordinator(id distributedtxn.ID) *ShardResponse {
@@ -645,6 +691,18 @@ func (c *shardConn) executeParticipantStatements(
 				return 0, transactionError(err)
 			}
 			guardPending = true
+			continue
+		}
+		if mutation.Kind == MutationPrimaryCheck {
+			if guardPending {
+				return 0, transactionError(ErrMutationBatch)
+			}
+			if err := c.sess.CheckPrimaryDocumentDigests(
+				ctx, mutation.Relation, mutation.PrimaryPath,
+				mutation.ExpectedKeys, mutation.ExpectedDigests,
+			); err != nil {
+				return 0, transactionError(err)
+			}
 			continue
 		}
 		if mutation.Kind != MutationSQL {

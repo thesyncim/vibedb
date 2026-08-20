@@ -14,6 +14,98 @@ import (
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
+var (
+	// ErrDocumentScanPageTooSmall reports a positive page budget that cannot
+	// hold even one key/document pair. Retrying with the returned cursor would
+	// make no progress, so the scan fails instead of looping.
+	ErrDocumentScanPageTooSmall = errors.New("vibedb: document scan page cannot hold its next row")
+	errDocumentScanPageFull     = errors.New("vibedb: document scan page is full")
+)
+
+// ScanDocumentsAfter visits a bounded page of canonical documents in native
+// primary-key order, starting strictly after the supplied cursor. It seeks the
+// durable primary graph directly and returns an owned resume key. Complete is
+// true only when the captured snapshot has no later row.
+func (s *Session) ScanDocumentsAfter(
+	ctx context.Context,
+	relation string,
+	after []byte,
+	maxRows int,
+	maxBytes int64,
+	visit func(key, document []byte) error,
+) (next []byte, complete bool, err error) {
+	if err := s.ready(ctx); err != nil {
+		return nil, false, err
+	}
+	if s.state != SessionIdle || s.conn.tx != nil {
+		return nil, false, s.fail(ErrTransactionActive)
+	}
+	if relation == "" || maxRows <= 0 || maxBytes <= 0 || visit == nil {
+		return nil, false, s.fail(errors.New("vibedb: invalid bounded document scan"))
+	}
+	d := s.conn.db
+	if err := lockContext(ctx, &d.mu); err != nil {
+		return nil, false, s.fail(err)
+	}
+	if d.closed {
+		d.mu.Unlock()
+		return nil, false, s.fail(sqldriver.ErrBadConn)
+	}
+	if err := d.settleCatalogLocked(); err != nil {
+		d.mu.Unlock()
+		return nil, false, s.fail(err)
+	}
+	t, ok := d.tables[relation]
+	if !ok {
+		d.mu.Unlock()
+		return nil, false, s.fail(fmt.Errorf("%w: %q", ErrTableNotFound, relation))
+	}
+	if t.collection == nil {
+		d.mu.Unlock()
+		return nil, true, nil
+	}
+	snapshot, err := t.collection.Snapshot()
+	d.mu.Unlock()
+	if err != nil {
+		return nil, false, s.fail(err)
+	}
+	defer func() {
+		err = errors.Join(err, snapshot.Close())
+		if err != nil {
+			err = s.fail(err)
+		}
+	}()
+	ctx = withCooperativeCancellation(ctx, s.conn.exec.Options.Cancel)
+	rows := 0
+	var retained int64
+	err = snapshot.RangeAfterRaw(after, func(key, document []byte) error {
+		if err := contextCheckpoint(ctx); err != nil {
+			return err
+		}
+		rowBytes := int64(len(key) + len(document))
+		if rows >= maxRows || rowBytes > maxBytes-retained {
+			if rows == 0 {
+				return ErrDocumentScanPageTooSmall
+			}
+			return errDocumentScanPageFull
+		}
+		if err := visit(key, document); err != nil {
+			return err
+		}
+		next = append(next[:0], key...)
+		rows++
+		retained += rowBytes
+		return nil
+	})
+	if errors.Is(err, errDocumentScanPageFull) {
+		return next, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return next, true, nil
+}
+
 // CaptureMutationInto visits the exact primary keys and current documents an
 // UPDATE or DELETE would target without publishing the mutation. Selection is
 // performed by the same lowered DML statement as Exec, including its WHERE,
@@ -36,6 +128,9 @@ func (p *Prepared) CaptureMutationInto(
 	}
 	if err := p.session.ready(ctx); err != nil {
 		return p.fail(err)
+	}
+	if p.session.state != SessionIdle || p.session.conn.tx != nil {
+		return p.fail(ErrTransactionActive)
 	}
 	if err := p.statement.checkArgumentCount(len(values)); err != nil {
 		return p.fail(err)
@@ -181,6 +276,35 @@ func (s *Session) ValidatePrimaryDocumentDigests(
 	keys [][]byte,
 	digests [][sha256.Size]byte,
 ) error {
+	return s.validatePrimaryDocumentDigests(
+		ctx, relation, primaryPath, keys, digests, true,
+	)
+}
+
+// CheckPrimaryDocumentDigests retains the same serializable point
+// dependencies as ValidatePrimaryDocumentDigests without arming a following
+// SQL mutation guard. Online backfill uses it as the base participant of a
+// compare-and-put transaction.
+func (s *Session) CheckPrimaryDocumentDigests(
+	ctx context.Context,
+	relation string,
+	primaryPath []byte,
+	keys [][]byte,
+	digests [][sha256.Size]byte,
+) error {
+	return s.validatePrimaryDocumentDigests(
+		ctx, relation, primaryPath, keys, digests, false,
+	)
+}
+
+func (s *Session) validatePrimaryDocumentDigests(
+	ctx context.Context,
+	relation string,
+	primaryPath []byte,
+	keys [][]byte,
+	digests [][sha256.Size]byte,
+	installGuard bool,
+) error {
 	if err := s.ready(ctx); err != nil {
 		return err
 	}
@@ -200,9 +324,13 @@ func (s *Session) ValidatePrimaryDocumentDigests(
 		len(keys) != len(digests) || tx.primaryMutationGuard != nil {
 		return s.fail(ErrDistributedTransactionConflict)
 	}
-	guard := &primaryMutationGuard{relation: relation, keys: make([]string, len(keys))}
+	var guard *primaryMutationGuard
+	if installGuard {
+		guard = &primaryMutationGuard{relation: relation, keys: make([]string, len(keys))}
+	}
 	scratch := s.conn.pointRaw[:0]
 	defer func() { s.conn.pointRaw = scratch[:0] }()
+	previous := ""
 	for i := range keys {
 		if err := contextCheckpoint(ctx); err != nil {
 			return s.fail(err)
@@ -211,10 +339,13 @@ func (s *Session) ValidatePrimaryDocumentDigests(
 			return s.fail(ErrDistributedTransactionConflict)
 		}
 		key := byteview.String(keys[i])
-		if i != 0 && guard.keys[i-1] >= key {
+		if i != 0 && previous >= key {
 			return s.fail(ErrDistributedTransactionConflict)
 		}
-		guard.keys[i] = key
+		previous = key
+		if installGuard {
+			guard.keys[i] = key
+		}
 		tx.trackSerializablePointRead(state, key)
 		var found bool
 		var err error
@@ -226,6 +357,8 @@ func (s *Session) ValidatePrimaryDocumentDigests(
 			return s.fail(ErrDistributedTransactionConflict)
 		}
 	}
-	tx.primaryMutationGuard = guard
+	if installGuard {
+		tx.primaryMutationGuard = guard
+	}
 	return nil
 }

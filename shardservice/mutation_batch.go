@@ -24,10 +24,11 @@ const (
 	MutationGlobalIndexPut
 	MutationGlobalIndexDelete
 	MutationPrimaryPrecondition
+	MutationPrimaryCheck
 )
 
 func (k MutationKind) valid() bool {
-	return k >= MutationSQL && k <= MutationPrimaryPrecondition
+	return k >= MutationSQL && k <= MutationPrimaryCheck
 }
 
 // MutationStatement is one non-row-returning mutation inside a shard-local
@@ -113,7 +114,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 			}
 			continue
 		}
-		if statement.Kind == MutationPrimaryPrecondition {
+		if statement.Kind == MutationPrimaryPrecondition || statement.Kind == MutationPrimaryCheck {
 			if statement.SQL != "" || len(statement.Params) != 0 ||
 				statement.Relation == "" || len(statement.Relation) > maxMutationRelationBytes ||
 				!utf8.ValidString(statement.Relation) || statement.IndexID != 0 ||
@@ -185,7 +186,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statements)))
 	for i := range statements {
 		statement := &statements[i]
-		if statement.Kind == MutationPrimaryPrecondition {
+		if statement.Kind == MutationPrimaryPrecondition || statement.Kind == MutationPrimaryCheck {
 			dst = binary.LittleEndian.AppendUint32(dst, 0)
 			dst = append(dst, byte(statement.Kind), 0, 0, 0)
 			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Relation)))
@@ -294,7 +295,8 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 		if len(b.body) < 5 {
 			return MutationStatement{}, ErrMutationBatch
 		}
-		if MutationKind(b.body[4]) == MutationPrimaryPrecondition {
+		if MutationKind(b.body[4]) == MutationPrimaryPrecondition ||
+			MutationKind(b.body[4]) == MutationPrimaryCheck {
 			return b.nextPrimaryPrecondition(materialize)
 		}
 		return b.nextGlobalIndex()
@@ -350,7 +352,8 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 func (b *MutationBatch) nextPrimaryPrecondition(materialize bool) (MutationStatement, error) {
 	rest := b.body[4:]
 	if len(rest) < primaryConditionFixedBytes-4 ||
-		rest[0] != byte(MutationPrimaryPrecondition) || rest[1] != 0 || rest[2] != 0 || rest[3] != 0 {
+		(MutationKind(rest[0]) != MutationPrimaryPrecondition && MutationKind(rest[0]) != MutationPrimaryCheck) ||
+		rest[1] != 0 || rest[2] != 0 || rest[3] != 0 {
 		return MutationStatement{}, ErrMutationBatch
 	}
 	rest = rest[4:]
@@ -369,7 +372,7 @@ func (b *MutationBatch) nextPrimaryPrecondition(materialize bool) (MutationState
 		return MutationStatement{}, ErrMutationBatch
 	}
 	statement := MutationStatement{
-		Kind: MutationPrimaryPrecondition, Relation: byteview.String(relation), PrimaryPath: primaryPath,
+		Kind: MutationKind(b.body[4]), Relation: byteview.String(relation), PrimaryPath: primaryPath,
 	}
 	if materialize {
 		statement.ExpectedKeys = make([][]byte, int(count))

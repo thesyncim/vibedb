@@ -512,6 +512,36 @@ func TestGlobalNonUniqueEntryKeyIncludesLocator(t *testing.T) {
 	}
 }
 
+func TestGlobalIndexBuildAndDrainLifecyclesStayWriteMaintained(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	for _, lifecycle := range []IndexLifecycle{
+		IndexBuilding, IndexCatchingUp, IndexDraining,
+	} {
+		descriptor := testGlobalIndexDescriptor()
+		descriptor.Lifecycle = lifecycle
+		snapshot, err := NewSnapshotWithIndexes(
+			config, endpoints, uint64(lifecycle), []IndexDescriptor{descriptor},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := snapshot.CompileGlobalIndex("messages", "by_email"); !errors.Is(err, ErrIndexNotReady) {
+			t.Fatalf("%v read compiler = %v", lifecycle, err)
+		}
+		prepared, err := snapshot.Prepare(context.Background(),
+			`INSERT INTO messages (tenant_id, id, email) VALUES (?, ?, ?)`)
+		if err != nil {
+			t.Fatalf("%v prepare: %v", lifecycle, err)
+		}
+		bound, err := prepared.BindWrite([]any{
+			[]byte("tenant"), []byte("message"), []byte("a@example.com"),
+		})
+		if err != nil || len(bound.globalIndexes) != 1 {
+			t.Fatalf("%v maintained mutations = %d, %v", lifecycle, len(bound.globalIndexes), err)
+		}
+	}
+}
+
 func BenchmarkGlobalIndexRouteDocument(b *testing.B) {
 	config, endpoints := globalIndexCatalog(b)
 	snapshot, err := NewSnapshotWithIndexes(

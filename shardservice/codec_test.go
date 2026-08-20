@@ -169,6 +169,17 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "document_scan",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				MaxRows: 128, MaxResultBytes: 1 << 20,
+				DocumentScan: DocumentScanRequest{
+					Relation: []byte("messages"), After: []byte{1, 'a'},
+				},
+			},
+		},
+		{
 			name: "stage_participant",
 			req: &ShardRequest{
 				Distribution: "tenant_data", Shard: "40-80",
@@ -252,6 +263,10 @@ func TestRequestRoundTrip(t *testing.T) {
 			if got.MutationCapture != tc.req.MutationCapture {
 				t.Errorf("MutationCapture = %v, want %v", got.MutationCapture, tc.req.MutationCapture)
 			}
+			if !bytes.Equal(got.DocumentScan.Relation, tc.req.DocumentScan.Relation) ||
+				!bytes.Equal(got.DocumentScan.After, tc.req.DocumentScan.After) {
+				t.Errorf("DocumentScan = %+v, want %+v", got.DocumentScan, tc.req.DocumentScan)
+			}
 		})
 	}
 }
@@ -275,6 +290,19 @@ func TestResponseRoundTrip(t *testing.T) {
 		{
 			name: "rows_empty",
 			resp: RowsResponse([]Column{{Name: "n", TypeOID: 20}}, nil),
+		},
+		{
+			name: "document_scan_page",
+			resp: func() *ShardResponse {
+				resp := RowsResponse(
+					[]Column{{Name: "primary_key"}, {Name: "document"}},
+					[][]Cell{{{Bytes: []byte{1, 'a'}}, {Bytes: []byte(`{"id":"a"}`)}}},
+				)
+				resp.DocumentScan = DocumentScanReply{
+					Present: true, Next: []byte{1, 'a'},
+				}
+				return resp
+			}(),
 		},
 		{
 			name: "completion",
@@ -323,6 +351,11 @@ func TestResponseRoundTrip(t *testing.T) {
 			}
 			if !got.Transaction.Equal(tc.resp.Transaction) {
 				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.resp.Transaction)
+			}
+			if got.DocumentScan.Present != tc.resp.DocumentScan.Present ||
+				got.DocumentScan.Complete != tc.resp.DocumentScan.Complete ||
+				!bytes.Equal(got.DocumentScan.Next, tc.resp.DocumentScan.Next) {
+				t.Errorf("DocumentScan = %+v, want %+v", got.DocumentScan, tc.resp.DocumentScan)
 			}
 		})
 	}
@@ -765,6 +798,15 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadMutationCapture,
+		},
+		{
+			name: "document_scan_requires_explicit_bounds",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					DocumentScan: DocumentScanRequest{Relation: []byte("messages")},
+				})
+			},
+			want: errBadDocumentScan,
 		},
 		{
 			name: "row_arity_mismatch",

@@ -999,6 +999,46 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	}
 }
 
+func TestFileSnapshotRangeAfterRawSeeksExclusiveCursor(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-fs-range-after-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	collection, err := Create(file, testFileStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collection.Close()
+	for _, key := range []string{"a", "c", "e", "g"} {
+		if _, err := collection.Put([]byte(key), []byte(`{"id":"`+key+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	for _, tc := range []struct {
+		after string
+		want  string
+	}{
+		{"", "a,c,e,g"}, {"c", "e,g"}, {"d", "e,g"}, {"g", ""},
+	} {
+		var keys []string
+		if err := snapshot.RangeAfterRaw([]byte(tc.after), func(key, _ []byte) error {
+			keys = append(keys, string(key))
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(keys, ","); got != tc.want {
+			t.Fatalf("RangeAfterRaw(%q) = %q, want %q", tc.after, got, tc.want)
+		}
+	}
+}
+
 func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-index-alloc-*")
 	if err != nil {

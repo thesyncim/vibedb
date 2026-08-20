@@ -95,6 +95,24 @@ type PrimaryKeyReadRequest struct {
 	Keys        [][]byte
 }
 
+// DocumentScanRequest is a resumable raw base-table scan for online index
+// build/export workers. After is an exclusive native-primary cursor. The zero
+// value is absent; slices borrow the request frame.
+type DocumentScanRequest struct {
+	Relation []byte
+	After    []byte
+}
+
+func (r DocumentScanRequest) present() bool { return len(r.Relation) != 0 }
+
+func (r DocumentScanRequest) canonical() bool {
+	if !r.present() {
+		return len(r.After) == 0
+	}
+	return len(r.Relation) <= 1<<16-1 && utf8.Valid(r.Relation) &&
+		bytes.IndexByte(r.Relation, 0) < 0 && len(r.After) <= maxFrameBody
+}
+
 func (r PrimaryKeyReadRequest) present() bool {
 	return len(r.PrimaryPath) != 0 || len(r.Keys) != 0
 }
@@ -409,6 +427,9 @@ type ShardRequest struct {
 	// and returns native primary keys plus canonical old documents. It is a
 	// read-only, single-shard precursor to optimistic indexed maintenance.
 	MutationCapture bool
+	// DocumentScan selects the bounded raw scan lane. MaxRows and
+	// MaxResultBytes are its mandatory page bounds.
+	DocumentScan DocumentScanRequest
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
@@ -584,9 +605,28 @@ type ShardResponse struct {
 	HasReadPosition bool
 	ReadPosition    Position
 
+	// DocumentScan is present only on a successful raw scan page.
+	DocumentScan DocumentScanReply
+
 	// Transaction is present only on a successful transaction command. Its zero
 	// value preserves the ordinary response encoding.
 	Transaction TransactionReply
+}
+
+// DocumentScanReply carries an owned exclusive resume cursor. Complete is true
+// only when the shard snapshot had no later row. Present distinguishes an
+// empty completed relation from the absent zero value.
+type DocumentScanReply struct {
+	Present  bool
+	Complete bool
+	Next     []byte
+}
+
+func (r DocumentScanReply) canonical() bool {
+	if !r.Present {
+		return !r.Complete && len(r.Next) == 0
+	}
+	return len(r.Next) <= maxFrameBody && (r.Complete || len(r.Next) != 0)
 }
 
 // RowsResponse builds a ResponseRows reply over columns and rows.

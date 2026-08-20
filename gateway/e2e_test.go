@@ -859,7 +859,7 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 	for i := range indexShards {
 		endpoints[indexShards[i].endpoint] = indexShards[i].address
 	}
-	snapshot, err := NewSnapshotWithIndexes(distribution.ClusterConfig{
+	clusterConfig := distribution.ClusterConfig{
 		Distributions: []distribution.DistributionSpec{
 			{Name: c.dist, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
 			{Name: indexDistribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
@@ -869,17 +869,22 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 			{Table: "messages_by_n", Distribution: indexDistribution, Columns: []string{"/n"}},
 		},
 		Manifests: []*distribution.Manifest{c.man, indexManifest},
-	}, endpoints, 2, []IndexDescriptor{{
+	}
+	descriptor := IndexDescriptor{
 		IndexID: 91, Incarnation: 1, Table: "messages", Name: "by_n",
 		Relation: "messages_by_n", Paths: []string{"/n"},
 		LocatorPaths: []string{"/tenant_id"},
 		PrimaryPath:  "/tenant_id",
-		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
-	}})
+		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexBuilding,
+	}
+	snapshot, err := NewSnapshotWithIndexes(
+		clusterConfig, endpoints, 2, []IndexDescriptor{descriptor},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{})
+	holder := NewCatalogHolder(snapshot)
+	executor := NewExecutor(c.client, holder, Options{})
 	baseKey := c.freshKeysForShard(t, c.shards[1].id, 1)[0]
 	result, err := executor.Exec(context.Background(), Query{
 		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
@@ -896,6 +901,47 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 		t.Fatalf("indexed insert result = %+v", result)
 	}
 	c.verifyInserted(t, baseKey, 777)
+
+	tasks, err := snapshot.PlanGlobalIndexBackfill("messages", "by_n")
+	if err != nil || len(tasks) != len(c.shards) {
+		t.Fatalf("plan global backfill = %d tasks, %v", len(tasks), err)
+	}
+	backfilled := 0
+	for i := range tasks {
+		for {
+			page, pageErr := executor.RunGlobalIndexBackfillTask(
+				context.Background(), tasks[i], 1, 1<<20,
+			)
+			if pageErr != nil {
+				t.Fatalf("backfill %s after %x: %v", tasks[i].BaseShard, tasks[i].After, pageErr)
+			}
+			backfilled += page.Rows
+			tasks[i].After = page.Next
+			if page.Complete {
+				break
+			}
+		}
+	}
+	if backfilled != 9 {
+		t.Fatalf("backfilled rows = %d, want 9", backfilled)
+	}
+	descriptor.Lifecycle = IndexReady
+	readySnapshot, err := NewSnapshotWithIndexes(
+		clusterConfig, endpoints, 3, []IndexDescriptor{descriptor},
+	)
+	if err != nil || !holder.PublishNewer(readySnapshot) {
+		t.Fatalf("publish ready global index = %v", err)
+	}
+	snapshot = readySnapshot
+	historicalRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("1")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(historicalRead.Rows) != 1 ||
+		string(historicalRead.Rows[0][0].Bytes) != `"`+c.shards[0].keys[0]+`"` {
+		t.Fatalf("historical row after online backfill = %+v, %v", historicalRead, err)
+	}
 
 	foundLocator := false
 	for i := range indexShards {

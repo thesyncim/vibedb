@@ -487,6 +487,53 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	return s.rangePrimaryGraphBuffer(nil, nil, nil, scratch, fn)
 }
 
+// RangeAfterRaw visits live rows whose key is strictly greater than after, in
+// the same lexical order as RangeRaw. The primary graph seeks directly to the
+// supplied floor; only an exact key equal to after is skipped. This is the
+// resumable scan primitive used by online backfill and export workers.
+func (s *Snapshot) RangeAfterRaw(
+	after []byte,
+	fn func(key, value []byte) error,
+) error {
+	if s == nil || s.collection == nil || s.state == nil {
+		return ErrClosed
+	}
+	if fn == nil {
+		return nil
+	}
+	if len(after) == 0 {
+		return s.RangeRaw(fn)
+	}
+	return s.rangePrimaryGraph(after, nil, nil, func(key, value []byte) error {
+		if bytes.Equal(key, after) {
+			return nil
+		}
+		return fn(key, value)
+	})
+}
+
+// RangeAfterRawBuffer is RangeAfterRaw with caller-owned overflow storage.
+func (s *Snapshot) RangeAfterRawBuffer(
+	after, scratch []byte,
+	fn func(key, value []byte) error,
+) ([]byte, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return scratch, ErrClosed
+	}
+	if fn == nil {
+		return scratch, nil
+	}
+	if len(after) == 0 {
+		return s.RangeRawBuffer(scratch, fn)
+	}
+	return s.rangePrimaryGraphBuffer(after, nil, nil, scratch, func(key, value []byte) error {
+		if bytes.Equal(key, after) {
+			return nil
+		}
+		return fn(key, value)
+	})
+}
+
 // RangePrefixRaw visits only live rows whose bytewise key starts with prefix,
 // in the same lexical order as RangeRaw. The primary graph seeks directly to
 // the prefix floor and stops at its lexical successor; it never filters a full

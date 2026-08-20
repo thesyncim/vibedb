@@ -126,6 +126,20 @@ func TestMutationBatchPrimaryPreconditionRoundTrip(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("empty-set precondition: %v", err)
 	}
+	checkRaw, err := AppendMutationBatch(nil, []MutationStatement{{
+		Kind: MutationPrimaryCheck, Relation: "docs", PrimaryPath: []byte("/id"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkBatch, err := OpenMutationBatch(checkRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check, ok, err := checkBatch.Next()
+	if err != nil || !ok || check.Kind != MutationPrimaryCheck {
+		t.Fatalf("primary check = %+v,%v,%v", check, ok, err)
+	}
 }
 
 func BenchmarkMutationBatchOpen(b *testing.B) {

@@ -97,6 +97,17 @@ type globalIndexOwner struct {
 // its compiled vibejson programs. Catalog publication fences ID, incarnation,
 // relation placement, and every key/locator path.
 func (s *Snapshot) CompileGlobalIndex(table, name string) (GlobalIndexProgram, error) {
+	return s.compileGlobalIndex(table, name, true)
+}
+
+// compileGlobalIndex also serves the write-maintenance lane for non-Ready
+// lifecycle states. Building/CatchingUp must receive every new mutation before
+// backfill starts, and Draining must remain current until all older Ready plans
+// have left the system. Only the public read compiler requires Ready.
+func (s *Snapshot) compileGlobalIndex(
+	table, name string,
+	requireReady bool,
+) (GlobalIndexProgram, error) {
 	if s == nil {
 		return GlobalIndexProgram{}, ErrNoCatalog
 	}
@@ -104,7 +115,7 @@ func (s *Snapshot) CompileGlobalIndex(table, name string) (GlobalIndexProgram, e
 	if !ok {
 		return GlobalIndexProgram{}, ErrIndexNotFound
 	}
-	if !metadata.Ready() {
+	if requireReady && !metadata.Ready() {
 		return GlobalIndexProgram{}, ErrIndexNotReady
 	}
 	if !metadata.Global() {
