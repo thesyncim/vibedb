@@ -72,7 +72,7 @@ func newPlacementBinding(cfg distribution.ClusterConfig, table string) (*placeme
 		}
 		pointers[i] = p
 	}
-	native := distribution.NewNativeMapper(spec.Arity)
+	native := distribution.NewNativeMapperWithBucketBits(spec.Arity, spec.EffectiveBucketBits())
 	return &placementBinding{
 		placement: placement,
 		spec:      spec,

@@ -1,6 +1,9 @@
 package distribution
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // DistributionSpec is the immutable identity of a logical keyspace: its name,
 // the shard-key column count (arity), and the frozen mapper revision routing it.
@@ -8,6 +11,17 @@ type DistributionSpec struct {
 	Name          DistributionName
 	Arity         int
 	MapperVersion MapperVersion
+	// BucketBits is the high-bit width of the virtual bucket space. Zero selects
+	// DefaultVirtualBucketBits; an explicit value is immutable placement identity.
+	BucketBits uint8
+}
+
+// EffectiveBucketBits returns the virtual-bucket width used by the mapper.
+func (s DistributionSpec) EffectiveBucketBits() uint8 {
+	if s.BucketBits == 0 {
+		return DefaultVirtualBucketBits
+	}
+	return s.BucketBits
 }
 
 // TablePlacement binds a table to a distribution over an ordered shard-key
@@ -17,6 +31,13 @@ type TablePlacement struct {
 	Table        string
 	Distribution DistributionName
 	Columns      []string
+	// TenantPath marks a tenant-scoped table. It must be one placement column,
+	// but never the only column: tenant identity cannot be the physical shard key.
+	TenantPath string
+	// AffinityGroup explicitly names tables intended to share placement tuples
+	// for colocated joins and transactions. Empty retains the distribution-wide
+	// legacy colocation contract.
+	AffinityGroup string
 }
 
 // ClusterConfig is the static placement metadata a local cluster facade
@@ -50,6 +71,9 @@ func (c ClusterConfig) Validate() error {
 		if spec.Arity < 1 || spec.Arity > KeyspaceWidth {
 			return &PlacementError{Reason: "distribution " + string(spec.Name) + " has arity " + strconv.Itoa(spec.Arity) + " outside 1.." + strconv.Itoa(KeyspaceWidth)}
 		}
+		if bits := spec.BucketBits; bits != 0 && !ValidVirtualBucketBits(bits) {
+			return &PlacementError{Reason: "distribution " + string(spec.Name) + " has virtual bucket bits " + strconv.Itoa(int(bits)) + " outside " + strconv.Itoa(int(MinVirtualBucketBits)) + ".." + strconv.Itoa(int(MaxVirtualBucketBits))}
+		}
 		specs[spec.Name] = spec
 	}
 
@@ -65,6 +89,20 @@ func (c ClusterConfig) Validate() error {
 		if _, dup := manifests[d]; dup {
 			return &PlacementError{Reason: "more than one manifest for distribution " + string(d)}
 		}
+		// Explicit bucket metadata requires physical ownership boundaries to be
+		// whole-bucket boundaries. Zero-valued metadata remains loadable while
+		// being interpreted by the mapper with the current default.
+		if spec := specs[d]; spec.BucketBits != 0 {
+			for i := 0; i < m.ShardCount(); i++ {
+				shard, _ := m.ShardMetadataAt(i)
+				if !VirtualBucketBoundary(shard.Range.Start, spec.BucketBits) {
+					return &PlacementError{Reason: "distribution " + string(d) + " shard " + string(shard.ID) + " starts inside a virtual bucket"}
+				}
+				if !shard.Range.End.Max && !VirtualBucketBoundary(shard.Range.End.Point, spec.BucketBits) {
+					return &PlacementError{Reason: "distribution " + string(d) + " shard " + string(shard.ID) + " ends inside a virtual bucket"}
+				}
+			}
+		}
 		manifests[d] = struct{}{}
 	}
 	for _, spec := range c.Distributions {
@@ -74,6 +112,11 @@ func (c ClusterConfig) Validate() error {
 	}
 
 	tables := make(map[string]struct{}, len(c.Placements))
+	type affinityIdentity struct {
+		distribution  DistributionName
+		tenantOrdinal int
+	}
+	affinity := make(map[string]affinityIdentity)
 	for _, p := range c.Placements {
 		if p.Table == "" {
 			return &PlacementError{Reason: "table placement has an empty table name"}
@@ -90,7 +133,8 @@ func (c ClusterConfig) Validate() error {
 			return &PlacementError{Reason: "table " + p.Table + " has " + strconv.Itoa(len(p.Columns)) + " shard-key columns but distribution " + string(spec.Name) + " has arity " + strconv.Itoa(spec.Arity)}
 		}
 		seen := make(map[string]struct{}, len(p.Columns))
-		for _, col := range p.Columns {
+		tenantOrdinal := -1
+		for ordinal, col := range p.Columns {
 			if col == "" {
 				return &PlacementError{Reason: "table " + p.Table + " has an empty shard-key column"}
 			}
@@ -98,6 +142,27 @@ func (c ClusterConfig) Validate() error {
 				return &PlacementError{Reason: "table " + p.Table + " repeats shard-key column " + col}
 			}
 			seen[col] = struct{}{}
+			if col == p.TenantPath {
+				tenantOrdinal = ordinal
+			}
+		}
+		if p.TenantPath != "" {
+			if tenantOrdinal < 0 {
+				return &PlacementError{Reason: "table " + p.Table + " tenant path is not part of its placement tuple"}
+			}
+			if len(p.Columns) < 2 {
+				return &PlacementError{Reason: "table " + p.Table + " uses tenant identity as its complete physical shard key"}
+			}
+		}
+		if p.AffinityGroup != "" {
+			if len(p.AffinityGroup) > 128 || strings.TrimSpace(p.AffinityGroup) != p.AffinityGroup || strings.IndexByte(p.AffinityGroup, 0) >= 0 {
+				return &PlacementError{Reason: "table " + p.Table + " has an invalid affinity group"}
+			}
+			identity := affinityIdentity{distribution: p.Distribution, tenantOrdinal: tenantOrdinal}
+			if prior, exists := affinity[p.AffinityGroup]; exists && prior != identity {
+				return &PlacementError{Reason: "affinity group " + p.AffinityGroup + " has inconsistent distribution or tenant ordinal"}
+			}
+			affinity[p.AffinityGroup] = identity
 		}
 	}
 	return nil

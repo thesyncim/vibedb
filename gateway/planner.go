@@ -253,6 +253,15 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 				cause: ErrDistributedPlanUnsupported,
 			}
 		}
+		if (placement.AffinityGroup != "" || joined.AffinityGroup != "") &&
+			joined.AffinityGroup != placement.AffinityGroup {
+			return nil, &PlanError{
+				Table: relation.Name,
+				Reason: fmt.Sprintf("affinity group %q is not colocated with %q",
+					joined.AffinityGroup, placement.AffinityGroup),
+				cause: ErrDistributedPlanUnsupported,
+			}
+		}
 		plan.tables = append(plan.tables, relation.Name)
 		placements[i] = joined
 		if relation.Join != sqlast.JoinInner && relation.Join != sqlast.JoinLeft {

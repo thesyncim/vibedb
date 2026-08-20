@@ -315,7 +315,7 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
 		return nil, 0, ScatterNone, &CatalogError{Reason: "distributed write plan does not belong to the pinned catalog generation"}
 	}
-	mapper := distribution.NewNativeMapper(bound.spec.Arity)
+	mapper := distribution.NewNativeMapperWithBucketBits(bound.spec.Arity, bound.spec.EffectiveBucketBits())
 	var (
 		targets []distribution.Target
 		route   distribution.Route

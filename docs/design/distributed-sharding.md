@@ -15,7 +15,7 @@ shard.
 
 | Component | Current responsibility |
 | --- | --- |
-| `distribution` | Canonical placement scalars, tuple encoding, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
+| `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol |
 | `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out and result merging, and colocated single-shard writes |
@@ -44,6 +44,22 @@ The gateway catalog is supplied externally as an immutable snapshot. The
 gateway can validate, inspect, load, pin, and reload a strictly newer catalog;
 the repository does not provide a complete topology service or workflow
 controller.
+
+## Placement and tenant boundary
+
+The current native mapper hashes the complete canonical placement tuple into a
+20-bit virtual bucket and routes the bucket through the immutable manifest.
+Explicit bucket metadata requires bucket-aligned shard boundaries and exposes
+allocation-free bucket-interval ownership for future movement. A tenant-scoped
+placement marks `TenantPath`; validation rejects a tuple containing only that
+path, so tenant identity cannot become the complete physical shard key. Tables
+may name an affinity group when equal placement ordinals are intended to be
+colocated.
+
+Because the full tuple is hashed, a predicate binding only `TenantPath` cannot
+predict the remaining locality key and routes as a scatter. A full placement
+tuple routes to one bucket. Tenant-only access becomes narrow through an index,
+not through a false assumption that one tenant belongs to one shard.
 
 ## Store initialization and local fencing
 

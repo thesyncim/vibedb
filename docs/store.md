@@ -658,7 +658,10 @@ are not a distributed lease, election, or copied-store revocation mechanism.
 
 The current component inventory, initialization commands, supported query
 shapes, and explicit HA/resharding exclusions are maintained in the
-[distributed server boundary](design/distributed-sharding.md). The PostgreSQL
+[distributed server boundary](design/distributed-sharding.md). Its current
+placement mapper hashes a full locality tuple into tenant-independent virtual
+buckets; tenant-scoped metadata refuses tenant identity as the complete shard
+key. The PostgreSQL
 protocol-v3 server is a separate embedded SQL endpoint. It supports the
 documented DDL, DML, SELECT, prepared-statement, join, and transaction subset,
 including multi-table commits and savepoints, but does not provide general

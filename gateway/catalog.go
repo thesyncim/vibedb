@@ -502,7 +502,7 @@ func cloneConfig(c distribution.ClusterConfig) distribution.ClusterConfig {
 		columnCount += len(c.Placements[i].Columns)
 	}
 	columnArena := make([]string, columnCount)
-	interned := make(map[string]string, len(c.Distributions)+columnCount)
+	interned := make(map[string]string, len(c.Distributions)+len(c.Placements)+columnCount)
 	intern := func(value string) string {
 		if canonical, ok := interned[value]; ok {
 			return canonical
@@ -526,6 +526,12 @@ func cloneConfig(c distribution.ClusterConfig) distribution.ClusterConfig {
 		for i, p := range c.Placements {
 			p.Table = intern(p.Table)
 			p.Distribution = distribution.DistributionName(intern(string(p.Distribution)))
+			if p.TenantPath != "" {
+				p.TenantPath = intern(p.TenantPath)
+			}
+			if p.AffinityGroup != "" {
+				p.AffinityGroup = intern(p.AffinityGroup)
+			}
 			start := columnOffset
 			for _, column := range p.Columns {
 				columnArena[columnOffset] = intern(column)
@@ -639,12 +645,15 @@ type persistedDistribution struct {
 	Name          string `json:"name"`
 	Arity         int    `json:"arity"`
 	MapperVersion uint32 `json:"mapper_version"`
+	BucketBits    uint8  `json:"bucket_bits,omitempty"`
 }
 
 type persistedPlacement struct {
-	Table        string   `json:"table"`
-	Distribution string   `json:"distribution"`
-	Columns      []string `json:"columns"`
+	Table         string   `json:"table"`
+	Distribution  string   `json:"distribution"`
+	Columns       []string `json:"columns"`
+	TenantPath    string   `json:"tenant_path,omitempty"`
+	AffinityGroup string   `json:"affinity_group,omitempty"`
 }
 
 type persistedIndex struct {
@@ -700,11 +709,13 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	for _, d := range s.config.Distributions {
 		pc.Distributions = append(pc.Distributions, persistedDistribution{
 			Name: string(d.Name), Arity: d.Arity, MapperVersion: uint32(d.MapperVersion),
+			BucketBits: d.BucketBits,
 		})
 	}
 	for _, p := range s.config.Placements {
 		pc.Placements = append(pc.Placements, persistedPlacement{
 			Table: p.Table, Distribution: string(p.Distribution), Columns: p.Columns,
+			TenantPath: p.TenantPath, AffinityGroup: p.AffinityGroup,
 		})
 	}
 	for tableOrdinal := range s.plannerIndexSpans {
@@ -1155,13 +1166,16 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 			Name:          distribution.DistributionName(d.Name),
 			Arity:         d.Arity,
 			MapperVersion: distribution.MapperVersion(d.MapperVersion),
+			BucketBits:    d.BucketBits,
 		})
 	}
 	for _, p := range pc.Placements {
 		config.Placements = append(config.Placements, distribution.TablePlacement{
-			Table:        p.Table,
-			Distribution: distribution.DistributionName(p.Distribution),
-			Columns:      slices.Clone(p.Columns),
+			Table:         p.Table,
+			Distribution:  distribution.DistributionName(p.Distribution),
+			Columns:       slices.Clone(p.Columns),
+			TenantPath:    p.TenantPath,
+			AffinityGroup: p.AffinityGroup,
 		})
 	}
 	for _, pm := range pc.Manifests {

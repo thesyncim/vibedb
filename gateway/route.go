@@ -74,7 +74,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
 		return nil, &CatalogError{Reason: "distributed plan does not belong to the pinned catalog generation"}
 	}
-	mapper := distribution.NewNativeMapper(bound.spec.Arity)
+	mapper := distribution.NewNativeMapperWithBucketBits(bound.spec.Arity, bound.spec.EffectiveBucketBits())
 
 	r := e.routers.get()
 	route, err := r.Route(bound.constraints, mapper, bound.manifest, p.Policy)

@@ -31,6 +31,32 @@ part of the scalar domain and have no encoding here.
 A **tuple** is an ordered, fixed-arity sequence of scalars — one per
 shard-key column, in column-declaration order.
 
+## From tuple bytes to a virtual bucket
+
+The current native mapper hashes the complete canonical tuple byte string with
+XXH64, takes the high `BucketBits` (20 by default) as a `VirtualBucket`, and
+represents that bucket by its 8-byte big-endian keyspace start:
+
+```text
+hash         = XXH64(tuple_bytes)
+bucket       = hash >> (64 - BucketBits)
+keyspace_id  = bucket << (64 - BucketBits)
+```
+
+Physical manifests own contiguous runs in that keyspace. Explicit catalog
+bucket widths require every shard boundary to be bucket-aligned. The mapper
+uses the complete tuple deliberately: `(tenant, locality-key)` spreads one
+tenant across buckets instead of making tenant identity a physical shard. A
+shorter leading prefix cannot predict the missing hash input and maps to the
+full keyspace. Applications that need a narrow tenant-only scan use an index;
+the router never invents a false tenant-local range.
+
+The mapper path is allocation-free for canonical tuples up to 256 bytes and
+has committed bucket vectors in `distribution/bucket_test.go`. `BucketBits`,
+mapper identity, tuple version, arity, and ordered placement paths are immutable
+placement identity. The repository accepts one current mapping contract, not a
+ladder of named protocol generations.
+
 ### Implementation map
 
 | File | Responsibility |
@@ -38,6 +64,9 @@ shard-key column, in column-declaration order.
 | `distribution/scalar.go` | `Scalar`, `ScalarKind`, `NewString`, `NewNumber` — the closed constructor surface |
 | `distribution/decimal.go` | JSON number spelling validation and canonical decomposition (frozen fork, no shared code with `query/decimal.go`) |
 | `distribution/tuple.go` | `TupleCodec`, `CurrentTupleCodec`, the tag/form bytes this document specifies, and the actual `Append*` logic |
+| `distribution/bucket.go` | fixed virtual-bucket geometry and keyspace projection |
+| `distribution/bucket_manifest.go` | allocation-free bucket-interval ownership and target lookup |
+| `distribution/mapper.go` | full-tuple hash mapping and honest prefix scatter |
 | `distribution/errors.go` | `InvalidNumberError`, `UnsupportedScalarError` |
 
 ## Framing principle

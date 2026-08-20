@@ -341,6 +341,9 @@ The tier is unreleased and unstable like the rest of VibeDB. The
 The implementation target keeps the gateway's explicitly routed fast path but
 adds replicated distributed transactions, snapshots, global indexes, query
 exchange, and online movement as opt-in costs when an operation crosses shards.
+Its analytical lane uses vectorized multi-stage execution, projection/data
+skipping, pushdown, and parallel replicas without imposing a MergeTree-style
+write path on transactional storage.
 Tenants route through many virtual buckets rather than being assigned to one
 physical shard. The target and its correctness/performance gates are specified
 in [Distributed system target](docs/design/distributed-system.md); the table

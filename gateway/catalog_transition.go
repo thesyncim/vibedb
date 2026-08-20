@@ -430,7 +430,9 @@ func validateRoutingTransition(current, next *Snapshot) error {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"distribution %q was removed without an incarnation protocol", old.Name)}
 		}
-		if candidate != old {
+		if candidate.Name != old.Name || candidate.Arity != old.Arity ||
+			candidate.MapperVersion != old.MapperVersion ||
+			candidate.EffectiveBucketBits() != old.EffectiveBucketBits() {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"distribution %q changed immutable mapper identity", old.Name)}
 		}
@@ -455,7 +457,10 @@ func validateRoutingTransition(current, next *Snapshot) error {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"placement for table %q was removed without an incarnation protocol", old.Table)}
 		}
-		if candidate.Distribution != old.Distribution || !slices.Equal(candidate.Columns, old.Columns) {
+		if candidate.Distribution != old.Distribution ||
+			candidate.TenantPath != old.TenantPath ||
+			candidate.AffinityGroup != old.AffinityGroup ||
+			!slices.Equal(candidate.Columns, old.Columns) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"placement for table %q changed immutable routing identity", old.Table)}
 		}

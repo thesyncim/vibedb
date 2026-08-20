@@ -17,7 +17,7 @@ func routeBoundPlan(t testing.TB, plan *BoundPlan) distribution.Route {
 	t.Helper()
 	route, err := distribution.NewRouter().Route(
 		plan.constraints,
-		distribution.NewNativeMapper(plan.spec.Arity),
+		distribution.NewNativeMapperWithBucketBits(plan.spec.Arity, plan.spec.EffectiveBucketBits()),
 		plan.manifest,
 		distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
 	)
@@ -202,6 +202,19 @@ func TestPreparedPlanJoinColocationProof(t *testing.T) {
 	}
 	if err := noncolocatedBound.ValidateRoute(routeBoundPlan(t, noncolocatedBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
 		t.Fatalf("non-colocated join validation = %v, want unsupported", err)
+	}
+
+	config.Placements[0].AffinityGroup = "messages"
+	config.Placements[1].AffinityGroup = "users"
+	nonaffine, err := NewSnapshot(config, testEndpoints(), 2)
+	if err != nil {
+		t.Fatalf("NewSnapshot nonaffine: %v", err)
+	}
+	if _, err := nonaffine.Prepare(t.Context(), `
+		SELECT messages.n
+		FROM messages JOIN users ON messages.tenant_id = users.tenant_id
+		WHERE messages.tenant_id = 'acme'`); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("nonaffine join prepare = %v, want unsupported", err)
 	}
 }
 

@@ -14,8 +14,8 @@ read cut instead of silently weakening correctness.
 ## Placement model
 
 A tenant is an isolation and accounting identity, never a physical shard.
-Tables declare a placement tuple that normally contains both a tenant identity
-and a workload locality key:
+Tenant-scoped tables explicitly mark `TenantPath`; validation requires it to be
+one component of a placement tuple with at least one workload locality key:
 
 ```text
 (tenant, account)
@@ -23,16 +23,17 @@ and a workload locality key:
 (tenant, order)
 ```
 
-The canonical placement tuple is hashed once and its high-order bits select a
-virtual bucket. The initial bucket space is 20 bits. Catalog manifests map
+The complete canonical placement tuple is hashed once with the current native
+mapper and its high-order bits select a virtual bucket. The initial bucket space
+is 20 bits. Catalog manifests map
 contiguous bucket intervals to allocation identities, so routing is a bounded
 binary search over ranges rather than a million-entry directory. The bucket
 width is part of the distribution identity and cannot change in place.
 
 One tenant therefore occupies as many buckets and physical shards as its
-locality keys require. A small tenant can remain naturally compact; a hot
-tenant spreads without a tenant-wide migration. Operators move, split, and
-replicate bucket intervals, not tenants.
+locality keys require. A small tenant touches only the buckets selected by its
+few keys; a hot tenant spreads without a tenant-wide migration. Operators move,
+split, and replicate bucket intervals, not tenants.
 
 Tables that need cheap joins or transactions may join an affinity group. Every
 member uses the same distribution, tuple codec, bucket width, and declared
@@ -111,16 +112,44 @@ sketches. Planning accounts for selectivity, covering width, base-fetch fanout,
 skew, hot keys, network bytes, memory, and spill. Statistics never sit on the
 foreground mutation path.
 
+## Analytical lane
+
+The analytical lane borrows the strongest current ClickHouse ideas without
+turning foreground transactional storage into a MergeTree:
+
+- scans produce fixed-capacity column vectors and retain raw document bytes for
+  late materialization;
+- min/max, exact-value, Bloom, and full-text summaries skip immutable row
+  groups before decoding;
+- covering projections maintain alternate sort/order layouts through the same
+  committed mutation stream as global indexes;
+- predicates, runtime filters, projection pruning, partial aggregation, and
+  local top-K are pushed below joins and exchanges;
+- parallel hash joins partition build and probe batches into CPU-local lanes;
+- one query may schedule disjoint ranges across caught-up replicas; and
+- immutable snapshots and cold projections may live in object storage behind a
+  content-addressed local cache, while foreground intents, journals, and Raft
+  state remain on quorum-controlled local storage.
+
+The row-oriented routed lane remains authoritative for point reads and writes.
+Columnar projections are derived, incarnation-fenced structures: the optimizer
+may ignore them without changing results, and repair can rebuild them from a
+certified snapshot plus committed mutation tail.
+
 ## Distributed query execution
 
 The gateway retains colocated execution whenever possible. Non-colocated plans
-use bounded exchange operators:
+are split into vectorized stages joined by bounded exchange operators:
 
 - broadcast only below an explicit byte and row threshold;
 - hash repartition on canonical encoded keys;
 - partial aggregation followed by merge/final aggregation;
 - local top-K followed by merge top-K; and
 - external runs for bounded-memory sort, distinct, hash join, and aggregation.
+
+Top-K, filters, runtime join filters, and partial aggregates move as close to
+scans as semantics allow. Stage placement accounts for data locality and
+replica load; it does not force all intermediate state through the gateway.
 
 Every exchange carries an operation deadline, byte/row budget, bounded channel,
 and cancellation signal. Backpressure reaches shard scans; it never creates an
@@ -133,6 +162,11 @@ allocation generation and ownership epoch. Serving requires a quorum-backed
 lease or equivalent leadership proof. Client request identities and
 transaction transitions are replicated state-machine inputs, so leader loss
 does not duplicate acknowledged work.
+
+Read-only analytical work can use parallel replicas at one certified read
+timestamp. Range leases prevent duplicate scan work, and losing a worker
+reissues only its unfinished ranges. Replica parallelism never permits a
+stale or mixed snapshot.
 
 Movement uses snapshot plus ordered catch-up:
 
@@ -171,9 +205,12 @@ cluster does not fork into named protocol generations.
    identity.
 3. Finish gateway transaction partitioning, recovery, scoped intents, and
    timestamped reads.
-4. Add independently sharded global indexes and online build.
-5. Add bounded distributed exchange operators.
-6. Wire the existing Raft foundation into serving and then enable movement.
+4. Add independently sharded global indexes, projections, data skipping, and
+   online build.
+5. Add vectorized multi-stage exchange, pushdown, parallel hash joins, spill,
+   and parallel replica scheduling.
+6. Wire the existing Raft foundation into serving, enable movement, and add
+   disaggregated immutable snapshot/cold-data caching.
 7. Add topology workflows, TLS/auth, backup/PITR, CDC, quotas, and upgrades.
 
 Every step requires deterministic encoding tests, crash/restart tests, stale

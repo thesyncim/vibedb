@@ -1,12 +1,10 @@
 package distribution
 
-// The native reference mapper is the dependency-free stand-in that lets routing
-// run end-to-end, so its two structural guarantees are pinned here: equal-valued
-// scalar spellings map to identical keyspace positions (the same canonical-byte
-// identity the golden tuple vectors freeze), and a full key always lands inside
-// every one of its own shorter leading-prefix ranges — the invariant the router
-// leans on so a partially bound key can only ever widen, never point somewhere a
-// full key would not. Arity, prefix, and value-type contracts round out the set.
+// The native mapper hashes complete canonical tuples into virtual buckets. Its
+// structural guarantees are pinned here: equal-valued scalar spellings map to
+// identical positions; a full key lands inside the honest full-keyspace range
+// of every incomplete prefix; and ordinary composite keys remain allocation
+// free. Arity, prefix, and value-type contracts round out the set.
 
 import (
 	"errors"
@@ -14,7 +12,7 @@ import (
 )
 
 // TestNativeMapperArity covers the arity contract: 1..8 construct and report
-// their arity, anything else panics because a component needs a keyspace byte.
+// their arity, and anything else panics because placement arity is bounded.
 func TestNativeMapperArity(t *testing.T) {
 	for _, a := range []int{-1, 0, 9, 100} {
 		func() {

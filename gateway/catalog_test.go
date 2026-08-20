@@ -156,6 +156,35 @@ func TestSnapshotPersistRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSnapshotPersistsVirtualBucketsAndAffinity(t *testing.T) {
+	config := testConfig(t)
+	config.Distributions[0].Arity = 2
+	config.Distributions[0].BucketBits = distribution.DefaultVirtualBucketBits
+	config.Placements[0].Columns = []string{"/tenant_id", "/message_id"}
+	config.Placements[0].TenantPath = "/tenant_id"
+	config.Placements[0].AffinityGroup = "messaging"
+	snapshot, err := NewSnapshot(config, testEndpoints(), 8)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, snapshot); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	spec, ok := loaded.Spec("tenant_data")
+	if !ok || spec.BucketBits != distribution.DefaultVirtualBucketBits {
+		t.Fatalf("loaded distribution = %+v,%v", spec, ok)
+	}
+	placement, ok := loaded.Placement("messages")
+	if !ok || placement.TenantPath != "/tenant_id" || placement.AffinityGroup != "messaging" {
+		t.Fatalf("loaded placement = %+v,%v", placement, ok)
+	}
+}
+
 func TestSnapshotReadAccessorsDoNotExposeMutableConfig(t *testing.T) {
 	snapshot := testSnapshot(t, 1)
 	placement, ok := snapshot.Placement("messages")
@@ -452,10 +481,28 @@ func TestCatalogTransitionFencesRoutingIdentity(t *testing.T) {
 			endpoints: testEndpoints(),
 		},
 		{
+			name: "virtual_bucket_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Distributions[0].BucketBits = distribution.DefaultVirtualBucketBits - 1
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
 			name: "placement_identity",
 			config: func() distribution.ClusterConfig {
 				config := testConfig(t)
 				config.Placements[0].Columns = []string{"/other"}
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "affinity_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Placements[0].AffinityGroup = "other"
 				return config
 			}(),
 			endpoints: testEndpoints(),

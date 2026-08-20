@@ -22,8 +22,9 @@ release promises or a compatibility roadmap.
   explicit HA/resharding exclusions.
 - [Distributed system target](design/distributed-system.md): routed and
   distributed execution lanes, tenant-independent virtual buckets, global
-  indexes, replication, movement, and delivery gates. It is an implementation
-  contract, not a statement of current capability.
+  indexes/projections, vectorized multi-stage analytics, replication, movement,
+  and delivery gates. It is an implementation contract, not a statement of
+  current capability.
 - [Distributed transactions](design/distributed-transactions.md): participant
   state, visibility, recovery, encoding, and current implementation boundary.
 - [Performance](performance.md): latest commit-pinned benchmark publication

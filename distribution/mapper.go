@@ -1,5 +1,7 @@
 package distribution
 
+import "github.com/cespare/xxhash/v2"
+
 // MapperVersion identifies a mapper's frozen mapping revision. It is part of
 // placement identity.
 type MapperVersion uint32
@@ -79,43 +81,41 @@ type MapperInto interface {
 // NativeMapperVersion is the frozen version of the native reference mapper.
 const NativeMapperVersion MapperVersion = 1
 
-// NativeMapper is a dependency-free reference mapper over the fixed 8-byte
-// keyspace. Each shard-key component owns a contiguous byte segment of the
-// keyspace; a component's canonical scalar bytes are folded with FNV-1a into
-// its segment. A full key of Arity components fills every segment and maps to
-// one point; a supported shorter leading prefix fills only its leading
-// segments and maps to the keyspace range that every completion of that prefix
-// falls within, so a full-key point always lies inside its own leading-prefix
-// range. The mapping is deterministic and is not a Vitess mapping. It exists so
-// routing can be exercised end-to-end without any external dependency.
+// NativeMapper hashes the complete canonical placement tuple and maps its high
+// bits to one virtual bucket in the fixed 8-byte keyspace. Hashing the complete
+// tuple is the property that lets (tenant, locality-key) placements spread one
+// tenant across many buckets and physical shards. A shorter leading prefix
+// cannot predict the remaining tuple hash and therefore maps honestly to the
+// full keyspace; a tenant-only query scatters unless an index narrows it.
+//
+// xxHash64 is used only as a deterministic, high-throughput distribution hash.
+// Scalar equality and tuple framing remain defined exclusively by the current
+// canonical tuple codec.
 type NativeMapper struct {
-	arity    int
-	prefixes PrefixSet
-	bounds   [KeyspaceWidth + 1]int // component i owns bytes [bounds[i], bounds[i+1])
+	arity      int
+	prefixes   PrefixSet
+	bucketBits uint8
 }
 
-// NewNativeMapper returns a native mapper over arity components (1..8),
-// supporting every leading prefix length 1..arity. It panics for an arity
-// outside 1..8, since a component needs at least one of the eight keyspace
-// bytes.
+// NewNativeMapper returns the one current native mapper over arity components
+// using DefaultVirtualBucketBits.
 func NewNativeMapper(arity int) *NativeMapper {
+	return NewNativeMapperWithBucketBits(arity, DefaultVirtualBucketBits)
+}
+
+// NewNativeMapperWithBucketBits returns the current native mapper with an
+// explicit virtual-bucket width. It panics for invalid static metadata; runtime
+// catalog construction validates the same bounds before calling it.
+func NewNativeMapperWithBucketBits(arity int, bucketBits uint8) *NativeMapper {
 	if arity < 1 || arity > KeyspaceWidth {
 		panic("distribution: NativeMapper arity must be in 1..8")
 	}
-	m := &NativeMapper{arity: arity}
+	if !ValidVirtualBucketBits(bucketBits) {
+		panic("distribution: NativeMapper virtual bucket bits must be in 8..24")
+	}
+	m := &NativeMapper{arity: arity, bucketBits: bucketBits}
 	for l := 1; l <= arity; l++ {
 		m.prefixes |= 1 << uint(l)
-	}
-	base := KeyspaceWidth / arity
-	rem := KeyspaceWidth % arity
-	off := 0
-	for i := 0; i < arity; i++ {
-		w := base
-		if i < rem {
-			w++
-		}
-		off += w
-		m.bounds[i+1] = off
 	}
 	return m
 }
@@ -129,6 +129,9 @@ func (m *NativeMapper) SupportedPrefixes() PrefixSet { return m.prefixes }
 // Version reports the frozen native mapping revision.
 func (m *NativeMapper) Version() MapperVersion { return NativeMapperVersion }
 
+// VirtualBucketBits reports the mapper's immutable bucket-space width.
+func (m *NativeMapper) VirtualBucketBits() uint8 { return m.bucketBits }
+
 // Admits reports whether values form an acceptable prefix of length prefixLen:
 // the length must match and be supported, and every value must be an encodable
 // placement scalar. It returns ErrIncompleteShardKey on a length mismatch, a
@@ -141,11 +144,9 @@ func (m *NativeMapper) Admits(prefixLen int, values []Scalar) error {
 	if !m.prefixes.Contains(prefixLen) {
 		return &MapperError{Reason: "unsupported prefix length"}
 	}
-	var buf [64]byte
-	for i := range values {
-		if _, err := appendScalar(buf[:0], values[i]); err != nil {
-			return &ShardValueError{Reason: "value is not an encodable placement scalar"}
-		}
+	var buf [256]byte
+	if _, err := appendTuple(buf[:0], values); err != nil {
+		return &ShardValueError{Reason: "value is not an encodable placement scalar"}
 	}
 	return nil
 }
@@ -170,16 +171,19 @@ func (m *NativeMapper) MapPrefixInto(
 		}
 		return DestinationSet{}, &MapperError{Reason: "unsupported prefix length"}
 	}
-	p, full, err := m.mapToPoint(values)
-	if err != nil {
-		return DestinationSet{}, err
-	}
-	if full {
+	if len(values) == m.arity {
+		p, err := m.mapFullKey(values)
+		if err != nil {
+			return DestinationSet{}, err
+		}
 		pointScratch = append(pointScratch[:0], p)
 		return DestinationSet{Points: pointScratch}, nil
 	}
+	if err := m.Admits(len(values), values); err != nil {
+		return DestinationSet{}, err
+	}
 	rangeScratch = append(rangeScratch[:0], KeyRange{
-		Start: p, End: successorEnd(p, m.bounds[len(values)]),
+		Start: KeyspacePoint{}, End: KeyspaceEnd{Max: true},
 	})
 	return DestinationSet{Ranges: rangeScratch}, nil
 }
@@ -191,8 +195,7 @@ func (m *NativeMapper) PointFor(values []Scalar) (KeyspacePoint, error) {
 	if len(values) != m.arity {
 		return KeyspacePoint{}, ErrIncompleteShardKey
 	}
-	p, _, err := m.mapToPoint(values)
-	return p, err
+	return m.mapFullKey(values)
 }
 
 // PrefixRangeFor returns the keyspace range a supported shorter leading prefix
@@ -206,60 +209,24 @@ func (m *NativeMapper) PrefixRangeFor(values []Scalar) (KeyRange, error) {
 	if !m.prefixes.Contains(l) {
 		return KeyRange{}, &MapperError{Reason: "unsupported prefix length"}
 	}
-	p, _, err := m.mapToPoint(values)
-	if err != nil {
+	if err := m.Admits(l, values); err != nil {
 		return KeyRange{}, err
 	}
-	return KeyRange{Start: p, End: successorEnd(p, m.bounds[l])}, nil
+	return KeyRange{Start: KeyspacePoint{}, End: KeyspaceEnd{Max: true}}, nil
 }
 
-// mapToPoint fills the leading segments of a point from values' canonical bytes
-// and reports whether values are a full key. Trailing segments stay zero, which
-// makes the returned point double as a prefix range start.
-func (m *NativeMapper) mapToPoint(values []Scalar) (KeyspacePoint, bool, error) {
-	var p KeyspacePoint
-	var buf [64]byte
-	for i := range values {
-		b, err := appendScalar(buf[:0], values[i])
-		if err != nil {
-			return KeyspacePoint{}, false, &ShardValueError{Reason: "value is not an encodable placement scalar"}
-		}
-		h := fnv1a64(b)
-		lo, hi := m.bounds[i], m.bounds[i+1]
-		w := hi - lo
-		for j := 0; j < w; j++ {
-			p[lo+j] = byte(h >> uint(8*(w-1-j)))
-		}
+// mapFullKey hashes one canonical tuple into its bucket-start point. The common
+// path stays on a 256-byte stack buffer; only unusually large placement keys
+// allocate while preserving exactly the same bytes and result.
+func (m *NativeMapper) mapFullKey(values []Scalar) (KeyspacePoint, error) {
+	if len(values) != m.arity {
+		return KeyspacePoint{}, ErrIncompleteShardKey
 	}
-	return p, len(values) == m.arity, nil
-}
-
-// successorEnd returns the exclusive end just past every point sharing the
-// width-byte leading region of p (whose trailing bytes are zero): the region
-// incremented by one, or Max when the region is all ones.
-func successorEnd(p KeyspacePoint, width int) KeyspaceEnd {
-	var e KeyspacePoint
-	copy(e[:width], p[:width])
-	for i := width - 1; i >= 0; i-- {
-		e[i]++
-		if e[i] != 0 {
-			return KeyspaceEnd{Point: e}
-		}
+	var storage [256]byte
+	encoded, err := appendTuple(storage[:0], values)
+	if err != nil {
+		return KeyspacePoint{}, &ShardValueError{Reason: "value is not an encodable placement scalar"}
 	}
-	return KeyspaceEnd{Max: true}
-}
-
-// fnv1a64 is the 64-bit FNV-1a hash, inlined so component folding stays
-// dependency-free and allocation-free.
-func fnv1a64(b []byte) uint64 {
-	const (
-		offset = 14695981039346656037
-		prime  = 1099511628211
-	)
-	h := uint64(offset)
-	for _, c := range b {
-		h ^= uint64(c)
-		h *= prime
-	}
-	return h
+	_, point, _ := VirtualBucketForHash(xxhash.Sum64(encoded), m.bucketBits)
+	return point, nil
 }
