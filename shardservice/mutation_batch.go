@@ -6,20 +6,52 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	vibejson "github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-// MutationStatement is one non-row-returning SQL mutation inside a shard-local
-// participant batch. SQL remains text because the ordinary local parser is the
-// sole plan authority; typed parameter payloads remain borrowed bytes.
+// MutationKind identifies one participant-batch entry. The zero value remains
+// ordinary SQL so existing constructors and the routed SQL lane stay compact.
+// Typed entries use the formerly invalid zero SQL-length sentinel inside the
+// same batch format; there is no parallel or named protocol generation.
+type MutationKind uint8
+
+const (
+	MutationSQL MutationKind = iota
+	MutationGlobalIndexPut
+	MutationGlobalIndexDelete
+)
+
+func (k MutationKind) valid() bool {
+	return k >= MutationSQL && k <= MutationGlobalIndexDelete
+}
+
+// MutationStatement is one non-row-returning mutation inside a shard-local
+// participant batch. Ordinary SQL remains text because the local parser is its
+// plan authority. Global-index entries are byte-native: Relation is cold
+// identity, EntryKey is the canonical tuple key, and Value is the bounded JSON
+// locator array produced with vibejson. All decoded payloads borrow the durable
+// participant record.
 type MutationStatement struct {
+	Kind   MutationKind
 	SQL    string
 	Params []Param
+
+	Relation     string
+	IndexID      uint64
+	Incarnation  uint64
+	EntryKey     []byte
+	Value        []byte
+	LocatorCount uint8
+	Unique       bool
 }
 
 const (
-	maxMutationStatements = 4096
-	mutationBatchHeader   = 8
+	maxMutationStatements    = 4096
+	maxMutationRelationBytes = 1<<16 - 1
+	mutationBatchHeader      = 8
+	globalMutationFixedBytes = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 4 + 4
 )
 
 var (
@@ -38,25 +70,70 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 	total := mutationBatchHeader
 	for i := range statements {
 		statement := &statements[i]
-		if statement.SQL == "" || !utf8.ValidString(statement.SQL) || len(statement.Params) > maxParams {
+		if !statement.Kind.valid() {
 			return dst, ErrMutationBatch
 		}
-		total += 8 + len(statement.SQL)
-		for j := range statement.Params {
-			param := &statement.Params[j]
-			if !param.Kind.valid() || !param.Valid() {
+		if statement.Kind == MutationSQL {
+			if statement.SQL == "" || !utf8.ValidString(statement.SQL) ||
+				len(statement.Params) > maxParams || statement.Relation != "" ||
+				statement.IndexID != 0 || statement.Incarnation != 0 ||
+				len(statement.EntryKey) != 0 || len(statement.Value) != 0 ||
+				statement.LocatorCount != 0 || statement.Unique {
 				return dst, ErrMutationBatch
 			}
-			total++
-			switch param.Kind {
-			case ParamBool:
+			total += 8 + len(statement.SQL)
+			for j := range statement.Params {
+				param := &statement.Params[j]
+				if !param.Kind.valid() || !param.Valid() {
+					return dst, ErrMutationBatch
+				}
 				total++
-			case ParamNumber, ParamString, ParamDocument:
-				total += 4 + len(param.Bytes)
+				switch param.Kind {
+				case ParamBool:
+					total++
+				case ParamNumber, ParamString, ParamDocument:
+					total += 4 + len(param.Bytes)
+				}
+				if total > distributedtxn.MaxMutationBytes {
+					return dst, distributedtxn.ErrTooLarge
+				}
 			}
-			if total > distributedtxn.MaxMutationBytes {
-				return dst, distributedtxn.ErrTooLarge
-			}
+			continue
+		}
+		if statement.SQL != "" || len(statement.Params) != 0 ||
+			statement.Relation == "" ||
+			len(statement.Relation) > maxMutationRelationBytes ||
+			!utf8.ValidString(statement.Relation) || statement.IndexID == 0 ||
+			statement.Incarnation == 0 || len(statement.EntryKey) == 0 ||
+			statement.EntryKey[0] == 0 || statement.LocatorCount == 0 ||
+			statement.LocatorCount > 8 ||
+			len(statement.Value) == 0 || !vibejson.Valid(statement.Value) ||
+			(vibejson.RawValue{Src: statement.Value}).Kind() != jsondoc.Array {
+			return dst, ErrMutationBatch
+		}
+		if len(statement.Relation) > distributedtxn.MaxMutationBytes-total-globalMutationFixedBytes ||
+			len(statement.EntryKey) > distributedtxn.MaxMutationBytes-total-globalMutationFixedBytes-len(statement.Relation) ||
+			len(statement.Value) > distributedtxn.MaxMutationBytes-total-globalMutationFixedBytes-len(statement.Relation)-len(statement.EntryKey) {
+			return dst, distributedtxn.ErrTooLarge
+		}
+		total += globalMutationFixedBytes + len(statement.Relation) +
+			len(statement.EntryKey) + len(statement.Value)
+		if total > distributedtxn.MaxMutationBytes {
+			return dst, distributedtxn.ErrTooLarge
+		}
+		if statement.Kind == MutationGlobalIndexDelete && statement.Unique {
+			// Uniqueness changes PUT conflict semantics; DELETE always compares
+			// the expected locator and does not need another wire bit.
+			return dst, ErrMutationBatch
+		}
+		if statement.Kind != MutationGlobalIndexPut && statement.Unique {
+			return dst, ErrMutationBatch
+		}
+		if statement.Kind == MutationGlobalIndexDelete && len(statement.Value) == 0 {
+			return dst, ErrMutationBatch
+		}
+		if statement.Kind != MutationGlobalIndexPut && statement.Kind != MutationGlobalIndexDelete {
+			return dst, ErrMutationBatch
 		}
 	}
 	if total > distributedtxn.MaxMutationBytes {
@@ -67,6 +144,25 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statements)))
 	for i := range statements {
 		statement := &statements[i]
+		if statement.Kind != MutationSQL {
+			dst = binary.LittleEndian.AppendUint32(dst, 0)
+			dst = append(dst, byte(statement.Kind))
+			if statement.Unique {
+				dst = append(dst, 1)
+			} else {
+				dst = append(dst, 0)
+			}
+			dst = append(dst, statement.LocatorCount, 0)
+			dst = binary.LittleEndian.AppendUint64(dst, statement.IndexID)
+			dst = binary.LittleEndian.AppendUint64(dst, statement.Incarnation)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Relation)))
+			dst = append(dst, statement.Relation...)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.EntryKey)))
+			dst = append(dst, statement.EntryKey...)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Value)))
+			dst = append(dst, statement.Value...)
+			continue
+		}
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.SQL)))
 		dst = append(dst, statement.SQL...)
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Params)))
@@ -138,6 +234,9 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 	if b.remaining == 0 || len(b.body) < 4 {
 		return MutationStatement{}, ErrMutationBatch
 	}
+	if binary.LittleEndian.Uint32(b.body[:4]) == 0 {
+		return b.nextGlobalIndex()
+	}
 	sqlBytes, rest, ok := takeMutationBytes(b.body)
 	if !ok || len(sqlBytes) == 0 || !utf8.Valid(sqlBytes) || len(rest) < 4 {
 		return MutationStatement{}, ErrMutationBatch
@@ -180,6 +279,41 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 		if materialize {
 			statement.Params[i] = param
 		}
+	}
+	b.body = rest
+	b.remaining--
+	return statement, nil
+}
+
+func (b *MutationBatch) nextGlobalIndex() (MutationStatement, error) {
+	rest := b.body[4:]
+	if len(rest) < globalMutationFixedBytes-4 || rest[1] > 1 ||
+		rest[2] == 0 || rest[2] > 8 || rest[3] != 0 {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	statement := MutationStatement{
+		Kind: MutationKind(rest[0]), Unique: rest[1] == 1, LocatorCount: rest[2],
+		IndexID:     binary.LittleEndian.Uint64(rest[4:12]),
+		Incarnation: binary.LittleEndian.Uint64(rest[12:20]),
+	}
+	rest = rest[20:]
+	relation, rest, ok := takeMutationBytes(rest)
+	if !ok || len(relation) == 0 || len(relation) > maxMutationRelationBytes ||
+		!utf8.Valid(relation) {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	statement.Relation = byteview.String(relation)
+	statement.EntryKey, rest, ok = takeMutationBytes(rest)
+	if !ok || len(statement.EntryKey) == 0 || statement.EntryKey[0] == 0 {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	statement.Value, rest, ok = takeMutationBytes(rest)
+	if !ok || len(statement.Value) == 0 || !vibejson.Valid(statement.Value) ||
+		(vibejson.RawValue{Src: statement.Value}).Kind() != jsondoc.Array ||
+		statement.IndexID == 0 || statement.Incarnation == 0 ||
+		!statement.Kind.valid() || statement.Kind == MutationSQL ||
+		(statement.Kind == MutationGlobalIndexDelete && statement.Unique) {
+		return MutationStatement{}, ErrMutationBatch
 	}
 	b.body = rest
 	b.remaining--

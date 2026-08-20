@@ -520,6 +520,17 @@ func (c *shardConn) executeParticipantStatements(
 		if !ok {
 			break
 		}
+		if mutation.Kind != MutationSQL {
+			_, mutationErr := c.sess.ApplyGlobalIndexMutation(
+				ctx, mutation.Relation, mutation.IndexID, mutation.Incarnation,
+				mutation.EntryKey, mutation.Value, mutation.LocatorCount,
+				mutation.Unique, mutation.Kind == MutationGlobalIndexDelete,
+			)
+			if mutationErr != nil {
+				return 0, transactionError(mutationErr)
+			}
+			continue
+		}
 		prep, err := c.sess.Prepare(ctx, mutation.SQL)
 		if err != nil {
 			return 0, classifyError(err)
@@ -571,9 +582,16 @@ func transactionError(err error) *ShardResponse {
 	if errors.Is(err, errReadFenceCapacity) {
 		return NewErrorResponse(ErrorResourceLimit, err.Error())
 	}
+	if errors.Is(err, durable.ErrBatchTooLarge) ||
+		errors.Is(err, durable.ErrKeyTooLarge) ||
+		errors.Is(err, durable.ErrDocumentTooLarge) ||
+		errors.Is(err, sqldriver.ErrTransactionTooLarge) {
+		return NewErrorResponse(ErrorResourceLimit, err.Error())
+	}
 	if errors.Is(err, distributedtxn.ErrJournalConflict) ||
 		errors.Is(err, distributedtxn.ErrJournalBusy) ||
 		errors.Is(err, distributedtxn.ErrInvalidState) ||
+		errors.Is(err, sqldriver.ErrTransactionConflict) ||
 		errors.Is(err, sqldriver.ErrDistributedTransactionConflict) {
 		return NewErrorResponse(ErrorTransactionConflict, err.Error())
 	}

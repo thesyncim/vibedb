@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
@@ -52,6 +53,32 @@ var ErrWriteShardKeyMove = errors.New("gateway: update replacement document woul
 // ErrExecRequiresMutation reports a non-mutating statement submitted to
 // [Executor.Exec].
 var ErrExecRequiresMutation = errors.New("gateway: Exec requires a mutating statement")
+
+// ErrGlobalIndexMaintenanceUnsupported reports an indexed mutation whose old
+// and new rows cannot yet be proven before participant staging. Refusing it is
+// a correctness fence: a READY global index is never allowed to drift behind
+// its base table.
+var ErrGlobalIndexMaintenanceUnsupported = errors.New("gateway: global index maintenance for this mutation shape is unsupported")
+
+type preparedGlobalIndex struct {
+	program        GlobalIndexProgram
+	keyColumns     [4]int
+	locatorColumns [distribution.KeyspaceWidth]int
+	wholeDocument  bool
+}
+
+type boundGlobalIndexMutation struct {
+	metadata IndexMetadata
+
+	distribution         distribution.DistributionName
+	target               distribution.Target
+	address              string
+	routingVersion       distribution.RoutingVersion
+	bucketBits           uint8
+	scope                distributedtxn.IntentScope
+	entryStart, entryEnd int
+	valueStart, valueEnd int
+}
 
 // prepareWrite validates one mutating statement against the pinned catalog
 // generation and records the routing metadata [PreparedPlan.BindWrite] binds
@@ -164,6 +191,73 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 			plan.writeKeyColumns = keyColumns
 		}
 	}
+	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Snapshot) prepareGlobalIndexWrites(
+	plan *PreparedPlan,
+	wholeDocument bool,
+) error {
+	indexes := s.Indexes(plan.table)
+	if indexes.Len() == 0 {
+		return nil
+	}
+	var columns map[string]int
+	if plan.statement.Kind == sqlast.KindInsert && !wholeDocument {
+		columns = make(map[string]int, len(plan.statement.Insert.Columns))
+		for i := range plan.statement.Insert.Columns {
+			columns[string(plan.statement.Insert.Columns[i].AppendPointer(nil))] = i
+		}
+	}
+	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
+		metadata, _ := indexes.At(ordinal)
+		if !metadata.Global() || !metadata.Ready() {
+			continue
+		}
+		if plan.statement.Kind != sqlast.KindInsert {
+			return &PlanError{
+				Table: plan.table,
+				Reason: "READY global index " + metadata.Name +
+					" requires old-row capture for UPDATE or DELETE",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+		program, err := s.CompileGlobalIndex(plan.table, metadata.Name)
+		if err != nil {
+			return err
+		}
+		prepared := preparedGlobalIndex{program: program, wholeDocument: wholeDocument}
+		if !wholeDocument {
+			for i := uint8(0); i < metadata.PathCount; i++ {
+				column, ok := columns[metadata.Paths[i]]
+				if !ok {
+					return &PlanError{
+						Table: plan.table,
+						Reason: "global index " + metadata.Name +
+							" key path " + metadata.Paths[i] + " is absent from INSERT",
+						cause: ErrGlobalIndexMaintenanceUnsupported,
+					}
+				}
+				prepared.keyColumns[i] = column
+			}
+			for i := uint8(0); i < metadata.LocatorCount; i++ {
+				column, ok := columns[metadata.LocatorPaths[i]]
+				if !ok {
+					return &PlanError{
+						Table: plan.table,
+						Reason: "global index " + metadata.Name +
+							" locator path " + metadata.LocatorPaths[i] + " is absent from INSERT",
+						cause: ErrGlobalIndexMaintenanceUnsupported,
+					}
+				}
+				prepared.locatorColumns[i] = column
+			}
+		}
+		plan.writeGlobalIndexes = append(plan.writeGlobalIndexes, prepared)
+	}
 	return nil
 }
 
@@ -190,6 +284,9 @@ type BoundWritePlan struct {
 	// the executor re-reads its shard key from it to prove the replacement cannot
 	// move a row to another shard.
 	updateDoc []byte
+
+	globalIndexes    []boundGlobalIndexMutation
+	globalIndexArena []byte
 }
 
 // BindWrite applies params to a prepared write plan without reparsing SQL.
@@ -232,6 +329,9 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 			return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
 		}
 		bound.rowKeys = keys
+		if err := p.bindGlobalIndexInserts(bound, args); err != nil {
+			return nil, err
+		}
 	case sqlast.KindUpdate, sqlast.KindDelete:
 		if p.constraints == nil {
 			return nil, &PlanError{
@@ -254,6 +354,101 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 		}
 	}
 	return bound, nil
+}
+
+func (p *PreparedPlan) bindGlobalIndexInserts(
+	bound *BoundWritePlan,
+	args []any,
+) error {
+	if len(p.writeGlobalIndexes) == 0 {
+		return nil
+	}
+	rows := p.statement.Insert.Rows
+	bound.globalIndexes = make([]boundGlobalIndexMutation, 0, len(rows)*len(p.writeGlobalIndexes))
+	var workspace GlobalIndexWorkspace
+	var keyStorage [4]distribution.Scalar
+	var locatorStorage [distribution.KeyspaceWidth]distribution.Scalar
+	baseMapper := distribution.NewNativeMapperWithBucketBits(
+		bound.spec.Arity, bound.spec.EffectiveBucketBits(),
+	)
+	for rowOrdinal := range rows {
+		row := &rows[rowOrdinal]
+		basePoint, err := baseMapper.PointFor(bound.rowKeys[rowOrdinal])
+		if err != nil {
+			return fmt.Errorf("global index base row %d: %w", rowOrdinal, err)
+		}
+		baseTarget, ok := bound.manifest.ResolvePointTarget(basePoint)
+		if !ok {
+			return &CatalogError{Reason: "global index base row maps outside active manifest"}
+		}
+		for indexOrdinal := range p.writeGlobalIndexes {
+			prepared := &p.writeGlobalIndexes[indexOrdinal]
+			var route GlobalIndexRoute
+			if prepared.wholeDocument {
+				document, docErr := writeOperandDocument(row.Values[0], args)
+				if docErr != nil {
+					return fmt.Errorf("global index row %d: %w", rowOrdinal, docErr)
+				}
+				route, err = prepared.program.RouteDocument(document, &workspace)
+			} else {
+				metadata := prepared.program.metadata
+				key := keyStorage[:metadata.PathCount]
+				locator := locatorStorage[:metadata.LocatorCount]
+				for i := range key {
+					key[i], err = writeScalarFromValue(writeOperandValue(
+						row.Values[prepared.keyColumns[i]], args,
+					))
+					if err != nil {
+						break
+					}
+				}
+				if err == nil {
+					for i := range locator {
+						locator[i], err = writeScalarFromValue(writeOperandValue(
+							row.Values[prepared.locatorColumns[i]], args,
+						))
+						if err != nil {
+							break
+						}
+					}
+				}
+				if err == nil {
+					route, err = prepared.program.RouteScalars(key, locator, &workspace)
+				}
+			}
+			if err != nil {
+				return fmt.Errorf(
+					"global index %s row %d: %w",
+					prepared.program.metadata.Name, rowOrdinal, err,
+				)
+			}
+			if !sameWriteTarget(route.BaseTarget, baseTarget) {
+				return &CatalogError{Reason: "global index locator does not identify the inserted base owner"}
+			}
+			mutation := boundGlobalIndexMutation{
+				metadata:     prepared.program.metadata,
+				distribution: prepared.program.indexSpec.Name,
+				target:       route.IndexTarget, address: route.IndexAddress,
+				routingVersion: prepared.program.indexManifest.Version(),
+				bucketBits:     route.IndexBucketBits, scope: route.IndexScope,
+				entryStart: len(bound.globalIndexArena),
+			}
+			bound.globalIndexArena = append(bound.globalIndexArena, route.EntryKey...)
+			mutation.entryEnd = len(bound.globalIndexArena)
+			mutation.valueStart = mutation.entryEnd
+			bound.globalIndexArena = append(bound.globalIndexArena, route.LocatorValue...)
+			mutation.valueEnd = len(bound.globalIndexArena)
+			bound.globalIndexes = append(bound.globalIndexes, mutation)
+		}
+	}
+	return nil
+}
+
+func sameWriteTarget(a, b distribution.Target) bool {
+	return a.Shard == b.Shard &&
+		a.AllocationGeneration == b.AllocationGeneration &&
+		a.OwnershipEpoch == b.OwnershipEpoch && a.Endpoint == b.Endpoint &&
+		a.Role == b.Role
 }
 
 // bindInsertRowKeys extracts one full shard key per VALUES row. A whole-document

@@ -16,6 +16,12 @@ func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
 		{SQL: "UPDATE docs SET doc = ? WHERE id = ?", Params: []Param{
 			DocumentBytesParam([]byte(`{"id":"first","n":8}`)), StringBytesParam([]byte("first")),
 		}},
+		{
+			Kind: MutationGlobalIndexPut, Relation: "docs_by_email",
+			IndexID: 17, Incarnation: 3,
+			EntryKey: []byte{1, 3, 'a', '@', 'b'},
+			Value:    []byte(`["tenant",7.0]`), LocatorCount: 2, Unique: true,
+		},
 	}
 	raw, err := AppendMutationBatch([]byte("prefix"), statements)
 	if err != nil {
@@ -39,6 +45,18 @@ func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
 	if err != nil || !ok || second.SQL != statements[1].SQL || len(second.Params) != 2 {
 		t.Fatalf("second = %+v,%v,%v", second, ok, err)
 	}
+	third, ok, err := batch.Next()
+	if err != nil || !ok || third.Kind != MutationGlobalIndexPut ||
+		third.Relation != "docs_by_email" || third.IndexID != 17 ||
+		third.Incarnation != 3 || third.LocatorCount != 2 || !third.Unique ||
+		!bytes.Equal(third.EntryKey, statements[2].EntryKey) ||
+		!bytes.Equal(third.Value, statements[2].Value) {
+		t.Fatalf("third = %+v,%v,%v", third, ok, err)
+	}
+	entryOffset := bytes.Index(raw, statements[2].EntryKey)
+	if entryOffset < 0 || &third.EntryKey[0] != &raw[entryOffset] {
+		t.Fatal("global index key did not borrow the durable batch")
+	}
 	if _, ok, err := batch.Next(); err != nil || ok {
 		t.Fatalf("batch end = %v,%v", ok, err)
 	}
@@ -57,6 +75,15 @@ func TestMutationBatchRejectsCorruptionAndOversize(t *testing.T) {
 	tooLarge := MutationStatement{SQL: string(make([]byte, distributedtxn.MaxMutationBytes))}
 	if _, err := AppendMutationBatch(nil, []MutationStatement{tooLarge}); !errors.Is(err, distributedtxn.ErrTooLarge) {
 		t.Fatalf("oversize batch = %v", err)
+	}
+	for _, invalid := range []MutationStatement{
+		{Kind: MutationGlobalIndexPut, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{0}, Value: []byte(`[]`), LocatorCount: 1},
+		{Kind: MutationGlobalIndexPut, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{1}, Value: []byte(`{}`), LocatorCount: 1},
+		{Kind: MutationGlobalIndexDelete, Relation: "idx", IndexID: 1, Incarnation: 1, EntryKey: []byte{1}, Value: []byte(`["x"]`), LocatorCount: 1, Unique: true},
+	} {
+		if _, err := AppendMutationBatch(nil, []MutationStatement{invalid}); !errors.Is(err, ErrMutationBatch) {
+			t.Fatalf("invalid typed mutation %+v err = %v", invalid, err)
+		}
 	}
 }
 

@@ -787,6 +787,152 @@ func TestE2EAtomicBatchAcrossShards(t *testing.T) {
 	c.verifyDeleted(t, keys0[1])
 }
 
+func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
+	c := newE2ECluster(t)
+	const (
+		indexDistribution = distribution.DistributionName("message_n_index")
+		indexVersion      = distribution.RoutingVersion(19)
+	)
+	type indexShard struct {
+		id         distribution.ShardID
+		allocation distribution.ShardAllocationGeneration
+		epoch      distribution.OwnershipEpoch
+		endpoint   distribution.EndpointID
+		address    string
+		kr         distribution.KeyRange
+	}
+	indexShards := []indexShard{
+		{id: "i0", allocation: 101, epoch: 31, endpoint: "ep-i0", address: "index-i0", kr: e2eRange(0, false, 0x80)},
+		{id: "i1", allocation: 102, epoch: 32, endpoint: "ep-i1", address: "index-i1", kr: e2eRange(0x80, true, 0)},
+	}
+	manifestShards := make([]distribution.Shard, len(indexShards))
+	for i := range indexShards {
+		shard := &indexShards[i]
+		ownership := shardservice.Ownership{
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation, Epoch: shard.epoch,
+			RoutingVersion: indexVersion,
+		}
+		database := initializeTestShardStore(
+			t, filepath.Join(t.TempDir(), string(shard.id)+".vdb"), ownership,
+		)
+		server, err := shardservice.NewServer(database, ownership, shardservice.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = server.Close() })
+		c.dialer.mu.Lock()
+		c.dialer.servers[shard.address] = server
+		c.dialer.mu.Unlock()
+		manifestShards[i] = distribution.Shard{
+			ID: shard.id, AllocationGeneration: shard.allocation,
+			Range: shard.kr, Leaders: []distribution.EndpointID{shard.endpoint},
+			Epoch: shard.epoch,
+		}
+	}
+	indexManifest, err := distribution.NewManifest(
+		indexDistribution, indexVersion, manifestShards,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	for i := range indexShards {
+		shard := &indexShards[i]
+		_, err := seedClient.Do(context.Background(), shard.address, &shardservice.ShardRequest{
+			SQL:          `CREATE TABLE messages_by_n (PRIMARY KEY (id))`,
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation,
+			RoutingVersion:       indexVersion, OwnershipEpoch: shard.epoch,
+			ExecutionMode: shardservice.ExecutionReadWrite,
+		})
+		if err != nil {
+			t.Fatalf("create index relation on %s: %v", shard.id, err)
+		}
+	}
+
+	endpoints := make(map[distribution.EndpointID]string, len(c.shards)+len(indexShards))
+	for i := range c.shards {
+		endpoints[c.shards[i].endpoint] = c.shards[i].address
+	}
+	for i := range indexShards {
+		endpoints[indexShards[i].endpoint] = indexShards[i].address
+	}
+	snapshot, err := NewSnapshotWithIndexes(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{
+			{Name: c.dist, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+			{Name: indexDistribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+		},
+		Placements: []distribution.TablePlacement{
+			{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+			{Table: "messages_by_n", Distribution: indexDistribution, Columns: []string{"/n"}},
+		},
+		Manifests: []*distribution.Manifest{c.man, indexManifest},
+	}, endpoints, 2, []IndexDescriptor{{
+		IndexID: 91, Incarnation: 1, Table: "messages", Name: "by_n",
+		Relation: "messages_by_n", Paths: []string{"/n"},
+		LocatorPaths: []string{"/tenant_id"},
+		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexReady,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{})
+	baseKey := c.freshKeysForShard(t, c.shards[1].id, 1)[0]
+	result, err := executor.Exec(context.Background(), Query{
+		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(baseKey), shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("indexed insert: %v", err)
+	}
+	if result.RowsAffected != 1 || result.ShardsFanned != 2 ||
+		result.RouteKind != distribution.RouteTargeted {
+		t.Fatalf("indexed insert result = %+v", result)
+	}
+	c.verifyInserted(t, baseKey, 777)
+
+	foundLocator := false
+	for i := range indexShards {
+		shard := &indexShards[i]
+		response, queryErr := seedClient.Do(context.Background(), shard.address, &shardservice.ShardRequest{
+			SQL:          `SELECT * FROM messages_by_n`,
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation,
+			RoutingVersion:       indexVersion, OwnershipEpoch: shard.epoch,
+			ExecutionMode: shardservice.ExecutionReadOnly,
+		})
+		if queryErr != nil {
+			t.Fatalf("read index relation %s: %v", shard.id, queryErr)
+		}
+		for _, row := range response.Rows {
+			if len(row) == 1 && string(row[0].Bytes) == `["`+baseKey+`"]` {
+				foundLocator = true
+			}
+		}
+	}
+	if !foundLocator {
+		t.Fatal("committed global index locator was not found")
+	}
+
+	conflictingBase := c.freshKeysForShard(t, c.shards[3].id, 1)[0]
+	_, err = executor.Exec(context.Background(), Query{
+		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(conflictingBase), shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("duplicate global claim err = %v", err)
+	}
+	c.verifyDeleted(t, conflictingBase)
+}
+
 func TestE2EAtomicBatchSpansTablesAndShards(t *testing.T) {
 	c := newE2ECluster(t)
 	seedClient := NewClient(plainDial(c.dialer.servers))

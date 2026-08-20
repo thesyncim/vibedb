@@ -98,7 +98,8 @@ is an ordinary hidden relation with its own distribution and Raft groups; there
 is no central index service. Its ordered key is:
 
 ```text
-(encoded index values, encoded base primary key)
+non-unique: (encoded index values, encoded base locator)
+unique:     (encoded index values) -> encoded base locator
 ```
 
 An entry may carry a bounded covering payload. Equality and range predicates
@@ -107,6 +108,14 @@ owner before fetch. Strong index maintenance participates in the same
 transaction as the base mutation. A globally unique index is owned by the
 bucket containing its encoded unique key, which serializes conflicting claims
 without a cluster-wide lock.
+
+The current implementation slice compiles READY global-index key/locator
+programs with `vibejson` and expands an INSERT into base plus index participants
+inside the existing durable fixed-set transaction. Index entries use canonical
+binary tuple keys and compact JSON scalar-array locators, with one shard-local
+ID/incarnation marker instead of repeating that fence in every value. Lookup,
+owner-grouped base fetch, UPDATE/DELETE old-row capture, and online build remain
+gated work; until they land, a READY indexed UPDATE or DELETE fails closed.
 
 An online build has one monotone incarnation and the following catalog states:
 

@@ -152,32 +152,98 @@ func (e *Executor) planTransaction(
 		if call == nil {
 			continue
 		}
-		participantIndex := -1
-		for j := range participants {
-			if sameTransactionTarget(participants[j].call.req, call.req) {
-				participantIndex = j
-				break
-			}
-		}
-		if participantIndex < 0 {
-			participants = append(participants, transactionParticipant{
-				call: *call, bucketBits: call.req.BucketBits,
-				scopes: call.req.AccessScopes,
-			})
-			participantIndex = len(participants) - 1
-			if len(participants) > distributedtxn.MaxParticipants {
-				return nil, ErrTransactionParticipantLimit
-			}
-		}
-		participant := &participants[participantIndex]
-		if len(participant.statements) != 0 {
-			mergeParticipantScopes(participant, call.req.BucketBits, call.req.AccessScopes)
-		}
-		participant.statements = append(
-			participant.statements,
-			shardservice.MutationStatement{SQL: query.SQL, Params: query.Params},
+		participants, err = appendBoundWriteParticipants(
+			participants, *call, query, bound, profile,
 		)
+		if err != nil {
+			return nil, err
+		}
 	}
+	sortTransactionParticipants(participants)
+	return participants, nil
+}
+
+func appendBoundWriteParticipants(
+	participants []transactionParticipant,
+	baseCall shardCall,
+	query *Query,
+	bound *BoundWritePlan,
+	profile Profile,
+) ([]transactionParticipant, error) {
+	var err error
+	participants, err = appendTransactionStatement(
+		participants, baseCall,
+		shardservice.MutationStatement{SQL: query.SQL, Params: query.Params},
+	)
+	if err != nil {
+		return nil, err
+	}
+	for i := range bound.globalIndexes {
+		index := &bound.globalIndexes[i]
+		call := shardCall{
+			target: index.target, address: index.address,
+			req: &shardservice.ShardRequest{
+				Distribution: index.distribution, Shard: index.target.Shard,
+				AllocationGeneration: index.target.AllocationGeneration,
+				RoutingVersion:       index.routingVersion,
+				OwnershipEpoch:       index.target.OwnershipEpoch,
+				ReadPolicy:           profile.ReadPolicy, ExecutionMode: shardservice.ExecutionReadWrite,
+				Deadline: profile.PerShardDeadline, MaxRows: profile.PerShardRows,
+				MaxResultBytes: profile.PerShardBytes,
+				BucketBits:     index.bucketBits,
+				AccessScopes:   []distributedtxn.IntentScope{index.scope},
+			},
+		}
+		entryKey := bound.globalIndexArena[index.entryStart:index.entryEnd]
+		value := bound.globalIndexArena[index.valueStart:index.valueEnd]
+		participants, err = appendTransactionStatement(
+			participants, call, shardservice.MutationStatement{
+				Kind:     shardservice.MutationGlobalIndexPut,
+				Relation: index.metadata.Relation,
+				IndexID:  index.metadata.IndexID, Incarnation: index.metadata.Incarnation,
+				EntryKey: entryKey, Value: value,
+				LocatorCount: index.metadata.LocatorCount,
+				Unique:       index.metadata.Flags&IndexUnique != 0,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return participants, nil
+}
+
+func appendTransactionStatement(
+	participants []transactionParticipant,
+	call shardCall,
+	statement shardservice.MutationStatement,
+) ([]transactionParticipant, error) {
+	participantIndex := -1
+	for i := range participants {
+		if sameTransactionTarget(participants[i].call.req, call.req) {
+			participantIndex = i
+			break
+		}
+	}
+	if participantIndex < 0 {
+		participants = append(participants, transactionParticipant{
+			call: call, bucketBits: call.req.BucketBits,
+			scopes: call.req.AccessScopes,
+		})
+		participantIndex = len(participants) - 1
+		if len(participants) > distributedtxn.MaxParticipants {
+			return nil, ErrTransactionParticipantLimit
+		}
+	}
+	participant := &participants[participantIndex]
+	if len(participant.statements) != 0 {
+		mergeParticipantScopes(participant, call.req.BucketBits, call.req.AccessScopes)
+	}
+	participant.statements = append(participant.statements, statement)
+	return participants, nil
+}
+
+func sortTransactionParticipants(participants []transactionParticipant) {
 	slices.SortFunc(participants, func(a, b transactionParticipant) int {
 		if a.call.req.Distribution < b.call.req.Distribution {
 			return -1
@@ -193,7 +259,6 @@ func (e *Executor) planTransaction(
 		}
 		return 0
 	})
-	return participants, nil
 }
 
 func mergeParticipantScopes(

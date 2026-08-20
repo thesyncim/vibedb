@@ -79,6 +79,9 @@ type PreparedPlan struct {
 	// column index that supplies it; it is set only for a flat single-document
 	// INSERT.
 	writeKeyColumns []int
+	// writeGlobalIndexes is populated only for a table with READY global index
+	// incarnations. Local and non-ready indexes add no prepared-plan footprint.
+	writeGlobalIndexes []preparedGlobalIndex
 }
 
 // BoundPlan is the immutable execution-specific result of binding typed

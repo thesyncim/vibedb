@@ -3,6 +3,7 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -48,6 +49,7 @@ type GlobalIndexWorkspace struct {
 	keyTuple     []byte
 	locatorTuple []byte
 	entryKey     []byte
+	locatorValue []byte
 }
 
 // GlobalIndexRoute is one extracted index entry plus both independently
@@ -58,6 +60,10 @@ type GlobalIndexRoute struct {
 	KeyTuple     []byte
 	LocatorTuple []byte
 	EntryKey     []byte
+	// LocatorValue is a compact vibejson-compatible scalar array persisted as
+	// the entry payload. It preserves exact numbers and decodes back to the
+	// locator tuple without base64 or a binary-to-text space tax.
+	LocatorValue []byte
 
 	IndexPoint      distribution.KeyspacePoint
 	IndexTarget     distribution.Target
@@ -207,17 +213,41 @@ func (p GlobalIndexProgram) RouteDocument(
 	key := workspace.scalars[:len(p.keyPointers)]
 	locator := workspace.scalars[len(p.keyPointers) : len(p.keyPointers)+len(p.locatorPointers)]
 	workspace.decoded, err = extractGlobalIndexScalars(
-		root, p.keyPointers, key, workspace.decoded, "key",
+		root, p.keyPointers, key, workspace.decoded, "key", nil,
 	)
 	if err != nil {
 		return GlobalIndexRoute{}, err
 	}
 	workspace.decoded, err = extractGlobalIndexScalars(
 		root, p.locatorPointers, locator, workspace.decoded, "locator",
+		&workspace.locatorValue,
 	)
 	if err != nil {
 		return GlobalIndexRoute{}, err
 	}
+	return p.routeScalars(key, locator, workspace, false)
+}
+
+// RouteScalars routes an already extracted index key and base locator. It is
+// the flat-INSERT fast path: prepared column ordinals feed canonical scalars
+// directly, avoiding construction and reparsing of an intermediate document.
+func (p GlobalIndexProgram) RouteScalars(
+	key, locator []distribution.Scalar,
+	workspace *GlobalIndexWorkspace,
+) (GlobalIndexRoute, error) {
+	if p.snapshot == nil || workspace == nil || len(key) != len(p.keyPointers) ||
+		len(locator) != len(p.locatorPointers) {
+		return GlobalIndexRoute{}, ErrGlobalIndexDocument
+	}
+	return p.routeScalars(key, locator, workspace, true)
+}
+
+func (p GlobalIndexProgram) routeScalars(
+	key, locator []distribution.Scalar,
+	workspace *GlobalIndexWorkspace,
+	encodeLocator bool,
+) (GlobalIndexRoute, error) {
+	var err error
 	workspace.keyTuple, err = distribution.CurrentTupleCodec.AppendTuple(workspace.keyTuple[:0], key)
 	if err != nil {
 		return GlobalIndexRoute{}, fmt.Errorf("%w: encode key: %v", ErrGlobalIndexDocument, err)
@@ -231,6 +261,14 @@ func (p GlobalIndexProgram) RouteDocument(
 	workspace.entryKey = append(workspace.entryKey[:0], workspace.keyTuple...)
 	if p.metadata.Flags&IndexUnique == 0 {
 		workspace.entryKey = append(workspace.entryKey, workspace.locatorTuple...)
+	}
+	if encodeLocator {
+		workspace.locatorValue, err = appendGlobalIndexLocatorValue(
+			workspace.locatorValue[:0], locator,
+		)
+		if err != nil {
+			return GlobalIndexRoute{}, err
+		}
 	}
 
 	indexMapper := distribution.NewNativeMapperWithBucketBits(
@@ -273,7 +311,7 @@ func (p GlobalIndexProgram) RouteDocument(
 	return GlobalIndexRoute{
 		Index:    p.metadata,
 		KeyTuple: workspace.keyTuple, LocatorTuple: workspace.locatorTuple,
-		EntryKey:   workspace.entryKey,
+		EntryKey: workspace.entryKey, LocatorValue: workspace.locatorValue,
 		IndexPoint: indexPoint, IndexTarget: indexTarget, IndexAddress: indexAddress,
 		IndexBucketBits: indexMapper.VirtualBucketBits(),
 		IndexScope:      distributedtxn.IntentScope{Start: uint32(indexBucket), End: uint32(indexBucket) + 1},
@@ -283,13 +321,63 @@ func (p GlobalIndexProgram) RouteDocument(
 	}, nil
 }
 
+var globalIndexStringEncoder, globalIndexStringEncoderError = vibejson.CompileEncoder[string](vibejson.EncoderOptions{DisableHTMLEscaping: true})
+
+func appendGlobalIndexLocatorValue(
+	dst []byte,
+	locator []distribution.Scalar,
+) ([]byte, error) {
+	if globalIndexStringEncoderError != nil {
+		return dst, fmt.Errorf("%w: compile string encoder: %v",
+			ErrGlobalIndexDocument, globalIndexStringEncoderError)
+	}
+	start := len(dst)
+	dst = append(dst, '[')
+	for i := range locator {
+		if i != 0 {
+			dst = append(dst, ',')
+		}
+		switch locator[i].Kind() {
+		case distribution.KindString:
+			value, _ := locator[i].StringValue()
+			if !utf8.ValidString(value) {
+				return dst[:start], fmt.Errorf(
+					"%w: locator %d is not valid UTF-8",
+					ErrGlobalIndexDocument, i,
+				)
+			}
+			var err error
+			dst, err = globalIndexStringEncoder.AppendJSON(dst, &value)
+			if err != nil {
+				return dst[:start], fmt.Errorf(
+					"%w: encode locator %d: %v",
+					ErrGlobalIndexDocument, i, err,
+				)
+			}
+		case distribution.KindNumber:
+			value, _ := locator[i].NumberSpelling()
+			dst = append(dst, value...)
+		default:
+			return dst[:start], fmt.Errorf(
+				"%w: locator %d has invalid scalar kind",
+				ErrGlobalIndexDocument, i,
+			)
+		}
+	}
+	return append(dst, ']'), nil
+}
+
 func extractGlobalIndexScalars(
 	root vibejson.Node,
 	pointers []vibejson.CompiledPointer,
 	destination []distribution.Scalar,
 	decoded []byte,
 	label string,
+	rawArray *[]byte,
 ) ([]byte, error) {
+	if rawArray != nil {
+		*rawArray = append((*rawArray)[:0], '[')
+	}
 	for i := range pointers {
 		node, found, err := root.PointerCompiled(pointers[i])
 		if err != nil {
@@ -306,15 +394,14 @@ func extractGlobalIndexScalars(
 		case jsondoc.String:
 			if text, ok := value.StringBytes(); ok {
 				destination[i] = distribution.NewString(byteview.String(text))
-				continue
+			} else {
+				start := len(decoded)
+				decoded, ok, err = value.AppendText(decoded)
+				if err != nil || !ok {
+					return decoded, fmt.Errorf("%w: %s path %d has an invalid string", ErrGlobalIndexDocument, label, i)
+				}
+				destination[i] = distribution.NewString(byteview.String(decoded[start:]))
 			}
-			start := len(decoded)
-			var ok bool
-			decoded, ok, err = value.AppendText(decoded)
-			if err != nil || !ok {
-				return decoded, fmt.Errorf("%w: %s path %d has an invalid string", ErrGlobalIndexDocument, label, i)
-			}
-			destination[i] = distribution.NewString(byteview.String(decoded[start:]))
 		case jsondoc.Number:
 			number, ok := value.NumberText()
 			if !ok {
@@ -327,6 +414,15 @@ func extractGlobalIndexScalars(
 		default:
 			return decoded, fmt.Errorf("%w: %s path %d is not a string or number", ErrGlobalIndexDocument, label, i)
 		}
+		if rawArray != nil {
+			if i != 0 {
+				*rawArray = append(*rawArray, ',')
+			}
+			*rawArray = value.AppendJSON(*rawArray)
+		}
+	}
+	if rawArray != nil {
+		*rawArray = append(*rawArray, ']')
 	}
 	return decoded, nil
 }

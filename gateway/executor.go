@@ -276,18 +276,30 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
-		e.metrics.observeRoute(kind, 1, scatter)
 
 		var res *Result
-		if call != nil {
+		if call != nil && len(bound.globalIndexes) != 0 {
+			participants, participantErr := appendBoundWriteParticipants(
+				nil, *call, &q, bound, profile,
+			)
+			if participantErr != nil {
+				return nil, participantErr
+			}
+			sortTransactionParticipants(participants)
+			res, err = e.executeTransaction(opctx, snap, participants, profile)
+		} else if call != nil {
+			e.metrics.observeRoute(kind, 1, scatter)
 			res, err = e.single(opctx, *call, profile)
 		} else {
+			e.metrics.observeRoute(kind, 0, scatter)
 			res = &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 0}
 		}
 		if err == nil {
-			res.RouteKind = kind
+			if len(bound.globalIndexes) == 0 {
+				res.RouteKind = kind
+			}
 			res.Generation = snap.Generation()
-			if call != nil {
+			if call != nil && len(bound.globalIndexes) == 0 {
 				res.ShardsFanned = 1
 			}
 			res.Retries = attempt

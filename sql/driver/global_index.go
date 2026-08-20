@@ -1,0 +1,274 @@
+package driver
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+
+	"github.com/thesyncim/vibedb/store/durable"
+	vibejson "github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
+)
+
+var (
+	// ErrGlobalIndexUniqueConflict reports two base locators claiming the same
+	// key in one globally unique index incarnation.
+	ErrGlobalIndexUniqueConflict = errors.New("vibedb: global unique index key is already claimed")
+	// ErrGlobalIndexFence reports a command whose index ID/incarnation does not
+	// match the shard-local relation marker. It fences delayed gateways and
+	// physical-relation reuse without a per-entry identity tax.
+	ErrGlobalIndexFence = errors.New("vibedb: global index relation incarnation conflicts")
+	// ErrGlobalIndexRelation reports a physical relation that is not suitable
+	// for raw canonical index keys and compact locator-array documents.
+	ErrGlobalIndexRelation = errors.New("vibedb: invalid global index relation")
+)
+
+const globalIndexMarkerKey = "\x00"
+
+// ApplyGlobalIndexMutation stages one byte-native global-index entry in the
+// active SQL transaction. The caller has already admitted the containing
+// distributed participant by virtual bucket. This method still validates the
+// relation incarnation and exact locator shape and participates in the SQL
+// runtime's serializable conflict validation before publication.
+//
+// entryKey must be a canonical tuple and therefore cannot begin with the
+// reserved zero tag. value is a compact JSON array of string/exact-number base
+// locator scalars. PUT is idempotent for the same locator. A unique PUT rejects
+// a different locator; DELETE compares its expected locator so a stale delete
+// can never remove a newer claim.
+func (s *Session) ApplyGlobalIndexMutation(
+	ctx context.Context,
+	relation string,
+	indexID, incarnation uint64,
+	entryKey, value []byte,
+	locatorCount uint8,
+	unique, remove bool,
+) (changed bool, err error) {
+	if err := s.ready(ctx); err != nil {
+		return false, err
+	}
+	if s.state != SessionInTransaction || s.conn.tx == nil {
+		return false, ErrNoTransaction
+	}
+	if s.conn.tx.readOnly {
+		return false, s.fail(ErrReadOnlyTransaction)
+	}
+	if relation == "" || indexID == 0 || incarnation == 0 ||
+		len(entryKey) == 0 || entryKey[0] == 0 ||
+		locatorCount == 0 || locatorCount > 8 {
+		return false, s.fail(ErrGlobalIndexRelation)
+	}
+	tx := s.conn.tx
+	state := tx.tables[relation]
+	if state == nil {
+		return false, s.fail(fmt.Errorf("%w: %q", ErrTableNotFound, relation))
+	}
+	if state.schema != nil || len(state.incarnation.meta.Indexes) != 0 {
+		return false, s.fail(fmt.Errorf(
+			"%w: relation %q must be schemaless and locally unindexed",
+			ErrGlobalIndexRelation, relation,
+		))
+	}
+	if len(entryKey) > state.limits.MaxKeyBytes {
+		return false, s.fail(durable.ErrKeyTooLarge)
+	}
+	if err := validateGlobalIndexLocator(value, locatorCount); err != nil {
+		return false, s.fail(err)
+	}
+
+	var markerStorage [43]byte
+	marker := markerStorage[:0]
+	marker = append(marker, '[')
+	marker = strconv.AppendUint(marker, indexID, 10)
+	marker = append(marker, ',')
+	marker = strconv.AppendUint(marker, incarnation, 10)
+	marker = append(marker, ']')
+
+	stagedStorage := [2]stagedTxMutation{}
+	staged := stagedStorage[:0]
+	tx.trackSerializablePointRead(state, globalIndexMarkerKey)
+	scratch, markerFound, lookupErr := state.appendRaw(
+		s.conn.pointRaw[:0], globalIndexMarkerKey,
+	)
+	if lookupErr != nil {
+		s.conn.pointRaw = scratch[:0]
+		return false, s.fail(lookupErr)
+	}
+	if markerFound {
+		if !bytes.Equal(scratch, marker) {
+			s.conn.pointRaw = scratch[:0]
+			return false, s.fail(fmt.Errorf(
+				"%w: relation %q", ErrGlobalIndexFence, relation,
+			))
+		}
+	} else {
+		staged = append(staged, stagedTxMutation{
+			key: globalIndexMarkerKey, document: marker, existed: false,
+		})
+	}
+	s.conn.pointRaw = scratch[:0]
+
+	entryKeyString := byteview.String(entryKey)
+	tx.trackSerializablePointRead(state, entryKeyString)
+	scratch, found, lookupErr := state.appendRaw(s.conn.pointRaw[:0], entryKeyString)
+	if lookupErr != nil {
+		s.conn.pointRaw = scratch[:0]
+		return false, s.fail(lookupErr)
+	}
+	if found {
+		equal := globalIndexLocatorsEqual(scratch, value, locatorCount)
+		if remove {
+			if !equal {
+				s.conn.pointRaw = scratch[:0]
+				return false, s.fail(fmt.Errorf(
+					"%w: stale delete for relation %q", ErrTransactionConflict, relation,
+				))
+			}
+			staged = append(staged, stagedTxMutation{
+				key: entryKeyString, remove: true, existed: true,
+			})
+		} else if equal {
+			// Exact placement identity is already present. Retain the original
+			// spelling and avoid a write-amplifying replacement.
+			s.conn.pointRaw = scratch[:0]
+			if len(staged) == 0 {
+				return false, nil
+			}
+		} else if unique {
+			s.conn.pointRaw = scratch[:0]
+			return false, s.fail(fmt.Errorf(
+				"%w: relation %q: %w",
+				ErrTransactionConflict, relation, ErrGlobalIndexUniqueConflict,
+			))
+		} else {
+			s.conn.pointRaw = scratch[:0]
+			return false, s.fail(fmt.Errorf(
+				"%w: non-unique entry key collision in relation %q",
+				ErrTransactionConflict, relation,
+			))
+		}
+	} else if !remove {
+		staged = append(staged, stagedTxMutation{
+			key: entryKeyString, document: value, existed: false,
+		})
+	}
+	s.conn.pointRaw = scratch[:0]
+	if len(staged) == 0 {
+		return false, nil
+	}
+	if err := admitGlobalIndexStaged(state, relation, staged); err != nil {
+		return false, s.fail(err)
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return false, s.fail(err)
+	}
+	tx.applyResolvedMutations(state, staged)
+	return true, nil
+}
+
+func admitGlobalIndexStaged(
+	state *txTable,
+	relation string,
+	staged []stagedTxMutation,
+) error {
+	distinct := max(state.highWaterKeys, len(state.order))
+	stagedBytes := max(state.highWaterBytes, state.stagedBytes)
+	probeBytes := state.stagedBytes
+	for i := range staged {
+		mutation := &staged[i]
+		if previous, present := state.pending[mutation.key]; present {
+			probeBytes -= len(mutation.key) + len(previous.document)
+		} else {
+			distinct++
+		}
+		probeBytes += len(mutation.key) + len(mutation.document)
+		stagedBytes = max(stagedBytes, probeBytes)
+	}
+	if distinct > state.limits.MaxBatchDocuments {
+		return fmt.Errorf(
+			"%w: global index relation %q would stage %d keys, limit %d: %w",
+			ErrTransactionTooLarge, relation, distinct,
+			state.limits.MaxBatchDocuments, durable.ErrBatchTooLarge,
+		)
+	}
+	if stagedBytes > state.limits.MaxBatchBytes {
+		return fmt.Errorf(
+			"%w: global index relation %q would stage %d bytes, limit %d: %w",
+			ErrTransactionTooLarge, relation, stagedBytes,
+			state.limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+		)
+	}
+	return nil
+}
+
+func validateGlobalIndexLocator(value []byte, count uint8) error {
+	if len(value) == 0 {
+		return ErrGlobalIndexRelation
+	}
+	var entries [9]vibejson.IndexEntry
+	index, err := vibejson.BuildIndex(value, entries[:])
+	if err != nil {
+		return fmt.Errorf("%w: locator JSON: %v", ErrGlobalIndexRelation, err)
+	}
+	root := index.Root()
+	length, ok := root.ArrayLen()
+	if !ok || length != int(count) {
+		return fmt.Errorf(
+			"%w: locator has %d values, want %d",
+			ErrGlobalIndexRelation, length, count,
+		)
+	}
+	for i := 0; i < length; i++ {
+		node, _ := root.Index(i)
+		if node.Kind() != jsondoc.String && node.Kind() != jsondoc.Number {
+			return fmt.Errorf(
+				"%w: locator value %d is not string or number",
+				ErrGlobalIndexRelation, i,
+			)
+		}
+	}
+	return nil
+}
+
+func globalIndexLocatorsEqual(a, b []byte, count uint8) bool {
+	var aEntries, bEntries [9]vibejson.IndexEntry
+	aIndex, aErr := vibejson.BuildIndex(a, aEntries[:])
+	bIndex, bErr := vibejson.BuildIndex(b, bEntries[:])
+	if aErr != nil || bErr != nil {
+		return false
+	}
+	aRoot, bRoot := aIndex.Root(), bIndex.Root()
+	aLen, aOK := aRoot.ArrayLen()
+	bLen, bOK := bRoot.ArrayLen()
+	if !aOK || !bOK || aLen != int(count) || bLen != int(count) {
+		return false
+	}
+	for i := 0; i < int(count); i++ {
+		aNode, _ := aRoot.Index(i)
+		bNode, _ := bRoot.Index(i)
+		if aNode.Kind() != bNode.Kind() {
+			return false
+		}
+		switch aNode.Kind() {
+		case jsondoc.String:
+			if !vibejson.RawJSONStringEqual(
+				aNode.Raw().Bytes(), aNode.Entry.Flags(),
+				bNode.Raw().Bytes(), bNode.Entry.Flags(),
+			) {
+				return false
+			}
+		case jsondoc.Number:
+			if !vibejson.JSONNumberEqual(
+				aNode.Raw().Bytes(), bNode.Raw().Bytes(),
+			) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}

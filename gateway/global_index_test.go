@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -151,7 +152,8 @@ func TestGlobalIndexRoutesIndexAndBaseIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(route.KeyTuple, wantKey) || !bytes.Equal(route.EntryKey, wantKey) ||
-		!bytes.Equal(route.LocatorTuple, wantLocator) {
+		!bytes.Equal(route.LocatorTuple, wantLocator) ||
+		!bytes.Equal(route.LocatorValue, []byte(`["tenant-7","message-9"]`)) {
 		t.Fatalf("tuples key=%x entry=%x locator=%x, want %x/%x", route.KeyTuple, route.EntryKey, route.LocatorTuple, wantKey, wantLocator)
 	}
 	indexMapper := distribution.NewNativeMapperWithBucketBits(1, distribution.DefaultVirtualBucketBits)
@@ -185,6 +187,96 @@ func TestGlobalIndexRoutesIndexAndBaseIndependently(t *testing.T) {
 	} {
 		if _, err := program.RouteDocument(invalid, &workspace); !errors.Is(err, ErrGlobalIndexDocument) {
 			t.Fatalf("invalid document %s err=%v", invalid, err)
+		}
+	}
+}
+
+func TestGlobalIndexRoutesFlatScalarsWithoutDocument(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := snapshot.CompileGlobalIndex("messages", "by_email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	number, err := distribution.NewNumber("7.00e0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace GlobalIndexWorkspace
+	route, err := program.RouteScalars(
+		[]distribution.Scalar{distribution.NewString("a@example.com")},
+		[]distribution.Scalar{distribution.NewString("tenant"), number},
+		&workspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(route.LocatorValue, []byte(`["tenant",7.00e0]`)) {
+		t.Fatalf("locator value = %s", route.LocatorValue)
+	}
+	if _, err := program.RouteScalars(nil, nil, &workspace); !errors.Is(err, ErrGlobalIndexDocument) {
+		t.Fatalf("invalid scalar arity err = %v", err)
+	}
+}
+
+func TestPreparedInsertExpandsReadyGlobalIndexes(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(context.Background(),
+		`INSERT INTO messages (tenant_id, id, email) VALUES (?, ?, ?)`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.BindWrite([]any{
+		[]byte("tenant-7"), []byte("message-9"), []byte("a@example.com"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bound.globalIndexes) != 1 {
+		t.Fatalf("global mutations = %d, want 1", len(bound.globalIndexes))
+	}
+	mutation := bound.globalIndexes[0]
+	entry := bound.globalIndexArena[mutation.entryStart:mutation.entryEnd]
+	value := bound.globalIndexArena[mutation.valueStart:mutation.valueEnd]
+	if mutation.metadata.Name != "by_email" || mutation.target.Shard == "" ||
+		mutation.address == "" || mutation.bucketBits == 0 ||
+		mutation.scope.End != mutation.scope.Start+1 ||
+		!bytes.Equal(value, []byte(`["tenant-7","message-9"]`)) ||
+		len(entry) == 0 || entry[0] == 0 {
+		t.Fatalf("bound global mutation = %+v entry=%x value=%s", mutation, entry, value)
+	}
+
+	whole, err := snapshot.Prepare(context.Background(),
+		`INSERT INTO messages VALUES (?)`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wholeBound, err := whole.BindWrite([]any{[]byte(
+		`{"tenant_id":"tenant-7","id":"message-9","email":"a@example.com"}`,
+	)})
+	if err != nil || len(wholeBound.globalIndexes) != 1 {
+		t.Fatalf("whole-document global bind = %d,%v", len(wholeBound.globalIndexes), err)
+	}
+
+	for _, statement := range []string{
+		`UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		`DELETE FROM messages WHERE tenant_id = ?`,
+	} {
+		if _, err := snapshot.Prepare(context.Background(), statement); !errors.Is(err, ErrGlobalIndexMaintenanceUnsupported) {
+			t.Fatalf("indexed mutation %q err = %v", statement, err)
 		}
 	}
 }
@@ -236,6 +328,35 @@ func BenchmarkGlobalIndexRouteDocument(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		if _, err := program.RouteDocument(document, &workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkGlobalIndexRouteScalars(b *testing.B) {
+	config, endpoints := globalIndexCatalog(b)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	program, err := snapshot.CompileGlobalIndex("messages", "by_email")
+	if err != nil {
+		b.Fatal(err)
+	}
+	key := []distribution.Scalar{distribution.NewString("a@example.com")}
+	locator := []distribution.Scalar{
+		distribution.NewString("tenant-7"), distribution.NewString("message-9"),
+	}
+	var workspace GlobalIndexWorkspace
+	if _, err := program.RouteScalars(key, locator, &workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := program.RouteScalars(key, locator, &workspace); err != nil {
 			b.Fatal(err)
 		}
 	}
