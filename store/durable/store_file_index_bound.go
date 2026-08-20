@@ -17,14 +17,15 @@ import (
 // by the snapshot's immutable collection catalog; AppendIndexes borrows those
 // strings rather than copying their bytes into query workspace. MaskCount is
 // the maximum number of stable-slot masks one probe can return. The workspace
-// fields bound the storage retained by one candidate, exact single-column, or
-// exact compound probe respectively; query-owned output masks are intentionally
-// separate because a boolean predicate may retain several independent mask
+// fields bound storage retained by one candidate, ordered range, exact
+// single-column, or exact compound probe respectively; query-owned output masks
+// are separate because a boolean predicate may retain several independent mask
 // buffers at once.
 type IndexProbeMemoryBound struct {
 	CatalogBytes                int64
 	MaskCount                   uint64
 	CandidateWorkspaceBytes     int64
+	RangeWorkspaceBytes         int64
 	ExactSingleWorkspaceBytes   int64
 	ExactCompoundWorkspaceBytes int64
 }
@@ -54,6 +55,16 @@ func (s *Snapshot) IndexProbeMemoryBound() (IndexProbeMemoryBound, error) {
 		// the fold base's occupied tiles plus every tile the overlay window
 		// could have added — conservative, which is this function's contract.
 		bound.MaskCount = s.epoch.liveTileBound()
+		maskBytes := retainedIndexSliceBytes(
+			bound.MaskCount, uint64(unsafe.Sizeof(store.Mask{})),
+		)
+		termBytes := retainedIndexSliceBytes(
+			storeio.IndexTermMaxKeyBytes+1, 1,
+		)
+		bound.RangeWorkspaceBytes = indexBoundSum(
+			indexBoundProduct(3, uint64(maskBytes)),
+			indexBoundProduct(3, uint64(termBytes)),
+		)
 		return bound, nil
 	}
 

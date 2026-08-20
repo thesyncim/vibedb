@@ -286,6 +286,52 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 		t.Fatalf("bounded OR pushdown stats = %+v", stats)
 	}
 
+	rangeQuery := Select(Path("id")).Where(Cmp("tenant", Lt, "b"))
+	compiledRange, err := rangeQuery.compiled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	planJSON, err := compiledRange.explainJSON("", 1, ExplainOptions{
+		IndexCatalogKnown: true,
+		Indexes:           snapshot.AppendIndexes(nil),
+		IndexRanges:       true,
+	})
+	if err != nil || !strings.Contains(
+		planJSON, `"access_path":"adaptive-exact-index-or-scan"`,
+	) {
+		t.Fatalf("ordered secondary range explain = (%s,%v)", planJSON, err)
+	}
+	_, stats = run(rangeQuery)
+	if !stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 64 || stats.RowsScanned != 64 ||
+		stats.IndexCertificateRows != 0 || stats.IndexPostingPages == 0 {
+		t.Fatalf("ordered secondary range pushdown stats = %+v", stats)
+	}
+
+	_, stats = run(
+		Select(Path("id")).Where(And(
+			Cmp("tenant", Ge, "a"),
+			Cmp("tenant", Ge, "acme"),
+			Cmp("tenant", Lt, "b"),
+			Cmp("tenant", Le, "z"),
+		)),
+	)
+	if !stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 64 || stats.RowsScanned != 64 {
+		t.Fatalf("combined ordered secondary span stats = %+v", stats)
+	}
+
+	_, stats = run(
+		Select(Path("id")).Where(And(
+			Cmp("tenant", Lt, "b"),
+			Cmp("profile.geo.country", Eq, "PT"),
+		)),
+	)
+	if !stats.IndexBounded || stats.IndexLookups != 2 ||
+		stats.CandidateRows != 32 || stats.RowsScanned != 32 {
+		t.Fatalf("range and exact mask intersection stats = %+v", stats)
+	}
+
 	_, stats = run(
 		Select(Path("id")).Where(Or(
 			Cmp("tenant", Eq, "acme"),

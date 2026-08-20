@@ -18,6 +18,7 @@ import (
 type ExplainOptions struct {
 	IndexCatalogKnown bool
 	Indexes           []store.IndexInfo
+	IndexRanges       bool
 	PrimaryPoint      bool
 	PrimaryRange      bool
 }
@@ -751,7 +752,9 @@ func explainAccessPath(predicate *compiledPredicate, paths []compiledPath, joins
 	}
 	if options.IndexCatalogKnown {
 		var workspace Workspace
-		if predicate.canBound(paths, options.Indexes, &workspace) {
+		if predicate.canBoundWithRanges(
+			paths, options.Indexes, &workspace, options.IndexRanges,
+		) {
 			return "adaptive-exact-index-or-scan"
 		}
 		if joins != 0 {

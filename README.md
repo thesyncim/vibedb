@@ -158,11 +158,12 @@ func main() {
 }
 ```
 
-The supported surface includes schema-checked tables, exact indexes, DML with
-`RETURNING`, joins, derived tables, CTEs, set operations, a bounded recursive
-CTE subset, a documented window-function subset, views, predicate subqueries,
-and snapshot transactions. Unsupported shapes return explicit positioned
-errors instead of silently changing semantics.
+The supported surface includes schema-checked tables, exact indexes with
+durable ordered-range pushdown, DML with `RETURNING`, joins, derived tables,
+CTEs, set operations, a bounded recursive CTE subset, a documented
+window-function subset, views, predicate subqueries, and snapshot transactions.
+Unsupported shapes return explicit positioned errors instead of silently
+changing semantics.
 
 VibeDB SQL is intentionally a subset, not PostgreSQL compatibility. Read the
 [SQL surface](docs/design/sql-surface.md) before choosing an ORM or generating

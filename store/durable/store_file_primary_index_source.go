@@ -65,3 +65,33 @@ func (s *Snapshot) AppendIndexCandidateMasks(dst []store.Mask, name string, valu
 func (s *Snapshot) AppendIndexCandidateMasksInto(dst []store.Mask, workspace *IndexWorkspace, name string, values ...vibejson.Index) ([]store.Mask, error) {
 	return s.AppendIndexMasksInto(dst, workspace, name, values...)
 }
+
+// AppendIndexRangeCandidateMasks probes a single-column ordered exact index.
+// The returned masks are a candidate superset; callers must recheck the full
+// comparison. A false bound result leaves dst unchanged and requests a scan.
+func (s *Snapshot) AppendIndexRangeCandidateMasks(
+	dst []store.Mask,
+	name string,
+	span store.IndexRange,
+) ([]store.Mask, bool, error) {
+	var workspace IndexWorkspace
+	return s.AppendIndexRangeCandidateMasksInto(dst, &workspace, name, span)
+}
+
+// AppendIndexRangeCandidateMasksInto is the reusable-workspace form of
+// AppendIndexRangeCandidateMasks.
+func (s *Snapshot) AppendIndexRangeCandidateMasksInto(
+	dst []store.Mask,
+	workspace *IndexWorkspace,
+	name string,
+	span store.IndexRange,
+) ([]store.Mask, bool, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return dst, false, ErrClosed
+	}
+	if workspace == nil {
+		var local IndexWorkspace
+		workspace = &local
+	}
+	return s.appendPrimaryExactRangeMasks(dst, workspace, name, span)
+}

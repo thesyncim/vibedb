@@ -194,6 +194,16 @@ type IndexWorkspace struct {
 	// needle is the canonicalized probe term's scratch, retained so a warmed
 	// probe neither heap-allocates nor re-zeroes a maximum-size stack array.
 	needle []byte
+	// Range probes union many exact term postings without exposing intermediate
+	// masks to query. Three alternating buffers keep every merge ordered and
+	// allocation-free after the observed tile high-water mark; endpoint terms
+	// retain their canonical ordered-key bytes independently.
+	rangeProbe []store.Mask
+	rangeAcc   []store.Mask
+	rangeMerge []store.Mask
+	rangeLower []byte
+	rangeUpper []byte
+	rangeLast  []byte
 }
 
 // primaryExactProbeTile is one resolved overlay contribution for a probe:
@@ -238,6 +248,12 @@ func (w *IndexWorkspace) Release() {
 	w.overlayTiles = nil
 	w.baseTiles = nil
 	w.needle = nil
+	w.rangeProbe = nil
+	w.rangeAcc = nil
+	w.rangeMerge = nil
+	w.rangeLower = nil
+	w.rangeUpper = nil
+	w.rangeLast = nil
 }
 
 // Snapshot acquires an explicit generation lease.

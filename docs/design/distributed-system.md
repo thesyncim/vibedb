@@ -250,9 +250,9 @@ cluster does not fork into named protocol generations.
    wired.
 4. **In progress:** independently sharded global-index CRUD, batched finite-key
    locator projections, exact grouped base fetch, resumable online-build data
-   plane, local generation drains, and native primary-range skipping are
-   present; cluster-wide build orchestration and persisted non-primary row-group
-   summaries are next.
+   plane, local generation drains, native primary-range skipping, and bounded
+   ordered secondary-index range masks are present; cluster-wide build
+   orchestration and compact non-indexed row-group summaries are next.
 5. **Partly serving:** shard-local execution already has bounded parallel
    batches, filter-first/lazy projection, exact-index pushdown, covering
    aggregates, adaptive joins, and spill. Distributed vectorized stage

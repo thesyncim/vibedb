@@ -554,6 +554,7 @@ func (s *stmt) analyzeRows(ctx context.Context, args []any) (*rows, error) {
 	options := query.ExplainOptions{}
 	if resultRows.snapshot != nil {
 		options.IndexCatalogKnown = true
+		options.IndexRanges = true
 		options.Indexes = resultRows.snapshot.AppendIndexes(nil)
 	} else {
 		options, err = s.explainOptions(ctx)
@@ -650,6 +651,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 			return query.ExplainOptions{}, s.missingDependency(collection, true)
 		}
 		if state.snapshot != nil {
+			options.IndexRanges = true
 			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
 		}
 		options.PrimaryPoint = s.pointCandidate && s.pointPath == state.primaryKey
@@ -676,6 +678,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 		return query.ExplainOptions{}, err
 	}
 	options.Indexes = snapshot.AppendIndexes(options.Indexes)
+	options.IndexRanges = true
 	closeErr := snapshot.Close()
 	if closeErr != nil {
 		return query.ExplainOptions{}, closeErr

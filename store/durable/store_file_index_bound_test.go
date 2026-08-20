@@ -44,6 +44,7 @@ func TestIndexProbeMemoryBoundCatalogOwnership(t *testing.T) {
 	if bound.CatalogBytes != wantCatalog ||
 		bound.MaskCount != 0 ||
 		bound.CandidateWorkspaceBytes != 0 ||
+		bound.RangeWorkspaceBytes <= 0 ||
 		bound.ExactSingleWorkspaceBytes != 0 ||
 		bound.ExactCompoundWorkspaceBytes != 0 {
 		t.Fatalf("empty indexed bound = %+v, catalog want %d", bound, wantCatalog)
@@ -107,6 +108,7 @@ func TestIndexProbeMemoryBoundNoIndexLeavesProbeWorkspaceZero(t *testing.T) {
 	if bound.CatalogBytes != 0 ||
 		bound.MaskCount != 1 ||
 		bound.CandidateWorkspaceBytes != 0 ||
+		bound.RangeWorkspaceBytes != 0 ||
 		bound.ExactSingleWorkspaceBytes != 0 ||
 		bound.ExactCompoundWorkspaceBytes != 0 {
 		t.Fatalf("zone-only bound = %+v", bound)

@@ -84,8 +84,15 @@ Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
 ordered-key bounds and seek the durable primary graph before document decoding.
 The query engine retains its compiled predicate as the correctness authority,
 then applies filter-first extraction and late projection over only the visited
-span. Exact-index candidate masks and covering aggregates remain separate
-adaptive paths; no range metadata is duplicated into another format.
+span. Single-column secondary inequalities binary-search the same persisted,
+prefix-compressed ordered term leaves used by equality indexes, union their
+stable-slot postings under the pinned overlay generation, and intersect those
+masks with other exact candidates before row decoding. Broad term spans decline
+under a fixed latency bound. Conjunctive lower and upper bounds over one path
+become one physical term span, so `BETWEEN` does not materialize two broad
+posting unions merely to intersect them. Covering aggregates remain a separate
+exact path; no secondary values or range metadata are duplicated into another
+format.
 
 `SUM` uses exact rational arithmetic and emits a finite canonical JSON decimal.
 `MIN` and `MAX` compare exact values and preserve a contributing spelling.

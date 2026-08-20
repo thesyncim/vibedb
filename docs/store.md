@@ -277,6 +277,17 @@ Boolean intersections use linear advance for nearby masks and galloping advance
 for skewed masks. An exact indexed `COUNT(*)` popcounts the final masks without
 reopening JSON.
 
+The durable ordered-primary implementation also range-seeks single-column
+exact indexes. Canonical scalar bounds binary-search the existing
+prefix-compressed term leaves, union only the postings in the selected term
+span, and then recheck the complete predicate. Snapshot-generation overlays,
+including terms created after the last fold, use the same newest-visible rule
+as equality probes. Fixed term-count and cumulative bitmap-merge budgets
+decline broad or adversarial probes to the ordinary scan without exposing
+partial masks; warmed bounded probes retain their endpoint and bitmap arenas
+and allocate nothing. This reuses the exact index bytes—there is no second
+range-index format or per-row value copy.
+
 This is a Roaring-inspired execution strategy, not the Roaring serialization or
 container format. Array, bitmap, and run-container adaptation is not currently
 implemented.

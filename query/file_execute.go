@@ -677,6 +677,12 @@ func (p *plan) runFileSnapshotBatched(
 	n.mergeBytes = max(int64(1), n.memoryBytes/4)
 	stats.IndexLookups = e.Workspace.storeIndexProbes
 	stats.IndexBounded = candidateMasks != nil
+	indexMetrics := e.file.index.Metrics()
+	stats.IndexPostingPages = int(min(
+		indexMetrics.PostingPages, uint64(^uint(0)>>1),
+	))
+	stats.IndexCertificateRows = indexMetrics.CertificateRows
+	stats.IndexRecheckRows = indexMetrics.DocumentRecheckRows
 	if stats.IndexBounded {
 		for _, mask := range candidateMasks {
 			rows := bits.OnesCount64(mask.Bits)
