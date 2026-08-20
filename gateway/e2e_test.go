@@ -918,6 +918,38 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 	if !foundLocator {
 		t.Fatal("committed global index locator was not found")
 	}
+	indexedRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("global indexed read: %v", err)
+	}
+	if indexedRead.RouteKind != distribution.RouteTargeted ||
+		indexedRead.ShardsFanned != 2 || len(indexedRead.Rows) != 1 ||
+		len(indexedRead.Rows[0]) != 2 ||
+		string(indexedRead.Rows[0][0].Bytes) != `"`+baseKey+`"` ||
+		string(indexedRead.Rows[0][1].Bytes) != "777" ||
+		indexedRead.PlanFingerprint == "" {
+		t.Fatalf("global indexed read result = %+v", indexedRead)
+	}
+	missingRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("778"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("missing global indexed read: %v", err)
+	}
+	if missingRead.RouteKind != distribution.RouteSingle ||
+		missingRead.ShardsFanned != 1 || len(missingRead.Rows) != 0 {
+		t.Fatalf("missing global indexed read result = %+v", missingRead)
+	}
 
 	conflictingBase := c.freshKeysForShard(t, c.shards[3].id, 1)[0]
 	_, err = executor.Exec(context.Background(), Query{

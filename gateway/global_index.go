@@ -78,6 +78,14 @@ type GlobalIndexRoute struct {
 	BaseScope      distributedtxn.IntentScope
 }
 
+type globalIndexOwner struct {
+	point   distribution.KeyspacePoint
+	target  distribution.Target
+	address string
+	bits    uint8
+	scope   distributedtxn.IntentScope
+}
+
 // CompileGlobalIndex resolves and pins one ready global index without copying
 // its compiled vibejson programs. Catalog publication fences ID, incarnation,
 // relation placement, and every key/locator path.
@@ -242,6 +250,96 @@ func (p GlobalIndexProgram) RouteScalars(
 	return p.routeScalars(key, locator, workspace, true)
 }
 
+// RouteKey resolves an equality key to the independently sharded index owner
+// without requiring a base locator. It is the gateway read-planning fast path:
+// the canonical tuple is sent byte-for-byte to the shard lookup envelope.
+func (p GlobalIndexProgram) RouteKey(
+	key []distribution.Scalar,
+	workspace *GlobalIndexWorkspace,
+) (GlobalIndexRoute, error) {
+	if p.snapshot == nil || workspace == nil || len(key) != len(p.keyPointers) {
+		return GlobalIndexRoute{}, ErrGlobalIndexDocument
+	}
+	var err error
+	workspace.keyTuple, err = distribution.CurrentTupleCodec.AppendTuple(
+		workspace.keyTuple[:0], key,
+	)
+	if err != nil {
+		return GlobalIndexRoute{}, fmt.Errorf("%w: encode key: %v", ErrGlobalIndexDocument, err)
+	}
+	owner, err := p.resolveIndexOwner(key)
+	if err != nil {
+		return GlobalIndexRoute{}, err
+	}
+	return GlobalIndexRoute{
+		Index: p.metadata, KeyTuple: workspace.keyTuple,
+		IndexPoint: owner.point, IndexTarget: owner.target,
+		IndexAddress: owner.address, IndexBucketBits: owner.bits,
+		IndexScope: owner.scope,
+	}, nil
+}
+
+// RouteLocatorValue validates and decodes one compact locator array returned by
+// an index shard, then resolves its base owner. Strings remain byte-native and
+// exact numbers never cross floating point. Returned slices alias workspace.
+func (p GlobalIndexProgram) RouteLocatorValue(
+	value []byte,
+	workspace *GlobalIndexWorkspace,
+) (GlobalIndexRoute, error) {
+	if p.snapshot == nil || workspace == nil || len(value) == 0 {
+		return GlobalIndexRoute{}, ErrGlobalIndexDocument
+	}
+	needed, err := vibejson.RequiredIndexEntries(value)
+	if err != nil {
+		return GlobalIndexRoute{}, fmt.Errorf("%w: invalid locator JSON: %v", ErrGlobalIndexDocument, err)
+	}
+	if cap(workspace.entries) < needed {
+		workspace.entries = make([]vibejson.IndexEntry, needed)
+	} else {
+		workspace.entries = workspace.entries[:needed]
+	}
+	index, err := vibejson.BuildIndex(value, workspace.entries)
+	if err != nil {
+		return GlobalIndexRoute{}, fmt.Errorf("%w: invalid locator JSON: %v", ErrGlobalIndexDocument, err)
+	}
+	root := index.Root()
+	length, ok := root.ArrayLen()
+	if !ok || length != len(p.locatorPointers) {
+		return GlobalIndexRoute{}, fmt.Errorf(
+			"%w: locator has %d values, want %d",
+			ErrGlobalIndexDocument, length, len(p.locatorPointers),
+		)
+	}
+	workspace.decoded = workspace.decoded[:0]
+	locator := workspace.scalars[len(p.keyPointers) : len(p.keyPointers)+length]
+	for i := range locator {
+		node, _ := root.Index(i)
+		workspace.decoded, err = extractGlobalIndexScalar(
+			node.Raw(), &locator[i], workspace.decoded, "locator", i,
+		)
+		if err != nil {
+			return GlobalIndexRoute{}, err
+		}
+	}
+	workspace.locatorTuple, err = distribution.CurrentTupleCodec.AppendTuple(
+		workspace.locatorTuple[:0], locator,
+	)
+	if err != nil {
+		return GlobalIndexRoute{}, fmt.Errorf("%w: encode locator: %v", ErrGlobalIndexDocument, err)
+	}
+	owner, err := p.resolveBaseOwner(locator, workspace)
+	if err != nil {
+		return GlobalIndexRoute{}, err
+	}
+	return GlobalIndexRoute{
+		Index: p.metadata, LocatorTuple: workspace.locatorTuple,
+		LocatorValue: value,
+		BasePoint:    owner.point, BaseTarget: owner.target,
+		BaseAddress: owner.address, BaseBucketBits: owner.bits,
+		BaseScope: owner.scope,
+	}, nil
+}
+
 func (p GlobalIndexProgram) routeScalars(
 	key, locator []distribution.Scalar,
 	workspace *GlobalIndexWorkspace,
@@ -271,53 +369,79 @@ func (p GlobalIndexProgram) routeScalars(
 		}
 	}
 
-	indexMapper := distribution.NewNativeMapperWithBucketBits(
-		p.indexSpec.Arity, p.indexSpec.EffectiveBucketBits(),
-	)
-	indexPoint, err := indexMapper.PointFor(key)
-	if err != nil {
-		return GlobalIndexRoute{}, fmt.Errorf("%w: route index key: %v", ErrGlobalIndexDocument, err)
-	}
-	indexTarget, ok := p.indexManifest.ResolvePointTarget(indexPoint)
-	if !ok {
-		return GlobalIndexRoute{}, &CatalogError{Reason: "global index manifest does not own mapped point"}
-	}
-	indexAddress, err := p.snapshot.Address(indexTarget.Endpoint)
+	indexOwner, err := p.resolveIndexOwner(key)
 	if err != nil {
 		return GlobalIndexRoute{}, err
 	}
-
-	baseKey := workspace.baseScalars[:p.baseArity]
-	for i := range baseKey {
-		baseKey[i] = locator[p.baseOrdinals[i]]
-	}
-	baseMapper := distribution.NewNativeMapperWithBucketBits(
-		p.baseSpec.Arity, p.baseSpec.EffectiveBucketBits(),
-	)
-	basePoint, err := baseMapper.PointFor(baseKey)
-	if err != nil {
-		return GlobalIndexRoute{}, fmt.Errorf("%w: route base locator: %v", ErrGlobalIndexDocument, err)
-	}
-	baseTarget, ok := p.baseManifest.ResolvePointTarget(basePoint)
-	if !ok {
-		return GlobalIndexRoute{}, &CatalogError{Reason: "base manifest does not own global index locator"}
-	}
-	baseAddress, err := p.snapshot.Address(baseTarget.Endpoint)
+	baseOwner, err := p.resolveBaseOwner(locator, workspace)
 	if err != nil {
 		return GlobalIndexRoute{}, err
 	}
-	indexBucket, _ := distribution.VirtualBucketForPoint(indexPoint, indexMapper.VirtualBucketBits())
-	baseBucket, _ := distribution.VirtualBucketForPoint(basePoint, baseMapper.VirtualBucketBits())
 	return GlobalIndexRoute{
 		Index:    p.metadata,
 		KeyTuple: workspace.keyTuple, LocatorTuple: workspace.locatorTuple,
 		EntryKey: workspace.entryKey, LocatorValue: workspace.locatorValue,
-		IndexPoint: indexPoint, IndexTarget: indexTarget, IndexAddress: indexAddress,
-		IndexBucketBits: indexMapper.VirtualBucketBits(),
-		IndexScope:      distributedtxn.IntentScope{Start: uint32(indexBucket), End: uint32(indexBucket) + 1},
-		BasePoint:       basePoint, BaseTarget: baseTarget, BaseAddress: baseAddress,
-		BaseBucketBits: baseMapper.VirtualBucketBits(),
-		BaseScope:      distributedtxn.IntentScope{Start: uint32(baseBucket), End: uint32(baseBucket) + 1},
+		IndexPoint: indexOwner.point, IndexTarget: indexOwner.target,
+		IndexAddress: indexOwner.address, IndexBucketBits: indexOwner.bits,
+		IndexScope: indexOwner.scope,
+		BasePoint:  baseOwner.point, BaseTarget: baseOwner.target,
+		BaseAddress: baseOwner.address, BaseBucketBits: baseOwner.bits,
+		BaseScope: baseOwner.scope,
+	}, nil
+}
+
+func (p GlobalIndexProgram) resolveIndexOwner(
+	key []distribution.Scalar,
+) (globalIndexOwner, error) {
+	mapper := distribution.NewNativeMapperWithBucketBits(
+		p.indexSpec.Arity, p.indexSpec.EffectiveBucketBits(),
+	)
+	point, err := mapper.PointFor(key)
+	if err != nil {
+		return globalIndexOwner{}, fmt.Errorf("%w: route index key: %v", ErrGlobalIndexDocument, err)
+	}
+	target, ok := p.indexManifest.ResolvePointTarget(point)
+	if !ok {
+		return globalIndexOwner{}, &CatalogError{Reason: "global index manifest does not own mapped point"}
+	}
+	address, err := p.snapshot.Address(target.Endpoint)
+	if err != nil {
+		return globalIndexOwner{}, err
+	}
+	bucket, _ := distribution.VirtualBucketForPoint(point, mapper.VirtualBucketBits())
+	return globalIndexOwner{
+		point: point, target: target, address: address, bits: mapper.VirtualBucketBits(),
+		scope: distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
+	}, nil
+}
+
+func (p GlobalIndexProgram) resolveBaseOwner(
+	locator []distribution.Scalar,
+	workspace *GlobalIndexWorkspace,
+) (globalIndexOwner, error) {
+	baseKey := workspace.baseScalars[:p.baseArity]
+	for i := range baseKey {
+		baseKey[i] = locator[p.baseOrdinals[i]]
+	}
+	mapper := distribution.NewNativeMapperWithBucketBits(
+		p.baseSpec.Arity, p.baseSpec.EffectiveBucketBits(),
+	)
+	point, err := mapper.PointFor(baseKey)
+	if err != nil {
+		return globalIndexOwner{}, fmt.Errorf("%w: route base locator: %v", ErrGlobalIndexDocument, err)
+	}
+	target, ok := p.baseManifest.ResolvePointTarget(point)
+	if !ok {
+		return globalIndexOwner{}, &CatalogError{Reason: "base manifest does not own global index locator"}
+	}
+	address, err := p.snapshot.Address(target.Endpoint)
+	if err != nil {
+		return globalIndexOwner{}, err
+	}
+	bucket, _ := distribution.VirtualBucketForPoint(point, mapper.VirtualBucketBits())
+	return globalIndexOwner{
+		point: point, target: target, address: address, bits: mapper.VirtualBucketBits(),
+		scope: distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
 	}, nil
 }
 
@@ -390,29 +514,11 @@ func extractGlobalIndexScalars(
 		if value.IsNull() {
 			return decoded, fmt.Errorf("%w: %s path %d is null", ErrGlobalIndexDocument, label, i)
 		}
-		switch value.Kind() {
-		case jsondoc.String:
-			if text, ok := value.StringBytes(); ok {
-				destination[i] = distribution.NewString(byteview.String(text))
-			} else {
-				start := len(decoded)
-				decoded, ok, err = value.AppendText(decoded)
-				if err != nil || !ok {
-					return decoded, fmt.Errorf("%w: %s path %d has an invalid string", ErrGlobalIndexDocument, label, i)
-				}
-				destination[i] = distribution.NewString(byteview.String(decoded[start:]))
-			}
-		case jsondoc.Number:
-			number, ok := value.NumberText()
-			if !ok {
-				return decoded, fmt.Errorf("%w: %s path %d has an invalid number", ErrGlobalIndexDocument, label, i)
-			}
-			destination[i], err = distribution.NewNumber(number)
-			if err != nil {
-				return decoded, fmt.Errorf("%w: %s path %d: %v", ErrGlobalIndexDocument, label, i, err)
-			}
-		default:
-			return decoded, fmt.Errorf("%w: %s path %d is not a string or number", ErrGlobalIndexDocument, label, i)
+		decoded, err = extractGlobalIndexScalar(
+			value, &destination[i], decoded, label, i,
+		)
+		if err != nil {
+			return decoded, err
 		}
 		if rawArray != nil {
 			if i != 0 {
@@ -425,4 +531,58 @@ func extractGlobalIndexScalars(
 		*rawArray = append(*rawArray, ']')
 	}
 	return decoded, nil
+}
+
+func extractGlobalIndexScalar(
+	value vibejson.RawValue,
+	destination *distribution.Scalar,
+	decoded []byte,
+	label string,
+	ordinal int,
+) ([]byte, error) {
+	if value.IsNull() {
+		return decoded, fmt.Errorf(
+			"%w: %s path %d is null", ErrGlobalIndexDocument, label, ordinal,
+		)
+	}
+	switch value.Kind() {
+	case jsondoc.String:
+		if text, ok := value.StringBytes(); ok {
+			*destination = distribution.NewString(byteview.String(text))
+			return decoded, nil
+		}
+		start := len(decoded)
+		var ok bool
+		var err error
+		decoded, ok, err = value.AppendText(decoded)
+		if err != nil || !ok {
+			return decoded, fmt.Errorf(
+				"%w: %s path %d has an invalid string",
+				ErrGlobalIndexDocument, label, ordinal,
+			)
+		}
+		*destination = distribution.NewString(byteview.String(decoded[start:]))
+		return decoded, nil
+	case jsondoc.Number:
+		number, ok := value.NumberText()
+		if !ok {
+			return decoded, fmt.Errorf(
+				"%w: %s path %d has an invalid number",
+				ErrGlobalIndexDocument, label, ordinal,
+			)
+		}
+		parsed, err := distribution.NewNumber(number)
+		if err != nil {
+			return decoded, fmt.Errorf(
+				"%w: %s path %d: %v", ErrGlobalIndexDocument, label, ordinal, err,
+			)
+		}
+		*destination = parsed
+		return decoded, nil
+	default:
+		return decoded, fmt.Errorf(
+			"%w: %s path %d is not a string or number",
+			ErrGlobalIndexDocument, label, ordinal,
+		)
+	}
 }

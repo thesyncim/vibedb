@@ -42,37 +42,68 @@ func (e *Executor) acquireReadFences(
 		if err != nil {
 			return distributedtxn.ID{}, err
 		}
-		errs := e.readFencePhase(
-			ctx, calls, profile, id, shardservice.TransactionAcquireReadFence,
-		)
-		phaseErr := errors.Join(errs...)
+		phaseErr := e.acquireReadFencesOnce(ctx, calls, profile, id)
 		if phaseErr == nil {
 			return id, nil
 		}
-		acquired := successfulReadFenceCalls(calls, errs)
-		releaseErr := e.releaseReadFences(ctx, acquired, profile, id)
-		if releaseErr != nil || !onlyReadFenceBusy(errs) {
-			return distributedtxn.ID{}, errors.Join(phaseErr, releaseErr)
+		if !errors.Is(phaseErr, ErrReadFenceBusy) {
+			return distributedtxn.ID{}, phaseErr
 		}
-		base := 100 * time.Microsecond
-		base <<= min(attempt, 5)
-		if base > 5*time.Millisecond {
-			base = 5 * time.Millisecond
-		}
-		delay := base + time.Duration(id[0])*base/256
-		timer := time.NewTimer(delay)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return distributedtxn.ID{}, ctx.Err()
+		if err := waitReadFenceRetry(ctx, id, attempt); err != nil {
+			return distributedtxn.ID{}, err
 		}
 	}
+}
+
+func waitReadFenceRetry(
+	ctx context.Context,
+	id distributedtxn.ID,
+	attempt int,
+) error {
+	base := 100 * time.Microsecond
+	base <<= min(attempt, 5)
+	if base > 5*time.Millisecond {
+		base = 5 * time.Millisecond
+	}
+	delay := base + time.Duration(id[0])*base/256
+	timer := time.NewTimer(delay)
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return ctx.Err()
+	}
+}
+
+// acquireReadFencesOnce attempts one all-or-nothing phase using caller-owned
+// identity. Every partial success is released before an error returns. Dynamic
+// global-index reads use this to acquire the index scope first and the
+// locator-discovered base scopes second without changing identities mid-cut.
+func (e *Executor) acquireReadFencesOnce(
+	ctx context.Context,
+	calls []shardCall,
+	profile Profile,
+	id distributedtxn.ID,
+) error {
+	errs := e.readFencePhase(
+		ctx, calls, profile, id, shardservice.TransactionAcquireReadFence,
+	)
+	phaseErr := errors.Join(errs...)
+	if phaseErr == nil {
+		return nil
+	}
+	acquired := successfulReadFenceCalls(calls, errs)
+	releaseErr := e.releaseReadFences(ctx, acquired, profile, id)
+	if releaseErr != nil || !onlyReadFenceBusy(errs) {
+		return errors.Join(phaseErr, releaseErr)
+	}
+	return ErrReadFenceBusy
 }
 
 func onlyReadFenceBusy(errs []error) bool {

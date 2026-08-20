@@ -1442,6 +1442,12 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 			return arg, nil
 		case query.Number, json.Number:
 			return arg, nil
+		case vibejson.RawValue:
+			if _, ok := value.NumberBytes(); !ok {
+				return nil, errors.New(
+					"vibedb: raw scalar parameter must be a JSON number")
+			}
+			return arg, nil
 		case []byte:
 			if !utf8.Valid(value) {
 				return nil, errors.New(

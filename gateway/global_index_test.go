@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -224,6 +225,144 @@ func TestGlobalIndexRoutesFlatScalarsWithoutDocument(t *testing.T) {
 	}
 }
 
+func TestGlobalIndexRoutesLookupKeyAndReturnedLocator(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := snapshot.CompileGlobalIndex("messages", "by_email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace GlobalIndexWorkspace
+	lookupKey := []distribution.Scalar{distribution.NewString("a@example.com")}
+	locatorValue := []byte(`["tenant\u002d7","message-9"]`)
+	keyRoute, err := program.RouteKey(
+		lookupKey, &workspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keyRoute.KeyTuple) == 0 || keyRoute.IndexTarget.Shard == "" ||
+		keyRoute.IndexAddress == "" || keyRoute.IndexScope.End != keyRoute.IndexScope.Start+1 {
+		t.Fatalf("key route = %+v", keyRoute)
+	}
+	locatorRoute, err := program.RouteLocatorValue(
+		locatorValue, &workspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locatorRoute.BaseTarget.Shard == "" || locatorRoute.BaseAddress == "" ||
+		locatorRoute.BaseScope.End != locatorRoute.BaseScope.Start+1 ||
+		len(locatorRoute.LocatorTuple) == 0 {
+		t.Fatalf("locator route = %+v", locatorRoute)
+	}
+	documentRoute, err := program.RouteDocument(
+		[]byte(`{"tenant_id":"tenant-7","id":"message-9","email":"a@example.com"}`),
+		&workspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locatorRoute.BaseTarget != documentRoute.BaseTarget ||
+		!bytes.Equal(locatorRoute.LocatorTuple, documentRoute.LocatorTuple) {
+		t.Fatalf("lookup locator route = %+v, document route = %+v", locatorRoute, documentRoute)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if _, routeErr := program.RouteKey(lookupKey, &workspace); routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if _, routeErr := program.RouteLocatorValue(locatorValue, &workspace); routeErr != nil {
+			t.Fatal(routeErr)
+		}
+	}); allocations != 0 {
+		t.Fatalf("warm global-index lookup routing allocations = %v, want 0", allocations)
+	}
+}
+
+func TestPreparedReadSelectsGlobalIndexOnlyWhenBaseIsNotPointRoutable(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(
+		context.Background(), `SELECT id FROM messages WHERE email = ?`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.Bind([]any{"a@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.globalIndex == nil || !useGlobalIndexRead(bound) ||
+		bound.globalIndex.program.metadata.Name != "by_email" {
+		t.Fatalf("global index bound plan = %+v", bound.globalIndex)
+	}
+
+	prepared, err = snapshot.Prepare(
+		context.Background(), `SELECT id FROM messages WHERE tenant_id = ? AND email = ?`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err = prepared.Bind([]any{"tenant-7", "a@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.globalIndex != nil || useGlobalIndexRead(bound) {
+		t.Fatalf("base point route did not retain direct fast path: %+v", bound)
+	}
+}
+
+func TestExplainGlobalIndexReadShowsIndexScan(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 7, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := newRouteExecutor(t, snapshot)
+	explanation, err := executor.Explain(t.Context(), Query{
+		SQL:   `SELECT id FROM messages WHERE email = 'a@example.com'`,
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explanation.RouteKind != distribution.RouteTargeted || explanation.Shards != 2 ||
+		!strings.Contains(explanation.PhysicalPlan, "index-scan") ||
+		explanation.PlanFingerprint == "" {
+		t.Fatalf("global index explanation = %+v\n%s", explanation, explanation.PhysicalPlan)
+	}
+}
+
+func TestGlobalIndexDynamicTargetAdmission(t *testing.T) {
+	interactive := DefaultProfiles()[ClassInteractive]
+	if _, err := admitGlobalIndexTargets(2, 2, interactive); !errors.Is(err, distribution.ErrScatterRejected) {
+		t.Fatalf("interactive all-shard locator set err = %v", err)
+	}
+	batch := DefaultProfiles()[ClassBatch]
+	if kind, err := admitGlobalIndexTargets(2, 2, batch); err != nil || kind != distribution.RouteScatter {
+		t.Fatalf("batch all-shard locator set = %v,%v", kind, err)
+	}
+	if _, err := admitGlobalIndexTargets(
+		distribution.DefaultMaxTargetShards+1,
+		distribution.DefaultMaxTargetShards+2,
+		batch,
+	); !errors.Is(err, distribution.ErrTargetShardLimit) {
+		t.Fatalf("dynamic target overflow err = %v", err)
+	}
+}
+
 func TestPreparedInsertExpandsReadyGlobalIndexes(t *testing.T) {
 	config, endpoints := globalIndexCatalog(t)
 	snapshot, err := NewSnapshotWithIndexes(
@@ -357,6 +496,40 @@ func BenchmarkGlobalIndexRouteScalars(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		if _, err := program.RouteScalars(key, locator, &workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkGlobalIndexRouteLookup(b *testing.B) {
+	config, endpoints := globalIndexCatalog(b)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	program, err := snapshot.CompileGlobalIndex("messages", "by_email")
+	if err != nil {
+		b.Fatal(err)
+	}
+	key := []distribution.Scalar{distribution.NewString("a@example.com")}
+	locator := []byte(`["tenant\u002d7","message-9"]`)
+	var workspace GlobalIndexWorkspace
+	if _, err := program.RouteKey(key, &workspace); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := program.RouteLocatorValue(locator, &workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(locator)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := program.RouteKey(key, &workspace); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := program.RouteLocatorValue(locator, &workspace); err != nil {
 			b.Fatal(err)
 		}
 	}

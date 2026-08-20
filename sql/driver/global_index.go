@@ -223,12 +223,21 @@ func (s *Session) LookupGlobalIndex(
 		core.mu.RUnlock()
 		return fmt.Errorf("%w: %q", ErrTableNotFound, relation)
 	}
-	if table.schema != nil || len(table.meta.Indexes) != 0 || table.collection == nil {
+	if table.schema != nil || len(table.meta.Indexes) != 0 {
 		core.mu.RUnlock()
 		return fmt.Errorf(
 			"%w: relation %q must be schemaless and locally unindexed",
 			ErrGlobalIndexRelation, relation,
 		)
+	}
+	// A freshly provisioned physical index relation has no durable collection
+	// until its first claim is written. Under the shard-level read fence this is
+	// an exact empty answer: a concurrent first writer cannot publish until the
+	// fence is released. There is no marker to validate yet, but there is also
+	// no data an older incarnation could expose.
+	if table.collection == nil {
+		core.mu.RUnlock()
+		return nil
 	}
 	limits, limitsErr := tableMutationLimits(table)
 	if limitsErr != nil {

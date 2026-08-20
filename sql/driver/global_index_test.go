@@ -43,6 +43,14 @@ func TestGlobalIndexLookupPointPrefixFenceAndBounds(t *testing.T) {
 	key := []byte{1, 5, 'a', '@', 'b'}
 	uniqueValue := []byte(`["tenant-7",7]`)
 
+	visited := false
+	if err := session.LookupGlobalIndex(
+		ctx, "messages_by_email", 17, 3, key, 2, true, 8, 1024,
+		func([]byte) error { visited = true; return nil },
+	); err != nil || visited {
+		t.Fatalf("unmaterialized lookup = visited %v, err %v; want exact empty", visited, err)
+	}
+
 	if err := session.Begin(ctx, TxOptions{Isolation: IsolationSerializable}); err != nil {
 		t.Fatal(err)
 	}

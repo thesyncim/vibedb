@@ -201,6 +201,45 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if useGlobalIndexRead(bound) {
+			execution, indexErr := e.queryGlobalIndex(opctx, &q, bound, profile)
+			if indexErr == nil {
+				kind := execution.routeKind
+				if execution.shardsFanned > 1 && kind != distribution.RouteScatter {
+					kind = distribution.RouteTargeted
+				}
+				route := distribution.Route{
+					Kind: kind, Distribution: bound.distribution,
+					RoutingVersion: bound.manifest.Version(), Targets: execution.baseTargets,
+				}
+				physical, planning, planErr := optimizeGlobalIndexPlan(
+					opctx, snap, bound, route, profile,
+				)
+				if planErr != nil {
+					return nil, planErr
+				}
+				scatter := ScatterNone
+				if kind == distribution.RouteScatter {
+					scatter = ScatterAllShards
+				}
+				e.metrics.observeRoute(kind, execution.shardsFanned, scatter)
+				res := execution.result
+				res.RouteKind = kind
+				res.Generation = snap.Generation()
+				res.ShardsFanned = execution.shardsFanned
+				res.Retries = attempt
+				res.ScatterReason = scatter
+				res.PlanFingerprint = physical.Fingerprint()
+				res.Planning = planning
+				return res, nil
+			}
+			if isStaleErr(indexErr) && attempt < e.maxRetry {
+				staleGen = snap.Generation()
+				e.metrics.observeRetry()
+				continue
+			}
+			return nil, indexErr
+		}
 		pl, err := e.routeContext(opctx, snap, &q, bound, profile)
 		if err != nil {
 			return nil, err
@@ -535,7 +574,48 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err != nil {
 		return nil, err
 	}
-	physical, err := e.routeContext(ctx, snap, &q, bound, e.profileFor(q.Class))
+	profile := e.profileFor(q.Class)
+	if useGlobalIndexRead(bound) {
+		if bound.alwaysReason != "" || (bound.globalEmpty && bound.emptyReason != "") {
+			reason := bound.alwaysReason
+			if reason == "" {
+				reason = bound.emptyReason
+			}
+			return nil, &PlanError{
+				Table: bound.table, Reason: reason,
+				cause: ErrDistributedPlanUnsupported,
+			}
+		}
+		route, shards := globalIndexExplainRoute(bound)
+		baseKind, admissionErr := admitGlobalIndexTargets(
+			len(route.Targets), bound.manifest.ShardCount(), profile,
+		)
+		if admissionErr != nil {
+			return nil, admissionErr
+		}
+		route.Kind = baseKind
+		physical, planning, planErr := optimizeGlobalIndexPlan(
+			ctx, snap, bound, route, profile,
+		)
+		if planErr != nil {
+			return nil, planErr
+		}
+		kind := baseKind
+		if shards > 1 && baseKind != distribution.RouteScatter {
+			kind = distribution.RouteTargeted
+		}
+		scatter := ScatterNone
+		if kind == distribution.RouteScatter {
+			scatter = ScatterAllShards
+		}
+		return &Explanation{
+			PhysicalPlan: physical.String(), PlanFingerprint: physical.Fingerprint(),
+			Cost: physical.Cost, Planning: planning,
+			RouteKind: kind, Generation: snap.Generation(),
+			Shards: shards, ScatterReason: scatter,
+		}, nil
+	}
+	physical, err := e.routeContext(ctx, snap, &q, bound, profile)
 	if err != nil {
 		return nil, err
 	}

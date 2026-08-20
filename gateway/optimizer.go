@@ -15,14 +15,15 @@ import (
 // gateway currently has one remote fragment, but the representation naturally
 // extends to separately costed join/aggregate fragments and exchanges.
 type distributedPrivate struct {
-	targets    int
-	shards     int
-	scanRows   float64
-	scanBytes  float64
-	outputRows float64
-	rowBytes   float64
-	order      []OrderKey
-	aggregates []bootstrap.AggKind
+	targets     int
+	shards      int
+	scanRows    float64
+	scanBytes   float64
+	outputRows  float64
+	rowBytes    float64
+	order       []OrderKey
+	aggregates  []bootstrap.AggKind
+	indexLookup bool
 }
 
 type distributedCostModel struct {
@@ -30,7 +31,8 @@ type distributedCostModel struct {
 }
 
 func (m *distributedCostModel) IsPhysical(expr queryplanner.Expression) bool {
-	return expr.Op == queryplanner.OpRemoteQuery || expr.Op == queryplanner.OpFinalAggregate
+	return expr.Op == queryplanner.OpRemoteQuery || expr.Op == queryplanner.OpIndexScan ||
+		expr.Op == queryplanner.OpFinalAggregate
 }
 
 func (m *distributedCostModel) ChildPropertyAlternatives(
@@ -41,7 +43,7 @@ func (m *distributedCostModel) ChildPropertyAlternatives(
 	_ queryplanner.PhysicalProperties,
 ) ([][]queryplanner.PhysicalProperties, error) {
 	switch expr.Op {
-	case queryplanner.OpRemoteQuery:
+	case queryplanner.OpRemoteQuery, queryplanner.OpIndexScan:
 		return [][]queryplanner.PhysicalProperties{nil}, nil
 	case queryplanner.OpFinalAggregate:
 		return [][]queryplanner.PhysicalProperties{{{
@@ -64,7 +66,7 @@ func (m *distributedCostModel) Provided(
 		return queryplanner.PhysicalProperties{}, fmt.Errorf("missing private metadata %d", expr.Private)
 	}
 	switch expr.Op {
-	case queryplanner.OpRemoteQuery:
+	case queryplanner.OpRemoteQuery, queryplanner.OpIndexScan:
 		distributionProperty := queryplanner.Distribution{Kind: queryplanner.DistributionSingleton, Partitions: 1}
 		if metadata.targets > 1 {
 			distributionProperty = queryplanner.Distribution{
@@ -96,13 +98,20 @@ func (m *distributedCostModel) LocalCost(
 		return queryplanner.Cost{}, fmt.Errorf("missing private metadata %d", expr.Private)
 	}
 	switch expr.Op {
-	case queryplanner.OpRemoteQuery:
+	case queryplanner.OpRemoteQuery, queryplanner.OpIndexScan:
 		// Shards execute in parallel, so Startup follows fan-out width while CPU
 		// and IO retain total cluster work. Network belongs to the exchange.
+		startup := float64(metadata.targets)
+		network := 0.0
+		if metadata.indexLookup {
+			startup++
+			network = boundedProduct(max(1, metadata.outputRows), max(16, metadata.rowBytes))
+		}
 		return queryplanner.Cost{
-			Startup: float64(metadata.targets),
+			Startup: startup,
 			CPU:     metadata.scanRows,
 			IO:      metadata.scanBytes,
+			Network: network,
 			Memory:  min(metadata.scanBytes, 1<<20),
 		}, nil
 	case queryplanner.OpFinalAggregate:
@@ -221,12 +230,42 @@ func optimizeDistributedPlan(
 	route distribution.Route,
 	profile Profile,
 ) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
+	return optimizeDistributedAccessPlan(
+		ctx, snap, bound, route, profile,
+		queryplanner.OpLogicalRemoteQuery, queryplanner.OpRemoteQuery, false,
+	)
+}
+
+func optimizeGlobalIndexPlan(
+	ctx context.Context,
+	snap *Snapshot,
+	bound *BoundPlan,
+	route distribution.Route,
+	profile Profile,
+) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
+	return optimizeDistributedAccessPlan(
+		ctx, snap, bound, route, profile,
+		queryplanner.OpLogicalScan, queryplanner.OpIndexScan, true,
+	)
+}
+
+func optimizeDistributedAccessPlan(
+	ctx context.Context,
+	snap *Snapshot,
+	bound *BoundPlan,
+	route distribution.Route,
+	profile Profile,
+	logicalAccess queryplanner.Operator,
+	physicalAccess queryplanner.Operator,
+	indexLookup bool,
+) (*queryplanner.Plan, queryplanner.OptimizerStatistics, error) {
 	const privateID queryplanner.PrivateID = 1
 	scanRows, scanBytes, outputRows, rowBytes := distributedEstimates(snap, bound, route)
 	metadata := distributedPrivate{
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates,
+		indexLookup: indexLookup,
 	}
 	if bound.limit > 0 && len(bound.aggregates) == 0 {
 		metadata.outputRows = min(outputRows,
@@ -246,7 +285,7 @@ func optimizeDistributedPlan(
 		return nil, queryplanner.OptimizerStatistics{}, err
 	}
 	if _, _, err := memo.Add(remoteGroup, queryplanner.Expression{
-		Op: queryplanner.OpLogicalRemoteQuery, Private: privateID,
+		Op: logicalAccess, Private: privateID,
 	}); err != nil {
 		return nil, queryplanner.OptimizerStatistics{}, err
 	}
@@ -268,13 +307,13 @@ func optimizeDistributedPlan(
 	}
 	rules := []queryplanner.Rule{
 		queryplanner.FuncRule{
-			RuleName: "implement-remote-query", RulePhase: queryplanner.ImplementPhase,
+			RuleName: "implement-distributed-access", RulePhase: queryplanner.ImplementPhase,
 			MatchFunc: func(_ *queryplanner.Memo, _ queryplanner.GroupID, _ queryplanner.ExprID, expr queryplanner.Expression) bool {
-				return expr.Op == queryplanner.OpLogicalRemoteQuery
+				return expr.Op == logicalAccess
 			},
 			ApplyFunc: func(call *queryplanner.RuleCall) error {
 				expr := call.Expr()
-				expr.Op = queryplanner.OpRemoteQuery
+				expr.Op = physicalAccess
 				_, _, err := call.Yield(expr)
 				return err
 			},

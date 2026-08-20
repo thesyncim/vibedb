@@ -82,6 +82,20 @@ type PreparedPlan struct {
 	// writeGlobalIndexes is populated only for a table with READY global index
 	// incarnations. Local and non-ready indexes add no prepared-plan footprint.
 	writeGlobalIndexes []preparedGlobalIndex
+	// readGlobalIndexes contains equality-routing programs for READY global
+	// indexes on the driving table. Bind selects at most one complete key; the
+	// ordinary base-shard route remains preferred when it is already a point.
+	readGlobalIndexes []preparedGlobalIndexRead
+}
+
+type preparedGlobalIndexRead struct {
+	program     GlobalIndexProgram
+	constraints *sqldriver.ConstraintProgram
+}
+
+type boundGlobalIndexRead struct {
+	program GlobalIndexProgram
+	route   GlobalIndexRoute
 }
 
 // BoundPlan is the immutable execution-specific result of binding typed
@@ -98,6 +112,8 @@ type BoundPlan struct {
 	limit        int
 	aggregates   []sqlast.AggKind
 	aggHeaders   []string
+	globalIndex  *boundGlobalIndexRead
+	globalEmpty  bool
 
 	spec         distribution.DistributionSpec
 	manifest     *distribution.Manifest
@@ -231,6 +247,9 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	plan.manifest = manifest
 	plan.params = plan.statement.Params()
 	plan.constraints = sqldriver.CompileConstraintProgram(placement.Columns, selectStmt.Where)
+	if err := s.prepareGlobalIndexReads(plan, selectStmt.Where); err != nil {
+		return nil, err
+	}
 	placements := make([]distribution.TablePlacement, len(selectStmt.From))
 	placements[0] = placement
 
@@ -311,15 +330,109 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	var globalIndex *boundGlobalIndexRead
+	var globalEmpty bool
+	if !boundConstraintsSinglePoint(constraints, p.spec.Arity) {
+		globalIndex, globalEmpty, err = p.bindGlobalIndexRead(args)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &BoundPlan{
 		generation: p.generation, table: p.table,
 		tables:       p.tables,
 		distribution: p.distribution, constraints: constraints,
 		order: p.order, limit: limit,
 		aggregates: p.aggregates, aggHeaders: p.aggHeaders,
+		globalIndex: globalIndex, globalEmpty: globalEmpty,
 		spec: p.spec, manifest: p.manifest,
 		alwaysReason: p.alwaysReason, emptyReason: p.emptyReason, multiReason: p.multiReason,
 	}, nil
+}
+
+func boundConstraintsSinglePoint(
+	constraints distribution.BoundConstraints,
+	arity int,
+) bool {
+	if len(constraints) != arity {
+		return false
+	}
+	for i := range constraints {
+		domain := constraints[i]
+		if domain.Kind != distribution.DomainFinite || len(domain.Values) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Snapshot) prepareGlobalIndexReads(
+	plan *PreparedPlan,
+	where *sqlast.Expr,
+) error {
+	indexes := s.Indexes(plan.table)
+	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
+		metadata, _ := indexes.At(ordinal)
+		if !metadata.Global() || !metadata.Ready() {
+			continue
+		}
+		program, err := s.CompileGlobalIndex(plan.table, metadata.Name)
+		if err != nil {
+			return err
+		}
+		paths := metadata.Paths[:metadata.PathCount]
+		plan.readGlobalIndexes = append(plan.readGlobalIndexes, preparedGlobalIndexRead{
+			program: program, constraints: sqldriver.CompileConstraintProgram(paths, where),
+		})
+	}
+	return nil
+}
+
+func (p *PreparedPlan) bindGlobalIndexRead(
+	args []any,
+) (*boundGlobalIndexRead, bool, error) {
+	for pass := 0; pass < 2; pass++ {
+		for i := range p.readGlobalIndexes {
+			candidate := &p.readGlobalIndexes[i]
+			unique := candidate.program.metadata.Flags&IndexUnique != 0
+			if (pass == 0) != unique {
+				continue
+			}
+			constraints, err := candidate.constraints.Bind(args)
+			if err != nil {
+				return nil, false, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+			}
+			var keyStorage [4]distribution.Scalar
+			if len(constraints) == 0 || len(constraints) > len(keyStorage) {
+				continue
+			}
+			complete := true
+			key := keyStorage[:len(constraints)]
+			for ordinal := range constraints {
+				domain := constraints[ordinal]
+				if domain.Kind == distribution.DomainEmpty {
+					return nil, true, nil
+				}
+				if domain.Kind != distribution.DomainFinite || len(domain.Values) != 1 {
+					complete = false
+					break
+				}
+				key[ordinal] = domain.Values[0]
+			}
+			if complete {
+				var workspace GlobalIndexWorkspace
+				route, err := candidate.program.RouteKey(key, &workspace)
+				if err != nil {
+					return nil, false, err
+				}
+				route.KeyTuple = append([]byte(nil), route.KeyTuple...)
+				return &boundGlobalIndexRead{
+					program: candidate.program, route: route,
+				}, false, nil
+			}
+		}
+	}
+	return nil, false, nil
 }
 
 // ValidateRoute refuses a cross-shard route whose result semantics the current
