@@ -328,7 +328,7 @@ available.
 | --- | --- |
 | Leader-only shard process | Available; one locally fenced store |
 | Stateless gateway | Available; scoped coherent read fan-out, single-shard fast writes, fixed-participant atomic write batches, and bounded durable coordinator redrive |
-| Independently sharded global indexes | Catalog/fencing, byte-native routing, and atomic READY-index INSERT/unique-claim maintenance available; lookup, UPDATE/DELETE old-row capture, and online build not yet serving |
+| Independently sharded global indexes | Catalog/fencing, byte-native lookup with exact base-primary fetch, and atomic READY-index INSERT/UPDATE/DELETE maintenance available; online build/backfill is not yet serving |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |

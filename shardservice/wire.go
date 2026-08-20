@@ -405,6 +405,10 @@ type ShardRequest struct {
 	// projection, aggregation, order, and limit over those rows; the keys only
 	// replace its physical scan source.
 	PrimaryKeyRead PrimaryKeyReadRequest
+	// MutationCapture executes UPDATE/DELETE target selection without mutation
+	// and returns native primary keys plus canonical old documents. It is a
+	// read-only, single-shard precursor to optimistic indexed maintenance.
+	MutationCapture bool
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.

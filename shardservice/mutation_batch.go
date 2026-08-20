@@ -1,6 +1,8 @@
 package shardservice
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"unicode/utf8"
@@ -21,10 +23,11 @@ const (
 	MutationSQL MutationKind = iota
 	MutationGlobalIndexPut
 	MutationGlobalIndexDelete
+	MutationPrimaryPrecondition
 )
 
 func (k MutationKind) valid() bool {
-	return k >= MutationSQL && k <= MutationGlobalIndexDelete
+	return k >= MutationSQL && k <= MutationPrimaryPrecondition
 }
 
 // MutationStatement is one non-row-returning mutation inside a shard-local
@@ -45,13 +48,21 @@ type MutationStatement struct {
 	Value        []byte
 	LocatorCount uint8
 	Unique       bool
+
+	// PrimaryPath and the sorted key/digest pairs belong only to a base-row
+	// precondition. Keys are native durable primary keys; digests are SHA-256 of
+	// the captured canonical documents. Decoded key slices borrow the batch.
+	PrimaryPath     []byte
+	ExpectedKeys    [][]byte
+	ExpectedDigests [][sha256.Size]byte
 }
 
 const (
-	maxMutationStatements    = 4096
-	maxMutationRelationBytes = 1<<16 - 1
-	mutationBatchHeader      = 8
-	globalMutationFixedBytes = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 4 + 4
+	maxMutationStatements      = 4096
+	maxMutationRelationBytes   = 1<<16 - 1
+	mutationBatchHeader        = 8
+	globalMutationFixedBytes   = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 4 + 4
+	primaryConditionFixedBytes = 4 + 1 + 1 + 2 + 4 + 4 + 4
 )
 
 var (
@@ -78,7 +89,9 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 				len(statement.Params) > maxParams || statement.Relation != "" ||
 				statement.IndexID != 0 || statement.Incarnation != 0 ||
 				len(statement.EntryKey) != 0 || len(statement.Value) != 0 ||
-				statement.LocatorCount != 0 || statement.Unique {
+				statement.LocatorCount != 0 || statement.Unique ||
+				len(statement.PrimaryPath) != 0 || len(statement.ExpectedKeys) != 0 ||
+				len(statement.ExpectedDigests) != 0 {
 				return dst, ErrMutationBatch
 			}
 			total += 8 + len(statement.SQL)
@@ -100,6 +113,32 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 			}
 			continue
 		}
+		if statement.Kind == MutationPrimaryPrecondition {
+			if statement.SQL != "" || len(statement.Params) != 0 ||
+				statement.Relation == "" || len(statement.Relation) > maxMutationRelationBytes ||
+				!utf8.ValidString(statement.Relation) || statement.IndexID != 0 ||
+				statement.Incarnation != 0 || len(statement.EntryKey) != 0 ||
+				len(statement.Value) != 0 || statement.LocatorCount != 0 || statement.Unique ||
+				len(statement.PrimaryPath) == 0 || len(statement.PrimaryPath) > maxMutationRelationBytes ||
+				!utf8.Valid(statement.PrimaryPath) ||
+				len(statement.ExpectedKeys) != len(statement.ExpectedDigests) ||
+				len(statement.ExpectedKeys) > maxParams {
+				return dst, ErrMutationBatch
+			}
+			total += primaryConditionFixedBytes + len(statement.Relation) + len(statement.PrimaryPath)
+			for j := range statement.ExpectedKeys {
+				key := statement.ExpectedKeys[j]
+				if len(key) == 0 || (j != 0 && bytes.Compare(statement.ExpectedKeys[j-1], key) >= 0) ||
+					len(key) > distributedtxn.MaxMutationBytes-total-4-sha256.Size {
+					return dst, ErrMutationBatch
+				}
+				total += 4 + len(key) + sha256.Size
+				if total > distributedtxn.MaxMutationBytes {
+					return dst, distributedtxn.ErrTooLarge
+				}
+			}
+			continue
+		}
 		if statement.SQL != "" || len(statement.Params) != 0 ||
 			statement.Relation == "" ||
 			len(statement.Relation) > maxMutationRelationBytes ||
@@ -108,6 +147,8 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 			statement.EntryKey[0] == 0 || statement.LocatorCount == 0 ||
 			statement.LocatorCount > 8 ||
 			len(statement.Value) == 0 || !vibejson.Valid(statement.Value) ||
+			len(statement.PrimaryPath) != 0 || len(statement.ExpectedKeys) != 0 ||
+			len(statement.ExpectedDigests) != 0 ||
 			(vibejson.RawValue{Src: statement.Value}).Kind() != jsondoc.Array {
 			return dst, ErrMutationBatch
 		}
@@ -144,6 +185,21 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statements)))
 	for i := range statements {
 		statement := &statements[i]
+		if statement.Kind == MutationPrimaryPrecondition {
+			dst = binary.LittleEndian.AppendUint32(dst, 0)
+			dst = append(dst, byte(statement.Kind), 0, 0, 0)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.Relation)))
+			dst = append(dst, statement.Relation...)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.PrimaryPath)))
+			dst = append(dst, statement.PrimaryPath...)
+			dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.ExpectedKeys)))
+			for j := range statement.ExpectedKeys {
+				dst = binary.LittleEndian.AppendUint32(dst, uint32(len(statement.ExpectedKeys[j])))
+				dst = append(dst, statement.ExpectedKeys[j]...)
+				dst = append(dst, statement.ExpectedDigests[j][:]...)
+			}
+			continue
+		}
 		if statement.Kind != MutationSQL {
 			dst = binary.LittleEndian.AppendUint32(dst, 0)
 			dst = append(dst, byte(statement.Kind))
@@ -235,6 +291,12 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 		return MutationStatement{}, ErrMutationBatch
 	}
 	if binary.LittleEndian.Uint32(b.body[:4]) == 0 {
+		if len(b.body) < 5 {
+			return MutationStatement{}, ErrMutationBatch
+		}
+		if MutationKind(b.body[4]) == MutationPrimaryPrecondition {
+			return b.nextPrimaryPrecondition(materialize)
+		}
 		return b.nextGlobalIndex()
 	}
 	sqlBytes, rest, ok := takeMutationBytes(b.body)
@@ -279,6 +341,53 @@ func (b *MutationBatch) next(materialize bool) (MutationStatement, error) {
 		if materialize {
 			statement.Params[i] = param
 		}
+	}
+	b.body = rest
+	b.remaining--
+	return statement, nil
+}
+
+func (b *MutationBatch) nextPrimaryPrecondition(materialize bool) (MutationStatement, error) {
+	rest := b.body[4:]
+	if len(rest) < primaryConditionFixedBytes-4 ||
+		rest[0] != byte(MutationPrimaryPrecondition) || rest[1] != 0 || rest[2] != 0 || rest[3] != 0 {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	rest = rest[4:]
+	relation, rest, ok := takeMutationBytes(rest)
+	if !ok || len(relation) == 0 || len(relation) > maxMutationRelationBytes || !utf8.Valid(relation) {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	primaryPath, rest, ok := takeMutationBytes(rest)
+	if !ok || len(primaryPath) == 0 || len(primaryPath) > maxMutationRelationBytes ||
+		!utf8.Valid(primaryPath) || len(rest) < 4 {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	count := binary.LittleEndian.Uint32(rest[:4])
+	rest = rest[4:]
+	if count > maxParams || uint64(count)*(4+sha256.Size) > uint64(len(rest)) {
+		return MutationStatement{}, ErrMutationBatch
+	}
+	statement := MutationStatement{
+		Kind: MutationPrimaryPrecondition, Relation: byteview.String(relation), PrimaryPath: primaryPath,
+	}
+	if materialize {
+		statement.ExpectedKeys = make([][]byte, int(count))
+		statement.ExpectedDigests = make([][sha256.Size]byte, int(count))
+	}
+	var previous []byte
+	for i := uint32(0); i < count; i++ {
+		key, next, valid := takeMutationBytes(rest)
+		if !valid || len(key) == 0 || (i != 0 && bytes.Compare(previous, key) >= 0) ||
+			len(next) < sha256.Size {
+			return MutationStatement{}, ErrMutationBatch
+		}
+		if materialize {
+			statement.ExpectedKeys[i] = key
+			copy(statement.ExpectedDigests[i][:], next[:sha256.Size])
+		}
+		previous = key
+		rest = next[sha256.Size:]
 	}
 	b.body = rest
 	b.remaining--

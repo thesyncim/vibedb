@@ -1,11 +1,15 @@
 package gateway
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
@@ -69,6 +73,7 @@ type preparedGlobalIndex struct {
 
 type boundGlobalIndexMutation struct {
 	metadata IndexMetadata
+	kind     shardservice.MutationKind
 
 	distribution         distribution.DistributionName
 	target               distribution.Target
@@ -217,20 +222,15 @@ func (s *Snapshot) prepareGlobalIndexWrites(
 		if !metadata.Global() || !metadata.Ready() {
 			continue
 		}
-		if plan.statement.Kind != sqlast.KindInsert {
-			return &PlanError{
-				Table: plan.table,
-				Reason: "READY global index " + metadata.Name +
-					" requires old-row capture for UPDATE or DELETE",
-				cause: ErrGlobalIndexMaintenanceUnsupported,
-			}
-		}
 		program, err := s.CompileGlobalIndex(plan.table, metadata.Name)
 		if err != nil {
 			return err
 		}
-		prepared := preparedGlobalIndex{program: program, wholeDocument: wholeDocument}
-		if !wholeDocument {
+		prepared := preparedGlobalIndex{
+			program:       program,
+			wholeDocument: wholeDocument || plan.statement.Kind != sqlast.KindInsert,
+		}
+		if plan.statement.Kind == sqlast.KindInsert && !wholeDocument {
 			for i := uint8(0); i < metadata.PathCount; i++ {
 				column, ok := columns[metadata.Paths[i]]
 				if !ok {
@@ -287,6 +287,13 @@ type BoundWritePlan struct {
 
 	globalIndexes    []boundGlobalIndexMutation
 	globalIndexArena []byte
+	primaryPath      []byte
+	expectedKeys     [][]byte
+	expectedDigests  [][sha256.Size]byte
+}
+
+func (b *BoundWritePlan) requiresIndexTransaction() bool {
+	return b != nil && (len(b.primaryPath) != 0 || len(b.globalIndexes) != 0)
 }
 
 // BindWrite applies params to a prepared write plan without reparsing SQL.
@@ -427,6 +434,7 @@ func (p *PreparedPlan) bindGlobalIndexInserts(
 			}
 			mutation := boundGlobalIndexMutation{
 				metadata:     prepared.program.metadata,
+				kind:         shardservice.MutationGlobalIndexPut,
 				distribution: prepared.program.indexSpec.Name,
 				target:       route.IndexTarget, address: route.IndexAddress,
 				routingVersion: prepared.program.indexManifest.Version(),
@@ -442,6 +450,135 @@ func (p *PreparedPlan) bindGlobalIndexInserts(
 		}
 	}
 	return nil
+}
+
+type capturedPrimaryExpectation struct {
+	key    []byte
+	digest [sha256.Size]byte
+}
+
+// bindGlobalIndexCapture converts one base-shard capture into a compact
+// compare-and-maintain transaction. Documents are consumed immediately by the
+// compiled vibejson programs; only native primary keys and SHA-256 digests are
+// retained in the durable base precondition.
+func (p *PreparedPlan) bindGlobalIndexCapture(
+	bound *BoundWritePlan,
+	baseTarget distribution.Target,
+	rows [][]shardservice.Cell,
+) error {
+	if len(p.writeGlobalIndexes) == 0 {
+		return nil
+	}
+	if bound == nil || (bound.kind != sqlast.KindUpdate && bound.kind != sqlast.KindDelete) {
+		return ErrGlobalIndexMaintenanceUnsupported
+	}
+	firstProgram := &p.writeGlobalIndexes[0].program
+	primaryPath := firstProgram.metadata.LocatorPaths[firstProgram.primary]
+	if primaryPath == "" {
+		return ErrGlobalIndexMaintenanceUnsupported
+	}
+	for i := range p.writeGlobalIndexes {
+		program := &p.writeGlobalIndexes[i].program
+		if program.metadata.LocatorPaths[program.primary] != primaryPath {
+			return &CatalogError{Reason: "READY global indexes disagree on the base primary path"}
+		}
+	}
+	bound.primaryPath = byteview.Bytes(primaryPath)
+	expected := make([]capturedPrimaryExpectation, 0, len(rows))
+	bound.globalIndexes = make(
+		[]boundGlobalIndexMutation, 0, len(rows)*len(p.writeGlobalIndexes)*2,
+	)
+	var oldWorkspace, newWorkspace GlobalIndexWorkspace
+	for rowOrdinal := range rows {
+		row := rows[rowOrdinal]
+		if len(row) != 2 || row[0].Null || row[1].Null || len(row[0].Bytes) == 0 ||
+			len(row[1].Bytes) == 0 || !vibejson.Valid(row[1].Bytes) {
+			return &PlanError{
+				Table: p.table, Reason: "base shard returned a malformed mutation capture row",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+		expected = append(expected, capturedPrimaryExpectation{
+			key: row[0].Bytes, digest: sha256.Sum256(row[1].Bytes),
+		})
+		for indexOrdinal := range p.writeGlobalIndexes {
+			prepared := &p.writeGlobalIndexes[indexOrdinal]
+			oldRoute, err := prepared.program.RouteDocument(row[1].Bytes, &oldWorkspace)
+			if err != nil {
+				return fmt.Errorf("global index %s captured row %d: %w",
+					prepared.program.metadata.Name, rowOrdinal, err)
+			}
+			if !sameWriteTarget(oldRoute.BaseTarget, baseTarget) ||
+				!bytes.Equal(oldRoute.BasePrimaryKey, row[0].Bytes) {
+				return &CatalogError{Reason: "global index locator does not identify the captured base row"}
+			}
+			if bound.kind == sqlast.KindDelete {
+				bound.appendGlobalIndexRoute(
+					prepared, oldRoute,
+					shardservice.MutationGlobalIndexDelete,
+				)
+				continue
+			}
+			newRoute, err := prepared.program.RouteDocument(bound.updateDoc, &newWorkspace)
+			if err != nil {
+				return fmt.Errorf("global index %s replacement row %d: %w",
+					prepared.program.metadata.Name, rowOrdinal, err)
+			}
+			if !sameWriteTarget(newRoute.BaseTarget, baseTarget) ||
+				!bytes.Equal(newRoute.BasePrimaryKey, row[0].Bytes) {
+				return &CatalogError{Reason: "global index replacement locator does not identify the captured base row"}
+			}
+			if bytes.Equal(oldRoute.EntryKey, newRoute.EntryKey) &&
+				bytes.Equal(oldRoute.LocatorValue, newRoute.LocatorValue) {
+				continue
+			}
+			bound.appendGlobalIndexRoute(
+				prepared, oldRoute,
+				shardservice.MutationGlobalIndexDelete,
+			)
+			bound.appendGlobalIndexRoute(
+				prepared, newRoute,
+				shardservice.MutationGlobalIndexPut,
+			)
+		}
+	}
+	slices.SortFunc(expected, func(a, b capturedPrimaryExpectation) int {
+		return bytes.Compare(a.key, b.key)
+	})
+	bound.expectedKeys = make([][]byte, len(expected))
+	bound.expectedDigests = make([][sha256.Size]byte, len(expected))
+	for i := range expected {
+		if i != 0 && bytes.Equal(expected[i-1].key, expected[i].key) {
+			return &PlanError{
+				Table: p.table, Reason: "base shard returned duplicate captured primary keys",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+		bound.expectedKeys[i] = expected[i].key
+		bound.expectedDigests[i] = expected[i].digest
+	}
+	return nil
+}
+
+func (b *BoundWritePlan) appendGlobalIndexRoute(
+	prepared *preparedGlobalIndex,
+	route GlobalIndexRoute,
+	kind shardservice.MutationKind,
+) {
+	mutation := boundGlobalIndexMutation{
+		metadata: prepared.program.metadata, kind: kind,
+		distribution: prepared.program.indexSpec.Name,
+		target:       route.IndexTarget, address: route.IndexAddress,
+		routingVersion: prepared.program.indexManifest.Version(),
+		bucketBits:     route.IndexBucketBits, scope: route.IndexScope,
+		entryStart: len(b.globalIndexArena),
+	}
+	b.globalIndexArena = append(b.globalIndexArena, route.EntryKey...)
+	mutation.entryEnd = len(b.globalIndexArena)
+	mutation.valueStart = mutation.entryEnd
+	b.globalIndexArena = append(b.globalIndexArena, route.LocatorValue...)
+	mutation.valueEnd = len(b.globalIndexArena)
+	b.globalIndexes = append(b.globalIndexes, mutation)
 }
 
 func sameWriteTarget(a, b distribution.Target) bool {

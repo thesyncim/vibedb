@@ -158,6 +158,17 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "mutation_capture",
+			req: &ShardRequest{
+				SQL:          `DELETE FROM messages WHERE tenant_id = ?`,
+				Params:       []Param{StringParam("acme")},
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				BucketBits: 20, AccessScopes: []distributedtxn.IntentScope{{Start: 31, End: 32}},
+				MutationCapture: true,
+			},
+		},
+		{
 			name: "stage_participant",
 			req: &ShardRequest{
 				Distribution: "tenant_data", Shard: "40-80",
@@ -237,6 +248,9 @@ func TestRequestRoundTrip(t *testing.T) {
 				if !bytes.Equal(got.PrimaryKeyRead.Keys[i], tc.req.PrimaryKeyRead.Keys[i]) {
 					t.Errorf("PrimaryKeyRead.Keys[%d] = %x, want %x", i, got.PrimaryKeyRead.Keys[i], tc.req.PrimaryKeyRead.Keys[i])
 				}
+			}
+			if got.MutationCapture != tc.req.MutationCapture {
+				t.Errorf("MutationCapture = %v, want %v", got.MutationCapture, tc.req.MutationCapture)
 			}
 		})
 	}
@@ -740,6 +754,17 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "mutation_capture_requires_read_only_sql",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:           `DELETE FROM messages WHERE tenant_id = ?`,
+					Params:        []Param{StringParam("acme")},
+					ExecutionMode: ExecutionReadWrite, MutationCapture: true,
+				})
+			},
+			want: errBadMutationCapture,
 		},
 		{
 			name: "row_arity_mismatch",

@@ -39,6 +39,11 @@ type insertSelectStageAccount struct {
 	active          bool
 }
 
+type primaryMutationGuard struct {
+	relation string
+	keys     []string
+}
+
 type txTable struct {
 	name               string
 	incarnation        *table
@@ -95,6 +100,7 @@ type tx struct {
 	serialReadBytes        int
 	serialReadRetained     int
 	distributedParticipant *distributedParticipantCommit
+	primaryMutationGuard   *primaryMutationGuard
 }
 
 var (
@@ -1166,6 +1172,9 @@ func (t *tx) execMutationCore(
 		if err != nil {
 			return nil, err
 		}
+		if err := t.consumePrimaryMutationGuard(tableName, keys); err != nil {
+			return nil, err
+		}
 		if len(keys) != 0 {
 			if err := validateDocument(
 				state.schema, document, limits.MaxDocumentBytes,
@@ -1193,6 +1202,9 @@ func (t *tx) execMutationCore(
 		keys, err := t.conn.matchingKeysTransaction(
 			ctx, t, statement, args, state, 0)
 		if err != nil {
+			return nil, err
+		}
+		if err := t.consumePrimaryMutationGuard(tableName, keys); err != nil {
 			return nil, err
 		}
 		for _, key := range keys {
@@ -1302,6 +1314,25 @@ func (t *tx) execMutationCore(
 	}
 	t.applyResolvedMutations(state, staged)
 	return result{affected: int64(len(staged))}, nil
+}
+
+func (t *tx) consumePrimaryMutationGuard(relation string, selected []string) error {
+	guard := t.primaryMutationGuard
+	if guard == nil {
+		return nil
+	}
+	t.primaryMutationGuard = nil
+	if guard.relation != relation || len(guard.keys) != len(selected) {
+		return ErrDistributedTransactionConflict
+	}
+	ordered := slices.Clone(selected)
+	slices.Sort(ordered)
+	for i := range ordered {
+		if ordered[i] != guard.keys[i] {
+			return ErrDistributedTransactionConflict
+		}
+	}
+	return nil
 }
 
 // stageInsertSelect evaluates the source against the transaction view that
@@ -1879,6 +1910,9 @@ func (t *tx) Commit() error {
 		return errors.New("vibedb: transaction is already finished")
 	}
 	defer t.finish()
+	if t.primaryMutationGuard != nil {
+		return ErrDistributedTransactionConflict
+	}
 	dirtyNames := t.dirtyTableNames()
 	if len(dirtyNames) == 0 && t.distributedParticipant == nil {
 		return nil

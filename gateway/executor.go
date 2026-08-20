@@ -315,9 +315,21 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if call != nil && len(prepared.writeGlobalIndexes) != 0 &&
+			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
+			err = e.captureIndexedMutation(opctx, prepared, bound, *call, profile)
+			if err != nil {
+				if isStaleErr(err) && attempt < e.maxRetry {
+					staleGen = snap.Generation()
+					e.metrics.observeRetry()
+					continue
+				}
+				return nil, err
+			}
+		}
 
 		var res *Result
-		if call != nil && len(bound.globalIndexes) != 0 {
+		if call != nil && bound.requiresIndexTransaction() {
 			participants, participantErr := appendBoundWriteParticipants(
 				nil, *call, &q, bound, profile,
 			)
@@ -334,11 +346,11 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 			res = &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 0}
 		}
 		if err == nil {
-			if len(bound.globalIndexes) == 0 {
+			if !bound.requiresIndexTransaction() {
 				res.RouteKind = kind
 			}
 			res.Generation = snap.Generation()
-			if call != nil && len(bound.globalIndexes) == 0 {
+			if call != nil && !bound.requiresIndexTransaction() {
 				res.ShardsFanned = 1
 			}
 			res.Retries = attempt
@@ -730,6 +742,44 @@ func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Resu
 	}
 	e.metrics.observeResult(rows, bytes)
 	return &Result{Kind: resp.Kind, Columns: resp.Columns, Rows: resp.Rows, RowsAffected: resp.RowsAffected}, nil
+}
+
+func (e *Executor) captureIndexedMutation(
+	ctx context.Context,
+	prepared *PreparedPlan,
+	bound *BoundWritePlan,
+	baseCall shardCall,
+	p Profile,
+) error {
+	req := *baseCall.req
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MutationCapture = true
+	captureCtx, cancel := context.WithTimeout(ctx, p.PerShardDeadline)
+	defer cancel()
+	resp, err := e.client.Do(captureCtx, baseCall.address, &req)
+	if err != nil {
+		return err
+	}
+	if resp.Kind != shardservice.ResponseRows || len(resp.Columns) != 2 {
+		return &PlanError{
+			Table: bound.table, Reason: "base shard returned an invalid mutation capture response",
+			cause: ErrGlobalIndexMaintenanceUnsupported,
+		}
+	}
+	rows := uint64(len(resp.Rows))
+	resultBytes := responseBytes(resp)
+	if err := checkAggregate(p, rows, resultBytes); err != nil {
+		return err
+	}
+	for i := range resp.Rows {
+		if len(resp.Rows[i]) != 2 {
+			return &PlanError{
+				Table: bound.table, Reason: "base shard returned a malformed mutation capture row",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+	}
+	return prepared.bindGlobalIndexCapture(bound, baseCall.target, resp.Rows)
 }
 
 // fanout dispatches every shard call concurrently through a bounded worker pool,

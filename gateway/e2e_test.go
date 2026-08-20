@@ -964,6 +964,71 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 		t.Fatalf("duplicate global claim err = %v", err)
 	}
 	c.verifyDeleted(t, conflictingBase)
+
+	updated, err := executor.Exec(context.Background(), Query{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":778}`, baseKey)),
+			shardservice.StringParam(baseKey),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil || updated.RowsAffected != 1 || updated.ShardsFanned < 2 {
+		t.Fatalf("indexed update = %+v, %v", updated, err)
+	}
+	oldRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("777")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(oldRead.Rows) != 0 {
+		t.Fatalf("old indexed key after update = %+v, %v", oldRead, err)
+	}
+	newRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("778")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(newRead.Rows) != 1 ||
+		string(newRead.Rows[0][0].Bytes) != `"`+baseKey+`"` {
+		t.Fatalf("new indexed key after update = %+v, %v", newRead, err)
+	}
+	unchanged, err := executor.Exec(context.Background(), Query{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":778}`, baseKey)),
+			shardservice.StringParam(baseKey),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil || unchanged.RowsAffected != 1 || unchanged.ShardsFanned != 1 {
+		t.Fatalf("index-stable guarded update = %+v, %v", unchanged, err)
+	}
+	emptyDelete, err := executor.Exec(context.Background(), Query{
+		SQL:    `DELETE FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(conflictingBase)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || emptyDelete.RowsAffected != 0 || emptyDelete.ShardsFanned != 1 {
+		t.Fatalf("empty guarded indexed delete = %+v, %v", emptyDelete, err)
+	}
+	deleted, err := executor.Exec(context.Background(), Query{
+		SQL:    `DELETE FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(baseKey)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || deleted.RowsAffected != 1 || deleted.ShardsFanned < 2 {
+		t.Fatalf("indexed delete = %+v, %v", deleted, err)
+	}
+	c.verifyDeleted(t, baseKey)
+	afterDelete, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("778")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(afterDelete.Rows) != 0 {
+		t.Fatalf("indexed key after delete = %+v, %v", afterDelete, err)
+	}
 }
 
 func TestE2EAtomicBatchSpansTablesAndShards(t *testing.T) {

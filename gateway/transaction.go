@@ -152,6 +152,12 @@ func (e *Executor) planTransaction(
 		if call == nil {
 			continue
 		}
+		if len(prepared.writeGlobalIndexes) != 0 &&
+			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
+			if err := e.captureIndexedMutation(ctx, prepared, bound, *call, profile); err != nil {
+				return nil, err
+			}
+		}
 		participants, err = appendBoundWriteParticipants(
 			participants, *call, query, bound, profile,
 		)
@@ -171,6 +177,19 @@ func appendBoundWriteParticipants(
 	profile Profile,
 ) ([]transactionParticipant, error) {
 	var err error
+	if len(bound.primaryPath) != 0 {
+		participants, err = appendTransactionStatement(
+			participants, baseCall,
+			shardservice.MutationStatement{
+				Kind:     shardservice.MutationPrimaryPrecondition,
+				Relation: bound.table, PrimaryPath: bound.primaryPath,
+				ExpectedKeys: bound.expectedKeys, ExpectedDigests: bound.expectedDigests,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
 	participants, err = appendTransactionStatement(
 		participants, baseCall,
 		shardservice.MutationStatement{SQL: query.SQL, Params: query.Params},
@@ -198,12 +217,13 @@ func appendBoundWriteParticipants(
 		value := bound.globalIndexArena[index.valueStart:index.valueEnd]
 		participants, err = appendTransactionStatement(
 			participants, call, shardservice.MutationStatement{
-				Kind:     shardservice.MutationGlobalIndexPut,
+				Kind:     index.kind,
 				Relation: index.metadata.Relation,
 				IndexID:  index.metadata.IndexID, Incarnation: index.metadata.Incarnation,
 				EntryKey: entryKey, Value: value,
 				LocatorCount: index.metadata.LocatorCount,
-				Unique:       index.metadata.Flags&IndexUnique != 0,
+				Unique: index.kind == shardservice.MutationGlobalIndexPut &&
+					index.metadata.Flags&IndexUnique != 0,
 			},
 		)
 		if err != nil {

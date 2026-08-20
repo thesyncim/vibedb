@@ -2,6 +2,7 @@ package shardservice
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -84,6 +85,46 @@ func TestMutationBatchRejectsCorruptionAndOversize(t *testing.T) {
 		if _, err := AppendMutationBatch(nil, []MutationStatement{invalid}); !errors.Is(err, ErrMutationBatch) {
 			t.Fatalf("invalid typed mutation %+v err = %v", invalid, err)
 		}
+	}
+}
+
+func TestMutationBatchPrimaryPreconditionRoundTrip(t *testing.T) {
+	digests := [][sha256.Size]byte{
+		sha256.Sum256([]byte(`{"id":"a"}`)),
+		sha256.Sum256([]byte(`{"id":"b"}`)),
+	}
+	raw, err := AppendMutationBatch(nil, []MutationStatement{{
+		Kind: MutationPrimaryPrecondition, Relation: "docs", PrimaryPath: []byte("/id"),
+		ExpectedKeys: [][]byte{{1, 'a'}, {1, 'b'}}, ExpectedDigests: digests,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := OpenMutationBatch(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	condition, ok, err := batch.Next()
+	if err != nil || !ok || condition.Kind != MutationPrimaryPrecondition ||
+		condition.Relation != "docs" || string(condition.PrimaryPath) != "/id" ||
+		len(condition.ExpectedKeys) != 2 || condition.ExpectedDigests[1] != digests[1] {
+		t.Fatalf("condition = %+v,%v,%v", condition, ok, err)
+	}
+	keyOffset := bytes.Index(raw, []byte{1, 'a'})
+	if keyOffset < 0 || &condition.ExpectedKeys[0][0] != &raw[keyOffset] {
+		t.Fatal("precondition key did not borrow the durable batch")
+	}
+
+	if _, err := AppendMutationBatch(nil, []MutationStatement{{
+		Kind: MutationPrimaryPrecondition, Relation: "docs", PrimaryPath: []byte("/id"),
+		ExpectedKeys: [][]byte{{1, 'b'}, {1, 'a'}}, ExpectedDigests: digests,
+	}}); !errors.Is(err, ErrMutationBatch) {
+		t.Fatalf("unsorted precondition err = %v", err)
+	}
+	if _, err := AppendMutationBatch(nil, []MutationStatement{{
+		Kind: MutationPrimaryPrecondition, Relation: "docs", PrimaryPath: []byte("/id"),
+	}}); err != nil {
+		t.Fatalf("empty-set precondition: %v", err)
 	}
 }
 

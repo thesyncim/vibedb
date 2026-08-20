@@ -468,13 +468,22 @@ func TestPreparedInsertExpandsReadyGlobalIndexes(t *testing.T) {
 		t.Fatalf("whole-document global bind = %d,%v", len(wholeBound.globalIndexes), err)
 	}
 
-	for _, statement := range []string{
-		`UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
-		`DELETE FROM messages WHERE tenant_id = ?`,
-	} {
-		if _, err := snapshot.Prepare(context.Background(), statement); !errors.Is(err, ErrGlobalIndexMaintenanceUnsupported) {
-			t.Fatalf("indexed mutation %q err = %v", statement, err)
-		}
+	update, err := snapshot.Prepare(context.Background(),
+		`UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`)
+	if err != nil || len(update.writeGlobalIndexes) != 1 {
+		t.Fatalf("prepare indexed UPDATE = %v, programs=%d", err, len(update.writeGlobalIndexes))
+	}
+	updateBound, err := update.BindWrite([]any{
+		[]byte(`{"tenant_id":"tenant-7","id":"message-9","email":"b@example.com"}`),
+		[]byte("tenant-7"),
+	})
+	if err != nil || len(updateBound.globalIndexes) != 0 {
+		t.Fatalf("bind indexed UPDATE before capture = %v, mutations=%d", err, len(updateBound.globalIndexes))
+	}
+	remove, err := snapshot.Prepare(context.Background(),
+		`DELETE FROM messages WHERE tenant_id = ?`)
+	if err != nil || len(remove.writeGlobalIndexes) != 1 {
+		t.Fatalf("prepare indexed DELETE = %v, programs=%d", err, len(remove.writeGlobalIndexes))
 	}
 }
 

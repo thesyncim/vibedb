@@ -119,7 +119,7 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
 	if req.Transaction.Operation != TransactionNone {
-		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() {
+		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture {
 			return NewErrorResponse(ErrorMalformedRequest,
 				"shardservice: a transaction command cannot carry an index read envelope")
 		}
@@ -177,6 +177,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 	if req.GlobalIndexLookup.present() {
 		return c.executeGlobalIndexLookup(req)
 	}
+	if req.MutationCapture {
+		return c.executeMutationCapture(req)
+	}
 	return c.execute(req)
 }
 
@@ -188,7 +191,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
 	allowAccess := tx.Operation == TransactionAcquireReadFence
 	if req.SQL != "" || len(req.Params) != 0 || req.GlobalIndexLookup.present() ||
-		req.PrimaryKeyRead.present() ||
+		req.PrimaryKeyRead.present() || req.MutationCapture ||
 		(!allowAccess && len(req.AccessScopes) != 0) ||
 		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
@@ -344,6 +347,68 @@ func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 	return RowsResponse(
 		[]Column{{Name: "locator", TypeOID: pgOIDJSON}}, rows,
 	)
+}
+
+var errMutationCaptureLimit = errors.New("shardservice: mutation capture exceeds result bound")
+
+// executeMutationCapture runs the DML runtime's target selector without
+// publishing. Native storage keys and canonical vibejson documents are copied
+// once at the session/wire boundary.
+func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
+	if req.ExecutionMode != ExecutionReadOnly || req.SQL == "" ||
+		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
+		!req.ReadFenceID.IsZero() || !req.MutationCapture {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: invalid mutation capture request")
+	}
+	maxRows, maxBytes := c.server.resultLimits(req)
+	if err := c.sess.SetResultLimits(maxRows, maxBytes); err != nil {
+		return classifyError(err)
+	}
+	if err := c.sess.SetIntermediateLimit(c.server.opts.MaxIntermediateBytes); err != nil {
+		return classifyError(err)
+	}
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	prep, err := c.sess.Prepare(ctx, req.SQL)
+	if err != nil {
+		return classifyError(err)
+	}
+	defer prep.Close()
+	if prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: mutation capture requires UPDATE or DELETE")
+	}
+	capacity := maxRows
+	if capacity < 0 || capacity > 256 {
+		capacity = 16
+	}
+	rows := make([][]Cell, 0, capacity)
+	var retained int64
+	err = prep.CaptureMutationInto(ctx, runtimeArgs(req.Params), func(key, document []byte) error {
+		if maxRows >= 0 && len(rows) >= maxRows {
+			return errMutationCaptureLimit
+		}
+		if maxBytes >= 0 && (int64(len(key)) > maxBytes-retained ||
+			int64(len(document)) > maxBytes-retained-int64(len(key))) {
+			return errMutationCaptureLimit
+		}
+		ownedKey := append([]byte(nil), key...)
+		ownedDocument := append([]byte(nil), document...)
+		rows = append(rows, []Cell{{Bytes: ownedKey}, {Bytes: ownedDocument}})
+		retained += int64(len(key) + len(document))
+		return nil
+	})
+	if errors.Is(err, errMutationCaptureLimit) {
+		return NewErrorResponse(ErrorResourceLimit, err.Error())
+	}
+	if err != nil {
+		return classifyError(err)
+	}
+	return RowsResponse([]Column{
+		{Name: "primary_key", TypeOID: pgOIDJSON},
+		{Name: "document", TypeOID: pgOIDJSON},
+	}, rows)
 }
 
 func (c *shardConn) lookupCoordinator(id distributedtxn.ID) *ShardResponse {
@@ -560,6 +625,7 @@ func (c *shardConn) executeParticipantStatements(
 	batch MutationBatch,
 ) (int64, *ShardResponse) {
 	var rowsAffected int64
+	guardPending := false
 	for {
 		mutation, ok, err := batch.Next()
 		if err != nil {
@@ -568,7 +634,23 @@ func (c *shardConn) executeParticipantStatements(
 		if !ok {
 			break
 		}
+		if mutation.Kind == MutationPrimaryPrecondition {
+			if guardPending {
+				return 0, transactionError(ErrMutationBatch)
+			}
+			if err := c.sess.ValidatePrimaryDocumentDigests(
+				ctx, mutation.Relation, mutation.PrimaryPath,
+				mutation.ExpectedKeys, mutation.ExpectedDigests,
+			); err != nil {
+				return 0, transactionError(err)
+			}
+			guardPending = true
+			continue
+		}
 		if mutation.Kind != MutationSQL {
+			if guardPending {
+				return 0, transactionError(ErrMutationBatch)
+			}
 			_, mutationErr := c.sess.ApplyGlobalIndexMutation(
 				ctx, mutation.Relation, mutation.IndexID, mutation.Incarnation,
 				mutation.EntryKey, mutation.Value, mutation.LocatorCount,
@@ -583,7 +665,8 @@ func (c *shardConn) executeParticipantStatements(
 		if err != nil {
 			return 0, classifyError(err)
 		}
-		if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() {
+		if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() ||
+			(guardPending && prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete) {
 			_ = prep.Close()
 			return 0, NewErrorResponse(ErrorMalformedRequest,
 				"shardservice: a distributed participant mutation must be non-row-returning DML")
@@ -598,6 +681,10 @@ func (c *shardConn) executeParticipantStatements(
 				"shardservice: participant affected-row count overflow")
 		}
 		rowsAffected += result.RowsAffected
+		guardPending = false
+	}
+	if guardPending {
+		return 0, transactionError(ErrMutationBatch)
 	}
 	return rowsAffected, nil
 }
