@@ -1,7 +1,6 @@
 package shardservice
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -161,8 +160,9 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		// The fixed-set protocol designates the first sorted participant as
 		// coordinator, avoiding another identity field in every record.
 		first := record.Participants[0]
-		if record.RoutingVersion != uint64(req.RoutingVersion) ||
+		if !vibejson.BytesEqualString(first.Distribution, string(req.Distribution)) ||
 			!vibejson.BytesEqualString(first.Shard, string(req.Shard)) ||
+			first.RoutingVersion != uint64(req.RoutingVersion) ||
 			first.AllocationGeneration != uint64(req.AllocationGeneration) ||
 			first.OwnershipEpoch != uint64(req.OwnershipEpoch) {
 			return transactionError(distributedtxn.ErrJournalConflict)
@@ -181,17 +181,27 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		status, err = c.server.journal.StageParticipant(tx.Record)
 	case TransactionLookupCoordinator:
 		var ok bool
-		status, ok = c.server.journal.Status(tx.ID)
-		if !ok || status.Role != distributedtxn.RoleCoordinator {
+		status, ok = c.server.journal.CoordinatorStatus(tx.ID)
+		if !ok {
 			err = distributedtxn.ErrJournalNotFound
 		}
 	case TransactionLookupParticipant:
 		return c.lookupParticipant(tx.ID)
+	case TransactionPrepareParticipant:
+		return c.prepareParticipant(req)
 	case TransactionApplyParticipant:
 		return c.applyParticipant(req)
 	case TransactionCommitCoordinator:
 		status, err = c.server.journal.TransitionCoordinator(
 			tx.ID, tx.Revision, distributedtxn.CoordinatorCommitted,
+		)
+	case TransactionAbortCoordinator:
+		status, err = c.server.journal.TransitionCoordinator(
+			tx.ID, tx.Revision, distributedtxn.CoordinatorAborted,
+		)
+	case TransactionAbortParticipant:
+		status, err = c.server.journal.TransitionParticipant(
+			tx.ID, tx.Revision, distributedtxn.ParticipantAborted,
 		)
 	case TransactionReleaseParticipant:
 		status, err = c.server.journal.TransitionParticipant(
@@ -203,7 +213,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		)
 	default:
 		return NewErrorResponse(ErrorMalformedRequest,
-			"shardservice: transaction transition is not enabled before atomic SQL publication")
+			"shardservice: transaction operation is not recognized")
 	}
 	if err != nil {
 		return transactionError(err)
@@ -212,8 +222,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 }
 
 func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
-	status, ok := c.server.journal.Status(id)
-	if !ok || status.Role != distributedtxn.RoleParticipant {
+	status, ok := c.server.journal.ParticipantStatus(id)
+	if !ok {
 		return transactionError(distributedtxn.ErrJournalNotFound)
 	}
 	revision, rowsAffected, applied, err := c.server.db.DistributedParticipantStatus(id)
@@ -221,7 +231,7 @@ func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
 		return transactionError(err)
 	}
 	if applied {
-		if status.ParticipantState == distributedtxn.ParticipantStaged && revision == status.Revision+1 {
+		if status.ParticipantState == distributedtxn.ParticipantPrepared && revision == status.Revision+1 {
 			if repaired, transitionErr := c.server.journal.TransitionParticipant(
 				id, status.Revision, distributedtxn.ParticipantApplied,
 			); transitionErr == nil {
@@ -244,15 +254,15 @@ func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
 
 func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	status, ok := c.server.journal.Status(tx.ID)
-	if !ok || status.Role != distributedtxn.RoleParticipant {
+	status, ok := c.server.journal.ParticipantStatus(tx.ID)
+	if !ok {
 		return transactionError(distributedtxn.ErrJournalNotFound)
 	}
 	if (status.ParticipantState == distributedtxn.ParticipantApplied && status.Revision == tx.Revision+1) ||
 		(status.ParticipantState == distributedtxn.ParticipantReleased && status.Revision == tx.Revision+2) {
 		return c.lookupParticipant(tx.ID)
 	}
-	if status.ParticipantState != distributedtxn.ParticipantStaged || status.Revision != tx.Revision {
+	if status.ParticipantState != distributedtxn.ParticipantPrepared || status.Revision != tx.Revision {
 		return transactionError(distributedtxn.ErrJournalConflict)
 	}
 	if revision, rowsAffected, found, err := c.server.db.DistributedParticipantStatus(tx.ID); err != nil {
@@ -270,34 +280,73 @@ func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {
 		resp.RowsAffected = rowsAffected
 		return resp
 	}
-	record, err := c.server.journal.Participant(tx.ID)
-	if err != nil || sha256.Sum256(record.Mutation) != record.MutationDigest {
-		if err == nil {
-			err = distributedtxn.ErrCorrupt
-		}
+	batch, err := c.participantBatch(tx.ID)
+	if err != nil {
 		return transactionError(err)
 	}
-	mutationBytes := bytes.NewReader(record.Mutation)
-	mutation, err := DecodeRequest(mutationBytes)
-	if err != nil || mutationBytes.Len() != 0 ||
-		mutation.Transaction.Operation != TransactionNone ||
-		mutation.ExecutionMode != ExecutionReadWrite || mutation.SQL == "" {
-		if err == nil {
-			err = distributedtxn.ErrCorrupt
-		}
+	return c.executeParticipantMutation(req, batch)
+}
+
+func (c *shardConn) prepareParticipant(req *ShardRequest) *ShardResponse {
+	tx := req.Transaction
+	status, ok := c.server.journal.ParticipantStatus(tx.ID)
+	if !ok {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	if status.ParticipantState == distributedtxn.ParticipantPrepared && status.Revision == tx.Revision+1 {
+		return transactionStatusResponse(status)
+	}
+	if status.ParticipantState != distributedtxn.ParticipantStaged || status.Revision != tx.Revision {
+		return transactionError(distributedtxn.ErrJournalConflict)
+	}
+	batch, err := c.participantBatch(tx.ID)
+	if err != nil {
 		return transactionError(err)
 	}
-	if err := c.server.ownership.Admit(mutation); err != nil {
+	rows, resultBytes := c.server.resultLimits(req)
+	if err := c.sess.SetResultLimits(rows, resultBytes); err != nil {
+		return classifyError(err)
+	}
+	if err := c.sess.SetIntermediateLimit(c.server.opts.MaxIntermediateBytes); err != nil {
+		return classifyError(err)
+	}
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	if err := c.sess.Begin(ctx, sqldriver.TxOptions{Isolation: sqldriver.IsolationSerializable}); err != nil {
+		return classifyError(err)
+	}
+	defer c.sess.Rollback(context.Background())
+	if _, response := c.executeParticipantStatements(ctx, batch); response != nil {
+		return response
+	}
+	if err := c.sess.Rollback(ctx); err != nil {
+		return classifyError(err)
+	}
+	status, err = c.server.journal.TransitionParticipant(
+		tx.ID, tx.Revision, distributedtxn.ParticipantPrepared,
+	)
+	if err != nil {
 		return transactionError(err)
 	}
-	return c.executeParticipantMutation(req, mutation)
+	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) participantBatch(id distributedtxn.ID) (MutationBatch, error) {
+	record, err := c.server.journal.Participant(id)
+	if err != nil {
+		return MutationBatch{}, err
+	}
+	if sha256.Sum256(record.Mutation) != record.MutationDigest {
+		return MutationBatch{}, distributedtxn.ErrCorrupt
+	}
+	return OpenMutationBatch(record.Mutation)
 }
 
 func (c *shardConn) executeParticipantMutation(
 	outer *ShardRequest,
-	mutation *ShardRequest,
+	batch MutationBatch,
 ) *ShardResponse {
-	rows, resultBytes := c.server.resultLimits(mutation)
+	rows, resultBytes := c.server.resultLimits(outer)
 	if err := c.sess.SetResultLimits(rows, resultBytes); err != nil {
 		return classifyError(err)
 	}
@@ -306,25 +355,16 @@ func (c *shardConn) executeParticipantMutation(
 	}
 	ctx, cancel := c.server.requestContext(outer)
 	defer cancel()
-	prep, err := c.sess.Prepare(ctx, mutation.SQL)
-	if err != nil {
-		return classifyError(err)
-	}
-	defer prep.Close()
-	if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() {
-		return NewErrorResponse(ErrorMalformedRequest,
-			"shardservice: a distributed participant mutation must be non-row-returning DML")
-	}
 	if err := c.sess.Begin(ctx, sqldriver.TxOptions{Isolation: sqldriver.IsolationSerializable}); err != nil {
 		return classifyError(err)
 	}
 	defer c.sess.Rollback(context.Background())
-	result, err := prep.Exec(ctx, runtimeArgs(mutation.Params))
-	if err != nil {
-		return classifyError(err)
+	rowsAffected, response := c.executeParticipantStatements(ctx, batch)
+	if response != nil {
+		return response
 	}
 	affected, err := c.sess.CommitDistributedParticipant(
-		ctx, outer.Transaction.ID, outer.Transaction.Revision, result.RowsAffected,
+		ctx, outer.Transaction.ID, outer.Transaction.Revision, rowsAffected,
 	)
 	if err != nil {
 		return classifyError(err)
@@ -346,6 +386,42 @@ func (c *shardConn) executeParticipantMutation(
 	return resp
 }
 
+func (c *shardConn) executeParticipantStatements(
+	ctx context.Context,
+	batch MutationBatch,
+) (int64, *ShardResponse) {
+	var rowsAffected int64
+	for {
+		mutation, ok, err := batch.Next()
+		if err != nil {
+			return 0, transactionError(err)
+		}
+		if !ok {
+			break
+		}
+		prep, err := c.sess.Prepare(ctx, mutation.SQL)
+		if err != nil {
+			return 0, classifyError(err)
+		}
+		if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() {
+			_ = prep.Close()
+			return 0, NewErrorResponse(ErrorMalformedRequest,
+				"shardservice: a distributed participant mutation must be non-row-returning DML")
+		}
+		result, execErr := prep.Exec(ctx, runtimeArgs(mutation.Params))
+		closeErr := prep.Close()
+		if execErr != nil || closeErr != nil {
+			return 0, classifyError(errors.Join(execErr, closeErr))
+		}
+		if result.RowsAffected < 0 || result.RowsAffected > math.MaxInt64-rowsAffected {
+			return 0, NewErrorResponse(ErrorResourceLimit,
+				"shardservice: participant affected-row count overflow")
+		}
+		rowsAffected += result.RowsAffected
+	}
+	return rowsAffected, nil
+}
+
 func transactionStatusResponse(status distributedtxn.Status) *ShardResponse {
 	resp := CompletionResponse(0)
 	resp.Transaction.ID = status.ID
@@ -364,6 +440,15 @@ func transactionStatusResponse(status distributedtxn.Status) *ShardResponse {
 func transactionError(err error) *ShardResponse {
 	if errors.Is(err, distributedtxn.ErrOutcomeUnknown) {
 		return NewErrorResponse(ErrorCommitOutcomeUnknown, err.Error())
+	}
+	if errors.Is(err, distributedtxn.ErrJournalNotFound) {
+		return NewErrorResponse(ErrorTransactionNotFound, err.Error())
+	}
+	if errors.Is(err, distributedtxn.ErrJournalConflict) ||
+		errors.Is(err, distributedtxn.ErrJournalBusy) ||
+		errors.Is(err, distributedtxn.ErrInvalidState) ||
+		errors.Is(err, sqldriver.ErrDistributedTransactionConflict) {
+		return NewErrorResponse(ErrorTransactionConflict, err.Error())
 	}
 	return NewErrorResponse(ErrorMalformedRequest, err.Error())
 }

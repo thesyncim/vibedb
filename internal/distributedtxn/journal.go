@@ -16,6 +16,7 @@ var (
 	ErrJournalClosed   = errors.New("distributed transaction journal is closed")
 	ErrJournalConflict = errors.New("distributed transaction journal identity conflicts with durable state")
 	ErrJournalNotFound = errors.New("distributed transaction journal identity was not found")
+	ErrJournalBusy     = errors.New("distributed transaction journal has another active participant")
 	ErrOutcomeUnknown  = errors.New("distributed transaction journal durability outcome is unknown")
 	journalEntryMagic  = [4]byte{'V', 'T', 'J', '1'}
 )
@@ -60,13 +61,14 @@ type journalRecord struct {
 // is published only after fsync succeeds, and a sync failure poisons the handle
 // so callers must reopen and resolve the durable outcome from recovery.
 type Journal struct {
-	mu          sync.RWMutex
-	file        *os.File
-	records     map[ID]*journalRecord
-	sticky      error
-	closed      bool
-	barriers    int
-	barrierDone chan struct{}
+	mu           sync.RWMutex
+	file         *os.File
+	coordinators map[ID]*journalRecord
+	participants map[ID]*journalRecord
+	sticky       error
+	closed       bool
+	barriers     int
+	barrierDone  chan struct{}
 }
 
 // OpenJournal opens or creates path, recovers every checksummed entry, and
@@ -96,7 +98,10 @@ func OpenJournal(path string) (*Journal, error) {
 	}
 	barrierDone := make(chan struct{})
 	close(barrierDone)
-	j := &Journal{file: file, records: make(map[ID]*journalRecord), barrierDone: barrierDone}
+	j := &Journal{
+		file: file, coordinators: make(map[ID]*journalRecord),
+		participants: make(map[ID]*journalRecord), barrierDone: barrierDone,
+	}
 	if err := j.recover(); err != nil {
 		_ = file.Close()
 		return nil, err
@@ -201,13 +206,13 @@ func (j *Journal) replayCoordinatorStage(raw []byte, record CoordinatorRecord) e
 	if record.State != CoordinatorStaging {
 		return ErrCorrupt
 	}
-	if prior := j.records[record.ID]; prior != nil {
-		if prior.status.Role != RoleCoordinator || !bytes.Equal(prior.stage, raw) {
+	if prior := j.coordinators[record.ID]; prior != nil {
+		if !bytes.Equal(prior.stage, raw) {
 			return ErrJournalConflict
 		}
 		return nil
 	}
-	j.records[record.ID] = &journalRecord{
+	j.coordinators[record.ID] = &journalRecord{
 		status: Status{Role: RoleCoordinator, ID: record.ID, Revision: record.Revision,
 			CoordinatorState: record.State},
 		stage: bytes.Clone(raw),
@@ -219,13 +224,13 @@ func (j *Journal) replayParticipantStage(raw []byte, record ParticipantRecord) e
 	if record.State != ParticipantStaged {
 		return ErrCorrupt
 	}
-	if prior := j.records[record.ID]; prior != nil {
-		if prior.status.Role != RoleParticipant || !bytes.Equal(prior.stage, raw) {
+	if prior := j.participants[record.ID]; prior != nil {
+		if !bytes.Equal(prior.stage, raw) {
 			return ErrJournalConflict
 		}
 		return nil
 	}
-	j.records[record.ID] = &journalRecord{
+	j.participants[record.ID] = &journalRecord{
 		status: Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
 			ParticipantState: record.State, MutationDigest: record.MutationDigest},
 		stage: bytes.Clone(raw),
@@ -235,8 +240,8 @@ func (j *Journal) replayParticipantStage(raw []byte, record ParticipantRecord) e
 }
 
 func (j *Journal) replayCoordinatorTransition(id ID, revision uint64, next CoordinatorState) error {
-	record := j.records[id]
-	if record == nil || record.status.Role != RoleCoordinator || revision != record.status.Revision+1 ||
+	record := j.coordinators[id]
+	if record == nil || revision != record.status.Revision+1 ||
 		!record.status.CoordinatorState.CanTransitionTo(next) {
 		return ErrCorrupt
 	}
@@ -246,8 +251,8 @@ func (j *Journal) replayCoordinatorTransition(id ID, revision uint64, next Coord
 }
 
 func (j *Journal) replayParticipantTransition(id ID, revision uint64, next ParticipantState) error {
-	record := j.records[id]
-	if record == nil || record.status.Role != RoleParticipant || revision != record.status.Revision+1 ||
+	record := j.participants[id]
+	if record == nil || revision != record.status.Revision+1 ||
 		!record.status.ParticipantState.CanTransitionTo(next) {
 		return ErrCorrupt
 	}
@@ -313,8 +318,8 @@ func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if prior := j.records[record.ID]; prior != nil {
-		if prior.status.Role == RoleCoordinator && bytes.Equal(prior.stage, raw) {
+	if prior := j.coordinators[record.ID]; prior != nil {
+		if bytes.Equal(prior.stage, raw) {
 			return prior.status, nil
 		}
 		return Status{}, ErrJournalConflict
@@ -325,7 +330,7 @@ func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
 	owned := bytes.Clone(raw)
 	status := Status{Role: RoleCoordinator, ID: record.ID, Revision: record.Revision,
 		CoordinatorState: record.State}
-	j.records[record.ID] = &journalRecord{status: status, stage: owned}
+	j.coordinators[record.ID] = &journalRecord{status: status, stage: owned}
 	return status, nil
 }
 
@@ -336,18 +341,25 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if prior := j.records[record.ID]; prior != nil {
-		if prior.status.Role == RoleParticipant && bytes.Equal(prior.stage, raw) {
+	if prior := j.participants[record.ID]; prior != nil {
+		if bytes.Equal(prior.stage, raw) {
 			return prior.status, nil
 		}
 		return Status{}, ErrJournalConflict
+	}
+	// The current visibility barrier is shard-wide, so admitting a second
+	// distributed participant would let two dry-run/commit sequences observe the
+	// same pre-commit state. Fail fast instead of waiting or deadlocking across
+	// shards. Scoped intents replace this conservative exclusion later.
+	if j.barriers != 0 {
+		return Status{}, ErrJournalBusy
 	}
 	if err := j.writeEntryLocked(journalParticipantStage, byte(record.State), record.Revision, record.ID, raw); err != nil {
 		return Status{}, err
 	}
 	status := Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
 		ParticipantState: record.State, MutationDigest: record.MutationDigest}
-	j.records[record.ID] = &journalRecord{status: status, stage: bytes.Clone(raw)}
+	j.participants[record.ID] = &journalRecord{status: status, stage: bytes.Clone(raw)}
 	j.addBarrierLocked()
 	return status, nil
 }
@@ -355,7 +367,35 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 func (j *Journal) Status(id ID) (Status, bool) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.records[id]
+	record := j.participants[id]
+	if record == nil {
+		record = j.coordinators[id]
+	}
+	if record == nil {
+		return Status{}, false
+	}
+	return record.status, true
+}
+
+// CoordinatorStatus returns only the coordinator role for id. A coordinator
+// shard may also be a data participant for the same transaction, so protocol
+// callers must not use the compatibility Status lookup when the role matters.
+func (j *Journal) CoordinatorStatus(id ID) (Status, bool) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	record := j.coordinators[id]
+	if record == nil {
+		return Status{}, false
+	}
+	return record.status, true
+}
+
+// ParticipantStatus returns only the participant role for id. Coordinator and
+// participant records have independent revisions and may coexist on one shard.
+func (j *Journal) ParticipantStatus(id ID) (Status, bool) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	record := j.participants[id]
 	if record == nil {
 		return Status{}, false
 	}
@@ -365,8 +405,8 @@ func (j *Journal) Status(id ID) (Status, bool) {
 func (j *Journal) TransitionCoordinator(id ID, expected uint64, next CoordinatorState) (Status, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	record := j.records[id]
-	if record == nil || record.status.Role != RoleCoordinator {
+	record := j.coordinators[id]
+	if record == nil {
 		return Status{}, ErrJournalNotFound
 	}
 	if record.status.Revision == expected+1 && record.status.CoordinatorState == next {
@@ -386,8 +426,8 @@ func (j *Journal) TransitionCoordinator(id ID, expected uint64, next Coordinator
 func (j *Journal) TransitionParticipant(id ID, expected uint64, next ParticipantState) (Status, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	record := j.records[id]
-	if record == nil || record.status.Role != RoleParticipant {
+	record := j.participants[id]
+	if record == nil {
 		return Status{}, ErrJournalNotFound
 	}
 	if record.status.Revision == expected+1 && record.status.ParticipantState == next {
@@ -431,11 +471,24 @@ func (j *Journal) WaitNoParticipantBarrier(ctx context.Context) error {
 func (j *Journal) Participant(id ID) (ParticipantRecord, error) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.records[id]
-	if record == nil || record.status.Role != RoleParticipant {
+	record := j.participants[id]
+	if record == nil {
 		return ParticipantRecord{}, ErrJournalNotFound
 	}
 	return OpenParticipant(record.stage)
+}
+
+// Coordinator returns a decoded immutable view of the coordinator stage
+// payload. Participant slices alias journal-owned storage and remain valid
+// until Close.
+func (j *Journal) Coordinator(id ID) (CoordinatorRecord, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	record := j.coordinators[id]
+	if record == nil {
+		return CoordinatorRecord{}, ErrJournalNotFound
+	}
+	return OpenCoordinator(record.stage)
 }
 
 func (j *Journal) Close() error {

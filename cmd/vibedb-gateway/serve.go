@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -25,8 +26,9 @@ const maxServeRequestBytes = 1 << 20
 // catalog generation, refreshes the atomically replaced catalog file after a
 // shard reports stale routing metadata, and accepts newline-delimited JSON
 // requests over a connection. Each request routes and dispatches against the
-// pinned generation: a bounded distributed read by default, or one colocated
-// single-shard write when the envelope's op is exec. The reply is the merged
+// pinned generation: a bounded distributed read by default, one colocated
+// single-shard write for exec, or an atomic fixed-participant write batch for
+// exec_batch. The reply is the merged
 // result. The wire form is a minimal JSON envelope; a request
 // carries SQL, typed parameters, and an operational class. The pinned catalog
 // and shared SQL planner derive placement, shard constraints, merge order, and
@@ -37,10 +39,17 @@ const maxServeRequestBytes = 1 << 20
 // merge metadata independently of the statement.
 type serveRequest struct {
 	// Op selects the gateway operation: the empty value and "query" are the
-	// read path; "exec" is the single-shard write path.
-	Op     string       `json:"op,omitempty"`
+	// read path; "exec" is the single-shard write path; "exec_batch" uses
+	// Statements and applies one Class to the complete atomic batch.
+	Op         string           `json:"op,omitempty"`
+	SQL        string           `json:"sql"`
+	Class      string           `json:"class,omitempty"`
+	Params     []serveParam     `json:"params,omitempty"`
+	Statements []serveStatement `json:"statements,omitempty"`
+}
+
+type serveStatement struct {
 	SQL    string       `json:"sql"`
-	Class  string       `json:"class,omitempty"`
 	Params []serveParam `json:"params,omitempty"`
 }
 
@@ -322,22 +331,58 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 // execRequest translates one request and dispatches it, mapping any failure into
 // an error reply rather than dropping the connection.
 func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) *serveResponse {
-	q, err := buildQuery(req)
-	if err != nil {
-		return &serveResponse{Error: err.Error()}
-	}
 	var res *gateway.Result
-	if req.Op == "exec" {
+	var err error
+	switch req.Op {
+	case "exec_batch":
+		queries, buildErr := buildBatchQueries(req)
+		if buildErr != nil {
+			return &serveResponse{Error: buildErr.Error()}
+		}
+		res, err = exec.ExecBatch(ctx, queries)
+	case "exec":
 		// The write path routes the statement to its single owning shard and
 		// refuses every scatter before any dispatch.
+		q, buildErr := buildQuery(req)
+		if buildErr != nil {
+			return &serveResponse{Error: buildErr.Error()}
+		}
 		res, err = exec.Exec(ctx, q)
-	} else {
+	case "", "query":
+		q, buildErr := buildQuery(req)
+		if buildErr != nil {
+			return &serveResponse{Error: buildErr.Error()}
+		}
 		res, err = exec.Query(ctx, q)
+	default:
+		return &serveResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}
 	}
 	if err != nil {
 		return &serveResponse{Error: err.Error()}
 	}
 	return encodeResult(res)
+}
+
+func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
+	if req.SQL != "" || len(req.Params) != 0 {
+		return nil, errors.New("exec_batch uses statements instead of top-level sql or params")
+	}
+	if len(req.Statements) == 0 {
+		return nil, gateway.ErrBatchEmpty
+	}
+	class, err := parseClass(req.Class)
+	if err != nil {
+		return nil, err
+	}
+	queries := make([]gateway.Query, len(req.Statements))
+	for i := range req.Statements {
+		params, err := buildParams(req.Statements[i].Params)
+		if err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		queries[i] = gateway.Query{SQL: req.Statements[i].SQL, Params: params, Class: class}
+	}
+	return queries, nil
 }
 
 // buildQuery turns a request envelope into a gateway query. Placement, routing,

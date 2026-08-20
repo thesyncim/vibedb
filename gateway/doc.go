@@ -35,10 +35,11 @@
 // lineage translation rather than dropping or numerically comparing positions.
 //
 // The current package is leader-only. Its read path fans out and merges; its
-// write path (Exec) executes one mutating statement the pinned generation
-// proves resident on exactly one shard, and refuses every scatter, cross-shard
-// batch, and DDL before any network I/O. It does not provide cross-shard
-// transactions, two-phase commit, peer authentication, replication, failover,
-// online movement, or a topology authority. The command front end is
-// loopback-only newline-delimited JSON, not pgwire.
+// write path keeps Exec as the single-statement/single-shard fast lane.
+// ExecBatch prepares every statement against one pinned generation and runs a
+// bounded fixed-participant transaction across tables and shards. Coordinator
+// and participant state is durable on shards; automatic background recovery,
+// key-range-scoped intents, replicated serving, peer authentication, failover,
+// online movement, and a topology authority are not yet provided. The command
+// front end is loopback-only newline-delimited JSON, not pgwire.
 package gateway

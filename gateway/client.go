@@ -49,6 +49,11 @@ var (
 	// ErrUnexpectedError reports an error frame whose kind this client does not
 	// recognize, so a future error kind fails closed rather than silently.
 	ErrUnexpectedError = errors.New("gateway: shard reported an unrecognized error kind")
+	// ErrTransactionConflict reports a non-idempotent transaction retry or an
+	// invalid durable state transition.
+	ErrTransactionConflict = errors.New("gateway: distributed transaction state conflicts with durable state")
+	// ErrTransactionNotFound reports a missing coordinator or participant role.
+	ErrTransactionNotFound = errors.New("gateway: distributed transaction record was not found")
 )
 
 // ShardError is a typed failure a shard reported in an error frame. Kind is the
@@ -95,6 +100,10 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrPositionIdentity
 	case shardservice.ErrorPositionNotReached:
 		return ErrPositionNotReached
+	case shardservice.ErrorTransactionConflict:
+		return ErrTransactionConflict
+	case shardservice.ErrorTransactionNotFound:
+		return ErrTransactionNotFound
 	default:
 		return ErrUnexpectedError
 	}

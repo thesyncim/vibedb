@@ -28,7 +28,8 @@ import (
 // Everything else — a scatter, an unbounded predicate, a cross-shard batch, or
 // a statement kind with no single-shard form (DDL, TRUNCATE, INSERT ... SELECT)
 // — is refused before any network I/O, so a write never partially commits.
-// Cross-shard transactions and two-phase commit remain outside this boundary.
+// Cross-shard batches use this same per-statement proof before ExecBatch groups
+// their single-owner statements into durable participants.
 
 // ErrDistributedWriteUnsupported reports a write shape the distributed layer
 // cannot execute against more than zero shards of a generation. It wraps a

@@ -722,6 +722,143 @@ func TestE2EDistributedWriteRoutesToOwningShard(t *testing.T) {
 	}
 }
 
+func TestE2EAtomicBatchAcrossShards(t *testing.T) {
+	c := newE2ECluster(t)
+	executor := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	keys0 := c.freshKeysForShard(t, c.shards[0].id, 2)
+	key2 := c.freshKeysForShard(t, c.shards[2].id, 1)[0]
+
+	result, err := executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys0[0]), shardservice.NumberParam("101"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(key2), shardservice.NumberParam("202"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecBatch: %v", err)
+	}
+	if result.Kind != shardservice.ResponseCompletion || result.RowsAffected != 2 ||
+		result.RouteKind != distribution.RouteTargeted || result.ShardsFanned != 2 {
+		t.Fatalf("batch result = %+v", result)
+	}
+	c.verifyInserted(t, keys0[0], 101)
+	c.verifyInserted(t, key2, 202)
+
+	// The second participant fails preparation on a duplicate primary key. The
+	// first participant's successful dry-run must be rolled back and every
+	// participant barrier released before the batch returns.
+	_, err = executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys0[1]), shardservice.NumberParam("303"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(c.shards[3].keys[0]), shardservice.NumberParam("404"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err == nil {
+		t.Fatal("batch with a duplicate participant mutation succeeded")
+	}
+	c.verifyDeleted(t, keys0[1])
+}
+
+func TestE2EAtomicBatchSpansTablesAndShards(t *testing.T) {
+	c := newE2ECluster(t)
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	for i := range c.shards {
+		c.seed(t, seedClient, c.shards[i],
+			`CREATE TABLE audit (tenant_id STRING PRIMARY KEY, event STRING NOT NULL)`, nil)
+	}
+	endpoints := make(map[distribution.EndpointID]string, len(c.shards))
+	for i := range c.shards {
+		endpoints[c.shards[i].endpoint] = c.shards[i].address
+	}
+	snapshot, err := NewSnapshot(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{
+			Name: c.dist, Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+		}},
+		Placements: []distribution.TablePlacement{
+			{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+			{Table: "audit", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+		},
+		Manifests: []*distribution.Manifest{c.man},
+	}, endpoints, 2)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{})
+	messageKey := c.shards[1].keys[0]
+	auditKey := c.freshKeysForShard(t, c.shards[3].id, 1)[0]
+	result, err := executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":111}`, messageKey)),
+				shardservice.StringParam(messageKey),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO audit (tenant_id, event) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(messageKey), shardservice.StringParam("updated"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO audit (tenant_id, event) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(auditKey), shardservice.StringParam("remote"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecBatch: %v", err)
+	}
+	if result.RowsAffected != 3 || result.ShardsFanned != 2 ||
+		result.RouteKind != distribution.RouteTargeted {
+		t.Fatalf("batch result = %+v", result)
+	}
+	message, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(messageKey)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || !equalInts(decodeInts(t, message.Rows), []int64{111}) {
+		t.Fatalf("updated message = %+v, %v", message, err)
+	}
+	for key, want := range map[string]string{messageKey: `"updated"`, auditKey: `"remote"`} {
+		audit, err := executor.Query(context.Background(), Query{
+			SQL:    `SELECT event FROM audit WHERE tenant_id = ?`,
+			Params: []shardservice.Param{shardservice.StringParam(key)},
+			Class:  ClassInteractive,
+		})
+		if err != nil || len(audit.Rows) != 1 || len(audit.Rows[0]) != 1 ||
+			string(audit.Rows[0][0].Bytes) != want {
+			t.Fatalf("audit %q = %+v, %v; want %s", key, audit, err, want)
+		}
+	}
+}
+
 // TestE2EWriteRefusalsBeforeDispatch proves every write shape that cannot be
 // proven single-shard is refused before any network I/O: a cross-shard INSERT
 // batch, a scatter UPDATE or DELETE over a non-shard-key predicate, an

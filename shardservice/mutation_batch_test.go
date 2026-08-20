@@ -1,0 +1,79 @@
+package shardservice
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
+)
+
+func TestMutationBatchRoundTripAndBorrowing(t *testing.T) {
+	statements := []MutationStatement{
+		{SQL: "INSERT INTO docs (id, n) VALUES (?, ?)", Params: []Param{
+			StringBytesParam([]byte("first")), NumberBytesParam([]byte("7")),
+		}},
+		{SQL: "UPDATE docs SET doc = ? WHERE id = ?", Params: []Param{
+			DocumentBytesParam([]byte(`{"id":"first","n":8}`)), StringBytesParam([]byte("first")),
+		}},
+	}
+	raw, err := AppendMutationBatch([]byte("prefix"), statements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = raw[len("prefix"):]
+	batch, err := OpenMutationBatch(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := batch.Next()
+	if err != nil || !ok || first.SQL != statements[0].SQL || len(first.Params) != 2 ||
+		!bytes.Equal(first.Params[0].Bytes, []byte("first")) {
+		t.Fatalf("first = %+v,%v,%v", first, ok, err)
+	}
+	offset := bytes.Index(raw, []byte("first"))
+	if offset < 0 || &first.Params[0].Bytes[0] != &raw[offset] {
+		t.Fatal("parameter payload did not borrow the durable batch")
+	}
+	second, ok, err := batch.Next()
+	if err != nil || !ok || second.SQL != statements[1].SQL || len(second.Params) != 2 {
+		t.Fatalf("second = %+v,%v,%v", second, ok, err)
+	}
+	if _, ok, err := batch.Next(); err != nil || ok {
+		t.Fatalf("batch end = %v,%v", ok, err)
+	}
+}
+
+func TestMutationBatchRejectsCorruptionAndOversize(t *testing.T) {
+	raw, err := AppendMutationBatch(nil, []MutationStatement{{SQL: "DELETE FROM docs WHERE id = ?", Params: []Param{StringParam("x")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append([]byte(nil), raw...)
+	raw[len(raw)-1] = 0xff
+	if _, err := OpenMutationBatch(raw); !errors.Is(err, ErrMutationBatch) {
+		t.Fatalf("corrupt batch = %v", err)
+	}
+	tooLarge := MutationStatement{SQL: string(make([]byte, distributedtxn.MaxMutationBytes))}
+	if _, err := AppendMutationBatch(nil, []MutationStatement{tooLarge}); !errors.Is(err, distributedtxn.ErrTooLarge) {
+		t.Fatalf("oversize batch = %v", err)
+	}
+}
+
+func BenchmarkMutationBatchOpen(b *testing.B) {
+	raw, err := AppendMutationBatch(nil, []MutationStatement{
+		{SQL: "INSERT INTO docs (id, n) VALUES (?, ?)", Params: []Param{StringParam("first"), NumberParam("7")}},
+		{SQL: "DELETE FROM docs WHERE id = ?", Params: []Param{StringParam("second")}},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := OpenMutationBatch(raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -29,7 +29,8 @@ func journalParticipant(t testing.TB, id ID, mutation []byte) []byte {
 	raw, err := AppendParticipant(nil, ParticipantRecord{
 		ID: id, State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
 		AllocationGeneration: 4, OwnershipEpoch: 7,
-		CoordinatorShard: []byte("-40"), CoordinatorAllocation: 4,
+		CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-40"), CoordinatorAllocation: 4,
+		CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 7,
 		MutationDigest: journalDigest(id[0] + 40), Mutation: mutation,
 	})
 	if err != nil {
@@ -41,12 +42,12 @@ func journalParticipant(t testing.TB, id ID, mutation []byte) []byte {
 func journalCoordinator(t testing.TB, id ID) []byte {
 	t.Helper()
 	raw, err := AppendCoordinator(nil, CoordinatorRecord{
-		ID: id, State: CoordinatorStaging, Revision: 1, RoutingVersion: 9,
+		ID: id, State: CoordinatorStaging, Revision: 1, CatalogGeneration: 9,
 		RecoveryDeadline: 1234,
 		Participants: []ParticipantRef{
-			{Shard: []byte("-40"), AllocationGeneration: 4, OwnershipEpoch: 7,
+			{Distribution: []byte("docs"), Shard: []byte("-40"), RoutingVersion: 9, AllocationGeneration: 4, OwnershipEpoch: 7,
 				MutationDigest: journalDigest(40), State: ParticipantStaged},
-			{Shard: []byte("40-"), AllocationGeneration: 5, OwnershipEpoch: 8,
+			{Distribution: []byte("docs"), Shard: []byte("40-"), RoutingVersion: 9, AllocationGeneration: 5, OwnershipEpoch: 8,
 				MutationDigest: journalDigest(80), State: ParticipantStaged},
 		},
 	})
@@ -81,14 +82,18 @@ func TestJournalIdempotentStageTransitionAndRecovery(t *testing.T) {
 	if info.Size() != stagedBytes {
 		t.Fatalf("duplicate stage grew journal from %d to %d", stagedBytes, info.Size())
 	}
-	applied, err := j.TransitionParticipant(id, 1, ParticipantApplied)
-	if err != nil || applied.Revision != 2 || applied.ParticipantState != ParticipantApplied {
+	prepared, err := j.TransitionParticipant(id, 1, ParticipantPrepared)
+	if err != nil || prepared.Revision != 2 || prepared.ParticipantState != ParticipantPrepared {
+		t.Fatalf("prepare = %+v, %v", prepared, err)
+	}
+	applied, err := j.TransitionParticipant(id, 2, ParticipantApplied)
+	if err != nil || applied.Revision != 3 || applied.ParticipantState != ParticipantApplied {
 		t.Fatalf("apply = %+v, %v", applied, err)
 	}
-	if again, err := j.TransitionParticipant(id, 1, ParticipantApplied); err != nil || again != applied {
+	if again, err := j.TransitionParticipant(id, 2, ParticipantApplied); err != nil || again != applied {
 		t.Fatalf("duplicate apply = %+v, %v; want %+v", again, err, applied)
 	}
-	if _, err := j.TransitionParticipant(id, 1, ParticipantAborted); !errors.Is(err, ErrJournalConflict) {
+	if _, err := j.TransitionParticipant(id, 2, ParticipantAborted); !errors.Is(err, ErrJournalConflict) {
 		t.Fatalf("conflicting transition = %v, want ErrJournalConflict", err)
 	}
 	if err := j.Close(); err != nil {
@@ -121,8 +126,14 @@ func TestJournalCoordinatorAndIdentityConflict(t *testing.T) {
 	if _, err := j.StageCoordinator(raw); err != nil {
 		t.Fatalf("StageCoordinator: %v", err)
 	}
-	if _, err := j.StageParticipant(journalParticipant(t, id, []byte("different-role"))); !errors.Is(err, ErrJournalConflict) {
-		t.Fatalf("same ID participant = %v, want ErrJournalConflict", err)
+	if _, err := j.StageParticipant(journalParticipant(t, id, []byte("coordinator-local-mutation"))); err != nil {
+		t.Fatalf("same ID coordinator participant: %v", err)
+	}
+	if coordinator, ok := j.CoordinatorStatus(id); !ok || coordinator.Role != RoleCoordinator {
+		t.Fatalf("coordinator role = %+v,%v", coordinator, ok)
+	}
+	if participant, ok := j.ParticipantStatus(id); !ok || participant.Role != RoleParticipant {
+		t.Fatalf("participant role = %+v,%v", participant, ok)
 	}
 	committed, err := j.TransitionCoordinator(id, 1, CoordinatorCommitted)
 	if err != nil || committed.CoordinatorState != CoordinatorCommitted {
@@ -131,6 +142,28 @@ func TestJournalCoordinatorAndIdentityConflict(t *testing.T) {
 	retired, err := j.TransitionCoordinator(id, 2, CoordinatorRetired)
 	if err != nil || retired.Revision != 3 || retired.CoordinatorState != CoordinatorRetired {
 		t.Fatalf("retire = %+v, %v", retired, err)
+	}
+}
+
+func TestJournalRefusesConcurrentShardWideParticipants(t *testing.T) {
+	j, err := OpenJournal(filepath.Join(t.TempDir(), "transactions.vtj"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	first := journalID(31)
+	if _, err := j.StageParticipant(journalParticipant(t, first, []byte("first"))); err != nil {
+		t.Fatalf("stage first: %v", err)
+	}
+	second := journalID(32)
+	if _, err := j.StageParticipant(journalParticipant(t, second, []byte("second"))); !errors.Is(err, ErrJournalBusy) {
+		t.Fatalf("stage overlapping participant = %v, want ErrJournalBusy", err)
+	}
+	if _, err := j.TransitionParticipant(first, 1, ParticipantAborted); err != nil {
+		t.Fatalf("abort first: %v", err)
+	}
+	if _, err := j.StageParticipant(journalParticipant(t, second, []byte("second"))); err != nil {
+		t.Fatalf("stage after release: %v", err)
 	}
 }
 

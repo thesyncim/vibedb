@@ -42,10 +42,11 @@ const (
 	TransactionAbortParticipant
 	TransactionRetireCoordinator
 	TransactionReleaseParticipant
+	TransactionPrepareParticipant
 )
 
 func (op TransactionOperation) valid() bool {
-	return op >= TransactionStageCoordinator && op <= TransactionReleaseParticipant
+	return op >= TransactionStageCoordinator && op <= TransactionPrepareParticipant
 }
 
 func (op TransactionOperation) stages() bool {
@@ -392,6 +393,12 @@ const (
 	// ErrorShardAllocation reports a stale physical allocation generation for
 	// an otherwise matching distribution and shard id.
 	ErrorShardAllocation
+	// ErrorTransactionConflict reports a durable transaction identity, revision,
+	// digest, role, or state that conflicts with the requested transition.
+	ErrorTransactionConflict
+	// ErrorTransactionNotFound reports that the requested durable coordinator or
+	// participant role does not exist on this shard.
+	ErrorTransactionNotFound
 )
 
 // String renders the kind name for diagnostics.
@@ -423,13 +430,17 @@ func (k ErrorKind) String() string {
 		return "PositionNotReached"
 	case ErrorShardAllocation:
 		return "ShardAllocation"
+	case ErrorTransactionConflict:
+		return "TransactionConflict"
+	case ErrorTransactionNotFound:
+		return "TransactionNotFound"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorShardAllocation }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorTransactionNotFound }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.

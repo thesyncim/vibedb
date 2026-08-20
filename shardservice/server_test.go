@@ -160,9 +160,10 @@ func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
-		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
-		CoordinatorAllocation: uint64(owner.AllocationGeneration),
-		MutationDigest:        testTransactionDigest(55), Mutation: []byte("compact-mutation"),
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation:     uint64(owner.AllocationGeneration),
+		CoordinatorRoutingVersion: uint64(owner.RoutingVersion), CoordinatorOwnershipEpoch: uint64(owner.Epoch),
+		MutationDigest: testTransactionDigest(55), Mutation: []byte("compact-mutation"),
 	})
 	if err != nil {
 		t.Fatalf("AppendParticipant: %v", err)
@@ -197,9 +198,10 @@ func TestTransactionStageSurvivesShardRestart(t *testing.T) {
 		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
-		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
-		CoordinatorAllocation: uint64(owner.AllocationGeneration),
-		MutationDigest:        testTransactionDigest(77), Mutation: []byte("restart-mutation"),
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation:     uint64(owner.AllocationGeneration),
+		CoordinatorRoutingVersion: uint64(owner.RoutingVersion), CoordinatorOwnershipEpoch: uint64(owner.Epoch),
+		MutationDigest: testTransactionDigest(77), Mutation: []byte("restart-mutation"),
 	})
 	if err != nil {
 		t.Fatalf("AppendParticipant: %v", err)
@@ -242,18 +244,22 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	exec(t, conn, ownedRequest(ddlDocs))
 	owner := testOwner()
 	id := testTransactionID(31)
-	mutation := encodeRequest(t, ownedRequest(
-		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
-		StringParam("atomic"), StringParam("published"), NumberParam("7"),
-	))
+	mutation, err := AppendMutationBatch(nil, []MutationStatement{{
+		SQL:    `INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+		Params: []Param{StringParam("atomic"), StringParam("published"), NumberParam("7")},
+	}})
+	if err != nil {
+		t.Fatalf("AppendMutationBatch: %v", err)
+	}
 	digest := sha256.Sum256(mutation)
 	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
 		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
-		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
-		CoordinatorAllocation: uint64(owner.AllocationGeneration),
-		MutationDigest:        digest, Mutation: mutation,
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation:     uint64(owner.AllocationGeneration),
+		CoordinatorRoutingVersion: uint64(owner.RoutingVersion), CoordinatorOwnershipEpoch: uint64(owner.Epoch),
+		MutationDigest: digest, Mutation: mutation,
 	})
 	if err != nil {
 		t.Fatalf("AppendParticipant: %v", err)
@@ -261,14 +267,23 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	stage := ownedRequest("")
 	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
 	exec(t, conn, stage)
+	prepare := ownedRequest("")
+	prepare.Transaction = TransactionRequest{
+		Operation: TransactionPrepareParticipant, ID: id, Revision: 1,
+	}
+	prepared := exec(t, conn, prepare)
+	if prepared.Transaction.ParticipantState != distributedtxn.ParticipantPrepared ||
+		prepared.Transaction.Revision != 2 {
+		t.Fatalf("prepare = %+v", prepared)
+	}
 	apply := ownedRequest("")
 	apply.Transaction = TransactionRequest{
-		Operation: TransactionApplyParticipant, ID: id, Revision: 1,
+		Operation: TransactionApplyParticipant, ID: id, Revision: 2,
 	}
 	applied := exec(t, conn, apply)
 	if applied.RowsAffected != 1 ||
 		applied.Transaction.ParticipantState != distributedtxn.ParticipantApplied ||
-		applied.Transaction.Revision != 2 {
+		applied.Transaction.Revision != 3 {
 		t.Fatalf("apply = %+v", applied)
 	}
 	// A response-lost retry resolves the retained SQL-atomic outcome and cannot
@@ -302,11 +317,11 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	}
 	release := ownedRequest("")
 	release.Transaction = TransactionRequest{
-		Operation: TransactionReleaseParticipant, ID: id, Revision: 2,
+		Operation: TransactionReleaseParticipant, ID: id, Revision: 3,
 	}
 	released := exec(t, conn, release)
 	if released.Transaction.ParticipantState != distributedtxn.ParticipantReleased ||
-		released.Transaction.Revision != 3 {
+		released.Transaction.Revision != 4 {
 		t.Fatalf("release = %+v", released)
 	}
 	lookup := ownedRequest("")

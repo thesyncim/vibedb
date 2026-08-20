@@ -233,8 +233,8 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 // carries ExecutionReadWrite instead of the read-only fence, and a scatter, a
 // cross-shard INSERT batch, or a replacement that moves a row's shard key is
 // refused before any network I/O so a write never partially commits. An empty
-// route is a successful local no-op: no shard is contacted. Cross-shard
-// transactions and two-phase commit remain outside this boundary.
+// route is a successful local no-op: no shard is contacted. Atomic
+// multi-statement and cross-shard writes dispatch through ExecBatch.
 func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()

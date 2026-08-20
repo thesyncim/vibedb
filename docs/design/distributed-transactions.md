@@ -18,9 +18,10 @@ the transaction by its 128-bit transaction ID.
 One transaction carries:
 
 - a random 128-bit transaction ID minted once outside every retry loop;
-- the pinned catalog generation and routing version;
-- an ordered participant vector containing shard, allocation generation,
-  ownership epoch, and a SHA-256 digest of that participant's mutation batch;
+- the pinned catalog generation;
+- an ordered participant vector containing distribution, shard, routing
+  version, allocation generation, ownership epoch, and a SHA-256 digest of that
+  participant's mutation batch;
 - a monotonically increasing coordinator record revision; and
 - a bounded absolute recovery deadline used only to elect abort while no commit
   decision exists.
@@ -42,8 +43,8 @@ STAGING -> COMMITTED -> RETIRED
 Participant records use:
 
 ```
-ABSENT -> STAGED -> APPLIED -> RELEASED
-               \-> ABORTED
+ABSENT -> STAGED -> PREPARED -> APPLIED -> RELEASED
+               \-> ABORTED <-/
 ```
 
 Transitions are compare-and-set operations over the transaction ID, exact
@@ -52,30 +53,27 @@ retained result. A conflicting transition is rejected.
 
 ## Visibility protocol
 
-1. **Stage in parallel.** The coordinator durably records `STAGING` with the
-   complete participant/digest vector while every participant concurrently
-   validates ownership, conflicts, limits, and SQL, retains one compact mutation
-   batch, and acquires its visibility barrier. Nothing is applied to user data.
-2. **Implicit commit.** Once the gateway has durable success from the `STAGING`
-   record and every listed participant, the transaction is committed and may be
-   acknowledged immediately. This is one network/consensus barrier. An observer
-   that did not witness those responses proves the same condition by checking
-   every listed participant. A recovery that finds a missing intent first fences
-   that participant against the old coordinator revision, then may abort.
-3. **Apply.** Participants apply their retained mutation and move to `APPLIED`
-   atomically in one local database transaction. User data may have changed,
-   but the visibility barrier still blocks reads and unrelated writes.
-4. **Make explicit.** After every participant reports `APPLIED`, the coordinator
-   records `COMMITTED`. This is asynchronous cleanup and is not on client
-   latency. Only explicit or proven implicit commit authorizes release.
-5. **Release.** Participants verify the coordinator's committed revision and
-   release their barriers. A released shard contains new data; an unreleased
-   shard blocks instead of exposing old data, so no read can return a mixed cut.
+1. **Stage.** The coordinator first durably records `STAGING` with the complete
+   participant/digest vector. Participants then retain their compact mutation
+   batches in parallel and acquire visibility barriers. Nothing is applied to
+   user data.
+2. **Prepare in parallel.** Each participant executes its entire batch inside a
+   serializable local transaction, checks SQL and constraints, and rolls the
+   transaction back while its barrier excludes ordinary shard traffic. Only a
+   successful dry run advances the durable participant to `PREPARED`.
+3. **Record the decision.** Only after every listed participant is `PREPARED`
+   does the coordinator durably transition to `COMMITTED`. This is the sole
+   commit point. A transport response never creates or erases that decision.
+4. **Apply.** Participants re-execute the prepared bytes and publish all local
+   tables plus the raw transaction-ID outcome in one crash-atomic local database
+   transaction, then advance to `APPLIED`. The barrier remains held.
+5. **Release.** After every participant is applied, barriers are released and
+   the coordinator is retired. An unreleased shard blocks rather than exposing
+   a mixed cut.
 
-Abort removes retained intents and releases barriers only after a durable abort
-record. A `STAGING` transaction is implicitly committed when every listed
-digest exists. Recovery may choose abort only after proving at least one digest
-missing and durably fencing every missing participant against late staging.
+Before the coordinator commit decision, `STAGED` and `PREPARED` participants
+may durably abort and release their barriers. After `COMMITTED`, recovery may
+only drive apply, release, and retirement; it may never choose abort.
 
 ## Recovery
 
@@ -112,24 +110,25 @@ Initial production bounds:
 | participants per transaction | 64 |
 | mutation bytes per participant | 16 MiB wire-frame bound |
 | active transactions per shard | 4,096 |
-| coordinator record | 52 bytes + 50 bytes/participant + identities |
-| participant fixed metadata | 104 bytes + coordinator identity + mutation |
+| coordinator record | 52 bytes + 60 bytes/participant + distribution/shard identities |
+| participant fixed metadata | 120 bytes + coordinator identities + mutation |
 
 ## Implementation status
 
 The current branch implements the single-format transaction suffix, checksummed
-coordinator and participant records, the append-once shard journal with compact
-transition deltas, idempotent stage/status after restart, SQL-atomic participant
-apply keyed by the raw transaction ID, and a recovery-aware shard visibility
-barrier. Apply retries return the retained affected-row count without executing
-the SQL mutation twice. Ordinary traffic waits while a participant is staged or
-applied and resumes only after release.
+coordinator and participant records, independent colocated coordinator and
+participant roles, append-once journals, explicit prepare, a durable commit
+decision, SQL-atomic multi-table participant apply keyed by the raw transaction
+ID, and a shard visibility barrier. `Executor.ExecBatch` partitions statements
+by full participant identity and runs stage/prepare/commit/apply/release with
+bounded parallelism. Apply retries return the retained affected-row count
+without executing the SQL mutation twice. End-to-end tests cover cross-shard,
+multi-table, and prepare-failure rollback.
 
-Gateway batch partitioning, coordinator-owned redrive, and automatic cleanup
-are not enabled yet. Until those pieces exist, gateway writes remain
-single-shard; the low-level transition path is not presented as completed
-cross-shard execution. Their integration order, key/range-scoped barrier target,
-and common read-timestamp contract are specified in
+Automatic background redrive and key/range-scoped barriers are not enabled yet;
+ordinary traffic currently waits behind any active participant on its shard.
+The common read-timestamp contract is also still pending. Their integration
+order is specified in
 [Distributed system target](distributed-system.md).
 
 ## Latency and throughput
@@ -139,16 +138,18 @@ Multi-shard work uses persistent pooled connections. The acknowledged critical
 path is:
 
 ```
-stage coordinator + all participant batch intents (one parallel barrier)
-acknowledge implicit commit
-apply + mark explicit commit + release (asynchronous)
+stage coordinator
+stage participants (parallel)
+prepare participants (parallel dry run)
+commit coordinator decision
+apply participants + release (parallel phases)
 ```
 
-The coordinator's participant intent is committed atomically with its `STAGING`
-record. Lagging apply/release work stays safely fenced and is redriven in the
-background. This matches the one-consensus-round latency floor of parallel
-commit systems while using one intent envelope per shard instead of one intent
-record per mutated key.
+The current safe implementation waits for apply and release before returning
+success. It deliberately does not claim a one-round parallel-commit latency
+until replicated intents, coordinator proof, and autonomous redrive make that
+claim true. It still stores one compact intent envelope per participant rather
+than one record per mutated row.
 
 Hot-path requirements:
 

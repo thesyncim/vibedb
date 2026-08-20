@@ -1,8 +1,9 @@
 # Distributed server boundary
 
 VibeDB is embedded-first. Its distributed packages and commands are
-experimental, unreleased, and currently provide a leader-only read path plus
-colocated single-shard writes—not a high-availability database.
+experimental, unreleased, and currently provide a leader-only read path,
+single-shard fast writes, and synchronous fixed-participant atomic write
+batches—not a high-availability database.
 
 This document is the operator contract for what exists now. It intentionally
 does not describe unfinished features as current capability. The implementation
@@ -18,7 +19,7 @@ shard.
 | `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol |
-| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out and result merging, and colocated single-shard writes |
+| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out/result merging, a single-shard write fast path, and synchronous multi-table/cross-shard `ExecBatch` coordination |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
 

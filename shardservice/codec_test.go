@@ -34,9 +34,10 @@ func testParticipantRecord(t *testing.T) []byte {
 	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
 		ID: testTransactionID(1), State: distributedtxn.ParticipantStaged,
 		Revision: 1, RoutingVersion: 7, AllocationGeneration: 5,
-		OwnershipEpoch: 3, CoordinatorShard: []byte("-40"),
-		CoordinatorAllocation: 5, MutationDigest: testTransactionDigest(33),
-		Mutation: []byte{0x56, 0x4d, 0x31, 0, 1, 2, 3},
+		OwnershipEpoch: 3, CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-40"),
+		CoordinatorAllocation: 5, CoordinatorRoutingVersion: 7, CoordinatorOwnershipEpoch: 3,
+		MutationDigest: testTransactionDigest(33),
+		Mutation:       []byte{0x56, 0x4d, 0x31, 0, 1, 2, 3},
 	})
 	if err != nil {
 		t.Fatalf("AppendParticipant: %v", err)
