@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -175,6 +176,161 @@ func TestServeGatewayEndToEnd(t *testing.T) {
 	}
 }
 
+// TestServeGatewayExecOperation proves the serve front-end's exec operation
+// routes one single-shard write to its owning shard and reports the affected
+// count, while a cross-shard batch is refused before any dispatch.
+func TestServeGatewayExecOperation(t *testing.T) {
+	const version = distribution.RoutingVersion(3)
+	shardA := startShard(t, "ep-a", shardservice.Ownership{Distribution: "tenant_data", Shard: "-80", AllocationGeneration: 1, Epoch: 7, RoutingVersion: version})
+	shardB := startShard(t, "ep-b", shardservice.Ownership{Distribution: "tenant_data", Shard: "80-", AllocationGeneration: 2, Epoch: 9, RoutingVersion: version})
+
+	client := gateway.NewClient(nil)
+	seedShard(t, client, shardA, `CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`)
+	seedShard(t, client, shardB, `CREATE TABLE messages (tenant_id STRING PRIMARY KEY, n INTEGER NOT NULL)`)
+
+	shards := []distribution.Shard{
+		{ID: "-80", AllocationGeneration: 1, Range: keyRange(0x00, false, 0x80), Leaders: []distribution.EndpointID{shardA.endpoint}, Epoch: 7},
+		{ID: "80-", AllocationGeneration: 2, Range: keyRange(0x80, true, 0x00), Leaders: []distribution.EndpointID{shardB.endpoint}, Epoch: 9},
+	}
+	man, err := distribution.NewManifest("tenant_data", version, shards)
+	if err != nil {
+		t.Fatalf("NewManifest: %v", err)
+	}
+
+	// Pick one key that routes to each shard under the pinned manifest.
+	mapper := distribution.NewNativeMapper(1)
+	route := func(key string) distribution.ShardID {
+		t.Helper()
+		p, err := mapper.PointFor([]distribution.Scalar{distribution.NewString(key)})
+		if err != nil {
+			t.Fatalf("PointFor: %v", err)
+		}
+		id, ok := man.ResolvePoint(p)
+		if !ok {
+			t.Fatalf("key %q maps outside the manifest", key)
+		}
+		return id
+	}
+
+	var keyA, keyB string
+	for i := 0; i < 100000 && (keyA == "" || keyB == ""); i++ {
+		key := fmt.Sprintf("k%d", i)
+		switch route(key) {
+		case "-80":
+			if keyA == "" {
+				keyA = key
+			}
+		case "80-":
+			if keyB == "" {
+				keyB = key
+			}
+		}
+	}
+	if keyA == "" || keyB == "" {
+		t.Fatalf("found keys %q %q, want one per shard", keyA, keyB)
+	}
+
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "tenant_data", Arity: 1, MapperVersion: 1}},
+		Placements:    []distribution.TablePlacement{{Table: "messages", Distribution: "tenant_data", Columns: []string{"/tenant_id"}}},
+		Manifests:     []*distribution.Manifest{man},
+	}
+	snap, err := gateway.NewSnapshot(config, map[distribution.EndpointID]string{
+		shardA.endpoint: shardA.address,
+		shardB.endpoint: shardB.address,
+	}, 5)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	catalogPath := filepath.Join(t.TempDir(), "catalog.json")
+	if err := gateway.SaveSnapshot(catalogPath, snap); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	exec, _, err := newGateway(catalogPath)
+	if err != nil {
+		t.Fatalf("newGateway: %v", err)
+	}
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("front listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() {
+		served <- serveGateway(ctx, front, exec, func(string, ...any) {})
+	}()
+
+	conn, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatalf("dial front: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
+
+	// A single-shard write commits on its owning shard and reports the count.
+	if err := enc.Encode(&serveRequest{
+		Op:    "exec",
+		SQL:   `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Class: "interactive",
+		Params: []serveParam{
+			{Kind: "string", Text: keyA}, {Kind: "number", Text: "42"},
+		},
+	}); err != nil {
+		t.Fatalf("encode exec: %v", err)
+	}
+	var resp serveResponse
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("decode exec reply: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("exec error: %s", resp.Error)
+	}
+	if resp.Route != "Single" || resp.ShardsFanned != 1 || resp.RowsAffected != 1 {
+		t.Fatalf("exec = route %q fanned %d affected %d, want Single 1 1", resp.Route, resp.ShardsFanned, resp.RowsAffected)
+	}
+
+	// The row landed on its owning shard: the read path sees it.
+	if err := enc.Encode(&serveRequest{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Class:  "interactive",
+		Params: []serveParam{{Kind: "string", Text: keyA}},
+	}); err != nil {
+		t.Fatalf("encode verify: %v", err)
+	}
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("decode verify reply: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("verify read error: %s", resp.Error)
+	}
+	if got := rawInts(t, resp.Rows); !intsEqual(got, []int64{42}) {
+		t.Fatalf("written row = %v, want [42]", got)
+	}
+
+	// A cross-shard batch is refused before dispatch.
+	if err := enc.Encode(&serveRequest{
+		Op:    "exec",
+		SQL:   `INSERT INTO messages (tenant_id, n) VALUES (?, ?), (?, ?)`,
+		Class: "interactive",
+		Params: []serveParam{
+			{Kind: "string", Text: keyA}, {Kind: "number", Text: "1"},
+			{Kind: "string", Text: keyB}, {Kind: "number", Text: "2"},
+		},
+	}); err != nil {
+		t.Fatalf("encode cross-shard: %v", err)
+	}
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("decode cross-shard reply: %v", err)
+	}
+	if resp.Error == "" {
+		t.Fatal("cross-shard insert = success, want a refusal")
+	}
+}
+
 // TestNewGatewayReloadsCatalogAfterStaleRefusal exercises the production file
 // refresher: the process starts on generation 1, the catalog file is atomically
 // replaced with generation 2, and a routing-version refusal advances the
@@ -270,7 +426,7 @@ func keyRange(start byte, endMax bool, end byte) distribution.KeyRange {
 }
 
 // rawInts decodes a single-column integer result into its int64 sequence.
-func rawInts(t *testing.T, rows [][]json.RawMessage) []int64 {
+func rawInts(t *testing.T, rows [][]serveRawValue) []int64 {
 	t.Helper()
 	out := make([]int64, len(rows))
 	for i, row := range rows {

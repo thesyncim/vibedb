@@ -264,7 +264,7 @@ func TestAcceptanceMalformedFraming(t *testing.T) {
 		own := testOwner()
 		body := func() []byte {
 			var e encbuf
-			e.u8(wireVersion1)
+			e.u8(wireVersion)
 			e.str("SELECT id FROM docs")
 			e.str(string(own.Distribution))
 			e.str(string(own.Shard))
@@ -359,13 +359,14 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
+		"Transaction": true,
 	})
 	assertNoPlanField(t, "ShardRequest", reqFields)
 
 	// (2) A parameter is a typed scalar/document value, never an encoded plan.
 	paramFields := structFieldNames(reflect.TypeOf(Param{}))
 	assertFieldSet(t, "Param", paramFields, map[string]bool{
-		"Kind": true, "Bool": true, "Text": true,
+		"Kind": true, "Bool": true, "Bytes": true,
 	})
 	assertNoPlanField(t, "Param", paramFields)
 

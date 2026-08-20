@@ -11,6 +11,8 @@ import (
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Database owns one SQL catalog and its exclusive durable writer lease.
@@ -1000,11 +1002,36 @@ func (c *conn) runtimeValues(kinds []ParamKind, values []any) ([]any, error) {
 			clear(c.args)
 			return nil, err
 		}
+		kind := ParamScalar
+		if i < len(kinds) {
+			kind = kinds[i]
+		}
+		if raw, ok := normalized.(vibejson.RawValue); ok {
+			if kind == ParamDocument {
+				// Documents stay byte-native all the way into the mutation path.
+				if err := vibejson.Validate(raw.Bytes()); err != nil {
+					clear(c.args)
+					return nil, fmt.Errorf("vibedb: invalid raw JSON document parameter %d: %w", i+1, err)
+				}
+				normalized = raw.Bytes()
+			} else {
+				spelling, number := raw.NumberBytes()
+				if !number {
+					clear(c.args)
+					return nil, fmt.Errorf(
+						"vibedb: scalar parameter %d is not an exact JSON number", i+1)
+				}
+				// query.Number is the SQL runtime's exact-number discriminator. The
+				// string header aliases the immutable RawValue bytes; no text is
+				// materialized or copied.
+				normalized = query.Number(byteview.String(spelling))
+			}
+		}
 		if err := addRuntimeArgumentBytes(&total, normalized); err != nil {
 			clear(c.args)
 			return nil, err
 		}
-		if i < len(kinds) && kinds[i] == ParamDocument {
+		if kind == ParamDocument {
 			switch value := normalized.(type) {
 			case string, []byte:
 			case *string:
@@ -1064,6 +1091,8 @@ func normalizeRuntimeValue(argument any) (any, error) {
 		return argument, nil
 	case json.Number:
 		return query.Number(value.String()), nil
+	case vibejson.RawValue:
+		return argument, nil
 	case query.Number:
 		return argument, nil
 	case *bool, *int64:

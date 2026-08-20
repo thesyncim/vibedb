@@ -1,11 +1,15 @@
 # Distributed server boundary
 
 VibeDB is embedded-first. Its distributed packages and commands are
-experimental, unreleased, and currently provide a leader-only read path—not a
-high-availability database.
+experimental, unreleased, and currently provide a leader-only read path plus
+colocated single-shard writes—not a high-availability database.
 
 This document is the operator contract for what exists now. It intentionally
-does not describe a future replication or resharding architecture.
+does not describe unfinished features as current capability. The implementation
+architecture and ordered delivery gates are in
+[Distributed system target](distributed-system.md). That target uses
+tenant-independent virtual buckets: a tenant is never assigned to one physical
+shard.
 
 ## Current components
 
@@ -14,7 +18,7 @@ does not describe a future replication or resharding architecture.
 | `distribution` | Canonical placement scalars, tuple encoding, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol |
-| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read-only fan-out, and result merging |
+| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out and result merging, and colocated single-shard writes |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
 
@@ -70,7 +74,11 @@ trusted caller opening the files through a separate direct handle.
 
 ## Gateway query contract
 
-The gateway accepts explicitly read-only SQL and typed parameters. One query
+The gateway's query operation accepts explicitly read-only SQL and typed
+parameters. Parameter payloads are byte-native across the gateway/shard wire:
+exact numbers remain `vibejson` raw values, and strings and documents remain
+borrowed bytes, avoiding `encoding/json` and intermediate Go strings in routing,
+merge-key decoding, and shard binding. One query
 pins one catalog generation, resolves the relevant immutable manifest, routes
 to leader endpoints, applies per-shard and operation-wide deadlines, and merges
 within configured result, memory, fan-out, and concurrency limits.
@@ -83,7 +91,38 @@ Currently executable distributed shapes include:
 - global `LIMIT`; and
 - global `COUNT`, `SUM`, `MIN`, and `MAX` over mergeable shard results.
 
-The distributed layer rejects before dispatch:
+## Gateway write contract
+
+The gateway's write operation (`Executor.Exec`, or the serve front-end with
+`"op": "exec"`) executes one mutating statement that the pinned generation
+proves resident on exactly one shard. It reuses the read path's
+pin-one-generation, prepare, bind, route, and stale-epoch retry machinery, but
+dispatches a single leader call with the shard service's read-write execution
+mode instead of a fan-out, so a write commits as one local shard statement and
+never partially commits.
+
+Currently executable distributed writes include:
+
+- `INSERT ... VALUES` whose rows all route to the same shard by their shard
+  key, flat or whole-document, with an optional `RETURNING` projection;
+- `UPDATE ... WHERE` whose shard-key equality or `IN` predicate resolves to
+  one shard, whose whole-document replacement does not move the row's shard
+  key; and
+- `DELETE ... WHERE` whose shard-key equality or `IN` predicate resolves to
+  one shard.
+
+A write predicate that matches no shard routes to an empty set: a successful
+local no-op that contacts no shard.
+
+The distributed layer rejects a write before any network I/O:
+
+- an `INSERT` whose rows route to more than one shard;
+- an `UPDATE` or `DELETE` whose predicate does not resolve to one shard;
+- an `UPDATE` whose replacement document moves the row to another shard;
+- `INSERT ... SELECT`, `TRUNCATE`, and every DDL statement; and
+- a `SELECT` submitted to the write operation.
+
+Reads still reject before dispatch:
 
 - every mutation and DDL statement;
 - cross-shard writes and transactions;
@@ -121,6 +160,8 @@ or replica reconfiguration protocol.
   transfer;
 - online split, merge, move, catch-up, or topology recovery;
 - cross-shard transactions or a common real-time distributed snapshot;
+- cross-shard or multi-shard writes: a scattered `INSERT ... VALUES`, a
+  scatter `UPDATE` or `DELETE`, an `INSERT ... SELECT`, and two-phase commit;
 - distributed backup, restore, PITR, or disaster-recovery orchestration; and
 - a release-scale or 100 TB qualification claim.
 
@@ -134,6 +175,8 @@ validate the current file; they do not establish its authority.
 For exact routing encodings, see
 [Placement scalar and tuple codec](distribution-tuple-format.md). For the
 implemented planner core, see [Query planner](query-planner.md). For the
+distributed implementation target, see
+[Distributed system target](distributed-system.md). For the
 non-serving Raft boundary, see
 [Raft core selection](raft-core-selection.md), [Raft WAL](raft-wal.md), and
 [Replicated state machine](replicated-state-machine.md).

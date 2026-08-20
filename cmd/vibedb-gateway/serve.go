@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // maxServeRequestBytes bounds one newline-delimited JSON envelope before JSON
@@ -23,17 +23,22 @@ const maxServeRequestBytes = 1 << 20
 
 // The serve subcommand: a stateless routing front-end. It loads an immutable
 // catalog generation, refreshes the atomically replaced catalog file after a
-// shard reports stale routing metadata, and accepts newline-delimited JSON requests over a
-// connection, routes and dispatches each as a bounded distributed read against
-// the pinned generation, and replies with the merged result. The wire form is a
-// minimal, stdlib-only JSON envelope; a request carries SQL, typed parameters,
-// and an operational class. The pinned catalog and shared SQL planner derive
-// placement, shard constraints, merge order, and the global limit.
+// shard reports stale routing metadata, and accepts newline-delimited JSON
+// requests over a connection. Each request routes and dispatches against the
+// pinned generation: a bounded distributed read by default, or one colocated
+// single-shard write when the envelope's op is exec. The reply is the merged
+// result. The wire form is a minimal JSON envelope; a request
+// carries SQL, typed parameters, and an operational class. The pinned catalog
+// and shared SQL planner derive placement, shard constraints, merge order, and
+// the global limit. The envelope itself is decoded and emitted with vibejson.
 
 // serveRequest is one query envelope a client sends. SQL and its typed
 // parameters are the only semantic inputs; clients cannot override routing or
 // merge metadata independently of the statement.
 type serveRequest struct {
+	// Op selects the gateway operation: the empty value and "query" are the
+	// read path; "exec" is the single-shard write path.
+	Op     string       `json:"op,omitempty"`
 	SQL    string       `json:"sql"`
 	Class  string       `json:"class,omitempty"`
 	Params []serveParam `json:"params,omitempty"`
@@ -50,15 +55,27 @@ type serveParam struct {
 // observability. Rows carries each cell as raw JSON (a null cell is the JSON
 // literal null); Error is set instead when the operation failed.
 type serveResponse struct {
-	Kind         string              `json:"kind,omitempty"`
-	Columns      []string            `json:"columns,omitempty"`
-	Rows         [][]json.RawMessage `json:"rows,omitempty"`
-	RowsAffected int64               `json:"rows_affected,omitempty"`
-	Route        string              `json:"route,omitempty"`
-	Generation   uint64              `json:"generation,omitempty"`
-	ShardsFanned int                 `json:"shards_fanned,omitempty"`
-	Retries      int                 `json:"retries,omitempty"`
-	Error        string              `json:"error,omitempty"`
+	Kind         string            `json:"kind,omitempty"`
+	Columns      []string          `json:"columns,omitempty"`
+	Rows         [][]serveRawValue `json:"rows,omitempty"`
+	RowsAffected int64             `json:"rows_affected,omitempty"`
+	Route        string            `json:"route,omitempty"`
+	Generation   uint64            `json:"generation,omitempty"`
+	ShardsFanned int               `json:"shards_fanned,omitempty"`
+	Retries      int               `json:"retries,omitempty"`
+	Error        string            `json:"error,omitempty"`
+}
+
+// serveRawValue is one already-encoded JSON cell. The methods preserve test and
+// client interoperability with encoding/json without using it in the server;
+// production output writes the bytes directly through vibejson.Writer.
+type serveRawValue []byte
+
+func (r serveRawValue) MarshalJSON() ([]byte, error) { return r, nil }
+
+func (r *serveRawValue) UnmarshalJSON(src []byte) error {
+	*r = append((*r)[:0], src...)
+	return nil
 }
 
 // runServe loads the catalog, binds the listener, and serves until interrupted.
@@ -176,16 +193,16 @@ func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4096), maxServeRequestBytes)
-	enc := json.NewEncoder(conn)
+	writer := vibejson.NewWriter(conn)
 	for scanner.Scan() {
 		var req serveRequest
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+		if err := vibejson.Unmarshal(scanner.Bytes(), &req); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: decode request: %v", err)
 			}
 			return
 		}
-		if err := enc.Encode(execRequest(ctx, exec, req)); err != nil {
+		if err := writeServeResponse(writer, execRequest(ctx, exec, req)); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: encode response: %v", err)
 			}
@@ -197,6 +214,111 @@ func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf
 	}
 }
 
+// writeServeResponse emits one NDJSON response without converting raw result
+// cells into strings or passing them through a generic JSON tree.
+func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
+	if err := w.BeginObject(); err != nil {
+		return err
+	}
+	stringField := func(name, value string) error {
+		if value == "" {
+			return nil
+		}
+		if err := w.Key(name); err != nil {
+			return err
+		}
+		return w.String(value)
+	}
+	if err := stringField("kind", resp.Kind); err != nil {
+		return err
+	}
+	if len(resp.Columns) != 0 {
+		if err := w.Key("columns"); err != nil {
+			return err
+		}
+		if err := w.BeginArray(); err != nil {
+			return err
+		}
+		for _, column := range resp.Columns {
+			if err := w.String(column); err != nil {
+				return err
+			}
+		}
+		if err := w.EndArray(); err != nil {
+			return err
+		}
+	}
+	if len(resp.Rows) != 0 {
+		if err := w.Key("rows"); err != nil {
+			return err
+		}
+		if err := w.BeginArray(); err != nil {
+			return err
+		}
+		for _, row := range resp.Rows {
+			if err := w.BeginArray(); err != nil {
+				return err
+			}
+			for _, cell := range row {
+				if err := w.RawUnchecked(cell); err != nil {
+					return err
+				}
+			}
+			if err := w.EndArray(); err != nil {
+				return err
+			}
+		}
+		if err := w.EndArray(); err != nil {
+			return err
+		}
+	}
+	if resp.RowsAffected != 0 {
+		if err := w.Key("rows_affected"); err != nil {
+			return err
+		}
+		if err := w.Int(resp.RowsAffected); err != nil {
+			return err
+		}
+	}
+	if err := stringField("route", resp.Route); err != nil {
+		return err
+	}
+	if resp.Generation != 0 {
+		if err := w.Key("generation"); err != nil {
+			return err
+		}
+		if err := w.Uint(resp.Generation); err != nil {
+			return err
+		}
+	}
+	if resp.ShardsFanned != 0 {
+		if err := w.Key("shards_fanned"); err != nil {
+			return err
+		}
+		if err := w.Int(int64(resp.ShardsFanned)); err != nil {
+			return err
+		}
+	}
+	if resp.Retries != 0 {
+		if err := w.Key("retries"); err != nil {
+			return err
+		}
+		if err := w.Int(int64(resp.Retries)); err != nil {
+			return err
+		}
+	}
+	if err := stringField("error", resp.Error); err != nil {
+		return err
+	}
+	if err := w.EndObject(); err != nil {
+		return err
+	}
+	if err := w.Newline(); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
 // execRequest translates one request and dispatches it, mapping any failure into
 // an error reply rather than dropping the connection.
 func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) *serveResponse {
@@ -204,7 +326,14 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 	if err != nil {
 		return &serveResponse{Error: err.Error()}
 	}
-	res, err := exec.Query(ctx, q)
+	var res *gateway.Result
+	if req.Op == "exec" {
+		// The write path routes the statement to its single owning shard and
+		// refuses every scatter before any dispatch.
+		res, err = exec.Exec(ctx, q)
+	} else {
+		res, err = exec.Query(ctx, q)
+	}
 	if err != nil {
 		return &serveResponse{Error: err.Error()}
 	}
@@ -286,14 +415,14 @@ func encodeResult(res *gateway.Result) *serveResponse {
 		resp.Columns = append(resp.Columns, col.Name)
 	}
 	if len(res.Rows) > 0 {
-		resp.Rows = make([][]json.RawMessage, len(res.Rows))
+		resp.Rows = make([][]serveRawValue, len(res.Rows))
 		for i, row := range res.Rows {
-			cells := make([]json.RawMessage, len(row))
+			cells := make([]serveRawValue, len(row))
 			for j, c := range row {
 				if c.Null {
-					cells[j] = json.RawMessage("null")
+					cells[j] = serveRawValue("null")
 				} else {
-					cells[j] = json.RawMessage(c.Bytes)
+					cells[j] = serveRawValue(c.Bytes)
 				}
 			}
 			resp.Rows[i] = cells

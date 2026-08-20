@@ -1,7 +1,9 @@
 package shardservice
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -9,10 +11,12 @@ import (
 	"net"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // One connection's request lifecycle: read a frame, admit it, and on success pin
@@ -115,7 +119,253 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		}
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
+	if req.Transaction.Operation != TransactionNone {
+		return c.transaction(req)
+	}
+	barrierCtx, barrierCancel := c.server.requestContext(req)
+	err := c.server.journal.WaitNoParticipantBarrier(barrierCtx)
+	barrierCancel()
+	if err != nil {
+		return classifyError(err)
+	}
 	return c.execute(req)
+}
+
+// transaction executes the durable subset of the transaction protocol. Stage
+// and lookup are safe independently of SQL publication. State transitions stay
+// closed until commit proof and participant apply are joined to the local SQL
+// transaction boundary; accepting them earlier would permit partial commit.
+func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
+	tx := req.Transaction
+	if req.SQL != "" || len(req.Params) != 0 {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: a transaction command cannot also carry SQL or parameters")
+	}
+	if tx.Operation != TransactionLookupCoordinator &&
+		tx.Operation != TransactionLookupParticipant &&
+		req.ExecutionMode != ExecutionReadWrite {
+		return NewErrorResponse(ErrorReadOnly,
+			"shardservice: a transaction mutation requires read-write execution authority")
+	}
+	var (
+		status distributedtxn.Status
+		err    error
+	)
+	switch tx.Operation {
+	case TransactionStageCoordinator:
+		var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+		if openErr != nil {
+			return transactionError(openErr)
+		}
+		// The fixed-set protocol designates the first sorted participant as
+		// coordinator, avoiding another identity field in every record.
+		first := record.Participants[0]
+		if record.RoutingVersion != uint64(req.RoutingVersion) ||
+			!vibejson.BytesEqualString(first.Shard, string(req.Shard)) ||
+			first.AllocationGeneration != uint64(req.AllocationGeneration) ||
+			first.OwnershipEpoch != uint64(req.OwnershipEpoch) {
+			return transactionError(distributedtxn.ErrJournalConflict)
+		}
+		status, err = c.server.journal.StageCoordinator(tx.Record)
+	case TransactionStageParticipant:
+		record, openErr := distributedtxn.OpenParticipant(tx.Record)
+		if openErr != nil {
+			return transactionError(openErr)
+		}
+		if record.RoutingVersion != uint64(req.RoutingVersion) ||
+			record.AllocationGeneration != uint64(req.AllocationGeneration) ||
+			record.OwnershipEpoch != uint64(req.OwnershipEpoch) {
+			return transactionError(distributedtxn.ErrJournalConflict)
+		}
+		status, err = c.server.journal.StageParticipant(tx.Record)
+	case TransactionLookupCoordinator:
+		var ok bool
+		status, ok = c.server.journal.Status(tx.ID)
+		if !ok || status.Role != distributedtxn.RoleCoordinator {
+			err = distributedtxn.ErrJournalNotFound
+		}
+	case TransactionLookupParticipant:
+		return c.lookupParticipant(tx.ID)
+	case TransactionApplyParticipant:
+		return c.applyParticipant(req)
+	case TransactionCommitCoordinator:
+		status, err = c.server.journal.TransitionCoordinator(
+			tx.ID, tx.Revision, distributedtxn.CoordinatorCommitted,
+		)
+	case TransactionReleaseParticipant:
+		status, err = c.server.journal.TransitionParticipant(
+			tx.ID, tx.Revision, distributedtxn.ParticipantReleased,
+		)
+	case TransactionRetireCoordinator:
+		status, err = c.server.journal.TransitionCoordinator(
+			tx.ID, tx.Revision, distributedtxn.CoordinatorRetired,
+		)
+	default:
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: transaction transition is not enabled before atomic SQL publication")
+	}
+	if err != nil {
+		return transactionError(err)
+	}
+	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
+	status, ok := c.server.journal.Status(id)
+	if !ok || status.Role != distributedtxn.RoleParticipant {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	revision, rowsAffected, applied, err := c.server.db.DistributedParticipantStatus(id)
+	if err != nil {
+		return transactionError(err)
+	}
+	if applied {
+		if status.ParticipantState == distributedtxn.ParticipantStaged && revision == status.Revision+1 {
+			if repaired, transitionErr := c.server.journal.TransitionParticipant(
+				id, status.Revision, distributedtxn.ParticipantApplied,
+			); transitionErr == nil {
+				status = repaired
+			}
+		}
+		validApplied := status.ParticipantState == distributedtxn.ParticipantApplied &&
+			status.Revision == revision
+		validReleased := status.ParticipantState == distributedtxn.ParticipantReleased &&
+			status.Revision == revision+1
+		if !validApplied && !validReleased {
+			return transactionError(sqldriver.ErrDistributedTransactionConflict)
+		}
+		resp := transactionStatusResponse(status)
+		resp.RowsAffected = rowsAffected
+		return resp
+	}
+	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {
+	tx := req.Transaction
+	status, ok := c.server.journal.Status(tx.ID)
+	if !ok || status.Role != distributedtxn.RoleParticipant {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	if (status.ParticipantState == distributedtxn.ParticipantApplied && status.Revision == tx.Revision+1) ||
+		(status.ParticipantState == distributedtxn.ParticipantReleased && status.Revision == tx.Revision+2) {
+		return c.lookupParticipant(tx.ID)
+	}
+	if status.ParticipantState != distributedtxn.ParticipantStaged || status.Revision != tx.Revision {
+		return transactionError(distributedtxn.ErrJournalConflict)
+	}
+	if revision, rowsAffected, found, err := c.server.db.DistributedParticipantStatus(tx.ID); err != nil {
+		return transactionError(err)
+	} else if found {
+		if revision != tx.Revision+1 {
+			return transactionError(sqldriver.ErrDistributedTransactionConflict)
+		}
+		_, _ = c.server.journal.TransitionParticipant(
+			tx.ID, tx.Revision, distributedtxn.ParticipantApplied,
+		)
+		status.Revision = revision
+		status.ParticipantState = distributedtxn.ParticipantApplied
+		resp := transactionStatusResponse(status)
+		resp.RowsAffected = rowsAffected
+		return resp
+	}
+	record, err := c.server.journal.Participant(tx.ID)
+	if err != nil || sha256.Sum256(record.Mutation) != record.MutationDigest {
+		if err == nil {
+			err = distributedtxn.ErrCorrupt
+		}
+		return transactionError(err)
+	}
+	mutationBytes := bytes.NewReader(record.Mutation)
+	mutation, err := DecodeRequest(mutationBytes)
+	if err != nil || mutationBytes.Len() != 0 ||
+		mutation.Transaction.Operation != TransactionNone ||
+		mutation.ExecutionMode != ExecutionReadWrite || mutation.SQL == "" {
+		if err == nil {
+			err = distributedtxn.ErrCorrupt
+		}
+		return transactionError(err)
+	}
+	if err := c.server.ownership.Admit(mutation); err != nil {
+		return transactionError(err)
+	}
+	return c.executeParticipantMutation(req, mutation)
+}
+
+func (c *shardConn) executeParticipantMutation(
+	outer *ShardRequest,
+	mutation *ShardRequest,
+) *ShardResponse {
+	rows, resultBytes := c.server.resultLimits(mutation)
+	if err := c.sess.SetResultLimits(rows, resultBytes); err != nil {
+		return classifyError(err)
+	}
+	if err := c.sess.SetIntermediateLimit(c.server.opts.MaxIntermediateBytes); err != nil {
+		return classifyError(err)
+	}
+	ctx, cancel := c.server.requestContext(outer)
+	defer cancel()
+	prep, err := c.sess.Prepare(ctx, mutation.SQL)
+	if err != nil {
+		return classifyError(err)
+	}
+	defer prep.Close()
+	if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() {
+		return NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: a distributed participant mutation must be non-row-returning DML")
+	}
+	if err := c.sess.Begin(ctx, sqldriver.TxOptions{Isolation: sqldriver.IsolationSerializable}); err != nil {
+		return classifyError(err)
+	}
+	defer c.sess.Rollback(context.Background())
+	result, err := prep.Exec(ctx, runtimeArgs(mutation.Params))
+	if err != nil {
+		return classifyError(err)
+	}
+	affected, err := c.sess.CommitDistributedParticipant(
+		ctx, outer.Transaction.ID, outer.Transaction.Revision, result.RowsAffected,
+	)
+	if err != nil {
+		return classifyError(err)
+	}
+	status, err := c.server.journal.TransitionParticipant(
+		outer.Transaction.ID, outer.Transaction.Revision, distributedtxn.ParticipantApplied,
+	)
+	if err != nil {
+		// SQL participant state is the atomic authority. A journal delta is a
+		// compact recovery index and lookup repairs it after reopen.
+		status = distributedtxn.Status{
+			Role: distributedtxn.RoleParticipant, ID: outer.Transaction.ID,
+			Revision:         outer.Transaction.Revision + 1,
+			ParticipantState: distributedtxn.ParticipantApplied,
+		}
+	}
+	resp := transactionStatusResponse(status)
+	resp.RowsAffected = affected
+	return resp
+}
+
+func transactionStatusResponse(status distributedtxn.Status) *ShardResponse {
+	resp := CompletionResponse(0)
+	resp.Transaction.ID = status.ID
+	resp.Transaction.Revision = status.Revision
+	switch status.Role {
+	case distributedtxn.RoleCoordinator:
+		resp.Transaction.Role = TransactionRoleCoordinator
+		resp.Transaction.CoordinatorState = status.CoordinatorState
+	case distributedtxn.RoleParticipant:
+		resp.Transaction.Role = TransactionRoleParticipant
+		resp.Transaction.ParticipantState = status.ParticipantState
+	}
+	return resp
+}
+
+func transactionError(err error) *ShardResponse {
+	if errors.Is(err, distributedtxn.ErrOutcomeUnknown) {
+		return NewErrorResponse(ErrorCommitOutcomeUnknown, err.Error())
+	}
+	return NewErrorResponse(ErrorMalformedRequest, err.Error())
 }
 
 // execute runs one admitted request against the borrowed Session and returns its
@@ -160,19 +410,25 @@ func (c *shardConn) executeQuery(
 	prep *sqldriver.Prepared,
 	args []any,
 ) *ShardResponse {
-	// A request is one statement-level snapshot. The SQL runtime defaults to
+	// A SELECT is one statement-level snapshot. The SQL runtime defaults to
 	// Read Committed, which refreshes the committed base before each statement;
 	// pin this read-only transaction explicitly so a concurrent write cannot
-	// leak into a result whose execution has already begun.
-	if err := c.sess.Begin(ctx, sqldriver.TxOptions{
-		ReadOnly:  true,
-		Isolation: sqldriver.IsolationRepeatableRead,
-	}); err != nil {
-		return classifyError(err)
+	// leak into a result whose execution has already begun. A mutation with a
+	// RETURNING projection must instead commit as a writable statement: pinning
+	// it read-only would reject the DML, and the RETURNING rows are exactly the
+	// rows the statement publishes, so autocommit is the correct cut.
+	if prep.Kind() == sqlast.KindSelect {
+		if err := c.sess.Begin(ctx, sqldriver.TxOptions{
+			ReadOnly:  true,
+			Isolation: sqldriver.IsolationRepeatableRead,
+		}); err != nil {
+			return classifyError(err)
+		}
+		// Release the snapshot unconditionally; a canceled request context must
+		// not leave the pinned lease behind, so rollback runs on a background
+		// context.
+		defer c.sess.Rollback(context.Background())
 	}
-	// Release the snapshot unconditionally; a canceled request context must not
-	// leave the pinned lease behind, so rollback runs on a background context.
-	defer c.sess.Rollback(context.Background())
 
 	cur, err := prep.Query(ctx, args)
 	if err != nil {

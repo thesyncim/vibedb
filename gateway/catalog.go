@@ -3,7 +3,6 @@ package gateway
 import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -18,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	queryplanner "github.com/thesyncim/vibedb/planner"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // The minimal authoritative catalog: one immutable snapshot generation of the
@@ -857,7 +857,12 @@ func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
 		}
 	}
 
-	raw, err := json.MarshalIndent(toPersisted(nextState), "", "  ")
+	persisted := toPersisted(nextState)
+	compact, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return err
+	}
+	raw, err := vibejson.AppendIndent(nil, compact, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -966,7 +971,7 @@ func decodeSnapshotFile(file *os.File, label string) (*Snapshot, error) {
 			ErrCatalogTooLarge, label, maxCatalogBytes)
 	}
 	var pc persistedCatalog
-	if err := json.Unmarshal(raw, &pc); err != nil {
+	if err := vibejson.Unmarshal(raw, &pc); err != nil {
 		return nil, err
 	}
 	if pc.Version != catalogVersion {

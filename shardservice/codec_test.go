@@ -5,12 +5,44 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	vibejson "github.com/thesyncim/vibejson"
 )
+
+func testTransactionID(seed byte) distributedtxn.ID {
+	var id distributedtxn.ID
+	for i := range id {
+		id[i] = seed + byte(i)
+	}
+	return id
+}
+
+func testTransactionDigest(seed byte) distributedtxn.Digest {
+	var digest distributedtxn.Digest
+	for i := range digest {
+		digest[i] = seed + byte(i)
+	}
+	return digest
+}
+
+func testParticipantRecord(t *testing.T) []byte {
+	t.Helper()
+	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
+		ID: testTransactionID(1), State: distributedtxn.ParticipantStaged,
+		Revision: 1, RoutingVersion: 7, AllocationGeneration: 5,
+		OwnershipEpoch: 3, CoordinatorShard: []byte("-40"),
+		CoordinatorAllocation: 5, MutationDigest: testTransactionDigest(33),
+		Mutation: []byte{0x56, 0x4d, 0x31, 0, 1, 2, 3},
+	})
+	if err != nil {
+		t.Fatalf("AppendParticipant: %v", err)
+	}
+	return record
+}
 
 // encodeRequest / encodeResponse are one-shot helpers that fail the test rather
 // than thread an error through every case.
@@ -84,6 +116,30 @@ func TestRequestRoundTrip(t *testing.T) {
 				Params: []Param{StringParam(""), NumberParam("0"), BoolParam(false)},
 			},
 		},
+		{
+			name: "stage_participant",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadWrite,
+				Transaction: TransactionRequest{
+					Operation: TransactionStageParticipant,
+					Record:    testParticipantRecord(t),
+				},
+			},
+		},
+		{
+			name: "apply_participant",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadWrite,
+				Transaction: TransactionRequest{
+					Operation: TransactionApplyParticipant,
+					ID:        testTransactionID(1), Revision: 1,
+				},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,7 +159,9 @@ func TestRequestRoundTrip(t *testing.T) {
 				t.Fatalf("params = %d, want %d", len(got.Params), len(tc.req.Params))
 			}
 			for i := range got.Params {
-				if !reflect.DeepEqual(got.Params[i], tc.req.Params[i]) {
+				if got.Params[i].Kind != tc.req.Params[i].Kind ||
+					got.Params[i].Bool != tc.req.Params[i].Bool ||
+					!bytes.Equal(got.Params[i].Bytes, tc.req.Params[i].Bytes) {
 					t.Errorf("param %d = %+v, want %+v", i, got.Params[i], tc.req.Params[i])
 				}
 			}
@@ -112,6 +170,12 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if got.ExecutionMode != tc.req.ExecutionMode {
 				t.Errorf("ExecutionMode = %v, want %v", got.ExecutionMode, tc.req.ExecutionMode)
+			}
+			if got.Transaction.Operation != tc.req.Transaction.Operation ||
+				got.Transaction.ID != tc.req.Transaction.ID ||
+				got.Transaction.Revision != tc.req.Transaction.Revision ||
+				!bytes.Equal(got.Transaction.Record, tc.req.Transaction.Record) {
+				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.req.Transaction)
 			}
 		})
 	}
@@ -157,6 +221,16 @@ func TestResponseRoundTrip(t *testing.T) {
 			name: "commit_outcome_unknown",
 			resp: NewErrorResponse(ErrorCommitOutcomeUnknown, "completion unknown"),
 		},
+		{
+			name: "participant_state",
+			resp: &ShardResponse{
+				Kind: ResponseCompletion, RowsAffected: 3,
+				Transaction: TransactionReply{
+					Role: TransactionRoleParticipant, ID: testTransactionID(1), Revision: 2,
+					ParticipantState: distributedtxn.ParticipantApplied,
+				},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -172,7 +246,32 @@ func TestResponseRoundTrip(t *testing.T) {
 			if got.Kind != tc.resp.Kind {
 				t.Errorf("Kind = %v, want %v", got.Kind, tc.resp.Kind)
 			}
+			if got.Transaction != tc.resp.Transaction {
+				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.resp.Transaction)
+			}
 		})
+	}
+}
+
+func TestTransactionStageRecordRemainsBorrowed(t *testing.T) {
+	req := &ShardRequest{
+		Transaction: TransactionRequest{
+			Operation: TransactionStageParticipant,
+			Record:    testParticipantRecord(t),
+		},
+	}
+	decoded, err := DecodeRequest(bytes.NewReader(encodeRequest(t, req)))
+	if err != nil {
+		t.Fatalf("DecodeRequest: %v", err)
+	}
+	record, err := distributedtxn.OpenParticipant(decoded.Transaction.Record)
+	if err != nil {
+		t.Fatalf("OpenParticipant: %v", err)
+	}
+	record.Mutation[0] ^= 0xff
+	openedAgain := decoded.Transaction.Record[len(decoded.Transaction.Record)-len(record.Mutation)-4]
+	if openedAgain != record.Mutation[0] {
+		t.Fatal("participant mutation was copied instead of aliasing the request frame")
 	}
 }
 
@@ -216,7 +315,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 	// position marker.
 	valid := func() []byte {
 		var e encbuf
-		e.u8(wireVersion1)
+		e.u8(wireVersion)
 		e.str("SELECT 1")
 		e.str("d")
 		e.str("s")
@@ -267,7 +366,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 			name: "bad_read_policy",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.str("")
 				e.str("")
 				e.str("")
@@ -289,7 +388,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 			name: "bad_execution_mode",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.str("")
 				e.str("")
 				e.str("")
@@ -311,7 +410,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 			name: "impossible_param_count",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.str("")
 				e.str("")
 				e.str("")
@@ -332,7 +431,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 			name: "bad_param_kind",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.str("")
 				e.str("")
 				e.str("")
@@ -362,7 +461,7 @@ func TestDecodeRequestMalformed(t *testing.T) {
 			name: "negative_deadline",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.str("")
 				e.str("")
 				e.str("")
@@ -401,7 +500,7 @@ func TestDecodeResponseMalformed(t *testing.T) {
 	}{
 		{
 			name:  "wrong_tag",
-			frame: rawFrame(tagRequest, []byte{wireVersion1, uint8(ResponseCompletion), 0, 0, 0, 0, 0, 0, 0, 0}),
+			frame: rawFrame(tagRequest, []byte{wireVersion, uint8(ResponseCompletion), 0, 0, 0, 0, 0, 0, 0, 0}),
 			want:  errBadTag,
 		},
 		{
@@ -411,14 +510,14 @@ func TestDecodeResponseMalformed(t *testing.T) {
 		},
 		{
 			name:  "bad_response_kind",
-			frame: rawFrame(tagResponse, []byte{wireVersion1, 0xff}),
+			frame: rawFrame(tagResponse, []byte{wireVersion, 0xff}),
 			want:  errBadEnum,
 		},
 		{
 			name: "rows_without_columns",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.u8(uint8(ResponseRows))
 				e.u32(0)       // zero columns
 				e.u32(1000000) // but a million rows
@@ -430,7 +529,7 @@ func TestDecodeResponseMalformed(t *testing.T) {
 			name: "impossible_row_count",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.u8(uint8(ResponseRows))
 				e.u32(1) // one column
 				e.str("c")
@@ -444,7 +543,7 @@ func TestDecodeResponseMalformed(t *testing.T) {
 			name: "bad_error_kind",
 			frame: func() []byte {
 				var e encbuf
-				e.u8(wireVersion1)
+				e.u8(wireVersion)
 				e.u8(uint8(ResponseError))
 				e.u8(0xff) // invalid ErrorKind
 				e.str("boom")
@@ -500,6 +599,27 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 			want: errBadEnum,
 		},
 		{
+			name: "invalid_number_param",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{Params: []Param{NumberParam("01")}})
+			},
+			want: errBadParam,
+		},
+		{
+			name: "invalid_document_param",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{Params: []Param{DocumentParam("{")}})
+			},
+			want: errBadParam,
+		},
+		{
+			name: "invalid_string_param",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{Params: []Param{StringBytesParam([]byte{0xff})}})
+			},
+			want: errBadParam,
+		},
+		{
 			name: "row_arity_mismatch",
 			enc: func() error {
 				return EncodeResponse(io.Discard, &ShardResponse{
@@ -527,8 +647,8 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 	}
 }
 
-// TestParamRuntimeValue proves each wire parameter materializes into a
-// standard-library value sql/driver's runtime already binds.
+// TestParamRuntimeValue proves each wire parameter stays byte-native when it
+// crosses into sql/driver.
 func TestParamRuntimeValue(t *testing.T) {
 	if (Param{Kind: ParamInvalid}).Valid() {
 		t.Error("invalid parameter kind reported valid")
@@ -542,14 +662,32 @@ func TestParamRuntimeValue(t *testing.T) {
 	if got := BoolParam(true).RuntimeValue(); got != true {
 		t.Errorf("bool = %v, want true", got)
 	}
-	if got, ok := NumberParam("5e0").RuntimeValue().(interface{ String() string }); !ok || got.String() != "5e0" {
-		t.Errorf("number = %v, want json.Number 5e0", NumberParam("5e0").RuntimeValue())
+	if got, ok := NumberParam("5e0").RuntimeValue().(vibejson.RawValue); !ok || !bytes.Equal(got.Bytes(), []byte("5e0")) {
+		t.Errorf("number = %v, want vibejson raw number 5e0", NumberParam("5e0").RuntimeValue())
 	}
-	if got := StringParam("k").RuntimeValue(); got != "k" {
-		t.Errorf("string = %v, want k", got)
+	if got, ok := StringParam("k").RuntimeValue().([]byte); !ok || !bytes.Equal(got, []byte("k")) {
+		t.Errorf("string = %v, want byte-native k", got)
 	}
-	if got := DocumentParam(`{"a":1}`).RuntimeValue(); got != `{"a":1}` {
-		t.Errorf("document = %v, want JSON text", got)
+	if got, ok := DocumentParam(`{"a":1}`).RuntimeValue().([]byte); !ok || !bytes.Equal(got, []byte(`{"a":1}`)) {
+		t.Errorf("document = %v, want JSON bytes", got)
+	}
+
+	// Byte constructors and RuntimeValue borrow the exact caller storage; the
+	// distributed bridge does not materialize an intermediate string or copy.
+	numberBytes := []byte("123.5")
+	number := NumberBytesParam(numberBytes).RuntimeValue().(vibejson.RawValue)
+	if &number.Bytes()[0] != &numberBytes[0] {
+		t.Fatal("number runtime value did not borrow input bytes")
+	}
+	stringBytes := []byte("tenant")
+	stringValue := StringBytesParam(stringBytes).RuntimeValue().([]byte)
+	if &stringValue[0] != &stringBytes[0] {
+		t.Fatal("string runtime value did not borrow input bytes")
+	}
+	documentBytes := []byte(`{"tenant":"a"}`)
+	document := DocumentBytesParam(documentBytes).RuntimeValue().([]byte)
+	if &document[0] != &documentBytes[0] {
+		t.Fatal("document runtime value did not borrow input bytes")
 	}
 }
 

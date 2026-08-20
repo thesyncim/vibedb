@@ -9,10 +9,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 )
 
-// The shard-service codec: a stdlib-only, big-endian length-prefixed framing
-// mirroring pgwire/proto.go, with every decode bounded so a malformed or
+// The shard-service codec: a big-endian length-prefixed framing mirroring
+// pgwire/proto.go, with every decode bounded so a malformed or
 // oversized frame is rejected rather than turned into an allocation a remote
 // peer chose the size of.
 //
@@ -27,6 +28,10 @@ import (
 const (
 	tagRequest  = 'Q'
 	tagResponse = 'R'
+
+	// transactionMarker makes the optional trailing envelope unambiguous while
+	// leaving every ordinary frame byte-for-byte unchanged.
+	transactionMarker = 0xd7
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -36,7 +41,7 @@ const (
 	// maxFrameBody is the largest request or response body this codec reads. It
 	// is generous for a large statement or document parameter and small enough
 	// that a frame cannot request an arbitrary allocation.
-	maxFrameBody = 16 << 20
+	maxFrameBody = distributedtxn.MaxMutationBytes + (64 << 10)
 
 	// maxParams, maxColumns, and maxRows bound the three repeated collections.
 	// The frame-body bound already limits total bytes; these keep a small frame
@@ -77,6 +82,14 @@ var errFieldTooLarge = errors.New("shardservice: field length exceeds the frame 
 // errBadEnum reports a discriminator byte outside its closed set.
 var errBadEnum = errors.New("shardservice: frame carries an out-of-range enumerator")
 
+// errBadParam reports a typed parameter whose byte payload does not match its
+// discriminator (for example malformed JSON or an invalid exact number).
+var errBadParam = errors.New("shardservice: frame carries an invalid parameter payload")
+
+// errBadTransaction reports a non-canonical command, a corrupt durable stage
+// record, or a reply whose role and typed state disagree.
+var errBadTransaction = errors.New("shardservice: frame carries an invalid transaction envelope")
+
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
 var errNegativeDuration = errors.New("shardservice: request deadline is negative")
@@ -104,6 +117,8 @@ type encbuf struct {
 func (e *encbuf) u8(v uint8)   { e.b = append(e.b, v) }
 func (e *encbuf) u32(v uint32) { e.b = binary.BigEndian.AppendUint32(e.b, v) }
 func (e *encbuf) u64(v uint64) { e.b = binary.BigEndian.AppendUint64(e.b, v) }
+
+func (e *encbuf) fixed16(v [16]byte) { e.b = append(e.b, v[:]...) }
 
 // bytes appends a uint32 length prefix and the raw bytes, bounding the length.
 func (e *encbuf) bytes(p []byte) {
@@ -376,6 +391,140 @@ func readFrame(r io.Reader, tag byte) ([]byte, error) {
 	return body, nil
 }
 
+func validateTransactionRequest(tx TransactionRequest) error {
+	if tx.Operation == TransactionNone {
+		if !tx.ID.IsZero() || tx.Revision != 0 || len(tx.Record) != 0 {
+			return errBadTransaction
+		}
+		return nil
+	}
+	if !tx.Operation.valid() {
+		return errBadEnum
+	}
+	if tx.Operation.stages() {
+		if !tx.ID.IsZero() || tx.Revision != 0 || len(tx.Record) == 0 {
+			return errBadTransaction
+		}
+		var err error
+		if tx.Operation == TransactionStageCoordinator {
+			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+		} else {
+			_, err = distributedtxn.OpenParticipant(tx.Record)
+		}
+		if err != nil {
+			return errors.Join(errBadTransaction, err)
+		}
+		return nil
+	}
+	if tx.ID.IsZero() || len(tx.Record) != 0 {
+		return errBadTransaction
+	}
+	lookup := tx.Operation == TransactionLookupCoordinator ||
+		tx.Operation == TransactionLookupParticipant
+	if (lookup && tx.Revision != 0) || (!lookup && tx.Revision == 0) {
+		return errBadTransaction
+	}
+	return nil
+}
+
+func validateTransactionReply(tx TransactionReply) error {
+	if tx.Role == TransactionRoleNone {
+		if !tx.ID.IsZero() || tx.Revision != 0 ||
+			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
+			tx.ParticipantState != distributedtxn.ParticipantInvalid {
+			return errBadTransaction
+		}
+		return nil
+	}
+	if tx.ID.IsZero() || tx.Revision == 0 {
+		return errBadTransaction
+	}
+	switch tx.Role {
+	case TransactionRoleCoordinator:
+		if tx.CoordinatorState < distributedtxn.CoordinatorStaging ||
+			tx.CoordinatorState > distributedtxn.CoordinatorRetired ||
+			tx.ParticipantState != distributedtxn.ParticipantInvalid {
+			return errBadTransaction
+		}
+	case TransactionRoleParticipant:
+		if tx.ParticipantState < distributedtxn.ParticipantStaged ||
+			tx.ParticipantState > distributedtxn.ParticipantReleased ||
+			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
+			return errBadTransaction
+		}
+	default:
+		return errBadEnum
+	}
+	return nil
+}
+
+func encodeTransactionRequest(e *encbuf, tx TransactionRequest) {
+	e.u8(uint8(tx.Operation))
+	if tx.Operation.stages() {
+		e.bytes(tx.Record)
+		return
+	}
+	e.fixed16(tx.ID)
+	e.u64(tx.Revision)
+}
+
+func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
+	tx := TransactionRequest{Operation: TransactionOperation(d.u8())}
+	if d.bad() {
+		return TransactionRequest{}, d.why
+	}
+	if tx.Operation == TransactionNone {
+		return TransactionRequest{}, errBadTransaction
+	}
+	if tx.Operation.stages() {
+		tx.Record = d.slice()
+	} else {
+		tx.ID = distributedtxn.ID(d.fixed16())
+		tx.Revision = d.u64()
+	}
+	if d.bad() {
+		return TransactionRequest{}, d.why
+	}
+	if err := validateTransactionRequest(tx); err != nil {
+		return TransactionRequest{}, err
+	}
+	return tx, nil
+}
+
+func encodeTransactionReply(e *encbuf, tx TransactionReply) {
+	e.u8(uint8(tx.Role))
+	e.fixed16(tx.ID)
+	e.u64(tx.Revision)
+	if tx.Role == TransactionRoleCoordinator {
+		e.u8(uint8(tx.CoordinatorState))
+	} else {
+		e.u8(uint8(tx.ParticipantState))
+	}
+}
+
+func decodeTransactionReply(d *deccur) (TransactionReply, error) {
+	tx := TransactionReply{Role: TransactionRole(d.u8())}
+	if tx.Role == TransactionRoleNone {
+		return TransactionReply{}, errBadTransaction
+	}
+	tx.ID = distributedtxn.ID(d.fixed16())
+	tx.Revision = d.u64()
+	state := d.u8()
+	if tx.Role == TransactionRoleCoordinator {
+		tx.CoordinatorState = distributedtxn.CoordinatorState(state)
+	} else if tx.Role == TransactionRoleParticipant {
+		tx.ParticipantState = distributedtxn.ParticipantState(state)
+	}
+	if d.bad() {
+		return TransactionReply{}, d.why
+	}
+	if err := validateTransactionReply(tx); err != nil {
+		return TransactionReply{}, err
+	}
+	return tx, nil
+}
+
 // EncodeRequest writes req as one framed message. It is deterministic: equal
 // requests encode to identical bytes.
 func EncodeRequest(w io.Writer, req *ShardRequest) error {
@@ -394,9 +543,12 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if len(req.Params) > maxParams {
 		return errFieldTooLarge
 	}
+	if err := validateTransactionRequest(req.Transaction); err != nil {
+		return err
+	}
 
 	var e encbuf
-	e.u8(wireVersion1)
+	e.u8(wireVersion)
 	e.str(req.SQL)
 	e.str(string(req.Distribution))
 	e.str(string(req.Shard))
@@ -414,6 +566,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		if !p.Kind.valid() {
 			return errBadEnum
 		}
+		if !p.Valid() {
+			return errBadParam
+		}
 		e.u8(uint8(p.Kind))
 		switch p.Kind {
 		case ParamBool:
@@ -423,13 +578,17 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 				e.u8(0)
 			}
 		case ParamNumber, ParamString, ParamDocument:
-			e.str(p.Text)
+			e.bytes(p.Bytes)
 		case ParamNull:
 			// no payload
 		}
 	}
 	if err := e.position(req.HasMinPosition, req.MinPosition); err != nil {
 		return err
+	}
+	if req.Transaction.Operation != TransactionNone {
+		e.u8(transactionMarker)
+		encodeTransactionRequest(&e, req.Transaction)
 	}
 	if e.err != nil {
 		return e.err
@@ -445,7 +604,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		return nil, err
 	}
 	d := deccur{b: body}
-	if d.u8() != wireVersion1 {
+	if d.u8() != wireVersion {
 		return nil, errBadVersion
 	}
 
@@ -489,8 +648,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 				}
 				p.Bool = marker == 1
 			case ParamNumber, ParamString, ParamDocument:
-				p.Text = d.str()
+				p.Bytes = d.slice()
 			case ParamNull:
+			}
+			if !d.bad() && !p.Valid() {
+				return nil, errBadParam
 			}
 			req.Params[i] = p
 		}
@@ -498,6 +660,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	req.HasMinPosition, req.MinPosition, err = d.position()
 	if err != nil {
 		return nil, err
+	}
+	if len(d.b) != 0 && d.b[0] == transactionMarker {
+		d.u8()
+		req.Transaction, err = decodeTransactionRequest(&d)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := d.end(); err != nil {
 		return nil, err
@@ -523,9 +692,12 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if resp.HasReadPosition && resp.Kind != ResponseRows {
 		return errUnexpectedReadPosition
 	}
+	if err := validateTransactionReply(resp.Transaction); err != nil {
+		return err
+	}
 
 	var e encbuf
-	e.u8(wireVersion1)
+	e.u8(wireVersion)
 	e.u8(uint8(resp.Kind))
 	switch resp.Kind {
 	case ResponseRows:
@@ -567,6 +739,10 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if err := e.position(resp.HasReadPosition, resp.ReadPosition); err != nil {
 		return err
 	}
+	if resp.Transaction.Role != TransactionRoleNone {
+		e.u8(transactionMarker)
+		encodeTransactionReply(&e, resp.Transaction)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -584,7 +760,7 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 		return nil, err
 	}
 	d := deccur{b: body}
-	if d.u8() != wireVersion1 {
+	if d.u8() != wireVersion {
 		return nil, errBadVersion
 	}
 	kind := ResponseKind(d.u8())
@@ -657,6 +833,13 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 	}
 	if resp.HasReadPosition && kind != ResponseRows {
 		return nil, errUnexpectedReadPosition
+	}
+	if len(d.b) != 0 && d.b[0] == transactionMarker {
+		d.u8()
+		resp.Transaction, err = decodeTransactionReply(&d)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := d.end(); err != nil {
 		return nil, err

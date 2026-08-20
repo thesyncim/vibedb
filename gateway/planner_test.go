@@ -274,8 +274,14 @@ func TestPreparedPlanRefusals(t *testing.T) {
 	if _, err := prepared.Bind(nil); !errors.Is(err, ErrPlanParameters) {
 		t.Fatalf("missing param err = %v, want ErrPlanParameters", err)
 	}
-	if _, err := snap.Prepare(context.Background(), `DELETE FROM messages`); !errors.Is(err, ErrWriteNotSupported) {
-		t.Fatalf("DELETE err = %v, want ErrWriteNotSupported", err)
+	// An unbounded DELETE prepares as a write plan but is refused at bind: it has
+	// no shard-key predicate, so it cannot be proven single-shard for any values.
+	deletePlan, err := snap.Prepare(context.Background(), `DELETE FROM messages`)
+	if err != nil {
+		t.Fatalf("DELETE Prepare: %v", err)
+	}
+	if _, err := deletePlan.BindWrite(nil); !errors.Is(err, ErrDistributedWriteUnsupported) {
+		t.Fatalf("DELETE bind err = %v, want ErrDistributedWriteUnsupported", err)
 	}
 	if _, err := snap.Prepare(context.Background(), `
 		WITH dormant AS (SELECT id FROM absent)

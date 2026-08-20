@@ -327,7 +327,7 @@ available.
 | Server capability | Current state |
 | --- | --- |
 | Leader-only shard process | Available; one locally fenced store |
-| Stateless read-only gateway | Available; generation-pinned routing and bounded fan-out |
+| Stateless gateway | Available; generation-pinned routing, bounded read fan-out, and colocated single-shard writes |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |
@@ -338,9 +338,19 @@ available.
 The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.
 
+The implementation target keeps the gateway's explicitly routed fast path but
+adds replicated distributed transactions, snapshots, global indexes, query
+exchange, and online movement as opt-in costs when an operation crosses shards.
+Tenants route through many virtual buckets rather than being assigned to one
+physical shard. The target and its correctness/performance gates are specified
+in [Distributed system target](docs/design/distributed-system.md); the table
+above remains the honest statement of what serves today.
+
 Read the design before relying on any of it:
 
 - [Distributed sharding](docs/design/distributed-sharding.md)
+- [Distributed system target](docs/design/distributed-system.md)
+- [Distributed transactions](docs/design/distributed-transactions.md)
 - [Query planner](docs/design/query-planner.md)
 - [Placement tuple format](docs/design/distribution-tuple-format.md)
 

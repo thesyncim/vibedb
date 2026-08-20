@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -148,6 +150,188 @@ func cellText(t *testing.T, resp *ShardResponse, row, col int) string {
 }
 
 const ddlDocs = `CREATE TABLE docs (id STRING PRIMARY KEY, name STRING NOT NULL, n INTEGER)`
+
+func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	owner := testOwner()
+	id := testTransactionID(11)
+	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
+		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+		RoutingVersion:       uint64(owner.RoutingVersion),
+		AllocationGeneration: uint64(owner.AllocationGeneration),
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation: uint64(owner.AllocationGeneration),
+		MutationDigest:        testTransactionDigest(55), Mutation: []byte("compact-mutation"),
+	})
+	if err != nil {
+		t.Fatalf("AppendParticipant: %v", err)
+	}
+	stage := ownedRequest("")
+	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	first := exec(t, conn, stage)
+	if first.Transaction.Role != TransactionRoleParticipant ||
+		first.Transaction.ID != id || first.Transaction.Revision != 1 ||
+		first.Transaction.ParticipantState != distributedtxn.ParticipantStaged {
+		t.Fatalf("stage response = %+v", first)
+	}
+	// A lost stage response is retried byte-for-byte and resolves to the same
+	// durable state without another journal entry.
+	second := exec(t, conn, stage)
+	if second.Transaction != first.Transaction {
+		t.Fatalf("duplicate stage = %+v, want %+v", second.Transaction, first.Transaction)
+	}
+	lookup := ownedRequest("")
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	observed := exec(t, conn, lookup)
+	if observed.Transaction != first.Transaction {
+		t.Fatalf("lookup = %+v, want %+v", observed.Transaction, first.Transaction)
+	}
+}
+
+func TestTransactionStageSurvivesShardRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shard.vdb")
+	owner := testOwner()
+	id := testTransactionID(21)
+	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
+		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+		RoutingVersion:       uint64(owner.RoutingVersion),
+		AllocationGeneration: uint64(owner.AllocationGeneration),
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation: uint64(owner.AllocationGeneration),
+		MutationDigest:        testTransactionDigest(77), Mutation: []byte("restart-mutation"),
+	})
+	if err != nil {
+		t.Fatalf("AppendParticipant: %v", err)
+	}
+
+	db := openDB(t, path)
+	srv, err := NewServer(db, owner, Options{})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	conn := dial(t, srv)
+	stage := ownedRequest("")
+	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	want := exec(t, conn, stage).Transaction
+	_ = conn.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("first server Close: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("first database Close: %v", err)
+	}
+
+	db = openDB(t, path)
+	srv, err = NewServer(db, owner, Options{})
+	if err != nil {
+		t.Fatalf("restart NewServer: %v", err)
+	}
+	defer srv.Close()
+	conn = dial(t, srv)
+	lookup := ownedRequest("")
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	if got := exec(t, conn, lookup).Transaction; got != want {
+		t.Fatalf("recovered transaction = %+v, want %+v", got, want)
+	}
+}
+
+func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+	owner := testOwner()
+	id := testTransactionID(31)
+	mutation := encodeRequest(t, ownedRequest(
+		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+		StringParam("atomic"), StringParam("published"), NumberParam("7"),
+	))
+	digest := sha256.Sum256(mutation)
+	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
+		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+		RoutingVersion:       uint64(owner.RoutingVersion),
+		AllocationGeneration: uint64(owner.AllocationGeneration),
+		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorShard: []byte(owner.Shard),
+		CoordinatorAllocation: uint64(owner.AllocationGeneration),
+		MutationDigest:        digest, Mutation: mutation,
+	})
+	if err != nil {
+		t.Fatalf("AppendParticipant: %v", err)
+	}
+	stage := ownedRequest("")
+	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	exec(t, conn, stage)
+	apply := ownedRequest("")
+	apply.Transaction = TransactionRequest{
+		Operation: TransactionApplyParticipant, ID: id, Revision: 1,
+	}
+	applied := exec(t, conn, apply)
+	if applied.RowsAffected != 1 ||
+		applied.Transaction.ParticipantState != distributedtxn.ParticipantApplied ||
+		applied.Transaction.Revision != 2 {
+		t.Fatalf("apply = %+v", applied)
+	}
+	// A response-lost retry resolves the retained SQL-atomic outcome and cannot
+	// execute the INSERT a second time.
+	retried := exec(t, conn, apply)
+	if retried.RowsAffected != 1 || retried.Transaction != applied.Transaction {
+		t.Fatalf("retried apply = %+v, want %+v", retried, applied)
+	}
+	blockedConn := dial(t, srv)
+	blockedResult := make(chan *ShardResponse, 1)
+	blockedErr := make(chan error, 1)
+	go func() {
+		query := ownedRequest(`SELECT name, n FROM docs WHERE id = ?`, StringParam("atomic"))
+		if err := EncodeRequest(blockedConn, query); err != nil {
+			blockedErr <- err
+			return
+		}
+		response, err := DecodeResponse(blockedConn)
+		if err != nil {
+			blockedErr <- err
+			return
+		}
+		blockedResult <- response
+	}()
+	select {
+	case result := <-blockedResult:
+		t.Fatalf("read crossed an applied-but-unreleased participant barrier: %+v", result)
+	case err := <-blockedErr:
+		t.Fatalf("blocked read failed early: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	release := ownedRequest("")
+	release.Transaction = TransactionRequest{
+		Operation: TransactionReleaseParticipant, ID: id, Revision: 2,
+	}
+	released := exec(t, conn, release)
+	if released.Transaction.ParticipantState != distributedtxn.ParticipantReleased ||
+		released.Transaction.Revision != 3 {
+		t.Fatalf("release = %+v", released)
+	}
+	lookup := ownedRequest("")
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	if retained := exec(t, conn, lookup); retained.RowsAffected != 1 ||
+		retained.Transaction != released.Transaction {
+		t.Fatalf("released lookup = %+v, want transaction %+v", retained, released.Transaction)
+	}
+	if afterRelease := exec(t, conn, apply); afterRelease.RowsAffected != 1 ||
+		afterRelease.Transaction != released.Transaction {
+		t.Fatalf("apply retry after release = %+v, want retained release", afterRelease)
+	}
+	var query *ShardResponse
+	select {
+	case query = <-blockedResult:
+	case err := <-blockedErr:
+		t.Fatalf("released read: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("released participant did not wake blocked read")
+	}
+	if query.Kind != ResponseRows || len(query.Rows) != 1 ||
+		cellText(t, query, 0, 0) != `"published"` || cellText(t, query, 0, 1) != "7" {
+		t.Fatalf("published row = %+v", query)
+	}
+}
 
 // TestServerExecuteLifecycle drives the full request lifecycle over one
 // connection: DDL, DML, and a parameterized SELECT that streams back rows.
@@ -619,6 +803,51 @@ func TestServerReadPolicyStrong(t *testing.T) {
 		t.Fatalf("strong read = %+v, want Rows", got)
 	} else if got.HasReadPosition || !got.ReadPosition.IsZero() {
 		t.Fatalf("strong read claimed unimplemented applied position %+v", got.ReadPosition)
+	}
+}
+
+// TestServerWriteReturningCommits proves a writable request executes a mutation
+// with a RETURNING projection as one autocommitted statement: the returned
+// rows are the rows the statement published, the completion count is absent
+// from a row response, and a later read observes the committed row. A mutation
+// without RETURNING still reports its affected-row count.
+func TestServerWriteReturningCommits(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+
+	req := ownedRequest(
+		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?) RETURNING id, n`,
+		StringParam("a"), StringParam("Ada"), NumberParam("7"))
+	resp := roundTrip(t, conn, req)
+	if resp.Kind != ResponseRows {
+		t.Fatalf("INSERT RETURNING kind = %s, want Rows", resp.Kind)
+	}
+	if len(resp.Rows) != 1 {
+		t.Fatalf("returned rows = %d, want 1", len(resp.Rows))
+	}
+	if got := cellText(t, resp, 0, 0); got != `"a"` {
+		t.Fatalf("returned id = %s, want \"a\"", got)
+	}
+	if got := cellText(t, resp, 0, 1); got != `7` {
+		t.Fatalf("returned n = %s, want 7", got)
+	}
+
+	// The statement committed: a later read observes the row.
+	sel := exec(t, conn, ownedRequest(`SELECT id, n FROM docs WHERE id = 'a'`))
+	if sel.Kind != ResponseRows || len(sel.Rows) != 1 {
+		t.Fatalf("post-write read = %+v, want the committed row", sel)
+	}
+	if got := cellText(t, sel, 0, 1); got != `7` {
+		t.Fatalf("committed n = %s, want 7", got)
+	}
+
+	// A RETURNING-less mutation still reports its affected-row count.
+	upd := exec(t, conn, ownedRequest(
+		`UPDATE docs SET "$doc" = ? WHERE id = 'a'`,
+		DocumentParam(`{"id":"a","name":"Ada","n":8}`)))
+	if upd.Kind != ResponseCompletion || upd.RowsAffected != 1 {
+		t.Fatalf("UPDATE = %+v, want completion affecting 1 row", upd)
 	}
 }
 

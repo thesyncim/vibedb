@@ -34,8 +34,11 @@
 // changes; routing integration requires a layout-provenance fence and certified
 // lineage translation rather than dropping or numerically comparing positions.
 //
-// The current package is leader-only and read-only. It does not provide peer
-// authentication, replication, failover, online movement, or a topology
-// authority. The command front end is loopback-only newline-delimited JSON,
-// not pgwire.
+// The current package is leader-only. Its read path fans out and merges; its
+// write path (Exec) executes one mutating statement the pinned generation
+// proves resident on exactly one shard, and refuses every scatter, cross-shard
+// batch, and DDL before any network I/O. It does not provide cross-shard
+// transactions, two-phase commit, peer authentication, replication, failover,
+// online movement, or a topology authority. The command front end is
+// loopback-only newline-delimited JSON, not pgwire.
 package gateway

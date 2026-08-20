@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -95,6 +96,7 @@ type Options struct {
 type Server struct {
 	db        *sqldriver.Database
 	claim     *sqldriver.ShardStoreServingClaim
+	journal   *distributedtxn.Journal
 	ownership Ownership
 	opts      Options
 
@@ -168,9 +170,9 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxIntermediateBytes == 0 {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
-	// Do not advance durable serving authority for a constructor that will be
-	// rejected on an option error. The claim is the final fallible construction
-	// step and is retained until Close has drained every admitted connection.
+	// Claim first so an unbound, mismatched, or stale store retains its precise
+	// admission error. Opening the journal afterward may create hidden state;
+	// failure closes the claim and an equal-fence retry resumes safely.
 	claim, err := db.ClaimShardStoreServing(sqldriver.ShardStoreBinding{
 		Distribution:         cfg.Distribution,
 		Shard:                cfg.Shard,
@@ -182,10 +184,18 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if err != nil {
 		return nil, fmt.Errorf("shardservice: claim SQL shard serving fence: %w", err)
 	}
+	journal, err := db.OpenDistributedTransactionJournal()
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("shardservice: open transaction journal: %w", err),
+			claim.Close(),
+		)
+	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		db:        db,
 		claim:     claim,
+		journal:   journal,
 		ownership: cfg,
 		opts:      opts,
 		baseCtx:   baseCtx,
@@ -313,7 +323,7 @@ func (s *Server) Close() error {
 		_ = c.Close()
 	}
 	s.wg.Wait()
-	err = errors.Join(err, s.claim.Close())
+	err = errors.Join(err, s.journal.Close(), s.claim.Close())
 	s.mu.Lock()
 	s.closeErr = err
 	close(s.closeDone)

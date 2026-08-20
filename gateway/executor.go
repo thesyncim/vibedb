@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -191,6 +192,11 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if prepared.statement.Kind != sqlast.KindSelect {
+			// Query is the read path: it fans out and merges, so it must never
+			// partially commit a mutation. Writes dispatch through Exec instead.
+			return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
+		}
 		bound, err := prepared.Bind(args)
 		if err != nil {
 			return nil, err
@@ -221,6 +227,268 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	}
 }
 
+// Exec is one bounded distributed write: a mutating statement that the pinned
+// generation proves resident on exactly one shard. It reuses the read path's
+// pin-prepare-bind-route-dispatch machinery, except the single dispatch target
+// carries ExecutionReadWrite instead of the read-only fence, and a scatter, a
+// cross-shard INSERT batch, or a replacement that moves a row's shard key is
+// refused before any network I/O so a write never partially commits. An empty
+// route is a successful local no-op: no shard is contacted. Cross-shard
+// transactions and two-phase commit remain outside this boundary.
+func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	profile := e.profileFor(q.Class)
+	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	defer cancel()
+	args, err := queryRuntimeArgs(q.Params)
+	if err != nil {
+		return nil, err
+	}
+
+	var staleGen uint64
+	for attempt := 0; ; attempt++ {
+		if err := opctx.Err(); err != nil {
+			return nil, err
+		}
+		snap, err := e.pin(opctx, attempt, staleGen)
+		if err != nil {
+			return nil, err
+		}
+		prepared, err := snap.Prepare(opctx, q.SQL)
+		if err != nil {
+			return nil, err
+		}
+		if prepared.statement.Kind == sqlast.KindSelect {
+			// Exec is the write path: a SELECT has no affected rows to report and
+			// must not be routed as a mutation.
+			return nil, ErrExecRequiresMutation
+		}
+		bound, err := prepared.BindWrite(args)
+		if err != nil {
+			return nil, err
+		}
+		call, kind, scatter, err := e.routeWrite(snap, &q, bound, profile)
+		if err != nil {
+			return nil, err
+		}
+		e.metrics.observeRoute(kind, 1, scatter)
+
+		var res *Result
+		if call != nil {
+			res, err = e.single(opctx, *call, profile)
+		} else {
+			res = &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 0}
+		}
+		if err == nil {
+			res.RouteKind = kind
+			res.Generation = snap.Generation()
+			if call != nil {
+				res.ShardsFanned = 1
+			}
+			res.Retries = attempt
+			res.ScatterReason = scatter
+			return res, nil
+		}
+		if isStaleErr(err) && attempt < e.maxRetry {
+			staleGen = snap.Generation()
+			e.metrics.observeRetry()
+			continue
+		}
+		return nil, err
+	}
+}
+
+// routeWrite resolves one bound write plan against the pinned generation and
+// returns its single dispatch target. An INSERT maps every VALUES row to its
+// point target and is admitted only when all rows share one target; an UPDATE
+// or DELETE routes its predicate targeted-only and is admitted only on a single
+// or empty route, and a whole-document UPDATE is refused when its replacement
+// would move the row to another shard. A nil call with a nil error is an empty
+// route: a successful no-op that contacts no shard. Every refusal here happens
+// before any network I/O.
+func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p Profile) (*shardCall, distribution.RouteKind, ScatterReason, error) {
+	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
+		return nil, 0, ScatterNone, &CatalogError{Reason: "distributed write plan does not belong to the pinned catalog generation"}
+	}
+	mapper := distribution.NewNativeMapper(bound.spec.Arity)
+	var (
+		targets []distribution.Target
+		route   distribution.Route
+		err     error
+	)
+	if bound.kind == sqlast.KindInsert {
+		targets, err = e.insertTargets(bound, mapper)
+	} else {
+		r, ok := e.targetedWriteRoute(bound, mapper)
+		if !ok {
+			return nil, 0, ScatterNone, &PlanError{
+				Table: bound.table, Reason: "write predicate does not resolve to a single shard",
+				cause: ErrWriteScatter,
+			}
+		}
+		route = r
+		targets = route.Targets
+	}
+	if err != nil {
+		return nil, 0, ScatterNone, err
+	}
+
+	var kind distribution.RouteKind
+	switch len(targets) {
+	case 0:
+		// An empty route is a successful local no-op: the statement matches no
+		// rows on any shard, so nothing is dispatched and the affected count is
+		// zero. A write never partially commits by contacting nothing.
+		kind = distribution.RouteEmpty
+		return nil, kind, ScatterNone, nil
+	case 1:
+		kind = distribution.RouteSingle
+	default:
+		// More than one target is a cross-shard write. An INSERT with rows that
+		// route to different shards is the expected case; any other shape
+		// reaching this point is a planner bug, so fail closed to the same
+		// refusal rather than dispatching a partial batch.
+		return nil, 0, ScatterNone, &PlanError{
+			Table: bound.table, Reason: "write routes to more than one shard",
+			cause: ErrWriteCrossShard,
+		}
+	}
+
+	if bound.kind == sqlast.KindUpdate && len(bound.updateDoc) > 0 {
+		if err := e.writeDocShardKeyMatchesTarget(bound, mapper, targets[0]); err != nil {
+			return nil, kind, ScatterNone, err
+		}
+	}
+
+	addr, err := snap.Address(targets[0].Endpoint)
+	if err != nil {
+		return nil, kind, ScatterNone, err
+	}
+	call := &shardCall{
+		target:  targets[0],
+		address: addr,
+		req: &shardservice.ShardRequest{
+			SQL:                  q.SQL,
+			Params:               q.Params,
+			Distribution:         bound.distribution,
+			Shard:                targets[0].Shard,
+			AllocationGeneration: targets[0].AllocationGeneration,
+			RoutingVersion:       bound.manifest.Version(),
+			OwnershipEpoch:       targets[0].OwnershipEpoch,
+			ReadPolicy:           p.ReadPolicy,
+			ExecutionMode:        shardservice.ExecutionReadWrite,
+			Deadline:             p.PerShardDeadline,
+			MaxRows:              p.PerShardRows,
+			MaxResultBytes:       p.PerShardBytes,
+		},
+	}
+	return call, kind, ScatterNone, nil
+}
+
+// insertTargets maps every VALUES row of a bound INSERT to its point target and
+// returns the single target when all rows agree, else ErrWriteCrossShard. The
+// mapper is a per-call scratch: it is not shared across goroutines, so it is
+// built fresh here rather than borrowed from the executor's router pool.
+func (e *Executor) insertTargets(bound *BoundWritePlan, mapper *distribution.NativeMapper) ([]distribution.Target, error) {
+	if len(bound.rowKeys) == 0 {
+		return nil, nil
+	}
+	target := distribution.Target{}
+	set := false
+	for i, key := range bound.rowKeys {
+		point, err := mapper.PointFor(key)
+		if err != nil {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + ": " + err.Error(),
+				cause: ErrWriteCrossShard,
+			}
+		}
+		t, ok := bound.manifest.ResolvePointTarget(point)
+		if !ok {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + " maps outside the active manifest",
+				cause: ErrWriteCrossShard,
+			}
+		}
+		if !set {
+			target = t
+			set = true
+			continue
+		}
+		if t.Shard != target.Shard || t.AllocationGeneration != target.AllocationGeneration ||
+			t.Endpoint != target.Endpoint || t.OwnershipEpoch != target.OwnershipEpoch ||
+			t.Role != target.Role {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + " routes to a different shard than row 0",
+				cause: ErrWriteCrossShard,
+			}
+		}
+	}
+	return []distribution.Target{target}, nil
+}
+
+// targetedWriteRoute routes an UPDATE or DELETE predicate targeted-only against
+// the pinned manifest and reports whether it resolved to a single or empty
+// route. A scatter, unknown, or multi-shard route reports ok=false so the caller
+// refuses it before any dispatch.
+func (e *Executor) targetedWriteRoute(bound *BoundWritePlan, mapper *distribution.NativeMapper) (distribution.Route, bool) {
+	r := e.routers.get()
+	route, err := r.Route(bound.constraints, mapper, bound.manifest,
+		distribution.NewRoutePolicy(distribution.AdmissionTargetedOnly, distribution.RouteLimits{}))
+	e.routers.put(r)
+	if err != nil {
+		return distribution.Route{}, false
+	}
+	switch route.Kind {
+	case distribution.RouteSingle, distribution.RouteEmpty:
+		return route, true
+	default:
+		return distribution.Route{}, false
+	}
+}
+
+// writeDocShardKeyMatchesTarget proves a whole-document UPDATE's replacement
+// routes to the same target the predicate selected, so the replacement cannot
+// move a row to another shard. It re-reads the replacement's shard key with the
+// plan's compiled pointers and resolves it to its point target.
+func (e *Executor) writeDocShardKeyMatchesTarget(bound *BoundWritePlan, mapper *distribution.NativeMapper, target distribution.Target) error {
+	key, err := writeDocShardKey(bound.updateDoc, bound.keyPointers)
+	if err != nil {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document: " + err.Error(),
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	point, err := mapper.PointFor(key)
+	if err != nil {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document: " + err.Error(),
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	routed, ok := bound.manifest.ResolvePointTarget(point)
+	if !ok {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document maps outside the active manifest",
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	if routed.Shard != target.Shard || routed.AllocationGeneration != target.AllocationGeneration ||
+		routed.Endpoint != target.Endpoint || routed.OwnershipEpoch != target.OwnershipEpoch ||
+		routed.Role != target.Role {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document routes to a different shard",
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	return nil
+}
+
 // Explain plans q against the currently pinned generation without opening a
 // shard connection. It applies the same parameter binding, route admission,
 // statistics, rules, objective, and memory limits as Query.
@@ -242,6 +510,11 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	prepared, err := snap.Prepare(ctx, q.SQL)
 	if err != nil {
 		return nil, err
+	}
+	if prepared.statement.Kind != sqlast.KindSelect {
+		// Explain is a read-path diagnostic: it plans a distributed SELECT and
+		// never dispatches a mutation, so it refuses non-SELECT statements.
+		return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
 	}
 	bound, err := prepared.Bind(args)
 	if err != nil {

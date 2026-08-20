@@ -649,9 +649,10 @@ for another.
 
 The embedded API has no replication, failover, backup manager, point-in-time
 restore, or cross-database transaction. The separate distributed tier is
-experimental, server-only, leader-only, and read-only. Its shard and gateway
-commands accept loopback listeners; the gateway speaks newline-delimited JSON,
-not pgwire, and neither server protocol supplies transport authentication.
+experimental, server-only, and leader-only, with a read fan-out and a
+colocated single-shard write path. Its shard and gateway commands accept
+loopback listeners; the gateway speaks newline-delimited JSON, not pgwire, and
+neither server protocol supplies transport authentication.
 Local catalog high-water marks fence stale coordinates on one open store but
 are not a distributed lease, election, or copied-store revocation mechanism.
 

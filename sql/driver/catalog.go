@@ -214,6 +214,11 @@ type database struct {
 	replicatedApplyFile       *os.File
 	replicatedApplyCollection *durable.Collection
 	replicatedApplyClaim      *ReplicatedApply
+	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
+	// state joined atomically with user-table publication. The larger staged
+	// mutation remains in the append-only transaction journal.
+	distributedTxnFile       *os.File
+	distributedTxnCollection *durable.Collection
 }
 
 func (d *database) advanceLayoutEpochLocked() {
@@ -619,20 +624,32 @@ func (d *database) recoverVisibleNamespace() error {
 }
 
 type catalogCollectionOpen struct {
-	name  string
-	table *table
-	file  *os.File
-	apply bool
+	name        string
+	table       *table
+	file        *os.File
+	apply       bool
+	distributed bool
 }
 
 func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
-	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+1)
-	opened := make([]catalogCollectionOpen, 0, len(d.tables)+1)
+	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+2)
+	opened := make([]catalogCollectionOpen, 0, len(d.tables)+2)
 	abortFiles := func(cause error) error {
 		for i := range opened {
 			cause = errors.Join(cause, opened[i].file.Close())
 		}
 		return cause
+	}
+	if path := d.distributedTransactionStatePath(); path != "" {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err == nil {
+			opened = append(opened, catalogCollectionOpen{file: file, distributed: true})
+			requests = append(requests, durable.TransactionCollectionOpen{
+				File: file, Options: distributedTransactionStateOptions(),
+			})
+		} else if !os.IsNotExist(err) {
+			return abortFiles(err)
+		}
 	}
 	if meta := d.catalog.ReplicatedApply; meta != nil {
 		path := d.replicatedApplyPath(meta)
@@ -702,6 +719,11 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 	for i := range opened {
 		entry := opened[i]
 		collection := collections[i]
+		if entry.distributed {
+			d.distributedTxnFile = entry.file
+			d.distributedTxnCollection = collection
+			continue
+		}
 		if entry.apply {
 			d.replicatedApplyFile = entry.file
 			d.replicatedApplyCollection = collection
@@ -714,6 +736,12 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 	for i := range opened {
 		entry := opened[i]
 		collection := collections[i]
+		if entry.distributed {
+			if err := validateDistributedTransactionStateCollection(collection); err != nil {
+				return err
+			}
+			continue
+		}
 		if entry.apply {
 			if err := validateReplicatedApplyCollection(
 				collection, d.catalog.ReplicatedApply.Sidecars,
@@ -1762,6 +1790,15 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			retryable = true
 		}
 	}
+	if d.distributedTxnCollection != nil {
+		closeErr, completed := d.collectionCloseState(d.distributedTxnCollection)
+		result = errors.Join(result, closeErr)
+		if completed {
+			d.distributedTxnCollection = nil
+		} else {
+			retryable = true
+		}
+	}
 	for _, t := range d.tables {
 		if t.collection != nil {
 			closeErr, completed := d.collectionCloseState(t.collection)
@@ -1794,6 +1831,10 @@ func (d *database) closeWithPolicy(terminal bool) error {
 	if d.replicatedApplyFile != nil {
 		result = errors.Join(result, d.replicatedApplyFile.Close())
 		d.replicatedApplyFile = nil
+	}
+	if d.distributedTxnFile != nil {
+		result = errors.Join(result, d.distributedTxnFile.Close())
+		d.distributedTxnFile = nil
 	}
 	for _, t := range d.tables {
 		if t.file != nil {

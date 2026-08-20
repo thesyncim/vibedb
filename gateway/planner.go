@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -13,6 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // ErrTableNotPlaced reports a physical table with no distributed placement in
@@ -69,6 +70,15 @@ type PreparedPlan struct {
 	alwaysReason string
 	emptyReason  string
 	multiReason  string
+
+	// writeKeyPointers holds one compiled shard-key pointer per ordinal for a
+	// whole-document insert or a whole-document UPDATE; it is nil for every
+	// other shape.
+	writeKeyPointers []vibejson.CompiledPointer
+	// writeKeyColumns maps each shard-key ordinal to the named top-level insert
+	// column index that supplies it; it is set only for a flat single-document
+	// INSERT.
+	writeKeyColumns []int
 }
 
 // BoundPlan is the immutable execution-specific result of binding typed
@@ -183,7 +193,16 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		return nil, err
 	}
 	if plan.statement.Kind != sqlast.KindSelect || plan.statement.Select == nil {
-		return nil, &WriteNotSupportedError{Kind: plan.statement.Kind}
+		// A mutating statement is planned for the distributed write path: it is
+		// admitted only when its shape is provably single-shard, refused before
+		// any dispatch otherwise.
+		if err := s.prepareWrite(plan); err != nil {
+			return nil, err
+		}
+		if cacheable {
+			return s.cachePreparedPlan(sqlText, hash, plan), nil
+		}
+		return plan, nil
 	}
 	selectStmt := plan.statement.Select
 	if err := validatePlanPhysicalTables(s, selectStmt, make(map[*sqlast.SelectStmt]struct{})); err != nil {
@@ -818,32 +837,59 @@ func bindPlanLimit(limit *sqlast.Operand, args []any) (int, error) {
 	if limit == nil {
 		return 0, nil
 	}
-	var spelling string
+	var spelling []byte
 	switch limit.Kind {
 	case sqlast.OperandNumber:
-		spelling = limit.Text
+		spelling = byteview.Bytes(limit.Text)
 	case sqlast.OperandParam:
 		if limit.Ordinal < 0 || limit.Ordinal >= len(args) {
 			return 0, fmt.Errorf("%w: LIMIT parameter %d is not bound", ErrPlanParameters, limit.Ordinal+1)
 		}
 		switch value := args[limit.Ordinal].(type) {
-		case json.Number:
-			spelling = string(value)
+		case vibejson.RawValue:
+			var ok bool
+			spelling, ok = value.NumberBytes()
+			if !ok {
+				return 0, fmt.Errorf("%w: LIMIT requires an integer", ErrPlanParameters)
+			}
 		case int:
-			spelling = strconv.Itoa(value)
+			spelling = strconv.AppendInt(nil, int64(value), 10)
 		case int64:
-			spelling = strconv.FormatInt(value, 10)
+			spelling = strconv.AppendInt(nil, value, 10)
 		case uint64:
-			spelling = strconv.FormatUint(value, 10)
+			spelling = strconv.AppendUint(nil, value, 10)
+		case interface{ String() string }:
+			// Compatibility for direct encoding/json.Number binds. Distributed
+			// requests use the vibejson.RawValue path above.
+			spelling = byteview.Bytes(value.String())
 		default:
 			return 0, fmt.Errorf("%w: LIMIT requires an integer, got %T", ErrPlanParameters, value)
 		}
 	default:
 		return 0, fmt.Errorf("%w: LIMIT is not numeric", ErrPlanParameters)
 	}
-	value, err := strconv.ParseUint(spelling, 10, 31)
-	if err != nil {
+	value, ok := parseLimitUint31(spelling)
+	if !ok {
 		return 0, fmt.Errorf("%w: invalid LIMIT %q", ErrPlanParameters, spelling)
 	}
-	return int(value), nil
+	return value, nil
+}
+
+// parseLimitUint31 accepts only the SQL runtime's unsigned base-10 LIMIT
+// spelling and avoids materializing a string for strconv.ParseUint.
+func parseLimitUint31(spelling []byte) (int, bool) {
+	if len(spelling) == 0 {
+		return 0, false
+	}
+	var value uint64
+	for _, c := range spelling {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		value = value*10 + uint64(c-'0')
+		if value > 1<<31-1 {
+			return 0, false
+		}
+	}
+	return int(value), true
 }

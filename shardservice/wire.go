@@ -1,10 +1,13 @@
 package shardservice
 
 import (
-	"encoding/json"
 	"time"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The shard-service wire vocabulary: the request a gateway sends one leader,
@@ -19,7 +22,65 @@ import (
 
 // wireVersion is the first byte of every request and response body. A decoder
 // rejects an unknown version rather than guessing an older or newer layout.
-const wireVersion1 = 1
+const wireVersion = 1
+
+// TransactionOperation is the closed transaction command set. Ordinary
+// requests leave it at TransactionNone and retain their existing wire shape.
+// Stage commands carry the checksummed durable record itself; later
+// commands address it by its raw 128-bit identity and expected revision.
+type TransactionOperation uint8
+
+const (
+	TransactionNone TransactionOperation = iota
+	TransactionStageCoordinator
+	TransactionStageParticipant
+	TransactionLookupCoordinator
+	TransactionLookupParticipant
+	TransactionCommitCoordinator
+	TransactionApplyParticipant
+	TransactionAbortCoordinator
+	TransactionAbortParticipant
+	TransactionRetireCoordinator
+	TransactionReleaseParticipant
+)
+
+func (op TransactionOperation) valid() bool {
+	return op >= TransactionStageCoordinator && op <= TransactionReleaseParticipant
+}
+
+func (op TransactionOperation) stages() bool {
+	return op == TransactionStageCoordinator || op == TransactionStageParticipant
+}
+
+// TransactionRequest is the optional transaction envelope. Record aliases the
+// request frame and is populated only by a stage operation. Every other
+// operation uses ID and Revision; lookup permits Revision zero, while a state
+// transition requires an exact nonzero revision for compare-and-swap replay.
+type TransactionRequest struct {
+	Operation TransactionOperation
+	ID        distributedtxn.ID
+	Revision  uint64
+	Record    []byte
+}
+
+// TransactionRole discriminates the state returned by a transaction reply.
+type TransactionRole uint8
+
+const (
+	TransactionRoleNone TransactionRole = iota
+	TransactionRoleCoordinator
+	TransactionRoleParticipant
+)
+
+// TransactionReply reports the durable state observed after a transaction
+// command. Exactly one typed state is populated according to Role.
+type TransactionReply struct {
+	Role             TransactionRole
+	ID               distributedtxn.ID
+	Revision         uint64
+	CoordinatorState distributedtxn.CoordinatorState
+	ParticipantState distributedtxn.ParticipantState
+}
 
 // ReadPolicy selects the consistency contract a read is served under. The enum
 // ordering is a stable public safety contract and must not be reordered: the
@@ -128,18 +189,34 @@ func (k ParamKind) String() string {
 func (k ParamKind) valid() bool { return k >= ParamNull && k <= ParamDocument }
 
 // Param is one typed bound parameter. Bool is meaningful only for ParamBool;
-// Text carries the number spelling, string bytes, or document JSON for the
-// other non-null kinds.
+// Bytes carries the number spelling, UTF-8 string bytes, or document JSON for
+// the other non-null kinds. Bytes is borrowed and must remain immutable until
+// the request finishes; a decoded request owns the frame backing its slices.
 type Param struct {
-	Kind ParamKind
-	Bool bool
-	Text string
+	Kind  ParamKind
+	Bool  bool
+	Bytes []byte
 }
 
-// Valid reports whether p names a real wire parameter member. Payload syntax
-// is validated by the SQL binder; this gate prevents the zero/unknown enum from
-// silently materializing as SQL NULL before a request reaches the codec.
-func (p Param) Valid() bool { return p.Kind.valid() }
+// Valid reports whether p names a real wire parameter member and carries a
+// valid byte payload. This keeps malformed JSON and number spellings out of the
+// routing and shard execution paths instead of deferring validation until SQL
+// binding.
+func (p Param) Valid() bool {
+	switch p.Kind {
+	case ParamNull, ParamBool:
+		return len(p.Bytes) == 0
+	case ParamString:
+		return utf8.Valid(p.Bytes)
+	case ParamNumber:
+		_, ok := (vibejson.RawValue{Src: p.Bytes}).NumberBytes()
+		return ok
+	case ParamDocument:
+		return vibejson.Valid(p.Bytes)
+	default:
+		return false
+	}
+}
 
 // NullParam returns a SQL NULL parameter.
 func NullParam() Param { return Param{Kind: ParamNull} }
@@ -150,19 +227,30 @@ func BoolParam(v bool) Param { return Param{Kind: ParamBool, Bool: v} }
 // NumberParam returns an exact-decimal scalar parameter over spelling, a JSON
 // number literal. The codec carries the spelling verbatim; the receiving shard
 // binds it through the same exact-number path used by local equality.
-func NumberParam(spelling string) Param { return Param{Kind: ParamNumber, Text: spelling} }
+func NumberParam(spelling string) Param { return NumberBytesParam(byteview.Bytes(spelling)) }
+
+// NumberBytesParam returns an exact-decimal scalar parameter borrowing
+// spelling. The caller must keep spelling immutable until the request finishes.
+func NumberBytesParam(spelling []byte) Param { return Param{Kind: ParamNumber, Bytes: spelling} }
 
 // StringParam returns a UTF-8 string scalar parameter.
-func StringParam(s string) Param { return Param{Kind: ParamString, Text: s} }
+func StringParam(s string) Param { return StringBytesParam(byteview.Bytes(s)) }
+
+// StringBytesParam returns a UTF-8 scalar parameter borrowing value.
+func StringBytesParam(value []byte) Param { return Param{Kind: ParamString, Bytes: value} }
 
 // DocumentParam returns a complete-JSON-document parameter.
-func DocumentParam(jsonText string) Param { return Param{Kind: ParamDocument, Text: jsonText} }
+func DocumentParam(jsonText string) Param { return DocumentBytesParam(byteview.Bytes(jsonText)) }
 
-// RuntimeValue materializes p as a value the local sql/driver Session accepts in
-// its Query/Exec argument slice. It returns only standard-library types —
-// nil, bool, json.Number, and string — every one of which sql/driver's runtime
-// value normalization already binds. It performs no execution; the execution
-// stage calls it to bridge a decoded request into the local planner.
+// DocumentBytesParam returns a complete JSON parameter borrowing document.
+func DocumentBytesParam(document []byte) Param {
+	return Param{Kind: ParamDocument, Bytes: document}
+}
+
+// RuntimeValue materializes p as a byte-native value the local sql/driver
+// Session accepts. Exact numbers use vibejson.RawValue so they remain distinct
+// from unquoted UTF-8 strings without encoding/json.Number or a string copy;
+// strings and documents remain borrowed byte slices.
 func (p Param) RuntimeValue() any {
 	switch p.Kind {
 	case ParamNull:
@@ -170,9 +258,9 @@ func (p Param) RuntimeValue() any {
 	case ParamBool:
 		return p.Bool
 	case ParamNumber:
-		return json.Number(p.Text)
+		return vibejson.RawValue{Src: p.Bytes}
 	case ParamString, ParamDocument:
-		return p.Text
+		return p.Bytes
 	default:
 		return nil
 	}
@@ -222,6 +310,10 @@ type ShardRequest struct {
 	// MaxRows caps the returned row count; zero means the shard's configured
 	// default.
 	MaxRows uint64
+
+	// Transaction selects the transaction path. Its zero value is absent and
+	// preserves the ordinary autocommit encoding and execution path.
+	Transaction TransactionRequest
 }
 
 // ResponseKind discriminates the three shapes a ShardResponse can take.
@@ -377,6 +469,10 @@ type ShardResponse struct {
 	// on every successful strong read. When false, ReadPosition must be zero.
 	HasReadPosition bool
 	ReadPosition    Position
+
+	// Transaction is present only on a successful transaction command. Its zero
+	// value preserves the ordinary response encoding.
+	Transaction TransactionReply
 }
 
 // RowsResponse builds a ResponseRows reply over columns and rows.

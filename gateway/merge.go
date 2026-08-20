@@ -3,16 +3,17 @@ package gateway
 import (
 	"bytes"
 	"container/heap"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
-	"strconv"
 	"strings"
 
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	vibejson "github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The shard-result merge: a single-shard route streams through unchanged; a
@@ -75,8 +76,8 @@ type cellValue struct {
 	bval  bool
 	isInt bool
 	ival  int64
-	num   string
-	sval  string
+	num   []byte
+	sval  []byte
 	raw   []byte
 }
 
@@ -90,27 +91,30 @@ func classifyCell(c shardservice.Cell) cellValue {
 	if len(b) == 0 {
 		return cellValue{kind: ckNull}
 	}
-	switch b[0] {
-	case 'n':
+	raw := vibejson.RawValue{Src: b}
+	switch raw.Kind() {
+	case jsondoc.Null:
 		return cellValue{kind: ckNull}
-	case 't':
-		return cellValue{kind: ckBool, bval: true}
-	case 'f':
-		return cellValue{kind: ckBool, bval: false}
-	case '"':
-		var s string
-		if err := json.Unmarshal(b, &s); err == nil {
-			return cellValue{kind: ckString, sval: s}
+	case jsondoc.Bool:
+		value, _ := raw.Bool()
+		return cellValue{kind: ckBool, bval: value}
+	case jsondoc.String:
+		if value, clean := raw.StringBytes(); clean {
+			return cellValue{kind: ckString, sval: value}
 		}
-		return cellValue{kind: ckString, sval: string(b)}
-	case '{', '[':
-		return cellValue{kind: ckContainer, raw: b}
-	default:
-		v := cellValue{kind: ckNumber, num: string(b)}
-		if i, err := strconv.ParseInt(v.num, 10, 64); err == nil {
+		value, ok, err := raw.AppendText(nil)
+		if err == nil && ok {
+			return cellValue{kind: ckString, sval: value}
+		}
+		return cellValue{kind: ckString, sval: b}
+	case jsondoc.Number:
+		v := cellValue{kind: ckNumber, num: b}
+		if i, ok := raw.Int64(); ok {
 			v.isInt, v.ival = true, i
 		}
 		return v
+	default:
+		return cellValue{kind: ckContainer, raw: b}
 	}
 }
 
@@ -148,7 +152,7 @@ func compareCells(a, b cellValue) int {
 		}
 		return compareNumberSpelling(a.num, b.num)
 	case ckString:
-		return strings.Compare(a.sval, b.sval)
+		return bytes.Compare(a.sval, b.sval)
 	default:
 		return bytes.Compare(a.raw, b.raw)
 	}
@@ -157,15 +161,15 @@ func compareCells(a, b cellValue) int {
 // compareNumberSpelling compares two JSON numbers without expanding their
 // decimal exponents. A short hostile value such as 1e1000000000 therefore has
 // work proportional to its spelling rather than its mathematical magnitude.
-func compareNumberSpelling(a, b string) int {
-	ca, erra := queryplanner.CanonicalScalarJSON(a)
-	cb, errb := queryplanner.CanonicalScalarJSON(b)
+func compareNumberSpelling(a, b []byte) int {
+	ca, erra := queryplanner.CanonicalScalarJSON(byteview.String(a))
+	cb, errb := queryplanner.CanonicalScalarJSON(byteview.String(b))
 	if erra != nil || errb != nil {
-		return strings.Compare(a, b)
+		return bytes.Compare(a, b)
 	}
 	comparison, err := queryplanner.CompareCanonicalScalarJSON(ca, cb)
 	if err != nil {
-		return strings.Compare(a, b)
+		return bytes.Compare(a, b)
 	}
 	return comparison
 }

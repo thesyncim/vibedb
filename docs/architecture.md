@@ -299,6 +299,10 @@ remain predictable because their capacities and fold work are fixed at open.
   the embedded surface. It also documents that `autosplit` is a shadow-only
   unwired recommender and that serving replication, failover, and online
   movement are absent.
+- [Distributed system target](design/distributed-system.md): the routed fast
+  path plus distributed fallback, tenant-independent virtual buckets, global
+  indexes, coherent snapshots, bounded exchange, serving replication, and
+  online movement. It is a delivery contract, not current capability.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and
   transactions.
