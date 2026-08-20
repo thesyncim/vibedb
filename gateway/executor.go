@@ -607,7 +607,10 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 				cause: ErrDistributedPlanUnsupported,
 			}
 		}
-		route, shards := globalIndexExplainRoute(bound)
+		route, shards, indexKeys, routeErr := globalIndexExplainRoute(bound, profile)
+		if routeErr != nil {
+			return nil, routeErr
+		}
 		baseKind, admissionErr := admitGlobalIndexTargets(
 			len(route.Targets), bound.manifest.ShardCount(), profile,
 		)
@@ -620,7 +623,7 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 			candidateRows = 0
 		} else if bound.globalIndex != nil &&
 			bound.globalIndex.program.metadata.Flags&IndexUnique != 0 {
-			candidateRows = 1
+			candidateRows = indexKeys
 		}
 		physical, planning, planErr := optimizeGlobalIndexPlan(
 			ctx, snap, bound, route, profile, candidateRows,

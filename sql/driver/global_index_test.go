@@ -76,6 +76,37 @@ func TestGlobalIndexLookupPointPrefixFenceAndBounds(t *testing.T) {
 	if len(got) != 1 || !bytes.Equal(got[0], uniqueValue) {
 		t.Fatalf("unique lookup = %q, want %q", got, uniqueValue)
 	}
+	key2 := []byte{1, 5, 'z', '@', 'b'}
+	uniqueValue2 := []byte(`["tenant-8",8]`)
+	if err := session.Begin(ctx, TxOptions{Isolation: IsolationSerializable}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.ApplyGlobalIndexMutation(
+		ctx, "messages_by_email", 17, 3, key2, uniqueValue2, 2, true, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got = got[:0]
+	if err := session.LookupGlobalIndexKeys(
+		ctx, "messages_by_email", 17, 3, [][]byte{key, key2},
+		2, true, 8, 1024, collect,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !bytes.Equal(got[0], uniqueValue) ||
+		!bytes.Equal(got[1], uniqueValue2) {
+		t.Fatalf("batched unique lookup = %q, want %q/%q", got, uniqueValue, uniqueValue2)
+	}
+	got = got[:0]
+	if err := session.LookupGlobalIndexKeys(
+		ctx, "messages_by_email", 17, 3, [][]byte{key, key2},
+		2, true, 1, 1024, collect,
+	); !errors.Is(err, ErrGlobalIndexLookupTooLarge) {
+		t.Fatalf("batched row bound = %v, want lookup-too-large", err)
+	}
 	got = got[:0]
 	missing := append(append([]byte(nil), key...), 99)
 	if err := session.LookupGlobalIndex(

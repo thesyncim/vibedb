@@ -951,6 +951,23 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 		string(historicalRead.Rows[0][0].Bytes) != `"`+c.shards[0].keys[0]+`"` {
 		t.Fatalf("historical row after online backfill = %+v, %v", historicalRead, err)
 	}
+	finiteRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n IN (?, ?) ORDER BY n`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("1"), shardservice.NumberParam("777"),
+		},
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("finite-domain global indexed read: %v", err)
+	}
+	if finiteRead.RouteKind != distribution.RouteTargeted ||
+		finiteRead.ShardsFanned < 3 || finiteRead.ShardsFanned > 4 ||
+		len(finiteRead.Rows) != 2 ||
+		string(finiteRead.Rows[0][1].Bytes) != "1" ||
+		string(finiteRead.Rows[1][1].Bytes) != "777" {
+		t.Fatalf("finite-domain global indexed result = %+v", finiteRead)
+	}
 
 	foundLocator := false
 	for i := range indexShards {

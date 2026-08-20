@@ -197,6 +197,29 @@ func (s *Session) LookupGlobalIndex(
 	maxBytes int64,
 	visit func(locator []byte) error,
 ) error {
+	keys := [...][]byte{keyTuple}
+	return s.LookupGlobalIndexKeys(
+		ctx, relation, indexID, incarnation, keys[:], locatorCount,
+		unique, maxRows, maxBytes, visit,
+	)
+}
+
+// LookupGlobalIndexKeys reads a strictly ordered, deduplicated finite key set
+// from one gateway-maintained global index relation at one durable snapshot.
+// Marker validation, snapshot acquisition, cancellation, and result bounds are
+// shared across the batch. This is the finite-domain locator-projection lane;
+// it avoids one local snapshot and one network request per IN-list element.
+func (s *Session) LookupGlobalIndexKeys(
+	ctx context.Context,
+	relation string,
+	indexID, incarnation uint64,
+	keyTuples [][]byte,
+	locatorCount uint8,
+	unique bool,
+	maxRows int,
+	maxBytes int64,
+	visit func(locator []byte) error,
+) error {
 	if err := s.ready(ctx); err != nil {
 		return err
 	}
@@ -204,10 +227,16 @@ func (s *Session) LookupGlobalIndex(
 		return ErrTransactionActive
 	}
 	if relation == "" || indexID == 0 || incarnation == 0 ||
-		len(keyTuple) == 0 || keyTuple[0] == 0 ||
+		len(keyTuples) == 0 ||
 		locatorCount == 0 || locatorCount > 8 ||
 		maxRows < -1 || maxBytes < -1 || visit == nil {
 		return ErrGlobalIndexRelation
+	}
+	for i := range keyTuples {
+		if len(keyTuples[i]) == 0 || keyTuples[i][0] == 0 ||
+			i != 0 && bytes.Compare(keyTuples[i-1], keyTuples[i]) >= 0 {
+			return ErrGlobalIndexRelation
+		}
 	}
 
 	core := s.conn.db
@@ -244,9 +273,11 @@ func (s *Session) LookupGlobalIndex(
 		core.mu.RUnlock()
 		return limitsErr
 	}
-	if len(keyTuple) > limits.MaxKeyBytes {
-		core.mu.RUnlock()
-		return durable.ErrKeyTooLarge
+	for i := range keyTuples {
+		if len(keyTuples[i]) > limits.MaxKeyBytes {
+			core.mu.RUnlock()
+			return durable.ErrKeyTooLarge
+		}
 	}
 	snapshot, snapshotErr := table.collection.Snapshot()
 	core.mu.RUnlock()
@@ -298,17 +329,24 @@ func (s *Session) LookupGlobalIndex(
 		return nil
 	}
 
-	if unique {
-		scratch, found, err = snapshot.AppendRaw(s.conn.pointRaw[:0], keyTuple)
-		if err == nil && found {
-			err = emit(scratch)
+	for i := range keyTuples {
+		keyTuple := keyTuples[i]
+		if unique {
+			scratch, found, err = snapshot.AppendRaw(s.conn.pointRaw[:0], keyTuple)
+			if err == nil && found {
+				err = emit(scratch)
+			}
+			s.conn.pointRaw = scratch[:0]
+		} else {
+			err = snapshot.RangePrefixRaw(keyTuple, func(_ []byte, locator []byte) error {
+				return emit(locator)
+			})
 		}
-		s.conn.pointRaw = scratch[:0]
-		return err
+		if err != nil {
+			return err
+		}
 	}
-	return snapshot.RangePrefixRaw(keyTuple, func(_ []byte, locator []byte) error {
-		return emit(locator)
-	})
+	return nil
 }
 
 func admitGlobalIndexStaged(

@@ -618,7 +618,7 @@ func TestServerGlobalIndexLookupUsesRawBoundedLane(t *testing.T) {
 	lookup.ExecutionMode = ExecutionReadOnly
 	lookup.GlobalIndexLookup = GlobalIndexLookupRequest{
 		Relation: []byte("messages_by_email"), IndexID: 17, Incarnation: 3,
-		KeyTuple: key, LocatorCount: 2, Unique: true,
+		KeyTuples: [][]byte{key}, LocatorCount: 2, Unique: true,
 	}
 	response := exec(t, conn, lookup)
 	if len(response.Columns) != 1 || response.Columns[0].Name != "locator" ||

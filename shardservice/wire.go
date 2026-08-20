@@ -70,9 +70,11 @@ type TransactionRequest struct {
 }
 
 // GlobalIndexLookupRequest is the optional byte-native lookup envelope for a
-// gateway-maintained global index relation. Relation and KeyTuple borrow the
-// request frame. Unique selects an exact point lookup; non-unique lookup seeks
-// directly to KeyTuple and visits its contiguous locator-key prefix.
+// gateway-maintained global index relation. Relation and KeyTuples borrow the
+// request frame. Tuples are strictly ordered and deduplicated. Unique selects
+// exact point lookups; non-unique lookup seeks directly to each tuple and
+// visits its contiguous locator-key prefix. One request pins one relation
+// snapshot and shares result bounds across every tuple.
 //
 // The zero value is absent. An admitted lookup is read-only and mutually
 // exclusive with SQL, parameters, and transaction commands. IndexID plus
@@ -81,7 +83,7 @@ type GlobalIndexLookupRequest struct {
 	Relation     []byte
 	IndexID      uint64
 	Incarnation  uint64
-	KeyTuple     []byte
+	KeyTuples    [][]byte
 	LocatorCount uint8
 	Unique       bool
 }
@@ -141,12 +143,22 @@ func (r GlobalIndexLookupRequest) present() bool {
 func (r GlobalIndexLookupRequest) canonical() bool {
 	if !r.present() {
 		return len(r.Relation) == 0 && r.Incarnation == 0 &&
-			len(r.KeyTuple) == 0 && r.LocatorCount == 0 && !r.Unique
+			len(r.KeyTuples) == 0 && r.LocatorCount == 0 && !r.Unique
 	}
-	return len(r.Relation) != 0 && len(r.Relation) <= 1<<16-1 &&
-		utf8.Valid(r.Relation) && bytes.IndexByte(r.Relation, 0) < 0 && r.Incarnation != 0 &&
-		len(r.KeyTuple) != 0 && r.KeyTuple[0] != 0 &&
-		r.LocatorCount != 0 && r.LocatorCount <= 8
+	if len(r.Relation) == 0 || len(r.Relation) > 1<<16-1 ||
+		len(r.KeyTuples) == 0 || len(r.KeyTuples) > maxParams ||
+		!utf8.Valid(r.Relation) || bytes.IndexByte(r.Relation, 0) >= 0 ||
+		r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 {
+		return false
+	}
+	for i := range r.KeyTuples {
+		if len(r.KeyTuples[i]) == 0 || len(r.KeyTuples[i]) > maxFrameBody ||
+			r.KeyTuples[i][0] == 0 ||
+			i != 0 && bytes.Compare(r.KeyTuples[i-1], r.KeyTuples[i]) >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // TransactionRole discriminates the state returned by a transaction reply.

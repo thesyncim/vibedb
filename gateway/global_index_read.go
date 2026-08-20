@@ -37,17 +37,24 @@ func useGlobalIndexRead(bound *BoundPlan) bool {
 	return !boundConstraintsSinglePoint(bound.constraints, bound.spec.Arity)
 }
 
-func globalIndexExplainRoute(bound *BoundPlan) (distribution.Route, int) {
+func globalIndexExplainRoute(
+	bound *BoundPlan,
+	profile Profile,
+) (distribution.Route, int, int, error) {
 	route := distribution.Route{
 		Kind: distribution.RouteEmpty, Distribution: bound.distribution,
 		RoutingVersion: bound.manifest.Version(),
 	}
 	if bound.globalEmpty || bound.globalIndex == nil {
-		return route, 0
+		return route, 0, 0, nil
+	}
+	indexCalls, keyCount, err := planGlobalIndexShardCalls(bound.globalIndex, profile)
+	if err != nil {
+		return distribution.Route{}, 0, 0, err
 	}
 	baseShards := bound.manifest.ShardCount()
 	if bound.globalIndex.program.metadata.Flags&IndexUnique != 0 {
-		baseShards = min(baseShards, 1)
+		baseShards = min(baseShards, keyCount)
 	}
 	for i := 0; i < baseShards; i++ {
 		shard, ok := bound.manifest.ShardInfo(i)
@@ -65,7 +72,7 @@ func globalIndexExplainRoute(bound *BoundPlan) (distribution.Route, int) {
 	} else if len(route.Targets) > 1 {
 		route.Kind = distribution.RouteTargeted
 	}
-	return route, len(route.Targets) + 1
+	return route, len(route.Targets) + len(indexCalls), keyCount, nil
 }
 
 func admitGlobalIndexTargets(
@@ -136,13 +143,22 @@ func (e *Executor) queryGlobalIndex(
 		}
 	}
 
-	indexCall := globalIndexShardCall(bound.globalIndex, profile)
+	indexCalls, _, err := planGlobalIndexShardCalls(bound.globalIndex, profile)
+	if err != nil {
+		return globalIndexExecution{}, err
+	}
+	indexKind, err := admitGlobalIndexTargets(
+		len(indexCalls), bound.globalIndex.program.indexManifest.ShardCount(), profile,
+	)
+	if err != nil {
+		return globalIndexExecution{}, err
+	}
 	for attempt := 0; ; attempt++ {
 		id, err := newTransactionID(cryptorand.Reader)
 		if err != nil {
 			return globalIndexExecution{}, err
 		}
-		if err := e.acquireReadFencesOnce(ctx, []shardCall{indexCall}, profile, id); err != nil {
+		if err := e.acquireReadFencesOnce(ctx, indexCalls, profile, id); err != nil {
 			if errors.Is(err, ErrReadFenceBusy) {
 				if waitErr := waitReadFenceRetry(ctx, id, attempt); waitErr != nil {
 					return globalIndexExecution{}, waitErr
@@ -152,36 +168,40 @@ func (e *Executor) queryGlobalIndex(
 			return globalIndexExecution{}, err
 		}
 
-		indexCall.req.ReadFenceID = id
-		response, lookupErr := e.globalIndexRoundTrip(ctx, indexCall, profile)
-		indexCall.req.ReadFenceID = distributedtxn.ID{}
+		for i := range indexCalls {
+			indexCalls[i].req.ReadFenceID = id
+		}
+		response, lookupErr := e.globalIndexRoundTrip(ctx, indexCalls, profile)
+		for i := range indexCalls {
+			indexCalls[i].req.ReadFenceID = distributedtxn.ID{}
+		}
 		if lookupErr != nil {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(lookupErr, releaseErr)
 		}
 		baseCalls, targets, locatorErr := globalIndexBaseCalls(
 			bound.globalIndex.program, response, q, profile,
 		)
 		if locatorErr != nil {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(locatorErr, releaseErr)
 		}
 		baseKind, admissionErr := admitGlobalIndexTargets(
 			len(baseCalls), bound.manifest.ShardCount(), profile,
 		)
 		if admissionErr != nil {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(admissionErr, releaseErr)
 		}
 		if len(baseCalls) > 1 && bound.multiReason != "" {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(&PlanError{
 				Table: bound.table, Reason: bound.multiReason,
 				cause: ErrDistributedPlanUnsupported,
 			}, releaseErr)
 		}
 		if len(baseCalls) == 0 {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			if releaseErr != nil {
 				return globalIndexExecution{}, releaseErr
 			}
@@ -197,13 +217,13 @@ func (e *Executor) queryGlobalIndex(
 				result = emptyAggregateResult(plan)
 			}
 			return globalIndexExecution{
-				result: result, shardsFanned: 1, routeKind: distribution.RouteSingle,
+				result: result, shardsFanned: len(indexCalls), routeKind: indexKind,
 				candidateRows: 0,
 			}, nil
 		}
 
 		if err := e.acquireReadFencesOnce(ctx, baseCalls, profile, id); err != nil {
-			releaseErr := e.releaseReadFences(ctx, []shardCall{indexCall}, profile, id)
+			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			if errors.Is(err, ErrReadFenceBusy) && releaseErr == nil {
 				if waitErr := waitReadFenceRetry(ctx, id, attempt); waitErr != nil {
 					return globalIndexExecution{}, waitErr
@@ -226,15 +246,15 @@ func (e *Executor) queryGlobalIndex(
 		} else {
 			result, queryErr = e.fanout(ctx, basePlan, profile)
 		}
-		allCalls := make([]shardCall, 0, len(baseCalls)+1)
+		allCalls := make([]shardCall, 0, len(baseCalls)+len(indexCalls))
 		allCalls = append(allCalls, baseCalls...)
-		allCalls = append(allCalls, indexCall)
+		allCalls = append(allCalls, indexCalls...)
 		releaseErr := e.releaseReadFences(ctx, allCalls, profile, id)
 		if queryErr != nil || releaseErr != nil {
 			return globalIndexExecution{}, globalIndexReadError(queryErr, releaseErr)
 		}
 		return globalIndexExecution{
-			result: result, baseTargets: targets, shardsFanned: len(baseCalls) + 1,
+			result: result, baseTargets: targets, shardsFanned: len(baseCalls) + len(indexCalls),
 			routeKind: baseKind, candidateRows: len(response.Rows),
 		}, nil
 	}
@@ -257,52 +277,166 @@ func globalIndexReadError(primary, release error) error {
 	)
 }
 
-func globalIndexShardCall(
+type globalIndexLookupGroup struct {
+	target  distribution.Target
+	address string
+	bits    uint8
+	scopes  []distributedtxn.IntentScope
+	arena   []byte
+	ends    []int
+}
+
+// planGlobalIndexShardCalls expands one fully finite index-key domain under
+// the route candidate bound, then groups its locator keys by independently
+// sharded index owner. Each owner receives one sorted batch and one shared
+// relation snapshot instead of one request per key.
+func planGlobalIndexShardCalls(
 	bound *boundGlobalIndexRead,
 	profile Profile,
-) shardCall {
-	program := bound.program
-	route := bound.route
-	return shardCall{
-		target: route.IndexTarget, address: route.IndexAddress,
-		req: &shardservice.ShardRequest{
-			Distribution:         program.indexManifest.Distribution(),
-			Shard:                route.IndexTarget.Shard,
-			AllocationGeneration: route.IndexTarget.AllocationGeneration,
-			RoutingVersion:       program.indexManifest.Version(),
-			OwnershipEpoch:       route.IndexTarget.OwnershipEpoch,
-			ReadPolicy:           profile.ReadPolicy, ExecutionMode: shardservice.ExecutionReadOnly,
-			Deadline: profile.PerShardDeadline,
-			MaxRows:  profile.PerShardRows, MaxResultBytes: profile.PerShardBytes,
-			BucketBits:   route.IndexBucketBits,
-			AccessScopes: []distributedtxn.IntentScope{route.IndexScope},
-			GlobalIndexLookup: shardservice.GlobalIndexLookupRequest{
-				Relation:     byteview.Bytes(program.metadata.Relation),
-				IndexID:      program.metadata.IndexID,
-				Incarnation:  program.metadata.Incarnation,
-				KeyTuple:     route.KeyTuple,
-				LocatorCount: program.metadata.LocatorCount,
-				Unique:       program.metadata.Flags&IndexUnique != 0,
-			},
-		},
+) ([]shardCall, int, error) {
+	if bound == nil || bound.program.snapshot == nil || len(bound.constraints) == 0 ||
+		len(bound.constraints) != len(bound.program.keyPointers) {
+		return nil, 0, ErrGlobalIndexResult
 	}
+	limit := profile.Policy.Limits.MaxCandidateMappings
+	if limit <= 0 {
+		limit = distribution.DefaultMaxCandidateMappings
+	}
+	keyCount := 1
+	for i := range bound.constraints {
+		domain := bound.constraints[i]
+		if domain.Kind != distribution.DomainFinite || len(domain.Values) == 0 {
+			return nil, 0, ErrGlobalIndexResult
+		}
+		if keyCount > limit/len(domain.Values) {
+			return nil, 0, &distribution.ExpansionLimitError{Limit: limit}
+		}
+		keyCount *= len(domain.Values)
+	}
+
+	groups := make([]globalIndexLookupGroup, 0,
+		min(keyCount, bound.program.indexManifest.ShardCount()))
+	positions := make(map[distribution.ShardID]int, cap(groups))
+	var (
+		workspace GlobalIndexWorkspace
+		key       [4]distribution.Scalar
+		indices   [4]int
+	)
+	for produced := 0; produced < keyCount; produced++ {
+		for ordinal := range bound.constraints {
+			key[ordinal] = bound.constraints[ordinal].Values[indices[ordinal]]
+		}
+		route, err := bound.program.RouteKey(key[:len(bound.constraints)], &workspace)
+		if err != nil {
+			return nil, 0, err
+		}
+		position, found := positions[route.IndexTarget.Shard]
+		if !found {
+			position = len(groups)
+			positions[route.IndexTarget.Shard] = position
+			groups = append(groups, globalIndexLookupGroup{
+				target: route.IndexTarget, address: route.IndexAddress,
+				bits: route.IndexBucketBits,
+			})
+		}
+		group := &groups[position]
+		group.scopes = append(group.scopes, route.IndexScope)
+		group.arena = append(group.arena, route.KeyTuple...)
+		group.ends = append(group.ends, len(group.arena))
+
+		for ordinal := len(bound.constraints) - 1; ordinal >= 0; ordinal-- {
+			indices[ordinal]++
+			if indices[ordinal] < len(bound.constraints[ordinal].Values) {
+				break
+			}
+			indices[ordinal] = 0
+		}
+	}
+	if _, err := admitGlobalIndexTargets(
+		len(groups), bound.program.indexManifest.ShardCount(), profile,
+	); err != nil {
+		return nil, 0, err
+	}
+
+	calls := make([]shardCall, len(groups))
+	for i := range groups {
+		group := &groups[i]
+		keys := make([][]byte, len(group.ends))
+		start := 0
+		for keyOrdinal, end := range group.ends {
+			keys[keyOrdinal] = group.arena[start:end:end]
+			start = end
+		}
+		slices.SortFunc(keys, func(a, b []byte) int { return bytes.Compare(a, b) })
+		scopes := coalesceIntentScopes(group.scopes)
+		if len(scopes) > distributedtxn.MaxIntentScopes {
+			group.bits, scopes = wholeShardAccessScope(
+				bound.program.indexManifest, group.target, group.bits,
+			)
+		}
+		calls[i] = shardCall{
+			target: group.target, address: group.address,
+			req: &shardservice.ShardRequest{
+				Distribution:         bound.program.indexManifest.Distribution(),
+				Shard:                group.target.Shard,
+				AllocationGeneration: group.target.AllocationGeneration,
+				RoutingVersion:       bound.program.indexManifest.Version(),
+				OwnershipEpoch:       group.target.OwnershipEpoch,
+				ReadPolicy:           profile.ReadPolicy,
+				ExecutionMode:        shardservice.ExecutionReadOnly,
+				Deadline:             profile.PerShardDeadline,
+				MaxRows:              profile.PerShardRows,
+				MaxResultBytes:       profile.PerShardBytes,
+				BucketBits:           group.bits,
+				AccessScopes:         scopes,
+				GlobalIndexLookup: shardservice.GlobalIndexLookupRequest{
+					Relation: byteview.Bytes(bound.program.metadata.Relation),
+					IndexID:  bound.program.metadata.IndexID, Incarnation: bound.program.metadata.Incarnation,
+					KeyTuples: keys, LocatorCount: bound.program.metadata.LocatorCount,
+					Unique: bound.program.metadata.Flags&IndexUnique != 0,
+				},
+			},
+		}
+	}
+	slices.SortFunc(calls, func(a, b shardCall) int {
+		if a.target.Shard < b.target.Shard {
+			return -1
+		}
+		if a.target.Shard > b.target.Shard {
+			return 1
+		}
+		return 0
+	})
+	return calls, keyCount, nil
 }
 
 func (e *Executor) globalIndexRoundTrip(
 	ctx context.Context,
-	call shardCall,
+	calls []shardCall,
 	profile Profile,
 ) (*shardservice.ShardResponse, error) {
-	requestContext, cancel := context.WithTimeout(ctx, profile.PerShardDeadline)
-	defer cancel()
-	response, err := e.client.Do(requestContext, call.address, call.req)
+	if len(calls) == 0 {
+		return nil, ErrGlobalIndexResult
+	}
+	if len(calls) == 1 {
+		requestContext, cancel := context.WithTimeout(ctx, profile.PerShardDeadline)
+		defer cancel()
+		response, err := e.client.Do(requestContext, calls[0].address, calls[0].req)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkAggregate(profile, uint64(len(response.Rows)), responseBytes(response)); err != nil {
+			return nil, err
+		}
+		return response, nil
+	}
+	result, err := e.fanout(ctx, &plan{calls: calls}, profile)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkAggregate(profile, uint64(len(response.Rows)), responseBytes(response)); err != nil {
-		return nil, err
-	}
-	return response, nil
+	return &shardservice.ShardResponse{
+		Kind: result.Kind, Columns: result.Columns, Rows: result.Rows,
+	}, nil
 }
 
 func globalIndexBaseCalls(

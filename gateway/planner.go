@@ -82,9 +82,9 @@ type PreparedPlan struct {
 	// writeGlobalIndexes is populated only for a table with READY global index
 	// incarnations. Local and non-ready indexes add no prepared-plan footprint.
 	writeGlobalIndexes []preparedGlobalIndex
-	// readGlobalIndexes contains equality-routing programs for READY global
-	// indexes on the driving table. Bind selects at most one complete key; the
-	// ordinary base-shard route remains preferred when it is already a point.
+	// readGlobalIndexes contains finite-domain routing programs for READY global
+	// indexes on the driving table. Bind selects at most one complete key domain;
+	// the ordinary base-shard route remains preferred when it is already a point.
 	readGlobalIndexes []preparedGlobalIndexRead
 }
 
@@ -94,8 +94,8 @@ type preparedGlobalIndexRead struct {
 }
 
 type boundGlobalIndexRead struct {
-	program GlobalIndexProgram
-	route   GlobalIndexRoute
+	program     GlobalIndexProgram
+	constraints distribution.BoundConstraints
 }
 
 // BoundPlan is the immutable execution-specific result of binding typed
@@ -402,32 +402,23 @@ func (p *PreparedPlan) bindGlobalIndexRead(
 			if err != nil {
 				return nil, false, fmt.Errorf("%w: %w", ErrPlanParameters, err)
 			}
-			var keyStorage [4]distribution.Scalar
-			if len(constraints) == 0 || len(constraints) > len(keyStorage) {
+			if len(constraints) == 0 || len(constraints) > 4 {
 				continue
 			}
 			complete := true
-			key := keyStorage[:len(constraints)]
 			for ordinal := range constraints {
 				domain := constraints[ordinal]
 				if domain.Kind == distribution.DomainEmpty {
 					return nil, true, nil
 				}
-				if domain.Kind != distribution.DomainFinite || len(domain.Values) != 1 {
+				if domain.Kind != distribution.DomainFinite || len(domain.Values) == 0 {
 					complete = false
 					break
 				}
-				key[ordinal] = domain.Values[0]
 			}
 			if complete {
-				var workspace GlobalIndexWorkspace
-				route, err := candidate.program.RouteKey(key, &workspace)
-				if err != nil {
-					return nil, false, err
-				}
-				route.KeyTuple = append([]byte(nil), route.KeyTuple...)
 				return &boundGlobalIndexRead{
-					program: candidate.program, route: route,
+					program: candidate.program, constraints: constraints,
 				}, false, nil
 			}
 		}

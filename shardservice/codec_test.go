@@ -138,7 +138,9 @@ func TestRequestRoundTrip(t *testing.T) {
 				ReadFenceID: testTransactionID(51),
 				GlobalIndexLookup: GlobalIndexLookupRequest{
 					Relation: []byte("messages_by_email_17"), IndexID: 17,
-					Incarnation: 3, KeyTuple: []byte{1, 5, 'a', '@', 'b'},
+					Incarnation: 3, KeyTuples: [][]byte{
+						{1, 5, 'a', '@', 'b'}, {1, 5, 'c', '@', 'd'},
+					},
 					LocatorCount: 2, Unique: true,
 				},
 			},
@@ -248,8 +250,16 @@ func TestRequestRoundTrip(t *testing.T) {
 				got.GlobalIndexLookup.LocatorCount != tc.req.GlobalIndexLookup.LocatorCount ||
 				got.GlobalIndexLookup.Unique != tc.req.GlobalIndexLookup.Unique ||
 				!bytes.Equal(got.GlobalIndexLookup.Relation, tc.req.GlobalIndexLookup.Relation) ||
-				!bytes.Equal(got.GlobalIndexLookup.KeyTuple, tc.req.GlobalIndexLookup.KeyTuple) {
+				len(got.GlobalIndexLookup.KeyTuples) != len(tc.req.GlobalIndexLookup.KeyTuples) {
 				t.Errorf("GlobalIndexLookup = %+v, want %+v", got.GlobalIndexLookup, tc.req.GlobalIndexLookup)
+			}
+			if len(got.GlobalIndexLookup.KeyTuples) == len(tc.req.GlobalIndexLookup.KeyTuples) {
+				for i := range got.GlobalIndexLookup.KeyTuples {
+					if !bytes.Equal(got.GlobalIndexLookup.KeyTuples[i], tc.req.GlobalIndexLookup.KeyTuples[i]) {
+						t.Errorf("GlobalIndexLookup.KeyTuples[%d] = %x, want %x",
+							i, got.GlobalIndexLookup.KeyTuples[i], tc.req.GlobalIndexLookup.KeyTuples[i])
+					}
+				}
 			}
 			if !bytes.Equal(got.PrimaryKeyRead.PrimaryPath, tc.req.PrimaryKeyRead.PrimaryPath) ||
 				len(got.PrimaryKeyRead.Keys) != len(tc.req.PrimaryKeyRead.Keys) {
@@ -747,7 +757,7 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 					SQL: "SELECT 1",
 					GlobalIndexLookup: GlobalIndexLookupRequest{
 						Relation: []byte("idx"), IndexID: 1, Incarnation: 1,
-						KeyTuple: []byte{1}, LocatorCount: 1,
+						KeyTuples: [][]byte{{1}}, LocatorCount: 1,
 					},
 				})
 			},
@@ -759,7 +769,7 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				return EncodeRequest(io.Discard, &ShardRequest{
 					GlobalIndexLookup: GlobalIndexLookupRequest{
 						Relation: []byte("idx"), IndexID: 1, Incarnation: 1,
-						KeyTuple: []byte{0}, LocatorCount: 1,
+						KeyTuples: [][]byte{{0}}, LocatorCount: 1,
 					},
 				})
 			},

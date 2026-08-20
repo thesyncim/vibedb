@@ -316,9 +316,9 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 
 // executeGlobalIndexLookup serves the raw index lane after ordinary ownership,
 // participant-barrier, scoped-intent, and optional coherent-read-fence
-// admission. The driver pins exactly one relation snapshot and performs either
-// one point lookup or one prefix-seek scan; no SQL parsing or JSON re-encoding
-// occurs on this path.
+// admission. The driver pins exactly one relation snapshot and performs one
+// point lookup or prefix-seek scan per ordered finite-domain key; no SQL
+// parsing or JSON re-encoding occurs on this path.
 func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 	lookup := req.GlobalIndexLookup
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" ||
@@ -335,9 +335,9 @@ func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 		capacity = 16
 	}
 	rows := make([][]Cell, 0, capacity)
-	err := c.sess.LookupGlobalIndex(
+	err := c.sess.LookupGlobalIndexKeys(
 		ctx, byteview.String(lookup.Relation), lookup.IndexID,
-		lookup.Incarnation, lookup.KeyTuple, lookup.LocatorCount,
+		lookup.Incarnation, lookup.KeyTuples, lookup.LocatorCount,
 		lookup.Unique, maxRows, maxBytes,
 		func(locator []byte) error {
 			owned := append([]byte(nil), locator...)

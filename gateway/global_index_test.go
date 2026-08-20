@@ -305,6 +305,67 @@ func TestGlobalIndexRoutesLookupKeyAndReturnedLocator(t *testing.T) {
 	}
 }
 
+func TestGlobalIndexFiniteDomainsBatchOneLookupPerIndexShard(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	snapshot, err := NewSnapshotWithIndexes(
+		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := snapshot.Prepare(
+		context.Background(), `SELECT id FROM messages WHERE email IN (?, ?, ?)`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := prepared.Bind([]any{"a@example.com", "b@example.com", "c@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.globalIndex == nil {
+		t.Fatal("finite global-index domain was not selected")
+	}
+	calls, keyCount, err := planGlobalIndexShardCalls(
+		bound.globalIndex, DefaultProfiles()[ClassBatch],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyCount != 3 || len(calls) == 0 || len(calls) > 2 {
+		t.Fatalf("batched lookup = %d keys across %d calls", keyCount, len(calls))
+	}
+	total := 0
+	seen := make(map[distribution.ShardID]struct{}, len(calls))
+	for i := range calls {
+		request := calls[i].req.GlobalIndexLookup
+		if _, duplicate := seen[calls[i].target.Shard]; duplicate {
+			t.Fatalf("duplicate request for index shard %q", calls[i].target.Shard)
+		}
+		seen[calls[i].target.Shard] = struct{}{}
+		if len(request.KeyTuples) == 0 {
+			t.Fatalf("empty batched lookup for %q", calls[i].target.Shard)
+		}
+		for key := 1; key < len(request.KeyTuples); key++ {
+			if bytes.Compare(request.KeyTuples[key-1], request.KeyTuples[key]) >= 0 {
+				t.Fatalf("unsorted lookup keys for %q", calls[i].target.Shard)
+			}
+		}
+		total += len(request.KeyTuples)
+	}
+	if total != keyCount {
+		t.Fatalf("batched keys = %d, want %d", total, keyCount)
+	}
+
+	profile := DefaultProfiles()[ClassBatch]
+	profile.Policy.Limits.MaxCandidateMappings = 2
+	if _, _, err := planGlobalIndexShardCalls(bound.globalIndex, profile); !errors.Is(
+		err, distribution.ErrRouteExpansionLimit,
+	) {
+		t.Fatalf("finite-domain overflow err = %v", err)
+	}
+}
+
 func TestGlobalIndexBaseCallsCarrySortedNativePrimaryCandidates(t *testing.T) {
 	config, endpoints := globalIndexCatalog(t)
 	snapshot, err := NewSnapshotWithIndexes(

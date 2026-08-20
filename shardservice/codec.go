@@ -592,6 +592,13 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.GlobalIndexLookup.canonical() {
 		return errBadGlobalIndexLookup
 	}
+	globalIndexLookupBytes := uint64(4)
+	for i := range req.GlobalIndexLookup.KeyTuples {
+		globalIndexLookupBytes += uint64(4 + len(req.GlobalIndexLookup.KeyTuples[i]))
+		if globalIndexLookupBytes > maxFrameBody {
+			return errFieldTooLarge
+		}
+	}
 	if len(req.PrimaryKeyRead.Keys) > maxParams {
 		return errFieldTooLarge
 	}
@@ -693,7 +700,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.bytes(lookup.Relation)
 		e.u64(lookup.IndexID)
 		e.u64(lookup.Incarnation)
-		e.bytes(lookup.KeyTuple)
+		e.u32(uint32(len(lookup.KeyTuples)))
+		for i := range lookup.KeyTuples {
+			e.bytes(lookup.KeyTuples[i])
+		}
 		e.u8(lookup.LocatorCount)
 		if lookup.Unique {
 			e.u8(1)
@@ -818,7 +828,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.GlobalIndexLookup.Relation = d.slice()
 		req.GlobalIndexLookup.IndexID = d.u64()
 		req.GlobalIndexLookup.Incarnation = d.u64()
-		req.GlobalIndexLookup.KeyTuple = d.slice()
+		count := d.count(4, maxParams)
+		if count != 0 {
+			req.GlobalIndexLookup.KeyTuples = make([][]byte, count)
+			for i := range req.GlobalIndexLookup.KeyTuples {
+				req.GlobalIndexLookup.KeyTuples[i] = d.slice()
+			}
+		}
 		req.GlobalIndexLookup.LocatorCount = d.u8()
 		unique := d.u8()
 		if unique > 1 {
