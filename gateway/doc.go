@@ -42,8 +42,11 @@
 // bounded fixed-participant transaction across tables and shards. Coordinator
 // and participant state is durable on shards; bounded scanning and redrive let
 // any gateway recover current-catalog coordinators. Virtual-bucket-scoped
-// intents and read fences allow disjoint traffic to proceed; replicated scalar
-// timestamps, finer row-key intents, replicated serving, peer authentication, failover,
-// online movement, and a topology authority are not yet provided. The command
-// front end is loopback-only newline-delimited JSON, not pgwire.
+// intents and read fences allow disjoint traffic to proceed. The catalog can
+// also pin independently sharded global-index relations and compile allocation-
+// free vibejson key/locator routing programs; foreground index maintenance,
+// lookup planning, and online build workers are not wired yet. Replicated scalar
+// timestamps, finer row-key intents, replicated serving, peer authentication,
+// failover, online movement, and a topology authority are not yet provided. The
+// command front end is loopback-only newline-delimited JSON, not pgwire.
 package gateway

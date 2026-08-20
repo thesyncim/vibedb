@@ -81,18 +81,22 @@ func (e *CatalogError) Unwrap() error { return ErrInvalidCatalog }
 // catalog records are exposed by value; placement columns are copied; manifests
 // are themselves immutable.
 type Snapshot struct {
-	config              distribution.ClusterConfig
-	endpoints           map[distribution.EndpointID]string
-	generation          uint64
-	planner             []plannerTable
-	plannerIndexes      []plannerIndex
-	plannerIndexPaths   []plannerStringRef
-	plannerIndexSpans   []plannerIndexSpan
-	plannerIndexStrings string
-	statistics          *queryplanner.StatisticsCatalog
-	indexLineage        []plannerIndexLineageRef
-	shardLineage        []plannerShardLineageRef
-	indexIDHighWater    uint64
+	config                         distribution.ClusterConfig
+	endpoints                      map[distribution.EndpointID]string
+	generation                     uint64
+	planner                        []plannerTable
+	plannerIndexes                 []plannerIndex
+	plannerIndexPaths              []plannerStringRef
+	plannerIndexRelations          []uint32
+	plannerGlobalIndexPrograms     []plannerGlobalIndexProgram
+	plannerGlobalIndexPointers     []vibejson.CompiledPointer
+	plannerGlobalPointerExtraBytes uint64
+	plannerIndexSpans              []plannerIndexSpan
+	plannerIndexStrings            string
+	statistics                     *queryplanner.StatisticsCatalog
+	indexLineage                   []plannerIndexLineageRef
+	shardLineage                   []plannerShardLineageRef
+	indexIDHighWater               uint64
 	// shardGenerationHighWaters is aligned with Distributions. One scalar per
 	// logical keyspace fences every removed shard identity without retaining a
 	// tombstone per split, merge, or move.
@@ -210,18 +214,22 @@ func NewSnapshotWithPlannerMetadata(
 		return nil, err
 	}
 	snapshot := &Snapshot{
-		config:              cloned,
-		endpoints:           cloneEndpoints(endpoints),
-		generation:          generation,
-		planner:             planner,
-		plannerIndexes:      indexBuild.indexes,
-		plannerIndexPaths:   indexBuild.paths,
-		plannerIndexSpans:   indexBuild.spans,
-		plannerIndexStrings: indexBuild.arena,
-		statistics:          statisticsCatalog,
-		indexLineage:        indexLineage,
-		shardLineage:        shardLineage,
-		planSeed:            maphash.MakeSeed(),
+		config:                         cloned,
+		endpoints:                      cloneEndpoints(endpoints),
+		generation:                     generation,
+		planner:                        planner,
+		plannerIndexes:                 indexBuild.indexes,
+		plannerIndexPaths:              indexBuild.paths,
+		plannerIndexRelations:          indexBuild.relations,
+		plannerGlobalIndexPrograms:     indexBuild.globalPrograms,
+		plannerGlobalIndexPointers:     indexBuild.globalPointers,
+		plannerGlobalPointerExtraBytes: indexBuild.globalPointerExtraBytes,
+		plannerIndexSpans:              indexBuild.spans,
+		plannerIndexStrings:            indexBuild.arena,
+		statistics:                     statisticsCatalog,
+		indexLineage:                   indexLineage,
+		shardLineage:                   shardLineage,
+		planSeed:                       maphash.MakeSeed(),
 	}
 	return snapshot, nil
 }
@@ -657,13 +665,15 @@ type persistedPlacement struct {
 }
 
 type persistedIndex struct {
-	IndexID     uint64         `json:"index_id"`
-	Incarnation uint64         `json:"incarnation"`
-	Table       string         `json:"table"`
-	Name        string         `json:"name"`
-	Paths       []string       `json:"paths"`
-	Flags       IndexFlags     `json:"flags"`
-	Lifecycle   IndexLifecycle `json:"lifecycle"`
+	IndexID      uint64         `json:"index_id"`
+	Incarnation  uint64         `json:"incarnation"`
+	Table        string         `json:"table"`
+	Name         string         `json:"name"`
+	Relation     string         `json:"relation,omitempty"`
+	Paths        []string       `json:"paths"`
+	LocatorPaths []string       `json:"locator_paths,omitempty"`
+	Flags        IndexFlags     `json:"flags"`
+	Lifecycle    IndexLifecycle `json:"lifecycle"`
 }
 
 type persistedManifest struct {
@@ -725,9 +735,16 @@ func toPersisted(s *Snapshot) persistedCatalog {
 			metadata := s.indexMetadata(table, span.first+i)
 			paths := make([]string, metadata.PathCount)
 			copy(paths, metadata.Paths[:metadata.PathCount])
+			locators := make([]string, metadata.LocatorCount)
+			copy(locators, metadata.LocatorPaths[:metadata.LocatorCount])
+			relation := ""
+			if metadata.Global() {
+				relation = metadata.Relation
+			}
 			pc.Indexes = append(pc.Indexes, persistedIndex{
 				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
-				Table: metadata.Table, Name: metadata.Name, Paths: paths,
+				Table: metadata.Table, Name: metadata.Name, Relation: relation,
+				Paths: paths, LocatorPaths: locators,
 				Flags: metadata.Flags, Lifecycle: metadata.Lifecycle,
 			})
 		}
@@ -1212,7 +1229,8 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 		index := &pc.Indexes[i]
 		indexes[i] = IndexDescriptor{
 			IndexID: index.IndexID, Incarnation: index.Incarnation,
-			Table: index.Table, Name: index.Name, Paths: slices.Clone(index.Paths),
+			Table: index.Table, Name: index.Name, Relation: index.Relation,
+			Paths: slices.Clone(index.Paths), LocatorPaths: slices.Clone(index.LocatorPaths),
 			Flags: index.Flags, Lifecycle: index.Lifecycle,
 		}
 	}

@@ -199,6 +199,10 @@ or replica reconfiguration protocol.
   mutation: `ExecBatch` is a bounded fixed-participant atomic batch, while a
   scattered `INSERT ... VALUES`, scatter `UPDATE`/`DELETE`, and `INSERT ...
   SELECT` remain refused;
+- foreground global-index maintenance and uniqueness claims, index lookup plus
+  owner-grouped base fetch, and online build/catch-up workers; the catalog and
+  zero-allocation byte-native key/locator routing foundation exist, but are not
+  yet a serving access path;
 - distributed backup, restore, PITR, or disaster-recovery orchestration; and
 - a release-scale or 100 TB qualification claim.
 

@@ -84,19 +84,10 @@ func (s *Snapshot) indexMetadataForLineage(ref plannerIndexLineageRef) IndexMeta
 func (s *Snapshot) indexMetadataForOrdinal(ordinal uint32) IndexMetadata {
 	entry := s.plannerIndexes[ordinal]
 	table := s.config.Placements[entry.placement].Table
-	pathCount := entry.pathCount()
-	metadata := IndexMetadata{
-		IndexID: entry.indexID, Incarnation: entry.incarnation,
-		Table: table, Name: s.indexName(entry.name), PathCount: pathCount,
-		Flags: entry.flags(), Lifecycle: entry.lifecycle(),
-	}
-	for i := uint8(0); i < pathCount; i++ {
-		metadata.Paths[i] = s.indexString(s.plannerIndexPaths[entry.pathBase+uint32(i)])
-	}
-	return metadata
+	return s.indexMetadata(table, ordinal)
 }
 
-const plannerIndexDefinitionMask = plannerIndexFlagsMask | plannerIndexPathCountMask
+const plannerIndexDefinitionMask = plannerIndexFlagsMask | plannerIndexPathCountMask | plannerIndexLocatorCountMask
 
 func samePlannerIndexLogicalIdentity(
 	aSnapshot *Snapshot,
@@ -110,17 +101,19 @@ func samePlannerIndexLogicalIdentity(
 }
 
 func samePlannerIndexDefinition(
-	aSnapshot *Snapshot,
+	aSnapshot *Snapshot, aOrdinal uint32,
 	a plannerIndex,
-	bSnapshot *Snapshot,
+	bSnapshot *Snapshot, bOrdinal uint32,
 	b plannerIndex,
 ) bool {
 	if a.properties()&plannerIndexDefinitionMask !=
 		b.properties()&plannerIndexDefinitionMask ||
-		!samePlannerIndexLogicalIdentity(aSnapshot, a, bSnapshot, b) {
+		!samePlannerIndexLogicalIdentity(aSnapshot, a, bSnapshot, b) ||
+		aSnapshot.indexRelation(aSnapshot.config.Placements[a.placement].Table, aOrdinal, a) !=
+			bSnapshot.indexRelation(bSnapshot.config.Placements[b.placement].Table, bOrdinal, b) {
 		return false
 	}
-	pathCount := a.pathCount()
+	pathCount := a.pathCount() + a.locatorCount()
 	for i := uint8(0); i < pathCount; i++ {
 		if aSnapshot.indexString(aSnapshot.plannerIndexPaths[a.pathBase+uint32(i)]) !=
 			bSnapshot.indexString(bSnapshot.plannerIndexPaths[b.pathBase+uint32(i)]) {
@@ -205,21 +198,25 @@ func snapshotWithCatalogLineage(
 	shardHighWaters []distribution.ShardAllocationGeneration,
 ) *Snapshot {
 	out := &Snapshot{
-		config:                    snapshot.config,
-		endpoints:                 snapshot.endpoints,
-		generation:                snapshot.generation,
-		planner:                   snapshot.planner,
-		plannerIndexes:            snapshot.plannerIndexes,
-		plannerIndexPaths:         snapshot.plannerIndexPaths,
-		plannerIndexSpans:         snapshot.plannerIndexSpans,
-		plannerIndexStrings:       snapshot.plannerIndexStrings,
-		statistics:                snapshot.statistics,
-		indexLineage:              snapshot.indexLineage,
-		shardLineage:              snapshot.shardLineage,
-		indexIDHighWater:          indexHighWater,
-		shardGenerationHighWaters: slices.Clone(shardHighWaters),
-		catalogLineagePresent:     true,
-		planSeed:                  snapshot.planSeed,
+		config:                         snapshot.config,
+		endpoints:                      snapshot.endpoints,
+		generation:                     snapshot.generation,
+		planner:                        snapshot.planner,
+		plannerIndexes:                 snapshot.plannerIndexes,
+		plannerIndexPaths:              snapshot.plannerIndexPaths,
+		plannerIndexRelations:          snapshot.plannerIndexRelations,
+		plannerGlobalIndexPrograms:     snapshot.plannerGlobalIndexPrograms,
+		plannerGlobalIndexPointers:     snapshot.plannerGlobalIndexPointers,
+		plannerGlobalPointerExtraBytes: snapshot.plannerGlobalPointerExtraBytes,
+		plannerIndexSpans:              snapshot.plannerIndexSpans,
+		plannerIndexStrings:            snapshot.plannerIndexStrings,
+		statistics:                     snapshot.statistics,
+		indexLineage:                   snapshot.indexLineage,
+		shardLineage:                   snapshot.shardLineage,
+		indexIDHighWater:               indexHighWater,
+		shardGenerationHighWaters:      slices.Clone(shardHighWaters),
+		catalogLineagePresent:          true,
+		planSeed:                       snapshot.planSeed,
 	}
 	out.planCache.Store(snapshot.planCache.Load())
 	return out
@@ -295,7 +292,10 @@ func advanceIndexIDHighWater(current, next *Snapshot) (uint64, error) {
 		}
 		switch {
 		case active && nextEntry.incarnation == oldEntry.incarnation:
-			if !samePlannerIndexDefinition(current, oldEntry, next, nextEntry) ||
+			if !samePlannerIndexDefinition(
+				current, uint32(current.indexLineage[currentOrdinal]), oldEntry,
+				next, uint32(nextRef), nextEntry,
+			) ||
 				nextEntry.lifecycle() < oldEntry.lifecycle() {
 				return 0, &CatalogError{Reason: fmt.Sprintf(
 					"index %d changed definition or regressed lifecycle within one incarnation",

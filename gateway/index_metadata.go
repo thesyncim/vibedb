@@ -20,12 +20,13 @@ type IndexFlags uint8
 
 const (
 	IndexLocal IndexFlags = 1 << iota
+	IndexGlobal
 	IndexUnique
 	IndexCovering
 	IndexOrdered
 )
 
-const allIndexFlags = IndexLocal | IndexUnique | IndexCovering | IndexOrdered
+const allIndexFlags = IndexLocal | IndexGlobal | IndexUnique | IndexCovering | IndexOrdered
 
 // IndexLifecycle is the catalog-controlled publication state of an index
 // incarnation. Only Ready is eligible for ordinary planning; the other states
@@ -55,27 +56,40 @@ type IndexDescriptor struct {
 	Incarnation uint64
 	Table       string
 	Name        string
-	Paths       []string
-	Flags       IndexFlags
-	Lifecycle   IndexLifecycle
+	// Relation names the independently placed hidden relation that stores a
+	// global index. Local indexes leave it empty and live with Table.
+	Relation string
+	Paths    []string
+	// LocatorPaths identify the base row carried by a global entry. They must
+	// include every base placement path so locators can be grouped by owner.
+	LocatorPaths []string
+	Flags        IndexFlags
+	Lifecycle    IndexLifecycle
 }
 
 // IndexMetadata is the allocation-free public view of one compact descriptor.
 // Only the first PathCount entries of Paths are populated. The strings are
 // immutable views into the snapshot's single index string arena.
 type IndexMetadata struct {
-	IndexID     uint64
-	Incarnation uint64
-	Table       string
-	Name        string
-	Paths       [4]string
-	PathCount   uint8
-	Flags       IndexFlags
-	Lifecycle   IndexLifecycle
+	IndexID      uint64
+	Incarnation  uint64
+	Table        string
+	Name         string
+	Relation     string
+	Paths        [4]string
+	PathCount    uint8
+	LocatorPaths [distribution.KeyspaceWidth]string
+	LocatorCount uint8
+	Flags        IndexFlags
+	Lifecycle    IndexLifecycle
 }
 
 // Ready reports whether this exact incarnation is eligible for planning.
 func (m IndexMetadata) Ready() bool { return m.Lifecycle == IndexReady }
+
+// Global reports whether the index is stored in its independently sharded
+// Relation rather than inside each base-table shard.
+func (m IndexMetadata) Global() bool { return m.Flags&IndexGlobal != 0 }
 
 type plannerStringRef struct {
 	offset uint32
@@ -108,11 +122,13 @@ type plannerIndex struct {
 }
 
 const (
-	plannerIndexFlagsMask      = uint16((1 << 4) - 1)
-	plannerIndexLifecycleShift = 4
-	plannerIndexLifecycleMask  = uint16((1<<3)-1) << plannerIndexLifecycleShift
-	plannerIndexPathCountShift = 7
-	plannerIndexPathCountMask  = uint16((1<<3)-1) << plannerIndexPathCountShift
+	plannerIndexFlagsMask         = uint16((1 << 5) - 1)
+	plannerIndexLifecycleShift    = 5
+	plannerIndexLifecycleMask     = uint16((1<<3)-1) << plannerIndexLifecycleShift
+	plannerIndexPathCountShift    = 8
+	plannerIndexPathCountMask     = uint16((1<<3)-1) << plannerIndexPathCountShift
+	plannerIndexLocatorCountShift = 11
+	plannerIndexLocatorCountMask  = uint16((1<<4)-1) << plannerIndexLocatorCountShift
 )
 
 func newPlannerIndex(
@@ -121,11 +137,12 @@ func newPlannerIndex(
 	pathBase, placement uint32,
 	flags IndexFlags,
 	lifecycle IndexLifecycle,
-	pathCount uint8,
+	pathCount, locatorCount uint8,
 ) plannerIndex {
 	properties := uint16(flags) |
 		uint16(lifecycle)<<plannerIndexLifecycleShift |
-		uint16(pathCount)<<plannerIndexPathCountShift
+		uint16(pathCount)<<plannerIndexPathCountShift |
+		uint16(locatorCount)<<plannerIndexLocatorCountShift
 	return plannerIndex{
 		indexID: indexID, incarnation: incarnation,
 		name: plannerIndexNameRef{
@@ -151,6 +168,10 @@ func (p plannerIndex) lifecycle() IndexLifecycle {
 
 func (p plannerIndex) pathCount() uint8 {
 	return uint8((p.properties() & plannerIndexPathCountMask) >> plannerIndexPathCountShift)
+}
+
+func (p plannerIndex) locatorCount() uint8 {
+	return uint8((p.properties() & plannerIndexLocatorCountMask) >> plannerIndexLocatorCountShift)
 }
 
 const plannerIndexBytes = unsafe.Sizeof(plannerIndex{})
@@ -256,6 +277,10 @@ func (s *Snapshot) PlannerIndexMetadataBytes() uint64 {
 	}
 	return uint64(cap(s.plannerIndexes))*uint64(unsafe.Sizeof(plannerIndex{})) +
 		uint64(cap(s.plannerIndexPaths))*uint64(unsafe.Sizeof(plannerStringRef{})) +
+		uint64(cap(s.plannerIndexRelations))*uint64(unsafe.Sizeof(uint32(0))) +
+		uint64(cap(s.plannerGlobalIndexPrograms))*uint64(unsafe.Sizeof(plannerGlobalIndexProgram{})) +
+		uint64(cap(s.plannerGlobalIndexPointers))*uint64(unsafe.Sizeof(vibejson.CompiledPointer{})) +
+		s.plannerGlobalPointerExtraBytes +
 		uint64(cap(s.plannerIndexSpans))*uint64(unsafe.Sizeof(plannerIndexSpan{})) +
 		uint64(len(s.plannerIndexStrings))
 }
@@ -288,28 +313,62 @@ func (s *Snapshot) indexName(ref plannerIndexNameRef) string {
 
 func (s *Snapshot) indexMetadata(table string, ordinal uint32) IndexMetadata {
 	entry := s.plannerIndexes[ordinal]
-	return s.indexMetadataFromEntry(table, entry)
+	return s.indexMetadataFromEntry(table, ordinal, entry)
 }
 
-func (s *Snapshot) indexMetadataFromEntry(table string, entry plannerIndex) IndexMetadata {
+func (s *Snapshot) indexMetadataFromEntry(table string, ordinal uint32, entry plannerIndex) IndexMetadata {
 	pathCount := entry.pathCount()
+	locatorCount := entry.locatorCount()
 	metadata := IndexMetadata{
 		IndexID: entry.indexID, Incarnation: entry.incarnation,
-		Table: table, Name: s.indexName(entry.name), PathCount: pathCount,
+		Table: table, Name: s.indexName(entry.name),
+		Relation:  s.indexRelation(table, ordinal, entry),
+		PathCount: pathCount, LocatorCount: locatorCount,
 		Flags: entry.flags(), Lifecycle: entry.lifecycle(),
 	}
 	for i := uint8(0); i < pathCount; i++ {
 		metadata.Paths[i] = s.indexString(s.plannerIndexPaths[entry.pathBase+uint32(i)])
 	}
+	locatorBase := entry.pathBase + uint32(pathCount)
+	for i := uint8(0); i < locatorCount; i++ {
+		metadata.LocatorPaths[i] = s.indexString(s.plannerIndexPaths[locatorBase+uint32(i)])
+	}
 	return metadata
 }
 
-type plannerIndexBuild struct {
-	indexes []plannerIndex
-	paths   []plannerStringRef
-	spans   []plannerIndexSpan
-	arena   string
+func (s *Snapshot) indexRelation(table string, ordinal uint32, entry plannerIndex) string {
+	if entry.flags()&IndexGlobal == 0 {
+		return table
+	}
+	return s.config.Placements[s.plannerIndexRelations[ordinal]].Table
 }
+
+type plannerIndexBuild struct {
+	indexes                 []plannerIndex
+	paths                   []plannerStringRef
+	relations               []uint32
+	globalPrograms          []plannerGlobalIndexProgram
+	globalPointers          []vibejson.CompiledPointer
+	globalPointerExtraBytes uint64
+	globalPointerRefs       []plannerStringRef
+	spans                   []plannerIndexSpan
+	arena                   string
+}
+
+type plannerGlobalIndexProgram struct {
+	ordinal      uint32
+	pointerBase  uint32
+	keyCount     uint8
+	locatorCount uint8
+	_            uint16
+}
+
+const plannerGlobalIndexProgramBytes = unsafe.Sizeof(plannerGlobalIndexProgram{})
+
+var (
+	_ [12 - plannerGlobalIndexProgramBytes]byte
+	_ [plannerGlobalIndexProgramBytes - 12]byte
+)
 
 func validateCompactPlannerDimensions(config distribution.ClusterConfig) error {
 	for kind, count := range map[string]int{
@@ -352,11 +411,18 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 	}
 
 	placements := make(map[string]distribution.TablePlacement, len(config.Placements))
+	placementOrdinals := make(map[string]uint32, len(config.Placements))
 	for i := range config.Placements {
 		placements[config.Placements[i].Table] = config.Placements[i]
+		placementOrdinals[config.Placements[i].Table] = uint32(i)
+	}
+	specs := make(map[distribution.DistributionName]distribution.DistributionSpec, len(config.Distributions))
+	for i := range config.Distributions {
+		specs[config.Distributions[i].Name] = config.Distributions[i]
 	}
 	ids := make(map[uint64]string, len(descriptors))
 	names := make(map[string]struct{}, len(descriptors))
+	globalRelations := make(map[string]string, len(descriptors))
 	pathCount := uint64(0)
 	for i := range descriptors {
 		d := &descriptors[i]
@@ -388,13 +454,10 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		if d.Flags&^allIndexFlags != 0 {
 			return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("unknown flags %#x", d.Flags&^allIndexFlags))
 		}
-		if d.Flags&IndexUnique != 0 && d.Flags&IndexLocal == 0 {
+		locality := d.Flags & (IndexLocal | IndexGlobal)
+		if locality != IndexLocal && locality != IndexGlobal {
 			return plannerIndexBuild{}, indexCatalogError(d,
-				"global uniqueness is not certified; a unique index must be local")
-		}
-		if d.Flags&IndexLocal == 0 {
-			return plannerIndexBuild{}, indexCatalogError(d,
-				"only shard-local indexes are supported")
+				"exactly one of local or global must be set")
 		}
 		if !d.Lifecycle.valid() {
 			return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("invalid lifecycle %d", d.Lifecycle))
@@ -402,7 +465,51 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		if len(d.Paths) < 1 || len(d.Paths) > 4 {
 			return plannerIndexBuild{}, indexCatalogError(d, "path count must be in [1,4]")
 		}
-		pathCount += uint64(len(d.Paths))
+		if locality == IndexLocal {
+			if d.Relation != "" {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"local index must not name a separate relation")
+			}
+			if len(d.LocatorPaths) != 0 {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"local index must not carry base locator paths")
+			}
+		} else {
+			if err := validateIndexCatalogName("relation", d.Relation); err != nil {
+				return plannerIndexBuild{}, indexCatalogError(d, err.Error())
+			}
+			relationPlacement, exists := placements[d.Relation]
+			if !exists {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"global index relation has no placement")
+			}
+			if d.Relation == d.Table {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"global index relation aliases its base table")
+			}
+			if owner, exists := globalRelations[d.Relation]; exists {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					fmt.Sprintf("global index relation is already owned by %s", owner))
+			}
+			globalRelations[d.Relation] = d.Table + "." + d.Name
+			relationSpec := specs[relationPlacement.Distribution]
+			if relationSpec.Arity != len(d.Paths) {
+				return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf(
+					"global relation placement arity %d does not match index key arity %d",
+					relationSpec.Arity, len(d.Paths)))
+			}
+			if len(d.LocatorPaths) < 1 || len(d.LocatorPaths) > distribution.KeyspaceWidth {
+				return plannerIndexBuild{}, indexCatalogError(d,
+					"global locator path count must be in [1,8]")
+			}
+			for _, shardPath := range placement.Columns {
+				if !slices.Contains(d.LocatorPaths, shardPath) {
+					return plannerIndexBuild{}, indexCatalogError(d,
+						fmt.Sprintf("global locator does not contain base shard-key path %q", shardPath))
+				}
+			}
+		}
+		pathCount += uint64(len(d.Paths) + len(d.LocatorPaths))
 		if pathCount > uint64(math.MaxUint32) {
 			return plannerIndexBuild{}, indexCatalogError(d, "path count exceeds compact catalog capacity")
 		}
@@ -416,6 +523,19 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 			for prior := range pathIndex {
 				if d.Paths[prior] == path {
 					return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("path %q is repeated", path))
+				}
+			}
+		}
+		for pathIndex, path := range d.LocatorPaths {
+			if !utf8.ValidString(path) {
+				return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("locator path %d is not valid UTF-8", pathIndex))
+			}
+			if _, err := vibejson.CompilePointer(path); err != nil {
+				return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("locator path %d %q is invalid: %v", pathIndex, path, err))
+			}
+			for prior := range pathIndex {
+				if d.LocatorPaths[prior] == path {
+					return plannerIndexBuild{}, indexCatalogError(d, fmt.Sprintf("locator path %q is repeated", path))
 				}
 			}
 		}
@@ -469,6 +589,9 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		paths:   make([]plannerStringRef, pathCountInt),
 		spans:   make([]plannerIndexSpan, len(planner)),
 	}
+	if len(globalRelations) != 0 {
+		build.relations = make([]uint32, len(ordered))
+	}
 	tableOrdinals := make(map[string]uint32, len(planner))
 	for i := range planner {
 		tableOrdinals[config.Placements[planner[i].placement].Table] = uint32(i)
@@ -484,7 +607,7 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		entry := newPlannerIndex(
 			d.IndexID, d.Incarnation, name, pathBase,
 			planner[tableOrdinal].placement,
-			d.Flags, d.Lifecycle, uint8(len(d.Paths)),
+			d.Flags, d.Lifecycle, uint8(len(d.Paths)), uint8(len(d.LocatorPaths)),
 		)
 		for _, path := range d.Paths {
 			ref, err := intern(path)
@@ -494,7 +617,25 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 			build.paths[pathBase] = ref
 			pathBase++
 		}
+		for _, path := range d.LocatorPaths {
+			ref, err := intern(path)
+			if err != nil {
+				return plannerIndexBuild{}, err
+			}
+			build.paths[pathBase] = ref
+			pathBase++
+		}
 		build.indexes[i] = entry
+		if d.Flags&IndexGlobal != 0 {
+			build.relations[i] = placementOrdinals[d.Relation]
+			build.globalPrograms = append(build.globalPrograms, plannerGlobalIndexProgram{
+				ordinal: uint32(i), pointerBase: uint32(len(build.globalPointerRefs)),
+				keyCount: uint8(len(d.Paths)), locatorCount: uint8(len(d.LocatorPaths)),
+			})
+			build.globalPointerRefs = append(
+				build.globalPointerRefs, build.paths[entry.pathBase:pathBase]...,
+			)
+		}
 		span := &build.spans[tableOrdinal]
 		if span.count == 0 {
 			span.first = uint32(i)
@@ -502,7 +643,40 @@ func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTab
 		span.count++
 	}
 	build.arena = string(arenaBytes)
+	build.globalPointers = make([]vibejson.CompiledPointer, len(build.globalPointerRefs))
+	for i := range build.globalPointerRefs {
+		ref := build.globalPointerRefs[i]
+		path := build.arena[ref.offset : ref.offset+ref.length]
+		compiled, err := vibejson.CompilePointer(path)
+		if err != nil {
+			return plannerIndexBuild{}, &CatalogError{Reason: "compile retained index path: " + err.Error()}
+		}
+		build.globalPointers[i] = compiled
+		build.globalPointerExtraBytes += uint64(cap(compiled.Tokens)) *
+			uint64(unsafe.Sizeof(vibejson.CompiledPointerToken{}))
+		build.globalPointerExtraBytes += compiledPointerOwnedTextBytes(path, compiled)
+	}
+	build.globalPointerRefs = nil
 	return build, nil
+}
+
+func compiledPointerOwnedTextBytes(path string, compiled vibejson.CompiledPointer) uint64 {
+	if !strings.Contains(path, "~") {
+		return 0
+	}
+	var bytes uint64
+	start := 1
+	for i := range compiled.Tokens {
+		end := start
+		for end < len(path) && path[end] != '/' {
+			end++
+		}
+		if strings.Contains(path[start:end], "~") {
+			bytes += uint64(len(compiled.Tokens[i].Text))
+		}
+		start = end + 1
+	}
+	return bytes
 }
 
 func validateIndexCatalogName(kind, name string) error {
