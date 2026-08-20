@@ -141,7 +141,13 @@ virtual-bucket intervals. The shard journal keeps a cache-friendly sorted
 non-overlapping interval index: disjoint transactions may prepare concurrently,
 and scoped ordinary traffic waits only on an intersecting interval. An absent
 scope remains the fail-safe whole-shard form. The common read-timestamp contract
-is still pending. Its integration order is specified in
+has a leader-only bridge: multi-shard reads use leased,
+virtual-bucket-scoped raw-ID fences to form a coherent ephemeral vector cut.
+Fence acquisition is all-or-nothing with partial release and bounded retry, so
+it cannot deadlock against participants staged in a different shard order.
+Writers retain scoped gate admission through publication, while disjoint
+buckets continue. Replicated scalar MVCC/closed timestamps and historical reads
+remain pending; their integration order is specified in
 [Distributed system target](distributed-system.md).
 
 ## Latency and throughput

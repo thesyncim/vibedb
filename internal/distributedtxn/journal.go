@@ -578,6 +578,21 @@ func (j *Journal) WaitNoParticipantBarrier(
 	}
 }
 
+// ParticipantBarrierConflict is the non-blocking form used while assembling a
+// distributed read cut. A caller must first hold its shard-local read gate so a
+// participant cannot appear between this check and fence publication.
+func (j *Journal) ParticipantBarrierConflict(
+	bucketBits uint8,
+	access []IntentScope,
+) (bool, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return false, ErrJournalClosed
+	}
+	return j.scopeConflictLocked(bucketBits, access), nil
+}
+
 func (j *Journal) scopeConflictLocked(bucketBits uint8, access []IntentScope) bool {
 	if j.barriers == 0 {
 		return false

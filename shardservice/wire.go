@@ -46,10 +46,12 @@ const (
 	TransactionPrepareParticipant
 	TransactionScanCoordinator
 	TransactionReadParticipant
+	TransactionAcquireReadFence
+	TransactionReleaseReadFence
 )
 
 func (op TransactionOperation) valid() bool {
-	return op >= TransactionStageCoordinator && op <= TransactionReadParticipant
+	return op >= TransactionStageCoordinator && op <= TransactionReleaseReadFence
 }
 
 func (op TransactionOperation) stages() bool {
@@ -330,6 +332,9 @@ type ShardRequest struct {
 	// whole shard and remains fail-safe for direct clients.
 	BucketBits   uint8
 	AccessScopes []distributedtxn.IntentScope
+	// ReadFenceID authorizes a read against an active short-lived coherent-cut
+	// fence. It is absent on ordinary single-shard reads and every write.
+	ReadFenceID distributedtxn.ID
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
@@ -418,6 +423,9 @@ const (
 	// ErrorTransactionNotFound reports that the requested durable coordinator or
 	// participant role does not exist on this shard.
 	ErrorTransactionNotFound
+	// ErrorReadFenceBusy asks a coherent multi-shard reader to release any
+	// partial cut and retry after an intersecting writer or participant.
+	ErrorReadFenceBusy
 )
 
 // String renders the kind name for diagnostics.
@@ -453,13 +461,15 @@ func (k ErrorKind) String() string {
 		return "TransactionConflict"
 	case ErrorTransactionNotFound:
 		return "TransactionNotFound"
+	case ErrorReadFenceBusy:
+		return "ReadFenceBusy"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorTransactionNotFound }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorReadFenceBusy }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.

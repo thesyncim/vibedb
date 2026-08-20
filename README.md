@@ -327,7 +327,7 @@ available.
 | Server capability | Current state |
 | --- | --- |
 | Leader-only shard process | Available; one locally fenced store |
-| Stateless gateway | Available; generation-pinned read fan-out, single-shard fast writes, fixed-participant atomic write batches, and bounded durable coordinator redrive |
+| Stateless gateway | Available; scoped coherent read fan-out, single-shard fast writes, fixed-participant atomic write batches, and bounded durable coordinator redrive |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |
@@ -341,9 +341,11 @@ The tier is unreleased and unstable like the rest of VibeDB. The
 The implementation target keeps the gateway's explicitly routed fast path but
 adds replicated distributed transactions, snapshots, global indexes, query
 exchange, and online movement as opt-in costs when an operation crosses shards.
-Its analytical lane uses vectorized multi-stage execution, projection/data
-skipping, pushdown, and parallel replicas without imposing a MergeTree-style
-write path on transactional storage.
+Its analytical lane follows current ClickHouse-style vectorized multi-stage
+execution, exchanges, projection/data skipping, pushdown, and parallel replicas
+without imposing a MergeTree-style write path on transactional storage. CRDB's
+useful consensus/MVCC/closed-timestamp correctness properties inform replicated
+serving without putting distributed coordination on the routed fast path.
 Tenants route through many virtual buckets rather than being assigned to one
 physical shard. The target and its correctness/performance gates are specified
 in [Distributed system target](docs/design/distributed-system.md); the table

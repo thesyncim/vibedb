@@ -611,7 +611,7 @@ func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, 
 	case 1:
 		return e.single(ctx, pl.calls[0], p)
 	default:
-		return e.fanout(ctx, pl, p)
+		return e.snapshotFanout(ctx, pl, p)
 	}
 }
 

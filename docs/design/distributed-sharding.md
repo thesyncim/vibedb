@@ -19,7 +19,7 @@ shard.
 | `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol |
-| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, bounded read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, and periodic durable coordinator redrive |
+| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, and periodic durable coordinator redrive |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
 
@@ -105,6 +105,16 @@ transaction participants bind those intervals into their mutation digest, and
 the shard's sorted interval index blocks only overlapping traffic. Direct
 requests with no interval remain whole-shard scoped and therefore fail safe.
 
+A multi-shard query establishes an ephemeral coherent vector cut before reading:
+it acquires the same leased raw identity on every target, reads only while that
+identity and exact scope validate, then releases in parallel. A writer holds its
+scoped admission token through publication. Transaction staging turns that
+token into a durable participant barrier without an admission gap. If a writer
+or participant wins on any target, the gateway releases the partial cut and
+retries with a fresh identity, avoiding distributed lock cycles. Lease expiry
+is the crash cleanup, and a finite per-shard active-fence limit bounds abandoned
+scope storage. Single-shard reads bypass this bridge and retain one round trip.
+
 Currently executable distributed shapes include:
 
 - projection and filters that can be lowered for shard-local execution;
@@ -144,10 +154,10 @@ The distributed layer rejects a write before any network I/O:
 - `INSERT ... SELECT`, `TRUNCATE`, and every DDL statement; and
 - a `SELECT` submitted to the write operation.
 
-Reads still reject before dispatch:
+The read operation still rejects before dispatch:
 
 - every mutation and DDL statement;
-- cross-shard writes and transactions;
+- every write shape, which belongs to `Exec` or `ExecBatch`;
 - non-colocated, `RIGHT`, and `FULL` joins;
 - distributed `AVG`, grouped aggregation, `HAVING`, `DISTINCT`, windows, and
   `OFFSET`; and
@@ -161,9 +171,11 @@ execute it.
 ## Freshness and catalog changes
 
 The current shard service is leader-only, so a successful routed read is a
-read from the configured leader process. Session-position types are reserved,
-but the public gateway query/result path does not accept
-or return session positions, and the shard service refuses a minimum-position
+read from the configured leader process. A multi-shard result is protected from
+mixed visibility with the scoped vector fence above, but it is not yet a
+portable scalar MVCC timestamp and cannot be replayed later. Session-position
+types are reserved, but the public gateway query/result path does not accept or
+return session positions, and the shard service refuses a minimum-position
 request before SQL execution.
 
 Ordinary catalog publication validates monotonic catalog, routing, allocation,
@@ -181,9 +193,12 @@ or replica reconfiguration protocol.
 - runtime Raft snapshots, WAL compaction, dynamic membership, or snapshot
   transfer;
 - online split, merge, move, catch-up, or topology recovery;
-- cross-shard transactions or a common real-time distributed snapshot;
-- cross-shard or multi-shard writes: a scattered `INSERT ... VALUES`, a
-  scatter `UPDATE` or `DELETE`, an `INSERT ... SELECT`, and two-phase commit;
+- a replicated scalar MVCC/closed-timestamp snapshot or historical distributed
+  reads; the current leader-only vector fence is ephemeral;
+- arbitrary distributed SQL transaction sessions and single-statement scatter
+  mutation: `ExecBatch` is a bounded fixed-participant atomic batch, while a
+  scattered `INSERT ... VALUES`, scatter `UPDATE`/`DELETE`, and `INSERT ...
+  SELECT` remain refused;
 - distributed backup, restore, PITR, or disaster-recovery orchestration; and
 - a release-scale or 100 TB qualification claim.
 

@@ -33,6 +33,7 @@ const (
 	// leaving every ordinary frame byte-for-byte unchanged.
 	transactionMarker = 0xd7
 	accessScopeMarker = 0xd8
+	readFenceMarker   = 0xd9
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -573,6 +574,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
 		return errBadTransaction
 	}
+	if req.Transaction.Operation != TransactionNone && !req.ReadFenceID.IsZero() {
+		return errBadTransaction
+	}
 
 	var e encbuf
 	e.u8(wireVersion)
@@ -621,6 +625,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 			e.u32(req.AccessScopes[i].Start)
 			e.u32(req.AccessScopes[i].End)
 		}
+	}
+	if !req.ReadFenceID.IsZero() {
+		e.u8(readFenceMarker)
+		e.fixed16(req.ReadFenceID)
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
@@ -711,12 +719,22 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadTransaction
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == readFenceMarker {
+		d.u8()
+		req.ReadFenceID = distributedtxn.ID(d.fixed16())
+		if d.bad() || req.ReadFenceID.IsZero() {
+			return nil, errBadTransaction
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if req.Transaction.Operation != TransactionNone && !req.ReadFenceID.IsZero() {
+		return nil, errBadTransaction
 	}
 	if err := d.end(); err != nil {
 		return nil, err

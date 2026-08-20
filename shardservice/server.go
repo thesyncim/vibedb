@@ -48,6 +48,9 @@ const (
 	DefaultMaxResultRows        = query.DefaultResultRows
 	DefaultMaxResultBytes       = query.DefaultResultBytes
 	DefaultMaxIntermediateBytes = query.DefaultIntermediateBytes
+	// DefaultMaxReadFences bounds abandoned leased coherent cuts and their scope
+	// copies independently of the connection limit.
+	DefaultMaxReadFences = 4096
 
 	// UnlimitedConnections and UnlimitedResults are explicit opt-outs from the
 	// corresponding finite defaults; a negative timeout disables that deadline.
@@ -83,6 +86,9 @@ type Options struct {
 	// MaxIntermediateBytes bounds statement-wide subplan storage. Zero selects
 	// DefaultMaxIntermediateBytes; UnlimitedResults disables it.
 	MaxIntermediateBytes int64
+	// MaxReadFences bounds active leased coherent multi-shard read cuts. Zero
+	// selects DefaultMaxReadFences; unlike connections it cannot be unbounded.
+	MaxReadFences int
 
 	// OnError is called with every connection-terminating error, including the
 	// ordinary ones (a peer that closed its connection). It is the only logging
@@ -94,11 +100,12 @@ type Options struct {
 // A Server is a leader-only shard endpoint. It admits every request against one
 // static ownership identity and executes the admitted statement locally.
 type Server struct {
-	db        *sqldriver.Database
-	claim     *sqldriver.ShardStoreServingClaim
-	journal   *distributedtxn.Journal
-	ownership Ownership
-	opts      Options
+	db         *sqldriver.Database
+	claim      *sqldriver.ShardStoreServingClaim
+	journal    *distributedtxn.Journal
+	readFences *readFenceSet
+	ownership  Ownership
+	opts       Options
 
 	// baseCtx is the parent of every request context; cancel fires on Close so a
 	// graceful shutdown cancels in-flight executions rather than waiting them out.
@@ -143,6 +150,9 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxIntermediateBytes < UnlimitedResults {
 		return nil, fmt.Errorf("shardservice: MaxIntermediateBytes must be >= %d", UnlimitedResults)
 	}
+	if opts.MaxReadFences < 0 {
+		return nil, errors.New("shardservice: MaxReadFences must be nonnegative")
+	}
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = DefaultMaxConnections
 	}
@@ -170,6 +180,9 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxIntermediateBytes == 0 {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
+	if opts.MaxReadFences == 0 {
+		opts.MaxReadFences = DefaultMaxReadFences
+	}
 	// Claim first so an unbound, mismatched, or stale store retains its precise
 	// admission error. Opening the journal afterward may create hidden state;
 	// failure closes the claim and an equal-fence retry resumes safely.
@@ -193,16 +206,17 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		db:        db,
-		claim:     claim,
-		journal:   journal,
-		ownership: cfg,
-		opts:      opts,
-		baseCtx:   baseCtx,
-		cancel:    cancel,
-		conns:     map[net.Conn]struct{}{},
-		listeners: map[net.Listener]struct{}{},
-		closeDone: make(chan struct{}),
+		db:         db,
+		claim:      claim,
+		journal:    journal,
+		readFences: newReadFenceSet(opts.MaxReadFences),
+		ownership:  cfg,
+		opts:       opts,
+		baseCtx:    baseCtx,
+		cancel:     cancel,
+		conns:      map[net.Conn]struct{}{},
+		listeners:  map[net.Listener]struct{}{},
+		closeDone:  make(chan struct{}),
 	}, nil
 }
 
@@ -313,6 +327,7 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 
 	s.cancel()
+	s.readFences.close()
 	var err error
 	for _, l := range listeners {
 		if closeErr := l.Close(); closeErr != nil && err == nil {

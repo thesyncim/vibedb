@@ -359,7 +359,7 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
-		"BucketBits": true, "AccessScopes": true, "Transaction": true,
+		"BucketBits": true, "AccessScopes": true, "ReadFenceID": true, "Transaction": true,
 	})
 	assertNoPlanField(t, "ShardRequest", reqFields)
 

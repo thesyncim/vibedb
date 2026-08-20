@@ -75,11 +75,21 @@ barrier. A future row-key refinement can narrow hot buckets further without
 changing participant identity. Admission bounds active intents, participants,
 retained bytes, range count, and recovery work.
 
-Read-only fan-out pins one catalog generation and one read timestamp. Each
-participant waits until its applied/closed timestamp covers that cut. A
-read-write transaction additionally validates its read dependencies before the
-commit decision. Session vectors remain available for causal reads that do not
-require a cluster-wide snapshot.
+The current leader-only bridge gives read-only fan-out a coherent vector cut:
+the gateway acquires one leased raw-ID fence on every routed shard in parallel,
+executes the reads, and releases the cut. Fences and writers carry the same
+virtual-bucket scopes, so unrelated traffic proceeds. Acquisition is an
+all-or-nothing try/release loop; it cannot deadlock against a transaction that
+wins participant admission on another shard. An ordinary one-shard read never
+enters this protocol and remains one request/response.
+
+Replicated serving replaces that bridge with one certified read timestamp.
+Each participant waits until its applied/closed timestamp covers the cut, using
+the useful CRDB property—timestamped MVCC visibility backed by consensus—without
+putting a timestamp-oracle round trip on routed work. A read-write transaction
+additionally validates its read dependencies before the commit decision.
+Session vectors remain available for causal reads that do not require a
+cluster-wide snapshot.
 
 ## Indexes
 
@@ -116,8 +126,9 @@ foreground mutation path.
 
 ## Analytical lane
 
-The analytical lane borrows the strongest current ClickHouse ideas without
-turning foreground transactional storage into a MergeTree:
+The analytical lane follows current ClickHouse's multi-stage, exchange-aware,
+vectorized architecture—not the older model that forwards a complete query to
+each shard—without turning foreground transactional storage into a MergeTree:
 
 - scans produce fixed-capacity column vectors and retain raw document bytes for
   late materialization;
@@ -206,7 +217,8 @@ cluster does not fork into named protocol generations.
 2. Add virtual buckets and affinity groups without changing placement-scalar
    identity.
 3. Finish gateway transaction partitioning, recovery, scoped intents, and
-   timestamped reads.
+   coherent leader-only vector cuts; replace the read-fence bridge with
+   replicated MVCC/closed timestamps when serving Raft is wired.
 4. Add independently sharded global indexes, projections, data skipping, and
    online build.
 5. Add vectorized multi-stage exchange, pushdown, parallel hash joins, spill,

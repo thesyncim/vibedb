@@ -120,13 +120,54 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 	if req.Transaction.Operation != TransactionNone {
 		return c.transaction(req)
 	}
-	barrierCtx, barrierCancel := c.server.requestContext(req)
-	err := c.server.journal.WaitNoParticipantBarrier(
-		barrierCtx, req.BucketBits, req.AccessScopes,
-	)
-	barrierCancel()
-	if err != nil {
-		return classifyError(err)
+	if req.ExecutionMode == ExecutionReadWrite {
+		writeCtx, writeCancel := c.server.requestContext(req)
+		for {
+			if err := c.server.journal.WaitNoParticipantBarrier(
+				writeCtx, req.BucketBits, req.AccessScopes,
+			); err != nil {
+				writeCancel()
+				return classifyError(err)
+			}
+			writeToken, err := c.server.readFences.enterWrite(
+				writeCtx, req.BucketBits, req.AccessScopes,
+			)
+			if err != nil {
+				writeCancel()
+				return classifyError(err)
+			}
+			conflict, barrierErr := c.server.journal.ParticipantBarrierConflict(
+				req.BucketBits, req.AccessScopes,
+			)
+			if barrierErr != nil {
+				c.server.readFences.leaveWrite(writeToken)
+				writeCancel()
+				return classifyError(barrierErr)
+			}
+			if conflict {
+				c.server.readFences.leaveWrite(writeToken)
+				continue
+			}
+			defer writeCancel()
+			defer c.server.readFences.leaveWrite(writeToken)
+			break
+		}
+	} else {
+		barrierCtx, barrierCancel := c.server.requestContext(req)
+		err := c.server.journal.WaitNoParticipantBarrier(
+			barrierCtx, req.BucketBits, req.AccessScopes,
+		)
+		barrierCancel()
+		if err != nil {
+			return classifyError(err)
+		}
+	}
+	if !req.ReadFenceID.IsZero() {
+		if req.ExecutionMode != ExecutionReadOnly || !c.server.readFences.validate(
+			req.ReadFenceID, req.BucketBits, req.AccessScopes,
+		) {
+			return transactionError(distributedtxn.ErrJournalConflict)
+		}
 	}
 	return c.execute(req)
 }
@@ -137,7 +178,9 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 // transaction boundary; accepting them earlier would permit partial commit.
 func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	if req.SQL != "" || len(req.Params) != 0 || len(req.AccessScopes) != 0 || req.BucketBits != 0 {
+	allowAccess := tx.Operation == TransactionAcquireReadFence
+	if req.SQL != "" || len(req.Params) != 0 || (!allowAccess && len(req.AccessScopes) != 0) ||
+		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: a transaction command cannot also carry SQL or parameters")
 	}
@@ -154,6 +197,28 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		err    error
 	)
 	switch tx.Operation {
+	case TransactionAcquireReadFence:
+		if err := c.server.readFences.acquire(
+			tx.ID, req.Deadline, req.BucketBits, req.AccessScopes,
+		); err != nil {
+			return transactionError(err)
+		}
+		conflict, err := c.server.journal.ParticipantBarrierConflict(
+			req.BucketBits, req.AccessScopes,
+		)
+		if err != nil || conflict {
+			_ = c.server.readFences.release(tx.ID)
+			if err != nil {
+				return transactionError(err)
+			}
+			return transactionError(errReadFenceBusy)
+		}
+		return CompletionResponse(0)
+	case TransactionReleaseReadFence:
+		if err := c.server.readFences.release(tx.ID); err != nil {
+			return transactionError(err)
+		}
+		return CompletionResponse(0)
 	case TransactionStageCoordinator:
 		var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
 		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
@@ -182,6 +247,16 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			record.OwnershipEpoch != uint64(req.OwnershipEpoch) {
 			return transactionError(distributedtxn.ErrJournalConflict)
 		}
+		writeCtx, writeCancel := c.server.requestContext(req)
+		writeToken, waitErr := c.server.readFences.enterParticipant(
+			writeCtx, record.BucketBits, record.IntentScopes,
+		)
+		if waitErr != nil {
+			writeCancel()
+			return classifyError(waitErr)
+		}
+		defer writeCancel()
+		defer c.server.readFences.leaveParticipant(writeToken)
 		status, err = c.server.journal.StageParticipant(tx.Record)
 	case TransactionLookupCoordinator:
 		return c.lookupCoordinator(tx.ID)
@@ -489,6 +564,12 @@ func transactionError(err error) *ShardResponse {
 	}
 	if errors.Is(err, distributedtxn.ErrJournalNotFound) {
 		return NewErrorResponse(ErrorTransactionNotFound, err.Error())
+	}
+	if errors.Is(err, errReadFenceBusy) {
+		return NewErrorResponse(ErrorReadFenceBusy, err.Error())
+	}
+	if errors.Is(err, errReadFenceCapacity) {
+		return NewErrorResponse(ErrorResourceLimit, err.Error())
 	}
 	if errors.Is(err, distributedtxn.ErrJournalConflict) ||
 		errors.Is(err, distributedtxn.ErrJournalBusy) ||

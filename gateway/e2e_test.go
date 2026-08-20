@@ -412,6 +412,10 @@ func (c *e2eCluster) verifyDeleted(t *testing.T, key string) {
 // assertDialedOnly asserts every want address was dialed exactly once and no
 // other shard was contacted.
 func (c *e2eCluster) assertDialedOnly(t *testing.T, want ...string) {
+	c.assertDialedOnlyN(t, 1, want...)
+}
+
+func (c *e2eCluster) assertDialedOnlyN(t *testing.T, count int, want ...string) {
 	t.Helper()
 	set := map[string]bool{}
 	for _, a := range want {
@@ -420,8 +424,8 @@ func (c *e2eCluster) assertDialedOnly(t *testing.T, want ...string) {
 	for _, s := range c.shards {
 		got := c.dialer.dialCount(s.address)
 		switch {
-		case set[s.address] && got != 1:
-			t.Fatalf("shard %s dialed %d times, want 1", s.id, got)
+		case set[s.address] && got != count:
+			t.Fatalf("shard %s dialed %d times, want %d", s.id, got, count)
 		case !set[s.address] && got != 0:
 			t.Fatalf("shard %s dialed %d times, want 0", s.id, got)
 		}
@@ -512,7 +516,11 @@ func TestE2EFanoutShapes(t *testing.T) {
 			if got := decodeInts(t, res.Rows); !equalInts(got, tc.wantRows) {
 				t.Fatalf("merged rows = %v, want %v", got, tc.wantRows)
 			}
-			c.assertDialedOnly(t, tc.wantDialed...)
+			if tc.wantShards == 1 {
+				c.assertDialedOnly(t, tc.wantDialed...)
+			} else {
+				c.assertDialedOnlyN(t, 3, tc.wantDialed...)
+			}
 		})
 	}
 }
@@ -1048,8 +1056,8 @@ func TestE2EScatterAggregateFinalization(t *testing.T) {
 	if got := decodeInts(t, result.Rows); !equalInts(got, []int64{8}) {
 		t.Fatalf("global COUNT = %v, want [8]", got)
 	}
-	if got := c.dialer.totalDials(); got != 4 {
-		t.Fatalf("total dials = %d, want one per shard", got)
+	if got := c.dialer.totalDials(); got != 12 {
+		t.Fatalf("total dials = %d, want acquire/query/release per shard", got)
 	}
 	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 ||
 		result.Planning.PhysicalAlternatives != 2 {

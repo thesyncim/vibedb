@@ -126,6 +126,7 @@ func TestRequestRoundTrip(t *testing.T) {
 				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
 				BucketBits:   20,
 				AccessScopes: []distributedtxn.IntentScope{{Start: 17, End: 18}, {Start: 99, End: 101}},
+				ReadFenceID:  testTransactionID(41),
 			},
 		},
 		{
@@ -188,6 +189,9 @@ func TestRequestRoundTrip(t *testing.T) {
 				got.Transaction.Revision != tc.req.Transaction.Revision ||
 				!bytes.Equal(got.Transaction.Record, tc.req.Transaction.Record) {
 				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.req.Transaction)
+			}
+			if got.ReadFenceID != tc.req.ReadFenceID {
+				t.Errorf("ReadFenceID = %x, want %x", got.ReadFenceID, tc.req.ReadFenceID)
 			}
 		})
 	}
@@ -630,6 +634,19 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				return EncodeRequest(io.Discard, &ShardRequest{Params: []Param{StringBytesParam([]byte{0xff})}})
 			},
 			want: errBadParam,
+		},
+		{
+			name: "read_fence_on_transaction_command",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					ReadFenceID: testTransactionID(70),
+					Transaction: TransactionRequest{
+						Operation: TransactionReleaseReadFence,
+						ID:        testTransactionID(71), Revision: 1,
+					},
+				})
+			},
+			want: errBadTransaction,
 		},
 		{
 			name: "row_arity_mismatch",

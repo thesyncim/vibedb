@@ -54,6 +54,9 @@ var (
 	ErrTransactionConflict = errors.New("gateway: distributed transaction state conflicts with durable state")
 	// ErrTransactionNotFound reports a missing coordinator or participant role.
 	ErrTransactionNotFound = errors.New("gateway: distributed transaction record was not found")
+	// ErrReadFenceBusy asks a coherent fan-out reader to drop a partial cut and
+	// retry after an intersecting write has crossed admission.
+	ErrReadFenceBusy = errors.New("gateway: coherent read fence intersects an admitted writer")
 )
 
 // ShardError is a typed failure a shard reported in an error frame. Kind is the
@@ -104,6 +107,8 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrTransactionConflict
 	case shardservice.ErrorTransactionNotFound:
 		return ErrTransactionNotFound
+	case shardservice.ErrorReadFenceBusy:
+		return ErrReadFenceBusy
 	default:
 		return ErrUnexpectedError
 	}

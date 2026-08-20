@@ -34,14 +34,16 @@
 // changes; routing integration requires a layout-provenance fence and certified
 // lineage translation rather than dropping or numerically comparing positions.
 //
-// The current package is leader-only. Its read path fans out and merges; its
-// write path keeps Exec as the single-statement/single-shard fast lane.
+// The current package is leader-only. A multi-shard read acquires short-lived,
+// virtual-bucket-scoped fences in parallel, reads one coherent vector cut, and
+// releases them; a single-shard read bypasses the fence protocol and remains
+// one round trip. Its write path keeps Exec as the single-statement/single-shard fast lane.
 // ExecBatch prepares every statement against one pinned generation and runs a
 // bounded fixed-participant transaction across tables and shards. Coordinator
 // and participant state is durable on shards; bounded scanning and redrive let
 // any gateway recover current-catalog coordinators. Virtual-bucket-scoped
-// intents allow disjoint traffic to proceed; finer row-key intents, replicated
-// serving, peer authentication, failover,
+// intents and read fences allow disjoint traffic to proceed; replicated scalar
+// timestamps, finer row-key intents, replicated serving, peer authentication, failover,
 // online movement, and a topology authority are not yet provided. The command
 // front end is loopback-only newline-delimited JSON, not pgwire.
 package gateway

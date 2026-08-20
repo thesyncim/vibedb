@@ -380,6 +380,28 @@ func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
 	stage := ownedRequest("")
 	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
 	exec(t, conn, stage)
+	disjointFenceID := testTransactionID(92)
+	disjointFence := ownedRequest("")
+	disjointFence.BucketBits = 8
+	disjointFence.AccessScopes = []distributedtxn.IntentScope{{Start: 20, End: 21}}
+	disjointFence.Transaction = TransactionRequest{
+		Operation: TransactionAcquireReadFence, ID: disjointFenceID, Revision: 1,
+	}
+	exec(t, conn, disjointFence)
+	disjointFence.AccessScopes = nil
+	disjointFence.BucketBits = 0
+	disjointFence.Transaction.Operation = TransactionReleaseReadFence
+	exec(t, conn, disjointFence)
+	overlappingFence := ownedRequest("")
+	overlappingFence.BucketBits = 8
+	overlappingFence.AccessScopes = scopes
+	overlappingFence.Transaction = TransactionRequest{
+		Operation: TransactionAcquireReadFence, ID: testTransactionID(93), Revision: 1,
+	}
+	if response := roundTrip(t, conn, overlappingFence); response.Kind != ResponseError ||
+		response.ErrorKind != ErrorReadFenceBusy {
+		t.Fatalf("fence over participant = %+v, want read-fence busy", response)
+	}
 
 	disjoint := ownedRequest(`SELECT n FROM docs WHERE id = ?`, StringParam("visible"))
 	disjoint.BucketBits = 8
@@ -427,6 +449,92 @@ func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
 		t.Fatal(err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("intersecting read did not resume after abort")
+	}
+}
+
+func TestCoherentReadFenceBlocksOnlyIntersectingWrites(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+	exec(t, conn, ownedRequest(
+		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+		StringParam("visible"), StringParam("row"), NumberParam("1"),
+	))
+	id := testTransactionID(121)
+	scope := []distributedtxn.IntentScope{{Start: 10, End: 11}}
+	acquire := ownedRequest("")
+	acquire.BucketBits = 8
+	acquire.AccessScopes = scope
+	acquire.Deadline = time.Second
+	acquire.Transaction = TransactionRequest{
+		Operation: TransactionAcquireReadFence, ID: id, Revision: 1,
+	}
+	exec(t, conn, acquire)
+
+	read := ownedRequest(`SELECT n FROM docs WHERE id = ?`, StringParam("visible"))
+	read.ExecutionMode = ExecutionReadOnly
+	read.BucketBits = 8
+	read.AccessScopes = scope
+	read.ReadFenceID = id
+	if response := exec(t, conn, read); response.Kind != ResponseRows || len(response.Rows) != 1 {
+		t.Fatalf("fenced read = %+v", response)
+	}
+	widened := ownedRequest(`SELECT n FROM docs`)
+	widened.ExecutionMode = ExecutionReadOnly
+	widened.ReadFenceID = id
+	if response := roundTrip(t, conn, widened); response.Kind != ResponseError ||
+		response.ErrorKind != ErrorTransactionConflict {
+		t.Fatalf("widened fenced read = %+v, want transaction conflict", response)
+	}
+
+	disjoint := ownedRequest(`UPDATE docs SET "$doc" = ? WHERE id = ?`,
+		DocumentParam(`{"id":"visible","name":"row","n":2}`), StringParam("visible"))
+	disjoint.BucketBits = 8
+	disjoint.AccessScopes = []distributedtxn.IntentScope{{Start: 20, End: 21}}
+	if response := exec(t, conn, disjoint); response.RowsAffected != 1 {
+		t.Fatalf("disjoint write = %+v", response)
+	}
+
+	blockedConn := dial(t, srv)
+	blocked := make(chan *ShardResponse, 1)
+	blockedErr := make(chan error, 1)
+	go func() {
+		request := ownedRequest(`UPDATE docs SET "$doc" = ? WHERE id = ?`,
+			DocumentParam(`{"id":"visible","name":"row","n":3}`), StringParam("visible"))
+		request.BucketBits = 8
+		request.AccessScopes = scope
+		if err := EncodeRequest(blockedConn, request); err != nil {
+			blockedErr <- err
+			return
+		}
+		response, err := DecodeResponse(blockedConn)
+		if err != nil {
+			blockedErr <- err
+			return
+		}
+		blocked <- response
+	}()
+	select {
+	case response := <-blocked:
+		t.Fatalf("intersecting write crossed fence: %+v", response)
+	case err := <-blockedErr:
+		t.Fatalf("intersecting write failed early: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	release := ownedRequest("")
+	release.Transaction = TransactionRequest{
+		Operation: TransactionReleaseReadFence, ID: id, Revision: 1,
+	}
+	exec(t, conn, release)
+	select {
+	case response := <-blocked:
+		if response.Kind != ResponseCompletion || response.RowsAffected != 1 {
+			t.Fatalf("released write = %+v", response)
+		}
+	case err := <-blockedErr:
+		t.Fatalf("released write failed: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("released fence did not wake intersecting write")
 	}
 }
 
@@ -726,6 +834,9 @@ func TestNewServerValidation(t *testing.T) {
 	if _, err := NewServer(db, testOwner(), Options{MaxConnections: -2}); err == nil {
 		t.Fatal("NewServer(MaxConnections=-2) = nil error")
 	}
+	if _, err := NewServer(db, testOwner(), Options{MaxReadFences: -1}); err == nil {
+		t.Fatal("NewServer(MaxReadFences=-1) = nil error")
+	}
 	srv, err := NewServer(db, testOwner(), Options{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -738,6 +849,10 @@ func TestNewServerValidation(t *testing.T) {
 	if srv.opts.MaxResultRows != DefaultMaxResultRows {
 		t.Fatalf("MaxResultRows default = %d, want %d",
 			srv.opts.MaxResultRows, DefaultMaxResultRows)
+	}
+	if srv.opts.MaxReadFences != DefaultMaxReadFences {
+		t.Fatalf("MaxReadFences default = %d, want %d",
+			srv.opts.MaxReadFences, DefaultMaxReadFences)
 	}
 }
 
