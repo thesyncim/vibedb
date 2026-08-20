@@ -52,8 +52,10 @@ var ErrStaleGeneration = errors.New("gateway: pinned catalog generation is stale
 
 // RefreshFunc obtains a catalog generation strictly newer than staleGen after a
 // shard reports the pinned generation is stale. It must return a snapshot whose
-// generation exceeds staleGen, or an error. A nil RefreshFunc re-reads the
-// executor's catalog holder.
+// generation exceeds staleGen, or an error. The executor validates and
+// publishes the result before leasing it, so refresh cannot bypass catalog
+// lineage or generation-drain fences. A nil RefreshFunc re-reads the executor's
+// catalog holder.
 type RefreshFunc func(ctx context.Context, staleGen uint64) (*Snapshot, error)
 
 // Options configure an [Executor]. The zero value is usable: the default
@@ -178,16 +180,19 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	var leases catalogLeaseSet
+	defer leases.release()
 
 	var staleGen uint64
 	for attempt := 0; ; attempt++ {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
-		snap, err := e.pin(opctx, attempt, staleGen)
+		snap, lease, err := e.pin(opctx, attempt, staleGen)
 		if err != nil {
 			return nil, err
 		}
+		leases.add(lease)
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
 			return nil, err
@@ -288,16 +293,19 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	var leases catalogLeaseSet
+	defer leases.release()
 
 	var staleGen uint64
 	for attempt := 0; ; attempt++ {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
-		snap, err := e.pin(opctx, attempt, staleGen)
+		snap, lease, err := e.pin(opctx, attempt, staleGen)
 		if err != nil {
 			return nil, err
 		}
+		leases.add(lease)
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
 			return nil, err
@@ -569,10 +577,11 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap, err := e.pin(ctx, 0, 0)
+	snap, lease, err := e.pin(ctx, 0, 0)
 	if err != nil {
 		return nil, err
 	}
+	defer lease.release()
 	prepared, err := snap.Prepare(ctx, q.SQL)
 	if err != nil {
 		return nil, err
@@ -673,29 +682,37 @@ func (e *Executor) profileFor(class OperationClass) Profile {
 // pin returns the generation the attempt routes against: the current generation
 // on the first attempt, or a strictly newer generation obtained by refresh on a
 // retry. A refresh that cannot produce a newer generation fails closed.
-func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snapshot, error) {
-	if attempt == 0 {
-		snap := e.catalog.Current()
-		if snap == nil {
-			return nil, ErrNoCatalog
-		}
-		return snap, nil
+func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snapshot, catalogLease, error) {
+	if e == nil || e.catalog == nil {
+		return nil, catalogLease{}, ErrNoCatalog
 	}
 	if e.refresh != nil {
-		snap, err := e.refresh(ctx, staleGen)
-		if err != nil {
-			return nil, err
+		if attempt > 0 {
+			snap, err := e.refresh(ctx, staleGen)
+			if err != nil {
+				return nil, catalogLease{}, err
+			}
+			if snap == nil || snap.Generation() <= staleGen {
+				return nil, catalogLease{}, ErrStaleGeneration
+			}
+			current := e.catalog.Current()
+			if current == nil || current.Generation() < snap.Generation() {
+				if err := e.catalog.publishNewerChecked(snap); err != nil &&
+					!errors.Is(err, ErrCatalogGenerationNotNewer) {
+					return nil, catalogLease{}, err
+				}
+			}
 		}
-		if snap == nil || snap.Generation() <= staleGen {
-			return nil, ErrStaleGeneration
-		}
-		return snap, nil
 	}
-	snap := e.catalog.Current()
-	if snap == nil || snap.Generation() <= staleGen {
-		return nil, ErrStaleGeneration
+	lease := e.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		return nil, catalogLease{}, ErrNoCatalog
 	}
-	return snap, nil
+	if attempt > 0 && lease.generation <= staleGen {
+		lease.release()
+		return nil, catalogLease{}, ErrStaleGeneration
+	}
+	return lease.snapshot, lease, nil
 }
 
 // isStaleErr reports whether err is a shard's refusal of the pinned generation:

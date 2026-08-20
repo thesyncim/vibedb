@@ -45,14 +45,43 @@ type GlobalIndexBackfillResult struct {
 	Complete bool
 }
 
-// PlanGlobalIndexBackfill returns one task per independently owned base shard.
+// PlanGlobalIndexBackfill waits for this gateway's older operations to drain,
+// then returns one task per independently owned base shard. A cluster schema
+// controller must obtain the same [CatalogHolder.WaitOlderDrained]
+// acknowledgement from every serving gateway before dispatching any task; the
+// local wait here prevents accidental unsafe use by a single-gateway caller.
+func (e *Executor) PlanGlobalIndexBackfill(
+	ctx context.Context,
+	table, index string,
+) ([]GlobalIndexBackfillTask, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if e == nil || e.catalog == nil {
+		return nil, ErrNoCatalog
+	}
+	lease := e.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		return nil, ErrNoCatalog
+	}
+	defer lease.release()
+	if _, err := e.catalog.WaitOlderDrained(ctx, lease.generation); err != nil {
+		return nil, err
+	}
+	return lease.snapshot.planGlobalIndexBackfill(table, index)
+}
+
+// planGlobalIndexBackfill returns one task per independently owned base shard.
 // Building and CatchingUp are writable but never readable; foreground writes
 // maintain them while these tasks fill the historical rows. The catalog
 // controller must first prove the Building generation is serving on every
 // gateway (and older write plans have drained), then publish Ready only after
 // every returned task reports Complete. This API is the bounded data plane,
 // not a substitute for that cluster-wide schema-change barrier.
-func (s *Snapshot) PlanGlobalIndexBackfill(
+func (s *Snapshot) planGlobalIndexBackfill(
 	table, index string,
 ) ([]GlobalIndexBackfillTask, error) {
 	program, err := s.compileGlobalIndex(table, index, false)
@@ -117,8 +146,13 @@ func (e *Executor) RunGlobalIndexBackfillTask(
 	if maxRows == 0 || maxBytes == 0 {
 		return nil, ErrIndexBackfillTask
 	}
-	snapshot := e.catalog.Current()
-	if snapshot == nil || snapshot.Generation() < task.Generation {
+	lease := e.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		return nil, ErrIndexBackfillTask
+	}
+	defer lease.release()
+	snapshot := lease.snapshot
+	if snapshot.Generation() < task.Generation {
 		return nil, ErrIndexBackfillTask
 	}
 	program, err := snapshot.compileGlobalIndex(task.Table, task.Index, false)

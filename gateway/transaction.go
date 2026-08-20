@@ -101,10 +101,11 @@ func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, err
 	profile := e.profileFor(class)
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	snapshot, err := e.pin(opctx, 0, 0)
+	snapshot, lease, err := e.pin(opctx, 0, 0)
 	if err != nil {
 		return nil, err
 	}
+	defer lease.release()
 	participants, err := e.planTransaction(opctx, snapshot, queries, profile)
 	if err != nil {
 		return nil, err

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -565,17 +567,26 @@ func cloneEndpoints(endpoints map[distribution.EndpointID]string) map[distributi
 }
 
 // CatalogHolder publishes immutable Snapshot generations for lock-free
-// concurrent reads. A reader always observes one whole generation — the old or
-// the new — never a mixed or partially published state, because each Snapshot is
-// immutable and only its pointer is swapped. It mirrors
-// distribution.ManifestHolder.
+// metadata reads and tracks the generations pinned by executor operations. A
+// reader always observes one whole generation — the old or the new — never a
+// mixed or partially published state. Publication and operational pinning share
+// one short lock so, after a generation is published, no new operation can pin
+// an older write plan. Per-row planning and execution remain lock-free.
 type CatalogHolder struct {
 	ptr atomic.Pointer[Snapshot]
+
+	leaseMu      sync.Mutex
+	activeLeases map[uint64]uint64
+	leaseChanged chan struct{}
+	leaseWaiters uint64
 }
 
 // NewCatalogHolder returns a holder seeded with initial, which may be nil.
 func NewCatalogHolder(initial *Snapshot) *CatalogHolder {
-	h := &CatalogHolder{}
+	h := &CatalogHolder{
+		activeLeases: make(map[uint64]uint64),
+		leaseChanged: make(chan struct{}),
+	}
 	if initial != nil {
 		snapshot, err := initialCatalogState(initial)
 		if err == nil {
@@ -607,29 +618,205 @@ func (h *CatalogHolder) publishNewerChecked(s *Snapshot) error {
 	if s == nil {
 		return &CatalogError{Reason: "next catalog snapshot is nil"}
 	}
-	for {
-		cur := h.ptr.Load()
-		if cur != nil && s.generation <= cur.generation {
-			return fmt.Errorf(
-				"%w: proposed=%d current=%d",
-				ErrCatalogGenerationNotNewer, s.generation, cur.generation,
-			)
-		}
-		next, err := advanceCatalogState(cur, s)
-		if err != nil {
-			return err
-		}
-		if h.ptr.CompareAndSwap(cur, next) {
-			return nil
-		}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	cur := h.ptr.Load()
+	if cur != nil && s.generation <= cur.generation {
+		return fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, s.generation, cur.generation,
+		)
 	}
+	next, err := advanceCatalogState(cur, s)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
 }
 
 // Current returns the most recently published Snapshot, or nil if none has been
-// published. The read path takes no lock; a caller pins one generation for a
-// whole operation by reading Current once.
+// published. It is a lock-free metadata-inspection API. Code that dispatches
+// shard work must acquire an operational lease through Executor so schema
+// generation drains can observe it.
 func (h *CatalogHolder) Current() *Snapshot {
 	return h.ptr.Load()
+}
+
+// catalogLease pins one immutable generation for an executor operation. A
+// stale-generation retry may hold more than one lease until the operation
+// returns; this deliberately makes a schema barrier wait for the whole old
+// operation, not merely its last network attempt.
+type catalogLease struct {
+	holder     *CatalogHolder
+	snapshot   *Snapshot
+	generation uint64
+	released   bool
+}
+
+// catalogLeaseSet keeps the ordinary initial attempt plus the default retry
+// budget inline. Only an explicitly oversized retry policy allocates overflow
+// storage. Query and Exec retain prior-attempt leases until return so a schema
+// drain fences the complete logical operation without allocating per attempt.
+type catalogLeaseSet struct {
+	inline   [4]catalogLease
+	overflow []catalogLease
+	count    int
+}
+
+func (s *catalogLeaseSet) add(lease catalogLease) {
+	if lease.holder == nil {
+		return
+	}
+	if s.count < len(s.inline) {
+		s.inline[s.count] = lease
+	} else {
+		s.overflow = append(s.overflow, lease)
+	}
+	s.count++
+}
+
+func (s *catalogLeaseSet) release() {
+	if s == nil {
+		return
+	}
+	for i := range s.overflow {
+		s.overflow[len(s.overflow)-1-i].release()
+	}
+	inlineCount := min(s.count, len(s.inline))
+	for i := 0; i < inlineCount; i++ {
+		s.inline[inlineCount-1-i].release()
+	}
+}
+
+// pinCurrent atomically observes and leases the current generation with
+// respect to publication. Once generation G is published, no later call can
+// acquire a lease below G.
+func (h *CatalogHolder) pinCurrent() catalogLease {
+	if h == nil {
+		return catalogLease{}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	snapshot := h.ptr.Load()
+	if snapshot == nil {
+		return catalogLease{}
+	}
+	generation := snapshot.Generation()
+	h.activeLeases[generation]++
+	return catalogLease{holder: h, snapshot: snapshot, generation: generation}
+}
+
+func (l *catalogLease) release() {
+	if l == nil || l.holder == nil || l.released {
+		return
+	}
+	l.released = true
+	h := l.holder
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	active := h.activeLeases[l.generation]
+	if active <= 1 {
+		delete(h.activeLeases, l.generation)
+	} else {
+		h.activeLeases[l.generation] = active - 1
+	}
+	h.signalLeaseChangeLocked()
+}
+
+func (h *CatalogHolder) initLeaseTrackerLocked() {
+	if h.activeLeases == nil {
+		h.activeLeases = make(map[uint64]uint64)
+	}
+	if h.leaseChanged == nil {
+		h.leaseChanged = make(chan struct{})
+	}
+}
+
+func (h *CatalogHolder) signalLeaseChangeLocked() {
+	h.initLeaseTrackerLocked()
+	if h.leaseWaiters == 0 {
+		return
+	}
+	close(h.leaseChanged)
+	h.leaseChanged = make(chan struct{})
+}
+
+// CatalogDrainStatus is the local serving process's catalog-generation fence
+// state. A cluster schema controller gathers one drained acknowledgement from
+// every serving gateway before starting a historical index scan.
+type CatalogDrainStatus struct {
+	CurrentGeneration      uint64
+	OldestActiveGeneration uint64
+	ActiveOlderOperations  uint64
+}
+
+// DrainStatus reports active operations older than generation without waiting.
+// OldestActiveGeneration is zero when there is no such operation.
+func (h *CatalogHolder) DrainStatus(generation uint64) CatalogDrainStatus {
+	if h == nil {
+		return CatalogDrainStatus{}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	return h.drainStatusLocked(generation)
+}
+
+func (h *CatalogHolder) drainStatusLocked(generation uint64) CatalogDrainStatus {
+	status := CatalogDrainStatus{}
+	if current := h.ptr.Load(); current != nil {
+		status.CurrentGeneration = current.Generation()
+	}
+	for activeGeneration, count := range h.activeLeases {
+		if activeGeneration >= generation || count == 0 {
+			continue
+		}
+		status.ActiveOlderOperations += count
+		if status.OldestActiveGeneration == 0 || activeGeneration < status.OldestActiveGeneration {
+			status.OldestActiveGeneration = activeGeneration
+		}
+	}
+	return status
+}
+
+// WaitOlderDrained waits until this serving process has published at least
+// generation and every operation pinned below it has returned. Publication and
+// pin acquisition use the same lock, so a successful return is a stable local
+// fence: a late operation cannot subsequently acquire an older plan.
+func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64) (CatalogDrainStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if h == nil || generation == 0 {
+		return CatalogDrainStatus{}, ErrStaleGeneration
+	}
+	for {
+		h.leaseMu.Lock()
+		h.initLeaseTrackerLocked()
+		status := h.drainStatusLocked(generation)
+		if status.CurrentGeneration >= generation && status.ActiveOlderOperations == 0 {
+			h.leaseMu.Unlock()
+			return status, nil
+		}
+		changed := h.leaseChanged
+		h.leaseWaiters++
+		h.leaseMu.Unlock()
+		var err error
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-changed:
+		}
+		h.leaseMu.Lock()
+		h.leaseWaiters--
+		h.leaseMu.Unlock()
+		if err != nil {
+			return status, err
+		}
+	}
 }
 
 // The on-disk catalog format. It is a versioned JSON document; keyspace points

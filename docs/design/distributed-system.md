@@ -109,13 +109,15 @@ transaction as the base mutation. A globally unique index is owned by the
 bucket containing its encoded unique key, which serializes conflicting claims
 without a cluster-wide lock.
 
-The current implementation slice compiles READY global-index key/locator
-programs with `vibejson` and expands an INSERT into base plus index participants
-inside the existing durable fixed-set transaction. Index entries use canonical
-binary tuple keys and compact JSON scalar-array locators, with one shard-local
-ID/incarnation marker instead of repeating that fence in every value. Lookup,
-owner-grouped base fetch, UPDATE/DELETE old-row capture, and online build remain
-gated work; until they land, a READY indexed UPDATE or DELETE fails closed.
+The current implementation compiles lifecycle-wide global-index key/locator
+programs with `vibejson`. INSERT, UPDATE, and DELETE maintain base and index
+participants in the same durable fixed-set transaction; UPDATE/DELETE capture
+canonical old documents and validate the exact selected primary set inside the
+serializable base participant. Index entries use canonical binary tuple keys
+and compact scalar-array locators, with one shard-local ID/incarnation marker
+instead of repeating that fence in every value. READY equality lookup is
+byte-native, groups locators by base owner, and fetches exact native primary
+keys rather than rescanning predicates.
 
 An online build has one monotone incarnation and the following catalog states:
 
@@ -123,10 +125,24 @@ An online build has one monotone incarnation and the following catalog states:
 BUILDING -> CATCHING_UP -> READY -> DRAINING
 ```
 
-Workers backfill disjoint snapshot ranges, consume the retained mutation stream
-from the snapshot cut, verify counts and digests by range, and only then publish
-`READY`. Plans pin index ID and incarnation. Retirement waits for the oldest
-pinned catalog generation before reclaiming storage.
+Foreground writes maintain BUILDING and CATCHING_UP incarnations but reads use
+only READY. Backfill workers scan disjoint base-shard primary ranges through a
+bounded exclusive native cursor. Every idempotent index PUT commits with a
+serializable digest check on the exact base document, so a concurrent
+UPDATE/DELETE either maintains the entry after the PUT or conflicts the page;
+the scanner cannot resurrect a stale entry. Tasks fence catalog generation,
+index ID/incarnation, base routing version, and allocation generation, and the
+controller checkpoints a cursor only after the page commits.
+
+Each executor operation holds a catalog-generation lease. Publication and
+lease acquisition share a short lock, which makes the local drain
+acknowledgement stable: after BUILDING is published no late operation can pin an
+older write plan. The build planner waits for that local drain automatically;
+the cluster controller must gather the same acknowledgement from every serving
+gateway before dispatching historical tasks, and publishes READY only after all
+tasks complete. Cluster-wide ack aggregation and checkpoint scheduling remain
+control-plane work. Retirement uses the same generation-drain primitive before
+reclaiming an old incarnation.
 
 Statistics are collected per bucket range and merged into bounded catalog
 sketches. Planning accounts for selectivity, covering width, base-fetch fanout,
@@ -222,19 +238,23 @@ cluster does not fork into named protocol generations.
 
 ## Delivery order and gates
 
-1. Preserve and benchmark the routed byte-native write/read lane.
-2. Add virtual buckets and affinity groups without changing placement-scalar
-   identity.
-3. Finish gateway transaction partitioning, recovery, scoped intents, and
-   coherent leader-only vector cuts; replace the read-fence bridge with
-   replicated MVCC/closed timestamps when serving Raft is wired.
-4. Add independently sharded global indexes, projections, data skipping, and
-   online build.
-5. Add vectorized multi-stage exchange, pushdown, parallel hash joins, spill,
-   and parallel replica scheduling.
-6. Wire the existing Raft foundation into serving, enable movement, and add
-   disaggregated immutable snapshot/cold-data caching.
-7. Add topology workflows, TLS/auth, backup/PITR, CDC, quotas, and upgrades.
+1. **Serving:** preserve and benchmark the routed byte-native write/read lane.
+2. **Serving:** add tenant-independent virtual buckets and affinity metadata
+   without changing placement-scalar identity.
+3. **Partly serving:** gateway transaction partitioning, durable recovery,
+   scoped intents, and coherent leader-only vector cuts are present; replicated
+   MVCC/closed timestamps replace the read-fence bridge when serving Raft is
+   wired.
+4. **In progress:** independently sharded global-index CRUD, exact lookup,
+   resumable online-build data plane, and local generation drains are present;
+   cluster-wide build orchestration, locator projections, and row-group data
+   skipping are next.
+5. **Pending:** vectorized multi-stage exchange, lazy materialization,
+   pushdown, parallel hash joins, spill, and parallel replica scheduling.
+6. **Pending:** wire the existing Raft foundation into serving, enable
+   movement, and add disaggregated immutable snapshot/cold-data caching.
+7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
+   upgrades.
 
 Every step requires deterministic encoding tests, crash/restart tests, stale
 catalog and ownership fences, bounded-memory tests, fault injection, race and

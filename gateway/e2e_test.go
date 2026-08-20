@@ -285,6 +285,15 @@ func (c *e2eCluster) snapshot(t *testing.T, gen uint64) *Snapshot {
 // buildSnapshot builds a snapshot generation, applying any per-shard epoch
 // override so a test can pin a generation whose ownership epoch is stale.
 func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribution.ShardID]distribution.OwnershipEpoch) *Snapshot {
+	return c.buildSnapshotAtVersion(t, gen, c.version, epochs)
+}
+
+func (c *e2eCluster) buildSnapshotAtVersion(
+	t *testing.T,
+	gen uint64,
+	version distribution.RoutingVersion,
+	epochs map[distribution.ShardID]distribution.OwnershipEpoch,
+) *Snapshot {
 	t.Helper()
 	manShards := make([]distribution.Shard, len(c.shards))
 	endpoints := make(map[distribution.EndpointID]string, len(c.shards))
@@ -299,7 +308,7 @@ func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribu
 		}
 		endpoints[s.endpoint] = s.address
 	}
-	man, err := distribution.NewManifest(c.dist, c.version, manShards)
+	man, err := distribution.NewManifest(c.dist, version, manShards)
 	if err != nil {
 		t.Fatalf("NewManifest: %v", err)
 	}
@@ -902,7 +911,7 @@ func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
 	}
 	c.verifyInserted(t, baseKey, 777)
 
-	tasks, err := snapshot.PlanGlobalIndexBackfill("messages", "by_n")
+	tasks, err := executor.PlanGlobalIndexBackfill(context.Background(), "messages", "by_n")
 	if err != nil || len(tasks) != len(c.shards) {
 		t.Fatalf("plan global backfill = %d tasks, %v", len(tasks), err)
 	}
@@ -1239,13 +1248,15 @@ func TestE2EWriteRefusalsBeforeDispatch(t *testing.T) {
 	c.verifyInserted(t, a.keys[0], 1)
 }
 
-// TestE2EWriteStaleEpochRetry proves a write whose pinned generation carries a
-// stale ownership epoch is retried exactly once, against a strictly newer
-// refreshed generation, mirroring the read path: the shard refuses the stale
-// epoch and the refreshed generation commits the statement.
+// TestE2EWriteStaleEpochRetry proves a write whose pinned generation carries
+// stale routing and ownership metadata is retried exactly once against a
+// strictly newer, valid catalog transition.
 func TestE2EWriteStaleEpochRetry(t *testing.T) {
 	c := newE2ECluster(t)
-	stale := c.buildSnapshot(t, 1, map[distribution.ShardID]distribution.OwnershipEpoch{c.shards[1].id: 99})
+	stale := c.buildSnapshotAtVersion(t, 1, c.version-1,
+		map[distribution.ShardID]distribution.OwnershipEpoch{
+			c.shards[1].id: c.shards[1].epoch - 1,
+		})
 	fresh := c.snapshot(t, 2)
 	holder := NewCatalogHolder(stale)
 
@@ -1426,14 +1437,15 @@ func TestE2EDeadlineCancelsOutstanding(t *testing.T) {
 	}
 }
 
-// TestE2EStaleEpochRefreshRetry proves a stale ownership epoch from one shard
-// triggers exactly one retry, only against a strictly newer refreshed
-// generation, and never mixes generations within an attempt.
+// TestE2EStaleEpochRefreshRetry proves stale routing and ownership metadata
+// triggers exactly one retry, only against a strictly newer valid catalog
+// transition, and never mixes generations within an attempt.
 func TestE2EStaleEpochRefreshRetry(t *testing.T) {
 	c := newE2ECluster(t)
 	// Generation 1 pins a stale epoch for s2 (live epoch is 12), so a scatter's
 	// s2 leg is refused; generation 2 carries the correct epochs.
-	stale := c.buildSnapshot(t, 1, map[distribution.ShardID]distribution.OwnershipEpoch{"s2": 99})
+	stale := c.buildSnapshotAtVersion(t, 1, c.version-1,
+		map[distribution.ShardID]distribution.OwnershipEpoch{"s2": c.shards[1].epoch - 1})
 	fresh := c.snapshot(t, 2)
 	holder := NewCatalogHolder(stale)
 

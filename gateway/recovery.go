@@ -42,10 +42,11 @@ func (e *Executor) RecoverTransaction(ctx context.Context, id distributedtxn.ID)
 	profile := e.profileFor(ClassAdmin)
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	snapshot, err := e.pin(opctx, 0, 0)
+	snapshot, lease, err := e.pin(opctx, 0, 0)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
+	defer lease.release()
 	coordinator, err := e.findRecoveryCoordinator(opctx, snapshot, id, profile)
 	if err != nil {
 		return RecoveryResult{}, err
@@ -362,10 +363,11 @@ func (e *Executor) RecoverAll(ctx context.Context) ([]RecoveryResult, error) {
 		ctx = context.Background()
 	}
 	profile := e.profileFor(ClassAdmin)
-	snapshot, err := e.pin(ctx, 0, 0)
+	snapshot, lease, err := e.pin(ctx, 0, 0)
 	if err != nil {
 		return nil, err
 	}
+	defer lease.release()
 	calls, err := transactionCatalogCalls(snapshot, profile)
 	if err != nil {
 		return nil, err

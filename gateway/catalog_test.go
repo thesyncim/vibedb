@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -903,6 +905,83 @@ func TestCatalogHolderPublishAndPin(t *testing.T) {
 	}
 	if h.Current().Generation() != 2 {
 		t.Fatalf("current generation regressed to %d, want 2", h.Current().Generation())
+	}
+}
+
+// TestCatalogHolderGenerationDrainFence proves publication closes the late-old
+// pin race and the schema barrier waits for an already pinned operation.
+func TestCatalogHolderGenerationDrainFence(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	old := h.pinCurrent()
+	if old.generation != 1 {
+		t.Fatalf("old lease = %+v, want generation 1", old)
+	}
+	if !h.PublishNewer(testSnapshot(t, 2)) {
+		t.Fatal("generation 2 publication was refused")
+	}
+	late := h.pinCurrent()
+	if late.generation != 2 {
+		t.Fatalf("late lease = %+v, want generation 2", late)
+	}
+	defer late.release()
+
+	status := h.DrainStatus(2)
+	if status.CurrentGeneration != 2 || status.OldestActiveGeneration != 1 ||
+		status.ActiveOlderOperations != 1 {
+		t.Fatalf("drain status = %+v, want current=2 oldest=1 active=1", status)
+	}
+	timeout, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := h.WaitOlderDrained(timeout, 2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitOlderDrained while pinned error = %v, want deadline", err)
+	}
+
+	old.release()
+	drained, err := h.WaitOlderDrained(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("WaitOlderDrained after release: %v", err)
+	}
+	if drained.CurrentGeneration != 2 || drained.OldestActiveGeneration != 0 ||
+		drained.ActiveOlderOperations != 0 {
+		t.Fatalf("drained status = %+v, want current=2 with no older operations", drained)
+	}
+}
+
+// TestCatalogHolderGenerationDrainWaitsForPublication proves a controller can
+// begin waiting before its catalog watcher publishes the requested generation.
+func TestCatalogHolderGenerationDrainWaitsForPublication(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.WaitOlderDrained(context.Background(), 2)
+		done <- err
+	}()
+	if !h.PublishNewer(testSnapshot(t, 2)) {
+		t.Fatal("generation 2 publication was refused")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitOlderDrained: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitOlderDrained did not observe publication")
+	}
+}
+
+// TestCatalogHolderLeaseSteadyStateAllocations keeps the request-level schema
+// fence honest: after holder construction and warmup, pin/release must not add
+// heap pressure to the routed lane when no schema controller is waiting.
+func TestCatalogHolderLeaseSteadyStateAllocations(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	warm := h.pinCurrent()
+	warm.release()
+	allocs := testing.AllocsPerRun(1000, func() {
+		lease := h.pinCurrent()
+		lease.release()
+	})
+	if allocs != 0 {
+		t.Fatalf("pin/release allocations = %g, want 0", allocs)
 	}
 }
 
