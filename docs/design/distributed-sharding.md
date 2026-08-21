@@ -146,8 +146,11 @@ not rebalancing: the returned manifest is not publishable until a separate data
 plane has transferred and installed the now-available certified snapshot
 artifact, applied the ordered mutation tail, closed the final source gap, and
 passed cutover validation. Artifact export is deterministic, bounded-memory,
-hash-chained, and checkpointed; destination staging/install and transport are
-not implemented here.
+hash-chained, and checkpointed. Non-serving destination files can now resume at
+an atomically persisted cursor, apply bounded local batches, and pass a full
+candidate-open proof without retaining a second artifact copy. Transport,
+learner publication, tail catch-up, and ownership cutover are not implemented
+here.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
@@ -243,14 +246,15 @@ reconfiguration protocol.
   failover;
 - serving follower/session reads or a coherent SQL read bound to the
   non-serving runtime's `ReadIndex` outcome;
-- runtime Raft snapshot publication/install, WAL compaction,
+- runtime Raft snapshot publication, WAL compaction,
   topology-authorized dynamic membership reconciliation, or snapshot transfer;
-  portable coherent artifact export/verification and context-free model-checked
-  configuration proposals are exposed only through the non-serving kernel;
-- destination snapshot staging/install, catch-up, and cutover execution for an
-  online split, merge, move, or topology recovery; bounded hot-bucket evidence,
-  desired split planning, and source artifact export do exist, but confer no
-  serving authority;
+  portable coherent artifact export, resumable non-serving staging/candidate
+  validation, and context-free model-checked configuration proposals are
+  exposed only through the non-serving kernel;
+- ordered catch-up and cutover execution for an online split, merge, move, or
+  topology recovery; bounded hot-bucket evidence, desired split planning,
+  source artifact export, and offline destination install do exist, but confer
+  no serving authority;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed
   reads; the current leader-only vector fence is ephemeral;
 - arbitrary distributed SQL transaction sessions and single-statement scatter

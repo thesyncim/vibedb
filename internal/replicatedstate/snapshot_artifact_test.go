@@ -90,7 +90,13 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 			})
 			return nil
 		},
-		Chunk: func(checkpoint SnapshotArtifactCheckpoint) error {
+		Chunk: func(checkpoint SnapshotArtifactCheckpoint, cursor *SnapshotArtifactCursor) error {
+			if cursor.Offset() != checkpoint.EndOffset ||
+				cursor.NextSequence() != checkpoint.Sequence+1 ||
+				cursor.PreviousDigest() != checkpoint.Digest {
+				t.Fatalf("checkpoint cursor = offset %d sequence %d digest %x, checkpoint %+v",
+					cursor.Offset(), cursor.NextSequence(), cursor.PreviousDigest(), checkpoint)
+			}
 			checkpoints = append(checkpoints, checkpoint)
 			return nil
 		},
@@ -227,7 +233,7 @@ func TestSnapshotArtifactDoesNotFragmentRowAboveTarget(t *testing.T) {
 	artifact, _ := writeSnapshotArtifactFixture(t, snapshot)
 	userChunks := 0
 	if _, err := VerifySnapshotArtifact(bytes.NewReader(artifact), SnapshotArtifactCallbacks{
-		Chunk: func(checkpoint SnapshotArtifactCheckpoint) error {
+		Chunk: func(checkpoint SnapshotArtifactCheckpoint, _ *SnapshotArtifactCursor) error {
 			if checkpoint.Collection == SnapshotArtifactUser {
 				userChunks++
 				if checkpoint.Rows != 1 || checkpoint.PayloadBytes <= MinSnapshotArtifactChunkBytes {
@@ -241,6 +247,101 @@ func TestSnapshotArtifactDoesNotFragmentRowAboveTarget(t *testing.T) {
 	}
 	if userChunks != 1 {
 		t.Fatalf("user chunks = %d, want 1", userChunks)
+	}
+}
+
+func TestSnapshotArtifactResumesAtEveryVerifiedChunk(t *testing.T) {
+	_, snapshot := snapshotArtifactFixture(t)
+	artifact, written := writeSnapshotArtifactFixture(t, snapshot)
+	var checkpoints []SnapshotArtifactCheckpoint
+	if _, err := VerifySnapshotArtifact(bytes.NewReader(artifact), SnapshotArtifactCallbacks{
+		Chunk: func(checkpoint SnapshotArtifactCheckpoint, _ *SnapshotArtifactCursor) error {
+			checkpoints = append(checkpoints, checkpoint)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantRows := collectSnapshotArtifactSourceRows(t, snapshot)
+	for _, split := range checkpoints {
+		t.Run(fmt.Sprintf("sequence-%d", split.Sequence), func(t *testing.T) {
+			var rows []snapshotArtifactRow
+			callbacks := SnapshotArtifactCallbacks{
+				Row: func(collection SnapshotArtifactCollection, key, value []byte) error {
+					rows = append(rows, snapshotArtifactRow{
+						collection: collection, key: bytes.Clone(key), value: bytes.Clone(value),
+					})
+					return nil
+				},
+			}
+			manifest, cursor, err := ContinueSnapshotArtifact(
+				bytes.NewReader(artifact[:split.EndOffset]), nil, callbacks,
+			)
+			if manifest.State.Applied != 0 || manifest.Digest != ([sha256.Size]byte{}) ||
+				len(manifest.UserCollection) != 0 || !errors.Is(err, ErrSnapshotArtifact) ||
+				cursor == nil || cursor.Offset() != split.EndOffset ||
+				cursor.NextSequence() != split.Sequence+1 ||
+				cursor.PreviousDigest() != split.Digest {
+				t.Fatalf("prefix = manifest %+v cursor offset=%d sequence=%d digest=%x error=%v",
+					manifest, cursor.Offset(), cursor.NextSequence(), cursor.PreviousDigest(), err)
+			}
+			manifest, finalCursor, err := ContinueSnapshotArtifact(
+				bytes.NewReader(artifact[split.EndOffset:]), cursor, callbacks,
+			)
+			if err != nil || manifest.Digest != written.Digest ||
+				manifest.EncodedBytes != uint64(len(artifact)) || finalCursor == nil {
+				t.Fatalf("resume = manifest %+v cursor=%+v error=%v", manifest, finalCursor, err)
+			}
+			if len(rows) != len(wantRows) {
+				t.Fatalf("resumed rows = %d, want %d", len(rows), len(wantRows))
+			}
+			for i := range rows {
+				if rows[i].collection != wantRows[i].collection ||
+					!bytes.Equal(rows[i].key, wantRows[i].key) ||
+					!bytes.Equal(rows[i].value, wantRows[i].value) {
+					t.Fatalf("resumed row[%d] = %+v, want %+v", i, rows[i], wantRows[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSnapshotArtifactChunkCallbackOrderingAndReplayCursor(t *testing.T) {
+	_, snapshot := snapshotArtifactFixture(t)
+	artifact, _ := writeSnapshotArtifactFixture(t, snapshot)
+	phase := uint8(0)
+	rows := uint64(0)
+	chunks := 0
+	stop := errors.New("stop after first chunk")
+	_, cursor, err := ContinueSnapshotArtifact(bytes.NewReader(artifact), nil, SnapshotArtifactCallbacks{
+		BeginChunk: func(checkpoint SnapshotArtifactCheckpoint) error {
+			if phase != 0 || rows != 0 || checkpoint.Sequence != 0 {
+				t.Fatalf("begin phase=%d rows=%d checkpoint=%+v", phase, rows, checkpoint)
+			}
+			phase = 1
+			return nil
+		},
+		Row: func(SnapshotArtifactCollection, []byte, []byte) error {
+			if phase != 1 {
+				t.Fatalf("row phase = %d", phase)
+			}
+			rows++
+			return nil
+		},
+		Chunk: func(checkpoint SnapshotArtifactCheckpoint, next *SnapshotArtifactCursor) error {
+			if phase != 1 || rows != checkpoint.Rows || next.Offset() != checkpoint.EndOffset {
+				t.Fatalf("chunk phase=%d rows=%d checkpoint=%+v offset=%d",
+					phase, rows, checkpoint, next.Offset())
+			}
+			chunks++
+			phase = 2
+			return stop
+		},
+	})
+	if !errors.Is(err, stop) || cursor == nil || cursor.NextSequence() != 0 ||
+		cursor.Offset() >= uint64(len(artifact)) || chunks != 1 {
+		t.Fatalf("stopped cursor offset=%d sequence=%d chunks=%d error=%v",
+			cursor.Offset(), cursor.NextSequence(), chunks, err)
 	}
 }
 
@@ -321,7 +422,7 @@ func TestSnapshotArtifactBoundsAndCallbackFailures(t *testing.T) {
 	stopChunk := errors.New("stop chunk")
 	chunks := 0
 	if _, err := VerifySnapshotArtifact(bytes.NewReader(artifact), SnapshotArtifactCallbacks{
-		Chunk: func(SnapshotArtifactCheckpoint) error {
+		Chunk: func(SnapshotArtifactCheckpoint, *SnapshotArtifactCursor) error {
 			chunks++
 			return stopChunk
 		},

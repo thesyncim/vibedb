@@ -246,7 +246,7 @@ watermark without reapplying an already published entry.
 `WriteSnapshotArtifact` now streams precisely this coherent cut. Its one current
 binary grammar embeds the canonical state envelope, raw user-collection name,
 every hidden system row, and every user row in strict collection/key order.
-Rows are never fragmented. Ordinary chunks target 1 MiB, one exceptional row
+Rows are never fragmented. Ordinary chunks target 4 MiB, one exceptional row
 is bounded by the frozen 4 MiB document profile, and callers can reuse a fixed
 payload buffer. Every chunk carries its sequence and prior digest; the footer
 binds exact row, payload, chunk, and encoded-byte totals. Verification refuses
@@ -255,14 +255,28 @@ exposing borrowed row bytes, matches the hidden state row to the header, and
 emits exact end-offset/digest checkpoints for resumable destination staging.
 No `encoding/json`, synthesized SQL, or per-row collection string is involved.
 
-This is a certified export primitive, not a serving snapshot. Transfer
-authentication and topology authorization must supply the expected artifact
-identity. A destination must stage and revalidate user rows with its catalog
-validator, sync the complete artifact, compare the final digest, atomically
-install both collections, and only then publish it. The repository,
-snapshot-install transaction, ordered log-tail catch-up, and WAL
-generation-swap protocol are still absent. Snapshot publication and compaction
-therefore continue to depend on those gates.
+This is a certified transfer primitive, not a serving snapshot. Transfer
+authentication and topology authorization must supply the expected final
+manifest. `SnapshotArtifactStage` writes chunks only into caller-owned
+non-serving synchronous collections, splits them at the destination's real
+batch bounds, and orders every acknowledged collection update before cursor
+publication. The fixed cursor sidecar is checksum-protected, atomically
+replaced under an advisory writer lease, directory-synced, and binds the source
+state/header, exact range offset, hash-chain predecessor, cumulative bounds,
+collection order, and last key. Resume therefore requests only the next range;
+it retains no second artifact copy and replays at most a cursor-outcome-unknown
+chunk through exact idempotent puts. Cursor replacement is grouped at a 64 MiB
+default (and forced on every receive return), avoiding a directory fsync per
+4 MiB transfer chunk while keeping crash replay explicitly bounded.
+
+After the footer matches the authenticated expected manifest, `OpenCandidate`
+still performs the expensive full proof: hidden state and completions, user
+placement validation, logical-digest recomputation, binding, membership, and
+applied publication. It returns only a non-serving Machine. The transport
+orchestrator, learner snapshot publication, ordered log-tail catch-up, suffix
+reservation reconstruction, and WAL generation-swap protocol remain absent.
+Snapshot publication and compaction therefore continue to depend on those
+gates.
 
 ## Isolation boundary
 
@@ -311,9 +325,10 @@ Serving is prohibited because the current tree lacks:
 
 - physical system/user byte reservation and safe completion GC beyond the
   instantaneous static-base logical headroom proof;
-- a crash-atomic runtime snapshot repository/install transaction, a
-  reconstructed suffix-reservation ledger, and WAL generation compaction; the
-  coherent portable export/verification artifact alone grants no authority;
+- learner snapshot publication into Raft storage, a reconstructed
+  suffix-reservation ledger, and WAL generation compaction; coherent export,
+  resumable non-serving destination staging, and full candidate validation
+  alone grant no authority;
 - peer enrollment, mutually authenticated network I/O, shared per-peer flow
   control, snapshot transport, dynamic membership reconciliation, and
   deadline/slow-disk isolation around the in-process host and frame validator;

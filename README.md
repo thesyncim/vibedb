@@ -336,9 +336,9 @@ available.
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |
 | Raft read/membership control | Non-serving runtime and Multi-Raft ports expose quorum-safe `ReadIndex` outcomes and model-checked context-free configuration proposals; topology authorization, reconciliation, snapshot transfer, serving reads, and online membership remain unavailable |
-| Runtime Raft snapshots and WAL compaction | A coherent applied cut can be exported and verified as a deterministic, bounded-memory, hash-chained artifact with resumable chunk checkpoints. Destination install, Raft publication, repository durability, and WAL compaction are not available |
+| Runtime Raft snapshots and WAL compaction | A coherent applied cut can be exported as a deterministic bounded-memory hash chain, resumed into non-serving durable destination files through an atomic cursor without retaining an artifact copy, and fully revalidated as a non-serving candidate. Transfer orchestration, learner publication to Raft, ordered tail catch-up, and WAL compaction are not available |
 | Follower/session reads, online movement, and backup/PITR orchestration | Not available |
-| Hot-shard detection and split planning | Optional shard request completion records exact fixed-space per-bucket pressure and fan-out windows; sustained recommendations produce bucket-aligned, allocation-high-water and generation-fenced desired manifests. No controller publishes them; source snapshot export exists, but destination install/catch-up/cutover data movement is not yet available |
+| Hot-shard detection and split planning | Optional shard request completion records exact fixed-space per-bucket pressure and fan-out windows; sustained recommendations produce bucket-aligned, allocation-high-water and generation-fenced desired manifests. No controller publishes them; source export and offline destination staging exist, but learner catch-up/cutover data movement is not yet available |
 
 The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.

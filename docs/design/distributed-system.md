@@ -400,14 +400,17 @@ cluster does not fork into named protocol generations.
    The non-serving Runtime/Host now expose context-free model-checked
    configuration proposals, detached applied publication, and exact quorum-safe
    `ReadIndex` outcomes without making reads consume worst-case WAL headroom.
-   Serving Raft, topology authorization/reconciliation, destination snapshot
-   staging/install, ordered log catch-up, lease relocation, atomic
+   Serving Raft, topology authorization/reconciliation, learner snapshot
+   publication, ordered log catch-up, lease relocation, atomic
    cutover/drain/retire, merge planning, and
    disaggregated immutable snapshot/cold-data caching remain pending; no desired
    split is serving authority until those gates pass. The replicated-state
    boundary can now stream and verify a deterministic hash-chained artifact for
-   one certified applied cut with bounded reusable memory and exact resumable
-   chunk checkpoints; it does not transfer, install, or publish that artifact.
+   one certified applied cut with bounded reusable memory, apply resumed ranges
+   into non-serving durable destination files without retaining an artifact
+   copy, persist atomic hash-chain cursors, and fully validate a non-serving
+   candidate. It does not orchestrate transfer, publish the snapshot to Raft,
+   catch up the ordered tail, or grant ownership.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

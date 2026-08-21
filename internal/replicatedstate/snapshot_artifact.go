@@ -22,7 +22,7 @@ const (
 
 	// DefaultSnapshotArtifactChunkBytes bounds the ordinary retained transfer
 	// buffer. A single larger row is emitted alone, up to the fixed row bound.
-	DefaultSnapshotArtifactChunkBytes = 1 << 20
+	DefaultSnapshotArtifactChunkBytes = 4 << 20
 	// MinSnapshotArtifactChunkBytes prevents pathological framing overhead.
 	MinSnapshotArtifactChunkBytes = 4 << 10
 	// MaxSnapshotArtifactChunkBytes is one maximum-sized raw row frame. The
@@ -83,15 +83,112 @@ type SnapshotArtifactCheckpoint struct {
 }
 
 // SnapshotArtifactCallbacks consume verified, borrowed rows and durable chunk
-// boundaries. Row bytes remain valid only until Row returns. Chunk is called
-// after every row in that chunk has been accepted. PayloadBuffer is optional
-// caller-owned workspace; its contents are borrowed and overwritten for the
-// call. Capacity through MaxSnapshotArtifactChunkBytes prevents growth for
-// every valid artifact.
+// boundaries. BeginChunk is called after the entire chunk passes its digest but
+// before any row is exposed. Row bytes remain valid only until Row returns.
+// Chunk is called after every row has been accepted and receives the next
+// immutable resume cursor; it must return only after the corresponding row
+// effects and cursor are durably ordered. PayloadBuffer is optional caller-owned
+// workspace and is overwritten for the call. Capacity through
+// MaxSnapshotArtifactChunkBytes prevents growth for every valid artifact.
 type SnapshotArtifactCallbacks struct {
+	BeginChunk    func(checkpoint SnapshotArtifactCheckpoint) error
 	Row           func(collection SnapshotArtifactCollection, key, value []byte) error
-	Chunk         func(checkpoint SnapshotArtifactCheckpoint) error
+	Rows          func(checkpoint SnapshotArtifactCheckpoint, rows SnapshotArtifactRows) error
+	Chunk         func(checkpoint SnapshotArtifactCheckpoint, next *SnapshotArtifactCursor) error
 	PayloadBuffer []byte
+}
+
+// SnapshotArtifactRows is one complete structurally verified chunk. Iterator
+// borrows its payload only for the Rows callback that receives it.
+type SnapshotArtifactRows struct {
+	collection SnapshotArtifactCollection
+	payload    []byte
+	rows       uint64
+}
+
+// Collection returns the collection shared by every row in the chunk.
+func (r SnapshotArtifactRows) Collection() SnapshotArtifactCollection { return r.collection }
+
+// Len returns the exact row count in the chunk.
+func (r SnapshotArtifactRows) Len() uint64 { return r.rows }
+
+// Iterator returns a zero-allocation forward iterator over borrowed rows.
+func (r SnapshotArtifactRows) Iterator() SnapshotArtifactRowIterator {
+	return SnapshotArtifactRowIterator{payload: r.payload, remaining: r.rows}
+}
+
+// SnapshotArtifactRowIterator walks one already verified chunk. The zero value
+// is empty. Returned key/value bytes are borrowed until the Rows callback ends.
+type SnapshotArtifactRowIterator struct {
+	payload   []byte
+	cursor    int
+	remaining uint64
+}
+
+// Next returns the next borrowed row. ok is false after the declared count.
+func (i *SnapshotArtifactRowIterator) Next() (key, value []byte, ok bool) {
+	if i == nil || i.remaining == 0 {
+		return nil, nil, false
+	}
+	keyBytes := int(binary.LittleEndian.Uint32(i.payload[i.cursor : i.cursor+4]))
+	valueBytes := int(binary.LittleEndian.Uint32(i.payload[i.cursor+4 : i.cursor+8]))
+	i.cursor += snapshotArtifactRowHeaderBytes
+	keyEnd := i.cursor + keyBytes
+	valueEnd := keyEnd + valueBytes
+	key, value = i.payload[i.cursor:keyEnd], i.payload[keyEnd:valueEnd]
+	i.cursor = valueEnd
+	i.remaining--
+	return key, value, true
+}
+
+// SnapshotArtifactCursor is the exact verified prefix from which a receiver
+// may request the next artifact range. Its representation is opaque so callers
+// cannot accidentally advance past durable row effects. Use
+// AppendSnapshotArtifactCursor and OpenSnapshotArtifactCursor for persistence.
+type SnapshotArtifactCursor struct {
+	manifest              SnapshotArtifactManifest
+	expectedStateDocument []byte
+	nextSequence          uint64
+	encodedBytes          uint64
+	previousDigest        [sha256.Size]byte
+	previousKey           [replication.MaxMutationKeyBytes]byte
+	previousKeyBytes      uint16
+	currentCollection     SnapshotArtifactCollection
+	stateRowSeen          bool
+}
+
+// Offset returns the exact byte offset at which the next range begins.
+func (c *SnapshotArtifactCursor) Offset() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.encodedBytes
+}
+
+// NextSequence returns the next required chunk sequence.
+func (c *SnapshotArtifactCursor) NextSequence() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.nextSequence
+}
+
+// PreviousDigest returns the hash-chain predecessor required by the next
+// chunk. For a header-only cursor this is the header digest.
+func (c *SnapshotArtifactCursor) PreviousDigest() [sha256.Size]byte {
+	if c == nil {
+		return [sha256.Size]byte{}
+	}
+	return c.previousDigest
+}
+
+// PrefixManifest returns a detached manifest for the verified prefix. Digest
+// and EncodedBytes remain zero until the artifact footer is verified.
+func (c *SnapshotArtifactCursor) PrefixManifest() SnapshotArtifactManifest {
+	if c == nil {
+		return SnapshotArtifactManifest{}
+	}
+	return cloneSnapshotArtifactManifest(c.manifest)
 }
 
 // SnapshotArtifactManifest certifies one coherent system/user image. The
@@ -371,44 +468,67 @@ func VerifySnapshotArtifact(
 	r io.Reader,
 	callbacks SnapshotArtifactCallbacks,
 ) (SnapshotArtifactManifest, error) {
+	manifest, _, err := ContinueSnapshotArtifact(r, nil, callbacks)
+	return manifest, err
+}
+
+// ContinueSnapshotArtifact verifies an artifact from its header when cursor is
+// nil, or from cursor.Offset when cursor is non-nil. On failure after at least
+// one complete chunk, next is the last prefix whose Chunk callback returned
+// successfully. The caller may persist it and request the source range at its
+// exact offset. A resumed reader must begin with the next chunk magic, not the
+// artifact header.
+func ContinueSnapshotArtifact(
+	r io.Reader,
+	cursor *SnapshotArtifactCursor,
+	callbacks SnapshotArtifactCallbacks,
+) (manifest SnapshotArtifactManifest, next *SnapshotArtifactCursor, resultErr error) {
 	if r == nil {
-		return SnapshotArtifactManifest{}, fmt.Errorf("%w: nil reader", ErrSnapshotArtifact)
+		return SnapshotArtifactManifest{}, cursor, fmt.Errorf("%w: nil reader", ErrSnapshotArtifact)
 	}
-	manifest, expectedStateDocument, encodedBytes, err := readSnapshotArtifactHeader(r)
-	if err != nil {
-		return SnapshotArtifactManifest{}, err
+	var current SnapshotArtifactCursor
+	if cursor == nil {
+		headerManifest, expectedStateDocument, encodedBytes, err := readSnapshotArtifactHeader(r)
+		if err != nil {
+			return SnapshotArtifactManifest{}, nil, err
+		}
+		current = SnapshotArtifactCursor{
+			manifest: headerManifest, expectedStateDocument: expectedStateDocument,
+			encodedBytes: encodedBytes, previousDigest: headerManifest.HeaderDigest,
+			currentCollection: SnapshotArtifactSystem,
+		}
+	} else {
+		if err := validateSnapshotArtifactCursor(cursor); err != nil {
+			return SnapshotArtifactManifest{}, cursor, err
+		}
+		current = *cursor
 	}
-	expectedSequence := uint64(0)
-	previousDigest := manifest.HeaderDigest
 	payload := callbacks.PayloadBuffer[:0]
 	if payload == nil {
-		payload = make([]byte, 0, min(int(manifest.TargetChunkBytes), 64<<10))
+		payload = make([]byte, 0, min(int(current.manifest.TargetChunkBytes), 64<<10))
 	}
-	var previousKey [replication.MaxMutationKeyBytes]byte
-	previousKeyBytes := 0
-	currentCollection := SnapshotArtifactSystem
-	stateRowSeen := false
 	for {
 		var magic [8]byte
 		if err := readSnapshotArtifactBytes(r, magic[:], "record magic"); err != nil {
-			return SnapshotArtifactManifest{}, err
+			return SnapshotArtifactManifest{}, &current, err
 		}
 		switch magic {
 		case snapshotArtifactChunkMagic:
 			var header [snapshotArtifactChunkHeaderBytes]byte
 			copy(header[:8], magic[:])
 			if err := readSnapshotArtifactBytes(r, header[8:], "chunk header"); err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
 			chunk, payloadBytes, err := validateSnapshotArtifactChunkHeader(
-				header[:], expectedSequence, previousDigest, currentCollection,
+				header[:], current.nextSequence, current.previousDigest,
+				current.currentCollection,
 			)
 			if err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
-			if chunk.Collection != currentCollection {
-				currentCollection = chunk.Collection
-				previousKeyBytes = 0
+			if chunk.Collection == SnapshotArtifactUser && !current.stateRowSeen {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: user rows precede hidden state", ErrSnapshotArtifact)
 			}
 			if cap(payload) < payloadBytes {
 				payload = make([]byte, payloadBytes)
@@ -416,82 +536,174 @@ func VerifySnapshotArtifact(
 				payload = payload[:payloadBytes]
 			}
 			if err := readSnapshotArtifactBytes(r, payload, "chunk payload"); err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
 			var storedDigest [sha256.Size]byte
 			if err := readSnapshotArtifactBytes(r, storedDigest[:], "chunk digest"); err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
 			wantDigest := snapshotArtifactDigestParts(snapshotArtifactChunkDomain, header[:], payload)
 			if storedDigest != wantDigest {
-				return SnapshotArtifactManifest{}, fmt.Errorf("%w: chunk digest", ErrSnapshotArtifact)
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: chunk digest", ErrSnapshotArtifact)
 			}
+			chunkBytes := uint64(snapshotArtifactChunkHeaderBytes + payloadBytes + sha256.Size)
+			if current.manifest.Chunks == math.MaxUint64 ||
+				current.nextSequence == math.MaxUint64 ||
+				current.encodedBytes > math.MaxUint64-chunkBytes ||
+				current.manifest.PayloadBytes > math.MaxUint64-uint64(payloadBytes) {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: artifact counters", ErrSnapshotArtifactBound)
+			}
+			if chunk.Collection == SnapshotArtifactSystem {
+				if current.manifest.SystemRows > math.MaxUint64-chunk.Rows {
+					return SnapshotArtifactManifest{}, &current,
+						fmt.Errorf("%w: system rows", ErrSnapshotArtifactBound)
+				}
+			} else {
+				if current.manifest.UserRows > math.MaxUint64-chunk.Rows {
+					return SnapshotArtifactManifest{}, &current,
+						fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
+				}
+			}
+			checkpoint := SnapshotArtifactCheckpoint{
+				Sequence: chunk.Sequence, Collection: chunk.Collection,
+				Rows: chunk.Rows, PayloadBytes: uint64(payloadBytes),
+				EndOffset: current.encodedBytes + chunkBytes, Digest: storedDigest,
+			}
+			if callbacks.BeginChunk != nil {
+				if err := callbacks.BeginChunk(checkpoint); err != nil {
+					return SnapshotArtifactManifest{}, &current, err
+				}
+			}
+			candidate := current
+			if chunk.Collection != candidate.currentCollection {
+				candidate.currentCollection = chunk.Collection
+				candidate.previousKeyBytes = 0
+			}
+			previousKeyBytes := int(candidate.previousKeyBytes)
 			seenState, err := consumeSnapshotArtifactRows(
-				chunk, payload, callbacks.Row, previousKey[:], &previousKeyBytes,
-				expectedStateDocument, stateRowSeen,
+				chunk, payload, callbacks.Row, candidate.previousKey[:], &previousKeyBytes,
+				candidate.expectedStateDocument, candidate.stateRowSeen,
 			)
 			if err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
-			stateRowSeen = stateRowSeen || seenState
-			chunkBytes := uint64(snapshotArtifactChunkHeaderBytes + payloadBytes + sha256.Size)
-			if manifest.Chunks == math.MaxUint64 || expectedSequence == math.MaxUint64 ||
-				encodedBytes > math.MaxUint64-chunkBytes ||
-				manifest.PayloadBytes > math.MaxUint64-uint64(payloadBytes) {
-				return SnapshotArtifactManifest{}, fmt.Errorf("%w: artifact counters", ErrSnapshotArtifactBound)
-			}
-			encodedBytes += chunkBytes
-			manifest.PayloadBytes += uint64(payloadBytes)
+			candidate.previousKeyBytes = uint16(previousKeyBytes)
+			candidate.stateRowSeen = candidate.stateRowSeen || seenState
+			candidate.encodedBytes = checkpoint.EndOffset
+			candidate.manifest.PayloadBytes += uint64(payloadBytes)
 			if chunk.Collection == SnapshotArtifactSystem {
-				if manifest.SystemRows > math.MaxUint64-chunk.Rows {
-					return SnapshotArtifactManifest{}, fmt.Errorf("%w: system rows", ErrSnapshotArtifactBound)
-				}
-				manifest.SystemRows += chunk.Rows
+				candidate.manifest.SystemRows += chunk.Rows
 			} else {
-				if manifest.UserRows > math.MaxUint64-chunk.Rows {
-					return SnapshotArtifactManifest{}, fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
-				}
-				manifest.UserRows += chunk.Rows
+				candidate.manifest.UserRows += chunk.Rows
 			}
-			manifest.Chunks++
-			manifest.LastChunkDigest = storedDigest
-			previousDigest = storedDigest
-			expectedSequence++
-			if callbacks.Chunk != nil {
-				if err := callbacks.Chunk(SnapshotArtifactCheckpoint{
-					Sequence: chunk.Sequence, Collection: chunk.Collection,
-					Rows: chunk.Rows, PayloadBytes: uint64(payloadBytes),
-					EndOffset: encodedBytes, Digest: storedDigest,
+			candidate.manifest.Chunks++
+			candidate.manifest.LastChunkDigest = storedDigest
+			candidate.previousDigest = storedDigest
+			candidate.nextSequence++
+			if callbacks.Rows != nil {
+				if err := callbacks.Rows(checkpoint, SnapshotArtifactRows{
+					collection: chunk.Collection, payload: payload, rows: chunk.Rows,
 				}); err != nil {
-					return SnapshotArtifactManifest{}, err
+					return SnapshotArtifactManifest{}, &current, err
 				}
 			}
+			if callbacks.Chunk != nil {
+				if err := callbacks.Chunk(checkpoint, &candidate); err != nil {
+					return SnapshotArtifactManifest{}, &current, err
+				}
+			}
+			current = candidate
 		case snapshotArtifactFooterMagic:
 			var footer [snapshotArtifactFooterBytes]byte
 			copy(footer[:8], magic[:])
 			if err := readSnapshotArtifactBytes(r, footer[8:], "footer"); err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
 			if err := validateSnapshotArtifactFooter(
-				footer[:], manifest, previousDigest, encodedBytes, stateRowSeen,
+				footer[:], current.manifest, current.previousDigest,
+				current.encodedBytes, current.stateRowSeen,
 			); err != nil {
-				return SnapshotArtifactManifest{}, err
+				return SnapshotArtifactManifest{}, &current, err
 			}
-			manifest.EncodedBytes = encodedBytes + snapshotArtifactFooterBytes
+			manifest = cloneSnapshotArtifactManifest(current.manifest)
+			manifest.EncodedBytes = current.encodedBytes + snapshotArtifactFooterBytes
 			copy(manifest.Digest[:], footer[128:160])
 			var trailing [1]byte
 			n, readErr := io.ReadFull(r, trailing[:])
 			if n != 0 || readErr == nil {
-				return SnapshotArtifactManifest{}, fmt.Errorf("%w: trailing bytes", ErrSnapshotArtifact)
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: trailing bytes", ErrSnapshotArtifact)
 			}
 			if readErr != io.EOF {
-				return SnapshotArtifactManifest{}, readErr
+				return SnapshotArtifactManifest{}, &current, readErr
 			}
-			return manifest, nil
+			return manifest, &current, nil
 		default:
-			return SnapshotArtifactManifest{}, fmt.Errorf("%w: record magic", ErrSnapshotArtifact)
+			return SnapshotArtifactManifest{}, &current,
+				fmt.Errorf("%w: record magic", ErrSnapshotArtifact)
 		}
 	}
+}
+
+func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
+	if cursor == nil || cursor.encodedBytes == 0 ||
+		cursor.nextSequence != cursor.manifest.Chunks ||
+		cursor.previousDigest != cursor.manifest.LastChunkDigest ||
+		cursor.manifest.Digest != ([sha256.Size]byte{}) || cursor.manifest.EncodedBytes != 0 ||
+		cursor.manifest.HeaderDigest == ([sha256.Size]byte{}) ||
+		cursor.manifest.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
+		cursor.manifest.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
+		(cursor.currentCollection != SnapshotArtifactSystem &&
+			cursor.currentCollection != SnapshotArtifactUser) ||
+		cursor.previousKeyBytes > replication.MaxMutationKeyBytes ||
+		len(cursor.expectedStateDocument) == 0 {
+		return fmt.Errorf("%w: resume cursor", ErrSnapshotArtifact)
+	}
+	stateEnvelope, err := AppendState(nil, cursor.manifest.State)
+	if err != nil || !bytes.Equal(wrapJSONHex(nil, stateEnvelope), cursor.expectedStateDocument) {
+		return fmt.Errorf("%w: resume state", ErrSnapshotArtifact)
+	}
+	if len(cursor.manifest.UserCollection) == 0 ||
+		len(cursor.manifest.UserCollection) > replication.MaxCollectionBytes ||
+		!utf8.Valid(cursor.manifest.UserCollection) ||
+		bytes.IndexByte(cursor.manifest.UserCollection, 0) >= 0 {
+		return fmt.Errorf("%w: resume collection", ErrSnapshotArtifact)
+	}
+	header, headerDigest, err := makeSnapshotArtifactHeader(
+		stateEnvelope, string(cursor.manifest.UserCollection),
+		int(cursor.manifest.TargetChunkBytes),
+	)
+	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
+		cursor.encodedBytes < uint64(len(header)) ||
+		cursor.manifest.SystemRows > cursor.manifest.State.CompletionCount+1 {
+		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
+	}
+	if cursor.manifest.Chunks == 0 {
+		if cursor.encodedBytes != uint64(len(header)) || cursor.nextSequence != 0 ||
+			cursor.manifest.SystemRows != 0 || cursor.manifest.UserRows != 0 ||
+			cursor.manifest.PayloadBytes != 0 || cursor.previousKeyBytes != 0 ||
+			cursor.currentCollection != SnapshotArtifactSystem || cursor.stateRowSeen ||
+			cursor.previousDigest != cursor.manifest.HeaderDigest {
+			return fmt.Errorf("%w: empty resume prefix", ErrSnapshotArtifact)
+		}
+		return nil
+	}
+	if cursor.encodedBytes <= uint64(len(header)) || cursor.previousKeyBytes == 0 ||
+		!cursor.stateRowSeen || cursor.manifest.SystemRows == 0 ||
+		cursor.currentCollection == SnapshotArtifactSystem && cursor.manifest.UserRows != 0 ||
+		cursor.currentCollection == SnapshotArtifactUser &&
+			cursor.manifest.SystemRows != cursor.manifest.State.CompletionCount+1 {
+		return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
+	}
+	return nil
+}
+
+func cloneSnapshotArtifactManifest(manifest SnapshotArtifactManifest) SnapshotArtifactManifest {
+	manifest.State = cloneState(manifest.State)
+	manifest.UserCollection = bytes.Clone(manifest.UserCollection)
+	return manifest
 }
 
 type snapshotArtifactChunk struct {
@@ -641,6 +853,9 @@ func consumeSnapshotArtifactRows(
 	}
 	if cursor != len(payload) {
 		return false, fmt.Errorf("%w: trailing chunk payload", ErrSnapshotArtifact)
+	}
+	if chunk.Collection == SnapshotArtifactSystem && !stateRowAlreadySeen && !stateRowSeen {
+		return false, fmt.Errorf("%w: first system chunk omits hidden state", ErrSnapshotArtifact)
 	}
 	return stateRowSeen, nil
 }

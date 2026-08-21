@@ -311,9 +311,11 @@ remain predictable because their capacities and fold work are fixed at open.
   the embedded surface. It also documents the optional fixed-space hot-bucket
   request recorder and generation-fenced desired split planner in `autosplit`;
   no controller publishes those plans. The replicated-state boundary can export
-  one coherent applied cut as a deterministic bounded-memory, hash-chained
-  artifact with exact chunk checkpoints, but destination install, catch-up,
-  serving replication, failover, and online movement remain absent.
+  one coherent applied cut as a deterministic bounded-memory hash chain, resume
+  it into non-serving durable destination files through an atomic cursor without
+  retaining an artifact copy, and fully validate a candidate. Transfer
+  orchestration, learner publication/catch-up, serving replication, failover,
+  and online movement remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and
