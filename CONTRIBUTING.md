@@ -1,158 +1,148 @@
 # Contributing
 
-vibedb changes must preserve storage correctness, transaction isolation,
-durability, bounded memory, and format validation before improving a benchmark.
-The repository targets Go 1.26 and is unreleased. Format changes replace the
-current development grammar and its goldens in place; do not add compatibility
-readers. Every format or API break must leave the current tree internally
-consistent.
+VibeDB changes must preserve correctness, isolation, durability, bounded
+resource use, and format validation. Do not trade one of these contracts for a
+benchmark result.
 
-## Start focused
+The repository targets Go 1.26 and has no tagged release.
 
-Run the smallest package and test that exercise the change while iterating:
+## Start with a focused test
 
-```sh
-go test ./internal/storeio -run 'TestName' -count=1
-go test ./store/durable -run 'TestName' -count=1
-go test ./query -run 'TestName' -count=1
+Run the smallest package and test while you work:
+
+```bash
+go test ./internal/storeio -run '^TestName$' -count=1
+go test ./store/durable -run '^TestName$' -count=1
+go test ./query -run '^TestName$' -count=1
 ```
 
-Use `-count=1` when cached success would hide the run. Add `-race` for
-concurrency, snapshot, cache, combiner, or lease changes. Storage failures need
-the existing fault-injection and reopen oracles, not only a successful happy
-path.
+Use `-race` for concurrency, snapshot, cache, lease, or publication changes.
+Use fault injection and reopen oracles for a persistence change.
 
-## Before handing off
+## Run the root checks
 
-The local equivalent of the main CI lane is:
-
-```sh
+```bash
 go build ./...
 go vet ./...
-go test -timeout=25m ./...
-go test -race -timeout=25m \
-  -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' \
-  ./internal/storeio/ ./store/durable/
+go test -p=1 -timeout=25m ./...
 git diff --check
 ```
 
-CI runs these checks on linux/amd64 and linux/arm64. Platform-specific I/O
-changes also require the affected platform: Darwin durability work must prove
-the `F_FULLFSYNC`/`F_BARRIERFSYNC` path; Linux direct-I/O or io_uring work must
-prove fallback and required-mode behavior.
+CI runs build, vet, and tests on Linux amd64 and arm64. It also cross-compiles
+root and PostgreSQL-client packages for 32-bit Linux and Windows.
 
-The nested competitive harness is a separate module and is not covered by
-`go test ./...` at the root:
+The focused race lane is:
 
-```sh
+```bash
+go test -race -timeout=25m \
+  -skip 'Qualification' \
+  -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' \
+  ./internal/storeio/ ./store/durable/
+```
+
+CI also runs a focused cross-layer LATERAL race suite.
+
+## Run nested-module checks
+
+The competitive harness is a separate module:
+
+```bash
 cd bench/competitive
-go test -run 'TestFullEquivalence|TestCorpusVariantsAreShapeMatched' \
-  -count=1 -timeout=60m .
+go test ./...
 ```
 
 Do not add competitor dependencies to the root `go.mod`.
 
-## Test discipline
+The PostgreSQL client integration is also a separate module:
 
-Add the smallest permanent test that proves the contract:
+```bash
+cd integration/pgclient
+go test -timeout=2m ./...
+```
 
-- Codec changes need byte-exact golden images, checksum-valid semantic
-  corruption cases, reserved-zero validation, and truncation bounds.
-- COW or publication changes need failure injection before and after each
-  write/barrier, reopen, and previous-generation fallback.
-- Canonical materialization needs every capsule/data/root crash cut and
-  idempotent second recovery.
-- Snapshot or reclamation changes need held-old-generation tests, bounded
-  pressure, release/retry, and race coverage.
-- Index changes need hash-collision candidates, exact-value rechecks, aliases,
-  mutation maintenance, and scan differentials.
-- Optimized read/write routes need allocation assertions and a structural
-  oracle such as page acquisitions, device bytes, or route selection.
-- Query changes need heap/durable differential coverage and reusable-workspace
-  tests where the API promises a warmed allocation boundary.
+## Match tests to the change
 
-A benchmark is not a correctness test. Keep a deterministic oracle beside each
-new measured path.
+- A codec change needs byte-exact fixtures, truncation checks, checksum-valid
+  semantic corruption, reserved-zero validation, and bounds checks.
+- A root or copy-on-write change needs injected failure before and after each
+  write and barrier, followed by reopen.
+- A journal change needs append, sync, recycle, torn-tail, and identity tests.
+- A snapshot change needs an old held generation, pressure, release, retry, and
+  race tests.
+- An index change needs collision candidates, exact-value rechecks, mutation
+  maintenance, reopen, and scan differential tests.
+- An optimized path needs a correctness oracle and an allocation or route
+  assertion when the API promises that property.
+- A query change needs heap and durable differential coverage.
+- A distributed change needs stale identity, admission precedence, bounded
+  fanout, cancellation, and partial-failure tests.
 
-## Storage-format changes
+A benchmark is not a correctness test.
 
-[docs/format.md](docs/format.md) is the readable specification; codecs are
-authoritative. Change them together. Preserve or regenerate byte-exact fixtures
-under `internal/storeio/testdata/format0`, and make obsolete or malformed
-development layouts fail closed. Do not add compatibility branches.
+## Change the on-disk format
 
-Update [docs/architecture.md](docs/architecture.md) when a representation or
-root graph changes, and [docs/durability.md](docs/durability.md) when an
-acknowledgement, checkpoint, platform barrier, or recovery window changes.
+Format 0 is an unreleased development format. A change replaces the current
+grammar and its golden images. Do not add a compatibility decoder for an
+obsolete development image.
 
-## Benchmark discipline
+In the same change:
 
-Follow [docs/performance.md](docs/performance.md). In particular:
+1. Update codecs and validation.
+2. Replace affected fixtures in `internal/storeio/testdata/format0`.
+3. Add malformed and truncated input tests.
+4. Update [the format reference](docs/format.md).
+5. Update [the architecture](docs/architecture.md) when the root graph changes.
+6. Update [durability](docs/durability.md) when an acknowledgement or recovery
+   boundary changes.
 
-- compare the same commit pair, compiler, CPU, OS, filesystem, corpus, seed,
-  duration, writer count, and durability lane;
-- report time, bytes, allocations, device I/O, and tail latency relevant to the
-  changed path;
-- use repeated isolated samples and medians;
-- run correctness before performance;
-- label every value measured, projected, or a gate;
-- never replace a database-level table with an isolated primitive result.
+## Measure performance
 
-An automated allocation gate guards the hot paths. `bench/gate` runs a curated
-set of warm read, scan, apply, and bulk-build benchmarks on your revision and on
-the merge-base, then fails when a gated `allocs/op` count rises at all or a gated
-`B/op` count rises by more than 5%; it never gates `ns/op`, so machine load
-cannot trip it. Run `go run ./bench/gate` before proposing any change to a warm
-read, scan, join, apply, or durable write path, and expect the same check on
-every pull request. When a change deliberately trades a new allocation on a gated
-path for a larger win, adjust the curated entry and its policy in
-[bench/gate](bench/gate) — the curated table and its gating rules live in the
-tool's code, not its prose — and record the justifying measurement in
-[bench/gate/README.md](bench/gate/README.md) in the same change, rather than
-silently loosening the gate.
+Run the allocation gate for a hot-path change:
 
-Cross-engine figures have one authoritative home:
-[bench/competitive/RESULTS.md](bench/competitive/RESULTS.md). Record the exact
-commit, dirty state, machine, Go version, corpus variant, mode, and sampling
-method there.
+```bash
+go run ./bench/gate
+```
 
-## Experimental changes
+The gate compares the working tree and base on the same machine. It gates
+allocations and bytes, not time.
 
-An experiment may graduate into the sole production path. Add it in this order:
+Follow [the performance measurement rules](docs/performance.md) for a published
+number. Keep raw rows and exact provenance.
 
-1. State the idea, current status, and invariant it must preserve in one design
-   document under `docs/design/`.
-2. Define explicit correctness, read-path, space, allocation, and latency
-   gates before implementing the lab.
-3. Build the smallest isolated codec or routing experiment under
-   `internal/storeio`, with differential and corruption tests.
-4. Record every measured number with commit, machine, input shape, repetition,
-   and units. Keep projections labeled.
-5. Integrate reads first when the experiment changes representation; stop if the
-   standing read gates fail.
-6. Integrate mutation and recovery paths, then run the crash, snapshot, churn,
-   and whole-file matrices.
-7. Promote one representation and remove obsolete paths. Do not leave a
-   permanent reader-visible fallback or overlay to rescue a failed gate.
+## Change unsafe code
 
-After a decision, rewrite the design record to describe only the current path
-and explicit product boundaries. Delete rejected experiment code, dead plans,
-and stale benchmark claims.
+Read [the unsafe-code boundary](UNSAFE.md). Keep pointer-free storage free of Go
+pointers. Keep every backing owner alive for the full borrow.
 
-## Ownership and unsafe code
+Regenerate the inventory after an unsafe import changes:
 
-The caller owns files and explicit snapshot leases. Returned borrowed bytes
-must not outlive their documented owner. Keep Go pointers out of external
-memory, do not retain pointers as `uintptr`, and preserve pointer-free durable
-and mmap-backed layouts.
+```bash
+go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
+```
 
-Review [UNSAFE.md](UNSAFE.md) before changing an unsafe scope and update it only
-when the inventory or its links actually change. Preserve
-[docs/provenance.md](docs/provenance.md) and its evidence requirements for
-externally derived algorithms or source.
+## Change generated documentation
 
-## Documentation links
+Regenerate benchmark coverage from the nested module:
 
-Use relative in-repository links and run the repository link sanity check
-described in the task or review. A moved design document requires updating
-every inbound link in the same change.
+```bash
+cd bench/competitive
+go generate .
+go test -run '^TestBenchmarkCoverage' -count=1 ./internal/coverage
+```
+
+Do not hand-edit the generated capability matrix or benchmark coverage table.
+The related golden tests compare exact bytes.
+
+Use [the documentation language guide](docs/STYLE.md). Keep industry terms and
+exact code identifiers. Add implementation references for an internal contract.
+
+## Review the final diff
+
+```bash
+git status --short
+git diff --check
+git diff --stat
+```
+
+Confirm that the change does not include local caches, benchmark binaries,
+temporary data, or unrelated user work.

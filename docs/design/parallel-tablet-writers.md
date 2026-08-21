@@ -1,77 +1,47 @@
-# Primary write concurrency
+# Write concurrency
 
-The buffered-visible, schemaless, unindexed durable primary supports bounded
-parallel point-mutation preparation. This is a current implementation
-contract, not a roadmap or a benchmark report.
+VibeDB separates admission concurrency from generation publication. It bounds
+both.
 
-## Pipeline
+## Facade concurrency
 
-An eligible mutation uses three stages:
+Each facade collection has its own direct-mutation fence. A write to one
+collection does not take the fence of an unrelated collection.
 
-1. **Private preparation.** A caller claims one preallocated scratch context
-   and validates/canonicalizes a `Put` before entering the shared writer path.
-2. **Leaf-local inspection.** Under `writer.RLock`, the caller routes to the
-   exact `BucketID`, locks one of 4,096 padded stripes, reloads current state,
-   and performs bounded lookup, slot, size, and patch analysis.
-3. **Serialized publication.** A fixed combiner elects one leader for the
-   arrived cohort. It assigns consecutive generations, installs fully
-   initialized overlay records, and publishes one complete visibility cut.
+A transaction takes all dirty collection fences in name order. This closes the
+window between conflict validation and participant publication without adding
+a database-wide lock to every point write.
 
-The cohort combines independent point calls; it is not a user-visible atomic
-batch. Capacity pressure may publish a valid prefix and send untouched calls
-through the coordinated fallback. Every successful call still has one
-linearization point and one generation.
+## Heap concurrency
 
-## Resource bounds
+One heap collection has one writer mutex. Readers use an immutable state pointer
+and do not take that mutex. A point write rebuilds at most one bounded chunk.
 
-- At most 32 scratch contexts exist per collection, capped by configured file
-  visibility slots.
-- Contexts, request records, completion signals, canonical workspaces, and the
-  32-entry publisher arrays are allocated at open and do not grow on the hot
-  path.
-- The lane admits source documents no larger than half the maximum primary
-  leaf extent, canonical output no larger than one leaf, and at most 8,192 JSON
-  tape entries.
-- Context acquisition uses bounded CAS attempts and a condition variable; it
-  does not spin indefinitely or allocate an unbounded workspace.
-- Same-leaf writers serialize. Different leaves serialize only on a stripe
-  hash collision or at final publication.
+## Durable concurrency
 
-## Eligibility
+The durable engine can admit concurrent mutation requests through bounded
+queues and buffers. One publisher orders journal, page, and root transitions.
+The selected durability lane defines when each caller can return.
 
-The lane exists only when all of these are true:
+Queue admission is not unbounded buffering. An operation reserves the required
+descriptors and bytes before an irreversible write.
 
-- durability is `DurabilityBufferedVisible`;
-- per-mutation recovery-journal admission is disabled;
-- the collection has no schema or exact indexes; and
-- the unified primary overlay is enabled.
+Long-lived snapshots can reduce write progress because they pin retired
+extents. Reclamation pressure returns a typed capacity error instead of
+overwriting a referenced extent.
 
-It rechecks eligibility under the shared writer lock and declines while a
-primary epoch, online index build, or journal replay is active.
+## Multi-collection ordering
 
-Eligible class-5 leaves support inline replacement, stable-slot resurrection,
-bounded insertion, and deletion that leaves at least one live row. A missing
-delete is a no-op. Immutable overlay append is safe with active snapshots;
-same-size arena reuse raises its separate reader fence.
+Heap and durable database transactions take participant locks or gates in a
+stable order. Coherent database snapshots use the related ordered gate protocol.
 
-## Coordinated fallback
+Do not infer one serial global write order from this design. Unrelated
+collections retain independent point-write concurrency.
 
-The exclusive path remains authoritative for stronger durability, explicit
-journaling, schemas, indexes, online index construction, replay, overflow,
-splits, slot exhaustion, final-row deletion, topology changes, snapshots,
-flushes, and lifecycle work.
+## Implementation references
 
-One pressure coordinator owns fold/retry so overlay exhaustion does not create
-an exclusive-writer stampede. Checkpoints and structural mutations retain
-`writer.Lock` and therefore include every earlier published shared-lane cut.
-No background compaction is involved.
-
-## Qualification
-
-Tests cover disjoint and colliding stripes, same-leaf races, delete/restore,
-consecutive generation assignment, stable-slot resurrection, complete reader
-visibility, snapshots and direct epochs, reader-fenced reuse, crash recovery,
-flush/snapshot overlap, pressure coordination, scratch exhaustion, and fixed
-context ownership under race instrumentation. Performance evidence belongs in
-[the benchmark results](../../bench/competitive/RESULTS.md), pinned to the
-exact commit that produced it.
+- `vibedb.go` and `vibedb_txn.go`
+- `store/engine.go`
+- `store/durable/store_file_mutation_combiner.go`
+- `store/durable/store_file_primary_concurrent.go`
+- `store/durable/store_database_snapshot.go`

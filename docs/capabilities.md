@@ -1,20 +1,19 @@
-# Database capability conformance
+# Executable capability matrix
 
-This table is not hand-authored product prose. Its rows come from
-`internal/conformance.Cases`; native, `database/sql`, and pgwire adapter tests
-execute those same case IDs, and a golden test rejects any table that differs
-from the manifest.
+This table comes from `internal/conformance.Cases`. Native, `database/sql`, and
+pgwire tests run the same case IDs. A golden test rejects a table that differs
+from the executable manifest.
 
-“Atomic unit” means the named call, statement, protocol batch, or explicit
-transaction is visible wholly or not at all. It does not turn several native
-point calls into a transaction. SQL tables currently use the fixed zero-value
-durability contract (`DurabilitySync` with the power-safe recovery journal);
-the wider durability matrix is exposed by the native collection API.
+An atomic unit is one named call, statement, protocol batch, or explicit
+transaction. It becomes visible completely or not at all. Separate native
+point calls do not become one transaction.
 
-SQL fixtures are pre-materialized only to keep DDL and initial file publication
-outside each mutation assertion. Indexed steady-state mutations and explicit
-transactions then enter the same bounded `Collection.Update` publication path
-as the native batch cases.
+SQL tables use the fixed zero-value durability contract. This contract is
+`DurabilitySync` with the power-safe recovery journal. The native storage API
+exposes the wider durability matrix.
+
+The generated table uses exact code terms. Its text is not rewritten to match
+the general documentation language rules.
 
 <!-- capability-matrix:start -->
 | Executable case | Entry point | Indexing | Tables | Transaction | Keys | Operations | Durability / publication | Result | Atomic unit |
@@ -58,23 +57,22 @@ as the native batch cases.
 | `pgwire-transaction-serialization-failure` | pgwire | unindexed | multiple tables | explicit transaction | one key | update | fixed SQL default: sync-journal / power-safe | documented error: `SQLSTATE 40001`; first-committer-wins conflict on a multi-table write set surfaces as serialization_failure; no participant publishes | no |
 <!-- capability-matrix:end -->
 
-## How the result is checked
+## Test method
 
-Successful atomic rows also run a rejected sibling. A preflight sibling
-rejection must leave every participant collection's prior generation, primary
-rows, document count, and exact-index answers unchanged. Explicit SQL tests additionally force a rejected
-commit; database/sql proves first-committer-wins conflict rollback, while pgwire
-proves failed-transaction status and `COMMIT`-as-rollback. The general atomic
-promise is about logical rows and postings: bounded topology preparation may
-publish a representation-only generation before retrying a batch. Documented-
-error rows require the named Go error, no logical change, and a still-usable
-collection or session.
+A successful atomic row also runs a rejected sibling. A preflight rejection
+must leave participant generations, rows, document counts, and exact-index
+answers unchanged.
 
-Durability crash qualification is stricter than this semantic table. Journal
-tests cover whole-record/torn-record, append, sync, and synced-before-publish
-windows; device tests cover each data write, ordering barrier, alternate-root
-write, final sync, torn root, and space failure. Those suites establish the
-publication primitives' before-or-after cuts.
-`TestFilePrimaryIndexedBatchCheckpointCrashBoundary` composes those device
-faults with a multi-key indexed batch and validates both primary rows and exact
-postings against the same before-or-after oracle.
+SQL tests also force rejected commits. The `database/sql` tests check
+first-committer-wins rollback. Pgwire tests check failed-transaction state and
+`COMMIT`-as-rollback.
+
+The atomic contract applies to logical rows and postings. Bounded topology
+preparation can publish a representation-only generation before a later
+logical rejection. A documented-error row must return the named error, keep the
+logical state unchanged, and leave the collection or session usable.
+
+Crash tests cover complete and torn journal records, append, sync, data writes,
+ordering barriers, alternate-root writes, final sync, torn roots, and capacity
+failure. `TestFilePrimaryIndexedBatchCheckpointCrashBoundary` composes device
+faults with one indexed multi-key batch.
