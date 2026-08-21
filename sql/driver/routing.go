@@ -72,7 +72,7 @@ func newPlacementBinding(cfg distribution.ClusterConfig, table string) (*placeme
 		}
 		pointers[i] = p
 	}
-	native := distribution.NewNativeMapper(spec.Arity)
+	native := distribution.NewNativeMapperWithBucketBits(spec.Arity, spec.EffectiveBucketBits())
 	return &placementBinding{
 		placement: placement,
 		spec:      spec,
@@ -327,6 +327,12 @@ func scalarFromValue(value any) (distribution.Scalar, bool, error) {
 		return distribution.NewString(v), true, nil
 	case []byte:
 		return distribution.NewString(string(v)), true, nil
+	case vibejson.RawValue:
+		spelling, ok := v.NumberBytes()
+		if !ok {
+			return distribution.Scalar{}, false, errors.New("raw routing scalar is not a JSON number")
+		}
+		return numberScalar(byteview.String(spelling))
 	case *string:
 		if v == nil {
 			return distribution.Scalar{}, false, nil

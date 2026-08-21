@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,7 +207,18 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 		db := initializeTestShardStore(
 			t, filepath.Join(t.TempDir(), string(spec.id)+".vdb"), ownership,
 		)
-		srv, err := shardservice.NewServer(db, ownership, shardservice.Options{})
+		srv, err := shardservice.NewServer(db, ownership, shardservice.Options{
+			ExchangeDial: func(_ context.Context, address []byte) (net.Conn, error) {
+				name := string(address)
+				peer := servers[name]
+				if peer == nil {
+					return nil, fmt.Errorf("no exchange peer at %q", name)
+				}
+				client, server := net.Pipe()
+				go peer.ServeConn(server)
+				return client, nil
+			},
+		})
 		if err != nil {
 			t.Fatalf("NewServer %s: %v", spec.id, err)
 		}
@@ -282,9 +294,36 @@ func (c *e2eCluster) snapshot(t *testing.T, gen uint64) *Snapshot {
 	return c.buildSnapshot(t, gen, nil)
 }
 
+func (c *e2eCluster) snapshotWithStatistics(
+	t *testing.T,
+	gen uint64,
+	statistics []TableStatistics,
+) *Snapshot {
+	return c.buildSnapshotAtVersionWithStatistics(t, gen, c.version, nil, statistics)
+}
+
 // buildSnapshot builds a snapshot generation, applying any per-shard epoch
 // override so a test can pin a generation whose ownership epoch is stale.
 func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribution.ShardID]distribution.OwnershipEpoch) *Snapshot {
+	return c.buildSnapshotAtVersion(t, gen, c.version, epochs)
+}
+
+func (c *e2eCluster) buildSnapshotAtVersion(
+	t *testing.T,
+	gen uint64,
+	version distribution.RoutingVersion,
+	epochs map[distribution.ShardID]distribution.OwnershipEpoch,
+) *Snapshot {
+	return c.buildSnapshotAtVersionWithStatistics(t, gen, version, epochs, nil)
+}
+
+func (c *e2eCluster) buildSnapshotAtVersionWithStatistics(
+	t *testing.T,
+	gen uint64,
+	version distribution.RoutingVersion,
+	epochs map[distribution.ShardID]distribution.OwnershipEpoch,
+	statistics []TableStatistics,
+) *Snapshot {
 	t.Helper()
 	manShards := make([]distribution.Shard, len(c.shards))
 	endpoints := make(map[distribution.EndpointID]string, len(c.shards))
@@ -299,7 +338,7 @@ func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribu
 		}
 		endpoints[s.endpoint] = s.address
 	}
-	man, err := distribution.NewManifest(c.dist, c.version, manShards)
+	man, err := distribution.NewManifest(c.dist, version, manShards)
 	if err != nil {
 		t.Fatalf("NewManifest: %v", err)
 	}
@@ -308,7 +347,7 @@ func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribu
 		Placements:    []distribution.TablePlacement{{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}}},
 		Manifests:     []*distribution.Manifest{man},
 	}
-	snap, err := NewSnapshot(config, endpoints, gen)
+	snap, err := NewSnapshotWithPlannerMetadata(config, endpoints, gen, nil, statistics)
 	if err != nil {
 		t.Fatalf("NewSnapshot: %v", err)
 	}
@@ -339,9 +378,83 @@ func (c *e2eCluster) keysForShard(t *testing.T, want distribution.ShardID, count
 	return nil
 }
 
+// freshKeysForShard finds count distinct keys owned by want that the fixture
+// did not seed, so a write test can insert under them and prove the statement
+// routed to the owning shard instead of colliding with a seeded row.
+func (c *e2eCluster) freshKeysForShard(t *testing.T, want distribution.ShardID, count int) []string {
+	t.Helper()
+	taken := map[string]bool{}
+	for _, s := range c.shards {
+		for _, k := range s.keys {
+			taken[k] = true
+		}
+	}
+	out := make([]string, 0, count)
+	for i := 0; i < 100000; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if taken[key] {
+			continue
+		}
+		s := distribution.NewString(key)
+		p, err := c.mapper.PointFor([]distribution.Scalar{s})
+		if err != nil {
+			t.Fatalf("PointFor: %v", err)
+		}
+		if id, ok := c.man.ResolvePoint(p); ok && id == want {
+			out = append(out, key)
+			if len(out) == count {
+				return out
+			}
+		}
+	}
+	t.Fatalf("found %d fresh keys for shard %s, want %d", len(out), want, count)
+	return nil
+}
+
+// verifyInserted reads back one written key through the read path and proves
+// the write committed on its owning shard under the exact key and value.
+func (c *e2eCluster) verifyInserted(t *testing.T, key string, n int64) {
+	t.Helper()
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	c.dialer.reset()
+	res, err := e.Query(context.Background(), Query{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Params: stringParams(key),
+		Class:  ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("verification read: %v", err)
+	}
+	if got := decodeInts(t, res.Rows); !equalInts(got, []int64{n}) {
+		t.Fatalf("written row = %v, want [%d]", got, n)
+	}
+}
+
+// verifyDeleted reads back a deleted key and proves the row is gone.
+func (c *e2eCluster) verifyDeleted(t *testing.T, key string) {
+	t.Helper()
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	c.dialer.reset()
+	res, err := e.Query(context.Background(), Query{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Params: stringParams(key),
+		Class:  ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("verification read: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("deleted key still holds rows: %+v", res.Rows)
+	}
+}
+
 // assertDialedOnly asserts every want address was dialed exactly once and no
 // other shard was contacted.
 func (c *e2eCluster) assertDialedOnly(t *testing.T, want ...string) {
+	c.assertDialedOnlyN(t, 1, want...)
+}
+
+func (c *e2eCluster) assertDialedOnlyN(t *testing.T, count int, want ...string) {
 	t.Helper()
 	set := map[string]bool{}
 	for _, a := range want {
@@ -350,8 +463,8 @@ func (c *e2eCluster) assertDialedOnly(t *testing.T, want ...string) {
 	for _, s := range c.shards {
 		got := c.dialer.dialCount(s.address)
 		switch {
-		case set[s.address] && got != 1:
-			t.Fatalf("shard %s dialed %d times, want 1", s.id, got)
+		case set[s.address] && got != count:
+			t.Fatalf("shard %s dialed %d times, want %d", s.id, got, count)
 		case !set[s.address] && got != 0:
 			t.Fatalf("shard %s dialed %d times, want 0", s.id, got)
 		}
@@ -442,7 +555,11 @@ func TestE2EFanoutShapes(t *testing.T) {
 			if got := decodeInts(t, res.Rows); !equalInts(got, tc.wantRows) {
 				t.Fatalf("merged rows = %v, want %v", got, tc.wantRows)
 			}
-			c.assertDialedOnly(t, tc.wantDialed...)
+			if tc.wantShards == 1 {
+				c.assertDialedOnly(t, tc.wantDialed...)
+			} else {
+				c.assertDialedOnlyN(t, 3, tc.wantDialed...)
+			}
 		})
 	}
 }
@@ -540,6 +657,697 @@ func TestE2EDistributedWritesRejectedBeforeDispatch(t *testing.T) {
 	}
 }
 
+// TestE2EDistributedWriteRoutesToOwningShard proves every single-shard write
+// form dispatches to exactly the shard owning its rows and commits as one
+// local statement: a flat multi-row INSERT, a whole-document INSERT with
+// RETURNING, a whole-document UPDATE whose replacement keeps the shard key, a
+// targeted DELETE, and a contradictory-predicate DELETE that routes to an
+// empty set and contacts no shard. Each write is read back through the read
+// path to prove it landed on its owning shard.
+func TestE2EDistributedWriteRoutesToOwningShard(t *testing.T) {
+	c := newE2ECluster(t)
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	sh := c.shards[1]
+
+	// Flat multi-row INSERT: every row routes to the same shard.
+	flat := c.freshKeysForShard(t, sh.id, 3)
+	c.dialer.reset()
+	res, err := e.Exec(context.Background(), Query{
+		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?), (?, ?)`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(flat[0]), shardservice.NumberParam("100"),
+			shardservice.StringParam(flat[1]), shardservice.NumberParam("101"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec insert: %v", err)
+	}
+	if res.Kind != shardservice.ResponseCompletion || res.RowsAffected != 2 {
+		t.Fatalf("insert = %+v, want completion affecting 2 rows", res)
+	}
+	if res.RouteKind != distribution.RouteSingle || res.ShardsFanned != 1 {
+		t.Fatalf("route = %v fanned %d, want single shard", res.RouteKind, res.ShardsFanned)
+	}
+	c.assertDialedOnly(t, sh.address)
+	c.verifyInserted(t, flat[0], 100)
+	c.verifyInserted(t, flat[1], 101)
+
+	// Whole-document INSERT with RETURNING: the row routes by its document's
+	// shard key and the returned row is the one published.
+	docKey := flat[2]
+	c.dialer.reset()
+	res, err = e.Exec(context.Background(), Query{
+		SQL:    `INSERT INTO messages VALUES (?) RETURNING n`,
+		Params: []shardservice.Param{shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":200}`, docKey))},
+		Class:  ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec document insert: %v", err)
+	}
+	if res.Kind != shardservice.ResponseRows {
+		t.Fatalf("insert returning kind = %s, want Rows", res.Kind)
+	}
+	if got := decodeInts(t, res.Rows); !equalInts(got, []int64{200}) {
+		t.Fatalf("returned row = %v, want [200]", got)
+	}
+	c.assertDialedOnly(t, sh.address)
+	c.verifyInserted(t, docKey, 200)
+
+	// Whole-document UPDATE: the replacement keeps the shard key, so the row
+	// stays in place and the statement targets exactly its shard.
+	c.dialer.reset()
+	res, err = e.Exec(context.Background(), Query{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":300}`, flat[0])),
+			shardservice.StringParam(flat[0]),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec update: %v", err)
+	}
+	if res.Kind != shardservice.ResponseCompletion || res.RowsAffected != 1 {
+		t.Fatalf("update = %+v, want completion affecting 1 row", res)
+	}
+	c.assertDialedOnly(t, sh.address)
+	c.verifyInserted(t, flat[0], 300)
+
+	// Targeted DELETE: the predicate resolves to the row's shard and the row
+	// is gone afterwards.
+	c.dialer.reset()
+	res, err = e.Exec(context.Background(), Query{
+		SQL:    `DELETE FROM messages WHERE tenant_id = ?`,
+		Params: stringParams(flat[0]),
+		Class:  ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec delete: %v", err)
+	}
+	if res.Kind != shardservice.ResponseCompletion || res.RowsAffected != 1 {
+		t.Fatalf("delete = %+v, want completion affecting 1 row", res)
+	}
+	c.assertDialedOnly(t, sh.address)
+	c.verifyDeleted(t, flat[0])
+
+	// A contradictory shard-key predicate resolves to an empty route: a
+	// successful local no-op that contacts no shard.
+	c.dialer.reset()
+	res, err = e.Exec(context.Background(), Query{
+		SQL:   `DELETE FROM messages WHERE tenant_id = 'a' AND tenant_id = 'b'`,
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec empty-route delete: %v", err)
+	}
+	if res.RouteKind != distribution.RouteEmpty || res.RowsAffected != 0 {
+		t.Fatalf("empty route = %v affected %d, want empty and zero", res.RouteKind, res.RowsAffected)
+	}
+	if got := c.dialer.totalDials(); got != 0 {
+		t.Fatalf("empty route dialed %d shards, want zero", got)
+	}
+}
+
+func TestE2EAtomicBatchAcrossShards(t *testing.T) {
+	c := newE2ECluster(t)
+	executor := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	keys0 := c.freshKeysForShard(t, c.shards[0].id, 2)
+	key2 := c.freshKeysForShard(t, c.shards[2].id, 1)[0]
+
+	result, err := executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys0[0]), shardservice.NumberParam("101"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(key2), shardservice.NumberParam("202"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecBatch: %v", err)
+	}
+	if result.Kind != shardservice.ResponseCompletion || result.RowsAffected != 2 ||
+		result.RouteKind != distribution.RouteTargeted || result.ShardsFanned != 2 {
+		t.Fatalf("batch result = %+v", result)
+	}
+	c.verifyInserted(t, keys0[0], 101)
+	c.verifyInserted(t, key2, 202)
+
+	// The second participant fails preparation on a duplicate primary key. The
+	// first participant's successful dry-run must be rolled back and every
+	// participant barrier released before the batch returns.
+	_, err = executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(keys0[1]), shardservice.NumberParam("303"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(c.shards[3].keys[0]), shardservice.NumberParam("404"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err == nil {
+		t.Fatal("batch with a duplicate participant mutation succeeded")
+	}
+	c.verifyDeleted(t, keys0[1])
+}
+
+func TestE2EGlobalUniqueIndexCommitsWithBaseInsert(t *testing.T) {
+	c := newE2ECluster(t)
+	const (
+		indexDistribution = distribution.DistributionName("message_n_index")
+		indexVersion      = distribution.RoutingVersion(19)
+	)
+	type indexShard struct {
+		id         distribution.ShardID
+		allocation distribution.ShardAllocationGeneration
+		epoch      distribution.OwnershipEpoch
+		endpoint   distribution.EndpointID
+		address    string
+		kr         distribution.KeyRange
+	}
+	indexShards := []indexShard{
+		{id: "i0", allocation: 101, epoch: 31, endpoint: "ep-i0", address: "index-i0", kr: e2eRange(0, false, 0x80)},
+		{id: "i1", allocation: 102, epoch: 32, endpoint: "ep-i1", address: "index-i1", kr: e2eRange(0x80, true, 0)},
+	}
+	manifestShards := make([]distribution.Shard, len(indexShards))
+	for i := range indexShards {
+		shard := &indexShards[i]
+		ownership := shardservice.Ownership{
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation, Epoch: shard.epoch,
+			RoutingVersion: indexVersion,
+		}
+		database := initializeTestShardStore(
+			t, filepath.Join(t.TempDir(), string(shard.id)+".vdb"), ownership,
+		)
+		server, err := shardservice.NewServer(database, ownership, shardservice.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = server.Close() })
+		c.dialer.mu.Lock()
+		c.dialer.servers[shard.address] = server
+		c.dialer.mu.Unlock()
+		manifestShards[i] = distribution.Shard{
+			ID: shard.id, AllocationGeneration: shard.allocation,
+			Range: shard.kr, Leaders: []distribution.EndpointID{shard.endpoint},
+			Epoch: shard.epoch,
+		}
+	}
+	indexManifest, err := distribution.NewManifest(
+		indexDistribution, indexVersion, manifestShards,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	for i := range indexShards {
+		shard := &indexShards[i]
+		_, err := seedClient.Do(context.Background(), shard.address, &shardservice.ShardRequest{
+			SQL:          `CREATE TABLE messages_by_n (PRIMARY KEY (id))`,
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation,
+			RoutingVersion:       indexVersion, OwnershipEpoch: shard.epoch,
+			ExecutionMode: shardservice.ExecutionReadWrite,
+		})
+		if err != nil {
+			t.Fatalf("create index relation on %s: %v", shard.id, err)
+		}
+	}
+
+	endpoints := make(map[distribution.EndpointID]string, len(c.shards)+len(indexShards))
+	for i := range c.shards {
+		endpoints[c.shards[i].endpoint] = c.shards[i].address
+	}
+	for i := range indexShards {
+		endpoints[indexShards[i].endpoint] = indexShards[i].address
+	}
+	clusterConfig := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{
+			{Name: c.dist, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+			{Name: indexDistribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion},
+		},
+		Placements: []distribution.TablePlacement{
+			{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+			{Table: "messages_by_n", Distribution: indexDistribution, Columns: []string{"/n"}},
+		},
+		Manifests: []*distribution.Manifest{c.man, indexManifest},
+	}
+	descriptor := IndexDescriptor{
+		IndexID: 91, Incarnation: 1, Table: "messages", Name: "by_n",
+		Relation: "messages_by_n", Paths: []string{"/n"},
+		LocatorPaths: []string{"/tenant_id"},
+		PrimaryPath:  "/tenant_id",
+		Flags:        IndexGlobal | IndexUnique | IndexOrdered, Lifecycle: IndexBuilding,
+	}
+	snapshot, err := NewSnapshotWithIndexes(
+		clusterConfig, endpoints, 2, []IndexDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := NewCatalogHolder(snapshot)
+	executor := NewExecutor(c.client, holder, Options{})
+	baseKey := c.freshKeysForShard(t, c.shards[1].id, 1)[0]
+	result, err := executor.Exec(context.Background(), Query{
+		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(baseKey), shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("indexed insert: %v", err)
+	}
+	if result.RowsAffected != 1 || result.ShardsFanned != 2 ||
+		result.RouteKind != distribution.RouteTargeted {
+		t.Fatalf("indexed insert result = %+v", result)
+	}
+	c.verifyInserted(t, baseKey, 777)
+
+	tasks, err := executor.PlanGlobalIndexBackfill(context.Background(), "messages", "by_n")
+	if err != nil || len(tasks) != len(c.shards) {
+		t.Fatalf("plan global backfill = %d tasks, %v", len(tasks), err)
+	}
+	backfilled := 0
+	for i := range tasks {
+		for {
+			page, pageErr := executor.RunGlobalIndexBackfillTask(
+				context.Background(), tasks[i], 1, 1<<20,
+			)
+			if pageErr != nil {
+				t.Fatalf("backfill %s after %x: %v", tasks[i].BaseShard, tasks[i].After, pageErr)
+			}
+			backfilled += page.Rows
+			tasks[i].After = page.Next
+			if page.Complete {
+				break
+			}
+		}
+	}
+	if backfilled != 9 {
+		t.Fatalf("backfilled rows = %d, want 9", backfilled)
+	}
+	descriptor.Lifecycle = IndexReady
+	readySnapshot, err := NewSnapshotWithIndexes(
+		clusterConfig, endpoints, 3, []IndexDescriptor{descriptor},
+	)
+	if err != nil || !holder.PublishNewer(readySnapshot) {
+		t.Fatalf("publish ready global index = %v", err)
+	}
+	snapshot = readySnapshot
+	historicalRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("1")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(historicalRead.Rows) != 1 ||
+		string(historicalRead.Rows[0][0].Bytes) != `"`+c.shards[0].keys[0]+`"` {
+		t.Fatalf("historical row after online backfill = %+v, %v", historicalRead, err)
+	}
+	finiteRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n IN (?, ?) ORDER BY n`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("1"), shardservice.NumberParam("777"),
+		},
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("finite-domain global indexed read: %v", err)
+	}
+	if finiteRead.RouteKind != distribution.RouteTargeted ||
+		finiteRead.ShardsFanned < 3 || finiteRead.ShardsFanned > 4 ||
+		len(finiteRead.Rows) != 2 ||
+		string(finiteRead.Rows[0][1].Bytes) != "1" ||
+		string(finiteRead.Rows[1][1].Bytes) != "777" {
+		t.Fatalf("finite-domain global indexed result = %+v", finiteRead)
+	}
+
+	foundLocator := false
+	for i := range indexShards {
+		shard := &indexShards[i]
+		response, queryErr := seedClient.Do(context.Background(), shard.address, &shardservice.ShardRequest{
+			SQL:          `SELECT * FROM messages_by_n`,
+			Distribution: indexDistribution, Shard: shard.id,
+			AllocationGeneration: shard.allocation,
+			RoutingVersion:       indexVersion, OwnershipEpoch: shard.epoch,
+			ExecutionMode: shardservice.ExecutionReadOnly,
+		})
+		if queryErr != nil {
+			t.Fatalf("read index relation %s: %v", shard.id, queryErr)
+		}
+		for _, row := range response.Rows {
+			if len(row) == 1 && string(row[0].Bytes) == `["`+baseKey+`"]` {
+				foundLocator = true
+			}
+		}
+	}
+	if !foundLocator {
+		t.Fatal("committed global index locator was not found")
+	}
+	indexedRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("global indexed read: %v", err)
+	}
+	if indexedRead.RouteKind != distribution.RouteTargeted ||
+		indexedRead.ShardsFanned != 2 || len(indexedRead.Rows) != 1 ||
+		len(indexedRead.Rows[0]) != 2 ||
+		string(indexedRead.Rows[0][0].Bytes) != `"`+baseKey+`"` ||
+		string(indexedRead.Rows[0][1].Bytes) != "777" ||
+		indexedRead.PlanFingerprint == "" {
+		t.Fatalf("global indexed read result = %+v", indexedRead)
+	}
+	missingRead, err := executor.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("778"),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("missing global indexed read: %v", err)
+	}
+	if missingRead.RouteKind != distribution.RouteSingle ||
+		missingRead.ShardsFanned != 1 || len(missingRead.Rows) != 0 {
+		t.Fatalf("missing global indexed read result = %+v", missingRead)
+	}
+
+	conflictingBase := c.freshKeysForShard(t, c.shards[3].id, 1)[0]
+	_, err = executor.Exec(context.Background(), Query{
+		SQL: `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Params: []shardservice.Param{
+			shardservice.StringParam(conflictingBase), shardservice.NumberParam("777"),
+		},
+		Class: ClassInteractive,
+	})
+	if !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("duplicate global claim err = %v", err)
+	}
+	c.verifyDeleted(t, conflictingBase)
+
+	updated, err := executor.Exec(context.Background(), Query{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":778}`, baseKey)),
+			shardservice.StringParam(baseKey),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil || updated.RowsAffected != 1 || updated.ShardsFanned < 2 {
+		t.Fatalf("indexed update = %+v, %v", updated, err)
+	}
+	oldRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("777")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(oldRead.Rows) != 0 {
+		t.Fatalf("old indexed key after update = %+v, %v", oldRead, err)
+	}
+	newRead, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id, n FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("778")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(newRead.Rows) != 1 ||
+		string(newRead.Rows[0][0].Bytes) != `"`+baseKey+`"` {
+		t.Fatalf("new indexed key after update = %+v, %v", newRead, err)
+	}
+	unchanged, err := executor.Exec(context.Background(), Query{
+		SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":778}`, baseKey)),
+			shardservice.StringParam(baseKey),
+		},
+		Class: ClassInteractive,
+	})
+	if err != nil || unchanged.RowsAffected != 1 || unchanged.ShardsFanned != 1 {
+		t.Fatalf("index-stable guarded update = %+v, %v", unchanged, err)
+	}
+	emptyDelete, err := executor.Exec(context.Background(), Query{
+		SQL:    `DELETE FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(conflictingBase)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || emptyDelete.RowsAffected != 0 || emptyDelete.ShardsFanned != 1 {
+		t.Fatalf("empty guarded indexed delete = %+v, %v", emptyDelete, err)
+	}
+	deleted, err := executor.Exec(context.Background(), Query{
+		SQL:    `DELETE FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(baseKey)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || deleted.RowsAffected != 1 || deleted.ShardsFanned < 2 {
+		t.Fatalf("indexed delete = %+v, %v", deleted, err)
+	}
+	c.verifyDeleted(t, baseKey)
+	afterDelete, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT tenant_id FROM messages WHERE n = ?`,
+		Params: []shardservice.Param{shardservice.NumberParam("778")},
+		Class:  ClassInteractive,
+	})
+	if err != nil || len(afterDelete.Rows) != 0 {
+		t.Fatalf("indexed key after delete = %+v, %v", afterDelete, err)
+	}
+}
+
+func TestE2EAtomicBatchSpansTablesAndShards(t *testing.T) {
+	c := newE2ECluster(t)
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	for i := range c.shards {
+		c.seed(t, seedClient, c.shards[i],
+			`CREATE TABLE audit (tenant_id STRING PRIMARY KEY, event STRING NOT NULL)`, nil)
+	}
+	endpoints := make(map[distribution.EndpointID]string, len(c.shards))
+	for i := range c.shards {
+		endpoints[c.shards[i].endpoint] = c.shards[i].address
+	}
+	snapshot, err := NewSnapshot(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{
+			Name: c.dist, Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+		}},
+		Placements: []distribution.TablePlacement{
+			{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+			{Table: "audit", Distribution: c.dist, Columns: []string{"/tenant_id"}},
+		},
+		Manifests: []*distribution.Manifest{c.man},
+	}, endpoints, 2)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{})
+	messageKey := c.shards[1].keys[0]
+	auditKey := c.freshKeysForShard(t, c.shards[3].id, 1)[0]
+	result, err := executor.ExecBatch(context.Background(), []Query{
+		{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":111}`, messageKey)),
+				shardservice.StringParam(messageKey),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO audit (tenant_id, event) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(messageKey), shardservice.StringParam("updated"),
+			},
+			Class: ClassInteractive,
+		},
+		{
+			SQL: `INSERT INTO audit (tenant_id, event) VALUES (?, ?)`,
+			Params: []shardservice.Param{
+				shardservice.StringParam(auditKey), shardservice.StringParam("remote"),
+			},
+			Class: ClassInteractive,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecBatch: %v", err)
+	}
+	if result.RowsAffected != 3 || result.ShardsFanned != 2 ||
+		result.RouteKind != distribution.RouteTargeted {
+		t.Fatalf("batch result = %+v", result)
+	}
+	message, err := executor.Query(context.Background(), Query{
+		SQL:    `SELECT n FROM messages WHERE tenant_id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam(messageKey)},
+		Class:  ClassInteractive,
+	})
+	if err != nil || !equalInts(decodeInts(t, message.Rows), []int64{111}) {
+		t.Fatalf("updated message = %+v, %v", message, err)
+	}
+	for key, want := range map[string]string{messageKey: `"updated"`, auditKey: `"remote"`} {
+		audit, err := executor.Query(context.Background(), Query{
+			SQL:    `SELECT event FROM audit WHERE tenant_id = ?`,
+			Params: []shardservice.Param{shardservice.StringParam(key)},
+			Class:  ClassInteractive,
+		})
+		if err != nil || len(audit.Rows) != 1 || len(audit.Rows[0]) != 1 ||
+			string(audit.Rows[0][0].Bytes) != want {
+			t.Fatalf("audit %q = %+v, %v; want %s", key, audit, err, want)
+		}
+	}
+}
+
+// TestE2EWriteRefusalsBeforeDispatch proves every write shape that cannot be
+// proven single-shard is refused before any network I/O: a cross-shard INSERT
+// batch, a scatter UPDATE or DELETE over a non-shard-key predicate, an
+// unbounded DELETE, an UPDATE whose replacement moves the row's shard key, a
+// SELECT through Exec, and DDL through Exec.
+func TestE2EWriteRefusalsBeforeDispatch(t *testing.T) {
+	c := newE2ECluster(t)
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	a, b := c.shards[0], c.shards[2]
+
+	tests := []struct {
+		name   string
+		sql    string
+		params []shardservice.Param
+		want   error
+	}{
+		{
+			name: "cross_shard_insert",
+			sql:  `INSERT INTO messages (tenant_id, n) VALUES (?, ?), (?, ?)`,
+			params: []shardservice.Param{
+				shardservice.StringParam(c.freshKeysForShard(t, a.id, 1)[0]), shardservice.NumberParam("1"),
+				shardservice.StringParam(c.freshKeysForShard(t, b.id, 1)[0]), shardservice.NumberParam("2"),
+			},
+			want: ErrWriteCrossShard,
+		},
+		{
+			name:   "scatter_update",
+			sql:    `UPDATE messages SET "$doc" = ? WHERE n = ?`,
+			params: []shardservice.Param{shardservice.DocumentParam(`{"tenant_id":"x","n":5}`), shardservice.NumberParam("5")},
+			want:   ErrWriteScatter,
+		},
+		{
+			name:   "scatter_delete",
+			sql:    `DELETE FROM messages WHERE n = ?`,
+			params: []shardservice.Param{shardservice.NumberParam("5")},
+			want:   ErrWriteScatter,
+		},
+		{
+			name: "unbounded_delete",
+			sql:  `DELETE FROM messages`,
+			want: ErrDistributedWriteUnsupported,
+		},
+		{
+			name: "shard_key_move",
+			sql:  `UPDATE messages SET "$doc" = ? WHERE tenant_id = ?`,
+			params: []shardservice.Param{
+				shardservice.DocumentParam(fmt.Sprintf(`{"tenant_id":%q,"n":7}`, c.freshKeysForShard(t, b.id, 1)[0])),
+				shardservice.StringParam(a.keys[0]),
+			},
+			want: ErrWriteShardKeyMove,
+		},
+		{
+			name:   "select_via_exec",
+			sql:    `SELECT n FROM messages WHERE tenant_id = ?`,
+			params: stringParams(a.keys[0]),
+			want:   ErrExecRequiresMutation,
+		},
+		{
+			name: "ddl_via_exec",
+			sql:  `DROP TABLE messages`,
+			want: ErrWriteNotSupported,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c.dialer.reset()
+			_, err := e.Exec(context.Background(), Query{
+				SQL: tc.sql, Params: tc.params, Class: ClassInteractive,
+			})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Exec err = %v, want errors.Is %v", err, tc.want)
+			}
+			if got := c.dialer.totalDials(); got != 0 {
+				t.Fatalf("refusal dialed %d shards, want zero", got)
+			}
+		})
+	}
+
+	// A refused write never lands: the pre-refusal rows are unchanged.
+	c.verifyInserted(t, a.keys[0], 1)
+}
+
+// TestE2EWriteStaleEpochRetry proves a write whose pinned generation carries
+// stale routing and ownership metadata is retried exactly once against a
+// strictly newer, valid catalog transition.
+func TestE2EWriteStaleEpochRetry(t *testing.T) {
+	c := newE2ECluster(t)
+	stale := c.buildSnapshotAtVersion(t, 1, c.version-1,
+		map[distribution.ShardID]distribution.OwnershipEpoch{
+			c.shards[1].id: c.shards[1].epoch - 1,
+		})
+	fresh := c.snapshot(t, 2)
+	holder := NewCatalogHolder(stale)
+
+	var refreshes int
+	e := NewExecutor(c.client, holder, Options{
+		MaxRetries: 2,
+		Refresh: func(_ context.Context, staleGen uint64) (*Snapshot, error) {
+			refreshes++
+			if staleGen != 1 {
+				t.Errorf("refresh staleGen = %d, want 1", staleGen)
+			}
+			return fresh, nil
+		},
+	})
+
+	sh := c.shards[1]
+	docKey := c.freshKeysForShard(t, sh.id, 1)[0]
+	c.dialer.reset()
+	res, err := e.Exec(context.Background(), Query{
+		SQL:    `INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+		Params: []shardservice.Param{shardservice.StringParam(docKey), shardservice.NumberParam("400")},
+		Class:  ClassInteractive,
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if res.Retries != 1 {
+		t.Fatalf("retries = %d, want 1", res.Retries)
+	}
+	if res.Generation != 2 {
+		t.Fatalf("served generation = %d, want 2 (retried against the refreshed generation)", res.Generation)
+	}
+	if refreshes != 1 {
+		t.Fatalf("refresh count = %d, want 1", refreshes)
+	}
+	if res.RowsAffected != 1 {
+		t.Fatalf("rows affected = %d, want 1", res.RowsAffected)
+	}
+	if got := c.dialer.totalDials(); got != 2 {
+		t.Fatalf("total dials = %d, want 2 (one refused stale, one committed fresh)", got)
+	}
+	c.verifyInserted(t, docKey, 400)
+}
+
 // TestE2EGlobalLimitTrim proves a scatter read trims the globally merged result
 // to the statement's global LIMIT.
 func TestE2EGlobalLimitTrim(t *testing.T) {
@@ -596,12 +1404,202 @@ func TestE2EScatterAggregateFinalization(t *testing.T) {
 	if got := decodeInts(t, result.Rows); !equalInts(got, []int64{8}) {
 		t.Fatalf("global COUNT = %v, want [8]", got)
 	}
-	if got := c.dialer.totalDials(); got != 4 {
-		t.Fatalf("total dials = %d, want one per shard", got)
+	if got := c.dialer.totalDials(); got != 12 {
+		t.Fatalf("total dials = %d, want acquire/query/release per shard", got)
 	}
 	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 ||
 		result.Planning.PhysicalAlternatives != 2 {
 		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
+	}
+}
+
+func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
+	c := newE2ECluster(t)
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	allKeys := make([]string, 0, len(c.shards)*3)
+	for i := range c.shards {
+		allKeys = append(allKeys, c.shards[i].keys...)
+		key := c.freshKeysForShard(t, c.shards[i].id, 1)[0]
+		allKeys = append(allKeys, key)
+		c.seed(t, seedClient, c.shards[i],
+			`INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			[]shardservice.Param{
+				shardservice.StringParam(key), shardservice.NumberParam("7"),
+			})
+	}
+
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	result, err := e.Query(context.Background(), Query{
+		SQL: `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages ` +
+			`GROUP BY n ORDER BY n DESC`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Rows) != 9 {
+		t.Fatalf("group count = %d, want 9", len(result.Rows))
+	}
+	for row := 1; row < len(result.Rows); row++ {
+		previous := classifyCell(result.Rows[row-1][0])
+		current := classifyCell(result.Rows[row][0])
+		if compareCells(previous, current) < 0 {
+			t.Fatalf("grouped final order regressed at rows %d/%d", row-1, row)
+		}
+	}
+	found := false
+	for _, row := range result.Rows {
+		if len(row) != 5 || row[0].Null || string(row[0].Bytes) != "7" {
+			continue
+		}
+		found = true
+		want := []string{"7", "4", "28", "7", "7"}
+		for column := range want {
+			if row[column].Null || string(row[column].Bytes) != want[column] {
+				t.Fatalf("combined group column %d = %q/null=%v, want %q",
+					column, row[column].Bytes, row[column].Null, want[column])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("combined n=7 group was not returned")
+	}
+	if got := c.dialer.totalDials(); got != 12 {
+		t.Fatalf("total dials = %d, want acquire/query/release per shard", got)
+	}
+	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 {
+		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
+	}
+
+	limited, err := e.Query(context.Background(), Query{
+		SQL: `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages ` +
+			`GROUP BY n ORDER BY n DESC LIMIT 2`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("nonlocal top-k Query: %v", err)
+	}
+	if len(limited.Rows) != 2 {
+		t.Fatalf("nonlocal top-k rows = %d, want 2", len(limited.Rows))
+	}
+	for row := range limited.Rows {
+		if len(limited.Rows[row]) != len(result.Rows[row]) {
+			t.Fatalf("nonlocal top-k row %d width = %d, want %d",
+				row, len(limited.Rows[row]), len(result.Rows[row]))
+		}
+		for column := range limited.Rows[row] {
+			got, want := limited.Rows[row][column], result.Rows[row][column]
+			if got.Null != want.Null || string(got.Bytes) != string(want.Bytes) {
+				t.Fatalf("nonlocal top-k cell %d/%d = %q/null=%v, want %q/null=%v",
+					row, column, got.Bytes, got.Null, want.Bytes, want.Null)
+			}
+		}
+	}
+	if got := c.dialer.totalDials(); got != 24 {
+		t.Fatalf("total dials after nonlocal top-k = %d, want 24", got)
+	}
+
+	distinct, err := e.Query(context.Background(), Query{
+		SQL:   `SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 2 OFFSET 1`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("distributed DISTINCT Query: %v", err)
+	}
+	if len(distinct.Rows) != 2 {
+		t.Fatalf("distributed DISTINCT rows = %d, want 2", len(distinct.Rows))
+	}
+	for row := range distinct.Rows {
+		if len(distinct.Rows[row]) != 1 || distinct.Rows[row][0].Null ||
+			string(distinct.Rows[row][0].Bytes) != string(result.Rows[row+1][0].Bytes) {
+			t.Fatalf("distributed DISTINCT row %d = %+v, want %q",
+				row, distinct.Rows[row], result.Rows[row+1][0].Bytes)
+		}
+	}
+	if got := c.dialer.totalDials(); got != 36 {
+		t.Fatalf("total dials after distributed DISTINCT = %d, want 36", got)
+	}
+
+	sort.Strings(allKeys)
+	top, err := e.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`GROUP BY tenant_id ORDER BY tenant_id LIMIT 3`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("top-k Query: %v", err)
+	}
+	if len(top.Rows) != 3 {
+		t.Fatalf("top-k rows = %d, want 3", len(top.Rows))
+	}
+	for row := range top.Rows {
+		value := classifyCell(top.Rows[row][0])
+		if value.kind != ckString || string(value.sval) != allKeys[row] ||
+			string(top.Rows[row][1].Bytes) != "1" {
+			t.Fatalf("top-k row %d = %+v, want key %q count 1", row, top.Rows[row], allKeys[row])
+		}
+	}
+	if got := c.dialer.totalDials(); got != 48 {
+		t.Fatalf("total dials after grouped sort and top-k = %d, want 48", got)
+	}
+}
+
+func TestE2EPlannerSelectedWorkerRepartitionAggregation(t *testing.T) {
+	c := newE2ECluster(t)
+	partitions := make([]PartitionStatistics, len(c.shards))
+	for i := range c.shards {
+		partitions[i] = PartitionStatistics{
+			Partition: string(c.shards[i].id),
+			Rows:      Estimate{Value: 250_000, Lower: 200_000, Upper: 250_000, Confidence: .9},
+		}
+	}
+	snapshot := c.snapshotWithStatistics(t, 1, []TableStatistics{{
+		Table:      "messages",
+		Rows:       Estimate{Value: 1_000_000, Lower: 800_000, Upper: 1_000_000, Confidence: .9},
+		RowBytes:   Estimate{Value: 128, Lower: 96, Upper: 128, Confidence: .9},
+		Partitions: partitions,
+	}})
+	profiles := DefaultProfiles()
+	batch := profiles[ClassBatch]
+	// Centralized grouped state is estimated at 128 MiB; four worker-local
+	// reducers are estimated below this hard 40 MiB per-query objective.
+	batch.MaxAggregateBytes = 40 << 20
+	profiles[ClassBatch] = batch
+	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{Profiles: profiles})
+	query := Query{
+		SQL:   `SELECT n, COUNT(*) FROM messages GROUP BY n`,
+		Class: ClassBatch,
+	}
+	explanation, err := executor.Explain(t.Context(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(explanation.PhysicalPlan, "repartition") {
+		t.Fatalf("planner did not select worker repartition:\n%s", explanation.PhysicalPlan)
+	}
+	result, err := executor.Query(t.Context(), query)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Rows) != 8 {
+		t.Fatalf("groups = %d, want 8", len(result.Rows))
+	}
+	got := make(map[int64]int64, len(result.Rows))
+	for _, row := range result.Rows {
+		if len(row) != 2 {
+			t.Fatalf("row width = %d, want 2", len(row))
+		}
+		key := decodeInts(t, [][]shardservice.Cell{{row[0]}})[0]
+		count := decodeInts(t, [][]shardservice.Cell{{row[1]}})[0]
+		got[key] = count
+	}
+	for _, shard := range c.shards {
+		for _, value := range shard.ns {
+			if got[value] != 1 {
+				t.Fatalf("group %d count = %d, want 1 (all %v)", value, got[value], got)
+			}
+		}
 	}
 }
 
@@ -627,6 +1625,21 @@ func TestE2EEmptyRouteAggregateIdentity(t *testing.T) {
 	}
 	if got := c.dialer.totalDials(); got != 0 {
 		t.Fatalf("empty aggregate opened %d shard connections", got)
+	}
+
+	grouped, err := e.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`WHERE tenant_id = 'a' AND tenant_id = 'b' GROUP BY tenant_id`,
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grouped.Columns) != 2 || len(grouped.Rows) != 0 {
+		t.Fatalf("empty grouped result = %d columns, %d rows", len(grouped.Columns), len(grouped.Rows))
+	}
+	if got := c.dialer.totalDials(); got != 0 {
+		t.Fatalf("empty grouped aggregate opened %d shard connections", got)
 	}
 }
 
@@ -676,14 +1689,15 @@ func TestE2EDeadlineCancelsOutstanding(t *testing.T) {
 	}
 }
 
-// TestE2EStaleEpochRefreshRetry proves a stale ownership epoch from one shard
-// triggers exactly one retry, only against a strictly newer refreshed
-// generation, and never mixes generations within an attempt.
+// TestE2EStaleEpochRefreshRetry proves stale routing and ownership metadata
+// triggers exactly one retry, only against a strictly newer valid catalog
+// transition, and never mixes generations within an attempt.
 func TestE2EStaleEpochRefreshRetry(t *testing.T) {
 	c := newE2ECluster(t)
 	// Generation 1 pins a stale epoch for s2 (live epoch is 12), so a scatter's
 	// s2 leg is refused; generation 2 carries the correct epochs.
-	stale := c.buildSnapshot(t, 1, map[distribution.ShardID]distribution.OwnershipEpoch{"s2": 99})
+	stale := c.buildSnapshotAtVersion(t, 1, c.version-1,
+		map[distribution.ShardID]distribution.OwnershipEpoch{"s2": c.shards[1].epoch - 1})
 	fresh := c.snapshot(t, 2)
 	holder := NewCatalogHolder(stale)
 

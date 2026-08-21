@@ -168,6 +168,11 @@ func TestCanonicalStatisticStringMatchesJSONEncoding(t *testing.T) {
 		if string(got) != "prefix:"+string(want) {
 			t.Fatalf("AppendCanonicalStatisticString(%q) = %q, want %q", value, got, "prefix:"+string(want))
 		}
+		got, err = AppendCanonicalStatisticStringBytes([]byte("prefix:"), []byte(value))
+		if err != nil || string(got) != "prefix:"+string(want) {
+			t.Fatalf("AppendCanonicalStatisticStringBytes(%q) = %q, %v; want %q",
+				value, got, err, "prefix:"+string(want))
+		}
 	}
 	if _, err := AppendCanonicalStatisticString(nil, string([]byte{0xff})); err == nil {
 		t.Fatal("invalid UTF-8 statistic string was accepted")
@@ -191,15 +196,77 @@ func TestCanonicalStatisticStringMatchesJSONEncoding(t *testing.T) {
 	}
 }
 
+func TestAppendCanonicalScalarJSONByteNativeStrings(t *testing.T) {
+	inputs := []string{
+		`"plain"`, `"quote\"slash\\\/"`, `"\b\f\n\r\t\u0000\u001f"`,
+		`"\u003cscript\u003e\u0026"`, `"caf\u00e9"`,
+		`"\u2028line\u2029paragraph"`, `"\ud83d\ude00"`, `"😀"`,
+	}
+	for _, input := range inputs {
+		var decoded string
+		if err := json.Unmarshal([]byte(input), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		want, err := json.Marshal(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := AppendCanonicalScalarJSON([]byte("prefix:"), []byte(input))
+		if err != nil || string(got) != "prefix:"+string(want) {
+			t.Fatalf("AppendCanonicalScalarJSON(%q) = %q, %v; want %q",
+				input, got, err, "prefix:"+string(want))
+		}
+	}
+
+	for _, input := range [][]byte{
+		{}, []byte(`"unterminated`), []byte(`"\ud800"`), []byte(`[]`),
+		[]byte(`{}`), []byte(`true trailing`), {0xff},
+	} {
+		prefix := []byte("keep:")
+		got, err := AppendCanonicalScalarJSON(prefix, input)
+		if err == nil || string(got) != "keep:" {
+			t.Fatalf("invalid scalar %q = %q, %v; want unchanged prefix and error", input, got, err)
+		}
+	}
+
+	source := []byte(`"hot \ud83d\ude00 \u003c value"`)
+	dst := make([]byte, 0, 128)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		var err error
+		dst, err = AppendCanonicalScalarJSON(dst[:0], source)
+		if err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("byte-native canonical string allocations = %v, want 0", allocs)
+	}
+}
+
 func TestCanonicalStatisticNumberValidation(t *testing.T) {
-	for _, value := range []string{"0", "-0", "1", "-1.25", "1e+2", "1E-02"} {
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{"0", "0"}, {"-0", "0"}, {"0.000", "0"}, {"1", "1"},
+		{"-1.25", "-1.25"}, {"1e+2", "1e2"}, {"1E-02", "1e-2"},
+		{"123", "1.23e2"}, {"0.0012300", "1.23e-3"}, {"-1200.00e-2", "-1.2e1"},
+		{"100e999999999999999999999", "1e1000000000000000000001"},
+	} {
+		value := test.value
 		canonical, err := CanonicalStatisticNumber(value)
 		if err != nil {
 			t.Fatalf("CanonicalStatisticNumber(%q): %v", value, err)
 		}
+		if canonical != test.want {
+			t.Fatalf("CanonicalStatisticNumber(%q) = %q, want %q", value, canonical, test.want)
+		}
 		generic, err := CanonicalScalarJSON(value)
 		if err != nil || canonical != generic {
 			t.Fatalf("direct/generic canonical number %q = %q/%q, %v", value, canonical, generic, err)
+		}
+		appended, err := AppendCanonicalStatisticNumber([]byte("prefix:"), []byte(value))
+		if err != nil || string(appended) != "prefix:"+test.want {
+			t.Fatalf("AppendCanonicalStatisticNumber(%q) = %q, %v", value, appended, err)
 		}
 	}
 	for _, value := range []string{"", "+1", "01", "-", ".1", "1.", "1e", "1e+", "1x", "NaN"} {

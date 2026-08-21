@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -153,6 +155,35 @@ func TestSnapshotPersistRoundTrip(t *testing.T) {
 		got.shardGenerationHighWaters[0] != 2 {
 		t.Fatalf("lineage = index %d shards %v, want 0/[2]",
 			got.indexIDHighWater, got.shardGenerationHighWaters)
+	}
+}
+
+func TestSnapshotPersistsVirtualBucketsAndAffinity(t *testing.T) {
+	config := testConfig(t)
+	config.Distributions[0].Arity = 2
+	config.Distributions[0].BucketBits = distribution.DefaultVirtualBucketBits
+	config.Placements[0].Columns = []string{"/tenant_id", "/message_id"}
+	config.Placements[0].TenantPath = "/tenant_id"
+	config.Placements[0].AffinityGroup = "messaging"
+	snapshot, err := NewSnapshot(config, testEndpoints(), 8)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, snapshot); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	spec, ok := loaded.Spec("tenant_data")
+	if !ok || spec.BucketBits != distribution.DefaultVirtualBucketBits {
+		t.Fatalf("loaded distribution = %+v,%v", spec, ok)
+	}
+	placement, ok := loaded.Placement("messages")
+	if !ok || placement.TenantPath != "/tenant_id" || placement.AffinityGroup != "messaging" {
+		t.Fatalf("loaded placement = %+v,%v", placement, ok)
 	}
 }
 
@@ -319,6 +350,46 @@ func TestSaveSnapshotRejectsDurableGenerationRollback(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotAfterFencesConcurrentTopology(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, testSnapshot(t, 5)); err != nil {
+		t.Fatalf("SaveSnapshot generation 5: %v", err)
+	}
+	if err := SaveSnapshotAfter(path, 4, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("SaveSnapshotAfter stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	got, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != 5 {
+		t.Fatalf("stale CAS mutated durable generation to %d, want 5", got.Generation())
+	}
+	if err := SaveSnapshotAfter(path, 5, testSnapshot(t, 6)); err != nil {
+		t.Fatalf("SaveSnapshotAfter generation 5: %v", err)
+	}
+	got, err = LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != 6 {
+		t.Fatalf("durable generation = %d, want 6", got.Generation())
+	}
+}
+
+func TestSaveSnapshotAfterTreatsAbsentCatalogAsGenerationZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshotAfter(path, 1, testSnapshot(t, 2)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("SaveSnapshotAfter absent stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed CAS created catalog: %v", err)
+	}
+	if err := SaveSnapshotAfter(path, 0, testSnapshot(t, 1)); err != nil {
+		t.Fatalf("SaveSnapshotAfter generation zero: %v", err)
+	}
+}
+
 // TestSaveSnapshotConcurrentPublishersConverge proves the writer lease covers
 // the generation comparison and rename as one operation. Contending writers
 // retry only the typed lease refusal; a generation already superseded by a
@@ -452,10 +523,28 @@ func TestCatalogTransitionFencesRoutingIdentity(t *testing.T) {
 			endpoints: testEndpoints(),
 		},
 		{
+			name: "virtual_bucket_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Distributions[0].BucketBits = distribution.DefaultVirtualBucketBits - 1
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
 			name: "placement_identity",
 			config: func() distribution.ClusterConfig {
 				config := testConfig(t)
 				config.Placements[0].Columns = []string{"/other"}
+				return config
+			}(),
+			endpoints: testEndpoints(),
+		},
+		{
+			name: "affinity_identity",
+			config: func() distribution.ClusterConfig {
+				config := testConfig(t)
+				config.Placements[0].AffinityGroup = "other"
 				return config
 			}(),
 			endpoints: testEndpoints(),
@@ -859,6 +948,83 @@ func TestCatalogHolderPublishAndPin(t *testing.T) {
 	}
 }
 
+// TestCatalogHolderGenerationDrainFence proves publication closes the late-old
+// pin race and the schema barrier waits for an already pinned operation.
+func TestCatalogHolderGenerationDrainFence(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	old := h.pinCurrent()
+	if old.generation != 1 {
+		t.Fatalf("old lease = %+v, want generation 1", old)
+	}
+	if !h.PublishNewer(testSnapshot(t, 2)) {
+		t.Fatal("generation 2 publication was refused")
+	}
+	late := h.pinCurrent()
+	if late.generation != 2 {
+		t.Fatalf("late lease = %+v, want generation 2", late)
+	}
+	defer late.release()
+
+	status := h.DrainStatus(2)
+	if status.CurrentGeneration != 2 || status.OldestActiveGeneration != 1 ||
+		status.ActiveOlderOperations != 1 {
+		t.Fatalf("drain status = %+v, want current=2 oldest=1 active=1", status)
+	}
+	timeout, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := h.WaitOlderDrained(timeout, 2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitOlderDrained while pinned error = %v, want deadline", err)
+	}
+
+	old.release()
+	drained, err := h.WaitOlderDrained(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("WaitOlderDrained after release: %v", err)
+	}
+	if drained.CurrentGeneration != 2 || drained.OldestActiveGeneration != 0 ||
+		drained.ActiveOlderOperations != 0 {
+		t.Fatalf("drained status = %+v, want current=2 with no older operations", drained)
+	}
+}
+
+// TestCatalogHolderGenerationDrainWaitsForPublication proves a controller can
+// begin waiting before its catalog watcher publishes the requested generation.
+func TestCatalogHolderGenerationDrainWaitsForPublication(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.WaitOlderDrained(context.Background(), 2)
+		done <- err
+	}()
+	if !h.PublishNewer(testSnapshot(t, 2)) {
+		t.Fatal("generation 2 publication was refused")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitOlderDrained: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitOlderDrained did not observe publication")
+	}
+}
+
+// TestCatalogHolderLeaseSteadyStateAllocations keeps the request-level schema
+// fence honest: after holder construction and warmup, pin/release must not add
+// heap pressure to the routed lane when no schema controller is waiting.
+func TestCatalogHolderLeaseSteadyStateAllocations(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 1))
+	warm := h.pinCurrent()
+	warm.release()
+	allocs := testing.AllocsPerRun(1000, func() {
+		lease := h.pinCurrent()
+		lease.release()
+	})
+	if allocs != 0 {
+		t.Fatalf("pin/release allocations = %g, want 0", allocs)
+	}
+}
+
 // TestCatalogHolderPublishNewer proves the strongly ordered publication
 // primitive installs only strictly newer generations and refuses a stale or
 // equal republish.
@@ -881,6 +1047,82 @@ func TestCatalogHolderPublishNewer(t *testing.T) {
 	}
 	if h.Current().Generation() != 6 {
 		t.Fatalf("current generation = %d, want 6", h.Current().Generation())
+	}
+}
+
+func TestCatalogHolderPublishAfterFencesConcurrentTopology(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 5))
+	if err := h.PublishAfter(4, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("PublishAfter stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	if got := h.Current().Generation(); got != 5 {
+		t.Fatalf("stale CAS published generation %d, want 5", got)
+	}
+	if err := h.PublishAfter(5, testSnapshot(t, 6)); err != nil {
+		t.Fatalf("PublishAfter generation 5: %v", err)
+	}
+	if got := h.Current().Generation(); got != 6 {
+		t.Fatalf("current generation = %d, want 6", got)
+	}
+	if err := h.PublishAfter(6, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationNotNewer) {
+		t.Fatalf("PublishAfter equal generation err=%v, want ErrCatalogGenerationNotNewer", err)
+	}
+
+	empty := NewCatalogHolder(nil)
+	if err := empty.PublishAfter(0, testSnapshot(t, 1)); err != nil {
+		t.Fatalf("PublishAfter generation zero: %v", err)
+	}
+}
+
+func TestBuildManifestTransitionPreservesCatalogAndRaisesOwnershipFence(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	current, err := NewSnapshotWithPlannerMetadata(
+		config, endpoints, 5, []IndexDescriptor{testGlobalIndexDescriptor()}, gatewayTestStatistics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := current.Manifest("tenant_data")
+	shards := make([]distribution.Shard, manifest.ShardCount())
+	for i := range shards {
+		shards[i], _ = manifest.ShardInfo(i)
+	}
+	shards[0].Leaders = []distribution.EndpointID{"ep-b"}
+	shards[0].Epoch++
+	nextManifest, err := distribution.NewManifest("tenant_data", manifest.Version()+1, shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildManifestTransition(current, nextManifest, 6)
+	if err != nil {
+		t.Fatalf("BuildManifestTransition: %v", err)
+	}
+	if next.Generation() != 6 || next.PlacementCount() != current.PlacementCount() ||
+		next.DistributionCount() != current.DistributionCount() {
+		t.Fatalf("next catalog shape = generation %d placements %d distributions %d",
+			next.Generation(), next.PlacementCount(), next.DistributionCount())
+	}
+	routed, _ := next.Manifest("tenant_data")
+	shard, _ := routed.ShardInfo(0)
+	if routed.Version() != manifest.Version()+1 || shard.Leaders[0] != "ep-b" || shard.Epoch != 8 {
+		t.Fatalf("transitioned shard = version %d shard %+v", routed.Version(), shard)
+	}
+	original, _ := manifest.ShardInfo(0)
+	if original.Leaders[0] != "ep-a" || original.Epoch != 7 {
+		t.Fatalf("current manifest mutated: %+v", original)
+	}
+	index, indexOK := next.Index("messages", "by_email")
+	statistics, statisticsOK := next.Statistics("messages")
+	address, addressErr := next.Address("ep-index-a")
+	if !indexOK || !index.Global() || index.Relation != "messages_email_index" ||
+		index.LocatorCount != 2 || index.LocatorPaths[1] != "/id" ||
+		!statisticsOK || statistics.Rows().Value != 10_000 ||
+		addressErr != nil || address != "127.0.0.1:7101" {
+		t.Fatalf("preserved metadata = index %+v/%t statistics=%+v/%t address=%q/%v",
+			index, indexOK, statistics.Rows(), statisticsOK, address, addressErr)
+	}
+	if _, err := BuildManifestTransition(current, nextManifest, 5); !errors.Is(err, ErrCatalogGenerationNotNewer) {
+		t.Fatalf("equal catalog generation err=%v, want ErrCatalogGenerationNotNewer", err)
 	}
 }
 

@@ -8,6 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -17,10 +20,11 @@ import (
 //
 // # Concurrency
 //
-// One connection is one goroutine and owns one sql/driver Session, exactly like
-// pgwire: the Session is single-consumer, so its prepared statements, cursors,
-// and pinned snapshot are never reachable from another goroutine and need no
-// lock on the request path. Two things are shared and each is shared
+// One connection is one goroutine and lazily owns one sql/driver Session when
+// it first carries SQL, exactly like pgwire: the Session is single-consumer, so
+// its prepared statements, cursors, and pinned snapshot are never reachable
+// from another goroutine and need no lock on the request path. Exchange-only
+// peer connections never allocate a Session. Two things are shared and each is shared
 // deliberately: the [Options] and [Ownership] are read-only after construction,
 // and the connection registry is a mutex-guarded map touched once when a
 // connection starts and once when it ends, never on a request.
@@ -47,6 +51,14 @@ const (
 	DefaultMaxResultRows        = query.DefaultResultRows
 	DefaultMaxResultBytes       = query.DefaultResultBytes
 	DefaultMaxIntermediateBytes = query.DefaultIntermediateBytes
+	// DefaultMaxReadFences bounds abandoned leased coherent cuts and their scope
+	// copies independently of the connection limit.
+	DefaultMaxReadFences = 4096
+	// Exchange defaults reserve a finite aggregate promise across ephemeral
+	// stage mailboxes. A mailbox allocates only its ring and producer state at
+	// Open; payload memory remains bounded by this admitted reservation.
+	DefaultMaxExchangeMailboxes   = 1024
+	DefaultMaxExchangeBufferBytes = 512 << 20
 
 	// UnlimitedConnections and UnlimitedResults are explicit opt-outs from the
 	// corresponding finite defaults; a negative timeout disables that deadline.
@@ -82,6 +94,24 @@ type Options struct {
 	// MaxIntermediateBytes bounds statement-wide subplan storage. Zero selects
 	// DefaultMaxIntermediateBytes; UnlimitedResults disables it.
 	MaxIntermediateBytes int64
+	// MaxReadFences bounds active leased coherent multi-shard read cuts. Zero
+	// selects DefaultMaxReadFences; unlike connections it cannot be unbounded.
+	MaxReadFences int
+	// MaxExchangeMailboxes and MaxExchangeBufferBytes bound worker exchange
+	// state independently of SQL results and connections. Zero selects finite
+	// defaults; neither resource can be configured as unbounded.
+	MaxExchangeMailboxes   int
+	MaxExchangeBufferBytes uint64
+	// ExchangeDial resolves a repartition target's opaque address bytes. Nil
+	// selects TCP and permits loopback targets only. An injected resolver is a
+	// trusted control-plane boundary and may interpret addresses as endpoint IDs.
+	ExchangeDial ExchangeDialFunc
+
+	// HotRecorder is an optional fixed-space, striped observation window for
+	// this exact shard allocation. Its source identity is validated against
+	// Ownership before the database serving claim is acquired. Rotation and
+	// controller delivery remain the caller's responsibility.
+	HotRecorder *autosplit.Recorder
 
 	// OnError is called with every connection-terminating error, including the
 	// ordinary ones (a peer that closed its connection). It is the only logging
@@ -90,13 +120,22 @@ type Options struct {
 	OnError func(err error)
 }
 
+// ExchangeDialFunc opens one direct worker connection for a repartition
+// producer. It must honor ctx cancellation and returns an exclusively owned
+// connection.
+type ExchangeDialFunc func(ctx context.Context, address []byte) (net.Conn, error)
+
 // A Server is a leader-only shard endpoint. It admits every request against one
 // static ownership identity and executes the admitted statement locally.
 type Server struct {
-	db        *sqldriver.Database
-	claim     *sqldriver.ShardStoreServingClaim
-	ownership Ownership
-	opts      Options
+	db          *sqldriver.Database
+	claim       *sqldriver.ShardStoreServingClaim
+	journal     *distributedtxn.Journal
+	readFences  *readFenceSet
+	exchanges   *exchange.Registry
+	hotRecorder *autosplit.Recorder
+	ownership   Ownership
+	opts        Options
 
 	// baseCtx is the parent of every request context; cancel fires on Close so a
 	// graceful shutdown cancels in-flight executions rather than waiting them out.
@@ -117,8 +156,8 @@ type Server struct {
 }
 
 // NewServer builds a shard server over db that owns the identity in cfg. The
-// database is borrowed and remains the caller's responsibility; each connection
-// opens one independent Session that the server closes on every disconnect path.
+// database is borrowed and remains the caller's responsibility; each SQL-bearing
+// connection lazily opens one independent Session that the server closes on every disconnect path.
 // NewServer defaults and validates opts and rejects an empty ownership identity.
 func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, error) {
 	if db == nil {
@@ -128,6 +167,16 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 		cfg.Epoch == 0 || cfg.RoutingVersion == 0 {
 		return nil, errors.New(
 			"shardservice: ownership must name a non-empty distribution and shard with nonzero allocation generation, epoch, and routing version")
+	}
+	if opts.HotRecorder != nil {
+		source := opts.HotRecorder.Source()
+		if source.Distribution != cfg.Distribution || source.Shard != cfg.Shard ||
+			source.AllocationGeneration != cfg.AllocationGeneration ||
+			source.RoutingVersion != cfg.RoutingVersion ||
+			source.OwnershipEpoch != cfg.Epoch {
+			return nil, errors.New(
+				"shardservice: hot recorder source does not match the serving ownership identity")
+		}
 	}
 	if opts.MaxConnections < UnlimitedConnections {
 		return nil, fmt.Errorf("shardservice: MaxConnections must be >= %d", UnlimitedConnections)
@@ -140,6 +189,12 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	}
 	if opts.MaxIntermediateBytes < UnlimitedResults {
 		return nil, fmt.Errorf("shardservice: MaxIntermediateBytes must be >= %d", UnlimitedResults)
+	}
+	if opts.MaxReadFences < 0 {
+		return nil, errors.New("shardservice: MaxReadFences must be nonnegative")
+	}
+	if opts.MaxExchangeMailboxes < 0 {
+		return nil, errors.New("shardservice: MaxExchangeMailboxes must be nonnegative")
 	}
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = DefaultMaxConnections
@@ -168,9 +223,18 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxIntermediateBytes == 0 {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
-	// Do not advance durable serving authority for a constructor that will be
-	// rejected on an option error. The claim is the final fallible construction
-	// step and is retained until Close has drained every admitted connection.
+	if opts.MaxReadFences == 0 {
+		opts.MaxReadFences = DefaultMaxReadFences
+	}
+	if opts.MaxExchangeMailboxes == 0 {
+		opts.MaxExchangeMailboxes = DefaultMaxExchangeMailboxes
+	}
+	if opts.MaxExchangeBufferBytes == 0 {
+		opts.MaxExchangeBufferBytes = DefaultMaxExchangeBufferBytes
+	}
+	// Claim first so an unbound, mismatched, or stale store retains its precise
+	// admission error. Opening the journal afterward may create hidden state;
+	// failure closes the claim and an equal-fence retry resumes safely.
 	claim, err := db.ClaimShardStoreServing(sqldriver.ShardStoreBinding{
 		Distribution:         cfg.Distribution,
 		Shard:                cfg.Shard,
@@ -182,17 +246,31 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if err != nil {
 		return nil, fmt.Errorf("shardservice: claim SQL shard serving fence: %w", err)
 	}
+	journal, err := db.OpenDistributedTransactionJournal()
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("shardservice: open transaction journal: %w", err),
+			claim.Close(),
+		)
+	}
 	baseCtx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		db:        db,
-		claim:     claim,
-		ownership: cfg,
-		opts:      opts,
-		baseCtx:   baseCtx,
-		cancel:    cancel,
-		conns:     map[net.Conn]struct{}{},
-		listeners: map[net.Listener]struct{}{},
-		closeDone: make(chan struct{}),
+		db:         db,
+		claim:      claim,
+		journal:    journal,
+		readFences: newReadFenceSet(opts.MaxReadFences),
+		exchanges: exchange.NewRegistry(exchange.RegistryOptions{
+			MaxMailboxes:           opts.MaxExchangeMailboxes,
+			MaxReservedBufferBytes: opts.MaxExchangeBufferBytes,
+		}),
+		hotRecorder: opts.HotRecorder,
+		ownership:   cfg,
+		opts:        opts,
+		baseCtx:     baseCtx,
+		cancel:      cancel,
+		conns:       map[net.Conn]struct{}{},
+		listeners:   map[net.Listener]struct{}{},
+		closeDone:   make(chan struct{}),
 	}, nil
 }
 
@@ -266,12 +344,12 @@ func (s *Server) serveConn(nc net.Conn) error {
 	defer s.wg.Done()
 	defer s.releaseConnection(nc)
 	defer nc.Close()
-	sess, err := s.db.NewSession(s.baseCtx)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-	c := &shardConn{server: s, nc: nc, sess: sess}
+	c := &shardConn{server: s, nc: nc}
+	defer func() {
+		if c.sess != nil {
+			_ = c.sess.Close()
+		}
+	}()
 	return c.loop()
 }
 
@@ -303,6 +381,8 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 
 	s.cancel()
+	s.readFences.close()
+	s.exchanges.Close()
 	var err error
 	for _, l := range listeners {
 		if closeErr := l.Close(); closeErr != nil && err == nil {
@@ -313,7 +393,7 @@ func (s *Server) Close() error {
 		_ = c.Close()
 	}
 	s.wg.Wait()
-	err = errors.Join(err, s.claim.Close())
+	err = errors.Join(err, s.journal.Close(), s.claim.Close())
 	s.mu.Lock()
 	s.closeErr = err
 	close(s.closeDone)

@@ -9,6 +9,7 @@ import (
 // exported methods — no adapter needed for basic conformance. Repeated probing
 // should go through IndexSession below, which owns reusable private scratch.
 var _ store.IndexSource = (*Snapshot)(nil)
+var _ store.RangeIndexSource = (*Snapshot)(nil)
 
 // SupportsUpdate reports whether the collection's durability lane can publish
 // [Collection.Update] batches. It describes a structural capability, not a size
@@ -35,6 +36,7 @@ type IndexSession struct {
 }
 
 var _ store.IndexSource = (*IndexSession)(nil)
+var _ store.RangeIndexSource = (*IndexSession)(nil)
 
 // IndexSessionMetrics is a detached, stable summary accumulated since the
 // session's last Reset. It reports logical candidate work and physical posting
@@ -115,6 +117,24 @@ func (s *IndexSession) AppendIndexCandidateMasks(dst []store.Mask, name string, 
 	out, err := s.snapshot.AppendIndexCandidateMasksInto(dst, &s.workspace, name, values...)
 	s.accumulate()
 	return out, err
+}
+
+// AppendIndexRangeCandidateMasks unions the ordered exact terms inside span
+// with retained private scratch. A false bound result asks the planner to use
+// its ordinary scan and leaves dst unchanged.
+func (s *IndexSession) AppendIndexRangeCandidateMasks(
+	dst []store.Mask,
+	name string,
+	span store.IndexRange,
+) ([]store.Mask, bool, error) {
+	if s == nil || s.snapshot == nil {
+		return dst, false, ErrClosed
+	}
+	out, bounded, err := s.snapshot.AppendIndexRangeCandidateMasksInto(
+		dst, &s.workspace, name, span,
+	)
+	s.accumulate()
+	return out, bounded, err
 }
 
 func (s *IndexSession) accumulate() {

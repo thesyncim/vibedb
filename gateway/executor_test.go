@@ -11,6 +11,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 // shardNode is one in-process shard server plus the ownership and address a
@@ -341,6 +342,88 @@ func TestExecutorAggregateRowCap(t *testing.T) {
 	_, err := e.Query(context.Background(), scatterQuery())
 	if !errors.Is(err, ErrResultLimit) {
 		t.Fatalf("err = %v, want errors.Is ErrResultLimit", err)
+	}
+}
+
+func TestFanoutGroupedBatchesCombinesMultipleFramesInRouteOrder(t *testing.T) {
+	columns := []shardservice.Column{{Name: "k", TypeOID: 114}, {Name: "n", TypeOID: 114}}
+	batch := func(sequence uint32, final bool, withSchema bool, rows ...[]shardservice.Cell) *shardservice.ShardResponse {
+		var schema []shardservice.Column
+		if withSchema {
+			schema = columns
+		}
+		return &shardservice.ShardResponse{
+			Kind: shardservice.ResponseRowBatch, Columns: schema, Rows: rows,
+			RowBatch: shardservice.RowBatchReply{
+				Sequence: sequence, ColumnCount: 2, Final: final,
+			},
+		}
+	}
+	row := func(key, count string) []shardservice.Cell {
+		return []shardservice.Cell{{Bytes: []byte(key)}, {Bytes: []byte(count)}}
+	}
+	scripts := map[string][]*shardservice.ShardResponse{
+		"s0": {
+			batch(0, false, true, row(`"a"`, "1")),
+			batch(1, true, false, row(`"b"`, "1")),
+		},
+		"s1": {
+			batch(0, true, true, row(`"a"`, "2"), row(`"c"`, "1")),
+		},
+	}
+	served := make(chan error, len(scripts))
+	client := NewClient(func(_ context.Context, address string) (net.Conn, error) {
+		peer, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			req, err := shardservice.DecodeRequest(server)
+			if err == nil && (req.RowBatch.BatchRows != distributedBatchRows ||
+				req.RowBatch.BatchBytes != distributedBatchBytes) {
+				err = fmt.Errorf("row batch = %+v", req.RowBatch)
+			}
+			for _, response := range scripts[address] {
+				if err != nil {
+					break
+				}
+				err = shardservice.EncodeResponse(server, response)
+			}
+			served <- err
+		}()
+		return peer, nil
+	})
+	t.Cleanup(func() { _ = client.Close() })
+
+	calls := make([]shardCall, 2)
+	for i, address := range []string{"s0", "s1"} {
+		calls[i] = shardCall{address: address, req: &shardservice.ShardRequest{
+			SQL:              `SELECT k, COUNT(*) FROM docs GROUP BY k`,
+			PartialAggregate: true, ExecutionMode: shardservice.ExecutionReadOnly,
+			MaxRows: 10_000, MaxResultBytes: 1 << 20,
+		}}
+	}
+	e := &Executor{client: client}
+	p := DefaultProfiles()[ClassBatch]
+	result, err := e.fanout(context.Background(), &plan{
+		calls: calls, aggregates: []sqlast.AggKind{sqlast.AggNone, sqlast.AggCount},
+		groupKeys: []int{0},
+	}, p)
+	if err != nil {
+		t.Fatalf("fanout: %v", err)
+	}
+	for range scripts {
+		if err := <-served; err != nil {
+			t.Fatalf("scripted shard: %v", err)
+		}
+	}
+	want := [][2]string{{`"a"`, "3"}, {`"b"`, "1"}, {`"c"`, "1"}}
+	if len(result.Rows) != len(want) {
+		t.Fatalf("rows = %d, want %d", len(result.Rows), len(want))
+	}
+	for i := range want {
+		if gotKey, gotCount := string(result.Rows[i][0].Bytes), string(result.Rows[i][1].Bytes); gotKey != want[i][0] || gotCount != want[i][1] {
+			t.Fatalf("row %d = (%s,%s), want (%s,%s)",
+				i, gotKey, gotCount, want[i][0], want[i][1])
+		}
 	}
 }
 

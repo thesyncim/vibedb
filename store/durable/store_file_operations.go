@@ -155,6 +155,10 @@ type Snapshot struct {
 	// forever. The mask scan already threads its reconstruction buffer through
 	// caller-owned scratch; this gives the full scan the same retention.
 	scanSpliceScratch []byte
+	// rangeLowerScratch holds the immediate lexical successor of an exclusive
+	// lower bound. Retaining it avoids a wrapper callback and boxed captures
+	// while preserving allocation-free warmed bounded scans.
+	rangeLowerScratch []byte
 	// maskGroups retains the bucket-to-floor routing plan for exact-index mask
 	// scans. Reuse keeps warmed sparse probes allocation-free while sorting by
 	// lexical floor preserves the same callback order as RangeRaw even after a
@@ -190,6 +194,16 @@ type IndexWorkspace struct {
 	// needle is the canonicalized probe term's scratch, retained so a warmed
 	// probe neither heap-allocates nor re-zeroes a maximum-size stack array.
 	needle []byte
+	// Range probes union many exact term postings without exposing intermediate
+	// masks to query. Three alternating buffers keep every merge ordered and
+	// allocation-free after the observed tile high-water mark; endpoint terms
+	// retain their canonical ordered-key bytes independently.
+	rangeProbe []store.Mask
+	rangeAcc   []store.Mask
+	rangeMerge []store.Mask
+	rangeLower []byte
+	rangeUpper []byte
+	rangeLast  []byte
 }
 
 // primaryExactProbeTile is one resolved overlay contribution for a probe:
@@ -234,6 +248,12 @@ func (w *IndexWorkspace) Release() {
 	w.overlayTiles = nil
 	w.baseTiles = nil
 	w.needle = nil
+	w.rangeProbe = nil
+	w.rangeAcc = nil
+	w.rangeMerge = nil
+	w.rangeLower = nil
+	w.rangeUpper = nil
+	w.rangeLast = nil
 }
 
 // Snapshot acquires an explicit generation lease.

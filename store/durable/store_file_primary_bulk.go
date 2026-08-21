@@ -199,7 +199,9 @@ func createFromPrimaryGraphRecords(
 	}
 	storeID := primaryBulkStoreID(records, normalized)
 	placed := len(normalized.indexes) != 0
-	primaryPlan, err := storeio.PlanPrimaryGraph(storeID, records, placed)
+	primaryPlan, err := storeio.PlanPrimaryGraphSummarized(
+		storeID, records, placed, normalized.skipIndexes,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -334,7 +336,9 @@ func createFromPrimaryGraphRecords(
 		PrimaryRoot:           primaryRoot,
 		ExactIndexRoot:        exactIndexRoot,
 	}
-	root.Options = fileStoreCollectionOptionFlags(normalized.Collection)
+	root.Options = fileStoreCollectionOptionFlags(
+		normalized.Collection, len(normalized.SkipIndexes) != 0,
+	)
 	if normalized.MaterializationDamageGranule != 0 {
 		root.Options |= storeio.StateOptionCanonicalMaterialization
 		root.MaterializationDamageGranule =
@@ -559,7 +563,9 @@ func primaryBulkStoreID(
 	writeUint64(uint64(options.MaxKeyBytes))
 	writeUint64(uint64(options.InlineValueBytes))
 	writeUint64(uint64(options.MaxDocumentBytes))
-	writeUint64(uint64(fileStoreCollectionOptionFlags(options.Collection)))
+	writeUint64(uint64(fileStoreCollectionOptionFlags(
+		options.Collection, len(options.SkipIndexes) != 0,
+	)))
 	// The canonical index catalog is part of the immutable file image: a build
 	// with different indexes must produce a different identity. indexCatalogHash
 	// is the deterministic FNV of the canonical alias names and paths, so it

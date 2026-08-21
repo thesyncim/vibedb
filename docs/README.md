@@ -20,6 +20,13 @@ release promises or a compatibility roadmap.
 - [Distributed server boundary](design/distributed-sharding.md): loopback
   shard/gateway commands, local fencing, supported distributed reads, and
   explicit HA/resharding exclusions.
+- [Distributed system target](design/distributed-system.md): routed and
+  distributed execution lanes, tenant-independent virtual buckets, global
+  indexes/projections, vectorized multi-stage analytics, replication, movement,
+  and delivery gates. It is an implementation contract, not a statement of
+  current capability.
+- [Distributed transactions](design/distributed-transactions.md): participant
+  state, visibility, recovery, encoding, and current implementation boundary.
 - [Performance](performance.md): latest commit-pinned benchmark publication
   and reproduction guidance.
 - [Security policy](../SECURITY.md): current reporting and support boundary.

@@ -860,69 +860,84 @@ func (s *compactStreamScratch) encodePrefixInt(
 		}, true
 	}
 	restarts := (len(values) + compactStreamRestart - 1) / compactStreamRestart
-	data := slices.Grow(s.data[slot][:0], 2+4*restarts)[:2+4*restarts]
-	clear(data)
 	if fixedWidth {
 		if first.width > int(^uint8(0)) {
 			return compactStreamEncoding{}, false
 		}
-		data[0], data[1] = 1, byte(first.width)
 	}
-	var previous uint64
-	for row, value := range parsed {
-		if row%compactStreamRestart == 0 {
-			binary.LittleEndian.PutUint32(data[2+(row/compactStreamRestart)*4:], uint32(len(data)))
-			var fixed [8]byte
-			binary.LittleEndian.PutUint64(fixed[:], value)
-			data = append(data, fixed[:]...)
-		} else {
-			delta := int64(value - previous)
-			data = appendCompactUvarint(data, uint64(delta<<1)^uint64(delta>>63))
-		}
-		previous = value
-	}
-	packedBytes := 2 + 4*restarts
-	for first := 0; first < len(parsed); first += compactStreamRestart {
-		last := min(first+compactStreamRestart, len(parsed))
+	headerBytes := 2 + 4*restarts
+	varintBytes, packedBytes := headerBytes, headerBytes
+	for blockFirst := 0; blockFirst < len(parsed); blockFirst += compactStreamRestart {
+		last := min(blockFirst+compactStreamRestart, len(parsed))
 		width := 0
-		previous := parsed[first]
-		for row := first + 1; row < last; row++ {
+		previous := parsed[blockFirst]
+		varintBytes += 8
+		for row := blockFirst + 1; row < last; row++ {
 			delta := int64(parsed[row] - previous)
 			zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+			varintBytes += (bits.Len64(zigzag|1) + 6) / 7
 			width = max(width, bits.Len64(zigzag))
 			previous = parsed[row]
 		}
-		packedBytes += 9 + ((last-first-1)*width+7)/8
+		packedBytes += 9 + ((last-blockFirst-1)*width+7)/8
 	}
-	if packedBytes < len(data) {
-		data = slices.Grow(data[:0], packedBytes)[:2+4*restarts]
+	var data []byte
+	if packedBytes < varintBytes {
+		data = slices.Grow(s.data[slot][:0], packedBytes)[:packedBytes]
 		clear(data)
 		if fixedWidth {
 			data[0], data[1] = 1, byte(first.width)
 		}
 		data[0] |= 4
-		for first := 0; first < len(parsed); first += compactStreamRestart {
-			last := min(first+compactStreamRestart, len(parsed))
+		cursor := headerBytes
+		for blockFirst := 0; blockFirst < len(parsed); blockFirst += compactStreamRestart {
+			last := min(blockFirst+compactStreamRestart, len(parsed))
 			width := 0
-			previous := parsed[first]
-			for row := first + 1; row < last; row++ {
+			previous := parsed[blockFirst]
+			for row := blockFirst + 1; row < last; row++ {
 				delta := int64(parsed[row] - previous)
 				zigzag := uint64(delta<<1) ^ uint64(delta>>63)
 				width = max(width, bits.Len64(zigzag))
 				previous = parsed[row]
 			}
-			block := first / compactStreamRestart
-			binary.LittleEndian.PutUint32(data[2+block*4:], uint32(len(data)))
-			blockStart := len(data)
-			blockBytes := ((last-first-1)*width + 7) / 8
-			data = append(data, make([]byte, 9+blockBytes)...)
-			binary.LittleEndian.PutUint64(data[blockStart:], parsed[first])
+			block := blockFirst / compactStreamRestart
+			binary.LittleEndian.PutUint32(data[2+block*4:], uint32(cursor))
+			blockStart := cursor
+			cursor += 9 + ((last-blockFirst-1)*width+7)/8
+			binary.LittleEndian.PutUint64(data[blockStart:], parsed[blockFirst])
 			data[blockStart+8] = byte(width)
-			previous = parsed[first]
-			for row := first + 1; row < last; row++ {
+			previous = parsed[blockFirst]
+			for row := blockFirst + 1; row < last; row++ {
 				delta := int64(parsed[row] - previous)
 				zigzag := uint64(delta<<1) ^ uint64(delta>>63)
-				compactPutBits(data[blockStart+9:], (row-first-1)*width, width, zigzag)
+				compactPutBits(data[blockStart+9:], (row-blockFirst-1)*width, width, zigzag)
+				previous = parsed[row]
+			}
+		}
+	} else {
+		data = slices.Grow(s.data[slot][:0], varintBytes)[:varintBytes]
+		clear(data[:headerBytes])
+		if fixedWidth {
+			data[0], data[1] = 1, byte(first.width)
+		}
+		cursor := headerBytes
+		for blockFirst := 0; blockFirst < len(parsed); blockFirst += compactStreamRestart {
+			last := min(blockFirst+compactStreamRestart, len(parsed))
+			block := blockFirst / compactStreamRestart
+			binary.LittleEndian.PutUint32(data[2+block*4:], uint32(cursor))
+			previous := parsed[blockFirst]
+			binary.LittleEndian.PutUint64(data[cursor:], previous)
+			cursor += 8
+			for row := blockFirst + 1; row < last; row++ {
+				delta := int64(parsed[row] - previous)
+				zigzag := uint64(delta<<1) ^ uint64(delta>>63)
+				for zigzag >= 0x80 {
+					data[cursor] = byte(zigzag) | 0x80
+					cursor++
+					zigzag >>= 7
+				}
+				data[cursor] = byte(zigzag)
+				cursor++
 				previous = parsed[row]
 			}
 		}

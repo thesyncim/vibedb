@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/bits"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -116,6 +117,120 @@ func TestCompactPrimaryStripeRoundTrip(t *testing.T) {
 	}
 	if matched != want {
 		t.Fatalf("compact country count=%d want=%d", matched, want)
+	}
+}
+
+func TestCompactPrimaryStripeScalarSummary(t *testing.T) {
+	pointer, err := vibejson.CompilePointer("/score")
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []CommonPrimaryLeafRecord{
+		{Key: []byte("a"), Value: CommonPrimaryLeafValue{Inline: []byte(`{"score":10}`)}},
+		{Key: []byte("b"), Value: CommonPrimaryLeafValue{Inline: []byte(`{"score":20}`)}},
+	}
+	builder := NewUnifiedPrimaryLeafBuilder()
+	if err := builder.SetCompactPrimarySummaries([]vibejson.CompiledPointer{pointer}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := BuildCompactPrimaryStripePayload(records, builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if _, buildErr := BuildCompactPrimaryStripePayload(records, builder); buildErr != nil {
+			panic(buildErr)
+		}
+	}); allocs != 0 {
+		t.Fatalf("warm summarized compact build allocations = %v, want 0", allocs)
+	}
+	page, err := EncodeCompactPrimaryStripe(
+		make([]byte, 4096),
+		CommonPrimaryLeafHeader{
+			StoreID: unifiedTestStoreID(), Generation: 1,
+			Bucket: 0, PageSize: 4096,
+		},
+		records, builder,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = payload
+	view, ok := AdmittedCompactPrimaryStripe(page, unifiedTestStoreID(), 0)
+	if !ok || view.SummaryCount() != 1 {
+		t.Fatalf("summary view = (%v, %d)", ok, view.SummaryCount())
+	}
+	minimum, maximum, valid := view.Summary(0)
+	if !valid || bytes.Compare(minimum, maximum) >= 0 {
+		t.Fatalf("summary = (%x, %x, %v)", minimum, maximum, valid)
+	}
+	header, encoded, err := OpenPage(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryBytes := int(binary.LittleEndian.Uint32(encoded[36:40]))
+	corrupt := bytes.Clone(encoded)
+	corrupt[len(corrupt)-summaryBytes] |= 0x80
+	if _, admitted := AdmittedCachedCompactPrimaryStripe(
+		header, corrupt, unifiedTestStoreID(), 0,
+	); admitted {
+		t.Fatal("cached compact admission accepted unknown summary flags")
+	}
+}
+
+func TestCompactPrimaryStripeSummaryDeclinesUnboundedValues(t *testing.T) {
+	pointer, err := vibejson.CompilePointer("/score")
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflow := PageRef{
+		Offset: 128 << 10, LogicalID: PrimaryFirstDynamicLogicalID + 7,
+		Generation: 1, Length: 4096, Kind: PageOverflow,
+	}
+	tests := []struct {
+		name  string
+		value CommonPrimaryLeafValue
+		valid bool
+	}{
+		{name: "missing-is-null", value: CommonPrimaryLeafValue{Inline: []byte(`{"other":1}`)}, valid: true},
+		{name: "container", value: CommonPrimaryLeafValue{Inline: []byte(`{"score":{"nested":1}}`)}},
+		{name: "oversized", value: CommonPrimaryLeafValue{Inline: fmt.Appendf(nil, `{"score":%q}`, strings.Repeat("x", CompactPrimarySummaryMaxKeyBytes+1))}},
+		{name: "overflow", value: CommonPrimaryLeafValue{Overflow: overflow}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			builder := NewUnifiedPrimaryLeafBuilder()
+			if err := builder.SetCompactPrimarySummaries(
+				[]vibejson.CompiledPointer{pointer},
+			); err != nil {
+				t.Fatal(err)
+			}
+			records := []CommonPrimaryLeafRecord{{
+				Key: []byte("a"), Value: test.value,
+			}}
+			payload, err := BuildCompactPrimaryStripePayload(records, builder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := openCompactPrimaryStripePayload(
+				payload,
+				PageHeader{
+					StoreID: unifiedTestStoreID(), Generation: 1,
+					Kind: PagePrimaryLeaf, PayloadLength: uint32(len(payload)),
+				},
+				unifiedTestStoreID(), 0, CommonPrimaryLeafBounds{}, false, false,
+			)
+			if err != nil || view.SummaryCount() != 1 {
+				t.Fatalf("open summary = count %d, err %v", view.SummaryCount(), err)
+			}
+			minimum, maximum, valid := view.Summary(0)
+			if valid != test.valid {
+				t.Fatalf("summary valid = %v, want %v", valid, test.valid)
+			}
+			if valid && !bytes.Equal(minimum, maximum) {
+				t.Fatalf("single-row extrema differ: %x / %x", minimum, maximum)
+			}
+		})
 	}
 }
 

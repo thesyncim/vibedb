@@ -7,14 +7,16 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
 
 type fakeReady struct {
-	kind     raftmember.DriveKind
-	outbound *pb.Message
-	err      error
+	kind         raftmember.DriveKind
+	outbound     *pb.Message
+	readOutcomes []raftmodel.ReadOutcome
+	err          error
 }
 
 type fakeRuntime struct {
@@ -22,7 +24,14 @@ type fakeRuntime struct {
 	ready               []fakeReady
 	inputs              []ProgressKind
 	proposals           [][]byte
+	confChanges         []*pb.ConfChangeV2
+	readContexts        [][]byte
 	messages            []*pb.Message
+	publication         raftmodel.Publication
+	snapshotState       replicatedstate.State
+	status              raftmember.RuntimeStatus
+	progress            map[uint64]raftmodel.MemberProgress
+	transfers           []uint64
 	inputErr            error
 	failure             error
 	failureOnReadyError bool
@@ -50,6 +59,44 @@ func (runtime *fakeRuntime) Failure() error                       { return runti
 func (runtime *fakeRuntime) Propose(data []byte) error {
 	runtime.inputs = append(runtime.inputs, ProgressProposal)
 	runtime.proposals = append(runtime.proposals, append([]byte(nil), data...))
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) ProposeConfChange(change pb.ConfChangeI) error {
+	if change == nil {
+		runtime.confChanges = append(runtime.confChanges, nil)
+	} else {
+		runtime.confChanges = append(
+			runtime.confChanges, proto.Clone(change.AsV2()).(*pb.ConfChangeV2),
+		)
+	}
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) ReadIndex(context []byte) error {
+	runtime.readContexts = append(runtime.readContexts, append([]byte(nil), context...))
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Publication() (raftmodel.Publication, error) {
+	return runtime.publication, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) SnapshotState() (replicatedstate.State, error) {
+	return runtime.snapshotState, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Status() (raftmember.RuntimeStatus, error) {
+	return runtime.status, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Progress(memberID uint64) (raftmodel.MemberProgress, bool, error) {
+	progress, found := runtime.progress[memberID]
+	return progress, found, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) TransferLeader(memberID uint64) error {
+	runtime.transfers = append(runtime.transfers, memberID)
 	return runtime.inputErr
 }
 
@@ -94,7 +141,9 @@ func (runtime *fakeRuntime) DriveReady(
 	}
 	runtime.ready[0] = fakeReady{}
 	runtime.ready = runtime.ready[1:]
-	return raftmember.DriveResult{Kind: step.kind, ReadyID: 1}, nil
+	return raftmember.DriveResult{
+		Kind: step.kind, ReadyID: 1, ReadOutcomes: step.readOutcomes,
+	}, nil
 }
 
 func (runtime *fakeRuntime) Close() error {
@@ -267,6 +316,85 @@ func TestHostQueueDetachesAndRotatesInputClasses(t *testing.T) {
 	}
 	if host.queueItems != 0 || host.queueBytes != 0 {
 		t.Fatalf("queue accounting after drain = %d, %d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(4)
+	runtime.publication = raftmodel.Publication{Applied: 9, ReplicaSetVersion: 7}
+	runtime.status = raftmember.RuntimeStatus{
+		MemberID: runtime.identity.MemberID, LeaderID: runtime.identity.MemberID,
+		Term: 5, Commit: 9, Applied: 9,
+	}
+	runtime.progress = map[uint64]raftmodel.MemberProgress{
+		99: {Match: 9, Next: 10, RecentActive: true},
+	}
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); done || err != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, err)
+	}
+
+	member := uint64(99)
+	change := &pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &member,
+	}
+	if err := host.ProposeConfChange(runtime.identity.Group, change); err != nil {
+		t.Fatal(err)
+	}
+	member = 100
+	if len(runtime.confChanges) != 1 || runtime.confChanges[0].GetChanges()[0].GetNodeId() != 99 {
+		t.Fatalf("detached configuration changes = %+v", runtime.confChanges)
+	}
+
+	context := []byte("linearizable-read")
+	if err := host.ReadIndex(runtime.identity.Group, context); err != nil {
+		t.Fatal(err)
+	}
+	context[0] = 'X'
+	if len(runtime.readContexts) != 1 || string(runtime.readContexts[0]) != "linearizable-read" {
+		t.Fatalf("detached read contexts = %q", runtime.readContexts)
+	}
+	publication, err := host.Publication(runtime.identity.Group)
+	if err != nil || publication.Applied != 9 || publication.ReplicaSetVersion != 7 {
+		t.Fatalf("Publication = %+v, %v", publication, err)
+	}
+	runtime.snapshotState = replicatedstate.State{Applied: 9, SnapshotBaseDigest: [32]byte{1}}
+	snapshotState, err := host.SnapshotState(runtime.identity.Group)
+	if err != nil || snapshotState.Applied != 9 || snapshotState.SnapshotBaseDigest[0] != 1 {
+		t.Fatalf("SnapshotState = %+v, %v", snapshotState, err)
+	}
+	status, err := host.Status(runtime.identity.Group)
+	if err != nil || status.Term != 5 || status.Commit != 9 {
+		t.Fatalf("Status = %+v, %v", status, err)
+	}
+	memberProgress, found, err := host.Progress(runtime.identity.Group, 99)
+	if err != nil || !found || memberProgress.Match != 9 || !memberProgress.RecentActive {
+		t.Fatalf("Progress = %+v, %t, %v", memberProgress, found, err)
+	}
+	if err := host.TransferLeader(runtime.identity.Group, 99); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(runtime.transfers, []uint64{99}) {
+		t.Fatalf("leader transfers = %v", runtime.transfers)
+	}
+
+	runtime.ready = []fakeReady{{
+		kind: raftmember.DriveReadStatesFinished,
+		readOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+			Context: []byte("linearizable-read"), Index: 9, Term: 3, Incarnation: 1,
+		}}},
+	}}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.ReadyKind != raftmember.DriveReadStatesFinished ||
+		len(progress.ReadOutcomes) != 1 ||
+		string(progress.ReadOutcomes[0].Barrier.Context) != "linearizable-read" {
+		t.Fatalf("read outcome progress = %+v, %t, %v", progress, done, err)
 	}
 }
 

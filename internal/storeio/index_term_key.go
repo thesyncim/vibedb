@@ -58,6 +58,46 @@ type IndexTermComponent struct {
 	JSON      []byte
 }
 
+// IndexTermKeyEncodedSize reports the exact byte length AppendIndexTermKey
+// would append while applying the same scalar, direction, and total-key
+// validation. It materializes no canonical term, allowing bounded consumers to
+// decline an oversized key before granting an append room to grow.
+func IndexTermKeyEncodedSize(components []IndexTermComponent) (int, bool) {
+	if len(components) == 0 || len(components) > IndexTermMaxComponents {
+		return 0, false
+	}
+	size := 2 // format byte plus tuple terminator
+	for _, component := range components {
+		if component.Direction != IndexTermAscending ||
+			len(component.JSON) == 0 ||
+			len(component.JSON) > IndexTermMaxKeyBytes {
+			return 0, false
+		}
+		componentBytes := 0
+		valid := false
+		switch component.Kind {
+		case IndexTermNull:
+			valid = bytes.Equal(component.JSON, []byte("null"))
+			componentBytes = 1
+		case IndexTermBool:
+			valid = bytes.Equal(component.JSON, []byte("false")) ||
+				bytes.Equal(component.JSON, []byte("true"))
+			componentBytes = 1
+		case IndexTermNumber:
+			componentBytes, valid = orderedkey.NumberEncodedSize(component.JSON)
+		case IndexTermString:
+			componentBytes, valid = orderedkey.JSONStringEncodedSize(component.JSON)
+		default:
+			return 0, false
+		}
+		if !valid || componentBytes > IndexTermMaxKeyBytes-size {
+			return 0, false
+		}
+		size += componentBytes
+	}
+	return size, true
+}
+
 // AppendIndexTermKey appends one versioned, prefix-free canonical scalar tuple.
 // Components use orderedkey's type order (null, false, true, number, string)
 // and are concatenated in declared tuple order. The trailing byte makes a

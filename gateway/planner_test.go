@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +18,7 @@ func routeBoundPlan(t testing.TB, plan *BoundPlan) distribution.Route {
 	t.Helper()
 	route, err := distribution.NewRouter().Route(
 		plan.constraints,
-		distribution.NewNativeMapper(plan.spec.Arity),
+		distribution.NewNativeMapperWithBucketBits(plan.spec.Arity, plan.spec.EffectiveBucketBits()),
 		plan.manifest,
 		distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
 	)
@@ -109,6 +110,108 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	}
 	if len(scatterBound.aggregates) != 1 || scatterBound.aggregates[0] != sqlast.AggCount {
 		t.Fatalf("aggregate program = %v, want COUNT", scatterBound.aggregates)
+	}
+
+	grouped, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages GROUP BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare grouped aggregate: %v", err)
+	}
+	groupedBound, err := grouped.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind grouped aggregate: %v", err)
+	}
+	if err := groupedBound.ValidateRoute(routeBoundPlan(t, groupedBound)); err != nil {
+		t.Fatalf("scatter GROUP BY validation: %v", err)
+	}
+	wantKinds := []sqlast.AggKind{
+		sqlast.AggNone, sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}
+	if !slices.Equal(groupedBound.aggregates, wantKinds) || !slices.Equal(groupedBound.groupKeys, []int{0}) {
+		t.Fatalf("grouped program = %v keys %v, want %v keys [0]",
+			groupedBound.aggregates, groupedBound.groupKeys, wantKinds)
+	}
+
+	groupedOrder, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare grouped ORDER BY: %v", err)
+	}
+	groupedOrderBound, err := groupedOrder.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind grouped ORDER BY: %v", err)
+	}
+	if err := groupedOrderBound.ValidateRoute(routeBoundPlan(t, groupedOrderBound)); err != nil {
+		t.Fatalf("grouped ORDER BY validation = %v, want post-finalization sort", err)
+	}
+
+	nonlocalLimit, err := snap.Prepare(context.Background(),
+		`SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare nonlocal grouped LIMIT: %v", err)
+	}
+	nonlocalLimitBound, err := nonlocalLimit.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind nonlocal grouped LIMIT: %v", err)
+	}
+	if err := nonlocalLimitBound.ValidateRoute(routeBoundPlan(t, nonlocalLimitBound)); err != nil {
+		t.Fatalf("nonlocal grouped LIMIT validation = %v, want partial-fragment admission", err)
+	}
+
+	distinct, err := snap.Prepare(context.Background(),
+		`SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare DISTINCT: %v", err)
+	}
+	distinctBound, err := distinct.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind DISTINCT: %v", err)
+	}
+	if !slices.Equal(distinctBound.aggregates, []sqlast.AggKind{sqlast.AggNone}) ||
+		!slices.Equal(distinctBound.groupKeys, []int{0}) {
+		t.Fatalf("DISTINCT program = %v keys %v", distinctBound.aggregates, distinctBound.groupKeys)
+	}
+	if err := distinctBound.ValidateRoute(routeBoundPlan(t, distinctBound)); err != nil {
+		t.Fatalf("distributed DISTINCT validation = %v", err)
+	}
+	windowedDistinct, err := snap.Prepare(context.Background(),
+		`SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT ? OFFSET ?`)
+	if err != nil {
+		t.Fatalf("Prepare windowed DISTINCT: %v", err)
+	}
+	windowedDistinctBound, err := windowedDistinct.Bind([]any{2, 1})
+	if err != nil || !windowedDistinctBound.hasLimit || windowedDistinctBound.limit != 2 ||
+		windowedDistinctBound.offset != 1 {
+		t.Fatalf("windowed DISTINCT bind = %+v, %v", windowedDistinctBound, err)
+	}
+	if err := windowedDistinctBound.ValidateRoute(routeBoundPlan(t, windowedDistinctBound)); err != nil {
+		t.Fatalf("windowed DISTINCT validation = %v", err)
+	}
+
+	localLimit, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare shard-local grouped LIMIT: %v", err)
+	}
+	localLimitBound, err := localLimit.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind shard-local grouped LIMIT: %v", err)
+	}
+	if err := localLimitBound.ValidateRoute(routeBoundPlan(t, localLimitBound)); err != nil {
+		t.Fatalf("shard-local grouped LIMIT validation = %v", err)
+	}
+
+	missingKey, err := snap.Prepare(context.Background(),
+		`SELECT COUNT(*) FROM messages GROUP BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare omitted grouped key: %v", err)
+	}
+	missingKeyBound, err := missingKey.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind omitted grouped key: %v", err)
+	}
+	if err := missingKeyBound.ValidateRoute(routeBoundPlan(t, missingKeyBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("omitted grouped key validation = %v, want unsupported finalization", err)
 	}
 
 	single, err := snap.Prepare(context.Background(),
@@ -203,6 +306,19 @@ func TestPreparedPlanJoinColocationProof(t *testing.T) {
 	if err := noncolocatedBound.ValidateRoute(routeBoundPlan(t, noncolocatedBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
 		t.Fatalf("non-colocated join validation = %v, want unsupported", err)
 	}
+
+	config.Placements[0].AffinityGroup = "messages"
+	config.Placements[1].AffinityGroup = "users"
+	nonaffine, err := NewSnapshot(config, testEndpoints(), 2)
+	if err != nil {
+		t.Fatalf("NewSnapshot nonaffine: %v", err)
+	}
+	if _, err := nonaffine.Prepare(t.Context(), `
+		SELECT messages.n
+		FROM messages JOIN users ON messages.tenant_id = users.tenant_id
+		WHERE messages.tenant_id = 'acme'`); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("nonaffine join prepare = %v, want unsupported", err)
+	}
 }
 
 func TestPreparedPlanNeverPrunesAlwaysUnsafeSemantics(t *testing.T) {
@@ -274,8 +390,14 @@ func TestPreparedPlanRefusals(t *testing.T) {
 	if _, err := prepared.Bind(nil); !errors.Is(err, ErrPlanParameters) {
 		t.Fatalf("missing param err = %v, want ErrPlanParameters", err)
 	}
-	if _, err := snap.Prepare(context.Background(), `DELETE FROM messages`); !errors.Is(err, ErrWriteNotSupported) {
-		t.Fatalf("DELETE err = %v, want ErrWriteNotSupported", err)
+	// An unbounded DELETE prepares as a write plan but is refused at bind: it has
+	// no shard-key predicate, so it cannot be proven single-shard for any values.
+	deletePlan, err := snap.Prepare(context.Background(), `DELETE FROM messages`)
+	if err != nil {
+		t.Fatalf("DELETE Prepare: %v", err)
+	}
+	if _, err := deletePlan.BindWrite(nil); !errors.Is(err, ErrDistributedWriteUnsupported) {
+		t.Fatalf("DELETE bind err = %v, want ErrDistributedWriteUnsupported", err)
 	}
 	if _, err := snap.Prepare(context.Background(), `
 		WITH dormant AS (SELECT id FROM absent)

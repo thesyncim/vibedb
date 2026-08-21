@@ -16,6 +16,7 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
 			{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
 		},
+		SkipPaths: []string{"/score", "/profile/region"},
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: []PageCatalogSchemaField{
@@ -47,6 +48,9 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 		got.Schema.Fields[1].Path != "/tenant" {
 		t.Fatalf("canonical schema = %+v", got.Schema)
 	}
+	if !slices.Equal(got.SkipPaths, []string{"/profile/region", "/score"}) {
+		t.Fatalf("canonical skip paths = %q", got.SkipPaths)
+	}
 
 	reordered := PageCatalogDefinition{
 		Indexes: []PageCatalogIndex{
@@ -54,6 +58,7 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 			{Name: "z_by_score", Paths: []string{"/score"}},
 			{Name: "tenant_status_alias", Paths: []string{"/tenant", "/status"}},
 		},
+		SkipPaths: []string{"/profile/region", "/score"},
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: []PageCatalogSchemaField{
@@ -80,7 +85,9 @@ func TestPageCatalogCanonicalOrderDedupAndOwnership(t *testing.T) {
 	// Mutating caller and returned declarative storage cannot mutate the image.
 	input.Indexes[0].Name = "mutated"
 	input.Indexes[1].Paths[0] = "/mutated"
+	input.SkipPaths[0] = "/mutated"
 	got.Indexes[0].Name = "also_mutated"
+	got.SkipPaths[0] = "/also_mutated"
 	got.Schema.Fields[0].Path = "/also_mutated"
 	if !catalog.Equal(other) {
 		t.Fatal("catalog aliases caller or returned definition storage")
@@ -189,8 +196,16 @@ func TestPageCatalogRejectsInvalidDefinitions(t *testing.T) {
 	tooManySchema := make(
 		[]PageCatalogSchemaField, PageCatalogMaxSchemaFields+1,
 	)
+	tooManySkipPaths := make([]string, PageCatalogMaxSkipIndexes+1)
+	for i := range tooManySkipPaths {
+		tooManySkipPaths[i] = fmt.Sprintf("/skip/%d", i)
+	}
 	tests := []PageCatalogDefinition{
 		{Indexes: tooManyLogical},
+		{SkipPaths: tooManySkipPaths},
+		{SkipPaths: []string{"not/a/pointer"}},
+		{SkipPaths: []string{"/bad~2escape"}},
+		{SkipPaths: []string{"/same", "/same"}},
 		{Schema: &PageCatalogSchema{Fields: tooManySchema}},
 		{Indexes: []PageCatalogIndex{{Name: "", Paths: []string{"/a"}}}},
 		{Indexes: []PageCatalogIndex{{Name: "a"}}},
@@ -255,6 +270,10 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 				[]PageCatalogSchemaField, PageCatalogMaxSchemaFields,
 			),
 		},
+	}
+	maximum.SkipPaths = make([]string, PageCatalogMaxSkipIndexes)
+	for i := range maximum.SkipPaths {
+		maximum.SkipPaths[i] = fmt.Sprintf("/skip/%02d", i)
 	}
 	physicalPaths := make(
 		[][]string, PageCatalogMaxPhysicalIndexes,
@@ -358,6 +377,7 @@ func assertPageCatalogCompactAccounting(
 	wantTotal := PageCatalogCanonicalHeaderSize +
 		stringBytes + physicalBytes +
 		len(definition.Indexes)*4 +
+		len(definition.SkipPaths)*2 +
 		fieldCount*6
 	if catalog.CanonicalSize() != wantTotal ||
 		int(binary.LittleEndian.Uint32(catalog.canonical[16:20])) != wantTotal ||
@@ -379,6 +399,7 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 			{Name: "a", Paths: []string{"/aa"}},
 			{Name: "b", Paths: []string{"/ab"}},
 		},
+		SkipPaths: []string{"/skip/a", "/skip/b"},
 		Schema: &PageCatalogSchema{
 			Fields: []PageCatalogSchemaField{{
 				Path: "/s", Types: PageCatalogSchemaString,
@@ -392,6 +413,7 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 	stringBytes := int(binary.LittleEndian.Uint32(image[36:40]))
 	physicalBytes := int(binary.LittleEndian.Uint32(image[40:44]))
 	aliasStart := PageCatalogCanonicalHeaderSize + stringBytes + physicalBytes
+	skipStart := aliasStart + 2*4
 	for _, test := range []struct {
 		name   string
 		mutate func([]byte)
@@ -411,6 +433,11 @@ func TestPageCatalogRejectsNonCanonicalImages(t *testing.T) {
 			first := slices.Clone(src[aliasStart : aliasStart+4])
 			copy(src[aliasStart:aliasStart+4], src[aliasStart+4:aliasStart+8])
 			copy(src[aliasStart+4:aliasStart+8], first)
+		}},
+		{"skip order", func(src []byte) {
+			first := slices.Clone(src[skipStart : skipStart+2])
+			copy(src[skipStart:skipStart+2], src[skipStart+2:skipStart+4])
+			copy(src[skipStart+2:skipStart+4], first)
 		}},
 		{"schema reserved", func(src []byte) { src[len(src)-1] = 1 }},
 	} {

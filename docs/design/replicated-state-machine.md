@@ -8,11 +8,12 @@ durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
-wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
-snapshots, compact the Raft WAL, reserve physical system/user storage, provide
-peer authentication or network I/O, or authorize Read Committed or Serializable
-transactions across replicas. A static-WAL qualification now proves finite logical
-completion-count headroom for one exact healthy, initialized WAL/apply pair
+wire shard RPCs to Raft, permit client-facing replicated SQL writes, compact a
+live Raft WAL, reserve physical system/user
+storage, provide peer authentication or network I/O, or authorize Read Committed
+or Serializable transactions across replicas. An immutable-base WAL qualification now
+proves finite logical completion-count headroom for one exact healthy,
+initialized WAL/apply pair
 after checking its binding and applied/committed/log cut. It does not reserve
 bytes, grant proposal authority, or produce a lease. Its purpose is to make the
 local committed-entry boundary executable and crash-testable before those
@@ -209,17 +210,29 @@ A configuration entry mutates only the system state. It persists the exact
 core-produced `ConfState`, sets `ReplicaSetVersion` to the entry index, advances
 `Applied`, and leaves the logical data digest unchanged.
 
+An ownership-transition normal entry is a separate bounded binary control
+grammar, not a JSON document or synthetic SQL statement. It binds the complete
+current shard/group identity, exact replica-set version, source and target voter
+IDs, and current mutable serving fence. Apply requires both members in the
+stable incoming voter set, rejects joint membership, and advances ownership
+epoch, routing version, and catalog/route generation by exactly one in the same
+durable publication as `Applied`. Immutable allocation identity, schema/policy
+fences, logical data digest, and retained results do not change. Reopen requires
+the advanced binding, while exact retries of commands committed under an older
+monotone routing fence still resolve from their retained completion.
+
 The current state-machine port supplies configuration metadata plus the
 core-produced `ConfState`, not the original `ConfChange` bytes. Its retained
 configuration digest therefore binds index, term, entry type, and deterministic
 `ConfState`; it is exact at the apply-port boundary but is not a claim to retain
 the original configuration proposal envelope.
 
-The current machine accepts only the exact static bootstrap snapshot fixed at
-construction. Installation is an idempotent verification at the same cut,
-including exact snapshot bytes/identity, logical digest, `ConfState`, binding,
-and replica-set version. A newer runtime snapshot is unsupported until the
-snapshot repository and WAL generation-swap protocol exist.
+The Raft state-machine port accepts the exact static bootstrap and a newer
+bounded certificate only after its complete collection artifact has already
+been installed into non-serving destination files. Certificate installation is
+idempotent at the same cut and binds exact artifact identity, logical digest,
+`ConfState`, binding, replica-set version, and original bootstrap without
+putting collection rows in Raft snapshot data.
 
 ## Reader publication and reopen
 
@@ -240,13 +253,50 @@ fails stop. Reopen resolves the decision and observes either the old cut or the
 fully new cut; `raftmodel.NewNode` then resumes from the recovered `Applied`
 watermark without reapplying an already published entry.
 
-The first runtime snapshot interface must pin precisely this coherent cut. Its
-manifest must include user data, every retained completion, the exact binding
-and mutable authority profile, last-entry identity, logical digest,
-`ConfState`, replica-set version, and applied index. The pin need not itself be
-durable: the repository must create, verify, sync, and publish an immutable
-artifact before compaction. Snapshot publication and WAL compaction therefore
-depend on this state-machine boundary, not the reverse.
+`WriteSnapshotArtifact` now streams precisely this coherent cut. Its one current
+binary grammar embeds the canonical state envelope, raw user-collection name,
+every hidden system row, and every user row in strict collection/key order.
+Rows are never fragmented. Ordinary chunks target 4 MiB, one exceptional row
+is bounded by the frozen 4 MiB document profile, and callers can reuse a fixed
+payload buffer. Every chunk carries its sequence and prior digest; the footer
+binds exact row, payload, chunk, and encoded-byte totals. Verification refuses
+declared oversize chunks before allocation, verifies a complete chunk before
+exposing borrowed row bytes, matches the hidden state row to the header, and
+emits exact end-offset/digest checkpoints for resumable destination staging.
+No `encoding/json`, synthesized SQL, or per-row collection string is involved.
+
+This is a certified transfer primitive, not a serving snapshot. Transfer
+authentication and topology authorization must supply the expected final
+manifest. `SnapshotArtifactStage` writes chunks only into caller-owned
+non-serving synchronous collections, splits them at the destination's real
+batch bounds, and orders every acknowledged collection update before cursor
+publication. The fixed cursor sidecar is checksum-protected, atomically
+replaced under an advisory writer lease, directory-synced, and binds the source
+state/header, exact range offset, hash-chain predecessor, cumulative bounds,
+collection order, and last key. Resume therefore requests only the next range;
+it retains no second artifact copy and replays at most a cursor-outcome-unknown
+chunk through exact idempotent puts. Cursor replacement is grouped at a 64 MiB
+default (and forced on every receive return), avoiding a directory fsync per
+4 MiB transfer chunk while keeping crash replay explicitly bounded.
+
+After the footer matches the authenticated expected manifest, `OpenCandidate`
+still performs the expensive full proof: hidden state and completions, user
+placement validation, logical-digest recomputation, binding, membership, and
+applied publication. It returns only a non-serving Machine. A deterministic
+bounded certificate then binds that exact artifact state, original index-one
+bootstrap, and stable `ConfState` into a fresh encrypted immutable-base WAL.
+The candidate atomically retains the certificate identity at the same applied
+cut, and a learner created from it accepts `N+1...` only through ordinary Raft
+`AppendEntries`; no row bytes or ad hoc mutation tail pass through Raft
+snapshot data. Exact certificate reinstall is idempotent, and a different
+certificate at the same cut fails closed.
+
+The non-serving rebalance kernel now orders intact-shard learner qualification,
+promotion, leader transfer, replicated ownership transition, exact catalog CAS,
+generation drain, source removal, and retirement. Authenticated transfer,
+external topology authorization, source-to-target SQL-root construction,
+server wiring, physical range filtering/split, and live serving failover remain
+absent. The implemented primitives grant no serving authority by themselves.
 
 ## Isolation boundary
 
@@ -294,12 +344,14 @@ local apply claim. They deliberately grant no serving authority.
 Serving is prohibited because the current tree lacks:
 
 - physical system/user byte reservation and safe completion GC beyond the
-  instantaneous static-base logical headroom proof;
-- crash-atomic runtime snapshots, a reconstructed suffix-reservation ledger,
-  and WAL generation compaction;
+  instantaneous immutable-base logical headroom proof;
+- topology-authorized learner publication, a live WAL generation swap, and the
+  source/target orchestration around the implemented certified learner base,
+  ordinary ordered tail catch-up, and suffix-capacity reconstruction;
 - peer enrollment, mutually authenticated network I/O, shared per-peer flow
   control, snapshot transport, dynamic membership reconciliation, and
   deadline/slow-disk isolation around the in-process host and frame validator;
 - leader-aware routing with a fenced range proof, applied-position tokens,
-  completion lookup, and `ReadIndex` reads; and
+  completion lookup, and a coherent SQL snapshot bound to the now-exposed
+  non-serving `ReadIndex` outcome; and
 - a replicated SQL command grammar capable of the advertised isolation mode.

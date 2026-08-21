@@ -277,6 +277,17 @@ Boolean intersections use linear advance for nearby masks and galloping advance
 for skewed masks. An exact indexed `COUNT(*)` popcounts the final masks without
 reopening JSON.
 
+The durable ordered-primary implementation also range-seeks single-column
+exact indexes. Canonical scalar bounds binary-search the existing
+prefix-compressed term leaves, union only the postings in the selected term
+span, and then recheck the complete predicate. Snapshot-generation overlays,
+including terms created after the last fold, use the same newest-visible rule
+as equality probes. Fixed term-count and cumulative bitmap-merge budgets
+decline broad or adversarial probes to the ordinary scan without exposing
+partial masks; warmed bounded probes retain their endpoint and bitmap arenas
+and allocate nothing. This reuses the exact index bytes—there is no second
+range-index format or per-row value copy.
+
 This is a Roaring-inspired execution strategy, not the Roaring serialization or
 container format. Array, bitmap, and run-container adaptation is not currently
 implemented.
@@ -479,6 +490,15 @@ retirement capacity is exhausted.
 never returns a borrowed cache page. Query execution and range scans use the
 same lease.
 
+Prepared SQL point predicates materialize only exact native primary candidates.
+Prepared `<`, `<=`, `>`, `>=`, and `BETWEEN` predicates on the primary path bind
+directly into the same canonical ordered-key bytes and seek the durable primary
+graph at both endpoints. The bounded cursor skips excluded leaves before JSON
+reconstruction, while the ordinary compiled SQL predicate still rechecks every
+visited row. Inclusive endpoints, contradictory bounds, NULL, and oversized
+legal operands therefore change physical work only. Warm bound binding and
+bounded overflow scans retain caller/connection scratch and allocate nothing.
+
 Retirements are generation ordered. A pinned snapshot check is constant in the
 pending retired-extent count, and eligible drains are proportional only to the
 bounded number of extents reclaimed. Closing old snapshots promptly still
@@ -551,6 +571,26 @@ cannot inject counter pointers or reach the workspace through the session.
 `IndexWorkspace` and the snapshot `AppendIndex*Into` methods remain an explicit
 expert, single-consumer engine API for embedders implementing their own planner.
 The root facade and the standard query executor do not expose or require them.
+
+`durable.Options.SkipIndexes` declares up to eight RFC 6901 scalar paths for
+compact primary-stripe min/max summaries. Unlike an exact index, a skip index
+has no posting list and cannot identify matching rows; it only proves that an
+entire stripe cannot satisfy a conjunctive equality or ordered comparison.
+Paths and their canonical order are persisted in the page catalog and are
+reconstructed on a zero-option reopen. Missing values order as null. A
+container, a canonical scalar key longer than 256 bytes, any overflow row, or
+the 4 KiB per-stripe summary ceiling makes the relevant metadata conservative
+and unprunable rather than rejecting the write. Mutation patches retain old
+extrema and only widen them; if the existing entry cannot hold the wider key,
+the ordinary full-leaf rebuild recomputes the exact bounds.
+
+`Snapshot.CompileDataSkippingFilter` and
+`Snapshot.RangeDataSkippingRawBuffer` expose the reusable byte-native engine
+surface. The standard query executor uses it automatically when no stronger
+exact candidate mask, ordered-primary range, or overlay source is active. A
+warmed inline scan allocates nothing, and `ExecStats.DataSkippedRows` plus
+`DataSkippedStripes` expose physical work avoided. Row predicates remain the
+semantic authority for every retained stripe.
 
 ### Bulk creation
 
@@ -649,15 +689,21 @@ for another.
 
 The embedded API has no replication, failover, backup manager, point-in-time
 restore, or cross-database transaction. The separate distributed tier is
-experimental, server-only, leader-only, and read-only. Its shard and gateway
-commands accept loopback listeners; the gateway speaks newline-delimited JSON,
-not pgwire, and neither server protocol supplies transport authentication.
+experimental, server-only, and leader-only, with a read fan-out and a
+single-shard write fast path plus synchronous fixed-participant atomic batches
+across tables and shards. Gateways periodically scan the bounded durable
+coordinator index and redrive recovery. Its shard and gateway commands accept
+loopback listeners; the gateway speaks newline-delimited JSON, not pgwire, and
+neither server protocol supplies transport authentication.
 Local catalog high-water marks fence stale coordinates on one open store but
 are not a distributed lease, election, or copied-store revocation mechanism.
 
 The current component inventory, initialization commands, supported query
 shapes, and explicit HA/resharding exclusions are maintained in the
-[distributed server boundary](design/distributed-sharding.md). The PostgreSQL
+[distributed server boundary](design/distributed-sharding.md). Its current
+placement mapper hashes a full locality tuple into tenant-independent virtual
+buckets; tenant-scoped metadata refuses tenant identity as the complete shard
+key. The PostgreSQL
 protocol-v3 server is a separate embedded SQL endpoint. It supports the
 documented DDL, DML, SELECT, prepared-statement, join, and transaction subset,
 including multi-table commits and savepoints, but does not provide general

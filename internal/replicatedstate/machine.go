@@ -193,7 +193,7 @@ func Open(
 		m.publication = raftmodel.Publication{LogicalDigest: logical, ConfState: new(pb.ConfState)}
 		return m, nil
 	}
-	if state.Binding != binding || state.BootstrapDigest != bootstrapDigest ||
+	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
 		state.LogicalDigest != logical || state.CompletionCount != completionCount ||
 		state.CompletionCount > options.MaxCompletions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
@@ -207,9 +207,35 @@ func Open(
 		return nil, err
 	}
 	m.state = state
+	m.binding = state.Binding
 	m.initialized = true
 	m.publication = publicationFromState(state)
 	return m, nil
+}
+
+// bindingAdvancesFrom permits reopen through the write-once SQL/WAL binding
+// after one or more replicated intact-shard ownership transitions. Immutable
+// allocation identity and policy/schema fences remain exact. The three serving
+// coordinates must advance together by the same distance because the sole
+// ownership control grammar increments each exactly once per committed move.
+func bindingAdvancesFrom(initial, current Binding) bool {
+	if initial.ClusterID != current.ClusterID ||
+		initial.ClusterIncarnation != current.ClusterIncarnation ||
+		initial.TopologyRecoveryEpoch != current.TopologyRecoveryEpoch ||
+		initial.Distribution != current.Distribution || initial.Shard != current.Shard ||
+		initial.AllocationGeneration != current.AllocationGeneration ||
+		initial.ShardIncarnation != current.ShardIncarnation || initial.GroupID != current.GroupID ||
+		initial.ActivePolicyGeneration != current.ActivePolicyGeneration ||
+		initial.ProtectionEpoch != current.ProtectionEpoch ||
+		initial.SchemaGeneration != current.SchemaGeneration ||
+		current.OwnershipEpoch < initial.OwnershipEpoch ||
+		current.RoutingVersion < initial.RoutingVersion ||
+		current.RouteGeneration < initial.RouteGeneration {
+		return false
+	}
+	delta := current.OwnershipEpoch - initial.OwnershipEpoch
+	return current.RoutingVersion-initial.RoutingVersion == delta &&
+		current.RouteGeneration-initial.RouteGeneration == delta
 }
 
 func checkedTxnBytes(userBatchBytes, systemBatchBytes int) (int64, bool) {
@@ -253,6 +279,8 @@ func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
 	if snapshot == nil || snapshot.GetMetadata() == nil ||
 		snapshot.GetMetadata().GetIndex() != 1 || snapshot.GetMetadata().GetTerm() != 1 ||
 		len(snapshot.GetData()) > MaxStaticBootstrapBytes ||
+		(len(snapshot.GetData()) >= len(snapshotBaseMagic) &&
+			bytes.Equal(snapshot.GetData()[:len(snapshotBaseMagic)], snapshotBaseMagic[:])) ||
 		len(snapshot.ProtoReflect().GetUnknown()) != 0 ||
 		len(snapshot.GetMetadata().ProtoReflect().GetUnknown()) != 0 {
 		return nil, [32]byte{}, ErrStaticSnapshotOnly
@@ -366,8 +394,8 @@ func (m *Machine) validateRetainedCompletions(snapshot *durable.Snapshot, state 
 				completion.ReplicaSetVersion > state.ReplicaSetVersion ||
 				completion.ActivePolicyGeneration != state.Binding.ActivePolicyGeneration ||
 				completion.ProtectionEpoch != state.Binding.ProtectionEpoch ||
-				completion.RoutingVersion != state.Binding.RoutingVersion ||
-				completion.RouteGeneration != state.Binding.RouteGeneration) {
+				completion.RoutingVersion > state.Binding.RoutingVersion ||
+				completion.RouteGeneration > state.Binding.RouteGeneration) {
 			return fmt.Errorf("%w: retained completion mutable binding", ErrCompletionCorrupt)
 		}
 		switch completion.ResultCode {

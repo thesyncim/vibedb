@@ -20,12 +20,13 @@ func (p *plan) fileCandidateMasks(snapshot *durable.Snapshot, index *durable.Ind
 		return nil, err
 	}
 	index.Reset(snapshot)
-	// Durable offers neither optional capability: the ordered primary graph
-	// carries no block-pruning summaries, and a live-row universe would mean
-	// reading every document page — real I/O rather than the metadata read a
-	// NOT needs it to be — so durable declines NOT. Candidate generation runs
-	// from the declared index catalog alone.
-	masks, _, err := snapshotCandidateMasks(p, index, sourceCaps{}, w, false)
+	// Durable offers ordered scalar range probes through its persisted exact
+	// term leaves. It still offers no cheap live-row universe: constructing one
+	// would read every primary page, so durable declines NOT rather than hiding
+	// a full scan behind a metadata capability.
+	masks, _, err := snapshotCandidateMasks(
+		p, index, sourceCaps{ranges: index}, w, false,
+	)
 	if err == nil {
 		err = w.checkCanceled()
 	}
@@ -57,9 +58,11 @@ func (p *plan) fileCandidateMasksBounded(
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, err
 	}
-	planned := p.fileIndexPlanMemoryBytes(
-		bound, bound.CandidateWorkspaceBytes,
-	)
+	workspaceBytes := bound.CandidateWorkspaceBytes
+	if p.where.hasRangeComparison() {
+		workspaceBytes = max(workspaceBytes, bound.RangeWorkspaceBytes)
+	}
+	planned := p.fileIndexPlanMemoryBytes(bound, workspaceBytes)
 	if memoryBytes < 0 || planned > memoryBytes {
 		return nil, 0, nil
 	}

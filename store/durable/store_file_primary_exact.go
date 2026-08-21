@@ -463,6 +463,18 @@ func (s *Snapshot) appendPrimaryExactMasks(
 	if err != nil {
 		return dst, err
 	}
+	return s.appendPrimaryExactMasksKey(dst, workspace, indexID, key)
+}
+
+// appendPrimaryExactMasksKey is the canonical-term core shared by equality
+// and ordered range probes. key is already a validated single- or compound-
+// index term owned by the caller for this call.
+func (s *Snapshot) appendPrimaryExactMasksKey(
+	dst []store.Mask,
+	workspace *IndexWorkspace,
+	indexID uint32,
+	key []byte,
+) ([]store.Mask, error) {
 	epoch := s.epoch
 	if epoch == nil || int(indexID) >= len(epoch.exact) {
 		return dst, nil
@@ -707,6 +719,268 @@ func (s *Snapshot) appendPrimaryExactMasks(
 		workspace.lastProbe.PostingPages = 1
 	}
 	return dst, nil
+}
+
+// primaryExactRangeMaxTerms bounds the number of distinct ordered terms a
+// candidate range will union before declining to the ordinary scan. It is a
+// latency guard, not a correctness limit: declining exposes no partial masks.
+const (
+	primaryExactRangeMaxTerms         = 4096
+	primaryExactRangeMaxMaskMergeWork = 1 << 20
+)
+
+// appendPrimaryExactRangeMasks walks only canonical terms in [lower, upper),
+// resolves every term through the same snapshot-generation overlay rule as an
+// equality probe, and unions its ordered posting masks. The resident exact
+// leaves already persist prefix-compressed ordered keys, so this adds no second
+// index copy or leaf grammar.
+func (s *Snapshot) appendPrimaryExactRangeMasks(
+	dst []store.Mask,
+	workspace *IndexWorkspace,
+	name string,
+	span store.IndexRange,
+) ([]store.Mask, bool, error) {
+	workspace.lastProbe = IndexProbeStats{}
+	if !span.HasLower && !span.HasUpper {
+		return dst, false, nil
+	}
+	indexID, ok := s.indexNameIDs[name]
+	if !ok {
+		return dst, false, store.ErrIndexNotFound
+	}
+	if int(indexID) >= len(s.indexes) || s.indexes[indexID].N != 1 {
+		return dst, false, store.ErrIndexArity
+	}
+	exact := s.indexes[indexID]
+	var components [store.MaxIndexColumns]storeio.IndexTermComponent
+	var one [1]vibejson.Index
+	var lower, upper []byte
+	if span.HasLower {
+		one[0] = span.Lower
+		key, err := appendPrimaryExactNeedleTerm(
+			workspace.rangeLower[:0], components[:], exact, one[:],
+		)
+		if err != nil {
+			return dst, false, err
+		}
+		if !span.LowerInclusive {
+			// Canonical tuple keys are prefix-free. Appending one zero byte is
+			// their immediate lexical successor and excludes only the endpoint.
+			key = append(key, 0)
+		}
+		workspace.rangeLower = key
+		lower = key
+	}
+	if span.HasUpper {
+		one[0] = span.Upper
+		key, err := appendPrimaryExactNeedleTerm(
+			workspace.rangeUpper[:0], components[:], exact, one[:],
+		)
+		if err != nil {
+			return dst, false, err
+		}
+		if span.UpperInclusive {
+			key = append(key, 0)
+		}
+		workspace.rangeUpper = key
+		upper = key
+	}
+	if len(lower) != 0 && len(upper) != 0 && bytes.Compare(lower, upper) >= 0 {
+		return dst, true, nil
+	}
+
+	epoch := s.epoch
+	if epoch == nil || int(indexID) >= len(epoch.exact) {
+		return dst, true, nil
+	}
+	resident := &epoch.exact[indexID]
+	acc := workspace.rangeAcc[:0]
+	merge := workspace.rangeMerge[:0]
+	probe := workspace.rangeProbe[:0]
+	last := workspace.rangeLast[:0]
+	terms := 0
+	mergeWork := 0
+	postingPages := 0
+
+	appendTerm := func(key []byte) (bool, error) {
+		if bytes.Equal(last, key) {
+			return true, nil
+		}
+		if terms == primaryExactRangeMaxTerms {
+			return false, nil
+		}
+		last = append(last[:0], key...)
+		workspace.lastProbe = IndexProbeStats{}
+		var err error
+		probe, err = s.appendPrimaryExactMasksKey(
+			probe[:0], workspace, indexID, key,
+		)
+		if err != nil {
+			return false, err
+		}
+		postingPages += workspace.lastProbe.PostingPages
+		remainingWork := primaryExactRangeMaxMaskMergeWork - mergeWork
+		if len(acc) > remainingWork || len(probe) > remainingWork-len(acc) {
+			return false, nil
+		}
+		stepWork := len(acc) + len(probe)
+		mergeWork += stepWork
+		merge = unionPrimaryExactRangeMasks(merge[:0], acc, probe)
+		acc, merge = merge, acc[:0]
+		terms++
+		return true, nil
+	}
+
+	// Start at the predecessor leaf because it may contain lower after a first
+	// term smaller than lower. Upper terminates the leaf walk before any later
+	// prefix-compressed key is reconstructed.
+	start := 0
+	if len(lower) != 0 && len(resident.leaves) != 0 {
+		start = primaryExactLeafAt(resident.leaves, lower, 0)
+		if start < 0 {
+			start = 0
+		}
+	}
+	for at := start; at < len(resident.leaves); at++ {
+		leaf := &resident.leaves[at]
+		if len(upper) != 0 && bytes.Compare(leaf.firstKey, upper) >= 0 {
+			break
+		}
+		iterator := leaf.view.Range(lower, upper)
+		for {
+			key, _, next := iterator.Next()
+			if !next {
+				break
+			}
+			bounded, err := appendTerm(key)
+			if err != nil {
+				return dst, false, err
+			}
+			if !bounded {
+				workspace.rangeProbe = probe
+				workspace.rangeAcc = acc
+				workspace.rangeMerge = merge
+				workspace.rangeLast = last
+				workspace.lastProbe = IndexProbeStats{}
+				return dst, false, nil
+			}
+		}
+	}
+
+	// A term created after the fold base is absent from the resident leaf walk.
+	// Overlay entries are published atomically into a fixed table, so scanning
+	// its bounded slots is race-free. Base-backed entries were already resolved
+	// above and are skipped to avoid duplicate physical work.
+	if epoch.termRecordCount.Load() != 0 {
+		for slot := range epoch.termTable {
+			entry := epoch.termTable[slot].Load()
+			if entry == nil || entry.indexID != indexID {
+				continue
+			}
+			key := epoch.termBytesFor(entry)
+			if !primaryExactRangeContains(key, lower, upper) ||
+				primaryExactResidentHasTerm(
+					resident, s.collection.storeID, key,
+				) ||
+				!primaryExactEntryVisible(entry, s.state.root.Generation) {
+				continue
+			}
+			bounded, err := appendTerm(key)
+			if err != nil {
+				return dst, false, err
+			}
+			if !bounded {
+				workspace.rangeProbe = probe
+				workspace.rangeAcc = acc
+				workspace.rangeMerge = merge
+				workspace.rangeLast = last
+				workspace.lastProbe = IndexProbeStats{}
+				return dst, false, nil
+			}
+		}
+	}
+
+	workspace.rangeProbe = probe
+	workspace.rangeAcc = acc
+	workspace.rangeMerge = merge
+	workspace.rangeLast = last
+	stats := IndexProbeStats{PostingPages: postingPages}
+	for _, mask := range acc {
+		if mask.Bits == 0 {
+			continue
+		}
+		stats.CandidateRows += uint64(bits.OnesCount64(mask.Bits))
+		stats.CandidateChunks++
+	}
+	workspace.lastProbe = stats
+	return append(dst, acc...), true, nil
+}
+
+func primaryExactRangeContains(key, lower, upper []byte) bool {
+	return (len(lower) == 0 || bytes.Compare(key, lower) >= 0) &&
+		(len(upper) == 0 || bytes.Compare(key, upper) < 0)
+}
+
+func primaryExactEntryVisible(entry *primaryExactTermEntry, atGen uint64) bool {
+	for record := entry.head.Load(); record != nil; record = record.next {
+		if record.gen <= atGen {
+			return true
+		}
+	}
+	return false
+}
+
+func primaryExactResidentHasTerm(
+	resident *primaryExactResident,
+	storeID [16]byte,
+	key []byte,
+) bool {
+	if resident == nil || len(resident.leaves) == 0 {
+		return false
+	}
+	at := primaryExactLeafAt(resident.leaves, key, 0)
+	if at < 0 {
+		at = 0
+	}
+	record := storeio.IndexTermKeyRecord{
+		Canonical: key,
+		RouteHash: storeio.IndexTermRouteHash(storeID, key),
+	}
+	for ; at < len(resident.leaves); at++ {
+		leaf := &resident.leaves[at]
+		if bytes.Compare(leaf.firstKey, key) > 0 {
+			break
+		}
+		if _, ok := leaf.view.LookupRecord(record); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func unionPrimaryExactRangeMasks(
+	dst, left, right []store.Mask,
+) []store.Mask {
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		switch {
+		case left[i].Chunk < right[j].Chunk:
+			dst = append(dst, left[i])
+			i++
+		case left[i].Chunk > right[j].Chunk:
+			dst = append(dst, right[j])
+			j++
+		default:
+			dst = append(dst, store.Mask{
+				Chunk: left[i].Chunk,
+				Bits:  left[i].Bits | right[j].Bits,
+			})
+			i++
+			j++
+		}
+	}
+	dst = append(dst, left[i:]...)
+	return append(dst, right[j:]...)
 }
 
 // primaryExactStagedLeaf is one leaf staged durable by the bulk build or a

@@ -157,6 +157,15 @@ type UnifiedPrimaryLeafBuilder struct {
 	patchValues  []unifiedPrimaryPatchValueDelta
 	patchInteger [24]byte
 	compact      compactPrimaryBuildScratch
+	// compactSummaryPointers are collection-catalog paths in canonical order.
+	// The per-path extrema slices are reused across every leaf build; they hold
+	// canonical ordered scalar keys, never document strings.
+	compactSummaryPointers []vibejson.CompiledPointer
+	compactSummaryMin      [][]byte
+	compactSummaryMax      [][]byte
+	compactSummaryValid    []bool
+	compactSummaryArena    []byte
+	compactSummaryProbe    []byte
 }
 
 // NewUnifiedPrimaryLeafBuilder returns a builder with modest starting scratch.
@@ -164,6 +173,55 @@ func NewUnifiedPrimaryLeafBuilder() *UnifiedPrimaryLeafBuilder {
 	return &UnifiedPrimaryLeafBuilder{
 		indexStore: make([]vibejson.IndexEntry, 0, 64),
 	}
+}
+
+// SetCompactPrimarySummaries fixes the canonical path order used by compact
+// stripe min/max metadata. Call it only while the builder is idle. The paths
+// are copied; their compiled bytecode remains immutable and safe to share.
+func (b *UnifiedPrimaryLeafBuilder) SetCompactPrimarySummaries(
+	pointers []vibejson.CompiledPointer,
+) error {
+	if b == nil || len(pointers) > PageCatalogMaxSkipIndexes {
+		return fmt.Errorf("%w: compact summary paths", ErrInvalidWrite)
+	}
+	clear(b.compactSummaryPointers)
+	clear(b.compactSummaryMin)
+	clear(b.compactSummaryMax)
+	b.compactSummaryPointers = append(
+		b.compactSummaryPointers[:0], pointers...,
+	)
+	b.compactSummaryMin = slices.Grow(
+		b.compactSummaryMin[:0], len(pointers),
+	)[:len(pointers)]
+	b.compactSummaryMax = slices.Grow(
+		b.compactSummaryMax[:0], len(pointers),
+	)[:len(pointers)]
+	b.compactSummaryValid = slices.Grow(
+		b.compactSummaryValid[:0], len(pointers),
+	)[:len(pointers)]
+	if len(pointers) == 0 {
+		b.compactSummaryArena = nil
+		b.compactSummaryProbe = nil
+		return nil
+	}
+	arenaBytes := 2 * len(pointers) * CompactPrimarySummaryMaxKeyBytes
+	if cap(b.compactSummaryArena) != arenaBytes {
+		b.compactSummaryArena = make([]byte, arenaBytes)
+	} else {
+		b.compactSummaryArena = b.compactSummaryArena[:arenaBytes]
+		clear(b.compactSummaryArena)
+	}
+	for i := range pointers {
+		start := 2 * i * CompactPrimarySummaryMaxKeyBytes
+		middle := start + CompactPrimarySummaryMaxKeyBytes
+		end := middle + CompactPrimarySummaryMaxKeyBytes
+		b.compactSummaryMin[i] = b.compactSummaryArena[start:start:middle]
+		b.compactSummaryMax[i] = b.compactSummaryArena[middle:middle:end]
+	}
+	b.compactSummaryProbe = make(
+		[]byte, 0, compactPrimarySummaryProbeBytes,
+	)
+	return nil
 }
 
 // canonicalOf resolves row i's canonical spelling against the builder heap or
@@ -375,6 +433,7 @@ func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 	b.spans = b.spans[:0]
 	b.rows = slices.Grow(b.rows[:0], count)[:0]
 	b.shapes = b.shapes[:0]
+	b.resetCompactPrimarySummaries()
 	for i := range count {
 		key := b.keyAt(i)
 		inline := b.inlineValueAt(i)
@@ -390,6 +449,7 @@ func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 			// chain itself holds the canonical spelling and the row takes
 			// no part in the template census.
 			b.rows = append(b.rows, unifiedPrimaryLeafRow{heapOff: -1, shape: -1})
+			b.invalidateCompactPrimarySummaries()
 			continue
 		}
 		if len(inline) == 0 {
@@ -397,6 +457,9 @@ func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 		}
 		index, err := b.buildIndex(inline)
 		if err != nil {
+			return err
+		}
+		if err := b.addCompactPrimarySummaryRow(inline); err != nil {
 			return err
 		}
 		row := unifiedPrimaryLeafRow{heapOff: -1}

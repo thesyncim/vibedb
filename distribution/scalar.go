@@ -1,6 +1,6 @@
-// Package distribution implements the frozen placement scalar and ordered
-// tuple codec used as cross-shard routing identity: a closed String/exact
-// Number scalar set, canonical byte encoding, and current tuple framing.
+// Package distribution implements cross-shard placement identity: a closed
+// String/exact-Number scalar set, canonical tuple framing, tenant-independent
+// virtual buckets, immutable range manifests, and fenced routing targets.
 package distribution
 
 // ScalarKind identifies which member of the closed placement scalar set a

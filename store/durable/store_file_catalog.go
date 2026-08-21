@@ -41,6 +41,7 @@ func planFilePageCatalog(
 	size := catalog.CanonicalSize()
 	definition := catalog.Definition()
 	semanticEmpty := len(definition.Indexes) == 0 &&
+		len(definition.SkipPaths) == 0 &&
 		definition.Schema == nil
 	if size == 0 {
 		if !semanticEmpty {
@@ -158,11 +159,15 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 
 // fileStoreCollectionOptionFlags returns durable collection semantics carried
 // through every root generation.
-func fileStoreCollectionOptionFlags(options store.Options) uint32 {
+func fileStoreCollectionOptionFlags(options store.Options, hasSkipIndexes bool) uint32 {
+	var flags uint32
 	if options.Schema != nil {
-		return storeio.StateOptionSchema
+		flags |= storeio.StateOptionSchema
 	}
-	return 0
+	if hasSkipIndexes {
+		flags |= storeio.StateOptionSkipIndexes
+	}
+	return flags
 }
 
 // normalizeOpenedFileStoreOptions reconstructs every frozen collection option
@@ -181,13 +186,16 @@ func normalizeOpenedFileStoreOptions(
 	}
 	definition := catalog.Definition()
 	hasIndexes := len(definition.Indexes) != 0
+	hasSkipIndexes := len(definition.SkipPaths) != 0
 	hasSchema := definition.Schema != nil
 	catalogAsserted := supplied.Indexes != nil ||
+		supplied.SkipIndexes != nil ||
 		supplied.Collection.Schema != nil
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
 		(root.Options&storeio.StateOptionSchema != 0) != hasSchema ||
+		(root.Options&storeio.StateOptionSkipIndexes != 0) != hasSkipIndexes ||
 		(root.PageCatalogBytes != 0) !=
-			(hasIndexes || hasSchema) {
+			(hasIndexes || hasSkipIndexes || hasSchema) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: catalog definition disagrees with state root",
 			storeio.ErrPageCatalogCorrupt,
@@ -228,8 +236,11 @@ func normalizeOpenedFileStoreOptions(
 			"vibedb: collection persisted option mismatch",
 		)
 	}
-	persistedFlags := root.Options & storeio.StateOptionSchema
-	assertedFlags := fileStoreCollectionOptionFlags(supplied.Collection)
+	persistedFlags := root.Options &
+		(storeio.StateOptionSchema | storeio.StateOptionSkipIndexes)
+	assertedFlags := fileStoreCollectionOptionFlags(
+		supplied.Collection, len(supplied.SkipIndexes) != 0,
+	)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"vibedb: collection persisted representation mismatch",
@@ -253,6 +264,9 @@ func normalizeOpenedFileStoreOptions(
 				Name: index.Name, Paths: slices.Clone(index.Paths),
 			}
 		}
+	}
+	if options.SkipIndexes == nil {
+		options.SkipIndexes = slices.Clone(definition.SkipPaths)
 	}
 	if options.Collection.Schema == nil && definition.Schema != nil {
 		fields := make(
@@ -297,7 +311,9 @@ func normalizeOpenedFileStoreOptions(
 		root.IndexMaxDepth !=
 			uint32(max(normalized.Collection.IndexOptions.MaxDepth, 0)) ||
 		persistedFlags !=
-			fileStoreCollectionOptionFlags(normalized.Collection) {
+			fileStoreCollectionOptionFlags(
+				normalized.Collection, len(normalized.SkipIndexes) != 0,
+			) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: state summaries disagree with canonical catalog",
 			storeio.ErrPageCatalogCorrupt,

@@ -3,16 +3,16 @@ package gateway
 import (
 	"bytes"
 	"container/heap"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
-	"strconv"
-	"strings"
+	"slices"
 
-	queryplanner "github.com/thesyncim/vibedb/planner"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
+	queryengine "github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	vibejson "github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
 )
 
 // The shard-result merge: a single-shard route streams through unchanged; a
@@ -55,6 +55,10 @@ var ErrMergeColumn = errors.New("gateway: order key column is out of range for t
 // into the wrong output columns.
 var ErrMergeSchema = errors.New("gateway: shard result schemas do not match")
 
+// ErrMergeValue reports an invalid JSON sort-key cell. Heap comparators cannot
+// return errors, so k-way merge validates every key once before heap admission.
+var ErrMergeValue = errors.New("gateway: shard result contains an invalid JSON merge key")
+
 // ErrMergeAggregate reports a malformed or non-algebraic shard aggregate
 // state. The gateway fails closed rather than treating partial states as rows.
 var ErrMergeAggregate = errors.New("gateway: shard aggregate states cannot be merged")
@@ -68,6 +72,8 @@ const (
 	ckContainer
 )
 
+var groupedNullJSON = [...]byte{'n', 'u', 'l', 'l'}
+
 // cellValue is one decoded sort-key value: its kind and just enough of its
 // content to compare exactly. A number keeps its spelling and an int64 fast path.
 type cellValue struct {
@@ -75,42 +81,60 @@ type cellValue struct {
 	bval  bool
 	isInt bool
 	ival  int64
-	num   string
-	sval  string
+	num   []byte
+	valid bool
+	sval  []byte
 	raw   []byte
 }
 
 // classifyCell decodes one wire cell into a comparable value under the query's
 // total order. An explicit null cell and a null literal are one value.
 func classifyCell(c shardservice.Cell) cellValue {
+	var text []byte
+	return classifyCellInto(c, &text)
+}
+
+func classifyCellInto(c shardservice.Cell, text *[]byte) cellValue {
 	if c.Null {
-		return cellValue{kind: ckNull}
+		return cellValue{kind: ckNull, valid: true}
 	}
 	b := bytes.TrimSpace(c.Bytes)
 	if len(b) == 0 {
-		return cellValue{kind: ckNull}
+		return cellValue{kind: ckNull, valid: true}
 	}
-	switch b[0] {
-	case 'n':
-		return cellValue{kind: ckNull}
-	case 't':
-		return cellValue{kind: ckBool, bval: true}
-	case 'f':
-		return cellValue{kind: ckBool, bval: false}
-	case '"':
-		var s string
-		if err := json.Unmarshal(b, &s); err == nil {
-			return cellValue{kind: ckString, sval: s}
+	valid := vibejson.Valid(b)
+	raw := vibejson.RawValue{Src: b}
+	switch raw.Kind() {
+	case jsondoc.Null:
+		return cellValue{kind: ckNull, valid: valid}
+	case jsondoc.Bool:
+		value, _ := raw.Bool()
+		return cellValue{kind: ckBool, bval: value, valid: valid, raw: b}
+	case jsondoc.String:
+		if !valid {
+			return cellValue{kind: ckString, valid: false, raw: b}
 		}
-		return cellValue{kind: ckString, sval: string(b)}
-	case '{', '[':
-		return cellValue{kind: ckContainer, raw: b}
-	default:
-		v := cellValue{kind: ckNumber, num: string(b)}
-		if i, err := strconv.ParseInt(v.num, 10, 64); err == nil {
+		if value, clean := raw.StringBytes(); clean {
+			return cellValue{kind: ckString, sval: value, valid: true}
+		}
+		mark := len(*text)
+		value, ok, err := raw.AppendText(*text)
+		if err == nil && ok {
+			*text = value
+			return cellValue{kind: ckString, sval: value[mark:], valid: true}
+		}
+		return cellValue{kind: ckString, valid: false, raw: b}
+	case jsondoc.Number:
+		v := cellValue{kind: ckNumber, num: b, valid: valid}
+		if !v.valid {
+			return v
+		}
+		if i, ok := raw.Int64(); ok {
 			v.isInt, v.ival = true, i
 		}
 		return v
+	default:
+		return cellValue{kind: ckContainer, raw: b, valid: valid}
 	}
 }
 
@@ -136,6 +160,9 @@ func compareCells(a, b cellValue) int {
 			return 1
 		}
 	case ckNumber:
+		if !a.valid || !b.valid {
+			return bytes.Compare(a.num, b.num)
+		}
 		if a.isInt && b.isInt {
 			switch {
 			case a.ival < b.ival:
@@ -148,7 +175,7 @@ func compareCells(a, b cellValue) int {
 		}
 		return compareNumberSpelling(a.num, b.num)
 	case ckString:
-		return strings.Compare(a.sval, b.sval)
+		return bytes.Compare(a.sval, b.sval)
 	default:
 		return bytes.Compare(a.raw, b.raw)
 	}
@@ -157,17 +184,8 @@ func compareCells(a, b cellValue) int {
 // compareNumberSpelling compares two JSON numbers without expanding their
 // decimal exponents. A short hostile value such as 1e1000000000 therefore has
 // work proportional to its spelling rather than its mathematical magnitude.
-func compareNumberSpelling(a, b string) int {
-	ca, erra := queryplanner.CanonicalScalarJSON(a)
-	cb, errb := queryplanner.CanonicalScalarJSON(b)
-	if erra != nil || errb != nil {
-		return strings.Compare(a, b)
-	}
-	comparison, err := queryplanner.CompareCanonicalScalarJSON(ca, cb)
-	if err != nil {
-		return strings.Compare(a, b)
-	}
-	return comparison
+func compareNumberSpelling(a, b []byte) int {
+	return queryengine.CompareValidatedJSONNumbers(a, b)
 }
 
 // shardRun is one shard's already-ordered rows plus the decoded sort keys of
@@ -223,11 +241,280 @@ func compareHeads(a, b *shardRun, order []OrderKey) int {
 	return 0
 }
 
+type groupedSortEntry struct {
+	row     []shardservice.Cell
+	keys    []cellValue
+	text    []byte
+	ordinal int
+}
+
+func compareGroupedSortEntries(a, b *groupedSortEntry, order []OrderKey) int {
+	for key := range order {
+		comparison := compareCells(a.keys[key], b.keys[key])
+		if order[key].Desc {
+			comparison = -comparison
+		}
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	switch {
+	case a.ordinal < b.ordinal:
+		return -1
+	case a.ordinal > b.ordinal:
+		return 1
+	default:
+		return 0
+	}
+}
+
+type groupedTopKHeap struct {
+	entries []groupedSortEntry
+	order   []OrderKey
+}
+
+func (h groupedTopKHeap) Len() int { return len(h.entries) }
+func (h groupedTopKHeap) Less(i, j int) bool {
+	// Reverse the requested order so the worst retained row is the root.
+	return compareGroupedSortEntries(&h.entries[i], &h.entries[j], h.order) > 0
+}
+func (h groupedTopKHeap) Swap(i, j int) { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
+func (h *groupedTopKHeap) Push(value any) {
+	h.entries = append(h.entries, value.(groupedSortEntry))
+}
+func (h *groupedTopKHeap) Pop() any {
+	last := len(h.entries) - 1
+	value := h.entries[last]
+	h.entries = h.entries[:last]
+	return value
+}
+
+// finalizeGroupedRows applies the coordinator-only stage after exact grouped
+// aggregation. ORDER BY with a strict LIMIT retains only K decoded key tuples;
+// ORDER BY without LIMIT performs one bounded full sort. LIMIT without order
+// trims stable first-appearance order without allocating.
+func finalizeGroupedRows(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	limit int,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	return finalizeGroupedRowsWindow(rows, order, 0, limit, limit > 0, maxBytes)
+}
+
+func finalizeGroupedRowsWindow(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	offset int,
+	limit int,
+	hasLimit bool,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	if limit < 0 || offset < 0 {
+		return nil, fmt.Errorf("%w: grouped LIMIT is negative", ErrMergeAggregate)
+	}
+	if len(order) == 0 {
+		return sliceGroupedWindow(rows, offset, limit, hasLimit), nil
+	}
+	for _, key := range order {
+		if key.Column < 0 || (len(rows) != 0 && key.Column >= len(rows[0])) {
+			return nil, ErrMergeColumn
+		}
+	}
+	if len(rows) < 2 {
+		return sliceGroupedWindow(rows, offset, limit, hasLimit), nil
+	}
+	retain := len(rows)
+	if hasLimit {
+		if offset > int(^uint(0)>>1)-limit {
+			return nil, fmt.Errorf("%w: grouped OFFSET + LIMIT overflows", ErrMergeAggregate)
+		}
+		retain = min(retain, offset+limit)
+		if retain == 0 {
+			return rows[:0], nil
+		}
+	}
+	if hasLimit && retain < len(rows) {
+		selected, err := groupedTopK(rows, order, retain, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		return sliceGroupedWindow(selected, offset, limit, true), nil
+	}
+	ordered, err := groupedFullSort(rows, order, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return sliceGroupedWindow(ordered, offset, limit, hasLimit), nil
+}
+
+func sliceGroupedWindow(rows [][]shardservice.Cell, offset, limit int, hasLimit bool) [][]shardservice.Cell {
+	if offset >= len(rows) {
+		return rows[:0]
+	}
+	rows = rows[offset:]
+	if hasLimit && limit < len(rows) {
+		rows = rows[:limit]
+	}
+	return rows
+}
+
+func groupedTopK(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	limit int,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	maxText := 0
+	for _, row := range rows {
+		maxText = max(maxText, groupedEscapedTextBytes(row, order))
+	}
+	if err := admitGroupedSortState(limit+1, len(order), maxText, maxBytes); err != nil {
+		return nil, err
+	}
+	keySlab := make([]cellValue, (limit+1)*len(order))
+	h := &groupedTopKHeap{
+		entries: make([]groupedSortEntry, limit), order: order,
+	}
+	for row := 0; row < limit; row++ {
+		h.entries[row].keys = keySlab[row*len(order) : (row+1)*len(order)]
+		if err := prepareGroupedSortEntry(&h.entries[row], rows[row], order, row); err != nil {
+			return nil, err
+		}
+	}
+	heap.Init(h)
+	candidate := groupedSortEntry{keys: keySlab[limit*len(order):]}
+	for row := limit; row < len(rows); row++ {
+		if err := prepareGroupedSortEntry(&candidate, rows[row], order, row); err != nil {
+			return nil, err
+		}
+		if compareGroupedSortEntries(&candidate, &h.entries[0], order) >= 0 {
+			continue
+		}
+		displaced := h.entries[0]
+		h.entries[0] = candidate
+		candidate = displaced
+		heap.Fix(h, 0)
+	}
+	slices.SortFunc(h.entries, func(a, b groupedSortEntry) int {
+		return compareGroupedSortEntries(&a, &b, order)
+	})
+	out := make([][]shardservice.Cell, limit)
+	for row := range out {
+		out[row] = h.entries[row].row
+	}
+	return out, nil
+}
+
+func groupedFullSort(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	totalText := 0
+	for _, row := range rows {
+		text := groupedEscapedTextBytes(row, order)
+		if totalText > int(^uint(0)>>1)-text {
+			return nil, fmt.Errorf("%w: grouped sort text accounting overflow", ErrMergeAggregate)
+		}
+		totalText += text
+	}
+	if err := admitGroupedSortState(len(rows), len(order), totalText, maxBytes); err != nil {
+		return nil, err
+	}
+	entries := make([]groupedSortEntry, len(rows))
+	keySlab := make([]cellValue, len(rows)*len(order))
+	text := make([]byte, 0, totalText)
+	for row := range rows {
+		entries[row] = groupedSortEntry{
+			row: rows[row], keys: keySlab[row*len(order) : (row+1)*len(order)], ordinal: row,
+		}
+		for key := range order {
+			entries[row].keys[key] = classifyCellInto(rows[row][order[key].Column], &text)
+			if !entries[row].keys[key].valid {
+				return nil, fmt.Errorf("%w: grouped row %d column %d", ErrMergeValue, row, order[key].Column)
+			}
+		}
+	}
+	slices.SortFunc(entries, func(a, b groupedSortEntry) int {
+		return compareGroupedSortEntries(&a, &b, order)
+	})
+	out := make([][]shardservice.Cell, len(rows))
+	for row := range out {
+		out[row] = entries[row].row
+	}
+	return out, nil
+}
+
+func prepareGroupedSortEntry(
+	entry *groupedSortEntry,
+	row []shardservice.Cell,
+	order []OrderKey,
+	ordinal int,
+) error {
+	textBytes := groupedEscapedTextBytes(row, order)
+	if cap(entry.text) < textBytes {
+		entry.text = make([]byte, 0, textBytes)
+	} else {
+		entry.text = entry.text[:0]
+	}
+	entry.row, entry.ordinal = row, ordinal
+	for key := range order {
+		entry.keys[key] = classifyCellInto(row[order[key].Column], &entry.text)
+		if !entry.keys[key].valid {
+			return fmt.Errorf("%w: grouped row %d column %d", ErrMergeValue, ordinal, order[key].Column)
+		}
+	}
+	return nil
+}
+
+func groupedEscapedTextBytes(row []shardservice.Cell, order []OrderKey) int {
+	total := 0
+	for _, key := range order {
+		cell := row[key.Column]
+		if !cell.Null && len(cell.Bytes) >= 2 && cell.Bytes[0] == '"' &&
+			bytes.IndexByte(cell.Bytes, '\\') >= 0 {
+			total += len(cell.Bytes)
+		}
+	}
+	return total
+}
+
+func admitGroupedSortState(rows, keys, textBytes int, maxBytes uint64) error {
+	if rows < 0 || keys < 0 || textBytes < 0 {
+		return fmt.Errorf("%w: grouped sort state is invalid", ErrMergeAggregate)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if keys != 0 && rows > maxInt/keys {
+		return fmt.Errorf("%w: grouped sort key cardinality overflows address space", ErrMergeAggregate)
+	}
+	perRow := uint64(48)
+	if keys != 0 {
+		if uint64(keys) > (^uint64(0)-perRow)/96 {
+			return fmt.Errorf("%w: grouped sort state accounting overflow", ErrMergeAggregate)
+		}
+		perRow += uint64(keys) * 96
+	}
+	if uint64(rows) > (^uint64(0)-uint64(textBytes))/perRow {
+		return fmt.Errorf("%w: grouped sort state accounting overflow", ErrMergeAggregate)
+	}
+	stateBytes := uint64(rows)*perRow + uint64(textBytes)
+	if maxBytes != 0 && stateBytes > maxBytes {
+		return fmt.Errorf("%w: grouped sort state %d bytes exceeds %d-byte cap",
+			ErrMergeAggregate, stateBytes, maxBytes)
+	}
+	return nil
+}
+
 // mergeRows combines the shard responses into one ordered result. With no order
 // keys it concatenates in target order; with order keys it k-way merges the
 // already-ordered shards. A positive limit trims the merged rows. Columns come
 // from the first shard's row frame, and every response must be a row set.
 func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit int) ([]shardservice.Column, [][]shardservice.Cell, error) {
+	return mergeRowsWindow(results, order, 0, limit, limit > 0)
+}
+
+func mergeRowsWindow(results []*shardservice.ShardResponse, order []OrderKey, offset, limit int, hasLimit bool) ([]shardservice.Column, [][]shardservice.Cell, error) {
 	if len(results) == 0 {
 		return nil, nil, nil
 	}
@@ -235,14 +522,22 @@ func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit in
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(order) == 0 {
-		return columns, concatRows(results, limit), nil
+	if hasLimit && limit == 0 {
+		return columns, nil, nil
 	}
-	rows, err := kwayMerge(results, order, limit)
+	if len(order) == 0 {
+		rows := concatRows(results, 0)
+		return columns, sliceGroupedWindow(rows, offset, limit, hasLimit), nil
+	}
+	window := 0
+	if hasLimit {
+		window = offset + limit
+	}
+	rows, err := kwayMerge(results, order, window)
 	if err != nil {
 		return nil, nil, err
 	}
-	return columns, rows, nil
+	return columns, sliceGroupedWindow(rows, offset, limit, hasLimit), nil
 }
 
 func validateRowResults(results []*shardservice.ShardResponse) ([]shardservice.Column, error) {
@@ -296,166 +591,91 @@ func mergeAggregateRows(
 		for shard := range results {
 			cells[shard] = results[shard].Rows[0][column]
 		}
-		switch kind {
-		case sqlast.AggCount:
-			row[column], err = mergeCounts(cells, maxBytes)
-		case sqlast.AggSum:
-			row[column], err = mergeSums(cells, maxBytes)
-		case sqlast.AggMin:
-			row[column], err = mergeExtrema(cells, false)
-		case sqlast.AggMax:
-			row[column], err = mergeExtrema(cells, true)
-		default:
+		program, programErr := distributedAggregateKind(kind)
+		if programErr != nil || program == distributedagg.None {
 			err = fmt.Errorf("%w: aggregate %s has no combiner", ErrMergeAggregate, kind)
+		} else {
+			row[column], err = distributedagg.MergeCells(program, cells, maxBytes)
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, errors.Join(ErrMergeAggregate, err)
 		}
 	}
 	return columns, [][]shardservice.Cell{row}, nil
 }
 
-func mergeCounts(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
-	var total big.Int
-	for _, cell := range cells {
-		if cell.Null {
-			return shardservice.Cell{}, fmt.Errorf("%w: COUNT state is null", ErrMergeAggregate)
-		}
-		var count big.Int
-		if _, ok := count.SetString(string(bytes.TrimSpace(cell.Bytes)), 10); !ok || count.Sign() < 0 {
-			return shardservice.Cell{}, fmt.Errorf("%w: COUNT state %q is not a non-negative integer", ErrMergeAggregate, cell.Bytes)
-		}
-		total.Add(&total, &count)
-	}
-	spelling := total.String()
-	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
-		return shardservice.Cell{}, fmt.Errorf("%w: COUNT state exceeds aggregate byte cap", ErrMergeAggregate)
-	}
-	return shardservice.Cell{Bytes: []byte(spelling)}, nil
+type groupedAggregateMerger struct {
+	shared *distributedagg.Merger
 }
 
-func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
-	var total big.Rat
-	hasValue := false
-	for _, cell := range cells {
-		if cell.Null {
-			continue
-		}
-		spelling := string(bytes.TrimSpace(cell.Bytes))
-		canonical, canonicalErr := queryplanner.CanonicalScalarJSON(spelling)
-		if canonicalErr != nil || !queryplanner.CanonicalNumberFitsDecimalBytes(canonical, maxBytes) {
-			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q exceeds exact numeric admission", ErrMergeAggregate, cell.Bytes)
-		}
-		value, ok := new(big.Rat).SetString(canonical)
-		if !ok {
-			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
-		}
-		total.Add(&total, value)
-		hasValue = true
-	}
-	if !hasValue {
-		return shardservice.Cell{Null: true}, nil
-	}
-	spelling, err := exactDecimalString(&total, maxBytes)
+func newGroupedAggregateMerger(
+	kinds []sqlast.AggKind,
+	groupKeys []int,
+	maxBytes uint64,
+) (*groupedAggregateMerger, error) {
+	program, keys, err := distributedAggregateProgram(kinds, groupKeys)
 	if err != nil {
-		return shardservice.Cell{}, err
+		return nil, err
 	}
-	return shardservice.Cell{Bytes: []byte(spelling)}, nil
+	shared, err := distributedagg.NewMerger(program, keys, maxBytes)
+	if err != nil {
+		return nil, errors.Join(ErrMergeAggregate, err)
+	}
+	return &groupedAggregateMerger{shared: shared}, nil
 }
 
-func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, error) {
-	var chosen shardservice.Cell
-	chosenCanonical := ""
-	hasValue := false
-	for _, cell := range cells {
-		if cell.Null {
-			continue
-		}
-		candidate := classifyCell(cell)
-		if candidate.kind != ckNumber {
-			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
-		}
-		canonical, err := queryplanner.CanonicalScalarJSON(string(bytes.TrimSpace(cell.Bytes)))
-		if err != nil || len(canonical) == 0 || canonical[0] == '"' || canonical == "true" || canonical == "false" || canonical == "null" {
-			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not an exact JSON number", ErrMergeAggregate, cell.Bytes)
-		}
-		if !hasValue {
-			chosen, chosenCanonical, hasValue = cell, canonical, true
-			continue
-		}
-		comparison, err := queryplanner.CompareCanonicalScalarJSON(canonical, chosenCanonical)
-		if err != nil {
-			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state comparison: %v", ErrMergeAggregate, err)
-		}
-		if (maximum && comparison > 0) || (!maximum && comparison < 0) {
-			chosen, chosenCanonical = cell, canonical
+// mergeGroupedAggregateRows combines shard-local GROUP BY rows by the query
+// engine's exact composite group identity, then finalizes COUNT/SUM/MIN/MAX.
+func mergeGroupedAggregateRows(
+	results []*shardservice.ShardResponse,
+	kinds []sqlast.AggKind,
+	groupKeys []int,
+	maxBytes uint64,
+) ([]shardservice.Column, [][]shardservice.Cell, error) {
+	columns, err := validateRowResults(results)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(columns) != len(kinds) {
+		return nil, nil, ErrMergeSchema
+	}
+	merger, err := newGroupedAggregateMerger(kinds, groupKeys, maxBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	for shard := range results {
+		for row := range results[shard].Rows {
+			if err := merger.add(results[shard].Rows[row]); err != nil {
+				return nil, nil, fmt.Errorf("%w: shard %d row %d: %v", ErrMergeAggregate, shard, row, err)
+			}
 		}
 	}
-	if !hasValue {
-		return shardservice.Cell{Null: true}, nil
+	rows, err := merger.finish()
+	if err != nil {
+		return nil, nil, err
 	}
-	return chosen, nil
+	return columns, rows, nil
 }
 
-func exactDecimalString(value *big.Rat, maxBytes uint64) (string, error) {
-	denominator := new(big.Int).Set(value.Denom())
-	twos, fives := 0, 0
-	for denominator.Bit(0) == 0 {
-		denominator.Rsh(denominator, 1)
-		twos++
+func (m *groupedAggregateMerger) add(row []shardservice.Cell) error {
+	if m == nil || m.shared == nil {
+		return ErrMergeAggregate
 	}
-	five := big.NewInt(5)
-	var remainder big.Int
-	for {
-		remainder.Mod(denominator, five)
-		if remainder.Sign() != 0 {
-			break
-		}
-		denominator.Quo(denominator, five)
-		fives++
+	if err := m.shared.Add(row); err != nil {
+		return errors.Join(ErrMergeAggregate, err)
 	}
-	if denominator.Cmp(big.NewInt(1)) != 0 {
-		return "", fmt.Errorf("%w: SUM state is not a finite decimal", ErrMergeAggregate)
+	return nil
+}
+
+func (m *groupedAggregateMerger) finish() ([][]shardservice.Cell, error) {
+	if m == nil || m.shared == nil {
+		return nil, ErrMergeAggregate
 	}
-	scale := max(twos, fives)
-	coefficient := new(big.Int).Set(value.Num())
-	if twos < scale {
-		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(scale-twos)), nil))
+	rows, err := m.shared.Finish()
+	if err != nil {
+		return nil, errors.Join(ErrMergeAggregate, err)
 	}
-	if fives < scale {
-		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(5), big.NewInt(int64(scale-fives)), nil))
-	}
-	negative := coefficient.Sign() < 0
-	coefficient.Abs(coefficient)
-	digits := coefficient.String()
-	needed := len(digits)
-	if scale >= len(digits) {
-		needed = scale + 2
-	} else if scale != 0 {
-		needed++
-	}
-	if negative {
-		needed++
-	}
-	if maxBytes != 0 && uint64(needed) > maxBytes {
-		return "", fmt.Errorf("%w: SUM state exceeds aggregate byte cap", ErrMergeAggregate)
-	}
-	if scale == 0 {
-		if negative && digits != "0" {
-			return "-" + digits, nil
-		}
-		return digits, nil
-	}
-	if scale >= len(digits) {
-		digits = strings.Repeat("0", scale-len(digits)+1) + digits
-	}
-	point := len(digits) - scale
-	digits = digits[:point] + "." + digits[point:]
-	digits = strings.TrimRight(strings.TrimRight(digits, "0"), ".")
-	if negative && digits != "0" {
-		digits = "-" + digits
-	}
-	return digits, nil
+	return rows, nil
 }
 
 // concatRows appends every shard's rows in target order, trimming at a positive
@@ -490,6 +710,9 @@ func kwayMerge(results []*shardservice.ShardResponse, order []OrderKey, limit in
 					return nil, ErrMergeColumn
 				}
 				kv[k] = classifyCell(row[col])
+				if !kv[k].valid {
+					return nil, fmt.Errorf("%w: shard %d row %d column %d", ErrMergeValue, idx, r, col)
+				}
 			}
 			keys[r] = kv
 		}

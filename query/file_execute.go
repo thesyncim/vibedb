@@ -130,10 +130,12 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
-	index      durable.IndexSession
-	overflow   []byte
-	accs       []aggAcc
-	fileGroups []fileGroup
+	index          durable.IndexSession
+	skipFilter     durable.DataSkippingFilter
+	skipPredicates [16]durable.DataSkippingPredicate
+	overflow       []byte
+	accs           []aggAcc
+	fileGroups     []fileGroup
 
 	// tokenFilter is the reusable full-scan equality kernel for the narrow
 	// scalar COUNT lane. It is deliberately execution-local: EqFilter is
@@ -212,6 +214,8 @@ func (w *fileWorkspace) release() {
 	// dropping them is what makes the pool unreachable.
 	w.stopPool()
 	w.index.Release()
+	w.skipFilter = durable.DataSkippingFilter{}
+	clear(w.skipPredicates[:])
 	w.overflow = nil
 	w.accs = nil
 	w.fileGroups = nil
@@ -369,6 +373,7 @@ type ExecStats struct {
 	BufferedBytes        int64
 	SpillRuns            uint64
 	SpilledBytes         int64
+	PrimaryRangeBounded  bool
 	IndexBounded         bool
 	IndexLookups         int
 	IndexPostingPages    int
@@ -377,6 +382,10 @@ type ExecStats struct {
 	CandidateRows        uint64
 	CandidateChunks      int
 	CoveringColumns      int
+	// DataSkippedRows/DataSkippedStripes are compact primary stripes rejected
+	// from persisted scalar min/max metadata before document reconstruction.
+	DataSkippedRows    uint64
+	DataSkippedStripes uint64
 	// TokenFilterRows were evaluated directly from durable leaf templates and
 	// scalar tokens during an honest full scan. TokenFilterFallbackRows were
 	// scanned by the same lane but required canonical document rendering. Their
@@ -507,7 +516,12 @@ func normalizeFileOptions(opts ExecOptions) (normalizedFileOptions, error) {
 // nothing. Materialized cells own their bytes and stay valid after the snapshot
 // is closed, until e is reused or released. The snapshot stays owned by the
 // caller.
-func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.DatabaseSnapshot) error {
+func (p *plan) runFileInto(
+	e *Exec,
+	snapshot *durable.Snapshot,
+	catalog durable.DatabaseSnapshot,
+	rangeSource *FileRangeSource,
+) error {
 	e.Result.fileData = e.Result.fileData[:0]
 	e.Stats = ExecStats{}
 	if err := e.Workspace.checkCanceled(); err != nil {
@@ -521,6 +535,15 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		return fmt.Errorf("query: FromFile was given a nil snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: snapshot.Len()}
+	if rangeSource != nil {
+		stats.PrimaryRangeBounded = true
+		result, boundedStats, runErr := p.runFileSnapshotBatched(
+			e, snapshot, nil, rangeSource, n, stats,
+		)
+		boundedStats.CandidateRows = boundedStats.RowsScanned
+		e.Result, e.Stats = result, boundedStats
+		return runErr
+	}
 	if len(p.joins) != 0 || len(p.marks) != 0 {
 		// The direct dispatchers below answer straight out of the persistent
 		// index or a covering projection, without ever evaluating the compiled
@@ -575,7 +598,7 @@ func (p *plan) runFileInto(e *Exec, snapshot *durable.Snapshot, catalog durable.
 		}
 		return directErr
 	}
-	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, n, stats)
+	result, stats, err := p.runFileSnapshotBatched(e, snapshot, nil, nil, n, stats)
 	e.Result, e.Stats = result, stats
 	return err
 }
@@ -609,7 +632,7 @@ func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay F
 		return fmt.Errorf("query: FileOverlay LenDelta underflows the base snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: uint64(rows)}
-	result, stats, err := p.runFileSnapshotBatched(e, snapshot, overlay, n, stats)
+	result, stats, err := p.runFileSnapshotBatched(e, snapshot, overlay, nil, n, stats)
 	e.Result, e.Stats = result, stats
 	return err
 }
@@ -621,6 +644,7 @@ func (p *plan) runFileSnapshotBatched(
 	e *Exec,
 	snapshot *durable.Snapshot,
 	overlay FileOverlay,
+	rangeSource *FileRangeSource,
 	n normalizedFileOptions,
 	base ExecStats,
 ) (result Result, stats ExecStats, err error) {
@@ -652,6 +676,26 @@ func (p *plan) runFileSnapshotBatched(
 			return result, stats, err
 		}
 	}
+	var skipFilter *durable.DataSkippingFilter
+	if candidateMasks == nil && overlay == nil && rangeSource == nil &&
+		work.remaining() >= durable.DataSkippingFilterMemoryBytes {
+		var enabled bool
+		enabled, err = p.fileDataSkippingFilter(
+			snapshot, &e.file.skipFilter, e.file.skipPredicates[:],
+		)
+		if err != nil {
+			return result, stats, err
+		}
+		if enabled {
+			if err := work.admit(
+				"durable data-skipping workspace",
+				durable.DataSkippingFilterMemoryBytes,
+			); err != nil {
+				return result, stats, err
+			}
+			skipFilter = &e.file.skipFilter
+		}
+	}
 	n.memoryBytes = work.remaining()
 	// A fileArena's controlled growth retains earlier generations while the
 	// merge frontier still references them. Its cumulative capacity is less
@@ -661,6 +705,12 @@ func (p *plan) runFileSnapshotBatched(
 	n.mergeBytes = max(int64(1), n.memoryBytes/4)
 	stats.IndexLookups = e.Workspace.storeIndexProbes
 	stats.IndexBounded = candidateMasks != nil
+	indexMetrics := e.file.index.Metrics()
+	stats.IndexPostingPages = int(min(
+		indexMetrics.PostingPages, uint64(^uint(0)>>1),
+	))
+	stats.IndexCertificateRows = indexMetrics.CertificateRows
+	stats.IndexRecheckRows = indexMetrics.DocumentRecheckRows
 	if stats.IndexBounded {
 		for _, mask := range candidateMasks {
 			rows := bits.OnesCount64(mask.Bits)
@@ -754,6 +804,7 @@ func (p *plan) runFileSnapshotBatched(
 	}
 	pool.start(fileJob{
 		p: p, snapshot: snapshot, overlay: overlay, masks: candidateMasks,
+		scanRange: rangeSource, skip: skipFilter,
 		overflow: &e.file.overflow, slots: slots,
 		spaces: e.file.workers, segments: e.file.segments,
 		arenas: e.file.arenas, opts: n, active: n.workers,
@@ -1013,6 +1064,11 @@ func (p *plan) runFileSnapshotBatched(
 	e.file.rows, e.file.rowRuns, e.file.groupRuns = rows, rowRuns, groupRuns
 	e.file.groupSet = groups
 	stats.RowsScanned = scan.rows
+	if skipFilter != nil {
+		skipped := skipFilter.Metrics()
+		stats.DataSkippedRows = skipped.Rows
+		stats.DataSkippedStripes = skipped.Stripes
+	}
 	stats.Batches = scan.batches
 	stats.PeakBatchRows = scan.peakRows
 	stats.PeakBatchBytes = scan.peakBytes

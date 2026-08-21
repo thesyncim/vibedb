@@ -11,6 +11,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 var (
@@ -169,6 +170,14 @@ type Options struct {
 	// share posting maintenance and durable bytes while remaining independently
 	// discoverable and queryable.
 	Indexes []store.IndexDefinition
+	// SkipIndexes are RFC 6901 paths with compact per-primary-stripe min/max
+	// summaries. They accelerate equality and ordered scalar predicates without
+	// materializing posting lists. Paths are canonicalized and persisted; at
+	// most storeio.PageCatalogMaxSkipIndexes are accepted so write and space
+	// amplification stay strictly bounded. Missing values summarize as null;
+	// a container, oversized scalar, or overflow row makes only that stripe/path
+	// unprunable and never affects query correctness.
+	SkipIndexes []string
 	// PageSize is the base page of the ordered primary graph. It must be 4096:
 	// every tree, root, directory, and metadata page is exactly one base page.
 	// Zero defaults to 4096; any other value is rejected on Create with
@@ -496,6 +505,7 @@ type normalizedFileStoreOptions struct {
 	freeFoldLimit                    int
 	pageCatalog                      *storeio.CanonicalPageCatalog
 	indexes                          []*store.ExactIndex
+	skipIndexes                      []vibejson.CompiledPointer
 	indexNameIDs                     map[string]uint32
 	indexCatalogHash                 uint64
 	primaryUnifiedOverlayBytes       int
@@ -697,6 +707,22 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			store.ErrIndexDefinition, fileStoreMaxLogicalIndexes,
 		)
 	}
+	if len(o.SkipIndexes) > storeio.PageCatalogMaxSkipIndexes {
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"vibedb: collection supports at most %d skip indexes",
+			storeio.PageCatalogMaxSkipIndexes,
+		)
+	}
+	inputSkipPaths := make([]string, len(o.SkipIndexes))
+	for i, path := range o.SkipIndexes {
+		owned := strings.Clone(path)
+		if _, compileErr := vibejson.CompilePointer(owned); compileErr != nil {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: skip path %d: %v", store.ErrIndexDefinition, i, compileErr,
+			)
+		}
+		inputSkipPaths[i] = owned
+	}
 	inputIndexes := make([]storeio.PageCatalogIndex, len(o.Indexes))
 	seenIndexes := make(map[string]struct{}, len(o.Indexes))
 	for i, definition := range o.Indexes {
@@ -734,7 +760,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	pageCatalog, catalogErr := storeio.BuildCanonicalPageCatalog(
 		storeio.PageCatalogDefinition{
-			Indexes: inputIndexes, Schema: catalogSchema,
+			Indexes: inputIndexes, SkipPaths: inputSkipPaths, Schema: catalogSchema,
 		},
 	)
 	if catalogErr != nil {
@@ -743,6 +769,18 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		)
 	}
 	canonical := pageCatalog.Definition()
+	compiledSkipIndexes := make([]vibejson.CompiledPointer, len(canonical.SkipPaths))
+	for i, path := range canonical.SkipPaths {
+		pointer, compileErr := vibejson.CompilePointer(path)
+		if compileErr != nil {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: canonical skip path %q: %v",
+				store.ErrIndexDefinition, path, compileErr,
+			)
+		}
+		compiledSkipIndexes[i] = pointer
+	}
+	o.SkipIndexes = slices.Clone(canonical.SkipPaths)
 	physicalDefinitions := pageCatalog.PhysicalIndexes()
 	if len(physicalDefinitions) > fileStoreMaxPhysicalIndexes {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -810,7 +848,13 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 			catalogHash, identity[:],
 		)
 	}
-	if len(compiled) == 0 && o.Collection.Schema == nil {
+	for _, path := range o.SkipIndexes {
+		catalogHash = fileIndexHashBytes(catalogHash, []byte{0x53, 0x4b, 0x50})
+		catalogHash = fileIndexHashBytes(catalogHash, []byte(path))
+		catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
+	}
+	if len(compiled) == 0 && len(compiledSkipIndexes) == 0 &&
+		o.Collection.Schema == nil {
 		catalogHash = 0
 	} else if catalogHash == 0 {
 		// StateRoot reserves zero to mean that no exact catalog exists. FNV is
@@ -1053,6 +1097,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		freeFoldLimit:                  freeFoldLimit,
 		pageCatalog:                    pageCatalog,
 		indexes:                        compiled, indexNameIDs: indexNameIDs,
+		skipIndexes:                      compiledSkipIndexes,
 		indexCatalogHash:                 catalogHash,
 		primaryUnifiedOverlayBytes:       primaryUnifiedOverlayBytes,
 		primaryUnifiedOverlayBuckets:     primaryOverlayBucketLimit,

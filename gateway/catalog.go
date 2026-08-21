@@ -1,9 +1,9 @@
 package gateway
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	queryplanner "github.com/thesyncim/vibedb/planner"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 // The minimal authoritative catalog: one immutable snapshot generation of the
@@ -48,6 +50,12 @@ var ErrCatalogWriterLocked = errors.New("gateway: catalog snapshot has an active
 // ErrCatalogGenerationNotNewer reports an attempted durable publication whose
 // generation is not strictly newer than the snapshot already on disk.
 var ErrCatalogGenerationNotNewer = errors.New("gateway: catalog generation is not newer than the durable generation")
+
+// ErrCatalogGenerationMismatch reports an exact-generation publication whose
+// observed authority differs from the generation the controller planned from.
+// It is the topology compare-and-swap fence: callers must reload and replan
+// rather than applying a valid transition over unrelated concurrent changes.
+var ErrCatalogGenerationMismatch = errors.New("gateway: catalog generation differs from the expected generation")
 
 // ErrCatalogPublishOutcomeUnknown reports that the catalog rename completed
 // but a post-publication close, unlock, or pinned parent-directory durability
@@ -81,18 +89,22 @@ func (e *CatalogError) Unwrap() error { return ErrInvalidCatalog }
 // catalog records are exposed by value; placement columns are copied; manifests
 // are themselves immutable.
 type Snapshot struct {
-	config              distribution.ClusterConfig
-	endpoints           map[distribution.EndpointID]string
-	generation          uint64
-	planner             []plannerTable
-	plannerIndexes      []plannerIndex
-	plannerIndexPaths   []plannerStringRef
-	plannerIndexSpans   []plannerIndexSpan
-	plannerIndexStrings string
-	statistics          *queryplanner.StatisticsCatalog
-	indexLineage        []plannerIndexLineageRef
-	shardLineage        []plannerShardLineageRef
-	indexIDHighWater    uint64
+	config                         distribution.ClusterConfig
+	endpoints                      map[distribution.EndpointID]string
+	generation                     uint64
+	planner                        []plannerTable
+	plannerIndexes                 []plannerIndex
+	plannerIndexPaths              []plannerStringRef
+	plannerIndexRelations          []uint32
+	plannerGlobalIndexPrograms     []plannerGlobalIndexProgram
+	plannerGlobalIndexPointers     []vibejson.CompiledPointer
+	plannerGlobalPointerExtraBytes uint64
+	plannerIndexSpans              []plannerIndexSpan
+	plannerIndexStrings            string
+	statistics                     *queryplanner.StatisticsCatalog
+	indexLineage                   []plannerIndexLineageRef
+	shardLineage                   []plannerShardLineageRef
+	indexIDHighWater               uint64
 	// shardGenerationHighWaters is aligned with Distributions. One scalar per
 	// logical keyspace fences every removed shard identity without retaining a
 	// tombstone per split, merge, or move.
@@ -210,18 +222,22 @@ func NewSnapshotWithPlannerMetadata(
 		return nil, err
 	}
 	snapshot := &Snapshot{
-		config:              cloned,
-		endpoints:           cloneEndpoints(endpoints),
-		generation:          generation,
-		planner:             planner,
-		plannerIndexes:      indexBuild.indexes,
-		plannerIndexPaths:   indexBuild.paths,
-		plannerIndexSpans:   indexBuild.spans,
-		plannerIndexStrings: indexBuild.arena,
-		statistics:          statisticsCatalog,
-		indexLineage:        indexLineage,
-		shardLineage:        shardLineage,
-		planSeed:            maphash.MakeSeed(),
+		config:                         cloned,
+		endpoints:                      cloneEndpoints(endpoints),
+		generation:                     generation,
+		planner:                        planner,
+		plannerIndexes:                 indexBuild.indexes,
+		plannerIndexPaths:              indexBuild.paths,
+		plannerIndexRelations:          indexBuild.relations,
+		plannerGlobalIndexPrograms:     indexBuild.globalPrograms,
+		plannerGlobalIndexPointers:     indexBuild.globalPointers,
+		plannerGlobalPointerExtraBytes: indexBuild.globalPointerExtraBytes,
+		plannerIndexSpans:              indexBuild.spans,
+		plannerIndexStrings:            indexBuild.arena,
+		statistics:                     statisticsCatalog,
+		indexLineage:                   indexLineage,
+		shardLineage:                   shardLineage,
+		planSeed:                       maphash.MakeSeed(),
 	}
 	return snapshot, nil
 }
@@ -502,7 +518,7 @@ func cloneConfig(c distribution.ClusterConfig) distribution.ClusterConfig {
 		columnCount += len(c.Placements[i].Columns)
 	}
 	columnArena := make([]string, columnCount)
-	interned := make(map[string]string, len(c.Distributions)+columnCount)
+	interned := make(map[string]string, len(c.Distributions)+len(c.Placements)+columnCount)
 	intern := func(value string) string {
 		if canonical, ok := interned[value]; ok {
 			return canonical
@@ -526,6 +542,12 @@ func cloneConfig(c distribution.ClusterConfig) distribution.ClusterConfig {
 		for i, p := range c.Placements {
 			p.Table = intern(p.Table)
 			p.Distribution = distribution.DistributionName(intern(string(p.Distribution)))
+			if p.TenantPath != "" {
+				p.TenantPath = intern(p.TenantPath)
+			}
+			if p.AffinityGroup != "" {
+				p.AffinityGroup = intern(p.AffinityGroup)
+			}
 			start := columnOffset
 			for _, column := range p.Columns {
 				columnArena[columnOffset] = intern(column)
@@ -551,17 +573,26 @@ func cloneEndpoints(endpoints map[distribution.EndpointID]string) map[distributi
 }
 
 // CatalogHolder publishes immutable Snapshot generations for lock-free
-// concurrent reads. A reader always observes one whole generation — the old or
-// the new — never a mixed or partially published state, because each Snapshot is
-// immutable and only its pointer is swapped. It mirrors
-// distribution.ManifestHolder.
+// metadata reads and tracks the generations pinned by executor operations. A
+// reader always observes one whole generation — the old or the new — never a
+// mixed or partially published state. Publication and operational pinning share
+// one short lock so, after a generation is published, no new operation can pin
+// an older write plan. Per-row planning and execution remain lock-free.
 type CatalogHolder struct {
 	ptr atomic.Pointer[Snapshot]
+
+	leaseMu      sync.Mutex
+	activeLeases map[uint64]uint64
+	leaseChanged chan struct{}
+	leaseWaiters uint64
 }
 
 // NewCatalogHolder returns a holder seeded with initial, which may be nil.
 func NewCatalogHolder(initial *Snapshot) *CatalogHolder {
-	h := &CatalogHolder{}
+	h := &CatalogHolder{
+		activeLeases: make(map[uint64]uint64),
+		leaseChanged: make(chan struct{}),
+	}
 	if initial != nil {
 		snapshot, err := initialCatalogState(initial)
 		if err == nil {
@@ -585,6 +616,44 @@ func (h *CatalogHolder) PublishNewer(s *Snapshot) bool {
 	return h.publishNewerChecked(s) == nil
 }
 
+// PublishAfter atomically installs s only when the currently published
+// generation exactly equals expectedGeneration. A nil holder state is
+// generation zero. This is the in-memory half of a topology cutover CAS; it
+// prevents a controller from publishing a transition planned from stale
+// metadata even when its proposed generation is numerically newer.
+func (h *CatalogHolder) PublishAfter(expectedGeneration uint64, s *Snapshot) error {
+	if s == nil {
+		return &CatalogError{Reason: "next catalog snapshot is nil"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	cur := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if cur != nil {
+		currentGeneration = cur.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	if s.generation <= currentGeneration {
+		return fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, s.generation, currentGeneration,
+		)
+	}
+	next, err := advanceCatalogState(cur, s)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
 // publishNewerChecked is the diagnostic publication path used by catalog
 // refresh. The bool API remains convenient for optimistic callers, while a
 // topology loader must distinguish an ordinary stale generation from a newer
@@ -593,29 +662,205 @@ func (h *CatalogHolder) publishNewerChecked(s *Snapshot) error {
 	if s == nil {
 		return &CatalogError{Reason: "next catalog snapshot is nil"}
 	}
-	for {
-		cur := h.ptr.Load()
-		if cur != nil && s.generation <= cur.generation {
-			return fmt.Errorf(
-				"%w: proposed=%d current=%d",
-				ErrCatalogGenerationNotNewer, s.generation, cur.generation,
-			)
-		}
-		next, err := advanceCatalogState(cur, s)
-		if err != nil {
-			return err
-		}
-		if h.ptr.CompareAndSwap(cur, next) {
-			return nil
-		}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	cur := h.ptr.Load()
+	if cur != nil && s.generation <= cur.generation {
+		return fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, s.generation, cur.generation,
+		)
 	}
+	next, err := advanceCatalogState(cur, s)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
 }
 
 // Current returns the most recently published Snapshot, or nil if none has been
-// published. The read path takes no lock; a caller pins one generation for a
-// whole operation by reading Current once.
+// published. It is a lock-free metadata-inspection API. Code that dispatches
+// shard work must acquire an operational lease through Executor so schema
+// generation drains can observe it.
 func (h *CatalogHolder) Current() *Snapshot {
 	return h.ptr.Load()
+}
+
+// catalogLease pins one immutable generation for an executor operation. A
+// stale-generation retry may hold more than one lease until the operation
+// returns; this deliberately makes a schema barrier wait for the whole old
+// operation, not merely its last network attempt.
+type catalogLease struct {
+	holder     *CatalogHolder
+	snapshot   *Snapshot
+	generation uint64
+	released   bool
+}
+
+// catalogLeaseSet keeps the ordinary initial attempt plus the default retry
+// budget inline. Only an explicitly oversized retry policy allocates overflow
+// storage. Query and Exec retain prior-attempt leases until return so a schema
+// drain fences the complete logical operation without allocating per attempt.
+type catalogLeaseSet struct {
+	inline   [4]catalogLease
+	overflow []catalogLease
+	count    int
+}
+
+func (s *catalogLeaseSet) add(lease catalogLease) {
+	if lease.holder == nil {
+		return
+	}
+	if s.count < len(s.inline) {
+		s.inline[s.count] = lease
+	} else {
+		s.overflow = append(s.overflow, lease)
+	}
+	s.count++
+}
+
+func (s *catalogLeaseSet) release() {
+	if s == nil {
+		return
+	}
+	for i := range s.overflow {
+		s.overflow[len(s.overflow)-1-i].release()
+	}
+	inlineCount := min(s.count, len(s.inline))
+	for i := 0; i < inlineCount; i++ {
+		s.inline[inlineCount-1-i].release()
+	}
+}
+
+// pinCurrent atomically observes and leases the current generation with
+// respect to publication. Once generation G is published, no later call can
+// acquire a lease below G.
+func (h *CatalogHolder) pinCurrent() catalogLease {
+	if h == nil {
+		return catalogLease{}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	snapshot := h.ptr.Load()
+	if snapshot == nil {
+		return catalogLease{}
+	}
+	generation := snapshot.Generation()
+	h.activeLeases[generation]++
+	return catalogLease{holder: h, snapshot: snapshot, generation: generation}
+}
+
+func (l *catalogLease) release() {
+	if l == nil || l.holder == nil || l.released {
+		return
+	}
+	l.released = true
+	h := l.holder
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	active := h.activeLeases[l.generation]
+	if active <= 1 {
+		delete(h.activeLeases, l.generation)
+	} else {
+		h.activeLeases[l.generation] = active - 1
+	}
+	h.signalLeaseChangeLocked()
+}
+
+func (h *CatalogHolder) initLeaseTrackerLocked() {
+	if h.activeLeases == nil {
+		h.activeLeases = make(map[uint64]uint64)
+	}
+	if h.leaseChanged == nil {
+		h.leaseChanged = make(chan struct{})
+	}
+}
+
+func (h *CatalogHolder) signalLeaseChangeLocked() {
+	h.initLeaseTrackerLocked()
+	if h.leaseWaiters == 0 {
+		return
+	}
+	close(h.leaseChanged)
+	h.leaseChanged = make(chan struct{})
+}
+
+// CatalogDrainStatus is the local serving process's catalog-generation fence
+// state. A cluster schema controller gathers one drained acknowledgement from
+// every serving gateway before starting a historical index scan.
+type CatalogDrainStatus struct {
+	CurrentGeneration      uint64
+	OldestActiveGeneration uint64
+	ActiveOlderOperations  uint64
+}
+
+// DrainStatus reports active operations older than generation without waiting.
+// OldestActiveGeneration is zero when there is no such operation.
+func (h *CatalogHolder) DrainStatus(generation uint64) CatalogDrainStatus {
+	if h == nil {
+		return CatalogDrainStatus{}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	return h.drainStatusLocked(generation)
+}
+
+func (h *CatalogHolder) drainStatusLocked(generation uint64) CatalogDrainStatus {
+	status := CatalogDrainStatus{}
+	if current := h.ptr.Load(); current != nil {
+		status.CurrentGeneration = current.Generation()
+	}
+	for activeGeneration, count := range h.activeLeases {
+		if activeGeneration >= generation || count == 0 {
+			continue
+		}
+		status.ActiveOlderOperations += count
+		if status.OldestActiveGeneration == 0 || activeGeneration < status.OldestActiveGeneration {
+			status.OldestActiveGeneration = activeGeneration
+		}
+	}
+	return status
+}
+
+// WaitOlderDrained waits until this serving process has published at least
+// generation and every operation pinned below it has returned. Publication and
+// pin acquisition use the same lock, so a successful return is a stable local
+// fence: a late operation cannot subsequently acquire an older plan.
+func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64) (CatalogDrainStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if h == nil || generation == 0 {
+		return CatalogDrainStatus{}, ErrStaleGeneration
+	}
+	for {
+		h.leaseMu.Lock()
+		h.initLeaseTrackerLocked()
+		status := h.drainStatusLocked(generation)
+		if status.CurrentGeneration >= generation && status.ActiveOlderOperations == 0 {
+			h.leaseMu.Unlock()
+			return status, nil
+		}
+		changed := h.leaseChanged
+		h.leaseWaiters++
+		h.leaseMu.Unlock()
+		var err error
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-changed:
+		}
+		h.leaseMu.Lock()
+		h.leaseWaiters--
+		h.leaseMu.Unlock()
+		if err != nil {
+			return status, err
+		}
+	}
 }
 
 // The on-disk catalog format. It is a versioned JSON document; keyspace points
@@ -639,22 +884,28 @@ type persistedDistribution struct {
 	Name          string `json:"name"`
 	Arity         int    `json:"arity"`
 	MapperVersion uint32 `json:"mapper_version"`
+	BucketBits    uint8  `json:"bucket_bits,omitempty"`
 }
 
 type persistedPlacement struct {
-	Table        string   `json:"table"`
-	Distribution string   `json:"distribution"`
-	Columns      []string `json:"columns"`
+	Table         string   `json:"table"`
+	Distribution  string   `json:"distribution"`
+	Columns       []string `json:"columns"`
+	TenantPath    string   `json:"tenant_path,omitempty"`
+	AffinityGroup string   `json:"affinity_group,omitempty"`
 }
 
 type persistedIndex struct {
-	IndexID     uint64         `json:"index_id"`
-	Incarnation uint64         `json:"incarnation"`
-	Table       string         `json:"table"`
-	Name        string         `json:"name"`
-	Paths       []string       `json:"paths"`
-	Flags       IndexFlags     `json:"flags"`
-	Lifecycle   IndexLifecycle `json:"lifecycle"`
+	IndexID      uint64         `json:"index_id"`
+	Incarnation  uint64         `json:"incarnation"`
+	Table        string         `json:"table"`
+	Name         string         `json:"name"`
+	Relation     string         `json:"relation,omitempty"`
+	Paths        []string       `json:"paths"`
+	LocatorPaths []string       `json:"locator_paths,omitempty"`
+	PrimaryPath  string         `json:"primary_path,omitempty"`
+	Flags        IndexFlags     `json:"flags"`
+	Lifecycle    IndexLifecycle `json:"lifecycle"`
 }
 
 type persistedManifest struct {
@@ -700,23 +951,36 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	for _, d := range s.config.Distributions {
 		pc.Distributions = append(pc.Distributions, persistedDistribution{
 			Name: string(d.Name), Arity: d.Arity, MapperVersion: uint32(d.MapperVersion),
+			BucketBits: d.BucketBits,
 		})
 	}
 	for _, p := range s.config.Placements {
 		pc.Placements = append(pc.Placements, persistedPlacement{
 			Table: p.Table, Distribution: string(p.Distribution), Columns: p.Columns,
+			TenantPath: p.TenantPath, AffinityGroup: p.AffinityGroup,
 		})
 	}
 	for tableOrdinal := range s.plannerIndexSpans {
 		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
 		span := s.plannerIndexSpans[tableOrdinal]
 		for i := uint32(0); i < span.count; i++ {
-			metadata := s.indexMetadata(table, span.first+i)
+			ordinal := span.first + i
+			metadata := s.indexMetadata(table, ordinal)
 			paths := make([]string, metadata.PathCount)
 			copy(paths, metadata.Paths[:metadata.PathCount])
+			locators := make([]string, metadata.LocatorCount)
+			copy(locators, metadata.LocatorPaths[:metadata.LocatorCount])
+			relation := ""
+			primaryPath := ""
+			if metadata.Global() {
+				relation = metadata.Relation
+				program, _ := s.globalIndexPointerProgram(ordinal)
+				primaryPath = metadata.LocatorPaths[program.primary]
+			}
 			pc.Indexes = append(pc.Indexes, persistedIndex{
 				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
-				Table: metadata.Table, Name: metadata.Name, Paths: paths,
+				Table: metadata.Table, Name: metadata.Name, Relation: relation,
+				Paths: paths, LocatorPaths: locators, PrimaryPath: primaryPath,
 				Flags: metadata.Flags, Lifecycle: metadata.Lifecycle,
 			})
 		}
@@ -767,7 +1031,20 @@ func toPersisted(s *Snapshot) persistedCatalog {
 // The serialization proof covers cooperating publishers using this API; an
 // administrator must not unlink or replace the persistent .lock entry while
 // catalog publication is live.
-func SaveSnapshot(path string, s *Snapshot) (err error) {
+func SaveSnapshot(path string, s *Snapshot) error {
+	return saveSnapshot(path, s, nil)
+}
+
+// SaveSnapshotAfter durably publishes s only when the catalog currently on
+// disk has exactly expectedGeneration. The comparison executes while holding
+// the same cross-process writer lease as the atomic replacement, so a
+// successful return proves the transition was applied to the topology it was
+// planned from. An absent durable catalog is generation zero.
+func SaveSnapshotAfter(path string, expectedGeneration uint64, s *Snapshot) error {
+	return saveSnapshot(path, s, &expectedGeneration)
+}
+
+func saveSnapshot(path string, s *Snapshot, expectedGeneration *uint64) (err error) {
 	if s == nil {
 		return errors.New("gateway: SaveSnapshot requires a non-nil snapshot")
 	}
@@ -778,7 +1055,7 @@ func SaveSnapshot(path string, s *Snapshot) (err error) {
 	if err != nil {
 		return err
 	}
-	publishErr := saveSnapshotAtRoot(root, base, s)
+	publishErr := saveSnapshotAtRootAfter(root, base, s, expectedGeneration)
 	closeErr := root.Close()
 	if closeErr == nil {
 		return publishErr
@@ -790,6 +1067,15 @@ func SaveSnapshot(path string, s *Snapshot) (err error) {
 }
 
 func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
+	return saveSnapshotAtRootAfter(root, base, s, nil)
+}
+
+func saveSnapshotAtRootAfter(
+	root *os.Root,
+	base string,
+	s *Snapshot,
+	expectedGeneration *uint64,
+) (err error) {
 	if root == nil || base == "" || s == nil {
 		return errors.New("gateway: invalid pinned catalog publication")
 	}
@@ -834,6 +1120,12 @@ func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
 	var nextState *Snapshot
 	switch {
 	case loadErr == nil:
+		if expectedGeneration != nil && current.generation != *expectedGeneration {
+			return fmt.Errorf(
+				"%w: expected=%d durable=%d",
+				ErrCatalogGenerationMismatch, *expectedGeneration, current.generation,
+			)
+		}
 		if s.generation <= current.generation {
 			return fmt.Errorf(
 				"%w: proposed=%d durable=%d",
@@ -851,13 +1143,24 @@ func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
 	case !errors.Is(loadErr, os.ErrNotExist):
 		return loadErr
 	default:
+		if expectedGeneration != nil && *expectedGeneration != 0 {
+			return fmt.Errorf(
+				"%w: expected=%d durable=0",
+				ErrCatalogGenerationMismatch, *expectedGeneration,
+			)
+		}
 		nextState, err = initialCatalogState(s)
 		if err != nil {
 			return err
 		}
 	}
 
-	raw, err := json.MarshalIndent(toPersisted(nextState), "", "  ")
+	persisted := toPersisted(nextState)
+	compact, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return err
+	}
+	raw, err := vibejson.AppendIndent(nil, compact, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -966,7 +1269,7 @@ func decodeSnapshotFile(file *os.File, label string) (*Snapshot, error) {
 			ErrCatalogTooLarge, label, maxCatalogBytes)
 	}
 	var pc persistedCatalog
-	if err := json.Unmarshal(raw, &pc); err != nil {
+	if err := vibejson.Unmarshal(raw, &pc); err != nil {
 		return nil, err
 	}
 	if pc.Version != catalogVersion {
@@ -1150,13 +1453,16 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 			Name:          distribution.DistributionName(d.Name),
 			Arity:         d.Arity,
 			MapperVersion: distribution.MapperVersion(d.MapperVersion),
+			BucketBits:    d.BucketBits,
 		})
 	}
 	for _, p := range pc.Placements {
 		config.Placements = append(config.Placements, distribution.TablePlacement{
-			Table:        p.Table,
-			Distribution: distribution.DistributionName(p.Distribution),
-			Columns:      slices.Clone(p.Columns),
+			Table:         p.Table,
+			Distribution:  distribution.DistributionName(p.Distribution),
+			Columns:       slices.Clone(p.Columns),
+			TenantPath:    p.TenantPath,
+			AffinityGroup: p.AffinityGroup,
 		})
 	}
 	for _, pm := range pc.Manifests {
@@ -1193,8 +1499,10 @@ func (pc persistedCatalog) toConfig() (distribution.ClusterConfig, map[distribut
 		index := &pc.Indexes[i]
 		indexes[i] = IndexDescriptor{
 			IndexID: index.IndexID, Incarnation: index.Incarnation,
-			Table: index.Table, Name: index.Name, Paths: slices.Clone(index.Paths),
-			Flags: index.Flags, Lifecycle: index.Lifecycle,
+			Table: index.Table, Name: index.Name, Relation: index.Relation,
+			Paths: slices.Clone(index.Paths), LocatorPaths: slices.Clone(index.LocatorPaths),
+			PrimaryPath: index.PrimaryPath,
+			Flags:       index.Flags, Lifecycle: index.Lifecycle,
 		}
 	}
 	return config, endpoints, indexes, slices.Clone(pc.Statistics), nil

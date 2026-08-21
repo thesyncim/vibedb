@@ -365,7 +365,9 @@ func (c *Collection) createInitialState() error {
 	if err != nil {
 		return err
 	}
-	primaryRoot, err := storeio.BuildEmptyPrimaryGraph(tx)
+	primaryRoot, err := storeio.BuildEmptyPrimaryGraphSummarized(
+		tx, c.options.skipIndexes,
+	)
 	if err != nil {
 		_ = tx.Abort()
 		return err
@@ -390,7 +392,9 @@ func (c *Collection) createInitialState() error {
 		PrimaryRoot:           primaryRoot,
 		ExactIndexRoot:        exactIndexRoot,
 	}
-	root.Options = fileStoreCollectionOptionFlags(c.options.Collection)
+	root.Options = fileStoreCollectionOptionFlags(
+		c.options.Collection, len(c.options.SkipIndexes) != 0,
+	)
 	if c.options.MaterializationDamageGranule != 0 {
 		root.Options |= storeio.StateOptionCanonicalMaterialization
 		root.MaterializationDamageGranule =

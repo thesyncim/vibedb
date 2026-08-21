@@ -136,6 +136,14 @@ record is a delete. It never trusts a physical sibling pointer that a later COW
 generation could make stale. Query execution takes an explicit heap or durable
 snapshot and uses the same cut for indexes, scans, and document rechecks.
 
+Collections may persist up to eight explicit scalar min/max summaries in each
+primary stripe. A query with sound conjunctive scalar bounds compares canonical
+ordered bytes and advances a rejected stripe before document reconstruction;
+the full predicate still owns correctness for retained stripes. Summary space
+is capped at 4 KiB per stripe and unsupported scalar shapes disable pruning
+locally, so the optimization has bounded write/space cost and cannot create
+false negatives.
+
 ## SQL and JSON documents
 
 The relational boundary has one language: SQL. Embedded callers use
@@ -293,12 +301,36 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Distributed server boundary](design/distributed-sharding.md): the
   separate, server-only distributed tier. Its routed leader-only shard
   execution (`shardservice`) and stateless routing gateway (`gateway`) exist
-  today; both are server-only and not part of the embedded API. They route on
+  today, including an opt-in bounded row-batch transport primitive and
+  owner-fenced retry-safe mailbox lifecycle commands that keep the routed
+  one-frame lane unchanged, plus planner-selected hash repartition and
+  partition-local grouped reducers;
+  both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
-  the embedded surface. It also documents that `autosplit` is a shadow-only
-  unwired recommender and that serving replication, failover, and online
-  movement are absent.
+  the embedded surface. It also documents the optional fixed-space hot-bucket
+  request recorder and generation-fenced desired split planner in `autosplit`;
+  no controller publishes those plans. The replicated-state boundary can export
+  one coherent applied cut as a deterministic bounded-memory hash chain, resume
+  it into non-serving durable destination files through an atomic cursor without
+  retaining an artifact copy, and fully validate a candidate. The exact
+  candidate can be certified as a fresh immutable Raft base and catch up as a
+  learner through ordinary `AppendEntries`. `internal/rebalance` now derives an
+  intact-shard replica move from exact catalog, membership, snapshot-digest,
+  apply, progress, leadership, ownership-transition, catalog-CAS, generation-
+  drain, and retirement evidence. It remains a non-serving controller kernel:
+  peer transport, an external topology authority, server wiring, automatic
+  failover, and physical child-range split execution remain absent.
+- [Distributed system target](design/distributed-system.md): the routed fast
+  path plus distributed fallback, tenant-independent virtual buckets, global
+  indexes, coherent snapshots, bounded exchange, serving replication, and
+  online movement. Its bounded worker-mailbox state machine, canonical
+  intermediate row blocks, shard-wire lifecycle commands, and gateway stage
+  lifecycle/producer primitives, direct shard-cursor-to-mailbox pushing,
+  worker-local grouped reducers, and memory-costed `OpRepartition` selection
+  exist, but authenticated peer admission and general join/range stages remain
+  unfinished. It is a delivery
+  contract, not current capability.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and
   transactions.

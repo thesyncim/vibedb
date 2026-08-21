@@ -140,8 +140,8 @@ func TestFilePrimaryOrderedScan100K(t *testing.T) {
 		first *= width
 		last := min(first+width, count)
 		at := first
-		err := primarySnapshot.rangePrimaryGraph(
-			nil, nil, prefix,
+		err := primarySnapshot.RangePrefixRaw(
+			prefix,
 			func(key, value []byte) error {
 				if at >= last || string(key) != keys[at] ||
 					!bytes.Equal(value, values[at]) {
@@ -198,9 +198,7 @@ func TestFilePrimaryOrderedScanAllocatesZero(t *testing.T) {
 	}
 	prefix := []byte("primary-key-000001")
 	allocs = testing.AllocsPerRun(100, func() {
-		if err := snapshot.rangePrimaryGraph(
-			nil, nil, prefix, visit,
-		); err != nil {
+		if err := snapshot.RangePrefixRaw(prefix, visit); err != nil {
 			panic(err)
 		}
 	})

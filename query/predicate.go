@@ -390,20 +390,18 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		}
 		cp := c.nodes.one()
 		*cp = compiledPredicate{kind: predCmp, col: col, op: p.op, lit: classifyLiteral(lit)}
-		// Every equality compiles its exact scalar needle for declared collection
-		// indexes, including nested paths. The older Segment posting family is
-		// limited to one top-level field and receives the same needle only when
-		// that narrower contract applies.
-		if p.op == Eq {
-			if needle, ok := c.eqNeedle(cp.lit); ok {
-				idx, err := c.buildNeedleIndex(needle)
-				if err != nil {
-					return nil, err
-				}
-				cp.needle = idx
-				if reg.paths[col].single {
-					cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: idx}
-				}
+		// Every scalar comparison compiles one vibejson needle. Equality uses it
+		// for exact probes; ordered durable indexes use the same typed bytes as a
+		// lower or upper bound. The older Segment posting family remains equality-
+		// only and limited to one top-level field.
+		if needle, ok := c.eqNeedle(cp.lit); ok {
+			idx, err := c.buildNeedleIndex(needle)
+			if err != nil {
+				return nil, err
+			}
+			cp.needle = idx
+			if p.op == Eq && reg.paths[col].single {
+				cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: idx}
 			}
 		}
 		return cp, nil

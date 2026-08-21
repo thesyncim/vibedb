@@ -1,0 +1,213 @@
+package autosplit
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/thesyncim/vibedb/distribution"
+)
+
+const MaxSplitChildren = 3
+
+var ErrInvalidSplit = errors.New("autosplit: invalid generation-fenced split")
+
+// Destination is one topology-prepared, non-serving child allocation. Its
+// allocation generation must be above the distribution's durable lifetime
+// high-water; a retired identity is never reused.
+type Destination struct {
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	Leaders              []distribution.EndpointID
+	OwnershipEpoch       distribution.OwnershipEpoch
+}
+
+// SplitRequest turns one sustained recommendation into exact desired routing
+// geometry. RetainChild stays on the source allocation; every other child is
+// assigned a Destination in keyspace order. The data plane must populate and
+// catch up those destinations before publishing the returned manifest.
+type SplitRequest struct {
+	Recommendation      Recommendation
+	RetainChild         uint8
+	NextRoutingVersion  distribution.RoutingVersion
+	AllocationHighWater distribution.ShardAllocationGeneration
+	Destinations        []Destination
+}
+
+// SplitChild is one immutable child description. Retained marks the child that
+// continues on the source allocation at a higher ownership epoch.
+type SplitChild struct {
+	Range                distribution.KeyRange
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	Leaders              []distribution.EndpointID
+	OwnershipEpoch       distribution.OwnershipEpoch
+	Retained             bool
+}
+
+// SplitPlan is a bounded desired-state artifact. It does not publish topology
+// or move data. Manifest becomes publishable only after every non-retained
+// child has installed a certified snapshot, caught up, and passed cutover
+// validation against this exact Source incarnation.
+type SplitPlan struct {
+	Source        SourceIdentity
+	ChildCount    uint8
+	RetainedChild uint8
+	children      [MaxSplitChildren]SplitChild
+	manifest      *distribution.Manifest
+}
+
+// Child returns a detached child record.
+func (p *SplitPlan) Child(index int) (SplitChild, bool) {
+	if p == nil || index < 0 || index >= int(p.ChildCount) {
+		return SplitChild{}, false
+	}
+	child := p.children[index]
+	child.Leaders = slices.Clone(child.Leaders)
+	return child, true
+}
+
+// Manifest returns the immutable desired routing manifest.
+func (p *SplitPlan) Manifest() *distribution.Manifest {
+	if p == nil {
+		return nil
+	}
+	return p.manifest
+}
+
+// PlanSplit validates stale-evidence, bucket geometry, allocation lineage, and
+// ownership fencing before constructing a desired manifest. It is deliberately
+// separate from cutover: a recommendation never gains publication authority.
+func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan, error) {
+	rec := request.Recommendation
+	if current == nil || rec.Source.Distribution != current.Distribution() ||
+		rec.Source.RoutingVersion != current.Version() ||
+		request.NextRoutingVersion <= current.Version() || !actionableRecommendation(rec) {
+		return nil, ErrInvalidSplit
+	}
+	sourceOrdinal, source, ok := exactSourceShard(current, rec.Source)
+	if !ok || rec.BoundaryCount == 0 || rec.BoundaryCount >= MaxSplitChildren {
+		return nil, ErrInvalidSplit
+	}
+	if !distribution.VirtualBucketBoundary(source.Range.Start, rec.Source.BucketBits) ||
+		(!source.Range.End.Max &&
+			!distribution.VirtualBucketBoundary(source.Range.End.Point, rec.Source.BucketBits)) {
+		return nil, ErrInvalidSplit
+	}
+	childCount := int(rec.BoundaryCount) + 1
+	if int(request.RetainChild) >= childCount || len(request.Destinations) != childCount-1 ||
+		source.Epoch == ^distribution.OwnershipEpoch(0) {
+		return nil, ErrInvalidSplit
+	}
+
+	var ranges [MaxSplitChildren]distribution.KeyRange
+	start := source.Range.Start
+	for i := 0; i < int(rec.BoundaryCount); i++ {
+		boundary := rec.Boundaries[i]
+		if !distribution.VirtualBucketBoundary(boundary, rec.Source.BucketBits) ||
+			distribution.ComparePoints(start, boundary) >= 0 ||
+			(!source.Range.End.Max && distribution.ComparePoints(boundary, source.Range.End.Point) >= 0) {
+			return nil, ErrInvalidSplit
+		}
+		ranges[i] = distribution.KeyRange{
+			Start: start, End: distribution.KeyspaceEnd{Point: boundary},
+		}
+		start = boundary
+	}
+	ranges[childCount-1] = distribution.KeyRange{Start: start, End: source.Range.End}
+	for i := 0; i < childCount; i++ {
+		if !ranges[i].Valid() {
+			return nil, ErrInvalidSplit
+		}
+	}
+
+	usedIDs := make(map[distribution.ShardID]struct{}, current.ShardCount()+len(request.Destinations))
+	usedAllocations := make(map[distribution.ShardAllocationGeneration]struct{}, current.ShardCount()+len(request.Destinations))
+	for i := 0; i < current.ShardCount(); i++ {
+		metadata, _ := current.ShardMetadataAt(i)
+		usedIDs[metadata.ID] = struct{}{}
+		usedAllocations[metadata.AllocationGeneration] = struct{}{}
+	}
+
+	plan := &SplitPlan{
+		Source: rec.Source, ChildCount: uint8(childCount), RetainedChild: request.RetainChild,
+	}
+	destinationOrdinal := 0
+	lastAllocation := request.AllocationHighWater
+	for i := 0; i < childCount; i++ {
+		child := SplitChild{Range: ranges[i]}
+		if i == int(request.RetainChild) {
+			child.Shard = source.ID
+			child.AllocationGeneration = source.AllocationGeneration
+			child.Leaders = slices.Clone(source.Leaders)
+			child.OwnershipEpoch = source.Epoch + 1
+			child.Retained = true
+		} else {
+			destination := request.Destinations[destinationOrdinal]
+			destinationOrdinal++
+			if destination.Shard == "" || len(destination.Leaders) == 0 ||
+				destination.OwnershipEpoch == 0 ||
+				destination.AllocationGeneration <= lastAllocation {
+				return nil, ErrInvalidSplit
+			}
+			if _, exists := usedIDs[destination.Shard]; exists {
+				return nil, ErrInvalidSplit
+			}
+			if _, exists := usedAllocations[destination.AllocationGeneration]; exists {
+				return nil, ErrInvalidSplit
+			}
+			for _, leader := range destination.Leaders {
+				if leader == "" {
+					return nil, ErrInvalidSplit
+				}
+			}
+			usedIDs[destination.Shard] = struct{}{}
+			usedAllocations[destination.AllocationGeneration] = struct{}{}
+			lastAllocation = destination.AllocationGeneration
+			child.Shard = destination.Shard
+			child.AllocationGeneration = destination.AllocationGeneration
+			child.Leaders = slices.Clone(destination.Leaders)
+			child.OwnershipEpoch = destination.OwnershipEpoch
+		}
+		plan.children[i] = child
+	}
+
+	shards := make([]distribution.Shard, 0, current.ShardCount()+childCount-1)
+	for i := 0; i < current.ShardCount(); i++ {
+		if i != sourceOrdinal {
+			shard, _ := current.ShardInfo(i)
+			shards = append(shards, shard)
+			continue
+		}
+		for child := 0; child < childCount; child++ {
+			descriptor := &plan.children[child]
+			shards = append(shards, distribution.Shard{
+				ID: descriptor.Shard, AllocationGeneration: descriptor.AllocationGeneration,
+				Range: descriptor.Range, Leaders: descriptor.Leaders, Epoch: descriptor.OwnershipEpoch,
+			})
+		}
+	}
+	manifest, err := distribution.NewManifest(
+		current.Distribution(), request.NextRoutingVersion, shards,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSplit, err)
+	}
+	plan.manifest = manifest
+	return plan, nil
+}
+
+func exactSourceShard(
+	manifest *distribution.Manifest,
+	source SourceIdentity,
+) (int, distribution.Shard, bool) {
+	for i := 0; i < manifest.ShardCount(); i++ {
+		shard, ok := manifest.ShardInfo(i)
+		if !ok || shard.ID != source.Shard {
+			continue
+		}
+		return i, shard, shard.AllocationGeneration == source.AllocationGeneration &&
+			shard.Range == source.Range && shard.Epoch == source.OwnershipEpoch
+	}
+	return 0, distribution.Shard{}, false
+}

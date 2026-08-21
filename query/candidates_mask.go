@@ -36,10 +36,10 @@ import (
 // stable-slot masks, or a nil, unbounded result when the catalog can't
 // answer it. requireExact selects between candidate masks (may still need a
 // document recheck) and exact masks (already collision-verified).
-// A sourceCaps is the optional [store.IndexSource] capability a backend has: a
-// materializable live-row universe for complementing a NOT. It is genuinely
-// optional — the heap Snapshot has it, durable does not — so the planner has to
-// know which it is dealing with.
+// sourceCaps states optional [store.IndexSource] capabilities: a materializable
+// live-row universe for complementing NOT and ordered scalar ranges. Heap owns
+// the former; durable owns the latter. The planner must know which concrete
+// source it is dealing with without runtime discovery.
 //
 // Whatever a caller puts in this field is converted to an interface, so a
 // backend should state the narrowest concrete type that implements the
@@ -54,7 +54,8 @@ import (
 // at compile time, so each concrete entry point states its own and the compiler
 // checks the claim.
 type sourceCaps struct {
-	live store.LiveMaskSource
+	live   store.LiveMaskSource
+	ranges store.RangeIndexSource
 }
 
 func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourceCaps, w *Workspace, requireExact bool) ([]store.Mask, bool, error) {
@@ -82,15 +83,47 @@ func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourc
 func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps sourceCaps, paths []compiledPath, indexes []store.IndexInfo, w *Workspace, requireExact bool) ([]store.Mask, bool, bool, error) {
 	switch p.kind {
 	case predCmp, predCmpBound:
-		if p.op != Eq {
-			return nil, false, false, nil
-		}
-		needle, present, bindable := p.equalityNeedle(w)
+		needle, present, bindable := p.comparisonNeedle(w)
 		if !bindable {
 			return nil, false, false, nil
 		}
 		if !present {
 			return nil, true, true, nil
+		}
+		if p.op != Eq {
+			if requireExact || caps.ranges == nil {
+				return nil, false, false, nil
+			}
+			index, ok := singleColumnIndex(p.indexPath(paths), indexes)
+			if !ok {
+				return nil, false, false, nil
+			}
+			span := store.IndexRange{}
+			switch p.op {
+			case Lt, Le:
+				span.Upper, span.HasUpper = needle, true
+				span.UpperInclusive = p.op == Le
+			case Gt, Ge:
+				span.Lower, span.HasLower = needle, true
+				span.LowerInclusive = p.op == Ge
+			default:
+				return nil, false, false, nil
+			}
+			out := w.nextStoreMasks()
+			out, bounded, err := caps.ranges.AppendIndexRangeCandidateMasks(
+				out, index.Name, span,
+			)
+			if err != nil {
+				return nil, false, false, err
+			}
+			if !bounded {
+				return nil, false, false, nil
+			}
+			w.storeIndexProbes++
+			w.keepStoreMasks(out)
+			// Range masks remain candidates: the SQL comparison's NULL behavior
+			// and complete scalar semantics are rechecked on every selected row.
+			return out, true, false, nil
 		}
 		if index, ok := singleColumnIndex(p.indexPath(paths), indexes); ok {
 			out := w.nextStoreMasks()
@@ -205,7 +238,9 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		return andCandidatesFor(p, snapshot, caps, paths, indexes, w, requireExact)
 	case predOr:
 		for _, kid := range p.kids {
-			if !kid.canBound(paths, indexes, w) {
+			if !kid.canBoundWithRanges(
+				paths, indexes, w, caps.ranges != nil,
+			) {
 				return nil, false, false, nil
 			}
 		}
@@ -250,25 +285,59 @@ func andCandidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, cap
 	var acc []store.Mask
 	have := false
 	allExact := true
+	var rangePath string
+	haveRange := false
+	if !requireExact && caps.ranges != nil {
+		if index, span, ok := p.bestRangeIndex(
+			paths, indexes, w,
+		); ok {
+			candidate := w.nextStoreMasks()
+			var bounded bool
+			var err error
+			candidate, bounded, err = caps.ranges.AppendIndexRangeCandidateMasks(
+				candidate, index.Name, span,
+			)
+			if err != nil {
+				return nil, false, false, err
+			}
+			if bounded {
+				w.storeIndexProbes++
+				w.keepStoreMasks(candidate)
+				acc, have = candidate, true
+				allExact = false
+				rangePath, haveRange = index.Columns[0], true
+			}
+		}
+	}
 	var compound store.IndexInfo
 	if index, count, ok := p.bestCompoundIndexInto(paths, indexes, w, &w.needleScratch); ok {
 		compound = index
-		acc = w.nextStoreMasks()
+		compoundMasks := w.nextStoreMasks()
 		var err error
 		if requireExact {
-			acc, err = snapshot.AppendIndexMasks(acc, index.Name, w.needleScratch[:count]...)
+			compoundMasks, err = snapshot.AppendIndexMasks(compoundMasks, index.Name, w.needleScratch[:count]...)
 		} else {
-			acc, err = snapshot.AppendIndexCandidateMasks(acc, index.Name, w.needleScratch[:count]...)
+			compoundMasks, err = snapshot.AppendIndexCandidateMasks(compoundMasks, index.Name, w.needleScratch[:count]...)
 		}
 		if err != nil {
 			return nil, false, false, err
 		}
 		w.storeIndexProbes++
-		w.keepStoreMasks(acc)
-		have = true
-		allExact = requireExact
+		w.keepStoreMasks(compoundMasks)
+		if have {
+			acc = intersectStoreMasks(w.nextStoreMasks(), acc, compoundMasks)
+			w.keepStoreMasks(acc)
+		} else {
+			acc, have = compoundMasks, true
+		}
+		allExact = allExact && requireExact
 	}
 	for _, kid := range p.kids {
+		if haveRange && kid != nil &&
+			(kid.kind == predCmp || kid.kind == predCmpBound) &&
+			orderedRangeOp(kid.op) && kid.indexPath(paths) == rangePath {
+			continue
+		}
 		if kid.coveredEquality(paths, compound) {
 			continue
 		}
@@ -292,6 +361,68 @@ func andCandidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, cap
 		return nil, false, false, nil
 	}
 	return acc, true, allExact, nil
+}
+
+// bestRangeIndex folds the tightest direct lower and upper conjuncts over one
+// ready single-column index into one physical span. BETWEEN and authored
+// `x >= a AND x < b` therefore walk and union the selected term run once,
+// rather than materializing two broad posting unions and intersecting them.
+func (p *compiledPredicate) bestRangeIndex(
+	paths []compiledPath,
+	indexes []store.IndexInfo,
+	w *Workspace,
+) (
+	store.IndexInfo,
+	store.IndexRange,
+	bool,
+) {
+	if p == nil || p.kind != predAnd {
+		return store.IndexInfo{}, store.IndexRange{}, false
+	}
+	for _, index := range indexes {
+		if index.Kind != store.IndexExact || index.State != store.IndexReady ||
+			index.ColumnCount != 1 {
+			continue
+		}
+		var lower, upper *compiledPredicate
+		var lowerValue, upperValue scalar
+		for _, kid := range p.kids {
+			if kid == nil ||
+				(kid.kind != predCmp && kid.kind != predCmpBound) ||
+				!orderedRangeOp(kid.op) || kid.indexPath(paths) != index.Columns[0] {
+				continue
+			}
+			value, present, bindable := kid.comparisonScalar(w)
+			if !bindable || !present {
+				continue
+			}
+			switch kid.op {
+			case Gt, Ge:
+				if lower == nil || compareScalar(value, lowerValue) > 0 ||
+					compareScalar(value, lowerValue) == 0 && kid.op == Gt && lower.op == Ge {
+					lower, lowerValue = kid, value
+				}
+			case Lt, Le:
+				if upper == nil || compareScalar(value, upperValue) < 0 ||
+					compareScalar(value, upperValue) == 0 && kid.op == Lt && upper.op == Le {
+					upper, upperValue = kid, value
+				}
+			}
+		}
+		if lower == nil || upper == nil {
+			continue
+		}
+		lowerNeedle, lowerPresent, lowerBindable := lower.comparisonNeedle(w)
+		upperNeedle, upperPresent, upperBindable := upper.comparisonNeedle(w)
+		if !lowerBindable || !lowerPresent || !upperBindable || !upperPresent {
+			continue
+		}
+		return index, store.IndexRange{
+			Lower: lowerNeedle, HasLower: true, LowerInclusive: lower.op == Ge,
+			Upper: upperNeedle, HasUpper: true, UpperInclusive: upper.op == Le,
+		}, true
+	}
+	return store.IndexInfo{}, store.IndexRange{}, false
 }
 
 func orCandidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps sourceCaps, paths []compiledPath, indexes []store.IndexInfo, w *Workspace, requireExact bool) ([]store.Mask, bool, bool, error) {
@@ -397,6 +528,43 @@ func (p *compiledPredicate) equalityNeedle(w *Workspace) (
 	return needle, ok, ok
 }
 
+// comparisonNeedle resolves the typed scalar endpoint of any comparison.
+// Equality keeps its historical wrapper below; ordered range candidates use
+// this broader spelling so static and late-bound comparisons share one NULL
+// and binding rule.
+func (p *compiledPredicate) comparisonNeedle(w *Workspace) (
+	needle vibejson.Index,
+	present bool,
+	bindable bool,
+) {
+	if p.kind == predCmp {
+		return p.needle, true, true
+	}
+	if p.kind != predCmpBound || w == nil || p.slot < 0 || p.slot >= len(w.correlations) {
+		return vibejson.Index{}, false, false
+	}
+	if w.correlations[p.slot].kind == kindNull {
+		return vibejson.Index{}, false, true
+	}
+	needle, ok := w.correlationNeedle(p.slot)
+	return needle, ok, ok
+}
+
+func (p *compiledPredicate) comparisonScalar(w *Workspace) (
+	value scalar,
+	present bool,
+	bindable bool,
+) {
+	if p.kind == predCmp {
+		return p.lit, p.lit.kind != kindNull, true
+	}
+	if p.kind != predCmpBound || w == nil || p.slot < 0 || p.slot >= len(w.correlations) {
+		return scalar{}, false, false
+	}
+	value = w.correlations[p.slot]
+	return value, value.kind != kindNull, true
+}
+
 // canBound is the no-I/O planner pass: does the declared index catalog
 // alone (no snapshot access) let this predicate return a bounded candidate
 // set? OR requires every branch to prove usable before any backend attempts
@@ -409,12 +577,21 @@ func (p *compiledPredicate) equalityNeedle(w *Workspace) (
 func (p *compiledPredicate) canBound(
 	paths []compiledPath, indexes []store.IndexInfo, w *Workspace,
 ) bool {
+	return p.canBoundWithRanges(paths, indexes, w, false)
+}
+
+func (p *compiledPredicate) canBoundWithRanges(
+	paths []compiledPath,
+	indexes []store.IndexInfo,
+	w *Workspace,
+	ranges bool,
+) bool {
 	switch p.kind {
 	case predCmp, predCmpBound:
-		if p.op != Eq {
+		if p.op != Eq && (!ranges || !orderedRangeOp(p.op)) {
 			return false
 		}
-		_, present, bindable := p.equalityNeedle(w)
+		_, present, bindable := p.comparisonNeedle(w)
 		if !bindable || !present {
 			return bindable
 		}
@@ -423,13 +600,15 @@ func (p *compiledPredicate) canBound(
 	case predIn, predInBound:
 		return p.membershipBounded(paths, indexes, w)
 	case predContains:
-		return p.containPlan != nil && p.containPlan.canBound(paths, indexes, w)
+		return p.containPlan != nil && p.containPlan.canBoundWithRanges(
+			paths, indexes, w, ranges,
+		)
 	case predAnd:
 		if _, _, ok := p.bestCompoundIndex(paths, indexes, w); ok {
 			return true
 		}
 		for _, kid := range p.kids {
-			if kid.canBound(paths, indexes, w) {
+			if kid.canBoundWithRanges(paths, indexes, w, ranges) {
 				return true
 			}
 		}
@@ -439,7 +618,7 @@ func (p *compiledPredicate) canBound(
 			return false
 		}
 		for _, kid := range p.kids {
-			if !kid.canBound(paths, indexes, w) {
+			if !kid.canBoundWithRanges(paths, indexes, w, ranges) {
 				return false
 			}
 		}
@@ -447,6 +626,28 @@ func (p *compiledPredicate) canBound(
 	default:
 		return false
 	}
+}
+
+func (p *compiledPredicate) hasRangeComparison() bool {
+	if p == nil {
+		return false
+	}
+	if (p.kind == predCmp || p.kind == predCmpBound) && orderedRangeOp(p.op) {
+		return true
+	}
+	if p.containPlan != nil && p.containPlan.hasRangeComparison() {
+		return true
+	}
+	for _, kid := range p.kids {
+		if kid.hasRangeComparison() {
+			return true
+		}
+	}
+	return false
+}
+
+func orderedRangeOp(op Op) bool {
+	return op == Lt || op == Le || op == Gt || op == Ge
 }
 
 // canAnswerExactly is the no-I/O proof for a direct indexed-answer lane

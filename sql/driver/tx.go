@@ -39,6 +39,11 @@ type insertSelectStageAccount struct {
 	active          bool
 }
 
+type primaryMutationGuard struct {
+	relation string
+	keys     []string
+}
+
 type txTable struct {
 	name               string
 	incarnation        *table
@@ -80,20 +85,22 @@ type txTable struct {
 // dirty set is every table with a non-empty overlay; COMMIT validates each
 // participant and publishes through Collection.Update or UpdateCollections.
 type tx struct {
-	conn               *conn
-	tables             map[string]*txTable
-	views              map[string]*viewMeta
-	layoutEpoch        *catalogLayoutEpoch
-	refreshStates      []*txTable
-	refreshStaged      map[string]*txTable
-	savepoints         []savepointFrame
-	readOnly           bool
-	isolation          IsolationLevel
-	done               bool
-	staged             []stagedTxMutation
-	serialReadKeys     int
-	serialReadBytes    int
-	serialReadRetained int
+	conn                   *conn
+	tables                 map[string]*txTable
+	views                  map[string]*viewMeta
+	layoutEpoch            *catalogLayoutEpoch
+	refreshStates          []*txTable
+	refreshStaged          map[string]*txTable
+	savepoints             []savepointFrame
+	readOnly               bool
+	isolation              IsolationLevel
+	done                   bool
+	staged                 []stagedTxMutation
+	serialReadKeys         int
+	serialReadBytes        int
+	serialReadRetained     int
+	distributedParticipant *distributedParticipantCommit
+	primaryMutationGuard   *primaryMutationGuard
 }
 
 var (
@@ -1165,6 +1172,9 @@ func (t *tx) execMutationCore(
 		if err != nil {
 			return nil, err
 		}
+		if err := t.consumePrimaryMutationGuard(tableName, keys); err != nil {
+			return nil, err
+		}
 		if len(keys) != 0 {
 			if err := validateDocument(
 				state.schema, document, limits.MaxDocumentBytes,
@@ -1192,6 +1202,9 @@ func (t *tx) execMutationCore(
 		keys, err := t.conn.matchingKeysTransaction(
 			ctx, t, statement, args, state, 0)
 		if err != nil {
+			return nil, err
+		}
+		if err := t.consumePrimaryMutationGuard(tableName, keys); err != nil {
 			return nil, err
 		}
 		for _, key := range keys {
@@ -1301,6 +1314,25 @@ func (t *tx) execMutationCore(
 	}
 	t.applyResolvedMutations(state, staged)
 	return result{affected: int64(len(staged))}, nil
+}
+
+func (t *tx) consumePrimaryMutationGuard(relation string, selected []string) error {
+	guard := t.primaryMutationGuard
+	if guard == nil {
+		return nil
+	}
+	t.primaryMutationGuard = nil
+	if guard.relation != relation || len(guard.keys) != len(selected) {
+		return ErrDistributedTransactionConflict
+	}
+	ordered := slices.Clone(selected)
+	slices.Sort(ordered)
+	for i := range ordered {
+		if ordered[i] != guard.keys[i] {
+			return ErrDistributedTransactionConflict
+		}
+	}
+	return nil
 }
 
 // stageInsertSelect evaluates the source against the transaction view that
@@ -1878,8 +1910,11 @@ func (t *tx) Commit() error {
 		return errors.New("vibedb: transaction is already finished")
 	}
 	defer t.finish()
+	if t.primaryMutationGuard != nil {
+		return ErrDistributedTransactionConflict
+	}
 	dirtyNames := t.dirtyTableNames()
-	if len(dirtyNames) == 0 {
+	if len(dirtyNames) == 0 && t.distributedParticipant == nil {
 		return nil
 	}
 	if err := t.conn.requireDirectWriteAllowed(); err != nil {
@@ -1890,6 +1925,9 @@ func (t *tx) Commit() error {
 	t.conn.db.mu.Lock()
 	defer t.conn.db.mu.Unlock()
 	if err := t.conn.db.settleCatalogLocked(); err != nil {
+		return err
+	}
+	if err := t.checkDistributedParticipantLocked(); err != nil {
 		return err
 	}
 	if t.isolation == IsolationSerializable {
@@ -1991,7 +2029,7 @@ func (t *tx) Commit() error {
 		}
 	}
 
-	if len(dirty) == 1 {
+	if len(dirty) == 1 && t.distributedParticipant == nil {
 		return t.commitOneTable(dirty[0].name, dirty[0].table, dirty[0].state)
 	}
 	return t.commitManyTables(dirty)
@@ -2067,13 +2105,22 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 	if t.conn.db.txnLog == nil {
 		return errors.New("vibedb: database transaction log is not open")
 	}
-	members := make([]durable.NamedCollection, 0, len(t.conn.db.tables))
+	members := make([]durable.NamedCollection, 0, len(t.conn.db.tables)+1)
 	for name, table := range t.conn.db.tables {
 		if table.collection == nil {
 			continue
 		}
 		members = append(members, durable.NamedCollection{
 			Name: name, Collection: table.collection,
+		})
+	}
+	if t.distributedParticipant != nil {
+		if t.conn.db.distributedTxnCollection == nil {
+			return errors.New("vibedb: distributed transaction state collection is not open")
+		}
+		members = append(members, durable.NamedCollection{
+			Name:       distributedTransactionMember,
+			Collection: t.conn.db.distributedTxnCollection,
 		})
 	}
 	slices.SortFunc(members, func(a, b durable.NamedCollection) int {
@@ -2103,6 +2150,15 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 				}
 				if fillErr := fillWriteBatchFromTxTable(wb, state); fillErr != nil {
 					return fillErr
+				}
+			}
+			if t.distributedParticipant != nil {
+				wb, batchErr := batch.Collection(distributedTransactionMember)
+				if batchErr != nil {
+					return batchErr
+				}
+				if putErr := wb.Put(t.distributedParticipant.id[:], t.distributedParticipant.document); putErr != nil {
+					return transactionBatchError(putErr)
 				}
 			}
 			return nil

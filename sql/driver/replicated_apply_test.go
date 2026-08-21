@@ -105,6 +105,87 @@ func testReplicatedApplyKey(t *testing.T, database *Database, document []byte) [
 	return []byte(key)
 }
 
+func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *testing.T) {
+	path, database, base := bindReplicatedApplyTestRoot(t, "ownership-transition")
+	bootstrap := testReplicatedApplyBootstrap()
+	options := testReplicatedApplyOptions()
+	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	conf := &pb.ConfState{Voters: []uint64{1, 2}}
+	if _, err := claim.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: 2, Term: 2, Type: pb.EntryConfChange,
+	}, conf); err != nil {
+		t.Fatal(err)
+	}
+	binding := replicatedStateBinding(base)
+	transition, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+		From: binding, ExpectedReplicaSetVersion: 2,
+		SourceMember: 1, TargetMember: 2,
+		ToOwnershipEpoch:  binding.OwnershipEpoch + 1,
+		ToRoutingVersion:  binding.RoutingVersion + 1,
+		ToRouteGeneration: binding.RouteGeneration + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.AdmitCommand(transition); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), transition); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := claim.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if state.Binding.OwnershipEpoch != binding.OwnershipEpoch+1 ||
+		state.Binding.RoutingVersion != binding.RoutingVersion+1 ||
+		state.Binding.RouteGeneration != binding.RouteGeneration+1 {
+		t.Fatalf("transitioned SQL state = %+v", state.Binding)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedClaim, reopenedIdentity, err := reopened.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil || reopenedIdentity != identity {
+		t.Fatalf("reopen transitioned claim = %+v, %v", reopenedIdentity, err)
+	}
+	cut, err = reopenedClaim.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedState := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopenedState.Binding != state.Binding || reopenedState.Applied != 3 {
+		t.Fatalf("reopened transitioned state = %+v", reopenedState)
+	}
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type replicatedPlacementProbe struct {
 	id       string
 	document []byte

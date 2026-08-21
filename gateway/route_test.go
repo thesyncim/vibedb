@@ -44,6 +44,30 @@ func TestExplainDistributedPhysicalPlanWithoutDispatch(t *testing.T) {
 	if !strings.HasPrefix(aggregate.PhysicalPlan, "final-aggregate") {
 		t.Fatalf("aggregate physical plan:\n%s", aggregate.PhysicalPlan)
 	}
+
+	groupedSort, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n`, Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(groupedSort.PhysicalPlan, "sort") ||
+		!strings.Contains(groupedSort.PhysicalPlan, "final-aggregate") {
+		t.Fatalf("grouped sort physical plan:\n%s", groupedSort.PhysicalPlan)
+	}
+
+	groupedTopK, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(groupedTopK.PhysicalPlan, "top-k") ||
+		!strings.Contains(groupedTopK.PhysicalPlan, "final-aggregate") {
+		t.Fatalf("grouped top-k physical plan:\n%s", groupedTopK.PhysicalPlan)
+	}
 }
 
 func routeSQL(t *testing.T, e *Executor, snap *Snapshot, sql string, class OperationClass) (*plan, error) {
@@ -151,6 +175,36 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 		if c.address != w.addr {
 			t.Fatalf("call %d address = %q, want %q", i, c.address, w.addr)
 		}
+	}
+}
+
+func TestRouteMarksOnlyMultiShardGroupedFragmentsPartial(t *testing.T) {
+	snap := testSnapshot(t, 1)
+	e := newRouteExecutor(t, snap)
+
+	grouped, err := routeSQL(t, e, snap,
+		`SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n LIMIT 2`, ClassBatch)
+	if err != nil {
+		t.Fatalf("grouped route: %v", err)
+	}
+	if len(grouped.calls) != 2 {
+		t.Fatalf("grouped calls = %d, want 2", len(grouped.calls))
+	}
+	for i := range grouped.calls {
+		if !grouped.calls[i].req.PartialAggregate {
+			t.Fatalf("grouped call %d did not request a partial aggregate fragment", i)
+		}
+	}
+
+	single, err := routeSQL(t, e, snap,
+		`SELECT n, COUNT(*) FROM messages WHERE tenant_id = 'tenant-42' GROUP BY n ORDER BY n LIMIT 2`,
+		ClassInteractive)
+	if err != nil {
+		t.Fatalf("single route: %v", err)
+	}
+	if len(single.calls) != 1 || single.calls[0].req.PartialAggregate {
+		t.Fatalf("single grouped route = %d calls partial=%v, want one final shard query",
+			len(single.calls), len(single.calls) != 0 && single.calls[0].req.PartialAggregate)
 	}
 }
 

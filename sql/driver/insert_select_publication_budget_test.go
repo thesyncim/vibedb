@@ -329,7 +329,7 @@ func TestTransactionInsertSelectStagesExactNativeRecordSize(t *testing.T) {
 
 func TestPlacedInsertStreamingRoutingIsAtomicAndZeroAllocation(t *testing.T) {
 	binding, router, same, diff := twoShardFixture(t)
-	native := distribution.NewNativeMapper(binding.spec.Arity)
+	native := distribution.NewNativeMapperWithBucketBits(binding.spec.Arity, binding.spec.EffectiveBucketBits())
 	binding.mapper = native
 	binding.native = native
 	sameDocs := [][]byte{doc(t, same[0]), doc(t, same[1])}

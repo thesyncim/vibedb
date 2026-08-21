@@ -11,6 +11,8 @@ import (
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Database owns one SQL catalog and its exclusive durable writer lease.
@@ -246,10 +248,28 @@ func (s *Session) SetMemoryLimit(bytes int64) error {
 // An error while a transaction is active moves the session to
 // SessionFailedTransaction, matching PostgreSQL's failed-transaction rule.
 func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
+	return s.prepare(ctx, text, false)
+}
+
+// PreparePartialAggregate parses one grouped SELECT and lowers its shard-local
+// partial fragment. Final ORDER BY and LIMIT stages are removed from the owned
+// AST before lowering so a coordinator can combine every partial group without
+// reparsing or rewriting authored SQL text.
+func (s *Session) PreparePartialAggregate(ctx context.Context, text string) (*Prepared, error) {
+	return s.prepare(ctx, text, true)
+}
+
+func (s *Session) prepare(ctx context.Context, text string, partialAggregate bool) (*Prepared, error) {
 	if err := s.ready(ctx); err != nil {
 		return nil, s.fail(err)
 	}
-	statement, err := s.conn.prepareContext(ctx, text)
+	var statement *stmt
+	var err error
+	if partialAggregate {
+		statement, err = s.conn.preparePartialAggregateContext(ctx, text)
+	} else {
+		statement, err = s.conn.prepareContext(ctx, text)
+	}
 	if err != nil {
 		return nil, s.fail(err)
 	}
@@ -603,6 +623,35 @@ func (p *Prepared) QueryInto(
 	values []any,
 	dst *Cursor,
 ) error {
+	return p.queryInto(ctx, values, nil, nil, dst)
+}
+
+// QueryCandidateKeysInto executes the original SELECT over an exact set of
+// native primary storage keys. It is the distributed-index handoff: candidate
+// keys replace only the physical table scan, while the prepared predicate,
+// projection, aggregation, order, and limit remain authoritative. Keys borrow
+// caller storage until this method returns; an empty set is rejected so nil
+// retains one unambiguous meaning at the internal execution boundary.
+func (p *Prepared) QueryCandidateKeysInto(
+	ctx context.Context,
+	values []any,
+	primaryPath []byte,
+	keys [][]byte,
+	dst *Cursor,
+) error {
+	if len(primaryPath) == 0 || len(keys) == 0 {
+		return p.fail(errors.New("vibedb: candidate-key query requires at least one key"))
+	}
+	return p.queryInto(ctx, values, primaryPath, keys, dst)
+}
+
+func (p *Prepared) queryInto(
+	ctx context.Context,
+	values []any,
+	primaryPath []byte,
+	keys [][]byte,
+	dst *Cursor,
+) error {
 	if err := p.usable(); err != nil {
 		return p.fail(err)
 	}
@@ -632,7 +681,7 @@ func (p *Prepared) QueryInto(
 		clear(args)
 		return p.fail(err)
 	}
-	rowset, err := p.statement.queryRows(ctx, args)
+	rowset, err := p.statement.queryRowsCandidates(ctx, args, primaryPath, keys)
 	err = scope.finish(err)
 	if err != nil {
 		return p.fail(err)
@@ -1000,11 +1049,36 @@ func (c *conn) runtimeValues(kinds []ParamKind, values []any) ([]any, error) {
 			clear(c.args)
 			return nil, err
 		}
+		kind := ParamScalar
+		if i < len(kinds) {
+			kind = kinds[i]
+		}
+		if raw, ok := normalized.(vibejson.RawValue); ok {
+			if kind == ParamDocument {
+				// Documents stay byte-native all the way into the mutation path.
+				if err := vibejson.Validate(raw.Bytes()); err != nil {
+					clear(c.args)
+					return nil, fmt.Errorf("vibedb: invalid raw JSON document parameter %d: %w", i+1, err)
+				}
+				normalized = raw.Bytes()
+			} else {
+				spelling, number := raw.NumberBytes()
+				if !number {
+					clear(c.args)
+					return nil, fmt.Errorf(
+						"vibedb: scalar parameter %d is not an exact JSON number", i+1)
+				}
+				// query.Number is the SQL runtime's exact-number discriminator. The
+				// string header aliases the immutable RawValue bytes; no text is
+				// materialized or copied.
+				normalized = query.Number(byteview.String(spelling))
+			}
+		}
 		if err := addRuntimeArgumentBytes(&total, normalized); err != nil {
 			clear(c.args)
 			return nil, err
 		}
-		if i < len(kinds) && kinds[i] == ParamDocument {
+		if kind == ParamDocument {
 			switch value := normalized.(type) {
 			case string, []byte:
 			case *string:
@@ -1064,6 +1138,8 @@ func normalizeRuntimeValue(argument any) (any, error) {
 		return argument, nil
 	case json.Number:
 		return query.Number(value.String()), nil
+	case vibejson.RawValue:
+		return argument, nil
 	case query.Number:
 		return argument, nil
 	case *bool, *int64:

@@ -153,13 +153,20 @@ func TestIndexTermRejectsInvalidWithoutPartialAppend(t *testing.T) {
 
 func TestIndexTermKeyExactSizeBoundary(t *testing.T) {
 	payload := strings.Repeat("x", IndexTermMaxKeyBytes-5)
-	key := mustIndexTermKey(t, indexTerm(IndexTermString, `"`+payload+`"`))
+	component := indexTerm(IndexTermString, `"`+payload+`"`)
+	key := mustIndexTermKey(t, component)
 	if len(key) != IndexTermMaxKeyBytes {
 		t.Fatalf("boundary key size = %d, want %d", len(key), IndexTermMaxKeyBytes)
+	}
+	if size, ok := IndexTermKeyEncodedSize([]IndexTermComponent{component}); !ok || size != len(key) {
+		t.Fatalf("boundary encoded size = %d,%v want %d,true", size, ok, len(key))
 	}
 	tooLarge := indexTerm(IndexTermString, `"`+payload+"x"+`"`)
 	if got, ok := AppendIndexTermKey(nil, []IndexTermComponent{tooLarge}); ok || got != nil {
 		t.Fatalf("oversized canonical key = (%x,%v), want (nil,false)", got, ok)
+	}
+	if size, ok := IndexTermKeyEncodedSize([]IndexTermComponent{tooLarge}); ok || size != 0 {
+		t.Fatalf("oversized encoded size = %d,%v want 0,false", size, ok)
 	}
 }
 
@@ -281,7 +288,14 @@ func FuzzAppendIndexTermKey(f *testing.F) {
 		backing := make([]byte, 4, IndexTermMaxKeyBytes+16)
 		copy(backing, "seed")
 		before := append([]byte(nil), backing...)
+		size, sized := IndexTermKeyEncodedSize([]IndexTermComponent{component})
 		got, ok := AppendIndexTermKey(backing, []IndexTermComponent{component})
+		if ok != sized {
+			t.Fatalf(
+				"size/append admission differs: size=%d,%v append=%v",
+				size, sized, ok,
+			)
+		}
 		if !ok {
 			if len(got) != len(backing) || !bytes.Equal(got, before) {
 				t.Fatalf("rejected append changed dst: %x => %x", before, got)
@@ -289,6 +303,9 @@ func FuzzAppendIndexTermKey(f *testing.F) {
 			return
 		}
 		key := got[len(backing):]
+		if size != len(key) {
+			t.Fatalf("encoded size=%d, appended=%d", size, len(key))
+		}
 		if !ValidIndexTermKey(key) {
 			t.Fatalf("accepted input emitted invalid key: kind=%d direction=%d raw=%q key=%x",
 				kind, direction, raw, key)

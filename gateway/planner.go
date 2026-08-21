@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -13,6 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // ErrTableNotPlaced reports a physical table with no distributed placement in
@@ -63,12 +64,40 @@ type PreparedPlan struct {
 	constraints  *sqldriver.ConstraintProgram
 	order        []OrderKey
 	limit        *sqlast.Operand
+	offset       *sqlast.Operand
 	aggregates   []sqlast.AggKind
+	groupKeys    []int
 	aggHeaders   []string
 	params       int
 	alwaysReason string
 	emptyReason  string
 	multiReason  string
+
+	// writeKeyPointers holds one compiled shard-key pointer per ordinal for a
+	// whole-document insert or a whole-document UPDATE; it is nil for every
+	// other shape.
+	writeKeyPointers []vibejson.CompiledPointer
+	// writeKeyColumns maps each shard-key ordinal to the named top-level insert
+	// column index that supplies it; it is set only for a flat single-document
+	// INSERT.
+	writeKeyColumns []int
+	// writeGlobalIndexes is populated only for a table with READY global index
+	// incarnations. Local and non-ready indexes add no prepared-plan footprint.
+	writeGlobalIndexes []preparedGlobalIndex
+	// readGlobalIndexes contains finite-domain routing programs for READY global
+	// indexes on the driving table. Bind selects at most one complete key domain;
+	// the ordinary base-shard route remains preferred when it is already a point.
+	readGlobalIndexes []preparedGlobalIndexRead
+}
+
+type preparedGlobalIndexRead struct {
+	program     GlobalIndexProgram
+	constraints *sqldriver.ConstraintProgram
+}
+
+type boundGlobalIndexRead struct {
+	program     GlobalIndexProgram
+	constraints distribution.BoundConstraints
 }
 
 // BoundPlan is the immutable execution-specific result of binding typed
@@ -83,8 +112,13 @@ type BoundPlan struct {
 	constraints  distribution.BoundConstraints
 	order        []OrderKey
 	limit        int
+	offset       int
+	hasLimit     bool
 	aggregates   []sqlast.AggKind
+	groupKeys    []int
 	aggHeaders   []string
+	globalIndex  *boundGlobalIndexRead
+	globalEmpty  bool
 
 	spec         distribution.DistributionSpec
 	manifest     *distribution.Manifest
@@ -183,7 +217,16 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		return nil, err
 	}
 	if plan.statement.Kind != sqlast.KindSelect || plan.statement.Select == nil {
-		return nil, &WriteNotSupportedError{Kind: plan.statement.Kind}
+		// A mutating statement is planned for the distributed write path: it is
+		// admitted only when its shape is provably single-shard, refused before
+		// any dispatch otherwise.
+		if err := s.prepareWrite(plan); err != nil {
+			return nil, err
+		}
+		if cacheable {
+			return s.cachePreparedPlan(sqlText, hash, plan), nil
+		}
+		return plan, nil
 	}
 	selectStmt := plan.statement.Select
 	if err := validatePlanPhysicalTables(s, selectStmt, make(map[*sqlast.SelectStmt]struct{})); err != nil {
@@ -209,6 +252,9 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	plan.manifest = manifest
 	plan.params = plan.statement.Params()
 	plan.constraints = sqldriver.CompileConstraintProgram(placement.Columns, selectStmt.Where)
+	if err := s.prepareGlobalIndexReads(plan, selectStmt.Where); err != nil {
+		return nil, err
+	}
 	placements := make([]distribution.TablePlacement, len(selectStmt.From))
 	placements[0] = placement
 
@@ -234,6 +280,15 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 				cause: ErrDistributedPlanUnsupported,
 			}
 		}
+		if (placement.AffinityGroup != "" || joined.AffinityGroup != "") &&
+			joined.AffinityGroup != placement.AffinityGroup {
+			return nil, &PlanError{
+				Table: relation.Name,
+				Reason: fmt.Sprintf("affinity group %q is not colocated with %q",
+					joined.AffinityGroup, placement.AffinityGroup),
+				cause: ErrDistributedPlanUnsupported,
+			}
+		}
 		plan.tables = append(plan.tables, relation.Name)
 		placements[i] = joined
 		if relation.Join != sqlast.JoinInner && relation.Join != sqlast.JoinLeft {
@@ -248,11 +303,16 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	}
 
 	plan.order, plan.multiReason = planOrder(selectStmt, plan.multiReason)
-	plan.aggregates, plan.aggHeaders, plan.multiReason = planDistributedAggregates(selectStmt, plan.multiReason)
+	plan.aggregates, plan.groupKeys, plan.aggHeaders, plan.multiReason =
+		planDistributedAggregates(selectStmt, plan.multiReason)
 	plan.limit = selectStmt.Limit
+	plan.offset = selectStmt.Offset
 	plan.alwaysReason = allRouteSemanticBoundary(selectStmt, plan.alwaysReason)
-	plan.multiReason = multiShardSemanticBoundary(selectStmt, plan.multiReason, len(plan.aggregates) != 0)
-	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0, plan.multiReason)
+	plan.multiReason = multiShardSemanticBoundary(
+		selectStmt, plan.multiReason, len(plan.aggregates) != 0, len(plan.groupKeys) != 0,
+	)
+	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0,
+		len(plan.groupKeys) != 0, plan.multiReason)
 	if cacheable {
 		return s.cachePreparedPlan(sqlText, hash, plan), nil
 	}
@@ -280,15 +340,105 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	offset, err := bindPlanOperand(p.offset, args, "OFFSET")
+	if err != nil {
+		return nil, err
+	}
+	var globalIndex *boundGlobalIndexRead
+	var globalEmpty bool
+	if !boundConstraintsSinglePoint(constraints, p.spec.Arity) {
+		globalIndex, globalEmpty, err = p.bindGlobalIndexRead(args)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &BoundPlan{
 		generation: p.generation, table: p.table,
 		tables:       p.tables,
 		distribution: p.distribution, constraints: constraints,
-		order: p.order, limit: limit,
-		aggregates: p.aggregates, aggHeaders: p.aggHeaders,
+		order: p.order, limit: limit, offset: offset, hasLimit: p.limit != nil,
+		aggregates: p.aggregates, groupKeys: p.groupKeys,
+		aggHeaders:  p.aggHeaders,
+		globalIndex: globalIndex, globalEmpty: globalEmpty,
 		spec: p.spec, manifest: p.manifest,
 		alwaysReason: p.alwaysReason, emptyReason: p.emptyReason, multiReason: p.multiReason,
 	}, nil
+}
+
+func boundConstraintsSinglePoint(
+	constraints distribution.BoundConstraints,
+	arity int,
+) bool {
+	if len(constraints) != arity {
+		return false
+	}
+	for i := range constraints {
+		domain := constraints[i]
+		if domain.Kind != distribution.DomainFinite || len(domain.Values) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Snapshot) prepareGlobalIndexReads(
+	plan *PreparedPlan,
+	where *sqlast.Expr,
+) error {
+	indexes := s.Indexes(plan.table)
+	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
+		metadata, _ := indexes.At(ordinal)
+		if !metadata.Global() || !metadata.Ready() {
+			continue
+		}
+		program, err := s.CompileGlobalIndex(plan.table, metadata.Name)
+		if err != nil {
+			return err
+		}
+		paths := metadata.Paths[:metadata.PathCount]
+		plan.readGlobalIndexes = append(plan.readGlobalIndexes, preparedGlobalIndexRead{
+			program: program, constraints: sqldriver.CompileConstraintProgram(paths, where),
+		})
+	}
+	return nil
+}
+
+func (p *PreparedPlan) bindGlobalIndexRead(
+	args []any,
+) (*boundGlobalIndexRead, bool, error) {
+	for pass := 0; pass < 2; pass++ {
+		for i := range p.readGlobalIndexes {
+			candidate := &p.readGlobalIndexes[i]
+			unique := candidate.program.metadata.Flags&IndexUnique != 0
+			if (pass == 0) != unique {
+				continue
+			}
+			constraints, err := candidate.constraints.Bind(args)
+			if err != nil {
+				return nil, false, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+			}
+			if len(constraints) == 0 || len(constraints) > 4 {
+				continue
+			}
+			complete := true
+			for ordinal := range constraints {
+				domain := constraints[ordinal]
+				if domain.Kind == distribution.DomainEmpty {
+					return nil, true, nil
+				}
+				if domain.Kind != distribution.DomainFinite || len(domain.Values) == 0 {
+					complete = false
+					break
+				}
+			}
+			if complete {
+				return &boundGlobalIndexRead{
+					program: candidate.program, constraints: constraints,
+				}, false, nil
+			}
+		}
+	}
+	return nil, false, nil
 }
 
 // ValidateRoute refuses a cross-shard route whose result semantics the current
@@ -314,20 +464,21 @@ func (p *BoundPlan) ValidateRoute(route distribution.Route) error {
 }
 
 // emptyRouteSemanticBoundary separates route pruning from SQL cardinality.
-// Ordinary scans over no shards are empty, but a global aggregate can still
-// produce one row. Only the exact algebraic aggregate shape handled by
-// emptyAggregateResult may use that shortcut; every other aggregate shape
-// fails closed instead of letting an empty physical route erase SQL semantics.
+// Ordinary scans and grouped aggregates over no shards are empty, while an
+// ungrouped global aggregate still produces one identity row. Only an exact
+// algebraic program handled by emptyAggregateResult may use either shortcut;
+// every other aggregate shape fails closed instead of erasing SQL semantics.
 func emptyRouteSemanticBoundary(
 	stmt *sqlast.SelectStmt,
 	aggregateSupported bool,
+	groupedSupported bool,
 	multiReason string,
 ) string {
 	if stmt == nil || !selectHasAggregate(stmt) {
 		return ""
 	}
-	if aggregateSupported && !stmt.Distinct && len(stmt.GroupBy) == 0 && stmt.Having == nil &&
-		len(stmt.Windows) == 0 && stmt.Offset == nil && stmt.Limit == nil {
+	if aggregateSupported && stmt.Having == nil && len(stmt.Windows) == 0 &&
+		(groupedSupported || (!stmt.Distinct && stmt.Offset == nil && stmt.Limit == nil)) {
 		return ""
 	}
 	if multiReason != "" {
@@ -418,19 +569,24 @@ func samePlanPath(a, b *sqlast.PathExpr) bool {
 	return true
 }
 
-func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string, aggregateSupported bool) string {
+func multiShardSemanticBoundary(
+	stmt *sqlast.SelectStmt,
+	reason string,
+	aggregateSupported bool,
+	groupedAggregateSupported bool,
+) string {
 	switch {
-	case stmt.Distinct:
+	case stmt.Distinct && !groupedAggregateSupported:
 		return firstPlanReason(reason, "DISTINCT requires a bounded global deduplicator")
-	case len(stmt.GroupBy) != 0:
+	case len(stmt.GroupBy) != 0 && !groupedAggregateSupported:
 		return firstPlanReason(reason, "GROUP BY requires a partial-aggregate combiner")
 	case stmt.Having != nil:
 		return firstPlanReason(reason, "HAVING requires global aggregate evaluation")
 	case len(stmt.Windows) != 0:
 		return firstPlanReason(reason, "window functions require global partition planning")
-	case stmt.Offset != nil:
+	case stmt.Offset != nil && !groupedAggregateSupported:
 		return firstPlanReason(reason, "OFFSET requires distributed top-k rewriting")
-	case aggregateSupported && stmt.Limit != nil:
+	case aggregateSupported && !groupedAggregateSupported && stmt.Limit != nil:
 		return firstPlanReason(reason, "aggregate LIMIT requires coordinator-side rewriting")
 	}
 	if aggregateSupported {
@@ -458,40 +614,78 @@ func multiShardSemanticBoundary(stmt *sqlast.SelectStmt, reason string, aggregat
 func planDistributedAggregates(
 	stmt *sqlast.SelectStmt,
 	reason string,
-) ([]sqlast.AggKind, []string, string) {
+) ([]sqlast.AggKind, []int, []string, string) {
 	if stmt == nil || len(stmt.Columns) == 0 {
-		return nil, nil, reason
+		return nil, nil, nil, reason
+	}
+	grouped := len(stmt.GroupBy) != 0
+	groupKeys := make([]int, 0, len(stmt.GroupBy))
+	for key := range stmt.GroupBy {
+		projectedKey := false
+		for column := range stmt.Columns {
+			projected := &stmt.Columns[column]
+			if projected.Agg == sqlast.AggNone && projected.Scalar == nil && projected.Window == nil &&
+				samePlanPath(projected.Path, stmt.GroupBy[key]) {
+				projectedKey = true
+				break
+			}
+		}
+		if !projectedKey {
+			return nil, nil, nil, firstPlanReason(reason,
+				"every GROUP BY key must be projected for distributed finalization")
+		}
 	}
 	kinds := make([]sqlast.AggKind, len(stmt.Columns))
 	headers := make([]string, len(stmt.Columns))
+	hasAggregate := false
 	for i := range stmt.Columns {
 		column := &stmt.Columns[i]
-		if column.Scalar != nil {
+		if column.Scalar != nil || column.Window != nil {
 			if scalarHasAggregate(column.Scalar) {
-				return nil, nil, firstPlanReason(reason,
+				return nil, nil, nil, firstPlanReason(reason,
 					"scalar aggregates require an algebraic expression combiner")
 			}
-			return nil, nil, reason
+			return nil, nil, nil, reason
 		}
 		switch column.Agg {
 		case sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax:
 			kinds[i] = column.Agg
+			hasAggregate = true
 		case sqlast.AggAvg:
-			return nil, nil, firstPlanReason(reason,
+			return nil, nil, nil, firstPlanReason(reason,
 				"AVG requires shard-local SUM and COUNT state")
 		case sqlast.AggNone:
-			return nil, nil, reason
+			if !grouped || column.Path == nil {
+				return nil, nil, nil, reason
+			}
+			isKey := false
+			for _, key := range stmt.GroupBy {
+				if samePlanPath(column.Path, key) {
+					isKey = true
+					break
+				}
+			}
+			if !isKey {
+				return nil, nil, nil, reason
+			}
+			groupKeys = append(groupKeys, i)
 		default:
-			return nil, nil, firstPlanReason(reason, "aggregate has no distributed combiner")
+			return nil, nil, nil, firstPlanReason(reason, "aggregate has no distributed combiner")
 		}
-		headers[i] = distributedAggregateHeader(column)
+		headers[i] = distributedResultHeader(column)
 	}
-	return kinds, headers, reason
+	if !grouped && !hasAggregate {
+		return nil, nil, nil, reason
+	}
+	return kinds, groupKeys, headers, reason
 }
 
-func distributedAggregateHeader(column *sqlast.ResultColumn) string {
+func distributedResultHeader(column *sqlast.ResultColumn) string {
 	if column.Alias != "" {
 		return column.Alias
+	}
+	if column.Agg == sqlast.AggNone && column.Path != nil {
+		return string(column.Path.AppendSpec(nil))
 	}
 	if column.Agg == sqlast.AggCount && column.Path == nil {
 		return "count(*)"
@@ -815,35 +1009,66 @@ func firstPlanReason(current, candidate string) string {
 }
 
 func bindPlanLimit(limit *sqlast.Operand, args []any) (int, error) {
+	return bindPlanOperand(limit, args, "LIMIT")
+}
+
+func bindPlanOperand(limit *sqlast.Operand, args []any, name string) (int, error) {
 	if limit == nil {
 		return 0, nil
 	}
-	var spelling string
+	var spelling []byte
 	switch limit.Kind {
 	case sqlast.OperandNumber:
-		spelling = limit.Text
+		spelling = byteview.Bytes(limit.Text)
 	case sqlast.OperandParam:
 		if limit.Ordinal < 0 || limit.Ordinal >= len(args) {
-			return 0, fmt.Errorf("%w: LIMIT parameter %d is not bound", ErrPlanParameters, limit.Ordinal+1)
+			return 0, fmt.Errorf("%w: %s parameter %d is not bound", ErrPlanParameters, name, limit.Ordinal+1)
 		}
 		switch value := args[limit.Ordinal].(type) {
-		case json.Number:
-			spelling = string(value)
+		case vibejson.RawValue:
+			var ok bool
+			spelling, ok = value.NumberBytes()
+			if !ok {
+				return 0, fmt.Errorf("%w: %s requires an integer", ErrPlanParameters, name)
+			}
 		case int:
-			spelling = strconv.Itoa(value)
+			spelling = strconv.AppendInt(nil, int64(value), 10)
 		case int64:
-			spelling = strconv.FormatInt(value, 10)
+			spelling = strconv.AppendInt(nil, value, 10)
 		case uint64:
-			spelling = strconv.FormatUint(value, 10)
+			spelling = strconv.AppendUint(nil, value, 10)
+		case interface{ String() string }:
+			// Compatibility for direct encoding/json.Number binds. Distributed
+			// requests use the vibejson.RawValue path above.
+			spelling = byteview.Bytes(value.String())
 		default:
-			return 0, fmt.Errorf("%w: LIMIT requires an integer, got %T", ErrPlanParameters, value)
+			return 0, fmt.Errorf("%w: %s requires an integer, got %T", ErrPlanParameters, name, value)
 		}
 	default:
-		return 0, fmt.Errorf("%w: LIMIT is not numeric", ErrPlanParameters)
+		return 0, fmt.Errorf("%w: %s is not numeric", ErrPlanParameters, name)
 	}
-	value, err := strconv.ParseUint(spelling, 10, 31)
-	if err != nil {
-		return 0, fmt.Errorf("%w: invalid LIMIT %q", ErrPlanParameters, spelling)
+	value, ok := parseLimitUint31(spelling)
+	if !ok {
+		return 0, fmt.Errorf("%w: invalid %s %q", ErrPlanParameters, name, spelling)
 	}
-	return int(value), nil
+	return value, nil
+}
+
+// parseLimitUint31 accepts only the SQL runtime's unsigned base-10 LIMIT
+// spelling and avoids materializing a string for strconv.ParseUint.
+func parseLimitUint31(spelling []byte) (int, bool) {
+	if len(spelling) == 0 {
+		return 0, false
+	}
+	var value uint64
+	for _, c := range spelling {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		value = value*10 + uint64(c-'0')
+		if value > 1<<31-1 {
+			return 0, false
+		}
+	}
+	return int(value), true
 }

@@ -1,6 +1,7 @@
 package raftmember
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -21,6 +22,9 @@ type runtimeFixture struct {
 	database *sqldriver.Database
 	apply    *sqldriver.ReplicatedApply
 	base     sqldriver.ReplicatedShardStoreIdentity
+	applyID  sqldriver.ReplicatedApplyIdentity
+	sqlPath  string
+	options  raftstore.Options
 }
 
 func newRuntimeFixture(t testing.TB, seed byte, voters []uint64) runtimeFixture {
@@ -56,7 +60,7 @@ func newRuntimeFixtureWithOptions(
 	if err != nil {
 		t.Fatalf("create runtime WAL: %v", err)
 	}
-	_, database, _ := prepareSQLRoot(t, identity, "runtime")
+	sqlPath, database, _ := prepareSQLRoot(t, identity, "runtime")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
 	skipIfStrictAllocationUnsupported(t, "bind runtime SQL", err)
@@ -64,8 +68,8 @@ func newRuntimeFixtureWithOptions(
 		t.Fatalf("bind runtime SQL: %v", err)
 	}
 	applyOptions := testApplyOptions()
-	applyOptions.MaxCompletions = uint64(options.MaxEntries)
-	apply, _, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
+	applyOptions.MaxCompletions = uint64(options.MaxEntries) + 1024
+	apply, applyID, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
 	skipIfStrictAllocationUnsupported(t, "open runtime apply", err)
 	if err != nil {
 		t.Fatalf("open runtime apply: %v", err)
@@ -85,7 +89,10 @@ func newRuntimeFixtureWithOptions(
 		t.Fatalf("adopt runtime: %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	return runtimeFixture{runtime: runtime, wal: wal, database: database, apply: apply, base: base}
+	return runtimeFixture{
+		runtime: runtime, wal: wal, database: database, apply: apply, base: base,
+		applyID: applyID, sqlPath: sqlPath, options: options,
+	}
 }
 
 func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) error) {
@@ -201,6 +208,153 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	}
 }
 
+func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.T) {
+	fixture := newRuntimeFixture(t, 219, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	key, _ := orderedkey.AppendJSONString(nil, []byte(`"base"`), orderedkey.Ascending)
+	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"base","value":1}`))
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	before, err := fixture.runtime.Publication()
+	if err != nil || before.Applied <= 1 {
+		t.Fatalf("source publication = %+v, %v", before, err)
+	}
+	cut, err := fixture.apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact bytes.Buffer
+	manifest, err := replicatedstate.WriteSnapshotArtifact(
+		&artifact, cut, replicatedstate.SnapshotArtifactOptions{},
+	)
+	closeErr := cut.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("snapshot artifact = %v, close=%v", err, closeErr)
+	}
+	static, err := fixture.wal.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := replicatedstate.BuildSnapshotBase(manifest, static)
+	if err != nil || base.GetMetadata().GetIndex() != before.Applied {
+		t.Fatalf("BuildSnapshotBase = %v, %v", base, err)
+	}
+	identity := fixture.wal.Identity()
+	if err := fixture.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	newWAL, err := raftstore.Create(
+		filepath.Join(t.TempDir(), "replacement.wal"), identity, testWALKey(),
+		raftstore.Bootstrap{TopologyRecoveryEpoch: testTopologyRecoveryEpoch, Snapshot: base},
+		fixture.options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, reopenedApply, err := OpenBoundSQLWithApply(
+		fixture.sqlPath, newWAL, testAuthorityProfile(), fixture.base, fixture.applyID,
+	)
+	if err != nil {
+		_ = newWAL.Close()
+		t.Fatal(err)
+	}
+	restarted, err := AdoptRuntime(newWAL, reopenedDB, reopenedApply)
+	if err != nil {
+		if restarted != nil {
+			_ = restarted.Close()
+		}
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	after, err := restarted.Publication()
+	if err != nil || after.Applied != before.Applied ||
+		after.LogicalDigest != before.LogicalDigest ||
+		after.ReplicaSetVersion != before.ReplicaSetVersion ||
+		after.ConfState.Equivalent(before.ConfState) != nil {
+		t.Fatalf("restarted publication = %+v, %v; before %+v", after, err, before)
+	}
+	drainRuntime(t, restarted, nil)
+	if err := restarted.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, restarted, nil)
+	key, _ = orderedkey.AppendJSONString(nil, []byte(`"tail"`), orderedkey.Ascending)
+	tail := testApplyCommand(fixture.base, 2, key, []byte(`{"id":"tail","value":2}`))
+	if err := restarted.Propose(tail); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, restarted, nil)
+	final, err := restarted.Publication()
+	if err != nil || final.Applied <= after.Applied {
+		t.Fatalf("ordinary suffix publication = %+v, %v; base %+v", final, err, after)
+	}
+}
+
+func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
+	fixture := newRuntimeFixture(t, 221, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	peer := fixture.runtime.identity.MemberID + 1
+	change := &pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(peer),
+	}
+	if err := fixture.runtime.ProposeConfChange(change); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.ProposeConfChange(change); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("second configuration proposal before drain = %v", err)
+	}
+	change.NodeId = runtimeUint64Ptr(peer + 1)
+	drainRuntime(t, fixture.runtime, nil)
+	publication, err := fixture.runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication.ReplicaSetVersion != publication.Applied ||
+		len(publication.ConfState.GetLearners()) != 1 ||
+		publication.ConfState.GetLearners()[0] != peer {
+		t.Fatalf("configuration publication = %+v", publication)
+	}
+
+	context := []byte("linearizable-read")
+	if err := fixture.runtime.ReadIndex(context); err != nil {
+		t.Fatal(err)
+	}
+	context[0] = 'X'
+	var outcomes []raftmodel.ReadOutcome
+	for step := 0; step < 1000; step++ {
+		result, driveErr := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		if driveErr != nil {
+			t.Fatalf("DriveReady step %d: %v", step, driveErr)
+		}
+		outcomes = append(outcomes, result.ReadOutcomes...)
+		if !result.Progressed() {
+			break
+		}
+	}
+	if len(outcomes) != 1 || outcomes[0].Err != nil ||
+		string(outcomes[0].Barrier.Context) != "linearizable-read" ||
+		outcomes[0].Barrier.Index == 0 || outcomes[0].Barrier.Term == 0 ||
+		outcomes[0].Barrier.Incarnation != fixture.runtime.identity.NodeIncarnation {
+		t.Fatalf("read outcomes = %+v", outcomes)
+	}
+	publication, err = fixture.runtime.Publication()
+	if err != nil || publication.Applied < outcomes[0].Barrier.Index {
+		t.Fatalf("published cut %+v behind outcome %+v: %v", publication, outcomes[0], err)
+	}
+}
+
 func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 	identity := testWALIdentity(230)
 	peer := identity.MemberID + 1
@@ -291,6 +445,24 @@ func TestRuntimeTerminalWALCapacityFailureLatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.ReadIndex([]byte("full-wal-read")); err != nil {
+		t.Fatalf("ReadIndex at sealed WAL limit: %v", err)
+	}
+	var outcomes []raftmodel.ReadOutcome
+	for step := 0; step < 1000; step++ {
+		result, err := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		if err != nil {
+			t.Fatalf("ReadIndex DriveReady step %d: %v", step, err)
+		}
+		outcomes = append(outcomes, result.ReadOutcomes...)
+		if !result.Progressed() {
+			break
+		}
+	}
+	if len(outcomes) != 1 || outcomes[0].Err != nil ||
+		string(outcomes[0].Barrier.Context) != "full-wal-read" {
+		t.Fatalf("ReadIndex at sealed WAL outcomes = %+v", outcomes)
+	}
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"full"`), orderedkey.Ascending)
 	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"full"}`))
 	if err := fixture.runtime.Tick(); !errors.Is(err, raftstore.ErrFull) ||

@@ -46,12 +46,40 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if len(data) > replication.MaxCommandBytes {
 		return raftmodel.Publication{}, m.fail(ErrAdmissionBound)
 	}
+	kind := RecordNormal
+	if IsOwnershipTransition(data) {
+		kind = RecordOwnership
+	}
 	digest := normalEntryDigest(meta, data)
-	replay, err := m.checkTransition(meta, RecordNormal, digest)
+	replay, err := m.checkTransition(meta, kind, digest)
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	if replay {
+		if kind == RecordOwnership {
+			transition, openErr := OpenOwnershipTransition(data)
+			if openErr != nil || m.state.Binding.OwnershipEpoch != transition.ToOwnershipEpoch ||
+				m.state.Binding.RoutingVersion != transition.ToRoutingVersion ||
+				m.state.Binding.RouteGeneration != transition.ToRouteGeneration {
+				return raftmodel.Publication{}, m.fail(ErrOwnershipTransition)
+			}
+		}
+		return clonePublication(m.publication), nil
+	}
+	if kind == RecordOwnership {
+		transition, openErr := OpenOwnershipTransition(data)
+		if openErr != nil {
+			return raftmodel.Publication{}, m.fail(openErr)
+		}
+		binding, transitionErr := m.ownershipTransitionBinding(transition)
+		if transitionErr != nil {
+			return raftmodel.Publication{}, m.fail(transitionErr)
+		}
+		next := m.nextState(meta, RecordOwnership, digest)
+		next.Binding = binding
+		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
 		return clonePublication(m.publication), nil
 	}
 	if len(data) == 0 {
@@ -129,43 +157,95 @@ func (m *Machine) ApplyConfiguration(meta raftmodel.ApplyMeta, conf *pb.ConfStat
 	return clonePublication(m.publication), nil
 }
 
-// InstallSnapshot implements raftmodel.StateMachine. It accepts only the
-// deterministic exact static bootstrap fixed at Open.
+// InstallSnapshot implements raftmodel.StateMachine. The index-one bootstrap
+// initializes an empty store. A newer certificate may only bind an already
+// staged, fully validated candidate at the exact same publication; collection
+// rows are never carried or rewritten through Raft snapshot data.
 func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.checkUsable(); err != nil {
 		return raftmodel.Publication{}, err
 	}
-	encoded, digest, err := validateBootstrap(snapshot)
-	if err != nil || digest != m.bootstrapDigest || !bytes.Equal(encoded, m.bootstrap) {
-		return raftmodel.Publication{}, m.fail(ErrStaticSnapshotOnly)
-	}
-	if m.initialized {
-		if m.state.Applied == 1 && m.state.LastKind == RecordStaticSnapshot &&
-			m.state.LastTerm == 1 && m.state.LastEntryDigest == m.bootstrapDigest &&
-			proto.Equal(m.state.ConfState, snapshot.GetMetadata().GetConfState()) {
-			return clonePublication(m.publication), nil
+	encoded, digest, bootstrapErr := validateBootstrap(snapshot)
+	if bootstrapErr == nil && digest == m.bootstrapDigest && bytes.Equal(encoded, m.bootstrap) {
+		if m.initialized {
+			if m.state.Applied == 1 && m.state.LastKind == RecordStaticSnapshot &&
+				m.state.LastTerm == 1 && m.state.LastEntryDigest == m.bootstrapDigest &&
+				m.state.SnapshotBaseDigest == m.bootstrapDigest &&
+				proto.Equal(m.state.ConfState, snapshot.GetMetadata().GetConfState()) {
+				return clonePublication(m.publication), nil
+			}
+			return raftmodel.Publication{}, m.fail(ErrStaticSnapshotOnly)
 		}
-		return raftmodel.Publication{}, m.fail(ErrStaticSnapshotOnly)
+		next := State{
+			Binding: m.binding, Applied: 1, LastTerm: 1,
+			LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
+			LastEntryDigest: m.bootstrapDigest, LogicalDigest: m.state.LogicalDigest,
+			ConfState:         cloneConfState(snapshot.GetMetadata().GetConfState()),
+			ReplicaSetVersion: 1, BootstrapDigest: m.bootstrapDigest,
+			SnapshotBaseDigest: m.bootstrapDigest,
+		}
+		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		return clonePublication(m.publication), nil
 	}
-	next := State{
-		Binding: m.binding, Applied: 1, LastTerm: 1,
-		LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
-		LastEntryDigest: m.bootstrapDigest, LogicalDigest: m.state.LogicalDigest,
-		ConfState:         cloneConfState(snapshot.GetMetadata().GetConfState()),
-		ReplicaSetVersion: 1, BootstrapDigest: m.bootstrapDigest,
+
+	certificate, certificateErr := OpenSnapshotBase(snapshot)
+	if certificateErr != nil {
+		return raftmodel.Publication{}, m.fail(errors.Join(ErrStaticSnapshotOnly, certificateErr))
 	}
-	if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
-		return raftmodel.Publication{}, m.fail(err)
+	certBootstrap, certBootstrapDigest, err := validateBootstrap(certificate.StaticBootstrap)
+	if err != nil || certBootstrapDigest != m.bootstrapDigest ||
+		!bytes.Equal(certBootstrap, m.bootstrap) || !m.initialized ||
+		certificate.Manifest.State.Binding != m.binding ||
+		!bytes.Equal(certificate.Manifest.UserCollection, []byte(m.userName)) ||
+		certificate.Manifest.State.BootstrapDigest != m.bootstrapDigest ||
+		!equalStateExceptSnapshotBaseDigest(certificate.Manifest.State, m.state) {
+		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
-	return clonePublication(m.publication), nil
+	switch m.state.SnapshotBaseDigest {
+	case certificate.Digest:
+		return clonePublication(m.publication), nil
+	case certificate.Manifest.State.SnapshotBaseDigest:
+		next := cloneState(m.state)
+		next.SnapshotBaseDigest = certificate.Digest
+		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		return clonePublication(m.publication), nil
+	default:
+		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+	}
 }
 
 // AdmitCommand performs the complete non-reserving pre-proposal check.
 // Serving remains forbidden because a successful return does not reserve the
 // proved storage for the future committed entry.
 func (m *Machine) AdmitCommand(data []byte) error {
+	if IsOwnershipTransition(data) {
+		transition, err := OpenOwnershipTransition(data)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if err := m.checkUsable(); err != nil {
+			return err
+		}
+		if !m.initialized || m.state.Applied == math.MaxUint64-1 {
+			return ErrAdmissionBound
+		}
+		binding, err := m.ownershipTransitionBinding(transition)
+		if err != nil {
+			return err
+		}
+		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
+		next := m.nextState(meta, RecordOwnership, normalEntryDigest(meta, transition.Bytes()))
+		next.Binding = binding
+		return m.checkTransitionCapacity(next, nil, [33]byte{}, nil)
+	}
 	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return err
@@ -244,7 +324,8 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		LastKind: kind, LastEntryType: meta.Type, LastEntryDigest: digest,
 		LogicalDigest: m.state.LogicalDigest, ConfState: cloneConfState(m.state.ConfState),
 		ReplicaSetVersion: m.state.ReplicaSetVersion,
-		BootstrapDigest:   m.bootstrapDigest, CompletionCount: m.state.CompletionCount,
+		BootstrapDigest:   m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
+		CompletionCount: m.state.CompletionCount,
 	}
 }
 
@@ -547,6 +628,7 @@ func (m *Machine) persistTransition(
 		return err
 	}
 	m.state = next
+	m.binding = next.Binding
 	m.initialized = true
 	m.publication = publicationFromState(next)
 	return nil

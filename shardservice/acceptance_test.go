@@ -264,7 +264,7 @@ func TestAcceptanceMalformedFraming(t *testing.T) {
 		own := testOwner()
 		body := func() []byte {
 			var e encbuf
-			e.u8(wireVersion1)
+			e.u8(wireVersion)
 			e.str("SELECT id FROM docs")
 			e.str(string(own.Distribution))
 			e.str(string(own.Shard))
@@ -349,9 +349,9 @@ func TestAcceptanceResourceLimits(t *testing.T) {
 // typed parameters only — never a serialized plan or program — and the shard
 // re-parses the text locally.
 func TestAcceptanceNoSerializedPlan(t *testing.T) {
-	// (1) The request type carries only SQL text, typed params, ownership and
-	// optional session-position coordinates, and execution bounds — no
-	// plan-shaped field.
+	// (1) The request type carries SQL text, typed params, ownership, optional
+	// byte-native storage access envelopes, session-position coordinates, and
+	// execution bounds — no serialized plan-shaped field.
 	reqFields := structFieldNames(reflect.TypeOf(ShardRequest{}))
 	assertFieldSet(t, "ShardRequest", reqFields, map[string]bool{
 		"SQL": true, "Params": true, "Distribution": true, "Shard": true,
@@ -359,13 +359,18 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 		"HasMinPosition": true, "MinPosition": true, "ReadPolicy": true,
 		"ExecutionMode": true,
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
+		"BucketBits": true, "AccessScopes": true, "ReadFenceID": true,
+		"GlobalIndexLookup": true, "PrimaryKeyRead": true,
+		"MutationCapture": true, "DocumentScan": true, "Repartition": true, "PartialAggregate": true,
+		"RowBatch": true, "Exchange": true,
+		"Transaction": true,
 	})
 	assertNoPlanField(t, "ShardRequest", reqFields)
 
 	// (2) A parameter is a typed scalar/document value, never an encoded plan.
 	paramFields := structFieldNames(reflect.TypeOf(Param{}))
 	assertFieldSet(t, "Param", paramFields, map[string]bool{
-		"Kind": true, "Bool": true, "Text": true,
+		"Kind": true, "Bool": true, "Bytes": true,
 	})
 	assertNoPlanField(t, "Param", paramFields)
 

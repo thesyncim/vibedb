@@ -8,6 +8,93 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 )
 
+// BuildManifestTransition constructs an unpublished catalog generation by
+// replacing exactly one distribution manifest while preserving the current
+// placements, endpoint directory, indexes, and statistics. Publication still
+// requires PublishAfter or SaveSnapshotAfter: constructing this value grants
+// no topology authority.
+//
+// This is deliberately a cold control-plane operation. The returned snapshot
+// is independently owned and fully revalidated; routed requests continue to
+// use the compact immutable metadata already published in current.
+func BuildManifestTransition(
+	current *Snapshot,
+	nextManifest *distribution.Manifest,
+	nextGeneration uint64,
+) (*Snapshot, error) {
+	if current == nil || nextManifest == nil {
+		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
+	}
+	if nextGeneration <= current.generation {
+		return nil, fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, nextGeneration, current.generation,
+		)
+	}
+	config := cloneConfig(current.config)
+	found := false
+	for i := range config.Manifests {
+		if config.Manifests[i].Distribution() != nextManifest.Distribution() {
+			continue
+		}
+		config.Manifests[i] = nextManifest
+		found = true
+		break
+	}
+	if !found {
+		return nil, &CatalogError{Reason: fmt.Sprintf(
+			"manifest transition references unknown distribution %q",
+			nextManifest.Distribution(),
+		)}
+	}
+	indexes := current.indexDescriptors()
+	statistics := current.statistics.Descriptors()
+	next, err := NewSnapshotWithPlannerMetadata(
+		config, current.endpoints, nextGeneration, indexes, statistics,
+	)
+	if err != nil {
+		return nil, err
+	}
+	currentState, err := initialCatalogState(current)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := advanceCatalogState(currentState, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func (s *Snapshot) indexDescriptors() []IndexDescriptor {
+	if s == nil || len(s.plannerIndexes) == 0 {
+		return nil
+	}
+	descriptors := make([]IndexDescriptor, 0, len(s.plannerIndexes))
+	for tableOrdinal := range s.plannerIndexSpans {
+		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
+		span := s.plannerIndexSpans[tableOrdinal]
+		for i := uint32(0); i < span.count; i++ {
+			ordinal := span.first + i
+			metadata := s.indexMetadata(table, ordinal)
+			descriptor := IndexDescriptor{
+				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
+				Table: metadata.Table, Name: metadata.Name, Relation: metadata.Relation,
+				Paths:        make([]string, metadata.PathCount),
+				LocatorPaths: make([]string, metadata.LocatorCount),
+				Flags:        metadata.Flags, Lifecycle: metadata.Lifecycle,
+			}
+			copy(descriptor.Paths, metadata.Paths[:metadata.PathCount])
+			copy(descriptor.LocatorPaths, metadata.LocatorPaths[:metadata.LocatorCount])
+			if metadata.Global() {
+				program, _ := s.globalIndexPointerProgram(ordinal)
+				descriptor.PrimaryPath = metadata.LocatorPaths[program.primary]
+			}
+			descriptors = append(descriptors, descriptor)
+		}
+	}
+	return descriptors
+}
+
 // These compact active-record directories turn cross-generation validation
 // into merge walks. They are planner metadata, not lifetime tombstones: the
 // high-waters remain constant-size under churn. Each index reference is one
@@ -84,19 +171,10 @@ func (s *Snapshot) indexMetadataForLineage(ref plannerIndexLineageRef) IndexMeta
 func (s *Snapshot) indexMetadataForOrdinal(ordinal uint32) IndexMetadata {
 	entry := s.plannerIndexes[ordinal]
 	table := s.config.Placements[entry.placement].Table
-	pathCount := entry.pathCount()
-	metadata := IndexMetadata{
-		IndexID: entry.indexID, Incarnation: entry.incarnation,
-		Table: table, Name: s.indexName(entry.name), PathCount: pathCount,
-		Flags: entry.flags(), Lifecycle: entry.lifecycle(),
-	}
-	for i := uint8(0); i < pathCount; i++ {
-		metadata.Paths[i] = s.indexString(s.plannerIndexPaths[entry.pathBase+uint32(i)])
-	}
-	return metadata
+	return s.indexMetadata(table, ordinal)
 }
 
-const plannerIndexDefinitionMask = plannerIndexFlagsMask | plannerIndexPathCountMask
+const plannerIndexDefinitionMask = plannerIndexFlagsMask | plannerIndexPathCountMask | plannerIndexLocatorCountMask
 
 func samePlannerIndexLogicalIdentity(
 	aSnapshot *Snapshot,
@@ -110,20 +188,29 @@ func samePlannerIndexLogicalIdentity(
 }
 
 func samePlannerIndexDefinition(
-	aSnapshot *Snapshot,
+	aSnapshot *Snapshot, aOrdinal uint32,
 	a plannerIndex,
-	bSnapshot *Snapshot,
+	bSnapshot *Snapshot, bOrdinal uint32,
 	b plannerIndex,
 ) bool {
 	if a.properties()&plannerIndexDefinitionMask !=
 		b.properties()&plannerIndexDefinitionMask ||
-		!samePlannerIndexLogicalIdentity(aSnapshot, a, bSnapshot, b) {
+		!samePlannerIndexLogicalIdentity(aSnapshot, a, bSnapshot, b) ||
+		aSnapshot.indexRelation(aSnapshot.config.Placements[a.placement].Table, aOrdinal, a) !=
+			bSnapshot.indexRelation(bSnapshot.config.Placements[b.placement].Table, bOrdinal, b) {
 		return false
 	}
-	pathCount := a.pathCount()
+	pathCount := a.pathCount() + a.locatorCount()
 	for i := uint8(0); i < pathCount; i++ {
 		if aSnapshot.indexString(aSnapshot.plannerIndexPaths[a.pathBase+uint32(i)]) !=
 			bSnapshot.indexString(bSnapshot.plannerIndexPaths[b.pathBase+uint32(i)]) {
+			return false
+		}
+	}
+	if a.flags()&IndexGlobal != 0 {
+		aProgram, aOK := aSnapshot.globalIndexPointerProgram(aOrdinal)
+		bProgram, bOK := bSnapshot.globalIndexPointerProgram(bOrdinal)
+		if !aOK || !bOK || aProgram.primary != bProgram.primary {
 			return false
 		}
 	}
@@ -205,21 +292,25 @@ func snapshotWithCatalogLineage(
 	shardHighWaters []distribution.ShardAllocationGeneration,
 ) *Snapshot {
 	out := &Snapshot{
-		config:                    snapshot.config,
-		endpoints:                 snapshot.endpoints,
-		generation:                snapshot.generation,
-		planner:                   snapshot.planner,
-		plannerIndexes:            snapshot.plannerIndexes,
-		plannerIndexPaths:         snapshot.plannerIndexPaths,
-		plannerIndexSpans:         snapshot.plannerIndexSpans,
-		plannerIndexStrings:       snapshot.plannerIndexStrings,
-		statistics:                snapshot.statistics,
-		indexLineage:              snapshot.indexLineage,
-		shardLineage:              snapshot.shardLineage,
-		indexIDHighWater:          indexHighWater,
-		shardGenerationHighWaters: slices.Clone(shardHighWaters),
-		catalogLineagePresent:     true,
-		planSeed:                  snapshot.planSeed,
+		config:                         snapshot.config,
+		endpoints:                      snapshot.endpoints,
+		generation:                     snapshot.generation,
+		planner:                        snapshot.planner,
+		plannerIndexes:                 snapshot.plannerIndexes,
+		plannerIndexPaths:              snapshot.plannerIndexPaths,
+		plannerIndexRelations:          snapshot.plannerIndexRelations,
+		plannerGlobalIndexPrograms:     snapshot.plannerGlobalIndexPrograms,
+		plannerGlobalIndexPointers:     snapshot.plannerGlobalIndexPointers,
+		plannerGlobalPointerExtraBytes: snapshot.plannerGlobalPointerExtraBytes,
+		plannerIndexSpans:              snapshot.plannerIndexSpans,
+		plannerIndexStrings:            snapshot.plannerIndexStrings,
+		statistics:                     snapshot.statistics,
+		indexLineage:                   snapshot.indexLineage,
+		shardLineage:                   snapshot.shardLineage,
+		indexIDHighWater:               indexHighWater,
+		shardGenerationHighWaters:      slices.Clone(shardHighWaters),
+		catalogLineagePresent:          true,
+		planSeed:                       snapshot.planSeed,
 	}
 	out.planCache.Store(snapshot.planCache.Load())
 	return out
@@ -295,7 +386,10 @@ func advanceIndexIDHighWater(current, next *Snapshot) (uint64, error) {
 		}
 		switch {
 		case active && nextEntry.incarnation == oldEntry.incarnation:
-			if !samePlannerIndexDefinition(current, oldEntry, next, nextEntry) ||
+			if !samePlannerIndexDefinition(
+				current, uint32(current.indexLineage[currentOrdinal]), oldEntry,
+				next, uint32(nextRef), nextEntry,
+			) ||
 				nextEntry.lifecycle() < oldEntry.lifecycle() {
 				return 0, &CatalogError{Reason: fmt.Sprintf(
 					"index %d changed definition or regressed lifecycle within one incarnation",
@@ -430,7 +524,9 @@ func validateRoutingTransition(current, next *Snapshot) error {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"distribution %q was removed without an incarnation protocol", old.Name)}
 		}
-		if candidate != old {
+		if candidate.Name != old.Name || candidate.Arity != old.Arity ||
+			candidate.MapperVersion != old.MapperVersion ||
+			candidate.EffectiveBucketBits() != old.EffectiveBucketBits() {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"distribution %q changed immutable mapper identity", old.Name)}
 		}
@@ -455,7 +551,10 @@ func validateRoutingTransition(current, next *Snapshot) error {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"placement for table %q was removed without an incarnation protocol", old.Table)}
 		}
-		if candidate.Distribution != old.Distribution || !slices.Equal(candidate.Columns, old.Columns) {
+		if candidate.Distribution != old.Distribution ||
+			candidate.TenantPath != old.TenantPath ||
+			candidate.AffinityGroup != old.AffinityGroup ||
+			!slices.Equal(candidate.Columns, old.Columns) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"placement for table %q changed immutable routing identity", old.Table)}
 		}

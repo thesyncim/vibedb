@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -51,8 +52,10 @@ var ErrStaleGeneration = errors.New("gateway: pinned catalog generation is stale
 
 // RefreshFunc obtains a catalog generation strictly newer than staleGen after a
 // shard reports the pinned generation is stale. It must return a snapshot whose
-// generation exceeds staleGen, or an error. A nil RefreshFunc re-reads the
-// executor's catalog holder.
+// generation exceeds staleGen, or an error. The executor validates and
+// publishes the result before leasing it, so refresh cannot bypass catalog
+// lineage or generation-drain fences. A nil RefreshFunc re-reads the executor's
+// catalog holder.
 type RefreshFunc func(ctx context.Context, staleGen uint64) (*Snapshot, error)
 
 // Options configure an [Executor]. The zero value is usable: the default
@@ -177,23 +180,70 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	var leases catalogLeaseSet
+	defer leases.release()
 
 	var staleGen uint64
 	for attempt := 0; ; attempt++ {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
-		snap, err := e.pin(opctx, attempt, staleGen)
+		snap, lease, err := e.pin(opctx, attempt, staleGen)
 		if err != nil {
 			return nil, err
 		}
+		leases.add(lease)
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
 			return nil, err
 		}
+		if prepared.statement.Kind != sqlast.KindSelect {
+			// Query is the read path: it fans out and merges, so it must never
+			// partially commit a mutation. Writes dispatch through Exec instead.
+			return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
+		}
 		bound, err := prepared.Bind(args)
 		if err != nil {
 			return nil, err
+		}
+		if useGlobalIndexRead(bound) {
+			execution, indexErr := e.queryGlobalIndex(opctx, &q, bound, profile)
+			if indexErr == nil {
+				kind := execution.routeKind
+				if execution.shardsFanned > 1 && kind != distribution.RouteScatter {
+					kind = distribution.RouteTargeted
+				}
+				route := distribution.Route{
+					Kind: kind, Distribution: bound.distribution,
+					RoutingVersion: bound.manifest.Version(), Targets: execution.baseTargets,
+				}
+				physical, planning, planErr := optimizeGlobalIndexPlan(
+					opctx, snap, bound, route, profile, execution.candidateRows,
+				)
+				if planErr != nil {
+					return nil, planErr
+				}
+				scatter := ScatterNone
+				if kind == distribution.RouteScatter {
+					scatter = ScatterAllShards
+				}
+				e.metrics.observeRoute(kind, execution.shardsFanned, scatter)
+				res := execution.result
+				res.RouteKind = kind
+				res.Generation = snap.Generation()
+				res.ShardsFanned = execution.shardsFanned
+				res.Retries = attempt
+				res.ScatterReason = scatter
+				res.PlanFingerprint = physical.Fingerprint()
+				res.Planning = planning
+				return res, nil
+			}
+			if isStaleErr(indexErr) && attempt < e.maxRetry {
+				staleGen = snap.Generation()
+				e.metrics.observeRetry()
+				continue
+			}
+			return nil, indexErr
 		}
 		pl, err := e.routeContext(opctx, snap, &q, bound, profile)
 		if err != nil {
@@ -221,6 +271,298 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 	}
 }
 
+// Exec is one bounded distributed write: a mutating statement that the pinned
+// generation proves resident on exactly one shard. It reuses the read path's
+// pin-prepare-bind-route-dispatch machinery, except the single dispatch target
+// carries ExecutionReadWrite instead of the read-only fence, and a scatter, a
+// cross-shard INSERT batch, or a replacement that moves a row's shard key is
+// refused before any network I/O so a write never partially commits. An empty
+// route is a successful local no-op: no shard is contacted. Atomic
+// multi-statement and cross-shard writes dispatch through ExecBatch.
+func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	profile := e.profileFor(q.Class)
+	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	defer cancel()
+	args, err := queryRuntimeArgs(q.Params)
+	if err != nil {
+		return nil, err
+	}
+	var leases catalogLeaseSet
+	defer leases.release()
+
+	var staleGen uint64
+	for attempt := 0; ; attempt++ {
+		if err := opctx.Err(); err != nil {
+			return nil, err
+		}
+		snap, lease, err := e.pin(opctx, attempt, staleGen)
+		if err != nil {
+			return nil, err
+		}
+		leases.add(lease)
+		prepared, err := snap.Prepare(opctx, q.SQL)
+		if err != nil {
+			return nil, err
+		}
+		if prepared.statement.Kind == sqlast.KindSelect {
+			// Exec is the write path: a SELECT has no affected rows to report and
+			// must not be routed as a mutation.
+			return nil, ErrExecRequiresMutation
+		}
+		bound, err := prepared.BindWrite(args)
+		if err != nil {
+			return nil, err
+		}
+		call, kind, scatter, err := e.routeWrite(snap, &q, bound, profile)
+		if err != nil {
+			return nil, err
+		}
+		if call != nil && len(prepared.writeGlobalIndexes) != 0 &&
+			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
+			err = e.captureIndexedMutation(opctx, prepared, bound, *call, profile)
+			if err != nil {
+				if isStaleErr(err) && attempt < e.maxRetry {
+					staleGen = snap.Generation()
+					e.metrics.observeRetry()
+					continue
+				}
+				return nil, err
+			}
+		}
+
+		var res *Result
+		if call != nil && bound.requiresIndexTransaction() {
+			participants, participantErr := appendBoundWriteParticipants(
+				nil, *call, &q, bound, profile,
+			)
+			if participantErr != nil {
+				return nil, participantErr
+			}
+			sortTransactionParticipants(participants)
+			res, err = e.executeTransaction(opctx, snap, participants, profile)
+		} else if call != nil {
+			e.metrics.observeRoute(kind, 1, scatter)
+			res, err = e.single(opctx, *call, profile)
+		} else {
+			e.metrics.observeRoute(kind, 0, scatter)
+			res = &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 0}
+		}
+		if err == nil {
+			if !bound.requiresIndexTransaction() {
+				res.RouteKind = kind
+			}
+			res.Generation = snap.Generation()
+			if call != nil && !bound.requiresIndexTransaction() {
+				res.ShardsFanned = 1
+			}
+			res.Retries = attempt
+			res.ScatterReason = scatter
+			return res, nil
+		}
+		if isStaleErr(err) && attempt < e.maxRetry {
+			staleGen = snap.Generation()
+			e.metrics.observeRetry()
+			continue
+		}
+		return nil, err
+	}
+}
+
+// routeWrite resolves one bound write plan against the pinned generation and
+// returns its single dispatch target. An INSERT maps every VALUES row to its
+// point target and is admitted only when all rows share one target; an UPDATE
+// or DELETE routes its predicate targeted-only and is admitted only on a single
+// or empty route, and a whole-document UPDATE is refused when its replacement
+// would move the row to another shard. A nil call with a nil error is an empty
+// route: a successful no-op that contacts no shard. Every refusal here happens
+// before any network I/O.
+func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p Profile) (*shardCall, distribution.RouteKind, ScatterReason, error) {
+	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
+		return nil, 0, ScatterNone, &CatalogError{Reason: "distributed write plan does not belong to the pinned catalog generation"}
+	}
+	mapper := distribution.NewNativeMapperWithBucketBits(bound.spec.Arity, bound.spec.EffectiveBucketBits())
+	var (
+		targets []distribution.Target
+		route   distribution.Route
+		err     error
+	)
+	if bound.kind == sqlast.KindInsert {
+		targets, err = e.insertTargets(bound, mapper)
+	} else {
+		r, ok := e.targetedWriteRoute(bound, mapper)
+		if !ok {
+			return nil, 0, ScatterNone, &PlanError{
+				Table: bound.table, Reason: "write predicate does not resolve to a single shard",
+				cause: ErrWriteScatter,
+			}
+		}
+		route = r
+		targets = route.Targets
+	}
+	if err != nil {
+		return nil, 0, ScatterNone, err
+	}
+
+	var kind distribution.RouteKind
+	switch len(targets) {
+	case 0:
+		// An empty route is a successful local no-op: the statement matches no
+		// rows on any shard, so nothing is dispatched and the affected count is
+		// zero. A write never partially commits by contacting nothing.
+		kind = distribution.RouteEmpty
+		return nil, kind, ScatterNone, nil
+	case 1:
+		kind = distribution.RouteSingle
+	default:
+		// More than one target is a cross-shard write. An INSERT with rows that
+		// route to different shards is the expected case; any other shape
+		// reaching this point is a planner bug, so fail closed to the same
+		// refusal rather than dispatching a partial batch.
+		return nil, 0, ScatterNone, &PlanError{
+			Table: bound.table, Reason: "write routes to more than one shard",
+			cause: ErrWriteCrossShard,
+		}
+	}
+
+	if bound.kind == sqlast.KindUpdate && len(bound.updateDoc) > 0 {
+		if err := e.writeDocShardKeyMatchesTarget(bound, mapper, targets[0]); err != nil {
+			return nil, kind, ScatterNone, err
+		}
+	}
+
+	addr, err := snap.Address(targets[0].Endpoint)
+	if err != nil {
+		return nil, kind, ScatterNone, err
+	}
+	bucketBits, accessScopes := writeAccessScopes(bound, targets[0])
+	call := &shardCall{
+		target:  targets[0],
+		address: addr,
+		req: &shardservice.ShardRequest{
+			SQL:                  q.SQL,
+			Params:               q.Params,
+			Distribution:         bound.distribution,
+			Shard:                targets[0].Shard,
+			AllocationGeneration: targets[0].AllocationGeneration,
+			RoutingVersion:       bound.manifest.Version(),
+			OwnershipEpoch:       targets[0].OwnershipEpoch,
+			ReadPolicy:           p.ReadPolicy,
+			ExecutionMode:        shardservice.ExecutionReadWrite,
+			Deadline:             p.PerShardDeadline,
+			MaxRows:              p.PerShardRows,
+			MaxResultBytes:       p.PerShardBytes,
+			BucketBits:           bucketBits,
+			AccessScopes:         accessScopes,
+		},
+	}
+	return call, kind, ScatterNone, nil
+}
+
+// insertTargets maps every VALUES row of a bound INSERT to its point target and
+// returns the single target when all rows agree, else ErrWriteCrossShard. The
+// mapper is a per-call scratch: it is not shared across goroutines, so it is
+// built fresh here rather than borrowed from the executor's router pool.
+func (e *Executor) insertTargets(bound *BoundWritePlan, mapper *distribution.NativeMapper) ([]distribution.Target, error) {
+	if len(bound.rowKeys) == 0 {
+		return nil, nil
+	}
+	target := distribution.Target{}
+	set := false
+	for i, key := range bound.rowKeys {
+		point, err := mapper.PointFor(key)
+		if err != nil {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + ": " + err.Error(),
+				cause: ErrWriteCrossShard,
+			}
+		}
+		t, ok := bound.manifest.ResolvePointTarget(point)
+		if !ok {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + " maps outside the active manifest",
+				cause: ErrWriteCrossShard,
+			}
+		}
+		if !set {
+			target = t
+			set = true
+			continue
+		}
+		if t.Shard != target.Shard || t.AllocationGeneration != target.AllocationGeneration ||
+			t.Endpoint != target.Endpoint || t.OwnershipEpoch != target.OwnershipEpoch ||
+			t.Role != target.Role {
+			return nil, &PlanError{
+				Table: bound.table, Reason: "insert row " + strconv.Itoa(i) + " routes to a different shard than row 0",
+				cause: ErrWriteCrossShard,
+			}
+		}
+	}
+	return []distribution.Target{target}, nil
+}
+
+// targetedWriteRoute routes an UPDATE or DELETE predicate targeted-only against
+// the pinned manifest and reports whether it resolved to a single or empty
+// route. A scatter, unknown, or multi-shard route reports ok=false so the caller
+// refuses it before any dispatch.
+func (e *Executor) targetedWriteRoute(bound *BoundWritePlan, mapper *distribution.NativeMapper) (distribution.Route, bool) {
+	r := e.routers.get()
+	route, err := r.Route(bound.constraints, mapper, bound.manifest,
+		distribution.NewRoutePolicy(distribution.AdmissionTargetedOnly, distribution.RouteLimits{}))
+	e.routers.put(r)
+	if err != nil {
+		return distribution.Route{}, false
+	}
+	switch route.Kind {
+	case distribution.RouteSingle, distribution.RouteEmpty:
+		return route, true
+	default:
+		return distribution.Route{}, false
+	}
+}
+
+// writeDocShardKeyMatchesTarget proves a whole-document UPDATE's replacement
+// routes to the same target the predicate selected, so the replacement cannot
+// move a row to another shard. It re-reads the replacement's shard key with the
+// plan's compiled pointers and resolves it to its point target.
+func (e *Executor) writeDocShardKeyMatchesTarget(bound *BoundWritePlan, mapper *distribution.NativeMapper, target distribution.Target) error {
+	key, err := writeDocShardKey(bound.updateDoc, bound.keyPointers)
+	if err != nil {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document: " + err.Error(),
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	point, err := mapper.PointFor(key)
+	if err != nil {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document: " + err.Error(),
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	routed, ok := bound.manifest.ResolvePointTarget(point)
+	if !ok {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document maps outside the active manifest",
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	if routed.Shard != target.Shard || routed.AllocationGeneration != target.AllocationGeneration ||
+		routed.Endpoint != target.Endpoint || routed.OwnershipEpoch != target.OwnershipEpoch ||
+		routed.Role != target.Role {
+		return &PlanError{
+			Table: bound.table, Reason: "update replacement document routes to a different shard",
+			cause: ErrWriteShardKeyMove,
+		}
+	}
+	return nil
+}
+
 // Explain plans q against the currently pinned generation without opening a
 // shard connection. It applies the same parameter binding, route admission,
 // statistics, rules, objective, and memory limits as Query.
@@ -235,19 +577,76 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap, err := e.pin(ctx, 0, 0)
+	snap, lease, err := e.pin(ctx, 0, 0)
 	if err != nil {
 		return nil, err
 	}
+	defer lease.release()
 	prepared, err := snap.Prepare(ctx, q.SQL)
 	if err != nil {
 		return nil, err
+	}
+	if prepared.statement.Kind != sqlast.KindSelect {
+		// Explain is a read-path diagnostic: it plans a distributed SELECT and
+		// never dispatches a mutation, so it refuses non-SELECT statements.
+		return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
 	}
 	bound, err := prepared.Bind(args)
 	if err != nil {
 		return nil, err
 	}
-	physical, err := e.routeContext(ctx, snap, &q, bound, e.profileFor(q.Class))
+	profile := e.profileFor(q.Class)
+	if useGlobalIndexRead(bound) {
+		if bound.alwaysReason != "" || (bound.globalEmpty && bound.emptyReason != "") {
+			reason := bound.alwaysReason
+			if reason == "" {
+				reason = bound.emptyReason
+			}
+			return nil, &PlanError{
+				Table: bound.table, Reason: reason,
+				cause: ErrDistributedPlanUnsupported,
+			}
+		}
+		route, shards, indexKeys, routeErr := globalIndexExplainRoute(bound, profile)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		baseKind, admissionErr := admitGlobalIndexTargets(
+			len(route.Targets), bound.manifest.ShardCount(), profile,
+		)
+		if admissionErr != nil {
+			return nil, admissionErr
+		}
+		route.Kind = baseKind
+		candidateRows := -1
+		if bound.globalEmpty {
+			candidateRows = 0
+		} else if bound.globalIndex != nil &&
+			bound.globalIndex.program.metadata.Flags&IndexUnique != 0 {
+			candidateRows = indexKeys
+		}
+		physical, planning, planErr := optimizeGlobalIndexPlan(
+			ctx, snap, bound, route, profile, candidateRows,
+		)
+		if planErr != nil {
+			return nil, planErr
+		}
+		kind := baseKind
+		if shards > 1 && baseKind != distribution.RouteScatter {
+			kind = distribution.RouteTargeted
+		}
+		scatter := ScatterNone
+		if kind == distribution.RouteScatter {
+			scatter = ScatterAllShards
+		}
+		return &Explanation{
+			PhysicalPlan: physical.String(), PlanFingerprint: physical.Fingerprint(),
+			Cost: physical.Cost, Planning: planning,
+			RouteKind: kind, Generation: snap.Generation(),
+			Shards: shards, ScatterReason: scatter,
+		}, nil
+	}
+	physical, err := e.routeContext(ctx, snap, &q, bound, profile)
 	if err != nil {
 		return nil, err
 	}
@@ -286,29 +685,37 @@ func (e *Executor) profileFor(class OperationClass) Profile {
 // pin returns the generation the attempt routes against: the current generation
 // on the first attempt, or a strictly newer generation obtained by refresh on a
 // retry. A refresh that cannot produce a newer generation fails closed.
-func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snapshot, error) {
-	if attempt == 0 {
-		snap := e.catalog.Current()
-		if snap == nil {
-			return nil, ErrNoCatalog
-		}
-		return snap, nil
+func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snapshot, catalogLease, error) {
+	if e == nil || e.catalog == nil {
+		return nil, catalogLease{}, ErrNoCatalog
 	}
 	if e.refresh != nil {
-		snap, err := e.refresh(ctx, staleGen)
-		if err != nil {
-			return nil, err
+		if attempt > 0 {
+			snap, err := e.refresh(ctx, staleGen)
+			if err != nil {
+				return nil, catalogLease{}, err
+			}
+			if snap == nil || snap.Generation() <= staleGen {
+				return nil, catalogLease{}, ErrStaleGeneration
+			}
+			current := e.catalog.Current()
+			if current == nil || current.Generation() < snap.Generation() {
+				if err := e.catalog.publishNewerChecked(snap); err != nil &&
+					!errors.Is(err, ErrCatalogGenerationNotNewer) {
+					return nil, catalogLease{}, err
+				}
+			}
 		}
-		if snap == nil || snap.Generation() <= staleGen {
-			return nil, ErrStaleGeneration
-		}
-		return snap, nil
 	}
-	snap := e.catalog.Current()
-	if snap == nil || snap.Generation() <= staleGen {
-		return nil, ErrStaleGeneration
+	lease := e.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		return nil, catalogLease{}, ErrNoCatalog
 	}
-	return snap, nil
+	if attempt > 0 && lease.generation <= staleGen {
+		lease.release()
+		return nil, catalogLease{}, ErrStaleGeneration
+	}
+	return lease.snapshot, lease, nil
 }
 
 // isStaleErr reports whether err is a shard's refusal of the pinned generation:
@@ -335,7 +742,7 @@ func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, 
 	case 1:
 		return e.single(ctx, pl.calls[0], p)
 	default:
-		return e.fanout(ctx, pl, p)
+		return e.snapshotFanout(ctx, pl, p)
 	}
 }
 
@@ -357,11 +764,52 @@ func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Resu
 	return &Result{Kind: resp.Kind, Columns: resp.Columns, Rows: resp.Rows, RowsAffected: resp.RowsAffected}, nil
 }
 
+func (e *Executor) captureIndexedMutation(
+	ctx context.Context,
+	prepared *PreparedPlan,
+	bound *BoundWritePlan,
+	baseCall shardCall,
+	p Profile,
+) error {
+	req := *baseCall.req
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MutationCapture = true
+	captureCtx, cancel := context.WithTimeout(ctx, p.PerShardDeadline)
+	defer cancel()
+	resp, err := e.client.Do(captureCtx, baseCall.address, &req)
+	if err != nil {
+		return err
+	}
+	if resp.Kind != shardservice.ResponseRows || len(resp.Columns) != 2 {
+		return &PlanError{
+			Table: bound.table, Reason: "base shard returned an invalid mutation capture response",
+			cause: ErrGlobalIndexMaintenanceUnsupported,
+		}
+	}
+	rows := uint64(len(resp.Rows))
+	resultBytes := responseBytes(resp)
+	if err := checkAggregate(p, rows, resultBytes); err != nil {
+		return err
+	}
+	for i := range resp.Rows {
+		if len(resp.Rows[i]) != 2 {
+			return &PlanError{
+				Table: bound.table, Reason: "base shard returned a malformed mutation capture row",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+	}
+	return prepared.bindGlobalIndexCapture(bound, baseCall.target, resp.Rows)
+}
+
 // fanout dispatches every shard call concurrently through a bounded worker pool,
 // enforces the aggregate caps, cancels outstanding shards on a hard failure or
 // once a cap is hit, and merges the results. The partial-result policy is
 // fail-closed: any shard failure fails the whole operation.
 func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, error) {
+	if len(pl.aggregates) != 0 && len(pl.groupKeys) != 0 {
+		return e.fanoutGroupedBatches(ctx, pl, p)
+	}
 	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
@@ -437,9 +885,20 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	var rows [][]shardservice.Cell
 	var err error
 	if len(pl.aggregates) != 0 {
-		columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
+		if len(pl.groupKeys) != 0 {
+			columns, rows, err = mergeGroupedAggregateRows(
+				results, pl.aggregates, pl.groupKeys, p.MaxAggregateBytes,
+			)
+			if err == nil {
+				rows, err = finalizeGroupedRowsWindow(
+					rows, pl.order, pl.offset, pl.limit, pl.hasLimit, p.MaxAggregateBytes,
+				)
+			}
+		} else {
+			columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
+		}
 	} else {
-		columns, rows, err = mergeRows(results, pl.order, pl.limit)
+		columns, rows, err = mergeRowsWindow(results, pl.order, 0, pl.limit, pl.hasLimit)
 	}
 	if err != nil {
 		return nil, err
@@ -448,12 +907,207 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: rows}, nil
 }
 
+const (
+	distributedBatchRows  uint32 = 4 << 10
+	distributedBatchBytes uint32 = 256 << 10
+)
+
+type groupedShardStream struct {
+	batches chan *shardservice.ShardResponse
+	done    chan error
+}
+
+// fanoutGroupedBatches incrementally combines grouped shard fragments in
+// canonical route order. One unbuffered channel per active request lets a shard
+// hold at most its current decoded frame while the coordinator is busy; the
+// synchronous client callback propagates that pressure to the shard cursor.
+func (e *Executor) fanoutGroupedBatches(
+	ctx context.Context,
+	pl *plan,
+	p Profile,
+) (*Result, error) {
+	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
+	defer cancel()
+
+	merger, err := newGroupedAggregateMerger(pl.aggregates, pl.groupKeys, p.MaxAggregateBytes)
+	if err != nil {
+		return nil, err
+	}
+	streams := make([]groupedShardStream, len(pl.calls))
+	for i := range streams {
+		streams[i] = groupedShardStream{
+			batches: make(chan *shardservice.ShardResponse),
+			done:    make(chan error, 1),
+		}
+	}
+
+	var (
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+		cancel()
+	}
+	readError := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
+	}
+
+	jobs := make(chan int)
+	workers := min(max(1, p.MaxConcurrency), len(pl.calls))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				req := *pl.calls[i].req
+				req.RowBatch = distributedRowBatch(&req)
+				sctx, stop := context.WithTimeout(opctx, p.PerShardDeadline)
+				err := e.client.DoBatches(
+					sctx, pl.calls[i].address, &req,
+					func(batch *shardservice.ShardResponse) error {
+						select {
+						case streams[i].batches <- batch:
+							return nil
+						case <-sctx.Done():
+							return sctx.Err()
+						}
+					},
+				)
+				stop()
+				if err != nil {
+					fail(err)
+				}
+				streams[i].done <- err
+				close(streams[i].batches)
+			}
+		})
+	}
+	go func() {
+		defer close(jobs)
+		for i := range pl.calls {
+			select {
+			case jobs <- i:
+			case <-opctx.Done():
+				return
+			}
+		}
+	}()
+
+	var (
+		columns    []shardservice.Column
+		totalRows  uint64
+		totalBytes uint64
+	)
+	for shard := range streams {
+		shardRows := 0
+		for {
+			select {
+			case batch, ok := <-streams[shard].batches:
+				if !ok {
+					if streamErr := <-streams[shard].done; streamErr != nil {
+						fail(streamErr)
+					}
+					goto nextShard
+				}
+				if batch.RowBatch.Sequence == 0 {
+					if columns == nil {
+						columns = append([]shardservice.Column(nil), batch.Columns...)
+					} else if !sameColumns(columns, batch.Columns) {
+						fail(ErrMergeSchema)
+						goto finished
+					}
+				}
+				batchRows := uint64(len(batch.Rows))
+				batchBytes := responseBytes(batch)
+				if ^uint64(0)-totalRows < batchRows || ^uint64(0)-totalBytes < batchBytes {
+					fail(ErrResultLimit)
+					goto finished
+				}
+				totalRows += batchRows
+				totalBytes += batchBytes
+				if limitErr := checkAggregate(p, totalRows, totalBytes); limitErr != nil {
+					fail(limitErr)
+					goto finished
+				}
+				for row := range batch.Rows {
+					if addErr := merger.add(batch.Rows[row]); addErr != nil {
+						fail(fmt.Errorf("%w: shard %d row %d: %v",
+							ErrMergeAggregate, shard, shardRows+row, addErr))
+						goto finished
+					}
+				}
+				shardRows += len(batch.Rows)
+			case <-opctx.Done():
+				goto finished
+			}
+		}
+	nextShard:
+	}
+
+finished:
+	cancel()
+	wg.Wait()
+	if err := readError(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(columns) != len(pl.aggregates) {
+		return nil, ErrMergeSchema
+	}
+	rows, err := merger.finish()
+	if err != nil {
+		return nil, err
+	}
+	rows, err = finalizeGroupedRowsWindow(
+		rows, pl.order, pl.offset, pl.limit, pl.hasLimit, p.MaxAggregateBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	e.metrics.observeResult(totalRows, totalBytes)
+	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: rows}, nil
+}
+
+func distributedRowBatch(req *shardservice.ShardRequest) shardservice.RowBatchRequest {
+	rows := min(uint64(distributedBatchRows), req.MaxRows)
+	bytes := min(uint64(distributedBatchBytes), req.MaxResultBytes)
+	return shardservice.RowBatchRequest{BatchRows: uint32(rows), BatchBytes: uint32(bytes)}
+}
+
+func sameColumns(a, b []shardservice.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func emptyAggregateResult(pl *plan) *Result {
 	const oidJSON int32 = 114
 	columns := make([]shardservice.Column, len(pl.aggregates))
-	row := make([]shardservice.Cell, len(pl.aggregates))
 	for i := range pl.aggregates {
 		columns[i] = shardservice.Column{Name: pl.aggHeaders[i], TypeOID: oidJSON}
+	}
+	if len(pl.groupKeys) != 0 {
+		return &Result{Kind: shardservice.ResponseRows, Columns: columns}
+	}
+	row := make([]shardservice.Cell, len(pl.aggregates))
+	for i := range pl.aggregates {
 		if pl.aggregates[i] == sqlast.AggCount {
 			row[i].Bytes = []byte("0")
 		} else {

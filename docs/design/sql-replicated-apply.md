@@ -10,7 +10,7 @@ transaction log, and underlying machine remain private to the driver.
 It grants no proposal authority, leadership,
 lease, peer authentication, `ReadIndex`, replicated position token, runtime
 snapshot/compaction, or physical completion/system/user byte reservation. A
-separate static-WAL qualification can prove finite logical completion-count
+separate immutable-base WAL qualification can prove finite logical completion-count
 headroom only after exact binding, claim health, completion count, applied cut,
 WAL commit, and last-index checks. The result is an instantaneous predicate,
 not a lease, and cannot advertise replicated Read Committed or Serializable
@@ -98,6 +98,15 @@ member-local coordinates so the logical digest remains portable.
 provisioned with the same profile; `Command` does not carry the digest, so
 this slice makes no cryptographic peer-attestation claim.
 
+The catalog binding remains write-once. An ordered intact-shard ownership
+transition does not change placement range or this validation digest; it
+advances the durable state record's ownership epoch, routing version, and route
+generation together. Reopen accepts that state only as a lockstep monotone
+descendant of the original catalog binding while requiring every immutable
+allocation identity and policy/schema fence to remain exact. This makes restart
+consume the replicated fence without rewriting the SQL catalog or accepting an
+arbitrary authority tuple.
+
 Planning first performs completion dedupe/conflict and
 stale/unknown-collection classification. It then collapses repeated keys to
 their final ordinal effect, checks ordinary collection/JSON bounds, reads the
@@ -160,8 +169,8 @@ The static no-compaction WAL check is only an instantaneous logical-count
 predicate. The current boundary does not reserve collection main-file bytes,
 committed in-flight user/state/completion bytes, Raft log space, snapshots, or
 ranges. It also provides no completion garbage collection, compacted-WAL suffix
-ledger, runtime snapshot export/install, authenticated peer transport, dynamic
-membership, leadership-aware routing, shared replicated position, retry result
+ledger, authenticated peer transport, server-wired membership,
+leadership-aware routing, shared replicated position, retry result
 grammar, composite-key routing proof, `ReadIndex`-gated coherent read, SQL
 predicate/read/range dependency grammar, or cross-shard coordination. None of
 the current apply or sidecar identities grants serving authority or an SQL

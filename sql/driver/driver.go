@@ -256,6 +256,7 @@ type conn struct {
 	pointKeyRaw    []byte
 	pointKeyEnds   []int
 	pointKeys      []string
+	fileRange      query.FileRangeSource
 	matchKeys      []string
 	insertSeeds    []seedDocument
 	insertKeyRaw   []byte
@@ -421,6 +422,14 @@ func (c *conn) PrepareContext(ctx context.Context, src string) (sqldriver.Stmt, 
 // database/sql and the typed runtime. The returned statement owns the parsed
 // tree and both possible lowerings; adapters must not parse src independently.
 func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
+	return c.prepareContextMode(ctx, src, false)
+}
+
+func (c *conn) preparePartialAggregateContext(ctx context.Context, src string) (*stmt, error) {
+	return c.prepareContextMode(ctx, src, true)
+}
+
+func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggregate bool) (*stmt, error) {
 	if err := c.usable(ctx); err != nil {
 		return nil, err
 	}
@@ -453,6 +462,19 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 	}
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
+	}
+	if partialAggregate {
+		if tree.Kind != sqlast.KindSelect || tree.Select == nil ||
+			len(tree.Select.GroupBy) == 0 ||
+			tree.Select.Having != nil || len(tree.Select.Windows) != 0 {
+			return nil, errors.New("vibedb: partial aggregate fragment requires a grouped SELECT without HAVING or windows")
+		}
+		// The parser owns this tree and the prepared statement owns the parser's
+		// arena. Mutating these final-only fields is therefore isolated to this
+		// preparation and preserves placeholder ordinals and source diagnostics.
+		tree.Select.OrderBy = nil
+		tree.Select.Limit = nil
+		tree.Select.Offset = nil
 	}
 	s := &stmt{
 		conn:       c,
@@ -525,6 +547,9 @@ func (c *conn) prepareContext(ctx context.Context, src string) (*stmt, error) {
 				}
 				if t != nil {
 					s.pointPredicate = s.query.DrivingPredicate()
+					s.primaryRange = compilePrimaryRangeProgram(
+						s.pointPredicate, t.meta.PrimaryKey,
+					)
 					s.pointPath, s.pointCandidate = primaryPredicateIdentity(
 						s.pointPredicate,
 					)

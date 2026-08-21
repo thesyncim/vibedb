@@ -38,8 +38,12 @@ type plan struct {
 	calls        []shardCall
 	order        []OrderKey
 	limit        int
+	offset       int
+	hasLimit     bool
 	aggregates   []sqlast.AggKind
+	groupKeys    []int
 	aggHeaders   []string
+	repartition  bool
 	physical     *queryplanner.Plan
 	planning     queryplanner.OptimizerStatistics
 }
@@ -74,7 +78,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
 		return nil, &CatalogError{Reason: "distributed plan does not belong to the pinned catalog generation"}
 	}
-	mapper := distribution.NewNativeMapper(bound.spec.Arity)
+	mapper := distribution.NewNativeMapperWithBucketBits(bound.spec.Arity, bound.spec.EffectiveBucketBits())
 
 	r := e.routers.get()
 	route, err := r.Route(bound.constraints, mapper, bound.manifest, p.Policy)
@@ -87,8 +91,10 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 	}
 
 	calls := make([]shardCall, len(route.Targets))
+	partialAggregate := len(route.Targets) > 1 && len(bound.groupKeys) != 0
 	for i := range route.Targets {
 		t := route.Targets[i]
+		bucketBits, accessScopes := readAccessScopes(bound, t)
 		addr, err := snap.Address(t.Endpoint)
 		if err != nil {
 			return nil, err
@@ -99,6 +105,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 			req: &shardservice.ShardRequest{
 				SQL:                  q.SQL,
 				Params:               q.Params,
+				PartialAggregate:     partialAggregate,
 				Distribution:         route.Distribution,
 				Shard:                t.Shard,
 				AllocationGeneration: t.AllocationGeneration,
@@ -109,6 +116,8 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 				Deadline:             p.PerShardDeadline,
 				MaxRows:              p.PerShardRows,
 				MaxResultBytes:       p.PerShardBytes,
+				BucketBits:           bucketBits,
+				AccessScopes:         accessScopes,
 			},
 		}
 	}
@@ -126,11 +135,30 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		calls:        calls,
 		order:        bound.order,
 		limit:        bound.limit,
+		offset:       bound.offset,
+		hasLimit:     bound.hasLimit,
 		aggregates:   bound.aggregates,
+		groupKeys:    bound.groupKeys,
 		aggHeaders:   bound.aggHeaders,
+		repartition:  physicalPlanContains(physical, queryplanner.OpRepartition),
 		physical:     physical,
 		planning:     planning,
 	}, nil
+}
+
+func physicalPlanContains(plan *queryplanner.Plan, operation queryplanner.Operator) bool {
+	if plan == nil {
+		return false
+	}
+	if plan.Expression.Op == operation {
+		return true
+	}
+	for i := range plan.Children {
+		if physicalPlanContains(plan.Children[i], operation) {
+			return true
+		}
+	}
+	return false
 }
 
 // scatterReason classifies why a route scattered, best-effort, for metrics: a

@@ -117,6 +117,14 @@ func TestConstraintProgramBind(t *testing.T) {
 			wantLen: []int{1},
 		},
 		{
+			name:    "equality raw number parameter",
+			binding: binding,
+			where:   eqExpr("tenant_id", paramOp(0)),
+			args:    []any{vibejson.RawValue{Src: []byte("777")}},
+			want:    []distribution.DomainKind{distribution.DomainFinite},
+			wantLen: []int{1},
+		},
+		{
 			name:    "membership two values",
 			binding: binding,
 			where:   inExpr("tenant_id", strOp("a"), strOp("b")),

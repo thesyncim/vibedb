@@ -26,7 +26,7 @@ func DefaultTrackerPolicy() TrackerPolicy {
 }
 
 // Tracker is the fixed-space sustained-hotness state for one source shard.
-// Observe advances exactly one evidence window and reports whether a shadow
+// Observe advances exactly one evidence window and reports whether a
 // recommendation has qualified now.
 type Tracker struct {
 	source       SourceIdentity
@@ -36,12 +36,12 @@ type Tracker struct {
 	fast    uint64
 	slow    uint64
 
-	cooldown    uint16
-	seen        uint8
-	anchorBin   uint8
-	lastKind    RecommendationKind
-	stable      bool
-	anchorPoint distribution.KeyspacePoint
+	cooldown     uint16
+	seen         uint8
+	anchorBin    uint8
+	lastKind     RecommendationKind
+	stable       bool
+	anchorBucket distribution.KeyspacePoint
 }
 
 // Observe consumes one recommendation window. It applies fast (1/2) and slow
@@ -90,7 +90,7 @@ func (t *Tracker) Observe(rec Recommendation, policy TrackerPolicy) bool {
 	if qualifies {
 		if !t.stable {
 			t.anchorBin = rec.CandidateBin
-			t.anchorPoint = rec.HotPoint
+			t.anchorBucket = rec.HotBucketStart
 			t.lastKind, t.stable = rec.Kind, true
 		}
 	}
@@ -129,7 +129,7 @@ func (t *Tracker) resetEvidence() {
 
 func (t *Tracker) clearAnchor() {
 	t.anchorBin = 0
-	t.anchorPoint = distribution.KeyspacePoint{}
+	t.anchorBucket = distribution.KeyspacePoint{}
 	t.lastKind = RecommendationNone
 	t.stable = false
 }
@@ -141,8 +141,8 @@ func (t *Tracker) sameTarget(rec Recommendation, policy TrackerPolicy) bool {
 	switch rec.Kind {
 	case RecommendationBinarySplit:
 		return distance(rec.CandidateBin, t.anchorBin) <= policy.MaxBoundaryDrift
-	case RecommendationIsolatePoint:
-		return rec.HotPoint == t.anchorPoint
+	case RecommendationIsolateBucket:
+		return rec.HotBucketStart == t.anchorBucket
 	default:
 		return false
 	}
@@ -157,13 +157,17 @@ func actionableRecommendation(rec Recommendation) bool {
 		return rec.BoundaryCount == 1 && rec.CandidateBin > 0 &&
 			rec.CandidateBin < BinCount &&
 			rec.Boundaries[0] == boundaryForRange(rec.Source.Range, int(rec.CandidateBin))
-	case RecommendationIsolatePoint:
-		if !rec.Source.Range.Contains(rec.HotPoint) || rec.CandidateBin >= BinCount ||
-			int(rec.CandidateBin) != binForRange(rec.Source.Range, rec.HotPoint) {
+	case RecommendationIsolateBucket:
+		if !rec.Source.Range.Contains(rec.HotBucketStart) ||
+			!distribution.VirtualBucketBoundary(rec.HotBucketStart, rec.Source.BucketBits) ||
+			rec.CandidateBin >= BinCount ||
+			int(rec.CandidateBin) != binForRange(rec.Source.Range, rec.HotBucketStart) {
 			return false
 		}
 		var boundaries [2]distribution.KeyspacePoint
-		count := isolationBoundaries(rec.Source.Range, rec.HotPoint, &boundaries)
+		count := isolationBoundaries(
+			rec.Source.Range, rec.Source.BucketBits, rec.HotBucketStart, &boundaries,
+		)
 		return count != 0 && rec.BoundaryCount == count && rec.Boundaries == boundaries
 	default:
 		return false

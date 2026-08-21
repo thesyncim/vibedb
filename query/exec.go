@@ -20,6 +20,7 @@ const (
 	sourceSegment
 	sourceHeapSnapshot
 	sourceFileSnapshot
+	sourceFileRange
 	sourceFileOverlay
 	sourceSnapshotOverlay
 	sourceDatabase
@@ -28,7 +29,7 @@ const (
 )
 
 // A Source is the collection a compiled query runs over. Construct one with
-// exactly one of [FromSegment], [FromSnapshot], [FromFile],
+// exactly one of [FromSegment], [FromSnapshot], [FromFile], [FromFileRange],
 // [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase], or
 // [FromFileDatabase]; the zero Source names nothing and every execution
 // rejects it.
@@ -42,8 +43,9 @@ const (
 // escaping.
 type Source struct {
 	kind sourceKind
-	// payload is a *store.Segment for sourceSegment and a *FileOverlaySource
-	// for sourceFileOverlay and sourceSnapshotOverlay. Those variants are
+	// payload is a *store.Segment for sourceSegment, a *FileRangeSource for
+	// sourceFileRange, and a *FileOverlaySource for sourceFileOverlay and
+	// sourceSnapshotOverlay. Those variants are
 	// disjoint, so one GC-visible pointer keeps Source the same size it had
 	// before overlay support; adding an interface field here made every
 	// ordinary database/sql query retain 16 extra bytes even though it never
@@ -129,6 +131,44 @@ func FromSnapshot(s store.Snapshot) Source {
 // result cells survive snapshot close and page eviction.
 func FromFile(s *durable.Snapshot) Source {
 	return Source{kind: sourceFileSnapshot, file: s}
+}
+
+// FileRangeSource is one reusable native ordered-primary scan bound. Its lower
+// endpoint is inclusive unless configured as exclusive; its upper endpoint is
+// always exclusive. A nil endpoint is unbounded. The bytes are borrowed rather
+// than copied, so keep them alive and do not mutate them until execution returns.
+//
+// The holder keeps ordinary [Source] values compact: only the uncommon range
+// source pays for two slice headers, while FromFile and every heap source retain
+// their existing size and allocation behavior.
+type FileRangeSource struct {
+	lower          []byte
+	upper          []byte
+	lowerExclusive bool
+}
+
+// NewFileRangeSource returns a holder bound to one native ordered-primary span.
+func NewFileRangeSource(lower, upper []byte, lowerExclusive bool) FileRangeSource {
+	return FileRangeSource{
+		lower: lower, upper: upper, lowerExclusive: lowerExclusive,
+	}
+}
+
+// Bind replaces the holder's borrowed bounds for reuse by another execution.
+func (s *FileRangeSource) Bind(lower, upper []byte, lowerExclusive bool) {
+	if s != nil {
+		s.lower, s.upper, s.lowerExclusive = lower, upper, lowerExclusive
+	}
+}
+
+// FromFileRange names a page-backed snapshot restricted to one native ordered-
+// primary span. The complete compiled predicate remains authoritative after the
+// seek, so this changes physical work only. rangeSource must remain alive and
+// unchanged until execution returns.
+func FromFileRange(s *durable.Snapshot, rangeSource *FileRangeSource) Source {
+	return Source{
+		kind: sourceFileRange, file: s, payload: unsafe.Pointer(rangeSource),
+	}
 }
 
 // FileOverlay is the bounded staged-write layer over a durable snapshot.
@@ -496,7 +536,21 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		if err := rejectJoins(p, "FromFile"); err != nil {
 			return err
 		}
-		return p.runFileInto(e, src.file, durable.DatabaseSnapshot{})
+		return p.runFileInto(e, src.file, durable.DatabaseSnapshot{}, nil)
+	case sourceFileRange:
+		if err := rejectJoins(p, "FromFileRange"); err != nil {
+			return err
+		}
+		if src.payload == nil {
+			return fmt.Errorf("query: FromFileRange was given a nil range source")
+		}
+		rangeSource := (*FileRangeSource)(src.payload)
+		if len(rangeSource.lower) == 0 && len(rangeSource.upper) == 0 {
+			return fmt.Errorf("query: FromFileRange requires at least one bound")
+		}
+		return p.runFileInto(
+			e, src.file, durable.DatabaseSnapshot{}, rangeSource,
+		)
 	case sourceFileOverlay:
 		if err := rejectJoins(p, "FromFileOverlay"); err != nil {
 			return err
@@ -526,7 +580,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		if driving == nil {
 			return p.runEmptyFileDatabaseInto(e, src.files)
 		}
-		return p.runFileInto(e, driving, src.files)
+		return p.runFileInto(e, driving, src.files, nil)
 	case sourceDatabase:
 		driving, ok := src.catalog.Collection(src.name)
 		if !ok {
@@ -539,7 +593,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 	default:
 		return fmt.Errorf(
 			"query: the zero Source names no collection; " +
-				"build one with FromSegment, FromSnapshot, FromFile, FromFileOverlay, " +
+				"build one with FromSegment, FromSnapshot, FromFile, FromFileRange, FromFileOverlay, " +
 				"FromSnapshotOverlay, FromDatabase, or FromFileDatabase",
 		)
 	}

@@ -1,6 +1,7 @@
-// Package autosplit contains SABLE, a bounded, shadow-only sustained adaptive
-// bottleneck and locality evidence recommender. It never publishes manifests,
-// moves data, or changes shard ownership.
+// Package autosplit contains SABLE, a bounded sustained adaptive bottleneck
+// and locality evidence recorder, recommender, and generation-fenced desired
+// split planner. It never publishes manifests, moves data, or changes shard
+// ownership.
 package autosplit
 
 import (
@@ -79,12 +80,13 @@ type heavyHitter struct {
 // Point load is kept in 64 equal subranges of the source range. Span crossings
 // use a difference vector, so observing a bounded range costs O(log BinCount)
 // and querying all candidate boundaries costs O(BinCount). Eight deterministic
-// SpaceSaving entries retain exact hot-point candidates.
+// SpaceSaving entries retain exact hot-bucket candidates.
 type Sketch struct {
 	source   SourceIdentity
 	sequence uint64
 	bins     [BinCount]loadBin
 	total    [ResourceCount]uint64
+	uniform  [ResourceCount]uint64
 	cross    [BinCount + 1]int64
 	heavy    [HeavyHitterCount]heavyHitter
 
@@ -157,7 +159,46 @@ func (s *Sketch) ObservePoint(point distribution.KeyspacePoint, load LoadVector,
 	}
 	s.samples = saturatingAdd64(s.samples, 1, &s.overflow)
 	if hotWeight != 0 {
-		s.observeHeavy(point, load, uint64(hotWeight))
+		bucket, ok := distribution.VirtualBucketForPoint(point, s.source.BucketBits)
+		if !ok {
+			return false
+		}
+		bucketRange, ok := distribution.VirtualBucketRange(bucket, s.source.BucketBits)
+		if !ok {
+			return false
+		}
+		// A virtual bucket is the smallest movable unit. Collapse every hot
+		// point in it to the canonical bucket start so the controller never
+		// recommends an unservable row-sized range.
+		s.observeHeavy(bucketRange.Start, load, uint64(hotWeight))
+	}
+	return true
+}
+
+func (s *Sketch) observeBucket(
+	start distribution.KeyspacePoint,
+	load LoadVector,
+	hotWeight uint32,
+	fanoutWeight uint32,
+) bool {
+	if s == nil || fanoutWeight == 0 || !s.source.Range.Contains(start) ||
+		!distribution.VirtualBucketBoundary(start, s.source.BucketBits) {
+		return false
+	}
+	bin := s.binFor(start)
+	for resource := range ResourceCount {
+		value := load[resource]
+		s.total[resource] = saturatingAdd64(s.total[resource], uint64(value), &s.overflow)
+		s.bins[bin][resource] = saturatingAdd32(s.bins[bin][resource], value, &s.overflow)
+	}
+	s.samples = saturatingAdd64(s.samples, 1, &s.overflow)
+	// A canonical bucket cannot cross a valid split boundary: any compact
+	// boundary inside it is rejected as unaligned, while its endpoints route the
+	// request wholly to one child. Retain the bounded-query denominator without
+	// touching the crossing difference vector.
+	s.bounded = saturatingAdd64(s.bounded, uint64(fanoutWeight), &s.overflow)
+	if hotWeight != 0 {
+		s.observeHeavy(start, load, uint64(hotWeight))
 	}
 	return true
 }
@@ -199,6 +240,18 @@ func (s *Sketch) ObserveUnbounded(weight uint32) {
 		return
 	}
 	s.unbounded = saturatingAdd64(s.unbounded, uint64(weight), &s.overflow)
+}
+
+func (s *Sketch) observeUniform(load LoadVector) {
+	if s == nil {
+		return
+	}
+	for resource := range ResourceCount {
+		value := load[resource]
+		s.total[resource] = saturatingAdd64(s.total[resource], uint64(value), &s.overflow)
+		s.uniform[resource] = saturatingAdd64(s.uniform[resource], uint64(value), &s.overflow)
+	}
+	s.samples = saturatingAdd64(s.samples, 1, &s.overflow)
 }
 
 func (s *Sketch) observeHeavy(point distribution.KeyspacePoint, load LoadVector, weight uint64) {

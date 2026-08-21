@@ -86,7 +86,7 @@ func (c *Collection) resetPrimaryNativeFoldResults(count int) {
 // otherwise idle during its ordered wave slot. Every bound is known at
 // construction: CPU count, resident allowance, and the normalized
 // pending-parent window.
-func (c *Collection) setupPrimaryNativeFoldContexts() {
+func (c *Collection) setupPrimaryNativeFoldContexts() error {
 	if c == nil || c.primaryUnifiedOverlay == nil ||
 		!c.primaryNativeFoldContextEligible() ||
 		c.primaryUnifiedBuilder == nil ||
@@ -94,7 +94,7 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 		cap(c.primaryPendingParents) == 0 ||
 		cap(c.primaryUnifiedReplacementScratch) <
 			storeio.CommonPrimaryLeafWideSlots {
-		return
+		return nil
 	}
 	workers := min(runtime.GOMAXPROCS(0), primaryNativeFoldMaxWorkers)
 	residentWorkers := int(c.options.ResidentBytes /
@@ -109,7 +109,7 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 		workers = min(workers, 1)
 	}
 	if workers <= 0 {
-		return
+		return nil
 	}
 	c.primaryNativeFoldContexts = make(
 		[]primaryNativeFoldContext, workers,
@@ -136,10 +136,16 @@ func (c *Collection) setupPrimaryNativeFoldContexts() {
 			context.builder = c.primaryUnifiedBuilder
 		} else {
 			context.builder = storeio.NewCompactPrimaryPatchBuilder()
+			if err := context.builder.SetCompactPrimarySummaries(
+				c.options.skipIndexes,
+			); err != nil {
+				return fmt.Errorf("vibedb: configure compact fold summaries: %w", err)
+			}
 			context.jobs = make(chan primaryNativeFoldJob)
 			context.done = make(chan struct{})
 		}
 	}
+	return nil
 }
 
 // primaryNativeFoldContextEligible is the construction-time ownership

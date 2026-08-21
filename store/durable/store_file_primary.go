@@ -670,6 +670,11 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		storeio.CommonPrimaryLeafMaxExtentBytes,
 	)
 	c.primaryUnifiedBuilder = storeio.NewUnifiedPrimaryLeafBuilder()
+	if err := c.primaryUnifiedBuilder.SetCompactPrimarySummaries(
+		c.options.skipIndexes,
+	); err != nil {
+		return fmt.Errorf("vibedb: configure compact summaries: %w", err)
+	}
 	if overlay := c.primaryUnifiedOverlay; overlay != nil {
 		c.primaryUnifiedReplacementScratch = make(
 			[]storeio.CommonPrimaryUnifiedReplacement,
@@ -721,7 +726,9 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 			[]storeio.PageRef, 0, c.options.MaxRetiredExtents,
 		)
 	}
-	c.setupPrimaryNativeFoldContexts()
+	if err := c.setupPrimaryNativeFoldContexts(); err != nil {
+		return err
+	}
 	if err := c.openPrimaryExactIndexes(state); err != nil {
 		return fmt.Errorf(
 			"vibedb: open ordered-primary exact indexes: %w", err,

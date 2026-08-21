@@ -18,7 +18,9 @@ import (
 type ExplainOptions struct {
 	IndexCatalogKnown bool
 	Indexes           []store.IndexInfo
+	IndexRanges       bool
 	PrimaryPoint      bool
+	PrimaryRange      bool
 }
 
 // ExplainAnalysis is the measured result attached to EXPLAIN ANALYZE. The
@@ -191,6 +193,7 @@ type explainAnalyze struct {
 	BufferedBytes           int64  `json:"buffered_bytes"`
 	SpillRuns               uint64 `json:"spill_runs"`
 	SpilledBytes            int64  `json:"spilled_bytes"`
+	PrimaryRangeBounded     bool   `json:"primary_range_bounded"`
 	IndexBounded            bool   `json:"index_bounded"`
 	IndexLookups            int    `json:"index_lookups"`
 	IndexPostingPages       int    `json:"index_posting_pages"`
@@ -231,6 +234,7 @@ func newExplainAnalyze(analysis *ExplainAnalysis) *explainAnalyze {
 		BufferedBytes:           s.BufferedBytes,
 		SpillRuns:               s.SpillRuns,
 		SpilledBytes:            s.SpilledBytes,
+		PrimaryRangeBounded:     s.PrimaryRangeBounded,
 		IndexBounded:            s.IndexBounded,
 		IndexLookups:            s.IndexLookups,
 		IndexPostingPages:       s.IndexPostingPages,
@@ -737,12 +741,20 @@ func explainAccessPath(predicate *compiledPredicate, paths []compiledPath, joins
 		// materialization, so say both truthful alternatives.
 		return "primary-key-point-or-scan"
 	}
+	if options.PrimaryRange {
+		// The SQL driver binds canonical endpoints at execution. Oversized legal
+		// operands and transactional overlays may still choose the full scan, so
+		// an undispatched EXPLAIN reports both truthful alternatives.
+		return "primary-key-range-or-scan"
+	}
 	if predicate == nil {
 		return "full-scan"
 	}
 	if options.IndexCatalogKnown {
 		var workspace Workspace
-		if predicate.canBound(paths, options.Indexes, &workspace) {
+		if predicate.canBoundWithRanges(
+			paths, options.Indexes, &workspace, options.IndexRanges,
+		) {
 			return "adaptive-exact-index-or-scan"
 		}
 		if joins != 0 {

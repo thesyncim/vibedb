@@ -14,7 +14,7 @@ import (
 
 const (
 	stateCodecFormat  = uint16(1)
-	stateHeaderBytes  = 296
+	stateHeaderBytes  = 328
 	recordChecksumLen = sha256.Size
 )
 
@@ -31,6 +31,7 @@ const (
 	RecordStaticSnapshot RecordKind = 1
 	RecordNormal         RecordKind = 2
 	RecordConfiguration  RecordKind = 3
+	RecordOwnership      RecordKind = 4
 )
 
 // State is the exact durable publication stored at the fixed state key.
@@ -45,7 +46,11 @@ type State struct {
 	ConfState         *pb.ConfState
 	ReplicaSetVersion uint64
 	BootstrapDigest   [32]byte
-	CompletionCount   uint64
+	// SnapshotBaseDigest binds the exact Raft snapshot certificate that most
+	// recently established this state-machine base. Normal ordered applies
+	// preserve it; installing a newer certified base replaces it atomically.
+	SnapshotBaseDigest [32]byte
+	CompletionCount    uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -99,9 +104,10 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	copy(frame[184:216], state.LastEntryDigest[:])
 	copy(frame[216:248], state.LogicalDigest[:])
 	copy(frame[248:280], state.BootstrapDigest[:])
-	binary.LittleEndian.PutUint16(frame[280:282], uint16(len(state.Binding.Distribution)))
-	binary.LittleEndian.PutUint16(frame[282:284], uint16(len(state.Binding.Shard)))
-	binary.LittleEndian.PutUint32(frame[284:288], uint32(len(conf)))
+	copy(frame[280:312], state.SnapshotBaseDigest[:])
+	binary.LittleEndian.PutUint16(frame[312:314], uint16(len(state.Binding.Distribution)))
+	binary.LittleEndian.PutUint16(frame[314:316], uint16(len(state.Binding.Shard)))
+	binary.LittleEndian.PutUint32(frame[316:320], uint32(len(conf)))
 	cursor := stateHeaderBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
@@ -118,7 +124,7 @@ func OpenState(src []byte) (State, error) {
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		binary.LittleEndian.Uint16(src[12:14]) != stateHeaderBytes ||
-		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[288:296]) {
+		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[320:328]) {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -128,9 +134,9 @@ func OpenState(src []byte) (State, error) {
 		!verifyRecord(src, stateChecksumDomain) {
 		return State{}, fmt.Errorf("%w: state size or checksum", ErrStateCorrupt)
 	}
-	distributionLen64 := uint64(binary.LittleEndian.Uint16(src[280:282]))
-	shardLen64 := uint64(binary.LittleEndian.Uint16(src[282:284]))
-	confLen64 := uint64(binary.LittleEndian.Uint32(src[284:288]))
+	distributionLen64 := uint64(binary.LittleEndian.Uint16(src[312:314]))
+	shardLen64 := uint64(binary.LittleEndian.Uint16(src[314:316]))
+	confLen64 := uint64(binary.LittleEndian.Uint32(src[316:320]))
 	if distributionLen64+shardLen64+confLen64 != body64 || confLen64 == 0 ||
 		distributionLen64 > uint64(len(src)) || shardLen64 > uint64(len(src)) ||
 		confLen64 > uint64(len(src)) {
@@ -159,6 +165,7 @@ func OpenState(src []byte) (State, error) {
 	copy(state.LastEntryDigest[:], src[184:216])
 	copy(state.LogicalDigest[:], src[216:248])
 	copy(state.BootstrapDigest[:], src[248:280])
+	copy(state.SnapshotBaseDigest[:], src[280:312])
 	cursor := stateHeaderBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
@@ -187,7 +194,8 @@ func validateState(state State) error {
 	if state.Applied == 0 || state.Applied == math.MaxUint64 ||
 		state.LastTerm == 0 || state.LastTerm == math.MaxUint64 || state.ConfState == nil ||
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||
-		state.ReplicaSetVersion == math.MaxUint64 || state.CompletionCount > state.Applied-1 {
+		state.ReplicaSetVersion == math.MaxUint64 || state.CompletionCount > state.Applied-1 ||
+		state.SnapshotBaseDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: invalid state scalar", ErrStateCorrupt)
 	}
 	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
@@ -219,6 +227,11 @@ func validateState(state State) error {
 		}, state.ConfState)
 		if err != nil || state.LastEntryDigest != want {
 			return fmt.Errorf("%w: configuration entry digest", ErrStateCorrupt)
+		}
+	case RecordOwnership:
+		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
+			state.ReplicaSetVersion >= state.Applied {
+			return fmt.Errorf("%w: ownership entry type", ErrStateCorrupt)
 		}
 	default:
 		return fmt.Errorf("%w: record kind", ErrStateCorrupt)
@@ -318,6 +331,12 @@ func equalState(left, right State) bool {
 		left.LogicalDigest == right.LogicalDigest &&
 		left.ReplicaSetVersion == right.ReplicaSetVersion &&
 		left.BootstrapDigest == right.BootstrapDigest &&
+		left.SnapshotBaseDigest == right.SnapshotBaseDigest &&
 		left.CompletionCount == right.CompletionCount &&
 		proto.Equal(left.ConfState, right.ConfState)
+}
+
+func equalStateExceptSnapshotBaseDigest(left, right State) bool {
+	left.SnapshotBaseDigest = right.SnapshotBaseDigest
+	return equalState(left, right)
 }

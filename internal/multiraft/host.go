@@ -13,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -70,17 +71,26 @@ const (
 
 // Progress describes one completed Ready micro-step or one consumed input.
 // When RunOne also returns an error, Done is still true if the input was
-// consumed or a group was newly latched faulted.
+// consumed or a group was newly latched faulted. ReadOutcomes is owned by the
+// caller and present only on the corresponding Ready completion step.
 type Progress struct {
-	Group     raftmember.GroupKey
-	Kind      ProgressKind
-	ReadyKind raftmember.DriveKind
+	Group        raftmember.GroupKey
+	Kind         ProgressKind
+	ReadyKind    raftmember.DriveKind
+	ReadOutcomes []raftmodel.ReadOutcome
 }
 
 type memberRuntime interface {
 	Identity() raftmember.RuntimeIdentity
 	Failure() error
 	Propose([]byte) error
+	ProposeConfChange(pb.ConfChangeI) error
+	ReadIndex([]byte) error
+	Publication() (raftmodel.Publication, error)
+	SnapshotState() (replicatedstate.State, error)
+	Status() (raftmember.RuntimeStatus, error)
+	Progress(uint64) (raftmodel.MemberProgress, bool, error)
+	TransferLeader(uint64) error
 	StepMessage(*pb.Message) error
 	Tick() error
 	Campaign() error
@@ -482,6 +492,105 @@ func (host *Host) EnqueueProposal(key raftmember.GroupKey, data []byte) error {
 	return nil
 }
 
+// ProposeConfChange synchronously admits one caller-authorized membership
+// operation. Control input is intentionally not queued: the caller must drive
+// and retry after ErrReadyPending, preventing stale topology intent from
+// lingering behind unrelated work.
+func (host *Host) ProposeConfChange(key raftmember.GroupKey, change pb.ConfChangeI) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	err = group.runtime.ProposeConfChange(change)
+	host.finishDirectControl(group, err)
+	return err
+}
+
+// ReadIndex synchronously starts one bounded quorum-confirmed read barrier.
+// The exact terminal outcome is returned by a later RunOne Progress value.
+func (host *Host) ReadIndex(key raftmember.GroupKey, context []byte) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	err = group.runtime.ReadIndex(context)
+	host.finishDirectControl(group, err)
+	return err
+}
+
+// Publication returns the group's detached atomically published apply cut.
+func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmodel.Publication{}, err
+	}
+	return group.runtime.Publication()
+}
+
+// SnapshotState returns one group's coherent durable state for control-plane
+// verification of an installed certified learner base.
+func (host *Host) SnapshotState(key raftmember.GroupKey) (replicatedstate.State, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return replicatedstate.State{}, err
+	}
+	return group.runtime.SnapshotState()
+}
+
+// Status returns one group's detached local Raft status.
+func (host *Host) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmember.RuntimeStatus{}, err
+	}
+	return group.runtime.Status()
+}
+
+// Progress returns one member's allocation-free replication progress from the
+// local leader.
+func (host *Host) Progress(
+	key raftmember.GroupKey,
+	memberID uint64,
+) (raftmodel.MemberProgress, bool, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmodel.MemberProgress{}, false, err
+	}
+	return group.runtime.Progress(memberID)
+}
+
+// TransferLeader synchronously admits an authorized leadership handoff. Like
+// configuration control it is not queued behind stale topology intent.
+func (host *Host) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	err = group.runtime.TransferLeader(transferee)
+	host.finishDirectControl(group, err)
+	return err
+}
+
+func (host *Host) finishDirectControl(group *groupState, controlErr error) {
+	if group == nil || group.runtime == nil {
+		return
+	}
+	failure := group.runtime.Failure()
+	if failure != nil || errors.Is(controlErr, raftmember.ErrRuntimeFailed) ||
+		errors.Is(controlErr, raftmember.ErrRuntimeClosed) {
+		if failure != nil {
+			group.failure = failure
+		} else {
+			group.failure = controlErr
+		}
+		host.purgeGroup(group)
+		return
+	}
+	if controlErr == nil {
+		host.wake(group)
+	}
+}
+
 // RequestTick retains one exact logical tick. Tick debt is bounded, counted as
 // queue items, and serviced one tick per scheduling turn.
 func (host *Host) RequestTick(key raftmember.GroupKey) error {
@@ -626,7 +735,10 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		}
 		if ready.Progressed() {
 			host.wake(group)
-			return Progress{Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind}, true, nil
+			return Progress{
+				Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind,
+				ReadOutcomes: ready.ReadOutcomes,
+			}, true, nil
 		}
 
 		progress, consumed, inputErr := host.runInput(group)

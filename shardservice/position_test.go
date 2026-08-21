@@ -119,7 +119,7 @@ func TestPositionWireStrictValidation(t *testing.T) {
 	}
 	for _, kind := range []ResponseKind{ResponseCompletion, ResponseError} {
 		var body encbuf
-		body.u8(wireVersion1)
+		body.u8(wireVersion)
 		body.u8(uint8(kind))
 		if kind == ResponseCompletion {
 			body.u64(0)
@@ -156,7 +156,7 @@ func TestPositionWireStrictValidation(t *testing.T) {
 	}
 
 	var body encbuf
-	body.u8(wireVersion1)
+	body.u8(wireVersion)
 	body.str("")
 	body.str("")
 	body.str("")

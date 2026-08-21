@@ -807,6 +807,25 @@ func (a *ReplicatedApply) Published() raftmodel.Publication {
 	return a.machine.Published()
 }
 
+// SnapshotArtifactCut captures one coherent, read-only system/user cut for
+// streaming snapshot export. The returned handle owns the durable collection
+// snapshots until Close; it carries no SQL session or serving authority.
+func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, error) {
+	if a == nil || a.database == nil {
+		return nil, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return nil, err
+	}
+	base := a.database.catalog.ReplicatedShardStore
+	if base == nil || base.UserTable == "" {
+		return nil, ErrReplicatedApplyMismatch
+	}
+	return a.machine.Snapshot(base.UserTable)
+}
+
 // ApplyNormal implements raftmodel.StateMachine under the SQL publication
 // lock, pairing durable user/system mutation with conflict-clock publication.
 func (a *ReplicatedApply) ApplyNormal(
@@ -846,8 +865,9 @@ func (a *ReplicatedApply) ApplyConfiguration(
 	return a.machine.ApplyConfiguration(meta, conf)
 }
 
-// InstallSnapshot implements raftmodel.StateMachine. The underlying Phase-1b
-// machine accepts only its exact static bootstrap snapshot.
+// InstallSnapshot implements raftmodel.StateMachine. The underlying machine
+// initializes from its exact static bootstrap or binds an already-staged exact
+// candidate to a certified immutable Raft base.
 func (a *ReplicatedApply) InstallSnapshot(
 	snapshot *pb.Snapshot,
 ) (raftmodel.Publication, error) {

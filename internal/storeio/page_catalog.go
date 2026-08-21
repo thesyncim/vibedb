@@ -15,11 +15,16 @@ const (
 	PageCatalogMaxIndexColumns    = 4
 	PageCatalogMaxLogicalIndexes  = 4096
 	PageCatalogMaxPhysicalIndexes = 64
-	PageCatalogMaxSchemaFields    = 4096
+	// PageCatalogMaxSkipIndexes bounds the compact min/max summaries carried by
+	// every primary stripe. A small fixed ceiling keeps write amplification and
+	// per-leaf metadata predictable; wider predicates can still use exact
+	// indexes or residual scans.
+	PageCatalogMaxSkipIndexes  = 8
+	PageCatalogMaxSchemaFields = 4096
 	// PageCatalogMaxUniqueStrings is the exact sum of every independently
-	// addressable maximum: 4096 aliases, 64*4 physical paths, and 4096 schema
-	// fields.
-	PageCatalogMaxUniqueStrings  = 8448
+	// addressable maximum: 4096 aliases, 64*4 physical paths, 8 skip paths, and
+	// 4096 schema fields.
+	PageCatalogMaxUniqueStrings  = 8456
 	PageCatalogMaxStringBytes    = 1<<16 - 1
 	PageCatalogMaxCanonicalBytes = 32 << 20
 	PageCatalogDigestSize        = 16
@@ -60,7 +65,8 @@ const (
 )
 
 const (
-	pageCatalogCanonicalSchema = uint16(1)
+	pageCatalogCanonicalSchema    = uint16(1)
+	pageCatalogCanonicalSkipPaths = uint16(1 << 1)
 )
 
 var (
@@ -99,8 +105,9 @@ type PageCatalogSchema struct {
 // PageCatalogDefinition is the complete configuration needed to reopen a
 // Store without caller-supplied index or schema options.
 type PageCatalogDefinition struct {
-	Indexes []PageCatalogIndex
-	Schema  *PageCatalogSchema
+	Indexes   []PageCatalogIndex
+	SkipPaths []string
+	Schema    *PageCatalogSchema
 }
 
 type pageCatalogPhysicalDefinition struct {
@@ -114,6 +121,7 @@ type CanonicalPageCatalog struct {
 	digest    [PageCatalogDigestSize]byte
 	indexes   []PageCatalogIndex
 	physical  []pageCatalogPhysicalDefinition
+	skipPaths []string
 	schema    *PageCatalogSchema
 }
 
@@ -158,7 +166,8 @@ func (c *CanonicalPageCatalog) Definition() PageCatalogDefinition {
 		return PageCatalogDefinition{}
 	}
 	out := PageCatalogDefinition{
-		Indexes: clonePageCatalogIndexes(c.indexes),
+		Indexes:   clonePageCatalogIndexes(c.indexes),
+		SkipPaths: slices.Clone(c.skipPaths),
 	}
 	if c.schema != nil {
 		out.Schema = &PageCatalogSchema{
@@ -223,7 +232,8 @@ func BuildCanonicalPageCatalog(
 	if err != nil {
 		return nil, err
 	}
-	if len(normalized.Indexes) == 0 && normalized.Schema == nil {
+	if len(normalized.Indexes) == 0 && len(normalized.SkipPaths) == 0 &&
+		normalized.Schema == nil {
 		return &CanonicalPageCatalog{}, nil
 	}
 	stringsTable, stringIDs, err := pageCatalogStrings(normalized, physical)
@@ -243,7 +253,8 @@ func BuildCanonicalPageCatalog(
 	}
 	total64 := uint64(PageCatalogCanonicalHeaderSize) +
 		uint64(stringBytes) + uint64(physicalBytes) +
-		uint64(len(normalized.Indexes))*4
+		uint64(len(normalized.Indexes))*4 +
+		uint64(len(normalized.SkipPaths))*2
 	if normalized.Schema != nil {
 		total64 += uint64(len(normalized.Schema.Fields)) * 6
 	}
@@ -261,9 +272,12 @@ func BuildCanonicalPageCatalog(
 	schemaFields := 0
 	schemaRoot := uint16(0)
 	if normalized.Schema != nil {
-		flags = pageCatalogCanonicalSchema
+		flags |= pageCatalogCanonicalSchema
 		schemaFields = len(normalized.Schema.Fields)
 		schemaRoot = normalized.Schema.Root
+	}
+	if len(normalized.SkipPaths) != 0 {
+		flags |= pageCatalogCanonicalSkipPaths
 	}
 	binary.LittleEndian.PutUint16(canonical[14:16], flags)
 	binary.LittleEndian.PutUint32(canonical[16:20], uint32(len(canonical)))
@@ -274,6 +288,7 @@ func BuildCanonicalPageCatalog(
 	binary.LittleEndian.PutUint32(canonical[36:40], uint32(stringBytes))
 	binary.LittleEndian.PutUint32(canonical[40:44], uint32(physicalBytes))
 	binary.LittleEndian.PutUint16(canonical[44:46], schemaRoot)
+	binary.LittleEndian.PutUint32(canonical[46:50], uint32(len(normalized.SkipPaths)))
 
 	cursor := PageCatalogCanonicalHeaderSize
 	previous = ""
@@ -300,6 +315,10 @@ func BuildCanonicalPageCatalog(
 		canonical[cursor+2] = byte(physicalID)
 		cursor += 4
 	}
+	for _, path := range normalized.SkipPaths {
+		binary.LittleEndian.PutUint16(canonical[cursor:cursor+2], stringIDs[path])
+		cursor += 2
+	}
 	if normalized.Schema != nil {
 		for _, field := range normalized.Schema.Fields {
 			binary.LittleEndian.PutUint16(canonical[cursor:cursor+2], stringIDs[field.Path])
@@ -318,6 +337,7 @@ func BuildCanonicalPageCatalog(
 		digest:    pageCatalogDigest(canonical),
 		indexes:   clonePageCatalogIndexes(normalized.Indexes),
 		physical:  clonePageCatalogPhysical(physical),
+		skipPaths: slices.Clone(normalized.SkipPaths),
 		schema:    clonePageCatalogSchema(normalized.Schema),
 	}, nil
 }
@@ -351,6 +371,7 @@ func openOwnedCanonicalPageCatalog(
 		digest:    pageCatalogDigest(canonical),
 		indexes:   definition.Indexes,
 		physical:  physical,
+		skipPaths: definition.SkipPaths,
 		schema:    definition.Schema,
 	}, nil
 }
@@ -432,6 +453,10 @@ func normalizePageCatalogDefinition(
 	physical = slices.CompactFunc(physical, func(a, b pageCatalogPhysicalDefinition) bool {
 		return comparePageCatalogPhysical(a, b) == 0
 	})
+	skipPaths, err := normalizePageCatalogSkipPaths(definition.SkipPaths)
+	if err != nil {
+		return PageCatalogDefinition{}, nil, err
+	}
 	if len(physical) > PageCatalogMaxPhysicalIndexes {
 		return PageCatalogDefinition{}, nil, fmt.Errorf(
 			"%w: %d physical indexes, maximum is %d",
@@ -444,8 +469,35 @@ func normalizePageCatalogDefinition(
 		return PageCatalogDefinition{}, nil, err
 	}
 	return PageCatalogDefinition{
-		Indexes: indexes, Schema: schema,
+		Indexes: indexes, SkipPaths: skipPaths, Schema: schema,
 	}, physical, nil
+}
+
+func normalizePageCatalogSkipPaths(paths []string) ([]string, error) {
+	if len(paths) > PageCatalogMaxSkipIndexes {
+		return nil, fmt.Errorf(
+			"%w: %d skip paths, maximum is %d",
+			ErrPageCatalogDefinition, len(paths), PageCatalogMaxSkipIndexes,
+		)
+	}
+	out := make([]string, len(paths))
+	for i, path := range paths {
+		if err := pageCatalogPointer(path, true); err != nil {
+			return nil, fmt.Errorf(
+				"%w: skip path %d: %v", ErrPageCatalogDefinition, i, err,
+			)
+		}
+		out[i] = strings.Clone(path)
+	}
+	slices.Sort(out)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] == out[i] {
+			return nil, fmt.Errorf(
+				"%w: duplicate skip path %q", ErrPageCatalogDefinition, out[i],
+			)
+		}
+	}
+	return out, nil
 }
 
 func normalizePageCatalogSchema(schema *PageCatalogSchema) (*PageCatalogSchema, error) {
@@ -513,6 +565,9 @@ func pageCatalogStrings(
 			unique[path] = struct{}{}
 		}
 	}
+	for _, path := range definition.SkipPaths {
+		unique[path] = struct{}{}
+	}
 	if definition.Schema != nil {
 		for _, field := range definition.Schema.Fields {
 			unique[field.Path] = struct{}{}
@@ -543,7 +598,7 @@ func decodeCanonicalPageCatalogDefinition(
 		!bytes.Equal(src[0:8], pageCatalogCanonicalMagic[:]) ||
 		binary.LittleEndian.Uint32(src[8:12]) != pageCatalogCanonicalVersion ||
 		binary.LittleEndian.Uint16(src[12:14]) != PageCatalogCanonicalHeaderSize ||
-		!allZero(src[46:PageCatalogCanonicalHeaderSize]) {
+		!allZero(src[50:PageCatalogCanonicalHeaderSize]) {
 		return PageCatalogDefinition{}, fmt.Errorf(
 			"%w: canonical header", ErrPageCatalogCorrupt,
 		)
@@ -557,12 +612,15 @@ func decodeCanonicalPageCatalogDefinition(
 	stringBytes := binary.LittleEndian.Uint32(src[36:40])
 	physicalBytes := binary.LittleEndian.Uint32(src[40:44])
 	root := binary.LittleEndian.Uint16(src[44:46])
-	if flags&^pageCatalogCanonicalSchema != 0 ||
+	skipCount := binary.LittleEndian.Uint32(src[46:50])
+	if flags&^(pageCatalogCanonicalSchema|pageCatalogCanonicalSkipPaths) != 0 ||
 		total != uint32(len(src)) || len(src) > PageCatalogMaxCanonicalBytes ||
 		stringCount > PageCatalogMaxUniqueStrings ||
 		aliasCount > PageCatalogMaxLogicalIndexes ||
 		physicalCount > PageCatalogMaxPhysicalIndexes ||
 		fieldCount > PageCatalogMaxSchemaFields ||
+		skipCount > PageCatalogMaxSkipIndexes ||
+		(flags&pageCatalogCanonicalSkipPaths == 0) != (skipCount == 0) ||
 		flags&pageCatalogCanonicalSchema == 0 && (root != 0 || fieldCount != 0) ||
 		flags&pageCatalogCanonicalSchema != 0 &&
 			(!validPageCatalogSchemaTypes(root) ||
@@ -574,7 +632,7 @@ func decodeCanonicalPageCatalogDefinition(
 	}
 	sections64 := uint64(PageCatalogCanonicalHeaderSize) +
 		uint64(stringBytes) + uint64(physicalBytes) +
-		uint64(aliasCount)*4 + uint64(fieldCount)*6
+		uint64(aliasCount)*4 + uint64(skipCount)*2 + uint64(fieldCount)*6
 	if sections64 != uint64(len(src)) {
 		return PageCatalogDefinition{}, fmt.Errorf(
 			"%w: canonical section bounds", ErrPageCatalogCorrupt,
@@ -696,6 +754,23 @@ func decodeCanonicalPageCatalogDefinition(
 		}
 	}
 
+	skipPaths := make([]string, int(skipCount))
+	previous = ""
+	for i := range skipPaths {
+		id := binary.LittleEndian.Uint16(src[cursor : cursor+2])
+		cursor += 2
+		if int(id) >= len(values) ||
+			pageCatalogPointer(values[id], true) != nil ||
+			i != 0 && values[id] <= previous {
+			return PageCatalogDefinition{}, fmt.Errorf(
+				"%w: skip path", ErrPageCatalogCorrupt,
+			)
+		}
+		skipPaths[i] = values[id]
+		previous = values[id]
+		usedStrings[id] = true
+	}
+
 	var schema *PageCatalogSchema
 	if flags&pageCatalogCanonicalSchema != 0 {
 		schema = &PageCatalogSchema{
@@ -738,7 +813,7 @@ func decodeCanonicalPageCatalogDefinition(
 		}
 	}
 	return PageCatalogDefinition{
-		Indexes: indexes, Schema: schema,
+		Indexes: indexes, SkipPaths: skipPaths, Schema: schema,
 	}, nil
 }
 

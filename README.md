@@ -158,11 +158,12 @@ func main() {
 }
 ```
 
-The supported surface includes schema-checked tables, exact indexes, DML with
-`RETURNING`, joins, derived tables, CTEs, set operations, a bounded recursive
-CTE subset, a documented window-function subset, views, predicate subqueries,
-and snapshot transactions. Unsupported shapes return explicit positioned
-errors instead of silently changing semantics.
+The supported surface includes schema-checked tables, exact indexes with
+durable ordered-range pushdown, DML with `RETURNING`, joins, derived tables,
+CTEs, set operations, a bounded recursive CTE subset, a documented
+window-function subset, views, predicate subqueries, and snapshot transactions.
+Unsupported shapes return explicit positioned errors instead of silently
+changing semantics.
 
 VibeDB SQL is intentionally a subset, not PostgreSQL compatibility. Read the
 [SQL surface](docs/design/sql-surface.md) before choosing an ORM or generating
@@ -285,7 +286,8 @@ embedded facade:
   dispatches bounded, leader-only, explicitly read-only queries to the shards;
 - a bounded Cascades-style optimizer core (`planner`) with memoized rules,
   required physical properties, distributed exchanges, multidimensional costs,
-  compact generation-pinned statistics, and deterministic planning metrics;
+  compact generation-pinned statistics, byte-native `vibejson` scalar bounds,
+  and deterministic planning metrics;
 - the frozen placement scalar and tuple codec (`distribution`) used as
   cross-shard routing identity; and
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server
@@ -326,21 +328,39 @@ available.
 
 | Server capability | Current state |
 | --- | --- |
-| Leader-only shard process | Available; one locally fenced store |
-| Stateless read-only gateway | Available; generation-pinned routing and bounded fan-out |
+| Leader-only shard process | Available; one locally fenced store, owner-fenced bounded exchange mailboxes, direct shard-cursor producers over canonical row blocks, and exact partition-local grouped reducers with terminal-output retry proof |
+| Stateless gateway | Available; scoped coherent read fan-out, exact bounded grouped partial/final aggregation and path-projection DISTINCT, final sort and O(OFFSET+LIMIT) top-K, single-shard fast writes, fixed-participant atomic write batches, bounded durable coordinator redrive, and cost-selected worker-to-worker hash repartition when centralized grouped state exceeds the query memory objective; range exchange, joins, and runtime filters are not yet wired |
+| Independently sharded global indexes | Catalog/incarnation fencing, byte-native finite-domain lookup batched once per index shard, locator-only projection with exact grouped base-primary fetch, atomic lifecycle-wide INSERT/UPDATE/DELETE maintenance, resumable per-base-shard compare-and-put backfill, and a stable local catalog-generation drain fence available; cluster-wide build scheduling, checkpoint persistence, and gateway-ack aggregation remain external |
+| Shard-local data skipping | Durable primary stripes can persist up to eight declared scalar min/max summaries; conjunctive equality/range filters reject stripes before document reconstruction through an allocation-free warmed byte-native scan, while the full predicate remains authoritative |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |
-| Runtime Raft snapshots, WAL compaction, and dynamic membership | Not available |
-| Follower/session reads, online movement, and backup/PITR orchestration | Not available |
-| Adaptive splitting | Shadow-only recommender; not wired to topology publication or data movement |
+| Raft read/membership control | Non-serving runtime and Multi-Raft ports expose quorum-safe `ReadIndex`, model-checked membership, allocation-free per-member progress, and explicit leader transfer. A stateless intact-shard relocation kernel requires exact certified-base, catch-up, ownership, catalog-CAS, drain, removal, and retirement evidence; external topology authorization and server wiring remain unavailable |
+| Runtime Raft snapshots and WAL compaction | A coherent applied cut can be exported as a deterministic bounded-memory hash chain, resumed into non-serving durable destination files through an atomic cursor without retaining an artifact copy, fully revalidated, certified as an immutable learner WAL base, and caught up through ordinary `AppendEntries`. Authenticated transfer and live WAL compaction are not available |
+| Follower/session reads, serving online movement, and backup/PITR orchestration | Not available; intact-shard replica movement exists only as a non-serving controller/runtime kernel |
+| Hot-shard detection and split planning | Optional shard request completion records exact fixed-space per-bucket pressure and fan-out windows; sustained recommendations produce bucket-aligned, allocation-high-water and generation-fenced desired manifests. Intact-shard replica relocation is modeled, but filtered child artifacts and physical split cutover are not yet available |
 
 The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.
 
+The implementation target keeps the gateway's explicitly routed fast path but
+adds replicated distributed transactions, snapshots, global indexes, query
+exchange, and online movement as opt-in costs when an operation crosses shards.
+Its analytical lane follows current ClickHouse-style vectorized multi-stage
+execution, exchanges, projection/data skipping, pushdown, and parallel replicas
+without imposing a MergeTree-style write path on transactional storage. CRDB's
+useful consensus/MVCC/closed-timestamp correctness properties inform replicated
+serving without putting distributed coordination on the routed fast path.
+Tenants route through many virtual buckets rather than being assigned to one
+physical shard. The target and its correctness/performance gates are specified
+in [Distributed system target](docs/design/distributed-system.md); the table
+above remains the honest statement of what serves today.
+
 Read the design before relying on any of it:
 
 - [Distributed sharding](docs/design/distributed-sharding.md)
+- [Distributed system target](docs/design/distributed-system.md)
+- [Distributed transactions](docs/design/distributed-transactions.md)
 - [Query planner](docs/design/query-planner.md)
 - [Placement tuple format](docs/design/distribution-tuple-format.md)
 

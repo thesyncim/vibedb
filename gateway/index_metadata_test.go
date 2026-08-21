@@ -135,8 +135,8 @@ func TestLocalUniqueIndexMustContainShardKey(t *testing.T) {
 		t.Fatal("local unique missing one shard-key path succeeded")
 	}
 
-	// Global uniqueness cannot be certified before global-index enforcement and
-	// a distributed transaction fence exist.
+	// Locality is always explicit; omitting both local and global cannot smuggle
+	// an unenforced unique descriptor into the catalog.
 	invalid.Flags = IndexUnique
 	if _, err := NewSnapshotWithIndexes(config, testEndpoints(), 1, []IndexDescriptor{invalid}); err == nil {
 		t.Fatal("non-local unique descriptor succeeded")

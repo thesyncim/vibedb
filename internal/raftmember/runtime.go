@@ -76,10 +76,25 @@ const (
 	DriveAdvanced
 )
 
-// DriveResult reports one bounded synchronous Ready micro-step.
+// DriveResult reports one bounded synchronous Ready micro-step. ReadOutcomes
+// is present only for DriveReadStatesFinished; ownership of the slice and its
+// detached contexts transfers to the caller.
 type DriveResult struct {
-	Kind    DriveKind
-	ReadyID uint64
+	Kind         DriveKind
+	ReadyID      uint64
+	ReadOutcomes []raftmodel.ReadOutcome
+}
+
+// RuntimeStatus is a detached allocation-free control-plane view. It is
+// evidence only; serving authority still requires topology ownership fences.
+type RuntimeStatus struct {
+	MemberID       uint64
+	LeaderID       uint64
+	Term           uint64
+	Commit         uint64
+	Applied        uint64
+	LeadTransferee uint64
+	RaftState      raft.StateType
 }
 
 // Progressed reports whether DriveReady performed one lifecycle operation.
@@ -118,7 +133,7 @@ func AdoptRuntime(
 	if wal == nil || database == nil || apply == nil {
 		return nil, ErrRuntimeOwnership
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, apply); err != nil {
+	if err := ValidateImmutableBaseNoGCCompletionCapacity(wal, apply); err != nil {
 		return nil, err
 	}
 	profile, err := apply.CapacityQualificationProfile()
@@ -261,6 +276,98 @@ func (runtime *Runtime) Propose(data []byte) error {
 	return runtime.node.Propose(data)
 }
 
+// ProposeConfChange admits one topology-authorized configuration change into
+// the existing model-checked Raft path. Runtime does not itself authorize
+// membership or grant serving authority. Nil means only local core admission.
+func (runtime *Runtime) ProposeConfChange(change pb.ConfChangeI) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	if err := runtime.wal.ReserveReady(); err != nil {
+		if deterministicPersistFailure(err) {
+			return runtime.fail(err)
+		}
+		return err
+	}
+	return runtime.node.ProposeConfChange(change)
+}
+
+// ReadIndex starts one quorum-confirmed linearizable-read barrier. Context is
+// copied by the Node before return. Completion is surfaced exactly once in a
+// later DriveResult.ReadOutcomes value; it does not itself expose SQL data.
+func (runtime *Runtime) ReadIndex(context []byte) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	// ReadIndex cannot append an entry or advance HardState. Its Ready contains
+	// only messages/read states, so pessimistic worst-case WAL reservation would
+	// incorrectly make linearizable reads unavailable at a sealed log limit.
+	// PersistReady still performs the empty-batch namespace proof before send.
+	return runtime.node.ReadIndex(context)
+}
+
+// Publication returns a detached view of the atomically published apply cut.
+// It is diagnostic/control evidence, not a leader or range-ownership proof.
+func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return raftmodel.Publication{}, err
+	}
+	return runtime.node.Published(), nil
+}
+
+// SnapshotState returns the complete coherent durable state paired with a
+// short-lived read snapshot. It is control-plane evidence for certified
+// learner installation; callers do not receive collection handles or serving
+// authority.
+func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return replicatedstate.State{}, err
+	}
+	cut, err := runtime.apply.SnapshotArtifactCut()
+	if err != nil {
+		return replicatedstate.State{}, err
+	}
+	state := cut.State()
+	if closeErr := cut.Close(); closeErr != nil {
+		return replicatedstate.State{}, closeErr
+	}
+	return state, nil
+}
+
+// Status returns detached local Raft status without allocating the leader's
+// complete progress map.
+func (runtime *Runtime) Status() (RuntimeStatus, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return RuntimeStatus{}, err
+	}
+	status := runtime.node.Status()
+	return RuntimeStatus{
+		MemberID: status.ID, LeaderID: status.Lead, Term: status.GetTerm(),
+		Commit: status.GetCommit(), Applied: status.Applied,
+		LeadTransferee: status.LeadTransferee, RaftState: status.RaftState,
+	}, nil
+}
+
+// Progress returns one allocation-free detached follower progress record from
+// a local leader.
+func (runtime *Runtime) Progress(memberID uint64) (raftmodel.MemberProgress, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return raftmodel.MemberProgress{}, false, err
+	}
+	progress, found := runtime.node.Progress(memberID)
+	return progress, found, nil
+}
+
+// TransferLeader starts an explicit handoff to one configured voter. The
+// caller must drain Ready and observe Status before treating the handoff as
+// complete.
+func (runtime *Runtime) TransferLeader(transferee uint64) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	return runtime.node.TransferLeader(transferee)
+}
+
 // StepMessage admits one ordinary, non-snapshot peer message. The message is
 // detached by raftmodel.Node before this method returns.
 func (runtime *Runtime) StepMessage(message *pb.Message) error {
@@ -332,7 +439,7 @@ func (runtime *Runtime) DriveReady(
 		}
 		if progress.HasSnapshot {
 			return DriveResult{}, runtime.fail(&raftmodel.UnsupportedError{
-				Feature: "runtime snapshots in the static WAL kernel",
+				Feature: "in-band Ready snapshots in the immutable-base WAL kernel",
 			})
 		}
 		return DriveResult{Kind: DriveCaptured, ReadyID: progress.ReadyID}, nil
@@ -428,12 +535,10 @@ func (runtime *Runtime) DriveReady(
 		if err != nil {
 			return DriveResult{}, runtime.fail(err)
 		}
-		if len(outcomes) != 0 {
-			return DriveResult{}, runtime.fail(&raftmodel.UnsupportedError{
-				Feature: "read outcomes in the non-serving runtime",
-			})
-		}
-		return DriveResult{Kind: DriveReadStatesFinished, ReadyID: progress.ReadyID}, nil
+		return DriveResult{
+			Kind: DriveReadStatesFinished, ReadyID: progress.ReadyID,
+			ReadOutcomes: outcomes,
+		}, nil
 
 	case raftmodel.PhaseReadStatesRecorded:
 		readyID := runtime.node.ReadyID()
@@ -487,7 +592,7 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 		return 0, errors.New("raftmember: nil Raft message")
 	}
 	if message.GetType() == pb.MsgSnap || message.Snapshot != nil {
-		return 0, &raftmodel.UnsupportedError{Feature: "snapshot message in the static WAL runtime"}
+		return 0, &raftmodel.UnsupportedError{Feature: "snapshot message in the immutable-base WAL runtime"}
 	}
 	if len(message.GetResponses()) != 0 || message.Vote != nil {
 		return 0, errors.New("raftmember: ordinary message carries recursive or local-storage fields")

@@ -140,8 +140,9 @@ There is no separately allocated state-root page. The active prefix is:
 | 200:512 | reserved zero suffix |
 
 The ordered-primary root is the sole document root. A mutable store cannot open
-without it. The only current option bits are schema binding and canonical
-materialization qualification; unknown bits fail closed.
+without it. The current option bits are schema binding, persisted primary-stripe
+skip summaries, and canonical materialization qualification; unknown bits fail
+closed.
 
 ## Ordered primary graph
 
@@ -165,6 +166,36 @@ templates, scalar dictionary entries, typed tokens, and complete trivial JSON
 spellings when templating does not save space. This is one encoding grammar,
 not a selectable document-format mode.
 
+The compact stripe payload begins with one 40-byte `VCS1` header:
+
+| Offset | Field |
+| --- | --- |
+| 0:4 | magic `VCS1` |
+| 4:8 | row count |
+| 8:10 | shape count |
+| 10 | shape-code bit width |
+| 11 | flags; bit 0 means overflow rows are present |
+| 12:16 | encoded key-stream bytes |
+| 16:20 | shape-code bytes |
+| 20:24 | rank-checkpoint bytes |
+| 24:28 | shape-stream bytes, excluding summaries |
+| 28:32 | stable-slot bytes |
+| 32:34 | catalog-ordered summary count, at most 8 |
+| 34:36 | reserved zero |
+| 36:40 | trailing summary-section bytes, at most 4 KiB |
+
+After the existing shape directory, key/slot/overflow sections, shape codes,
+rank checkpoints, and shape streams, the summary section carries one
+variable-capacity entry per persisted skip path. Each entry starts with
+`{flags u8, reserved u8, entryBytes u16, minBytes u16, maxBytes u16}` followed
+by canonical ordered scalar term bytes and zero padding. Bit 0 marks valid
+extrema; every other flag and reserved byte is zero. Each bound is at most 256
+bytes, `min <= max`, and every term must pass the same ordered-key grammar used
+by exact indexes. A disabled entry contains no bounds and an all-zero body.
+Open validates the complete tiling, padding, term grammar, and bounded count
+before admitting the leaf; a filtered scan additionally requires that count to
+equal its pinned catalog path count.
+
 Values up to `InlineValueBytes` remain in the leaf. Larger values use a
 forward-linked `PageOverflow` chain whose fixed header and every reference are
 validated before bytes are returned. Publication creates the overflow chain
@@ -185,9 +216,13 @@ the selected primary graph's live slot masks.
 
 ## Catalog, free space, and journals
 
-`PageCatalogSegment` stores the canonical schema and exact-index definition.
-StateRoot records its byte length and digest, so reopen reconstructs and hashes
-the exact bytes rather than trusting a compact rejection key.
+`PageCatalogSegment` stores the canonical schema, exact-index definition, and
+ordered skip paths. Its 64-byte canonical header carries skip-path count at
+`46:50`; bytes `50:64` remain reserved zero. The sorted skip-path string IDs
+follow logical exact-index aliases and precede schema fields. StateRoot records
+the catalog byte length and digest, so reopen reconstructs and hashes the exact
+bytes rather than trusting a compact rejection key. The catalog order is the
+summary ordinal order in every primary stripe.
 
 The allocator publishes a free image plus bounded deltas through
 `PageFreeImage`, `PageFreeIndex`, `PageFreeDelta`, and the inline free run.
