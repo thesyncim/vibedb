@@ -2,13 +2,18 @@
 
 package replicatedstate
 
-import "testing"
+import (
+	"bytes"
+	"io"
+	"testing"
+)
 
 var (
 	codecBytesSink  []byte
 	codecDigestSink [32]byte
 	codecStateSink  State
 	codecRecordSink CompletionRecord
+	artifactSink    SnapshotArtifactManifest
 )
 
 func TestDigestAndCompletionAppendAllocationBounds(t *testing.T) {
@@ -116,6 +121,50 @@ func BenchmarkOpenCompletionRecord(b *testing.B) {
 	b.SetBytes(int64(len(encoded)))
 	for b.Loop() {
 		codecRecordSink, err = OpenCompletionRecord(encoded)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteSnapshotArtifact(b *testing.B) {
+	_, snapshot := snapshotArtifactFixture(b)
+	options := SnapshotArtifactOptions{
+		PayloadBuffer: make([]byte, 0, MaxSnapshotArtifactChunkBytes),
+	}
+	var err error
+	artifactSink, err = WriteSnapshotArtifact(io.Discard, snapshot, options)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(artifactSink.PayloadBytes))
+	b.ResetTimer()
+	for b.Loop() {
+		artifactSink, err = WriteSnapshotArtifact(io.Discard, snapshot, options)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVerifySnapshotArtifact(b *testing.B) {
+	_, snapshot := snapshotArtifactFixture(b)
+	var artifact bytes.Buffer
+	var err error
+	artifactSink, err = WriteSnapshotArtifact(&artifact, snapshot, SnapshotArtifactOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded := artifact.Bytes()
+	callbacks := SnapshotArtifactCallbacks{
+		PayloadBuffer: make([]byte, 0, MaxSnapshotArtifactChunkBytes),
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(artifactSink.PayloadBytes))
+	b.ResetTimer()
+	for b.Loop() {
+		artifactSink, err = VerifySnapshotArtifact(bytes.NewReader(encoded), callbacks)
 		if err != nil {
 			b.Fatal(err)
 		}

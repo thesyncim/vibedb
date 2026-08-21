@@ -8,11 +8,12 @@ durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
-wire shard RPCs to Raft, permit client-facing replicated SQL writes, create runtime
-snapshots, compact the Raft WAL, reserve physical system/user storage, provide
-peer authentication or network I/O, or authorize Read Committed or Serializable
-transactions across replicas. A static-WAL qualification now proves finite logical
-completion-count headroom for one exact healthy, initialized WAL/apply pair
+wire shard RPCs to Raft, permit client-facing replicated SQL writes, install or
+publish runtime snapshots, compact the Raft WAL, reserve physical system/user
+storage, provide peer authentication or network I/O, or authorize Read Committed
+or Serializable transactions across replicas. A static-WAL qualification now
+proves finite logical completion-count headroom for one exact healthy,
+initialized WAL/apply pair
 after checking its binding and applied/committed/log cut. It does not reserve
 bytes, grant proposal authority, or produce a lease. Its purpose is to make the
 local committed-entry boundary executable and crash-testable before those
@@ -215,11 +216,13 @@ configuration digest therefore binds index, term, entry type, and deterministic
 `ConfState`; it is exact at the apply-port boundary but is not a claim to retain
 the original configuration proposal envelope.
 
-The current machine accepts only the exact static bootstrap snapshot fixed at
-construction. Installation is an idempotent verification at the same cut,
-including exact snapshot bytes/identity, logical digest, `ConfState`, binding,
-and replica-set version. A newer runtime snapshot is unsupported until the
-snapshot repository and WAL generation-swap protocol exist.
+The Raft state-machine port still accepts only the exact static bootstrap
+snapshot fixed at construction. Installation is an idempotent verification at
+the same cut, including exact snapshot bytes/identity, logical digest,
+`ConfState`, binding, and replica-set version. A portable runtime artifact can
+now be exported and verified, but installing it as replacement durable state,
+publishing it to Raft storage, and swapping WAL generations remain unsupported
+until the destination staging repository and crash protocol exist.
 
 ## Reader publication and reopen
 
@@ -240,13 +243,26 @@ fails stop. Reopen resolves the decision and observes either the old cut or the
 fully new cut; `raftmodel.NewNode` then resumes from the recovered `Applied`
 watermark without reapplying an already published entry.
 
-The first runtime snapshot interface must pin precisely this coherent cut. Its
-manifest must include user data, every retained completion, the exact binding
-and mutable authority profile, last-entry identity, logical digest,
-`ConfState`, replica-set version, and applied index. The pin need not itself be
-durable: the repository must create, verify, sync, and publish an immutable
-artifact before compaction. Snapshot publication and WAL compaction therefore
-depend on this state-machine boundary, not the reverse.
+`WriteSnapshotArtifact` now streams precisely this coherent cut. Its one current
+binary grammar embeds the canonical state envelope, raw user-collection name,
+every hidden system row, and every user row in strict collection/key order.
+Rows are never fragmented. Ordinary chunks target 1 MiB, one exceptional row
+is bounded by the frozen 4 MiB document profile, and callers can reuse a fixed
+payload buffer. Every chunk carries its sequence and prior digest; the footer
+binds exact row, payload, chunk, and encoded-byte totals. Verification refuses
+declared oversize chunks before allocation, verifies a complete chunk before
+exposing borrowed row bytes, matches the hidden state row to the header, and
+emits exact end-offset/digest checkpoints for resumable destination staging.
+No `encoding/json`, synthesized SQL, or per-row collection string is involved.
+
+This is a certified export primitive, not a serving snapshot. Transfer
+authentication and topology authorization must supply the expected artifact
+identity. A destination must stage and revalidate user rows with its catalog
+validator, sync the complete artifact, compare the final digest, atomically
+install both collections, and only then publish it. The repository,
+snapshot-install transaction, ordered log-tail catch-up, and WAL
+generation-swap protocol are still absent. Snapshot publication and compaction
+therefore continue to depend on those gates.
 
 ## Isolation boundary
 
@@ -295,8 +311,9 @@ Serving is prohibited because the current tree lacks:
 
 - physical system/user byte reservation and safe completion GC beyond the
   instantaneous static-base logical headroom proof;
-- crash-atomic runtime snapshots, a reconstructed suffix-reservation ledger,
-  and WAL generation compaction;
+- a crash-atomic runtime snapshot repository/install transaction, a
+  reconstructed suffix-reservation ledger, and WAL generation compaction; the
+  coherent portable export/verification artifact alone grants no authority;
 - peer enrollment, mutually authenticated network I/O, shared per-peer flow
   control, snapshot transport, dynamic membership reconciliation, and
   deadline/slow-disk isolation around the in-process host and frame validator;

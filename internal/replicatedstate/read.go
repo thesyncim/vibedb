@@ -103,8 +103,8 @@ func (s *ReadSnapshot) Collection(name string) (*durable.Snapshot, bool) {
 	return s.cut.Collection(name)
 }
 
-// RangeSystem exports the bounded canonical system key/value image needed by a
-// future runtime snapshot manifest. Callback bytes are borrowed for the call.
+// RangeSystem exports the bounded canonical system key/value image used by the
+// portable snapshot artifact. Callback bytes are borrowed for the call.
 func (s *ReadSnapshot) RangeSystem(fn func(key, value []byte) error) error {
 	if s == nil || fn == nil {
 		return ErrInconsistentSnapshot

@@ -142,9 +142,10 @@ go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
 <!-- unsafe-file-list:start -->
-The root module contains 61 non-test Go files that import `unsafe`:
+The root module contains 62 non-test Go files that import `unsafe`:
 
 ```text
+autosplit/recorder.go
 gateway/catalog.go
 gateway/index_metadata.go
 internal/raftstore/preallocate_windows.go

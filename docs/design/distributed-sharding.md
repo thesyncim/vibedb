@@ -143,8 +143,11 @@ single-bucket isolation. `PlanSplit` then validates the full source allocation,
 routing version, ownership epoch, bucket geometry, and lifetime allocation
 high-water before constructing an immutable desired manifest. This is planning,
 not rebalancing: the returned manifest is not publishable until a separate data
-plane has installed a certified snapshot, applied the ordered mutation tail,
-closed the final source gap, and passed cutover validation.
+plane has transferred and installed the now-available certified snapshot
+artifact, applied the ordered mutation tail, closed the final source gap, and
+passed cutover validation. Artifact export is deterministic, bounded-memory,
+hash-chained, and checkpointed; destination staging/install and transport are
+not implemented here.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
@@ -240,12 +243,14 @@ reconfiguration protocol.
   failover;
 - serving follower/session reads or a coherent SQL read bound to the
   non-serving runtime's `ReadIndex` outcome;
-- runtime Raft snapshots, WAL compaction, topology-authorized dynamic
-  membership reconciliation, or snapshot transfer; context-free model-checked
+- runtime Raft snapshot publication/install, WAL compaction,
+  topology-authorized dynamic membership reconciliation, or snapshot transfer;
+  portable coherent artifact export/verification and context-free model-checked
   configuration proposals are exposed only through the non-serving kernel;
-- snapshot/catch-up/cutover execution for an online split, merge, move, or
-  topology recovery; bounded hot-bucket evidence and desired split planning do
-  exist, but confer no serving authority;
+- destination snapshot staging/install, catch-up, and cutover execution for an
+  online split, merge, move, or topology recovery; bounded hot-bucket evidence,
+  desired split planning, and source artifact export do exist, but confer no
+  serving authority;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed
   reads; the current leader-only vector fence is ephemeral;
 - arbitrary distributed SQL transaction sessions and single-statement scatter
