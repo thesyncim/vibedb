@@ -200,15 +200,48 @@ func TestRecommendChargesBoundedSpanFanout(t *testing.T) {
 	}
 }
 
+func TestRecommendProjectsUnknownLocalityWithoutFirstBinBias(t *testing.T) {
+	source := testSource(balancedRange())
+	sketch, _ := NewSketch(source, 1)
+	sketch.observeUniform(LoadVector{
+		ResourceWriteCPU: 64, ResourceRequests: 64, ResourceLiveBytes: 64,
+	})
+	cap := capFor(32, 32, 32)
+	recommendation := Recommend(sketch, CapacitySet{
+		Source: source, WindowSequence: 1,
+		Current: cap, Left: cap, Right: cap, Isolated: cap,
+	}, Policy{TriggerPressurePPM: 1_100_000, MinBenefitPPM: 500_000})
+	if recommendation.Kind != RecommendationBinarySplit ||
+		recommendation.CandidateBin != BinCount/2 ||
+		recommendation.Boundaries[0] != testPoint(uint64(1)<<63) {
+		t.Fatalf("uniform recommendation = %+v", recommendation)
+	}
+
+	tiny, _ := NewSketch(source, 2)
+	tiny.observeUniform(LoadVector{ResourceRequests: 1})
+	tinyRecommendation := Recommend(tiny, CapacitySet{
+		Source: source, WindowSequence: 2,
+		Current:  CapacityVector{ResourceRequests: 1},
+		Left:     CapacityVector{ResourceRequests: 1},
+		Right:    CapacityVector{ResourceRequests: 1},
+		Isolated: CapacityVector{ResourceRequests: 1},
+	}, Policy{TriggerPressurePPM: 1, MinBenefitPPM: 1})
+	if tinyRecommendation.Kind != RecommendationNone {
+		t.Fatalf("one unknown request fabricated a split: %+v", tinyRecommendation)
+	}
+}
+
 func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
 	source := SourceIdentity{
 		Distribution: "d", Shard: "s", AllocationGeneration: 3,
-		Range: range_, RoutingVersion: 7, OwnershipEpoch: 9,
+		Range: range_, BucketBits: distribution.DefaultVirtualBucketBits,
+		RoutingVersion: 7, OwnershipEpoch: 9,
 	}
 	sketch, _ := NewSketch(source, 1)
-	hot := testPoint(12345)
-	neighbor := testPoint(12445)
+	hot := testPoint(uint64(12345)<<(64-source.BucketBits) | 17)
+	hotBucket := testPoint(uint64(12345) << (64 - source.BucketBits))
+	neighbor := testPoint(uint64(12346)<<(64-source.BucketBits) | 17)
 	for range 70 {
 		sketch.ObservePoint(hot, LoadVector{ResourceWriteCPU: 10, ResourceRequests: 1, ResourceLiveBytes: 1}, 10)
 	}
@@ -217,7 +250,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 	}
 	if !sketch.ObserveSpan(
 		hot,
-		distribution.KeyspaceEnd{Point: testPoint(pointUint64(hot) + 2)},
+		distribution.KeyspaceEnd{Point: testPoint(uint64(12347) << (64 - source.BucketBits))},
 		10,
 	) {
 		t.Fatal("celebrity-crossing span rejected")
@@ -232,10 +265,11 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 		Isolated: capFor(1_200, 120, 120),
 	}
 	rec := Recommend(sketch, capacities, policy)
-	if rec.Kind != RecommendationIsolatePoint || rec.HotPoint != hot || rec.BoundaryCount != 2 {
+	if rec.Kind != RecommendationIsolateBucket || rec.HotBucketStart != hotBucket || rec.BoundaryCount != 2 {
 		t.Fatalf("isolation recommendation = %+v", rec)
 	}
-	if rec.Boundaries[0] != hot || pointUint64(rec.Boundaries[1]) != pointUint64(hot)+1 {
+	if rec.Boundaries[0] != hotBucket ||
+		pointUint64(rec.Boundaries[1]) != pointUint64(hotBucket)+(uint64(1)<<(64-source.BucketBits)) {
 		t.Fatalf("isolation boundaries = %x, %x", rec.Boundaries[0], rec.Boundaries[1])
 	}
 	assertChildrenCover(t, source.Range, rec)
@@ -246,7 +280,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 		Isolated: capFor(1_200, 120, 120),
 	}
 	defaultRec := Recommend(sketch, defaultCapacities, DefaultPolicy())
-	if defaultRec.Kind != RecommendationIsolatePoint || defaultRec.BenefitPPM < DefaultPolicy().MinBenefitPPM {
+	if defaultRec.Kind != RecommendationIsolateBucket || defaultRec.BenefitPPM < DefaultPolicy().MinBenefitPPM {
 		t.Fatalf("default-policy isolation recommendation = %+v", defaultRec)
 	}
 	if defaultRec.FanoutTaxPPM == 0 {
@@ -255,7 +289,7 @@ func TestRecommendCelebrityIsolationAndUnsplittable(t *testing.T) {
 
 	capacities.Isolated = capFor(600, 100, 100)
 	rec = Recommend(sketch, capacities, policy)
-	if rec.Kind != RecommendationUnsplittableHotKey || rec.HotPoint != hot || rec.BoundaryCount != 0 {
+	if rec.Kind != RecommendationUnsplittableBucket || rec.HotBucketStart != hotBucket || rec.BoundaryCount != 0 {
 		t.Fatalf("unsplittable recommendation = %+v", rec)
 	}
 }
@@ -264,8 +298,8 @@ func TestRecommendDoesNotCallCrowdedBinHotKeyUnsplittable(t *testing.T) {
 	range_ := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
 	source := testSource(range_)
 	sketch, _ := NewSketch(source, 1)
-	hot := testPoint(12345)
-	neighbor := testPoint(12445)
+	hot := testPoint(uint64(12345)<<(64-source.BucketBits) | 17)
+	neighbor := testPoint(uint64(12346)<<(64-source.BucketBits) | 17)
 	for range 70 {
 		sketch.ObservePoint(hot, LoadVector{ResourceWriteCPU: 10, ResourceRequests: 1}, 10)
 	}
@@ -282,7 +316,7 @@ func TestRecommendDoesNotCallCrowdedBinHotKeyUnsplittable(t *testing.T) {
 		Right: capFor(2_000, 100, 1), Isolated: capFor(1_000, 100, 1),
 	}
 	rec := Recommend(sketch, capacities, policy)
-	if rec.Kind == RecommendationUnsplittableHotKey {
+	if rec.Kind == RecommendationUnsplittableBucket {
 		t.Fatalf("crowded-bin recommendation falsely proved hot key unsplittable: %+v", rec)
 	}
 }
@@ -355,7 +389,7 @@ func TestRecommendRejectsCapacityFenceMismatchBeforePlanning(t *testing.T) {
 				t.Fatalf("mismatch recommendation = %+v", rec)
 			}
 			if rec.BoundaryCount != 0 || rec.Boundaries != [2]distribution.KeyspacePoint{} ||
-				rec.HotPoint != (distribution.KeyspacePoint{}) || rec.CandidateBin != 0 ||
+				rec.HotBucketStart != (distribution.KeyspacePoint{}) || rec.CandidateBin != 0 ||
 				rec.CurrentPressurePPM != 0 || rec.PredictedPressurePPM != 0 ||
 				rec.BenefitPPM != 0 || rec.FanoutTaxPPM != 0 || rec.MigrationTaxPPM != 0 {
 				t.Fatalf("mismatch leaked decision state: %+v", rec)
@@ -570,7 +604,7 @@ func TestTrackerEverySourceCoordinateStartsFresh(t *testing.T) {
 		{"routing", func(s *SourceIdentity) { s.RoutingVersion++ }},
 		{"ownership", func(s *SourceIdentity) { s.OwnershipEpoch++ }},
 		{"range", func(s *SourceIdentity) {
-			s.Range.Start = testPoint(1)
+			s.Range.Start = testPoint(uint64(1) << (64 - s.BucketBits))
 		}},
 	}
 	for _, test := range changes {
@@ -604,29 +638,30 @@ func TestTrackerSlowBoundaryWalkCannotQualify(t *testing.T) {
 	}
 }
 
-func TestTrackerIsolationRequiresExactHotPoint(t *testing.T) {
+func TestTrackerIsolationRequiresExactHotBucket(t *testing.T) {
 	policy := DefaultTrackerPolicy()
 	source := testSource(balancedRange())
-	hotA, hotB := testPoint(100), testPoint(101)
+	hotA := testPoint(uint64(100)<<(64-source.BucketBits) | 1)
+	hotB := testPoint(uint64(101)<<(64-source.BucketBits) | 1)
 	if binForRange(source.Range, hotA) != binForRange(source.Range, hotB) {
 		t.Fatal("test hot points must occupy the same compact bin")
 	}
 	var tracker Tracker
 	for sequence := uint64(1); sequence <= 5; sequence++ {
 		if tracker.Observe(testIsolateRecommendation(source, sequence, hotA), policy) {
-			t.Fatalf("first hot point qualified early at %d", sequence)
+			t.Fatalf("first hot bucket qualified early at %d", sequence)
 		}
 	}
 	if tracker.Observe(testIsolateRecommendation(source, 6, hotB), policy) {
-		t.Fatal("different hot point inherited same-bin evidence")
+		t.Fatal("different hot bucket inherited same-bin evidence")
 	}
 	for sequence := uint64(7); sequence <= 12; sequence++ {
 		if tracker.Observe(testIsolateRecommendation(source, sequence, hotB), policy) {
-			t.Fatalf("second hot point qualified early at %d", sequence)
+			t.Fatalf("second hot bucket qualified early at %d", sequence)
 		}
 	}
 	if !tracker.Observe(testIsolateRecommendation(source, 13, hotB), policy) {
-		t.Fatal("eight exact hot-point windows did not qualify")
+		t.Fatal("eight exact hot-bucket windows did not qualify")
 	}
 }
 
@@ -743,6 +778,7 @@ func testPoint(value uint64) distribution.KeyspacePoint { return uint64Point(val
 func testSource(range_ distribution.KeyRange) SourceIdentity {
 	return SourceIdentity{
 		Distribution: "d", Shard: "s", AllocationGeneration: 1, Range: range_,
+		BucketBits:     distribution.DefaultVirtualBucketBits,
 		RoutingVersion: 1, OwnershipEpoch: 2,
 	}
 }
@@ -762,13 +798,16 @@ func testIsolateRecommendation(
 	sequence uint64,
 	hot distribution.KeyspacePoint,
 ) Recommendation {
+	bucket, _ := distribution.VirtualBucketForPoint(hot, source.BucketBits)
+	bucketRange, _ := distribution.VirtualBucketRange(bucket, source.BucketBits)
+	hot = bucketRange.Start
 	var boundaries [2]distribution.KeyspacePoint
-	count := isolationBoundaries(source.Range, hot, &boundaries)
+	count := isolationBoundaries(source.Range, source.BucketBits, hot, &boundaries)
 	return Recommendation{
 		Source: source, WindowSequence: sequence,
-		Kind: RecommendationIsolatePoint, Reason: ReasonNone,
+		Kind: RecommendationIsolateBucket, Reason: ReasonNone,
 		Boundaries: boundaries, BoundaryCount: count,
-		CandidateBin: uint8(binForRange(source.Range, hot)), HotPoint: hot,
+		CandidateBin: uint8(binForRange(source.Range, hot)), HotBucketStart: hot,
 		CurrentPressurePPM: 1_100_000, BenefitPPM: 200_000,
 	}
 }

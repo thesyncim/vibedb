@@ -10,13 +10,14 @@ import (
 // PPM is the fixed-point scale used for utilization, penalties, and policy.
 const PPM uint64 = 1_000_000
 
-// SourceIdentity fences a shadow recommendation to the exact serving range it
-// observed. A future workflow must compare every field before acting on it.
+// SourceIdentity fences evidence and recommendations to the exact serving
+// range that produced them. Every field must match before planning a change.
 type SourceIdentity struct {
 	Distribution         distribution.DistributionName
 	Shard                distribution.ShardID
 	AllocationGeneration distribution.ShardAllocationGeneration
 	Range                distribution.KeyRange
+	BucketBits           uint8
 	RoutingVersion       distribution.RoutingVersion
 	OwnershipEpoch       distribution.OwnershipEpoch
 }
@@ -24,15 +25,16 @@ type SourceIdentity struct {
 func (s SourceIdentity) valid() bool {
 	return s.Distribution != "" && s.Shard != "" &&
 		s.AllocationGeneration != 0 && s.RoutingVersion != 0 &&
-		s.OwnershipEpoch != 0 && s.Range.Valid()
+		s.OwnershipEpoch != 0 && s.Range.Valid() &&
+		distribution.ValidVirtualBucketBits(s.BucketBits)
 }
 
-// CapacitySet describes current, binary-child, and optional isolated-point
+// CapacitySet describes current, binary-child, and optional isolated-bucket
 // placements for one exact observation window. Source and WindowSequence must
 // match the sketch: capacity projected for another shard incarnation or
 // collection window is stale evidence and is refused before planning.
-// Isolated is required before an IsolatePoint recommendation can be
-// actionable; a zero vector makes an observed hot point unsplittable.
+// Isolated is required before an IsolateBucket recommendation can be
+// actionable; a zero vector makes an observed hot bucket unsplittable.
 type CapacitySet struct {
 	Source         SourceIdentity
 	WindowSequence uint64
@@ -43,7 +45,7 @@ type CapacitySet struct {
 	Isolated CapacityVector
 }
 
-// Policy contains deterministic shadow-decision bounds. Use DefaultPolicy as
+// Policy contains deterministic recommendation bounds. Use DefaultPolicy as
 // a conservative starting point; zero values deliberately disable a bound or
 // penalty so simulations can isolate each term.
 type Policy struct {
@@ -58,7 +60,7 @@ type Policy struct {
 	MinChildLiveBytes   uint64
 }
 
-// DefaultPolicy returns conservative fixed-point shadow defaults.
+// DefaultPolicy returns conservative fixed-point recommendation defaults.
 func DefaultPolicy() Policy {
 	return Policy{
 		TriggerPressurePPM:  900_000,
@@ -72,14 +74,14 @@ func DefaultPolicy() Policy {
 	}
 }
 
-// RecommendationKind is a shadow-mode outcome. No kind mutates topology.
+// RecommendationKind is a planning outcome. No kind mutates topology.
 type RecommendationKind uint8
 
 const (
 	RecommendationNone RecommendationKind = iota
 	RecommendationBinarySplit
-	RecommendationIsolatePoint
-	RecommendationUnsplittableHotKey
+	RecommendationIsolateBucket
+	RecommendationUnsplittableBucket
 )
 
 // Reason explains a RecommendationNone result.
@@ -95,19 +97,19 @@ const (
 	ReasonNoBenefit
 )
 
-// Recommendation is a pure, generation-fenced shadow decision. IsolatePoint
+// Recommendation is a pure, generation-fenced decision. IsolateBucket
 // may carry one or two boundaries, producing two or three non-overlapping
-// children. UnsplittableHotKey carries HotPoint and no actionable boundary.
+// children. UnsplittableBucket carries HotBucketStart and no boundary.
 type Recommendation struct {
 	Source         SourceIdentity
 	WindowSequence uint64
 	Kind           RecommendationKind
 	Reason         Reason
 
-	Boundaries    [2]distribution.KeyspacePoint
-	BoundaryCount uint8
-	CandidateBin  uint8
-	HotPoint      distribution.KeyspacePoint
+	Boundaries     [2]distribution.KeyspacePoint
+	BoundaryCount  uint8
+	CandidateBin   uint8
+	HotBucketStart distribution.KeyspacePoint
 
 	CurrentPressurePPM   uint64
 	PredictedPressurePPM uint64
@@ -152,7 +154,7 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		migrationTax = mulPPM(ratioPPM(sketch.total[ResourceLiveBytes], policy.MigrationBudget), policy.MigrationWeightPPM)
 	}
 
-	var left [ResourceCount]uint64
+	var pointLeft [ResourceCount]uint64
 	bestObjective := uint64(math.MaxUint64)
 	bestLoad := uint64(math.MaxUint64)
 	bestFanout := uint64(0)
@@ -163,7 +165,9 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 	lastBoundary := distribution.KeyspacePoint{}
 	for k := 1; k < BinCount; k++ {
 		for resource := range ResourceCount {
-			left[resource] = saturatingPlainAdd(left[resource], uint64(sketch.bins[k-1][resource]))
+			pointLeft[resource] = saturatingPlainAdd(
+				pointLeft[resource], uint64(sketch.bins[k-1][resource]),
+			)
 		}
 		var crossingOK bool
 		crossing, crossingOK = addSigned(crossing, sketch.cross[k])
@@ -173,14 +177,18 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		}
 		boundary := sketch.boundary(k)
 		if boundary == source.Range.Start || boundary == lastBoundary ||
+			!distribution.VirtualBucketBoundary(boundary, source.BucketBits) ||
 			(!source.Range.End.Max && boundary == source.Range.End.Point) {
 			lastBoundary = boundary
 			continue
 		}
 		lastBoundary = boundary
 
-		var right [ResourceCount]uint64
+		var left, right [ResourceCount]uint64
 		for resource := range ResourceCount {
+			left[resource] = saturatingPlainAdd(
+				pointLeft[resource], proportional(sketch.uniform[resource], uint64(k), BinCount),
+			)
 			right[resource] = sketch.total[resource] - left[resource]
 		}
 		if left[ResourceLiveBytes] < policy.MinChildLiveBytes || right[ResourceLiveBytes] < policy.MinChildLiveBytes {
@@ -207,21 +215,29 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 	if hasCelebrity && policy.MaxChildPressurePPM != 0 &&
 		(bestBin < 0 || bestLoad > policy.MaxChildPressurePPM) {
 		// SpaceSaving proves a lower bound for identity/frequency. Cost the entire
-		// compact bin against isolated capacity (an upper bound for the hot point),
-		// then subtract only the point load observed while its slot was resident
+		// compact bin against isolated capacity (an upper bound for the hot bucket),
+		// then subtract only the bucket load observed while its slot was resident
 		// from the bin. The remaining bin load is an upper bound for neighbours;
 		// charge it to both residual sides because the compact bin does not retain
 		// their exact position around the point.
 		var hotLoad, residualLeft, residualRight [ResourceCount]uint64
 		hotBin := sketch.binFor(celebrity.point)
 		for resource := range ResourceCount {
-			hotLoad[resource] = uint64(sketch.bins[hotBin][resource])
+			uniformBefore := proportional(sketch.uniform[resource], uint64(hotBin), BinCount)
+			uniformThrough := proportional(sketch.uniform[resource], uint64(hotBin+1), BinCount)
+			hotLoad[resource] = saturatingPlainAdd(
+				uint64(sketch.bins[hotBin][resource]), uniformThrough-uniformBefore,
+			)
 			for bin := 0; bin < hotBin; bin++ {
 				residualLeft[resource] += uint64(sketch.bins[bin][resource])
 			}
 			for bin := hotBin + 1; bin < BinCount; bin++ {
 				residualRight[resource] += uint64(sketch.bins[bin][resource])
 			}
+			residualLeft[resource] = saturatingPlainAdd(residualLeft[resource], uniformBefore)
+			residualRight[resource] = saturatingPlainAdd(
+				residualRight[resource], sketch.uniform[resource]-uniformThrough,
+			)
 			knownHot := min(celebrity.load[resource], hotLoad[resource])
 			binResidual := hotLoad[resource] - knownHot
 			residualLeft[resource] = saturatingPlainAdd(residualLeft[resource], binResidual)
@@ -229,17 +245,18 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		}
 		hotUtil := dominantUtil(hotLoad, capacities.Isolated)
 		provenHotUtil := dominantUtil(celebrity.load, capacities.Isolated)
-		out.HotPoint = celebrity.point
+		out.HotBucketStart = celebrity.point
 		out.CandidateBin = uint8(hotBin)
-		out.BoundaryCount = isolationBoundaries(source.Range, celebrity.point, &out.Boundaries)
+		out.BoundaryCount = isolationBoundaries(
+			source.Range, source.BucketBits, celebrity.point, &out.Boundaries,
+		)
 		if out.BoundaryCount == 0 {
-			out.Kind = RecommendationUnsplittableHotKey
+			out.Kind = RecommendationUnsplittableBucket
 			return out
 		}
-		hasLeft := distribution.ComparePoints(celebrity.point, source.Range.Start) > 0
-		hasRight := pointUint64(celebrity.point) != math.MaxUint64 &&
-			(source.Range.End.Max || distribution.ComparePoints(
-				uint64Point(pointUint64(celebrity.point)+1), source.Range.End.Point) < 0)
+		hasLeft := out.BoundaryCount != 0 && out.Boundaries[0] == celebrity.point
+		hasRight := out.BoundaryCount == 2 ||
+			(out.BoundaryCount == 1 && out.Boundaries[0] != celebrity.point)
 		leftUtil, rightUtil := uint64(0), uint64(0)
 		if hasLeft {
 			leftUtil = dominantUtil(residualLeft, capacities.Left)
@@ -251,7 +268,7 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		if isolationLoad > policy.MaxChildPressurePPM {
 			if provenHotUtil > policy.MaxChildPressurePPM {
 				out.PredictedPressurePPM = provenHotUtil
-				out.Kind = RecommendationUnsplittableHotKey
+				out.Kind = RecommendationUnsplittableBucket
 				out.BoundaryCount = 0
 				return out
 			}
@@ -274,7 +291,7 @@ func Recommend(sketch *Sketch, capacities CapacitySet, policy Policy) Recommenda
 		out.PredictedPressurePPM = saturatingPlainAdd(out.PredictedPressurePPM, policy.UncertaintyPPM)
 		out.PredictedPressurePPM = saturatingPlainAdd(out.PredictedPressurePPM, fanoutTax)
 		out.PredictedPressurePPM = saturatingPlainAdd(out.PredictedPressurePPM, migrationTax)
-		out.Kind = RecommendationIsolatePoint
+		out.Kind = RecommendationIsolateBucket
 		if current > out.PredictedPressurePPM {
 			out.BenefitPPM = current - out.PredictedPressurePPM
 		}
@@ -333,19 +350,29 @@ func strongestCelebrity(sketch *Sketch, sharePPM uint64) (heavyHitter, bool) {
 	return sketch.heavy[best], true
 }
 
-func isolationBoundaries(r distribution.KeyRange, point distribution.KeyspacePoint, out *[2]distribution.KeyspacePoint) uint8 {
+func isolationBoundaries(
+	r distribution.KeyRange,
+	bits uint8,
+	point distribution.KeyspacePoint,
+	out *[2]distribution.KeyspacePoint,
+) uint8 {
+	bucket, ok := distribution.VirtualBucketForPoint(point, bits)
+	if !ok {
+		return 0
+	}
+	bucketRange, ok := distribution.VirtualBucketRange(bucket, bits)
+	if !ok || !r.Contains(bucketRange.Start) {
+		return 0
+	}
 	n := uint8(0)
-	if distribution.ComparePoints(point, r.Start) > 0 {
-		out[n] = point
+	if distribution.ComparePoints(bucketRange.Start, r.Start) > 0 {
+		out[n] = bucketRange.Start
 		n++
 	}
-	value := pointUint64(point)
-	if value != math.MaxUint64 {
-		next := uint64Point(value + 1)
-		if r.End.Max || distribution.ComparePoints(next, r.End.Point) < 0 {
-			out[n] = next
-			n++
-		}
+	if !bucketRange.End.Max &&
+		(r.End.Max || distribution.ComparePoints(bucketRange.End.Point, r.End.Point) < 0) {
+		out[n] = bucketRange.End.Point
+		n++
 	}
 	return n
 }
@@ -386,6 +413,14 @@ func mulPPM(a, b uint64) uint64 {
 	}
 	q, _ := bits.Div64(hi, lo, PPM)
 	return q
+}
+
+func proportional(value, numerator, denominator uint64) uint64 {
+	if value == 0 || numerator == 0 || denominator == 0 {
+		return 0
+	}
+	quotient, remainder := value/denominator, value%denominator
+	return quotient*numerator + remainder*numerator/denominator
 }
 
 func saturatingPlainAdd(a, b uint64) uint64 {

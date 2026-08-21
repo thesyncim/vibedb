@@ -308,9 +308,10 @@ remain predictable because their capacities and fold work are fixed at open.
   both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
-  the embedded surface. It also documents that `autosplit` is a shadow-only
-  unwired recommender and that serving replication, failover, and online
-  movement are absent.
+  the embedded surface. It also documents the optional fixed-space hot-bucket
+  request recorder and generation-fenced desired split planner in `autosplit`;
+  no controller publishes those plans, and serving replication, failover, and
+  online movement remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and

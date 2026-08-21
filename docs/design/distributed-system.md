@@ -391,10 +391,16 @@ cluster does not fork into named protocol generations.
    also present. General hash/range join exchange follows, then runtime filters,
    batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.
-6. **Pending:** wire the existing Raft foundation into serving, enable
-   per-bucket telemetry, lease relocation, replica catch-up, hysteretic
-   split/move/merge rebalancing, and disaggregated immutable snapshot/cold-data
-   caching.
+6. **Partly present:** shard request completion can feed a striped fixed-space
+   recorder with exact virtual-bucket pressure, service-time, result-byte, and
+   fan-out evidence. Sustained decisions isolate no unit smaller than a virtual
+   bucket, and desired split manifests are fenced by source generation,
+   ownership epoch, bucket geometry, and lifetime allocation high-water.
+   Controller window publication and capacity feedback remain to be wired.
+   Serving Raft, certified snapshot/log catch-up, lease relocation, atomic
+   cutover/drain/retire, merge planning, and disaggregated immutable
+   snapshot/cold-data caching remain pending; no desired split is serving
+   authority until those gates pass.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

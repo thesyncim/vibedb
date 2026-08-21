@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/query"
@@ -152,6 +154,37 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 	if req.Exchange.present() {
 		return write(c.executeExchange(req))
 	}
+	if c.server.hotRecorder == nil {
+		return c.handleAdmitted(req, write)
+	}
+	started := time.Now()
+	var payloadBytes uint64
+	observed := false
+	observe := func() {
+		if observed {
+			return
+		}
+		observed = true
+		c.server.observeHotRequest(req, time.Since(started), payloadBytes)
+	}
+	observedWrite := func(resp *ShardResponse) error {
+		payloadBytes = saturatingPayloadAdd(payloadBytes, responsePayloadBytes(resp))
+		// Publish telemetry before the terminal frame becomes visible to the
+		// caller. A controller can therefore rotate after observing completion
+		// without moving this request into the following evidence window.
+		if resp == nil || resp.Kind != ResponseRowBatch || resp.RowBatch.Final {
+			observe()
+		}
+		return write(resp)
+	}
+	defer observe()
+	return c.handleAdmitted(req, observedWrite)
+}
+
+// handleAdmitted executes a non-exchange request after the static ownership
+// fence has accepted it. Keeping telemetry outside this function preserves the
+// original path for servers that do not opt into a recorder.
+func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse) error) error {
 	if err := c.ensureSession(); err != nil {
 		return write(classifyError(err))
 	}
@@ -224,6 +257,113 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 		return write(c.executeDocumentScan(req))
 	}
 	return c.execute(req, write)
+}
+
+// observeHotRequest attributes exact one-bucket work directly and distributes
+// work with unknown point locality across the fixed sketch. Resource totals
+// remain exact either way; bounded scopes independently retain split fan-out
+// evidence. The path allocates no maps, strings, or JSON values.
+func (s *Server) observeHotRequest(req *ShardRequest, elapsed time.Duration, payloadBytes uint64) {
+	recorder := s.hotRecorder
+	if recorder == nil || req == nil {
+		return
+	}
+	latency := clippedUint32(elapsed.Microseconds())
+	if latency == 0 {
+		latency = 1
+	}
+	load := autosplit.LoadVector{
+		autosplit.ResourceIO:          clippedUint32FromUint64(payloadBytes),
+		autosplit.ResourceRequests:    1,
+		autosplit.ResourceLatencyDebt: latency,
+	}
+	source := recorder.Source()
+	exact := len(req.AccessScopes) == 1 && req.BucketBits == source.BucketBits &&
+		req.AccessScopes[0].End == req.AccessScopes[0].Start+1
+	if exact {
+		bucketRange, ok := distribution.VirtualBucketRange(
+			distribution.VirtualBucket(req.AccessScopes[0].Start), req.BucketBits,
+		)
+		if ok && recorder.ObserveBucket(bucketRange.Start, load, latency, 1) {
+			return
+		}
+	}
+	if req.BucketBits != source.BucketBits || len(req.AccessScopes) == 0 {
+		recorder.ObserveUnknown(load, 1)
+		return
+	}
+	recorder.ObserveUniform(load)
+	for i := range req.AccessScopes {
+		start, end, ok := virtualBucketSpan(req.AccessScopes[i], req.BucketBits)
+		if !ok || !recorder.ObserveSpan(start, end, 1) {
+			recorder.ObserveUnbounded(1)
+		}
+	}
+}
+
+func virtualBucketSpan(
+	scope distributedtxn.IntentScope,
+	bits uint8,
+) (distribution.KeyspacePoint, distribution.KeyspaceEnd, bool) {
+	count := distribution.VirtualBucketCount(bits)
+	if scope.Start >= scope.End || scope.End > count {
+		return distribution.KeyspacePoint{}, distribution.KeyspaceEnd{}, false
+	}
+	first, ok := distribution.VirtualBucketRange(distribution.VirtualBucket(scope.Start), bits)
+	if !ok {
+		return distribution.KeyspacePoint{}, distribution.KeyspaceEnd{}, false
+	}
+	if scope.End == count {
+		return first.Start, distribution.KeyspaceEnd{Max: true}, true
+	}
+	after, ok := distribution.VirtualBucketRange(distribution.VirtualBucket(scope.End), bits)
+	if !ok {
+		return distribution.KeyspacePoint{}, distribution.KeyspaceEnd{}, false
+	}
+	return first.Start, distribution.KeyspaceEnd{Point: after.Start}, true
+}
+
+func responsePayloadBytes(resp *ShardResponse) uint64 {
+	if resp == nil {
+		return 0
+	}
+	var total uint64
+	for i := range resp.Columns {
+		total = saturatingPayloadAdd(total, uint64(len(resp.Columns[i].Name)))
+	}
+	for i := range resp.Rows {
+		for j := range resp.Rows[i] {
+			total = saturatingPayloadAdd(total, uint64(len(resp.Rows[i][j].Bytes)))
+		}
+	}
+	total = saturatingPayloadAdd(total, uint64(len(resp.ErrorMessage)))
+	total = saturatingPayloadAdd(total, uint64(len(resp.DocumentScan.Next)))
+	total = saturatingPayloadAdd(total, uint64(len(resp.Transaction.Record)))
+	return total
+}
+
+func saturatingPayloadAdd(left, right uint64) uint64 {
+	if ^uint64(0)-left < right {
+		return ^uint64(0)
+	}
+	return left + right
+}
+
+func clippedUint32(value int64) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(value)
+}
+
+func clippedUint32FromUint64(value uint64) uint32 {
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(value)
 }
 
 // executeRepartition runs a read-only shard fragment and pushes its rows

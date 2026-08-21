@@ -21,7 +21,7 @@ shard.
 | `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol; ordinary reads remain one frame, opted-in internal reads can use bounded sequence-checked row frames, and owner-fenced exchange commands provide retry-safe backpressure plus exact partition-local grouped reduction without generic JSON parsing |
 | `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, periodic durable coordinator redrive, byte-native grouped streaming, and memory-costed worker-to-worker hash repartition; general range/join exchange is not yet wired |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
-| `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
+| `autosplit` | Fixed-space striped request telemetry, sustained bucket-aligned recommendations, and allocation-high-water/generation-fenced desired split manifests; it cannot publish topology, copy state, catch up a destination, or move ownership |
 
 The repository also contains a non-serving Raft foundation: a pinned upstream
 Raft core, append-only static-base WAL, local replicated-apply state machine,
@@ -126,6 +126,26 @@ transaction participants bind those intervals into their mutation digest, and
 the shard's sorted interval index blocks only overlapping traffic. Direct
 requests with no interval remain whole-shard scoped and therefore fail safe.
 
+When a shard server is constructed with an `autosplit.Recorder`, request
+completion contributes exact request, response-byte, and service-time totals
+to one fixed-space striped window. A one-bucket access scope is attributed to
+that canonical virtual bucket; wider scopes retain boundary-crossing evidence,
+while missing or mismatched locality is retained as an exact separate total,
+projected proportionally only while costing boundaries, and charged as
+unbounded fan-out rather than inventing a hot key. Exchange-control traffic is
+excluded. The disabled default adds no recorder lock or clock read to ordinary
+requests. A terminal response is recorded before it becomes visible to the
+caller, so a concurrent window rotation cannot move a completed request into
+the next interval.
+
+Sustained evidence can produce either a bucket-aligned binary split or exact
+single-bucket isolation. `PlanSplit` then validates the full source allocation,
+routing version, ownership epoch, bucket geometry, and lifetime allocation
+high-water before constructing an immutable desired manifest. This is planning,
+not rebalancing: the returned manifest is not publishable until a separate data
+plane has installed a certified snapshot, applied the ordered mutation tail,
+closed the final source gap, and passed cutover validation.
+
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
 identity and exact scope validate, then releases in parallel. A writer holds its
@@ -206,9 +226,11 @@ return session positions, and the shard service refuses a minimum-position
 request before SQL execution.
 
 Ordinary catalog publication validates monotonic catalog, routing, allocation,
-range, leader, and ownership coordinates. There is no online range-movement
-workflow. Operators must not treat a catalog edit as a safe split, merge, move,
-or replica reconfiguration protocol.
+range, leader, and ownership coordinates. Desired split planning now applies
+the same generation and allocation-lineage fences, but there is no online
+range-movement executor. Operators must not publish its desired manifest or
+treat any catalog edit as a safe split, merge, move, or replica
+reconfiguration protocol.
 
 ## What is not implemented
 
@@ -219,7 +241,9 @@ or replica reconfiguration protocol.
 - follower/session reads or `ReadIndex` integration;
 - runtime Raft snapshots, WAL compaction, dynamic membership, or snapshot
   transfer;
-- online split, merge, move, catch-up, or topology recovery;
+- snapshot/catch-up/cutover execution for an online split, merge, move, or
+  topology recovery; bounded hot-bucket evidence and desired split planning do
+  exist, but confer no serving authority;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed
   reads; the current leader-only vector fence is ephemeral;
 - arbitrary distributed SQL transaction sessions and single-statement scatter

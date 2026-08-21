@@ -337,7 +337,7 @@ available.
 | Replicated client writes and automatic failover | Not available |
 | Runtime Raft snapshots, WAL compaction, and dynamic membership | Not available |
 | Follower/session reads, online movement, and backup/PITR orchestration | Not available |
-| Adaptive splitting | Shadow-only recommender; not wired to topology publication or data movement |
+| Hot-shard detection and split planning | Optional shard request completion records exact fixed-space per-bucket pressure and fan-out windows; sustained recommendations produce bucket-aligned, allocation-high-water and generation-fenced desired manifests. No controller publishes them and snapshot/catch-up/cutover data movement is not yet available |
 
 The tier is unreleased and unstable like the rest of VibeDB. The
 [capability matrix](docs/capabilities.md) covers the embedded surface only.

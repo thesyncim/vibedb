@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/query"
@@ -106,6 +107,12 @@ type Options struct {
 	// trusted control-plane boundary and may interpret addresses as endpoint IDs.
 	ExchangeDial ExchangeDialFunc
 
+	// HotRecorder is an optional fixed-space, striped observation window for
+	// this exact shard allocation. Its source identity is validated against
+	// Ownership before the database serving claim is acquired. Rotation and
+	// controller delivery remain the caller's responsibility.
+	HotRecorder *autosplit.Recorder
+
 	// OnError is called with every connection-terminating error, including the
 	// ordinary ones (a peer that closed its connection). It is the only logging
 	// hook. The connection is released before the hook runs, so it may
@@ -121,13 +128,14 @@ type ExchangeDialFunc func(ctx context.Context, address []byte) (net.Conn, error
 // A Server is a leader-only shard endpoint. It admits every request against one
 // static ownership identity and executes the admitted statement locally.
 type Server struct {
-	db         *sqldriver.Database
-	claim      *sqldriver.ShardStoreServingClaim
-	journal    *distributedtxn.Journal
-	readFences *readFenceSet
-	exchanges  *exchange.Registry
-	ownership  Ownership
-	opts       Options
+	db          *sqldriver.Database
+	claim       *sqldriver.ShardStoreServingClaim
+	journal     *distributedtxn.Journal
+	readFences  *readFenceSet
+	exchanges   *exchange.Registry
+	hotRecorder *autosplit.Recorder
+	ownership   Ownership
+	opts        Options
 
 	// baseCtx is the parent of every request context; cancel fires on Close so a
 	// graceful shutdown cancels in-flight executions rather than waiting them out.
@@ -159,6 +167,16 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 		cfg.Epoch == 0 || cfg.RoutingVersion == 0 {
 		return nil, errors.New(
 			"shardservice: ownership must name a non-empty distribution and shard with nonzero allocation generation, epoch, and routing version")
+	}
+	if opts.HotRecorder != nil {
+		source := opts.HotRecorder.Source()
+		if source.Distribution != cfg.Distribution || source.Shard != cfg.Shard ||
+			source.AllocationGeneration != cfg.AllocationGeneration ||
+			source.RoutingVersion != cfg.RoutingVersion ||
+			source.OwnershipEpoch != cfg.Epoch {
+			return nil, errors.New(
+				"shardservice: hot recorder source does not match the serving ownership identity")
+		}
 	}
 	if opts.MaxConnections < UnlimitedConnections {
 		return nil, fmt.Errorf("shardservice: MaxConnections must be >= %d", UnlimitedConnections)
@@ -245,13 +263,14 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 			MaxMailboxes:           opts.MaxExchangeMailboxes,
 			MaxReservedBufferBytes: opts.MaxExchangeBufferBytes,
 		}),
-		ownership: cfg,
-		opts:      opts,
-		baseCtx:   baseCtx,
-		cancel:    cancel,
-		conns:     map[net.Conn]struct{}{},
-		listeners: map[net.Listener]struct{}{},
-		closeDone: make(chan struct{}),
+		hotRecorder: opts.HotRecorder,
+		ownership:   cfg,
+		opts:        opts,
+		baseCtx:     baseCtx,
+		cancel:      cancel,
+		conns:       map[net.Conn]struct{}{},
+		listeners:   map[net.Listener]struct{}{},
+		closeDone:   make(chan struct{}),
 	}, nil
 }
 
