@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -8,6 +9,83 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 )
+
+// CertifiedRangeSplit is one independently prepared split result for a shared
+// catalog successor. Target changes exactly the partitioner's source shard.
+type CertifiedRangeSplit struct {
+	Target      *distribution.Manifest
+	Partitioner *rangesplit.Partitioner
+	Certificate rangesplit.CutoverCertificate
+	Prune       rangesplit.RetainedPruneCursor
+}
+
+// BuildCertifiedRangeSplitBatch validates and composes disjoint range splits
+// prepared from one catalog generation. Splits may share a distribution when
+// their source allocations differ. The result remains unpublished; one later
+// durable and in-memory catalog CAS grants authority to the whole batch.
+func BuildCertifiedRangeSplitBatch(
+	current *Snapshot,
+	nextGeneration uint64,
+	splits []CertifiedRangeSplit,
+) (*Snapshot, error) {
+	if current == nil || current.Generation() == ^uint64(0) ||
+		nextGeneration != current.Generation()+1 || len(splits) == 0 ||
+		len(splits) > rangesplit.MaxComposedManifestSplits {
+		return nil, rangesplit.ErrManifestTransition
+	}
+	var order [rangesplit.MaxComposedManifestSplits]uint8
+	for index := range splits {
+		split := &splits[index]
+		if split.Target == nil || split.Partitioner == nil {
+			return nil, rangesplit.ErrManifestTransition
+		}
+		source, ok := current.Manifest(split.Target.Distribution())
+		if !ok {
+			return nil, rangesplit.ErrManifestTransition
+		}
+		if err := split.Partitioner.ValidatePublicationTransition(
+			source, split.Target, current.Generation(), nextGeneration,
+			split.Certificate, split.Prune,
+		); err != nil {
+			return nil, err
+		}
+		order[index] = uint8(index)
+	}
+	slices.SortFunc(order[:len(splits)], func(left, right uint8) int {
+		return cmp.Compare(
+			splits[left].Target.Distribution(), splits[right].Target.Distribution(),
+		)
+	})
+
+	var manifests [rangesplit.MaxComposedManifestSplits]*distribution.Manifest
+	manifestCount := 0
+	for first := 0; first < len(splits); {
+		distributionName := splits[order[first]].Target.Distribution()
+		last := first + 1
+		for last < len(splits) &&
+			splits[order[last]].Target.Distribution() == distributionName {
+			last++
+		}
+		currentManifest, _ := current.Manifest(distributionName)
+		var transitions [rangesplit.MaxComposedManifestSplits]rangesplit.ManifestTransition
+		for index := first; index < last; index++ {
+			split := &splits[order[index]]
+			transitions[index-first] = rangesplit.ManifestTransition{
+				Partitioner: split.Partitioner, Target: split.Target,
+			}
+		}
+		combined, err := rangesplit.ComposeManifestTransitions(
+			currentManifest, transitions[:last-first],
+		)
+		if err != nil {
+			return nil, err
+		}
+		manifests[manifestCount] = combined
+		manifestCount++
+		first = last
+	}
+	return BuildManifestTransitions(current, manifests[:manifestCount], nextGeneration)
+}
 
 // BuildCertifiedRangeSplitTransition constructs an unpublished catalog
 // generation only after cutover, retained-source pruning, and the exact
@@ -52,7 +130,24 @@ func BuildManifestTransition(
 	nextManifest *distribution.Manifest,
 	nextGeneration uint64,
 ) (*Snapshot, error) {
-	if current == nil || nextManifest == nil {
+	if nextManifest == nil {
+		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
+	}
+	return BuildManifestTransitions(
+		current, []*distribution.Manifest{nextManifest}, nextGeneration,
+	)
+}
+
+// BuildManifestTransitions constructs one unpublished generation by replacing
+// multiple distinct distribution manifests in one catalog clone. Publication
+// still requires PublishAfter or SaveSnapshotAfter.
+func BuildManifestTransitions(
+	current *Snapshot,
+	nextManifests []*distribution.Manifest,
+	nextGeneration uint64,
+) (*Snapshot, error) {
+	if current == nil || len(nextManifests) == 0 ||
+		len(nextManifests) > len(current.config.Manifests) {
 		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
 	}
 	if nextGeneration <= current.generation {
@@ -62,20 +157,34 @@ func BuildManifestTransition(
 		)
 	}
 	config := cloneConfig(current.config)
-	found := false
-	for i := range config.Manifests {
-		if config.Manifests[i].Distribution() != nextManifest.Distribution() {
-			continue
+	for transition := range nextManifests {
+		nextManifest := nextManifests[transition]
+		if nextManifest == nil {
+			return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
 		}
-		config.Manifests[i] = nextManifest
-		found = true
-		break
-	}
-	if !found {
-		return nil, &CatalogError{Reason: fmt.Sprintf(
-			"manifest transition references unknown distribution %q",
-			nextManifest.Distribution(),
-		)}
+		for prior := 0; prior < transition; prior++ {
+			if nextManifests[prior].Distribution() == nextManifest.Distribution() {
+				return nil, &CatalogError{Reason: fmt.Sprintf(
+					"manifest transition repeats distribution %q",
+					nextManifest.Distribution(),
+				)}
+			}
+		}
+		found := false
+		for i := range config.Manifests {
+			if config.Manifests[i].Distribution() != nextManifest.Distribution() {
+				continue
+			}
+			config.Manifests[i] = nextManifest
+			found = true
+			break
+		}
+		if !found {
+			return nil, &CatalogError{Reason: fmt.Sprintf(
+				"manifest transition references unknown distribution %q",
+				nextManifest.Distribution(),
+			)}
+		}
 	}
 	indexes := current.indexDescriptors()
 	statistics := current.statistics.Descriptors()

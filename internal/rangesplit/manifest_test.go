@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 )
 
@@ -72,4 +73,143 @@ func TestValidateManifestTransitionChangesOnlyExactSource(t *testing.T) {
 	if err := partitioner.ValidateManifestTransition(wrongCurrent, plan.Manifest()); !errors.Is(err, ErrManifestTransition) {
 		t.Fatalf("wrong source error=%v", err)
 	}
+}
+
+func TestComposeManifestTransitionsBatchesDisjointSources(t *testing.T) {
+	middle := distribution.KeyspacePoint{0x80}
+	current, err := distribution.NewManifest("orders", 11, []distribution.Shard{
+		{
+			ID: "left", AllocationGeneration: 1,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Point: middle}},
+			Leaders: []distribution.EndpointID{"node-a"}, Epoch: 3,
+		},
+		{
+			ID: "right", AllocationGeneration: 2,
+			Range:   distribution.KeyRange{Start: middle, End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{"node-b"}, Epoch: 5,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftPlan := composedSplitPlan(
+		t, current, "left", 1,
+		distribution.KeyRange{End: distribution.KeyspaceEnd{Point: middle}},
+		3, distribution.KeyspacePoint{0x40}, "left-tail", 3, "node-c",
+	)
+	rightPlan := composedSplitPlan(
+		t, current, "right", 2,
+		distribution.KeyRange{Start: middle, End: distribution.KeyspaceEnd{Max: true}},
+		5, distribution.KeyspacePoint{0xc0}, "right-tail", 4, "node-d",
+	)
+	left, err := NewPartitioner(
+		leftPlan, "docs", []string{"/tenant"}, distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := NewPartitioner(
+		rightPlan, "docs", []string{"/tenant"}, distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitions := []ManifestTransition{
+		{Partitioner: right, Target: rightPlan.Manifest()},
+		{Partitioner: left, Target: leftPlan.Manifest()},
+	}
+	combined, err := ComposeManifestTransitions(current, transitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if combined.Version() != 12 || combined.ShardCount() != 4 {
+		t.Fatalf("combined version/shards = %d/%d", combined.Version(), combined.ShardCount())
+	}
+	want := [...]distribution.ShardID{"left", "left-tail", "right", "right-tail"}
+	for ordinal := range want {
+		metadata, ok := combined.ShardMetadataAt(ordinal)
+		if !ok || metadata.ID != want[ordinal] {
+			t.Fatalf("combined shard %d = %+v, ok=%v, want %q", ordinal, metadata, ok, want[ordinal])
+		}
+	}
+	if err := left.ValidatePublishedManifestTransition(current, combined); err != nil {
+		t.Fatalf("left published recognition = %v", err)
+	}
+	if err := right.ValidatePublishedManifestTransition(current, combined); err != nil {
+		t.Fatalf("right published recognition = %v", err)
+	}
+	if allocations := testing.AllocsPerRun(1_000, func() {
+		if err := left.ValidatePublishedManifestTransition(current, combined); err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("published split recognition allocations = %v, want 0", allocations)
+	}
+	changed := make([]distribution.Shard, combined.ShardCount())
+	for ordinal := range changed {
+		changed[ordinal], _ = combined.ShardInfo(ordinal)
+	}
+	changed[1].Epoch++
+	changedCombined, err := distribution.NewManifest(
+		combined.Distribution(), combined.Version(), changed,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := left.ValidatePublishedManifestTransition(
+		current, changedCombined,
+	); !errors.Is(err, ErrManifestTransition) {
+		t.Fatalf("changed published child error = %v", err)
+	}
+
+	if _, err := ComposeManifestTransitions(current, []ManifestTransition{
+		{Partitioner: left, Target: leftPlan.Manifest()},
+		{Partitioner: left, Target: leftPlan.Manifest()},
+	}); !errors.Is(err, ErrManifestTransition) {
+		t.Fatalf("duplicate source error = %v", err)
+	}
+	if _, err := ComposeManifestTransitions(current, []ManifestTransition{
+		{Partitioner: left, Target: rightPlan.Manifest()},
+	}); !errors.Is(err, ErrManifestTransition) {
+		t.Fatalf("mismatched target error = %v", err)
+	}
+}
+
+func composedSplitPlan(
+	t testing.TB,
+	current *distribution.Manifest,
+	shard distribution.ShardID,
+	allocation distribution.ShardAllocationGeneration,
+	range_ distribution.KeyRange,
+	epoch distribution.OwnershipEpoch,
+	boundary distribution.KeyspacePoint,
+	destination distribution.ShardID,
+	destinationAllocation distribution.ShardAllocationGeneration,
+	destinationLeader distribution.EndpointID,
+) *autosplit.SplitPlan {
+	t.Helper()
+	source := autosplit.SourceIdentity{
+		Distribution: current.Distribution(), Shard: shard,
+		AllocationGeneration: allocation, Range: range_,
+		BucketBits:     distribution.DefaultVirtualBucketBits,
+		RoutingVersion: current.Version(), OwnershipEpoch: epoch,
+	}
+	plan, err := autosplit.PlanSplit(current, autosplit.SplitRequest{
+		Recommendation: autosplit.Recommendation{
+			Source: source, WindowSequence: 1, Kind: autosplit.RecommendationBinarySplit,
+			Boundaries: [2]distribution.KeyspacePoint{boundary}, BoundaryCount: 1,
+			CandidateBin: 32, CurrentPressurePPM: 950_000,
+			PredictedPressurePPM: 700_000, BenefitPPM: 250_000,
+		},
+		RetainChild: 0, NextRoutingVersion: current.Version() + 1,
+		AllocationHighWater: destinationAllocation - 1,
+		Destinations: []autosplit.Destination{{
+			Shard: destination, AllocationGeneration: destinationAllocation,
+			Leaders: []distribution.EndpointID{destinationLeader}, OwnershipEpoch: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }

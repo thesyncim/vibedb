@@ -42,6 +42,12 @@ most three child ranges. One child keeps the source allocation. The target
 routing version must be the exact successor because the ownership seal advances
 all mutable coordinates once.
 
+The target manifest is a copy-on-write successor: it keeps new contiguous
+shard and range-start arrays for the routing hot path, shares only immutable
+backing from untouched shards, and defensively copies the replacement children.
+The bounded replacement validates coverage, adjacency, IDs, allocation
+generations, and endpoints without a hash map or per-untouched-shard clone.
+
 `internal/rangesplit` implements the non-serving data plane for that plan. It
 uses one source scan and one compiled `vibejson` index per row. It sends each
 borrowed key and document to one child and can skip the retained child copy.
@@ -129,6 +135,42 @@ unsealed source. Child activation, WAL creation, and runtime adoption use one
 monotonic phase byte, so skipped phases and premature later-phase evidence fail
 closed.
 
+Up to 64 disjoint splits prepared from the same catalog generation can share
+one successor publication. Each certificate, retained-image proof, and exact
+one-source manifest transition is validated independently before composition.
+Distinct sources in the same distribution are merged in range order; distinct
+distributions are replaced in one catalog clone. Duplicate sources, allocation
+identity collisions, skipped generations, or stale proofs fail before the
+single catalog CAS. This permits parallel hot-shard data preparation without
+serial full-catalog rebuilds or weakened cutover fencing.
+
+Before preparation, `internal/topologyscheduler` can select a bounded cut from
+as many as 4,096 hot-range recommendations. Selection reuses an 8 KiB
+caller-owned workspace, allocates no heap memory on the warm path, and returns
+only fixed-width candidate ordinals. It requires the exact catalog generation
+and exact current source allocation, using an O(log shard-count) range-index
+lookup. Deterministic priority favors benefit and pressure, then lower movement
+cost; policy caps the batch, each distribution's share, and aggregate migration
+bytes.
+
+This admission cut never groups work by tenant. The range allocation is the
+scheduling and fencing unit, while virtual-bucket mapping permits one tenant's
+data to span physical shards when its placement key has sufficient entropy or
+additional placement fields. `BuildSplitPlanBatch` binds selected ordinals to
+caller-prepared destinations only after it rechecks the catalog cut, exact
+source allocation, durable per-distribution allocation high-water, endpoint
+directory, and cross-plan identity uniqueness. It does not assign those
+resources or publish topology. Placement reservations and every later data
+proof remain separate prerequisites.
+
+The scheduler's optional 1,024-entry feedback table prevents the same exact
+source incarnation from being admitted while work is in flight. Retryable
+outcomes use capped exponential delay measured in new evidence windows, not
+wall time. The fixed-width fingerprint table has a compact open-addressed index
+and stores no topology strings. It is advisory, single-owner state: restart
+safety still comes from durable child/capture proofs and exact generation
+fences, not from recovering this table.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -145,6 +187,7 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

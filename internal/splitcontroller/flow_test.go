@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
@@ -210,6 +211,19 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	next, err := plan.BuildCatalogTransition(catalog, certificate, prune)
 	if err != nil {
 		t.Fatal(err)
+	}
+	batched, err := gateway.BuildCertifiedRangeSplitBatch(
+		catalog, 20, []gateway.CertifiedRangeSplit{{
+			Target: split.Manifest(), Partitioner: plan.partitioner,
+			Certificate: certificate, Prune: prune,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchedManifest, ok := batched.Manifest(split.Source.Distribution)
+	if !ok || !batchedManifest.Equal(split.Manifest()) {
+		t.Fatal("certified batch did not publish the exact split manifest")
 	}
 	observed.Catalog = next
 	assertFlowAction(t, plan, observed, ActionAwaitCatalogDrain)

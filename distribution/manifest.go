@@ -5,6 +5,9 @@ import (
 	"strings"
 )
 
+// MaxManifestReplacementShards bounds one copy-on-write manifest edit.
+const MaxManifestReplacementShards = 64
+
 // Shard is one physical shard: a unique id, the half-open keyspace range it
 // owns, at least one leader endpoint, and the ownership epoch that fences its
 // writers. It is the input record to NewManifest; a validated Manifest holds
@@ -127,6 +130,92 @@ func NewManifest(distribution DistributionName, version RoutingVersion, shards [
 	}, nil
 }
 
+// ReplaceShard constructs an immutable manifest by replacing exactly one
+// active shard with an ordered, gap-free partition of that shard's range.
+// Untouched shard identity and leader storage is safely shared with m because
+// manifests expose no mutators; replacement inputs are defensively cloned.
+// Validation is allocation-free before the two successor arrays are created.
+func (m *Manifest) ReplaceShard(
+	ordinal int,
+	version RoutingVersion,
+	replacements []Shard,
+) (*Manifest, error) {
+	if m == nil || ordinal < 0 || ordinal >= len(m.shards) ||
+		len(replacements) == 0 || len(replacements) > MaxManifestReplacementShards {
+		return nil, &ManifestError{Reason: "invalid bounded shard replacement"}
+	}
+	if len(replacements)-1 > int(^uint(0)>>1)-len(m.shards) {
+		return nil, &ManifestError{Reason: "shard replacement exceeds platform capacity"}
+	}
+	source := &m.shards[ordinal]
+	if replacements[0].Range.Start != source.Range.Start ||
+		replacements[len(replacements)-1].Range.End != source.Range.End {
+		return nil, &ManifestError{Reason: "replacement does not cover the source range"}
+	}
+	for index := range replacements {
+		replacement := &replacements[index]
+		if replacement.ID == "" || replacement.AllocationGeneration == 0 ||
+			!replacement.Range.Valid() || len(replacement.Leaders) == 0 {
+			return nil, &ManifestError{Reason: "invalid replacement shard"}
+		}
+		for _, endpoint := range replacement.Leaders {
+			if endpoint == "" {
+				return nil, &ManifestError{Reason: "replacement shard has an empty leader endpoint"}
+			}
+		}
+		if index > 0 {
+			prior := &replacements[index-1]
+			if prior.Range.End.Max || prior.Range.End.Point != replacement.Range.Start {
+				return nil, &ManifestError{Reason: "replacement shard ranges are not adjacent"}
+			}
+		}
+		for prior := 0; prior < index; prior++ {
+			if replacement.ID == replacements[prior].ID {
+				return nil, &ManifestError{Reason: "duplicate replacement shard id"}
+			}
+			if replacement.AllocationGeneration == replacements[prior].AllocationGeneration {
+				return nil, &ManifestError{Reason: "duplicate replacement allocation generation"}
+			}
+		}
+		for active := range m.shards {
+			if active == ordinal {
+				continue
+			}
+			if replacement.ID == m.shards[active].ID {
+				return nil, &ManifestError{Reason: "replacement reuses an active shard id"}
+			}
+			if replacement.AllocationGeneration == m.shards[active].AllocationGeneration {
+				return nil, &ManifestError{Reason: "replacement reuses an active allocation generation"}
+			}
+		}
+	}
+
+	shards := make([]Shard, len(m.shards)+len(replacements)-1)
+	copy(shards, m.shards[:ordinal])
+	for index := range replacements {
+		shards[ordinal+index] = cloneManifestShard(replacements[index])
+	}
+	copy(shards[ordinal+len(replacements):], m.shards[ordinal+1:])
+	starts := make([]KeyspacePoint, len(shards))
+	for index := range shards {
+		starts[index] = shards[index].Range.Start
+	}
+	return &Manifest{
+		distribution: m.distribution, version: version,
+		shards: shards, starts: starts,
+	}, nil
+}
+
+func cloneManifestShard(shard Shard) Shard {
+	clone := shard
+	clone.ID = ShardID(strings.Clone(string(shard.ID)))
+	clone.Leaders = make([]EndpointID, len(shard.Leaders))
+	for index := range shard.Leaders {
+		clone.Leaders[index] = EndpointID(strings.Clone(string(shard.Leaders[index])))
+	}
+	return clone
+}
+
 // Distribution reports the distribution this manifest routes.
 func (m *Manifest) Distribution() DistributionName { return m.distribution }
 
@@ -159,6 +248,31 @@ func (m *Manifest) ShardMetadataAt(i int) (ShardMetadata, bool) {
 		Range: shard.Range, Epoch: shard.Epoch,
 		LeaderCount: len(shard.Leaders),
 	}, true
+}
+
+// ShardMetadataForRange returns allocation-free scalar metadata when r is the
+// exact range of one active shard. The lookup is O(log shard_count) over the
+// manifest's immutable range-start index; overlapping or stale range geometry
+// does not match.
+func (m *Manifest) ShardMetadataForRange(r KeyRange) (ShardMetadata, bool) {
+	index, ok := m.ShardOrdinalForRange(r)
+	if !ok {
+		return ShardMetadata{}, false
+	}
+	return m.ShardMetadataAt(index)
+}
+
+// ShardOrdinalForRange returns the ordinal of the active shard whose range is
+// exactly r. The ordinal is meaningful only for this immutable manifest.
+func (m *Manifest) ShardOrdinalForRange(r KeyRange) (int, bool) {
+	if m == nil || !r.Valid() {
+		return 0, false
+	}
+	index := m.searchStart(r.Start)
+	if index < 0 || m.shards[index].Range != r {
+		return 0, false
+	}
+	return index, true
 }
 
 // SameShardLeaders reports whether shard i and other's shard j have the exact

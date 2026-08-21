@@ -2,10 +2,13 @@ package autosplit
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
 )
+
+var splitPlanBenchmarkSink *SplitPlan
 
 func TestPlanSplitBuildsBucketAlignedGenerationFencedManifest(t *testing.T) {
 	current := actionManifest(t)
@@ -166,6 +169,52 @@ func TestPlanSplitRejectsUnalignedSourceGeometry(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidSplit) {
 		t.Fatalf("PlanSplit error = %v, want ErrInvalidSplit", err)
+	}
+}
+
+func BenchmarkPlanSplitLargeManifest(b *testing.B) {
+	const shardCount = 1024
+	shards := make([]distribution.Shard, shardCount)
+	for index := range shards {
+		keyRange := distribution.KeyRange{Start: testPoint(uint64(index) << 54)}
+		if index == shardCount-1 {
+			keyRange.End.Max = true
+		} else {
+			keyRange.End.Point = testPoint(uint64(index+1) << 54)
+		}
+		shards[index] = distribution.Shard{
+			ID:                   distribution.ShardID("s-" + strconv.Itoa(index)),
+			AllocationGeneration: distribution.ShardAllocationGeneration(index + 1),
+			Range:                keyRange, Leaders: []distribution.EndpointID{"node-a"}, Epoch: 1,
+		}
+	}
+	manifest, err := distribution.NewManifest("d", 11, shards)
+	if err != nil {
+		b.Fatal(err)
+	}
+	sourceShard, _ := manifest.ShardInfo(shardCount - 1)
+	source := SourceIdentity{
+		Distribution: manifest.Distribution(), Shard: sourceShard.ID,
+		AllocationGeneration: sourceShard.AllocationGeneration, Range: sourceShard.Range,
+		BucketBits:     distribution.DefaultVirtualBucketBits,
+		RoutingVersion: manifest.Version(), OwnershipEpoch: sourceShard.Epoch,
+	}
+	request := SplitRequest{
+		Recommendation: testBinaryRecommendation(source, 1, 32), RetainChild: 0,
+		NextRoutingVersion:  manifest.Version() + 1,
+		AllocationHighWater: shardCount,
+		Destinations: []Destination{{
+			Shard: "new", AllocationGeneration: shardCount + 1,
+			Leaders: []distribution.EndpointID{"node-b"}, OwnershipEpoch: 1,
+		}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		splitPlanBenchmarkSink, err = PlanSplit(manifest, request)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

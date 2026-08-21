@@ -118,6 +118,11 @@ type Recommendation struct {
 	MigrationTaxPPM      uint64
 }
 
+// Actionable reports whether the recommendation carries one complete split
+// geometry accepted by PlanSplit. It performs no allocation and grants no
+// topology authority.
+func (r Recommendation) Actionable() bool { return actionableRecommendation(r) }
+
 // Recommend evaluates every compact boundary with a dominant-resource
 // counterfactual. The source identity comes only from the fenced sketch, so a
 // caller cannot relabel stale evidence as a newer ownership incarnation. It is

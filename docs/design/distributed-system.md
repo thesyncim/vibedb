@@ -101,11 +101,44 @@ The `autosplit` package records fixed-memory pressure evidence and recommends a
 bucket boundary. `PlanSplit` validates a desired manifest with at most three
 children.
 
+`internal/topologyscheduler` admits up to 4,096 recommendations with one
+caller-owned 8 KiB workspace and returns at most 64 candidate ordinals in a
+fixed-size decision. The hot path is allocation-free. Every recommendation is
+fenced to the exact catalog generation and exact source allocation; source
+range lookup uses the manifest's immutable O(log shard-count) start index.
+Priority is deterministic and fixed-point. Policy bounds minimum benefit,
+concurrent splits per distribution, total batch size, and estimated migration
+bytes so one hot keyspace cannot consume the entire publication cut.
+
+The scheduling unit is a physical range allocation, not a tenant. Tenant keys
+continue to map through virtual buckets and may occupy ranges on many shards.
+Admission returns indices only. `BuildSplitPlanBatch` can then bind them to
+caller-prepared destinations while rechecking the same catalog and source
+fences, the durable allocation high-water, endpoint membership, and resource
+uniqueness across the batch. Allocation namespaces remain per distribution.
+The handoff still does not choose destination members, reserve identities,
+move data, execute a controller action, or grant catalog authority.
+
+A single-owner fixed-memory feedback table can suppress duplicate in-flight
+work and apply capped exponential retry delay in source evidence windows. Its
+1,024 entries use fixed-width source fingerprints plus a compact open-addressed
+index; the table retains no topology strings and the warm admission path still
+allocates nothing. Feedback is deliberately advisory and need not survive a
+crash. Durable split artifacts, controller reconstruction, and catalog/source
+generation checks remain the authority after restart.
+
 `PlanSplit` does not move data or publish the catalog. The internal
 `rangesplit` package can populate non-retained child images from one source
 scan. It uses compiled `vibejson` placement and deterministic hash-chained
 artifacts. Verification checks key order and document placement before it
 exposes a complete chunk.
+
+Split planning constructs its target manifest copy-on-write. It allocates new
+contiguous shard and range-start arrays for fast routing, structurally shares
+immutable identity and leader backing for untouched shards, and defensively
+copies only the replacement children. The edit revalidates exact source-range
+coverage, adjacency, IDs, allocation generations, and endpoints without a map
+or per-unchanged-shard allocation.
 
 The range-split tail translator binds the exact source applied position, term,
 last-entry digest, logical digest, and snapshot base. It parses each before and
@@ -177,6 +210,11 @@ The reconciler treats a captured source ahead of its tail cursor as catch-up,
 including the crash window after the ownership seal applies but before that
 seal reaches every child stage. Child progress is a single monotonic phase,
 not independent booleans; skipped phases and premature evidence are rejected.
+Certified disjoint splits may prepare concurrently against one source catalog
+and publish as one bounded successor batch. Every split retains its own data
+proofs; composition only removes repeated catalog cloning and CAS contention.
+The batch accepts distinct source allocations within one distribution as well
+as independent distributions.
 The repository still has no runnable automatic split controller or merge
 planner.
 
@@ -205,6 +243,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`
 - `shardservice/admit.go`, `read_fence.go`, and `server.go`
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
