@@ -1,20 +1,11 @@
-# Development format 0 goldens
+# Development format 0 golden images
 
-These fixtures are sparse hexadecimal renderings of complete byte images.
-The `size` line fixes the image length, each following line gives a hexadecimal
-offset and byte string, and every byte not named by a line is authoritatively
-zero.
+These files are byte-exact fixtures for the current unreleased on-disk format.
+They are not a compatibility promise.
 
-`TestFormat0PrintGolden` regenerates the text from public encoders without
-writing the fixture. For example:
+When a codec change is intentional, regenerate or replace the affected fixture
+and update its test oracle. Keep malformed old layouts rejected. Do not add a
+compatibility branch for an obsolete development image.
 
-```sh
-STOREIO_FORMAT0_GOLDEN=empty_inline_superblock \
-  go test ./internal/storeio -run '^TestFormat0PrintGolden$' -count=1 -v
-```
-
-`sealed_inline_superblock` pins the non-zero main-file physical-capacity field
-and its enclosing inline-root checksum.
-
-Changing a fixture is an intentional on-disk format change and should be
-reviewed byte-for-byte.
+See `docs/format.md` for the readable format map. The codecs and validation in
+`internal/storeio` are authoritative.
