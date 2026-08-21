@@ -184,7 +184,7 @@ review rules.
 | PostgreSQL protocol | `pgwire` |
 | Static distributed runtime | `distribution`, `gateway`, `shardservice` |
 | Replication kernel | `internal/raft*`, `internal/multiraft`, `internal/replicatedstate` |
-| Range-split kernel | `autosplit`, `internal/rangesplit`, `internal/splitcontroller` |
+| Range-split kernel | `autosplit`, `internal/topologyscheduler`, `internal/rangesplit`, `internal/splitcontroller` |
 
 ## Implementation references
 
@@ -194,6 +194,7 @@ review rules.
 - `gateway/executor.go` and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
+- `internal/topologyscheduler/admission.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, `stage.go`, and
   `source_capture.go`
 - `internal/rangesplit/cutover.go`

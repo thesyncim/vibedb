@@ -70,6 +70,28 @@ func TestManifestShardMetadataAt(t *testing.T) {
 	}
 }
 
+func TestManifestShardMetadataForRange(t *testing.T) {
+	manifest := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
+	want, _ := manifest.ShardMetadataAt(1)
+	if got, ok := manifest.ShardMetadataForRange(want.Range); !ok || got != want {
+		t.Fatalf("ShardMetadataForRange = %+v, %v; want %+v, true", got, ok, want)
+	}
+
+	wrongEnd := want.Range
+	wrongEnd.End = KeyspaceEnd{Point: pt(hb(0xf0))}
+	wrongStart := want.Range
+	wrongStart.Start = pt(hb(0x90))
+	for _, keyRange := range []KeyRange{wrongEnd, wrongStart, {}} {
+		if got, ok := manifest.ShardMetadataForRange(keyRange); ok || got != (ShardMetadata{}) {
+			t.Errorf("ShardMetadataForRange(%+v) = %+v, %v; want zero, false", keyRange, got, ok)
+		}
+	}
+	var nilManifest *Manifest
+	if got, ok := nilManifest.ShardMetadataForRange(want.Range); ok || got != (ShardMetadata{}) {
+		t.Errorf("nil ShardMetadataForRange = %+v, %v; want zero, false", got, ok)
+	}
+}
+
 func TestManifestSameShardLeaders(t *testing.T) {
 	base := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
 	equal := manifestForMetadataTest(t, "dist", 7, cloneMetadataTestShards())
@@ -222,9 +244,11 @@ func TestManifestEqualSemanticIdentity(t *testing.T) {
 func TestManifestInspectionZeroAlloc(t *testing.T) {
 	left := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
 	right := manifestForMetadataTest(t, "dist", 7, cloneMetadataTestShards())
+	metadataRange := metadataTestShards()[0].Range
 
 	// Warm each path before measuring so one-time runtime setup is excluded.
 	manifestMetadataSink, manifestBoolSink = left.ShardMetadataAt(0)
+	manifestMetadataSink, manifestBoolSink = left.ShardMetadataForRange(metadataRange)
 	manifestBoolSink = left.SameShardLeaders(0, right, 0)
 	manifestBoolSink = left.Equal(right)
 
@@ -236,6 +260,12 @@ func TestManifestInspectionZeroAlloc(t *testing.T) {
 			name: "metadata",
 			run: func() {
 				manifestMetadataSink, manifestBoolSink = left.ShardMetadataAt(0)
+			},
+		},
+		{
+			name: "metadata by exact range",
+			run: func() {
+				manifestMetadataSink, manifestBoolSink = left.ShardMetadataForRange(metadataRange)
 			},
 		},
 		{
@@ -268,6 +298,13 @@ func BenchmarkManifestAllocationFreeInspection(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			manifestMetadataSink, manifestBoolSink = left.ShardMetadataAt(0)
+		}
+	})
+	b.Run("metadata-by-exact-range", func(b *testing.B) {
+		keyRange := metadataTestShards()[0].Range
+		b.ReportAllocs()
+		for b.Loop() {
+			manifestMetadataSink, manifestBoolSink = left.ShardMetadataForRange(keyRange)
 		}
 	})
 	b.Run("leaders", func(b *testing.B) {

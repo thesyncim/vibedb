@@ -101,6 +101,22 @@ The `autosplit` package records fixed-memory pressure evidence and recommends a
 bucket boundary. `PlanSplit` validates a desired manifest with at most three
 children.
 
+`internal/topologyscheduler` admits up to 4,096 recommendations with one
+caller-owned 8 KiB workspace and returns at most 64 candidate ordinals in a
+fixed-size decision. The hot path is allocation-free. Every recommendation is
+fenced to the exact catalog generation and exact source allocation; source
+range lookup uses the manifest's immutable O(log shard-count) start index.
+Priority is deterministic and fixed-point. Policy bounds minimum benefit,
+concurrent splits per distribution, total batch size, and estimated migration
+bytes so one hot keyspace cannot consume the entire publication cut.
+
+The scheduling unit is a physical range allocation, not a tenant. Tenant keys
+continue to map through virtual buckets and may occupy ranges on many shards.
+Admission returns indices only: it does not choose destination members, reserve
+allocation generations, move data, execute a controller action, or grant
+catalog authority. A placement owner must supply those independently fenced
+resources before `PlanSplit` and the proof pipeline can run.
+
 `PlanSplit` does not move data or publish the catalog. The internal
 `rangesplit` package can populate non-retained child images from one source
 scan. It uses compiled `vibejson` placement and deterministic hash-chained
@@ -210,6 +226,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`
 - `shardservice/admit.go`, `read_fence.go`, and `server.go`
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
+- `internal/topologyscheduler/admission.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

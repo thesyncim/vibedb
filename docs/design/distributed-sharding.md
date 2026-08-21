@@ -138,6 +138,22 @@ identity collisions, skipped generations, or stale proofs fail before the
 single catalog CAS. This permits parallel hot-shard data preparation without
 serial full-catalog rebuilds or weakened cutover fencing.
 
+Before preparation, `internal/topologyscheduler` can select a bounded cut from
+as many as 4,096 hot-range recommendations. Selection reuses an 8 KiB
+caller-owned workspace, allocates no heap memory on the warm path, and returns
+only fixed-width candidate ordinals. It requires the exact catalog generation
+and exact current source allocation, using an O(log shard-count) range-index
+lookup. Deterministic priority favors benefit and pressure, then lower movement
+cost; policy caps the batch, each distribution's share, and aggregate migration
+bytes.
+
+This admission cut never groups work by tenant. The range allocation is the
+scheduling and fencing unit, while virtual-bucket mapping permits one tenant's
+data to span physical shards when its placement key has sufficient entropy or
+additional placement fields. Selection does not assign child endpoints or
+allocation generations and does not publish topology. Those placement
+reservations and every later data proof remain separate prerequisites.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -154,6 +170,7 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
+- `internal/topologyscheduler/admission.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

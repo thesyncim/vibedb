@@ -161,6 +161,21 @@ func (m *Manifest) ShardMetadataAt(i int) (ShardMetadata, bool) {
 	}, true
 }
 
+// ShardMetadataForRange returns allocation-free scalar metadata when r is the
+// exact range of one active shard. The lookup is O(log shard_count) over the
+// manifest's immutable range-start index; overlapping or stale range geometry
+// does not match.
+func (m *Manifest) ShardMetadataForRange(r KeyRange) (ShardMetadata, bool) {
+	if m == nil || !r.Valid() {
+		return ShardMetadata{}, false
+	}
+	index := m.searchStart(r.Start)
+	if index < 0 || m.shards[index].Range != r {
+		return ShardMetadata{}, false
+	}
+	return m.ShardMetadataAt(index)
+}
+
 // SameShardLeaders reports whether shard i and other's shard j have the exact
 // same ordered leader identity without cloning either immutable slice.
 func (m *Manifest) SameShardLeaders(i int, other *Manifest, j int) bool {
