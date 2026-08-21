@@ -131,7 +131,8 @@ func (s *ChildStage) ArtifactComplete() bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cursor != nil && s.cursor.phase == ChildStageTail
+	return s.cursor != nil &&
+		(s.cursor.phase == ChildStageTail || s.cursor.phase == ChildStageSealed)
 }
 
 // ReceiveArtifact verifies one complete artifact stream. It skips callbacks
@@ -146,7 +147,8 @@ func (s *ChildStage) ReceiveArtifact(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cursor != nil && s.cursor.phase == ChildStageTail {
+	if s.cursor != nil &&
+		(s.cursor.phase == ChildStageTail || s.cursor.phase == ChildStageSealed) {
 		return s.expected, nil
 	}
 	working := s.initialCursor()
@@ -243,7 +245,8 @@ func (s *ChildStage) ApplyTailBatch(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cursor == nil || s.cursor.phase != ChildStageTail ||
+	if s.cursor == nil ||
+		(s.cursor.phase != ChildStageTail && s.cursor.phase != ChildStageSealed) ||
 		s.partitioner.VerifyTailBatch(batch, &s.tailVerify) != nil ||
 		batch.Child != s.expected.Child ||
 		batch.SourceBaseDigest != s.expected.Source.BaseDigest ||
@@ -256,15 +259,19 @@ func (s *ChildStage) ApplyTailBatch(
 			batch.Digest == current.lastBatchDigest && batch.Term == current.term &&
 			batch.EntryDigest == current.entryDigest &&
 			batch.AfterLogicalDigest == current.logicalDigest &&
-			batch.RouteGeneration == current.routeGeneration {
+			batch.AfterRouteGeneration == current.routeGeneration {
 			return nil
 		}
 		return ErrChildStage
 	}
+	if current.phase == ChildStageSealed {
+		return ErrChildStage
+	}
 	if current.applied == math.MaxUint64 || batch.Applied != current.applied+1 ||
-		batch.Term < current.term || batch.RouteGeneration != current.routeGeneration ||
+		batch.Term < current.term ||
 		batch.PreviousEntryDigest != current.entryDigest ||
-		batch.BeforeLogicalDigest != current.logicalDigest {
+		batch.BeforeLogicalDigest != current.logicalDigest ||
+		!s.validTailBatchCoordinates(batch, current.routeGeneration) {
 		return ErrChildStage
 	}
 	if err := s.applyTailOperations(batch); err != nil {
@@ -275,8 +282,31 @@ func (s *ChildStage) ApplyTailBatch(
 	next.term = batch.Term
 	next.entryDigest = batch.EntryDigest
 	next.logicalDigest = batch.AfterLogicalDigest
+	next.routeGeneration = batch.AfterRouteGeneration
 	next.lastBatchDigest = batch.Digest
+	if batch.beforeCoordinates() != batch.afterCoordinates() {
+		next.phase = ChildStageSealed
+	}
 	return s.persistCursor(&next, persist)
+}
+
+func (s *ChildStage) validTailBatchCoordinates(
+	batch TailBatch,
+	currentRouteGeneration uint64,
+) bool {
+	before, after := batch.beforeCoordinates(), batch.afterCoordinates()
+	if before.OwnershipEpoch != uint64(s.partitioner.source.OwnershipEpoch) ||
+		before.RoutingVersion != uint64(s.partitioner.source.RoutingVersion) ||
+		before.RouteGeneration != currentRouteGeneration {
+		return false
+	}
+	if after == before {
+		return true
+	}
+	retained := s.partitioner.children[s.partitioner.retained]
+	return before.incremented() == after && batch.TransitionCount == 0 &&
+		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
+		after.RoutingVersion == uint64(s.partitioner.target)
 }
 
 func (s *ChildStage) initialCursor() ChildStageCursor {
@@ -501,14 +531,14 @@ func childStageCursorMatchesExpected(
 		cursor.artifactDigest != expected.Digest ||
 		cursor.headerDigest != expected.HeaderDigest ||
 		cursor.baseDigest != expected.Source.BaseDigest ||
-		cursor.routeGeneration != expected.Source.RouteGeneration ||
 		cursor.artifactChunks > expected.Chunks || cursor.artifactRows > expected.Rows ||
 		cursor.artifactPayload > expected.PayloadBytes ||
 		cursor.artifactOffset > expected.EncodedBytes {
 		return false
 	}
 	if cursor.phase == ChildStageArtifact {
-		return cursor.applied == expected.Source.Applied &&
+		return cursor.routeGeneration == expected.Source.RouteGeneration &&
+			cursor.applied == expected.Source.Applied &&
 			cursor.term == expected.Source.Term &&
 			cursor.logicalDigest == expected.Source.LogicalDigest &&
 			cursor.entryDigest == expected.Source.EntryDigest &&
@@ -516,13 +546,22 @@ func childStageCursorMatchesExpected(
 			(cursor.artifactChunks != expected.Chunks ||
 				cursor.lastChunkDigest == expected.LastChunkDigest)
 	}
-	if cursor.phase != ChildStageTail ||
+	if cursor.phase != ChildStageTail && cursor.phase != ChildStageSealed ||
 		cursor.artifactChunks != expected.Chunks ||
 		cursor.artifactRows != expected.Rows ||
 		cursor.artifactPayload != expected.PayloadBytes ||
 		cursor.artifactOffset != expected.EncodedBytes ||
 		cursor.lastChunkDigest != expected.LastChunkDigest ||
 		cursor.applied < expected.Source.Applied || cursor.term < expected.Source.Term {
+		return false
+	}
+	if cursor.phase == ChildStageTail &&
+		cursor.routeGeneration != expected.Source.RouteGeneration {
+		return false
+	}
+	if cursor.phase == ChildStageSealed &&
+		(expected.Source.RouteGeneration == math.MaxUint64 ||
+			cursor.routeGeneration != expected.Source.RouteGeneration+1) {
 		return false
 	}
 	if cursor.applied == expected.Source.Applied {

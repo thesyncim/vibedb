@@ -55,6 +55,7 @@ type SourceCapture struct {
 	current     sourceCapturePublication
 	encode      SourceCaptureWorkspace
 	key         [8]byte
+	pending     uint64
 	begun       atomic.Bool
 	head        atomic.Uint64
 }
@@ -192,13 +193,14 @@ func (c *SourceCapture) AppendTransition(
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.begun.Load() || !c.transitionFollowsCurrent(transition) {
+	if !c.begun.Load() || c.pending != 0 || !c.transitionFollowsCurrent(transition) {
 		return dst, ErrSourceCapture
 	}
 	record, err := c.appendEntry(dst, transition, &c.encode)
 	if err != nil {
 		return dst, err
 	}
+	c.pending = transition.Applied
 	return record, nil
 }
 
@@ -209,10 +211,12 @@ func (c *SourceCapture) Published(transition replicatedstate.CapturedTransition)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.begun.Load() || !c.transitionFollowsCurrent(transition) {
+	if !c.begun.Load() || c.pending != transition.Applied ||
+		!c.transitionFollowsCurrent(transition) {
 		return ErrSourceCapture
 	}
 	c.current = publicationFromTransition(transition)
+	c.pending = 0
 	c.head.Store(transition.Applied)
 	return nil
 }
@@ -251,17 +255,24 @@ func (c *SourceCapture) NextTailEntry(
 	if err != nil || record.Applied != next ||
 		record.PreviousEntryDigest != cursor.entryDigest ||
 		record.BeforeLogicalDigest != cursor.logicalDigest ||
+		record.BeforeOwnershipEpoch != cursor.ownershipEpoch ||
+		record.BeforeRoutingVersion != cursor.routingVersion ||
 		record.BeforeRouteGeneration != cursor.routeGeneration {
 		return TailEntry{}, false, errors.Join(ErrSourceCapture, err)
 	}
 	entry := TailEntry{
 		Applied: record.Applied, Term: record.Term,
-		RouteGeneration:     record.AfterRouteGeneration,
-		PreviousEntryDigest: record.PreviousEntryDigest,
-		EntryDigest:         record.EntryDigest,
-		BeforeLogicalDigest: record.BeforeLogicalDigest,
-		AfterLogicalDigest:  record.AfterLogicalDigest,
-		Transitions:         record.Transitions,
+		BeforeOwnershipEpoch:  record.BeforeOwnershipEpoch,
+		AfterOwnershipEpoch:   record.AfterOwnershipEpoch,
+		BeforeRoutingVersion:  record.BeforeRoutingVersion,
+		AfterRoutingVersion:   record.AfterRoutingVersion,
+		BeforeRouteGeneration: record.BeforeRouteGeneration,
+		AfterRouteGeneration:  record.AfterRouteGeneration,
+		PreviousEntryDigest:   record.PreviousEntryDigest,
+		EntryDigest:           record.EntryDigest,
+		BeforeLogicalDigest:   record.BeforeLogicalDigest,
+		AfterLogicalDigest:    record.AfterLogicalDigest,
+		Transitions:           record.Transitions,
 	}
 	return entry, true, nil
 }

@@ -21,6 +21,11 @@ func TestInitialTailCursorRequiresCompleteExactArtifactSet(t *testing.T) {
 	cut := cursor.SourceCut()
 	if cursor.PlanDigest() != partitioner.Digest() ||
 		cursor.PlacementDigest() != partitioner.program.Digest() ||
+		cursor.SourceCoordinates() != (TailSourceCoordinates{
+			OwnershipEpoch:  uint64(partitioner.source.OwnershipEpoch),
+			RoutingVersion:  uint64(partitioner.source.RoutingVersion),
+			RouteGeneration: set.Partition.RouteGeneration,
+		}) || cursor.Sealed() ||
 		cut.Applied != set.Partition.SourceApplied ||
 		cut.Term != set.Partition.SourceTerm ||
 		cut.RouteGeneration != set.Partition.RouteGeneration ||
@@ -100,7 +105,7 @@ func TestTranslateTailEntryRoutesInsertDeleteUpdateAndMove(t *testing.T) {
 	assertTailOperations(t, got[1], wantRight)
 	cut := next.SourceCut()
 	if cut.Applied != entry.Applied || cut.Term != entry.Term ||
-		cut.RouteGeneration != entry.RouteGeneration ||
+		cut.RouteGeneration != entry.AfterRouteGeneration ||
 		cut.EntryDigest != entry.EntryDigest ||
 		cut.LogicalDigest != entry.AfterLogicalDigest ||
 		cut.BaseDigest != cursor.SourceCut().BaseDigest {
@@ -137,6 +142,42 @@ func TestTranslateTailEntryAdvancesEveryChildThroughEmptyEntry(t *testing.T) {
 		next.SourceCut().Applied != entry.Applied ||
 		stats.ChildDigests[0] == stats.ChildDigests[1] {
 		t.Fatalf("next=%+v stats=%+v seen=%v error=%v", next.SourceCut(), stats, seen, err)
+	}
+}
+
+func TestTranslateTailEntrySealsOnExactOwnershipFence(t *testing.T) {
+	partitioner, cursor, _ := testTailCursor(t)
+	entry := nextTailEntry(cursor, nil, 17)
+	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterOwnershipEpoch++
+	entry.AfterRoutingVersion++
+	entry.AfterRouteGeneration++
+	seen := 0
+	sinks := []TailSink{
+		func(batch TailBatch) error {
+			seen++
+			if batch.beforeCoordinates() == batch.afterCoordinates() || batch.Operations != 0 {
+				t.Fatalf("left seal batch=%+v", batch)
+			}
+			return nil
+		},
+		func(batch TailBatch) error {
+			seen++
+			if batch.beforeCoordinates() == batch.afterCoordinates() || batch.Operations != 0 {
+				t.Fatalf("right seal batch=%+v", batch)
+			}
+			return nil
+		},
+	}
+	var workspace TailWorkspace
+	sealed, _, err := partitioner.TranslateTailEntry(cursor, entry, sinks, &workspace)
+	if err != nil || seen != 2 || !sealed.Sealed() ||
+		sealed.SourceCoordinates() != entry.afterCoordinates() {
+		t.Fatalf("sealed=%+v seen=%d err=%v", sealed, seen, err)
+	}
+	postSeal := nextTailEntry(sealed, nil, 18)
+	if next, _, err := partitioner.TranslateTailEntry(sealed, postSeal, sinks, &workspace); !errors.Is(err, ErrTailEntry) || next != sealed {
+		t.Fatalf("post-seal next=%+v err=%v", next, err)
 	}
 }
 
@@ -192,7 +233,7 @@ func TestTranslateTailEntryFailsClosedAndLeavesCursorRetryable(t *testing.T) {
 	}{
 		{"applied-gap", func(entry *TailEntry) { entry.Applied++ }},
 		{"term-regression", func(entry *TailEntry) { entry.Term = cursor.SourceCut().Term - 1 }},
-		{"route-change", func(entry *TailEntry) { entry.RouteGeneration++ }},
+		{"route-change", func(entry *TailEntry) { entry.AfterRouteGeneration++ }},
 		{"previous-entry", func(entry *TailEntry) { entry.PreviousEntryDigest[0] ^= 1 }},
 		{"logical-prefix", func(entry *TailEntry) { entry.BeforeLogicalDigest[0] ^= 1 }},
 		{"nil-transition", func(entry *TailEntry) {
@@ -389,12 +430,17 @@ func nextTailEntry(cursor TailCursor, transitions []TailTransition, marker byte)
 	cut := cursor.SourceCut()
 	return TailEntry{
 		Applied: cut.Applied + 1, Term: cut.Term + 1,
-		RouteGeneration:     cut.RouteGeneration,
-		PreviousEntryDigest: cut.EntryDigest,
-		EntryDigest:         [32]byte{marker},
-		BeforeLogicalDigest: cut.LogicalDigest,
-		AfterLogicalDigest:  [32]byte{marker, 1},
-		Transitions:         transitions,
+		BeforeOwnershipEpoch:  cursor.ownershipEpoch,
+		AfterOwnershipEpoch:   cursor.ownershipEpoch,
+		BeforeRoutingVersion:  cursor.routingVersion,
+		AfterRoutingVersion:   cursor.routingVersion,
+		BeforeRouteGeneration: cursor.routeGeneration,
+		AfterRouteGeneration:  cursor.routeGeneration,
+		PreviousEntryDigest:   cut.EntryDigest,
+		EntryDigest:           [32]byte{marker},
+		BeforeLogicalDigest:   cut.LogicalDigest,
+		AfterLogicalDigest:    [32]byte{marker, 1},
+		Transitions:           transitions,
 	}
 }
 

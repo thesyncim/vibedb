@@ -140,8 +140,11 @@ rows and tail batches to one durable collection. It validates the complete
 artifact image before tail catch-up and persists a fixed-size cursor through an
 atomic file replacement on Unix. An optional replicated-state capture writes
 each exact before-and-after transition in the same durable
-transaction as its source publication. The package does not close the final
-write gap, prune the retained range, or publish topology.
+transaction as its source publication. A terminal ownership-fence entry must
+advance all mutable serving coordinates together; every child durably records
+its empty seal batch before a fixed-size cutover certificate can be issued.
+The certificate is evidence, not topology authority. The package does not
+prune the retained range or publish topology.
 
 ## External memory and unsafe code
 
@@ -178,4 +181,5 @@ review rules.
 - `autosplit/action.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, `stage.go`, and
   `source_capture.go`
+- `internal/rangesplit/cutover.go`
 - `internal/replicatedstate/capture.go`

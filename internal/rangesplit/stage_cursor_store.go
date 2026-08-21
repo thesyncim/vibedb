@@ -246,12 +246,14 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 		current.placementDigest != next.placementDigest ||
 		current.artifactDigest != next.artifactDigest ||
 		current.headerDigest != next.headerDigest ||
-		current.baseDigest != next.baseDigest ||
-		current.routeGeneration != next.routeGeneration {
+		current.baseDigest != next.baseDigest {
 		return false
 	}
 	switch current.phase {
 	case ChildStageArtifact:
+		if next.routeGeneration != current.routeGeneration {
+			return false
+		}
 		if next.phase == ChildStageArtifact {
 			return next.applied == current.applied && next.term == current.term &&
 				next.logicalDigest == current.logicalDigest &&
@@ -270,14 +272,24 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 			next.artifactPayload >= current.artifactPayload &&
 			next.artifactOffset > current.artifactOffset
 	case ChildStageTail:
-		return next.phase == ChildStageTail && current.applied != ^uint64(0) &&
-			next.applied == current.applied+1 && next.term >= current.term &&
-			next.artifactChunks == current.artifactChunks &&
-			next.artifactRows == current.artifactRows &&
-			next.artifactPayload == current.artifactPayload &&
-			next.artifactOffset == current.artifactOffset &&
-			next.lastChunkDigest == current.lastChunkDigest &&
-			next.lastBatchDigest != ([32]byte{})
+		if current.applied == ^uint64(0) ||
+			(next.phase != ChildStageTail && next.phase != ChildStageSealed) ||
+			next.applied != current.applied+1 || next.term < current.term ||
+			next.artifactChunks != current.artifactChunks ||
+			next.artifactRows != current.artifactRows ||
+			next.artifactPayload != current.artifactPayload ||
+			next.artifactOffset != current.artifactOffset ||
+			next.lastChunkDigest != current.lastChunkDigest ||
+			next.lastBatchDigest == ([32]byte{}) {
+			return false
+		}
+		if next.phase == ChildStageTail {
+			return next.routeGeneration == current.routeGeneration
+		}
+		return current.routeGeneration != ^uint64(0) &&
+			next.routeGeneration == current.routeGeneration+1
+	case ChildStageSealed:
+		return false
 	default:
 		return false
 	}

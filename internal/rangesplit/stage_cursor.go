@@ -30,6 +30,9 @@ const (
 	// ChildStageTail means that the complete artifact is validated and the
 	// cursor can advance through translated source entries.
 	ChildStageTail
+	// ChildStageSealed means that the terminal ownership-fence entry is durable.
+	// No later tail entry is accepted.
+	ChildStageSealed
 )
 
 // ChildStageCursor is a constant-size authenticated destination progress
@@ -240,9 +243,12 @@ func validateChildStageCursor(cursor *ChildStageCursor) error {
 			cursor.lastBatchDigest != ([sha256.Size]byte{}) {
 			return fmt.Errorf("%w: artifact cursor", ErrChildStage)
 		}
-	case ChildStageTail:
+	case ChildStageTail, ChildStageSealed:
 		if cursor.artifactOffset == 0 {
 			return fmt.Errorf("%w: tail cursor", ErrChildStage)
+		}
+		if cursor.phase == ChildStageSealed && cursor.lastBatchDigest == ([sha256.Size]byte{}) {
+			return fmt.Errorf("%w: sealed cursor", ErrChildStage)
 		}
 	default:
 		return fmt.Errorf("%w: stage cursor phase", ErrChildStage)

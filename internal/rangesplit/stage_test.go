@@ -245,6 +245,73 @@ func TestChildStagePersistsTailAdvanceWithNoChildOperations(t *testing.T) {
 	}
 }
 
+func TestChildStagePersistsTerminalOwnershipSeal(t *testing.T) {
+	partitioner, artifact, set, collection := testChildStageArtifact(t, 1)
+	expected := set.Children[1]
+	stage, err := NewChildStage(partitioner, expected, collection, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []byte
+	persist := func(raw []byte) error {
+		persisted = append(persisted[:0], raw...)
+		return nil
+	}
+	if _, err := stage.ReceiveArtifact(bytes.NewReader(artifact), persist); err != nil {
+		t.Fatal(err)
+	}
+	source, err := partitioner.InitialTailCursor(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := nextTailEntry(source, nil, 31)
+	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterOwnershipEpoch++
+	entry.AfterRoutingVersion++
+	entry.AfterRouteGeneration++
+	var sealedBatch TailBatch
+	sinks := []TailSink{
+		func(TailBatch) error { return nil },
+		func(batch TailBatch) error {
+			sealedBatch = batch
+			return stage.ApplyTailBatch(batch, persist)
+		},
+	}
+	var workspace TailWorkspace
+	sealed, _, err := partitioner.TranslateTailEntry(source, entry, sinks, &workspace)
+	if err != nil || !sealed.Sealed() {
+		t.Fatalf("sealed=%+v err=%v", sealed, err)
+	}
+	cursor, ok := stage.Cursor()
+	if !ok || cursor.Phase() != ChildStageSealed ||
+		cursor.SourceCut() != sealed.SourceCut() ||
+		cursor.LastBatchDigest() != sealedBatch.Digest {
+		t.Fatalf("cursor=%+v sealed=%+v", cursor, sealed)
+	}
+	if err := stage.ApplyTailBatch(sealedBatch, persist); err != nil {
+		t.Fatalf("exact sealed retry: %v", err)
+	}
+	reopened, err := NewChildStage(partitioner, expected, collection, persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.ApplyTailBatch(sealedBatch, persist); err != nil {
+		t.Fatalf("reopened sealed retry: %v", err)
+	}
+	ordinary := nextTailEntry(source, nil, 32)
+	ordinary.AfterLogicalDigest = ordinary.BeforeLogicalDigest
+	var ordinaryBatch TailBatch
+	if _, _, err := partitioner.TranslateTailEntry(source, ordinary, []TailSink{
+		func(TailBatch) error { return nil },
+		func(batch TailBatch) error { ordinaryBatch = batch; return nil },
+	}, &workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.ApplyTailBatch(ordinaryBatch, persist); !errors.Is(err, ErrChildStage) {
+		t.Fatalf("post-seal batch error=%v", err)
+	}
+}
+
 func TestChildStageSplitsLargeTailBatchIntoBoundedDurableUpdates(t *testing.T) {
 	partitioner, artifact, set, collection := testChildStageArtifact(t, 1)
 	expected := set.Children[1]
@@ -399,6 +466,50 @@ func TestChildStageCursorStoreRecoversAndRejectsRegression(t *testing.T) {
 			_ = corrupt.Close()
 		}
 		t.Fatalf("corrupt cursor error = %v", err)
+	}
+}
+
+func TestChildStageCursorStorePersistsTerminalSeal(t *testing.T) {
+	partitioner, artifact, set, collection := testChildStageArtifact(t, 0)
+	store, err := OpenChildStageCursorStore(filepath.Join(t.TempDir(), "sealed.cursor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	stage, err := NewChildStage(partitioner, set.Children[1], collection, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stage.ReceiveArtifact(bytes.NewReader(artifact), store.Persist); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := partitioner.InitialTailCursor(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := nextTailEntry(cursor, nil, 33)
+	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterOwnershipEpoch++
+	entry.AfterRoutingVersion++
+	entry.AfterRouteGeneration++
+	var workspace TailWorkspace
+	if _, _, err := partitioner.TranslateTailEntry(cursor, entry, []TailSink{
+		func(TailBatch) error { return nil },
+		func(batch TailBatch) error { return stage.ApplyTailBatch(batch, store.Persist) },
+	}, &workspace); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok, err := store.Load(nil)
+	if err != nil || !ok {
+		t.Fatalf("load ok=%v err=%v", ok, err)
+	}
+	sealed, err := OpenChildStageCursor(raw)
+	if err != nil || sealed.Phase() != ChildStageSealed ||
+		sealed.SourceCut().RouteGeneration != set.Partition.RouteGeneration+1 {
+		t.Fatalf("sealed=%+v err=%v", sealed, err)
+	}
+	if err := store.Persist(raw); err != nil {
+		t.Fatalf("sealed exact retry: %v", err)
 	}
 }
 

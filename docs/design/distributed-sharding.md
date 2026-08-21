@@ -65,8 +65,14 @@ private collection. The replicated state machine includes each capture record
 in the same transaction as the source state and row changes. Recovery verifies
 the complete digest and publication chain before capture resumes.
 
-This kernel does not close the final source gap, prune the retained range,
-transfer ownership, or publish the catalog.
+The final source gap closes with one captured ownership-fence entry. It advances
+ownership epoch, routing version, and route generation together and carries no
+row changes. Every child persists the exact empty batch and enters a terminal
+sealed phase. Certification rereads and verifies that capture record, recomputes
+all child batch digests, and refuses a source head that advanced past the seal.
+
+The resulting certificate does not publish the catalog. Retained-range pruning
+and the generation-fenced catalog transaction remain outside this kernel.
 
 ## Security boundary
 
@@ -87,3 +93,4 @@ boundary.
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
+- `internal/rangesplit/cutover.go`

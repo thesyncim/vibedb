@@ -138,6 +138,38 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 		!bytes.Equal(entry.Transitions[0].Before, right) || entry.Transitions[0].After != nil {
 		t.Fatalf("delete entry=%+v ok=%v err=%v", entry, ok, err)
 	}
+	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
+	if _, err := reopened.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: 6, Term: 2, Type: pb.EntryConfChange,
+	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err = recovered.NextTailEntry(cursor, &readWorkspace)
+	if err != nil || !ok || len(entry.Transitions) != 0 {
+		t.Fatalf("configuration entry=%+v ok=%v err=%v", entry, ok, err)
+	}
+	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
+	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+		From: fixture.binding, ExpectedReplicaSetVersion: 6,
+		SourceMember: 1, TargetMember: 2,
+		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
+		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
+		ToRouteGeneration: fixture.binding.RouteGeneration + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.ApplyNormal(sourceCaptureMeta(7), ownership); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err = recovered.NextTailEntry(cursor, &readWorkspace)
+	if err != nil || !ok || len(entry.Transitions) != 0 || !tailEntrySeals(entry) {
+		t.Fatalf("seal entry=%+v ok=%v err=%v", entry, ok, err)
+	}
+	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
+	if !cursor.Sealed() || recovered.Head() != 7 {
+		t.Fatalf("sealed cursor=%+v head=%d", cursor, recovered.Head())
+	}
 }
 
 func TestSourceCaptureRecoveryRejectsRecordCorruption(t *testing.T) {

@@ -124,9 +124,15 @@ transition atomically with its replicated source publication. Its compact
 `vibejson` records bind the split plan, placement program, publication chain,
 and mutable ownership coordinates. Recovery verifies the full retained chain.
 
-The implementation does not close the final write gap, prune the retained
-range, validate ownership transfer, or publish topology. The repository has no
-automatic split controller or merge planner.
+The source closes the final write gap with a terminal ownership-fence entry.
+All mutable serving coordinates advance together, every child persists the
+corresponding empty batch, and certification reconstructs that capture entry
+and matches every durable child cursor. A fixed-size checksum-protected
+certificate records the exact cut but deliberately grants no serving authority.
+
+The implementation does not prune the retained range or perform the catalog
+compare-and-swap that publishes topology. The repository has no automatic split
+controller or merge planner.
 
 ## Replication kernel
 
@@ -156,5 +162,6 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
+- `internal/rangesplit/cutover.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

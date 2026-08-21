@@ -28,7 +28,7 @@ var (
 const tailChildMissing = uint8(math.MaxUint8)
 
 // TailTransition is one exact final key transition observed while applying a
-// source entry. Before and After are canonical document bytes; nil means the
+// source entry. Before and After are valid JSON document bytes; nil means the
 // key was absent on that side. Both cannot be nil. Input keys must be strictly
 // byte ordered and distinct so every derived child batch remains ordered.
 type TailTransition struct {
@@ -41,14 +41,27 @@ type TailTransition struct {
 // Empty Transitions are required for no-op, rejected, and configuration
 // entries so every child can advance through the exact same applied sequence.
 type TailEntry struct {
-	Applied             uint64
-	Term                uint64
-	RouteGeneration     uint64
-	PreviousEntryDigest [sha256.Size]byte
-	EntryDigest         [sha256.Size]byte
-	BeforeLogicalDigest [sha256.Size]byte
-	AfterLogicalDigest  [sha256.Size]byte
-	Transitions         []TailTransition
+	Applied               uint64
+	Term                  uint64
+	BeforeOwnershipEpoch  uint64
+	AfterOwnershipEpoch   uint64
+	BeforeRoutingVersion  uint64
+	AfterRoutingVersion   uint64
+	BeforeRouteGeneration uint64
+	AfterRouteGeneration  uint64
+	PreviousEntryDigest   [sha256.Size]byte
+	EntryDigest           [sha256.Size]byte
+	BeforeLogicalDigest   [sha256.Size]byte
+	AfterLogicalDigest    [sha256.Size]byte
+	Transitions           []TailTransition
+}
+
+// TailSourceCoordinates are the mutable source-serving fences represented by
+// a translated prefix.
+type TailSourceCoordinates struct {
+	OwnershipEpoch  uint64
+	RoutingVersion  uint64
+	RouteGeneration uint64
 }
 
 // TailCursor is a constant-size, exact translated source prefix. Its fields
@@ -63,7 +76,10 @@ type TailCursor struct {
 	childBaseDigests [autosplit.MaxSplitChildren][sha256.Size]byte
 	applied          uint64
 	term             uint64
+	ownershipEpoch   uint64
+	routingVersion   uint64
 	routeGeneration  uint64
+	sealed           bool
 }
 
 // SourceCut returns the exact source publication represented by c.
@@ -80,6 +96,17 @@ func (c TailCursor) PlanDigest() [sha256.Size]byte { return c.planDigest }
 
 // PlacementDigest returns the placement-program identity bound to c.
 func (c TailCursor) PlacementDigest() [sha256.Size]byte { return c.placementDigest }
+
+// SourceCoordinates returns the mutable source fences represented by c.
+func (c TailCursor) SourceCoordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: c.ownershipEpoch, RoutingVersion: c.routingVersion,
+		RouteGeneration: c.routeGeneration,
+	}
+}
+
+// Sealed reports whether c ends at the terminal ownership fence.
+func (c TailCursor) Sealed() bool { return c.sealed }
 
 // TailOperation is one borrowed child-local mutation. A moved row becomes a
 // delete in its old child and a put in its new child.
@@ -98,26 +125,31 @@ type tailRoute struct {
 // empty batch is semantically required. The sink may iterate it only during
 // the callback and must durably order the operations and Digest together.
 type TailBatch struct {
-	Child               uint8
-	PlanDigest          [sha256.Size]byte
-	PlacementDigest     [sha256.Size]byte
-	TranslationDigest   [sha256.Size]byte
-	Digest              [sha256.Size]byte
-	PreviousEntryDigest [sha256.Size]byte
-	EntryDigest         [sha256.Size]byte
-	BeforeLogicalDigest [sha256.Size]byte
-	AfterLogicalDigest  [sha256.Size]byte
-	SourceBaseDigest    [sha256.Size]byte
-	ChildBaseDigest     [sha256.Size]byte
-	Applied             uint64
-	Term                uint64
-	RouteGeneration     uint64
-	TransitionCount     uint64
-	Operations          uint64
-	Bytes               uint64
-	transitions         []TailTransition
-	routes              []tailRoute
-	translated          bool
+	Child                 uint8
+	PlanDigest            [sha256.Size]byte
+	PlacementDigest       [sha256.Size]byte
+	TranslationDigest     [sha256.Size]byte
+	Digest                [sha256.Size]byte
+	PreviousEntryDigest   [sha256.Size]byte
+	EntryDigest           [sha256.Size]byte
+	BeforeLogicalDigest   [sha256.Size]byte
+	AfterLogicalDigest    [sha256.Size]byte
+	SourceBaseDigest      [sha256.Size]byte
+	ChildBaseDigest       [sha256.Size]byte
+	Applied               uint64
+	Term                  uint64
+	BeforeOwnershipEpoch  uint64
+	AfterOwnershipEpoch   uint64
+	BeforeRoutingVersion  uint64
+	AfterRoutingVersion   uint64
+	BeforeRouteGeneration uint64
+	AfterRouteGeneration  uint64
+	TransitionCount       uint64
+	Operations            uint64
+	Bytes                 uint64
+	transitions           []TailTransition
+	routes                []tailRoute
+	translated            bool
 }
 
 // Iterator returns a zero-allocation forward iterator over child-local
@@ -189,7 +221,7 @@ type TailBatchVerifyWorkspace struct {
 	hasher   hash.Hash
 	digest   [sha256.Size]byte
 	identity [sha256.Size]byte
-	fixed    [256]byte
+	fixed    [320]byte
 	size     [8]byte
 }
 
@@ -200,7 +232,7 @@ type TailWorkspace struct {
 	document  distribution.DocumentPointWorkspace
 	hashers   [autosplit.MaxSplitChildren + 1]hash.Hash
 	digests   [autosplit.MaxSplitChildren + 1][sha256.Size]byte
-	fixed     [256]byte
+	fixed     [320]byte
 	size      [8]byte
 	childBase [sha256.Size]byte
 	stats     TailStats
@@ -257,6 +289,8 @@ func (p *Partitioner) InitialTailCursor(set ChildArtifactSet) (TailCursor, error
 		planDigest: p.digest, placementDigest: placement,
 		logicalDigest: cut.LogicalDigest, baseDigest: cut.BaseDigest,
 		entryDigest: cut.EntryDigest, applied: cut.Applied, term: cut.Term,
+		ownershipEpoch:  uint64(p.source.OwnershipEpoch),
+		routingVersion:  uint64(p.source.RoutingVersion),
 		routeGeneration: cut.RouteGeneration, childBaseDigests: childBases,
 	}, nil
 }
@@ -271,7 +305,7 @@ func (p *Partitioner) TranslateTailEntry(
 	workspace *TailWorkspace,
 ) (TailCursor, TailStats, error) {
 	if p == nil || workspace == nil || len(sinks) != int(p.childCount) ||
-		!p.validTailCursor(cursor) || !validTailEntry(cursor, entry) {
+		!p.validTailCursor(cursor) || !p.validTailEntry(cursor, entry) {
 		return cursor, TailStats{}, ErrTailEntry
 	}
 	for _, sink := range sinks {
@@ -355,9 +389,14 @@ func (p *Partitioner) TranslateTailEntry(
 			SourceBaseDigest:    cursor.baseDigest,
 			ChildBaseDigest:     cursor.childBaseDigests[child],
 			Applied:             entry.Applied, Term: entry.Term,
-			RouteGeneration: entry.RouteGeneration,
-			TransitionCount: uint64(len(entry.Transitions)),
-			Operations:      stats.Operations[child], Bytes: stats.Bytes[child],
+			BeforeOwnershipEpoch:  entry.BeforeOwnershipEpoch,
+			AfterOwnershipEpoch:   entry.AfterOwnershipEpoch,
+			BeforeRoutingVersion:  entry.BeforeRoutingVersion,
+			AfterRoutingVersion:   entry.AfterRoutingVersion,
+			BeforeRouteGeneration: entry.BeforeRouteGeneration,
+			AfterRouteGeneration:  entry.AfterRouteGeneration,
+			TransitionCount:       uint64(len(entry.Transitions)),
+			Operations:            stats.Operations[child], Bytes: stats.Bytes[child],
 			transitions: entry.Transitions, routes: workspace.routes, translated: true,
 		}
 		if err := sinks[child](batch); err != nil {
@@ -369,6 +408,10 @@ func (p *Partitioner) TranslateTailEntry(
 	next.entryDigest = entry.EntryDigest
 	next.applied = entry.Applied
 	next.term = entry.Term
+	next.ownershipEpoch = entry.AfterOwnershipEpoch
+	next.routingVersion = entry.AfterRoutingVersion
+	next.routeGeneration = entry.AfterRouteGeneration
+	next.sealed = tailEntrySeals(entry)
 	return next, *stats, nil
 }
 
@@ -392,7 +435,7 @@ func (p *Partitioner) VerifyTailBatch(
 		batch.AfterLogicalDigest == ([sha256.Size]byte{}) ||
 		batch.Applied == 0 || batch.Applied == math.MaxUint64 ||
 		batch.Term == 0 || batch.Term == math.MaxUint64 ||
-		batch.RouteGeneration == 0 ||
+		!validTailBatchCoordinates(batch) ||
 		batch.TransitionCount > replication.MaxMutations ||
 		batch.Operations > batch.TransitionCount {
 		return ErrTailEntry
@@ -404,7 +447,8 @@ func (p *Partitioner) VerifyTailBatch(
 	h.Reset()
 	fixed := appendTailFixed(
 		workspace.fixed[:0], batch.PlanDigest, batch.PlacementDigest,
-		batch.Applied, batch.Term, batch.RouteGeneration, batch.TransitionCount,
+		batch.Applied, batch.Term, batch.TransitionCount,
+		batch.beforeCoordinates(), batch.afterCoordinates(),
 		batch.PreviousEntryDigest, batch.EntryDigest,
 		batch.BeforeLogicalDigest, batch.AfterLogicalDigest, batch.SourceBaseDigest,
 	)
@@ -466,7 +510,8 @@ func (p *Partitioner) validTailCursor(cursor TailCursor) bool {
 		cursor.logicalDigest == ([sha256.Size]byte{}) ||
 		cursor.baseDigest == ([sha256.Size]byte{}) ||
 		cursor.entryDigest == ([sha256.Size]byte{}) || cursor.applied == 0 ||
-		cursor.term == 0 || cursor.routeGeneration == 0 {
+		cursor.term == 0 || cursor.ownershipEpoch == 0 ||
+		cursor.routingVersion == 0 || cursor.routeGeneration == 0 {
 		return false
 	}
 	for child := 0; child < int(p.childCount); child++ {
@@ -477,15 +522,88 @@ func (p *Partitioner) validTailCursor(cursor TailCursor) bool {
 	return true
 }
 
-func validTailEntry(cursor TailCursor, entry TailEntry) bool {
-	return cursor.applied != math.MaxUint64 && entry.Applied == cursor.applied+1 &&
-		entry.Applied != math.MaxUint64 && entry.Term >= cursor.term &&
-		entry.Term != 0 && entry.Term != math.MaxUint64 &&
-		entry.RouteGeneration == cursor.routeGeneration &&
-		entry.PreviousEntryDigest == cursor.entryDigest &&
-		entry.EntryDigest != ([sha256.Size]byte{}) &&
-		entry.BeforeLogicalDigest == cursor.logicalDigest &&
-		entry.AfterLogicalDigest != ([sha256.Size]byte{})
+func (p *Partitioner) validTailEntry(cursor TailCursor, entry TailEntry) bool {
+	if cursor.sealed || cursor.applied == math.MaxUint64 ||
+		entry.Applied != cursor.applied+1 ||
+		entry.Applied == math.MaxUint64 || entry.Term < cursor.term ||
+		entry.Term == 0 || entry.Term == math.MaxUint64 ||
+		entry.PreviousEntryDigest != cursor.entryDigest ||
+		entry.EntryDigest == ([sha256.Size]byte{}) ||
+		entry.BeforeLogicalDigest != cursor.logicalDigest ||
+		entry.AfterLogicalDigest == ([sha256.Size]byte{}) {
+		return false
+	}
+	before, after := entry.beforeCoordinates(), entry.afterCoordinates()
+	if before != cursor.coordinates() {
+		return false
+	}
+	if after == before {
+		return true
+	}
+	retained := p.children[p.retained]
+	return len(entry.Transitions) == 0 &&
+		entry.AfterLogicalDigest == entry.BeforeLogicalDigest &&
+		before.incremented() == after &&
+		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
+		after.RoutingVersion == uint64(p.target)
+}
+
+func (c TailCursor) coordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: c.ownershipEpoch, RoutingVersion: c.routingVersion,
+		RouteGeneration: c.routeGeneration,
+	}
+}
+
+func (e TailEntry) beforeCoordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: e.BeforeOwnershipEpoch, RoutingVersion: e.BeforeRoutingVersion,
+		RouteGeneration: e.BeforeRouteGeneration,
+	}
+}
+
+func (e TailEntry) afterCoordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: e.AfterOwnershipEpoch, RoutingVersion: e.AfterRoutingVersion,
+		RouteGeneration: e.AfterRouteGeneration,
+	}
+}
+
+func (b TailBatch) beforeCoordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: b.BeforeOwnershipEpoch, RoutingVersion: b.BeforeRoutingVersion,
+		RouteGeneration: b.BeforeRouteGeneration,
+	}
+}
+
+func (b TailBatch) afterCoordinates() TailSourceCoordinates {
+	return TailSourceCoordinates{
+		OwnershipEpoch: b.AfterOwnershipEpoch, RoutingVersion: b.AfterRoutingVersion,
+		RouteGeneration: b.AfterRouteGeneration,
+	}
+}
+
+func (c TailSourceCoordinates) incremented() TailSourceCoordinates {
+	if c.OwnershipEpoch == math.MaxUint64 || c.RoutingVersion == math.MaxUint64 ||
+		c.RouteGeneration == math.MaxUint64 {
+		return TailSourceCoordinates{}
+	}
+	return TailSourceCoordinates{
+		OwnershipEpoch: c.OwnershipEpoch + 1, RoutingVersion: c.RoutingVersion + 1,
+		RouteGeneration: c.RouteGeneration + 1,
+	}
+}
+
+func tailEntrySeals(entry TailEntry) bool {
+	return entry.beforeCoordinates() != entry.afterCoordinates()
+}
+
+func validTailBatchCoordinates(batch TailBatch) bool {
+	before, after := batch.beforeCoordinates(), batch.afterCoordinates()
+	return before.OwnershipEpoch != 0 && before.RoutingVersion != 0 &&
+		before.RouteGeneration != 0 &&
+		(after == before || before.incremented() == after && batch.TransitionCount == 0 &&
+			batch.AfterLogicalDigest == batch.BeforeLogicalDigest)
 }
 
 func validTailTransition(transition *TailTransition, previousKey []byte) bool {
@@ -553,7 +671,8 @@ func (w *TailWorkspace) prepareTailHashes(
 	placement := p.program.Digest()
 	fixed := appendTailFixed(
 		w.fixed[:0], p.digest, placement,
-		entry.Applied, entry.Term, entry.RouteGeneration, uint64(len(entry.Transitions)),
+		entry.Applied, entry.Term, uint64(len(entry.Transitions)),
+		entry.beforeCoordinates(), entry.afterCoordinates(),
 		entry.PreviousEntryDigest, entry.EntryDigest,
 		entry.BeforeLogicalDigest, entry.AfterLogicalDigest, cursor.baseDigest,
 	)
@@ -610,15 +729,20 @@ func (w *TailWorkspace) hashFrame(h hash.Hash, value []byte) {
 func appendTailFixed(
 	dst []byte,
 	plan, placement [sha256.Size]byte,
-	applied, term, routeGeneration, transitions uint64,
+	applied, term, transitions uint64,
+	before, after TailSourceCoordinates,
 	previousEntry, entry, beforeLogical, afterLogical, sourceBase [sha256.Size]byte,
 ) []byte {
 	dst = append(dst, plan[:]...)
 	dst = append(dst, placement[:]...)
 	dst = binary.LittleEndian.AppendUint64(dst, applied)
 	dst = binary.LittleEndian.AppendUint64(dst, term)
-	dst = binary.LittleEndian.AppendUint64(dst, routeGeneration)
 	dst = binary.LittleEndian.AppendUint64(dst, transitions)
+	for _, coordinates := range [2]TailSourceCoordinates{before, after} {
+		dst = binary.LittleEndian.AppendUint64(dst, coordinates.OwnershipEpoch)
+		dst = binary.LittleEndian.AppendUint64(dst, coordinates.RoutingVersion)
+		dst = binary.LittleEndian.AppendUint64(dst, coordinates.RouteGeneration)
+	}
 	dst = append(dst, previousEntry[:]...)
 	dst = append(dst, entry[:]...)
 	dst = append(dst, beforeLogical[:]...)
