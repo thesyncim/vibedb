@@ -165,7 +165,7 @@ func TestPartialAggregateFragmentRemovesFinalOrderAndLimit(t *testing.T) {
 		))
 	}
 
-	const statement = `SELECT n, COUNT(*) FROM docs GROUP BY n ORDER BY n LIMIT ?`
+	const statement = `SELECT n, COUNT(*) FROM docs GROUP BY n ORDER BY n LIMIT ? OFFSET 1`
 	final := ownedRequest(statement, NumberParam("1"))
 	final.ExecutionMode = ExecutionReadOnly
 	if got := exec(t, conn, final); len(got.Rows) != 1 {

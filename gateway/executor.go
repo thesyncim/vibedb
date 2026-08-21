@@ -887,13 +887,15 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 				results, pl.aggregates, pl.groupKeys, p.MaxAggregateBytes,
 			)
 			if err == nil {
-				rows, err = finalizeGroupedRows(rows, pl.order, pl.limit, p.MaxAggregateBytes)
+				rows, err = finalizeGroupedRowsWindow(
+					rows, pl.order, pl.offset, pl.limit, pl.hasLimit, p.MaxAggregateBytes,
+				)
 			}
 		} else {
 			columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
 		}
 	} else {
-		columns, rows, err = mergeRows(results, pl.order, pl.limit)
+		columns, rows, err = mergeRowsWindow(results, pl.order, 0, pl.limit, pl.hasLimit)
 	}
 	if err != nil {
 		return nil, err

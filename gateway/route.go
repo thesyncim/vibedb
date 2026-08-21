@@ -38,6 +38,8 @@ type plan struct {
 	calls        []shardCall
 	order        []OrderKey
 	limit        int
+	offset       int
+	hasLimit     bool
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
 	aggHeaders   []string
@@ -132,6 +134,8 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		calls:        calls,
 		order:        bound.order,
 		limit:        bound.limit,
+		offset:       bound.offset,
+		hasLimit:     bound.hasLimit,
 		aggregates:   bound.aggregates,
 		groupKeys:    bound.groupKeys,
 		aggHeaders:   bound.aggHeaders,

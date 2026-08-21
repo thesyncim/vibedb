@@ -466,15 +466,15 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 	if partialAggregate {
 		if tree.Kind != sqlast.KindSelect || tree.Select == nil ||
 			len(tree.Select.GroupBy) == 0 ||
-			tree.Select.Having != nil || len(tree.Select.Windows) != 0 ||
-			tree.Select.Offset != nil {
-			return nil, errors.New("vibedb: partial aggregate fragment requires a grouped SELECT without DISTINCT, HAVING, windows, or OFFSET")
+			tree.Select.Having != nil || len(tree.Select.Windows) != 0 {
+			return nil, errors.New("vibedb: partial aggregate fragment requires a grouped SELECT without HAVING or windows")
 		}
 		// The parser owns this tree and the prepared statement owns the parser's
 		// arena. Mutating these final-only fields is therefore isolated to this
 		// preparation and preserves placeholder ordinals and source diagnostics.
 		tree.Select.OrderBy = nil
 		tree.Select.Limit = nil
+		tree.Select.Offset = nil
 	}
 	s := &stmt{
 		conn:       c,

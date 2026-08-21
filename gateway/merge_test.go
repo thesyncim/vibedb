@@ -438,6 +438,17 @@ func TestFinalizeGroupedRowsExactSortAndTopK(t *testing.T) {
 	if err != nil || len(trimmed) != 2 || &trimmed[0][0] != &rows[0][0] {
 		t.Fatalf("unordered grouped LIMIT = %+v, %v", trimmed, err)
 	}
+	windowed, err := finalizeGroupedRowsWindow(
+		rows, []OrderKey{{Column: 0}}, 1, 2, true, 1<<20,
+	)
+	if err != nil || len(windowed) != 2 || string(windowed[0][0].Bytes) != "1" ||
+		string(windowed[1][0].Bytes) != "2" {
+		t.Fatalf("grouped OFFSET/LIMIT = %+v, %v", windowed, err)
+	}
+	empty, err := finalizeGroupedRowsWindow(rows, nil, 0, 0, true, 1<<20)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("grouped LIMIT 0 = %+v, %v", empty, err)
+	}
 
 	invalid := [][]shardservice.Cell{{cell("1x")}, {cell("2")}}
 	if _, err := finalizeGroupedRows(invalid, []OrderKey{{Column: 0}}, 0, 1<<20); !errors.Is(err, ErrMergeValue) {

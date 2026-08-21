@@ -174,6 +174,19 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	if err := distinctBound.ValidateRoute(routeBoundPlan(t, distinctBound)); err != nil {
 		t.Fatalf("distributed DISTINCT validation = %v", err)
 	}
+	windowedDistinct, err := snap.Prepare(context.Background(),
+		`SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT ? OFFSET ?`)
+	if err != nil {
+		t.Fatalf("Prepare windowed DISTINCT: %v", err)
+	}
+	windowedDistinctBound, err := windowedDistinct.Bind([]any{2, 1})
+	if err != nil || !windowedDistinctBound.hasLimit || windowedDistinctBound.limit != 2 ||
+		windowedDistinctBound.offset != 1 {
+		t.Fatalf("windowed DISTINCT bind = %+v, %v", windowedDistinctBound, err)
+	}
+	if err := windowedDistinctBound.ValidateRoute(routeBoundPlan(t, windowedDistinctBound)); err != nil {
+		t.Fatalf("windowed DISTINCT validation = %v", err)
+	}
 
 	localLimit, err := snap.Prepare(context.Background(),
 		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`)

@@ -26,6 +26,8 @@ type distributedPrivate struct {
 	aggregates  []bootstrap.AggKind
 	groupKeys   []int
 	limit       int
+	offset      int
+	hasLimit    bool
 	indexLookup bool
 }
 
@@ -188,9 +190,9 @@ func (m *distributedCostModel) Enforcers(
 		!orderingPrefix(provided.Ordering, required.Ordering) {
 		op := queryplanner.OpSort
 		cpuRows, memoryRows := rows, rows
-		if metadata, ok := m.private[1]; ok && len(metadata.groupKeys) != 0 && metadata.limit > 0 {
+		if metadata, ok := m.private[1]; ok && len(metadata.groupKeys) != 0 && metadata.hasLimit {
 			op = queryplanner.OpTopK
-			memoryRows = min(rows, float64(metadata.limit))
+			memoryRows = min(rows, float64(metadata.limit+metadata.offset))
 			cpuRows = max(2, memoryRows)
 		}
 		return []queryplanner.EnforcerChain{{{
@@ -286,9 +288,11 @@ func optimizeDistributedAccessPlan(
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates, groupKeys: bound.groupKeys,
 		limit:       bound.limit,
+		offset:      bound.offset,
+		hasLimit:    bound.hasLimit,
 		indexLookup: indexLookup,
 	}
-	if bound.limit > 0 && len(bound.aggregates) == 0 {
+	if bound.hasLimit && len(bound.aggregates) == 0 {
 		metadata.outputRows = min(outputRows,
 			float64(bound.limit)*float64(max(1, len(route.Targets))))
 	}

@@ -302,8 +302,8 @@ cluster does not fork into named protocol generations.
    now run as shard-local partial aggregation plus a memory-capped, exact
    columnar final stage. Parsed partial fragments remove shard-local final
    ordering and limits without serializing a plan or synthesizing SQL; bounded
-   exact final sorting and O(K) top-K work even when group identities span
-   shards. Path-projection DISTINCT reuses the same canonical grouped state.
+   exact final sorting and O(OFFSET+LIMIT) top-K work even when group identities
+   span shards. Path-projection DISTINCT reuses the same canonical grouped state.
    Hash/range exchange and worker-local final aggregation come next, followed
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.

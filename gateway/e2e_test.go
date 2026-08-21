@@ -1471,20 +1471,20 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 	}
 
 	distinct, err := e.Query(context.Background(), Query{
-		SQL:   `SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 3`,
+		SQL:   `SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 2 OFFSET 1`,
 		Class: ClassBatch,
 	})
 	if err != nil {
 		t.Fatalf("distributed DISTINCT Query: %v", err)
 	}
-	if len(distinct.Rows) != 3 {
-		t.Fatalf("distributed DISTINCT rows = %d, want 3", len(distinct.Rows))
+	if len(distinct.Rows) != 2 {
+		t.Fatalf("distributed DISTINCT rows = %d, want 2", len(distinct.Rows))
 	}
 	for row := range distinct.Rows {
 		if len(distinct.Rows[row]) != 1 || distinct.Rows[row][0].Null ||
-			string(distinct.Rows[row][0].Bytes) != string(result.Rows[row][0].Bytes) {
+			string(distinct.Rows[row][0].Bytes) != string(result.Rows[row+1][0].Bytes) {
 			t.Fatalf("distributed DISTINCT row %d = %+v, want %q",
-				row, distinct.Rows[row], result.Rows[row][0].Bytes)
+				row, distinct.Rows[row], result.Rows[row+1][0].Bytes)
 		}
 	}
 	if got := c.dialer.totalDials(); got != 36 {

@@ -305,14 +305,22 @@ func finalizeGroupedRows(
 	limit int,
 	maxBytes uint64,
 ) ([][]shardservice.Cell, error) {
-	if limit < 0 {
+	return finalizeGroupedRowsWindow(rows, order, 0, limit, limit > 0, maxBytes)
+}
+
+func finalizeGroupedRowsWindow(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	offset int,
+	limit int,
+	hasLimit bool,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	if limit < 0 || offset < 0 {
 		return nil, fmt.Errorf("%w: grouped LIMIT is negative", ErrMergeAggregate)
 	}
 	if len(order) == 0 {
-		if limit > 0 && limit < len(rows) {
-			return rows[:limit], nil
-		}
-		return rows, nil
+		return sliceGroupedWindow(rows, offset, limit, hasLimit), nil
 	}
 	for _, key := range order {
 		if key.Column < 0 || (len(rows) != 0 && key.Column >= len(rows[0])) {
@@ -320,12 +328,41 @@ func finalizeGroupedRows(
 		}
 	}
 	if len(rows) < 2 {
-		return rows, nil
+		return sliceGroupedWindow(rows, offset, limit, hasLimit), nil
 	}
-	if limit > 0 && limit < len(rows) {
-		return groupedTopK(rows, order, limit, maxBytes)
+	retain := len(rows)
+	if hasLimit {
+		if offset > int(^uint(0)>>1)-limit {
+			return nil, fmt.Errorf("%w: grouped OFFSET + LIMIT overflows", ErrMergeAggregate)
+		}
+		retain = min(retain, offset+limit)
+		if retain == 0 {
+			return rows[:0], nil
+		}
 	}
-	return groupedFullSort(rows, order, maxBytes)
+	if hasLimit && retain < len(rows) {
+		selected, err := groupedTopK(rows, order, retain, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		return sliceGroupedWindow(selected, offset, limit, true), nil
+	}
+	ordered, err := groupedFullSort(rows, order, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return sliceGroupedWindow(ordered, offset, limit, hasLimit), nil
+}
+
+func sliceGroupedWindow(rows [][]shardservice.Cell, offset, limit int, hasLimit bool) [][]shardservice.Cell {
+	if offset >= len(rows) {
+		return rows[:0]
+	}
+	rows = rows[offset:]
+	if hasLimit && limit < len(rows) {
+		rows = rows[:limit]
+	}
+	return rows
 }
 
 func groupedTopK(
@@ -480,6 +517,10 @@ func admitGroupedSortState(rows, keys, textBytes int, maxBytes uint64) error {
 // already-ordered shards. A positive limit trims the merged rows. Columns come
 // from the first shard's row frame, and every response must be a row set.
 func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit int) ([]shardservice.Column, [][]shardservice.Cell, error) {
+	return mergeRowsWindow(results, order, 0, limit, limit > 0)
+}
+
+func mergeRowsWindow(results []*shardservice.ShardResponse, order []OrderKey, offset, limit int, hasLimit bool) ([]shardservice.Column, [][]shardservice.Cell, error) {
 	if len(results) == 0 {
 		return nil, nil, nil
 	}
@@ -487,14 +528,22 @@ func mergeRows(results []*shardservice.ShardResponse, order []OrderKey, limit in
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(order) == 0 {
-		return columns, concatRows(results, limit), nil
+	if hasLimit && limit == 0 {
+		return columns, nil, nil
 	}
-	rows, err := kwayMerge(results, order, limit)
+	if len(order) == 0 {
+		rows := concatRows(results, 0)
+		return columns, sliceGroupedWindow(rows, offset, limit, hasLimit), nil
+	}
+	window := 0
+	if hasLimit {
+		window = offset + limit
+	}
+	rows, err := kwayMerge(results, order, window)
 	if err != nil {
 		return nil, nil, err
 	}
-	return columns, rows, nil
+	return columns, sliceGroupedWindow(rows, offset, limit, hasLimit), nil
 }
 
 func validateRowResults(results []*shardservice.ShardResponse) ([]shardservice.Column, error) {

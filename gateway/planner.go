@@ -64,6 +64,7 @@ type PreparedPlan struct {
 	constraints  *sqldriver.ConstraintProgram
 	order        []OrderKey
 	limit        *sqlast.Operand
+	offset       *sqlast.Operand
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
 	aggHeaders   []string
@@ -111,6 +112,8 @@ type BoundPlan struct {
 	constraints  distribution.BoundConstraints
 	order        []OrderKey
 	limit        int
+	offset       int
+	hasLimit     bool
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
 	aggHeaders   []string
@@ -303,11 +306,13 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	plan.aggregates, plan.groupKeys, plan.aggHeaders, plan.multiReason =
 		planDistributedAggregates(selectStmt, plan.multiReason)
 	plan.limit = selectStmt.Limit
+	plan.offset = selectStmt.Offset
 	plan.alwaysReason = allRouteSemanticBoundary(selectStmt, plan.alwaysReason)
 	plan.multiReason = multiShardSemanticBoundary(
 		selectStmt, plan.multiReason, len(plan.aggregates) != 0, len(plan.groupKeys) != 0,
 	)
-	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0, plan.multiReason)
+	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0,
+		len(plan.groupKeys) != 0, plan.multiReason)
 	if cacheable {
 		return s.cachePreparedPlan(sqlText, hash, plan), nil
 	}
@@ -335,6 +340,10 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	offset, err := bindPlanOperand(p.offset, args, "OFFSET")
+	if err != nil {
+		return nil, err
+	}
 	var globalIndex *boundGlobalIndexRead
 	var globalEmpty bool
 	if !boundConstraintsSinglePoint(constraints, p.spec.Arity) {
@@ -347,7 +356,7 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 		generation: p.generation, table: p.table,
 		tables:       p.tables,
 		distribution: p.distribution, constraints: constraints,
-		order: p.order, limit: limit,
+		order: p.order, limit: limit, offset: offset, hasLimit: p.limit != nil,
 		aggregates: p.aggregates, groupKeys: p.groupKeys,
 		aggHeaders:  p.aggHeaders,
 		globalIndex: globalIndex, globalEmpty: globalEmpty,
@@ -462,13 +471,14 @@ func (p *BoundPlan) ValidateRoute(route distribution.Route) error {
 func emptyRouteSemanticBoundary(
 	stmt *sqlast.SelectStmt,
 	aggregateSupported bool,
+	groupedSupported bool,
 	multiReason string,
 ) string {
 	if stmt == nil || !selectHasAggregate(stmt) {
 		return ""
 	}
-	if aggregateSupported && !stmt.Distinct && stmt.Having == nil &&
-		len(stmt.Windows) == 0 && stmt.Offset == nil && stmt.Limit == nil {
+	if aggregateSupported && stmt.Having == nil && len(stmt.Windows) == 0 &&
+		(groupedSupported || (!stmt.Distinct && stmt.Offset == nil && stmt.Limit == nil)) {
 		return ""
 	}
 	if multiReason != "" {
@@ -574,7 +584,7 @@ func multiShardSemanticBoundary(
 		return firstPlanReason(reason, "HAVING requires global aggregate evaluation")
 	case len(stmt.Windows) != 0:
 		return firstPlanReason(reason, "window functions require global partition planning")
-	case stmt.Offset != nil:
+	case stmt.Offset != nil && !groupedAggregateSupported:
 		return firstPlanReason(reason, "OFFSET requires distributed top-k rewriting")
 	case aggregateSupported && !groupedAggregateSupported && stmt.Limit != nil:
 		return firstPlanReason(reason, "aggregate LIMIT requires coordinator-side rewriting")
@@ -999,6 +1009,10 @@ func firstPlanReason(current, candidate string) string {
 }
 
 func bindPlanLimit(limit *sqlast.Operand, args []any) (int, error) {
+	return bindPlanOperand(limit, args, "LIMIT")
+}
+
+func bindPlanOperand(limit *sqlast.Operand, args []any, name string) (int, error) {
 	if limit == nil {
 		return 0, nil
 	}
@@ -1008,14 +1022,14 @@ func bindPlanLimit(limit *sqlast.Operand, args []any) (int, error) {
 		spelling = byteview.Bytes(limit.Text)
 	case sqlast.OperandParam:
 		if limit.Ordinal < 0 || limit.Ordinal >= len(args) {
-			return 0, fmt.Errorf("%w: LIMIT parameter %d is not bound", ErrPlanParameters, limit.Ordinal+1)
+			return 0, fmt.Errorf("%w: %s parameter %d is not bound", ErrPlanParameters, name, limit.Ordinal+1)
 		}
 		switch value := args[limit.Ordinal].(type) {
 		case vibejson.RawValue:
 			var ok bool
 			spelling, ok = value.NumberBytes()
 			if !ok {
-				return 0, fmt.Errorf("%w: LIMIT requires an integer", ErrPlanParameters)
+				return 0, fmt.Errorf("%w: %s requires an integer", ErrPlanParameters, name)
 			}
 		case int:
 			spelling = strconv.AppendInt(nil, int64(value), 10)
@@ -1028,14 +1042,14 @@ func bindPlanLimit(limit *sqlast.Operand, args []any) (int, error) {
 			// requests use the vibejson.RawValue path above.
 			spelling = byteview.Bytes(value.String())
 		default:
-			return 0, fmt.Errorf("%w: LIMIT requires an integer, got %T", ErrPlanParameters, value)
+			return 0, fmt.Errorf("%w: %s requires an integer, got %T", ErrPlanParameters, name, value)
 		}
 	default:
-		return 0, fmt.Errorf("%w: LIMIT is not numeric", ErrPlanParameters)
+		return 0, fmt.Errorf("%w: %s is not numeric", ErrPlanParameters, name)
 	}
 	value, ok := parseLimitUint31(spelling)
 	if !ok {
-		return 0, fmt.Errorf("%w: invalid LIMIT %q", ErrPlanParameters, spelling)
+		return 0, fmt.Errorf("%w: invalid %s %q", ErrPlanParameters, name, spelling)
 	}
 	return value, nil
 }

@@ -89,7 +89,7 @@ Executable multi-shard shapes are:
 
 Grouped execution sends the authored `GROUP BY` to every shard as the partial
 stage. On a multi-shard route an additive request marker asks the shard runtime
-to parse the original SQL once, then remove final-only `ORDER BY` and `LIMIT`
+to parse the original SQL once, then remove final-only `ORDER BY`, `OFFSET`, and `LIMIT`
 nodes from its owned AST before lowering. The wire still carries authored SQL
 and typed parameters, never a serialized plan or a second rewritten SQL string.
 This guarantees that a local LIMIT cannot discard a partial group needed by
@@ -99,7 +99,7 @@ integer counts and sums stay in native registers, promote to `big.Int` only on
 overflow, and enter rational mode only for a real decimal. Retained state and
 completed output share the operation's finite aggregate byte admission. Group
 order is stable first appearance when unordered. Grouped `ORDER BY` adds a
-bounded exact final sort. `ORDER BY ... LIMIT K` uses an exact O(K) max-heap
+bounded exact final sort. `ORDER BY ... OFFSET M LIMIT K` uses an exact O(M+K) max-heap
 after final aggregation instead of sorting every group, including when one
 group identity spans shards. The physical plan exposes these as `sort` and
 `top-k` above `final-aggregate`. Every distributed group key must still be
@@ -139,8 +139,8 @@ number canonicalization, float conversion, or allocation.
 
 The gateway refuses:
 
-- `AVG`, grouped `HAVING`, computed/window DISTINCT, windows, and `OFFSET` on a
-  multi-shard route;
+- `AVG`, grouped `HAVING`, computed/window DISTINCT, windows, and OFFSET on a
+  non-grouped multi-shard route;
 - derived, CTE, or predicate-subquery plans that read another physical source;
 - non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
 - unsupported single-statement scatter writes. Explicit bounded write batches

@@ -244,6 +244,7 @@ func (e *Executor) queryGlobalIndex(
 		}
 		basePlan := &plan{
 			calls: baseCalls, order: bound.order, limit: bound.limit,
+			offset: bound.offset, hasLimit: bound.hasLimit,
 			aggregates: bound.aggregates, groupKeys: bound.groupKeys, aggHeaders: bound.aggHeaders,
 		}
 		var result *Result
