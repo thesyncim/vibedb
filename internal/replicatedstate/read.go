@@ -78,6 +78,30 @@ type ReadSnapshot struct {
 	closeErr    error
 }
 
+// SnapshotFence is the allocation-free, immutable publication identity paired
+// with a ReadSnapshot. It excludes ConfState because consumers that only need
+// to reject a changed data/ownership cut should not clone Raft membership.
+type SnapshotFence struct {
+	Binding            Binding
+	Applied            uint64
+	LastTerm           uint64
+	LastEntryDigest    [32]byte
+	LogicalDigest      [32]byte
+	SnapshotBaseDigest [32]byte
+}
+
+// Fence returns the exact data and routing identity paired with this cut.
+func (s *ReadSnapshot) Fence() SnapshotFence {
+	if s == nil {
+		return SnapshotFence{}
+	}
+	return SnapshotFence{
+		Binding: s.state.Binding, Applied: s.state.Applied, LastTerm: s.state.LastTerm,
+		LastEntryDigest: s.state.LastEntryDigest, LogicalDigest: s.state.LogicalDigest,
+		SnapshotBaseDigest: s.state.SnapshotBaseDigest,
+	}
+}
+
 // State returns the complete durable state record paired with this cut.
 func (s *ReadSnapshot) State() State {
 	if s == nil {

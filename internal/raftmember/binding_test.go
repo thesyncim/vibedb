@@ -49,6 +49,38 @@ func TestBindingFromWALMapsCompleteIdentityWithoutMintingIncarnation(t *testing.
 	}
 }
 
+func TestBindingForNewWALMatchesTheEventuallyCreatedWAL(t *testing.T) {
+	identity := testWALIdentity(12)
+	authority := testAuthorityProfile()
+	planned, err := BindingForNewWAL(identity, testTopologyRecoveryEpoch, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wal, _, _ := createWAL(t, identity)
+	live, err := BindingFromWAL(wal, authority)
+	if err != nil || live != planned || wal.CurrentIncarnation() != 0 {
+		t.Fatalf("planned=%+v live=%+v incarnation=%d err=%v", planned, live, wal.CurrentIncarnation(), err)
+	}
+	invalid := identity
+	invalid.StoreID = [16]byte{}
+	if _, err := BindingForNewWAL(
+		invalid, testTopologyRecoveryEpoch, authority,
+	); !errors.Is(err, ErrWALUnavailable) {
+		t.Fatalf("invalid planned identity error = %v", err)
+	}
+	if _, err := BindingForNewWAL(
+		identity, 0, authority,
+	); !errors.Is(err, ErrWALUnavailable) {
+		t.Fatalf("zero topology epoch error = %v", err)
+	}
+	authority.RouteGeneration = 0
+	if _, err := BindingForNewWAL(
+		identity, testTopologyRecoveryEpoch, authority,
+	); !errors.Is(err, ErrBindingMismatch) {
+		t.Fatalf("zero authority generation error = %v", err)
+	}
+}
+
 func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 	walIdentity := testWALIdentity(20)
 	_, wal, _, _ := createWAL(t, walIdentity)

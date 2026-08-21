@@ -171,6 +171,13 @@ func (m *Manifest) SameShardLeaders(i int, other *Manifest, j int) bool {
 	return slices.Equal(m.shards[i].Leaders, other.shards[j].Leaders)
 }
 
+// ShardLeadersEqual compares one immutable manifest leader set with leaders
+// without cloning either slice.
+func (m *Manifest) ShardLeadersEqual(i int, leaders []EndpointID) bool {
+	return m != nil && i >= 0 && i < len(m.shards) &&
+		slices.Equal(m.shards[i].Leaders, leaders)
+}
+
 // Equal reports exact semantic manifest equality without allocating defensive
 // shard copies. Distribution, routing version, range geometry, shard ids,
 // ordered leaders, and ownership epochs all participate.

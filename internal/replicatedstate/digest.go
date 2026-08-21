@@ -12,9 +12,11 @@ import (
 var logicalDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
 
 type finalMutation struct {
-	key    []byte
-	value  []byte
-	delete bool
+	key         []byte
+	value       []byte
+	before      []byte
+	delete      bool
+	beforeFound bool
 }
 
 func logicalDigest(

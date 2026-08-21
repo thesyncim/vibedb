@@ -43,6 +43,11 @@ type Machine struct {
 	user            CollectionTarget
 	txnLog          *durable.TxnLog
 	options         Options
+	capture         TransitionCapture
+	captureTarget   TransitionCaptureTarget
+	captureBuffer   []byte
+	captureChanges  []finalMutation
+	captureKey      [8]byte
 
 	state       State
 	publication raftmodel.Publication
@@ -59,6 +64,17 @@ type CompletionCapacityState struct {
 	CompletionCount uint64
 }
 
+type openInputs struct {
+	binding         Binding
+	bootstrap       []byte
+	bootstrapDigest [sha256.Size]byte
+	system          CollectionTarget
+	userName        string
+	user            CollectionTarget
+	txnLog          *durable.TxnLog
+	options         Options
+}
+
 // Open validates and freezes one system collection and exactly one user
 // collection. An empty system collection represents a not-yet-installed static
 // bootstrap and is valid only with an empty user collection.
@@ -70,83 +86,19 @@ func Open(
 	txnLog *durable.TxnLog,
 	options Options,
 ) (result *Machine, resultErr error) {
-	if err := binding.validate(); err != nil {
-		return nil, err
-	}
-	if err := options.validate(); err != nil {
-		return nil, err
-	}
-	if err := system.validate(); err != nil {
-		return nil, fmt.Errorf("system collection: %w", err)
-	}
-	if system.Validation != ValidationSchemaFreeJSON ||
-		system.ValidationDigest != ([32]byte{}) || system.Validator != nil ||
-		system.ObserveMutationAttempt != nil {
-		return nil, fmt.Errorf("%w: system collection requires schema-free validation", ErrInvalidCollection)
-	}
-	if txnLog == nil {
-		return nil, fmt.Errorf("%w: nil transaction log", ErrInvalidOptions)
-	}
-	userName, user := userSpec.Name, userSpec.Target
-	if userName == "" || userName == systemCollectionName ||
-		len(userName) > replication.MaxCollectionBytes || !utf8.ValidString(userName) ||
-		strings.IndexByte(userName, 0) >= 0 {
-		return nil, fmt.Errorf("%w: user collection name", ErrInvalidCollection)
-	}
-	if err := user.validate(); err != nil {
-		return nil, fmt.Errorf("user collection %q: %w", userName, err)
-	}
-	if user.Validation != ValidationDeterministicMutation {
-		return nil, fmt.Errorf(
-			"user collection %q: %w: deterministic validation is required",
-			userName, ErrInvalidCollection,
-		)
-	}
-	if user.Limits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
-		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes ||
-		user.Limits.MaxDistinctMutations > MaxDistinctMutations {
-		return nil, fmt.Errorf("%w: user limits exceed the command profile", ErrInvalidCollection)
-	}
-	if user.Collection == system.Collection {
-		return nil, fmt.Errorf("%w: system and user handles alias", ErrInvalidCollection)
-	}
-	maxStateDocument := 2*MaxStateEnvelopeBytes + 2
-	maxCompletionDocument := 2*MaxCompletionRecordBytes + 2
-	maxSystemBatchBytes := len(stateKey) + maxStateDocument +
-		sha256.Size + 1 + maxCompletionDocument
-	if system.Limits.MaxKeyBytes < sha256.Size+1 ||
-		system.Limits.MaxDocumentBytes < maxCompletionDocument ||
-		system.Limits.MaxDistinctMutations < 2 ||
-		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
-		return nil, fmt.Errorf("%w: system collection cannot hold bounded records", ErrInvalidCollection)
-	}
-	maxUserBatchBytes := min(user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
-	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, maxSystemBatchBytes)
-	if !ok {
-		return nil, fmt.Errorf("%w: transaction byte proof overflows", ErrInvalidOptions)
-	}
-	if options.TxnLimits.MaxDocuments < user.Limits.MaxDistinctMutations+2 ||
-		options.TxnLimits.MaxBytes < requiredTxnBytes {
-		return nil, fmt.Errorf("%w: transaction limits do not cover the frozen apply profile", ErrInvalidOptions)
-	}
-	if err := txnLog.ValidateCollections([]durable.NamedCollection{
-		{Name: systemCollectionName, Collection: system.Collection},
-		{Name: userName, Collection: user.Collection},
-	}); err != nil {
-		return nil, fmt.Errorf("%w: transaction-log binding: %w", ErrInvalidCollection, err)
-	}
-	bootstrapBytes, bootstrapDigest, err := validateBootstrap(bootstrap)
+	prepared, err := prepareOpenInputs(
+		binding, bootstrap, system, userSpec, txnLog, options,
+	)
 	if err != nil {
 		return nil, err
 	}
-
-	binding.Distribution = strings.Clone(binding.Distribution)
-	binding.Shard = strings.Clone(binding.Shard)
-	userName = strings.Clone(userName)
+	binding, system = prepared.binding, prepared.system
+	userName, user := prepared.userName, prepared.user
+	bootstrapBytes, bootstrapDigest := prepared.bootstrap, prepared.bootstrapDigest
 	m := &Machine{
 		binding: binding, bootstrap: bootstrapBytes,
 		bootstrapDigest: bootstrapDigest, system: system,
-		userName: userName, user: user, txnLog: txnLog, options: options,
+		userName: userName, user: user, txnLog: prepared.txnLog, options: prepared.options,
 	}
 	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
 		{Name: systemCollectionName, Collection: system.Collection},
@@ -183,6 +135,9 @@ func Open(
 		return nil, err
 	}
 	if !present {
+		if options.TransitionCapture != nil {
+			return nil, ErrTransitionCapture
+		}
 		if completionCount != 0 || userSnapshot.Len() != 0 {
 			return nil, fmt.Errorf("%w: uninitialized system with durable rows", ErrStateCorrupt)
 		}
@@ -210,7 +165,112 @@ func Open(
 	m.binding = state.Binding
 	m.initialized = true
 	m.publication = publicationFromState(state)
+	if options.TransitionCapture != nil {
+		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
+}
+
+func prepareOpenInputs(
+	binding Binding,
+	bootstrap *pb.Snapshot,
+	system CollectionTarget,
+	userSpec UserCollection,
+	txnLog *durable.TxnLog,
+	options Options,
+) (openInputs, error) {
+	if err := binding.validate(); err != nil {
+		return openInputs{}, err
+	}
+	if err := options.validate(); err != nil {
+		return openInputs{}, err
+	}
+	if err := system.validate(); err != nil {
+		return openInputs{}, fmt.Errorf("system collection: %w", err)
+	}
+	if system.Validation != ValidationSchemaFreeJSON ||
+		system.ValidationDigest != ([32]byte{}) || system.Validator != nil ||
+		system.ObserveMutationAttempt != nil {
+		return openInputs{}, fmt.Errorf(
+			"%w: system collection requires schema-free validation", ErrInvalidCollection,
+		)
+	}
+	if txnLog == nil {
+		return openInputs{}, fmt.Errorf("%w: nil transaction log", ErrInvalidOptions)
+	}
+	userName, user := userSpec.Name, userSpec.Target
+	if userName == "" || userName == systemCollectionName ||
+		len(userName) > replication.MaxCollectionBytes || !utf8.ValidString(userName) ||
+		strings.IndexByte(userName, 0) >= 0 {
+		return openInputs{}, fmt.Errorf("%w: user collection name", ErrInvalidCollection)
+	}
+	if err := user.validate(); err != nil {
+		return openInputs{}, fmt.Errorf("user collection %q: %w", userName, err)
+	}
+	if user.Validation != ValidationDeterministicMutation {
+		return openInputs{}, fmt.Errorf(
+			"user collection %q: %w: deterministic validation is required",
+			userName, ErrInvalidCollection,
+		)
+	}
+	if user.Limits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
+		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes ||
+		user.Limits.MaxDistinctMutations > MaxDistinctMutations {
+		return openInputs{}, fmt.Errorf(
+			"%w: user limits exceed the command profile", ErrInvalidCollection,
+		)
+	}
+	if user.Collection == system.Collection {
+		return openInputs{}, fmt.Errorf(
+			"%w: system and user handles alias", ErrInvalidCollection,
+		)
+	}
+	maxStateDocument := 2*MaxStateEnvelopeBytes + 2
+	maxCompletionDocument := 2*MaxCompletionRecordBytes + 2
+	maxSystemBatchBytes := len(stateKey) + maxStateDocument +
+		sha256.Size + 1 + maxCompletionDocument
+	if system.Limits.MaxKeyBytes < sha256.Size+1 ||
+		system.Limits.MaxDocumentBytes < maxCompletionDocument ||
+		system.Limits.MaxDistinctMutations < 2 ||
+		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
+		return openInputs{}, fmt.Errorf(
+			"%w: system collection cannot hold bounded records", ErrInvalidCollection,
+		)
+	}
+	maxUserBatchBytes := min(user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
+	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, maxSystemBatchBytes)
+	if !ok {
+		return openInputs{}, fmt.Errorf(
+			"%w: transaction byte proof overflows", ErrInvalidOptions,
+		)
+	}
+	if options.TxnLimits.MaxDocuments < user.Limits.MaxDistinctMutations+2 ||
+		options.TxnLimits.MaxBytes < requiredTxnBytes {
+		return openInputs{}, fmt.Errorf(
+			"%w: transaction limits do not cover the frozen apply profile", ErrInvalidOptions,
+		)
+	}
+	if err := txnLog.ValidateCollections([]durable.NamedCollection{
+		{Name: systemCollectionName, Collection: system.Collection},
+		{Name: userName, Collection: user.Collection},
+	}); err != nil {
+		return openInputs{}, fmt.Errorf(
+			"%w: transaction-log binding: %w", ErrInvalidCollection, err,
+		)
+	}
+	bootstrapBytes, bootstrapDigest, err := validateBootstrap(bootstrap)
+	if err != nil {
+		return openInputs{}, err
+	}
+	binding.Distribution = strings.Clone(binding.Distribution)
+	binding.Shard = strings.Clone(binding.Shard)
+	return openInputs{
+		binding: binding, bootstrap: bootstrapBytes, bootstrapDigest: bootstrapDigest,
+		system: system, userName: strings.Clone(userName), user: user,
+		txnLog: txnLog, options: options,
+	}, nil
 }
 
 // bindingAdvancesFrom permits reopen through the write-once SQL/WAL binding

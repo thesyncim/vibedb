@@ -127,6 +127,40 @@ atomic write batches.
 The runnable path has no Raft replication, follower read, endpoint failover,
 or automatic topology controller.
 
+The internal range-split data plane is not part of the runnable path. It scans
+one certified source image once and routes each borrowed row to at most three
+children. It uses a compiled `vibejson` placement program and does not use
+`encoding/json`. It can omit the retained child copy.
+
+The same package writes deterministic hash-chained child artifacts. A verifier
+checks framing, key order, and document placement before it exposes a chunk.
+An ordered tail translator derives one exact batch for every child, including
+empty advances and shard-key moves. A non-serving child stage applies verified
+rows and tail batches to one durable collection. It validates the complete
+artifact image before tail catch-up and persists a fixed-size cursor through an
+atomic file replacement on Unix. An optional replicated-state capture writes
+each exact before-and-after transition in the same durable
+transaction as its source publication. A terminal ownership-fence entry must
+advance all mutable serving coordinates together. Every child durably records
+its empty seal batch, scans and hashes its complete ordered final image, and
+rechecks that image on reopen before a fixed-size cutover certificate can be
+issued. The certificate binds every non-retained child image. A sealed stage
+can initialize the standard replicated-state snapshot base in place without a
+second durable user-row copy. The SQL driver holds an exclusive non-serving
+claim while it receives the child. Activation converts that claim to the
+normal replicated apply owner without changing the user collection
+incarnation. A planned WAL identity breaks the bootstrap cycle. The final WAL
+is allocated once from the newer snapshot base and is rechecked against the
+SQL binding before the existing Raft runtime can adopt it.
+
+The certificate is evidence, not topology authority. Retained cleanup plans
+bounded ordered key batches, checkpoints each batch before proposal, and
+confirms only the exact atomically captured replicated deletes. A final fresh
+scan certifies the retained image. The gateway accepts that completion proof
+only with the exact one-source manifest replacement. Durable and in-memory
+authority still move through the catalog's generation compare-and-swap
+operations.
+
 ## External memory and unsafe code
 
 The engine uses pointer-free mapped arenas, typed byte views, SIMD loads, and
@@ -150,6 +184,7 @@ review rules.
 | PostgreSQL protocol | `pgwire` |
 | Static distributed runtime | `distribution`, `gateway`, `shardservice` |
 | Replication kernel | `internal/raft*`, `internal/multiraft`, `internal/replicatedstate` |
+| Range-split kernel | `autosplit`, `internal/rangesplit` |
 
 ## Implementation references
 
@@ -158,3 +193,10 @@ review rules.
 - `query/exec.go` and `sql/driver/runtime.go`
 - `gateway/executor.go` and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
+- `autosplit/action.go`
+- `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, `stage.go`, and
+  `source_capture.go`
+- `internal/rangesplit/cutover.go`
+- `internal/replicatedstate/capture.go`
+- `sql/driver/replicated_child_stage.go`
+- `internal/raftmember/staged_child.go`

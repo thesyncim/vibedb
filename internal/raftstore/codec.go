@@ -221,6 +221,12 @@ func validateIdentity(identity Identity) error {
 	return nil
 }
 
+// ValidateIdentity validates the immutable member identity without creating,
+// opening, allocating, or otherwise mutating a WAL namespace.
+func ValidateIdentity(identity Identity) error {
+	return validateIdentity(identity)
+}
+
 func readFresh(reader io.Reader, destination []byte) error {
 	if _, err := io.ReadFull(reader, destination); err != nil {
 		return fmt.Errorf("%w: random bytes: %v", ErrInvalid, err)

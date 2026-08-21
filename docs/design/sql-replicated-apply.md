@@ -9,6 +9,24 @@ command.
 A runtime adopts one healthy WAL, one bound SQL database, and one apply claim.
 Direct SQL mutation remains fenced while the claim is active.
 
+## Staged child activation
+
+`OpenReplicatedChildStage` claims one bound user collection before any child
+row is visible through SQL. It requires an exact child artifact, placement
+program, shard range, allocation generation, ownership epoch, routing version,
+and apply profile. The claim accepts verified artifact chunks and consecutive
+tail batches. It does not expose the collection or the state machine.
+
+`Activate` requires a sealed cutover certificate. It publishes or reuses the
+hidden apply collection, initializes the replicated state row, and transfers
+the exclusive connector reference to `ReplicatedApply`. It does not copy the
+user rows or replace their storage incarnation. SQL sessions remain refused
+until a runtime claims the apply owner or the owner closes explicitly.
+
+An invalid artifact-output profile fails before hidden storage publication. An
+uncertain catalog publication returns the intended apply identity and keeps the
+stage exclusive. An exact retry settles publication and resumes activation.
+
 ## Determinism
 
 A replicated command contains immutable binding identity and mutable state
@@ -46,3 +64,5 @@ A deterministic WAL or apply failure latches terminal runtime failure.
 - `internal/replicatedstate/apply.go` and `machine.go`
 - `internal/raftmember/runtime.go`, `apply.go`, and `admission.go`
 - `sql/driver/replicated_store.go` and `replicated_apply.go`
+- `sql/driver/replicated_child_stage.go`
+- `internal/rangesplit/activate.go`

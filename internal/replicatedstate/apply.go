@@ -483,6 +483,8 @@ func (m *Machine) planMutations(
 		if err != nil {
 			return nil, 0, err
 		}
+		mutation.before = current
+		mutation.beforeFound = found
 		if m.user.Validation == ValidationDeterministicMutation {
 			validation := MutationValidation(0)
 			if mutation.delete {
@@ -577,17 +579,42 @@ func (m *Machine) persistTransition(
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
+	var transition CapturedTransition
+	var captureRecord []byte
+	if m.shouldCaptureTransition(next) {
+		transition = m.capturedTransition(next, changes)
+		if !validCapturedTransition(transition) {
+			return ErrTransitionCapture
+		}
+		maxRecord, err := m.capture.MaxEncodedBytes(transition.Bounds())
+		if err != nil || maxRecord <= 0 {
+			return errors.Join(ErrTransitionCapture, err)
+		}
+		captureRecord, err = m.capture.AppendTransition(m.captureBuffer[:0], transition)
+		if err != nil || len(captureRecord) == 0 || len(captureRecord) > maxRecord ||
+			len(captureRecord) > m.captureTarget.Collection.MaxDocumentBytes() {
+			return errors.Join(ErrTransitionCapture, err)
+		}
+		m.captureBuffer = captureRecord
+	}
 	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
 		return err
 	}
 	stateDocument := wrapJSONHex(nil, stateEnvelope)
-	if err := m.checkTransitionCapacity(next, changes, completionKey, completionDocument); err != nil {
+	if err := m.checkTransitionCapacityWithCapture(
+		next, changes, completionKey, completionDocument, len(captureRecord),
+	); err != nil {
 		return err
 	}
 	members := []durable.NamedCollection{{Name: systemCollectionName, Collection: m.system.Collection}}
 	if len(changes) != 0 {
 		members = append(members, durable.NamedCollection{Name: m.userName, Collection: m.user.Collection})
+	}
+	if len(captureRecord) != 0 {
+		members = append(members, durable.NamedCollection{
+			Name: m.captureTarget.Name, Collection: m.captureTarget.Collection,
+		})
 	}
 	err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, func(batch *durable.DatabaseBatch) error {
 		systemBatch, err := batch.Collection(systemCollectionName)
@@ -600,6 +627,16 @@ func (m *Machine) persistTransition(
 		if len(completionDocument) != 0 {
 			if err := systemBatch.Put(completionKey[:], completionDocument); err != nil {
 				return err
+			}
+		}
+		if len(captureRecord) != 0 {
+			captureBatch, captureErr := batch.Collection(m.captureTarget.Name)
+			if captureErr != nil {
+				return captureErr
+			}
+			binary.BigEndian.PutUint64(m.captureKey[:], transition.Applied)
+			if captureErr = captureBatch.Put(m.captureKey[:], captureRecord); captureErr != nil {
+				return captureErr
 			}
 		}
 		if len(changes) == 0 {
@@ -631,6 +668,11 @@ func (m *Machine) persistTransition(
 	m.binding = next.Binding
 	m.initialized = true
 	m.publication = publicationFromState(next)
+	if len(captureRecord) != 0 {
+		if err := m.capture.Published(transition); err != nil {
+			return errors.Join(ErrTransitionCapture, err)
+		}
+	}
 	return nil
 }
 
@@ -639,6 +681,31 @@ func (m *Machine) checkTransitionCapacity(
 	changes []finalMutation,
 	completionKey [33]byte,
 	completionDocument []byte,
+) error {
+	captureBytes := 0
+	if m.shouldCaptureTransition(next) {
+		transition := m.capturedTransition(next, changes)
+		if !validCapturedTransition(transition) {
+			return ErrTransitionCapture
+		}
+		var err error
+		captureBytes, err = m.capture.MaxEncodedBytes(transition.Bounds())
+		if err != nil || captureBytes <= 0 ||
+			captureBytes > m.captureTarget.Collection.MaxDocumentBytes() {
+			return errors.Join(ErrTransitionCapture, err)
+		}
+	}
+	return m.checkTransitionCapacityWithCapture(
+		next, changes, completionKey, completionDocument, captureBytes,
+	)
+}
+
+func (m *Machine) checkTransitionCapacityWithCapture(
+	next State,
+	changes []finalMutation,
+	completionKey [33]byte,
+	completionDocument []byte,
+	captureBytes int,
 ) error {
 	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
@@ -669,9 +736,19 @@ func (m *Machine) checkTransitionCapacity(
 	if len(changes) != 0 {
 		collections++
 	}
+	if captureBytes != 0 {
+		if captureBytes > m.captureTarget.Collection.MaxBatchBytes()-8 ||
+			userBytes > math.MaxInt-captureBytes-8 {
+			return ErrAdmissionBound
+		}
+		collections++
+		userBytes += 8 + captureBytes
+		systemDocs++
+	}
 	if collections > m.options.TxnLimits.MaxCollections ||
 		systemDocs+len(changes) > m.options.TxnLimits.MaxDocuments ||
-		int64(stateBytes+userBytes) > m.options.TxnLimits.MaxBytes {
+		int64(stateBytes) > math.MaxInt64-int64(userBytes) ||
+		int64(stateBytes)+int64(userBytes) > m.options.TxnLimits.MaxBytes {
 		return ErrAdmissionBound
 	}
 	return nil

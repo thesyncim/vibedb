@@ -61,6 +61,7 @@ var (
 	ErrSnapshotStageIncomplete     = errors.New("replicatedstate: snapshot staging is incomplete")
 	ErrSnapshotStageOutcomeUnknown = errors.New("replicatedstate: snapshot staging durability outcome is unknown")
 	ErrSnapshotBase                = errors.New("replicatedstate: invalid snapshot base certificate")
+	ErrStagedSnapshot              = errors.New("replicatedstate: invalid staged snapshot initialization")
 	ErrOwnershipTransition         = errors.New("replicatedstate: invalid ownership transition")
 )
 
@@ -228,8 +229,9 @@ func (t CollectionTarget) validate() error {
 // Options fixes the cross-collection and completion-retention admission
 // profile. Zero values fail closed.
 type Options struct {
-	TxnLimits      durable.TxnLimits
-	MaxCompletions uint64
+	TxnLimits         durable.TxnLimits
+	MaxCompletions    uint64
+	TransitionCapture TransitionCapture
 }
 
 func (o Options) validate() error {

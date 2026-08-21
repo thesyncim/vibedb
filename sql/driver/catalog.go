@@ -214,6 +214,10 @@ type database struct {
 	replicatedApplyFile       *os.File
 	replicatedApplyCollection *durable.Collection
 	replicatedApplyClaim      *ReplicatedApply
+	// replicatedChildStageClaim exclusively owns the sole user collection
+	// while a certified split child is received and converted in place into
+	// replicated apply. It is never a SQL or serving capability.
+	replicatedChildStageClaim *ReplicatedChildStage
 	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
 	// state joined atomically with user-table publication. The larger staged
 	// mutation remains in the append-only transaction journal.
