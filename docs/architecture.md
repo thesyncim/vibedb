@@ -318,9 +318,13 @@ remain predictable because their capacities and fold work are fixed at open.
   learner through ordinary `AppendEntries`. `internal/rebalance` now derives an
   intact-shard replica move from exact catalog, membership, snapshot-digest,
   apply, progress, leadership, ownership-transition, catalog-CAS, generation-
-  drain, and retirement evidence. It remains a non-serving controller kernel:
-  peer transport, an external topology authority, server wiring, automatic
-  failover, and physical child-range split execution remain absent.
+  drain, and retirement evidence. `internal/rangesplit` adds the first physical
+  child data-plane kernel: one source scan, one compiled `vibejson` placement
+  extraction per row, fixed child-range dispatch, a no-copy retained child, and
+  a digest over the complete desired manifest. Both remain non-serving:
+  persistent certified child outputs, source-tail translation, peer transport,
+  an external topology authority, server wiring, automatic failover, and
+  ordered split cutover remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and

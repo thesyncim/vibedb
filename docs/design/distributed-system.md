@@ -413,9 +413,14 @@ cluster does not fork into named protocol generations.
    `AppendEntries`. An intact-shard stateless reconciler now binds exact
    membership, base digest, target apply/progress, promotion, leader transfer,
    replicated ownership-fence advance, expected-generation catalog CAS,
-   generation drain, removal, and retirement evidence. It does not authenticate
-   or transport the artifact, provide topology authority, construct the target
-   SQL root, execute a filtered physical split, wire servers, or grant serving
+   generation drain, removal, and retirement evidence. A separate physical
+   split kernel now binds the complete desired-manifest identity and performs a
+   single source scan that routes each borrowed row through one compiled
+   `vibejson` placement program into one fixed child range, without copying the
+   retained child and without warmed row-path allocation. It does not persist
+   or certify those filtered outputs, translate the ordered source tail into
+   independent child groups, authenticate transport, provide topology
+   authority, construct target SQL roots, wire servers, or grant serving
    ownership by itself.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
