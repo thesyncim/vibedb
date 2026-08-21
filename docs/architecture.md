@@ -161,6 +161,17 @@ only with the exact one-source manifest replacement. Durable and in-memory
 authority still move through the catalog's generation compare-and-swap
 operations.
 
+The internal topology scheduler has a second non-serving path for replica
+movement. It consumes fixed-width, exact-generation capacity reports, nets
+source releases against target reservations in seven resource dimensions, and
+selects endpoints only when the maximum projected dominant pressure improves.
+Current replicas, failure domains, receive concurrency, migration ingress, and
+per-node concentration are hard bounds. The warm scheduler is fixed-memory and
+allocation-free. Its result is still advisory: an external owner attaches Raft
+member identities and drives the stateless `internal/rebalance` proof sequence.
+Leader-only manifest cutover shares the immutable range index and untouched
+leader storage instead of rebuilding every shard.
+
 ## External memory and unsafe code
 
 The engine uses pointer-free mapped arenas, typed byte views, SIMD loads, and
@@ -194,8 +205,8 @@ review rules.
 - `gateway/executor.go` and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`, and
-  `capacity_placement.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`,
+  `capacity_placement.go`, and `replica_move.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, `stage.go`, and
   `source_capture.go`
 - `internal/rangesplit/cutover.go`
@@ -204,3 +215,4 @@ review rules.
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
 - `internal/splitcontroller/execute.go`
+- `internal/rebalance/plan.go` and `reconcile.go`
