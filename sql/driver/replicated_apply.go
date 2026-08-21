@@ -108,6 +108,10 @@ type ReplicatedApply struct {
 	closed            bool
 	attemptGeneration uint64
 	attemptActive     bool
+	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
+	// SQL sessions fenced until raftmember atomically retires the connector or
+	// the apply claim is explicitly closed.
+	exclusiveConnector bool
 }
 
 var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
@@ -337,97 +341,16 @@ func (d *Database) openReplicatedApply(
 			"%w: replicated user collection is unavailable", ErrReplicatedApplyMismatch,
 		)
 	}
-	if core.catalog.ReplicatedApply == nil {
-		// A prior definite descriptor failure may have retained an unpublished
-		// candidate because detaching it from the transaction log could not yet
-		// complete. Retry ownership discharge and cleanup before allocating a new
-		// identity; never overwrite the only pointers to a still-registered store.
-		if core.replicatedApplyCollection != nil || core.replicatedApplyFile != nil {
-			if core.replicatedApplyCollection == nil || core.replicatedApplyFile == nil {
-				return nil, ReplicatedApplyIdentity{}, errors.New(
-					"vibedb: incomplete unpublished replicated apply ownership",
-				)
-			}
-			if err := core.txnLog.DetachCollection(
-				core.replicatedApplyCollection,
-			); err != nil {
-				return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-					"vibedb: retry unpublished replicated apply detach: %w", err,
-				)
-			}
-			path := core.replicatedApplyFile.Name()
-			cleanupErr := core.discardUnpublishedStorageLocked(
-				core.replicatedApplyCollection, core.replicatedApplyFile, path,
-			)
-			core.replicatedApplyCollection = nil
-			core.replicatedApplyFile = nil
-			if cleanupErr != nil {
-				return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-					"vibedb: retry unpublished replicated apply cleanup: %w",
-					cleanupErr,
-				)
-			}
-		}
-		if t.collection.Len() != 0 {
-			return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-				"%w: first activation requires an empty user collection",
-				ErrReplicatedApplyMismatch,
-			)
-		}
-		identity, err := core.createReplicatedApplyStorageLocked(expected, options)
-		if err != nil {
-			return nil, ReplicatedApplyIdentity{}, err
-		}
-		previousPending := core.catalogWritePending
-		stored := replicatedApplyMetaFromIdentity(identity)
-		core.catalog.ReplicatedApply = &stored
-		core.catalogWritePending = true
-		var published bool
-		if persist != nil {
-			published, err = persist(core)
-		} else {
-			published, err = core.persistCatalogLocked()
-		}
-		if err == nil && !published {
-			err = errors.New("catalog persistence returned without publication")
-		}
-		if err != nil {
-			publicationErr := fmt.Errorf("vibedb: publish replicated apply descriptor: %w", err)
-			if published || errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-				core.catalogWritePending = !published
-				return nil, identity, publicationErr
-			}
-			core.catalog.ReplicatedApply = nil
-			core.catalogWritePending = previousPending
-			path := core.replicatedApplyPath(&stored)
-			detachErr := core.txnLog.DetachCollection(core.replicatedApplyCollection)
-			if detachErr != nil {
-				// Keep the unpublished candidate owned by the database. Closing or
-				// unlinking it while the transaction log still names the handle would
-				// leave stale catalog scope; the detach failure already makes retry
-				// unsafe and database teardown will release both owners.
-				return nil, ReplicatedApplyIdentity{}, errors.Join(
-					publicationErr,
-					fmt.Errorf(
-						"vibedb: detach unpublished replicated apply storage: %w",
-						detachErr,
-					),
-				)
-			}
-			cleanupErr := core.discardUnpublishedStorageLocked(
-				core.replicatedApplyCollection, core.replicatedApplyFile, path,
-			)
-			core.replicatedApplyCollection = nil
-			core.replicatedApplyFile = nil
-			return nil, ReplicatedApplyIdentity{}, errors.Join(publicationErr, cleanupErr)
-		}
-	} else if !replicatedApplyMetaMatchesOptions(
-		core.catalog.ReplicatedApply, expected, options,
-	) {
-		return nil, ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+	if core.catalog.ReplicatedApply == nil && t.collection.Len() != 0 {
+		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+			"%w: first activation requires an empty user collection",
+			ErrReplicatedApplyMismatch,
+		)
 	}
-
-	identity := core.catalog.ReplicatedApply.identity()
+	identity, err := core.prepareReplicatedApplyStorageLocked(expected, options, persist)
+	if err != nil {
+		return nil, identity, err
+	}
 	if core.replicatedApplyCollection == nil {
 		return nil, identity, fmt.Errorf(
 			"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
@@ -467,6 +390,105 @@ func (d *Database) openReplicatedApply(
 	core.replicatedApplyClaim = claim
 	d.connector.refs++
 	return claim, identity, nil
+}
+
+// prepareReplicatedApplyStorageLocked makes the hidden participant and its
+// descriptor durable, or validates the exact already-published participant.
+// The caller owns database.mu and is responsible for deciding whether a
+// non-empty user collection is legal before calling this common publication
+// boundary.
+func (d *database) prepareReplicatedApplyStorageLocked(
+	expected ReplicatedShardStoreIdentity,
+	options ReplicatedApplyOptions,
+	persist func(*database) (bool, error),
+) (ReplicatedApplyIdentity, error) {
+	if d.catalog.ReplicatedApply != nil {
+		if !replicatedApplyMetaMatchesOptions(d.catalog.ReplicatedApply, expected, options) {
+			return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+		}
+		identity := d.catalog.ReplicatedApply.identity()
+		if d.replicatedApplyCollection == nil {
+			return identity, fmt.Errorf(
+				"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
+			)
+		}
+		return identity, nil
+	}
+
+	// A prior definite descriptor failure may have retained an unpublished
+	// candidate because detaching it from the transaction log could not yet
+	// complete. Retry ownership discharge and cleanup before allocating a new
+	// identity; never overwrite the only pointers to a still-registered store.
+	if d.replicatedApplyCollection != nil || d.replicatedApplyFile != nil {
+		if d.replicatedApplyCollection == nil || d.replicatedApplyFile == nil {
+			return ReplicatedApplyIdentity{}, errors.New(
+				"vibedb: incomplete unpublished replicated apply ownership",
+			)
+		}
+		if err := d.txnLog.DetachCollection(d.replicatedApplyCollection); err != nil {
+			return ReplicatedApplyIdentity{}, fmt.Errorf(
+				"vibedb: retry unpublished replicated apply detach: %w", err,
+			)
+		}
+		path := d.replicatedApplyFile.Name()
+		cleanupErr := d.discardUnpublishedStorageLocked(
+			d.replicatedApplyCollection, d.replicatedApplyFile, path,
+		)
+		d.replicatedApplyCollection = nil
+		d.replicatedApplyFile = nil
+		if cleanupErr != nil {
+			return ReplicatedApplyIdentity{}, fmt.Errorf(
+				"vibedb: retry unpublished replicated apply cleanup: %w", cleanupErr,
+			)
+		}
+	}
+
+	identity, err := d.createReplicatedApplyStorageLocked(expected, options)
+	if err != nil {
+		return ReplicatedApplyIdentity{}, err
+	}
+	previousPending := d.catalogWritePending
+	stored := replicatedApplyMetaFromIdentity(identity)
+	d.catalog.ReplicatedApply = &stored
+	d.catalogWritePending = true
+	var published bool
+	if persist != nil {
+		published, err = persist(d)
+	} else {
+		published, err = d.persistCatalogLocked()
+	}
+	if err == nil && !published {
+		err = errors.New("catalog persistence returned without publication")
+	}
+	if err == nil {
+		return identity, nil
+	}
+	publicationErr := fmt.Errorf("vibedb: publish replicated apply descriptor: %w", err)
+	if published || errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		d.catalogWritePending = !published
+		return identity, publicationErr
+	}
+	d.catalog.ReplicatedApply = nil
+	d.catalogWritePending = previousPending
+	path := d.replicatedApplyPath(&stored)
+	detachErr := d.txnLog.DetachCollection(d.replicatedApplyCollection)
+	if detachErr != nil {
+		// Keep the unpublished candidate owned by the database. Closing or
+		// unlinking it while the transaction log still names the handle would
+		// leave stale catalog scope; the detach failure already makes retry unsafe.
+		return ReplicatedApplyIdentity{}, errors.Join(
+			publicationErr,
+			fmt.Errorf(
+				"vibedb: detach unpublished replicated apply storage: %w", detachErr,
+			),
+		)
+	}
+	cleanupErr := d.discardUnpublishedStorageLocked(
+		d.replicatedApplyCollection, d.replicatedApplyFile, path,
+	)
+	d.replicatedApplyCollection = nil
+	d.replicatedApplyFile = nil
+	return ReplicatedApplyIdentity{}, errors.Join(publicationErr, cleanupErr)
 }
 
 func (d *database) createReplicatedApplyStorageLocked(
@@ -740,7 +762,8 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 	if connector.closed || connector.db == nil {
 		return ErrDatabaseClosed
 	}
-	if a.owner != connector || a.database != connector.db || connector.refs != 1 {
+	if a.owner != connector || a.database != connector.db || connector.refs != 1 ||
+		(connector.exclusive && !a.exclusiveConnector) {
 		return fmt.Errorf(
 			"%w: runtime ownership requires the apply claim as the sole live reference",
 			ErrReplicatedApplyBusy,
@@ -756,6 +779,7 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 		return ErrReplicatedApplyClosed
 	}
 	connector.closed = true
+	connector.exclusive = false
 	return nil
 }
 
@@ -778,6 +802,11 @@ func (a *ReplicatedApply) Close() error {
 	a.closed = true
 	core.replicatedApplyClaim = nil
 	core.mu.Unlock()
+	if a.exclusiveConnector {
+		a.owner.mu.Lock()
+		a.owner.exclusive = false
+		a.owner.mu.Unlock()
+	}
 	return a.owner.release()
 }
 

@@ -141,18 +141,23 @@ artifact image before tail catch-up and persists a fixed-size cursor through an
 atomic file replacement on Unix. An optional replicated-state capture writes
 each exact before-and-after transition in the same durable
 transaction as its source publication. A terminal ownership-fence entry must
-advance all mutable serving coordinates together; every child durably records
+advance all mutable serving coordinates together. Every child durably records
 its empty seal batch, scans and hashes its complete ordered final image, and
 rechecks that image on reopen before a fixed-size cutover certificate can be
 issued. The certificate binds every non-retained child image. A sealed stage
 can initialize the standard replicated-state snapshot base in place without a
-second durable user-row copy; the Raft runtime must still install that base
-before the child can serve.
+second durable user-row copy. The SQL driver holds an exclusive non-serving
+claim while it receives the child. Activation converts that claim to the
+normal replicated apply owner without changing the user collection
+incarnation. A planned WAL identity breaks the bootstrap cycle. The final WAL
+is allocated once from the newer snapshot base and is rechecked against the
+SQL binding before the existing Raft runtime can adopt it.
+
 The certificate is evidence, not topology authority. Retained cleanup plans
 bounded ordered key batches, checkpoints each batch before proposal, and
 confirms only the exact atomically captured replicated deletes. A final fresh
 scan certifies the retained image. The gateway accepts that completion proof
-only with the exact one-source manifest replacement; durable and in-memory
+only with the exact one-source manifest replacement. Durable and in-memory
 authority still move through the catalog's generation compare-and-swap
 operations.
 
@@ -193,3 +198,5 @@ review rules.
   `source_capture.go`
 - `internal/rangesplit/cutover.go`
 - `internal/replicatedstate/capture.go`
+- `sql/driver/replicated_child_stage.go`
+- `internal/raftmember/staged_child.go`

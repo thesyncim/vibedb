@@ -128,7 +128,7 @@ The source closes the final write gap with a terminal ownership-fence entry.
 All mutable serving coordinates advance together, every child persists the
 corresponding empty batch, and certification reconstructs that capture entry
 and matches every durable child cursor. Each destination also scans and hashes
-its complete ordered final image; reopen verifies the same proof. A fixed-size
+its complete ordered final image. Reopen verifies the same proof. A fixed-size
 checksum-protected certificate binds those non-retained child images and the
 exact cut but deliberately grants no serving authority.
 
@@ -137,6 +137,19 @@ replicated-state snapshot base. The conversion validates the final image with
 the child's mutation contract, writes only the hidden state row, and does not
 rewrite user rows. The independent child Raft runtime must still install that
 small base before the child is eligible to serve.
+
+The SQL driver owns this conversion. It prevents SQL sessions while the child
+image is incomplete. It stages into the final bound table, publishes the
+hidden apply participant, and transfers one exclusive claim to the normal
+replicated apply path. The user collection handle and storage identity do not
+change. An uncertain catalog publication retains the intended apply identity
+for exact settlement and retry.
+
+The child WAL is not allocated twice. A validated immutable member identity
+provides the planned SQL binding before the WAL exists. After activation, the
+WAL builder checks the live apply cut, artifact manifest, snapshot-base state,
+planned binding, and newly created WAL. Only then can the existing runtime mint
+an incarnation and construct a Raft node.
 
 Retained cleanup never deletes storage behind Raft. It checkpoints bounded
 ordered batches, submits them as normal replicated deletes at the post-seal
@@ -181,6 +194,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/stage_image.go` and `activate.go`
 - `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`
 - `internal/replicatedstate/staged_snapshot.go`
+- `sql/driver/replicated_child_stage.go`
+- `internal/raftmember/staged_child.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

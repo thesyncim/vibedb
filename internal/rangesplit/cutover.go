@@ -46,11 +46,18 @@ type CutoverCertificate struct {
 type CutoverWorkspace struct {
 	capture SourceCaptureWorkspace
 	tail    TailWorkspace
-	hasher  hash.Hash
-	digest  [sha256.Size]byte
-	body    [cutoverCertificateBody]byte
+	verify  CutoverVerifyWorkspace
 	stages  [autosplit.MaxSplitChildren]*ChildStageCursor
 	batches [autosplit.MaxSplitChildren][sha256.Size]byte
+}
+
+// CutoverVerifyWorkspace retains only the fixed hash state needed to validate
+// one certificate. It avoids attaching the larger capture and tail workspaces
+// to long-lived child stages.
+type CutoverVerifyWorkspace struct {
+	hasher hash.Hash
+	digest [sha256.Size]byte
+	body   [cutoverCertificateBody]byte
 }
 
 // SourceCut returns the terminal source publication bound to the certificate.
@@ -203,14 +210,25 @@ func (p *Partitioner) CertifyCutover(
 			certificate.childImages[child] = workspace.stages[child].imageDigest
 		}
 	}
-	certificate.digest = cutoverDigest(&certificate, workspace)
+	certificate.digest = cutoverDigest(&certificate, &workspace.verify)
 	return certificate, nil
 }
 
 // VerifyCutoverCertificate checks immutable plan and geometry bindings. It
 // does not replace the live SourceCapture check performed by CertifyCutover.
 func (p *Partitioner) VerifyCutoverCertificate(certificate CutoverCertificate) error {
+	var workspace CutoverVerifyWorkspace
+	return p.VerifyCutoverCertificateWithWorkspace(certificate, &workspace)
+}
+
+// VerifyCutoverCertificateWithWorkspace is VerifyCutoverCertificate with
+// reusable hash state for allocation-free repeated checks.
+func (p *Partitioner) VerifyCutoverCertificateWithWorkspace(
+	certificate CutoverCertificate,
+	workspace *CutoverVerifyWorkspace,
+) error {
 	if p == nil || !validCutoverCertificate(&certificate) ||
+		workspace == nil ||
 		certificate.plan != p.digest ||
 		certificate.placement != p.program.Digest() ||
 		certificate.childCount != p.childCount || certificate.retained != p.retained ||
@@ -219,8 +237,7 @@ func (p *Partitioner) VerifyCutoverCertificate(certificate CutoverCertificate) e
 		certificate.coordinates.RoutingVersion != uint64(p.target) {
 		return ErrCutoverCertificate
 	}
-	var workspace CutoverWorkspace
-	if cutoverDigest(&certificate, &workspace) != certificate.digest {
+	if cutoverDigest(&certificate, workspace) != certificate.digest {
 		return ErrCutoverCertificate
 	}
 	return nil
@@ -242,7 +259,7 @@ func AppendCutoverCertificateWithWorkspace(
 	workspace *CutoverWorkspace,
 ) ([]byte, error) {
 	if workspace == nil || !validCutoverCertificate(certificate) ||
-		cutoverDigest(certificate, workspace) != certificate.digest {
+		cutoverDigest(certificate, &workspace.verify) != certificate.digest {
 		return dst, ErrCutoverCertificate
 	}
 	start := len(dst)
@@ -286,7 +303,7 @@ func OpenCutoverCertificate(raw []byte) (*CutoverCertificate, error) {
 		copy(certificate.childImages[child][:], raw[416+child*32:448+child*32])
 	}
 	copy(certificate.digest[:], raw[cutoverCertificateBody:cutoverCertificateBytes])
-	var workspace CutoverWorkspace
+	var workspace CutoverVerifyWorkspace
 	if !validCutoverCertificate(certificate) ||
 		cutoverDigest(certificate, &workspace) != certificate.digest {
 		return nil, ErrCutoverCertificate
@@ -323,7 +340,7 @@ func appendCutoverBody(dst []byte, certificate *CutoverCertificate) []byte {
 
 func cutoverDigest(
 	certificate *CutoverCertificate,
-	workspace *CutoverWorkspace,
+	workspace *CutoverVerifyWorkspace,
 ) [sha256.Size]byte {
 	if workspace.hasher == nil {
 		workspace.hasher = sha256.New()

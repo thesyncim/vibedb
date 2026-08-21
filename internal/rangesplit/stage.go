@@ -55,6 +55,7 @@ type ChildStage struct {
 	validator       childArtifactWriter
 	tailVerify      TailBatchVerifyWorkspace
 	image           childStageImageWorkspace
+	activation      CutoverVerifyWorkspace
 }
 
 // NewChildStage creates one stage with the default artifact replay bound.

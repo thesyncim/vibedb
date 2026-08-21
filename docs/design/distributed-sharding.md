@@ -68,7 +68,7 @@ the complete digest and publication chain before capture resumes.
 The final source gap closes with one captured ownership-fence entry. It advances
 ownership epoch, routing version, and route generation together and carries no
 row changes. Every child persists the exact empty batch and enters a terminal
-sealed phase. Sealing hashes the complete ordered child image; reopening a
+sealed phase. Sealing hashes the complete ordered child image. Reopening a
 sealed stage rescans it and rejects changed files. Certification rereads and
 verifies the capture record, recomputes all child batch digests, binds every
 non-retained image digest, and refuses a source head that advanced past the
@@ -76,8 +76,22 @@ seal. A sealed stage can initialize the standard replicated-state snapshot base
 in place without rewriting user rows. Raft must install that base before
 serving activation.
 
+The SQL adapter stages rows directly into the final bound user collection. It
+holds an exclusive connector claim, so SQL sessions cannot observe the image
+while artifact or tail work is active. Activation publishes the hidden apply
+participant, writes only the replicated state row, and transfers the same
+claim to `ReplicatedApply`. A crash after hidden-participant publication can
+settle and retry with the exact apply identity and sealed stage cursor.
+
+The destination does not need a provisional WAL. `BindingForNewWAL` derives a
+non-serving SQL binding from the intended immutable member identity.
+`CreateStagedChildWAL` later requires the activated apply cut, child artifact
+manifest, snapshot-base state, planned SQL binding, and created live WAL to
+agree. It then returns the WAL without minting a node incarnation. The ordinary
+Raft runtime remains the only activation owner.
+
 The resulting certificate does not publish the catalog. Retained cleanup is a
-bounded, resumable sequence of ordinary replicated deletes; it checkpoints a
+bounded, resumable sequence of ordinary replicated deletes. It checkpoints a
 batch before proposal, verifies the exact captured transition after apply, and
 finishes with a fresh retained-image digest. The gateway accepts the terminal
 proof only when the next manifest replaces exactly the planned source and
@@ -105,3 +119,5 @@ boundary.
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/rangesplit/cutover.go`
 - `internal/rangesplit/stage_image.go` and `activate.go`
+- `sql/driver/replicated_child_stage.go`
+- `internal/raftmember/staged_child.go`

@@ -70,6 +70,13 @@ type SnapshotArtifactOptions struct {
 	PayloadBuffer    []byte
 }
 
+// ValidateSnapshotArtifactOptions validates deterministic artifact framing
+// bounds without opening a snapshot or writing output.
+func ValidateSnapshotArtifactOptions(options SnapshotArtifactOptions) error {
+	_, err := normalizeSnapshotArtifactOptions(options)
+	return err
+}
+
 // SnapshotArtifactCheckpoint is emitted after one complete chunk has passed
 // its hash-chain and row-frame checks. EndOffset is the exact byte position at
 // the end of the chunk, suitable for a durable receiver checkpoint.

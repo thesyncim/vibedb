@@ -42,6 +42,19 @@ a caller from replacing an uncertain record with different data.
 The active WAL is append-only. Compaction creates an offline generation. It
 does not rewrite the active file in place.
 
+## Staged child base
+
+A split child can start from a certified snapshot base whose index is newer
+than one. `BindingForNewWAL` validates an intended immutable member identity
+and derives its SQL binding without allocating a provisional WAL. This binding
+does not grant serving authority.
+
+After SQL child activation, `CreateStagedChildWAL` checks the live apply cut,
+artifact manifest, snapshot-base state, planned SQL binding, and final WAL
+identity. It creates one preallocated WAL from that base. It does not mint a
+node incarnation. `AdoptRuntime` remains the ownership transfer that constructs
+the Raft node.
+
 ## Replicated SQL binding
 
 `BindReplicatedShardStore` permanently converts a prepared local SQL root. The
@@ -68,3 +81,4 @@ controls must protect physical root ownership.
 - `sql/driver/replicated_store.go`
 - `internal/raftstore/store_test.go`
 - `sql/driver/replicated_store_test.go`
+- `internal/raftmember/binding.go` and `staged_child.go`

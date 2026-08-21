@@ -57,10 +57,42 @@ func BindingFromWAL(
 	}
 
 	identity := wal.Identity()
+	return bindingFromIdentity(identity, wal.TopologyRecoveryEpoch(), authority), nil
+}
+
+// BindingForNewWAL derives the exact SQL binding for an intended immutable WAL
+// identity before that WAL exists. This breaks the staged-child bootstrap
+// cycle: SQL can receive and certify its final image first, then the WAL can be
+// created once from the resulting newer immutable snapshot base. The planned
+// binding grants no runtime or serving authority; CreateStagedChildWAL must
+// later prove the created WAL and snapshot base match it exactly.
+func BindingForNewWAL(
+	identity raftstore.Identity,
+	topologyRecoveryEpoch uint64,
+	authority sqldriver.ReplicatedAuthorityProfile,
+) (sqldriver.ReplicatedShardStoreBinding, error) {
+	if err := raftstore.ValidateIdentity(identity); err != nil || topologyRecoveryEpoch == 0 {
+		return sqldriver.ReplicatedShardStoreBinding{}, errors.Join(
+			ErrWALUnavailable, err,
+		)
+	}
+	if authority.ActivePolicyGeneration == 0 || authority.ProtectionEpoch == 0 ||
+		authority.OwnershipEpoch == 0 || authority.SchemaGeneration == 0 ||
+		authority.RoutingVersion == 0 || authority.RouteGeneration == 0 {
+		return sqldriver.ReplicatedShardStoreBinding{}, ErrBindingMismatch
+	}
+	return bindingFromIdentity(identity, topologyRecoveryEpoch, authority), nil
+}
+
+func bindingFromIdentity(
+	identity raftstore.Identity,
+	topologyRecoveryEpoch uint64,
+	authority sqldriver.ReplicatedAuthorityProfile,
+) sqldriver.ReplicatedShardStoreBinding {
 	return sqldriver.ReplicatedShardStoreBinding{
 		ClusterID:             identity.ClusterID,
 		ClusterIncarnation:    identity.ClusterIncarnation,
-		TopologyRecoveryEpoch: wal.TopologyRecoveryEpoch(),
+		TopologyRecoveryEpoch: topologyRecoveryEpoch,
 		Distribution:          identity.Distribution,
 		Shard:                 identity.Shard,
 		AllocationGeneration:  identity.AllocationGeneration,
@@ -69,7 +101,7 @@ func BindingFromWAL(
 		MemberID:              identity.MemberID,
 		StoreID:               identity.StoreID,
 		Authority:             authority,
-	}, nil
+	}
 }
 
 // BindPreparedSQL permanently puts an already-prepared local shard root into

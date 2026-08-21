@@ -201,6 +201,16 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 			MaxCompletions: 128,
 		},
 	}
+	if err := stage.CheckActivationCoordinates(certificate, binding); err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(1_000, func() {
+		if err := stage.CheckActivationCoordinates(certificate, binding); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("activation coordinate check allocations = %v, want 0", allocs)
+	}
 	wrong := target
 	wrong.Binding.AllocationGeneration++
 	if _, _, _, err := stage.InitializeReplicatedChild(

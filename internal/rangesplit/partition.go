@@ -132,6 +132,24 @@ func (p *Partitioner) Digest() [sha256.Size]byte {
 	return p.digest
 }
 
+// CollectionName returns the immutable user collection bound into every
+// artifact and tail proof produced by this partitioner.
+func (p *Partitioner) CollectionName() string {
+	if p == nil {
+		return ""
+	}
+	return p.collection
+}
+
+// SourceDistribution returns the immutable distribution whose source range is
+// being split.
+func (p *Partitioner) SourceDistribution() distribution.DistributionName {
+	if p == nil {
+		return ""
+	}
+	return p.source.Distribution
+}
+
 // PartitionSnapshot scans the source user collection exactly once. Every row
 // is parsed once and dispatched to exactly one child. It copies no row bytes.
 func (p *Partitioner) PartitionSnapshot(

@@ -96,6 +96,10 @@ type dbConnector struct {
 	db     *database
 	closed bool
 	refs   int
+	// exclusive is held only by a non-serving replicated child stage and the
+	// apply claim produced directly from it. It prevents SQL readers from racing
+	// in-place image construction or the immediate Raft ownership handoff.
+	exclusive bool
 }
 
 const (
@@ -191,6 +195,9 @@ func (c *dbConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 	}
 	if c.closed {
 		return nil, sqldriver.ErrBadConn
+	}
+	if c.exclusive {
+		return nil, ErrReplicatedChildStageBusy
 	}
 	c.refs++
 	return &conn{

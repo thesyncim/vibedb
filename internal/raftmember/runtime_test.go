@@ -3,6 +3,7 @@ package raftmember
 import (
 	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -246,16 +247,33 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 		t.Fatalf("BuildSnapshotBase = %v, %v", base, err)
 	}
 	identity := fixture.wal.Identity()
-	if err := fixture.runtime.Close(); err != nil {
-		t.Fatal(err)
+	activation := sqldriver.ReplicatedChildActivation{
+		Apply: fixture.apply, ApplyIdentity: fixture.applyID,
+		SnapshotBase: base, ArtifactManifest: manifest,
+	}
+	wrong := activation
+	wrong.ArtifactManifest.Digest[0] ^= 0xff
+	rejectedPath := filepath.Join(t.TempDir(), "rejected.wal")
+	if got, err := CreateStagedChildWAL(
+		rejectedPath, identity, testWALKey(), testTopologyRecoveryEpoch,
+		testAuthorityProfile(), fixture.base, wrong, fixture.options,
+	); got != nil || !errors.Is(err, ErrBindingMismatch) {
+		t.Fatalf("mismatched staged WAL = %v, %v", got, err)
+	}
+	if _, err := os.Stat(rejectedPath); !os.IsNotExist(err) {
+		t.Fatalf("mismatched staged WAL created namespace: %v", err)
 	}
 
-	newWAL, err := raftstore.Create(
+	newWAL, err := CreateStagedChildWAL(
 		filepath.Join(t.TempDir(), "replacement.wal"), identity, testWALKey(),
-		raftstore.Bootstrap{TopologyRecoveryEpoch: testTopologyRecoveryEpoch, Snapshot: base},
+		testTopologyRecoveryEpoch, testAuthorityProfile(), fixture.base, activation,
 		fixture.options,
 	)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.Close(); err != nil {
+		_ = newWAL.Close()
 		t.Fatal(err)
 	}
 	reopenedDB, reopenedApply, err := OpenBoundSQLWithApply(

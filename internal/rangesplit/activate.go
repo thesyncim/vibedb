@@ -43,16 +43,9 @@ func (s *ChildStage) InitializeReplicatedChild(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cursor == nil || s.cursor.phase != ChildStageSealed ||
-		s.partitioner.VerifyCutoverCertificate(certificate) != nil ||
+	if !s.validActivationLocked(certificate, target.Binding) ||
 		target.User.Name != s.partitioner.collection ||
-		target.User.Target.Collection != s.collection ||
-		!s.activationBindingMatches(target.Binding, certificate) ||
-		s.cursor.SourceCut() != certificate.SourceCut() ||
-		s.cursor.artifactDigest != certificate.childBases[s.cursor.child] ||
-		s.cursor.lastBatchDigest != certificate.sealBatches[s.cursor.child] ||
-		s.cursor.imageDigest != certificate.childImages[s.cursor.child] ||
-		s.verifySealedImage(s.cursor) != nil {
+		target.User.Target.Collection != s.collection {
 		return nil, nil, replicatedstate.SnapshotArtifactManifest{}, ErrChildStage
 	}
 	entryDigest := childActivationEntryDigest(
@@ -67,6 +60,47 @@ func (s *ChildStage) InitializeReplicatedChild(
 		},
 		target.ArtifactOptions,
 	)
+}
+
+func (s *ChildStage) validActivationLocked(
+	certificate CutoverCertificate,
+	binding replicatedstate.Binding,
+) bool {
+	return s.validActivationCoordinatesLocked(certificate, binding) &&
+		s.verifySealedImage(s.cursor) == nil
+}
+
+// CheckActivationCoordinates validates the sealed cursor, cutover
+// certificate, and destination binding without rescanning the child image.
+// InitializeReplicatedChild performs the full image scan before mutation.
+func (s *ChildStage) CheckActivationCoordinates(
+	certificate CutoverCertificate,
+	binding replicatedstate.Binding,
+) error {
+	if s == nil {
+		return ErrChildStage
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.validActivationCoordinatesLocked(certificate, binding) {
+		return ErrChildStage
+	}
+	return nil
+}
+
+func (s *ChildStage) validActivationCoordinatesLocked(
+	certificate CutoverCertificate,
+	binding replicatedstate.Binding,
+) bool {
+	return s.cursor != nil && s.cursor.phase == ChildStageSealed &&
+		s.partitioner.VerifyCutoverCertificateWithWorkspace(
+			certificate, &s.activation,
+		) == nil &&
+		s.activationBindingMatches(binding, certificate) &&
+		s.cursor.SourceCut() == certificate.SourceCut() &&
+		s.cursor.artifactDigest == certificate.childBases[s.cursor.child] &&
+		s.cursor.lastBatchDigest == certificate.sealBatches[s.cursor.child] &&
+		s.cursor.imageDigest == certificate.childImages[s.cursor.child]
 }
 
 func (s *ChildStage) activationBindingMatches(
