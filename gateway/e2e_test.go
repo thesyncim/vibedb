@@ -1383,6 +1383,55 @@ func TestE2EScatterAggregateFinalization(t *testing.T) {
 	}
 }
 
+func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
+	c := newE2ECluster(t)
+	seedClient := NewClient(plainDial(c.dialer.servers))
+	defer seedClient.Close()
+	for i := range c.shards {
+		key := c.freshKeysForShard(t, c.shards[i].id, 1)[0]
+		c.seed(t, seedClient, c.shards[i],
+			`INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
+			[]shardservice.Param{
+				shardservice.StringParam(key), shardservice.NumberParam("7"),
+			})
+	}
+
+	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
+	result, err := e.Query(context.Background(), Query{
+		SQL:   `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages GROUP BY n`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Rows) != 9 {
+		t.Fatalf("group count = %d, want 9", len(result.Rows))
+	}
+	found := false
+	for _, row := range result.Rows {
+		if len(row) != 5 || row[0].Null || string(row[0].Bytes) != "7" {
+			continue
+		}
+		found = true
+		want := []string{"7", "4", "28", "7", "7"}
+		for column := range want {
+			if row[column].Null || string(row[column].Bytes) != want[column] {
+				t.Fatalf("combined group column %d = %q/null=%v, want %q",
+					column, row[column].Bytes, row[column].Null, want[column])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("combined n=7 group was not returned")
+	}
+	if got := c.dialer.totalDials(); got != 12 {
+		t.Fatalf("total dials = %d, want acquire/query/release per shard", got)
+	}
+	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 {
+		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
+	}
+}
+
 func TestE2EEmptyRouteAggregateIdentity(t *testing.T) {
 	c := newE2ECluster(t)
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
@@ -1405,6 +1454,21 @@ func TestE2EEmptyRouteAggregateIdentity(t *testing.T) {
 	}
 	if got := c.dialer.totalDials(); got != 0 {
 		t.Fatalf("empty aggregate opened %d shard connections", got)
+	}
+
+	grouped, err := e.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`WHERE tenant_id = 'a' AND tenant_id = 'b' GROUP BY tenant_id`,
+		Class: ClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grouped.Columns) != 2 || len(grouped.Rows) != 0 {
+		t.Fatalf("empty grouped result = %d columns, %d rows", len(grouped.Columns), len(grouped.Rows))
+	}
+	if got := c.dialer.totalDials(); got != 0 {
+		t.Fatalf("empty grouped aggregate opened %d shard connections", got)
 	}
 }
 

@@ -24,6 +24,7 @@ type distributedPrivate struct {
 	rowBytes    float64
 	order       []OrderKey
 	aggregates  []bootstrap.AggKind
+	groupKeys   []int
 	indexLookup bool
 }
 
@@ -117,6 +118,9 @@ func (m *distributedCostModel) LocalCost(
 		}, nil
 	case queryplanner.OpFinalAggregate:
 		rows := max(1, float64(metadata.targets))
+		if len(metadata.groupKeys) != 0 {
+			rows = max(1, metadata.outputRows)
+		}
 		width := max(16, metadata.rowBytes)
 		return queryplanner.Cost{
 			CPU:     boundedProduct(rows, float64(len(metadata.aggregates))),
@@ -272,7 +276,7 @@ func optimizeDistributedAccessPlan(
 	metadata := distributedPrivate{
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
-		order: bound.order, aggregates: bound.aggregates,
+		order: bound.order, aggregates: bound.aggregates, groupKeys: bound.groupKeys,
 		indexLookup: indexLookup,
 	}
 	if bound.limit > 0 && len(bound.aggregates) == 0 {
@@ -280,7 +284,9 @@ func optimizeDistributedAccessPlan(
 			float64(bound.limit)*float64(max(1, len(route.Targets))))
 	}
 	if len(bound.aggregates) != 0 {
-		metadata.outputRows = float64(len(route.Targets))
+		if len(bound.groupKeys) == 0 {
+			metadata.outputRows = float64(len(route.Targets))
+		}
 		metadata.rowBytes = max(metadata.rowBytes, float64(len(bound.aggregates))*16)
 	}
 	memo := queryplanner.NewMemo(queryplanner.Limits{})
@@ -299,8 +305,12 @@ func optimizeDistributedAccessPlan(
 	}
 	root := remoteGroup
 	if len(bound.aggregates) != 0 && len(route.Targets) > 1 {
+		finalRows := metadata.outputRows
+		if len(bound.groupKeys) == 0 {
+			finalRows = 1
+		}
 		root, err = memo.NewGroup(queryplanner.LogicalProperties{
-			Rows:     queryplanner.ExactEstimate(1),
+			Rows:     queryplanner.ExactEstimate(finalRows),
 			RowBytes: queryplanner.ExactEstimate(metadata.rowBytes),
 		})
 		if err != nil {

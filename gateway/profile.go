@@ -57,7 +57,8 @@ type Profile struct {
 	MaxConcurrency int
 
 	// MaxAggregateRows and MaxAggregateBytes cap the rows and result bytes the
-	// gateway buffers across every shard of one operation.
+	// gateway buffers across every shard of one operation. MaxAggregateBytes
+	// also caps retained grouped-finalization state and its completed output.
 	MaxAggregateRows  uint64
 	MaxAggregateBytes uint64
 

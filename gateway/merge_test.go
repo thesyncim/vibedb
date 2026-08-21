@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/shardservice"
@@ -90,6 +91,34 @@ func BenchmarkCrossShardExactNumberCompare(b *testing.B) {
 	b.SetBytes(int64(len(left.num) + len(right.num)))
 	for b.Loop() {
 		_ = compareCells(left, right)
+	}
+}
+
+func BenchmarkMergeGroupedPartialAggregates1K(b *testing.B) {
+	const groups = 1024
+	columns := []shardservice.Column{{Name: "k"}, {Name: "count"}, {Name: "sum"}}
+	results := make([]*shardservice.ShardResponse, 2)
+	var inputBytes int64
+	for shard := range results {
+		rows := make([][]shardservice.Cell, groups)
+		for group := range rows {
+			key := strconv.Itoa(group)
+			value := strconv.Itoa(group + shard + 1)
+			rows[group] = []shardservice.Cell{cell(key), cell("1"), cell(value)}
+			inputBytes += int64(len(key) + 1 + len(value))
+		}
+		results[shard] = &shardservice.ShardResponse{
+			Kind: shardservice.ResponseRows, Columns: columns, Rows: rows,
+		}
+	}
+	kinds := []sqlast.AggKind{sqlast.AggNone, sqlast.AggCount, sqlast.AggSum}
+	b.ReportAllocs()
+	b.SetBytes(inputBytes)
+	for b.Loop() {
+		_, rows, err := mergeGroupedAggregateRows(results, kinds, []int{0}, 64<<20)
+		if err != nil || len(rows) != groups {
+			b.Fatalf("merge = %d rows, %v", len(rows), err)
+		}
 	}
 }
 
@@ -237,6 +266,121 @@ func TestMergeAggregateRowsExact(t *testing.T) {
 		if got := string(rows[0][i].Bytes); got != want[i] || rows[0][i].Null {
 			t.Fatalf("column %d = %q/null=%v, want %q", i, got, rows[0][i].Null, want[i])
 		}
+	}
+}
+
+func groupedResponse(rows ...[]shardservice.Cell) *shardservice.ShardResponse {
+	return &shardservice.ShardResponse{
+		Kind: shardservice.ResponseRows,
+		Columns: []shardservice.Column{
+			{Name: "k"}, {Name: "count"}, {Name: "sum"}, {Name: "min"}, {Name: "max"},
+		},
+		Rows: rows,
+	}
+}
+
+func TestMergeGroupedAggregateRowsExactCanonicalKeys(t *testing.T) {
+	results := []*shardservice.ShardResponse{
+		groupedResponse(
+			[]shardservice.Cell{cell("1"), cell("2"), cell("3.5"), cell("1"), cell("2.5")},
+			[]shardservice.Cell{cell(`"caf\u00e9"`), cell("1"), cell("5"), cell("5"), cell("5")},
+		),
+		groupedResponse(
+			[]shardservice.Cell{cell("1.0"), cell("3"), cell("2.5"), cell("-1"), cell("4")},
+			[]shardservice.Cell{cell(`"café"`), cell("4"), cell("1"), cell("0"), cell("1")},
+		),
+	}
+	kinds := []sqlast.AggKind{
+		sqlast.AggNone, sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}
+	columns, rows, err := mergeGroupedAggregateRows(results, kinds, []int{0}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 5 || len(rows) != 2 {
+		t.Fatalf("shape = %d columns, %d rows", len(columns), len(rows))
+	}
+	want := [][]string{
+		{"1", "5", "6", "-1", "4"},
+		{`"caf\u00e9"`, "5", "6", "0", "5"},
+	}
+	for row := range want {
+		for column := range want[row] {
+			if got := string(rows[row][column].Bytes); rows[row][column].Null || got != want[row][column] {
+				t.Fatalf("row %d column %d = %q/null=%v, want %q",
+					row, column, got, rows[row][column].Null, want[row][column])
+			}
+		}
+	}
+}
+
+func TestMergeGroupedAggregateRowsAdmissionAndMalformedKey(t *testing.T) {
+	kinds := []sqlast.AggKind{sqlast.AggNone, sqlast.AggCount}
+	columns := []shardservice.Column{{Name: "k"}, {Name: "count"}}
+	malformed := &shardservice.ShardResponse{
+		Kind: shardservice.ResponseRows, Columns: columns,
+		Rows: [][]shardservice.Cell{{cell("1x"), cell("1")}},
+	}
+	if _, _, err := mergeGroupedAggregateRows(
+		[]*shardservice.ShardResponse{malformed}, kinds, []int{0}, 1<<20,
+	); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("malformed grouped key error = %v, want ErrMergeAggregate", err)
+	}
+
+	valid := &shardservice.ShardResponse{
+		Kind: shardservice.ResponseRows, Columns: columns,
+		Rows: [][]shardservice.Cell{{cell(`"large-group-key"`), cell("1")}},
+	}
+	if _, _, err := mergeGroupedAggregateRows(
+		[]*shardservice.ShardResponse{valid}, kinds, []int{0}, 1,
+	); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("grouped state cap error = %v, want ErrMergeAggregate", err)
+	}
+
+	if _, _, err := mergeGroupedAggregateRows(
+		[]*shardservice.ShardResponse{valid}, kinds, []int{1}, 1<<20,
+	); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("invalid grouped program error = %v, want ErrMergeAggregate", err)
+	}
+}
+
+func TestMergeGroupedAggregateIntegerPromotionAndKeyOnlyDedup(t *testing.T) {
+	columns := []shardservice.Column{{Name: "k"}, {Name: "count"}, {Name: "sum"}}
+	results := []*shardservice.ShardResponse{
+		{
+			Kind: shardservice.ResponseRows, Columns: columns,
+			Rows: [][]shardservice.Cell{{
+				cell("1"), cell("18446744073709551615"), cell("9223372036854775807"),
+			}},
+		},
+		{
+			Kind: shardservice.ResponseRows, Columns: columns,
+			Rows: [][]shardservice.Cell{{cell("1.0"), cell("1"), cell("1")}},
+		},
+	}
+	_, rows, err := mergeGroupedAggregateRows(results,
+		[]sqlast.AggKind{sqlast.AggNone, sqlast.AggCount, sqlast.AggSum},
+		[]int{0}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || string(rows[0][1].Bytes) != "18446744073709551616" ||
+		string(rows[0][2].Bytes) != "9223372036854775808" {
+		t.Fatalf("promoted grouped state = %+v", rows)
+	}
+
+	keyOnlyColumns := []shardservice.Column{{Name: "k"}}
+	keyOnly := []*shardservice.ShardResponse{
+		{Kind: shardservice.ResponseRows, Columns: keyOnlyColumns,
+			Rows: [][]shardservice.Cell{{cell("1")}}},
+		{Kind: shardservice.ResponseRows, Columns: keyOnlyColumns,
+			Rows: [][]shardservice.Cell{{cell("1e0")}}},
+	}
+	_, rows, err = mergeGroupedAggregateRows(
+		keyOnly, []sqlast.AggKind{sqlast.AggNone}, []int{0}, 1<<20,
+	)
+	if err != nil || len(rows) != 1 || string(rows[0][0].Bytes) != "1" {
+		t.Fatalf("key-only grouped dedup = %+v, %v", rows, err)
 	}
 }
 

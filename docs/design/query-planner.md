@@ -84,7 +84,19 @@ Executable multi-shard shapes are:
   ordinal;
 - unordered `Gather` and ordered k-way `MergeGather`, including global
   `LIMIT`; and
-- exact global `COUNT`, `SUM`, `MIN`, and `MAX` finalization.
+- exact global and grouped `COUNT`, `SUM`, `MIN`, and `MAX` finalization.
+
+Grouped execution sends the authored `GROUP BY` to every shard as the partial
+stage, interns the returned key tuples using the query engine's exact group-key
+encoding, and finalizes dense columnar accumulator lanes at the gateway. Small
+integer counts and sums stay in native registers, promote to `big.Int` only on
+overflow, and enter rational mode only for a real decimal. Retained state and
+completed output share the operation's finite aggregate byte admission. Group
+order is stable first appearance; plans needing post-finalization ordering or
+top-K are still refused.
+Until fragment projection rewriting lands, every distributed group key must be
+present in the SELECT output so the final stage receives the complete identity;
+a single-shard route retains the local engine's broader projection surface.
 
 Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
 ordered-key bounds and seek the durable primary graph before document decoding.
@@ -119,8 +131,8 @@ number canonicalization, float conversion, or allocation.
 
 The gateway refuses:
 
-- `AVG`, grouped aggregates, `HAVING`, `DISTINCT`, windows, and `OFFSET` on a
-  multi-shard route;
+- `AVG`, grouped `HAVING`/`ORDER BY`/`LIMIT`, `DISTINCT`, windows, and `OFFSET`
+  on a multi-shard route;
 - derived, CTE, or predicate-subquery plans that read another physical source;
 - non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
 - unsupported single-statement scatter writes. Explicit bounded write batches

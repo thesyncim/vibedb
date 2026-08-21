@@ -124,7 +124,10 @@ Currently executable distributed shapes include:
 - colocated `INNER` and `LEFT` joins;
 - `Gather` and ordered `MergeGather`;
 - global `LIMIT`; and
-- global `COUNT`, `SUM`, `MIN`, and `MAX` over mergeable shard results.
+- global and grouped `COUNT`, `SUM`, `MIN`, and `MAX` over mergeable
+  shard-local states. Grouped finalization uses the query engine's exact
+  composite key identity and a memory-capped columnar accumulator; grouped
+  `ORDER BY`, `LIMIT`, `HAVING`, and `AVG` remain refused.
 
 ## Gateway write contract
 

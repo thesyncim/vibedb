@@ -882,7 +882,13 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	var rows [][]shardservice.Cell
 	var err error
 	if len(pl.aggregates) != 0 {
-		columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
+		if len(pl.groupKeys) != 0 {
+			columns, rows, err = mergeGroupedAggregateRows(
+				results, pl.aggregates, pl.groupKeys, p.MaxAggregateBytes,
+			)
+		} else {
+			columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
+		}
 	} else {
 		columns, rows, err = mergeRows(results, pl.order, pl.limit)
 	}
@@ -896,9 +902,14 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 func emptyAggregateResult(pl *plan) *Result {
 	const oidJSON int32 = 114
 	columns := make([]shardservice.Column, len(pl.aggregates))
-	row := make([]shardservice.Cell, len(pl.aggregates))
 	for i := range pl.aggregates {
 		columns[i] = shardservice.Column{Name: pl.aggHeaders[i], TypeOID: oidJSON}
+	}
+	if len(pl.groupKeys) != 0 {
+		return &Result{Kind: shardservice.ResponseRows, Columns: columns}
+	}
+	row := make([]shardservice.Cell, len(pl.aggregates))
+	for i := range pl.aggregates {
 		if pl.aggregates[i] == sqlast.AggCount {
 			row[i].Bytes = []byte("0")
 		} else {

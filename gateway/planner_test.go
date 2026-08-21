@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -109,6 +110,52 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	}
 	if len(scatterBound.aggregates) != 1 || scatterBound.aggregates[0] != sqlast.AggCount {
 		t.Fatalf("aggregate program = %v, want COUNT", scatterBound.aggregates)
+	}
+
+	grouped, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages GROUP BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare grouped aggregate: %v", err)
+	}
+	groupedBound, err := grouped.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind grouped aggregate: %v", err)
+	}
+	if err := groupedBound.ValidateRoute(routeBoundPlan(t, groupedBound)); err != nil {
+		t.Fatalf("scatter GROUP BY validation: %v", err)
+	}
+	wantKinds := []sqlast.AggKind{
+		sqlast.AggNone, sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}
+	if !slices.Equal(groupedBound.aggregates, wantKinds) || !slices.Equal(groupedBound.groupKeys, []int{0}) {
+		t.Fatalf("grouped program = %v keys %v, want %v keys [0]",
+			groupedBound.aggregates, groupedBound.groupKeys, wantKinds)
+	}
+
+	groupedOrder, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare grouped ORDER BY: %v", err)
+	}
+	groupedOrderBound, err := groupedOrder.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind grouped ORDER BY: %v", err)
+	}
+	if err := groupedOrderBound.ValidateRoute(routeBoundPlan(t, groupedOrderBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("grouped ORDER BY validation = %v, want unsupported post-finalization sort", err)
+	}
+
+	missingKey, err := snap.Prepare(context.Background(),
+		`SELECT COUNT(*) FROM messages GROUP BY tenant_id`)
+	if err != nil {
+		t.Fatalf("Prepare omitted grouped key: %v", err)
+	}
+	missingKeyBound, err := missingKey.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind omitted grouped key: %v", err)
+	}
+	if err := missingKeyBound.ValidateRoute(routeBoundPlan(t, missingKeyBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("omitted grouped key validation = %v, want unsupported finalization", err)
 	}
 
 	single, err := snap.Prepare(context.Background(),

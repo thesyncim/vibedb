@@ -39,6 +39,7 @@ type plan struct {
 	order        []OrderKey
 	limit        int
 	aggregates   []sqlast.AggKind
+	groupKeys    []int
 	aggHeaders   []string
 	physical     *queryplanner.Plan
 	planning     queryplanner.OptimizerStatistics
@@ -130,6 +131,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		order:        bound.order,
 		limit:        bound.limit,
 		aggregates:   bound.aggregates,
+		groupKeys:    bound.groupKeys,
 		aggHeaders:   bound.aggHeaders,
 		physical:     physical,
 		planning:     planning,
