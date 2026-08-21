@@ -87,23 +87,23 @@ Executable multi-shard shapes are:
 - exact global and grouped `COUNT`, `SUM`, `MIN`, and `MAX` finalization.
 
 Grouped execution sends the authored `GROUP BY` to every shard as the partial
-stage, interns the returned key tuples using the query engine's exact group-key
-encoding, and finalizes dense columnar accumulator lanes at the gateway. Small
+stage. On a multi-shard route an additive request marker asks the shard runtime
+to parse the original SQL once, then remove final-only `ORDER BY` and `LIMIT`
+nodes from its owned AST before lowering. The wire still carries authored SQL
+and typed parameters, never a serialized plan or a second rewritten SQL string.
+This guarantees that a local LIMIT cannot discard a partial group needed by
+another shard. The gateway interns returned key tuples using the query engine's
+exact group-key encoding and finalizes dense columnar accumulator lanes. Small
 integer counts and sums stay in native registers, promote to `big.Int` only on
 overflow, and enter rational mode only for a real decimal. Retained state and
 completed output share the operation's finite aggregate byte admission. Group
 order is stable first appearance when unordered. Grouped `ORDER BY` adds a
-bounded exact final sort. When the GROUP BY tuple contains the full placement
-key, groups are shard-local: each shard's local K is then sufficient for the
-global K, and `ORDER BY ... LIMIT K` uses an exact O(K) max-heap final stage
-instead of sorting every group. The physical plan exposes these as `sort` and
-`top-k` above `final-aggregate`.
-Until fragment projection rewriting lands, every distributed group key must be
+bounded exact final sort. `ORDER BY ... LIMIT K` uses an exact O(K) max-heap
+after final aggregation instead of sorting every group, including when one
+group identity spans shards. The physical plan exposes these as `sort` and
+`top-k` above `final-aggregate`. Every distributed group key must still be
 present in the SELECT output so the final stage receives the complete identity;
 a single-shard route retains the local engine's broader projection surface.
-LIMIT on a group identity that can span shards also remains refused: forwarding
-the authored local LIMIT could discard a partial group needed by the final
-stage.
 
 Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
 ordered-key bounds and seek the durable primary graph before document decoding.
@@ -138,8 +138,8 @@ number canonicalization, float conversion, or allocation.
 
 The gateway refuses:
 
-- `AVG`, grouped `HAVING`, non-shard-local grouped `LIMIT`, `DISTINCT`, windows,
-  and `OFFSET` on a multi-shard route;
+- `AVG`, grouped `HAVING`, `DISTINCT`, windows, and `OFFSET` on a multi-shard
+  route;
 - derived, CTE, or predicate-subquery plans that read another physical source;
 - non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
 - unsupported single-statement scatter writes. Explicit bounded write batches

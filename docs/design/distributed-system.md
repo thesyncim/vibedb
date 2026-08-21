@@ -91,6 +91,14 @@ additionally validates its read dependencies before the commit decision.
 Session vectors remain available for causal reads that do not require a
 cluster-wide snapshot.
 
+The CRDB reference is deliberately limited to its strongest correctness
+mechanisms: [serializable read refresh, recoverable parallel commit, and
+Raft-synchronized closed
+timestamps](https://www.cockroachlabs.com/docs/v26.3/architecture/transaction-layer),
+plus leaseholder/range fencing. These protect the distributed lane and follower
+reads; they do not add a timestamp-oracle, DistSQL, or transaction-record round
+trip to a proven one-bucket routed operation.
+
 ## Indexes
 
 Shard-local indexes remain the preferred colocated access path. A global index
@@ -177,6 +185,20 @@ each shard—without turning foreground transactional storage into a MergeTree:
 - immutable snapshots and cold projections may live in object storage behind a
   content-addressed local cache, while foreground intents, journals, and Raft
   state remain on quorum-controlled local storage.
+
+The reference direction is ClickHouse's current execution stack, not its old
+`Distributed`-table bottleneck: [multi-stage distributed
+execution](https://clickhouse.com/blog/multi-stage-distributed-query-execution-clickhouse-cloud)
+repartitions intermediate rows between stages; [runtime join
+filters](https://clickhouse.com/blog/clickhouse-fast-joins) reject probe work
+before hash lookup; [distributed index
+analysis](https://clickhouse.com/blog/index-sharding-clickhouse-cloud-petabyte-scale-indexing)
+assigns index ranges independently of data reading; and current [batched lazy
+materialization](https://clickhouse.com/blog/clickhouse-release-25-12) finds
+row identities from narrow sort/filter columns before fetching wide payloads.
+VibeDB adopts these operator shapes under certified transactional snapshots and
+bounded ownership-aware work leases rather than copying ClickHouse Cloud's
+shared-storage assumptions.
 
 The row-oriented routed lane remains authoritative for point reads and writes.
 Columnar projections are derived, incarnation-fenced structures: the optimizer
@@ -278,10 +300,12 @@ cluster does not fork into named protocol generations.
    batches, filter-first/lazy projection, exact-index pushdown, covering
    aggregates, adaptive joins, and spill. Distributed grouped COUNT/SUM/MIN/MAX
    now run as shard-local partial aggregation plus a memory-capped, exact
-   columnar final stage; bounded exact final sorting and O(K) top-K for
-   placement-local groups are present. Vectorized stage exchange, top-K over
-   cross-shard group identities, runtime filters across exchanges, and parallel
-   replica scheduling remain pending.
+   columnar final stage. Parsed partial fragments remove shard-local final
+   ordering and limits without serializing a plan or synthesizing SQL; bounded
+   exact final sorting and O(K) top-K work even when group identities span
+   shards. Hash/range exchange and worker-local final aggregation come next,
+   followed by runtime filters, batched row-ID late materialization, distributed
+   index analysis, and guarded parallel-replica range scheduling.
 6. **Pending:** wire the existing Raft foundation into serving, enable
    movement, and add disaggregated immutable snapshot/cold-data caching.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
