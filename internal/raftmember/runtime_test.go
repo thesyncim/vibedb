@@ -201,6 +201,64 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
+	fixture := newRuntimeFixture(t, 221, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	peer := fixture.runtime.identity.MemberID + 1
+	change := &pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(peer),
+	}
+	if err := fixture.runtime.ProposeConfChange(change); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.ProposeConfChange(change); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("second configuration proposal before drain = %v", err)
+	}
+	change.NodeId = runtimeUint64Ptr(peer + 1)
+	drainRuntime(t, fixture.runtime, nil)
+	publication, err := fixture.runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication.ReplicaSetVersion != publication.Applied ||
+		len(publication.ConfState.GetLearners()) != 1 ||
+		publication.ConfState.GetLearners()[0] != peer {
+		t.Fatalf("configuration publication = %+v", publication)
+	}
+
+	context := []byte("linearizable-read")
+	if err := fixture.runtime.ReadIndex(context); err != nil {
+		t.Fatal(err)
+	}
+	context[0] = 'X'
+	var outcomes []raftmodel.ReadOutcome
+	for step := 0; step < 1000; step++ {
+		result, driveErr := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		if driveErr != nil {
+			t.Fatalf("DriveReady step %d: %v", step, driveErr)
+		}
+		outcomes = append(outcomes, result.ReadOutcomes...)
+		if !result.Progressed() {
+			break
+		}
+	}
+	if len(outcomes) != 1 || outcomes[0].Err != nil ||
+		string(outcomes[0].Barrier.Context) != "linearizable-read" ||
+		outcomes[0].Barrier.Index == 0 || outcomes[0].Barrier.Term == 0 ||
+		outcomes[0].Barrier.Incarnation != fixture.runtime.identity.NodeIncarnation {
+		t.Fatalf("read outcomes = %+v", outcomes)
+	}
+	publication, err = fixture.runtime.Publication()
+	if err != nil || publication.Applied < outcomes[0].Barrier.Index {
+		t.Fatalf("published cut %+v behind outcome %+v: %v", publication, outcomes[0], err)
+	}
+}
+
 func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 	identity := testWALIdentity(230)
 	peer := identity.MemberID + 1
@@ -291,6 +349,24 @@ func TestRuntimeTerminalWALCapacityFailureLatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.ReadIndex([]byte("full-wal-read")); err != nil {
+		t.Fatalf("ReadIndex at sealed WAL limit: %v", err)
+	}
+	var outcomes []raftmodel.ReadOutcome
+	for step := 0; step < 1000; step++ {
+		result, err := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		if err != nil {
+			t.Fatalf("ReadIndex DriveReady step %d: %v", step, err)
+		}
+		outcomes = append(outcomes, result.ReadOutcomes...)
+		if !result.Progressed() {
+			break
+		}
+	}
+	if len(outcomes) != 1 || outcomes[0].Err != nil ||
+		string(outcomes[0].Barrier.Context) != "full-wal-read" {
+		t.Fatalf("ReadIndex at sealed WAL outcomes = %+v", outcomes)
+	}
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"full"`), orderedkey.Ascending)
 	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"full"}`))
 	if err := fixture.runtime.Tick(); !errors.Is(err, raftstore.ErrFull) ||

@@ -4,9 +4,10 @@
 driver, bounded model/simulator, static-snapshot append-only WAL, exact member
 runtime, in-process Multi-Raft host, and an ordinary-message frame/roster
 validator that accepts a caller-supplied authenticated NodeID are executable.
-There is no serving replication, failover,
-runtime snapshot or WAL compaction path, peer authentication, or network
-transport.
+The runtime/host now surface model-checked context-free configuration proposals
+and exact quorum-safe `ReadIndex` outcomes, but no serving API consumes them.
+There is no serving replication, failover, runtime snapshot or WAL compaction
+path, peer authentication, or network transport.
 
 ## Exact selection and provenance
 
@@ -232,14 +233,22 @@ claiming a production replicated store:
 - `internal/raftmember.Runtime` exclusively adopts one exact WAL, SQL root,
   apply claim, and Node; mints a fresh incarnation; enforces
   `AdmitCommand` -> `ReserveReady` -> `Node.Propose`; and drives one explicit
-  persistence-before-send Ready micro-step at a time. It rejects snapshots and
-  exposes no raw component, read, membership, or serving API.
+  persistence-before-send Ready micro-step at a time. It also exposes the
+  existing model-checked configuration proposal port, a `ReadIndex` issue port,
+  detached applied publication, and exact terminal read outcomes. `ReadIndex`
+  does not consume worst-case WAL reservation because it cannot append entries
+  or advance `HardState`; its empty Ready still proves the durable namespace
+  before messages are released. Runtime rejects snapshots and exposes no raw
+  component or serving API.
 - `internal/multiraft.Host` owns a bounded set of independent range runtimes.
   A single-range deployment adds one group to the same Host. A FIFO runnable
   queue and rotating input classes provide operation-count fairness without a
   goroutine, timer, or polling scan per idle group. It is an in-process outbox,
   not peer transport, and one synchronous slow operation can still block its
-  caller.
+  caller. Direct membership/read controls are deliberately not queued: a
+  topology/serving coordinator must drain and retry `ErrReadyPending`, so stale
+  control intent never lingers behind unrelated group work. `RunOne` transfers
+  completed read outcomes exactly once to its caller.
 - `internal/rafttransport` owns a bounded immutable caller-supplied static
   member/role/NodeID roster and one canonical ordinary-message frame. One
   registry is designed for one node-pair connection to multiplex every range

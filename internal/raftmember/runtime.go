@@ -76,10 +76,13 @@ const (
 	DriveAdvanced
 )
 
-// DriveResult reports one bounded synchronous Ready micro-step.
+// DriveResult reports one bounded synchronous Ready micro-step. ReadOutcomes
+// is present only for DriveReadStatesFinished; ownership of the slice and its
+// detached contexts transfers to the caller.
 type DriveResult struct {
-	Kind    DriveKind
-	ReadyID uint64
+	Kind         DriveKind
+	ReadyID      uint64
+	ReadOutcomes []raftmodel.ReadOutcome
 }
 
 // Progressed reports whether DriveReady performed one lifecycle operation.
@@ -261,6 +264,45 @@ func (runtime *Runtime) Propose(data []byte) error {
 	return runtime.node.Propose(data)
 }
 
+// ProposeConfChange admits one topology-authorized configuration change into
+// the existing model-checked Raft path. Runtime does not itself authorize
+// membership or grant serving authority. Nil means only local core admission.
+func (runtime *Runtime) ProposeConfChange(change pb.ConfChangeI) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	if err := runtime.wal.ReserveReady(); err != nil {
+		if deterministicPersistFailure(err) {
+			return runtime.fail(err)
+		}
+		return err
+	}
+	return runtime.node.ProposeConfChange(change)
+}
+
+// ReadIndex starts one quorum-confirmed linearizable-read barrier. Context is
+// copied by the Node before return. Completion is surfaced exactly once in a
+// later DriveResult.ReadOutcomes value; it does not itself expose SQL data.
+func (runtime *Runtime) ReadIndex(context []byte) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	// ReadIndex cannot append an entry or advance HardState. Its Ready contains
+	// only messages/read states, so pessimistic worst-case WAL reservation would
+	// incorrectly make linearizable reads unavailable at a sealed log limit.
+	// PersistReady still performs the empty-batch namespace proof before send.
+	return runtime.node.ReadIndex(context)
+}
+
+// Publication returns a detached view of the atomically published apply cut.
+// It is diagnostic/control evidence, not a leader or range-ownership proof.
+func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return raftmodel.Publication{}, err
+	}
+	return runtime.node.Published(), nil
+}
+
 // StepMessage admits one ordinary, non-snapshot peer message. The message is
 // detached by raftmodel.Node before this method returns.
 func (runtime *Runtime) StepMessage(message *pb.Message) error {
@@ -428,12 +470,10 @@ func (runtime *Runtime) DriveReady(
 		if err != nil {
 			return DriveResult{}, runtime.fail(err)
 		}
-		if len(outcomes) != 0 {
-			return DriveResult{}, runtime.fail(&raftmodel.UnsupportedError{
-				Feature: "read outcomes in the non-serving runtime",
-			})
-		}
-		return DriveResult{Kind: DriveReadStatesFinished, ReadyID: progress.ReadyID}, nil
+		return DriveResult{
+			Kind: DriveReadStatesFinished, ReadyID: progress.ReadyID,
+			ReadOutcomes: outcomes,
+		}, nil
 
 	case raftmodel.PhaseReadStatesRecorded:
 		readyID := runtime.node.ReadyID()

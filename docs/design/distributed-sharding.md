@@ -238,9 +238,11 @@ reconfiguration protocol.
   control;
 - serving Raft replication, replicated client writes, automatic election, or
   failover;
-- follower/session reads or `ReadIndex` integration;
-- runtime Raft snapshots, WAL compaction, dynamic membership, or snapshot
-  transfer;
+- serving follower/session reads or a coherent SQL read bound to the
+  non-serving runtime's `ReadIndex` outcome;
+- runtime Raft snapshots, WAL compaction, topology-authorized dynamic
+  membership reconciliation, or snapshot transfer; context-free model-checked
+  configuration proposals are exposed only through the non-serving kernel;
 - snapshot/catch-up/cutover execution for an online split, merge, move, or
   topology recovery; bounded hot-bucket evidence and desired split planning do
   exist, but confer no serving authority;

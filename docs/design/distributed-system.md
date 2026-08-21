@@ -397,10 +397,13 @@ cluster does not fork into named protocol generations.
    bucket, and desired split manifests are fenced by source generation,
    ownership epoch, bucket geometry, and lifetime allocation high-water.
    Controller window publication and capacity feedback remain to be wired.
-   Serving Raft, certified snapshot/log catch-up, lease relocation, atomic
-   cutover/drain/retire, merge planning, and disaggregated immutable
-   snapshot/cold-data caching remain pending; no desired split is serving
-   authority until those gates pass.
+   The non-serving Runtime/Host now expose context-free model-checked
+   configuration proposals, detached applied publication, and exact quorum-safe
+   `ReadIndex` outcomes without making reads consume worst-case WAL headroom.
+   Serving Raft, topology authorization/reconciliation, certified snapshot/log
+   catch-up, lease relocation, atomic cutover/drain/retire, merge planning, and
+   disaggregated immutable snapshot/cold-data caching remain pending; no desired
+   split is serving authority until those gates pass.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

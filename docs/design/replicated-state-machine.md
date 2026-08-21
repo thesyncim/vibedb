@@ -301,5 +301,6 @@ Serving is prohibited because the current tree lacks:
   control, snapshot transport, dynamic membership reconciliation, and
   deadline/slow-disk isolation around the in-process host and frame validator;
 - leader-aware routing with a fenced range proof, applied-position tokens,
-  completion lookup, and `ReadIndex` reads; and
+  completion lookup, and a coherent SQL snapshot bound to the now-exposed
+  non-serving `ReadIndex` outcome; and
 - a replicated SQL command grammar capable of the advertised isolation mode.

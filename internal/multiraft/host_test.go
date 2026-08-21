@@ -12,9 +12,10 @@ import (
 )
 
 type fakeReady struct {
-	kind     raftmember.DriveKind
-	outbound *pb.Message
-	err      error
+	kind         raftmember.DriveKind
+	outbound     *pb.Message
+	readOutcomes []raftmodel.ReadOutcome
+	err          error
 }
 
 type fakeRuntime struct {
@@ -22,7 +23,10 @@ type fakeRuntime struct {
 	ready               []fakeReady
 	inputs              []ProgressKind
 	proposals           [][]byte
+	confChanges         []*pb.ConfChangeV2
+	readContexts        [][]byte
 	messages            []*pb.Message
+	publication         raftmodel.Publication
 	inputErr            error
 	failure             error
 	failureOnReadyError bool
@@ -51,6 +55,26 @@ func (runtime *fakeRuntime) Propose(data []byte) error {
 	runtime.inputs = append(runtime.inputs, ProgressProposal)
 	runtime.proposals = append(runtime.proposals, append([]byte(nil), data...))
 	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) ProposeConfChange(change pb.ConfChangeI) error {
+	if change == nil {
+		runtime.confChanges = append(runtime.confChanges, nil)
+	} else {
+		runtime.confChanges = append(
+			runtime.confChanges, proto.Clone(change.AsV2()).(*pb.ConfChangeV2),
+		)
+	}
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) ReadIndex(context []byte) error {
+	runtime.readContexts = append(runtime.readContexts, append([]byte(nil), context...))
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Publication() (raftmodel.Publication, error) {
+	return runtime.publication, runtime.inputErr
 }
 
 func (runtime *fakeRuntime) StepMessage(message *pb.Message) error {
@@ -94,7 +118,9 @@ func (runtime *fakeRuntime) DriveReady(
 	}
 	runtime.ready[0] = fakeReady{}
 	runtime.ready = runtime.ready[1:]
-	return raftmember.DriveResult{Kind: step.kind, ReadyID: 1}, nil
+	return raftmember.DriveResult{
+		Kind: step.kind, ReadyID: 1, ReadOutcomes: step.readOutcomes,
+	}, nil
 }
 
 func (runtime *fakeRuntime) Close() error {
@@ -267,6 +293,59 @@ func TestHostQueueDetachesAndRotatesInputClasses(t *testing.T) {
 	}
 	if host.queueItems != 0 || host.queueBytes != 0 {
 		t.Fatalf("queue accounting after drain = %d, %d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(4)
+	runtime.publication = raftmodel.Publication{Applied: 9, ReplicaSetVersion: 7}
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); done || err != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, err)
+	}
+
+	member := uint64(99)
+	change := &pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &member,
+	}
+	if err := host.ProposeConfChange(runtime.identity.Group, change); err != nil {
+		t.Fatal(err)
+	}
+	member = 100
+	if len(runtime.confChanges) != 1 || runtime.confChanges[0].GetChanges()[0].GetNodeId() != 99 {
+		t.Fatalf("detached configuration changes = %+v", runtime.confChanges)
+	}
+
+	context := []byte("linearizable-read")
+	if err := host.ReadIndex(runtime.identity.Group, context); err != nil {
+		t.Fatal(err)
+	}
+	context[0] = 'X'
+	if len(runtime.readContexts) != 1 || string(runtime.readContexts[0]) != "linearizable-read" {
+		t.Fatalf("detached read contexts = %q", runtime.readContexts)
+	}
+	publication, err := host.Publication(runtime.identity.Group)
+	if err != nil || publication.Applied != 9 || publication.ReplicaSetVersion != 7 {
+		t.Fatalf("Publication = %+v, %v", publication, err)
+	}
+
+	runtime.ready = []fakeReady{{
+		kind: raftmember.DriveReadStatesFinished,
+		readOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+			Context: []byte("linearizable-read"), Index: 9, Term: 3, Incarnation: 1,
+		}}},
+	}}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.ReadyKind != raftmember.DriveReadStatesFinished ||
+		len(progress.ReadOutcomes) != 1 ||
+		string(progress.ReadOutcomes[0].Barrier.Context) != "linearizable-read" {
+		t.Fatalf("read outcome progress = %+v, %t, %v", progress, done, err)
 	}
 }
 

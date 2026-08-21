@@ -335,7 +335,8 @@ available.
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |
-| Runtime Raft snapshots, WAL compaction, and dynamic membership | Not available |
+| Raft read/membership control | Non-serving runtime and Multi-Raft ports expose quorum-safe `ReadIndex` outcomes and model-checked context-free configuration proposals; topology authorization, reconciliation, snapshot transfer, serving reads, and online membership remain unavailable |
+| Runtime Raft snapshots and WAL compaction | Not available |
 | Follower/session reads, online movement, and backup/PITR orchestration | Not available |
 | Hot-shard detection and split planning | Optional shard request completion records exact fixed-space per-bucket pressure and fan-out windows; sustained recommendations produce bucket-aligned, allocation-high-water and generation-fenced desired manifests. No controller publishes them and snapshot/catch-up/cutover data movement is not yet available |
 
