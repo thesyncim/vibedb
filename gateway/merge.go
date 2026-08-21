@@ -766,6 +766,12 @@ func (a *groupedOutputArena) appendInteger(value *exactSignedInteger) []byte {
 	return a.current[start:len(a.current):len(a.current)]
 }
 
+func (a *groupedOutputArena) appendBytes(value []byte) []byte {
+	start := a.reserve(len(value))
+	a.current = append(a.current, value...)
+	return a.current[start:len(a.current):len(a.current)]
+}
+
 func (s *exactSum) add(
 	cell shardservice.Cell,
 	maxBytes uint64,
@@ -868,6 +874,7 @@ type groupedAggregateMerger struct {
 	key           []byte
 	numberScratch []byte
 	keyEncoder    queryengine.JSONGroupKeyEncoder
+	input         groupedOutputArena
 	output        groupedOutputArena
 	retained      uint64
 	maxBytes      uint64
@@ -992,11 +999,11 @@ func (m *groupedAggregateMerger) add(row []shardservice.Cell) error {
 				return err
 			}
 		case sqlast.AggMin:
-			if err := addExtreme(&m.extrema[column][group], cell, false); err != nil {
+			if err := m.addExtreme(&m.extrema[column][group], cell, false); err != nil {
 				return err
 			}
 		case sqlast.AggMax:
-			if err := addExtreme(&m.extrema[column][group], cell, true); err != nil {
+			if err := m.addExtreme(&m.extrema[column][group], cell, true); err != nil {
 				return err
 			}
 		default:
@@ -1010,15 +1017,29 @@ func (m *groupedAggregateMerger) addGroup(row []shardservice.Cell, keyBytes int)
 	// The fixed charge deliberately overestimates slice headers, cell headers,
 	// interner directory load, and columnar accumulator metadata. Exact key and
 	// big-number backing bytes are charged separately as they grow.
-	charge := uint64(96 + keyBytes + len(row)*192)
+	inputBytes := 0
+	for column, kind := range m.kinds {
+		if kind == sqlast.AggNone && !row[column].Null {
+			inputBytes += len(row[column].Bytes)
+		}
+	}
+	charge := uint64(96 + keyBytes + inputBytes + len(row)*192)
 	if err := m.charge(charge); err != nil {
 		return err
 	}
 	if m.width == 0 {
 		m.width = len(row)
 	}
-	m.rows = append(m.rows, row...)
 	for column, kind := range m.kinds {
+		if kind == sqlast.AggNone {
+			cell := row[column]
+			if !cell.Null {
+				cell.Bytes = m.input.appendBytes(cell.Bytes)
+			}
+			m.rows = append(m.rows, cell)
+		} else {
+			m.rows = append(m.rows, shardservice.Cell{})
+		}
 		switch kind {
 		case sqlast.AggCount:
 			m.counts[column] = append(m.counts[column], exactCount{})
@@ -1028,6 +1049,38 @@ func (m *groupedAggregateMerger) addGroup(row []shardservice.Cell, keyBytes int)
 			m.extrema[column] = append(m.extrema[column], groupedExtreme{})
 		}
 	}
+	return nil
+}
+
+// addExtreme retains only a winning spelling in merger-owned packed storage.
+// Streamed response frames can therefore be released immediately after add
+// returns instead of one tiny MIN/MAX value pinning a whole transport frame.
+func (m *groupedAggregateMerger) addExtreme(
+	state *groupedExtreme,
+	cell shardservice.Cell,
+	maximum bool,
+) error {
+	if cell.Null {
+		return nil
+	}
+	candidate := classifyCell(cell)
+	if candidate.kind != ckNumber || !candidate.valid {
+		return fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
+	}
+	replace := !state.set
+	if state.set {
+		comparison := queryengine.CompareValidatedJSONNumbers(candidate.num, state.number)
+		replace = (maximum && comparison > 0) || (!maximum && comparison < 0)
+	}
+	if !replace {
+		return nil
+	}
+	if err := m.charge(uint64(len(cell.Bytes))); err != nil {
+		return err
+	}
+	owned := shardservice.Cell{Bytes: m.input.appendBytes(cell.Bytes)}
+	ownedCandidate := classifyCell(owned)
+	state.cell, state.number, state.set = owned, ownedCandidate.num, true
 	return nil
 }
 

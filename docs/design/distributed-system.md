@@ -246,6 +246,14 @@ backpressure; the current SQL cursor still materializes its locally bounded
 result before framing, so this is not yet a vector-streaming scan or an
 inter-node hash/range exchange.
 
+Multi-shard grouped partial/final reads now consume this lane directly. A
+bounded worker set opens shard streams in parallel; unbuffered per-request
+handoffs let each active shard retain only its current decoded frame, while the
+final merger drains in canonical route order for deterministic first-appearance
+semantics. Group keys and winning extrema move into packed merger-owned byte
+arenas before a frame is released. This is a bounded streaming gather/final
+aggregate, not yet a hash/range repartition between worker nodes.
+
 ## Replication and movement
 
 Every physical bucket interval belongs to one Raft group with a topology-issued
@@ -337,7 +345,9 @@ cluster does not fork into named protocol generations.
    span shards. Path-projection DISTINCT reuses the same canonical grouped state.
    The additive row-batch wire lane now provides sequence-checked terminal
    frames, exact row/byte caps, synchronous backpressure, schema-once delivery,
-   and borrowed byte-native decode while preserving the one-frame routed lane.
+   and borrowed byte-native decode while preserving the one-frame routed lane;
+   grouped partial/final fan-out consumes it incrementally in deterministic
+   route order without whole-shard response materialization.
    Hash/range exchange and worker-local final aggregation come next, followed
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.

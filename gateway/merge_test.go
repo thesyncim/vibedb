@@ -401,6 +401,32 @@ func TestMergeGroupedAggregateIntegerPromotionAndKeyOnlyDedup(t *testing.T) {
 	}
 }
 
+func TestGroupedAggregateMergerOwnsStreamedInputs(t *testing.T) {
+	merger, err := newGroupedAggregateMerger(
+		[]sqlast.AggKind{sqlast.AggNone, sqlast.AggMin}, []int{0}, 1<<20,
+	)
+	if err != nil {
+		t.Fatalf("newGroupedAggregateMerger: %v", err)
+	}
+	key := []byte(`"a"`)
+	minimum := []byte("5")
+	if err := merger.add([]shardservice.Cell{{Bytes: key}, {Bytes: minimum}}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	copy(key, []byte(`"z"`))
+	minimum[0] = '9'
+	rows, err := merger.finish()
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if got := string(rows[0][0].Bytes); got != `"a"` {
+		t.Fatalf("owned key = %s, want a", got)
+	}
+	if got := string(rows[0][1].Bytes); got != "5" {
+		t.Fatalf("owned minimum = %s, want 5", got)
+	}
+}
+
 func TestFinalizeGroupedRowsExactSortAndTopK(t *testing.T) {
 	rows := [][]shardservice.Cell{
 		{cell("3"), cell(`"c"`)},

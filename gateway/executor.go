@@ -807,6 +807,9 @@ func (e *Executor) captureIndexedMutation(
 // once a cap is hit, and merges the results. The partial-result policy is
 // fail-closed: any shard failure fails the whole operation.
 func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, error) {
+	if len(pl.aggregates) != 0 && len(pl.groupKeys) != 0 {
+		return e.fanoutGroupedBatches(ctx, pl, p)
+	}
 	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
@@ -902,6 +905,196 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	}
 	e.metrics.observeResult(totalRows, totalBytes)
 	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: rows}, nil
+}
+
+const (
+	distributedBatchRows  uint32 = 4 << 10
+	distributedBatchBytes uint32 = 256 << 10
+)
+
+type groupedShardStream struct {
+	batches chan *shardservice.ShardResponse
+	done    chan error
+}
+
+// fanoutGroupedBatches incrementally combines grouped shard fragments in
+// canonical route order. One unbuffered channel per active request lets a shard
+// hold at most its current decoded frame while the coordinator is busy; the
+// synchronous client callback propagates that pressure to the shard cursor.
+func (e *Executor) fanoutGroupedBatches(
+	ctx context.Context,
+	pl *plan,
+	p Profile,
+) (*Result, error) {
+	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
+	defer cancel()
+
+	merger, err := newGroupedAggregateMerger(pl.aggregates, pl.groupKeys, p.MaxAggregateBytes)
+	if err != nil {
+		return nil, err
+	}
+	streams := make([]groupedShardStream, len(pl.calls))
+	for i := range streams {
+		streams[i] = groupedShardStream{
+			batches: make(chan *shardservice.ShardResponse),
+			done:    make(chan error, 1),
+		}
+	}
+
+	var (
+		errMu    sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+		cancel()
+	}
+	readError := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
+	}
+
+	jobs := make(chan int)
+	workers := min(max(1, p.MaxConcurrency), len(pl.calls))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				req := *pl.calls[i].req
+				req.RowBatch = distributedRowBatch(&req)
+				sctx, stop := context.WithTimeout(opctx, p.PerShardDeadline)
+				err := e.client.DoBatches(
+					sctx, pl.calls[i].address, &req,
+					func(batch *shardservice.ShardResponse) error {
+						select {
+						case streams[i].batches <- batch:
+							return nil
+						case <-sctx.Done():
+							return sctx.Err()
+						}
+					},
+				)
+				stop()
+				if err != nil {
+					fail(err)
+				}
+				streams[i].done <- err
+				close(streams[i].batches)
+			}
+		})
+	}
+	go func() {
+		defer close(jobs)
+		for i := range pl.calls {
+			select {
+			case jobs <- i:
+			case <-opctx.Done():
+				return
+			}
+		}
+	}()
+
+	var (
+		columns    []shardservice.Column
+		totalRows  uint64
+		totalBytes uint64
+	)
+	for shard := range streams {
+		shardRows := 0
+		for {
+			select {
+			case batch, ok := <-streams[shard].batches:
+				if !ok {
+					if streamErr := <-streams[shard].done; streamErr != nil {
+						fail(streamErr)
+					}
+					goto nextShard
+				}
+				if batch.RowBatch.Sequence == 0 {
+					if columns == nil {
+						columns = append([]shardservice.Column(nil), batch.Columns...)
+					} else if !sameColumns(columns, batch.Columns) {
+						fail(ErrMergeSchema)
+						goto finished
+					}
+				}
+				batchRows := uint64(len(batch.Rows))
+				batchBytes := responseBytes(batch)
+				if ^uint64(0)-totalRows < batchRows || ^uint64(0)-totalBytes < batchBytes {
+					fail(ErrResultLimit)
+					goto finished
+				}
+				totalRows += batchRows
+				totalBytes += batchBytes
+				if limitErr := checkAggregate(p, totalRows, totalBytes); limitErr != nil {
+					fail(limitErr)
+					goto finished
+				}
+				for row := range batch.Rows {
+					if addErr := merger.add(batch.Rows[row]); addErr != nil {
+						fail(fmt.Errorf("%w: shard %d row %d: %v",
+							ErrMergeAggregate, shard, shardRows+row, addErr))
+						goto finished
+					}
+				}
+				shardRows += len(batch.Rows)
+			case <-opctx.Done():
+				goto finished
+			}
+		}
+	nextShard:
+	}
+
+finished:
+	cancel()
+	wg.Wait()
+	if err := readError(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(columns) != len(pl.aggregates) {
+		return nil, ErrMergeSchema
+	}
+	rows, err := merger.finish()
+	if err != nil {
+		return nil, err
+	}
+	rows, err = finalizeGroupedRowsWindow(
+		rows, pl.order, pl.offset, pl.limit, pl.hasLimit, p.MaxAggregateBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	e.metrics.observeResult(totalRows, totalBytes)
+	return &Result{Kind: shardservice.ResponseRows, Columns: columns, Rows: rows}, nil
+}
+
+func distributedRowBatch(req *shardservice.ShardRequest) shardservice.RowBatchRequest {
+	rows := min(uint64(distributedBatchRows), req.MaxRows)
+	bytes := min(uint64(distributedBatchBytes), req.MaxResultBytes)
+	return shardservice.RowBatchRequest{BatchRows: uint32(rows), BatchBytes: uint32(bytes)}
+}
+
+func sameColumns(a, b []shardservice.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func emptyAggregateResult(pl *plan) *Result {
