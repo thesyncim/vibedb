@@ -248,10 +248,28 @@ func (s *Session) SetMemoryLimit(bytes int64) error {
 // An error while a transaction is active moves the session to
 // SessionFailedTransaction, matching PostgreSQL's failed-transaction rule.
 func (s *Session) Prepare(ctx context.Context, text string) (*Prepared, error) {
+	return s.prepare(ctx, text, false)
+}
+
+// PreparePartialAggregate parses one grouped SELECT and lowers its shard-local
+// partial fragment. Final ORDER BY and LIMIT stages are removed from the owned
+// AST before lowering so a coordinator can combine every partial group without
+// reparsing or rewriting authored SQL text.
+func (s *Session) PreparePartialAggregate(ctx context.Context, text string) (*Prepared, error) {
+	return s.prepare(ctx, text, true)
+}
+
+func (s *Session) prepare(ctx context.Context, text string, partialAggregate bool) (*Prepared, error) {
 	if err := s.ready(ctx); err != nil {
 		return nil, s.fail(err)
 	}
-	statement, err := s.conn.prepareContext(ctx, text)
+	var statement *stmt
+	var err error
+	if partialAggregate {
+		statement, err = s.conn.preparePartialAggregateContext(ctx, text)
+	} else {
+		statement, err = s.conn.prepareContext(ctx, text)
+	}
 	if err != nil {
 		return nil, s.fail(err)
 	}

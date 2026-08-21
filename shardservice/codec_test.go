@@ -92,6 +92,13 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "partial_aggregate",
+			req: &ShardRequest{
+				SQL:    `SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n LIMIT ?`,
+				Params: []Param{NumberParam("2")}, PartialAggregate: true,
+			},
+		},
+		{
 			name: "all_param_kinds",
 			req: &ShardRequest{
 				SQL:           "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
@@ -235,6 +242,9 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if got.ExecutionMode != tc.req.ExecutionMode {
 				t.Errorf("ExecutionMode = %v, want %v", got.ExecutionMode, tc.req.ExecutionMode)
+			}
+			if got.PartialAggregate != tc.req.PartialAggregate {
+				t.Errorf("PartialAggregate = %v, want %v", got.PartialAggregate, tc.req.PartialAggregate)
 			}
 			if got.Transaction.Operation != tc.req.Transaction.Operation ||
 				got.Transaction.ID != tc.req.Transaction.ID ||
@@ -817,6 +827,16 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadDocumentScan,
+		},
+		{
+			name: "partial_aggregate_requires_read_only_sql",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:           "SELECT n, COUNT(*) FROM messages GROUP BY n",
+					ExecutionMode: ExecutionReadWrite, PartialAggregate: true,
+				})
+			},
+			want: errBadPartialAggregate,
 		},
 		{
 			name: "row_arity_mismatch",

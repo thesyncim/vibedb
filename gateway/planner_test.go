@@ -154,8 +154,8 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bind nonlocal grouped LIMIT: %v", err)
 	}
-	if err := nonlocalLimitBound.ValidateRoute(routeBoundPlan(t, nonlocalLimitBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
-		t.Fatalf("nonlocal grouped LIMIT validation = %v, want fragment-rewrite refusal", err)
+	if err := nonlocalLimitBound.ValidateRoute(routeBoundPlan(t, nonlocalLimitBound)); err != nil {
+		t.Fatalf("nonlocal grouped LIMIT validation = %v, want partial-fragment admission", err)
 	}
 
 	localLimit, err := snap.Prepare(context.Background(),
@@ -166,9 +166,6 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	localLimitBound, err := localLimit.Bind(nil)
 	if err != nil {
 		t.Fatalf("Bind shard-local grouped LIMIT: %v", err)
-	}
-	if !localLimitBound.groupsLocal {
-		t.Fatal("placement-key GROUP BY was not recognized as shard-local")
 	}
 	if err := localLimitBound.ValidateRoute(routeBoundPlan(t, localLimitBound)); err != nil {
 		t.Fatalf("shard-local grouped LIMIT validation = %v", err)

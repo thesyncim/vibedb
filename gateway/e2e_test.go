@@ -1442,6 +1442,34 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
 	}
 
+	limited, err := e.Query(context.Background(), Query{
+		SQL: `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages ` +
+			`GROUP BY n ORDER BY n DESC LIMIT 2`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("nonlocal top-k Query: %v", err)
+	}
+	if len(limited.Rows) != 2 {
+		t.Fatalf("nonlocal top-k rows = %d, want 2", len(limited.Rows))
+	}
+	for row := range limited.Rows {
+		if len(limited.Rows[row]) != len(result.Rows[row]) {
+			t.Fatalf("nonlocal top-k row %d width = %d, want %d",
+				row, len(limited.Rows[row]), len(result.Rows[row]))
+		}
+		for column := range limited.Rows[row] {
+			got, want := limited.Rows[row][column], result.Rows[row][column]
+			if got.Null != want.Null || string(got.Bytes) != string(want.Bytes) {
+				t.Fatalf("nonlocal top-k cell %d/%d = %q/null=%v, want %q/null=%v",
+					row, column, got.Bytes, got.Null, want.Bytes, want.Null)
+			}
+		}
+	}
+	if got := c.dialer.totalDials(); got != 24 {
+		t.Fatalf("total dials after nonlocal top-k = %d, want 24", got)
+	}
+
 	sort.Strings(allKeys)
 	top, err := e.Query(context.Background(), Query{
 		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
@@ -1461,8 +1489,8 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 			t.Fatalf("top-k row %d = %+v, want key %q count 1", row, top.Rows[row], allKeys[row])
 		}
 	}
-	if got := c.dialer.totalDials(); got != 24 {
-		t.Fatalf("total dials after grouped sort and top-k = %d, want 24", got)
+	if got := c.dialer.totalDials(); got != 36 {
+		t.Fatalf("total dials after grouped sort and top-k = %d, want 36", got)
 	}
 }
 

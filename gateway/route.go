@@ -88,6 +88,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 	}
 
 	calls := make([]shardCall, len(route.Targets))
+	partialAggregate := len(route.Targets) > 1 && len(bound.groupKeys) != 0
 	for i := range route.Targets {
 		t := route.Targets[i]
 		bucketBits, accessScopes := readAccessScopes(bound, t)
@@ -101,6 +102,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 			req: &shardservice.ShardRequest{
 				SQL:                  q.SQL,
 				Params:               q.Params,
+				PartialAggregate:     partialAggregate,
 				Distribution:         route.Distribution,
 				Shard:                t.Shard,
 				AllocationGeneration: t.AllocationGeneration,

@@ -806,7 +806,13 @@ func (c *shardConn) execute(req *ShardRequest) *ShardResponse {
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
 
-	prep, err := c.sess.Prepare(ctx, req.SQL)
+	var prep *sqldriver.Prepared
+	var err error
+	if req.PartialAggregate {
+		prep, err = c.sess.PreparePartialAggregate(ctx, req.SQL)
+	} else {
+		prep, err = c.sess.Prepare(ctx, req.SQL)
+	}
 	if err != nil {
 		return classifyError(err)
 	}

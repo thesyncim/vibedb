@@ -383,6 +383,10 @@ type ShardRequest struct {
 	SQL string
 	// Params are the typed bound parameters, in placeholder order.
 	Params []Param
+	// PartialAggregate asks the shard to lower a grouped SELECT without its
+	// final ORDER BY or LIMIT. The coordinator applies those stages after exact
+	// partial-state combination, so groups spanning shards cannot be truncated.
+	PartialAggregate bool
 
 	// Distribution and Shard name the target the shard admits ownership of.
 	Distribution distribution.DistributionName

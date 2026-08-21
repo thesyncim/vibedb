@@ -66,7 +66,6 @@ type PreparedPlan struct {
 	limit        *sqlast.Operand
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
-	groupsLocal  bool
 	aggHeaders   []string
 	params       int
 	alwaysReason string
@@ -114,7 +113,6 @@ type BoundPlan struct {
 	limit        int
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
-	groupsLocal  bool
 	aggHeaders   []string
 	globalIndex  *boundGlobalIndexRead
 	globalEmpty  bool
@@ -304,12 +302,10 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	plan.order, plan.multiReason = planOrder(selectStmt, plan.multiReason)
 	plan.aggregates, plan.groupKeys, plan.aggHeaders, plan.multiReason =
 		planDistributedAggregates(selectStmt, plan.multiReason)
-	plan.groupsLocal = len(plan.groupKeys) != 0 && groupByProvesShardLocal(selectStmt.GroupBy, placement)
 	plan.limit = selectStmt.Limit
 	plan.alwaysReason = allRouteSemanticBoundary(selectStmt, plan.alwaysReason)
 	plan.multiReason = multiShardSemanticBoundary(
 		selectStmt, plan.multiReason, len(plan.aggregates) != 0, len(plan.groupKeys) != 0,
-		plan.groupsLocal,
 	)
 	plan.emptyReason = emptyRouteSemanticBoundary(selectStmt, len(plan.aggregates) != 0, plan.multiReason)
 	if cacheable {
@@ -352,7 +348,7 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 		tables:       p.tables,
 		distribution: p.distribution, constraints: constraints,
 		order: p.order, limit: limit,
-		aggregates: p.aggregates, groupKeys: p.groupKeys, groupsLocal: p.groupsLocal,
+		aggregates: p.aggregates, groupKeys: p.groupKeys,
 		aggHeaders:  p.aggHeaders,
 		globalIndex: globalIndex, globalEmpty: globalEmpty,
 		spec: p.spec, manifest: p.manifest,
@@ -568,7 +564,6 @@ func multiShardSemanticBoundary(
 	reason string,
 	aggregateSupported bool,
 	groupedAggregateSupported bool,
-	groupsLocal bool,
 ) string {
 	switch {
 	case stmt.Distinct:
@@ -581,9 +576,6 @@ func multiShardSemanticBoundary(
 		return firstPlanReason(reason, "window functions require global partition planning")
 	case stmt.Offset != nil:
 		return firstPlanReason(reason, "OFFSET requires distributed top-k rewriting")
-	case groupedAggregateSupported && stmt.Limit != nil && !groupsLocal:
-		return firstPlanReason(reason,
-			"grouped LIMIT requires shard-local group identity or fragment projection rewriting")
 	case aggregateSupported && !groupedAggregateSupported && stmt.Limit != nil:
 		return firstPlanReason(reason, "aggregate LIMIT requires coordinator-side rewriting")
 	}
@@ -602,28 +594,6 @@ func multiShardSemanticBoundary(
 		}
 	}
 	return reason
-}
-
-func groupByProvesShardLocal(
-	groupBy []*sqlast.PathExpr,
-	placement distribution.TablePlacement,
-) bool {
-	if len(groupBy) == 0 || len(placement.Columns) == 0 {
-		return false
-	}
-	for _, placementPath := range placement.Columns {
-		matched := false
-		for _, key := range groupBy {
-			if key != nil && key.Source == 0 && string(key.AppendPointer(nil)) == placementPath {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	return true
 }
 
 // planDistributedAggregates recognizes the algebraic aggregate subset whose

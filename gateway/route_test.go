@@ -178,6 +178,36 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 	}
 }
 
+func TestRouteMarksOnlyMultiShardGroupedFragmentsPartial(t *testing.T) {
+	snap := testSnapshot(t, 1)
+	e := newRouteExecutor(t, snap)
+
+	grouped, err := routeSQL(t, e, snap,
+		`SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n LIMIT 2`, ClassBatch)
+	if err != nil {
+		t.Fatalf("grouped route: %v", err)
+	}
+	if len(grouped.calls) != 2 {
+		t.Fatalf("grouped calls = %d, want 2", len(grouped.calls))
+	}
+	for i := range grouped.calls {
+		if !grouped.calls[i].req.PartialAggregate {
+			t.Fatalf("grouped call %d did not request a partial aggregate fragment", i)
+		}
+	}
+
+	single, err := routeSQL(t, e, snap,
+		`SELECT n, COUNT(*) FROM messages WHERE tenant_id = 'tenant-42' GROUP BY n ORDER BY n LIMIT 2`,
+		ClassInteractive)
+	if err != nil {
+		t.Fatalf("single route: %v", err)
+	}
+	if len(single.calls) != 1 || single.calls[0].req.PartialAggregate {
+		t.Fatalf("single grouped route = %d calls partial=%v, want one final shard query",
+			len(single.calls), len(single.calls) != 0 && single.calls[0].req.PartialAggregate)
+	}
+}
+
 // TestRouteUnknownPlacement proves SQL cannot select an arbitrary distribution;
 // its physical table must resolve through the pinned planner directory.
 func TestRouteUnknownPlacement(t *testing.T) {

@@ -38,6 +38,7 @@ const (
 	primaryKeyReadMarker    = 0xdb
 	mutationCaptureMarker   = 0xdc
 	documentScanMarker      = 0xdd
+	partialAggregateMarker  = 0xde
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -109,6 +110,8 @@ var errBadPrimaryKeyRead = errors.New("shardservice: frame carries invalid prima
 var errBadMutationCapture = errors.New("shardservice: frame carries an invalid mutation capture")
 
 var errBadDocumentScan = errors.New("shardservice: frame carries an invalid document scan")
+
+var errBadPartialAggregate = errors.New("shardservice: frame carries an invalid partial aggregate fragment")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -641,6 +644,11 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.MutationCapture) {
 		return errBadDocumentScan
 	}
+	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
+		req.MutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+		req.Transaction.Operation != TransactionNone) {
+		return errBadPartialAggregate
+	}
 
 	var e encbuf
 	e.u8(wireVersion)
@@ -726,6 +734,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.u8(documentScanMarker)
 		e.bytes(req.DocumentScan.Relation)
 		e.bytes(req.DocumentScan.After)
+	}
+	if req.PartialAggregate {
+		e.u8(partialAggregateMarker)
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
@@ -874,6 +885,10 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadDocumentScan
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == partialAggregateMarker {
+		d.u8()
+		req.PartialAggregate = true
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
@@ -912,6 +927,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
 		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.MutationCapture) {
 		return nil, errBadDocumentScan
+	}
+	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
+		req.MutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+		req.Transaction.Operation != TransactionNone) {
+		return nil, errBadPartialAggregate
 	}
 	return req, nil
 }

@@ -151,6 +151,43 @@ func cellText(t *testing.T, resp *ShardResponse, row, col int) string {
 
 const ddlDocs = `CREATE TABLE docs (id STRING PRIMARY KEY, name STRING NOT NULL, n INTEGER)`
 
+func TestPartialAggregateFragmentRemovesFinalOrderAndLimit(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+	for _, row := range []struct {
+		id string
+		n  string
+	}{{"a", "1"}, {"b", "1"}, {"c", "2"}} {
+		exec(t, conn, ownedRequest(
+			`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+			StringParam(row.id), StringParam(row.id), NumberParam(row.n),
+		))
+	}
+
+	const statement = `SELECT n, COUNT(*) FROM docs GROUP BY n ORDER BY n LIMIT ?`
+	final := ownedRequest(statement, NumberParam("1"))
+	final.ExecutionMode = ExecutionReadOnly
+	if got := exec(t, conn, final); len(got.Rows) != 1 {
+		t.Fatalf("final shard rows = %d, want 1", len(got.Rows))
+	}
+
+	partial := ownedRequest(statement, NumberParam("1"))
+	partial.ExecutionMode = ExecutionReadOnly
+	partial.PartialAggregate = true
+	got := exec(t, conn, partial)
+	if len(got.Rows) != 2 {
+		t.Fatalf("partial shard rows = %d, want every 2 groups", len(got.Rows))
+	}
+	counts := map[string]string{}
+	for i := range got.Rows {
+		counts[cellText(t, got, i, 0)] = cellText(t, got, i, 1)
+	}
+	if counts["1"] != "2" || counts["2"] != "1" {
+		t.Fatalf("partial groups = %v, want map[1:2 2:1]", counts)
+	}
+}
+
 func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)

@@ -194,6 +194,11 @@ func (e *Executor) queryGlobalIndex(
 			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(admissionErr, releaseErr)
 		}
+		if len(baseCalls) > 1 && len(bound.groupKeys) != 0 {
+			for i := range baseCalls {
+				baseCalls[i].req.PartialAggregate = true
+			}
+		}
 		if len(baseCalls) > 1 && bound.multiReason != "" {
 			releaseErr := e.releaseReadFences(ctx, indexCalls, profile, id)
 			return globalIndexExecution{}, globalIndexReadError(&PlanError{
