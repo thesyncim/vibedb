@@ -73,10 +73,14 @@ type ChildTarget struct {
 // non-retained child to its final SQL/Raft identity. It is immutable after
 // construction.
 type Plan struct {
-	split          *autosplit.SplitPlan
 	partitioner    *rangesplit.Partitioner
 	sourceManifest *distribution.Manifest
 	targetManifest *distribution.Manifest
+	source         autosplit.SourceIdentity
+	children       [autosplit.MaxSplitChildren]autosplit.SplitChildIdentity
+	leaderCounts   [autosplit.MaxSplitChildren]uint16
+	childCount     uint8
+	retained       uint8
 	current        uint64
 	next           uint64
 	targets        [autosplit.MaxSplitChildren]ChildTarget
@@ -90,15 +94,66 @@ func NewPlan(
 	partitioner *rangesplit.Partitioner,
 	targets []ChildTarget,
 ) (*Plan, error) {
-	if current == nil || split == nil || split.Manifest() == nil || partitioner == nil ||
-		current.Generation() == math.MaxUint64 || split.ChildCount < 2 ||
+	if current == nil || split == nil {
+		return nil, ErrInvalidPlan
+	}
+	sourceManifest, ok := current.Manifest(split.Source.Distribution)
+	if !ok {
+		return nil, ErrInvalidPlan
+	}
+	return newPlan(
+		sourceManifest, current.Generation(), split, partitioner, targets,
+	)
+}
+
+// RecoverPlan reconstructs the immutable plan against either the exact source
+// catalog generation or its already-published successor. After publication it
+// collapses the authenticated child sequence back into the one original source
+// descriptor, then re-runs the normal manifest and target-identity validation.
+// The caller still retains split and targets. No old catalog snapshot is needed.
+func RecoverPlan(
+	current *gateway.Snapshot,
+	sourceGeneration uint64,
+	split *autosplit.SplitPlan,
+	partitioner *rangesplit.Partitioner,
+	targets []ChildTarget,
+) (*Plan, error) {
+	if current == nil || split == nil || sourceGeneration == math.MaxUint64 {
+		return nil, ErrInvalidPlan
+	}
+	switch current.Generation() {
+	case sourceGeneration:
+		return NewPlan(current, split, partitioner, targets)
+	case sourceGeneration + 1:
+		target, ok := current.Manifest(split.Source.Distribution)
+		if !ok || split.Manifest() == nil || !target.Equal(split.Manifest()) {
+			return nil, ErrTopologyConflict
+		}
+		source, err := reconstructSourceManifest(split)
+		if err != nil {
+			return nil, err
+		}
+		return newPlan(source, sourceGeneration, split, partitioner, targets)
+	default:
+		return nil, ErrTopologyConflict
+	}
+}
+
+func newPlan(
+	sourceManifest *distribution.Manifest,
+	sourceGeneration uint64,
+	split *autosplit.SplitPlan,
+	partitioner *rangesplit.Partitioner,
+	targets []ChildTarget,
+) (*Plan, error) {
+	if sourceManifest == nil || split == nil || split.Manifest() == nil || partitioner == nil ||
+		sourceGeneration == math.MaxUint64 || split.ChildCount < 2 ||
 		split.ChildCount > autosplit.MaxSplitChildren ||
 		split.RetainedChild >= split.ChildCount ||
 		len(targets) != int(split.ChildCount)-1 {
 		return nil, ErrInvalidPlan
 	}
-	sourceManifest, ok := current.Manifest(split.Source.Distribution)
-	if !ok || sourceManifest.Version() == ^distribution.RoutingVersion(0) ||
+	if sourceManifest.Version() == ^distribution.RoutingVersion(0) ||
 		split.Manifest().Version() != sourceManifest.Version()+1 ||
 		partitioner.Digest() == ([32]byte{}) {
 		return nil, ErrInvalidPlan
@@ -110,9 +165,22 @@ func NewPlan(
 	}
 
 	plan := &Plan{
-		split: split, partitioner: partitioner,
+		partitioner:    partitioner,
 		sourceManifest: sourceManifest, targetManifest: split.Manifest(),
-		current: current.Generation(), next: current.Generation() + 1,
+		source:     cloneSourceIdentity(split.Source),
+		childCount: split.ChildCount, retained: split.RetainedChild,
+		current: sourceGeneration, next: sourceGeneration + 1,
+	}
+	for child := 0; child < int(split.ChildCount); child++ {
+		identity, identityOK := split.ChildIdentity(child)
+		descriptor, descriptorOK := split.Child(child)
+		if !identityOK || !descriptorOK || len(descriptor.Leaders) == 0 ||
+			len(descriptor.Leaders) > math.MaxUint16 {
+			return nil, ErrInvalidPlan
+		}
+		identity.Shard = distribution.ShardID(strings.Clone(string(identity.Shard)))
+		plan.children[child] = identity
+		plan.leaderCounts[child] = uint16(len(descriptor.Leaders))
 	}
 	var seen [autosplit.MaxSplitChildren]bool
 	for index := range targets {
@@ -150,6 +218,63 @@ func NewPlan(
 	return plan, nil
 }
 
+func reconstructSourceManifest(split *autosplit.SplitPlan) (*distribution.Manifest, error) {
+	if split == nil || split.Manifest() == nil || split.ChildCount < 2 ||
+		split.ChildCount > autosplit.MaxSplitChildren || split.RetainedChild >= split.ChildCount ||
+		split.Source.RoutingVersion == ^distribution.RoutingVersion(0) ||
+		split.Manifest().Version() != split.Source.RoutingVersion+1 {
+		return nil, ErrInvalidPlan
+	}
+	target := split.Manifest()
+	start := -1
+	for ordinal := 0; ordinal < target.ShardCount(); ordinal++ {
+		metadata, ok := target.ShardMetadataAt(ordinal)
+		if ok && metadata.Range.Start == split.Source.Range.Start {
+			start = ordinal
+			break
+		}
+	}
+	if start < 0 || start+int(split.ChildCount) > target.ShardCount() {
+		return nil, ErrTopologyConflict
+	}
+	for child := 0; child < int(split.ChildCount); child++ {
+		identity, ok := split.ChildIdentity(child)
+		descriptor, descriptorOK := split.Child(child)
+		metadata, metadataOK := target.ShardMetadataAt(start + child)
+		if !ok || !descriptorOK || !metadataOK || metadata.ID != identity.Shard ||
+			metadata.AllocationGeneration != identity.AllocationGeneration ||
+			metadata.Range != identity.Range || metadata.Epoch != identity.OwnershipEpoch ||
+			!target.ShardLeadersEqual(start+child, descriptor.Leaders) {
+			return nil, ErrTopologyConflict
+		}
+	}
+
+	shards := make([]distribution.Shard, 0, target.ShardCount()-int(split.ChildCount)+1)
+	for ordinal := 0; ordinal < start; ordinal++ {
+		shard, _ := target.ShardInfo(ordinal)
+		shards = append(shards, shard)
+	}
+	retained, ok := split.Child(int(split.RetainedChild))
+	if !ok || len(retained.Leaders) == 0 {
+		return nil, ErrTopologyConflict
+	}
+	shards = append(shards, distribution.Shard{
+		ID: split.Source.Shard, AllocationGeneration: split.Source.AllocationGeneration,
+		Range: split.Source.Range, Leaders: retained.Leaders, Epoch: split.Source.OwnershipEpoch,
+	})
+	for ordinal := start + int(split.ChildCount); ordinal < target.ShardCount(); ordinal++ {
+		shard, _ := target.ShardInfo(ordinal)
+		shards = append(shards, shard)
+	}
+	source, err := distribution.NewManifest(
+		split.Source.Distribution, split.Source.RoutingVersion, shards,
+	)
+	if err != nil {
+		return nil, errors.Join(ErrTopologyConflict, err)
+	}
+	return source, nil
+}
+
 // CatalogGeneration returns the exact source generation and its only valid
 // successor for this operation.
 func (p *Plan) CatalogGeneration() (current, next uint64) {
@@ -161,7 +286,7 @@ func (p *Plan) CatalogGeneration() (current, next uint64) {
 
 // Target returns a detached child target.
 func (p *Plan) Target(child uint8) (ChildTarget, bool) {
-	if p == nil || int(child) >= int(p.split.ChildCount) {
+	if p == nil || int(child) >= int(p.childCount) {
 		return ChildTarget{}, false
 	}
 	target := p.targets[child]
@@ -318,7 +443,7 @@ const (
 )
 
 func (p *Plan) catalogStage(snapshot *gateway.Snapshot) (catalogStage, error) {
-	manifest, ok := snapshot.Manifest(p.split.Source.Distribution)
+	manifest, ok := snapshot.Manifest(p.source.Distribution)
 	if !ok {
 		return 0, ErrTopologyConflict
 	}
@@ -344,13 +469,13 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 	if state.Applied == 0 || state.LastTerm == 0 ||
 		state.LogicalDigest == ([32]byte{}) || state.LastEntryDigest == ([32]byte{}) ||
 		state.SnapshotBaseDigest == ([32]byte{}) ||
-		binding.Distribution != string(p.split.Source.Distribution) ||
-		binding.Shard != string(p.split.Source.Shard) ||
-		binding.AllocationGeneration != uint64(p.split.Source.AllocationGeneration) {
+		binding.Distribution != string(p.source.Distribution) ||
+		binding.Shard != string(p.source.Shard) ||
+		binding.AllocationGeneration != uint64(p.source.AllocationGeneration) {
 		return ErrTopologyConflict
 	}
 	sealed := observed.Certificate != nil || observed.Tail != nil && observed.Tail.Sealed()
-	retained, _ := p.split.ChildIdentity(int(p.split.RetainedChild))
+	retained := p.children[p.retained]
 	if sealed {
 		if binding.OwnershipEpoch != uint64(retained.OwnershipEpoch) ||
 			binding.RoutingVersion != uint64(p.targetManifest.Version()) ||
@@ -359,8 +484,8 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 		}
 		return nil
 	}
-	if binding.OwnershipEpoch != uint64(p.split.Source.OwnershipEpoch) ||
-		binding.RoutingVersion != uint64(p.split.Source.RoutingVersion) ||
+	if binding.OwnershipEpoch != uint64(p.source.OwnershipEpoch) ||
+		binding.RoutingVersion != uint64(p.source.RoutingVersion) ||
 		binding.RouteGeneration != p.current {
 		return ErrTopologyConflict
 	}
@@ -404,8 +529,8 @@ func (p *Plan) stageAction(
 	initial rangesplit.TailCursor,
 ) (Action, bool, error) {
 	placement := initial.PlacementDigest()
-	for child := 0; child < int(p.split.ChildCount); child++ {
-		descriptor, _ := p.split.ChildIdentity(child)
+	for child := 0; child < int(p.childCount); child++ {
+		descriptor := p.children[child]
 		if descriptor.Retained {
 			if observed.Stages[child] != nil {
 				return Action{}, false, ErrTopologyConflict
@@ -441,8 +566,8 @@ func (p *Plan) stagesMatchTail(
 	tail rangesplit.TailCursor,
 	sealed bool,
 ) bool {
-	for child := 0; child < int(p.split.ChildCount); child++ {
-		descriptor, _ := p.split.ChildIdentity(child)
+	for child := 0; child < int(p.childCount); child++ {
+		descriptor := p.children[child]
 		if descriptor.Retained {
 			continue
 		}
@@ -464,8 +589,8 @@ func (p *Plan) childAction(
 	observed Observation,
 	certificate rangesplit.CutoverCertificate,
 ) (Action, bool, error) {
-	for child := 0; child < int(p.split.ChildCount); child++ {
-		descriptor, _ := p.split.ChildIdentity(child)
+	for child := 0; child < int(p.childCount); child++ {
+		descriptor := p.children[child]
 		if descriptor.Retained {
 			if observed.Children[child] != nil {
 				return Action{}, false, ErrTopologyConflict
@@ -567,4 +692,12 @@ func cloneChildTarget(target ChildTarget) ChildTarget {
 	target.SQL.UserStorage = strings.Clone(target.SQL.UserStorage)
 	target.SQL.UserPrimaryKey = strings.Clone(target.SQL.UserPrimaryKey)
 	return target
+}
+
+func cloneSourceIdentity(source autosplit.SourceIdentity) autosplit.SourceIdentity {
+	source.Distribution = distribution.DistributionName(
+		strings.Clone(string(source.Distribution)),
+	)
+	source.Shard = distribution.ShardID(strings.Clone(string(source.Shard)))
+	return source
 }

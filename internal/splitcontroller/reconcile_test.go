@@ -20,7 +20,7 @@ import (
 )
 
 func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
-	plan, _, target := testPlan(t)
+	plan, _, target, split := testPlan(t)
 	current, next := plan.CatalogGeneration()
 	if current != 19 || next != 20 {
 		t.Fatalf("catalog generations = %d/%d", current, next)
@@ -33,16 +33,58 @@ func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
 	bad := target
 	bad.Authority.RouteGeneration++
 	if _, err := NewPlan(
-		plan.sourceSnapshotForTest(t), plan.split, plan.partitioner, []ChildTarget{bad},
+		plan.sourceSnapshotForTest(t), split, plan.partitioner, []ChildTarget{bad},
 	); !errors.Is(err, ErrInvalidPlan) {
 		t.Fatalf("route-generation mismatch error = %v", err)
 	}
 	bad = target
 	bad.Endpoint = "node-c"
 	if _, err := NewPlan(
-		plan.sourceSnapshotForTest(t), plan.split, plan.partitioner, []ChildTarget{bad},
+		plan.sourceSnapshotForTest(t), split, plan.partitioner, []ChildTarget{bad},
 	); !errors.Is(err, ErrInvalidPlan) {
 		t.Fatalf("leader mismatch error = %v", err)
+	}
+
+	// Caller-owned plan headers cannot relabel the accepted operation afterward.
+	split.Source.Shard = "mutated"
+	split.ChildCount = 3
+	split.RetainedChild = 2
+	state := testSourceState(plan)
+	action, err := Reconcile(plan, Observation{
+		Catalog: plan.sourceSnapshotForTest(t), SourceState: state,
+		SourceStatus: testLeaderStatus(state),
+	})
+	if err != nil || action.Kind != ActionStartCapture {
+		t.Fatalf("action after caller plan mutation = %+v, err = %v", action, err)
+	}
+}
+
+func TestRecoverPlanCollapsesPublishedChildrenWithoutOldCatalog(t *testing.T) {
+	plan, _, target, split := testPlan(t)
+	published := plan.targetSnapshotForTest(t)
+	recovered, err := RecoverPlan(
+		published, 19, split, plan.partitioner, []ChildTarget{target},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current, next := recovered.CatalogGeneration(); current != 19 || next != 20 {
+		t.Fatalf("recovered generations = %d/%d", current, next)
+	}
+	if !recovered.sourceManifest.Equal(plan.sourceManifest) ||
+		!recovered.targetManifest.Equal(plan.targetManifest) {
+		t.Fatal("recovered manifests differ from original plan")
+	}
+	if _, err := RecoverPlan(
+		published, 18, split, plan.partitioner, []ChildTarget{target},
+	); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("wrong source generation error = %v", err)
+	}
+	wrong := plan.sourceSnapshotForTestAt(t, 20)
+	if _, err := RecoverPlan(
+		wrong, 19, split, plan.partitioner, []ChildTarget{target},
+	); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("wrong published manifest error = %v", err)
 	}
 }
 
@@ -53,7 +95,7 @@ func TestControlLoopStateIsFixedAndWarmAwaitAllocatesZero(t *testing.T) {
 	if size := unsafe.Sizeof(Action{}); size > 16 {
 		t.Fatalf("Action size = %d B, want <= 16 B", size)
 	}
-	plan, snapshot, _ := testPlan(t)
+	plan, snapshot, _, _ := testPlan(t)
 	observed := Observation{Catalog: snapshot, SourceState: testSourceState(plan)}
 	if allocations := testing.AllocsPerRun(1_000, func() {
 		action, err := Reconcile(plan, observed)
@@ -66,7 +108,7 @@ func TestControlLoopStateIsFixedAndWarmAwaitAllocatesZero(t *testing.T) {
 }
 
 func TestReconcileStartsOnlyFromExactSourceLeader(t *testing.T) {
-	plan, snapshot, _ := testPlan(t)
+	plan, snapshot, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	action, err := Reconcile(plan, Observation{Catalog: snapshot, SourceState: state})
 	if err != nil || action.Kind != ActionAwaitSourceLeader {
@@ -90,7 +132,7 @@ func TestReconcileStartsOnlyFromExactSourceLeader(t *testing.T) {
 }
 
 func TestReconcileBuildsThenStagesOnePassArtifacts(t *testing.T) {
-	plan, snapshot, _ := testPlan(t)
+	plan, snapshot, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	database, err := durable.OpenDatabase(t.TempDir(), durable.DatabaseOptions{})
 	if err != nil {
@@ -137,7 +179,7 @@ func TestReconcileBuildsThenStagesOnePassArtifacts(t *testing.T) {
 }
 
 func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
-	plan, _, target := testPlan(t)
+	plan, _, target, _ := testPlan(t)
 	certificate := rangesplit.CutoverCertificate{}
 	observed := Observation{}
 	action, ok, err := plan.childAction(observed, certificate)
@@ -190,7 +232,7 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 	}
 }
 
-func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget) {
+func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget, *autosplit.SplitPlan) {
 	t.Helper()
 	manifest, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
 		ID: "source", AllocationGeneration: 7,
@@ -253,7 +295,7 @@ func testPlan(t testing.TB) (*Plan, *gateway.Snapshot, ChildTarget) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return plan, snapshot, target
+	return plan, snapshot, target, split
 }
 
 func testChildTarget(
@@ -293,12 +335,12 @@ func testSourceState(plan *Plan) replicatedstate.State {
 			ClusterID:             replication.ID128(testID(1)),
 			ClusterIncarnation:    replication.ID128(testID(2)),
 			TopologyRecoveryEpoch: 1,
-			Distribution:          string(plan.split.Source.Distribution), Shard: string(plan.split.Source.Shard),
-			AllocationGeneration: uint64(plan.split.Source.AllocationGeneration),
+			Distribution:          string(plan.source.Distribution), Shard: string(plan.source.Shard),
+			AllocationGeneration: uint64(plan.source.AllocationGeneration),
 			ShardIncarnation:     replication.ID128(testID(7)), GroupID: replication.ID128(testID(8)),
 			ActivePolicyGeneration: 1, ProtectionEpoch: 1,
-			OwnershipEpoch: uint64(plan.split.Source.OwnershipEpoch), SchemaGeneration: 1,
-			RoutingVersion: uint64(plan.split.Source.RoutingVersion), RouteGeneration: plan.current,
+			OwnershipEpoch: uint64(plan.source.OwnershipEpoch), SchemaGeneration: 1,
+			RoutingVersion: uint64(plan.source.RoutingVersion), RouteGeneration: plan.current,
 		},
 		Applied: 41, LastTerm: 7, LastEntryDigest: sha256.Sum256([]byte("entry")),
 		LogicalDigest:      sha256.Sum256([]byte("logical")),
@@ -349,7 +391,7 @@ func testArtifactSet(
 		SourceApplied: cut.Applied, SourceTerm: cut.Term,
 		RouteGeneration: cut.RouteGeneration,
 	}}
-	child, _ := plan.split.Child(1)
+	child := plan.children[1]
 	set.Children[1] = rangesplit.ChildArtifactManifest{
 		Present: true, Child: 1, PlanDigest: plan.partitioner.Digest(),
 		PlacementDigest: program.Digest(), Source: cut,
@@ -357,7 +399,7 @@ func testArtifactSet(
 		Descriptor: rangesplit.ChildArtifactDescriptor{
 			Range: child.Range, Shard: child.Shard,
 			AllocationGeneration: child.AllocationGeneration,
-			OwnershipEpoch:       child.OwnershipEpoch, LeaderCount: uint16(len(child.Leaders)),
+			OwnershipEpoch:       child.OwnershipEpoch, LeaderCount: plan.leaderCounts[1],
 		},
 		EncodedBytes: 1, HeaderDigest: sha256.Sum256([]byte("header")),
 		LastChunkDigest: sha256.Sum256([]byte("chunk")),
@@ -375,6 +417,10 @@ func testID(seed byte) [16]byte {
 }
 
 func (p *Plan) sourceSnapshotForTest(t testing.TB) *gateway.Snapshot {
+	return p.sourceSnapshotForTestAt(t, p.current)
+}
+
+func (p *Plan) sourceSnapshotForTestAt(t testing.TB, generation uint64) *gateway.Snapshot {
 	t.Helper()
 	config := distribution.ClusterConfig{
 		Distributions: []distribution.DistributionSpec{{
@@ -390,7 +436,31 @@ func (p *Plan) sourceSnapshotForTest(t testing.TB) *gateway.Snapshot {
 		map[distribution.EndpointID]string{
 			"node-a": "127.0.0.1:1", "node-b": "127.0.0.1:2",
 		},
-		p.current,
+		generation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func (p *Plan) targetSnapshotForTest(t testing.TB) *gateway.Snapshot {
+	t.Helper()
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{
+			Name: "orders", Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+		}},
+		Placements: []distribution.TablePlacement{{
+			Table: "docs", Distribution: "orders", Columns: []string{"/tenant"},
+		}},
+		Manifests: []*distribution.Manifest{p.targetManifest},
+	}
+	snapshot, err := gateway.NewSnapshot(
+		config,
+		map[distribution.EndpointID]string{
+			"node-a": "127.0.0.1:1", "node-b": "127.0.0.1:2",
+		},
+		p.next,
 	)
 	if err != nil {
 		t.Fatal(err)

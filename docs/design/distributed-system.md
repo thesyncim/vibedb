@@ -167,6 +167,9 @@ identity for each new child. It derives one action at a time from the capture,
 artifacts, child cursors, cutover certificate, apply profile, WAL binding,
 runtime status, prune proof, and catalog. Its warm wait path does not allocate.
 The caller must retain the immutable plan and execute each proof-checking action.
+Post-publication recovery reconstructs and validates the prior source manifest
+from the exact child sequence. Caller mutation of the original split request
+cannot relabel an accepted controller plan.
 The repository still has no runnable automatic split controller or merge
 planner.
 

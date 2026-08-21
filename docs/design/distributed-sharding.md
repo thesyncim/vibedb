@@ -106,6 +106,9 @@ non-retained child to its final first-leader SQL and Raft identity. The control
 loop does not write a second progress journal. A restart can reconstruct
 progress from the caller-retained plan, capture head, child stage cursors, SQL
 apply profile, WAL binding, runtime identity, prune proof, and catalog.
+After catalog publication, recovery collapses the exact published child
+sequence back into the original source manifest and revalidates the transition.
+It does not require the old catalog snapshot.
 
 The reconciler rejects skipped routing or catalog generations. It also requires
 the cutover route generation to equal the exact catalog successor. It does not
