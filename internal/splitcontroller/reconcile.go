@@ -126,12 +126,16 @@ func RecoverPlan(
 		return NewPlan(current, split, partitioner, targets)
 	case sourceGeneration + 1:
 		target, ok := current.Manifest(split.Source.Distribution)
-		if !ok || split.Manifest() == nil || !target.Equal(split.Manifest()) {
+		if !ok || split.Manifest() == nil {
 			return nil, ErrTopologyConflict
 		}
 		source, err := reconstructSourceManifest(split)
 		if err != nil {
 			return nil, err
+		}
+		if partitioner == nil ||
+			partitioner.ValidatePublishedManifestTransition(source, target) != nil {
+			return nil, ErrTopologyConflict
 		}
 		return newPlan(source, sourceGeneration, split, partitioner, targets)
 	default:
@@ -466,7 +470,9 @@ func (p *Plan) catalogStage(snapshot *gateway.Snapshot) (catalogStage, error) {
 		}
 		return catalogSource, nil
 	case p.next:
-		if !manifest.Equal(p.targetManifest) {
+		if p.partitioner.ValidatePublishedManifestTransition(
+			p.sourceManifest, manifest,
+		) != nil {
 			return 0, ErrTopologyConflict
 		}
 		return catalogTarget, nil

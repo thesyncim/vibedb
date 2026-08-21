@@ -88,6 +88,124 @@ func TestRecoverPlanCollapsesPublishedChildrenWithoutOldCatalog(t *testing.T) {
 	}
 }
 
+func TestRecoverPlanRecognizesComposedSameDistributionPublication(t *testing.T) {
+	middle := distribution.KeyspacePoint{0x80}
+	current, err := distribution.NewManifest("orders", 11, []distribution.Shard{
+		{
+			ID: "left", AllocationGeneration: 7,
+			Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Point: middle}},
+			Leaders: []distribution.EndpointID{"node-a"}, Epoch: 5,
+		},
+		{
+			ID: "right", AllocationGeneration: 8,
+			Range:   distribution.KeyRange{Start: middle, End: distribution.KeyspaceEnd{Max: true}},
+			Leaders: []distribution.EndpointID{"node-b"}, Epoch: 7,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftSplit := controllerComposedSplitPlan(
+		t, current, "left", 7,
+		distribution.KeyRange{End: distribution.KeyspaceEnd{Point: middle}},
+		5, distribution.KeyspacePoint{0x40}, "left-tail", 9, "node-c",
+	)
+	rightSplit := controllerComposedSplitPlan(
+		t, current, "right", 8,
+		distribution.KeyRange{Start: middle, End: distribution.KeyspaceEnd{Max: true}},
+		7, distribution.KeyspacePoint{0xc0}, "right-tail", 10, "node-d",
+	)
+	left, err := rangesplit.NewPartitioner(
+		leftSplit, "docs", []string{"/tenant"}, distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := rangesplit.NewPartitioner(
+		rightSplit, "docs", []string{"/tenant"}, distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rangesplit.ComposeManifestTransitions(
+		current, []rangesplit.ManifestTransition{
+			{Partitioner: right, Target: rightSplit.Manifest()},
+			{Partitioner: left, Target: leftSplit.Manifest()},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := gateway.NewSnapshot(
+		distribution.ClusterConfig{
+			Distributions: []distribution.DistributionSpec{{
+				Name: "orders", Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+			}},
+			Placements: []distribution.TablePlacement{{
+				Table: "docs", Distribution: "orders", Columns: []string{"/tenant"},
+			}},
+			Manifests: []*distribution.Manifest{combined},
+		},
+		map[distribution.EndpointID]string{
+			"node-a": "127.0.0.1:1", "node-b": "127.0.0.1:2",
+			"node-c": "127.0.0.1:3", "node-d": "127.0.0.1:4",
+		},
+		20,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := testChildTarget(t, leftSplit, left)
+	recovered, err := RecoverPlan(
+		published, 19, leftSplit, left, []ChildTarget{target},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stage, err := recovered.catalogStage(published); err != nil || stage != catalogTarget {
+		t.Fatalf("composed published stage = %v, err = %v", stage, err)
+	}
+}
+
+func controllerComposedSplitPlan(
+	t testing.TB,
+	current *distribution.Manifest,
+	shard distribution.ShardID,
+	allocation distribution.ShardAllocationGeneration,
+	range_ distribution.KeyRange,
+	epoch distribution.OwnershipEpoch,
+	boundary distribution.KeyspacePoint,
+	destination distribution.ShardID,
+	destinationAllocation distribution.ShardAllocationGeneration,
+	destinationLeader distribution.EndpointID,
+) *autosplit.SplitPlan {
+	t.Helper()
+	source := autosplit.SourceIdentity{
+		Distribution: current.Distribution(), Shard: shard,
+		AllocationGeneration: allocation, Range: range_,
+		BucketBits:     distribution.DefaultVirtualBucketBits,
+		RoutingVersion: current.Version(), OwnershipEpoch: epoch,
+	}
+	plan, err := autosplit.PlanSplit(current, autosplit.SplitRequest{
+		Recommendation: autosplit.Recommendation{
+			Source: source, WindowSequence: 1, Kind: autosplit.RecommendationBinarySplit,
+			Boundaries: [2]distribution.KeyspacePoint{boundary}, BoundaryCount: 1,
+			CandidateBin: 32, CurrentPressurePPM: 950_000,
+			PredictedPressurePPM: 700_000, BenefitPPM: 250_000,
+		},
+		RetainChild: 0, NextRoutingVersion: current.Version() + 1,
+		AllocationHighWater: destinationAllocation - 1,
+		Destinations: []autosplit.Destination{{
+			Shard: destination, AllocationGeneration: destinationAllocation,
+			Leaders: []distribution.EndpointID{destinationLeader}, OwnershipEpoch: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
 func TestControlLoopStateIsFixedAndWarmAwaitAllocatesZero(t *testing.T) {
 	if size := unsafe.Sizeof(Plan{}); size > 4096 {
 		t.Fatalf("Plan size = %d B, want <= 4096 B", size)

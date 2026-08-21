@@ -42,6 +42,44 @@ func BenchmarkCatalogTransitionScale(b *testing.B) {
 	}
 }
 
+func BenchmarkBuildManifestTransitionBatch(b *testing.B) {
+	config, endpoints := globalIndexCatalog(b)
+	current, err := NewSnapshotWithIndexes(
+		config, endpoints, 5, []IndexDescriptor{testGlobalIndexDescriptor()},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	base, _ := current.Manifest("tenant_data")
+	index, _ := current.Manifest("message_email_index")
+	manifests := []*distribution.Manifest{
+		changedManifestLeader(b, index, "ep-index-b"),
+		changedManifestLeader(b, base, "ep-b"),
+	}
+	b.Run("batch", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			next, err := BuildManifestTransitions(current, manifests, 6)
+			if err != nil {
+				b.Fatal(err)
+			}
+			runtime.KeepAlive(next)
+		}
+	})
+	b.Run("independent", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			for _, manifest := range manifests {
+				next, err := BuildManifestTransition(current, manifest, 6)
+				if err != nil {
+					b.Fatal(err)
+				}
+				runtime.KeepAlive(next)
+			}
+		}
+	})
+}
+
 func benchmarkCatalogTransition(
 	b *testing.B,
 	scale catalogTransitionBenchmarkScale,

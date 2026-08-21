@@ -129,6 +129,15 @@ unsealed source. Child activation, WAL creation, and runtime adoption use one
 monotonic phase byte, so skipped phases and premature later-phase evidence fail
 closed.
 
+Up to 64 disjoint splits prepared from the same catalog generation can share
+one successor publication. Each certificate, retained-image proof, and exact
+one-source manifest transition is validated independently before composition.
+Distinct sources in the same distribution are merged in range order; distinct
+distributions are replaced in one catalog clone. Duplicate sources, allocation
+identity collisions, skipped generations, or stale proofs fail before the
+single catalog CAS. This permits parallel hot-shard data preparation without
+serial full-catalog rebuilds or weakened cutover fencing.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols

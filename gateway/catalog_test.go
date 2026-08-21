@@ -1126,6 +1126,96 @@ func TestBuildManifestTransitionPreservesCatalogAndRaisesOwnershipFence(t *testi
 	}
 }
 
+func TestBuildManifestTransitionsPublishesDistinctDistributionsInOneClone(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	current, err := NewSnapshotWithPlannerMetadata(
+		config, endpoints, 5, []IndexDescriptor{testGlobalIndexDescriptor()}, gatewayTestStatistics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, _ := current.Manifest("tenant_data")
+	index, _ := current.Manifest("message_email_index")
+	baseNext := changedManifestLeader(t, base, "ep-b")
+	indexNext := changedManifestLeader(t, index, "ep-index-b")
+	next, err := BuildManifestTransitions(
+		current, []*distribution.Manifest{indexNext, baseNext}, 6,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Generation() != 6 {
+		t.Fatalf("generation = %d, want 6", next.Generation())
+	}
+	for _, check := range []struct {
+		name   distribution.DistributionName
+		leader distribution.EndpointID
+	}{
+		{name: "tenant_data", leader: "ep-b"},
+		{name: "message_email_index", leader: "ep-index-b"},
+	} {
+		manifest, ok := next.Manifest(check.name)
+		shard, shardOK := manifest.ShardInfo(0)
+		if !ok || !shardOK || shard.Leaders[0] != check.leader {
+			t.Fatalf("manifest %q = %+v, ok=%v/%v", check.name, shard, ok, shardOK)
+		}
+	}
+	if _, err := BuildManifestTransitions(
+		current, []*distribution.Manifest{baseNext, baseNext}, 6,
+	); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("duplicate distribution error = %v", err)
+	}
+	manifests := []*distribution.Manifest{indexNext, baseNext}
+	var built *Snapshot
+	batchAllocs := testing.AllocsPerRun(100, func() {
+		var buildErr error
+		built, buildErr = BuildManifestTransitions(current, manifests, 6)
+		if buildErr != nil {
+			panic(buildErr)
+		}
+	})
+	independentAllocs := testing.AllocsPerRun(100, func() {
+		for _, manifest := range manifests {
+			var buildErr error
+			built, buildErr = BuildManifestTransition(current, manifest, 6)
+			if buildErr != nil {
+				panic(buildErr)
+			}
+		}
+	})
+	runtime.KeepAlive(built)
+	if batchAllocs >= independentAllocs {
+		t.Fatalf(
+			"batch allocations = %v, independent = %v, want batch lower",
+			batchAllocs, independentAllocs,
+		)
+	}
+	if original, _ := base.ShardInfo(0); original.Leaders[0] == "ep-b" {
+		t.Fatal("current manifest mutated")
+	}
+}
+
+func changedManifestLeader(
+	t testing.TB,
+	manifest *distribution.Manifest,
+	leader distribution.EndpointID,
+) *distribution.Manifest {
+	t.Helper()
+	shards := make([]distribution.Shard, manifest.ShardCount())
+	for ordinal := range shards {
+		shards[ordinal], _ = manifest.ShardInfo(ordinal)
+	}
+	shards[0].Leaders = []distribution.EndpointID{leader}
+	shards[0].Epoch++
+	next, err := distribution.NewManifest(
+		manifest.Distribution(), manifest.Version()+1, shards,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return next
+}
+
 // TestCatalogHolderAtomicPublicationRace proves concurrent publication and reads
 // never expose a torn or mixed generation: every observed snapshot is a whole,
 // internally consistent immutable value. It is meaningful under -race.

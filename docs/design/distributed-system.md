@@ -177,6 +177,11 @@ The reconciler treats a captured source ahead of its tail cursor as catch-up,
 including the crash window after the ownership seal applies but before that
 seal reaches every child stage. Child progress is a single monotonic phase,
 not independent booleans; skipped phases and premature evidence are rejected.
+Certified disjoint splits may prepare concurrently against one source catalog
+and publish as one bounded successor batch. Every split retains its own data
+proofs; composition only removes repeated catalog cloning and CAS contention.
+The batch accepts distinct source allocations within one distribution as well
+as independent distributions.
 The repository still has no runnable automatic split controller or merge
 planner.
 
