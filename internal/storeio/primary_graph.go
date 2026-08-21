@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -59,11 +60,12 @@ const primaryLeafPlanRecordBytes = int(unsafe.Sizeof(CommonPrimaryLeafRecord{}))
 // mutate them. Reusing the plan prevents each phase from re-encoding every
 // candidate leaf solely to rediscover identical boundaries.
 type PrimaryGraphPlan struct {
-	storeID [16]byte
-	records []PrimaryGraphRecord
-	leaves  []primaryLeafPlan
-	pages   int
-	placed  bool
+	storeID   [16]byte
+	records   []PrimaryGraphRecord
+	leaves    []primaryLeafPlan
+	pages     int
+	placed    bool
+	summaries []vibejson.CompiledPointer
 }
 
 // PlanPrimaryGraph computes exact compact leaf boundaries and total graph page
@@ -75,7 +77,21 @@ func PlanPrimaryGraph(
 	placed bool,
 ) (PrimaryGraphPlan, error) {
 	return planPrimaryGraph(
-		storeID, records, placed, CommonPrimaryLeafMaxExtentBytes,
+		storeID, records, placed, CommonPrimaryLeafMaxExtentBytes, nil,
+	)
+}
+
+// PlanPrimaryGraphSummarized is PlanPrimaryGraph with compact stripe min/max
+// paths in canonical catalog order. The plan owns a copy of the compiled
+// pointers so its retained payloads and any later rebuild use one definition.
+func PlanPrimaryGraphSummarized(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	placed bool,
+	summaries []vibejson.CompiledPointer,
+) (PrimaryGraphPlan, error) {
+	return planPrimaryGraph(
+		storeID, records, placed, CommonPrimaryLeafMaxExtentBytes, summaries,
 	)
 }
 
@@ -84,6 +100,7 @@ func planPrimaryGraph(
 	records []PrimaryGraphRecord,
 	placed bool,
 	maxExtent int,
+	summaries []vibejson.CompiledPointer,
 ) (PrimaryGraphPlan, error) {
 	if err := validatePrimaryGraphRecords(storeID, records); err != nil {
 		return PrimaryGraphPlan{}, err
@@ -92,8 +109,8 @@ func planPrimaryGraph(
 	if placed {
 		maxRows = CommonPrimaryLeafWideSlots
 	}
-	leaves, err := planCompactPrimaryLeaves(
-		storeID, records, maxRows, maxExtent,
+	leaves, err := planCompactPrimaryLeavesSummarized(
+		storeID, records, maxRows, maxExtent, summaries,
 	)
 	if err != nil {
 		return PrimaryGraphPlan{}, err
@@ -105,6 +122,7 @@ func planPrimaryGraph(
 	return PrimaryGraphPlan{
 		storeID: storeID, records: records, leaves: leaves,
 		pages: pages, placed: placed,
+		summaries: append([]vibejson.CompiledPointer(nil), summaries...),
 	}, nil
 }
 
@@ -214,6 +232,16 @@ const EmptyPrimaryGraphPageCount = 1 + 3 + 1 + 1
 // empty leaf), so this only composes them. The returned reference is suitable
 // for StateRoot.PrimaryRoot.
 func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
+	return BuildEmptyPrimaryGraphSummarized(tx, nil)
+}
+
+// BuildEmptyPrimaryGraphSummarized is BuildEmptyPrimaryGraph with the compact
+// summary catalog already embedded in the empty leaf, so its first mutation
+// cannot change leaf grammar behind an existing root.
+func BuildEmptyPrimaryGraphSummarized(
+	tx *WriteTransaction,
+	summaries []vibejson.CompiledPointer,
+) (PageRef, error) {
 	if tx == nil || !tx.active || tx.options.PageSize != physicalPageQuantum ||
 		tx.options.StoreID == ([16]byte{}) || tx.options.Generation == 0 ||
 		tx.nextID < PrimaryFirstDynamicLogicalID {
@@ -230,6 +258,10 @@ func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
 	if err != nil {
 		return PageRef{}, err
 	}
+	builder := NewUnifiedPrimaryLeafBuilder()
+	if err := builder.SetCompactPrimarySummaries(summaries); err != nil {
+		return PageRef{}, err
+	}
 	if _, err := EncodeCompactPrimaryStripe(
 		page.Bytes(),
 		CommonPrimaryLeafHeader{
@@ -237,7 +269,7 @@ func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
 			Bucket: BucketID(bucket), PageSize: CommonPrimaryLeafNarrowBytes,
 		},
 		nil,
-		NewUnifiedPrimaryLeafBuilder(),
+		builder,
 	); err != nil {
 		return PageRef{}, err
 	}
@@ -265,7 +297,7 @@ func buildPrimaryGraphPlaced(
 	}
 	plan, err := planPrimaryGraph(
 		tx.options.StoreID, records, placements != nil,
-		min(tx.committer.bufferSize, CommonPrimaryLeafMaxExtentBytes),
+		min(tx.committer.bufferSize, CommonPrimaryLeafMaxExtentBytes), nil,
 	)
 	if err != nil {
 		return PageRef{}, err
@@ -295,7 +327,7 @@ func BuildPlannedPrimaryGraph(
 		}
 	}
 	built, err := buildPrimaryLeaves(
-		tx, plan.records, plan.leaves, placements,
+		tx, plan.records, plan.leaves, placements, plan.summaries,
 	)
 	if err != nil {
 		return PageRef{}, err
@@ -415,6 +447,17 @@ func planCompactPrimaryLeaves(
 	records []PrimaryGraphRecord,
 	maxRows, maxExtent int,
 ) ([]primaryLeafPlan, error) {
+	return planCompactPrimaryLeavesSummarized(
+		storeID, records, maxRows, maxExtent, nil,
+	)
+}
+
+func planCompactPrimaryLeavesSummarized(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	maxRows, maxExtent int,
+	summaries []vibejson.CompiledPointer,
+) ([]primaryLeafPlan, error) {
 	if storeID == ([16]byte{}) || maxRows < 1 ||
 		maxRows > CompactPrimaryStripeMaxRows ||
 		maxExtent < int(physicalPageQuantum) || maxExtent > CommonPrimaryLeafMaxExtentBytes {
@@ -422,6 +465,9 @@ func planCompactPrimaryLeaves(
 	}
 	var plans []primaryLeafPlan
 	builder := NewUnifiedPrimaryLeafBuilder()
+	if err := builder.SetCompactPrimarySummaries(summaries); err != nil {
+		return nil, err
+	}
 	countHint := 0
 	for first := 0; first < len(records); {
 		hi := min(maxRows, len(records)-first)
@@ -570,6 +616,7 @@ func buildPrimaryLeaves(
 	input []PrimaryGraphRecord,
 	plans []primaryLeafPlan,
 	placements []PrimaryGraphPlacement,
+	summaries []vibejson.CompiledPointer,
 ) ([]primaryBuiltLeaf, error) {
 	built := make([]primaryBuiltLeaf, len(plans))
 	var unifiedBuilder *UnifiedPrimaryLeafBuilder
@@ -604,6 +651,9 @@ func buildPrimaryLeaves(
 		} else {
 			if unifiedBuilder == nil {
 				unifiedBuilder = NewUnifiedPrimaryLeafBuilder()
+				if err := unifiedBuilder.SetCompactPrimarySummaries(summaries); err != nil {
+					return nil, err
+				}
 			}
 			_, encodeErr = encodeCompactPrimaryGraphStripe(
 				page.Bytes(), leafHeader,

@@ -58,6 +58,18 @@ func (b *UnifiedPrimaryLeafBuilder) CompactPatchCapacityBytes() uint64 {
 	bytes += uint64(cap(b.shapeSavings)) * uint64(unsafe.Sizeof(int64(0)))
 	bytes += uint64(cap(b.dictionary)) * uint64(unsafe.Sizeof(unifiedDictionaryCandidate{}))
 	bytes += uint64(cap(b.patchValues)) * uint64(unsafe.Sizeof(unifiedPrimaryPatchValueDelta{}))
+	bytes += uint64(cap(b.compactSummaryPointers)) *
+		uint64(unsafe.Sizeof(vibejson.CompiledPointer{}))
+	bytes += uint64(cap(b.compactSummaryMin)+cap(b.compactSummaryMax)) *
+		uint64(unsafe.Sizeof([]byte{}))
+	for i := range b.compactSummaryMin {
+		bytes += uint64(cap(b.compactSummaryMin[i]))
+	}
+	for i := range b.compactSummaryMax {
+		bytes += uint64(cap(b.compactSummaryMax[i]))
+	}
+	bytes += uint64(cap(b.compactSummaryValid)) * uint64(unsafe.Sizeof(bool(false)))
+	bytes += uint64(cap(b.compactSummaryProbe))
 	bytes += b.compact.capacityBytes()
 	return bytes
 }

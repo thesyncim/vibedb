@@ -107,6 +107,7 @@ type fileJob struct {
 	overlay   FileOverlay
 	masks     []store.Mask
 	scanRange *FileRangeSource
+	skip      *durable.DataSkippingFilter
 	overflow  *[]byte
 	slots     []fileSlot
 	spaces    []Workspace
@@ -374,6 +375,10 @@ func (pool *filePool) runScan(
 		if err == nil {
 			err = job.overlay.RangeInserts(overlayInsert)
 		}
+	case job.skip != nil:
+		*job.overflow, err = job.snapshot.RangeDataSkippingRawBuffer(
+			job.skip, (*job.overflow)[:0], row,
+		)
 	case job.masks == nil:
 		*job.overflow, err = job.snapshot.RangeRawBuffer((*job.overflow)[:0], row)
 	default:

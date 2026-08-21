@@ -330,6 +330,7 @@ available.
 | Leader-only shard process | Available; one locally fenced store |
 | Stateless gateway | Available; scoped coherent read fan-out, single-shard fast writes, fixed-participant atomic write batches, and bounded durable coordinator redrive |
 | Independently sharded global indexes | Catalog/incarnation fencing, byte-native finite-domain lookup batched once per index shard, locator-only projection with exact grouped base-primary fetch, atomic lifecycle-wide INSERT/UPDATE/DELETE maintenance, resumable per-base-shard compare-and-put backfill, and a stable local catalog-generation drain fence available; cluster-wide build scheduling, checkpoint persistence, and gateway-ack aggregation remain external |
+| Shard-local data skipping | Durable primary stripes can persist up to eight declared scalar min/max summaries; conjunctive equality/range filters reject stripes before document reconstruction through an allocation-free warmed byte-native scan, while the full predicate remains authoritative |
 | Embedded single-shard placement checks | Available through `OpenCluster` |
 | Peer enrollment, authentication, and network transport | Not available |
 | Replicated client writes and automatic failover | Not available |

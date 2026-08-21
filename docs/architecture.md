@@ -136,6 +136,14 @@ record is a delete. It never trusts a physical sibling pointer that a later COW
 generation could make stale. Query execution takes an explicit heap or durable
 snapshot and uses the same cut for indexes, scans, and document rechecks.
 
+Collections may persist up to eight explicit scalar min/max summaries in each
+primary stripe. A query with sound conjunctive scalar bounds compares canonical
+ordered bytes and advances a rejected stripe before document reconstruction;
+the full predicate still owns correctness for retained stripes. Summary space
+is capped at 4 KiB per stripe and unsupported scalar shapes disable pruning
+locally, so the optimization has bounded write/space cost and cannot create
+false negatives.
+
 ## SQL and JSON documents
 
 The relational boundary has one language: SQL. Embedded callers use

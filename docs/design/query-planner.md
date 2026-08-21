@@ -94,6 +94,16 @@ posting unions merely to intersect them. Covering aggregates remain a separate
 exact path; no secondary values or range metadata are duplicated into another
 format.
 
+For declared `durable.Options.SkipIndexes`, conjunctive immutable scalar
+`=`, `<`, `<=`, `>`, and `>=` comparisons compile into canonical ordered byte
+bounds over catalog ordinals. A warmed scan compares those bounds with compact
+per-primary-stripe min/max terms without path strings or JSON parsing and
+advances rejected leaves before key/value decoding. Exact candidate masks and
+native primary ranges take precedence; overlays decline the optimization. The
+complete compiled predicate still rechecks every row in retained stripes, so
+missing/invalid summaries affect work only, never results. Query statistics
+report both skipped stripes and their logical row count.
+
 `SUM` uses exact rational arithmetic and emits a finite canonical JSON decimal.
 `MIN` and `MAX` compare exact values and preserve a contributing spelling.
 Every shard aggregate must return exactly one row with the expected schema.

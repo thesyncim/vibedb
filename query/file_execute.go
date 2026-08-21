@@ -130,10 +130,12 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
-	index      durable.IndexSession
-	overflow   []byte
-	accs       []aggAcc
-	fileGroups []fileGroup
+	index          durable.IndexSession
+	skipFilter     durable.DataSkippingFilter
+	skipPredicates [16]durable.DataSkippingPredicate
+	overflow       []byte
+	accs           []aggAcc
+	fileGroups     []fileGroup
 
 	// tokenFilter is the reusable full-scan equality kernel for the narrow
 	// scalar COUNT lane. It is deliberately execution-local: EqFilter is
@@ -212,6 +214,8 @@ func (w *fileWorkspace) release() {
 	// dropping them is what makes the pool unreachable.
 	w.stopPool()
 	w.index.Release()
+	w.skipFilter = durable.DataSkippingFilter{}
+	clear(w.skipPredicates[:])
 	w.overflow = nil
 	w.accs = nil
 	w.fileGroups = nil
@@ -378,6 +382,10 @@ type ExecStats struct {
 	CandidateRows        uint64
 	CandidateChunks      int
 	CoveringColumns      int
+	// DataSkippedRows/DataSkippedStripes are compact primary stripes rejected
+	// from persisted scalar min/max metadata before document reconstruction.
+	DataSkippedRows    uint64
+	DataSkippedStripes uint64
 	// TokenFilterRows were evaluated directly from durable leaf templates and
 	// scalar tokens during an honest full scan. TokenFilterFallbackRows were
 	// scanned by the same lane but required canonical document rendering. Their
@@ -668,6 +676,26 @@ func (p *plan) runFileSnapshotBatched(
 			return result, stats, err
 		}
 	}
+	var skipFilter *durable.DataSkippingFilter
+	if candidateMasks == nil && overlay == nil && rangeSource == nil &&
+		work.remaining() >= durable.DataSkippingFilterMemoryBytes {
+		var enabled bool
+		enabled, err = p.fileDataSkippingFilter(
+			snapshot, &e.file.skipFilter, e.file.skipPredicates[:],
+		)
+		if err != nil {
+			return result, stats, err
+		}
+		if enabled {
+			if err := work.admit(
+				"durable data-skipping workspace",
+				durable.DataSkippingFilterMemoryBytes,
+			); err != nil {
+				return result, stats, err
+			}
+			skipFilter = &e.file.skipFilter
+		}
+	}
 	n.memoryBytes = work.remaining()
 	// A fileArena's controlled growth retains earlier generations while the
 	// merge frontier still references them. Its cumulative capacity is less
@@ -776,8 +804,8 @@ func (p *plan) runFileSnapshotBatched(
 	}
 	pool.start(fileJob{
 		p: p, snapshot: snapshot, overlay: overlay, masks: candidateMasks,
-		scanRange: rangeSource,
-		overflow:  &e.file.overflow, slots: slots,
+		scanRange: rangeSource, skip: skipFilter,
+		overflow: &e.file.overflow, slots: slots,
 		spaces: e.file.workers, segments: e.file.segments,
 		arenas: e.file.arenas, opts: n, active: n.workers,
 		budget: &e.Workspace.aggregateBudget, cancel: e.Options.Cancel,
@@ -1036,6 +1064,11 @@ func (p *plan) runFileSnapshotBatched(
 	e.file.rows, e.file.rowRuns, e.file.groupRuns = rows, rowRuns, groupRuns
 	e.file.groupSet = groups
 	stats.RowsScanned = scan.rows
+	if skipFilter != nil {
+		skipped := skipFilter.Metrics()
+		stats.DataSkippedRows = skipped.Rows
+		stats.DataSkippedStripes = skipped.Stripes
+	}
 	stats.Batches = scan.batches
 	stats.PeakBatchRows = scan.peakRows
 	stats.PeakBatchBytes = scan.peakBytes

@@ -160,8 +160,9 @@ each shard—without turning foreground transactional storage into a MergeTree:
 
 - scans produce fixed-capacity column vectors and retain raw document bytes for
   late materialization;
-- min/max, exact-value, Bloom, and full-text summaries skip immutable row
-  groups before decoding;
+- declared scalar min/max summaries skip immutable primary stripes before
+  decoding; exact-value, Bloom, and full-text summaries remain later bounded
+  structures rather than automatic write amplification on every field;
 - covering projections maintain alternate sort/order layouts through the same
   committed mutation stream as global indexes;
 - predicates, runtime filters, projection pruning, partial aggregation, and
@@ -176,6 +177,17 @@ The row-oriented routed lane remains authoritative for point reads and writes.
 Columnar projections are derived, incarnation-fenced structures: the optimizer
 may ignore them without changing results, and repair can rebuild them from a
 certified snapshot plus committed mutation tail.
+
+The storage foundation for the first bullet is serving locally now. Up to eight
+catalog-persisted RFC 6901 paths carry compact ordered scalar extrema in every
+primary stripe. Query planning turns only sound conjunctive immutable scalar
+comparisons into byte-native bounds; rejected stripes advance the primary graph
+without decoding keys, reconstructing documents, or resolving overflow chains.
+Containers, oversized scalar keys, overflow rows, and bounded metadata pressure
+disable pruning for only the affected stripe/path. Updates conservatively widen
+old extrema or take the normal deterministic full-leaf rebuild, so summaries
+can add false positives but never false negatives. Distributed stage scheduling
+and parallel-replica range assignment remain separate work.
 
 ## Distributed query execution
 
@@ -251,8 +263,10 @@ cluster does not fork into named protocol generations.
 4. **In progress:** independently sharded global-index CRUD, batched finite-key
    locator projections, exact grouped base fetch, resumable online-build data
    plane, local generation drains, native primary-range skipping, and bounded
-   ordered secondary-index range masks are present; cluster-wide build
-   orchestration and compact non-indexed row-group summaries are next.
+   ordered secondary-index range masks are present. Compact catalog-persisted
+   scalar min/max summaries now prune non-indexed primary stripes through the
+   local durable query path; cluster-wide build orchestration and richer
+   bounded skip structures remain pending.
 5. **Partly serving:** shard-local execution already has bounded parallel
    batches, filter-first/lazy projection, exact-index pushdown, covering
    aggregates, adaptive joins, and spill. Distributed vectorized stage

@@ -56,6 +56,9 @@ const (
 	// application-supplied document schema. The schema definition remains
 	// caller configuration; reopening with a different definition fails.
 	StateOptionSchema uint32 = 1 << iota
+	// StateOptionSkipIndexes means the durable catalog also binds compact
+	// primary-stripe min/max paths.
+	StateOptionSkipIndexes
 	// StateOptionCanonicalMaterialization means the file may contain
 	// recovery-journaled canonical page replacements. The exact qualified
 	// power-loss damage granule is carried by StateRoot so Open can recover
@@ -64,6 +67,7 @@ const (
 )
 
 const stateRootKnownOptions = StateOptionSchema |
+	StateOptionSkipIndexes |
 	StateOptionCanonicalMaterialization
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
@@ -327,7 +331,8 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 			ErrInvalidWrite,
 		)
 	}
-	hasCatalog := root.IndexCount != 0 || root.Options&StateOptionSchema != 0
+	hasCatalog := root.IndexCount != 0 ||
+		root.Options&(StateOptionSchema|StateOptionSkipIndexes) != 0
 	hasExactCatalog := root.PageCatalogBytes != 0
 	if !validPhysicalPageSize(root.MaxPageSize) ||
 		root.MaxPageSize < root.PageSize ||

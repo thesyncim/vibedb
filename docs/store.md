@@ -572,6 +572,26 @@ cannot inject counter pointers or reach the workspace through the session.
 expert, single-consumer engine API for embedders implementing their own planner.
 The root facade and the standard query executor do not expose or require them.
 
+`durable.Options.SkipIndexes` declares up to eight RFC 6901 scalar paths for
+compact primary-stripe min/max summaries. Unlike an exact index, a skip index
+has no posting list and cannot identify matching rows; it only proves that an
+entire stripe cannot satisfy a conjunctive equality or ordered comparison.
+Paths and their canonical order are persisted in the page catalog and are
+reconstructed on a zero-option reopen. Missing values order as null. A
+container, a canonical scalar key longer than 256 bytes, any overflow row, or
+the 4 KiB per-stripe summary ceiling makes the relevant metadata conservative
+and unprunable rather than rejecting the write. Mutation patches retain old
+extrema and only widen them; if the existing entry cannot hold the wider key,
+the ordinary full-leaf rebuild recomputes the exact bounds.
+
+`Snapshot.CompileDataSkippingFilter` and
+`Snapshot.RangeDataSkippingRawBuffer` expose the reusable byte-native engine
+surface. The standard query executor uses it automatically when no stronger
+exact candidate mask, ordered-primary range, or overlay source is active. A
+warmed inline scan allocates nothing, and `ExecStats.DataSkippedRows` plus
+`DataSkippedStripes` expose physical work avoided. Row predicates remain the
+semantic authority for every retained stripe.
+
 ### Bulk creation
 
 `durable.CreateFromRecords` is the native bulk path: it borrows a complete row

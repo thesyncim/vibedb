@@ -10,7 +10,7 @@ import (
 
 const (
 	CompactPrimaryStripeMaxRows = 4 << 10
-	compactPrimaryHeaderBytes   = 32
+	compactPrimaryHeaderBytes   = 40
 	compactPrimaryShapeHeader   = 16
 	compactPrimaryMagic         = "VCS1"
 	compactPrimaryHasOverflow   = 1 << 0
@@ -353,7 +353,17 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 			payload[compactPrimaryHeaderBytes+shape*4:], uint32(len(payload)-shapeDataStart),
 		)
 	}
-	binary.LittleEndian.PutUint32(payload[24:], uint32(len(payload)-shapeDataStart))
+	shapeBytes := len(payload) - shapeDataStart
+	binary.LittleEndian.PutUint32(payload[24:], uint32(shapeBytes))
+	summaryStart := len(payload)
+	payload, err = appendPreparedCompactPrimarySummaries(payload, builder, rowCount)
+	if err != nil {
+		return nil, err
+	}
+	binary.LittleEndian.PutUint16(
+		payload[32:], uint16(len(builder.compactSummaryPointers)),
+	)
+	binary.LittleEndian.PutUint32(payload[36:], uint32(len(payload)-summaryStart))
 	scratch.payload = payload
 	return payload, nil
 }
@@ -826,6 +836,11 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 		page, err := CloneCompactPrimaryStripeGeneration(dst, v.page, generation)
 		return page, err == nil, err
 	}
+	if summariesFit, summaryErr := v.prepareCompactPrimarySummaryWiden(
+		builder, replacements,
+	); summaryErr != nil || !summariesFit {
+		return nil, false, summaryErr
+	}
 
 	patch.patchGroups = patch.patchGroups[:0]
 	for _, modification := range patch.patchMods {
@@ -998,6 +1013,14 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			binary.LittleEndian.PutUint32(payload[at:], uint32(end))
 		}
 	}
+	if v.summaryCount != 0 {
+		summaryStart := len(payload) - len(v.summaryRaw)
+		if summaryStart < 0 || !v.rewriteCompactPrimarySummaries(
+			payload[summaryStart:], builder,
+		) {
+			return nil, false, corrupt("summary rewrite")
+		}
+	}
 	page = dst[:extent]
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, false, err
@@ -1018,21 +1041,23 @@ type compactPrimaryShapeView struct {
 }
 
 type CompactPrimaryStripeView struct {
-	header      CommonPrimaryLeafHeader
-	page        []byte
-	payload     []byte
-	rows        int
-	shapeCount  int
-	shapeWidth  int
-	key         compactStreamView
-	shapeCodes  []byte
-	rankTable   []byte
-	shapeDir    []byte
-	slots       []byte
-	overflow    []byte
-	overflowRef []byte
-	shapeData   []byte
-	shapeStart  int
+	header       CommonPrimaryLeafHeader
+	page         []byte
+	payload      []byte
+	rows         int
+	shapeCount   int
+	shapeWidth   int
+	key          compactStreamView
+	shapeCodes   []byte
+	rankTable    []byte
+	shapeDir     []byte
+	slots        []byte
+	overflow     []byte
+	overflowRef  []byte
+	shapeData    []byte
+	shapeStart   int
+	summaryRaw   []byte
+	summaryCount int
 }
 
 func OpenCompactPrimaryStripe(
@@ -1148,6 +1173,14 @@ func openCompactPrimaryStripePayload(
 	rankBytes := int(binary.LittleEndian.Uint32(payload[20:]))
 	shapeBytes := int(binary.LittleEndian.Uint32(payload[24:]))
 	slotBytes := int(binary.LittleEndian.Uint32(payload[28:]))
+	summaryCount := int(binary.LittleEndian.Uint16(payload[32:]))
+	summaryBytes := int(binary.LittleEndian.Uint32(payload[36:]))
+	if binary.LittleEndian.Uint16(payload[34:]) != 0 ||
+		summaryCount > PageCatalogMaxSkipIndexes ||
+		(summaryCount == 0) != (summaryBytes == 0) ||
+		summaryBytes > CompactPrimarySummaryMaxBytes {
+		return corrupt("summary header")
+	}
 	wantShapeCodes := (rows*shapeWidth + 7) / 8
 	restarts := (rows + compactStreamRestart - 1) / compactStreamRestart
 	wantRanks := restarts * shapeCount * 2
@@ -1171,7 +1204,8 @@ func openCompactPrimaryStripePayload(
 	}
 	overflowRefBytes := overflowCount * PageRefSize
 	fixed64 := prefix64 + uint64(overflowRefBytes) +
-		uint64(shapeCodeBytes) + uint64(rankBytes) + uint64(shapeBytes)
+		uint64(shapeCodeBytes) + uint64(rankBytes) + uint64(shapeBytes) +
+		uint64(summaryBytes)
 	if shapeCodeBytes != wantShapeCodes || rankBytes != wantRanks ||
 		(slotBytes != 0 && (slotBytes != rows || rows > CommonPrimaryLeafWideSlots)) ||
 		fixed64 != uint64(len(payload)) {
@@ -1194,7 +1228,11 @@ func openCompactPrimaryStripePayload(
 	cursor += shapeCodeBytes
 	rankTable := payload[cursor : cursor+rankBytes]
 	cursor += rankBytes
-	shapeData := payload[cursor:]
+	shapeData := payload[cursor : cursor+shapeBytes]
+	summaryRaw := payload[cursor+shapeBytes:]
+	if err := validateCompactPrimarySummaries(summaryRaw, summaryCount); err != nil {
+		return CompactPrimaryStripeView{}, err
+	}
 	v := CompactPrimaryStripeView{
 		header: CommonPrimaryLeafHeader{
 			StoreID: storeID, Generation: pageHeader.Generation,
@@ -1204,6 +1242,7 @@ func openCompactPrimaryStripePayload(
 		key: key, slots: slots, overflow: overflowBitmap, overflowRef: overflowRefs,
 		shapeCodes: shapeCodes, rankTable: rankTable,
 		shapeDir: shapeDir, shapeData: shapeData, shapeStart: cursor,
+		summaryRaw: summaryRaw, summaryCount: summaryCount,
 	}
 	if validate {
 		if err := v.validate(bounds, validateOverflowBounds); err != nil {
@@ -1453,6 +1492,28 @@ func (v *CompactPrimaryStripeView) Header() CommonPrimaryLeafHeader {
 		return CommonPrimaryLeafHeader{}
 	}
 	return v.header
+}
+
+// SummaryCount is the collection-catalog ordered min/max entry count carried
+// by this stripe.
+func (v *CompactPrimaryStripeView) SummaryCount() int {
+	if v == nil {
+		return 0
+	}
+	return v.summaryCount
+}
+
+// Summary returns one borrowed canonical ordered scalar interval. false means
+// the entry was deliberately made unprunable by a container, oversized value,
+// overflow row, or bounded metadata admission.
+func (v *CompactPrimaryStripeView) Summary(index int) (
+	minTerm, maxTerm []byte,
+	valid bool,
+) {
+	if v == nil || index < 0 || index >= v.summaryCount {
+		return nil, nil, false
+	}
+	return compactPrimarySummaryAt(v.summaryRaw, index)
 }
 
 // RowAt returns the borrowed-through-scratch key at lexical rank.
