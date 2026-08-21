@@ -42,6 +42,12 @@ most three child ranges. One child keeps the source allocation. The target
 routing version must be the exact successor because the ownership seal advances
 all mutable coordinates once.
 
+The target manifest is a copy-on-write successor: it keeps new contiguous
+shard and range-start arrays for the routing hot path, shares only immutable
+backing from untouched shards, and defensively copies the replacement children.
+The bounded replacement validates coverage, adjacency, IDs, allocation
+generations, and endpoints without a hash map or per-untouched-shard clone.
+
 `internal/rangesplit` implements the non-serving data plane for that plan. It
 uses one source scan and one compiled `vibejson` index per row. It sends each
 borrowed key and document to one child and can skip the retained child copy.
@@ -150,9 +156,12 @@ bytes.
 This admission cut never groups work by tenant. The range allocation is the
 scheduling and fencing unit, while virtual-bucket mapping permits one tenant's
 data to span physical shards when its placement key has sufficient entropy or
-additional placement fields. Selection does not assign child endpoints or
-allocation generations and does not publish topology. Those placement
-reservations and every later data proof remain separate prerequisites.
+additional placement fields. `BuildSplitPlanBatch` binds selected ordinals to
+caller-prepared destinations only after it rechecks the catalog cut, exact
+source allocation, durable per-distribution allocation high-water, endpoint
+directory, and cross-plan identity uniqueness. It does not assign those
+resources or publish topology. Placement reservations and every later data
+proof remain separate prerequisites.
 
 ## Security boundary
 
@@ -170,7 +179,7 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go`
+- `internal/topologyscheduler/admission.go` and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

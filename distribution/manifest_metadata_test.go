@@ -73,6 +73,9 @@ func TestManifestShardMetadataAt(t *testing.T) {
 func TestManifestShardMetadataForRange(t *testing.T) {
 	manifest := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
 	want, _ := manifest.ShardMetadataAt(1)
+	if ordinal, ok := manifest.ShardOrdinalForRange(want.Range); !ok || ordinal != 1 {
+		t.Fatalf("ShardOrdinalForRange = %d, %v; want 1, true", ordinal, ok)
+	}
 	if got, ok := manifest.ShardMetadataForRange(want.Range); !ok || got != want {
 		t.Fatalf("ShardMetadataForRange = %+v, %v; want %+v, true", got, ok, want)
 	}
@@ -82,6 +85,9 @@ func TestManifestShardMetadataForRange(t *testing.T) {
 	wrongStart := want.Range
 	wrongStart.Start = pt(hb(0x90))
 	for _, keyRange := range []KeyRange{wrongEnd, wrongStart, {}} {
+		if ordinal, ok := manifest.ShardOrdinalForRange(keyRange); ok || ordinal != 0 {
+			t.Errorf("ShardOrdinalForRange(%+v) = %d, %v; want 0, false", keyRange, ordinal, ok)
+		}
 		if got, ok := manifest.ShardMetadataForRange(keyRange); ok || got != (ShardMetadata{}) {
 			t.Errorf("ShardMetadataForRange(%+v) = %+v, %v; want zero, false", keyRange, got, ok)
 		}

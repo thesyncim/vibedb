@@ -112,16 +112,25 @@ bytes so one hot keyspace cannot consume the entire publication cut.
 
 The scheduling unit is a physical range allocation, not a tenant. Tenant keys
 continue to map through virtual buckets and may occupy ranges on many shards.
-Admission returns indices only: it does not choose destination members, reserve
-allocation generations, move data, execute a controller action, or grant
-catalog authority. A placement owner must supply those independently fenced
-resources before `PlanSplit` and the proof pipeline can run.
+Admission returns indices only. `BuildSplitPlanBatch` can then bind them to
+caller-prepared destinations while rechecking the same catalog and source
+fences, the durable allocation high-water, endpoint membership, and resource
+uniqueness across the batch. Allocation namespaces remain per distribution.
+The handoff still does not choose destination members, reserve identities,
+move data, execute a controller action, or grant catalog authority.
 
 `PlanSplit` does not move data or publish the catalog. The internal
 `rangesplit` package can populate non-retained child images from one source
 scan. It uses compiled `vibejson` placement and deterministic hash-chained
 artifacts. Verification checks key order and document placement before it
 exposes a complete chunk.
+
+Split planning constructs its target manifest copy-on-write. It allocates new
+contiguous shard and range-start arrays for fast routing, structurally shares
+immutable identity and leader backing for untouched shards, and defensively
+copies only the replacement children. The edit revalidates exact source-range
+coverage, adjacency, IDs, allocation generations, and endpoints without a map
+or per-unchanged-shard allocation.
 
 The range-split tail translator binds the exact source applied position, term,
 last-entry digest, logical digest, and snapshot base. It parses each before and
@@ -226,7 +235,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`
 - `shardservice/admit.go`, `read_fence.go`, and `server.go`
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
-- `internal/topologyscheduler/admission.go`
+- `internal/topologyscheduler/admission.go` and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

@@ -155,14 +155,6 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 		}
 	}
 
-	usedIDs := make(map[distribution.ShardID]struct{}, current.ShardCount()+len(request.Destinations))
-	usedAllocations := make(map[distribution.ShardAllocationGeneration]struct{}, current.ShardCount()+len(request.Destinations))
-	for i := 0; i < current.ShardCount(); i++ {
-		metadata, _ := current.ShardMetadataAt(i)
-		usedIDs[metadata.ID] = struct{}{}
-		usedAllocations[metadata.AllocationGeneration] = struct{}{}
-	}
-
 	plan := &SplitPlan{
 		Source: rec.Source, ChildCount: uint8(childCount), RetainedChild: request.RetainChild,
 	}
@@ -173,7 +165,7 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 		if i == int(request.RetainChild) {
 			child.Shard = source.ID
 			child.AllocationGeneration = source.AllocationGeneration
-			child.Leaders = slices.Clone(source.Leaders)
+			child.Leaders = source.Leaders
 			child.OwnershipEpoch = source.Epoch + 1
 			child.Retained = true
 		} else {
@@ -184,10 +176,9 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 				destination.AllocationGeneration <= lastAllocation {
 				return nil, ErrInvalidSplit
 			}
-			if _, exists := usedIDs[destination.Shard]; exists {
-				return nil, ErrInvalidSplit
-			}
-			if _, exists := usedAllocations[destination.AllocationGeneration]; exists {
+			if destinationConflicts(
+				current, request.Destinations[:destinationOrdinal-1], destination,
+			) {
 				return nil, ErrInvalidSplit
 			}
 			for _, leader := range destination.Leaders {
@@ -195,8 +186,6 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 					return nil, ErrInvalidSplit
 				}
 			}
-			usedIDs[destination.Shard] = struct{}{}
-			usedAllocations[destination.AllocationGeneration] = struct{}{}
 			lastAllocation = destination.AllocationGeneration
 			child.Shard = destination.Shard
 			child.AllocationGeneration = destination.AllocationGeneration
@@ -206,23 +195,16 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 		plan.children[i] = child
 	}
 
-	shards := make([]distribution.Shard, 0, current.ShardCount()+childCount-1)
-	for i := 0; i < current.ShardCount(); i++ {
-		if i != sourceOrdinal {
-			shard, _ := current.ShardInfo(i)
-			shards = append(shards, shard)
-			continue
-		}
-		for child := 0; child < childCount; child++ {
-			descriptor := &plan.children[child]
-			shards = append(shards, distribution.Shard{
-				ID: descriptor.Shard, AllocationGeneration: descriptor.AllocationGeneration,
-				Range: descriptor.Range, Leaders: descriptor.Leaders, Epoch: descriptor.OwnershipEpoch,
-			})
+	var replacements [MaxSplitChildren]distribution.Shard
+	for child := 0; child < childCount; child++ {
+		descriptor := &plan.children[child]
+		replacements[child] = distribution.Shard{
+			ID: descriptor.Shard, AllocationGeneration: descriptor.AllocationGeneration,
+			Range: descriptor.Range, Leaders: descriptor.Leaders, Epoch: descriptor.OwnershipEpoch,
 		}
 	}
-	manifest, err := distribution.NewManifest(
-		current.Distribution(), request.NextRoutingVersion, shards,
+	manifest, err := current.ReplaceShard(
+		sourceOrdinal, request.NextRoutingVersion, replacements[:childCount],
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidSplit, err)
@@ -231,17 +213,37 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 	return plan, nil
 }
 
+func destinationConflicts(
+	current *distribution.Manifest,
+	prior []Destination,
+	destination Destination,
+) bool {
+	for index := 0; index < current.ShardCount(); index++ {
+		metadata, _ := current.ShardMetadataAt(index)
+		if destination.Shard == metadata.ID ||
+			destination.AllocationGeneration == metadata.AllocationGeneration {
+			return true
+		}
+	}
+	for index := range prior {
+		if destination.Shard == prior[index].Shard ||
+			destination.AllocationGeneration == prior[index].AllocationGeneration {
+			return true
+		}
+	}
+	return false
+}
+
 func exactSourceShard(
 	manifest *distribution.Manifest,
 	source SourceIdentity,
 ) (int, distribution.Shard, bool) {
-	for i := 0; i < manifest.ShardCount(); i++ {
-		shard, ok := manifest.ShardInfo(i)
-		if !ok || shard.ID != source.Shard {
-			continue
-		}
-		return i, shard, shard.AllocationGeneration == source.AllocationGeneration &&
-			shard.Range == source.Range && shard.Epoch == source.OwnershipEpoch
+	ordinal, ok := manifest.ShardOrdinalForRange(source.Range)
+	if !ok {
+		return 0, distribution.Shard{}, false
 	}
-	return 0, distribution.Shard{}, false
+	shard, ok := manifest.ShardInfo(ordinal)
+	return ordinal, shard, ok && shard.ID == source.Shard &&
+		shard.AllocationGeneration == source.AllocationGeneration &&
+		shard.Epoch == source.OwnershipEpoch
 }
