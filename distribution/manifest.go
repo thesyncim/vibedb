@@ -216,6 +216,41 @@ func cloneManifestShard(shard Shard) Shard {
 	return clone
 }
 
+// ReplaceShardLeader constructs an immutable manifest by replacing one
+// endpoint in one shard's ordered leader set and assigning its new ownership
+// epoch. Range geometry and every untouched shard remain unchanged, so the
+// immutable range-start index and untouched leader backing are safely shared.
+func (m *Manifest) ReplaceShardLeader(
+	ordinal int,
+	version RoutingVersion,
+	leader int,
+	endpoint EndpointID,
+	epoch OwnershipEpoch,
+) (*Manifest, error) {
+	if m == nil || ordinal < 0 || ordinal >= len(m.shards) ||
+		leader < 0 || leader >= len(m.shards[ordinal].Leaders) || endpoint == "" {
+		return nil, &ManifestError{Reason: "invalid shard leader replacement"}
+	}
+	source := &m.shards[ordinal]
+	for index := range source.Leaders {
+		if index != leader && source.Leaders[index] == endpoint {
+			return nil, &ManifestError{Reason: "replacement duplicates a shard leader endpoint"}
+		}
+	}
+	leaders := slices.Clone(source.Leaders)
+	leaders[leader] = EndpointID(strings.Clone(string(endpoint)))
+	shards := make([]Shard, len(m.shards))
+	copy(shards, m.shards)
+	shards[ordinal].Leaders = leaders
+	shards[ordinal].Epoch = epoch
+	return &Manifest{
+		distribution: m.distribution,
+		version:      version,
+		shards:       shards,
+		starts:       m.starts,
+	}, nil
+}
+
 // Distribution reports the distribution this manifest routes.
 func (m *Manifest) Distribution() DistributionName { return m.distribution }
 

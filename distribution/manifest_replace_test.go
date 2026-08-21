@@ -2,6 +2,7 @@ package distribution
 
 import (
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -53,6 +54,76 @@ func TestManifestReplaceShardSharesOnlyImmutableUnchangedStorage(t *testing.T) {
 	revalidated, err := NewManifest(next.Distribution(), next.Version(), detached)
 	if err != nil || !next.Equal(revalidated) {
 		t.Fatalf("copy-on-write successor did not revalidate: %v", err)
+	}
+}
+
+func TestManifestReplaceShardLeaderSharesImmutableRangeIndex(t *testing.T) {
+	current := manifestForMetadataTest(t, "dist", 7, []Shard{
+		{ID: "left", AllocationGeneration: 1,
+			Range:   KeyRange{End: KeyspaceEnd{Point: pt(hb(0x80))}},
+			Leaders: []EndpointID{"a", "b"}, Epoch: 2},
+		{ID: "right", AllocationGeneration: 2,
+			Range:   KeyRange{Start: pt(hb(0x80)), End: maxKeyEnd},
+			Leaders: []EndpointID{"c"}, Epoch: 3},
+	})
+	next, err := current.ReplaceShardLeader(0, 8, 0, "d", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Version() != 8 || next.shards[0].Epoch != 4 ||
+		!slices.Equal(next.shards[0].Leaders, []EndpointID{"d", "b"}) {
+		t.Fatalf("replacement = version %d shard %+v", next.Version(), next.shards[0])
+	}
+	if current.shards[0].Epoch != 2 || current.shards[0].Leaders[0] != "a" {
+		t.Fatal("leader replacement mutated source manifest")
+	}
+	if &current.starts[0] != &next.starts[0] {
+		t.Fatal("immutable range-start index was copied")
+	}
+	if &current.shards[1].Leaders[0] != &next.shards[1].Leaders[0] {
+		t.Fatal("untouched immutable leader storage was copied")
+	}
+	if &current.shards[0].Leaders[0] == &next.shards[0].Leaders[0] {
+		t.Fatal("changed leader storage was retained")
+	}
+	detached := make([]Shard, next.ShardCount())
+	for index := range detached {
+		detached[index], _ = next.ShardInfo(index)
+	}
+	revalidated, err := NewManifest(next.Distribution(), next.Version(), detached)
+	if err != nil || !next.Equal(revalidated) {
+		t.Fatalf("leader successor did not revalidate: %v", err)
+	}
+}
+
+func TestManifestReplaceShardLeaderRejectsInvalidReplacement(t *testing.T) {
+	current := manifestForMetadataTest(t, "dist", 7, []Shard{{
+		ID: "all", AllocationGeneration: 1, Range: KeyRange{End: maxKeyEnd},
+		Leaders: []EndpointID{"a", "b"}, Epoch: 2,
+	}})
+	tests := []struct {
+		name     string
+		manifest *Manifest
+		ordinal  int
+		leader   int
+		endpoint EndpointID
+	}{
+		{name: "nil manifest", manifest: nil, ordinal: 0, leader: 0, endpoint: "c"},
+		{name: "negative shard", manifest: current, ordinal: -1, leader: 0, endpoint: "c"},
+		{name: "unknown shard", manifest: current, ordinal: 1, leader: 0, endpoint: "c"},
+		{name: "negative leader", manifest: current, ordinal: 0, leader: -1, endpoint: "c"},
+		{name: "unknown leader", manifest: current, ordinal: 0, leader: 2, endpoint: "c"},
+		{name: "empty endpoint", manifest: current, ordinal: 0, leader: 0},
+		{name: "duplicate endpoint", manifest: current, ordinal: 0, leader: 0, endpoint: "b"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.manifest.ReplaceShardLeader(
+				test.ordinal, 8, test.leader, test.endpoint, 3,
+			); !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("ReplaceShardLeader error = %v, want ErrInvalidManifest", err)
+			}
+		})
 	}
 }
 
