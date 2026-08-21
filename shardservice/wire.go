@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -453,10 +454,89 @@ type ShardRequest struct {
 	// DocumentScan selects the bounded raw scan lane. MaxRows and
 	// MaxResultBytes are its mandatory page bounds.
 	DocumentScan DocumentScanRequest
+	// Exchange selects the ephemeral worker mailbox lane. It is mutually
+	// exclusive with SQL, storage reads, fences, and durable transactions.
+	Exchange ExchangeRequest
 
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
 	Transaction TransactionRequest
+}
+
+// ExchangeOperation is one mailbox lifecycle or data command.
+type ExchangeOperation uint8
+
+const (
+	ExchangeNone ExchangeOperation = iota
+	ExchangeOpen
+	ExchangePush
+	ExchangePull
+	ExchangeCancel
+)
+
+func (o ExchangeOperation) valid() bool { return o >= ExchangeOpen && o <= ExchangeCancel }
+
+// ExchangeRequest carries raw attempt-fenced mailbox commands without SQL,
+// JSON parsing, formatted identities, or a serialized query plan.
+type ExchangeRequest struct {
+	Operation ExchangeOperation
+	Key       exchange.Key
+
+	Producers       uint16
+	QueuedBatches   uint16
+	ProducerBatches uint16
+	BufferedRows    uint64
+	BufferedBytes   uint64
+	TotalRows       uint64
+	TotalBytes      uint64
+
+	Batch exchange.Batch
+
+	HasAck      bool
+	AckProducer uint16
+	AckSequence uint32
+}
+
+func (r ExchangeRequest) present() bool { return r.Operation != ExchangeNone }
+
+func (r ExchangeRequest) canonical() bool {
+	openFields := r.Producers != 0 || r.QueuedBatches != 0 || r.ProducerBatches != 0 ||
+		r.BufferedRows != 0 || r.BufferedBytes != 0 || r.TotalRows != 0 || r.TotalBytes != 0
+	batchFields := r.Batch.Producer != 0 || r.Batch.Sequence != 0 || r.Batch.Rows != 0 ||
+		len(r.Batch.Data) != 0 || r.Batch.Final
+	ackFields := r.HasAck || r.AckProducer != 0 || r.AckSequence != 0
+	if !r.present() {
+		return r.Key == (exchange.Key{}) && !openFields && !batchFields && !ackFields
+	}
+	if !r.Operation.valid() || r.Key.Operation.IsZero() {
+		return false
+	}
+	switch r.Operation {
+	case ExchangeOpen:
+		return !batchFields && !ackFields && (exchange.Spec{
+			Key: r.Key, Producers: r.Producers, QueuedBatches: r.QueuedBatches,
+			ProducerBatches: r.ProducerBatches, BufferedRows: r.BufferedRows,
+			BufferedBytes: r.BufferedBytes, TotalRows: r.TotalRows, TotalBytes: r.TotalBytes,
+		}).Valid()
+	case ExchangePush:
+		return !openFields && !ackFields && canonicalExchangeBatch(r.Batch)
+	case ExchangePull:
+		return !openFields && !batchFields &&
+			((r.HasAck && r.AckProducer < exchange.MaxProducers) ||
+				(!r.HasAck && r.AckProducer == 0 && r.AckSequence == 0))
+	case ExchangeCancel:
+		return !openFields && !batchFields && !ackFields
+	default:
+		return false
+	}
+}
+
+func canonicalExchangeBatch(batch exchange.Batch) bool {
+	return batch.Producer < exchange.MaxProducers && batch.Rows <= exchange.MaxBatchRows &&
+		len(batch.Data) <= int(exchange.MaxBatchBytes) &&
+		((batch.Rows == 0 && len(batch.Data) == 0 && batch.Final) ||
+			(batch.Rows != 0 && len(batch.Data) != 0)) &&
+		(batch.Final || batch.Sequence != ^uint32(0))
 }
 
 // RowBatchRequest bounds one streamed row frame. It is an opt-in transport
@@ -579,6 +659,15 @@ const (
 	// ErrorReadFenceBusy asks a coherent multi-shard reader to release any
 	// partial cut and retry after an intersecting writer or participant.
 	ErrorReadFenceBusy
+	// ErrorExchangeNotFound reports a mailbox key absent on this worker.
+	ErrorExchangeNotFound
+	// ErrorExchangeConflict reports an incompatible retry of an open command.
+	ErrorExchangeConflict
+	// ErrorExchangeSequence reports a producer sequence, digest, or consumer ack
+	// that does not match the mailbox state.
+	ErrorExchangeSequence
+	// ErrorExchangeClosed reports a canceled or retired mailbox.
+	ErrorExchangeClosed
 )
 
 // String renders the kind name for diagnostics.
@@ -616,13 +705,21 @@ func (k ErrorKind) String() string {
 		return "TransactionNotFound"
 	case ErrorReadFenceBusy:
 		return "ReadFenceBusy"
+	case ErrorExchangeNotFound:
+		return "ExchangeNotFound"
+	case ErrorExchangeConflict:
+		return "ExchangeConflict"
+	case ErrorExchangeSequence:
+		return "ExchangeSequence"
+	case ErrorExchangeClosed:
+		return "ExchangeClosed"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorReadFenceBusy }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorExchangeClosed }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.
@@ -673,6 +770,36 @@ type ShardResponse struct {
 	// Transaction is present only on a successful transaction command. Its zero
 	// value preserves the ordinary response encoding.
 	Transaction TransactionReply
+	// Exchange is present only on a successful exchange completion response.
+	Exchange ExchangeReply
+}
+
+// ExchangeReply acknowledges a mailbox command or carries one pull result.
+// EOF is valid only for ExchangePull and carries no batch.
+type ExchangeReply struct {
+	Operation ExchangeOperation
+	Batch     exchange.Batch
+	EOF       bool
+}
+
+func (r ExchangeReply) present() bool { return r.Operation != ExchangeNone }
+
+func (r ExchangeReply) canonical() bool {
+	batchFields := r.Batch.Producer != 0 || r.Batch.Sequence != 0 || r.Batch.Rows != 0 ||
+		len(r.Batch.Data) != 0 || r.Batch.Final
+	if !r.present() {
+		return !batchFields && !r.EOF
+	}
+	if !r.Operation.valid() {
+		return false
+	}
+	if r.Operation != ExchangePull {
+		return !r.EOF && !batchFields
+	}
+	if r.EOF {
+		return !batchFields
+	}
+	return canonicalExchangeBatch(r.Batch)
 }
 
 // RowBatchReply is the framing metadata for one bounded row fragment.

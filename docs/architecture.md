@@ -301,8 +301,9 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Distributed server boundary](design/distributed-sharding.md): the
   separate, server-only distributed tier. Its routed leader-only shard
   execution (`shardservice`) and stateless routing gateway (`gateway`) exist
-  today, including an opt-in bounded row-batch transport primitive that keeps
-  the routed one-frame lane unchanged but is not yet a repartition exchange;
+  today, including an opt-in bounded row-batch transport primitive and
+  owner-fenced retry-safe mailbox lifecycle commands that keep the routed
+  one-frame lane unchanged but are not yet planner-orchestrated repartition;
   both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
@@ -312,8 +313,9 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and
-  online movement. Its bounded worker-mailbox state machine exists internally,
-  but network exchange orchestration remains unfinished. It is a delivery
+  online movement. Its bounded worker-mailbox state machine and shard-wire
+  lifecycle commands exist, but direct producer routing, authenticated peer
+  admission, and planner exchange orchestration remain unfinished. It is a delivery
   contract, not current capability.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and

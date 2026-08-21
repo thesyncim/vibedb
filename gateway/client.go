@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/shardservice"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -57,6 +58,12 @@ var (
 	// ErrReadFenceBusy asks a coherent fan-out reader to drop a partial cut and
 	// retry after an intersecting write has crossed admission.
 	ErrReadFenceBusy = errors.New("gateway: coherent read fence intersects an admitted writer")
+	// Exchange sentinels preserve the mailbox retry state machine across the
+	// shard wire without exposing string-formatted operation identities.
+	ErrExchangeNotFound = exchange.ErrNotFound
+	ErrExchangeConflict = exchange.ErrSpecConflict
+	ErrExchangeSequence = exchange.ErrSequence
+	ErrExchangeClosed   = exchange.ErrClosed
 )
 
 // ShardError is a typed failure a shard reported in an error frame. Kind is the
@@ -109,6 +116,14 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrTransactionNotFound
 	case shardservice.ErrorReadFenceBusy:
 		return ErrReadFenceBusy
+	case shardservice.ErrorExchangeNotFound:
+		return ErrExchangeNotFound
+	case shardservice.ErrorExchangeConflict:
+		return ErrExchangeConflict
+	case shardservice.ErrorExchangeSequence:
+		return ErrExchangeSequence
+	case shardservice.ErrorExchangeClosed:
+		return ErrExchangeClosed
 	default:
 		return ErrUnexpectedError
 	}

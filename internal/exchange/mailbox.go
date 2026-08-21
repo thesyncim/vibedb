@@ -6,6 +6,7 @@ package exchange
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"sync"
@@ -29,6 +30,7 @@ var (
 	ErrProducerBusy  = errors.New("exchange: producer already has an in-flight push")
 	ErrProducerFinal = errors.New("exchange: producer already ended its stream")
 	ErrSequence      = errors.New("exchange: producer sequence is not the next sequence")
+	ErrAck           = errors.New("exchange: acknowledgment does not name the delivered batch")
 	ErrBatchLimit    = errors.New("exchange: batch exceeds its row or byte bound")
 	ErrTotalLimit    = errors.New("exchange: mailbox exceeds its total row or byte bound")
 )
@@ -67,7 +69,8 @@ type Spec struct {
 	DeadlineUnixNano int64
 }
 
-func (s Spec) valid() bool {
+// Valid reports whether every mailbox identity and bound is canonical.
+func (s Spec) Valid() bool {
 	return s.Key.valid() && s.Producers != 0 && s.Producers <= MaxProducers &&
 		s.QueuedBatches != 0 && s.QueuedBatches <= MaxQueuedBatches &&
 		s.ProducerBatches != 0 && s.ProducerBatches <= MaxProducerBatches &&
@@ -92,10 +95,15 @@ type Batch struct {
 }
 
 type producerState struct {
-	next   uint32
-	queued uint16
-	active bool
-	final  bool
+	next         uint32
+	lastSequence uint32
+	lastRows     uint32
+	lastDigest   [sha256.Size]byte
+	queued       uint16
+	active       bool
+	final        bool
+	lastFinal    bool
+	hasLast      bool
 }
 
 // Mailbox is one bounded multi-producer, single-consumer partition queue.
@@ -105,17 +113,21 @@ type producerState struct {
 type Mailbox struct {
 	spec Spec
 
-	mu         sync.Mutex
-	queue      []Batch
-	head       uint16
-	tail       uint16
-	count      uint16
-	rows       uint64
-	bytes      uint64
-	totalRows  uint64
-	totalBytes uint64
-	finals     uint16
-	cause      error
+	mu          sync.Mutex
+	queue       []Batch
+	head        uint16
+	tail        uint16
+	count       uint16
+	rows        uint64
+	bytes       uint64
+	totalRows   uint64
+	totalBytes  uint64
+	finals      uint16
+	cause       error
+	delivered   bool
+	hasAck      bool
+	ackProducer uint16
+	ackSequence uint32
 
 	producers  []producerState
 	dataReady  chan struct{}
@@ -191,11 +203,21 @@ func (m *Mailbox) Push(ctx context.Context, batch Batch) error {
 		return ErrBatchLimit
 	}
 
+	digest := sha256.Sum256(batch.Data)
 	m.mu.Lock()
 	state := &m.producers[batch.Producer]
 	if state.active {
 		m.mu.Unlock()
 		return ErrProducerBusy
+	}
+	if state.hasLast && batch.Sequence == state.lastSequence {
+		if batch.Rows == state.lastRows && batch.Final == state.lastFinal &&
+			digest == state.lastDigest {
+			m.mu.Unlock()
+			return nil
+		}
+		m.mu.Unlock()
+		return ErrSequence
 	}
 	if state.final {
 		m.mu.Unlock()
@@ -241,6 +263,11 @@ func (m *Mailbox) Push(ctx context.Context, batch Batch) error {
 			m.totalBytes += batchBytes
 			state.queued++
 			state.active = false
+			state.lastSequence = batch.Sequence
+			state.lastRows = batch.Rows
+			state.lastDigest = digest
+			state.lastFinal = batch.Final
+			state.hasLast = true
 			if batch.Final {
 				state.final = true
 				m.finals++
@@ -262,8 +289,9 @@ func (m *Mailbox) Push(ctx context.Context, batch Batch) error {
 	}
 }
 
-// Pull returns the next arrived batch and transfers Data ownership to the
-// caller. io.EOF means every producer ended and the queue is drained.
+// Pull returns the next arrived batch. It redelivers the same batch until Ack
+// names its producer and sequence, so a lost network response cannot lose data.
+// io.EOF means every producer ended and the acknowledged queue is drained.
 func (m *Mailbox) Pull(ctx context.Context) (Batch, error) {
 	if m == nil {
 		return Batch{}, ErrClosed
@@ -283,17 +311,8 @@ func (m *Mailbox) Pull(ctx context.Context) (Batch, error) {
 		}
 		if m.count != 0 {
 			batch := m.queue[m.head]
-			m.queue[m.head] = Batch{}
-			m.head++
-			if m.head == uint16(len(m.queue)) {
-				m.head = 0
-			}
-			m.count--
-			m.rows -= uint64(batch.Rows)
-			m.bytes -= uint64(len(batch.Data))
-			m.producers[batch.Producer].queued--
+			m.delivered = true
 			m.mu.Unlock()
-			signal(m.spaceReady)
 			return batch, nil
 		}
 		if m.finals == m.spec.Producers {
@@ -308,6 +327,50 @@ func (m *Mailbox) Pull(ctx context.Context) (Batch, error) {
 			return Batch{}, err
 		}
 	}
+}
+
+// Ack releases the currently delivered batch. Repeating the most recently
+// accepted acknowledgment is idempotent; every other stale or speculative ack
+// fails closed.
+func (m *Mailbox) Ack(producer uint16, sequence uint32) error {
+	if m == nil {
+		return ErrClosed
+	}
+	m.mu.Lock()
+	if err := m.stateErrorLocked(); err != nil {
+		m.mu.Unlock()
+		m.signalAll()
+		return err
+	}
+	if m.hasAck && producer == m.ackProducer && sequence == m.ackSequence {
+		m.mu.Unlock()
+		return nil
+	}
+	if !m.delivered || m.count == 0 {
+		m.mu.Unlock()
+		return ErrAck
+	}
+	batch := m.queue[m.head]
+	if batch.Producer != producer || batch.Sequence != sequence {
+		m.mu.Unlock()
+		return ErrAck
+	}
+	m.queue[m.head] = Batch{}
+	m.head++
+	if m.head == uint16(len(m.queue)) {
+		m.head = 0
+	}
+	m.count--
+	m.rows -= uint64(batch.Rows)
+	m.bytes -= uint64(len(batch.Data))
+	m.producers[batch.Producer].queued--
+	m.delivered = false
+	m.hasAck = true
+	m.ackProducer = producer
+	m.ackSequence = sequence
+	m.mu.Unlock()
+	signal(m.spaceReady)
+	return nil
 }
 
 // Cancel fails current and future operations and drops queued ownership.
@@ -326,6 +389,7 @@ func (m *Mailbox) Cancel(cause error) {
 		}
 		m.head, m.tail, m.count = 0, 0, 0
 		m.rows, m.bytes = 0, 0
+		m.delivered = false
 	}
 	m.mu.Unlock()
 	m.signalAll()

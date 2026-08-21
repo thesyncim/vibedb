@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -51,6 +52,11 @@ const (
 	// DefaultMaxReadFences bounds abandoned leased coherent cuts and their scope
 	// copies independently of the connection limit.
 	DefaultMaxReadFences = 4096
+	// Exchange defaults reserve a finite aggregate promise across ephemeral
+	// stage mailboxes. A mailbox allocates only its ring and producer state at
+	// Open; payload memory remains bounded by this admitted reservation.
+	DefaultMaxExchangeMailboxes   = 1024
+	DefaultMaxExchangeBufferBytes = 512 << 20
 
 	// UnlimitedConnections and UnlimitedResults are explicit opt-outs from the
 	// corresponding finite defaults; a negative timeout disables that deadline.
@@ -89,6 +95,11 @@ type Options struct {
 	// MaxReadFences bounds active leased coherent multi-shard read cuts. Zero
 	// selects DefaultMaxReadFences; unlike connections it cannot be unbounded.
 	MaxReadFences int
+	// MaxExchangeMailboxes and MaxExchangeBufferBytes bound worker exchange
+	// state independently of SQL results and connections. Zero selects finite
+	// defaults; neither resource can be configured as unbounded.
+	MaxExchangeMailboxes   int
+	MaxExchangeBufferBytes uint64
 
 	// OnError is called with every connection-terminating error, including the
 	// ordinary ones (a peer that closed its connection). It is the only logging
@@ -104,6 +115,7 @@ type Server struct {
 	claim      *sqldriver.ShardStoreServingClaim
 	journal    *distributedtxn.Journal
 	readFences *readFenceSet
+	exchanges  *exchange.Registry
 	ownership  Ownership
 	opts       Options
 
@@ -153,6 +165,9 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxReadFences < 0 {
 		return nil, errors.New("shardservice: MaxReadFences must be nonnegative")
 	}
+	if opts.MaxExchangeMailboxes < 0 {
+		return nil, errors.New("shardservice: MaxExchangeMailboxes must be nonnegative")
+	}
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = DefaultMaxConnections
 	}
@@ -183,6 +198,12 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 	if opts.MaxReadFences == 0 {
 		opts.MaxReadFences = DefaultMaxReadFences
 	}
+	if opts.MaxExchangeMailboxes == 0 {
+		opts.MaxExchangeMailboxes = DefaultMaxExchangeMailboxes
+	}
+	if opts.MaxExchangeBufferBytes == 0 {
+		opts.MaxExchangeBufferBytes = DefaultMaxExchangeBufferBytes
+	}
 	// Claim first so an unbound, mismatched, or stale store retains its precise
 	// admission error. Opening the journal afterward may create hidden state;
 	// failure closes the claim and an equal-fence retry resumes safely.
@@ -210,13 +231,17 @@ func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, er
 		claim:      claim,
 		journal:    journal,
 		readFences: newReadFenceSet(opts.MaxReadFences),
-		ownership:  cfg,
-		opts:       opts,
-		baseCtx:    baseCtx,
-		cancel:     cancel,
-		conns:      map[net.Conn]struct{}{},
-		listeners:  map[net.Listener]struct{}{},
-		closeDone:  make(chan struct{}),
+		exchanges: exchange.NewRegistry(exchange.RegistryOptions{
+			MaxMailboxes:           opts.MaxExchangeMailboxes,
+			MaxReservedBufferBytes: opts.MaxExchangeBufferBytes,
+		}),
+		ownership: cfg,
+		opts:      opts,
+		baseCtx:   baseCtx,
+		cancel:    cancel,
+		conns:     map[net.Conn]struct{}{},
+		listeners: map[net.Listener]struct{}{},
+		closeDone: make(chan struct{}),
 	}, nil
 }
 
@@ -328,6 +353,7 @@ func (s *Server) Close() error {
 
 	s.cancel()
 	s.readFences.close()
+	s.exchanges.Close()
 	var err error
 	for _, l := range listeners {
 		if closeErr := l.Close(); closeErr != nil && err == nil {

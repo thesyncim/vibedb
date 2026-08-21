@@ -55,6 +55,25 @@ func TestMailboxBackpressureSequencingAndCompletion(t *testing.T) {
 	if err != nil || first.Sequence != 0 || string(first.Data) != "first" {
 		t.Fatalf("first Pull = %+v, %v", first, err)
 	}
+	if repeated, err := box.Pull(context.Background()); err != nil ||
+		repeated.Producer != first.Producer || repeated.Sequence != first.Sequence ||
+		string(repeated.Data) != "first" {
+		t.Fatalf("repeated Pull = %+v, %v", repeated, err)
+	}
+	select {
+	case err := <-pushed:
+		t.Fatalf("second Push completed before Ack: %v", err)
+	default:
+	}
+	if err := box.Ack(1, first.Sequence); !errors.Is(err, ErrAck) {
+		t.Fatalf("wrong Ack = %v, want ErrAck", err)
+	}
+	if err := box.Ack(first.Producer, first.Sequence); err != nil {
+		t.Fatalf("first Ack: %v", err)
+	}
+	if err := box.Ack(first.Producer, first.Sequence); err != nil {
+		t.Fatalf("idempotent first Ack: %v", err)
+	}
 	if err := <-pushed; err != nil {
 		t.Fatalf("second Push: %v", err)
 	}
@@ -62,12 +81,18 @@ func TestMailboxBackpressureSequencingAndCompletion(t *testing.T) {
 	if err != nil || second.Sequence != 1 || !second.Final || string(second.Data) != "second" {
 		t.Fatalf("second Pull = %+v, %v", second, err)
 	}
+	if err := box.Ack(second.Producer, second.Sequence); err != nil {
+		t.Fatalf("second Ack: %v", err)
+	}
 	if err := box.Push(context.Background(), Batch{Producer: 1, Final: true}); err != nil {
 		t.Fatalf("producer 1 terminal Push: %v", err)
 	}
 	terminal, err := box.Pull(context.Background())
 	if err != nil || !terminal.Final || terminal.Producer != 1 {
 		t.Fatalf("terminal Pull = %+v, %v", terminal, err)
+	}
+	if err := box.Ack(terminal.Producer, terminal.Sequence); err != nil {
+		t.Fatalf("terminal Ack: %v", err)
 	}
 	if _, err := box.Pull(context.Background()); !errors.Is(err, io.EOF) {
 		t.Fatalf("drained Pull = %v, want EOF", err)
@@ -101,6 +126,16 @@ func TestMailboxRejectsSequenceLimitsAndConcurrentProducer(t *testing.T) {
 		Producer: 0, Rows: 1, Data: []byte("held"),
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if err := box.Push(context.Background(), Batch{
+		Producer: 0, Rows: 1, Data: []byte("held"),
+	}); err != nil {
+		t.Fatalf("idempotent Push: %v", err)
+	}
+	if err := box.Push(context.Background(), Batch{
+		Producer: 0, Rows: 1, Data: []byte("different"),
+	}); !errors.Is(err, ErrSequence) {
+		t.Fatalf("conflicting retry = %v, want ErrSequence", err)
 	}
 	blocked := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -143,7 +178,11 @@ func TestMailboxCapsAndCancellationWakeWaiters(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := box.Pull(context.Background()); err != nil {
+	delivered, err := box.Pull(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := box.Ack(delivered.Producer, delivered.Sequence); err != nil {
 		t.Fatal(err)
 	}
 	if err := box.Push(context.Background(), Batch{
@@ -222,6 +261,13 @@ func TestRegistryAdmissionIdempotenceReapAndPartitioning(t *testing.T) {
 	if err != nil || again != box {
 		t.Fatalf("idempotent Open = %p, %v; want %p", again, err, box)
 	}
+	retried := spec
+	retried.DeadlineUnixNano = time.Now().Add(time.Hour).UnixNano()
+	again, err = r.Open(retried)
+	if err != nil || again != box || again.Spec().DeadlineUnixNano != spec.DeadlineUnixNano {
+		t.Fatalf("deadline-shifted Open retry = %p, %v, deadline %d; want original %p deadline %d",
+			again, err, again.Spec().DeadlineUnixNano, box, spec.DeadlineUnixNano)
+	}
 	conflict := spec
 	conflict.TotalRows++
 	if _, err := r.Open(conflict); !errors.Is(err, ErrSpecConflict) {
@@ -281,7 +327,7 @@ func TestMailboxDeadlineWakesBlockedOperationWithoutReaper(t *testing.T) {
 	}
 }
 
-func BenchmarkMailboxPushPull(b *testing.B) {
+func BenchmarkMailboxPushPullAck(b *testing.B) {
 	spec := testSpec()
 	spec.Producers = 1
 	spec.QueuedBatches = 1
@@ -306,7 +352,11 @@ func BenchmarkMailboxPushPull(b *testing.B) {
 		}); err != nil {
 			b.Fatal(err)
 		}
-		if _, err := box.Pull(context.Background()); err != nil {
+		delivered, err := box.Pull(context.Background())
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := box.Ack(delivered.Producer, delivered.Sequence); err != nil {
 			b.Fatal(err)
 		}
 	}

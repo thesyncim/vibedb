@@ -352,6 +352,10 @@ func TestClientExtendedErrorMapping(t *testing.T) {
 		{shardservice.ErrorPositionUnsupported, ErrPositionUnsupported},
 		{shardservice.ErrorPositionIdentity, ErrPositionIdentity},
 		{shardservice.ErrorPositionNotReached, ErrPositionNotReached},
+		{shardservice.ErrorExchangeNotFound, ErrExchangeNotFound},
+		{shardservice.ErrorExchangeConflict, ErrExchangeConflict},
+		{shardservice.ErrorExchangeSequence, ErrExchangeSequence},
+		{shardservice.ErrorExchangeClosed, ErrExchangeClosed},
 	}
 	for _, tc := range tests {
 		err := shardError(shardservice.NewErrorResponse(tc.kind, tc.kind.String()))

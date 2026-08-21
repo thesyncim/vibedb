@@ -328,7 +328,7 @@ available.
 
 | Server capability | Current state |
 | --- | --- |
-| Leader-only shard process | Available; one locally fenced store |
+| Leader-only shard process | Available; one locally fenced store, plus owner-fenced bounded exchange-mailbox lifecycle commands for internal workers (direct repartition routing is not yet orchestrated) |
 | Stateless gateway | Available; scoped coherent read fan-out, exact bounded grouped partial/final aggregation and path-projection DISTINCT with parsed shard fragments, final sort and O(OFFSET+LIMIT) top-K even when one group spans shards, single-shard fast writes, fixed-participant atomic write batches, bounded durable coordinator redrive, and byte-native row-batch consumption with sequence/limit validation and synchronous backpressure for grouped fan-out (not yet hash/range repartition) |
 | Independently sharded global indexes | Catalog/incarnation fencing, byte-native finite-domain lookup batched once per index shard, locator-only projection with exact grouped base-primary fetch, atomic lifecycle-wide INSERT/UPDATE/DELETE maintenance, resumable per-base-shard compare-and-put backfill, and a stable local catalog-generation drain fence available; cluster-wide build scheduling, checkpoint persistence, and gateway-ack aggregation remain external |
 | Shard-local data skipping | Durable primary stripes can persist up to eight declared scalar min/max summaries; conjunctive equality/range filters reject stripes before document reconstruction through an allocation-free warmed byte-native scan, while the full predicate remains authoritative |

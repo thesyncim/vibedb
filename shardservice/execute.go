@@ -8,8 +8,10 @@ import (
 	"math"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -147,6 +149,9 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 		}
 		return write(NewErrorResponse(ErrorMalformedRequest, err.Error()))
 	}
+	if req.Exchange.present() {
+		return write(c.executeExchange(req))
+	}
 	if req.Transaction.Operation != TransactionNone {
 		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() {
 			return write(NewErrorResponse(ErrorMalformedRequest,
@@ -213,6 +218,106 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 		return write(c.executeDocumentScan(req))
 	}
 	return c.execute(req, write)
+}
+
+// executeExchange runs the ephemeral mailbox protocol after ordinary ownership
+// admission but before SQL transaction barriers. Its keys and payloads remain
+// raw bytes; no SQL parser, JSON decoder, or formatted identifier is involved.
+func (c *shardConn) executeExchange(req *ShardRequest) *ShardResponse {
+	command := req.Exchange
+	if command.Operation == ExchangeOpen {
+		budget := req.Deadline
+		if budget <= 0 {
+			budget = c.server.opts.DefaultRequestDeadline
+		}
+		var deadline int64
+		if budget > 0 {
+			deadline = time.Now().Add(budget).UnixNano()
+		}
+		_, err := c.server.exchanges.Open(exchange.Spec{
+			Key: command.Key, Producers: command.Producers,
+			QueuedBatches: command.QueuedBatches, ProducerBatches: command.ProducerBatches,
+			BufferedRows: command.BufferedRows, BufferedBytes: command.BufferedBytes,
+			TotalRows: command.TotalRows, TotalBytes: command.TotalBytes,
+			DeadlineUnixNano: deadline,
+		})
+		if err != nil {
+			return exchangeError(err)
+		}
+		return exchangeCompletion(ExchangeOpen)
+	}
+
+	box, ok := c.server.exchanges.Lookup(command.Key)
+	if command.Operation == ExchangeCancel {
+		if ok {
+			c.server.exchanges.Delete(command.Key, exchange.ErrClosed)
+		}
+		return exchangeCompletion(ExchangeCancel)
+	}
+	if !ok {
+		return exchangeError(exchange.ErrNotFound)
+	}
+
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	switch command.Operation {
+	case ExchangePush:
+		if err := box.Push(ctx, command.Batch); err != nil {
+			return exchangeError(err)
+		}
+		return exchangeCompletion(ExchangePush)
+	case ExchangePull:
+		if command.HasAck {
+			if err := box.Ack(command.AckProducer, command.AckSequence); err != nil {
+				return exchangeError(err)
+			}
+		}
+		batch, err := box.Pull(ctx)
+		if errors.Is(err, io.EOF) {
+			resp := exchangeCompletion(ExchangePull)
+			resp.Exchange.EOF = true
+			return resp
+		}
+		if err != nil {
+			return exchangeError(err)
+		}
+		resp := exchangeCompletion(ExchangePull)
+		resp.Exchange.Batch = batch
+		return resp
+	default:
+		return exchangeError(exchange.ErrInvalidSpec)
+	}
+}
+
+func exchangeCompletion(operation ExchangeOperation) *ShardResponse {
+	resp := CompletionResponse(0)
+	resp.Exchange.Operation = operation
+	return resp
+}
+
+func exchangeError(err error) *ShardResponse {
+	switch {
+	case errors.Is(err, exchange.ErrNotFound):
+		return NewErrorResponse(ErrorExchangeNotFound, err.Error())
+	case errors.Is(err, exchange.ErrSpecConflict):
+		return NewErrorResponse(ErrorExchangeConflict, err.Error())
+	case errors.Is(err, exchange.ErrSequence),
+		errors.Is(err, exchange.ErrAck),
+		errors.Is(err, exchange.ErrProducer),
+		errors.Is(err, exchange.ErrProducerBusy),
+		errors.Is(err, exchange.ErrProducerFinal):
+		return NewErrorResponse(ErrorExchangeSequence, err.Error())
+	case errors.Is(err, exchange.ErrClosed):
+		return NewErrorResponse(ErrorExchangeClosed, err.Error())
+	case errors.Is(err, exchange.ErrRegistryLimit),
+		errors.Is(err, exchange.ErrBatchLimit),
+		errors.Is(err, exchange.ErrTotalLimit):
+		return NewErrorResponse(ErrorResourceLimit, err.Error())
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return NewErrorResponse(ErrorDeadlineExceeded, err.Error())
+	default:
+		return NewErrorResponse(ErrorMalformedRequest, err.Error())
+	}
 }
 
 // transaction executes the durable subset of the transaction protocol. Stage

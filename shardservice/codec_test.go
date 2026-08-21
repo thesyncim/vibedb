@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -27,6 +28,14 @@ func testTransactionDigest(seed byte) distributedtxn.Digest {
 		digest[i] = seed + byte(i)
 	}
 	return digest
+}
+
+func testExchangeKey(seed byte) exchange.Key {
+	var id exchange.ID
+	for i := range id {
+		id[i] = seed + byte(i)
+	}
+	return exchange.Key{Operation: id, Stage: 2, Partition: 3, Attempt: 4}
 }
 
 func testParticipantRecord(t *testing.T) []byte {
@@ -221,6 +230,44 @@ func TestRequestRoundTrip(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "exchange_open",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadWrite, Deadline: 5 * time.Second,
+				Exchange: ExchangeRequest{
+					Operation: ExchangeOpen, Key: testExchangeKey(61),
+					Producers: 3, QueuedBatches: 8, ProducerBatches: 2,
+					BufferedRows: 1024, BufferedBytes: 1 << 20,
+					TotalRows: 4096, TotalBytes: 4 << 20,
+				},
+			},
+		},
+		{
+			name: "exchange_push",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadWrite,
+				Exchange: ExchangeRequest{
+					Operation: ExchangePush, Key: testExchangeKey(61),
+					Batch: exchange.Batch{Producer: 2, Sequence: 7, Rows: 2, Data: []byte{1, 2, 3}, Final: true},
+				},
+			},
+		},
+		{
+			name: "exchange_pull_ack",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadOnly,
+				Exchange: ExchangeRequest{
+					Operation: ExchangePull, Key: testExchangeKey(61),
+					HasAck: true, AckProducer: 2, AckSequence: 7,
+				},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -257,6 +304,24 @@ func TestRequestRoundTrip(t *testing.T) {
 			}
 			if got.RowBatch != tc.req.RowBatch {
 				t.Errorf("RowBatch = %+v, want %+v", got.RowBatch, tc.req.RowBatch)
+			}
+			if got.Exchange.Operation != tc.req.Exchange.Operation || got.Exchange.Key != tc.req.Exchange.Key ||
+				got.Exchange.Producers != tc.req.Exchange.Producers ||
+				got.Exchange.QueuedBatches != tc.req.Exchange.QueuedBatches ||
+				got.Exchange.ProducerBatches != tc.req.Exchange.ProducerBatches ||
+				got.Exchange.BufferedRows != tc.req.Exchange.BufferedRows ||
+				got.Exchange.BufferedBytes != tc.req.Exchange.BufferedBytes ||
+				got.Exchange.TotalRows != tc.req.Exchange.TotalRows ||
+				got.Exchange.TotalBytes != tc.req.Exchange.TotalBytes ||
+				got.Exchange.HasAck != tc.req.Exchange.HasAck ||
+				got.Exchange.AckProducer != tc.req.Exchange.AckProducer ||
+				got.Exchange.AckSequence != tc.req.Exchange.AckSequence ||
+				got.Exchange.Batch.Producer != tc.req.Exchange.Batch.Producer ||
+				got.Exchange.Batch.Sequence != tc.req.Exchange.Batch.Sequence ||
+				got.Exchange.Batch.Rows != tc.req.Exchange.Batch.Rows ||
+				got.Exchange.Batch.Final != tc.req.Exchange.Batch.Final ||
+				!bytes.Equal(got.Exchange.Batch.Data, tc.req.Exchange.Batch.Data) {
+				t.Errorf("Exchange = %+v, want %+v", got.Exchange, tc.req.Exchange)
 			}
 			if got.Transaction.Operation != tc.req.Transaction.Operation ||
 				got.Transaction.ID != tc.req.Transaction.ID ||
@@ -360,6 +425,21 @@ func TestResponseRoundTrip(t *testing.T) {
 			resp: CompletionResponse(0),
 		},
 		{
+			name: "exchange_push_ack",
+			resp: &ShardResponse{Kind: ResponseCompletion, Exchange: ExchangeReply{Operation: ExchangePush}},
+		},
+		{
+			name: "exchange_pull_batch",
+			resp: &ShardResponse{Kind: ResponseCompletion, Exchange: ExchangeReply{
+				Operation: ExchangePull,
+				Batch:     exchange.Batch{Producer: 1, Sequence: 8, Rows: 2, Data: []byte{4, 5}, Final: true},
+			}},
+		},
+		{
+			name: "exchange_pull_eof",
+			resp: &ShardResponse{Kind: ResponseCompletion, Exchange: ExchangeReply{Operation: ExchangePull, EOF: true}},
+		},
+		{
 			name: "error",
 			resp: NewErrorResponse(ErrorNotOwner, "not owner: shard -80"),
 		},
@@ -403,6 +483,15 @@ func TestResponseRoundTrip(t *testing.T) {
 				got.DocumentScan.Complete != tc.resp.DocumentScan.Complete ||
 				!bytes.Equal(got.DocumentScan.Next, tc.resp.DocumentScan.Next) {
 				t.Errorf("DocumentScan = %+v, want %+v", got.DocumentScan, tc.resp.DocumentScan)
+			}
+			if got.Exchange.Operation != tc.resp.Exchange.Operation ||
+				got.Exchange.EOF != tc.resp.Exchange.EOF ||
+				got.Exchange.Batch.Producer != tc.resp.Exchange.Batch.Producer ||
+				got.Exchange.Batch.Sequence != tc.resp.Exchange.Batch.Sequence ||
+				got.Exchange.Batch.Rows != tc.resp.Exchange.Batch.Rows ||
+				got.Exchange.Batch.Final != tc.resp.Exchange.Batch.Final ||
+				!bytes.Equal(got.Exchange.Batch.Data, tc.resp.Exchange.Batch.Data) {
+				t.Errorf("Exchange = %+v, want %+v", got.Exchange, tc.resp.Exchange)
 			}
 		})
 	}
@@ -448,6 +537,53 @@ func TestEncodeDeterministic(t *testing.T) {
 		if got := encodeRequest(t, req); !bytes.Equal(got, first) {
 			t.Fatalf("encode %d differs: %x vs %x", i, got, first)
 		}
+	}
+}
+
+func TestExchangeEnvelopeRejectsMixedLanes(t *testing.T) {
+	base := ShardRequest{
+		Distribution: "d", Shard: "s", AllocationGeneration: 1,
+		RoutingVersion: 1, OwnershipEpoch: 1, ExecutionMode: ExecutionReadWrite,
+		Exchange: ExchangeRequest{
+			Operation: ExchangeCancel, Key: testExchangeKey(71),
+		},
+	}
+	for _, mutate := range []func(*ShardRequest){
+		func(r *ShardRequest) { r.SQL = "SELECT 1" },
+		func(r *ShardRequest) { r.MaxRows = 1 },
+		func(r *ShardRequest) { r.BucketBits = 8 },
+		func(r *ShardRequest) { r.Transaction.Operation = TransactionScanCoordinator },
+		func(r *ShardRequest) { r.ExecutionMode = ExecutionReadOnly },
+	} {
+		req := base
+		mutate(&req)
+		if err := EncodeRequest(io.Discard, &req); !errors.Is(err, errBadExchange) {
+			t.Fatalf("mixed exchange request error = %v, want errBadExchange", err)
+		}
+	}
+
+	pull := base
+	pull.Exchange.Operation = ExchangePull
+	pull.ExecutionMode = ExecutionReadOnly
+	if err := EncodeRequest(io.Discard, &pull); err != nil {
+		t.Fatalf("canonical pull: %v", err)
+	}
+	badReply := &ShardResponse{
+		Kind: ResponseCompletion, RowsAffected: 1,
+		Exchange: ExchangeReply{Operation: ExchangeOpen},
+	}
+	if err := EncodeResponse(io.Discard, badReply); !errors.Is(err, errBadExchange) {
+		t.Fatalf("mixed exchange response error = %v, want errBadExchange", err)
+	}
+	var body encbuf
+	body.u8(wireVersion)
+	body.u8(uint8(ResponseCompletion))
+	body.u64(0)
+	body.u8(0) // absent read position
+	body.u8(exchangeMarker)
+	body.u8(uint8(ExchangeNone))
+	if _, err := DecodeResponse(bytes.NewReader(rawFrame(tagResponse, body.b))); !errors.Is(err, errBadEnum) {
+		t.Fatalf("present exchange marker with absent operation = %v, want errBadEnum", err)
 	}
 }
 

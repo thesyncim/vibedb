@@ -54,7 +54,7 @@ func NewRegistry(options RegistryOptions) *Registry {
 // Open creates a mailbox or returns the existing mailbox for an identical
 // retry. Reusing a key with different limits fails closed.
 func (r *Registry) Open(spec Spec) (*Mailbox, error) {
-	if r == nil || !spec.valid() {
+	if r == nil || !spec.Valid() {
 		return nil, ErrInvalidSpec
 	}
 	r.mu.Lock()
@@ -63,7 +63,7 @@ func (r *Registry) Open(spec Spec) (*Mailbox, error) {
 		return nil, ErrClosed
 	}
 	if existing := r.boxes[spec.Key]; existing != nil {
-		if existing.spec != spec {
+		if !sameOpenSpec(existing.spec, spec) {
 			return nil, ErrSpecConflict
 		}
 		if existing.Err() != nil {
@@ -78,6 +78,15 @@ func (r *Registry) Open(spec Spec) (*Mailbox, error) {
 	r.boxes[spec.Key] = box
 	r.reserved += spec.BufferedBytes
 	return box, nil
+}
+
+// sameOpenSpec deliberately ignores the locally-derived absolute deadline.
+// A transport retry may arrive later and recompute that value, but it must not
+// mutate or extend the lifetime admitted by the first successful Open.
+func sameOpenSpec(a, b Spec) bool {
+	a.DeadlineUnixNano = 0
+	b.DeadlineUnixNano = 0
+	return a == b
 }
 
 func (r *Registry) Lookup(key Key) (*Mailbox, bool) {

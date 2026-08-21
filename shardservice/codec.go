@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 )
 
 // The shard-service codec: a big-endian length-prefixed framing mirroring
@@ -40,6 +41,7 @@ const (
 	documentScanMarker      = 0xdd
 	partialAggregateMarker  = 0xde
 	rowBatchMarker          = 0xdf
+	exchangeMarker          = 0xe0
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -115,6 +117,8 @@ var errBadDocumentScan = errors.New("shardservice: frame carries an invalid docu
 var errBadPartialAggregate = errors.New("shardservice: frame carries an invalid partial aggregate fragment")
 
 var errBadRowBatch = errors.New("shardservice: frame carries an invalid row batch")
+
+var errBadExchange = errors.New("shardservice: frame carries an invalid exchange command")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -506,6 +510,188 @@ func validateTransactionReply(tx TransactionReply) error {
 	return nil
 }
 
+func validateExchangeRequest(req *ShardRequest) error {
+	if !req.Exchange.canonical() {
+		return errBadExchange
+	}
+	if !req.Exchange.present() {
+		return nil
+	}
+	if req.SQL != "" || len(req.Params) != 0 || req.PartialAggregate ||
+		req.RowBatch.present() || req.HasMinPosition || req.MinPosition != (Position{}) ||
+		req.MaxResultBytes != 0 || req.MaxRows != 0 || req.BucketBits != 0 ||
+		len(req.AccessScopes) != 0 || !req.ReadFenceID.IsZero() ||
+		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
+		req.MutationCapture || req.DocumentScan.present() ||
+		req.Transaction.Operation != TransactionNone {
+		return errBadExchange
+	}
+	wantMode := ExecutionReadWrite
+	if req.Exchange.Operation == ExchangePull {
+		wantMode = ExecutionReadOnly
+	}
+	if req.ExecutionMode != wantMode {
+		return errBadExchange
+	}
+	return nil
+}
+
+func encodeExchangeRequest(e *encbuf, request ExchangeRequest) {
+	e.u8(uint8(request.Operation))
+	e.fixed16(request.Key.Operation)
+	e.u32(request.Key.Stage)
+	e.u32(request.Key.Partition)
+	e.u32(request.Key.Attempt)
+	switch request.Operation {
+	case ExchangeOpen:
+		e.u32(uint32(request.Producers))
+		e.u32(uint32(request.QueuedBatches))
+		e.u32(uint32(request.ProducerBatches))
+		e.u64(request.BufferedRows)
+		e.u64(request.BufferedBytes)
+		e.u64(request.TotalRows)
+		e.u64(request.TotalBytes)
+	case ExchangePush:
+		encodeExchangeBatch(e, request.Batch)
+	case ExchangePull:
+		if request.HasAck {
+			e.u8(1)
+			e.u32(uint32(request.AckProducer))
+			e.u32(request.AckSequence)
+		} else {
+			e.u8(0)
+		}
+	}
+}
+
+func decodeExchangeRequest(d *deccur) (ExchangeRequest, error) {
+	request := ExchangeRequest{
+		Operation: ExchangeOperation(d.u8()),
+		Key: exchange.Key{
+			Operation: exchange.ID(d.fixed16()),
+			Stage:     d.u32(), Partition: d.u32(), Attempt: d.u32(),
+		},
+	}
+	switch request.Operation {
+	case ExchangeOpen:
+		producers := d.u32()
+		queued := d.u32()
+		producerBatches := d.u32()
+		if producers > math.MaxUint16 || queued > math.MaxUint16 || producerBatches > math.MaxUint16 {
+			return ExchangeRequest{}, errBadExchange
+		}
+		request.Producers = uint16(producers)
+		request.QueuedBatches = uint16(queued)
+		request.ProducerBatches = uint16(producerBatches)
+		request.BufferedRows = d.u64()
+		request.BufferedBytes = d.u64()
+		request.TotalRows = d.u64()
+		request.TotalBytes = d.u64()
+	case ExchangePush:
+		batch, err := decodeExchangeBatch(d)
+		if err != nil {
+			return ExchangeRequest{}, err
+		}
+		request.Batch = batch
+	case ExchangePull:
+		present := d.u8()
+		if present > 1 {
+			return ExchangeRequest{}, errBadPresence
+		}
+		request.HasAck = present == 1
+		if request.HasAck {
+			producer := d.u32()
+			if producer > math.MaxUint16 {
+				return ExchangeRequest{}, errBadExchange
+			}
+			request.AckProducer = uint16(producer)
+			request.AckSequence = d.u32()
+		}
+	case ExchangeCancel:
+	default:
+		return ExchangeRequest{}, errBadEnum
+	}
+	if d.bad() {
+		return ExchangeRequest{}, d.why
+	}
+	if !request.canonical() {
+		return ExchangeRequest{}, errBadExchange
+	}
+	return request, nil
+}
+
+func encodeExchangeBatch(e *encbuf, batch exchange.Batch) {
+	e.u32(uint32(batch.Producer))
+	e.u32(batch.Sequence)
+	e.u32(batch.Rows)
+	if batch.Final {
+		e.u8(1)
+	} else {
+		e.u8(0)
+	}
+	e.bytes(batch.Data)
+}
+
+func decodeExchangeBatch(d *deccur) (exchange.Batch, error) {
+	producer := d.u32()
+	batch := exchange.Batch{Sequence: d.u32(), Rows: d.u32()}
+	final := d.u8()
+	if producer > math.MaxUint16 || final > 1 {
+		return exchange.Batch{}, errBadExchange
+	}
+	batch.Producer = uint16(producer)
+	batch.Final = final == 1
+	batch.Data = d.slice()
+	if d.bad() {
+		return exchange.Batch{}, d.why
+	}
+	if !canonicalExchangeBatch(batch) {
+		return exchange.Batch{}, errBadExchange
+	}
+	return batch, nil
+}
+
+func encodeExchangeReply(e *encbuf, reply ExchangeReply) {
+	e.u8(uint8(reply.Operation))
+	if reply.Operation != ExchangePull {
+		return
+	}
+	if reply.EOF {
+		e.u8(1)
+		return
+	}
+	e.u8(0)
+	encodeExchangeBatch(e, reply.Batch)
+}
+
+func decodeExchangeReply(d *deccur) (ExchangeReply, error) {
+	reply := ExchangeReply{Operation: ExchangeOperation(d.u8())}
+	if !reply.Operation.valid() {
+		return ExchangeReply{}, errBadEnum
+	}
+	if reply.Operation == ExchangePull {
+		eof := d.u8()
+		if eof > 1 {
+			return ExchangeReply{}, errBadPresence
+		}
+		reply.EOF = eof == 1
+		if !reply.EOF {
+			batch, err := decodeExchangeBatch(d)
+			if err != nil {
+				return ExchangeReply{}, err
+			}
+			reply.Batch = batch
+		}
+	}
+	if d.bad() {
+		return ExchangeReply{}, d.why
+	}
+	if !reply.canonical() {
+		return ExchangeReply{}, errBadExchange
+	}
+	return reply, nil
+}
+
 func encodeTransactionRequest(e *encbuf, tx TransactionRequest) {
 	e.u8(uint8(tx.Operation))
 	if tx.Operation.stages() {
@@ -593,6 +779,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		return errFieldTooLarge
 	}
 	if err := validateTransactionRequest(req.Transaction); err != nil {
+		return err
+	}
+	if err := validateExchangeRequest(req); err != nil {
 		return err
 	}
 	if !req.GlobalIndexLookup.canonical() {
@@ -753,6 +942,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.u32(req.RowBatch.BatchRows)
 		e.u32(req.RowBatch.BatchBytes)
 	}
+	if req.Exchange.present() {
+		e.u8(exchangeMarker)
+		encodeExchangeRequest(&e, req.Exchange)
+	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
 		encodeTransactionRequest(&e, req.Transaction)
@@ -912,6 +1105,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadRowBatch
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == exchangeMarker {
+		d.u8()
+		req.Exchange, err = decodeExchangeRequest(&d)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
@@ -934,6 +1134,9 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	}
 	if !mode.valid() {
 		return nil, errBadEnum
+	}
+	if err := validateExchangeRequest(req); err != nil {
+		return nil, err
 	}
 	if req.GlobalIndexLookup.present() &&
 		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
@@ -988,6 +1191,14 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if !resp.DocumentScan.canonical() ||
 		(resp.DocumentScan.Present && resp.Kind != ResponseRows) {
 		return errBadDocumentScan
+	}
+	if !resp.Exchange.canonical() {
+		return errBadExchange
+	}
+	if resp.Exchange.present() && (resp.Kind != ResponseCompletion || resp.RowsAffected != 0 ||
+		resp.HasReadPosition || resp.DocumentScan.Present ||
+		resp.Transaction.Role != TransactionRoleNone || len(resp.Columns) != 0 || len(resp.Rows) != 0) {
+		return errBadExchange
 	}
 
 	var e encbuf
@@ -1084,6 +1295,10 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 			e.u8(0)
 		}
 		e.bytes(resp.DocumentScan.Next)
+	}
+	if resp.Exchange.present() {
+		e.u8(exchangeMarker)
+		encodeExchangeReply(&e, resp.Exchange)
 	}
 	if resp.Transaction.Role != TransactionRoleNone {
 		e.u8(transactionMarker)
@@ -1245,12 +1460,26 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 			return nil, errBadDocumentScan
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == exchangeMarker {
+		d.u8()
+		resp.Exchange, err = decodeExchangeReply(&d)
+		if err != nil {
+			return nil, err
+		}
+		if kind != ResponseCompletion || resp.RowsAffected != 0 || resp.HasReadPosition ||
+			resp.DocumentScan.Present {
+			return nil, errBadExchange
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		resp.Transaction, err = decodeTransactionReply(&d)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if resp.Exchange.present() && resp.Transaction.Role != TransactionRoleNone {
+		return nil, errBadExchange
 	}
 	if err := d.end(); err != nil {
 		return nil, err

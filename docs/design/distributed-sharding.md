@@ -18,7 +18,7 @@ shard.
 | --- | --- |
 | `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
-| `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol; ordinary reads remain one frame and opted-in internal reads can use bounded sequence-checked row frames with synchronous backpressure |
+| `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol; ordinary reads remain one frame, opted-in internal reads can use bounded sequence-checked row frames, and owner-fenced exchange mailbox commands provide retry-safe backpressure without SQL/JSON parsing |
 | `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, periodic durable coordinator redrive, and byte-native bounded row-batch consumption for grouped partial/final reads; hash/range repartition is not yet wired |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
@@ -29,11 +29,14 @@ bounded in-process scheduler/outbox, and a frame/roster validator that accepts
 a caller-supplied authenticated NodeID. These internal packages are not wired
 to either server command, a public API, or operator configuration.
 
-`internal/exchange` likewise contains a non-serving bounded worker mailbox:
+`internal/exchange` contains a bounded worker mailbox:
 raw attempt-fenced identities, unbiased fixed-stage partition selection,
 registry capacity reservation, per-producer sequence/credit enforcement,
-backpressure, deadlines, and deterministic cancellation cleanup. No shard wire
-command or planner currently opens it, so it is not a network exchange yet.
+retry-digest idempotence, acknowledgment-based redelivery, backpressure,
+deadlines, and deterministic cancellation cleanup. The shard wire exposes
+owner-fenced open/push/pull+ack/cancel commands. No planner currently opens or
+routes producers to those mailboxes, so this is not yet a serving distributed
+hash/range exchange.
 
 ## Network and trust boundary
 

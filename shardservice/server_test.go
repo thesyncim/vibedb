@@ -13,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/exchange"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -130,6 +131,121 @@ func exec(t *testing.T, conn net.Conn, req *ShardRequest) *ShardResponse {
 			req.SQL, resp.ErrorKind, resp.ErrorMessage)
 	}
 	return resp
+}
+
+func ownedExchangeRequest(operation ExchangeOperation, key exchange.Key) *ShardRequest {
+	req := ownedRequest("")
+	req.Exchange = ExchangeRequest{Operation: operation, Key: key}
+	if operation == ExchangePull {
+		req.ExecutionMode = ExecutionReadOnly
+	}
+	return req
+}
+
+func TestExchangeWireLifecycleRedeliveryAndOwnershipFence(t *testing.T) {
+	srv, _ := newServer(t, Options{
+		MaxExchangeMailboxes: 2, MaxExchangeBufferBytes: 128,
+	})
+	conn := dial(t, srv)
+	key := testExchangeKey(81)
+
+	open := ownedExchangeRequest(ExchangeOpen, key)
+	open.Exchange.Producers = 1
+	open.Exchange.QueuedBatches = 2
+	open.Exchange.ProducerBatches = 2
+	open.Exchange.BufferedRows = 4
+	open.Exchange.BufferedBytes = 64
+	open.Exchange.TotalRows = 8
+	open.Exchange.TotalBytes = 128
+	opened := exec(t, conn, open)
+	if opened.Exchange.Operation != ExchangeOpen {
+		t.Fatalf("Open = %+v", opened)
+	}
+	// A transport retry recomputes its local absolute deadline but returns the
+	// already admitted mailbox without changing its original lifetime.
+	open.Deadline = time.Second
+	if got := exec(t, conn, open); got.Exchange.Operation != ExchangeOpen {
+		t.Fatalf("Open retry = %+v", got)
+	}
+
+	push := ownedExchangeRequest(ExchangePush, key)
+	push.Exchange.Batch = exchange.Batch{Rows: 1, Data: []byte("first")}
+	if got := exec(t, conn, push); got.Exchange.Operation != ExchangePush {
+		t.Fatalf("Push = %+v", got)
+	}
+	if got := exec(t, conn, push); got.Exchange.Operation != ExchangePush {
+		t.Fatalf("Push retry = %+v", got)
+	}
+	push.Exchange.Batch = exchange.Batch{
+		Sequence: 1, Rows: 1, Data: []byte("second"), Final: true,
+	}
+	if got := exec(t, conn, push); got.Exchange.Operation != ExchangePush {
+		t.Fatalf("second Push = %+v", got)
+	}
+
+	pull := ownedExchangeRequest(ExchangePull, key)
+	first := exec(t, conn, pull)
+	if first.Exchange.Operation != ExchangePull || first.Exchange.EOF ||
+		first.Exchange.Batch.Sequence != 0 || string(first.Exchange.Batch.Data) != "first" {
+		t.Fatalf("first Pull = %+v", first)
+	}
+	repeated := exec(t, conn, pull)
+	if repeated.Exchange.Batch.Sequence != first.Exchange.Batch.Sequence ||
+		string(repeated.Exchange.Batch.Data) != "first" {
+		t.Fatalf("unacked Pull = %+v, want redelivery", repeated)
+	}
+	pull.Exchange.HasAck = true
+	pull.Exchange.AckProducer = first.Exchange.Batch.Producer
+	pull.Exchange.AckSequence = first.Exchange.Batch.Sequence
+	second := exec(t, conn, pull)
+	if second.Exchange.Batch.Sequence != 1 || string(second.Exchange.Batch.Data) != "second" ||
+		!second.Exchange.Batch.Final {
+		t.Fatalf("acked Pull = %+v", second)
+	}
+	pull.Exchange.AckSequence = second.Exchange.Batch.Sequence
+	done := exec(t, conn, pull)
+	if !done.Exchange.EOF {
+		t.Fatalf("drained Pull = %+v, want EOF", done)
+	}
+	if retry := exec(t, conn, pull); !retry.Exchange.EOF {
+		t.Fatalf("EOF ack retry = %+v, want EOF", retry)
+	}
+
+	conflict := *open
+	conflict.Exchange.TotalRows++
+	if got := roundTrip(t, conn, &conflict); got.Kind != ResponseError || got.ErrorKind != ErrorExchangeConflict {
+		t.Fatalf("conflicting Open = %+v", got)
+	}
+
+	staleKey := testExchangeKey(91)
+	stale := ownedExchangeRequest(ExchangeOpen, staleKey)
+	stale.Exchange.Producers = 1
+	stale.Exchange.QueuedBatches = 1
+	stale.Exchange.ProducerBatches = 1
+	stale.Exchange.BufferedRows = 1
+	stale.Exchange.BufferedBytes = 1
+	stale.Exchange.TotalRows = 1
+	stale.Exchange.TotalBytes = 1
+	stale.OwnershipEpoch++
+	if got := roundTrip(t, conn, stale); got.Kind != ResponseError || got.ErrorKind != ErrorOwnershipEpoch {
+		t.Fatalf("stale Open = %+v", got)
+	}
+	probe := ownedExchangeRequest(ExchangePush, staleKey)
+	probe.Exchange.Batch = exchange.Batch{Final: true}
+	if got := roundTrip(t, conn, probe); got.Kind != ResponseError || got.ErrorKind != ErrorExchangeNotFound {
+		t.Fatalf("stale Open changed registry: %+v", got)
+	}
+
+	cancel := ownedExchangeRequest(ExchangeCancel, key)
+	if got := exec(t, conn, cancel); got.Exchange.Operation != ExchangeCancel {
+		t.Fatalf("Cancel = %+v", got)
+	}
+	if got := exec(t, conn, cancel); got.Exchange.Operation != ExchangeCancel {
+		t.Fatalf("Cancel retry = %+v", got)
+	}
+	if got := roundTrip(t, conn, push); got.Kind != ResponseError || got.ErrorKind != ErrorExchangeNotFound {
+		t.Fatalf("post-Cancel Push = %+v", got)
+	}
 }
 
 // cellText returns the JSON bytes of one non-null cell as a string.
@@ -949,6 +1065,9 @@ func TestNewServerValidation(t *testing.T) {
 	if _, err := NewServer(db, testOwner(), Options{MaxReadFences: -1}); err == nil {
 		t.Fatal("NewServer(MaxReadFences=-1) = nil error")
 	}
+	if _, err := NewServer(db, testOwner(), Options{MaxExchangeMailboxes: -1}); err == nil {
+		t.Fatal("NewServer(MaxExchangeMailboxes=-1) = nil error")
+	}
 	srv, err := NewServer(db, testOwner(), Options{})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -965,6 +1084,12 @@ func TestNewServerValidation(t *testing.T) {
 	if srv.opts.MaxReadFences != DefaultMaxReadFences {
 		t.Fatalf("MaxReadFences default = %d, want %d",
 			srv.opts.MaxReadFences, DefaultMaxReadFences)
+	}
+	if srv.opts.MaxExchangeMailboxes != DefaultMaxExchangeMailboxes ||
+		srv.opts.MaxExchangeBufferBytes != DefaultMaxExchangeBufferBytes {
+		t.Fatalf("exchange defaults = %d/%d, want %d/%d",
+			srv.opts.MaxExchangeMailboxes, srv.opts.MaxExchangeBufferBytes,
+			DefaultMaxExchangeMailboxes, DefaultMaxExchangeBufferBytes)
 	}
 }
 
