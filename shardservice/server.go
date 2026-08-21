@@ -19,10 +19,11 @@ import (
 //
 // # Concurrency
 //
-// One connection is one goroutine and owns one sql/driver Session, exactly like
-// pgwire: the Session is single-consumer, so its prepared statements, cursors,
-// and pinned snapshot are never reachable from another goroutine and need no
-// lock on the request path. Two things are shared and each is shared
+// One connection is one goroutine and lazily owns one sql/driver Session when
+// it first carries SQL, exactly like pgwire: the Session is single-consumer, so
+// its prepared statements, cursors, and pinned snapshot are never reachable
+// from another goroutine and need no lock on the request path. Exchange-only
+// peer connections never allocate a Session. Two things are shared and each is shared
 // deliberately: the [Options] and [Ownership] are read-only after construction,
 // and the connection registry is a mutex-guarded map touched once when a
 // connection starts and once when it ends, never on a request.
@@ -100,6 +101,10 @@ type Options struct {
 	// defaults; neither resource can be configured as unbounded.
 	MaxExchangeMailboxes   int
 	MaxExchangeBufferBytes uint64
+	// ExchangeDial resolves a repartition target's opaque address bytes. Nil
+	// selects TCP and permits loopback targets only. An injected resolver is a
+	// trusted control-plane boundary and may interpret addresses as endpoint IDs.
+	ExchangeDial ExchangeDialFunc
 
 	// OnError is called with every connection-terminating error, including the
 	// ordinary ones (a peer that closed its connection). It is the only logging
@@ -107,6 +112,11 @@ type Options struct {
 	// synchronously call Close.
 	OnError func(err error)
 }
+
+// ExchangeDialFunc opens one direct worker connection for a repartition
+// producer. It must honor ctx cancellation and returns an exclusively owned
+// connection.
+type ExchangeDialFunc func(ctx context.Context, address []byte) (net.Conn, error)
 
 // A Server is a leader-only shard endpoint. It admits every request against one
 // static ownership identity and executes the admitted statement locally.
@@ -138,8 +148,8 @@ type Server struct {
 }
 
 // NewServer builds a shard server over db that owns the identity in cfg. The
-// database is borrowed and remains the caller's responsibility; each connection
-// opens one independent Session that the server closes on every disconnect path.
+// database is borrowed and remains the caller's responsibility; each SQL-bearing
+// connection lazily opens one independent Session that the server closes on every disconnect path.
 // NewServer defaults and validates opts and rejects an empty ownership identity.
 func NewServer(db *sqldriver.Database, cfg Ownership, opts Options) (*Server, error) {
 	if db == nil {
@@ -315,12 +325,12 @@ func (s *Server) serveConn(nc net.Conn) error {
 	defer s.wg.Done()
 	defer s.releaseConnection(nc)
 	defer nc.Close()
-	sess, err := s.db.NewSession(s.baseCtx)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-	c := &shardConn{server: s, nc: nc, sess: sess}
+	c := &shardConn{server: s, nc: nc}
+	defer func() {
+		if c.sess != nil {
+			_ = c.sess.Close()
+		}
+	}()
 	return c.loop()
 }
 

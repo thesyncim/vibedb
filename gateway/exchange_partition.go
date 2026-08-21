@@ -35,7 +35,7 @@ func newExchangeRowPartitioner(columns []int, partitions uint32) (exchangeRowPar
 	}, nil
 }
 
-func (p *exchangeRowPartitioner) partition(row []shardservice.Cell) (uint32, error) {
+func (p *exchangeRowPartitioner) Partition(row []shardservice.Cell) (uint32, error) {
 	if p == nil || len(p.columns) == 0 {
 		return 0, ErrExchangePartitionKey
 	}
@@ -59,4 +59,8 @@ func (p *exchangeRowPartitioner) partition(row []shardservice.Cell) (uint32, err
 		return 0, errors.Join(ErrExchangePartitionKey, err)
 	}
 	return partition, nil
+}
+
+func (p *exchangeRowPartitioner) partition(row []shardservice.Cell) (uint32, error) {
+	return p.Partition(row)
 }

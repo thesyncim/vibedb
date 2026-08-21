@@ -23,6 +23,29 @@ type exchangeStage struct {
 	concurrency int
 }
 
+func (s *exchangeStage) repartitionRequest(
+	producer uint16,
+	keyColumns []uint16,
+	blockRows, blockBytes uint32,
+	maxMemory uint64,
+) shardservice.RepartitionRequest {
+	request := shardservice.RepartitionRequest{
+		Operation: s.key.Operation, Stage: s.key.Stage, Attempt: s.key.Attempt,
+		Producer: producer, KeyColumns: append([]uint16(nil), keyColumns...),
+		Targets:   make([]shardservice.RepartitionTarget, len(s.targets)),
+		BlockRows: blockRows, BlockBytes: blockBytes, MaxMemory: maxMemory,
+	}
+	for partition := range s.targets {
+		call := s.targets[partition]
+		request.Targets[partition] = shardservice.RepartitionTarget{
+			Address: []byte(call.address), Distribution: call.req.Distribution,
+			Shard: call.target.Shard, AllocationGeneration: call.target.AllocationGeneration,
+			RoutingVersion: call.req.RoutingVersion, OwnershipEpoch: call.target.OwnershipEpoch,
+		}
+	}
+	return request
+}
+
 func newExchangeStage(
 	client *Client,
 	targets []shardCall,
@@ -120,7 +143,7 @@ func (s *exchangeStage) Open(ctx context.Context) error {
 	return errors.Join(err, cleanupErr)
 }
 
-func (s *exchangeStage) PushExchange(ctx context.Context, partition uint32, batch exchange.Batch) error {
+func (s *exchangeStage) Push(ctx context.Context, partition uint32, batch exchange.Batch) error {
 	if s == nil || int(partition) >= len(s.targets) {
 		return exchange.ErrPartitions
 	}

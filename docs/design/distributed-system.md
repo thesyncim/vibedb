@@ -246,9 +246,9 @@ selection avoids modulo bias. Additive shard-wire commands now open, push,
 pull with explicit acknowledgment, and cancel these mailboxes after ordinary
 allocation/routing/ownership admission. Open and push retries are idempotent;
 an unacknowledged pull is redelivered, so a lost response cannot drop a batch.
-Direct producer routing, authenticated peer admission, and planner stage
-orchestration remain required before this becomes a serving worker-to-worker
-hash/range exchange.
+Authenticated peer admission, worker-local reducers, and planner stage
+selection remain required before this becomes the default serving
+worker-to-worker hash/range execution path.
 
 The intermediate data plane also has one compact row-block representation.
 It frames opaque value bytes and nulls directly, validates bounded row/cell/byte
@@ -258,10 +258,13 @@ and grows individual arenas lazily. Exact composite JSON group identities feed
 a fixed xxhash plus multiply-high reduction, so equal numeric/string spellings
 always meet on one worker. The gateway lifecycle coordinator can open partitions
 in bounded parallelism and its producer core emits retry-sequenced blocks plus
-an explicit final batch for every partition. The remaining boundary is wiring a
-shard cursor directly to peer transports and selecting that path from the
-physical `OpRepartition`; routing rows through the gateway query path would add
-an avoidable hop and is intentionally not presented as the finished design.
+an explicit final batch for every partition. A read-only shard fragment now
+wires its SQL cursor directly to persistent destination-worker connections;
+the fragment carries only SQL/typed parameters plus bounded key ordinals and
+ownership coordinates, never a serialized relational plan. The remaining
+boundary is a worker-local reducer and selection from physical `OpRepartition`;
+routing rows through the gateway query path would add an avoidable hop and is
+intentionally not presented as the finished design.
 
 The first transport primitive now serves: an additive row-batch request keeps
 the ordinary routed request/response bytes unchanged, while opted-in reads send
@@ -377,9 +380,9 @@ cluster does not fork into named protocol generations.
    grouped partial/final fan-out consumes it incrementally in deterministic
    route order without whole-shard response materialization.
    A bounded worker mailbox/partition state machine and owner-fenced shard-wire
-   lifecycle commands, canonical blocks, exact partitioning, and bounded gateway
-   lifecycle/producer primitives are also present; shard-cursor direct producer
-   routing is next.
+   lifecycle commands, canonical blocks, exact partitioning, bounded gateway
+   lifecycle/producer primitives, and direct shard-cursor producers are also
+   present; worker-local reduction and planner selection are next.
    Hash/range exchange and worker-local final aggregation follow, then
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.

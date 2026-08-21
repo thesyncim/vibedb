@@ -155,6 +155,12 @@ func validBlockLimits(columns, maxRows, maxBytes uint32) bool {
 		maxBytes <= MaxBatchBytes && uint64(columns)*uint64(maxRows) <= MaxBlockCells
 }
 
+// ValidBlockLimits reports whether one negotiated intermediate block shape is
+// within the hard exchange bounds.
+func ValidBlockLimits(columns, maxRows, maxBytes uint32) bool {
+	return validBlockLimits(columns, maxRows, maxBytes)
+}
+
 // AppendRow appends one exact-width row. It is atomic with respect to a limit
 // refusal: the builder remains unchanged when the row cannot fit.
 func (b *BlockBuilder) AppendRow(row []Cell) error {

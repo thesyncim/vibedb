@@ -35,12 +35,14 @@ registry capacity reservation, per-producer sequence/credit enforcement,
 retry-digest idempotence, acknowledgment-based redelivery, backpressure,
 deadlines, and deterministic cancellation cleanup. The shard wire exposes
 owner-fenced open/push/pull+ack/cancel commands. No planner currently opens or
-routes shard cursors to those mailboxes, so this is not yet a serving distributed
-hash/range exchange. A gateway-internal lifecycle coordinator and producer core
+selects this path for `Query`, so this is not yet the default distributed
+hash/range execution path. A gateway-internal lifecycle coordinator and producer core
 can already open partitions in bounded parallelism, exact-hash canonical JSON
 group identities, build borrowed-decode row blocks, sequence pushes, and
 terminate empty partitions; these are orchestration primitives, not a query
-path exposed by `Query`.
+path exposed by `Query`. An additive read-only shard fragment can now stream its
+cursor directly to those destination mailboxes over persistent per-partition
+peer connections; exchange-only destination connections allocate no SQL session.
 
 ## Network and trust boundary
 

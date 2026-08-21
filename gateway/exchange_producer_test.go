@@ -20,7 +20,7 @@ type recordingExchangeSink struct {
 	failAt  int
 }
 
-func (s *recordingExchangeSink) PushExchange(
+func (s *recordingExchangeSink) Push(
 	_ context.Context,
 	partition uint32,
 	batch exchange.Batch,

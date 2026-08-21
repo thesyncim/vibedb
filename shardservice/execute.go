@@ -152,6 +152,9 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 	if req.Exchange.present() {
 		return write(c.executeExchange(req))
 	}
+	if err := c.ensureSession(); err != nil {
+		return write(classifyError(err))
+	}
 	if req.Transaction.Operation != TransactionNone {
 		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() {
 			return write(NewErrorResponse(ErrorMalformedRequest,
@@ -208,6 +211,9 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 			return write(transactionError(distributedtxn.ErrJournalConflict))
 		}
 	}
+	if req.Repartition.present() {
+		return write(c.executeRepartition(req))
+	}
 	if req.GlobalIndexLookup.present() {
 		return write(c.executeGlobalIndexLookup(req))
 	}
@@ -218,6 +224,129 @@ func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) 
 		return write(c.executeDocumentScan(req))
 	}
 	return c.execute(req, write)
+}
+
+// executeRepartition runs a read-only shard fragment and pushes its rows
+// directly into destination worker mailboxes. The gateway coordinates mailbox
+// lifecycle but is not on the row data path.
+func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
+	rows, resultBytes := c.server.resultLimits(req)
+	if err := c.sess.SetResultLimits(rows, resultBytes); err != nil {
+		return classifyError(err)
+	}
+	if err := c.sess.SetIntermediateLimit(c.server.opts.MaxIntermediateBytes); err != nil {
+		return classifyError(err)
+	}
+
+	ctx, cancel := c.server.requestContext(req)
+	defer cancel()
+	var (
+		prep *sqldriver.Prepared
+		err  error
+	)
+	if req.PartialAggregate {
+		prep, err = c.sess.PreparePartialAggregate(ctx, req.SQL)
+	} else {
+		prep, err = c.sess.Prepare(ctx, req.SQL)
+	}
+	if err != nil {
+		return classifyError(err)
+	}
+	defer prep.Close()
+	if prep.Kind() != sqlast.KindSelect || !prep.ReturnsRows() {
+		return NewErrorResponse(ErrorReadOnly,
+			"shardservice: repartition producer requires a row-returning SELECT")
+	}
+	if err := c.sess.Begin(ctx, sqldriver.TxOptions{
+		ReadOnly: true, Isolation: sqldriver.IsolationRepeatableRead,
+	}); err != nil {
+		return classifyError(err)
+	}
+	defer c.sess.Rollback(context.Background())
+
+	var cursor sqldriver.Cursor
+	if err := prep.QueryInto(ctx, runtimeArgs(req.Params), &cursor); err != nil {
+		return classifyError(err)
+	}
+	defer cursor.Close()
+	columns := len(prep.Columns())
+	if columns == 0 || columns > int(exchange.MaxBlockColumns) ||
+		!exchange.ValidBlockLimits(uint32(columns), req.Repartition.BlockRows, req.Repartition.BlockBytes) {
+		return NewErrorResponse(ErrorResourceLimit, errBadRepartition.Error())
+	}
+	for _, ordinal := range req.Repartition.KeyColumns {
+		if int(ordinal) >= columns {
+			return NewErrorResponse(ErrorMalformedRequest, errBadRepartition.Error())
+		}
+	}
+
+	sink, err := newRepartitionPeerSink(c.server, req.Repartition)
+	if err != nil {
+		return repartitionError(err)
+	}
+	defer sink.Close()
+	partitioner := &repartitionPartitioner{
+		columns: req.Repartition.KeyColumns, partitions: uint32(len(req.Repartition.Targets)),
+	}
+	producer, err := exchange.NewProducer(
+		partitioner, uint32(len(req.Repartition.Targets)), uint32(columns),
+		req.Repartition.BlockRows, req.Repartition.BlockBytes, req.Repartition.MaxMemory,
+		req.Repartition.Producer, sink,
+	)
+	if err != nil {
+		return repartitionError(err)
+	}
+	row := make([]Cell, columns)
+	arena := make([]byte, 0, min(int(req.Repartition.BlockBytes), 64<<10))
+	var produced int64
+	for cursor.Next() {
+		arena = arena[:0]
+		for column := range row {
+			cell := cursor.Cell(column)
+			if cell.IsNull() {
+				row[column] = Cell{Null: true}
+				continue
+			}
+			start := len(arena)
+			arena = cell.AppendJSON(arena)
+			row[column] = Cell{Bytes: arena[start:len(arena):len(arena)]}
+		}
+		if err := producer.Add(ctx, row); err != nil {
+			return repartitionError(err)
+		}
+		produced++
+	}
+	if err := producer.Finish(ctx); err != nil {
+		return repartitionError(err)
+	}
+	return CompletionResponse(produced)
+}
+
+func repartitionError(err error) *ShardResponse {
+	var peer *peerExchangeError
+	if errors.As(err, &peer) && peer.kind.valid() {
+		return NewErrorResponse(peer.kind, peer.Error())
+	}
+	if errors.Is(err, exchange.ErrBlockLimit) || errors.Is(err, exchange.ErrTotalLimit) ||
+		errors.Is(err, exchange.ErrRegistryLimit) {
+		return NewErrorResponse(ErrorResourceLimit, err.Error())
+	}
+	return classifyError(err)
+}
+
+// ensureSession keeps exchange-only peer connections out of the SQL/session
+// allocator entirely. A direct repartition can therefore hold one backpressured
+// connection per destination without also pinning a database session there.
+func (c *shardConn) ensureSession() error {
+	if c.sess != nil {
+		return nil
+	}
+	sess, err := c.server.db.NewSession(c.server.baseCtx)
+	if err != nil {
+		return err
+	}
+	c.sess = sess
+	return nil
 }
 
 // executeExchange runs the ephemeral mailbox protocol after ordinary ownership

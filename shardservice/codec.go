@@ -42,6 +42,7 @@ const (
 	partialAggregateMarker  = 0xde
 	rowBatchMarker          = 0xdf
 	exchangeMarker          = 0xe0
+	repartitionMarker       = 0xe1
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -119,6 +120,8 @@ var errBadPartialAggregate = errors.New("shardservice: frame carries an invalid 
 var errBadRowBatch = errors.New("shardservice: frame carries an invalid row batch")
 
 var errBadExchange = errors.New("shardservice: frame carries an invalid exchange command")
+
+var errBadRepartition = errors.New("shardservice: frame carries an invalid repartition producer")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -532,7 +535,7 @@ func validateExchangeRequest(req *ShardRequest) error {
 		req.MaxResultBytes != 0 || req.MaxRows != 0 || req.BucketBits != 0 ||
 		len(req.AccessScopes) != 0 || !req.ReadFenceID.IsZero() ||
 		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
-		req.MutationCapture || req.DocumentScan.present() ||
+		req.MutationCapture || req.DocumentScan.present() || req.Repartition.present() ||
 		req.Transaction.Operation != TransactionNone {
 		return errBadExchange
 	}
@@ -544,6 +547,92 @@ func validateExchangeRequest(req *ShardRequest) error {
 		return errBadExchange
 	}
 	return nil
+}
+
+func validateRepartitionRequest(req *ShardRequest) error {
+	if !req.Repartition.canonical() {
+		return errBadRepartition
+	}
+	if !req.Repartition.present() {
+		return nil
+	}
+	if req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
+		req.MaxRows == 0 || req.MaxResultBytes == 0 || req.RowBatch.present() ||
+		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
+		req.MutationCapture || req.DocumentScan.present() || req.Exchange.present() ||
+		req.Transaction.Operation != TransactionNone {
+		return errBadRepartition
+	}
+	return nil
+}
+
+func encodeRepartitionRequest(e *encbuf, request RepartitionRequest) {
+	e.fixed16(request.Operation)
+	e.u32(request.Stage)
+	e.u32(request.Attempt)
+	e.u32(uint32(request.Producer))
+	e.u32(uint32(len(request.KeyColumns)))
+	for _, column := range request.KeyColumns {
+		e.u32(uint32(column))
+	}
+	e.u32(uint32(len(request.Targets)))
+	for i := range request.Targets {
+		target := request.Targets[i]
+		e.bytes(target.Address)
+		e.str(string(target.Distribution))
+		e.str(string(target.Shard))
+		e.u64(uint64(target.AllocationGeneration))
+		e.u64(uint64(target.RoutingVersion))
+		e.u64(uint64(target.OwnershipEpoch))
+	}
+	e.u32(request.BlockRows)
+	e.u32(request.BlockBytes)
+	e.u64(request.MaxMemory)
+}
+
+func decodeRepartitionRequest(d *deccur) (RepartitionRequest, error) {
+	request := RepartitionRequest{
+		Operation: exchange.ID(d.fixed16()), Stage: d.u32(), Attempt: d.u32(),
+	}
+	producer := d.u32()
+	if producer > math.MaxUint16 {
+		return RepartitionRequest{}, errBadRepartition
+	}
+	request.Producer = uint16(producer)
+	keys := d.count(4, MaxRepartitionKeyColumns)
+	if keys != 0 {
+		request.KeyColumns = make([]uint16, keys)
+		for i := range request.KeyColumns {
+			column := d.u32()
+			if column > math.MaxUint16 {
+				return RepartitionRequest{}, errBadRepartition
+			}
+			request.KeyColumns[i] = uint16(column)
+		}
+	}
+	targets := d.count(36, MaxRepartitionTargets)
+	if targets != 0 {
+		request.Targets = make([]RepartitionTarget, targets)
+		for i := range request.Targets {
+			request.Targets[i] = RepartitionTarget{
+				Address: d.slice(), Distribution: distribution.DistributionName(d.str()),
+				Shard:                distribution.ShardID(d.str()),
+				AllocationGeneration: distribution.ShardAllocationGeneration(d.u64()),
+				RoutingVersion:       distribution.RoutingVersion(d.u64()),
+				OwnershipEpoch:       distribution.OwnershipEpoch(d.u64()),
+			}
+		}
+	}
+	request.BlockRows = d.u32()
+	request.BlockBytes = d.u32()
+	request.MaxMemory = d.u64()
+	if d.bad() {
+		return RepartitionRequest{}, d.why
+	}
+	if !request.canonical() {
+		return RepartitionRequest{}, errBadRepartition
+	}
+	return request, nil
 }
 
 func encodeExchangeRequest(e *encbuf, request ExchangeRequest) {
@@ -794,6 +883,9 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if err := validateExchangeRequest(req); err != nil {
 		return err
 	}
+	if err := validateRepartitionRequest(req); err != nil {
+		return err
+	}
 	if !req.GlobalIndexLookup.canonical() {
 		return errBadGlobalIndexLookup
 	}
@@ -951,6 +1043,10 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.u8(rowBatchMarker)
 		e.u32(req.RowBatch.BatchRows)
 		e.u32(req.RowBatch.BatchBytes)
+	}
+	if req.Repartition.present() {
+		e.u8(repartitionMarker)
+		encodeRepartitionRequest(&e, req.Repartition)
 	}
 	if req.Exchange.present() {
 		e.u8(exchangeMarker)
@@ -1115,6 +1211,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadRowBatch
 		}
 	}
+	if len(d.b) != 0 && d.b[0] == repartitionMarker {
+		d.u8()
+		req.Repartition, err = decodeRepartitionRequest(&d)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == exchangeMarker {
 		d.u8()
 		req.Exchange, err = decodeExchangeRequest(&d)
@@ -1146,6 +1249,9 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		return nil, errBadEnum
 	}
 	if err := validateExchangeRequest(req); err != nil {
+		return nil, err
+	}
+	if err := validateRepartitionRequest(req); err != nil {
 		return nil, err
 	}
 	if req.GlobalIndexLookup.present() &&

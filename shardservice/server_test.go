@@ -248,6 +248,123 @@ func TestExchangeWireLifecycleRedeliveryAndOwnershipFence(t *testing.T) {
 	}
 }
 
+func TestDirectRepartitionPushesShardCursorToDestinationWorkers(t *testing.T) {
+	destination, _ := newServer(t, Options{})
+	source, _ := newServer(t, Options{
+		ExchangeDial: func(_ context.Context, address []byte) (net.Conn, error) {
+			if string(address) != "destination" {
+				return nil, fmt.Errorf("unexpected exchange address %q", address)
+			}
+			client, server := net.Pipe()
+			go destination.ServeConn(server)
+			return client, nil
+		},
+	})
+	destinationConn := dial(t, destination)
+	sourceConn := dial(t, source)
+
+	exec(t, sourceConn, ownedRequest(`CREATE TABLE docs (
+		id STRING PRIMARY KEY, tenant STRING NOT NULL, n INTEGER NOT NULL)`))
+	for _, row := range [][3]string{
+		{"1", "alpha", "1"}, {"2", "alpha", "2"}, {"3", "beta", "3"},
+		{"4", "gamma", "4"}, {"5", "gamma", "5"},
+	} {
+		exec(t, sourceConn, ownedRequest(
+			`INSERT INTO docs (id, tenant, n) VALUES (?, ?, ?)`,
+			StringParam(row[0]), StringParam(row[1]), NumberParam(row[2]),
+		))
+	}
+
+	const partitions = 4
+	key := testExchangeKey(111)
+	key.Stage, key.Attempt = 6, 2
+	for partition := uint32(0); partition < partitions; partition++ {
+		open := ownedExchangeRequest(ExchangeOpen, key)
+		open.Exchange.Key.Partition = partition
+		open.Exchange.Producers = 1
+		open.Exchange.QueuedBatches = 8
+		open.Exchange.ProducerBatches = 8
+		open.Exchange.BufferedRows = 64
+		open.Exchange.BufferedBytes = 64 << 10
+		open.Exchange.TotalRows = 128
+		open.Exchange.TotalBytes = 128 << 10
+		exec(t, destinationConn, open)
+	}
+
+	owner := testOwner()
+	targets := make([]RepartitionTarget, partitions)
+	for partition := range targets {
+		targets[partition] = RepartitionTarget{
+			Address: []byte("destination"), Distribution: owner.Distribution, Shard: owner.Shard,
+			AllocationGeneration: owner.AllocationGeneration,
+			RoutingVersion:       owner.RoutingVersion, OwnershipEpoch: owner.Epoch,
+		}
+	}
+	repartition := ownedRequest(`SELECT tenant, COUNT(*) FROM docs GROUP BY tenant`)
+	repartition.ExecutionMode = ExecutionReadOnly
+	repartition.PartialAggregate = true
+	repartition.MaxRows = 64
+	repartition.MaxResultBytes = 1 << 20
+	repartition.Repartition = RepartitionRequest{
+		Operation: key.Operation, Stage: key.Stage, Attempt: key.Attempt,
+		KeyColumns: []uint16{0}, Targets: targets,
+		BlockRows: 2, BlockBytes: 256, MaxMemory: partitions * 256,
+	}
+	response := exec(t, sourceConn, repartition)
+	if response.Kind != ResponseCompletion || response.RowsAffected != 3 {
+		t.Fatalf("repartition response = %+v, want three produced groups", response)
+	}
+
+	partitioner := &repartitionPartitioner{columns: []uint16{0}, partitions: partitions}
+	groups := make(map[string]string)
+	for partition := uint32(0); partition < partitions; partition++ {
+		pull := ownedExchangeRequest(ExchangePull, key)
+		pull.Exchange.Key.Partition = partition
+		for {
+			batch := exec(t, destinationConn, pull).Exchange
+			if batch.EOF {
+				break
+			}
+			pull.Exchange.HasAck = true
+			pull.Exchange.AckProducer = batch.Batch.Producer
+			pull.Exchange.AckSequence = batch.Batch.Sequence
+			if batch.Batch.Rows == 0 {
+				continue
+			}
+			block, err := exchange.OpenBlock(batch.Batch.Data)
+			if err != nil || block.Rows() != batch.Batch.Rows || block.Columns() != 2 {
+				t.Fatalf("partition %d block = %dx%d, %v", partition, block.Rows(), block.Columns(), err)
+			}
+			row := make([]exchange.Cell, 2)
+			for block.NextInto(row) {
+				actual, err := partitioner.Partition(row)
+				if err != nil || actual != partition {
+					t.Fatalf("partition %d row mapped to %d, %v", partition, actual, err)
+				}
+				groups[string(row[0].Bytes)] = string(row[1].Bytes)
+			}
+		}
+	}
+	for group, count := range map[string]string{`"alpha"`: "2", `"beta"`: "1", `"gamma"`: "2"} {
+		if groups[group] != count {
+			t.Fatalf("group %s count = %s, want %s (all %v)", group, groups[group], count, groups)
+		}
+	}
+}
+
+func TestRepartitionDefaultDialIsLoopbackOnly(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:9000", "[::1]:9000", "localhost:9000"} {
+		if !loopbackExchangeAddress([]byte(address)) {
+			t.Fatalf("loopback address %q was rejected", address)
+		}
+	}
+	for _, address := range []string{"10.0.0.1:9000", "example.com:9000", "destination", "127.0.0.1"} {
+		if loopbackExchangeAddress([]byte(address)) {
+			t.Fatalf("non-loopback/invalid address %q was admitted", address)
+		}
+	}
+}
+
 // cellText returns the JSON bytes of one non-null cell as a string.
 func cellText(t *testing.T, resp *ShardResponse, row, col int) string {
 	t.Helper()

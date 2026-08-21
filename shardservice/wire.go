@@ -454,6 +454,10 @@ type ShardRequest struct {
 	// DocumentScan selects the bounded raw scan lane. MaxRows and
 	// MaxResultBytes are its mandatory page bounds.
 	DocumentScan DocumentScanRequest
+	// Repartition turns a read-only SQL cursor into a direct worker producer.
+	// It carries execution coordinates and peer ownership fences, never a
+	// serialized relational plan.
+	Repartition RepartitionRequest
 	// Exchange selects the ephemeral worker mailbox lane. It is mutually
 	// exclusive with SQL, storage reads, fences, and durable transactions.
 	Exchange ExchangeRequest
@@ -461,6 +465,83 @@ type ShardRequest struct {
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
 	Transaction TransactionRequest
+}
+
+const (
+	MaxRepartitionTargets    = 256
+	MaxRepartitionKeyColumns = 64
+	MaxExchangeAddressBytes  = 512
+)
+
+// RepartitionTarget is one destination worker/partition. Address is retained
+// as bytes on the wire and converted only at the cold socket-open boundary.
+type RepartitionTarget struct {
+	Address              []byte
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	RoutingVersion       distribution.RoutingVersion
+	OwnershipEpoch       distribution.OwnershipEpoch
+}
+
+func (t RepartitionTarget) canonical() bool {
+	return len(t.Address) != 0 && len(t.Address) <= MaxExchangeAddressBytes &&
+		utf8.Valid(t.Address) && bytes.IndexByte(t.Address, 0) < 0 &&
+		len(t.Distribution) != 0 && len(t.Distribution) <= MaxPositionIdentityBytes &&
+		utf8.ValidString(string(t.Distribution)) && bytes.IndexByte(byteview.Bytes(string(t.Distribution)), 0) < 0 &&
+		len(t.Shard) != 0 && len(t.Shard) <= MaxPositionIdentityBytes &&
+		utf8.ValidString(string(t.Shard)) && bytes.IndexByte(byteview.Bytes(string(t.Shard)), 0) < 0 &&
+		t.AllocationGeneration != 0 && t.RoutingVersion != 0 && t.OwnershipEpoch != 0
+}
+
+// RepartitionRequest selects exact hash partitioning of a shard-local result.
+// KeyColumns are result ordinals and use the query engine's exact GROUP BY
+// identity. Operation/stage/attempt fence every destination mailbox retry.
+type RepartitionRequest struct {
+	Operation exchange.ID
+	Stage     uint32
+	Attempt   uint32
+	Producer  uint16
+
+	KeyColumns []uint16
+	Targets    []RepartitionTarget
+
+	BlockRows  uint32
+	BlockBytes uint32
+	MaxMemory  uint64
+}
+
+func (r RepartitionRequest) present() bool { return !r.Operation.IsZero() }
+
+func (r RepartitionRequest) canonical() bool {
+	fields := r.Stage != 0 || r.Attempt != 0 || r.Producer != 0 ||
+		len(r.KeyColumns) != 0 || len(r.Targets) != 0 ||
+		r.BlockRows != 0 || r.BlockBytes != 0 || r.MaxMemory != 0
+	if !r.present() {
+		return !fields
+	}
+	if r.Stage == 0 || r.Attempt == 0 ||
+		len(r.KeyColumns) == 0 || len(r.KeyColumns) > MaxRepartitionKeyColumns ||
+		len(r.Targets) == 0 || len(r.Targets) > MaxRepartitionTargets ||
+		r.Producer >= exchange.MaxProducers ||
+		!exchange.ValidBlockLimits(1, r.BlockRows, r.BlockBytes) ||
+		r.MaxMemory == 0 || r.MaxMemory > exchange.MaxMailboxBytes ||
+		uint64(len(r.Targets))*uint64(r.BlockBytes) > r.MaxMemory {
+		return false
+	}
+	for i, column := range r.KeyColumns {
+		for previous := range i {
+			if r.KeyColumns[previous] == column {
+				return false
+			}
+		}
+	}
+	for i := range r.Targets {
+		if !r.Targets[i].canonical() {
+			return false
+		}
+	}
+	return true
 }
 
 // ExchangeOperation is one mailbox lifecycle or data command.

@@ -268,6 +268,23 @@ func TestRequestRoundTrip(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "direct_repartition",
+			req: &ShardRequest{
+				SQL:          "SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id",
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadOnly, MaxRows: 1024, MaxResultBytes: 1 << 20,
+				Repartition: RepartitionRequest{
+					Operation: testExchangeKey(72).Operation, Stage: 3, Attempt: 2, Producer: 4,
+					KeyColumns: []uint16{0}, BlockRows: 128, BlockBytes: 64 << 10, MaxMemory: 128 << 10,
+					Targets: []RepartitionTarget{
+						{Address: []byte("127.0.0.1:9001"), Distribution: "workers", Shard: "-80", AllocationGeneration: 11, RoutingVersion: 8, OwnershipEpoch: 5},
+						{Address: []byte("127.0.0.1:9002"), Distribution: "workers", Shard: "80-", AllocationGeneration: 12, RoutingVersion: 8, OwnershipEpoch: 6},
+					},
+				},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -322,6 +339,32 @@ func TestRequestRoundTrip(t *testing.T) {
 				got.Exchange.Batch.Final != tc.req.Exchange.Batch.Final ||
 				!bytes.Equal(got.Exchange.Batch.Data, tc.req.Exchange.Batch.Data) {
 				t.Errorf("Exchange = %+v, want %+v", got.Exchange, tc.req.Exchange)
+			}
+			if got.Repartition.Operation != tc.req.Repartition.Operation ||
+				got.Repartition.Stage != tc.req.Repartition.Stage ||
+				got.Repartition.Attempt != tc.req.Repartition.Attempt ||
+				got.Repartition.Producer != tc.req.Repartition.Producer ||
+				got.Repartition.BlockRows != tc.req.Repartition.BlockRows ||
+				got.Repartition.BlockBytes != tc.req.Repartition.BlockBytes ||
+				got.Repartition.MaxMemory != tc.req.Repartition.MaxMemory ||
+				len(got.Repartition.KeyColumns) != len(tc.req.Repartition.KeyColumns) ||
+				len(got.Repartition.Targets) != len(tc.req.Repartition.Targets) {
+				t.Fatalf("Repartition = %+v, want %+v", got.Repartition, tc.req.Repartition)
+			}
+			for i := range got.Repartition.KeyColumns {
+				if got.Repartition.KeyColumns[i] != tc.req.Repartition.KeyColumns[i] {
+					t.Errorf("Repartition.KeyColumns[%d] = %d, want %d", i, got.Repartition.KeyColumns[i], tc.req.Repartition.KeyColumns[i])
+				}
+			}
+			for i := range got.Repartition.Targets {
+				if !bytes.Equal(got.Repartition.Targets[i].Address, tc.req.Repartition.Targets[i].Address) ||
+					got.Repartition.Targets[i].Distribution != tc.req.Repartition.Targets[i].Distribution ||
+					got.Repartition.Targets[i].Shard != tc.req.Repartition.Targets[i].Shard ||
+					got.Repartition.Targets[i].AllocationGeneration != tc.req.Repartition.Targets[i].AllocationGeneration ||
+					got.Repartition.Targets[i].RoutingVersion != tc.req.Repartition.Targets[i].RoutingVersion ||
+					got.Repartition.Targets[i].OwnershipEpoch != tc.req.Repartition.Targets[i].OwnershipEpoch {
+					t.Errorf("Repartition.Targets[%d] = %+v, want %+v", i, got.Repartition.Targets[i], tc.req.Repartition.Targets[i])
+				}
 			}
 			if got.Transaction.Operation != tc.req.Transaction.Operation ||
 				got.Transaction.ID != tc.req.Transaction.ID ||
@@ -584,6 +627,42 @@ func TestExchangeEnvelopeRejectsMixedLanes(t *testing.T) {
 	body.u8(uint8(ExchangeNone))
 	if _, err := DecodeResponse(bytes.NewReader(rawFrame(tagResponse, body.b))); !errors.Is(err, errBadEnum) {
 		t.Fatalf("present exchange marker with absent operation = %v, want errBadEnum", err)
+	}
+}
+
+func TestRepartitionEnvelopeRejectsMixedOrUnboundedLanes(t *testing.T) {
+	base := ShardRequest{
+		SQL: "SELECT tenant_id FROM docs", Distribution: "d", Shard: "s",
+		AllocationGeneration: 1, RoutingVersion: 1, OwnershipEpoch: 1,
+		ExecutionMode: ExecutionReadOnly, MaxRows: 100, MaxResultBytes: 1 << 20,
+		Repartition: RepartitionRequest{
+			Operation: testExchangeKey(73).Operation, Stage: 1, Attempt: 1, KeyColumns: []uint16{0},
+			Targets: []RepartitionTarget{{
+				Address: []byte("127.0.0.1:9000"), Distribution: "d", Shard: "s",
+				AllocationGeneration: 1, RoutingVersion: 1, OwnershipEpoch: 1,
+			}},
+			BlockRows: 16, BlockBytes: 4096, MaxMemory: 4096,
+		},
+	}
+	if err := EncodeRequest(io.Discard, &base); err != nil {
+		t.Fatalf("canonical repartition: %v", err)
+	}
+	for _, mutate := range []func(*ShardRequest){
+		func(r *ShardRequest) { r.ExecutionMode = ExecutionReadWrite },
+		func(r *ShardRequest) { r.MaxRows = 0 },
+		func(r *ShardRequest) { r.RowBatch = RowBatchRequest{BatchRows: 1, BatchBytes: 64} },
+		func(r *ShardRequest) { r.Repartition.KeyColumns = []uint16{0, 0} },
+		func(r *ShardRequest) { r.Repartition.MaxMemory-- },
+		func(r *ShardRequest) { r.Repartition.Targets[0].Address = []byte("bad\x00address") },
+	} {
+		req := base
+		req.Repartition.KeyColumns = append([]uint16(nil), base.Repartition.KeyColumns...)
+		req.Repartition.Targets = append([]RepartitionTarget(nil), base.Repartition.Targets...)
+		req.Repartition.Targets[0].Address = bytes.Clone(base.Repartition.Targets[0].Address)
+		mutate(&req)
+		if err := EncodeRequest(io.Discard, &req); !errors.Is(err, errBadRepartition) {
+			t.Fatalf("invalid repartition error = %v, want errBadRepartition", err)
+		}
 	}
 }
 
