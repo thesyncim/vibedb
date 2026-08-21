@@ -56,6 +56,40 @@ func TestDocumentPointProgramRejectsIncompleteOrNonscalarKeys(t *testing.T) {
 	}
 }
 
+func TestDocumentPointProgramDigestBindsOrderedPlacementIdentity(t *testing.T) {
+	first, err := CompileDocumentPointProgram(
+		[]string{"/tenant", "/sequence"}, DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := CompileDocumentPointProgram(
+		[]string{"/tenant", "/sequence"}, DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reordered, err := CompileDocumentPointProgram(
+		[]string{"/sequence", "/tenant"}, DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	widerBuckets, err := CompileDocumentPointProgram(
+		[]string{"/tenant", "/sequence"}, DefaultVirtualBucketBits+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest() == ([32]byte{}) || first.Digest() != again.Digest() ||
+		first.Digest() == reordered.Digest() || first.Digest() == widerBuckets.Digest() {
+		t.Fatalf(
+			"placement digests = %x / %x / %x / %x",
+			first.Digest(), again.Digest(), reordered.Digest(), widerBuckets.Digest(),
+		)
+	}
+}
+
 func TestDocumentPointProgramAllocatesZeroWhenWarm(t *testing.T) {
 	program, err := CompileDocumentPointProgram(
 		[]string{"/tenant", "/region", "/sequence"}, DefaultVirtualBucketBits,

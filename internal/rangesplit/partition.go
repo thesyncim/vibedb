@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -65,10 +67,12 @@ type partitionScan struct {
 type Partitioner struct {
 	source     autosplit.SourceIdentity
 	ranges     [autosplit.MaxSplitChildren]distribution.KeyRange
+	children   [autosplit.MaxSplitChildren]autosplit.SplitChild
 	childCount uint8
 	retained   uint8
 	collection string
 	program    *distribution.DocumentPointProgram
+	target     distribution.RoutingVersion
 	digest     [sha256.Size]byte
 }
 
@@ -92,13 +96,24 @@ func NewPartitioner(
 	}
 	p := &Partitioner{
 		source: plan.Source, childCount: plan.ChildCount,
-		retained: plan.RetainedChild, collection: collection, program: program,
+		retained: plan.RetainedChild, collection: strings.Clone(collection), program: program,
+		target: plan.Manifest().Version(),
 	}
+	p.source.Distribution = distribution.DistributionName(strings.Clone(string(p.source.Distribution)))
+	p.source.Shard = distribution.ShardID(strings.Clone(string(p.source.Shard)))
 	for child := 0; child < int(plan.ChildCount); child++ {
 		descriptor, ok := plan.Child(child)
 		if !ok {
 			return nil, ErrInvalidPartition
 		}
+		descriptor.Shard = distribution.ShardID(strings.Clone(string(descriptor.Shard)))
+		descriptor.Leaders = slices.Clone(descriptor.Leaders)
+		for ordinal := range descriptor.Leaders {
+			descriptor.Leaders[ordinal] = distribution.EndpointID(
+				strings.Clone(string(descriptor.Leaders[ordinal])),
+			)
+		}
+		p.children[child] = descriptor
 		p.ranges[child] = descriptor.Range
 	}
 	p.digest, err = SplitPlanDigest(plan)

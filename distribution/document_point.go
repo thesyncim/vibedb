@@ -1,6 +1,8 @@
 package distribution
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -18,7 +20,10 @@ var ErrDocumentPoint = errors.New("distribution: document placement point")
 type DocumentPointProgram struct {
 	mapper   *NativeMapper
 	pointers []vibejson.CompiledPointer
+	digest   [sha256.Size]byte
 }
+
+var documentPointProgramDomain = []byte("vibedb/document-point-program\x00")
 
 // DocumentPointWorkspace owns reusable structural-index and decoded-string
 // storage. One workspace may be reused serially; it must not be shared by
@@ -48,9 +53,32 @@ func CompileDocumentPointProgram(
 		}
 		pointers[ordinal] = pointer
 	}
-	return &DocumentPointProgram{
+	h := sha256.New()
+	_, _ = h.Write(documentPointProgramDomain)
+	var fixed [8]byte
+	binary.LittleEndian.PutUint32(fixed[0:4], uint32(NativeMapperVersion))
+	fixed[4], fixed[5] = bucketBits, byte(len(columns))
+	_, _ = h.Write(fixed[:])
+	for _, column := range columns {
+		binary.LittleEndian.PutUint64(fixed[:], uint64(len(column)))
+		_, _ = h.Write(fixed[:])
+		_, _ = h.Write([]byte(column))
+	}
+	program := &DocumentPointProgram{
 		mapper: NewNativeMapperWithBucketBits(len(columns), bucketBits), pointers: pointers,
-	}, nil
+	}
+	_ = h.Sum(program.digest[:0])
+	return program, nil
+}
+
+// Digest returns the immutable mapper, bucket geometry, and ordered compiled
+// pointer identity. Artifact builders bind it so the same topology cannot be
+// populated with rows produced by a different placement program.
+func (p *DocumentPointProgram) Digest() [sha256.Size]byte {
+	if p == nil {
+		return [sha256.Size]byte{}
+	}
+	return p.digest
 }
 
 // Arity returns the number of scalar components read from every document.

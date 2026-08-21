@@ -23,7 +23,7 @@ shard.
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space striped request telemetry, sustained bucket-aligned recommendations, and allocation-high-water/generation-fenced desired split manifests; it cannot publish topology, copy state, catch up a destination, or move ownership |
 | `internal/rebalance` | Non-serving, stateless intact-shard replica movement: exact membership stages, certified learner-base/install proof, applied catch-up, promotion, leader transfer, ordered ownership-fence advance, catalog generation CAS, old-generation drain, source removal, and retirement action |
-| `internal/rangesplit` | Non-serving one-pass physical child row partitioning: complete desired-manifest digest, exact source fences, compiled `vibejson` placement extraction, fixed child dispatch, and no-copy retained-child support; it does not persist/certify outputs or authorize cutover |
+| `internal/rangesplit` | Non-serving one-pass physical child row partitioning: complete desired-manifest and placement-program digests, exact source fences, compiled `vibejson` extraction, no-copy retained-child support, and bounded deterministic hash-chained artifacts for non-retained children; verification proves framing, key order, and row placement before a durable chunk callback, but no destination installer or cutover authority is wired |
 
 The repository also contains a non-serving Raft foundation: a pinned upstream
 Raft core, append-only immutable-base WAL, local replicated-apply state machine,
@@ -169,10 +169,16 @@ allocation and complete desired-manifest digest, scans the source user image
 once, builds one reusable `vibejson` structural index per row, computes the
 canonical native placement point, and dispatches borrowed key/value bytes to
 exactly one of at most three child sinks. The retained child may use a nil sink,
-avoiding a redundant copy. Its warmed row path is allocation-free. This is row
-partitioning only: it does not persist or certify child artifacts, translate a
-source mutation tail into child groups, change validation ownership, or publish
-topology.
+avoiding a redundant copy. Its warmed row path is allocation-free. Every other
+child can be written during that same scan as a bounded deterministic
+hash-chained artifact. The header binds the complete plan, placement program,
+source applied/base cut, exact child range/allocation/ownership, and ordered
+endpoint set; the footer certifies row/byte/chunk totals. Verification checks
+the chain and strict key order, then recomputes every document's `vibejson`
+placement before exposing an entire borrowed chunk to a receiver that can
+atomically persist rows and its checkpoint. This still does not install a child
+database, translate a source mutation tail into child groups, change validation
+ownership, or publish topology.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
@@ -274,9 +280,10 @@ merge, move, or replica reconfiguration protocol.
   resumable non-serving staging/candidate validation, model-checked membership,
   and intact-shard move reconciliation are exposed only through the non-serving
   kernel;
-- persistent filtered child artifacts and ordered cutover for an online split
-  or merge; bounded hot-bucket evidence, desired split planning, one-pass
-  allocation-free child row partitioning, source artifact export, offline
+- persistent destination staging/install and ordered cutover for an online
+  split or merge; bounded hot-bucket evidence, desired split planning, one-pass
+  allocation-free child row partitioning, deterministic filtered child
+  artifact framing/verification, source artifact export, offline whole-shard
   destination install, and intact-shard replica relocation primitives exist,
   but confer no serving authority by themselves;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed

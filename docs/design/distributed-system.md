@@ -417,11 +417,15 @@ cluster does not fork into named protocol generations.
    split kernel now binds the complete desired-manifest identity and performs a
    single source scan that routes each borrowed row through one compiled
    `vibejson` placement program into one fixed child range, without copying the
-   retained child and without warmed row-path allocation. It does not persist
-   or certify those filtered outputs, translate the ordered source tail into
-   independent child groups, authenticate transport, provide topology
-   authority, construct target SQL roots, wire servers, or grant serving
-   ownership by itself.
+   retained child and without warmed row-path allocation. That same scan can
+   stream each non-retained child into a bounded deterministic hash chain bound
+   to the exact source cut, complete plan, placement program, child allocation,
+   range, ownership, and endpoints. Its verifier authenticates framing and
+   totals, enforces strict key order, and recomputes `vibejson` placement before
+   exposing a whole chunk to a durable receiver. It does not stage/install the
+   resulting child database, translate the ordered source tail into independent
+   child groups, authenticate transport, provide topology authority, construct
+   target SQL roots, wire servers, or grant serving ownership by itself.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

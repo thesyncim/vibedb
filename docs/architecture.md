@@ -321,10 +321,13 @@ remain predictable because their capacities and fold work are fixed at open.
   drain, and retirement evidence. `internal/rangesplit` adds the first physical
   child data-plane kernel: one source scan, one compiled `vibejson` placement
   extraction per row, fixed child-range dispatch, a no-copy retained child, and
-  a digest over the complete desired manifest. Both remain non-serving:
-  persistent certified child outputs, source-tail translation, peer transport,
-  an external topology authority, server wiring, automatic failover, and
-  ordered split cutover remain absent.
+  a digest over the complete desired manifest. Non-retained children can be
+  streamed directly into bounded deterministic hash-chained artifacts whose
+  verifier rechecks key order and `vibejson` placement before handing a whole
+  chunk to a durable receiver. Both remain non-serving: persistent destination
+  staging/install, source-tail translation, peer transport, an external
+  topology authority, server wiring, automatic failover, and ordered split
+  cutover remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and
