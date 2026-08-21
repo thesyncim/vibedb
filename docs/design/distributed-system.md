@@ -130,9 +130,16 @@ corresponding empty batch, and certification reconstructs that capture entry
 and matches every durable child cursor. A fixed-size checksum-protected
 certificate records the exact cut but deliberately grants no serving authority.
 
-The implementation does not prune the retained range or perform the catalog
-compare-and-swap that publishes topology. The repository has no automatic split
-controller or merge planner.
+Retained cleanup never deletes storage behind Raft. It checkpoints bounded
+ordered batches, submits them as normal replicated deletes at the post-seal
+fences, verifies the exact captured transition, and survives both sides of the
+apply/cursor crash window. A final fresh scan hashes the exact retained image.
+
+The gateway binds that completion proof to an exact manifest transition: only
+the planned source may be replaced, and unrelated shard identities and leaders
+must remain unchanged. Existing durable and in-memory catalog compare-and-swap
+operations provide publication authority. The repository still has no
+automatic split controller or merge planner.
 
 ## Replication kernel
 
@@ -163,5 +170,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/rangesplit/cutover.go`
+- `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`
+- `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

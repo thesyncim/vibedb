@@ -143,8 +143,13 @@ each exact before-and-after transition in the same durable
 transaction as its source publication. A terminal ownership-fence entry must
 advance all mutable serving coordinates together; every child durably records
 its empty seal batch before a fixed-size cutover certificate can be issued.
-The certificate is evidence, not topology authority. The package does not
-prune the retained range or publish topology.
+The certificate is evidence, not topology authority. Retained cleanup plans
+bounded ordered key batches, checkpoints each batch before proposal, and
+confirms only the exact atomically captured replicated deletes. A final fresh
+scan certifies the retained image. The gateway accepts that completion proof
+only with the exact one-source manifest replacement; durable and in-memory
+authority still move through the catalog's generation compare-and-swap
+operations.
 
 ## External memory and unsafe code
 

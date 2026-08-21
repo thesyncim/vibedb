@@ -71,8 +71,13 @@ row changes. Every child persists the exact empty batch and enters a terminal
 sealed phase. Certification rereads and verifies that capture record, recomputes
 all child batch digests, and refuses a source head that advanced past the seal.
 
-The resulting certificate does not publish the catalog. Retained-range pruning
-and the generation-fenced catalog transaction remain outside this kernel.
+The resulting certificate does not publish the catalog. Retained cleanup is a
+bounded, resumable sequence of ordinary replicated deletes; it checkpoints a
+batch before proposal, verifies the exact captured transition after apply, and
+finishes with a fresh retained-image digest. The gateway accepts the terminal
+proof only when the next manifest replaces exactly the planned source and
+leaves every unrelated shard unchanged. Publication then reuses the durable
+and in-memory catalog generation compare-and-swap operations.
 
 ## Security boundary
 

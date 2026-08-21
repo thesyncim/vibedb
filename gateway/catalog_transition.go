@@ -6,7 +6,36 @@ import (
 	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/rangesplit"
 )
+
+// BuildCertifiedRangeSplitTransition constructs an unpublished catalog
+// generation only after cutover, retained-source pruning, and the exact
+// one-source manifest replacement all match the same split plan. Durable and
+// in-memory authority still move through SaveSnapshotAfter and
+// CatalogHolder.PublishAfter.
+func BuildCertifiedRangeSplitTransition(
+	current *Snapshot,
+	nextManifest *distribution.Manifest,
+	nextGeneration uint64,
+	partitioner *rangesplit.Partitioner,
+	certificate rangesplit.CutoverCertificate,
+	prune rangesplit.RetainedPruneCursor,
+) (*Snapshot, error) {
+	if current == nil || nextManifest == nil || partitioner == nil {
+		return nil, rangesplit.ErrManifestTransition
+	}
+	currentManifest, ok := current.Manifest(nextManifest.Distribution())
+	if !ok {
+		return nil, rangesplit.ErrManifestTransition
+	}
+	if err := partitioner.ValidatePublicationTransition(
+		currentManifest, nextManifest, certificate, prune,
+	); err != nil {
+		return nil, err
+	}
+	return BuildManifestTransition(current, nextManifest, nextGeneration)
+}
 
 // BuildManifestTransition constructs an unpublished catalog generation by
 // replacing exactly one distribution manifest while preserving the current

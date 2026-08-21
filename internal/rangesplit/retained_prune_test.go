@@ -137,6 +137,20 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	if err := partitioner.VerifyRetainedPruneCompletion(certificate, cursor); err != nil {
 		t.Fatal(err)
 	}
+	currentManifest, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
+		ID: "source", AllocationGeneration: 7,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"node-a"}, Epoch: 5,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextManifest := testSplitPlan(t, "node-b").Manifest()
+	if err := partitioner.ValidatePublicationTransition(
+		currentManifest, nextManifest, certificate, cursor,
+	); err != nil {
+		t.Fatal(err)
+	}
 	incomplete := cursor
 	incomplete.phase = RetainedPruneScan
 	incomplete.snapshotGeneration = 0
@@ -145,6 +159,11 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		certificate, incomplete,
 	); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("incomplete proof err=%v", err)
+	}
+	if err := partitioner.ValidatePublicationTransition(
+		currentManifest, nextManifest, certificate, incomplete,
+	); !errors.Is(err, ErrRetainedPrune) {
+		t.Fatalf("incomplete publication proof err=%v", err)
 	}
 	corrupt := bytes.Clone(persisted)
 	corrupt[len(corrupt)-1] ^= 1
