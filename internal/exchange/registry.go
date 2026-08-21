@@ -6,6 +6,8 @@ import (
 	"math/bits"
 	"sync"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 const (
@@ -168,4 +170,12 @@ func PartitionFor(hash uint64, partitions uint32) (uint32, error) {
 	}
 	hi, _ := bits.Mul64(hash, uint64(partitions))
 	return uint32(hi), nil
+}
+
+// PartitionForKey hashes one already-canonical composite key with the fixed
+// cross-process xxhash algorithm, then uses multiply-high reduction. Every
+// producer therefore maps equal keys to one stage partition without serializing
+// a seed or paying modulo bias.
+func PartitionForKey(key []byte, partitions uint32) (uint32, error) {
+	return PartitionFor(xxhash.Sum64(key), partitions)
 }

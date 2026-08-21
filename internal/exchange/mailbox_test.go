@@ -306,6 +306,14 @@ func TestRegistryAdmissionIdempotenceReapAndPartitioning(t *testing.T) {
 			t.Fatalf("PartitionFor(%x,%d) = %d,%v want %d", test.hash, test.partitions, got, err, test.want)
 		}
 	}
+	left, err := PartitionForKey([]byte{1, 2, 3}, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := PartitionForKey([]byte{1, 2, 3}, 31)
+	if err != nil || left != right {
+		t.Fatalf("PartitionForKey repeat = %d,%v want %d", right, err, left)
+	}
 	if _, err := PartitionFor(1, 0); !errors.Is(err, ErrPartitions) {
 		t.Fatalf("zero partitions = %v", err)
 	}

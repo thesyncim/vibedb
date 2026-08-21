@@ -250,6 +250,19 @@ Direct producer routing, authenticated peer admission, and planner stage
 orchestration remain required before this becomes a serving worker-to-worker
 hash/range exchange.
 
+The intermediate data plane also has one compact row-block representation.
+It frames opaque value bytes and nulls directly, validates bounded row/cell/byte
+counts once, and then decodes borrowed cells without per-cell allocation. A
+reusable partition-block set reserves worst-case memory before a stage starts
+and grows individual arenas lazily. Exact composite JSON group identities feed
+a fixed xxhash plus multiply-high reduction, so equal numeric/string spellings
+always meet on one worker. The gateway lifecycle coordinator can open partitions
+in bounded parallelism and its producer core emits retry-sequenced blocks plus
+an explicit final batch for every partition. The remaining boundary is wiring a
+shard cursor directly to peer transports and selecting that path from the
+physical `OpRepartition`; routing rows through the gateway query path would add
+an avoidable hop and is intentionally not presented as the finished design.
+
 The first transport primitive now serves: an additive row-batch request keeps
 the ordinary routed request/response bytes unchanged, while opted-in reads send
 sequence-checked terminal frames with explicit per-batch and total row/byte
@@ -364,7 +377,9 @@ cluster does not fork into named protocol generations.
    grouped partial/final fan-out consumes it incrementally in deterministic
    route order without whole-shard response materialization.
    A bounded worker mailbox/partition state machine and owner-fenced shard-wire
-   lifecycle commands are also present; direct producer routing is next.
+   lifecycle commands, canonical blocks, exact partitioning, and bounded gateway
+   lifecycle/producer primitives are also present; shard-cursor direct producer
+   routing is next.
    Hash/range exchange and worker-local final aggregation follow, then
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.

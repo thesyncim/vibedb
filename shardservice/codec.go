@@ -379,17 +379,27 @@ func (d *deccur) end() error {
 	return nil
 }
 
-// writeFrame prefixes body with tag and the pgwire-style self-covering length,
-// then writes the whole frame in one call.
-func writeFrame(w io.Writer, tag byte, body []byte) error {
-	if len(body) > maxFrameBody {
+// newFrameEncoder reserves the wire header in the same arena as the body. This
+// keeps the single-Write contract without copying a completed multi-megabyte
+// body into a second whole-frame allocation.
+func newFrameEncoder(payloadHint int) encbuf {
+	capacity := 5 + 256
+	if payloadHint > 0 && payloadHint <= maxFrameBody-256 {
+		capacity += payloadHint
+	}
+	return encbuf{b: make([]byte, 5, capacity)}
+}
+
+func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
+	if len(frame) < 5 || len(frame)-5 > maxFrameBody {
 		return errFrameTooLarge
 	}
-	frame := make([]byte, 5+len(body))
 	frame[0] = tag
-	binary.BigEndian.PutUint32(frame[1:5], uint32(len(body)+4))
-	copy(frame[5:], body)
-	_, err := w.Write(frame)
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(frame)-1))
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -849,7 +859,7 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		return errBadRowBatch
 	}
 
-	var e encbuf
+	e := newFrameEncoder(len(req.Exchange.Batch.Data))
 	e.u8(wireVersion)
 	e.str(req.SQL)
 	e.str(string(req.Distribution))
@@ -953,7 +963,7 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if e.err != nil {
 		return e.err
 	}
-	return writeFrame(w, tagRequest, e.b)
+	return writeEncodedFrame(w, tagRequest, e.b)
 }
 
 // DecodeRequest reads one framed request. A malformed or oversized frame yields
@@ -1201,7 +1211,7 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 		return errBadExchange
 	}
 
-	var e encbuf
+	e := newFrameEncoder(len(resp.Exchange.Batch.Data))
 	e.u8(wireVersion)
 	e.u8(uint8(resp.Kind))
 	switch resp.Kind {
@@ -1307,7 +1317,7 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if e.err != nil {
 		return e.err
 	}
-	return writeFrame(w, tagResponse, e.b)
+	return writeEncodedFrame(w, tagResponse, e.b)
 }
 
 // errRowArity reports a row whose cell count does not match the column count.

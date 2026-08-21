@@ -313,9 +313,10 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and
-  online movement. Its bounded worker-mailbox state machine and shard-wire
-  lifecycle commands exist, but direct producer routing, authenticated peer
-  admission, and planner exchange orchestration remain unfinished. It is a delivery
+  online movement. Its bounded worker-mailbox state machine, canonical
+  intermediate row blocks, shard-wire lifecycle commands, and gateway stage
+  lifecycle/producer primitives exist, but shard-cursor-to-worker routing,
+  authenticated peer admission, and planner-selected serving exchange remain unfinished. It is a delivery
   contract, not current capability.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and

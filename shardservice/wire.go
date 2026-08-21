@@ -728,13 +728,11 @@ type Column struct {
 	TypeOID int32
 }
 
-// Cell is one result value. When Null is true, Bytes is empty; otherwise Bytes
-// holds the column's already-encoded value (for example JSON text for a
-// document column), mirroring the pgwire DataRow model.
-type Cell struct {
-	Null  bool
-	Bytes []byte
-}
+// Cell is one result value. It aliases the exchange block cell so a shard row
+// can move into a byte-native intermediate block without an adapter object.
+// When Null is true, Bytes is empty; otherwise Bytes holds the already-encoded
+// value (for example canonical vibejson bytes for a document column).
+type Cell = exchange.Cell
 
 // ShardResponse is a shard's reply to one request: a materialized row set, a
 // completion count, or a typed error frame, selected by Kind.
