@@ -1387,8 +1387,11 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 	c := newE2ECluster(t)
 	seedClient := NewClient(plainDial(c.dialer.servers))
 	defer seedClient.Close()
+	allKeys := make([]string, 0, len(c.shards)*3)
 	for i := range c.shards {
+		allKeys = append(allKeys, c.shards[i].keys...)
 		key := c.freshKeysForShard(t, c.shards[i].id, 1)[0]
+		allKeys = append(allKeys, key)
 		c.seed(t, seedClient, c.shards[i],
 			`INSERT INTO messages (tenant_id, n) VALUES (?, ?)`,
 			[]shardservice.Param{
@@ -1398,7 +1401,8 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 
 	e := NewExecutor(c.client, NewCatalogHolder(c.snapshot(t, 1)), Options{})
 	result, err := e.Query(context.Background(), Query{
-		SQL:   `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages GROUP BY n`,
+		SQL: `SELECT n, COUNT(*), SUM(n), MIN(n), MAX(n) FROM messages ` +
+			`GROUP BY n ORDER BY n DESC`,
 		Class: ClassBatch,
 	})
 	if err != nil {
@@ -1406,6 +1410,13 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 	}
 	if len(result.Rows) != 9 {
 		t.Fatalf("group count = %d, want 9", len(result.Rows))
+	}
+	for row := 1; row < len(result.Rows); row++ {
+		previous := classifyCell(result.Rows[row-1][0])
+		current := classifyCell(result.Rows[row][0])
+		if compareCells(previous, current) < 0 {
+			t.Fatalf("grouped final order regressed at rows %d/%d", row-1, row)
+		}
 	}
 	found := false
 	for _, row := range result.Rows {
@@ -1429,6 +1440,29 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 	}
 	if result.PlanFingerprint == "" || result.Planning.Memo.Groups != 2 {
 		t.Fatalf("planning diagnostics = %+v fingerprint=%q", result.Planning, result.PlanFingerprint)
+	}
+
+	sort.Strings(allKeys)
+	top, err := e.Query(context.Background(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`GROUP BY tenant_id ORDER BY tenant_id LIMIT 3`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("top-k Query: %v", err)
+	}
+	if len(top.Rows) != 3 {
+		t.Fatalf("top-k rows = %d, want 3", len(top.Rows))
+	}
+	for row := range top.Rows {
+		value := classifyCell(top.Rows[row][0])
+		if value.kind != ckString || string(value.sval) != allKeys[row] ||
+			string(top.Rows[row][1].Bytes) != "1" {
+			t.Fatalf("top-k row %d = %+v, want key %q count 1", row, top.Rows[row], allKeys[row])
+		}
+	}
+	if got := c.dialer.totalDials(); got != 24 {
+		t.Fatalf("total dials after grouped sort and top-k = %d, want 24", got)
 	}
 }
 

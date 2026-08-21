@@ -44,6 +44,30 @@ func TestExplainDistributedPhysicalPlanWithoutDispatch(t *testing.T) {
 	if !strings.HasPrefix(aggregate.PhysicalPlan, "final-aggregate") {
 		t.Fatalf("aggregate physical plan:\n%s", aggregate.PhysicalPlan)
 	}
+
+	groupedSort, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n`, Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(groupedSort.PhysicalPlan, "sort") ||
+		!strings.Contains(groupedSort.PhysicalPlan, "final-aggregate") {
+		t.Fatalf("grouped sort physical plan:\n%s", groupedSort.PhysicalPlan)
+	}
+
+	groupedTopK, err := executor.Explain(t.Context(), Query{
+		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
+			`GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(groupedTopK.PhysicalPlan, "top-k") ||
+		!strings.Contains(groupedTopK.PhysicalPlan, "final-aggregate") {
+		t.Fatalf("grouped top-k physical plan:\n%s", groupedTopK.PhysicalPlan)
+	}
 }
 
 func routeSQL(t *testing.T, e *Executor, snap *Snapshot, sql string, class OperationClass) (*plan, error) {

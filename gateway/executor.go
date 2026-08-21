@@ -886,6 +886,9 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 			columns, rows, err = mergeGroupedAggregateRows(
 				results, pl.aggregates, pl.groupKeys, p.MaxAggregateBytes,
 			)
+			if err == nil {
+				rows, err = finalizeGroupedRows(rows, pl.order, pl.limit, p.MaxAggregateBytes)
+			}
 		} else {
 			columns, rows, err = mergeAggregateRows(results, pl.aggregates, p.MaxAggregateBytes)
 		}

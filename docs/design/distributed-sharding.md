@@ -126,8 +126,11 @@ Currently executable distributed shapes include:
 - global `LIMIT`; and
 - global and grouped `COUNT`, `SUM`, `MIN`, and `MAX` over mergeable
   shard-local states. Grouped finalization uses the query engine's exact
-  composite key identity and a memory-capped columnar accumulator; grouped
-  `ORDER BY`, `LIMIT`, `HAVING`, and `AVG` remain refused.
+  composite key identity and a memory-capped columnar accumulator. A bounded
+  exact final sort implements grouped `ORDER BY`; `ORDER BY ... LIMIT K` uses
+  O(K) heap state when the group includes the complete placement key, which
+  proves shard-local groups and makes local top-K pushdown sound. Grouped
+  `HAVING`, `AVG`, and LIMIT over cross-shard group identities remain refused.
 
 ## Gateway write contract
 

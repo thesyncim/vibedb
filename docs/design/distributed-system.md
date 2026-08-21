@@ -278,9 +278,10 @@ cluster does not fork into named protocol generations.
    batches, filter-first/lazy projection, exact-index pushdown, covering
    aggregates, adaptive joins, and spill. Distributed grouped COUNT/SUM/MIN/MAX
    now run as shard-local partial aggregation plus a memory-capped, exact
-   columnar final stage. Vectorized stage exchange, post-finalization top-K,
-   runtime filters across exchanges, and parallel replica scheduling remain
-   pending.
+   columnar final stage; bounded exact final sorting and O(K) top-K for
+   placement-local groups are present. Vectorized stage exchange, top-K over
+   cross-shard group identities, runtime filters across exchanges, and parallel
+   replica scheduling remain pending.
 6. **Pending:** wire the existing Raft foundation into serving, enable
    movement, and add disaggregated immutable snapshot/cold-data caching.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and

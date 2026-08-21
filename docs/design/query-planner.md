@@ -92,11 +92,18 @@ encoding, and finalizes dense columnar accumulator lanes at the gateway. Small
 integer counts and sums stay in native registers, promote to `big.Int` only on
 overflow, and enter rational mode only for a real decimal. Retained state and
 completed output share the operation's finite aggregate byte admission. Group
-order is stable first appearance; plans needing post-finalization ordering or
-top-K are still refused.
+order is stable first appearance when unordered. Grouped `ORDER BY` adds a
+bounded exact final sort. When the GROUP BY tuple contains the full placement
+key, groups are shard-local: each shard's local K is then sufficient for the
+global K, and `ORDER BY ... LIMIT K` uses an exact O(K) max-heap final stage
+instead of sorting every group. The physical plan exposes these as `sort` and
+`top-k` above `final-aggregate`.
 Until fragment projection rewriting lands, every distributed group key must be
 present in the SELECT output so the final stage receives the complete identity;
 a single-shard route retains the local engine's broader projection surface.
+LIMIT on a group identity that can span shards also remains refused: forwarding
+the authored local LIMIT could discard a partial group needed by the final
+stage.
 
 Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
 ordered-key bounds and seek the durable primary graph before document decoding.
@@ -131,8 +138,8 @@ number canonicalization, float conversion, or allocation.
 
 The gateway refuses:
 
-- `AVG`, grouped `HAVING`/`ORDER BY`/`LIMIT`, `DISTINCT`, windows, and `OFFSET`
-  on a multi-shard route;
+- `AVG`, grouped `HAVING`, non-shard-local grouped `LIMIT`, `DISTINCT`, windows,
+  and `OFFSET` on a multi-shard route;
 - derived, CTE, or predicate-subquery plans that read another physical source;
 - non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
 - unsupported single-statement scatter writes. Explicit bounded write batches

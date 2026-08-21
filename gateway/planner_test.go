@@ -141,8 +141,37 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bind grouped ORDER BY: %v", err)
 	}
-	if err := groupedOrderBound.ValidateRoute(routeBoundPlan(t, groupedOrderBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
-		t.Fatalf("grouped ORDER BY validation = %v, want unsupported post-finalization sort", err)
+	if err := groupedOrderBound.ValidateRoute(routeBoundPlan(t, groupedOrderBound)); err != nil {
+		t.Fatalf("grouped ORDER BY validation = %v, want post-finalization sort", err)
+	}
+
+	nonlocalLimit, err := snap.Prepare(context.Background(),
+		`SELECT n, COUNT(*) FROM messages GROUP BY n ORDER BY n LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare nonlocal grouped LIMIT: %v", err)
+	}
+	nonlocalLimitBound, err := nonlocalLimit.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind nonlocal grouped LIMIT: %v", err)
+	}
+	if err := nonlocalLimitBound.ValidateRoute(routeBoundPlan(t, nonlocalLimitBound)); !errors.Is(err, ErrDistributedPlanUnsupported) {
+		t.Fatalf("nonlocal grouped LIMIT validation = %v, want fragment-rewrite refusal", err)
+	}
+
+	localLimit, err := snap.Prepare(context.Background(),
+		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare shard-local grouped LIMIT: %v", err)
+	}
+	localLimitBound, err := localLimit.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind shard-local grouped LIMIT: %v", err)
+	}
+	if !localLimitBound.groupsLocal {
+		t.Fatal("placement-key GROUP BY was not recognized as shard-local")
+	}
+	if err := localLimitBound.ValidateRoute(routeBoundPlan(t, localLimitBound)); err != nil {
+		t.Fatalf("shard-local grouped LIMIT validation = %v", err)
 	}
 
 	missingKey, err := snap.Prepare(context.Background(),

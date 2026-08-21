@@ -25,6 +25,7 @@ type distributedPrivate struct {
 	order       []OrderKey
 	aggregates  []bootstrap.AggKind
 	groupKeys   []int
+	limit       int
 	indexLookup bool
 }
 
@@ -185,13 +186,20 @@ func (m *distributedCostModel) Enforcers(
 	}
 	if provided.Distribution.Kind == queryplanner.DistributionSingleton &&
 		!orderingPrefix(provided.Ordering, required.Ordering) {
+		op := queryplanner.OpSort
+		cpuRows, memoryRows := rows, rows
+		if metadata, ok := m.private[1]; ok && len(metadata.groupKeys) != 0 && metadata.limit > 0 {
+			op = queryplanner.OpTopK
+			memoryRows = min(rows, float64(metadata.limit))
+			cpuRows = max(2, memoryRows)
+		}
 		return []queryplanner.EnforcerChain{{{
-			Op: queryplanner.OpSort,
+			Op: op,
 			Provided: queryplanner.PhysicalProperties{
 				Distribution: provided.Distribution, Ordering: required.Ordering,
 			},
 			Cost: queryplanner.Cost{
-				CPU: boundedProduct(rows, math.Log2(max(2, rows))), Memory: boundedProduct(rows, width),
+				CPU: boundedProduct(rows, math.Log2(cpuRows)), Memory: boundedProduct(memoryRows, width),
 			},
 		}}}, nil
 	}
@@ -277,6 +285,7 @@ func optimizeDistributedAccessPlan(
 		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates, groupKeys: bound.groupKeys,
+		limit:       bound.limit,
 		indexLookup: indexLookup,
 	}
 	if bound.limit > 0 && len(bound.aggregates) == 0 {
@@ -352,7 +361,7 @@ func optimizeDistributedAccessPlan(
 	required := queryplanner.PhysicalProperties{
 		Distribution: queryplanner.Distribution{Kind: queryplanner.DistributionSingleton, Partitions: 1},
 	}
-	if len(bound.aggregates) == 0 {
+	if len(bound.aggregates) == 0 || len(bound.groupKeys) != 0 {
 		required.Ordering = plannerOrdering(bound.order)
 	}
 	optimizer := queryplanner.Optimizer{

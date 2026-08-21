@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -118,6 +119,22 @@ func BenchmarkMergeGroupedPartialAggregates1K(b *testing.B) {
 		_, rows, err := mergeGroupedAggregateRows(results, kinds, []int{0}, 64<<20)
 		if err != nil || len(rows) != groups {
 			b.Fatalf("merge = %d rows, %v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkGroupedTopK10From10K(b *testing.B) {
+	const rowsCount = 10_000
+	rows := make([][]shardservice.Cell, rowsCount)
+	for row := range rows {
+		rows[row] = []shardservice.Cell{cell(strconv.Itoa(rowsCount - row))}
+	}
+	order := []OrderKey{{Column: 0}}
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := finalizeGroupedRows(rows, order, 10, 64<<20)
+		if err != nil || len(out) != 10 {
+			b.Fatalf("top-k = %d rows, %v", len(out), err)
 		}
 	}
 }
@@ -381,6 +398,53 @@ func TestMergeGroupedAggregateIntegerPromotionAndKeyOnlyDedup(t *testing.T) {
 	)
 	if err != nil || len(rows) != 1 || string(rows[0][0].Bytes) != "1" {
 		t.Fatalf("key-only grouped dedup = %+v, %v", rows, err)
+	}
+}
+
+func TestFinalizeGroupedRowsExactSortAndTopK(t *testing.T) {
+	rows := [][]shardservice.Cell{
+		{cell("3"), cell(`"c"`)},
+		{cell("1.0"), cell(`"first"`)},
+		{cell("2"), cell(`"b"`)},
+		{cell("1"), cell(`"second"`)},
+	}
+	ordered, err := finalizeGroupedRows(rows, []OrderKey{{Column: 0}}, 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{
+		string(ordered[0][1].Bytes), string(ordered[1][1].Bytes),
+		string(ordered[2][1].Bytes), string(ordered[3][1].Bytes),
+	}; !slices.Equal(got, []string{`"first"`, `"second"`, `"b"`, `"c"`}) {
+		t.Fatalf("exact grouped order = %v", got)
+	}
+
+	top, err := finalizeGroupedRows(rows, []OrderKey{{Column: 0, Desc: true}}, 2, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top) != 2 || string(top[0][0].Bytes) != "3" || string(top[1][0].Bytes) != "2" {
+		t.Fatalf("grouped top-k = %+v", top)
+	}
+	textRows := [][]shardservice.Cell{
+		{cell(`"\u0062"`)}, {cell(`"c"`)}, {cell(`"\u0061"`)},
+	}
+	textTop, err := finalizeGroupedRows(textRows, []OrderKey{{Column: 0}}, 2, 1<<20)
+	if err != nil || len(textTop) != 2 || string(textTop[0][0].Bytes) != `"\u0061"` ||
+		string(textTop[1][0].Bytes) != `"\u0062"` {
+		t.Fatalf("escaped string grouped top-k = %+v, %v", textTop, err)
+	}
+	trimmed, err := finalizeGroupedRows(rows, nil, 2, 1<<20)
+	if err != nil || len(trimmed) != 2 || &trimmed[0][0] != &rows[0][0] {
+		t.Fatalf("unordered grouped LIMIT = %+v, %v", trimmed, err)
+	}
+
+	invalid := [][]shardservice.Cell{{cell("1x")}, {cell("2")}}
+	if _, err := finalizeGroupedRows(invalid, []OrderKey{{Column: 0}}, 0, 1<<20); !errors.Is(err, ErrMergeValue) {
+		t.Fatalf("invalid grouped sort key error = %v, want ErrMergeValue", err)
+	}
+	if _, err := finalizeGroupedRows(rows, []OrderKey{{Column: 0}}, 0, 1); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("grouped sort state cap error = %v, want ErrMergeAggregate", err)
 	}
 }
 

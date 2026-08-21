@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -95,6 +96,11 @@ type cellValue struct {
 // classifyCell decodes one wire cell into a comparable value under the query's
 // total order. An explicit null cell and a null literal are one value.
 func classifyCell(c shardservice.Cell) cellValue {
+	var text []byte
+	return classifyCellInto(c, &text)
+}
+
+func classifyCellInto(c shardservice.Cell, text *[]byte) cellValue {
 	if c.Null {
 		return cellValue{kind: ckNull, valid: true}
 	}
@@ -117,9 +123,11 @@ func classifyCell(c shardservice.Cell) cellValue {
 		if value, clean := raw.StringBytes(); clean {
 			return cellValue{kind: ckString, sval: value, valid: true}
 		}
-		value, ok, err := raw.AppendText(nil)
+		mark := len(*text)
+		value, ok, err := raw.AppendText(*text)
 		if err == nil && ok {
-			return cellValue{kind: ckString, sval: value, valid: true}
+			*text = value
+			return cellValue{kind: ckString, sval: value[mark:], valid: true}
 		}
 		return cellValue{kind: ckString, valid: false, raw: b}
 	case jsondoc.Number:
@@ -237,6 +245,234 @@ func compareHeads(a, b *shardRun, order []OrderKey) int {
 		}
 	}
 	return 0
+}
+
+type groupedSortEntry struct {
+	row     []shardservice.Cell
+	keys    []cellValue
+	text    []byte
+	ordinal int
+}
+
+func compareGroupedSortEntries(a, b *groupedSortEntry, order []OrderKey) int {
+	for key := range order {
+		comparison := compareCells(a.keys[key], b.keys[key])
+		if order[key].Desc {
+			comparison = -comparison
+		}
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	switch {
+	case a.ordinal < b.ordinal:
+		return -1
+	case a.ordinal > b.ordinal:
+		return 1
+	default:
+		return 0
+	}
+}
+
+type groupedTopKHeap struct {
+	entries []groupedSortEntry
+	order   []OrderKey
+}
+
+func (h groupedTopKHeap) Len() int { return len(h.entries) }
+func (h groupedTopKHeap) Less(i, j int) bool {
+	// Reverse the requested order so the worst retained row is the root.
+	return compareGroupedSortEntries(&h.entries[i], &h.entries[j], h.order) > 0
+}
+func (h groupedTopKHeap) Swap(i, j int) { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
+func (h *groupedTopKHeap) Push(value any) {
+	h.entries = append(h.entries, value.(groupedSortEntry))
+}
+func (h *groupedTopKHeap) Pop() any {
+	last := len(h.entries) - 1
+	value := h.entries[last]
+	h.entries = h.entries[:last]
+	return value
+}
+
+// finalizeGroupedRows applies the coordinator-only stage after exact grouped
+// aggregation. ORDER BY with a strict LIMIT retains only K decoded key tuples;
+// ORDER BY without LIMIT performs one bounded full sort. LIMIT without order
+// trims stable first-appearance order without allocating.
+func finalizeGroupedRows(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	limit int,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	if limit < 0 {
+		return nil, fmt.Errorf("%w: grouped LIMIT is negative", ErrMergeAggregate)
+	}
+	if len(order) == 0 {
+		if limit > 0 && limit < len(rows) {
+			return rows[:limit], nil
+		}
+		return rows, nil
+	}
+	for _, key := range order {
+		if key.Column < 0 || (len(rows) != 0 && key.Column >= len(rows[0])) {
+			return nil, ErrMergeColumn
+		}
+	}
+	if len(rows) < 2 {
+		return rows, nil
+	}
+	if limit > 0 && limit < len(rows) {
+		return groupedTopK(rows, order, limit, maxBytes)
+	}
+	return groupedFullSort(rows, order, maxBytes)
+}
+
+func groupedTopK(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	limit int,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	maxText := 0
+	for _, row := range rows {
+		maxText = max(maxText, groupedEscapedTextBytes(row, order))
+	}
+	if err := admitGroupedSortState(limit+1, len(order), maxText, maxBytes); err != nil {
+		return nil, err
+	}
+	keySlab := make([]cellValue, (limit+1)*len(order))
+	h := &groupedTopKHeap{
+		entries: make([]groupedSortEntry, limit), order: order,
+	}
+	for row := 0; row < limit; row++ {
+		h.entries[row].keys = keySlab[row*len(order) : (row+1)*len(order)]
+		if err := prepareGroupedSortEntry(&h.entries[row], rows[row], order, row); err != nil {
+			return nil, err
+		}
+	}
+	heap.Init(h)
+	candidate := groupedSortEntry{keys: keySlab[limit*len(order):]}
+	for row := limit; row < len(rows); row++ {
+		if err := prepareGroupedSortEntry(&candidate, rows[row], order, row); err != nil {
+			return nil, err
+		}
+		if compareGroupedSortEntries(&candidate, &h.entries[0], order) >= 0 {
+			continue
+		}
+		displaced := h.entries[0]
+		h.entries[0] = candidate
+		candidate = displaced
+		heap.Fix(h, 0)
+	}
+	slices.SortFunc(h.entries, func(a, b groupedSortEntry) int {
+		return compareGroupedSortEntries(&a, &b, order)
+	})
+	out := make([][]shardservice.Cell, limit)
+	for row := range out {
+		out[row] = h.entries[row].row
+	}
+	return out, nil
+}
+
+func groupedFullSort(
+	rows [][]shardservice.Cell,
+	order []OrderKey,
+	maxBytes uint64,
+) ([][]shardservice.Cell, error) {
+	totalText := 0
+	for _, row := range rows {
+		text := groupedEscapedTextBytes(row, order)
+		if totalText > int(^uint(0)>>1)-text {
+			return nil, fmt.Errorf("%w: grouped sort text accounting overflow", ErrMergeAggregate)
+		}
+		totalText += text
+	}
+	if err := admitGroupedSortState(len(rows), len(order), totalText, maxBytes); err != nil {
+		return nil, err
+	}
+	entries := make([]groupedSortEntry, len(rows))
+	keySlab := make([]cellValue, len(rows)*len(order))
+	text := make([]byte, 0, totalText)
+	for row := range rows {
+		entries[row] = groupedSortEntry{
+			row: rows[row], keys: keySlab[row*len(order) : (row+1)*len(order)], ordinal: row,
+		}
+		for key := range order {
+			entries[row].keys[key] = classifyCellInto(rows[row][order[key].Column], &text)
+			if !entries[row].keys[key].valid {
+				return nil, fmt.Errorf("%w: grouped row %d column %d", ErrMergeValue, row, order[key].Column)
+			}
+		}
+	}
+	slices.SortFunc(entries, func(a, b groupedSortEntry) int {
+		return compareGroupedSortEntries(&a, &b, order)
+	})
+	out := make([][]shardservice.Cell, len(rows))
+	for row := range out {
+		out[row] = entries[row].row
+	}
+	return out, nil
+}
+
+func prepareGroupedSortEntry(
+	entry *groupedSortEntry,
+	row []shardservice.Cell,
+	order []OrderKey,
+	ordinal int,
+) error {
+	textBytes := groupedEscapedTextBytes(row, order)
+	if cap(entry.text) < textBytes {
+		entry.text = make([]byte, 0, textBytes)
+	} else {
+		entry.text = entry.text[:0]
+	}
+	entry.row, entry.ordinal = row, ordinal
+	for key := range order {
+		entry.keys[key] = classifyCellInto(row[order[key].Column], &entry.text)
+		if !entry.keys[key].valid {
+			return fmt.Errorf("%w: grouped row %d column %d", ErrMergeValue, ordinal, order[key].Column)
+		}
+	}
+	return nil
+}
+
+func groupedEscapedTextBytes(row []shardservice.Cell, order []OrderKey) int {
+	total := 0
+	for _, key := range order {
+		cell := row[key.Column]
+		if !cell.Null && len(cell.Bytes) >= 2 && cell.Bytes[0] == '"' &&
+			bytes.IndexByte(cell.Bytes, '\\') >= 0 {
+			total += len(cell.Bytes)
+		}
+	}
+	return total
+}
+
+func admitGroupedSortState(rows, keys, textBytes int, maxBytes uint64) error {
+	if rows < 0 || keys < 0 || textBytes < 0 {
+		return fmt.Errorf("%w: grouped sort state is invalid", ErrMergeAggregate)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if keys != 0 && rows > maxInt/keys {
+		return fmt.Errorf("%w: grouped sort key cardinality overflows address space", ErrMergeAggregate)
+	}
+	perRow := uint64(48)
+	if keys != 0 {
+		if uint64(keys) > (^uint64(0)-perRow)/96 {
+			return fmt.Errorf("%w: grouped sort state accounting overflow", ErrMergeAggregate)
+		}
+		perRow += uint64(keys) * 96
+	}
+	if uint64(rows) > (^uint64(0)-uint64(textBytes))/perRow {
+		return fmt.Errorf("%w: grouped sort state accounting overflow", ErrMergeAggregate)
+	}
+	stateBytes := uint64(rows)*perRow + uint64(textBytes)
+	if maxBytes != 0 && stateBytes > maxBytes {
+		return fmt.Errorf("%w: grouped sort state %d bytes exceeds %d-byte cap",
+			ErrMergeAggregate, stateBytes, maxBytes)
+	}
+	return nil
 }
 
 // mergeRows combines the shard responses into one ordered result. With no order

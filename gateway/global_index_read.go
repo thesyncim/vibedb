@@ -130,7 +130,8 @@ func (e *Executor) queryGlobalIndex(
 				cause: ErrDistributedPlanUnsupported,
 			}
 		}
-		plan := &plan{aggregates: bound.aggregates, groupKeys: bound.groupKeys, aggHeaders: bound.aggHeaders}
+		plan := &plan{aggregates: bound.aggregates, groupKeys: bound.groupKeys,
+			aggHeaders: bound.aggHeaders}
 		if len(bound.aggregates) != 0 {
 			return globalIndexExecution{result: emptyAggregateResult(plan)}, nil
 		}
@@ -211,7 +212,8 @@ func (e *Executor) queryGlobalIndex(
 					cause: ErrDistributedPlanUnsupported,
 				}
 			}
-			plan := &plan{aggregates: bound.aggregates, groupKeys: bound.groupKeys, aggHeaders: bound.aggHeaders}
+			plan := &plan{aggregates: bound.aggregates, groupKeys: bound.groupKeys,
+				aggHeaders: bound.aggHeaders}
 			result := &Result{Kind: shardservice.ResponseRows}
 			if len(bound.aggregates) != 0 {
 				result = emptyAggregateResult(plan)
