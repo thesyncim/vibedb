@@ -286,7 +286,8 @@ embedded facade:
   dispatches bounded, leader-only, explicitly read-only queries to the shards;
 - a bounded Cascades-style optimizer core (`planner`) with memoized rules,
   required physical properties, distributed exchanges, multidimensional costs,
-  compact generation-pinned statistics, and deterministic planning metrics;
+  compact generation-pinned statistics, byte-native `vibejson` scalar bounds,
+  and deterministic planning metrics;
 - the frozen placement scalar and tuple codec (`distribution`) used as
   cross-shard routing identity; and
 - the `cmd/vibedb-shard` and `cmd/vibedb-gateway` binaries that run the server

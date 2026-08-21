@@ -95,7 +95,10 @@ The gateway's query operation accepts explicitly read-only SQL and typed
 parameters. Parameter payloads are byte-native across the gateway/shard wire:
 exact numbers remain `vibejson` raw values, and strings and documents remain
 borrowed bytes, avoiding `encoding/json` and intermediate Go strings in routing,
-merge-key decoding, and shard binding. One query
+statistics-bound encoding, merge-key decoding, and shard binding. Ordered
+multi-shard merge validates each numeric cell once, then uses the query
+engine's exact allocation-free byte comparator directly; it does not
+canonicalize or allocate inside heap comparisons. One query
 pins one catalog generation, resolves the relevant immutable manifest, routes
 to leader endpoints, applies per-shard and operation-wide deadlines, and merges
 within configured result, memory, fan-out, and concurrency limits.

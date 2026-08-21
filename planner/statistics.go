@@ -2,7 +2,6 @@ package planner
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -11,6 +10,9 @@ import (
 	"strings"
 	"unicode/utf8"
 	"unsafe"
+
+	vibejson "github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 var ErrInvalidStatistics = errors.New("planner: invalid statistics")
@@ -404,46 +406,50 @@ func finiteFraction(value float64) bool {
 	return finiteNonNegative(value) && value <= 1
 }
 
-// CanonicalScalarJSON validates one JSON scalar and returns a stable spelling.
-// Equal numbers share one normalized scientific representation and strings use
-// encoding/json's canonical escaping. Catalog publication uses this before
-// duplicate detection, so spelling variants cannot create duplicate skew keys.
+// CanonicalScalarJSON is the string compatibility boundary for
+// [AppendCanonicalScalarJSON]. New request paths should retain byte ownership
+// and call the append form directly.
 func CanonicalScalarJSON(value string) (string, error) {
-	if value == "" || !utf8.ValidString(value) {
-		return "", errors.New("value is empty or invalid UTF-8")
-	}
-	value = trimJSONSpace(value)
-	if value == "" {
-		return "", errors.New("value is empty JSON")
+	encoded, err := AppendCanonicalScalarJSON(nil, byteview.Bytes(value))
+	return string(encoded), err
+}
+
+// AppendCanonicalScalarJSON validates one JSON scalar and appends its stable
+// spelling to dst. Equal numbers share one normalized scientific spelling and
+// strings are decoded and re-escaped directly from vibejson's validated byte
+// stream, without an intermediate Go string.
+func AppendCanonicalScalarJSON(dst, value []byte) ([]byte, error) {
+	value = trimJSONSpaceBytes(value)
+	if len(value) == 0 {
+		return dst, errors.New("value is empty JSON")
 	}
 	switch value[0] {
 	case 'n':
-		if value != "null" {
-			return "", fmt.Errorf("value %q is not JSON null", value)
+		if !bytes.Equal(value, []byte("null")) {
+			return dst, errors.New("value is not JSON null")
 		}
-		return "null", nil
+		return append(dst, "null"...), nil
 	case 't', 'f':
-		if value != "true" && value != "false" {
-			return "", fmt.Errorf("value %q is not a JSON boolean", value)
+		if !bytes.Equal(value, []byte("true")) && !bytes.Equal(value, []byte("false")) {
+			return dst, errors.New("value is not a JSON boolean")
 		}
-		return value, nil
+		return append(dst, value...), nil
 	case '"':
-		var scalar string
-		if err := json.Unmarshal([]byte(value), &scalar); err != nil {
-			return "", fmt.Errorf("value %q is not a JSON string: %w", value, err)
+		if !vibejson.Valid(value) || len(value) < 2 || value[len(value)-1] != '"' {
+			return dst, errors.New("value is not a JSON string")
 		}
-		return CanonicalStatisticString(scalar)
+		return appendCanonicalStatisticJSONString(dst, value[1:len(value)-1]), nil
 	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		return CanonicalStatisticNumber(value)
+		return AppendCanonicalStatisticNumber(dst, value)
 	default:
-		return "", fmt.Errorf("value %q is not a scalar", value)
+		return dst, errors.New("value is not a scalar")
 	}
 }
 
 // CanonicalStatisticString returns the canonical JSON spelling of one raw
 // UTF-8 string without reparsing an intermediate quoted representation.
 func CanonicalStatisticString(value string) (string, error) {
-	encoded, err := AppendCanonicalStatisticString(nil, value)
+	encoded, err := AppendCanonicalStatisticStringBytes(nil, byteview.Bytes(value))
 	return string(encoded), err
 }
 
@@ -451,64 +457,182 @@ func CanonicalStatisticString(value string) (string, error) {
 // dst. Callers with request-local scratch can perform a skew lookup without a
 // transient heap string.
 func AppendCanonicalStatisticString(dst []byte, value string) ([]byte, error) {
-	if !utf8.ValidString(value) {
+	return AppendCanonicalStatisticStringBytes(dst, byteview.Bytes(value))
+}
+
+// AppendCanonicalStatisticStringBytes appends the canonical JSON spelling of
+// raw UTF-8 bytes to dst. The source is borrowed and never retained.
+func AppendCanonicalStatisticStringBytes(dst, value []byte) ([]byte, error) {
+	if !utf8.Valid(value) {
 		return dst, errors.New("string is invalid UTF-8")
 	}
-	const hex = "0123456789abcdef"
 	dst = append(dst, '"')
-	for index := 0; index < len(value); {
+	for index := 0; index < len(value); index++ {
 		char := value[index]
-		if char < utf8.RuneSelf {
-			index++
-			switch char {
-			case '\\', '"':
-				dst = append(dst, '\\', char)
-			case '\b':
-				dst = append(dst, '\\', 'b')
-			case '\f':
-				dst = append(dst, '\\', 'f')
-			case '\n':
-				dst = append(dst, '\\', 'n')
-			case '\r':
-				dst = append(dst, '\\', 'r')
-			case '\t':
-				dst = append(dst, '\\', 't')
-			case '<', '>', '&':
-				dst = append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
-			default:
-				if char < 0x20 {
-					dst = append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
-				} else {
-					dst = append(dst, char)
-				}
+		if char == 0xe2 && index+2 < len(value) && value[index+1] == 0x80 &&
+			(value[index+2] == 0xa8 || value[index+2] == 0xa9) {
+			dst = appendCanonicalStatisticLineSeparator(dst, value[index+2])
+			index += 2
+			continue
+		}
+		dst = appendCanonicalStatisticByte(dst, char)
+	}
+	return append(dst, '"'), nil
+}
+
+func appendCanonicalStatisticJSONString(dst, interior []byte) []byte {
+	dst = append(dst, '"')
+	iterator := vibejson.JSONStringByteIter{Raw: interior}
+	for {
+		char, ok := iterator.Next()
+		if !ok {
+			break
+		}
+		if char == 0xe2 {
+			second, _ := iterator.Next()
+			third, _ := iterator.Next()
+			if second == 0x80 && (third == 0xa8 || third == 0xa9) {
+				dst = appendCanonicalStatisticLineSeparator(dst, third)
+			} else {
+				dst = append(dst, char, second, third)
 			}
 			continue
 		}
-		runeValue, width := utf8.DecodeRuneInString(value[index:])
-		if runeValue == '\u2028' || runeValue == '\u2029' {
-			dst = append(dst, '\\', 'u', '2', '0', '2', hex[byte(runeValue)&0xf])
-		} else {
-			dst = append(dst, value[index:index+width]...)
-		}
-		index += width
+		dst = appendCanonicalStatisticByte(dst, char)
 	}
-	return append(dst, '"'), nil
+	return append(dst, '"')
+}
+
+func appendCanonicalStatisticByte(dst []byte, char byte) []byte {
+	if char >= utf8.RuneSelf {
+		return append(dst, char)
+	}
+	const hex = "0123456789abcdef"
+	switch char {
+	case '\\', '"':
+		return append(dst, '\\', char)
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	case '<', '>', '&':
+		return append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
+	default:
+		if char < 0x20 {
+			return append(dst, '\\', 'u', '0', '0', hex[char>>4], hex[char&0xf])
+		}
+		return append(dst, char)
+	}
+}
+
+func appendCanonicalStatisticLineSeparator(dst []byte, tail byte) []byte {
+	return append(dst, '\\', 'u', '2', '0', '2', "89"[tail-0xa8])
 }
 
 // CanonicalStatisticNumber validates and canonicalizes one JSON number. It is
 // the direct path for already typed routing numbers and avoids interface-based
 // generic JSON decoding.
 func CanonicalStatisticNumber(value string) (string, error) {
-	if value == "" || !utf8.ValidString(value) {
-		return "", errors.New("number is empty or invalid UTF-8")
-	}
-	if err := validateJSONNumber(value); err != nil {
-		return "", err
-	}
-	return canonicalJSONNumber(value)
+	encoded, err := AppendCanonicalStatisticNumber(nil, byteview.Bytes(value))
+	return string(encoded), err
 }
 
-func trimJSONSpace(value string) string {
+// AppendCanonicalStatisticNumber validates one unpadded JSON number and
+// appends its normalized scientific spelling. It scans borrowed bytes and uses
+// math/big only for the unbounded decimal exponent; no intermediate strings or
+// mantissa buffers are constructed.
+func AppendCanonicalStatisticNumber(dst, value []byte) ([]byte, error) {
+	if err := validateJSONNumberBytes(value); err != nil {
+		return dst, err
+	}
+	negative := value[0] == '-'
+	mantissaStart := 0
+	if negative {
+		mantissaStart = 1
+	}
+	exponentAt := len(value)
+	pointAt := -1
+	for index := mantissaStart; index < len(value); index++ {
+		switch value[index] {
+		case '.':
+			pointAt = index
+		case 'e', 'E':
+			exponentAt = index
+			index = len(value)
+		}
+	}
+
+	first, last := -1, -1
+	for index := mantissaStart; index < exponentAt; index++ {
+		if value[index] != '.' && value[index] != '0' {
+			first = index
+			break
+		}
+	}
+	if first < 0 {
+		return append(dst, '0'), nil
+	}
+	for index := exponentAt - 1; index >= first; index-- {
+		if value[index] != '.' && value[index] != '0' {
+			last = index
+			break
+		}
+	}
+
+	fractionDigits := int64(0)
+	if pointAt >= 0 {
+		fractionDigits = int64(exponentAt - pointAt - 1)
+	}
+	trailingZeros := int64(0)
+	for index := last + 1; index < exponentAt; index++ {
+		if value[index] == '0' {
+			trailingZeros++
+		}
+	}
+	significantDigits := int64(0)
+	for index := first; index <= last; index++ {
+		if value[index] != '.' {
+			significantDigits++
+		}
+	}
+
+	var exponent big.Int
+	if exponentAt < len(value) {
+		if _, ok := exponent.SetString(byteview.String(value[exponentAt+1:]), 10); !ok {
+			return dst, errors.New("number has an invalid exponent")
+		}
+	}
+	adjustment := -fractionDigits + trailingZeros + significantDigits - 1
+	var adjustmentInteger big.Int
+	adjustmentInteger.SetInt64(adjustment)
+	exponent.Add(&exponent, &adjustmentInteger)
+
+	if negative {
+		dst = append(dst, '-')
+	}
+	dst = append(dst, value[first])
+	if significantDigits > 1 {
+		dst = append(dst, '.')
+		for index := first + 1; index <= last; index++ {
+			if value[index] != '.' {
+				dst = append(dst, value[index])
+			}
+		}
+	}
+	if exponent.Sign() != 0 {
+		dst = append(dst, 'e')
+		dst = exponent.Append(dst, 10)
+	}
+	return dst, nil
+}
+
+func trimJSONSpaceBytes(value []byte) []byte {
 	start, end := 0, len(value)
 	for start < end && isJSONSpace(value[start]) {
 		start++
@@ -523,7 +647,10 @@ func isJSONSpace(value byte) bool {
 	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
 }
 
-func validateJSONNumber(value string) error {
+func validateJSONNumberBytes(value []byte) error {
+	if len(value) == 0 {
+		return errors.New("number is empty")
+	}
 	index := 0
 	if value[index] == '-' {
 		index++
@@ -571,52 +698,6 @@ func validateJSONNumber(value string) error {
 		return errors.New("number has trailing syntax")
 	}
 	return nil
-}
-
-func canonicalJSONNumber(value string) (string, error) {
-	negative := len(value) != 0 && value[0] == '-'
-	if negative {
-		value = value[1:]
-	}
-	mantissa, exponentText := value, "0"
-	if index := strings.IndexAny(value, "eE"); index >= 0 {
-		mantissa, exponentText = value[:index], value[index+1:]
-	}
-	var exponent big.Int
-	if _, ok := exponent.SetString(exponentText, 10); !ok {
-		return "", errors.New("number has an invalid exponent")
-	}
-	fractionDigits := 0
-	if point := strings.IndexByte(mantissa, '.'); point >= 0 {
-		fractionDigits = len(mantissa) - point - 1
-		mantissa = mantissa[:point] + mantissa[point+1:]
-	}
-	digits := strings.TrimLeft(mantissa, "0")
-	if digits == "" {
-		return "0", nil
-	}
-	exponent.Sub(&exponent, big.NewInt(int64(fractionDigits)))
-	trimmed := len(digits) - len(strings.TrimRight(digits, "0"))
-	if trimmed != 0 {
-		digits = digits[:len(digits)-trimmed]
-		exponent.Add(&exponent, big.NewInt(int64(trimmed)))
-	}
-	exponent.Add(&exponent, big.NewInt(int64(len(digits)-1)))
-	var out strings.Builder
-	out.Grow(len(digits) + len(exponent.String()) + 3)
-	if negative {
-		out.WriteByte('-')
-	}
-	out.WriteByte(digits[0])
-	if len(digits) > 1 {
-		out.WriteByte('.')
-		out.WriteString(digits[1:])
-	}
-	if exponent.Sign() != 0 {
-		out.WriteByte('e')
-		out.WriteString(exponent.String())
-	}
-	return out.String(), nil
 }
 
 type canonicalStatisticNumber struct {

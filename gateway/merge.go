@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	queryplanner "github.com/thesyncim/vibedb/planner"
+	queryengine "github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	vibejson "github.com/thesyncim/vibejson"
@@ -56,6 +57,10 @@ var ErrMergeColumn = errors.New("gateway: order key column is out of range for t
 // into the wrong output columns.
 var ErrMergeSchema = errors.New("gateway: shard result schemas do not match")
 
+// ErrMergeValue reports an invalid JSON sort-key cell. Heap comparators cannot
+// return errors, so k-way merge validates every key once before heap admission.
+var ErrMergeValue = errors.New("gateway: shard result contains an invalid JSON merge key")
+
 // ErrMergeAggregate reports a malformed or non-algebraic shard aggregate
 // state. The gateway fails closed rather than treating partial states as rows.
 var ErrMergeAggregate = errors.New("gateway: shard aggregate states cannot be merged")
@@ -77,6 +82,7 @@ type cellValue struct {
 	isInt bool
 	ival  int64
 	num   []byte
+	valid bool
 	sval  []byte
 	raw   []byte
 }
@@ -85,36 +91,43 @@ type cellValue struct {
 // total order. An explicit null cell and a null literal are one value.
 func classifyCell(c shardservice.Cell) cellValue {
 	if c.Null {
-		return cellValue{kind: ckNull}
+		return cellValue{kind: ckNull, valid: true}
 	}
 	b := bytes.TrimSpace(c.Bytes)
 	if len(b) == 0 {
-		return cellValue{kind: ckNull}
+		return cellValue{kind: ckNull, valid: true}
 	}
+	valid := vibejson.Valid(b)
 	raw := vibejson.RawValue{Src: b}
 	switch raw.Kind() {
 	case jsondoc.Null:
-		return cellValue{kind: ckNull}
+		return cellValue{kind: ckNull, valid: valid}
 	case jsondoc.Bool:
 		value, _ := raw.Bool()
-		return cellValue{kind: ckBool, bval: value}
+		return cellValue{kind: ckBool, bval: value, valid: valid, raw: b}
 	case jsondoc.String:
+		if !valid {
+			return cellValue{kind: ckString, valid: false, raw: b}
+		}
 		if value, clean := raw.StringBytes(); clean {
-			return cellValue{kind: ckString, sval: value}
+			return cellValue{kind: ckString, sval: value, valid: true}
 		}
 		value, ok, err := raw.AppendText(nil)
 		if err == nil && ok {
-			return cellValue{kind: ckString, sval: value}
+			return cellValue{kind: ckString, sval: value, valid: true}
 		}
-		return cellValue{kind: ckString, sval: b}
+		return cellValue{kind: ckString, valid: false, raw: b}
 	case jsondoc.Number:
-		v := cellValue{kind: ckNumber, num: b}
+		v := cellValue{kind: ckNumber, num: b, valid: valid}
+		if !v.valid {
+			return v
+		}
 		if i, ok := raw.Int64(); ok {
 			v.isInt, v.ival = true, i
 		}
 		return v
 	default:
-		return cellValue{kind: ckContainer, raw: b}
+		return cellValue{kind: ckContainer, raw: b, valid: valid}
 	}
 }
 
@@ -140,6 +153,9 @@ func compareCells(a, b cellValue) int {
 			return 1
 		}
 	case ckNumber:
+		if !a.valid || !b.valid {
+			return bytes.Compare(a.num, b.num)
+		}
 		if a.isInt && b.isInt {
 			switch {
 			case a.ival < b.ival:
@@ -162,16 +178,7 @@ func compareCells(a, b cellValue) int {
 // decimal exponents. A short hostile value such as 1e1000000000 therefore has
 // work proportional to its spelling rather than its mathematical magnitude.
 func compareNumberSpelling(a, b []byte) int {
-	ca, erra := queryplanner.CanonicalScalarJSON(byteview.String(a))
-	cb, errb := queryplanner.CanonicalScalarJSON(byteview.String(b))
-	if erra != nil || errb != nil {
-		return bytes.Compare(a, b)
-	}
-	comparison, err := queryplanner.CompareCanonicalScalarJSON(ca, cb)
-	if err != nil {
-		return bytes.Compare(a, b)
-	}
-	return comparison
+	return queryengine.CompareValidatedJSONNumbers(a, b)
 }
 
 // shardRun is one shard's already-ordered rows plus the decoded sort keys of
@@ -345,12 +352,14 @@ func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, e
 		if cell.Null {
 			continue
 		}
-		spelling := string(bytes.TrimSpace(cell.Bytes))
-		canonical, canonicalErr := queryplanner.CanonicalScalarJSON(spelling)
-		if canonicalErr != nil || !queryplanner.CanonicalNumberFitsDecimalBytes(canonical, maxBytes) {
+		spelling := bytes.TrimSpace(cell.Bytes)
+		canonical, canonicalErr := queryplanner.AppendCanonicalScalarJSON(nil, spelling)
+		if canonicalErr != nil || len(canonical) == 0 || canonical[0] == '"' ||
+			canonical[0] == 't' || canonical[0] == 'f' || canonical[0] == 'n' ||
+			!queryplanner.CanonicalNumberFitsDecimalBytes(byteview.String(canonical), maxBytes) {
 			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q exceeds exact numeric admission", ErrMergeAggregate, cell.Bytes)
 		}
-		value, ok := new(big.Rat).SetString(canonical)
+		value, ok := new(big.Rat).SetString(byteview.String(canonical))
 		if !ok {
 			return shardservice.Cell{}, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
 		}
@@ -369,30 +378,23 @@ func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, e
 
 func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, error) {
 	var chosen shardservice.Cell
-	chosenCanonical := ""
+	var chosenNumber []byte
 	hasValue := false
 	for _, cell := range cells {
 		if cell.Null {
 			continue
 		}
 		candidate := classifyCell(cell)
-		if candidate.kind != ckNumber {
+		if candidate.kind != ckNumber || !candidate.valid {
 			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
 		}
-		canonical, err := queryplanner.CanonicalScalarJSON(string(bytes.TrimSpace(cell.Bytes)))
-		if err != nil || len(canonical) == 0 || canonical[0] == '"' || canonical == "true" || canonical == "false" || canonical == "null" {
-			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state %q is not an exact JSON number", ErrMergeAggregate, cell.Bytes)
-		}
 		if !hasValue {
-			chosen, chosenCanonical, hasValue = cell, canonical, true
+			chosen, chosenNumber, hasValue = cell, candidate.num, true
 			continue
 		}
-		comparison, err := queryplanner.CompareCanonicalScalarJSON(canonical, chosenCanonical)
-		if err != nil {
-			return shardservice.Cell{}, fmt.Errorf("%w: MIN/MAX state comparison: %v", ErrMergeAggregate, err)
-		}
+		comparison := queryengine.CompareValidatedJSONNumbers(candidate.num, chosenNumber)
 		if (maximum && comparison > 0) || (!maximum && comparison < 0) {
-			chosen, chosenCanonical = cell, canonical
+			chosen, chosenNumber = cell, candidate.num
 		}
 	}
 	if !hasValue {
@@ -494,6 +496,9 @@ func kwayMerge(results []*shardservice.ShardResponse, order []OrderKey, limit in
 					return nil, ErrMergeColumn
 				}
 				kv[k] = classifyCell(row[col])
+				if !kv[k].valid {
+					return nil, fmt.Errorf("%w: shard %d row %d column %d", ErrMergeValue, idx, r, col)
+				}
 			}
 			keys[r] = kv
 		}

@@ -71,6 +71,26 @@ func TestCompareCells(t *testing.T) {
 			}
 		})
 	}
+
+	left := classifyCell(cell("1.0000000000000000000001e1000000000"))
+	right := classifyCell(cell("9.999999999999999999999e999999999"))
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if compareCells(left, right) <= 0 {
+			panic("unexpected number order")
+		}
+	}); allocs != 0 {
+		t.Fatalf("cross-shard exact number comparison allocations = %v, want 0", allocs)
+	}
+}
+
+func BenchmarkCrossShardExactNumberCompare(b *testing.B) {
+	left := classifyCell(cell("1.0000000000000000000001e1000000000"))
+	right := classifyCell(cell("9.999999999999999999999e999999999"))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(left.num) + len(right.num)))
+	for b.Loop() {
+		_ = compareCells(left, right)
+	}
 }
 
 // decodeInts decodes a single-column integer result into its int64 sequence.
@@ -176,6 +196,16 @@ func TestMergeRejectsBadOrderColumn(t *testing.T) {
 	}
 }
 
+func TestMergeRejectsInvalidJSONOrderKeyBeforeHeapAdmission(t *testing.T) {
+	_, _, err := mergeRows(
+		[]*shardservice.ShardResponse{rowsOf("1.5"), rowsOf("1x")},
+		[]OrderKey{{Column: 0}}, 0,
+	)
+	if !errors.Is(err, ErrMergeValue) {
+		t.Fatalf("invalid merge key error = %v, want ErrMergeValue", err)
+	}
+}
+
 func aggregateResponse(values ...shardservice.Cell) *shardservice.ShardResponse {
 	columns := make([]shardservice.Column, len(values))
 	for i := range columns {
@@ -239,6 +269,14 @@ func TestMergeAggregateNullAndMalformedStates(t *testing.T) {
 		sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
 	}, 1024); !errors.Is(err, ErrMergeAggregate) {
 		t.Fatalf("malformed extrema error = %v, want ErrMergeAggregate", err)
+	}
+	malformedNumber := []*shardservice.ShardResponse{
+		aggregateResponse(cell("1"), cell("1"), cell("1x"), cell("1")),
+	}
+	if _, _, err := mergeAggregateRows(malformedNumber, []sqlast.AggKind{
+		sqlast.AggCount, sqlast.AggSum, sqlast.AggMin, sqlast.AggMax,
+	}, 1024); !errors.Is(err, ErrMergeAggregate) {
+		t.Fatalf("malformed numeric extrema error = %v, want ErrMergeAggregate", err)
 	}
 }
 

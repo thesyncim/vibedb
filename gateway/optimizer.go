@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	bootstrap "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // distributedPrivate is immutable metadata behind one memo PrivateID. The
@@ -503,15 +504,12 @@ func appendBoundStatisticScalar(dst []byte, value distribution.Scalar) ([]byte, 
 	switch value.Kind() {
 	case distribution.KindString:
 		raw, _ := value.StringValue()
-		canonical, err := queryplanner.AppendCanonicalStatisticString(dst, raw)
+		canonical, err := queryplanner.AppendCanonicalStatisticStringBytes(dst, byteview.Bytes(raw))
 		return canonical, err == nil
 	case distribution.KindNumber:
 		spelling, _ := value.NumberSpelling()
-		canonical, err := queryplanner.CanonicalStatisticNumber(spelling)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, canonical...), true
+		canonical, err := queryplanner.AppendCanonicalStatisticNumber(dst, byteview.Bytes(spelling))
+		return canonical, err == nil
 	default:
 		return dst, false
 	}

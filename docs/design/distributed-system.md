@@ -150,7 +150,12 @@ reclaiming an old incarnation.
 Statistics are collected per bucket range and merged into bounded catalog
 sketches. Planning accounts for selectivity, covering width, base-fetch fanout,
 skew, hot keys, network bytes, memory, and spill. Statistics never sit on the
-foreground mutation path.
+foreground mutation path. Publication and request-bound encoding are
+byte-native: `vibejson` validates and decodes canonical scalar strings directly
+into caller scratch, and numeric bounds normalize from borrowed exact spellings
+without stdlib JSON or intermediate mantissa strings. Ordered cross-shard
+number merges validate once per cell and compare exact arbitrary exponents
+without allocation inside the heap.
 
 ## Analytical lane
 
@@ -266,7 +271,9 @@ cluster does not fork into named protocol generations.
    ordered secondary-index range masks are present. Compact catalog-persisted
    scalar min/max summaries now prune non-indexed primary stripes through the
    local durable query path; cluster-wide build orchestration and richer
-   bounded skip structures remain pending.
+   bounded skip structures remain pending. Distributed statistics bounds and
+   numeric merge keys are byte-native and allocation-free in their warmed hot
+   loops.
 5. **Partly serving:** shard-local execution already has bounded parallel
    batches, filter-first/lazy projection, exact-index pushdown, covering
    aggregates, adaptive joins, and spill. Distributed vectorized stage

@@ -64,6 +64,12 @@ allocation-free. Canonical JSON scalar comparison makes numeric spelling
 variants share one statistical identity. Missing or stale data produces
 conservative estimates, never a semantic shortcut.
 
+Statistics publication and request-bound construction use byte-native append
+APIs. `vibejson` validates and streams decoded JSON strings directly into the
+canonical arena, while exact numbers normalize from borrowed spellings without
+an intermediate mantissa or Go string. String-returning helpers remain cold
+compatibility boundaries rather than distributed request-path dependencies.
+
 ## Current distributed execution
 
 One gateway attempt pins one routing/statistics generation. The constraint
@@ -107,6 +113,9 @@ report both skipped stripes and their logical row count.
 `SUM` uses exact rational arithmetic and emits a finite canonical JSON decimal.
 `MIN` and `MAX` compare exact values and preserve a contributing spelling.
 Every shard aggregate must return exactly one row with the expected schema.
+Non-integral `MergeGather` keys and numeric `MIN`/`MAX` states share the query
+engine's exact arbitrary-exponent byte comparator; the merge heap performs no
+number canonicalization, float conversion, or allocation.
 
 The gateway refuses:
 
