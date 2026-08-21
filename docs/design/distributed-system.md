@@ -127,8 +127,16 @@ and mutable ownership coordinates. Recovery verifies the full retained chain.
 The source closes the final write gap with a terminal ownership-fence entry.
 All mutable serving coordinates advance together, every child persists the
 corresponding empty batch, and certification reconstructs that capture entry
-and matches every durable child cursor. A fixed-size checksum-protected
-certificate records the exact cut but deliberately grants no serving authority.
+and matches every durable child cursor. Each destination also scans and hashes
+its complete ordered final image; reopen verifies the same proof. A fixed-size
+checksum-protected certificate binds those non-retained child images and the
+exact cut but deliberately grants no serving authority.
+
+A sealed destination can be converted in place into the standard
+replicated-state snapshot base. The conversion validates the final image with
+the child's mutation contract, writes only the hidden state row, and does not
+rewrite user rows. The independent child Raft runtime must still install that
+small base before the child is eligible to serve.
 
 Retained cleanup never deletes storage behind Raft. It checkpoints bounded
 ordered batches, submits them as normal replicated deletes at the post-seal
@@ -170,7 +178,9 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/rangesplit/cutover.go`
+- `internal/rangesplit/stage_image.go` and `activate.go`
 - `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`
+- `internal/replicatedstate/staged_snapshot.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

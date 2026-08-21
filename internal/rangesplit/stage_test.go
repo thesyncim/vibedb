@@ -288,6 +288,11 @@ func TestChildStagePersistsTerminalOwnershipSeal(t *testing.T) {
 		cursor.LastBatchDigest() != sealedBatch.Digest {
 		t.Fatalf("cursor=%+v sealed=%+v", cursor, sealed)
 	}
+	imageRows, imageBytes, imageDigest, imageOK := cursor.ImageProof()
+	if !imageOK || imageRows != collection.Len() || imageBytes == 0 ||
+		imageDigest == ([32]byte{}) {
+		t.Fatalf("image rows=%d bytes=%d digest=%x ok=%v", imageRows, imageBytes, imageDigest, imageOK)
+	}
 	if err := stage.ApplyTailBatch(sealedBatch, persist); err != nil {
 		t.Fatalf("exact sealed retry: %v", err)
 	}
@@ -309,6 +314,16 @@ func TestChildStagePersistsTerminalOwnershipSeal(t *testing.T) {
 	}
 	if err := reopened.ApplyTailBatch(ordinaryBatch, persist); !errors.Is(err, ErrChildStage) {
 		t.Fatalf("post-seal batch error=%v", err)
+	}
+	if _, err := collection.Put(
+		[]byte("foreign-after-seal"), documentForChild(t, partitioner, 1),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewChildStage(
+		partitioner, expected, collection, persisted,
+	); !errors.Is(err, ErrChildStage) {
+		t.Fatalf("changed sealed image reopen error=%v", err)
 	}
 }
 
@@ -504,9 +519,14 @@ func TestChildStageCursorStorePersistsTerminalSeal(t *testing.T) {
 		t.Fatalf("load ok=%v err=%v", ok, err)
 	}
 	sealed, err := OpenChildStageCursor(raw)
-	if err != nil || sealed.Phase() != ChildStageSealed ||
-		sealed.SourceCut().RouteGeneration != set.Partition.RouteGeneration+1 {
-		t.Fatalf("sealed=%+v err=%v", sealed, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, bytesCount, imageDigest, imageOK := sealed.ImageProof()
+	if sealed.Phase() != ChildStageSealed ||
+		sealed.SourceCut().RouteGeneration != set.Partition.RouteGeneration+1 ||
+		!imageOK || rows != 0 || bytesCount != 0 || imageDigest == ([32]byte{}) {
+		t.Fatalf("sealed=%+v", sealed)
 	}
 	if err := store.Persist(raw); err != nil {
 		t.Fatalf("sealed exact retry: %v", err)

@@ -68,8 +68,13 @@ the complete digest and publication chain before capture resumes.
 The final source gap closes with one captured ownership-fence entry. It advances
 ownership epoch, routing version, and route generation together and carries no
 row changes. Every child persists the exact empty batch and enters a terminal
-sealed phase. Certification rereads and verifies that capture record, recomputes
-all child batch digests, and refuses a source head that advanced past the seal.
+sealed phase. Sealing hashes the complete ordered child image; reopening a
+sealed stage rescans it and rejects changed files. Certification rereads and
+verifies the capture record, recomputes all child batch digests, binds every
+non-retained image digest, and refuses a source head that advanced past the
+seal. A sealed stage can initialize the standard replicated-state snapshot base
+in place without rewriting user rows. Raft must install that base before
+serving activation.
 
 The resulting certificate does not publish the catalog. Retained cleanup is a
 bounded, resumable sequence of ordinary replicated deletes; it checkpoints a
@@ -99,3 +104,4 @@ boundary.
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/rangesplit/cutover.go`
+- `internal/rangesplit/stage_image.go` and `activate.go`

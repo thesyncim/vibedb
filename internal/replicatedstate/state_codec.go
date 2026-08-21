@@ -32,6 +32,10 @@ const (
 	RecordNormal         RecordKind = 2
 	RecordConfiguration  RecordKind = 3
 	RecordOwnership      RecordKind = 4
+	// RecordImportedSnapshot anchors an independently bootstrapped shard at a
+	// certified staged image. Its synthetic entry digest becomes the prefix for
+	// every later local Raft apply.
+	RecordImportedSnapshot RecordKind = 5
 )
 
 // State is the exact durable publication stored at the fixed state key.
@@ -232,6 +236,12 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
 			state.ReplicaSetVersion >= state.Applied {
 			return fmt.Errorf("%w: ownership entry type", ErrStateCorrupt)
+		}
+	case RecordImportedSnapshot:
+		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
+			state.ReplicaSetVersion >= state.Applied || state.CompletionCount != 0 ||
+			state.LastEntryDigest == ([sha256.Size]byte{}) {
+			return fmt.Errorf("%w: imported snapshot state", ErrStateCorrupt)
 		}
 	default:
 		return fmt.Errorf("%w: record kind", ErrStateCorrupt)

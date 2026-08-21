@@ -142,7 +142,12 @@ atomic file replacement on Unix. An optional replicated-state capture writes
 each exact before-and-after transition in the same durable
 transaction as its source publication. A terminal ownership-fence entry must
 advance all mutable serving coordinates together; every child durably records
-its empty seal batch before a fixed-size cutover certificate can be issued.
+its empty seal batch, scans and hashes its complete ordered final image, and
+rechecks that image on reopen before a fixed-size cutover certificate can be
+issued. The certificate binds every non-retained child image. A sealed stage
+can initialize the standard replicated-state snapshot base in place without a
+second durable user-row copy; the Raft runtime must still install that base
+before the child can serve.
 The certificate is evidence, not topology authority. Retained cleanup plans
 bounded ordered key batches, checkpoints each batch before proposal, and
 confirms only the exact atomically captured replicated deletes. A final fresh

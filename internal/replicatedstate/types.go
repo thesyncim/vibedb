@@ -61,6 +61,7 @@ var (
 	ErrSnapshotStageIncomplete     = errors.New("replicatedstate: snapshot staging is incomplete")
 	ErrSnapshotStageOutcomeUnknown = errors.New("replicatedstate: snapshot staging durability outcome is unknown")
 	ErrSnapshotBase                = errors.New("replicatedstate: invalid snapshot base certificate")
+	ErrStagedSnapshot              = errors.New("replicatedstate: invalid staged snapshot initialization")
 	ErrOwnershipTransition         = errors.New("replicatedstate: invalid ownership transition")
 )
 

@@ -284,10 +284,14 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 			return false
 		}
 		if next.phase == ChildStageTail {
-			return next.routeGeneration == current.routeGeneration
+			return next.routeGeneration == current.routeGeneration &&
+				next.imageRows == 0 && next.imageBytes == 0 &&
+				next.imageDigest == ([32]byte{})
 		}
 		return current.routeGeneration != ^uint64(0) &&
-			next.routeGeneration == current.routeGeneration+1
+			next.routeGeneration == current.routeGeneration+1 &&
+			next.imageDigest != ([32]byte{}) &&
+			(next.imageRows != 0 || next.imageBytes == 0)
 	case ChildStageSealed:
 		return false
 	default:

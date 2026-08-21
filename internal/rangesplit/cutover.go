@@ -15,8 +15,8 @@ var ErrCutoverCertificate = errors.New("rangesplit: invalid cutover certificate"
 
 const (
 	cutoverCertificateFormat = uint16(1)
-	cutoverCertificateBytes  = 448
-	cutoverCertificateBody   = 416
+	cutoverCertificateBytes  = 544
+	cutoverCertificateBody   = 512
 )
 
 var (
@@ -37,6 +37,7 @@ type CutoverCertificate struct {
 	coordinates TailSourceCoordinates
 	childBases  [autosplit.MaxSplitChildren][sha256.Size]byte
 	sealBatches [autosplit.MaxSplitChildren][sha256.Size]byte
+	childImages [autosplit.MaxSplitChildren][sha256.Size]byte
 	digest      [sha256.Size]byte
 }
 
@@ -85,6 +86,15 @@ func (c CutoverCertificate) SealBatchDigest(child int) ([sha256.Size]byte, bool)
 	return c.sealBatches[child], true
 }
 
+// ChildImageDigest returns the terminal ordered image identity for one
+// non-retained child. The retained child is certified after source pruning.
+func (c CutoverCertificate) ChildImageDigest(child int) ([sha256.Size]byte, bool) {
+	if child < 0 || child >= int(c.childCount) || child == int(c.retained) {
+		return [sha256.Size]byte{}, false
+	}
+	return c.childImages[child], true
+}
+
 // CertifyCutover reconstructs the terminal capture record, recomputes every
 // child seal batch, and requires each non-retained stage to have durably
 // persisted that exact batch at the exact terminal source cut.
@@ -109,7 +119,8 @@ func (p *Partitioner) CertifyCutover(
 			stage.planDigest != p.digest || stage.placementDigest != p.program.Digest() ||
 			stage.artifactDigest != cursor.childBaseDigests[child] ||
 			stage.SourceCut() != cursor.SourceCut() ||
-			stage.lastBatchDigest == ([sha256.Size]byte{}) {
+			stage.lastBatchDigest == ([sha256.Size]byte{}) ||
+			stage.imageDigest == ([sha256.Size]byte{}) {
 			return CutoverCertificate{}, ErrCutoverCertificate
 		}
 		workspace.stages[child] = stage
@@ -186,6 +197,11 @@ func (p *Partitioner) CertifyCutover(
 		plan: p.digest, placement: p.program.Digest(), cut: cursor.SourceCut(),
 		coordinates: cursor.coordinates(), childBases: cursor.childBaseDigests,
 		sealBatches: workspace.batches,
+	}
+	for child := 0; child < int(p.childCount); child++ {
+		if child != int(p.retained) {
+			certificate.childImages[child] = workspace.stages[child].imageDigest
+		}
 	}
 	certificate.digest = cutoverDigest(&certificate, workspace)
 	return certificate, nil
@@ -267,6 +283,7 @@ func OpenCutoverCertificate(raw []byte) (*CutoverCertificate, error) {
 	for child := 0; child < autosplit.MaxSplitChildren; child++ {
 		copy(certificate.childBases[child][:], raw[224+child*32:256+child*32])
 		copy(certificate.sealBatches[child][:], raw[320+child*32:352+child*32])
+		copy(certificate.childImages[child][:], raw[416+child*32:448+child*32])
 	}
 	copy(certificate.digest[:], raw[cutoverCertificateBody:cutoverCertificateBytes])
 	var workspace CutoverWorkspace
@@ -299,6 +316,7 @@ func appendCutoverBody(dst []byte, certificate *CutoverCertificate) []byte {
 	for child := 0; child < autosplit.MaxSplitChildren; child++ {
 		copy(frame[224+child*32:256+child*32], certificate.childBases[child][:])
 		copy(frame[320+child*32:352+child*32], certificate.sealBatches[child][:])
+		copy(frame[416+child*32:448+child*32], certificate.childImages[child][:])
 	}
 	return dst
 }
@@ -340,7 +358,9 @@ func validCutoverCertificate(certificate *CutoverCertificate) bool {
 	for child := 0; child < autosplit.MaxSplitChildren; child++ {
 		used := child < int(certificate.childCount)
 		if used != (certificate.childBases[child] != ([sha256.Size]byte{})) ||
-			used != (certificate.sealBatches[child] != ([sha256.Size]byte{})) {
+			used != (certificate.sealBatches[child] != ([sha256.Size]byte{})) ||
+			(used && child != int(certificate.retained)) !=
+				(certificate.childImages[child] != ([sha256.Size]byte{})) {
 			return false
 		}
 	}

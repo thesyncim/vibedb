@@ -54,6 +54,7 @@ type ChildStage struct {
 	verify          ChildArtifactVerifyWorkspace
 	validator       childArtifactWriter
 	tailVerify      TailBatchVerifyWorkspace
+	image           childStageImageWorkspace
 }
 
 // NewChildStage creates one stage with the default artifact replay bound.
@@ -106,6 +107,9 @@ func NewChildStageWithOptions(
 	}
 	if cursor != nil {
 		stage.persistedOffset = cursor.artifactOffset
+		if cursor.phase == ChildStageSealed && stage.verifySealedImage(cursor) != nil {
+			return nil, ErrChildStage
+		}
 	}
 	return stage, nil
 }
@@ -286,6 +290,9 @@ func (s *ChildStage) ApplyTailBatch(
 	next.lastBatchDigest = batch.Digest
 	if batch.beforeCoordinates() != batch.afterCoordinates() {
 		next.phase = ChildStageSealed
+		if err := s.certifySealedImage(&next); err != nil {
+			return err
+		}
 	}
 	return s.persistCursor(&next, persist)
 }

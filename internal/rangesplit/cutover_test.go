@@ -130,6 +130,14 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	if err := partitioner.VerifyCutoverCertificate(certificate); err != nil {
 		t.Fatal(err)
 	}
+	imageDigest, imageOK := certificate.ChildImageDigest(1)
+	_, _, wantImageDigest, wantImageOK := stageCursor.ImageProof()
+	if !imageOK || !wantImageOK || imageDigest != wantImageDigest {
+		t.Fatalf("certificate image=%x/%v stage=%x/%v", imageDigest, imageOK, wantImageDigest, wantImageOK)
+	}
+	if _, ok := certificate.ChildImageDigest(0); ok {
+		t.Fatal("retained child unexpectedly has a pre-prune image proof")
+	}
 	raw, err := AppendCutoverCertificate(nil, &certificate)
 	if err != nil || len(raw) != cutoverCertificateBytes {
 		t.Fatalf("encode bytes=%d err=%v", len(raw), err)
