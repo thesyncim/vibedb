@@ -350,6 +350,46 @@ func TestSaveSnapshotRejectsDurableGenerationRollback(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotAfterFencesConcurrentTopology(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, testSnapshot(t, 5)); err != nil {
+		t.Fatalf("SaveSnapshot generation 5: %v", err)
+	}
+	if err := SaveSnapshotAfter(path, 4, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("SaveSnapshotAfter stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	got, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != 5 {
+		t.Fatalf("stale CAS mutated durable generation to %d, want 5", got.Generation())
+	}
+	if err := SaveSnapshotAfter(path, 5, testSnapshot(t, 6)); err != nil {
+		t.Fatalf("SaveSnapshotAfter generation 5: %v", err)
+	}
+	got, err = LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation() != 6 {
+		t.Fatalf("durable generation = %d, want 6", got.Generation())
+	}
+}
+
+func TestSaveSnapshotAfterTreatsAbsentCatalogAsGenerationZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshotAfter(path, 1, testSnapshot(t, 2)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("SaveSnapshotAfter absent stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed CAS created catalog: %v", err)
+	}
+	if err := SaveSnapshotAfter(path, 0, testSnapshot(t, 1)); err != nil {
+		t.Fatalf("SaveSnapshotAfter generation zero: %v", err)
+	}
+}
+
 // TestSaveSnapshotConcurrentPublishersConverge proves the writer lease covers
 // the generation comparison and rename as one operation. Contending writers
 // retry only the typed lease refusal; a generation already superseded by a
@@ -1007,6 +1047,30 @@ func TestCatalogHolderPublishNewer(t *testing.T) {
 	}
 	if h.Current().Generation() != 6 {
 		t.Fatalf("current generation = %d, want 6", h.Current().Generation())
+	}
+}
+
+func TestCatalogHolderPublishAfterFencesConcurrentTopology(t *testing.T) {
+	h := NewCatalogHolder(testSnapshot(t, 5))
+	if err := h.PublishAfter(4, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationMismatch) {
+		t.Fatalf("PublishAfter stale base err=%v, want ErrCatalogGenerationMismatch", err)
+	}
+	if got := h.Current().Generation(); got != 5 {
+		t.Fatalf("stale CAS published generation %d, want 5", got)
+	}
+	if err := h.PublishAfter(5, testSnapshot(t, 6)); err != nil {
+		t.Fatalf("PublishAfter generation 5: %v", err)
+	}
+	if got := h.Current().Generation(); got != 6 {
+		t.Fatalf("current generation = %d, want 6", got)
+	}
+	if err := h.PublishAfter(6, testSnapshot(t, 6)); !errors.Is(err, ErrCatalogGenerationNotNewer) {
+		t.Fatalf("PublishAfter equal generation err=%v, want ErrCatalogGenerationNotNewer", err)
+	}
+
+	empty := NewCatalogHolder(nil)
+	if err := empty.PublishAfter(0, testSnapshot(t, 1)); err != nil {
+		t.Fatalf("PublishAfter generation zero: %v", err)
 	}
 }
 

@@ -27,6 +27,9 @@ type fakeRuntime struct {
 	readContexts        [][]byte
 	messages            []*pb.Message
 	publication         raftmodel.Publication
+	status              raftmember.RuntimeStatus
+	progress            map[uint64]raftmodel.MemberProgress
+	transfers           []uint64
 	inputErr            error
 	failure             error
 	failureOnReadyError bool
@@ -75,6 +78,20 @@ func (runtime *fakeRuntime) ReadIndex(context []byte) error {
 
 func (runtime *fakeRuntime) Publication() (raftmodel.Publication, error) {
 	return runtime.publication, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Status() (raftmember.RuntimeStatus, error) {
+	return runtime.status, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) Progress(memberID uint64) (raftmodel.MemberProgress, bool, error) {
+	progress, found := runtime.progress[memberID]
+	return progress, found, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) TransferLeader(memberID uint64) error {
+	runtime.transfers = append(runtime.transfers, memberID)
+	return runtime.inputErr
 }
 
 func (runtime *fakeRuntime) StepMessage(message *pb.Message) error {
@@ -303,6 +320,13 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	}
 	runtime := newFakeRuntime(4)
 	runtime.publication = raftmodel.Publication{Applied: 9, ReplicaSetVersion: 7}
+	runtime.status = raftmember.RuntimeStatus{
+		MemberID: runtime.identity.MemberID, LeaderID: runtime.identity.MemberID,
+		Term: 5, Commit: 9, Applied: 9,
+	}
+	runtime.progress = map[uint64]raftmodel.MemberProgress{
+		99: {Match: 9, Next: 10, RecentActive: true},
+	}
 	if err := host.addRuntime(runtime); err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +357,20 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	publication, err := host.Publication(runtime.identity.Group)
 	if err != nil || publication.Applied != 9 || publication.ReplicaSetVersion != 7 {
 		t.Fatalf("Publication = %+v, %v", publication, err)
+	}
+	status, err := host.Status(runtime.identity.Group)
+	if err != nil || status.Term != 5 || status.Commit != 9 {
+		t.Fatalf("Status = %+v, %v", status, err)
+	}
+	memberProgress, found, err := host.Progress(runtime.identity.Group, 99)
+	if err != nil || !found || memberProgress.Match != 9 || !memberProgress.RecentActive {
+		t.Fatalf("Progress = %+v, %t, %v", memberProgress, found, err)
+	}
+	if err := host.TransferLeader(runtime.identity.Group, 99); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(runtime.transfers, []uint64{99}) {
+		t.Fatalf("leader transfers = %v", runtime.transfers)
 	}
 
 	runtime.ready = []fakeReady{{

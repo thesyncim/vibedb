@@ -86,6 +86,9 @@ type memberRuntime interface {
 	ProposeConfChange(pb.ConfChangeI) error
 	ReadIndex([]byte) error
 	Publication() (raftmodel.Publication, error)
+	Status() (raftmember.RuntimeStatus, error)
+	Progress(uint64) (raftmodel.MemberProgress, bool, error)
+	TransferLeader(uint64) error
 	StepMessage(*pb.Message) error
 	Tick() error
 	Campaign() error
@@ -520,6 +523,40 @@ func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, e
 		return raftmodel.Publication{}, err
 	}
 	return group.runtime.Publication()
+}
+
+// Status returns one group's detached local Raft status.
+func (host *Host) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmember.RuntimeStatus{}, err
+	}
+	return group.runtime.Status()
+}
+
+// Progress returns one member's allocation-free replication progress from the
+// local leader.
+func (host *Host) Progress(
+	key raftmember.GroupKey,
+	memberID uint64,
+) (raftmodel.MemberProgress, bool, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmodel.MemberProgress{}, false, err
+	}
+	return group.runtime.Progress(memberID)
+}
+
+// TransferLeader synchronously admits an authorized leadership handoff. Like
+// configuration control it is not queued behind stale topology intent.
+func (host *Host) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	err = group.runtime.TransferLeader(transferee)
+	host.finishDirectControl(group, err)
+	return err
 }
 
 func (host *Host) finishDirectControl(group *groupState, controlErr error) {

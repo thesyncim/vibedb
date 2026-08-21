@@ -85,6 +85,18 @@ type DriveResult struct {
 	ReadOutcomes []raftmodel.ReadOutcome
 }
 
+// RuntimeStatus is a detached allocation-free control-plane view. It is
+// evidence only; serving authority still requires topology ownership fences.
+type RuntimeStatus struct {
+	MemberID       uint64
+	LeaderID       uint64
+	Term           uint64
+	Commit         uint64
+	Applied        uint64
+	LeadTransferee uint64
+	RaftState      raft.StateType
+}
+
 // Progressed reports whether DriveReady performed one lifecycle operation.
 func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 
@@ -301,6 +313,40 @@ func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
 		return raftmodel.Publication{}, err
 	}
 	return runtime.node.Published(), nil
+}
+
+// Status returns detached local Raft status without allocating the leader's
+// complete progress map.
+func (runtime *Runtime) Status() (RuntimeStatus, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return RuntimeStatus{}, err
+	}
+	status := runtime.node.Status()
+	return RuntimeStatus{
+		MemberID: status.ID, LeaderID: status.Lead, Term: status.GetTerm(),
+		Commit: status.GetCommit(), Applied: status.Applied,
+		LeadTransferee: status.LeadTransferee, RaftState: status.RaftState,
+	}, nil
+}
+
+// Progress returns one allocation-free detached follower progress record from
+// a local leader.
+func (runtime *Runtime) Progress(memberID uint64) (raftmodel.MemberProgress, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return raftmodel.MemberProgress{}, false, err
+	}
+	progress, found := runtime.node.Progress(memberID)
+	return progress, found, nil
+}
+
+// TransferLeader starts an explicit handoff to one configured voter. The
+// caller must drain Ready and observe Status before treating the handoff as
+// complete.
+func (runtime *Runtime) TransferLeader(transferee uint64) error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	return runtime.node.TransferLeader(transferee)
 }
 
 // StepMessage admits one ordinary, non-snapshot peer message. The message is

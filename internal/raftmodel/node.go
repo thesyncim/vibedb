@@ -58,6 +58,18 @@ type ReadyProgress struct {
 	HasSnapshot        bool
 }
 
+// MemberProgress is an allocation-free detached observation of one member in
+// the local leader's progress tracker. Found is reported separately because a
+// follower has no authoritative remote progress view.
+type MemberProgress struct {
+	Match           uint64
+	Next            uint64
+	PendingSnapshot uint64
+	Learner         bool
+	RecentActive    bool
+	FlowPaused      bool
+}
+
 // NewNode recovers a RawNode at the state machine's atomically published cut.
 // If StableStore has already advanced its snapshot past that cut, NewNode first
 // asks StateMachine to install and atomically publish the exact durable
@@ -250,6 +262,28 @@ func (n *Node) Published() Publication { return clonePublication(n.published) }
 // Status returns the allocation-free core status. It remains subject to the
 // Node's single-owner contract.
 func (n *Node) Status() raft.BasicStatus { return n.raw.BasicStatus() }
+
+// Progress returns one detached tracker record without allocating a map. It is
+// available only when the local member is leader and the member is configured.
+func (n *Node) Progress(memberID uint64) (MemberProgress, bool) {
+	if memberID == raft.None || raft.IsLocalMsgTarget(memberID) {
+		return MemberProgress{}, false
+	}
+	var result MemberProgress
+	found := false
+	n.raw.WithProgress(func(id uint64, _ raft.ProgressType, progress tracker.Progress) {
+		if id != memberID {
+			return
+		}
+		result = MemberProgress{
+			Match: progress.Match, Next: progress.Next,
+			PendingSnapshot: progress.PendingSnapshot, Learner: progress.IsLearner,
+			RecentActive: progress.RecentActive, FlowPaused: progress.IsPaused(),
+		}
+		found = true
+	})
+	return result, found
+}
 
 // HasReady reports whether CaptureReady would capture work.
 func (n *Node) HasReady() (bool, error) {
@@ -622,6 +656,32 @@ func (n *Node) Campaign() error {
 		n.recordProtocolInput(1, 0)
 	}
 	return err
+}
+
+// TransferLeader starts an explicit handoff to one configured voter. Nil means
+// the request entered RawNode's bounded input window, not that the transferee
+// has already become leader; callers must observe Status after draining Ready.
+func (n *Node) TransferLeader(transferee uint64) error {
+	if transferee == raft.None || transferee == n.id || raft.IsLocalMsgTarget(transferee) {
+		return ErrInvalidTransferee
+	}
+	status := n.raw.BasicStatus()
+	if status.RaftState != raft.StateLeader {
+		return ErrNotLeader
+	}
+	if status.LeadTransferee != raft.None && status.LeadTransferee != transferee {
+		return ErrLeaderTransferPending
+	}
+	progress, found := n.Progress(transferee)
+	if !found || progress.Learner {
+		return ErrInvalidTransferee
+	}
+	if err := n.admitProtocolInput("TransferLeader", 1, 0); err != nil {
+		return err
+	}
+	n.raw.TransferLeader(transferee)
+	n.recordProtocolInput(1, 0)
+	return nil
 }
 
 // Propose submits a normal entry. The payload is copied before the core can

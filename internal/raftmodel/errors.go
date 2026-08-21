@@ -24,6 +24,10 @@ var (
 	// ErrConfChangePending identifies configuration admission while the core has
 	// outstanding Ready/log work whose predecessor is not yet fully applied.
 	ErrConfChangePending = errors.New("raftmodel: configuration change pending")
+	// ErrLeaderTransferPending identifies a conflicting leadership handoff.
+	ErrLeaderTransferPending = errors.New("raftmodel: leader transfer pending")
+	// ErrInvalidTransferee identifies a non-voter or local transfer target.
+	ErrInvalidTransferee = errors.New("raftmodel: invalid leader transferee")
 )
 
 // Phase is the externally visible point in the synchronous Ready lifecycle.

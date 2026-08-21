@@ -990,6 +990,36 @@ func TestReadIndexWaitsForOrderedPublication(t *testing.T) {
 	}
 }
 
+func TestLeaderTransferRequiresConfiguredVoterAndExposesProgress(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	if err := node.TransferLeader(2); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("follower TransferLeader = %v", err)
+	}
+	driveCampaignWithPeer(t, node, 2)
+	progress, found := node.Progress(2)
+	if !found || progress.Learner || progress.Next == 0 {
+		t.Fatalf("peer progress = %+v, %t", progress, found)
+	}
+	if _, found := node.Progress(99); found {
+		t.Fatal("unknown member exposed progress")
+	}
+	if err := node.TransferLeader(1); !errors.Is(err, ErrInvalidTransferee) {
+		t.Fatalf("self TransferLeader = %v", err)
+	}
+	if err := node.TransferLeader(99); !errors.Is(err, ErrInvalidTransferee) {
+		t.Fatalf("unknown TransferLeader = %v", err)
+	}
+	if err := node.TransferLeader(2); err != nil {
+		t.Fatal(err)
+	}
+	if status := node.Status(); status.LeadTransferee != 2 {
+		t.Fatalf("lead transferee = %d", status.LeadTransferee)
+	}
+	if err := node.TransferLeader(3); !errors.Is(err, ErrLeaderTransferPending) {
+		t.Fatalf("conflicting TransferLeader = %v", err)
+	}
+}
+
 func TestReadIndexRejectsLeadershipChangeBeforeRelease(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
 	driveCampaignWithPeer(t, node, 2)

@@ -51,6 +51,12 @@ var ErrCatalogWriterLocked = errors.New("gateway: catalog snapshot has an active
 // generation is not strictly newer than the snapshot already on disk.
 var ErrCatalogGenerationNotNewer = errors.New("gateway: catalog generation is not newer than the durable generation")
 
+// ErrCatalogGenerationMismatch reports an exact-generation publication whose
+// observed authority differs from the generation the controller planned from.
+// It is the topology compare-and-swap fence: callers must reload and replan
+// rather than applying a valid transition over unrelated concurrent changes.
+var ErrCatalogGenerationMismatch = errors.New("gateway: catalog generation differs from the expected generation")
+
 // ErrCatalogPublishOutcomeUnknown reports that the catalog rename completed
 // but a post-publication close, unlock, or pinned parent-directory durability
 // fence failed. The generation may be visible, but retry safety and crash
@@ -610,6 +616,44 @@ func (h *CatalogHolder) PublishNewer(s *Snapshot) bool {
 	return h.publishNewerChecked(s) == nil
 }
 
+// PublishAfter atomically installs s only when the currently published
+// generation exactly equals expectedGeneration. A nil holder state is
+// generation zero. This is the in-memory half of a topology cutover CAS; it
+// prevents a controller from publishing a transition planned from stale
+// metadata even when its proposed generation is numerically newer.
+func (h *CatalogHolder) PublishAfter(expectedGeneration uint64, s *Snapshot) error {
+	if s == nil {
+		return &CatalogError{Reason: "next catalog snapshot is nil"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	cur := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if cur != nil {
+		currentGeneration = cur.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	if s.generation <= currentGeneration {
+		return fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, s.generation, currentGeneration,
+		)
+	}
+	next, err := advanceCatalogState(cur, s)
+	if err != nil {
+		return err
+	}
+	h.ptr.Store(next)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
 // publishNewerChecked is the diagnostic publication path used by catalog
 // refresh. The bool API remains convenient for optimistic callers, while a
 // topology loader must distinguish an ordinary stale generation from a newer
@@ -987,7 +1031,20 @@ func toPersisted(s *Snapshot) persistedCatalog {
 // The serialization proof covers cooperating publishers using this API; an
 // administrator must not unlink or replace the persistent .lock entry while
 // catalog publication is live.
-func SaveSnapshot(path string, s *Snapshot) (err error) {
+func SaveSnapshot(path string, s *Snapshot) error {
+	return saveSnapshot(path, s, nil)
+}
+
+// SaveSnapshotAfter durably publishes s only when the catalog currently on
+// disk has exactly expectedGeneration. The comparison executes while holding
+// the same cross-process writer lease as the atomic replacement, so a
+// successful return proves the transition was applied to the topology it was
+// planned from. An absent durable catalog is generation zero.
+func SaveSnapshotAfter(path string, expectedGeneration uint64, s *Snapshot) error {
+	return saveSnapshot(path, s, &expectedGeneration)
+}
+
+func saveSnapshot(path string, s *Snapshot, expectedGeneration *uint64) (err error) {
 	if s == nil {
 		return errors.New("gateway: SaveSnapshot requires a non-nil snapshot")
 	}
@@ -998,7 +1055,7 @@ func SaveSnapshot(path string, s *Snapshot) (err error) {
 	if err != nil {
 		return err
 	}
-	publishErr := saveSnapshotAtRoot(root, base, s)
+	publishErr := saveSnapshotAtRootAfter(root, base, s, expectedGeneration)
 	closeErr := root.Close()
 	if closeErr == nil {
 		return publishErr
@@ -1010,6 +1067,15 @@ func SaveSnapshot(path string, s *Snapshot) (err error) {
 }
 
 func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
+	return saveSnapshotAtRootAfter(root, base, s, nil)
+}
+
+func saveSnapshotAtRootAfter(
+	root *os.Root,
+	base string,
+	s *Snapshot,
+	expectedGeneration *uint64,
+) (err error) {
 	if root == nil || base == "" || s == nil {
 		return errors.New("gateway: invalid pinned catalog publication")
 	}
@@ -1054,6 +1120,12 @@ func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
 	var nextState *Snapshot
 	switch {
 	case loadErr == nil:
+		if expectedGeneration != nil && current.generation != *expectedGeneration {
+			return fmt.Errorf(
+				"%w: expected=%d durable=%d",
+				ErrCatalogGenerationMismatch, *expectedGeneration, current.generation,
+			)
+		}
 		if s.generation <= current.generation {
 			return fmt.Errorf(
 				"%w: proposed=%d durable=%d",
@@ -1071,6 +1143,12 @@ func saveSnapshotAtRoot(root *os.Root, base string, s *Snapshot) (err error) {
 	case !errors.Is(loadErr, os.ErrNotExist):
 		return loadErr
 	default:
+		if expectedGeneration != nil && *expectedGeneration != 0 {
+			return fmt.Errorf(
+				"%w: expected=%d durable=0",
+				ErrCatalogGenerationMismatch, *expectedGeneration,
+			)
+		}
 		nextState, err = initialCatalogState(s)
 		if err != nil {
 			return err
