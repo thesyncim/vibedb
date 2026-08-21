@@ -119,9 +119,14 @@ effects. Recovery revalidates an artifact prefix before it skips that prefix.
 The stage reconstructs the deterministic artifact from the completed
 destination and requires the exact expected digest before tail catch-up.
 
-The implementation does not capture source transitions, close the final write
-gap, prune the retained range, validate ownership transfer, or publish
-topology. The repository has no automatic split controller or merge planner.
+An optional capture collection receives each exact before-and-after source
+transition atomically with its replicated source publication. Its compact
+`vibejson` records bind the split plan, placement program, publication chain,
+and mutable ownership coordinates. Recovery verifies the full retained chain.
+
+The implementation does not close the final write gap, prune the retained
+range, validate ownership transfer, or publish topology. The repository has no
+automatic split controller or merge planner.
 
 ## Replication kernel
 
@@ -150,5 +155,6 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
+- `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

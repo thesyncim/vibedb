@@ -228,8 +228,9 @@ func (t CollectionTarget) validate() error {
 // Options fixes the cross-collection and completion-retention admission
 // profile. Zero values fail closed.
 type Options struct {
-	TxnLimits      durable.TxnLimits
-	MaxCompletions uint64
+	TxnLimits         durable.TxnLimits
+	MaxCompletions    uint64
+	TransitionCapture TransitionCapture
 }
 
 func (o Options) validate() error {

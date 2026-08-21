@@ -60,9 +60,13 @@ requires the exact manifest digest. A fixed-size digest-protected cursor records
 artifact and tail progress. On Unix, the cursor store uses a writer lease, file
 sync, atomic replacement, and directory sync.
 
-This kernel does not capture the source transition stream. It does not close
-the final source gap, prune the retained range, transfer ownership, or publish
-the catalog.
+An optional source capture stores exact before-and-after transitions in a
+private collection. The replicated state machine includes each capture record
+in the same transaction as the source state and row changes. Recovery verifies
+the complete digest and publication chain before capture resumes.
+
+This kernel does not close the final source gap, prune the retained range,
+transfer ownership, or publish the catalog.
 
 ## Security boundary
 
@@ -82,3 +86,4 @@ boundary.
 - `autosplit/action.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
+- `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

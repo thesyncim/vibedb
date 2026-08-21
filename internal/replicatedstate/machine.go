@@ -43,6 +43,11 @@ type Machine struct {
 	user            CollectionTarget
 	txnLog          *durable.TxnLog
 	options         Options
+	capture         TransitionCapture
+	captureTarget   TransitionCaptureTarget
+	captureBuffer   []byte
+	captureChanges  []finalMutation
+	captureKey      [8]byte
 
 	state       State
 	publication raftmodel.Publication
@@ -183,6 +188,9 @@ func Open(
 		return nil, err
 	}
 	if !present {
+		if options.TransitionCapture != nil {
+			return nil, ErrTransitionCapture
+		}
 		if completionCount != 0 || userSnapshot.Len() != 0 {
 			return nil, fmt.Errorf("%w: uninitialized system with durable rows", ErrStateCorrupt)
 		}
@@ -210,6 +218,11 @@ func Open(
 	m.binding = state.Binding
 	m.initialized = true
 	m.publication = publicationFromState(state)
+	if options.TransitionCapture != nil {
+		if err := m.beginTransitionCapture(options.TransitionCapture); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
 }
 
