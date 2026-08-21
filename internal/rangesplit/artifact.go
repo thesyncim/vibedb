@@ -18,7 +18,7 @@ import (
 
 const (
 	childArtifactFormat           = uint16(1)
-	childArtifactHeaderFixedBytes = 240
+	childArtifactHeaderFixedBytes = 272
 	childArtifactChunkHeaderBytes = 96
 	childArtifactFooterBytes      = 160
 	childArtifactRowHeaderBytes   = 8
@@ -54,6 +54,7 @@ var (
 type ChildArtifactSourceCut struct {
 	LogicalDigest   [sha256.Size]byte
 	BaseDigest      [sha256.Size]byte
+	EntryDigest     [sha256.Size]byte
 	Applied         uint64
 	Term            uint64
 	RouteGeneration uint64
@@ -306,7 +307,8 @@ func (p *Partitioner) writeChildArtifacts(
 func sourceCut(state replicatedstate.State) ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{
 		LogicalDigest: state.LogicalDigest, BaseDigest: state.SnapshotBaseDigest,
-		Applied: state.Applied, Term: state.LastTerm,
+		EntryDigest: state.LastEntryDigest,
+		Applied:     state.Applied, Term: state.LastTerm,
 		RouteGeneration: state.Binding.RouteGeneration,
 	}
 }
@@ -534,7 +536,8 @@ func makeChildArtifactHeader(
 	if p == nil || int(child) >= int(p.childCount) || child == p.retained ||
 		cut.Applied == 0 || cut.Term == 0 || cut.RouteGeneration == 0 ||
 		cut.LogicalDigest == ([sha256.Size]byte{}) ||
-		cut.BaseDigest == ([sha256.Size]byte{}) {
+		cut.BaseDigest == ([sha256.Size]byte{}) ||
+		cut.EntryDigest == ([sha256.Size]byte{}) {
 		return nil, [sha256.Size]byte{}, ErrInvalidPartition
 	}
 	descriptor := p.children[child]
@@ -587,6 +590,7 @@ func makeChildArtifactHeader(
 	copy(header[144:176], placement[:])
 	copy(header[176:208], cut.LogicalDigest[:])
 	copy(header[208:240], cut.BaseDigest[:])
+	copy(header[240:272], cut.EntryDigest[:])
 	cursor := childArtifactHeaderFixedBytes
 	cursor += copy(header[cursor:], descriptor.Shard)
 	cursor += copy(header[cursor:], p.collection)
@@ -839,8 +843,10 @@ func (p *Partitioner) readChildArtifactHeader(
 	}
 	copy(cut.LogicalDigest[:], header[176:208])
 	copy(cut.BaseDigest[:], header[208:240])
+	copy(cut.EntryDigest[:], header[240:272])
 	if cut.Applied == 0 || cut.Term == 0 || cut.RouteGeneration == 0 ||
-		cut.LogicalDigest == ([sha256.Size]byte{}) || cut.BaseDigest == ([sha256.Size]byte{}) {
+		cut.LogicalDigest == ([sha256.Size]byte{}) || cut.BaseDigest == ([sha256.Size]byte{}) ||
+		cut.EntryDigest == ([sha256.Size]byte{}) {
 		return ChildArtifactSourceCut{}, 0, [sha256.Size]byte{}, 0,
 			fmt.Errorf("%w: source cut", ErrChildArtifact)
 	}

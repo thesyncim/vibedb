@@ -324,10 +324,13 @@ remain predictable because their capacities and fold work are fixed at open.
   a digest over the complete desired manifest. Non-retained children can be
   streamed directly into bounded deterministic hash-chained artifacts whose
   verifier rechecks key order and `vibejson` placement before handing a whole
-  chunk to a durable receiver. Both remain non-serving: persistent destination
-  staging/install, source-tail translation, peer transport, an external
-  topology authority, server wiring, automatic failover, and ordered split
-  cutover remain absent.
+  chunk to a durable receiver. Exact ordered before/after transitions can also
+  be translated allocation-free into one idempotence-digested batch per child;
+  moves become delete-old plus put-new and empty batches preserve a common
+  source watermark. Both remain non-serving: source transition capture,
+  persistent destination staging/install and tail apply, final-gap closure,
+  peer transport, an external topology authority, server wiring, automatic
+  failover, and ordered split cutover remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and

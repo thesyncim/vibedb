@@ -422,10 +422,15 @@ cluster does not fork into named protocol generations.
    to the exact source cut, complete plan, placement program, child allocation,
    range, ownership, and endpoints. Its verifier authenticates framing and
    totals, enforces strict key order, and recomputes `vibejson` placement before
-   exposing a whole chunk to a durable receiver. It does not stage/install the
-   resulting child database, translate the ordered source tail into independent
-   child groups, authenticate transport, provide topology authority, construct
-   target SQL roots, wire servers, or grant serving ownership by itself.
+   exposing a whole chunk to a durable receiver. An allocation-free tail kernel
+   then maps an exact consecutive before/after transition stream into one
+   idempotence-digested batch per child, including empty advances and
+   delete-old/put-new shard-key moves. Each batch binds the source base, exact
+   child artifact, entry/logical chain, and derived operations. It does not
+   capture that transition stream, persist/apply child batches, close the final
+   write gap, prune the retained root, authenticate transport, provide topology
+   authority, construct target SQL roots, wire servers, or grant serving
+   ownership by itself.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

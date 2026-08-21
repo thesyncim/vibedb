@@ -23,7 +23,7 @@ shard.
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space striped request telemetry, sustained bucket-aligned recommendations, and allocation-high-water/generation-fenced desired split manifests; it cannot publish topology, copy state, catch up a destination, or move ownership |
 | `internal/rebalance` | Non-serving, stateless intact-shard replica movement: exact membership stages, certified learner-base/install proof, applied catch-up, promotion, leader transfer, ordered ownership-fence advance, catalog generation CAS, old-generation drain, source removal, and retirement action |
-| `internal/rangesplit` | Non-serving one-pass physical child row partitioning: complete desired-manifest and placement-program digests, exact source fences, compiled `vibejson` extraction, no-copy retained-child support, and bounded deterministic hash-chained artifacts for non-retained children; verification proves framing, key order, and row placement before a durable chunk callback, but no destination installer or cutover authority is wired |
+| `internal/rangesplit` | Non-serving physical split data plane: one-pass compiled-`vibejson` child partitioning, no-copy retained-child support, bounded deterministic hash-chained artifacts, semantic verification before a durable chunk callback, and allocation-free ordered before/after tail translation into exact child batches; source transition capture, destination staging/apply, final-gap closure, and cutover authority are not wired |
 
 The repository also contains a non-serving Raft foundation: a pinned upstream
 Raft core, append-only immutable-base WAL, local replicated-apply state machine,
@@ -177,8 +177,17 @@ endpoint set; the footer certifies row/byte/chunk totals. Verification checks
 the chain and strict key order, then recomputes every document's `vibejson`
 placement before exposing an entire borrowed chunk to a receiver that can
 atomically persist rows and its checkpoint. This still does not install a child
-database, translate a source mutation tail into child groups, change validation
-ownership, or publish topology.
+database. A separate pure tail kernel starts only from the complete artifact
+set, chains the exact source applied/term/last-entry/logical prefix, parses each
+before/after document at most once, and derives one batch for every child at
+every source entry. A shard-key-changing update is delete-old plus put-new;
+same-child updates remain one put; no-op/configuration entries still emit empty
+advances so no child can claim a later watermark with a gap. Per-entry and
+per-child digests bind the exact before images, derived operations, source base,
+and installed child artifact. A failed sink leaves the cursor unchanged for an
+idempotent retry. Source-side transition capture, persisted cursor/batch
+framing, durable child apply, final write freeze, retained-child pruning,
+validation ownership change, and topology publication remain absent.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
@@ -280,10 +289,11 @@ merge, move, or replica reconfiguration protocol.
   resumable non-serving staging/candidate validation, model-checked membership,
   and intact-shard move reconciliation are exposed only through the non-serving
   kernel;
-- persistent destination staging/install and ordered cutover for an online
-  split or merge; bounded hot-bucket evidence, desired split planning, one-pass
-  allocation-free child row partitioning, deterministic filtered child
-  artifact framing/verification, source artifact export, offline whole-shard
+- source transition capture, persistent destination staging/install, and
+  ordered cutover for an online split or merge; bounded hot-bucket evidence,
+  desired split planning, one-pass allocation-free child row partitioning,
+  deterministic filtered child artifact framing/verification, allocation-free
+  exact tail translation, source artifact export, offline whole-shard
   destination install, and intact-shard replica relocation primitives exist,
   but confer no serving authority by themselves;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed

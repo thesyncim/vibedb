@@ -38,6 +38,7 @@ type PartitionStats struct {
 	PlanDigest      [sha256.Size]byte
 	SourceDigest    [sha256.Size]byte
 	SourceBase      [sha256.Size]byte
+	SourceEntry     [sha256.Size]byte
 	SourceApplied   uint64
 	SourceTerm      uint64
 	RouteGeneration uint64
@@ -172,8 +173,9 @@ func (p *Partitioner) partitionRows(
 	workspace.scan.document = &workspace.document
 	workspace.scan.stats = PartitionStats{
 		PlanDigest: p.digest, SourceDigest: state.LogicalDigest,
-		SourceBase: state.SnapshotBaseDigest, SourceApplied: state.Applied,
-		SourceTerm: state.LastTerm, RouteGeneration: state.Binding.RouteGeneration,
+		SourceBase: state.SnapshotBaseDigest, SourceEntry: state.LastEntryDigest,
+		SourceApplied: state.Applied,
+		SourceTerm:    state.LastTerm, RouteGeneration: state.Binding.RouteGeneration,
 	}
 	if workspace.visit == nil || workspace.bound != &workspace.scan {
 		workspace.visit = workspace.scan.visitRow
@@ -221,6 +223,7 @@ func (p *Partitioner) matchesSource(state replicatedstate.State) bool {
 	binding := state.Binding
 	return state.Applied != 0 && state.LastTerm != 0 &&
 		state.LogicalDigest != ([sha256.Size]byte{}) &&
+		state.LastEntryDigest != ([sha256.Size]byte{}) &&
 		state.SnapshotBaseDigest != ([sha256.Size]byte{}) &&
 		binding.RouteGeneration != 0 &&
 		binding.Distribution == string(p.source.Distribution) &&

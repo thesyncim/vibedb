@@ -63,6 +63,7 @@ func TestPartitionRowsScansOnceAndDispatchesExactly(t *testing.T) {
 		stats.Bytes[1] != uint64(len("right")+len(right)) ||
 		stats.PlanDigest != partitioner.Digest() ||
 		stats.SourceDigest != ([32]byte{1}) || stats.SourceBase != ([32]byte{2}) ||
+		stats.SourceEntry != ([32]byte{3}) ||
 		stats.SourceApplied != 41 ||
 		stats.SourceTerm != 7 || stats.RouteGeneration != 19 {
 		t.Fatalf("stats = %+v", stats)
@@ -273,7 +274,8 @@ func testSourceState(plan *autosplit.SplitPlan) replicatedstate.State {
 			OwnershipEpoch:       uint64(plan.Source.OwnershipEpoch),
 			RoutingVersion:       uint64(plan.Source.RoutingVersion), RouteGeneration: 19,
 		},
-		Applied: 41, LastTerm: 7, LogicalDigest: [32]byte{1}, SnapshotBaseDigest: [32]byte{2},
+		Applied: 41, LastTerm: 7, LastEntryDigest: [32]byte{3},
+		LogicalDigest: [32]byte{1}, SnapshotBaseDigest: [32]byte{2},
 	}
 }
 
