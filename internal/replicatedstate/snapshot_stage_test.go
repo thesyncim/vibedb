@@ -120,6 +120,45 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 	) {
 		t.Fatalf("candidate publication = %+v, expected state = %+v", publication, expected.State)
 	}
+	base, err := BuildSnapshotBase(expected, source.bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := OpenSnapshotBase(base)
+	if err != nil || !equalSnapshotArtifactManifest(certificate.Manifest, expected) ||
+		!bytes.Equal(certificate.StaticBootstrap.GetData(), source.bootstrap.GetData()) {
+		t.Fatalf("snapshot base certificate = %+v, %v", certificate, err)
+	}
+	if installed, err := candidate.InstallSnapshot(base); err != nil ||
+		installed.Applied != publication.Applied || installed.LogicalDigest != publication.LogicalDigest {
+		t.Fatalf("InstallSnapshot(base) = %+v, %v", installed, err)
+	}
+	if installed, err := candidate.InstallSnapshot(base); err != nil || installed.Applied != publication.Applied {
+		t.Fatalf("retry InstallSnapshot(base) = %+v, %v", installed, err)
+	}
+	static, err := StaticBootstrapForSnapshot(base)
+	if err != nil || !bytes.Equal(static.GetData(), source.bootstrap.GetData()) {
+		t.Fatalf("StaticBootstrapForSnapshot = %v, %v", static, err)
+	}
+	alternateCut, err := source.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alternateArtifact bytes.Buffer
+	alternateManifest, artifactErr := WriteSnapshotArtifact(
+		&alternateArtifact, alternateCut, SnapshotArtifactOptions{},
+	)
+	closeErr := alternateCut.Close()
+	if artifactErr != nil || closeErr != nil {
+		t.Fatalf("alternate artifact = %v, close=%v", artifactErr, closeErr)
+	}
+	alternateBase, err := BuildSnapshotBase(alternateManifest, source.bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := candidate.InstallSnapshot(alternateBase); !errors.Is(err, ErrSnapshotBase) {
+		t.Fatalf("different certificate at same cut error = %v", err)
+	}
 	if _, err := stage.OpenCandidate(source.bootstrap, log, machineOptionsFor(user)); !errors.Is(err, ErrSnapshotStage) {
 		t.Fatalf("second OpenCandidate error = %v", err)
 	}

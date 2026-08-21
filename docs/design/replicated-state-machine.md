@@ -8,10 +8,10 @@ durable user collection and publishes the matching completion and Raft applied
 state atomically through one hidden durable system collection.
 
 This is deliberately not a serving or high-availability milestone. It does not
-wire shard RPCs to Raft, permit client-facing replicated SQL writes, install or
-publish runtime snapshots, compact the Raft WAL, reserve physical system/user
+wire shard RPCs to Raft, permit client-facing replicated SQL writes, compact a
+live Raft WAL, reserve physical system/user
 storage, provide peer authentication or network I/O, or authorize Read Committed
-or Serializable transactions across replicas. A static-WAL qualification now
+or Serializable transactions across replicas. An immutable-base WAL qualification now
 proves finite logical completion-count headroom for one exact healthy,
 initialized WAL/apply pair
 after checking its binding and applied/committed/log cut. It does not reserve
@@ -272,11 +272,18 @@ default (and forced on every receive return), avoiding a directory fsync per
 After the footer matches the authenticated expected manifest, `OpenCandidate`
 still performs the expensive full proof: hidden state and completions, user
 placement validation, logical-digest recomputation, binding, membership, and
-applied publication. It returns only a non-serving Machine. The transport
-orchestrator, learner snapshot publication, ordered log-tail catch-up, suffix
-reservation reconstruction, and WAL generation-swap protocol remain absent.
-Snapshot publication and compaction therefore continue to depend on those
-gates.
+applied publication. It returns only a non-serving Machine. A deterministic
+bounded certificate then binds that exact artifact state, original index-one
+bootstrap, and stable `ConfState` into a fresh encrypted immutable-base WAL.
+The candidate atomically retains the certificate identity at the same applied
+cut, and a learner created from it accepts `N+1...` only through ordinary Raft
+`AppendEntries`; no row bytes or ad hoc mutation tail pass through Raft
+snapshot data. Exact certificate reinstall is idempotent, and a different
+certificate at the same cut fails closed.
+
+The transport/range orchestrator, topology-authorized learner publication,
+source-to-target SQL-root construction, live generation swap, and ownership
+cutover remain absent. The implemented primitives grant no serving authority.
 
 ## Isolation boundary
 
@@ -324,11 +331,10 @@ local apply claim. They deliberately grant no serving authority.
 Serving is prohibited because the current tree lacks:
 
 - physical system/user byte reservation and safe completion GC beyond the
-  instantaneous static-base logical headroom proof;
-- learner snapshot publication into Raft storage, a reconstructed
-  suffix-reservation ledger, and WAL generation compaction; coherent export,
-  resumable non-serving destination staging, and full candidate validation
-  alone grant no authority;
+  instantaneous immutable-base logical headroom proof;
+- topology-authorized learner publication, a live WAL generation swap, and the
+  source/target orchestration around the implemented certified learner base,
+  ordinary ordered tail catch-up, and suffix-capacity reconstruction;
 - peer enrollment, mutually authenticated network I/O, shared per-peer flow
   control, snapshot transport, dynamic membership reconciliation, and
   deadline/slow-disk isolation around the in-process host and frame validator;

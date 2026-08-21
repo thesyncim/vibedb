@@ -24,7 +24,7 @@ shard.
 | `autosplit` | Fixed-space striped request telemetry, sustained bucket-aligned recommendations, and allocation-high-water/generation-fenced desired split manifests; it cannot publish topology, copy state, catch up a destination, or move ownership |
 
 The repository also contains a non-serving Raft foundation: a pinned upstream
-Raft core, append-only static-base WAL, local replicated-apply state machine,
+Raft core, append-only immutable-base WAL, local replicated-apply state machine,
 bounded in-process scheduler/outbox, and a frame/roster validator that accepts
 a caller-supplied authenticated NodeID. These internal packages are not wired
 to either server command, a public API, or operator configuration.
@@ -148,9 +148,11 @@ artifact, applied the ordered mutation tail, closed the final source gap, and
 passed cutover validation. Artifact export is deterministic, bounded-memory,
 hash-chained, and checkpointed. Non-serving destination files can now resume at
 an atomically persisted cursor, apply bounded local batches, and pass a full
-candidate-open proof without retaining a second artifact copy. Transport,
-learner publication, tail catch-up, and ownership cutover are not implemented
-here.
+candidate-open proof without retaining a second artifact copy. A verified
+candidate can now be bound to a fresh immutable Raft WAL at the exact cut, and
+a learner catches up its suffix through ordinary `AppendEntries`. Transport
+orchestration, topology-authorized membership publication, target SQL-root
+construction, and ownership cutover are not implemented here.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that

@@ -60,6 +60,7 @@ var (
 	ErrSnapshotStage               = errors.New("replicatedstate: invalid snapshot staging state")
 	ErrSnapshotStageIncomplete     = errors.New("replicatedstate: snapshot staging is incomplete")
 	ErrSnapshotStageOutcomeUnknown = errors.New("replicatedstate: snapshot staging durability outcome is unknown")
+	ErrSnapshotBase                = errors.New("replicatedstate: invalid snapshot base certificate")
 )
 
 // Binding is the exact shard and recovery lineage owned by one Machine.

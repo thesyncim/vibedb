@@ -10,7 +10,7 @@ transaction log, and underlying machine remain private to the driver.
 It grants no proposal authority, leadership,
 lease, peer authentication, `ReadIndex`, replicated position token, runtime
 snapshot/compaction, or physical completion/system/user byte reservation. A
-separate static-WAL qualification can prove finite logical completion-count
+separate immutable-base WAL qualification can prove finite logical completion-count
 headroom only after exact binding, claim health, completion count, applied cut,
 WAL commit, and last-index checks. The result is an instantaneous predicate,
 not a lease, and cannot advertise replicated Read Committed or Serializable

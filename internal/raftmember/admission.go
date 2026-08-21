@@ -10,9 +10,25 @@ import (
 
 // ErrStaticCompletionCapacity reports that the fixed bootstrap WAL/apply pair
 // cannot prove one retained completion slot for every entry it can hold.
-var ErrStaticCompletionCapacity = errors.New(
-	"raftmember: static WAL does not qualify completion capacity",
+var (
+	ErrCompletionCapacity = errors.New(
+		"raftmember: immutable-base WAL does not qualify completion capacity",
+	)
+	// ErrStaticCompletionCapacity is retained as an API alias for the original
+	// index-one-only validator.
+	ErrStaticCompletionCapacity = ErrCompletionCapacity
 )
+
+// ValidateImmutableBaseNoGCCompletionCapacity proves that the bounded suffix
+// after this WAL's exact immutable base cannot create more retained completion
+// records than the apply store can hold. It supports both index-one startup and
+// newer certified learner bases.
+func ValidateImmutableBaseNoGCCompletionCapacity(
+	wal *raftstore.Store,
+	apply *sqldriver.ReplicatedApply,
+) error {
+	return validateLiveNoGCCompletionCapacity(wal, apply, false)
+}
 
 // ValidateStaticNoGCCompletionCapacity proves the count-only completion bound
 // for one exact live WAL/apply pair while the WAL has the immutable bootstrap
@@ -32,6 +48,14 @@ var ErrStaticCompletionCapacity = errors.New(
 func ValidateStaticNoGCCompletionCapacity(
 	wal *raftstore.Store,
 	apply *sqldriver.ReplicatedApply,
+) error {
+	return validateLiveNoGCCompletionCapacity(wal, apply, true)
+}
+
+func validateLiveNoGCCompletionCapacity(
+	wal *raftstore.Store,
+	apply *sqldriver.ReplicatedApply,
+	requireInitialBase bool,
 ) error {
 	if wal == nil {
 		return ErrWALUnavailable
@@ -68,7 +92,13 @@ func ValidateStaticNoGCCompletionCapacity(
 	if err != nil {
 		return fmt.Errorf("%w: inspect last index: %w", ErrWALUnavailable, err)
 	}
-	return validateStaticNoGCCompletionCapacity(
+	if requireInitialBase && profile.LogBaseIndex != 1 {
+		return fmt.Errorf(
+			"%w: require initial snapshot base 1, got %d",
+			ErrStaticCompletionCapacity, profile.LogBaseIndex,
+		)
+	}
+	return validateImmutableBaseNoGCCompletionCapacity(
 		profile, applyProfile, hardState.GetCommit(), lastIndex,
 	)
 }
@@ -79,12 +109,27 @@ func validateStaticNoGCCompletionCapacity(
 	commit uint64,
 	last uint64,
 ) error {
-	if profile.Format != raftstore.CapacityFormatStatic || profile.LogBaseIndex != 1 {
+	if profile.LogBaseIndex != 1 {
 		return fmt.Errorf(
 			"%w: require static snapshot base 1, got format=%d base=%d",
 			ErrStaticCompletionCapacity,
 			profile.Format,
 			profile.LogBaseIndex,
+		)
+	}
+	return validateImmutableBaseNoGCCompletionCapacity(profile, apply, commit, last)
+}
+
+func validateImmutableBaseNoGCCompletionCapacity(
+	profile raftstore.CapacityProfile,
+	apply sqldriver.ReplicatedApplyCapacityProfile,
+	commit uint64,
+	last uint64,
+) error {
+	if profile.Format != raftstore.CapacityFormatImmutableBase || profile.LogBaseIndex == 0 {
+		return fmt.Errorf(
+			"%w: unsupported immutable-base profile format=%d base=%d",
+			ErrStaticCompletionCapacity, profile.Format, profile.LogBaseIndex,
 		)
 	}
 	if apply.ApplyFormat != sqldriver.ReplicatedApplyFormat {
@@ -101,7 +146,8 @@ func validateStaticNoGCCompletionCapacity(
 			apply.MaxCompletions,
 		)
 	}
-	if !apply.Initialized || apply.Applied == 0 || commit == 0 || last == 0 ||
+	base := profile.LogBaseIndex
+	if !apply.Initialized || apply.Applied < base || commit < base || last < base ||
 		apply.CompletionCount > apply.Applied-1 || apply.Applied > commit || commit > last {
 		return fmt.Errorf(
 			"%w: invalid apply/WAL cut initialized=%t C=%d A=%d commit=%d L=%d",
@@ -109,19 +155,30 @@ func validateStaticNoGCCompletionCapacity(
 			apply.Applied, commit, last,
 		)
 	}
-	if last-1 > profile.MaxEntries {
+	maxLast := base + profile.MaxEntries
+	if maxLast < base {
+		maxLast = ^uint64(0)
+	}
+	if last > maxLast {
 		return fmt.Errorf(
-			"%w: WAL suffix=%d exceeds sealed entries=%d",
-			ErrStaticCompletionCapacity, last-1, profile.MaxEntries,
+			"%w: WAL last=%d exceeds sealed range [%d,%d]",
+			ErrStaticCompletionCapacity, last, base, maxLast,
 		)
 	}
-	if profile.MaxEntries > apply.MaxCompletions ||
-		apply.CompletionCount > apply.MaxCompletions ||
-		last-apply.Applied > apply.MaxCompletions-apply.CompletionCount {
+	if apply.CompletionCount > apply.MaxCompletions {
 		return fmt.Errorf(
-			"%w: WAL entries=%d C=%d A=%d L=%d completions=%d",
-			ErrStaticCompletionCapacity, profile.MaxEntries, apply.CompletionCount,
-			apply.Applied, last, apply.MaxCompletions,
+			"%w: completion count %d exceeds capacity %d",
+			ErrStaticCompletionCapacity, apply.CompletionCount, apply.MaxCompletions,
+		)
+	}
+	remainingCompletions := apply.MaxCompletions - apply.CompletionCount
+	currentUnapplied := last - apply.Applied
+	maximumFuture := maxLast - apply.Applied
+	if currentUnapplied > remainingCompletions || maximumFuture > remainingCompletions {
+		return fmt.Errorf(
+			"%w: WAL entries=%d base=%d C=%d A=%d L=%d completions=%d",
+			ErrStaticCompletionCapacity, profile.MaxEntries, base,
+			apply.CompletionCount, apply.Applied, last, apply.MaxCompletions,
 		)
 	}
 	return nil

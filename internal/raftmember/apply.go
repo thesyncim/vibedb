@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -125,10 +126,16 @@ func applyPrerequisites(
 	if err != nil {
 		return sqldriver.ReplicatedShardStoreBinding{}, nil, err
 	}
-	bootstrap, err := wal.Snapshot()
+	base, err := wal.Snapshot()
 	if err != nil {
 		return sqldriver.ReplicatedShardStoreBinding{}, nil, fmt.Errorf(
-			"%w: read static snapshot: %w", ErrWALUnavailable, err,
+			"%w: read snapshot base: %w", ErrWALUnavailable, err,
+		)
+	}
+	bootstrap, err := replicatedstate.StaticBootstrapForSnapshot(base)
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, nil, fmt.Errorf(
+			"%w: recover static bootstrap from snapshot base: %w", ErrWALUnavailable, err,
 		)
 	}
 	return binding, bootstrap, nil

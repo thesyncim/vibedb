@@ -253,6 +253,8 @@ func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
 	if snapshot == nil || snapshot.GetMetadata() == nil ||
 		snapshot.GetMetadata().GetIndex() != 1 || snapshot.GetMetadata().GetTerm() != 1 ||
 		len(snapshot.GetData()) > MaxStaticBootstrapBytes ||
+		(len(snapshot.GetData()) >= len(snapshotBaseMagic) &&
+			bytes.Equal(snapshot.GetData()[:len(snapshotBaseMagic)], snapshotBaseMagic[:])) ||
 		len(snapshot.ProtoReflect().GetUnknown()) != 0 ||
 		len(snapshot.GetMetadata().ProtoReflect().GetUnknown()) != 0 {
 		return nil, [32]byte{}, ErrStaticSnapshotOnly

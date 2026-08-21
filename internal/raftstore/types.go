@@ -35,8 +35,8 @@ const (
 	// MaxSnapshotBaseBytes bounds the small Raft snapshot certificate sealed
 	// into a WAL generation. Bulk state is transferred and verified by the
 	// replicated-state streaming artifact, never through this field.
-	MaxSnapshotBaseBytes       = 2 << 20
-	MaxSnapshotBaseRecordBytes = 4 << 20
+	MaxSnapshotBaseBytes       = 3 << 19
+	MaxSnapshotBaseRecordBytes = 2 << 20
 	// Compatibility names retained for callers that construct the index-one
 	// initial base. The on-disk format has one immutable-base concept.
 	MaxBootstrapBytes       = MaxSnapshotBaseBytes

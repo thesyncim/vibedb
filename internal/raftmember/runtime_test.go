@@ -1,6 +1,7 @@
 package raftmember
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -21,6 +22,9 @@ type runtimeFixture struct {
 	database *sqldriver.Database
 	apply    *sqldriver.ReplicatedApply
 	base     sqldriver.ReplicatedShardStoreIdentity
+	applyID  sqldriver.ReplicatedApplyIdentity
+	sqlPath  string
+	options  raftstore.Options
 }
 
 func newRuntimeFixture(t testing.TB, seed byte, voters []uint64) runtimeFixture {
@@ -56,7 +60,7 @@ func newRuntimeFixtureWithOptions(
 	if err != nil {
 		t.Fatalf("create runtime WAL: %v", err)
 	}
-	_, database, _ := prepareSQLRoot(t, identity, "runtime")
+	sqlPath, database, _ := prepareSQLRoot(t, identity, "runtime")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedSQL(wal, database, authority, "docs")
 	skipIfStrictAllocationUnsupported(t, "bind runtime SQL", err)
@@ -64,8 +68,8 @@ func newRuntimeFixtureWithOptions(
 		t.Fatalf("bind runtime SQL: %v", err)
 	}
 	applyOptions := testApplyOptions()
-	applyOptions.MaxCompletions = uint64(options.MaxEntries)
-	apply, _, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
+	applyOptions.MaxCompletions = uint64(options.MaxEntries) + 1024
+	apply, applyID, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
 	skipIfStrictAllocationUnsupported(t, "open runtime apply", err)
 	if err != nil {
 		t.Fatalf("open runtime apply: %v", err)
@@ -85,7 +89,10 @@ func newRuntimeFixtureWithOptions(
 		t.Fatalf("adopt runtime: %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	return runtimeFixture{runtime: runtime, wal: wal, database: database, apply: apply, base: base}
+	return runtimeFixture{
+		runtime: runtime, wal: wal, database: database, apply: apply, base: base,
+		applyID: applyID, sqlPath: sqlPath, options: options,
+	}
 }
 
 func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) error) {
@@ -198,6 +205,95 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
 		t.Fatalf("completion = %+v, %v", completion, err)
+	}
+}
+
+func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.T) {
+	fixture := newRuntimeFixture(t, 219, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	key, _ := orderedkey.AppendJSONString(nil, []byte(`"base"`), orderedkey.Ascending)
+	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"base","value":1}`))
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	before, err := fixture.runtime.Publication()
+	if err != nil || before.Applied <= 1 {
+		t.Fatalf("source publication = %+v, %v", before, err)
+	}
+	cut, err := fixture.apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact bytes.Buffer
+	manifest, err := replicatedstate.WriteSnapshotArtifact(
+		&artifact, cut, replicatedstate.SnapshotArtifactOptions{},
+	)
+	closeErr := cut.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("snapshot artifact = %v, close=%v", err, closeErr)
+	}
+	static, err := fixture.wal.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := replicatedstate.BuildSnapshotBase(manifest, static)
+	if err != nil || base.GetMetadata().GetIndex() != before.Applied {
+		t.Fatalf("BuildSnapshotBase = %v, %v", base, err)
+	}
+	identity := fixture.wal.Identity()
+	if err := fixture.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	newWAL, err := raftstore.Create(
+		filepath.Join(t.TempDir(), "replacement.wal"), identity, testWALKey(),
+		raftstore.Bootstrap{TopologyRecoveryEpoch: testTopologyRecoveryEpoch, Snapshot: base},
+		fixture.options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, reopenedApply, err := OpenBoundSQLWithApply(
+		fixture.sqlPath, newWAL, testAuthorityProfile(), fixture.base, fixture.applyID,
+	)
+	if err != nil {
+		_ = newWAL.Close()
+		t.Fatal(err)
+	}
+	restarted, err := AdoptRuntime(newWAL, reopenedDB, reopenedApply)
+	if err != nil {
+		if restarted != nil {
+			_ = restarted.Close()
+		}
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	after, err := restarted.Publication()
+	if err != nil || after.Applied != before.Applied ||
+		after.LogicalDigest != before.LogicalDigest ||
+		after.ReplicaSetVersion != before.ReplicaSetVersion ||
+		after.ConfState.Equivalent(before.ConfState) != nil {
+		t.Fatalf("restarted publication = %+v, %v; before %+v", after, err, before)
+	}
+	drainRuntime(t, restarted, nil)
+	if err := restarted.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, restarted, nil)
+	key, _ = orderedkey.AppendJSONString(nil, []byte(`"tail"`), orderedkey.Ascending)
+	tail := testApplyCommand(fixture.base, 2, key, []byte(`{"id":"tail","value":2}`))
+	if err := restarted.Propose(tail); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, restarted, nil)
+	final, err := restarted.Publication()
+	if err != nil || final.Applied <= after.Applied {
+		t.Fatalf("ordinary suffix publication = %+v, %v; base %+v", final, err, after)
 	}
 }
 

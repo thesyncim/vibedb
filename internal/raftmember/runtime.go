@@ -121,7 +121,7 @@ func AdoptRuntime(
 	if wal == nil || database == nil || apply == nil {
 		return nil, ErrRuntimeOwnership
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, apply); err != nil {
+	if err := ValidateImmutableBaseNoGCCompletionCapacity(wal, apply); err != nil {
 		return nil, err
 	}
 	profile, err := apply.CapacityQualificationProfile()
@@ -374,7 +374,7 @@ func (runtime *Runtime) DriveReady(
 		}
 		if progress.HasSnapshot {
 			return DriveResult{}, runtime.fail(&raftmodel.UnsupportedError{
-				Feature: "runtime snapshots in the static WAL kernel",
+				Feature: "in-band Ready snapshots in the immutable-base WAL kernel",
 			})
 		}
 		return DriveResult{Kind: DriveCaptured, ReadyID: progress.ReadyID}, nil
@@ -527,7 +527,7 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 		return 0, errors.New("raftmember: nil Raft message")
 	}
 	if message.GetType() == pb.MsgSnap || message.Snapshot != nil {
-		return 0, &raftmodel.UnsupportedError{Feature: "snapshot message in the static WAL runtime"}
+		return 0, &raftmodel.UnsupportedError{Feature: "snapshot message in the immutable-base WAL runtime"}
 	}
 	if len(message.GetResponses()) != 0 || message.Vote != nil {
 		return 0, errors.New("raftmember: ordinary message carries recursive or local-storage fields")

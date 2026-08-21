@@ -6,7 +6,7 @@ runtime, in-process Multi-Raft host, and an ordinary-message frame/roster
 validator that accepts a caller-supplied authenticated NodeID are executable.
 The runtime/host now surface model-checked context-free configuration proposals
 and exact quorum-safe `ReadIndex` outcomes, but no serving API consumes them.
-There is no serving replication, failover, runtime snapshot or WAL compaction
+There is no serving replication, failover, in-band snapshot transport, or live WAL compaction
 path, peer authentication, or network transport.
 
 ## Exact selection and provenance

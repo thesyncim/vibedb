@@ -122,6 +122,31 @@ func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
 	}
 }
 
+func TestImmutableBaseNoGCCompletionCapacityBoundary(t *testing.T) {
+	profile := raftstore.CapacityProfile{
+		Format: raftstore.CapacityFormatImmutableBase, LogBaseIndex: 100, MaxEntries: 4096,
+	}
+	apply := sqldriver.ReplicatedApplyCapacityProfile{
+		ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: 4108,
+		Initialized: true, Applied: 100, CompletionCount: 12,
+	}
+	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); err != nil {
+		t.Fatalf("exact newer-base capacity: %v", err)
+	}
+	apply.MaxCompletions--
+	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); !errors.Is(err, ErrStaticCompletionCapacity) {
+		t.Fatalf("one-short newer-base capacity = %v", err)
+	}
+	apply.MaxCompletions++
+	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 101, 101); err != nil {
+		t.Fatalf("one unapplied newer-base entry: %v", err)
+	}
+	apply.Applied = 99
+	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); !errors.Is(err, ErrStaticCompletionCapacity) {
+		t.Fatalf("apply below base = %v", err)
+	}
+}
+
 func TestStaticNoGCCompletionCapacityArithmetic(t *testing.T) {
 	// One previously unseen normal command creates one completion even when it
 	// deterministically records a stale-fence or semantic refusal. Configuration

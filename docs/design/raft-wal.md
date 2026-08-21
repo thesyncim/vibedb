@@ -66,7 +66,7 @@ generation may instead use a newer certified base. Its ConfState is stable,
 bounded to 64 voters and learners, and preserves protobuf presence for
 `AutoLeave`. Unknown protobuf fields on Snapshot, SnapshotMetadata, ConfState,
 HardState, and Entry are rejected rather than silently discarded by the strict
-current codec. The base data is bounded to 2 MiB and carries only certification
+current codec. The base data is bounded to 1.5 MiB and carries only certification
 metadata; bulk collection bytes use the streaming snapshot artifact.
 
 ## Physical layout

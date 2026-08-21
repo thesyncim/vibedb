@@ -39,7 +39,7 @@ func codecState() State {
 		LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
 		LastEntryDigest: bootstrap, LogicalDigest: logical,
 		ConfState: &pb.ConfState{Voters: []uint64{1}}, ReplicaSetVersion: 1,
-		BootstrapDigest: bootstrap,
+		BootstrapDigest: bootstrap, SnapshotBaseDigest: bootstrap,
 	}
 }
 
@@ -49,7 +49,7 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "f3f0320ae210a813536d165560bc58e7c3d4f1ccda284d84e1a5859b30f2357f"
+	const wantDigest = "30cf248b8aeb3077343559561bd1afaff561432f7ebc34fda13702dbeaa47d04"
 	gotDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(gotDigest[:]) != wantDigest {
 		t.Fatalf("state golden digest = %x, want %s", gotDigest, wantDigest)
@@ -87,7 +87,7 @@ func TestStateAndCompletionLengthFieldsCannotOverflowInt(t *testing.T) {
 	binary.LittleEndian.PutUint16(state[12:14], stateHeaderBytes)
 	binary.LittleEndian.PutUint32(state[16:20], uint32(len(state)))
 	binary.LittleEndian.PutUint32(state[20:24], 0)
-	binary.LittleEndian.PutUint32(state[284:288], math.MaxUint32)
+	binary.LittleEndian.PutUint32(state[316:320], math.MaxUint32)
 	sealRecord(state, stateChecksumDomain)
 	if _, err := OpenState(state); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("maximum ConfState length error = %v", err)
@@ -151,9 +151,9 @@ func TestStateRejectsResealedUnsortedConfStateMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	distributionLen := int(binary.LittleEndian.Uint16(encoded[280:282]))
-	shardLen := int(binary.LittleEndian.Uint16(encoded[282:284]))
-	confLen := int(binary.LittleEndian.Uint32(encoded[284:288]))
+	distributionLen := int(binary.LittleEndian.Uint16(encoded[312:314]))
+	shardLen := int(binary.LittleEndian.Uint16(encoded[314:316]))
+	confLen := int(binary.LittleEndian.Uint32(encoded[316:320]))
 	if len(conf) != confLen {
 		t.Fatalf("unsorted ConfState length = %d, want %d", len(conf), confLen)
 	}

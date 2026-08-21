@@ -412,7 +412,7 @@ func TestPersistUsesActualRecordSizeAfterWorstCaseAdmissionCloses(t *testing.T) 
 	options.MaxLiveBytes = 64 << 10
 	options.MaxFileBytes = HeaderBytes + MaxBootstrapRecordBytes + options.MaxLiveBytes + int64(options.MaxRecordBytes)
 	options.allowSmallBounds = true
-	options.MaxRecords = 4096
+	options.MaxRecords = 1024
 	path := filepath.Join(t.TempDir(), "tail.wal")
 	store, err := Create(path, testIdentity(), testKey(), testBootstrap(), options)
 	if err != nil {
