@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -150,6 +151,31 @@ func (s *exchangeStage) Push(ctx context.Context, partition uint32, batch exchan
 	req := s.request(partition, shardservice.ExchangePush)
 	req.Exchange.Batch = batch
 	return s.do(ctx, partition, req, shardservice.ExchangePush)
+}
+
+func (s *exchangeStage) Reduce(
+	ctx context.Context,
+	partition uint32,
+	output *exchangeStage,
+	kinds []distributedagg.Kind,
+	groupKeys []uint16,
+	maxStateBytes uint64,
+	blockRows, blockBytes uint32,
+) error {
+	if s == nil || output == nil || int(partition) >= len(s.targets) ||
+		len(s.targets) != len(output.targets) || s.key.Operation != output.key.Operation ||
+		s.key.Attempt != output.key.Attempt || s.key.Stage == output.key.Stage {
+		return ErrExchangeProducer
+	}
+	req := s.request(partition, shardservice.ExchangeReduce)
+	req.Exchange.Output = output.keyFor(partition)
+	// The synchronous request encoder only borrows this immutable stage program.
+	req.Exchange.Kinds = kinds
+	req.Exchange.GroupKeys = groupKeys
+	req.Exchange.MaxStateBytes = maxStateBytes
+	req.Exchange.BlockRows = blockRows
+	req.Exchange.BlockBytes = blockBytes
+	return s.do(ctx, partition, req, shardservice.ExchangeReduce)
 }
 
 func (s *exchangeStage) Pull(

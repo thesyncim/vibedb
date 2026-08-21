@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	vibejson "github.com/thesyncim/vibejson"
@@ -269,6 +271,27 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "exchange_reduce",
+			req: &ShardRequest{
+				Distribution: "tenant_data", Shard: "40-80",
+				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
+				ExecutionMode: ExecutionReadWrite,
+				Exchange: ExchangeRequest{
+					Operation: ExchangeReduce, Key: testExchangeKey(62),
+					Output: func() exchange.Key {
+						key := testExchangeKey(62)
+						key.Stage++
+						return key
+					}(),
+					Kinds: []distributedagg.Kind{
+						distributedagg.None, distributedagg.Count, distributedagg.Sum,
+					},
+					GroupKeys: []uint16{0}, MaxStateBytes: 1 << 20,
+					BlockRows: 128, BlockBytes: 64 << 10,
+				},
+			},
+		},
+		{
 			name: "direct_repartition",
 			req: &ShardRequest{
 				SQL:          "SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id",
@@ -323,6 +346,12 @@ func TestRequestRoundTrip(t *testing.T) {
 				t.Errorf("RowBatch = %+v, want %+v", got.RowBatch, tc.req.RowBatch)
 			}
 			if got.Exchange.Operation != tc.req.Exchange.Operation || got.Exchange.Key != tc.req.Exchange.Key ||
+				got.Exchange.Output != tc.req.Exchange.Output ||
+				!slices.Equal(got.Exchange.Kinds, tc.req.Exchange.Kinds) ||
+				!slices.Equal(got.Exchange.GroupKeys, tc.req.Exchange.GroupKeys) ||
+				got.Exchange.MaxStateBytes != tc.req.Exchange.MaxStateBytes ||
+				got.Exchange.BlockRows != tc.req.Exchange.BlockRows ||
+				got.Exchange.BlockBytes != tc.req.Exchange.BlockBytes ||
 				got.Exchange.Producers != tc.req.Exchange.Producers ||
 				got.Exchange.QueuedBatches != tc.req.Exchange.QueuedBatches ||
 				got.Exchange.ProducerBatches != tc.req.Exchange.ProducerBatches ||
@@ -610,6 +639,35 @@ func TestExchangeEnvelopeRejectsMixedLanes(t *testing.T) {
 	pull.ExecutionMode = ExecutionReadOnly
 	if err := EncodeRequest(io.Discard, &pull); err != nil {
 		t.Fatalf("canonical pull: %v", err)
+	}
+	reduce := base
+	reduce.Exchange.Operation = ExchangeReduce
+	reduce.Exchange.Output = reduce.Exchange.Key
+	reduce.Exchange.Output.Stage++
+	reduce.Exchange.Kinds = []distributedagg.Kind{distributedagg.None, distributedagg.Count}
+	reduce.Exchange.GroupKeys = []uint16{0}
+	reduce.Exchange.MaxStateBytes = 1 << 20
+	reduce.Exchange.BlockRows = 16
+	reduce.Exchange.BlockBytes = 4096
+	if err := EncodeRequest(io.Discard, &reduce); err != nil {
+		t.Fatalf("canonical reduce: %v", err)
+	}
+	for _, mutate := range []func(*ExchangeRequest){
+		func(r *ExchangeRequest) { r.Output.Operation[0]++ },
+		func(r *ExchangeRequest) { r.Output.Stage = r.Key.Stage },
+		func(r *ExchangeRequest) { r.Kinds[1] = distributedagg.Kind(99) },
+		func(r *ExchangeRequest) { r.Kinds[1] = distributedagg.None },
+		func(r *ExchangeRequest) { r.GroupKeys = []uint16{0, 0} },
+		func(r *ExchangeRequest) { r.MaxStateBytes = 0 },
+		func(r *ExchangeRequest) { r.BlockBytes = 8 },
+	} {
+		req := reduce
+		req.Exchange.Kinds = append([]distributedagg.Kind(nil), reduce.Exchange.Kinds...)
+		req.Exchange.GroupKeys = append([]uint16(nil), reduce.Exchange.GroupKeys...)
+		mutate(&req.Exchange)
+		if err := EncodeRequest(io.Discard, &req); !errors.Is(err, errBadExchange) {
+			t.Fatalf("invalid reduce request error = %v, want errBadExchange", err)
+		}
 	}
 	badReply := &ShardResponse{
 		Kind: ResponseCompletion, RowsAffected: 1,

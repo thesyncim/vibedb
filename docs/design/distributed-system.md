@@ -246,9 +246,9 @@ selection avoids modulo bias. Additive shard-wire commands now open, push,
 pull with explicit acknowledgment, and cancel these mailboxes after ordinary
 allocation/routing/ownership admission. Open and push retries are idempotent;
 an unacknowledged pull is redelivered, so a lost response cannot drop a batch.
-Authenticated peer admission, worker-local reducers, and planner stage
-selection remain required before this becomes the default serving
-worker-to-worker hash/range execution path.
+Authenticated peer admission remains required before enabling this transport
+outside the current trusted/loopback boundary. General hash joins and range
+exchange also remain pending; grouped hash reduction is serving and cost gated.
 
 The intermediate data plane also has one compact row-block representation.
 It frames opaque value bytes and nulls directly, validates bounded row/cell/byte
@@ -261,10 +261,14 @@ in bounded parallelism and its producer core emits retry-sequenced blocks plus
 an explicit final batch for every partition. A read-only shard fragment now
 wires its SQL cursor directly to persistent destination-worker connections;
 the fragment carries only SQL/typed parameters plus bounded key ordinals and
-ownership coordinates, never a serialized relational plan. The remaining
-boundary is a worker-local reducer and selection from physical `OpRepartition`;
-routing rows through the gateway query path would add an avoidable hop and is
-intentionally not presented as the finished design.
+ownership coordinates, never a serialized relational plan. Destination reducers
+consume all input partitions concurrently with producers, use the same
+byte-native exact combiner as the gateway fallback, and stream disjoint final
+groups through a second bounded mailbox. A terminal output batch makes a
+completed reduce retry detectable without replaying drained input. Physical
+`OpRepartition` is selected when centralized grouped state violates the memory
+objective; otherwise the lower-network gateway finalizer remains the winning
+plan.
 
 The first transport primitive now serves: an additive row-batch request keeps
 the ordinary routed request/response bytes unchanged, while opted-in reads send
@@ -277,13 +281,14 @@ backpressure; the current SQL cursor still materializes its locally bounded
 result before framing, so this is not yet a vector-streaming scan or an
 inter-node hash/range exchange.
 
-Multi-shard grouped partial/final reads now consume this lane directly. A
+The lower-cardinality multi-shard grouped fallback consumes this lane directly. A
 bounded worker set opens shard streams in parallel; unbuffered per-request
 handoffs let each active shard retain only its current decoded frame, while the
 final merger drains in canonical route order for deterministic first-appearance
 semantics. Group keys and winning extrema move into packed merger-owned byte
 arenas before a frame is released. This is a bounded streaming gather/final
-aggregate, not yet a hash/range repartition between worker nodes.
+aggregate. Higher estimated grouped state uses the separate worker-to-worker
+hash path above; range repartition and distributed joins remain pending.
 
 ## Replication and movement
 
@@ -381,10 +386,10 @@ cluster does not fork into named protocol generations.
    route order without whole-shard response materialization.
    A bounded worker mailbox/partition state machine and owner-fenced shard-wire
    lifecycle commands, canonical blocks, exact partitioning, bounded gateway
-   lifecycle/producer primitives, and direct shard-cursor producers are also
-   present; worker-local reduction and planner selection are next.
-   Hash/range exchange and worker-local final aggregation follow, then
-   by runtime filters, batched row-ID late materialization, distributed index
+   lifecycle/producer primitives, direct shard-cursor producers, partition-local
+   grouped reducers, and memory-costed physical hash-repartition selection are
+   also present. General hash/range join exchange follows, then runtime filters,
+   batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.
 6. **Pending:** wire the existing Raft foundation into serving, enable
    per-bucket telemetry, lease relocation, replica catch-up, hysteretic

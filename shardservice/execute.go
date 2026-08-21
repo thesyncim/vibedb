@@ -413,6 +413,8 @@ func (c *shardConn) executeExchange(req *ShardRequest) *ShardResponse {
 		resp := exchangeCompletion(ExchangePull)
 		resp.Exchange.Batch = batch
 		return resp
+	case ExchangeReduce:
+		return c.executeExchangeReduce(ctx, box, command)
 	default:
 		return exchangeError(exchange.ErrInvalidSpec)
 	}

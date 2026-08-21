@@ -18,8 +18,8 @@ shard.
 | --- | --- |
 | `distribution` | Canonical placement scalars, full-tuple virtual-bucket mapping, affinity/tenant placement validation, immutable shard manifests, routing versions, allocation generations, and ownership epochs |
 | `sql/driver.OpenCluster` | Opt-in, one-shard embedded placement and write preflight; no network |
-| `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol; ordinary reads remain one frame, opted-in internal reads can use bounded sequence-checked row frames, and owner-fenced exchange mailbox commands provide retry-safe backpressure without SQL/JSON parsing |
-| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, periodic durable coordinator redrive, and byte-native bounded row-batch consumption for grouped partial/final reads; hash/range repartition is not yet wired |
+| `vibedb-shard` / `shardservice` | One locally fenced, leader-only SQL store served over the bounded shard protocol; ordinary reads remain one frame, opted-in internal reads can use bounded sequence-checked row frames, and owner-fenced exchange commands provide retry-safe backpressure plus exact partition-local grouped reduction without generic JSON parsing |
+| `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, periodic durable coordinator redrive, byte-native grouped streaming, and memory-costed worker-to-worker hash repartition; general range/join exchange is not yet wired |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space, shadow-only split recommendation; it has no production caller and cannot publish or move topology |
 
@@ -34,15 +34,18 @@ raw attempt-fenced identities, unbiased fixed-stage partition selection,
 registry capacity reservation, per-producer sequence/credit enforcement,
 retry-digest idempotence, acknowledgment-based redelivery, backpressure,
 deadlines, and deterministic cancellation cleanup. The shard wire exposes
-owner-fenced open/push/pull+ack/cancel commands. No planner currently opens or
-selects this path for `Query`, so this is not yet the default distributed
-hash/range execution path. A gateway-internal lifecycle coordinator and producer core
+owner-fenced open/push/pull+ack/cancel/reduce commands. The physical planner
+selects this path for multi-shard grouped queries when centralized state cannot
+satisfy the active memory objective; smaller plans retain the lower-network
+gateway finalizer. A gateway-internal lifecycle coordinator and producer core
 can already open partitions in bounded parallelism, exact-hash canonical JSON
 group identities, build borrowed-decode row blocks, sequence pushes, and
-terminate empty partitions; these are orchestration primitives, not a query
-path exposed by `Query`. An additive read-only shard fragment can now stream its
+terminate empty partitions. An additive read-only shard fragment streams its
 cursor directly to those destination mailboxes over persistent per-partition
 peer connections; exchange-only destination connections allocate no SQL session.
+Every destination reducer drains while producers run, combines the exact shared
+COUNT/SUM/MIN/MAX program, and publishes bounded result blocks to a second
+mailbox before the gateway gathers disjoint partitions.
 
 ## Network and trust boundary
 

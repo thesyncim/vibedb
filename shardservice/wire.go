@@ -6,6 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	vibejson "github.com/thesyncim/vibejson"
@@ -468,9 +469,10 @@ type ShardRequest struct {
 }
 
 const (
-	MaxRepartitionTargets    = 256
-	MaxRepartitionKeyColumns = 64
-	MaxExchangeAddressBytes  = 512
+	MaxRepartitionTargets     = 256
+	MaxRepartitionKeyColumns  = 64
+	MaxExchangeAddressBytes   = 512
+	MaxExchangeReducerColumns = 1024
 )
 
 // RepartitionTarget is one destination worker/partition. Address is retained
@@ -553,9 +555,10 @@ const (
 	ExchangePush
 	ExchangePull
 	ExchangeCancel
+	ExchangeReduce
 )
 
-func (o ExchangeOperation) valid() bool { return o >= ExchangeOpen && o <= ExchangeCancel }
+func (o ExchangeOperation) valid() bool { return o >= ExchangeOpen && o <= ExchangeReduce }
 
 // ExchangeRequest carries raw attempt-fenced mailbox commands without SQL,
 // JSON parsing, formatted identities, or a serialized query plan.
@@ -576,6 +579,16 @@ type ExchangeRequest struct {
 	HasAck      bool
 	AckProducer uint16
 	AckSequence uint32
+
+	// Output and the aggregate program are present only for ExchangeReduce.
+	// The reducer drains Key, finalizes partition-local groups, and transfers
+	// canonical result blocks into Output as producer zero.
+	Output        exchange.Key
+	Kinds         []distributedagg.Kind
+	GroupKeys     []uint16
+	MaxStateBytes uint64
+	BlockRows     uint32
+	BlockBytes    uint32
 }
 
 func (r ExchangeRequest) present() bool { return r.Operation != ExchangeNone }
@@ -586,27 +599,64 @@ func (r ExchangeRequest) canonical() bool {
 	batchFields := r.Batch.Producer != 0 || r.Batch.Sequence != 0 || r.Batch.Rows != 0 ||
 		len(r.Batch.Data) != 0 || r.Batch.Final
 	ackFields := r.HasAck || r.AckProducer != 0 || r.AckSequence != 0
+	reduceFields := r.Output != (exchange.Key{}) || len(r.Kinds) != 0 || len(r.GroupKeys) != 0 ||
+		r.MaxStateBytes != 0 || r.BlockRows != 0 || r.BlockBytes != 0
 	if !r.present() {
-		return r.Key == (exchange.Key{}) && !openFields && !batchFields && !ackFields
+		return r.Key == (exchange.Key{}) && !openFields && !batchFields && !ackFields && !reduceFields
 	}
 	if !r.Operation.valid() || r.Key.Operation.IsZero() {
 		return false
 	}
 	switch r.Operation {
 	case ExchangeOpen:
-		return !batchFields && !ackFields && (exchange.Spec{
+		return !batchFields && !ackFields && !reduceFields && (exchange.Spec{
 			Key: r.Key, Producers: r.Producers, QueuedBatches: r.QueuedBatches,
 			ProducerBatches: r.ProducerBatches, BufferedRows: r.BufferedRows,
 			BufferedBytes: r.BufferedBytes, TotalRows: r.TotalRows, TotalBytes: r.TotalBytes,
 		}).Valid()
 	case ExchangePush:
-		return !openFields && !ackFields && canonicalExchangeBatch(r.Batch)
+		return !openFields && !ackFields && !reduceFields && canonicalExchangeBatch(r.Batch)
 	case ExchangePull:
-		return !openFields && !batchFields &&
+		return !openFields && !batchFields && !reduceFields &&
 			((r.HasAck && r.AckProducer < exchange.MaxProducers) ||
 				(!r.HasAck && r.AckProducer == 0 && r.AckSequence == 0))
 	case ExchangeCancel:
-		return !openFields && !batchFields && !ackFields
+		return !openFields && !batchFields && !ackFields && !reduceFields
+	case ExchangeReduce:
+		if openFields || batchFields || ackFields || r.Output.Operation.IsZero() ||
+			r.Output.Operation != r.Key.Operation || r.Output.Attempt != r.Key.Attempt ||
+			r.Output.Partition != r.Key.Partition || r.Output.Stage == r.Key.Stage ||
+			len(r.Kinds) == 0 || len(r.Kinds) > MaxExchangeReducerColumns ||
+			len(r.GroupKeys) == 0 || len(r.GroupKeys) > MaxRepartitionKeyColumns ||
+			r.MaxStateBytes == 0 || r.MaxStateBytes > exchange.MaxMailboxBytes ||
+			!exchange.ValidBlockLimits(uint32(len(r.Kinds)), r.BlockRows, r.BlockBytes) {
+			return false
+		}
+		for i, column := range r.GroupKeys {
+			if int(column) >= len(r.Kinds) || r.Kinds[column] != distributedagg.None {
+				return false
+			}
+			for previous := range i {
+				if r.GroupKeys[previous] == column {
+					return false
+				}
+			}
+		}
+		for column, kind := range r.Kinds {
+			if !kind.Valid() {
+				return false
+			}
+			if kind == distributedagg.None {
+				found := false
+				for _, key := range r.GroupKeys {
+					found = found || int(key) == column
+				}
+				if !found {
+					return false
+				}
+			}
+		}
+		return true
 	default:
 		return false
 	}

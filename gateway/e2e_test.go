@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,7 +207,18 @@ func newE2ECluster(t *testing.T) *e2eCluster {
 		db := initializeTestShardStore(
 			t, filepath.Join(t.TempDir(), string(spec.id)+".vdb"), ownership,
 		)
-		srv, err := shardservice.NewServer(db, ownership, shardservice.Options{})
+		srv, err := shardservice.NewServer(db, ownership, shardservice.Options{
+			ExchangeDial: func(_ context.Context, address []byte) (net.Conn, error) {
+				name := string(address)
+				peer := servers[name]
+				if peer == nil {
+					return nil, fmt.Errorf("no exchange peer at %q", name)
+				}
+				client, server := net.Pipe()
+				go peer.ServeConn(server)
+				return client, nil
+			},
+		})
 		if err != nil {
 			t.Fatalf("NewServer %s: %v", spec.id, err)
 		}
@@ -282,6 +294,14 @@ func (c *e2eCluster) snapshot(t *testing.T, gen uint64) *Snapshot {
 	return c.buildSnapshot(t, gen, nil)
 }
 
+func (c *e2eCluster) snapshotWithStatistics(
+	t *testing.T,
+	gen uint64,
+	statistics []TableStatistics,
+) *Snapshot {
+	return c.buildSnapshotAtVersionWithStatistics(t, gen, c.version, nil, statistics)
+}
+
 // buildSnapshot builds a snapshot generation, applying any per-shard epoch
 // override so a test can pin a generation whose ownership epoch is stale.
 func (c *e2eCluster) buildSnapshot(t *testing.T, gen uint64, epochs map[distribution.ShardID]distribution.OwnershipEpoch) *Snapshot {
@@ -293,6 +313,16 @@ func (c *e2eCluster) buildSnapshotAtVersion(
 	gen uint64,
 	version distribution.RoutingVersion,
 	epochs map[distribution.ShardID]distribution.OwnershipEpoch,
+) *Snapshot {
+	return c.buildSnapshotAtVersionWithStatistics(t, gen, version, epochs, nil)
+}
+
+func (c *e2eCluster) buildSnapshotAtVersionWithStatistics(
+	t *testing.T,
+	gen uint64,
+	version distribution.RoutingVersion,
+	epochs map[distribution.ShardID]distribution.OwnershipEpoch,
+	statistics []TableStatistics,
 ) *Snapshot {
 	t.Helper()
 	manShards := make([]distribution.Shard, len(c.shards))
@@ -317,7 +347,7 @@ func (c *e2eCluster) buildSnapshotAtVersion(
 		Placements:    []distribution.TablePlacement{{Table: "messages", Distribution: c.dist, Columns: []string{"/tenant_id"}}},
 		Manifests:     []*distribution.Manifest{man},
 	}
-	snap, err := NewSnapshot(config, endpoints, gen)
+	snap, err := NewSnapshotWithPlannerMetadata(config, endpoints, gen, nil, statistics)
 	if err != nil {
 		t.Fatalf("NewSnapshot: %v", err)
 	}
@@ -1512,6 +1542,64 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 	}
 	if got := c.dialer.totalDials(); got != 48 {
 		t.Fatalf("total dials after grouped sort and top-k = %d, want 48", got)
+	}
+}
+
+func TestE2EPlannerSelectedWorkerRepartitionAggregation(t *testing.T) {
+	c := newE2ECluster(t)
+	partitions := make([]PartitionStatistics, len(c.shards))
+	for i := range c.shards {
+		partitions[i] = PartitionStatistics{
+			Partition: string(c.shards[i].id),
+			Rows:      Estimate{Value: 250_000, Lower: 200_000, Upper: 250_000, Confidence: .9},
+		}
+	}
+	snapshot := c.snapshotWithStatistics(t, 1, []TableStatistics{{
+		Table:      "messages",
+		Rows:       Estimate{Value: 1_000_000, Lower: 800_000, Upper: 1_000_000, Confidence: .9},
+		RowBytes:   Estimate{Value: 128, Lower: 96, Upper: 128, Confidence: .9},
+		Partitions: partitions,
+	}})
+	profiles := DefaultProfiles()
+	batch := profiles[ClassBatch]
+	// Centralized grouped state is estimated at 128 MiB; four worker-local
+	// reducers are estimated below this hard 40 MiB per-query objective.
+	batch.MaxAggregateBytes = 40 << 20
+	profiles[ClassBatch] = batch
+	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{Profiles: profiles})
+	query := Query{
+		SQL:   `SELECT n, COUNT(*) FROM messages GROUP BY n`,
+		Class: ClassBatch,
+	}
+	explanation, err := executor.Explain(t.Context(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(explanation.PhysicalPlan, "repartition") {
+		t.Fatalf("planner did not select worker repartition:\n%s", explanation.PhysicalPlan)
+	}
+	result, err := executor.Query(t.Context(), query)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Rows) != 8 {
+		t.Fatalf("groups = %d, want 8", len(result.Rows))
+	}
+	got := make(map[int64]int64, len(result.Rows))
+	for _, row := range result.Rows {
+		if len(row) != 2 {
+			t.Fatalf("row width = %d, want 2", len(row))
+		}
+		key := decodeInts(t, [][]shardservice.Cell{{row[0]}})[0]
+		count := decodeInts(t, [][]shardservice.Cell{{row[1]}})[0]
+		got[key] = count
+	}
+	for _, shard := range c.shards {
+		for _, value := range shard.ns {
+			if got[value] != 1 {
+				t.Fatalf("group %d count = %d, want 1 (all %v)", value, got[value], got)
+			}
+		}
 	}
 }
 

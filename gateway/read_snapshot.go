@@ -23,7 +23,13 @@ func (e *Executor) snapshotFanout(ctx context.Context, plan *plan, profile Profi
 	for i := range plan.calls {
 		plan.calls[i].req.ReadFenceID = id
 	}
-	result, queryErr := e.fanout(ctx, plan, profile)
+	var result *Result
+	var queryErr error
+	if plan.repartition {
+		result, queryErr = e.fanoutRepartitionGrouped(ctx, plan, profile)
+	} else {
+		result, queryErr = e.fanout(ctx, plan, profile)
+	}
 	releaseErr := e.releaseReadFences(ctx, plan.calls, profile, id)
 	return result, errors.Join(queryErr, releaseErr)
 }

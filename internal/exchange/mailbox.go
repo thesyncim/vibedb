@@ -128,10 +128,63 @@ type Mailbox struct {
 	hasAck      bool
 	ackProducer uint16
 	ackSequence uint32
+	consumer    bool
 
 	producers  []producerState
 	dataReady  chan struct{}
 	spaceReady chan struct{}
+}
+
+// ProducerProgress is a constant-size retry probe for one output producer.
+// Accepted is true after at least one batch; Final proves the exact stream has
+// reached its terminal batch.
+type ProducerProgress struct {
+	Accepted bool
+	Final    bool
+}
+
+// ProducerProgress reports whether producer has begun or completed its stream.
+func (m *Mailbox) ProducerProgress(producer uint16) (ProducerProgress, error) {
+	if m == nil {
+		return ProducerProgress{}, ErrClosed
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if producer >= uint16(len(m.producers)) {
+		return ProducerProgress{}, ErrProducer
+	}
+	if err := m.stateErrorLocked(); err != nil {
+		return ProducerProgress{}, err
+	}
+	state := &m.producers[producer]
+	return ProducerProgress{Accepted: state.hasLast, Final: state.final}, nil
+}
+
+// ClaimConsumer admits exactly one reducer or pull loop for the lifetime of a
+// mailbox drain. It prevents duplicate reduce requests from concurrently
+// acknowledging the same redelivered input stream.
+func (m *Mailbox) ClaimConsumer() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	if m.consumer || m.stateErrorLocked() != nil {
+		m.mu.Unlock()
+		return false
+	}
+	m.consumer = true
+	m.mu.Unlock()
+	return true
+}
+
+// ReleaseConsumer releases a successful or failed drain claim.
+func (m *Mailbox) ReleaseConsumer() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.consumer = false
+	m.mu.Unlock()
 }
 
 // Statistics is a detached constant-size mailbox accounting snapshot.
@@ -390,6 +443,7 @@ func (m *Mailbox) Cancel(cause error) {
 		m.head, m.tail, m.count = 0, 0, 0
 		m.rows, m.bytes = 0, 0
 		m.delivered = false
+		m.consumer = false
 	}
 	m.mu.Unlock()
 	m.signalAll()

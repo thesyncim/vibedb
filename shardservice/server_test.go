@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -349,6 +350,106 @@ func TestDirectRepartitionPushesShardCursorToDestinationWorkers(t *testing.T) {
 		if groups[group] != count {
 			t.Fatalf("group %s count = %s, want %s (all %v)", group, groups[group], count, groups)
 		}
+	}
+}
+
+func TestExchangeReducerCombinesPartitionLocallyAndRetriesAfterCompletion(t *testing.T) {
+	server, _ := newServer(t, Options{})
+	conn := dial(t, server)
+	inputKey := testExchangeKey(121)
+	inputKey.Stage, inputKey.Partition, inputKey.Attempt = 4, 2, 3
+	outputKey := inputKey
+	outputKey.Stage++
+
+	openBox := func(key exchange.Key, producers uint16) {
+		req := ownedExchangeRequest(ExchangeOpen, key)
+		req.Exchange.Producers = producers
+		req.Exchange.QueuedBatches = 8
+		req.Exchange.ProducerBatches = 8
+		req.Exchange.BufferedRows = 64
+		req.Exchange.BufferedBytes = 64 << 10
+		req.Exchange.TotalRows = 128
+		req.Exchange.TotalBytes = 128 << 10
+		exec(t, conn, req)
+	}
+	openBox(inputKey, 2)
+	openBox(outputKey, 1)
+
+	pushRows := func(producer uint16, rows [][]exchange.Cell) {
+		var block exchange.BlockBuilder
+		if err := block.Reset(nil, 5, 16, 4<<10); err != nil {
+			t.Fatal(err)
+		}
+		for i := range rows {
+			if err := block.AppendRow(rows[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		data, count := block.Bytes()
+		req := ownedExchangeRequest(ExchangePush, inputKey)
+		req.Exchange.Batch = exchange.Batch{
+			Producer: producer, Rows: count, Data: data, Final: true,
+		}
+		exec(t, conn, req)
+	}
+	pushRows(0, [][]exchange.Cell{
+		{{Bytes: []byte(`1`)}, {Bytes: []byte(`2`)}, {Bytes: []byte(`5`)}, {Bytes: []byte(`2`)}, {Bytes: []byte(`3`)}},
+		{{Bytes: []byte(`2`)}, {Bytes: []byte(`1`)}, {Bytes: []byte(`4`)}, {Bytes: []byte(`4`)}, {Bytes: []byte(`4`)}},
+	})
+	pushRows(1, [][]exchange.Cell{
+		{{Bytes: []byte(`1.0`)}, {Bytes: []byte(`3`)}, {Bytes: []byte(`7`)}, {Bytes: []byte(`1`)}, {Bytes: []byte(`10`)}},
+	})
+
+	reduce := ownedExchangeRequest(ExchangeReduce, inputKey)
+	reduce.Exchange.Output = outputKey
+	reduce.Exchange.Kinds = []distributedagg.Kind{
+		distributedagg.None, distributedagg.Count, distributedagg.Sum,
+		distributedagg.Min, distributedagg.Max,
+	}
+	reduce.Exchange.GroupKeys = []uint16{0}
+	reduce.Exchange.MaxStateBytes = 1 << 20
+	reduce.Exchange.BlockRows = 16
+	reduce.Exchange.BlockBytes = 4 << 10
+	if got := exec(t, conn, reduce); got.Exchange.Operation != ExchangeReduce {
+		t.Fatalf("Reduce = %+v", got)
+	}
+	// The input is drained, so this proves retry success comes from the output
+	// terminal marker rather than recomputing or duplicating rows.
+	if got := exec(t, conn, reduce); got.Exchange.Operation != ExchangeReduce {
+		t.Fatalf("Reduce retry = %+v", got)
+	}
+
+	pull := ownedExchangeRequest(ExchangePull, outputKey)
+	response := exec(t, conn, pull)
+	if response.Exchange.EOF || !response.Exchange.Batch.Final {
+		t.Fatalf("output = %+v", response.Exchange)
+	}
+	block, err := exchange.OpenBlock(response.Exchange.Batch.Data)
+	if err != nil || block.Rows() != 2 || block.Columns() != 5 {
+		t.Fatalf("output block = %dx%d, %v", block.Rows(), block.Columns(), err)
+	}
+	got := make(map[string][4]string)
+	row := make([]exchange.Cell, 5)
+	for block.NextInto(row) {
+		got[string(row[0].Bytes)] = [4]string{
+			string(row[1].Bytes), string(row[2].Bytes),
+			string(row[3].Bytes), string(row[4].Bytes),
+		}
+	}
+	if got["1"] != [4]string{"5", "12", "1", "10"} ||
+		got["2"] != [4]string{"1", "4", "4", "4"} {
+		t.Fatalf("reduced groups = %v", got)
+	}
+}
+
+func TestExchangeReducerLimitIsTypedResourceLimit(t *testing.T) {
+	response := reducerError(distributedagg.ErrLimit)
+	if response.Kind != ResponseError || response.ErrorKind != ErrorResourceLimit {
+		t.Fatalf("reducer limit = %+v, want ResourceLimit error frame", response)
+	}
+	response = reducerError(distributedagg.ErrAggregate)
+	if response.Kind != ResponseError || response.ErrorKind == ErrorResourceLimit {
+		t.Fatalf("malformed reducer fragment = %+v, want non-limit error frame", response)
 	}
 }
 

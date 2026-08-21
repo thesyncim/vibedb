@@ -43,6 +43,7 @@ type plan struct {
 	aggregates   []sqlast.AggKind
 	groupKeys    []int
 	aggHeaders   []string
+	repartition  bool
 	physical     *queryplanner.Plan
 	planning     queryplanner.OptimizerStatistics
 }
@@ -139,9 +140,25 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		aggregates:   bound.aggregates,
 		groupKeys:    bound.groupKeys,
 		aggHeaders:   bound.aggHeaders,
+		repartition:  physicalPlanContains(physical, queryplanner.OpRepartition),
 		physical:     physical,
 		planning:     planning,
 	}, nil
+}
+
+func physicalPlanContains(plan *queryplanner.Plan, operation queryplanner.Operator) bool {
+	if plan == nil {
+		return false
+	}
+	if plan.Expression.Op == operation {
+		return true
+	}
+	for i := range plan.Children {
+		if physicalPlanContains(plan.Children[i], operation) {
+			return true
+		}
+	}
+	return false
 }
 
 // scatterReason classifies why a route scattered, best-effort, for metrics: a

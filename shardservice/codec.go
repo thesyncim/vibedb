@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
 )
@@ -660,6 +661,22 @@ func encodeExchangeRequest(e *encbuf, request ExchangeRequest) {
 		} else {
 			e.u8(0)
 		}
+	case ExchangeReduce:
+		e.fixed16(request.Output.Operation)
+		e.u32(request.Output.Stage)
+		e.u32(request.Output.Partition)
+		e.u32(request.Output.Attempt)
+		e.u32(uint32(len(request.Kinds)))
+		for _, kind := range request.Kinds {
+			e.u8(uint8(kind))
+		}
+		e.u32(uint32(len(request.GroupKeys)))
+		for _, column := range request.GroupKeys {
+			e.u32(uint32(column))
+		}
+		e.u64(request.MaxStateBytes)
+		e.u32(request.BlockRows)
+		e.u32(request.BlockBytes)
 	}
 }
 
@@ -707,6 +724,32 @@ func decodeExchangeRequest(d *deccur) (ExchangeRequest, error) {
 			request.AckSequence = d.u32()
 		}
 	case ExchangeCancel:
+	case ExchangeReduce:
+		request.Output = exchange.Key{
+			Operation: exchange.ID(d.fixed16()), Stage: d.u32(),
+			Partition: d.u32(), Attempt: d.u32(),
+		}
+		kinds := d.count(1, MaxExchangeReducerColumns)
+		if kinds > 0 {
+			request.Kinds = make([]distributedagg.Kind, kinds)
+			for i := range request.Kinds {
+				request.Kinds[i] = distributedagg.Kind(d.u8())
+			}
+		}
+		keys := d.count(4, MaxRepartitionKeyColumns)
+		if keys > 0 {
+			request.GroupKeys = make([]uint16, keys)
+			for i := range request.GroupKeys {
+				column := d.u32()
+				if column > math.MaxUint16 {
+					return ExchangeRequest{}, errBadExchange
+				}
+				request.GroupKeys[i] = uint16(column)
+			}
+		}
+		request.MaxStateBytes = d.u64()
+		request.BlockRows = d.u32()
+		request.BlockBytes = d.u32()
 	default:
 		return ExchangeRequest{}, errBadEnum
 	}

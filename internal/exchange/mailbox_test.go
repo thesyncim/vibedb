@@ -102,6 +102,29 @@ func TestMailboxBackpressureSequencingAndCompletion(t *testing.T) {
 	}
 }
 
+func TestMailboxReducerClaimAndProducerProgress(t *testing.T) {
+	box := newMailbox(testSpec())
+	if !box.ClaimConsumer() || box.ClaimConsumer() {
+		t.Fatal("consumer claim was not exclusive")
+	}
+	box.ReleaseConsumer()
+	if !box.ClaimConsumer() {
+		t.Fatal("released consumer claim could not be reacquired")
+	}
+	box.ReleaseConsumer()
+	progress, err := box.ProducerProgress(0)
+	if err != nil || progress.Accepted || progress.Final {
+		t.Fatalf("initial progress = %+v, %v", progress, err)
+	}
+	if err := box.Push(t.Context(), Batch{Producer: 0, Final: true}); err != nil {
+		t.Fatal(err)
+	}
+	progress, err = box.ProducerProgress(0)
+	if err != nil || !progress.Accepted || !progress.Final {
+		t.Fatalf("final progress = %+v, %v", progress, err)
+	}
+}
+
 func TestMailboxRejectsSequenceLimitsAndConcurrentProducer(t *testing.T) {
 	spec := testSpec()
 	spec.QueuedBatches = 1

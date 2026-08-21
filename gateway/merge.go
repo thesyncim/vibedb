@@ -5,20 +5,14 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
-	"math/big"
-	"math/bits"
 	"slices"
-	"strconv"
-	"strings"
 
-	queryplanner "github.com/thesyncim/vibedb/planner"
+	"github.com/thesyncim/vibedb/internal/distributedagg"
 	queryengine "github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
-	"github.com/thesyncim/vibedb/store"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The shard-result merge: a single-shard route streams through unchanged; a
@@ -597,287 +591,21 @@ func mergeAggregateRows(
 		for shard := range results {
 			cells[shard] = results[shard].Rows[0][column]
 		}
-		switch kind {
-		case sqlast.AggCount:
-			row[column], err = mergeCounts(cells, maxBytes)
-		case sqlast.AggSum:
-			row[column], err = mergeSums(cells, maxBytes)
-		case sqlast.AggMin:
-			row[column], err = mergeExtrema(cells, false)
-		case sqlast.AggMax:
-			row[column], err = mergeExtrema(cells, true)
-		default:
+		program, programErr := distributedAggregateKind(kind)
+		if programErr != nil || program == distributedagg.None {
 			err = fmt.Errorf("%w: aggregate %s has no combiner", ErrMergeAggregate, kind)
+		} else {
+			row[column], err = distributedagg.MergeCells(program, cells, maxBytes)
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, errors.Join(ErrMergeAggregate, err)
 		}
 	}
 	return columns, [][]shardservice.Cell{row}, nil
 }
 
-type groupedExtreme struct {
-	cell   shardservice.Cell
-	number []byte
-	set    bool
-}
-
-type exactCount struct {
-	small uint64
-	wide  big.Int
-	large bool
-}
-
-func (c *exactCount) add(value uint64) {
-	if !c.large && ^uint64(0)-c.small >= value {
-		c.small += value
-		return
-	}
-	if !c.large {
-		c.wide.SetUint64(c.small)
-		c.large = true
-	}
-	var term big.Int
-	term.SetUint64(value)
-	c.wide.Add(&c.wide, &term)
-}
-
-func (c *exactCount) addBig(value *big.Int) {
-	if !c.large {
-		c.wide.SetUint64(c.small)
-		c.large = true
-	}
-	c.wide.Add(&c.wide, value)
-}
-
-func (c *exactCount) append(dst []byte) []byte {
-	if c.large {
-		return c.wide.Append(dst, 10)
-	}
-	return strconv.AppendUint(dst, c.small, 10)
-}
-
-func (c *exactCount) retainedBytes() uint64 {
-	if !c.large {
-		return 0
-	}
-	return retainedBigIntBytes(&c.wide)
-}
-
-type exactSignedInteger struct {
-	small int64
-	wide  big.Int
-	large bool
-}
-
-func (i *exactSignedInteger) add(value int64) {
-	const maxInt64 = int64(^uint64(0) >> 1)
-	const minInt64 = -maxInt64 - 1
-	if !i.large && !((value > 0 && i.small > maxInt64-value) ||
-		(value < 0 && i.small < minInt64-value)) {
-		i.small += value
-		return
-	}
-	if !i.large {
-		i.wide.SetInt64(i.small)
-		i.large = true
-	}
-	var term big.Int
-	term.SetInt64(value)
-	i.wide.Add(&i.wide, &term)
-}
-
-func (i *exactSignedInteger) addBig(value *big.Int) {
-	if !i.large {
-		i.wide.SetInt64(i.small)
-		i.large = true
-	}
-	i.wide.Add(&i.wide, value)
-}
-
-func (i *exactSignedInteger) append(dst []byte) []byte {
-	if i.large {
-		return i.wide.Append(dst, 10)
-	}
-	return strconv.AppendInt(dst, i.small, 10)
-}
-
-func (i *exactSignedInteger) setRat(dst *big.Rat) {
-	if i.large {
-		dst.SetInt(&i.wide)
-		return
-	}
-	var value big.Int
-	value.SetInt64(i.small)
-	dst.SetInt(&value)
-}
-
-func (i *exactSignedInteger) retainedBytes() uint64 {
-	if !i.large {
-		return 0
-	}
-	return retainedBigIntBytes(&i.wide)
-}
-
-type exactSum struct {
-	integer  exactSignedInteger
-	rational big.Rat
-	set      bool
-	fraction bool
-}
-
-type groupedOutputArena struct {
-	chunks  [][]byte
-	current []byte
-}
-
-func (a *groupedOutputArena) reserve(need int) int {
-	if cap(a.current)-len(a.current) < need {
-		size := max(4<<10, 2*cap(a.current))
-		if size > 64<<10 {
-			size = 64 << 10
-		}
-		if size < need {
-			size = need
-		}
-		a.current = make([]byte, 0, size)
-		a.chunks = append(a.chunks, a.current)
-	}
-	return len(a.current)
-}
-
-func (a *groupedOutputArena) appendCount(value *exactCount) []byte {
-	need := 21
-	if value.large {
-		need = value.wide.BitLen()/3 + 2
-	}
-	start := a.reserve(need)
-	a.current = value.append(a.current)
-	return a.current[start:len(a.current):len(a.current)]
-}
-
-func (a *groupedOutputArena) appendInteger(value *exactSignedInteger) []byte {
-	need := 21
-	if value.large {
-		need = value.wide.BitLen()/3 + 3
-	}
-	start := a.reserve(need)
-	a.current = value.append(a.current)
-	return a.current[start:len(a.current):len(a.current)]
-}
-
-func (a *groupedOutputArena) appendBytes(value []byte) []byte {
-	start := a.reserve(len(value))
-	a.current = append(a.current, value...)
-	return a.current[start:len(a.current):len(a.current)]
-}
-
-func (s *exactSum) add(
-	cell shardservice.Cell,
-	maxBytes uint64,
-	scratch []byte,
-) ([]byte, error) {
-	if cell.Null {
-		return scratch, nil
-	}
-	spelling := bytes.TrimSpace(cell.Bytes)
-	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
-		return scratch, fmt.Errorf("%w: SUM state %q exceeds exact numeric admission", ErrMergeAggregate, cell.Bytes)
-	}
-	raw := vibejson.RawValue{Src: spelling}
-	if value, ok := raw.Int64(); ok {
-		if s.fraction {
-			var term big.Rat
-			term.SetInt64(value)
-			s.rational.Add(&s.rational, &term)
-		} else {
-			s.integer.add(value)
-		}
-		s.set = true
-		return scratch, nil
-	}
-	if isPlainJSONInteger(spelling) && vibejson.Valid(spelling) {
-		var value big.Int
-		if _, ok := value.SetString(byteview.String(spelling), 10); !ok {
-			return scratch, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
-		}
-		if s.fraction {
-			var term big.Rat
-			term.SetInt(&value)
-			s.rational.Add(&s.rational, &term)
-		} else {
-			s.integer.addBig(&value)
-		}
-		s.set = true
-		return scratch, nil
-	}
-
-	canonical, canonicalErr := queryplanner.AppendCanonicalScalarJSON(scratch, spelling)
-	if canonicalErr != nil || len(canonical) == 0 || canonical[0] == '"' ||
-		canonical[0] == 't' || canonical[0] == 'f' || canonical[0] == 'n' ||
-		!queryplanner.CanonicalNumberFitsDecimalBytes(byteview.String(canonical), maxBytes) {
-		return canonical, fmt.Errorf("%w: SUM state %q exceeds exact numeric admission", ErrMergeAggregate, cell.Bytes)
-	}
-	var value big.Rat
-	if _, ok := value.SetString(byteview.String(canonical)); !ok {
-		return canonical, fmt.Errorf("%w: SUM state %q is not an exact number", ErrMergeAggregate, cell.Bytes)
-	}
-	if !s.fraction {
-		s.integer.setRat(&s.rational)
-		s.fraction = true
-	}
-	s.rational.Add(&s.rational, &value)
-	s.set = true
-	return canonical, nil
-}
-
-func (s *exactSum) retainedBytes() uint64 {
-	if s.fraction {
-		return retainedBigRatBytes(&s.rational)
-	}
-	return s.integer.retainedBytes()
-}
-
-func isPlainJSONInteger(value []byte) bool {
-	if len(value) == 0 {
-		return false
-	}
-	start := 0
-	if value[0] == '-' {
-		start = 1
-	}
-	if start == len(value) {
-		return false
-	}
-	for _, char := range value[start:] {
-		if char < '0' || char > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// groupedAggregateMerger is a columnar final-aggregation state. Each aggregate
-// kind owns a dense slice indexed by group ID, avoiding one map entry or heap
-// object per (group, column). KeyInterner supplies stable dense IDs and owns one
-// copy of each composite exact-value group key.
 type groupedAggregateMerger struct {
-	kinds     []sqlast.AggKind
-	groupKeys []int
-	rows      []shardservice.Cell
-	width     int
-	counts    [][]exactCount
-	sums      [][]exactSum
-	extrema   [][]groupedExtreme
-
-	interner      store.KeyInterner
-	key           []byte
-	numberScratch []byte
-	keyEncoder    queryengine.JSONGroupKeyEncoder
-	input         groupedOutputArena
-	output        groupedOutputArena
-	retained      uint64
-	maxBytes      uint64
+	shared *distributedagg.Merger
 }
 
 func newGroupedAggregateMerger(
@@ -885,33 +613,19 @@ func newGroupedAggregateMerger(
 	groupKeys []int,
 	maxBytes uint64,
 ) (*groupedAggregateMerger, error) {
-	if len(kinds) == 0 || len(groupKeys) == 0 {
-		return nil, fmt.Errorf("%w: grouped program has no columns or keys", ErrMergeAggregate)
+	program, keys, err := distributedAggregateProgram(kinds, groupKeys)
+	if err != nil {
+		return nil, err
 	}
-	seen := make([]bool, len(kinds))
-	for _, column := range groupKeys {
-		if column < 0 || column >= len(kinds) || seen[column] || kinds[column] != sqlast.AggNone {
-			return nil, fmt.Errorf("%w: grouped key program is invalid", ErrMergeAggregate)
-		}
-		seen[column] = true
+	shared, err := distributedagg.NewMerger(program, keys, maxBytes)
+	if err != nil {
+		return nil, errors.Join(ErrMergeAggregate, err)
 	}
-	for column, kind := range kinds {
-		if kind == sqlast.AggNone && !seen[column] {
-			return nil, fmt.Errorf("%w: grouped projection column %d is not a key", ErrMergeAggregate, column)
-		}
-	}
-	m := &groupedAggregateMerger{
-		kinds: kinds, groupKeys: groupKeys, maxBytes: maxBytes,
-		counts: make([][]exactCount, len(kinds)), sums: make([][]exactSum, len(kinds)),
-		extrema: make([][]groupedExtreme, len(kinds)),
-	}
-	return m, nil
+	return &groupedAggregateMerger{shared: shared}, nil
 }
 
 // mergeGroupedAggregateRows combines shard-local GROUP BY rows by the query
 // engine's exact composite group identity, then finalizes COUNT/SUM/MIN/MAX.
-// Result order is stable first appearance in route/row order; grouped ORDER BY
-// remains a separate post-finalization stage and is rejected by planning.
 func mergeGroupedAggregateRows(
 	results []*shardservice.ShardResponse,
 	kinds []sqlast.AggKind,
@@ -944,380 +658,24 @@ func mergeGroupedAggregateRows(
 }
 
 func (m *groupedAggregateMerger) add(row []shardservice.Cell) error {
-	m.key = m.key[:0]
-	var rawKeyBytes uint64
-	for keyOrdinal, column := range m.groupKeys {
-		value := row[column].Bytes
-		if row[column].Null {
-			value = groupedNullJSON[:]
-		}
-		if ^uint64(0)-rawKeyBytes < uint64(len(value))+16 {
-			return fmt.Errorf("group key byte accounting overflow")
-		}
-		rawKeyBytes += uint64(len(value)) + 16
-		if m.maxBytes != 0 &&
-			(m.retained > m.maxBytes || rawKeyBytes > m.maxBytes-m.retained) {
-			return fmt.Errorf("group key %d exceeds grouped state byte cap", keyOrdinal)
-		}
-		var ok bool
-		m.key, ok = m.keyEncoder.Append(m.key, value)
-		if !ok {
-			return fmt.Errorf("group key column %d is not valid JSON", column)
-		}
+	if m == nil || m.shared == nil {
+		return ErrMergeAggregate
 	}
-	before := m.interner.Len()
-	id := m.interner.Intern(m.key)
-	if int(id) == before {
-		if err := m.addGroup(row, len(m.key)); err != nil {
-			return err
-		}
-	}
-	group := int(id)
-	for column, kind := range m.kinds {
-		cell := row[column]
-		switch kind {
-		case sqlast.AggNone:
-			continue
-		case sqlast.AggCount:
-			previous := m.counts[column][group].retainedBytes()
-			if err := addCount(&m.counts[column][group], cell, m.maxBytes); err != nil {
-				return err
-			}
-			if err := m.growState(previous, m.counts[column][group].retainedBytes()); err != nil {
-				return err
-			}
-		case sqlast.AggSum:
-			previous := m.sums[column][group].retainedBytes()
-			var err error
-			m.numberScratch, err = m.sums[column][group].add(
-				cell, m.maxBytes, m.numberScratch[:0],
-			)
-			if err != nil {
-				return err
-			}
-			if err := m.growState(previous, m.sums[column][group].retainedBytes()); err != nil {
-				return err
-			}
-		case sqlast.AggMin:
-			if err := m.addExtreme(&m.extrema[column][group], cell, false); err != nil {
-				return err
-			}
-		case sqlast.AggMax:
-			if err := m.addExtreme(&m.extrema[column][group], cell, true); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("aggregate %s has no grouped combiner", kind)
-		}
-	}
-	return nil
-}
-
-func (m *groupedAggregateMerger) addGroup(row []shardservice.Cell, keyBytes int) error {
-	// The fixed charge deliberately overestimates slice headers, cell headers,
-	// interner directory load, and columnar accumulator metadata. Exact key and
-	// big-number backing bytes are charged separately as they grow.
-	inputBytes := 0
-	for column, kind := range m.kinds {
-		if kind == sqlast.AggNone && !row[column].Null {
-			inputBytes += len(row[column].Bytes)
-		}
-	}
-	charge := uint64(96 + keyBytes + inputBytes + len(row)*192)
-	if err := m.charge(charge); err != nil {
-		return err
-	}
-	if m.width == 0 {
-		m.width = len(row)
-	}
-	for column, kind := range m.kinds {
-		if kind == sqlast.AggNone {
-			cell := row[column]
-			if !cell.Null {
-				cell.Bytes = m.input.appendBytes(cell.Bytes)
-			}
-			m.rows = append(m.rows, cell)
-		} else {
-			m.rows = append(m.rows, shardservice.Cell{})
-		}
-		switch kind {
-		case sqlast.AggCount:
-			m.counts[column] = append(m.counts[column], exactCount{})
-		case sqlast.AggSum:
-			m.sums[column] = append(m.sums[column], exactSum{})
-		case sqlast.AggMin, sqlast.AggMax:
-			m.extrema[column] = append(m.extrema[column], groupedExtreme{})
-		}
-	}
-	return nil
-}
-
-// addExtreme retains only a winning spelling in merger-owned packed storage.
-// Streamed response frames can therefore be released immediately after add
-// returns instead of one tiny MIN/MAX value pinning a whole transport frame.
-func (m *groupedAggregateMerger) addExtreme(
-	state *groupedExtreme,
-	cell shardservice.Cell,
-	maximum bool,
-) error {
-	if cell.Null {
-		return nil
-	}
-	candidate := classifyCell(cell)
-	if candidate.kind != ckNumber || !candidate.valid {
-		return fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
-	}
-	replace := !state.set
-	if state.set {
-		comparison := queryengine.CompareValidatedJSONNumbers(candidate.num, state.number)
-		replace = (maximum && comparison > 0) || (!maximum && comparison < 0)
-	}
-	if !replace {
-		return nil
-	}
-	if err := m.charge(uint64(len(cell.Bytes))); err != nil {
-		return err
-	}
-	owned := shardservice.Cell{Bytes: m.input.appendBytes(cell.Bytes)}
-	ownedCandidate := classifyCell(owned)
-	state.cell, state.number, state.set = owned, ownedCandidate.num, true
-	return nil
-}
-
-func (m *groupedAggregateMerger) growState(previous, current uint64) error {
-	if current <= previous {
-		return nil
-	}
-	delta := current - previous
-	if err := m.charge(delta); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *groupedAggregateMerger) charge(bytes uint64) error {
-	if ^uint64(0)-m.retained < bytes {
-		return fmt.Errorf("grouped state byte accounting overflow")
-	}
-	m.retained += bytes
-	if m.maxBytes != 0 && m.retained > m.maxBytes {
-		return fmt.Errorf("grouped state %d bytes exceeds %d-byte cap", m.retained, m.maxBytes)
+	if err := m.shared.Add(row); err != nil {
+		return errors.Join(ErrMergeAggregate, err)
 	}
 	return nil
 }
 
 func (m *groupedAggregateMerger) finish() ([][]shardservice.Cell, error) {
-	groups := m.interner.Len()
-	var outputBytes uint64
-	for group := 0; group < groups; group++ {
-		for column, kind := range m.kinds {
-			cell := &m.rows[group*m.width+column]
-			switch kind {
-			case sqlast.AggNone:
-			case sqlast.AggCount:
-				*cell = shardservice.Cell{Bytes: m.output.appendCount(&m.counts[column][group])}
-			case sqlast.AggSum:
-				state := &m.sums[column][group]
-				if !state.set {
-					*cell = shardservice.Cell{Null: true}
-				} else if !state.fraction {
-					*cell = shardservice.Cell{Bytes: m.output.appendInteger(&state.integer)}
-				} else {
-					spelling, err := exactDecimalString(&state.rational, m.maxBytes)
-					if err != nil {
-						return nil, err
-					}
-					*cell = shardservice.Cell{Bytes: []byte(spelling)}
-				}
-			case sqlast.AggMin, sqlast.AggMax:
-				state := &m.extrema[column][group]
-				if state.set {
-					*cell = state.cell
-				} else {
-					*cell = shardservice.Cell{Null: true}
-				}
-			}
-			if ^uint64(0)-outputBytes < uint64(len(cell.Bytes)) {
-				return nil, fmt.Errorf("%w: grouped output byte accounting overflow", ErrMergeAggregate)
-			}
-			outputBytes += uint64(len(cell.Bytes))
-			if m.maxBytes != 0 && outputBytes > m.maxBytes {
-				return nil, fmt.Errorf("%w: grouped output %d bytes exceeds %d-byte cap",
-					ErrMergeAggregate, outputBytes, m.maxBytes)
-			}
-		}
+	if m == nil || m.shared == nil {
+		return nil, ErrMergeAggregate
 	}
-	rows := make([][]shardservice.Cell, groups)
-	for group := range rows {
-		start := group * m.width
-		rows[group] = m.rows[start : start+m.width : start+m.width]
+	rows, err := m.shared.Finish()
+	if err != nil {
+		return nil, errors.Join(ErrMergeAggregate, err)
 	}
 	return rows, nil
-}
-
-func retainedBigIntBytes(value *big.Int) uint64 {
-	return uint64(cap(value.Bits())) * uint64(bits.UintSize/8)
-}
-
-func retainedBigRatBytes(value *big.Rat) uint64 {
-	return retainedBigIntBytes(value.Num()) + retainedBigIntBytes(value.Denom())
-}
-
-func mergeCounts(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
-	var total exactCount
-	for _, cell := range cells {
-		if err := addCount(&total, cell, maxBytes); err != nil {
-			return shardservice.Cell{}, err
-		}
-	}
-	spelling := total.append(nil)
-	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
-		return shardservice.Cell{}, fmt.Errorf("%w: COUNT state exceeds aggregate byte cap", ErrMergeAggregate)
-	}
-	return shardservice.Cell{Bytes: spelling}, nil
-}
-
-func addCount(total *exactCount, cell shardservice.Cell, maxBytes uint64) error {
-	if cell.Null {
-		return fmt.Errorf("%w: COUNT state is null", ErrMergeAggregate)
-	}
-	spelling := bytes.TrimSpace(cell.Bytes)
-	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
-		return fmt.Errorf("%w: COUNT state exceeds aggregate byte cap", ErrMergeAggregate)
-	}
-	if count, ok := (vibejson.RawValue{Src: spelling}).Uint64(); ok {
-		total.add(count)
-		return nil
-	}
-	var count big.Int
-	if !isPlainJSONInteger(spelling) || !vibejson.Valid(spelling) {
-		return fmt.Errorf("%w: COUNT state %q is not a non-negative integer", ErrMergeAggregate, cell.Bytes)
-	}
-	if _, ok := count.SetString(byteview.String(spelling), 10); !ok || count.Sign() < 0 {
-		return fmt.Errorf("%w: COUNT state %q is not a non-negative integer", ErrMergeAggregate, cell.Bytes)
-	}
-	total.addBig(&count)
-	return nil
-}
-
-func mergeSums(cells []shardservice.Cell, maxBytes uint64) (shardservice.Cell, error) {
-	var total exactSum
-	var scratch []byte
-	for _, cell := range cells {
-		var err error
-		scratch, err = total.add(cell, maxBytes, scratch[:0])
-		if err != nil {
-			return shardservice.Cell{}, err
-		}
-	}
-	if !total.set {
-		return shardservice.Cell{Null: true}, nil
-	}
-	if !total.fraction {
-		spelling := total.integer.append(nil)
-		if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
-			return shardservice.Cell{}, fmt.Errorf("%w: SUM state exceeds aggregate byte cap", ErrMergeAggregate)
-		}
-		return shardservice.Cell{Bytes: spelling}, nil
-	}
-	spelling, err := exactDecimalString(&total.rational, maxBytes)
-	if err != nil {
-		return shardservice.Cell{}, err
-	}
-	return shardservice.Cell{Bytes: []byte(spelling)}, nil
-}
-
-func mergeExtrema(cells []shardservice.Cell, maximum bool) (shardservice.Cell, error) {
-	var state groupedExtreme
-	for _, cell := range cells {
-		if err := addExtreme(&state, cell, maximum); err != nil {
-			return shardservice.Cell{}, err
-		}
-	}
-	if !state.set {
-		return shardservice.Cell{Null: true}, nil
-	}
-	return state.cell, nil
-}
-
-func addExtreme(state *groupedExtreme, cell shardservice.Cell, maximum bool) error {
-	if cell.Null {
-		return nil
-	}
-	candidate := classifyCell(cell)
-	if candidate.kind != ckNumber || !candidate.valid {
-		return fmt.Errorf("%w: MIN/MAX state %q is not numeric", ErrMergeAggregate, cell.Bytes)
-	}
-	if !state.set {
-		state.cell, state.number, state.set = cell, candidate.num, true
-		return nil
-	}
-	comparison := queryengine.CompareValidatedJSONNumbers(candidate.num, state.number)
-	if (maximum && comparison > 0) || (!maximum && comparison < 0) {
-		state.cell, state.number = cell, candidate.num
-	}
-	return nil
-}
-
-func exactDecimalString(value *big.Rat, maxBytes uint64) (string, error) {
-	denominator := new(big.Int).Set(value.Denom())
-	twos, fives := 0, 0
-	for denominator.Bit(0) == 0 {
-		denominator.Rsh(denominator, 1)
-		twos++
-	}
-	five := big.NewInt(5)
-	var remainder big.Int
-	for {
-		remainder.Mod(denominator, five)
-		if remainder.Sign() != 0 {
-			break
-		}
-		denominator.Quo(denominator, five)
-		fives++
-	}
-	if denominator.Cmp(big.NewInt(1)) != 0 {
-		return "", fmt.Errorf("%w: SUM state is not a finite decimal", ErrMergeAggregate)
-	}
-	scale := max(twos, fives)
-	coefficient := new(big.Int).Set(value.Num())
-	if twos < scale {
-		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(scale-twos)), nil))
-	}
-	if fives < scale {
-		coefficient.Mul(coefficient, new(big.Int).Exp(big.NewInt(5), big.NewInt(int64(scale-fives)), nil))
-	}
-	negative := coefficient.Sign() < 0
-	coefficient.Abs(coefficient)
-	digits := coefficient.String()
-	needed := len(digits)
-	if scale >= len(digits) {
-		needed = scale + 2
-	} else if scale != 0 {
-		needed++
-	}
-	if negative {
-		needed++
-	}
-	if maxBytes != 0 && uint64(needed) > maxBytes {
-		return "", fmt.Errorf("%w: SUM state exceeds aggregate byte cap", ErrMergeAggregate)
-	}
-	if scale == 0 {
-		if negative && digits != "0" {
-			return "-" + digits, nil
-		}
-		return digits, nil
-	}
-	if scale >= len(digits) {
-		digits = strings.Repeat("0", scale-len(digits)+1) + digits
-	}
-	point := len(digits) - scale
-	digits = digits[:point] + "." + digits[point:]
-	digits = strings.TrimRight(strings.TrimRight(digits, "0"), ".")
-	if negative && digits != "0" {
-		digits = "-" + digits
-	}
-	return digits, nil
 }
 
 // concatRows appends every shard's rows in target order, trimming at a positive

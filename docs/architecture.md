@@ -303,7 +303,8 @@ remain predictable because their capacities and fold work are fixed at open.
   execution (`shardservice`) and stateless routing gateway (`gateway`) exist
   today, including an opt-in bounded row-batch transport primitive and
   owner-fenced retry-safe mailbox lifecycle commands that keep the routed
-  one-frame lane unchanged but are not yet planner-orchestrated repartition;
+  one-frame lane unchanged, plus planner-selected hash repartition and
+  partition-local grouped reducers;
   both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
@@ -315,9 +316,10 @@ remain predictable because their capacities and fold work are fixed at open.
   indexes, coherent snapshots, bounded exchange, serving replication, and
   online movement. Its bounded worker-mailbox state machine, canonical
   intermediate row blocks, shard-wire lifecycle commands, and gateway stage
-  lifecycle/producer primitives, and direct shard-cursor-to-mailbox pushing
-  exist, but worker-local reducers, authenticated peer admission, and
-  planner-selected serving exchange remain unfinished. It is a delivery
+  lifecycle/producer primitives, direct shard-cursor-to-mailbox pushing,
+  worker-local grouped reducers, and memory-costed `OpRepartition` selection
+  exist, but authenticated peer admission and general join/range stages remain
+  unfinished. It is a delivery
   contract, not current capability.
 - [SQL surface](design/sql-surface.md): the shared `database/sql` and `pgwire`
   contract over JSON documents, schemas, exact indexes, joins, and

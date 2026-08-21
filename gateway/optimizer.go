@@ -51,9 +51,19 @@ func (m *distributedCostModel) ChildPropertyAlternatives(
 	case queryplanner.OpRemoteQuery, queryplanner.OpIndexScan:
 		return [][]queryplanner.PhysicalProperties{nil}, nil
 	case queryplanner.OpFinalAggregate:
-		return [][]queryplanner.PhysicalProperties{{{
+		alternatives := [][]queryplanner.PhysicalProperties{{{
 			Distribution: queryplanner.Distribution{Kind: queryplanner.DistributionAny},
-		}}}, nil
+		}}}
+		metadata, ok := m.private[expr.Private]
+		if ok && !metadata.indexLookup && len(metadata.groupKeys) != 0 && metadata.targets > 1 {
+			alternatives = append(alternatives, []queryplanner.PhysicalProperties{{
+				Distribution: queryplanner.Distribution{
+					Kind: queryplanner.DistributionHash, Keys: plannerGroupKeys(metadata.groupKeys),
+					Partitions: uint32(metadata.targets),
+				},
+			}})
+		}
+		return alternatives, nil
 	default:
 		return nil, nil
 	}
@@ -64,7 +74,7 @@ func (m *distributedCostModel) Provided(
 	_ queryplanner.GroupID,
 	_ queryplanner.ExprID,
 	expr queryplanner.Expression,
-	_ []*queryplanner.Plan,
+	children []*queryplanner.Plan,
 ) (queryplanner.PhysicalProperties, error) {
 	metadata, ok := m.private[expr.Private]
 	if !ok {
@@ -83,6 +93,9 @@ func (m *distributedCostModel) Provided(
 			Ordering:     plannerOrdering(metadata.order),
 		}, nil
 	case queryplanner.OpFinalAggregate:
+		if len(children) == 1 && children[0].Provided.Distribution.Kind == queryplanner.DistributionHash {
+			return queryplanner.PhysicalProperties{Distribution: children[0].Provided.Distribution}, nil
+		}
 		return queryplanner.PhysicalProperties{
 			Distribution: queryplanner.Distribution{Kind: queryplanner.DistributionSingleton, Partitions: 1},
 		}, nil
@@ -96,7 +109,7 @@ func (m *distributedCostModel) LocalCost(
 	_ queryplanner.GroupID,
 	_ queryplanner.ExprID,
 	expr queryplanner.Expression,
-	_ []*queryplanner.Plan,
+	children []*queryplanner.Plan,
 ) (queryplanner.Cost, error) {
 	metadata, ok := m.private[expr.Private]
 	if !ok {
@@ -125,10 +138,19 @@ func (m *distributedCostModel) LocalCost(
 			rows = max(1, metadata.outputRows)
 		}
 		width := max(16, metadata.rowBytes)
+		partitions := 1.0
+		network := boundedProduct(rows, width)
+		if len(children) == 1 && children[0].Provided.Distribution.Kind == queryplanner.DistributionHash {
+			partitions = max(1, float64(children[0].Provided.Distribution.Partitions))
+			network = 0
+		}
+		memory := boundedProduct(rows, width) / partitions
+		if len(metadata.groupKeys) == 0 {
+			memory = boundedProduct(width, float64(len(metadata.aggregates)))
+		}
 		return queryplanner.Cost{
-			CPU:     boundedProduct(rows, float64(len(metadata.aggregates))),
-			Network: boundedProduct(rows, width),
-			Memory:  boundedProduct(width, float64(len(metadata.aggregates))),
+			CPU:     boundedProduct(rows/partitions, float64(len(metadata.aggregates))),
+			Network: network, Memory: memory,
 		}, nil
 	default:
 		return queryplanner.Cost{}, fmt.Errorf("unknown physical operator %s", expr.Op)
@@ -149,6 +171,20 @@ func (m *distributedCostModel) Enforcers(
 	width := logical.RowBytes.Normalize(128).Upper
 	if rows < 0 || width < 0 {
 		return nil, queryplanner.ErrInvalidStatistics
+	}
+	if required.Distribution.Kind == queryplanner.DistributionHash &&
+		(provided.Distribution.Kind != required.Distribution.Kind ||
+			provided.Distribution.Partitions != required.Distribution.Partitions ||
+			!slices.Equal(provided.Distribution.Keys, required.Distribution.Keys)) {
+		partitions := max(1, float64(required.Distribution.Partitions))
+		return []queryplanner.EnforcerChain{{{
+			Op:       queryplanner.OpRepartition,
+			Provided: queryplanner.PhysicalProperties{Distribution: required.Distribution},
+			Cost: queryplanner.Cost{
+				CPU: rows / partitions, Network: boundedProduct(rows, width),
+				Memory: boundedProduct(width, partitions),
+			},
+		}}}, nil
 	}
 	if required.Distribution.Kind == queryplanner.DistributionSingleton &&
 		provided.Distribution.Kind != queryplanner.DistributionSingleton {
@@ -206,6 +242,14 @@ func (m *distributedCostModel) Enforcers(
 		}}}, nil
 	}
 	return nil, nil
+}
+
+func plannerGroupKeys(keys []int) []queryplanner.ColumnID {
+	out := make([]queryplanner.ColumnID, len(keys))
+	for i := range keys {
+		out[i] = queryplanner.ColumnID(keys[i])
+	}
+	return out
 }
 
 func orderingPrefix(provided, required []queryplanner.OrderingColumn) bool {
