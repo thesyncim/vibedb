@@ -13,8 +13,13 @@ func TestAppendSourceSealBuildsExactAllocationFreeBinaryTransition(t *testing.T)
 	plan, _, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 2
+	artifacts := testArtifactSet(t, plan, state)
+	tail, err := plan.partitioner.InitialTailCursor(artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	buffer := make([]byte, 0, replicatedstate.MaxOwnershipTransitionBytes)
-	encoded, err := plan.AppendSourceSeal(buffer[:0], state, 1, 2)
+	encoded, err := plan.AppendSourceSeal(buffer[:0], state, tail, 1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +37,7 @@ func TestAppendSourceSealBuildsExactAllocationFreeBinaryTransition(t *testing.T)
 	if !raceDetectorEnabled {
 		if allocations := testing.AllocsPerRun(1_000, func() {
 			var appendErr error
-			encoded, appendErr = plan.AppendSourceSeal(buffer[:0], state, 1, 2)
+			encoded, appendErr = plan.AppendSourceSeal(buffer[:0], state, tail, 1, 2)
 			if appendErr != nil {
 				panic(appendErr)
 			}
@@ -44,13 +49,20 @@ func TestAppendSourceSealBuildsExactAllocationFreeBinaryTransition(t *testing.T)
 	prefix := []byte("unchanged")
 	stale := state
 	stale.Binding.RouteGeneration--
-	got, err := plan.AppendSourceSeal(prefix, stale, 1, 2)
+	got, err := plan.AppendSourceSeal(prefix, stale, tail, 1, 2)
 	if !errors.Is(err, ErrTopologyConflict) || !bytes.Equal(got, prefix) {
 		t.Fatalf("stale seal = %q, %v", got, err)
 	}
-	got, err = plan.AppendSourceSeal(prefix, state, 1, 1)
+	got, err = plan.AppendSourceSeal(prefix, state, tail, 1, 1)
 	if !errors.Is(err, ErrTopologyConflict) || !bytes.Equal(got, prefix) {
 		t.Fatalf("same-member seal = %q, %v", got, err)
+	}
+	advanced := state
+	advanced.Applied++
+	advanced.LastEntryDigest = [32]byte{1}
+	got, err = plan.AppendSourceSeal(prefix, advanced, tail, 1, 2)
+	if !errors.Is(err, ErrTopologyConflict) || !bytes.Equal(got, prefix) {
+		t.Fatalf("tail-behind seal = %q, %v", got, err)
 	}
 }
 

@@ -170,9 +170,9 @@ The caller must retain the immutable plan and execute each proof-checking action
 Post-publication recovery reconstructs and validates the prior source manifest
 from the exact child sequence. Caller mutation of the original split request
 cannot relabel an accepted controller plan.
-The execution helpers encode the source seal without JSON and construct the
-certified unpublished catalog successor. They do not bypass replicated apply or
-the catalog CAS.
+The execution helpers encode the source seal without JSON only from an exact
+caught-up unsealed tail, and construct the certified unpublished catalog
+successor. They do not bypass replicated apply or the catalog CAS.
 The reconciler treats a captured source ahead of its tail cursor as catch-up,
 including the crash window after the ownership seal applies but before that
 seal reaches every child stage. Child progress is a single monotonic phase,

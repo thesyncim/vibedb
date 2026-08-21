@@ -9,17 +9,21 @@ import (
 )
 
 // AppendSourceSeal appends the exact binary ownership transition required by
-// ActionSealSource. The current source binding and replica-set version remain
-// in the command, so replicated apply rechecks them at proposal execution.
+// ActionSealSource. The state must equal the exact validated unsealed tail cut.
+// The current source binding and replica-set version remain in the command, so
+// replicated apply rechecks them at proposal execution.
 // A caller can reuse a buffer with capacity MaxOwnershipTransitionBytes to keep
 // the control loop allocation-free.
 func (p *Plan) AppendSourceSeal(
 	dst []byte,
 	state replicatedstate.State,
+	tail rangesplit.TailCursor,
 	sourceMember uint64,
 	targetMember uint64,
 ) ([]byte, error) {
-	if p == nil || !p.initialSourceState(state) || state.ReplicaSetVersion == 0 {
+	if p == nil || !p.initialSourceState(state) || state.ReplicaSetVersion == 0 ||
+		p.partitioner.ValidateTailCursor(tail) != nil || tail.Sealed() ||
+		!p.sourceStateMatchesCut(state, tail) {
 		return dst, ErrTopologyConflict
 	}
 	retained := p.children[p.retained]

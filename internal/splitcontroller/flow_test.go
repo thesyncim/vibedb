@@ -116,7 +116,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	assertFlowAction(t, plan, observed, ActionSealSource)
 
 	seal, err := plan.AppendSourceSeal(
-		make([]byte, 0, replicatedstate.MaxOwnershipTransitionBytes), state, 1, 2,
+		make([]byte, 0, replicatedstate.MaxOwnershipTransitionBytes), state, tail, 1, 2,
 	)
 	if err != nil {
 		t.Fatal(err)

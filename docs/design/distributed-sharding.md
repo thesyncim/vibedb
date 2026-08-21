@@ -115,10 +115,11 @@ the cutover route generation to equal the exact catalog successor. It does not
 execute an action or provide a runnable service controller.
 
 The plan can encode the source ownership seal directly into the existing fixed
-binary transition grammar. A reused maximum-size buffer keeps this step
-allocation-free. The plan also constructs the certified unpublished catalog
-successor, but the existing durable and in-memory generation CAS operations
-remain the publication authority.
+binary transition grammar only when the supplied source state exactly matches
+the validated, unsealed tail cursor. A reused maximum-size buffer keeps this
+step allocation-free. The plan also constructs the certified unpublished
+catalog successor, but the existing durable and in-memory generation CAS
+operations remain the publication authority.
 
 An observed source publication may legitimately be ahead of a durable tail
 cursor while captured writes or the ownership seal await translation. The
