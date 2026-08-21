@@ -236,7 +236,7 @@ func readFresh(reader io.Reader, destination []byte) error {
 }
 
 func marshalSnapshot(snapshot *pb.Snapshot) ([]byte, error) {
-	if err := validateBootstrapSnapshot(snapshot, 0); err != nil {
+	if err := validateSnapshotBase(snapshot, 0); err != nil {
 		return nil, err
 	}
 	metadata := snapshot.GetMetadata()
@@ -309,7 +309,7 @@ func unmarshalSnapshot(data []byte, memberID uint64) (*pb.Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	if outgoing != 0 || next != 0 || reserved != 0 || int(voters)+int(learners) > MaxBootstrapMembers || dataLength > MaxBootstrapBytes {
+	if outgoing != 0 || next != 0 || reserved != 0 || int(voters)+int(learners) > MaxBootstrapMembers || dataLength > MaxSnapshotBaseBytes {
 		return nil, fmt.Errorf("%w: snapshot geometry", ErrCorrupt)
 	}
 	conf := &pb.ConfState{Voters: make([]uint64, int(voters)), Learners: make([]uint64, int(learners))}
@@ -338,24 +338,25 @@ func unmarshalSnapshot(data []byte, memberID uint64) (*pb.Snapshot, error) {
 	snapshot := &pb.Snapshot{Data: append([]byte(nil), payload...), Metadata: &pb.SnapshotMetadata{
 		ConfState: conf, Index: uint64Pointer(index), Term: uint64Pointer(term),
 	}}
-	if err := validateBootstrapSnapshot(snapshot, memberID); err != nil {
+	if err := validateSnapshotBase(snapshot, memberID); err != nil {
 		return nil, fmt.Errorf("%w: decoded snapshot: %v", ErrCorrupt, err)
 	}
 	return snapshot, nil
 }
 
-func validateBootstrapSnapshot(snapshot *pb.Snapshot, memberID uint64) error {
+func validateSnapshotBase(snapshot *pb.Snapshot, memberID uint64) error {
 	if snapshot == nil || snapshot.GetMetadata() == nil || snapshot.GetMetadata().GetConfState() == nil ||
 		len(snapshot.ProtoReflect().GetUnknown()) != 0 || len(snapshot.GetMetadata().ProtoReflect().GetUnknown()) != 0 ||
 		len(snapshot.GetMetadata().GetConfState().ProtoReflect().GetUnknown()) != 0 ||
-		snapshot.GetMetadata().GetIndex() != 1 || snapshot.GetMetadata().GetTerm() != 1 ||
-		len(snapshot.GetData()) > MaxBootstrapBytes {
-		return fmt.Errorf("%w: bootstrap snapshot must be index/term one and bounded", ErrInvalid)
+		snapshot.GetMetadata().GetIndex() == 0 || snapshot.GetMetadata().GetIndex() == math.MaxUint64 ||
+		snapshot.GetMetadata().GetTerm() == 0 || snapshot.GetMetadata().GetTerm() == math.MaxUint64 ||
+		len(snapshot.GetData()) > MaxSnapshotBaseBytes {
+		return fmt.Errorf("%w: snapshot base metadata or bytes", ErrInvalid)
 	}
 	conf := snapshot.GetMetadata().GetConfState()
 	if len(conf.GetVoters()) == 0 || len(conf.GetVoters())+len(conf.GetLearners()) > MaxBootstrapMembers ||
 		len(conf.GetVotersOutgoing()) != 0 || len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() {
-		return fmt.Errorf("%w: bootstrap ConfState must be static", ErrInvalid)
+		return fmt.Errorf("%w: snapshot-base ConfState must be stable", ErrInvalid)
 	}
 	all := make([]uint64, 0, len(conf.GetVoters())+len(conf.GetLearners()))
 	for _, list := range [][]uint64{conf.GetVoters(), conf.GetLearners()} {
@@ -365,7 +366,7 @@ func validateBootstrapSnapshot(snapshot *pb.Snapshot, memberID uint64) error {
 		var previous uint64
 		for index, id := range list {
 			if id == raft.None || raft.IsLocalMsgTarget(id) || (index != 0 && id == previous) {
-				return fmt.Errorf("%w: invalid bootstrap member ID", ErrInvalid)
+				return fmt.Errorf("%w: invalid snapshot-base member ID", ErrInvalid)
 			}
 			previous = id
 			all = append(all, id)
@@ -374,11 +375,11 @@ func validateBootstrapSnapshot(snapshot *pb.Snapshot, memberID uint64) error {
 	slices.Sort(all)
 	for index := 1; index < len(all); index++ {
 		if all[index] == all[index-1] {
-			return fmt.Errorf("%w: bootstrap member appears twice", ErrInvalid)
+			return fmt.Errorf("%w: snapshot-base member appears twice", ErrInvalid)
 		}
 	}
 	if memberID != 0 && !slices.Contains(all, memberID) {
-		return fmt.Errorf("%w: local member is absent from bootstrap ConfState", ErrInvalid)
+		return fmt.Errorf("%w: local member is absent from snapshot-base ConfState", ErrInvalid)
 	}
 	return nil
 }
@@ -407,7 +408,7 @@ func marshalBootstrap(bootstrap Bootstrap, memberID uint64) ([]byte, []byte, err
 	if bootstrap.TopologyRecoveryEpoch == 0 {
 		return nil, nil, fmt.Errorf("%w: zero topology recovery epoch", ErrInvalid)
 	}
-	if err := validateBootstrapSnapshot(bootstrap.Snapshot, memberID); err != nil {
+	if err := validateSnapshotBase(bootstrap.Snapshot, memberID); err != nil {
 		return nil, nil, err
 	}
 	snapshotBytes, err := marshalSnapshot(bootstrap.Snapshot)
@@ -439,7 +440,7 @@ func unmarshalBootstrap(data []byte, memberID uint64) (Bootstrap, []byte, error)
 		return Bootstrap{}, nil, fmt.Errorf("%w: bootstrap epoch", ErrCorrupt)
 	}
 	snapshotLength, err := reader.u32()
-	if err != nil || snapshotLength > MaxBootstrapBytes+1024 {
+	if err != nil || snapshotLength > MaxSnapshotBaseBytes+1024 {
 		return Bootstrap{}, nil, fmt.Errorf("%w: bootstrap length", ErrCorrupt)
 	}
 	reserved, err := reader.u32()
@@ -611,8 +612,10 @@ func unmarshalIdentity(data []byte) (Identity, snapshotReference, formatBounds, 
 	if err := validateIdentity(identity); err != nil {
 		return Identity{}, snapshotReference{}, formatBounds{}, fmt.Errorf("%w: decoded identity: %v", ErrCorrupt, err)
 	}
-	if reference.id == ([16]byte{}) || reference.size == 0 || reference.size > MaxBootstrapBytes+1024 || reference.index != 1 || reference.term != 1 {
-		return Identity{}, snapshotReference{}, formatBounds{}, fmt.Errorf("%w: invalid bootstrap reference", ErrCorrupt)
+	if reference.id == ([16]byte{}) || reference.size == 0 ||
+		reference.size > MaxSnapshotBaseBytes+1024 || reference.index == 0 ||
+		reference.index == math.MaxUint64 || reference.term == 0 || reference.term == math.MaxUint64 {
+		return Identity{}, snapshotReference{}, formatBounds{}, fmt.Errorf("%w: invalid snapshot-base reference", ErrCorrupt)
 	}
 	if bounds.fileBytes < HeaderBytes || bounds.fileBytes > uint64(AbsoluteMaxFileBytes) || bounds.recordBytes == 0 || bounds.recordBytes > AbsoluteMaxRecordBytes ||
 		bounds.records == 0 || bounds.records > AbsoluteMaxRecords || bounds.entries == 0 || bounds.entries > AbsoluteMaxEntries || bounds.liveBytes == 0 || bounds.liveBytes > uint64(AbsoluteMaxLiveBytes) {

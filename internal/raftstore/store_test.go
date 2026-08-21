@@ -248,6 +248,62 @@ func TestCapacityProfileIsSealedAndSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestCreateFromNewerImmutableSnapshotBase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "learner.wal")
+	options := testOptions()
+	index, term := uint64(101), uint64(7)
+	base := Bootstrap{TopologyRecoveryEpoch: 11, Snapshot: &pb.Snapshot{
+		Data: []byte("certified-snapshot-base"),
+		Metadata: &pb.SnapshotMetadata{
+			Index: &index, Term: &term,
+			ConfState: &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}},
+		},
+	}}
+	store, err := Create(path, testIdentity(), testKey(), base, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := store.CapacityProfile()
+	if err != nil || profile.Format != CapacityFormatImmutableBase || profile.LogBaseIndex != index {
+		t.Fatalf("CapacityProfile = %+v, %v", profile, err)
+	}
+	first, _ := store.FirstIndex()
+	last, _ := store.LastIndex()
+	baseTerm, termErr := store.Term(index)
+	hardState, confState, stateErr := store.InitialState()
+	if first != index+1 || last != index || baseTerm != term || termErr != nil || stateErr != nil ||
+		hardState.GetCommit() != index || hardState.GetTerm() != term ||
+		confState.Equivalent(base.Snapshot.GetMetadata().GetConfState()) != nil {
+		t.Fatalf("base recovery first=%d last=%d term=%d/%v hard=%v conf=%v/%v",
+			first, last, baseTerm, termErr, hardState, confState, stateErr)
+	}
+	incarnation, err := store.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation, ReadyID: 1,
+		HardState: hard(8, index+1), Entries: []*pb.Entry{entry(index+1, 8, "tail")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, testIdentity(), base.TopologyRecoveryEpoch, testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	gotBase, _ := reopened.Snapshot()
+	gotEntries, entriesErr := reopened.Entries(index+1, index+2, math.MaxUint64)
+	if !bytes.Equal(gotBase.GetData(), base.Snapshot.GetData()) ||
+		gotBase.GetMetadata().GetIndex() != index || entriesErr != nil || len(gotEntries) != 1 ||
+		!bytes.Equal(gotEntries[0].GetData(), []byte("tail")) {
+		t.Fatalf("recovered base=%v entries=%v/%v", gotBase, gotEntries, entriesErr)
+	}
+}
+
 func TestSingleWriterWrongIdentityAndWrongKeyFailClosed(t *testing.T) {
 	path, store, options := createTestStore(t)
 	if _, err := Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options); !errors.Is(err, ErrLocked) {
@@ -356,7 +412,7 @@ func TestPersistUsesActualRecordSizeAfterWorstCaseAdmissionCloses(t *testing.T) 
 	options.MaxLiveBytes = 64 << 10
 	options.MaxFileBytes = HeaderBytes + MaxBootstrapRecordBytes + options.MaxLiveBytes + int64(options.MaxRecordBytes)
 	options.allowSmallBounds = true
-	options.MaxRecords = 1024
+	options.MaxRecords = 4096
 	path := filepath.Join(t.TempDir(), "tail.wal")
 	store, err := Create(path, testIdentity(), testKey(), testBootstrap(), options)
 	if err != nil {

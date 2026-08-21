@@ -95,8 +95,8 @@ func Create(path string, identity Identity, key Key, bootstrap Bootstrap, option
 	if err != nil {
 		return nil, err
 	}
-	if len(bootstrapRecord) > MaxBootstrapRecordBytes {
-		return nil, fmt.Errorf("%w: bootstrap record %d exceeds reserved %d", ErrBounds, len(bootstrapRecord), MaxBootstrapRecordBytes)
+	if len(bootstrapRecord) > MaxSnapshotBaseRecordBytes {
+		return nil, fmt.Errorf("%w: snapshot-base record %d exceeds reserved %d", ErrBounds, len(bootstrapRecord), MaxSnapshotBaseRecordBytes)
 	}
 	walEnd := int64(HeaderBytes + len(bootstrapRecord))
 	current := initialCurrent(header, walEnd, 1, bootstrapDigest)
@@ -491,7 +491,7 @@ func (store *Store) CapacityProfile() (CapacityProfile, error) {
 		return CapacityProfile{}, err
 	}
 	return CapacityProfile{
-		Format:       CapacityFormatStatic,
+		Format:       CapacityFormatImmutableBase,
 		LogBaseIndex: store.header.snapshot.GetMetadata().GetIndex(),
 		MaxEntries:   store.options.maxEntries,
 	}, nil
@@ -823,8 +823,8 @@ func (store *Store) FirstIndex() (uint64, error) {
 	return store.image.first, nil
 }
 
-// Snapshot implements raft.Storage. The current format always returns the detached
-// static bootstrap snapshot.
+// Snapshot implements raft.Storage and returns the detached immutable base
+// sealed into this WAL generation.
 func (store *Store) Snapshot() (*pb.Snapshot, error) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()

@@ -1,18 +1,22 @@
 # Raft WAL
 
-**Status:** current non-serving static-base Raft WAL.
+**Status:** current non-serving immutable-base Raft WAL.
 
 This design defines the first disk-backed implementation of
 `raftmodel.StableStore`. It provides bounded recovery, exact Ready retry,
 single-writer fencing, encryption at rest, and crash-ordered publication for
 one Raft member. It is not a serving or high-availability milestone.
 
-The current WAL deliberately does not provide Raft transport, Multi-Raft
+The current WAL deliberately does not provide Raft transport, serving fences,
+in-place compaction, generation cutover, or snapshot network transfer. It does
+support creating a fresh offline WAL generation from a bounded certified
+snapshot base newer than index one; learner adoption and topology publication
+remain separate higher-level gates. It otherwise does not provide
+Multi-Raft
 scheduling, shard allocation, serving fences, adaptive splitting, distributed
-query routing, log compaction, key rotation, or a snapshot newer than the
-static bootstrap snapshot. A file eventually reaches `ErrFull` and must not
-accept more durable Raft work. This document defines the only WAL contract
-accepted by the unreleased repository.
+query routing, key rotation, or live-file compaction. A file eventually reaches
+`ErrFull` and must not accept more durable Raft work. This document defines the
+only WAL contract accepted by the unreleased repository.
 
 ## Qualified platforms
 
@@ -42,7 +46,7 @@ must be restored by qualified operator tooling.
 - an immutable `Identity`;
 - one explicit AES key ID, exactly 32 bytes of master key material, and opaque
   wrapped-key provider metadata;
-- the static bootstrap snapshot and its topology recovery epoch; and
+- an immutable snapshot base and its topology recovery epoch; and
 - hard physical and recovery bounds.
 
 The immutable identity contains cluster ID and incarnation, distribution and
@@ -57,11 +61,13 @@ expected epoch and compares it exactly with the authenticated bootstrap record
 before returning a handle. A lower or higher epoch fails closed. A post-open
 getter is diagnostic only and is not the topology fence.
 
-The bootstrap snapshot is fixed at index 1, term 1. Its ConfState is
-static, bounded to 64 voters and learners, and preserves protobuf presence for
+The initial bootstrap snapshot is index 1, term 1. A newly created offline
+generation may instead use a newer certified base. Its ConfState is stable,
+bounded to 64 voters and learners, and preserves protobuf presence for
 `AutoLeave`. Unknown protobuf fields on Snapshot, SnapshotMetadata, ConfState,
 HardState, and Entry are rejected rather than silently discarded by the strict
-current codec.
+current codec. The base data is bounded to 2 MiB and carries only certification
+metadata; bulk collection bytes use the streaming snapshot artifact.
 
 ## Physical layout
 
@@ -73,7 +79,7 @@ granule.
 | 0 | 4096 | Static authenticated header |
 | 4096 | 4096 | Alternating current slot 0 |
 | 8192 | 4096 | Alternating current slot 1 |
-| 12288 | variable, 4096-aligned | Bootstrap record followed by Ready records |
+| 12288 | variable, 4096-aligned | Snapshot-base record followed by Ready records |
 | selected WAL end | remaining fixed capacity | Unselected/preallocated tail |
 
 The file has one sealed, fixed logical size and is physically reserved at
@@ -90,7 +96,7 @@ The encrypted body contains the immutable identity, bootstrap snapshot
 reference, and exact sealed bounds. Zero padding and a Castagnoli CRC plus its
 complement cover the full 4 KiB image.
 
-The bootstrap reference contains a random nonzero snapshot ID, exact encoded
+The snapshot-base reference contains a random nonzero snapshot ID, exact encoded
 size, SHA-256 digest, index, and term. Snapshot bytes are not embedded in the
 static header; the reference selects the authenticated bootstrap record.
 
@@ -104,7 +110,7 @@ contains:
 - durable boot incarnation;
 - HardState and live-log first/last bounds;
 - the final selected Ready key and encrypted semantic digest, when present;
-- bootstrap snapshot ID, index, term, size, chunk count, and digest; and
+- snapshot-base ID, index, term, size, chunk count, and digest; and
 - topology recovery epoch.
 
 Generation parity fixes the slot position. Each publication overwrites the
@@ -114,7 +120,7 @@ padding and a Castagnoli CRC/complement.
 
 ### WAL records
 
-Record 1 is the bootstrap record and starts the chain from the static-header
+Record 1 is the snapshot-base record and starts the chain from the static-header
 SHA-256 digest. Every later record is one nonempty durable Ready. Each record
 prefix contains kind, flags, padded/plain/cipher lengths, sequence,
 NodeIncarnation, ReadyID, previous-chain digest, file ID, object tag, nonce, and

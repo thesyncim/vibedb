@@ -32,12 +32,19 @@ const (
 	MaxIdentityComponentBytes = 255
 	MaxKeyIDBytes             = 255
 	MaxWrappedKeyBytes        = 1024
-	MaxBootstrapBytes         = 1 << 20
-	MaxBootstrapRecordBytes   = 2 << 20
-	MaxBootstrapMembers       = 64
-	MaxReadyEntries           = raftmodel.MaxMessageEntries
-	MinimumReadyLiveBytes     = raftmodel.MaxUncommittedEntriesSize + 32*MaxReadyEntries
-	MinimumReadyRecordBytes   = (40 + 32*MaxReadyEntries + raftmodel.MaxUncommittedEntriesSize + recordPrefixBytes + MaxKeyIDBytes + 16 + recordChecksumBytes + recordDamageGranule - 1) &^ (recordDamageGranule - 1)
+	// MaxSnapshotBaseBytes bounds the small Raft snapshot certificate sealed
+	// into a WAL generation. Bulk state is transferred and verified by the
+	// replicated-state streaming artifact, never through this field.
+	MaxSnapshotBaseBytes       = 2 << 20
+	MaxSnapshotBaseRecordBytes = 4 << 20
+	// Compatibility names retained for callers that construct the index-one
+	// initial base. The on-disk format has one immutable-base concept.
+	MaxBootstrapBytes       = MaxSnapshotBaseBytes
+	MaxBootstrapRecordBytes = MaxSnapshotBaseRecordBytes
+	MaxBootstrapMembers     = 64
+	MaxReadyEntries         = raftmodel.MaxMessageEntries
+	MinimumReadyLiveBytes   = raftmodel.MaxUncommittedEntriesSize + 32*MaxReadyEntries
+	MinimumReadyRecordBytes = (40 + 32*MaxReadyEntries + raftmodel.MaxUncommittedEntriesSize + recordPrefixBytes + MaxKeyIDBytes + 16 + recordChecksumBytes + recordDamageGranule - 1) &^ (recordDamageGranule - 1)
 )
 
 var (
@@ -54,7 +61,7 @@ var (
 	ErrPersistenceUnknown  = errors.New("raftstore: persistence outcome unknown")
 	ErrPlatformUnsupported = errors.New("raftstore: durable WAL publication is unsupported on this platform")
 	ErrRetryConflict       = errors.New("raftstore: Ready retry payload changed")
-	ErrUnsupportedSnapshot = errors.New("raftstore: non-bootstrap snapshots are not supported")
+	ErrUnsupportedSnapshot = errors.New("raftstore: Ready snapshots are not supported")
 )
 
 // Identity is the complete immutable placement identity sealed into a WAL.
@@ -72,9 +79,11 @@ type Identity struct {
 	StoreID              [16]byte
 }
 
-// Bootstrap is the only snapshot accepted by the current format. The recovery epoch is
-// mutable committed topology state, so it is sealed into this snapshot record
-// and the selected current slot rather than the member's immutable identity.
+// Bootstrap supplies the immutable snapshot base for a newly created WAL
+// generation. Index one is the initial bootstrap; a newer certified base is
+// used to start an offline-staged learner without copying the historical log.
+// The recovery epoch is mutable committed topology state, so it is sealed into
+// the base record and selected current slot rather than immutable identity.
 type Bootstrap struct {
 	TopologyRecoveryEpoch uint64
 	Snapshot              *pb.Snapshot
@@ -85,9 +94,11 @@ type Bootstrap struct {
 type CapacityFormat uint8
 
 const (
-	// CapacityFormatStatic is the immutable bootstrap-base, no-compaction
-	// contract implemented by the current WAL format.
-	CapacityFormatStatic CapacityFormat = 1
+	// CapacityFormatImmutableBase is one immutable snapshot base followed by a
+	// bounded append-only suffix. Compaction creates another offline generation;
+	// it never rewrites the active file in place.
+	CapacityFormatImmutableBase CapacityFormat = 1
+	CapacityFormatStatic                       = CapacityFormatImmutableBase
 )
 
 // CapacityProfile is a detached view of the immutable log-capacity facts
@@ -96,9 +107,8 @@ const (
 // snapshot index selected by this handle. Format is a capability contract, not
 // a serving or capacity reservation.
 //
-// The current WAL format always reports CapacityFormatStatic and LogBaseIndex 1. A
-// future runtime-snapshot or compaction-capable WAL must report another format
-// even before its first compaction, preventing retention of an invalid proof.
+// The current WAL format reports CapacityFormatImmutableBase. LogBaseIndex is
+// the exact authenticated base and may be newer than one.
 type CapacityProfile struct {
 	Format       CapacityFormat
 	LogBaseIndex uint64
@@ -204,7 +214,7 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	if int64(result.maxRecordBytes) > result.maxFileBytes-HeaderBytes {
 		return normalizedOptions{}, fmt.Errorf("%w: record bound exceeds WAL capacity", ErrBounds)
 	}
-	if result.maxLiveBytes > result.maxFileBytes-HeaderBytes-MaxBootstrapRecordBytes-int64(result.maxRecordBytes) {
+	if result.maxLiveBytes > result.maxFileBytes-HeaderBytes-MaxSnapshotBaseRecordBytes-int64(result.maxRecordBytes) {
 		return normalizedOptions{}, fmt.Errorf("%w: WAL does not reserve one maximum Ready beyond the live-log bound", ErrBounds)
 	}
 	if !result.allowSmallBounds && (result.maxRecordBytes < MinimumReadyRecordBytes || result.maxEntries < MaxReadyEntries || result.maxLiveBytes < MinimumReadyLiveBytes || result.maxRecords < 2) {
