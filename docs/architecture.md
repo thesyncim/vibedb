@@ -135,8 +135,11 @@ children. It uses a compiled `vibejson` placement program and does not use
 The same package writes deterministic hash-chained child artifacts. A verifier
 checks framing, key order, and document placement before it exposes a chunk.
 An ordered tail translator derives one exact batch for every child, including
-empty advances and shard-key moves. The package does not capture source
-transitions, install a child database, close the final write gap, or publish
+empty advances and shard-key moves. A non-serving child stage applies verified
+rows and tail batches to one durable collection. It validates the complete
+artifact image before tail catch-up and persists a fixed-size cursor through an
+atomic file replacement on Unix. The package does not capture source
+transitions, close the final write gap, prune the retained range, or publish
 topology.
 
 ## External memory and unsafe code
@@ -172,4 +175,4 @@ review rules.
 - `gateway/executor.go` and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
-- `internal/rangesplit/partition.go`, `artifact.go`, and `tail.go`
+- `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`

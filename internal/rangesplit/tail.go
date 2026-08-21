@@ -112,10 +112,12 @@ type TailBatch struct {
 	Applied             uint64
 	Term                uint64
 	RouteGeneration     uint64
+	TransitionCount     uint64
 	Operations          uint64
 	Bytes               uint64
 	transitions         []TailTransition
 	routes              []tailRoute
+	translated          bool
 }
 
 // Iterator returns a zero-allocation forward iterator over child-local
@@ -179,6 +181,16 @@ type TailStats struct {
 	ChildDigests      [autosplit.MaxSplitChildren][sha256.Size]byte
 	Operations        [autosplit.MaxSplitChildren]uint64
 	Bytes             [autosplit.MaxSplitChildren]uint64
+}
+
+// TailBatchVerifyWorkspace retains one SHA-256 state. Reuse it serially when
+// a destination verifies translated batches before durable apply.
+type TailBatchVerifyWorkspace struct {
+	hasher   hash.Hash
+	digest   [sha256.Size]byte
+	identity [sha256.Size]byte
+	fixed    [256]byte
+	size     [8]byte
 }
 
 // TailWorkspace owns the compact two-byte route table, reusable vibejson
@@ -344,8 +356,9 @@ func (p *Partitioner) TranslateTailEntry(
 			ChildBaseDigest:     cursor.childBaseDigests[child],
 			Applied:             entry.Applied, Term: entry.Term,
 			RouteGeneration: entry.RouteGeneration,
+			TransitionCount: uint64(len(entry.Transitions)),
 			Operations:      stats.Operations[child], Bytes: stats.Bytes[child],
-			transitions: entry.Transitions, routes: workspace.routes,
+			transitions: entry.Transitions, routes: workspace.routes, translated: true,
 		}
 		if err := sinks[child](batch); err != nil {
 			return cursor, TailStats{}, err
@@ -357,6 +370,95 @@ func (p *Partitioner) TranslateTailEntry(
 	next.applied = entry.Applied
 	next.term = entry.Term
 	return next, *stats, nil
+}
+
+// VerifyTailBatch recomputes one child batch digest and validates its ordered
+// borrowed operation stream. It does not grant serving or cutover authority.
+func (p *Partitioner) VerifyTailBatch(
+	batch TailBatch,
+	workspace *TailBatchVerifyWorkspace,
+) error {
+	if p == nil || workspace == nil || !batch.translated ||
+		uint64(len(batch.transitions)) != batch.TransitionCount ||
+		len(batch.routes) != len(batch.transitions) ||
+		int(batch.Child) >= int(p.childCount) ||
+		batch.PlanDigest != p.digest || batch.PlacementDigest != p.program.Digest() ||
+		batch.TranslationDigest == ([sha256.Size]byte{}) ||
+		batch.SourceBaseDigest == ([sha256.Size]byte{}) ||
+		batch.ChildBaseDigest == ([sha256.Size]byte{}) ||
+		batch.PreviousEntryDigest == ([sha256.Size]byte{}) ||
+		batch.EntryDigest == ([sha256.Size]byte{}) ||
+		batch.BeforeLogicalDigest == ([sha256.Size]byte{}) ||
+		batch.AfterLogicalDigest == ([sha256.Size]byte{}) ||
+		batch.Applied == 0 || batch.Applied == math.MaxUint64 ||
+		batch.Term == 0 || batch.Term == math.MaxUint64 ||
+		batch.RouteGeneration == 0 ||
+		batch.TransitionCount > replication.MaxMutations ||
+		batch.Operations > batch.TransitionCount {
+		return ErrTailEntry
+	}
+	if workspace.hasher == nil {
+		workspace.hasher = sha256.New()
+	}
+	h := workspace.hasher
+	h.Reset()
+	fixed := appendTailFixed(
+		workspace.fixed[:0], batch.PlanDigest, batch.PlacementDigest,
+		batch.Applied, batch.Term, batch.RouteGeneration, batch.TransitionCount,
+		batch.PreviousEntryDigest, batch.EntryDigest,
+		batch.BeforeLogicalDigest, batch.AfterLogicalDigest, batch.SourceBaseDigest,
+	)
+	_, _ = h.Write(tailChildDomain)
+	_, _ = h.Write(fixed)
+	workspace.size[0] = batch.Child
+	_, _ = h.Write(workspace.size[:1])
+	workspace.identity = batch.ChildBaseDigest
+	_, _ = h.Write(workspace.identity[:])
+	iterator := TailOperationIterator{
+		child: batch.Child, transitions: batch.transitions, routes: batch.routes,
+	}
+	var previousKey []byte
+	var operations, bytesCount uint64
+	for iterator.Next() {
+		operation := iterator.Operation()
+		if len(operation.Key) == 0 || len(operation.Key) > replication.MaxMutationKeyBytes ||
+			previousKey != nil && bytes.Compare(previousKey, operation.Key) >= 0 {
+			return ErrTailEntry
+		}
+		switch operation.Kind {
+		case replication.MutationPut:
+			if len(operation.Value) == 0 || len(operation.Value) > replication.MaxMutationValueBytes {
+				return ErrTailEntry
+			}
+		case replication.MutationDelete:
+			if operation.Value != nil {
+				return ErrTailEntry
+			}
+		default:
+			return ErrTailEntry
+		}
+		if operations == math.MaxUint64 ||
+			bytesCount > math.MaxUint64-uint64(len(operation.Key))-uint64(len(operation.Value)) {
+			return ErrTailEntry
+		}
+		operations++
+		bytesCount += uint64(len(operation.Key) + len(operation.Value))
+		workspace.fixed[0] = byte(operation.Kind)
+		_, _ = h.Write(workspace.fixed[:1])
+		hashTailFrame(h, &workspace.size, operation.Key)
+		hashTailFrame(h, &workspace.size, operation.Value)
+		previousKey = operation.Key
+	}
+	if operations != batch.Operations || bytesCount != batch.Bytes {
+		return ErrTailEntry
+	}
+	workspace.identity = batch.TranslationDigest
+	_, _ = h.Write(workspace.identity[:])
+	_ = h.Sum(workspace.digest[:0])
+	if workspace.digest != batch.Digest {
+		return ErrTailEntry
+	}
+	return nil
 }
 
 func (p *Partitioner) validTailCursor(cursor TailCursor) bool {
@@ -448,19 +550,13 @@ func (w *TailWorkspace) prepareTailHashes(
 		}
 		w.hashers[ordinal].Reset()
 	}
-	fixed := w.fixed[:0]
-	fixed = append(fixed, p.digest[:]...)
 	placement := p.program.Digest()
-	fixed = append(fixed, placement[:]...)
-	fixed = binary.LittleEndian.AppendUint64(fixed, entry.Applied)
-	fixed = binary.LittleEndian.AppendUint64(fixed, entry.Term)
-	fixed = binary.LittleEndian.AppendUint64(fixed, entry.RouteGeneration)
-	fixed = binary.LittleEndian.AppendUint64(fixed, uint64(len(entry.Transitions)))
-	fixed = append(fixed, entry.PreviousEntryDigest[:]...)
-	fixed = append(fixed, entry.EntryDigest[:]...)
-	fixed = append(fixed, entry.BeforeLogicalDigest[:]...)
-	fixed = append(fixed, entry.AfterLogicalDigest[:]...)
-	fixed = append(fixed, cursor.baseDigest[:]...)
+	fixed := appendTailFixed(
+		w.fixed[:0], p.digest, placement,
+		entry.Applied, entry.Term, entry.RouteGeneration, uint64(len(entry.Transitions)),
+		entry.PreviousEntryDigest, entry.EntryDigest,
+		entry.BeforeLogicalDigest, entry.AfterLogicalDigest, cursor.baseDigest,
+	)
 	overall := w.hashers[0]
 	_, _ = overall.Write(tailTranslationDomain)
 	_, _ = overall.Write(fixed)
@@ -508,8 +604,32 @@ func (w *TailWorkspace) hashOptionalFrame(h hash.Hash, value []byte) {
 }
 
 func (w *TailWorkspace) hashFrame(h hash.Hash, value []byte) {
-	binary.LittleEndian.PutUint64(w.size[:], uint64(len(value)))
-	_, _ = h.Write(w.size[:])
+	hashTailFrame(h, &w.size, value)
+}
+
+func appendTailFixed(
+	dst []byte,
+	plan, placement [sha256.Size]byte,
+	applied, term, routeGeneration, transitions uint64,
+	previousEntry, entry, beforeLogical, afterLogical, sourceBase [sha256.Size]byte,
+) []byte {
+	dst = append(dst, plan[:]...)
+	dst = append(dst, placement[:]...)
+	dst = binary.LittleEndian.AppendUint64(dst, applied)
+	dst = binary.LittleEndian.AppendUint64(dst, term)
+	dst = binary.LittleEndian.AppendUint64(dst, routeGeneration)
+	dst = binary.LittleEndian.AppendUint64(dst, transitions)
+	dst = append(dst, previousEntry[:]...)
+	dst = append(dst, entry[:]...)
+	dst = append(dst, beforeLogical[:]...)
+	dst = append(dst, afterLogical[:]...)
+	dst = append(dst, sourceBase[:]...)
+	return dst
+}
+
+func hashTailFrame(h hash.Hash, size *[8]byte, value []byte) {
+	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
 	_, _ = h.Write(value)
 }
 

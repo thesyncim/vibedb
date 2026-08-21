@@ -53,9 +53,16 @@ It emits one digested batch for every child at every source entry. A
 shard-key move becomes a delete from the old child and a put to the new child.
 An entry with no row change still advances every child.
 
-This kernel does not capture the source transition stream. It does not persist
-or apply destination batches, close the final source gap, prune the retained
-range, transfer ownership, or publish the catalog.
+A child stage applies verified rows and tail batches to a caller-owned durable
+collection. It can resume an artifact after a persisted verified prefix. Before
+tail catch-up, it rebuilds the deterministic artifact from the destination and
+requires the exact manifest digest. A fixed-size digest-protected cursor records
+artifact and tail progress. On Unix, the cursor store uses a writer lease, file
+sync, atomic replacement, and directory sync.
+
+This kernel does not capture the source transition stream. It does not close
+the final source gap, prune the retained range, transfer ownership, or publish
+the catalog.
 
 ## Security boundary
 
@@ -73,4 +80,5 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
-- `internal/rangesplit/partition.go`, `artifact.go`, and `tail.go`
+- `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
+- `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
