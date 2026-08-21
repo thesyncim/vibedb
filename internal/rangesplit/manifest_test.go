@@ -8,7 +8,7 @@ import (
 )
 
 func TestValidateManifestTransitionChangesOnlyExactSource(t *testing.T) {
-	plan := testSplitPlanWithNeighbor(t, "node-z", 12)
+	plan := testSplitPlanWithNeighbor(t, "node-z")
 	partitioner, err := NewPartitioner(
 		plan, "docs", []string{"/tenant", "/sequence"},
 		distribution.DefaultVirtualBucketBits,

@@ -159,8 +159,16 @@ apply/cursor crash window. A final fresh scan hashes the exact retained image.
 The gateway binds that completion proof to an exact manifest transition: only
 the planned source may be replaced, and unrelated shard identities and leaders
 must remain unchanged. Existing durable and in-memory catalog compare-and-swap
-operations provide publication authority. The repository still has no
-automatic split controller or merge planner.
+operations provide publication authority. The certificate route generation,
+target catalog generation, and source catalog successor must be equal.
+
+The internal split reconciler validates the prepared first-leader SQL and Raft
+identity for each new child. It derives one action at a time from the capture,
+artifacts, child cursors, cutover certificate, apply profile, WAL binding,
+runtime status, prune proof, and catalog. Its warm wait path does not allocate.
+The caller must retain the immutable plan and execute each proof-checking action.
+The repository still has no runnable automatic split controller or merge
+planner.
 
 ## Replication kernel
 
@@ -196,6 +204,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/replicatedstate/staged_snapshot.go`
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
+- `internal/splitcontroller/reconcile.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

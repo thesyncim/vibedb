@@ -77,6 +77,15 @@ func (c ChildStageCursor) Phase() ChildStagePhase { return c.phase }
 // Child returns the split child ordinal.
 func (c ChildStageCursor) Child() uint8 { return c.child }
 
+// PlanDigest returns the exact split plan bound to this durable cursor.
+func (c ChildStageCursor) PlanDigest() [sha256.Size]byte { return c.planDigest }
+
+// PlacementDigest returns the exact compiled placement program bound to this
+// durable cursor.
+func (c ChildStageCursor) PlacementDigest() [sha256.Size]byte {
+	return c.placementDigest
+}
+
 // SourceCut returns the exact translated source prefix.
 func (c ChildStageCursor) SourceCut() ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{

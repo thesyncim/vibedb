@@ -38,7 +38,9 @@ permitted.
 ## Non-serving range splits
 
 `autosplit.PlanSplit` validates one desired split manifest. The plan has at
-most three child ranges. One child keeps the source allocation.
+most three child ranges. One child keeps the source allocation. The target
+routing version must be the exact successor because the ownership seal advances
+all mutable coordinates once.
 
 `internal/rangesplit` implements the non-serving data plane for that plan. It
 uses one source scan and one compiled `vibejson` index per row. It sends each
@@ -98,6 +100,17 @@ proof only when the next manifest replaces exactly the planned source and
 leaves every unrelated shard unchanged. Publication then reuses the durable
 and in-memory catalog generation compare-and-swap operations.
 
+`internal/splitcontroller` derives one safe next operation from these durable
+authorities. Its fixed plan binds the source catalog generation and each
+non-retained child to its final first-leader SQL and Raft identity. The control
+loop does not write a second progress journal. A restart can reconstruct
+progress from the caller-retained plan, capture head, child stage cursors, SQL
+apply profile, WAL binding, runtime identity, prune proof, and catalog.
+
+The reconciler rejects skipped routing or catalog generations. It also requires
+the cutover route generation to equal the exact catalog successor. It does not
+execute an action or provide a runnable service controller.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -121,3 +134,4 @@ boundary.
 - `internal/rangesplit/stage_image.go` and `activate.go`
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
+- `internal/splitcontroller/reconcile.go`
