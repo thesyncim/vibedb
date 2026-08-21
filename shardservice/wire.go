@@ -387,6 +387,13 @@ type ShardRequest struct {
 	// final ORDER BY or LIMIT. The coordinator applies those stages after exact
 	// partial-state combination, so groups spanning shards cannot be truncated.
 	PartialAggregate bool
+	// RowBatch opts a read-only SQL request into bounded multi-frame delivery.
+	// The ordinary routed lane leaves it zero and receives exactly one response.
+	// BatchRows bounds rows per frame; BatchBytes bounds the encoded row-data
+	// bytes (cell markers, lengths, and payloads), excluding frame and schema
+	// metadata. Both bounds and the request's total MaxRows/MaxResultBytes must
+	// be present together.
+	RowBatch RowBatchRequest
 
 	// Distribution and Shard name the target the shard admits ownership of.
 	Distribution distribution.DistributionName
@@ -452,7 +459,37 @@ type ShardRequest struct {
 	Transaction TransactionRequest
 }
 
-// ResponseKind discriminates the three shapes a ShardResponse can take.
+// RowBatchRequest bounds one streamed row frame. It is an opt-in transport
+// envelope, not another wire version: its absent zero value preserves the
+// original request and response bytes.
+type RowBatchRequest struct {
+	BatchRows  uint32
+	BatchBytes uint32
+}
+
+// Hard row-batch bounds keep one peer-selected frame small enough for pooled
+// exchange workers while still matching a columnar execution block. The cell
+// bound protects wide or all-null results whose wire bytes understate their
+// decoded metadata footprint.
+const (
+	MaxRowBatchRows  uint32 = 64 << 10
+	MaxRowBatchBytes uint32 = 4 << 20
+	MaxRowBatchCells uint32 = 1 << 18
+)
+
+func (r RowBatchRequest) present() bool {
+	return r.BatchRows != 0 || r.BatchBytes != 0
+}
+
+func (r RowBatchRequest) canonical() bool {
+	if !r.present() {
+		return true
+	}
+	return r.BatchRows != 0 && r.BatchRows <= MaxRowBatchRows &&
+		r.BatchBytes != 0 && r.BatchBytes <= MaxRowBatchBytes
+}
+
+// ResponseKind discriminates the shapes a ShardResponse can take.
 type ResponseKind uint8
 
 const (
@@ -464,6 +501,9 @@ const (
 	ResponseCompletion
 	// ResponseError carries a typed error frame.
 	ResponseError
+	// ResponseRowBatch carries one sequence-checked fragment of an opt-in row
+	// stream. Sequence zero owns the schema; later batches carry only its count.
+	ResponseRowBatch
 )
 
 // String renders the kind name for diagnostics.
@@ -475,13 +515,15 @@ func (k ResponseKind) String() string {
 		return "Completion"
 	case ResponseError:
 		return "Error"
+	case ResponseRowBatch:
+		return "RowBatch"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real response member.
-func (k ResponseKind) valid() bool { return k >= ResponseRows && k <= ResponseError }
+func (k ResponseKind) valid() bool { return k >= ResponseRows && k <= ResponseRowBatch }
 
 // ErrorKind is the closed set of typed failures a shard reports in an error
 // frame. Each maps to exactly one admission or execution refusal.
@@ -606,6 +648,10 @@ type ShardResponse struct {
 	// len(Columns) cells.
 	Columns []Column
 	Rows    [][]Cell
+	// RowBatch is present only for ResponseRowBatch. Sequence starts at zero and
+	// Final terminates the request stream. ColumnCount gives continuation frames
+	// an independently decodable row arity without repeating column names.
+	RowBatch RowBatchReply
 
 	// RowsAffected is set only for ResponseCompletion.
 	RowsAffected int64
@@ -627,6 +673,13 @@ type ShardResponse struct {
 	// Transaction is present only on a successful transaction command. Its zero
 	// value preserves the ordinary response encoding.
 	Transaction TransactionReply
+}
+
+// RowBatchReply is the framing metadata for one bounded row fragment.
+type RowBatchReply struct {
+	Sequence    uint32
+	ColumnCount uint32
+	Final       bool
 }
 
 // DocumentScanReply carries an owned exclusive resume cursor. Complete is true

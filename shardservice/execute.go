@@ -61,7 +61,14 @@ func (c *shardConn) loop() error {
 			}
 			continue
 		}
-		if werr := c.writeResponse(c.handle(req)); werr != nil {
+		write := c.writeResponse
+		if req.RowBatch.present() {
+			write = c.writeBatchedResponse
+		}
+		if werr := c.handle(req, write); werr != nil {
+			if errors.Is(werr, errRowBatchTerminated) {
+				continue
+			}
 			return werr
 		}
 	}
@@ -99,31 +106,53 @@ func (c *shardConn) writeResponse(resp *ShardResponse) error {
 	return err
 }
 
+var errRowBatchTerminated = errors.New("shardservice: row batch stream terminated by a typed error")
+
+// writeBatchedResponse preserves stream alignment when a batch is rejected
+// before any bytes are written. The substitute error frame is terminal for this
+// request, so the private sentinel stops execution without closing the healthy
+// connection.
+func (c *shardConn) writeBatchedResponse(resp *ShardResponse) error {
+	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
+	err := EncodeResponse(c.nc, resp)
+	if err == nil {
+		return nil
+	}
+	if !isEncodeRejection(err) {
+		return err
+	}
+	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
+	if writeErr := EncodeResponse(c.nc, NewErrorResponse(ErrorResourceLimit, err.Error())); writeErr != nil {
+		return writeErr
+	}
+	return errRowBatchTerminated
+}
+
 // isEncodeRejection reports whether EncodeResponse rejected a response before
 // writing any bytes, which means a substitute frame can be sent safely.
 func isEncodeRejection(err error) bool {
 	return errors.Is(err, errFrameTooLarge) ||
 		errors.Is(err, errFieldTooLarge) ||
 		errors.Is(err, errRowArity) ||
+		errors.Is(err, errBadRowBatch) ||
 		errors.Is(err, errBadEnum)
 }
 
-// handle admits req and, on success, executes it, always returning a response
-// frame to send.
-func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
+// handle admits req and writes its single response or bounded row stream.
+func (c *shardConn) handle(req *ShardRequest, write func(*ShardResponse) error) error {
 	if err := c.server.ownership.Admit(req); err != nil {
 		var ae *AdmissionError
 		if errors.As(err, &ae) {
-			return ae.Response()
+			return write(ae.Response())
 		}
-		return NewErrorResponse(ErrorMalformedRequest, err.Error())
+		return write(NewErrorResponse(ErrorMalformedRequest, err.Error()))
 	}
 	if req.Transaction.Operation != TransactionNone {
 		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() {
-			return NewErrorResponse(ErrorMalformedRequest,
-				"shardservice: a transaction command cannot carry an index read envelope")
+			return write(NewErrorResponse(ErrorMalformedRequest,
+				"shardservice: a transaction command cannot carry an index read envelope"))
 		}
-		return c.transaction(req)
+		return write(c.transaction(req))
 	}
 	if req.ExecutionMode == ExecutionReadWrite {
 		writeCtx, writeCancel := c.server.requestContext(req)
@@ -132,14 +161,14 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 				writeCtx, req.BucketBits, req.AccessScopes,
 			); err != nil {
 				writeCancel()
-				return classifyError(err)
+				return write(classifyError(err))
 			}
 			writeToken, err := c.server.readFences.enterWrite(
 				writeCtx, req.BucketBits, req.AccessScopes,
 			)
 			if err != nil {
 				writeCancel()
-				return classifyError(err)
+				return write(classifyError(err))
 			}
 			conflict, barrierErr := c.server.journal.ParticipantBarrierConflict(
 				req.BucketBits, req.AccessScopes,
@@ -147,7 +176,7 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 			if barrierErr != nil {
 				c.server.readFences.leaveWrite(writeToken)
 				writeCancel()
-				return classifyError(barrierErr)
+				return write(classifyError(barrierErr))
 			}
 			if conflict {
 				c.server.readFences.leaveWrite(writeToken)
@@ -164,26 +193,26 @@ func (c *shardConn) handle(req *ShardRequest) *ShardResponse {
 		)
 		barrierCancel()
 		if err != nil {
-			return classifyError(err)
+			return write(classifyError(err))
 		}
 	}
 	if !req.ReadFenceID.IsZero() {
 		if req.ExecutionMode != ExecutionReadOnly || !c.server.readFences.validate(
 			req.ReadFenceID, req.BucketBits, req.AccessScopes,
 		) {
-			return transactionError(distributedtxn.ErrJournalConflict)
+			return write(transactionError(distributedtxn.ErrJournalConflict))
 		}
 	}
 	if req.GlobalIndexLookup.present() {
-		return c.executeGlobalIndexLookup(req)
+		return write(c.executeGlobalIndexLookup(req))
 	}
 	if req.MutationCapture {
-		return c.executeMutationCapture(req)
+		return write(c.executeMutationCapture(req))
 	}
 	if req.DocumentScan.present() {
-		return c.executeDocumentScan(req)
+		return write(c.executeDocumentScan(req))
 	}
-	return c.execute(req)
+	return c.execute(req, write)
 }
 
 // transaction executes the durable subset of the transaction protocol. Stage
@@ -791,16 +820,19 @@ func transactionError(err error) *ShardResponse {
 	return NewErrorResponse(ErrorMalformedRequest, err.Error())
 }
 
-// execute runs one admitted request against the borrowed Session and returns its
+// execute runs one admitted request against the borrowed Session and writes its
 // typed response. Resource limits and the execution deadline are applied here;
 // reads pin a snapshot and writes autocommit.
-func (c *shardConn) execute(req *ShardRequest) *ShardResponse {
+func (c *shardConn) execute(
+	req *ShardRequest,
+	write func(*ShardResponse) error,
+) error {
 	rows, resultBytes := c.server.resultLimits(req)
 	if err := c.sess.SetResultLimits(rows, resultBytes); err != nil {
-		return classifyError(err)
+		return write(classifyError(err))
 	}
 	if err := c.sess.SetIntermediateLimit(c.server.opts.MaxIntermediateBytes); err != nil {
-		return classifyError(err)
+		return write(classifyError(err))
 	}
 
 	ctx, cancel := c.server.requestContext(req)
@@ -814,21 +846,24 @@ func (c *shardConn) execute(req *ShardRequest) *ShardResponse {
 		prep, err = c.sess.Prepare(ctx, req.SQL)
 	}
 	if err != nil {
-		return classifyError(err)
+		return write(classifyError(err))
 	}
 	defer prep.Close()
 	if req.ExecutionMode == ExecutionReadOnly && prep.Kind() != sqlast.KindSelect {
-		return NewErrorResponse(
+		return write(NewErrorResponse(
 			ErrorReadOnly,
 			fmt.Sprintf("shardservice: %s is not permitted by a read-only request", prep.Kind()),
-		)
+		))
 	}
 
 	args := runtimeArgs(req.Params)
 	if prep.ReturnsRows() {
-		return c.executeQuery(ctx, prep, args, req.PrimaryKeyRead)
+		if req.RowBatch.present() {
+			return c.executeQueryBatches(ctx, prep, args, req.PrimaryKeyRead, req.RowBatch, write)
+		}
+		return write(c.executeQuery(ctx, prep, args, req.PrimaryKeyRead))
 	}
-	return c.executeExec(ctx, prep, args)
+	return write(c.executeExec(ctx, prep, args))
 }
 
 // executeQuery pins a read-only snapshot for the request, runs the SELECT against
@@ -879,6 +914,145 @@ func (c *shardConn) executeQuery(
 	cols := responseColumns(prep)
 	rows := collectRows(&cur, len(cols))
 	return RowsResponse(cols, rows)
+}
+
+// executeQueryBatches consumes a materialized SQL cursor into independently
+// bounded wire batches. Synchronous writes provide transport backpressure and
+// the batch arenas are reused after each frame, avoiding a second whole-result
+// copy. The SQL executor's own total row/byte budget remains authoritative.
+func (c *shardConn) executeQueryBatches(
+	ctx context.Context,
+	prep *sqldriver.Prepared,
+	args []any,
+	primaryRead PrimaryKeyReadRequest,
+	limits RowBatchRequest,
+	write func(*ShardResponse) error,
+) error {
+	if prep.Kind() == sqlast.KindSelect {
+		if err := c.sess.Begin(ctx, sqldriver.TxOptions{
+			ReadOnly: true, Isolation: sqldriver.IsolationRepeatableRead,
+		}); err != nil {
+			return write(classifyError(err))
+		}
+		defer c.sess.Rollback(context.Background())
+	}
+
+	var (
+		cur sqldriver.Cursor
+		err error
+	)
+	if primaryRead.present() {
+		err = prep.QueryCandidateKeysInto(
+			ctx, args, primaryRead.PrimaryPath, primaryRead.Keys, &cur,
+		)
+	} else {
+		err = prep.QueryInto(ctx, args, &cur)
+	}
+	if err != nil {
+		return write(classifyError(err))
+	}
+	defer cur.Close()
+
+	cols := responseColumns(prep)
+	if len(cols) == 0 {
+		return write(NewErrorResponse(ErrorMalformedRequest,
+			"shardservice: a row batch requires at least one result column"))
+	}
+	return streamCursorBatches(&cur, cols, limits, write)
+}
+
+// streamCursorBatches packs cell JSON into one pre-sized arena per frame. The
+// negotiated capacity prevents growth, so Cell.Bytes can point directly into
+// it without a per-cell allocation or a staging copy.
+func streamCursorBatches(
+	cur *sqldriver.Cursor,
+	cols []Column,
+	limits RowBatchRequest,
+	write func(*ShardResponse) error,
+) error {
+	ncols := len(cols)
+	batchRows := int(limits.BatchRows)
+	if byBytes := int(limits.BatchBytes) / ncols; byBytes < batchRows {
+		batchRows = byBytes
+	}
+	if byCells := int(MaxRowBatchCells) / ncols; byCells < batchRows {
+		batchRows = byCells
+	}
+	if batchRows < 1 {
+		batchRows = 1
+	}
+
+	rows := make([][]Cell, 0, batchRows)
+	cells := make([]Cell, 0, batchRows*ncols)
+	arena := make([]byte, 0, int(limits.BatchBytes))
+	rowDataBytes := 0
+	sequence := uint32(0)
+
+	flush := func(final bool) error {
+		rows = rows[:0]
+		for start := 0; start < len(cells); start += ncols {
+			rows = append(rows, cells[start:start+ncols:start+ncols])
+		}
+		batchCols := []Column(nil)
+		if sequence == 0 {
+			batchCols = cols
+		}
+		resp := &ShardResponse{
+			Kind: ResponseRowBatch, Columns: batchCols, Rows: rows,
+			RowBatch: RowBatchReply{
+				Sequence: sequence, ColumnCount: uint32(ncols), Final: final,
+			},
+		}
+		if err := write(resp); err != nil {
+			return err
+		}
+		sequence++
+		cells = cells[:0]
+		arena = arena[:0]
+		rowDataBytes = 0
+		return nil
+	}
+
+	for cur.Next() {
+		pendingBytes := 0
+		for i := 0; i < ncols; i++ {
+			cell := cur.Cell(i)
+			if cell.IsNull() {
+				pendingBytes++
+				continue
+			}
+			payload := cell.Payload()
+			if payload != nil {
+				pendingBytes += 1 + 4 + len(payload)
+				continue
+			}
+			var scratch [32]byte
+			pendingBytes += 1 + 4 + len(cell.AppendJSON(scratch[:0]))
+		}
+		if pendingBytes > int(limits.BatchBytes) {
+			return write(NewErrorResponse(ErrorResourceLimit,
+				"shardservice: one encoded row exceeds the row-batch byte limit"))
+		}
+		if len(cells) != 0 && (len(cells)/ncols >= int(limits.BatchRows) ||
+			len(cells)+ncols > int(MaxRowBatchCells) ||
+			rowDataBytes+pendingBytes > int(limits.BatchBytes)) {
+			if err := flush(false); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < ncols; i++ {
+			cell := cur.Cell(i)
+			if cell.IsNull() {
+				cells = append(cells, Cell{Null: true})
+				continue
+			}
+			start := len(arena)
+			arena = cell.AppendJSON(arena)
+			cells = append(cells, Cell{Bytes: arena[start:len(arena):len(arena)]})
+		}
+		rowDataBytes += pendingBytes
+	}
+	return flush(true)
 }
 
 // executeExec runs a DML or DDL statement and reports its affected-row count.

@@ -301,7 +301,9 @@ remain predictable because their capacities and fold work are fixed at open.
 - [Distributed server boundary](design/distributed-sharding.md): the
   separate, server-only distributed tier. Its routed leader-only shard
   execution (`shardservice`) and stateless routing gateway (`gateway`) exist
-  today; both are server-only and not part of the embedded API. They route on
+  today, including an opt-in bounded row-batch transport primitive that keeps
+  the routed one-frame lane unchanged but is not yet a repartition exchange;
+  both are server-only and not part of the embedded API. They route on
   the frozen placement scalar (`distribution`), which also backs the opt-in
   single-shard `sql/driver` local-cluster facade and is therefore reachable from
   the embedded surface. It also documents that `autosplit` is a shadow-only

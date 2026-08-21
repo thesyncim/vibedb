@@ -39,6 +39,7 @@ const (
 	mutationCaptureMarker   = 0xdc
 	documentScanMarker      = 0xdd
 	partialAggregateMarker  = 0xde
+	rowBatchMarker          = 0xdf
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -112,6 +113,8 @@ var errBadMutationCapture = errors.New("shardservice: frame carries an invalid m
 var errBadDocumentScan = errors.New("shardservice: frame carries an invalid document scan")
 
 var errBadPartialAggregate = errors.New("shardservice: frame carries an invalid partial aggregate fragment")
+
+var errBadRowBatch = errors.New("shardservice: frame carries an invalid row batch")
 
 // errNegativeDuration reports a request deadline encoded as a negative
 // duration.
@@ -649,6 +652,13 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		req.Transaction.Operation != TransactionNone) {
 		return errBadPartialAggregate
 	}
+	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
+		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.MutationCapture ||
+			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
+			req.MaxResultBytes == 0)) {
+		return errBadRowBatch
+	}
 
 	var e encbuf
 	e.u8(wireVersion)
@@ -737,6 +747,11 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	}
 	if req.PartialAggregate {
 		e.u8(partialAggregateMarker)
+	}
+	if req.RowBatch.present() {
+		e.u8(rowBatchMarker)
+		e.u32(req.RowBatch.BatchRows)
+		e.u32(req.RowBatch.BatchBytes)
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
@@ -889,6 +904,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		d.u8()
 		req.PartialAggregate = true
 	}
+	if len(d.b) != 0 && d.b[0] == rowBatchMarker {
+		d.u8()
+		req.RowBatch.BatchRows = d.u32()
+		req.RowBatch.BatchBytes = d.u32()
+		if d.bad() || !req.RowBatch.canonical() {
+			return nil, errBadRowBatch
+		}
+	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
 		req.Transaction, err = decodeTransactionRequest(&d)
@@ -933,6 +956,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.Transaction.Operation != TransactionNone) {
 		return nil, errBadPartialAggregate
 	}
+	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
+		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.MutationCapture ||
+			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
+			req.MaxResultBytes == 0)) {
+		return nil, errBadRowBatch
+	}
 	return req, nil
 }
 
@@ -945,11 +975,15 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if !resp.Kind.valid() {
 		return errBadEnum
 	}
-	if resp.HasReadPosition && resp.Kind != ResponseRows {
+	if resp.HasReadPosition && resp.Kind != ResponseRows &&
+		(resp.Kind != ResponseRowBatch || !resp.RowBatch.Final) {
 		return errUnexpectedReadPosition
 	}
 	if err := validateTransactionReply(resp.Transaction); err != nil {
 		return err
+	}
+	if resp.Kind == ResponseRowBatch && resp.Transaction.Role != TransactionRoleNone {
+		return errBadRowBatch
 	}
 	if !resp.DocumentScan.canonical() ||
 		(resp.DocumentScan.Present && resp.Kind != ResponseRows) {
@@ -975,6 +1009,49 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 		e.u32(uint32(len(resp.Rows)))
 		for i := range resp.Rows {
 			if len(resp.Rows[i]) != len(resp.Columns) {
+				return errRowArity
+			}
+			for j := range resp.Rows[i] {
+				c := resp.Rows[i][j]
+				if c.Null {
+					e.u8(1)
+				} else {
+					e.u8(0)
+					e.bytes(c.Bytes)
+				}
+			}
+		}
+	case ResponseRowBatch:
+		batch := resp.RowBatch
+		if batch.ColumnCount == 0 || batch.ColumnCount > maxColumns ||
+			len(resp.Rows) > int(MaxRowBatchRows) ||
+			uint64(len(resp.Rows))*uint64(batch.ColumnCount) > uint64(MaxRowBatchCells) ||
+			(!batch.Final && len(resp.Rows) == 0) {
+			return errBadRowBatch
+		}
+		if batch.Sequence == 0 {
+			if len(resp.Columns) != int(batch.ColumnCount) {
+				return errBadRowBatch
+			}
+		} else if len(resp.Columns) != 0 {
+			return errBadRowBatch
+		}
+		e.u32(batch.Sequence)
+		if batch.Final {
+			e.u8(1)
+		} else {
+			e.u8(0)
+		}
+		e.u32(batch.ColumnCount)
+		if batch.Sequence == 0 {
+			for i := range resp.Columns {
+				e.str(resp.Columns[i].Name)
+				e.u32(uint32(resp.Columns[i].TypeOID))
+			}
+		}
+		e.u32(uint32(len(resp.Rows)))
+		for i := range resp.Rows {
+			if len(resp.Rows[i]) != int(batch.ColumnCount) {
 				return errRowArity
 			}
 			for j := range resp.Rows[i] {
@@ -1083,6 +1160,57 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 				}
 			}
 		}
+	case ResponseRowBatch:
+		resp.RowBatch.Sequence = d.u32()
+		final := d.u8()
+		if final > 1 {
+			return nil, errBadEnum
+		}
+		resp.RowBatch.Final = final == 1
+		nc32 := d.u32()
+		if nc32 == 0 || nc32 > maxColumns {
+			return nil, errBadRowBatch
+		}
+		nc := int(nc32)
+		resp.RowBatch.ColumnCount = nc32
+		if resp.RowBatch.Sequence == 0 {
+			resp.Columns = make([]Column, nc)
+			for i := range resp.Columns {
+				resp.Columns[i].Name = d.str()
+				resp.Columns[i].TypeOID = int32(d.u32())
+			}
+		}
+		nr := d.count(nc, maxRows)
+		if d.bad() || nr > int(MaxRowBatchRows) ||
+			uint64(nr)*uint64(nc) > uint64(MaxRowBatchCells) ||
+			(!resp.RowBatch.Final && nr == 0) {
+			return nil, errBadRowBatch
+		}
+		if nr != 0 {
+			resp.Rows = make([][]Cell, nr)
+			cells := make([]Cell, nr*nc)
+			for i := range resp.Rows {
+				start := i * nc
+				row := cells[start : start+nc : start+nc]
+				for j := range row {
+					marker := d.u8()
+					if marker > 1 {
+						return nil, errBadEnum
+					}
+					if marker == 1 {
+						row[j] = Cell{Null: true}
+					} else {
+						// The response owns this bounded frame through its cell
+						// slices, avoiding one payload allocation per cell.
+						row[j] = Cell{Bytes: d.slice()}
+					}
+				}
+				resp.Rows[i] = row
+				if d.bad() {
+					break
+				}
+			}
+		}
 	case ResponseCompletion:
 		resp.RowsAffected = int64(d.u64())
 	case ResponseError:
@@ -1100,7 +1228,8 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	if resp.HasReadPosition && kind != ResponseRows {
+	if resp.HasReadPosition && kind != ResponseRows &&
+		(kind != ResponseRowBatch || !resp.RowBatch.Final) {
 		return nil, errUnexpectedReadPosition
 	}
 	if len(d.b) != 0 && d.b[0] == documentScanMarker {

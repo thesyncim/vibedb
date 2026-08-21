@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -115,6 +116,187 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if got := string(sel.Rows[0][0].Bytes); got != `"keep"` {
 		t.Fatalf("selected id = %s, want \"keep\"", got)
+	}
+}
+
+func TestClientBoundedRowBatchesAndConnectionReuse(t *testing.T) {
+	c := pipeClient(newShardServer(t))
+	ctx := context.Background()
+	if _, err := c.Do(ctx, "shard-a", ownedReq(
+		`CREATE TABLE docs (id STRING PRIMARY KEY, n INTEGER)`)); err != nil {
+		t.Fatalf("DDL: %v", err)
+	}
+	for i, id := range []string{"a", "b", "c", "d", "e"} {
+		if _, err := c.Do(ctx, "shard-a", ownedReq(
+			`INSERT INTO docs (id, n) VALUES (?, ?)`,
+			shardservice.StringParam(id), shardservice.NumberParam(string(rune('1'+i))))); err != nil {
+			t.Fatalf("INSERT %q: %v", id, err)
+		}
+	}
+
+	req := ownedReq(`SELECT id FROM docs ORDER BY id`)
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MaxRows = 10
+	req.MaxResultBytes = 1 << 10
+	req.RowBatch = shardservice.RowBatchRequest{BatchRows: 2, BatchBytes: 64}
+	var (
+		sequences []uint32
+		ids       []string
+	)
+	err := c.DoBatches(ctx, "shard-a", req, func(batch *shardservice.ShardResponse) error {
+		sequences = append(sequences, batch.RowBatch.Sequence)
+		if batch.RowBatch.Sequence == 0 {
+			if len(batch.Columns) != 1 || batch.Columns[0].Name != "id" {
+				t.Fatalf("first schema = %+v, want id", batch.Columns)
+			}
+		} else if len(batch.Columns) != 0 {
+			t.Fatalf("continuation repeated schema: %+v", batch.Columns)
+		}
+		for i := range batch.Rows {
+			ids = append(ids, string(batch.Rows[i][0].Bytes))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DoBatches: %v", err)
+	}
+	if got, want := len(sequences), 3; got != want {
+		t.Fatalf("batch count = %d (%v), want %d", got, sequences, want)
+	}
+	for i, sequence := range sequences {
+		if sequence != uint32(i) {
+			t.Fatalf("sequence[%d] = %d", i, sequence)
+		}
+	}
+	if got, want := fmt.Sprint(ids), `["a" "b" "c" "d" "e"]`; got != want {
+		t.Fatalf("ids = %s, want %s", got, want)
+	}
+
+	// The terminal frame was drained, so the same pooled connection remains
+	// aligned for the ordinary one-frame routed lane.
+	read := ownedReq(`SELECT id FROM docs WHERE id = ?`, shardservice.StringParam("a"))
+	read.ExecutionMode = shardservice.ExecutionReadOnly
+	resp, err := c.Do(ctx, "shard-a", read)
+	if err != nil || len(resp.Rows) != 1 {
+		t.Fatalf("post-stream read = %+v, %v", resp, err)
+	}
+}
+
+func TestOrdinaryRoundTripRejectsRowBatchWithoutDial(t *testing.T) {
+	dials := 0
+	c := NewClient(func(context.Context, string) (net.Conn, error) {
+		dials++
+		return nil, errors.New("unexpected dial")
+	})
+	req := ownedReq(`SELECT id FROM docs`)
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MaxRows = 10
+	req.MaxResultBytes = 1 << 10
+	req.RowBatch = shardservice.RowBatchRequest{BatchRows: 1, BatchBytes: 64}
+	if _, err := c.Do(context.Background(), "shard-a", req); !errors.Is(err, ErrMalformedRequest) {
+		t.Fatalf("Do error = %v, want ErrMalformedRequest", err)
+	}
+	if dials != 0 {
+		t.Fatalf("dials = %d, want zero", dials)
+	}
+}
+
+func TestRoundTripBatchesAppliesConsumerBackpressure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	secondWritten := make(chan error, 1)
+	go func() {
+		if _, err := shardservice.DecodeRequest(server); err != nil {
+			secondWritten <- err
+			return
+		}
+		first := &shardservice.ShardResponse{
+			Kind:    shardservice.ResponseRowBatch,
+			Columns: []shardservice.Column{{Name: "id", TypeOID: 114}},
+			Rows:    [][]shardservice.Cell{{{Bytes: []byte(`"a"`)}}},
+			RowBatch: shardservice.RowBatchReply{
+				ColumnCount: 1,
+			},
+		}
+		if err := shardservice.EncodeResponse(server, first); err != nil {
+			secondWritten <- err
+			return
+		}
+		second := &shardservice.ShardResponse{
+			Kind: shardservice.ResponseRowBatch,
+			Rows: [][]shardservice.Cell{{{Bytes: []byte(`"b"`)}}},
+			RowBatch: shardservice.RowBatchReply{
+				Sequence: 1, ColumnCount: 1, Final: true,
+			},
+		}
+		secondWritten <- shardservice.EncodeResponse(server, second)
+	}()
+
+	req := ownedReq(`SELECT id FROM docs ORDER BY id`)
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MaxRows = 2
+	req.MaxResultBytes = 64
+	req.RowBatch = shardservice.RowBatchRequest{BatchRows: 1, BatchBytes: 16}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- RoundTripBatches(context.Background(), client, req,
+			func(batch *shardservice.ShardResponse) error {
+				if batch.RowBatch.Sequence == 0 {
+					close(entered)
+					<-release
+				}
+				return nil
+			})
+	}()
+	<-entered
+	select {
+	case err := <-secondWritten:
+		t.Fatalf("second frame completed before consumer released: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("RoundTripBatches: %v", err)
+	}
+	if err := <-secondWritten; err != nil {
+		t.Fatalf("second frame: %v", err)
+	}
+}
+
+func TestRoundTripBatchesRejectsNegotiatedLimitViolation(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	served := make(chan error, 1)
+	go func() {
+		if _, err := shardservice.DecodeRequest(server); err != nil {
+			served <- err
+			return
+		}
+		served <- shardservice.EncodeResponse(server, &shardservice.ShardResponse{
+			Kind:    shardservice.ResponseRowBatch,
+			Columns: []shardservice.Column{{Name: "id", TypeOID: 114}},
+			Rows: [][]shardservice.Cell{
+				{{Bytes: []byte(`"a"`)}}, {{Bytes: []byte(`"b"`)}},
+			},
+			RowBatch: shardservice.RowBatchReply{ColumnCount: 1, Final: true},
+		})
+	}()
+	req := ownedReq(`SELECT id FROM docs`)
+	req.ExecutionMode = shardservice.ExecutionReadOnly
+	req.MaxRows = 2
+	req.MaxResultBytes = 64
+	req.RowBatch = shardservice.RowBatchRequest{BatchRows: 1, BatchBytes: 16}
+	err := RoundTripBatches(context.Background(), client, req,
+		func(*shardservice.ShardResponse) error { return nil })
+	if !errors.Is(err, ErrResultLimit) {
+		t.Fatalf("error = %v, want ErrResultLimit", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("scripted shard: %v", err)
 	}
 }
 

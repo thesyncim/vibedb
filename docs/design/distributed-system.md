@@ -235,6 +235,17 @@ Every exchange carries an operation deadline, byte/row budget, bounded channel,
 and cancellation signal. Backpressure reaches shard scans; it never creates an
 unbounded gateway buffer or one goroutine per row.
 
+The first transport primitive now serves: an additive row-batch request keeps
+the ordinary routed request/response bytes unchanged, while opted-in reads send
+sequence-checked terminal frames with explicit per-batch and total row/byte
+bounds. The gateway consumes each frame synchronously, validates the negotiated
+limits again, borrows cell payloads directly from the bounded frame, and closes
+rather than drains on consumer cancellation. Schema is sent only in sequence
+zero. This removes the second whole-result wire copy and establishes exchange
+backpressure; the current SQL cursor still materializes its locally bounded
+result before framing, so this is not yet a vector-streaming scan or an
+inter-node hash/range exchange.
+
 ## Replication and movement
 
 Every physical bucket interval belongs to one Raft group with a topology-issued
@@ -260,6 +271,26 @@ Movement uses snapshot plus ordered catch-up:
 Split and merge are the same protocol with different source and destination
 intervals. In-flight transactions remain bound to their original allocation;
 movement cannot translate a participant identity underneath them.
+
+Automatic hot-shard control operates on bucket intervals, never tenants. Nodes
+publish bounded per-interval EWMAs for admitted rows/bytes, service time, queue
+delay, CPU, storage growth, Raft-log pressure, and replica lag. The topology
+controller first relocates a lease when capacity already exists, adds and
+catches up a replica for read or failure-domain pressure, and splits then moves
+an interval for sustained write/size skew. Decisions require a minimum observed
+window, projected benefit above copy/catch-up cost, high/low watermarks,
+cooldowns, and cluster-wide movement budgets; inverse cold intervals may merge
+only after a longer quiet window. Catalog generation and ownership-epoch
+cutovers use the movement protocol above, so a stale router cannot write both
+sides.
+
+A single virtual bucket is the irreducible placement unit in the current
+format. Reads for one hot key can use certified followers or a derived cache,
+but conflicting writes to one logical row must still serialize. Workloads that
+need more write parallelism must include a real locality component in the
+placement tuple; a future row-key intent refinement may reduce contention
+inside a bucket, but the controller must never pretend that cloning one mutable
+key creates independent write ownership.
 
 ## Control, security, and recovery
 
@@ -304,11 +335,16 @@ cluster does not fork into named protocol generations.
    ordering and limits without serializing a plan or synthesizing SQL; bounded
    exact final sorting and O(OFFSET+LIMIT) top-K work even when group identities
    span shards. Path-projection DISTINCT reuses the same canonical grouped state.
+   The additive row-batch wire lane now provides sequence-checked terminal
+   frames, exact row/byte caps, synchronous backpressure, schema-once delivery,
+   and borrowed byte-native decode while preserving the one-frame routed lane.
    Hash/range exchange and worker-local final aggregation come next, followed
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.
 6. **Pending:** wire the existing Raft foundation into serving, enable
-   movement, and add disaggregated immutable snapshot/cold-data caching.
+   per-bucket telemetry, lease relocation, replica catch-up, hysteretic
+   split/move/merge rebalancing, and disaggregated immutable snapshot/cold-data
+   caching.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 

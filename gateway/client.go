@@ -235,6 +235,9 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 	if err := validateRequestPosition(req); err != nil {
 		return nil, err
 	}
+	if req != nil && (req.RowBatch.BatchRows != 0 || req.RowBatch.BatchBytes != 0) {
+		return nil, fmt.Errorf("%w: a row-batch request requires DoBatches", ErrMalformedRequest)
+	}
 	conn, err := c.take(address)
 	if err != nil {
 		return nil, err
@@ -252,6 +255,45 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 		_ = conn.Close()
 	}
 	return resp, err
+}
+
+// DoBatches performs one opt-in bounded row stream over a pooled connection.
+// consume runs synchronously, so its pace applies network backpressure to the
+// shard. Batches are provisional until this method returns nil; consumers must
+// discard partial work on any error. A consumer refusal closes the connection
+// instead of trying to drain an arbitrarily long response.
+func (c *Client) DoBatches(
+	ctx context.Context,
+	address string,
+	req *shardservice.ShardRequest,
+	consume func(*shardservice.ShardResponse) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateRequestPosition(req); err != nil {
+		return err
+	}
+	if err := validateBatchCall(req, consume); err != nil {
+		return err
+	}
+	conn, err := c.take(address)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		conn, err = c.dial(ctx, address)
+		if err != nil {
+			return err
+		}
+	}
+	err = RoundTripBatches(ctx, conn, req, consume)
+	if ctx.Err() == nil && roundTripKeepsStream(err) {
+		c.put(address, conn)
+	} else {
+		_ = conn.Close()
+	}
+	return err
 }
 
 // roundTripKeepsStream reports errors produced only after a whole response
@@ -418,6 +460,9 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 	if err := validateRequestPosition(req); err != nil {
 		return nil, err
 	}
+	if req != nil && (req.RowBatch.BatchRows != 0 || req.RowBatch.BatchBytes != 0) {
+		return nil, fmt.Errorf("%w: a row-batch request requires RoundTripBatches", ErrMalformedRequest)
+	}
 	// AfterFunc trips the socket's I/O deadline once ctx is done, unblocking a
 	// blocked Encode or Decode; stop cancels it on the fast path so a healthy
 	// round-trip pays nothing after it returns.
@@ -449,6 +494,138 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 		return nil, err
 	}
 	return resp, nil
+}
+
+// RoundTripBatches sends one row-batch request and consumes its ordered frames
+// through consume. Sequence, schema arity, terminal framing, error frames, read
+// proofs, cancellation, and deadlines are checked before a successful return.
+// It does not close conn; a caller using it directly must discard conn after
+// any non-shard error because the response may be only partly consumed.
+func RoundTripBatches(
+	ctx context.Context,
+	conn net.Conn,
+	req *shardservice.ShardRequest,
+	consume func(*shardservice.ShardResponse) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateRequestPosition(req); err != nil {
+		return err
+	}
+	if err := validateBatchCall(req, consume); err != nil {
+		return err
+	}
+
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(tripped)
+		close(callbackDone)
+	})
+	defer func() {
+		if !stop() {
+			<-callbackDone
+		}
+	}()
+
+	if err := shardservice.EncodeRequest(conn, req); err != nil {
+		return firstErr(ctx, err)
+	}
+	var (
+		expectedSequence uint32
+		columnCount      uint32
+		totalRows        uint64
+		totalPayload     uint64
+	)
+	for {
+		resp, err := shardservice.DecodeResponse(conn)
+		if err != nil {
+			return firstErr(ctx, err)
+		}
+		if resp.Kind == shardservice.ResponseError {
+			return shardError(resp)
+		}
+		if resp.Kind != shardservice.ResponseRowBatch {
+			return fmt.Errorf("%w: shard returned %s to a row-batch request",
+				ErrUnexpectedError, resp.Kind)
+		}
+		if resp.RowBatch.Sequence != expectedSequence {
+			return fmt.Errorf("%w: row-batch sequence is %d, want %d",
+				ErrUnexpectedError, resp.RowBatch.Sequence, expectedSequence)
+		}
+		if expectedSequence == 0 {
+			columnCount = resp.RowBatch.ColumnCount
+		} else if resp.RowBatch.ColumnCount != columnCount {
+			return fmt.Errorf("%w: row-batch column count changed from %d to %d",
+				ErrUnexpectedError, columnCount, resp.RowBatch.ColumnCount)
+		}
+		batchRows, batchBytes, batchPayload := rowBatchSizes(resp)
+		if batchRows > uint64(req.RowBatch.BatchRows) ||
+			batchBytes > uint64(req.RowBatch.BatchBytes) {
+			return fmt.Errorf("%w: shard exceeded negotiated row-batch limits", ErrResultLimit)
+		}
+		if batchRows > req.MaxRows || batchPayload > req.MaxResultBytes ||
+			totalRows > req.MaxRows-batchRows ||
+			totalPayload > req.MaxResultBytes-batchPayload {
+			return fmt.Errorf("%w: shard exceeded negotiated total result limits", ErrResultLimit)
+		}
+		totalRows += batchRows
+		totalPayload += batchPayload
+		if !resp.RowBatch.Final && resp.HasReadPosition {
+			return fmt.Errorf("%w: a non-final row batch carried a read proof", ErrUnexpectedError)
+		}
+		if resp.RowBatch.Final {
+			if err := validateReadPosition(req, resp); err != nil {
+				return err
+			}
+		}
+		if err := consume(resp); err != nil {
+			return err
+		}
+		if resp.RowBatch.Final {
+			return nil
+		}
+		expectedSequence++
+	}
+}
+
+func validateBatchCall(
+	req *shardservice.ShardRequest,
+	consume func(*shardservice.ShardResponse) error,
+) error {
+	if req == nil || req.RowBatch.BatchRows == 0 || req.RowBatch.BatchBytes == 0 ||
+		req.MaxRows == 0 || req.MaxResultBytes == 0 {
+		return fmt.Errorf("%w: row batches require nonzero per-batch and total row/byte limits", ErrMalformedRequest)
+	}
+	if req.RowBatch.BatchRows > shardservice.MaxRowBatchRows ||
+		req.RowBatch.BatchBytes > shardservice.MaxRowBatchBytes {
+		return fmt.Errorf("%w: row-batch limits exceed the shard protocol bounds", ErrMalformedRequest)
+	}
+	if consume == nil {
+		return fmt.Errorf("%w: row batches require a consumer", ErrMalformedRequest)
+	}
+	return nil
+}
+
+// rowBatchSizes returns negotiated accounting without converting any cell to a
+// string. Batch bytes match shardservice.RowBatchRequest (wire row data), while
+// payload bytes are a safe lower bound on the SQL engine's stricter logical
+// ResultBytes accounting.
+func rowBatchSizes(resp *shardservice.ShardResponse) (rows, batchBytes, payload uint64) {
+	rows = uint64(len(resp.Rows))
+	for i := range resp.Rows {
+		for j := range resp.Rows[i] {
+			cell := resp.Rows[i][j]
+			batchBytes++ // null/non-null marker
+			if cell.Null {
+				continue
+			}
+			n := uint64(len(cell.Bytes))
+			batchBytes += 4 + n
+			payload += n
+		}
+	}
+	return rows, batchBytes, payload
 }
 
 // validateRequestPosition binds a session minimum to the logical shard named

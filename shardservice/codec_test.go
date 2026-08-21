@@ -99,6 +99,15 @@ func TestRequestRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "row_batch",
+			req: &ShardRequest{
+				SQL: "SELECT id FROM messages", MaxRows: 1024, MaxResultBytes: 1 << 20,
+				RowBatch: RowBatchRequest{
+					BatchRows: 128, BatchBytes: 64 << 10,
+				},
+			},
+		},
+		{
 			name: "all_param_kinds",
 			req: &ShardRequest{
 				SQL:           "INSERT INTO messages VALUES ($1,$2,$3,$4,$5)",
@@ -246,6 +255,9 @@ func TestRequestRoundTrip(t *testing.T) {
 			if got.PartialAggregate != tc.req.PartialAggregate {
 				t.Errorf("PartialAggregate = %v, want %v", got.PartialAggregate, tc.req.PartialAggregate)
 			}
+			if got.RowBatch != tc.req.RowBatch {
+				t.Errorf("RowBatch = %+v, want %+v", got.RowBatch, tc.req.RowBatch)
+			}
 			if got.Transaction.Operation != tc.req.Transaction.Operation ||
 				got.Transaction.ID != tc.req.Transaction.ID ||
 				got.Transaction.Revision != tc.req.Transaction.Revision ||
@@ -310,6 +322,21 @@ func TestResponseRoundTrip(t *testing.T) {
 		{
 			name: "rows_empty",
 			resp: RowsResponse([]Column{{Name: "n", TypeOID: 20}}, nil),
+		},
+		{
+			name: "row_batch_first",
+			resp: &ShardResponse{
+				Kind: ResponseRowBatch, Columns: []Column{{Name: "id", TypeOID: 114}},
+				Rows:     [][]Cell{{{Bytes: []byte(`"a"`)}}},
+				RowBatch: RowBatchReply{ColumnCount: 1},
+			},
+		},
+		{
+			name: "row_batch_continuation_final",
+			resp: &ShardResponse{
+				Kind: ResponseRowBatch, Rows: [][]Cell{{{Null: true}}},
+				RowBatch: RowBatchReply{Sequence: 3, ColumnCount: 1, Final: true},
+			},
 		},
 		{
 			name: "document_scan_page",
@@ -837,6 +864,47 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 				})
 			},
 			want: errBadPartialAggregate,
+		},
+		{
+			name: "row_batch_requires_both_limits",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:      "SELECT id FROM messages",
+					RowBatch: RowBatchRequest{BatchRows: 1},
+				})
+			},
+			want: errBadRowBatch,
+		},
+		{
+			name: "row_batch_requires_total_limits",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL:      "SELECT id FROM messages",
+					RowBatch: RowBatchRequest{BatchRows: 1, BatchBytes: 64},
+				})
+			},
+			want: errBadRowBatch,
+		},
+		{
+			name: "row_batch_rejects_writes",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: "DELETE FROM messages", ExecutionMode: ExecutionReadWrite,
+					RowBatch: RowBatchRequest{BatchRows: 1, BatchBytes: 64},
+				})
+			},
+			want: errBadRowBatch,
+		},
+		{
+			name: "row_batch_continuation_rejects_schema",
+			enc: func() error {
+				return EncodeResponse(io.Discard, &ShardResponse{
+					Kind: ResponseRowBatch, Columns: []Column{{Name: "id"}},
+					Rows:     [][]Cell{{{Bytes: []byte("1")}}},
+					RowBatch: RowBatchReply{Sequence: 1, ColumnCount: 1, Final: true},
+				})
+			},
+			want: errBadRowBatch,
 		},
 		{
 			name: "row_arity_mismatch",
