@@ -1,59 +1,58 @@
-# Documentation
+# VibeDB documentation
 
-VibeDB is unreleased. These documents describe the current tree; they are not
-release promises or a compatibility roadmap.
+VibeDB is an embedded JSON database written in Go. It also provides a SQL
+runtime and a PostgreSQL wire server. An experimental distributed runtime adds
+shard routing, replicated state, and distributed execution.
 
-## Users
+Start with the page that matches your task.
 
-- [Store guide](store.md): native API, queries, snapshots, transactions,
-  indexes, limits, and ownership.
-- [SQL surface](design/sql-surface.md): accepted SQL and explicit refusals.
-- [Capability matrix](capabilities.md): generated, executable combinations of
-  operations, indexes, transactions, and durability.
-- [Durability](durability.md): acknowledgement, crash, recovery, and
-  unknown-outcome contracts.
-- [Pgwire package contract](../pgwire/doc.go): protocol, authentication,
-  result types, and PostgreSQL compatibility boundaries.
+## Get started
 
-## Operators
+- [Install and run VibeDB](getting-started.md)
+- [Select an API](api/README.md)
+- [Understand the architecture](architecture.md)
+- [Check current capabilities](capabilities.md)
 
-- [Distributed server boundary](design/distributed-sharding.md): loopback
-  shard/gateway commands, local fencing, supported distributed reads, and
-  explicit HA/resharding exclusions.
-- [Distributed system target](design/distributed-system.md): routed and
-  distributed execution lanes, tenant-independent virtual buckets, global
-  indexes/projections, vectorized multi-stage analytics, replication, movement,
-  and delivery gates. It is an implementation contract, not a statement of
-  current capability.
-- [Distributed transactions](design/distributed-transactions.md): participant
-  state, visibility, recovery, encoding, and current implementation boundary.
-- [Performance](performance.md): latest commit-pinned benchmark publication
-  and reproduction guidance.
-- [Security policy](../SECURITY.md): current reporting and support boundary.
-- [Provenance](provenance.md): dependency and adapted-algorithm ledger.
+## Use an API
 
-## Storage and engineering
+- [Native embedded API](api/native.md)
+- [Typed query API](api/query.md)
+- [SQL and `database/sql`](api/sql.md)
+- [PostgreSQL wire server](api/pgwire.md)
 
-- [Architecture](architecture.md): current storage and execution map.
-- [Format](format.md): sole accepted development on-disk grammar.
-- [Recovery journal](design/recovery-journal.md): journal structure and
-  recovery invariants.
-- [Canonical materialization](design/canonical-materialization.md): bounded
-  immutable publication.
-- [Primary write concurrency](design/parallel-tablet-writers.md): concurrent
-  mutation lane, bounds, and fallbacks.
-- [Multi-table transactions](design/multi-table-transactions.md): current K+1
-  decision protocol and exclusions.
-- [Query planner](design/query-planner.md): optimizer and distributed execution
-  subset.
-- [Raft core](design/raft-core-selection.md), [Raft WAL](design/raft-wal.md),
-  and [replicated state machine](design/replicated-state-machine.md): the
-  non-serving replication foundation and its serving exclusions.
-- [Ownership](../store/durable/OWNERSHIP.md) and [unsafe inventory](../UNSAFE.md):
-  resource lifetime and audited unsafe scopes.
-- [Contributing](../CONTRIBUTING.md): tests, format discipline, benchmarks, and
-  documentation rules.
+## Operate and inspect data
 
-Files under `docs/design` are current technical contracts. Completed delivery
-plans, rejected alternatives, and historical benchmark narratives are not kept
-in the public documentation tree; Git history is the archive.
+- [Durability and recovery](durability.md)
+- [Offline verification, salvage, and repack](operations/verification.md)
+- [Distributed runtime](operations/distributed.md)
+- [Performance tests](performance.md)
+- [Security boundary](../SECURITY.md)
+- [Unsafe-code inventory](../UNSAFE.md)
+
+## Design and internals
+
+- [Storage model](store.md)
+- [On-disk format](format.md)
+- [SQL surface](design/sql-surface.md)
+- [Query planner](design/query-planner.md)
+- [Distributed transactions](design/distributed-transactions.md)
+- [Placement tuple format](design/distribution-tuple-format.md)
+- [Replicated state machine](design/replicated-state-machine.md)
+- [Raft WAL](design/raft-wal.md)
+- [Source provenance](provenance.md)
+
+## Contribute
+
+- [Contribution guide](../CONTRIBUTING.md)
+- [Documentation language](STYLE.md)
+- [Benchmark harness](../bench/competitive/README.md)
+- [Allocation regression gate](../bench/gate/README.md)
+
+## Status
+
+The root Go module does not publish a tagged release in this repository. Pin a
+tested commit when you use it as a dependency. The distributed commands are
+experimental and bind only to loopback addresses.
+
+The implementation is the source of truth. Each design page lists the source
+files and tests that support its contract.

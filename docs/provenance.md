@@ -1,43 +1,59 @@
-# Provenance
+# Source and algorithm provenance
 
-This is the current inventory of externally derived or adapted algorithms in
-vibedb. Each implementation site carries a stable `Provenance: ID` comment that
-maps to one row below.
+This page maps external dependencies and derived algorithms to repository
+evidence. License files remain authoritative for license text.
 
-The repository has no root project license. `LICENSE-ROARING` contains the
-Apache-2.0 text required for the Roaring-derived algorithm named here, and
-`LICENSE-ETCD-RAFT` carries the exact license distributed with the pinned Raft
-module. `LICENSE-PROTOBUF` and `PATENTS-PROTOBUF` carry the notices from the
-protobuf runtime used directly by the integration and transitively by the core.
-`LICENSE-XXHASH` carries the MIT notice for the root routing-hash dependency.
-None of these files licenses the repository as a whole.
+## Root module dependencies
 
-## Dependency ledger
+| Dependency | Version in `go.mod` | Use in source | Repository notice |
+| --- | --- | --- | --- |
+| `github.com/cespare/xxhash/v2` | `v2.3.0` | Hashing and compatible placement adapters | `LICENSE-XXHASH` |
+| `github.com/thesyncim/vibejson` | Pseudo-version pinned in `go.mod` | JSON parsing, canonicalization, paths, and output | Dependency module metadata |
+| `go.etcd.io/raft/v3` | `v3.7.0` | Internal Raft state machine | `LICENSE-ETCD-RAFT` |
+| `golang.org/x/sys` | `v0.47.0` | Platform I/O and system calls | Dependency module metadata |
+| `google.golang.org/protobuf` | `v1.36.11` | Raft transport message encoding | `LICENSE-PROTOBUF`, `PATENTS-PROTOBUF` |
 
-| Dependency | Pin, license, and treatment |
-| --- | --- |
-| `github.com/cespare/xxhash/v2` | `v2.3.0`, module sum `h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=`, MIT (`LICENSE-XXHASH`). The root distribution mapper hashes canonical tuple bytes with the unmodified library and truncates the high bits to the configured virtual-bucket width. Scalar encoding, tuple framing, bucket geometry, and physical routing are local. Golden bucket vectors and allocation benchmarks pin the integration. |
-| `go.etcd.io/raft/v3` | `v3.7.0`, tag commit `b867cf13f6bc0dae21204302df97bc2355c3af55`, module sum `h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=`, Apache-2.0 (`LICENSE-ETCD-RAFT`). It is used unmodified as consensus protocol machinery whose transitions are deterministic for fixed internal timeout state and exact input order; upstream privately samples election jitter from `crypto/rand`. VibeDB is responsible for the surrounding scheduling, storage, transport, identity/admission, apply/publication, snapshots, encryption, and configuration safety. The repository currently implements a bounded non-serving scheduler, append-only immutable-base WAL, certified offline learner base/catch-up primitive, local apply boundary, and a frame/roster validator that accepts caller-supplied authenticated identity; it does not implement peer authentication, network transport, live generation compaction/cutover, or replicated serving. The exact settings, exclusions, and threat model are recorded in [`design/raft-core-selection.md`](design/raft-core-selection.md). |
-| `google.golang.org/protobuf` | Direct runtime dependency of the local integration and the selected Raft core's sole runtime module dependency at `v1.36.11`, module sum `h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=`, BSD-3-Clause (`LICENSE-PROTOBUF`) plus the distributed additional IP rights grant (`PATENTS-PROTOBUF`). It supplies the generated Raft wire types and protobuf runtime; no protobuf source is copied or modified locally. |
+The repository also keeps `LICENSE-ROARING` as a third-party notice. Do not
+infer a current dependency path from the notice alone. Use source imports and
+module files to determine active dependency use.
 
-## Algorithm ledger
+## Vitess compatibility module
 
-| ID | Local material | Source and treatment |
-| --- | --- | --- |
-| `ALGO-BLOOM-BLOCKED-001` | `query/join_bloom.go`: `joinBloomBlock`, `joinBloomSalt`, and `joinBloom.signature` | Blocked Bloom-filter layout described by Felix Putze, Peter Sanders, and Johannes Singler, “Cache-, Hash- and Space-Efficient Bloom Filters,” WEA 2007, DOI `10.1007/978-3-540-72845-0_9`, and specified as `BlockSplitBloomFilter` by Apache Parquet. The published eight odd salts are specification constants. Sizing, the bounded memory policy, the seeded `hash/maphash` hash, adaptive semi-join admission, and all integration are local. False-positive, no-false-negative, differential, and bounded-sizing tests enforce the contract. |
-| `ALGO-ROARING-001` | `store/store_index_exact.go`: `storeIndexMergeBulkMasks`; `query/candidates_mask.go`: `advanceStoreMasksUntil` | Forward merge and galloping `advanceUntil` strategy adapted from RoaringBitmap Java PR [#840](https://github.com/RoaringBitmap/RoaringBitmap/pull/840), merge `ef131a71e0aa6cd67b4ea649c957b1cd4c52b141`, and Roaring Go commit `438e356606d4e651d47a1b8a95b5f2fe08f8c7fd`; Apache-2.0, `LICENSE-ROARING`. The local form operates on immutable stable-slot chunk words and a persistent radix posting. It does not copy Roaring's container representation. Randomized differentials cover order, overlap, intersection, and difference. |
-| `ALGO-VITESS-XXHASH-001` | `x/vitessroute/xxhash.go`: `vindexBytes` and `xxhashPointFromBytes` | Vitess `xxhash` Vindex keyspace-id computation, `vitess.io/vitess` `go/vt/vtgate/vindexes/xxhash.go`; Apache-2.0, `x/vitessroute/LICENSE-VITESS`. The keyspace id is `binary.LittleEndian` of `cespare/xxhash/v2` `Sum64` over `sqltypes.Value.ToBytes()`: raw bytes for a `String`, minimal decimal ASCII for an admitted lossless integer (the load-bearing subtlety — an integer never hashes as its binary form). Only the small serialization/framing is reproduced; the hash primitive is the same upstream library. The design names `v0.22.0`; the differential harness pins `v0.24.2`, whose `xxhash.go` is byte-identical to `v0.22.0` (`v0.22.0`'s `go/hack` package does not compile under this repo's Go 1.26 toolchain — the `swissmap` GOEXPERIMENT was removed). Vitess is a test-only dependency confined to `x/vitessroute/go.mod`; the root module and shipped adapter files carry no Vitess dependency. Authoritative differential tests drive real upstream Vitess (`x/vitessroute/differential_test.go`, golden vectors in `x/vitessroute/testdata/`); a mismatch is a stop condition. |
-| `ALGO-VITESS-MULTICOL-001` | `x/vitessroute/multicol.go`: `resolveColumnBytes`, `mapMultiCol`, and `prefixRange` | Vitess `multicol` Vindex, `vitess.io/vitess` `go/vt/vtgate/vindexes/multicol.go`, plus the `NewKeyRangeFromPrefix`/`addOne` prefix-range logic in `go/vt/vtgate/vindexes/cfc.go`; Apache-2.0, `x/vitessroute/LICENSE-VITESS`. Reproduces `getColumnBytes` (the `ceil(remaining/pending)` width distribution), `mapKsid` (each column hashed by its `xxhash` sub-vindex, truncated to its byte width, and concatenated in column order), and `NewKeyRangeFromPrefix`/`addOne` (a leading prefix maps to `[prefix, addOne(prefix))`; an all-`0xff` prefix opens to the maximum end), narrowed to the fixed 8-byte profile. Pinned for differential testing at `v0.24.2`; the reproduced behavior is unchanged from the design's named `v0.22.0` (`cfc.go` is byte-identical and `multicol.go` differs only cosmetically). Authoritative differential tests drive real upstream Vitess; a mismatch is a stop condition. |
+`x/vitessroute` is a nested Go module. It pins Vitess `v0.24.2` for differential
+tests and provides a bounded compatibility adapter.
 
-## Maintenance
+The derived algorithms are:
 
-Before adding externally derived material:
+| ID | Source implementation | Local implementation | Validation |
+| --- | --- | --- | --- |
+| `ALGO-VITESS-XXHASH-001` | Vitess `vindexes/xxhash.go` | `x/vitessroute/xxhash.go` | Golden and differential tests |
+| `ALGO-VITESS-MULTICOL-001` | Vitess `vindexes/multicol.go` and `cfc.go` | `x/vitessroute/multicol.go` | Golden and differential tests |
 
-1. add a stable ledger ID with the project or paper, exact revision and source
-   location, upstream license, local changes, and integrity tests;
-2. add `Provenance: ID` at every adapted implementation site;
-3. include required upstream license and notice text;
-4. do not guess an origin or retain provenance for code no longer present; and
-5. add a root `LICENSE` and any required `NOTICE` before distributing the
-   repository as a licensed product; the dependency license files do not
-   license VibeDB itself.
+The local files identify the upstream paths, compatible version range, and
+behavioral boundary. `x/vitessroute/LICENSE-VITESS` contains the related
+license notice.
+
+The adapter does not expose all Vitess Vindexes. It supports its documented
+closed scalar and keyspace profile only.
+
+## Maintenance rules
+
+When you add or update an external dependency:
+
+1. Update the applicable `go.mod` and `go.sum`.
+2. Add or update the required license and patent notice.
+3. Identify copied or derived source in the local file header.
+4. Record the upstream repository, file, and version.
+5. Add a stable algorithm ID when behavior must stay compatible.
+6. Add golden and differential tests for compatibility code.
+7. Update this ledger.
+
+Do not use a benchmark match as the only parity proof. Compare exact outputs
+over normal, boundary, and invalid inputs.
+
+## Implementation references
+
+- `go.mod` and `go.sum`
+- `x/vitessroute/go.mod` and `go.sum`
+- `x/vitessroute/xxhash.go` and `multicol.go`
+- `x/vitessroute/differential_test.go` and `golden_test.go`

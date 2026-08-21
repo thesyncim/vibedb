@@ -1,80 +1,45 @@
-# Canonical materialization
+# Canonical page materialization
 
-**Status:** implemented behind strict eligibility checks. Materialized frames
-are one possible base of the generation cut; deferred primary lanes may also
-select a bounded immutable row overlay until foreground checkpoint folding.
+Canonical materialization is an opt-in durable path that can replace eligible
+canonical pages in place. It uses a recovery capsule with complete before-image
+regions.
 
-## Current paths
+## Configuration
 
-Buffered-visible and journal-backed synchronous mutations may patch an
-exclusively owned canonical leaf frame when the replacement has the same size
-and does not require a structural change. The frame is volatile until the next
-checkpoint, so this path needs no materialization capsule. A failed eligibility
-check uses copy-on-write.
+`MaterializationDamageGranule` is a storage-stack assertion. It states the
+largest complete region that a power failure can damage. Zero disables this
+path.
 
-An asynchronous store configured with a non-zero
-`MaterializationDamageGranule` may persist a same-length, projection-safe
-inline update through the before-image capsule. A zone change may include the
-document page and its route-summary page in the same capsule. Inserts, deletes,
-overflow transitions, structural changes, and unqualified devices use
-copy-on-write.
+The value is stored in the file and checked on each open. It is not inferred
+from a filesystem or device block size.
 
-The capsule itself is recovery-only and never enters ordinary reads. Separately,
-the unified deferred primary lane can publish bounded generation-stamped put or
-delete records over these base pages. Point reads, scans, filters, and indexes
-resolve the published base-plus-overlay cut exactly; no background merge or
-unbounded version structure is involved.
+Canonical sparse writes currently require buffered write mode. Direct-I/O
+alignment depends on the device and is refused for this path.
 
-## Eligibility
+## Fixed capsules
 
-The writer constructs complete after-images before publication, then verifies:
+The mutable file prefix contains two 4 KiB materialization capsules. An
+eligible change must fit all complete before-image sectors and metadata in one
+bounded capsule.
 
-1. the selected state is still current;
-2. every target resolves to the exact `PageRef` selected by that state;
-3. no active reader can observe a target that would be overwritten;
-4. each target cache frame is ready, clean, exclusively owned, and unpinned;
-5. the extent, page identity, and encoded length remain unchanged;
-6. no split, merge, relocation, fence, slot reassignment, or overflow
-   transition is required;
-7. exact-index postings and route summaries remain complete for the after-image;
-8. the bounded queue or capsule has capacity for the complete operation.
+The protocol records the before image, orders it before the canonical change,
+validates the after image, and then publishes the root state. Recovery can undo
+an incomplete canonical replacement.
 
-Failure of any check is a normal copy-on-write decision. A mutation never waits
-for ownership and never weakens its configured acknowledgement contract.
+If a mutation does not meet the eligibility and capacity checks, it uses the
+ordinary copy-on-write path.
 
-## Before-image protocol
+## Validation
 
-The persistent path uses two fixed, allocator-excluded 4 KiB capsule slots. A
-capsule binds the store identity, sequence, target generation, qualified sector
-size, exact target references, complete aligned before-sectors, and checksum.
+Tests inject failure at capsule, data, and root cuts. They also run recovery a
+second time to prove idempotence.
 
-Publication is ordered:
+This injected model does not prove the asserted damage granule for a real
+storage stack. Deployment evidence must establish that value.
 
-1. write and synchronize the alternate capsule slot;
-2. write all changed canonical sectors and ordinary copy-on-write pages;
-3. synchronize data;
-4. write and synchronize the alternate inline root.
+## Implementation references
 
-The inline-root generation is the commit marker. On open, a selected root older
-than the capsule target causes every recorded before-sector to be restored and
-synchronized. A root at or beyond the target ignores the capsule targets. A
-torn prospective capsule is ignored in favor of the preceding valid slot.
-
-The capsule remains intact because the alternate inline root may still require
-its before-images.
-
-## Invariants and qualification
-
-- snapshots observe the complete old or new generation, never a mixture;
-- page-cache replacement occurs under the snapshot gate and reader fence;
-- every ordinary read remains independent of the capsule;
-- crash tests cover each capsule, data, synchronization, and root boundary;
-- stale-state, pinned-reader, dirty-frame, capacity, and structural cases prove
-  copy-on-write selection;
-- exact-index and route-summary answers match a full rebuild;
-- warmed read allocation and page-acquisition gates remain unchanged;
-- matched-durability benchmarks report latency and device bytes separately for
-  copy-on-write and materialized updates.
-
-Materialization is an optimization. Correctness never depends on a mutation
-qualifying for it.
+- `internal/storeio/materialization_journal.go`
+- `internal/storeio/committer_materialization.go`
+- `store/durable/store_file_options.go`
+- `internal/storeio/mutable_file_layout.go`

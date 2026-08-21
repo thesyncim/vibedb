@@ -1,154 +1,149 @@
 # Query planner
 
-VibeDB has two complementary planning paths:
+VibeDB has a local query planner, a generic memo optimizer, and a gateway plan
+layer. Their capability sets are not identical.
 
-- `query` compiles the embedded SQL/native execution surface into bounded local
-  operators; and
-- `planner` provides a reusable Cascades-style memo, rules, physical
-  properties, statistics, and multidimensional cost model used by the
-  distributed gateway.
+## Local access planning
 
-This document describes what those planner primitives and the gateway execute
-now. Representable operators are not automatically executable operators.
+Local execution can use:
 
-## Memo and rules
+- Primary-key point access
+- Primary-key range access
+- Exact-index or posting candidates
+- Skip-index stripe pruning
+- Adaptive join access
+- Full scan
 
-A memo group represents one relational result and stores equivalent logical or
-physical expressions. Child edges name groups. Exact comparison, not hashes,
-decides equality. Exploration and implementation rules have stable phase,
-priority, and name ordering; equal-cost winners use deterministic structural
-digests with exact collision fallback.
+The full predicate remains authoritative. An index or summary only removes
+impossible candidates.
 
-Rule application is atomic: cancellation or a limit error rolls back the
-entire yielded change. Successful exploration seals the memo, after which the
-same immutable memo can be searched for multiple root property requirements.
+Skip-index pruning applies only to durable collections configured with
+`durable.Options.SkipIndexes`. SQL `CREATE INDEX` creates exact posting
+indexes, not skip indexes.
 
-## Physical properties
+`EXPLAIN` emits JSON without execution. `EXPLAIN ANALYZE` runs the query and
+adds actual rows, scans, batches, spill, index, and join counters.
 
-Plans provide and consume:
+Access names use `or-scan` when runtime conditions can select a fallback.
 
-- distribution: any, singleton, random, hash, range, or replicated;
-- a partition count, with zero as a consumer wildcard; and
-- an ordered column prefix with direction and explicit null placement.
+## Generic memo optimizer
 
-Ordering is local to a partition unless the distribution is singleton. Sorted
-shard streams therefore require `MergeGather` for global order; unordered
-streams use `Gather`; an unmet singleton order requires a sort.
+The `planner` package implements a Cascades-style memo search. Its logical and
+physical vocabulary includes scans, filters, projects, joins, aggregates,
+sorts, Top-K, limits, remote execution, gather, repartition, broadcast, and
+partial or final aggregation.
 
-## Cost and limits
+Physical distributions include singleton, random, hash, range, and replicated.
+Ordering records direction and null order.
 
-Cost is a vector of startup, CPU, IO, network, and peak memory. Sequential peak
-memory composes with `max`; a physical operator can provide a custom composer
-for pipelined or concurrent children. Overflow and non-finite costs fail
-closed.
+The cost model separates startup, CPU, I/O, network, and memory costs.
 
-Independent limits bound groups, expressions, rule applications, physical
-alternatives, property states, enforcer steps, recursion depth, memo payload,
-search payload, plan nodes, and memory. Cancellation is checked during
-exploration and search. Hitting a bound returns a typed error; the optimizer
-never publishes a partial best-so-far plan.
+Default optimizer bounds are:
 
-`OptimizerStatistics` reports memo/search counts and accounted bytes but no
-clock. Benchmarks time the call boundary.
+| Resource | Maximum |
+| --- | ---: |
+| Memo groups | 4096 |
+| Expressions | 32,768 |
+| Rule applications | 131,072 |
+| Plans | 65,536 |
+| Property states | 65,536 |
+| Enforcer steps | 65,536 |
+| Depth | 1024 |
+| Memo payload | 64 MiB |
+| Search payload | 256 MiB |
 
-## Statistics
+This vocabulary is generic capability. It does not prove that the SQL gateway
+can lower every SQL construct to every operator.
 
-Statistics are immutable and pinned to the same catalog generation as routing.
-They affect cost only; routing, ownership, SQL semantics, colocation, and
-resource admission never trust them.
+## Gateway plan cache
 
-The compact catalog stores uncertain table row/width estimates, sparse column
-NDV/null/width data, heavy hitters, histograms, and optional per-shard row
-estimates in flat sorted runs and an interned scalar arena. Query lookup is
-allocation-free. Canonical JSON scalar comparison makes numeric spelling
-variants share one statistical identity. Missing or stale data produces
-conservative estimates, never a semantic shortcut.
+`gateway.Snapshot.Prepare` compiles and caches plans for one immutable catalog
+generation. The cache has 1024 direct-mapped slots. SQL text longer than 4 KiB
+still compiles but is not cached.
 
-Statistics publication and request-bound construction use byte-native append
-APIs. `vibejson` validates and streams decoded JSON strings directly into the
-canonical arena, while exact numbers normalize from borrowed spellings without
-an intermediate mantissa or Go string. String-returning helpers remain cold
-compatibility boundaries rather than distributed request-path dependencies.
+Gateway SELECT planning requires a physical driving table as its first `FROM`
+source. Every physical table must exist in the pinned placement catalog.
+FROM-less local queries do not have a gateway plan.
 
-## Current distributed execution
+Routing uses SQL shard-key constraints and bound parameter values. A READY
+global index can provide routing when every indexed key ordinal binds to a
+finite, nonempty exact domain and the base shard key is not already a single
+point. The gateway selects at most one eligible global index.
 
-One gateway attempt pins one routing/statistics generation. The constraint
-compiler derives placement-key domains and produces empty, single, targeted,
-or scatter routes under admission limits.
+## Distributed joins
 
-Executable multi-shard shapes are:
+The gateway distributes a join only when every input has compatible placement
+and affinity. The join must prove equality for every shard-key ordinal against
+an earlier colocated input.
 
-- projection/filter reads with bounded fan-out and fail-closed partial-result
-  behavior;
-- colocated `INNER` and `LEFT` joins whose equality covers every placement-key
-  ordinal;
-- unordered `Gather` and ordered k-way `MergeGather`, including global
-  `LIMIT`; and
-- exact global and grouped `COUNT`, `SUM`, `MIN`, and `MAX` finalization, plus
-  path-projection `DISTINCT` through the same exact grouped state.
+The gateway permits colocated inner and left joins. Right, full, and cross
+joins need an all-shard relation plan and are refused. The current path also
+refuses derived-table and CTE joins.
 
-Grouped execution sends the authored `GROUP BY` to every shard as the partial
-stage. On a multi-shard route an additive request marker asks the shard runtime
-to parse the original SQL once, then remove final-only `ORDER BY`, `OFFSET`, and `LIMIT`
-nodes from its owned AST before lowering. The wire still carries authored SQL
-and typed parameters, never a serialized plan or a second rewritten SQL string.
-This guarantees that a local LIMIT cannot discard a partial group needed by
-another shard. The gateway interns returned key tuples using the query engine's
-exact group-key encoding and finalizes dense columnar accumulator lanes. Small
-integer counts and sums stay in native registers, promote to `big.Int` only on
-overflow, and enter rational mode only for a real decimal. Retained state and
-completed output share the operation's finite aggregate byte admission. Group
-order is stable first appearance when unordered. Grouped `ORDER BY` adds a
-bounded exact final sort. `ORDER BY ... OFFSET M LIMIT K` uses an exact O(M+K) max-heap
-after final aggregation instead of sorting every group, including when one
-group identity spans shards. The physical plan exposes these as `sort` and
-`top-k` above `final-aggregate`. Every distributed group key must still be
-present in the SELECT output so the final stage receives the complete identity;
-a single-shard route retains the local engine's broader projection surface.
+These are gateway restrictions. The local query runtime supports more join
+forms.
 
-Inside each shard, primary-key inequalities and `BETWEEN` bind to canonical
-ordered-key bounds and seek the durable primary graph before document decoding.
-The query engine retains its compiled predicate as the correctness authority,
-then applies filter-first extraction and late projection over only the visited
-span. Single-column secondary inequalities binary-search the same persisted,
-prefix-compressed ordered term leaves used by equality indexes, union their
-stable-slot postings under the pinned overlay generation, and intersect those
-masks with other exact candidates before row decoding. Broad term spans decline
-under a fixed latency bound. Conjunctive lower and upper bounds over one path
-become one physical term span, so `BETWEEN` does not materialize two broad
-posting unions merely to intersect them. Covering aggregates remain a separate
-exact path; no secondary values or range metadata are duplicated into another
-format.
+## Route restrictions
 
-For declared `durable.Options.SkipIndexes`, conjunctive immutable scalar
-`=`, `<`, `<=`, `>`, and `>=` comparisons compile into canonical ordered byte
-bounds over catalog ordinals. A warmed scan compares those bounds with compact
-per-primary-stripe min/max terms without path strings or JSON parsing and
-advances rejected leaves before key/value decoding. Exact candidate masks and
-native primary ranges take precedence; overlays decline the optimization. The
-complete compiled predicate still rechecks every row in retained stripes, so
-missing/invalid summaries affect work only, never results. Query statistics
-report both skipped stripes and their logical row count.
+The gateway refuses these shapes on every route, including one target:
 
-`SUM` uses exact rational arithmetic and emits a finite canonical JSON decimal.
-`MIN` and `MAX` compare exact values and preserve a contributing spelling.
-Every shard aggregate must return exactly one row with the expected schema.
-Non-integral `MergeGather` keys and numeric `MIN`/`MAX` states share the query
-engine's exact arbitrary-exponent byte comparator; the merge heap performs no
-number canonicalization, float conversion, or allocation.
+- Set expressions
+- CTEs
+- Physical predicate subqueries
+- Derived-table and CTE joins
+- Unsupported join types
+- Joins without a complete colocation proof
 
-The gateway refuses:
+The gateway refuses these shapes only when a route has more than one target:
 
-- `AVG`, grouped `HAVING`, computed/window DISTINCT, windows, and OFFSET on a
-  non-grouped multi-shard route;
-- derived, CTE, or predicate-subquery plans that read another physical source;
-- non-colocated, cross-distribution, `RIGHT`, and `FULL` joins; and
-- unsupported single-statement scatter writes. Explicit bounded write batches
-  may partition into a fixed participant set and commit through the durable
-  coordinator protocol; the one-shard `Exec` lane remains the lower-latency
-  path.
+- Global `HAVING`
+- Global windows
+- Hidden ordering columns
+- Unmergeable `DISTINCT`
+- Unmergeable grouping
+- Unsafe global offset or Top-K
+- Unsupported aggregate shapes
 
-The generic memo includes additional operator identities for testing and
-composition, but the gateway must reject any plan whose execution
-kernel is absent. See [Distributed server boundary](distributed-sharding.md)
-for the operator-facing network and HA limits.
+Cross-shard ordering requires a projected ordering key. Hidden merge columns
+are not supported.
+
+Cross-shard combination supports direct projected `COUNT`, `SUM`, `MIN`, and
+`MAX`. Aggregates inside scalar expressions are refused. Grouped combination
+requires every grouping key in the projection. `AVG` is unsupported, and an
+ungrouped combined aggregate cannot carry `LIMIT`.
+
+`BoundPlan.ValidateRoute` checks these conditions after bind-time routing and
+before dispatch.
+
+## Gateway physical paths
+
+The current gateway memo centers on:
+
+- Remote base-table access
+- Global-index access
+- Optional final aggregation
+- Gather or merge-gather
+- Repartition for grouped aggregation
+
+Catalog table, partition, and column statistics can inform cost. Missing join
+correlation statistics use conservative expansion assumptions.
+
+Fanout execution supports targeted and scatter routes, ordered merge, global
+limit, aggregate combine, grouped partial aggregation, cancellation, and stale
+generation retry.
+
+## Write planning
+
+An ordinary distributed mutation must have one provable owner. Cross-shard
+insert, scatter update or delete, and shard-key-changing update fail before
+dispatch.
+
+The separate transaction-batch API can span shards and tables. An ordinary
+multi-row SQL mutation does not automatically select that API.
+
+## Implementation references
+
+- `query/explain.go`, `exec.go`, and `file_execute.go`
+- `planner/types.go`, `memo.go`, and `optimizer.go`
+- `gateway/planner.go` and `optimizer.go`
+- `gateway/global_index_read.go` and `merge.go`
