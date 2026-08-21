@@ -171,6 +171,20 @@ and stores no topology strings. It is advisory, single-owner state: restart
 safety still comes from durable child/capture proofs and exact generation
 fences, not from recovering this table.
 
+Capacity placement consumes exact-catalog-generation reports for up to 4,096
+nodes. It uses SABLE's seven resource dimensions plus migration ingress and
+receive concurrency. A bounded pointer-free workspace orders at most 128 child
+allocations by dominant cluster share, then places as many as five replicas by
+minimum projected dominant pressure. Source-leader exclusion, numeric
+failure-domain anti-affinity, per-node primary/replica limits, and a physical
+migration cap are hard constraints. Sibling reservations immediately affect
+later scores, so equal-capacity children spread without a tenant affinity key.
+
+The fixed cut contains node ordinals, not a serialized plan. Its bridge rechecks
+catalog/node generations and endpoint membership before using the existing
+allocation-lineage-fenced split builder. It does not create Raft membership,
+move bytes, or publish topology.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -187,7 +201,8 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`, and
+  `capacity_placement.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

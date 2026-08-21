@@ -194,7 +194,8 @@ review rules.
 - `gateway/executor.go` and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`, and
+  `capacity_placement.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, `stage.go`, and
   `source_capture.go`
 - `internal/rangesplit/cutover.go`

@@ -250,6 +250,16 @@ func (m *Manifest) ShardMetadataAt(i int) (ShardMetadata, bool) {
 	}, true
 }
 
+// ShardLeaderAt returns one borrowed immutable endpoint identity without
+// cloning the shard's complete ordered leader set.
+func (m *Manifest) ShardLeaderAt(shard, leader int) (EndpointID, bool) {
+	if m == nil || shard < 0 || shard >= len(m.shards) || leader < 0 ||
+		leader >= len(m.shards[shard].Leaders) {
+		return "", false
+	}
+	return m.shards[shard].Leaders[leader], true
+}
+
 // ShardMetadataForRange returns allocation-free scalar metadata when r is the
 // exact range of one active shard. The lookup is O(log shard_count) over the
 // manifest's immutable range-start index; overlapping or stale range geometry

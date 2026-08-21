@@ -70,6 +70,19 @@ func TestManifestShardMetadataAt(t *testing.T) {
 	}
 }
 
+func TestManifestShardLeaderAt(t *testing.T) {
+	manifest := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
+	if endpoint, ok := manifest.ShardLeaderAt(0, 1); !ok || endpoint != "ep-0b" {
+		t.Fatalf("ShardLeaderAt = %q, %v; want ep-0b, true", endpoint, ok)
+	}
+	for _, coordinates := range [][2]int{{-1, 0}, {0, -1}, {2, 0}, {0, 2}} {
+		if endpoint, ok := manifest.ShardLeaderAt(coordinates[0], coordinates[1]); ok || endpoint != "" {
+			t.Errorf("ShardLeaderAt(%d, %d) = %q, %v; want empty, false",
+				coordinates[0], coordinates[1], endpoint, ok)
+		}
+	}
+}
+
 func TestManifestShardMetadataForRange(t *testing.T) {
 	manifest := manifestForMetadataTest(t, "dist", 7, metadataTestShards())
 	want, _ := manifest.ShardMetadataAt(1)
@@ -254,6 +267,7 @@ func TestManifestInspectionZeroAlloc(t *testing.T) {
 
 	// Warm each path before measuring so one-time runtime setup is excluded.
 	manifestMetadataSink, manifestBoolSink = left.ShardMetadataAt(0)
+	_, manifestBoolSink = left.ShardLeaderAt(0, 0)
 	manifestMetadataSink, manifestBoolSink = left.ShardMetadataForRange(metadataRange)
 	manifestBoolSink = left.SameShardLeaders(0, right, 0)
 	manifestBoolSink = left.Equal(right)
@@ -266,6 +280,12 @@ func TestManifestInspectionZeroAlloc(t *testing.T) {
 			name: "metadata",
 			run: func() {
 				manifestMetadataSink, manifestBoolSink = left.ShardMetadataAt(0)
+			},
+		},
+		{
+			name: "leader",
+			run: func() {
+				_, manifestBoolSink = left.ShardLeaderAt(0, 0)
 			},
 		},
 		{

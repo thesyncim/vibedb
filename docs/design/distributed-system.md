@@ -127,6 +127,22 @@ allocates nothing. Feedback is deliberately advisory and need not survive a
 crash. Durable split artifacts, controller reconstruction, and catalog/source
 generation checks remain the authority after restart.
 
+Capacity placement accepts at most 4,096 exact-generation node reports and 128
+non-retained children. Reports use the same seven fixed SABLE resource units
+plus per-cut migration ingress, receive concurrency, a readiness bit, and a
+numeric failure domain. The pointer-free caller workspace is bounded below 320
+KiB and the warm path allocates nothing. Work is ordered by dominant share of
+cluster capacity, then each replica minimizes projected dominant node pressure.
+Hard policy can exclude source leaders, require distinct failure domains, cap
+new replicas and primaries per node, and cap physical migration after replica
+fanout.
+
+The placement cut stores only fixed-width node ordinals. A cold bridge uses one
+temporary leader backing, rechecks node and catalog generations plus endpoint
+membership, then invokes the existing allocation-high-water-fenced split plan
+builder. Capacity evidence never prepares Raft members or grants serving or
+catalog authority.
+
 `PlanSplit` does not move data or publish the catalog. The internal
 `rangesplit` package can populate non-retained child images from one source
 scan. It uses compiled `vibejson` placement and deterministic hash-chained
@@ -243,7 +259,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`
 - `shardservice/admit.go`, `read_fence.go`, and `server.go`
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
-- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`, and
+  `capacity_placement.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
