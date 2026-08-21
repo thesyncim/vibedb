@@ -74,7 +74,5 @@ func (p *Plan) initialSourceState(state replicatedstate.State) bool {
 		binding.Distribution == string(p.source.Distribution) &&
 		binding.Shard == string(p.source.Shard) &&
 		binding.AllocationGeneration == uint64(p.source.AllocationGeneration) &&
-		binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
-		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
-		binding.RouteGeneration == p.current
+		p.sourceBindingInitial(binding)
 }

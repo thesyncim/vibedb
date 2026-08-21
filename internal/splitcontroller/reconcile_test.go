@@ -192,7 +192,7 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 		MaxCompletions: 8,
 	}
 	child := &ChildObservation{
-		Child: 1, Activated: true, ApplyIdentity: identity,
+		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true, MaxCompletions: 8,
 		},
@@ -203,14 +203,14 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 		t.Fatalf("WAL action = %+v, %v, %v", action, ok, err)
 	}
 
-	child.WALCreated = true
+	child.Phase = ChildPhaseWALCreated
 	child.WALBinding = target.SQL.Binding
 	action, ok, err = plan.childAction(observed, certificate)
 	if err != nil || !ok || action.Kind != ActionAdoptChildRuntime {
 		t.Fatalf("adopt action = %+v, %v, %v", action, ok, err)
 	}
 
-	child.RuntimeAdopted = true
+	child.Phase = ChildPhaseRuntimeAdopted
 	child.RuntimeIdentity = testRuntimeIdentity(target)
 	child.RuntimeStatus = raftmember.RuntimeStatus{
 		MemberID: target.WAL.MemberID, LeaderID: target.WAL.MemberID + 1,
@@ -229,6 +229,40 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 	child.WALBinding.Authority.RouteGeneration++
 	if _, _, err := plan.childAction(observed, certificate); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("changed WAL binding error = %v", err)
+	}
+}
+
+func TestChildActionsRejectSkippedPhaseAndPrematureEvidence(t *testing.T) {
+	plan, _, target, _ := testPlan(t)
+	certificate := rangesplit.CutoverCertificate{}
+	identity := sqldriver.ReplicatedApplyIdentity{
+		Storage: "apply", ValidationDigest: sha256.Sum256([]byte("apply")),
+		MaxCompletions: 8,
+	}
+	child := &ChildObservation{
+		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
+		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
+			Binding: target.SQL.Binding, Initialized: true, MaxCompletions: 8,
+		},
+		WALBinding: target.SQL.Binding,
+	}
+	observed := Observation{}
+	observed.Children[1] = child
+	if _, _, err := plan.childAction(observed, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("premature WAL evidence error = %v", err)
+	}
+
+	child.WALBinding = sqldriver.ReplicatedShardStoreBinding{}
+	child.Phase = ChildPhase(4)
+	if _, _, err := plan.childAction(observed, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("unknown phase error = %v", err)
+	}
+
+	child.Phase = ChildPhaseWALCreated
+	child.WALBinding = target.SQL.Binding
+	child.RuntimeIdentity = testRuntimeIdentity(target)
+	if _, _, err := plan.childAction(observed, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("premature runtime evidence error = %v", err)
 	}
 }
 

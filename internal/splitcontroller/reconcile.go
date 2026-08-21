@@ -296,19 +296,27 @@ func (p *Plan) Target(child uint8) (ChildTarget, bool) {
 	return cloneChildTarget(target), true
 }
 
+// ChildPhase is the monotonic durable progress observed for one non-retained
+// child. Absence is represented by a nil ChildObservation, so zero is invalid.
+type ChildPhase uint8
+
+const (
+	ChildPhaseActivated ChildPhase = iota + 1
+	ChildPhaseWALCreated
+	ChildPhaseRuntimeAdopted
+)
+
 // ChildObservation is a detached scheduler cut for one non-retained child.
-// Each later flag requires all earlier exact identities to remain present.
+// Each later phase requires all earlier exact identities to remain present.
 type ChildObservation struct {
 	Child uint8
+	Phase ChildPhase
 
-	Activated     bool
 	ApplyIdentity sqldriver.ReplicatedApplyIdentity
 	ApplyProfile  sqldriver.ReplicatedApplyCapacityProfile
 
-	WALCreated bool
 	WALBinding sqldriver.ReplicatedShardStoreBinding
 
-	RuntimeAdopted  bool
 	RuntimeIdentity raftmember.RuntimeIdentity
 	RuntimeStatus   raftmember.RuntimeStatus
 }
@@ -383,12 +391,16 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{}, ErrTopologyConflict
 	}
 	if !tail.Sealed() {
-		if !plan.sourceStateMatchesCut(observed.SourceState, tail) ||
-			observed.Capture.Head() < tail.SourceCut().Applied {
+		if observed.Capture.Head() < tail.SourceCut().Applied {
 			return Action{}, ErrTopologyConflict
 		}
-		if observed.Capture.Head() > tail.SourceCut().Applied ||
-			!plan.stagesMatchTail(observed, tail, false) {
+		if observed.Capture.Head() > tail.SourceCut().Applied {
+			return Action{Kind: ActionCatchUpTail}, nil
+		}
+		if !plan.sourceStateMatchesCut(observed.SourceState, tail) {
+			return Action{}, ErrTopologyConflict
+		}
+		if !plan.stagesMatchTail(observed, tail, false) {
 			return Action{Kind: ActionCatchUpTail}, nil
 		}
 		if !sourceLeader(observed.SourceStatus, observed.SourceState) {
@@ -474,22 +486,32 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 		binding.AllocationGeneration != uint64(p.source.AllocationGeneration) {
 		return ErrTopologyConflict
 	}
-	sealed := observed.Certificate != nil || observed.Tail != nil && observed.Tail.Sealed()
-	retained := p.children[p.retained]
-	if sealed {
-		if binding.OwnershipEpoch != uint64(retained.OwnershipEpoch) ||
-			binding.RoutingVersion != uint64(p.targetManifest.Version()) ||
-			binding.RouteGeneration != p.next {
-			return ErrTopologyConflict
-		}
-		return nil
+	initial := p.sourceBindingInitial(binding)
+	sealed := p.sourceBindingSealed(binding)
+	if !initial && !sealed {
+		return ErrTopologyConflict
 	}
-	if binding.OwnershipEpoch != uint64(p.source.OwnershipEpoch) ||
-		binding.RoutingVersion != uint64(p.source.RoutingVersion) ||
-		binding.RouteGeneration != p.current {
+	proofSealed := observed.Certificate != nil || observed.Tail != nil && observed.Tail.Sealed()
+	if proofSealed && !sealed {
 		return ErrTopologyConflict
 	}
 	return nil
+}
+
+func (p *Plan) sourceBindingInitial(binding replicatedstate.Binding) bool {
+	return p != nil && binding.OwnershipEpoch == uint64(p.source.OwnershipEpoch) &&
+		binding.RoutingVersion == uint64(p.source.RoutingVersion) &&
+		binding.RouteGeneration == p.current
+}
+
+func (p *Plan) sourceBindingSealed(binding replicatedstate.Binding) bool {
+	if p == nil {
+		return false
+	}
+	retained := p.children[p.retained]
+	return binding.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
+		binding.RoutingVersion == uint64(p.targetManifest.Version()) &&
+		binding.RouteGeneration == p.next
 }
 
 func (p *Plan) sourceStateMatchesCut(state replicatedstate.State, tail rangesplit.TailCursor) bool {
@@ -599,13 +621,12 @@ func (p *Plan) childAction(
 		}
 		target := p.targets[child]
 		status := observed.Children[child]
-		if status == nil || !status.Activated {
-			if status != nil && (status.WALCreated || status.RuntimeAdopted) {
-				return Action{}, false, ErrTopologyConflict
-			}
+		if status == nil {
 			return Action{Kind: ActionActivateChild, Child: uint8(child)}, true, nil
 		}
-		if status.Child != uint8(child) || status.ApplyIdentity.Storage == "" ||
+		if status.Child != uint8(child) ||
+			status.Phase < ChildPhaseActivated || status.Phase > ChildPhaseRuntimeAdopted ||
+			status.ApplyIdentity.Storage == "" ||
 			status.ApplyIdentity.ValidationDigest == ([32]byte{}) ||
 			status.ApplyProfile.Binding != target.SQL.Binding ||
 			!status.ApplyProfile.Initialized ||
@@ -613,8 +634,10 @@ func (p *Plan) childAction(
 			status.ApplyProfile.MaxCompletions != status.ApplyIdentity.MaxCompletions {
 			return Action{}, false, ErrTopologyConflict
 		}
-		if !status.WALCreated {
-			if status.RuntimeAdopted ||
+		if status.Phase == ChildPhaseActivated {
+			if status.WALBinding != (sqldriver.ReplicatedShardStoreBinding{}) ||
+				status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
+				status.RuntimeStatus != (raftmember.RuntimeStatus{}) ||
 				status.ApplyProfile.Applied != certificate.SourceCut().Applied ||
 				status.ApplyProfile.CompletionCount != 0 {
 				return Action{}, false, ErrTopologyConflict
@@ -624,7 +647,11 @@ func (p *Plan) childAction(
 		if status.WALBinding != target.SQL.Binding {
 			return Action{}, false, ErrTopologyConflict
 		}
-		if !status.RuntimeAdopted {
+		if status.Phase == ChildPhaseWALCreated {
+			if status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
+				status.RuntimeStatus != (raftmember.RuntimeStatus{}) {
+				return Action{}, false, ErrTopologyConflict
+			}
 			return Action{Kind: ActionAdoptChildRuntime, Child: uint8(child)}, true, nil
 		}
 		if !runtimeIdentityMatches(target, status.RuntimeIdentity) {

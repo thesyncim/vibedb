@@ -173,6 +173,10 @@ cannot relabel an accepted controller plan.
 The execution helpers encode the source seal without JSON and construct the
 certified unpublished catalog successor. They do not bypass replicated apply or
 the catalog CAS.
+The reconciler treats a captured source ahead of its tail cursor as catch-up,
+including the crash window after the ownership seal applies but before that
+seal reaches every child stage. Child progress is a single monotonic phase,
+not independent booleans; skipped phases and premature evidence are rejected.
 The repository still has no runnable automatic split controller or merge
 planner.
 

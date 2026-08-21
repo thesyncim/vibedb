@@ -120,6 +120,14 @@ allocation-free. The plan also constructs the certified unpublished catalog
 successor, but the existing durable and in-memory generation CAS operations
 remain the publication authority.
 
+An observed source publication may legitimately be ahead of a durable tail
+cursor while captured writes or the ownership seal await translation. The
+controller returns bounded tail catch-up in that window; it rejects a regressed
+capture head, an unknown fence tuple, or a sealed cursor paired with an
+unsealed source. Child activation, WAL creation, and runtime adoption use one
+monotonic phase byte, so skipped phases and premature later-phase evidence fail
+closed.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
