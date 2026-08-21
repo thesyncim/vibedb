@@ -158,6 +158,23 @@ func TestPreparedPlanDistributedAggregateBoundary(t *testing.T) {
 		t.Fatalf("nonlocal grouped LIMIT validation = %v, want partial-fragment admission", err)
 	}
 
+	distinct, err := snap.Prepare(context.Background(),
+		`SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 2`)
+	if err != nil {
+		t.Fatalf("Prepare DISTINCT: %v", err)
+	}
+	distinctBound, err := distinct.Bind(nil)
+	if err != nil {
+		t.Fatalf("Bind DISTINCT: %v", err)
+	}
+	if !slices.Equal(distinctBound.aggregates, []sqlast.AggKind{sqlast.AggNone}) ||
+		!slices.Equal(distinctBound.groupKeys, []int{0}) {
+		t.Fatalf("DISTINCT program = %v keys %v", distinctBound.aggregates, distinctBound.groupKeys)
+	}
+	if err := distinctBound.ValidateRoute(routeBoundPlan(t, distinctBound)); err != nil {
+		t.Fatalf("distributed DISTINCT validation = %v", err)
+	}
+
 	localLimit, err := snap.Prepare(context.Background(),
 		`SELECT tenant_id, COUNT(*) FROM messages GROUP BY tenant_id ORDER BY tenant_id LIMIT 2`)
 	if err != nil {

@@ -1470,6 +1470,27 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 		t.Fatalf("total dials after nonlocal top-k = %d, want 24", got)
 	}
 
+	distinct, err := e.Query(context.Background(), Query{
+		SQL:   `SELECT DISTINCT n FROM messages ORDER BY n DESC LIMIT 3`,
+		Class: ClassBatch,
+	})
+	if err != nil {
+		t.Fatalf("distributed DISTINCT Query: %v", err)
+	}
+	if len(distinct.Rows) != 3 {
+		t.Fatalf("distributed DISTINCT rows = %d, want 3", len(distinct.Rows))
+	}
+	for row := range distinct.Rows {
+		if len(distinct.Rows[row]) != 1 || distinct.Rows[row][0].Null ||
+			string(distinct.Rows[row][0].Bytes) != string(result.Rows[row][0].Bytes) {
+			t.Fatalf("distributed DISTINCT row %d = %+v, want %q",
+				row, distinct.Rows[row], result.Rows[row][0].Bytes)
+		}
+	}
+	if got := c.dialer.totalDials(); got != 36 {
+		t.Fatalf("total dials after distributed DISTINCT = %d, want 36", got)
+	}
+
 	sort.Strings(allKeys)
 	top, err := e.Query(context.Background(), Query{
 		SQL: `SELECT tenant_id, COUNT(*) FROM messages ` +
@@ -1489,8 +1510,8 @@ func TestE2EScatterGroupedPartialFinalAggregation(t *testing.T) {
 			t.Fatalf("top-k row %d = %+v, want key %q count 1", row, top.Rows[row], allKeys[row])
 		}
 	}
-	if got := c.dialer.totalDials(); got != 36 {
-		t.Fatalf("total dials after grouped sort and top-k = %d, want 36", got)
+	if got := c.dialer.totalDials(); got != 48 {
+		t.Fatalf("total dials after grouped sort and top-k = %d, want 48", got)
 	}
 }
 

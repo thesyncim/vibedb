@@ -566,7 +566,7 @@ func multiShardSemanticBoundary(
 	groupedAggregateSupported bool,
 ) string {
 	switch {
-	case stmt.Distinct:
+	case stmt.Distinct && !groupedAggregateSupported:
 		return firstPlanReason(reason, "DISTINCT requires a bounded global deduplicator")
 	case len(stmt.GroupBy) != 0 && !groupedAggregateSupported:
 		return firstPlanReason(reason, "GROUP BY requires a partial-aggregate combiner")

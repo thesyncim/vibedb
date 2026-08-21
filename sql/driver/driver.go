@@ -465,7 +465,7 @@ func (c *conn) prepareContextMode(ctx context.Context, src string, partialAggreg
 	}
 	if partialAggregate {
 		if tree.Kind != sqlast.KindSelect || tree.Select == nil ||
-			len(tree.Select.GroupBy) == 0 || tree.Select.Distinct ||
+			len(tree.Select.GroupBy) == 0 ||
 			tree.Select.Having != nil || len(tree.Select.Windows) != 0 ||
 			tree.Select.Offset != nil {
 			return nil, errors.New("vibedb: partial aggregate fragment requires a grouped SELECT without DISTINCT, HAVING, windows, or OFFSET")

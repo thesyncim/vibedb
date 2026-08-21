@@ -188,6 +188,29 @@ func TestPartialAggregateFragmentRemovesFinalOrderAndLimit(t *testing.T) {
 	}
 }
 
+func TestPartialAggregateFragmentRetainsLocalDistinct(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	conn := dial(t, srv)
+	exec(t, conn, ownedRequest(ddlDocs))
+	for _, row := range []struct {
+		id string
+		n  string
+	}{{"a", "1"}, {"b", "1"}, {"c", "2"}} {
+		exec(t, conn, ownedRequest(
+			`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+			StringParam(row.id), StringParam(row.id), NumberParam(row.n),
+		))
+	}
+
+	req := ownedRequest(`SELECT DISTINCT n FROM docs ORDER BY n LIMIT 1`)
+	req.ExecutionMode = ExecutionReadOnly
+	req.PartialAggregate = true
+	got := exec(t, conn, req)
+	if len(got.Rows) != 2 || cellText(t, got, 0, 0) != "1" || cellText(t, got, 1, 0) != "2" {
+		t.Fatalf("partial DISTINCT rows = %+v, want [1 2]", got.Rows)
+	}
+}
+
 func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)
