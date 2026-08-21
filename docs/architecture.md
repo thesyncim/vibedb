@@ -201,3 +201,4 @@ review rules.
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
+- `internal/splitcontroller/execute.go`

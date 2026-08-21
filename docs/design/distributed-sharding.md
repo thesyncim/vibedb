@@ -114,6 +114,12 @@ The reconciler rejects skipped routing or catalog generations. It also requires
 the cutover route generation to equal the exact catalog successor. It does not
 execute an action or provide a runnable service controller.
 
+The plan can encode the source ownership seal directly into the existing fixed
+binary transition grammar. A reused maximum-size buffer keeps this step
+allocation-free. The plan also constructs the certified unpublished catalog
+successor, but the existing durable and in-memory generation CAS operations
+remain the publication authority.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -138,3 +144,4 @@ boundary.
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
+- `internal/splitcontroller/execute.go`

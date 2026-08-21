@@ -170,6 +170,9 @@ The caller must retain the immutable plan and execute each proof-checking action
 Post-publication recovery reconstructs and validates the prior source manifest
 from the exact child sequence. Caller mutation of the original split request
 cannot relabel an accepted controller plan.
+The execution helpers encode the source seal without JSON and construct the
+certified unpublished catalog successor. They do not bypass replicated apply or
+the catalog CAS.
 The repository still has no runnable automatic split controller or merge
 planner.
 
@@ -208,6 +211,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
+- `internal/splitcontroller/execute.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`
