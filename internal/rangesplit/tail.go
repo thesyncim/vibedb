@@ -108,6 +108,15 @@ func (c TailCursor) SourceCoordinates() TailSourceCoordinates {
 // Sealed reports whether c ends at the terminal ownership fence.
 func (c TailCursor) Sealed() bool { return c.sealed }
 
+// ValidateTailCursor checks that c is an authentic cursor for this exact
+// partitioner. It performs no I/O and grants no source or serving authority.
+func (p *Partitioner) ValidateTailCursor(c TailCursor) error {
+	if p == nil || !p.validTailCursor(c) {
+		return ErrTailCursor
+	}
+	return nil
+}
+
 // TailOperation is one borrowed child-local mutation. A moved row becomes a
 // delete in its old child and a put in its new child.
 type TailOperation struct {

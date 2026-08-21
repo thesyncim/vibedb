@@ -180,10 +180,9 @@ func TestSplitPlanDigestBindsEndpoints(t *testing.T) {
 	}
 }
 
-func TestSplitPlanDigestBindsUnchangedManifestAndTargetVersion(t *testing.T) {
-	first := testSplitPlanWithNeighbor(t, "node-z", 12)
-	changedNeighbor := testSplitPlanWithNeighbor(t, "node-y", 12)
-	changedVersion := testSplitPlanWithNeighbor(t, "node-z", 13)
+func TestSplitPlanDigestBindsUnchangedManifest(t *testing.T) {
+	first := testSplitPlanWithNeighbor(t, "node-z")
+	changedNeighbor := testSplitPlanWithNeighbor(t, "node-y")
 	a, err := SplitPlanDigest(first)
 	if err != nil {
 		t.Fatal(err)
@@ -192,12 +191,8 @@ func TestSplitPlanDigestBindsUnchangedManifestAndTargetVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := SplitPlanDigest(changedVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a == b || a == c || b == c {
-		t.Fatalf("full-manifest digests collided: %x / %x / %x", a, b, c)
+	if a == b {
+		t.Fatalf("full-manifest digests collided: %x / %x", a, b)
 	}
 }
 
@@ -282,7 +277,6 @@ func testSourceState(plan *autosplit.SplitPlan) replicatedstate.State {
 func testSplitPlanWithNeighbor(
 	t testing.TB,
 	neighbor distribution.EndpointID,
-	next distribution.RoutingVersion,
 ) *autosplit.SplitPlan {
 	t.Helper()
 	middle := distribution.KeyspacePoint{0x80}
@@ -313,7 +307,7 @@ func testSplitPlanWithNeighbor(
 			Boundaries: [2]distribution.KeyspacePoint{{0x40}}, BoundaryCount: 1,
 			CandidateBin: 32, BenefitPPM: 1,
 		},
-		RetainChild: 0, NextRoutingVersion: next, AllocationHighWater: 8,
+		RetainChild: 0, NextRoutingVersion: 12, AllocationHighWater: 8,
 		Destinations: []autosplit.Destination{{
 			Shard: "middle", AllocationGeneration: 9,
 			Leaders: []distribution.EndpointID{"node-b"}, OwnershipEpoch: 1,

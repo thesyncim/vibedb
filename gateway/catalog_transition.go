@@ -30,7 +30,8 @@ func BuildCertifiedRangeSplitTransition(
 		return nil, rangesplit.ErrManifestTransition
 	}
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, certificate, prune,
+		currentManifest, nextManifest, current.Generation(), nextGeneration,
+		certificate, prune,
 	); err != nil {
 		return nil, err
 	}

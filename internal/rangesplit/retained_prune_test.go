@@ -147,9 +147,19 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	nextManifest := testSplitPlan(t, "node-b").Manifest()
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, certificate, cursor,
+		currentManifest, nextManifest, 19, 20, certificate, cursor,
 	); err != nil {
 		t.Fatal(err)
+	}
+	if err := partitioner.ValidatePublicationTransition(
+		currentManifest, nextManifest, 19, 21, certificate, cursor,
+	); !errors.Is(err, ErrManifestTransition) {
+		t.Fatalf("skipped catalog generation err=%v", err)
+	}
+	if err := partitioner.ValidatePublicationTransition(
+		currentManifest, nextManifest, 18, 20, certificate, cursor,
+	); !errors.Is(err, ErrManifestTransition) {
+		t.Fatalf("certificate/catalog generation mismatch err=%v", err)
 	}
 	incomplete := cursor
 	incomplete.phase = RetainedPruneScan
@@ -161,7 +171,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatalf("incomplete proof err=%v", err)
 	}
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, certificate, incomplete,
+		currentManifest, nextManifest, 19, 20, certificate, incomplete,
 	); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("incomplete publication proof err=%v", err)
 	}

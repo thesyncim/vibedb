@@ -159,8 +159,26 @@ apply/cursor crash window. A final fresh scan hashes the exact retained image.
 The gateway binds that completion proof to an exact manifest transition: only
 the planned source may be replaced, and unrelated shard identities and leaders
 must remain unchanged. Existing durable and in-memory catalog compare-and-swap
-operations provide publication authority. The repository still has no
-automatic split controller or merge planner.
+operations provide publication authority. The certificate route generation,
+target catalog generation, and source catalog successor must be equal.
+
+The internal split reconciler validates the prepared first-leader SQL and Raft
+identity for each new child. It derives one action at a time from the capture,
+artifacts, child cursors, cutover certificate, apply profile, WAL binding,
+runtime status, prune proof, and catalog. Its warm wait path does not allocate.
+The caller must retain the immutable plan and execute each proof-checking action.
+Post-publication recovery reconstructs and validates the prior source manifest
+from the exact child sequence. Caller mutation of the original split request
+cannot relabel an accepted controller plan.
+The execution helpers encode the source seal without JSON only from an exact
+caught-up unsealed tail, and construct the certified unpublished catalog
+successor. They do not bypass replicated apply or the catalog CAS.
+The reconciler treats a captured source ahead of its tail cursor as catch-up,
+including the crash window after the ownership seal applies but before that
+seal reaches every child stage. Child progress is a single monotonic phase,
+not independent booleans; skipped phases and premature evidence are rejected.
+The repository still has no runnable automatic split controller or merge
+planner.
 
 ## Replication kernel
 
@@ -196,6 +214,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/replicatedstate/staged_snapshot.go`
 - `sql/driver/replicated_child_stage.go`
 - `internal/raftmember/staged_child.go`
+- `internal/splitcontroller/reconcile.go`
+- `internal/splitcontroller/execute.go`
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`

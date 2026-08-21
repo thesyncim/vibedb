@@ -94,6 +94,7 @@ func TestPlanSplitRejectsStaleOrUnsafeTopology(t *testing.T) {
 	}{
 		{"stale source epoch", func(r *SplitRequest) { r.Recommendation.Source.OwnershipEpoch-- }},
 		{"routing regression", func(r *SplitRequest) { r.NextRoutingVersion = current.Version() }},
+		{"routing skip", func(r *SplitRequest) { r.NextRoutingVersion = current.Version() + 2 }},
 		{"unaligned boundary", func(r *SplitRequest) { r.Recommendation.Boundaries[0][7] = 1 }},
 		{"allocation below high water", func(r *SplitRequest) { r.Destinations[0].AllocationGeneration = 7 }},
 		{"active shard id reuse", func(r *SplitRequest) { r.Destinations[0].Shard = "source" }},
@@ -108,6 +109,29 @@ func TestPlanSplitRejectsStaleOrUnsafeTopology(t *testing.T) {
 				t.Fatalf("PlanSplit error = %v, want ErrInvalidSplit", err)
 			}
 		})
+	}
+}
+
+func TestPlanSplitRejectsExhaustedRoutingVersion(t *testing.T) {
+	current, err := distribution.NewManifest("d", ^distribution.RoutingVersion(0), []distribution.Shard{{
+		ID: "source", AllocationGeneration: 7,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"node-a"}, Epoch: 5,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := actionSource(t, current)
+	request := SplitRequest{
+		Recommendation: testBinaryRecommendation(source, 1, 32), RetainChild: 0,
+		NextRoutingVersion: 1, AllocationHighWater: 7,
+		Destinations: []Destination{{
+			Shard: "right", AllocationGeneration: 8,
+			Leaders: []distribution.EndpointID{"node-b"}, OwnershipEpoch: 1,
+		}},
+	}
+	if _, err := PlanSplit(current, request); !errors.Is(err, ErrInvalidSplit) {
+		t.Fatalf("PlanSplit error = %v, want ErrInvalidSplit", err)
 	}
 }
 

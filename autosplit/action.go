@@ -45,6 +45,16 @@ type SplitChild struct {
 	Retained             bool
 }
 
+// SplitChildIdentity is the allocation-free scalar view used by control loops.
+// Ordered leaders remain in the immutable plan and are accessed separately.
+type SplitChildIdentity struct {
+	Range                distribution.KeyRange
+	Shard                distribution.ShardID
+	AllocationGeneration distribution.ShardAllocationGeneration
+	OwnershipEpoch       distribution.OwnershipEpoch
+	Retained             bool
+}
+
 // SplitPlan is a bounded desired-state artifact. It does not publish topology
 // or move data. Manifest becomes publishable only after every non-retained
 // child has installed a certified snapshot, caught up, and passed cutover
@@ -67,6 +77,29 @@ func (p *SplitPlan) Child(index int) (SplitChild, bool) {
 	return child, true
 }
 
+// ChildIdentity returns one allocation-free scalar child view.
+func (p *SplitPlan) ChildIdentity(index int) (SplitChildIdentity, bool) {
+	if p == nil || index < 0 || index >= int(p.ChildCount) {
+		return SplitChildIdentity{}, false
+	}
+	child := p.children[index]
+	return SplitChildIdentity{
+		Range: child.Range, Shard: child.Shard,
+		AllocationGeneration: child.AllocationGeneration,
+		OwnershipEpoch:       child.OwnershipEpoch, Retained: child.Retained,
+	}, true
+}
+
+// ChildLeader returns one borrowed immutable endpoint identity without cloning
+// the complete leader list.
+func (p *SplitPlan) ChildLeader(child, leader int) (distribution.EndpointID, bool) {
+	if p == nil || child < 0 || child >= int(p.ChildCount) || leader < 0 ||
+		leader >= len(p.children[child].Leaders) {
+		return "", false
+	}
+	return p.children[child].Leaders[leader], true
+}
+
 // Manifest returns the immutable desired routing manifest.
 func (p *SplitPlan) Manifest() *distribution.Manifest {
 	if p == nil {
@@ -82,7 +115,8 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 	rec := request.Recommendation
 	if current == nil || rec.Source.Distribution != current.Distribution() ||
 		rec.Source.RoutingVersion != current.Version() ||
-		request.NextRoutingVersion <= current.Version() || !actionableRecommendation(rec) {
+		current.Version() == ^distribution.RoutingVersion(0) ||
+		request.NextRoutingVersion != current.Version()+1 || !actionableRecommendation(rec) {
 		return nil, ErrInvalidSplit
 	}
 	sourceOrdinal, source, ok := exactSourceShard(current, rec.Source)

@@ -2,6 +2,7 @@ package rangesplit
 
 import (
 	"errors"
+	"math"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
@@ -15,6 +16,8 @@ var ErrManifestTransition = errors.New("rangesplit: manifest does not exactly ap
 func (p *Partitioner) ValidatePublicationTransition(
 	current *distribution.Manifest,
 	next *distribution.Manifest,
+	currentGeneration uint64,
+	nextGeneration uint64,
 	certificate CutoverCertificate,
 	prune RetainedPruneCursor,
 ) error {
@@ -23,6 +26,10 @@ func (p *Partitioner) ValidatePublicationTransition(
 	}
 	if p.VerifyRetainedPruneCompletion(certificate, prune) != nil {
 		return ErrRetainedPrune
+	}
+	if currentGeneration == math.MaxUint64 || nextGeneration != currentGeneration+1 ||
+		certificate.SourceCoordinates().RouteGeneration != nextGeneration {
+		return ErrManifestTransition
 	}
 	return p.ValidateManifestTransition(current, next)
 }
