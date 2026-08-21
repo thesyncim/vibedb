@@ -235,6 +235,17 @@ Every exchange carries an operation deadline, byte/row budget, bounded channel,
 and cancellation signal. Backpressure reaches shard scans; it never creates an
 unbounded gateway buffer or one goroutine per row.
 
+The non-serving worker mailbox state machine now exists in `internal/exchange`.
+Raw operation/stage/partition/attempt keys fence retries without formatted IDs;
+registries reserve aggregate buffer capacity before publication; mailboxes
+enforce per-batch, per-producer-credit, live-queue, total-stage, sequence,
+producer-count, and deadline limits. Accepted payload ownership transfers as
+opaque bytes without JSON or string conversion. Cancellation and deadline
+expiry wake every blocked producer/consumer, and multiply-high partition
+selection avoids modulo bias. Network commands, authenticated peer admission,
+and planner stage orchestration remain required before this becomes a serving
+worker-to-worker exchange.
+
 The first transport primitive now serves: an additive row-batch request keeps
 the ordinary routed request/response bytes unchanged, while opted-in reads send
 sequence-checked terminal frames with explicit per-batch and total row/byte
@@ -348,6 +359,8 @@ cluster does not fork into named protocol generations.
    and borrowed byte-native decode while preserving the one-frame routed lane;
    grouped partial/final fan-out consumes it incrementally in deterministic
    route order without whole-shard response materialization.
+   A bounded non-serving worker mailbox/partition state machine is also present;
+   shard wire lifecycle commands and direct producer routing are next.
    Hash/range exchange and worker-local final aggregation come next, followed
    by runtime filters, batched row-ID late materialization, distributed index
    analysis, and guarded parallel-replica range scheduling.

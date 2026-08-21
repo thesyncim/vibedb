@@ -29,6 +29,12 @@ bounded in-process scheduler/outbox, and a frame/roster validator that accepts
 a caller-supplied authenticated NodeID. These internal packages are not wired
 to either server command, a public API, or operator configuration.
 
+`internal/exchange` likewise contains a non-serving bounded worker mailbox:
+raw attempt-fenced identities, unbiased fixed-stage partition selection,
+registry capacity reservation, per-producer sequence/credit enforcement,
+backpressure, deadlines, and deterministic cancellation cleanup. No shard wire
+command or planner currently opens it, so it is not a network exchange yet.
+
 ## Network and trust boundary
 
 Both server commands accept loopback listeners only. This is a deliberate
