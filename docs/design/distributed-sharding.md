@@ -163,6 +163,14 @@ directory, and cross-plan identity uniqueness. It does not assign those
 resources or publish topology. Placement reservations and every later data
 proof remain separate prerequisites.
 
+The scheduler's optional 1,024-entry feedback table prevents the same exact
+source incarnation from being admitted while work is in flight. Retryable
+outcomes use capped exponential delay measured in new evidence windows, not
+wall time. The fixed-width fingerprint table has a compact open-addressed index
+and stores no topology strings. It is advisory, single-owner state: restart
+safety still comes from durable child/capture proofs and exact generation
+fences, not from recovering this table.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -179,7 +187,7 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go` and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

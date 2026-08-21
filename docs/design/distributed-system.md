@@ -119,6 +119,14 @@ uniqueness across the batch. Allocation namespaces remain per distribution.
 The handoff still does not choose destination members, reserve identities,
 move data, execute a controller action, or grant catalog authority.
 
+A single-owner fixed-memory feedback table can suppress duplicate in-flight
+work and apply capped exponential retry delay in source evidence windows. Its
+1,024 entries use fixed-width source fingerprints plus a compact open-addressed
+index; the table retains no topology strings and the warm admission path still
+allocates nothing. Feedback is deliberately advisory and need not survive a
+crash. Durable split artifacts, controller reconstruction, and catalog/source
+generation checks remain the authority after restart.
+
 `PlanSplit` does not move data or publish the catalog. The internal
 `rangesplit` package can populate non-retained child images from one source
 scan. It uses compiled `vibejson` placement and deterministic hash-chained
@@ -235,7 +243,7 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`
 - `shardservice/admit.go`, `read_fence.go`, and `server.go`
 - `autosplit/recorder.go`, `planner.go`, `tracker.go`, and `action.go`
-- `internal/topologyscheduler/admission.go` and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`

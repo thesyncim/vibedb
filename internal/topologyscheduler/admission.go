@@ -62,6 +62,7 @@ type Decision struct {
 	Duplicate    uint16
 	Distribution uint16
 	Budget       uint16
+	Deferred     uint16
 }
 
 // Workspace is caller-owned fixed scratch. Reusing it keeps warm admission
@@ -78,6 +79,32 @@ func SelectSplits(
 	candidates []SplitCandidate,
 	policy Policy,
 	workspace *Workspace,
+) (Decision, error) {
+	return selectSplits(catalog, candidates, policy, workspace, nil)
+}
+
+// SelectSplitsWithFeedback applies the same deterministic admission cut while
+// deferring exact source incarnations that are already in flight or inside a
+// retry window. Feedback is a scheduling optimization, never topology proof.
+func SelectSplitsWithFeedback(
+	catalog *gateway.Snapshot,
+	candidates []SplitCandidate,
+	policy Policy,
+	workspace *Workspace,
+	feedback *FeedbackTable,
+) (Decision, error) {
+	if feedback == nil {
+		return Decision{}, ErrInvalidAdmission
+	}
+	return selectSplits(catalog, candidates, policy, workspace, feedback)
+}
+
+func selectSplits(
+	catalog *gateway.Snapshot,
+	candidates []SplitCandidate,
+	policy Policy,
+	workspace *Workspace,
+	feedback *FeedbackTable,
 ) (Decision, error) {
 	if catalog == nil || workspace == nil || len(candidates) > MaxCandidates ||
 		policy.MaxBatch == 0 || policy.MaxBatch > MaxBatch ||
@@ -104,6 +131,9 @@ func SelectSplits(
 			recommendation.BenefitPPM < policy.MinBenefitPPM ||
 			!exactSource(catalog, recommendation.Source):
 			decision.Invalid++
+			continue
+		case feedback != nil && !feedback.eligible(candidate):
+			decision.Deferred++
 			continue
 		case selectedSource(&decision, candidates, recommendation.Source):
 			decision.Duplicate++
