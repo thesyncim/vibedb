@@ -22,6 +22,7 @@ shard.
 | `gateway` / `vibedb-gateway` | Immutable catalog validation, generation-pinned routing, scoped coherent read fan-out/result merging, a single-shard write fast path, synchronous multi-table/cross-shard `ExecBatch`, periodic durable coordinator redrive, byte-native grouped streaming, and memory-costed worker-to-worker hash repartition; general range/join exchange is not yet wired |
 | `planner` | Bounded memo/rule/cost/statistics primitives used by the distributed planning layer |
 | `autosplit` | Fixed-space striped request telemetry, sustained bucket-aligned recommendations, and allocation-high-water/generation-fenced desired split manifests; it cannot publish topology, copy state, catch up a destination, or move ownership |
+| `internal/rebalance` | Non-serving, stateless intact-shard replica movement: exact membership stages, certified learner-base/install proof, applied catch-up, promotion, leader transfer, ordered ownership-fence advance, catalog generation CAS, old-generation drain, source removal, and retirement action |
 
 The repository also contains a non-serving Raft foundation: a pinned upstream
 Raft core, append-only immutable-base WAL, local replicated-apply state machine,
@@ -60,9 +61,11 @@ authentication or authorization.
   local boundary.
 
 The gateway catalog is supplied externally as an immutable snapshot. The
-gateway can validate, inspect, load, pin, and reload a strictly newer catalog;
-the repository does not provide a complete topology service or workflow
-controller.
+gateway can validate, inspect, load, pin, and reload a strictly newer catalog.
+Both durable and in-memory publication also expose an expected-generation CAS,
+so a movement planned from generation N cannot overwrite unrelated topology.
+The repository does not provide a topology authority or a server-wired workflow
+service.
 
 ## Placement and tenant boundary
 
@@ -150,9 +153,16 @@ hash-chained, and checkpointed. Non-serving destination files can now resume at
 an atomically persisted cursor, apply bounded local batches, and pass a full
 candidate-open proof without retaining a second artifact copy. A verified
 candidate can now be bound to a fresh immutable Raft WAL at the exact cut, and
-a learner catches up its suffix through ordinary `AppendEntries`. Transport
-orchestration, topology-authorized membership publication, target SQL-root
-construction, and ownership cutover are not implemented here.
+a learner catches up its suffix through ordinary `AppendEntries`. For an intact
+shard allocation, the non-serving rebalance kernel now admits only the exact
+sequence: learner membership, certified base identity, target apply at the
+leader commit, voter promotion, explicit leader transfer, one binary replicated
+ownership/routing/catalog-fence increment, expected-generation catalog CAS,
+old-generation operation drain, source-voter removal, and source retirement.
+It fails closed on an unrelated catalog or membership edit and reconstructs its
+next action from durable evidence after restart. Peer transfer orchestration,
+topology authorization, target SQL-root construction, server integration, and
+physical filtered child-range artifacts are not implemented here.
 
 A multi-shard query establishes an ephemeral coherent vector cut before reading:
 it acquires the same leased raw identity on every target, reads only while that
@@ -234,11 +244,12 @@ return session positions, and the shard service refuses a minimum-position
 request before SQL execution.
 
 Ordinary catalog publication validates monotonic catalog, routing, allocation,
-range, leader, and ownership coordinates. Desired split planning now applies
-the same generation and allocation-lineage fences, but there is no online
-range-movement executor. Operators must not publish its desired manifest or
-treat any catalog edit as a safe split, merge, move, or replica
-reconfiguration protocol.
+range, leader, and ownership coordinates. Intact-shard replica cutover has an
+exact-generation publication and drain protocol in the non-serving kernel.
+Desired split planning applies the same generation and allocation-lineage
+fences, but there is no online range-split executor. Operators must not publish
+a desired split manifest or treat an arbitrary catalog edit as a safe split,
+merge, move, or replica reconfiguration protocol.
 
 ## What is not implemented
 
@@ -248,15 +259,15 @@ reconfiguration protocol.
   failover;
 - serving follower/session reads or a coherent SQL read bound to the
   non-serving runtime's `ReadIndex` outcome;
-- runtime Raft snapshot publication, WAL compaction,
-  topology-authorized dynamic membership reconciliation, or snapshot transfer;
-  portable coherent artifact export, resumable non-serving staging/candidate
-  validation, and context-free model-checked configuration proposals are
-  exposed only through the non-serving kernel;
-- ordered catch-up and cutover execution for an online split, merge, move, or
-  topology recovery; bounded hot-bucket evidence, desired split planning,
-  source artifact export, and offline destination install do exist, but confer
-  no serving authority;
+- runtime Raft log compaction, authenticated snapshot transport, or a
+  server-wired topology authority; portable coherent artifact export,
+  resumable non-serving staging/candidate validation, model-checked membership,
+  and intact-shard move reconciliation are exposed only through the non-serving
+  kernel;
+- filtered child artifacts and ordered cutover for an online split or merge;
+  bounded hot-bucket evidence, desired split planning, source artifact export,
+  offline destination install, and intact-shard replica relocation primitives
+  exist, but confer no serving authority by themselves;
 - a replicated scalar MVCC/closed-timestamp snapshot or historical distributed
   reads; the current leader-only vector fence is ephemeral;
 - arbitrary distributed SQL transaction sessions and single-statement scatter

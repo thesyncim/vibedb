@@ -210,19 +210,29 @@ A configuration entry mutates only the system state. It persists the exact
 core-produced `ConfState`, sets `ReplicaSetVersion` to the entry index, advances
 `Applied`, and leaves the logical data digest unchanged.
 
+An ownership-transition normal entry is a separate bounded binary control
+grammar, not a JSON document or synthetic SQL statement. It binds the complete
+current shard/group identity, exact replica-set version, source and target voter
+IDs, and current mutable serving fence. Apply requires both members in the
+stable incoming voter set, rejects joint membership, and advances ownership
+epoch, routing version, and catalog/route generation by exactly one in the same
+durable publication as `Applied`. Immutable allocation identity, schema/policy
+fences, logical data digest, and retained results do not change. Reopen requires
+the advanced binding, while exact retries of commands committed under an older
+monotone routing fence still resolve from their retained completion.
+
 The current state-machine port supplies configuration metadata plus the
 core-produced `ConfState`, not the original `ConfChange` bytes. Its retained
 configuration digest therefore binds index, term, entry type, and deterministic
 `ConfState`; it is exact at the apply-port boundary but is not a claim to retain
 the original configuration proposal envelope.
 
-The Raft state-machine port still accepts only the exact static bootstrap
-snapshot fixed at construction. Installation is an idempotent verification at
-the same cut, including exact snapshot bytes/identity, logical digest,
-`ConfState`, binding, and replica-set version. A portable runtime artifact can
-now be exported and verified, but installing it as replacement durable state,
-publishing it to Raft storage, and swapping WAL generations remain unsupported
-until the destination staging repository and crash protocol exist.
+The Raft state-machine port accepts the exact static bootstrap and a newer
+bounded certificate only after its complete collection artifact has already
+been installed into non-serving destination files. Certificate installation is
+idempotent at the same cut and binds exact artifact identity, logical digest,
+`ConfState`, binding, replica-set version, and original bootstrap without
+putting collection rows in Raft snapshot data.
 
 ## Reader publication and reopen
 
@@ -281,9 +291,12 @@ cut, and a learner created from it accepts `N+1...` only through ordinary Raft
 snapshot data. Exact certificate reinstall is idempotent, and a different
 certificate at the same cut fails closed.
 
-The transport/range orchestrator, topology-authorized learner publication,
-source-to-target SQL-root construction, live generation swap, and ownership
-cutover remain absent. The implemented primitives grant no serving authority.
+The non-serving rebalance kernel now orders intact-shard learner qualification,
+promotion, leader transfer, replicated ownership transition, exact catalog CAS,
+generation drain, source removal, and retirement. Authenticated transfer,
+external topology authorization, source-to-target SQL-root construction,
+server wiring, physical range filtering/split, and live serving failover remain
+absent. The implemented primitives grant no serving authority by themselves.
 
 ## Isolation boundary
 

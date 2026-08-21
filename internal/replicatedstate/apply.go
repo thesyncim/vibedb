@@ -46,12 +46,40 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if len(data) > replication.MaxCommandBytes {
 		return raftmodel.Publication{}, m.fail(ErrAdmissionBound)
 	}
+	kind := RecordNormal
+	if IsOwnershipTransition(data) {
+		kind = RecordOwnership
+	}
 	digest := normalEntryDigest(meta, data)
-	replay, err := m.checkTransition(meta, RecordNormal, digest)
+	replay, err := m.checkTransition(meta, kind, digest)
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	if replay {
+		if kind == RecordOwnership {
+			transition, openErr := OpenOwnershipTransition(data)
+			if openErr != nil || m.state.Binding.OwnershipEpoch != transition.ToOwnershipEpoch ||
+				m.state.Binding.RoutingVersion != transition.ToRoutingVersion ||
+				m.state.Binding.RouteGeneration != transition.ToRouteGeneration {
+				return raftmodel.Publication{}, m.fail(ErrOwnershipTransition)
+			}
+		}
+		return clonePublication(m.publication), nil
+	}
+	if kind == RecordOwnership {
+		transition, openErr := OpenOwnershipTransition(data)
+		if openErr != nil {
+			return raftmodel.Publication{}, m.fail(openErr)
+		}
+		binding, transitionErr := m.ownershipTransitionBinding(transition)
+		if transitionErr != nil {
+			return raftmodel.Publication{}, m.fail(transitionErr)
+		}
+		next := m.nextState(meta, RecordOwnership, digest)
+		next.Binding = binding
+		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
 		return clonePublication(m.publication), nil
 	}
 	if len(data) == 0 {
@@ -196,6 +224,28 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 // Serving remains forbidden because a successful return does not reserve the
 // proved storage for the future committed entry.
 func (m *Machine) AdmitCommand(data []byte) error {
+	if IsOwnershipTransition(data) {
+		transition, err := OpenOwnershipTransition(data)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if err := m.checkUsable(); err != nil {
+			return err
+		}
+		if !m.initialized || m.state.Applied == math.MaxUint64-1 {
+			return ErrAdmissionBound
+		}
+		binding, err := m.ownershipTransitionBinding(transition)
+		if err != nil {
+			return err
+		}
+		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
+		next := m.nextState(meta, RecordOwnership, normalEntryDigest(meta, transition.Bytes()))
+		next.Binding = binding
+		return m.checkTransitionCapacity(next, nil, [33]byte{}, nil)
+	}
 	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return err
@@ -578,6 +628,7 @@ func (m *Machine) persistTransition(
 		return err
 	}
 	m.state = next
+	m.binding = next.Binding
 	m.initialized = true
 	m.publication = publicationFromState(next)
 	return nil

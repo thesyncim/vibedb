@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -27,6 +28,7 @@ type fakeRuntime struct {
 	readContexts        [][]byte
 	messages            []*pb.Message
 	publication         raftmodel.Publication
+	snapshotState       replicatedstate.State
 	status              raftmember.RuntimeStatus
 	progress            map[uint64]raftmodel.MemberProgress
 	transfers           []uint64
@@ -78,6 +80,10 @@ func (runtime *fakeRuntime) ReadIndex(context []byte) error {
 
 func (runtime *fakeRuntime) Publication() (raftmodel.Publication, error) {
 	return runtime.publication, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) SnapshotState() (replicatedstate.State, error) {
+	return runtime.snapshotState, runtime.inputErr
 }
 
 func (runtime *fakeRuntime) Status() (raftmember.RuntimeStatus, error) {
@@ -357,6 +363,11 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	publication, err := host.Publication(runtime.identity.Group)
 	if err != nil || publication.Applied != 9 || publication.ReplicaSetVersion != 7 {
 		t.Fatalf("Publication = %+v, %v", publication, err)
+	}
+	runtime.snapshotState = replicatedstate.State{Applied: 9, SnapshotBaseDigest: [32]byte{1}}
+	snapshotState, err := host.SnapshotState(runtime.identity.Group)
+	if err != nil || snapshotState.Applied != 9 || snapshotState.SnapshotBaseDigest[0] != 1 {
+		t.Fatalf("SnapshotState = %+v, %v", snapshotState, err)
 	}
 	status, err := host.Status(runtime.identity.Group)
 	if err != nil || status.Term != 5 || status.Commit != 9 {

@@ -315,6 +315,25 @@ func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
 	return runtime.node.Published(), nil
 }
 
+// SnapshotState returns the complete coherent durable state paired with a
+// short-lived read snapshot. It is control-plane evidence for certified
+// learner installation; callers do not receive collection handles or serving
+// authority.
+func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return replicatedstate.State{}, err
+	}
+	cut, err := runtime.apply.SnapshotArtifactCut()
+	if err != nil {
+		return replicatedstate.State{}, err
+	}
+	state := cut.State()
+	if closeErr := cut.Close(); closeErr != nil {
+		return replicatedstate.State{}, closeErr
+	}
+	return state, nil
+}
+
 // Status returns detached local Raft status without allocating the leader's
 // complete progress map.
 func (runtime *Runtime) Status() (RuntimeStatus, error) {

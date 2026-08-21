@@ -8,6 +8,93 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 )
 
+// BuildManifestTransition constructs an unpublished catalog generation by
+// replacing exactly one distribution manifest while preserving the current
+// placements, endpoint directory, indexes, and statistics. Publication still
+// requires PublishAfter or SaveSnapshotAfter: constructing this value grants
+// no topology authority.
+//
+// This is deliberately a cold control-plane operation. The returned snapshot
+// is independently owned and fully revalidated; routed requests continue to
+// use the compact immutable metadata already published in current.
+func BuildManifestTransition(
+	current *Snapshot,
+	nextManifest *distribution.Manifest,
+	nextGeneration uint64,
+) (*Snapshot, error) {
+	if current == nil || nextManifest == nil {
+		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
+	}
+	if nextGeneration <= current.generation {
+		return nil, fmt.Errorf(
+			"%w: proposed=%d current=%d",
+			ErrCatalogGenerationNotNewer, nextGeneration, current.generation,
+		)
+	}
+	config := cloneConfig(current.config)
+	found := false
+	for i := range config.Manifests {
+		if config.Manifests[i].Distribution() != nextManifest.Distribution() {
+			continue
+		}
+		config.Manifests[i] = nextManifest
+		found = true
+		break
+	}
+	if !found {
+		return nil, &CatalogError{Reason: fmt.Sprintf(
+			"manifest transition references unknown distribution %q",
+			nextManifest.Distribution(),
+		)}
+	}
+	indexes := current.indexDescriptors()
+	statistics := current.statistics.Descriptors()
+	next, err := NewSnapshotWithPlannerMetadata(
+		config, current.endpoints, nextGeneration, indexes, statistics,
+	)
+	if err != nil {
+		return nil, err
+	}
+	currentState, err := initialCatalogState(current)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := advanceCatalogState(currentState, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func (s *Snapshot) indexDescriptors() []IndexDescriptor {
+	if s == nil || len(s.plannerIndexes) == 0 {
+		return nil
+	}
+	descriptors := make([]IndexDescriptor, 0, len(s.plannerIndexes))
+	for tableOrdinal := range s.plannerIndexSpans {
+		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
+		span := s.plannerIndexSpans[tableOrdinal]
+		for i := uint32(0); i < span.count; i++ {
+			ordinal := span.first + i
+			metadata := s.indexMetadata(table, ordinal)
+			descriptor := IndexDescriptor{
+				IndexID: metadata.IndexID, Incarnation: metadata.Incarnation,
+				Table: metadata.Table, Name: metadata.Name, Relation: metadata.Relation,
+				Paths:        make([]string, metadata.PathCount),
+				LocatorPaths: make([]string, metadata.LocatorCount),
+				Flags:        metadata.Flags, Lifecycle: metadata.Lifecycle,
+			}
+			copy(descriptor.Paths, metadata.Paths[:metadata.PathCount])
+			copy(descriptor.LocatorPaths, metadata.LocatorPaths[:metadata.LocatorCount])
+			if metadata.Global() {
+				program, _ := s.globalIndexPointerProgram(ordinal)
+				descriptor.PrimaryPath = metadata.LocatorPaths[program.primary]
+			}
+			descriptors = append(descriptors, descriptor)
+		}
+	}
+	return descriptors
+}
+
 // These compact active-record directories turn cross-generation validation
 // into merge walks. They are planner metadata, not lifetime tombstones: the
 // high-waters remain constant-size under churn. Each index reference is one

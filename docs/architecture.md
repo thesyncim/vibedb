@@ -315,9 +315,12 @@ remain predictable because their capacities and fold work are fixed at open.
   it into non-serving durable destination files through an atomic cursor without
   retaining an artifact copy, and fully validate a candidate. The exact
   candidate can be certified as a fresh immutable Raft base and catch up as a
-  learner through ordinary `AppendEntries`. Transfer orchestration,
-  topology-authorized learner publication, serving replication, failover, and
-  online movement remain absent.
+  learner through ordinary `AppendEntries`. `internal/rebalance` now derives an
+  intact-shard replica move from exact catalog, membership, snapshot-digest,
+  apply, progress, leadership, ownership-transition, catalog-CAS, generation-
+  drain, and retirement evidence. It remains a non-serving controller kernel:
+  peer transport, an external topology authority, server wiring, automatic
+  failover, and physical child-range split execution remain absent.
 - [Distributed system target](design/distributed-system.md): the routed fast
   path plus distributed fallback, tenant-independent virtual buckets, global
   indexes, coherent snapshots, bounded exchange, serving replication, and

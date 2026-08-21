@@ -31,6 +31,7 @@ const (
 	RecordStaticSnapshot RecordKind = 1
 	RecordNormal         RecordKind = 2
 	RecordConfiguration  RecordKind = 3
+	RecordOwnership      RecordKind = 4
 )
 
 // State is the exact durable publication stored at the fixed state key.
@@ -226,6 +227,11 @@ func validateState(state State) error {
 		}, state.ConfState)
 		if err != nil || state.LastEntryDigest != want {
 			return fmt.Errorf("%w: configuration entry digest", ErrStateCorrupt)
+		}
+	case RecordOwnership:
+		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
+			state.ReplicaSetVersion >= state.Applied {
+			return fmt.Errorf("%w: ownership entry type", ErrStateCorrupt)
 		}
 	default:
 		return fmt.Errorf("%w: record kind", ErrStateCorrupt)

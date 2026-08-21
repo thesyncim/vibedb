@@ -13,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -86,6 +87,7 @@ type memberRuntime interface {
 	ProposeConfChange(pb.ConfChangeI) error
 	ReadIndex([]byte) error
 	Publication() (raftmodel.Publication, error)
+	SnapshotState() (replicatedstate.State, error)
 	Status() (raftmember.RuntimeStatus, error)
 	Progress(uint64) (raftmodel.MemberProgress, bool, error)
 	TransferLeader(uint64) error
@@ -523,6 +525,16 @@ func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, e
 		return raftmodel.Publication{}, err
 	}
 	return group.runtime.Publication()
+}
+
+// SnapshotState returns one group's coherent durable state for control-plane
+// verification of an installed certified learner base.
+func (host *Host) SnapshotState(key raftmember.GroupKey) (replicatedstate.State, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return replicatedstate.State{}, err
+	}
+	return group.runtime.SnapshotState()
 }
 
 // Status returns one group's detached local Raft status.

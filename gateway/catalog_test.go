@@ -1074,6 +1074,58 @@ func TestCatalogHolderPublishAfterFencesConcurrentTopology(t *testing.T) {
 	}
 }
 
+func TestBuildManifestTransitionPreservesCatalogAndRaisesOwnershipFence(t *testing.T) {
+	config, endpoints := globalIndexCatalog(t)
+	current, err := NewSnapshotWithPlannerMetadata(
+		config, endpoints, 5, []IndexDescriptor{testGlobalIndexDescriptor()}, gatewayTestStatistics(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := current.Manifest("tenant_data")
+	shards := make([]distribution.Shard, manifest.ShardCount())
+	for i := range shards {
+		shards[i], _ = manifest.ShardInfo(i)
+	}
+	shards[0].Leaders = []distribution.EndpointID{"ep-b"}
+	shards[0].Epoch++
+	nextManifest, err := distribution.NewManifest("tenant_data", manifest.Version()+1, shards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildManifestTransition(current, nextManifest, 6)
+	if err != nil {
+		t.Fatalf("BuildManifestTransition: %v", err)
+	}
+	if next.Generation() != 6 || next.PlacementCount() != current.PlacementCount() ||
+		next.DistributionCount() != current.DistributionCount() {
+		t.Fatalf("next catalog shape = generation %d placements %d distributions %d",
+			next.Generation(), next.PlacementCount(), next.DistributionCount())
+	}
+	routed, _ := next.Manifest("tenant_data")
+	shard, _ := routed.ShardInfo(0)
+	if routed.Version() != manifest.Version()+1 || shard.Leaders[0] != "ep-b" || shard.Epoch != 8 {
+		t.Fatalf("transitioned shard = version %d shard %+v", routed.Version(), shard)
+	}
+	original, _ := manifest.ShardInfo(0)
+	if original.Leaders[0] != "ep-a" || original.Epoch != 7 {
+		t.Fatalf("current manifest mutated: %+v", original)
+	}
+	index, indexOK := next.Index("messages", "by_email")
+	statistics, statisticsOK := next.Statistics("messages")
+	address, addressErr := next.Address("ep-index-a")
+	if !indexOK || !index.Global() || index.Relation != "messages_email_index" ||
+		index.LocatorCount != 2 || index.LocatorPaths[1] != "/id" ||
+		!statisticsOK || statistics.Rows().Value != 10_000 ||
+		addressErr != nil || address != "127.0.0.1:7101" {
+		t.Fatalf("preserved metadata = index %+v/%t statistics=%+v/%t address=%q/%v",
+			index, indexOK, statistics.Rows(), statisticsOK, address, addressErr)
+	}
+	if _, err := BuildManifestTransition(current, nextManifest, 5); !errors.Is(err, ErrCatalogGenerationNotNewer) {
+		t.Fatalf("equal catalog generation err=%v, want ErrCatalogGenerationNotNewer", err)
+	}
+}
+
 // TestCatalogHolderAtomicPublicationRace proves concurrent publication and reads
 // never expose a torn or mixed generation: every observed snapshot is a whole,
 // internally consistent immutable value. It is meaningful under -race.

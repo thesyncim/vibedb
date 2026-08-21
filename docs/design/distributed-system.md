@@ -400,10 +400,9 @@ cluster does not fork into named protocol generations.
    The non-serving Runtime/Host now expose context-free model-checked
    configuration proposals, detached applied publication, and exact quorum-safe
    `ReadIndex` outcomes without making reads consume worst-case WAL headroom.
-   Serving Raft, topology authorization/reconciliation, learner membership
-   publication, lease relocation, atomic
-   cutover/drain/retire, merge planning, and
-   disaggregated immutable snapshot/cold-data caching remain pending; no desired
+   Serving Raft, external topology authorization, server-wired learner
+   publication/transport, merge planning, and disaggregated immutable
+   snapshot/cold-data caching remain pending; no desired
    split is serving authority until those gates pass. The replicated-state
    boundary can now stream and verify a deterministic hash-chained artifact for
    one certified applied cut with bounded reusable memory, apply resumed ranges
@@ -411,8 +410,13 @@ cluster does not fork into named protocol generations.
    copy, persist atomic hash-chain cursors, and fully validate a non-serving
    candidate. That candidate can bind a small exact certificate into a fresh
    immutable-base WAL and apply the ordered tail through ordinary Raft
-   `AppendEntries`. It does not orchestrate transfer, authorize/publish learner
-   membership, construct the target SQL root, or grant ownership.
+   `AppendEntries`. An intact-shard stateless reconciler now binds exact
+   membership, base digest, target apply/progress, promotion, leader transfer,
+   replicated ownership-fence advance, expected-generation catalog CAS,
+   generation drain, removal, and retirement evidence. It does not authenticate
+   or transport the artifact, provide topology authority, construct the target
+   SQL root, execute a filtered physical split, wire servers, or grant serving
+   ownership by itself.
 7. **Pending:** topology workflows, TLS/auth, backup/PITR, CDC, quotas, and
    upgrades.
 
