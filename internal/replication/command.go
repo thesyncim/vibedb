@@ -8,13 +8,17 @@ import (
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
-// Command is one deterministic, single-collection state-machine mutation.
+// Command is one deterministic, single-collection state-machine operation.
 // It contains no Raft term, index, physical root generation, deadline, SQL text,
 // or serialized execution plan. Fingerprint is the already-canonical request
 // fingerprint minted by the request layer; this codec treats it as opaque.
-// Mutation order, including duplicate keys, is semantic and preserved exactly;
-// upstream fingerprinting must bind every mutation ordinal.
+// Mutation-batch order, including duplicate keys, is semantic and preserved
+// exactly; upstream fingerprinting must bind every mutation ordinal. A session
+// retirement carries no mutations. AckThrough is the greatest earlier client
+// sequence that will never be retried; zero acknowledges nothing.
 type Command struct {
+	Kind CommandKind
+
 	ClusterID             ID128
 	ClusterIncarnation    ID128
 	TopologyRecoveryEpoch uint64
@@ -37,6 +41,7 @@ type Command struct {
 	ClientID       ID128
 	ClientEpoch    uint64
 	ClientSequence uint64
+	AckThrough     uint64
 	Fingerprint    Digest
 	RetryHome      RetryHome
 
@@ -48,6 +53,8 @@ type Command struct {
 // byte slices alias the OpenCommand input and must be treated as immutable.
 // Copying or retaining the view retains the complete bounded input envelope.
 type CommandView struct {
+	kind CommandKind
+
 	ClusterID             ID128
 	ClusterIncarnation    ID128
 	TopologyRecoveryEpoch uint64
@@ -70,6 +77,7 @@ type CommandView struct {
 	ClientID       ID128
 	ClientEpoch    uint64
 	ClientSequence uint64
+	AckThrough     uint64
 	Fingerprint    Digest
 	RetryHome      RetryHome
 	Collection     []byte
@@ -84,6 +92,10 @@ type CommandView struct {
 func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
+
+// Kind reports whether the command mutates the collection or retires its
+// client session.
+func (v CommandView) Kind() CommandKind { return v.kind }
 
 // MutationCount reports the number of mutations the iterator will produce.
 func (v CommandView) MutationCount() int { return int(v.mutationCount) }
@@ -160,7 +172,7 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 
 	copy(frame[0:8], commandMagic[:])
 	appendU16(frame, 8, commandCodecFormat)
-	frame[10] = commandKindMutationBatch
+	frame[10] = commandWireKind(command.Kind)
 	appendU16(frame, 12, commandHeaderBytes)
 	appendU32(frame, 16, uint32(total))
 	appendU32(frame, 20, uint32(total-commandHeaderBytes-envelopeChecksumBytes))
@@ -187,6 +199,7 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	appendU16(frame, 242, uint16(len(command.Distribution)))
 	appendU16(frame, 244, uint16(len(command.Shard)))
 	appendU16(frame, 246, uint16(len(command.Collection)))
+	appendU64(frame, 248, command.AckThrough)
 
 	cursor := commandHeaderBytes
 	cursor += copy(frame[cursor:], command.Tenant)
@@ -229,6 +242,17 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	return false
 }
 
+func commandWireKind(kind CommandKind) uint8 {
+	switch kind {
+	case CommandMutationBatch:
+		return commandWireMutationBatch
+	case CommandSessionRetire:
+		return commandWireSessionRetire
+	default:
+		panic("replication: validated command kind has no wire encoding")
+	}
+}
+
 func measureCommand(command Command) (int, error) {
 	if err := validateCommandHeader(command); err != nil {
 		return 0, err
@@ -265,6 +289,18 @@ func measureCommand(command Command) (int, error) {
 }
 
 func validateCommandHeader(command Command) error {
+	switch command.Kind {
+	case CommandMutationBatch:
+		if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
+			return semantic("mutation count")
+		}
+	case CommandSessionRetire:
+		if len(command.Mutations) != 0 {
+			return semantic("session retire carries mutations")
+		}
+	default:
+		return semantic("unknown command kind")
+	}
 	if !nonzero128(command.ClusterID) || !nonzero128(command.ClusterIncarnation) ||
 		!nonzero128(command.ShardIncarnation) || !nonzero128(command.GroupID) ||
 		!nonzero128(command.ClientID) {
@@ -277,6 +313,9 @@ func validateCommandHeader(command Command) error {
 		command.RouteGeneration == 0 || command.ClientEpoch == 0 ||
 		command.ClientSequence == 0 {
 		return semantic("command contains a zero generation, epoch, or sequence")
+	}
+	if command.AckThrough >= command.ClientSequence {
+		return semantic("command acknowledgement does not precede client sequence")
 	}
 	if !nonzeroDigest(command.Fingerprint) {
 		return semantic("command contains a zero request fingerprint")
@@ -292,9 +331,6 @@ func validateCommandHeader(command Command) error {
 	}
 	if err := validateTextIdentity("collection", command.Collection, MaxCollectionBytes); err != nil {
 		return err
-	}
-	if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
-		return semantic("mutation count")
 	}
 	return nil
 }
@@ -356,18 +392,25 @@ func OpenCommand(src []byte) (CommandView, error) {
 	if err := verifyEnvelopeChecksum(src); err != nil {
 		return CommandView{}, err
 	}
-	if src[10] != commandKindMutationBatch || src[11] != 0 ||
+	kind, ok := openCommandKind(src[10])
+	if !ok || src[11] != 0 ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
-		binary.LittleEndian.Uint32(src[28:32]) != 0 ||
-		!allZero(src[248:256]) {
+		binary.LittleEndian.Uint32(src[28:32]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
-	if count == 0 || uint64(count) > MaxMutations {
-		return CommandView{}, semantic("mutation count")
+	switch kind {
+	case CommandMutationBatch:
+		if count == 0 || uint64(count) > MaxMutations {
+			return CommandView{}, semantic("mutation count")
+		}
+	case CommandSessionRetire:
+		if count != 0 {
+			return CommandView{}, semantic("session retire carries mutations")
+		}
 	}
 
-	var view CommandView
+	view := CommandView{kind: kind}
 	copy(view.ClusterID[:], src[32:48])
 	copy(view.ClusterIncarnation[:], src[48:64])
 	view.TopologyRecoveryEpoch = binary.LittleEndian.Uint64(src[64:72])
@@ -386,6 +429,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 	view.ClientSequence = binary.LittleEndian.Uint64(src[192:200])
 	copy(view.Fingerprint[:], src[200:232])
 	copy(view.RetryHome[:], src[232:240])
+	view.AckThrough = binary.LittleEndian.Uint64(src[248:256])
 
 	tenantLen := int(binary.LittleEndian.Uint16(src[240:242]))
 	distributionLen := int(binary.LittleEndian.Uint16(src[242:244]))
@@ -429,6 +473,17 @@ func OpenCommand(src []byte) (CommandView, error) {
 	return view, nil
 }
 
+func openCommandKind(wire uint8) (CommandKind, bool) {
+	switch wire {
+	case commandWireMutationBatch:
+		return CommandMutationBatch, true
+	case commandWireSessionRetire:
+		return CommandSessionRetire, true
+	default:
+		return 0, false
+	}
+}
+
 func validateDecodedCommandScalars(view CommandView) error {
 	if !nonzero128(view.ClusterID) || !nonzero128(view.ClusterIncarnation) ||
 		!nonzero128(view.ShardIncarnation) || !nonzero128(view.GroupID) ||
@@ -442,6 +497,9 @@ func validateDecodedCommandScalars(view CommandView) error {
 		view.RouteGeneration == 0 || view.ClientEpoch == 0 ||
 		view.ClientSequence == 0 {
 		return semantic("command contains a zero generation, epoch, or sequence")
+	}
+	if view.AckThrough >= view.ClientSequence {
+		return semantic("command acknowledgement does not precede client sequence")
 	}
 	return nil
 }

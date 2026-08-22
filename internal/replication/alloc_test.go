@@ -33,6 +33,27 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("OpenCommand + iteration allocations = %v, want 0", allocations)
 	}
+	retire := testSessionRetireCommand()
+	encodedRetire := encodeCommand(t, retire)
+	retireScratch := make([]byte, 0, len(encodedRetire))
+	if allocations := testing.AllocsPerRun(1000, func() {
+		var err error
+		allocationBytesSink, err = AppendCommand(retireScratch[:0], retire)
+		if err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("pre-sized session-retire AppendCommand allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		view, err := OpenCommand(encodedRetire)
+		if err != nil {
+			panic(err)
+		}
+		allocationIntSink += int(view.Kind()) + view.MutationCount()
+	}); allocations != 0 {
+		t.Fatalf("session-retire OpenCommand allocations = %v, want 0", allocations)
+	}
 
 	completion := testInlineCompletion()
 	encodedCompletion := encodeCompletion(t, completion)

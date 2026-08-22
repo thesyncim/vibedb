@@ -8,6 +8,7 @@ import (
 
 func FuzzOpenCommand(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
+	retire := testSessionRetireCommand()
 	ordered := testCommand()
 	ordered.Mutations = []Mutation{
 		{Kind: MutationPut, Key: []byte("z"), Value: []byte("first")},
@@ -15,6 +16,7 @@ func FuzzOpenCommand(f *testing.F) {
 		{Kind: MutationPut, Key: []byte("a"), Value: []byte("descending")},
 	}
 	f.Add(valid)
+	f.Add(encodeCommand(f, retire))
 	f.Add(encodeCommand(f, ordered))
 	f.Add(valid[:len(valid)-1])
 	f.Add([]byte{})
@@ -41,6 +43,7 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 	}{
 		{0, 0}, {2, commandHeaderBytes}, {3, uint64(len(valid))},
 		{5, MaxMutations + 1}, {8, MaxIdentityBytes + 1},
+		{6, testCommand().ClientSequence},
 		{14, MaxMutationKeyBytes + 1}, {15, MaxMutationValueBytes + 1},
 	} {
 		f.Add(seed.field, seed.value)
@@ -61,7 +64,7 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 		case 5:
 			binary.LittleEndian.PutUint32(candidate[24:28], uint32(value))
 		case 6:
-			candidate[248+int(value%8)] = byte(value >> 8)
+			binary.LittleEndian.PutUint64(candidate[248:256], value)
 		case 7:
 			scalarOffsets := [...]int{64, 104, 112, 120, 128, 136, 144, 152, 160, 184, 192}
 			offset := scalarOffsets[value%uint64(len(scalarOffsets))]
@@ -98,8 +101,20 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 	t.Helper()
 	if !bytes.Equal(view.Bytes(), data) || cap(view.Bytes()) != len(view.Bytes()) ||
-		view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
+		view.AckThrough >= view.ClientSequence {
 		t.Fatal("accepted command view does not preserve bounded input")
+	}
+	switch view.Kind() {
+	case CommandMutationBatch:
+		if view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
+			t.Fatal("accepted mutation batch has invalid mutation count")
+		}
+	case CommandSessionRetire:
+		if view.MutationCount() != 0 {
+			t.Fatal("accepted session retire carries mutations")
+		}
+	default:
+		t.Fatal("accepted unknown command kind")
 	}
 	for _, borrowed := range [][]byte{view.Tenant, view.Distribution, view.Shard, view.Collection} {
 		if cap(borrowed) != len(borrowed) {
