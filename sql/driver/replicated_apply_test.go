@@ -641,17 +641,20 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 		t.Fatalf("pure present wrong-shard DELETE validation = %d", got)
 	}
 
-	// A forbidden out-of-band row is never followed by another apply. Snapshot
-	// must independently re-route the complete logical image and poison closed.
+	// A forbidden out-of-band row is never followed by another apply. Capturing
+	// a coherent cut remains cheap; the explicit canonical audit independently
+	// re-routes the complete image and rejects the row.
 	if _, err := database.connector.db.tables["docs"].collection.Put(upper.key, upper.document); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot, err := claim.machine.Snapshot("docs"); snapshot != nil ||
-		!errors.Is(err, replicatedstate.ErrSchemaProfile) {
-		if snapshot != nil {
-			_ = snapshot.Close()
-		}
-		t.Fatalf("snapshot wrong-shard scan = %p,%v", snapshot, err)
+	snapshot, err := claim.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatalf("coherent snapshot = %v", err)
+	}
+	_, auditErr := snapshot.CanonicalImageDigest()
+	closeErr := snapshot.Close()
+	if !errors.Is(auditErr, replicatedstate.ErrSchemaProfile) || closeErr != nil {
+		t.Fatalf("wrong-shard image audit = %v, close = %v", auditErr, closeErr)
 	}
 }
 
