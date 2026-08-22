@@ -232,7 +232,7 @@ func TestMemoryMachineAppliesExactOrderedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if publication.Applied != 2 || publication.LogicalDigest == ([32]byte{}) {
+	if publication.Applied != 2 || publication.DataChainDigest == ([32]byte{}) {
 		t.Fatalf("publication = %+v", publication)
 	}
 	record, ok := machine.Entry(2)

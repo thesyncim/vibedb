@@ -73,7 +73,7 @@ func (p *Plan) initialSourceState(state replicatedstate.State) bool {
 	}
 	binding := state.Binding
 	return state.Applied != 0 && state.LastTerm != 0 &&
-		state.LogicalDigest != ([32]byte{}) && state.LastEntryDigest != ([32]byte{}) &&
+		state.DataChainDigest != ([32]byte{}) && state.LastEntryDigest != ([32]byte{}) &&
 		state.SnapshotBaseDigest != ([32]byte{}) &&
 		binding.Distribution == string(p.source.Distribution) &&
 		binding.Shard == string(p.source.Shard) &&

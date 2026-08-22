@@ -55,8 +55,8 @@ type CapturedTransition struct {
 	AfterRouteGeneration  uint64
 	PreviousEntryDigest   [32]byte
 	EntryDigest           [32]byte
-	BeforeLogicalDigest   [32]byte
-	AfterLogicalDigest    [32]byte
+	BeforeDataChainDigest [32]byte
+	AfterDataChainDigest  [32]byte
 	mutations             []finalMutation
 }
 
@@ -209,8 +209,8 @@ func (m *Machine) capturedTransition(next State, changes []finalMutation) Captur
 		AfterRouteGeneration:  next.Binding.RouteGeneration,
 		PreviousEntryDigest:   m.state.LastEntryDigest,
 		EntryDigest:           next.LastEntryDigest,
-		BeforeLogicalDigest:   m.state.LogicalDigest,
-		AfterLogicalDigest:    next.LogicalDigest,
+		BeforeDataChainDigest: m.state.DataChainDigest,
+		AfterDataChainDigest:  next.DataChainDigest,
 		mutations:             m.captureChanges,
 	}
 }
@@ -226,8 +226,8 @@ func validCapturedTransition(t CapturedTransition) bool {
 		t.AfterOwnershipEpoch == 0 || t.BeforeRoutingVersion == 0 ||
 		t.AfterRoutingVersion == 0 || t.BeforeRouteGeneration == 0 ||
 		t.AfterRouteGeneration == 0 || t.PreviousEntryDigest == ([32]byte{}) ||
-		t.EntryDigest == ([32]byte{}) || t.BeforeLogicalDigest == ([32]byte{}) ||
-		t.AfterLogicalDigest == ([32]byte{}) || len(t.mutations) > MaxDistinctMutations {
+		t.EntryDigest == ([32]byte{}) || t.BeforeDataChainDigest == ([32]byte{}) ||
+		t.AfterDataChainDigest == ([32]byte{}) || len(t.mutations) > MaxDistinctMutations {
 		return false
 	}
 	var previous []byte

@@ -41,6 +41,8 @@ type Machine struct {
 	system          CollectionTarget
 	userName        string
 	user            CollectionTarget
+	applyContract   [32]byte
+	dataChainHash   *dataChainHasher
 	txnLog          *durable.TxnLog
 	options         Options
 	capture         TransitionCapture
@@ -49,10 +51,12 @@ type Machine struct {
 	captureChanges  []finalMutation
 	captureKey      [8]byte
 
-	state       State
-	publication raftmodel.Publication
-	initialized bool
-	poison      error
+	state              State
+	publication        raftmodel.Publication
+	openedImageDigest  [32]byte
+	openedImageApplied uint64
+	initialized        bool
+	poison             error
 }
 
 // CompletionCapacityState is the constant-size durable apply cut used by
@@ -71,6 +75,7 @@ type openInputs struct {
 	system          CollectionTarget
 	userName        string
 	user            CollectionTarget
+	applyContract   [32]byte
 	txnLog          *durable.TxnLog
 	options         Options
 }
@@ -98,7 +103,9 @@ func Open(
 	m := &Machine{
 		binding: binding, bootstrap: bootstrapBytes,
 		bootstrapDigest: bootstrapDigest, system: system,
-		userName: userName, user: user, txnLog: prepared.txnLog, options: prepared.options,
+		userName: userName, user: user, applyContract: prepared.applyContract,
+		dataChainHash: newDataChainHasher(),
+		txnLog:        prepared.txnLog, options: prepared.options,
 	}
 	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
 		{Name: systemCollectionName, Collection: system.Collection},
@@ -117,14 +124,15 @@ func Open(
 	if !ok || userSnapshot == nil {
 		return nil, fmt.Errorf("%w: missing user snapshot", ErrInconsistentSnapshot)
 	}
-	if err := validateExistingRows(userSnapshot, user); err != nil {
-		return nil, fmt.Errorf("user collection %q: %w", userName, err)
-	}
-	logical, err := logicalDigest(
+	imageDigest, err := canonicalImageDigest(
 		userName, user.Validation, user.ValidationDigest, user.Validator, userSnapshot, nil,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("user collection %q: %w", userName, err)
+	}
+	seedDigest, err := dataChainSeedDigest(prepared.applyContract, imageDigest)
+	if err != nil {
+		return nil, fmt.Errorf("user collection %q: %w", userName, err)
 	}
 	systemSnapshot, ok := cut.Collection(systemCollectionName)
 	if !ok || systemSnapshot == nil {
@@ -142,14 +150,17 @@ func Open(
 			return nil, fmt.Errorf("%w: uninitialized system with durable rows", ErrStateCorrupt)
 		}
 		m.state = State{
-			Binding: binding, LogicalDigest: logical,
-			ConfState: new(pb.ConfState), BootstrapDigest: bootstrapDigest,
+			Binding: binding, DataChainDigest: seedDigest,
+			ApplyContractDigest: prepared.applyContract,
+			ConfState:           new(pb.ConfState), BootstrapDigest: bootstrapDigest,
 		}
-		m.publication = raftmodel.Publication{LogicalDigest: logical, ConfState: new(pb.ConfState)}
+		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
+		m.openedImageDigest = imageDigest
 		return m, nil
 	}
 	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
-		state.LogicalDigest != logical || state.CompletionCount != completionCount ||
+		state.ApplyContractDigest != prepared.applyContract ||
+		state.CompletionCount != completionCount ||
 		state.CompletionCount > options.MaxCompletions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
@@ -162,6 +173,8 @@ func Open(
 		return nil, err
 	}
 	m.state = state
+	m.openedImageDigest = imageDigest
+	m.openedImageApplied = state.Applied
 	m.binding = state.Binding
 	m.initialized = true
 	m.publication = publicationFromState(state)
@@ -266,10 +279,15 @@ func prepareOpenInputs(
 	}
 	binding.Distribution = strings.Clone(binding.Distribution)
 	binding.Shard = strings.Clone(binding.Shard)
+	contractDigest, err := applyContractDigest(userName, user, options.MaxCompletions)
+	if err != nil {
+		return openInputs{}, err
+	}
 	return openInputs{
 		binding: binding, bootstrap: bootstrapBytes, bootstrapDigest: bootstrapDigest,
 		system: system, userName: strings.Clone(userName), user: user,
-		txnLog: txnLog, options: options,
+		applyContract: contractDigest,
+		txnLog:        txnLog, options: options,
 	}, nil
 }
 
@@ -483,7 +501,7 @@ func (m *Machine) validateCompletionResult(completion replication.CompletionView
 
 func publicationFromState(state State) raftmodel.Publication {
 	return raftmodel.Publication{
-		Applied: state.Applied, LogicalDigest: state.LogicalDigest,
+		Applied: state.Applied, DataChainDigest: state.DataChainDigest,
 		ConfState: cloneConfState(state.ConfState), ReplicaSetVersion: state.ReplicaSetVersion,
 	}
 }

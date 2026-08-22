@@ -129,7 +129,7 @@ func TestMachineOwnershipTransitionOrdersServingFenceAndSurvivesReopen(t *testin
 		state.Binding.OwnershipEpoch != fixture.binding.OwnershipEpoch+1 ||
 		state.Binding.RoutingVersion != fixture.binding.RoutingVersion+1 ||
 		state.Binding.RouteGeneration != fixture.binding.RouteGeneration+1 ||
-		state.LogicalDigest != publication.LogicalDigest {
+		state.DataChainDigest != publication.DataChainDigest {
 		t.Fatalf("ownership publication = %+v state=%+v", publication, state)
 	}
 	if retry, err := machine.LookupCompletion(oldEncoded); err != nil ||

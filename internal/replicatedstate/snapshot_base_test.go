@@ -167,7 +167,7 @@ func TestCertifiedLearnerBaseCatchesUpOnlyThroughAppendEntries(t *testing.T) {
 	}
 	driveReplicatedStateNode(t, node)
 	publication := candidate.Published()
-	if publication.Applied != tailIndex || publication.LogicalDigest == manifest.State.LogicalDigest {
+	if publication.Applied != tailIndex || publication.DataChainDigest == manifest.State.DataChainDigest {
 		t.Fatalf("learner publication = %+v, base=%+v", publication, manifest.State)
 	}
 	last, err := wal.LastIndex()

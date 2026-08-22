@@ -206,7 +206,10 @@ func TestSourceCaptureRecoveryRejectsRecordCorruption(t *testing.T) {
 	if err != nil || !found {
 		t.Fatal(err)
 	}
-	raw[len(raw)-3] ^= 1
+	// Corrupt a fully significant base64 digit. The final digit contains
+	// unused trailing bits for a 32-byte digest, so changing only those bits
+	// can still decode to the original digest.
+	raw[len(raw)-4] ^= 1
 	if err := fixture.capture.Update(func(batch *durable.WriteBatch) error {
 		return batch.Put(key[:], raw)
 	}); err != nil {

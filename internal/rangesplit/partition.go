@@ -190,7 +190,7 @@ func (p *Partitioner) partitionRows(
 	workspace.scan.sinks = sinks
 	workspace.scan.document = &workspace.document
 	workspace.scan.stats = PartitionStats{
-		PlanDigest: p.digest, SourceDigest: state.LogicalDigest,
+		PlanDigest: p.digest, SourceDigest: state.DataChainDigest,
 		SourceBase: state.SnapshotBaseDigest, SourceEntry: state.LastEntryDigest,
 		SourceApplied: state.Applied,
 		SourceTerm:    state.LastTerm, RouteGeneration: state.Binding.RouteGeneration,
@@ -240,7 +240,7 @@ func (s *partitionScan) visitRow(key, value []byte) error {
 func (p *Partitioner) matchesSource(state replicatedstate.State) bool {
 	binding := state.Binding
 	return state.Applied != 0 && state.LastTerm != 0 &&
-		state.LogicalDigest != ([sha256.Size]byte{}) &&
+		state.DataChainDigest != ([sha256.Size]byte{}) &&
 		state.LastEntryDigest != ([sha256.Size]byte{}) &&
 		state.SnapshotBaseDigest != ([sha256.Size]byte{}) &&
 		binding.RouteGeneration != 0 &&

@@ -274,7 +274,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if reopened.Applied() != 5 || reopened.Published().LogicalDigest != machine.Published().LogicalDigest {
+	if reopened.Applied() != 5 || reopened.Published().DataChainDigest != machine.Published().DataChainDigest {
 		t.Fatalf("reopened publication = %+v", reopened.Published())
 	}
 	snapshot, err := reopened.Snapshot("docs")
@@ -294,12 +294,12 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	}
 }
 
-func TestMachineConfigurationAndEmptyNormalPreserveLogicalDigest(t *testing.T) {
+func TestMachineConfigurationAndEmptyNormalPreserveDataChainDigest(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	initial := fixture.machine.Published().LogicalDigest
+	initial := fixture.machine.Published().DataChainDigest
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestMachineConfigurationAndEmptyNormalPreserveLogicalDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if publication.LogicalDigest != initial || publication.ReplicaSetVersion != 3 {
+	if publication.DataChainDigest != initial || publication.ReplicaSetVersion != 3 {
 		t.Fatalf("configuration publication = %+v", publication)
 	}
 	if _, err := fixture.machine.ApplyConfiguration(meta, conf); err != nil {
@@ -390,7 +390,7 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopened.Published().Applied != 2 || reopened.Published().LogicalDigest != publication.LogicalDigest {
+	if reopened.Published().Applied != 2 || reopened.Published().DataChainDigest != publication.DataChainDigest {
 		t.Fatalf("reopened publication = %+v, want %+v", reopened.Published(), publication)
 	}
 	value, found, err := user.Collection.AppendRaw(nil, []byte("k"))

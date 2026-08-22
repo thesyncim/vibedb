@@ -53,7 +53,7 @@ type ApplyMeta struct {
 // immutable by callers.
 type Publication struct {
 	Applied           uint64
-	LogicalDigest     [32]byte
+	DataChainDigest   [32]byte
 	ConfState         *pb.ConfState
 	ReplicaSetVersion uint64
 }
@@ -65,7 +65,7 @@ type Publication struct {
 // of an older snapshot's ConfState. InstallSnapshot must be idempotent for the
 // same exact snapshot: restart calls it both when the durable base is newer and
 // when it equals the published cut. The state machine must durably bind the
-// snapshot's exact identity/manifest, logical digest, ConfState, and expected
+// snapshot's exact identity/manifest, data-chain digest, ConfState, and expected
 // ReplicaSetVersion, reject different bytes at the same cut, and reject every
 // regressing field even after an earlier call published before returning an
 // error. A later Published call must expose an ambiguous successful

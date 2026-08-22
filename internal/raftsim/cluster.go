@@ -711,7 +711,7 @@ func (c *Cluster) checkInvariants() error {
 			}
 			if leftMachine.Applied() == rightMachine.Applied() {
 				leftPub, rightPub := leftMachine.Published(), rightMachine.Published()
-				if leftPub.LogicalDigest != rightPub.LogicalDigest ||
+				if leftPub.DataChainDigest != rightPub.DataChainDigest ||
 					leftPub.ReplicaSetVersion != rightPub.ReplicaSetVersion ||
 					!proto.Equal(leftPub.ConfState, rightPub.ConfState) {
 					return fmt.Errorf("%w: equal applied cuts differ for members %d/%d", ErrInvariant, c.members[left].id, c.members[right].id)

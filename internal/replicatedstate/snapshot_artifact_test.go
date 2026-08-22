@@ -57,7 +57,7 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	const golden = "adfc16e1f45b94d4a9872874250dabe63fd6cfbc0ce779eea3a301e811d77803"
+	const golden = "8e281171b1d44336b2a7ee62673df7e2641759c48647c72e480362f5ec2f525e"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -65,7 +65,8 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	if !bytes.Equal(first, second) {
 		t.Fatal("same snapshot and options produced different artifact bytes")
 	}
-	if written.Digest != again.Digest || written.HeaderDigest != again.HeaderDigest {
+	if written.Digest != again.Digest || written.HeaderDigest != again.HeaderDigest ||
+		written.ImageDigest != again.ImageDigest {
 		t.Fatal("same artifact produced different manifest digests")
 	}
 	var buffered bytes.Buffer
@@ -112,7 +113,8 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 		verified.UserRows != written.UserRows || verified.PayloadBytes != written.PayloadBytes ||
 		verified.EncodedBytes != uint64(len(first)) || verified.EncodedBytes != written.EncodedBytes ||
 		verified.HeaderDigest != written.HeaderDigest ||
-		verified.LastChunkDigest != written.LastChunkDigest || verified.Digest != written.Digest {
+		verified.LastChunkDigest != written.LastChunkDigest ||
+		verified.ImageDigest != written.ImageDigest || verified.Digest != written.Digest {
 		t.Fatalf("verified manifest = %+v, written = %+v", verified, written)
 	}
 	if verified.Chunks < 4 || len(checkpoints) != int(verified.Chunks) {
@@ -165,6 +167,39 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	if systemRows != verified.SystemRows || userRows != verified.UserRows ||
 		systemRows != verified.State.CompletionCount+1 || userRows != 7 {
 		t.Fatalf("row totals system=%d user=%d manifest=%+v", systemRows, userRows, verified)
+	}
+}
+
+func TestSnapshotArtifactImageDigestIsCanonicalAcrossChunking(t *testing.T) {
+	_, snapshot := snapshotArtifactFixture(t)
+	var compact, wide bytes.Buffer
+	compactManifest, err := WriteSnapshotArtifact(&compact, snapshot, SnapshotArtifactOptions{
+		TargetChunkBytes: MinSnapshotArtifactChunkBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wideManifest, err := WriteSnapshotArtifact(&wide, snapshot, SnapshotArtifactOptions{
+		TargetChunkBytes: DefaultSnapshotArtifactChunkBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compactManifest.Digest == wideManifest.Digest || bytes.Equal(compact.Bytes(), wide.Bytes()) {
+		t.Fatal("different chunking unexpectedly produced the same artifact identity")
+	}
+	if compactManifest.ImageDigest == ([sha256.Size]byte{}) ||
+		compactManifest.ImageDigest != wideManifest.ImageDigest {
+		t.Fatalf("chunk-dependent image digests: compact=%x wide=%x",
+			compactManifest.ImageDigest, wideManifest.ImageDigest)
+	}
+	audited, err := snapshot.CanonicalImageDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audited != compactManifest.ImageDigest {
+		t.Fatalf("artifact image digest = %x, explicit audit = %x",
+			compactManifest.ImageDigest, audited)
 	}
 }
 

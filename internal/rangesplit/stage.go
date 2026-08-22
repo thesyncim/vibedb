@@ -263,7 +263,7 @@ func (s *ChildStage) ApplyTailBatch(
 		if current.lastBatchDigest != ([sha256.Size]byte{}) &&
 			batch.Digest == current.lastBatchDigest && batch.Term == current.term &&
 			batch.EntryDigest == current.entryDigest &&
-			batch.AfterLogicalDigest == current.logicalDigest &&
+			batch.AfterDataChainDigest == current.dataChainDigest &&
 			batch.AfterRouteGeneration == current.routeGeneration {
 			return nil
 		}
@@ -275,7 +275,7 @@ func (s *ChildStage) ApplyTailBatch(
 	if current.applied == math.MaxUint64 || batch.Applied != current.applied+1 ||
 		batch.Term < current.term ||
 		batch.PreviousEntryDigest != current.entryDigest ||
-		batch.BeforeLogicalDigest != current.logicalDigest ||
+		batch.BeforeDataChainDigest != current.dataChainDigest ||
 		!s.validTailBatchCoordinates(batch, current.routeGeneration) {
 		return ErrChildStage
 	}
@@ -286,7 +286,7 @@ func (s *ChildStage) ApplyTailBatch(
 	next.applied = batch.Applied
 	next.term = batch.Term
 	next.entryDigest = batch.EntryDigest
-	next.logicalDigest = batch.AfterLogicalDigest
+	next.dataChainDigest = batch.AfterDataChainDigest
 	next.routeGeneration = batch.AfterRouteGeneration
 	next.lastBatchDigest = batch.Digest
 	if batch.beforeCoordinates() != batch.afterCoordinates() {
@@ -323,7 +323,7 @@ func (s *ChildStage) initialCursor() ChildStageCursor {
 		planDigest: s.expected.PlanDigest, placementDigest: s.expected.PlacementDigest,
 		artifactDigest: s.expected.Digest, headerDigest: s.expected.HeaderDigest,
 		lastChunkDigest: s.expected.HeaderDigest,
-		logicalDigest:   s.expected.Source.LogicalDigest,
+		dataChainDigest: s.expected.Source.DataChainDigest,
 		baseDigest:      s.expected.Source.BaseDigest,
 		entryDigest:     s.expected.Source.EntryDigest,
 		applied:         s.expected.Source.Applied, term: s.expected.Source.Term,
@@ -548,7 +548,7 @@ func childStageCursorMatchesExpected(
 		return cursor.routeGeneration == expected.Source.RouteGeneration &&
 			cursor.applied == expected.Source.Applied &&
 			cursor.term == expected.Source.Term &&
-			cursor.logicalDigest == expected.Source.LogicalDigest &&
+			cursor.dataChainDigest == expected.Source.DataChainDigest &&
 			cursor.entryDigest == expected.Source.EntryDigest &&
 			cursor.artifactOffset < expected.EncodedBytes &&
 			(cursor.artifactChunks != expected.Chunks ||
@@ -574,7 +574,7 @@ func childStageCursorMatchesExpected(
 	}
 	if cursor.applied == expected.Source.Applied {
 		return cursor.term == expected.Source.Term &&
-			cursor.logicalDigest == expected.Source.LogicalDigest &&
+			cursor.dataChainDigest == expected.Source.DataChainDigest &&
 			cursor.entryDigest == expected.Source.EntryDigest &&
 			cursor.lastBatchDigest == ([sha256.Size]byte{})
 	}

@@ -65,7 +65,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
 		txnLog, options, cut, SnapshotArtifactOptions{},
 	)
-	if err != nil || reopened.Published().LogicalDigest != publication.LogicalDigest ||
+	if err != nil || reopened.Published().DataChainDigest != publication.DataChainDigest ||
 		retryManifest.Digest != manifest.Digest || !proto.Equal(base, retryBase) {
 		t.Fatalf("retry publication=%+v manifest=%+v baseEqual=%v err=%v",
 			reopened.Published(), retryManifest, proto.Equal(base, retryBase), err)
@@ -76,7 +76,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	}
 	installed, err := machine.InstallSnapshot(base)
 	if err != nil || installed.Applied != cut.Applied ||
-		installed.LogicalDigest != publication.LogicalDigest {
+		installed.DataChainDigest != publication.DataChainDigest {
 		t.Fatalf("install=%+v err=%v", installed, err)
 	}
 	afterA, found, err := user.Collection.AppendRaw(nil, []byte("a"))

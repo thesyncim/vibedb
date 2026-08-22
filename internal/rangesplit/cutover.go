@@ -147,7 +147,7 @@ func (p *Partitioner) CertifyCutover(
 	pre := cursor
 	pre.applied--
 	pre.term = cursor.term
-	pre.logicalDigest = [sha256.Size]byte{}
+	pre.dataChainDigest = [sha256.Size]byte{}
 	pre.entryDigest = [sha256.Size]byte{}
 	pre.ownershipEpoch = 0
 	pre.routingVersion = 0
@@ -165,7 +165,7 @@ func (p *Partitioner) CertifyCutover(
 	if err != nil || record.Applied != cursor.applied {
 		return CutoverCertificate{}, errors.Join(ErrCutoverCertificate, err)
 	}
-	pre.logicalDigest = record.BeforeLogicalDigest
+	pre.dataChainDigest = record.BeforeDataChainDigest
 	pre.entryDigest = record.PreviousEntryDigest
 	pre.ownershipEpoch = record.BeforeOwnershipEpoch
 	pre.routingVersion = record.BeforeRoutingVersion
@@ -294,7 +294,7 @@ func OpenCutoverCertificate(raw []byte) (*CutoverCertificate, error) {
 	}
 	copy(certificate.plan[:], raw[64:96])
 	copy(certificate.placement[:], raw[96:128])
-	copy(certificate.cut.LogicalDigest[:], raw[128:160])
+	copy(certificate.cut.DataChainDigest[:], raw[128:160])
 	copy(certificate.cut.BaseDigest[:], raw[160:192])
 	copy(certificate.cut.EntryDigest[:], raw[192:224])
 	for child := 0; child < autosplit.MaxSplitChildren; child++ {
@@ -327,7 +327,7 @@ func appendCutoverBody(dst []byte, certificate *CutoverCertificate) []byte {
 	binary.LittleEndian.PutUint64(frame[56:64], certificate.coordinates.RouteGeneration)
 	copy(frame[64:96], certificate.plan[:])
 	copy(frame[96:128], certificate.placement[:])
-	copy(frame[128:160], certificate.cut.LogicalDigest[:])
+	copy(frame[128:160], certificate.cut.DataChainDigest[:])
 	copy(frame[160:192], certificate.cut.BaseDigest[:])
 	copy(frame[192:224], certificate.cut.EntryDigest[:])
 	for child := 0; child < autosplit.MaxSplitChildren; child++ {
@@ -363,7 +363,7 @@ func validCutoverCertificate(certificate *CutoverCertificate) bool {
 		certificate.cut.Applied == 0 || certificate.cut.Applied == math.MaxUint64 ||
 		certificate.cut.Term == 0 || certificate.cut.Term == math.MaxUint64 ||
 		certificate.cut.RouteGeneration == 0 ||
-		certificate.cut.LogicalDigest == ([sha256.Size]byte{}) ||
+		certificate.cut.DataChainDigest == ([sha256.Size]byte{}) ||
 		certificate.cut.BaseDigest == ([sha256.Size]byte{}) ||
 		certificate.cut.EntryDigest == ([sha256.Size]byte{}) ||
 		certificate.coordinates.OwnershipEpoch == 0 ||
@@ -389,7 +389,7 @@ func publicationFromTailCursor(cursor TailCursor) sourceCapturePublication {
 		applied: cursor.applied, term: cursor.term,
 		ownershipEpoch: cursor.ownershipEpoch, routingVersion: cursor.routingVersion,
 		routeGeneration: cursor.routeGeneration,
-		entryDigest:     cursor.entryDigest, logicalDigest: cursor.logicalDigest,
+		entryDigest:     cursor.entryDigest, dataChainDigest: cursor.dataChainDigest,
 	}
 }
 
@@ -404,8 +404,8 @@ func tailEntryFromCaptureRecord(record sourceCaptureEntry) TailEntry {
 		AfterRouteGeneration:  record.AfterRouteGeneration,
 		PreviousEntryDigest:   record.PreviousEntryDigest,
 		EntryDigest:           record.EntryDigest,
-		BeforeLogicalDigest:   record.BeforeLogicalDigest,
-		AfterLogicalDigest:    record.AfterLogicalDigest,
+		BeforeDataChainDigest: record.BeforeDataChainDigest,
+		AfterDataChainDigest:  record.AfterDataChainDigest,
 		Transitions:           record.Transitions,
 	}
 }

@@ -50,7 +50,7 @@ func CreateStagedChildWAL(
 	}
 	if activation.ArtifactManifest.State.Binding != opened.Manifest.State.Binding ||
 		activation.ArtifactManifest.State.Applied != opened.Manifest.State.Applied ||
-		activation.ArtifactManifest.State.LogicalDigest != opened.Manifest.State.LogicalDigest {
+		activation.ArtifactManifest.State.DataChainDigest != opened.Manifest.State.DataChainDigest {
 		return nil, ErrBindingMismatch
 	}
 	wal, err := raftstore.Create(

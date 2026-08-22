@@ -70,12 +70,15 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 // ReadSnapshot pins the sole user collection and its hidden state collection
 // at one publication cut.
 type ReadSnapshot struct {
-	cut         durable.DatabaseSnapshot
-	publication raftmodel.Publication
-	state       State
-	userName    string
-	once        sync.Once
-	closeErr    error
+	cut              durable.DatabaseSnapshot
+	publication      raftmodel.Publication
+	state            State
+	userName         string
+	validation       ValidationProfile
+	validationDigest [32]byte
+	validator        MutationValidator
+	once             sync.Once
+	closeErr         error
 }
 
 // SnapshotFence is the allocation-free, immutable publication identity paired
@@ -86,7 +89,7 @@ type SnapshotFence struct {
 	Applied            uint64
 	LastTerm           uint64
 	LastEntryDigest    [32]byte
-	LogicalDigest      [32]byte
+	DataChainDigest    [32]byte
 	SnapshotBaseDigest [32]byte
 }
 
@@ -97,7 +100,7 @@ func (s *ReadSnapshot) Fence() SnapshotFence {
 	}
 	return SnapshotFence{
 		Binding: s.state.Binding, Applied: s.state.Applied, LastTerm: s.state.LastTerm,
-		LastEntryDigest: s.state.LastEntryDigest, LogicalDigest: s.state.LogicalDigest,
+		LastEntryDigest: s.state.LastEntryDigest, DataChainDigest: s.state.DataChainDigest,
 		SnapshotBaseDigest: s.state.SnapshotBaseDigest,
 	}
 }
@@ -140,6 +143,22 @@ func (s *ReadSnapshot) RangeSystem(fn func(key, value []byte) error) error {
 	return snapshot.RangeRaw(fn)
 }
 
+// CanonicalImageDigest performs an explicit, complete user-image audit. It is
+// intentionally O(rows) and belongs at certification, import, or offline
+// verification boundaries—not on ordinary reads, admission, or apply.
+func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
+	if s == nil {
+		return [32]byte{}, ErrInconsistentSnapshot
+	}
+	user, ok := s.cut.Collection(s.userName)
+	if !ok || user == nil {
+		return [32]byte{}, ErrInconsistentSnapshot
+	}
+	return canonicalImageDigest(
+		s.userName, s.validation, s.validationDigest, s.validator, user, nil,
+	)
+}
+
 // Close releases both generation leases. It is idempotent.
 func (s *ReadSnapshot) Close() error {
 	if s == nil {
@@ -161,7 +180,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if len(names) > 1 || len(names) == 1 && names[0] != m.userName {
 		return nil, fmt.Errorf("%w: snapshot names", ErrInvalidCollection)
 	}
-	cut, systemSnapshot, userSnapshot, err := m.captureApplyCutLocked()
+	cut, systemSnapshot, _, err := m.captureApplyCutLocked()
 	if err != nil {
 		return nil, m.fail(err)
 	}
@@ -175,7 +194,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	}
 	if present {
 		if completionCount != state.CompletionCount || !equalState(state, m.state) ||
-			!equalStatePublication(state, m.publication.Applied, m.publication.LogicalDigest,
+			!equalStatePublication(state, m.publication.Applied, m.publication.DataChainDigest,
 				m.publication.ConfState, m.publication.ReplicaSetVersion) {
 			return nil, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
 		}
@@ -183,18 +202,9 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 			return nil, m.fail(errors.Join(err, cut.Close()))
 		}
 	}
-	logical, err := logicalDigest(
-		m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
-		userSnapshot, nil,
-	)
-	if err != nil {
-		return nil, m.fail(errors.Join(err, cut.Close()))
-	}
-	if logical != m.state.LogicalDigest || logical != m.publication.LogicalDigest {
-		return nil, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
-	}
 	return &ReadSnapshot{
 		cut: cut, publication: clonePublication(m.publication), state: cloneState(m.state),
-		userName: m.userName,
+		userName: m.userName, validation: m.user.Validation,
+		validationDigest: m.user.ValidationDigest, validator: m.user.Validator,
 	}, nil
 }

@@ -145,9 +145,9 @@ func (m *MemoryMachine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raft
 	if len(data) != 0 {
 		hasher := sha256.New()
 		_, _ = hasher.Write([]byte("VDBLOGICAL/v1\x00"))
-		_, _ = hasher.Write(next.LogicalDigest[:])
+		_, _ = hasher.Write(next.DataChainDigest[:])
 		_, _ = hasher.Write(data)
-		_ = hasher.Sum(next.LogicalDigest[:0])
+		_ = hasher.Sum(next.DataChainDigest[:0])
 	}
 	m.entries = append(m.entries, record)
 	m.chain = record.Digest

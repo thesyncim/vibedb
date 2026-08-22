@@ -98,7 +98,7 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	}
 	driveReplicatedStateNode(t, restarted)
 	after := reopened.Published()
-	if after.Applied != before.Applied || after.LogicalDigest != before.LogicalDigest ||
+	if after.Applied != before.Applied || after.DataChainDigest != before.DataChainDigest ||
 		reopened.state.CompletionCount != 1 {
 		t.Fatalf("restart replayed publication: before=%+v after=%+v state=%+v", before, after, reopened.state)
 	}

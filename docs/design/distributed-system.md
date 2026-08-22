@@ -95,6 +95,31 @@ The backfill package plans one bounded task per base shard. The caller must run
 all tasks and publish the `Ready` state. The repository has no lifecycle or
 backfill CLI.
 
+## Replicated state digests
+
+Normal replicated command admission and apply use point reads for the command
+completion and mutation keys. They do not scan the shard image. Planning,
+validation, and digest work are O(changed keys plus changed document bytes),
+bounded by 64 distinct mutations, and independent of the shard row count.
+
+`DataChainDigest` is a deterministic replicated transition fence. Each
+effective mutation advances it from the prior chain, the frozen apply contract,
+and the sorted exact before-and-after rows. It is history-sensitive. Two shards
+with the same current rows can have different `DataChainDigest` values when
+their mutation histories differ. A rejected, duplicate, configuration-only, or
+data no-op command preserves it.
+
+`ImageDigest` is the canonical identity of one validated, ordered user image.
+The machine computes it on the cold path during reopen and import. Snapshot
+artifact creation computes it while it already streams the image. An explicit
+audit can compute it from a coherent read snapshot. Normal admission and apply
+do not compute it.
+
+The current kernel does not maintain a canonical incremental Merkle root.
+`DataChainDigest` does not prove same-content equality across different
+histories. A canonical `ImageDigest` still requires a complete ordered image
+scan or an existing complete image stream.
+
 ## Autosplit boundary
 
 The `autosplit` package records fixed-memory pressure evidence and recommends a
@@ -183,10 +208,10 @@ post-cutover recovery use symmetric transitions, so neither path reclones every
 shard or rebuilds unchanged range metadata.
 
 The range-split tail translator binds the exact source applied position, term,
-last-entry digest, logical digest, and snapshot base. It parses each before and
-after document at most once. It produces one idempotence-addressed batch for
-every child. Empty entries advance every child, and shard-key moves produce a
-delete and a put.
+last-entry digest, `DataChainDigest`, and snapshot base. It parses each before
+and after document at most once. It produces one idempotence-addressed batch
+for every child. Empty entries advance every child, and shard-key moves produce
+a delete and a put.
 
 A non-serving child stage applies verified artifact chunks and tail batches to
 one durable collection. It persists a fixed-size cursor after durable row

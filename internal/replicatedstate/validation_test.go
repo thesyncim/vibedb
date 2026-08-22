@@ -272,13 +272,11 @@ func TestValidatedMutationPlanningUsesCollapsedSnapshotAwareFinals(t *testing.T)
 		{kind: replication.MutationPut, key: "same", value: `{"n":1}`},
 		{kind: replication.MutationDelete, key: "missing", found: false},
 		{kind: replication.MutationDelete, key: "gone", current: `{"n":3}`, found: true},
-		{kind: replication.MutationPut, key: "put", value: `{"n":2}`},
-		{kind: replication.MutationPut, key: "same", value: `{"n":1}`},
 	}
 	if !slices.Equal(calls, wantCalls) {
 		t.Fatalf("validator calls = %#v, want %#v", calls, wantCalls)
 	}
-	wantObserved := [][][]byte{{[]byte("put"), []byte("gone")}}
+	wantObserved := [][][]byte{{[]byte("gone"), []byte("put")}}
 	if got := observed.snapshot(); !equalObservedMutationKeys(got, wantObserved) {
 		t.Fatalf("observed keys = %q, want %q", got, wantObserved)
 	}
@@ -386,7 +384,7 @@ func TestValidatedMutationRejectsMalformedJSONBeforeCustomValidator(t *testing.T
 	}
 }
 
-func TestValidatedOpenScansRowsAndBindsDigest(t *testing.T) {
+func TestValidatedOpenScansRowsOnceAndBindsApplyContract(t *testing.T) {
 	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, nil)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -416,10 +414,10 @@ func TestValidatedOpenScansRowsAndBindsDigest(t *testing.T) {
 	}
 	gotPublication, wantPublication := reopened.Published(), fixture.machine.Published()
 	if gotPublication.Applied != wantPublication.Applied ||
-		gotPublication.LogicalDigest != wantPublication.LogicalDigest ||
+		gotPublication.DataChainDigest != wantPublication.DataChainDigest ||
 		gotPublication.ReplicaSetVersion != wantPublication.ReplicaSetVersion ||
 		!proto.Equal(gotPublication.ConfState, wantPublication.ConfState) ||
-		!slices.Equal(scanned, []string{"a", "b", "a", "b"}) {
+		!slices.Equal(scanned, []string{"a", "b"}) {
 		t.Fatalf("reopen publication=%+v scanned=%q", gotPublication, scanned)
 	}
 
@@ -442,9 +440,18 @@ func TestValidatedOpenScansRowsAndBindsDigest(t *testing.T) {
 	); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("wrong digest reopen error = %v, want ErrStateCorrupt", err)
 	}
+
+	wrongCompletionBound := fixture.machine.options
+	wrongCompletionBound.MaxCompletions++
+	if _, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: reopenTarget}, fixture.log, wrongCompletionBound,
+	); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("wrong completion bound reopen error = %v, want ErrStateCorrupt", err)
+	}
 }
 
-func TestValidatedOpenAndSnapshotRouteEveryExtantRow(t *testing.T) {
+func TestValidatedOpenAndExplicitAuditRouteEveryExtantRow(t *testing.T) {
 	validator := mutationValidatorFuncs{
 		put: func(key, _ []byte) MutationValidation {
 			if bytes.Equal(key, []byte("outside")) {
@@ -473,12 +480,13 @@ func TestValidatedOpenAndSnapshotRouteEveryExtantRow(t *testing.T) {
 	); !errors.Is(err, ErrSchemaProfile) {
 		t.Fatalf("wrong-shard reopen = %v, want ErrSchemaProfile", err)
 	}
-	if snapshot, err := fixture.machine.Snapshot("docs"); snapshot != nil ||
-		!errors.Is(err, ErrSchemaProfile) {
-		if snapshot != nil {
-			_ = snapshot.Close()
-		}
-		t.Fatalf("wrong-shard snapshot = %p,%v", snapshot, err)
+	snapshot, err := fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatalf("cheap coherent snapshot: %v", err)
+	}
+	defer snapshot.Close()
+	if _, err := snapshot.CanonicalImageDigest(); !errors.Is(err, ErrSchemaProfile) {
+		t.Fatalf("wrong-shard image audit = %v, want ErrSchemaProfile", err)
 	}
 }
 
@@ -599,18 +607,18 @@ func TestMutationAttemptObserverIsSynchronousWithApply(t *testing.T) {
 	}
 }
 
-func TestLogicalDigestGolden(t *testing.T) {
+func TestCanonicalImageDigestGolden(t *testing.T) {
 	overlay := []finalMutation{
 		{key: []byte("b"), value: []byte(`{"n":2}`)},
 		{key: []byte("z"), delete: true},
 		{key: []byte("a"), value: []byte(`{"n":1}`)},
 	}
-	if _, err := logicalDigest(
+	if _, err := canonicalImageDigest(
 		"docs", ValidationSchemaFreeJSON, [32]byte{}, nil, nil, overlay,
 	); !errors.Is(err, ErrInvalidCollection) {
-		t.Fatalf("schema-free logical digest error = %v, want ErrInvalidCollection", err)
+		t.Fatalf("schema-free image digest error = %v, want ErrInvalidCollection", err)
 	}
-	validated, err := logicalDigest(
+	validated, err := canonicalImageDigest(
 		"docs", ValidationDeterministicMutation, testMutationValidationDigest,
 		mutationValidatorFuncs{}, nil, overlay,
 	)
@@ -631,7 +639,7 @@ func assertDigestHex(t testing.TB, name string, got [32]byte, wantHex string) {
 	}
 }
 
-func FuzzLogicalDigestValidationProfile(f *testing.F) {
+func FuzzCanonicalImageDigestValidationProfile(f *testing.F) {
 	f.Add("docs", []byte("a"), []byte(`{"n":1}`), false)
 	f.Add("", []byte{}, []byte{}, true)
 	f.Fuzz(func(t *testing.T, name string, key, value []byte, deleteMutation bool) {
@@ -642,14 +650,14 @@ func FuzzLogicalDigestValidationProfile(f *testing.F) {
 			key: bytes.Clone(key), value: bytes.Clone(value), delete: deleteMutation,
 		}}
 		beforeKey, beforeValue := bytes.Clone(overlay[0].key), bytes.Clone(overlay[0].value)
-		first, err := logicalDigest(
+		first, err := canonicalImageDigest(
 			name, ValidationDeterministicMutation, testMutationValidationDigest,
 			mutationValidatorFuncs{}, nil, overlay,
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		second, err := logicalDigest(
+		second, err := canonicalImageDigest(
 			name, ValidationDeterministicMutation, testMutationValidationDigest,
 			mutationValidatorFuncs{}, nil, overlay,
 		)
@@ -660,7 +668,7 @@ func FuzzLogicalDigestValidationProfile(f *testing.F) {
 			t.Fatalf("nondeterministic digest: %x != %x", first, second)
 		}
 		if !bytes.Equal(overlay[0].key, beforeKey) || !bytes.Equal(overlay[0].value, beforeValue) {
-			t.Fatal("logical digest mutated its overlay")
+			t.Fatal("canonical image digest mutated its overlay")
 		}
 	})
 }

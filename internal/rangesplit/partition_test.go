@@ -270,7 +270,7 @@ func testSourceState(plan *autosplit.SplitPlan) replicatedstate.State {
 			RoutingVersion:       uint64(plan.Source.RoutingVersion), RouteGeneration: 19,
 		},
 		Applied: 41, LastTerm: 7, LastEntryDigest: [32]byte{3},
-		LogicalDigest: [32]byte{1}, SnapshotBaseDigest: [32]byte{2},
+		DataChainDigest: [32]byte{1}, SnapshotBaseDigest: [32]byte{2},
 	}
 }
 

@@ -57,7 +57,7 @@ type ChildStageCursor struct {
 	artifactDigest  [sha256.Size]byte
 	headerDigest    [sha256.Size]byte
 	lastChunkDigest [sha256.Size]byte
-	logicalDigest   [sha256.Size]byte
+	dataChainDigest [sha256.Size]byte
 	baseDigest      [sha256.Size]byte
 	entryDigest     [sha256.Size]byte
 	lastBatchDigest [sha256.Size]byte
@@ -89,7 +89,7 @@ func (c ChildStageCursor) PlacementDigest() [sha256.Size]byte {
 // SourceCut returns the exact translated source prefix.
 func (c ChildStageCursor) SourceCut() ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{
-		LogicalDigest: c.logicalDigest, BaseDigest: c.baseDigest,
+		DataChainDigest: c.dataChainDigest, BaseDigest: c.baseDigest,
 		EntryDigest: c.entryDigest, Applied: c.applied, Term: c.term,
 		RouteGeneration: c.routeGeneration,
 	}
@@ -174,7 +174,7 @@ func AppendChildStageCursorWithWorkspace(
 	copy(frame[160:192], cursor.artifactDigest[:])
 	copy(frame[192:224], cursor.headerDigest[:])
 	copy(frame[224:256], cursor.lastChunkDigest[:])
-	copy(frame[256:288], cursor.logicalDigest[:])
+	copy(frame[256:288], cursor.dataChainDigest[:])
 	copy(frame[288:320], cursor.baseDigest[:])
 	copy(frame[320:352], cursor.entryDigest[:])
 	copy(frame[352:384], cursor.lastBatchDigest[:])
@@ -240,7 +240,7 @@ func decodeChildStageCursor(
 	copy(cursor.artifactDigest[:], src[160:192])
 	copy(cursor.headerDigest[:], src[192:224])
 	copy(cursor.lastChunkDigest[:], src[224:256])
-	copy(cursor.logicalDigest[:], src[256:288])
+	copy(cursor.dataChainDigest[:], src[256:288])
 	copy(cursor.baseDigest[:], src[288:320])
 	copy(cursor.entryDigest[:], src[320:352])
 	copy(cursor.lastBatchDigest[:], src[352:384])
@@ -261,7 +261,7 @@ func validateChildStageCursor(cursor *ChildStageCursor) error {
 		cursor.artifactDigest == ([sha256.Size]byte{}) ||
 		cursor.headerDigest == ([sha256.Size]byte{}) ||
 		cursor.lastChunkDigest == ([sha256.Size]byte{}) ||
-		cursor.logicalDigest == ([sha256.Size]byte{}) ||
+		cursor.dataChainDigest == ([sha256.Size]byte{}) ||
 		cursor.baseDigest == ([sha256.Size]byte{}) ||
 		cursor.entryDigest == ([sha256.Size]byte{}) {
 		return fmt.Errorf("%w: invalid stage cursor", ErrChildStage)
