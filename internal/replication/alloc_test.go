@@ -56,6 +56,7 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}
 
 	completion := testInlineCompletion()
+	completionBytes := testCompletionBytes(completion)
 	encodedCompletion := encodeCompletion(t, completion)
 	completionScratch := make([]byte, 0, len(encodedCompletion))
 	if allocations := testing.AllocsPerRun(1000, func() {
@@ -73,6 +74,15 @@ func TestHotPathsAllocateZero(t *testing.T) {
 		}
 	}); allocations != 0 {
 		t.Fatalf("pre-sized AppendCompletion allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		var err error
+		allocationBytesSink, err = AppendCompletionBytes(completionScratch[:0], completionBytes)
+		if err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("pre-sized AppendCompletionBytes allocations = %v, want 0", allocations)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
 		view, err := OpenCompletion(encodedCompletion)
@@ -125,6 +135,22 @@ func BenchmarkAppendCompletion(b *testing.B) {
 	for b.Loop() {
 		var err error
 		allocationBytesSink, err = AppendCompletion(scratch[:0], completion)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAppendCompletionBytes(b *testing.B) {
+	completion := testInlineCompletion()
+	completionBytes := testCompletionBytes(completion)
+	encoded := encodeCompletion(b, completion)
+	scratch := make([]byte, 0, len(encoded))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(encoded)))
+	for b.Loop() {
+		var err error
+		allocationBytesSink, err = AppendCompletionBytes(scratch[:0], completionBytes)
 		if err != nil {
 			b.Fatal(err)
 		}

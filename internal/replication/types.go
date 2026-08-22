@@ -62,8 +62,9 @@ type CommandKind uint8
 const (
 	// CommandMutationBatch applies one nonempty ordered mutation batch.
 	CommandMutationBatch CommandKind = iota
-	// CommandSessionRetire removes the command's client session and carries no
-	// mutations.
+	// CommandSessionRetire seals the command's client epoch and carries no
+	// mutations. The compact identity high-water remains durable so delayed
+	// commands from a retired epoch can never become new again.
 	CommandSessionRetire
 )
 

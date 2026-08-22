@@ -91,6 +91,37 @@ func testReferenceCompletion() Completion {
 	return completion
 }
 
+func testCompletionBytes(completion Completion) CompletionBytes {
+	return CompletionBytes{
+		ClusterID:              completion.ClusterID,
+		ClusterIncarnation:     completion.ClusterIncarnation,
+		TopologyRecoveryEpoch:  completion.TopologyRecoveryEpoch,
+		Distribution:           []byte(completion.Distribution),
+		Shard:                  []byte(completion.Shard),
+		AllocationGeneration:   completion.AllocationGeneration,
+		ShardIncarnation:       completion.ShardIncarnation,
+		GroupID:                completion.GroupID,
+		ReplicaSetVersion:      completion.ReplicaSetVersion,
+		ActivePolicyGeneration: completion.ActivePolicyGeneration,
+		ProtectionEpoch:        completion.ProtectionEpoch,
+		RoutingVersion:         completion.RoutingVersion,
+		RouteGeneration:        completion.RouteGeneration,
+		Tenant:                 completion.Tenant,
+		ClientID:               completion.ClientID,
+		ClientEpoch:            completion.ClientEpoch,
+		ClientSequence:         completion.ClientSequence,
+		Fingerprint:            completion.Fingerprint,
+		RetryHome:              completion.RetryHome,
+		AppliedSequence:        completion.AppliedSequence,
+		ResultCode:             completion.ResultCode,
+		ResultFormat:           completion.ResultFormat,
+		Storage:                completion.Storage,
+		ResultLength:           completion.ResultLength,
+		ResultDigest:           completion.ResultDigest,
+		InlineResult:           completion.InlineResult,
+	}
+}
+
 func encodeCommand(t testing.TB, command Command) []byte {
 	t.Helper()
 	encoded, err := AppendCommand(nil, command)
@@ -275,6 +306,37 @@ func TestCompletionRoundTrip(t *testing.T) {
 			view.AppliedSequence != completion.AppliedSequence {
 			t.Fatal("decoded completion scalar mismatch")
 		}
+	}
+}
+
+func TestCompletionByteInputIsWireIdentical(t *testing.T) {
+	for _, completion := range []Completion{
+		testInlineCompletion(), testReferenceCompletion(),
+	} {
+		want := encodeCompletion(t, completion)
+		prefix := []byte("prefix:")
+		dst := make([]byte, len(prefix), len(prefix)+len(want))
+		copy(dst, prefix)
+		got, err := AppendCompletionBytes(dst, testCompletionBytes(completion))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[:len(prefix)], prefix) || !bytes.Equal(got[len(prefix):], want) {
+			t.Fatal("byte-native completion differs from canonical completion bytes")
+		}
+	}
+}
+
+func TestCompletionByteInputUsesCanonicalValidation(t *testing.T) {
+	completion := testCompletionBytes(testInlineCompletion())
+	completion.Distribution = []byte{0xff}
+	prefix := []byte("unchanged")
+	got, err := AppendCompletionBytes(prefix, completion)
+	if !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatal("validation failure changed destination")
 	}
 }
 
@@ -666,6 +728,16 @@ func TestAppendCompletionRejectsWritableRegionAliases(t *testing.T) {
 			copy(region, source)
 			completion.Tenant = region[:len(source)]
 		}},
+		{"distribution", func(completion *Completion, region []byte) {
+			source := []byte(completion.Distribution)
+			copy(region, source)
+			completion.Distribution = unsafe.String(unsafe.SliceData(region), len(source))
+		}},
+		{"shard", func(completion *Completion, region []byte) {
+			source := []byte(completion.Shard)
+			copy(region, source)
+			completion.Shard = unsafe.String(unsafe.SliceData(region), len(source))
+		}},
 		{"inline_result", func(completion *Completion, region []byte) {
 			source := append([]byte(nil), completion.InlineResult...)
 			copy(region, source)
@@ -688,6 +760,27 @@ func TestAppendCompletionRejectsWritableRegionAliases(t *testing.T) {
 				t.Fatal("alias rejection modified destination backing")
 			}
 		})
+	}
+}
+
+func TestAppendCompletionBytesRejectsWritableRegionAliases(t *testing.T) {
+	completion := testCompletionBytes(testInlineCompletion())
+	frameBytes := len(encodeCompletion(t, testInlineCompletion()))
+	const prefix = "prefix"
+	backing := make([]byte, len(prefix)+frameBytes)
+	copy(backing, prefix)
+	region := backing[len(prefix):]
+	copy(region, completion.Distribution)
+	completion.Distribution = region[:len(completion.Distribution)]
+	dst := backing[:len(prefix)]
+	before := append([]byte(nil), backing...)
+
+	got, err := AppendCompletionBytes(dst, completion)
+	if !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+	}
+	if !bytes.Equal(got, dst) || !bytes.Equal(backing, before) {
+		t.Fatal("alias rejection modified destination backing")
 	}
 }
 
