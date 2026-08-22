@@ -463,27 +463,72 @@ func (w *snapshotArtifactWriter) writeFooter(
 		return [sha256.Size]byte{}, fmt.Errorf("%w: artifact bytes", ErrSnapshotArtifactBound)
 	}
 	totalBytes := w.encodedBytes + snapshotArtifactFooterBytes
-	var footer [snapshotArtifactFooterBytes]byte
-	copy(footer[0:8], snapshotArtifactFooterMagic[:])
-	binary.LittleEndian.PutUint16(footer[8:10], snapshotArtifactFormat)
-	binary.LittleEndian.PutUint16(footer[10:12], snapshotArtifactFooterBytes)
-	binary.LittleEndian.PutUint32(footer[12:16], snapshotArtifactFooterBytes)
-	binary.LittleEndian.PutUint64(footer[16:24], w.chunks)
-	binary.LittleEndian.PutUint64(footer[24:32], w.chunks)
-	binary.LittleEndian.PutUint64(footer[32:40], w.systemRows)
-	binary.LittleEndian.PutUint64(footer[40:48], w.userRows)
-	binary.LittleEndian.PutUint64(footer[48:56], w.payloadBytes)
-	binary.LittleEndian.PutUint64(footer[56:64], totalBytes)
-	copy(footer[64:96], w.previousDigest[:])
-	copy(footer[96:128], w.headerDigest[:])
-	copy(footer[128:160], imageDigest[:])
-	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
-	copy(footer[160:192], digest[:])
+	footer, digest := makeSnapshotArtifactFooter(
+		w.chunks, w.systemRows, w.userRows, w.payloadBytes, totalBytes,
+		w.previousDigest, w.headerDigest, imageDigest,
+	)
 	if err := writeSnapshotArtifactBytes(w.w, footer[:]); err != nil {
 		return [sha256.Size]byte{}, err
 	}
 	w.encodedBytes = totalBytes
 	return digest, nil
+}
+
+func makeSnapshotArtifactFooter(
+	chunks uint64,
+	systemRows uint64,
+	userRows uint64,
+	payloadBytes uint64,
+	totalBytes uint64,
+	lastChunkDigest [sha256.Size]byte,
+	headerDigest [sha256.Size]byte,
+	imageDigest [sha256.Size]byte,
+) ([snapshotArtifactFooterBytes]byte, [sha256.Size]byte) {
+	var footer [snapshotArtifactFooterBytes]byte
+	copy(footer[0:8], snapshotArtifactFooterMagic[:])
+	binary.LittleEndian.PutUint16(footer[8:10], snapshotArtifactFormat)
+	binary.LittleEndian.PutUint16(footer[10:12], snapshotArtifactFooterBytes)
+	binary.LittleEndian.PutUint32(footer[12:16], snapshotArtifactFooterBytes)
+	binary.LittleEndian.PutUint64(footer[16:24], chunks)
+	binary.LittleEndian.PutUint64(footer[24:32], chunks)
+	binary.LittleEndian.PutUint64(footer[32:40], systemRows)
+	binary.LittleEndian.PutUint64(footer[40:48], userRows)
+	binary.LittleEndian.PutUint64(footer[48:56], payloadBytes)
+	binary.LittleEndian.PutUint64(footer[56:64], totalBytes)
+	copy(footer[64:96], lastChunkDigest[:])
+	copy(footer[96:128], headerDigest[:])
+	copy(footer[128:160], imageDigest[:])
+	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
+	copy(footer[160:192], digest[:])
+	return footer, digest
+}
+
+func snapshotArtifactEncodedBytes(
+	headerBytes uint64,
+	chunks uint64,
+	payloadBytes uint64,
+	withFooter bool,
+) (uint64, bool) {
+	const chunkOverhead = uint64(snapshotArtifactChunkHeaderBytes + sha256.Size)
+	if headerBytes == 0 || chunks > math.MaxUint64/chunkOverhead {
+		return 0, false
+	}
+	total := chunks * chunkOverhead
+	if headerBytes > math.MaxUint64-total {
+		return 0, false
+	}
+	total += headerBytes
+	if payloadBytes > math.MaxUint64-total {
+		return 0, false
+	}
+	total += payloadBytes
+	if withFooter {
+		if total > math.MaxUint64-snapshotArtifactFooterBytes {
+			return 0, false
+		}
+		total += snapshotArtifactFooterBytes
+	}
+	return total, true
 }
 
 // VerifySnapshotArtifact streams and verifies one complete artifact. It
@@ -704,8 +749,11 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		stateEnvelope, string(cursor.manifest.UserCollection),
 		int(cursor.manifest.TargetChunkBytes),
 	)
+	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
+		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes, false,
+	)
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
-		cursor.encodedBytes < uint64(len(header)) ||
+		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
 		cursor.manifest.SystemRows > cursor.manifest.State.CompletionCount+1 {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}

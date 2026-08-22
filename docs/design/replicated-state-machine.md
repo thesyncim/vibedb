@@ -55,6 +55,13 @@ The machine does not maintain a canonical incremental Merkle root.
 mutation histories. Canonical same-content comparison uses `ImageDigest`, which
 still requires a complete ordered scan or an existing complete image stream.
 
+The user and system collections are exclusive state-machine storage. Direct
+out-of-band mutation violates the apply contract. Ordinary reopen validates
+every user row and the frozen apply contract, but after transition history
+exists it cannot derive the expected canonical image from `DataChainDigest`.
+Serving certification must compare `ImageDigest` at the same applied cut;
+`OpenCandidate` performs that comparison for transferred images.
+
 ## SQL apply boundary
 
 User validation must be deterministic. It can return a deterministic

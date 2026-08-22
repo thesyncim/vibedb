@@ -43,6 +43,8 @@ type Machine struct {
 	user            CollectionTarget
 	applyContract   [32]byte
 	dataChainHash   *dataChainHasher
+	mutationPlan    []finalMutation
+	mutationInline  [8]finalMutation
 	txnLog          *durable.TxnLog
 	options         Options
 	capture         TransitionCapture
@@ -163,6 +165,10 @@ func Open(
 		state.CompletionCount != completionCount ||
 		state.CompletionCount > options.MaxCompletions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+	}
+	if (state.LastKind == RecordStaticSnapshot || state.LastKind == RecordImportedSnapshot) &&
+		state.DataChainDigest != seedDigest {
+		return nil, fmt.Errorf("%w: persisted base data-chain seed", ErrStateCorrupt)
 	}
 	if state.LastKind == RecordStaticSnapshot &&
 		(state.LastEntryDigest != bootstrapDigest ||

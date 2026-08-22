@@ -39,7 +39,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	}
 	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
 	key := completionStorageKey(digest)
-	record, found, readErr := completionAt(snapshot, key)
+	record, found, readErr := completionAt(pointSnapshot{snapshot}, key)
 	err = errors.Join(readErr, cut.Close())
 	if err != nil {
 		return CompletionLookup{}, m.fail(err)

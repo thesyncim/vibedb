@@ -120,6 +120,11 @@ The current kernel does not maintain a canonical incremental Merkle root.
 histories. A canonical `ImageDigest` still requires a complete ordered image
 scan or an existing complete image stream.
 
+Replicated-state collections are exclusively owned by the state machine.
+Out-of-band row mutation is outside the storage contract. A serving candidate
+must pair a canonical `ImageDigest` with the same applied cut; snapshot staging
+does so before membership or serving authority can be granted.
+
 ## Autosplit boundary
 
 The `autosplit` package records fixed-memory pressure evidence and recommends a

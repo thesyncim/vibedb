@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -35,10 +36,10 @@ func TestSnapshotArtifactCursorRoundTripAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0xd1, 0x30, 0xba, 0xea, 0x00, 0xa8, 0xec, 0x1d,
-		0xc1, 0x1c, 0x5d, 0xe5, 0x6e, 0x94, 0xab, 0x12,
-		0x7a, 0xf0, 0xef, 0x01, 0xe5, 0x29, 0x6b, 0x48,
-		0x8c, 0xe0, 0x9f, 0x68, 0xd8, 0xa5, 0x4e, 0xb0,
+		0x43, 0xcd, 0xff, 0xf7, 0xd7, 0x34, 0x0f, 0x5e,
+		0xe8, 0x06, 0x39, 0x52, 0x94, 0x5f, 0x55, 0xc3,
+		0xee, 0x38, 0xa8, 0xd3, 0x43, 0x1a, 0xc7, 0x54,
+		0xf7, 0xf1, 0xf4, 0x94, 0x80, 0xaf, 0x63, 0x50,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("cursor golden digest = %x, want %x", got, wantGolden)
@@ -114,6 +115,15 @@ func TestSnapshotArtifactCursorStrictCorruptionAndTruncation(t *testing.T) {
 	copy(resealed[len(resealed)-sha256.Size:], digest[:])
 	if _, err := OpenSnapshotArtifactCursor(resealed); !errors.Is(err, ErrSnapshotArtifact) {
 		t.Fatalf("resealed reserved field error = %v", err)
+	}
+	resealed = bytes.Clone(encoded)
+	binary.LittleEndian.PutUint64(
+		resealed[40:48], binary.LittleEndian.Uint64(resealed[40:48])+1,
+	)
+	digest = snapshotArtifactDigest(snapshotArtifactCursorDomain, resealed[:len(resealed)-sha256.Size])
+	copy(resealed[len(resealed)-sha256.Size:], digest[:])
+	if _, err := OpenSnapshotArtifactCursor(resealed); !errors.Is(err, ErrSnapshotArtifact) {
+		t.Fatalf("resealed impossible offset error = %v", err)
 	}
 }
 

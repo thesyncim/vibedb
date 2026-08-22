@@ -121,6 +121,42 @@ func TestDataChainSeedDigestBindsContractAndCanonicalImage(t *testing.T) {
 	}
 }
 
+func TestReplicatedDigestGoldenVectors(t *testing.T) {
+	validationDigest := sha256.Sum256([]byte("validation profile"))
+	contract, err := applyContractDigest("docs", CollectionTarget{
+		Validation:       ValidationDeterministicMutation,
+		ValidationDigest: validationDigest,
+		Limits: CollectionLimits{
+			MaxKeyBytes: 256, MaxDocumentBytes: 1 << 20,
+			MaxDistinctMutations: 64, MaxBatchBytes: 8 << 20,
+		},
+	}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := dataChainSeedDigest(contract, sha256.Sum256([]byte("canonical image")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := dataChainTransitionDigest(nil, seed, contract, []finalMutation{
+		{key: []byte("a"), value: []byte(`{"n":1}`)},
+		{
+			key: []byte("b"), before: []byte(`{"n":1}`), value: []byte(`{"n":2}`),
+			beforeFound: true,
+		},
+		{key: []byte("c"), before: []byte(`{"n":3}`), beforeFound: true, delete: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDigestHex(t, "apply contract", contract,
+		"5eeca35c9c2373644bd2bcf03ca6e6d8d2c82bf212f1616845c3adb3723fabf0")
+	assertDigestHex(t, "data-chain seed", seed,
+		"71b4d325d8a4fc89c051c1b32aa7404d054605415448fab0d5ef8e0452fbc5bc")
+	assertDigestHex(t, "data-chain transition", transition,
+		"5314ba67dbee20d490b6c3b2bf9f6507f972f59fc07d9fd9060bf95f4784110f")
+}
+
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
 	previous := sha256.Sum256([]byte("previous publication"))
 	contract := sha256.Sum256([]byte("apply contract"))
@@ -346,6 +382,44 @@ func TestAdmitAndApplyValidateOnlyCommandKeys(t *testing.T) {
 			}
 			assertDataChainValidationCalls(t, "ApplyNormal", trace.calls, want)
 		})
+	}
+}
+
+func TestDataChainPreservedWithoutEffectiveRowChanges(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	put := testCommand(fixture.binding, 1, replication.Mutation{
+		Kind: replication.MutationPut, Key: []byte("present"), Value: []byte(`{"n":1}`),
+	})
+	publication, err := fixture.machine.ApplyNormal(normalMeta(2), put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := publication.DataChainDigest
+
+	publication, err = fixture.machine.ApplyNormal(normalMeta(2), put)
+	if err != nil || publication.DataChainDigest != want {
+		t.Fatalf("exact replay chain = %x, %v; want %x", publication.DataChainDigest, err, want)
+	}
+	commands := [][]byte{
+		testCommand(fixture.binding, 2, replication.Mutation{
+			Kind: replication.MutationPut, Key: []byte("present"), Value: []byte(`{"n":1}`),
+		}),
+		testCommand(fixture.binding, 3, replication.Mutation{
+			Kind: replication.MutationDelete, Key: []byte("absent"),
+		}),
+		testCommand(fixture.binding, 4, replication.Mutation{
+			Kind: replication.MutationPut, Key: []byte("invalid"), Value: []byte(`{"n":`),
+		}),
+	}
+	for index, command := range commands {
+		publication, err = fixture.machine.ApplyNormal(normalMeta(uint64(index+3)), command)
+		if err != nil || publication.DataChainDigest != want {
+			t.Fatalf("non-changing command %d chain = %x, %v; want %x",
+				index, publication.DataChainDigest, err, want)
+		}
 	}
 }
 

@@ -215,6 +215,11 @@ func (m *Machine) capturedTransition(next State, changes []finalMutation) Captur
 	}
 }
 
+func (m *Machine) releaseCaptureChanges() {
+	clear(m.captureChanges)
+	m.captureChanges = m.captureChanges[:0]
+}
+
 func (m *Machine) shouldCaptureTransition(next State) bool {
 	return m.capture != nil && m.initialized && m.state.Applied != math.MaxUint64 &&
 		next.Applied == m.state.Applied+1

@@ -38,6 +38,7 @@ type commandPlan struct {
 func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.releaseMutationPlan()
 	if err := m.checkUsable(); err != nil {
 		return raftmodel.Publication{}, err
 	}
@@ -101,7 +102,9 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
-	plan, planErr := m.planCommand(command, meta.Index, systemSnapshot, userSnapshot)
+	plan, planErr := m.planCommand(
+		command, meta.Index, pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+	)
 	err = errors.Join(planErr, cut.Close())
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
@@ -233,6 +236,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		defer m.releaseMutationPlan()
 		if err := m.checkUsable(); err != nil {
 			return err
 		}
@@ -254,6 +258,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.releaseMutationPlan()
 	if err := m.checkUsable(); err != nil {
 		return err
 	}
@@ -267,7 +272,10 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if err != nil {
 		return m.fail(err)
 	}
-	plan, planErr := m.planCommand(command, m.state.Applied+1, systemSnapshot, userSnapshot)
+	plan, planErr := m.planCommand(
+		command, m.state.Applied+1,
+		pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+	)
 	closeErr := cut.Close()
 	if planErr != nil || closeErr != nil {
 		joined := errors.Join(planErr, closeErr)
@@ -452,19 +460,29 @@ func (m *Machine) planMutations(
 	command replication.CommandView,
 	snapshot pointSnapshot,
 ) ([]finalMutation, uint32, error) {
-	ordered := make([]finalMutation, 0, min(command.MutationCount(), m.user.Limits.MaxDistinctMutations+1))
-	positions := make(map[string]int, min(command.MutationCount(), m.user.Limits.MaxDistinctMutations+1))
+	if cap(m.mutationPlan) == 0 {
+		m.mutationPlan = m.mutationInline[:0]
+	}
+	clear(m.mutationPlan)
+	ordered := m.mutationPlan[:0]
+	defer func() { m.mutationPlan = ordered }()
 	iterator := command.Mutations()
 	for iterator.Next() {
 		mutation := iterator.Mutation()
-		if at, ok := positions[string(mutation.Key)]; ok {
+		at := -1
+		for index := range ordered {
+			if bytes.Equal(ordered[index].key, mutation.Key) {
+				at = index
+				break
+			}
+		}
+		if at >= 0 {
 			ordered[at].delete = mutation.Kind == replication.MutationDelete
-			ordered[at].value = bytes.Clone(mutation.Value)
+			ordered[at].value = mutation.Value
 			continue
 		}
-		positions[string(mutation.Key)] = len(ordered)
 		ordered = append(ordered, finalMutation{
-			key: bytes.Clone(mutation.Key), value: bytes.Clone(mutation.Value),
+			key: mutation.Key, value: mutation.Value,
 			delete: mutation.Kind == replication.MutationDelete,
 		})
 		if len(ordered) > m.user.Limits.MaxDistinctMutations {
@@ -483,7 +501,7 @@ func (m *Machine) planMutations(
 				return nil, ResultInvalidDocument, nil
 			}
 		}
-		current, found, err := snapshot.AppendRaw(nil, mutation.key)
+		current, found, err := snapshot.appendRaw(nil, mutation.key)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -529,6 +547,11 @@ func (m *Machine) planMutations(
 	return changes, ResultApplied, nil
 }
 
+func (m *Machine) releaseMutationPlan() {
+	clear(m.mutationPlan)
+	m.mutationPlan = m.mutationPlan[:0]
+}
+
 func (m *Machine) makeCompletionDocument(
 	command replication.CommandView,
 	applied uint64,
@@ -567,12 +590,19 @@ func (m *Machine) makeCompletionDocument(
 	return wrapJSONHex(nil, record), nil
 }
 
-type pointSnapshot interface {
-	AppendRaw(dst []byte, key []byte) ([]byte, bool, error)
+// pointSnapshot is the planning capability: its API deliberately has no range
+// operation. Keeping the wrapper concrete also lets point reads inline without
+// interface escape allocations on every command key.
+type pointSnapshot struct {
+	value *durable.Snapshot
+}
+
+func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
+	return s.value.AppendRaw(dst, key)
 }
 
 func completionAt(snapshot pointSnapshot, key [33]byte) (CompletionRecord, bool, error) {
-	document, found, err := snapshot.AppendRaw(nil, key[:])
+	document, found, err := snapshot.appendRaw(nil, key[:])
 	if err != nil || !found {
 		return CompletionRecord{}, found, err
 	}
@@ -590,6 +620,7 @@ func (m *Machine) persistTransition(
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
+	defer m.releaseCaptureChanges()
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
@@ -693,6 +724,7 @@ func (m *Machine) checkTransitionCapacity(
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
+	defer m.releaseCaptureChanges()
 	captureBytes := 0
 	if m.shouldCaptureTransition(next) {
 		transition := m.capturedTransition(next, changes)

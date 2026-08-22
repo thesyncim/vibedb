@@ -237,12 +237,8 @@ func TestSnapshotArtifactStageRejectsWrongExpectationCursorAndLostRows(t *testin
 	_, system, user := newTargets(t)
 	wrong := cloneSnapshotArtifactManifest(expected)
 	wrong.Digest[0] ^= 1
-	stage, err := NewSnapshotArtifactStage(wrong, system, user, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = stage.Receive(bytes.NewReader(artifact), func([]byte) error { return nil }); !errors.Is(err, ErrSnapshotStage) {
-		t.Fatalf("wrong final digest error = %v", err)
+	if _, err := NewSnapshotArtifactStage(wrong, system, user, nil); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("wrong final digest constructor error = %v", err)
 	}
 
 	var checkpoints []SnapshotArtifactCheckpoint
@@ -256,7 +252,7 @@ func TestSnapshotArtifactStageRejectsWrongExpectationCursorAndLostRows(t *testin
 	}
 	_, system, user = newTargets(t)
 	var cursorBytes []byte
-	stage, err = NewSnapshotArtifactStage(expected, system, user, nil)
+	stage, err := NewSnapshotArtifactStage(expected, system, user, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

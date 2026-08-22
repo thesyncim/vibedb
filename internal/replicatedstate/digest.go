@@ -12,12 +12,17 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
+const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
+	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
+	"mutation-validation-result-map;bytewise-changed-key-order"
+
 var (
 	canonicalImageDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
 	dataChainSeedDigestDomain  = []byte("vibedb/replicated-state/data-chain-seed\x00")
 	dataChainDigestDomain      = []byte("vibedb/replicated-state/data-chain\x00")
 	applyContractDigestDomain  = []byte("vibedb/replicated-state/apply-contract\x00")
 	dataChainMarkers           = [2][1]byte{{0}, {1}}
+	applySemanticsDigest       = sha256.Sum256([]byte(deterministicApplySemantics))
 )
 
 type finalMutation struct {
@@ -254,6 +259,7 @@ func applyContractDigest(
 	writeHashFrame(h, []byte(name))
 	_, _ = h.Write([]byte{byte(target.Validation)})
 	_, _ = h.Write(target.ValidationDigest[:])
+	_, _ = h.Write(applySemanticsDigest[:])
 	var grammar [2 + 7*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{

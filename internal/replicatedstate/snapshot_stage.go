@@ -321,9 +321,17 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	header, headerDigest, err := makeSnapshotArtifactHeader(
 		stateEnvelope, string(expected.UserCollection), int(expected.TargetChunkBytes),
 	)
+	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
+		uint64(len(header)), expected.Chunks, expected.PayloadBytes, true,
+	)
+	_, wantFooterDigest := makeSnapshotArtifactFooter(
+		expected.Chunks, expected.SystemRows, expected.UserRows,
+		expected.PayloadBytes, expected.EncodedBytes,
+		expected.LastChunkDigest, expected.HeaderDigest, expected.ImageDigest,
+	)
 	if err != nil || headerDigest != expected.HeaderDigest ||
-		expected.EncodedBytes <= uint64(len(header))+snapshotArtifactFooterBytes ||
-		expected.PayloadBytes >= expected.EncodedBytes {
+		!encodedBytesOK || expected.EncodedBytes != wantEncodedBytes ||
+		expected.Digest != wantFooterDigest {
 		return fmt.Errorf("%w: expected artifact identity", ErrSnapshotStage)
 	}
 	return nil
