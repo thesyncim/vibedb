@@ -407,22 +407,15 @@ func targetManifestForMove(
 	if !ok {
 		return nil, ErrInvalidPlan
 	}
-	shards := make([]distribution.Shard, sourceManifest.ShardCount())
-	for i := range shards {
-		shards[i], _ = sourceManifest.ShardInfo(i)
-	}
-	source := shards[ordinal]
-	if len(source.Leaders) == 0 || source.Leaders[0] != request.Source ||
-		source.Epoch == ^distribution.OwnershipEpoch(0) ||
-		!unambiguousMoveLeaders(source.Leaders, request.Source, request.Target) {
+	source, _ := sourceManifest.ShardMetadataAt(ordinal)
+	if source.Epoch == ^distribution.OwnershipEpoch(0) ||
+		!unambiguousManifestMoveLeaders(
+			sourceManifest, ordinal, source.LeaderCount, request.Source, request.Target,
+		) {
 		return nil, ErrInvalidPlan
 	}
-	moved := &shards[ordinal]
-	moved.Epoch++
-	moved.Leaders = append(moved.Leaders[:0], request.Target)
-	moved.Leaders = append(moved.Leaders, source.Leaders[1:]...)
-	target, err := distribution.NewManifest(
-		sourceManifest.Distribution(), sourceManifest.Version()+1, shards,
+	target, err := sourceManifest.ReplaceShardLeader(
+		ordinal, sourceManifest.Version()+1, 0, request.Target, source.Epoch+1,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
@@ -442,21 +435,14 @@ func sourceManifestForRecovery(
 	if !ok {
 		return nil, ErrTopologyConflict
 	}
-	shards := make([]distribution.Shard, targetManifest.ShardCount())
-	for i := range shards {
-		shards[i], _ = targetManifest.ShardInfo(i)
-	}
-	targetSource := shards[ordinal]
-	target := &shards[ordinal]
-	if len(target.Leaders) == 0 || target.Leaders[0] != request.Target || target.Epoch == 0 ||
-		!unambiguousMoveLeaders(target.Leaders, request.Target, request.Source) {
+	target, _ := targetManifest.ShardMetadataAt(ordinal)
+	if target.Epoch == 0 || !unambiguousManifestMoveLeaders(
+		targetManifest, ordinal, target.LeaderCount, request.Target, request.Source,
+	) {
 		return nil, ErrTopologyConflict
 	}
-	target.Epoch--
-	target.Leaders = append(target.Leaders[:0], request.Source)
-	target.Leaders = append(target.Leaders, targetSource.Leaders[1:]...)
-	source, err := distribution.NewManifest(
-		targetManifest.Distribution(), targetManifest.Version()-1, shards,
+	source, err := targetManifest.ReplaceShardLeader(
+		ordinal, targetManifest.Version()-1, 0, request.Source, target.Epoch-1,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTopologyConflict, err)
@@ -464,19 +450,22 @@ func sourceManifestForRecovery(
 	return source, nil
 }
 
-func unambiguousMoveLeaders(
-	leaders []distribution.EndpointID,
+func unambiguousManifestMoveLeaders(
+	manifest *distribution.Manifest,
+	shard, count int,
 	first, excluded distribution.EndpointID,
 ) bool {
-	if len(leaders) == 0 || leaders[0] != first {
+	if count == 0 {
 		return false
 	}
-	for i, leader := range leaders {
-		if leader == "" || leader == excluded {
+	for index := 0; index < count; index++ {
+		leader, ok := manifest.ShardLeaderAt(shard, index)
+		if !ok || leader == "" || leader == excluded || index == 0 && leader != first {
 			return false
 		}
-		for j := 0; j < i; j++ {
-			if leaders[j] == leader {
+		for prior := 0; prior < index; prior++ {
+			priorLeader, _ := manifest.ShardLeaderAt(shard, prior)
+			if priorLeader == leader {
 				return false
 			}
 		}

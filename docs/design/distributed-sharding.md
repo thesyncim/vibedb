@@ -171,6 +171,47 @@ and stores no topology strings. It is advisory, single-owner state: restart
 safety still comes from durable child/capture proofs and exact generation
 fences, not from recovering this table.
 
+Capacity placement consumes exact-catalog-generation reports for up to 4,096
+nodes. It uses SABLE's seven resource dimensions plus migration ingress and
+receive concurrency. A bounded pointer-free workspace orders at most 128 child
+allocations by dominant cluster share, then places as many as five replicas by
+minimum projected dominant pressure. Source-leader exclusion, numeric
+failure-domain anti-affinity, per-node primary/replica limits, and a physical
+migration cap are hard constraints. Sibling reservations immediately affect
+later scores, so equal-capacity children spread without a tenant affinity key.
+
+The fixed cut contains node ordinals, not a serialized plan. Its bridge rechecks
+catalog/node generations and endpoint membership before using the existing
+allocation-lineage-fenced split builder. It does not create Raft membership,
+move bytes, or publish topology.
+
+## Non-serving replica movement
+
+`internal/topologyscheduler` also selects capacity-relieving replica moves from
+as many as 1,024 exact allocation candidates and 4,096 node reports. The warm
+path is allocation-free and returns at most 64 fixed-width candidate/source/
+target ordinals. A candidate is fenced to the exact catalog, range, allocation,
+routing version, and ownership epoch; its seven-resource demand must be
+physically present in the current first leader's report.
+
+The scheduler excludes every current replica endpoint, enforces receive and
+migration ingress capacity, and can require a destination failure domain
+different from every replica that will remain. It scores the maximum projected
+dominant pressure after both source relief and target load. Reservations are
+netted across the whole cut, including when one node is both a source and a
+target, while bounded per-source and per-target counts limit concentration.
+No tenant affinity is introduced: the physical range allocation remains the
+unit of evidence, placement, and fencing.
+
+The fixed cut exposes endpoints only after rechecking the complete candidate,
+node, and policy fingerprint. An external membership owner must still attach
+Raft group and member identities. `internal/rebalance` then drives the existing
+learner, certified snapshot, catch-up, promotion, leadership, ownership,
+catalog-CAS, drain, and source-removal sequence one proof-checked action at a
+time. Its manifest cutover copies only the shard array and changed leader set;
+the immutable range index and untouched leader storage remain shared. This is
+not a runnable automatic rebalancing controller or snapshot transport.
+
 ## Security boundary
 
 The gateway and shard commands accept loopback listeners only. Their protocols
@@ -187,7 +228,8 @@ boundary.
 - `shardservice/admit.go` and `server.go`
 - `cmd/vibedb-gateway` and `cmd/vibedb-shard`
 - `autosplit/action.go`
-- `internal/topologyscheduler/admission.go`, `feedback.go`, and `planning.go`
+- `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`,
+  `capacity_placement.go`, and `replica_move.go`
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
@@ -197,3 +239,4 @@ boundary.
 - `internal/raftmember/staged_child.go`
 - `internal/splitcontroller/reconcile.go`
 - `internal/splitcontroller/execute.go`
+- `internal/rebalance/plan.go` and `reconcile.go`

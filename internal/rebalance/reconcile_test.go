@@ -1,7 +1,9 @@
 package rebalance
 
 import (
+	"encoding/binary"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -314,5 +316,42 @@ func TestReplicaMoveRecoversCertifiedPlanAcrossCutover(t *testing.T) {
 		Applied: 11, ReplicaSetVersion: 11, ConfState: initial.removedConf,
 	}, moveTestRequest(), certificate); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("removed source catalog error = %v", err)
+	}
+}
+
+func BenchmarkTargetManifestForMove1024Shards(b *testing.B) {
+	const shardCount = 1024
+	shards := make([]distribution.Shard, shardCount)
+	for index := range shards {
+		start := uint64(index) << 54
+		end := uint64(index+1) << 54
+		binary.BigEndian.PutUint64(shards[index].Range.Start[:], start)
+		if index == shardCount-1 {
+			shards[index].Range.End.Max = true
+		} else {
+			binary.BigEndian.PutUint64(shards[index].Range.End.Point[:], end)
+		}
+		shards[index].ID = distribution.ShardID("shard-" + strconv.Itoa(index))
+		shards[index].AllocationGeneration = distribution.ShardAllocationGeneration(index + 1)
+		shards[index].Leaders = []distribution.EndpointID{"source"}
+		shards[index].Epoch = 13
+	}
+	manifest, err := distribution.NewManifest("data", 7, shards)
+	if err != nil {
+		b.Fatal(err)
+	}
+	request := MoveRequest{
+		Distribution: "data", Shard: shards[shardCount-1].ID,
+		Source: "source", Target: "target",
+	}
+	if _, err := targetManifestForMove(manifest, request); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := targetManifestForMove(manifest, request); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
