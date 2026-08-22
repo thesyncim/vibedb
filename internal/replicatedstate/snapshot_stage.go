@@ -257,7 +257,7 @@ func (s *SnapshotArtifactStage) applyRows(rows SnapshotArtifactRows) error {
 
 // OpenCandidate performs the expensive final proof over both completed files:
 // system-record validation, retained-completion validation, user placement
-// validation, and logical-digest recomputation. Success returns a non-serving
+// validation, and canonical-image verification. Success returns a non-serving
 // Machine at the exact expected publication. The caller still needs learner
 // membership, log-tail catch-up, and topology cutover before serving it.
 func (s *SnapshotArtifactStage) OpenCandidate(
@@ -284,9 +284,13 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	if err != nil {
 		return nil, err
 	}
+	if machine.openedImageApplied != s.expected.State.Applied ||
+		machine.openedImageDigest != s.expected.ImageDigest {
+		return nil, fmt.Errorf("%w: candidate image digest", ErrSnapshotStage)
+	}
 	publication := machine.Published()
 	if !equalStatePublication(
-		s.expected.State, publication.Applied, publication.LogicalDigest,
+		s.expected.State, publication.Applied, publication.DataChainDigest,
 		publication.ConfState, publication.ReplicaSetVersion,
 	) {
 		return nil, fmt.Errorf("%w: candidate publication", ErrSnapshotStage)
@@ -306,7 +310,8 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		expected.Chunks == 0 || expected.SystemRows != expected.State.CompletionCount+1 ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
-		expected.LastChunkDigest == ([32]byte{}) || expected.Digest == ([32]byte{}) {
+		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||
+		expected.Digest == ([32]byte{}) {
 		return fmt.Errorf("%w: expected artifact", ErrSnapshotStage)
 	}
 	stateEnvelope, err := AppendState(nil, expected.State)
@@ -316,9 +321,17 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	header, headerDigest, err := makeSnapshotArtifactHeader(
 		stateEnvelope, string(expected.UserCollection), int(expected.TargetChunkBytes),
 	)
+	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
+		uint64(len(header)), expected.Chunks, expected.PayloadBytes, true,
+	)
+	_, wantFooterDigest := makeSnapshotArtifactFooter(
+		expected.Chunks, expected.SystemRows, expected.UserRows,
+		expected.PayloadBytes, expected.EncodedBytes,
+		expected.LastChunkDigest, expected.HeaderDigest, expected.ImageDigest,
+	)
 	if err != nil || headerDigest != expected.HeaderDigest ||
-		expected.EncodedBytes <= uint64(len(header))+snapshotArtifactFooterBytes ||
-		expected.PayloadBytes >= expected.EncodedBytes {
+		!encodedBytesOK || expected.EncodedBytes != wantEncodedBytes ||
+		expected.Digest != wantFooterDigest {
 		return fmt.Errorf("%w: expected artifact identity", ErrSnapshotStage)
 	}
 	return nil
@@ -347,5 +360,6 @@ func equalSnapshotArtifactManifest(left, right SnapshotArtifactManifest) bool {
 		left.UserRows == right.UserRows && left.PayloadBytes == right.PayloadBytes &&
 		left.EncodedBytes == right.EncodedBytes &&
 		left.HeaderDigest == right.HeaderDigest &&
-		left.LastChunkDigest == right.LastChunkDigest && left.Digest == right.Digest
+		left.LastChunkDigest == right.LastChunkDigest &&
+		left.ImageDigest == right.ImageDigest && left.Digest == right.Digest
 }

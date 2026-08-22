@@ -14,7 +14,7 @@ import (
 
 const (
 	stateCodecFormat  = uint16(1)
-	stateHeaderBytes  = 328
+	stateHeaderBytes  = 360
 	recordChecksumLen = sha256.Size
 )
 
@@ -40,16 +40,20 @@ const (
 
 // State is the exact durable publication stored at the fixed state key.
 type State struct {
-	Binding           Binding
-	Applied           uint64
-	LastTerm          uint64
-	LastKind          RecordKind
-	LastEntryType     pb.EntryType
-	LastEntryDigest   [32]byte
-	LogicalDigest     [32]byte
-	ConfState         *pb.ConfState
-	ReplicaSetVersion uint64
-	BootstrapDigest   [32]byte
+	Binding         Binding
+	Applied         uint64
+	LastTerm        uint64
+	LastKind        RecordKind
+	LastEntryType   pb.EntryType
+	LastEntryDigest [32]byte
+	// DataChainDigest is the history-sensitive logical data transition chain.
+	// It advances from exact changed rows and is intentionally distinct from
+	// the canonical full-image digest produced at certification boundaries.
+	DataChainDigest     [32]byte
+	ApplyContractDigest [32]byte
+	ConfState           *pb.ConfState
+	ReplicaSetVersion   uint64
+	BootstrapDigest     [32]byte
 	// SnapshotBaseDigest binds the exact Raft snapshot certificate that most
 	// recently established this state-machine base. Normal ordered applies
 	// preserve it; installing a newer certified base replaces it atomically.
@@ -106,12 +110,13 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	copy(frame[152:168], state.Binding.ShardIncarnation[:])
 	copy(frame[168:184], state.Binding.GroupID[:])
 	copy(frame[184:216], state.LastEntryDigest[:])
-	copy(frame[216:248], state.LogicalDigest[:])
-	copy(frame[248:280], state.BootstrapDigest[:])
-	copy(frame[280:312], state.SnapshotBaseDigest[:])
-	binary.LittleEndian.PutUint16(frame[312:314], uint16(len(state.Binding.Distribution)))
-	binary.LittleEndian.PutUint16(frame[314:316], uint16(len(state.Binding.Shard)))
-	binary.LittleEndian.PutUint32(frame[316:320], uint32(len(conf)))
+	copy(frame[216:248], state.DataChainDigest[:])
+	copy(frame[248:280], state.ApplyContractDigest[:])
+	copy(frame[280:312], state.BootstrapDigest[:])
+	copy(frame[312:344], state.SnapshotBaseDigest[:])
+	binary.LittleEndian.PutUint16(frame[344:346], uint16(len(state.Binding.Distribution)))
+	binary.LittleEndian.PutUint16(frame[346:348], uint16(len(state.Binding.Shard)))
+	binary.LittleEndian.PutUint32(frame[348:352], uint32(len(conf)))
 	cursor := stateHeaderBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
@@ -128,7 +133,7 @@ func OpenState(src []byte) (State, error) {
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		binary.LittleEndian.Uint16(src[12:14]) != stateHeaderBytes ||
-		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[320:328]) {
+		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[352:360]) {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -138,9 +143,9 @@ func OpenState(src []byte) (State, error) {
 		!verifyRecord(src, stateChecksumDomain) {
 		return State{}, fmt.Errorf("%w: state size or checksum", ErrStateCorrupt)
 	}
-	distributionLen64 := uint64(binary.LittleEndian.Uint16(src[312:314]))
-	shardLen64 := uint64(binary.LittleEndian.Uint16(src[314:316]))
-	confLen64 := uint64(binary.LittleEndian.Uint32(src[316:320]))
+	distributionLen64 := uint64(binary.LittleEndian.Uint16(src[344:346]))
+	shardLen64 := uint64(binary.LittleEndian.Uint16(src[346:348]))
+	confLen64 := uint64(binary.LittleEndian.Uint32(src[348:352]))
 	if distributionLen64+shardLen64+confLen64 != body64 || confLen64 == 0 ||
 		distributionLen64 > uint64(len(src)) || shardLen64 > uint64(len(src)) ||
 		confLen64 > uint64(len(src)) {
@@ -167,9 +172,10 @@ func OpenState(src []byte) (State, error) {
 	copy(state.Binding.ShardIncarnation[:], src[152:168])
 	copy(state.Binding.GroupID[:], src[168:184])
 	copy(state.LastEntryDigest[:], src[184:216])
-	copy(state.LogicalDigest[:], src[216:248])
-	copy(state.BootstrapDigest[:], src[248:280])
-	copy(state.SnapshotBaseDigest[:], src[280:312])
+	copy(state.DataChainDigest[:], src[216:248])
+	copy(state.ApplyContractDigest[:], src[248:280])
+	copy(state.BootstrapDigest[:], src[280:312])
+	copy(state.SnapshotBaseDigest[:], src[312:344])
 	cursor := stateHeaderBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
@@ -199,6 +205,7 @@ func validateState(state State) error {
 		state.LastTerm == 0 || state.LastTerm == math.MaxUint64 || state.ConfState == nil ||
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||
 		state.ReplicaSetVersion == math.MaxUint64 || state.CompletionCount > state.Applied-1 ||
+		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||
 		state.SnapshotBaseDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: invalid state scalar", ErrStateCorrupt)
 	}
@@ -324,7 +331,7 @@ func cloneConfState(state *pb.ConfState) *pb.ConfState {
 }
 
 func equalStatePublication(state State, applied uint64, digest [32]byte, conf *pb.ConfState, version uint64) bool {
-	return state.Applied == applied && state.LogicalDigest == digest &&
+	return state.Applied == applied && state.DataChainDigest == digest &&
 		state.ReplicaSetVersion == version && proto.Equal(state.ConfState, conf)
 }
 
@@ -338,7 +345,8 @@ func equalState(left, right State) bool {
 		left.LastTerm == right.LastTerm && left.LastKind == right.LastKind &&
 		left.LastEntryType == right.LastEntryType &&
 		left.LastEntryDigest == right.LastEntryDigest &&
-		left.LogicalDigest == right.LogicalDigest &&
+		left.DataChainDigest == right.DataChainDigest &&
+		left.ApplyContractDigest == right.ApplyContractDigest &&
 		left.ReplicaSetVersion == right.ReplicaSetVersion &&
 		left.BootstrapDigest == right.BootstrapDigest &&
 		left.SnapshotBaseDigest == right.SnapshotBaseDigest &&

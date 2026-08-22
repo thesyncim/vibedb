@@ -23,6 +23,28 @@ benchmark regex, input flags, and `GOMAXPROCS` constant.
 Correctness tests must pass before the benchmark. A benchmark is not a
 correctness oracle.
 
+## Replicated apply complexity
+
+Normal replicated command admission and apply do not scan the shard image.
+They read the bounded command's completion and mutation keys. Planning,
+validation, and digest work are O(changed keys plus changed document bytes),
+bounded by 64 distinct mutations, and independent of the shard row count.
+
+The hot path advances a deterministic `DataChainDigest` from the prior chain
+and the exact row changes. This digest is history-sensitive. It is not a
+canonical incremental Merkle root and it cannot prove that images with
+different histories contain the same rows.
+
+Canonical `ImageDigest` work stays on cold full-image paths. Reopen and import
+scan the image. Snapshot artifact creation computes the digest while it already
+streams the image. An explicit audit scans a coherent read snapshot. Normal
+admission and apply do not compute `ImageDigest`.
+
+When you measure this contract, vary shard row count independently from command
+mutation count and changed document bytes. Report point-update latency and
+allocation data separately from full-image reopen, artifact, import, and audit
+costs. The complexity contract is not a published throughput or latency claim.
+
 ## Run the allocation gate
 
 ```bash
@@ -110,3 +132,5 @@ frequency, storage-controller behavior, restart latency, or availability.
 - `bench/competitive/cmd/footprint/main.go`
 - `bench/competitive/cmd/churndisk/main.go`
 - `bench/competitive/internal/coverage/manifest.go`
+- `internal/replicatedstate/apply.go` and `digest.go`
+- `internal/replicatedstate/read.go` and `snapshot_artifact.go`

@@ -25,7 +25,7 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 	split := checkpoints[len(checkpoints)/2]
 
 	dir := t.TempDir()
-	collectionOptions := durable.Options{MaxBatchDocuments: 2}
+	collectionOptions := durable.Options{}
 	system := createTargetAt(t, dir, "system", collectionOptions)
 	system = systemTargetOf(system.Collection)
 	user := createTargetAt(t, dir, "user", collectionOptions)
@@ -115,7 +115,7 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 	}
 	publication := candidate.Published()
 	if !equalStatePublication(
-		expected.State, publication.Applied, publication.LogicalDigest,
+		expected.State, publication.Applied, publication.DataChainDigest,
 		publication.ConfState, publication.ReplicaSetVersion,
 	) {
 		t.Fatalf("candidate publication = %+v, expected state = %+v", publication, expected.State)
@@ -130,7 +130,7 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 		t.Fatalf("snapshot base certificate = %+v, %v", certificate, err)
 	}
 	if installed, err := candidate.InstallSnapshot(base); err != nil ||
-		installed.Applied != publication.Applied || installed.LogicalDigest != publication.LogicalDigest {
+		installed.Applied != publication.Applied || installed.DataChainDigest != publication.DataChainDigest {
 		t.Fatalf("InstallSnapshot(base) = %+v, %v", installed, err)
 	}
 	if installed, err := candidate.InstallSnapshot(base); err != nil || installed.Applied != publication.Applied {
@@ -237,12 +237,8 @@ func TestSnapshotArtifactStageRejectsWrongExpectationCursorAndLostRows(t *testin
 	_, system, user := newTargets(t)
 	wrong := cloneSnapshotArtifactManifest(expected)
 	wrong.Digest[0] ^= 1
-	stage, err := NewSnapshotArtifactStage(wrong, system, user, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = stage.Receive(bytes.NewReader(artifact), func([]byte) error { return nil }); !errors.Is(err, ErrSnapshotStage) {
-		t.Fatalf("wrong final digest error = %v", err)
+	if _, err := NewSnapshotArtifactStage(wrong, system, user, nil); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("wrong final digest constructor error = %v", err)
 	}
 
 	var checkpoints []SnapshotArtifactCheckpoint
@@ -256,7 +252,7 @@ func TestSnapshotArtifactStageRejectsWrongExpectationCursorAndLostRows(t *testin
 	}
 	_, system, user = newTargets(t)
 	var cursorBytes []byte
-	stage, err = NewSnapshotArtifactStage(expected, system, user, nil)
+	stage, err := NewSnapshotArtifactStage(expected, system, user, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

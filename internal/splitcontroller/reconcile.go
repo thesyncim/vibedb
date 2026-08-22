@@ -485,7 +485,7 @@ func (p *Plan) validateSourceObservation(observed Observation) error {
 	state := observed.SourceState
 	binding := state.Binding
 	if state.Applied == 0 || state.LastTerm == 0 ||
-		state.LogicalDigest == ([32]byte{}) || state.LastEntryDigest == ([32]byte{}) ||
+		state.DataChainDigest == ([32]byte{}) || state.LastEntryDigest == ([32]byte{}) ||
 		state.SnapshotBaseDigest == ([32]byte{}) ||
 		binding.Distribution != string(p.source.Distribution) ||
 		binding.Shard != string(p.source.Shard) ||
@@ -524,7 +524,7 @@ func (p *Plan) sourceStateMatchesCut(state replicatedstate.State, tail rangespli
 	cut := tail.SourceCut()
 	coordinates := tail.SourceCoordinates()
 	return state.Applied == cut.Applied && state.LastTerm == cut.Term &&
-		state.LogicalDigest == cut.LogicalDigest && state.LastEntryDigest == cut.EntryDigest &&
+		state.DataChainDigest == cut.DataChainDigest && state.LastEntryDigest == cut.EntryDigest &&
 		state.SnapshotBaseDigest == cut.BaseDigest &&
 		state.Binding.OwnershipEpoch == coordinates.OwnershipEpoch &&
 		state.Binding.RoutingVersion == coordinates.RoutingVersion &&
@@ -546,7 +546,7 @@ func (p *Plan) sourceStateAfterCutover(
 	}
 	if prune == nil {
 		return state.Applied == cut.Applied && state.LastTerm == cut.Term &&
-			state.LogicalDigest == cut.LogicalDigest && state.LastEntryDigest == cut.EntryDigest
+			state.DataChainDigest == cut.DataChainDigest && state.LastEntryDigest == cut.EntryDigest
 	}
 	pruneCut := prune.SourceCut()
 	return state.Applied >= pruneCut.Applied

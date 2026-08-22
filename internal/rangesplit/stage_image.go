@@ -56,7 +56,7 @@ func (s *ChildStage) certifySealedImage(cursor *ChildStageCursor) (resultErr err
 	_, _ = h.Write(cursor.placementDigest[:])
 	_, _ = h.Write(cursor.artifactDigest[:])
 	_, _ = h.Write(cursor.lastBatchDigest[:])
-	_, _ = h.Write(cursor.logicalDigest[:])
+	_, _ = h.Write(cursor.dataChainDigest[:])
 	_, _ = h.Write(cursor.baseDigest[:])
 	_, _ = h.Write(cursor.entryDigest[:])
 	workspace.fixed = [56]byte{}

@@ -13,7 +13,7 @@ import (
 
 const (
 	snapshotBaseFormat              = uint16(1)
-	snapshotBaseHeaderBytes         = 240
+	snapshotBaseHeaderBytes         = 272
 	MaxSnapshotBaseCertificateBytes = snapshotBaseHeaderBytes +
 		MaxStateEnvelopeBytes + MaxStaticBootstrapEnvelopeBytes +
 		replication.MaxCollectionBytes + recordChecksumLen
@@ -79,9 +79,10 @@ func BuildSnapshotBase(
 	copy(result[80:112], manifest.HeaderDigest[:])
 	copy(result[112:144], manifest.LastChunkDigest[:])
 	copy(result[144:176], manifest.Digest[:])
+	copy(result[176:208], manifest.ImageDigest[:])
 	stateDigest := sha256.Sum256(stateBytes)
-	copy(result[176:208], stateDigest[:])
-	copy(result[208:240], bootstrapDigest[:])
+	copy(result[208:240], stateDigest[:])
+	copy(result[240:272], bootstrapDigest[:])
 	cursor := snapshotBaseHeaderBytes
 	cursor += copy(result[cursor:], stateBytes)
 	cursor += copy(result[cursor:], bootstrapBytes)
@@ -129,7 +130,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	userEnd := bootstrapEnd + int(userBytes)
 	stateRaw := data[cursor:stateEnd]
 	wantStateDigest := sha256.Sum256(stateRaw)
-	if !bytes.Equal(wantStateDigest[:], data[176:208]) {
+	if !bytes.Equal(wantStateDigest[:], data[208:240]) {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: state digest", ErrSnapshotBase)
 	}
 	state, err := OpenState(stateRaw)
@@ -145,7 +146,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	canonicalBootstrap, bootstrapDigest, err := validateBootstrap(bootstrap)
 	if err != nil || !bytes.Equal(canonicalBootstrap, bootstrapRaw) ||
 		bootstrapDigest != state.BootstrapDigest ||
-		!bytes.Equal(bootstrapDigest[:], data[208:240]) {
+		!bytes.Equal(bootstrapDigest[:], data[240:272]) {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: static bootstrap identity", ErrSnapshotBase)
 	}
 	manifest := SnapshotArtifactManifest{
@@ -160,6 +161,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	copy(manifest.HeaderDigest[:], data[80:112])
 	copy(manifest.LastChunkDigest[:], data[112:144])
 	copy(manifest.Digest[:], data[144:176])
+	copy(manifest.ImageDigest[:], data[176:208])
 	if err := validateExpectedSnapshotArtifact(manifest); err != nil {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: manifest: %v", ErrSnapshotBase, err)
 	}

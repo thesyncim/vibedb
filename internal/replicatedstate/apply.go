@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -22,21 +23,22 @@ var (
 )
 
 type commandPlan struct {
-	command        replication.CommandView
-	key            [33]byte
-	completionDoc  []byte
-	changes        []finalMutation
-	logicalDigest  [32]byte
-	resultCode     uint32
-	newCompletion  bool
-	exactDuplicate bool
-	conflict       bool
+	command         replication.CommandView
+	key             [33]byte
+	completionDoc   []byte
+	changes         []finalMutation
+	dataChainDigest [32]byte
+	resultCode      uint32
+	newCompletion   bool
+	exactDuplicate  bool
+	conflict        bool
 }
 
 // ApplyNormal implements raftmodel.StateMachine.
 func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.releaseMutationPlan()
 	if err := m.checkUsable(); err != nil {
 		return raftmodel.Publication{}, err
 	}
@@ -100,13 +102,15 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
-	plan, planErr := m.planCommand(command, meta.Index, systemSnapshot, userSnapshot)
+	plan, planErr := m.planCommand(
+		command, meta.Index, pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+	)
 	err = errors.Join(planErr, cut.Close())
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	next := m.nextState(meta, RecordNormal, digest)
-	next.LogicalDigest = plan.logicalDigest
+	next.DataChainDigest = plan.dataChainDigest
 	if plan.newCompletion {
 		next.CompletionCount++
 	}
@@ -181,9 +185,10 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		next := State{
 			Binding: m.binding, Applied: 1, LastTerm: 1,
 			LastKind: RecordStaticSnapshot, LastEntryType: pb.EntryNormal,
-			LastEntryDigest: m.bootstrapDigest, LogicalDigest: m.state.LogicalDigest,
-			ConfState:         cloneConfState(snapshot.GetMetadata().GetConfState()),
-			ReplicaSetVersion: 1, BootstrapDigest: m.bootstrapDigest,
+			LastEntryDigest: m.bootstrapDigest, DataChainDigest: m.state.DataChainDigest,
+			ApplyContractDigest: m.applyContract,
+			ConfState:           cloneConfState(snapshot.GetMetadata().GetConfState()),
+			ReplicaSetVersion:   1, BootstrapDigest: m.bootstrapDigest,
 			SnapshotBaseDigest: m.bootstrapDigest,
 		}
 		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
@@ -231,6 +236,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		defer m.releaseMutationPlan()
 		if err := m.checkUsable(); err != nil {
 			return err
 		}
@@ -252,6 +258,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.releaseMutationPlan()
 	if err := m.checkUsable(); err != nil {
 		return err
 	}
@@ -265,7 +272,10 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if err != nil {
 		return m.fail(err)
 	}
-	plan, planErr := m.planCommand(command, m.state.Applied+1, systemSnapshot, userSnapshot)
+	plan, planErr := m.planCommand(
+		command, m.state.Applied+1,
+		pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+	)
 	closeErr := cut.Close()
 	if planErr != nil || closeErr != nil {
 		joined := errors.Join(planErr, closeErr)
@@ -293,7 +303,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 func (m *Machine) hypotheticalState(command replication.CommandView, plan commandPlan) State {
 	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
-	next.LogicalDigest = plan.logicalDigest
+	next.DataChainDigest = plan.dataChainDigest
 	if plan.newCompletion {
 		next.CompletionCount++
 	}
@@ -322,9 +332,10 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 	return State{
 		Binding: m.binding, Applied: meta.Index, LastTerm: meta.Term,
 		LastKind: kind, LastEntryType: meta.Type, LastEntryDigest: digest,
-		LogicalDigest: m.state.LogicalDigest, ConfState: cloneConfState(m.state.ConfState),
-		ReplicaSetVersion: m.state.ReplicaSetVersion,
-		BootstrapDigest:   m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
+		DataChainDigest: m.state.DataChainDigest, ConfState: cloneConfState(m.state.ConfState),
+		ApplyContractDigest: m.applyContract,
+		ReplicaSetVersion:   m.state.ReplicaSetVersion,
+		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		CompletionCount: m.state.CompletionCount,
 	}
 }
@@ -386,9 +397,9 @@ func (m *Machine) captureApplyCutLocked() (durable.DatabaseSnapshot, *durable.Sn
 func (m *Machine) planCommand(
 	command replication.CommandView,
 	applied uint64,
-	systemSnapshot, userSnapshot *durable.Snapshot,
+	systemSnapshot, userSnapshot pointSnapshot,
 ) (commandPlan, error) {
-	plan := commandPlan{command: command, logicalDigest: m.state.LogicalDigest}
+	plan := commandPlan{command: command, dataChainDigest: m.state.DataChainDigest}
 	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
 	plan.key = completionStorageKey(digest)
 	existing, found, err := completionAt(systemSnapshot, plan.key)
@@ -428,12 +439,13 @@ func (m *Machine) planCommand(
 			return commandPlan{}, err
 		}
 		if plan.resultCode == ResultApplied {
-			plan.logicalDigest, err = logicalDigest(
-				m.userName, m.user.Validation, m.user.ValidationDigest, m.user.Validator,
-				userSnapshot, plan.changes,
-			)
-			if err != nil {
-				return commandPlan{}, err
+			if len(plan.changes) != 0 {
+				plan.dataChainDigest, err = dataChainTransitionDigest(
+					m.dataChainHash, m.state.DataChainDigest, m.applyContract, plan.changes,
+				)
+				if err != nil {
+					return commandPlan{}, err
+				}
 			}
 		}
 	}
@@ -446,21 +458,31 @@ func (m *Machine) planCommand(
 
 func (m *Machine) planMutations(
 	command replication.CommandView,
-	snapshot *durable.Snapshot,
+	snapshot pointSnapshot,
 ) ([]finalMutation, uint32, error) {
-	ordered := make([]finalMutation, 0, min(command.MutationCount(), m.user.Limits.MaxDistinctMutations+1))
-	positions := make(map[string]int, min(command.MutationCount(), m.user.Limits.MaxDistinctMutations+1))
+	if cap(m.mutationPlan) == 0 {
+		m.mutationPlan = m.mutationInline[:0]
+	}
+	clear(m.mutationPlan)
+	ordered := m.mutationPlan[:0]
+	defer func() { m.mutationPlan = ordered }()
 	iterator := command.Mutations()
 	for iterator.Next() {
 		mutation := iterator.Mutation()
-		if at, ok := positions[string(mutation.Key)]; ok {
+		at := -1
+		for index := range ordered {
+			if bytes.Equal(ordered[index].key, mutation.Key) {
+				at = index
+				break
+			}
+		}
+		if at >= 0 {
 			ordered[at].delete = mutation.Kind == replication.MutationDelete
-			ordered[at].value = bytes.Clone(mutation.Value)
+			ordered[at].value = mutation.Value
 			continue
 		}
-		positions[string(mutation.Key)] = len(ordered)
 		ordered = append(ordered, finalMutation{
-			key: bytes.Clone(mutation.Key), value: bytes.Clone(mutation.Value),
+			key: mutation.Key, value: mutation.Value,
 			delete: mutation.Kind == replication.MutationDelete,
 		})
 		if len(ordered) > m.user.Limits.MaxDistinctMutations {
@@ -479,7 +501,7 @@ func (m *Machine) planMutations(
 				return nil, ResultInvalidDocument, nil
 			}
 		}
-		current, found, err := snapshot.AppendRaw(nil, mutation.key)
+		current, found, err := snapshot.appendRaw(nil, mutation.key)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -519,7 +541,15 @@ func (m *Machine) planMutations(
 		stagedBytes += len(mutation.value)
 		changes = append(changes, mutation)
 	}
+	slices.SortFunc(changes, func(left, right finalMutation) int {
+		return bytes.Compare(left.key, right.key)
+	})
 	return changes, ResultApplied, nil
+}
+
+func (m *Machine) releaseMutationPlan() {
+	clear(m.mutationPlan)
+	m.mutationPlan = m.mutationPlan[:0]
 }
 
 func (m *Machine) makeCompletionDocument(
@@ -560,8 +590,19 @@ func (m *Machine) makeCompletionDocument(
 	return wrapJSONHex(nil, record), nil
 }
 
-func completionAt(snapshot *durable.Snapshot, key [33]byte) (CompletionRecord, bool, error) {
-	document, found, err := snapshot.AppendRaw(nil, key[:])
+// pointSnapshot is the planning capability: its API deliberately has no range
+// operation. Keeping the wrapper concrete also lets point reads inline without
+// interface escape allocations on every command key.
+type pointSnapshot struct {
+	value *durable.Snapshot
+}
+
+func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
+	return s.value.AppendRaw(dst, key)
+}
+
+func completionAt(snapshot pointSnapshot, key [33]byte) (CompletionRecord, bool, error) {
+	document, found, err := snapshot.appendRaw(nil, key[:])
 	if err != nil || !found {
 		return CompletionRecord{}, found, err
 	}
@@ -579,6 +620,7 @@ func (m *Machine) persistTransition(
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
+	defer m.releaseCaptureChanges()
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
@@ -682,6 +724,7 @@ func (m *Machine) checkTransitionCapacity(
 	completionKey [33]byte,
 	completionDocument []byte,
 ) error {
+	defer m.releaseCaptureChanges()
 	captureBytes := 0
 	if m.shouldCaptureTransition(next) {
 		transition := m.capturedTransition(next, changes)

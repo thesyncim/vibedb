@@ -29,7 +29,7 @@ func TestInitialTailCursorRequiresCompleteExactArtifactSet(t *testing.T) {
 		cut.Applied != set.Partition.SourceApplied ||
 		cut.Term != set.Partition.SourceTerm ||
 		cut.RouteGeneration != set.Partition.RouteGeneration ||
-		cut.LogicalDigest != set.Partition.SourceDigest ||
+		cut.DataChainDigest != set.Partition.SourceDigest ||
 		cut.BaseDigest != set.Partition.SourceBase ||
 		cut.EntryDigest != set.Partition.SourceEntry {
 		t.Fatalf("cursor cut = %+v set = %+v", cut, set.Partition)
@@ -107,7 +107,7 @@ func TestTranslateTailEntryRoutesInsertDeleteUpdateAndMove(t *testing.T) {
 	if cut.Applied != entry.Applied || cut.Term != entry.Term ||
 		cut.RouteGeneration != entry.AfterRouteGeneration ||
 		cut.EntryDigest != entry.EntryDigest ||
-		cut.LogicalDigest != entry.AfterLogicalDigest ||
+		cut.DataChainDigest != entry.AfterDataChainDigest ||
 		cut.BaseDigest != cursor.SourceCut().BaseDigest {
 		t.Fatalf("next cut = %+v entry=%+v", cut, entry)
 	}
@@ -116,7 +116,7 @@ func TestTranslateTailEntryRoutesInsertDeleteUpdateAndMove(t *testing.T) {
 func TestTranslateTailEntryAdvancesEveryChildThroughEmptyEntry(t *testing.T) {
 	partitioner, cursor, _ := testTailCursor(t)
 	entry := nextTailEntry(cursor, nil, 10)
-	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterDataChainDigest = entry.BeforeDataChainDigest
 	seen := [2]int{}
 	sinks := []TailSink{
 		func(batch TailBatch) error {
@@ -148,7 +148,7 @@ func TestTranslateTailEntryAdvancesEveryChildThroughEmptyEntry(t *testing.T) {
 func TestTranslateTailEntrySealsOnExactOwnershipFence(t *testing.T) {
 	partitioner, cursor, _ := testTailCursor(t)
 	entry := nextTailEntry(cursor, nil, 17)
-	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterDataChainDigest = entry.BeforeDataChainDigest
 	entry.AfterOwnershipEpoch++
 	entry.AfterRoutingVersion++
 	entry.AfterRouteGeneration++
@@ -184,7 +184,7 @@ func TestTranslateTailEntrySealsOnExactOwnershipFence(t *testing.T) {
 func TestTranslateTailEntryAdvancesThreeChildrenWithMiddleRetained(t *testing.T) {
 	partitioner, cursor := testTernaryTailCursor(t)
 	entry := nextTailEntry(cursor, nil, 15)
-	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterDataChainDigest = entry.BeforeDataChainDigest
 	seen := [autosplit.MaxSplitChildren]int{}
 	sinks := make([]TailSink, autosplit.MaxSplitChildren)
 	for child := range sinks {
@@ -235,7 +235,7 @@ func TestTranslateTailEntryFailsClosedAndLeavesCursorRetryable(t *testing.T) {
 		{"term-regression", func(entry *TailEntry) { entry.Term = cursor.SourceCut().Term - 1 }},
 		{"route-change", func(entry *TailEntry) { entry.AfterRouteGeneration++ }},
 		{"previous-entry", func(entry *TailEntry) { entry.PreviousEntryDigest[0] ^= 1 }},
-		{"logical-prefix", func(entry *TailEntry) { entry.BeforeLogicalDigest[0] ^= 1 }},
+		{"data-chain-prefix", func(entry *TailEntry) { entry.BeforeDataChainDigest[0] ^= 1 }},
 		{"nil-transition", func(entry *TailEntry) {
 			entry.Transitions = []TailTransition{{Key: []byte("a")}}
 		}},
@@ -438,8 +438,8 @@ func nextTailEntry(cursor TailCursor, transitions []TailTransition, marker byte)
 		AfterRouteGeneration:  cursor.routeGeneration,
 		PreviousEntryDigest:   cut.EntryDigest,
 		EntryDigest:           [32]byte{marker},
-		BeforeLogicalDigest:   cut.LogicalDigest,
-		AfterLogicalDigest:    [32]byte{marker, 1},
+		BeforeDataChainDigest: cut.DataChainDigest,
+		AfterDataChainDigest:  [32]byte{marker, 1},
 		Transitions:           transitions,
 	}
 }

@@ -256,7 +256,7 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 		}
 		if next.phase == ChildStageArtifact {
 			return next.applied == current.applied && next.term == current.term &&
-				next.logicalDigest == current.logicalDigest &&
+				next.dataChainDigest == current.dataChainDigest &&
 				next.entryDigest == current.entryDigest &&
 				next.artifactChunks > current.artifactChunks &&
 				next.artifactRows >= current.artifactRows &&
@@ -264,7 +264,7 @@ func validChildStageCursorAdvance(current, next ChildStageCursor) bool {
 				next.artifactOffset > current.artifactOffset
 		}
 		return next.phase == ChildStageTail && next.applied == current.applied &&
-			next.term == current.term && next.logicalDigest == current.logicalDigest &&
+			next.term == current.term && next.dataChainDigest == current.dataChainDigest &&
 			next.entryDigest == current.entryDigest &&
 			next.lastBatchDigest == ([32]byte{}) &&
 			next.artifactChunks >= current.artifactChunks &&

@@ -63,6 +63,19 @@ func TestSnapshotBaseCertificateDeterministicStrictAndBounded(t *testing.T) {
 	if _, err := BuildSnapshotBase(manifest, wrongBootstrap); !errors.Is(err, ErrSnapshotBase) {
 		t.Fatalf("wrong bootstrap error = %v", err)
 	}
+	for name, mutate := range map[string]func(*SnapshotArtifactManifest){
+		"encoded bytes": func(manifest *SnapshotArtifactManifest) { manifest.EncodedBytes++ },
+		"image digest":  func(manifest *SnapshotArtifactManifest) { manifest.ImageDigest[0] ^= 1 },
+		"footer digest": func(manifest *SnapshotArtifactManifest) { manifest.Digest[0] ^= 1 },
+	} {
+		t.Run("impossible "+name, func(t *testing.T) {
+			invalid := cloneSnapshotArtifactManifest(manifest)
+			mutate(&invalid)
+			if _, err := BuildSnapshotBase(invalid, source.bootstrap); !errors.Is(err, ErrSnapshotBase) {
+				t.Fatalf("BuildSnapshotBase error = %v", err)
+			}
+		})
+	}
 }
 
 func TestCertifiedLearnerBaseCatchesUpOnlyThroughAppendEntries(t *testing.T) {
@@ -167,7 +180,7 @@ func TestCertifiedLearnerBaseCatchesUpOnlyThroughAppendEntries(t *testing.T) {
 	}
 	driveReplicatedStateNode(t, node)
 	publication := candidate.Published()
-	if publication.Applied != tailIndex || publication.LogicalDigest == manifest.State.LogicalDigest {
+	if publication.Applied != tailIndex || publication.DataChainDigest == manifest.State.DataChainDigest {
 		t.Fatalf("learner publication = %+v, base=%+v", publication, manifest.State)
 	}
 	last, err := wal.LastIndex()

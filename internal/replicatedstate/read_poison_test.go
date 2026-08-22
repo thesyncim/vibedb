@@ -80,21 +80,34 @@ func TestSnapshotIntegrityFailurePoisonsMachine(t *testing.T) {
 	}
 }
 
-func TestSnapshotDirectUserDivergencePoisonsMachine(t *testing.T) {
+func TestExplicitImageAuditDetectsDirectUserDivergence(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
+	}
+	before, err := fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeDigest, auditErr := before.CanonicalImageDigest()
+	closeErr := before.Close()
+	if auditErr != nil || closeErr != nil {
+		t.Fatalf("initial audit = %v, close = %v", auditErr, closeErr)
 	}
 	if err := fixture.user.Collection.Update(func(batch *durable.WriteBatch) error {
 		return batch.Put([]byte("outside"), []byte("null"))
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.Snapshot("docs"); !errors.Is(err, ErrInconsistentSnapshot) {
-		t.Fatalf("Snapshot error = %v", err)
+	after, err := fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); !errors.Is(err, ErrApplyPoisoned) {
-		t.Fatalf("post-Snapshot apply error = %v", err)
+	afterDigest, auditErr := after.CanonicalImageDigest()
+	closeErr = after.Close()
+	if auditErr != nil || closeErr != nil || afterDigest == beforeDigest {
+		t.Fatalf("changed audit = %x/%x, err = %v, close = %v",
+			beforeDigest, afterDigest, auditErr, closeErr)
 	}
 }
 

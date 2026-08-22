@@ -51,8 +51,8 @@ type TailEntry struct {
 	AfterRouteGeneration  uint64
 	PreviousEntryDigest   [sha256.Size]byte
 	EntryDigest           [sha256.Size]byte
-	BeforeLogicalDigest   [sha256.Size]byte
-	AfterLogicalDigest    [sha256.Size]byte
+	BeforeDataChainDigest [sha256.Size]byte
+	AfterDataChainDigest  [sha256.Size]byte
 	Transitions           []TailTransition
 }
 
@@ -70,7 +70,7 @@ type TailSourceCoordinates struct {
 type TailCursor struct {
 	planDigest       [sha256.Size]byte
 	placementDigest  [sha256.Size]byte
-	logicalDigest    [sha256.Size]byte
+	dataChainDigest  [sha256.Size]byte
 	baseDigest       [sha256.Size]byte
 	entryDigest      [sha256.Size]byte
 	childBaseDigests [autosplit.MaxSplitChildren][sha256.Size]byte
@@ -85,7 +85,7 @@ type TailCursor struct {
 // SourceCut returns the exact source publication represented by c.
 func (c TailCursor) SourceCut() ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{
-		LogicalDigest: c.logicalDigest, BaseDigest: c.baseDigest,
+		DataChainDigest: c.dataChainDigest, BaseDigest: c.baseDigest,
 		EntryDigest: c.entryDigest, Applied: c.applied, Term: c.term,
 		RouteGeneration: c.routeGeneration,
 	}
@@ -141,8 +141,8 @@ type TailBatch struct {
 	Digest                [sha256.Size]byte
 	PreviousEntryDigest   [sha256.Size]byte
 	EntryDigest           [sha256.Size]byte
-	BeforeLogicalDigest   [sha256.Size]byte
-	AfterLogicalDigest    [sha256.Size]byte
+	BeforeDataChainDigest [sha256.Size]byte
+	AfterDataChainDigest  [sha256.Size]byte
 	SourceBaseDigest      [sha256.Size]byte
 	ChildBaseDigest       [sha256.Size]byte
 	Applied               uint64
@@ -260,10 +260,10 @@ func (p *Partitioner) InitialTailCursor(set ChildArtifactSet) (TailCursor, error
 	}
 	placement := p.program.Digest()
 	cut := ChildArtifactSourceCut{
-		LogicalDigest: set.Partition.SourceDigest,
-		BaseDigest:    set.Partition.SourceBase,
-		EntryDigest:   set.Partition.SourceEntry,
-		Applied:       set.Partition.SourceApplied, Term: set.Partition.SourceTerm,
+		DataChainDigest: set.Partition.SourceDigest,
+		BaseDigest:      set.Partition.SourceBase,
+		EntryDigest:     set.Partition.SourceEntry,
+		Applied:         set.Partition.SourceApplied, Term: set.Partition.SourceTerm,
 		RouteGeneration: set.Partition.RouteGeneration,
 	}
 	var childBases [autosplit.MaxSplitChildren][sha256.Size]byte
@@ -296,7 +296,7 @@ func (p *Partitioner) InitialTailCursor(set ChildArtifactSet) (TailCursor, error
 	}
 	return TailCursor{
 		planDigest: p.digest, placementDigest: placement,
-		logicalDigest: cut.LogicalDigest, baseDigest: cut.BaseDigest,
+		dataChainDigest: cut.DataChainDigest, baseDigest: cut.BaseDigest,
 		entryDigest: cut.EntryDigest, applied: cut.Applied, term: cut.Term,
 		ownershipEpoch:  uint64(p.source.OwnershipEpoch),
 		routingVersion:  uint64(p.source.RoutingVersion),
@@ -388,16 +388,16 @@ func (p *Partitioner) TranslateTailEntry(
 	for child := 0; child < int(p.childCount); child++ {
 		batch := TailBatch{
 			Child: uint8(child), PlanDigest: p.digest,
-			PlacementDigest:     p.program.Digest(),
-			TranslationDigest:   stats.TranslationDigest,
-			Digest:              stats.ChildDigests[child],
-			PreviousEntryDigest: entry.PreviousEntryDigest,
-			EntryDigest:         entry.EntryDigest,
-			BeforeLogicalDigest: entry.BeforeLogicalDigest,
-			AfterLogicalDigest:  entry.AfterLogicalDigest,
-			SourceBaseDigest:    cursor.baseDigest,
-			ChildBaseDigest:     cursor.childBaseDigests[child],
-			Applied:             entry.Applied, Term: entry.Term,
+			PlacementDigest:       p.program.Digest(),
+			TranslationDigest:     stats.TranslationDigest,
+			Digest:                stats.ChildDigests[child],
+			PreviousEntryDigest:   entry.PreviousEntryDigest,
+			EntryDigest:           entry.EntryDigest,
+			BeforeDataChainDigest: entry.BeforeDataChainDigest,
+			AfterDataChainDigest:  entry.AfterDataChainDigest,
+			SourceBaseDigest:      cursor.baseDigest,
+			ChildBaseDigest:       cursor.childBaseDigests[child],
+			Applied:               entry.Applied, Term: entry.Term,
 			BeforeOwnershipEpoch:  entry.BeforeOwnershipEpoch,
 			AfterOwnershipEpoch:   entry.AfterOwnershipEpoch,
 			BeforeRoutingVersion:  entry.BeforeRoutingVersion,
@@ -413,7 +413,7 @@ func (p *Partitioner) TranslateTailEntry(
 		}
 	}
 	next := cursor
-	next.logicalDigest = entry.AfterLogicalDigest
+	next.dataChainDigest = entry.AfterDataChainDigest
 	next.entryDigest = entry.EntryDigest
 	next.applied = entry.Applied
 	next.term = entry.Term
@@ -440,8 +440,8 @@ func (p *Partitioner) VerifyTailBatch(
 		batch.ChildBaseDigest == ([sha256.Size]byte{}) ||
 		batch.PreviousEntryDigest == ([sha256.Size]byte{}) ||
 		batch.EntryDigest == ([sha256.Size]byte{}) ||
-		batch.BeforeLogicalDigest == ([sha256.Size]byte{}) ||
-		batch.AfterLogicalDigest == ([sha256.Size]byte{}) ||
+		batch.BeforeDataChainDigest == ([sha256.Size]byte{}) ||
+		batch.AfterDataChainDigest == ([sha256.Size]byte{}) ||
 		batch.Applied == 0 || batch.Applied == math.MaxUint64 ||
 		batch.Term == 0 || batch.Term == math.MaxUint64 ||
 		!validTailBatchCoordinates(batch) ||
@@ -459,7 +459,7 @@ func (p *Partitioner) VerifyTailBatch(
 		batch.Applied, batch.Term, batch.TransitionCount,
 		batch.beforeCoordinates(), batch.afterCoordinates(),
 		batch.PreviousEntryDigest, batch.EntryDigest,
-		batch.BeforeLogicalDigest, batch.AfterLogicalDigest, batch.SourceBaseDigest,
+		batch.BeforeDataChainDigest, batch.AfterDataChainDigest, batch.SourceBaseDigest,
 	)
 	_, _ = h.Write(tailChildDomain)
 	_, _ = h.Write(fixed)
@@ -516,7 +516,7 @@ func (p *Partitioner) VerifyTailBatch(
 
 func (p *Partitioner) validTailCursor(cursor TailCursor) bool {
 	if cursor.planDigest != p.digest || cursor.placementDigest != p.program.Digest() ||
-		cursor.logicalDigest == ([sha256.Size]byte{}) ||
+		cursor.dataChainDigest == ([sha256.Size]byte{}) ||
 		cursor.baseDigest == ([sha256.Size]byte{}) ||
 		cursor.entryDigest == ([sha256.Size]byte{}) || cursor.applied == 0 ||
 		cursor.term == 0 || cursor.ownershipEpoch == 0 ||
@@ -538,8 +538,8 @@ func (p *Partitioner) validTailEntry(cursor TailCursor, entry TailEntry) bool {
 		entry.Term == 0 || entry.Term == math.MaxUint64 ||
 		entry.PreviousEntryDigest != cursor.entryDigest ||
 		entry.EntryDigest == ([sha256.Size]byte{}) ||
-		entry.BeforeLogicalDigest != cursor.logicalDigest ||
-		entry.AfterLogicalDigest == ([sha256.Size]byte{}) {
+		entry.BeforeDataChainDigest != cursor.dataChainDigest ||
+		entry.AfterDataChainDigest == ([sha256.Size]byte{}) {
 		return false
 	}
 	before, after := entry.beforeCoordinates(), entry.afterCoordinates()
@@ -551,7 +551,7 @@ func (p *Partitioner) validTailEntry(cursor TailCursor, entry TailEntry) bool {
 	}
 	retained := p.children[p.retained]
 	return len(entry.Transitions) == 0 &&
-		entry.AfterLogicalDigest == entry.BeforeLogicalDigest &&
+		entry.AfterDataChainDigest == entry.BeforeDataChainDigest &&
 		before.incremented() == after &&
 		after.OwnershipEpoch == uint64(retained.OwnershipEpoch) &&
 		after.RoutingVersion == uint64(p.target)
@@ -612,7 +612,7 @@ func validTailBatchCoordinates(batch TailBatch) bool {
 	return before.OwnershipEpoch != 0 && before.RoutingVersion != 0 &&
 		before.RouteGeneration != 0 &&
 		(after == before || before.incremented() == after && batch.TransitionCount == 0 &&
-			batch.AfterLogicalDigest == batch.BeforeLogicalDigest)
+			batch.AfterDataChainDigest == batch.BeforeDataChainDigest)
 }
 
 func validTailTransition(transition *TailTransition, previousKey []byte) bool {
@@ -683,7 +683,7 @@ func (w *TailWorkspace) prepareTailHashes(
 		entry.Applied, entry.Term, uint64(len(entry.Transitions)),
 		entry.beforeCoordinates(), entry.afterCoordinates(),
 		entry.PreviousEntryDigest, entry.EntryDigest,
-		entry.BeforeLogicalDigest, entry.AfterLogicalDigest, cursor.baseDigest,
+		entry.BeforeDataChainDigest, entry.AfterDataChainDigest, cursor.baseDigest,
 	)
 	overall := w.hashers[0]
 	_, _ = overall.Write(tailTranslationDomain)

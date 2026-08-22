@@ -63,12 +63,7 @@ func InitializeStagedSnapshot(
 		_ = cutSnapshot.Close()
 		return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
 	}
-	if err := validateExistingRows(userSnapshot, prepared.user); err != nil {
-		_ = cutSnapshot.Close()
-		return nil, nil, SnapshotArtifactManifest{},
-			fmt.Errorf("%w: staged user image: %v", ErrStagedSnapshot, err)
-	}
-	logical, err := logicalDigest(
+	imageDigest, err := canonicalImageDigest(
 		prepared.userName, prepared.user.Validation, prepared.user.ValidationDigest,
 		prepared.user.Validator, userSnapshot, nil,
 	)
@@ -76,12 +71,18 @@ func InitializeStagedSnapshot(
 		_ = cutSnapshot.Close()
 		return nil, nil, SnapshotArtifactManifest{}, err
 	}
+	dataChainDigest, err := dataChainSeedDigest(prepared.applyContract, imageDigest)
+	if err != nil {
+		_ = cutSnapshot.Close()
+		return nil, nil, SnapshotArtifactManifest{}, err
+	}
 	state := State{
 		Binding: prepared.binding, Applied: cut.Applied, LastTerm: cut.Term,
 		LastKind: RecordImportedSnapshot, LastEntryType: pb.EntryNormal,
-		LastEntryDigest: cut.EntryDigest, LogicalDigest: logical,
-		ConfState:         cloneConfState(bootstrap.GetMetadata().GetConfState()),
-		ReplicaSetVersion: 1, BootstrapDigest: prepared.bootstrapDigest,
+		LastEntryDigest: cut.EntryDigest, DataChainDigest: dataChainDigest,
+		ApplyContractDigest: prepared.applyContract,
+		ConfState:           cloneConfState(bootstrap.GetMetadata().GetConfState()),
+		ReplicaSetVersion:   1, BootstrapDigest: prepared.bootstrapDigest,
 		SnapshotBaseDigest: prepared.bootstrapDigest,
 	}
 	if err := validateState(state); err != nil {

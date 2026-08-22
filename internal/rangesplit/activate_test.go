@@ -223,7 +223,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	retryMachine, retryBase, retryManifest, err := stage.InitializeReplicatedChild(certificate, target)
-	if err != nil || retryMachine.Published().LogicalDigest != machine.Published().LogicalDigest ||
+	if err != nil || retryMachine.Published().DataChainDigest != machine.Published().DataChainDigest ||
 		retryManifest.Digest != manifest.Digest || !proto.Equal(base, retryBase) {
 		t.Fatalf("retry manifest=%x baseEqual=%v err=%v", retryManifest.Digest, proto.Equal(base, retryBase), err)
 	}

@@ -245,14 +245,40 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
-	t.Run("logical image", func(t *testing.T) {
+	t.Run("apply contract", func(t *testing.T) {
 		fixture := newMachineFixture(t)
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixture.user.Collection.Update(func(batch *durable.WriteBatch) error {
-			return batch.Put([]byte("outside"), []byte("null"))
-		}); err != nil {
+		state := cloneState(fixture.machine.state)
+		state.ApplyContractDigest[0] ^= 1
+		putStateDocument(t, fixture.system.Collection, state, nil, nil)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("static data-chain seed", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		state := cloneState(fixture.machine.state)
+		state.DataChainDigest[0] ^= 1
+		putStateDocument(t, fixture.system.Collection, state, nil, nil)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("static user image", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.user.Collection.Put([]byte("direct"), []byte(`{"n":1}`)); err != nil {
 			t.Fatal(err)
 		}
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,

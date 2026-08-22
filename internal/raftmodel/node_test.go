@@ -284,7 +284,7 @@ func TestRecoveryReconcilesDurableSnapshotBeforeRawNode(t *testing.T) {
 		t.Fatalf("snapshot installs = %d, want 1", machine.snapshotCalls)
 	}
 	publication := machine.Published()
-	if publication.Applied != index || publication.LogicalDigest != sha256.Sum256(snapshot.GetData()) {
+	if publication.Applied != index || publication.DataChainDigest != sha256.Sum256(snapshot.GetData()) {
 		t.Fatalf("reconciled publication = %+v", publication)
 	}
 	if got := restarted.Published(); !equalPublication(got, publication) {
@@ -690,7 +690,7 @@ func TestNoopAndBothConfigurationEntryFormsPublishInOrder(t *testing.T) {
 	if len(machine.calls) != 1 || machine.calls[0].meta.Type != pb.EntryNormal || len(machine.calls[0].data) != 0 {
 		t.Fatalf("campaign apply calls = %+v, want one no-op", machine.calls)
 	}
-	initialDigest := machine.Published().LogicalDigest
+	initialDigest := machine.Published().DataChainDigest
 
 	v1 := &pb.ConfChange{
 		Type:   pb.ConfChangeAddLearnerNode.Enum(),
@@ -724,8 +724,8 @@ func TestNoopAndBothConfigurationEntryFormsPublishInOrder(t *testing.T) {
 	if publication.ReplicaSetVersion != machine.calls[2].meta.Index {
 		t.Fatalf("ReplicaSetVersion = %d, want %d", publication.ReplicaSetVersion, machine.calls[2].meta.Index)
 	}
-	if publication.LogicalDigest != initialDigest {
-		t.Fatal("configuration entries changed logical digest")
+	if publication.DataChainDigest != initialDigest {
+		t.Fatal("configuration entries changed data-chain digest")
 	}
 	if !slices.Contains(publication.ConfState.Learners, 2) || !slices.Contains(publication.ConfState.Learners, 3) {
 		t.Fatalf("published learners = %v, want 2 and 3", publication.ConfState.Learners)
@@ -1394,10 +1394,10 @@ func (m *fakeStateMachine) ApplyNormal(meta ApplyMeta, data []byte) (Publication
 	m.calls = append(m.calls, applyCall{meta: meta, data: slices.Clone(data)})
 	m.pub.Applied = meta.Index
 	if len(data) != 0 {
-		payload := make([]byte, 0, len(m.pub.LogicalDigest)+len(data))
-		payload = append(payload, m.pub.LogicalDigest[:]...)
+		payload := make([]byte, 0, len(m.pub.DataChainDigest)+len(data))
+		payload = append(payload, m.pub.DataChainDigest[:]...)
 		payload = append(payload, data...)
-		m.pub.LogicalDigest = sha256.Sum256(payload)
+		m.pub.DataChainDigest = sha256.Sum256(payload)
 	}
 	return m.Published(), nil
 }
@@ -1445,7 +1445,7 @@ func (m *fakeStateMachine) InstallSnapshot(snapshot *pb.Snapshot) (Publication, 
 	m.snapshotReplicaSetVersion = expectedVersion
 	m.snapshotConfState = cloneConfState(metadata.GetConfState())
 	m.pub.Applied = index
-	m.pub.LogicalDigest = sha256.Sum256(snapshot.GetData())
+	m.pub.DataChainDigest = sha256.Sum256(snapshot.GetData())
 	m.pub.ConfState = cloneConfState(metadata.GetConfState())
 	m.pub.ReplicaSetVersion = expectedVersion
 	if m.snapshotBadVersionAfterPublish != nil {
@@ -1480,7 +1480,7 @@ func newTestNode(t *testing.T, incarnation uint64, voters []uint64) (*Node, *fak
 	}
 	machine := &fakeStateMachine{pub: Publication{
 		Applied:           index,
-		LogicalDigest:     sha256.Sum256(snapshot.GetData()),
+		DataChainDigest:   sha256.Sum256(snapshot.GetData()),
 		ConfState:         cloneConfState(confState),
 		ReplicaSetVersion: index,
 	}, snapshotIndex: index, snapshotTerm: term,

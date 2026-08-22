@@ -293,7 +293,7 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 	defer restarted.Close()
 	after, err := restarted.Publication()
 	if err != nil || after.Applied != before.Applied ||
-		after.LogicalDigest != before.LogicalDigest ||
+		after.DataChainDigest != before.DataChainDigest ||
 		after.ReplicaSetVersion != before.ReplicaSetVersion ||
 		after.ConfState.Equivalent(before.ConfState) != nil {
 		t.Fatalf("restarted publication = %+v, %v; before %+v", after, err, before)

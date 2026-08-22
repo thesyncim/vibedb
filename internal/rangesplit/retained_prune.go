@@ -77,7 +77,7 @@ func (i *RetainedPruneKeyIterator) Key() []byte {
 
 // RetainedPruner plans bounded replicated deletes and confirms their exact
 // atomically captured transitions. It never mutates the user collection
-// directly, so every intermediate source logical digest remains reopen-safe.
+// directly, so every intermediate source data-chain digest remains reopen-safe.
 type RetainedPruner struct {
 	mu sync.Mutex
 
@@ -125,7 +125,7 @@ func NewRetainedPruner(
 			routingVersion:  coordinates.RoutingVersion,
 			routeGeneration: coordinates.RouteGeneration,
 			plan:            certificate.plan, placement: certificate.placement,
-			cutover: certificate.digest, logical: cut.LogicalDigest,
+			cutover: certificate.digest, dataChain: cut.DataChainDigest,
 			base: cut.BaseDigest, entry: cut.EntryDigest,
 		}
 		return pruner, nil
@@ -374,7 +374,7 @@ func (p *RetainedPruner) confirmPending(
 ) error {
 	tail := TailCursor{
 		planDigest: p.cursor.plan, placementDigest: p.cursor.placement,
-		logicalDigest: p.cursor.logical, baseDigest: p.cursor.base,
+		dataChainDigest: p.cursor.dataChain, baseDigest: p.cursor.base,
 		entryDigest: p.cursor.entry, applied: p.cursor.applied, term: p.cursor.term,
 		ownershipEpoch: p.cursor.ownershipEpoch, routingVersion: p.cursor.routingVersion,
 		routeGeneration: p.cursor.routeGeneration, sealed: true,
@@ -406,7 +406,7 @@ func (p *RetainedPruner) confirmPending(
 	next := p.cursor
 	next.phase = RetainedPruneScan
 	next.applied, next.term = entry.Applied, entry.Term
-	next.logical, next.entry = entry.AfterLogicalDigest, entry.EntryDigest
+	next.dataChain, next.entry = entry.AfterDataChainDigest, entry.EntryDigest
 	next.scanAfter = p.cursor.resumeAfter
 	next.resumeAfter = nil
 	next.pending = [sha256.Size]byte{}
@@ -539,7 +539,7 @@ func fenceMatchesRetainedCursor(
 	cursor *RetainedPruneCursor,
 ) bool {
 	return cursor != nil && fence.Applied == cursor.applied && fence.LastTerm == cursor.term &&
-		fence.LogicalDigest == cursor.logical && fence.SnapshotBaseDigest == cursor.base &&
+		fence.DataChainDigest == cursor.dataChain && fence.SnapshotBaseDigest == cursor.base &&
 		fence.LastEntryDigest == cursor.entry &&
 		fence.Binding.OwnershipEpoch == cursor.ownershipEpoch &&
 		fence.Binding.RoutingVersion == cursor.routingVersion &&
@@ -558,7 +558,7 @@ func captureMatchesRetainedCursor(capture *SourceCapture, cursor *RetainedPruneC
 			applied: cursor.applied, term: cursor.term,
 			ownershipEpoch: cursor.ownershipEpoch, routingVersion: cursor.routingVersion,
 			routeGeneration: cursor.routeGeneration,
-			entryDigest:     cursor.entry, logicalDigest: cursor.logical,
+			entryDigest:     cursor.entry, dataChainDigest: cursor.dataChain,
 		}
 }
 

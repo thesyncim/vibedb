@@ -39,7 +39,7 @@ type sourceCapturePublication struct {
 	routingVersion  uint64
 	routeGeneration uint64
 	entryDigest     [sha256.Size]byte
-	logicalDigest   [sha256.Size]byte
+	dataChainDigest [sha256.Size]byte
 }
 
 // SourceCapture stores every exact before-and-after source transition in one
@@ -254,7 +254,7 @@ func (c *SourceCapture) NextTailEntry(
 	record, err := c.decodeEntry(raw, workspace)
 	if err != nil || record.Applied != next ||
 		record.PreviousEntryDigest != cursor.entryDigest ||
-		record.BeforeLogicalDigest != cursor.logicalDigest ||
+		record.BeforeDataChainDigest != cursor.dataChainDigest ||
 		record.BeforeOwnershipEpoch != cursor.ownershipEpoch ||
 		record.BeforeRoutingVersion != cursor.routingVersion ||
 		record.BeforeRouteGeneration != cursor.routeGeneration {
@@ -270,8 +270,8 @@ func (c *SourceCapture) NextTailEntry(
 		AfterRouteGeneration:  record.AfterRouteGeneration,
 		PreviousEntryDigest:   record.PreviousEntryDigest,
 		EntryDigest:           record.EntryDigest,
-		BeforeLogicalDigest:   record.BeforeLogicalDigest,
-		AfterLogicalDigest:    record.AfterLogicalDigest,
+		BeforeDataChainDigest: record.BeforeDataChainDigest,
+		AfterDataChainDigest:  record.AfterDataChainDigest,
 		Transitions:           record.Transitions,
 	}
 	return entry, true, nil
@@ -288,8 +288,8 @@ type sourceCaptureEntry struct {
 	AfterRouteGeneration  uint64
 	PreviousEntryDigest   [sha256.Size]byte
 	EntryDigest           [sha256.Size]byte
-	BeforeLogicalDigest   [sha256.Size]byte
-	AfterLogicalDigest    [sha256.Size]byte
+	BeforeDataChainDigest [sha256.Size]byte
+	AfterDataChainDigest  [sha256.Size]byte
 	Transitions           []TailTransition
 	Digest                [sha256.Size]byte
 }
@@ -300,11 +300,11 @@ func (c *SourceCapture) appendHeader(
 	workspace *SourceCaptureWorkspace,
 ) ([]byte, ChildArtifactSourceCut, error) {
 	cut := ChildArtifactSourceCut{
-		LogicalDigest: state.LogicalDigest, BaseDigest: state.SnapshotBaseDigest,
+		DataChainDigest: state.DataChainDigest, BaseDigest: state.SnapshotBaseDigest,
 		EntryDigest: state.LastEntryDigest, Applied: state.Applied,
 		Term: state.LastTerm, RouteGeneration: state.Binding.RouteGeneration,
 	}
-	if cut.Applied == 0 || cut.Term == 0 || cut.LogicalDigest == ([32]byte{}) ||
+	if cut.Applied == 0 || cut.Term == 0 || cut.DataChainDigest == ([32]byte{}) ||
 		cut.BaseDigest == ([32]byte{}) || cut.EntryDigest == ([32]byte{}) {
 		return dst, ChildArtifactSourceCut{}, ErrSourceCapture
 	}
@@ -317,7 +317,7 @@ func (c *SourceCapture) appendHeader(
 	dst = appendBase64String(dst, c.placement[:])
 	dst = append(dst, ',')
 	dst = appendBase64String(dst, []byte(c.partitioner.collection))
-	for _, value := range [][32]byte{state.LogicalDigest, state.SnapshotBaseDigest, state.LastEntryDigest} {
+	for _, value := range [][32]byte{state.DataChainDigest, state.SnapshotBaseDigest, state.LastEntryDigest} {
 		dst = append(dst, ',')
 		dst = appendBase64String(dst, value[:])
 	}
@@ -356,7 +356,7 @@ func (c *SourceCapture) appendEntry(
 	}
 	for _, value := range [][32]byte{
 		transition.PreviousEntryDigest, transition.EntryDigest,
-		transition.BeforeLogicalDigest, transition.AfterLogicalDigest,
+		transition.BeforeDataChainDigest, transition.AfterDataChainDigest,
 	} {
 		dst = append(dst, ',')
 		dst = appendBase64String(dst, value[:])
@@ -410,7 +410,7 @@ func (c *SourceCapture) recover(
 		record, err := c.decodeEntry(value, workspace)
 		if err != nil || record.Applied != applied ||
 			record.PreviousEntryDigest != publication.entryDigest ||
-			record.BeforeLogicalDigest != publication.logicalDigest ||
+			record.BeforeDataChainDigest != publication.dataChainDigest ||
 			record.BeforeOwnershipEpoch != publication.ownershipEpoch ||
 			record.BeforeRoutingVersion != publication.routingVersion ||
 			record.BeforeRouteGeneration != publication.routeGeneration {
@@ -438,10 +438,10 @@ func (c *SourceCapture) decodeHeader(
 	if !ok || count != sourceCaptureHeaderFields || nodeUint(root, 0) != sourceCaptureHeaderKind {
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
-	var plan, placement, logical, base, entry, digest [32]byte
+	var plan, placement, dataChain, base, entry, digest [32]byte
 	if !decodeNodeDigest(root, 1, &plan) || !decodeNodeDigest(root, 2, &placement) ||
 		plan != c.partitioner.digest || placement != c.placement ||
-		!decodeNodeDigest(root, 4, &logical) || !decodeNodeDigest(root, 5, &base) ||
+		!decodeNodeDigest(root, 4, &dataChain) || !decodeNodeDigest(root, 5, &base) ||
 		!decodeNodeDigest(root, 6, &entry) || nodeUint(root, 12) != uint64(c.partitioner.target) ||
 		!decodeNodeDigest(root, 13, &digest) {
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
@@ -457,11 +457,11 @@ func (c *SourceCapture) decodeHeader(
 	publication := sourceCapturePublication{
 		applied: nodeUint(root, 7), term: nodeUint(root, 8),
 		ownershipEpoch: nodeUint(root, 9), routingVersion: nodeUint(root, 10),
-		routeGeneration: nodeUint(root, 11), entryDigest: entry, logicalDigest: logical,
+		routeGeneration: nodeUint(root, 11), entryDigest: entry, dataChainDigest: dataChain,
 	}
 	state := replicatedstate.State{
 		Applied: publication.applied, LastTerm: publication.term,
-		LastEntryDigest: entry, LogicalDigest: logical, SnapshotBaseDigest: base,
+		LastEntryDigest: entry, DataChainDigest: dataChain, SnapshotBaseDigest: base,
 		Binding: replicatedstate.Binding{
 			OwnershipEpoch:  publication.ownershipEpoch,
 			RoutingVersion:  publication.routingVersion,
@@ -472,7 +472,7 @@ func (c *SourceCapture) decodeHeader(
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
 	cut := ChildArtifactSourceCut{
-		LogicalDigest: logical, BaseDigest: base, EntryDigest: entry,
+		DataChainDigest: dataChain, BaseDigest: base, EntryDigest: entry,
 		Applied: publication.applied, Term: publication.term,
 		RouteGeneration: publication.routeGeneration,
 	}
@@ -500,8 +500,8 @@ func (c *SourceCapture) decodeEntry(
 	}
 	if !decodeNodeDigest(root, 9, &record.PreviousEntryDigest) ||
 		!decodeNodeDigest(root, 10, &record.EntryDigest) ||
-		!decodeNodeDigest(root, 11, &record.BeforeLogicalDigest) ||
-		!decodeNodeDigest(root, 12, &record.AfterLogicalDigest) ||
+		!decodeNodeDigest(root, 11, &record.BeforeDataChainDigest) ||
+		!decodeNodeDigest(root, 12, &record.AfterDataChainDigest) ||
 		!decodeNodeDigest(root, 14, &record.Digest) {
 		return sourceCaptureEntry{}, ErrSourceCapture
 	}
@@ -577,7 +577,7 @@ func (c *SourceCapture) hashHeader(
 	_, _ = h.Write(c.partitioner.digest[:])
 	_, _ = h.Write(c.placement[:])
 	hashTailFrame(h, &workspace.size, []byte(c.partitioner.collection))
-	_, _ = h.Write(state.LogicalDigest[:])
+	_, _ = h.Write(state.DataChainDigest[:])
 	_, _ = h.Write(state.SnapshotBaseDigest[:])
 	_, _ = h.Write(state.LastEntryDigest[:])
 	fixed := workspace.fixed[:0]
@@ -607,8 +607,8 @@ func (c *SourceCapture) hashTransition(
 		AfterRouteGeneration:  transition.AfterRouteGeneration,
 		PreviousEntryDigest:   transition.PreviousEntryDigest,
 		EntryDigest:           transition.EntryDigest,
-		BeforeLogicalDigest:   transition.BeforeLogicalDigest,
-		AfterLogicalDigest:    transition.AfterLogicalDigest,
+		BeforeDataChainDigest: transition.BeforeDataChainDigest,
+		AfterDataChainDigest:  transition.AfterDataChainDigest,
 	}
 	if cap(workspace.transitions) < transition.MutationCount() {
 		workspace.transitions = make([]TailTransition, transition.MutationCount())
@@ -646,8 +646,8 @@ func (c *SourceCapture) hashEntry(
 	_, _ = h.Write(fixed)
 	_, _ = h.Write(record.PreviousEntryDigest[:])
 	_, _ = h.Write(record.EntryDigest[:])
-	_, _ = h.Write(record.BeforeLogicalDigest[:])
-	_, _ = h.Write(record.AfterLogicalDigest[:])
+	_, _ = h.Write(record.BeforeDataChainDigest[:])
+	_, _ = h.Write(record.AfterDataChainDigest[:])
 	for index := range record.Transitions {
 		transition := &record.Transitions[index]
 		hashTailFrame(h, &workspace.size, transition.Key)
@@ -758,7 +758,7 @@ func (c *SourceCapture) transitionFollowsCurrent(
 	return current.applied != math.MaxUint64 && transition.Applied == current.applied+1 &&
 		transition.Term >= current.term &&
 		transition.PreviousEntryDigest == current.entryDigest &&
-		transition.BeforeLogicalDigest == current.logicalDigest &&
+		transition.BeforeDataChainDigest == current.dataChainDigest &&
 		transition.BeforeOwnershipEpoch == current.ownershipEpoch &&
 		transition.BeforeRoutingVersion == current.routingVersion &&
 		transition.BeforeRouteGeneration == current.routeGeneration
@@ -771,7 +771,7 @@ func validSourceCaptureEntry(record *sourceCaptureEntry) bool {
 		record.BeforeRoutingVersion != 0 && record.AfterRoutingVersion != 0 &&
 		record.BeforeRouteGeneration != 0 && record.AfterRouteGeneration != 0 &&
 		record.PreviousEntryDigest != ([32]byte{}) && record.EntryDigest != ([32]byte{}) &&
-		record.BeforeLogicalDigest != ([32]byte{}) && record.AfterLogicalDigest != ([32]byte{})
+		record.BeforeDataChainDigest != ([32]byte{}) && record.AfterDataChainDigest != ([32]byte{})
 }
 
 func publicationFromState(state replicatedstate.State) sourceCapturePublication {
@@ -780,7 +780,7 @@ func publicationFromState(state replicatedstate.State) sourceCapturePublication 
 		ownershipEpoch:  state.Binding.OwnershipEpoch,
 		routingVersion:  state.Binding.RoutingVersion,
 		routeGeneration: state.Binding.RouteGeneration,
-		entryDigest:     state.LastEntryDigest, logicalDigest: state.LogicalDigest,
+		entryDigest:     state.LastEntryDigest, dataChainDigest: state.DataChainDigest,
 	}
 }
 
@@ -792,7 +792,7 @@ func publicationFromTransition(
 		ownershipEpoch:  transition.AfterOwnershipEpoch,
 		routingVersion:  transition.AfterRoutingVersion,
 		routeGeneration: transition.AfterRouteGeneration,
-		entryDigest:     transition.EntryDigest, logicalDigest: transition.AfterLogicalDigest,
+		entryDigest:     transition.EntryDigest, dataChainDigest: transition.AfterDataChainDigest,
 	}
 }
 
@@ -802,7 +802,7 @@ func publicationFromEntry(record sourceCaptureEntry) sourceCapturePublication {
 		ownershipEpoch:  record.AfterOwnershipEpoch,
 		routingVersion:  record.AfterRoutingVersion,
 		routeGeneration: record.AfterRouteGeneration,
-		entryDigest:     record.EntryDigest, logicalDigest: record.AfterLogicalDigest,
+		entryDigest:     record.EntryDigest, dataChainDigest: record.AfterDataChainDigest,
 	}
 }
 

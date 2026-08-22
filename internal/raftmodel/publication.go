@@ -19,8 +19,8 @@ func (n *Node) acceptNormalPublication(meta ApplyMeta, noop bool, returned Publi
 	if returned.ReplicaSetVersion != previous.ReplicaSetVersion {
 		return errors.New("normal entry changed ReplicaSetVersion")
 	}
-	if noop && returned.LogicalDigest != previous.LogicalDigest {
-		return errors.New("no-op entry changed logical digest")
+	if noop && returned.DataChainDigest != previous.DataChainDigest {
+		return errors.New("no-op entry changed data-chain digest")
 	}
 	n.published = clonePublication(returned)
 	return nil
@@ -40,8 +40,8 @@ func (n *Node) acceptConfigurationPublication(meta ApplyMeta, state *pb.ConfStat
 	if returned.ReplicaSetVersion != meta.Index {
 		return fmt.Errorf("ReplicaSetVersion %d differs from configuration index %d", returned.ReplicaSetVersion, meta.Index)
 	}
-	if returned.LogicalDigest != previous.LogicalDigest {
-		return errors.New("configuration entry changed logical digest")
+	if returned.DataChainDigest != previous.DataChainDigest {
+		return errors.New("configuration entry changed data-chain digest")
 	}
 	n.published = clonePublication(returned)
 	return nil
@@ -101,7 +101,7 @@ func confStateHasMembers(state *pb.ConfState) bool {
 
 func equalPublication(left, right Publication) bool {
 	return left.Applied == right.Applied &&
-		left.LogicalDigest == right.LogicalDigest &&
+		left.DataChainDigest == right.DataChainDigest &&
 		left.ReplicaSetVersion == right.ReplicaSetVersion &&
 		proto.Equal(left.ConfState, right.ConfState)
 }

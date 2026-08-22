@@ -16,7 +16,7 @@ const (
 	snapshotArtifactFormat           = uint16(1)
 	snapshotArtifactHeaderFixedBytes = 64
 	snapshotArtifactChunkHeaderBytes = 96
-	snapshotArtifactFooterBytes      = 160
+	snapshotArtifactFooterBytes      = 192
 	snapshotArtifactChecksumBytes    = sha256.Size
 	snapshotArtifactRowHeaderBytes   = 8
 
@@ -212,7 +212,10 @@ type SnapshotArtifactManifest struct {
 	EncodedBytes     uint64
 	HeaderDigest     [sha256.Size]byte
 	LastChunkDigest  [sha256.Size]byte
-	Digest           [sha256.Size]byte
+	// ImageDigest is the canonical validated user image computed while the
+	// artifact's user rows are already being streamed.
+	ImageDigest [sha256.Size]byte
+	Digest      [sha256.Size]byte
 }
 
 type snapshotArtifactWriter struct {
@@ -228,6 +231,7 @@ type snapshotArtifactWriter struct {
 	encodedBytes   uint64
 	headerDigest   [sha256.Size]byte
 	previousDigest [sha256.Size]byte
+	image          *canonicalImageHasher
 }
 
 // WriteSnapshotArtifact writes a deterministic, bounded-memory artifact for
@@ -273,6 +277,12 @@ func WriteSnapshotArtifact(
 		encodedBytes: uint64(len(header)), headerDigest: headerDigest,
 		previousDigest: headerDigest,
 	}
+	writer.image, err = newCanonicalImageHasher(
+		snapshot.userName, snapshot.validation, snapshot.validationDigest, snapshot.validator,
+	)
+	if err != nil {
+		return SnapshotArtifactManifest{}, err
+	}
 	if err := writer.writeCollection(SnapshotArtifactSystem, snapshot.RangeSystem); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
@@ -283,7 +293,8 @@ func WriteSnapshotArtifact(
 	if err := writer.writeCollection(SnapshotArtifactUser, user.RangeRaw); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
-	digest, err := writer.writeFooter()
+	imageDigest := writer.image.sum()
+	digest, err := writer.writeFooter(imageDigest)
 	if err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
@@ -292,7 +303,8 @@ func WriteSnapshotArtifact(
 		TargetChunkBytes: uint32(target), Chunks: writer.chunks,
 		SystemRows: writer.systemRows, UserRows: writer.userRows,
 		PayloadBytes: writer.payloadBytes, EncodedBytes: writer.encodedBytes,
-		HeaderDigest: headerDigest, LastChunkDigest: writer.previousDigest, Digest: digest,
+		HeaderDigest: headerDigest, LastChunkDigest: writer.previousDigest,
+		ImageDigest: imageDigest, Digest: digest,
 	}, nil
 }
 
@@ -347,6 +359,11 @@ func (w *snapshotArtifactWriter) writeCollection(
 	}
 	w.collection = collection
 	err := rangeRows(func(key, value []byte) error {
+		if collection == SnapshotArtifactUser {
+			if err := w.image.add(key, value); err != nil {
+				return err
+			}
+		}
 		rowBytes, ok := snapshotArtifactRowBytes(key, value)
 		if !ok {
 			return fmt.Errorf("%w: row", ErrSnapshotArtifactBound)
@@ -439,31 +456,79 @@ func (w *snapshotArtifactWriter) flush() error {
 	return nil
 }
 
-func (w *snapshotArtifactWriter) writeFooter() ([sha256.Size]byte, error) {
+func (w *snapshotArtifactWriter) writeFooter(
+	imageDigest [sha256.Size]byte,
+) ([sha256.Size]byte, error) {
 	if w.encodedBytes > math.MaxUint64-snapshotArtifactFooterBytes {
 		return [sha256.Size]byte{}, fmt.Errorf("%w: artifact bytes", ErrSnapshotArtifactBound)
 	}
 	totalBytes := w.encodedBytes + snapshotArtifactFooterBytes
-	var footer [snapshotArtifactFooterBytes]byte
-	copy(footer[0:8], snapshotArtifactFooterMagic[:])
-	binary.LittleEndian.PutUint16(footer[8:10], snapshotArtifactFormat)
-	binary.LittleEndian.PutUint16(footer[10:12], snapshotArtifactFooterBytes)
-	binary.LittleEndian.PutUint32(footer[12:16], snapshotArtifactFooterBytes)
-	binary.LittleEndian.PutUint64(footer[16:24], w.chunks)
-	binary.LittleEndian.PutUint64(footer[24:32], w.chunks)
-	binary.LittleEndian.PutUint64(footer[32:40], w.systemRows)
-	binary.LittleEndian.PutUint64(footer[40:48], w.userRows)
-	binary.LittleEndian.PutUint64(footer[48:56], w.payloadBytes)
-	binary.LittleEndian.PutUint64(footer[56:64], totalBytes)
-	copy(footer[64:96], w.previousDigest[:])
-	copy(footer[96:128], w.headerDigest[:])
-	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:128])
-	copy(footer[128:], digest[:])
+	footer, digest := makeSnapshotArtifactFooter(
+		w.chunks, w.systemRows, w.userRows, w.payloadBytes, totalBytes,
+		w.previousDigest, w.headerDigest, imageDigest,
+	)
 	if err := writeSnapshotArtifactBytes(w.w, footer[:]); err != nil {
 		return [sha256.Size]byte{}, err
 	}
 	w.encodedBytes = totalBytes
 	return digest, nil
+}
+
+func makeSnapshotArtifactFooter(
+	chunks uint64,
+	systemRows uint64,
+	userRows uint64,
+	payloadBytes uint64,
+	totalBytes uint64,
+	lastChunkDigest [sha256.Size]byte,
+	headerDigest [sha256.Size]byte,
+	imageDigest [sha256.Size]byte,
+) ([snapshotArtifactFooterBytes]byte, [sha256.Size]byte) {
+	var footer [snapshotArtifactFooterBytes]byte
+	copy(footer[0:8], snapshotArtifactFooterMagic[:])
+	binary.LittleEndian.PutUint16(footer[8:10], snapshotArtifactFormat)
+	binary.LittleEndian.PutUint16(footer[10:12], snapshotArtifactFooterBytes)
+	binary.LittleEndian.PutUint32(footer[12:16], snapshotArtifactFooterBytes)
+	binary.LittleEndian.PutUint64(footer[16:24], chunks)
+	binary.LittleEndian.PutUint64(footer[24:32], chunks)
+	binary.LittleEndian.PutUint64(footer[32:40], systemRows)
+	binary.LittleEndian.PutUint64(footer[40:48], userRows)
+	binary.LittleEndian.PutUint64(footer[48:56], payloadBytes)
+	binary.LittleEndian.PutUint64(footer[56:64], totalBytes)
+	copy(footer[64:96], lastChunkDigest[:])
+	copy(footer[96:128], headerDigest[:])
+	copy(footer[128:160], imageDigest[:])
+	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
+	copy(footer[160:192], digest[:])
+	return footer, digest
+}
+
+func snapshotArtifactEncodedBytes(
+	headerBytes uint64,
+	chunks uint64,
+	payloadBytes uint64,
+	withFooter bool,
+) (uint64, bool) {
+	const chunkOverhead = uint64(snapshotArtifactChunkHeaderBytes + sha256.Size)
+	if headerBytes == 0 || chunks > math.MaxUint64/chunkOverhead {
+		return 0, false
+	}
+	total := chunks * chunkOverhead
+	if headerBytes > math.MaxUint64-total {
+		return 0, false
+	}
+	total += headerBytes
+	if payloadBytes > math.MaxUint64-total {
+		return 0, false
+	}
+	total += payloadBytes
+	if withFooter {
+		if total > math.MaxUint64-snapshotArtifactFooterBytes {
+			return 0, false
+		}
+		total += snapshotArtifactFooterBytes
+	}
+	return total, true
 }
 
 // VerifySnapshotArtifact streams and verifies one complete artifact. It
@@ -636,7 +701,8 @@ func ContinueSnapshotArtifact(
 			}
 			manifest = cloneSnapshotArtifactManifest(current.manifest)
 			manifest.EncodedBytes = current.encodedBytes + snapshotArtifactFooterBytes
-			copy(manifest.Digest[:], footer[128:160])
+			copy(manifest.ImageDigest[:], footer[128:160])
+			copy(manifest.Digest[:], footer[160:192])
 			var trailing [1]byte
 			n, readErr := io.ReadFull(r, trailing[:])
 			if n != 0 || readErr == nil {
@@ -658,6 +724,7 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	if cursor == nil || cursor.encodedBytes == 0 ||
 		cursor.nextSequence != cursor.manifest.Chunks ||
 		cursor.previousDigest != cursor.manifest.LastChunkDigest ||
+		cursor.manifest.ImageDigest != ([sha256.Size]byte{}) ||
 		cursor.manifest.Digest != ([sha256.Size]byte{}) || cursor.manifest.EncodedBytes != 0 ||
 		cursor.manifest.HeaderDigest == ([sha256.Size]byte{}) ||
 		cursor.manifest.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
@@ -682,8 +749,11 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		stateEnvelope, string(cursor.manifest.UserCollection),
 		int(cursor.manifest.TargetChunkBytes),
 	)
+	wantEncodedBytes, encodedBytesOK := snapshotArtifactEncodedBytes(
+		uint64(len(header)), cursor.manifest.Chunks, cursor.manifest.PayloadBytes, false,
+	)
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
-		cursor.encodedBytes < uint64(len(header)) ||
+		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
 		cursor.manifest.SystemRows > cursor.manifest.State.CompletionCount+1 {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}
@@ -884,13 +954,15 @@ func validateSnapshotArtifactFooter(
 	if encodedBeforeFooter > math.MaxUint64-snapshotArtifactFooterBytes {
 		return fmt.Errorf("%w: footer bytes", ErrSnapshotArtifactBound)
 	}
-	var storedPrevious, storedHeader [sha256.Size]byte
+	var storedPrevious, storedHeader, storedImage [sha256.Size]byte
 	copy(storedPrevious[:], footer[64:96])
 	copy(storedHeader[:], footer[96:128])
-	wantDigest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:128])
+	copy(storedImage[:], footer[128:160])
+	wantDigest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
 	var storedDigest [sha256.Size]byte
-	copy(storedDigest[:], footer[128:160])
+	copy(storedDigest[:], footer[160:192])
 	if storedDigest != wantDigest ||
+		storedImage == ([sha256.Size]byte{}) ||
 		binary.LittleEndian.Uint64(footer[16:24]) != manifest.Chunks ||
 		binary.LittleEndian.Uint64(footer[24:32]) != manifest.Chunks ||
 		binary.LittleEndian.Uint64(footer[32:40]) != manifest.SystemRows ||

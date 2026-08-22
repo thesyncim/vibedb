@@ -12,7 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
-func TestRandomizedMutationHistoryMatchesReferenceMapAndDigest(t *testing.T) {
+func TestRandomizedMutationHistoryMatchesReferenceMapAndImageAudit(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -42,8 +42,8 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndDigest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d apply: %v", step, err)
 		}
-		if got, want := publication.LogicalDigest, referenceLogicalDigest("docs", reference); got != want {
-			t.Fatalf("step %d digest = %x, want %x", step, got, want)
+		if publication.DataChainDigest == ([32]byte{}) {
+			t.Fatalf("step %d published a zero data-chain digest", step)
 		}
 		snapshot, err := fixture.user.Collection.Snapshot()
 		if err != nil {
@@ -67,6 +67,19 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndDigest(t *testing.T) {
 			}
 		}
 	}
+	snapshot, err := fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageDigest, auditErr := snapshot.CanonicalImageDigest()
+	closeErr := snapshot.Close()
+	if auditErr != nil || closeErr != nil {
+		t.Fatalf("canonical image audit = %x, %v; close = %v", imageDigest, auditErr, closeErr)
+	}
+	if want := referenceCanonicalImageDigest("docs", reference); imageDigest != want {
+		t.Fatalf("canonical image digest = %x, want %x", imageDigest, want)
+	}
+	wantChain := fixture.machine.Published().DataChainDigest
 	reopened, err := Open(
 		fixture.binding, fixture.bootstrap, fixture.system,
 		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
@@ -74,12 +87,12 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := reopened.Published().LogicalDigest, referenceLogicalDigest("docs", reference); got != want {
+	if got, want := reopened.Published().DataChainDigest, wantChain; got != want {
 		t.Fatalf("reopened digest = %x, want %x", got, want)
 	}
 }
 
-func referenceLogicalDigest(name string, rows map[string][]byte) [32]byte {
+func referenceCanonicalImageDigest(name string, rows map[string][]byte) [32]byte {
 	h := sha256.New()
 	_, _ = h.Write([]byte("vibedb/replicated-state/logical-image\x00"))
 	_, _ = h.Write([]byte{byte(ValidationDeterministicMutation)})
@@ -146,7 +159,7 @@ func TestCoherentSnapshotRacesApply(t *testing.T) {
 			t.Fatal(err)
 		}
 		publication, state := snapshot.Publication(), snapshot.State()
-		if publication.Applied != state.Applied || publication.LogicalDigest != state.LogicalDigest ||
+		if publication.Applied != state.Applied || publication.DataChainDigest != state.DataChainDigest ||
 			publication.ReplicaSetVersion != state.ReplicaSetVersion {
 			_ = snapshot.Close()
 			t.Fatalf("skewed snapshot publication=%+v state=%+v", publication, state)

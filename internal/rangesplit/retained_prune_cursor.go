@@ -54,7 +54,7 @@ type RetainedPruneCursor struct {
 	plan           [sha256.Size]byte
 	placement      [sha256.Size]byte
 	cutover        [sha256.Size]byte
-	logical        [sha256.Size]byte
+	dataChain      [sha256.Size]byte
 	base           [sha256.Size]byte
 	entry          [sha256.Size]byte
 	pending        [sha256.Size]byte
@@ -72,7 +72,7 @@ func (c RetainedPruneCursor) Phase() RetainedPrunePhase { return c.phase }
 
 func (c RetainedPruneCursor) SourceCut() ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{
-		LogicalDigest: c.logical, BaseDigest: c.base, EntryDigest: c.entry,
+		DataChainDigest: c.dataChain, BaseDigest: c.base, EntryDigest: c.entry,
 		Applied: c.applied, Term: c.term, RouteGeneration: c.routeGeneration,
 	}
 }
@@ -143,7 +143,7 @@ func AppendRetainedPruneCursorWithWorkspace(
 		binary.LittleEndian.PutUint64(frame[24+index*8:32+index*8], value)
 	}
 	digests := [...][sha256.Size]byte{
-		cursor.plan, cursor.placement, cursor.cutover, cursor.logical,
+		cursor.plan, cursor.placement, cursor.cutover, cursor.dataChain,
 		cursor.base, cursor.entry, cursor.pending, cursor.retainedDigest,
 	}
 	for index := range digests {
@@ -199,7 +199,7 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 		snapshotGeneration: values[13],
 	}
 	digests := []*[sha256.Size]byte{
-		&cursor.plan, &cursor.placement, &cursor.cutover, &cursor.logical,
+		&cursor.plan, &cursor.placement, &cursor.cutover, &cursor.dataChain,
 		&cursor.base, &cursor.entry, &cursor.pending, &cursor.retainedDigest,
 	}
 	for index := range digests {
@@ -234,7 +234,7 @@ func validRetainedPruneCursor(cursor *RetainedPruneCursor) bool {
 		cursor.ownershipEpoch == 0 || cursor.routingVersion == 0 ||
 		cursor.routeGeneration == 0 || cursor.plan == ([sha256.Size]byte{}) ||
 		cursor.placement == ([sha256.Size]byte{}) || cursor.cutover == ([sha256.Size]byte{}) ||
-		cursor.logical == ([sha256.Size]byte{}) || cursor.base == ([sha256.Size]byte{}) ||
+		cursor.dataChain == ([sha256.Size]byte{}) || cursor.base == ([sha256.Size]byte{}) ||
 		cursor.entry == ([sha256.Size]byte{}) ||
 		len(cursor.scanAfter) > replication.MaxMutationKeyBytes ||
 		len(cursor.resumeAfter) > replication.MaxMutationKeyBytes {

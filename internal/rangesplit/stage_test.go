@@ -265,7 +265,7 @@ func TestChildStagePersistsTerminalOwnershipSeal(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := nextTailEntry(source, nil, 31)
-	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterDataChainDigest = entry.BeforeDataChainDigest
 	entry.AfterOwnershipEpoch++
 	entry.AfterRoutingVersion++
 	entry.AfterRouteGeneration++
@@ -304,7 +304,7 @@ func TestChildStagePersistsTerminalOwnershipSeal(t *testing.T) {
 		t.Fatalf("reopened sealed retry: %v", err)
 	}
 	ordinary := nextTailEntry(source, nil, 32)
-	ordinary.AfterLogicalDigest = ordinary.BeforeLogicalDigest
+	ordinary.AfterDataChainDigest = ordinary.BeforeDataChainDigest
 	var ordinaryBatch TailBatch
 	if _, _, err := partitioner.TranslateTailEntry(source, ordinary, []TailSink{
 		func(TailBatch) error { return nil },
@@ -503,7 +503,7 @@ func TestChildStageCursorStorePersistsTerminalSeal(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := nextTailEntry(cursor, nil, 33)
-	entry.AfterLogicalDigest = entry.BeforeLogicalDigest
+	entry.AfterDataChainDigest = entry.BeforeDataChainDigest
 	entry.AfterOwnershipEpoch++
 	entry.AfterRoutingVersion++
 	entry.AfterRouteGeneration++

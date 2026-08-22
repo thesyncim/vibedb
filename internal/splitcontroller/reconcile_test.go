@@ -495,7 +495,7 @@ func testSourceState(plan *Plan) replicatedstate.State {
 			RoutingVersion: uint64(plan.source.RoutingVersion), RouteGeneration: plan.current,
 		},
 		Applied: 41, LastTerm: 7, LastEntryDigest: sha256.Sum256([]byte("entry")),
-		LogicalDigest:      sha256.Sum256([]byte("logical")),
+		DataChainDigest:    sha256.Sum256([]byte("data-chain")),
 		SnapshotBaseDigest: sha256.Sum256([]byte("base")),
 	}
 }
@@ -533,12 +533,12 @@ func testArtifactSet(
 		t.Fatal(err)
 	}
 	cut := rangesplit.ChildArtifactSourceCut{
-		LogicalDigest: state.LogicalDigest, BaseDigest: state.SnapshotBaseDigest,
+		DataChainDigest: state.DataChainDigest, BaseDigest: state.SnapshotBaseDigest,
 		EntryDigest: state.LastEntryDigest, Applied: state.Applied, Term: state.LastTerm,
 		RouteGeneration: state.Binding.RouteGeneration,
 	}
 	set := rangesplit.ChildArtifactSet{Partition: rangesplit.PartitionStats{
-		PlanDigest: plan.partitioner.Digest(), SourceDigest: cut.LogicalDigest,
+		PlanDigest: plan.partitioner.Digest(), SourceDigest: cut.DataChainDigest,
 		SourceBase: cut.BaseDigest, SourceEntry: cut.EntryDigest,
 		SourceApplied: cut.Applied, SourceTerm: cut.Term,
 		RouteGeneration: cut.RouteGeneration,
