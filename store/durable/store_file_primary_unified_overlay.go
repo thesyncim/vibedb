@@ -1351,6 +1351,9 @@ func (o *primaryUnifiedOverlay) stats() primaryUnifiedOverlayStats {
 // lanes so an overflow row, reader-forced COW, or async mutation cannot retain
 // a different byte spelling from the ordinary inline fast path.
 func (c *Collection) canonicalPrimaryMutationValue(src []byte) ([]byte, error) {
+	if c != nil && c.options.OpaqueValues {
+		return src, nil
+	}
 	estimate := max(64, len(src)/8+8)
 	for cap(c.primaryUnifiedIndexScratch) < estimate {
 		c.primaryUnifiedIndexScratch = make([]vibejson.IndexEntry, 0, estimate)

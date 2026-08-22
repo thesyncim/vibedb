@@ -11,9 +11,10 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// Put inserts or replaces one document. Every collection is an ordered primary
-// graph. Eligible inline mutations use its bounded row overlay; structural,
-// indexed, overflow, and pressure paths use routed copy-on-write.
+// Put inserts or replaces one document or opaque value. Every collection is an
+// ordered primary graph. Eligible JSON inline mutations use its bounded row
+// overlay; structural, indexed, overflow, and pressure paths use routed
+// copy-on-write.
 //
 // key is borrowed for the duration of the call and not retained after it
 // returns: the store copies it wherever it stages the key (leaf frame,
@@ -408,8 +409,9 @@ func (s *Snapshot) Generation() uint64 {
 	return s.state.root.Generation
 }
 
-// AppendRaw appends key's canonical JSON document into dst. It never returns a
-// borrowed page slice. key is borrowed for the call only; it is not retained.
+// AppendRaw appends key's canonical JSON document or exact opaque value into
+// dst. It never returns a borrowed page slice. key is borrowed for the call
+// only; it is not retained.
 func (s *Snapshot) AppendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst, false, ErrClosed

@@ -134,6 +134,13 @@ func (c *Collection) CreateIndexContext(
 		c.writer.Unlock()
 		return store.IndexInfo{}, ErrClosed
 	}
+	if c.options.OpaqueValues {
+		c.writer.Unlock()
+		return store.IndexInfo{}, fmt.Errorf(
+			"%w: opaque values do not support JSON indexes",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
 	if c.packedLogicalCutPending() {
 		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			c.writer.Unlock()

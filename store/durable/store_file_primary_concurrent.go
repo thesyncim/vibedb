@@ -151,7 +151,8 @@ type primaryConcurrentContextPool struct {
 func newPrimaryConcurrentContextPool(
 	options normalizedFileStoreOptions,
 ) *primaryConcurrentContextPool {
-	if options.Durability != DurabilityBufferedVisible ||
+	if options.OpaqueValues ||
+		options.Durability != DurabilityBufferedVisible ||
 		options.RecoveryJournal ||
 		options.Collection.Schema != nil ||
 		len(options.indexes) != 0 ||
@@ -616,7 +617,8 @@ func (c *Collection) publishConcurrentPrimaryMutations(
 func (c *Collection) tryConcurrentPrimaryPut(
 	key, src []byte,
 ) (handled, created bool, err error) {
-	if !c.packedLogicalCutEnabled() || c.onlineIndexBuild.Load() {
+	if c.options.OpaqueValues || !c.packedLogicalCutEnabled() ||
+		c.onlineIndexBuild.Load() {
 		return false, false, nil
 	}
 	pool := c.primaryConcurrentContexts
@@ -679,7 +681,7 @@ func (c *Collection) tryConcurrentPrimaryPut(
 	if failure := c.PersistenceError(); failure != nil {
 		return false, false, failure
 	}
-	if !c.buffered() || c.options.RecoveryJournal ||
+	if c.options.OpaqueValues || !c.buffered() || c.options.RecoveryJournal ||
 		c.options.Collection.Schema != nil ||
 		len(c.options.indexes) != 0 || c.primaryEpoch != nil ||
 		c.onlineIndexBuild.Load() || c.journalReplaying ||
@@ -950,7 +952,8 @@ func (c *Collection) tryConcurrentPrimaryPut(
 func (c *Collection) tryConcurrentPrimaryDelete(
 	key []byte,
 ) (handled, deleted bool, err error) {
-	if !c.packedLogicalCutEnabled() || c.onlineIndexBuild.Load() {
+	if c.options.OpaqueValues || !c.packedLogicalCutEnabled() ||
+		c.onlineIndexBuild.Load() {
 		return false, false, nil
 	}
 	pool := c.primaryConcurrentContexts
@@ -977,7 +980,7 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 	if failure := c.PersistenceError(); failure != nil {
 		return false, false, failure
 	}
-	if !c.buffered() || c.options.RecoveryJournal ||
+	if c.options.OpaqueValues || !c.buffered() || c.options.RecoveryJournal ||
 		c.options.Collection.Schema != nil ||
 		len(c.options.indexes) != 0 || c.primaryEpoch != nil ||
 		c.onlineIndexBuild.Load() || c.journalReplaying ||

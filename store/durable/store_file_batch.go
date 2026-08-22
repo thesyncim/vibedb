@@ -21,7 +21,7 @@ var ErrBatchClosed = errors.New("vibedb: collection write batch is no longer act
 //
 // Keys are deduplicated as they arrive: mutating the same key twice keeps only
 // the second mutation, so the published generation contains exactly one row
-// state per key. Keys and documents are copied into the batch, so the caller
+// state per key. Keys and values are copied into the batch, so the caller
 // may reuse its buffers as soon as a method returns.
 //
 // Deduplication also makes last-write-wins semantics explicit before routing:
@@ -29,9 +29,8 @@ var ErrBatchClosed = errors.New("vibedb: collection write batch is no longer act
 // document without staging an intermediate primary mutation. Physical row
 // coordinates are not part of the collection contract.
 //
-// Document syntax is validated when Update applies the batch, not when Put
-// records it. Validation needs the same parse the commit needs, and doing it
-// twice would double the only per-document CPU cost a batched write has left.
+// JSON syntax is validated when Update applies a JSON collection's batch, not
+// when Put records it. Opaque collections do no syntax validation.
 type WriteBatch struct {
 	collection *Collection
 	entries    []writeBatchEntry
@@ -71,7 +70,8 @@ func (b *WriteBatch) Len() int {
 }
 
 // Put records key with src. It reports ErrKeyTooLarge, ErrDocumentTooLarge, or
-// ErrBatchTooLarge immediately; malformed JSON is reported by Update.
+// ErrBatchTooLarge immediately; malformed JSON is reported by Update for JSON
+// collections. Opaque collections retain src byte-for-byte.
 //
 // key is borrowed for the duration of the call and not retained after it
 // returns: the batch copies it into its own arena. The caller may reuse or

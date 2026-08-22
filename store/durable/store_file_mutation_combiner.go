@@ -319,10 +319,13 @@ func (c *Collection) validatePrimaryMutationRequest(
 		len(request.value) > c.options.InlineValueBytes {
 		return ErrDocumentTooLarge
 	}
-	if err := vibejson.Validate(request.value); err != nil {
-		return err
+	if !c.options.OpaqueValues {
+		if err := vibejson.Validate(request.value); err != nil {
+			return err
+		}
+		return c.validatePrimarySchema(request.value)
 	}
-	return c.validatePrimarySchema(request.value)
+	return nil
 }
 
 // primaryKeyPresentLocked reads logical presence from the writer's newest

@@ -159,13 +159,20 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 
 // fileStoreCollectionOptionFlags returns durable collection semantics carried
 // through every root generation.
-func fileStoreCollectionOptionFlags(options store.Options, hasSkipIndexes bool) uint32 {
+func fileStoreCollectionOptionFlags(
+	options store.Options,
+	hasSkipIndexes bool,
+	hasOpaqueValues bool,
+) uint32 {
 	var flags uint32
 	if options.Schema != nil {
 		flags |= storeio.StateOptionSchema
 	}
 	if hasSkipIndexes {
 		flags |= storeio.StateOptionSkipIndexes
+	}
+	if hasOpaqueValues {
+		flags |= storeio.StateOptionOpaqueValues
 	}
 	return flags
 }
@@ -188,12 +195,16 @@ func normalizeOpenedFileStoreOptions(
 	hasIndexes := len(definition.Indexes) != 0
 	hasSkipIndexes := len(definition.SkipPaths) != 0
 	hasSchema := definition.Schema != nil
+	hasOpaqueValues := root.Options&storeio.StateOptionOpaqueValues != 0
+	opaqueCatalogConflict := hasOpaqueValues &&
+		(hasIndexes || hasSkipIndexes || hasSchema || root.IndexMaxDepth != 0)
 	catalogAsserted := supplied.Indexes != nil ||
 		supplied.SkipIndexes != nil ||
-		supplied.Collection.Schema != nil
+		supplied.Collection.Schema != nil || supplied.OpaqueValues
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
 		(root.Options&storeio.StateOptionSchema != 0) != hasSchema ||
 		(root.Options&storeio.StateOptionSkipIndexes != 0) != hasSkipIndexes ||
+		opaqueCatalogConflict ||
 		(root.PageCatalogBytes != 0) !=
 			(hasIndexes || hasSkipIndexes || hasSchema) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -237,9 +248,11 @@ func normalizeOpenedFileStoreOptions(
 		)
 	}
 	persistedFlags := root.Options &
-		(storeio.StateOptionSchema | storeio.StateOptionSkipIndexes)
+		(storeio.StateOptionSchema | storeio.StateOptionSkipIndexes |
+			storeio.StateOptionOpaqueValues)
 	assertedFlags := fileStoreCollectionOptionFlags(
 		supplied.Collection, len(supplied.SkipIndexes) != 0,
+		supplied.OpaqueValues,
 	)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -254,6 +267,7 @@ func normalizeOpenedFileStoreOptions(
 	options.InlineValueBytes = int(root.InlineValueBytes)
 	options.MaxDocumentBytes = int(root.MaxDocumentBytes)
 	options.PhysicalCapacityBytes = root.PhysicalCapacityBytes
+	options.OpaqueValues = hasOpaqueValues
 	options.Collection.IndexOptions.MaxDepth = int(root.IndexMaxDepth)
 	if options.Indexes == nil {
 		options.Indexes = make(
@@ -313,6 +327,7 @@ func normalizeOpenedFileStoreOptions(
 		persistedFlags !=
 			fileStoreCollectionOptionFlags(
 				normalized.Collection, len(normalized.SkipIndexes) != 0,
+				normalized.OpaqueValues,
 			) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: state summaries disagree with canonical catalog",

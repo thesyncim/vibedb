@@ -64,11 +64,17 @@ const (
 	// power-loss damage granule is carried by StateRoot so Open can recover
 	// safely before consulting caller options.
 	StateOptionCanonicalMaterialization
+	// StateOptionOpaqueValues means primary values are uninterpreted byte
+	// strings. Opaque collections carry no JSON schema, exact/skip index, or
+	// structural-index semantics; the bit is durable so Open cannot silently
+	// reinterpret arbitrary bytes as JSON.
+	StateOptionOpaqueValues
 )
 
 const stateRootKnownOptions = StateOptionSchema |
 	StateOptionSkipIndexes |
-	StateOptionCanonicalMaterialization
+	StateOptionCanonicalMaterialization |
+	StateOptionOpaqueValues
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
 // not encode a valid Store state root.
@@ -334,6 +340,11 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	hasCatalog := root.IndexCount != 0 ||
 		root.Options&(StateOptionSchema|StateOptionSkipIndexes) != 0
 	hasExactCatalog := root.PageCatalogBytes != 0
+	if root.Options&StateOptionOpaqueValues != 0 &&
+		(hasCatalog || root.ExactIndexRoot != (PageRef{}) ||
+			root.IndexMaxDepth != 0) {
+		return fmt.Errorf("%w: opaque values with JSON catalog semantics", ErrInvalidWrite)
+	}
 	if !validPhysicalPageSize(root.MaxPageSize) ||
 		root.MaxPageSize < root.PageSize ||
 		root.MaxPageSize%root.PageSize != 0 {

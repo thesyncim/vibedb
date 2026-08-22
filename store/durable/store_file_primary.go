@@ -670,6 +670,11 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		storeio.CommonPrimaryLeafMaxExtentBytes,
 	)
 	c.primaryUnifiedBuilder = storeio.NewUnifiedPrimaryLeafBuilder()
+	if err := c.primaryUnifiedBuilder.SetOpaqueValues(
+		c.options.OpaqueValues,
+	); err != nil {
+		return fmt.Errorf("vibedb: configure opaque primary values: %w", err)
+	}
 	if err := c.primaryUnifiedBuilder.SetCompactPrimarySummaries(
 		c.options.skipIndexes,
 	); err != nil {
