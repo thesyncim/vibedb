@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -12,6 +13,48 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestImportedSnapshotRequiresExactSessionEpochFence(t *testing.T) {
+	dir := t.TempDir()
+	system := createTargetAt(t, dir, "system", durable.Options{})
+	user := createTargetAt(t, dir, "user-fence", durable.Options{})
+	if _, err := user.Collection.Put([]byte("a"), []byte(`{"n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	txnLog, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = txnLog.Close() })
+	binding := testBinding()
+	bootstrap := testBootstrap()
+	options := machineOptionsFor(user)
+	cut := StagedSnapshotCut{
+		Applied: 7, Term: 3,
+		EntryDigest: sha256.Sum256([]byte("session-fenced-import")),
+	}
+	if _, _, _, err := InitializeStagedSnapshot(
+		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
+		txnLog, options, cut, SnapshotArtifactOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	raw, found, err := system.Collection.AppendRaw(nil, stateKey)
+	if err != nil || !found {
+		t.Fatalf("read imported state = %v, %v", found, err)
+	}
+	binary.LittleEndian.PutUint64(raw[360:368], cut.Applied-1)
+	sealRecord(raw, stateChecksumDomain)
+	if _, err := system.Collection.Put(stateKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(
+		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
+		txnLog, options,
+	); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("reopen imported state below certified fence = %v, want ErrStateCorrupt", err)
+	}
+}
 
 func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	dir := t.TempDir()

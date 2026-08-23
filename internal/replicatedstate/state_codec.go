@@ -260,7 +260,7 @@ func validateState(state State) error {
 	case RecordImportedSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
 			state.ReplicaSetVersion >= state.Applied || state.SessionCount != 0 ||
-			state.SessionSlotCount != 0 ||
+			state.SessionSlotCount != 0 || state.SessionEpochHighWater != state.Applied ||
 			state.LastEntryDigest == ([sha256.Size]byte{}) {
 			return fmt.Errorf("%w: imported snapshot state", ErrStateCorrupt)
 		}
