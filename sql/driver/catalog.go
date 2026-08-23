@@ -669,7 +669,7 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		}
 		opened = append(opened, catalogCollectionOpen{file: file, apply: true})
 		requests = append(requests, durable.TransactionCollectionOpen{
-			File: file, Options: replicatedApplyDurableOptions(),
+			File: file, Options: replicatedApplyDurableOptions(meta.SystemLimits),
 		})
 	}
 	names := make([]string, 0, len(d.tables))
@@ -748,7 +748,8 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		}
 		if entry.apply {
 			if err := validateReplicatedApplyCollection(
-				collection, d.catalog.ReplicatedApply.Sidecars,
+				collection, d.catalog.ReplicatedApply.SystemLimits,
+				d.catalog.ReplicatedApply.Sidecars,
 			); err != nil {
 				return err
 			}

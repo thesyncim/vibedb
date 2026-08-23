@@ -91,19 +91,18 @@ type ReplicatedApplyIdentity struct {
 // counters come from the same locked machine publication.
 // This profile does not reserve physical storage or grant serving authority.
 type ReplicatedApplyCapacityProfile struct {
-	Binding          ReplicatedShardStoreBinding
-	ApplyFormat      uint16
-	MaxSessions      uint64
-	RetryWindow      uint16
-	Initialized      bool
-	Applied          uint64
-	SessionCount     uint64
-	SessionSlotCount uint64
-	// MaxCompletions and CompletionCount are derived compatibility counters for
-	// the former append-only completion-capacity validator. They are not
-	// persisted identities: capacity is the fixed session-ring ceiling and count
-	// is the number of physical occupied slots.
-	// Deprecated: use MaxSessions, RetryWindow, and SessionSlotCount.
+	Binding               ReplicatedShardStoreBinding
+	ApplyFormat           uint16
+	MaxSessions           uint64
+	RetryWindow           uint16
+	Initialized           bool
+	Applied               uint64
+	SessionCount          uint64
+	SessionSlotCount      uint64
+	SessionEpochHighWater uint64
+	// Deprecated append-only completion counters remain only until the
+	// unreleased compatibility API is explicitly removed. Runtime admission uses
+	// the bounded session fields above exclusively.
 	MaxCompletions  uint64
 	CompletionCount uint64
 }
@@ -225,7 +224,7 @@ func (d *database) replicatedApplyPath(meta *replicatedApplyMeta) string {
 	return filepath.Join(d.dataDir, meta.Storage+".vjc")
 }
 
-func replicatedApplySystemLimits() ReplicatedShardStoreLimits {
+func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits {
 	const (
 		stateKeyBytes   = 1
 		sessionKeyBytes = sha256.Size + 1
@@ -236,18 +235,25 @@ func replicatedApplySystemLimits() ReplicatedShardStoreLimits {
 		replicatedstate.MaxSessionRecordBytes,
 		replicatedstate.MaxSessionSlotRecordBytes,
 	)
+	hotApplyBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
+		sessionKeyBytes + replicatedstate.MaxSessionRecordBytes +
+		slotKeyBytes + replicatedstate.MaxSessionSlotRecordBytes
+	releaseBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
+		sessionKeyBytes + int(retryWindow)*slotKeyBytes
+	// durable.Options requires the batch byte bound to admit one maximum
+	// document plus a maximum-sized key for every possible batch member. The
+	// exact release image can be smaller than that structural floor at wider
+	// retry windows, so bind both independently.
+	storageMinimumBytes := maxValueBytes + (int(retryWindow)+2)*slotKeyBytes
 	return ReplicatedShardStoreLimits{
 		MaxKeyBytes:       slotKeyBytes,
 		MaxDocumentBytes:  maxValueBytes,
-		MaxBatchDocuments: 3,
-		MaxBatchBytes: stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
-			sessionKeyBytes + replicatedstate.MaxSessionRecordBytes +
-			slotKeyBytes + replicatedstate.MaxSessionSlotRecordBytes,
+		MaxBatchDocuments: int(retryWindow) + 2,
+		MaxBatchBytes:     max(hotApplyBytes, releaseBytes, storageMinimumBytes),
 	}
 }
 
-func replicatedApplyDurableOptions() durable.Options {
-	limits := replicatedApplySystemLimits()
+func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Options {
 	sidecars := canonicalReplicatedApplySidecars()
 	return durable.Options{
 		Durability:                 durable.DurabilitySync,
@@ -262,9 +268,9 @@ func replicatedApplyDurableOptions() durable.Options {
 
 func validateReplicatedApplyCollection(
 	collection *durable.Collection,
+	limits ReplicatedShardStoreLimits,
 	sidecars ReplicatedApplySidecarProfile,
 ) error {
-	limits := replicatedApplySystemLimits()
 	if collection == nil || !collection.HasOpaqueValues() ||
 		collection.HasSchema() || collection.HasIndexes() ||
 		!collection.HasSynchronousDurability() || !collection.SupportsUpdate() ||
@@ -535,20 +541,22 @@ func (d *database) createReplicatedApplyStorageLocked(
 		return ReplicatedApplyIdentity{}, err
 	}
 	tmpPath := file.Name()
-	collection, err := durable.Create(file, replicatedApplyDurableOptions())
+	collection, err := durable.Create(file, replicatedApplyDurableOptions(meta.SystemLimits))
 	if err != nil {
 		return ReplicatedApplyIdentity{}, errors.Join(err,
 			d.discardUnpublishedStorageLocked(collection, file, tmpPath))
 	}
 	file, collection, err = d.publishTableStorageLocked(
-		tmpPath, path, file, collection, replicatedApplyDurableOptions(),
+		tmpPath, path, file, collection, replicatedApplyDurableOptions(meta.SystemLimits),
 	)
 	if err != nil {
 		return ReplicatedApplyIdentity{}, fmt.Errorf(
 			"vibedb: publish replicated apply storage: %w", err,
 		)
 	}
-	if err := validateReplicatedApplyCollection(collection, meta.Sidecars); err != nil {
+	if err := validateReplicatedApplyCollection(
+		collection, meta.SystemLimits, meta.Sidecars,
+	); err != nil {
 		return ReplicatedApplyIdentity{}, errors.Join(err,
 			d.discardUnpublishedStorageLocked(collection, file, path))
 	}
@@ -780,8 +788,10 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 		ApplyFormat: a.identity.Format, MaxSessions: a.identity.MaxSessions,
 		RetryWindow: a.identity.RetryWindow, Initialized: state.Initialized,
 		Applied: state.Applied, SessionCount: state.SessionCount,
-		SessionSlotCount: state.SessionSlotCount, MaxCompletions: maxCompletions,
-		CompletionCount: state.SessionSlotCount,
+		SessionSlotCount:      state.SessionSlotCount,
+		SessionEpochHighWater: state.SessionEpochHighWater,
+		MaxCompletions:        maxCompletions,
+		CompletionCount:       state.SessionSlotCount,
 	}, nil
 }
 
@@ -1049,7 +1059,7 @@ func newReplicatedApplyMeta(
 		Storage:           strings.Clone(storage),
 		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
 		ValidationDigest:  replicatedApplyProfileDigest(identity, options.Placement),
-		SystemLimits:      replicatedApplySystemLimits(),
+		SystemLimits:      replicatedApplySystemLimits(options.RetryWindow),
 		MaxSessions:       options.MaxSessions,
 		RetryWindow:       options.RetryWindow,
 		TxnMaxCollections: options.TxnLimits.MaxCollections,
@@ -1070,17 +1080,22 @@ func validateReplicatedApplyOptions(
 			ErrReplicatedApplyMismatch,
 		)
 	}
+	systemLimits := replicatedApplySystemLimits(options.RetryWindow)
+	maxTxnDocuments := max(
+		identity.UserLimits.MaxBatchDocuments+4,
+		systemLimits.MaxBatchDocuments+1,
+	)
 	if options.MaxSessions == 0 ||
 		options.MaxSessions > replicatedstate.MaxRetainedSessions ||
 		options.RetryWindow == 0 ||
 		options.RetryWindow > replicatedstate.MaxSessionRetryWindow ||
 		options.TxnLimits.MaxCollections < 2 ||
-		options.TxnLimits.MaxDocuments < identity.UserLimits.MaxBatchDocuments+3 ||
+		options.TxnLimits.MaxDocuments < maxTxnDocuments ||
 		options.TxnLimits.MaxBytes <= 0 {
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
 	userBytes := min(identity.UserLimits.MaxBatchBytes, replication.MaxCommandBytes)
-	systemBytes := replicatedApplySystemLimits().MaxBatchBytes
+	systemBytes := systemLimits.MaxBatchBytes
 	if userBytes < 0 || systemBytes < 0 ||
 		int64(userBytes) > math.MaxInt64-int64(systemBytes) ||
 		options.TxnLimits.MaxBytes < int64(userBytes)+int64(systemBytes) {
@@ -1205,7 +1220,7 @@ func validateReplicatedApplyMeta(
 		m.Storage == identity.UserStorage {
 		return fmt.Errorf("%w: invalid or aliased system storage identity", ErrReplicatedApplyMismatch)
 	}
-	if m.SystemLimits != replicatedApplySystemLimits() {
+	if m.SystemLimits != replicatedApplySystemLimits(m.RetryWindow) {
 		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	if err := validateReplicatedApplySidecarsForLimits(m.Sidecars, m.SystemLimits); err != nil {

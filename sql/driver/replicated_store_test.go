@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -55,7 +56,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 			markerPadded, ReplicatedTransactionMarkerBytes,
 		)
 	}
-	systemLimits := replicatedApplySystemLimits()
+	systemLimits := replicatedApplySystemLimits(replicatedstate.MaxSessionRetryWindow)
 	systemRequired := storeio.RecoveryBatchRecordPaddedSizeForPayload(
 		storeio.RecoveryJournalMinSectorSize,
 		systemLimits.MaxBatchDocuments,

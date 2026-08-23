@@ -363,11 +363,12 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 		t.Cleanup(func() { _ = collection.Close(); _ = file.Close() })
 		return collection
 	}
-	systemLimits := replicatedApplySystemLimits()
+	systemLimits := replicatedApplySystemLimits(8)
 	systemCollection := create("system", durable.Options{
 		OpaqueValues: true,
 		MaxKeyBytes:  systemLimits.MaxKeyBytes, MaxDocumentBytes: systemLimits.MaxDocumentBytes,
-		MaxBatchDocuments: 3, MaxBatchBytes: systemLimits.MaxBatchBytes,
+		MaxBatchDocuments: systemLimits.MaxBatchDocuments,
+		MaxBatchBytes:     systemLimits.MaxBatchBytes,
 	})
 	userCollection := create("user", durable.Options{
 		MaxKeyBytes: 256, MaxDocumentBytes: 4096,
@@ -415,7 +416,11 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 	}
 	machineOptions := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
+			MaxCollections: 3,
+			MaxDocuments: max(
+				user.Limits.MaxDistinctMutations+4,
+				systemLimits.MaxBatchDocuments+1,
+			),
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128,
@@ -431,11 +436,29 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 	if _, err := machine.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	command := replicatedChildCommand(binding, 1, replication.Mutation{
+	open := replicatedChildSessionOpen(binding)
+	if err := machine.AdmitCommand(open); err != nil {
+		t.Fatalf("admit source session open: %v", err)
+	}
+	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
+		Index: 2, Term: 2, Type: pb.EntryNormal,
+	}, open); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := machine.LookupCompletion(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened ||
+		completion.ClientEpoch != 2 {
+		t.Fatalf("source session-open completion = %+v, %v", completion, err)
+	}
+	command := replicatedChildCommand(binding, completion.ClientEpoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
 	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
-		Index: 2, Term: 2, Type: pb.EntryNormal,
+		Index: 3, Term: 2, Type: pb.EntryNormal,
 	}, command); err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +556,7 @@ func (f *replicatedChildSourceFixture) catchUpAndSeal(
 		t.Fatal("fixture already sealed")
 	}
 	if _, err := f.machine.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 3, Term: 2, Type: pb.EntryConfChange,
+		Index: 4, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +564,7 @@ func (f *replicatedChildSourceFixture) catchUpAndSeal(
 	transition, err := replicatedstate.AppendOwnershipTransition(
 		nil,
 		replicatedstate.OwnershipTransition{
-			From: f.binding, ExpectedReplicaSetVersion: 3,
+			From: f.binding, ExpectedReplicaSetVersion: 4,
 			SourceMember: 1, TargetMember: 2,
 			ToOwnershipEpoch: f.binding.OwnershipEpoch + 1,
 			ToRoutingVersion: 23, ToRouteGeneration: 29,
@@ -551,7 +574,7 @@ func (f *replicatedChildSourceFixture) catchUpAndSeal(
 		t.Fatal(err)
 	}
 	if _, err := f.machine.ApplyNormal(raftmodel.ApplyMeta{
-		Index: 4, Term: 2, Type: pb.EntryNormal,
+		Index: 5, Term: 2, Type: pb.EntryNormal,
 	}, transition); err != nil {
 		t.Fatal(err)
 	}
@@ -596,11 +619,24 @@ func (f *replicatedChildSourceFixture) certify(
 
 func replicatedChildCommand(
 	binding replicatedstate.Binding,
-	sequence uint64,
+	clientEpoch, sequence uint64,
 	mutations ...replication.Mutation,
 ) []byte {
+	command := replicatedChildCommandValue(binding, clientEpoch, sequence, mutations)
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func replicatedChildCommandValue(
+	binding replicatedstate.Binding,
+	clientEpoch, sequence uint64,
+	mutations []replication.Mutation,
+) replication.Command {
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x5c})
-	encoded, err := replication.AppendCommand(nil, replication.Command{
+	return replication.Command{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
@@ -610,9 +646,16 @@ func replicatedChildCommand(
 		ProtectionEpoch: binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: replicatedChildID(40), ClientEpoch: 1, ClientSequence: sequence,
+		ClientID: replicatedChildID(40), ClientEpoch: clientEpoch, ClientSequence: sequence,
 		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
-	})
+	}
+}
+
+func replicatedChildSessionOpen(binding replicatedstate.Binding) []byte {
+	command := replicatedChildCommandValue(binding, 0, 1, nil)
+	command.Kind = replication.CommandSessionOpen
+	command.Fingerprint = sha256.Sum256([]byte("driver/child-test-session-open"))
+	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)
 	}

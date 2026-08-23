@@ -657,7 +657,8 @@ func validateOpenedReplicatedCatalog(d *database) error {
 	}}
 	if d.catalog.ReplicatedApply != nil {
 		if err := validateReplicatedApplyCollection(
-			d.replicatedApplyCollection, d.catalog.ReplicatedApply.Sidecars,
+			d.replicatedApplyCollection, d.catalog.ReplicatedApply.SystemLimits,
+			d.catalog.ReplicatedApply.Sidecars,
 		); err != nil {
 			return err
 		}
