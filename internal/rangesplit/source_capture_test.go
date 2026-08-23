@@ -528,6 +528,7 @@ func (f sourceCaptureFixture) openSession(
 		Tenant:                 tenant,
 		ClientID:               clientID,
 		ClientSequence:         1,
+		NextDeadlineUnixNano:   2_000_000_000_000_000_000,
 		Fingerprint:            sha256.Sum256(seed),
 		Collection:             "docs",
 	})

@@ -79,6 +79,7 @@ func testApplyCommandValue(
 func testApplySessionOpen(identity sqldriver.ReplicatedShardStoreIdentity) []byte {
 	command := testApplyCommandValue(identity, 0, 1, nil, nil)
 	command.Kind = replication.CommandSessionOpen
+	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("raftmember/test-session-open"))
 	command.Mutations = nil
 	encoded, err := replication.AppendCommand(nil, command)
