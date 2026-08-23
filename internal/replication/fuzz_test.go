@@ -9,6 +9,7 @@ import (
 func FuzzOpenCommand(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
 	retire := testSessionRetireCommand()
+	release := testSessionReleaseCommand()
 	ordered := testCommand()
 	ordered.Mutations = []Mutation{
 		{Kind: MutationPut, Key: []byte("z"), Value: []byte("first")},
@@ -17,6 +18,7 @@ func FuzzOpenCommand(f *testing.F) {
 	}
 	f.Add(valid)
 	f.Add(encodeCommand(f, retire))
+	f.Add(encodeCommand(f, release))
 	f.Add(encodeCommand(f, ordered))
 	f.Add(valid[:len(valid)-1])
 	f.Add([]byte{})
@@ -109,9 +111,9 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		if view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
 			t.Fatal("accepted mutation batch has invalid mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease:
 		if view.MutationCount() != 0 {
-			t.Fatal("accepted session retire carries mutations")
+			t.Fatal("accepted session lifecycle command carries mutations")
 		}
 	default:
 		t.Fatal("accepted unknown command kind")

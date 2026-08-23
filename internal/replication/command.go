@@ -14,8 +14,9 @@ var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 // fingerprint minted by the request layer; this codec treats it as opaque.
 // Mutation-batch order, including duplicate keys, is semantic and preserved
 // exactly; upstream fingerprinting must bind every mutation ordinal. A session
-// retirement carries no mutations. AckThrough is the greatest earlier client
-// sequence that will never be retried; zero acknowledges nothing.
+// retirement or release carries no mutations. AckThrough is the greatest
+// earlier client sequence that will never be retried; zero acknowledges
+// nothing.
 type Command struct {
 	Kind CommandKind
 
@@ -93,8 +94,8 @@ func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
-// Kind reports whether the command mutates the collection or retires its
-// client session.
+// Kind reports whether the command mutates the collection, retires its client
+// session, or releases the retired session's retry state.
 func (v CommandView) Kind() CommandKind { return v.kind }
 
 // MutationCount reports the number of mutations the iterator will produce.
@@ -248,6 +249,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireMutationBatch
 	case CommandSessionRetire:
 		return commandWireSessionRetire
+	case CommandSessionRelease:
+		return commandWireSessionRelease
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -294,9 +297,9 @@ func validateCommandHeader(command Command) error {
 		if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
 			return semantic("mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease:
 		if len(command.Mutations) != 0 {
-			return semantic("session retire carries mutations")
+			return semantic("session lifecycle command carries mutations")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -404,9 +407,9 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count == 0 || uint64(count) > MaxMutations {
 			return CommandView{}, semantic("mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease:
 		if count != 0 {
-			return CommandView{}, semantic("session retire carries mutations")
+			return CommandView{}, semantic("session lifecycle command carries mutations")
 		}
 	}
 
@@ -479,6 +482,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandMutationBatch, true
 	case commandWireSessionRetire:
 		return CommandSessionRetire, true
+	case commandWireSessionRelease:
+		return CommandSessionRelease, true
 	default:
 		return 0, false
 	}

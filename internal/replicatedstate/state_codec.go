@@ -14,7 +14,7 @@ import (
 
 const (
 	stateCodecFormat  = uint16(1)
-	stateHeaderBytes  = 360
+	stateHeaderBytes  = 368
 	recordChecksumLen = sha256.Size
 )
 
@@ -59,6 +59,9 @@ type State struct {
 	SnapshotBaseDigest [32]byte
 	SessionCount       uint64
 	SessionSlotCount   uint64
+	// SessionEpochHighWater is the durable shard-wide anti-resurrection fence
+	// retained after an individual session header and retry ring are reclaimed.
+	SessionEpochHighWater uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -118,6 +121,7 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint16(frame[346:348], uint16(len(state.Binding.Shard)))
 	binary.LittleEndian.PutUint32(frame[348:352], uint32(len(conf)))
 	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
+	binary.LittleEndian.PutUint64(frame[360:368], state.SessionEpochHighWater)
 	cursor := stateHeaderBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
@@ -178,6 +182,7 @@ func OpenState(src []byte) (State, error) {
 	copy(state.BootstrapDigest[:], src[280:312])
 	copy(state.SnapshotBaseDigest[:], src[312:344])
 	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
+	state.SessionEpochHighWater = binary.LittleEndian.Uint64(src[360:368])
 	cursor := stateHeaderBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
@@ -208,6 +213,7 @@ func validateState(state State) error {
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||
 		state.ReplicaSetVersion == math.MaxUint64 || state.SessionCount > state.Applied-1 ||
 		state.SessionSlotCount > state.Applied-1 ||
+		state.SessionEpochHighWater > state.Applied-1 ||
 		state.SessionCount > MaxRetainedSessions ||
 		state.SessionSlotCount > state.SessionCount*MaxSessionRetryWindow ||
 		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||
@@ -224,7 +230,7 @@ func validateState(state State) error {
 	case RecordStaticSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied != 1 ||
 			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.SessionCount != 0 ||
-			state.SessionSlotCount != 0 ||
+			state.SessionSlotCount != 0 || state.SessionEpochHighWater != 0 ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -319,6 +325,7 @@ func equalState(left, right State) bool {
 		left.SnapshotBaseDigest == right.SnapshotBaseDigest &&
 		left.SessionCount == right.SessionCount &&
 		left.SessionSlotCount == right.SessionSlotCount &&
+		left.SessionEpochHighWater == right.SessionEpochHighWater &&
 		proto.Equal(left.ConfState, right.ConfState)
 }
 

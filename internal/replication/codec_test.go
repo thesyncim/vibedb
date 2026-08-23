@@ -60,6 +60,12 @@ func testSessionRetireCommand() Command {
 	return command
 }
 
+func testSessionReleaseCommand() Command {
+	command := testSessionRetireCommand()
+	command.Kind = CommandSessionRelease
+	return command
+}
+
 func testInlineCompletion() Completion {
 	result := []byte{0x01, 0x00, 0xff, 'o', 'k'}
 	completion := Completion{
@@ -222,6 +228,29 @@ func TestSessionRetireRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionReleaseRoundTrip(t *testing.T) {
+	command := testSessionReleaseCommand()
+	encoded := encodeCommand(t, command)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Kind() != CommandSessionRelease || view.MutationCount() != 0 ||
+		view.AckThrough != command.AckThrough ||
+		view.ClientEpoch != command.ClientEpoch ||
+		view.ClientSequence != command.ClientSequence ||
+		view.Fingerprint != command.Fingerprint {
+		t.Fatalf("decoded session release mismatch: %+v", view)
+	}
+	iterator := view.Mutations()
+	if iterator.Next() {
+		t.Fatal("session release exposed a mutation")
+	}
+	if len(encoded) != commandMutationOffset(encoded)+envelopeChecksumBytes {
+		t.Fatalf("session release length = %d, want empty mutation body", len(encoded))
+	}
+}
+
 func TestAckThroughBoundaries(t *testing.T) {
 	for _, ackThrough := range []uint64{0, testCommand().ClientSequence - 1} {
 		command := testCommand()
@@ -345,6 +374,7 @@ func TestCompletionByteInputUsesCanonicalValidation(t *testing.T) {
 func TestGoldenVectors(t *testing.T) {
 	const commandHex = "564442434d4400000100010000010000560100004e00000002000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b00030008001f0000000000000074656e616e74006f6e6574656e616e745f646174612d38306d657373616765730100050014000000616c7068617b226964223a22616c706861222c2276223a317d02000500000000006f6d6567610b481f1bf4b7e0e4"
 	const retireHex = "564442434d4400000100020000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573844f206c7bb0df93"
+	const releaseHex = "564442434d4400000100030000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d6573736167657318fc9ad0e703652f"
 	const inlineHex = "564442434d50000001000100200101004501000005000000000000001d0000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00ef4fa8c2f3151c0180717a46d7a6b869a9b85ccd1e82be796cf4ea1eb9af0650123456789abcdef05000000000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38300100ff6f6b19f88b6ce6077493"
 	const referenceHex = "564442434d5000000100020020010100400100000000000000000000180000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe00123456789abcdef01000100000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38304a28f106b5d70ef9"
 	for _, tc := range []struct {
@@ -354,6 +384,7 @@ func TestGoldenVectors(t *testing.T) {
 	}{
 		{"command", encodeCommand(t, testCommand()), commandHex},
 		{"session_retire", encodeCommand(t, testSessionRetireCommand()), retireHex},
+		{"session_release", encodeCommand(t, testSessionReleaseCommand()), releaseHex},
 		{"inline_completion", encodeCompletion(t, testInlineCompletion()), inlineHex},
 		{"reference_completion", encodeCompletion(t, testReferenceCompletion()), referenceHex},
 	} {
@@ -381,6 +412,7 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 		{"long_collection", func(c *Command) { c.Collection = strings.Repeat("x", MaxCollectionBytes+1) }, ErrEnvelopeSemantic},
 		{"no_mutations", func(c *Command) { c.Mutations = nil }, ErrEnvelopeSemantic},
 		{"retire_with_mutations", func(c *Command) { c.Kind = CommandSessionRetire }, ErrEnvelopeSemantic},
+		{"release_with_mutations", func(c *Command) { c.Kind = CommandSessionRelease }, ErrEnvelopeSemantic},
 		{"too_many_mutations", func(c *Command) { c.Mutations = make([]Mutation, MaxMutations+1) }, ErrEnvelopeSemantic},
 		{"empty_key", func(c *Command) { c.Mutations[0].Key = nil }, ErrEnvelopeSemantic},
 		{"long_key", func(c *Command) { c.Mutations[0].Key = bytes.Repeat([]byte{'a'}, MaxMutationKeyBytes+1) }, ErrEnvelopeSemantic},
@@ -549,6 +581,7 @@ func TestCommandDecodeRejectsDamageAndSemanticCorruption(t *testing.T) {
 		{"body_bytes", func(b []byte) { binary.LittleEndian.PutUint32(b[20:24], uint32(len(b))) }, ErrEnvelopeCorrupt},
 		{"unknown_command_kind", func(b []byte) { b[10] = 99 }, ErrEnvelopeSemantic},
 		{"retire_with_mutations", func(b []byte) { b[10] = commandWireSessionRetire }, ErrEnvelopeSemantic},
+		{"release_with_mutations", func(b []byte) { b[10] = commandWireSessionRelease }, ErrEnvelopeSemantic},
 		{"zero_mutation_count", func(b []byte) { clear(b[24:28]) }, ErrEnvelopeSemantic},
 		{"excess_mutation_count", func(b []byte) { binary.LittleEndian.PutUint32(b[24:28], 3) }, ErrEnvelopeCorrupt},
 		{"flags", func(b []byte) { b[11] = 1 }, ErrEnvelopeSemantic},

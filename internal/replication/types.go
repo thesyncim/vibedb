@@ -34,12 +34,13 @@ const (
 	MaxMutationKeyBytes   = 256
 	MaxMutationValueBytes = 4 << 20
 
-	commandHeaderBytes       = 256
-	completionHeaderBytes    = 288
-	envelopeChecksumBytes    = 8
-	mutationHeaderBytes      = 8
-	commandWireMutationBatch = uint8(1)
-	commandWireSessionRetire = uint8(2)
+	commandHeaderBytes        = 256
+	completionHeaderBytes     = 288
+	envelopeChecksumBytes     = 8
+	mutationHeaderBytes       = 8
+	commandWireMutationBatch  = uint8(1)
+	commandWireSessionRetire  = uint8(2)
+	commandWireSessionRelease = uint8(3)
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -55,8 +56,8 @@ type Digest [32]byte
 type RetryHome [8]byte
 
 // CommandKind selects the command's state-machine operation. The zero value is
-// the ordinary mutation batch so existing command producers remain explicit
-// only when they retire a session.
+// the ordinary mutation batch so command producers remain explicit for session
+// lifecycle operations.
 type CommandKind uint8
 
 const (
@@ -66,6 +67,9 @@ const (
 	// mutations. The compact identity high-water remains durable so delayed
 	// commands from a retired epoch can never become new again.
 	CommandSessionRetire
+	// CommandSessionRelease reclaims the bounded retry state for an already
+	// retired client epoch and carries no mutations.
+	CommandSessionRelease
 )
 
 // MutationKind selects one logical collection mutation.
