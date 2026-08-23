@@ -26,12 +26,18 @@ const (
 	ResultInvalidDocument   uint32 = 4
 	ResultTargetBound       uint32 = 5
 	ResultWrongShard        uint32 = 6
+	ResultSessionRetired    uint32 = 7
 
-	// MaxStateEnvelopeBytes and MaxCompletionRecordBytes bound the two binary
-	// records before their canonical hexadecimal JSON wrapping.
-	MaxStateEnvelopeBytes           = 64 << 10
-	MaxCompletionRecordBytes        = 256 << 10
-	MaxRetainedCompletions          = 1 << 20
+	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 360-byte
+	// header, two 255-byte identities, checksum, and a deterministic protobuf
+	// with at most 64 ten-byte member IDs fit below 1.6 KiB; 2 KiB retains a
+	// format margin without inflating every hidden collection. Session metadata
+	// and completion slots are independently bounded by their compact codecs.
+	// The product of MaxRetainedSessions and RetryWindow is the hard upper bound
+	// on retry state; it does not grow with operation count.
+	MaxStateEnvelopeBytes           = 2 << 10
+	MaxRetainedSessions             = 1 << 20
+	MaxSessionRetryWindow           = 256
 	MaxStaticBootstrapBytes         = 1 << 20
 	MaxStaticBootstrapEnvelopeBytes = MaxStaticBootstrapBytes + MaxStateEnvelopeBytes
 	MaxDistinctMutations            = 64
@@ -45,14 +51,20 @@ var (
 	ErrStateCorrupt                = errors.New("replicatedstate: corrupt state record")
 	ErrCompletionCorrupt           = errors.New("replicatedstate: corrupt completion record")
 	ErrCompletionNotFound          = errors.New("replicatedstate: completion not found")
+	ErrRetryRetired                = errors.New("replicatedstate: retry is outside the retained session window")
 	ErrRequestConflict             = errors.New("replicatedstate: client sequence conflicts with retained command")
+	ErrSessionEpoch                = errors.New("replicatedstate: invalid client session epoch")
+	ErrSessionSequence             = errors.New("replicatedstate: client sequence is not the next session sequence")
+	ErrSessionAck                  = errors.New("replicatedstate: client acknowledgement regressed")
+	ErrSessionActive               = errors.New("replicatedstate: current client session is still active")
+	ErrSessionRetired              = errors.New("replicatedstate: client session is retired")
 	ErrStaleCommand                = errors.New("replicatedstate: command has a stale mutable fence")
 	ErrWrongBinding                = errors.New("replicatedstate: command belongs to another shard binding")
 	ErrApplySequence               = errors.New("replicatedstate: invalid apply sequence")
 	ErrApplyPoisoned               = errors.New("replicatedstate: machine is poisoned; reopen required")
 	ErrStaticSnapshotOnly          = errors.New("replicatedstate: only the exact static bootstrap snapshot is supported")
 	ErrAdmissionBound              = errors.New("replicatedstate: command exceeds the frozen apply profile")
-	ErrSchemaProfile               = errors.New("replicatedstate: requires a schema-free JSON collection")
+	ErrSchemaProfile               = errors.New("replicatedstate: requires an exact schema-free collection profile")
 	ErrInconsistentSnapshot        = errors.New("replicatedstate: coherent snapshot disagrees with publication")
 	ErrCodecAlias                  = errors.New("replicatedstate: codec input aliases destination append region")
 	ErrSnapshotArtifact            = errors.New("replicatedstate: corrupt snapshot artifact")
@@ -110,9 +122,10 @@ func (b Binding) validate() error {
 type ValidationProfile uint8
 
 const (
-	// ValidationSchemaFreeJSON is reserved for the hidden system collection. It
-	// requires a zero ValidationDigest and no MutationValidator.
-	ValidationSchemaFreeJSON ValidationProfile = 1
+	// ValidationOpaqueBinary is reserved for the hidden system collection. It
+	// requires durable opaque-value mode, a zero ValidationDigest, and no
+	// MutationValidator.
+	ValidationOpaqueBinary ValidationProfile = 1
 
 	// ValidationDeterministicMutation adds a caller-supplied deterministic
 	// mutation contract, including explicit wrong-shard refusals. It requires a
@@ -201,12 +214,12 @@ func (t CollectionTarget) validate() error {
 	}
 	zeroDigest := t.ValidationDigest == ([32]byte{})
 	switch t.Validation {
-	case ValidationSchemaFreeJSON:
-		if !zeroDigest || t.Validator != nil {
-			return fmt.Errorf("%w: schema-free validation requires zero digest and no validator", ErrInvalidCollection)
+	case ValidationOpaqueBinary:
+		if !t.Collection.HasOpaqueValues() || !zeroDigest || t.Validator != nil {
+			return fmt.Errorf("%w: opaque validation requires opaque storage, zero digest, and no validator", ErrInvalidCollection)
 		}
 	case ValidationDeterministicMutation:
-		if zeroDigest || t.Validator == nil {
+		if t.Collection.HasOpaqueValues() || zeroDigest || t.Validator == nil {
 			return fmt.Errorf("%w: deterministic validation requires digest and validator", ErrInvalidCollection)
 		}
 	default:
@@ -226,25 +239,27 @@ func (t CollectionTarget) validate() error {
 	return nil
 }
 
-// Options fixes the cross-collection and completion-retention admission
-// profile. Zero values fail closed.
+// Options fixes the cross-collection and bounded-session admission profile.
+// Zero values fail closed.
 type Options struct {
 	TxnLimits         durable.TxnLimits
-	MaxCompletions    uint64
+	MaxSessions       uint64
+	RetryWindow       uint16
 	TransitionCapture TransitionCapture
 }
 
 func (o Options) validate() error {
-	if o.MaxCompletions == 0 || o.MaxCompletions > MaxRetainedCompletions ||
+	if o.MaxSessions == 0 || o.MaxSessions > MaxRetainedSessions ||
+		o.RetryWindow == 0 || o.RetryWindow > MaxSessionRetryWindow ||
 		o.TxnLimits.MaxCollections < 2 ||
-		o.TxnLimits.MaxDocuments < 3 || o.TxnLimits.MaxBytes <= 0 {
+		o.TxnLimits.MaxDocuments < 4 || o.TxnLimits.MaxBytes <= 0 {
 		return ErrInvalidOptions
 	}
 	return nil
 }
 
-// RequestConflictError identifies the retained completion key involved in a
-// tuple reuse. The original record remains authoritative and is not replaced.
+// RequestConflictError identifies the retained session key involved in a
+// sequence reuse. The original result remains authoritative and is not replaced.
 type RequestConflictError struct {
 	Key [32]byte
 }

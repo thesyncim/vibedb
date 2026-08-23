@@ -90,9 +90,12 @@ func InitializeStagedSnapshot(
 		return nil, nil, SnapshotArtifactManifest{},
 			fmt.Errorf("%w: %v", ErrStagedSnapshot, err)
 	}
-	current, present, completions, scanErr := scanSystemSnapshot(systemSnapshot, 0)
+	current, present, sessions, slots, scanErr := scanSessionSystemSnapshot(
+		systemSnapshot, options.MaxSessions, options.RetryWindow,
+	)
 	closeErr := cutSnapshot.Close()
-	if scanErr != nil || closeErr != nil || completions != 0 || present && !equalState(current, state) {
+	if scanErr != nil || closeErr != nil || sessions != 0 || slots != 0 ||
+		present && !equalState(current, state) {
 		return nil, nil, SnapshotArtifactManifest{}, errors.Join(
 			ErrStagedSnapshot, scanErr, closeErr,
 		)
@@ -102,9 +105,8 @@ func InitializeStagedSnapshot(
 		if appendErr != nil {
 			return nil, nil, SnapshotArtifactManifest{}, appendErr
 		}
-		document := wrapJSONHex(nil, envelope)
 		if err := prepared.system.Collection.Update(func(batch *durable.WriteBatch) error {
-			return batch.Put(stateKey, document)
+			return batch.Put(stateKey, envelope)
 		}); err != nil {
 			return nil, nil, SnapshotArtifactManifest{}, err
 		}

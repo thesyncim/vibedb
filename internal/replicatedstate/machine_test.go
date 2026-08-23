@@ -39,22 +39,22 @@ func (acceptAllMutationValidator) ValidateDelete(_, _ []byte, _ bool) MutationVa
 func newMachineFixture(t testing.TB) machineFixture {
 	t.Helper()
 	dir := t.TempDir()
-	openCollection := func(name string) CollectionTarget {
+	openCollection := func(name string, options durable.Options) CollectionTarget {
 		file, err := os.OpenFile(filepath.Join(dir, name+".vdb"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = file.Close() })
-		collection, err := durable.Create(file, durable.Options{})
+		collection, err := durable.Create(file, options)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = collection.Close() })
 		return targetOf(collection)
 	}
-	system := openCollection("system")
+	system := openCollection("system", durable.Options{OpaqueValues: true})
 	system = systemTargetOf(system.Collection)
-	user := openCollection("user")
+	user := openCollection("user", durable.Options{})
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +65,11 @@ func newMachineFixture(t testing.TB) machineFixture {
 	options := Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 2,
-			MaxDocuments:   user.Limits.MaxDistinctMutations + 2,
+			MaxDocuments:   user.Limits.MaxDistinctMutations + 3,
 			MaxBytes:       64 << 20,
 		},
-		MaxCompletions: 128,
+		MaxSessions: 128,
+		RetryWindow: 8,
 	}
 	machine, err := Open(binding, bootstrap, system, UserCollection{Name: "docs", Target: user}, log, options)
 	if err != nil {
@@ -91,7 +92,7 @@ func targetOf(collection *durable.Collection) CollectionTarget {
 
 func systemTargetOf(collection *durable.Collection) CollectionTarget {
 	target := targetOf(collection)
-	target.Validation = ValidationSchemaFreeJSON
+	target.Validation = ValidationOpaqueBinary
 	target.ValidationDigest = [32]byte{}
 	target.Validator = nil
 	return target
@@ -210,7 +211,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		SchemaGeneration: fixture.binding.SchemaGeneration, RoutingVersion: fixture.binding.RoutingVersion,
 		RouteGeneration: fixture.binding.RouteGeneration, Tenant: bytes.Clone(view.Tenant),
 		ClientID: view.ClientID, ClientEpoch: view.ClientEpoch, ClientSequence: view.ClientSequence,
-		Fingerprint: view.Fingerprint, RetryHome: replication.RetryHome{1}, Collection: "docs",
+		Fingerprint: view.Fingerprint, RetryHome: view.RetryHome, Collection: "docs",
 		Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
 	}
 	conflict, err = replication.AppendCommand(conflict[:0], conflictingCommand)
@@ -282,15 +283,16 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	defer snapshot.Close()
-	if snapshot.Publication().Applied != 5 || snapshot.State().CompletionCount != 2 {
+	if snapshot.Publication().Applied != 5 || snapshot.State().SessionCount != 1 ||
+		snapshot.State().SessionSlotCount != 2 {
 		t.Fatalf("snapshot state = %+v", snapshot.State())
 	}
 	systemRows := 0
 	if err := snapshot.RangeSystem(func(_, _ []byte) error { systemRows++; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if systemRows != 3 {
-		t.Fatalf("system rows = %d, want state + 2 completions", systemRows)
+	if systemRows != 4 {
+		t.Fatalf("system rows = %d, want state + session + 2 slots", systemRows)
 	}
 }
 

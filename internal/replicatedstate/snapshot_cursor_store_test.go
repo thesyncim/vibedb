@@ -167,7 +167,7 @@ func TestSnapshotCursorStoreRejectsForeignArtifact(t *testing.T) {
 	foreign.previousKeyBytes = 0
 	foreign.currentCollection = SnapshotArtifactSystem
 	foreign.stateRowSeen = false
-	foreign.expectedStateDocument = wrapJSONHex(nil, stateEnvelope)
+	foreign.expectedStateDocument = stateEnvelope
 	foreignRaw, err := AppendSnapshotArtifactCursor(nil, &foreign)
 	if err != nil {
 		t.Fatal(err)

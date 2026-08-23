@@ -21,7 +21,6 @@ const (
 var (
 	stateMagic          = [8]byte{'V', 'D', 'B', 'R', 'S', 'M', 0, 0}
 	stateChecksumDomain = []byte("vibedb/replicated-state/state-checksum\x00")
-	jsonHex             = []byte("0123456789abcdef")
 )
 
 // RecordKind identifies what produced the most recent persisted publication.
@@ -58,7 +57,8 @@ type State struct {
 	// recently established this state-machine base. Normal ordered applies
 	// preserve it; installing a newer certified base replaces it atomically.
 	SnapshotBaseDigest [32]byte
-	CompletionCount    uint64
+	SessionCount       uint64
+	SessionSlotCount   uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -96,7 +96,7 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[24:32], state.Applied)
 	binary.LittleEndian.PutUint64(frame[32:40], state.LastTerm)
 	binary.LittleEndian.PutUint64(frame[40:48], state.ReplicaSetVersion)
-	binary.LittleEndian.PutUint64(frame[48:56], state.CompletionCount)
+	binary.LittleEndian.PutUint64(frame[48:56], state.SessionCount)
 	binary.LittleEndian.PutUint64(frame[56:64], state.Binding.TopologyRecoveryEpoch)
 	binary.LittleEndian.PutUint64(frame[64:72], state.Binding.AllocationGeneration)
 	binary.LittleEndian.PutUint64(frame[72:80], state.Binding.ActivePolicyGeneration)
@@ -117,6 +117,7 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint16(frame[344:346], uint16(len(state.Binding.Distribution)))
 	binary.LittleEndian.PutUint16(frame[346:348], uint16(len(state.Binding.Shard)))
 	binary.LittleEndian.PutUint32(frame[348:352], uint32(len(conf)))
+	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
 	cursor := stateHeaderBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
@@ -133,7 +134,7 @@ func OpenState(src []byte) (State, error) {
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
 		binary.LittleEndian.Uint16(src[12:14]) != stateHeaderBytes ||
-		binary.LittleEndian.Uint16(src[14:16]) != 0 || !allZero(src[352:360]) {
+		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
@@ -158,7 +159,7 @@ func OpenState(src []byte) (State, error) {
 	state.Applied = binary.LittleEndian.Uint64(src[24:32])
 	state.LastTerm = binary.LittleEndian.Uint64(src[32:40])
 	state.ReplicaSetVersion = binary.LittleEndian.Uint64(src[40:48])
-	state.CompletionCount = binary.LittleEndian.Uint64(src[48:56])
+	state.SessionCount = binary.LittleEndian.Uint64(src[48:56])
 	state.Binding.TopologyRecoveryEpoch = binary.LittleEndian.Uint64(src[56:64])
 	state.Binding.AllocationGeneration = binary.LittleEndian.Uint64(src[64:72])
 	state.Binding.ActivePolicyGeneration = binary.LittleEndian.Uint64(src[72:80])
@@ -176,6 +177,7 @@ func OpenState(src []byte) (State, error) {
 	copy(state.ApplyContractDigest[:], src[248:280])
 	copy(state.BootstrapDigest[:], src[280:312])
 	copy(state.SnapshotBaseDigest[:], src[312:344])
+	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
 	cursor := stateHeaderBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
@@ -204,7 +206,10 @@ func validateState(state State) error {
 	if state.Applied == 0 || state.Applied == math.MaxUint64 ||
 		state.LastTerm == 0 || state.LastTerm == math.MaxUint64 || state.ConfState == nil ||
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||
-		state.ReplicaSetVersion == math.MaxUint64 || state.CompletionCount > state.Applied-1 ||
+		state.ReplicaSetVersion == math.MaxUint64 || state.SessionCount > state.Applied-1 ||
+		state.SessionSlotCount > state.Applied-1 ||
+		state.SessionCount > MaxRetainedSessions ||
+		state.SessionSlotCount > state.SessionCount*MaxSessionRetryWindow ||
 		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||
 		state.SnapshotBaseDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: invalid state scalar", ErrStateCorrupt)
@@ -218,7 +223,8 @@ func validateState(state State) error {
 	switch state.LastKind {
 	case RecordStaticSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied != 1 ||
-			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.CompletionCount != 0 ||
+			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.SessionCount != 0 ||
+			state.SessionSlotCount != 0 ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -246,7 +252,8 @@ func validateState(state State) error {
 		}
 	case RecordImportedSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
-			state.ReplicaSetVersion >= state.Applied || state.CompletionCount != 0 ||
+			state.ReplicaSetVersion >= state.Applied || state.SessionCount != 0 ||
+			state.SessionSlotCount != 0 ||
 			state.LastEntryDigest == ([sha256.Size]byte{}) {
 			return fmt.Errorf("%w: imported snapshot state", ErrStateCorrupt)
 		}
@@ -283,46 +290,6 @@ func allZero(src []byte) bool {
 	return true
 }
 
-func wrapJSONHex(dst, raw []byte) []byte {
-	dst = append(dst, '"')
-	for _, b := range raw {
-		dst = append(dst, jsonHex[b>>4], jsonHex[b&15])
-	}
-	dst = append(dst, '"')
-	return dst
-}
-
-func unwrapJSONHex(src []byte, maxRaw int, category error) ([]byte, error) {
-	if len(src) < 2 || src[0] != '"' || src[len(src)-1] != '"' ||
-		(len(src)-2)&1 != 0 || (len(src)-2)/2 > maxRaw {
-		return nil, fmt.Errorf("%w: noncanonical JSON wrapper", category)
-	}
-	raw := make([]byte, (len(src)-2)/2)
-	for i := range raw {
-		hi, ok := lowerHex(src[1+2*i])
-		if !ok {
-			return nil, fmt.Errorf("%w: noncanonical JSON wrapper", category)
-		}
-		lo, ok := lowerHex(src[2+2*i])
-		if !ok {
-			return nil, fmt.Errorf("%w: noncanonical JSON wrapper", category)
-		}
-		raw[i] = hi<<4 | lo
-	}
-	return raw, nil
-}
-
-func lowerHex(b byte) (byte, bool) {
-	switch {
-	case b >= '0' && b <= '9':
-		return b - '0', true
-	case b >= 'a' && b <= 'f':
-		return b - 'a' + 10, true
-	default:
-		return 0, false
-	}
-}
-
 func cloneConfState(state *pb.ConfState) *pb.ConfState {
 	if state == nil {
 		return nil
@@ -350,7 +317,8 @@ func equalState(left, right State) bool {
 		left.ReplicaSetVersion == right.ReplicaSetVersion &&
 		left.BootstrapDigest == right.BootstrapDigest &&
 		left.SnapshotBaseDigest == right.SnapshotBaseDigest &&
-		left.CompletionCount == right.CompletionCount &&
+		left.SessionCount == right.SessionCount &&
+		left.SessionSlotCount == right.SessionSlotCount &&
 		proto.Equal(left.ConfState, right.ConfState)
 }
 

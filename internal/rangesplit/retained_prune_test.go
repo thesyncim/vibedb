@@ -74,7 +74,9 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	binding.OwnershipEpoch++
 	binding.RoutingVersion++
 	binding.RouteGeneration++
-	sequence, applied := uint64(2), uint64(5)
+	// The prune controller owns an independent bounded session, so its first
+	// command starts at client sequence one regardless of the shard apply index.
+	sequence, applied := uint64(1), uint64(5)
 	if _, err := fixture.machine.ApplyNormal(
 		sourceCaptureMeta(applied), retainedPruneCommand(t, fixture, binding, 3, sequence, retry),
 	); err != nil {

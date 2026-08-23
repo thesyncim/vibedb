@@ -24,12 +24,19 @@ var (
 
 type commandPlan struct {
 	command         replication.CommandView
-	key             [33]byte
-	completionDoc   []byte
+	sessionDigest   [32]byte
+	sessionKey      [33]byte
+	slotKey         [35]byte
+	sessionRecord   []byte
+	slotRecord      []byte
 	changes         []finalMutation
 	dataChainDigest [32]byte
 	resultCode      uint32
-	newCompletion   bool
+	refusal         error
+	writeSession    bool
+	writeSlot       bool
+	newSession      bool
+	newPhysicalSlot bool
 	exactDuplicate  bool
 	conflict        bool
 }
@@ -79,14 +86,14 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 		}
 		next := m.nextState(meta, RecordOwnership, digest)
 		next.Binding = binding
-		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		return clonePublication(m.publication), nil
 	}
 	if len(data) == 0 {
 		next := m.nextState(meta, RecordNormal, digest)
-		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		return clonePublication(m.publication), nil
@@ -111,14 +118,13 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	}
 	next := m.nextState(meta, RecordNormal, digest)
 	next.DataChainDigest = plan.dataChainDigest
-	if plan.newCompletion {
-		next.CompletionCount++
+	if plan.newSession {
+		next.SessionCount++
 	}
-	var completionDoc []byte
-	if plan.newCompletion {
-		completionDoc = plan.completionDoc
+	if plan.newPhysicalSlot {
+		next.SessionSlotCount++
 	}
-	if err := m.persistTransition(next, plan.changes, plan.key, completionDoc); err != nil {
+	if err := m.persistTransition(next, plan.changes, plan); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	return clonePublication(m.publication), nil
@@ -155,7 +161,7 @@ func (m *Machine) ApplyConfiguration(meta raftmodel.ApplyMeta, conf *pb.ConfStat
 	next := m.nextState(meta, RecordConfiguration, digest)
 	next.ConfState = cloneConfState(conf)
 	next.ReplicaSetVersion = meta.Index
-	if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+	if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	return clonePublication(m.publication), nil
@@ -191,7 +197,7 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 			ReplicaSetVersion:   1, BootstrapDigest: m.bootstrapDigest,
 			SnapshotBaseDigest: m.bootstrapDigest,
 		}
-		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		return clonePublication(m.publication), nil
@@ -216,7 +222,7 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	case certificate.Manifest.State.SnapshotBaseDigest:
 		next := cloneState(m.state)
 		next.SnapshotBaseDigest = certificate.Digest
-		if err := m.persistTransition(next, nil, [33]byte{}, nil); err != nil {
+		if err := m.persistTransition(next, nil, commandPlan{}); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		return clonePublication(m.publication), nil
@@ -250,7 +256,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 		next := m.nextState(meta, RecordOwnership, normalEntryDigest(meta, transition.Bytes()))
 		next.Binding = binding
-		return m.checkTransitionCapacity(next, nil, [33]byte{}, nil)
+		return m.checkTransitionCapacity(next, nil, commandPlan{})
 	}
 	command, err := replication.OpenCommand(data)
 	if err != nil {
@@ -286,17 +292,19 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	switch {
 	case plan.conflict:
-		var digest [32]byte
-		copy(digest[:], plan.key[1:])
-		return &RequestConflictError{Key: digest}
+		return &RequestConflictError{Key: plan.sessionDigest}
+	case plan.refusal != nil:
+		return plan.refusal
 	case plan.exactDuplicate:
-		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, [33]byte{}, nil)
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultStaleFence:
 		return ErrStaleCommand
+	case plan.resultCode == ResultSessionRetired:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
 	default:
-		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), plan.changes, plan.key, plan.completionDoc)
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), plan.changes, plan)
 	}
 }
 
@@ -304,8 +312,11 @@ func (m *Machine) hypotheticalState(command replication.CommandView, plan comman
 	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
 	next.DataChainDigest = plan.dataChainDigest
-	if plan.newCompletion {
-		next.CompletionCount++
+	if plan.newSession {
+		next.SessionCount++
+	}
+	if plan.newPhysicalSlot {
+		next.SessionSlotCount++
 	}
 	return next
 }
@@ -336,7 +347,7 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ApplyContractDigest: m.applyContract,
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
-		CompletionCount: m.state.CompletionCount,
+		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 	}
 }
 
@@ -400,46 +411,168 @@ func (m *Machine) planCommand(
 	systemSnapshot, userSnapshot pointSnapshot,
 ) (commandPlan, error) {
 	plan := commandPlan{command: command, dataChainDigest: m.state.DataChainDigest}
-	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
-	plan.key = completionStorageKey(digest)
-	existing, found, err := completionAt(systemSnapshot, plan.key)
+	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
+	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
+	logicalDigest := LogicalCommandDigest(command)
+	session, found, err := sessionAt(systemSnapshot, plan.sessionKey)
 	if err != nil {
 		return commandPlan{}, err
 	}
-	if found {
-		completion, completionErr := replication.OpenCompletion(existing.Completion)
-		if completionErr != nil {
-			return commandPlan{}, fmt.Errorf("%w: %v", ErrCompletionCorrupt, completionErr)
-		}
-		if err := m.validateCompletionResult(completion); err != nil {
-			return commandPlan{}, err
-		}
-		if !recordTupleMatchesCommand(existing, command) {
-			return commandPlan{}, fmt.Errorf("%w: completion-key hash collision", ErrCompletionCorrupt)
-		}
-		if recordMatchesCommand(existing, command) {
-			plan.exactDuplicate = true
+
+	var next SessionRecord
+	if !found {
+		if m.state.SessionCount >= m.options.MaxSessions {
+			plan.refusal = ErrAdmissionBound
 			return plan, nil
 		}
-		plan.conflict = true
+		if command.ClientSequence != 1 || command.AckThrough != 0 {
+			plan.refusal = ErrSessionSequence
+			return plan, nil
+		}
+		next = SessionRecord{
+			Tenant: command.Tenant, ClientID: command.ClientID,
+			ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
+			Status: SessionActive, RetryWindow: m.options.RetryWindow,
+		}
+		plan.newSession = true
+	} else {
+		if session.Digest != plan.sessionDigest ||
+			!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID {
+			return commandPlan{}, fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+		}
+		if session.RetryWindow != m.options.RetryWindow {
+			return commandPlan{}, fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
+		}
+		switch {
+		case command.ClientEpoch < session.ClientEpoch:
+			plan.refusal = ErrRetryRetired
+			return plan, nil
+		case command.ClientEpoch > session.ClientEpoch:
+			if session.ClientEpoch == math.MaxUint64 ||
+				command.ClientEpoch != session.ClientEpoch+1 {
+				plan.refusal = ErrSessionEpoch
+				return plan, nil
+			}
+			if session.Status != SessionRetired {
+				plan.refusal = ErrSessionActive
+				return plan, nil
+			}
+			if command.ClientSequence != 1 || command.AckThrough != 0 {
+				plan.refusal = ErrSessionSequence
+				return plan, nil
+			}
+			if session.RetryHome != command.RetryHome {
+				plan.conflict = true
+				return plan, nil
+			}
+			next = SessionRecord{
+				Tenant: session.Tenant, ClientID: session.ClientID,
+				ClientEpoch: command.ClientEpoch, RetryHome: session.RetryHome,
+				Status: SessionActive, RetryWindow: session.RetryWindow,
+				PhysicalSlotCount: session.PhysicalSlotCount,
+			}
+		default:
+			if command.ClientSequence <= session.HighSequence {
+				if command.ClientSequence <= sessionRetryFloor(session) {
+					plan.refusal = ErrRetryRetired
+					return plan, nil
+				}
+				slot := uint16((command.ClientSequence - 1) % uint64(session.RetryWindow))
+				plan.slotKey, err = SessionSlotStorageKey(plan.sessionDigest, slot)
+				if err != nil {
+					return commandPlan{}, err
+				}
+				existing, slotFound, slotErr := sessionSlotAt(systemSnapshot, plan.slotKey)
+				if slotErr != nil {
+					return commandPlan{}, slotErr
+				}
+				if !slotFound || existing.SessionDigest != plan.sessionDigest ||
+					existing.Slot != slot || existing.ClientEpoch != command.ClientEpoch ||
+					existing.ClientSequence != command.ClientSequence {
+					return commandPlan{}, fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
+				}
+				if err := validateStoredSessionSlot(m.state, existing); err != nil {
+					return commandPlan{}, err
+				}
+				if err := validateSessionSlotAgainstHeader(session, existing); err != nil {
+					return commandPlan{}, err
+				}
+				if session.RetryHome != command.RetryHome ||
+					existing.Fingerprint != command.Fingerprint ||
+					existing.LogicalCommandDigest != logicalDigest {
+					plan.conflict = true
+					return plan, nil
+				}
+				plan.exactDuplicate = true
+				if command.AckThrough > session.AckThrough {
+					next = sessionRecord(session)
+					next.AckThrough = command.AckThrough
+					plan.sessionRecord, err = AppendSessionRecord(nil, next)
+					if err != nil {
+						return commandPlan{}, err
+					}
+					plan.writeSession = true
+				}
+				return plan, nil
+			}
+			if session.Status == SessionRetired {
+				plan.refusal = ErrSessionRetired
+				return plan, nil
+			}
+			if session.HighSequence == math.MaxUint64 ||
+				command.ClientSequence != session.HighSequence+1 {
+				plan.refusal = ErrSessionSequence
+				return plan, nil
+			}
+			if command.AckThrough < session.AckThrough {
+				plan.refusal = ErrSessionAck
+				return plan, nil
+			}
+			if session.RetryHome != command.RetryHome {
+				plan.conflict = true
+				return plan, nil
+			}
+			next = sessionRecord(session)
+		}
+	}
+
+	// Reserve the terminal uint64 value for retirement. An ordinary command at
+	// this sequence could leave an active epoch with no possible successor.
+	if command.Kind() != replication.CommandSessionRetire &&
+		command.ClientSequence == math.MaxUint64 {
+		plan.refusal = ErrSessionSequence
 		return plan, nil
 	}
-	if m.state.CompletionCount >= m.options.MaxCompletions {
-		return commandPlan{}, ErrAdmissionBound
-	}
-	plan.newCompletion = true
-	switch {
-	case !m.mutableBindingMatches(command):
-		plan.resultCode = ResultStaleFence
-	case string(command.Collection) != m.userName:
-		plan.resultCode = ResultUnknownCollection
-	default:
-		plan.changes, plan.resultCode, err = m.planMutations(command, userSnapshot)
-		if err != nil {
-			return commandPlan{}, err
+	if command.Kind() == replication.CommandSessionRetire {
+		if command.AckThrough != next.HighSequence {
+			plan.refusal = ErrSessionAck
+			return plan, nil
 		}
-		if plan.resultCode == ResultApplied {
-			if len(plan.changes) != 0 {
+		if !m.mutableBindingMatches(command) {
+			// The terminal sequence cannot retain a stale completion because that
+			// would strand an active epoch at MaxUint64. Leave the session
+			// unchanged so the same sequence can be proposed with refreshed
+			// mutable fences. The Raft apply position still advances.
+			if command.ClientSequence == math.MaxUint64 {
+				plan.refusal = ErrStaleCommand
+				return plan, nil
+			}
+			plan.resultCode = ResultStaleFence
+		} else {
+			plan.resultCode = ResultSessionRetired
+		}
+	} else {
+		switch {
+		case !m.mutableBindingMatches(command):
+			plan.resultCode = ResultStaleFence
+		case !bytes.Equal(command.Collection, m.userNameBytes):
+			plan.resultCode = ResultUnknownCollection
+		default:
+			plan.changes, plan.resultCode, err = m.planMutations(command, userSnapshot)
+			if err != nil {
+				return commandPlan{}, err
+			}
+			if plan.resultCode == ResultApplied && len(plan.changes) != 0 {
 				plan.dataChainDigest, err = dataChainTransitionDigest(
 					m.dataChainHash, m.state.DataChainDigest, m.applyContract, plan.changes,
 				)
@@ -449,11 +582,66 @@ func (m *Machine) planCommand(
 			}
 		}
 	}
-	plan.completionDoc, err = m.makeCompletionDocument(command, applied, plan.resultCode)
+
+	slot := uint16((command.ClientSequence - 1) % uint64(next.RetryWindow))
+	plan.slotKey, err = SessionSlotStorageKey(plan.sessionDigest, slot)
 	if err != nil {
 		return commandPlan{}, err
 	}
+	if slot >= next.PhysicalSlotCount {
+		if slot != next.PhysicalSlotCount {
+			return commandPlan{}, fmt.Errorf("%w: noncontiguous physical slot", ErrSessionCorrupt)
+		}
+		next.PhysicalSlotCount++
+		plan.newPhysicalSlot = true
+	}
+	next.HighSequence = command.ClientSequence
+	next.AckThrough = command.AckThrough
+	if plan.resultCode == ResultSessionRetired {
+		next.Status = SessionRetired
+	}
+	plan.sessionRecord, err = AppendSessionRecord(nil, next)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	plan.slotRecord, err = AppendSessionSlot(nil, SessionSlot{
+		Slot:                   slot,
+		SessionDigest:          plan.sessionDigest,
+		ClientEpoch:            command.ClientEpoch,
+		ClientSequence:         command.ClientSequence,
+		AppliedSequence:        applied,
+		Fingerprint:            command.Fingerprint,
+		LogicalCommandDigest:   logicalDigest,
+		ResultCode:             plan.resultCode,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch,
+		RoutingVersion:         command.RoutingVersion,
+		RouteGeneration:        command.RouteGeneration,
+	})
+	if err != nil {
+		return commandPlan{}, err
+	}
+	plan.writeSession, plan.writeSlot = true, true
 	return plan, nil
+}
+
+func sessionRecord(view SessionView) SessionRecord {
+	return SessionRecord{
+		Tenant: view.Tenant, ClientID: view.ClientID, ClientEpoch: view.ClientEpoch,
+		RetryHome: view.RetryHome, AckThrough: view.AckThrough,
+		HighSequence: view.HighSequence, Status: view.Status,
+		RetryWindow: view.RetryWindow, PhysicalSlotCount: view.PhysicalSlotCount,
+	}
+}
+
+func sessionRetryFloor(session SessionView) uint64 {
+	floor := session.AckThrough
+	window := uint64(session.RetryWindow)
+	if session.HighSequence > window && session.HighSequence-window > floor {
+		floor = session.HighSequence - window
+	}
+	return floor
 }
 
 func (m *Machine) planMutations(
@@ -552,44 +740,6 @@ func (m *Machine) releaseMutationPlan() {
 	m.mutationPlan = m.mutationPlan[:0]
 }
 
-func (m *Machine) makeCompletionDocument(
-	command replication.CommandView,
-	applied uint64,
-	code uint32,
-) ([]byte, error) {
-	resultDigest := replication.CompletionResultDigest(code, ResultFormatMutation, nil)
-	completion, err := replication.AppendCompletion(nil, replication.Completion{
-		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
-		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
-		Distribution:          string(command.Distribution), Shard: string(command.Shard),
-		AllocationGeneration: command.AllocationGeneration,
-		ShardIncarnation:     command.ShardIncarnation, GroupID: command.GroupID,
-		ReplicaSetVersion:      command.ReplicaSetVersion,
-		ActivePolicyGeneration: command.ActivePolicyGeneration,
-		ProtectionEpoch:        command.ProtectionEpoch, RoutingVersion: command.RoutingVersion,
-		RouteGeneration: command.RouteGeneration, Tenant: command.Tenant,
-		ClientID: command.ClientID, ClientEpoch: command.ClientEpoch,
-		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
-		RetryHome: command.RetryHome, AppliedSequence: applied,
-		ResultCode: code, ResultFormat: ResultFormatMutation,
-		Storage: replication.CompletionInline, ResultDigest: resultDigest,
-	})
-	if err != nil {
-		return nil, err
-	}
-	record, err := AppendCompletionRecord(nil, CompletionRecord{
-		Tenant: command.Tenant, ClientID: command.ClientID,
-		ClientEpoch: command.ClientEpoch, ClientSequence: command.ClientSequence,
-		RetryHome: command.RetryHome, Fingerprint: command.Fingerprint,
-		CommandDigest: CommandDigest(command.Bytes()), Collection: string(command.Collection),
-		Completion: completion,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return wrapJSONHex(nil, record), nil
-}
-
 // pointSnapshot is the planning capability: its API deliberately has no range
 // operation. Keeping the wrapper concrete also lets point reads inline without
 // interface escape allocations on every command key.
@@ -601,24 +751,41 @@ func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	return s.value.AppendRaw(dst, key)
 }
 
-func completionAt(snapshot pointSnapshot, key [33]byte) (CompletionRecord, bool, error) {
-	document, found, err := snapshot.appendRaw(nil, key[:])
+func sessionAt(snapshot pointSnapshot, key [33]byte) (SessionView, bool, error) {
+	record, found, err := snapshot.appendRaw(nil, key[:])
 	if err != nil || !found {
-		return CompletionRecord{}, found, err
+		return SessionView{}, found, err
 	}
-	raw, err := unwrapJSONHex(document, MaxCompletionRecordBytes, ErrCompletionCorrupt)
+	view, err := OpenSessionRecord(record)
 	if err != nil {
-		return CompletionRecord{}, false, err
+		return SessionView{}, false, err
 	}
-	record, err := OpenCompletionRecord(raw)
-	return record, err == nil, err
+	if key != SessionStorageKey(view.Digest) {
+		return SessionView{}, false, fmt.Errorf("%w: session storage key mismatch", ErrSessionCorrupt)
+	}
+	return view, true, nil
+}
+
+func sessionSlotAt(snapshot pointSnapshot, key [35]byte) (SessionSlotView, bool, error) {
+	record, found, err := snapshot.appendRaw(nil, key[:])
+	if err != nil || !found {
+		return SessionSlotView{}, found, err
+	}
+	view, err := OpenSessionSlot(record)
+	if err != nil {
+		return SessionSlotView{}, false, err
+	}
+	want, err := SessionSlotStorageKey(view.SessionDigest, view.Slot)
+	if err != nil || key != want {
+		return SessionSlotView{}, false, fmt.Errorf("%w: slot storage key mismatch", ErrSessionCorrupt)
+	}
+	return view, true, nil
 }
 
 func (m *Machine) persistTransition(
 	next State,
 	changes []finalMutation,
-	completionKey [33]byte,
-	completionDocument []byte,
+	plan commandPlan,
 ) error {
 	defer m.releaseCaptureChanges()
 	var transition CapturedTransition
@@ -643,9 +810,8 @@ func (m *Machine) persistTransition(
 	if err != nil {
 		return err
 	}
-	stateDocument := wrapJSONHex(nil, stateEnvelope)
 	if err := m.checkTransitionCapacityWithCapture(
-		next, changes, completionKey, completionDocument, len(captureRecord),
+		next, changes, plan, len(captureRecord),
 	); err != nil {
 		return err
 	}
@@ -663,11 +829,16 @@ func (m *Machine) persistTransition(
 		if err != nil {
 			return err
 		}
-		if err := systemBatch.Put(stateKey, stateDocument); err != nil {
+		if err := systemBatch.Put(stateKey, stateEnvelope); err != nil {
 			return err
 		}
-		if len(completionDocument) != 0 {
-			if err := systemBatch.Put(completionKey[:], completionDocument); err != nil {
+		if plan.writeSession {
+			if err := systemBatch.Put(plan.sessionKey[:], plan.sessionRecord); err != nil {
+				return err
+			}
+		}
+		if plan.writeSlot {
+			if err := systemBatch.Put(plan.slotKey[:], plan.slotRecord); err != nil {
 				return err
 			}
 		}
@@ -707,6 +878,12 @@ func (m *Machine) persistTransition(
 		return err
 	}
 	m.state = next
+	if m.binding.Distribution != next.Binding.Distribution {
+		m.distribution = []byte(next.Binding.Distribution)
+	}
+	if m.binding.Shard != next.Binding.Shard {
+		m.shard = []byte(next.Binding.Shard)
+	}
 	m.binding = next.Binding
 	m.initialized = true
 	m.publication = publicationFromState(next)
@@ -721,8 +898,7 @@ func (m *Machine) persistTransition(
 func (m *Machine) checkTransitionCapacity(
 	next State,
 	changes []finalMutation,
-	completionKey [33]byte,
-	completionDocument []byte,
+	plan commandPlan,
 ) error {
 	defer m.releaseCaptureChanges()
 	captureBytes := 0
@@ -739,31 +915,37 @@ func (m *Machine) checkTransitionCapacity(
 		}
 	}
 	return m.checkTransitionCapacityWithCapture(
-		next, changes, completionKey, completionDocument, captureBytes,
+		next, changes, plan, captureBytes,
 	)
 }
 
 func (m *Machine) checkTransitionCapacityWithCapture(
 	next State,
 	changes []finalMutation,
-	completionKey [33]byte,
-	completionDocument []byte,
+	plan commandPlan,
 	captureBytes int,
 ) error {
 	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
 		return err
 	}
-	stateBytes := len(stateKey) + 2*len(stateEnvelope) + 2
+	stateBytes := len(stateKey) + len(stateEnvelope)
 	systemDocs := 1
-	if len(completionDocument) != 0 {
-		if len(completionDocument) > m.system.Limits.MaxDocumentBytes {
+	if plan.writeSession {
+		if len(plan.sessionRecord) == 0 || len(plan.sessionRecord) > m.system.Limits.MaxDocumentBytes {
 			return ErrAdmissionBound
 		}
-		stateBytes += len(completionKey) + len(completionDocument)
+		stateBytes += len(plan.sessionKey) + len(plan.sessionRecord)
 		systemDocs++
 	}
-	if 2*len(stateEnvelope)+2 > m.system.Limits.MaxDocumentBytes ||
+	if plan.writeSlot {
+		if len(plan.slotRecord) == 0 || len(plan.slotRecord) > m.system.Limits.MaxDocumentBytes {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.slotKey) + len(plan.slotRecord)
+		systemDocs++
+	}
+	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||
 		systemDocs > m.system.Limits.MaxDistinctMutations ||
 		stateBytes > m.system.Limits.MaxBatchBytes {
 		return ErrAdmissionBound

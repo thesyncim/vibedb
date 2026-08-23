@@ -84,7 +84,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	userCollection := create("child-user", durable.Options{
 		MaxDocumentBytes: 4096, MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
-	systemCollection := create("child-system", durable.Options{})
+	systemCollection := create("child-system", durable.Options{OpaqueValues: true})
 	stage, err := NewChildStage(partitioner, set.Children[1], userCollection, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		return target
 	}
 	user := targetOf(userCollection, replicatedstate.ValidationDeterministicMutation)
-	system := targetOf(systemCollection, replicatedstate.ValidationSchemaFreeJSON)
+	system := targetOf(systemCollection, replicatedstate.ValidationOpaqueBinary)
 	txnLog, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -195,10 +195,11 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		TxnLog: txnLog,
 		MachineOptions: replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 2,
+				MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
 				MaxBytes: 64 << 20,
 			},
-			MaxCompletions: 128,
+			MaxSessions: 128,
+			RetryWindow: 8,
 		},
 	}
 	if err := stage.CheckActivationCoordinates(certificate, binding); err != nil {

@@ -126,7 +126,7 @@ func OpenSnapshotArtifactCursor(src []byte) (*SnapshotArtifactCursor, error) {
 			UserRows:         binary.LittleEndian.Uint64(src[64:72]),
 			PayloadBytes:     binary.LittleEndian.Uint64(src[72:80]),
 		},
-		expectedStateDocument: wrapJSONHex(nil, stateEnvelope),
+		expectedStateDocument: bytes.Clone(stateEnvelope),
 		nextSequence:          binary.LittleEndian.Uint64(src[32:40]),
 		encodedBytes:          binary.LittleEndian.Uint64(src[40:48]),
 		previousKeyBytes:      uint16(previousKeyBytes),

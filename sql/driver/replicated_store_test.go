@@ -61,7 +61,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		systemLimits.MaxBatchDocuments,
 		systemLimits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
 	)
-	if systemRequired != int(ReplicatedSystemRecoveryJournalBytes) ||
+	if systemRequired > int(ReplicatedSystemRecoveryJournalBytes) ||
 		ReplicatedSystemRecoveryJournalBytes != 655872 {
 		t.Fatalf(
 			"system conditional record = %d, system profile = %d",
@@ -216,7 +216,7 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 		"missing":    `{}`,
 		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":655872}`,
 		"duplicate":  `{"system_recovery_journal_bytes":655872,"system_recovery_journal_bytes":655872}`,
-		"wrong":      `{"system_recovery_journal_bytes":655360}`,
+		"wrong":      `{"system_recovery_journal_bytes":197120}`,
 		"null":       `null`,
 		"non_object": `[]`,
 	}

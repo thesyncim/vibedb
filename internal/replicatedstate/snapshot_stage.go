@@ -84,7 +84,7 @@ func NewSnapshotArtifactStageWithOptions(
 		return nil, err
 	}
 	if err := system.validate(); err != nil ||
-		system.Validation != ValidationSchemaFreeJSON ||
+		system.Validation != ValidationOpaqueBinary ||
 		system.ValidationDigest != ([32]byte{}) || system.Validator != nil ||
 		system.ObserveMutationAttempt != nil {
 		return nil, fmt.Errorf("%w: system target: %v", ErrSnapshotStage, err)
@@ -307,7 +307,8 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		bytes.Equal(expected.UserCollection, []byte(systemCollectionName)) ||
 		expected.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		expected.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
-		expected.Chunks == 0 || expected.SystemRows != expected.State.CompletionCount+1 ||
+		expected.Chunks == 0 || expected.SystemRows != expected.State.SessionCount+
+		expected.State.SessionSlotCount+1 ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
 		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||

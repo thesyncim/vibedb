@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	ErrInvalidPlan      = errors.New("splitcontroller: invalid online split plan")
-	ErrTopologyConflict = errors.New("splitcontroller: observed authority conflicts with split plan")
+	ErrInvalidPlan             = errors.New("splitcontroller: invalid online split plan")
+	ErrTopologyConflict        = errors.New("splitcontroller: observed authority conflicts with split plan")
+	ErrSessionTransferRequired = errors.New("splitcontroller: retained session transfer is required")
 )
 
 // ActionKind identifies the one safe next operation derived by Reconcile.
@@ -407,6 +408,9 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		if !plan.stagesMatchTail(observed, tail, false) {
 			return Action{Kind: ActionCatchUpTail}, nil
 		}
+		if !sourceSessionsEmpty(observed.SourceState) {
+			return Action{}, ErrSessionTransferRequired
+		}
 		if !sourceLeader(observed.SourceStatus, observed.SourceState) {
 			return Action{Kind: ActionAwaitSourceLeader}, nil
 		}
@@ -448,7 +452,14 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		) != nil {
 		return Action{}, ErrTopologyConflict
 	}
+	if !sourceSessionsEmpty(observed.SourceState) {
+		return Action{}, ErrSessionTransferRequired
+	}
 	return Action{Kind: ActionPublishCatalog, CatalogGeneration: plan.next}, nil
+}
+
+func sourceSessionsEmpty(state replicatedstate.State) bool {
+	return state.SessionCount == 0 && state.SessionSlotCount == 0
 }
 
 type catalogStage uint8
@@ -637,7 +648,8 @@ func (p *Plan) childAction(
 			status.ApplyProfile.Binding != target.SQL.Binding ||
 			!status.ApplyProfile.Initialized ||
 			status.ApplyProfile.Applied < certificate.SourceCut().Applied ||
-			status.ApplyProfile.MaxCompletions != status.ApplyIdentity.MaxCompletions {
+			status.ApplyProfile.MaxSessions != status.ApplyIdentity.MaxSessions ||
+			status.ApplyProfile.RetryWindow != status.ApplyIdentity.RetryWindow {
 			return Action{}, false, ErrTopologyConflict
 		}
 		if status.Phase == ChildPhaseActivated {
@@ -645,7 +657,8 @@ func (p *Plan) childAction(
 				status.RuntimeIdentity != (raftmember.RuntimeIdentity{}) ||
 				status.RuntimeStatus != (raftmember.RuntimeStatus{}) ||
 				status.ApplyProfile.Applied != certificate.SourceCut().Applied ||
-				status.ApplyProfile.CompletionCount != 0 {
+				status.ApplyProfile.SessionCount != 0 ||
+				status.ApplyProfile.SessionSlotCount != 0 {
 				return Action{}, false, ErrTopologyConflict
 			}
 			return Action{Kind: ActionCreateChildWAL, Child: uint8(child)}, true, nil

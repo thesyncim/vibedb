@@ -393,7 +393,7 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 		t.Cleanup(func() { _ = collection.Close(); _ = file.Close() })
 		return collection
 	}
-	systemCollection := create("system", durable.Options{})
+	systemCollection := create("system", durable.Options{OpaqueValues: true})
 	userCollection := create("user", durable.Options{
 		MaxDocumentBytes: 4096, MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
@@ -415,7 +415,7 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 		}
 	}
 	system := target(systemCollection)
-	system.Validation = replicatedstate.ValidationSchemaFreeJSON
+	system.Validation = replicatedstate.ValidationOpaqueBinary
 	system.ValidationDigest = [32]byte{}
 	system.Validator = nil
 	user := target(userCollection)
@@ -443,10 +443,11 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 	}
 	options := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
+			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
 			MaxBytes: 64 << 20,
 		},
-		MaxCompletions: 128,
+		MaxSessions: 128,
+		RetryWindow: 8,
 	}
 	machine, err := replicatedstate.Open(
 		binding, bootstrap, system,

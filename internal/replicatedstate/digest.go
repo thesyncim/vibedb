@@ -14,7 +14,10 @@ import (
 
 const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
-	"mutation-validation-result-map;bytewise-changed-key-order"
+	"mutation-validation-result-map;bytewise-changed-key-order;" +
+	"ordered-client-session-sequences;cumulative-ack-through;" +
+	"fixed-retry-ring;explicit-session-retirement;terminal-retire-only;" +
+	"terminal-stale-retire-unstored;stable-logical-command-digest"
 
 var (
 	canonicalImageDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
@@ -246,10 +249,11 @@ func dataChainTransitionDigest(
 func applyContractDigest(
 	name string,
 	target CollectionTarget,
-	maxCompletions uint64,
+	maxSessions uint64,
+	retryWindow uint16,
 ) ([32]byte, error) {
 	if name == "" || target.Validation != ValidationDeterministicMutation ||
-		target.ValidationDigest == ([32]byte{}) || maxCompletions == 0 ||
+		target.ValidationDigest == ([32]byte{}) || maxSessions == 0 || retryWindow == 0 ||
 		target.Limits.MaxKeyBytes <= 0 || target.Limits.MaxDocumentBytes <= 0 ||
 		target.Limits.MaxDistinctMutations <= 0 || target.Limits.MaxBatchBytes <= 0 {
 		return [32]byte{}, ErrInvalidCollection
@@ -260,7 +264,7 @@ func applyContractDigest(
 	_, _ = h.Write([]byte{byte(target.Validation)})
 	_, _ = h.Write(target.ValidationDigest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
-	var grammar [2 + 7*4]byte
+	var grammar [2 + 8*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -269,17 +273,20 @@ func applyContractDigest(
 		ResultInvalidDocument,
 		ResultTargetBound,
 		ResultWrongShard,
+		ResultSessionRetired,
 		MaxDistinctMutations,
 	} {
 		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)
 	}
 	_, _ = h.Write(grammar[:])
-	var fixed [40]byte
+	var fixed [50]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], uint64(target.Limits.MaxKeyBytes))
 	binary.LittleEndian.PutUint64(fixed[8:16], uint64(target.Limits.MaxDocumentBytes))
 	binary.LittleEndian.PutUint64(fixed[16:24], uint64(target.Limits.MaxDistinctMutations))
 	binary.LittleEndian.PutUint64(fixed[24:32], uint64(target.Limits.MaxBatchBytes))
-	binary.LittleEndian.PutUint64(fixed[32:40], maxCompletions)
+	binary.LittleEndian.PutUint64(fixed[32:40], maxSessions)
+	binary.LittleEndian.PutUint16(fixed[40:42], retryWindow)
+	binary.LittleEndian.PutUint64(fixed[42:50], MaxSessionRetryWindow)
 	_, _ = h.Write(fixed[:])
 	var result [32]byte
 	_ = h.Sum(result[:0])

@@ -307,12 +307,12 @@ func TestChildActionsRequireMonotonicExactEvidence(t *testing.T) {
 
 	identity := sqldriver.ReplicatedApplyIdentity{
 		Storage: "apply", ValidationDigest: sha256.Sum256([]byte("apply")),
-		MaxCompletions: 8,
+		MaxSessions: 8, RetryWindow: 8,
 	}
 	child := &ChildObservation{
 		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
-			Binding: target.SQL.Binding, Initialized: true, MaxCompletions: 8,
+			Binding: target.SQL.Binding, Initialized: true, MaxSessions: 8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
@@ -355,12 +355,12 @@ func TestChildActionsRejectSkippedPhaseAndPrematureEvidence(t *testing.T) {
 	certificate := rangesplit.CutoverCertificate{}
 	identity := sqldriver.ReplicatedApplyIdentity{
 		Storage: "apply", ValidationDigest: sha256.Sum256([]byte("apply")),
-		MaxCompletions: 8,
+		MaxSessions: 8, RetryWindow: 8,
 	}
 	child := &ChildObservation{
 		Child: 1, Phase: ChildPhaseActivated, ApplyIdentity: identity,
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
-			Binding: target.SQL.Binding, Initialized: true, MaxCompletions: 8,
+			Binding: target.SQL.Binding, Initialized: true, MaxSessions: 8, RetryWindow: 8,
 		},
 		WALBinding: target.SQL.Binding,
 	}

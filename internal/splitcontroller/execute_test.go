@@ -64,12 +64,20 @@ func TestAppendSourceSealBuildsExactAllocationFreeBinaryTransition(t *testing.T)
 	if !errors.Is(err, ErrTopologyConflict) || !bytes.Equal(got, prefix) {
 		t.Fatalf("tail-behind seal = %q, %v", got, err)
 	}
+	withSession := state
+	withSession.SessionCount = 1
+	withSession.SessionSlotCount = 1
+	got, err = plan.AppendSourceSeal(prefix, withSession, tail, 1, 2)
+	if !errors.Is(err, ErrSessionTransferRequired) || !bytes.Equal(got, prefix) {
+		t.Fatalf("session-bearing seal = %q, %v", got, err)
+	}
 }
 
 func TestBuildCatalogTransitionRefusesMissingProofs(t *testing.T) {
 	plan, current, _, _ := testPlan(t)
 	if _, err := plan.BuildCatalogTransition(
-		current, rangesplit.CutoverCertificate{}, rangesplit.RetainedPruneCursor{},
+		current, testSourceState(plan),
+		rangesplit.CutoverCertificate{}, rangesplit.RetainedPruneCursor{},
 	); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("missing proof error = %v", err)
 	}

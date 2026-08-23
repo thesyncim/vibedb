@@ -26,9 +26,10 @@ correctness oracle.
 ## Replicated apply complexity
 
 Normal replicated command admission and apply do not scan the shard image.
-They read the bounded command's completion and mutation keys. Planning,
-validation, and digest work are O(changed keys plus changed document bytes),
-bounded by 64 distinct mutations, and independent of the shard row count.
+They read one bounded session header, at most one fixed ring slot, and the
+command's mutation keys. Mutation planning is bounded by 64 distinct keys. It
+performs indexed point reads plus bytewise validation and digest work on the
+supplied changes.
 
 The hot path advances a deterministic `DataChainDigest` from the prior chain
 and the exact row changes. This digest is history-sensitive. It is not a

@@ -34,23 +34,63 @@ fences. User validation cannot depend on local time, random input, or a network
 result.
 
 A wrong immutable binding is terminal. A stale mutable fence records a durable
-deterministic stale completion.
+deterministic stale result in the client session ring.
 
 ## Atomic publication
 
-The apply machine updates user data, completion data, and replicated state in
-one publication. It derives a completion key from tenant, client ID, client
-epoch, and client sequence. An exact retained command is idempotent. Reusing
-that tuple with different command content is a conflict.
+The apply machine updates user data, replicated state, a changed session
+header, and a changed retry slot in one publication. A stable session header is
+keyed by tenant and client ID. It stores the current client epoch, `RetryHome`,
+cumulative `AckThrough` watermark, sequence high-water, status, and configured
+retry window. `RetryHome` is the fixed-width routing discriminator retained
+through intact-shard ownership transitions. Physical split activation does not
+yet migrate session rows.
 
-One command permits at most 64 distinct mutations. The completion table retains
-at most 1,048,576 entries.
+An active epoch accepts strictly consecutive sequences. An exact retained retry
+is idempotent and can advance `AckThrough`. Reuse with a different `RetryHome`,
+fingerprint, or `LogicalCommandDigest` is a conflict. A retry older than the
+cumulative watermark or fixed ring window returns `ErrRetryRetired` and never
+executes.
 
-The current kernel does not garbage-collect completions. `AdoptRuntime`
-rejects a WAL and apply pair unless every entry that the immutable-base WAL can
-still admit has a remaining completion slot.
+A session-retire command has no mutations and acknowledges the prior sequence
+high-water. With current mutable fences it seals the current epoch. A stale
+retirement records a stale-fence result and leaves the epoch active. The next
+epoch must be exactly one higher and starts with sequence 1 and `AckThrough` 0.
+The next epoch reuses the same fixed ring.
+
+The terminal `uint64` client sequence is reserved for retirement. An ordinary
+command at that sequence returns `ErrSessionSequence`. A stale terminal
+retirement is an unstored `ErrStaleCommand` refusal. It leaves the session
+unchanged so the client can resubmit the same sequence with refreshed fences.
+
+One command permits at most 64 distinct mutations. The frozen apply identity
+sets `MaxSessions` and `RetryWindow`. The system image contains one state row,
+one header per retained stable identity, and at most `RetryWindow` fixed slots
+per identity. Retirement reuses this state. It does not reduce `SessionCount`.
+New identities are refused at `MaxSessions`.
+
+The hidden apply collection stores state, session headers, and retry slots as
+raw checksum-protected binary values in durable opaque-value mode. It does not
+wrap these records in hexadecimal JSON. A slot retains compact fixed-size
+result metadata. Completion lookup reconstructs the canonical completion
+envelope from the machine binding, session header, and slot. It checks the
+supplied fingerprint and `LogicalCommandDigest` before it accepts an exact
+retry.
+
+Admission and apply use one indexed session-header point read and at most one
+indexed slot point read. Reopen validates the hidden image in one ordered pass.
+Its hidden row count and session scan work are bounded by
+`1 + MaxSessions + MaxSessions * RetryWindow`, not by the number of applied
+operations.
 
 An invariant or corruption error poisons the machine until reopen.
+
+Range-split child activation initializes empty session state and currently
+transfers only the child user image and tail. It cannot yet preserve retries
+whose `RetryHome` moves to a non-retained child, and it cannot reconstruct an
+old completion from a child's new immutable binding without retained origin
+metadata. The split path remains non-serving until that migration contract is
+implemented and certified.
 
 ## Runtime order
 
@@ -59,10 +99,17 @@ then applies committed entries, records read states, and advances Raft.
 
 A deterministic WAL or apply failure latches terminal runtime failure.
 
+`ValidateImmutableBaseApplyCapacity` checks the live WAL cut and the bounded
+session counts. `AdoptRuntime` does not yet use it. Runtime adoption still calls
+the deprecated `ValidateImmutableBaseNoGCCompletionCapacity` suffix qualifier.
+It therefore still requires the derived session-ring ceiling to cover the
+complete sealed WAL suffix.
+
 ## Implementation references
 
 - `internal/replicatedstate/apply.go` and `machine.go`
-- `internal/raftmember/runtime.go`, `apply.go`, and `admission.go`
+- `internal/replicatedstate/session_codec.go` and `read.go`
+- `internal/raftmember/runtime.go`, `apply.go`, and `apply_capacity.go`
 - `sql/driver/replicated_store.go` and `replicated_apply.go`
 - `sql/driver/replicated_child_stage.go`
 - `internal/rangesplit/activate.go`

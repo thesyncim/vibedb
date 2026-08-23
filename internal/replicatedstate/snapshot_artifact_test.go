@@ -57,7 +57,7 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	const golden = "c4ffa01f36c2b85d67a19daa0acba89cbb3323ab4138f240281987dfb3daecd7"
+	const golden = "217806588459acdb52207de0a219c68b1a1e427af96dafd3defff911aca067fe"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -165,7 +165,8 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 		}
 	}
 	if systemRows != verified.SystemRows || userRows != verified.UserRows ||
-		systemRows != verified.State.CompletionCount+1 || userRows != 7 {
+		systemRows != verified.State.SessionCount+verified.State.SessionSlotCount+1 ||
+		userRows != 7 {
 		t.Fatalf("row totals system=%d user=%d manifest=%+v", systemRows, userRows, verified)
 	}
 }
@@ -406,6 +407,54 @@ func TestSnapshotArtifactRejectsCorruptionTruncationAndTrailingBytes(t *testing.
 				t.Fatalf("VerifySnapshotArtifact error = %v", err)
 			}
 		})
+	}
+}
+
+func TestSnapshotArtifactHiddenSystemKeyGrammar(t *testing.T) {
+	key := func(prefix byte, size int) []byte {
+		result := bytes.Repeat([]byte{0x7f}, size)
+		result[0] = prefix
+		return result
+	}
+	payload := func(key []byte) []byte {
+		result := make([]byte, snapshotArtifactRowHeaderBytes+len(key)+1)
+		binary.LittleEndian.PutUint32(result[0:4], uint32(len(key)))
+		binary.LittleEndian.PutUint32(result[4:8], 1)
+		copy(result[snapshotArtifactRowHeaderBytes:], key)
+		result[len(result)-1] = 1
+		return result
+	}
+	consume := func(key []byte) error {
+		previousKey := make([]byte, replication.MaxMutationKeyBytes)
+		previousKeyBytes := 0
+		_, err := consumeSnapshotArtifactRows(
+			snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
+			payload(key), nil, previousKey, &previousKeyBytes, nil, true,
+		)
+		return err
+	}
+
+	for _, valid := range [][]byte{
+		key(1, sha256.Size+1),
+		key(2, sha256.Size+3),
+	} {
+		if err := consume(valid); err != nil {
+			t.Fatalf("valid hidden system key %x rejected: %v", valid, err)
+		}
+	}
+	for _, invalid := range [][]byte{
+		key(1, sha256.Size),
+		key(1, sha256.Size+2),
+		key(1, sha256.Size+3),
+		key(2, sha256.Size+1),
+		key(2, sha256.Size+2),
+		key(2, sha256.Size+4),
+		key(3, sha256.Size+1),
+		key(3, sha256.Size+3),
+	} {
+		if err := consume(invalid); !errors.Is(err, ErrSnapshotArtifact) {
+			t.Fatalf("invalid hidden system key %x error = %v", invalid, err)
+		}
 	}
 }
 
