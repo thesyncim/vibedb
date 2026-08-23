@@ -31,6 +31,11 @@ func testRetryHome() RetryHome {
 	return RetryHome{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 }
 
+const (
+	testLeaseExpectedDeadlineUnixNano int64 = 1_700_000_000_123_456_789
+	testLeaseNextDeadlineUnixNano     int64 = 1_700_000_001_123_456_789
+)
+
 func testCommand() Command {
 	return Command{
 		ClusterID: testID(0x01), ClusterIncarnation: testID(0x21),
@@ -71,6 +76,22 @@ func testSessionOpenCommand() Command {
 	command.Kind = CommandSessionOpen
 	command.ClientEpoch = 0
 	command.ClientSequence = 1
+	command.NextDeadlineUnixNano = testLeaseExpectedDeadlineUnixNano
+	return command
+}
+
+func testSessionRenewCommand() Command {
+	command := testSessionRetireCommand()
+	command.Kind = CommandSessionRenew
+	command.ExpectedDeadlineUnixNano = testLeaseExpectedDeadlineUnixNano
+	command.NextDeadlineUnixNano = testLeaseNextDeadlineUnixNano
+	return command
+}
+
+func testSessionRevokeCommand() Command {
+	command := testSessionRetireCommand()
+	command.Kind = CommandSessionRevoke
+	command.ExpectedDeadlineUnixNano = testLeaseExpectedDeadlineUnixNano
 	return command
 }
 
@@ -192,7 +213,8 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 		view.RoutingVersion != command.RoutingVersion ||
 		view.RouteGeneration != command.RouteGeneration ||
 		view.ClientEpoch != command.ClientEpoch || view.ClientSequence != command.ClientSequence ||
-		view.AckThrough != command.AckThrough {
+		view.AckThrough != command.AckThrough || view.ExpectedDeadlineUnixNano != 0 ||
+		view.NextDeadlineUnixNano != 0 {
 		t.Fatal("decoded command scalar mismatch")
 	}
 	iterator := view.Mutations()
@@ -268,15 +290,50 @@ func TestSessionOpenRoundTrip(t *testing.T) {
 	}
 	if view.Kind() != CommandSessionOpen || view.MutationCount() != 0 ||
 		view.ClientEpoch != 0 || view.ClientSequence != 1 || view.AckThrough != 0 ||
-		view.Fingerprint != command.Fingerprint {
+		view.Fingerprint != command.Fingerprint ||
+		view.ExpectedDeadlineUnixNano != command.ExpectedDeadlineUnixNano ||
+		view.NextDeadlineUnixNano != command.NextDeadlineUnixNano {
 		t.Fatalf("decoded session open mismatch: %+v", view)
 	}
 	iterator := view.Mutations()
 	if iterator.Next() {
 		t.Fatal("session open exposed a mutation")
 	}
-	if len(encoded) != commandMutationOffset(encoded)+envelopeChecksumBytes {
-		t.Fatalf("session open length = %d, want empty mutation body", len(encoded))
+	if len(encoded) != commandMutationOffset(encoded)+sessionLeaseBodyBytes+envelopeChecksumBytes {
+		t.Fatalf("session open length = %d, want exact lease body", len(encoded))
+	}
+}
+
+func TestSessionRenewAndRevokeRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command Command
+	}{
+		{"renew", testSessionRenewCommand()},
+		{"revoke", testSessionRevokeCommand()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := encodeCommand(t, tc.command)
+			view, err := OpenCommand(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.Kind() != tc.command.Kind || view.MutationCount() != 0 ||
+				view.ClientEpoch != tc.command.ClientEpoch ||
+				view.ClientSequence != tc.command.ClientSequence ||
+				view.AckThrough != tc.command.AckThrough ||
+				view.ExpectedDeadlineUnixNano != tc.command.ExpectedDeadlineUnixNano ||
+				view.NextDeadlineUnixNano != tc.command.NextDeadlineUnixNano {
+				t.Fatalf("decoded session %s mismatch: %+v", tc.name, view)
+			}
+			mutations := view.Mutations()
+			if mutations.Next() {
+				t.Fatalf("session %s exposed a mutation", tc.name)
+			}
+			if len(encoded) != commandMutationOffset(encoded)+sessionLeaseBodyBytes+envelopeChecksumBytes {
+				t.Fatalf("session %s length = %d, want exact lease body", tc.name, len(encoded))
+			}
+		})
 	}
 }
 
@@ -318,6 +375,115 @@ func TestSessionOpenClientTupleValidation(t *testing.T) {
 	}
 }
 
+func TestSessionLeaseDeadlineValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		command func() Command
+		mutate  func(*Command)
+	}{
+		{"open_nonzero_expected", testSessionOpenCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = 1 }},
+		{"open_zero_next", testSessionOpenCommand, func(c *Command) { c.NextDeadlineUnixNano = 0 }},
+		{"open_negative_next", testSessionOpenCommand, func(c *Command) { c.NextDeadlineUnixNano = -1 }},
+		{"renew_zero_expected", testSessionRenewCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = 0 }},
+		{"renew_negative_expected", testSessionRenewCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = -1 }},
+		{"renew_equal", testSessionRenewCommand, func(c *Command) { c.NextDeadlineUnixNano = c.ExpectedDeadlineUnixNano }},
+		{"renew_regression", testSessionRenewCommand, func(c *Command) { c.NextDeadlineUnixNano = c.ExpectedDeadlineUnixNano - 1 }},
+		{"renew_negative_next", testSessionRenewCommand, func(c *Command) { c.NextDeadlineUnixNano = -1 }},
+		{"revoke_zero_expected", testSessionRevokeCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = 0 }},
+		{"revoke_negative_expected", testSessionRevokeCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = -1 }},
+		{"revoke_nonzero_next", testSessionRevokeCommand, func(c *Command) { c.NextDeadlineUnixNano = 1 }},
+	}
+	for _, tc := range tests {
+		t.Run("encode_"+tc.name, func(t *testing.T) {
+			command := tc.command()
+			tc.mutate(&command)
+			prefix := []byte("unchanged")
+			got, err := AppendCommand(prefix, command)
+			if !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+			}
+			if !bytes.Equal(got, prefix) {
+				t.Fatal("failed lease encode changed destination")
+			}
+		})
+
+		t.Run("decode_"+tc.name, func(t *testing.T) {
+			command := tc.command()
+			encoded := encodeCommand(t, command)
+			tc.mutate(&command)
+			lease := commandMutationOffset(encoded)
+			binary.LittleEndian.PutUint64(encoded[lease:lease+8], uint64(command.ExpectedDeadlineUnixNano))
+			binary.LittleEndian.PutUint64(encoded[lease+8:lease+16], uint64(command.NextDeadlineUnixNano))
+			sealEnvelope(encoded)
+			if _, err := OpenCommand(encoded); !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		command func() Command
+		mutate  func(*Command)
+	}{
+		{"mutation_expected", testCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = 1 }},
+		{"mutation_next", testCommand, func(c *Command) { c.NextDeadlineUnixNano = 1 }},
+		{"retire_expected", testSessionRetireCommand, func(c *Command) { c.ExpectedDeadlineUnixNano = 1 }},
+		{"release_next", testSessionReleaseCommand, func(c *Command) { c.NextDeadlineUnixNano = 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			command := tc.command()
+			tc.mutate(&command)
+			if _, err := AppendCommand(nil, command); !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+			}
+		})
+	}
+}
+
+func TestSessionLeaseBodyLengthIsExact(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command Command
+	}{
+		{"open", testSessionOpenCommand()},
+		{"renew", testSessionRenewCommand()},
+		{"revoke", testSessionRevokeCommand()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			valid := encodeCommand(t, tc.command)
+			for cut := 0; cut < len(valid); cut++ {
+				if _, err := OpenCommand(valid[:cut]); err == nil {
+					t.Fatalf("accepted raw truncation at %d", cut)
+				}
+			}
+			for _, bodyBytes := range []int{0, 1, sessionLeaseBodyBytes - 1, sessionLeaseBodyBytes + 1, 2 * sessionLeaseBodyBytes} {
+				candidate := commandWithLeaseBodyBytes(valid, bodyBytes)
+				if _, err := OpenCommand(candidate); !errors.Is(err, ErrEnvelopeSemantic) {
+					t.Fatalf("accepted %d-byte lease body: %v", bodyBytes, err)
+				}
+			}
+		})
+	}
+}
+
+func commandWithLeaseBodyBytes(frame []byte, bodyBytes int) []byte {
+	lease := commandMutationOffset(frame)
+	trailer := len(frame) - envelopeChecksumBytes
+	result := make([]byte, lease+bodyBytes+envelopeChecksumBytes)
+	copy(result[:lease], frame[:lease])
+	copyBytes := min(bodyBytes, sessionLeaseBodyBytes)
+	copy(result[lease:lease+copyBytes], frame[lease:lease+copyBytes])
+	copy(result[len(result)-envelopeChecksumBytes:], frame[trailer:])
+	binary.LittleEndian.PutUint32(result[16:20], uint32(len(result)))
+	originalBody := binary.LittleEndian.Uint32(frame[20:24])
+	binary.LittleEndian.PutUint32(
+		result[20:24], originalBody-sessionLeaseBodyBytes+uint32(bodyBytes),
+	)
+	sealEnvelope(result)
+	return result
+}
+
 func TestNonOpenCommandsRetainClientTupleRules(t *testing.T) {
 	commands := []struct {
 		name    string
@@ -326,6 +492,8 @@ func TestNonOpenCommandsRetainClientTupleRules(t *testing.T) {
 		{"mutation", testCommand()},
 		{"retire", testSessionRetireCommand()},
 		{"release", testSessionReleaseCommand()},
+		{"renew", testSessionRenewCommand()},
+		{"revoke", testSessionRevokeCommand()},
 	}
 	for _, commandCase := range commands {
 		for _, tc := range []struct {
@@ -472,7 +640,9 @@ func TestGoldenVectors(t *testing.T) {
 	const commandHex = "564442434d4400000100010000010000560100004e00000002000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b00030008001f0000000000000074656e616e74006f6e6574656e616e745f646174612d38306d657373616765730100050014000000616c7068617b226964223a22616c706861222c2276223a317d02000500000000006f6d6567610b481f1bf4b7e0e4"
 	const retireHex = "564442434d4400000100020000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573844f206c7bb0df93"
 	const releaseHex = "564442434d4400000100030000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d6573736167657318fc9ad0e703652f"
-	const openHex = "564442434d4400000100040000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f9000000000000000000100000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573520f6c9aadf09365"
+	const openHex = "564442434d4400000100040000010000380100003000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f9000000000000000000100000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573000000000000000015cd853dfe9c97170f6468bcf09b9743"
+	const renewHex = "564442434d4400000100050000010000380100003000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d6573736167657315cd853dfe9c971715972079fe9c9717f0eff2370f100dc8"
+	const revokeHex = "564442434d4400000100060000010000380100003000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d6573736167657315cd853dfe9c97170000000000000000f50786bc0af87943"
 	const inlineHex = "564442434d50000001000100200101004501000005000000000000001d0000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00ef4fa8c2f3151c0180717a46d7a6b869a9b85ccd1e82be796cf4ea1eb9af0650123456789abcdef05000000000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38300100ff6f6b19f88b6ce6077493"
 	const referenceHex = "564442434d5000000100020020010100400100000000000000000000180000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe00123456789abcdef01000100000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38304a28f106b5d70ef9"
 	for _, tc := range []struct {
@@ -484,6 +654,8 @@ func TestGoldenVectors(t *testing.T) {
 		{"session_retire", encodeCommand(t, testSessionRetireCommand()), retireHex},
 		{"session_release", encodeCommand(t, testSessionReleaseCommand()), releaseHex},
 		{"session_open", encodeCommand(t, testSessionOpenCommand()), openHex},
+		{"session_renew", encodeCommand(t, testSessionRenewCommand()), renewHex},
+		{"session_revoke", encodeCommand(t, testSessionRevokeCommand()), revokeHex},
 		{"inline_completion", encodeCompletion(t, testInlineCompletion()), inlineHex},
 		{"reference_completion", encodeCompletion(t, testReferenceCompletion()), referenceHex},
 	} {
