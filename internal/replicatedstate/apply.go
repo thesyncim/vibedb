@@ -443,7 +443,6 @@ func (m *Machine) planCommand(
 	plan := commandPlan{command: command, dataChainDigest: m.state.DataChainDigest}
 	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
 	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
-	logicalDigest := LogicalCommandDigest(command)
 	session, found, err := sessionAt(systemSnapshot, plan.sessionKey)
 	if err != nil {
 		return commandPlan{}, err
@@ -454,6 +453,7 @@ func (m *Machine) planCommand(
 	if command.Kind() == replication.CommandSessionRelease {
 		return m.planSessionRelease(command, systemSnapshot, plan, session, found)
 	}
+	logicalDigest := LogicalCommandDigest(command)
 
 	var next SessionRecord
 	if !found {
