@@ -70,6 +70,38 @@ mutation count and changed document bytes. Report point-update latency and
 allocation data separately from full-image reopen, artifact, import, and audit
 costs. The complexity contract is not a published throughput or latency claim.
 
+The default cardinality regression uses real durable collections at one row
+and 65,536 rows. It requires an effective one-key `ApplyNormal` publication to
+perform zero full-snapshot scans, exactly one attempted key and validator call,
+at most four user-page reads, at most one bounded leaf conversion, and no empty
+reclaim. A cold structural update may activate the fixed committer descriptor
+arena, so the test keeps that visible and caps the measured apply at 20 MiB and
+1,024 allocations. The benchmark additionally caps non-cold work at 64 KiB
+and 256 allocations per operation. Timing remains diagnostic; the fixed-work
+and allocation ceilings are the gates, not a latency claim.
+
+The literal 10,000,000-row qualification is intentionally opt-in because
+building its real on-disk image is setup work, not a suitable cost for every
+pull request:
+
+```bash
+VIBEDB_APPLY_10M=1 go test -count=1 -timeout=80m \
+  -json \
+  -run '^TestMachineApplyPointUpdateTenMillionQualification$' \
+  ./internal/replicatedstate
+```
+
+The `P0.1 10M-row apply qualification` workflow runs that qualification on a
+manual dispatch. A pull request can qualify its exact head by adding the
+`p01-apply-10m` label; ordinary pull requests do not pay the setup cost. The
+workflow retains the candidate revision, clean/dirty state, toolchain, host,
+memory, filesystem type and capacity, raw `go test -json` stream, a structured
+result, setup/open durations, measured apply duration, and before/after
+counters. The job fails if the exact named test is absent, lacks an exact test
+pass event, or omits the structured result. A candidate closes the cardinality
+exit gate only with a passing artifact for its exact commit. Setup and open
+time are reported separately and never presented as point-update latency.
+
 ## Run the allocation gate
 
 ```bash

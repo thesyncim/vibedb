@@ -455,9 +455,10 @@ func (c *Collection) visitRangeRawCurrentBaseUntil(
 // borrowed only for the callback; overflow values reuse one bounded buffer.
 // Returning an error stops the scan immediately.
 func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
-	if s == nil {
+	if s == nil || s.collection == nil || s.state == nil {
 		return ErrClosed
 	}
+	s.collection.snapshotFullScanCalls.Add(1)
 	scratch, err := s.rangePrimaryGraphBuffer(
 		nil, nil, nil, s.overflowScanValue, fn,
 	)
@@ -474,6 +475,7 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 	if s == nil || s.collection == nil || s.state == nil {
 		return scratch, ErrClosed
 	}
+	s.collection.snapshotFullScanCalls.Add(1)
 	if fn == nil {
 		return scratch, nil
 	}

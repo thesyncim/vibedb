@@ -1,0 +1,134 @@
+name: P0.1 10M-row apply qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p01-apply-10m-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: 10M-row point apply
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'p01-apply-10m'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # A labeled pull request qualifies its exact head, not GitHub's
+          # synthetic test-merge commit. The raw artifact records it again.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Record candidate and host
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/p01"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          git status --porcelain=v1 > "${evidence}/git-status.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          lscpu > "${evidence}/lscpu.txt"
+          free -b > "${evidence}/memory.txt"
+          df -T -B1 . > "${evidence}/filesystem.txt"
+          printf 'VIBEDB_APPLY_10M=1 VIBEDB_P01_EVIDENCE_PATH=%s go test -json -count=1 -timeout=80m -run %s ./internal/replicatedstate\n' \
+            "${evidence}/result.json" \
+            '^TestMachineApplyPointUpdateTenMillionQualification$' \
+            > "${evidence}/command.txt"
+      - name: Require the exact qualification test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_name='TestMachineApplyPointUpdateTenMillionQualification'
+          go test -list "^${test_name}$" ./internal/replicatedstate \
+            | grep -Fqx "${test_name}"
+      - name: Run exact 10M-row qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          VIBEDB_APPLY_10M=1 \
+          VIBEDB_P01_EVIDENCE_PATH="${RUNNER_TEMP}/p01/result.json" \
+          go test -json -count=1 -timeout=80m \
+            -run '^TestMachineApplyPointUpdateTenMillionQualification$' \
+            ./internal/replicatedstate \
+            | tee "${RUNNER_TEMP}/p01/go-test.jsonl"
+      - name: Validate qualification evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_name='TestMachineApplyPointUpdateTenMillionQualification'
+          jq -e --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name)' \
+            "${RUNNER_TEMP}/p01/go-test.jsonl" >/dev/null
+          result="${RUNNER_TEMP}/p01/result.json"
+          test -s "${result}"
+          jq -e --arg test_name "${test_name}" '
+            .schema == "vibedb.p01.apply-cardinality" and
+            .version == 1 and
+            .test_name == $test_name and
+            .rows == 10000000 and
+            .pass == true and
+            .durability.system == 0 and
+            .durability.user == 0 and
+            .cache_bytes.system > 0 and
+            .cache_bytes.user > 0 and
+            .corpus.key_format == "row-%08d" and
+            .corpus.target_row == 0 and
+            (.corpus.values | length) == 2 and
+            (.corpus.updated_value | length) > 0 and
+            .file_bytes.system > 0 and
+            .file_bytes.user > 0 and
+            .duration_ns.setup > 0 and
+            .duration_ns.open > 0 and
+            .duration_ns.apply > 0 and
+            .apply_allocation.bytes >= 0 and
+            .apply_allocation.bytes <= 20971520 and
+            .apply_allocation.objects >= 0 and
+            .apply_allocation.objects <= 1024 and
+            .before.system.full_scan_calls == .after.system.full_scan_calls and
+            .before.user.full_scan_calls == .after.user.full_scan_calls and
+            .after.user.page_reads >= .before.user.page_reads and
+            (.after.user.page_reads - .before.user.page_reads) <= 4 and
+            .after.user.leaf_splits >= .before.user.leaf_splits and
+            (.after.user.leaf_splits - .before.user.leaf_splits) <= 1 and
+            .after.user.empty_reclaims == .before.user.empty_reclaims and
+            .before.system.rows == 3 and
+            .after.system.rows == 4 and
+            .before.user.rows == 10000000 and
+            .after.user.rows == 10000000 and
+            .after.system.published_generation > .before.system.published_generation and
+            .after.user.published_generation > .before.user.published_generation and
+            .validator.put_calls == 1 and
+            .validator.delete_calls == 0 and
+            .observer.calls == 1 and
+            .observer.attempted_keys == 1 and
+            .applied > 0 and
+            (.digest_before | length) == 64 and
+            (.digest_after | length) == 64 and
+            .digest_before != .digest_after and
+            .digest_changed == true and
+            .row_count_before == 10000000 and
+            .row_count_after == 10000000
+          ' "${result}" >/dev/null
+          expected_revision='${{ github.event.pull_request.head.sha || github.sha }}'
+          test "$(cat "${RUNNER_TEMP}/p01/revision.txt")" = "${expected_revision}"
+          test ! -s "${RUNNER_TEMP}/p01/git-status.txt"
+      - name: Upload raw qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p01-apply-10m-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/p01
+          if-no-files-found: error
+          retention-days: 30

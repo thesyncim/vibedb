@@ -59,6 +59,55 @@ func openRedundantPrimaryScan(
 	return primary, keys, values
 }
 
+func TestSnapshotFullScanCallsExcludePointReadsAndCountPublicEntries(t *testing.T) {
+	primary, keys, values := openPrimaryScan(t, 4)
+	snapshot, err := primary.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	baseline := primary.Stats().SnapshotFullScanCalls
+	got, found, err := snapshot.AppendRaw(nil, []byte(keys[2]))
+	if err != nil || !found || !bytes.Equal(got, values[2]) {
+		t.Fatalf("AppendRaw = (%q,%t,%v), want (%q,true,nil)", got, found, err, values[2])
+	}
+	if found, err := snapshot.ContainsKey([]byte(keys[1])); err != nil || !found {
+		t.Fatalf("ContainsKey = (%t,%v), want (true,nil)", found, err)
+	}
+	if got := primary.Stats().SnapshotFullScanCalls; got != baseline {
+		t.Fatalf("full scans after point reads = %d, want %d", got, baseline)
+	}
+
+	rows := 0
+	if err := snapshot.RangeRaw(func(_, _ []byte) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rows != len(keys) {
+		t.Fatalf("RangeRaw rows = %d, want %d", rows, len(keys))
+	}
+	if got := primary.Stats().SnapshotFullScanCalls; got != baseline+1 {
+		t.Fatalf("full scans after RangeRaw = %d, want %d", got, baseline+1)
+	}
+
+	rows = 0
+	if _, err := snapshot.RangeRawBuffer(nil, func(_, _ []byte) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rows != len(keys) {
+		t.Fatalf("RangeRawBuffer rows = %d, want %d", rows, len(keys))
+	}
+	if got := primary.Stats().SnapshotFullScanCalls; got != baseline+2 {
+		t.Fatalf("full scans after RangeRawBuffer = %d, want %d", got, baseline+2)
+	}
+}
+
 func TestFilePrimaryOrderedScan100K(t *testing.T) {
 	const count = 100_000
 	primary, keys, values := openRedundantPrimaryScan(t, count)
