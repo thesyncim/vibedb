@@ -2981,7 +2981,7 @@ func (c *Collection) preparePrimaryLeafMutation(
 	if path == nil {
 		return nil, 0, 0, storeio.ErrInvalidWrite
 	}
-	if !deleting && found && !value.IsOverflow() &&
+	if !c.options.OpaqueValues && !deleting && found && !value.IsOverflow() &&
 		(len(path.compactSource) != 0 || len(path.leafLease.Page()) != 0) {
 		source := path.compactSource
 		bucket := path.leafRoute.Bucket

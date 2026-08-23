@@ -736,7 +736,7 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		return fmt.Errorf("%w: resume cursor", ErrSnapshotArtifact)
 	}
 	stateEnvelope, err := AppendState(nil, cursor.manifest.State)
-	if err != nil || !bytes.Equal(wrapJSONHex(nil, stateEnvelope), cursor.expectedStateDocument) {
+	if err != nil || !bytes.Equal(stateEnvelope, cursor.expectedStateDocument) {
 		return fmt.Errorf("%w: resume state", ErrSnapshotArtifact)
 	}
 	if len(cursor.manifest.UserCollection) == 0 ||
@@ -754,7 +754,8 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	)
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
 		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
-		cursor.manifest.SystemRows > cursor.manifest.State.CompletionCount+1 {
+		cursor.manifest.SystemRows > cursor.manifest.State.SessionCount+
+			cursor.manifest.State.SessionSlotCount+1 {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}
 	if cursor.manifest.Chunks == 0 {
@@ -771,7 +772,8 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		!cursor.stateRowSeen || cursor.manifest.SystemRows == 0 ||
 		cursor.currentCollection == SnapshotArtifactSystem && cursor.manifest.UserRows != 0 ||
 		cursor.currentCollection == SnapshotArtifactUser &&
-			cursor.manifest.SystemRows != cursor.manifest.State.CompletionCount+1 {
+			cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
+				cursor.manifest.State.SessionSlotCount+1 {
 		return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
 	}
 	return nil
@@ -836,7 +838,7 @@ func readSnapshotArtifactHeader(
 		bytes.Equal(name, []byte(systemCollectionName)) {
 		return SnapshotArtifactManifest{}, nil, 0, fmt.Errorf("%w: user collection", ErrSnapshotArtifact)
 	}
-	expectedStateDocument := wrapJSONHex(nil, stateEnvelope)
+	expectedStateDocument := stateEnvelope
 	return SnapshotArtifactManifest{
 		State: state, UserCollection: name, TargetChunkBytes: uint32(target),
 		HeaderDigest: storedDigest, LastChunkDigest: storedDigest,
@@ -918,7 +920,9 @@ func consumeSnapshotArtifactRows(
 					return false, fmt.Errorf("%w: hidden state row", ErrSnapshotArtifact)
 				}
 				stateRowSeen = true
-			case len(key) != sha256.Size+1 || key[0] != 1:
+			case len(key) == sha256.Size+1 && key[0] == 1:
+			case len(key) == sha256.Size+3 && key[0] == 2:
+			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)
 			}
 		}
@@ -972,7 +976,8 @@ func validateSnapshotArtifactFooter(
 		storedPrevious != previousDigest || storedHeader != manifest.HeaderDigest {
 		return fmt.Errorf("%w: footer totals or digest", ErrSnapshotArtifact)
 	}
-	if !stateRowSeen || manifest.SystemRows != manifest.State.CompletionCount+1 {
+	if !stateRowSeen || manifest.SystemRows != manifest.State.SessionCount+
+		manifest.State.SessionSlotCount+1 {
 		return fmt.Errorf("%w: hidden state image", ErrSnapshotArtifact)
 	}
 	return nil

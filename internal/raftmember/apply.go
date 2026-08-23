@@ -62,9 +62,10 @@ func OpenBoundSQLWithApply(
 	}
 	claim, actual, err := database.OpenReplicatedApply(
 		expectedSQL, bootstrap, sqldriver.ReplicatedApplyOptions{
-			MaxCompletions: expectedApply.MaxCompletions,
-			TxnLimits:      expectedApply.TxnLimits,
-			Placement:      expectedApply.Placement,
+			MaxSessions: expectedApply.MaxSessions,
+			RetryWindow: expectedApply.RetryWindow,
+			TxnLimits:   expectedApply.TxnLimits,
+			Placement:   expectedApply.Placement,
 		},
 	)
 	if err != nil || actual != expectedApply {

@@ -20,13 +20,15 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func testReplicatedApplyOptions() ReplicatedApplyOptions {
 	return ReplicatedApplyOptions{
-		MaxCompletions: 128,
-		TxnLimits:      defaultDriverTxnLimits(),
+		MaxSessions: 128,
+		RetryWindow: 8,
+		TxnLimits:   defaultDriverTxnLimits(),
 		Placement: ReplicatedPlacementProfile{
 			Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
 			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
@@ -255,7 +257,8 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 
 	want := ReplicatedApplyCapacityProfile{
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
-		MaxCompletions: options.MaxCompletions,
+		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
+		MaxCompletions: options.MaxSessions * uint64(options.RetryWindow),
 	}
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("uninitialized capacity profile = %+v, %v; want %+v", got, err, want)
@@ -276,7 +279,8 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
 		t.Fatal(err)
 	}
-	want.Applied, want.CompletionCount = 2, 1
+	want.Applied, want.SessionCount, want.SessionSlotCount = 2, 1, 1
+	want.CompletionCount = 1
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
 	}
@@ -285,9 +289,7 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := replicatedstate.CompletionKey(
-		view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence,
-	)
+	digest := replicatedstate.SessionKey(view.Tenant, view.ClientID)
 	var storageKey [33]byte
 	storageKey[0] = 1
 	copy(storageKey[1:], digest[:])
@@ -307,9 +309,9 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrCompletionCorrupt) ||
+	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrSessionCorrupt) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
-		t.Fatalf("first corrupt admission = %v, want completion corruption plus poison", err)
+		t.Fatalf("first corrupt admission = %v, want session corruption plus poison", err)
 	}
 	if got, err := claim.CapacityQualificationProfile(); got != (ReplicatedApplyCapacityProfile{}) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
@@ -336,7 +338,8 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if identity.Format != ReplicatedApplyFormat || identity.Storage == "" ||
 		identity.ValidationDigest == ([32]byte{}) || identity.Placement != options.Placement ||
 		identity.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) ||
-		identity.TxnLimits != options.TxnLimits || identity.MaxCompletions != options.MaxCompletions ||
+		identity.TxnLimits != options.TxnLimits || identity.MaxSessions != options.MaxSessions ||
+		identity.RetryWindow != options.RetryWindow ||
 		identity.Sidecars != canonicalReplicatedApplySidecars() {
 		t.Fatalf("apply identity = %+v", identity)
 	}
@@ -531,7 +534,10 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if reopenedClaim.Applied() != finalApplied {
 		t.Fatalf("reopened Applied = %d, want %d", reopenedClaim.Applied(), finalApplied)
 	}
-	if got := completionResultCode(t, reopenedClaim, valid); got != replicatedstate.ResultApplied {
+	if _, err := reopenedClaim.LookupCompletion(valid); !errors.Is(err, replicatedstate.ErrRetryRetired) {
+		t.Fatalf("reopened retired retry = %v, want ErrRetryRetired", err)
+	}
+	if got := completionResultCode(t, reopenedClaim, deletePresent); got != replicatedstate.ResultApplied {
 		t.Fatalf("reopened completion result = %d", got)
 	}
 	if err := reopenedClaim.Close(); err != nil {
@@ -676,6 +682,16 @@ func TestReplicatedSQLPlacementValidatorEscapedStringAndClosedScalarSet(t *testi
 	if got := validator.ValidateDelete([]byte(escapedKey), escaped, true); got != replicatedstate.MutationValidationAccept {
 		t.Fatalf("escaped present DELETE = %d", got)
 	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if got := validator.ValidatePut([]byte(escapedKey), escaped); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("escaped shard-key PUT = %d", got)
+		}
+		if got := validator.ValidateDelete([]byte(escapedKey), escaped, true); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("escaped present DELETE = %d", got)
+		}
+	}); allocations != 0 {
+		t.Fatalf("warmed escaped PUT + present DELETE allocations = %v, want 0", allocations)
+	}
 
 	boolean := []byte(`{"id":true}`)
 	booleanKey, err := documentKey(boolean, "/id", table.primary, base.UserLimits.MaxKeyBytes)
@@ -727,6 +743,103 @@ func TestReplicatedSQLPlacementValidatorCanonicalNumberParity(t *testing.T) {
 	if got := validator.ValidateDelete(canonicalKey, nil, false); got != replicatedstate.MutationValidationAccept {
 		t.Fatalf("canonical absent number DELETE = %d", got)
 	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if got := validator.ValidateDelete(canonicalKey, nil, false); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("canonical absent number DELETE = %d", got)
+		}
+	}); allocations != 0 {
+		t.Fatalf("warmed absent number DELETE allocations = %v, want 0", allocations)
+	}
+}
+
+func TestReplicatedSQLPlacementValidatorScratchIsConcurrentAndAllocationFree(t *testing.T) {
+	primary, err := vibejson.CompilePointer("/id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ReplicatedShardStoreIdentity{
+		Binding:        ReplicatedShardStoreBinding{Distribution: "test"},
+		UserTable:      "docs",
+		UserPrimaryKey: "/id",
+		UserLimits:     ReplicatedShardStoreLimits{MaxKeyBytes: 256},
+	}
+	validator := newReplicatedSQLMutationValidator(
+		identity, &table{primary: primary}, testReplicatedApplyOptions().Placement,
+	)
+	escaped := []byte(`{"id":"quote\\\" slash\\\\ line\\n"}`)
+	escapedKeyText, err := documentKey(escaped, "/id", primary, identity.UserLimits.MaxKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escapedKey := []byte(escapedKeyText)
+	numberKey, ok := orderedkey.AppendNumber(nil, []byte("1"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("number key did not encode")
+	}
+
+	if got := validator.ValidatePut(escapedKey, escaped); got != replicatedstate.MutationValidationAccept {
+		t.Fatalf("warm escaped PUT = %d", got)
+	}
+	if got := validator.ValidateDelete(numberKey, nil, false); got != replicatedstate.MutationValidationAccept {
+		t.Fatalf("warm absent number DELETE = %d", got)
+	}
+	var putResult, deleteResult replicatedstate.MutationValidation
+	if allocations := testing.AllocsPerRun(1000, func() {
+		putResult = validator.ValidatePut(escapedKey, escaped)
+		deleteResult = validator.ValidateDelete(numberKey, nil, false)
+	}); allocations != 0 {
+		t.Fatalf("warmed PUT + absent DELETE allocations = %v, want 0", allocations)
+	}
+	if putResult != replicatedstate.MutationValidationAccept ||
+		deleteResult != replicatedstate.MutationValidationAccept {
+		t.Fatalf("warmed validation = PUT %d, DELETE %d", putResult, deleteResult)
+	}
+	var canonicalNumberKey []byte
+	for _, document := range [][]byte{
+		[]byte(`{"id":1}`), []byte(`{"id":1.0}`), []byte(`{"id":1e0}`),
+	} {
+		keyText, keyErr := documentKey(document, "/id", primary, identity.UserLimits.MaxKeyBytes)
+		if keyErr != nil {
+			t.Fatalf("number key for %s: %v", document, keyErr)
+		}
+		key := []byte(keyText)
+		if canonicalNumberKey == nil {
+			canonicalNumberKey = bytes.Clone(key)
+		} else if !bytes.Equal(key, canonicalNumberKey) {
+			t.Fatalf("number key for %s = %x, want %x", document, key, canonicalNumberKey)
+		}
+		if got := validator.ValidatePut(key, document); got != replicatedstate.MutationValidationAccept {
+			t.Fatalf("number PUT for %s = %d", document, got)
+		}
+	}
+
+	const workers, iterations = 8, 2000
+	start := make(chan struct{})
+	failures := make(chan string, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			defer group.Done()
+			<-start
+			for iteration := 0; iteration < iterations; iteration++ {
+				if got := validator.ValidatePut(escapedKey, escaped); got != replicatedstate.MutationValidationAccept {
+					failures <- fmt.Sprintf("concurrent escaped PUT = %d", got)
+					return
+				}
+				if got := validator.ValidateDelete(numberKey, nil, false); got != replicatedstate.MutationValidationAccept {
+					failures <- fmt.Sprintf("concurrent absent DELETE = %d", got)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
 }
 
 func TestReplicatedApplySettlementAndStrictIdentity(t *testing.T) {
@@ -753,7 +866,7 @@ func TestReplicatedApplySettlementAndStrictIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongOptions := options
-	wrongOptions.MaxCompletions++
+	wrongOptions.MaxSessions++
 	if db, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
 		path, base, wrongOptions,
 	); !errors.Is(err, ErrReplicatedApplyMismatch) {
@@ -1059,7 +1172,7 @@ func TestReplicatedApplyPreflightAndPreRecoveryFences(t *testing.T) {
 
 		syncCalls = 0
 		wrongOptions := options
-		wrongOptions.MaxCompletions++
+		wrongOptions.MaxSessions++
 		opened, err = openDatabaseWithShardStorePolicy(path, func(string) error {
 			syncCalls++
 			return nil
@@ -1564,11 +1677,10 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 		Format: ReplicatedApplyFormat, Storage: "storage",
 		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
 		ValidationDigest:  validationDigest,
-		SystemLimits: ReplicatedShardStoreLimits{
-			MaxKeyBytes: 1, MaxDocumentBytes: 2, MaxBatchDocuments: 3, MaxBatchBytes: 4,
-		},
-		MaxCompletions: 5,
-		TxnLimits:      durable.TxnLimits{MaxCollections: 6, MaxDocuments: 7, MaxBytes: 8},
+		SystemLimits:      replicatedApplySystemLimits(),
+		MaxSessions:       5,
+		RetryWindow:       8,
+		TxnLimits:         durable.TxnLimits{MaxCollections: 6, MaxDocuments: 7, MaxBytes: 8},
 		Placement: ReplicatedPlacementProfile{
 			Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
 			TupleVersion:  distribution.CurrentTupleVersion,
@@ -1584,7 +1696,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":0,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":1,"max_document_bytes":2,"max_batch_documents":3,"max_batch_bytes":4},"max_completions":5,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
+	const want = `{"format":0,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":35,"max_document_bytes":2048,"max_batch_documents":3,"max_batch_bytes":2756},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
 	if string(encoded) != want {
 		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
@@ -1608,7 +1720,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 		{name: "missing", remove: true},
 		{name: "unknown", sidecar: json.RawMessage(`{"unknown":1,"system_recovery_journal_bytes":655872}`)},
 		{name: "nested_missing", sidecar: json.RawMessage(`{}`)},
-		{name: "mismatch", sidecar: json.RawMessage(`{"system_recovery_journal_bytes":655360}`)},
+		{name: "mismatch", sidecar: json.RawMessage(`{"system_recovery_journal_bytes":197120}`)},
 	} {
 		t.Run("sidecars_"+test.name, func(t *testing.T) {
 			changed := make(map[string]json.RawMessage, len(fields))

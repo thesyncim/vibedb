@@ -29,6 +29,8 @@ const (
 	_resultTargetBoundAtMostExact        = uint32(5) - ResultTargetBound
 	_resultWrongShardAtLeastExact        = ResultWrongShard - 6
 	_resultWrongShardAtMostExact         = uint32(6) - ResultWrongShard
+	_resultSessionRetiredAtLeastExact    = ResultSessionRetired - 7
+	_resultSessionRetiredAtMostExact     = uint32(7) - ResultSessionRetired
 )
 
 func codecState() State {
@@ -65,11 +67,6 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	if _, err := OpenState(corrupt); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("corrupt state error = %v", err)
 	}
-	wrapper := wrapJSONHex(nil, encoded)
-	wrapper[1] = 'A'
-	if _, err := unwrapJSONHex(wrapper, MaxStateEnvelopeBytes, ErrStateCorrupt); !errors.Is(err, ErrStateCorrupt) {
-		t.Fatalf("uppercase JSON hex error = %v", err)
-	}
 	unknown := codecState()
 	unknown.ConfState.ProtoReflect().SetUnknown([]byte{0x78, 0})
 	if _, err := AppendState(nil, unknown); !errors.Is(err, ErrStateCorrupt) {
@@ -82,7 +79,24 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	}
 }
 
-func TestStateAndCompletionLengthFieldsCannotOverflowInt(t *testing.T) {
+func TestStateEnvelopeBoundCoversMaximumConfiguration(t *testing.T) {
+	state := codecState()
+	const firstMember = uint64(math.MaxUint64 - 1024)
+	state.ConfState = &pb.ConfState{Voters: []uint64{firstMember}}
+	state.ConfState.Learners = make([]uint64, raftmodel.MaxConfStateMembers-1)
+	for index := range state.ConfState.Learners {
+		state.ConfState.Learners[index] = firstMember + uint64(index) + 1
+	}
+	encoded, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatalf("maximum configuration state: %v", err)
+	}
+	if len(encoded) > MaxStateEnvelopeBytes {
+		t.Fatalf("state envelope = %d, bound = %d", len(encoded), MaxStateEnvelopeBytes)
+	}
+}
+
+func TestRawCodecLengthFieldsCannotOverflowInt(t *testing.T) {
 	state := make([]byte, stateHeaderBytes+recordChecksumLen)
 	copy(state[:8], stateMagic[:])
 	binary.LittleEndian.PutUint16(state[8:10], stateCodecFormat)
@@ -95,17 +109,18 @@ func TestStateAndCompletionLengthFieldsCannotOverflowInt(t *testing.T) {
 		t.Fatalf("maximum ConfState length error = %v", err)
 	}
 
-	completion := make([]byte, completionRecordHeaderBytes+recordChecksumLen)
-	copy(completion[:8], completionRecordMagic[:])
-	binary.LittleEndian.PutUint16(completion[8:10], completionRecordCodecFormat)
-	binary.LittleEndian.PutUint16(completion[12:14], completionRecordHeaderBytes)
-	binary.LittleEndian.PutUint32(completion[16:20], uint32(len(completion)))
-	binary.LittleEndian.PutUint32(completion[20:24], 0)
-	binary.LittleEndian.PutUint32(completion[132:136], math.MaxUint32)
-	sealRecord(completion, completionRecordChecksumDomain)
-	if _, err := OpenCompletionRecord(completion); !errors.Is(err, ErrCompletionCorrupt) {
-		t.Fatalf("maximum completion length error = %v", err)
+	session := make([]byte, sessionRecordHeaderBytes+1+recordChecksumLen)
+	copy(session[:8], sessionRecordMagic[:])
+	binary.LittleEndian.PutUint16(session[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(session[10:12], sessionRecordHeaderBytes)
+	binary.LittleEndian.PutUint32(session[12:16], uint32(len(session)))
+	binary.LittleEndian.PutUint32(session[16:20], math.MaxUint32)
+	binary.LittleEndian.PutUint16(session[26:28], 1)
+	sealRecord(session, sessionRecordChecksumDomain)
+	if _, err := OpenSessionRecord(session); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("maximum session body length error = %v", err)
 	}
+
 }
 
 func TestStateRejectsResealedReconstructibleDigestMismatch(t *testing.T) {
@@ -167,81 +182,106 @@ func TestStateRejectsResealedUnsortedConfStateMembers(t *testing.T) {
 	}
 }
 
-func codecCompletion(code uint32) ([]byte, CompletionRecord) {
+func codecLogicalCommand() replication.Command {
 	binding := testBinding()
-	fingerprint := sha256.Sum256([]byte("fingerprint"))
-	resultDigest := replication.CompletionResultDigest(code, ResultFormatMutation, nil)
-	completion, err := replication.AppendCompletion(nil, replication.Completion{
+	return replication.Command{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		Distribution:          binding.Distribution, Shard: binding.Shard,
 		AllocationGeneration: binding.AllocationGeneration,
 		ShardIncarnation:     binding.ShardIncarnation, GroupID: binding.GroupID,
 		ReplicaSetVersion: 1, ActivePolicyGeneration: binding.ActivePolicyGeneration,
-		ProtectionEpoch: binding.ProtectionEpoch, RoutingVersion: binding.RoutingVersion,
+		ProtectionEpoch: binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
+		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: id128(44), ClientEpoch: 2, ClientSequence: 3,
-		Fingerprint: fingerprint, AppliedSequence: 4, ResultCode: code,
-		ResultFormat: ResultFormatMutation, Storage: replication.CompletionInline,
-		ResultDigest: resultDigest,
-	})
-	if err != nil {
-		panic(err)
+		ClientID: id128(44), ClientEpoch: 2, ClientSequence: 3, AckThrough: 1,
+		Fingerprint: sha256.Sum256([]byte("logical-fingerprint")),
+		RetryHome:   replication.RetryHome{7, 6, 5, 4, 3, 2, 1, 0},
+		Collection:  "docs",
+		Mutations: []replication.Mutation{
+			{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+			{Kind: replication.MutationDelete, Key: []byte("z")},
+		},
 	}
-	record := CompletionRecord{
-		Tenant: []byte("tenant"), ClientID: id128(44), ClientEpoch: 2,
-		ClientSequence: 3, Fingerprint: fingerprint,
-		CommandDigest: sha256.Sum256([]byte("command")), Collection: "docs",
-		Completion: completion,
-	}
-	return completion, record
 }
 
-func TestCompletionRecordRoundTripAndFixedGrammar(t *testing.T) {
-	if ValidationSchemaFreeJSON != 1 || ValidationDeterministicMutation != 2 ||
+func openCodecLogicalCommand(t testing.TB, command replication.Command) replication.CommandView {
+	t.Helper()
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatalf("AppendCommand: %v", err)
+	}
+	view, err := replication.OpenCommand(encoded)
+	if err != nil {
+		t.Fatalf("OpenCommand: %v", err)
+	}
+	return view
+}
+
+func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
+	if ValidationOpaqueBinary != 1 || ValidationDeterministicMutation != 2 ||
 		ResultFormatMutation != 1 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
-		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d",
-			ValidationSchemaFreeJSON, ValidationDeterministicMutation,
+		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
+		ResultSessionRetired != 7 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d",
+			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownCollection,
-			ResultInvalidDocument, ResultTargetBound, ResultWrongShard)
+			ResultInvalidDocument, ResultTargetBound, ResultWrongShard, ResultSessionRetired)
 	}
-	_, record := codecCompletion(ResultApplied)
-	encoded, err := AppendCompletionRecord(nil, record)
+	record := sessionCodecRecord()
+	encoded, err := AppendSessionRecord(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "d21396c86062885f7c5efc6f0686f3c164602d47c41acd2a8a629b9402ef5d05"
-	if got := sha256.Sum256(encoded); hex.EncodeToString(got[:]) != wantDigest {
-		t.Fatalf("completion record golden digest = %x, want %s", got, wantDigest)
+	decoded, err := OpenSessionRecord(encoded)
+	if err != nil || decoded.Digest != SessionKey(record.Tenant, record.ClientID) ||
+		!bytes.Equal(decoded.Tenant, record.Tenant) || decoded.ClientID != record.ClientID ||
+		decoded.Bytes()[0] != encoded[0] {
+		t.Fatalf("OpenSessionRecord = %+v,%v", decoded, err)
 	}
-	decoded, err := OpenCompletionRecord(encoded)
-	if err != nil || !bytes.Equal(decoded.Completion, record.Completion) ||
-		!bytes.Equal(decoded.Tenant, record.Tenant) || decoded.Collection != record.Collection {
-		t.Fatalf("OpenCompletionRecord = %+v,%v", decoded, err)
-	}
-	_, zeroCode := codecCompletion(0)
-	if _, err := AppendCompletionRecord(nil, zeroCode); !errors.Is(err, ErrCompletionCorrupt) {
-		t.Fatalf("zero result code error = %v", err)
-	}
-	wrongShardCompletion, wrongShard := codecCompletion(ResultWrongShard)
-	wrongShardEncoded, err := AppendCompletionRecord(nil, wrongShard)
+
+	slot := sessionCodecSlot(t)
+	encoded, err = AppendSessionSlot(nil, slot)
 	if err != nil {
-		t.Fatalf("wrong-shard grammar: %v", err)
+		t.Fatal(err)
 	}
-	const wantWrongShardCompletionDigest = "3f3696e22cc412db43999af1decc6311caf8b117f17263e98e71154ec033e788"
-	if got := sha256.Sum256(wrongShardCompletion); hex.EncodeToString(got[:]) != wantWrongShardCompletionDigest {
-		t.Fatalf("wrong-shard completion envelope golden digest = %x, want %s", got, wantWrongShardCompletionDigest)
+	decodedSlot, err := OpenSessionSlot(encoded)
+	if err != nil || decodedSlot.SessionDigest != slot.SessionDigest ||
+		decodedSlot.LogicalCommandDigest != slot.LogicalCommandDigest ||
+		decodedSlot.AppliedSequence != slot.AppliedSequence ||
+		decodedSlot.ResultCode != slot.ResultCode || decodedSlot.Bytes()[0] != encoded[0] {
+		t.Fatalf("OpenSessionSlot = %+v,%v", decodedSlot, err)
 	}
-	const wantWrongShardRecordDigest = "d12136d0d8f1727e6f0b38f2c2e4b8c8d9da4a8876cefcb0e68bd2b64a1c7e55"
-	if got := sha256.Sum256(wrongShardEncoded); hex.EncodeToString(got[:]) != wantWrongShardRecordDigest {
-		t.Fatalf("wrong-shard completion record golden digest = %x, want %s", got, wantWrongShardRecordDigest)
+}
+
+func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
+	key := SessionKey([]byte("tenant"), id128(9))
+	const wantKey = "5dc75da7b53d9acda39520cbf89cb7a71bdfaba3a76a84a41e8dee27eb8bfefe"
+	if got := hex.EncodeToString(key[:]); got != wantKey {
+		t.Fatalf("SessionKey = %s, want %s", got, wantKey)
 	}
-	_, unknown := codecCompletion(ResultWrongShard + 1)
-	if _, err := AppendCompletionRecord(nil, unknown); !errors.Is(err, ErrCompletionCorrupt) {
-		t.Fatalf("unknown result grammar error = %v", err)
+
+	command := codecLogicalCommand()
+	digest := LogicalCommandDigest(openCodecLogicalCommand(t, command))
+	const wantLogical = "e18f0764424a1e06df37d6a99af5308b6b0397cc113f04a35be2094bb1c7235a"
+	if got := hex.EncodeToString(digest[:]); got != wantLogical {
+		t.Fatalf("LogicalCommandDigest = %s, want %s", got, wantLogical)
+	}
+	refreshed := command
+	refreshed.AckThrough = 2
+	refreshed.AllocationGeneration++
+	refreshed.RoutingVersion++
+	refreshed.RouteGeneration++
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, refreshed)); got != digest {
+		t.Fatalf("logical digest changed across acknowledgement/fence refresh: %x != %x", got, digest)
+	}
+	changed := command
+	changed.Mutations = append([]replication.Mutation(nil), command.Mutations...)
+	changed.Mutations[0].Key = []byte("other")
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changed)); got == digest {
+		t.Fatal("logical digest did not bind exact mutation bytes")
 	}
 }
 
@@ -255,10 +295,17 @@ func TestCodecAppendErrorsLeaveDestinationUnchanged(t *testing.T) {
 	if !errors.Is(err, ErrStateCorrupt) || !bytes.Equal(got, before) {
 		t.Fatalf("AppendState = %q,%v", got, err)
 	}
-	_, invalidCompletion := codecCompletion(0)
-	got, err = AppendCompletionRecord(dst, invalidCompletion)
-	if !errors.Is(err, ErrCompletionCorrupt) || !bytes.Equal(got, before) {
-		t.Fatalf("AppendCompletionRecord = %q,%v", got, err)
+	invalidSession := sessionCodecRecord()
+	invalidSession.RetryWindow = 0
+	got, err = AppendSessionRecord(dst, invalidSession)
+	if !errors.Is(err, ErrSessionCorrupt) || !bytes.Equal(got, before) {
+		t.Fatalf("AppendSessionRecord = %q,%v", got, err)
+	}
+	invalidSlot := sessionCodecSlot(t)
+	invalidSlot.LogicalCommandDigest = [sha256.Size]byte{}
+	got, err = AppendSessionSlot(dst, invalidSlot)
+	if !errors.Is(err, ErrSessionCorrupt) || !bytes.Equal(got, before) {
+		t.Fatalf("AppendSessionSlot = %q,%v", got, err)
 	}
 }
 
@@ -280,21 +327,21 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 			t.Fatalf("AppendState = %q,%v", got, err)
 		}
 	})
-	t.Run("completion writable slice", func(t *testing.T) {
-		_, record := codecCompletion(ResultApplied)
-		safe, err := AppendCompletionRecord(nil, record)
+	t.Run("session writable tenant", func(t *testing.T) {
+		record := sessionCodecRecord()
+		safe, err := AppendSessionRecord(nil, record)
 		if err != nil {
 			t.Fatal(err)
 		}
-		dst := make([]byte, 3, 3+len(safe)+len(record.Completion))
+		dst := make([]byte, 3, 3+len(safe)+len(record.Tenant))
 		copy(dst, "pre")
 		full := dst[:cap(dst)]
-		copy(full[3:3+len(record.Completion)], record.Completion)
-		record.Completion = full[3 : 3+len(record.Completion)]
+		copy(full[3:3+len(record.Tenant)], record.Tenant)
+		record.Tenant = full[3 : 3+len(record.Tenant)]
 		before := bytes.Clone(dst)
-		got, err := AppendCompletionRecord(dst, record)
+		got, err := AppendSessionRecord(dst, record)
 		if !errors.Is(err, ErrCodecAlias) || !bytes.Equal(got, before) {
-			t.Fatalf("AppendCompletionRecord = %q,%v", got, err)
+			t.Fatalf("AppendSessionRecord = %q,%v", got, err)
 		}
 	})
 	t.Run("relocation", func(t *testing.T) {
@@ -310,30 +357,28 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 			t.Fatalf("relocated state decode: %v", err)
 		}
 
-		_, record := codecCompletion(ResultApplied)
-		completionPrefix := make([]byte, len(record.Tenant), len(record.Tenant))
-		copy(completionPrefix, record.Tenant)
-		record.Tenant = completionPrefix
-		encoded, err = AppendCompletionRecord(completionPrefix, record)
-		if err != nil || !bytes.Equal(encoded[:len(completionPrefix)], []byte("tenant")) {
-			t.Fatalf("relocated completion = %q,%v", encoded, err)
+		record := sessionCodecRecord()
+		tenantPrefix := make([]byte, len(record.Tenant), len(record.Tenant))
+		copy(tenantPrefix, record.Tenant)
+		record.Tenant = tenantPrefix
+		encoded, err = AppendSessionRecord(tenantPrefix, record)
+		if err != nil || !bytes.Equal(encoded[:len(tenantPrefix)], []byte("tenant-a")) {
+			t.Fatalf("relocated session = %q,%v", encoded, err)
 		}
-		if _, err := OpenCompletionRecord(encoded[len(completionPrefix):]); err != nil {
-			t.Fatalf("relocated completion decode: %v", err)
+		if _, err := OpenSessionRecord(encoded[len(tenantPrefix):]); err != nil {
+			t.Fatalf("relocated session decode: %v", err)
+		}
+
+		slot := sessionCodecSlot(t)
+		slotPrefix := []byte("slot")
+		encoded, err = AppendSessionSlot(slotPrefix, slot)
+		if err != nil || !bytes.Equal(encoded[:len(slotPrefix)], slotPrefix) {
+			t.Fatalf("relocated slot = %q,%v", encoded, err)
+		}
+		if _, err := OpenSessionSlot(encoded[len(slotPrefix):]); err != nil {
+			t.Fatalf("relocated slot decode: %v", err)
 		}
 	})
-}
-
-func TestCompletionKeyGolden(t *testing.T) {
-	key := CompletionKey([]byte("tenant"), id128(9), 7, 11)
-	const want = "539b735a2ca83fe658e130c674cc1acd89e2c0e999320166f41cb3708e447e02"
-	if hex.EncodeToString(key[:]) != want {
-		t.Fatalf("CompletionKey = %x, want %s", key, want)
-	}
-	other := CompletionKey([]byte("tenant-2"), id128(9), 7, 11)
-	if key == other {
-		t.Fatal("different tuple produced the same test key")
-	}
 }
 
 func FuzzOpenState(f *testing.F) {
@@ -350,18 +395,31 @@ func FuzzOpenState(f *testing.F) {
 	})
 }
 
-func FuzzOpenCompletionRecord(f *testing.F) {
-	_, record := codecCompletion(ResultApplied)
-	seed, err := AppendCompletionRecord(nil, record)
+func FuzzOpenSessionRecord(f *testing.F) {
+	seed, err := AppendSessionRecord(nil, sessionCodecRecord())
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(seed)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > MaxCompletionRecordBytes+1 {
-			data = data[:MaxCompletionRecordBytes+1]
+		if len(data) > MaxSessionRecordBytes+1 {
+			data = data[:MaxSessionRecordBytes+1]
 		}
-		_, _ = OpenCompletionRecord(data)
+		_, _ = OpenSessionRecord(data)
+	})
+}
+
+func FuzzOpenSessionSlot(f *testing.F) {
+	seed, err := AppendSessionSlot(nil, sessionCodecSlot(f))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > MaxSessionSlotRecordBytes+1 {
+			data = data[:MaxSessionSlotRecordBytes+1]
+		}
+		_, _ = OpenSessionSlot(data)
 	})
 }
 
@@ -381,19 +439,34 @@ func FuzzOpenStateResealed(f *testing.F) {
 	})
 }
 
-func FuzzOpenCompletionRecordResealed(f *testing.F) {
-	_, record := codecCompletion(ResultApplied)
-	seed, err := AppendCompletionRecord(nil, record)
+func FuzzOpenSessionRecordResealed(f *testing.F) {
+	seed, err := AppendSessionRecord(nil, sessionCodecRecord())
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(uint32(0), byte(0))
-	f.Add(uint32(132), byte(0xff))
+	f.Add(uint32(104), byte(0xff))
 	f.Fuzz(func(t *testing.T, offset uint32, value byte) {
 		candidate := bytes.Clone(seed)
 		at := int(offset % uint32(len(candidate)-recordChecksumLen))
 		candidate[at] = value
-		sealRecord(candidate, completionRecordChecksumDomain)
-		_, _ = OpenCompletionRecord(candidate)
+		sealRecord(candidate, sessionRecordChecksumDomain)
+		_, _ = OpenSessionRecord(candidate)
+	})
+}
+
+func FuzzOpenSessionSlotResealed(f *testing.F) {
+	seed, err := AppendSessionSlot(nil, sessionCodecSlot(f))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(uint32(0), byte(0))
+	f.Add(uint32(104), byte(0xff))
+	f.Fuzz(func(t *testing.T, offset uint32, value byte) {
+		candidate := bytes.Clone(seed)
+		at := int(offset % uint32(len(candidate)-recordChecksumLen))
+		candidate[at] = value
+		sealRecord(candidate, sessionSlotChecksumDomain)
+		_, _ = OpenSessionSlot(candidate)
 	})
 }

@@ -3,6 +3,7 @@ package splitcontroller
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,6 +115,15 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	flowTranslateNext(t, plan.partitioner, capture, &tail, stage, persistStage)
 	stageCursor, _ = stage.Cursor()
 	observed.Stages[1] = &stageCursor
+	sessionState := observed.SourceState
+	sessionState.SessionCount = 1
+	sessionState.SessionSlotCount = 1
+	observed.SourceState = sessionState
+	if action, reconcileErr := Reconcile(plan, observed); action != (Action{}) ||
+		!errors.Is(reconcileErr, ErrSessionTransferRequired) {
+		t.Fatalf("seal with retained session action=%+v err=%v", action, reconcileErr)
+	}
+	observed.SourceState = state
 	assertFlowAction(t, plan, observed, ActionSealSource)
 
 	seal, err := plan.AppendSourceSeal(
@@ -162,11 +172,11 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		Child: 1, Phase: ChildPhaseActivated,
 		ApplyIdentity: sqldriver.ReplicatedApplyIdentity{
 			Storage: "apply", ValidationDigest: sha256.Sum256([]byte("flow-apply")),
-			MaxCompletions: 8,
+			MaxSessions: 8, RetryWindow: 8,
 		},
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			Applied: certificate.SourceCut().Applied, MaxCompletions: 8,
+			Applied: certificate.SourceCut().Applied, MaxSessions: 8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
@@ -206,9 +216,18 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	}
 	prune := pruner.Cursor()
 	observed.Prune = &prune
+	sessionState = observed.SourceState
+	sessionState.SessionCount = 1
+	sessionState.SessionSlotCount = 1
+	observed.SourceState = sessionState
+	if action, reconcileErr := Reconcile(plan, observed); action != (Action{}) ||
+		!errors.Is(reconcileErr, ErrSessionTransferRequired) {
+		t.Fatalf("publication with retained session action=%+v err=%v", action, reconcileErr)
+	}
+	observed.SourceState = state
 	assertFlowAction(t, plan, observed, ActionPublishCatalog)
 
-	next, err := plan.BuildCatalogTransition(catalog, certificate, prune)
+	next, err := plan.BuildCatalogTransition(catalog, state, certificate, prune)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +252,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	}
 	observed.OlderCatalogDrained = true
 	assertFlowAction(t, recovered, observed, ActionComplete)
-	if _, err := plan.BuildCatalogTransition(next, certificate, prune); err == nil {
+	if _, err := plan.BuildCatalogTransition(next, state, certificate, prune); err == nil {
 		t.Fatal("already-published catalog accepted as a new transition source")
 	}
 }
@@ -275,7 +294,7 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		t.Cleanup(func() { _ = collection.Close(); _ = file.Close() })
 		return collection
 	}
-	systemCollection := create("system", durable.Options{})
+	systemCollection := create("system", durable.Options{OpaqueValues: true})
 	userCollection := create("user", durable.Options{
 		MaxDocumentBytes: 4096, MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
@@ -295,7 +314,7 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		}
 	}
 	system := target(systemCollection)
-	system.Validation = replicatedstate.ValidationSchemaFreeJSON
+	system.Validation = replicatedstate.ValidationOpaqueBinary
 	system.ValidationDigest = [32]byte{}
 	system.Validator = nil
 	user := target(userCollection)
@@ -326,10 +345,11 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		replicatedstate.UserCollection{Name: "docs", Target: user}, log,
 		replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
+				MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
 				MaxBytes: 64 << 20,
 			},
-			MaxCompletions: 128,
+			MaxSessions: 128,
+			RetryWindow: 8,
 		},
 	)
 	if err != nil {

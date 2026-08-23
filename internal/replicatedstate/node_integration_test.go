@@ -77,7 +77,8 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	}
 	driveReplicatedStateNode(t, node)
 	before := machine.Published()
-	if before.Applied <= 1 || machine.state.CompletionCount != 1 {
+	if before.Applied <= 1 || machine.state.SessionCount != 1 ||
+		machine.state.SessionSlotCount != 1 {
 		t.Fatalf("publication before restart=%+v state=%+v", before, machine.state)
 	}
 	first, err := machine.LookupCompletion(command)
@@ -99,7 +100,7 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	driveReplicatedStateNode(t, restarted)
 	after := reopened.Published()
 	if after.Applied != before.Applied || after.DataChainDigest != before.DataChainDigest ||
-		reopened.state.CompletionCount != 1 {
+		reopened.state.SessionCount != 1 || reopened.state.SessionSlotCount != 1 {
 		t.Fatalf("restart replayed publication: before=%+v after=%+v state=%+v", before, after, reopened.state)
 	}
 	second, err := reopened.LookupCompletion(command)

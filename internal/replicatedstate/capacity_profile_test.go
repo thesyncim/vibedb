@@ -7,18 +7,18 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
-func TestCompletionCapacityStateTracksDurableCutAndPoison(t *testing.T) {
+func TestSessionCapacityStateTracksDurableCutAndPoison(t *testing.T) {
 	fixture := newMachineFixture(t)
-	want := CompletionCapacityState{}
-	if got, err := fixture.machine.CompletionCapacityState(); err != nil || got != want {
+	want := SessionCapacityState{}
+	if got, err := fixture.machine.SessionCapacityState(); err != nil || got != want {
 		t.Fatalf("uninitialized capacity state = %+v, %v; want %+v", got, err, want)
 	}
 
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	want = CompletionCapacityState{Initialized: true, Applied: 1}
-	if got, err := fixture.machine.CompletionCapacityState(); err != nil || got != want {
+	want = SessionCapacityState{Initialized: true, Applied: 1}
+	if got, err := fixture.machine.SessionCapacityState(); err != nil || got != want {
 		t.Fatalf("bootstrap capacity state = %+v, %v; want %+v", got, err, want)
 	}
 
@@ -28,15 +28,17 @@ func TestCompletionCapacityStateTracksDurableCutAndPoison(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
 		t.Fatal(err)
 	}
-	want = CompletionCapacityState{Initialized: true, Applied: 2, CompletionCount: 1}
-	if got, err := fixture.machine.CompletionCapacityState(); err != nil || got != want {
+	want = SessionCapacityState{
+		Initialized: true, Applied: 2, SessionCount: 1, SessionSlotCount: 1,
+	}
+	if got, err := fixture.machine.SessionCapacityState(); err != nil || got != want {
 		t.Fatalf("applied capacity state = %+v, %v; want %+v", got, err, want)
 	}
 
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); err == nil {
 		t.Fatal("conflicting replay did not poison machine")
 	}
-	if got, err := fixture.machine.CompletionCapacityState(); got != (CompletionCapacityState{}) ||
+	if got, err := fixture.machine.SessionCapacityState(); got != (SessionCapacityState{}) ||
 		!errors.Is(err, ErrApplyPoisoned) {
 		t.Fatalf("poisoned capacity state = %+v, %v; want zero, ErrApplyPoisoned", got, err)
 	}

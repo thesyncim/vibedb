@@ -363,7 +363,12 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 		t.Cleanup(func() { _ = collection.Close(); _ = file.Close() })
 		return collection
 	}
-	systemCollection := create("system", durable.Options{})
+	systemLimits := replicatedApplySystemLimits()
+	systemCollection := create("system", durable.Options{
+		OpaqueValues: true,
+		MaxKeyBytes:  systemLimits.MaxKeyBytes, MaxDocumentBytes: systemLimits.MaxDocumentBytes,
+		MaxBatchDocuments: 3, MaxBatchBytes: systemLimits.MaxBatchBytes,
+	})
 	userCollection := create("user", durable.Options{
 		MaxKeyBytes: 256, MaxDocumentBytes: 4096,
 		MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
@@ -384,7 +389,7 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 		}
 	}
 	system := target(systemCollection)
-	system.Validation = replicatedstate.ValidationSchemaFreeJSON
+	system.Validation = replicatedstate.ValidationOpaqueBinary
 	system.ValidationDigest = [32]byte{}
 	system.Validator = nil
 	user := target(userCollection)
@@ -410,10 +415,11 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 	}
 	machineOptions := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
+			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
 			MaxBytes: 64 << 20,
 		},
-		MaxCompletions: 128,
+		MaxSessions: 128,
+		RetryWindow: 8,
 	}
 	machine, err := replicatedstate.Open(
 		binding, bootstrap, system,

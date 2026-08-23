@@ -125,17 +125,18 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 		want   error
 	}{
 		{
-			name: "schema free",
+			name: "opaque profile on JSON collection",
 			mutate: func(target *CollectionTarget) {
-				target.Validation = ValidationSchemaFreeJSON
+				target.Validation = ValidationOpaqueBinary
 				target.ValidationDigest = [32]byte{}
 				target.Validator = nil
 			},
+			want: ErrInvalidCollection,
 		},
 		{
 			name: "schema free digest",
 			mutate: func(target *CollectionTarget) {
-				target.Validation = ValidationSchemaFreeJSON
+				target.Validation = ValidationOpaqueBinary
 				target.Validator = nil
 				target.ValidationDigest = testMutationValidationDigest
 			},
@@ -144,7 +145,7 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 		{
 			name: "schema free validator",
 			mutate: func(target *CollectionTarget) {
-				target.Validation = ValidationSchemaFreeJSON
+				target.Validation = ValidationOpaqueBinary
 				target.ValidationDigest = [32]byte{}
 				target.Validator = accepting
 			},
@@ -187,7 +188,7 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 		})
 	}
 	schemaFreeUser := fixture.user
-	schemaFreeUser.Validation = ValidationSchemaFreeJSON
+	schemaFreeUser.Validation = ValidationOpaqueBinary
 	schemaFreeUser.ValidationDigest = [32]byte{}
 	schemaFreeUser.Validator = nil
 	if _, err := Open(
@@ -195,6 +196,9 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 		UserCollection{Name: "docs", Target: schemaFreeUser}, fixture.log, fixture.machine.options,
 	); !errors.Is(err, ErrInvalidCollection) {
 		t.Fatalf("schema-free user Open error = %v, want ErrInvalidCollection", err)
+	}
+	if err := fixture.system.validate(); err != nil {
+		t.Fatalf("opaque system target validation: %v", err)
 	}
 
 	for _, mutateSystem := range []func(*CollectionTarget){
@@ -442,7 +446,7 @@ func TestValidatedOpenScansRowsOnceAndBindsApplyContract(t *testing.T) {
 	}
 
 	wrongCompletionBound := fixture.machine.options
-	wrongCompletionBound.MaxCompletions++
+	wrongCompletionBound.MaxSessions++
 	if _, err := Open(
 		fixture.binding, fixture.bootstrap, fixture.system,
 		UserCollection{Name: "docs", Target: reopenTarget}, fixture.log, wrongCompletionBound,
@@ -492,7 +496,9 @@ func TestValidatedOpenAndExplicitAuditRouteEveryExtantRow(t *testing.T) {
 
 func TestCompletionResultGrammar(t *testing.T) {
 	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, nil)
-	for _, code := range []uint32{ResultApplied, ResultTargetBound, ResultWrongShard} {
+	for _, code := range []uint32{
+		ResultApplied, ResultTargetBound, ResultWrongShard, ResultSessionRetired,
+	} {
 		if err := fixture.machine.validateCompletionResult(replication.CompletionView{
 			ResultFormat: ResultFormatMutation, ResultCode: code,
 		}); err != nil {
@@ -502,7 +508,7 @@ func TestCompletionResultGrammar(t *testing.T) {
 	for _, completion := range []replication.CompletionView{
 		{ResultFormat: ResultFormatMutation + 1, ResultCode: ResultApplied},
 		{ResultFormat: ResultFormatMutation, ResultCode: 0},
-		{ResultFormat: ResultFormatMutation, ResultCode: ResultWrongShard + 1},
+		{ResultFormat: ResultFormatMutation, ResultCode: ResultSessionRetired + 1},
 	} {
 		if err := fixture.machine.validateCompletionResult(completion); !errors.Is(err, ErrCompletionCorrupt) {
 			t.Fatalf("accepted invalid completion grammar %+v: %v", completion, err)
@@ -614,7 +620,7 @@ func TestCanonicalImageDigestGolden(t *testing.T) {
 		{key: []byte("a"), value: []byte(`{"n":1}`)},
 	}
 	if _, err := canonicalImageDigest(
-		"docs", ValidationSchemaFreeJSON, [32]byte{}, nil, nil, overlay,
+		"docs", ValidationOpaqueBinary, [32]byte{}, nil, nil, overlay,
 	); !errors.Is(err, ErrInvalidCollection) {
 		t.Fatalf("schema-free image digest error = %v, want ErrInvalidCollection", err)
 	}

@@ -191,7 +191,8 @@ func TestValidateStaticNoGCCompletionCapacityAgainstLiveApply(t *testing.T) {
 				t.Fatal(err)
 			}
 			options := testApplyOptions()
-			options.MaxCompletions = test.maxCompletions
+			options.MaxSessions = test.maxCompletions
+			options.RetryWindow = 1
 			claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
 			skipIfStrictAllocationUnsupported(t, "open live capacity apply", err)
 			if err != nil {
@@ -226,7 +227,8 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
-	options.MaxCompletions = uint64(testWALOptions().MaxEntries)
+	options.MaxSessions = uint64(testWALOptions().MaxEntries)
+	options.RetryWindow = 1
 	claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
 	skipIfStrictAllocationUnsupported(t, "open capacity-cut apply", err)
 	if err != nil {
@@ -322,7 +324,8 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 		t.Fatal(err)
 	}
 	firstOptions := testApplyOptions()
-	firstOptions.MaxCompletions = uint64(testWALOptions().MaxEntries)
+	firstOptions.MaxSessions = uint64(testWALOptions().MaxEntries)
+	firstOptions.RetryWindow = 1
 	firstClaim, _, err := OpenPreparedApply(
 		firstWAL, firstDB, authority, firstBase, firstOptions,
 	)
@@ -340,7 +343,8 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 		t.Fatal(err)
 	}
 	secondOptions := testApplyOptions()
-	secondOptions.MaxCompletions = uint64(testWALOptions().MaxEntries)
+	secondOptions.MaxSessions = uint64(testWALOptions().MaxEntries)
+	secondOptions.RetryWindow = 1
 	secondClaim, _, err := OpenPreparedApply(
 		secondWAL, secondDB, authority, secondBase, secondOptions,
 	)
@@ -377,7 +381,8 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
-	options.MaxCompletions = uint64(walOptions.MaxEntries)
+	options.MaxSessions = uint64(walOptions.MaxEntries)
+	options.RetryWindow = 1
 	claim, applyIdentity, err := OpenPreparedApply(wal, database, authority, base, options)
 	skipIfStrictAllocationUnsupported(t, "open restart capacity apply", err)
 	if err != nil {
@@ -474,7 +479,8 @@ func TestValidateStaticNoGCCompletionCapacityRejectsUnavailableInputs(t *testing
 		t.Fatal(err)
 	}
 	options := testApplyOptions()
-	options.MaxCompletions = uint64(testWALOptions().MaxEntries)
+	options.MaxSessions = uint64(testWALOptions().MaxEntries)
+	options.RetryWindow = 1
 	claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
 	skipIfStrictAllocationUnsupported(t, "open closed-input capacity apply", err)
 	if err != nil {

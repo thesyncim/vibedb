@@ -69,7 +69,7 @@ func newRuntimeFixtureWithOptions(
 		t.Fatalf("bind runtime SQL: %v", err)
 	}
 	applyOptions := testApplyOptions()
-	applyOptions.MaxCompletions = uint64(options.MaxEntries) + 1024
+	applyOptions.MaxSessions = uint64(options.MaxEntries) + 1024
 	apply, applyID, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
 	skipIfStrictAllocationUnsupported(t, "open runtime apply", err)
 	if err != nil {
@@ -124,7 +124,7 @@ func TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyOptions := testApplyOptions()
-	applyOptions.MaxCompletions = uint64(options.MaxEntries)
+	applyOptions.MaxSessions = uint64(options.MaxEntries)
 	apply, _, err := OpenPreparedApply(wal, database, authority, base, applyOptions)
 	skipIfStrictAllocationUnsupported(t, "open runtime owner apply", err)
 	if err != nil {

@@ -451,11 +451,13 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 			if len(value) == 0 || len(value) > c.options.MaxDocumentBytes {
 				return ErrDocumentTooLarge
 			}
-			if err := vibejson.Validate(value); err != nil {
-				return err
-			}
-			if err := c.validatePrimarySchema(value); err != nil {
-				return err
+			if !c.options.OpaqueValues {
+				if err := vibejson.Validate(value); err != nil {
+					return err
+				}
+				if err := c.validatePrimarySchema(value); err != nil {
+					return err
+				}
 			}
 		}
 		resident, err := c.currentPrimaryResidentRoute(state, key)

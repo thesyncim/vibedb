@@ -42,6 +42,7 @@ func testCommand() Command {
 		RoutingVersion: 23, RouteGeneration: 29,
 		Tenant: []byte("tenant\x00one"), ClientID: testID(0x81),
 		ClientEpoch: 31, ClientSequence: 37,
+		AckThrough:  31,
 		Fingerprint: testDigest(0xa1), RetryHome: testRetryHome(),
 		Collection: "messages",
 		Mutations: []Mutation{
@@ -49,6 +50,14 @@ func testCommand() Command {
 			{Kind: MutationDelete, Key: []byte("omega")},
 		},
 	}
+}
+
+func testSessionRetireCommand() Command {
+	command := testCommand()
+	command.Kind = CommandSessionRetire
+	command.AckThrough = 0
+	command.Mutations = nil
+	return command
 }
 
 func testInlineCompletion() Completion {
@@ -80,6 +89,37 @@ func testReferenceCompletion() Completion {
 	completion.InlineResult = nil
 	completion.ResultDigest = testDigest(0xc1)
 	return completion
+}
+
+func testCompletionBytes(completion Completion) CompletionBytes {
+	return CompletionBytes{
+		ClusterID:              completion.ClusterID,
+		ClusterIncarnation:     completion.ClusterIncarnation,
+		TopologyRecoveryEpoch:  completion.TopologyRecoveryEpoch,
+		Distribution:           []byte(completion.Distribution),
+		Shard:                  []byte(completion.Shard),
+		AllocationGeneration:   completion.AllocationGeneration,
+		ShardIncarnation:       completion.ShardIncarnation,
+		GroupID:                completion.GroupID,
+		ReplicaSetVersion:      completion.ReplicaSetVersion,
+		ActivePolicyGeneration: completion.ActivePolicyGeneration,
+		ProtectionEpoch:        completion.ProtectionEpoch,
+		RoutingVersion:         completion.RoutingVersion,
+		RouteGeneration:        completion.RouteGeneration,
+		Tenant:                 completion.Tenant,
+		ClientID:               completion.ClientID,
+		ClientEpoch:            completion.ClientEpoch,
+		ClientSequence:         completion.ClientSequence,
+		Fingerprint:            completion.Fingerprint,
+		RetryHome:              completion.RetryHome,
+		AppliedSequence:        completion.AppliedSequence,
+		ResultCode:             completion.ResultCode,
+		ResultFormat:           completion.ResultFormat,
+		Storage:                completion.Storage,
+		ResultLength:           completion.ResultLength,
+		ResultDigest:           completion.ResultDigest,
+		InlineResult:           completion.InlineResult,
+	}
 }
 
 func encodeCommand(t testing.TB, command Command) []byte {
@@ -117,7 +157,8 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(view.Bytes(), frame) || view.ClusterID != command.ClusterID ||
+	if !bytes.Equal(view.Bytes(), frame) || view.Kind() != command.Kind ||
+		view.ClusterID != command.ClusterID ||
 		view.ClusterIncarnation != command.ClusterIncarnation ||
 		view.ShardIncarnation != command.ShardIncarnation || view.GroupID != command.GroupID ||
 		view.ClientID != command.ClientID || view.Fingerprint != command.Fingerprint ||
@@ -136,7 +177,8 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 		view.SchemaGeneration != command.SchemaGeneration ||
 		view.RoutingVersion != command.RoutingVersion ||
 		view.RouteGeneration != command.RouteGeneration ||
-		view.ClientEpoch != command.ClientEpoch || view.ClientSequence != command.ClientSequence {
+		view.ClientEpoch != command.ClientEpoch || view.ClientSequence != command.ClientSequence ||
+		view.AckThrough != command.AckThrough {
 		t.Fatal("decoded command scalar mismatch")
 	}
 	iterator := view.Mutations()
@@ -156,6 +198,41 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 	var empty MutationIterator
 	if empty.Next() || (*MutationIterator)(nil).Next() {
 		t.Fatal("empty or nil iterator advanced")
+	}
+}
+
+func TestSessionRetireRoundTrip(t *testing.T) {
+	command := testSessionRetireCommand()
+	encoded := encodeCommand(t, command)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Kind() != CommandSessionRetire || view.MutationCount() != 0 ||
+		view.AckThrough != command.AckThrough ||
+		view.ClientSequence != command.ClientSequence {
+		t.Fatalf("decoded session retire mismatch: %+v", view)
+	}
+	iterator := view.Mutations()
+	if iterator.Next() {
+		t.Fatal("session retire exposed a mutation")
+	}
+	if len(encoded) != commandMutationOffset(encoded)+envelopeChecksumBytes {
+		t.Fatalf("session retire length = %d, want empty mutation body", len(encoded))
+	}
+}
+
+func TestAckThroughBoundaries(t *testing.T) {
+	for _, ackThrough := range []uint64{0, testCommand().ClientSequence - 1} {
+		command := testCommand()
+		command.AckThrough = ackThrough
+		view, err := OpenCommand(encodeCommand(t, command))
+		if err != nil {
+			t.Fatalf("AckThrough %d: %v", ackThrough, err)
+		}
+		if view.AckThrough != ackThrough {
+			t.Fatalf("AckThrough = %d, want %d", view.AckThrough, ackThrough)
+		}
 	}
 }
 
@@ -232,10 +309,42 @@ func TestCompletionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompletionByteInputIsWireIdentical(t *testing.T) {
+	for _, completion := range []Completion{
+		testInlineCompletion(), testReferenceCompletion(),
+	} {
+		want := encodeCompletion(t, completion)
+		prefix := []byte("prefix:")
+		dst := make([]byte, len(prefix), len(prefix)+len(want))
+		copy(dst, prefix)
+		got, err := AppendCompletionBytes(dst, testCompletionBytes(completion))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[:len(prefix)], prefix) || !bytes.Equal(got[len(prefix):], want) {
+			t.Fatal("byte-native completion differs from canonical completion bytes")
+		}
+	}
+}
+
+func TestCompletionByteInputUsesCanonicalValidation(t *testing.T) {
+	completion := testCompletionBytes(testInlineCompletion())
+	completion.Distribution = []byte{0xff}
+	prefix := []byte("unchanged")
+	got, err := AppendCompletionBytes(prefix, completion)
+	if !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatal("validation failure changed destination")
+	}
+}
+
 // These vectors freeze every byte of the current envelopes. They change only
 // when the single supported grammar intentionally changes.
 func TestGoldenVectors(t *testing.T) {
-	const commandHex = "564442434d4400000100010000010000560100004e00000002000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d657373616765730100050014000000616c7068617b226964223a22616c706861222c2276223a317d02000500000000006f6d6567617aab10f08554ef0f"
+	const commandHex = "564442434d4400000100010000010000560100004e00000002000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b00030008001f0000000000000074656e616e74006f6e6574656e616e745f646174612d38306d657373616765730100050014000000616c7068617b226964223a22616c706861222c2276223a317d02000500000000006f6d6567610b481f1bf4b7e0e4"
+	const retireHex = "564442434d4400000100020000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573844f206c7bb0df93"
 	const inlineHex = "564442434d50000001000100200101004501000005000000000000001d0000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00ef4fa8c2f3151c0180717a46d7a6b869a9b85ccd1e82be796cf4ea1eb9af0650123456789abcdef05000000000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38300100ff6f6b19f88b6ce6077493"
 	const referenceHex = "564442434d5000000100020020010100400100000000000000000000180000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe00123456789abcdef01000100000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38304a28f106b5d70ef9"
 	for _, tc := range []struct {
@@ -244,6 +353,7 @@ func TestGoldenVectors(t *testing.T) {
 		want string
 	}{
 		{"command", encodeCommand(t, testCommand()), commandHex},
+		{"session_retire", encodeCommand(t, testSessionRetireCommand()), retireHex},
 		{"inline_completion", encodeCompletion(t, testInlineCompletion()), inlineHex},
 		{"reference_completion", encodeCompletion(t, testReferenceCompletion()), referenceHex},
 	} {
@@ -261,12 +371,16 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 	}{
 		{"zero_cluster", func(c *Command) { c.ClusterID = ID128{} }, ErrEnvelopeSemantic},
 		{"zero_generation", func(c *Command) { c.RouteGeneration = 0 }, ErrEnvelopeSemantic},
+		{"unknown_command_kind", func(c *Command) { c.Kind = 99 }, ErrEnvelopeSemantic},
+		{"ack_equal_sequence", func(c *Command) { c.AckThrough = c.ClientSequence }, ErrEnvelopeSemantic},
+		{"ack_after_sequence", func(c *Command) { c.AckThrough = c.ClientSequence + 1 }, ErrEnvelopeSemantic},
 		{"zero_fingerprint", func(c *Command) { c.Fingerprint = Digest{} }, ErrEnvelopeSemantic},
 		{"empty_tenant", func(c *Command) { c.Tenant = nil }, ErrEnvelopeSemantic},
 		{"long_tenant", func(c *Command) { c.Tenant = bytes.Repeat([]byte{'x'}, MaxIdentityBytes+1) }, ErrEnvelopeSemantic},
 		{"invalid_distribution_utf8", func(c *Command) { c.Distribution = "\xff" }, ErrEnvelopeSemantic},
 		{"long_collection", func(c *Command) { c.Collection = strings.Repeat("x", MaxCollectionBytes+1) }, ErrEnvelopeSemantic},
 		{"no_mutations", func(c *Command) { c.Mutations = nil }, ErrEnvelopeSemantic},
+		{"retire_with_mutations", func(c *Command) { c.Kind = CommandSessionRetire }, ErrEnvelopeSemantic},
 		{"too_many_mutations", func(c *Command) { c.Mutations = make([]Mutation, MaxMutations+1) }, ErrEnvelopeSemantic},
 		{"empty_key", func(c *Command) { c.Mutations[0].Key = nil }, ErrEnvelopeSemantic},
 		{"long_key", func(c *Command) { c.Mutations[0].Key = bytes.Repeat([]byte{'a'}, MaxMutationKeyBytes+1) }, ErrEnvelopeSemantic},
@@ -433,10 +547,18 @@ func TestCommandDecodeRejectsDamageAndSemanticCorruption(t *testing.T) {
 		{"header_bytes", func(b []byte) { binary.LittleEndian.PutUint16(b[12:14], commandHeaderBytes-1) }, ErrEnvelopeCorrupt},
 		{"total_bytes", func(b []byte) { binary.LittleEndian.PutUint32(b[16:20], uint32(len(b)-1)) }, ErrEnvelopeCorrupt},
 		{"body_bytes", func(b []byte) { binary.LittleEndian.PutUint32(b[20:24], uint32(len(b))) }, ErrEnvelopeCorrupt},
+		{"unknown_command_kind", func(b []byte) { b[10] = 99 }, ErrEnvelopeSemantic},
+		{"retire_with_mutations", func(b []byte) { b[10] = commandWireSessionRetire }, ErrEnvelopeSemantic},
 		{"zero_mutation_count", func(b []byte) { clear(b[24:28]) }, ErrEnvelopeSemantic},
 		{"excess_mutation_count", func(b []byte) { binary.LittleEndian.PutUint32(b[24:28], 3) }, ErrEnvelopeCorrupt},
 		{"flags", func(b []byte) { b[11] = 1 }, ErrEnvelopeSemantic},
-		{"reserved", func(b []byte) { b[248] = 1 }, ErrEnvelopeSemantic},
+		{"reserved", func(b []byte) { b[28] = 1 }, ErrEnvelopeSemantic},
+		{"ack_equal_sequence", func(b []byte) {
+			copy(b[248:256], b[192:200])
+		}, ErrEnvelopeSemantic},
+		{"ack_after_sequence", func(b []byte) {
+			binary.LittleEndian.PutUint64(b[248:256], binary.LittleEndian.Uint64(b[192:200])+1)
+		}, ErrEnvelopeSemantic},
 		{"zero_identity", func(b []byte) { clear(b[32:48]) }, ErrEnvelopeSemantic},
 		{"zero_generation", func(b []byte) { clear(b[160:168]) }, ErrEnvelopeSemantic},
 		{"zero_tenant_length", func(b []byte) { clear(b[240:242]) }, ErrEnvelopeSemantic},
@@ -606,6 +728,16 @@ func TestAppendCompletionRejectsWritableRegionAliases(t *testing.T) {
 			copy(region, source)
 			completion.Tenant = region[:len(source)]
 		}},
+		{"distribution", func(completion *Completion, region []byte) {
+			source := []byte(completion.Distribution)
+			copy(region, source)
+			completion.Distribution = unsafe.String(unsafe.SliceData(region), len(source))
+		}},
+		{"shard", func(completion *Completion, region []byte) {
+			source := []byte(completion.Shard)
+			copy(region, source)
+			completion.Shard = unsafe.String(unsafe.SliceData(region), len(source))
+		}},
 		{"inline_result", func(completion *Completion, region []byte) {
 			source := append([]byte(nil), completion.InlineResult...)
 			copy(region, source)
@@ -628,6 +760,27 @@ func TestAppendCompletionRejectsWritableRegionAliases(t *testing.T) {
 				t.Fatal("alias rejection modified destination backing")
 			}
 		})
+	}
+}
+
+func TestAppendCompletionBytesRejectsWritableRegionAliases(t *testing.T) {
+	completion := testCompletionBytes(testInlineCompletion())
+	frameBytes := len(encodeCompletion(t, testInlineCompletion()))
+	const prefix = "prefix"
+	backing := make([]byte, len(prefix)+frameBytes)
+	copy(backing, prefix)
+	region := backing[len(prefix):]
+	copy(region, completion.Distribution)
+	completion.Distribution = region[:len(completion.Distribution)]
+	dst := backing[:len(prefix)]
+	before := append([]byte(nil), backing...)
+
+	got, err := AppendCompletionBytes(dst, completion)
+	if !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+	}
+	if !bytes.Equal(got, dst) || !bytes.Equal(backing, before) {
+		t.Fatal("alias rejection modified destination backing")
 	}
 }
 

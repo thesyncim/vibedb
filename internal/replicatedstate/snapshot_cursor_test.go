@@ -36,10 +36,10 @@ func TestSnapshotArtifactCursorRoundTripAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x43, 0xcd, 0xff, 0xf7, 0xd7, 0x34, 0x0f, 0x5e,
-		0xe8, 0x06, 0x39, 0x52, 0x94, 0x5f, 0x55, 0xc3,
-		0xee, 0x38, 0xa8, 0xd3, 0x43, 0x1a, 0xc7, 0x54,
-		0xf7, 0xf1, 0xf4, 0x94, 0x80, 0xaf, 0x63, 0x50,
+		0xde, 0xe9, 0x60, 0x3e, 0xba, 0xc5, 0xf5, 0x43,
+		0x6e, 0x86, 0x25, 0x5a, 0x4a, 0xaf, 0x0a, 0xe3,
+		0x87, 0x8d, 0x57, 0x40, 0xd8, 0xac, 0x25, 0x6a,
+		0xc9, 0xe3, 0x26, 0x9c, 0x40, 0x19, 0x27, 0x1d,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("cursor golden digest = %x, want %x", got, wantGolden)
@@ -83,6 +83,26 @@ func TestSnapshotArtifactCursorRoundTripAndResume(t *testing.T) {
 	second, err := OpenSnapshotArtifactCursor(appended[len(prefixed):])
 	if err != nil || second.Offset() != decoded.Offset() {
 		t.Fatalf("prefixed open offset = %d, %v", second.Offset(), err)
+	}
+}
+
+func TestOpenSnapshotArtifactCursorOwnsInput(t *testing.T) {
+	_, _, cursor := snapshotArtifactCursorFixture(t)
+	encoded, err := AppendSnapshotArtifactCursor(nil, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Clone(encoded)
+	decoded, err := OpenSnapshotArtifactCursor(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range encoded {
+		encoded[index] ^= 0xff
+	}
+	reencoded, err := AppendSnapshotArtifactCursor(nil, decoded)
+	if err != nil || !bytes.Equal(reencoded, want) {
+		t.Fatalf("cursor retained caller input: encoded=%x want=%x err=%v", reencoded, want, err)
 	}
 }
 

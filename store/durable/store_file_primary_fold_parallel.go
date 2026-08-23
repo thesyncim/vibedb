@@ -156,6 +156,7 @@ func (c *Collection) setupPrimaryNativeFoldContexts() error {
 // recovery-journal ordering.
 func (c *Collection) primaryNativeFoldContextEligible() bool {
 	return c != nil && c.buffered() && c.primaryUnifiedOverlay != nil &&
+		!c.options.OpaqueValues &&
 		c.options.Collection.Schema == nil && len(c.options.indexes) == 0
 }
 

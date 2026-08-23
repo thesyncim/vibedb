@@ -2,6 +2,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -11,27 +12,29 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestCompletionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
+func TestSessionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	a := encodeCommand(t, commandValue(fixture.binding, 1))
-	b := encodeCommand(t, commandValue(fixture.binding, 2))
-	viewA, _ := replication.OpenCommand(a)
-	viewB, _ := replication.OpenCommand(b)
-	document, err := fixture.machine.makeCompletionDocument(viewB, 2, ResultApplied)
+	command := encodeCommand(t, commandValue(fixture.binding, 1))
+	view, _ := replication.OpenCommand(command)
+	digest := SessionKey(view.Tenant, view.ClientID)
+	key := SessionStorageKey(digest)
+	foreign, err := AppendSessionRecord(nil, SessionRecord{
+		Tenant: []byte("foreign"), ClientID: id128(91), ClientEpoch: 1,
+		RetryHome: view.RetryHome, HighSequence: 1, Status: SessionActive,
+		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: 1,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	digestA := CompletionKey(viewA.Tenant, viewA.ClientID, viewA.ClientEpoch, viewA.ClientSequence)
-	keyA := completionStorageKey(digestA)
 	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
-		return batch.Put(keyA[:], document)
+		return batch.Put(key[:], foreign)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), a); !errors.Is(err, ErrCompletionCorrupt) {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); !errors.Is(err, ErrSessionCorrupt) {
 		t.Fatalf("collision apply error = %v", err)
 	}
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); !errors.Is(err, ErrApplyPoisoned) {
@@ -39,9 +42,9 @@ func TestCompletionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
 	}
 }
 
-func TestCompletionRetentionCapFailsClosed(t *testing.T) {
+func TestSessionIdentityCapacityRefusesWithoutPoisoning(t *testing.T) {
 	fixture := newMachineFixture(t)
-	fixture.machine.options.MaxCompletions = 1
+	fixture.machine.options.MaxSessions = 1
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -49,15 +52,63 @@ func TestCompletionRetentionCapFailsClosed(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(2), first); err != nil {
 		t.Fatal(err)
 	}
-	second := encodeCommand(t, commandValue(fixture.binding, 2))
+	secondValue := commandValue(fixture.binding, 1)
+	secondValue.ClientID = id128(99)
+	secondValue.Fingerprint = replication.Digest{99}
+	second := encodeCommand(t, secondValue)
 	if err := fixture.machine.AdmitCommand(second); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("cap admission error = %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), second); !errors.Is(err, ErrAdmissionBound) {
-		t.Fatalf("cap apply error = %v", err)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), second)
+	if err != nil || publication.Applied != 3 {
+		t.Fatalf("committed refusal = %+v,%v", publication, err)
 	}
-	if fixture.machine.Applied() != 2 || fixture.machine.state.CompletionCount != 1 {
+	if fixture.machine.state.SessionCount != 1 || fixture.machine.state.SessionSlotCount != 1 {
 		t.Fatalf("cap failure publication=%+v state=%+v", fixture.machine.Published(), fixture.machine.state)
+	}
+	if _, err := fixture.machine.LookupCompletion(second); !errors.Is(err, ErrCompletionNotFound) {
+		t.Fatalf("refused lookup error = %v", err)
+	}
+}
+
+func TestPointPathsRejectSessionRetirementMismatch(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Machine, []byte) error
+	}{
+		{name: "lookup", run: func(machine *Machine, command []byte) error {
+			_, err := machine.LookupCompletion(command)
+			return err
+		}},
+		{name: "admission", run: func(machine *Machine, command []byte) error {
+			return machine.AdmitCommand(command)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineFixture(t)
+			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			command := encodeCommand(t, commandValue(fixture.binding, 1))
+			view, err := replication.OpenCommand(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+				t.Fatal(err)
+			}
+			digest := SessionKey(view.Tenant, view.ClientID)
+			rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+				binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
+			})
+			if err := test.run(fixture.machine, command); !errors.Is(err, ErrSessionCorrupt) {
+				t.Fatalf("point-path error = %v, want ErrSessionCorrupt", err)
+			}
+			if _, err := fixture.machine.SessionCapacityState(); !errors.Is(err, ErrApplyPoisoned) {
+				t.Fatalf("post-corruption health = %v, want ErrApplyPoisoned", err)
+			}
+		})
 	}
 }
 
@@ -104,7 +155,7 @@ func TestOpenRequiresExactCollectionAndTransactionBounds(t *testing.T) {
 	})
 	t.Run("transaction documents", func(t *testing.T) {
 		options := base
-		options.TxnLimits.MaxDocuments = fixture.user.Limits.MaxDistinctMutations + 1
+		options.TxnLimits.MaxDocuments = fixture.user.Limits.MaxDistinctMutations + 2
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, options)
 		if !errors.Is(err, ErrInvalidOptions) {
@@ -112,9 +163,8 @@ func TestOpenRequiresExactCollectionAndTransactionBounds(t *testing.T) {
 		}
 	})
 	t.Run("transaction bytes", func(t *testing.T) {
-		maxStateDocument := 2*MaxStateEnvelopeBytes + 2
-		maxCompletionDocument := 2*MaxCompletionRecordBytes + 2
-		maxSystem := len(stateKey) + maxStateDocument + 33 + maxCompletionDocument
+		maxSystem := len(stateKey) + MaxStateEnvelopeBytes +
+			33 + MaxSessionRecordBytes + 35 + MaxSessionSlotRecordBytes
 		options := base
 		options.TxnLimits.MaxBytes = int64(min(fixture.user.Limits.MaxBatchBytes, replication.MaxCommandBytes)+maxSystem) - 1
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
@@ -192,7 +242,7 @@ func TestBootstrapExactnessAndBounds(t *testing.T) {
 	})
 }
 
-func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
+func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 	t.Run("static last-entry digest", func(t *testing.T) {
 		fixture := newMachineFixture(t)
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -205,7 +255,7 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		envelope[184] ^= 1
 		sealRecord(envelope, stateChecksumDomain)
 		if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
-			return batch.Put(stateKey, wrapJSONHex(nil, envelope))
+			return batch.Put(stateKey, envelope)
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -287,7 +337,7 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
-	t.Run("completion count", func(t *testing.T) {
+	t.Run("session row counts", func(t *testing.T) {
 		fixture := newMachineFixture(t)
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
@@ -297,7 +347,7 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 0
+		state.SessionSlotCount = 0
 		putStateDocument(t, fixture.system.Collection, state, nil, nil)
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
@@ -305,32 +355,142 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
-	t.Run("duplicate completion applied sequence", func(t *testing.T) {
+	t.Run("retired header needs retire result", func(t *testing.T) {
 		fixture := newMachineFixture(t)
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
-		first := encodeCommand(t, commandValue(fixture.binding, 1))
-		if _, err := fixture.machine.ApplyNormal(normalMeta(2), first); err != nil {
+		command := encodeCommand(t, commandValue(fixture.binding, 1))
+		view, _ := replication.OpenCommand(command)
+		if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
-			t.Fatal(err)
+		digest := SessionKey(view.Tenant, view.ClientID)
+		key := SessionStorageKey(digest)
+		raw, found, err := fixture.system.Collection.AppendRaw(nil, key[:])
+		if err != nil || !found {
+			t.Fatalf("session read = %v,%v", found, err)
 		}
-		second := encodeCommand(t, commandValue(fixture.binding, 2))
-		view, _ := replication.OpenCommand(second)
-		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultApplied)
+		header, err := OpenSessionRecord(raw)
 		if err != nil {
 			t.Fatal(err)
 		}
-		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-		key := completionStorageKey(digest)
-		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 2
-		putStateDocument(t, fixture.system.Collection, state, key[:], document)
+		next := sessionRecord(header)
+		next.Status = SessionRetired
+		record, err := AppendSessionRecord(nil, next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.system.Collection.Put(key[:], record); err != nil {
+			t.Fatal(err)
+		}
 		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
-		if !errors.Is(err, ErrCompletionCorrupt) {
+		if !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("current epoch retry slot", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		for sequence := uint64(1); sequence <= 9; sequence++ {
+			if _, err := fixture.machine.ApplyNormal(
+				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		digest := SessionKey([]byte("tenant"), id128(77))
+		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+			binary.LittleEndian.PutUint64(raw[60:68], 1)
+		})
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("session result apply order", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		for sequence := uint64(1); sequence <= 2; sequence++ {
+			if _, err := fixture.machine.ApplyNormal(
+				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		digest := SessionKey([]byte("tenant"), id128(77))
+		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+			binary.LittleEndian.PutUint64(raw[68:76], 3)
+		})
+		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
+			binary.LittleEndian.PutUint64(raw[68:76], 2)
+		})
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("mixed routing coordinates", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(
+			normalMeta(2), encodeCommand(t, commandValue(fixture.binding, 1)),
+		); err != nil {
+			t.Fatal(err)
+		}
+		configuration := normalMeta(3)
+		configuration.Type = pb.EntryConfChange
+		if _, err := fixture.machine.ApplyConfiguration(
+			configuration, &pb.ConfState{Voters: []uint64{1, 2}},
+		); err != nil {
+			t.Fatal(err)
+		}
+		transition := testOwnershipTransition(fixture.binding, 3)
+		encoded, err := AppendOwnershipTransition(nil, transition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(normalMeta(4), encoded); err != nil {
+			t.Fatal(err)
+		}
+		digest := SessionKey([]byte("tenant"), id128(77))
+		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+			binary.LittleEndian.PutUint64(raw[176:184], transition.ToRouteGeneration)
+		})
+		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("Open error = %v", err)
+		}
+	})
+	t.Run("early retirement result", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		for sequence := uint64(1); sequence <= 2; sequence++ {
+			if _, err := fixture.machine.ApplyNormal(
+				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		digest := SessionKey([]byte("tenant"), id128(77))
+		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+			binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
+		})
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
+			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
+		if !errors.Is(err, ErrSessionCorrupt) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
@@ -344,18 +504,11 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		}
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
 		view, _ := replication.OpenCommand(command)
-		document, err := fixture.machine.makeCompletionDocument(view, 1, ResultApplied)
-		if err != nil {
-			t.Fatal(err)
-		}
-		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 1
-		putStateDocument(t, fixture.system.Collection, state, key[:], document)
-		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
+		putCraftedSession(t, fixture, state, view, 1, ResultApplied)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
-		if !errors.Is(err, ErrCompletionCorrupt) {
+		if !errors.Is(err, ErrSessionCorrupt) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
@@ -371,18 +524,11 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command.ReplicaSetVersion = 2
 		encoded := encodeCommand(t, command)
 		view, _ := replication.OpenCommand(encoded)
-		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultApplied)
-		if err != nil {
-			t.Fatal(err)
-		}
-		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 1
-		putStateDocument(t, fixture.system.Collection, state, key[:], document)
-		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
+		putCraftedSession(t, fixture, state, view, 2, ResultApplied)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
-		if !errors.Is(err, ErrCompletionCorrupt) {
+		if !errors.Is(err, ErrSessionCorrupt) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
@@ -400,18 +546,11 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command.ReplicaSetVersion = 2
 		encoded := encodeCommand(t, command)
 		view, _ := replication.OpenCommand(encoded)
-		document, err := fixture.machine.makeCompletionDocument(view, 3, ResultApplied)
-		if err != nil {
-			t.Fatal(err)
-		}
-		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 1
-		putStateDocument(t, fixture.system.Collection, state, key[:], document)
-		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
+		putCraftedSession(t, fixture, state, view, 3, ResultApplied)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
-		if !errors.Is(err, ErrCompletionCorrupt) {
+		if !errors.Is(err, ErrSessionCorrupt) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
@@ -429,21 +568,37 @@ func TestOpenDetectsStateLogicalCountAndCompletionCorruption(t *testing.T) {
 		command.ReplicaSetVersion = 100
 		encoded := encodeCommand(t, command)
 		view, _ := replication.OpenCommand(encoded)
-		document, err := fixture.machine.makeCompletionDocument(view, 2, ResultStaleFence)
-		if err != nil {
-			t.Fatal(err)
-		}
-		digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-		key := completionStorageKey(digest)
 		state := cloneState(fixture.machine.state)
-		state.CompletionCount = 1
-		putStateDocument(t, fixture.system.Collection, state, key[:], document)
-		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
+		putCraftedSession(t, fixture, state, view, 2, ResultStaleFence)
+		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
-		if !errors.Is(err, ErrCompletionCorrupt) {
+		if !errors.Is(err, ErrSessionCorrupt) {
 			t.Fatalf("Open error = %v", err)
 		}
 	})
+}
+
+func rewriteSessionSlot(
+	t testing.TB,
+	fixture machineFixture,
+	digest [32]byte,
+	slot uint16,
+	mutate func([]byte),
+) {
+	t.Helper()
+	key, err := SessionSlotStorageKey(digest, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, found, err := fixture.system.Collection.AppendRaw(nil, key[:])
+	if err != nil || !found {
+		t.Fatalf("session slot read = %v,%v", found, err)
+	}
+	mutate(raw)
+	sealRecord(raw, sessionSlotChecksumDomain)
+	if _, err := fixture.system.Collection.Put(key[:], raw); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func putStateDocument(t testing.TB, collection *durable.Collection, state State, extraKey, extraDocument []byte) {
@@ -452,15 +607,85 @@ func putStateDocument(t testing.TB, collection *durable.Collection, state State,
 	if err != nil {
 		t.Fatal(err)
 	}
-	document := wrapJSONHex(nil, envelope)
 	if err := collection.Update(func(batch *durable.WriteBatch) error {
-		if err := batch.Put(stateKey, document); err != nil {
+		if err := batch.Put(stateKey, envelope); err != nil {
 			return err
 		}
 		if len(extraDocument) != 0 {
 			return batch.Put(extraKey, extraDocument)
 		}
 		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func putCraftedSession(
+	t testing.TB,
+	fixture machineFixture,
+	state State,
+	command replication.CommandView,
+	applied uint64,
+	result uint32,
+) {
+	t.Helper()
+	digest := SessionKey(command.Tenant, command.ClientID)
+	sessionKey := SessionStorageKey(digest)
+	slotKey, err := SessionSlotStorageKey(digest, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := AppendSessionRecord(nil, SessionRecord{
+		Tenant: command.Tenant, ClientID: command.ClientID,
+		ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
+		HighSequence: command.ClientSequence, Status: SessionActive,
+		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedApplied := applied
+	if encodedApplied < 2 {
+		// The codec rejects impossible apply indexes. Encode a structurally valid
+		// slot, then reseal the deliberately corrupted fixture below so Open's
+		// persisted-image validation remains covered independently.
+		encodedApplied = 2
+	}
+	slot, err := AppendSessionSlot(nil, SessionSlot{
+		Slot:                   0,
+		SessionDigest:          digest,
+		ClientEpoch:            command.ClientEpoch,
+		ClientSequence:         command.ClientSequence,
+		AppliedSequence:        encodedApplied,
+		Fingerprint:            command.Fingerprint,
+		LogicalCommandDigest:   LogicalCommandDigest(command),
+		ResultCode:             result,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch,
+		RoutingVersion:         command.RoutingVersion,
+		RouteGeneration:        command.RouteGeneration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != encodedApplied {
+		binary.LittleEndian.PutUint64(slot[68:76], applied)
+		sealRecord(slot, sessionSlotChecksumDomain)
+	}
+	state.SessionCount, state.SessionSlotCount = 1, 1
+	stateEnvelope, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		if err := batch.Put(stateKey, stateEnvelope); err != nil {
+			return err
+		}
+		if err := batch.Put(sessionKey[:], header); err != nil {
+			return err
+		}
+		return batch.Put(slotKey[:], slot)
 	}); err != nil {
 		t.Fatal(err)
 	}

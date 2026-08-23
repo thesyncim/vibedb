@@ -18,7 +18,8 @@ import (
 
 func testApplyOptions() sqldriver.ReplicatedApplyOptions {
 	return sqldriver.ReplicatedApplyOptions{
-		MaxCompletions: 128,
+		MaxSessions: 128,
+		RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 16,
 			MaxDocuments:   256,

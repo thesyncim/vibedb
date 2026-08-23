@@ -21,7 +21,7 @@ func (c *Collection) MaxKeyBytes() int {
 	return c.options.MaxKeyBytes
 }
 
-// MaxDocumentBytes reports the maximum JSON document size.
+// MaxDocumentBytes reports the maximum document or opaque-value size.
 func (c *Collection) MaxDocumentBytes() int {
 	if c == nil {
 		return 0
@@ -71,6 +71,13 @@ func (c *Collection) SealedRecoveryJournalBytes() uint64 {
 // could make committed input fail only at apply time.
 func (c *Collection) HasSchema() bool {
 	return c != nil && c.options.Collection.Schema != nil
+}
+
+// HasOpaqueValues reports whether the collection stores uninterpreted primary
+// value bytes instead of JSON documents. The result is persisted and immutable
+// for the collection lifetime.
+func (c *Collection) HasOpaqueValues() bool {
+	return c != nil && c.options.OpaqueValues
 }
 
 // HasIndexes reports whether the collection's current durable logical catalog

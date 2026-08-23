@@ -165,18 +165,19 @@ func TestCoherentSnapshotRacesApply(t *testing.T) {
 			t.Fatalf("skewed snapshot publication=%+v state=%+v", publication, state)
 		}
 		user, ok := snapshot.Collection("docs")
-		if !ok || user.Len() != state.CompletionCount {
+		if !ok || user == nil {
 			_ = snapshot.Close()
-			t.Fatalf("snapshot rows=%d completions=%d", user.Len(), state.CompletionCount)
+			t.Fatal("snapshot is missing the user collection")
 		}
 		systemRows := uint64(0)
 		if err := snapshot.RangeSystem(func(_, _ []byte) error { systemRows++; return nil }); err != nil {
 			_ = snapshot.Close()
 			t.Fatal(err)
 		}
-		if systemRows != state.CompletionCount+1 {
+		if systemRows != state.SessionCount+state.SessionSlotCount+1 {
 			_ = snapshot.Close()
-			t.Fatalf("system rows=%d completions=%d", systemRows, state.CompletionCount)
+			t.Fatalf("system rows=%d sessions=%d slots=%d", systemRows,
+				state.SessionCount, state.SessionSlotCount)
 		}
 		if err := snapshot.Close(); err != nil {
 			t.Fatal(err)

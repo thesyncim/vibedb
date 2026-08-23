@@ -1,10 +1,10 @@
 package driver
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibejson"
 )
 
 const (
@@ -17,8 +17,9 @@ const (
 	// 2,048 current two-participant decisions so recycle is pressure handling,
 	// not a per-apply steady-state fence.
 	ReplicatedTransactionMarkerBytes uint64 = 1 << 20
-	// ReplicatedSystemRecoveryJournalBytes is the exact padded conditional
-	// record for the current hidden state/completion pair.
+	// ReplicatedSystemRecoveryJournalBytes is the sealed conservative region
+	// retained by the current profile. It covers the maximum hidden
+	// state/session/slot conditional record with margin.
 	ReplicatedSystemRecoveryJournalBytes uint64 = 655872
 )
 
@@ -36,6 +37,17 @@ type ReplicatedShardStoreSidecarProfile struct {
 // the hidden system collection. The base identity already owns txn.vtm.
 type ReplicatedApplySidecarProfile struct {
 	SystemRecoveryJournalBytes uint64
+}
+
+type replicatedShardStoreSidecarVibe ReplicatedShardStoreSidecarProfile
+type replicatedApplySidecarVibe ReplicatedApplySidecarProfile
+
+var replicatedShardStoreSidecarFields = vibejson.MakeFieldSet(
+	"user_recovery_journal_bytes", "transaction_marker_bytes",
+)
+
+var replicatedShardStoreSidecarFieldNames = [...]string{
+	"user_recovery_journal_bytes", "transaction_marker_bytes",
 }
 
 func canonicalReplicatedShardStoreSidecars() ReplicatedShardStoreSidecarProfile {
@@ -116,9 +128,9 @@ func validateReplicatedApplySidecarsForLimits(
 		limits.MaxBatchDocuments,
 		limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
 	)
-	if required <= 0 || uint64(required) != profile.SystemRecoveryJournalBytes {
+	if required <= 0 || uint64(required) > profile.SystemRecoveryJournalBytes {
 		return fmt.Errorf(
-			"%w: system journal does not exactly cover the frozen batch profile",
+			"%w: system journal cannot cover the frozen batch profile",
 			ErrReplicatedApplyMismatch,
 		)
 	}
@@ -129,46 +141,16 @@ func (profile ReplicatedShardStoreSidecarProfile) MarshalJSON() ([]byte, error) 
 	if err := validateReplicatedShardStoreSidecarGrammar(profile); err != nil {
 		return nil, err
 	}
-	type encoded struct {
-		UserRecoveryJournalBytes uint64 `json:"user_recovery_journal_bytes"`
-		TransactionMarkerBytes   uint64 `json:"transaction_marker_bytes"`
-	}
-	return json.Marshal(encoded(profile))
+	encoded := replicatedShardStoreSidecarVibe(profile)
+	return vibejson.Marshal(&encoded)
 }
 
 func (profile *ReplicatedShardStoreSidecarProfile) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedShardStoreSidecarProfile
-	present := make(map[string]bool, 2)
-	err := decodeCatalogObject(data, "replicated shard sidecars", func(
-		name string, decoder *json.Decoder,
-	) error {
-		present[name] = true
-		switch name {
-		case "user_recovery_journal_bytes":
-			return decoder.Decode(&decoded.UserRecoveryJournalBytes)
-		case "transaction_marker_bytes":
-			return decoder.Decode(&decoded.TransactionMarkerBytes)
-		default:
-			return unknownCatalogMember("replicated shard sidecars", name)
-		}
-	})
-	if err != nil {
+	var decoded replicatedShardStoreSidecarVibe
+	if err := vibejson.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	for _, name := range []string{
-		"user_recovery_journal_bytes", "transaction_marker_bytes",
-	} {
-		if !present[name] {
-			return fmt.Errorf(
-				"vibedb: replicated shard sidecars are missing member %q",
-				name,
-			)
-		}
-	}
-	if err := validateReplicatedShardStoreSidecarGrammar(decoded); err != nil {
-		return err
-	}
-	*profile = decoded
+	*profile = ReplicatedShardStoreSidecarProfile(decoded)
 	return nil
 }
 
@@ -176,38 +158,94 @@ func (profile ReplicatedApplySidecarProfile) MarshalJSON() ([]byte, error) {
 	if err := validateReplicatedApplySidecarGrammar(profile); err != nil {
 		return nil, err
 	}
-	type encoded struct {
-		SystemRecoveryJournalBytes uint64 `json:"system_recovery_journal_bytes"`
-	}
-	return json.Marshal(encoded(profile))
+	encoded := replicatedApplySidecarVibe(profile)
+	return vibejson.Marshal(&encoded)
 }
 
 func (profile *ReplicatedApplySidecarProfile) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedApplySidecarProfile
-	present := false
-	err := decodeCatalogObject(data, "replicated apply sidecars", func(
-		name string, decoder *json.Decoder,
-	) error {
-		switch name {
-		case "system_recovery_journal_bytes":
-			present = true
-			return decoder.Decode(&decoded.SystemRecoveryJournalBytes)
-		default:
-			return unknownCatalogMember("replicated apply sidecars", name)
-		}
-	})
-	if err != nil {
+	var decoded replicatedApplySidecarVibe
+	if err := vibejson.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	if !present {
-		return fmt.Errorf(
-			"vibedb: replicated apply sidecars are missing member %q",
-			"system_recovery_journal_bytes",
-		)
-	}
-	if err := validateReplicatedApplySidecarGrammar(decoded); err != nil {
-		return err
-	}
-	*profile = decoded
+	*profile = ReplicatedApplySidecarProfile(decoded)
 	return nil
+}
+
+func (profile *replicatedShardStoreSidecarVibe) MarshalVibeJSON(
+	w vibejson.TrustedAppender,
+) vibejson.TrustedAppender {
+	value := (*ReplicatedShardStoreSidecarProfile)(profile)
+	w = w.RawUnchecked(`{"user_recovery_journal_bytes":`).Uint(
+		value.UserRecoveryJournalBytes,
+	)
+	w = w.RawUnchecked(`,"transaction_marker_bytes":`).Uint(value.TransactionMarkerBytes)
+	return w.RawByteUnchecked('}')
+}
+
+func (profile *replicatedApplySidecarVibe) MarshalVibeJSON(
+	w vibejson.TrustedAppender,
+) vibejson.TrustedAppender {
+	return appendReplicatedApplySidecars(
+		w, ReplicatedApplySidecarProfile(*profile),
+	)
+}
+
+func (profile *replicatedShardStoreSidecarVibe) UnmarshalVibeJSON(
+	c vibejson.DecodeCursor,
+) (vibejson.DecodeCursor, error) {
+	if err := c.BeginObject("replicated shard sidecars"); err != nil {
+		return c, fmt.Errorf("vibedb: SQL catalog replicated shard sidecars must be a JSON object")
+	}
+	var decoded ReplicatedShardStoreSidecarProfile
+	var seen uint64
+	for first := true; ; first = false {
+		name, ok, err := c.NextField(first)
+		if err != nil {
+			return c, err
+		}
+		if !ok {
+			break
+		}
+		index, known := replicatedShardStoreSidecarFields.Lookup(name, true)
+		if !known {
+			return c, unknownCatalogMember("replicated shard sidecars", name)
+		}
+		if err := markReplicatedCatalogField(
+			&seen, index, "replicated shard sidecars", name,
+		); err != nil {
+			return c, err
+		}
+		switch index {
+		case 0:
+			err = c.Uint64(&decoded.UserRecoveryJournalBytes)
+		case 1:
+			err = c.Uint64(&decoded.TransactionMarkerBytes)
+		}
+		if err != nil {
+			return c, err
+		}
+	}
+	for index, name := range replicatedShardStoreSidecarFieldNames {
+		if seen&(uint64(1)<<index) == 0 {
+			return c, fmt.Errorf(
+				"vibedb: replicated shard sidecars are missing member %q", name,
+			)
+		}
+	}
+	if err := validateReplicatedShardStoreSidecarGrammar(decoded); err != nil {
+		return c, err
+	}
+	*profile = replicatedShardStoreSidecarVibe(decoded)
+	return c, nil
+}
+
+func (profile *replicatedApplySidecarVibe) UnmarshalVibeJSON(
+	c vibejson.DecodeCursor,
+) (vibejson.DecodeCursor, error) {
+	var decoded ReplicatedApplySidecarProfile
+	if err := decodeReplicatedApplySidecarsVibe(&c, &decoded); err != nil {
+		return c, err
+	}
+	*profile = replicatedApplySidecarVibe(decoded)
+	return c, nil
 }

@@ -39,11 +39,11 @@ const (
 	closePhaseUnlocked
 )
 
-// Collection is a bounded-residency, page-oriented JSON document store. It owns
-// no caller file lifetime: file must remain open through Close. Structural
-// mutations are copy-on-write and automatically persisted through a checksummed
-// double root. Reads use explicit Snapshot leases and caller-owned copy-out
-// buffers.
+// Collection is a bounded-residency, page-oriented document or opaque-value
+// store. It owns no caller file lifetime: file must remain open through Close.
+// Structural mutations are copy-on-write and automatically persisted through
+// a checksummed double root. Reads use explicit Snapshot leases and caller-owned
+// copy-out buffers.
 type Collection struct {
 	file         *os.File
 	writerLocked bool

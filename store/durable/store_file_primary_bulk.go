@@ -64,6 +64,12 @@ func CreateFromRecords(
 	if err != nil {
 		return 0, err
 	}
+	if normalized.OpaqueValues {
+		return 0, fmt.Errorf(
+			"%w: opaque values are not available in CreateFromRecords",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
 	if normalized.PageSize != 4096 ||
 		normalized.MaxPageSize < storeio.GlobalTabletCatalogRootBytes {
 		return 0, fmt.Errorf(
@@ -147,6 +153,12 @@ func CreateFromPrimary(
 	normalized, err := options.normalized()
 	if err != nil {
 		return 0, err
+	}
+	if normalized.OpaqueValues {
+		return 0, fmt.Errorf(
+			"%w: opaque values are not available in CreateFromPrimary",
+			ErrPrimaryCutoverUnsupported,
+		)
 	}
 	if normalized.PageSize != 4096 ||
 		normalized.MaxPageSize < storeio.GlobalTabletCatalogRootBytes {
@@ -338,6 +350,7 @@ func createFromPrimaryGraphRecords(
 	}
 	root.Options = fileStoreCollectionOptionFlags(
 		normalized.Collection, len(normalized.SkipIndexes) != 0,
+		normalized.OpaqueValues,
 	)
 	if normalized.MaterializationDamageGranule != 0 {
 		root.Options |= storeio.StateOptionCanonicalMaterialization
@@ -565,6 +578,7 @@ func primaryBulkStoreID(
 	writeUint64(uint64(options.MaxDocumentBytes))
 	writeUint64(uint64(fileStoreCollectionOptionFlags(
 		options.Collection, len(options.SkipIndexes) != 0,
+		options.OpaqueValues,
 	)))
 	// The canonical index catalog is part of the immutable file image: a build
 	// with different indexes must produce a different identity. indexCatalogHash

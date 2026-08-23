@@ -11,9 +11,10 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// LookupCompletion resolves data's client tuple and then exact-compares every
-// collision-sensitive request field. A conflict returns the original exact
-// completion together with a typed RequestConflictError.
+// LookupCompletion resolves data through the bounded session ring. A conflict
+// returns the reconstructed original completion together with a typed
+// RequestConflictError; a logically reclaimed retry returns ErrRetryRetired
+// and is never re-executed.
 func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	command, err := replication.OpenCommand(data)
 	if err != nil {
@@ -37,34 +38,123 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	if !ok || snapshot == nil {
 		return CompletionLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
 	}
-	digest := CompletionKey(command.Tenant, command.ClientID, command.ClientEpoch, command.ClientSequence)
-	key := completionStorageKey(digest)
-	record, found, readErr := completionAt(pointSnapshot{snapshot}, key)
-	err = errors.Join(readErr, cut.Close())
-	if err != nil {
-		return CompletionLookup{}, m.fail(err)
+	digest := SessionKey(command.Tenant, command.ClientID)
+	key := SessionStorageKey(digest)
+	session, found, readErr := sessionAt(pointSnapshot{snapshot}, key)
+	if readErr == nil && found &&
+		(session.Digest != digest || !bytes.Equal(session.Tenant, command.Tenant) ||
+			session.ClientID != command.ClientID) {
+		readErr = fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
 	}
-	if !found {
+	if readErr == nil && found && session.RetryWindow != m.options.RetryWindow {
+		readErr = fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
+	}
+	if readErr != nil || !found {
+		err = errors.Join(readErr, cut.Close())
+		if err != nil {
+			return CompletionLookup{}, m.fail(err)
+		}
 		return CompletionLookup{}, ErrCompletionNotFound
 	}
-	completion, err := replication.OpenCompletion(record.Completion)
-	if err != nil {
-		return CompletionLookup{}, m.fail(fmt.Errorf("%w: %v", ErrCompletionCorrupt, err))
+	if command.ClientEpoch < session.ClientEpoch ||
+		command.ClientEpoch == session.ClientEpoch &&
+			command.ClientSequence <= sessionRetryFloor(session) {
+		err = cut.Close()
+		if err != nil {
+			return CompletionLookup{}, m.fail(err)
+		}
+		return CompletionLookup{}, ErrRetryRetired
 	}
-	if err := m.validateCompletionResult(completion); err != nil {
+	if command.ClientEpoch > session.ClientEpoch || command.ClientSequence > session.HighSequence {
+		err = cut.Close()
+		if err != nil {
+			return CompletionLookup{}, m.fail(err)
+		}
+		if command.ClientEpoch == session.ClientEpoch && session.Status == SessionRetired {
+			return CompletionLookup{}, ErrSessionRetired
+		}
+		return CompletionLookup{}, ErrCompletionNotFound
+	}
+	slot := uint16((command.ClientSequence - 1) % uint64(session.RetryWindow))
+	slotKey, keyErr := SessionSlotStorageKey(digest, slot)
+	if keyErr != nil {
+		_ = cut.Close()
+		return CompletionLookup{}, m.fail(keyErr)
+	}
+	record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, slotKey)
+	if slotErr == nil && (!slotFound || record.SessionDigest != digest || record.Slot != slot ||
+		record.ClientEpoch != command.ClientEpoch || record.ClientSequence != command.ClientSequence) {
+		slotErr = fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
+	}
+	if slotErr == nil {
+		slotErr = validateStoredSessionSlot(m.state, record)
+	}
+	if slotErr == nil {
+		slotErr = validateSessionSlotAgainstHeader(session, record)
+	}
+	var completionBytes []byte
+	if slotErr == nil {
+		completionBytes, slotErr = m.appendSessionCompletion(nil, session, record)
+		if slotErr != nil {
+			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
+		}
+	}
+	err = errors.Join(slotErr, cut.Close())
+	if err != nil {
 		return CompletionLookup{}, m.fail(err)
 	}
 	result := CompletionLookup{
-		Key: digest, Bytes: bytes.Clone(record.Completion),
-		AppliedSequence: completion.AppliedSequence,
+		Key: digest, Bytes: completionBytes,
+		AppliedSequence: record.AppliedSequence,
 	}
-	if !recordTupleMatchesCommand(record, command) {
-		return CompletionLookup{}, m.fail(fmt.Errorf("%w: completion-key hash collision", ErrCompletionCorrupt))
-	}
-	if !recordMatchesCommand(record, command) {
+	if session.RetryHome != command.RetryHome ||
+		record.Fingerprint != command.Fingerprint ||
+		record.LogicalCommandDigest != LogicalCommandDigest(command) {
 		return result, &RequestConflictError{Key: digest}
 	}
 	return result, nil
+}
+
+// appendSessionCompletion reconstructs the one canonical public completion
+// from fixed-width retained metadata plus identities stored once in the
+// machine binding and session header.
+func (m *Machine) appendSessionCompletion(
+	dst []byte,
+	session SessionView,
+	slot SessionSlotView,
+) ([]byte, error) {
+	if session.Digest != slot.SessionDigest || session.ClientEpoch != slot.ClientEpoch {
+		return dst, ErrSessionCorrupt
+	}
+	resultDigest := replication.CompletionResultDigest(
+		slot.ResultCode, ResultFormatMutation, nil,
+	)
+	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
+		ClusterID:              m.binding.ClusterID,
+		ClusterIncarnation:     m.binding.ClusterIncarnation,
+		TopologyRecoveryEpoch:  m.binding.TopologyRecoveryEpoch,
+		Distribution:           m.distribution,
+		Shard:                  m.shard,
+		AllocationGeneration:   m.binding.AllocationGeneration,
+		ShardIncarnation:       m.binding.ShardIncarnation,
+		GroupID:                m.binding.GroupID,
+		ReplicaSetVersion:      slot.ReplicaSetVersion,
+		ActivePolicyGeneration: slot.ActivePolicyGeneration,
+		ProtectionEpoch:        slot.ProtectionEpoch,
+		RoutingVersion:         slot.RoutingVersion,
+		RouteGeneration:        slot.RouteGeneration,
+		Tenant:                 session.Tenant,
+		ClientID:               session.ClientID,
+		ClientEpoch:            slot.ClientEpoch,
+		ClientSequence:         slot.ClientSequence,
+		Fingerprint:            slot.Fingerprint,
+		RetryHome:              session.RetryHome,
+		AppliedSequence:        slot.AppliedSequence,
+		ResultCode:             slot.ResultCode,
+		ResultFormat:           ResultFormatMutation,
+		Storage:                replication.CompletionInline,
+		ResultDigest:           resultDigest,
+	})
 }
 
 // ReadSnapshot pins the sole user collection and its hidden state collection
@@ -184,7 +274,9 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if err != nil {
 		return nil, m.fail(err)
 	}
-	state, present, completionCount, err := scanSystemSnapshot(systemSnapshot, m.options.MaxCompletions)
+	state, present, sessionCount, slotCount, err := scanSessionSystemSnapshot(
+		systemSnapshot, m.options.MaxSessions, m.options.RetryWindow,
+	)
 	if err != nil || present != m.initialized {
 		closeErr := cut.Close()
 		if err != nil {
@@ -193,13 +285,11 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 		return nil, m.fail(errors.Join(ErrInconsistentSnapshot, closeErr))
 	}
 	if present {
-		if completionCount != state.CompletionCount || !equalState(state, m.state) ||
+		if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount ||
+			!equalState(state, m.state) ||
 			!equalStatePublication(state, m.publication.Applied, m.publication.DataChainDigest,
 				m.publication.ConfState, m.publication.ReplicaSetVersion) {
 			return nil, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
-		}
-		if err := m.validateRetainedCompletions(systemSnapshot, state); err != nil {
-			return nil, m.fail(errors.Join(err, cut.Close()))
 		}
 	}
 	return &ReadSnapshot{

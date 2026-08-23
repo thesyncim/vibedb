@@ -1,6 +1,7 @@
 package replicatedstate
 
 import (
+	"crypto/sha256"
 	"errors"
 	"math"
 	"os"
@@ -11,8 +12,28 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
+func constructionSystemBatchBytes() int {
+	return len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxSessionRecordBytes +
+		sha256.Size + 3 + MaxSessionSlotRecordBytes
+}
+
+func constructionSystemOptions(options durable.Options) durable.Options {
+	options.OpaqueValues = true
+	options.MaxKeyBytes = sha256.Size + 3
+	options.MaxDocumentBytes = max(
+		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
+	)
+	options.MaxBatchDocuments = 3
+	options.MaxBatchBytes = constructionSystemBatchBytes()
+	return options
+}
+
 func createTargetAt(t testing.TB, dir, name string, options durable.Options) CollectionTarget {
 	t.Helper()
+	if name == "system" {
+		options = constructionSystemOptions(options)
+	}
 	file, err := os.OpenFile(filepath.Join(dir, name+".vdb"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -32,10 +53,11 @@ func createTargetAt(t testing.TB, dir, name string, options durable.Options) Col
 func machineOptionsFor(user CollectionTarget) Options {
 	return Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 2,
+			MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
 			MaxBytes: 64 << 20,
 		},
-		MaxCompletions: 128,
+		MaxSessions: 128,
+		RetryWindow: 8,
 	}
 }
 
@@ -140,17 +162,16 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	maxSystem := len(stateKey) + 2*MaxStateEnvelopeBytes + 2 +
-		33 + 2*MaxCompletionRecordBytes + 2
+	maxSystem := constructionSystemBatchBytes()
 	required, ok := checkedTxnBytes(replication.MaxCommandBytes, maxSystem)
 	if !ok {
 		t.Fatal("test byte proof overflowed")
 	}
 	options := Options{TxnLimits: durable.TxnLimits{
 		MaxCollections: 2,
-		MaxDocuments:   user.Limits.MaxDistinctMutations + 2,
+		MaxDocuments:   user.Limits.MaxDistinctMutations + 3,
 		MaxBytes:       required,
-	}, MaxCompletions: 128}
+	}, MaxSessions: 128, RetryWindow: 8}
 	if _, err := Open(testBinding(), testBootstrap(), system,
 		UserCollection{Name: "docs", Target: user}, log, options); err != nil {
 		t.Fatalf("exact bounded transaction proof: %v", err)

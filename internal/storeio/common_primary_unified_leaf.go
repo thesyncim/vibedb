@@ -141,6 +141,7 @@ type unifiedPrefixPlan struct {
 type UnifiedPrimaryLeafBuilder struct {
 	indexStore   []vibejson.IndexEntry
 	ws           CanonicalWorkspace
+	opaqueValues bool
 	heap         []byte
 	spans        []UnifiedTokenSpan
 	rows         []unifiedPrimaryLeafRow
@@ -175,13 +176,27 @@ func NewUnifiedPrimaryLeafBuilder() *UnifiedPrimaryLeafBuilder {
 	}
 }
 
+// SetOpaqueValues configures the builder to treat every inline value as an
+// uninterpreted byte string. Opaque rows use one whole-value span so the
+// compact stripe can retain its binary stream coding, while the unified
+// planner always classifies them as trivial rows. No vibejson index or
+// canonical workspace is touched. Call it only while the builder is idle.
+func (b *UnifiedPrimaryLeafBuilder) SetOpaqueValues(enabled bool) error {
+	if b == nil || enabled && len(b.compactSummaryPointers) != 0 {
+		return fmt.Errorf("%w: opaque primary values", ErrInvalidWrite)
+	}
+	b.opaqueValues = enabled
+	return nil
+}
+
 // SetCompactPrimarySummaries fixes the canonical path order used by compact
 // stripe min/max metadata. Call it only while the builder is idle. The paths
 // are copied; their compiled bytecode remains immutable and safe to share.
 func (b *UnifiedPrimaryLeafBuilder) SetCompactPrimarySummaries(
 	pointers []vibejson.CompiledPointer,
 ) error {
-	if b == nil || len(pointers) > PageCatalogMaxSkipIndexes {
+	if b == nil || len(pointers) > PageCatalogMaxSkipIndexes ||
+		b.opaqueValues && len(pointers) != 0 {
 		return fmt.Errorf("%w: compact summary paths", ErrInvalidWrite)
 	}
 	clear(b.compactSummaryPointers)
@@ -294,7 +309,7 @@ func (b *UnifiedPrimaryLeafBuilder) buildIndex(src []byte) (vibejson.Index, erro
 func (b *UnifiedPrimaryLeafBuilder) canonicalSpanIndex(
 	src []byte,
 ) (CanonicalSpanIndex, bool, error) {
-	if b == nil || len(src) == 0 {
+	if b == nil || b.opaqueValues || len(src) == 0 {
 		return CanonicalSpanIndex{}, false, nil
 	}
 	index, err := b.buildIndex(src)
@@ -454,6 +469,35 @@ func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 		}
 		if len(inline) == 0 {
 			return fmt.Errorf("%w: unified leaf empty value", ErrInvalidWrite)
+		}
+		if b.opaqueValues {
+			if len(inline) > math.MaxInt32 {
+				return fmt.Errorf("%w: opaque unified leaf value", ErrInvalidWrite)
+			}
+			row := unifiedPrimaryLeafRow{
+				heapOff:   -1,
+				length:    int32(len(inline)),
+				spanStart: int32(len(b.spans)),
+				// Keep the legacy unified planner on its trivial row escape
+				// without inspecting the bytes as JSON scalar spellings.
+				tokensNoDict: math.MaxInt32,
+			}
+			b.spans = append(b.spans, UnifiedTokenSpan{
+				Start: 0, End: uint32(len(inline)),
+			})
+			row.spanEnd = int32(len(b.spans))
+			b.rows = append(b.rows, row)
+			at := len(b.rows) - 1
+			if len(b.shapes) == 0 {
+				b.shapes = append(b.shapes, unifiedPrimaryLeafShape{
+					firstRow: at,
+					holes:    1,
+					// Header plus two zero-length static segment ends.
+					entryBytes: 8 + 2*4,
+				})
+			}
+			b.rows[at].shape = 0
+			continue
 		}
 		index, err := b.buildIndex(inline)
 		if err != nil {

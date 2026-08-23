@@ -95,12 +95,56 @@ The backfill package plans one bounded task per base shard. The caller must run
 all tasks and publish the `Ready` state. The repository has no lifecycle or
 backfill CLI.
 
-## Replicated state digests
+## Replicated state and digests
 
-Normal replicated command admission and apply use point reads for the command
-completion and mutation keys. They do not scan the shard image. Planning,
-validation, and digest work are O(changed keys plus changed document bytes),
-bounded by 64 distinct mutations, and independent of the shard row count.
+Normal replicated command admission and apply use one indexed point read for a
+client session header. A retained sequence adds one indexed fixed-ring-slot
+read. User planning uses point reads for mutation keys. These paths do not scan
+the shard image. Mutation planning is bounded by 64 distinct keys. It performs
+indexed point reads plus bytewise validation and digest work on the supplied
+changes.
+
+A stable session key binds tenant and client ID. Its collision-verifiable header
+stores the current client epoch, `RetryHome`, `AckThrough`, sequence high-water,
+status, and configured retry window. `RetryHome` is the fixed-width routing
+discriminator retained through intact-shard ownership transitions. The epoch
+accepts strictly consecutive sequences. An exact retained retry is idempotent.
+A different `RetryHome`, fingerprint, or `LogicalCommandDigest` conflicts.
+The terminal `uint64` sequence is reserved for retirement. An ordinary command
+at that sequence returns `ErrSessionSequence`.
+
+The logical retirement floor is the greater of `AckThrough` and the sequence
+high-water minus the retry-window width, with subtraction clamped at zero.
+Older retries return `ErrRetryRetired` and never execute. Explicit retirement
+with current mutable fences seals an epoch. A stale retirement records a stale
+result and leaves the epoch active. Only the next epoch can reuse a sealed
+stable identity and fixed ring. A stale terminal retirement is an unstored
+`ErrStaleCommand` refusal, so the same sequence can be resubmitted with refreshed
+fences.
+
+The hidden collection stores one raw binary session header and at most
+`RetryWindow` raw fixed-size slots per retained stable identity. The slot stores
+compact result metadata. Completion lookup reconstructs a canonical completion
+envelope rather than retaining one envelope per operation. The state,
+session-header, and slot codecs use durable opaque values without hexadecimal
+JSON wrappers.
+
+Reopen validates the hidden image in one ordered pass with scratch state
+proportional to retained session identities. Persistent dedupe rows and the
+dedupe portion of reopen are bounded by
+`1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
+Retirement reuses a stable identity but does not remove it. New stable
+identities are refused at `MaxSessions`.
+
+The current range-split child artifact and tail move user rows, not session
+headers or ring slots. A `RetryHome` that moves to a non-retained child would
+therefore lose its retained retry image, and compact completions also need the
+original shard lineage rather than the child's new binding. Range split remains
+non-serving when the source has any retained session header or slot: the split
+controller refuses the source seal and catalog publication, and the transition
+builders reject direct construction. A serving split requires a certified
+session-partition transfer carrying both the retained ring and its origin
+descriptor before catalog publication.
 
 `DataChainDigest` is a deterministic replicated transition fence. Each
 effective mutation advances it from the prior chain, the frozen apply contract,
@@ -331,3 +375,5 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`
+- `internal/replicatedstate/session_codec.go` and
+  `internal/raftmember/apply_capacity.go`

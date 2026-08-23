@@ -161,6 +161,12 @@ const (
 // power-safe configuration; every field below documents what it overrides.
 type Options struct {
 	Collection store.Options
+	// OpaqueValues stores primary values as uninterpreted, non-empty byte
+	// strings. It disables JSON parsing and canonicalization and therefore
+	// cannot be combined with schemas, exact or skip indexes, or the resident
+	// store's JSON-only representation options. The mode is persisted and a
+	// zero-options Open reconstructs it from the selected state root.
+	OpaqueValues bool
 	// Indexes are exact scalar definitions maintained from their atomic durable
 	// publication onward. CreateIndex can add definitions to a live collection
 	// when its fixed transaction/resident arenas admit the resulting write path.
@@ -541,6 +547,16 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, err
 	}
 	o.Collection = storeOptions
+	if o.OpaqueValues &&
+		(len(o.Indexes) != 0 || len(o.SkipIndexes) != 0 ||
+			o.Collection.Schema != nil || o.Collection.ShapeTapes ||
+			o.Collection.Postings || o.Collection.ValueDict ||
+			o.Collection.IndexOptions.MaxDepth != 0 ||
+			o.Collection.IndexOptions.HashKeys) {
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"vibedb: opaque values cannot enable JSON schema, index, or representation options",
+		)
+	}
 	if o.PageSize == 0 {
 		o.PageSize = 4096
 	}
@@ -985,6 +1001,10 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		o.PageSize, o.MaxKeyBytes, o.InlineValueBytes,
 	))
 	primaryOverlayBucketLimit := primaryUnifiedOverlayBuckets
+	if o.OpaqueValues {
+		primaryOverlayTargetBytes = 0
+		primaryOverlayBucketLimit = 0
+	}
 	limitByPages := func(pageLimit int) {
 		if pageLimit <= primaryOverlayFixedPages {
 			primaryOverlayBucketLimit = 0

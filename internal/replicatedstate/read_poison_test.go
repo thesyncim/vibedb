@@ -15,18 +15,19 @@ func corruptRetainedCompletion(t testing.TB, fixture machineFixture, command []b
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := CompletionKey(view.Tenant, view.ClientID, view.ClientEpoch, view.ClientSequence)
-	key := completionStorageKey(digest)
+	digest := SessionKey(view.Tenant, view.ClientID)
+	key, err := SessionSlotStorageKey(
+		digest, uint16((view.ClientSequence-1)%uint64(fixture.machine.options.RetryWindow)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	document, found, err := fixture.system.Collection.AppendRaw(nil, key[:])
 	if err != nil || !found {
 		t.Fatalf("completion document = %q,%v,%v", document, found, err)
 	}
 	document = bytes.Clone(document)
-	if document[8] == '0' {
-		document[8] = '1'
-	} else {
-		document[8] = '0'
-	}
+	document[8] ^= 1
 	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
 		return batch.Put(key[:], document)
 	}); err != nil {
@@ -52,7 +53,7 @@ func TestLookupAndAdmitCorruptionPoisonMachine(t *testing.T) {
 			} else {
 				err = fixture.machine.AdmitCommand(command)
 			}
-			if !errors.Is(err, ErrCompletionCorrupt) {
+			if !errors.Is(err, ErrSessionCorrupt) {
 				t.Fatalf("%s error = %v", operation, err)
 			}
 			if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); !errors.Is(err, ErrApplyPoisoned) {
@@ -120,7 +121,7 @@ func TestOrdinaryReadAndAdmissionRefusalsDoNotPoison(t *testing.T) {
 	if _, err := fixture.machine.LookupCompletion(missing); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("not-found error = %v", err)
 	}
-	staleValue := commandValue(fixture.binding, 2)
+	staleValue := commandValue(fixture.binding, 1)
 	staleValue.ReplicaSetVersion = 100
 	stale := encodeCommand(t, staleValue)
 	if err := fixture.machine.AdmitCommand(stale); !errors.Is(err, ErrStaleCommand) {

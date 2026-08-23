@@ -318,7 +318,7 @@ func (s *ReplicatedChildStage) activate(
 			Binding: replicatedStateBinding(s.base), StaticBootstrap: staticBootstrap,
 			System: replicatedstate.CollectionTarget{
 				Collection: core.replicatedApplyCollection,
-				Validation: replicatedstate.ValidationSchemaFreeJSON,
+				Validation: replicatedstate.ValidationOpaqueBinary,
 				Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
 			},
 			User: replicatedstate.UserCollection{
@@ -333,7 +333,8 @@ func (s *ReplicatedChildStage) activate(
 			},
 			TxnLog: core.txnLog,
 			MachineOptions: replicatedstate.Options{
-				TxnLimits: identity.TxnLimits, MaxCompletions: identity.MaxCompletions,
+				TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
+				RetryWindow: identity.RetryWindow,
 			},
 			ArtifactOptions: artifactOptions,
 		},

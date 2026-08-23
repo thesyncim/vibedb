@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"unicode/utf8"
+	"unsafe"
 )
 
 var completionMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'P', 0, 0}
@@ -21,6 +22,41 @@ type Completion struct {
 
 	Distribution           string
 	Shard                  string
+	AllocationGeneration   uint64
+	ShardIncarnation       ID128
+	GroupID                ID128
+	ReplicaSetVersion      uint64
+	ActivePolicyGeneration uint64
+	ProtectionEpoch        uint64
+	RoutingVersion         uint64
+	RouteGeneration        uint64
+
+	Tenant          []byte
+	ClientID        ID128
+	ClientEpoch     uint64
+	ClientSequence  uint64
+	Fingerprint     Digest
+	RetryHome       RetryHome
+	AppliedSequence uint64
+
+	ResultCode   uint32
+	ResultFormat uint16
+	Storage      CompletionStorage
+	ResultLength uint64
+	ResultDigest Digest
+	InlineResult []byte
+}
+
+// CompletionBytes is the byte-native input to AppendCompletionBytes.
+// Distribution, Shard, Tenant, and InlineResult are borrowed for the duration
+// of the call and are never retained or modified.
+type CompletionBytes struct {
+	ClusterID             ID128
+	ClusterIncarnation    ID128
+	TopologyRecoveryEpoch uint64
+
+	Distribution           []byte
+	Shard                  []byte
 	AllocationGeneration   uint64
 	ShardIncarnation       ID128
 	GroupID                ID128
@@ -123,6 +159,44 @@ func completionResultDigest(
 // slices must not overlap the writable append region in dst's current backing
 // array; such aliases are rejected before dst is modified.
 func AppendCompletion(dst []byte, completion Completion) ([]byte, error) {
+	return appendCompletion(dst, CompletionBytes{
+		ClusterID:              completion.ClusterID,
+		ClusterIncarnation:     completion.ClusterIncarnation,
+		TopologyRecoveryEpoch:  completion.TopologyRecoveryEpoch,
+		Distribution:           completionStringBytes(completion.Distribution),
+		Shard:                  completionStringBytes(completion.Shard),
+		AllocationGeneration:   completion.AllocationGeneration,
+		ShardIncarnation:       completion.ShardIncarnation,
+		GroupID:                completion.GroupID,
+		ReplicaSetVersion:      completion.ReplicaSetVersion,
+		ActivePolicyGeneration: completion.ActivePolicyGeneration,
+		ProtectionEpoch:        completion.ProtectionEpoch,
+		RoutingVersion:         completion.RoutingVersion,
+		RouteGeneration:        completion.RouteGeneration,
+		Tenant:                 completion.Tenant,
+		ClientID:               completion.ClientID,
+		ClientEpoch:            completion.ClientEpoch,
+		ClientSequence:         completion.ClientSequence,
+		Fingerprint:            completion.Fingerprint,
+		RetryHome:              completion.RetryHome,
+		AppliedSequence:        completion.AppliedSequence,
+		ResultCode:             completion.ResultCode,
+		ResultFormat:           completion.ResultFormat,
+		Storage:                completion.Storage,
+		ResultLength:           completion.ResultLength,
+		ResultDigest:           completion.ResultDigest,
+		InlineResult:           completion.InlineResult,
+	})
+}
+
+// AppendCompletionBytes appends one canonical completion envelope from
+// borrowed byte-native identities. It has the same validation, wire format,
+// alias rejection, and allocation contract as AppendCompletion.
+func AppendCompletionBytes(dst []byte, completion CompletionBytes) ([]byte, error) {
+	return appendCompletion(dst, completion)
+}
+
+func appendCompletion(dst []byte, completion CompletionBytes) ([]byte, error) {
 	total, err := measureCompletion(completion)
 	if err != nil {
 		return dst, err
@@ -177,15 +251,15 @@ func AppendCompletion(dst []byte, completion Completion) ([]byte, error) {
 	return dst, nil
 }
 
-func completionOverlapsAppendRegion(dst []byte, total int, completion Completion) bool {
+func completionOverlapsAppendRegion(dst []byte, total int, completion CompletionBytes) bool {
 	region := writableAppendRegion(dst, total)
 	return len(region) != 0 && (byteSlicesOverlap(region, completion.Tenant) ||
-		byteSliceStringOverlap(region, completion.Distribution) ||
-		byteSliceStringOverlap(region, completion.Shard) ||
+		byteSlicesOverlap(region, completion.Distribution) ||
+		byteSlicesOverlap(region, completion.Shard) ||
 		byteSlicesOverlap(region, completion.InlineResult))
 }
 
-func measureCompletion(completion Completion) (int, error) {
+func measureCompletion(completion CompletionBytes) (int, error) {
 	if err := validateCompletion(completion); err != nil {
 		return 0, err
 	}
@@ -203,7 +277,7 @@ func measureCompletion(completion Completion) (int, error) {
 	return int(total), nil
 }
 
-func validateCompletion(completion Completion) error {
+func validateCompletion(completion CompletionBytes) error {
 	if !nonzero128(completion.ClusterID) || !nonzero128(completion.ClusterIncarnation) ||
 		!nonzero128(completion.ShardIncarnation) || !nonzero128(completion.GroupID) ||
 		!nonzero128(completion.ClientID) || !nonzeroDigest(completion.Fingerprint) ||
@@ -223,10 +297,10 @@ func validateCompletion(completion Completion) error {
 	if len(completion.Tenant) == 0 || len(completion.Tenant) > MaxIdentityBytes {
 		return semantic("tenant identity length")
 	}
-	if err := validateTextIdentity("distribution", completion.Distribution, MaxIdentityBytes); err != nil {
+	if err := validateTextIdentityBytes("distribution", completion.Distribution, MaxIdentityBytes); err != nil {
 		return err
 	}
-	if err := validateTextIdentity("shard", completion.Shard, MaxIdentityBytes); err != nil {
+	if err := validateTextIdentityBytes("shard", completion.Shard, MaxIdentityBytes); err != nil {
 		return err
 	}
 	if completion.ResultLength > MaxCompletionResultBytes {
@@ -252,6 +326,24 @@ func validateCompletion(completion Completion) error {
 		}
 	default:
 		return semantic("unknown completion storage kind")
+	}
+	return nil
+}
+
+func completionStringBytes(value string) []byte {
+	if len(value) == 0 {
+		return nil
+	}
+	// The encoder treats all input spans as immutable and never retains them.
+	return unsafe.Slice(unsafe.StringData(value), len(value))
+}
+
+func validateTextIdentityBytes(field string, value []byte, limit int) error {
+	if len(value) == 0 || len(value) > limit {
+		return semantic(field + " identity length")
+	}
+	if !utf8.Valid(value) {
+		return semantic(field + " identity is not valid UTF-8")
 	}
 	return nil
 }

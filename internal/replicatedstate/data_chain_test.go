@@ -130,7 +130,7 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 			MaxKeyBytes: 256, MaxDocumentBytes: 1 << 20,
 			MaxDistinctMutations: 64, MaxBatchBytes: 8 << 20,
 		},
-	}, 1024)
+	}, 1024, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,11 +150,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"5eeca35c9c2373644bd2bcf03ca6e6d8d2c82bf212f1616845c3adb3723fabf0")
+		"35b1baabe9481742d43a8d2ac6c01167709672c17b662ed2cfaf2f22cfd14e30")
 	assertDigestHex(t, "data-chain seed", seed,
-		"71b4d325d8a4fc89c051c1b32aa7404d054605415448fab0d5ef8e0452fbc5bc")
+		"1d9dc7965ff687035d7883ed13b5c8a2c9d5dd76aa9c11e506201b8d5f3358e3")
 	assertDigestHex(t, "data-chain transition", transition,
-		"5314ba67dbee20d490b6c3b2bf9f6507f972f59fc07d9fd9060bf95f4784110f")
+		"823cbb19c4dd70600d76d9dfa427c04934a4003300c678da17bae129706f602d")
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {

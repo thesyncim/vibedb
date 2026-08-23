@@ -38,7 +38,8 @@ const (
 	completionHeaderBytes    = 288
 	envelopeChecksumBytes    = 8
 	mutationHeaderBytes      = 8
-	commandKindMutationBatch = uint8(1)
+	commandWireMutationBatch = uint8(1)
+	commandWireSessionRetire = uint8(2)
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -52,6 +53,20 @@ type Digest [32]byte
 // RetryHome is the stable, fixed-width keyspace point that owns completion
 // state across route changes and range movement. Zero is a valid keyspace point.
 type RetryHome [8]byte
+
+// CommandKind selects the command's state-machine operation. The zero value is
+// the ordinary mutation batch so existing command producers remain explicit
+// only when they retire a session.
+type CommandKind uint8
+
+const (
+	// CommandMutationBatch applies one nonempty ordered mutation batch.
+	CommandMutationBatch CommandKind = iota
+	// CommandSessionRetire seals the command's client epoch and carries no
+	// mutations. The compact identity high-water remains durable so delayed
+	// commands from a retired epoch can never become new again.
+	CommandSessionRetire
+)
 
 // MutationKind selects one logical collection mutation.
 type MutationKind uint8
