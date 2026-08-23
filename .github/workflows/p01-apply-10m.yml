@@ -51,8 +51,9 @@ jobs:
         run: |
           set -euo pipefail
           test_name='TestMachineApplyPointUpdateTenMillionQualification'
-          go test -list "^${test_name}$" ./internal/replicatedstate \
-            | grep -Fqx "${test_name}"
+          test_list="${RUNNER_TEMP}/p01/test-list.txt"
+          go test -list "^${test_name}$" ./internal/replicatedstate > "${test_list}"
+          grep -Fqx "${test_name}" "${test_list}"
       - name: Run exact 10M-row qualification
         shell: bash
         run: |
