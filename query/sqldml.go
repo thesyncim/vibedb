@@ -1,14 +1,17 @@
 package query
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 )
 
 // ErrInsertSelectShape reports an INSERT query source that cannot supply one
@@ -155,6 +158,15 @@ type DMLStatement struct {
 	// the authored byte position plus one; zero retains ordinary scalar meaning
 	// and keeps a placeholder at byte zero representable without a second mask.
 	insertDocumentPositions []int
+	// insertFlatFieldOrdinals is the once-compiled encoding order for a flat
+	// VALUES insert. It contains one authored ordinal per parser-validated unique
+	// field, sorted by the unescaped UTF-8 key exactly as encoding/json orders
+	// object keys.
+	insertFlatFieldOrdinals []uint32
+	// insertFlatKeyJSONBytes is the exact combined wire size of every encoded
+	// object key, including quotes and encoding/json-compatible escaping. It is
+	// compiled once so row execution never rescans immutable SQL identifiers.
+	insertFlatKeyJSONBytes uint64
 	// all marks a DELETE written without a WHERE, which acts on every document.
 	// It is distinct from "filter is nil" so that no code path can arrive at
 	// "every document" by failing to look at one pointer.
@@ -216,6 +228,10 @@ func PrepareParsedDML(
 	switch tree.Kind {
 	case sqlast.KindInsert:
 		d.kind = DMLInsert
+		if tree.Insert.Source == nil && len(tree.Insert.Columns) != 0 {
+			d.insertFlatFieldOrdinals, d.insertFlatKeyJSONBytes =
+				compileInsertFlatFields(tree.Insert)
+		}
 		if tree.Insert.Source != nil {
 			source, err := prepareTree(src, tree.Insert.Source)
 			if err != nil {
@@ -332,6 +348,60 @@ func (d *DMLStatement) InsertSource() *Statement {
 		return nil
 	}
 	return d.source
+}
+
+// InsertFlatFieldOrdinals returns the immutable sorted field order compiled for
+// INSERT ... VALUES with an explicit column list.
+// The capacity-clamped slice aliases the statement and remains valid only until
+// Release. Whole-document and INSERT ... SELECT statements return nil.
+func (d *DMLStatement) InsertFlatFieldOrdinals() []uint32 {
+	if d == nil || len(d.insertFlatFieldOrdinals) == 0 {
+		return nil
+	}
+	return d.insertFlatFieldOrdinals[:len(d.insertFlatFieldOrdinals):len(d.insertFlatFieldOrdinals)]
+}
+
+// InsertFlatKeyJSONBytes returns the exact combined encoded size of the flat
+// INSERT field names. Whole-document and INSERT ... SELECT statements return
+// zero.
+func (d *DMLStatement) InsertFlatKeyJSONBytes() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.insertFlatKeyJSONBytes
+}
+
+var insertFlatKeyEncoder = func() vibejson.Encoder[string] {
+	encoder, err := vibejson.CompileEncoder[string](vibejson.EncoderOptions{})
+	if err != nil {
+		panic(fmt.Sprintf("query: compile flat INSERT key encoder: %v", err))
+	}
+	return encoder
+}()
+
+func compileInsertFlatFields(insert *sqlast.InsertStmt) ([]uint32, uint64) {
+	ordinals := make([]uint32, len(insert.Columns))
+	var keyJSONBytes uint64
+	var workspace []byte
+	for index := range ordinals {
+		ordinals[index] = uint32(index)
+		key := insert.Columns[index].Segments[0].Key
+		var err error
+		workspace, err = insertFlatKeyEncoder.AppendJSON(workspace[:0], &key)
+		if err != nil {
+			panic(fmt.Sprintf("query: encode validated flat INSERT key: %v", err))
+		}
+		keyJSONBytes += uint64(len(workspace))
+	}
+	slices.SortFunc(ordinals, func(left, right uint32) int {
+		leftKey := insert.Columns[left].Segments[0].Key
+		rightKey := insert.Columns[right].Segments[0].Key
+		if order := cmp.Compare(leftKey, rightKey); order != 0 {
+			return order
+		}
+		return cmp.Compare(left, right)
+	})
+	return ordinals, keyJSONBytes
 }
 
 // ScansEveryDocument reports whether executing this statement means visiting
