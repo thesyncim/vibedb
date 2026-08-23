@@ -82,11 +82,10 @@ one ordered pass. Its session scratch state is proportional to the configured
 session count, and its slot work is bounded by `MaxSessions * RetryWindow`.
 
 `ValidateImmutableBaseApplyCapacity` validates this bounded session profile
-against a live immutable-base WAL. `AdoptRuntime` does not yet use that
-validator. It still calls the deprecated
-`ValidateImmutableBaseNoGCCompletionCapacity` suffix qualifier. Runtime
-adoption therefore still requires the derived session-ring ceiling to cover
-the complete sealed WAL suffix.
+against a live immutable-base WAL. `AdoptRuntime` uses that proof directly.
+Runtime adoption therefore binds the exact WAL/apply cut and fixed session
+limits without requiring the retry-ring ceiling to cover the complete sealed
+WAL suffix.
 
 ## Publication identities
 
