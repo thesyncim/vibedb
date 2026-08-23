@@ -307,7 +307,6 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	want := ReplicatedApplyCapacityProfile{
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
-		MaxCompletions: options.MaxSessions * uint64(options.RetryWindow),
 	}
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("uninitialized capacity profile = %+v, %v; want %+v", got, err, want)
@@ -330,7 +329,7 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	want.Applied, want.SessionCount, want.SessionSlotCount = 3, 1, 2
-	want.SessionEpochHighWater, want.CompletionCount = epoch, 2
+	want.SessionEpochHighWater = epoch
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
 	}

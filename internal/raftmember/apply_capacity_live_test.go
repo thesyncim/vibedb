@@ -2,7 +2,6 @@ package raftmember
 
 import (
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,208 +14,7 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-func TestStaticNoGCCompletionCapacityBoundary(t *testing.T) {
-	base := raftstore.CapacityProfile{
-		Format:       raftstore.CapacityFormatStatic,
-		LogBaseIndex: 1,
-		MaxEntries:   8192,
-	}
-	baseApply := sqldriver.ReplicatedApplyCapacityProfile{
-		ApplyFormat:    sqldriver.ReplicatedApplyFormat,
-		MaxCompletions: 8192, Initialized: true, Applied: 1,
-	}
-	tests := []struct {
-		name      string
-		profile   raftstore.CapacityProfile
-		apply     sqldriver.ReplicatedApplyCapacityProfile
-		commit    uint64
-		last      uint64
-		wantError bool
-	}{
-		{name: "equality", profile: base, apply: baseApply, commit: 1, last: 1},
-		{name: "nontrivial suffix", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.Applied, result.CompletionCount = 3, 1
-			return result
-		}(), commit: 4, last: 5},
-		{name: "maximum arithmetic", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStatic,
-			LogBaseIndex: 1,
-			MaxEntries:   math.MaxUint64,
-		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
-			Initialized: true, Applied: math.MaxUint64 - 1, CompletionCount: math.MaxUint64 - 2,
-		}, commit: math.MaxUint64, last: math.MaxUint64},
-		{name: "maximum invalid count", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStatic,
-			LogBaseIndex: 1,
-			MaxEntries:   math.MaxUint64,
-		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
-			Initialized: true, Applied: math.MaxUint64, CompletionCount: math.MaxUint64,
-		}, commit: math.MaxUint64, last: math.MaxUint64, wantError: true},
-		{name: "maximum sealed suffix exceeded", profile: raftstore.CapacityProfile{
-			Format:       raftstore.CapacityFormatStatic,
-			LogBaseIndex: 1,
-			MaxEntries:   math.MaxUint64 - 2,
-		}, apply: sqldriver.ReplicatedApplyCapacityProfile{
-			ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: math.MaxUint64,
-			Initialized: true, Applied: math.MaxUint64 - 2,
-		}, commit: math.MaxUint64 - 1, last: math.MaxUint64, wantError: true},
-		{name: "unknown apply format", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.ApplyFormat = 2
-			return result
-		}(), commit: 1, last: 1, wantError: true},
-		{name: "one short", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.MaxCompletions--
-			return result
-		}(), commit: 1, last: 1, wantError: true},
-		{name: "zero WAL entries", profile: raftstore.CapacityProfile{
-			Format: raftstore.CapacityFormatStatic, LogBaseIndex: 1,
-		}, apply: baseApply, commit: 1, last: 1, wantError: true},
-		{name: "zero completions", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.MaxCompletions = 0
-			return result
-		}(), commit: 1, last: 1, wantError: true},
-		{name: "advanced base", profile: raftstore.CapacityProfile{
-			Format: raftstore.CapacityFormatStatic, LogBaseIndex: 2, MaxEntries: 8192,
-		}, apply: baseApply, commit: 1, last: 1, wantError: true},
-		{name: "unknown capacity format", profile: raftstore.CapacityProfile{
-			Format: raftstore.CapacityFormat(2), LogBaseIndex: 1, MaxEntries: 8192,
-		}, apply: baseApply, commit: 1, last: 1, wantError: true},
-		{name: "uninitialized", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.Initialized, result.Applied = false, 0
-			return result
-		}(), commit: 1, last: 1, wantError: true},
-		{name: "completion count ahead", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.Applied, result.CompletionCount = 2, 2
-			return result
-		}(), commit: 2, last: 2, wantError: true},
-		{name: "apply ahead of commit", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
-			result := baseApply
-			result.Applied = 2
-			return result
-		}(), commit: 1, last: 2, wantError: true},
-		{name: "commit ahead of last", profile: base, apply: baseApply, commit: 2, last: 1, wantError: true},
-		{name: "zero WAL cut", profile: base, apply: baseApply, wantError: true},
-		{name: "last exceeds sealed suffix", profile: base, apply: baseApply,
-			commit: 1, last: 8194, wantError: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := validateStaticNoGCCompletionCapacity(
-				test.profile, test.apply, test.commit, test.last,
-			)
-			if test.wantError && !errors.Is(err, ErrStaticCompletionCapacity) {
-				t.Fatalf("validation error = %v, want ErrStaticCompletionCapacity", err)
-			}
-			if !test.wantError && err != nil {
-				t.Fatalf("validation error = %v", err)
-			}
-		})
-	}
-}
-
-func TestImmutableBaseNoGCCompletionCapacityBoundary(t *testing.T) {
-	profile := raftstore.CapacityProfile{
-		Format: raftstore.CapacityFormatImmutableBase, LogBaseIndex: 100, MaxEntries: 4096,
-	}
-	apply := sqldriver.ReplicatedApplyCapacityProfile{
-		ApplyFormat: sqldriver.ReplicatedApplyFormat, MaxCompletions: 4108,
-		Initialized: true, Applied: 100, CompletionCount: 12,
-	}
-	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); err != nil {
-		t.Fatalf("exact newer-base capacity: %v", err)
-	}
-	apply.MaxCompletions--
-	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); !errors.Is(err, ErrStaticCompletionCapacity) {
-		t.Fatalf("one-short newer-base capacity = %v", err)
-	}
-	apply.MaxCompletions++
-	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 101, 101); err != nil {
-		t.Fatalf("one unapplied newer-base entry: %v", err)
-	}
-	apply.Applied = 99
-	if err := validateImmutableBaseNoGCCompletionCapacity(profile, apply, 100, 100); !errors.Is(err, ErrStaticCompletionCapacity) {
-		t.Fatalf("apply below base = %v", err)
-	}
-}
-
-func TestStaticNoGCCompletionCapacityArithmetic(t *testing.T) {
-	// One previously unseen normal command creates one completion even when it
-	// deterministically records a stale-fence or semantic refusal. Configuration
-	// entries, empty normal entries, exact duplicates, and retained conflicts
-	// create zero. Therefore one is the exact worst-case cost of every unapplied
-	// log entry, independent of the entry mix.
-	for maxEntries := uint64(1); maxEntries <= 128; maxEntries++ {
-		for last := uint64(1); last-1 <= maxEntries; last++ {
-			for applied := uint64(1); applied <= last; applied++ {
-				for completions := uint64(0); completions <= applied-1; completions++ {
-					unapplied := last - applied
-					if completions+unapplied > maxEntries {
-						t.Fatalf(
-							"C=%d A=%d L=%d MaxEntries=%d violates C+(L-A)<=MaxEntries",
-							completions, applied, last, maxEntries,
-						)
-					}
-				}
-			}
-		}
-	}
-}
-
-func TestValidateStaticNoGCCompletionCapacityAgainstLiveApply(t *testing.T) {
-	tests := []struct {
-		name           string
-		maxCompletions uint64
-		wantError      bool
-	}{
-		{name: "equality", maxCompletions: 8192},
-		{name: "one short", maxCompletions: 8191, wantError: true},
-	}
-	for index, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			walIdentity := testWALIdentity(byte(170 + index))
-			_, wal, _, _ := createWAL(t, walIdentity)
-			_, database, _ := prepareSQLRoot(t, walIdentity, "capacity")
-			authority := testAuthorityProfile()
-			base, err := BindPreparedSQL(wal, database, authority, "docs")
-			skipIfStrictAllocationUnsupported(t, "bind live capacity SQL root", err)
-			if err != nil {
-				t.Fatal(err)
-			}
-			options := testApplyOptions()
-			options.MaxSessions = test.maxCompletions
-			options.RetryWindow = 1
-			claim, _, err := OpenPreparedApply(wal, database, authority, base, options)
-			skipIfStrictAllocationUnsupported(t, "open live capacity apply", err)
-			if err != nil {
-				t.Fatal(err)
-			}
-			bootstrap, err := wal.Snapshot()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := claim.InstallSnapshot(bootstrap); err != nil {
-				t.Fatal(err)
-			}
-			err = ValidateStaticNoGCCompletionCapacity(wal, claim)
-			if test.wantError && !errors.Is(err, ErrStaticCompletionCapacity) {
-				t.Fatalf("validation error = %v, want ErrStaticCompletionCapacity", err)
-			}
-			if !test.wantError && err != nil {
-				t.Fatalf("validation error = %v", err)
-			}
-		})
-	}
-}
-
-func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
+func TestValidateImmutableBaseApplyCapacityChecksActualCut(t *testing.T) {
 	walIdentity := testWALIdentity(190)
 	_, wal, _, _ := createWAL(t, walIdentity)
 	_, database, _ := prepareSQLRoot(t, walIdentity, "capacity-cut")
@@ -234,10 +32,10 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
-		err, ErrStaticCompletionCapacity,
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); !errors.Is(
+		err, ErrApplyCapacity,
 	) {
-		t.Fatalf("uninitialized qualification = %v, want ErrStaticCompletionCapacity", err)
+		t.Fatalf("uninitialized qualification = %v, want ErrApplyCapacity", err)
 	}
 	bootstrap, err := wal.Snapshot()
 	if err != nil {
@@ -246,7 +44,7 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); err != nil {
 		t.Fatalf("bootstrap qualification: %v", err)
 	}
 
@@ -260,13 +58,14 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	}
 	profile, err := claim.CapacityQualificationProfile()
 	if err != nil || !profile.Initialized || profile.Applied != 3 ||
-		profile.CompletionCount != 1 || profile.SessionEpochHighWater != epoch {
+		profile.SessionCount != 1 || profile.SessionSlotCount != 1 ||
+		profile.SessionEpochHighWater != epoch {
 		t.Fatalf("applied capacity profile = %+v, %v", profile, err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
-		err, ErrStaticCompletionCapacity,
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); !errors.Is(
+		err, ErrApplyCapacity,
 	) {
-		t.Fatalf("ahead apply qualification = %v, want ErrStaticCompletionCapacity", err)
+		t.Fatalf("ahead apply qualification = %v, want ErrApplyCapacity", err)
 	}
 
 	incarnation, err := wal.BeginIncarnation()
@@ -286,7 +85,7 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); err != nil {
 		t.Fatalf("matched applied/WAL cut qualification: %v", err)
 	}
 	fourthIndex, fifthIndex := uint64(4), uint64(5)
@@ -303,20 +102,20 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); err != nil {
 		t.Fatalf("nontrivial unapplied suffix qualification: %v", err)
 	}
 	if _, err := claim.ApplyNormal(meta, nil); err == nil {
 		t.Fatal("conflicting replay did not poison claim")
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); !errors.Is(
 		err, replicatedstate.ErrApplyPoisoned,
 	) {
 		t.Fatalf("poisoned qualification = %v, want ErrApplyPoisoned", err)
 	}
 }
 
-func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testing.T) {
+func TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims(t *testing.T) {
 	authority := testAuthorityProfile()
 	firstIdentity := testWALIdentity(191)
 	_, firstWAL, _, _ := createWAL(t, firstIdentity)
@@ -364,7 +163,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 		"second WAL with first claim": {wal: secondWAL, claim: firstClaim},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := ValidateStaticNoGCCompletionCapacity(test.wal, test.claim); !errors.Is(
+			if err := ValidateImmutableBaseApplyCapacity(test.wal, test.claim); !errors.Is(
 				err, ErrBindingMismatch,
 			) {
 				t.Fatalf("cross-binding qualification = %v, want ErrBindingMismatch", err)
@@ -373,7 +172,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsCrossBindingClaims(t *testin
 	}
 }
 
-func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
+func TestImmutableBaseApplyCapacityRequalifiesAfterRestart(t *testing.T) {
 	walIdentity := testWALIdentity(201)
 	walPath, wal, key, walOptions := createWAL(t, walIdentity)
 	sqlPath, database, _ := prepareSQLRoot(t, walIdentity, "capacity-restart")
@@ -422,7 +221,7 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); err != nil {
 		t.Fatalf("initial qualification: %v", err)
 	}
 	if err := claim.Close(); err != nil {
@@ -454,11 +253,12 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 		_ = reopenedDB.Close()
 	}()
 	profile, err := reopenedClaim.CapacityQualificationProfile()
-	if err != nil || profile.Applied != 3 || profile.CompletionCount != 1 ||
-		profile.SessionEpochHighWater != epoch || !profile.Initialized {
+	if err != nil || profile.Applied != 3 || profile.SessionCount != 1 ||
+		profile.SessionSlotCount != 1 || profile.SessionEpochHighWater != epoch ||
+		!profile.Initialized {
 		t.Fatalf("reopened capacity profile = %+v, %v", profile, err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(reopenedWAL, reopenedClaim); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(reopenedWAL, reopenedClaim); err != nil {
 		t.Fatalf("reopened qualification: %v", err)
 	}
 	if filepath.Clean(walPath) == filepath.Clean(sqlPath) {
@@ -466,13 +266,13 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	}
 }
 
-func TestValidateStaticNoGCCompletionCapacityRejectsUnavailableInputs(t *testing.T) {
-	if err := ValidateStaticNoGCCompletionCapacity(nil, nil); !errors.Is(err, ErrWALUnavailable) {
+func TestValidateImmutableBaseApplyCapacityRejectsUnavailableInputs(t *testing.T) {
+	if err := ValidateImmutableBaseApplyCapacity(nil, nil); !errors.Is(err, ErrWALUnavailable) {
 		t.Fatalf("nil WAL error = %v, want ErrWALUnavailable", err)
 	}
 	walIdentity := testWALIdentity(220)
 	_, wal, _, _ := createWAL(t, walIdentity)
-	if err := ValidateStaticNoGCCompletionCapacity(wal, nil); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(wal, nil); !errors.Is(
 		err, sqldriver.ErrReplicatedApplyClosed,
 	) {
 		t.Fatalf("nil apply error = %v, want ErrReplicatedApplyClosed", err)
@@ -495,7 +295,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsUnavailableInputs(t *testing
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); !errors.Is(
 		err, sqldriver.ErrReplicatedApplyClosed,
 	) {
 		t.Fatalf("closed apply error = %v, want ErrReplicatedApplyClosed", err)
@@ -503,14 +303,14 @@ func TestValidateStaticNoGCCompletionCapacityRejectsUnavailableInputs(t *testing
 	if err := wal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(wal, claim); !errors.Is(
 		err, ErrWALUnavailable,
 	) {
 		t.Fatalf("closed WAL error = %v, want ErrWALUnavailable", err)
 	}
 }
 
-func TestValidateStaticNoGCCompletionCapacityRejectsTornWAL(t *testing.T) {
+func TestValidateImmutableBaseApplyCapacityRejectsTornWAL(t *testing.T) {
 	walIdentity := testWALIdentity(230)
 	walPath, wal, key, options := createWAL(t, walIdentity)
 	if _, err := wal.BeginIncarnation(); err != nil {
@@ -547,14 +347,14 @@ func TestValidateStaticNoGCCompletionCapacityRejectsTornWAL(t *testing.T) {
 	if !reopened.RecoveredTornCurrentSlot() {
 		t.Fatal("test setup did not recover a torn current slot")
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(reopened, nil); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(reopened, nil); !errors.Is(
 		err, ErrWALQuarantined,
 	) {
 		t.Fatalf("torn qualification error = %v, want ErrWALQuarantined", err)
 	}
 }
 
-func TestValidateStaticNoGCCompletionCapacityRejectsNamespacePoisonedWAL(t *testing.T) {
+func TestValidateImmutableBaseApplyCapacityRejectsNamespacePoisonedWAL(t *testing.T) {
 	walIdentity := testWALIdentity(231)
 	walPath, wal, _, _ := createWAL(t, walIdentity)
 	incarnation, err := wal.BeginIncarnation()
@@ -572,7 +372,7 @@ func TestValidateStaticNoGCCompletionCapacityRejectsNamespacePoisonedWAL(t *test
 	}); !errors.Is(err, raftstore.ErrNamespaceChanged) {
 		t.Fatalf("namespace poison setup = %v, want ErrNamespaceChanged", err)
 	}
-	if err := ValidateStaticNoGCCompletionCapacity(wal, nil); !errors.Is(
+	if err := ValidateImmutableBaseApplyCapacity(wal, nil); !errors.Is(
 		err, ErrWALUnavailable,
 	) || !errors.Is(err, raftstore.ErrNamespaceChanged) {
 		t.Fatalf("namespace-poisoned qualification = %v, want WAL unavailable/namespace changed", err)

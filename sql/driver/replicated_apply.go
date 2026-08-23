@@ -100,11 +100,6 @@ type ReplicatedApplyCapacityProfile struct {
 	SessionCount          uint64
 	SessionSlotCount      uint64
 	SessionEpochHighWater uint64
-	// Deprecated append-only completion counters remain only until the
-	// unreleased compatibility API is explicitly removed. Runtime admission uses
-	// the bounded session fields above exclusively.
-	MaxCompletions  uint64
-	CompletionCount uint64
 }
 
 // ReplicatedApply is the opaque, singleton trusted apply claim over one bound
@@ -756,8 +751,8 @@ func (a *ReplicatedApply) Identity() (ReplicatedApplyIdentity, error) {
 }
 
 // CapacityQualificationProfile returns the exact binding and constant-size
-// durable apply cut needed by a higher-level compatibility/capacity proof. It
-// fails closed for a closed or poisoned claim.
+// durable apply cut needed by a higher-level capacity proof. It fails closed
+// for a closed or poisoned claim.
 func (a *ReplicatedApply) CapacityQualificationProfile() (
 	ReplicatedApplyCapacityProfile,
 	error,
@@ -778,11 +773,6 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 	if err != nil {
 		return ReplicatedApplyCapacityProfile{}, err
 	}
-	maxCompletions := a.identity.MaxSessions * uint64(a.identity.RetryWindow)
-	if a.identity.RetryWindow != 0 &&
-		maxCompletions/uint64(a.identity.RetryWindow) != a.identity.MaxSessions {
-		maxCompletions = math.MaxUint64
-	}
 	return ReplicatedApplyCapacityProfile{
 		Binding:     ownedReplicatedShardStoreBinding(base.Binding),
 		ApplyFormat: a.identity.Format, MaxSessions: a.identity.MaxSessions,
@@ -790,8 +780,6 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 		Applied: state.Applied, SessionCount: state.SessionCount,
 		SessionSlotCount:      state.SessionSlotCount,
 		SessionEpochHighWater: state.SessionEpochHighWater,
-		MaxCompletions:        maxCompletions,
-		CompletionCount:       state.SessionSlotCount,
 	}, nil
 }
 
