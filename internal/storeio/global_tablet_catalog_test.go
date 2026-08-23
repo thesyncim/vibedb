@@ -730,6 +730,27 @@ func TestGlobalTabletCatalogCacheableTabletReadPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantFence := leaves[target].Fence
+	prefix := []byte("owned-prefix:")
+	fenceScratch := make([]byte, len(prefix), len(prefix)+len(wantFence))
+	copy(fenceScratch, prefix)
+	appended, ok := anchor.AppendFenceAt(fenceScratch, 0)
+	if !ok || !bytes.Equal(appended[:len(prefix)], prefix) ||
+		!bytes.Equal(appended[len(prefix):], wantFence) {
+		t.Fatalf("appended fence = %q,%v, want prefix %q fence %q",
+			appended, ok, prefix, wantFence)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		var appendOK bool
+		fenceScratch, appendOK = anchor.AppendFenceAt(
+			fenceScratch[:len(prefix)], 0,
+		)
+		if !appendOK {
+			panic("AppendFenceAt failed on admitted rank")
+		}
+	}); got != 0 {
+		t.Fatalf("AppendFenceAt allocations = %v, want 0", got)
+	}
 	crossStoreRoot := tablet
 	crossStoreRoot.bounds.StoreID[0] ^= 1
 	if _, err := OpenGlobalTabletCatalogAnchor(
