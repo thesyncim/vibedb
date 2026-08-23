@@ -59,8 +59,9 @@ type State struct {
 	SnapshotBaseDigest [32]byte
 	SessionCount       uint64
 	SessionSlotCount   uint64
-	// SessionEpochHighWater is the durable shard-wide anti-resurrection fence
-	// retained after an individual session header and retry ring are reclaimed.
+	// SessionEpochHighWater is the greatest Raft apply index assigned by a
+	// SessionOpen. It is the durable shard-wide anti-resurrection fence retained
+	// after an individual session header and retry ring are reclaimed.
 	SessionEpochHighWater uint64
 }
 
@@ -213,7 +214,7 @@ func validateState(state State) error {
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||
 		state.ReplicaSetVersion == math.MaxUint64 || state.SessionCount > state.Applied-1 ||
 		state.SessionSlotCount > state.Applied-1 ||
-		state.SessionEpochHighWater > state.Applied-1 ||
+		state.SessionEpochHighWater > state.Applied ||
 		state.SessionCount > MaxRetainedSessions ||
 		state.SessionSlotCount > state.SessionCount*MaxSessionRetryWindow ||
 		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||

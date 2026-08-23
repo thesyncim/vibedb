@@ -85,7 +85,7 @@ func TestStateSessionEpochHighWaterRoundTripAndBounds(t *testing.T) {
 	state.LastTerm = 2
 	state.LastKind = RecordNormal
 	state.LastEntryDigest = sha256.Sum256([]byte("normal-entry"))
-	state.SessionEpochHighWater = state.Applied - 1
+	state.SessionEpochHighWater = state.Applied
 
 	encoded, err := AppendState(nil, state)
 	if err != nil {
@@ -100,15 +100,15 @@ func TestStateSessionEpochHighWaterRoundTripAndBounds(t *testing.T) {
 	}
 
 	tooHigh := state
-	tooHigh.SessionEpochHighWater = tooHigh.Applied
+	tooHigh.SessionEpochHighWater = tooHigh.Applied + 1
 	if _, err := AppendState(nil, tooHigh); !errors.Is(err, ErrStateCorrupt) {
-		t.Fatalf("high-water at Applied error = %v", err)
+		t.Fatalf("high-water beyond Applied error = %v", err)
 	}
 	corruptHighWater := bytes.Clone(encoded)
-	binary.LittleEndian.PutUint64(corruptHighWater[360:368], state.Applied)
+	binary.LittleEndian.PutUint64(corruptHighWater[360:368], state.Applied+1)
 	sealRecord(corruptHighWater, stateChecksumDomain)
 	if _, err := OpenState(corruptHighWater); !errors.Is(err, ErrStateCorrupt) {
-		t.Fatalf("decoded high-water at Applied error = %v", err)
+		t.Fatalf("decoded high-water beyond Applied error = %v", err)
 	}
 
 	static := codecState()
@@ -262,12 +262,13 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 		ResultFormatMutation != 1 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
-		ResultSessionRetired != 7 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d",
+		ResultSessionRetired != 7 || ResultSessionOpened != 8 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownCollection,
-			ResultInvalidDocument, ResultTargetBound, ResultWrongShard, ResultSessionRetired)
+			ResultInvalidDocument, ResultTargetBound, ResultWrongShard,
+			ResultSessionRetired, ResultSessionOpened)
 	}
 	record := sessionCodecRecord()
 	encoded, err := AppendSessionRecord(nil, record)

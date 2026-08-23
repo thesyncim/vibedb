@@ -669,11 +669,11 @@ func putCraftedSession(
 		t.Fatal(err)
 	}
 	encodedApplied := applied
-	if encodedApplied < 2 {
+	if encodedApplied <= command.ClientEpoch {
 		// The codec rejects impossible apply indexes. Encode a structurally valid
 		// slot, then reseal the deliberately corrupted fixture below so Open's
 		// persisted-image validation remains covered independently.
-		encodedApplied = 2
+		encodedApplied = command.ClientEpoch + 1
 	}
 	openSlot, err := AppendSessionSlot(nil, SessionSlot{
 		Slot:                   0,

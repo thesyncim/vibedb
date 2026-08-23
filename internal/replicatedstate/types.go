@@ -27,8 +27,9 @@ const (
 	ResultTargetBound       uint32 = 5
 	ResultWrongShard        uint32 = 6
 	ResultSessionRetired    uint32 = 7
+	ResultSessionOpened     uint32 = 8
 
-	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 360-byte
+	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf
 	// with at most 64 ten-byte member IDs fit below 1.6 KiB; 2 KiB retains a
 	// format margin without inflating every hidden collection. Session metadata
@@ -58,6 +59,7 @@ var (
 	ErrSessionAck                  = errors.New("replicatedstate: client acknowledgement regressed")
 	ErrSessionActive               = errors.New("replicatedstate: current client session is still active")
 	ErrSessionRetired              = errors.New("replicatedstate: client session is retired")
+	ErrSessionReleased             = errors.New("replicatedstate: client session release is complete")
 	ErrStaleCommand                = errors.New("replicatedstate: command has a stale mutable fence")
 	ErrWrongBinding                = errors.New("replicatedstate: command belongs to another shard binding")
 	ErrApplySequence               = errors.New("replicatedstate: invalid apply sequence")

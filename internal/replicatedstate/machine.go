@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -68,10 +69,11 @@ type Machine struct {
 // Raft integration. Initialized distinguishes the empty pre-bootstrap machine
 // from the durable static snapshot at Applied index 1.
 type SessionCapacityState struct {
-	Initialized      bool
-	Applied          uint64
-	SessionCount     uint64
-	SessionSlotCount uint64
+	Initialized           bool
+	Applied               uint64
+	SessionCount          uint64
+	SessionSlotCount      uint64
+	SessionEpochHighWater uint64
 }
 
 type openInputs struct {
@@ -256,12 +258,16 @@ func prepareOpenInputs(
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
 	)
-	maxSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
+	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
+	releaseSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
+	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes)
+	maxSystemDocuments := max(3, int(options.RetryWindow)+2)
 	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
 		system.Limits.MaxDocumentBytes < maxSystemDocument ||
-		system.Limits.MaxDistinctMutations < 3 ||
+		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
 		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
 		return openInputs{}, fmt.Errorf(
 			"%w: system collection cannot hold bounded records", ErrInvalidCollection,
@@ -274,7 +280,10 @@ func prepareOpenInputs(
 			"%w: transaction byte proof overflows", ErrInvalidOptions,
 		)
 	}
-	if options.TxnLimits.MaxDocuments < user.Limits.MaxDistinctMutations+3 ||
+	if options.TxnLimits.MaxDocuments < max(
+		user.Limits.MaxDistinctMutations+3,
+		maxSystemDocuments,
+	) ||
 		options.TxnLimits.MaxBytes < requiredTxnBytes {
 		return openInputs{}, fmt.Errorf(
 			"%w: transaction limits do not cover the frozen apply profile", ErrInvalidOptions,
@@ -433,6 +442,7 @@ func scanSessionSystemSnapshot(
 	var statePresent bool
 	var sessionCount, slotCount uint64
 	var sessions map[[sha256.Size]byte]scannedSession
+	var sessionEpochs []uint64
 	err := snapshot.RangeRaw(func(key, value []byte) error {
 		switch {
 		case bytes.Equal(key, stateKey):
@@ -450,6 +460,7 @@ func scanSessionSystemSnapshot(
 			}
 			statePresent = true
 			sessions = make(map[[sha256.Size]byte]scannedSession, int(state.SessionCount))
+			sessionEpochs = make([]uint64, 0, int(state.SessionCount))
 			return nil
 
 		case len(key) == 1+sha256.Size && key[0] == 1:
@@ -462,6 +473,7 @@ func scanSessionSystemSnapshot(
 			}
 			want := SessionStorageKey(view.Digest)
 			if !bytes.Equal(key, want[:]) || view.RetryWindow != retryWindow ||
+				view.ClientEpoch > state.SessionEpochHighWater ||
 				view.HighSequence == 0 || view.AckThrough >= view.HighSequence ||
 				view.PhysicalSlotCount == 0 {
 				return fmt.Errorf("%w: session header", ErrSessionCorrupt)
@@ -477,6 +489,7 @@ func scanSessionSystemSnapshot(
 				highSequence: view.HighSequence, physicalSlots: view.PhysicalSlotCount,
 				retryWindow: view.RetryWindow, status: view.Status,
 			}
+			sessionEpochs = append(sessionEpochs, view.ClientEpoch)
 			sessionCount++
 			return nil
 
@@ -493,9 +506,7 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: slot key mismatch", ErrSessionCorrupt)
 			}
 			summary, ok := sessions[view.SessionDigest]
-			if !ok || view.Slot >= summary.physicalSlots ||
-				view.ClientEpoch > summary.epoch ||
-				view.Slot != uint16((view.ClientSequence-1)%uint64(summary.retryWindow)) {
+			if !ok || view.Slot >= summary.physicalSlots {
 				return fmt.Errorf("%w: slot outside session header", ErrSessionCorrupt)
 			}
 			word, bit := view.Slot/64, view.Slot%64
@@ -507,44 +518,28 @@ func scanSessionSystemSnapshot(
 			if err := validateStoredSessionSlot(state, view); err != nil {
 				return err
 			}
-			baseSequence := uint64(view.Slot) + 1
-			if baseSequence <= summary.highSequence {
-				expectedSequence := baseSequence +
-					(summary.highSequence-baseSequence)/uint64(summary.retryWindow)*
-						uint64(summary.retryWindow)
-				if view.ClientEpoch != summary.epoch ||
-					view.ClientSequence != expectedSequence {
-					return fmt.Errorf("%w: missing current session retry", ErrSessionCorrupt)
-				}
-				summary.currentSlots++
-				wrapped := summary.highSequence > uint64(summary.retryWindow) &&
-					uint64(view.Slot) < summary.highSequence%uint64(summary.retryWindow)
-				if wrapped {
-					if summary.wrappedLastApplied != 0 &&
-						view.AppliedSequence <= summary.wrappedLastApplied {
-						return fmt.Errorf("%w: session result order", ErrSessionCorrupt)
-					}
-					if summary.wrappedFirstApplied == 0 {
-						summary.wrappedFirstApplied = view.AppliedSequence
-					}
-					summary.wrappedLastApplied = view.AppliedSequence
-				} else {
-					if summary.orderedLastApplied != 0 &&
-						view.AppliedSequence <= summary.orderedLastApplied {
-						return fmt.Errorf("%w: session result order", ErrSessionCorrupt)
-					}
-					summary.orderedLastApplied = view.AppliedSequence
-				}
-				if view.ResultCode == ResultSessionRetired &&
-					view.ClientSequence != summary.highSequence {
-					return fmt.Errorf("%w: early session retirement result", ErrSessionCorrupt)
-				}
-				if view.ClientSequence == summary.highSequence {
-					summary.latestSeen = true
-					summary.latestResult = view.ResultCode
-				}
-			} else if view.ClientEpoch == summary.epoch {
-				return fmt.Errorf("%w: future current-epoch slot", ErrSessionCorrupt)
+			if err := validateSessionSlotAgainstHeader(SessionView{
+				Digest: view.SessionDigest, ClientEpoch: summary.epoch,
+				HighSequence: summary.highSequence, RetryWindow: summary.retryWindow,
+				PhysicalSlotCount: summary.physicalSlots, Status: summary.status,
+			}, view); err != nil {
+				return err
+			}
+			order := sessionAppliedOrder{
+				orderedLast:  summary.orderedLastApplied,
+				wrappedFirst: summary.wrappedFirstApplied,
+				wrappedLast:  summary.wrappedLastApplied,
+			}
+			if err := order.observe(summary.highSequence, summary.retryWindow, view); err != nil {
+				return err
+			}
+			summary.orderedLastApplied = order.orderedLast
+			summary.wrappedFirstApplied = order.wrappedFirst
+			summary.wrappedLastApplied = order.wrappedLast
+			summary.currentSlots++
+			if view.ClientSequence == summary.highSequence {
+				summary.latestSeen = true
+				summary.latestResult = view.ResultCode
 			}
 			sessions[view.SessionDigest] = summary
 			slotCount++
@@ -566,18 +561,29 @@ func scanSessionSystemSnapshot(
 	if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount {
 		return State{}, false, 0, 0, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
 	}
+	// Session tokens are Raft apply indices and therefore shard-wide unique. A
+	// compact sorted vector costs eight bytes per active session—materially less
+	// reopen RSS than a second Go map—while keeping corruption detection bounded
+	// by active sessions rather than historical operations.
+	slices.Sort(sessionEpochs)
+	for i := 1; i < len(sessionEpochs); i++ {
+		if sessionEpochs[i-1] == sessionEpochs[i] {
+			return State{}, false, 0, 0, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
+		}
+	}
 	for _, summary := range sessions {
 		requiredCurrent := uint64(summary.retryWindow)
 		if summary.highSequence < requiredCurrent {
 			requiredCurrent = summary.highSequence
 		}
-		wrappedOrderInvalid := summary.highSequence > uint64(summary.retryWindow) &&
-			summary.highSequence%uint64(summary.retryWindow) != 0 &&
-			(summary.orderedLastApplied == 0 || summary.wrappedFirstApplied == 0 ||
-				summary.orderedLastApplied >= summary.wrappedFirstApplied)
+		orderErr := (sessionAppliedOrder{
+			orderedLast:  summary.orderedLastApplied,
+			wrappedFirst: summary.wrappedFirstApplied,
+			wrappedLast:  summary.wrappedLastApplied,
+		}).finish(summary.highSequence, summary.retryWindow)
 		if summary.seenSlots != summary.physicalSlots ||
 			uint64(summary.currentSlots) != requiredCurrent || !summary.latestSeen ||
-			wrappedOrderInvalid ||
+			orderErr != nil ||
 			summary.status == SessionRetired && summary.latestResult != ResultSessionRetired ||
 			summary.status == SessionActive && summary.latestResult == ResultSessionRetired {
 			return State{}, false, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
@@ -587,7 +593,7 @@ func scanSessionSystemSnapshot(
 }
 
 func validateStoredSessionSlot(state State, slot SessionSlotView) error {
-	if slot.ResultCode < ResultApplied || slot.ResultCode > ResultSessionRetired {
+	if slot.ResultCode < ResultApplied || slot.ResultCode > ResultSessionOpened {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrSessionCorrupt)
 	}
 	if slot.AppliedSequence < 2 || slot.AppliedSequence > state.Applied ||
@@ -613,6 +619,12 @@ func validateSessionSlotAgainstHeader(session SessionView, slot SessionSlotView)
 	if session.Digest != slot.SessionDigest || session.ClientEpoch != slot.ClientEpoch {
 		return fmt.Errorf("%w: retained session result identity", ErrSessionCorrupt)
 	}
+	expected, ok := canonicalSessionSlotSequence(
+		session.HighSequence, session.RetryWindow, slot.Slot,
+	)
+	if !ok || slot.Slot >= session.PhysicalSlotCount || slot.ClientSequence != expected {
+		return fmt.Errorf("%w: retained session result sequence", ErrSessionCorrupt)
+	}
 	if slot.ResultCode == ResultSessionRetired {
 		if session.Status != SessionRetired || slot.ClientSequence != session.HighSequence {
 			return fmt.Errorf("%w: misplaced session retirement result", ErrSessionCorrupt)
@@ -623,9 +635,58 @@ func validateSessionSlotAgainstHeader(session SessionView, slot SessionSlotView)
 	return nil
 }
 
+func canonicalSessionSlotSequence(high uint64, window uint16, slot uint16) (uint64, bool) {
+	if window == 0 || slot >= window {
+		return 0, false
+	}
+	base := uint64(slot) + 1
+	if base > high {
+		return 0, false
+	}
+	width := uint64(window)
+	return base + (high-base)/width*width, true
+}
+
+type sessionAppliedOrder struct {
+	orderedLast  uint64
+	wrappedFirst uint64
+	wrappedLast  uint64
+}
+
+func (o *sessionAppliedOrder) observe(high uint64, window uint16, slot SessionSlotView) error {
+	if o == nil || window == 0 {
+		return fmt.Errorf("%w: nil session apply order", ErrSessionCorrupt)
+	}
+	wrapped := high > uint64(window) &&
+		uint64(slot.Slot) < high%uint64(window)
+	if wrapped {
+		if o.wrappedLast != 0 && slot.AppliedSequence <= o.wrappedLast {
+			return fmt.Errorf("%w: session result order", ErrSessionCorrupt)
+		}
+		if o.wrappedFirst == 0 {
+			o.wrappedFirst = slot.AppliedSequence
+		}
+		o.wrappedLast = slot.AppliedSequence
+		return nil
+	}
+	if o.orderedLast != 0 && slot.AppliedSequence <= o.orderedLast {
+		return fmt.Errorf("%w: session result order", ErrSessionCorrupt)
+	}
+	o.orderedLast = slot.AppliedSequence
+	return nil
+}
+
+func (o sessionAppliedOrder) finish(high uint64, window uint16) error {
+	if window != 0 && high > uint64(window) && high%uint64(window) != 0 &&
+		(o.orderedLast == 0 || o.wrappedFirst == 0 || o.orderedLast >= o.wrappedFirst) {
+		return fmt.Errorf("%w: session result order", ErrSessionCorrupt)
+	}
+	return nil
+}
+
 func (m *Machine) validateCompletionResult(completion replication.CompletionView) error {
 	if completion.ResultFormat != ResultFormatMutation || completion.ResultCode < ResultApplied ||
-		completion.ResultCode > ResultSessionRetired {
+		completion.ResultCode > ResultSessionOpened {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
 	return nil
@@ -665,6 +726,7 @@ func (m *Machine) SessionCapacityState() (SessionCapacityState, error) {
 	return SessionCapacityState{
 		Initialized: m.initialized, Applied: m.state.Applied,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
+		SessionEpochHighWater: m.state.SessionEpochHighWater,
 	}, nil
 }
 
