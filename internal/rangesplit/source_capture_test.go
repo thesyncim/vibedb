@@ -30,6 +30,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
 	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err != nil {
 		t.Fatal(err)
@@ -68,23 +69,23 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(2), fixture.command(1, replication.Mutation{
+		sourceCaptureMeta(3), fixture.command(2, replication.Mutation{
 			Kind: replication.MutationPut, Key: []byte("row"), Value: left,
 		}),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(3), fixture.command(2, replication.Mutation{
+		sourceCaptureMeta(4), fixture.command(3, replication.Mutation{
 			Kind: replication.MutationPut, Key: []byte("row"), Value: right,
 		}),
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(4), nil); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(5), nil); err != nil {
 		t.Fatal(err)
 	}
-	if capture.Head() != 4 || fixture.capture.Len() != 4 {
+	if capture.Head() != 5 || fixture.capture.Len() != 4 {
 		t.Fatalf("head=%d rows=%d", capture.Head(), fixture.capture.Len())
 	}
 
@@ -123,11 +124,11 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 		replicatedstate.UserCollection{Name: "docs", Target: fixture.user},
 		fixture.log, reopenOptions,
 	)
-	if err != nil || recovered.Head() != 4 {
+	if err != nil || recovered.Head() != 5 {
 		t.Fatalf("reopen=%v head=%d", err, recovered.Head())
 	}
 	if _, err := reopened.ApplyNormal(
-		sourceCaptureMeta(5), fixture.command(3, replication.Mutation{
+		sourceCaptureMeta(6), fixture.command(4, replication.Mutation{
 			Kind: replication.MutationDelete, Key: []byte("row"),
 		}),
 	); err != nil {
@@ -140,7 +141,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	}
 	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
 	if _, err := reopened.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 6, Term: 2, Type: pb.EntryConfChange,
+		Index: 7, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +151,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	}
 	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
 	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
-		From: fixture.binding, ExpectedReplicaSetVersion: 6,
+		From: fixture.binding, ExpectedReplicaSetVersion: 7,
 		SourceMember: 1, TargetMember: 2,
 		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
@@ -159,7 +160,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reopened.ApplyNormal(sourceCaptureMeta(7), ownership); err != nil {
+	if _, err := reopened.ApplyNormal(sourceCaptureMeta(8), ownership); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok, err = recovered.NextTailEntry(cursor, &readWorkspace)
@@ -167,7 +168,7 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 		t.Fatalf("seal entry=%+v ok=%v err=%v", entry, ok, err)
 	}
 	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
-	if !cursor.Sealed() || recovered.Head() != 7 {
+	if !cursor.Sealed() || recovered.Head() != 8 {
 		t.Fatalf("sealed cursor=%+v head=%d", cursor, recovered.Head())
 	}
 }
@@ -184,6 +185,7 @@ func TestSourceCaptureRecoveryRejectsRecordCorruption(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
 	capture, _ := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err := fixture.machine.BeginTransitionCapture(capture); err != nil {
 		t.Fatal(err)
@@ -194,14 +196,14 @@ func TestSourceCaptureRecoveryRejectsRecordCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(2), fixture.command(1, replication.Mutation{
+		sourceCaptureMeta(3), fixture.command(2, replication.Mutation{
 			Kind: replication.MutationPut, Key: []byte("row"), Value: document,
 		}),
 	); err != nil {
 		t.Fatal(err)
 	}
 	var key [8]byte
-	key[7] = 2
+	key[7] = 3
 	raw, found, err := fixture.capture.AppendRaw(nil, key[:])
 	if err != nil || !found {
 		t.Fatal(err)
@@ -315,6 +317,7 @@ func newSourceCaptureBenchmark(
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		b.Fatal(err)
 	}
+	fixture.clientEpoch = fixture.openSession(b, 2, []byte("tenant"), sourceCaptureID(20))
 	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err != nil || fixture.machine.BeginTransitionCapture(capture) != nil {
 		b.Fatal(err)
@@ -341,7 +344,7 @@ func newSourceCaptureBenchmark(
 		b.Fatal(err)
 	}
 	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(2), fixture.command(1, replication.Mutation{
+		sourceCaptureMeta(3), fixture.command(2, replication.Mutation{
 			Kind: replication.MutationPut, Key: []byte("row"), Value: document,
 		}),
 	); err != nil {
@@ -355,15 +358,19 @@ func newSourceCaptureBenchmark(
 }
 
 type sourceCaptureFixture struct {
-	machine   *replicatedstate.Machine
-	binding   replicatedstate.Binding
-	bootstrap *pb.Snapshot
-	system    replicatedstate.CollectionTarget
-	user      replicatedstate.CollectionTarget
-	capture   *durable.Collection
-	log       *durable.TxnLog
-	options   replicatedstate.Options
+	machine            *replicatedstate.Machine
+	binding            replicatedstate.Binding
+	bootstrap          *pb.Snapshot
+	system             replicatedstate.CollectionTarget
+	user               replicatedstate.CollectionTarget
+	capture            *durable.Collection
+	log                *durable.TxnLog
+	options            replicatedstate.Options
+	clientEpoch        uint64
+	retainedPruneEpoch uint64
 }
+
+const sourceCaptureRetryWindow = uint16(8)
 
 type sourceCaptureValidator struct{}
 
@@ -443,11 +450,15 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 	}
 	options := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
+			MaxCollections: 3,
+			MaxDocuments: max(
+				user.Limits.MaxDistinctMutations+4,
+				int(sourceCaptureRetryWindow)+3,
+			),
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128,
-		RetryWindow: 8,
+		RetryWindow: sourceCaptureRetryWindow,
 	}
 	machine, err := replicatedstate.Open(
 		binding, bootstrap, system,
@@ -477,13 +488,70 @@ func (f sourceCaptureFixture) command(
 		ProtectionEpoch: f.binding.ProtectionEpoch, OwnershipEpoch: f.binding.OwnershipEpoch,
 		SchemaGeneration: f.binding.SchemaGeneration, RoutingVersion: f.binding.RoutingVersion,
 		RouteGeneration: f.binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: sourceCaptureID(20), ClientEpoch: 1, ClientSequence: sequence,
+		ClientID: sourceCaptureID(20), ClientEpoch: f.clientEpoch, ClientSequence: sequence,
 		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
 	})
 	if err != nil {
 		panic(err)
 	}
 	return encoded
+}
+
+func (f sourceCaptureFixture) openSession(
+	t testing.TB,
+	index uint64,
+	tenant []byte,
+	clientID replication.ID128,
+) uint64 {
+	t.Helper()
+	seed := make([]byte, 0, len("rangesplit/test-session-open/")+len(tenant)+len(clientID))
+	seed = append(seed, "rangesplit/test-session-open/"...)
+	seed = append(seed, tenant...)
+	seed = append(seed, clientID[:]...)
+	encoded, err := replication.AppendCommand(nil, replication.Command{
+		Kind:                   replication.CommandSessionOpen,
+		ClusterID:              f.binding.ClusterID,
+		ClusterIncarnation:     f.binding.ClusterIncarnation,
+		TopologyRecoveryEpoch:  f.binding.TopologyRecoveryEpoch,
+		Distribution:           f.binding.Distribution,
+		Shard:                  f.binding.Shard,
+		AllocationGeneration:   f.binding.AllocationGeneration,
+		ShardIncarnation:       f.binding.ShardIncarnation,
+		GroupID:                f.binding.GroupID,
+		ReplicaSetVersion:      1,
+		ActivePolicyGeneration: f.binding.ActivePolicyGeneration,
+		ProtectionEpoch:        f.binding.ProtectionEpoch,
+		OwnershipEpoch:         f.binding.OwnershipEpoch,
+		SchemaGeneration:       f.binding.SchemaGeneration,
+		RoutingVersion:         f.binding.RoutingVersion,
+		RouteGeneration:        f.binding.RouteGeneration,
+		Tenant:                 tenant,
+		ClientID:               clientID,
+		ClientSequence:         1,
+		Fingerprint:            sha256.Sum256(seed),
+		Collection:             "docs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.machine.AdmitCommand(encoded); err != nil {
+		t.Fatalf("admit session open at %d: %v", index, err)
+	}
+	publication, err := f.machine.ApplyNormal(sourceCaptureMeta(index), encoded)
+	if err != nil || publication.Applied != index {
+		t.Fatalf("apply session open at %d = %+v, %v", index, publication, err)
+	}
+	lookup, err := f.machine.LookupCompletion(encoded)
+	if err != nil {
+		t.Fatalf("lookup session open at %d: %v", index, err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened ||
+		completion.ClientEpoch != index || completion.ClientSequence != 1 ||
+		completion.AppliedSequence != index {
+		t.Fatalf("session open completion at %d = %+v, %v", index, completion, err)
+	}
+	return completion.ClientEpoch
 }
 
 func sourceCaptureID(seed byte) replication.ID128 {

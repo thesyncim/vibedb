@@ -24,6 +24,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
 	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +75,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	}
 
 	if _, err := fixture.machine.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 2, Term: 2, Type: pb.EntryConfChange,
+		Index: 3, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 		t.Fatal(err)
 	}
 	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
-		From: fixture.binding, ExpectedReplicaSetVersion: 2,
+		From: fixture.binding, ExpectedReplicaSetVersion: 3,
 		SourceMember: 1, TargetMember: 2,
 		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
@@ -102,7 +103,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(3), ownership); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(4), ownership); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok, err = capture.NextTailEntry(cursor, &captureWorkspace)
@@ -170,7 +171,7 @@ func TestCertifyCutoverRequiresExactCapturedSealAndDurableChildren(t *testing.T)
 		t.Fatalf("corrupt error=%v", err)
 	}
 
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(4), nil); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(5), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := partitioner.CertifyCutover(

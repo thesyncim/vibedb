@@ -74,11 +74,11 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	binding.OwnershipEpoch++
 	binding.RoutingVersion++
 	binding.RouteGeneration++
-	// The prune controller owns an independent bounded session, so its first
-	// command starts at client sequence one regardless of the shard apply index.
-	sequence, applied := uint64(1), uint64(5)
+	// The prune controller owns an independent bounded session opened before
+	// capture. Sequence one is its Open, so pruning starts at sequence two.
+	sequence, applied := uint64(2), uint64(7)
 	if _, err := fixture.machine.ApplyNormal(
-		sourceCaptureMeta(applied), retainedPruneCommand(t, fixture, binding, 3, sequence, retry),
+		sourceCaptureMeta(applied), retainedPruneCommand(t, fixture, binding, 5, sequence, retry),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		applied++
 		if _, err := fixture.machine.ApplyNormal(
 			sourceCaptureMeta(applied),
-			retainedPruneCommand(t, fixture, binding, 3, sequence, batch),
+			retainedPruneCommand(t, fixture, binding, 5, sequence, batch),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -251,7 +251,7 @@ func TestRetainedPrunerRejectsUnexpectedPostSealEntry(t *testing.T) {
 	if err := snapshot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(5), nil); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(7), nil); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err = fixture.machine.Snapshot("docs")
@@ -280,6 +280,7 @@ func newRetainedPruneFixture(
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
 	left, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +289,7 @@ func newRetainedPruneFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(2), fixture.command(1,
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(3), fixture.command(2,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("a-left"), Value: left},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("b-right"), Value: right},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("c-left"), Value: left},
@@ -296,6 +297,9 @@ func newRetainedPruneFixture(
 	)); err != nil {
 		t.Fatal(err)
 	}
+	fixture.retainedPruneEpoch = fixture.openSession(
+		t, 4, []byte("split-controller"), sourceCaptureID(30),
+	)
 	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +348,7 @@ func newRetainedPruneFixture(
 		t.Fatal(err)
 	}
 	if _, err := fixture.machine.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 3, Term: 2, Type: pb.EntryConfChange,
+		Index: 5, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +367,7 @@ func newRetainedPruneFixture(
 		t.Fatal(err)
 	}
 	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
-		From: fixture.binding, ExpectedReplicaSetVersion: 3,
+		From: fixture.binding, ExpectedReplicaSetVersion: 5,
 		SourceMember: 1, TargetMember: 2,
 		ToOwnershipEpoch:  fixture.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  fixture.binding.RoutingVersion + 1,
@@ -372,7 +376,7 @@ func newRetainedPruneFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(4), ownership); err != nil {
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(6), ownership); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok, err = capture.NextTailEntry(cursor, &captureWorkspace)
@@ -422,8 +426,9 @@ func retainedPruneCommand(
 		ProtectionEpoch:        binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("split-controller"),
-		ClientID: sourceCaptureID(30), ClientEpoch: 1, ClientSequence: sequence,
-		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
+		ClientID: sourceCaptureID(30), ClientEpoch: fixture.retainedPruneEpoch,
+		ClientSequence: sequence,
+		Fingerprint:    fingerprint, Collection: "docs", Mutations: mutations,
 	})
 	if err != nil {
 		t.Fatal(err)
