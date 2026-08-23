@@ -216,6 +216,12 @@ type Collection struct {
 	readEpochs    *storeio.ReadEpochs
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
+
+	// snapshotFullScanCalls counts calls at every public complete-collection scan
+	// entry point. The historical field name is retained inside the collection so
+	// this instrumentation remains an isolated, mechanically small qualification
+	// aid. Point reads and mutation routing never touch it.
+	snapshotFullScanCalls atomic.Uint64
 	// journal is the bounded redo log paired eagerly with DurabilitySync and
 	// explicit RecoveryJournal stores, and lazily on the first valid ordinary
 	// buffered-visible mutation. It is owned by the serialized writer exactly like
@@ -569,16 +575,24 @@ type Stats struct {
 	CommitCapacityBytes uint64
 	PinnedPages         uint64
 	DirtyBytes          uint64
-	PageReads           uint64
-	ReadBytes           uint64
-	CacheHits           uint64
-	CacheMisses         uint64
-	CoalescedReads      uint64
-	ReadErrors          uint64
-	PrefetchHits        uint64
-	Evictions           uint64
-	PrefetchQueued      uint64
-	PrefetchDropped     uint64
+
+	// SnapshotFullScanCalls counts valid calls to the complete-collection
+	// Snapshot.RangeRaw*, Collection.RangeRawCurrent* entry points since this
+	// collection was opened. It advances once at public entry, before cursor
+	// construction or callback delivery, so a stopped or failed full scan remains
+	// observable. Point reads do not change it.
+	SnapshotFullScanCalls uint64
+
+	PageReads       uint64
+	ReadBytes       uint64
+	CacheHits       uint64
+	CacheMisses     uint64
+	CoalescedReads  uint64
+	ReadErrors      uint64
+	PrefetchHits    uint64
+	Evictions       uint64
+	PrefetchQueued  uint64
+	PrefetchDropped uint64
 	// PrefetchQueueDepth samples references waiting for either read engine.
 	PrefetchQueueDepth uint64
 	// ReadQueueDepth is the configured native submission bound.

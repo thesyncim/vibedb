@@ -831,6 +831,7 @@ func (c *Collection) Stats() Stats {
 		CommitCapacityBytes:    c.committer.StagingCapacityBytes(),
 		PinnedPages:            cache.PinnedPages,
 		DirtyBytes:             cache.DirtyBytes + overlay.logicalDirtyBytes,
+		SnapshotFullScanCalls:  c.snapshotFullScanCalls.Load(),
 		PageReads:              cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
 		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,

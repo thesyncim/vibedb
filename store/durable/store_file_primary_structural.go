@@ -136,8 +136,22 @@ func (c *Collection) flushPendingForStructural() error {
 func (c *Collection) enumerateTabletLeaves(
 	tablet *storeio.GlobalTabletCatalogTabletRootView,
 ) ([]structuralLeaf, error) {
-	leaves := make([]structuralLeaf, 0, 256)
-	for anchorRank := 0; anchorRank < tablet.AnchorCount(); anchorRank++ {
+	anchorCount := tablet.AnchorCount()
+	// One allocation owns the leaf descriptors and one normally owns every
+	// flattened fence. Anchor images are prefix-compressed, so adversarial long
+	// shared prefixes can outgrow this initial arena; append then grows it
+	// geometrically rather than allocating one object per leaf. Each fence slice
+	// remains owned even if a later growth moves the current arena, which is
+	// load-bearing because this structural transaction retires the source pages.
+	leaves := make(
+		[]structuralLeaf, 0,
+		anchorCount*storeio.SegmentedTabletRouterRowsPerPage,
+	)
+	fenceArena := make(
+		[]byte, 0,
+		anchorCount*storeio.SegmentedTabletRouterAnchorPageBytes,
+	)
+	for anchorRank := 0; anchorRank < anchorCount; anchorRank++ {
 		route, ok := tablet.AnchorAt(anchorRank)
 		if !ok {
 			return nil, storeio.ErrGlobalTabletCatalogCorrupt
@@ -152,7 +166,9 @@ func (c *Collection) enumerateTabletLeaves(
 		count := anchor.Count()
 		for rank := 0; rank < count; rank++ {
 			r, rok := anchor.RouteAt(rank, 0)
-			fence, fok := anchor.FenceAt(rank)
+			fenceAt := len(fenceArena)
+			var fok bool
+			fenceArena, fok = anchor.AppendFenceAt(fenceArena, rank)
 			_, localID, lok := storeio.SplitTabletLocalIdentityBucket(
 				uint32(r.Bucket),
 			)
@@ -162,7 +178,7 @@ func (c *Collection) enumerateTabletLeaves(
 			}
 			leaves = append(leaves, structuralLeaf{
 				bucket: r.Bucket, localID: uint16(localID), pageID: r.PageID,
-				fence: fence, ref: r.Ref, zone: r.Zone,
+				fence: fenceArena[fenceAt:], ref: r.Ref, zone: r.Zone,
 			})
 		}
 		lease.Release()

@@ -1582,23 +1582,33 @@ func (v *GlobalTabletCatalogAnchorView) RouteAt(
 	return v.page.routeAt(rank, hash), true
 }
 
-// FenceAt returns a freshly allocated copy of the lexical fence at rank in flat
-// form. Rank 0 of the first anchor page is the empty tablet floor. It is the
-// enumeration counterpart to RouteAt: a structural split/merge transaction
-// rebuilds a tablet from its current leaf set, pairing each RouteAt handle with
-// its fence to feed EncodeSegmentedTabletRouter. The copy is owned by the
-// caller because the source anchor page is retired in the same transaction.
-func (v *GlobalTabletCatalogAnchorView) FenceAt(rank int) ([]byte, bool) {
+// AppendFenceAt appends the lexical fence at rank to dst in flat form. Rank 0
+// of the first anchor page is the empty tablet floor. It is the enumeration
+// counterpart to RouteAt: a structural split/merge transaction rebuilds a
+// tablet from its current leaf set, pairing each RouteAt handle with its fence
+// to feed EncodeSegmentedTabletRouter. The appended bytes are owned by the
+// caller because the source anchor page can retire in the same transaction.
+// Supplying sufficient spare capacity makes the operation allocation-free.
+func (v *GlobalTabletCatalogAnchorView) AppendFenceAt(
+	dst []byte, rank int,
+) ([]byte, bool) {
 	if v == nil {
-		return nil, false
+		return dst, false
 	}
 	fence, ok := v.page.fenceAtChecked(rank)
 	if !ok {
-		return nil, false
+		return dst, false
 	}
-	out := make([]byte, fence.length())
-	fence.copyTo(out, 0)
-	return out, true
+	start := len(dst)
+	dst = append(dst, make([]byte, fence.length())...)
+	fence.copyTo(dst[start:], 0)
+	return dst, true
+}
+
+// FenceAt returns a freshly allocated owned copy. Structural callers that
+// enumerate more than one row should use AppendFenceAt with a shared arena.
+func (v *GlobalTabletCatalogAnchorView) FenceAt(rank int) ([]byte, bool) {
+	return v.AppendFenceAt(nil, rank)
 }
 
 // ResolveBucket is the posting path. It verifies tablet identity, live locator
