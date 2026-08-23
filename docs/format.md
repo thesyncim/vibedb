@@ -166,9 +166,10 @@ Do not add a compatibility reader unless the project adopts a released format
 and an explicit migration policy.
 
 The replicated session header and slot grammar follows the same format-0 rule.
-Lease-enabled headers consume reserved bytes for an absolute deadline and bump
-their private codec sentinel; pre-lease session images fail closed rather than
-opening with an invented deadline.
+Lease-enabled headers replace reserved bytes in place with an absolute deadline
+and mandatory lease marker. The single current codec sentinel remains `1`;
+pre-lease development images fail closed rather than opening with an invented
+deadline.
 
 ## Implementation references
 

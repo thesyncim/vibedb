@@ -150,7 +150,7 @@ func TestRawCodecLengthFieldsCannotOverflowInt(t *testing.T) {
 
 	session := make([]byte, sessionRecordHeaderBytes+1+recordChecksumLen)
 	copy(session[:8], sessionRecordMagic[:])
-	binary.LittleEndian.PutUint16(session[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(session[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(session[10:12], sessionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(session[12:16], uint32(len(session)))
 	binary.LittleEndian.PutUint32(session[16:20], math.MaxUint32)

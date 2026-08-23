@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	sessionRecordCodecFormat = uint16(2)
-	sessionRecordHeaderBytes = 128
-	sessionSlotHeaderBytes   = 192
+	// Session records are still part of the single unreleased format-0 image.
+	// This is a corruption sentinel, not a compatibility-version ladder.
+	sessionRecordCodecSentinel = uint16(1)
+	sessionLeaseMarker         = uint8(1)
+	sessionRecordHeaderBytes   = 128
+	sessionSlotHeaderBytes     = 192
 
 	MaxSessionRecordBytes = sessionRecordHeaderBytes +
 		replication.MaxIdentityBytes + recordChecksumLen
@@ -152,7 +155,7 @@ func AppendSessionRecord(dst []byte, record SessionRecord) ([]byte, error) {
 	digest := SessionKey(record.Tenant, record.ClientID)
 
 	copy(frame[0:8], sessionRecordMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(frame[10:12], sessionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(len(record.Tenant)))
@@ -167,6 +170,7 @@ func AppendSessionRecord(dst []byte, record SessionRecord) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[96:104], record.HighSequence)
 	copy(frame[104:112], record.RetryHome[:])
 	binary.LittleEndian.PutUint64(frame[112:120], uint64(record.LeaseDeadlineUnixNano))
+	frame[120] = sessionLeaseMarker
 	copy(frame[sessionRecordHeaderBytes:], record.Tenant)
 	sealRecord(frame, sessionRecordChecksumDomain)
 	return dst, nil
@@ -180,10 +184,11 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 		return SessionView{}, fmt.Errorf("%w: session length", ErrSessionCorrupt)
 	}
 	if !bytes.Equal(src[0:8], sessionRecordMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecFormat ||
+		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionRecordHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		src[21] != 0 || !allZero(src[28:32]) || !allZero(src[120:sessionRecordHeaderBytes]) ||
+		src[21] != 0 || !allZero(src[28:32]) || src[120] != sessionLeaseMarker ||
+		!allZero(src[121:sessionRecordHeaderBytes]) ||
 		!verifySessionChecksum(src, sessionRecordChecksumDomain) {
 		return SessionView{}, fmt.Errorf("%w: session envelope", ErrSessionCorrupt)
 	}
@@ -317,7 +322,7 @@ func AppendSessionSlot(dst []byte, slot SessionSlot) ([]byte, error) {
 	frame := dst[start:]
 
 	copy(frame[0:8], sessionSlotMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(frame[10:12], sessionSlotHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint16(frame[16:18], slot.Slot)
@@ -344,7 +349,7 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 		return SessionSlotView{}, fmt.Errorf("%w: session slot length", ErrSessionCorrupt)
 	}
 	if !bytes.Equal(src[0:8], sessionSlotMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecFormat ||
+		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionSlotHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
 		!allZero(src[18:20]) || !allZero(src[184:sessionSlotHeaderBytes]) ||

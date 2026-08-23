@@ -556,26 +556,15 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup recovered revoke lease: %v", err)
 	}
-	switch {
-	case lease.HighSequence == 1 && lease.Status == SessionActive &&
-		lease.LeaseDeadlineUnixNano == testSessionLeaseDeadlineUnixNano &&
-		lease.TerminalResult == 0:
-		if capture.collection.Len() != 0 {
-			t.Fatalf("all-old revoke retained %d capture rows", capture.collection.Len())
-		}
-		if _, err := store.machine.LookupCompletion(revokeBytes); !errors.Is(err, ErrCompletionNotFound) {
-			t.Fatalf("all-old revoke lookup = %v, want ErrCompletionNotFound", err)
-		}
-	case lease.HighSequence == 2 && lease.AckThrough == 1 &&
-		lease.Status == SessionRetired && lease.LeaseDeadlineUnixNano == 0 &&
-		lease.TerminalResult == ResultSessionRevoked:
-		if capture.collection.Len() != 1 {
-			t.Fatalf("all-new revoke retained %d capture rows, want 1", capture.collection.Len())
-		}
-		requireSessionResult(t, store.machine, revokeBytes, ResultSessionRevoked)
-	default:
-		t.Fatalf("recovered torn revoke state = %+v", lease)
+	if lease.HighSequence != 2 || lease.AckThrough != 1 ||
+		lease.Status != SessionRetired || lease.LeaseDeadlineUnixNano != 0 ||
+		lease.TerminalResult != ResultSessionRevoked {
+		t.Fatalf("recovered revoke did not roll forward = %+v", lease)
 	}
+	if capture.collection.Len() != 1 {
+		t.Fatalf("rolled-forward revoke retained %d capture rows, want 1", capture.collection.Len())
+	}
+	requireSessionResult(t, store.machine, revokeBytes, ResultSessionRevoked)
 }
 
 func reopenSessionLeaseStoreAfterUnknownOutcome(

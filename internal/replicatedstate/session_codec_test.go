@@ -211,11 +211,17 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	if _, err := OpenSessionRecord(badChecksum); !errors.Is(err, ErrSessionCorrupt) {
 		t.Fatalf("checksum error = %v", err)
 	}
-	oldFormat := bytes.Clone(encoded)
-	binary.LittleEndian.PutUint16(oldFormat[8:10], sessionRecordCodecFormat-1)
-	sealRecord(oldFormat, sessionRecordChecksumDomain)
-	if _, err := OpenSessionRecord(oldFormat); !errors.Is(err, ErrSessionCorrupt) {
-		t.Fatalf("obsolete session format error = %v, want ErrSessionCorrupt", err)
+	wrongSentinel := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint16(wrongSentinel[8:10], 0)
+	sealRecord(wrongSentinel, sessionRecordChecksumDomain)
+	if _, err := OpenSessionRecord(wrongSentinel); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("wrong session sentinel error = %v, want ErrSessionCorrupt", err)
+	}
+	preLease := bytes.Clone(encoded)
+	preLease[120] = 0
+	sealRecord(preLease, sessionRecordChecksumDomain)
+	if _, err := OpenSessionRecord(preLease); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("missing lease marker error = %v, want ErrSessionCorrupt", err)
 	}
 
 	for name, mutate := range map[string]func([]byte){
@@ -236,6 +242,9 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 		},
 		"zero-active-deadline": func(candidate []byte) {
 			clear(candidate[112:120])
+		},
+		"lease-marker": func(candidate []byte) {
+			candidate[120] = 2
 		},
 		"window": func(candidate []byte) {
 			binary.LittleEndian.PutUint16(candidate[22:24], MaxSessionRetryWindow+1)
