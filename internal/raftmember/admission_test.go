@@ -252,13 +252,15 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"capacity"`), orderedkey.Ascending)
 	document := []byte(`{"id":"capacity"}`)
-	command := testApplyCommand(base, 1, key, document)
-	meta := raftmodel.ApplyMeta{Index: 2, Term: 2, Type: pb.EntryNormal}
+	open, epoch := applyTestSessionOpen(t, claim, base, 2)
+	command := testApplyCommand(base, epoch, 2, key, document)
+	meta := raftmodel.ApplyMeta{Index: 3, Term: 2, Type: pb.EntryNormal}
 	if _, err := claim.ApplyNormal(meta, command); err != nil {
 		t.Fatal(err)
 	}
 	profile, err := claim.CapacityQualificationProfile()
-	if err != nil || !profile.Initialized || profile.Applied != 2 || profile.CompletionCount != 1 {
+	if err != nil || !profile.Initialized || profile.Applied != 3 ||
+		profile.CompletionCount != 1 || profile.SessionEpochHighWater != epoch {
 		t.Fatalf("applied capacity profile = %+v, %v", profile, err)
 	}
 	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); !errors.Is(
@@ -271,14 +273,15 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index, term, entryType := uint64(2), uint64(2), pb.EntryNormal
+	openIndex, index, term, entryType := uint64(2), uint64(3), uint64(2), pb.EntryNormal
 	if err := wal.Persist(raftmodel.PersistBatch{
 		NodeIncarnation: incarnation,
 		ReadyID:         1,
 		HardState:       &pb.HardState{Term: &term, Commit: &index},
-		Entries: []*pb.Entry{{
-			Term: &term, Index: &index, Type: &entryType, Data: command,
-		}},
+		Entries: []*pb.Entry{
+			{Term: &term, Index: &openIndex, Type: &entryType, Data: open},
+			{Term: &term, Index: &index, Type: &entryType, Data: command},
+		},
 		MustSync: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -286,15 +289,15 @@ func TestValidateStaticNoGCCompletionCapacityChecksActualCut(t *testing.T) {
 	if err := ValidateStaticNoGCCompletionCapacity(wal, claim); err != nil {
 		t.Fatalf("matched applied/WAL cut qualification: %v", err)
 	}
-	thirdIndex, fourthIndex := uint64(3), uint64(4)
-	thirdTerm, thirdCommit := uint64(3), uint64(3)
+	fourthIndex, fifthIndex := uint64(4), uint64(5)
+	fourthTerm, fourthCommit := uint64(3), uint64(4)
 	if err := wal.Persist(raftmodel.PersistBatch{
 		NodeIncarnation: incarnation,
 		ReadyID:         2,
-		HardState:       &pb.HardState{Term: &thirdTerm, Commit: &thirdCommit},
+		HardState:       &pb.HardState{Term: &fourthTerm, Commit: &fourthCommit},
 		Entries: []*pb.Entry{
-			{Term: &thirdTerm, Index: &thirdIndex, Type: &entryType},
-			{Term: &thirdTerm, Index: &fourthIndex, Type: &entryType},
+			{Term: &fourthTerm, Index: &fourthIndex, Type: &entryType},
+			{Term: &fourthTerm, Index: &fifthIndex, Type: &entryType},
 		},
 		MustSync: true,
 	}); err != nil {
@@ -397,9 +400,10 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	}
 	keyBytes, _ := orderedkey.AppendJSONString(nil, []byte(`"restart"`), orderedkey.Ascending)
 	document := []byte(`{"id":"restart"}`)
-	command := testApplyCommand(base, 1, keyBytes, document)
+	open, epoch := applyTestSessionOpen(t, claim, base, 2)
+	command := testApplyCommand(base, epoch, 2, keyBytes, document)
 	if _, err := claim.ApplyNormal(raftmodel.ApplyMeta{
-		Index: 2, Term: 2, Type: pb.EntryNormal,
+		Index: 3, Term: 2, Type: pb.EntryNormal,
 	}, command); err != nil {
 		t.Fatal(err)
 	}
@@ -407,13 +411,14 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index, term, entryType := uint64(2), uint64(2), pb.EntryNormal
+	openIndex, index, term, entryType := uint64(2), uint64(3), uint64(2), pb.EntryNormal
 	if err := wal.Persist(raftmodel.PersistBatch{
 		NodeIncarnation: incarnation, ReadyID: 1,
 		HardState: &pb.HardState{Term: &term, Commit: &index},
-		Entries: []*pb.Entry{{
-			Term: &term, Index: &index, Type: &entryType, Data: command,
-		}}, MustSync: true,
+		Entries: []*pb.Entry{
+			{Term: &term, Index: &openIndex, Type: &entryType, Data: open},
+			{Term: &term, Index: &index, Type: &entryType, Data: command},
+		}, MustSync: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +454,8 @@ func TestStaticNoGCCompletionCapacityRequalifiesAfterRestart(t *testing.T) {
 		_ = reopenedDB.Close()
 	}()
 	profile, err := reopenedClaim.CapacityQualificationProfile()
-	if err != nil || profile.Applied != 2 || profile.CompletionCount != 1 || !profile.Initialized {
+	if err != nil || profile.Applied != 3 || profile.CompletionCount != 1 ||
+		profile.SessionEpochHighWater != epoch || !profile.Initialized {
 		t.Fatalf("reopened capacity profile = %+v, %v", profile, err)
 	}
 	if err := ValidateStaticNoGCCompletionCapacity(reopenedWAL, reopenedClaim); err != nil {

@@ -35,12 +35,14 @@ func TestImmutableBaseApplyCapacityBoundary(t *testing.T) {
 		{name: "nontrivial unapplied suffix", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.Applied, result.SessionCount, result.SessionSlotCount = 3, 1, 2
+			result.SessionEpochHighWater = 2
 			return result
 		}(), commit: 4, last: 5},
 		{name: "full retry rings do not consume suffix capacity", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.MaxSessions, result.RetryWindow = 2, 2
 			result.Applied, result.SessionCount, result.SessionSlotCount = 5, 2, 4
+			result.SessionEpochHighWater = 4
 			return result
 		}(), commit: 6, last: 8193},
 		{name: "maximum arithmetic", profile: raftstore.CapacityProfile{
@@ -100,11 +102,18 @@ func TestImmutableBaseApplyCapacityBoundary(t *testing.T) {
 		{name: "session count ahead of apply", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.Applied, result.SessionCount = 2, 2
+			result.SessionEpochHighWater = 1
 			return result
 		}(), commit: 2, last: 2, wantError: true},
 		{name: "slot count ahead of apply", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.Applied, result.SessionCount, result.SessionSlotCount = 2, 1, 2
+			result.SessionEpochHighWater = 1
+			return result
+		}(), commit: 2, last: 2, wantError: true},
+		{name: "session epoch high-water ahead of apply", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
+			result := baseApply
+			result.Applied, result.SessionEpochHighWater = 2, 3
 			return result
 		}(), commit: 2, last: 2, wantError: true},
 		{name: "apply ahead of commit", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
@@ -116,12 +125,14 @@ func TestImmutableBaseApplyCapacityBoundary(t *testing.T) {
 		{name: "session capacity exceeded", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.MaxSessions, result.Applied, result.SessionCount = 1, 3, 2
+			result.SessionEpochHighWater = 2
 			return result
 		}(), commit: 3, last: 3, wantError: true},
 		{name: "retry ring capacity exceeded", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
 			result.RetryWindow = 2
 			result.Applied, result.SessionCount, result.SessionSlotCount = 4, 1, 3
+			result.SessionEpochHighWater = 2
 			return result
 		}(), commit: 4, last: 4, wantError: true},
 		{name: "last exceeds sealed suffix", profile: base, apply: baseApply,
@@ -147,13 +158,14 @@ func TestImmutableBaseApplyCapacityAdvancedBase(t *testing.T) {
 		Format: raftstore.CapacityFormatImmutableBase, LogBaseIndex: 100, MaxEntries: 4096,
 	}
 	apply := sqldriver.ReplicatedApplyCapacityProfile{
-		ApplyFormat:      sqldriver.ReplicatedApplyFormat,
-		MaxSessions:      128,
-		RetryWindow:      8,
-		Initialized:      true,
-		Applied:          100,
-		SessionCount:     12,
-		SessionSlotCount: 64,
+		ApplyFormat:           sqldriver.ReplicatedApplyFormat,
+		MaxSessions:           128,
+		RetryWindow:           8,
+		Initialized:           true,
+		Applied:               100,
+		SessionCount:          12,
+		SessionSlotCount:      64,
+		SessionEpochHighWater: 100,
 	}
 	if err := validateImmutableBaseApplyCapacity(profile, apply, 100, 100); err != nil {
 		t.Fatalf("exact newer-base capacity: %v", err)

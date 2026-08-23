@@ -112,6 +112,31 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 	t.Fatal("Runtime Ready drain did not converge")
 }
 
+func openRuntimeTestSession(
+	t testing.TB,
+	runtime *Runtime,
+	apply *sqldriver.ReplicatedApply,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) uint64 {
+	t.Helper()
+	command := testApplySessionOpen(base)
+	if err := runtime.Propose(command); err != nil {
+		t.Fatalf("propose session open: %v", err)
+	}
+	drainRuntime(t, runtime, nil)
+	lookup, err := apply.LookupCompletion(command)
+	if err != nil {
+		t.Fatalf("lookup session open: %v", err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened ||
+		completion.ClientEpoch == 0 || completion.ClientSequence != 1 ||
+		completion.AppliedSequence != completion.ClientEpoch {
+		t.Fatalf("runtime session-open completion = %+v, %v", completion, err)
+	}
+	return completion.ClientEpoch
+}
+
 func TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation(t *testing.T) {
 	identity := testWALIdentity(210)
 	_, wal, _, _ := createWAL(t, identity)
@@ -192,8 +217,9 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	}
 	drainRuntime(t, fixture.runtime, nil)
 
+	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"a"`), orderedkey.Ascending)
-	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"a","value":1}`))
+	command := testApplyCommand(fixture.base, epoch, 2, key, []byte(`{"id":"a","value":1}`))
 	if err := fixture.runtime.Propose(command); err != nil {
 		t.Fatal(err)
 	}
@@ -215,8 +241,9 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 		t.Fatal(err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"base"`), orderedkey.Ascending)
-	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"base","value":1}`))
+	command := testApplyCommand(fixture.base, epoch, 2, key, []byte(`{"id":"base","value":1}`))
 	if err := fixture.runtime.Propose(command); err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +330,7 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 	}
 	drainRuntime(t, restarted, nil)
 	key, _ = orderedkey.AppendJSONString(nil, []byte(`"tail"`), orderedkey.Ascending)
-	tail := testApplyCommand(fixture.base, 2, key, []byte(`{"id":"tail","value":2}`))
+	tail := testApplyCommand(fixture.base, epoch, 3, key, []byte(`{"id":"tail","value":2}`))
 	if err := restarted.Propose(tail); err != nil {
 		t.Fatal(err)
 	}
@@ -480,8 +507,7 @@ func TestRuntimeTerminalWALCapacityFailureLatches(t *testing.T) {
 		string(outcomes[0].Barrier.Context) != "full-wal-read" {
 		t.Fatalf("ReadIndex at sealed WAL outcomes = %+v", outcomes)
 	}
-	key, _ := orderedkey.AppendJSONString(nil, []byte(`"full"`), orderedkey.Ascending)
-	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"full"}`))
+	command := testApplySessionOpen(fixture.base)
 	if err := fixture.runtime.Tick(); !errors.Is(err, raftstore.ErrFull) ||
 		!errors.Is(err, ErrRuntimeFailed) {
 		t.Fatalf("Tick at sealed WAL limit = %v", err)
@@ -501,8 +527,7 @@ func TestRuntimePoisonedApplyAdmissionLatches(t *testing.T) {
 	if failure := fixture.runtime.Failure(); failure != nil {
 		t.Fatalf("ordinary proposal refusal faulted Runtime: %v", failure)
 	}
-	key, _ := orderedkey.AppendJSONString(nil, []byte(`"poison"`), orderedkey.Ascending)
-	command := testApplyCommand(fixture.base, 1, key, []byte(`{"id":"poison"}`))
+	command := testApplySessionOpen(fixture.base)
 	if _, err := fixture.apply.ApplyNormal(raftmodel.ApplyMeta{
 		Index: 1, Term: 1, Type: pb.EntryNormal,
 	}, command); err == nil {

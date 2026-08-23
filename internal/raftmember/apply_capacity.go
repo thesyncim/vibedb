@@ -106,11 +106,14 @@ func validateImmutableBaseApplyCapacity(
 	base := profile.LogBaseIndex
 	if !apply.Initialized || apply.Applied < base || commit < base || last < base ||
 		apply.SessionCount > apply.Applied-1 || apply.SessionSlotCount > apply.Applied-1 ||
+		apply.SessionEpochHighWater > apply.Applied ||
+		apply.SessionCount != 0 && apply.SessionEpochHighWater == 0 ||
 		apply.Applied > commit || commit > last {
 		return fmt.Errorf(
-			"%w: invalid apply/WAL cut initialized=%t sessions=%d slots=%d A=%d commit=%d L=%d",
+			"%w: invalid apply/WAL cut initialized=%t sessions=%d slots=%d epoch-high=%d A=%d commit=%d L=%d",
 			ErrApplyCapacity, apply.Initialized, apply.SessionCount,
-			apply.SessionSlotCount, apply.Applied, commit, last,
+			apply.SessionSlotCount, apply.SessionEpochHighWater,
+			apply.Applied, commit, last,
 		)
 	}
 	if apply.SessionCount > apply.MaxSessions ||
