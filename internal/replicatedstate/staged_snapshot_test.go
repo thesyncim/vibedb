@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -12,6 +13,48 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestImportedSnapshotRequiresExactSessionEpochFence(t *testing.T) {
+	dir := t.TempDir()
+	system := createTargetAt(t, dir, "system", durable.Options{})
+	user := createTargetAt(t, dir, "user-fence", durable.Options{})
+	if _, err := user.Collection.Put([]byte("a"), []byte(`{"n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	txnLog, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = txnLog.Close() })
+	binding := testBinding()
+	bootstrap := testBootstrap()
+	options := machineOptionsFor(user)
+	cut := StagedSnapshotCut{
+		Applied: 7, Term: 3,
+		EntryDigest: sha256.Sum256([]byte("session-fenced-import")),
+	}
+	if _, _, _, err := InitializeStagedSnapshot(
+		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
+		txnLog, options, cut, SnapshotArtifactOptions{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	raw, found, err := system.Collection.AppendRaw(nil, stateKey)
+	if err != nil || !found {
+		t.Fatalf("read imported state = %v, %v", found, err)
+	}
+	binary.LittleEndian.PutUint64(raw[360:368], cut.Applied-1)
+	sealRecord(raw, stateChecksumDomain)
+	if _, err := system.Collection.Put(stateKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(
+		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
+		txnLog, options,
+	); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("reopen imported state below certified fence = %v, want ErrStateCorrupt", err)
+	}
+}
 
 func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	dir := t.TempDir()
@@ -83,11 +126,35 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	if err != nil || !found || !bytes.Equal(afterA, beforeA) {
 		t.Fatalf("row after install=%q found=%v err=%v", afterA, found, err)
 	}
-	command := testCommand(binding, 1, replication.Mutation{
-		Kind: replication.MutationPut, Key: []byte("c"), Value: []byte(`{"n":3}`),
-	})
-	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
+	open := commandValue(binding, 1)
+	openCommand := sessionOpenFor(open)
+	encodedOpen := encodeCommand(t, openCommand)
+	if err := machine.AdmitCommand(encodedOpen); err != nil {
+		t.Fatalf("admit imported session open: %v", err)
+	}
+	if publication, err := machine.ApplyNormal(raftmodel.ApplyMeta{
 		Index: 8, Term: 3, Type: pb.EntryNormal,
+	}, encodedOpen); err != nil || publication.Applied != 8 {
+		t.Fatalf("apply imported session open = %+v, %v", publication, err)
+	}
+	lookup, err := machine.LookupCompletion(encodedOpen)
+	if err != nil {
+		t.Fatalf("lookup imported session open: %v", err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != ResultSessionOpened ||
+		completion.ClientEpoch != 8 || completion.AppliedSequence != 8 {
+		t.Fatalf("imported session open completion = %+v, %v", completion, err)
+	}
+	epoch := completion.ClientEpoch
+	userCommand := commandValue(binding, 1)
+	userCommand.ClientEpoch = epoch
+	userCommand.Mutations = []replication.Mutation{{
+		Kind: replication.MutationPut, Key: []byte("c"), Value: []byte(`{"n":3}`),
+	}}
+	command := encodeCommand(t, userCommand)
+	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
+		Index: 9, Term: 3, Type: pb.EntryNormal,
 	}, command); err != nil {
 		t.Fatal(err)
 	}

@@ -69,16 +69,36 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 	driveReplicatedStateNode(t, node)
-	command := testCommand(fixture.binding, 1, replication.Mutation{
+	prototype := commandValue(fixture.binding, 1)
+	open := encodeCommand(t, sessionOpenFor(prototype))
+	if err := node.Propose(open); err != nil {
+		t.Fatal(err)
+	}
+	driveReplicatedStateNode(t, node)
+	openLookup, err := machine.LookupCompletion(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openCompletion, err := replication.OpenCompletion(openLookup.Bytes)
+	if err != nil || openCompletion.ResultCode != ResultSessionOpened ||
+		openCompletion.ClientEpoch != openLookup.AppliedSequence ||
+		machine.state.SessionEpochHighWater != openCompletion.ClientEpoch {
+		t.Fatalf("node session open = %+v lookup=%+v state=%+v err=%v",
+			openCompletion, openLookup, machine.state, err)
+	}
+	prototype.ClientEpoch = openCompletion.ClientEpoch
+	prototype.Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`),
-	})
+	}}
+	command := encodeCommand(t, prototype)
 	if err := node.Propose(command); err != nil {
 		t.Fatal(err)
 	}
 	driveReplicatedStateNode(t, node)
 	before := machine.Published()
-	if before.Applied <= 1 || machine.state.SessionCount != 1 ||
-		machine.state.SessionSlotCount != 1 {
+	if before.Applied != openCompletion.ClientEpoch+1 || machine.state.SessionCount != 1 ||
+		machine.state.SessionSlotCount != 2 ||
+		machine.state.SessionEpochHighWater != openCompletion.ClientEpoch {
 		t.Fatalf("publication before restart=%+v state=%+v", before, machine.state)
 	}
 	first, err := machine.LookupCompletion(command)
@@ -100,7 +120,8 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 	driveReplicatedStateNode(t, restarted)
 	after := reopened.Published()
 	if after.Applied != before.Applied || after.DataChainDigest != before.DataChainDigest ||
-		reopened.state.SessionCount != 1 || reopened.state.SessionSlotCount != 1 {
+		reopened.state.SessionCount != 1 || reopened.state.SessionSlotCount != 2 ||
+		reopened.state.SessionEpochHighWater != openCompletion.ClientEpoch {
 		t.Fatalf("restart replayed publication: before=%+v after=%+v state=%+v", before, after, reopened.state)
 	}
 	second, err := reopened.LookupCompletion(command)

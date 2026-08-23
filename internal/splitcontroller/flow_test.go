@@ -35,7 +35,10 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	capture, err := rangesplit.NewSourceCapture(
 		plan.partitioner, "controller-flow-capture", source.capture,
 	)
-	if err != nil || source.machine.BeginTransitionCapture(capture) != nil {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.machine.BeginTransitionCapture(capture); err != nil {
 		t.Fatal(err)
 	}
 	observed.Capture = capture
@@ -176,10 +179,23 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		},
 		ApplyProfile: sqldriver.ReplicatedApplyCapacityProfile{
 			Binding: target.SQL.Binding, Initialized: true,
-			Applied: certificate.SourceCut().Applied, MaxSessions: 8, RetryWindow: 8,
+			Applied:               certificate.SourceCut().Applied,
+			SessionEpochHighWater: certificate.SourceCut().Applied,
+			MaxSessions:           8, RetryWindow: 8,
 		},
 	}
 	observed.Children[1] = child
+	for _, sessionFence := range []uint64{0, certificate.SourceCut().Applied - 1} {
+		child.ApplyProfile.SessionEpochHighWater = sessionFence
+		if action, reconcileErr := Reconcile(plan, observed); action != (Action{}) ||
+			!errors.Is(reconcileErr, ErrTopologyConflict) {
+			t.Fatalf(
+				"activation with session fence %d action=%+v err=%v",
+				sessionFence, action, reconcileErr,
+			)
+		}
+	}
+	child.ApplyProfile.SessionEpochHighWater = certificate.SourceCut().Applied
 	assertFlowAction(t, plan, observed, ActionCreateChildWAL)
 	child.Phase = ChildPhaseWALCreated
 	child.WALBinding = target.SQL.Binding
@@ -345,8 +361,9 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		replicatedstate.UserCollection{Name: "docs", Target: user}, log,
 		replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 3, MaxDocuments: user.Limits.MaxDistinctMutations + 4,
-				MaxBytes: 64 << 20,
+				MaxCollections: 3,
+				MaxDocuments:   max(user.Limits.MaxDistinctMutations+4, 8+3),
+				MaxBytes:       64 << 20,
 			},
 			MaxSessions: 128,
 			RetryWindow: 8,

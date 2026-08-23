@@ -84,6 +84,10 @@ func InitializeStagedSnapshot(
 		ConfState:           cloneConfState(bootstrap.GetMetadata().GetConfState()),
 		ReplicaSetVersion:   1, BootstrapDigest: prepared.bootstrapDigest,
 		SnapshotBaseDigest: prepared.bootstrapDigest,
+		// Split children do not inherit the source session image yet. Fence every
+		// epoch that could have been allocated before this certified source cut,
+		// so a delayed command cannot create a fresh child-local session.
+		SessionEpochHighWater: cut.Applied,
 	}
 	if err := validateState(state); err != nil {
 		_ = cutSnapshot.Close()

@@ -648,6 +648,7 @@ func (p *Plan) childAction(
 			status.ApplyProfile.Binding != target.SQL.Binding ||
 			!status.ApplyProfile.Initialized ||
 			status.ApplyProfile.Applied < certificate.SourceCut().Applied ||
+			status.ApplyProfile.SessionEpochHighWater != certificate.SourceCut().Applied ||
 			status.ApplyProfile.MaxSessions != status.ApplyIdentity.MaxSessions ||
 			status.ApplyProfile.RetryWindow != status.ApplyIdentity.RetryWindow {
 			return Action{}, false, ErrTopologyConflict

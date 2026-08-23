@@ -53,7 +53,7 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "073d8d565e6dfe0dd89b98261d5266762a67a0631c7ed62c33714a88b5c60786"
+	const wantDigest = "1455b8b87530344c39f7ccf0104e287e1f28752c4e1515d01c249ddf8e2717d2"
 	gotDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(gotDigest[:]) != wantDigest {
 		t.Fatalf("state golden digest = %x, want %s", gotDigest, wantDigest)
@@ -76,6 +76,45 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	duplicate.ConfState.Voters = []uint64{1, 1}
 	if _, err := AppendState(nil, duplicate); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("duplicate voter error = %v", err)
+	}
+}
+
+func TestStateSessionEpochHighWaterRoundTripAndBounds(t *testing.T) {
+	state := codecState()
+	state.Applied = 3
+	state.LastTerm = 2
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("normal-entry"))
+	state.SessionEpochHighWater = state.Applied
+
+	encoded, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint64(encoded[360:368]); got != state.SessionEpochHighWater {
+		t.Fatalf("encoded session epoch high-water = %d, want %d", got, state.SessionEpochHighWater)
+	}
+	decoded, err := OpenState(encoded)
+	if err != nil || !equalState(decoded, state) {
+		t.Fatalf("OpenState = %+v,%v", decoded, err)
+	}
+
+	tooHigh := state
+	tooHigh.SessionEpochHighWater = tooHigh.Applied + 1
+	if _, err := AppendState(nil, tooHigh); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("high-water beyond Applied error = %v", err)
+	}
+	corruptHighWater := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint64(corruptHighWater[360:368], state.Applied+1)
+	sealRecord(corruptHighWater, stateChecksumDomain)
+	if _, err := OpenState(corruptHighWater); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("decoded high-water beyond Applied error = %v", err)
+	}
+
+	static := codecState()
+	static.SessionEpochHighWater = 1
+	if _, err := AppendState(nil, static); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("static high-water error = %v", err)
 	}
 }
 
@@ -223,12 +262,13 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 		ResultFormatMutation != 1 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
-		ResultSessionRetired != 7 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d",
+		ResultSessionRetired != 7 || ResultSessionOpened != 8 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownCollection,
-			ResultInvalidDocument, ResultTargetBound, ResultWrongShard, ResultSessionRetired)
+			ResultInvalidDocument, ResultTargetBound, ResultWrongShard,
+			ResultSessionRetired, ResultSessionOpened)
 	}
 	record := sessionCodecRecord()
 	encoded, err := AppendSessionRecord(nil, record)

@@ -599,9 +599,13 @@ func UpdateCollections(
 	batch := &DatabaseBatch{byName: make(map[string]*WriteBatch, len(ordered))}
 	batches := make([]*WriteBatch, len(ordered))
 	for i, member := range ordered {
+		initialDocuments := member.BatchDocumentsHint
+		if initialDocuments == 0 {
+			initialDocuments = member.Collection.options.MaxBatchDocuments
+		}
 		wb := &WriteBatch{
 			collection: member.Collection,
-			position:   make(map[string]int, member.Collection.options.MaxBatchDocuments),
+			position:   make(map[string]int, initialDocuments),
 			active:     true,
 		}
 		batches[i] = wb
@@ -698,6 +702,14 @@ func validateTxnMembers(members []NamedCollection) ([]NamedCollection, error) {
 		if member.Collection == nil {
 			return nil, fmt.Errorf(
 				"%w: nil collection %q", ErrTxnParticipant, member.Name,
+			)
+		}
+		if member.BatchDocumentsHint < 0 ||
+			member.BatchDocumentsHint > member.Collection.options.MaxBatchDocuments {
+			return nil, fmt.Errorf(
+				"%w: collection %q batch hint %d exceeds [0,%d]",
+				ErrTxnParticipant, member.Name, member.BatchDocumentsHint,
+				member.Collection.options.MaxBatchDocuments,
 			)
 		}
 		if previous, exists := seenHandle[member.Collection]; exists {

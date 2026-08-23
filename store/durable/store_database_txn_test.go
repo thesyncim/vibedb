@@ -104,6 +104,44 @@ func putTxnPair(t testing.TB, batch *DatabaseBatch, left, right string) error {
 	return nil
 }
 
+func TestUpdateCollectionsBatchDocumentsHintIsReservationOnly(t *testing.T) {
+	dir := t.TempDir()
+	a := openTxnNamedCollection(t, dir, "a", txnTestOptions())
+	b := openTxnNamedCollection(t, dir, "b", txnTestOptions())
+	log, err := NewTxnLog(dir, TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	a.BatchDocumentsHint, b.BatchDocumentsHint = 1, 1
+	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+		for _, name := range []string{"a", "b"} {
+			member, memberErr := batch.Collection(name)
+			if memberErr != nil {
+				return memberErr
+			}
+			for index := 0; index < 4; index++ {
+				mustTxnPut(t, member, fmt.Sprintf("k%d", index), `{"n":1}`)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("grow beyond reservation hint: %v", err)
+	}
+	if a.Collection.Len() != 4 || b.Collection.Len() != 4 {
+		t.Fatalf("hint truncated publication: a=%d b=%d", a.Collection.Len(), b.Collection.Len())
+	}
+
+	called := false
+	a.BatchDocumentsHint = a.Collection.MaxBatchDocuments() + 1
+	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), func(*DatabaseBatch) error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrTxnParticipant) || called {
+		t.Fatalf("invalid hint = %v, callback=%t", err, called)
+	}
+}
+
 func TestNewTxnLogRejectsExistingMarker(t *testing.T) {
 	dir := t.TempDir()
 	marker, err := storeio.CreateTxnMarker(

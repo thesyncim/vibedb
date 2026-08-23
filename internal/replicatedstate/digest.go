@@ -16,8 +16,10 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"mutation-validation-result-map;bytewise-changed-key-order;" +
 	"ordered-client-session-sequences;cumulative-ack-through;" +
-	"fixed-retry-ring;explicit-session-retirement;terminal-retire-only;" +
-	"terminal-stale-retire-unstored;stable-logical-command-digest"
+	"fixed-retry-ring;explicit-session-open;raft-index-session-epoch;" +
+	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
+	"exact-retired-session-release;terminal-stale-retire-unstored;" +
+	"stable-logical-command-digest"
 
 var (
 	canonicalImageDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
@@ -264,7 +266,7 @@ func applyContractDigest(
 	_, _ = h.Write([]byte{byte(target.Validation)})
 	_, _ = h.Write(target.ValidationDigest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
-	var grammar [2 + 8*4]byte
+	var grammar [2 + 9*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -274,6 +276,7 @@ func applyContractDigest(
 		ResultTargetBound,
 		ResultWrongShard,
 		ResultSessionRetired,
+		ResultSessionOpened,
 		MaxDistinctMutations,
 	} {
 		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)

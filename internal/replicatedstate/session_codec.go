@@ -51,8 +51,9 @@ const (
 // SessionRecord is the compact control record for one stable
 // (tenant, client ID) identity. ClientEpoch is deliberately a value rather than
 // part of the storage key: retaining its high-water prevents an old epoch from
-// becoming new again after retirement. PhysicalSlotCount counts populated ring
-// keys across all epochs and never exceeds RetryWindow.
+// becoming new again after release. PhysicalSlotCount counts populated ring
+// keys in this exact epoch and never exceeds RetryWindow. A new epoch is opened
+// only after release has removed the prior header and every slot.
 type SessionRecord struct {
 	Tenant            []byte
 	ClientID          replication.ID128
@@ -238,7 +239,7 @@ func validateSessionView(view SessionView) error {
 		view.RetryWindow == 0 ||
 		view.RetryWindow > MaxSessionRetryWindow ||
 		view.PhysicalSlotCount == 0 || view.PhysicalSlotCount > view.RetryWindow ||
-		uint64(view.PhysicalSlotCount) < minimumSlots ||
+		uint64(view.PhysicalSlotCount) != minimumSlots ||
 		(view.Status != SessionActive && view.Status != SessionRetired) {
 		return fmt.Errorf("%w: invalid session semantics", ErrSessionCorrupt)
 	}
@@ -388,10 +389,13 @@ func validateSessionSlotView(view SessionSlotView) error {
 		view.ClientSequence == 0 || view.AppliedSequence < 2 ||
 		view.Fingerprint == (replication.Digest{}) ||
 		view.LogicalCommandDigest == ([sha256.Size]byte{}) ||
-		view.ResultCode < ResultApplied || view.ResultCode > ResultSessionRetired ||
+		view.ResultCode < ResultApplied || view.ResultCode > ResultSessionOpened ||
 		view.ReplicaSetVersion == 0 || view.ActivePolicyGeneration == 0 ||
 		view.ProtectionEpoch == 0 || view.RoutingVersion == 0 ||
-		view.RouteGeneration == 0 {
+		view.RouteGeneration == 0 ||
+		(view.ClientSequence == 1) != (view.ResultCode == ResultSessionOpened) ||
+		view.ResultCode == ResultSessionOpened && view.AppliedSequence != view.ClientEpoch ||
+		view.ResultCode != ResultSessionOpened && view.AppliedSequence <= view.ClientEpoch {
 		return fmt.Errorf("%w: invalid session slot semantics", ErrSessionCorrupt)
 	}
 	return nil

@@ -297,6 +297,12 @@ type databaseSnapshotEntry struct {
 type NamedCollection struct {
 	Name       string
 	Collection *Collection
+	// BatchDocumentsHint bounds only the initial dedup-map reservation used by
+	// UpdateCollections. Zero preserves the collection-wide maximum. A precise
+	// hot-path hint avoids reserving a cold maintenance batch (for example a
+	// retry-ring release) on every small transaction; the batch still grows up
+	// to the collection's hard MaxBatchDocuments limit.
+	BatchDocumentsHint int
 }
 
 // SnapshotCollections captures application-owned collections at one instant.

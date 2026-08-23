@@ -60,12 +60,26 @@ func bindReplicatedApplyTestRoot(
 
 func testReplicatedApplyCommand(
 	identity ReplicatedShardStoreIdentity,
+	clientEpoch uint64,
 	sequence uint64,
 	mutations ...replication.Mutation,
 ) []byte {
+	command := testReplicatedApplyCommandValue(identity, clientEpoch, sequence, mutations)
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func testReplicatedApplyCommandValue(
+	identity ReplicatedShardStoreIdentity,
+	clientEpoch, sequence uint64,
+	mutations []replication.Mutation,
+) replication.Command {
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x4a})
 	binding := identity.Binding
-	command, err := replication.AppendCommand(nil, replication.Command{
+	return replication.Command{
 		ClusterID:             replication.ID128(binding.ClusterID),
 		ClusterIncarnation:    replication.ID128(binding.ClusterIncarnation),
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
@@ -81,13 +95,48 @@ func testReplicatedApplyCommand(
 		RoutingVersion:         binding.Authority.RoutingVersion,
 		RouteGeneration:        binding.Authority.RouteGeneration,
 		Tenant:                 []byte("tenant"), ClientID: replication.ID128{9},
-		ClientEpoch: 1, ClientSequence: sequence, Fingerprint: fingerprint,
+		ClientEpoch: clientEpoch, ClientSequence: sequence, Fingerprint: fingerprint,
 		Collection: identity.UserTable, Mutations: mutations,
-	})
+	}
+}
+
+func testReplicatedApplySessionOpen(identity ReplicatedShardStoreIdentity) []byte {
+	command := testReplicatedApplyCommandValue(identity, 0, 1, nil)
+	command.Kind = replication.CommandSessionOpen
+	command.Fingerprint = sha256.Sum256([]byte("driver/test-session-open"))
+	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)
 	}
-	return command
+	return encoded
+}
+
+func applyReplicatedApplySessionOpen(
+	t *testing.T,
+	claim *ReplicatedApply,
+	identity ReplicatedShardStoreIdentity,
+	index uint64,
+) uint64 {
+	t.Helper()
+	command := testReplicatedApplySessionOpen(identity)
+	if err := claim.AdmitCommand(command); err != nil {
+		t.Fatalf("AdmitCommand session open at %d: %v", index, err)
+	}
+	publication, err := claim.ApplyNormal(testReplicatedApplyMeta(index), command)
+	if err != nil || publication.Applied != index {
+		t.Fatalf("ApplyNormal session open at %d = %+v, %v", index, publication, err)
+	}
+	lookup, err := claim.LookupCompletion(command)
+	if err != nil {
+		t.Fatalf("LookupCompletion session open at %d: %v", index, err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened ||
+		completion.ClientEpoch != index || completion.ClientSequence != 1 ||
+		completion.AppliedSequence != index {
+		t.Fatalf("session open completion at %d = %+v, %v", index, completion, err)
+	}
+	return completion.ClientEpoch
 }
 
 func testReplicatedApplyMeta(index uint64) raftmodel.ApplyMeta {
@@ -258,7 +307,6 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	want := ReplicatedApplyCapacityProfile{
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
-		MaxCompletions: options.MaxSessions * uint64(options.RetryWindow),
 	}
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("uninitialized capacity profile = %+v, %v; want %+v", got, err, want)
@@ -273,14 +321,15 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 
 	document := []byte(`{"id":"capacity"}`)
 	key := testReplicatedApplyKey(t, database, document)
-	command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
-	want.Applied, want.SessionCount, want.SessionSlotCount = 2, 1, 1
-	want.CompletionCount = 1
+	want.Applied, want.SessionCount, want.SessionSlotCount = 3, 1, 2
+	want.SessionEpochHighWater = epoch
 	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
 		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
 	}
@@ -326,6 +375,78 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}
 }
 
+func TestReplicatedApplyMaximumRetryWindowCreatesAndReopens(t *testing.T) {
+	path, database, base := bindReplicatedApplyTestRoot(t, "maximum-retry-window")
+	options := testReplicatedApplyOptions()
+	options.RetryWindow = replicatedstate.MaxSessionRetryWindow
+	limits := replicatedApplySystemLimits(options.RetryWindow)
+	options.TxnLimits.MaxDocuments = max(
+		base.UserLimits.MaxBatchDocuments+4,
+		limits.MaxBatchDocuments+1,
+	)
+	if limits.MaxBatchDocuments != int(replicatedstate.MaxSessionRetryWindow)+2 ||
+		limits.MaxBatchBytes < limits.MaxDocumentBytes+limits.MaxBatchDocuments*limits.MaxKeyBytes {
+		t.Fatalf("maximum retry-window system limits = %+v", limits)
+	}
+	if err := validateReplicatedApplyOptions(base, options); err != nil {
+		t.Fatalf("maximum retry-window options: %v", err)
+	}
+	tooSmall := options
+	tooSmall.TxnLimits.MaxDocuments--
+	if err := validateReplicatedApplyOptions(base, tooSmall); !errors.Is(
+		err, ErrReplicatedApplyMismatch,
+	) {
+		t.Fatalf("one-short maximum retry-window transaction profile = %v", err)
+	}
+
+	bootstrap := testReplicatedApplyBootstrap()
+	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil {
+		t.Fatalf("create maximum retry-window apply storage: %v", err)
+	}
+	if identity.SystemLimits != limits {
+		t.Fatalf("created maximum retry-window limits = %+v, want %+v", identity.SystemLimits, limits)
+	}
+	collection := database.connector.db.replicatedApplyCollection
+	if collection.MaxBatchDocuments() != limits.MaxBatchDocuments ||
+		collection.MaxBatchBytes() != limits.MaxBatchBytes {
+		t.Fatalf(
+			"created maximum retry-window collection = docs %d bytes %d, want %+v",
+			collection.MaxBatchDocuments(), collection.MaxBatchBytes(), limits,
+		)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+	profile, err := claim.CapacityQualificationProfile()
+	if err != nil || profile.SessionEpochHighWater != epoch ||
+		profile.SessionCount != 1 || profile.SessionSlotCount != 1 {
+		t.Fatalf("maximum retry-window capacity profile = %+v, %v", profile, err)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, identity)
+	if err != nil {
+		t.Fatalf("validate maximum retry-window storage: %v", err)
+	}
+	reopenedClaim, reopenedIdentity, err := reopened.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil || reopenedIdentity != identity || reopenedClaim.Applied() != 2 {
+		t.Fatalf("reopen maximum retry-window apply = %+v, %+v, %v", reopenedClaim, reopenedIdentity, err)
+	}
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "apply")
 	options := testReplicatedApplyOptions()
@@ -367,14 +488,15 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatalf("InstallSnapshot: %v", err)
 	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 
 	validDocument := []byte(`{"id":"a","n":1}`)
 	validKey := testReplicatedApplyKey(t, database, validDocument)
-	valid := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	valid := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: validKey, Value: validDocument,
 	})
 	beforeClock := core.tables["docs"].conflicts.observe()
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), valid); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), valid); err != nil {
 		t.Fatalf("apply valid PUT: %v", err)
 	}
 	if got := completionResultCode(t, claim, valid); got != replicatedstate.ResultApplied {
@@ -392,11 +514,11 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	}
 
 	wrongKey, _ := orderedkey.AppendJSONString(nil, []byte(`"wrong"`), orderedkey.Ascending)
-	invalid := testReplicatedApplyCommand(base, 2, replication.Mutation{
+	invalid := testReplicatedApplyCommand(base, epoch, 3, replication.Mutation{
 		Kind: replication.MutationPut, Key: wrongKey, Value: []byte(`{"id":"b"}`),
 	})
 	beforeRefusalClock := core.tables["docs"].conflicts.observe()
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), invalid); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(4), invalid); err != nil {
 		t.Fatalf("apply invalid PUT refusal: %v", err)
 	}
 	if after := core.tables["docs"].conflicts.observe(); after != beforeRefusalClock {
@@ -410,19 +532,19 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 		t.Fatalf("invalid PUT durable row found=%v err=%v", found, err)
 	}
 
-	deleteAbsent := testReplicatedApplyCommand(base, 3, replication.Mutation{
+	deleteAbsent := testReplicatedApplyCommand(base, epoch, 4, replication.Mutation{
 		Kind: replication.MutationDelete, Key: wrongKey,
 	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(4), deleteAbsent); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), deleteAbsent); err != nil {
 		t.Fatalf("apply canonical absent DELETE: %v", err)
 	}
 	if got := completionResultCode(t, claim, deleteAbsent); got != replicatedstate.ResultApplied {
 		t.Fatalf("absent DELETE result = %d, want applied", got)
 	}
-	deleteMalformed := testReplicatedApplyCommand(base, 4, replication.Mutation{
+	deleteMalformed := testReplicatedApplyCommand(base, epoch, 5, replication.Mutation{
 		Kind: replication.MutationDelete, Key: []byte("not-an-ordered-key"),
 	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), deleteMalformed); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), deleteMalformed); err != nil {
 		t.Fatalf("apply malformed DELETE refusal: %v", err)
 	}
 	if got := completionResultCode(t, claim, deleteMalformed); got != replicatedstate.ResultInvalidDocument {
@@ -442,11 +564,11 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 			[]byte(`{"id":"` + string(bytes.Repeat([]byte{'x'}, 300)) + `"}`),
 			replicatedstate.ResultTargetBound},
 	}
-	nextIndex := uint64(6)
-	nextSequence := uint64(5)
+	nextIndex := uint64(7)
+	nextSequence := uint64(6)
 	for _, refusal := range semanticRefusals {
 		t.Run(refusal.name, func(t *testing.T) {
-			command := testReplicatedApplyCommand(base, nextSequence, replication.Mutation{
+			command := testReplicatedApplyCommand(base, epoch, nextSequence, replication.Mutation{
 				Kind: replication.MutationPut, Key: refusal.key, Value: refusal.doc,
 			})
 			if _, err := claim.ApplyNormal(testReplicatedApplyMeta(nextIndex), command); err != nil {
@@ -465,7 +587,7 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	// deterministic refusal and cannot mutate the row.
 	lwwDocument := []byte(`{"id":"lww","n":2}`)
 	lwwKey := testReplicatedApplyKey(t, database, lwwDocument)
-	lwwApplied := testReplicatedApplyCommand(base, nextSequence,
+	lwwApplied := testReplicatedApplyCommand(base, epoch, nextSequence,
 		replication.Mutation{Kind: replication.MutationPut, Key: lwwKey, Value: []byte(`{"id":"wrong"}`)},
 		replication.Mutation{Kind: replication.MutationPut, Key: lwwKey, Value: lwwDocument},
 	)
@@ -477,7 +599,7 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	}
 	nextIndex++
 	nextSequence++
-	lwwRefused := testReplicatedApplyCommand(base, nextSequence,
+	lwwRefused := testReplicatedApplyCommand(base, epoch, nextSequence,
 		replication.Mutation{Kind: replication.MutationPut, Key: lwwKey, Value: lwwDocument},
 		replication.Mutation{Kind: replication.MutationPut, Key: lwwKey, Value: []byte(`{"id":"wrong"}`)},
 	)
@@ -489,7 +611,7 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	}
 	nextIndex++
 
-	deletePresent := testReplicatedApplyCommand(base, nextSequence+1, replication.Mutation{
+	deletePresent := testReplicatedApplyCommand(base, epoch, nextSequence+1, replication.Mutation{
 		Kind: replication.MutationDelete, Key: validKey,
 	})
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(nextIndex), deletePresent); err != nil {
@@ -572,6 +694,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 
 	apply := func(index, sequence uint64, probe replicatedPlacementProbe, kind replication.MutationKind) []byte {
 		t.Helper()
@@ -579,20 +702,20 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 		if kind == replication.MutationPut {
 			mutation.Value = probe.document
 		}
-		command := testReplicatedApplyCommand(base, sequence, mutation)
+		command := testReplicatedApplyCommand(base, epoch, sequence, mutation)
 		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(index), command); err != nil {
 			t.Fatalf("ApplyNormal(%s): %v", probe.id, err)
 		}
 		return command
 	}
 
-	insidePut := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	insidePut := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: inside.key, Value: inside.document,
 	})
 	if err := claim.AdmitCommand(insidePut); err != nil {
 		t.Fatalf("admit range start: %v", err)
 	}
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), insidePut); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), insidePut); err != nil {
 		t.Fatal(err)
 	}
 	if code, format := completionResult(t, claim, insidePut); code != replicatedstate.ResultApplied || format != replicatedstate.ResultFormatMutation {
@@ -600,7 +723,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 	}
 
 	for i, probe := range []replicatedPlacementProbe{below, upper} {
-		sequence := uint64(i + 2)
+		sequence := uint64(i + 3)
 		mutations := []replication.Mutation{{
 			Kind: replication.MutationPut, Key: probe.key, Value: probe.document,
 		}}
@@ -611,7 +734,7 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 				Kind: replication.MutationPut, Key: probe.key, Value: []byte(`{"id":"mismatch"}`),
 			}}, mutations...)
 		}
-		command := testReplicatedApplyCommand(base, sequence, mutations...)
+		command := testReplicatedApplyCommand(base, epoch, sequence, mutations...)
 		if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrAdmissionBound) {
 			t.Fatalf("admit wrong-shard %s = %v", probe.id, err)
 		}
@@ -623,20 +746,20 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 		}
 	}
 
-	absentUpper := testReplicatedApplyCommand(base, 4, replication.Mutation{
+	absentUpper := testReplicatedApplyCommand(base, epoch, 5, replication.Mutation{
 		Kind: replication.MutationDelete, Key: upper.key,
 	})
 	if err := claim.AdmitCommand(absentUpper); !errors.Is(err, replicatedstate.ErrAdmissionBound) {
 		t.Fatalf("admit absent wrong-shard DELETE = %v", err)
 	}
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), absentUpper); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), absentUpper); err != nil {
 		t.Fatal(err)
 	}
 	if code, format := completionResult(t, claim, absentUpper); code != replicatedstate.ResultWrongShard || format != replicatedstate.ResultFormatMutation {
 		t.Fatalf("absent wrong-shard DELETE = code %d format %d", code, format)
 	}
 
-	presentInside := apply(6, 5, inside, replication.MutationDelete)
+	presentInside := apply(7, 6, inside, replication.MutationDelete)
 	if code := completionResultCode(t, claim, presentInside); code != replicatedstate.ResultApplied {
 		t.Fatalf("present in-range DELETE = %d", code)
 	}
@@ -953,12 +1076,13 @@ func TestReplicatedApplyActivationPublicationSettlement(t *testing.T) {
 		if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 			t.Fatalf("install bootstrap after definite cleanup: %v", err)
 		}
+		epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 		document := []byte(`{"id":"after-definite-failure","n":1}`)
 		key := testReplicatedApplyKey(t, db, document)
-		command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+		command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 			Kind: replication.MutationPut, Key: key, Value: document,
 		})
-		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
+		if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
 			t.Fatalf("transaction after definite cleanup: %v", err)
 		}
 		if got := completionResultCode(t, claim, command); got != replicatedstate.ResultApplied {
@@ -1219,12 +1343,13 @@ func TestReplicatedApplyOpenFullScanRejectsPrimaryMismatch(t *testing.T) {
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 	document := []byte(`{"id":"scan"}`)
 	key := testReplicatedApplyKey(t, database, document)
-	command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); err != nil {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 	if err := claim.Close(); err != nil {
@@ -1458,9 +1583,10 @@ func TestReplicatedApplyClaimConnectorLifetime(t *testing.T) {
 }
 
 func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing.T) {
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "observer-unknown", false)
 	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
-	defer restore()
-	_, database, base := bindReplicatedApplyTestRoot(t, "observer-unknown")
+	t.Cleanup(restore)
+	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	claim, _, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
@@ -1474,14 +1600,15 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 	if _, err := claim.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
 		t.Fatal(err)
 	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 	document := []byte(`{"id":"unknown"}`)
 	key := testReplicatedApplyKey(t, database, document)
-	command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
 	clock := &database.connector.db.tables["docs"].conflicts
 	before := clock.observe()
-	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(2), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		t.Fatalf("decision-sync apply = %v, want unknown outcome", err)
 	}
 	if after := clock.observe(); after <= before {
@@ -1547,8 +1674,9 @@ func TestReplicatedApplyConcurrentClaimRetirement(t *testing.T) {
 	if _, err := claim.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
 		t.Fatal(err)
 	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
 	document := []byte(`{"id":"race"}`)
-	command := testReplicatedApplyCommand(base, 1, replication.Mutation{
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut,
 		Key:  testReplicatedApplyKey(t, database, document), Value: document,
 	})
@@ -1559,7 +1687,7 @@ func TestReplicatedApplyConcurrentClaimRetirement(t *testing.T) {
 	go func() {
 		defer workers.Done()
 		<-start
-		_, applyErr := claim.ApplyNormal(testReplicatedApplyMeta(2), command)
+		_, applyErr := claim.ApplyNormal(testReplicatedApplyMeta(3), command)
 		if applyErr != nil && !errors.Is(applyErr, ErrReplicatedApplyClosed) {
 			errs <- applyErr
 		}
@@ -1677,7 +1805,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 		Format: ReplicatedApplyFormat, Storage: "storage",
 		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
 		ValidationDigest:  validationDigest,
-		SystemLimits:      replicatedApplySystemLimits(),
+		SystemLimits:      replicatedApplySystemLimits(8),
 		MaxSessions:       5,
 		RetryWindow:       8,
 		TxnLimits:         durable.TxnLimits{MaxCollections: 6, MaxDocuments: 7, MaxBytes: 8},
@@ -1696,7 +1824,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"format":0,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":35,"max_document_bytes":2048,"max_batch_documents":3,"max_batch_bytes":2756},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
+	const want = `{"format":0,"storage":"storage","validation_profile":2,"validation_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","system_limits":{"max_key_bytes":35,"max_document_bytes":2048,"max_batch_documents":10,"max_batch_bytes":2756},"max_sessions":5,"retry_window":8,"txn_max_collections":6,"txn_max_documents":7,"txn_max_bytes":8,"placement":{"format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1,"range_start":"1000000000000000","range_end":"9000000000000000","range_end_max":false},"sidecars":{"system_recovery_journal_bytes":655872}}`
 	if string(encoded) != want {
 		t.Fatalf("identity JSON = %s, want %s", encoded, want)
 	}
@@ -1707,6 +1835,28 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	var decoded ReplicatedApplyIdentity
 	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != identity {
 		t.Fatalf("identity round trip = %+v,%v", decoded, err)
+	}
+	maximum := identity
+	maximum.RetryWindow = replicatedstate.MaxSessionRetryWindow
+	maximum.SystemLimits = replicatedApplySystemLimits(maximum.RetryWindow)
+	maximumEncoded, err := json.Marshal(maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(maximumEncoded, &decoded); err != nil || decoded != maximum {
+		t.Fatalf("maximum retry-window round trip = %+v,%v", decoded, err)
+	}
+	invalidMaximum := bytes.Replace(
+		maximumEncoded,
+		[]byte(`"max_batch_documents":258`),
+		[]byte(`"max_batch_documents":257`),
+		1,
+	)
+	if bytes.Equal(invalidMaximum, maximumEncoded) {
+		t.Fatal("maximum retry-window system-limit mutation did not match")
+	}
+	if err := json.Unmarshal(invalidMaximum, new(ReplicatedApplyIdentity)); !errors.Is(err, ErrReplicatedApplyMismatch) {
+		t.Fatalf("altered maximum retry-window system limits = %v, want mismatch", err)
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &fields); err != nil {

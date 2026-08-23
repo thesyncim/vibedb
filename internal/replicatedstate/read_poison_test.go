@@ -43,7 +43,8 @@ func TestLookupAndAdmitCorruptionPoisonMachine(t *testing.T) {
 				t.Fatal(err)
 			}
 			command := encodeCommand(t, commandValue(fixture.binding, 1))
-			if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+			applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+			if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 				t.Fatal(err)
 			}
 			corruptRetainedCompletion(t, fixture, command)
@@ -56,7 +57,7 @@ func TestLookupAndAdmitCorruptionPoisonMachine(t *testing.T) {
 			if !errors.Is(err, ErrSessionCorrupt) {
 				t.Fatalf("%s error = %v", operation, err)
 			}
-			if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); !errors.Is(err, ErrApplyPoisoned) {
+			if _, err := fixture.machine.ApplyNormal(normalMeta(4), nil); !errors.Is(err, ErrApplyPoisoned) {
 				t.Fatalf("post-%s apply error = %v", operation, err)
 			}
 		})
@@ -117,6 +118,7 @@ func TestOrdinaryReadAndAdmissionRefusalsDoNotPoison(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	missing := encodeCommand(t, commandValue(fixture.binding, 1))
 	if _, err := fixture.machine.LookupCompletion(missing); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("not-found error = %v", err)
@@ -127,7 +129,7 @@ func TestOrdinaryReadAndAdmissionRefusalsDoNotPoison(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(stale); !errors.Is(err, ErrStaleCommand) {
 		t.Fatalf("stale admission error = %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), missing); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), missing); err != nil {
 		t.Fatalf("apply after ordinary refusals: %v", err)
 	}
 	conflictValue := commandValue(fixture.binding, 1)
@@ -136,7 +138,7 @@ func TestOrdinaryReadAndAdmissionRefusalsDoNotPoison(t *testing.T) {
 	if _, err := fixture.machine.LookupCompletion(conflict); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("conflict lookup error = %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), nil); err != nil {
 		t.Fatalf("apply after conflict: %v", err)
 	}
 }

@@ -22,20 +22,22 @@ func TestSessionCapacityStateTracksDurableCutAndPoison(t *testing.T) {
 		t.Fatalf("bootstrap capacity state = %+v, %v; want %+v", got, err, want)
 	}
 
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("key"), Value: []byte(`{"value":1}`),
 	})
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 	want = SessionCapacityState{
-		Initialized: true, Applied: 2, SessionCount: 1, SessionSlotCount: 1,
+		Initialized: true, Applied: 3, SessionCount: 1, SessionSlotCount: 2,
+		SessionEpochHighWater: 2,
 	}
 	if got, err := fixture.machine.SessionCapacityState(); err != nil || got != want {
 		t.Fatalf("applied capacity state = %+v, %v; want %+v", got, err, want)
 	}
 
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); err == nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err == nil {
 		t.Fatal("conflicting replay did not poison machine")
 	}
 	if got, err := fixture.machine.SessionCapacityState(); got != (SessionCapacityState{}) ||

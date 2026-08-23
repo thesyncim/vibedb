@@ -49,10 +49,150 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	if readErr == nil && found && session.RetryWindow != m.options.RetryWindow {
 		readErr = fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
 	}
-	if readErr != nil || !found {
+	if readErr != nil {
 		err = errors.Join(readErr, cut.Close())
 		if err != nil {
 			return CompletionLookup{}, m.fail(err)
+		}
+	}
+	if !found {
+		orphanErr := ensureNoSessionSlots(
+			pointSnapshot{snapshot}, digest, m.options.RetryWindow,
+		)
+		if orphanErr != nil {
+			return CompletionLookup{}, m.fail(errors.Join(orphanErr, cut.Close()))
+		}
+	}
+	if command.Kind() == replication.CommandSessionOpen {
+		if !found {
+			if closeErr := cut.Close(); closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			return CompletionLookup{}, ErrCompletionNotFound
+		}
+		openKey, keyErr := SessionSlotStorageKey(digest, 0)
+		if keyErr != nil {
+			_ = cut.Close()
+			return CompletionLookup{}, m.fail(keyErr)
+		}
+		record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, openKey)
+		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
+			record.Slot != 0 || record.ClientEpoch != session.ClientEpoch) {
+			slotErr = fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
+		}
+		if slotErr == nil {
+			slotErr = validateStoredSessionSlot(m.state, record)
+		}
+		if slotErr == nil {
+			slotErr = validateSessionSlotAgainstHeader(session, record)
+		}
+		currentOpen := slotErr == nil && record.ClientSequence == 1 &&
+			record.ResultCode == ResultSessionOpened
+		var completionBytes []byte
+		if slotErr == nil && currentOpen {
+			completionBytes, slotErr = m.appendSessionCompletion(nil, session, record)
+		}
+		closeErr := cut.Close()
+		if slotErr != nil || closeErr != nil {
+			return CompletionLookup{}, m.fail(errors.Join(slotErr, closeErr))
+		}
+		if !currentOpen {
+			// A canonical later result now occupies physical slot zero, so the
+			// identity of sequence one's Open is no longer retained. Every Open
+			// retry is terminally outside the bounded window.
+			return CompletionLookup{}, ErrRetryRetired
+		}
+		result := CompletionLookup{
+			Key: digest, Bytes: completionBytes,
+			AppliedSequence: record.AppliedSequence,
+		}
+		matches := session.RetryHome == command.RetryHome &&
+			record.Fingerprint == command.Fingerprint &&
+			record.LogicalCommandDigest == LogicalCommandDigest(command)
+		if !matches {
+			if session.Status == SessionRetired {
+				return CompletionLookup{}, ErrSessionRetired
+			}
+			return result, &RequestConflictError{Key: digest}
+		}
+		// Apply the retry floor only after proving this is the exact retained
+		// Open. This preserves admission/lookup parity for a competing Open
+		// while the original sequence-one slot is still identifiable.
+		if sessionRetryFloor(session) >= 1 {
+			return CompletionLookup{}, ErrRetryRetired
+		}
+		return result, nil
+	}
+	if command.Kind() == replication.CommandSessionRelease {
+		if !found || command.ClientEpoch < session.ClientEpoch {
+			closeErr := cut.Close()
+			if closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			if command.ClientEpoch <= m.state.SessionEpochHighWater {
+				return CompletionLookup{}, ErrSessionReleased
+			}
+			return CompletionLookup{}, ErrCompletionNotFound
+		}
+		if command.ClientEpoch > session.ClientEpoch {
+			if closeErr := cut.Close(); closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			return CompletionLookup{}, ErrCompletionNotFound
+		}
+		if session.Status != SessionRetired {
+			if closeErr := cut.Close(); closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			return CompletionLookup{}, ErrSessionActive
+		}
+		if command.ClientSequence != session.HighSequence {
+			if closeErr := cut.Close(); closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			return CompletionLookup{}, ErrSessionSequence
+		}
+		if command.AckThrough != session.HighSequence-1 {
+			if closeErr := cut.Close(); closeErr != nil {
+				return CompletionLookup{}, m.fail(closeErr)
+			}
+			return CompletionLookup{}, ErrSessionAck
+		}
+		retirementSlot := uint16((session.HighSequence - 1) % uint64(session.RetryWindow))
+		retirementKey, keyErr := SessionSlotStorageKey(digest, retirementSlot)
+		if keyErr != nil {
+			_ = cut.Close()
+			return CompletionLookup{}, m.fail(keyErr)
+		}
+		record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, retirementKey)
+		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
+			record.Slot != retirementSlot || record.ClientEpoch != session.ClientEpoch ||
+			record.ClientSequence != session.HighSequence ||
+			record.ResultCode != ResultSessionRetired) {
+			slotErr = fmt.Errorf("%w: retirement slot mismatch", ErrSessionCorrupt)
+		}
+		if slotErr == nil {
+			slotErr = validateStoredSessionSlot(m.state, record)
+		}
+		if slotErr == nil {
+			slotErr = validateSessionSlotAgainstHeader(session, record)
+		}
+		closeErr := cut.Close()
+		if slotErr != nil || closeErr != nil {
+			return CompletionLookup{}, m.fail(errors.Join(slotErr, closeErr))
+		}
+		if session.RetryHome != command.RetryHome || record.Fingerprint != command.Fingerprint {
+			return CompletionLookup{Key: digest}, &RequestConflictError{Key: digest}
+		}
+		return CompletionLookup{}, ErrCompletionNotFound
+	}
+	if !found {
+		err = cut.Close()
+		if err != nil {
+			return CompletionLookup{}, m.fail(err)
+		}
+		if command.ClientEpoch <= m.state.SessionEpochHighWater {
+			return CompletionLookup{}, ErrRetryRetired
 		}
 		return CompletionLookup{}, ErrCompletionNotFound
 	}

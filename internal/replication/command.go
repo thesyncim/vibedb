@@ -14,8 +14,11 @@ var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 // fingerprint minted by the request layer; this codec treats it as opaque.
 // Mutation-batch order, including duplicate keys, is semantic and preserved
 // exactly; upstream fingerprinting must bind every mutation ordinal. A session
-// retirement carries no mutations. AckThrough is the greatest earlier client
-// sequence that will never be retried; zero acknowledges nothing.
+// retirement, release, or open carries no mutations. AckThrough is the greatest
+// earlier client sequence that will never be retried; zero acknowledges
+// nothing. A session-open request has the canonical client tuple (epoch 0,
+// sequence 1, acknowledgement 0); the state machine returns its allocated
+// epoch.
 type Command struct {
 	Kind CommandKind
 
@@ -93,8 +96,8 @@ func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
-// Kind reports whether the command mutates the collection or retires its
-// client session.
+// Kind reports whether the command mutates the collection, opens or retires its
+// client session, or releases the retired session's retry state.
 func (v CommandView) Kind() CommandKind { return v.kind }
 
 // MutationCount reports the number of mutations the iterator will produce.
@@ -248,6 +251,10 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireMutationBatch
 	case CommandSessionRetire:
 		return commandWireSessionRetire
+	case CommandSessionRelease:
+		return commandWireSessionRelease
+	case CommandSessionOpen:
+		return commandWireSessionOpen
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -294,9 +301,9 @@ func validateCommandHeader(command Command) error {
 		if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
 			return semantic("mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen:
 		if len(command.Mutations) != 0 {
-			return semantic("session retire carries mutations")
+			return semantic("session lifecycle command carries mutations")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -310,12 +317,13 @@ func validateCommandHeader(command Command) error {
 		command.ReplicaSetVersion == 0 || command.ActivePolicyGeneration == 0 ||
 		command.ProtectionEpoch == 0 || command.OwnershipEpoch == 0 ||
 		command.SchemaGeneration == 0 || command.RoutingVersion == 0 ||
-		command.RouteGeneration == 0 || command.ClientEpoch == 0 ||
-		command.ClientSequence == 0 {
+		command.RouteGeneration == 0 {
 		return semantic("command contains a zero generation, epoch, or sequence")
 	}
-	if command.AckThrough >= command.ClientSequence {
-		return semantic("command acknowledgement does not precede client sequence")
+	if err := validateCommandClientTuple(
+		command.Kind, command.ClientEpoch, command.ClientSequence, command.AckThrough,
+	); err != nil {
+		return err
 	}
 	if !nonzeroDigest(command.Fingerprint) {
 		return semantic("command contains a zero request fingerprint")
@@ -404,9 +412,9 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count == 0 || uint64(count) > MaxMutations {
 			return CommandView{}, semantic("mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen:
 		if count != 0 {
-			return CommandView{}, semantic("session retire carries mutations")
+			return CommandView{}, semantic("session lifecycle command carries mutations")
 		}
 	}
 
@@ -479,6 +487,10 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandMutationBatch, true
 	case commandWireSessionRetire:
 		return CommandSessionRetire, true
+	case commandWireSessionRelease:
+		return CommandSessionRelease, true
+	case commandWireSessionOpen:
+		return CommandSessionOpen, true
 	default:
 		return 0, false
 	}
@@ -494,11 +506,25 @@ func validateDecodedCommandScalars(view CommandView) error {
 		view.ReplicaSetVersion == 0 || view.ActivePolicyGeneration == 0 ||
 		view.ProtectionEpoch == 0 || view.OwnershipEpoch == 0 ||
 		view.SchemaGeneration == 0 || view.RoutingVersion == 0 ||
-		view.RouteGeneration == 0 || view.ClientEpoch == 0 ||
-		view.ClientSequence == 0 {
+		view.RouteGeneration == 0 {
 		return semantic("command contains a zero generation, epoch, or sequence")
 	}
-	if view.AckThrough >= view.ClientSequence {
+	return validateCommandClientTuple(
+		view.kind, view.ClientEpoch, view.ClientSequence, view.AckThrough,
+	)
+}
+
+func validateCommandClientTuple(kind CommandKind, epoch, sequence, ackThrough uint64) error {
+	if kind == CommandSessionOpen {
+		if epoch != 0 || sequence != 1 || ackThrough != 0 {
+			return semantic("session open client tuple")
+		}
+		return nil
+	}
+	if epoch == 0 || sequence == 0 {
+		return semantic("command contains a zero client epoch or sequence")
+	}
+	if ackThrough >= sequence {
 		return semantic("command acknowledgement does not precede client sequence")
 	}
 	return nil

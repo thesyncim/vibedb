@@ -251,11 +251,13 @@ func TestValidatedMutationPlanningUsesCollapsedSnapshotAwareFinals(t *testing.T)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	seed := testCommand(fixture.binding, 1,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("same"), Value: []byte(`{"n":1}`)},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("gone"), Value: []byte(`{"n":3}`)},
 	)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), seed); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
 		t.Fatal(err)
 	}
 	calls = nil
@@ -268,7 +270,7 @@ func TestValidatedMutationPlanningUsesCollapsedSnapshotAwareFinals(t *testing.T)
 		replication.Mutation{Kind: replication.MutationDelete, Key: []byte("gone")},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("put"), Value: []byte(`{"n":2}`)},
 	)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), command); err != nil {
 		t.Fatal(err)
 	}
 	wantCalls := []validationCall{
@@ -332,10 +334,12 @@ func TestValidatedMutationResultMappingAndPrestageObserver(t *testing.T) {
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 				t.Fatal(err)
 			}
+			open := commandValue(fixture.binding, 1)
+			applySessionOpen(t, fixture.machine, 2, open)
 			command := testCommand(fixture.binding, 1, replication.Mutation{
 				Kind: replication.MutationPut, Key: []byte("bad"), Value: []byte(`{"n":1}`),
 			})
-			_, err := fixture.machine.ApplyNormal(normalMeta(2), command)
+			_, err := fixture.machine.ApplyNormal(normalMeta(3), command)
 			if test.wantError != nil {
 				if !errors.Is(err, test.wantError) {
 					t.Fatalf("ApplyNormal error = %v, want %v", err, test.wantError)
@@ -371,10 +375,12 @@ func TestValidatedMutationRejectsMalformedJSONBeforeCustomValidator(t *testing.T
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("bad"), Value: []byte(`{"n":`),
 	})
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 	if got := completionResultCode(t, fixture.machine, command); got != ResultInvalidDocument {
@@ -393,11 +399,13 @@ func TestValidatedOpenScansRowsOnceAndBindsApplyContract(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	command := testCommand(fixture.binding, 1,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("a"), Value: []byte(`{"n":1}`)},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("b"), Value: []byte(`{"n":2}`)},
 	)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 
@@ -468,10 +476,12 @@ func TestValidatedOpenAndExplicitAuditRouteEveryExtantRow(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	command := testCommand(fixture.binding, 1,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("inside"), Value: []byte(`{"n":1}`)},
 	)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fixture.user.Collection.Put([]byte("outside"), []byte(`{"n":2}`)); err != nil {
@@ -498,6 +508,7 @@ func TestCompletionResultGrammar(t *testing.T) {
 	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, nil)
 	for _, code := range []uint32{
 		ResultApplied, ResultTargetBound, ResultWrongShard, ResultSessionRetired,
+		ResultSessionOpened,
 	} {
 		if err := fixture.machine.validateCompletionResult(replication.CompletionView{
 			ResultFormat: ResultFormatMutation, ResultCode: code,
@@ -508,7 +519,7 @@ func TestCompletionResultGrammar(t *testing.T) {
 	for _, completion := range []replication.CompletionView{
 		{ResultFormat: ResultFormatMutation + 1, ResultCode: ResultApplied},
 		{ResultFormat: ResultFormatMutation, ResultCode: 0},
-		{ResultFormat: ResultFormatMutation, ResultCode: ResultSessionRetired + 1},
+		{ResultFormat: ResultFormatMutation, ResultCode: ResultSessionOpened + 1},
 	} {
 		if err := fixture.machine.validateCompletionResult(completion); !errors.Is(err, ErrCompletionCorrupt) {
 			t.Fatalf("accepted invalid completion grammar %+v: %v", completion, err)
@@ -522,13 +533,15 @@ func TestMutationAttemptObserverCoversDecisionSyncOutcomeUnknown(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
 	defer restore()
 	command := testCommand(fixture.binding, 1,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("a"), Value: []byte(`{"n":1}`)},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("b"), Value: []byte(`{"n":2}`)},
 	)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		t.Fatalf("ApplyNormal error = %v, want ErrCommitOutcomeUnknown", err)
 	}
 	want := [][][]byte{{[]byte("a"), []byte("b")}}
@@ -543,6 +556,8 @@ func TestMutationAttemptObserverCoversDefiniteTransactionSetupFailure(t *testing
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	beforeGeneration := fixture.user.Collection.Generation()
 	storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{
 		Phase: storeio.TxnMarkerFaultCreateHeaderWrite,
@@ -551,7 +566,7 @@ func TestMutationAttemptObserverCoversDefiniteTransactionSetupFailure(t *testing
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("a"), Value: []byte(`{"n":1}`),
 	})
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err == nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err == nil {
 		t.Fatal("ApplyNormal unexpectedly succeeded")
 	} else if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		t.Fatalf("definite setup failure classified outcome-unknown: %v", err)
@@ -584,12 +599,14 @@ func TestMutationAttemptObserverIsSynchronousWithApply(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("a"), Value: []byte(`{"n":1}`),
 	})
 	done := make(chan error, 1)
 	go func() {
-		_, err := fixture.machine.ApplyNormal(normalMeta(2), command)
+		_, err := fixture.machine.ApplyNormal(normalMeta(3), command)
 		done <- err
 	}()
 	select {

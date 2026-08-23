@@ -150,11 +150,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"35b1baabe9481742d43a8d2ac6c01167709672c17b662ed2cfaf2f22cfd14e30")
+		"d7a5e26195540fcd989c5c26111eda81b72731914391a1ab817118dee01418e1")
 	assertDigestHex(t, "data-chain seed", seed,
-		"1d9dc7965ff687035d7883ed13b5c8a2c9d5dd76aa9c11e506201b8d5f3358e3")
+		"b51b80970152eea4d335836d9b062de757022b501965bc6b6f3ab64a4c454378")
 	assertDigestHex(t, "data-chain transition", transition,
-		"823cbb19c4dd70600d76d9dfa427c04934a4003300c678da17bae129706f602d")
+		"303747f04b3c9c737943dbf46d8e589e6de8e7aac50e39536408f23f6d99a051")
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
@@ -256,8 +256,10 @@ func BenchmarkMachineAdmitPointUpdate(b *testing.B) {
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 				b.Fatal(err)
 			}
+			open := commandValue(fixture.binding, 1)
+			applySessionOpen(b, fixture.machine, 2, open)
 			sequence := uint64(1)
-			applied := uint64(2)
+			applied := uint64(3)
 			for first := 0; first < rows; first += MaxDistinctMutations {
 				last := min(first+MaxDistinctMutations, rows)
 				mutations := make([]replication.Mutation, 0, last-first)
@@ -332,9 +334,11 @@ func TestAdmitAndApplyValidateOnlyCommandKeys(t *testing.T) {
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 				t.Fatal(err)
 			}
+			open := commandValue(fixture.binding, 1)
+			applySessionOpen(t, fixture.machine, 2, open)
 
 			sequence := uint64(1)
-			applied := uint64(2)
+			applied := uint64(3)
 			for first := 0; first < rows; first += MaxDistinctMutations {
 				last := min(first+MaxDistinctMutations, rows)
 				mutations := make([]replication.Mutation, 0, last-first)
@@ -390,16 +394,18 @@ func TestDataChainPreservedWithoutEffectiveRowChanges(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	put := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("present"), Value: []byte(`{"n":1}`),
 	})
-	publication, err := fixture.machine.ApplyNormal(normalMeta(2), put)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), put)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := publication.DataChainDigest
 
-	publication, err = fixture.machine.ApplyNormal(normalMeta(2), put)
+	publication, err = fixture.machine.ApplyNormal(normalMeta(3), put)
 	if err != nil || publication.DataChainDigest != want {
 		t.Fatalf("exact replay chain = %x, %v; want %x", publication.DataChainDigest, err, want)
 	}
@@ -415,7 +421,7 @@ func TestDataChainPreservedWithoutEffectiveRowChanges(t *testing.T) {
 		}),
 	}
 	for index, command := range commands {
-		publication, err = fixture.machine.ApplyNormal(normalMeta(uint64(index+3)), command)
+		publication, err = fixture.machine.ApplyNormal(normalMeta(uint64(index+4)), command)
 		if err != nil || publication.DataChainDigest != want {
 			t.Fatalf("non-changing command %d chain = %x, %v; want %x",
 				index, publication.DataChainDigest, err, want)

@@ -35,12 +35,25 @@ func testApplyOptions() sqldriver.ReplicatedApplyOptions {
 
 func testApplyCommand(
 	identity sqldriver.ReplicatedShardStoreIdentity,
-	sequence uint64,
+	clientEpoch, sequence uint64,
 	key, document []byte,
 ) []byte {
+	command := testApplyCommandValue(identity, clientEpoch, sequence, key, document)
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func testApplyCommandValue(
+	identity sqldriver.ReplicatedShardStoreIdentity,
+	clientEpoch, sequence uint64,
+	key, document []byte,
+) replication.Command {
 	b := identity.Binding
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x7e})
-	encoded, err := replication.AppendCommand(nil, replication.Command{
+	return replication.Command{
 		ClusterID:             replication.ID128(b.ClusterID),
 		ClusterIncarnation:    replication.ID128(b.ClusterIncarnation),
 		TopologyRecoveryEpoch: b.TopologyRecoveryEpoch,
@@ -55,16 +68,54 @@ func testApplyCommand(
 		RoutingVersion:         b.Authority.RoutingVersion,
 		RouteGeneration:        b.Authority.RouteGeneration,
 		Tenant:                 []byte("tenant"), ClientID: replication.ID128{3},
-		ClientEpoch: 1, ClientSequence: sequence, Fingerprint: fingerprint,
+		ClientEpoch: clientEpoch, ClientSequence: sequence, Fingerprint: fingerprint,
 		Collection: identity.UserTable,
 		Mutations: []replication.Mutation{{
 			Kind: replication.MutationPut, Key: key, Value: document,
 		}},
-	})
+	}
+}
+
+func testApplySessionOpen(identity sqldriver.ReplicatedShardStoreIdentity) []byte {
+	command := testApplyCommandValue(identity, 0, 1, nil, nil)
+	command.Kind = replication.CommandSessionOpen
+	command.Fingerprint = sha256.Sum256([]byte("raftmember/test-session-open"))
+	command.Mutations = nil
+	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)
 	}
 	return encoded
+}
+
+func applyTestSessionOpen(
+	t testing.TB,
+	claim *sqldriver.ReplicatedApply,
+	identity sqldriver.ReplicatedShardStoreIdentity,
+	index uint64,
+) ([]byte, uint64) {
+	t.Helper()
+	command := testApplySessionOpen(identity)
+	if err := claim.AdmitCommand(command); err != nil {
+		t.Fatalf("admit session open at %d: %v", index, err)
+	}
+	publication, err := claim.ApplyNormal(raftmodel.ApplyMeta{
+		Index: index, Term: 2, Type: pb.EntryNormal,
+	}, command)
+	if err != nil || publication.Applied != index {
+		t.Fatalf("apply session open at %d = %+v, %v", index, publication, err)
+	}
+	lookup, err := claim.LookupCompletion(command)
+	if err != nil {
+		t.Fatalf("lookup session open at %d: %v", index, err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened ||
+		completion.ClientEpoch != index || completion.ClientSequence != 1 ||
+		completion.AppliedSequence != index {
+		t.Fatalf("session open completion at %d = %+v, %v", index, completion, err)
+	}
+	return command, completion.ClientEpoch
 }
 
 func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
@@ -93,9 +144,10 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	}
 	key, _ := orderedkey.AppendJSONString(nil, []byte(`"a"`), orderedkey.Ascending)
 	document := []byte(`{"id":"a","value":1}`)
-	command := testApplyCommand(base, 1, key, document)
+	_, epoch := applyTestSessionOpen(t, claim, base, 2)
+	command := testApplyCommand(base, epoch, 2, key, document)
 	if _, err := claim.ApplyNormal(raftmodel.ApplyMeta{
-		Index: 2, Term: 2, Type: pb.EntryNormal,
+		Index: 3, Term: 2, Type: pb.EntryNormal,
 	}, command); err != nil {
 		t.Fatalf("ApplyNormal: %v", err)
 	}
@@ -121,8 +173,8 @@ func TestOpenPreparedApplyAndExactRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenBoundSQLWithApply: %v", err)
 	}
-	if reopenedClaim.Applied() != 2 {
-		t.Fatalf("reopened Applied = %d, want 2", reopenedClaim.Applied())
+	if reopenedClaim.Applied() != 3 {
+		t.Fatalf("reopened Applied = %d, want 3", reopenedClaim.Applied())
 	}
 	if _, err := reopenedClaim.LookupCompletion(command); err != nil {
 		t.Fatalf("reopened completion: %v", err)

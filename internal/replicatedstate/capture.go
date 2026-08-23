@@ -153,7 +153,10 @@ func (m *Machine) validateTransitionCaptureTarget(
 		return ErrTransitionCapture
 	}
 	if m.options.TxnLimits.MaxCollections < 3 ||
-		m.options.TxnLimits.MaxDocuments < m.user.Limits.MaxDistinctMutations+4 {
+		m.options.TxnLimits.MaxDocuments < max(
+			m.user.Limits.MaxDistinctMutations+4,
+			int(m.options.RetryWindow)+3,
+		) {
 		return fmt.Errorf("%w: transaction dimensions", ErrTransitionCapture)
 	}
 	maxBefore := uint64(m.user.Limits.MaxDistinctMutations) *

@@ -9,6 +9,8 @@ import (
 func FuzzOpenCommand(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
 	retire := testSessionRetireCommand()
+	release := testSessionReleaseCommand()
+	open := testSessionOpenCommand()
 	ordered := testCommand()
 	ordered.Mutations = []Mutation{
 		{Kind: MutationPut, Key: []byte("z"), Value: []byte("first")},
@@ -17,6 +19,8 @@ func FuzzOpenCommand(f *testing.F) {
 	}
 	f.Add(valid)
 	f.Add(encodeCommand(f, retire))
+	f.Add(encodeCommand(f, release))
+	f.Add(encodeCommand(f, open))
 	f.Add(encodeCommand(f, ordered))
 	f.Add(valid[:len(valid)-1])
 	f.Add([]byte{})
@@ -100,18 +104,32 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 
 func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 	t.Helper()
-	if !bytes.Equal(view.Bytes(), data) || cap(view.Bytes()) != len(view.Bytes()) ||
-		view.AckThrough >= view.ClientSequence {
+	if !bytes.Equal(view.Bytes(), data) || cap(view.Bytes()) != len(view.Bytes()) {
 		t.Fatal("accepted command view does not preserve bounded input")
 	}
 	switch view.Kind() {
 	case CommandMutationBatch:
+		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
+			view.AckThrough >= view.ClientSequence {
+			t.Fatal("accepted mutation batch has invalid client tuple")
+		}
 		if view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
 			t.Fatal("accepted mutation batch has invalid mutation count")
 		}
-	case CommandSessionRetire:
+	case CommandSessionRetire, CommandSessionRelease:
+		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
+			view.AckThrough >= view.ClientSequence {
+			t.Fatal("accepted session lifecycle command has invalid client tuple")
+		}
 		if view.MutationCount() != 0 {
-			t.Fatal("accepted session retire carries mutations")
+			t.Fatal("accepted session lifecycle command carries mutations")
+		}
+	case CommandSessionOpen:
+		if view.ClientEpoch != 0 || view.ClientSequence != 1 || view.AckThrough != 0 {
+			t.Fatal("accepted session open has invalid client tuple")
+		}
+		if view.MutationCount() != 0 {
+			t.Fatal("accepted session open carries mutations")
 		}
 	default:
 		t.Fatal("accepted unknown command kind")

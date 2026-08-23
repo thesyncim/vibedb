@@ -20,6 +20,7 @@ import (
 var (
 	normalEntryDigestDomain = []byte("vibedb/replicated-state/normal-entry\x00")
 	configEntryDigestDomain = []byte("vibedb/replicated-state/config-entry\x00")
+	errStopSessionPrefix    = errors.New("replicatedstate: stop session-prefix probe")
 )
 
 type commandPlan struct {
@@ -37,6 +38,10 @@ type commandPlan struct {
 	writeSlot       bool
 	newSession      bool
 	newPhysicalSlot bool
+	advanceEpoch    uint64
+	deleteSession   bool
+	deleteSlots     uint16
+	release         bool
 	exactDuplicate  bool
 	conflict        bool
 }
@@ -123,6 +128,16 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	}
 	if plan.newPhysicalSlot {
 		next.SessionSlotCount++
+	}
+	if plan.advanceEpoch != 0 {
+		next.SessionEpochHighWater = plan.advanceEpoch
+	}
+	if plan.deleteSession {
+		if next.SessionCount == 0 || next.SessionSlotCount < uint64(plan.deleteSlots) {
+			return raftmodel.Publication{}, m.fail(ErrSessionCorrupt)
+		}
+		next.SessionCount--
+		next.SessionSlotCount -= uint64(plan.deleteSlots)
 	}
 	if err := m.persistTransition(next, plan.changes, plan); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
@@ -297,9 +312,13 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return plan.refusal
 	case plan.exactDuplicate:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.release:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultStaleFence:
 		return ErrStaleCommand
 	case plan.resultCode == ResultSessionRetired:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultSessionOpened:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
@@ -317,6 +336,16 @@ func (m *Machine) hypotheticalState(command replication.CommandView, plan comman
 	}
 	if plan.newPhysicalSlot {
 		next.SessionSlotCount++
+	}
+	if plan.advanceEpoch != 0 {
+		next.SessionEpochHighWater = plan.advanceEpoch
+	}
+	if plan.deleteSession {
+		if next.SessionCount == 0 || next.SessionSlotCount < uint64(plan.deleteSlots) {
+			return State{}
+		}
+		next.SessionCount--
+		next.SessionSlotCount -= uint64(plan.deleteSlots)
 	}
 	return next
 }
@@ -348,6 +377,7 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
+		SessionEpochHighWater: m.state.SessionEpochHighWater,
 	}
 }
 
@@ -413,28 +443,31 @@ func (m *Machine) planCommand(
 	plan := commandPlan{command: command, dataChainDigest: m.state.DataChainDigest}
 	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
 	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
-	logicalDigest := LogicalCommandDigest(command)
 	session, found, err := sessionAt(systemSnapshot, plan.sessionKey)
 	if err != nil {
 		return commandPlan{}, err
 	}
+	if command.Kind() == replication.CommandSessionOpen {
+		return m.planSessionOpen(command, applied, systemSnapshot, plan, session, found)
+	}
+	if command.Kind() == replication.CommandSessionRelease {
+		return m.planSessionRelease(command, systemSnapshot, plan, session, found)
+	}
+	logicalDigest := LogicalCommandDigest(command)
 
 	var next SessionRecord
 	if !found {
-		if m.state.SessionCount >= m.options.MaxSessions {
-			plan.refusal = ErrAdmissionBound
-			return plan, nil
+		if err := ensureNoSessionSlots(
+			systemSnapshot, plan.sessionDigest, m.options.RetryWindow,
+		); err != nil {
+			return commandPlan{}, err
 		}
-		if command.ClientSequence != 1 || command.AckThrough != 0 {
-			plan.refusal = ErrSessionSequence
-			return plan, nil
+		if command.ClientEpoch <= m.state.SessionEpochHighWater {
+			plan.refusal = ErrRetryRetired
+		} else {
+			plan.refusal = ErrSessionEpoch
 		}
-		next = SessionRecord{
-			Tenant: command.Tenant, ClientID: command.ClientID,
-			ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
-			Status: SessionActive, RetryWindow: m.options.RetryWindow,
-		}
-		plan.newSession = true
+		return plan, nil
 	} else {
 		if session.Digest != plan.sessionDigest ||
 			!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID {
@@ -448,29 +481,8 @@ func (m *Machine) planCommand(
 			plan.refusal = ErrRetryRetired
 			return plan, nil
 		case command.ClientEpoch > session.ClientEpoch:
-			if session.ClientEpoch == math.MaxUint64 ||
-				command.ClientEpoch != session.ClientEpoch+1 {
-				plan.refusal = ErrSessionEpoch
-				return plan, nil
-			}
-			if session.Status != SessionRetired {
-				plan.refusal = ErrSessionActive
-				return plan, nil
-			}
-			if command.ClientSequence != 1 || command.AckThrough != 0 {
-				plan.refusal = ErrSessionSequence
-				return plan, nil
-			}
-			if session.RetryHome != command.RetryHome {
-				plan.conflict = true
-				return plan, nil
-			}
-			next = SessionRecord{
-				Tenant: session.Tenant, ClientID: session.ClientID,
-				ClientEpoch: command.ClientEpoch, RetryHome: session.RetryHome,
-				Status: SessionActive, RetryWindow: session.RetryWindow,
-				PhysicalSlotCount: session.PhysicalSlotCount,
-			}
+			plan.refusal = ErrSessionEpoch
+			return plan, nil
 		default:
 			if command.ClientSequence <= session.HighSequence {
 				if command.ClientSequence <= sessionRetryFloor(session) {
@@ -626,6 +638,275 @@ func (m *Machine) planCommand(
 	return plan, nil
 }
 
+// planSessionOpen is the only path that creates or advances a client session.
+// The command deliberately carries epoch zero: ordered apply assigns the Raft
+// index as the globally unique shard-local epoch, so concurrent opens never
+// race on a caller-guessed H+1 token. Opening contains no user mutations; an
+// old open retried after reclamation can therefore create only an empty session.
+func (m *Machine) planSessionOpen(
+	command replication.CommandView,
+	applied uint64,
+	systemSnapshot pointSnapshot,
+	plan commandPlan,
+	session SessionView,
+	found bool,
+) (commandPlan, error) {
+	logicalDigest := LogicalCommandDigest(command)
+	if found {
+		if session.Digest != plan.sessionDigest ||
+			!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID {
+			return commandPlan{}, fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+		}
+		if session.RetryWindow != m.options.RetryWindow || session.PhysicalSlotCount == 0 {
+			return commandPlan{}, fmt.Errorf("%w: open session header", ErrSessionCorrupt)
+		}
+		openKey, err := SessionSlotStorageKey(plan.sessionDigest, 0)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		record, slotFound, err := sessionSlotAt(systemSnapshot, openKey)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		if !slotFound || record.SessionDigest != plan.sessionDigest || record.Slot != 0 ||
+			record.ClientEpoch != session.ClientEpoch {
+			return commandPlan{}, fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
+		}
+		if err := validateStoredSessionSlot(m.state, record); err != nil {
+			return commandPlan{}, err
+		}
+		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
+			return commandPlan{}, err
+		}
+		if record.ClientSequence == 1 {
+			if record.ResultCode != ResultSessionOpened {
+				return commandPlan{}, fmt.Errorf("%w: opening result", ErrSessionCorrupt)
+			}
+			if session.RetryHome == command.RetryHome &&
+				record.Fingerprint == command.Fingerprint &&
+				record.LogicalCommandDigest == logicalDigest {
+				if sessionRetryFloor(session) >= 1 {
+					plan.refusal = ErrRetryRetired
+					return plan, nil
+				}
+				plan.exactDuplicate = true
+				return plan, nil
+			}
+			if session.Status == SessionActive {
+				plan.conflict = true
+				return plan, nil
+			}
+		}
+		// When the bounded ring has replaced sequence one's physical slot, the
+		// Open identity is no longer retained and every possible retry is
+		// terminally old. Do not reinterpret the canonical replacement as a
+		// live competing Open.
+		if record.ClientSequence != 1 && sessionRetryFloor(session) >= 1 {
+			plan.refusal = ErrRetryRetired
+		} else if session.Status == SessionActive {
+			plan.refusal = ErrSessionActive
+		} else {
+			plan.refusal = ErrSessionRetired
+		}
+		return plan, nil
+	} else {
+		if err := ensureNoSessionSlots(
+			systemSnapshot, plan.sessionDigest, m.options.RetryWindow,
+		); err != nil {
+			return commandPlan{}, err
+		}
+		if m.state.SessionCount >= m.options.MaxSessions {
+			plan.refusal = ErrAdmissionBound
+			return plan, nil
+		}
+	}
+	if !m.mutableBindingMatches(command) {
+		// An Open completion carries the mutable fences used to mint its token.
+		// Never persist a token whose retained slot would fail the same binding
+		// validation on lookup or reopen.
+		plan.refusal = ErrStaleCommand
+		return plan, nil
+	}
+
+	// Apply indices are strictly increasing and never MaxUint64. Using the index
+	// as the epoch removes an allocator/reservation round trip while preserving a
+	// durable anti-resurrection high-water after the session rows are released.
+	if applied == 0 || applied == math.MaxUint64 || applied <= m.state.SessionEpochHighWater {
+		return commandPlan{}, fmt.Errorf("%w: session epoch allocation", ErrApplySequence)
+	}
+	if found {
+		// Every found-session branch above returns. Keep this fail-closed guard at
+		// the allocation boundary so later lifecycle edits cannot accidentally
+		// account an existing header as a newly created session.
+		return commandPlan{}, fmt.Errorf("%w: existing session reached allocation", ErrSessionCorrupt)
+	}
+	next := SessionRecord{
+		Tenant: command.Tenant, ClientID: command.ClientID,
+		ClientEpoch: applied, RetryHome: command.RetryHome,
+		AckThrough: 0, HighSequence: 1, Status: SessionActive,
+		RetryWindow: m.options.RetryWindow, PhysicalSlotCount: 1,
+	}
+	plan.newSession = true
+	plan.slotKey, _ = SessionSlotStorageKey(plan.sessionDigest, 0)
+	plan.newPhysicalSlot = true
+	var err error
+	plan.sessionRecord, err = AppendSessionRecord(nil, next)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	plan.slotRecord, err = AppendSessionSlot(nil, SessionSlot{
+		Slot:                   0,
+		SessionDigest:          plan.sessionDigest,
+		ClientEpoch:            applied,
+		ClientSequence:         1,
+		AppliedSequence:        applied,
+		Fingerprint:            command.Fingerprint,
+		LogicalCommandDigest:   logicalDigest,
+		ResultCode:             ResultSessionOpened,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch,
+		RoutingVersion:         command.RoutingVersion,
+		RouteGeneration:        command.RouteGeneration,
+	})
+	if err != nil {
+		return commandPlan{}, err
+	}
+	plan.writeSession, plan.writeSlot = true, true
+	plan.advanceEpoch = applied
+	plan.resultCode = ResultSessionOpened
+	return plan, nil
+}
+
+// planSessionRelease verifies the exact retired postcondition before removing
+// its bounded session image. Release is deliberately not another sequenced
+// request: it acknowledges the retained retirement tuple and is idempotent by
+// postcondition after the header has disappeared.
+func (m *Machine) planSessionRelease(
+	command replication.CommandView,
+	systemSnapshot pointSnapshot,
+	plan commandPlan,
+	session SessionView,
+	found bool,
+) (commandPlan, error) {
+	plan.release = true
+	if !found {
+		if err := ensureNoSessionSlots(
+			systemSnapshot, plan.sessionDigest, m.options.RetryWindow,
+		); err != nil {
+			return commandPlan{}, err
+		}
+		if command.ClientEpoch <= m.state.SessionEpochHighWater {
+			return plan, nil
+		}
+		plan.release = false
+		plan.refusal = ErrSessionEpoch
+		return plan, nil
+	}
+	if session.Digest != plan.sessionDigest ||
+		!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID {
+		return commandPlan{}, fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+	}
+	if session.RetryWindow != m.options.RetryWindow {
+		return commandPlan{}, fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
+	}
+	switch {
+	case command.ClientEpoch < session.ClientEpoch:
+		// A newer epoch at the same stable identity proves the named older epoch
+		// was already retired. Never let an old release delete the newer image.
+		return plan, nil
+	case command.ClientEpoch > session.ClientEpoch:
+		plan.release = false
+		plan.refusal = ErrSessionEpoch
+		return plan, nil
+	}
+	if session.Status != SessionRetired {
+		plan.release = false
+		plan.refusal = ErrSessionActive
+		return plan, nil
+	}
+	if command.ClientSequence != session.HighSequence {
+		plan.release = false
+		plan.refusal = ErrSessionSequence
+		return plan, nil
+	}
+	if command.AckThrough != session.HighSequence-1 {
+		plan.release = false
+		plan.refusal = ErrSessionAck
+		return plan, nil
+	}
+	retirementSlot := uint16((session.HighSequence - 1) % uint64(session.RetryWindow))
+	retirementSeen := false
+	retirementMatches := false
+	var appliedOrder sessionAppliedOrder
+	var seen uint16
+	err := systemSnapshot.rangeSessionSlots(plan.sessionDigest, func(key, value []byte) error {
+		// The prefix scan is both the validation pass and the extra-slot check:
+		// an exact release must account for every physical row before deleting
+		// any of them in the later atomic transaction.
+		if seen >= session.PhysicalSlotCount {
+			return fmt.Errorf("%w: extra release slot", ErrSessionCorrupt)
+		}
+		wantKey, keyErr := SessionSlotStorageKey(plan.sessionDigest, seen)
+		if keyErr != nil {
+			return keyErr
+		}
+		if !bytes.Equal(key, wantKey[:]) {
+			return fmt.Errorf("%w: noncontiguous release slot", ErrSessionCorrupt)
+		}
+		record, openErr := OpenSessionSlot(value)
+		if openErr != nil {
+			return openErr
+		}
+		if record.SessionDigest != plan.sessionDigest || record.Slot != seen ||
+			record.ClientEpoch != session.ClientEpoch {
+			return fmt.Errorf("%w: release slot mismatch", ErrSessionCorrupt)
+		}
+		if err := validateStoredSessionSlot(m.state, record); err != nil {
+			return err
+		}
+		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
+			return err
+		}
+		if err := appliedOrder.observe(
+			session.HighSequence, session.RetryWindow, record,
+		); err != nil {
+			return err
+		}
+		if seen == retirementSlot {
+			if record.ClientSequence != session.HighSequence ||
+				record.ResultCode != ResultSessionRetired {
+				return fmt.Errorf("%w: missing retirement slot", ErrSessionCorrupt)
+			}
+			retirementMatches = session.RetryHome == command.RetryHome &&
+				record.Fingerprint == command.Fingerprint
+			retirementSeen = true
+		}
+		seen++
+		return nil
+	})
+	if err != nil {
+		return commandPlan{}, err
+	}
+	if seen != session.PhysicalSlotCount {
+		return commandPlan{}, fmt.Errorf("%w: incomplete release ring", ErrSessionCorrupt)
+	}
+	if !retirementSeen {
+		return commandPlan{}, fmt.Errorf("%w: missing retirement slot", ErrSessionCorrupt)
+	}
+	if err := appliedOrder.finish(session.HighSequence, session.RetryWindow); err != nil {
+		return commandPlan{}, err
+	}
+	if !retirementMatches {
+		plan.release = false
+		plan.conflict = true
+		return plan, nil
+	}
+	plan.deleteSession = true
+	plan.deleteSlots = session.PhysicalSlotCount
+	return plan, nil
+}
+
 func sessionRecord(view SessionView) SessionRecord {
 	return SessionRecord{
 		Tenant: view.Tenant, ClientID: view.ClientID, ClientEpoch: view.ClientEpoch,
@@ -740,15 +1021,41 @@ func (m *Machine) releaseMutationPlan() {
 	m.mutationPlan = m.mutationPlan[:0]
 }
 
-// pointSnapshot is the planning capability: its API deliberately has no range
-// operation. Keeping the wrapper concrete also lets point reads inline without
-// interface escape allocations on every command key.
+// pointSnapshot is the planning capability. It exposes point reads plus one
+// session-prefix existence probe used only by Open/Release orphan checks; it
+// cannot perform an arbitrary collection scan. Keeping the wrapper concrete
+// also lets hot point reads inline without interface escapes.
 type pointSnapshot struct {
 	value *durable.Snapshot
 }
 
 func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	return s.value.AppendRaw(dst, key)
+}
+
+func (s pointSnapshot) hasRawPrefix(prefix []byte) (bool, error) {
+	found := false
+	err := s.value.RangePrefixRaw(prefix, func(_, _ []byte) error {
+		found = true
+		return errStopSessionPrefix
+	})
+	if errors.Is(err, errStopSessionPrefix) {
+		return true, nil
+	}
+	return found, err
+}
+
+func (s pointSnapshot) rangeSessionSlots(
+	digest [sha256.Size]byte,
+	visit func(key, value []byte) error,
+) error {
+	if digest == ([sha256.Size]byte{}) {
+		return ErrSessionCorrupt
+	}
+	var prefix [1 + sha256.Size]byte
+	prefix[0] = 2
+	copy(prefix[1:], digest[:])
+	return s.value.RangePrefixRaw(prefix[:], visit)
 }
 
 func sessionAt(snapshot pointSnapshot, key [33]byte) (SessionView, bool, error) {
@@ -780,6 +1087,27 @@ func sessionSlotAt(snapshot pointSnapshot, key [35]byte) (SessionSlotView, bool,
 		return SessionSlotView{}, false, fmt.Errorf("%w: slot storage key mismatch", ErrSessionCorrupt)
 	}
 	return view, true, nil
+}
+
+func ensureNoSessionSlots(
+	snapshot pointSnapshot,
+	digest [sha256.Size]byte,
+	retryWindow uint16,
+) error {
+	if retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
+		return ErrSessionCorrupt
+	}
+	var prefix [1 + sha256.Size]byte
+	prefix[0] = 2
+	copy(prefix[1:], digest[:])
+	found, err := snapshot.hasRawPrefix(prefix[:])
+	if err != nil {
+		return err
+	}
+	if found {
+		return fmt.Errorf("%w: orphan session slot", ErrSessionCorrupt)
+	}
+	return nil
 }
 
 func (m *Machine) persistTransition(
@@ -815,13 +1143,30 @@ func (m *Machine) persistTransition(
 	); err != nil {
 		return err
 	}
-	members := []durable.NamedCollection{{Name: systemCollectionName, Collection: m.system.Collection}}
+	systemDocuments := 1
+	if plan.writeSession {
+		systemDocuments++
+	}
+	if plan.writeSlot {
+		systemDocuments++
+	}
+	if plan.deleteSession {
+		systemDocuments += 1 + int(plan.deleteSlots)
+	}
+	members := []durable.NamedCollection{{
+		Name: systemCollectionName, Collection: m.system.Collection,
+		BatchDocumentsHint: systemDocuments,
+	}}
 	if len(changes) != 0 {
-		members = append(members, durable.NamedCollection{Name: m.userName, Collection: m.user.Collection})
+		members = append(members, durable.NamedCollection{
+			Name: m.userName, Collection: m.user.Collection,
+			BatchDocumentsHint: len(changes),
+		})
 	}
 	if len(captureRecord) != 0 {
 		members = append(members, durable.NamedCollection{
 			Name: m.captureTarget.Name, Collection: m.captureTarget.Collection,
+			BatchDocumentsHint: 1,
 		})
 	}
 	err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, func(batch *durable.DatabaseBatch) error {
@@ -840,6 +1185,20 @@ func (m *Machine) persistTransition(
 		if plan.writeSlot {
 			if err := systemBatch.Put(plan.slotKey[:], plan.slotRecord); err != nil {
 				return err
+			}
+		}
+		if plan.deleteSession {
+			if err := systemBatch.Delete(plan.sessionKey[:]); err != nil {
+				return err
+			}
+			for slot := uint16(0); slot < plan.deleteSlots; slot++ {
+				key, keyErr := SessionSlotStorageKey(plan.sessionDigest, slot)
+				if keyErr != nil {
+					return keyErr
+				}
+				if err := systemBatch.Delete(key[:]); err != nil {
+					return err
+				}
 			}
 		}
 		if len(captureRecord) != 0 {
@@ -944,6 +1303,18 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 		}
 		stateBytes += len(plan.slotKey) + len(plan.slotRecord)
 		systemDocs++
+	}
+	if plan.deleteSession {
+		if plan.writeSession || plan.writeSlot || plan.deleteSlots == 0 ||
+			plan.deleteSlots > m.options.RetryWindow {
+			return ErrAdmissionBound
+		}
+		deleteBytes := len(plan.sessionKey) + int(plan.deleteSlots)*len(plan.slotKey)
+		if deleteBytes < 0 || stateBytes > math.MaxInt-deleteBytes {
+			return ErrAdmissionBound
+		}
+		stateBytes += deleteBytes
+		systemDocs += 1 + int(plan.deleteSlots)
 	}
 	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||
 		systemDocs > m.system.Limits.MaxDistinctMutations ||

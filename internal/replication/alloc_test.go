@@ -54,6 +54,27 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("session-retire OpenCommand allocations = %v, want 0", allocations)
 	}
+	open := testSessionOpenCommand()
+	encodedOpen := encodeCommand(t, open)
+	openScratch := make([]byte, 0, len(encodedOpen))
+	if allocations := testing.AllocsPerRun(1000, func() {
+		var err error
+		allocationBytesSink, err = AppendCommand(openScratch[:0], open)
+		if err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("pre-sized session-open AppendCommand allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		view, err := OpenCommand(encodedOpen)
+		if err != nil {
+			panic(err)
+		}
+		allocationIntSink += int(view.Kind()) + view.MutationCount()
+	}); allocations != 0 {
+		t.Fatalf("session-open OpenCommand allocations = %v, want 0", allocations)
+	}
 
 	completion := testInlineCompletion()
 	completionBytes := testCompletionBytes(completion)

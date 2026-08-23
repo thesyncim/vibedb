@@ -133,7 +133,7 @@ func AdoptRuntime(
 	if wal == nil || database == nil || apply == nil {
 		return nil, ErrRuntimeOwnership
 	}
-	if err := ValidateImmutableBaseNoGCCompletionCapacity(wal, apply); err != nil {
+	if err := ValidateImmutableBaseApplyCapacity(wal, apply); err != nil {
 		return nil, err
 	}
 	profile, err := apply.CapacityQualificationProfile()

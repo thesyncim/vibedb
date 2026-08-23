@@ -30,11 +30,12 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	source.clientEpoch = source.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
 	right, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.machine.ApplyNormal(sourceCaptureMeta(2), source.command(1,
+	if _, err := source.machine.ApplyNormal(sourceCaptureMeta(3), source.command(2,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("right"), Value: right},
 	)); err != nil {
 		t.Fatal(err)
@@ -98,7 +99,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := source.machine.ApplyConfiguration(raftmodel.ApplyMeta{
-		Index: 3, Term: 2, Type: pb.EntryConfChange,
+		Index: 4, Term: 2, Type: pb.EntryConfChange,
 	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
-		From: source.binding, ExpectedReplicaSetVersion: 3,
+		From: source.binding, ExpectedReplicaSetVersion: 4,
 		SourceMember: 1, TargetMember: 2,
 		ToOwnershipEpoch:  source.binding.OwnershipEpoch + 1,
 		ToRoutingVersion:  source.binding.RoutingVersion + 1,
@@ -126,7 +127,7 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.machine.ApplyNormal(sourceCaptureMeta(4), ownership); err != nil {
+	if _, err := source.machine.ApplyNormal(sourceCaptureMeta(5), ownership); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok, err = capture.NextTailEntry(tail, &captureWorkspace)
@@ -195,11 +196,15 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		TxnLog: txnLog,
 		MachineOptions: replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
+				MaxCollections: 2,
+				MaxDocuments: max(
+					user.Limits.MaxDistinctMutations+3,
+					int(sourceCaptureRetryWindow)+2,
+				),
 				MaxBytes: 64 << 20,
 			},
 			MaxSessions: 128,
-			RetryWindow: 8,
+			RetryWindow: sourceCaptureRetryWindow,
 		},
 	}
 	if err := stage.CheckActivationCoordinates(certificate, binding); err != nil {
