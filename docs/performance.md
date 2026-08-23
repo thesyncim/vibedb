@@ -31,6 +31,30 @@ command's mutation keys. Mutation planning is bounded by 64 distinct keys. It
 performs indexed point reads plus bytewise validation and digest work on the
 supplied changes.
 
+Session creation is a zero-mutation Open whose Raft apply index becomes the
+client token; its retained result is sequence 1 and the first user mutation is
+sequence 2. The ordinary path keeps one raw-binary header and a fixed raw-binary
+ring with exactly `min(HighSequence, RetryWindow)` physical slots. `AckThrough`
+and the fixed window define a logical retry floor without moving or expanding
+the ring. Missing-header checks use one ordered session-prefix probe, not a scan
+of every possible slot.
+
+Retirement keeps the bounded image retryable. Exact Release is the cold
+maintenance path: it validates and atomically deletes at most `RetryWindow`
+slots. Its work is linear in the configured retry window, capped at 256, and is
+independent of shard row count and historical operation count. Release retains
+the epoch high-water, so reclaiming space does not trade away delayed-command
+fencing.
+
+The replicated SQL hidden collection's hard document limit is
+`RetryWindow + 2`, rather than a fixed maximum-window allocation for every
+shard. Normal transactions supply precise `BatchDocumentsHint` values, so the
+durable dedup map reserves only the actual one-to-three system changes on the
+hot path while retaining the ability to grow to the cold Release bound.
+Benchmark ordinary mutation separately from Open, retirement, and Release, and
+report retry windows 1, 8, and 256 so cold linear work is not blended into
+hot-path latency or allocation results.
+
 The hot path advances a deterministic `DataChainDigest` from the prior chain
 and the exact row changes. This digest is history-sensitive. It is not a
 canonical incremental Merkle root and it cannot prove that images with

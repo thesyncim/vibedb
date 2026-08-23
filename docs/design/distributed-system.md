@@ -104,23 +104,45 @@ the shard image. Mutation planning is bounded by 64 distinct keys. It performs
 indexed point reads plus bytewise validation and digest work on the supplied
 changes.
 
-A stable session key binds tenant and client ID. Its collision-verifiable header
-stores the current client epoch, `RetryHome`, `AckThrough`, sequence high-water,
-status, and configured retry window. `RetryHome` is the fixed-width routing
-discriminator retained through intact-shard ownership transitions. The epoch
-accepts strictly consecutive sequences. An exact retained retry is idempotent.
-A different `RetryHome`, fingerprint, or `LogicalCommandDigest` conflicts.
-The terminal `uint64` sequence is reserved for retirement. An ordinary command
-at that sequence returns `ErrSessionSequence`.
+A stable session key binds tenant and client ID. Session creation is an explicit
+zero-mutation `CommandSessionOpen` with the canonical caller tuple `(epoch=0,
+sequence=1, AckThrough=0)`. It is the only command that may create a header.
+Ordered apply assigns the Open entry's Raft apply index as the shard-issued
+client epoch and returns it in a `ResultSessionOpened` completion. Sequence 1
+therefore retains the Open result and the first user mutation uses the returned
+token at sequence 2. Callers do not guess or coordinate the token. An Open with
+stale mutable fences is an unstored `ErrStaleCommand`, not a minted token.
+
+The collision-verifiable header stores that token, `RetryHome`, `AckThrough`,
+sequence high-water, status, configured retry window, and physical slot count.
+`RetryHome` is the fixed-width routing discriminator retained through
+intact-shard ownership transitions. An active epoch accepts strictly
+consecutive sequences. An exact retained retry is idempotent and may advance
+`AckThrough` without replacing its slot. A different `RetryHome`, fingerprint,
+or `LogicalCommandDigest` conflicts. A competing Open cannot replace an active
+or retired header. The terminal `uint64` sequence is reserved for retirement;
+an ordinary command at that sequence returns `ErrSessionSequence`.
 
 The logical retirement floor is the greater of `AckThrough` and the sequence
 high-water minus the retry-window width, with subtraction clamped at zero.
 Older retries return `ErrRetryRetired` and never execute. Explicit retirement
-with current mutable fences seals an epoch. A stale retirement records a stale
-result and leaves the epoch active. Only the next epoch can reuse a sealed
-stable identity and fixed ring. A stale terminal retirement is an unstored
-`ErrStaleCommand` refusal, so the same sequence can be resubmitted with refreshed
-fences.
+with current mutable fences appends the next sequence and seals an epoch. A
+stale retirement records a stale result and leaves the epoch active. A stale
+terminal retirement is an unstored `ErrStaleCommand` refusal, so the same
+sequence can be resubmitted with refreshed fences. The retired image remains
+retryable until an exact `CommandSessionRelease` repeats its epoch, retirement
+sequence, `AckThrough`, `RetryHome`, and fingerprint. The Open result at
+sequence 1 follows the same floor: once acknowledged or displaced by the ring,
+an old Open retry is retired rather than reinterpreted as a new operation.
+
+Release validates the complete ring before changing it. Every physical slot
+must carry the exact epoch, occupy the canonical modulo position, preserve
+strict applied order across wrap, and only the latest slot may contain the
+retirement result. One atomic publication then deletes the header and every
+slot and decrements both retained counts. An active session is never released,
+and an old Release cannot delete a newer image. Once the header is absent, a
+released token at or below the durable epoch high-water resolves to
+`ErrSessionReleased`.
 
 The hidden collection stores one raw binary session header and at most
 `RetryWindow` raw fixed-size slots per retained stable identity. The slot stores
@@ -129,12 +151,32 @@ envelope rather than retaining one envelope per operation. The state,
 session-header, and slot codecs use durable opaque values without hexadecimal
 JSON wrappers.
 
-Reopen validates the hidden image in one ordered pass with scratch state
-proportional to retained session identities. Persistent dedupe rows and the
-dedupe portion of reopen are bounded by
+The physical slot count is exactly `min(HighSequence, RetryWindow)`. A missing
+header triggers one ordered prefix-existence probe for the session digest;
+orphan slots poison the machine instead of being mistaken for free capacity.
+Reopen validates the hidden image in one ordered pass, including exact epoch,
+slot-count, modulo-position, applied-order, and retirement invariants. Scratch
+state is proportional to retained session identities. Persistent dedupe rows
+and the dedupe portion of reopen are bounded by
 `1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
-Retirement reuses a stable identity but does not remove it. New stable
-identities are refused at `MaxSessions`.
+Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
+refused at `MaxSessions` only while that many images remain retained.
+
+`SessionEpochHighWater` is the durable anti-resurrection fence. During ordinary
+apply it is the greatest apply-index token issued by SessionOpen, and Release
+never lowers it. Mutation, retirement, and release commands cannot create a
+missing header. A missing token at or below the high-water is retired, while a
+token above it is invalid, so delayed commands cannot resurrect reclaimed
+effects. A replayed old Open can create only a new empty session with a later
+apply-index token; it cannot replay user mutations.
+
+The replicated SQL hidden collection's persisted `MaxBatchDocuments` is derived
+from the configured retry window as `RetryWindow + 2`, with a byte limit that
+admits both the full Release delete geometry and the three-record hot
+publication. Each publication passes a precise `BatchDocumentsHint`, so the
+durable transaction's dedup map normally reserves only the actual one-to-three
+system changes. The hint is not an admission limit: a cold Release can grow to
+the frozen hard bound and delete all retained slots atomically.
 
 The current range-split child artifact and tail move user rows, not session
 headers or ring slots. A `RetryHome` that moves to a non-retained child would
@@ -145,6 +187,14 @@ controller refuses the source seal and catalog publication, and the transition
 builders reject direct construction. A serving split requires a certified
 session-partition transfer carrying both the retained ring and its origin
 descriptor before catalog publication.
+
+Staged child initialization nevertheless seeds the empty child's
+`SessionEpochHighWater` to the certified source cut's applied index. Every
+source-issued token that could predate the child is therefore fenced even
+without copied session rows. The first successful child Open is ordered after
+that cut and receives its later child apply index. This prevents delayed source
+commands from manufacturing child-local sessions while the retained-retry
+transfer gate remains closed.
 
 `DataChainDigest` is a deterministic replicated transition fence. Each
 effective mutation advances it from the prior chain, the frozen apply contract,
