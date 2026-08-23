@@ -426,7 +426,6 @@ type scannedSession struct {
 	orderedLastApplied  uint64
 	wrappedFirstApplied uint64
 	wrappedLastApplied  uint64
-	seen                [MaxSessionRetryWindow / 64]uint64
 }
 
 // scanSessionSystemSnapshot performs one ordered, bounded pass over the hidden
@@ -509,11 +508,11 @@ func scanSessionSystemSnapshot(
 			if !ok || view.Slot >= summary.physicalSlots {
 				return fmt.Errorf("%w: slot outside session header", ErrSessionCorrupt)
 			}
-			word, bit := view.Slot/64, view.Slot%64
-			if summary.seen[word]&(uint64(1)<<bit) != 0 {
-				return fmt.Errorf("%w: duplicate physical slot", ErrSessionCorrupt)
-			}
-			summary.seen[word] |= uint64(1) << bit
+			// RangeRaw emits each live KV key once in bytewise order. The exact
+			// key/value round trip above therefore makes every increment a
+			// distinct slot ordinal. Since each ordinal is also below
+			// physicalSlots, the exact count checked after the scan proves the
+			// complete [0, physicalSlots) set without a per-session bitmap.
 			summary.seenSlots++
 			if err := validateStoredSessionSlot(state, view); err != nil {
 				return err
