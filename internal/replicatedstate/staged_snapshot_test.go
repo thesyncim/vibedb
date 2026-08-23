@@ -83,11 +83,35 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	if err != nil || !found || !bytes.Equal(afterA, beforeA) {
 		t.Fatalf("row after install=%q found=%v err=%v", afterA, found, err)
 	}
-	command := testCommand(binding, 1, replication.Mutation{
-		Kind: replication.MutationPut, Key: []byte("c"), Value: []byte(`{"n":3}`),
-	})
-	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
+	open := commandValue(binding, 1)
+	openCommand := sessionOpenFor(open)
+	encodedOpen := encodeCommand(t, openCommand)
+	if err := machine.AdmitCommand(encodedOpen); err != nil {
+		t.Fatalf("admit imported session open: %v", err)
+	}
+	if publication, err := machine.ApplyNormal(raftmodel.ApplyMeta{
 		Index: 8, Term: 3, Type: pb.EntryNormal,
+	}, encodedOpen); err != nil || publication.Applied != 8 {
+		t.Fatalf("apply imported session open = %+v, %v", publication, err)
+	}
+	lookup, err := machine.LookupCompletion(encodedOpen)
+	if err != nil {
+		t.Fatalf("lookup imported session open: %v", err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != ResultSessionOpened ||
+		completion.ClientEpoch != 8 || completion.AppliedSequence != 8 {
+		t.Fatalf("imported session open completion = %+v, %v", completion, err)
+	}
+	epoch := completion.ClientEpoch
+	userCommand := commandValue(binding, 1)
+	userCommand.ClientEpoch = epoch
+	userCommand.Mutations = []replication.Mutation{{
+		Kind: replication.MutationPut, Key: []byte("c"), Value: []byte(`{"n":3}`),
+	}}
+	command := encodeCommand(t, userCommand)
+	if _, err := machine.ApplyNormal(raftmodel.ApplyMeta{
+		Index: 9, Term: 3, Type: pb.EntryNormal,
 	}, command); err != nil {
 		t.Fatal(err)
 	}

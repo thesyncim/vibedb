@@ -24,14 +24,16 @@ func snapshotArtifactFixture(t testing.TB) (machineFixture, *ReadSnapshot) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatalf("InstallSnapshot: %v", err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	for i := uint64(1); i <= 7; i++ {
 		key := []byte(fmt.Sprintf("key-%02d", i))
 		value := []byte(fmt.Sprintf(`{"sequence":%d,"payload":"%s"}`, i, bytes.Repeat([]byte{'a' + byte(i)}, 1400)))
 		command := testCommand(fixture.binding, i, replication.Mutation{
 			Kind: replication.MutationPut, Key: key, Value: value,
 		})
-		if _, err := fixture.machine.ApplyNormal(normalMeta(i+1), command); err != nil {
-			t.Fatalf("ApplyNormal(%d): %v", i+1, err)
+		if _, err := fixture.machine.ApplyNormal(normalMeta(i+2), command); err != nil {
+			t.Fatalf("ApplyNormal(%d): %v", i+2, err)
 		}
 	}
 	snapshot, err := fixture.machine.Snapshot("docs")
@@ -57,7 +59,7 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	const golden = "217806588459acdb52207de0a219c68b1a1e427af96dafd3defff911aca067fe"
+	const golden = "13ed329c0e80868b5428fe5d84dd261d30263e1c47f286cac9837cf5adbfaec5"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -254,11 +256,13 @@ func TestSnapshotArtifactDoesNotFragmentRowAboveTarget(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	value := []byte(fmt.Sprintf(`{"payload":"%s"}`, bytes.Repeat([]byte{'x'}, 8<<10)))
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("large"), Value: value,
 	})
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := fixture.machine.Snapshot()

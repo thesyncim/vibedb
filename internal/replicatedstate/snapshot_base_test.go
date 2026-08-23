@@ -89,9 +89,13 @@ func TestCertifiedLearnerBaseCatchesUpOnlyThroughAppendEntries(t *testing.T) {
 	}, conf); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(source.binding, 1)
+	open.ClientID = id128(70)
+	open.ReplicaSetVersion = 2
+	applySessionOpen(t, source.machine, 3, open)
 	baseCommand := snapshotBaseTestCommand(source.binding, 1, 2, []byte("base"), []byte(`{"n":1}`))
 	if _, err := source.machine.ApplyNormal(raftmodel.ApplyMeta{
-		Index: 3, Term: 2, Type: raftpb.EntryNormal,
+		Index: 4, Term: 2, Type: raftpb.EntryNormal,
 	}, baseCommand); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +211,9 @@ func snapshotBaseTestCommand(
 		ProtectionEpoch:        binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: id128(70), ClientEpoch: 1, ClientSequence: sequence,
+		// The configuration entry occupies index 2 and the explicit session open
+		// mints epoch 3. Callers pass the zero-based user-request ordinal.
+		ClientID: id128(70), ClientEpoch: 3, ClientSequence: sequence + 1,
 		Fingerprint: fingerprint, Collection: "docs",
 		Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: value}},
 	})

@@ -17,6 +17,8 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndImageAudit(t *testing.T)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	random := rand.New(rand.NewSource(20260811))
 	reference := make(map[string][]byte)
 	for step := 0; step < 80; step++ {
@@ -38,7 +40,7 @@ func TestRandomizedMutationHistoryMatchesReferenceMapAndImageAudit(t *testing.T)
 			reference[key] = append([]byte(nil), value...)
 		}
 		command := testCommand(fixture.binding, uint64(step+1), mutations...)
-		publication, err := fixture.machine.ApplyNormal(normalMeta(uint64(step+2)), command)
+		publication, err := fixture.machine.ApplyNormal(normalMeta(uint64(step+3)), command)
 		if err != nil {
 			t.Fatalf("step %d apply: %v", step, err)
 		}
@@ -125,6 +127,8 @@ func TestCoherentSnapshotRacesApply(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	open := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, open)
 	errCh := make(chan error, 2)
 	done := make(chan struct{})
 	var wait sync.WaitGroup
@@ -136,7 +140,7 @@ func TestCoherentSnapshotRacesApply(t *testing.T) {
 			command := testCommand(fixture.binding, uint64(i+1), replication.Mutation{
 				Kind: replication.MutationPut, Key: []byte(fmt.Sprintf("k%02d", i)), Value: []byte("null"),
 			})
-			if _, err := fixture.machine.ApplyNormal(normalMeta(uint64(i+2)), command); err != nil {
+			if _, err := fixture.machine.ApplyNormal(normalMeta(uint64(i+3)), command); err != nil {
 				errCh <- err
 				return
 			}

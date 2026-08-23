@@ -12,10 +12,15 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-func constructionSystemBatchBytes() int {
-	return len(stateKey) + MaxStateEnvelopeBytes +
+const constructionRetryWindow = uint16(8)
+
+func constructionSystemBatchBytes(retryWindow uint16) int {
+	hot := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
+	release := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3)
+	return max(hot, release)
 }
 
 func constructionSystemOptions(options durable.Options) durable.Options {
@@ -24,8 +29,14 @@ func constructionSystemOptions(options durable.Options) durable.Options {
 	options.MaxDocumentBytes = max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
 	)
-	options.MaxBatchDocuments = 3
-	options.MaxBatchBytes = constructionSystemBatchBytes()
+	options.MaxBatchDocuments = int(constructionRetryWindow) + 2
+	// Durable collection profiles reserve room for every key at the collection
+	// maximum, even though the state key itself is only one byte.
+	collectionBound := MaxStateEnvelopeBytes +
+		(int(constructionRetryWindow)+2)*(sha256.Size+3)
+	options.MaxBatchBytes = max(
+		constructionSystemBatchBytes(constructionRetryWindow), collectionBound,
+	)
 	return options
 }
 
@@ -53,11 +64,15 @@ func createTargetAt(t testing.TB, dir, name string, options durable.Options) Col
 func machineOptionsFor(user CollectionTarget) Options {
 	return Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 3,
+			MaxCollections: 2,
+			MaxDocuments: max(
+				user.Limits.MaxDistinctMutations+3,
+				int(constructionRetryWindow)+2,
+			),
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128,
-		RetryWindow: 8,
+		RetryWindow: constructionRetryWindow,
 	}
 }
 
@@ -162,16 +177,19 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	maxSystem := constructionSystemBatchBytes()
+	maxSystem := constructionSystemBatchBytes(constructionRetryWindow)
 	required, ok := checkedTxnBytes(replication.MaxCommandBytes, maxSystem)
 	if !ok {
 		t.Fatal("test byte proof overflowed")
 	}
 	options := Options{TxnLimits: durable.TxnLimits{
 		MaxCollections: 2,
-		MaxDocuments:   user.Limits.MaxDistinctMutations + 3,
-		MaxBytes:       required,
-	}, MaxSessions: 128, RetryWindow: 8}
+		MaxDocuments: max(
+			user.Limits.MaxDistinctMutations+3,
+			int(constructionRetryWindow)+2,
+		),
+		MaxBytes: required,
+	}, MaxSessions: 128, RetryWindow: constructionRetryWindow}
 	if _, err := Open(testBinding(), testBootstrap(), system,
 		UserCollection{Name: "docs", Target: user}, log, options); err != nil {
 		t.Fatalf("exact bounded transaction proof: %v", err)
