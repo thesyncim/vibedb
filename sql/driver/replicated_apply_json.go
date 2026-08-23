@@ -251,7 +251,7 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 4:
-			if err := decodeReplicatedLimitsVibe(c, &decoded.SystemLimits); err != nil {
+			if err := decodeReplicatedSystemLimitsVibe(c, &decoded.SystemLimits); err != nil {
 				return err
 			}
 		case 5:
@@ -294,6 +294,13 @@ func decodeReplicatedApplyMetaVibe(
 	}
 	if decoded.ValidationProfile != uint8(replicatedstate.ValidationDeterministicMutation) {
 		return errors.New("vibedb: replicated apply has the wrong validation profile")
+	}
+	if decoded.RetryWindow == 0 ||
+		decoded.RetryWindow > replicatedstate.MaxSessionRetryWindow {
+		return fmt.Errorf("%w: retry window", ErrReplicatedApplyMismatch)
+	}
+	if decoded.SystemLimits != replicatedApplySystemLimits(decoded.RetryWindow) {
+		return fmt.Errorf("%w: system collection limits", ErrReplicatedApplyMismatch)
 	}
 	*dst = decoded
 	return nil
@@ -383,7 +390,7 @@ func decodeReplicatedPlacementVibe(
 	return nil
 }
 
-func decodeReplicatedLimitsVibe(
+func decodeReplicatedSystemLimitsVibe(
 	c *vibejson.DecodeCursor,
 	dst *ReplicatedShardStoreLimits,
 ) error {
@@ -430,9 +437,6 @@ func decodeReplicatedLimitsVibe(
 		if seen&(uint64(1)<<index) == 0 {
 			return fmt.Errorf("vibedb: replicated shard store limits are missing member %q", name)
 		}
-	}
-	if err := validateReplicatedShardStoreLimits(decoded); err != nil {
-		return err
 	}
 	*dst = decoded
 	return nil

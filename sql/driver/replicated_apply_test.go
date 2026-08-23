@@ -1583,7 +1583,10 @@ func TestReplicatedApplyClaimConnectorLifetime(t *testing.T) {
 }
 
 func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing.T) {
-	_, database, base := bindReplicatedApplyTestRoot(t, "observer-unknown")
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "observer-unknown", false)
+	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
+	t.Cleanup(restore)
+	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	claim, _, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
@@ -1598,8 +1601,6 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 		t.Fatal(err)
 	}
 	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
-	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
-	defer restore()
 	document := []byte(`{"id":"unknown"}`)
 	key := testReplicatedApplyKey(t, database, document)
 	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
@@ -1834,6 +1835,28 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	var decoded ReplicatedApplyIdentity
 	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != identity {
 		t.Fatalf("identity round trip = %+v,%v", decoded, err)
+	}
+	maximum := identity
+	maximum.RetryWindow = replicatedstate.MaxSessionRetryWindow
+	maximum.SystemLimits = replicatedApplySystemLimits(maximum.RetryWindow)
+	maximumEncoded, err := json.Marshal(maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(maximumEncoded, &decoded); err != nil || decoded != maximum {
+		t.Fatalf("maximum retry-window round trip = %+v,%v", decoded, err)
+	}
+	invalidMaximum := bytes.Replace(
+		maximumEncoded,
+		[]byte(`"max_batch_documents":258`),
+		[]byte(`"max_batch_documents":257`),
+		1,
+	)
+	if bytes.Equal(invalidMaximum, maximumEncoded) {
+		t.Fatal("maximum retry-window system-limit mutation did not match")
+	}
+	if err := json.Unmarshal(invalidMaximum, new(ReplicatedApplyIdentity)); !errors.Is(err, ErrReplicatedApplyMismatch) {
+		t.Fatalf("altered maximum retry-window system limits = %v, want mismatch", err)
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &fields); err != nil {
