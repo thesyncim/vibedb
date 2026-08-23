@@ -45,6 +45,7 @@ func (c *Collection) RangeRawCurrentBuffer(
 	if fn == nil {
 		return scratch, nil
 	}
+	c.snapshotFullScanCalls.Add(1)
 
 	var captured primaryCurrentScanOverlayCapture
 	view, pin, rooted, err := c.capturePrimaryCurrentScan(&captured)
@@ -60,7 +61,9 @@ func (c *Collection) RangeRawCurrentBuffer(
 			return scratch, snapshotErr
 		}
 		defer snapshot.Close()
-		return snapshot.RangeRawBuffer(scratch, fn)
+		// The current-scan entry above owns the one observable scan count. Calling
+		// the public Snapshot wrapper here would double-count this rare fallback.
+		return snapshot.rangeRawBuffer(scratch, fn)
 	}
 	defer pin.release()
 	return c.rangeRawCurrentAt(view, &captured, scratch, fn)
@@ -459,10 +462,7 @@ func (s *Snapshot) RangeRaw(fn func(key, value []byte) error) error {
 		return ErrClosed
 	}
 	s.collection.snapshotFullScanCalls.Add(1)
-	scratch, err := s.rangePrimaryGraphBuffer(
-		nil, nil, nil, s.overflowScanValue, fn,
-	)
-	s.overflowScanValue = scratch
+	_, err := s.rangeRawBuffer(nil, fn)
 	return err
 }
 
@@ -476,6 +476,13 @@ func (s *Snapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) err
 		return scratch, ErrClosed
 	}
 	s.collection.snapshotFullScanCalls.Add(1)
+	return s.rangeRawBuffer(scratch, fn)
+}
+
+// rangeRawBuffer executes one already-accounted complete snapshot scan. It is
+// private so Collection.RangeRawCurrentBuffer can preserve one-call/one-count
+// semantics when its rare deferred-structural fallback materializes a Snapshot.
+func (s *Snapshot) rangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if fn == nil {
 		return scratch, nil
 	}

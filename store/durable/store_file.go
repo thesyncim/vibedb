@@ -217,8 +217,10 @@ type Collection struct {
 	reclaimer     *storeio.ExtentReclaimer
 	pageValidator *fileStorePageValidator
 
-	// snapshotFullScanCalls counts calls at the two complete-snapshot scan
-	// entry points. Point reads and mutation routing never touch it.
+	// snapshotFullScanCalls counts calls at every public complete-collection scan
+	// entry point. The historical field name is retained inside the collection so
+	// this instrumentation remains an isolated, mechanically small qualification
+	// aid. Point reads and mutation routing never touch it.
 	snapshotFullScanCalls atomic.Uint64
 	// journal is the bounded redo log paired eagerly with DurabilitySync and
 	// explicit RecoveryJournal stores, and lazily on the first valid ordinary
@@ -574,10 +576,11 @@ type Stats struct {
 	PinnedPages         uint64
 	DirtyBytes          uint64
 
-	// SnapshotFullScanCalls counts valid calls to Snapshot.RangeRaw and
-	// Snapshot.RangeRawBuffer since this collection was opened. It advances at
-	// public entry, before cursor construction or callback delivery, so a
-	// stopped or failed full scan remains observable. Point reads do not change it.
+	// SnapshotFullScanCalls counts valid calls to the complete-collection
+	// Snapshot.RangeRaw*, Collection.RangeRawCurrent* entry points since this
+	// collection was opened. It advances once at public entry, before cursor
+	// construction or callback delivery, so a stopped or failed full scan remains
+	// observable. Point reads do not change it.
 	SnapshotFullScanCalls uint64
 
 	PageReads       uint64

@@ -3,7 +3,7 @@ name: P0.1 10M-row apply qualification
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
 
 permissions:
   contents: read
@@ -15,7 +15,10 @@ concurrency:
 jobs:
   qualify:
     name: 10M-row point apply
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'p01-apply-10m'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'p01-apply-10m') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'p01-apply-10m'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

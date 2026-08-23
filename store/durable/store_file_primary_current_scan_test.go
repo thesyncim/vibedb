@@ -466,6 +466,45 @@ func TestBufferedUnifiedRangeRawCurrentBufferStructuralMutationStartsNextCut(t *
 	assertBufferedCurrentScan(t, collection, nextOracle)
 }
 
+func TestRangeRawCurrentDeferredSnapshotFallbackCountsOneFullScan(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, 250, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	key := fixture.keys[8]
+	value := fmt.Appendf(
+		nil, `{"scan":"deferred-fallback","pad":%q}`,
+		strings.Repeat("x", collection.options.InlineValueBytes+1),
+	)
+	created, err := collection.Put([]byte(key), value)
+	if err != nil || created {
+		t.Fatalf("replace with overflow row: created=%v err=%v", created, err)
+	}
+
+	// A replacement beyond the inline budget takes the deferred COW lane and
+	// leaves a valid pending parent for checkpoint folding. RangeRawCurrent must
+	// use its Snapshot fallback here and still account for one public scan, not
+	// two.
+	if len(collection.primaryPendingParents) == 0 {
+		t.Fatal("deferred fallback fixture has no prepared parent")
+	}
+
+	before := collection.Stats().SnapshotFullScanCalls
+	rows := 0
+	if _, err := collection.RangeRawCurrentBuffer(nil, func(_, _ []byte) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rows != len(fixture.keys) {
+		t.Fatalf("deferred fallback rows = %d, want %d", rows, len(fixture.keys))
+	}
+	if got := collection.Stats().SnapshotFullScanCalls; got != before+1 {
+		t.Fatalf("deferred fallback full scans = %d, want %d", got, before+1)
+	}
+}
+
 func TestBufferedUnifiedRangeRawCurrentBufferDoesNotBlockFlushCallback(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 256, concurrentPrimaryTestOptions(),
