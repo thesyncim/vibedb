@@ -168,7 +168,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 			record.Slot != retirementSlot || record.ClientEpoch != session.ClientEpoch ||
 			record.ClientSequence != session.HighSequence ||
-			record.ResultCode != ResultSessionRetired) {
+			!isSessionTerminalResult(record.ResultCode)) {
 			slotErr = fmt.Errorf("%w: retirement slot mismatch", ErrSessionCorrupt)
 		}
 		if slotErr == nil {
@@ -251,6 +251,108 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 		record.Fingerprint != command.Fingerprint ||
 		record.LogicalCommandDigest != LogicalCommandDigest(command) {
 		return result, &RequestConflictError{Key: digest}
+	}
+	return result, nil
+}
+
+// LookupSessionLease returns the exact retained lease and sequence fence for
+// one issued client epoch. It performs only indexed point reads. The result is
+// observational state for a future authenticated serving layer; it grants no
+// authority to renew or revoke the session.
+func (m *Machine) LookupSessionLease(
+	tenant []byte,
+	clientID replication.ID128,
+	clientEpoch uint64,
+) (SessionLeaseLookup, error) {
+	if len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
+		clientID == (replication.ID128{}) || clientEpoch == 0 {
+		return SessionLeaseLookup{}, ErrSessionEpoch
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.checkUsable(); err != nil {
+		return SessionLeaseLookup{}, err
+	}
+	if !m.initialized {
+		return SessionLeaseLookup{}, ErrWrongBinding
+	}
+	cut, err := durable.SnapshotCollections([]durable.NamedCollection{{
+		Name: systemCollectionName, Collection: m.system.Collection,
+	}})
+	if err != nil {
+		return SessionLeaseLookup{}, m.fail(err)
+	}
+	snapshot, ok := cut.Collection(systemCollectionName)
+	if !ok || snapshot == nil {
+		return SessionLeaseLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
+	}
+	digest := SessionKey(tenant, clientID)
+	key := SessionStorageKey(digest)
+	session, found, readErr := sessionAt(pointSnapshot{snapshot}, key)
+	if readErr == nil && found &&
+		(session.Digest != digest || !bytes.Equal(session.Tenant, tenant) ||
+			session.ClientID != clientID) {
+		readErr = fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+	}
+	if readErr == nil && found && session.RetryWindow != m.options.RetryWindow {
+		readErr = fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
+	}
+	if readErr != nil {
+		return SessionLeaseLookup{}, m.fail(errors.Join(readErr, cut.Close()))
+	}
+	if !found {
+		orphanErr := ensureNoSessionSlots(
+			pointSnapshot{snapshot}, digest, m.options.RetryWindow,
+		)
+		closeErr := cut.Close()
+		if orphanErr != nil || closeErr != nil {
+			return SessionLeaseLookup{}, m.fail(errors.Join(orphanErr, closeErr))
+		}
+		if clientEpoch <= m.state.SessionEpochHighWater {
+			return SessionLeaseLookup{}, ErrSessionReleased
+		}
+		return SessionLeaseLookup{}, ErrSessionEpoch
+	}
+	if clientEpoch != session.ClientEpoch {
+		closeErr := cut.Close()
+		if closeErr != nil {
+			return SessionLeaseLookup{}, m.fail(closeErr)
+		}
+		if clientEpoch < session.ClientEpoch {
+			return SessionLeaseLookup{}, ErrRetryRetired
+		}
+		return SessionLeaseLookup{}, ErrSessionEpoch
+	}
+	slot := uint16((session.HighSequence - 1) % uint64(session.RetryWindow))
+	slotKey, keyErr := SessionSlotStorageKey(digest, slot)
+	if keyErr != nil {
+		_ = cut.Close()
+		return SessionLeaseLookup{}, m.fail(keyErr)
+	}
+	record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, slotKey)
+	if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
+		record.Slot != slot || record.ClientEpoch != clientEpoch ||
+		record.ClientSequence != session.HighSequence) {
+		slotErr = fmt.Errorf("%w: latest lease slot mismatch", ErrSessionCorrupt)
+	}
+	if slotErr == nil {
+		slotErr = validateStoredSessionSlot(m.state, record)
+	}
+	if slotErr == nil {
+		slotErr = validateSessionSlotAgainstHeader(session, record)
+	}
+	closeErr := cut.Close()
+	if slotErr != nil || closeErr != nil {
+		return SessionLeaseLookup{}, m.fail(errors.Join(slotErr, closeErr))
+	}
+	result := SessionLeaseLookup{
+		ClientEpoch: session.ClientEpoch, HighSequence: session.HighSequence,
+		AckThrough:            session.AckThrough,
+		LeaseDeadlineUnixNano: session.LeaseDeadlineUnixNano,
+		Status:                session.Status,
+	}
+	if session.Status == SessionRetired {
+		result.TerminalResult = record.ResultCode
 	}
 	return result, nil
 }

@@ -196,6 +196,23 @@ func TestStaleSessionRetireDoesNotSealLiveEpoch(t *testing.T) {
 }
 
 func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
+	testTerminalSessionCommandRetriesWithoutStrandingEpoch(
+		t, replication.CommandSessionRetire, ResultSessionRetired,
+	)
+}
+
+func TestTerminalSessionRevokeRetriesWithoutStrandingEpoch(t *testing.T) {
+	testTerminalSessionCommandRetriesWithoutStrandingEpoch(
+		t, replication.CommandSessionRevoke, ResultSessionRevoked,
+	)
+}
+
+func testTerminalSessionCommandRetriesWithoutStrandingEpoch(
+	t *testing.T,
+	kind replication.CommandKind,
+	wantResult uint32,
+) {
+	t.Helper()
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -219,8 +236,9 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 		Tenant: identity.Tenant, ClientID: identity.ClientID,
 		ClientEpoch: 2, RetryHome: identity.RetryHome,
 		AckThrough: low - 1, HighSequence: high, Status: SessionActive,
-		RetryWindow:       fixture.machine.options.RetryWindow,
-		PhysicalSlotCount: fixture.machine.options.RetryWindow,
+		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
+		RetryWindow:           fixture.machine.options.RetryWindow,
+		PhysicalSlotCount:     fixture.machine.options.RetryWindow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -276,13 +294,16 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 		t.Fatalf("terminal ordinary admission = %v", err)
 	}
 
-	retire := commandValue(fixture.binding, math.MaxUint64-1)
-	retire.Kind = replication.CommandSessionRetire
-	retire.AckThrough = high
-	retire.Mutations = nil
-	retire.RoutingVersion++
-	retire.RouteGeneration++
-	staleBytes := encodeCommand(t, retire)
+	terminal := commandValue(fixture.binding, math.MaxUint64-1)
+	terminal.Kind = kind
+	terminal.AckThrough = high
+	terminal.Mutations = nil
+	if kind == replication.CommandSessionRevoke {
+		terminal.ExpectedDeadlineUnixNano = testSessionLeaseDeadlineUnixNano
+	}
+	terminal.RoutingVersion++
+	terminal.RouteGeneration++
+	staleBytes := encodeCommand(t, terminal)
 	if err := machine.AdmitCommand(staleBytes); !errors.Is(err, ErrStaleCommand) {
 		t.Fatalf("terminal stale retirement admission = %v", err)
 	}
@@ -302,21 +323,21 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen terminal refusal: %v", err)
 	}
-	retire.RoutingVersion = fixture.binding.RoutingVersion
-	retire.RouteGeneration = fixture.binding.RouteGeneration
-	retireBytes := encodeCommand(t, retire)
-	if err := machine.AdmitCommand(retireBytes); err != nil {
+	terminal.RoutingVersion = fixture.binding.RoutingVersion
+	terminal.RouteGeneration = fixture.binding.RouteGeneration
+	terminalBytes := encodeCommand(t, terminal)
+	if err := machine.AdmitCommand(terminalBytes); err != nil {
 		t.Fatalf("refreshed terminal retirement admission: %v", err)
 	}
-	if _, err := machine.ApplyNormal(normalMeta(window+4), retireBytes); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(window+4), terminalBytes); err != nil {
 		t.Fatal(err)
 	}
-	lookup, err := machine.LookupCompletion(retireBytes)
+	lookup, err := machine.LookupCompletion(terminalBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	completion, err := replication.OpenCompletion(lookup.Bytes)
-	if err != nil || completion.ResultCode != ResultSessionRetired {
+	if err != nil || completion.ResultCode != wantResult {
 		t.Fatalf("terminal retirement completion = %+v,%v", completion, err)
 	}
 
@@ -328,7 +349,7 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen terminal retirement: %v", err)
 	}
-	release := sessionRelease(retire)
+	release := sessionRelease(terminal)
 	if _, err := machine.ApplyNormal(normalMeta(window+5), encodeCommand(t, release)); err != nil {
 		t.Fatalf("terminal release: %v", err)
 	}

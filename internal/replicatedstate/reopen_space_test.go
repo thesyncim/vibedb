@@ -6,7 +6,7 @@ import (
 )
 
 func TestScannedSessionScratchExcludesRetryWindowBitmap(t *testing.T) {
-	const wantScratchBytes = uintptr(56)
+	const wantScratchBytes = uintptr(64)
 	if got := unsafe.Sizeof(scannedSession{}); got != wantScratchBytes {
 		t.Fatalf("scannedSession scratch = %d bytes, want %d", got, wantScratchBytes)
 	}

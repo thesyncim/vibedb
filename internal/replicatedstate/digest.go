@@ -19,6 +19,7 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"fixed-retry-ring;explicit-session-open;raft-index-session-epoch;" +
 	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
 	"exact-retired-session-release;terminal-stale-retire-unstored;" +
+	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
 	"stable-logical-command-digest"
 
 var (
@@ -266,7 +267,7 @@ func applyContractDigest(
 	_, _ = h.Write([]byte{byte(target.Validation)})
 	_, _ = h.Write(target.ValidationDigest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
-	var grammar [2 + 9*4]byte
+	var grammar [2 + 11*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -277,6 +278,8 @@ func applyContractDigest(
 		ResultWrongShard,
 		ResultSessionRetired,
 		ResultSessionOpened,
+		ResultSessionRenewed,
+		ResultSessionRevoked,
 		MaxDistinctMutations,
 	} {
 		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)

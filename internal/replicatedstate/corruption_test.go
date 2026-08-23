@@ -24,7 +24,8 @@ func TestSessionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
 	foreign, err := AppendSessionRecord(nil, SessionRecord{
 		Tenant: []byte("foreign"), ClientID: id128(91), ClientEpoch: 1,
 		RetryHome: view.RetryHome, HighSequence: 1, Status: SessionActive,
-		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: 1,
+		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
+		RetryWindow:           fixture.machine.options.RetryWindow, PhysicalSlotCount: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -663,7 +664,8 @@ func putCraftedSession(
 		Tenant: command.Tenant, ClientID: command.ClientID,
 		ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
 		HighSequence: command.ClientSequence, Status: SessionActive,
-		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: slotIndex + 1,
+		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
+		RetryWindow:           fixture.machine.options.RetryWindow, PhysicalSlotCount: slotIndex + 1,
 	})
 	if err != nil {
 		t.Fatal(err)

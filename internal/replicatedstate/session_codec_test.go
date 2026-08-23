@@ -35,15 +35,16 @@ func sessionCodecFingerprint(seed byte) replication.Digest {
 
 func sessionCodecRecord() SessionRecord {
 	return SessionRecord{
-		Tenant:            []byte("tenant-a"),
-		ClientID:          sessionCodecID(11),
-		ClientEpoch:       7,
-		RetryHome:         replication.RetryHome{0, 1, 2, 3, 4, 5, 6, 7},
-		AckThrough:        11,
-		HighSequence:      14,
-		Status:            SessionActive,
-		RetryWindow:       16,
-		PhysicalSlotCount: 14,
+		Tenant:                []byte("tenant-a"),
+		ClientID:              sessionCodecID(11),
+		ClientEpoch:           7,
+		RetryHome:             replication.RetryHome{0, 1, 2, 3, 4, 5, 6, 7},
+		AckThrough:            11,
+		HighSequence:          14,
+		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
+		Status:                SessionActive,
+		RetryWindow:           16,
+		PhysicalSlotCount:     14,
 	}
 }
 
@@ -85,6 +86,7 @@ func TestSessionRecordRoundTripBorrowedAndAllocationFree(t *testing.T) {
 		!bytes.Equal(view.Tenant, record.Tenant) || view.ClientID != record.ClientID ||
 		view.ClientEpoch != record.ClientEpoch || view.RetryHome != record.RetryHome ||
 		view.AckThrough != record.AckThrough || view.HighSequence != record.HighSequence ||
+		view.LeaseDeadlineUnixNano != record.LeaseDeadlineUnixNano ||
 		view.Status != record.Status || view.RetryWindow != record.RetryWindow ||
 		view.PhysicalSlotCount != record.PhysicalSlotCount {
 		t.Fatalf("round trip view = %+v", view)
@@ -209,6 +211,12 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	if _, err := OpenSessionRecord(badChecksum); !errors.Is(err, ErrSessionCorrupt) {
 		t.Fatalf("checksum error = %v", err)
 	}
+	oldFormat := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint16(oldFormat[8:10], sessionRecordCodecFormat-1)
+	sealRecord(oldFormat, sessionRecordChecksumDomain)
+	if _, err := OpenSessionRecord(oldFormat); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("obsolete session format error = %v, want ErrSessionCorrupt", err)
+	}
 
 	for name, mutate := range map[string]func([]byte){
 		"status":   func(candidate []byte) { candidate[20] = 9 },
@@ -222,6 +230,12 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 		},
 		"retirement-seal": func(candidate []byte) {
 			candidate[20] = byte(SessionRetired)
+		},
+		"negative-deadline": func(candidate []byte) {
+			binary.LittleEndian.PutUint64(candidate[112:120], uint64(1)<<63)
+		},
+		"zero-active-deadline": func(candidate []byte) {
+			clear(candidate[112:120])
 		},
 		"window": func(candidate []byte) {
 			binary.LittleEndian.PutUint16(candidate[22:24], MaxSessionRetryWindow+1)
@@ -255,6 +269,11 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	got, err := AppendSessionRecord(prefix, invalid)
 	if !errors.Is(err, ErrSessionCorrupt) || !bytes.Equal(got, prefix) {
 		t.Fatalf("invalid append = %q,%v", got, err)
+	}
+	invalid = record
+	invalid.LeaseDeadlineUnixNano = 0
+	if _, err := AppendSessionRecord(nil, invalid); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("active zero lease deadline = %v, want ErrSessionCorrupt", err)
 	}
 }
 

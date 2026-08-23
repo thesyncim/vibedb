@@ -150,11 +150,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"d7a5e26195540fcd989c5c26111eda81b72731914391a1ab817118dee01418e1")
+		"7bfd39d5cc0f3b46ea3feb7c3f3f65bd93082150297a060000832037293246a2")
 	assertDigestHex(t, "data-chain seed", seed,
-		"b51b80970152eea4d335836d9b062de757022b501965bc6b6f3ab64a4c454378")
+		"85105f3343828b5bc192e5f0b093f4d02346b0ed6166d0cd86dd94ac022f4397")
 	assertDigestHex(t, "data-chain transition", transition,
-		"303747f04b3c9c737943dbf46d8e589e6de8e7aac50e39536408f23f6d99a051")
+		"b51ccf2ae848c0996e5317b54e23ec72e75bcfbf7675885ce9d59e3a5d9fa931")
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {

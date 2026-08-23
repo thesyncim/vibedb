@@ -416,6 +416,7 @@ func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
 type scannedSession struct {
 	epoch               uint64
 	highSequence        uint64
+	leaseDeadline       int64
 	physicalSlots       uint16
 	retryWindow         uint16
 	status              SessionStatus
@@ -485,8 +486,9 @@ func scanSessionSystemSnapshot(
 			}
 			sessions[view.Digest] = scannedSession{
 				epoch:        view.ClientEpoch,
-				highSequence: view.HighSequence, physicalSlots: view.PhysicalSlotCount,
-				retryWindow: view.RetryWindow, status: view.Status,
+				highSequence: view.HighSequence, leaseDeadline: view.LeaseDeadlineUnixNano,
+				physicalSlots: view.PhysicalSlotCount,
+				retryWindow:   view.RetryWindow, status: view.Status,
 			}
 			sessionEpochs = append(sessionEpochs, view.ClientEpoch)
 			sessionCount++
@@ -520,7 +522,8 @@ func scanSessionSystemSnapshot(
 			if err := validateSessionSlotAgainstHeader(SessionView{
 				Digest: view.SessionDigest, ClientEpoch: summary.epoch,
 				HighSequence: summary.highSequence, RetryWindow: summary.retryWindow,
-				PhysicalSlotCount: summary.physicalSlots, Status: summary.status,
+				LeaseDeadlineUnixNano: summary.leaseDeadline,
+				PhysicalSlotCount:     summary.physicalSlots, Status: summary.status,
 			}, view); err != nil {
 				return err
 			}
@@ -583,8 +586,10 @@ func scanSessionSystemSnapshot(
 		if summary.seenSlots != summary.physicalSlots ||
 			uint64(summary.currentSlots) != requiredCurrent || !summary.latestSeen ||
 			orderErr != nil ||
-			summary.status == SessionRetired && summary.latestResult != ResultSessionRetired ||
-			summary.status == SessionActive && summary.latestResult == ResultSessionRetired {
+			summary.status == SessionRetired && !isSessionTerminalResult(summary.latestResult) ||
+			summary.status == SessionActive && isSessionTerminalResult(summary.latestResult) ||
+			summary.latestResult == ResultSessionRevoked && summary.leaseDeadline != 0 ||
+			summary.latestResult == ResultSessionRetired && summary.leaseDeadline == 0 {
 			return State{}, false, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
 		}
 	}
@@ -592,7 +597,7 @@ func scanSessionSystemSnapshot(
 }
 
 func validateStoredSessionSlot(state State, slot SessionSlotView) error {
-	if slot.ResultCode < ResultApplied || slot.ResultCode > ResultSessionOpened {
+	if !isSessionResultCode(slot.ResultCode) {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrSessionCorrupt)
 	}
 	if slot.AppliedSequence < 2 || slot.AppliedSequence > state.Applied ||
@@ -624,9 +629,13 @@ func validateSessionSlotAgainstHeader(session SessionView, slot SessionSlotView)
 	if !ok || slot.Slot >= session.PhysicalSlotCount || slot.ClientSequence != expected {
 		return fmt.Errorf("%w: retained session result sequence", ErrSessionCorrupt)
 	}
-	if slot.ResultCode == ResultSessionRetired {
+	if isSessionTerminalResult(slot.ResultCode) {
 		if session.Status != SessionRetired || slot.ClientSequence != session.HighSequence {
 			return fmt.Errorf("%w: misplaced session retirement result", ErrSessionCorrupt)
+		}
+		if slot.ResultCode == ResultSessionRevoked && session.LeaseDeadlineUnixNano != 0 ||
+			slot.ResultCode == ResultSessionRetired && session.LeaseDeadlineUnixNano == 0 {
+			return fmt.Errorf("%w: terminal session lease mismatch", ErrSessionCorrupt)
 		}
 	} else if session.Status == SessionRetired && slot.ClientSequence == session.HighSequence {
 		return fmt.Errorf("%w: retired session lacks terminal result", ErrSessionCorrupt)
@@ -684,8 +693,8 @@ func (o sessionAppliedOrder) finish(high uint64, window uint16) error {
 }
 
 func (m *Machine) validateCompletionResult(completion replication.CompletionView) error {
-	if completion.ResultFormat != ResultFormatMutation || completion.ResultCode < ResultApplied ||
-		completion.ResultCode > ResultSessionOpened {
+	if completion.ResultFormat != ResultFormatMutation ||
+		!isSessionResultCode(completion.ResultCode) {
 		return fmt.Errorf("%w: unsupported completion result grammar", ErrCompletionCorrupt)
 	}
 	return nil
