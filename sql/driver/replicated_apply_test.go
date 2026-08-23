@@ -309,9 +309,9 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrCompletionCorrupt) ||
+	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrSessionCorrupt) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
-		t.Fatalf("first corrupt admission = %v, want completion corruption plus poison", err)
+		t.Fatalf("first corrupt admission = %v, want session corruption plus poison", err)
 	}
 	if got, err := claim.CapacityQualificationProfile(); got != (ReplicatedApplyCapacityProfile{}) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
@@ -534,7 +534,10 @@ func TestReplicatedApplyActivateValidateAndExactReopen(t *testing.T) {
 	if reopenedClaim.Applied() != finalApplied {
 		t.Fatalf("reopened Applied = %d, want %d", reopenedClaim.Applied(), finalApplied)
 	}
-	if got := completionResultCode(t, reopenedClaim, valid); got != replicatedstate.ResultApplied {
+	if _, err := reopenedClaim.LookupCompletion(valid); !errors.Is(err, replicatedstate.ErrRetryRetired) {
+		t.Fatalf("reopened retired retry = %v, want ErrRetryRetired", err)
+	}
+	if got := completionResultCode(t, reopenedClaim, deletePresent); got != replicatedstate.ResultApplied {
 		t.Fatalf("reopened completion result = %d", got)
 	}
 	if err := reopenedClaim.Close(); err != nil {
