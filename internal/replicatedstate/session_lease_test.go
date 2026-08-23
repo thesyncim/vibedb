@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -138,6 +141,80 @@ func TestSessionLeaseOpenRenewCASAndStaleFence(t *testing.T) {
 	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 3 || lease.LeaseDeadlineUnixNano != secondDeadline {
 		t.Fatalf("mismatched renewal changed lease = %+v, %v", lease, err)
+	}
+}
+
+func TestSessionRenewSurvivesReopenAndContinuesCAS(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	secondDeadline := testSessionLeaseDeadlineUnixNano + 1_000
+	first := sessionRenewal(
+		fixture.binding, 2, testSessionLeaseDeadlineUnixNano, secondDeadline,
+	)
+	firstBytes := encodeCommand(t, first)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), firstBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+		fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("reopen renewed lease: %v", err)
+	}
+	requireSessionResult(t, reopened, firstBytes, ResultSessionRenewed)
+	lease, err := reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	if err != nil || lease.HighSequence != 2 ||
+		lease.LeaseDeadlineUnixNano != secondDeadline || lease.Status != SessionActive {
+		t.Fatalf("reopened renewed lease = %+v, %v", lease, err)
+	}
+	thirdDeadline := secondDeadline + 1_000
+	second := sessionRenewal(fixture.binding, 3, secondDeadline, thirdDeadline)
+	second.AckThrough = 2
+	secondBytes := encodeCommand(t, second)
+	if _, err := reopened.ApplyNormal(normalMeta(4), secondBytes); err != nil {
+		t.Fatal(err)
+	}
+	requireSessionResult(t, reopened, secondBytes, ResultSessionRenewed)
+	lease, err = reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	if err != nil || lease.HighSequence != 3 || lease.AckThrough != 2 ||
+		lease.LeaseDeadlineUnixNano != thirdDeadline || lease.Status != SessionActive {
+		t.Fatalf("continued renewed lease = %+v, %v", lease, err)
+	}
+}
+
+func TestSessionRenewWinningSequenceFencesDelayedRevoke(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	deadline := testSessionLeaseDeadlineUnixNano
+	delayed := sessionRevocation(fixture.binding, 2, 1, deadline)
+	delayedBytes := encodeCommand(t, delayed)
+	renewedDeadline := deadline + 1_000
+	renew := sessionRenewal(fixture.binding, 2, deadline, renewedDeadline)
+	renewBytes := encodeCommand(t, renew)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), renewBytes); err != nil {
+		t.Fatal(err)
+	}
+	original := requireSessionResult(t, fixture.machine, renewBytes, ResultSessionRenewed)
+	conflict, err := fixture.machine.LookupCompletion(delayedBytes)
+	if !errors.Is(err, ErrRequestConflict) || conflict.AppliedSequence != original.AppliedSequence ||
+		!bytes.Equal(conflict.Bytes, original.Bytes) {
+		t.Fatalf("renew/revoke sequence conflict = %+v, %v", conflict, err)
+	}
+	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	if err != nil || lease.HighSequence != 2 || lease.Status != SessionActive ||
+		lease.LeaseDeadlineUnixNano != renewedDeadline {
+		t.Fatalf("delayed revoke overrode renewal = %+v, %v", lease, err)
 	}
 }
 
@@ -330,6 +407,50 @@ func TestFreshSessionRevokeRefusesCooperativelyRetiredSession(t *testing.T) {
 	}
 }
 
+func TestLookupSessionLeaseEpochOutcomes(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, prototype)
+	if _, err := fixture.machine.LookupSessionLease(
+		prototype.Tenant, prototype.ClientID, 0,
+	); !errors.Is(err, ErrSessionEpoch) {
+		t.Fatalf("zero epoch lookup = %v, want ErrSessionEpoch", err)
+	}
+	if _, err := fixture.machine.LookupSessionLease(
+		prototype.Tenant, prototype.ClientID, 3,
+	); !errors.Is(err, ErrSessionEpoch) {
+		t.Fatalf("future epoch lookup = %v, want ErrSessionEpoch", err)
+	}
+	retire := sessionRetirement(commandValue(fixture.binding, 1))
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encodeCommand(t, retire)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(
+		normalMeta(4), encodeCommand(t, sessionRelease(retire)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.LookupSessionLease(
+		prototype.Tenant, prototype.ClientID, 2,
+	); !errors.Is(err, ErrSessionReleased) {
+		t.Fatalf("released epoch lookup = %v, want ErrSessionReleased", err)
+	}
+	_, _, nextEpoch := applySessionOpen(t, fixture.machine, 5, prototype)
+	if _, err := fixture.machine.LookupSessionLease(
+		prototype.Tenant, prototype.ClientID, 2,
+	); !errors.Is(err, ErrRetryRetired) {
+		t.Fatalf("older epoch lookup = %v, want ErrRetryRetired", err)
+	}
+	if _, err := fixture.machine.LookupSessionLease(
+		prototype.Tenant, prototype.ClientID, nextEpoch+1,
+	); !errors.Is(err, ErrSessionEpoch) {
+		t.Fatalf("newer epoch lookup = %v, want ErrSessionEpoch", err)
+	}
+}
+
 func TestReopenRejectsRevokedLeaseDeadlineMismatch(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -363,4 +484,252 @@ func TestReopenRejectsRevokedLeaseDeadlineMismatch(t *testing.T) {
 	); !errors.Is(err, ErrSessionCorrupt) {
 		t.Fatalf("reopen revoked nonzero deadline = %v, want ErrSessionCorrupt", err)
 	}
+}
+
+func TestReopenRejectsRevokedTerminalResultMismatch(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, prototype)
+	revoke := sessionRevocation(
+		fixture.binding, 2, 1, testSessionLeaseDeadlineUnixNano,
+	)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encodeCommand(t, revoke)); err != nil {
+		t.Fatal(err)
+	}
+	digest := SessionKey(prototype.Tenant, prototype.ClientID)
+	slotKey, err := SessionSlotStorageKey(digest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, found := rawSessionReleaseRow(t, fixture.system.Collection, slotKey[:])
+	if !found {
+		t.Fatal("revocation slot is missing")
+	}
+	binary.LittleEndian.PutUint32(slot[140:144], ResultSessionRetired)
+	sealRecord(slot, sessionSlotChecksumDomain)
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		return batch.Put(slotKey[:], slot)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+		fixture.machine.options,
+	); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("reopen revoked retirement result = %v, want ErrSessionCorrupt", err)
+	}
+}
+
+func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
+	store := newPersistentSessionLifecycleStore(t, 4)
+	defer store.close(t)
+	if _, err := store.machine.InstallSnapshot(store.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(store.binding, 1)
+	_, _, epoch := applySessionOpen(t, store.machine, 2, prototype)
+	capture := newSessionLeaseCaptureStore(t, store.dir)
+	defer capture.close()
+	store.machine.options.TxnLimits.MaxCollections = 3
+	store.machine.options.TxnLimits.MaxDocuments = 68
+	store.machineOptions.TxnLimits.MaxCollections = 3
+	store.machineOptions.TxnLimits.MaxDocuments = 68
+	if err := store.machine.BeginTransitionCapture(capture.encoder); err != nil {
+		t.Fatalf("begin lease fault capture: %v", err)
+	}
+	revoke := sessionRevocation(
+		store.binding, 2, 1, testSessionLeaseDeadlineUnixNano,
+	)
+	revokeBytes := encodeCommand(t, revoke)
+	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
+	_, applyErr := store.machine.ApplyNormal(normalMeta(3), revokeBytes)
+	restore()
+	if !errors.Is(applyErr, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("revoke decision sync = %v, want ErrCommitOutcomeUnknown", applyErr)
+	}
+	reopenSessionLeaseStoreAfterUnknownOutcome(t, store, capture)
+	lease, err := store.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	if err != nil {
+		t.Fatalf("lookup recovered revoke lease: %v", err)
+	}
+	switch {
+	case lease.HighSequence == 1 && lease.Status == SessionActive &&
+		lease.LeaseDeadlineUnixNano == testSessionLeaseDeadlineUnixNano &&
+		lease.TerminalResult == 0:
+		if capture.collection.Len() != 0 {
+			t.Fatalf("all-old revoke retained %d capture rows", capture.collection.Len())
+		}
+		if _, err := store.machine.LookupCompletion(revokeBytes); !errors.Is(err, ErrCompletionNotFound) {
+			t.Fatalf("all-old revoke lookup = %v, want ErrCompletionNotFound", err)
+		}
+	case lease.HighSequence == 2 && lease.AckThrough == 1 &&
+		lease.Status == SessionRetired && lease.LeaseDeadlineUnixNano == 0 &&
+		lease.TerminalResult == ResultSessionRevoked:
+		if capture.collection.Len() != 1 {
+			t.Fatalf("all-new revoke retained %d capture rows, want 1", capture.collection.Len())
+		}
+		requireSessionResult(t, store.machine, revokeBytes, ResultSessionRevoked)
+	default:
+		t.Fatalf("recovered torn revoke state = %+v", lease)
+	}
+}
+
+func reopenSessionLeaseStoreAfterUnknownOutcome(
+	t testing.TB,
+	store *persistentSessionLifecycleStore,
+	capture *sessionLeaseCaptureStore,
+) {
+	t.Helper()
+	closeErr := errors.Join(
+		store.log.Close(), store.system.Collection.Close(), store.user.Collection.Close(),
+		capture.collection.Close(), store.systemFile.Close(), store.userFile.Close(),
+		capture.file.Close(),
+	)
+	if closeErr != nil && !errors.Is(closeErr, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("close unknown-outcome store: %v", closeErr)
+	}
+	store.log = nil
+	store.system.Collection = nil
+	store.user.Collection = nil
+	store.systemFile = nil
+	store.userFile = nil
+	capture.collection = nil
+	capture.file = nil
+	var err error
+	store.systemFile, err = os.OpenFile(store.systemPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.userFile, err = os.OpenFile(store.userPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture.file, err = os.OpenFile(capture.path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collections, log, err := durable.OpenCollectionsWithTransactions(
+		store.dir, durable.TxnLogOptions{}, []durable.TransactionCollectionOpen{
+			{File: store.systemFile, Options: store.systemOptions},
+			{File: store.userFile, Options: store.userOptions},
+			{File: capture.file, Options: capture.options},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.system = systemTargetOf(collections[0])
+	store.user = targetOf(collections[1])
+	capture.collection = collections[2]
+	capture.encoder = &sessionLeaseCapture{target: TransitionCaptureTarget{
+		Name: "capture", Collection: capture.collection,
+	}}
+	store.log = log
+	options := store.machineOptions
+	options.TransitionCapture = capture.encoder
+	store.machine, err = Open(
+		store.binding, store.bootstrap, store.system,
+		UserCollection{Name: "docs", Target: store.user}, store.log,
+		options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type sessionLeaseCaptureStore struct {
+	path       string
+	file       *os.File
+	collection *durable.Collection
+	options    durable.Options
+	encoder    *sessionLeaseCapture
+}
+
+func newSessionLeaseCaptureStore(
+	t testing.TB,
+	dir string,
+) *sessionLeaseCaptureStore {
+	t.Helper()
+	store := &sessionLeaseCaptureStore{
+		path: filepath.Join(dir, "lease-capture.vdb"),
+	}
+	var err error
+	store.file, err = os.OpenFile(store.path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.collection, err = durable.Create(store.file, store.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.encoder = &sessionLeaseCapture{target: TransitionCaptureTarget{
+		Name: "capture", Collection: store.collection,
+	}}
+	return store
+}
+
+func (s *sessionLeaseCaptureStore) close() {
+	if s == nil {
+		return
+	}
+	if s.collection != nil {
+		_ = s.collection.Close()
+		s.collection = nil
+	}
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
+}
+
+type sessionLeaseCapture struct {
+	target  TransitionCaptureTarget
+	current uint64
+	pending uint64
+}
+
+func (c *sessionLeaseCapture) Target() TransitionCaptureTarget { return c.target }
+
+func (*sessionLeaseCapture) MaxEncodedBytes(TransitionCaptureBounds) (int, error) {
+	return 64, nil
+}
+
+func (c *sessionLeaseCapture) Begin(state State) error {
+	if c == nil || c.target.Collection == nil || state.Applied == 0 {
+		return ErrTransitionCapture
+	}
+	c.current = state.Applied
+	c.pending = 0
+	return nil
+}
+
+func (c *sessionLeaseCapture) AppendTransition(
+	dst []byte,
+	transition CapturedTransition,
+) ([]byte, error) {
+	if c == nil || transition.Applied != c.current+1 || c.pending != 0 {
+		return dst, ErrTransitionCapture
+	}
+	start := len(dst)
+	dst = append(dst, `{"applied":`...)
+	dst = strconv.AppendUint(dst, transition.Applied, 10)
+	dst = append(dst, '}')
+	c.pending = transition.Applied
+	if len(dst)-start > 64 {
+		return dst[:start], ErrTransitionCapture
+	}
+	return dst, nil
+}
+
+func (c *sessionLeaseCapture) Published(transition CapturedTransition) error {
+	if c == nil || c.pending != transition.Applied || transition.Applied != c.current+1 {
+		return ErrTransitionCapture
+	}
+	c.current = transition.Applied
+	c.pending = 0
+	return nil
 }
