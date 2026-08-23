@@ -257,7 +257,7 @@ func TestReconcileBuildsThenStagesOnePassArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	collection, err := database.CreateCollection("capture", durable.Options{})
+	collection, err := database.CreateCollection("capture", durable.Options{OpaqueValues: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -332,9 +332,9 @@ The stage reconstructs the deterministic artifact from the completed
 destination and requires the exact expected digest before tail catch-up.
 
 An optional capture collection receives each exact before-and-after source
-transition atomically with its replicated source publication. Its compact
-`vibejson` records bind the split plan, placement program, publication chain,
-and mutable ownership coordinates. Recovery verifies the full retained chain.
+transition atomically with its replicated source publication. Its compact raw
+binary records bind the split plan, placement program, publication chain, and
+mutable ownership coordinates. Recovery verifies the full retained chain.
 
 The source closes the final write gap with a terminal ownership-fence entry.
 All mutable serving coordinates advance together, every child persists the

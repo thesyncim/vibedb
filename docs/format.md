@@ -171,6 +171,27 @@ and mandatory lease marker. The single current codec sentinel remains `1`;
 pre-lease development images fail closed rather than opening with an invented
 deadline.
 
+## Range-split source capture records
+
+`internal/rangesplit/source_capture.go` stores source-capture values only in a
+private opaque collection. Header and transition-entry rows share one raw
+binary envelope: an eight-byte identity, numeric format sentinel `0`, record
+kind, required zero reserved bytes, and exact little-endian total length. The
+header binds the split plan, placement program, collection, initial
+publication, and its semantic digest. Each entry carries fixed publication
+metadata and digests followed by strictly ordered transition frames. Every
+frame has explicit before/after presence bits, required zero reserved bytes,
+little-endian key/before/after lengths, and the exact raw bytes.
+
+A header is exactly `264 + collection bytes`. An entry is exactly
+`248 + 16*transition count + key bytes + before bytes + after bytes`; raw
+payload growth therefore has no base64 expansion.
+
+The decoder accepts only this current grammar, requires exact frame exhaustion,
+and borrows capacity-clamped key and document slices from the record. It parses
+only present before/after values as JSON; the binary envelope, collection, and
+keys are opaque bytes. A stale development JSON/base64 capture fails closed.
+
 ## Implementation references
 
 - `internal/storeio/page.go`
