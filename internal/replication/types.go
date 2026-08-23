@@ -41,6 +41,7 @@ const (
 	commandWireMutationBatch  = uint8(1)
 	commandWireSessionRetire  = uint8(2)
 	commandWireSessionRelease = uint8(3)
+	commandWireSessionOpen    = uint8(4)
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -70,6 +71,10 @@ const (
 	// CommandSessionRelease reclaims the bounded retry state for an already
 	// retired client epoch and carries no mutations.
 	CommandSessionRelease
+	// CommandSessionOpen allocates the next shard-issued client epoch and carries
+	// no mutations. Its request header uses epoch zero, sequence one, and no
+	// acknowledgement because the allocated epoch is returned by the apply path.
+	CommandSessionOpen
 )
 
 // MutationKind selects one logical collection mutation.

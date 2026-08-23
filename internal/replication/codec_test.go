@@ -66,6 +66,14 @@ func testSessionReleaseCommand() Command {
 	return command
 }
 
+func testSessionOpenCommand() Command {
+	command := testSessionRetireCommand()
+	command.Kind = CommandSessionOpen
+	command.ClientEpoch = 0
+	command.ClientSequence = 1
+	return command
+}
+
 func testInlineCompletion() Completion {
 	result := []byte{0x01, 0x00, 0xff, 'o', 'k'}
 	completion := Completion{
@@ -251,6 +259,95 @@ func TestSessionReleaseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionOpenRoundTrip(t *testing.T) {
+	command := testSessionOpenCommand()
+	encoded := encodeCommand(t, command)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Kind() != CommandSessionOpen || view.MutationCount() != 0 ||
+		view.ClientEpoch != 0 || view.ClientSequence != 1 || view.AckThrough != 0 ||
+		view.Fingerprint != command.Fingerprint {
+		t.Fatalf("decoded session open mismatch: %+v", view)
+	}
+	iterator := view.Mutations()
+	if iterator.Next() {
+		t.Fatal("session open exposed a mutation")
+	}
+	if len(encoded) != commandMutationOffset(encoded)+envelopeChecksumBytes {
+		t.Fatalf("session open length = %d, want empty mutation body", len(encoded))
+	}
+}
+
+func TestSessionOpenClientTupleValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Command)
+	}{
+		{"nonzero_epoch", func(command *Command) { command.ClientEpoch = 1 }},
+		{"zero_sequence", func(command *Command) { command.ClientSequence = 0 }},
+		{"later_sequence", func(command *Command) { command.ClientSequence = 2 }},
+		{"acknowledgement", func(command *Command) { command.AckThrough = 1 }},
+	} {
+		t.Run("encode_"+tc.name, func(t *testing.T) {
+			command := testSessionOpenCommand()
+			tc.mutate(&command)
+			prefix := []byte("unchanged")
+			got, err := AppendCommand(prefix, command)
+			if !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+			}
+			if !bytes.Equal(got, prefix) {
+				t.Fatal("failed session-open encode changed destination")
+			}
+		})
+
+		t.Run("decode_"+tc.name, func(t *testing.T) {
+			command := testSessionOpenCommand()
+			encoded := encodeCommand(t, command)
+			tc.mutate(&command)
+			binary.LittleEndian.PutUint64(encoded[184:192], command.ClientEpoch)
+			binary.LittleEndian.PutUint64(encoded[192:200], command.ClientSequence)
+			binary.LittleEndian.PutUint64(encoded[248:256], command.AckThrough)
+			sealEnvelope(encoded)
+			if _, err := OpenCommand(encoded); !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+			}
+		})
+	}
+}
+
+func TestNonOpenCommandsRetainClientTupleRules(t *testing.T) {
+	commands := []struct {
+		name    string
+		command Command
+	}{
+		{"mutation", testCommand()},
+		{"retire", testSessionRetireCommand()},
+		{"release", testSessionReleaseCommand()},
+	}
+	for _, commandCase := range commands {
+		for _, tc := range []struct {
+			name   string
+			mutate func(*Command)
+		}{
+			{"zero_epoch", func(command *Command) { command.ClientEpoch = 0 }},
+			{"zero_sequence", func(command *Command) { command.ClientSequence = 0 }},
+			{"ack_equal_sequence", func(command *Command) { command.AckThrough = command.ClientSequence }},
+			{"ack_after_sequence", func(command *Command) { command.AckThrough = command.ClientSequence + 1 }},
+		} {
+			t.Run(commandCase.name+"_"+tc.name, func(t *testing.T) {
+				testCommand := commandCase.command
+				tc.mutate(&testCommand)
+				if _, err := AppendCommand(nil, testCommand); !errors.Is(err, ErrEnvelopeSemantic) {
+					t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
+				}
+			})
+		}
+	}
+}
+
 func TestAckThroughBoundaries(t *testing.T) {
 	for _, ackThrough := range []uint64{0, testCommand().ClientSequence - 1} {
 		command := testCommand()
@@ -375,6 +472,7 @@ func TestGoldenVectors(t *testing.T) {
 	const commandHex = "564442434d4400000100010000010000560100004e00000002000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b00030008001f0000000000000074656e616e74006f6e6574656e616e745f646174612d38306d657373616765730100050014000000616c7068617b226964223a22616c706861222c2276223a317d02000500000000006f6d6567610b481f1bf4b7e0e4"
 	const retireHex = "564442434d4400000100020000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573844f206c7bb0df93"
 	const releaseHex = "564442434d4400000100030000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f000000000000002500000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d6573736167657318fc9ad0e703652f"
+	const openHex = "564442434d4400000100040000010000280100002000000000000000000000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d000000000000001100000000000000130000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f9000000000000000000100000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00123456789abcdef0a000b0003000800000000000000000074656e616e74006f6e6574656e616e745f646174612d38306d65737361676573520f6c9aadf09365"
 	const inlineHex = "564442434d50000001000100200101004501000005000000000000001d0000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc00ef4fa8c2f3151c0180717a46d7a6b869a9b85ccd1e82be796cf4ea1eb9af0650123456789abcdef05000000000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38300100ff6f6b19f88b6ce6077493"
 	const referenceHex = "564442434d5000000100020020010100400100000000000000000000180000000102030405060708090a0b0c0d0e0f102122232425262728292a2b2c2d2e2f3003000000000000004142434445464748494a4b4c4d4e4f506162636465666768696a6b6c6d6e6f70050000000000000007000000000000000b000000000000000d0000000000000017000000000000001d000000000000008182838485868788898a8b8c8d8e8f901f0000000000000025000000000000002900000000000000a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe00123456789abcdef01000100000000000a000b0003000000000000000000000074656e616e74006f6e6574656e616e745f646174612d38304a28f106b5d70ef9"
 	for _, tc := range []struct {
@@ -385,6 +483,7 @@ func TestGoldenVectors(t *testing.T) {
 		{"command", encodeCommand(t, testCommand()), commandHex},
 		{"session_retire", encodeCommand(t, testSessionRetireCommand()), retireHex},
 		{"session_release", encodeCommand(t, testSessionReleaseCommand()), releaseHex},
+		{"session_open", encodeCommand(t, testSessionOpenCommand()), openHex},
 		{"inline_completion", encodeCompletion(t, testInlineCompletion()), inlineHex},
 		{"reference_completion", encodeCompletion(t, testReferenceCompletion()), referenceHex},
 	} {
@@ -402,6 +501,8 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 	}{
 		{"zero_cluster", func(c *Command) { c.ClusterID = ID128{} }, ErrEnvelopeSemantic},
 		{"zero_generation", func(c *Command) { c.RouteGeneration = 0 }, ErrEnvelopeSemantic},
+		{"zero_client_epoch", func(c *Command) { c.ClientEpoch = 0 }, ErrEnvelopeSemantic},
+		{"zero_client_sequence", func(c *Command) { c.ClientSequence = 0 }, ErrEnvelopeSemantic},
 		{"unknown_command_kind", func(c *Command) { c.Kind = 99 }, ErrEnvelopeSemantic},
 		{"ack_equal_sequence", func(c *Command) { c.AckThrough = c.ClientSequence }, ErrEnvelopeSemantic},
 		{"ack_after_sequence", func(c *Command) { c.AckThrough = c.ClientSequence + 1 }, ErrEnvelopeSemantic},
@@ -413,6 +514,7 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 		{"no_mutations", func(c *Command) { c.Mutations = nil }, ErrEnvelopeSemantic},
 		{"retire_with_mutations", func(c *Command) { c.Kind = CommandSessionRetire }, ErrEnvelopeSemantic},
 		{"release_with_mutations", func(c *Command) { c.Kind = CommandSessionRelease }, ErrEnvelopeSemantic},
+		{"open_with_mutations", func(c *Command) { c.Kind = CommandSessionOpen }, ErrEnvelopeSemantic},
 		{"too_many_mutations", func(c *Command) { c.Mutations = make([]Mutation, MaxMutations+1) }, ErrEnvelopeSemantic},
 		{"empty_key", func(c *Command) { c.Mutations[0].Key = nil }, ErrEnvelopeSemantic},
 		{"long_key", func(c *Command) { c.Mutations[0].Key = bytes.Repeat([]byte{'a'}, MaxMutationKeyBytes+1) }, ErrEnvelopeSemantic},
@@ -582,6 +684,7 @@ func TestCommandDecodeRejectsDamageAndSemanticCorruption(t *testing.T) {
 		{"unknown_command_kind", func(b []byte) { b[10] = 99 }, ErrEnvelopeSemantic},
 		{"retire_with_mutations", func(b []byte) { b[10] = commandWireSessionRetire }, ErrEnvelopeSemantic},
 		{"release_with_mutations", func(b []byte) { b[10] = commandWireSessionRelease }, ErrEnvelopeSemantic},
+		{"open_with_mutations", func(b []byte) { b[10] = commandWireSessionOpen }, ErrEnvelopeSemantic},
 		{"zero_mutation_count", func(b []byte) { clear(b[24:28]) }, ErrEnvelopeSemantic},
 		{"excess_mutation_count", func(b []byte) { binary.LittleEndian.PutUint32(b[24:28], 3) }, ErrEnvelopeCorrupt},
 		{"flags", func(b []byte) { b[11] = 1 }, ErrEnvelopeSemantic},
