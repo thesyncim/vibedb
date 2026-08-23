@@ -138,7 +138,10 @@ func testCommand(binding Binding, sequence uint64, mutations ...replication.Muta
 		ProtectionEpoch: binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: id128(33), ClientEpoch: 1, ClientSequence: sequence,
+		// Test fixtures open their initial session at Raft index 2. Callers pass
+		// a zero-based user-request ordinal: the open owns sequence 1, so the
+		// first mutation is sequence 2.
+		ClientID: id128(77), ClientEpoch: 2, ClientSequence: sequence + 1,
 		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
 	})
 	if err != nil {
@@ -160,6 +163,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if _, err := machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatalf("InstallSnapshot: %v", err)
 	}
+	applySessionOpen(t, machine, 2, commandValue(fixture.binding, 1))
 	command := testCommand(fixture.binding, 1,
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
 		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":2}`)},
@@ -167,11 +171,11 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err := machine.AdmitCommand(command); err != nil {
 		t.Fatalf("AdmitCommand: %v", err)
 	}
-	publication, err := machine.ApplyNormal(normalMeta(2), command)
+	publication, err := machine.ApplyNormal(normalMeta(3), command)
 	if err != nil {
 		t.Fatalf("ApplyNormal: %v", err)
 	}
-	if publication.Applied != 2 {
+	if publication.Applied != 3 {
 		t.Fatalf("Applied = %d", publication.Applied)
 	}
 	value, found, err := fixture.user.Collection.AppendRaw(nil, []byte("k"))
@@ -179,7 +183,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		t.Fatalf("user value = %q,%v,%v", value, found, err)
 	}
 	first, err := machine.LookupCompletion(command)
-	if err != nil || first.AppliedSequence != 2 {
+	if err != nil || first.AppliedSequence != 3 {
 		t.Fatalf("LookupCompletion = %+v,%v", first, err)
 	}
 	completion, err := replication.OpenCompletion(first.Bytes)
@@ -187,11 +191,11 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		t.Fatalf("completion = %+v,%v", completion, err)
 	}
 
-	if _, err := machine.ApplyNormal(normalMeta(3), command); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(4), command); err != nil {
 		t.Fatalf("exact duplicate apply: %v", err)
 	}
 	duplicate, err := machine.LookupCompletion(command)
-	if err != nil || duplicate.AppliedSequence != 2 || !bytes.Equal(duplicate.Bytes, first.Bytes) {
+	if err != nil || duplicate.AppliedSequence != 3 || !bytes.Equal(duplicate.Bytes, first.Bytes) {
 		t.Fatalf("duplicate completion = %+v,%v", duplicate, err)
 	}
 
@@ -218,7 +222,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := machine.ApplyNormal(normalMeta(4), conflict); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(5), conflict); err != nil {
 		t.Fatalf("conflict apply: %v", err)
 	}
 	gotOriginal, err := machine.LookupCompletion(command)
@@ -252,7 +256,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := machine.ApplyNormal(normalMeta(5), stale); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(6), stale); err != nil {
 		t.Fatalf("stale apply: %v", err)
 	}
 	staleLookup, err := machine.LookupCompletion(stale)
@@ -275,7 +279,7 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if reopened.Applied() != 5 || reopened.Published().DataChainDigest != machine.Published().DataChainDigest {
+	if reopened.Applied() != 6 || reopened.Published().DataChainDigest != machine.Published().DataChainDigest {
 		t.Fatalf("reopened publication = %+v", reopened.Published())
 	}
 	snapshot, err := reopened.Snapshot("docs")
@@ -283,16 +287,16 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	defer snapshot.Close()
-	if snapshot.Publication().Applied != 5 || snapshot.State().SessionCount != 1 ||
-		snapshot.State().SessionSlotCount != 2 {
+	if snapshot.Publication().Applied != 6 || snapshot.State().SessionCount != 1 ||
+		snapshot.State().SessionSlotCount != 3 || snapshot.State().SessionEpochHighWater != 2 {
 		t.Fatalf("snapshot state = %+v", snapshot.State())
 	}
 	systemRows := 0
 	if err := snapshot.RangeSystem(func(_, _ []byte) error { systemRows++; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if systemRows != 4 {
-		t.Fatalf("system rows = %d, want state + session + 2 slots", systemRows)
+	if systemRows != 5 {
+		t.Fatalf("system rows = %d, want state + session + 3 slots", systemRows)
 	}
 }
 
@@ -335,10 +339,11 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	command := testCommand(fixture.binding, 1, replication.Mutation{
 		Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"ok":true}`),
 	})
-	publication, err := fixture.machine.ApplyNormal(normalMeta(2), command)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +397,7 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopened.Published().Applied != 2 || reopened.Published().DataChainDigest != publication.DataChainDigest {
+	if reopened.Published().Applied != 3 || reopened.Published().DataChainDigest != publication.DataChainDigest {
 		t.Fatalf("reopened publication = %+v, want %+v", reopened.Published(), publication)
 	}
 	value, found, err := user.Collection.AppendRaw(nil, []byte("k"))
@@ -400,7 +405,7 @@ func TestMachinePhysicalReopenRecoversAtomicUserCompletionAndState(t *testing.T)
 		t.Fatalf("reopened user row = %q,%v,%v", value, found, err)
 	}
 	lookup, err := reopened.LookupCompletion(command)
-	if err != nil || lookup.AppliedSequence != 2 {
+	if err != nil || lookup.AppliedSequence != 3 {
 		t.Fatalf("reopened completion = %+v,%v", lookup, err)
 	}
 }
@@ -410,6 +415,7 @@ func TestMachineCommittedTargetBoundBecomesDeterministicNoop(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	mutations := make([]replication.Mutation, MaxDistinctMutations+1)
 	for i := range mutations {
 		mutations[i] = replication.Mutation{
@@ -420,11 +426,11 @@ func TestMachineCommittedTargetBoundBecomesDeterministicNoop(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(command); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("AdmitCommand error = %v", err)
 	}
-	publication, err := fixture.machine.ApplyNormal(normalMeta(2), command)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
 	if err != nil {
 		t.Fatalf("committed target-bound apply: %v", err)
 	}
-	if publication.Applied != 2 || fixture.user.Collection.Len() != 0 {
+	if publication.Applied != 3 || fixture.user.Collection.Len() != 0 {
 		t.Fatalf("target-bound publication=%+v rows=%d", publication, fixture.user.Collection.Len())
 	}
 	lookup, err := fixture.machine.LookupCompletion(command)

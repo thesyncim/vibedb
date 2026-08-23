@@ -25,7 +25,10 @@ func commandValue(binding Binding, sequence uint64) replication.Command {
 		ProtectionEpoch: binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: id128(77), ClientEpoch: 1, ClientSequence: sequence,
+		// Test fixtures open their initial session at Raft index 2. Callers pass
+		// a zero-based user-request ordinal: the open owns sequence 1, so the
+		// first mutation is sequence 2.
+		ClientID: id128(77), ClientEpoch: 2, ClientSequence: sequence + 1,
 		Fingerprint: fingerprint, Collection: "docs",
 		Mutations: []replication.Mutation{{
 			Kind: replication.MutationPut, Key: []byte(fmt.Sprintf("k%d", sequence)),
@@ -92,17 +95,18 @@ func TestEveryMutableFenceMismatchPersistsStaleCompletion(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			sequence := uint64(i + 1)
 			command := commandValue(fixture.binding, sequence)
 			test.mutate(&command)
 			encoded := encodeCommand(t, command)
-			publication, err := fixture.machine.ApplyNormal(normalMeta(sequence+1), encoded)
+			publication, err := fixture.machine.ApplyNormal(normalMeta(sequence+2), encoded)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if publication.Applied != sequence+1 || fixture.user.Collection.Len() != 0 {
+			if publication.Applied != sequence+2 || fixture.user.Collection.Len() != 0 {
 				t.Fatalf("stale publication=%+v rows=%d", publication, fixture.user.Collection.Len())
 			}
 			lookup, err := fixture.machine.LookupCompletion(encoded)
@@ -122,6 +126,7 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	tests := []struct {
 		name string
 		code uint32
@@ -142,7 +147,7 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 		command := commandValue(fixture.binding, sequence)
 		test.edit(&command)
 		encoded := encodeCommand(t, command)
-		if _, err := fixture.machine.ApplyNormal(normalMeta(sequence+1), encoded); err != nil {
+		if _, err := fixture.machine.ApplyNormal(normalMeta(sequence+2), encoded); err != nil {
 			t.Fatalf("%s apply: %v", test.name, err)
 		}
 		lookup, err := fixture.machine.LookupCompletion(encoded)
@@ -190,8 +195,9 @@ func TestApplySequenceMatrix(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
-		meta := normalMeta(2)
+		meta := normalMeta(3)
 		if _, err := fixture.machine.ApplyNormal(meta, command); err != nil {
 			t.Fatal(err)
 		}

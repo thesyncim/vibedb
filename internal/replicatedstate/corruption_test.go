@@ -48,14 +48,11 @@ func TestSessionIdentityCapacityRefusesWithoutPoisoning(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	first := encodeCommand(t, commandValue(fixture.binding, 1))
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), first); err != nil {
-		t.Fatal(err)
-	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	secondValue := commandValue(fixture.binding, 1)
 	secondValue.ClientID = id128(99)
 	secondValue.Fingerprint = replication.Digest{99}
-	second := encodeCommand(t, secondValue)
+	second := encodeCommand(t, sessionOpenFor(secondValue))
 	if err := fixture.machine.AdmitCommand(second); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("cap admission error = %v", err)
 	}
@@ -95,11 +92,12 @@ func TestPointPathsRejectSessionRetirementMismatch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+			applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+			if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 				t.Fatal(err)
 			}
 			digest := SessionKey(view.Tenant, view.ClientID)
-			rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+			rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 				binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
 			})
 			if err := test.run(fixture.machine, command); !errors.Is(err, ErrSessionCorrupt) {
@@ -120,7 +118,8 @@ func TestFutureReplicaSetVersionStaleCompletionReopens(t *testing.T) {
 	command := commandValue(fixture.binding, 1)
 	command.ReplicaSetVersion = 100
 	encoded := encodeCommand(t, command)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), encoded); err != nil {
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encoded); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := Open(
@@ -343,7 +342,8 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
-		if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+		if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 			t.Fatal(err)
 		}
 		state := cloneState(fixture.machine.state)
@@ -362,7 +362,8 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		}
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
 		view, _ := replication.OpenCommand(command)
-		if _, err := fixture.machine.ApplyNormal(normalMeta(2), command); err != nil {
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+		if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 			t.Fatal(err)
 		}
 		digest := SessionKey(view.Tenant, view.ClientID)
@@ -377,6 +378,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		}
 		next := sessionRecord(header)
 		next.Status = SessionRetired
+		next.AckThrough = next.HighSequence - 1
 		record, err := AppendSessionRecord(nil, next)
 		if err != nil {
 			t.Fatal(err)
@@ -395,9 +397,10 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 		for sequence := uint64(1); sequence <= 9; sequence++ {
 			if _, err := fixture.machine.ApplyNormal(
-				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+				normalMeta(sequence+2), encodeCommand(t, commandValue(fixture.binding, sequence)),
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -417,19 +420,20 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 		for sequence := uint64(1); sequence <= 2; sequence++ {
 			if _, err := fixture.machine.ApplyNormal(
-				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+				normalMeta(sequence+2), encodeCommand(t, commandValue(fixture.binding, sequence)),
 			); err != nil {
 				t.Fatal(err)
 			}
 		}
 		digest := SessionKey([]byte("tenant"), id128(77))
-		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
-			binary.LittleEndian.PutUint64(raw[68:76], 3)
-		})
 		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
-			binary.LittleEndian.PutUint64(raw[68:76], 2)
+			binary.LittleEndian.PutUint64(raw[68:76], 4)
+		})
+		rewriteSessionSlot(t, fixture, digest, 2, func(raw []byte) {
+			binary.LittleEndian.PutUint64(raw[68:76], 3)
 		})
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
 			UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options)
@@ -442,28 +446,29 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 		if _, err := fixture.machine.ApplyNormal(
-			normalMeta(2), encodeCommand(t, commandValue(fixture.binding, 1)),
+			normalMeta(3), encodeCommand(t, commandValue(fixture.binding, 1)),
 		); err != nil {
 			t.Fatal(err)
 		}
-		configuration := normalMeta(3)
+		configuration := normalMeta(4)
 		configuration.Type = pb.EntryConfChange
 		if _, err := fixture.machine.ApplyConfiguration(
 			configuration, &pb.ConfState{Voters: []uint64{1, 2}},
 		); err != nil {
 			t.Fatal(err)
 		}
-		transition := testOwnershipTransition(fixture.binding, 3)
+		transition := testOwnershipTransition(fixture.binding, 4)
 		encoded, err := AppendOwnershipTransition(nil, transition)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fixture.machine.ApplyNormal(normalMeta(4), encoded); err != nil {
+		if _, err := fixture.machine.ApplyNormal(normalMeta(5), encoded); err != nil {
 			t.Fatal(err)
 		}
 		digest := SessionKey([]byte("tenant"), id128(77))
-		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 			binary.LittleEndian.PutUint64(raw[176:184], transition.ToRouteGeneration)
 		})
 		_, err = Open(fixture.binding, fixture.bootstrap, fixture.system,
@@ -477,15 +482,16 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 		for sequence := uint64(1); sequence <= 2; sequence++ {
 			if _, err := fixture.machine.ApplyNormal(
-				normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+				normalMeta(sequence+2), encodeCommand(t, commandValue(fixture.binding, sequence)),
 			); err != nil {
 				t.Fatal(err)
 			}
 		}
 		digest := SessionKey([]byte("tenant"), id128(77))
-		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
+		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 			binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
 		})
 		_, err := Open(fixture.binding, fixture.bootstrap, fixture.system,
@@ -500,6 +506,9 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
 			t.Fatal(err)
 		}
 		command := encodeCommand(t, commandValue(fixture.binding, 1))
@@ -517,7 +526,14 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fixture.machine.ApplyNormal(normalMeta(2), nil); err != nil {
+		configuration := normalMeta(2)
+		configuration.Type = pb.EntryConfChange
+		if _, err := fixture.machine.ApplyConfiguration(
+			configuration, &pb.ConfState{Voters: []uint64{1}},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
 			t.Fatal(err)
 		}
 		command := commandValue(fixture.binding, 1)
@@ -562,6 +578,9 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		meta := normalMeta(2)
 		meta.Type = pb.EntryConfChange
 		if _, err := fixture.machine.ApplyConfiguration(meta, &pb.ConfState{Voters: []uint64{1}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
 			t.Fatal(err)
 		}
 		command := commandValue(fixture.binding, 1)
@@ -631,7 +650,12 @@ func putCraftedSession(
 	t.Helper()
 	digest := SessionKey(command.Tenant, command.ClientID)
 	sessionKey := SessionStorageKey(digest)
-	slotKey, err := SessionSlotStorageKey(digest, 0)
+	openSlotKey, err := SessionSlotStorageKey(digest, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotIndex := uint16((command.ClientSequence - 1) % uint64(fixture.machine.options.RetryWindow))
+	slotKey, err := SessionSlotStorageKey(digest, slotIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -639,7 +663,7 @@ func putCraftedSession(
 		Tenant: command.Tenant, ClientID: command.ClientID,
 		ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
 		HighSequence: command.ClientSequence, Status: SessionActive,
-		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: 1,
+		RetryWindow: fixture.machine.options.RetryWindow, PhysicalSlotCount: slotIndex + 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -651,8 +675,26 @@ func putCraftedSession(
 		// persisted-image validation remains covered independently.
 		encodedApplied = 2
 	}
-	slot, err := AppendSessionSlot(nil, SessionSlot{
+	openSlot, err := AppendSessionSlot(nil, SessionSlot{
 		Slot:                   0,
+		SessionDigest:          digest,
+		ClientEpoch:            command.ClientEpoch,
+		ClientSequence:         1,
+		AppliedSequence:        command.ClientEpoch,
+		Fingerprint:            replication.Digest{0x6f, 0x70, 0x65, 0x6e},
+		LogicalCommandDigest:   [32]byte{0x6f, 0x70, 0x65, 0x6e},
+		ResultCode:             ResultSessionOpened,
+		ReplicaSetVersion:      1,
+		ActivePolicyGeneration: fixture.binding.ActivePolicyGeneration,
+		ProtectionEpoch:        fixture.binding.ProtectionEpoch,
+		RoutingVersion:         fixture.binding.RoutingVersion,
+		RouteGeneration:        fixture.binding.RouteGeneration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, err := AppendSessionSlot(nil, SessionSlot{
+		Slot:                   slotIndex,
 		SessionDigest:          digest,
 		ClientEpoch:            command.ClientEpoch,
 		ClientSequence:         command.ClientSequence,
@@ -673,7 +715,8 @@ func putCraftedSession(
 		binary.LittleEndian.PutUint64(slot[68:76], applied)
 		sealRecord(slot, sessionSlotChecksumDomain)
 	}
-	state.SessionCount, state.SessionSlotCount = 1, 1
+	state.SessionCount, state.SessionSlotCount = 1, uint64(slotIndex)+1
+	state.SessionEpochHighWater = command.ClientEpoch
 	stateEnvelope, err := AppendState(nil, state)
 	if err != nil {
 		t.Fatal(err)
@@ -683,6 +726,9 @@ func putCraftedSession(
 			return err
 		}
 		if err := batch.Put(sessionKey[:], header); err != nil {
+			return err
+		}
+		if err := batch.Put(openSlotKey[:], openSlot); err != nil {
 			return err
 		}
 		return batch.Put(slotKey[:], slot)

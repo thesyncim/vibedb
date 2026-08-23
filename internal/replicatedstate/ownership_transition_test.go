@@ -104,8 +104,13 @@ func TestMachineOwnershipTransitionOrdersServingFenceAndSurvivesReopen(t *testin
 
 	oldCommand := commandValue(fixture.binding, 1)
 	oldCommand.ReplicaSetVersion = 2
+	_, _, openEpoch := applySessionOpen(t, machine, 3, oldCommand)
+	if openEpoch != 3 || machine.state.SessionEpochHighWater != openEpoch {
+		t.Fatalf("session token/high-water = %d/%d, want 3", openEpoch, machine.state.SessionEpochHighWater)
+	}
+	oldCommand.ClientEpoch = openEpoch
 	oldEncoded := encodeCommand(t, oldCommand)
-	if _, err := machine.ApplyNormal(normalMeta(3), oldEncoded); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(4), oldEncoded); err != nil {
 		t.Fatalf("old-fence command: %v", err)
 	}
 	oldCompletion, err := machine.LookupCompletion(oldEncoded)
@@ -120,12 +125,12 @@ func TestMachineOwnershipTransitionOrdersServingFenceAndSurvivesReopen(t *testin
 	if err := machine.AdmitCommand(encoded); err != nil {
 		t.Fatalf("AdmitCommand ownership transition: %v", err)
 	}
-	publication, err := machine.ApplyNormal(normalMeta(4), encoded)
+	publication, err := machine.ApplyNormal(normalMeta(5), encoded)
 	if err != nil {
 		t.Fatalf("ApplyNormal ownership transition: %v", err)
 	}
 	state := machine.state
-	if publication.Applied != 4 || state.LastKind != RecordOwnership ||
+	if publication.Applied != 5 || state.LastKind != RecordOwnership ||
 		state.Binding.OwnershipEpoch != fixture.binding.OwnershipEpoch+1 ||
 		state.Binding.RoutingVersion != fixture.binding.RoutingVersion+1 ||
 		state.Binding.RouteGeneration != fixture.binding.RouteGeneration+1 ||
@@ -143,6 +148,7 @@ func TestMachineOwnershipTransitionOrdersServingFenceAndSurvivesReopen(t *testin
 	nextBinding.RouteGeneration++
 	newCommand := commandValue(nextBinding, 2)
 	newCommand.ReplicaSetVersion = 2
+	newCommand.ClientEpoch = openEpoch
 	newEncoded, err := replication.AppendCommand(nil, newCommand)
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +164,8 @@ func TestMachineOwnershipTransitionOrdersServingFenceAndSurvivesReopen(t *testin
 	if err != nil {
 		t.Fatalf("reopen at transitioned binding: %v", err)
 	}
-	if reopened.Applied() != 4 || reopened.state.Binding != nextBinding {
+	if reopened.Applied() != 5 || reopened.state.Binding != nextBinding ||
+		reopened.state.SessionEpochHighWater != openEpoch {
 		t.Fatalf("reopened ownership state = %+v", reopened.state)
 	}
 	if retry, err := reopened.LookupCompletion(oldEncoded); err != nil ||

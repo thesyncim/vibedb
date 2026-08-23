@@ -15,7 +15,14 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	index := uint64(2)
+	_, initialOpenBytes, initialEpoch := applySessionOpen(
+		t, fixture.machine, 2, commandValue(fixture.binding, 1),
+	)
+	if initialEpoch != 2 || fixture.machine.state.SessionEpochHighWater != initialEpoch {
+		t.Fatalf("initial session token/high-water = %d/%d, want 2",
+			initialEpoch, fixture.machine.state.SessionEpochHighWater)
+	}
+	index := uint64(3)
 	apply := func(command []byte) {
 		t.Helper()
 		publication, err := fixture.machine.ApplyNormal(normalMeta(index), command)
@@ -43,7 +50,7 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	}
 
 	acknowledging := commandValue(fixture.binding, 10)
-	acknowledging.AckThrough = 9
+	acknowledging.AckThrough = 10
 	ackCommand := encodeCommand(t, acknowledging)
 	if err := fixture.machine.AdmitCommand(ackCommand); err != nil {
 		t.Fatalf("acknowledging duplicate admission: %v", err)
@@ -59,10 +66,10 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	}
 
 	sequence11 := commandValue(fixture.binding, 11)
-	sequence11.AckThrough = 9
+	sequence11.AckThrough = 10
 	apply(encodeCommand(t, sequence11))
 	regressed := commandValue(fixture.binding, 12)
-	regressed.AckThrough = 8
+	regressed.AckThrough = 9
 	regressedBytes := encodeCommand(t, regressed)
 	if err := fixture.machine.AdmitCommand(regressedBytes); !errors.Is(err, ErrSessionAck) {
 		t.Fatalf("regressed ack admission = %v", err)
@@ -72,12 +79,12 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 		t.Fatalf("refused ack lookup = %v", err)
 	}
 	sequence12 := commandValue(fixture.binding, 12)
-	sequence12.AckThrough = 10
+	sequence12.AckThrough = 11
 	apply(encodeCommand(t, sequence12))
 
 	retire := commandValue(fixture.binding, 13)
 	retire.Kind = replication.CommandSessionRetire
-	retire.AckThrough = 12
+	retire.AckThrough = 13
 	retire.Mutations = nil
 	retireBytes := encodeCommand(t, retire)
 	if err := fixture.machine.AdmitCommand(retireBytes); err != nil {
@@ -94,34 +101,50 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	}
 
 	sameEpoch := commandValue(fixture.binding, 14)
-	sameEpoch.AckThrough = 12
+	sameEpoch.AckThrough = 13
 	sameEpochBytes := encodeCommand(t, sameEpoch)
 	if err := fixture.machine.AdmitCommand(sameEpochBytes); !errors.Is(err, ErrSessionRetired) {
 		t.Fatalf("retired epoch admission = %v", err)
 	}
 	apply(sameEpochBytes)
 
-	nextEpoch := commandValue(fixture.binding, 1)
-	nextEpoch.ClientEpoch = 2
-	nextEpochBytes := encodeCommand(t, nextEpoch)
+	releaseBytes := encodeCommand(t, sessionRelease(retire))
+	apply(releaseBytes)
+	if fixture.machine.state.SessionCount != 0 || fixture.machine.state.SessionSlotCount != 0 {
+		t.Fatalf("release left a bounded session image: %+v", fixture.machine.state)
+	}
+	// Replaying the original open after exact release allocates a fresh token;
+	// it cannot replay any old user mutations because Open carries none.
+	apply(initialOpenBytes)
+	nextEpoch := index - 1
+	if nextEpoch <= initialEpoch || fixture.machine.state.SessionEpochHighWater != nextEpoch ||
+		fixture.machine.state.SessionCount != 1 || fixture.machine.state.SessionSlotCount != 1 {
+		t.Fatalf("replayed open did not create an empty fresh session: %+v", fixture.machine.state)
+	}
+	if _, err := fixture.machine.LookupCompletion(initialOpenBytes); err != nil {
+		t.Fatalf("fresh open completion: %v", err)
+	}
+	nextCommand := commandValue(fixture.binding, 1)
+	nextCommand.ClientEpoch = nextEpoch
+	nextEpochBytes := encodeCommand(t, nextCommand)
 	apply(nextEpochBytes)
 	if _, err := fixture.machine.LookupCompletion(retireBytes); !errors.Is(err, ErrRetryRetired) {
 		t.Fatalf("prior epoch retry = %v", err)
 	}
 	if fixture.machine.state.SessionCount != 1 ||
-		fixture.machine.state.SessionSlotCount != uint64(fixture.machine.options.RetryWindow) {
+		fixture.machine.state.SessionSlotCount != 2 {
 		t.Fatalf("epoch reuse grew state = %+v", fixture.machine.state)
 	}
 
 	gap := commandValue(fixture.binding, 3)
-	gap.ClientEpoch = 2
+	gap.ClientEpoch = nextEpoch
 	gapBytes := encodeCommand(t, gap)
 	if err := fixture.machine.AdmitCommand(gapBytes); !errors.Is(err, ErrSessionSequence) {
 		t.Fatalf("gap admission = %v", err)
 	}
 	apply(gapBytes)
 	next := commandValue(fixture.binding, 2)
-	next.ClientEpoch = 2
+	next.ClientEpoch = nextEpoch
 	apply(encodeCommand(t, next))
 	if _, err := fixture.machine.LookupCompletion(gapBytes); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("unaccepted gap lookup = %v", err)
@@ -133,14 +156,15 @@ func TestStaleSessionRetireDoesNotSealLiveEpoch(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	first := encodeCommand(t, commandValue(fixture.binding, 1))
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), first); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), first); err != nil {
 		t.Fatal(err)
 	}
 
 	stale := commandValue(fixture.binding, 2)
 	stale.Kind = replication.CommandSessionRetire
-	stale.AckThrough = 1
+	stale.AckThrough = 2
 	stale.Mutations = nil
 	stale.RoutingVersion++
 	stale.RouteGeneration++
@@ -148,7 +172,7 @@ func TestStaleSessionRetireDoesNotSealLiveEpoch(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(staleBytes); !errors.Is(err, ErrStaleCommand) {
 		t.Fatalf("stale retirement admission = %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), staleBytes); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), staleBytes); err != nil {
 		t.Fatal(err)
 	}
 	lookup, err := fixture.machine.LookupCompletion(staleBytes)
@@ -161,12 +185,12 @@ func TestStaleSessionRetireDoesNotSealLiveEpoch(t *testing.T) {
 	}
 
 	next := commandValue(fixture.binding, 3)
-	next.AckThrough = 1
+	next.AckThrough = 2
 	nextBytes := encodeCommand(t, next)
 	if err := fixture.machine.AdmitCommand(nextBytes); err != nil {
 		t.Fatalf("live epoch was sealed: %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(4), nextBytes); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), nextBytes); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -176,9 +200,10 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
 	for sequence := uint64(1); sequence <= uint64(fixture.machine.options.RetryWindow); sequence++ {
 		if _, err := fixture.machine.ApplyNormal(
-			normalMeta(sequence+1), encodeCommand(t, commandValue(fixture.binding, sequence)),
+			normalMeta(sequence+2), encodeCommand(t, commandValue(fixture.binding, sequence)),
 		); err != nil {
 			t.Fatalf("seed sequence %d: %v", sequence, err)
 		}
@@ -192,7 +217,7 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	low := high - window + 1
 	header, err := AppendSessionRecord(nil, SessionRecord{
 		Tenant: identity.Tenant, ClientID: identity.ClientID,
-		ClientEpoch: 1, RetryHome: identity.RetryHome,
+		ClientEpoch: 2, RetryHome: identity.RetryHome,
 		AckThrough: low - 1, HighSequence: high, Status: SessionActive,
 		RetryWindow:       fixture.machine.options.RetryWindow,
 		PhysicalSlotCount: fixture.machine.options.RetryWindow,
@@ -214,8 +239,8 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 			fingerprint := replication.Digest{byte(offset + 1)}
 			logicalDigest := [32]byte{byte(offset + 1)}
 			record, recordErr := AppendSessionSlot(nil, SessionSlot{
-				Slot: slot, SessionDigest: digest, ClientEpoch: 1,
-				ClientSequence: sequence, AppliedSequence: offset + 2,
+				Slot: slot, SessionDigest: digest, ClientEpoch: 2,
+				ClientSequence: sequence, AppliedSequence: offset + 3,
 				Fingerprint: fingerprint, LogicalCommandDigest: logicalDigest,
 				ResultCode: ResultApplied, ReplicaSetVersion: 1,
 				ActivePolicyGeneration: fixture.binding.ActivePolicyGeneration,
@@ -244,14 +269,14 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 		t.Fatalf("reopen near-terminal session: %v", err)
 	}
 
-	ordinary := commandValue(fixture.binding, math.MaxUint64)
+	ordinary := commandValue(fixture.binding, math.MaxUint64-1)
 	ordinary.AckThrough = high
 	ordinaryBytes := encodeCommand(t, ordinary)
 	if err := machine.AdmitCommand(ordinaryBytes); !errors.Is(err, ErrSessionSequence) {
 		t.Fatalf("terminal ordinary admission = %v", err)
 	}
 
-	retire := commandValue(fixture.binding, math.MaxUint64)
+	retire := commandValue(fixture.binding, math.MaxUint64-1)
 	retire.Kind = replication.CommandSessionRetire
 	retire.AckThrough = high
 	retire.Mutations = nil
@@ -261,8 +286,8 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if err := machine.AdmitCommand(staleBytes); !errors.Is(err, ErrStaleCommand) {
 		t.Fatalf("terminal stale retirement admission = %v", err)
 	}
-	publication, err := machine.ApplyNormal(normalMeta(window+2), staleBytes)
-	if err != nil || publication.Applied != window+2 {
+	publication, err := machine.ApplyNormal(normalMeta(window+3), staleBytes)
+	if err != nil || publication.Applied != window+3 {
 		t.Fatalf("terminal stale retirement apply = %+v,%v", publication, err)
 	}
 	if _, err := machine.LookupCompletion(staleBytes); !errors.Is(err, ErrCompletionNotFound) {
@@ -283,7 +308,7 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if err := machine.AdmitCommand(retireBytes); err != nil {
 		t.Fatalf("refreshed terminal retirement admission: %v", err)
 	}
-	if _, err := machine.ApplyNormal(normalMeta(window+3), retireBytes); err != nil {
+	if _, err := machine.ApplyNormal(normalMeta(window+4), retireBytes); err != nil {
 		t.Fatal(err)
 	}
 	lookup, err := machine.LookupCompletion(retireBytes)
@@ -303,14 +328,20 @@ func TestTerminalSessionRetireRetriesWithoutStrandingEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen terminal retirement: %v", err)
 	}
-	nextEpoch := commandValue(fixture.binding, 1)
-	nextEpoch.ClientEpoch = 2
-	nextEpochBytes := encodeCommand(t, nextEpoch)
-	if err := machine.AdmitCommand(nextEpochBytes); err != nil {
-		t.Fatalf("next epoch admission: %v", err)
+	release := sessionRelease(retire)
+	if _, err := machine.ApplyNormal(normalMeta(window+5), encodeCommand(t, release)); err != nil {
+		t.Fatalf("terminal release: %v", err)
 	}
-	if _, err := machine.ApplyNormal(normalMeta(window+4), nextEpochBytes); err != nil {
+	nextOpen := sessionOpenFor(commandValue(fixture.binding, 1))
+	nextOpenBytes := encodeCommand(t, nextOpen)
+	if err := machine.AdmitCommand(nextOpenBytes); err != nil {
+		t.Fatalf("next session open admission: %v", err)
+	}
+	if _, err := machine.ApplyNormal(normalMeta(window+6), nextOpenBytes); err != nil {
 		t.Fatal(err)
+	}
+	if machine.state.SessionEpochHighWater != window+6 {
+		t.Fatalf("next session token = %d, want %d", machine.state.SessionEpochHighWater, window+6)
 	}
 }
 
@@ -321,8 +352,9 @@ func TestRetryHomeConflictReturnsOriginalUnlessRetryRetired(t *testing.T) {
 	}
 	original := commandValue(fixture.binding, 1)
 	original.RetryHome = replication.RetryHome{1, 2, 3, 4, 5, 6, 7, 8}
+	applySessionOpen(t, fixture.machine, 2, original)
 	originalBytes := encodeCommand(t, original)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), originalBytes); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), originalBytes); err != nil {
 		t.Fatal(err)
 	}
 	want, err := fixture.machine.LookupCompletion(originalBytes)
@@ -341,8 +373,8 @@ func TestRetryHomeConflictReturnsOriginalUnlessRetryRetired(t *testing.T) {
 
 	second := commandValue(fixture.binding, 2)
 	second.RetryHome = original.RetryHome
-	second.AckThrough = 1
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encodeCommand(t, second)); err != nil {
+	second.AckThrough = 2
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), encodeCommand(t, second)); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := fixture.machine.LookupCompletion(conflictBytes); !errors.Is(err, ErrRetryRetired) ||
@@ -385,8 +417,9 @@ func TestCompactSessionSlotReconstructsCanonicalOriginalCompletion(t *testing.T)
 		t.Fatal(err)
 	}
 	original := commandValue(fixture.binding, 1)
+	applySessionOpen(t, fixture.machine, 2, original)
 	originalBytes := encodeCommand(t, original)
-	if _, err := fixture.machine.ApplyNormal(normalMeta(2), originalBytes); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), originalBytes); err != nil {
 		t.Fatal(err)
 	}
 	view, err := replication.OpenCommand(originalBytes)
@@ -413,7 +446,7 @@ func TestCompactSessionSlotReconstructsCanonicalOriginalCompletion(t *testing.T)
 		ClientSequence:         view.ClientSequence,
 		Fingerprint:            view.Fingerprint,
 		RetryHome:              view.RetryHome,
-		AppliedSequence:        2,
+		AppliedSequence:        3,
 		ResultCode:             ResultApplied,
 		ResultFormat:           ResultFormatMutation,
 		Storage:                replication.CompletionInline,
@@ -441,12 +474,189 @@ func TestCompactSessionSlotReconstructsCanonicalOriginalCompletion(t *testing.T)
 	if err := fixture.machine.AdmitCommand(refreshedBytes); err != nil {
 		t.Fatalf("refreshed duplicate admission: %v", err)
 	}
-	if _, err := fixture.machine.ApplyNormal(normalMeta(3), refreshedBytes); err != nil {
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), refreshedBytes); err != nil {
 		t.Fatalf("refreshed duplicate apply: %v", err)
 	}
 	duplicate, err := fixture.machine.LookupCompletion(refreshedBytes)
-	if err != nil || !bytes.Equal(duplicate.Bytes, want) || duplicate.AppliedSequence != 2 {
+	if err != nil || !bytes.Equal(duplicate.Bytes, want) || duplicate.AppliedSequence != 3 {
 		t.Fatalf("refreshed duplicate completion=%x applied=%d err=%v",
 			duplicate.Bytes, duplicate.AppliedSequence, err)
 	}
+}
+
+func TestSessionOpenAllocatesOrderedTokensAndRetainsExactCompletion(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+
+	first := commandValue(fixture.binding, 1)
+	second := commandValue(fixture.binding, 1)
+	second.ClientID = id128(88)
+	firstOpen := encodeCommand(t, sessionOpenFor(first))
+	secondOpen := encodeCommand(t, sessionOpenFor(second))
+	// Admission is deliberately non-reserving: independently admitted opens
+	// receive their definitive, collision-free tokens only in ordered apply.
+	if err := fixture.machine.AdmitCommand(firstOpen); err != nil {
+		t.Fatalf("first concurrent open admission: %v", err)
+	}
+	if err := fixture.machine.AdmitCommand(secondOpen); err != nil {
+		t.Fatalf("second concurrent open admission: %v", err)
+	}
+	_, _, firstEpoch := applySessionOpen(t, fixture.machine, 2, first)
+	_, _, secondEpoch := applySessionOpen(t, fixture.machine, 3, second)
+	if firstEpoch != 2 || secondEpoch != 3 || firstEpoch == secondEpoch ||
+		fixture.machine.state.SessionEpochHighWater != secondEpoch {
+		t.Fatalf("ordered open tokens = %d,%d state=%+v", firstEpoch, secondEpoch, fixture.machine.state)
+	}
+
+	retained, err := fixture.machine.LookupCompletion(firstOpen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), firstOpen); err != nil {
+		t.Fatalf("exact open duplicate apply: %v", err)
+	}
+	duplicate, err := fixture.machine.LookupCompletion(firstOpen)
+	if err != nil || duplicate.AppliedSequence != firstEpoch ||
+		!bytes.Equal(duplicate.Bytes, retained.Bytes) {
+		t.Fatalf("retained open completion = %+v, %v; want %+v", duplicate, err, retained)
+	}
+
+	conflict := sessionOpenFor(first)
+	conflict.RetryHome[0] = 1
+	conflictBytes := encodeCommand(t, conflict)
+	if err := fixture.machine.AdmitCommand(conflictBytes); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("conflicting active open admission = %v, want ErrRequestConflict", err)
+	}
+	if original, err := fixture.machine.LookupCompletion(conflictBytes); !errors.Is(err, ErrRequestConflict) || !bytes.Equal(original.Bytes, retained.Bytes) {
+		t.Fatalf("conflicting active open lookup = %+v, %v", original, err)
+	}
+
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("reopen ordered session tokens: %v", err)
+	}
+	if reopened.state.SessionEpochHighWater != secondEpoch || reopened.state.SessionCount != 2 {
+		t.Fatalf("reopened token fence = %+v", reopened.state)
+	}
+	for _, open := range [][]byte{firstOpen, secondOpen} {
+		if _, err := reopened.LookupCompletion(open); err != nil {
+			t.Fatalf("reopened open completion: %v", err)
+		}
+	}
+}
+
+func TestSessionOpenStaleFenceIsNeverStored(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	stale := commandValue(fixture.binding, 1)
+	stale.RoutingVersion++
+	stale.RouteGeneration++
+	open := encodeCommand(t, sessionOpenFor(stale))
+	if err := fixture.machine.AdmitCommand(open); !errors.Is(err, ErrStaleCommand) {
+		t.Fatalf("stale open admission = %v, want ErrStaleCommand", err)
+	}
+	publication, err := fixture.machine.ApplyNormal(normalMeta(2), open)
+	if err != nil || publication.Applied != 2 {
+		t.Fatalf("committed stale open = %+v, %v", publication, err)
+	}
+	if _, err := fixture.machine.LookupCompletion(open); !errors.Is(err, ErrCompletionNotFound) {
+		t.Fatalf("stale open lookup = %v, want ErrCompletionNotFound", err)
+	}
+	if fixture.machine.state.SessionCount != 0 || fixture.machine.state.SessionSlotCount != 0 ||
+		fixture.machine.state.SessionEpochHighWater != 0 || fixture.system.Collection.Len() != 1 {
+		t.Fatalf("stale open persisted state: %+v rows=%d",
+			fixture.machine.state, fixture.system.Collection.Len())
+	}
+}
+
+func TestSessionOpenRequiresReleaseAndReplayCreatesEmptyFreshSession(t *testing.T) {
+	fixture := newSessionReleaseFixture(t, 1, 4)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	_, openBytes, oldEpoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	retirement := sessionRetirement(prototype)
+	retirementBytes := applySessionReleaseCommand(t, fixture.machine, 3, retirement)
+
+	freshWhileRetired := sessionOpenFor(prototype)
+	freshWhileRetired.Fingerprint[0] ^= 0xff
+	if err := fixture.machine.AdmitCommand(encodeCommand(t, freshWhileRetired)); !errors.Is(err, ErrSessionRetired) {
+		t.Fatalf("open over retired image = %v, want ErrSessionRetired", err)
+	}
+	if err := fixture.machine.AdmitCommand(openBytes); !errors.Is(err, ErrRetryRetired) {
+		t.Fatalf("exact retired open retry = %v, want ErrRetryRetired", err)
+	}
+	applySessionReleaseCommand(t, fixture.machine, 4, sessionRelease(retirement))
+	if fixture.machine.state.SessionCount != 0 || fixture.machine.state.SessionSlotCount != 0 {
+		t.Fatalf("release left session image: %+v", fixture.machine.state)
+	}
+
+	// The same old Open bytes are safe to replay: ordered apply assigns a new
+	// token and Open has no mutation payload to resurrect.
+	applySessionReleaseCommand(t, fixture.machine, 5, sessionOpenFor(prototype))
+	if fixture.machine.state.SessionEpochHighWater != 5 || oldEpoch != 2 ||
+		fixture.machine.state.SessionCount != 1 || fixture.machine.state.SessionSlotCount != 1 ||
+		fixture.user.Collection.Len() != 0 {
+		t.Fatalf("replayed open image = %+v user rows=%d",
+			fixture.machine.state, fixture.user.Collection.Len())
+	}
+	if _, err := fixture.machine.LookupCompletion(retirementBytes); !errors.Is(err, ErrRetryRetired) {
+		t.Fatalf("old retirement after fresh open = %v, want ErrRetryRetired", err)
+	}
+
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("reopen fresh empty session: %v", err)
+	}
+	if reopened.state.SessionEpochHighWater != 5 || reopened.state.SessionCount != 1 ||
+		reopened.state.SessionSlotCount != 1 {
+		t.Fatalf("reopened fresh session token = %+v", reopened.state)
+	}
+}
+
+func TestSessionOpenRetryRetiresAfterAckOrSlotEviction(t *testing.T) {
+	t.Run("acknowledged", func(t *testing.T) {
+		fixture := newMachineFixture(t)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		prototype := commandValue(fixture.binding, 1)
+		_, openBytes, _ := applySessionOpen(t, fixture.machine, 2, prototype)
+		prototype.AckThrough = 1
+		applySessionReleaseCommand(t, fixture.machine, 3, prototype)
+		if err := fixture.machine.AdmitCommand(openBytes); !errors.Is(err, ErrRetryRetired) {
+			t.Fatalf("acknowledged open admission = %v, want ErrRetryRetired", err)
+		}
+		if _, err := fixture.machine.LookupCompletion(openBytes); !errors.Is(err, ErrRetryRetired) {
+			t.Fatalf("acknowledged open lookup = %v, want ErrRetryRetired", err)
+		}
+	})
+
+	t.Run("evicted", func(t *testing.T) {
+		fixture := newSessionReleaseFixture(t, 4, 2)
+		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		prototype := commandValue(fixture.binding, 1)
+		_, openBytes, _ := applySessionOpen(t, fixture.machine, 2, prototype)
+		applySessionReleaseCommand(t, fixture.machine, 3, prototype)
+		applySessionReleaseCommand(t, fixture.machine, 4, commandValue(fixture.binding, 2))
+		if err := fixture.machine.AdmitCommand(openBytes); !errors.Is(err, ErrRetryRetired) {
+			t.Fatalf("evicted open admission = %v, want ErrRetryRetired", err)
+		}
+		if _, err := fixture.machine.LookupCompletion(openBytes); !errors.Is(err, ErrRetryRetired) {
+			t.Fatalf("evicted open lookup = %v, want ErrRetryRetired", err)
+		}
+	})
 }

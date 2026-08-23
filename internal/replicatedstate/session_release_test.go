@@ -119,6 +119,46 @@ func rawSessionReleaseRow(
 	return raw, found
 }
 
+func assertSessionReleaseSlotsEpoch(
+	t testing.TB,
+	fixture machineFixture,
+	identity replication.Command,
+	want uint64,
+) {
+	t.Helper()
+	digest := SessionKey(identity.Tenant, identity.ClientID)
+	headerKey := SessionStorageKey(digest)
+	raw, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
+	if !found {
+		t.Fatal("session header is missing")
+	}
+	header, err := OpenSessionRecord(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.ClientEpoch != want {
+		t.Fatalf("session header epoch = %d, want %d", header.ClientEpoch, want)
+	}
+	for slot := uint16(0); slot < header.PhysicalSlotCount; slot++ {
+		key, err := SessionSlotStorageKey(digest, slot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, found := rawSessionReleaseRow(t, fixture.system.Collection, key[:])
+		if !found {
+			t.Fatalf("session slot %d is missing", slot)
+		}
+		record, err := OpenSessionSlot(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.SessionDigest != digest || record.Slot != slot || record.ClientEpoch != want {
+			t.Fatalf("session slot %d identity/epoch = %+v, want digest=%x epoch=%d",
+				slot, record, digest, want)
+		}
+	}
+}
+
 func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 	fixture := newSessionReleaseFixture(t, 1, 4)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -126,35 +166,37 @@ func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 	}
 
 	first := commandValue(fixture.binding, 1)
-	firstBytes := applySessionReleaseCommand(t, fixture.machine, 2, first)
+	applySessionOpen(t, fixture.machine, 2, first)
+	firstBytes := applySessionReleaseCommand(t, fixture.machine, 3, first)
 	secondIdentity := commandValue(fixture.binding, 1)
 	secondIdentity.ClientID = id128(99)
-	secondIdentity.ClientEpoch = 2
 	secondIdentity.Fingerprint = sha256.Sum256([]byte("second stable identity"))
-	secondBytes := encodeCommand(t, secondIdentity)
+	secondOpen := sessionOpenFor(secondIdentity)
+	secondBytes := encodeCommand(t, secondOpen)
 	if err := fixture.machine.AdmitCommand(secondBytes); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("full-capacity admission = %v, want ErrAdmissionBound", err)
 	}
-	if publication, err := fixture.machine.ApplyNormal(normalMeta(3), secondBytes); err != nil ||
-		publication.Applied != 3 {
+	if publication, err := fixture.machine.ApplyNormal(normalMeta(4), secondBytes); err != nil ||
+		publication.Applied != 4 {
 		t.Fatalf("committed capacity refusal = %+v, %v", publication, err)
 	}
 	if fixture.machine.state.SessionCount != 1 ||
-		fixture.machine.state.SessionEpochHighWater != 1 {
+		fixture.machine.state.SessionEpochHighWater != 2 {
 		t.Fatalf("capacity refusal changed session state: %+v", fixture.machine.state)
 	}
 
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
-	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
+	applySessionReleaseCommand(t, fixture.machine, 5, retirement)
+	assertSessionReleaseSlotsEpoch(t, fixture, retirement, 2)
 	release := sessionRelease(retirement)
 	releaseBytes := encodeCommand(t, release)
 	if err := fixture.machine.AdmitCommand(releaseBytes); err != nil {
 		t.Fatalf("release admission: %v", err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 5, release)
+	applySessionReleaseCommand(t, fixture.machine, 6, release)
 	if fixture.machine.state.SessionCount != 0 ||
 		fixture.machine.state.SessionSlotCount != 0 ||
-		fixture.machine.state.SessionEpochHighWater != 1 ||
+		fixture.machine.state.SessionEpochHighWater != 2 ||
 		fixture.system.Collection.Len() != 1 {
 		t.Fatalf("release did not reclaim bounded image: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
@@ -166,8 +208,8 @@ func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 	if _, err := fixture.machine.LookupCompletion(firstBytes); !errors.Is(err, ErrRetryRetired) {
 		t.Fatalf("released command lookup = %v, want ErrRetryRetired", err)
 	}
-	if publication, err := fixture.machine.ApplyNormal(normalMeta(6), firstBytes); err != nil ||
-		publication.Applied != 6 {
+	if publication, err := fixture.machine.ApplyNormal(normalMeta(7), firstBytes); err != nil ||
+		publication.Applied != 7 {
 		t.Fatalf("committed old retry refusal = %+v, %v", publication, err)
 	}
 	if fixture.machine.state.SessionCount != 0 ||
@@ -179,10 +221,10 @@ func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(secondBytes); err != nil {
 		t.Fatalf("reclaimed capacity admission: %v", err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 7, secondIdentity)
+	applySessionReleaseCommand(t, fixture.machine, 8, secondOpen)
 	if fixture.machine.state.SessionCount != 1 ||
 		fixture.machine.state.SessionSlotCount != 1 ||
-		fixture.machine.state.SessionEpochHighWater != 2 {
+		fixture.machine.state.SessionEpochHighWater != 8 {
 		t.Fatalf("reclaimed capacity was not reusable: %+v", fixture.machine.state)
 	}
 }
@@ -192,11 +234,13 @@ func TestSessionReleaseExactRetryIsIdempotent(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	applySessionReleaseCommand(t, fixture.machine, 3, commandValue(fixture.binding, 1))
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
-	applySessionReleaseCommand(t, fixture.machine, 3, retirement)
+	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
+	assertSessionReleaseSlotsEpoch(t, fixture, retirement, 2)
 	release := sessionRelease(retirement)
-	releaseBytes := applySessionReleaseCommand(t, fixture.machine, 4, release)
+	releaseBytes := applySessionReleaseCommand(t, fixture.machine, 5, release)
 	if _, err := fixture.machine.LookupCompletion(releaseBytes); !errors.Is(err, ErrSessionReleased) {
 		t.Fatalf("first release lookup = %v, want ErrSessionReleased", err)
 	}
@@ -205,13 +249,13 @@ func TestSessionReleaseExactRetryIsIdempotent(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(releaseBytes); err != nil {
 		t.Fatalf("exact release retry admission: %v", err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 5, release)
+	applySessionReleaseCommand(t, fixture.machine, 6, release)
 	if _, err := fixture.machine.LookupCompletion(releaseBytes); !errors.Is(err, ErrSessionReleased) {
 		t.Fatalf("retried release lookup = %v, want ErrSessionReleased", err)
 	}
 	if fixture.machine.state.SessionCount != 0 ||
 		fixture.machine.state.SessionSlotCount != 0 ||
-		fixture.machine.state.SessionEpochHighWater != 1 ||
+		fixture.machine.state.SessionEpochHighWater != 2 ||
 		fixture.system.Collection.Len() != 1 ||
 		fixture.machine.Published().DataChainDigest != wantChain {
 		t.Fatalf("idempotent release changed durable postcondition: state=%+v rows=%d",
@@ -226,22 +270,23 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		active := commandValue(fixture.binding, 1)
-		applySessionReleaseCommand(t, fixture.machine, 2, active)
+		applySessionOpen(t, fixture.machine, 2, active)
+		applySessionReleaseCommand(t, fixture.machine, 3, active)
 		release := sessionRelease(active)
 		release.Mutations = nil
 		releaseBytes := encodeCommand(t, release)
 		if err := fixture.machine.AdmitCommand(releaseBytes); !errors.Is(err, ErrSessionActive) {
 			t.Fatalf("active release admission = %v, want ErrSessionActive", err)
 		}
-		if publication, err := fixture.machine.ApplyNormal(normalMeta(3), releaseBytes); err != nil ||
-			publication.Applied != 3 {
+		if publication, err := fixture.machine.ApplyNormal(normalMeta(4), releaseBytes); err != nil ||
+			publication.Applied != 4 {
 			t.Fatalf("committed active release refusal = %+v, %v", publication, err)
 		}
 		if _, err := fixture.machine.LookupCompletion(releaseBytes); !errors.Is(err, ErrSessionActive) {
 			t.Fatalf("active release lookup = %v, want ErrSessionActive", err)
 		}
 		if fixture.machine.state.SessionCount != 1 ||
-			fixture.machine.state.SessionSlotCount != 1 || fixture.system.Collection.Len() != 3 {
+			fixture.machine.state.SessionSlotCount != 2 || fixture.system.Collection.Len() != 4 {
 			t.Fatalf("active session was deleted: state=%+v rows=%d",
 				fixture.machine.state, fixture.system.Collection.Len())
 		}
@@ -252,19 +297,20 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
 		}
-		applySessionReleaseCommand(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+		applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+		applySessionReleaseCommand(t, fixture.machine, 3, commandValue(fixture.binding, 1))
 		retirement := sessionRetirement(commandValue(fixture.binding, 2))
-		applySessionReleaseCommand(t, fixture.machine, 3, retirement)
-		newer := commandValue(fixture.binding, 1)
-		newer.ClientEpoch = 2
-		newerBytes := applySessionReleaseCommand(t, fixture.machine, 4, newer)
+		applySessionReleaseCommand(t, fixture.machine, 4, retirement)
+		applySessionReleaseCommand(t, fixture.machine, 5, sessionRelease(retirement))
+		newer := sessionOpenFor(commandValue(fixture.binding, 1))
+		newerBytes := applySessionReleaseCommand(t, fixture.machine, 6, newer)
 
 		oldRelease := sessionRelease(retirement)
 		oldReleaseBytes := encodeCommand(t, oldRelease)
 		if err := fixture.machine.AdmitCommand(oldReleaseBytes); err != nil {
 			t.Fatalf("older release postcondition admission: %v", err)
 		}
-		applySessionReleaseCommand(t, fixture.machine, 5, oldRelease)
+		applySessionReleaseCommand(t, fixture.machine, 7, oldRelease)
 		if _, err := fixture.machine.LookupCompletion(oldReleaseBytes); !errors.Is(err, ErrSessionReleased) {
 			t.Fatalf("older release lookup = %v, want ErrSessionReleased", err)
 		}
@@ -272,9 +318,9 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 			t.Fatalf("newer completion disappeared: %v", err)
 		}
 		if fixture.machine.state.SessionCount != 1 ||
-			fixture.machine.state.SessionSlotCount != 2 ||
-			fixture.machine.state.SessionEpochHighWater != 2 ||
-			fixture.system.Collection.Len() != 4 {
+			fixture.machine.state.SessionSlotCount != 1 ||
+			fixture.machine.state.SessionEpochHighWater != 6 ||
+			fixture.system.Collection.Len() != 3 {
 			t.Fatalf("older release deleted newer image: state=%+v rows=%d",
 				fixture.machine.state, fixture.system.Collection.Len())
 		}
@@ -286,9 +332,11 @@ func TestSessionReleaseConflictsPreserveRetiredImage(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	applySessionReleaseCommand(t, fixture.machine, 3, commandValue(fixture.binding, 1))
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
-	applySessionReleaseCommand(t, fixture.machine, 3, retirement)
+	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
+	assertSessionReleaseSlotsEpoch(t, fixture, retirement, 2)
 	digest := SessionKey(retirement.Tenant, retirement.ClientID)
 	headerKey := SessionStorageKey(digest)
 	wantHeader, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
@@ -302,8 +350,8 @@ func TestSessionReleaseConflictsPreserveRetiredImage(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(wrongFingerprintBytes); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("wrong-fingerprint release admission = %v, want ErrRequestConflict", err)
 	}
-	if publication, err := fixture.machine.ApplyNormal(normalMeta(4), wrongFingerprintBytes); err != nil ||
-		publication.Applied != 4 {
+	if publication, err := fixture.machine.ApplyNormal(normalMeta(5), wrongFingerprintBytes); err != nil ||
+		publication.Applied != 5 {
 		t.Fatalf("committed fingerprint conflict = %+v, %v", publication, err)
 	}
 
@@ -313,20 +361,20 @@ func TestSessionReleaseConflictsPreserveRetiredImage(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(wrongHomeBytes); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("wrong-home release admission = %v, want ErrRequestConflict", err)
 	}
-	if publication, err := fixture.machine.ApplyNormal(normalMeta(5), wrongHomeBytes); err != nil ||
-		publication.Applied != 5 {
+	if publication, err := fixture.machine.ApplyNormal(normalMeta(6), wrongHomeBytes); err != nil ||
+		publication.Applied != 6 {
 		t.Fatalf("committed retry-home conflict = %+v, %v", publication, err)
 	}
 
 	gotHeader, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
 	if !found || !bytes.Equal(gotHeader, wantHeader) ||
 		fixture.machine.state.SessionCount != 1 ||
-		fixture.machine.state.SessionSlotCount != 2 || fixture.system.Collection.Len() != 4 {
+		fixture.machine.state.SessionSlotCount != 3 || fixture.system.Collection.Len() != 5 {
 		t.Fatalf("release conflict changed retired image: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
 	}
 	exactRelease := sessionRelease(retirement)
-	applySessionReleaseCommand(t, fixture.machine, 6, exactRelease)
+	applySessionReleaseCommand(t, fixture.machine, 7, exactRelease)
 	if fixture.machine.state.SessionCount != 0 || fixture.machine.state.SessionSlotCount != 0 {
 		t.Fatalf("exact release after conflicts failed: %+v", fixture.machine.state)
 	}
@@ -337,11 +385,12 @@ func TestSessionReleaseReopensWithOnlyEpochFence(t *testing.T) {
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	first := applySessionReleaseCommand(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	first := applySessionReleaseCommand(t, fixture.machine, 3, commandValue(fixture.binding, 1))
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
-	applySessionReleaseCommand(t, fixture.machine, 3, retirement)
+	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
 	release := sessionRelease(retirement)
-	releaseBytes := applySessionReleaseCommand(t, fixture.machine, 4, release)
+	releaseBytes := applySessionReleaseCommand(t, fixture.machine, 5, release)
 
 	reopened, err := Open(
 		fixture.binding, fixture.bootstrap, fixture.system,
@@ -352,7 +401,7 @@ func TestSessionReleaseReopensWithOnlyEpochFence(t *testing.T) {
 		t.Fatalf("reopen released image: %v", err)
 	}
 	if reopened.state.SessionCount != 0 || reopened.state.SessionSlotCount != 0 ||
-		reopened.state.SessionEpochHighWater != 1 || reopened.Applied() != 4 ||
+		reopened.state.SessionEpochHighWater != 2 || reopened.Applied() != 5 ||
 		fixture.system.Collection.Len() != 1 {
 		t.Fatalf("reopened release state = %+v rows=%d",
 			reopened.state, fixture.system.Collection.Len())
@@ -372,7 +421,7 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 	}
 
 	retirement := sessionRetirement(commandValue(
-		fixture.binding, uint64(MaxSessionRetryWindow)+1,
+		fixture.binding, uint64(MaxSessionRetryWindow),
 	))
 	retirementBytes := encodeCommand(t, retirement)
 	retirementView, err := replication.OpenCommand(retirementBytes)
@@ -461,6 +510,8 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 		t.Fatalf("full retry ring state=%+v rows=%d",
 			machine.state, fixture.system.Collection.Len())
 	}
+	fixture.machine = machine
+	assertSessionReleaseSlotsEpoch(t, fixture, retirement, retirement.ClientEpoch)
 	release := sessionRelease(retirement)
 	releaseBytes := encodeCommand(t, release)
 	if err := machine.AdmitCommand(releaseBytes); err != nil {
@@ -471,7 +522,7 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 		t.Fatalf("full-window release = %+v, %v", publication, err)
 	}
 	if machine.state.SessionCount != 0 || machine.state.SessionSlotCount != 0 ||
-		machine.state.SessionEpochHighWater != 1 || fixture.system.Collection.Len() != 1 {
+		machine.state.SessionEpochHighWater != retirement.ClientEpoch || fixture.system.Collection.Len() != 1 {
 		t.Fatalf("full-window release left rows: state=%+v rows=%d",
 			machine.state, fixture.system.Collection.Len())
 	}
@@ -512,22 +563,23 @@ func TestSessionReleaseCorruptOrMissingSlotDeletesNothing(t *testing.T) {
 			if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 				t.Fatal(err)
 			}
-			applySessionReleaseCommand(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+			applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+			applySessionReleaseCommand(t, fixture.machine, 3, commandValue(fixture.binding, 1))
 			second := commandValue(fixture.binding, 2)
-			second.AckThrough = 1
-			applySessionReleaseCommand(t, fixture.machine, 3, second)
+			second.AckThrough = 2
+			applySessionReleaseCommand(t, fixture.machine, 4, second)
 			retirement := sessionRetirement(commandValue(fixture.binding, 3))
-			applySessionReleaseCommand(t, fixture.machine, 4, retirement)
+			applySessionReleaseCommand(t, fixture.machine, 5, retirement)
 
 			digest := SessionKey(retirement.Tenant, retirement.ClientID)
-			targetKey, err := SessionSlotStorageKey(digest, 1)
+			targetKey, err := SessionSlotStorageKey(digest, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
 			test.mutate(t, fixture.system.Collection, targetKey[:])
 
 			headerKey := SessionStorageKey(digest)
-			retirementKey, err := SessionSlotStorageKey(digest, 0)
+			retirementKey, err := SessionSlotStorageKey(digest, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -542,7 +594,7 @@ func TestSessionReleaseCorruptOrMissingSlotDeletesNothing(t *testing.T) {
 			beforeLen := fixture.system.Collection.Len()
 			beforeApplied := fixture.machine.Applied()
 			releaseBytes := encodeCommand(t, sessionRelease(retirement))
-			if _, err := fixture.machine.ApplyNormal(normalMeta(5), releaseBytes); !errors.Is(err, ErrSessionCorrupt) {
+			if _, err := fixture.machine.ApplyNormal(normalMeta(6), releaseBytes); !errors.Is(err, ErrSessionCorrupt) {
 				t.Fatalf("release corrupt image error = %v, want ErrSessionCorrupt", err)
 			}
 			if fixture.machine.Applied() != beforeApplied ||
@@ -557,7 +609,7 @@ func TestSessionReleaseCorruptOrMissingSlotDeletesNothing(t *testing.T) {
 						keys[i], found, beforeFound[i])
 				}
 			}
-			if _, err := fixture.machine.ApplyNormal(normalMeta(5), releaseBytes); !errors.Is(err, ErrApplyPoisoned) {
+			if _, err := fixture.machine.ApplyNormal(normalMeta(6), releaseBytes); !errors.Is(err, ErrApplyPoisoned) {
 				t.Fatalf("post-corruption apply = %v, want ErrApplyPoisoned", err)
 			}
 		})
