@@ -320,6 +320,10 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultSessionOpened:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultSessionRenewed:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultSessionRevoked:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
 	default:
@@ -548,14 +552,17 @@ func (m *Machine) planCommand(
 		}
 	}
 
-	// Reserve the terminal uint64 value for retirement. An ordinary command at
-	// this sequence could leave an active epoch with no possible successor.
+	// Reserve the terminal uint64 value for retirement or revocation. An
+	// ordinary command at this sequence could leave an active epoch with no
+	// possible successor.
 	if command.Kind() != replication.CommandSessionRetire &&
+		command.Kind() != replication.CommandSessionRevoke &&
 		command.ClientSequence == math.MaxUint64 {
 		plan.refusal = ErrSessionSequence
 		return plan, nil
 	}
-	if command.Kind() == replication.CommandSessionRetire {
+	switch command.Kind() {
+	case replication.CommandSessionRetire:
 		if command.AckThrough != next.HighSequence {
 			plan.refusal = ErrSessionAck
 			return plan, nil
@@ -573,7 +580,38 @@ func (m *Machine) planCommand(
 		} else {
 			plan.resultCode = ResultSessionRetired
 		}
-	} else {
+	case replication.CommandSessionRenew:
+		if command.ExpectedDeadlineUnixNano != next.LeaseDeadlineUnixNano ||
+			command.NextDeadlineUnixNano <= command.ExpectedDeadlineUnixNano {
+			plan.refusal = ErrSessionLeaseDeadline
+			return plan, nil
+		}
+		if !m.mutableBindingMatches(command) {
+			plan.resultCode = ResultStaleFence
+		} else {
+			plan.resultCode = ResultSessionRenewed
+			next.LeaseDeadlineUnixNano = command.NextDeadlineUnixNano
+		}
+	case replication.CommandSessionRevoke:
+		if command.AckThrough != next.HighSequence {
+			plan.refusal = ErrSessionAck
+			return plan, nil
+		}
+		if command.ExpectedDeadlineUnixNano != next.LeaseDeadlineUnixNano {
+			plan.refusal = ErrSessionLeaseDeadline
+			return plan, nil
+		}
+		if !m.mutableBindingMatches(command) {
+			if command.ClientSequence == math.MaxUint64 {
+				plan.refusal = ErrStaleCommand
+				return plan, nil
+			}
+			plan.resultCode = ResultStaleFence
+		} else {
+			plan.resultCode = ResultSessionRevoked
+			next.LeaseDeadlineUnixNano = 0
+		}
+	default:
 		switch {
 		case !m.mutableBindingMatches(command):
 			plan.resultCode = ResultStaleFence
@@ -609,7 +647,7 @@ func (m *Machine) planCommand(
 	}
 	next.HighSequence = command.ClientSequence
 	next.AckThrough = command.AckThrough
-	if plan.resultCode == ResultSessionRetired {
+	if isSessionTerminalResult(plan.resultCode) {
 		next.Status = SessionRetired
 	}
 	plan.sessionRecord, err = AppendSessionRecord(nil, next)
@@ -744,7 +782,8 @@ func (m *Machine) planSessionOpen(
 		Tenant: command.Tenant, ClientID: command.ClientID,
 		ClientEpoch: applied, RetryHome: command.RetryHome,
 		AckThrough: 0, HighSequence: 1, Status: SessionActive,
-		RetryWindow: m.options.RetryWindow, PhysicalSlotCount: 1,
+		LeaseDeadlineUnixNano: command.NextDeadlineUnixNano,
+		RetryWindow:           m.options.RetryWindow, PhysicalSlotCount: 1,
 	}
 	plan.newSession = true
 	plan.slotKey, _ = SessionSlotStorageKey(plan.sessionDigest, 0)
@@ -875,7 +914,7 @@ func (m *Machine) planSessionRelease(
 		}
 		if seen == retirementSlot {
 			if record.ClientSequence != session.HighSequence ||
-				record.ResultCode != ResultSessionRetired {
+				!isSessionTerminalResult(record.ResultCode) {
 				return fmt.Errorf("%w: missing retirement slot", ErrSessionCorrupt)
 			}
 			retirementMatches = session.RetryHome == command.RetryHome &&
@@ -911,7 +950,8 @@ func sessionRecord(view SessionView) SessionRecord {
 	return SessionRecord{
 		Tenant: view.Tenant, ClientID: view.ClientID, ClientEpoch: view.ClientEpoch,
 		RetryHome: view.RetryHome, AckThrough: view.AckThrough,
-		HighSequence: view.HighSequence, Status: view.Status,
+		HighSequence: view.HighSequence, LeaseDeadlineUnixNano: view.LeaseDeadlineUnixNano,
+		Status:      view.Status,
 		RetryWindow: view.RetryWindow, PhysicalSlotCount: view.PhysicalSlotCount,
 	}
 }

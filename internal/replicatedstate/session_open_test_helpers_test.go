@@ -7,6 +7,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
+const testSessionLeaseDeadlineUnixNano int64 = 2_000_000_000_000_000_000
+
 // sessionOpenFor returns the canonical empty-session request for the same
 // stable identity and binding as prototype. Its fingerprint is deliberately
 // independent from the first user request.
@@ -15,6 +17,8 @@ func sessionOpenFor(prototype replication.Command) replication.Command {
 	prototype.ClientEpoch = 0
 	prototype.ClientSequence = 1
 	prototype.AckThrough = 0
+	prototype.ExpectedDeadlineUnixNano = 0
+	prototype.NextDeadlineUnixNano = testSessionLeaseDeadlineUnixNano
 	prototype.Mutations = nil
 	seed := make([]byte, 0, len("replicatedstate/test-session-open/")+len(prototype.Tenant)+len(prototype.ClientID))
 	seed = append(seed, "replicatedstate/test-session-open/"...)

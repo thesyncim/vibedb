@@ -103,6 +103,8 @@ func sessionRetirement(command replication.Command) replication.Command {
 
 func sessionRelease(retirement replication.Command) replication.Command {
 	retirement.Kind = replication.CommandSessionRelease
+	retirement.ExpectedDeadlineUnixNano = 0
+	retirement.NextDeadlineUnixNano = 0
 	return retirement
 }
 
@@ -433,7 +435,8 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 		Tenant: retirement.Tenant, ClientID: retirement.ClientID,
 		ClientEpoch: retirement.ClientEpoch, RetryHome: retirement.RetryHome,
 		AckThrough: retirement.AckThrough, HighSequence: retirement.ClientSequence,
-		Status: SessionRetired, RetryWindow: MaxSessionRetryWindow,
+		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
+		Status:                SessionRetired, RetryWindow: MaxSessionRetryWindow,
 		PhysicalSlotCount: MaxSessionRetryWindow,
 	})
 	if err != nil {

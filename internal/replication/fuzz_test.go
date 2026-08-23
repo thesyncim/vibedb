@@ -11,6 +11,8 @@ func FuzzOpenCommand(f *testing.F) {
 	retire := testSessionRetireCommand()
 	release := testSessionReleaseCommand()
 	open := testSessionOpenCommand()
+	renew := testSessionRenewCommand()
+	revoke := testSessionRevokeCommand()
 	ordered := testCommand()
 	ordered.Mutations = []Mutation{
 		{Kind: MutationPut, Key: []byte("z"), Value: []byte("first")},
@@ -21,6 +23,8 @@ func FuzzOpenCommand(f *testing.F) {
 	f.Add(encodeCommand(f, retire))
 	f.Add(encodeCommand(f, release))
 	f.Add(encodeCommand(f, open))
+	f.Add(encodeCommand(f, renew))
+	f.Add(encodeCommand(f, revoke))
 	f.Add(encodeCommand(f, ordered))
 	f.Add(valid[:len(valid)-1])
 	f.Add([]byte{})
@@ -34,6 +38,31 @@ func FuzzOpenCommand(f *testing.F) {
 			return
 		}
 		assertFuzzCommandView(t, data, view)
+	})
+}
+
+func FuzzOpenSessionLeaseResealedFields(f *testing.F) {
+	for kind, command := range []Command{
+		testSessionOpenCommand(), testSessionRenewCommand(), testSessionRevokeCommand(),
+	} {
+		f.Add(uint8(kind), uint64(command.ExpectedDeadlineUnixNano), uint64(command.NextDeadlineUnixNano))
+	}
+	f.Add(uint8(0), uint64(0), uint64(1)<<63)
+	f.Add(uint8(1), uint64(1)<<63, uint64(1)<<63|1)
+	f.Add(uint8(2), uint64(1)<<63, uint64(0))
+	f.Fuzz(func(t *testing.T, selector uint8, expected, next uint64) {
+		commands := [...]Command{
+			testSessionOpenCommand(), testSessionRenewCommand(), testSessionRevokeCommand(),
+		}
+		candidate := encodeCommand(t, commands[selector%uint8(len(commands))])
+		lease := commandMutationOffset(candidate)
+		binary.LittleEndian.PutUint64(candidate[lease:lease+8], expected)
+		binary.LittleEndian.PutUint64(candidate[lease+8:lease+16], next)
+		sealEnvelope(candidate)
+		view, err := OpenCommand(candidate)
+		if err == nil {
+			assertFuzzCommandView(t, candidate, view)
+		}
 	})
 }
 
@@ -110,7 +139,8 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 	switch view.Kind() {
 	case CommandMutationBatch:
 		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
-			view.AckThrough >= view.ClientSequence {
+			view.AckThrough >= view.ClientSequence || view.ExpectedDeadlineUnixNano != 0 ||
+			view.NextDeadlineUnixNano != 0 {
 			t.Fatal("accepted mutation batch has invalid client tuple")
 		}
 		if view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
@@ -118,7 +148,8 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		}
 	case CommandSessionRetire, CommandSessionRelease:
 		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
-			view.AckThrough >= view.ClientSequence {
+			view.AckThrough >= view.ClientSequence || view.ExpectedDeadlineUnixNano != 0 ||
+			view.NextDeadlineUnixNano != 0 {
 			t.Fatal("accepted session lifecycle command has invalid client tuple")
 		}
 		if view.MutationCount() != 0 {
@@ -128,8 +159,29 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		if view.ClientEpoch != 0 || view.ClientSequence != 1 || view.AckThrough != 0 {
 			t.Fatal("accepted session open has invalid client tuple")
 		}
+		if view.ExpectedDeadlineUnixNano != 0 || view.NextDeadlineUnixNano <= 0 {
+			t.Fatal("accepted session open has invalid lease deadlines")
+		}
 		if view.MutationCount() != 0 {
 			t.Fatal("accepted session open carries mutations")
+		}
+	case CommandSessionRenew:
+		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
+			view.AckThrough >= view.ClientSequence || view.ExpectedDeadlineUnixNano <= 0 ||
+			view.NextDeadlineUnixNano <= view.ExpectedDeadlineUnixNano {
+			t.Fatal("accepted session renew has invalid tuple or lease deadlines")
+		}
+		if view.MutationCount() != 0 {
+			t.Fatal("accepted session renew carries mutations")
+		}
+	case CommandSessionRevoke:
+		if view.ClientEpoch == 0 || view.ClientSequence == 0 ||
+			view.AckThrough >= view.ClientSequence || view.ExpectedDeadlineUnixNano <= 0 ||
+			view.NextDeadlineUnixNano != 0 {
+			t.Fatal("accepted session revoke has invalid tuple or lease deadlines")
+		}
+		if view.MutationCount() != 0 {
+			t.Fatal("accepted session revoke carries mutations")
 		}
 	default:
 		t.Fatal("accepted unknown command kind")

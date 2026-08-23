@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	sessionRecordCodecFormat = uint16(1)
-	sessionRecordHeaderBytes = 128
-	sessionSlotHeaderBytes   = 192
+	// Session records are still part of the single unreleased format-0 image.
+	// This is a corruption sentinel, not a compatibility-version ladder.
+	sessionRecordCodecSentinel = uint16(1)
+	sessionLeaseMarker         = uint8(1)
+	sessionRecordHeaderBytes   = 128
+	sessionSlotHeaderBytes     = 192
 
 	MaxSessionRecordBytes = sessionRecordHeaderBytes +
 		replication.MaxIdentityBytes + recordChecksumLen
@@ -55,32 +58,34 @@ const (
 // keys in this exact epoch and never exceeds RetryWindow. A new epoch is opened
 // only after release has removed the prior header and every slot.
 type SessionRecord struct {
-	Tenant            []byte
-	ClientID          replication.ID128
-	ClientEpoch       uint64
-	RetryHome         replication.RetryHome
-	AckThrough        uint64
-	HighSequence      uint64
-	Status            SessionStatus
-	RetryWindow       uint16
-	PhysicalSlotCount uint16
+	Tenant                []byte
+	ClientID              replication.ID128
+	ClientEpoch           uint64
+	RetryHome             replication.RetryHome
+	AckThrough            uint64
+	HighSequence          uint64
+	LeaseDeadlineUnixNano int64
+	Status                SessionStatus
+	RetryWindow           uint16
+	PhysicalSlotCount     uint16
 }
 
 // SessionView is a strictly validated borrowed session record. Tenant and
 // Bytes alias the OpenSessionRecord input, are capacity-clamped, and remain
 // valid only while that input remains immutable.
 type SessionView struct {
-	Digest            [sha256.Size]byte
-	Tenant            []byte
-	ClientID          replication.ID128
-	ClientEpoch       uint64
-	RetryHome         replication.RetryHome
-	AckThrough        uint64
-	HighSequence      uint64
-	Status            SessionStatus
-	RetryWindow       uint16
-	PhysicalSlotCount uint16
-	raw               []byte
+	Digest                [sha256.Size]byte
+	Tenant                []byte
+	ClientID              replication.ID128
+	ClientEpoch           uint64
+	RetryHome             replication.RetryHome
+	AckThrough            uint64
+	HighSequence          uint64
+	LeaseDeadlineUnixNano int64
+	Status                SessionStatus
+	RetryWindow           uint16
+	PhysicalSlotCount     uint16
+	raw                   []byte
 }
 
 // Bytes returns the exact validated envelope as a capacity-clamped borrowed
@@ -150,7 +155,7 @@ func AppendSessionRecord(dst []byte, record SessionRecord) ([]byte, error) {
 	digest := SessionKey(record.Tenant, record.ClientID)
 
 	copy(frame[0:8], sessionRecordMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(frame[10:12], sessionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(len(record.Tenant)))
@@ -164,6 +169,8 @@ func AppendSessionRecord(dst []byte, record SessionRecord) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[88:96], record.AckThrough)
 	binary.LittleEndian.PutUint64(frame[96:104], record.HighSequence)
 	copy(frame[104:112], record.RetryHome[:])
+	binary.LittleEndian.PutUint64(frame[112:120], uint64(record.LeaseDeadlineUnixNano))
+	frame[120] = sessionLeaseMarker
 	copy(frame[sessionRecordHeaderBytes:], record.Tenant)
 	sealRecord(frame, sessionRecordChecksumDomain)
 	return dst, nil
@@ -177,10 +184,11 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 		return SessionView{}, fmt.Errorf("%w: session length", ErrSessionCorrupt)
 	}
 	if !bytes.Equal(src[0:8], sessionRecordMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecFormat ||
+		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionRecordHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		src[21] != 0 || !allZero(src[28:32]) || !allZero(src[112:sessionRecordHeaderBytes]) ||
+		src[21] != 0 || !allZero(src[28:32]) || src[120] != sessionLeaseMarker ||
+		!allZero(src[121:sessionRecordHeaderBytes]) ||
 		!verifySessionChecksum(src, sessionRecordChecksumDomain) {
 		return SessionView{}, fmt.Errorf("%w: session envelope", ErrSessionCorrupt)
 	}
@@ -193,14 +201,15 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 	}
 
 	view := SessionView{
-		Tenant:            src[sessionRecordHeaderBytes : sessionRecordHeaderBytes+tenantBytes : sessionRecordHeaderBytes+tenantBytes],
-		ClientEpoch:       binary.LittleEndian.Uint64(src[80:88]),
-		AckThrough:        binary.LittleEndian.Uint64(src[88:96]),
-		HighSequence:      binary.LittleEndian.Uint64(src[96:104]),
-		Status:            SessionStatus(src[20]),
-		RetryWindow:       binary.LittleEndian.Uint16(src[22:24]),
-		PhysicalSlotCount: binary.LittleEndian.Uint16(src[24:26]),
-		raw:               src[:len(src):len(src)],
+		Tenant:                src[sessionRecordHeaderBytes : sessionRecordHeaderBytes+tenantBytes : sessionRecordHeaderBytes+tenantBytes],
+		ClientEpoch:           binary.LittleEndian.Uint64(src[80:88]),
+		AckThrough:            binary.LittleEndian.Uint64(src[88:96]),
+		HighSequence:          binary.LittleEndian.Uint64(src[96:104]),
+		LeaseDeadlineUnixNano: int64(binary.LittleEndian.Uint64(src[112:120])),
+		Status:                SessionStatus(src[20]),
+		RetryWindow:           binary.LittleEndian.Uint16(src[22:24]),
+		PhysicalSlotCount:     binary.LittleEndian.Uint16(src[24:26]),
+		raw:                   src[:len(src):len(src)],
 	}
 	copy(view.ClientID[:], src[32:48])
 	copy(view.Digest[:], src[48:80])
@@ -213,16 +222,17 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 
 func validateSessionRecord(record SessionRecord) error {
 	view := SessionView{
-		Digest:            SessionKey(record.Tenant, record.ClientID),
-		Tenant:            record.Tenant,
-		ClientID:          record.ClientID,
-		ClientEpoch:       record.ClientEpoch,
-		RetryHome:         record.RetryHome,
-		AckThrough:        record.AckThrough,
-		HighSequence:      record.HighSequence,
-		Status:            record.Status,
-		RetryWindow:       record.RetryWindow,
-		PhysicalSlotCount: record.PhysicalSlotCount,
+		Digest:                SessionKey(record.Tenant, record.ClientID),
+		Tenant:                record.Tenant,
+		ClientID:              record.ClientID,
+		ClientEpoch:           record.ClientEpoch,
+		RetryHome:             record.RetryHome,
+		AckThrough:            record.AckThrough,
+		HighSequence:          record.HighSequence,
+		LeaseDeadlineUnixNano: record.LeaseDeadlineUnixNano,
+		Status:                record.Status,
+		RetryWindow:           record.RetryWindow,
+		PhysicalSlotCount:     record.PhysicalSlotCount,
 	}
 	return validateSessionView(view)
 }
@@ -242,6 +252,10 @@ func validateSessionView(view SessionView) error {
 		uint64(view.PhysicalSlotCount) != minimumSlots ||
 		(view.Status != SessionActive && view.Status != SessionRetired) {
 		return fmt.Errorf("%w: invalid session semantics", ErrSessionCorrupt)
+	}
+	if view.LeaseDeadlineUnixNano < 0 ||
+		view.Status == SessionActive && view.LeaseDeadlineUnixNano == 0 {
+		return fmt.Errorf("%w: invalid session lease deadline", ErrSessionCorrupt)
 	}
 	if view.Status == SessionRetired && view.AckThrough != view.HighSequence-1 {
 		return fmt.Errorf("%w: invalid session retirement seal", ErrSessionCorrupt)
@@ -308,7 +322,7 @@ func AppendSessionSlot(dst []byte, slot SessionSlot) ([]byte, error) {
 	frame := dst[start:]
 
 	copy(frame[0:8], sessionSlotMagic[:])
-	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(frame[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(frame[10:12], sessionSlotHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint16(frame[16:18], slot.Slot)
@@ -335,7 +349,7 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 		return SessionSlotView{}, fmt.Errorf("%w: session slot length", ErrSessionCorrupt)
 	}
 	if !bytes.Equal(src[0:8], sessionSlotMagic[:]) ||
-		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecFormat ||
+		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionSlotHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
 		!allZero(src[18:20]) || !allZero(src[184:sessionSlotHeaderBytes]) ||
@@ -389,7 +403,7 @@ func validateSessionSlotView(view SessionSlotView) error {
 		view.ClientSequence == 0 || view.AppliedSequence < 2 ||
 		view.Fingerprint == (replication.Digest{}) ||
 		view.LogicalCommandDigest == ([sha256.Size]byte{}) ||
-		view.ResultCode < ResultApplied || view.ResultCode > ResultSessionOpened ||
+		!isSessionResultCode(view.ResultCode) ||
 		view.ReplicaSetVersion == 0 || view.ActivePolicyGeneration == 0 ||
 		view.ProtectionEpoch == 0 || view.RoutingVersion == 0 ||
 		view.RouteGeneration == 0 ||

@@ -75,6 +75,34 @@ func TestHotPathsAllocateZero(t *testing.T) {
 	}); allocations != 0 {
 		t.Fatalf("session-open OpenCommand allocations = %v, want 0", allocations)
 	}
+	for _, tc := range []struct {
+		name    string
+		command Command
+	}{
+		{"session-renew", testSessionRenewCommand()},
+		{"session-revoke", testSessionRevokeCommand()},
+	} {
+		encoded := encodeCommand(t, tc.command)
+		scratch := make([]byte, 0, len(encoded))
+		if allocations := testing.AllocsPerRun(1000, func() {
+			var err error
+			allocationBytesSink, err = AppendCommand(scratch[:0], tc.command)
+			if err != nil {
+				panic(err)
+			}
+		}); allocations != 0 {
+			t.Fatalf("pre-sized %s AppendCommand allocations = %v, want 0", tc.name, allocations)
+		}
+		if allocations := testing.AllocsPerRun(1000, func() {
+			view, err := OpenCommand(encoded)
+			if err != nil {
+				panic(err)
+			}
+			allocationIntSink += int(view.Kind()) + int(view.NextDeadlineUnixNano&1)
+		}); allocations != 0 {
+			t.Fatalf("%s OpenCommand allocations = %v, want 0", tc.name, allocations)
+		}
+	}
 
 	completion := testInlineCompletion()
 	completionBytes := testCompletionBytes(completion)

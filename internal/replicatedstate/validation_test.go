@@ -508,7 +508,7 @@ func TestCompletionResultGrammar(t *testing.T) {
 	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, nil)
 	for _, code := range []uint32{
 		ResultApplied, ResultTargetBound, ResultWrongShard, ResultSessionRetired,
-		ResultSessionOpened,
+		ResultSessionOpened, ResultSessionRenewed, ResultSessionRevoked,
 	} {
 		if err := fixture.machine.validateCompletionResult(replication.CompletionView{
 			ResultFormat: ResultFormatMutation, ResultCode: code,
@@ -519,7 +519,7 @@ func TestCompletionResultGrammar(t *testing.T) {
 	for _, completion := range []replication.CompletionView{
 		{ResultFormat: ResultFormatMutation + 1, ResultCode: ResultApplied},
 		{ResultFormat: ResultFormatMutation, ResultCode: 0},
-		{ResultFormat: ResultFormatMutation, ResultCode: ResultSessionOpened + 1},
+		{ResultFormat: ResultFormatMutation, ResultCode: ResultSessionRevoked + 1},
 	} {
 		if err := fixture.machine.validateCompletionResult(completion); !errors.Is(err, ErrCompletionCorrupt) {
 			t.Fatalf("accepted invalid completion grammar %+v: %v", completion, err)

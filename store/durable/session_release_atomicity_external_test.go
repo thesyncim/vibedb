@@ -209,6 +209,7 @@ func newSessionReleaseCrashFixture(
 	open.ClientEpoch = 0
 	open.ClientSequence = 1
 	open.AckThrough = 0
+	open.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	open.Mutations = nil
 	open.Fingerprint = replication.Digest{1, 2, 3, 4}
 	openBytes := sessionCrashEncode(t, open)

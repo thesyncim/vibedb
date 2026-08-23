@@ -150,7 +150,7 @@ func TestRawCodecLengthFieldsCannotOverflowInt(t *testing.T) {
 
 	session := make([]byte, sessionRecordHeaderBytes+1+recordChecksumLen)
 	copy(session[:8], sessionRecordMagic[:])
-	binary.LittleEndian.PutUint16(session[8:10], sessionRecordCodecFormat)
+	binary.LittleEndian.PutUint16(session[8:10], sessionRecordCodecSentinel)
 	binary.LittleEndian.PutUint16(session[10:12], sessionRecordHeaderBytes)
 	binary.LittleEndian.PutUint32(session[12:16], uint32(len(session)))
 	binary.LittleEndian.PutUint32(session[16:20], math.MaxUint32)
@@ -262,13 +262,15 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 		ResultFormatMutation != 1 ||
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
-		ResultSessionRetired != 7 || ResultSessionOpened != 8 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d",
+		ResultSessionRetired != 7 || ResultSessionOpened != 8 ||
+		ResultSessionRenewed != 9 || ResultSessionRevoked != 10 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownCollection,
 			ResultInvalidDocument, ResultTargetBound, ResultWrongShard,
-			ResultSessionRetired, ResultSessionOpened)
+			ResultSessionRetired, ResultSessionOpened, ResultSessionRenewed,
+			ResultSessionRevoked)
 	}
 	record := sessionCodecRecord()
 	encoded, err := AppendSessionRecord(nil, record)
@@ -305,7 +307,7 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 
 	command := codecLogicalCommand()
 	digest := LogicalCommandDigest(openCodecLogicalCommand(t, command))
-	const wantLogical = "e18f0764424a1e06df37d6a99af5308b6b0397cc113f04a35be2094bb1c7235a"
+	const wantLogical = "5619b831e41a1e0ee94744335e14d027c5b06d6c097f9e50367a8fb875233481"
 	if got := hex.EncodeToString(digest[:]); got != wantLogical {
 		t.Fatalf("LogicalCommandDigest = %s, want %s", got, wantLogical)
 	}
@@ -322,6 +324,22 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 	changed.Mutations[0].Key = []byte("other")
 	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changed)); got == digest {
 		t.Fatal("logical digest did not bind exact mutation bytes")
+	}
+	lease := command
+	lease.Kind = replication.CommandSessionRenew
+	lease.Mutations = nil
+	lease.ExpectedDeadlineUnixNano = 100
+	lease.NextDeadlineUnixNano = 200
+	leaseDigest := LogicalCommandDigest(openCodecLogicalCommand(t, lease))
+	changedLease := lease
+	changedLease.ExpectedDeadlineUnixNano = 99
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedLease)); got == leaseDigest {
+		t.Fatal("logical digest did not bind expected lease deadline")
+	}
+	changedLease = lease
+	changedLease.NextDeadlineUnixNano = 201
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedLease)); got == leaseDigest {
+		t.Fatal("logical digest did not bind next lease deadline")
 	}
 }
 

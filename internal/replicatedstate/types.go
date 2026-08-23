@@ -28,6 +28,8 @@ const (
 	ResultWrongShard        uint32 = 6
 	ResultSessionRetired    uint32 = 7
 	ResultSessionOpened     uint32 = 8
+	ResultSessionRenewed    uint32 = 9
+	ResultSessionRevoked    uint32 = 10
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf
@@ -60,6 +62,7 @@ var (
 	ErrSessionActive               = errors.New("replicatedstate: current client session is still active")
 	ErrSessionRetired              = errors.New("replicatedstate: client session is retired")
 	ErrSessionReleased             = errors.New("replicatedstate: client session release is complete")
+	ErrSessionLeaseDeadline        = errors.New("replicatedstate: client session lease deadline does not match")
 	ErrStaleCommand                = errors.New("replicatedstate: command has a stale mutable fence")
 	ErrWrongBinding                = errors.New("replicatedstate: command belongs to another shard binding")
 	ErrApplySequence               = errors.New("replicatedstate: invalid apply sequence")
@@ -277,4 +280,24 @@ type CompletionLookup struct {
 	Key             [32]byte
 	Bytes           []byte
 	AppliedSequence uint64
+}
+
+// SessionLeaseLookup is the exact retained lease state for one issued client
+// epoch. TerminalResult is zero for an active session and is the retained
+// retirement or revocation result for a retired session.
+type SessionLeaseLookup struct {
+	ClientEpoch           uint64
+	HighSequence          uint64
+	AckThrough            uint64
+	LeaseDeadlineUnixNano int64
+	Status                SessionStatus
+	TerminalResult        uint32
+}
+
+func isSessionTerminalResult(code uint32) bool {
+	return code == ResultSessionRetired || code == ResultSessionRevoked
+}
+
+func isSessionResultCode(code uint32) bool {
+	return code >= ResultApplied && code <= ResultSessionRevoked
 }

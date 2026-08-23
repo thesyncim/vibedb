@@ -34,9 +34,11 @@ component does not route or migrate session rows during a physical range split.
 The client epoch and the stable key together identify the current session.
 
 Session creation is a separate zero-mutation operation. `CommandSessionOpen`
-uses the canonical caller tuple `(epoch=0, sequence=1, AckThrough=0)` and is the
-only path that can create a header. Ordered apply assigns the entry's Raft apply
-index as its shard-local epoch and returns that token in a
+uses the canonical caller tuple `(epoch=0, sequence=1, AckThrough=0)` and the
+strict lease transition `(ExpectedDeadlineUnixNano=0,
+NextDeadlineUnixNano=D)` for a positive absolute UTC Unix-nanosecond deadline.
+It is the only path that can create a header. Ordered apply assigns the entry's
+Raft apply index as its shard-local epoch and returns that token in a
 `ResultSessionOpened` completion. The Open result occupies logical sequence 1;
 the first user mutation uses the issued token at sequence 2. Callers never
 guess an epoch, and successful Opens for distinct missing identities receive
@@ -50,15 +52,27 @@ An exact Open retry returns the retained issued token while sequence 1 remains
 above the retry floor. A competing Open cannot replace an active or retired
 header.
 
-The terminal `uint64` client sequence is reserved for retirement. An ordinary
-command at that sequence returns `ErrSessionSequence`.
+The terminal `uint64` client sequence is reserved for retirement or revocation.
+An ordinary command at that sequence returns `ErrSessionSequence`.
+
+An active header always carries a positive lease deadline. Session Renew is the
+next sequence and carries `(E,D)`, where `E` must equal the retained deadline
+and `D>E`. Success stores `ResultSessionRenewed`; a stale mutable fence stores
+`ResultStaleFence` and leaves the deadline unchanged. Session Revoke is also the
+next sequence. It carries `(E,0)`, compares `E` exactly, acknowledges the
+complete prior high-water, stores `ResultSessionRevoked`, clears the deadline,
+and seals the epoch with the existing retired status. A revoke constructed at
+`(sequence=H+1, AckThrough=H)` cannot seal activity that wins that sequence
+first: the delayed revoke conflicts with the retained command instead. Apply
+never reads a local clock.
 
 The logical retirement floor is the greater of `AckThrough` and the sequence
 high-water minus the retry-window width, with subtraction clamped at zero. A
 retry at or below this floor, or from an older epoch, returns `ErrRetryRetired`
 and never executes. A session-retire command has no mutations and acknowledges
 the previous high-water. With current mutable fences it appends the next
-sequence and seals the epoch. A stale retirement records `ResultStaleFence` and
+sequence and seals the epoch. A stale retirement or revocation records
+`ResultStaleFence` and
 leaves the epoch active. A stale retirement at the terminal sequence is an
 unstored `ErrStaleCommand` refusal. It leaves the session unchanged so the
 client can resubmit the same sequence with refreshed fences.
@@ -68,7 +82,8 @@ sequence: it repeats the exact retirement epoch, sequence, `AckThrough`,
 `RetryHome`, and fingerprint. Apply validates every retained slot before
 deletion. All slots must carry the exact epoch, match the canonical sequence for
 their modulo position, and preserve strict applied order; only the latest slot
-may contain `ResultSessionRetired`. A successful Release atomically deletes the
+may contain `ResultSessionRetired` or `ResultSessionRevoked`. A successful
+Release atomically deletes the
 header and all physical slots while updating the durable counts. A release of
 an active session is refused, and an old release cannot delete a newer session.
 Once the header is absent, a token at or below the durable epoch high-water
@@ -91,9 +106,11 @@ keeps the image retryable; Release removes it and decreases `SessionCount` and
 not increase dedupe rows after its ring is populated. The machine refuses a new
 Open at `MaxSessions` only until another retained image is released, so the
 capacity is not consumed by historical operation count for cooperative
-clients. An abandoned active header is deliberately not guessed dead by this
-kernel; serving must replicate an authenticated revoke or lease-expiry command
-before claiming unbounded churn across crashed client identities.
+clients. `LookupSessionLease` exposes the retained epoch, sequence/ack fence,
+deadline, status, and terminal result with indexed point reads. This unserved
+kernel does not authenticate callers, attest elapsed time, run timers, or grant
+revocation authority; RF3 serving must supply those pieces before unbounded
+churn across crashed client identities is a supported claim.
 
 User data, replicated state, a changed session header, and a changed ring slot
 publish atomically. Release deletes its complete bounded session image in one

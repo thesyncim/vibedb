@@ -42,6 +42,9 @@ const (
 	commandWireSessionRetire  = uint8(2)
 	commandWireSessionRelease = uint8(3)
 	commandWireSessionOpen    = uint8(4)
+	commandWireSessionRenew   = uint8(5)
+	commandWireSessionRevoke  = uint8(6)
+	sessionLeaseBodyBytes     = 16
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -74,7 +77,14 @@ const (
 	// CommandSessionOpen allocates the next shard-issued client epoch and carries
 	// no mutations. Its request header uses epoch zero, sequence one, and no
 	// acknowledgement because the allocated epoch is returned by the apply path.
+	// Its lease body is (0, NextDeadlineUnixNano), with a positive deadline.
 	CommandSessionOpen
+	// CommandSessionRenew conditionally advances an active session's replicated
+	// lease deadline. ExpectedDeadlineUnixNano fences delayed renewals.
+	CommandSessionRenew
+	// CommandSessionRevoke conditionally clears an active session's replicated
+	// lease deadline. ExpectedDeadlineUnixNano fences delayed revocations.
+	CommandSessionRevoke
 )
 
 // MutationKind selects one logical collection mutation.

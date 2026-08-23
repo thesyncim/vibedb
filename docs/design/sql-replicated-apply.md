@@ -53,8 +53,9 @@ so concurrent Opens for different stable identities cannot race on a shared
 The apply machine publishes user data, replicated state, a changed session
 header, and a changed retry slot atomically. A stable session header is keyed by
 tenant and client ID. It stores the current shard-issued epoch, `RetryHome`,
-cumulative `AckThrough` watermark, sequence high-water, status, configured retry
-window, and physical slot count. `RetryHome` is the fixed-width routing
+cumulative `AckThrough` watermark, sequence high-water, absolute UTC
+Unix-nanosecond lease deadline, status, configured retry window, and physical
+slot count. `RetryHome` is the fixed-width routing
 discriminator retained through intact-shard ownership transitions. Physical
 split activation does not yet migrate session rows.
 
@@ -72,6 +73,14 @@ high-water. With current mutable fences it appends the next sequence and seals
 the current epoch. A stale retirement records a stale-fence result and leaves
 the epoch active. A stable identity cannot Open again while its active or
 retired header remains.
+
+Open initializes a positive deadline. Renew is an ordinary next-sequence
+operation with an exact retained-deadline compare and a strict extension;
+success stores `ResultSessionRenewed`. Revoke compares the retained deadline,
+acknowledges the complete prior high-water, stores `ResultSessionRevoked`,
+clears the deadline, and leaves the image retired for exact retry and Release.
+The `(ClientSequence=H+1, AckThrough=H)` fence prevents a delayed revoke from
+sealing activity that consumed the sequence first. Apply reads no wall clock.
 
 `CommandSessionRelease` is an exact, non-sequenced acknowledgement of the
 retirement tuple. It verifies the epoch, retirement sequence, `AckThrough`,
@@ -104,10 +113,10 @@ one header per retained stable identity, and exactly
 bounded state available for retry. Exact Release reclaims it and reduces
 `SessionCount`, so cooperative clients can reuse capacity indefinitely. A new
 Open is refused at `MaxSessions` while that many session images are retained.
-An opened client that disappears before retirement/release still owns its
-bounded image; production serving therefore requires a replicated,
-authenticated abandoned-session revoke/lease contract before it may claim
-unbounded client-ID churn.
+`LookupSessionLease` provides point-read recovery of the retained lease and
+sequence fence. The kernel supplies no timer, elapsed-time attestation,
+authentication, or serving authority; RF3 serving must provide those pieces
+before it may claim unbounded client-ID churn.
 
 The hidden apply collection stores state, session headers, and retry slots as
 raw checksum-protected binary values in durable opaque-value mode. It does not

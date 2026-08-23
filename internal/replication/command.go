@@ -9,16 +9,20 @@ import (
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
 // Command is one deterministic, single-collection state-machine operation.
-// It contains no Raft term, index, physical root generation, deadline, SQL text,
-// or serialized execution plan. Fingerprint is the already-canonical request
-// fingerprint minted by the request layer; this codec treats it as opaque.
+// It contains no Raft term, index, physical root generation, SQL text, local
+// clock reading, or serialized execution plan. Lease deadlines are explicit
+// replicated inputs; this codec never samples time. Fingerprint is the already-
+// canonical request fingerprint minted by the request layer; this codec treats
+// it as opaque.
 // Mutation-batch order, including duplicate keys, is semantic and preserved
 // exactly; upstream fingerprinting must bind every mutation ordinal. A session
-// retirement, release, or open carries no mutations. AckThrough is the greatest
-// earlier client sequence that will never be retried; zero acknowledges
-// nothing. A session-open request has the canonical client tuple (epoch 0,
-// sequence 1, acknowledgement 0); the state machine returns its allocated
-// epoch.
+// retirement, release, open, renew, or revoke carries no mutations. AckThrough
+// is the greatest earlier client sequence that will never be retried; zero
+// acknowledges nothing. A session-open request has the canonical client tuple
+// (epoch 0, sequence 1, acknowledgement 0); the state machine returns its
+// allocated epoch. Session lease commands carry exactly two signed, positive-
+// domain Unix-nanosecond scalars: Open=(0,D), Renew=(E,D) where 0<E<D, and
+// Revoke=(E,0). All other command kinds require both scalars to be zero.
 type Command struct {
 	Kind CommandKind
 
@@ -47,6 +51,10 @@ type Command struct {
 	AckThrough     uint64
 	Fingerprint    Digest
 	RetryHome      RetryHome
+	// ExpectedDeadlineUnixNano is the exact compare-and-swap lease fence.
+	ExpectedDeadlineUnixNano int64
+	// NextDeadlineUnixNano is the deadline to publish, or zero for revoke.
+	NextDeadlineUnixNano int64
 
 	Collection string
 	Mutations  []Mutation
@@ -76,14 +84,16 @@ type CommandView struct {
 	RoutingVersion         uint64
 	RouteGeneration        uint64
 
-	Tenant         []byte
-	ClientID       ID128
-	ClientEpoch    uint64
-	ClientSequence uint64
-	AckThrough     uint64
-	Fingerprint    Digest
-	RetryHome      RetryHome
-	Collection     []byte
+	Tenant                   []byte
+	ClientID                 ID128
+	ClientEpoch              uint64
+	ClientSequence           uint64
+	AckThrough               uint64
+	Fingerprint              Digest
+	RetryHome                RetryHome
+	ExpectedDeadlineUnixNano int64
+	NextDeadlineUnixNano     int64
+	Collection               []byte
 
 	raw           []byte
 	mutationBytes []byte
@@ -96,8 +106,7 @@ func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
-// Kind reports whether the command mutates the collection, opens or retires its
-// client session, or releases the retired session's retry state.
+// Kind reports the collection or session-lifecycle operation.
 func (v CommandView) Kind() CommandKind { return v.kind }
 
 // MutationCount reports the number of mutations the iterator will produce.
@@ -209,6 +218,11 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	cursor += copy(frame[cursor:], command.Distribution)
 	cursor += copy(frame[cursor:], command.Shard)
 	cursor += copy(frame[cursor:], command.Collection)
+	if commandCarriesLeaseBody(command.Kind) {
+		appendU64(frame, cursor, uint64(command.ExpectedDeadlineUnixNano))
+		appendU64(frame, cursor+8, uint64(command.NextDeadlineUnixNano))
+		cursor += sessionLeaseBodyBytes
+	}
 	for index := range command.Mutations {
 		mutation := &command.Mutations[index]
 		frame[cursor] = byte(mutation.Kind)
@@ -255,6 +269,10 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireSessionRelease
 	case CommandSessionOpen:
 		return commandWireSessionOpen
+	case CommandSessionRenew:
+		return commandWireSessionRenew
+	case CommandSessionRevoke:
+		return commandWireSessionRevoke
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -271,6 +289,13 @@ func measureCommand(command Command) (int, error) {
 	} {
 		var ok bool
 		total, ok = checkedAdd(total, uint64(size), MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
+	if commandCarriesLeaseBody(command.Kind) {
+		var ok bool
+		total, ok = checkedAdd(total, sessionLeaseBodyBytes, MaxCommandBytes)
 		if !ok {
 			return 0, ErrEnvelopeTooLarge
 		}
@@ -301,7 +326,8 @@ func validateCommandHeader(command Command) error {
 		if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
 			return semantic("mutation count")
 		}
-	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen:
+	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
+		CommandSessionRenew, CommandSessionRevoke:
 		if len(command.Mutations) != 0 {
 			return semantic("session lifecycle command carries mutations")
 		}
@@ -322,6 +348,11 @@ func validateCommandHeader(command Command) error {
 	}
 	if err := validateCommandClientTuple(
 		command.Kind, command.ClientEpoch, command.ClientSequence, command.AckThrough,
+	); err != nil {
+		return err
+	}
+	if err := validateCommandLease(
+		command.Kind, command.ExpectedDeadlineUnixNano, command.NextDeadlineUnixNano,
 	); err != nil {
 		return err
 	}
@@ -412,7 +443,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count == 0 || uint64(count) > MaxMutations {
 			return CommandView{}, semantic("mutation count")
 		}
-	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen:
+	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
+		CommandSessionRenew, CommandSessionRevoke:
 		if count != 0 {
 			return CommandView{}, semantic("session lifecycle command carries mutations")
 		}
@@ -471,12 +503,30 @@ func OpenCommand(src []byte) (CommandView, error) {
 	if err := validateDecodedCommandScalars(view); err != nil {
 		return CommandView{}, err
 	}
-	mutations := src[cursor:bodyEnd:bodyEnd]
-	if err := validateMutationBytes(mutations, count); err != nil {
-		return CommandView{}, err
+	payload := src[cursor:bodyEnd:bodyEnd]
+	switch kind {
+	case CommandMutationBatch:
+		if err := validateMutationBytes(payload, count); err != nil {
+			return CommandView{}, err
+		}
+		view.mutationBytes = payload
+	case CommandSessionOpen, CommandSessionRenew, CommandSessionRevoke:
+		if len(payload) != sessionLeaseBodyBytes {
+			return CommandView{}, semantic("session lease body length")
+		}
+		view.ExpectedDeadlineUnixNano = int64(binary.LittleEndian.Uint64(payload[0:8]))
+		view.NextDeadlineUnixNano = int64(binary.LittleEndian.Uint64(payload[8:16]))
+		if err := validateCommandLease(
+			kind, view.ExpectedDeadlineUnixNano, view.NextDeadlineUnixNano,
+		); err != nil {
+			return CommandView{}, err
+		}
+	case CommandSessionRetire, CommandSessionRelease:
+		if len(payload) != 0 {
+			return CommandView{}, semantic("session lifecycle body length")
+		}
 	}
 	view.raw = src[:len(src):len(src)]
-	view.mutationBytes = mutations
 	view.mutationCount = count
 	return view, nil
 }
@@ -491,6 +541,10 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandSessionRelease, true
 	case commandWireSessionOpen:
 		return CommandSessionOpen, true
+	case commandWireSessionRenew:
+		return CommandSessionRenew, true
+	case commandWireSessionRevoke:
+		return CommandSessionRevoke, true
 	default:
 		return 0, false
 	}
@@ -526,6 +580,37 @@ func validateCommandClientTuple(kind CommandKind, epoch, sequence, ackThrough ui
 	}
 	if ackThrough >= sequence {
 		return semantic("command acknowledgement does not precede client sequence")
+	}
+	return nil
+}
+
+func commandCarriesLeaseBody(kind CommandKind) bool {
+	switch kind {
+	case CommandSessionOpen, CommandSessionRenew, CommandSessionRevoke:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCommandLease(kind CommandKind, expected, next int64) error {
+	switch kind {
+	case CommandSessionOpen:
+		if expected != 0 || next <= 0 {
+			return semantic("session open lease deadlines")
+		}
+	case CommandSessionRenew:
+		if expected <= 0 || next <= expected {
+			return semantic("session renew lease deadlines")
+		}
+	case CommandSessionRevoke:
+		if expected <= 0 || next != 0 {
+			return semantic("session revoke lease deadlines")
+		}
+	default:
+		if expected != 0 || next != 0 {
+			return semantic("non-lease command carries lease deadlines")
+		}
 	}
 	return nil
 }
