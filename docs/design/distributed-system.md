@@ -114,14 +114,23 @@ token at sequence 2. Callers do not guess or coordinate the token. An Open with
 stale mutable fences is an unstored `ErrStaleCommand`, not a minted token.
 
 The collision-verifiable header stores that token, `RetryHome`, `AckThrough`,
-sequence high-water, status, configured retry window, and physical slot count.
+sequence high-water, absolute UTC Unix-nanosecond lease deadline, status,
+configured retry window, and physical slot count.
 `RetryHome` is the fixed-width routing discriminator retained through
 intact-shard ownership transitions. An active epoch accepts strictly
 consecutive sequences. An exact retained retry is idempotent and may advance
 `AckThrough` without replacing its slot. A different `RetryHome`, fingerprint,
 or `LogicalCommandDigest` conflicts. A competing Open cannot replace an active
-or retired header. The terminal `uint64` sequence is reserved for retirement;
-an ordinary command at that sequence returns `ErrSessionSequence`.
+or retired header. The terminal `uint64` sequence is reserved for retirement or
+revocation; an ordinary command at that sequence returns `ErrSessionSequence`.
+
+Open initializes the deadline. Renew compares the exact retained deadline and
+strictly extends it as the next session sequence. Revoke compares that deadline,
+acknowledges the complete prior high-water, clears the deadline, and records a
+terminal revocation result. Its `(sequence=H+1, AckThrough=H)` tuple is the
+ordering fence: activity that wins the sequence makes the delayed revoke a
+conflict rather than allowing it to seal newer state. Apply never consults a
+replica-local clock.
 
 The logical retirement floor is the greater of `AckThrough` and the sequence
 high-water minus the retry-window width, with subtraction clamped at zero.
@@ -160,10 +169,11 @@ state is proportional to retained session identities. Persistent dedupe rows
 and the dedupe portion of reopen are bounded by
 `1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
 Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
-refused at `MaxSessions` while that many images remain retained. This kernel
-does not silently expire an active client: the serving layer still needs an
-authenticated, deterministic replicated revoke/lease contract for abandoned
-sessions before unbounded client-identity churn is a supported claim.
+refused at `MaxSessions` while that many images remain retained.
+`LookupSessionLease` recovers the retained deadline and sequence fence with
+point reads. This kernel does not run timers, attest elapsed time, authenticate
+the proposer, or expose serving authority; RF3 serving still owns those
+requirements before unbounded client-identity churn is a supported claim.
 
 `SessionEpochHighWater` is the durable anti-resurrection fence. During ordinary
 apply it is the greatest apply-index token issued by SessionOpen, and Release

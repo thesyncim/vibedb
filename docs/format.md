@@ -165,6 +165,11 @@ When a format change is intentional:
 Do not add a compatibility reader unless the project adopts a released format
 and an explicit migration policy.
 
+The replicated session header and slot grammar follows the same format-0 rule.
+Lease-enabled headers consume reserved bytes for an absolute deadline and bump
+their private codec sentinel; pre-lease session images fail closed rather than
+opening with an invented deadline.
+
 ## Implementation references
 
 - `internal/storeio/page.go`
