@@ -90,7 +90,10 @@ keeps the image retryable; Release removes it and decreases `SessionCount` and
 `SessionSlotCount`. Successive accepted operations for a retained identity do
 not increase dedupe rows after its ring is populated. The machine refuses a new
 Open at `MaxSessions` only until another retained image is released, so the
-capacity is not consumed by historical operation count.
+capacity is not consumed by historical operation count for cooperative
+clients. An abandoned active header is deliberately not guessed dead by this
+kernel; serving must replicate an authenticated revoke or lease-expiry command
+before claiming unbounded churn across crashed client identities.
 
 User data, replicated state, a changed session header, and a changed ring slot
 publish atomically. Release deletes its complete bounded session image in one

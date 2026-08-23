@@ -102,8 +102,12 @@ sets `MaxSessions` and `RetryWindow`. The system image contains one state row,
 one header per retained stable identity, and exactly
 `min(HighSequence, RetryWindow)` fixed slots per identity. Retirement keeps this
 bounded state available for retry. Exact Release reclaims it and reduces
-`SessionCount`, so capacity is reusable indefinitely. A new Open is refused at
-`MaxSessions` only while that many session images are retained.
+`SessionCount`, so cooperative clients can reuse capacity indefinitely. A new
+Open is refused at `MaxSessions` while that many session images are retained.
+An opened client that disappears before retirement/release still owns its
+bounded image; production serving therefore requires a replicated,
+authenticated abandoned-session revoke/lease contract before it may claim
+unbounded client-ID churn.
 
 The hidden apply collection stores state, session headers, and retry slots as
 raw checksum-protected binary values in durable opaque-value mode. It does not

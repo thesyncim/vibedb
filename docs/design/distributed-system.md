@@ -160,7 +160,10 @@ state is proportional to retained session identities. Persistent dedupe rows
 and the dedupe portion of reopen are bounded by
 `1 + MaxSessions + MaxSessions * RetryWindow`, not by total operations.
 Release makes `SessionCount` and `SessionSlotCount` reusable; a new Open is
-refused at `MaxSessions` only while that many images remain retained.
+refused at `MaxSessions` while that many images remain retained. This kernel
+does not silently expire an active client: the serving layer still needs an
+authenticated, deterministic replicated revoke/lease contract for abandoned
+sessions before unbounded client-identity churn is a supported claim.
 
 `SessionEpochHighWater` is the durable anti-resurrection fence. During ordinary
 apply it is the greatest apply-index token issued by SessionOpen, and Release
