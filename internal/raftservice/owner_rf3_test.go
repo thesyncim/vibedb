@@ -263,7 +263,10 @@ func rf3CommandFence(base sqldriver.ReplicatedShardStoreIdentity) CommandFence {
 }
 
 func pulseRF3(stop <-chan struct{}, pulses []chan struct{}) {
-	ticker := time.NewTicker(2 * time.Millisecond)
+	// Preserve enough wall time between logical ticks for strict WAL sync and
+	// authenticated vote delivery; a scheduler-scale logical tick creates
+	// election storms on valid but slower filesystems.
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -426,7 +429,7 @@ func newRF3Runtime(
 		}},
 		raftstore.Options{MaxFileBytes: 256 << 20,
 			MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096,
-			MaxEntries: 16384, MaxLiveBytes: raftstore.MinimumReadyLiveBytes},
+			MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
 	)
 	if err != nil {
 		t.Fatal(err)
