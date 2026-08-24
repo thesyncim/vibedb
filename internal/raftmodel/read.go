@@ -43,6 +43,13 @@ const (
 	// into one uncaptured Ready. Followers do not apply the leader proposal
 	// watermark, so the integration boundary enforces it independently.
 	MaxPendingInputBytes int64 = MaxUncommittedEntriesSize
+	// MaxProposalBatchEntries and MaxProposalBatchBytes bound one scheduler
+	// coalescing turn. The byte target is intentionally smaller than the hard
+	// uncaptured-Ready safety ceiling: one proposal above the target remains
+	// valid up to MaxProposalBytes, but must occupy the turn alone. A scheduler
+	// must not hold the window open waiting for more work.
+	MaxProposalBatchEntries       = MaxPendingInputCalls
+	MaxProposalBatchBytes   int64 = MaxSizePerMsg
 	// MaxConfStateMembers bounds the total incoming/outgoing voter and learner
 	// references reconstructed by upstream Changer. Joint configurations count
 	// both voter sets because both are retained and safety-critical.

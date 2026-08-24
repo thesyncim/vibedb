@@ -113,9 +113,12 @@ type Runtime struct {
 	apply    *sqldriver.ReplicatedApply
 	node     *raftmodel.Node
 	identity RuntimeIdentity
-	failure  error
-	stopping bool
-	closed   bool
+
+	proposalBatchEntries int
+	proposalBatchBytes   int64
+	failure              error
+	stopping             bool
+	closed               bool
 }
 
 // AdoptRuntime constructs the sole synchronous owner of wal, database, and
@@ -232,6 +235,8 @@ func (runtime *Runtime) fail(cause error) error {
 	if cause == nil {
 		cause = errors.New("unknown terminal failure")
 	}
+	runtime.proposalBatchEntries = 0
+	runtime.proposalBatchBytes = 0
 	if runtime.failure == nil {
 		runtime.failure = errors.Join(ErrRuntimeFailed, cause)
 	}
@@ -255,10 +260,28 @@ func (runtime *Runtime) requireEmptyInputWindow() error {
 	return nil
 }
 
-// Propose admits one already-encoded replicated command. Nil means only that
-// the local core accepted the proposal; it grants no serving or result claim.
+// Propose admits one already-encoded replicated command. Consecutive normal
+// proposals may share one bounded uncaptured Ready window. The first proposal
+// reserves worst-case WAL headroom; later proposals are admitted only while
+// the entry and coalescing-byte limits still fit that same reservation. A first
+// proposal above the coalescing target remains valid, but closes the batch.
+// Every other protocol input remains an empty-window barrier. Nil means only
+// that the local core accepted the proposal; it grants no serving or result
+// claim.
 func (runtime *Runtime) Propose(data []byte) error {
-	if err := runtime.requireEmptyInputWindow(); err != nil {
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	dataBytes := int64(len(data))
+	continuing := runtime.proposalBatchEntries != 0
+	if continuing {
+		if runtime.node.Phase() != raftmodel.PhaseIdle ||
+			runtime.proposalBatchEntries >= raftmodel.MaxProposalBatchEntries ||
+			runtime.proposalBatchBytes >= raftmodel.MaxProposalBatchBytes ||
+			dataBytes > raftmodel.MaxProposalBatchBytes-runtime.proposalBatchBytes {
+			return errors.Join(raftmodel.ErrReadyPending, raftmodel.ErrAdmissionBound)
+		}
+	} else if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
 	if err := runtime.apply.AdmitCommand(data); err != nil {
@@ -268,13 +291,20 @@ func (runtime *Runtime) Propose(data []byte) error {
 		}
 		return err
 	}
-	if err := runtime.wal.ReserveReady(); err != nil {
-		if deterministicPersistFailure(err) {
-			return runtime.fail(err)
+	if !continuing {
+		if err := runtime.wal.ReserveReady(); err != nil {
+			if deterministicPersistFailure(err) {
+				return runtime.fail(err)
+			}
+			return err
 		}
+	}
+	if err := runtime.node.Propose(data); err != nil {
 		return err
 	}
-	return runtime.node.Propose(data)
+	runtime.proposalBatchEntries++
+	runtime.proposalBatchBytes += dataBytes
+	return nil
 }
 
 // ProposeConfChange admits one topology-authorized configuration change into
@@ -452,8 +482,13 @@ func (runtime *Runtime) DriveReady(
 	case raftmodel.PhaseIdle:
 		captured, err := runtime.node.CaptureReady()
 		if err != nil || !captured {
+			if err == nil && runtime.proposalBatchEntries != 0 {
+				return DriveResult{}, runtime.fail(raftmodel.ErrReadyPending)
+			}
 			return DriveResult{}, err
 		}
+		runtime.proposalBatchEntries = 0
+		runtime.proposalBatchBytes = 0
 		progress, ok := runtime.node.CurrentReady()
 		if !ok {
 			return DriveResult{}, runtime.fail(errors.New("captured Ready has no progress record"))

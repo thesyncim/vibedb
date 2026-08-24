@@ -440,10 +440,19 @@ The internal replication kernel contains:
 
 - An encrypted preallocated Raft WAL
 - A deterministic replicated SQL state machine
-- A bounded single-owner Multi-Raft scheduler
+- A bounded single-owner Multi-Raft scheduler with normal-proposal coalescing
 - Static authenticated-identity frame validation
 - Offline snapshot artifacts and resumable staging
 - A stateless replica-move reconciler
+
+One scheduler turn admits only the currently queued normal-proposal prefix: at
+most 64 entries and 1 MiB for a multi-entry batch. A valid proposal up to the
+16 MiB command limit occupies a turn alone when it exceeds that target. The
+next fair group turn captures `Ready`; there is no timer or wall-clock hold.
+Configuration changes and read barriers remain strict boundaries. Committed
+entries are still applied and published one at a time, outbound messages are
+still retained as individual frames, and the kernel has no serving proposal
+waiters.
 
 The kernel has no production socket transport, TLS, peer authentication,
 snapshot-transfer service, or serving integration. The frame decoder requires

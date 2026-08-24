@@ -69,15 +69,20 @@ const (
 	ProgressFault
 )
 
-// Progress describes one completed Ready micro-step or one consumed input.
-// When RunOne also returns an error, Done is still true if the input was
-// consumed or a group was newly latched faulted. ReadOutcomes is owned by the
-// caller and present only on the corresponding Ready completion step.
+// Progress describes one completed Ready micro-step, one consumed input, or
+// one bounded normal-proposal batch. ProposalCount and ProposalBytes report the
+// exact queue prefix consumed by ProgressProposal, including a final rejected
+// proposal, and are zero for every other kind. When RunOne also returns an
+// error, Done is still true if input was consumed or a group was newly latched
+// faulted. ReadOutcomes is owned by the caller and present only on the
+// corresponding Ready completion step.
 type Progress struct {
-	Group        raftmember.GroupKey
-	Kind         ProgressKind
-	ReadyKind    raftmember.DriveKind
-	ReadOutcomes []raftmodel.ReadOutcome
+	Group         raftmember.GroupKey
+	Kind          ProgressKind
+	ReadyKind     raftmember.DriveKind
+	ProposalCount int
+	ProposalBytes int64
+	ReadOutcomes  []raftmodel.ReadOutcome
 }
 
 type memberRuntime interface {
@@ -186,6 +191,13 @@ func (queue *proposalQueue) pop() ([]byte, bool) {
 		queue.compact()
 	}
 	return result, true
+}
+
+func (queue *proposalQueue) peek() ([]byte, bool) {
+	if queue.head == len(queue.items) {
+		return nil, false
+	}
+	return queue.items[queue.head], true
 }
 
 func (queue *proposalQueue) compact() {
@@ -691,10 +703,13 @@ func (host *Host) popRunnable() *groupState {
 	return group
 }
 
-// RunOne performs at most one Ready lifecycle operation or consumes at most
-// one queued input. Only explicitly runnable groups are visited, in persistent
-// FIFO round-robin order; idle groups consume no scheduler scans. A group
-// blocked by outbox capacity does not prevent another group from progressing.
+// RunOne performs at most one Ready lifecycle operation, consumes one queued
+// non-proposal input, or admits one bounded prefix of currently queued normal
+// proposals. It never waits for a proposal to join a batch: the group's next
+// scheduler turn captures Ready. Only explicitly runnable groups are visited,
+// in persistent FIFO round-robin order; idle groups consume no scheduler
+// scans. A group blocked by outbox capacity does not prevent another group
+// from progressing.
 func (host *Host) RunOne() (Progress, bool, error) {
 	if host == nil || host.closed {
 		return Progress{}, false, ErrHostClosed
@@ -790,14 +805,40 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 			progress.Kind = ProgressMessage
 			return progress, true, group.runtime.StepMessage(item.message)
 		case inputProposal:
-			data, ok := group.proposals.pop()
+			data, ok := group.proposals.peek()
 			if !ok {
 				continue
 			}
-			host.releaseInput(group, int64(len(data)))
 			group.nextClass = (class + 1) % inputClassCount
 			progress.Kind = ProgressProposal
-			return progress, true, group.runtime.Propose(data)
+			batchEntries := 0
+			batchBytes := int64(0)
+			for batchEntries < raftmodel.MaxProposalBatchEntries {
+				dataBytes := int64(len(data))
+				if batchEntries != 0 && (batchBytes >= raftmodel.MaxProposalBatchBytes ||
+					dataBytes > raftmodel.MaxProposalBatchBytes-batchBytes) {
+					break
+				}
+				if _, popped := group.proposals.pop(); !popped {
+					break
+				}
+				host.releaseInput(group, dataBytes)
+				batchEntries++
+				batchBytes += dataBytes
+				progress.ProposalCount = batchEntries
+				progress.ProposalBytes = batchBytes
+				if err := group.runtime.Propose(data); err != nil {
+					return progress, true, err
+				}
+				if batchBytes >= raftmodel.MaxProposalBatchBytes {
+					break
+				}
+				data, ok = group.proposals.peek()
+				if !ok {
+					break
+				}
+			}
+			return progress, batchEntries != 0, nil
 		case inputTick:
 			if group.ticks == 0 {
 				continue
