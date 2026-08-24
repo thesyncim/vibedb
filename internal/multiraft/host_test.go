@@ -167,6 +167,12 @@ func (runtime *fakeRuntime) Publication() (raftmodel.Publication, error) {
 	return runtime.publication, runtime.inputErr
 }
 
+func (runtime *fakeRuntime) DurablePromotion(
+	uint64,
+) (raftmember.DurablePromotionProof, bool, error) {
+	return raftmember.DurablePromotionProof{}, false, runtime.inputErr
+}
+
 func (runtime *fakeRuntime) SnapshotState() (replicatedstate.State, error) {
 	return runtime.snapshotState, runtime.inputErr
 }

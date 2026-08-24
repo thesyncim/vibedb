@@ -1,6 +1,7 @@
 package raftmember
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -62,6 +63,15 @@ type RuntimeIdentity struct {
 	MemberID             uint64
 	StoreID              [16]byte
 	NodeIncarnation      uint64
+}
+
+// DurablePromotionProof identifies one canonical unapplied promotion entry in
+// the retained durable log. It grants no Raft role by itself; authenticated
+// transport consumes it only as a narrow election-liveness witness.
+type DurablePromotionProof struct {
+	Version             uint64
+	TargetMember        uint64
+	AuthorizationDigest [MembershipTransitionDigestBytes]byte
 }
 
 // AppliedSourceOwner is the exact fixed-width identity of one Runtime whose
@@ -374,9 +384,19 @@ type Runtime struct {
 
 	proposalBatchEntries int
 	proposalBatchBytes   int64
+	promotionScan        durablePromotionScan
 	failure              error
 	stopping             bool
 	closed               bool
+}
+
+type durablePromotionScan struct {
+	applied uint64
+	last    uint64
+	target  uint64
+	proof   DurablePromotionProof
+	found   bool
+	valid   bool
 }
 
 // AdoptRuntime constructs the sole synchronous owner of wal, database, and
@@ -612,6 +632,101 @@ func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
 		return raftmodel.Publication{}, err
 	}
 	return runtime.node.Published(), nil
+}
+
+// DurablePromotion finds the newest exact canonical AddNode entry for target
+// in the bounded durable-but-unapplied suffix. This reconstructs the election
+// witness after restart without trusting transient transport observations.
+func (runtime *Runtime) DurablePromotion(
+	target uint64,
+) (DurablePromotionProof, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return DurablePromotionProof{}, false, err
+	}
+	if target == 0 {
+		return DurablePromotionProof{}, false, errors.New("raftmember: invalid promotion target")
+	}
+	publication := runtime.node.Published()
+	last, err := runtime.wal.LastIndex()
+	if err != nil {
+		return DurablePromotionProof{}, false, err
+	}
+	if last <= publication.Applied {
+		runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+			last: last, target: target, valid: true}
+		return DurablePromotionProof{}, false, nil
+	}
+	if cached := runtime.promotionScan; cached.valid && cached.applied == publication.Applied &&
+		cached.last == last && cached.target == target {
+		return cached.proof, cached.found, nil
+	}
+	first := publication.Applied + 1
+	if span := last - first + 1; span > raftmodel.MaxMessageEntries {
+		first = last - raftmodel.MaxMessageEntries + 1
+	}
+	for index := last; index >= first; index-- {
+		entries, readErr := runtime.wal.Entries(index, index+1, raftmodel.MaxInboundMessageBytes)
+		if readErr != nil {
+			return DurablePromotionProof{}, false, readErr
+		}
+		if len(entries) == 1 {
+			promotionTarget, digest := durablePromotion(entries[0])
+			if promotionTarget != target {
+				if index == first {
+					break
+				}
+				continue
+			}
+			proof := DurablePromotionProof{Version: index, TargetMember: target,
+				AuthorizationDigest: digest}
+			runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+				last: last, target: target, proof: proof, found: true, valid: true}
+			return proof, true, nil
+		}
+		if index == first {
+			break
+		}
+	}
+	runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+		last: last, target: target, valid: true}
+	return DurablePromotionProof{}, false, nil
+}
+
+func durablePromotion(entry *pb.Entry) (uint64, [MembershipTransitionDigestBytes]byte) {
+	var digest [MembershipTransitionDigestBytes]byte
+	if entry == nil {
+		return 0, digest
+	}
+	if entry.GetType() == pb.EntryConfChange {
+		var change pb.ConfChange
+		if err := proto.Unmarshal(entry.GetData(), &change); err != nil ||
+			change.GetType() != pb.ConfChangeAddNode ||
+			len(change.GetContext()) != MembershipTransitionDigestBytes {
+			return 0, digest
+		}
+		canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(&change)
+		if err != nil || !bytes.Equal(canonical, entry.GetData()) {
+			return 0, digest
+		}
+		copy(digest[:], change.GetContext())
+		return change.GetNodeId(), digest
+	}
+	if entry.GetType() != pb.EntryConfChangeV2 {
+		return 0, digest
+	}
+	var change pb.ConfChangeV2
+	if err := proto.Unmarshal(entry.GetData(), &change); err != nil ||
+		len(change.GetContext()) != MembershipTransitionDigestBytes || len(change.GetChanges()) != 1 ||
+		change.GetTransition() != pb.ConfChangeTransition_ConfChangeTransitionAuto ||
+		change.GetChanges()[0].GetType() != pb.ConfChangeAddNode {
+		return 0, digest
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(&change)
+	if err != nil || !bytes.Equal(canonical, entry.GetData()) {
+		return 0, digest
+	}
+	copy(digest[:], change.GetContext())
+	return change.GetChanges()[0].GetNodeId(), digest
 }
 
 // SnapshotState returns the complete coherent durable state paired with a

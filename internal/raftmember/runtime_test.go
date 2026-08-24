@@ -596,6 +596,45 @@ func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
 	}
 }
 
+func TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply(t *testing.T) {
+	fixture := newRuntimeFixture(t, 222, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	target := fixture.runtime.identity.MemberID + 1
+	digest := MembershipTransitionDigest(fixture.runtime.identity.Group,
+		[16]byte{1}, 2, 3, fixture.runtime.identity.MemberID, target)
+	if err := fixture.runtime.ProposeConfChange(&pb.ConfChange{
+		Type: pb.ConfChangeAddNode.Enum(), NodeId: runtimeUint64Ptr(target),
+		Context: append([]byte(nil), digest[:]...),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	workspace := new(ReadyWorkspace)
+	if result, err := fixture.runtime.DriveReady(workspace, nil, settleTestApplied); err != nil || result.Kind != DriveCaptured {
+		t.Fatalf("capture = %+v, %v", result, err)
+	}
+	if result, err := fixture.runtime.DriveReady(workspace, nil, settleTestApplied); err != nil || result.Kind != DrivePersisted {
+		t.Fatalf("persist = %+v, %v", result, err)
+	}
+	before, err := fixture.runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, found, err := fixture.runtime.DurablePromotion(target)
+	if err != nil || !found || proof.TargetMember != target ||
+		proof.Version <= before.ReplicaSetVersion || proof.AuthorizationDigest != digest {
+		t.Fatalf("proof=%+v found=%t publication=%+v err=%v", proof, found, before, err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_, _, _ = fixture.runtime.DurablePromotion(target)
+	}); allocations != 0 {
+		t.Fatalf("cached durable promotion allocations = %v, want 0", allocations)
+	}
+}
+
 func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 	identity := testWALIdentity(230)
 	peer := identity.MemberID + 1

@@ -236,6 +236,8 @@ type Owner struct {
 
 type MembershipAuthoritySink interface {
 	PublishCommittedAuthority(raftmember.GroupKey, uint64, *pb.ConfState) error
+	PublishDurablePromotion(raftmember.GroupKey, raftmember.DurablePromotionProof) error
+	ClearDurablePromotion(raftmember.GroupKey) error
 }
 
 type ownerMember struct {
@@ -455,6 +457,22 @@ func (owner *Owner) syncMembershipAuthorities() error {
 		); err != nil {
 			return err
 		}
+		member := owner.members[group]
+		if member.authority.TargetMember == 0 {
+			continue
+		}
+		proof, found, err := owner.host.DurablePromotion(group,
+			member.authority.TargetMember)
+		if err != nil {
+			return err
+		}
+		if found {
+			if err = owner.authority.PublishDurablePromotion(group, proof); err != nil {
+				return err
+			}
+		} else if err = owner.authority.ClearDurablePromotion(group); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -607,14 +625,18 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		progress, progressFound); err != nil {
 		return err
 	}
+	authorizationDigest := raftmember.MembershipTransitionDigest(request.Fence.Group,
+		authority.TransitionID, authority.MetadataEpoch, authority.CatalogGeneration,
+		authority.SourceMember, authority.TargetMember)
+	context := append([]byte(nil), authorizationDigest[:]...)
 	switch request.Kind {
 	case MembershipAddLearner:
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
-			Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &request.TargetMember,
+			Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &request.TargetMember, Context: context,
 		})
 	case MembershipPromoteVoter:
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
-			Type: pb.ConfChangeAddNode.Enum(), NodeId: &request.TargetMember,
+			Type: pb.ConfChangeAddNode.Enum(), NodeId: &request.TargetMember, Context: context,
 		})
 	case MembershipTransferLeader:
 		return owner.host.TransferLeader(request.Fence.Group, request.TargetMember)
@@ -622,7 +644,7 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		// Removal is authorized only after the target is the observed leader.
 		// This makes deleting the active leader unrepresentable on this wire.
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
-			Type: pb.ConfChangeRemoveNode.Enum(), NodeId: &request.SourceMember,
+			Type: pb.ConfChangeRemoveNode.Enum(), NodeId: &request.SourceMember, Context: context,
 		})
 	default:
 		return ErrMembershipMalformed

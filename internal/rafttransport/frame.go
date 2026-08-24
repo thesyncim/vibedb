@@ -118,6 +118,12 @@ func (registry *StaticRegistry) preflightOutbound(
 	if !ok {
 		return outboundFramePlan{}, fmt.Errorf("%w: missing committed authority", ErrUnauthorized)
 	}
+	version := view.version
+	if election, electionOK := certifiedPromotionElectionAuthority(view, outbound.Message,
+		view.promotionVersion()); electionOK {
+		view = election
+		version = election.version
+	}
 	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
 		return outboundFramePlan{}, err
 	}
@@ -131,7 +137,7 @@ func (registry *StaticRegistry) preflightOutbound(
 	return outboundFramePlan{
 		destination: destination,
 		roster:      roster,
-		version:     view.version,
+		version:     version,
 		payloadSize: size,
 		frameSize:   FrameHeaderBytes + size,
 	}, nil
@@ -223,6 +229,12 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	}
 	view, ok := registry.authorityAt(header.group, header.version)
 	if !ok {
+		current, currentOK := registry.currentAuthority(header.group)
+		if currentOK {
+			view, ok = certifiedPromotionElectionAuthority(current, message, header.version)
+		}
+	}
+	if !ok {
 		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
 	}
 	if !ok {
@@ -248,6 +260,46 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	return Inbound{Group: header.group, Message: message}, nil
 }
 
+func (view *authorityView) promotionVersion() uint64 {
+	if view == nil || view.promotion == nil {
+		return 0
+	}
+	return view.promotion.Version
+}
+
+func certifiedPromotionElectionAuthority(
+	current *authorityView,
+	message *pb.Message,
+	version uint64,
+) (*authorityView, bool) {
+	if current == nil || current.promotion == nil || message == nil ||
+		version != current.promotion.Version ||
+		current.promotion.TargetMember != current.grant.TargetMember ||
+		current.roles[current.promotion.TargetMember] != MemberLearner {
+		return nil, false
+	}
+	target := current.promotion.TargetMember
+	from, to := message.GetFrom(), message.GetTo()
+	switch message.GetType() {
+	case pb.MsgVote, pb.MsgPreVote:
+		if to != target || current.roles[from] != MemberVoter {
+			return nil, false
+		}
+	case pb.MsgVoteResp, pb.MsgPreVoteResp:
+		if from != target || current.roles[to] != MemberVoter {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+	roles := make(map[uint64]MemberRole, len(current.roles))
+	for member, role := range current.roles {
+		roles[member] = role
+	}
+	roles[target] = MemberVoter
+	return &authorityView{version: version, roles: roles, grant: current.grant}, true
+}
+
 func (registry *StaticRegistry) prospectiveAuthority(
 	group raftmember.GroupKey,
 	version uint64,
@@ -262,8 +314,8 @@ func (registry *StaticRegistry) prospectiveAuthority(
 			(entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
 			continue
 		}
-		change, member, err := openSingleConfChange(entry)
-		if err != nil || !authorizedConfChange(current, change, member) {
+		change, member, digest, err := openSingleConfChange(entry)
+		if err != nil || !authorizedConfChange(current, change, member, digest) {
 			return nil, false
 		}
 		roles := make(map[uint64]MemberRole, len(current.roles)+1)
@@ -450,10 +502,10 @@ func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (
 		if found || (entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
 			return false, fmt.Errorf("%w: unsupported configuration batch", ErrUnauthorized)
 		}
-		change, member, err := openSingleConfChange(entry)
-		authorized := err == nil && authorizedConfChange(view, change, member)
+		change, member, digest, err := openSingleConfChange(entry)
+		authorized := err == nil && authorizedConfChange(view, change, member, digest)
 		if !authorized && view.previous != nil {
-			authorized = err == nil && authorizedConfChange(view.previous, change, member)
+			authorized = err == nil && authorizedConfChange(view.previous, change, member, digest)
 		}
 		if !authorized {
 			return false, fmt.Errorf("%w: configuration differs from metadata grant", ErrUnauthorized)
@@ -463,28 +515,48 @@ func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (
 	return found, nil
 }
 
-func openSingleConfChange(entry *pb.Entry) (pb.ConfChangeType, uint64, error) {
+func openSingleConfChange(
+	entry *pb.Entry,
+) (pb.ConfChangeType, uint64, [raftmember.MembershipTransitionDigestBytes]byte, error) {
+	var digest [raftmember.MembershipTransitionDigestBytes]byte
 	if entry == nil {
-		return 0, 0, ErrInvalidFrame
+		return 0, 0, digest, ErrInvalidFrame
 	}
 	if entry.GetType() == pb.EntryConfChange {
 		var change pb.ConfChange
-		if err := proto.Unmarshal(entry.GetData(), &change); err != nil || len(change.GetContext()) != 0 {
-			return 0, 0, ErrInvalidFrame
+		if err := proto.Unmarshal(entry.GetData(), &change); err != nil ||
+			len(change.GetContext()) != raftmember.MembershipTransitionDigestBytes {
+			return 0, 0, digest, ErrInvalidFrame
 		}
-		return change.GetType(), change.GetNodeId(), nil
+		canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(&change)
+		if err != nil || !bytes.Equal(canonical, entry.GetData()) {
+			return 0, 0, digest, ErrInvalidFrame
+		}
+		copy(digest[:], change.GetContext())
+		return change.GetType(), change.GetNodeId(), digest, nil
 	}
 	var change pb.ConfChangeV2
-	if err := proto.Unmarshal(entry.GetData(), &change); err != nil || len(change.GetContext()) != 0 ||
+	if err := proto.Unmarshal(entry.GetData(), &change); err != nil ||
+		len(change.GetContext()) != raftmember.MembershipTransitionDigestBytes ||
 		len(change.GetChanges()) != 1 || change.GetTransition() != pb.ConfChangeTransition_ConfChangeTransitionAuto {
-		return 0, 0, ErrInvalidFrame
+		return 0, 0, digest, ErrInvalidFrame
 	}
-	return change.GetChanges()[0].GetType(), change.GetChanges()[0].GetNodeId(), nil
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(&change)
+	if err != nil || !bytes.Equal(canonical, entry.GetData()) {
+		return 0, 0, digest, ErrInvalidFrame
+	}
+	copy(digest[:], change.GetContext())
+	return change.GetChanges()[0].GetType(), change.GetChanges()[0].GetNodeId(), digest, nil
 }
 
-func authorizedConfChange(view *authorityView, change pb.ConfChangeType, member uint64) bool {
+func authorizedConfChange(
+	view *authorityView,
+	change pb.ConfChangeType,
+	member uint64,
+	digest [raftmember.MembershipTransitionDigestBytes]byte,
+) bool {
 	grant := view.grant
-	if grant == (TransitionGrant{}) {
+	if grant == (TransitionGrant{}) || grant.digest() != digest {
 		return false
 	}
 	targetRole := view.roles[grant.TargetMember]

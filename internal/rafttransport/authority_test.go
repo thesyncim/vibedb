@@ -32,7 +32,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	if _, err := target.Role(group, 3); !errors.Is(err, ErrMemberNotFound) {
 		t.Fatalf("enrollment granted a role: %v", err)
 	}
-	add := authorizedConfigurationMessage(t, pb.ConfChangeAddLearnerNode, 3, 1, 3)
+	add := authorizedConfigurationMessage(t, group, pb.ConfChangeAddLearnerNode, 3, 1, 3)
 	frame, _, err := leader.EncodeOutbound(nil, raftmember.OutboundMessage{
 		Group: group, From: 1, To: 3, Message: add})
 	if err != nil {
@@ -117,7 +117,7 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 	if err := sender.PublishCommittedAuthority(group, 8, learner); err != nil {
 		t.Fatal(err)
 	}
-	add := authorizedConfigurationMessage(t, pb.ConfChangeAddLearnerNode, 3, 1, 3)
+	add := authorizedConfigurationMessage(t, group, pb.ConfChangeAddLearnerNode, 3, 1, 3)
 	frame, _, err := sender.EncodeOutbound(nil, raftmember.OutboundMessage{
 		Group: group, From: 1, To: 3, Message: add})
 	if err != nil {
@@ -126,7 +126,7 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 	if _, err = lagging.DecodeInbound(testPeerIdentity(lagging, testNode(1)), frame); err != nil {
 		t.Fatalf("exact adjacent configuration = %v", err)
 	}
-	wrong := authorizedConfigurationMessage(t, pb.ConfChangeAddNode, 3, 1, 3)
+	wrong := authorizedConfigurationMessage(t, group, pb.ConfChangeAddNode, 3, 1, 3)
 	wrongFrame, _, err := sender.EncodeOutbound(nil, raftmember.OutboundMessage{
 		Group: group, From: 1, To: 3, Message: wrong})
 	if err != nil {
@@ -137,13 +137,100 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 	}
 }
 
+func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
+	group := testGroup(33)
+	members := []Member{
+		{Group: group, ReplicaSetVersion: 6, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 3, Node: testNode(3), Role: MemberLearner},
+	}
+	open := func(local NodeID) *StaticRegistry {
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = registry.AuthorizeTransition(TransitionGrant{Group: group,
+			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
+			SourceMember: 1, TargetMember: 3}); err != nil {
+			t.Fatal(err)
+		}
+		proof := raftmember.DurablePromotionProof{Version: 8, TargetMember: 3,
+			AuthorizationDigest: raftmember.MembershipTransitionDigest(
+				group, [16]byte{1}, 7, 9, 1, 3)}
+		wrong := proof
+		wrong.AuthorizationDigest[0] ^= 0xff
+		if err = registry.PublishDurablePromotion(group, wrong); !errors.Is(err, ErrReplicaSet) {
+			t.Fatalf("wrong grant digest = %v", err)
+		}
+		if err = registry.PublishDurablePromotion(group, proof); err != nil {
+			t.Fatal(err)
+		}
+		return registry
+	}
+	candidate, target := open(testNode(2)), open(testNode(3))
+	vote := frameTestMessage(pb.MsgVote, 2, 3)
+	frame, _, err := candidate.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 2, To: 3, Message: vote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, _, err := parseFrame(frame)
+	if err != nil || header.version != 8 {
+		t.Fatalf("election frame version=%d err=%v", header.version, err)
+	}
+	if _, err = target.DecodeInbound(testPeerIdentity(target, testNode(2)), frame); err != nil {
+		t.Fatalf("candidate vote request = %v", err)
+	}
+	response := frameTestMessage(pb.MsgVoteResp, 3, 2)
+	responseFrame, _, err := target.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 3, To: 2, Message: response})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = candidate.DecodeInbound(testPeerIdentity(candidate, testNode(3)), responseFrame); err != nil {
+		t.Fatalf("target vote response = %v", err)
+	}
+	for _, disallowed := range []*pb.Message{
+		frameTestMessage(pb.MsgVote, 3, 2),
+		frameTestMessage(pb.MsgVoteResp, 1, 3),
+	} {
+		from, to := disallowed.GetFrom(), disallowed.GetTo()
+		local := candidate
+		if from == 3 {
+			local = target
+		}
+		if encoded, _, encodeErr := local.EncodeOutbound(nil, raftmember.OutboundMessage{
+			Group: group, From: from, To: to, Message: disallowed,
+		}); encodeErr == nil || encoded != nil || !errors.Is(encodeErr, ErrUnauthorized) {
+			t.Fatalf("disallowed %s %d->%d frame=%x err=%v",
+				disallowed.GetType(), from, to, encoded, encodeErr)
+		}
+	}
+	heartbeat := frameTestEncode(t, candidate, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
+	heartbeatHeader, _, err := parseFrame(heartbeat)
+	if err != nil || heartbeatHeader.version != 6 {
+		t.Fatalf("ordinary learner heartbeat version=%d err=%v", heartbeatHeader.version, err)
+	}
+	if err = candidate.ClearDurablePromotion(group); err != nil {
+		t.Fatal(err)
+	}
+	if revoked, _, revokeErr := candidate.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 2, To: 3, Message: vote,
+	}); revokeErr == nil || revoked != nil || !errors.Is(revokeErr, ErrUnauthorized) {
+		t.Fatalf("revoked proof frame=%x err=%v", revoked, revokeErr)
+	}
+}
+
 func authorizedConfigurationMessage(
 	t testing.TB,
+	group raftmember.GroupKey,
 	kind pb.ConfChangeType,
 	member, from, to uint64,
 ) *pb.Message {
 	t.Helper()
-	change := &pb.ConfChange{Type: kind.Enum(), NodeId: &member}
+	digest := raftmember.MembershipTransitionDigest(group, [16]byte{1}, 7, 9, 1, 3)
+	change := &pb.ConfChange{Type: kind.Enum(), NodeId: &member,
+		Context: append([]byte(nil), digest[:]...)}
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(change)
 	if err != nil {
 		t.Fatal(err)

@@ -113,6 +113,11 @@ type realTransferCluster struct {
 	pendingDuplicate    int
 	syncAuthority       bool
 	group               raftmember.GroupKey
+	promotionTarget     uint64
+	pausePromotion      bool
+	promotionPaused     bool
+	promotionVoteSeen   bool
+	holdTargetUntilVote bool
 }
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
@@ -124,6 +129,11 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 		progressed := false
 		for index, host := range cluster.hosts {
 			if cluster.inactive[index] {
+				continue
+			}
+			if cluster.holdTargetUntilVote &&
+				index == cluster.memberIndex[cluster.promotionTarget] &&
+				!cluster.promotionVoteSeen {
 				continue
 			}
 			_, consumed, err := host.RunOne()
@@ -145,6 +155,34 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 					cluster.group, publication.ReplicaSetVersion,
 					publication.ConfState); publishErr != nil {
 					cluster.t.Fatal(publishErr)
+				}
+				if cluster.promotionTarget != 0 {
+					proof, found, proofErr := host.DurablePromotion(cluster.group,
+						cluster.promotionTarget)
+					if proofErr != nil {
+						cluster.t.Fatal(proofErr)
+					}
+					if found {
+						if proofErr = cluster.registries[index].PublishDurablePromotion(
+							cluster.group, proof); proofErr != nil {
+							cluster.t.Fatal(proofErr)
+						}
+						if cluster.pausePromotion && index == cluster.memberIndex[cluster.promotionTarget] {
+							status, statusErr := host.Status(cluster.group)
+							publication, publicationErr := host.Publication(cluster.group)
+							if statusErr != nil || publicationErr != nil {
+								cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+							}
+							if status.Commit >= proof.Version && publication.ReplicaSetVersion < proof.Version {
+								cluster.pausePromotion = false
+								cluster.promotionPaused = true
+								cluster.inactive[index] = true
+							}
+						}
+					} else if proofErr = cluster.registries[index].ClearDurablePromotion(
+						cluster.group); proofErr != nil {
+						cluster.t.Fatal(proofErr)
+					}
 				}
 			}
 			for {
@@ -194,6 +232,15 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 		}
 		if err := cluster.hosts[receiverIndex].AdoptMessage(inbound.Group, inbound.Message); err != nil {
 			cluster.t.Fatalf("adopt %s %d->%d: %v", outbound.Message.GetType(), outbound.From, outbound.To, err)
+		}
+		if !cluster.promotionVoteSeen && outbound.To == cluster.promotionTarget &&
+			(outbound.Message.GetType() == pb.MsgVote || outbound.Message.GetType() == pb.MsgPreVote) {
+			role, roleErr := receiver.Role(outbound.Group, cluster.promotionTarget)
+			if roleErr != nil || role != rafttransport.MemberLearner {
+				cluster.t.Fatalf("promotion election admitted after target publication: role=%d err=%v",
+					role, roleErr)
+			}
+			cluster.promotionVoteSeen = true
 		}
 	}
 	deliver()

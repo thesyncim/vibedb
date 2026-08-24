@@ -186,6 +186,7 @@ type memberRuntime interface {
 	ProposeConfChange(pb.ConfChangeI) error
 	ReadIndex([]byte) error
 	Publication() (raftmodel.Publication, error)
+	DurablePromotion(uint64) (raftmember.DurablePromotionProof, bool, error)
 	SnapshotState() (replicatedstate.State, error)
 	Status() (raftmember.RuntimeStatus, error)
 	Progress(uint64) (raftmodel.MemberProgress, bool, error)
@@ -789,6 +790,19 @@ func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, e
 		return raftmodel.Publication{}, err
 	}
 	return group.runtime.Publication()
+}
+
+// DurablePromotion returns the exact bounded durable-log witness for an
+// unapplied target promotion.
+func (host *Host) DurablePromotion(
+	key raftmember.GroupKey,
+	target uint64,
+) (raftmember.DurablePromotionProof, bool, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmember.DurablePromotionProof{}, false, err
+	}
+	return group.runtime.DurablePromotion(target)
 }
 
 // SnapshotState returns one group's coherent durable state for control-plane

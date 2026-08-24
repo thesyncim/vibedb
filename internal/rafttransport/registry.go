@@ -110,12 +110,18 @@ type TransitionGrant struct {
 	TargetMember      uint64
 }
 
+func (grant TransitionGrant) digest() [raftmember.MembershipTransitionDigestBytes]byte {
+	return raftmember.MembershipTransitionDigest(grant.Group, grant.TransitionID,
+		grant.MetadataEpoch, grant.CatalogGeneration, grant.SourceMember, grant.TargetMember)
+}
+
 type authorityView struct {
 	version       uint64
 	roles         map[uint64]MemberRole
 	previous      *authorityView
 	allowPrevious bool
 	grant         TransitionGrant
+	promotion     *raftmember.DurablePromotionProof
 }
 
 type authoritySlot struct{ view atomic.Pointer[authorityView] }
@@ -334,6 +340,66 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 		next := &authorityView{version: version, roles: roles, grant: current.grant,
 			previous: previous, allowPrevious: !removed}
 		if slot.view.CompareAndSwap(current, next) {
+			return nil
+		}
+	}
+}
+
+// PublishDurablePromotion installs a narrow election witness only after the
+// local durable log proves the exact granted target's canonical promotion.
+// It does not publish the target as a general voter.
+func (registry *StaticRegistry) PublishDurablePromotion(
+	group raftmember.GroupKey,
+	proof raftmember.DurablePromotionProof,
+) error {
+	if registry == nil || proof.Version == 0 || proof.TargetMember == 0 {
+		return ErrReplicaSet
+	}
+	slot := registry.authorities[group]
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	for {
+		current := slot.view.Load()
+		if current.grant.TargetMember != proof.TargetMember ||
+			current.grant.digest() != proof.AuthorizationDigest ||
+			current.roles[proof.TargetMember] != MemberLearner ||
+			proof.Version <= current.version {
+			return ErrReplicaSet
+		}
+		if current.promotion != nil {
+			if *current.promotion == proof {
+				return nil
+			}
+			return ErrReplicaSet
+		}
+		detached := proof
+		next := *current
+		next.promotion = &detached
+		if slot.view.CompareAndSwap(current, &next) {
+			return nil
+		}
+	}
+}
+
+// ClearDurablePromotion revokes a transient election witness when the exact
+// entry is no longer present in the durable unapplied suffix.
+func (registry *StaticRegistry) ClearDurablePromotion(group raftmember.GroupKey) error {
+	if registry == nil {
+		return ErrReplicaSet
+	}
+	slot := registry.authorities[group]
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	for {
+		current := slot.view.Load()
+		if current.promotion == nil {
+			return nil
+		}
+		next := *current
+		next.promotion = nil
+		if slot.view.CompareAndSwap(current, &next) {
 			return nil
 		}
 	}
