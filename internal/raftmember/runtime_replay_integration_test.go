@@ -91,13 +91,50 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 			t.Fatalf("Propose(suffix %d) = %v", ordinal, err)
 		}
 	}
-	drainRuntime(t, fixture.runtime, nil)
+	// A single-node raft may expose the HardState commit in the same Ready as
+	// the new entries or in a later Ready after those entries are durable. Audit
+	// the entry-bearing persistence boundary itself so a legitimate later
+	// HardState-only record cannot be mistaken for a split proposal batch.
+	suffixPersisted := false
+	for step := 0; step < 10_000; step++ {
+		result, driveErr := fixture.runtime.DriveReady(nil)
+		if driveErr != nil {
+			t.Fatalf("DriveReady(suffix) step %d: %v", step, driveErr)
+		}
+		if result.Kind == DrivePersisted {
+			persistedLast, lastErr := fixture.wal.LastIndex()
+			if lastErr != nil {
+				t.Fatal(lastErr)
+			}
+			if persistedLast > lastBefore {
+				if suffixPersisted {
+					t.Fatalf("suffix entries crossed multiple persisted Ready records")
+				}
+				suffixPersisted = true
+				if persistedLast-lastBefore != uint64(len(suffixCommands)) {
+					t.Fatalf(
+						"entry-bearing suffix WAL range = %d..%d, want %d entries",
+						lastBefore, persistedLast, len(suffixCommands),
+					)
+				}
+				if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
+					t.Fatalf("entry-bearing suffix WAL syncs = %d, want 2", syncs)
+				}
+			}
+		}
+		if result.Kind == DriveIdle {
+			break
+		}
+		if step == 9_999 {
+			t.Fatal("DriveReady(suffix) did not become idle")
+		}
+	}
+	if !suffixPersisted {
+		t.Fatal("suffix entries were not persisted")
+	}
 	lastAfter, err := fixture.wal.LastIndex()
 	if err != nil || lastAfter-lastBefore != uint64(len(suffixCommands)) {
 		t.Fatalf("batched suffix WAL range = %d..%d, %v", lastBefore, lastAfter, err)
-	}
-	if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
-		t.Fatalf("batched suffix WAL syncs = %d, want 2", syncs)
 	}
 	finalPublication, err := fixture.runtime.Publication()
 	if err != nil {
