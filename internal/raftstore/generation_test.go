@@ -114,7 +114,7 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 		candidate.Info.SourceCurrentIncarnation != incarnation ||
 		candidate.Info.RetainedEntries != 1 || candidate.Info.RetainedBytes == 0 ||
 		candidate.Info.RetentionCommitment != testRetentionCommitment() ||
-		candidate.Info.SourceCutDigest == ([sha256.Size]byte{}) {
+		candidate.Info.SourceCutDigest != builder.current.chainDigest {
 		t.Fatalf("candidate info = %+v", candidate.Info)
 	}
 	if again, retryErr := builder.Build(); retryErr != nil || again != candidate {
