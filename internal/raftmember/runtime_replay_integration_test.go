@@ -89,7 +89,8 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		replicatedstate.ResultSessionOpened,
 	}
 	wantFinalApplied := prefixPublication.Applied + uint64(len(suffixCommands))
-	crashSQLPath := filepath.Join(t.TempDir(), "crash.vdb")
+	crashDir := t.TempDir()
+	crashSQLPath := filepath.Join(crashDir, "crash.vdb")
 	lastBefore, err := fixture.wal.LastIndex()
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +107,11 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	// HardState-only record cannot be mistaken for a split proposal batch.
 	suffixPersisted := false
 	commitPersisted := false
+	var crashHardState [3]uint64
+	var crashSyncCount uint64
+	var crashRemainingBytes int64
+	var crashWALLast uint64
+	var crashIncarnation uint64
 	observedLast := lastBefore
 	for step := 0; step < 10_000; step++ {
 		result, driveErr := fixture.runtime.DriveReady(nil)
@@ -157,6 +163,13 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 				}
 				copyRuntimeReplayPath(t, fixture.sqlPath, crashSQLPath)
 				copyRuntimeReplayPath(t, fixture.sqlPath+".tables", crashSQLPath+".tables")
+				crashHardState = [3]uint64{
+					hardState.GetTerm(), hardState.GetVote(), hardState.GetCommit(),
+				}
+				crashSyncCount = fixture.wal.SyncCount()
+				crashRemainingBytes = fixture.wal.RemainingBytes()
+				crashWALLast = persistedLast
+				crashIncarnation = fixture.wal.CurrentIncarnation()
 				commitPersisted = true
 				break
 			}
@@ -205,8 +218,19 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		)
 	}
 	hardState, _, err := fixture.wal.InitialState()
-	if err != nil || hardState.GetCommit() != finalPublication.Applied {
-		t.Fatalf("source WAL commit = %d, %v", hardState.GetCommit(), err)
+	lastAfterDrain, lastErr := fixture.wal.LastIndex()
+	if err != nil || lastErr != nil ||
+		[3]uint64{hardState.GetTerm(), hardState.GetVote(), hardState.GetCommit()} != crashHardState ||
+		fixture.wal.SyncCount() != crashSyncCount ||
+		fixture.wal.RemainingBytes() != crashRemainingBytes ||
+		lastAfterDrain != crashWALLast ||
+		fixture.wal.CurrentIncarnation() != crashIncarnation {
+		t.Fatalf(
+			"source WAL changed after crash cut: hard=%d/%d/%d sync=%d remaining=%d last=%d incarnation=%d errors=%v/%v",
+			hardState.GetTerm(), hardState.GetVote(), hardState.GetCommit(),
+			fixture.wal.SyncCount(), fixture.wal.RemainingBytes(), lastAfterDrain,
+			fixture.wal.CurrentIncarnation(), err, lastErr,
+		)
 	}
 
 	// Capture the exact expected logical result only after the crash image is
@@ -225,8 +249,8 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 
 	recovery := openRuntimeReplayHandles(t, crashSQLPath, fixture)
 
-	// Certificate-authoritative SQL recovery must discard the copied visible
-	// suffix before Runtime construction. The durable WAL still commits it.
+	// The frozen pre-apply SQL image must open at its exact certified prefix
+	// before Runtime construction. The unchanged coexisting WAL commits the suffix.
 	if recovery.apply.Applied() != prefixPublication.Applied ||
 		recovery.apply.CheckpointAppliedIndex() != prefixPublication.Applied {
 		t.Fatalf(
@@ -348,11 +372,14 @@ func openRuntimeReplayHandles(
 		sqlPath, wal, testAuthorityProfile(), fixture.base, fixture.applyID,
 	)
 	if err != nil {
-		_ = wal.Close()
-		t.Fatalf("open replay SQL: %v", err)
+		t.Fatalf("open replay SQL: %v", errors.Join(err, wal.Close()))
 	}
 	handles := &runtimeReplayHandles{wal: wal, database: database, apply: apply}
-	t.Cleanup(func() { _ = handles.close() })
+	t.Cleanup(func() {
+		if closeErr := handles.close(); closeErr != nil {
+			t.Errorf("close replay handles: %v", closeErr)
+		}
+	})
 	return handles
 }
 
@@ -361,7 +388,8 @@ func (h *runtimeReplayHandles) adopt(t testing.TB) *Runtime {
 	runtime, err := AdoptRuntime(h.wal, h.database, h.apply)
 	if err != nil {
 		if runtime != nil {
-			_ = runtime.Close()
+			h.runtime = runtime
+			err = errors.Join(err, h.close())
 		}
 		t.Fatal(err)
 	}
@@ -370,10 +398,38 @@ func (h *runtimeReplayHandles) adopt(t testing.TB) *Runtime {
 }
 
 func (h *runtimeReplayHandles) close() error {
-	if h.runtime != nil {
-		return h.runtime.Close()
+	if h == nil {
+		return nil
 	}
-	return errors.Join(h.apply.Close(), h.database.Close(), h.wal.Close())
+	if h.runtime != nil {
+		if err := h.runtime.Close(); err != nil {
+			return err
+		}
+		h.runtime = nil
+		h.apply = nil
+		h.database = nil
+		h.wal = nil
+		return nil
+	}
+	if h.apply != nil {
+		if err := h.apply.Close(); err != nil {
+			return err
+		}
+		h.apply = nil
+	}
+	if h.database != nil {
+		if err := h.database.Close(); err != nil {
+			return err
+		}
+		h.database = nil
+	}
+	if h.wal != nil {
+		if err := h.wal.Close(); err != nil {
+			return err
+		}
+		h.wal = nil
+	}
+	return nil
 }
 
 func captureRuntimeReplayImage(
@@ -518,7 +574,7 @@ func assertRuntimeReplayCompletionMissing(
 	if _, err := apply.LookupCompletion(command); !errors.Is(
 		err, replicatedstate.ErrCompletionNotFound,
 	) {
-		t.Fatalf("uncertified suffix completion survived SQL recovery: %v", err)
+		t.Fatalf("pre-apply suffix completion unexpectedly exists: %v", err)
 	}
 }
 
