@@ -27,7 +27,7 @@ type nativeSessionClient struct {
 
 func (client *nativeSessionClient) DoReplicated(
 	_ context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -308,12 +308,12 @@ func TestNativeGatewayPinsCatalogRF3RouteAndNeverFallsBackToSQL(t *testing.T) {
 		Fence: shardservice.ReplicatedFence{
 			Group: descriptor.Group, AllocationGeneration: uint64(descriptor.AllocationGeneration),
 			Command: descriptor.Command, MemberID: descriptor.Replicas[0].Member,
-			NodeIncarnation: 1, Term: 2,
+			StoreID:         descriptor.Replicas[0].StoreID,
+			NodeIncarnation: descriptor.Replicas[0].NodeIncarnation, Term: 2,
 		},
 		LeaderID: descriptor.Replicas[0].Member, Commit: 1, Applied: 1,
 		CheckpointApplied: 1,
 	}
-	state.Fence.StoreID[0] = 1
 	client := &nativeSessionClient{state: state}
 	native, err := NewNativeGateway(NativeGatewayOptions{
 		Catalog: NewCatalogHolder(snapshot), Client: client, MaxAttempts: 2,

@@ -10,9 +10,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibejson"
 )
 
-func TestJSONNumberParametersRemainExact(t *testing.T) {
+func TestNativeNumberParametersRemainExact(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`
 		CREATE TABLE docs (
@@ -25,7 +28,7 @@ func TestJSONNumberParametersRemainExact(t *testing.T) {
 	const wide = "9007199254740993"
 	if _, err := db.Exec(
 		`INSERT INTO docs (id, label) VALUES (?, ?)`,
-		json.Number(wide), "exact",
+		query.Number(wide), "exact",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +36,7 @@ func TestJSONNumberParametersRemainExact(t *testing.T) {
 	var label string
 	if err := db.QueryRow(
 		`SELECT label FROM docs WHERE id = ? LIMIT ?`,
-		json.Number(wide), json.Number("1"),
+		vibejson.RawValue{Src: []byte(wide)}, query.Number("1"),
 	).Scan(&label); err != nil {
 		t.Fatal(err)
 	}

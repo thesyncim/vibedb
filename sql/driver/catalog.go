@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,7 +41,7 @@ const maxCatalogTables = 128
 
 // maxCatalogBytes bounds both untrusted catalog reads and prospective catalog
 // rewrites. DDL is cold, so persistCatalogLocked computes a conservative
-// allocation-free upper bound before asking encoding/json to allocate.
+// allocation-free upper bound before allocating the canonical image.
 const maxCatalogBytes = 16 << 20
 
 type catalogFile struct {
@@ -311,7 +310,7 @@ func openDatabaseWithShardStorePolicy(
 				absolute,
 			)
 		}
-		if err := json.Unmarshal(raw, &d.catalog); err != nil {
+		if err := decodeCatalogJSON(raw, (*catalogFileVibe)(&d.catalog)); err != nil {
 			return nil, fmt.Errorf("vibedb: read SQL catalog %s: %w", absolute, err)
 		}
 		if d.catalog.Version != catalogVersion || d.catalog.Tables == nil {
@@ -1421,10 +1420,11 @@ func (d *database) persistCatalogLocked() (published bool, err error) {
 	if err := d.retryNamespaceFencesLocked(); err != nil {
 		return false, err
 	}
-	if err := checkCatalogSize(d.catalog); err != nil {
+	bound, err := catalogSizeUpperBound(d.catalog)
+	if err != nil {
 		return false, err
 	}
-	raw, err := json.MarshalIndent(d.catalog, "", "  ")
+	raw, err := appendCatalogJSON(make([]byte, 0, bound), d.catalog)
 	if err != nil {
 		return false, err
 	}
@@ -1476,10 +1476,10 @@ func (d *database) persistCatalogLocked() (published bool, err error) {
 	return true, nil
 }
 
-// checkCatalogSize computes a conservative upper bound for MarshalIndent
+// checkCatalogSize computes a conservative upper bound for canonical encoding
 // without allocating. The fixed allowances cover field names, punctuation,
 // booleans/numbers, newlines, and indentation at each structural level;
-// encodedJSONStringBytes accounts exactly for encoding/json's string escaping.
+// encodedJSONStringBytes conservatively accounts for JSON string escaping.
 func checkCatalogSize(catalog catalogFile) error {
 	_, err := catalogSizeUpperBound(catalog)
 	return err
@@ -1656,7 +1656,7 @@ func encodedJSONStringBytes(value string) int {
 		r, width := utf8.DecodeRuneInString(value)
 		switch {
 		case r == utf8.RuneError && width == 1:
-			size += 6 // encoding/json emits \ufffd for invalid UTF-8
+			size += 6 // canonical encoding replaces invalid UTF-8 with \ufffd
 		case r == '"' || r == '\\':
 			size += 2
 		case r == '\b' || r == '\f' || r == '\n' || r == '\r' || r == '\t':

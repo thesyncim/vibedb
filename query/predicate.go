@@ -205,6 +205,12 @@ func (c *compiler) makeLiteral(value any) (literal, error) {
 		return literal{kind: kindString, sval: *v}, nil
 	case Number:
 		return c.numberLiteral(v)
+	case vibejson.RawValue:
+		raw, ok := v.NumberBytes()
+		if !ok {
+			return literal{}, fmt.Errorf("query: raw literal is not a JSON number")
+		}
+		return c.numberLiteral(Number(byteview.String(raw)))
 	case *Number:
 		if v == nil {
 			return literal{}, fmt.Errorf("query: nil *query.Number literal")

@@ -8,6 +8,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 )
 
@@ -19,8 +20,11 @@ const ServingReplicaCount = 3
 // ReplicatedReplicaDescriptor binds one Raft member ID to the endpoint whose
 // address is already authenticated by the catalog endpoint directory.
 type ReplicatedReplicaDescriptor struct {
-	Member   uint64
-	Endpoint distribution.EndpointID
+	Member          uint64
+	Node            rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	Endpoint        distribution.EndpointID
 }
 
 // ReplicatedShardDescriptor is the cold control-plane identity for one RF3
@@ -125,7 +129,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			manifestEndpoint, _ := manifest.ShardLeaderAt(shardOrdinal, replicaOrdinal)
 			address, endpointExists := snapshot.endpoints[replica.Endpoint]
-			if replica.Member == 0 || replica.Endpoint == "" || !endpointExists ||
+			if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
+				replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
+				replica.Endpoint == "" || !endpointExists ||
 				address == "" || replica.Endpoint != manifestEndpoint {
 				return &CatalogError{Reason: fmt.Sprintf(
 					"replicated shard %q/%q replica %d does not match its manifest endpoint",
@@ -156,7 +162,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		base := len(replicas)
 		for _, replica := range entry.descriptor.Replicas {
 			replicas = append(replicas, ReplicatedEndpoint{
-				Member: replica.Member, Address: snapshot.endpoints[replica.Endpoint],
+				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
+				NodeIncarnation: replica.NodeIncarnation,
+				Address:         snapshot.endpoints[replica.Endpoint],
 			})
 		}
 		shards[ordinal] = replicatedCatalogShard{
@@ -287,8 +295,11 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 		for replicaOrdinal := range descriptor.Replicas {
 			endpoint, _ := manifest.ShardLeaderAt(int(entry.shard), replicaOrdinal)
 			descriptor.Replicas[replicaOrdinal] = ReplicatedReplicaDescriptor{
-				Member:   snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Member,
-				Endpoint: endpoint,
+				Member:          snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Member,
+				Node:            snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].Node,
+				StoreID:         snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].StoreID,
+				NodeIncarnation: snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NodeIncarnation,
+				Endpoint:        endpoint,
 			}
 		}
 		descriptors[ordinal] = descriptor
@@ -401,8 +412,11 @@ type persistedReplicatedShard struct {
 }
 
 type persistedReplicatedReplica struct {
-	Member   uint64 `json:"member"`
-	Endpoint string `json:"endpoint"`
+	Member          uint64 `json:"member"`
+	Node            string `json:"node"`
+	StoreID         string `json:"store_id"`
+	NodeIncarnation uint64 `json:"node_incarnation"`
+	Endpoint        string `json:"endpoint"`
 }
 
 func persistedReplicatedDescriptors(
@@ -435,7 +449,9 @@ func persistedReplicatedDescriptors(
 		}
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			entry.Replicas[replicaOrdinal] = persistedReplicatedReplica{
-				Member: replica.Member, Endpoint: string(replica.Endpoint),
+				Member: replica.Member, Node: hex.EncodeToString(replica.Node[:]),
+				StoreID:         hex.EncodeToString(replica.StoreID[:]),
+				NodeIncarnation: replica.NodeIncarnation, Endpoint: string(replica.Endpoint),
 			}
 		}
 		persisted[ordinal] = entry
@@ -488,8 +504,18 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 			Replicas: make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
 		}
 		for replicaOrdinal, replica := range persisted.Replicas {
+			var node rafttransport.NodeID
+			var storeID [16]byte
+			if err := decodeFixed16Hex(replica.Node, (*[16]byte)(&node)); err != nil {
+				return nil, &CatalogError{Reason: "replicated replica node: " + err.Error()}
+			}
+			if err := decodeFixed16Hex(replica.StoreID, &storeID); err != nil {
+				return nil, &CatalogError{Reason: "replicated replica store: " + err.Error()}
+			}
 			descriptor.Replicas[replicaOrdinal] = ReplicatedReplicaDescriptor{
-				Member: replica.Member, Endpoint: distribution.EndpointID(replica.Endpoint),
+				Member: replica.Member, Node: node, StoreID: storeID,
+				NodeIncarnation: replica.NodeIncarnation,
+				Endpoint:        distribution.EndpointID(replica.Endpoint),
 			}
 		}
 		descriptors[ordinal] = descriptor

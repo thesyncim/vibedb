@@ -4,7 +4,6 @@ import (
 	"context"
 	stdsql "database/sql"
 	sqldriver "database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -306,24 +305,23 @@ var (
 	_ sqldriver.SessionResetter    = (*conn)(nil)
 )
 
-// CheckNamedValue preserves exact decimal parameters. database/sql's default
-// converter treats json.Number as a string-shaped named type; converting it to
-// query.Number here keeps it numeric. Already-native driver values return
-// directly, and the remaining ordinary Go numeric/Valuer forms run through the
-// standard converter here, avoiding an ErrSkip round trip for every parameter.
+// CheckNamedValue preserves exact query.Number decimal parameters. Returning
+// the native exact-number type before database/sql's default converter sees it
+// keeps it numeric. The remaining ordinary Go numeric/Valuer forms run through
+// the standard converter here, avoiding an ErrSkip round trip per parameter.
 func (c *conn) CheckNamedValue(value *sqldriver.NamedValue) error {
 	if value.Name != "" {
 		return errors.New("vibedb: named parameters are not supported; use '?'")
 	}
 	switch number := value.Value.(type) {
-	case json.Number:
-		if err := checkSQLParameterBytes(len(number)); err != nil {
-			return err
-		}
-		value.Value = query.Number(number.String())
-		return nil
 	case query.Number:
 		return checkSQLParameterBytes(len(number))
+	case vibejson.RawValue:
+		raw, ok := number.NumberBytes()
+		if !ok {
+			return errors.New("vibedb: raw scalar parameters must be JSON numbers")
+		}
+		return checkSQLParameterBytes(len(raw))
 	case float64:
 		if math.IsNaN(number) || math.IsInf(number, 0) {
 			return errors.New("vibedb: numeric parameters must be finite JSON numbers")
@@ -375,10 +373,10 @@ func sqlArgumentBytes(value any) int {
 		return len(value)
 	case []byte:
 		return len(value)
-	case json.Number:
-		return len(value)
 	case query.Number:
 		return len(value)
+	case vibejson.RawValue:
+		return len(value.Bytes())
 	case nil:
 		return 4
 	default:

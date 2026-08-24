@@ -35,7 +35,7 @@ func TestFlatInsertVibeJSONMatchesLegacyScalarBytes(t *testing.T) {
 		uint(1), uint8(8), uint16(16), uint32(32), uint64(math.MaxUint64),
 		float32(0.1), float64(-123.5),
 		"text <>&  ", []byte("borrowed <bytes>"),
-		query.Number("1.2300e+9"), stdjson.Number("-0.125E-2"),
+		query.Number("1.2300e+9"), vibejson.RawValue{Src: []byte("-0.125E-2")},
 		&boolValue, &intValue, &floatValue, &stringValue, &numberValue,
 	} {
 		got, err := encodeFlatInsertDocument(
@@ -322,7 +322,7 @@ func TestFlatInsertVibeJSONRejectsInvalidNumbersAndOwnsOutput(t *testing.T) {
 	insert := statement.Tree().Insert
 	row := &insert.Rows[0]
 	for _, value := range []any{
-		query.Number("01"), stdjson.Number("1."),
+		query.Number("01"), vibejson.RawValue{Src: []byte("1.")},
 		vibejson.RawValue{Src: []byte("--1")},
 	} {
 		if _, err := encodeFlatInsertDocument(
@@ -504,6 +504,12 @@ func legacyFlatInsertValue(operand sqlast.Operand, args []any) (any, error) {
 		return stdjson.Number(value), nil
 	case *query.Number:
 		return stdjson.Number(*value), nil
+	case vibejson.RawValue:
+		raw, ok := value.NumberBytes()
+		if !ok {
+			return nil, errors.New("raw scalar is not a JSON number")
+		}
+		return stdjson.Number(raw), nil
 	case []byte:
 		return string(value), nil
 	case float32:

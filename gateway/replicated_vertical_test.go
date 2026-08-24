@@ -57,11 +57,15 @@ func TestNativeSessionThreeEndpointFailoverRetriesExactBytesWithoutDuplicateAppl
 		listeners[index] = listener
 		route.Replicas[index].Address = listener.Addr().String()
 		serverDone[index] = make(chan error, 1)
+	}
+	cluster.kill = func() { _ = listeners[1].Close() }
+	for index := range route.Replicas {
+		member := route.Replicas[index].Member
+		listener := listeners[index]
 		go func() {
 			serverDone[index] <- serveLogicalRF3Endpoint(ctx, listener, member, cluster)
 		}()
 	}
-	cluster.kill = func() { _ = listeners[1].Close() }
 	t.Cleanup(func() {
 		cancel()
 		for _, listener := range listeners {
