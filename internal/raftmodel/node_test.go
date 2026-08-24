@@ -158,6 +158,47 @@ func TestPendingReadyPayloadBytesAreBoundedBeforeCapture(t *testing.T) {
 	}
 }
 
+func TestNormalProposalsShareOneBoundedUncapturedReady(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1})
+	driveCampaign(t, node)
+
+	first := []byte("first")
+	second := []byte("second")
+	if err := node.Propose(first); err != nil {
+		t.Fatalf("Propose(first) error = %v", err)
+	}
+	if err := node.Propose(second); err != nil {
+		t.Fatalf("Propose(second) error = %v", err)
+	}
+	first[0] = 'X'
+	second[0] = 'Y'
+
+	if captured, err := node.CaptureReady(); err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if len(node.ready.Entries) != 2 || string(node.ready.Entries[0].GetData()) != "first" ||
+		string(node.ready.Entries[1].GetData()) != "second" {
+		t.Fatalf(
+			"batched Ready entries=%d data=%q/%q",
+			len(node.ready.Entries),
+			node.ready.Entries[0].GetData(), node.ready.Entries[1].GetData(),
+		)
+	}
+}
+
+func TestProposalBatchLimitsMatchUncapturedReadyWindow(t *testing.T) {
+	if MaxProposalBatchEntries != MaxPendingInputCalls ||
+		MaxProposalBatchEntries > MaxPendingInputUnits ||
+		MaxProposalBatchBytes != MaxSizePerMsg ||
+		MaxProposalBatchBytes >= MaxPendingInputBytes {
+		t.Fatalf(
+			"proposal batch limits entries=%d bytes=%d; input calls=%d units=%d hard bytes=%d",
+			MaxProposalBatchEntries, MaxProposalBatchBytes, MaxPendingInputCalls,
+			MaxPendingInputUnits, MaxPendingInputBytes,
+		)
+	}
+}
+
 func TestStepOwnsRetainedMessageGraph(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
 	term, index, commit := uint64(2), uint64(2), uint64(1)

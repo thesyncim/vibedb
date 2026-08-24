@@ -537,6 +537,114 @@ func TestHostReadyFirstAndGroupRoundRobin(t *testing.T) {
 	}
 }
 
+func TestHostProposalBatchPreservesGroupAndInputClassFairness(t *testing.T) {
+	limits := testHostLimits()
+	limits.MaxQueueItems = 128
+	limits.MaxGroupItems = 128
+	host, err := NewHost(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := newFakeRuntime(31), newFakeRuntime(32)
+	if err := host.addRuntime(first); err != nil {
+		t.Fatal(err)
+	}
+	for entry := 0; entry < raftmodel.MaxProposalBatchEntries+1; entry++ {
+		if err := host.EnqueueProposal(first.identity.Group, []byte{byte(entry)}); err != nil {
+			t.Fatalf("EnqueueProposal(%d) error = %v", entry, err)
+		}
+	}
+	if err := host.RequestTick(first.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.addRuntime(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.RequestTick(second.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.Group != first.identity.Group ||
+		progress.Kind != ProgressProposal ||
+		progress.ProposalCount != raftmodel.MaxProposalBatchEntries ||
+		progress.ProposalBytes != int64(raftmodel.MaxProposalBatchEntries) ||
+		len(first.proposals) != raftmodel.MaxProposalBatchEntries {
+		t.Fatalf("first proposal batch = %+v, %t, %v; proposals=%d", progress, done, err, len(first.proposals))
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.Group != second.identity.Group || progress.Kind != ProgressTick {
+		t.Fatalf("other-group turn = %+v, %t, %v", progress, done, err)
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.Group != first.identity.Group || progress.Kind != ProgressTick {
+		t.Fatalf("next input-class turn = %+v, %t, %v", progress, done, err)
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.Group != first.identity.Group ||
+		progress.Kind != ProgressProposal || progress.ProposalCount != 1 || progress.ProposalBytes != 1 ||
+		len(first.proposals) != raftmodel.MaxProposalBatchEntries+1 {
+		t.Fatalf("proposal remainder = %+v, %t, %v; proposals=%d", progress, done, err, len(first.proposals))
+	}
+	if host.queueItems != 0 || host.queueBytes != 0 {
+		t.Fatalf("queue accounting after batches = %d/%d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostProposalBatchByteTargetAndOversizedFirst(t *testing.T) {
+	t.Run("exact target", func(t *testing.T) {
+		host, err := NewHost(testHostLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime := newFakeRuntime(33)
+		if err := host.addRuntime(runtime); err != nil {
+			t.Fatal(err)
+		}
+		half := make([]byte, int(raftmodel.MaxProposalBatchBytes/2))
+		for _, proposal := range [][]byte{half, half, {1}} {
+			if err := host.EnqueueProposal(runtime.identity.Group, proposal); err != nil {
+				t.Fatal(err)
+			}
+		}
+		progress, done, err := host.RunOne()
+		if err != nil || !done || progress.Kind != ProgressProposal || progress.ProposalCount != 2 ||
+			progress.ProposalBytes != raftmodel.MaxProposalBatchBytes || len(runtime.proposals) != 2 {
+			t.Fatalf("exact-target batch = %+v, %t, %v; proposals=%d", progress, done, err, len(runtime.proposals))
+		}
+		if host.groups[runtime.identity.Group].proposals.len() != 1 {
+			t.Fatalf("exact-target remainder = %d", host.groups[runtime.identity.Group].proposals.len())
+		}
+	})
+
+	t.Run("oversized first", func(t *testing.T) {
+		host, err := NewHost(testHostLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime := newFakeRuntime(34)
+		if err := host.addRuntime(runtime); err != nil {
+			t.Fatal(err)
+		}
+		oversized := make([]byte, int(raftmodel.MaxProposalBatchBytes)+1)
+		if err := host.EnqueueProposal(runtime.identity.Group, oversized); err != nil {
+			t.Fatal(err)
+		}
+		if err := host.EnqueueProposal(runtime.identity.Group, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		progress, done, err := host.RunOne()
+		if err != nil || !done || progress.Kind != ProgressProposal || progress.ProposalCount != 1 ||
+			progress.ProposalBytes != int64(len(oversized)) || len(runtime.proposals) != 1 ||
+			len(runtime.proposals[0]) != len(oversized) {
+			t.Fatalf("oversized-first batch = %+v, %t, %v; proposals=%d", progress, done, err, len(runtime.proposals))
+		}
+		if host.groups[runtime.identity.Group].proposals.len() != 1 {
+			t.Fatalf("oversized-first remainder = %d", host.groups[runtime.identity.Group].proposals.len())
+		}
+	})
+}
+
 func TestHostOutboxBackpressureDoesNotStarveAnotherGroup(t *testing.T) {
 	limits := testHostLimits()
 	limits.MaxOutboxItems = 1
@@ -593,15 +701,23 @@ func TestHostConsumesInvalidInputAndLatchesRuntimeFailureOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.inputErr = errors.New("invalid queued request")
-	if err := host.EnqueueProposal(runtime.identity.Group, []byte("bad")); err != nil {
-		t.Fatal(err)
+	for _, proposal := range [][]byte{[]byte("bad"), []byte("later-1"), []byte("later-2")} {
+		if err := host.EnqueueProposal(runtime.identity.Group, proposal); err != nil {
+			t.Fatal(err)
+		}
 	}
 	progress, done, err := host.RunOne()
-	if err == nil || !done || progress.Kind != ProgressProposal {
+	if err == nil || !done || progress.Kind != ProgressProposal ||
+		progress.ProposalCount != 1 || progress.ProposalBytes != int64(len("bad")) {
 		t.Fatalf("invalid input = %+v, %t, %v", progress, done, err)
 	}
-	if host.queueItems != 0 {
-		t.Fatal("invalid queued input was retained")
+	group := host.groups[runtime.identity.Group]
+	if host.queueItems != 2 || host.queueBytes != int64(len("later-1")+len("later-2")) ||
+		group.items != 2 || group.proposals.len() != 2 || len(runtime.proposals) != 1 {
+		t.Fatalf(
+			"proposal error accounting global=%d/%d group=%d proposals=%d consumed=%d",
+			host.queueItems, host.queueBytes, group.items, group.proposals.len(), len(runtime.proposals),
+		)
 	}
 	runtime.inputErr = nil
 	if err := host.EnqueueProposal(runtime.identity.Group, []byte("retained")); err != nil {
@@ -622,6 +738,37 @@ func TestHostConsumesInvalidInputAndLatchesRuntimeFailureOnce(t *testing.T) {
 	}
 	if _, done, err = host.RunOne(); done || err != nil {
 		t.Fatalf("latched fault reran = %t, %v", done, err)
+	}
+}
+
+func TestHostProposalFaultRetainsConsumedPrefixAccounting(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(61)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	for _, proposal := range [][]byte{[]byte("fault"), []byte("purged-1"), []byte("purged-2")} {
+		if err := host.EnqueueProposal(runtime.identity.Group, proposal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.inputErr = errors.Join(raftmember.ErrRuntimeFailed, errors.New("terminal proposal"))
+
+	progress, done, err := host.RunOne()
+	if !errors.Is(err, raftmember.ErrRuntimeFailed) || !done ||
+		progress.Kind != ProgressFault || progress.Group != runtime.identity.Group ||
+		progress.ProposalCount != 1 || progress.ProposalBytes != int64(len("fault")) {
+		t.Fatalf("proposal fault = %+v, %t, %v", progress, done, err)
+	}
+	if host.queueItems != 0 || host.queueBytes != 0 ||
+		host.groups[runtime.identity.Group].proposals.len() != 0 {
+		t.Fatalf(
+			"proposal fault retained queue: global=%d/%d group=%d",
+			host.queueItems, host.queueBytes, host.groups[runtime.identity.Group].proposals.len(),
+		)
 	}
 }
 

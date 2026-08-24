@@ -20,6 +20,9 @@ import (
 type runtimeFixture struct {
 	runtime  *Runtime
 	wal      *raftstore.Store
+	walPath  string
+	walKey   raftstore.Key
+	walID    raftstore.Identity
 	database *sqldriver.Database
 	apply    *sqldriver.ReplicatedApply
 	base     sqldriver.ReplicatedShardStoreIdentity
@@ -90,7 +93,8 @@ func newRuntimeFixtureWithOptions(
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
 	return runtimeFixture{
-		runtime: runtime, wal: wal, database: database, apply: apply, base: base,
+		runtime: runtime, wal: wal, walPath: walPath, walKey: key, walID: identity,
+		database: database, apply: apply, base: base,
 		applyID: applyID, sqlPath: sqlPath, options: options,
 	}
 }
@@ -244,6 +248,181 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
 		t.Fatalf("completion = %+v, %v", completion, err)
+	}
+}
+
+func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
+	fixture := newRuntimeFixture(t, 221, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	command := testApplySessionOpen(fixture.base)
+	lastBefore, err := fixture.wal.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncsBefore := fixture.wal.SyncCount()
+	remainingBefore := fixture.wal.RemainingBytes()
+	for entry := 0; entry < raftmodel.MaxProposalBatchEntries; entry++ {
+		if err := fixture.runtime.Propose(command); err != nil {
+			t.Fatalf("Propose(%d) error = %v", entry, err)
+		}
+	}
+	if fixture.wal.SyncCount() != syncsBefore || fixture.wal.RemainingBytes() != remainingBefore {
+		t.Fatalf(
+			"proposal admission mutated WAL: syncs=%d->%d remaining=%d->%d",
+			syncsBefore, fixture.wal.SyncCount(), remainingBefore, fixture.wal.RemainingBytes(),
+		)
+	}
+	if fixture.runtime.proposalBatchEntries != raftmodel.MaxProposalBatchEntries {
+		t.Fatalf("proposal batch entries = %d", fixture.runtime.proposalBatchEntries)
+	}
+	if err := fixture.runtime.Propose(command); !errors.Is(err, raftmodel.ErrReadyPending) ||
+		!errors.Is(err, raftmodel.ErrAdmissionBound) {
+		t.Fatalf("proposal beyond entry limit = %v", err)
+	}
+	if err := fixture.runtime.ReadIndex([]byte("after-proposals")); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("ReadIndex across proposal batch = %v", err)
+	}
+	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(2)}
+	if err := fixture.runtime.ProposeConfChange(change); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("ProposeConfChange across proposal batch = %v", err)
+	}
+
+	captured, err := fixture.runtime.DriveReady(nil)
+	if err != nil || captured.Kind != DriveCaptured {
+		t.Fatalf("DriveReady(capture) = %+v, %v", captured, err)
+	}
+	if fixture.runtime.proposalBatchEntries != 0 || fixture.runtime.proposalBatchBytes != 0 {
+		t.Fatalf(
+			"proposal counters after capture = %d/%d",
+			fixture.runtime.proposalBatchEntries, fixture.runtime.proposalBatchBytes,
+		)
+	}
+	progress, ok := fixture.runtime.node.CurrentReady()
+	if !ok || progress.ReadyID != captured.ReadyID {
+		t.Fatalf("captured Ready progress = %+v, %t", progress, ok)
+	}
+	persisted, err := fixture.runtime.DriveReady(nil)
+	if err != nil || persisted.Kind != DrivePersisted || persisted.ReadyID != captured.ReadyID {
+		t.Fatalf("DriveReady(persist) = %+v, %v; capture=%+v", persisted, err, captured)
+	}
+	lastAfter, err := fixture.wal.LastIndex()
+	if err != nil || lastAfter-lastBefore != uint64(raftmodel.MaxProposalBatchEntries) {
+		t.Fatalf("persisted log range = %d..%d, err=%v", lastBefore, lastAfter, err)
+	}
+	if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
+		t.Fatalf("batched Ready sync count = %d, want 2", syncs)
+	}
+	recordBytes := remainingBefore - fixture.wal.RemainingBytes()
+	if recordBytes <= 0 || recordBytes > int64(fixture.options.MaxRecordBytes) {
+		t.Fatalf("batched Ready record bytes = %d", recordBytes)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	if err := fixture.runtime.ReadIndex([]byte("before-proposal")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.Propose(command); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("proposal across ReadIndex barrier = %v", err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.ProposeConfChange(change); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.Propose(command); !errors.Is(err, raftmodel.ErrReadyPending) {
+		t.Fatalf("proposal across configuration barrier = %v", err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+}
+
+func TestRuntimeProposalBatchByteLimitIsExact(t *testing.T) {
+	fixture := newRuntimeFixture(t, 222, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	command := testApplySessionOpen(fixture.base)
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.proposalBatchBytes = raftmodel.MaxProposalBatchBytes - int64(len(command))
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatalf("Propose at exact byte limit = %v", err)
+	}
+	if fixture.runtime.proposalBatchBytes != raftmodel.MaxProposalBatchBytes {
+		t.Fatalf("proposal batch bytes = %d", fixture.runtime.proposalBatchBytes)
+	}
+	if err := fixture.runtime.Propose(command); !errors.Is(err, raftmodel.ErrReadyPending) ||
+		!errors.Is(err, raftmodel.ErrAdmissionBound) {
+		t.Fatalf("Propose beyond byte limit = %v", err)
+	}
+	if fixture.runtime.proposalBatchEntries != 2 ||
+		fixture.runtime.proposalBatchBytes != raftmodel.MaxProposalBatchBytes {
+		t.Fatalf(
+			"proposal counters changed on refusal = %d/%d",
+			fixture.runtime.proposalBatchEntries, fixture.runtime.proposalBatchBytes,
+		)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+}
+
+func TestRuntimeOversizedFirstProposalOccupiesBatchAlone(t *testing.T) {
+	fixture := newRuntimeFixture(t, 223, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
+
+	key, ok := orderedkey.AppendJSONString(nil, []byte(`"large"`), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode oversized proposal key")
+	}
+	document := make([]byte, 0, int(raftmodel.MaxProposalBatchBytes)+64)
+	document = append(document, []byte(`{"id":"large","value":"`)...)
+	document = append(document, bytes.Repeat([]byte{'x'}, int(raftmodel.MaxProposalBatchBytes))...)
+	document = append(document, '"', '}')
+	command := testApplyCommand(fixture.base, epoch, 2, key, document)
+	if len(command) <= int(raftmodel.MaxProposalBatchBytes) || len(command) > raftmodel.MaxProposalBytes {
+		t.Fatalf("oversized command bytes = %d", len(command))
+	}
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatalf("Propose(oversized first) = %v", err)
+	}
+	if fixture.runtime.proposalBatchEntries != 1 ||
+		fixture.runtime.proposalBatchBytes != int64(len(command)) {
+		t.Fatalf(
+			"oversized proposal counters = %d/%d",
+			fixture.runtime.proposalBatchEntries, fixture.runtime.proposalBatchBytes,
+		)
+	}
+	if err := fixture.runtime.Propose(command); !errors.Is(err, raftmodel.ErrReadyPending) ||
+		!errors.Is(err, raftmodel.ErrAdmissionBound) {
+		t.Fatalf("second proposal after oversized first = %v", err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+}
+
+func TestRuntimeFailureClearsProposalBatchCounters(t *testing.T) {
+	runtime := &Runtime{
+		proposalBatchEntries: raftmodel.MaxProposalBatchEntries,
+		proposalBatchBytes:   raftmodel.MaxProposalBatchBytes,
+	}
+	if err := runtime.fail(raftmodel.ErrAdmissionBound); !errors.Is(err, ErrRuntimeFailed) {
+		t.Fatalf("fail() = %v", err)
+	}
+	if runtime.proposalBatchEntries != 0 || runtime.proposalBatchBytes != 0 {
+		t.Fatalf(
+			"failed proposal counters = %d/%d",
+			runtime.proposalBatchEntries, runtime.proposalBatchBytes,
+		)
 	}
 }
 

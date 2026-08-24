@@ -10,7 +10,10 @@ catalog file.
 
 The shipped commands do not start Raft replication. One `vibedb-shard` process
 serves one local store with one static ownership identity. The Raft and
-replicated-state packages are a separate non-serving kernel.
+replicated-state packages are a separate non-serving kernel. That kernel can
+coalesce a currently queued normal-proposal prefix into one `Ready` under
+fixed entry and byte targets, but still has no serving result waiters,
+committed-entry apply batch, or outbound-frame batch.
 
 ## Build the commands
 

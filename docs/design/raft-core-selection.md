@@ -62,9 +62,16 @@ The repository does not provide these components:
 `internal/multiraft.Host` is a single-owner synchronous scheduler. It has no
 goroutine, wall clock, socket, or client-serving API.
 
-`RunOne` does one bounded unit of work. Ready work has priority. Input classes
-and runnable groups use round-robin fairness. Idle groups leave the runnable
-queue.
+`RunOne` does one bounded unit of work. Ready work has priority. A proposal
+unit admits only the currently queued prefix, capped at 64 entries and a 1 MiB
+multi-entry coalescing target, before the next group turn captures one `Ready`.
+A valid 1–16 MiB proposal occupies its turn alone. The 64 MiB uncaptured-input
+limit remains an independent safety ceiling, not a scheduler fairness budget.
+The scheduler never waits for another proposal and exposes no batching clock,
+so it adds no wall-clock hold. Configuration changes and read barriers require
+an empty input window, so they cannot cross a normal-proposal batch. Input
+classes and runnable groups use round-robin fairness. Idle groups leave the
+runnable queue.
 
 Hard maxima include 4096 groups, 65,536 global queue items, 4096 items per
 group, and 1 GiB of global queue and outbox bytes.
