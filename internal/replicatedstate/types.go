@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -30,6 +31,8 @@ const (
 	ResultSessionOpened     uint32 = 8
 	ResultSessionRenewed    uint32 = 9
 	ResultSessionRevoked    uint32 = 10
+	ResultUnknownRelation   uint32 = 11
+	ResultIndexConflict     uint32 = 12
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf
@@ -212,12 +215,13 @@ type CollectionTarget struct {
 
 // UserCollection is the single logical collection owned by a Machine.
 type UserCollection struct {
-	Name   string
-	Target CollectionTarget
+	Name         string
+	Target       CollectionTarget
+	LocalIndexes []store.IndexDefinition
 }
 
 func (t CollectionTarget) validate() error {
-	if t.Collection == nil || t.Collection.HasSchema() || t.Collection.HasIndexes() ||
+	if t.Collection == nil || t.Collection.HasSchema() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() {
 		return ErrSchemaProfile
 	}
@@ -308,5 +312,5 @@ func isSessionTerminalResult(code uint32) bool {
 }
 
 func isSessionResultCode(code uint32) bool {
-	return code >= ResultApplied && code <= ResultSessionRevoked
+	return code >= ResultApplied && code <= ResultIndexConflict
 }

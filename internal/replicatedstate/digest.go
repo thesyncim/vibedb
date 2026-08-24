@@ -8,6 +8,7 @@ import (
 	"hash"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -22,6 +23,16 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
 	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
 
+// deterministicBundleApplySemantics extends, but never changes, the legacy
+// singleton contract above. Bundle-only relation and compare behavior must be
+// authenticated independently so adding the vertical slice cannot alter an
+// already-persisted singleton ApplyContractDigest.
+const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
+	"one-checkpoint-group-publication;all-relations-or-none;" +
+	"global-put-absent-or-vibejson-semantic-equal;" +
+	"global-delete-raw-length-and-sha256-equal;" +
+	"global-duplicate-key-conflict;byte-native-global-locator-array"
+
 var (
 	canonicalImageDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
 	dataChainSeedDigestDomain  = []byte("vibedb/replicated-state/data-chain-seed\x00")
@@ -29,6 +40,7 @@ var (
 	applyContractDigestDomain  = []byte("vibedb/replicated-state/apply-contract\x00")
 	dataChainMarkers           = [2][1]byte{{0}, {1}}
 	applySemanticsDigest       = sha256.Sum256([]byte(deterministicApplySemantics))
+	bundleApplySemanticsDigest = sha256.Sum256([]byte(deterministicBundleApplySemantics))
 )
 
 type finalMutation struct {
@@ -360,6 +372,62 @@ func applyContractDigest(
 	binary.LittleEndian.PutUint64(fixed[42:50], MaxSessionRetryWindow)
 	_, _ = h.Write(fixed[:])
 	var result [32]byte
+	_ = h.Sum(result[:0])
+	return result, nil
+}
+
+func bundleApplyContractDigest(
+	manifest [sha256.Size]byte,
+	relations []relationCollection,
+	maxSessions uint64,
+	retryWindow uint16,
+) ([sha256.Size]byte, error) {
+	if len(relations) == 1 && relations[0].kind == RelationJSON &&
+		len(relations[0].localIndexes) == 0 {
+		return applyContractDigest(
+			relations[0].name, relations[0].target, maxSessions, retryWindow,
+		)
+	}
+	if manifest == ([sha256.Size]byte{}) || len(relations) == 0 ||
+		maxSessions == 0 || retryWindow == 0 {
+		return [sha256.Size]byte{}, ErrInvalidCollection
+	}
+	h := sha256.New()
+	_, _ = h.Write(applyContractDigestDomain)
+	_, _ = h.Write(manifest[:])
+	_, _ = h.Write(applySemanticsDigest[:])
+	_, _ = h.Write(bundleApplySemanticsDigest[:])
+	var grammar [2 + 18*4]byte
+	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
+	for index, code := range [...]uint32{
+		ResultApplied,
+		ResultStaleFence,
+		ResultUnknownCollection,
+		ResultInvalidDocument,
+		ResultTargetBound,
+		ResultWrongShard,
+		ResultSessionRetired,
+		ResultSessionOpened,
+		ResultSessionRenewed,
+		ResultSessionRevoked,
+		ResultUnknownRelation,
+		ResultIndexConflict,
+		MaxDistinctMutations,
+		uint32(replication.MutationPut),
+		uint32(replication.MutationDelete),
+		uint32(replication.MutationPutAbsentOrEqual),
+		uint32(replication.MutationDeleteDigestEqual),
+		replication.MutationDigestCompareBytes,
+	} {
+		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)
+	}
+	_, _ = h.Write(grammar[:])
+	var fixed [18]byte
+	binary.LittleEndian.PutUint64(fixed[0:8], maxSessions)
+	binary.LittleEndian.PutUint16(fixed[8:10], retryWindow)
+	binary.LittleEndian.PutUint64(fixed[10:18], MaxSessionRetryWindow)
+	_, _ = h.Write(fixed[:])
+	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result, nil
 }

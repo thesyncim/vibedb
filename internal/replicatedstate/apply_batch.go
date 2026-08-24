@@ -114,7 +114,7 @@ func (m *Machine) ApplyNormalBatch(
 		}
 		totalBytes += len(entries[i].Data)
 	}
-	if m.checkpointGroup == nil || m.capture != nil {
+	if m.checkpointGroup == nil || m.capture != nil || len(m.relations) != 1 {
 		return 0, raftmodel.Publication{}, nil
 	}
 	first := entries[0]
@@ -130,10 +130,11 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, nil
 	}
 
-	cut, systemSnapshot, userSnapshot, err := m.captureApplyCutLocked()
+	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
 	if err != nil {
 		return 0, raftmodel.Publication{}, m.fail(err)
 	}
+	userSnapshot := relationSnapshots.values[0].value
 	batch := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 	defer func() {
 		telemetry := normalBatchTelemetry{
@@ -160,7 +161,7 @@ func (m *Machine) ApplyNormalBatch(
 		if stateErr == nil {
 			stateErr = ErrStateCorrupt
 		}
-		return 0, raftmodel.Publication{}, m.fail(errors.Join(stateErr, cut.Close()))
+		return 0, raftmodel.Publication{}, m.fail(errors.Join(stateErr, m.applyCut.Close()))
 	}
 	stateEnvelopeBytes := len(batch.state)
 	batch.state = batch.state[:0]
@@ -277,7 +278,7 @@ func (m *Machine) ApplyNormalBatch(
 			finalizeErr = ErrAdmissionBound
 		}
 	}
-	closeErr := cut.Close()
+	closeErr := m.applyCut.Close()
 	if finalizeErr != nil || closeErr != nil {
 		clear(dataChainWitnesses[:planned])
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(finalizeErr, closeErr))

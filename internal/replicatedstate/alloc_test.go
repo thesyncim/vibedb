@@ -20,7 +20,31 @@ var (
 	codecErrSink     error
 	artifactSink     SnapshotArtifactManifest
 	artifactByteSink int
+	codecBoolSink    bool
 )
+
+func TestGlobalIndexLocatorComparisonAllocatesZero(t *testing.T) {
+	left := []byte(`["doc\u002d1",1.00]`)
+	right := []byte(`["doc-1",1e0]`)
+	if !globalIndexLocatorsEqual(left, right, 2) {
+		t.Fatal("semantically equal byte-distinct locator rejected")
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		codecBoolSink = globalIndexLocatorsEqual(left, right, 2)
+	}); allocations != 0 {
+		t.Fatalf("global locator semantic equality allocations = %v, want 0", allocations)
+	}
+}
+
+func BenchmarkGlobalIndexLocatorSemanticEquality(b *testing.B) {
+	left := []byte(`["doc\u002d1",1.00]`)
+	right := []byte(`["doc-1",1e0]`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(left) + len(right)))
+	for b.Loop() {
+		codecBoolSink = globalIndexLocatorsEqual(left, right, 2)
+	}
+}
 
 func TestSessionCodecAllocationBounds(t *testing.T) {
 	record := sessionCodecRecord()

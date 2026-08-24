@@ -1,7 +1,9 @@
 package driver
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	stdsql "database/sql"
 	"encoding/json"
 	"errors"
@@ -1128,11 +1130,6 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"index", func(t *testing.T, session *Session) {
-			if err := testRuntimeExec(session, `CREATE INDEX by_id ON docs (id)`, nil); err != nil {
-				t.Fatal(err)
-			}
-		}},
 		{"view", func(t *testing.T, session *Session) {
 			if err := testRuntimeExec(session, `CREATE VIEW selected AS SELECT id FROM docs`, nil); err != nil {
 				t.Fatal(err)
@@ -1248,6 +1245,15 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, extension := range [][]byte{
+		[]byte(`"relation_schema_generation"`),
+		[]byte(`"relation_manifest_digest"`),
+		[]byte(`"relations"`),
+	} {
+		if bytes.Contains(raw, extension) {
+			t.Fatalf("legacy singleton identity acquired bundle field %s: %s", extension, raw)
+		}
+	}
 	if err := json.Unmarshal(raw, new(ReplicatedShardStoreIdentity)); err != nil {
 		t.Fatalf("valid decode: %v", err)
 	}
@@ -1294,6 +1300,113 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 	reserved.MemberID = ^uint64(0)
 	if err := validateReplicatedShardStoreBinding(reserved); err == nil {
 		t.Fatal("accepted reserved local-message member id")
+	}
+}
+
+func TestReplicatedShardRelationManifestCanonicalRoundTripAndRejection(t *testing.T) {
+	identity := ReplicatedShardStoreIdentity{
+		Format: ReplicatedShardStoreFormat, Binding: testReplicatedBinding(78),
+		LogID: [16]byte{0xac, 1}, UserTable: "docs",
+		UserStorage: strings.Repeat("a", storageIdentityBytes*2), UserPrimaryKey: "/id",
+		UserLimits: ReplicatedShardStoreLimits{
+			MaxKeyBytes: replicatedMaxKeyBytes, MaxDocumentBytes: replicatedMaxDocumentBytes,
+			MaxBatchDocuments: replicatedMaxDistinctMutations, MaxBatchBytes: replicatedMaxBatchBytes,
+		},
+		Sidecars: canonicalReplicatedShardStoreSidecars(), RelationCount: 2,
+	}
+	identity.RelationSchemaGeneration = identity.Binding.Authority.SchemaGeneration
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+		LocalIndexDigest: sha256.Sum256([]byte("by_email:/email")),
+	}
+	identity.Relations[1] = ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+		Table: "email_claims", Storage: strings.Repeat("b", storageIdentityBytes*2),
+		Limits: identity.UserLimits, IndexID: 41, Incarnation: 7,
+		LocatorCount: 1, Unique: true,
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
+	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
+	logicalManifest := replicatedRelationApplyManifestDigest(identity)
+	otherReplica := identity
+	otherReplica.UserStorage = strings.Repeat("c", storageIdentityBytes*2)
+	otherReplica.Relations[0].Storage = otherReplica.UserStorage
+	otherReplica.Relations[1].Storage = strings.Repeat("d", storageIdentityBytes*2)
+	otherReplica.RelationManifestDigest = replicatedRelationManifestDigest(otherReplica)
+	if otherReplica.RelationManifestDigest == identity.RelationManifestDigest ||
+		replicatedRelationApplyManifestDigest(otherReplica) != logicalManifest {
+		t.Fatal("replica-local storage identity leaked into the portable apply manifest")
+	}
+	placement := testReplicatedApplyOptions().Placement
+	if replicatedApplyProfileDigest(identity, placement) !=
+		replicatedApplyProfileDigest(otherReplica, placement) ||
+		replicatedGlobalIndexValidationDigest(
+			identity, identity.Relations[1], logicalManifest,
+		) != replicatedGlobalIndexValidationDigest(
+			otherReplica, otherReplica.Relations[1], logicalManifest,
+		) {
+		t.Fatal("replica-local storage identity changed a replicated validation contract")
+	}
+	otherSchema := identity
+	otherSchema.Relations[1].IndexID++
+	otherSchema.RelationManifestDigest = replicatedRelationManifestDigest(otherSchema)
+	if replicatedRelationApplyManifestDigest(otherSchema) == logicalManifest {
+		t.Fatal("logical global-index identity was omitted from the portable apply manifest")
+	}
+	raw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ReplicatedShardStoreIdentity
+	if err := json.Unmarshal(raw, &decoded); err != nil || decoded != identity {
+		t.Fatalf("round trip = %+v, %v", decoded, err)
+	}
+	if reencoded, err := json.Marshal(decoded); err != nil || !bytes.Equal(reencoded, raw) {
+		t.Fatalf("canonical re-encode differs: %s, %v", reencoded, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*ReplicatedShardStoreIdentity)
+	}{
+		{"reordered", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations[0], i.Relations[1] = i.Relations[1], i.Relations[0]
+		}},
+		{"duplicate", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations[1].Table = i.Relations[0].Table
+		}},
+		{"sparse", func(i *ReplicatedShardStoreIdentity) { i.Relations[1].Relation = 3 }},
+		{"schema_generation", func(i *ReplicatedShardStoreIdentity) {
+			i.RelationSchemaGeneration++
+		}},
+		{"digest", func(i *ReplicatedShardStoreIdentity) { i.RelationManifestDigest[0] ^= 1 }},
+		{"trailing", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations[2] = ReplicatedShardRelationIdentity{Relation: 3}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := identity
+			test.mutate(&candidate)
+			if err := validateReplicatedShardStoreIdentity(candidate); err == nil {
+				t.Fatal("accepted malformed relation manifest")
+			}
+		})
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "relation_manifest_digest")
+	partial, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(partial, new(ReplicatedShardStoreIdentity)); err == nil {
+		t.Fatal("accepted partial relation-manifest extension")
 	}
 }
 

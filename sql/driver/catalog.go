@@ -1538,11 +1538,22 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	}
 	if catalog.ReplicatedShardStore != nil {
 		r := catalog.ReplicatedShardStore
+		relationBytes := 0
+		for ordinal := 0; ordinal < int(r.RelationCount); ordinal++ {
+			relation := r.Relations[ordinal]
+			part := encodedJSONStringBytes(relation.Table) +
+				encodedJSONStringBytes(relation.Storage) + 1024
+			if part < 0 || relationBytes > maxCatalogBytes-part {
+				relationBytes = maxCatalogBytes + 1
+				break
+			}
+			relationBytes += part
+		}
 		if !add(encodedJSONStringBytes(r.Binding.Distribution) +
 			encodedJSONStringBytes(r.Binding.Shard) +
 			encodedJSONStringBytes(r.UserTable) +
 			encodedJSONStringBytes(r.UserStorage) +
-			encodedJSONStringBytes(r.UserPrimaryKey) + 4096) {
+			encodedJSONStringBytes(r.UserPrimaryKey) + relationBytes + 4096) {
 			return size, catalogSizeError(size)
 		}
 	}

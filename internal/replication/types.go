@@ -48,18 +48,20 @@ const (
 	MaxMutationKeyBytes   = 256
 	MaxMutationValueBytes = 4 << 20
 
-	commandHeaderBytes        = 256
-	completionHeaderBytes     = 288
-	envelopeChecksumBytes     = 8
-	mutationHeaderBytes       = 8
-	relationBatchHeaderBytes  = 8
-	commandWireMutationBatch  = uint8(1)
-	commandWireSessionRetire  = uint8(2)
-	commandWireSessionRelease = uint8(3)
-	commandWireSessionOpen    = uint8(4)
-	commandWireSessionRenew   = uint8(5)
-	commandWireSessionRevoke  = uint8(6)
-	sessionLeaseBodyBytes     = 16
+	commandHeaderBytes         = 256
+	completionHeaderBytes      = 288
+	envelopeChecksumBytes      = 8
+	mutationHeaderBytes        = 8
+	MutationDigestCompareBytes = 8 + 32
+	mutationDigestCompareBytes = MutationDigestCompareBytes
+	relationBatchHeaderBytes   = 8
+	commandWireMutationBatch   = uint8(1)
+	commandWireSessionRetire   = uint8(2)
+	commandWireSessionRelease  = uint8(3)
+	commandWireSessionOpen     = uint8(4)
+	commandWireSessionRenew    = uint8(5)
+	commandWireSessionRevoke   = uint8(6)
+	sessionLeaseBodyBytes      = 16
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -112,8 +114,10 @@ const (
 type MutationKind uint8
 
 const (
-	MutationPut    MutationKind = 1
-	MutationDelete MutationKind = 2
+	MutationPut               MutationKind = 1
+	MutationDelete            MutationKind = 2
+	MutationPutAbsentOrEqual  MutationKind = 3
+	MutationDeleteDigestEqual MutationKind = 4
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed
@@ -123,6 +127,13 @@ type Mutation struct {
 	Kind  MutationKind
 	Key   []byte
 	Value []byte
+
+	// ExpectedValueLength and ExpectedValueDigest are populated only by
+	// MutationDeleteDigestEqual. The closed compare operation makes a stale
+	// global-index delete deterministic without carrying or decoding another
+	// JSON value. Ordinary Put/Delete wire bytes remain unchanged.
+	ExpectedValueLength uint64
+	ExpectedValueDigest Digest
 }
 
 // RelationMutationBatch is one nonempty, caller-owned mutation sequence for a

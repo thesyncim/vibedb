@@ -136,8 +136,8 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 		edit func(*replication.Command)
 	}{
 		{"applied", ResultApplied, func(*replication.Command) {}},
-		{"unknown relation", ResultUnknownCollection, func(c *replication.Command) { c.Batches[0].Relation = 2 }},
-		{"multiple relations", ResultUnknownCollection, func(c *replication.Command) {
+		{"single unknown relation", ResultUnknownCollection, func(c *replication.Command) { c.Batches[0].Relation = 2 }},
+		{"bundle grammar on singleton unknown relation", ResultUnknownCollection, func(c *replication.Command) {
 			c.Batches = append(c.Batches, replication.RelationMutationBatch{
 				Relation:  2,
 				Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("other")}},

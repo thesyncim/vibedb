@@ -2,6 +2,7 @@ package replication
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -327,6 +328,87 @@ func TestMultiRelationCommandRoundTripPreservesBatchAndMutationOrdinals(t *testi
 	}
 	if relations.Next() {
 		t.Fatal("relation iterator exposed a trailing batch")
+	}
+}
+
+func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
+	deletedValue := []byte(`["document-1",1.0]`)
+	deletedDigest := Digest(sha256.Sum256(deletedValue))
+	command := testCommand()
+	command.Batches = []RelationMutationBatch{
+		{Relation: 1, Mutations: []Mutation{{
+			Kind: MutationPutAbsentOrEqual, Key: []byte("unique-key"),
+			Value: []byte(`["document\u002d1",1e0]`),
+		}}},
+		{Relation: 2, Mutations: []Mutation{{
+			Kind: MutationDeleteDigestEqual, Key: []byte("stale-safe-key"),
+			ExpectedValueLength: uint64(len(deletedValue)),
+			ExpectedValueDigest: deletedDigest,
+		}}},
+	}
+	encoded := encodeCommand(t, command)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decoded := command
+	decoded.Batches = make([]RelationMutationBatch, 0, view.RelationCount())
+	relations := view.RelationBatches()
+	for relations.Next() {
+		batchView := relations.Batch()
+		batch := RelationMutationBatch{
+			Relation:  batchView.Relation,
+			Mutations: make([]Mutation, 0, batchView.MutationCount()),
+		}
+		mutations := batchView.Mutations()
+		for mutations.Next() {
+			mutation := mutations.Mutation()
+			if len(mutation.Key) != cap(mutation.Key) ||
+				len(mutation.Value) != cap(mutation.Value) ||
+				len(mutation.Compare) != cap(mutation.Compare) {
+				t.Fatal("borrowed mutation fields are not capacity-clamped")
+			}
+			switch mutation.Kind {
+			case MutationPutAbsentOrEqual:
+				if len(mutation.Compare) != 0 || mutation.ExpectedValueLength != 0 ||
+					mutation.ExpectedValueDigest != (Digest{}) {
+					t.Fatalf("put-absent compare fields = %+v", mutation)
+				}
+			case MutationDeleteDigestEqual:
+				if len(mutation.Value) != 0 || len(mutation.Compare) != MutationDigestCompareBytes ||
+					mutation.ExpectedValueLength != uint64(len(deletedValue)) ||
+					mutation.ExpectedValueDigest != deletedDigest ||
+					binary.LittleEndian.Uint64(mutation.Compare[:8]) != uint64(len(deletedValue)) ||
+					!bytes.Equal(mutation.Compare[8:], deletedDigest[:]) {
+					t.Fatalf("delete compare fields = %+v", mutation)
+				}
+			default:
+				t.Fatalf("unexpected mutation kind %d", mutation.Kind)
+			}
+			batch.Mutations = append(batch.Mutations, Mutation{
+				Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+				ExpectedValueLength: mutation.ExpectedValueLength,
+				ExpectedValueDigest: mutation.ExpectedValueDigest,
+			})
+		}
+		decoded.Batches = append(decoded.Batches, batch)
+	}
+	reencoded := encodeCommand(t, decoded)
+	if !bytes.Equal(reencoded, encoded) {
+		t.Fatal("decode and re-encode did not preserve the unique canonical bytes")
+	}
+
+	sameDigestDifferentLength := command
+	sameDigestDifferentLength.Batches = append(
+		[]RelationMutationBatch(nil), command.Batches...,
+	)
+	sameDigestDifferentLength.Batches[1].Mutations = append(
+		[]Mutation(nil), command.Batches[1].Mutations...,
+	)
+	sameDigestDifferentLength.Batches[1].Mutations[0].ExpectedValueLength++
+	if bytes.Equal(encodeCommand(t, sameDigestDifferentLength), encoded) {
+		t.Fatal("delete compare framing did not bind expected value length")
 	}
 }
 
@@ -849,6 +931,43 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 		{"empty_put", func(c *Command) { c.Batches[0].Mutations[0].Value = nil }, ErrEnvelopeSemantic},
 		{"long_value", func(c *Command) { c.Batches[0].Mutations[0].Value = make([]byte, MaxMutationValueBytes+1) }, ErrEnvelopeSemantic},
 		{"delete_value", func(c *Command) { c.Batches[0].Mutations[1].Value = []byte("x") }, ErrEnvelopeSemantic},
+		{"put_absent_empty", func(c *Command) {
+			c.Batches[0].Mutations[0].Kind = MutationPutAbsentOrEqual
+			c.Batches[0].Mutations[0].Value = nil
+		}, ErrEnvelopeSemantic},
+		{"put_absent_delete_compare", func(c *Command) {
+			m := &c.Batches[0].Mutations[0]
+			m.Kind = MutationPutAbsentOrEqual
+			m.ExpectedValueLength = 1
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"ordinary_put_delete_compare", func(c *Command) {
+			m := &c.Batches[0].Mutations[0]
+			m.ExpectedValueLength = 1
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"conditional_delete_value", func(c *Command) {
+			m := &c.Batches[0].Mutations[0]
+			m.Kind = MutationDeleteDigestEqual
+			m.ExpectedValueLength = 1
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"conditional_delete_zero_length", func(c *Command) {
+			m := &c.Batches[0].Mutations[1]
+			m.Kind = MutationDeleteDigestEqual
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"conditional_delete_long_length", func(c *Command) {
+			m := &c.Batches[0].Mutations[1]
+			m.Kind = MutationDeleteDigestEqual
+			m.ExpectedValueLength = MaxMutationValueBytes + 1
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"conditional_delete_zero_digest", func(c *Command) {
+			m := &c.Batches[0].Mutations[1]
+			m.Kind = MutationDeleteDigestEqual
+			m.ExpectedValueLength = 1
+		}, ErrEnvelopeSemantic},
 		{"unknown_kind", func(c *Command) { c.Batches[0].Mutations[0].Kind = 99 }, ErrEnvelopeSemantic},
 	}
 	for _, tc := range tests {
@@ -1100,6 +1219,64 @@ func TestCommandDecodeRejectsDamageAndSemanticCorruption(t *testing.T) {
 			sealEnvelope(candidate)
 			if _, err := OpenCommand(candidate); !errors.Is(err, tc.want) {
 				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestConditionalDeleteDecodeRejectsNoncanonicalCompareFraming(t *testing.T) {
+	command := testCommand()
+	command.Batches[0].Mutations = []Mutation{{
+		Kind: MutationDeleteDigestEqual, Key: []byte("global-key"),
+		ExpectedValueLength: 17, ExpectedValueDigest: testDigest(0x41),
+	}}
+	valid := encodeCommand(t, command)
+	mutation := commandPayloadOffset(valid)
+	valueStart := mutation + mutationHeaderBytes + len(command.Batches[0].Mutations[0].Key)
+	valueEnd := valueStart + MutationDigestCompareBytes
+	if valueEnd != len(valid)-envelopeChecksumBytes {
+		t.Fatal("conditional compare is not the complete singleton mutation payload")
+	}
+
+	reframe := func(valueBytes int) []byte {
+		t.Helper()
+		candidate := make([]byte, len(valid)+valueBytes-MutationDigestCompareBytes)
+		copy(candidate[:valueStart], valid[:valueStart])
+		copied := min(valueBytes, MutationDigestCompareBytes)
+		copy(candidate[valueStart:valueStart+copied], valid[valueStart:valueStart+copied])
+		copy(candidate[valueStart+valueBytes:], valid[valueEnd:])
+		binary.LittleEndian.PutUint32(candidate[16:20], uint32(len(candidate)))
+		binary.LittleEndian.PutUint32(
+			candidate[20:24], uint32(len(candidate)-commandHeaderBytes-envelopeChecksumBytes),
+		)
+		binary.LittleEndian.PutUint32(candidate[mutation+4:mutation+8], uint32(valueBytes))
+		sealEnvelope(candidate)
+		return candidate
+	}
+	for _, valueBytes := range []int{MutationDigestCompareBytes - 1, MutationDigestCompareBytes + 1} {
+		if _, err := OpenCommand(reframe(valueBytes)); !errors.Is(err, ErrEnvelopeSemantic) {
+			t.Fatalf("compare bytes %d error = %v, want %v",
+				valueBytes, err, ErrEnvelopeSemantic)
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{"zero_expected_length", func(b []byte) { clear(b[valueStart : valueStart+8]) }},
+		{"oversized_expected_length", func(b []byte) {
+			binary.LittleEndian.PutUint64(b[valueStart:valueStart+8], MaxMutationValueBytes+1)
+		}},
+		{"zero_expected_digest", func(b []byte) { clear(b[valueStart+8 : valueEnd]) }},
+		{"reserved_mutation_header", func(b []byte) { b[mutation+1] = 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := append([]byte(nil), valid...)
+			tc.mutate(candidate)
+			sealEnvelope(candidate)
+			if _, err := OpenCommand(candidate); !errors.Is(err, ErrEnvelopeSemantic) {
+				t.Fatalf("error = %v, want %v", err, ErrEnvelopeSemantic)
 			}
 		})
 	}

@@ -244,6 +244,12 @@ func (c *SnapshotArtifactCursor) PrefixManifest() SnapshotArtifactManifest {
 type SnapshotArtifactManifest struct {
 	State          State
 	UserCollection []byte
+	// Bundle identifies a compact certificate over one coherent fixed relation
+	// set. Bundle certificates carry no streamed-artifact geometry; each
+	// relation image is authenticated below and remains in its durable file.
+	Bundle                 bool
+	RelationManifestDigest [sha256.Size]byte
+	Relations              []SnapshotArtifactRelation
 	// Seeded distinguishes a compact no-copy snapshot-base manifest from a
 	// streamed artifact manifest. Seeded manifests carry no artifact geometry;
 	// they bind the already durable user image directly.
@@ -260,6 +266,17 @@ type SnapshotArtifactManifest struct {
 	// artifact's user rows are already being streamed.
 	ImageDigest [sha256.Size]byte
 	Digest      [sha256.Size]byte
+}
+
+// SnapshotArtifactRelation is one dense relation image committed by a compact
+// bundle certificate. Collection is detached cold metadata. Apply never
+// resolves it; Relation addresses the already-opened handle.
+type SnapshotArtifactRelation struct {
+	Relation    replication.RelationID
+	Kind        RelationKind
+	Collection  []byte
+	Rows        uint64
+	ImageDigest [sha256.Size]byte
 }
 
 type snapshotArtifactWriter struct {
@@ -844,6 +861,8 @@ func ContinueSnapshotArtifact(
 
 func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	if cursor == nil || cursor.encodedBytes == 0 ||
+		cursor.manifest.Bundle || len(cursor.manifest.Relations) != 0 ||
+		cursor.manifest.RelationManifestDigest != ([sha256.Size]byte{}) ||
 		cursor.nextSequence != cursor.manifest.Chunks ||
 		cursor.previousDigest != cursor.manifest.LastChunkDigest ||
 		cursor.manifest.ImageDigest != ([sha256.Size]byte{}) ||
@@ -904,6 +923,10 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 func cloneSnapshotArtifactManifest(manifest SnapshotArtifactManifest) SnapshotArtifactManifest {
 	manifest.State = cloneState(manifest.State)
 	manifest.UserCollection = bytes.Clone(manifest.UserCollection)
+	manifest.Relations = append([]SnapshotArtifactRelation(nil), manifest.Relations...)
+	for i := range manifest.Relations {
+		manifest.Relations[i].Collection = bytes.Clone(manifest.Relations[i].Collection)
+	}
 	return manifest
 }
 

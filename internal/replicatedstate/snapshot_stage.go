@@ -301,7 +301,8 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 
 func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	if err := validateState(expected.State); err != nil ||
-		expected.Seeded ||
+		expected.Seeded || expected.Bundle || len(expected.Relations) != 0 ||
+		expected.RelationManifestDigest != ([32]byte{}) ||
 		len(expected.UserCollection) == 0 ||
 		len(expected.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(expected.UserCollection) || bytes.IndexByte(expected.UserCollection, 0) >= 0 ||
@@ -355,9 +356,23 @@ func snapshotArtifactPrefixMatchesExpected(
 }
 
 func equalSnapshotArtifactManifest(left, right SnapshotArtifactManifest) bool {
-	return equalState(left.State, right.State) &&
-		bytes.Equal(left.UserCollection, right.UserCollection) &&
-		left.Seeded == right.Seeded &&
+	if !equalState(left.State, right.State) ||
+		!bytes.Equal(left.UserCollection, right.UserCollection) ||
+		left.Bundle != right.Bundle ||
+		left.RelationManifestDigest != right.RelationManifestDigest ||
+		len(left.Relations) != len(right.Relations) {
+		return false
+	}
+	for i := range left.Relations {
+		if left.Relations[i].Relation != right.Relations[i].Relation ||
+			left.Relations[i].Kind != right.Relations[i].Kind ||
+			!bytes.Equal(left.Relations[i].Collection, right.Relations[i].Collection) ||
+			left.Relations[i].Rows != right.Relations[i].Rows ||
+			left.Relations[i].ImageDigest != right.Relations[i].ImageDigest {
+			return false
+		}
+	}
+	return left.Seeded == right.Seeded &&
 		left.TargetChunkBytes == right.TargetChunkBytes &&
 		left.Chunks == right.Chunks && left.SystemRows == right.SystemRows &&
 		left.UserRows == right.UserRows && left.PayloadBytes == right.PayloadBytes &&
