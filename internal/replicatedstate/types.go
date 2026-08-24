@@ -54,6 +54,7 @@ var (
 	ErrStateCorrupt                = errors.New("replicatedstate: corrupt state record")
 	ErrCompletionCorrupt           = errors.New("replicatedstate: corrupt completion record")
 	ErrCompletionNotFound          = errors.New("replicatedstate: completion not found")
+	ErrCompletionBufferSmall       = errors.New("replicatedstate: completion destination is too small")
 	ErrRetryRetired                = errors.New("replicatedstate: retry is outside the retained session window")
 	ErrRequestConflict             = errors.New("replicatedstate: client sequence conflicts with retained command")
 	ErrSessionEpoch                = errors.New("replicatedstate: invalid client session epoch")

@@ -458,15 +458,28 @@ exact system and user mutation budgets. The 128-entry node workspace is a hard
 ceiling, not a guarantee that every persisted profile can publish 128
 independent-session commands. Each published prefix creates a synchronous
 result settlement gate before the runtime can release read states or advance
-the `Ready`. The current non-serving Host supplies an explicit no-local-waiters
-sink. The kernel does not have a serving proposal-waiter registry. Outbound
-messages are still retained as individual frames.
+the `Ready`. The default non-serving Host supplies an explicit no-local-waiters
+sink. An internal bounded waiter registry can instead inject proposal-lifecycle
+and result-settlement sinks. It validates canonical commands before Host
+enqueue, coalesces only exact attempt identities, and publishes owned results
+only after deterministic apply. Its applied-range source authority comes from
+the synchronous Host and Runtime boundary. The registry does not independently
+authenticate an untrusted applied-range source. Outbound messages are still
+retained as individual frames.
+
+Wait cancellation releases only local waiter ownership. An admitted attempt
+remains bounded until deterministic apply or a Host-observed leadership,
+fault, removal, or close boundary makes it retryable as an infrastructure
+outcome. A leader that stays live without quorum has no time-based abandonment
+policy in this non-serving safe point. A serving gateway still needs a
+leader-and-quorum lease policy around request deadlines.
 
 The kernel has no production peer listener, address discovery, certificate
-operations, snapshot-transfer service, or serving integration. The internal
-transport foundation can derive the exact binary peer identity and cluster
-trust domain from a supplied raw mutual TLS connection. The shipped commands
-do not construct it.
+operations, snapshot-transfer service, gateway serving integration, or request
+authentication. The internal transport foundation can derive the exact binary
+peer identity and cluster trust domain from a supplied raw mutual TLS
+connection. The shipped commands do not construct it. The internal waiter
+registry alone does not make this a served database.
 
 Do not describe this kernel as a turnkey replicated deployment.
 
@@ -485,6 +498,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/raftmodel/node.go`, `internal/raftmember/runtime.go`,
   `internal/multiraft/host.go`, and `internal/replicatedstate/apply_batch.go`
+- `internal/raftserve/identity.go`, `internal/raftserve/registry.go`, and
+  `internal/raftserve/settlement.go`
 - `internal/rangesplit/cutover.go`
 - `internal/rangesplit/stage_image.go` and `activate.go`
 - `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`

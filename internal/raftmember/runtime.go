@@ -32,6 +32,9 @@ var (
 	// ErrResultSettlementRejected marks a retryable settlement sink failure. The
 	// Runtime retains the exact applied range and performs no later Node work.
 	ErrResultSettlementRejected = errors.New("raftmember: applied result settlement rejected")
+	// ErrRetryableResultSettlement identifies the sole sink error class that may
+	// retry the identical applied range. Every unwrapped sink error is terminal.
+	ErrRetryableResultSettlement = errors.New("raftmember: retryable applied result settlement")
 	// ErrReadyWorkspaceRequired reports a result-bearing apply that cannot begin
 	// without the caller-owned bounded batch workspace.
 	ErrReadyWorkspaceRequired = errors.New("raftmember: Ready workspace is required")
@@ -82,10 +85,32 @@ type ReadyWorkspace struct {
 type AppliedBatch struct {
 	normal raftmodel.AppliedNormalBatch
 	apply  *sqldriver.ReplicatedApply
+	source AppliedBatchSource
+}
+
+// AppliedBatchSource is the fixed identity of one applied Ready interval.
+// ReadyID is scoped by the exact local member store and Node incarnation.
+type AppliedBatchSource struct {
+	// Group is the exact GroupKey of the Runtime that published the interval.
+	Group                GroupKey
+	AllocationGeneration uint64
+	MemberID             uint64
+	StoreID              [16]byte
+	NodeIncarnation      uint64
+	ReadyID              uint64
+	FirstIndex           uint64
+	LastIndex            uint64
+	FinalDataChainDigest [32]byte
 }
 
 // Len returns the number of applied normal entries awaiting settlement.
 func (batch AppliedBatch) Len() int { return batch.normal.Len() }
+
+// Group returns the exact logical group whose entries were published.
+func (batch AppliedBatch) Group() GroupKey { return batch.source.Group }
+
+// Source returns the exact local member and applied Ready interval.
+func (batch AppliedBatch) Source() AppliedBatchSource { return batch.source }
 
 // ReadyID identifies the Ready containing the applied range.
 func (batch AppliedBatch) ReadyID() uint64 { return batch.normal.ReadyID() }
@@ -127,11 +152,52 @@ func (batch AppliedBatch) LookupCompletion(
 	return lookup, true, err
 }
 
+// LookupCompletionInto is LookupCompletion with caller-owned result storage.
+func (batch AppliedBatch) LookupCompletionInto(
+	index int,
+	dst []byte,
+) (lookup replicatedstate.CompletionLookup, hasCommand bool, err error) {
+	entry, ok := batch.normal.Entry(index)
+	if !ok {
+		return replicatedstate.CompletionLookup{}, false, errors.New("raftmember: applied result index out of range")
+	}
+	if len(entry.Data) == 0 {
+		return replicatedstate.CompletionLookup{}, false, nil
+	}
+	if batch.apply == nil {
+		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
+	}
+	lookup, err = batch.apply.LookupCompletionInto(entry.Data, dst)
+	return lookup, true, err
+}
+
 // ResultSettlementSink runs synchronously after apply publication and before
-// read-state release or Ready advancement. A failure may be outcome-unknown and
-// retries the identical ReadyID and range, so sinks must be idempotent. A sink
-// must not retain borrowed values or re-enter the Runtime.
+// read-state release or Ready advancement. A sink must not retain borrowed
+// values or re-enter the Runtime. Returning an error is terminal unless it was
+// produced by RetryResultSettlement. A retry receives the identical source and
+// range, so every sink must be idempotent.
 type ResultSettlementSink func(AppliedBatch) error
+
+type retryableResultSettlement struct {
+	cause error
+}
+
+func (failure retryableResultSettlement) Error() string {
+	return failure.cause.Error()
+}
+
+func (failure retryableResultSettlement) Unwrap() []error {
+	return []error{ErrRetryableResultSettlement, failure.cause}
+}
+
+// RetryResultSettlement marks a sink failure whose side effects may be
+// outcome-unknown and whose identical source and range must be retried.
+func RetryResultSettlement(cause error) error {
+	if cause == nil {
+		cause = errors.New("unspecified retryable settlement failure")
+	}
+	return retryableResultSettlement{cause: cause}
+}
 
 // DriveKind identifies the single Ready lifecycle operation performed by one
 // DriveReady call. DriveIdle means no Ready was available and no work occurred.
@@ -733,7 +799,10 @@ func (runtime *Runtime) settleAppliedResults(
 		return DriveResult{}, ErrResultSettlementRequired
 	}
 	if err := settle(batch); err != nil {
-		return DriveResult{}, errors.Join(ErrResultSettlementRejected, err)
+		if errors.Is(err, ErrRetryableResultSettlement) {
+			return DriveResult{}, errors.Join(ErrResultSettlementRejected, err)
+		}
+		return DriveResult{}, runtime.fail(err)
 	}
 	if err := runtime.node.SettleAppliedNormalBatch(batch.normal); err != nil {
 		return DriveResult{}, runtime.fail(err)
@@ -751,7 +820,28 @@ func (runtime *Runtime) pendingAppliedResults() (AppliedBatch, bool) {
 	if !pending {
 		return AppliedBatch{}, false
 	}
-	return AppliedBatch{normal: normal, apply: runtime.apply}, true
+	return AppliedBatch{
+		normal: normal,
+		apply:  runtime.apply,
+		source: AppliedBatchSource{
+			Group:                runtime.identity.Group,
+			AllocationGeneration: runtime.identity.AllocationGeneration,
+			MemberID:             runtime.identity.MemberID, StoreID: runtime.identity.StoreID,
+			NodeIncarnation: runtime.identity.NodeIncarnation,
+			ReadyID:         normal.ReadyID(), FirstIndex: normal.FirstIndex(), LastIndex: normal.LastIndex(),
+			FinalDataChainDigest: normal.FinalPublication().DataChainDigest,
+		},
+	}, true
+}
+
+// HasPendingResultSettlement reports whether Close and all later protocol work
+// are blocked on one already-published applied range.
+func (runtime *Runtime) HasPendingResultSettlement() bool {
+	if runtime == nil {
+		return false
+	}
+	_, pending := runtime.pendingAppliedResults()
+	return pending
 }
 
 func deterministicPersistFailure(err error) bool {

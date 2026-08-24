@@ -13,9 +13,36 @@ import (
 
 // LookupCompletion resolves data through the bounded session ring. A conflict
 // returns the reconstructed original completion together with a typed
-// RequestConflictError; a logically reclaimed retry returns ErrRetryRetired
+// RequestConflictError. A logically reclaimed retry returns ErrRetryRetired
 // and is never re-executed.
 func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
+	return m.lookupCompletion(data, nil)
+}
+
+// LookupCompletionInto is LookupCompletion with caller-owned result storage.
+// dst is reused from length zero. It must have capacity for the largest
+// metadata-only session completion so lookup never allocates result bytes.
+func (m *Machine) LookupCompletionInto(
+	data []byte,
+	dst []byte,
+) (CompletionLookup, error) {
+	if cap(dst) < replication.MaxEmptyResultCompletionEnvelopeBytes {
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	result, err := m.lookupCompletion(
+		data,
+		dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+	)
+	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
+		return CompletionLookup{}, ErrCompletionCorrupt
+	}
+	return result, err
+}
+
+func (m *Machine) lookupCompletion(
+	data []byte,
+	completionScratch []byte,
+) (CompletionLookup, error) {
 	command, err := replication.OpenCommand(data)
 	if err != nil {
 		return CompletionLookup{}, err
@@ -92,7 +119,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 			record.ResultCode == ResultSessionOpened
 		var completionBytes []byte
 		if slotErr == nil && currentOpen {
-			completionBytes, slotErr = m.appendSessionCompletion(nil, session, record)
+			completionBytes, slotErr = m.appendSessionCompletion(
+				completionScratch[:0], session, record,
+			)
 		}
 		closeErr := cut.Close()
 		if slotErr != nil || closeErr != nil {
@@ -240,7 +269,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	}
 	var completionBytes []byte
 	if slotErr == nil {
-		completionBytes, slotErr = m.appendSessionCompletion(nil, session, record)
+		completionBytes, slotErr = m.appendSessionCompletion(
+			completionScratch[:0], session, record,
+		)
 		if slotErr != nil {
 			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
 		}

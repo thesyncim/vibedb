@@ -1196,6 +1196,27 @@ func (a *ReplicatedApply) LookupCompletion(
 	return a.machine.LookupCompletion(data)
 }
 
+// LookupCompletionInto returns an exact completion in caller-owned storage.
+// The destination contract is defined by
+// [replicatedstate.Machine.LookupCompletionInto].
+func (a *ReplicatedApply) LookupCompletionInto(
+	data []byte,
+	dst []byte,
+) (replicatedstate.CompletionLookup, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.CompletionLookup{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	return a.machine.LookupCompletionInto(data, dst)
+}
+
 // DurabilityStats returns detached physical checkpoint-group counters for
 // apply batching and checkpoint observability. It exposes no storage handle or
 // serving authority.

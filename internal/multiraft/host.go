@@ -31,17 +31,65 @@ const (
 )
 
 var (
-	ErrInvalidLimits = errors.New("multiraft: invalid host limits")
-	ErrHostClosed    = errors.New("multiraft: host is closed")
-	ErrHostFull      = errors.New("multiraft: host group capacity reached")
-	ErrGroupExists   = errors.New("multiraft: group already exists")
-	ErrGroupNotFound = errors.New("multiraft: group not found")
-	ErrGroupBusy     = errors.New("multiraft: group is not quiescent")
-	ErrGroupFaulted  = errors.New("multiraft: group is faulted")
-	ErrQueueFull     = errors.New("multiraft: input queue is full")
-	ErrOutboxFull    = errors.New("multiraft: outbound queue is full")
-	ErrOutboundBound = errors.New("multiraft: outbound message exceeds host bound")
+	ErrInvalidLimits             = errors.New("multiraft: invalid host limits")
+	ErrHostClosed                = errors.New("multiraft: host is closed")
+	ErrHostFull                  = errors.New("multiraft: host group capacity reached")
+	ErrGroupExists               = errors.New("multiraft: group already exists")
+	ErrGroupNotFound             = errors.New("multiraft: group not found")
+	ErrGroupBusy                 = errors.New("multiraft: group is not quiescent")
+	ErrGroupFaulted              = errors.New("multiraft: group is faulted")
+	ErrQueueFull                 = errors.New("multiraft: input queue is full")
+	ErrOutboxFull                = errors.New("multiraft: outbound queue is full")
+	ErrOutboundBound             = errors.New("multiraft: outbound message exceeds host bound")
+	ErrSettlementSinkRequired    = errors.New("multiraft: result settlement sink is required")
+	ErrProposalSinkRequired      = errors.New("multiraft: proposal lifecycle sink is required")
+	ErrProposalGroupSinkRequired = errors.New("multiraft: proposal group lifecycle sink is required")
+	ErrProposalPendingRequired   = errors.New("multiraft: proposal group pending sink is required")
+	ErrProposalToken             = errors.New("multiraft: invalid tracked proposal token")
 )
+
+// ProposalToken is a fixed opaque serving-registry identity. The zero value is
+// reserved for ordinary untracked Host proposals.
+type ProposalToken [4]uint64
+
+// ProposalAdmission is the terminal local-core admission result for one
+// consumed tracked queue item. Cause is borrowed for the callback only.
+type ProposalAdmission struct {
+	Group    raftmember.GroupKey
+	Token    ProposalToken
+	Admitted bool
+	Cause    error
+}
+
+// ProposalLifecycleSink is invoked synchronously after a tracked queue item is
+// unambiguously consumed. It must not block, retain Cause, or re-enter Host.
+type ProposalLifecycleSink func(ProposalAdmission)
+
+// ProposalGroupTerminationReason is one closed infrastructure boundary after
+// which an admitted tracked proposal may no longer produce a local result.
+type ProposalGroupTerminationReason uint8
+
+const (
+	ProposalGroupLeadershipLost ProposalGroupTerminationReason = iota + 1
+	ProposalGroupRemoved
+	ProposalGroupFaulted
+	ProposalHostClosed
+)
+
+// ProposalGroupTermination identifies one exact group infrastructure boundary.
+type ProposalGroupTermination struct {
+	Group  raftmember.GroupKey
+	Reason ProposalGroupTerminationReason
+}
+
+// ProposalGroupLifecycleSink terminates admitted attempts that no longer have
+// a local apply path. It runs synchronously on the serialized Host owner.
+type ProposalGroupLifecycleSink func(ProposalGroupTermination)
+
+// ProposalGroupPendingSink reports whether a group retains at least one
+// locally admitted tracked attempt. It must be bounded, allocation-free, do no
+// external work, and be safe to call on the serialized Host owner.
+type ProposalGroupPendingSink func(raftmember.GroupKey) bool
 
 // Limits bounds every retained Host object. All fields are required; no zero
 // value is interpreted as an implicit default.
@@ -108,6 +156,7 @@ type memberRuntime interface {
 		func(raftmember.OutboundMessage) error,
 		raftmember.ResultSettlementSink,
 	) (raftmember.DriveResult, error)
+	HasPendingResultSettlement() bool
 	Close() error
 }
 
@@ -171,26 +220,32 @@ func (queue *messageQueue) clear() {
 	queue.head = 0
 }
 
+type queuedProposal struct {
+	data    []byte
+	token   ProposalToken
+	tracked bool
+}
+
 type proposalQueue struct {
-	items [][]byte
+	items []queuedProposal
 	head  int
 }
 
 func (queue *proposalQueue) len() int { return len(queue.items) - queue.head }
 
-func (queue *proposalQueue) push(item []byte) {
+func (queue *proposalQueue) push(item queuedProposal) {
 	if queue.head != 0 && len(queue.items) == cap(queue.items) {
 		queue.compact()
 	}
 	queue.items = append(queue.items, item)
 }
 
-func (queue *proposalQueue) pop() ([]byte, bool) {
+func (queue *proposalQueue) pop() (queuedProposal, bool) {
 	if queue.head == len(queue.items) {
-		return nil, false
+		return queuedProposal{}, false
 	}
 	result := queue.items[queue.head]
-	queue.items[queue.head] = nil
+	queue.items[queue.head] = queuedProposal{}
 	queue.head++
 	if queue.head == len(queue.items) {
 		queue.items = nil
@@ -201,9 +256,9 @@ func (queue *proposalQueue) pop() ([]byte, bool) {
 	return result, true
 }
 
-func (queue *proposalQueue) peek() ([]byte, bool) {
+func (queue *proposalQueue) peek() (queuedProposal, bool) {
 	if queue.head == len(queue.items) {
-		return nil, false
+		return queuedProposal{}, false
 	}
 	return queue.items[queue.head], true
 }
@@ -233,19 +288,20 @@ const (
 )
 
 type groupState struct {
-	key       raftmember.GroupKey
-	memberID  uint64
-	runtime   memberRuntime
-	runnable  bool
-	messages  messageQueue
-	proposals proposalQueue
-	ticks     int
-	campaigns int
-	items     int
-	bytes     int64
-	nextClass inputClass
-	failure   error
-	retiring  bool
+	key               raftmember.GroupKey
+	memberID          uint64
+	runtime           memberRuntime
+	runnable          bool
+	messages          messageQueue
+	proposals         proposalQueue
+	ticks             int
+	campaigns         int
+	items             int
+	bytes             int64
+	nextClass         inputClass
+	failure           error
+	retiring          bool
+	trackedLeaderTerm uint64
 }
 
 type outboundItem struct {
@@ -306,20 +362,82 @@ type Host struct {
 	runnable     []*groupState
 	runnableHead int
 
-	queueItems  int
-	queueBytes  int64
-	outbox      outboundQueue
-	outboxBytes int64
-	ready       raftmember.ReadyWorkspace
-	closed      bool
+	queueItems      int
+	queueBytes      int64
+	outbox          outboundQueue
+	outboxBytes     int64
+	ready           raftmember.ReadyWorkspace
+	readyGroup      *groupState
+	readySend       func(raftmember.OutboundMessage) error
+	settle          raftmember.ResultSettlementSink
+	proposals       ProposalLifecycleSink
+	proposalGroups  ProposalGroupLifecycleSink
+	proposalPending ProposalGroupPendingSink
+	closed          bool
 }
 
 // NewHost validates every limit and relationship before allocating the Host.
 func NewHost(limits Limits) (*Host, error) {
+	return newHost(limits, settleNoLocalWaiters, nil, nil, nil)
+}
+
+// NewHostWithResultSettlementSink constructs a Host whose published normal
+// results are synchronously offered to settle. The sink is called on the Host
+// owner goroutine and must follow [raftmember.ResultSettlementSink]. NewHost
+// retains the explicit no-local-waiters behavior for non-serving callers.
+func NewHostWithResultSettlementSink(
+	limits Limits,
+	settle raftmember.ResultSettlementSink,
+) (*Host, error) {
+	if settle == nil {
+		return nil, ErrSettlementSinkRequired
+	}
+	return newHost(limits, settle, nil, nil, nil)
+}
+
+// NewHostWithServingSinks constructs a Host with exact result-settlement and
+// tracked-proposal lifecycle sinks. Every callback runs on the serialized Host
+// owner and must not re-enter Host.
+func NewHostWithServingSinks(
+	limits Limits,
+	settle raftmember.ResultSettlementSink,
+	proposals ProposalLifecycleSink,
+	proposalGroups ProposalGroupLifecycleSink,
+	proposalPending ProposalGroupPendingSink,
+) (*Host, error) {
+	if settle == nil {
+		return nil, ErrSettlementSinkRequired
+	}
+	if proposals == nil {
+		return nil, ErrProposalSinkRequired
+	}
+	if proposalGroups == nil {
+		return nil, ErrProposalGroupSinkRequired
+	}
+	if proposalPending == nil {
+		return nil, ErrProposalPendingRequired
+	}
+	return newHost(limits, settle, proposals, proposalGroups, proposalPending)
+}
+
+func newHost(
+	limits Limits,
+	settle raftmember.ResultSettlementSink,
+	proposals ProposalLifecycleSink,
+	proposalGroups ProposalGroupLifecycleSink,
+	proposalPending ProposalGroupPendingSink,
+) (*Host, error) {
 	if err := validateLimits(limits); err != nil {
 		return nil, err
 	}
-	return &Host{limits: limits, groups: make(map[raftmember.GroupKey]*groupState)}, nil
+	host := &Host{
+		limits: limits,
+		groups: make(map[raftmember.GroupKey]*groupState),
+		settle: settle, proposals: proposals, proposalGroups: proposalGroups,
+		proposalPending: proposalPending,
+	}
+	host.readySend = host.enqueueReadyOutbound
+	return host, nil
 }
 
 func validateLimits(limits Limits) error {
@@ -405,12 +523,16 @@ func (host *Host) Remove(key raftmember.GroupKey) error {
 	if group == nil {
 		return ErrGroupNotFound
 	}
+	if group.runtime != nil && group.runtime.HasPendingResultSettlement() {
+		return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
+	}
 	if !group.retiring {
 		if group.runnable || group.items != 0 || group.messages.len() != 0 ||
 			group.proposals.len() != 0 || group.ticks != 0 || group.campaigns != 0 ||
 			host.hasOutboundFor(key) {
 			return ErrGroupBusy
 		}
+		host.finishTrackedGroup(group, ProposalGroupRemoved)
 		group.retiring = true
 	}
 	if group.runtime != nil {
@@ -497,6 +619,32 @@ func (host *Host) enqueueOwnedMessage(group *groupState, message *pb.Message, si
 // EnqueueProposal clones one bounded encoded command for later Runtime
 // admission. Queueing does not imply leadership or core admission.
 func (host *Host) EnqueueProposal(key raftmember.GroupKey, data []byte) error {
+	return host.enqueueProposal(key, data, ProposalToken{}, false)
+}
+
+// EnqueueTrackedProposal clones one command and atomically queues its fixed
+// lifecycle token. Success transfers ownership of both command and token.
+func (host *Host) EnqueueTrackedProposal(
+	key raftmember.GroupKey,
+	data []byte,
+	token ProposalToken,
+) error {
+	if token == (ProposalToken{}) {
+		return ErrProposalToken
+	}
+	if host == nil || host.proposals == nil || host.proposalGroups == nil ||
+		host.proposalPending == nil {
+		return ErrProposalSinkRequired
+	}
+	return host.enqueueProposal(key, data, token, true)
+}
+
+func (host *Host) enqueueProposal(
+	key raftmember.GroupKey,
+	data []byte,
+	token ProposalToken,
+	tracked bool,
+) error {
 	group, err := host.lookup(key)
 	if err != nil {
 		return err
@@ -507,7 +655,9 @@ func (host *Host) EnqueueProposal(key raftmember.GroupKey, data []byte) error {
 	if err := host.admitInput(group, int64(len(data))); err != nil {
 		return err
 	}
-	group.proposals.push(append([]byte(nil), data...))
+	group.proposals.push(queuedProposal{
+		data: append([]byte(nil), data...), token: token, tracked: tracked,
+	})
 	host.chargeInput(group, int64(len(data)))
 	host.wake(group)
 	return nil
@@ -589,6 +739,9 @@ func (host *Host) TransferLeader(key raftmember.GroupKey, transferee uint64) err
 	}
 	err = group.runtime.TransferLeader(transferee)
 	host.finishDirectControl(group, err)
+	if err == nil {
+		host.observeTrackedLeadership(group)
+	}
 	return err
 }
 
@@ -733,13 +886,9 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
 			continue
 		}
-		ready, err := group.runtime.DriveReady(
-			&host.ready,
-			func(outbound raftmember.OutboundMessage) error {
-				return host.enqueueOutbound(group, outbound)
-			},
-			settleNoLocalWaiters,
-		)
+		host.readyGroup = group
+		ready, err := group.runtime.DriveReady(&host.ready, host.readySend, host.settle)
+		host.readyGroup = nil
 		if err != nil {
 			if errors.Is(err, ErrOutboxFull) {
 				blockedOutbox = true
@@ -761,6 +910,8 @@ func (host *Host) RunOne() (Progress, bool, error) {
 			host.wake(group)
 			return Progress{Group: group.key, Kind: ProgressReady}, false, err
 		}
+		host.refreshTrackedPending(group)
+		host.observeTrackedLeadership(group)
 		if ready.Progressed() {
 			host.wake(group)
 			return Progress{
@@ -780,6 +931,9 @@ func (host *Host) RunOne() (Progress, bool, error) {
 			progress.Kind = ProgressFault
 			host.purgeGroup(group)
 		} else {
+			if progress.Kind != ProgressProposal {
+				host.observeTrackedLeadership(group)
+			}
 			host.wake(group)
 		}
 		return progress, true, inputErr
@@ -809,14 +963,91 @@ func settleNoLocalWaiters(batch raftmember.AppliedBatch) error {
 	return nil
 }
 
+func (host *Host) finishTrackedProposal(
+	group *groupState,
+	proposal queuedProposal,
+	cause error,
+) {
+	if host == nil || group == nil || !proposal.tracked || host.proposals == nil {
+		return
+	}
+	host.proposals(ProposalAdmission{
+		Group: group.key, Token: proposal.token, Admitted: cause == nil, Cause: cause,
+	})
+}
+
+func (host *Host) finishTrackedGroup(
+	group *groupState,
+	reason ProposalGroupTerminationReason,
+) {
+	if host == nil || group == nil || host.proposalGroups == nil {
+		return
+	}
+	host.proposalGroups(ProposalGroupTermination{Group: group.key, Reason: reason})
+	group.trackedLeaderTerm = 0
+}
+
+func (host *Host) refreshTrackedPending(group *groupState) {
+	if host == nil || group == nil || group.trackedLeaderTerm == 0 ||
+		host.proposalPending == nil {
+		return
+	}
+	if !host.proposalPending(group.key) {
+		group.trackedLeaderTerm = 0
+	}
+}
+
+func (host *Host) observeTrackedLeadership(group *groupState) {
+	if host == nil || group == nil || group.runtime == nil ||
+		group.trackedLeaderTerm == 0 || host.proposalGroups == nil {
+		return
+	}
+	status, err := group.runtime.Status()
+	if err != nil || status.MemberID != group.memberID ||
+		status.LeaderID != group.memberID || status.RaftState != raft.StateLeader ||
+		status.Term != group.trackedLeaderTerm {
+		host.finishTrackedGroup(group, ProposalGroupLeadershipLost)
+	}
+}
+
+func (host *Host) preflightTrackedProposal(group *groupState) (uint64, error) {
+	if group == nil || group.runtime == nil {
+		return 0, ErrGroupNotFound
+	}
+	status, err := group.runtime.Status()
+	if err != nil {
+		if group.trackedLeaderTerm != 0 {
+			host.finishTrackedGroup(group, ProposalGroupLeadershipLost)
+		}
+		return 0, err
+	}
+	if group.trackedLeaderTerm != 0 &&
+		(status.MemberID != group.memberID || status.LeaderID != group.memberID ||
+			status.RaftState != raft.StateLeader || status.Term != group.trackedLeaderTerm) {
+		host.finishTrackedGroup(group, ProposalGroupLeadershipLost)
+	}
+	if status.MemberID != group.memberID || status.LeaderID != group.memberID ||
+		status.RaftState != raft.StateLeader || status.Term == 0 {
+		return 0, raftmodel.ErrNotLeader
+	}
+	return status.Term, nil
+}
+
 func (host *Host) purgeGroup(group *groupState) {
 	if group == nil {
 		return
 	}
+	for {
+		proposal, ok := group.proposals.pop()
+		if !ok {
+			break
+		}
+		host.finishTrackedProposal(group, proposal, ErrGroupFaulted)
+	}
+	host.finishTrackedGroup(group, ProposalGroupFaulted)
 	host.queueItems -= group.items
 	host.queueBytes -= group.bytes
 	group.messages.clear()
-	group.proposals.clear()
 	group.ticks = 0
 	group.campaigns = 0
 	group.items = 0
@@ -839,7 +1070,7 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 			progress.Kind = ProgressMessage
 			return progress, true, group.runtime.StepMessage(item.message)
 		case inputProposal:
-			data, ok := group.proposals.peek()
+			item, ok := group.proposals.peek()
 			if !ok {
 				continue
 			}
@@ -847,13 +1078,17 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 			progress.Kind = ProgressProposal
 			batchEntries := 0
 			batchBytes := int64(0)
+			trackedChecked := false
+			trackedLeaderTerm := uint64(0)
+			var trackedLeadershipErr error
 			for batchEntries < raftmodel.MaxProposalBatchEntries {
-				dataBytes := int64(len(data))
+				dataBytes := int64(len(item.data))
 				if batchEntries != 0 && (batchBytes >= raftmodel.MaxProposalBatchBytes ||
 					dataBytes > raftmodel.MaxProposalBatchBytes-batchBytes) {
 					break
 				}
-				if _, popped := group.proposals.pop(); !popped {
+				consumed, popped := group.proposals.pop()
+				if !popped {
 					break
 				}
 				host.releaseInput(group, dataBytes)
@@ -861,17 +1096,46 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 				batchBytes += dataBytes
 				progress.ProposalCount = batchEntries
 				progress.ProposalBytes = batchBytes
-				if err := group.runtime.Propose(data); err != nil {
-					return progress, true, err
+				if consumed.tracked {
+					if !trackedChecked {
+						trackedChecked = true
+						trackedLeaderTerm, trackedLeadershipErr =
+							host.preflightTrackedProposal(group)
+					}
+					if trackedLeadershipErr != nil {
+						host.finishTrackedProposal(group, consumed, trackedLeadershipErr)
+						if !errors.Is(trackedLeadershipErr, raftmodel.ErrNotLeader) {
+							host.refreshTrackedPending(group)
+							return progress, true, trackedLeadershipErr
+						}
+						if batchBytes >= raftmodel.MaxProposalBatchBytes {
+							break
+						}
+						item, ok = group.proposals.peek()
+						if !ok {
+							break
+						}
+						continue
+					}
+				}
+				proposalErr := group.runtime.Propose(consumed.data)
+				host.finishTrackedProposal(group, consumed, proposalErr)
+				if proposalErr != nil {
+					host.refreshTrackedPending(group)
+					return progress, true, proposalErr
+				}
+				if consumed.tracked {
+					group.trackedLeaderTerm = trackedLeaderTerm
 				}
 				if batchBytes >= raftmodel.MaxProposalBatchBytes {
 					break
 				}
-				data, ok = group.proposals.peek()
+				item, ok = group.proposals.peek()
 				if !ok {
 					break
 				}
 			}
+			host.refreshTrackedPending(group)
 			return progress, batchEntries != 0, nil
 		case inputTick:
 			if group.ticks == 0 {
@@ -894,6 +1158,13 @@ func (host *Host) runInput(group *groupState) (Progress, bool, error) {
 		}
 	}
 	return Progress{}, false, nil
+}
+
+func (host *Host) enqueueReadyOutbound(outbound raftmember.OutboundMessage) error {
+	if host == nil || host.readyGroup == nil {
+		return errors.New("multiraft: outbound message outside Ready ownership")
+	}
+	return host.enqueueOutbound(host.readyGroup, outbound)
 }
 
 func (host *Host) enqueueOutbound(group *groupState, outbound raftmember.OutboundMessage) error {
@@ -948,7 +1219,14 @@ func (host *Host) clearQueues() {
 			continue
 		}
 		group.messages.clear()
-		group.proposals.clear()
+		for {
+			proposal, ok := group.proposals.pop()
+			if !ok {
+				break
+			}
+			host.finishTrackedProposal(group, proposal, ErrHostClosed)
+		}
+		host.finishTrackedGroup(group, ProposalHostClosed)
 		group.ticks = 0
 		group.campaigns = 0
 		group.items = 0
@@ -976,6 +1254,12 @@ func (host *Host) Close() error {
 		return nil
 	}
 	if !host.closed {
+		for _, group := range host.order {
+			if group != nil && group.runtime != nil &&
+				group.runtime.HasPendingResultSettlement() {
+				return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
+			}
+		}
 		host.closed = true
 		host.clearQueues()
 	}

@@ -307,6 +307,38 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	}
 }
 
+func TestMachineLookupCompletionIntoUsesExactCallerStorage(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	command := testCommand(fixture.binding, 1,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+	)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	short := make([]byte, 7, replication.MaxEmptyResultCompletionEnvelopeBytes-1)
+	if lookup, err := fixture.machine.LookupCompletionInto(command, short); !errors.Is(err, ErrCompletionBufferSmall) ||
+		lookup.Key != ([32]byte{}) || len(lookup.Bytes) != 0 ||
+		lookup.AppliedSequence != 0 || len(short) != 7 {
+		t.Fatalf("short lookup = %+v, %v, len %d", lookup, err, len(short))
+	}
+	scratch := make([]byte, 9, replication.MaxEmptyResultCompletionEnvelopeBytes+32)
+	lookup, err := fixture.machine.LookupCompletionInto(command, scratch)
+	if err != nil || len(lookup.Bytes) == 0 || lookup.AppliedSequence != 3 ||
+		&lookup.Bytes[0] != &scratch[:cap(scratch)][0] {
+		t.Fatalf("caller-backed lookup = %+v, %v", lookup, err)
+	}
+	want := bytes.Clone(lookup.Bytes)
+	lookup.Bytes[0] ^= 0xff
+	again, err := fixture.machine.LookupCompletionInto(command, scratch)
+	if err != nil || !bytes.Equal(again.Bytes, want) || &again.Bytes[0] != &scratch[:cap(scratch)][0] {
+		t.Fatalf("reused lookup = %+v, %v", again, err)
+	}
+}
+
 func TestMachineConfigurationAndEmptyNormalPreserveDataChainDigest(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {

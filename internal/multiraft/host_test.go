@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -35,13 +36,17 @@ type fakeRuntime struct {
 	progress            map[uint64]raftmodel.MemberProgress
 	transfers           []uint64
 	inputErr            error
+	proposalErrs        []error
 	failure             error
 	failureOnReadyError bool
 	closeErrs           []error
 	closeCalls          int
 	driveCalls          int
+	statusCalls         int
 	readyWorkspace      *raftmember.ReadyWorkspace
 	settlementSink      bool
+	pendingSettlement   bool
+	discardProposals    bool
 }
 
 func newFakeRuntime(seed byte) *fakeRuntime {
@@ -52,17 +57,34 @@ func newFakeRuntime(seed byte) *fakeRuntime {
 		key.ShardIncarnation[index] = seed + byte(index) + 33
 		key.GroupID[index] = seed + byte(index) + 49
 	}
-	return &fakeRuntime{identity: raftmember.RuntimeIdentity{
+	runtime := &fakeRuntime{identity: raftmember.RuntimeIdentity{
 		Group: key, MemberID: uint64(seed) + 1, NodeIncarnation: 1,
 	}}
+	runtime.status = raftmember.RuntimeStatus{
+		MemberID: runtime.identity.MemberID, LeaderID: runtime.identity.MemberID,
+		Term: 1, RaftState: raft.StateLeader,
+	}
+	return runtime
 }
+
+func ignoreProposalGroupTermination(ProposalGroupTermination) {}
+func retainProposalGroupPending(raftmember.GroupKey) bool     { return true }
 
 func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity { return runtime.identity }
 func (runtime *fakeRuntime) Failure() error                       { return runtime.failure }
+func (runtime *fakeRuntime) HasPendingResultSettlement() bool     { return runtime.pendingSettlement }
 
 func (runtime *fakeRuntime) Propose(data []byte) error {
-	runtime.inputs = append(runtime.inputs, ProgressProposal)
-	runtime.proposals = append(runtime.proposals, append([]byte(nil), data...))
+	if !runtime.discardProposals {
+		runtime.inputs = append(runtime.inputs, ProgressProposal)
+		runtime.proposals = append(runtime.proposals, append([]byte(nil), data...))
+	}
+	if len(runtime.proposalErrs) != 0 {
+		err := runtime.proposalErrs[0]
+		runtime.proposalErrs[0] = nil
+		runtime.proposalErrs = runtime.proposalErrs[1:]
+		return err
+	}
 	return runtime.inputErr
 }
 
@@ -91,6 +113,7 @@ func (runtime *fakeRuntime) SnapshotState() (replicatedstate.State, error) {
 }
 
 func (runtime *fakeRuntime) Status() (raftmember.RuntimeStatus, error) {
+	runtime.statusCalls++
 	return runtime.status, runtime.inputErr
 }
 
@@ -942,6 +965,458 @@ func TestHostRemoveRequiresQuiescenceRetriesCloseAndReusesCapacity(t *testing.T)
 	second := newFakeRuntime(72)
 	if err := host.addRuntime(second); err != nil {
 		t.Fatalf("reuse group capacity: %v", err)
+	}
+}
+
+func TestHostTrackedProposalLifecyclePreservesAcceptedPrefixAndProgress(t *testing.T) {
+	var admissions []ProposalAdmission
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
+		ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(91)
+	runtime.proposalErrs = []error{nil, raftmodel.ErrReadyPending}
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	tokens := []ProposalToken{{1}, {2}, {3}}
+	for index := range tokens {
+		if err := host.EnqueueTrackedProposal(
+			runtime.identity.Group, []byte{byte(index + 1)}, tokens[index],
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	progress, done, err := host.RunOne()
+	if !done || !errors.Is(err, raftmodel.ErrReadyPending) ||
+		progress.Kind != ProgressProposal || progress.ProposalCount != 2 ||
+		progress.ProposalBytes != 2 {
+		t.Fatalf("progress = %+v, %v, %v", progress, done, err)
+	}
+	if len(admissions) != 2 || !admissions[0].Admitted ||
+		admissions[0].Token != tokens[0] || admissions[0].Cause != nil ||
+		admissions[1].Admitted || admissions[1].Token != tokens[1] ||
+		!errors.Is(admissions[1].Cause, raftmodel.ErrReadyPending) {
+		t.Fatalf("admissions = %+v", admissions)
+	}
+	if runtime.statusCalls != 1 {
+		t.Fatalf("tracked proposal prefix status calls = %d, want 1", runtime.statusCalls)
+	}
+	group := host.groups[runtime.identity.Group]
+	if group.proposals.len() != 1 || host.queueItems != 1 || group.items != 1 {
+		t.Fatalf("remaining queue = proposals %d host %d group %d",
+			group.proposals.len(), host.queueItems, group.items)
+	}
+}
+
+func TestHostFaultPurgeTerminatesEveryTrackedQueueToken(t *testing.T) {
+	var admissions []ProposalAdmission
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
+		ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(92)
+	runtime.inputErr = raftmember.ErrRuntimeFailed
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	for index := uint64(1); index <= 3; index++ {
+		if err := host.EnqueueTrackedProposal(
+			runtime.identity.Group, []byte{byte(index)}, ProposalToken{index},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	progress, done, err := host.RunOne()
+	if !done || !errors.Is(err, raftmember.ErrRuntimeFailed) ||
+		progress.Kind != ProgressFault || progress.ProposalCount != 1 {
+		t.Fatalf("fault = %+v, %v, %v", progress, done, err)
+	}
+	if len(admissions) != 3 {
+		t.Fatalf("admission callbacks = %d", len(admissions))
+	}
+	for index, admission := range admissions {
+		if admission.Admitted || admission.Token != (ProposalToken{uint64(index + 1)}) ||
+			admission.Cause == nil {
+			t.Fatalf("admission %d = %+v", index, admission)
+		}
+	}
+	if host.queueItems != 0 || host.queueBytes != 0 {
+		t.Fatalf("purged accounting = %d, %d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostClosePendingSettlementPreflightLeavesEveryGroupRunnable(t *testing.T) {
+	var admissions []ProposalAdmission
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
+		ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := newFakeRuntime(93), newFakeRuntime(94)
+	first.pendingSettlement = true
+	if err := host.addRuntime(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.addRuntime(second); err != nil {
+		t.Fatal(err)
+	}
+	token := ProposalToken{7, 8, 9, 10}
+	if err := host.EnqueueTrackedProposal(second.identity.Group, []byte{1, 2}, token); err != nil {
+		t.Fatal(err)
+	}
+	beforeRunnable, beforeItems, beforeBytes := host.runnableLen(), host.queueItems, host.queueBytes
+	if err := host.Close(); !errors.Is(err, raftmember.ErrResultSettlementPending) ||
+		!errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("Close preflight = %v", err)
+	}
+	if host.closed || host.runnableLen() != beforeRunnable || host.queueItems != beforeItems ||
+		host.queueBytes != beforeBytes || first.closeCalls != 0 || second.closeCalls != 0 ||
+		len(admissions) != 0 {
+		t.Fatalf("Close mutated host: closed=%v runnable=%d items=%d bytes=%d calls=%d/%d callbacks=%d",
+			host.closed, host.runnableLen(), host.queueItems, host.queueBytes,
+			first.closeCalls, second.closeCalls, len(admissions))
+	}
+	first.pendingSettlement = false
+	if err := host.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !host.closed || len(admissions) != 1 || admissions[0].Token != token ||
+		admissions[0].Admitted || !errors.Is(admissions[0].Cause, ErrHostClosed) {
+		t.Fatalf("terminal close = closed %v callbacks %+v", host.closed, admissions)
+	}
+}
+
+func TestHostRemovePendingSettlementPreflightDoesNotRetireGroup(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(97)
+	runtime.pendingSettlement = true
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	group := host.groups[runtime.identity.Group]
+	beforeRunnable := host.runnableLen()
+	if err := host.Remove(runtime.identity.Group); !errors.Is(err, ErrGroupBusy) ||
+		!errors.Is(err, raftmember.ErrResultSettlementPending) {
+		t.Fatalf("Remove preflight = %v", err)
+	}
+	if group.retiring || group.runtime != runtime || host.runnableLen() != beforeRunnable ||
+		runtime.closeCalls != 0 {
+		t.Fatalf("Remove mutated group: retiring=%v runtime=%p runnable=%d closes=%d",
+			group.retiring, group.runtime, host.runnableLen(), runtime.closeCalls)
+	}
+	runtime.pendingSettlement = false
+	if _, done, err := host.RunOne(); err != nil || done {
+		t.Fatalf("drain idle probe = %v, %v", done, err)
+	}
+	if err := host.Remove(runtime.identity.Group); err != nil {
+		t.Fatalf("Remove retry = %v", err)
+	}
+}
+
+func TestHostTrackedProposalRequiresAtomicServingSinkAndQueueCapacity(t *testing.T) {
+	ordinary, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := newFakeRuntime(96).identity.Group
+	if err := ordinary.EnqueueTrackedProposal(
+		group, []byte{1}, ProposalToken{1},
+	); !errors.Is(err, ErrProposalSinkRequired) {
+		t.Fatalf("ordinary tracked proposal = %v", err)
+	}
+	if host, err := NewHostWithServingSinks(
+		testHostLimits(), nil, func(ProposalAdmission) {}, ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	); host != nil ||
+		!errors.Is(err, ErrSettlementSinkRequired) {
+		t.Fatalf("nil settlement = %v, %v", host, err)
+	}
+	if host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters, nil, ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	); host != nil ||
+		!errors.Is(err, ErrProposalSinkRequired) {
+		t.Fatalf("nil lifecycle = %v, %v", host, err)
+	}
+	if host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters, func(ProposalAdmission) {}, nil,
+		retainProposalGroupPending,
+	); host != nil || !errors.Is(err, ErrProposalGroupSinkRequired) {
+		t.Fatalf("nil group lifecycle = %v, %v", host, err)
+	}
+	if host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters, func(ProposalAdmission) {},
+		ignoreProposalGroupTermination, nil,
+	); host != nil || !errors.Is(err, ErrProposalPendingRequired) {
+		t.Fatalf("nil group pending = %v, %v", host, err)
+	}
+
+	limits := testHostLimits()
+	limits.MaxQueueItems = 1
+	limits.MaxGroupItems = 1
+	limits.MaxPendingTicks = 1
+	callbacks := 0
+	host, err := NewHostWithServingSinks(
+		limits, settleNoLocalWaiters, func(ProposalAdmission) { callbacks++ },
+		ignoreProposalGroupTermination,
+		retainProposalGroupPending,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(95)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.EnqueueTrackedProposal(runtime.identity.Group, []byte{1}, ProposalToken{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.EnqueueTrackedProposal(
+		runtime.identity.Group, []byte{2}, ProposalToken{2},
+	); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("full queue = %v", err)
+	}
+	if callbacks != 0 || host.queueItems != 1 || host.groups[runtime.identity.Group].proposals.len() != 1 {
+		t.Fatalf("partial tracked publication = callbacks %d items %d", callbacks, host.queueItems)
+	}
+}
+
+func TestHostTrackedLeadershipFencesFollowerAndTerminatesOldLeaderBeforeRetry(t *testing.T) {
+	var admissions []ProposalAdmission
+	var terminations []ProposalGroupTermination
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
+		func(termination ProposalGroupTermination) {
+			terminations = append(terminations, termination)
+		},
+		retainProposalGroupPending,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(98)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	first := ProposalToken{1, 2, 3, 4}
+	if err := host.EnqueueTrackedProposal(runtime.identity.Group, []byte{1}, first); err != nil {
+		t.Fatal(err)
+	}
+	if progress, done, err := host.RunOne(); err != nil || !done ||
+		progress.Kind != ProgressProposal {
+		t.Fatalf("leader proposal = %+v, %v, %v", progress, done, err)
+	}
+	if len(admissions) != 1 || !admissions[0].Admitted ||
+		host.groups[runtime.identity.Group].trackedLeaderTerm != 1 {
+		t.Fatalf("leader admission = %+v term %d", admissions,
+			host.groups[runtime.identity.Group].trackedLeaderTerm)
+	}
+
+	runtime.status.LeaderID = runtime.identity.MemberID + 1
+	runtime.status.RaftState = raft.StateFollower
+	runtime.status.Term = 2
+	if err := host.RequestTick(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); err != nil || !done {
+		t.Fatalf("leadership-loss boundary = %v, %v", done, err)
+	}
+	if len(terminations) != 1 || terminations[0].Group != runtime.identity.Group ||
+		terminations[0].Reason != ProposalGroupLeadershipLost {
+		t.Fatalf("leadership termination = %+v", terminations)
+	}
+
+	follower := ProposalToken{5, 6, 7, 8}
+	if err := host.EnqueueTrackedProposal(runtime.identity.Group, []byte{2}, follower); err != nil {
+		t.Fatal(err)
+	}
+	beforeProposals := len(runtime.proposals)
+	if progress, done, err := host.RunOne(); err != nil || !done ||
+		progress.Kind != ProgressProposal {
+		t.Fatalf("follower proposal = %+v, %v, %v", progress, done, err)
+	}
+	if len(runtime.proposals) != beforeProposals || len(admissions) != 2 ||
+		admissions[1].Admitted || !errors.Is(admissions[1].Cause, raftmodel.ErrNotLeader) {
+		t.Fatalf("follower admission forwarded into Raft: proposals %d admissions %+v",
+			len(runtime.proposals), admissions)
+	}
+
+	runtime.status.LeaderID = runtime.identity.MemberID
+	runtime.status.RaftState = raft.StateLeader
+	runtime.status.Term = 3
+	third := ProposalToken{9, 10, 11, 12}
+	if err := host.EnqueueTrackedProposal(runtime.identity.Group, []byte{3}, third); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); err != nil || !done {
+		t.Fatalf("new leader proposal = %v, %v", done, err)
+	}
+	if len(admissions) != 3 || !admissions[2].Admitted ||
+		host.groups[runtime.identity.Group].trackedLeaderTerm != 3 {
+		t.Fatalf("new leader admission = %+v", admissions)
+	}
+	if _, done, err := host.RunOne(); err != nil || done {
+		t.Fatalf("drain before Remove = %v, %v", done, err)
+	}
+	if err := host.Remove(runtime.identity.Group); err != nil {
+		t.Fatal(err)
+	}
+	if len(terminations) != 2 || terminations[1].Reason != ProposalGroupRemoved ||
+		runtime.closeCalls != 1 {
+		t.Fatalf("Remove termination ordering = %+v closes %d", terminations, runtime.closeCalls)
+	}
+}
+
+func TestHostTrackedLeadershipStopsStatusChecksAfterLastPendingAttempt(t *testing.T) {
+	pending := false
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(admission ProposalAdmission) {
+			if admission.Admitted {
+				pending = true
+			}
+		},
+		ignoreProposalGroupTermination,
+		func(raftmember.GroupKey) bool { return pending },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(99)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.EnqueueTrackedProposal(
+		runtime.identity.Group, []byte{1}, ProposalToken{1},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); err != nil || !done {
+		t.Fatalf("tracked proposal = %v, %v", done, err)
+	}
+	if runtime.statusCalls != 1 ||
+		host.groups[runtime.identity.Group].trackedLeaderTerm != 1 {
+		t.Fatalf("admitted tracking = status %d term %d", runtime.statusCalls,
+			host.groups[runtime.identity.Group].trackedLeaderTerm)
+	}
+
+	pending = false
+	if _, done, err := host.RunOne(); err != nil || done {
+		t.Fatalf("pending-clear scheduler turn = %v, %v", done, err)
+	}
+	if runtime.statusCalls != 1 ||
+		host.groups[runtime.identity.Group].trackedLeaderTerm != 0 {
+		t.Fatalf("cleared tracking = status %d term %d", runtime.statusCalls,
+			host.groups[runtime.identity.Group].trackedLeaderTerm)
+	}
+	if _, done, err := host.RunOne(); err != nil || done || runtime.statusCalls != 1 {
+		t.Fatalf("idle scheduler retained status tax = %v, %v, calls %d",
+			done, err, runtime.statusCalls)
+	}
+}
+
+func TestHostTrackedProposalRunOneWarmAllocations(t *testing.T) {
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(ProposalAdmission) {}, ignoreProposalGroupTermination,
+		func(raftmember.GroupKey) bool { return false },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(100)
+	runtime.discardProposals = true
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	group := host.groups[runtime.identity.Group]
+	data := []byte{1}
+	backing := make([]queuedProposal, 1)
+	run := func() {
+		backing[0] = queuedProposal{data: data, token: ProposalToken{1}, tracked: true}
+		group.proposals.items = backing[:1]
+		group.proposals.head = 0
+		group.items = 1
+		group.bytes = 1
+		host.queueItems = 1
+		host.queueBytes = 1
+		if !group.runnable {
+			host.wake(group)
+		}
+		progress, done, runErr := host.RunOne()
+		if runErr != nil || !done || progress.Kind != ProgressProposal ||
+			progress.ProposalCount != 1 {
+			panic("unexpected tracked proposal progress")
+		}
+	}
+	run()
+	allocs := testing.AllocsPerRun(1_000, run)
+	if allocs != 0 {
+		t.Fatalf("warm tracked proposal RunOne allocations = %v, want 0", allocs)
+	}
+}
+
+func BenchmarkHostTrackedProposalRunOne(b *testing.B) {
+	host, err := NewHostWithServingSinks(
+		testHostLimits(), settleNoLocalWaiters,
+		func(ProposalAdmission) {}, ignoreProposalGroupTermination,
+		func(raftmember.GroupKey) bool { return false },
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	runtime := newFakeRuntime(101)
+	runtime.discardProposals = true
+	if err := host.addRuntime(runtime); err != nil {
+		b.Fatal(err)
+	}
+	group := host.groups[runtime.identity.Group]
+	data := []byte{1}
+	backing := make([]queuedProposal, 1)
+	run := func() {
+		backing[0] = queuedProposal{data: data, token: ProposalToken{1}, tracked: true}
+		group.proposals.items = backing[:1]
+		group.proposals.head = 0
+		group.items = 1
+		group.bytes = 1
+		host.queueItems = 1
+		host.queueBytes = 1
+		if !group.runnable {
+			host.wake(group)
+		}
+		progress, done, runErr := host.RunOne()
+		if runErr != nil || !done || progress.Kind != ProgressProposal ||
+			progress.ProposalCount != 1 {
+			panic("unexpected tracked proposal progress")
+		}
+	}
+	run()
+	b.ReportAllocs()
+	b.SetBytes(1)
+	b.ReportMetric(float64(unsafe.Sizeof(Host{})), "host-B")
+	b.ReportMetric(float64(unsafe.Sizeof(raftmember.ReadyWorkspace{})), "workspace-B")
+	b.ResetTimer()
+	for range b.N {
+		run()
 	}
 }
 

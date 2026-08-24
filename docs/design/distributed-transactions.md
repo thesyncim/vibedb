@@ -63,9 +63,9 @@ data.
 
 The hidden collection uses raw opaque values. Its compact binary codec is part
 of the repository's unreleased format 0, not JSON and not a released protocol
-version. The sole codec sentinel admits only the current grammar; stale
-development text fails closed without a v2/v3 compatibility or migration
-ladder. `docs/format.md` records the exact envelope and storage bounds.
+version. The sole codec sentinel admits only the current grammar. Stale
+development text fails closed without an alternate compatibility decoder or
+migration ladder. `docs/format.md` records the exact envelope and storage bounds.
 
 Participant staging acquires scoped durable barriers. An overlapping
 participant fails fast. This behavior prevents a cross-shard deadlock.

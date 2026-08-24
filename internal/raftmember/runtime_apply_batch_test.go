@@ -281,7 +281,7 @@ func TestRuntimeInMemoryBatchDriverAndSettlementGate(t *testing.T) {
 				t.Fatalf("memory entry %d = %+v, %v", index, entry, ok)
 			}
 		}
-		return wantSinkErr
+		return RetryResultSettlement(wantSinkErr)
 	}); result.Progressed() || !errors.Is(err, ErrResultSettlementRejected) ||
 		!errors.Is(err, wantSinkErr) {
 		t.Fatalf("memory failed settlement = %+v, %v", result, err)
@@ -326,6 +326,23 @@ func TestRuntimeInMemoryBatchDriverAndSettlementGate(t *testing.T) {
 	}
 	if runtime.node.Phase() != raftmodel.PhaseEntriesApplied {
 		t.Fatalf("memory settled phase = %s", runtime.node.Phase())
+	}
+}
+
+func TestRuntimeUnclassifiedSettlementFailureIsTerminal(t *testing.T) {
+	runtime, _ := memoryRuntimeAtApplyBoundary(t, [][]byte{{0x80, 1, 2, 3}})
+	var workspace ReadyWorkspace
+	want := errors.New("unclassified settlement failure")
+	result, err := runtime.DriveReady(&workspace, nil, func(AppliedBatch) error {
+		return want
+	})
+	if result.Progressed() || !errors.Is(err, ErrRuntimeFailed) ||
+		!errors.Is(err, want) || errors.Is(err, ErrResultSettlementRejected) {
+		t.Fatalf("terminal settlement = %+v, %v", result, err)
+	}
+	if failure := runtime.Failure(); !errors.Is(failure, want) ||
+		!errors.Is(failure, ErrRuntimeFailed) {
+		t.Fatalf("latched failure = %v", failure)
 	}
 }
 
@@ -377,7 +394,7 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 		firstIndex = batch.FirstIndex()
 		lastIndex = batch.LastIndex()
 		firstCompletion = bytes.Clone(lookup.Bytes)
-		return wantSinkErr
+		return RetryResultSettlement(wantSinkErr)
 	}
 	if result, err := fixture.runtime.DriveReady(&workspace, nil, failedSink); result.Progressed() ||
 		!errors.Is(err, ErrResultSettlementRejected) || !errors.Is(err, wantSinkErr) {
