@@ -81,7 +81,7 @@ func NewSnapshotWithReplicatedMetadata(
 func (snapshot *Snapshot) attachReplicatedMetadata(
 	descriptors []ReplicatedShardDescriptor,
 ) error {
-	if snapshot == nil || len(descriptors) > int(^uint32(0)) ||
+	if snapshot == nil || uint64(len(descriptors)) > uint64(^uint32(0)) ||
 		len(descriptors) > maxCatalogBytes/ServingReplicaCount {
 		return &CatalogError{Reason: "replicated shard directory exceeds its bound"}
 	}

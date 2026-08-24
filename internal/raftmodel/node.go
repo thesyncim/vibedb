@@ -833,7 +833,8 @@ func (n *Node) validateInboundMessage(message *pb.Message) error {
 	}
 	switch message.GetType() {
 	case pb.MsgApp, pb.MsgAppResp, pb.MsgVote, pb.MsgVoteResp, pb.MsgSnap,
-		pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgPreVote, pb.MsgPreVoteResp:
+		pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgPreVote, pb.MsgPreVoteResp,
+		pb.MsgTimeoutNow:
 	default:
 		return &UnsupportedError{Feature: "remote message type " + message.GetType().String()}
 	}
@@ -843,6 +844,11 @@ func (n *Node) validateInboundMessage(message *pb.Message) error {
 	}
 	if len(message.GetResponses()) != 0 || message.Vote != nil {
 		return errors.New("raftmodel: remote message carries local-storage fields")
+	}
+	if message.GetType() == pb.MsgTimeoutNow {
+		if err := n.validateTimeoutNow(message); err != nil {
+			return err
+		}
 	}
 	contextBytes := len(message.GetContext())
 	switch message.GetType() {
@@ -880,6 +886,36 @@ func (n *Node) validateInboundMessage(message *pb.Message) error {
 		}
 		previous = entry.GetIndex()
 		previousTerm = entry.GetTerm()
+	}
+	return nil
+}
+
+// validateTimeoutNow admits only the exact leader-transfer signal emitted by
+// the current Raft core. The term and live tracker checks prevent a stale or
+// removed replica from inducing an election after a topology or term change.
+func (n *Node) validateTimeoutNow(message *pb.Message) error {
+	if message.Type == nil || message.From == nil || message.To == nil || message.Term == nil ||
+		message.LogTerm != nil || message.Index != nil || len(message.Entries) != 0 ||
+		message.Commit != nil || message.Snapshot != nil || message.Reject != nil ||
+		message.RejectHint != nil || len(message.Context) != 0 || message.Vote != nil ||
+		len(message.Responses) != 0 {
+		return errors.New("raftmodel: malformed leader-transfer message")
+	}
+	status := n.raw.BasicStatus()
+	if status.GetTerm() == 0 || message.GetTerm() != status.GetTerm() || status.Lead != message.GetFrom() {
+		return errors.New("raftmodel: leader-transfer message is not from the current-term leader")
+	}
+	fromVoter := false
+	toVoter := false
+	n.raw.WithProgress(func(id uint64, kind raft.ProgressType, _ tracker.Progress) {
+		if kind != raft.ProgressTypePeer {
+			return
+		}
+		fromVoter = fromVoter || id == message.GetFrom()
+		toVoter = toVoter || id == message.GetTo()
+	})
+	if !fromVoter || !toVoter {
+		return errors.New("raftmodel: leader-transfer endpoints are not current voters")
 	}
 	return nil
 }

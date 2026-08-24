@@ -1085,6 +1085,76 @@ func TestReadIndexRejectsLeadershipChangeBeforeRelease(t *testing.T) {
 	}
 }
 
+func TestStepAdmitsOnlyCurrentLeaderTimeoutNow(t *testing.T) {
+	newFollower := func(t *testing.T) (*Node, uint64) {
+		t.Helper()
+		node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+		term := node.Status().GetTerm() + 1
+		if err := node.Step(&pb.Message{
+			Type: pb.MsgHeartbeat.Enum(), From: uint64Ptr(2), To: uint64Ptr(1),
+			Term: &term, Commit: uint64Ptr(node.Status().GetCommit()),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		driveAllReady(t, node)
+		if status := node.Status(); status.Lead != 2 || status.GetTerm() != term {
+			t.Fatalf("follower status = %+v", status)
+		}
+		return node, term
+	}
+	timeoutNow := func(term uint64) *pb.Message {
+		return &pb.Message{
+			Type: pb.MsgTimeoutNow.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+		}
+	}
+
+	node, term := newFollower(t)
+	if err := node.Step(timeoutNow(term)); err != nil {
+		t.Fatalf("current leader TimeoutNow = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*pb.Message)
+	}{
+		{name: "stale term", mutate: func(message *pb.Message) { *message.Term-- }},
+		{name: "wrong source", mutate: func(message *pb.Message) { message.From = uint64Ptr(3) }},
+		{name: "wrong destination", mutate: func(message *pb.Message) { message.To = uint64Ptr(3) }},
+		{name: "entry", mutate: func(message *pb.Message) { message.Entries = []*pb.Entry{{}} }},
+		{name: "snapshot", mutate: func(message *pb.Message) { message.Snapshot = &pb.Snapshot{} }},
+		{name: "context", mutate: func(message *pb.Message) { message.Context = []byte("x") }},
+		{name: "explicit zero index", mutate: func(message *pb.Message) { message.Index = uint64Ptr(0) }},
+		{name: "reject", mutate: func(message *pb.Message) { value := false; message.Reject = &value }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node, term := newFollower(t)
+			message := timeoutNow(term)
+			test.mutate(message)
+			if err := node.Step(message); err == nil {
+				t.Fatal("unsafe TimeoutNow was accepted")
+			}
+		})
+	}
+
+	t.Run("learner target", func(t *testing.T) {
+		node, _, _ := newTestNodeWithConfState(t, 1, 1, &pb.ConfState{
+			Voters: []uint64{2}, Learners: []uint64{1},
+		})
+		term := node.Status().GetTerm() + 1
+		if err := node.Step(&pb.Message{
+			Type: pb.MsgHeartbeat.Enum(), From: uint64Ptr(2), To: uint64Ptr(1), Term: &term,
+			Commit: uint64Ptr(node.Status().GetCommit()),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		driveAllReady(t, node)
+		if err := node.Step(timeoutNow(term)); err == nil {
+			t.Fatal("learner target accepted TimeoutNow")
+		}
+	})
+}
+
 func TestApplyFailureIsFailStop(t *testing.T) {
 	node, _, machine := newTestNode(t, 1, []uint64{1})
 	driveCampaign(t, node)
@@ -1508,8 +1578,16 @@ func (m *fakeStateMachine) InstallSnapshot(snapshot *pb.Snapshot) (Publication, 
 
 func newTestNode(t *testing.T, incarnation uint64, voters []uint64) (*Node, *fakeStable, *fakeStateMachine) {
 	t.Helper()
+	return newTestNodeWithConfState(t, 1, incarnation, &pb.ConfState{Voters: slices.Clone(voters)})
+}
+
+func newTestNodeWithConfState(
+	t *testing.T,
+	memberID, incarnation uint64,
+	confState *pb.ConfState,
+) (*Node, *fakeStable, *fakeStateMachine) {
+	t.Helper()
 	index, term := uint64(1), uint64(1)
-	confState := &pb.ConfState{Voters: slices.Clone(voters)}
 	snapshot := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
 		ConfState: cloneConfState(confState),
 		Index:     &index,
@@ -1537,7 +1615,7 @@ func newTestNode(t *testing.T, incarnation uint64, voters []uint64) (*Node, *fak
 		snapshotReplicaSetVersion: index,
 		snapshotConfState:         cloneConfState(confState),
 	}
-	node, err := NewNode(1, incarnation, stable, machine)
+	node, err := NewNode(memberID, incarnation, stable, machine)
 	if err != nil {
 		t.Fatalf("NewNode() error = %v", err)
 	}

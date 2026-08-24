@@ -672,6 +672,126 @@ func TestRuntimeStepDetachesOrdinaryMessageAndRejectsSnapshot(t *testing.T) {
 	}
 }
 
+func TestRuntimeStepsCurrentLeaderTimeoutNow(t *testing.T) {
+	identity := testWALIdentity(241)
+	peer := identity.MemberID + 1
+	newFollower := func(t *testing.T) (runtimeFixture, uint64) {
+		t.Helper()
+		fixture := newRuntimeFixture(t, 241, []uint64{identity.MemberID, peer})
+		drainRuntime(t, fixture.runtime, nil)
+		status, err := fixture.runtime.Status()
+		if err != nil {
+			t.Fatal(err)
+		}
+		term := status.Term + 1
+		if err := fixture.runtime.StepMessage(&pb.Message{
+			Type: pb.MsgHeartbeat.Enum(), From: runtimeUint64Ptr(peer),
+			To: runtimeUint64Ptr(identity.MemberID), Term: &term, Commit: runtimeUint64Ptr(status.Commit),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		drainRuntime(t, fixture.runtime, nil)
+		return fixture, term
+	}
+
+	fixture, term := newFollower(t)
+	if err := fixture.runtime.StepMessage(&pb.Message{
+		Type: pb.MsgTimeoutNow.Enum(), From: runtimeUint64Ptr(peer),
+		To: runtimeUint64Ptr(identity.MemberID), Term: &term,
+	}); err != nil {
+		t.Fatalf("current leader TimeoutNow = %v", err)
+	}
+
+	stale, currentTerm := newFollower(t)
+	currentTerm--
+	if err := stale.runtime.StepMessage(&pb.Message{
+		Type: pb.MsgTimeoutNow.Enum(), From: runtimeUint64Ptr(peer),
+		To: runtimeUint64Ptr(identity.MemberID), Term: &currentTerm,
+	}); err == nil {
+		t.Fatal("stale TimeoutNow was accepted")
+	}
+}
+
+func TestRuntimeTransfersLeaderWithExactTimeoutNow(t *testing.T) {
+	identity := testWALIdentity(242)
+	peer := identity.MemberID + 1
+	fixture := newRuntimeFixture(t, 242, []uint64{identity.MemberID, peer})
+	drainRuntime(t, fixture.runtime, nil)
+
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	var preVote *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgPreVote && outbound.To == peer {
+			preVote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if preVote == nil {
+		t.Fatal("campaign produced no pre-vote request")
+	}
+	if err := fixture.runtime.StepMessage(&pb.Message{
+		Type: pb.MsgPreVoteResp.Enum(), From: runtimeUint64Ptr(peer),
+		To: runtimeUint64Ptr(identity.MemberID), Term: runtimeUint64Ptr(preVote.GetTerm()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var vote *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgVote && outbound.To == peer {
+			vote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if vote == nil {
+		t.Fatal("pre-vote response produced no vote request")
+	}
+	if err := fixture.runtime.StepMessage(&pb.Message{
+		Type: pb.MsgVoteResp.Enum(), From: runtimeUint64Ptr(peer),
+		To: runtimeUint64Ptr(identity.MemberID), Term: runtimeUint64Ptr(vote.GetTerm()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var appendMessage *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgApp && outbound.To == peer {
+			appendMessage = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if appendMessage == nil || len(appendMessage.GetEntries()) == 0 {
+		t.Fatalf("leadership produced no append: %v", appendMessage)
+	}
+	lastIndex := appendMessage.GetEntries()[len(appendMessage.GetEntries())-1].GetIndex()
+	if err := fixture.runtime.StepMessage(&pb.Message{
+		Type: pb.MsgAppResp.Enum(), From: runtimeUint64Ptr(peer),
+		To: runtimeUint64Ptr(identity.MemberID), Term: runtimeUint64Ptr(appendMessage.GetTerm()),
+		Index: runtimeUint64Ptr(lastIndex),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	if err := fixture.runtime.TransferLeader(peer); err != nil {
+		t.Fatal(err)
+	}
+	var timeoutNow *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgTimeoutNow {
+			timeoutNow = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if timeoutNow == nil || timeoutNow.GetFrom() != identity.MemberID || timeoutNow.GetTo() != peer ||
+		timeoutNow.GetTerm() == 0 {
+		t.Fatalf("leader transfer message = %v", timeoutNow)
+	}
+	if _, err := MeasureOrdinaryMessage(timeoutNow); err != nil {
+		t.Fatalf("generated TimeoutNow is not canonical: %v", err)
+	}
+}
+
 func TestRuntimeTerminalWALCapacityFailureLatches(t *testing.T) {
 	options := testWALOptions()
 	options.MaxFileBytes = 384 << 20
@@ -793,6 +913,39 @@ func TestCloneOrdinaryMessageRejectsGraphAmplification(t *testing.T) {
 	base.Term = runtimeUint64Ptr(9)
 	if owned.GetTerm() != 1 {
 		t.Fatalf("owned clone aliased caller term %d", owned.GetTerm())
+	}
+}
+
+func TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow(t *testing.T) {
+	base := &pb.Message{
+		Type: pb.MsgTimeoutNow.Enum(), From: runtimeUint64Ptr(1), To: runtimeUint64Ptr(2),
+		Term: runtimeUint64Ptr(3),
+	}
+	if size, err := MeasureOrdinaryMessage(base); err != nil || size == 0 {
+		t.Fatalf("exact TimeoutNow = %d, %v", size, err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*pb.Message)
+	}{
+		{name: "zero term", mutate: func(message *pb.Message) { message.Term = runtimeUint64Ptr(0) }},
+		{name: "missing term", mutate: func(message *pb.Message) { message.Term = nil }},
+		{name: "entry", mutate: func(message *pb.Message) { message.Entries = []*pb.Entry{{}} }},
+		{name: "snapshot", mutate: func(message *pb.Message) { message.Snapshot = &pb.Snapshot{} }},
+		{name: "context", mutate: func(message *pb.Message) { message.Context = []byte("x") }},
+		{name: "explicit index", mutate: func(message *pb.Message) { message.Index = runtimeUint64Ptr(0) }},
+		{name: "explicit commit", mutate: func(message *pb.Message) { message.Commit = runtimeUint64Ptr(0) }},
+		{name: "reject", mutate: func(message *pb.Message) { value := false; message.Reject = &value }},
+		{name: "response", mutate: func(message *pb.Message) { message.Responses = []*pb.Message{{}} }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := proto.Clone(base).(*pb.Message)
+			test.mutate(message)
+			if _, err := MeasureOrdinaryMessage(message); err == nil {
+				t.Fatal("unsafe TimeoutNow was accepted")
+			}
+		})
 	}
 }
 
