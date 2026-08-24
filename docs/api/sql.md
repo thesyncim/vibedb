@@ -89,6 +89,13 @@ One parameter has a 4 MiB limit. The total bound payload has a 16 MiB limit.
 The driver rejects invalid UTF-8 and nonfinite numbers. It keeps exact numeric
 values exact during normalization.
 
+A named-column `INSERT ... VALUES` accepts JSON scalar driver values. A
+`vibejson.RawValue` is accepted only when it contains one valid JSON number and
+is emitted with that exact numeric spelling; it is never encoded as its Go
+struct representation. `encoding/json.Number` remains accepted as an input
+compatibility type, but production document encoding is performed by
+`vibejson`.
+
 A physical connection can have only one open `Rows`. Close or exhaust the rows
 before you run another statement on that same connection.
 

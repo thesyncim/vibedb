@@ -3,11 +3,12 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
-	"encoding/json"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"unicode/utf8"
 	"unsafe"
 
@@ -18,7 +19,9 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
+	vibejsonsimd "github.com/thesyncim/vibejson/simd"
 	"github.com/thesyncim/vibejson/x/byteview"
+	"github.com/thesyncim/vibejson/x/scanner"
 )
 
 var errNoLastInsertID = errors.New("vibedb: LastInsertId is unavailable; primary keys come from JSON documents")
@@ -1335,20 +1338,11 @@ func resolveInsertRow(
 	if len(insert.Columns) == 0 {
 		document, err = operandDocument(statement, row.Values[0], args)
 	} else {
-		value := make(map[string]any, len(insert.Columns))
-		inputBytes := 2
-		for i, column := range insert.Columns {
-			value[column.Segments[0].Key], err = jsonOperandValue(row.Values[i], args)
-			if err != nil {
-				return nil, "", err
-			}
-			inputBytes += len(column.Segments[0].Key) + 4 +
-				scalarInputBytes(value[column.Segments[0].Key])
-			if inputBytes > limits.MaxDocumentBytes {
-				return nil, "", durable.ErrDocumentTooLarge
-			}
-		}
-		document, err = json.Marshal(value)
+		document, err = encodeFlatInsertDocument(
+			statement.InsertFlatFieldOrdinals(), statement.InsertFlatKeyJSONBytes(),
+			insert, row, args,
+			limits.MaxDocumentBytes,
+		)
 	}
 	if err != nil {
 		return nil, "", err
@@ -1362,17 +1356,345 @@ func resolveInsertRow(
 	return document, key, err
 }
 
-func scalarInputBytes(value any) int {
-	switch value := value.(type) {
-	case string:
-		return len(value)
-	case json.Number:
-		return len(value)
-	case nil:
-		return 4
-	default:
-		return 8
+type flatInsertDocument struct {
+	insert   *sqlast.InsertStmt
+	row      *sqlast.InsertRow
+	args     []any
+	ordinals []uint32
+	err      error
+}
+
+var flatInsertEncoder = compileFlatInsertEncoder()
+
+var flatInsertDocumentPool = sync.Pool{
+	New: func() any { return new(flatInsertDocument) },
+}
+
+func compileFlatInsertEncoder() vibejson.Encoder[flatInsertDocument] {
+	encoder, err := vibejson.CompileEncoder[flatInsertDocument](vibejson.EncoderOptions{})
+	if err != nil {
+		panic(fmt.Sprintf("vibedb: compile flat INSERT encoder: %v", err))
 	}
+	return encoder
+}
+
+// MarshalVibeJSON writes the already-compiled key order directly through
+// vibejson. It deliberately emits one syntactically valid null after a scalar
+// error so hook-validation builds still see a valid object; the caller rejects
+// the output through d.err and never publishes it.
+func (d *flatInsertDocument) MarshalVibeJSON(
+	w vibejson.TrustedAppender,
+) vibejson.TrustedAppender {
+	w = w.RawByteUnchecked('{')
+	for output, ordinal := range d.ordinals {
+		if output != 0 {
+			w = w.RawByteUnchecked(',')
+		}
+		column := d.insert.Columns[ordinal]
+		w = w.String(column.Segments[0].Key).RawByteUnchecked(':')
+		if d.err != nil {
+			w = w.Null()
+			continue
+		}
+		value, err := flatInsertOperandValue(d.row.Values[ordinal], d.args)
+		if err == nil {
+			w, err = appendFlatInsertScalar(w, value)
+		}
+		if err != nil {
+			d.err = err
+			w = w.Null()
+		}
+	}
+	return w.RawByteUnchecked('}')
+}
+
+func encodeFlatInsertDocument(
+	ordinals []uint32,
+	keyJSONBytes uint64,
+	insert *sqlast.InsertStmt,
+	row *sqlast.InsertRow,
+	args []any,
+	maxDocumentBytes int,
+) ([]byte, error) {
+	if len(ordinals) == 0 || len(insert.Columns) != len(row.Values) {
+		return nil, errors.New("vibedb: internal flat INSERT shape is incomplete")
+	}
+	if maxDocumentBytes < 0 {
+		return nil, durable.ErrDocumentTooLarge
+	}
+	maxBytes := uint64(maxDocumentBytes)
+	encodedBytes := uint64(2)                      // opening and closing object braces
+	structuralBytes := uint64(len(insert.Columns)) // one colon per field
+	if len(insert.Columns) > 1 {
+		structuralBytes += uint64(len(insert.Columns) - 1) // commas
+	}
+	for index := range insert.Columns {
+		value, err := flatInsertOperandValue(row.Values[index], args)
+		if err != nil {
+			return nil, err
+		}
+		scalarBytes, err := flatScalarEncodedCapacity(value, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		if !addFlatEncodedBytes(&encodedBytes, scalarBytes, maxBytes) {
+			return nil, durable.ErrDocumentTooLarge
+		}
+	}
+	// Inspect operands before rejecting immutable key/structure overhead so an
+	// unbound or malformed scalar retains binding-error priority.
+	if !addFlatEncodedBytes(&encodedBytes, keyJSONBytes, maxBytes) ||
+		!addFlatEncodedBytes(&encodedBytes, structuralBytes, maxBytes) {
+		return nil, durable.ErrDocumentTooLarge
+	}
+	document := flatInsertDocumentPool.Get().(*flatInsertDocument)
+	*document = flatInsertDocument{
+		insert: insert, row: row, args: args, ordinals: ordinals,
+	}
+	encoded, err := flatInsertEncoder.AppendJSON(
+		make([]byte, 0, int(encodedBytes)), document,
+	)
+	documentErr := document.err
+	releaseFlatInsertDocument(document)
+	if documentErr != nil {
+		return nil, documentErr
+	}
+	return encoded, err
+}
+
+func releaseFlatInsertDocument(document *flatInsertDocument) {
+	*document = flatInsertDocument{}
+	flatInsertDocumentPool.Put(document)
+}
+
+func flatScalarEncodedCapacity(value any, limit uint64) (uint64, error) {
+	var encoded uint64
+	switch value := value.(type) {
+	case nil:
+		encoded = 4
+	case bool:
+		if value {
+			encoded = 4
+		} else {
+			encoded = 5
+		}
+	case int:
+		encoded = flatIntBytes(int64(value))
+	case int8:
+		encoded = flatIntBytes(int64(value))
+	case int16:
+		encoded = flatIntBytes(int64(value))
+	case int32:
+		encoded = flatIntBytes(int64(value))
+	case int64:
+		encoded = flatIntBytes(value)
+	case uint:
+		encoded = flatUintBytes(uint64(value))
+	case uint8:
+		encoded = flatUintBytes(uint64(value))
+	case uint16:
+		encoded = flatUintBytes(uint64(value))
+	case uint32:
+		encoded = flatUintBytes(uint64(value))
+	case uint64:
+		encoded = flatUintBytes(value)
+	case float32:
+		return flatFloat64EncodedBytes(float64(value), limit)
+	case float64:
+		return flatFloat64EncodedBytes(value, limit)
+	case string:
+		return flatJSONStringEncodedBytes(value, limit)
+	case []byte:
+		return flatJSONStringEncodedBytes(byteview.String(value), limit)
+	case query.Number:
+		encoded = uint64(len(value))
+	case stdjson.Number:
+		encoded = uint64(len(value))
+	case vibejson.RawValue:
+		raw, ok := value.NumberBytes()
+		if !ok {
+			return 0, errors.New("vibedb: raw scalar parameter must be a JSON number")
+		}
+		encoded = uint64(len(raw))
+	case *bool:
+		if *value {
+			encoded = 4
+		} else {
+			encoded = 5
+		}
+	case *int64:
+		encoded = flatIntBytes(*value)
+	case *float64:
+		return flatFloat64EncodedBytes(*value, limit)
+	case *string:
+		return flatJSONStringEncodedBytes(*value, limit)
+	case *query.Number:
+		encoded = uint64(len(*value))
+	default:
+		return 0, fmt.Errorf("vibedb: %T is not a JSON scalar driver value", value)
+	}
+	if encoded > limit {
+		return 0, durable.ErrDocumentTooLarge
+	}
+	return encoded, nil
+}
+
+func flatFloat64EncodedBytes(value float64, limit uint64) (uint64, error) {
+	var scratch [32]byte
+	encoded, ok := vibejsonsimd.AppendFloat64(scratch[:0], value)
+	if !ok {
+		return 0, errors.New("vibedb: numeric parameters must be finite JSON numbers")
+	}
+	if uint64(len(encoded)) > limit {
+		return 0, durable.ErrDocumentTooLarge
+	}
+	return uint64(len(encoded)), nil
+}
+
+func addFlatEncodedBytes(total *uint64, additional, limit uint64) bool {
+	if *total > limit || additional > limit-*total {
+		return false
+	}
+	*total += additional
+	return true
+}
+
+// flatJSONStringEncodedBytes validates UTF-8 and returns the exact byte count
+// emitted by TrustedAppender.String under encoding/json-compatible HTML
+// escaping. One scanner pass therefore replaces a separate validation pass and
+// a conservative capacity guess.
+func flatJSONStringEncodedBytes(value string, limit uint64) (uint64, error) {
+	encoded := uint64(2)
+	tooLarge := false
+	if !addFlatEncodedBytes(&encoded, uint64(len(value)), limit) {
+		tooLarge = true
+	}
+	raw := byteview.Bytes(value)
+	for cursor := 0; cursor < len(raw); {
+		special := scanner.IndexHTMLStringSpecial(raw, cursor)
+		if special == len(raw) {
+			break
+		}
+		if raw[special] < utf8.RuneSelf {
+			extra := uint64(1)
+			switch raw[special] {
+			case '\b', '\f', '\n', '\r', '\t', '"', '\\':
+			default:
+				extra = 5
+			}
+			if !tooLarge && !addFlatEncodedBytes(&encoded, extra, limit) {
+				tooLarge = true
+			}
+			cursor = special + 1
+			continue
+		}
+		r, width := utf8.DecodeRune(raw[special:])
+		if r == utf8.RuneError && width == 1 {
+			return 0, errors.New("vibedb: a flat INSERT string must be valid UTF-8")
+		}
+		if (r == '\u2028' || r == '\u2029') && !tooLarge &&
+			!addFlatEncodedBytes(&encoded, 3, limit) {
+			tooLarge = true
+		}
+		cursor = special + width
+	}
+	if tooLarge {
+		return 0, durable.ErrDocumentTooLarge
+	}
+	return encoded, nil
+}
+
+func flatIntBytes(value int64) uint64 {
+	if value >= 0 {
+		return flatUintBytes(uint64(value))
+	}
+	return 1 + flatUintBytes(uint64(-(value+1))+1)
+}
+
+func flatUintBytes(value uint64) uint64 {
+	encoded := uint64(1)
+	for value >= 10 {
+		value /= 10
+		encoded++
+	}
+	return encoded
+}
+
+func appendFlatInsertScalar(
+	w vibejson.TrustedAppender,
+	value any,
+) (vibejson.TrustedAppender, error) {
+	switch value := value.(type) {
+	case nil:
+		return w.Null(), nil
+	case bool:
+		return w.Bool(value), nil
+	case int:
+		return w.Int(int64(value)), nil
+	case int8:
+		return w.Int(int64(value)), nil
+	case int16:
+		return w.Int(int64(value)), nil
+	case int32:
+		return w.Int(int64(value)), nil
+	case int64:
+		return w.Int(value), nil
+	case uint:
+		return w.Uint(uint64(value)), nil
+	case uint8:
+		return w.Uint(uint64(value)), nil
+	case uint16:
+		return w.Uint(uint64(value)), nil
+	case uint32:
+		return w.Uint(uint64(value)), nil
+	case uint64:
+		return w.Uint(value), nil
+	case float32:
+		// Preserve the old flat-INSERT rule: widen first, then choose the
+		// shortest exact float64 spelling.
+		return w.Float64(float64(value)), nil
+	case float64:
+		return w.Float64(value), nil
+	case string:
+		return w.String(value), nil
+	case []byte:
+		return w.String(byteview.String(value)), nil
+	case query.Number:
+		return appendFlatInsertNumber(w, byteview.Bytes(string(value)))
+	case stdjson.Number:
+		return appendFlatInsertNumber(w, byteview.Bytes(string(value)))
+	case vibejson.RawValue:
+		// RawValue is the zero-copy exact-number carrier accepted by the SQL
+		// operand boundary. The former map encoder accidentally serialized its
+		// exported Src field as base64 instead of honoring that scalar contract.
+		raw, ok := value.NumberBytes()
+		if !ok {
+			return w, errors.New("vibedb: raw scalar parameter must be a JSON number")
+		}
+		return w.RawBytesUnchecked(raw), nil
+	case *bool:
+		return w.Bool(*value), nil
+	case *int64:
+		return w.Int(*value), nil
+	case *float64:
+		return w.Float64(*value), nil
+	case *string:
+		return w.String(*value), nil
+	case *query.Number:
+		return appendFlatInsertNumber(w, byteview.Bytes(string(*value)))
+	default:
+		return w, fmt.Errorf("vibedb: %T is not a JSON scalar driver value", value)
+	}
+}
+
+func appendFlatInsertNumber(
+	w vibejson.TrustedAppender,
+	raw []byte,
+) (vibejson.TrustedAppender, error) {
+	if _, ok := (vibejson.RawValue{Src: raw}).NumberBytes(); !ok {
+		return w, fmt.Errorf("vibedb: invalid JSON number %q", raw)
+	}
+	return w.RawBytesUnchecked(raw), nil
 }
 
 func tableMutationLimits(t *table) (durable.Options, error) {
@@ -1408,6 +1730,18 @@ func operandDocument(statement *query.DMLStatement, operand sqlast.Operand, args
 }
 
 func operandValue(operand sqlast.Operand, args []any) (any, error) {
+	return operandValueWithUTF8(operand, args, true)
+}
+
+func flatInsertOperandValue(operand sqlast.Operand, args []any) (any, error) {
+	return operandValueWithUTF8(operand, args, false)
+}
+
+func operandValueWithUTF8(
+	operand sqlast.Operand,
+	args []any,
+	validateUTF8 bool,
+) (any, error) {
 	switch operand.Kind {
 	case sqlast.OperandParam:
 		if operand.Ordinal >= len(args) {
@@ -1435,12 +1769,12 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 			}
 			return arg, nil
 		case string:
-			if !utf8.ValidString(value) {
+			if validateUTF8 && !utf8.ValidString(value) {
 				return nil, errors.New(
 					"vibedb: a flat INSERT string must be valid UTF-8")
 			}
 			return arg, nil
-		case query.Number, json.Number:
+		case query.Number, stdjson.Number:
 			return arg, nil
 		case vibejson.RawValue:
 			if _, ok := value.NumberBytes(); !ok {
@@ -1449,7 +1783,7 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 			}
 			return arg, nil
 		case []byte:
-			if !utf8.Valid(value) {
+			if validateUTF8 && !utf8.Valid(value) {
 				return nil, errors.New(
 					"vibedb: a flat INSERT string must be valid UTF-8")
 			}
@@ -1477,7 +1811,7 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 			if value == nil {
 				return nil, nil
 			}
-			if !utf8.ValidString(*value) {
+			if validateUTF8 && !utf8.ValidString(*value) {
 				return nil, errors.New(
 					"vibedb: a flat INSERT string must be valid UTF-8")
 			}
@@ -1491,7 +1825,7 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 			return nil, fmt.Errorf("vibedb: %T is not a JSON scalar driver value", value)
 		}
 	case sqlast.OperandString:
-		if !utf8.ValidString(operand.Text) {
+		if validateUTF8 && !utf8.ValidString(operand.Text) {
 			return nil, errors.New(
 				"vibedb: a flat INSERT string must be valid UTF-8")
 		}
@@ -1499,42 +1833,9 @@ func operandValue(operand sqlast.Operand, args []any) (any, error) {
 	case sqlast.OperandBool:
 		return operand.Bool, nil
 	case sqlast.OperandNumber:
-		return json.Number(operand.Text), nil
+		return query.Number(operand.Text), nil
 	}
 	return nil, errors.New("vibedb: flat INSERT values must be JSON scalars or placeholders")
-}
-
-// jsonOperandValue is the flat-INSERT encoder boundary. operandValue preserves
-// caller interface headers and pointer-shaped protocol slots for the
-// allocation-free primary-key path; encoding/json instead needs exact numbers
-// identified as json.Number and byte strings identified as strings.
-func jsonOperandValue(operand sqlast.Operand, args []any) (any, error) {
-	value, err := operandValue(operand, args)
-	if err != nil {
-		return nil, err
-	}
-	switch value := value.(type) {
-	case query.Number:
-		return json.Number(value), nil
-	case *query.Number:
-		return json.Number(*value), nil
-	case []byte:
-		return string(value), nil
-	case float32:
-		// Match query's float32 literal rule: it widens to float64 before
-		// choosing the exact decimal spelling.
-		return float64(value), nil
-	case *bool:
-		return *value, nil
-	case *int64:
-		return *value, nil
-	case *float64:
-		return *value, nil
-	case *string:
-		return *value, nil
-	default:
-		return value, nil
-	}
 }
 
 func documentKey(
