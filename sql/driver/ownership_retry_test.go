@@ -103,7 +103,7 @@ func ownershipRetryConditionalImage(
 }
 
 func TestReplicatedApplyRetriesRetainedCandidateDetachBeforeReplacement(t *testing.T) {
-	_, db, base := bindReplicatedApplyTestRoot(t, "apply-detach-retry")
+	path, db, base := bindReplicatedApplyTestRoot(t, "apply-detach-retry")
 	core := db.connector.db
 	options := testReplicatedApplyOptions()
 	bootstrap := testReplicatedApplyBootstrap()
@@ -176,6 +176,23 @@ func TestReplicatedApplyRetriesRetainedCandidateDetachBeforeReplacement(t *testi
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, identity)
+	if err != nil {
+		t.Fatalf("reopen activation after detach retry: %v", err)
+	}
+	reopenedClaim, reopenedIdentity, err := reopened.OpenReplicatedApply(
+		base, bootstrap, options,
+	)
+	if err != nil || reopenedClaim == nil || reopenedIdentity != identity {
+		t.Fatalf("reacquire activation after detach retry = %p,%+v,%v",
+			reopenedClaim, reopenedIdentity, err)
+	}
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

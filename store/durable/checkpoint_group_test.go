@@ -341,6 +341,243 @@ func TestCheckpointGroupActivationRejectsRecycledGenericMarkerBase(t *testing.T)
 	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
 }
 
+func TestCheckpointGroupActivationBaselineResetsRecycledGenericMarker(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	retired := [16]byte{0x7f}
+	if _, err := log.marker.AppendRetirement(retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := log.marker.Header()
+	if err := log.marker.Recycle(before.Epoch + 1); err != nil {
+		t.Fatal(err)
+	}
+	before = log.marker.Header()
+	if before.BaseSequence == 0 || log.marker.Cursor() != 0 {
+		t.Fatalf("generic recycled marker = %+v/%d", before, log.marker.Cursor())
+	}
+
+	if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		t.Fatalf("ResetDischargedForCheckpointGroupActivation: %v", err)
+	}
+	after := log.marker.Header()
+	if after.MarkerID == before.MarkerID || after.Epoch != 1 ||
+		after.BaseSequence != 0 || after.RecycleCount != 1 ||
+		log.marker.Cursor() != 0 || log.marker.NextSequence() != 1 {
+		t.Fatalf("activation baseline = %+v cursor=%d next=%d, prior=%+v",
+			after, log.marker.Cursor(), log.marker.NextSequence(), before)
+	}
+
+	// A crash after the baseline but before descriptor/certificate publication is
+	// the canonical missing-certificate seam, never a recycled-owner rollback.
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+	collections, recoveredLog, recoveredGroup, err := OpenCollectionsWithCheckpointGroup(
+		crashImage, TxnLogOptions{}, requests, []string{"system", "user"},
+		CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	if collections != nil || recoveredLog != nil || recoveredGroup != nil ||
+		!errors.Is(err, ErrCheckpointGroupMissing) {
+		t.Fatalf("pre-certificate crash = %v,%v,%v,%v",
+			collections, recoveredLog, recoveredGroup, err)
+	}
+	collections, recoveredLog, err = OpenCollectionsWithTransactions(
+		crashImage, TxnLogOptions{}, requests,
+	)
+	if err != nil {
+		t.Fatalf("generic reopen after pre-certificate crash: %v", err)
+	}
+	for _, collection := range collections {
+		if closeErr := collection.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+	if err := recoveredLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	group, err := NewCheckpointGroup(
+		log, members, CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	if err != nil {
+		t.Fatalf("NewCheckpointGroup after baseline: %v", err)
+	}
+	t.Cleanup(func() { _ = group.Close() })
+}
+
+func TestCheckpointGroupActivationBaselineZeroBaseIsExactNoOp(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader := log.marker.Header()
+	beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		t.Fatal(err)
+	}
+	if after := log.marker.Header(); after != beforeHeader {
+		t.Fatalf("zero-base baseline changed marker: before=%+v after=%+v",
+			beforeHeader, after)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+}
+
+func TestCheckpointGroupActivationBaselineRefusesExistingCertificate(t *testing.T) {
+	dir, _, log := newCheckpointGroupTestResources(t, "system", "user")
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := os.OpenFile(
+		filepath.Join(dir, checkpointGroupFilename),
+		os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := certificate.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupRecoveryRequired) {
+		t.Fatalf("existing-certificate baseline = %v", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineRefusesLiveMarker(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("live-marker baseline = %v, want ErrCheckpointGroupCorrupt", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineMintFaultsReopenGeneric(t *testing.T) {
+	fault := errors.New("injected crash after activation marker removal")
+	tests := []struct {
+		name  string
+		phase storeio.TxnMarkerFaultPhase
+		hook  bool
+	}{
+		{name: "after-remove", hook: true},
+		{name: "mint-header", phase: storeio.TxnMarkerFaultCreateHeaderWrite},
+		{name: "mint-file-sync", phase: storeio.TxnMarkerFaultCreateFileSync},
+		{name: "mint-directory-sync", phase: storeio.TxnMarkerFaultCreateParentDirSync},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+			for _, member := range members {
+				if err := log.AdoptCollection(member.Collection); err != nil {
+					t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+				}
+			}
+			if err := log.EnsureMinted(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.marker.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			header := log.marker.Header()
+			if err := log.marker.Recycle(header.Epoch + 1); err != nil {
+				t.Fatal(err)
+			}
+
+			previousHook := checkpointGroupAfterActivationBaselineRemoveHook
+			if test.hook {
+				checkpointGroupAfterActivationBaselineRemoveHook = func(*TxnLog) error {
+					return fault
+				}
+			} else {
+				storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{Phase: test.phase})
+			}
+			t.Cleanup(func() {
+				checkpointGroupAfterActivationBaselineRemoveHook = previousHook
+				storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			})
+			err := log.ResetDischargedForCheckpointGroupActivation()
+			createFaulted := storeio.TxnMarkerCreateFaulted()
+			checkpointGroupAfterActivationBaselineRemoveHook = previousHook
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			if !errors.Is(err, ErrCommitOutcomeUnknown) ||
+				(test.hook && !errors.Is(err, fault)) {
+				t.Fatalf("activation baseline fault = %v", err)
+			}
+			if !test.hook && !createFaulted {
+				t.Fatal("activation remint fault did not fire")
+			}
+			if log.marker != nil || !errors.Is(log.poison, ErrCommitOutcomeUnknown) {
+				t.Fatalf("faulted baseline owner = marker %v poison %v", log.marker, log.poison)
+			}
+			for _, member := range members {
+				if !errors.Is(member.Collection.PersistenceError(), ErrCommitOutcomeUnknown) {
+					t.Fatalf("member %q poison = %v", member.Name, member.Collection.PersistenceError())
+				}
+			}
+
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+			collections, recoveredLog, openErr := OpenCollectionsWithTransactions(
+				crashImage, TxnLogOptions{}, requests,
+			)
+			if openErr != nil {
+				t.Fatalf("generic reopen after activation remint fault: %v", openErr)
+			}
+			for _, collection := range collections {
+				if closeErr := collection.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+			}
+			if closeErr := recoveredLog.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			for _, file := range files {
+				if closeErr := file.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+			}
+		})
+	}
+}
+
 func TestCheckpointGroupUpdateConsecutiveSharesAtomicUpdateContract(t *testing.T) {
 	t.Run("single-entry parity", func(t *testing.T) {
 		_, ordinaryMembers, _, ordinary := newCheckpointGroupTestStore(t, 8)

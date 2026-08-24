@@ -551,6 +551,16 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 			)
 		}
 	}
+	// Generic detach recycles txn.vtm after discharging its conditional window.
+	// That clean recycle retains a nonzero monotonic BaseSequence. Reset it before
+	// publishing a new apply identity: the SQL descriptor is durable before the
+	// checkpoint certificate, and recovery must be able to distinguish that
+	// legitimate activation seam from deletion of an already-live certificate.
+	if err := d.txnLog.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		return ReplicatedApplyIdentity{}, fmt.Errorf(
+			"vibedb: prepare replicated checkpoint activation baseline: %w", err,
+		)
+	}
 
 	identity, err := d.createReplicatedApplyStorageLocked(expected, options)
 	if err != nil {

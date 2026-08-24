@@ -91,7 +91,8 @@ var (
 	)
 	// ErrCheckpointGroupMissing distinguishes a clean pre-activation replicated
 	// store from a checkpoint-group reopen. Callers may create format 0 only when
-	// every intended member is empty and the marker has no decision.
+	// every intended member is empty and the marker has no decision or recycled
+	// BaseSequence.
 	ErrCheckpointGroupMissing = errors.New(
 		"vibedb: checkpoint group certificate is missing",
 	)
@@ -340,11 +341,12 @@ const (
 )
 
 var (
-	checkpointGroupFaultHook                        func(checkpointGroupFaultPoint) error
-	checkpointGroupAfterInitialValidationHook       func()
-	checkpointGroupAfterDirectoryMembershipHook     func()
-	checkpointGroupCertificateCloseHook             func(*os.File) error
-	checkpointGroupGenericDatabaseAfterPrecheckHook func()
+	checkpointGroupFaultHook                         func(checkpointGroupFaultPoint) error
+	checkpointGroupAfterInitialValidationHook        func()
+	checkpointGroupAfterDirectoryMembershipHook      func()
+	checkpointGroupAfterActivationBaselineRemoveHook func(*TxnLog) error
+	checkpointGroupCertificateCloseHook              func(*os.File) error
+	checkpointGroupGenericDatabaseAfterPrecheckHook  func()
 	// checkpointGroupNamespaceLease serializes the in-process engine entry
 	// points that can create/open a collection with the activation scan and
 	// fixed-name certificate publication. It is intentionally process-global:
@@ -353,6 +355,144 @@ var (
 	// the caller's existing exclusive-directory responsibility.
 	checkpointGroupNamespaceLease sync.RWMutex
 )
+
+// ResetDischargedForCheckpointGroupActivation replaces a fully discharged
+// generic marker with the sole canonical pre-certificate baseline. A generic
+// recycle preserves its monotonic DCSN in Header.BaseSequence; carrying that
+// nonzero base across SQL's descriptor-before-certificate publication would
+// make a crash in that seam indistinguishable from loss of a live certificate.
+//
+// The caller must invoke this before durably publishing checkpoint-group
+// activation intent. This method proves that no live marker record or recovery
+// journal can depend on the old marker identity, then namespace-safely removes
+// and remints only a nonzero-base marker. Base zero is an exact no-op after the
+// same discharge proof. Any uncertain remove/remint outcome poisons the live
+// log and every registered collection; reopen is then the only recovery path.
+func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	checkpointGroupNamespaceLease.Lock()
+	defer checkpointGroupNamespaceLease.Unlock()
+
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if err := rejectCheckpointGroupCertificate(l.root); err != nil {
+		return err
+	}
+	registered := l.registeredCollections()
+	for _, collection := range registered {
+		if collection == nil {
+			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+		}
+	}
+	sortCollectionSnapshotOrder(registered)
+	for _, collection := range registered {
+		collection.writer.Lock()
+	}
+	defer func() {
+		for i := len(registered) - 1; i >= 0; i-- {
+			registered[i].writer.Unlock()
+		}
+	}()
+	for _, collection := range registered {
+		if collection == nil || collection.closed || collection.journal == nil ||
+			collection.journal.Cursor() != 0 {
+			return fmt.Errorf(
+				"%w: checkpoint activation requires clean registered journals",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	holds, err := directoryHoldsAnyConditional(l.root)
+	if err != nil {
+		return err
+	}
+	if holds {
+		return fmt.Errorf(
+			"%w: checkpoint activation directory retains a conditional journal",
+			ErrCheckpointGroupCorrupt,
+		)
+	}
+	if l.marker == nil {
+		if err := l.ensureMintedLocked(); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+		if err := l.verifyMarkerDirectoryLocked(); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+		return nil
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		return err
+	}
+	decisions, err := rescanTxnLogMarker(l)
+	if err != nil {
+		return err
+	}
+	if decisions == nil || decisions.MaxTxnID() != 0 ||
+		decisions.MaxDCSN() != 0 || decisions.RetirementCount() != 0 ||
+		l.marker.Cursor() != 0 || l.undischarged != 0 {
+		return fmt.Errorf(
+			"%w: checkpoint activation requires a discharged transaction marker",
+			ErrCheckpointGroupCorrupt,
+		)
+	}
+	if l.marker.Header().BaseSequence == 0 {
+		return nil
+	}
+
+	marker := l.marker
+	l.marker = nil
+	l.nextTxnID = 1
+	l.undischarged = 0
+	if err := marker.Remove(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if checkpointGroupAfterActivationBaselineRemoveHook != nil {
+		if err := checkpointGroupAfterActivationBaselineRemoveHook(l); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+	}
+	if err := l.ensureMintedLocked(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if l.marker.Cursor() != 0 || l.marker.Header().BaseSequence != 0 {
+		return l.poisonCheckpointGroupActivationBaselineLocked(
+			fmt.Errorf("%w: reminted transaction marker is not at cut zero", ErrCheckpointGroupCorrupt),
+		)
+	}
+	return nil
+}
+
+func (l *TxnLog) poisonCheckpointGroupActivationBaselineLocked(cause error) error {
+	poisoned := journalCommitOutcomeUnknown(fmt.Errorf(
+		"vibedb: reset checkpoint activation marker: %w", cause,
+	))
+	if l.poison != nil {
+		poisoned = errors.Join(l.poison, poisoned)
+	}
+	l.poison = poisoned
+	for _, collection := range l.registeredCollections() {
+		_ = joinCatalogCommitOutcomeUnknown(collection, poisoned)
+	}
+	return poisoned
+}
 
 // rejectCheckpointGroupCertificate prevents every generic catalog recovery
 // path from consulting txn.vtm or member journals while the format-0
@@ -432,8 +572,8 @@ func acquireCheckpointGroupRecoveryNamespace() (func(), error) {
 // never adopted from generic-recovered handles: callers must reopen it through
 // OpenCollectionsWithCheckpointGroup so an uncertified marker suffix cannot be
 // folded before the certificate is consulted. Format 0 is created only when
-// every member is logically empty and txn.vtm has no decision; this is the
-// crash-safe first-activation seam.
+// every member is logically empty and txn.vtm is at its clean zero-base
+// baseline; this is the crash-safe first-activation seam.
 func NewCheckpointGroup(
 	log *TxnLog,
 	members []NamedCollection,
