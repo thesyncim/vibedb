@@ -382,7 +382,11 @@ func FuzzReplicatedNativeRequestCanonical(f *testing.F) {
 		f.Add(seed.Bytes())
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > 1<<20 {
+		// DecodeReplicatedRequest consumes one frame from a persistent stream;
+		// trailing bytes may be the next request. Canonical uniqueness therefore
+		// applies only when the corpus item contains exactly one complete frame.
+		if len(data) < 5 || len(data) > 1<<20 ||
+			uint64(binary.BigEndian.Uint32(data[1:5]))+1 != uint64(len(data)) {
 			return
 		}
 		request, err := DecodeReplicatedRequest(bytes.NewReader(data))
