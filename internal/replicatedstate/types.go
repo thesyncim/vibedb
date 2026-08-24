@@ -176,14 +176,17 @@ func (keys AttemptedMutationKeys) Len() int { return len(keys.changes) }
 // returned bytes are borrowed and must be cloned before retention.
 func (keys AttemptedMutationKeys) Key(index int) []byte { return keys.changes[index].key }
 
-// MutationAttemptObserver is invoked synchronously before ApplyNormal returns
-// after the configured durable update has been attempted with nonempty user
-// changes. This deliberately includes definite and outcome-unknown failures.
-// updateErr is the exact durable-update result. A caller that needs to publish
-// conflict clocks only for actual or uncertain storage publication must compare
-// the collection Generation captured before Apply, inspect PersistenceError,
-// and conservatively accept an updateErr classified ErrCommitOutcomeUnknown.
-// Implementations must not retain key slices or reenter the Machine.
+// MutationAttemptObserver is invoked synchronously before ApplyNormal or
+// ApplyNormalBatch returns after the configured durable update has been
+// attempted with nonempty user changes. A batch supplies the exact sorted union
+// of changed keys across its selected logical prefix, including keys whose
+// final net value equals the initial cut. This deliberately includes definite
+// and outcome-unknown failures. updateErr is the exact durable-update result. A
+// caller that needs to publish conflict clocks only for actual or uncertain
+// storage publication must compare the collection Generation captured before
+// Apply, inspect PersistenceError, and conservatively accept an updateErr
+// classified ErrCommitOutcomeUnknown. Implementations must not retain key
+// slices or reenter the Machine.
 type MutationAttemptObserver func(AttemptedMutationKeys, error)
 
 // CollectionLimits repeats the collection's frozen durable bounds at the

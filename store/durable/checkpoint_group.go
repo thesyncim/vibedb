@@ -24,16 +24,36 @@ import (
 // replicated apply. It deliberately has one on-disk format (format 0): there is
 // no compatibility ladder and no alternate record grammar.
 const (
-	checkpointGroupFilename              = "checkpoint.vgc"
-	checkpointGroupFormat         uint16 = 0
-	checkpointGroupSlotBytes             = 4096
-	checkpointGroupSlots                 = 2
-	checkpointGroupFileBytes             = checkpointGroupSlotBytes * checkpointGroupSlots
-	checkpointGroupHeaderBytes           = 168
-	checkpointGroupMemberBytes           = 64
-	checkpointGroupChecksumOffset        = checkpointGroupSlotBytes - sha256.Size
-	checkpointGroupMaxMembers            = (checkpointGroupChecksumOffset - checkpointGroupHeaderBytes) / checkpointGroupMemberBytes
-	defaultCheckpointEvery               = 128
+	checkpointGroupFilename           = "checkpoint.vgc"
+	checkpointGroupFormat      uint16 = 0
+	checkpointGroupSlotBytes          = 4096
+	checkpointGroupSlots              = 2
+	checkpointGroupFileBytes          = checkpointGroupSlotBytes * checkpointGroupSlots
+	checkpointGroupHeaderBytes        = 168
+	// Byte 14 is the authenticated maximum logical apply span represented by any
+	// one physical transaction in this certificate's history. Byte 15 remains
+	// canonical zero padding. A max-span byte of zero is the sole canonical
+	// encoding of effective span one and preserves every
+	// legacy format-0 certificate byte-for-byte. Values 2..128 enable the
+	// bounded consecutive-update grammar. Encoded one and values above the hard
+	// bound are authenticated corruption.
+	checkpointGroupMaxApplySpanOffset = 14
+	checkpointGroupMemberBytes        = 64
+	checkpointGroupChecksumOffset     = checkpointGroupSlotBytes - sha256.Size
+	// The final 24 authenticated bytes before the checksum are outside even the
+	// maximum member bank (which ends at byte 4008). Legacy format-0 files keep
+	// them all zero. A widened max span uses them as the exact transaction/range
+	// witness that prevents a checksum-valid certificate from merely widening
+	// its applied/transaction sanity envelope.
+	checkpointGroupMaxSpanWitnessTxnOffset   = checkpointGroupChecksumOffset - 24
+	checkpointGroupMaxSpanWitnessFirstOffset = checkpointGroupChecksumOffset - 16
+	checkpointGroupMaxSpanWitnessLastOffset  = checkpointGroupChecksumOffset - 8
+	checkpointGroupMaxMembers                = (checkpointGroupMaxSpanWitnessTxnOffset - checkpointGroupHeaderBytes) / checkpointGroupMemberBytes
+	defaultCheckpointEvery                   = 128
+	// MaxCheckpointGroupUpdateEntries bounds the logical index range one
+	// physical group transaction may certify. It matches the replicated apply
+	// port's independent bound without importing that higher layer.
+	MaxCheckpointGroupUpdateEntries = 128
 )
 
 var checkpointGroupMagic = [8]byte{'V', 'I', 'B', 'E', 'C', 'P', 'G', 0}
@@ -73,8 +93,9 @@ var (
 		"vibedb: checkpoint group requires certificate-authoritative recovery",
 	)
 	// ErrCheckpointGroupSequence reports a non-consecutive replicated apply cut
-	// or exhausted internal transaction sequence. Same-index metadata
-	// publications are allowed; advancing publications must be exactly +1.
+	// or exhausted internal transaction sequence. Update permits same-index
+	// metadata publications or an advance of exactly +1. UpdateConsecutive
+	// permits one bounded range beginning exactly at the next apply index.
 	ErrCheckpointGroupSequence = errors.New(
 		"vibedb: invalid checkpoint group apply sequence",
 	)
@@ -86,8 +107,11 @@ var (
 	)
 )
 
-// CheckpointGroupOptions fixes the periodic certificate cadence. Zero selects
-// 128 transitions. Pressure may checkpoint earlier; it never checkpoints after
+// CheckpointGroupOptions fixes the periodic certificate cadence in physical
+// group transactions. Zero selects 128 transactions. Since one consecutive
+// update may cover MaxCheckpointGroupUpdateEntries logical apply indices, the
+// default certificate lag can reach 128*MaxCheckpointGroupUpdateEntries
+// logical indices. Pressure may checkpoint earlier. It never checkpoints after
 // publishing the mutation that encountered pressure.
 type CheckpointGroupOptions struct {
 	CheckpointEvery uint64
@@ -161,12 +185,17 @@ type CheckpointGroupStats struct {
 	TransactionHighWater   uint64
 	CheckpointTransactions uint64
 	Updates                uint64
-	Checkpoints            uint64
-	JournalSyncs           uint64
-	MarkerSyncs            uint64
-	CertificateSyncs       uint64
-	BarrierSyncs           uint64
-	PhysicalCheckpoints    uint64
+	// LargestUpdateSpan is the largest number of consecutive logical applied
+	// indices represented by one successful physical Update transaction. It is
+	// zero before the first transaction and one for legacy/single-entry history.
+	// Updates itself retains its physical-transaction meaning.
+	LargestUpdateSpan   uint64
+	Checkpoints         uint64
+	JournalSyncs        uint64
+	MarkerSyncs         uint64
+	CertificateSyncs    uint64
+	BarrierSyncs        uint64
+	PhysicalCheckpoints uint64
 }
 
 type checkpointGroupMember struct {
@@ -182,6 +211,10 @@ type checkpointGroupCertificate struct {
 	applied      uint64
 	txnHighWater uint64
 	txnBase      uint64
+	maxApplySpan uint8
+	maxSpanTxn   uint64
+	maxSpanFirst uint64
+	maxSpanLast  uint64
 	markerEpoch  uint64
 	markerID     [16]byte
 	seedApplied  uint64
@@ -204,19 +237,23 @@ type CheckpointGroup struct {
 	file     *os.File
 	fileInfo os.FileInfo
 
-	sequence    uint64
-	txnBase     uint64
-	markerEpoch uint64
-	markerID    [16]byte
-	txn         uint64
-	applied     uint64
-	foldedTxn   uint64
-	seedApplied uint64
-	seedState   [sha256.Size]byte
-	seedMember  [sha256.Size]byte
-	closed      bool
-	closeErr    error
-	poison      error
+	sequence     uint64
+	txnBase      uint64
+	markerEpoch  uint64
+	markerID     [16]byte
+	txn          uint64
+	applied      uint64
+	maxApplySpan uint8
+	maxSpanTxn   uint64
+	maxSpanFirst uint64
+	maxSpanLast  uint64
+	foldedTxn    uint64
+	seedApplied  uint64
+	seedState    [sha256.Size]byte
+	seedMember   [sha256.Size]byte
+	closed       bool
+	closeErr     error
+	poison       error
 
 	visibleApplied atomic.Uint64
 	visibleTxn     atomic.Uint64
@@ -747,7 +784,9 @@ func checkpointGroupFromCertificateLocked(
 		file: file, fileInfo: info, sequence: certificate.sequence,
 		txnBase: certificate.txnBase, markerEpoch: certificate.markerEpoch,
 		markerID: certificate.markerID, txn: certificate.txnHighWater,
-		applied: certificate.applied, foldedTxn: certificate.txnHighWater,
+		applied: certificate.applied, maxApplySpan: certificate.maxApplySpan,
+		maxSpanTxn: certificate.maxSpanTxn, maxSpanFirst: certificate.maxSpanFirst,
+		maxSpanLast: certificate.maxSpanLast, foldedTxn: certificate.txnHighWater,
 		seedApplied: certificate.seedApplied, seedState: certificate.seedState,
 		seedMember: certificate.seedMember,
 	}
@@ -1006,15 +1045,20 @@ func (g *CheckpointGroup) Stats() CheckpointGroupStats {
 		return CheckpointGroupStats{}
 	}
 	g.mu.Lock()
-	applied, txn := g.applied, g.txn
+	applied, txn, maxApplySpan := g.applied, g.txn, g.maxApplySpan
 	g.mu.Unlock()
+	largestUpdateSpan := uint64(maxApplySpan)
+	if largestUpdateSpan == 0 && txn != 0 {
+		largestUpdateSpan = 1
+	}
 	journal := g.journalSyncs.Load()
 	marker := g.markerSyncs.Load()
 	certificate := g.certificateSyncs.Load()
 	return CheckpointGroupStats{
 		AppliedIndex: applied, CheckpointAppliedIndex: g.certApplied.Load(),
 		TransactionHighWater: txn, CheckpointTransactions: g.certTxn.Load(),
-		Updates: g.updates.Load(), Checkpoints: g.checkpoints.Load(),
+		Updates: g.updates.Load(), LargestUpdateSpan: largestUpdateSpan,
+		Checkpoints:  g.checkpoints.Load(),
 		JournalSyncs: journal, MarkerSyncs: marker,
 		CertificateSyncs: certificate, BarrierSyncs: g.barrierSyncs.Load(),
 		PhysicalCheckpoints: g.physicalCheckpoints.Load(),
@@ -1131,6 +1175,49 @@ func (g *CheckpointGroup) Update(
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.updateLocked(checkpointGroupUpdate{
+		firstApplied: applied, lastApplied: applied,
+	}, members, limits, fn)
+}
+
+// UpdateConsecutive publishes one physical fixed-group transaction for a
+// bounded, non-empty range of consecutive replicated apply indices. The
+// caller has already evaluated every logical transition in [firstApplied,
+// lastApplied] in order and fn must write their exact final net state. The
+// certificate and reader-visible group cut advance directly to lastApplied.
+// recovery either retains the complete transaction or none of it.
+//
+// Same-index metadata transitions deliberately remain on Update. A seeded
+// group must also bind its required same-index snapshot base through Update
+// before this method can advance beyond the imported cut.
+func (g *CheckpointGroup) UpdateConsecutive(
+	firstApplied, lastApplied uint64,
+	members []NamedCollection,
+	limits TxnLimits,
+	fn func(*DatabaseBatch) error,
+) error {
+	if g == nil || fn == nil {
+		return ErrCheckpointGroupOwned
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.updateLocked(checkpointGroupUpdate{
+		firstApplied: firstApplied, lastApplied: lastApplied, consecutive: true,
+	}, members, limits, fn)
+}
+
+type checkpointGroupUpdate struct {
+	firstApplied uint64
+	lastApplied  uint64
+	consecutive  bool
+}
+
+func (g *CheckpointGroup) updateLocked(
+	update checkpointGroupUpdate,
+	members []NamedCollection,
+	limits TxnLimits,
+	fn func(*DatabaseBatch) error,
+) error {
 	if err := g.checkUsableLocked(); err != nil {
 		return err
 	}
@@ -1138,12 +1225,13 @@ func (g *CheckpointGroup) Update(
 		switch {
 		case g.txn == 0:
 			// The cut-zero certificate grants exactly one mutation authority:
-			// Seed must publish the committed state envelope. Letting ordinary
-			// Update consume txn 1 would strand or replace that proof.
+			// Seed must publish the committed state envelope. Letting an
+			// ordinary update consume txn 1 would strand or replace that proof.
 			return fmt.Errorf(
 				"%w: seeded cut zero requires Seed", ErrCheckpointGroupSequence,
 			)
-		case g.txn == 1 && g.applied == g.seedApplied && applied != g.seedApplied:
+		case g.txn == 1 && g.applied == g.seedApplied &&
+			(update.consecutive || update.lastApplied != g.seedApplied):
 			// The first transition after Seed binds the immutable snapshot
 			// base at the imported cut. It cannot advance apply and thereby
 			// make an unbound child appear activation-complete.
@@ -1153,16 +1241,31 @@ func (g *CheckpointGroup) Update(
 			)
 		}
 	}
-	// Periodic barriers are admission work for the next transition. This keeps
-	// every checkpoint failure pre-mutation: a caller never receives a terminal
-	// error after the transition it asked us to publish has become visible.
+	// Periodic barriers are admission work for the next physical transaction.
+	// This keeps every checkpoint failure pre-mutation: a caller never receives
+	// a terminal checkpoint error after its requested publication is visible.
 	if g.txn-g.certTxn.Load() >= g.opts.CheckpointEvery {
 		if err := g.checkpointLocked(); err != nil {
 			return err
 		}
 	}
-	if applied < g.applied || applied > g.applied+1 || applied == math.MaxUint64 {
-		return fmt.Errorf("%w: have %d, transition %d", ErrCheckpointGroupSequence, g.applied, applied)
+	if update.consecutive {
+		if g.applied == math.MaxUint64 || update.firstApplied != g.applied+1 ||
+			update.lastApplied < update.firstApplied ||
+			update.lastApplied == math.MaxUint64 ||
+			update.lastApplied-update.firstApplied >= MaxCheckpointGroupUpdateEntries {
+			return fmt.Errorf(
+				"%w: have %d, consecutive range [%d,%d]",
+				ErrCheckpointGroupSequence, g.applied,
+				update.firstApplied, update.lastApplied,
+			)
+		}
+	} else if update.lastApplied < g.applied ||
+		update.lastApplied > g.applied+1 || update.lastApplied == math.MaxUint64 {
+		return fmt.Errorf(
+			"%w: have %d, transition %d",
+			ErrCheckpointGroupSequence, g.applied, update.lastApplied,
+		)
 	}
 	ordered, err := validateTxnMembers(members)
 	if err != nil {
@@ -1170,7 +1273,10 @@ func (g *CheckpointGroup) Update(
 	}
 	for _, member := range ordered {
 		if owned := g.byName[member.Name]; owned == nil || owned != member.Collection {
-			return fmt.Errorf("%w: member %q is outside the fixed group", ErrCheckpointGroupOwned, member.Name)
+			return fmt.Errorf(
+				"%w: member %q is outside the fixed group",
+				ErrCheckpointGroupOwned, member.Name,
+			)
 		}
 	}
 
@@ -1232,22 +1338,29 @@ func (g *CheckpointGroup) Update(
 				return roomErr
 			}
 			if !room {
-				// The fixed participant decision cannot fit even in an empty
-				// marker. Report the immutable bound before appending any prepare.
 				return ErrTxnTooLarge
 			}
 		}
-		err = g.commitTransitionLocked(g.txn+1, applied, dirty, batch.byName)
+		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName)
 		if !errors.Is(err, ErrCheckpointGroupPressure) {
 			if err == nil {
+				if update.consecutive {
+					span := update.lastApplied - update.firstApplied + 1
+					if span > 1 && uint8(span) > g.maxApplySpan {
+						g.maxApplySpan = uint8(span)
+						g.maxSpanTxn = g.txn + 1
+						g.maxSpanFirst = update.firstApplied
+						g.maxSpanLast = update.lastApplied
+					}
+				}
 				g.txn++
-				g.applied = applied
+				g.applied = update.lastApplied
+				// Updates retains its format-0 meaning: physical group
+				// transactions, not the number of logical entries represented.
 				g.updates.Add(1)
 			}
 			return err
 		}
-		// The stage returned before logical publication. Certify and fold the
-		// already-visible prefix, then re-plan the intact caller batch once.
 		if err := g.checkpointLocked(); err != nil {
 			return err
 		}
@@ -1400,7 +1513,7 @@ func (g *CheckpointGroup) markerRoomLocked(participantCount int) (bool, error) {
 	return marker.Cursor()+uint64(padded) <= marker.Header().Capacity, nil
 }
 
-// MaybeCheckpoint applies the configured transition cadence.
+// MaybeCheckpoint applies the configured physical-transaction cadence.
 func (g *CheckpointGroup) MaybeCheckpoint() error {
 	if g == nil {
 		return ErrCheckpointGroupOwned
@@ -1546,7 +1659,9 @@ func (g *CheckpointGroup) recycleMarkerLocked() error {
 func (g *CheckpointGroup) certificateLocked() checkpointGroupCertificate {
 	return checkpointGroupCertificate{
 		sequence: g.sequence, applied: g.applied,
-		txnHighWater: g.txn, txnBase: g.txnBase,
+		txnHighWater: g.txn, txnBase: g.txnBase, maxApplySpan: g.maxApplySpan,
+		maxSpanTxn: g.maxSpanTxn, maxSpanFirst: g.maxSpanFirst,
+		maxSpanLast: g.maxSpanLast,
 		markerEpoch: g.markerEpoch, markerID: g.markerID,
 		seedApplied: g.seedApplied, seedState: g.seedState, seedMember: g.seedMember,
 		members: g.members,
@@ -1803,7 +1918,7 @@ func validateCheckpointMarkerRecords(
 
 func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, error) {
 	if len(c.members) == 0 || len(c.members) > checkpointGroupMaxMembers ||
-		checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes > checkpointGroupChecksumOffset ||
+		checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes > checkpointGroupMaxSpanWitnessTxnOffset ||
 		c.sequence == 0 || c.markerID == ([16]byte{}) || c.markerEpoch == 0 ||
 		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) {
 		return nil, ErrCheckpointGroupCorrupt
@@ -1813,6 +1928,7 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 	binary.LittleEndian.PutUint16(buf[8:10], checkpointGroupFormat)
 	binary.LittleEndian.PutUint16(buf[10:12], checkpointGroupHeaderBytes)
 	binary.LittleEndian.PutUint16(buf[12:14], uint16(len(c.members)))
+	buf[checkpointGroupMaxApplySpanOffset] = c.maxApplySpan
 	binary.LittleEndian.PutUint64(buf[16:24], c.sequence)
 	binary.LittleEndian.PutUint64(buf[24:32], c.applied)
 	binary.LittleEndian.PutUint64(buf[32:40], c.txnHighWater)
@@ -1831,6 +1947,18 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
 	copy(buf[144:168], membership.Sum(nil)[:24])
+	binary.LittleEndian.PutUint64(
+		buf[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupMaxSpanWitnessFirstOffset],
+		c.maxSpanTxn,
+	)
+	binary.LittleEndian.PutUint64(
+		buf[checkpointGroupMaxSpanWitnessFirstOffset:checkpointGroupMaxSpanWitnessLastOffset],
+		c.maxSpanFirst,
+	)
+	binary.LittleEndian.PutUint64(
+		buf[checkpointGroupMaxSpanWitnessLastOffset:checkpointGroupChecksumOffset],
+		c.maxSpanLast,
+	)
 	h := sha256.New()
 	_, _ = h.Write(checkpointGroupDigestDomain)
 	_, _ = h.Write(buf[:checkpointGroupChecksumOffset])
@@ -1853,7 +1981,7 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 	}
 	count := int(binary.LittleEndian.Uint16(buf[12:14]))
 	if count == 0 || count > checkpointGroupMaxMembers ||
-		checkpointGroupHeaderBytes+count*checkpointGroupMemberBytes > checkpointGroupChecksumOffset {
+		checkpointGroupHeaderBytes+count*checkpointGroupMemberBytes > checkpointGroupMaxSpanWitnessTxnOffset {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	c := checkpointGroupCertificate{
@@ -1861,9 +1989,19 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		applied:      binary.LittleEndian.Uint64(buf[24:32]),
 		txnHighWater: binary.LittleEndian.Uint64(buf[32:40]),
 		txnBase:      binary.LittleEndian.Uint64(buf[40:48]),
-		markerEpoch:  binary.LittleEndian.Uint64(buf[48:56]),
-		seedApplied:  binary.LittleEndian.Uint64(buf[72:80]),
-		members:      make([]checkpointGroupMember, count),
+		maxApplySpan: buf[checkpointGroupMaxApplySpanOffset],
+		maxSpanTxn: binary.LittleEndian.Uint64(
+			buf[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupMaxSpanWitnessFirstOffset],
+		),
+		maxSpanFirst: binary.LittleEndian.Uint64(
+			buf[checkpointGroupMaxSpanWitnessFirstOffset:checkpointGroupMaxSpanWitnessLastOffset],
+		),
+		maxSpanLast: binary.LittleEndian.Uint64(
+			buf[checkpointGroupMaxSpanWitnessLastOffset:checkpointGroupChecksumOffset],
+		),
+		markerEpoch: binary.LittleEndian.Uint64(buf[48:56]),
+		seedApplied: binary.LittleEndian.Uint64(buf[72:80]),
+		members:     make([]checkpointGroupMember, count),
 	}
 	copy(c.markerID[:], buf[56:72])
 	copy(c.seedState[:], buf[80:112])
@@ -1891,21 +2029,79 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 }
 
 func validCheckpointGroupSeedCertificate(c checkpointGroupCertificate) bool {
+	// Zero is the legacy and sole canonical representation of span one. The
+	// authenticated field records only an actual widening of the format-0
+	// applied/transaction sanity envelope.
+	if c.maxApplySpan == 1 || c.maxApplySpan > MaxCheckpointGroupUpdateEntries {
+		return false
+	}
+	span := uint64(c.maxApplySpan)
+	if span == 0 {
+		if c.maxSpanTxn != 0 || c.maxSpanFirst != 0 || c.maxSpanLast != 0 {
+			return false
+		}
+		span = 1
+	} else if c.maxSpanTxn == 0 || c.maxSpanTxn > c.txnHighWater ||
+		c.maxSpanFirst == 0 || c.maxSpanLast < c.maxSpanFirst ||
+		c.maxSpanLast > c.applied ||
+		c.maxSpanLast-c.maxSpanFirst+1 != span {
+		return false
+	}
 	zeroState := c.seedState == ([sha256.Size]byte{})
 	zeroMember := c.seedMember == ([sha256.Size]byte{})
 	if c.seedApplied == 0 {
+		if c.maxApplySpan > 1 {
+			if c.applied < span ||
+				!checkpointGroupAppliedWithin(
+					c.maxSpanFirst-1, c.maxSpanTxn-1, span,
+				) || !checkpointGroupAppliedWithin(
+				c.applied-c.maxSpanLast,
+				c.txnHighWater-c.maxSpanTxn, span,
+			) {
+				return false
+			}
+		}
 		return zeroState && zeroMember && c.applied != math.MaxUint64 &&
-			c.applied <= c.txnHighWater
+			checkpointGroupAppliedWithin(c.applied, c.txnHighWater, span)
 	}
 	if c.seedApplied <= 1 || c.seedApplied == math.MaxUint64 || zeroState || zeroMember {
 		return false
 	}
 	if c.applied == 0 {
-		return c.txnHighWater == 0 && c.txnBase == 0
+		return c.maxApplySpan == 0 && c.txnHighWater == 0 && c.txnBase == 0
 	}
-	return c.applied != math.MaxUint64 && c.applied >= c.seedApplied &&
-		c.txnHighWater > 0 &&
-		c.applied-c.seedApplied <= c.txnHighWater-1
+	if c.maxApplySpan > 1 {
+		if c.applied-c.seedApplied < span || c.maxSpanTxn <= 2 ||
+			c.maxSpanFirst <= c.seedApplied ||
+			!checkpointGroupAppliedWithin(
+				c.maxSpanFirst-c.seedApplied-1, c.maxSpanTxn-3, span,
+			) || !checkpointGroupAppliedWithin(
+			c.applied-c.maxSpanLast,
+			c.txnHighWater-c.maxSpanTxn, span,
+		) {
+			return false
+		}
+	}
+	if c.applied == math.MaxUint64 || c.applied < c.seedApplied ||
+		c.txnHighWater == 0 {
+		return false
+	}
+	if c.applied == c.seedApplied {
+		return true
+	}
+	return c.txnHighWater >= 3 && checkpointGroupAppliedWithin(
+		c.applied-c.seedApplied, c.txnHighWater-2, span,
+	)
+}
+
+func checkpointGroupAppliedWithin(applied, transactions, span uint64) bool {
+	if span == 0 {
+		return false
+	}
+	if transactions > math.MaxUint64/span {
+		return true
+	}
+	return applied <= transactions*span
 }
 
 // checkpointGroupCertificateChecksumValid distinguishes an unauthenticated
@@ -2037,12 +2233,107 @@ func openCheckpointGroupCertificate(log *TxnLog) (*os.File, checkpointGroupCerti
 	selected := valid[len(valid)-1].certificate
 	if len(valid) > 1 {
 		previous := valid[len(valid)-2].certificate
-		if previous.sequence == math.MaxUint64 || previous.sequence+1 != selected.sequence {
+		if !validCheckpointGroupCertificateSuccessor(previous, selected) {
 			_ = file.Close()
 			return nil, checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 		}
 	}
 	return file, selected, nil
+}
+
+func validCheckpointGroupCertificateSuccessor(
+	previous, selected checkpointGroupCertificate,
+) bool {
+	if previous.sequence == math.MaxUint64 ||
+		previous.sequence+1 != selected.sequence ||
+		previous.markerID != selected.markerID ||
+		previous.seedApplied != selected.seedApplied ||
+		previous.seedState != selected.seedState ||
+		previous.seedMember != selected.seedMember ||
+		previous.maxApplySpan > selected.maxApplySpan ||
+		len(previous.members) != len(selected.members) {
+		return false
+	}
+	for index := range previous.members {
+		left, right := previous.members[index], selected.members[index]
+		if left.nameDigest != right.nameDigest || left.storeID != right.storeID ||
+			left.journalID != right.journalID {
+			return false
+		}
+	}
+
+	switch {
+	case selected.markerEpoch == previous.markerEpoch:
+		if selected.txnBase != previous.txnBase {
+			return false
+		}
+	case previous.markerEpoch != math.MaxUint64 &&
+		selected.markerEpoch == previous.markerEpoch+1:
+		if selected.txnBase != previous.txnHighWater {
+			return false
+		}
+	default:
+		return false
+	}
+	if selected.txnHighWater < previous.txnHighWater ||
+		selected.applied < previous.applied {
+		return false
+	}
+	deltaTransactions := selected.txnHighWater - previous.txnHighWater
+	deltaApplied := selected.applied - previous.applied
+	if deltaTransactions == 0 {
+		// The only certificate write without newly certified work is an empty
+		// marker rollover. It changes exactly the epoch/base tuple.
+		return selected.markerEpoch == previous.markerEpoch+1 &&
+			deltaApplied == 0 && selected.maxApplySpan == previous.maxApplySpan &&
+			selected.maxSpanTxn == previous.maxSpanTxn &&
+			selected.maxSpanFirst == previous.maxSpanFirst &&
+			selected.maxSpanLast == previous.maxSpanLast
+	}
+	if selected.markerEpoch != previous.markerEpoch {
+		return false
+	}
+	// Seed is the one certified transition whose applied index is imported
+	// rather than advanced from zero by ordinary Update. Its exact immutable
+	// seed profile was compared above. The first transaction must publish that
+	// cut without also advertising batching.
+	if previous.seedApplied > 1 && previous.applied == 0 &&
+		previous.txnHighWater == 0 && selected.txnHighWater == 1 &&
+		selected.applied == selected.seedApplied &&
+		selected.markerEpoch == previous.markerEpoch &&
+		selected.txnBase == 0 && selected.maxApplySpan == 0 {
+		return true
+	}
+	widened := selected.maxApplySpan > previous.maxApplySpan
+	if widened {
+		if selected.maxSpanTxn <= previous.txnHighWater ||
+			selected.maxSpanTxn > selected.txnHighWater ||
+			selected.maxSpanFirst <= previous.applied ||
+			selected.maxSpanLast > selected.applied {
+			return false
+		}
+	} else if selected.maxSpanTxn != previous.maxSpanTxn ||
+		selected.maxSpanFirst != previous.maxSpanFirst ||
+		selected.maxSpanLast != previous.maxSpanLast {
+		return false
+	}
+	span := uint64(selected.maxApplySpan)
+	if span == 0 {
+		span = 1
+	}
+	if !checkpointGroupAppliedWithin(deltaApplied, deltaTransactions, span) {
+		return false
+	}
+	if widened && (!checkpointGroupAppliedWithin(
+		selected.maxSpanFirst-previous.applied-1,
+		selected.maxSpanTxn-previous.txnHighWater-1, span,
+	) || !checkpointGroupAppliedWithin(
+		selected.applied-selected.maxSpanLast,
+		selected.txnHighWater-selected.maxSpanTxn, span,
+	)) {
+		return false
+	}
+	return true
 }
 
 func createCheckpointGroupCertificate(

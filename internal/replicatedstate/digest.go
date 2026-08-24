@@ -20,23 +20,35 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
 	"exact-retired-session-release;terminal-stale-retire-unstored;" +
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
-	"stable-logical-command-digest"
+	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
 
 var (
 	canonicalImageDigestDomain = []byte("vibedb/replicated-state/logical-image\x00")
 	dataChainSeedDigestDomain  = []byte("vibedb/replicated-state/data-chain-seed\x00")
-	dataChainDigestDomain      = []byte("vibedb/replicated-state/data-chain\x00")
+	dataChainDigestDomain      = []byte("vibedb/replicated-state/data-chain/value-descriptor-sha256\x00")
 	applyContractDigestDomain  = []byte("vibedb/replicated-state/apply-contract\x00")
 	dataChainMarkers           = [2][1]byte{{0}, {1}}
 	applySemanticsDigest       = sha256.Sum256([]byte(deterministicApplySemantics))
 )
 
 type finalMutation struct {
-	key         []byte
-	value       []byte
-	before      []byte
-	delete      bool
-	beforeFound bool
+	key             []byte
+	value           []byte
+	before          []byte
+	descriptorIndex uint16
+	delete          bool
+	beforeFound     bool
+	described       bool
+}
+
+// mutationValueDescriptor is transient batch workspace, never per-Machine
+// state. Singleton apply keeps the raw before/after slices it already owns.
+// batched apply stores fixed descriptors here so finalMutation stays compact.
+type mutationValueDescriptor struct {
+	beforeDigest [sha256.Size]byte
+	afterDigest  [sha256.Size]byte
+	beforeLength uint64
+	afterLength  uint64
 }
 
 type canonicalImageHasher struct {
@@ -63,6 +75,25 @@ func (h *dataChainHasher) writeFrame(value []byte) {
 	binary.LittleEndian.PutUint64(h.length[:], uint64(len(value)))
 	_, _ = h.h.Write(h.length[:])
 	_, _ = h.h.Write(value)
+}
+
+func (h *dataChainHasher) writeValueDescriptor(
+	found bool,
+	length uint64,
+	digest *[sha256.Size]byte,
+) {
+	marker := 0
+	if found {
+		marker = 1
+	}
+	_, _ = h.h.Write(dataChainMarkers[marker][:])
+	binary.LittleEndian.PutUint64(h.length[:], length)
+	_, _ = h.h.Write(h.length[:])
+	if digest == nil {
+		h.result = [32]byte{}
+		digest = &h.result
+	}
+	_, _ = h.h.Write(digest[:])
 }
 
 func newCanonicalImageHasher(
@@ -193,7 +224,7 @@ func dataChainSeedDigest(
 
 // dataChainTransitionDigest advances the replicated logical identity from only
 // the exact changed rows. changes must be unique and key ordered. The chain is
-// deterministic and independent of shard cardinality; unlike the certified
+// deterministic and independent of shard cardinality. Unlike the certified
 // image digest it intentionally commits to transition history as well as the
 // resulting values.
 func dataChainTransitionDigest(
@@ -201,6 +232,7 @@ func dataChainTransitionDigest(
 	previous [32]byte,
 	applyContractDigest [32]byte,
 	changes []finalMutation,
+	descriptors []mutationValueDescriptor,
 ) ([32]byte, error) {
 	if previous == ([32]byte{}) || applyContractDigest == ([32]byte{}) ||
 		len(changes) == 0 {
@@ -223,21 +255,54 @@ func dataChainTransitionDigest(
 	var prior []byte
 	for index := range changes {
 		change := &changes[index]
+		var descriptor *mutationValueDescriptor
+		if change.described {
+			if int(change.descriptorIndex) >= len(descriptors) {
+				return [32]byte{}, ErrInvalidCollection
+			}
+			descriptor = &descriptors[change.descriptorIndex]
+		} else if change.descriptorIndex != 0 {
+			return [32]byte{}, ErrInvalidCollection
+		}
 		if len(change.key) == 0 || prior != nil && bytes.Compare(prior, change.key) >= 0 ||
-			change.delete && !change.beforeFound {
+			change.delete && !change.beforeFound || descriptor != nil &&
+			((!change.beforeFound && (descriptor.beforeLength != 0 ||
+				descriptor.beforeDigest != ([sha256.Size]byte{}))) ||
+				(change.delete && (descriptor.afterLength != 0 ||
+					descriptor.afterDigest != ([sha256.Size]byte{})))) {
 			return [32]byte{}, ErrInvalidCollection
 		}
 		if change.beforeFound {
-			_, _ = h.Write(dataChainMarkers[1][:])
-			workspace.writeFrame(change.before)
+			if descriptor != nil {
+				workspace.writeValueDescriptor(
+					true, descriptor.beforeLength, &descriptor.beforeDigest,
+				)
+			} else {
+				if change.before == nil {
+					return [32]byte{}, ErrInvalidCollection
+				}
+				workspace.result = sha256.Sum256(change.before)
+				workspace.writeValueDescriptor(
+					true, uint64(len(change.before)), &workspace.result,
+				)
+			}
 		} else {
-			_, _ = h.Write(dataChainMarkers[0][:])
+			workspace.writeValueDescriptor(false, 0, nil)
 		}
 		if change.delete {
-			_, _ = h.Write(dataChainMarkers[0][:])
+			workspace.writeValueDescriptor(false, 0, nil)
+		} else if descriptor != nil {
+			workspace.writeValueDescriptor(
+				true, descriptor.afterLength, &descriptor.afterDigest,
+			)
 		} else {
-			_, _ = h.Write(dataChainMarkers[1][:])
-			workspace.writeFrame(change.value)
+			if change.value == nil {
+				return [32]byte{}, ErrInvalidCollection
+			}
+			workspace.result = sha256.Sum256(change.value)
+			workspace.writeValueDescriptor(
+				true, uint64(len(change.value)), &workspace.result,
+			)
 		}
 		workspace.writeFrame(change.key)
 		prior = change.key

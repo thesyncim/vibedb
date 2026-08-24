@@ -46,6 +46,106 @@ type commandPlan struct {
 	conflict        bool
 }
 
+// commandPlanScratch is optional caller-owned storage for the bounded raw
+// records a plan reads and emits. A batch plan is consumed into its logical
+// overlays before the next call reuses these buffers. Singleton planning passes
+// nil and retains its existing ownership behavior.
+type commandPlanScratch struct {
+	sessionRead   []byte
+	slotRead      []byte
+	sessionRecord []byte
+	slotRecord    []byte
+	currentValue  []byte
+	descriptors   []mutationValueDescriptor
+	// logicalValueReads counts mutation before-value reads in the current
+	// physical batch. It is retained only as bounded qualification telemetry.
+	logicalValueReads uint32
+	// physicalBaseValueReads is the subset served by the initial durable user
+	// snapshot rather than the in-memory overlay. It proves planning does not
+	// reread base values while still counting logical overlay dependencies.
+	physicalBaseValueReads uint32
+	// logicalValueHashes counts changed, found before-values reduced to fixed
+	// descriptors. Equal puts and rejected/no-op mutations must leave it zero.
+	logicalValueHashes uint32
+	// logicalAfterValueHashes counts changed put values reduced to fixed
+	// descriptors. The outer transition digest and overlay consume that one
+	// descriptor without hashing command bytes again.
+	logicalAfterValueHashes    uint32
+	hybridClassificationPasses uint32
+	hybridDescriptorRereads    uint32
+}
+
+func (s *commandPlanScratch) begin() {
+	if s != nil {
+		s.currentValue = s.currentValue[:0]
+		clear(s.descriptors)
+		s.descriptors = s.descriptors[:0]
+	}
+}
+
+func (s *commandPlanScratch) release() {
+	if s == nil {
+		return
+	}
+	clear(s.sessionRead)
+	clear(s.slotRead)
+	clear(s.sessionRecord)
+	clear(s.slotRecord)
+	clear(s.currentValue)
+	clear(s.descriptors)
+	s.sessionRead = s.sessionRead[:0]
+	s.slotRead = s.slotRead[:0]
+	s.sessionRecord = s.sessionRecord[:0]
+	s.slotRecord = s.slotRecord[:0]
+	s.descriptors = s.descriptors[:0]
+	if cap(s.sessionRead) > maxNormalBatchRetainedBufferBytes {
+		s.sessionRead = nil
+	}
+	if cap(s.slotRead) > maxNormalBatchRetainedBufferBytes {
+		s.slotRead = nil
+	}
+	if cap(s.sessionRecord) > maxNormalBatchRetainedBufferBytes {
+		s.sessionRecord = nil
+	}
+	if cap(s.slotRecord) > maxNormalBatchRetainedBufferBytes {
+		s.slotRecord = nil
+	}
+	if cap(s.currentValue) > maxNormalBatchRetainedBufferBytes {
+		s.currentValue = nil
+	} else {
+		s.currentValue = s.currentValue[:0]
+	}
+	if cap(s.descriptors) > maxNormalBatchRetainedOverlayEntries {
+		s.descriptors = nil
+	}
+}
+
+func (s *commandPlanScratch) appendSessionRecord(
+	record SessionRecord,
+) ([]byte, error) {
+	if s == nil {
+		return AppendSessionRecord(nil, record)
+	}
+	encoded, err := AppendSessionRecord(s.sessionRecord[:0], record)
+	if err == nil {
+		s.sessionRecord = encoded
+	}
+	return encoded, err
+}
+
+func (s *commandPlanScratch) appendSessionSlot(
+	slot SessionSlot,
+) ([]byte, error) {
+	if s == nil {
+		return AppendSessionSlot(nil, slot)
+	}
+	encoded, err := AppendSessionSlot(s.slotRecord[:0], slot)
+	if err == nil {
+		s.slotRecord = encoded
+	}
+	return encoded, err
+}
+
 // ApplyNormal implements raftmodel.StateMachine.
 func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.Publication, error) {
 	m.mu.Lock()
@@ -115,29 +215,17 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	plan, planErr := m.planCommand(
-		command, meta.Index, pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+		command, meta.Index, m.state,
+		pointSnapshot{value: systemSnapshot}, pointSnapshot{value: userSnapshot},
+		nil,
 	)
 	err = errors.Join(planErr, cut.Close())
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
 	next := m.nextState(meta, RecordNormal, digest)
-	next.DataChainDigest = plan.dataChainDigest
-	if plan.newSession {
-		next.SessionCount++
-	}
-	if plan.newPhysicalSlot {
-		next.SessionSlotCount++
-	}
-	if plan.advanceEpoch != 0 {
-		next.SessionEpochHighWater = plan.advanceEpoch
-	}
-	if plan.deleteSession {
-		if next.SessionCount == 0 || next.SessionSlotCount < uint64(plan.deleteSlots) {
-			return raftmodel.Publication{}, m.fail(ErrSessionCorrupt)
-		}
-		next.SessionCount--
-		next.SessionSlotCount -= uint64(plan.deleteSlots)
+	if err := applyCommandPlanToState(&next, plan); err != nil {
+		return raftmodel.Publication{}, m.fail(err)
 	}
 	if err := m.persistTransition(next, plan.changes, plan); err != nil {
 		return raftmodel.Publication{}, m.fail(err)
@@ -329,8 +417,9 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return m.fail(err)
 	}
 	plan, planErr := m.planCommand(
-		command, m.state.Applied+1,
-		pointSnapshot{systemSnapshot}, pointSnapshot{userSnapshot},
+		command, m.state.Applied+1, m.state,
+		pointSnapshot{value: systemSnapshot}, pointSnapshot{value: userSnapshot},
+		nil,
 	)
 	closeErr := cut.Close()
 	if planErr != nil || closeErr != nil {
@@ -369,6 +458,16 @@ func (m *Machine) AdmitCommand(data []byte) error {
 func (m *Machine) hypotheticalState(command replication.CommandView, plan commandPlan) State {
 	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
 	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
+	if err := applyCommandPlanToState(&next, plan); err != nil {
+		return State{}
+	}
+	return next
+}
+
+func applyCommandPlanToState(next *State, plan commandPlan) error {
+	if next == nil {
+		return ErrStateCorrupt
+	}
 	next.DataChainDigest = plan.dataChainDigest
 	if plan.newSession {
 		next.SessionCount++
@@ -381,12 +480,12 @@ func (m *Machine) hypotheticalState(command replication.CommandView, plan comman
 	}
 	if plan.deleteSession {
 		if next.SessionCount == 0 || next.SessionSlotCount < uint64(plan.deleteSlots) {
-			return State{}
+			return ErrSessionCorrupt
 		}
 		next.SessionCount--
 		next.SessionSlotCount -= uint64(plan.deleteSlots)
 	}
-	return next
+	return nil
 }
 
 func (m *Machine) checkTransition(meta raftmodel.ApplyMeta, kind RecordKind, digest [32]byte) (bool, error) {
@@ -477,20 +576,25 @@ func (m *Machine) captureApplyCutLocked() (durable.DatabaseSnapshot, *durable.Sn
 func (m *Machine) planCommand(
 	command replication.CommandView,
 	applied uint64,
+	state State,
 	systemSnapshot, userSnapshot pointSnapshot,
+	scratch *commandPlanScratch,
 ) (commandPlan, error) {
-	plan := commandPlan{command: command, dataChainDigest: m.state.DataChainDigest}
+	scratch.begin()
+	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
 	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
 	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
-	session, found, err := sessionAt(systemSnapshot, plan.sessionKey)
+	session, found, err := sessionAt(systemSnapshot, plan.sessionKey, scratch)
 	if err != nil {
 		return commandPlan{}, err
 	}
 	if command.Kind() == replication.CommandSessionOpen {
-		return m.planSessionOpen(command, applied, systemSnapshot, plan, session, found)
+		return m.planSessionOpen(
+			command, applied, state, systemSnapshot, plan, session, found, scratch,
+		)
 	}
 	if command.Kind() == replication.CommandSessionRelease {
-		return m.planSessionRelease(command, systemSnapshot, plan, session, found)
+		return m.planSessionRelease(command, state, systemSnapshot, plan, session, found)
 	}
 	logicalDigest := LogicalCommandDigest(command)
 
@@ -501,7 +605,7 @@ func (m *Machine) planCommand(
 		); err != nil {
 			return commandPlan{}, err
 		}
-		if command.ClientEpoch <= m.state.SessionEpochHighWater {
+		if command.ClientEpoch <= state.SessionEpochHighWater {
 			plan.refusal = ErrRetryRetired
 		} else {
 			plan.refusal = ErrSessionEpoch
@@ -533,7 +637,9 @@ func (m *Machine) planCommand(
 				if err != nil {
 					return commandPlan{}, err
 				}
-				existing, slotFound, slotErr := sessionSlotAt(systemSnapshot, plan.slotKey)
+				existing, slotFound, slotErr := sessionSlotAt(
+					systemSnapshot, plan.slotKey, scratch,
+				)
 				if slotErr != nil {
 					return commandPlan{}, slotErr
 				}
@@ -542,7 +648,7 @@ func (m *Machine) planCommand(
 					existing.ClientSequence != command.ClientSequence {
 					return commandPlan{}, fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
 				}
-				if err := validateStoredSessionSlot(m.state, existing); err != nil {
+				if err := validateStoredSessionSlot(state, existing); err != nil {
 					return commandPlan{}, err
 				}
 				if err := validateSessionSlotAgainstHeader(session, existing); err != nil {
@@ -558,7 +664,7 @@ func (m *Machine) planCommand(
 				if command.AckThrough > session.AckThrough {
 					next = sessionRecord(session)
 					next.AckThrough = command.AckThrough
-					plan.sessionRecord, err = AppendSessionRecord(nil, next)
+					plan.sessionRecord, err = scratch.appendSessionRecord(next)
 					if err != nil {
 						return commandPlan{}, err
 					}
@@ -602,7 +708,7 @@ func (m *Machine) planCommand(
 			plan.refusal = ErrSessionAck
 			return plan, nil
 		}
-		if !m.mutableBindingMatches(command) {
+		if !m.mutableBindingMatchesState(command, state) {
 			// The terminal sequence cannot retain a stale completion because that
 			// would strand an active epoch at MaxUint64. Leave the session
 			// unchanged so the same sequence can be proposed with refreshed
@@ -621,7 +727,7 @@ func (m *Machine) planCommand(
 			plan.refusal = ErrSessionLeaseDeadline
 			return plan, nil
 		}
-		if !m.mutableBindingMatches(command) {
+		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence
 		} else {
 			plan.resultCode = ResultSessionRenewed
@@ -636,7 +742,7 @@ func (m *Machine) planCommand(
 			plan.refusal = ErrSessionLeaseDeadline
 			return plan, nil
 		}
-		if !m.mutableBindingMatches(command) {
+		if !m.mutableBindingMatchesState(command, state) {
 			if command.ClientSequence == math.MaxUint64 {
 				plan.refusal = ErrStaleCommand
 				return plan, nil
@@ -648,18 +754,25 @@ func (m *Machine) planCommand(
 		}
 	default:
 		switch {
-		case !m.mutableBindingMatches(command):
+		case !m.mutableBindingMatchesState(command, state):
 			plan.resultCode = ResultStaleFence
 		case !bytes.Equal(command.Collection, m.userNameBytes):
 			plan.resultCode = ResultUnknownCollection
 		default:
-			plan.changes, plan.resultCode, err = m.planMutations(command, userSnapshot)
+			plan.changes, plan.resultCode, err = m.planMutations(
+				command, userSnapshot, scratch,
+			)
 			if err != nil {
 				return commandPlan{}, err
 			}
 			if plan.resultCode == ResultApplied && len(plan.changes) != 0 {
+				var descriptors []mutationValueDescriptor
+				if scratch != nil {
+					descriptors = scratch.descriptors
+				}
 				plan.dataChainDigest, err = dataChainTransitionDigest(
-					m.dataChainHash, m.state.DataChainDigest, m.applyContract, plan.changes,
+					m.dataChainHash, state.DataChainDigest, m.applyContract,
+					plan.changes, descriptors,
 				)
 				if err != nil {
 					return commandPlan{}, err
@@ -685,11 +798,11 @@ func (m *Machine) planCommand(
 	if isSessionTerminalResult(plan.resultCode) {
 		next.Status = SessionRetired
 	}
-	plan.sessionRecord, err = AppendSessionRecord(nil, next)
+	plan.sessionRecord, err = scratch.appendSessionRecord(next)
 	if err != nil {
 		return commandPlan{}, err
 	}
-	plan.slotRecord, err = AppendSessionSlot(nil, SessionSlot{
+	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   slot,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            command.ClientEpoch,
@@ -719,10 +832,12 @@ func (m *Machine) planCommand(
 func (m *Machine) planSessionOpen(
 	command replication.CommandView,
 	applied uint64,
+	state State,
 	systemSnapshot pointSnapshot,
 	plan commandPlan,
 	session SessionView,
 	found bool,
+	scratch *commandPlanScratch,
 ) (commandPlan, error) {
 	logicalDigest := LogicalCommandDigest(command)
 	if found {
@@ -737,7 +852,7 @@ func (m *Machine) planSessionOpen(
 		if err != nil {
 			return commandPlan{}, err
 		}
-		record, slotFound, err := sessionSlotAt(systemSnapshot, openKey)
+		record, slotFound, err := sessionSlotAt(systemSnapshot, openKey, scratch)
 		if err != nil {
 			return commandPlan{}, err
 		}
@@ -745,7 +860,7 @@ func (m *Machine) planSessionOpen(
 			record.ClientEpoch != session.ClientEpoch {
 			return commandPlan{}, fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(m.state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record); err != nil {
 			return commandPlan{}, err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
@@ -788,12 +903,12 @@ func (m *Machine) planSessionOpen(
 		); err != nil {
 			return commandPlan{}, err
 		}
-		if m.state.SessionCount >= m.options.MaxSessions {
+		if state.SessionCount >= m.options.MaxSessions {
 			plan.refusal = ErrAdmissionBound
 			return plan, nil
 		}
 	}
-	if !m.mutableBindingMatches(command) {
+	if !m.mutableBindingMatchesState(command, state) {
 		// An Open completion carries the mutable fences used to mint its token.
 		// Never persist a token whose retained slot would fail the same binding
 		// validation on lookup or reopen.
@@ -804,7 +919,7 @@ func (m *Machine) planSessionOpen(
 	// Apply indices are strictly increasing and never MaxUint64. Using the index
 	// as the epoch removes an allocator/reservation round trip while preserving a
 	// durable anti-resurrection high-water after the session rows are released.
-	if applied == 0 || applied == math.MaxUint64 || applied <= m.state.SessionEpochHighWater {
+	if applied == 0 || applied == math.MaxUint64 || applied <= state.SessionEpochHighWater {
 		return commandPlan{}, fmt.Errorf("%w: session epoch allocation", ErrApplySequence)
 	}
 	if found {
@@ -824,11 +939,11 @@ func (m *Machine) planSessionOpen(
 	plan.slotKey, _ = SessionSlotStorageKey(plan.sessionDigest, 0)
 	plan.newPhysicalSlot = true
 	var err error
-	plan.sessionRecord, err = AppendSessionRecord(nil, next)
+	plan.sessionRecord, err = scratch.appendSessionRecord(next)
 	if err != nil {
 		return commandPlan{}, err
 	}
-	plan.slotRecord, err = AppendSessionSlot(nil, SessionSlot{
+	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   0,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            applied,
@@ -858,6 +973,7 @@ func (m *Machine) planSessionOpen(
 // postcondition after the header has disappeared.
 func (m *Machine) planSessionRelease(
 	command replication.CommandView,
+	state State,
 	systemSnapshot pointSnapshot,
 	plan commandPlan,
 	session SessionView,
@@ -870,7 +986,7 @@ func (m *Machine) planSessionRelease(
 		); err != nil {
 			return commandPlan{}, err
 		}
-		if command.ClientEpoch <= m.state.SessionEpochHighWater {
+		if command.ClientEpoch <= state.SessionEpochHighWater {
 			return plan, nil
 		}
 		plan.release = false
@@ -936,7 +1052,7 @@ func (m *Machine) planSessionRelease(
 			record.ClientEpoch != session.ClientEpoch {
 			return fmt.Errorf("%w: release slot mismatch", ErrSessionCorrupt)
 		}
-		if err := validateStoredSessionSlot(m.state, record); err != nil {
+		if err := validateStoredSessionSlot(state, record); err != nil {
 			return err
 		}
 		if err := validateSessionSlotAgainstHeader(session, record); err != nil {
@@ -1003,6 +1119,7 @@ func sessionRetryFloor(session SessionView) uint64 {
 func (m *Machine) planMutations(
 	command replication.CommandView,
 	snapshot pointSnapshot,
+	scratch *commandPlanScratch,
 ) ([]finalMutation, uint32, error) {
 	if cap(m.mutationPlan) == 0 {
 		m.mutationPlan = m.mutationInline[:0]
@@ -1033,6 +1150,23 @@ func (m *Machine) planMutations(
 			return nil, ResultTargetBound, nil
 		}
 	}
+	rawUpperBytes := 0
+	rawUpperExceeds := false
+	for _, mutation := range ordered {
+		if len(mutation.key) > m.user.Limits.MaxBatchBytes-rawUpperBytes {
+			rawUpperExceeds = true
+			break
+		}
+		rawUpperBytes += len(mutation.key)
+		if len(mutation.value) > m.user.Limits.MaxBatchBytes-rawUpperBytes {
+			rawUpperExceeds = true
+			break
+		}
+		rawUpperBytes += len(mutation.value)
+	}
+	if rawUpperExceeds && scratch != nil {
+		scratch.hybridClassificationPasses++
+	}
 	stagedBytes := 0
 	changes := ordered[:0]
 	for _, mutation := range ordered {
@@ -1045,11 +1179,10 @@ func (m *Machine) planMutations(
 				return nil, ResultInvalidDocument, nil
 			}
 		}
-		current, found, err := snapshot.appendRaw(nil, mutation.key)
+		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 		if err != nil {
 			return nil, 0, err
 		}
-		mutation.before = current
 		mutation.beforeFound = found
 		if m.user.Validation == ValidationDeterministicMutation {
 			validation := MutationValidation(0)
@@ -1083,12 +1216,67 @@ func (m *Machine) planMutations(
 			return nil, ResultTargetBound, nil
 		}
 		stagedBytes += len(mutation.value)
+		if !rawUpperExceeds {
+			if err := describeFinalMutation(&mutation, current, scratch); err != nil {
+				return nil, 0, err
+			}
+		}
 		changes = append(changes, mutation)
+	}
+	if rawUpperExceeds {
+		for index := range changes {
+			mutation := &changes[index]
+			current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
+			if err != nil {
+				return nil, 0, err
+			}
+			if found != mutation.beforeFound {
+				return nil, 0, ErrInconsistentSnapshot
+			}
+			if scratch != nil {
+				scratch.hybridDescriptorRereads++
+			}
+			if err := describeFinalMutation(mutation, current, scratch); err != nil {
+				return nil, 0, err
+			}
+		}
 	}
 	slices.SortFunc(changes, func(left, right finalMutation) int {
 		return bytes.Compare(left.key, right.key)
 	})
 	return changes, ResultApplied, nil
+}
+
+func describeFinalMutation(
+	mutation *finalMutation,
+	current []byte,
+	scratch *commandPlanScratch,
+) error {
+	if mutation == nil {
+		return ErrInvalidCollection
+	}
+	if scratch == nil {
+		mutation.before = current
+		return nil
+	}
+	if len(scratch.descriptors) >= math.MaxUint16 {
+		return ErrInvalidCollection
+	}
+	descriptor := mutationValueDescriptor{}
+	if mutation.beforeFound {
+		descriptor.beforeLength = uint64(len(current))
+		descriptor.beforeDigest = sha256.Sum256(current)
+		scratch.logicalValueHashes++
+	}
+	if !mutation.delete {
+		descriptor.afterLength = uint64(len(mutation.value))
+		descriptor.afterDigest = sha256.Sum256(mutation.value)
+		scratch.logicalAfterValueHashes++
+	}
+	mutation.descriptorIndex = uint16(len(scratch.descriptors))
+	mutation.described = true
+	scratch.descriptors = append(scratch.descriptors, descriptor)
+	return nil
 }
 
 func (m *Machine) releaseMutationPlan() {
@@ -1101,19 +1289,54 @@ func (m *Machine) releaseMutationPlan() {
 // cannot perform an arbitrary collection scan. Keeping the wrapper concrete
 // also lets hot point reads inline without interface escapes.
 type pointSnapshot struct {
-	value *durable.Snapshot
+	value   *durable.Snapshot
+	overlay *logicalOverlay
 }
 
 func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
+	if s.overlay != nil {
+		return s.overlay.appendRaw(dst, key)
+	}
 	return s.value.AppendRaw(dst, key)
+}
+
+func (s pointSnapshot) appendRawForPlan(
+	key []byte,
+	scratch *commandPlanScratch,
+) ([]byte, bool, error) {
+	if scratch == nil {
+		return s.appendRaw(nil, key)
+	}
+	scratch.logicalValueReads++
+	var appended []byte
+	var found bool
+	var err error
+	if s.overlay != nil {
+		appended, found, err = s.overlay.appendRawTracked(
+			scratch.currentValue[:0], key, &scratch.physicalBaseValueReads,
+		)
+	} else {
+		appended, found, err = s.appendRaw(scratch.currentValue[:0], key)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	scratch.currentValue = appended
+	return appended, found, nil
 }
 
 func (s pointSnapshot) hasRawPrefix(prefix []byte) (bool, error) {
 	found := false
-	err := s.value.RangePrefixRaw(prefix, func(_, _ []byte) error {
+	visit := func(_, _ []byte) error {
 		found = true
 		return errStopSessionPrefix
-	})
+	}
+	var err error
+	if s.overlay != nil {
+		err = s.overlay.rangePrefixRaw(prefix, visit)
+	} else {
+		err = s.value.RangePrefixRaw(prefix, visit)
+	}
 	if errors.Is(err, errStopSessionPrefix) {
 		return true, nil
 	}
@@ -1130,13 +1353,27 @@ func (s pointSnapshot) rangeSessionSlots(
 	var prefix [1 + sha256.Size]byte
 	prefix[0] = 2
 	copy(prefix[1:], digest[:])
+	if s.overlay != nil {
+		return s.overlay.rangePrefixRaw(prefix[:], visit)
+	}
 	return s.value.RangePrefixRaw(prefix[:], visit)
 }
 
-func sessionAt(snapshot pointSnapshot, key [33]byte) (SessionView, bool, error) {
-	record, found, err := snapshot.appendRaw(nil, key[:])
+func sessionAt(
+	snapshot pointSnapshot,
+	key [33]byte,
+	scratch *commandPlanScratch,
+) (SessionView, bool, error) {
+	var dst []byte
+	if scratch != nil {
+		dst = scratch.sessionRead[:0]
+	}
+	record, found, err := snapshot.appendRaw(dst, key[:])
 	if err != nil || !found {
 		return SessionView{}, found, err
+	}
+	if scratch != nil {
+		scratch.sessionRead = record
 	}
 	view, err := OpenSessionRecord(record)
 	if err != nil {
@@ -1148,10 +1385,21 @@ func sessionAt(snapshot pointSnapshot, key [33]byte) (SessionView, bool, error) 
 	return view, true, nil
 }
 
-func sessionSlotAt(snapshot pointSnapshot, key [35]byte) (SessionSlotView, bool, error) {
-	record, found, err := snapshot.appendRaw(nil, key[:])
+func sessionSlotAt(
+	snapshot pointSnapshot,
+	key [35]byte,
+	scratch *commandPlanScratch,
+) (SessionSlotView, bool, error) {
+	var dst []byte
+	if scratch != nil {
+		dst = scratch.slotRead[:0]
+	}
+	record, found, err := snapshot.appendRaw(dst, key[:])
 	if err != nil || !found {
 		return SessionSlotView{}, found, err
+	}
+	if scratch != nil {
+		scratch.slotRead = record
 	}
 	view, err := OpenSessionSlot(record)
 	if err != nil {

@@ -97,6 +97,60 @@ func TestDataChainTransitionDigestDeterministicAndHistorySensitive(t *testing.T)
 	}
 }
 
+func TestDataChainTransitionDigestStoredBeforeDescriptorsMatchRawValues(t *testing.T) {
+	previous := sha256.Sum256([]byte("previous publication"))
+	contract := sha256.Sum256([]byte("apply contract"))
+	raw := []finalMutation{
+		{key: []byte("a"), value: []byte(`{"n":1}`)},
+		{
+			key: []byte("b"), before: []byte(`{"n":1}`), value: []byte(`{"n":2}`),
+			beforeFound: true,
+		},
+		{key: []byte("c"), before: []byte(`{"n":3}`), beforeFound: true, delete: true},
+	}
+	want := mustDataChainTransitionDigest(t, newDataChainHasher(), previous, contract, raw)
+	described := cloneFinalMutations(raw)
+	descriptors := make([]mutationValueDescriptor, len(described))
+	for index := range described {
+		described[index].described = true
+		described[index].descriptorIndex = uint16(index)
+		if described[index].beforeFound {
+			descriptors[index].beforeLength = uint64(len(described[index].before))
+			descriptors[index].beforeDigest = sha256.Sum256(described[index].before)
+			described[index].before = nil
+		}
+		if !described[index].delete {
+			descriptors[index].afterLength = uint64(len(described[index].value))
+			descriptors[index].afterDigest = sha256.Sum256(described[index].value)
+		}
+	}
+	if got := mustDataChainTransitionDigestWithDescriptors(
+		t, newDataChainHasher(), previous, contract, described, descriptors,
+	); got != want {
+		t.Fatalf("descriptor digest = %x, want raw-value digest %x", got, want)
+	}
+	descriptors[1].beforeLength++
+	if got := mustDataChainTransitionDigestWithDescriptors(
+		t, newDataChainHasher(), previous, contract, described, descriptors,
+	); got == want {
+		t.Fatal("descriptor digest did not bind before-value length")
+	}
+	descriptors[1].beforeLength--
+	descriptors[1].beforeDigest[0] ^= 1
+	if got := mustDataChainTransitionDigestWithDescriptors(
+		t, newDataChainHasher(), previous, contract, described, descriptors,
+	); got == want {
+		t.Fatal("descriptor digest did not bind before-value SHA-256")
+	}
+	descriptors[1].beforeDigest[0] ^= 1
+	descriptors[1].afterDigest[0] ^= 1
+	if got := mustDataChainTransitionDigestWithDescriptors(
+		t, newDataChainHasher(), previous, contract, described, descriptors,
+	); got == want {
+		t.Fatal("descriptor digest did not bind after-value SHA-256")
+	}
+}
+
 func TestDataChainSeedDigestBindsContractAndCanonicalImage(t *testing.T) {
 	contract := sha256.Sum256([]byte("apply contract"))
 	image := sha256.Sum256([]byte("canonical image"))
@@ -145,16 +199,16 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 			beforeFound: true,
 		},
 		{key: []byte("c"), before: []byte(`{"n":3}`), beforeFound: true, delete: true},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"7bfd39d5cc0f3b46ea3feb7c3f3f65bd93082150297a060000832037293246a2")
+		"428a5b40a86e0d39f987def4d81cb6c0c25b4e26eac90124a80cdbc40008c98c")
 	assertDigestHex(t, "data-chain seed", seed,
-		"85105f3343828b5bc192e5f0b093f4d02346b0ed6166d0cd86dd94ac022f4397")
+		"d29b649eb41266c8d9611fe18cd8989bb5abac50e31698c04bb5dcc80d4a51d9")
 	assertDigestHex(t, "data-chain transition", transition,
-		"b51ccf2ae848c0996e5317b54e23ec72e75bcfbf7675885ce9d59e3a5d9fa931")
+		"4eeaadfd5a9bfca12f6fad09a1a10adc2baef9f4eb79dcac2cb2b4050e01ce0e")
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
@@ -165,10 +219,11 @@ func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
 		{key: []byte("b"), before: []byte(`{"n":1}`), beforeFound: true, delete: true},
 	}
 	tests := []struct {
-		name     string
-		previous [32]byte
-		contract [32]byte
-		changes  []finalMutation
+		name        string
+		previous    [32]byte
+		contract    [32]byte
+		changes     []finalMutation
+		descriptors []mutationValueDescriptor
 	}{
 		{name: "zero previous", contract: contract, changes: cloneFinalMutations(valid)},
 		{name: "zero contract", previous: previous, changes: cloneFinalMutations(valid)},
@@ -182,11 +237,31 @@ func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
 			changes: []finalMutation{{key: []byte("a"), delete: true}},
 		},
 		{
+			name: "missing before descriptor", previous: previous, contract: contract,
+			changes: []finalMutation{{
+				key: []byte("a"), beforeFound: true, delete: true,
+			}},
+		},
+		{
+			name: "descriptor for absent before", previous: previous, contract: contract,
+			changes: []finalMutation{{
+				key: []byte("a"), value: []byte(`{"n":1}`), described: true,
+			}},
+			descriptors: []mutationValueDescriptor{{beforeLength: 1}},
+		},
+		{
 			name: "duplicate key", previous: previous, contract: contract,
 			changes: []finalMutation{
 				{key: []byte("a"), value: []byte(`{"n":1}`)},
 				{key: []byte("a"), value: []byte(`{"n":2}`)},
 			},
+		},
+		{
+			name: "descriptor for deleted after", previous: previous, contract: contract,
+			changes: []finalMutation{{
+				key: []byte("a"), beforeFound: true, delete: true, described: true,
+			}},
+			descriptors: []mutationValueDescriptor{{beforeLength: 7, afterLength: 1}},
 		},
 		{
 			name: "unsorted keys", previous: previous, contract: contract,
@@ -200,6 +275,7 @@ func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := dataChainTransitionDigest(
 				newDataChainHasher(), test.previous, test.contract, test.changes,
+				test.descriptors,
 			)
 			if !errors.Is(err, ErrInvalidCollection) {
 				t.Fatalf("error = %v, want ErrInvalidCollection", err)
@@ -218,7 +294,7 @@ func TestDataChainTransitionDigestReusableWorkspaceAllocations(t *testing.T) {
 	workspace := newDataChainHasher()
 	if allocations := testing.AllocsPerRun(1000, func() {
 		dataChainDigestTestSink, dataChainDigestTestErr = dataChainTransitionDigest(
-			workspace, previous, contract, changes,
+			workspace, previous, contract, changes, nil,
 		)
 	}); allocations != 0 {
 		t.Fatalf("dataChainTransitionDigest allocations = %v, want 0", allocations)
@@ -241,7 +317,7 @@ func BenchmarkDataChainTransitionDigestOneMutation(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		dataChainDigestTestSink, dataChainDigestTestErr = dataChainTransitionDigest(
-			workspace, previous, contract, changes,
+			workspace, previous, contract, changes, nil,
 		)
 	}
 	if dataChainDigestTestErr != nil {
@@ -436,7 +512,24 @@ func mustDataChainTransitionDigest(
 	changes []finalMutation,
 ) [32]byte {
 	t.Helper()
-	digest, err := dataChainTransitionDigest(workspace, previous, contract, changes)
+	digest, err := dataChainTransitionDigest(workspace, previous, contract, changes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+func mustDataChainTransitionDigestWithDescriptors(
+	t testing.TB,
+	workspace *dataChainHasher,
+	previous, contract [32]byte,
+	changes []finalMutation,
+	descriptors []mutationValueDescriptor,
+) [32]byte {
+	t.Helper()
+	digest, err := dataChainTransitionDigest(
+		workspace, previous, contract, changes, descriptors,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

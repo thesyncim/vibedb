@@ -126,7 +126,9 @@ func BenchmarkSessionLifecyclePlanOpen(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				sessionLifecyclePlanSink, err = fixture.machine.planCommand(
-					command, 2, pointSnapshot{system}, pointSnapshot{user},
+					command, 2, fixture.machine.state,
+					pointSnapshot{value: system}, pointSnapshot{value: user},
+					nil,
 				)
 				if err != nil || !sessionLifecyclePlanSink.newSession ||
 					sessionLifecyclePlanSink.advanceEpoch != 2 {
@@ -179,8 +181,9 @@ func BenchmarkSessionLifecyclePlanRelease(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				sessionLifecyclePlanSink, err = fixture.machine.planCommand(
-					command, nextIndex,
-					pointSnapshot{system}, pointSnapshot{user},
+					command, nextIndex, fixture.machine.state,
+					pointSnapshot{value: system}, pointSnapshot{value: user},
+					nil,
 				)
 				if err != nil || !sessionLifecyclePlanSink.deleteSession ||
 					sessionLifecyclePlanSink.deleteSlots != window {

@@ -40,7 +40,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	}
 	digest := SessionKey(command.Tenant, command.ClientID)
 	key := SessionStorageKey(digest)
-	session, found, readErr := sessionAt(pointSnapshot{snapshot}, key)
+	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, nil)
 	if readErr == nil && found &&
 		(session.Digest != digest || !bytes.Equal(session.Tenant, command.Tenant) ||
 			session.ClientID != command.ClientID) {
@@ -57,7 +57,7 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 	}
 	if !found {
 		orphanErr := ensureNoSessionSlots(
-			pointSnapshot{snapshot}, digest, m.options.RetryWindow,
+			pointSnapshot{value: snapshot}, digest, m.options.RetryWindow,
 		)
 		if orphanErr != nil {
 			return CompletionLookup{}, m.fail(errors.Join(orphanErr, cut.Close()))
@@ -75,7 +75,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 			_ = cut.Close()
 			return CompletionLookup{}, m.fail(keyErr)
 		}
-		record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, openKey)
+		record, slotFound, slotErr := sessionSlotAt(
+			pointSnapshot{value: snapshot}, openKey, nil,
+		)
 		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 			record.Slot != 0 || record.ClientEpoch != session.ClientEpoch) {
 			slotErr = fmt.Errorf("%w: opening slot mismatch", ErrSessionCorrupt)
@@ -164,7 +166,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 			_ = cut.Close()
 			return CompletionLookup{}, m.fail(keyErr)
 		}
-		record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, retirementKey)
+		record, slotFound, slotErr := sessionSlotAt(
+			pointSnapshot{value: snapshot}, retirementKey, nil,
+		)
 		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 			record.Slot != retirementSlot || record.ClientEpoch != session.ClientEpoch ||
 			record.ClientSequence != session.HighSequence ||
@@ -221,7 +225,9 @@ func (m *Machine) LookupCompletion(data []byte) (CompletionLookup, error) {
 		_ = cut.Close()
 		return CompletionLookup{}, m.fail(keyErr)
 	}
-	record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, slotKey)
+	record, slotFound, slotErr := sessionSlotAt(
+		pointSnapshot{value: snapshot}, slotKey, nil,
+	)
 	if slotErr == nil && (!slotFound || record.SessionDigest != digest || record.Slot != slot ||
 		record.ClientEpoch != command.ClientEpoch || record.ClientSequence != command.ClientSequence) {
 		slotErr = fmt.Errorf("%w: retained slot mismatch", ErrSessionCorrupt)
@@ -288,7 +294,7 @@ func (m *Machine) LookupSessionLease(
 	}
 	digest := SessionKey(tenant, clientID)
 	key := SessionStorageKey(digest)
-	session, found, readErr := sessionAt(pointSnapshot{snapshot}, key)
+	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, nil)
 	if readErr == nil && found &&
 		(session.Digest != digest || !bytes.Equal(session.Tenant, tenant) ||
 			session.ClientID != clientID) {
@@ -302,7 +308,7 @@ func (m *Machine) LookupSessionLease(
 	}
 	if !found {
 		orphanErr := ensureNoSessionSlots(
-			pointSnapshot{snapshot}, digest, m.options.RetryWindow,
+			pointSnapshot{value: snapshot}, digest, m.options.RetryWindow,
 		)
 		closeErr := cut.Close()
 		if orphanErr != nil || closeErr != nil {
@@ -329,7 +335,9 @@ func (m *Machine) LookupSessionLease(
 		_ = cut.Close()
 		return SessionLeaseLookup{}, m.fail(keyErr)
 	}
-	record, slotFound, slotErr := sessionSlotAt(pointSnapshot{snapshot}, slotKey)
+	record, slotFound, slotErr := sessionSlotAt(
+		pointSnapshot{value: snapshot}, slotKey, nil,
+	)
 	if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 		record.Slot != slot || record.ClientEpoch != clientEpoch ||
 		record.ClientSequence != session.HighSequence) {

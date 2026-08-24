@@ -27,7 +27,7 @@ const (
 type txConflictClock struct {
 	clock       txnclock.Clock
 	driverArmed bool
-	writes      map[string]uint64
+	writes      map[uint64]uint64
 	active      map[uint64]uint32
 }
 
@@ -77,6 +77,24 @@ func (c *txConflictClock) recordKeys(keys []string) {
 	c.armDriver()
 	c.clock.RecordKeys(keys)
 	c.syncView()
+}
+
+func (c *txConflictClock) recordBinary(keys txnclock.BinaryKeys) {
+	if keys == nil || keys.Len() == 0 {
+		return
+	}
+	c.armDriver()
+	c.clock.RecordBinary(keys)
+	c.syncView()
+}
+
+func (c *txConflictClock) recordWriteIfNoActive() bool {
+	c.armDriver()
+	if !c.clock.RecordWriteIfNoActive() {
+		return false
+	}
+	c.syncView()
+	return true
 }
 
 func (c *txConflictClock) recordSeeds(seeds []seedDocument) {

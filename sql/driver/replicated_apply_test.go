@@ -1744,6 +1744,81 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 	}
 }
 
+func TestReplicatedApplyNormalBatchPublishesNetNoopConflictUnion(t *testing.T) {
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "observer-batch-net-noop", false)
+	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
+	claim, _, err := database.OpenReplicatedApply(
+		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = claim.Close()
+		_ = database.Close()
+	})
+	if _, err := claim.InstallSnapshot(testReplicatedApplyBootstrap()); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+	secondOpen := testReplicatedApplyCommandValue(base, 0, 1, nil)
+	secondOpen.ClientID = replication.ID128{10}
+	secondOpen.Kind = replication.CommandSessionOpen
+	secondOpen.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+	secondOpen.Fingerprint = sha256.Sum256([]byte("driver/test-second-session-open"))
+	secondOpenBytes, err := replication.AppendCommand(nil, secondOpen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication, applyErr := claim.ApplyNormal(
+		testReplicatedApplyMeta(3), secondOpenBytes,
+	); applyErr != nil || publication.Applied != 3 {
+		t.Fatalf("second session open = %+v, %v", publication, applyErr)
+	}
+	document := []byte(`{"id":"batch-net-noop"}`)
+	key := testReplicatedApplyKey(t, database, document)
+	put := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
+		Kind: replication.MutationPut, Key: key, Value: document,
+	})
+	deleteValue := testReplicatedApplyCommandValue(base, 3, 2, []replication.Mutation{{
+		Kind: replication.MutationDelete, Key: key,
+	}})
+	deleteValue.ClientID = secondOpen.ClientID
+	deleteCommand, err := replication.AppendCommand(nil, deleteValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []raftmodel.NormalApply{
+		{Meta: testReplicatedApplyMeta(4), Data: put},
+		{Meta: testReplicatedApplyMeta(5), Data: deleteCommand},
+	}
+	core := database.connector.db
+	clock := &core.tables["docs"].conflicts
+	beforeClock := clock.observe()
+	beforeStats := core.checkpointGroup.Stats()
+	witnesses := make([][32]byte, len(entries))
+	applied, publication, err := claim.ApplyNormalBatch(entries, witnesses)
+	if err != nil || applied != len(entries) || publication.Applied != 5 {
+		t.Fatalf("ApplyNormalBatch = %d, %+v, %v", applied, publication, err)
+	}
+	if witnesses[len(entries)-1] != publication.DataChainDigest {
+		t.Fatalf("final batch witness = %x, want %x",
+			witnesses[len(entries)-1], publication.DataChainDigest)
+	}
+	if afterClock := clock.observe(); afterClock <= beforeClock {
+		t.Fatalf("net-noop batch conflict clock = before %d after %d",
+			beforeClock, afterClock)
+	}
+	afterStats := core.checkpointGroup.Stats()
+	if afterStats.TransactionHighWater != beforeStats.TransactionHighWater+1 ||
+		afterStats.Updates != beforeStats.Updates+1 {
+		t.Fatalf("batch group stats = before %+v after %+v", beforeStats, afterStats)
+	}
+	if _, found, err := core.tables["docs"].collection.AppendRaw(nil, key); err != nil || found {
+		t.Fatalf("net-noop user row = found %v, err %v", found, err)
+	}
+}
+
 func TestReplicatedApplyRetainsHiddenIncompleteClose(t *testing.T) {
 	_, database, base := bindReplicatedApplyTestRoot(t, "hidden-close")
 	claim, _, err := database.OpenReplicatedApply(
