@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -69,6 +70,95 @@ type preparedGlobalIndex struct {
 	keyColumns     [4]int
 	locatorColumns [distribution.KeyspaceWidth]int
 	wholeDocument  bool
+}
+
+type flatInsertColumnOrdinal struct {
+	start   int
+	end     int
+	ordinal int
+}
+
+type flatInsertColumnIndex struct {
+	seed    maphash.Seed
+	arena   []byte
+	columns []flatInsertColumnOrdinal
+	slots   []int
+}
+
+func buildFlatInsertColumnIndex(
+	columns []*sqlast.PathExpr,
+) (flatInsertColumnIndex, bool) {
+	return buildFlatInsertColumnIndexSeed(columns, maphash.MakeSeed())
+}
+
+func buildFlatInsertColumnIndexSeed(
+	columns []*sqlast.PathExpr,
+	seed maphash.Seed,
+) (flatInsertColumnIndex, bool) {
+	if len(columns) == 0 {
+		return flatInsertColumnIndex{}, false
+	}
+	maxInt := int(^uint(0) >> 1)
+	arenaCapacity := len(columns)
+	if arenaCapacity <= maxInt/16 {
+		arenaCapacity *= 16
+	}
+	slotCount := 2
+	for slotCount < len(columns) && slotCount <= maxInt/2 {
+		slotCount <<= 1
+	}
+	if slotCount <= maxInt/2 {
+		slotCount <<= 1
+	}
+	index := flatInsertColumnIndex{
+		seed:    seed,
+		arena:   make([]byte, 0, arenaCapacity),
+		columns: make([]flatInsertColumnOrdinal, len(columns)),
+		slots:   make([]int, slotCount),
+	}
+	mask := uint64(slotCount - 1)
+	for i := range columns {
+		column := &index.columns[i]
+		column.start = len(index.arena)
+		index.arena = columns[i].AppendPointer(index.arena)
+		column.end = len(index.arena)
+		column.ordinal = i
+		slot := int(maphash.Bytes(index.seed, index.arena[column.start:column.end]) & mask)
+		for {
+			stored := index.slots[slot]
+			if stored == 0 {
+				index.slots[slot] = i + 1
+				break
+			}
+			prior := index.columns[stored-1]
+			if bytes.Equal(
+				index.arena[prior.start:prior.end], index.arena[column.start:column.end],
+			) {
+				return index, true
+			}
+			slot = (slot + 1) & int(mask)
+		}
+	}
+	return index, false
+}
+
+func (index *flatInsertColumnIndex) find(path string) (int, bool) {
+	if index == nil || len(index.slots) == 0 {
+		return 0, false
+	}
+	mask := uint64(len(index.slots) - 1)
+	slot := int(maphash.String(index.seed, path) & mask)
+	for {
+		stored := index.slots[slot]
+		if stored == 0 {
+			return 0, false
+		}
+		column := index.columns[stored-1]
+		if vibejson.BytesEqualString(index.arena[column.start:column.end], path) {
+			return column.ordinal, true
+		}
+		slot = (slot + 1) & int(mask)
+	}
 }
 
 type boundGlobalIndexMutation struct {
@@ -172,20 +262,24 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 		plan.writeKeyPointers = pointers
 	}
 	// A flat insert supplies each shard-key ordinal from one named top-level
-	// column. Prove every ordinal is named before the plan can be bound; a
-	// missing ordinal means the row document's shard key is unknown at routing
-	// time and the insert is not single-shard-provable.
+	// column. Build one byte-native ordinal index for both shard and global-index
+	// routing. Repeated columns are ambiguous and fail before binding. A missing
+	// shard ordinal means the row cannot be proven single-shard.
+	var insertColumns flatInsertColumnIndex
 	if stmt.Kind == sqlast.KindInsert && !wholeDocIns {
 		ins := stmt.Insert
+		var duplicate bool
+		insertColumns, duplicate = buildFlatInsertColumnIndex(ins.Columns)
+		if duplicate {
+			return &PlanError{
+				Table:  plan.table,
+				Reason: "flat INSERT repeats a named column",
+				cause:  ErrDistributedWriteUnsupported,
+			}
+		}
 		keyColumns := make([]int, len(placement.Columns))
 		for ordinal, col := range placement.Columns {
-			i, ok := -1, false
-			for candidate := range ins.Columns {
-				if vibejson.BytesEqualString(ins.Columns[candidate].AppendPointer(nil), col) {
-					i, ok = candidate, true
-					break
-				}
-			}
+			i, ok := insertColumns.find(col)
 			if !ok {
 				plan.alwaysReason = "shard-key column " + col + " is not a top-level insert column"
 				break
@@ -196,7 +290,7 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 			plan.writeKeyColumns = keyColumns
 		}
 	}
-	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns); err != nil {
+	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns, insertColumns); err != nil {
 		return err
 	}
 	return nil
@@ -205,17 +299,11 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan) error {
 func (s *Snapshot) prepareGlobalIndexWrites(
 	plan *PreparedPlan,
 	wholeDocument bool,
+	columns flatInsertColumnIndex,
 ) error {
 	indexes := s.Indexes(plan.table)
 	if indexes.Len() == 0 {
 		return nil
-	}
-	var columns map[string]int
-	if plan.statement.Kind == sqlast.KindInsert && !wholeDocument {
-		columns = make(map[string]int, len(plan.statement.Insert.Columns))
-		for i := range plan.statement.Insert.Columns {
-			columns[string(plan.statement.Insert.Columns[i].AppendPointer(nil))] = i
-		}
 	}
 	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
 		metadata, _ := indexes.At(ordinal)
@@ -232,7 +320,7 @@ func (s *Snapshot) prepareGlobalIndexWrites(
 		}
 		if plan.statement.Kind == sqlast.KindInsert && !wholeDocument {
 			for i := uint8(0); i < metadata.PathCount; i++ {
-				column, ok := columns[metadata.Paths[i]]
+				column, ok := columns.find(metadata.Paths[i])
 				if !ok {
 					return &PlanError{
 						Table: plan.table,
@@ -244,7 +332,7 @@ func (s *Snapshot) prepareGlobalIndexWrites(
 				prepared.keyColumns[i] = column
 			}
 			for i := uint8(0); i < metadata.LocatorCount; i++ {
-				column, ok := columns[metadata.LocatorPaths[i]]
+				column, ok := columns.find(metadata.LocatorPaths[i])
 				if !ok {
 					return &PlanError{
 						Table: plan.table,
@@ -290,6 +378,11 @@ type BoundWritePlan struct {
 	primaryPath      []byte
 	expectedKeys     [][]byte
 	expectedDigests  [][sha256.Size]byte
+
+	// globalIndexLocatorJSON is batch-local encoder scratch. It is embedded in
+	// the already-returned bound plan so a flat indexed write does not allocate
+	// a separate custom-hook receiver on its first row.
+	globalIndexLocatorJSON globalIndexLocatorDocument
 }
 
 func (b *BoundWritePlan) requiresIndexTransaction() bool {
@@ -297,8 +390,8 @@ func (b *BoundWritePlan) requiresIndexTransaction() bool {
 }
 
 // BindWrite applies params to a prepared write plan without reparsing SQL.
-// args use the ordinary sql/driver scalar vocabulary. An INSERT extracts each
-// row's shard key from its bound values; an UPDATE or DELETE binds its WHERE
+// args use the gateway's closed runtime scalar vocabulary. An INSERT extracts
+// each row's shard key from its bound values. An UPDATE or DELETE binds its WHERE
 // predicate and, for a whole-document UPDATE, proves the replacement document
 // cannot move the row to another shard.
 func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
@@ -311,6 +404,9 @@ func (p *PreparedPlan) BindWrite(args []any) (*BoundWritePlan, error) {
 			Reason: fmt.Sprintf("got %d parameters, want %d", len(args), p.params),
 			cause:  ErrPlanParameters,
 		}
+	}
+	if err := validateGatewayBindArgs(args); err != nil {
+		return nil, err
 	}
 	if p.alwaysReason != "" {
 		// A shape refused at prepare time is unbindable by design: it can never
@@ -372,7 +468,7 @@ func (p *PreparedPlan) bindGlobalIndexInserts(
 	}
 	rows := p.statement.Insert.Rows
 	bound.globalIndexes = make([]boundGlobalIndexMutation, 0, len(rows)*len(p.writeGlobalIndexes))
-	var workspace GlobalIndexWorkspace
+	workspace := GlobalIndexWorkspace{locatorJSON: &bound.globalIndexLocatorJSON}
 	var keyStorage [4]distribution.Scalar
 	var locatorStorage [distribution.KeyspaceWidth]distribution.Scalar
 	baseMapper := distribution.NewNativeMapperWithBucketBits(
@@ -707,15 +803,6 @@ func writeScalarFromValue(value any) (distribution.Scalar, error) {
 	case vibejson.RawValue:
 		number, ok := v.NumberBytes()
 		if !ok {
-			return distribution.Scalar{}, errors.New("shard-key value is not a JSON number")
-		}
-		return distribution.NewNumber(byteview.String(number))
-	case interface{ String() string }:
-		// Compatibility for callers binding encoding/json.Number directly. New
-		// distributed traffic reaches this path as vibejson.RawValue.
-		number := byteview.Bytes(v.String())
-		raw := vibejson.RawValue{Src: number}
-		if !vibejson.Valid(number) || raw.Kind() != jsondoc.Number {
 			return distribution.Scalar{}, errors.New("shard-key value is not a JSON number")
 		}
 		return distribution.NewNumber(byteview.String(number))

@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func routeBoundPlan(t testing.TB, plan *BoundPlan) distribution.Route {
@@ -38,7 +38,9 @@ func TestPreparedPlanCompileBind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	bound, err := prepared.Bind([]any{"acme", json.Number("17")})
+	bound, err := prepared.Bind([]any{
+		"acme", vibejson.RawValue{Src: []byte("17")},
+	})
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}

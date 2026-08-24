@@ -53,6 +53,7 @@ type GlobalIndexWorkspace struct {
 	primaryKey   []byte
 	entryKey     []byte
 	locatorValue []byte
+	locatorJSON  *globalIndexLocatorDocument
 }
 
 // GlobalIndexRoute is one extracted index entry plus both independently
@@ -392,8 +393,14 @@ func (p GlobalIndexProgram) routeScalars(
 		workspace.entryKey = append(workspace.entryKey, workspace.locatorTuple...)
 	}
 	if encodeLocator {
+		if workspace.locatorJSON == nil {
+			// A custom encoder may retain its receiver under ordinary Go escape
+			// rules. Keep that lifetime in a compact, reusable document instead
+			// of making the complete routing workspace escape the writer frame.
+			workspace.locatorJSON = new(globalIndexLocatorDocument)
+		}
 		workspace.locatorValue, err = appendGlobalIndexLocatorValue(
-			workspace.locatorValue[:0], locator,
+			workspace.locatorValue[:0], locator, workspace.locatorJSON,
 		)
 		if err != nil {
 			return GlobalIndexRoute{}, err
@@ -498,50 +505,77 @@ func (p GlobalIndexProgram) resolveBaseOwner(
 	}, nil
 }
 
-var globalIndexStringEncoder, globalIndexStringEncoderError = vibejson.CompileEncoder[string](vibejson.EncoderOptions{DisableHTMLEscaping: true})
+type globalIndexLocatorDocument struct {
+	locator []distribution.Scalar
+}
+
+func (d globalIndexLocatorDocument) MarshalVibeJSON(
+	w vibejson.TrustedAppender,
+) vibejson.TrustedAppender {
+	w = w.RawByteUnchecked('[')
+	for i := range d.locator {
+		if i != 0 {
+			w = w.RawByteUnchecked(',')
+		}
+		switch d.locator[i].Kind() {
+		case distribution.KindString:
+			value, _ := d.locator[i].StringValue()
+			w = w.String(value)
+		case distribution.KindNumber:
+			value, _ := d.locator[i].NumberSpelling()
+			// distribution.Scalar is closed, and NewNumber validates the full
+			// JSON-number grammar before constructing this variant.
+			w = w.RawUnchecked(value)
+		}
+	}
+	return w.RawByteUnchecked(']')
+}
+
+var globalIndexLocatorEncoder = compileGlobalIndexLocatorEncoder()
+
+func compileGlobalIndexLocatorEncoder() vibejson.Encoder[globalIndexLocatorDocument] {
+	encoder, err := vibejson.CompileEncoder[globalIndexLocatorDocument](
+		vibejson.EncoderOptions{DisableHTMLEscaping: true},
+	)
+	if err != nil {
+		panic(fmt.Sprintf("gateway: compile global-index locator encoder: %v", err))
+	}
+	return encoder
+}
 
 func appendGlobalIndexLocatorValue(
 	dst []byte,
 	locator []distribution.Scalar,
+	document *globalIndexLocatorDocument,
 ) ([]byte, error) {
-	if globalIndexStringEncoderError != nil {
-		return dst, fmt.Errorf("%w: compile string encoder: %v",
-			ErrGlobalIndexDocument, globalIndexStringEncoderError)
+	if document == nil {
+		return dst, fmt.Errorf("%w: nil locator encoder workspace", ErrGlobalIndexDocument)
 	}
-	start := len(dst)
-	dst = append(dst, '[')
 	for i := range locator {
-		if i != 0 {
-			dst = append(dst, ',')
-		}
 		switch locator[i].Kind() {
 		case distribution.KindString:
 			value, _ := locator[i].StringValue()
 			if !utf8.ValidString(value) {
-				return dst[:start], fmt.Errorf(
+				return dst, fmt.Errorf(
 					"%w: locator %d is not valid UTF-8",
 					ErrGlobalIndexDocument, i,
 				)
 			}
-			var err error
-			dst, err = globalIndexStringEncoder.AppendJSON(dst, &value)
-			if err != nil {
-				return dst[:start], fmt.Errorf(
-					"%w: encode locator %d: %v",
-					ErrGlobalIndexDocument, i, err,
-				)
-			}
 		case distribution.KindNumber:
-			value, _ := locator[i].NumberSpelling()
-			dst = append(dst, value...)
 		default:
-			return dst[:start], fmt.Errorf(
+			return dst, fmt.Errorf(
 				"%w: locator %d has invalid scalar kind",
 				ErrGlobalIndexDocument, i,
 			)
 		}
 	}
-	return append(dst, ']'), nil
+	document.locator = locator
+	encoded, err := globalIndexLocatorEncoder.AppendJSON(dst, document)
+	document.locator = nil
+	if err != nil {
+		return dst, fmt.Errorf("%w: encode locator: %v", ErrGlobalIndexDocument, err)
+	}
+	return encoded, nil
 }
 
 func extractGlobalIndexScalars(

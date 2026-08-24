@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -320,7 +319,8 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 }
 
 // Bind applies params to a prepared plan without reparsing SQL or looking up
-// metadata. args use the ordinary sql/driver scalar vocabulary.
+// metadata. args use the gateway's closed runtime scalar vocabulary. Exact
+// wire numbers arrive as vibejson.RawValue.
 func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	if p == nil || p.constraints == nil || p.manifest == nil {
 		return nil, &PlanError{Reason: "incomplete prepared plan", cause: ErrDistributedPlanUnsupported}
@@ -331,6 +331,9 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 			Reason: fmt.Sprintf("got %d parameters, want %d", len(args), p.params),
 			cause:  ErrPlanParameters,
 		}
+	}
+	if err := validateGatewayBindArgs(args); err != nil {
+		return nil, err
 	}
 	constraints, err := p.constraints.Bind(args)
 	if err != nil {
@@ -363,6 +366,24 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 		spec: p.spec, manifest: p.manifest,
 		alwaysReason: p.alwaysReason, emptyReason: p.emptyReason, multiReason: p.multiReason,
 	}, nil
+}
+
+func validateGatewayBindArgs(args []any) error {
+	for ordinal, value := range args {
+		switch value.(type) {
+		case nil, bool, string, []byte, vibejson.RawValue,
+			int, int8, int16, int32, int64,
+			uint, uint8, uint16, uint32, uint64,
+			float32, float64:
+			continue
+		default:
+			return fmt.Errorf(
+				"%w: parameter %d has unsupported gateway type %T",
+				ErrPlanParameters, ordinal+1, value,
+			)
+		}
+	}
+	return nil
 }
 
 func boundConstraintsSinglePoint(
@@ -510,13 +531,13 @@ func joinProvesColocation(on *sqlast.JoinCond, source int, placements []distribu
 		matched := false
 		for _, key := range on.Keys {
 			if key.Right == nil || key.Right.Source != source ||
-				string(key.Right.AppendPointer(nil)) != column || key.Left == nil ||
+				!vibejson.BytesEqualString(key.Right.AppendPointer(nil), column) || key.Left == nil ||
 				key.Left.Source < 0 || key.Left.Source >= source {
 				continue
 			}
 			left := placements[key.Left.Source]
 			if ordinal < len(left.Columns) &&
-				string(key.Left.AppendPointer(nil)) == left.Columns[ordinal] {
+				vibejson.BytesEqualString(key.Left.AppendPointer(nil), left.Columns[ordinal]) {
 				matched = true
 				break
 			}
@@ -1032,15 +1053,20 @@ func bindPlanOperand(limit *sqlast.Operand, args []any, name string) (int, error
 				return 0, fmt.Errorf("%w: %s requires an integer", ErrPlanParameters, name)
 			}
 		case int:
-			spelling = strconv.AppendInt(nil, int64(value), 10)
+			if value < 0 || uint64(value) > 1<<31-1 {
+				return 0, fmt.Errorf("%w: invalid %s integer", ErrPlanParameters, name)
+			}
+			return value, nil
 		case int64:
-			spelling = strconv.AppendInt(nil, value, 10)
+			if value < 0 || uint64(value) > 1<<31-1 {
+				return 0, fmt.Errorf("%w: invalid %s integer", ErrPlanParameters, name)
+			}
+			return int(value), nil
 		case uint64:
-			spelling = strconv.AppendUint(nil, value, 10)
-		case interface{ String() string }:
-			// Compatibility for direct encoding/json.Number binds. Distributed
-			// requests use the vibejson.RawValue path above.
-			spelling = byteview.Bytes(value.String())
+			if value > 1<<31-1 {
+				return 0, fmt.Errorf("%w: invalid %s integer", ErrPlanParameters, name)
+			}
+			return int(value), nil
 		default:
 			return 0, fmt.Errorf("%w: %s requires an integer, got %T", ErrPlanParameters, name, value)
 		}
@@ -1055,7 +1081,7 @@ func bindPlanOperand(limit *sqlast.Operand, args []any, name string) (int, error
 }
 
 // parseLimitUint31 accepts only the SQL runtime's unsigned base-10 LIMIT
-// spelling and avoids materializing a string for strconv.ParseUint.
+// spelling without materializing a string.
 func parseLimitUint31(spelling []byte) (int, bool) {
 	if len(spelling) == 0 {
 		return 0, false
