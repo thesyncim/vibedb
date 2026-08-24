@@ -72,23 +72,41 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		)
 	}
 
-	// The artifact cut establishes the exact durable SQL prefix. Commit one
-	// more user/session transition through the real WAL without advancing that
-	// certificate, then copy the still-live SQL files as the crash image.
-	suffixOne := testApplyCommand(
-		fixture.base, epoch, 3, key, []byte(`{"id":"counter","value":1}`),
-	)
-	if err := fixture.runtime.Propose(suffixOne); err != nil {
+	// The artifact cut establishes the exact durable SQL prefix. Admit several
+	// user/session transitions into one uncaptured Ready and one WAL record
+	// without advancing that certificate, then copy the still-live SQL files as
+	// the crash image.
+	suffixCommands := [][]byte{
+		testApplyCommand(fixture.base, epoch, 3, key, []byte(`{"id":"counter","value":1}`)),
+		testApplyCommand(fixture.base, epoch, 4, key, []byte(`{"id":"counter","value":2}`)),
+		testApplyCommand(fixture.base, epoch, 5, key, []byte(`{"id":"counter","value":3}`)),
+	}
+	lastBefore, err := fixture.wal.LastIndex()
+	if err != nil {
 		t.Fatal(err)
 	}
+	syncsBefore := fixture.wal.SyncCount()
+	for ordinal, command := range suffixCommands {
+		if err := fixture.runtime.Propose(command); err != nil {
+			t.Fatalf("Propose(suffix %d) = %v", ordinal, err)
+		}
+	}
 	drainRuntime(t, fixture.runtime, nil)
+	lastAfter, err := fixture.wal.LastIndex()
+	if err != nil || lastAfter-lastBefore != uint64(len(suffixCommands)) {
+		t.Fatalf("batched suffix WAL range = %d..%d, %v", lastBefore, lastAfter, err)
+	}
+	if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
+		t.Fatalf("batched suffix WAL syncs = %d, want 2", syncs)
+	}
 	finalPublication, err := fixture.runtime.Publication()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finalPublication.Applied != prefixPublication.Applied+1 {
+	wantFinalApplied := prefixPublication.Applied + uint64(len(suffixCommands))
+	if finalPublication.Applied != wantFinalApplied {
 		t.Fatalf("visible suffix applied = %d, want %d",
-			finalPublication.Applied, prefixPublication.Applied+1)
+			finalPublication.Applied, wantFinalApplied)
 	}
 	assertRuntimeReplayStatus(t, fixture.runtime,
 		finalPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
@@ -107,7 +125,10 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	// Capture the exact expected logical result only after cloning the crash
 	// image. A full artifact cut may certify the live source as an intentional
 	// side effect, but it cannot alter the already-copied old-certificate image.
-	suffixOneCompletion := captureRuntimeReplayCompletion(t, fixture.apply, suffixOne)
+	suffixCompletions := make([][]byte, len(suffixCommands))
+	for ordinal, command := range suffixCommands {
+		suffixCompletions[ordinal] = captureRuntimeReplayCompletion(t, fixture.apply, command)
+	}
 	finalImage := captureRuntimeReplayImage(t, fixture.apply, fixture.base.UserTable)
 	if err := fixture.runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -132,7 +153,9 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		t, "recovered prefix completion",
 		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
 	)
-	assertRuntimeReplayCompletionMissing(t, recovery.apply, suffixOne)
+	for _, command := range suffixCommands {
+		assertRuntimeReplayCompletionMissing(t, recovery.apply, command)
+	}
 	hardState, _, err = recovery.wal.InitialState()
 	if err != nil || hardState.GetCommit() != finalPublication.Applied {
 		t.Fatalf("recovery WAL commit = %d, %v", hardState.GetCommit(), err)
@@ -166,10 +189,12 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		t, "replayed prefix completion",
 		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
 	)
-	assertRuntimeReplayBytes(
-		t, "replayed suffix completion",
-		captureRuntimeReplayCompletion(t, recovery.apply, suffixOne), suffixOneCompletion,
-	)
+	for ordinal, command := range suffixCommands {
+		assertRuntimeReplayBytes(
+			t, "replayed suffix completion",
+			captureRuntimeReplayCompletion(t, recovery.apply, command), suffixCompletions[ordinal],
+		)
+	}
 	// The exact-image audit comes last because it may advance the checkpoint.
 	// It must not change apply/publication state, and every user and bounded
 	// session byte must equal the pre-crash source image.

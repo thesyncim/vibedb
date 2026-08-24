@@ -741,6 +741,37 @@ func TestHostConsumesInvalidInputAndLatchesRuntimeFailureOnce(t *testing.T) {
 	}
 }
 
+func TestHostProposalFaultRetainsConsumedPrefixAccounting(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(61)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	for _, proposal := range [][]byte{[]byte("fault"), []byte("purged-1"), []byte("purged-2")} {
+		if err := host.EnqueueProposal(runtime.identity.Group, proposal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.inputErr = errors.Join(raftmember.ErrRuntimeFailed, errors.New("terminal proposal"))
+
+	progress, done, err := host.RunOne()
+	if !errors.Is(err, raftmember.ErrRuntimeFailed) || !done ||
+		progress.Kind != ProgressFault || progress.Group != runtime.identity.Group ||
+		progress.ProposalCount != 1 || progress.ProposalBytes != int64(len("fault")) {
+		t.Fatalf("proposal fault = %+v, %t, %v", progress, done, err)
+	}
+	if host.queueItems != 0 || host.queueBytes != 0 ||
+		host.groups[runtime.identity.Group].proposals.len() != 0 {
+		t.Fatalf(
+			"proposal fault retained queue: global=%d/%d group=%d",
+			host.queueItems, host.queueBytes, host.groups[runtime.identity.Group].proposals.len(),
+		)
+	}
+}
+
 func TestHostRejectsClosedRuntimeAndMisroutedMessageBeforeCharge(t *testing.T) {
 	host, err := NewHost(testHostLimits())
 	if err != nil {

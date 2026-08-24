@@ -72,10 +72,11 @@ const (
 // Progress describes one completed Ready micro-step, one consumed input, or
 // one bounded normal-proposal batch. ProposalCount and ProposalBytes report the
 // exact queue prefix consumed by ProgressProposal, including a final rejected
-// proposal, and are zero for every other kind. When RunOne also returns an
-// error, Done is still true if input was consumed or a group was newly latched
-// faulted. ReadOutcomes is owned by the caller and present only on the
-// corresponding Ready completion step.
+// proposal. They are also retained when a proposal-origin terminal error
+// promotes Kind to ProgressFault, and are zero for all other work. When RunOne
+// also returns an error, Done is still true if input was consumed or a group
+// was newly latched faulted. ReadOutcomes is owned by the caller and present
+// only on the corresponding Ready completion step.
 type Progress struct {
 	Group         raftmember.GroupKey
 	Kind          ProgressKind
