@@ -426,6 +426,18 @@ func readFrameBudgeted(
 	tag byte,
 	budget *replicatedFrameByteBudget,
 ) (body []byte, charged int64, err error) {
+	return readFrameBudgetedLimit(r, tag, budget, maxFrameBody)
+}
+
+func readFrameBudgetedLimit(
+	r io.Reader,
+	tag byte,
+	budget *replicatedFrameByteBudget,
+	maxBody int,
+) (body []byte, charged int64, err error) {
+	if maxBody < 0 || maxBody > maxFrameBody {
+		return nil, 0, errFrameTooLarge
+	}
 	var hdr [5]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, 0, err
@@ -437,7 +449,7 @@ func readFrameBudgeted(
 	if length < 4 {
 		return nil, 0, errBadLength
 	}
-	if int64(length)-4 > int64(maxFrameBody) {
+	if int64(length)-4 > int64(maxBody) {
 		return nil, 0, errFrameTooLarge
 	}
 	size := int(length) - 4

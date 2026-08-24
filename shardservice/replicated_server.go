@@ -19,7 +19,7 @@ import (
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
-	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, error)
+	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
@@ -219,6 +219,9 @@ func (server *ReplicatedServer) serveReplicatedRequest(
 	}
 	defer server.frames.release(charged)
 	response := server.executeReplicated(requestCtx, request)
+	if response.readLease != nil {
+		defer response.readLease.Release()
+	}
 	return EncodeReplicatedResponse(conn, response)
 }
 
@@ -243,7 +246,7 @@ func (server *ReplicatedServer) executeReplicated(
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
 	}
 	if request.Operation == ReplicatedReadLeader || request.Operation == ReplicatedReadFollower {
-		result, readErr := server.owner.ReadPoint(ctx, raftservice.PointReadRequest{
+		result, readLease, readErr := server.owner.ReadPoint(ctx, raftservice.PointReadRequest{
 			Fence: raftservice.ServingFence{
 				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
 				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
@@ -254,6 +257,10 @@ func (server *ReplicatedServer) executeReplicated(
 			MinimumApplied: request.MinimumApplied, MaxValueBytes: int(request.MaxValueBytes),
 			Linearizable: request.Operation == ReplicatedReadLeader,
 		})
+		if readErr != nil && readLease != nil {
+			readLease.Release()
+			readLease = nil
+		}
 		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
 			wireState = replicatedWireState(refreshed)
 		}
@@ -263,9 +270,12 @@ func (server *ReplicatedServer) executeReplicated(
 				kind = ReplicatedReadFound
 			}
 			response := &ReplicatedResponse{Kind: kind, HasState: true, State: wireState,
-				ReadApplied: result.Applied, Value: result.Value}
+				ReadApplied: result.Applied, Value: result.Value, readLease: readLease}
 			if validReplicatedResponse(response) {
 				return response
+			}
+			if readLease != nil {
+				readLease.Release()
 			}
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 				HasState: true, State: wireState}
@@ -403,7 +413,11 @@ func RoundTripReplicated(
 		}
 		return nil, err
 	}
-	response, err := DecodeReplicatedResponse(conn)
+	maximumResponse, boundErr := maximumReplicatedResponseBody(request)
+	if boundErr != nil {
+		return nil, boundErr
+	}
+	response, err := decodeReplicatedResponseLimit(conn, maximumResponse)
 	if err != nil && request.Operation == ReplicatedPropose {
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: err,

@@ -14,6 +14,11 @@ const (
 	replicatedWireVersion = 1
 	tagReplicatedRequest  = 'P'
 	tagReplicatedResponse = 'A'
+	// A response with state has a 265-byte body before a completion. Read
+	// responses add an applied index and value length. These exact ceilings let
+	// the client reject a hostile frame header before allocating its body.
+	replicatedResponseFixedBodyBytes     = 265
+	replicatedReadResponseFixedBodyBytes = replicatedResponseFixedBodyBytes + 12
 )
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
@@ -102,6 +107,7 @@ type ReplicatedResponse struct {
 	Completion  []byte
 	ReadApplied uint64
 	Value       []byte
+	readLease   raftservice.PointReadLease
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame.
@@ -182,7 +188,11 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	if w == nil || !validReplicatedResponse(response) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(len(response.Completion))
+	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
+	}
+	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(response.Kind))
 	e.u8(uint8(response.Refusal))
@@ -208,7 +218,11 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 
 // DecodeReplicatedResponse decodes and validates one bounded native response.
 func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
-	body, err := readFrame(r, tagReplicatedResponse)
+	return decodeReplicatedResponseLimit(r, maxFrameBody)
+}
+
+func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedResponse, error) {
+	body, _, err := readFrameBudgetedLimit(r, tagReplicatedResponse, nil, maxBody)
 	if err != nil {
 		return nil, err
 	}
@@ -231,11 +245,13 @@ func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
 	}
 	response.Outcome.AppliedIndex = d.u64()
 	response.Outcome.CompletionAppliedSequence = d.u64()
-	response.Completion = d.bytesCopy()
+	response.Completion = d.slice()
+	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
 		response.ReadApplied = d.u64()
-		response.Value = d.bytesCopy()
+		response.Value = d.slice()
+		response.Value = response.Value[:len(response.Value):len(response.Value)]
 	}
 	if err := d.end(); err != nil {
 		return nil, err
@@ -244,6 +260,23 @@ func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
 		return nil, ErrReplicatedWire
 	}
 	return response, nil
+}
+
+func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
+	if !validReplicatedRequest(request) {
+		return 0, ErrReplicatedWire
+	}
+	switch request.Operation {
+	case ReplicatedProbe:
+		return replicatedResponseFixedBodyBytes, nil
+	case ReplicatedPropose:
+		return replicatedResponseFixedBodyBytes +
+			replication.MaxEmptyResultCompletionEnvelopeBytes, nil
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
+	default:
+		return 0, ErrReplicatedWire
+	}
 }
 
 func encodeReplicatedFence(e *encbuf, fence ReplicatedFence) {

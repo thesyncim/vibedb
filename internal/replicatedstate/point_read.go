@@ -72,7 +72,8 @@ func (m *Machine) PointReadInto(
 	result := PointReadResult{
 		Fence: SnapshotFence{
 			Binding: m.state.Binding, RelationManifestDigest: m.manifestDigest,
-			Applied: m.state.Applied, LastTerm: m.state.LastTerm,
+			ReplicaSetVersion: m.publication.ReplicaSetVersion,
+			Applied:           m.state.Applied, LastTerm: m.state.LastTerm,
 			LastEntryDigest:    m.state.LastEntryDigest,
 			DataChainDigest:    m.state.DataChainDigest,
 			SnapshotBaseDigest: m.state.SnapshotBaseDigest,

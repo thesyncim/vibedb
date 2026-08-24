@@ -604,6 +604,7 @@ type ReadSnapshot struct {
 type SnapshotFence struct {
 	Binding                Binding
 	RelationManifestDigest [32]byte
+	ReplicaSetVersion      uint64
 	Applied                uint64
 	LastTerm               uint64
 	LastEntryDigest        [32]byte
@@ -618,7 +619,8 @@ func (s *ReadSnapshot) Fence() SnapshotFence {
 	}
 	return SnapshotFence{
 		Binding: s.state.Binding, RelationManifestDigest: s.manifestDigest,
-		Applied: s.state.Applied, LastTerm: s.state.LastTerm,
+		ReplicaSetVersion: s.publication.ReplicaSetVersion,
+		Applied:           s.state.Applied, LastTerm: s.state.LastTerm,
 		LastEntryDigest: s.state.LastEntryDigest, DataChainDigest: s.state.DataChainDigest,
 		SnapshotBaseDigest: s.state.SnapshotBaseDigest,
 	}

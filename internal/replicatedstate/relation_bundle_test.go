@@ -250,6 +250,7 @@ func TestPointReadIntoUsesDenseRelationAndExactPublicationCut(t *testing.T) {
 		if readErr != nil || !result.Found || !bytes.Equal(result.Value, test.want) ||
 			result.Fence.Applied != publication.Applied ||
 			result.Fence.Binding != fixture.binding ||
+			result.Fence.ReplicaSetVersion != publication.ReplicaSetVersion ||
 			result.Fence.RelationManifestDigest != fixture.machine.manifestDigest {
 			t.Fatalf("relation %d result=%+v err=%v", test.relation, result, readErr)
 		}

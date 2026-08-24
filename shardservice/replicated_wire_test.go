@@ -3,6 +3,10 @@ package shardservice
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"io"
+	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -164,6 +168,105 @@ func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
 		got, decodeErr := DecodeReplicatedResponse(bytes.NewReader(encoded.Bytes()))
 		if decodeErr != nil || got.Kind != response.Kind || got.ReadApplied != 20 || len(got.Value) != 0 {
 			t.Fatalf("response=%+v err=%v", got, decodeErr)
+		}
+	}
+}
+
+func TestReplicatedResponseRequestBoundRejectsOversizeHeaderBeforeAllocation(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
+		Fence: testReplicatedFence(), Relation: 1, Key: []byte("k"),
+		MinimumApplied: 1, MaxValueBytes: 32}
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := request.Fence
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: bytes.Repeat([]byte{1}, 32)}
+	var exact bytes.Buffer
+	if err := EncodeReplicatedResponse(&exact, response); err != nil {
+		t.Fatal(err)
+	}
+	if bodyBytes := exact.Len() - 5; bodyBytes != maximum {
+		t.Fatalf("exact response body=%d, request ceiling=%d", bodyBytes, maximum)
+	}
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(exact.Bytes()), maximum); err != nil {
+		t.Fatalf("exact bounded response: %v", err)
+	}
+	response.Value = append(response.Value, 2)
+	var oversized bytes.Buffer
+	if err := EncodeReplicatedResponse(&oversized, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(oversized.Bytes()), maximum); !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("oversized valid response error=%v", err)
+	}
+	var header [5]byte
+	header[0] = tagReplicatedResponse
+	binary.BigEndian.PutUint32(header[1:], uint32(maximum+1+4))
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := decodeReplicatedResponseLimit(bytes.NewReader(header[:]), maximum); !errors.Is(err, errFrameTooLarge) {
+			panic(err)
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("oversize header control path allocated %.2f times", allocs)
+	}
+	var wait sync.WaitGroup
+	wait.Add(32)
+	for range 32 {
+		go func() {
+			defer wait.Done()
+			if _, err := decodeReplicatedResponseLimit(bytes.NewReader(header[:]), maximum); !errors.Is(err, errFrameTooLarge) {
+				t.Errorf("concurrent oversize error=%v", err)
+			}
+		}()
+	}
+	wait.Wait()
+}
+
+func BenchmarkEncodeReplicatedLargePointRead(b *testing.B) {
+	fence := testReplicatedFence()
+	value := bytes.Repeat([]byte{7}, replication.MaxMutationValueBytes)
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: value}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(value)))
+	for b.Loop() {
+		if err := EncodeReplicatedResponse(io.Discard, response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeReplicatedLargePointRead(b *testing.B) {
+	fence := testReplicatedFence()
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: bytes.Repeat([]byte{7}, replication.MaxMutationValueBytes)}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedResponse(&encoded, response); err != nil {
+		b.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower, Fence: fence,
+		Relation: 1, Key: []byte("k"), MinimumApplied: 1,
+		MaxValueBytes: replication.MaxMutationValueBytes}
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(replication.MaxMutationValueBytes)
+	b.ResetTimer()
+	for b.Loop() {
+		decoded, err := decodeReplicatedResponseLimit(bytes.NewReader(encoded.Bytes()), maximum)
+		if err != nil || len(decoded.Value) != replication.MaxMutationValueBytes {
+			b.Fatal(err)
 		}
 	}
 }

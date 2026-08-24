@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
@@ -78,6 +79,56 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	}}})
 	if len(owner.pendingReads) != 0 || len(abandoned.reply) != 0 {
 		t.Fatal("canceled read was retained or redelivered")
+	}
+}
+
+func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
+	owner := &Owner{started: true, limits: Limits{
+		MaxPendingReadItems: 1, MaxPendingReadBytes: 8,
+	}}
+	if err := owner.reservePendingRead(8); err != nil {
+		t.Fatal(err)
+	}
+	lease := &pointReadLease{owner: owner, bytes: 8}
+	if err := owner.reservePendingRead(1); !errors.Is(err, ErrPendingReadsFull) {
+		t.Fatalf("concurrent reservation error=%v", err)
+	}
+	lease.Release()
+	lease.Release()
+	if err := owner.reservePendingRead(8); err != nil {
+		t.Fatalf("reservation after release=%v", err)
+	}
+	owner.releasePendingRead(8)
+	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
+		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
+	}
+}
+
+func TestPointReadFenceAuthenticatesReplicaSetVersion(t *testing.T) {
+	group := peerServerTestGroup()
+	serving := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11}}
+	fence := replicatedstate.SnapshotFence{Binding: replicatedstate.Binding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		AllocationGeneration:  serving.AllocationGeneration,
+		ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+		ActivePolicyGeneration: serving.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        serving.Command.ProtectionEpoch,
+		OwnershipEpoch:         serving.Command.OwnershipEpoch,
+		SchemaGeneration:       serving.Command.SchemaGeneration,
+		RoutingVersion:         serving.Command.RoutingVersion,
+		RouteGeneration:        serving.Command.RouteGeneration,
+	}, RelationManifestDigest: serving.Command.RelationManifestDigest,
+		ReplicaSetVersion: serving.Command.ReplicaSetVersion}
+	if !pointReadFenceMatches(fence, serving) {
+		t.Fatal("exact replica-set fence rejected")
+	}
+	fence.ReplicaSetVersion++
+	if pointReadFenceMatches(fence, serving) {
+		t.Fatal("stale replica-set publication accepted")
 	}
 }
 

@@ -176,6 +176,24 @@ type PointReadResult struct {
 	Value   []byte
 }
 
+// PointReadLease holds the conservative response-memory reservation until the
+// serving boundary has finished encoding and writing the result.
+type PointReadLease interface {
+	Release()
+}
+
+type pointReadLease struct {
+	owner    *Owner
+	bytes    int64
+	released atomic.Bool
+}
+
+func (lease *pointReadLease) Release() {
+	if lease != nil && lease.owner != nil && lease.released.CompareAndSwap(false, true) {
+		lease.owner.releasePendingRead(lease.bytes)
+	}
+}
+
 // CommandFence is the exact command/catalog contract served by one Runtime.
 // SchemaGeneration authenticates dense relation IDs; the other scalars fence
 // topology, protection, ownership, and routing interpretation before Raft
@@ -665,20 +683,25 @@ func (owner *Owner) stop(cause error) error {
 func (owner *Owner) ReadPoint(
 	ctx context.Context,
 	request PointReadRequest,
-) (PointReadResult, error) {
+) (PointReadResult, PointReadLease, error) {
 	if owner == nil || ctx == nil || request.Relation == 0 ||
 		len(request.Key) == 0 || len(request.Key) > replication.MaxMutationKeyBytes ||
 		request.MinimumApplied == 0 || request.MaxValueBytes <= 0 ||
 		request.MaxValueBytes > replication.MaxMutationValueBytes {
-		return PointReadResult{}, ErrInvalidOwner
+		return PointReadResult{}, nil, ErrInvalidOwner
 	}
 	// The server briefly owns the detached store result and its encoded frame.
 	// Charge both copies before either can exist.
 	responseCharge := int64(request.MaxValueBytes) * 2
 	if err := owner.reservePendingRead(responseCharge); err != nil {
-		return PointReadResult{}, err
+		return PointReadResult{}, nil, err
 	}
-	defer owner.releasePendingRead(responseCharge)
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
 	key := make([]byte, len(request.Key))
 	copy(key, request.Key)
 	kind := requestReadFollower
@@ -704,7 +727,7 @@ func (owner *Owner) ReadPoint(
 		})
 	}
 	if err != nil {
-		return PointReadResult{}, err
+		return PointReadResult{}, nil, err
 	}
 	value, err := reply.read.source.PointReadInto(
 		request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes,
@@ -713,11 +736,13 @@ func (owner *Owner) ReadPoint(
 	if err != nil || !pointReadFenceMatches(value.Fence, request.Fence) ||
 		value.Fence.Applied < reply.read.minimumApplied || len(value.Value) > request.MaxValueBytes {
 		if err != nil {
-			return PointReadResult{}, err
+			return PointReadResult{}, nil, err
 		}
-		return PointReadResult{}, ErrServingFence
+		return PointReadResult{}, nil, ErrServingFence
 	}
-	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value}, nil
+	releaseReservation = false
+	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
+		&pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
 func (owner *Owner) enqueueRead(
@@ -756,6 +781,7 @@ func pointReadFenceMatches(fence replicatedstate.SnapshotFence, serving ServingF
 		binding.OwnershipEpoch == serving.Command.OwnershipEpoch &&
 		binding.SchemaGeneration == serving.Command.SchemaGeneration &&
 		fence.RelationManifestDigest == serving.Command.RelationManifestDigest &&
+		fence.ReplicaSetVersion == serving.Command.ReplicaSetVersion &&
 		binding.RoutingVersion == serving.Command.RoutingVersion &&
 		binding.RouteGeneration == serving.Command.RouteGeneration
 }
