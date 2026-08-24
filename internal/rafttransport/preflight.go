@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -11,6 +12,8 @@ import (
 // allocating message, entry, snapshot, response, or unknown-field objects.
 func preflightOrdinaryPayload(payload []byte) error {
 	var seen uint16
+	var messageType uint64
+	var term uint64
 	entryCount := 0
 	payloadBytes := int64(0)
 	for len(payload) != 0 {
@@ -44,6 +47,12 @@ func preflightOrdinaryPayload(payload []byte) error {
 			}
 			if number == 10 && value > 1 {
 				return fmt.Errorf("%w: non-boolean reject field", ErrInvalidFrame)
+			}
+			if number == 1 {
+				messageType = value
+			}
+			if number == 4 {
+				term = value
 			}
 			payload = payload[consumed:]
 		case 7:
@@ -81,6 +90,12 @@ func preflightOrdinaryPayload(payload []byte) error {
 			payload = payload[consumed:]
 		default:
 			return fmt.Errorf("%w: unsupported protobuf field %d", ErrInvalidFrame, number)
+		}
+	}
+	if messageType == uint64(pb.MsgTimeoutNow) {
+		const timeoutNowFields = uint16(1<<1 | 1<<2 | 1<<3 | 1<<4)
+		if seen != timeoutNowFields || term == 0 || entryCount != 0 {
+			return fmt.Errorf("%w: malformed leader-transfer payload", ErrInvalidFrame)
 		}
 	}
 	return nil

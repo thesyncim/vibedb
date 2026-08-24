@@ -1015,7 +1015,8 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 	}
 	switch message.GetType() {
 	case pb.MsgApp, pb.MsgAppResp, pb.MsgVote, pb.MsgVoteResp,
-		pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgPreVote, pb.MsgPreVoteResp:
+		pb.MsgHeartbeat, pb.MsgHeartbeatResp, pb.MsgPreVote, pb.MsgPreVoteResp,
+		pb.MsgTimeoutNow:
 	default:
 		return 0, &raftmodel.UnsupportedError{Feature: "ordinary message type " + message.GetType().String()}
 	}
@@ -1023,6 +1024,14 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 		message.GetIndex() == math.MaxUint64 || message.GetLogTerm() == math.MaxUint64 ||
 		message.GetCommit() == math.MaxUint64 {
 		return 0, errors.New("raftmember: ordinary message has invalid Raft term or terminal index")
+	}
+	if message.GetType() == pb.MsgTimeoutNow &&
+		(message.Type == nil || message.From == nil || message.To == nil || message.Term == nil ||
+			message.LogTerm != nil || message.Index != nil || len(message.Entries) != 0 ||
+			message.Commit != nil || message.Snapshot != nil || message.Reject != nil ||
+			message.RejectHint != nil || len(message.Context) != 0 || message.Vote != nil ||
+			len(message.Responses) != 0) {
+		return 0, errors.New("raftmember: malformed leader-transfer message")
 	}
 	if len(message.GetEntries()) > raftmodel.MaxMessageEntries {
 		return 0, fmt.Errorf("%w: too many Raft entries", raftmodel.ErrAdmissionBound)
