@@ -41,15 +41,20 @@ const (
 	checkpointGroupMemberBytes        = 64
 	checkpointGroupChecksumOffset     = checkpointGroupSlotBytes - sha256.Size
 	// The final 24 authenticated bytes before the checksum are outside even the
-	// maximum member bank (which ends at byte 4008). Legacy format-0 files keep
-	// them all zero. A widened max span uses them as the exact transaction/range
-	// witness that prevents a checksum-valid certificate from merely widening
-	// its applied/transaction sanity envelope.
+	// maximum member and retention banks. Legacy format-0 files keep them all
+	// zero. A widened max span uses them as the exact transaction/range witness
+	// that prevents a checksum-valid certificate from merely widening its
+	// applied/transaction sanity envelope.
 	checkpointGroupMaxSpanWitnessTxnOffset   = checkpointGroupChecksumOffset - 24
 	checkpointGroupMaxSpanWitnessFirstOffset = checkpointGroupChecksumOffset - 16
 	checkpointGroupMaxSpanWitnessLastOffset  = checkpointGroupChecksumOffset - 8
-	checkpointGroupMaxMembers                = (checkpointGroupMaxSpanWitnessTxnOffset - checkpointGroupHeaderBytes) / checkpointGroupMemberBytes
-	defaultCheckpointEvery                   = 128
+	// The retention seal occupies the authenticated 32 bytes immediately before
+	// the max-span witness. The maximum 60-member bank ends at its applied field.
+	checkpointGroupRetentionEndOffset     = checkpointGroupMaxSpanWitnessTxnOffset
+	checkpointGroupRetentionCommitOffset  = checkpointGroupRetentionEndOffset - 24
+	checkpointGroupRetentionAppliedOffset = checkpointGroupRetentionCommitOffset - 8
+	checkpointGroupMaxMembers             = (checkpointGroupRetentionAppliedOffset - checkpointGroupHeaderBytes) / checkpointGroupMemberBytes
+	defaultCheckpointEvery                = 128
 	// MaxCheckpointGroupUpdateEntries bounds the logical index range one
 	// physical group transaction may certify. It matches the replicated apply
 	// port's independent bound without importing that higher layer.
@@ -59,6 +64,11 @@ const (
 var checkpointGroupMagic = [8]byte{'V', 'I', 'B', 'E', 'C', 'P', 'G', 0}
 var checkpointGroupDigestDomain = []byte("vibedb/checkpoint-group/format-0\x00")
 var checkpointGroupSeedDomain = []byte("vibedb/checkpoint-group/seed-state-envelope/format-0\x00")
+var checkpointGroupLineageDomain = []byte("vibedb/checkpoint-group/lineage/format-0\x00")
+var checkpointRetentionSealDomain = []byte("vibedb/checkpoint-group/retention-seal/format-0\x00")
+var checkpointRetentionWitnessDomain = []byte(
+	"vibedb/checkpoint-group/retention-witness/format-0\x00",
+)
 
 var (
 	// ErrCheckpointGroupOwned reports a direct generic mutation, Flush, Close,
@@ -81,7 +91,8 @@ var (
 	)
 	// ErrCheckpointGroupMissing distinguishes a clean pre-activation replicated
 	// store from a checkpoint-group reopen. Callers may create format 0 only when
-	// every intended member is empty and the marker has no decision.
+	// every intended member is empty and the marker has no decision or recycled
+	// BaseSequence.
 	ErrCheckpointGroupMissing = errors.New(
 		"vibedb: checkpoint group certificate is missing",
 	)
@@ -104,6 +115,12 @@ var (
 	// attached. No certificate is published for this pre-activation refusal.
 	ErrCheckpointGroupSeedChanged = errors.New(
 		"vibedb: checkpoint group seed image changed before activation",
+	)
+	// ErrCheckpointRetentionWitness reports a zero, stale, foreign, or otherwise
+	// non-current two-slot retention witness. It is a caller qualification
+	// failure, not evidence that the checkpoint group itself is corrupt.
+	ErrCheckpointRetentionWitness = errors.New(
+		"vibedb: checkpoint retention witness is not current",
 	)
 )
 
@@ -198,6 +215,37 @@ type CheckpointGroupStats struct {
 	PhysicalCheckpoints uint64
 }
 
+// CheckpointRetentionWitness is the fixed-width authenticated evidence that
+// both checkpoint certificate slots carry the same retained applied floor in
+// one live group lineage. It is intentionally opaque: an applied index without
+// exact revalidation through the owning group is not WAL-retention authority.
+//
+// Witness values are comparable and contain no borrowed storage. Only the
+// owning CheckpointGroup can validate one against its still-live certificate
+// descriptor and current publication.
+type CheckpointRetentionWitness struct {
+	applied    uint64
+	commitment [24]byte
+}
+
+// BindsAppliedIndex reports whether the complete witness certifies applied.
+// It deliberately does not expose a detachable scalar retention authority.
+func (w CheckpointRetentionWitness) BindsAppliedIndex(applied uint64) bool {
+	return applied != 0 && w.applied == applied && !w.IsZero()
+}
+
+// Commitment returns the canonical fixed-width commitment suitable for
+// binding into a future WAL generation lineage record. It is not independently
+// valid without ValidateRetentionWitness on the owning checkpoint group.
+func (w CheckpointRetentionWitness) Commitment() [sha256.Size]byte {
+	return checkpointRetentionWitnessCommitment(w)
+}
+
+// IsZero reports the invalid zero witness.
+func (w CheckpointRetentionWitness) IsZero() bool {
+	return w == (CheckpointRetentionWitness{})
+}
+
 type checkpointGroupMember struct {
 	name       string
 	nameDigest [sha256.Size]byte
@@ -207,20 +255,22 @@ type checkpointGroupMember struct {
 }
 
 type checkpointGroupCertificate struct {
-	sequence     uint64
-	applied      uint64
-	txnHighWater uint64
-	txnBase      uint64
-	maxApplySpan uint8
-	maxSpanTxn   uint64
-	maxSpanFirst uint64
-	maxSpanLast  uint64
-	markerEpoch  uint64
-	markerID     [16]byte
-	seedApplied  uint64
-	seedState    [sha256.Size]byte
-	seedMember   [sha256.Size]byte
-	members      []checkpointGroupMember
+	sequence            uint64
+	applied             uint64
+	txnHighWater        uint64
+	txnBase             uint64
+	maxApplySpan        uint8
+	maxSpanTxn          uint64
+	maxSpanFirst        uint64
+	maxSpanLast         uint64
+	markerEpoch         uint64
+	markerID            [16]byte
+	seedApplied         uint64
+	seedState           [sha256.Size]byte
+	seedMember          [sha256.Size]byte
+	retentionApplied    uint64
+	retentionCommitment [24]byte
+	members             []checkpointGroupMember
 }
 
 // CheckpointGroup exclusively owns one TxnLog and a fixed collection set. It
@@ -237,23 +287,29 @@ type CheckpointGroup struct {
 	file     *os.File
 	fileInfo os.FileInfo
 
-	sequence     uint64
-	txnBase      uint64
-	markerEpoch  uint64
-	markerID     [16]byte
-	txn          uint64
-	applied      uint64
-	maxApplySpan uint8
-	maxSpanTxn   uint64
-	maxSpanFirst uint64
-	maxSpanLast  uint64
-	foldedTxn    uint64
-	seedApplied  uint64
-	seedState    [sha256.Size]byte
-	seedMember   [sha256.Size]byte
-	closed       bool
-	closeErr     error
-	poison       error
+	sequence            uint64
+	txnBase             uint64
+	markerEpoch         uint64
+	markerID            [16]byte
+	txn                 uint64
+	applied             uint64
+	maxApplySpan        uint8
+	maxSpanTxn          uint64
+	maxSpanFirst        uint64
+	maxSpanLast         uint64
+	certMaxApplySpan    uint8
+	certMaxSpanTxn      uint64
+	certMaxSpanFirst    uint64
+	certMaxSpanLast     uint64
+	foldedTxn           uint64
+	seedApplied         uint64
+	seedState           [sha256.Size]byte
+	seedMember          [sha256.Size]byte
+	retentionApplied    uint64
+	retentionCommitment [24]byte
+	closed              bool
+	closeErr            error
+	poison              error
 
 	visibleApplied atomic.Uint64
 	visibleTxn     atomic.Uint64
@@ -285,11 +341,12 @@ const (
 )
 
 var (
-	checkpointGroupFaultHook                        func(checkpointGroupFaultPoint) error
-	checkpointGroupAfterInitialValidationHook       func()
-	checkpointGroupAfterDirectoryMembershipHook     func()
-	checkpointGroupCertificateCloseHook             func(*os.File) error
-	checkpointGroupGenericDatabaseAfterPrecheckHook func()
+	checkpointGroupFaultHook                         func(checkpointGroupFaultPoint) error
+	checkpointGroupAfterInitialValidationHook        func()
+	checkpointGroupAfterDirectoryMembershipHook      func()
+	checkpointGroupAfterActivationBaselineRemoveHook func(*TxnLog) error
+	checkpointGroupCertificateCloseHook              func(*os.File) error
+	checkpointGroupGenericDatabaseAfterPrecheckHook  func()
 	// checkpointGroupNamespaceLease serializes the in-process engine entry
 	// points that can create/open a collection with the activation scan and
 	// fixed-name certificate publication. It is intentionally process-global:
@@ -298,6 +355,183 @@ var (
 	// the caller's existing exclusive-directory responsibility.
 	checkpointGroupNamespaceLease sync.RWMutex
 )
+
+// ResetDischargedForCheckpointGroupActivation replaces a fully discharged
+// generic marker with the sole canonical pre-certificate baseline. A generic
+// recycle preserves its monotonic DCSN in Header.BaseSequence; carrying that
+// nonzero base across SQL's descriptor-before-certificate publication would
+// make a crash in that seam indistinguishable from loss of a live certificate.
+//
+// The caller must invoke this before durably publishing checkpoint-group
+// activation intent. This method first proves that no live marker record or
+// conditional journal can depend on the old marker identity. It then folds and
+// syncs every registered ordinary journal before namespace-safely removing and
+// reminting only a nonzero-base marker. A clean base-zero owner is an exact
+// no-op; a base-zero owner with ordinary staged data is folded without changing
+// marker identity. Any uncertain remove/remint outcome poisons the live log and
+// every registered collection; reopen is then the only recovery path.
+func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	checkpointGroupNamespaceLease.Lock()
+	defer checkpointGroupNamespaceLease.Unlock()
+
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if err := rejectCheckpointGroupCertificate(l.root); err != nil {
+		return err
+	}
+	registered := l.registeredCollections()
+	for _, collection := range registered {
+		if collection == nil {
+			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+		}
+	}
+	sortCollectionSnapshotOrder(registered)
+	for _, collection := range registered {
+		collection.writer.Lock()
+	}
+	defer func() {
+		for i := len(registered) - 1; i >= 0; i-- {
+			registered[i].writer.Unlock()
+		}
+	}()
+	for _, collection := range registered {
+		if collection == nil || collection.closed || collection.journal == nil {
+			return fmt.Errorf(
+				"%w: checkpoint activation requires live registered journals",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	// Refuse a live marker before folding an unrelated ordinary journal. Besides
+	// minimizing work on a rejected activation, this keeps a marker-integrity
+	// refusal byte-stable and makes the ordering independently testable.
+	if l.marker != nil {
+		if err := l.verifyMarkerDirectoryLocked(); err != nil {
+			return err
+		}
+		decisions, err := rescanTxnLogMarker(l)
+		if err != nil {
+			return err
+		}
+		if decisions == nil || decisions.MaxTxnID() != 0 ||
+			decisions.MaxDCSN() != 0 || decisions.RetirementCount() != 0 ||
+			l.marker.Cursor() != 0 || l.undischarged != 0 {
+			return fmt.Errorf(
+				"%w: checkpoint activation requires a discharged transaction marker",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	// A nil resolver is legal only after a complete directory-wide scan proves
+	// that every live journal record is ordinary. All registered writers and the
+	// transaction commit fence remain held across the scan and folds, so no
+	// conditional can appear between proof and consumption.
+	for _, collection := range registered {
+		holds, err := collection.journalHoldsAnyConditional()
+		if err != nil {
+			return err
+		}
+		if holds {
+			return fmt.Errorf(
+				"%w: checkpoint activation registered journal retains a conditional",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	holds, err := directoryHoldsAnyConditional(l.root)
+	if err != nil {
+		return err
+	}
+	if holds {
+		return fmt.Errorf(
+			"%w: checkpoint activation directory retains a conditional journal",
+			ErrCheckpointGroupCorrupt,
+		)
+	}
+	for _, collection := range registered {
+		if collection.journal.Cursor() == 0 {
+			continue
+		}
+		if err := collection.checkpointPastConditionalsLocked(nil, 0); err != nil {
+			return fmt.Errorf(
+				"vibedb: fold registered journal before checkpoint activation: %w",
+				err,
+			)
+		}
+		if collection.journal.Cursor() != 0 {
+			return fmt.Errorf(
+				"%w: checkpoint activation fold left a live registered journal",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	if l.marker == nil {
+		if err := l.ensureMintedLocked(); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+		if err := l.verifyMarkerDirectoryLocked(); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+		return nil
+	}
+	if l.marker.Header().BaseSequence == 0 {
+		return nil
+	}
+
+	marker := l.marker
+	l.marker = nil
+	l.nextTxnID = 1
+	l.undischarged = 0
+	if err := marker.Remove(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if checkpointGroupAfterActivationBaselineRemoveHook != nil {
+		if err := checkpointGroupAfterActivationBaselineRemoveHook(l); err != nil {
+			return l.poisonCheckpointGroupActivationBaselineLocked(err)
+		}
+	}
+	if err := l.ensureMintedLocked(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		return l.poisonCheckpointGroupActivationBaselineLocked(err)
+	}
+	if l.marker.Cursor() != 0 || l.marker.Header().BaseSequence != 0 {
+		return l.poisonCheckpointGroupActivationBaselineLocked(
+			fmt.Errorf("%w: reminted transaction marker is not at cut zero", ErrCheckpointGroupCorrupt),
+		)
+	}
+	return nil
+}
+
+func (l *TxnLog) poisonCheckpointGroupActivationBaselineLocked(cause error) error {
+	poisoned := journalCommitOutcomeUnknown(fmt.Errorf(
+		"vibedb: reset checkpoint activation marker: %w", cause,
+	))
+	if l.poison != nil {
+		poisoned = errors.Join(l.poison, poisoned)
+	}
+	l.poison = poisoned
+	for _, collection := range l.registeredCollections() {
+		_ = joinCatalogCommitOutcomeUnknown(collection, poisoned)
+	}
+	return poisoned
+}
 
 // rejectCheckpointGroupCertificate prevents every generic catalog recovery
 // path from consulting txn.vtm or member journals while the format-0
@@ -377,8 +611,8 @@ func acquireCheckpointGroupRecoveryNamespace() (func(), error) {
 // never adopted from generic-recovered handles: callers must reopen it through
 // OpenCollectionsWithCheckpointGroup so an uncertified marker suffix cannot be
 // folded before the certificate is consulted. Format 0 is created only when
-// every member is logically empty and txn.vtm has no decision; this is the
-// crash-safe first-activation seam.
+// every member is logically empty and txn.vtm is at its clean zero-base
+// baseline; this is the crash-safe first-activation seam.
 func NewCheckpointGroup(
 	log *TxnLog,
 	members []NamedCollection,
@@ -554,7 +788,8 @@ func newCheckpointGroup(
 	if scanErr != nil {
 		return nil, scanErr
 	}
-	if decisions.MaxTxnID() != 0 || log.marker.Cursor() != 0 {
+	if decisions.MaxTxnID() != 0 || log.marker.Cursor() != 0 ||
+		log.marker.Header().BaseSequence != 0 {
 		return nil, fmt.Errorf("%w: missing certificate beside a non-empty marker", ErrCheckpointGroupCorrupt)
 	}
 	for _, member := range ordered {
@@ -786,9 +1021,14 @@ func checkpointGroupFromCertificateLocked(
 		markerID: certificate.markerID, txn: certificate.txnHighWater,
 		applied: certificate.applied, maxApplySpan: certificate.maxApplySpan,
 		maxSpanTxn: certificate.maxSpanTxn, maxSpanFirst: certificate.maxSpanFirst,
-		maxSpanLast: certificate.maxSpanLast, foldedTxn: certificate.txnHighWater,
+		maxSpanLast:      certificate.maxSpanLast,
+		certMaxApplySpan: certificate.maxApplySpan,
+		certMaxSpanTxn:   certificate.maxSpanTxn, certMaxSpanFirst: certificate.maxSpanFirst,
+		certMaxSpanLast: certificate.maxSpanLast, foldedTxn: certificate.txnHighWater,
 		seedApplied: certificate.seedApplied, seedState: certificate.seedState,
-		seedMember: certificate.seedMember,
+		seedMember:          certificate.seedMember,
+		retentionApplied:    certificate.retentionApplied,
+		retentionCommitment: certificate.retentionCommitment,
 	}
 	group.certApplied.Store(certificate.applied)
 	group.certTxn.Store(certificate.txnHighWater)
@@ -1115,6 +1355,20 @@ func (g *CheckpointGroup) Seed(
 		g.certApplied.Load() != 0 || g.certTxn.Load() != 0 {
 		return fmt.Errorf("%w: seed requires cut zero", ErrCheckpointGroupSequence)
 	}
+	// The seed member needs a one-entry DCSN/generation budget before building or
+	// staging its row. Clean undeclared journals remain exact no-ops during the
+	// mandatory final all-member checkpoint.
+	if err := checkpointGroupMemberMutationTerminalForDocuments(owned, 1); err != nil {
+		return err
+	}
+	// Seed publishes and certifies one mutation before returning. Keep that final
+	// certificate generation available before building or appending the seed.
+	if err := g.requireCertificateSequenceBudgetLocked(1); err != nil {
+		return err
+	}
+	if _, _, _, _, err := g.markerAdmissionSnapshotLocked(1, false); err != nil {
+		return err
+	}
 
 	wb := &WriteBatch{
 		collection: owned,
@@ -1141,6 +1395,11 @@ func (g *CheckpointGroup) Seed(
 			return roomErr
 		}
 		if !room {
+			// One same-cut certificate rolls the empty marker. The second certifies
+			// the seed. Refuse before either persistent transition if only one remains.
+			if err := g.requireCertificateSequenceBudgetLocked(2); err != nil {
+				return err
+			}
 			if err := g.checkpointLocked(); err != nil {
 				return err
 			}
@@ -1247,14 +1506,6 @@ func (g *CheckpointGroup) updateLocked(
 			)
 		}
 	}
-	// Periodic barriers are admission work for the next physical transaction.
-	// This keeps every checkpoint failure pre-mutation: a caller never receives
-	// a terminal checkpoint error after its requested publication is visible.
-	if g.txn-g.certTxn.Load() >= g.opts.CheckpointEvery {
-		if err := g.checkpointLocked(); err != nil {
-			return err
-		}
-	}
 	if update.consecutive {
 		if g.applied == math.MaxUint64 || update.firstApplied != g.applied+1 ||
 			update.lastApplied < update.firstApplied ||
@@ -1283,6 +1534,53 @@ func (g *CheckpointGroup) updateLocked(
 				"%w: member %q is outside the fixed group",
 				ErrCheckpointGroupOwned, member.Name,
 			)
+		}
+		if err := checkpointGroupMemberMutationTerminal(member.Collection); err != nil {
+			return err
+		}
+	}
+	// One terminal transaction ID is reserved by the marker grammar. Refuse
+	// before fn just as certificate exhaustion does. The two counters advance
+	// independently and neither may rely on the other's preflight.
+	if g.txn >= math.MaxUint64-1 {
+		return ErrCheckpointGroupSequence
+	}
+	// Every accepted update needs one future certificate. An existing visible
+	// suffix may additionally need a pressure/admission checkpoint. Qualify this
+	// base budget before marker lineage so an aligned certificate-terminal owner
+	// with a retained aborted marker suffix remains a read-only endpoint rather
+	// than being misclassified as live corruption.
+	requiredSequences := uint64(1)
+	if g.certTxn.Load() != g.txn {
+		requiredSequences++
+	}
+	if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
+		return err
+	}
+	preflightMarker := math.MaxUint64-g.sequence <= 3
+	markerCursor, markerCapacity, markerMayNeedRollover, markerWindowCaptured, err :=
+		g.markerAdmissionSnapshotLocked(len(ordered), preflightMarker)
+	if err != nil {
+		return err
+	}
+	// Only within the final three generations inspect the marker before fn: a
+	// non-empty marker means the actual dirty subset may also require a same-cut
+	// rollover. Far from exhaustion the post-callback exact check remains the sole
+	// hot-path marker lock. An empty marker cannot require rollover for any subset
+	// that fits it.
+	if preflightMarker && markerMayNeedRollover {
+		requiredSequences++
+		if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
+			return err
+		}
+	}
+	// Periodic barriers are admission work for the next physical transaction.
+	// This keeps every checkpoint failure pre-mutation: a caller never receives
+	// a terminal checkpoint error after its requested publication is visible.
+	checkpointDue := g.txn-g.certTxn.Load() >= g.opts.CheckpointEvery
+	if checkpointDue {
+		if err := g.checkpointLocked(); err != nil {
+			return err
 		}
 	}
 
@@ -1323,27 +1621,43 @@ func (g *CheckpointGroup) updateLocked(
 	if err := checkTxnLimits(limits, len(dirty), totalDocs, totalBytes); err != nil {
 		return err
 	}
-	if g.txn >= math.MaxUint64-1 {
-		return ErrCheckpointGroupSequence
+	// Near terminal exhaustion, reuse the cursor/capacity captured under commitMu
+	// before fn. g.mu excludes every group marker writer. Otherwise retain the
+	// single exact marker-room acquisition used by the ordinary hot path.
+	actualMarkerRoom := false
+	if markerWindowCaptured {
+		padded, ok := txnDecisionRecordBytes(len(dirty))
+		if !ok || uint64(padded) > markerCapacity {
+			return ErrTxnTooLarge
+		}
+		actualMarkerRoom = uint64(padded) <= markerCapacity-markerCursor
+	} else {
+		actualMarkerRoom, err = g.markerRoomLocked(len(dirty))
+		if err != nil {
+			return err
+		}
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		room, roomErr := g.markerRoomLocked(len(dirty))
-		if roomErr != nil {
-			return roomErr
-		}
-		if !room {
+		if !actualMarkerRoom {
+			requiredSequences := uint64(2) // marker successor + future update certificate
+			if g.certTxn.Load() != g.txn {
+				requiredSequences++
+			}
+			if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
+				return err
+			}
 			if err := g.checkpointLocked(); err != nil {
 				return err
 			}
 			if err := g.recycleMarkerLocked(); err != nil {
 				return err
 			}
-			room, roomErr = g.markerRoomLocked(len(dirty))
-			if roomErr != nil {
-				return roomErr
+			actualMarkerRoom, err = g.markerRoomLocked(len(dirty))
+			if err != nil {
+				return err
 			}
-			if !room {
+			if !actualMarkerRoom {
 				return ErrTxnTooLarge
 			}
 		}
@@ -1365,6 +1679,13 @@ func (g *CheckpointGroup) updateLocked(
 				// transactions, not the number of logical entries represented.
 				g.updates.Add(1)
 			}
+			return err
+		}
+		requiredSequences := uint64(1) // future certificate for this update
+		if g.certTxn.Load() != g.txn {
+			requiredSequences++
+		}
+		if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
 			return err
 		}
 		if err := g.checkpointLocked(); err != nil {
@@ -1395,6 +1716,10 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	if log.marker == nil || log.marker.Header().MarkerID != g.markerID ||
 		log.marker.Header().Epoch != g.markerEpoch {
 		return fmt.Errorf("%w: transaction marker identity", ErrCheckpointGroupCorrupt)
+	}
+	if log.marker.Header().BaseSequence != g.txnBase ||
+		log.marker.NextSequence() != txnID {
+		return fmt.Errorf("%w: transaction marker sequence lineage", ErrCheckpointGroupCorrupt)
 	}
 
 	order := make([]*Collection, len(dirty))
@@ -1456,8 +1781,18 @@ func (g *CheckpointGroup) commitTransitionLocked(
 			return err
 		}
 	}
-	if _, appendErr := log.marker.AppendDecision(txnID, participants); appendErr != nil {
+	dcsn, appendErr := log.marker.AppendDecision(txnID, participants)
+	if appendErr != nil {
 		poisoned := journalCommitOutcomeUnknown(appendErr)
+		log.poison = poisoned
+		g.poison = poisoned
+		return poisoned
+	}
+	if dcsn != txnID {
+		poisoned := journalCommitOutcomeUnknown(fmt.Errorf(
+			"%w: decision sequence %d, want transaction %d",
+			ErrCheckpointGroupCorrupt, dcsn, txnID,
+		))
 		log.poison = poisoned
 		g.poison = poisoned
 		return poisoned
@@ -1499,6 +1834,149 @@ func checkpointNamedMembers(members []checkpointGroupMember) []NamedCollection {
 	return result
 }
 
+func checkpointGroupMemberCheckpointRecycleTerminal(collection *Collection) error {
+	if collection == nil || collection.journal == nil {
+		return ErrCheckpointGroupCorrupt
+	}
+	header := collection.journal.Header()
+	if header.RecycleCount != math.MaxUint64 {
+		return nil
+	}
+	// RecoveryJournal.Recycle is an exact no-op for an empty journal already
+	// anchored at this collection's visible generation. A final-DCSN endpoint
+	// remains foldable for the same reason. Only a header-changing checkpoint
+	// needs a recycle successor.
+	if collection.journal.Cursor() == 0 &&
+		header.BaseGeneration == collection.Generation() {
+		return nil
+	}
+	return ErrCheckpointGroupSequence
+}
+
+func checkpointGroupMemberMutationTerminal(collection *Collection) error {
+	if collection == nil {
+		return ErrCheckpointGroupCorrupt
+	}
+	return checkpointGroupMemberMutationTerminalForDocuments(
+		collection, collection.options.MaxBatchDocuments,
+	)
+}
+
+func checkpointGroupMemberMutationTerminalForDocuments(
+	collection *Collection,
+	maxDocuments int,
+) error {
+	if collection == nil || collection.journal == nil {
+		return ErrCheckpointGroupCorrupt
+	}
+	// A final legal append can consume DCSN Max and leave NextSequence at the
+	// zero sentinel. That terminal journal may still be certified and folded,
+	// but it cannot accept another mutation.
+	if collection.journal.NextSequence() == 0 {
+		return ErrCheckpointGroupSequence
+	}
+	if maxDocuments <= 0 {
+		return ErrCheckpointGroupCorrupt
+	}
+	// The primary batch stage loop has exactly
+	// 2*N+primaryStructuralRetryLimit+8 attempts. Each attempt either publishes
+	// at most one content-equivalent topology generation and retries, or stages
+	// the final logical generation and returns. Therefore one call consumes at
+	// most B generations: B-1 topology generations plus the final publication on
+	// success, or B topology generations before its already-bounded retry error.
+	// Reserve B from the collection's hard MaxBatchDocuments limit before fn so
+	// terminal exhaustion can never be discovered after a topology publication.
+	required, ok := checkpointGroupMemberGenerationBudget(maxDocuments)
+	if !ok {
+		return ErrCheckpointGroupSequence
+	}
+	recycleRequired, ok := checkpointGroupMemberRecycleBudget(maxDocuments)
+	if !ok || collection.journal.Header().RecycleCount >
+		math.MaxUint64-recycleRequired {
+		return ErrCheckpointGroupSequence
+	}
+	generation := collection.Generation()
+	if generation > fileLogicalCutGenerationMask ||
+		required > fileLogicalCutGenerationMask-generation {
+		return ErrCheckpointGroupSequence
+	}
+	return nil
+}
+
+func checkpointGroupMemberGenerationBudget(maxDocuments int) (uint64, bool) {
+	budget, ok := primaryBatchStageAttemptBudget(maxDocuments)
+	if !ok {
+		return 0, false
+	}
+	return uint64(budget), true
+}
+
+func checkpointGroupMemberRecycleBudget(maxDocuments int) (uint64, bool) {
+	budget, ok := checkpointGroupMemberGenerationBudget(maxDocuments)
+	if !ok || budget > math.MaxUint64-2 {
+		return 0, false
+	}
+	// B covers every topology generation plus the final logical fold. One older
+	// certified/pressure suffix may need folding before it, and one oversized
+	// conditional record may grow the journal exactly once.
+	return budget + 2, true
+}
+
+// markerAdmissionSnapshotLocked is a lock-free read under the group's
+// exclusive owner mutex. Every group append/recycle and ownership transition
+// holds g.mu. Generic TxnLog commits acquire commitMu and return at the attached
+// group fence before touching the marker. Keep the ordinary Update path at one
+// marker-room acquisition while refusing independent marker sequence exhaustion
+// and a definitely required terminal rollover before its callback.
+func (g *CheckpointGroup) markerAdmissionSnapshotLocked(
+	maxParticipants int,
+	inspectWindow bool,
+) (
+	cursor uint64,
+	capacity uint64,
+	mayNeedRollover bool,
+	windowCaptured bool,
+	err error,
+) {
+	if g.log == nil || g.log.marker == nil || g.log.checkpointGroup != g {
+		return 0, 0, false, false, ErrCheckpointGroupOwned
+	}
+	marker := g.log.marker
+	header := marker.Header()
+	nextSequence := marker.NextSequence()
+	if nextSequence == 0 {
+		return 0, 0, false, false, ErrCheckpointGroupSequence
+	}
+	if header.Epoch == math.MaxUint64 || header.RecycleCount == math.MaxUint64 {
+		return 0, 0, false, false, ErrCheckpointGroupSequence
+	}
+	if g.txn == math.MaxUint64 || nextSequence != g.txn+1 {
+		return 0, 0, false, false, fmt.Errorf(
+			"%w: transaction marker sequence lineage", ErrCheckpointGroupCorrupt,
+		)
+	}
+	lastRollover := header.Epoch == math.MaxUint64-1 ||
+		header.RecycleCount == math.MaxUint64-1
+	if !inspectWindow && !lastRollover {
+		return 0, 0, false, false, nil
+	}
+	cursor = marker.Cursor()
+	capacity = header.Capacity
+	if cursor > capacity {
+		return 0, 0, false, false, ErrCheckpointGroupCorrupt
+	}
+	padded, ok := txnDecisionRecordBytes(maxParticipants)
+	fullSetFits := false
+	if ok {
+		fullSetFits = uint64(padded) <= capacity-cursor
+	}
+	mayNeedRollover = cursor != 0 && !fullSetFits
+	if mayNeedRollover && lastRollover {
+		return 0, 0, false, false, ErrCheckpointGroupSequence
+	}
+	return cursor, capacity, mayNeedRollover, true, nil
+}
+
 func (g *CheckpointGroup) markerRoomLocked(participantCount int) (bool, error) {
 	padded, ok := txnDecisionRecordBytes(participantCount)
 	if !ok {
@@ -1510,13 +1988,28 @@ func (g *CheckpointGroup) markerRoomLocked(participantCount int) (bool, error) {
 		return false, ErrCheckpointGroupOwned
 	}
 	marker := g.log.marker
-	if marker.NextSequence() == 0 {
+	nextSequence := marker.NextSequence()
+	if nextSequence == 0 {
 		return false, ErrCheckpointGroupSequence
 	}
-	if uint64(padded) > marker.Header().Capacity {
+	header := marker.Header()
+	if header.Epoch == math.MaxUint64 || header.RecycleCount == math.MaxUint64 {
+		return false, ErrCheckpointGroupSequence
+	}
+	if g.txn == math.MaxUint64 || nextSequence != g.txn+1 {
+		return false, fmt.Errorf(
+			"%w: transaction marker sequence lineage", ErrCheckpointGroupCorrupt,
+		)
+	}
+	if uint64(padded) > header.Capacity {
 		return false, ErrTxnTooLarge
 	}
-	return marker.Cursor()+uint64(padded) <= marker.Header().Capacity, nil
+	room := marker.Cursor()+uint64(padded) <= header.Capacity
+	if !room && (header.Epoch == math.MaxUint64-1 ||
+		header.RecycleCount == math.MaxUint64-1) {
+		return false, ErrCheckpointGroupSequence
+	}
+	return room, nil
 }
 
 // MaybeCheckpoint applies the configured physical-transaction cadence.
@@ -1552,11 +2045,209 @@ func (g *CheckpointGroup) Checkpoint() error {
 	return g.checkpointLocked()
 }
 
+// SealRetentionFloor installs one explicit retained floor in both authenticated
+// certificate slots. Every later checkpoint carries that exact seal unchanged.
+// Success therefore proves that tearing either one slot cannot recover below
+// applied. Repeating the call at the unchanged floor performs no writes or
+// Syncs once both slots carry the seal.
+//
+// This is only a SQL durability foundation. The returned witness does not by
+// itself authorize WAL deletion: a generation owner must additionally bind the
+// exact Raft term, configuration, member lineage, and retained suffix.
+func (g *CheckpointGroup) SealRetentionFloor(
+	applied uint64,
+) (CheckpointRetentionWitness, error) {
+	if g == nil {
+		return CheckpointRetentionWitness{}, ErrCheckpointGroupOwned
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return CheckpointRetentionWitness{}, err
+	}
+	if applied == 0 || applied == math.MaxUint64 || applied != g.applied {
+		return CheckpointRetentionWitness{}, ErrCheckpointGroupSequence
+	}
+	// Qualify the currently certified pair before checkpointing a dirty suffix.
+	// A checksum-valid external mutation must not cause the next cut to be
+	// written and synced before the owner notices that its authority changed.
+	slots, currentSlot, err := g.retentionSlotsLocked()
+	if err != nil {
+		return CheckpointRetentionWitness{}, g.poisonLocked(err)
+	}
+	// Reserve the complete certificate transition before any checkpoint, owner,
+	// or slot mutation. A new floor requires both slots. A dirty checkpoint first
+	// consumes one additional sequence. An existing exact floor needs no mirror
+	// after that checkpoint because the rewritten slot and its predecessor both
+	// carry the same seal. Sequence exhaustion is terminal and must never turn a
+	// failed seal into a one-slot live transition.
+	checkpointWrites := uint64(0)
+	if g.certTxn.Load() != g.txn {
+		checkpointWrites = 1
+	}
+	sealWrites := uint64(0)
+	witness := CheckpointRetentionWitness{
+		applied:    applied,
+		commitment: g.retentionCommitment,
+	}
+	if g.retentionApplied != applied || g.retentionCommitment == ([24]byte{}) {
+		sealWrites = 2
+	} else if checkpointWrites == 0 {
+		other := slots[1-currentSlot]
+		if !other.valid || !checkpointRetentionSealMatches(other.certificate, witness) {
+			sealWrites = 1
+		}
+	}
+	requiredWrites := checkpointWrites + sealWrites
+	if requiredWrites > math.MaxUint64-g.sequence {
+		return CheckpointRetentionWitness{}, ErrCheckpointGroupSequence
+	}
+	if err := g.checkpointLocked(); err != nil {
+		return CheckpointRetentionWitness{}, err
+	}
+	// Revalidate the exact published pair before changing owner state. This
+	// prevents an externally forged checksum-valid seal from being adopted by
+	// the first write of an otherwise idempotent or repair call.
+	slots, currentSlot, err = g.retentionSlotsLocked()
+	if err != nil {
+		return CheckpointRetentionWitness{}, g.poisonLocked(err)
+	}
+	witness.commitment = g.retentionCommitment
+	if g.retentionApplied != applied ||
+		g.retentionCommitment == ([24]byte{}) {
+		witness.commitment = checkpointRetentionSealCommitment(
+			g.certificateLocked(),
+			applied,
+		)
+		g.retentionApplied = witness.applied
+		g.retentionCommitment = witness.commitment
+		if err := g.writeNextRetentionCertificateLocked(); err != nil {
+			return CheckpointRetentionWitness{}, err
+		}
+		slots, currentSlot, err = g.retentionSlotsLocked()
+		if err != nil {
+			return CheckpointRetentionWitness{}, g.poisonLocked(err)
+		}
+	}
+	if !checkpointRetentionSealMatches(slots[currentSlot].certificate, witness) {
+		return CheckpointRetentionWitness{}, g.poisonLocked(
+			fmt.Errorf("%w: current certificate lacks retention seal", ErrCheckpointGroupCorrupt),
+		)
+	}
+	otherSlot := 1 - currentSlot
+	if slots[otherSlot].valid &&
+		checkpointRetentionSealMatches(slots[otherSlot].certificate, witness) {
+		return witness, nil
+	}
+	if err := g.writeNextRetentionCertificateLocked(); err != nil {
+		return CheckpointRetentionWitness{}, err
+	}
+	slots, currentSlot, err = g.retentionSlotsLocked()
+	if err != nil {
+		return CheckpointRetentionWitness{}, g.poisonLocked(err)
+	}
+	if !checkpointRetentionSealMatches(slots[currentSlot].certificate, witness) ||
+		!slots[1-currentSlot].valid ||
+		!checkpointRetentionSealMatches(slots[1-currentSlot].certificate, witness) {
+		return CheckpointRetentionWitness{}, g.poisonLocked(
+			fmt.Errorf("%w: retention seal did not reach both slots", ErrCheckpointGroupCorrupt),
+		)
+	}
+	return witness, nil
+}
+
+func (g *CheckpointGroup) writeNextRetentionCertificateLocked() error {
+	if err := g.requireCertificateSequenceBudgetLocked(1); err != nil {
+		return err
+	}
+	g.sequence++
+	certificate := g.certificateLocked()
+	if err := g.writeCertificateLocked(certificate); err != nil {
+		return g.poisonLocked(err)
+	}
+	g.recordCertifiedSpanLocked(certificate)
+	return nil
+}
+
+func (g *CheckpointGroup) requireCertificateSequenceBudgetLocked(required uint64) error {
+	if required > math.MaxUint64-g.sequence {
+		return ErrCheckpointGroupSequence
+	}
+	return nil
+}
+
+// ValidateRetentionWitness re-reads both certificate slots through the exact
+// live checkpoint-group owner. An uncertified visible suffix and ordinary later
+// checkpoints do not invalidate the sealed floor because every later
+// certificate copies the exact seal. A deliberately higher seal stales an older
+// witness. Qualification requires both slots to be valid and to carry the
+// witness exactly. SealRetentionFloor repairs a recoverable one-slot state.
+func (g *CheckpointGroup) ValidateRetentionWitness(
+	witness CheckpointRetentionWitness,
+) error {
+	if g == nil {
+		return ErrCheckpointGroupOwned
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return err
+	}
+	if !validCheckpointRetentionWitness(witness) {
+		return ErrCheckpointRetentionWitness
+	}
+	if g.retentionApplied != witness.applied ||
+		g.retentionCommitment != witness.commitment {
+		return ErrCheckpointRetentionWitness
+	}
+	slots, _, err := g.retentionSlotsLocked()
+	if err != nil {
+		return g.poisonLocked(err)
+	}
+	for slot := range slots {
+		if !slots[slot].valid {
+			return ErrCheckpointRetentionWitness
+		}
+		if !checkpointRetentionSealMatches(slots[slot].certificate, witness) {
+			return ErrCheckpointRetentionWitness
+		}
+	}
+	return nil
+}
+
+func validCheckpointRetentionWitness(witness CheckpointRetentionWitness) bool {
+	return witness.applied != 0 && witness.applied != math.MaxUint64 &&
+		witness.commitment != ([24]byte{})
+}
+
+func checkpointRetentionSealMatches(
+	certificate checkpointGroupCertificate,
+	witness CheckpointRetentionWitness,
+) bool {
+	return certificate.retentionApplied == witness.applied &&
+		certificate.retentionCommitment == witness.commitment
+}
+
 func (g *CheckpointGroup) checkpointLocked() error {
 	if g.foldedTxn == g.txn && g.certTxn.Load() == g.txn {
 		return nil
 	}
+	// Every physical completion recycles every fixed member journal. Qualify all
+	// independent journal counters before the first journal Sync, certificate
+	// successor, or collection-root fold so a later member cannot expose a partial
+	// terminal checkpoint.
+	for _, member := range g.members {
+		if err := checkpointGroupMemberCheckpointRecycleTerminal(member.collection); err != nil {
+			return err
+		}
+	}
 	if g.certTxn.Load() != g.txn {
+		// Refuse before journal Sync or any owner mutation. Sequence zero is not a
+		// certificate encoding, so wrapping here would convert typed exhaustion
+		// into an in-memory/disk divergence and a generic corruption error.
+		if g.sequence == math.MaxUint64 {
+			return ErrCheckpointGroupSequence
+		}
 		g.log.commitMu.Lock()
 		for _, member := range g.members {
 			c := member.collection
@@ -1588,6 +2279,7 @@ func (g *CheckpointGroup) checkpointLocked() error {
 		}
 		g.certTxn.Store(g.txn)
 		g.certApplied.Store(g.applied)
+		g.recordCertifiedSpanLocked(certificate)
 		g.barrierSyncs.Add(uint64(len(g.members) + 1))
 		g.checkpoints.Add(1)
 		g.log.commitMu.Unlock()
@@ -1625,14 +2317,36 @@ func (g *CheckpointGroup) checkpointLocked() error {
 }
 
 func (g *CheckpointGroup) recycleMarkerLocked() error {
+	return g.recycleMarkerWithAuthorityLocked(false)
+}
+
+func (g *CheckpointGroup) recycleMarkerRecoveryLocked() error {
+	return g.recycleMarkerWithAuthorityLocked(true)
+}
+
+func (g *CheckpointGroup) recycleMarkerWithAuthorityLocked(recovery bool) error {
 	if g.foldedTxn != g.txn || g.certTxn.Load() != g.txn {
 		return fmt.Errorf("%w: recycle before complete checkpoint", ErrCheckpointGroupCorrupt)
+	}
+	// Marker recycle is power-safe before its same-cut certificate rewrite. Make
+	// terminal certificate exhaustion fail before that irreversible epoch change
+	// rather than wrapping the owner sequence to zero after the marker Sync.
+	if g.sequence == math.MaxUint64 {
+		return ErrCheckpointGroupSequence
 	}
 	g.log.commitMu.Lock()
 	defer g.log.commitMu.Unlock()
 	header := g.log.marker.Header()
-	if header.Epoch == math.MaxUint64 {
+	if header.Epoch == math.MaxUint64 ||
+		header.RecycleCount == math.MaxUint64 ||
+		g.log.marker.NextSequence() == 0 {
 		return ErrCheckpointGroupSequence
+	}
+	if header.BaseSequence != g.txnBase {
+		return fmt.Errorf("%w: marker base sequence", ErrCheckpointGroupCorrupt)
+	}
+	if !recovery && g.log.marker.NextSequence()-1 != g.txn {
+		return fmt.Errorf("%w: live marker sequence lineage", ErrCheckpointGroupCorrupt)
 	}
 	for _, member := range g.members {
 		if member.collection.journal.Cursor() != 0 {
@@ -1649,17 +2363,56 @@ func (g *CheckpointGroup) recycleMarkerLocked() error {
 			ErrCheckpointGroupCorrupt,
 		)
 	}
-	if err := g.log.marker.Recycle(header.Epoch + 1); err != nil {
-		return g.poisonLocked(journalCommitOutcomeUnknown(err))
+	var recycleErr error
+	markerSyncs := uint64(1)
+	if recovery {
+		if header.BaseSequence == g.txn && g.log.marker.Cursor() != 0 {
+			// Recovery first makes an equal-base aborted suffix durably
+			// unscannable, then publishes and Syncs the successor header.
+			markerSyncs++
+		}
+		recycleErr = g.log.marker.RecycleAtRecoveryAnchor(
+			storeio.TxnMarkerRecoveryAnchor{
+				MarkerID:     g.markerID,
+				Epoch:        header.Epoch + 1,
+				BaseSequence: g.txn,
+			},
+		)
+	} else {
+		recycleErr = g.log.marker.Recycle(header.Epoch + 1)
 	}
-	g.markerSyncs.Add(1)
+	if recycleErr != nil {
+		return g.poisonLocked(journalCommitOutcomeUnknown(recycleErr))
+	}
+	g.markerSyncs.Add(markerSyncs)
+	if checkpointGroupFaultHook != nil {
+		if err := checkpointGroupFaultHook(checkpointGroupAfterMarkerSync); err != nil {
+			return g.poisonLocked(journalCommitOutcomeUnknown(err))
+		}
+	}
+	if g.log.marker.Header().BaseSequence != g.txn {
+		return g.poisonLocked(fmt.Errorf(
+			"%w: recycled marker base sequence", ErrCheckpointGroupCorrupt,
+		))
+	}
 	g.markerEpoch = header.Epoch + 1
 	g.txnBase = g.txn
 	g.sequence++
-	if err := g.writeCertificateLocked(g.certificateLocked()); err != nil {
+	certificate := g.certificateLocked()
+	if err := g.writeCertificateLocked(certificate); err != nil {
 		return g.poisonLocked(err)
 	}
+	g.recordCertifiedSpanLocked(certificate)
 	return nil
+}
+
+func (g *CheckpointGroup) recordCertifiedSpanLocked(
+	certificate checkpointGroupCertificate,
+) {
+	g.certMaxApplySpan = certificate.maxApplySpan
+	g.certMaxSpanTxn = certificate.maxSpanTxn
+	g.certMaxSpanFirst = certificate.maxSpanFirst
+	g.certMaxSpanLast = certificate.maxSpanLast
 }
 
 func (g *CheckpointGroup) certificateLocked() checkpointGroupCertificate {
@@ -1670,20 +2423,192 @@ func (g *CheckpointGroup) certificateLocked() checkpointGroupCertificate {
 		maxSpanLast: g.maxSpanLast,
 		markerEpoch: g.markerEpoch, markerID: g.markerID,
 		seedApplied: g.seedApplied, seedState: g.seedState, seedMember: g.seedMember,
-		members: g.members,
+		retentionApplied:    g.retentionApplied,
+		retentionCommitment: g.retentionCommitment,
+		members:             g.members,
 	}
 }
 
-func (g *CheckpointGroup) writeCertificateLocked(c checkpointGroupCertificate) error {
-	if g.file == nil || g.fileInfo == nil {
+type checkpointRetentionSlot struct {
+	certificate checkpointGroupCertificate
+	valid       bool
+}
+
+func (g *CheckpointGroup) retentionSlotsLocked() (
+	[checkpointGroupSlots]checkpointRetentionSlot,
+	int,
+	error,
+) {
+	var slots [checkpointGroupSlots]checkpointRetentionSlot
+	if err := g.proveCertificateLocked(); err != nil {
+		return slots, 0, err
+	}
+	for slot := range slots {
+		var raw [checkpointGroupSlotBytes]byte
+		if _, err := g.file.ReadAt(
+			raw[:], int64(slot*checkpointGroupSlotBytes),
+		); err != nil {
+			return slots, 0, err
+		}
+		checksum := checkpointGroupCertificateChecksumValid(raw[:])
+		certificate, err := decodeCheckpointGroupCertificate(raw[:])
+		if err == nil {
+			slots[slot].certificate = certificate
+			slots[slot].valid = true
+			if int(certificate.sequence%checkpointGroupSlots) != slot {
+				return slots, 0, fmt.Errorf(
+					"%w: retention certificate slot parity", ErrCheckpointGroupCorrupt,
+				)
+			}
+			continue
+		}
+		if checksum {
+			return slots, 0, fmt.Errorf(
+				"%w: noncanonical retention certificate", ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+
+	currentSlot := int(g.sequence % checkpointGroupSlots)
+	current := slots[currentSlot]
+	owner := g.certificateLocked()
+	owner.applied = g.certApplied.Load()
+	owner.txnHighWater = g.certTxn.Load()
+	owner.maxApplySpan = g.certMaxApplySpan
+	owner.maxSpanTxn = g.certMaxSpanTxn
+	owner.maxSpanFirst = g.certMaxSpanFirst
+	owner.maxSpanLast = g.certMaxSpanLast
+	if !current.valid || current.certificate.sequence != owner.sequence ||
+		!equalCheckpointGroupCertificateBody(current.certificate, owner) {
+		return slots, 0, fmt.Errorf(
+			"%w: selected retention certificate differs from owner", ErrCheckpointGroupCorrupt,
+		)
+	}
+	if err := validateCheckpointGroupCertificateMembers(
+		current.certificate, g.members,
+	); err != nil {
+		return slots, 0, err
+	}
+
+	other := slots[1-currentSlot]
+	if other.valid {
+		if !validCheckpointGroupCertificateSuccessor(
+			other.certificate,
+			current.certificate,
+		) {
+			return slots, 0, fmt.Errorf(
+				"%w: previous retention certificate is not a valid successor pair",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	return slots, currentSlot, nil
+}
+
+func equalCheckpointGroupCertificateBody(
+	left checkpointGroupCertificate,
+	right checkpointGroupCertificate,
+) bool {
+	if left.applied != right.applied || left.txnHighWater != right.txnHighWater ||
+		left.txnBase != right.txnBase || left.markerEpoch != right.markerEpoch ||
+		left.markerID != right.markerID || left.seedApplied != right.seedApplied ||
+		left.seedState != right.seedState || left.seedMember != right.seedMember ||
+		left.maxApplySpan != right.maxApplySpan ||
+		left.maxSpanTxn != right.maxSpanTxn ||
+		left.maxSpanFirst != right.maxSpanFirst ||
+		left.maxSpanLast != right.maxSpanLast ||
+		left.retentionApplied != right.retentionApplied ||
+		left.retentionCommitment != right.retentionCommitment ||
+		len(left.members) != len(right.members) {
+		return false
+	}
+	for i := range left.members {
+		if left.members[i].nameDigest != right.members[i].nameDigest ||
+			left.members[i].storeID != right.members[i].storeID ||
+			left.members[i].journalID != right.members[i].journalID {
+			return false
+		}
+	}
+	return true
+}
+
+func checkpointGroupCertificateLineageDigest(
+	certificate checkpointGroupCertificate,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(checkpointGroupLineageDomain)
+	var scalar [8]byte
+	binary.LittleEndian.PutUint64(scalar[:], certificate.seedApplied)
+	_, _ = h.Write(scalar[:])
+	_, _ = h.Write(certificate.seedState[:])
+	_, _ = h.Write(certificate.seedMember[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(certificate.members)))
+	_, _ = h.Write(scalar[:])
+	for _, member := range certificate.members {
+		_, _ = h.Write(member.nameDigest[:])
+		_, _ = h.Write(member.storeID[:])
+		_, _ = h.Write(member.journalID[:])
+	}
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+func checkpointRetentionWitnessCommitment(
+	witness CheckpointRetentionWitness,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(checkpointRetentionWitnessDomain)
+	var scalar [8]byte
+	binary.LittleEndian.PutUint64(scalar[:], witness.applied)
+	_, _ = h.Write(scalar[:])
+	_, _ = h.Write(witness.commitment[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+func checkpointRetentionSealCommitment(
+	certificate checkpointGroupCertificate,
+	applied uint64,
+) [24]byte {
+	h := sha256.New()
+	_, _ = h.Write(checkpointRetentionSealDomain)
+	var scalar [8]byte
+	binary.LittleEndian.PutUint64(scalar[:], applied)
+	_, _ = h.Write(scalar[:])
+	_, _ = h.Write(certificate.markerID[:])
+	lineage := checkpointGroupCertificateLineageDigest(certificate)
+	_, _ = h.Write(lineage[:])
+	var result [24]byte
+	copy(result[:], h.Sum(nil))
+	return result
+}
+
+func (g *CheckpointGroup) proveCertificateLocked() error {
+	if g.file == nil || g.fileInfo == nil || g.log == nil || g.log.root == nil {
 		return ErrCheckpointGroupCorrupt
 	}
 	current, err := g.log.root.Lstat(checkpointGroupFilename)
-	if err != nil || !current.Mode().IsRegular() || !os.SameFile(current, g.fileInfo) {
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return err
+	}
+	descriptor, err := g.file.Stat()
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !descriptor.Mode().IsRegular() ||
+		current.Size() != checkpointGroupFileBytes ||
+		descriptor.Size() != checkpointGroupFileBytes ||
+		!os.SameFile(current, descriptor) || !os.SameFile(current, g.fileInfo) {
 		return fmt.Errorf("%w: certificate entry changed", ErrCheckpointGroupCorrupt)
+	}
+	return nil
+}
+
+func (g *CheckpointGroup) writeCertificateLocked(c checkpointGroupCertificate) error {
+	if err := g.proveCertificateLocked(); err != nil {
+		return err
 	}
 	encoded, err := encodeCheckpointGroupCertificate(c)
 	if err != nil {
@@ -1716,6 +2641,11 @@ func (g *CheckpointGroup) checkUsableLocked() error {
 	}
 	if g.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, g.poison)
+	}
+	if g.log.marker == nil || g.log.marker.Header().MarkerID != g.markerID ||
+		g.log.marker.Header().Epoch != g.markerEpoch ||
+		g.log.marker.Header().BaseSequence != g.txnBase {
+		return fmt.Errorf("%w: transaction marker lineage", ErrCheckpointGroupCorrupt)
 	}
 	return nil
 }
@@ -1930,9 +2860,10 @@ func validateCheckpointMarkerRecords(
 
 func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, error) {
 	if len(c.members) == 0 || len(c.members) > checkpointGroupMaxMembers ||
-		checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes > checkpointGroupMaxSpanWitnessTxnOffset ||
+		checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes > checkpointGroupRetentionAppliedOffset ||
 		c.sequence == 0 || c.markerID == ([16]byte{}) || c.markerEpoch == 0 ||
-		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) {
+		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) ||
+		!validCheckpointGroupRetentionSeal(c) {
 		return nil, ErrCheckpointGroupCorrupt
 	}
 	buf := make([]byte, checkpointGroupSlotBytes)
@@ -1959,6 +2890,14 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
 	copy(buf[144:168], membership.Sum(nil)[:24])
+	binary.LittleEndian.PutUint64(
+		buf[checkpointGroupRetentionAppliedOffset:checkpointGroupRetentionCommitOffset],
+		c.retentionApplied,
+	)
+	copy(
+		buf[checkpointGroupRetentionCommitOffset:checkpointGroupRetentionEndOffset],
+		c.retentionCommitment[:],
+	)
 	binary.LittleEndian.PutUint64(
 		buf[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupMaxSpanWitnessFirstOffset],
 		c.maxSpanTxn,
@@ -1993,7 +2932,7 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 	}
 	count := int(binary.LittleEndian.Uint16(buf[12:14]))
 	if count == 0 || count > checkpointGroupMaxMembers ||
-		checkpointGroupHeaderBytes+count*checkpointGroupMemberBytes > checkpointGroupMaxSpanWitnessTxnOffset {
+		checkpointGroupHeaderBytes+count*checkpointGroupMemberBytes > checkpointGroupRetentionAppliedOffset {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	c := checkpointGroupCertificate{
@@ -2013,11 +2952,18 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		),
 		markerEpoch: binary.LittleEndian.Uint64(buf[48:56]),
 		seedApplied: binary.LittleEndian.Uint64(buf[72:80]),
-		members:     make([]checkpointGroupMember, count),
+		retentionApplied: binary.LittleEndian.Uint64(
+			buf[checkpointGroupRetentionAppliedOffset:checkpointGroupRetentionCommitOffset],
+		),
+		members: make([]checkpointGroupMember, count),
 	}
 	copy(c.markerID[:], buf[56:72])
 	copy(c.seedState[:], buf[80:112])
 	copy(c.seedMember[:], buf[112:144])
+	copy(
+		c.retentionCommitment[:],
+		buf[checkpointGroupRetentionCommitOffset:checkpointGroupRetentionEndOffset],
+	)
 	if c.sequence == 0 || c.markerEpoch == 0 || c.markerID == ([16]byte{}) ||
 		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
@@ -2030,7 +2976,8 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		copy(c.members[i].journalID[:], buf[off+48:off+64])
 		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
-	if !slices.Equal(buf[144:168], membership.Sum(nil)[:24]) {
+	if !slices.Equal(buf[144:168], membership.Sum(nil)[:24]) ||
+		!validCheckpointGroupRetentionSeal(c) {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	canonical, err := encodeCheckpointGroupCertificate(c)
@@ -2038,6 +2985,19 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	return c, nil
+}
+
+func validCheckpointGroupRetentionSeal(c checkpointGroupCertificate) bool {
+	zeroCommitment := c.retentionCommitment == ([24]byte{})
+	if c.retentionApplied == 0 {
+		return zeroCommitment
+	}
+	return c.retentionApplied != math.MaxUint64 &&
+		c.retentionApplied <= c.applied &&
+		c.retentionCommitment == checkpointRetentionSealCommitment(
+			c,
+			c.retentionApplied,
+		)
 }
 
 func validCheckpointGroupSeedCertificate(c checkpointGroupCertificate) bool {
@@ -2142,9 +3102,26 @@ func validateCheckpointGroupCertificate(
 	if c.markerID != header.MarkerID {
 		return fmt.Errorf("%w: marker identity", ErrCheckpointGroupCorrupt)
 	}
-	if c.markerEpoch != header.Epoch &&
-		(c.markerEpoch == math.MaxUint64 || c.markerEpoch+1 != header.Epoch) {
+	return validateCheckpointMarkerLineage(c, header)
+}
+
+func validateCheckpointMarkerLineage(
+	c checkpointGroupCertificate,
+	header storeio.TxnMarkerHeader,
+) error {
+	wantBase := c.txnBase
+	switch {
+	case c.markerEpoch == header.Epoch:
+	case c.markerEpoch != math.MaxUint64 && c.markerEpoch+1 == header.Epoch:
+		wantBase = c.txnHighWater
+	default:
 		return fmt.Errorf("%w: marker epoch", ErrCheckpointGroupCorrupt)
+	}
+	if header.BaseSequence != wantBase {
+		return fmt.Errorf(
+			"%w: marker base sequence %d, want %d",
+			ErrCheckpointGroupCorrupt, header.BaseSequence, wantBase,
+		)
 	}
 	return nil
 }
@@ -2274,16 +3251,20 @@ func validCheckpointGroupCertificateSuccessor(
 		}
 	}
 
+	sameEpoch := false
+	rollover := false
 	switch {
 	case selected.markerEpoch == previous.markerEpoch:
 		if selected.txnBase != previous.txnBase {
 			return false
 		}
+		sameEpoch = true
 	case previous.markerEpoch != math.MaxUint64 &&
 		selected.markerEpoch == previous.markerEpoch+1:
 		if selected.txnBase != previous.txnHighWater {
 			return false
 		}
+		rollover = true
 	default:
 		return false
 	}
@@ -2293,16 +3274,33 @@ func validCheckpointGroupCertificateSuccessor(
 	}
 	deltaTransactions := selected.txnHighWater - previous.txnHighWater
 	deltaApplied := selected.applied - previous.applied
+	retentionExact := selected.retentionApplied == previous.retentionApplied &&
+		selected.retentionCommitment == previous.retentionCommitment
+	spanExact := selected.maxApplySpan == previous.maxApplySpan &&
+		selected.maxSpanTxn == previous.maxSpanTxn &&
+		selected.maxSpanFirst == previous.maxSpanFirst &&
+		selected.maxSpanLast == previous.maxSpanLast
 	if deltaTransactions == 0 {
-		// The only certificate write without newly certified work is an empty
-		// marker rollover. It changes exactly the epoch/base tuple.
-		return selected.markerEpoch == previous.markerEpoch+1 &&
-			deltaApplied == 0 && selected.maxApplySpan == previous.maxApplySpan &&
-			selected.maxSpanTxn == previous.maxSpanTxn &&
-			selected.maxSpanFirst == previous.maxSpanFirst &&
-			selected.maxSpanLast == previous.maxSpanLast
+		if deltaApplied != 0 || !spanExact {
+			return false
+		}
+		if rollover {
+			return retentionExact
+		}
+		if !sameEpoch {
+			return false
+		}
+		if retentionExact {
+			// A same-cut duplicate is only the second slot of an existing seal.
+			return selected.retentionApplied != 0
+		}
+		// A same-cut seal transition installs the current applied cut or
+		// deliberately advances an older retained floor to that exact cut.
+		return selected.retentionApplied == selected.applied &&
+			selected.retentionApplied > previous.retentionApplied &&
+			validCheckpointGroupRetentionSeal(selected)
 	}
-	if selected.markerEpoch != previous.markerEpoch {
+	if !sameEpoch || !retentionExact {
 		return false
 	}
 	// Seed is the one certified transition whose applied index is imported

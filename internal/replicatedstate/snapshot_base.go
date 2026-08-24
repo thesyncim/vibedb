@@ -51,11 +51,27 @@ func BuildSnapshotBase(
 	manifest SnapshotArtifactManifest,
 	staticBootstrap *pb.Snapshot,
 ) (*pb.Snapshot, error) {
+	bootstrapBytes, bootstrapDigest, err := validateBootstrap(staticBootstrap)
+	if err != nil {
+		return nil, fmt.Errorf("%w: static bootstrap", ErrSnapshotBase)
+	}
+	return buildSnapshotBaseFromCanonicalBootstrap(
+		manifest,
+		bootstrapBytes,
+		bootstrapDigest,
+	)
+}
+
+func buildSnapshotBaseFromCanonicalBootstrap(
+	manifest SnapshotArtifactManifest,
+	bootstrapBytes []byte,
+	bootstrapDigest [sha256.Size]byte,
+) (*pb.Snapshot, error) {
 	if err := validateSnapshotBaseManifest(manifest); err != nil {
 		return nil, fmt.Errorf("%w: manifest: %v", ErrSnapshotBase, err)
 	}
-	bootstrapBytes, bootstrapDigest, err := validateBootstrap(staticBootstrap)
-	if err != nil || bootstrapDigest != manifest.State.BootstrapDigest {
+	if len(bootstrapBytes) == 0 || len(bootstrapBytes) > MaxStaticBootstrapEnvelopeBytes ||
+		bootstrapDigest != manifest.State.BootstrapDigest {
 		return nil, fmt.Errorf("%w: static bootstrap", ErrSnapshotBase)
 	}
 	stateBytes, err := AppendState(nil, manifest.State)
@@ -100,6 +116,28 @@ func BuildSnapshotBase(
 	return &pb.Snapshot{Data: result, Metadata: &pb.SnapshotMetadata{
 		Index: &index, Term: &term, ConfState: cloneConfState(manifest.State.ConfState),
 	}}, nil
+}
+
+// BuildSnapshotBaseForManifest binds a manifest produced from a pinned Machine
+// snapshot to that Machine's immutable index-one bootstrap. The Machine may
+// continue applying after the snapshot was captured. Only the immutable
+// bootstrap is read here. This performs no collection scan.
+func (m *Machine) BuildSnapshotBaseForManifest(
+	manifest SnapshotArtifactManifest,
+) (*pb.Snapshot, error) {
+	if m == nil {
+		return nil, ErrSnapshotBase
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return nil, err
+	}
+	return buildSnapshotBaseFromCanonicalBootstrap(
+		manifest,
+		m.bootstrap,
+		m.bootstrapDigest,
+	)
 }
 
 // OpenSnapshotBase strictly verifies and detaches a snapshot certificate.

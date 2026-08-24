@@ -9,6 +9,15 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
+// checkpointGroupBeforeMemberReplayHook is a deterministic package-test seam
+// after every deferred member is open and authenticated but before phase-one
+// terminal-budget qualification. Production leaves it nil.
+var checkpointGroupBeforeMemberReplayHook func([]*Collection)
+
+// checkpointGroupBeforeMarkerRecoveryRecycleHook is a package-test seam after
+// member cleanup and before the recovery-authorized marker header transition.
+var checkpointGroupBeforeMarkerRecoveryRecycleHook func(*storeio.TxnMarker)
+
 // OpenCollectionsWithCheckpointGroup is the format-0 recovery entry point for
 // a fixed replicated catalog. names is parallel to requests and is the exact
 // fixed group membership. Recovery accepts only the certificate's transaction
@@ -116,6 +125,59 @@ func openCollectionsWithCheckpointGroup(
 		recovery = &databaseTxnRecovery{dir: log.dir, log: log, absent: true}
 	}
 	markerRepair := recovery.absent || recovery.log.marker == nil || recovery.decisions == nil
+	var header storeio.TxnMarkerHeader
+	transitionalRollover := false
+	if !markerRepair {
+		header = recovery.log.marker.Header()
+		sameMarker := certificate.markerID == header.MarkerID
+		sameEpoch := certificate.markerEpoch == header.Epoch
+		transitionalRollover = sameMarker && certificate.markerEpoch != math.MaxUint64 &&
+			certificate.markerEpoch+1 == header.Epoch
+		markerRepair = !sameMarker || (!sameEpoch && !transitionalRollover)
+	}
+	// Repair and a completed-but-uncertified rollover both require a certificate
+	// successor. Repair also needs nonzero marker-epoch and transaction-anchor
+	// successors. Qualify them before deferred member opens can replay or fold a
+	// byte. An aligned terminal state is different: after member cleanup it can
+	// attach read-only without changing the selected certificate or marker.
+	if markerRepair &&
+		(certificate.sequence == math.MaxUint64 ||
+			certificate.markerEpoch == math.MaxUint64 ||
+			certificate.txnHighWater == math.MaxUint64) {
+		return nil, nil, nil, errors.Join(
+			fmt.Errorf(
+				"%w: marker repair exhausted certificate sequence, marker epoch, or transaction anchor",
+				ErrCheckpointGroupSequence,
+			),
+			certificateFile.Close(),
+			recovery.log.Close(),
+		)
+	}
+	if transitionalRollover && certificate.sequence == math.MaxUint64 {
+		return nil, nil, nil, errors.Join(
+			fmt.Errorf(
+				"%w: transitional marker rollover exhausted certificate sequence",
+				ErrCheckpointGroupSequence,
+			),
+			certificateFile.Close(),
+			recovery.log.Close(),
+		)
+	}
+	if !markerRepair {
+		if err := validateCheckpointMarkerLineage(certificate, header); err != nil {
+			return nil, nil, nil, errors.Join(
+				err,
+				certificateFile.Close(),
+				recovery.log.Close(),
+			)
+		}
+	}
+	alignedTerminal := !markerRepair && !transitionalRollover &&
+		(certificate.sequence == math.MaxUint64 ||
+			certificate.txnHighWater >= math.MaxUint64-1 ||
+			header.Epoch == math.MaxUint64 ||
+			header.RecycleCount == math.MaxUint64 ||
+			recovery.log.marker.NextSequence() == 0)
 	abort := func(collections []*Collection, cause error) (
 		[]*Collection, *TxnLog, *CheckpointGroup, error,
 	) {
@@ -174,15 +236,24 @@ func openCollectionsWithCheckpointGroup(
 	if err := validateCheckpointGroupDirectoryMembership(recovery.log, members); err != nil {
 		return abort(collections, err)
 	}
-	var header storeio.TxnMarkerHeader
-	transitionalRollover := false
-	if !markerRepair {
-		header = recovery.log.marker.Header()
-		sameMarker := certificate.markerID == header.MarkerID
-		sameEpoch := certificate.markerEpoch == header.Epoch
-		transitionalRollover = sameMarker && certificate.markerEpoch != ^uint64(0) &&
-			certificate.markerEpoch+1 == header.Epoch
-		markerRepair = !sameMarker || (!sameEpoch && !transitionalRollover)
+	if checkpointGroupBeforeMemberReplayHook != nil {
+		checkpointGroupBeforeMemberReplayHook(collections)
+	}
+	// Deferred member opens have not replayed or folded a journal. A clean
+	// recycle-count-terminal journal is a valid read-only endpoint, and a final
+	// DCSN-Max append must remain certifiable/foldable. Refuse only when a member
+	// with no recycle successor actually needs replay or a base-generation fold,
+	// before phase two can publish any recovered root or recycle an earlier member.
+	for _, collection := range collections {
+		if collection == nil || collection.journal == nil {
+			return abort(collections, ErrCheckpointGroupCorrupt)
+		}
+		header := collection.journal.Header()
+		needsRecycle := collection.journal.Cursor() != 0 ||
+			collection.journal.BaseGeneration() < collection.committer.DurableGeneration()
+		if header.RecycleCount == math.MaxUint64 && needsRecycle {
+			return abort(collections, ErrCheckpointGroupSequence)
+		}
 	}
 	if transitionalRollover {
 		if recovery.log.marker.Cursor() != 0 {
@@ -227,13 +298,6 @@ func openCollectionsWithCheckpointGroup(
 
 	markerRepaired := false
 	if markerRepair {
-		if certificate.sequence == math.MaxUint64 ||
-			certificate.markerEpoch == math.MaxUint64 {
-			return abort(collections, fmt.Errorf(
-				"%w: marker repair exhausted certificate sequence or epoch",
-				ErrCheckpointGroupSequence,
-			))
-		}
 		if err := replaceCheckpointGroupMarker(
 			recovery.log,
 			storeio.TxnMarkerRecoveryAnchor{
@@ -269,10 +333,12 @@ func openCollectionsWithCheckpointGroup(
 		}
 	}
 	// Recovery has now folded every certified prepare and discarded every later
-	// suffix, so reopen always starts from a clean implementation-log epoch.
-	// This removes any unsynced marker prefix and prevents replay from colliding
-	// with a surviving suffix ordinal. A crash after Recycle's marker fence but
-	// before the same-cut certificate rewrite re-enters transitionalRollover.
+	// member suffix. An aligned terminal owner retains its authenticated marker
+	// prefix and attaches read-only, so repeated opens need no impossible counter
+	// successor and issue no marker or certificate write. Other aligned owners
+	// start from a clean implementation-log epoch. A crash after Recycle's marker
+	// fence but before the same-cut certificate rewrite re-enters
+	// transitionalRollover.
 	if markerRepaired {
 		// replaceCheckpointGroupMarker already installed a clean epoch and the
 		// same-cut certificate rewrite above made it authoritative.
@@ -284,8 +350,16 @@ func openCollectionsWithCheckpointGroup(
 		if err != nil {
 			return abort(collections, err)
 		}
-	} else if err = group.recycleMarkerLocked(); err != nil {
-		return abort(collections, err)
+	} else if alignedTerminal {
+		// Member cleanup above made the certificate cut self-contained. Retain the
+		// selected terminal marker/certificate pair exactly for idempotent reopen.
+	} else {
+		if checkpointGroupBeforeMarkerRecoveryRecycleHook != nil {
+			checkpointGroupBeforeMarkerRecoveryRecycleHook(recovery.log.marker)
+		}
+		if err = group.recycleMarkerRecoveryLocked(); err != nil {
+			return abort(collections, err)
+		}
 	}
 	recovery.log.commitMu.Lock()
 	if err = group.attachLocked(); err != nil {
@@ -358,6 +432,13 @@ func validateMissingCheckpointGroupActivation(
 	if recovery.log != nil && recovery.log.marker != nil && recovery.log.marker.Cursor() != 0 {
 		return errors.Join(
 			fmt.Errorf("%w: missing certificate beside marker records", ErrCheckpointGroupCorrupt),
+			cleanup(nil),
+		)
+	}
+	if recovery.log != nil && recovery.log.marker != nil &&
+		recovery.log.marker.Header().BaseSequence != 0 {
+		return errors.Join(
+			fmt.Errorf("%w: missing certificate beside recycled marker base", ErrCheckpointGroupCorrupt),
 			cleanup(nil),
 		)
 	}
@@ -490,6 +571,11 @@ func replayCheckpointGroupMembers(
 		if err := collection.preflightRecoveryJournalCertifiedPrefix(resolver, epoch); err != nil {
 			return err
 		}
+		if err := preflightCheckpointGroupRecoveryGenerationBudget(
+			collection, resolver,
+		); err != nil {
+			return err
+		}
 	}
 	for _, collection := range collections {
 		resolver := checkpointCertificateResolver(
@@ -503,6 +589,72 @@ func replayCheckpointGroupMembers(
 		}
 	}
 	return nil
+}
+
+func preflightCheckpointGroupRecoveryGenerationBudget(
+	collection *Collection,
+	resolve recoveryJournalDecisionResolver,
+) error {
+	if collection == nil || collection.journal == nil {
+		return ErrCheckpointGroupCorrupt
+	}
+	if collection.journal.Cursor() == 0 {
+		return nil
+	}
+	generation := collection.Generation()
+	if generation > fileLogicalCutGenerationMask {
+		return ErrCheckpointGroupSequence
+	}
+	remaining := fileLogicalCutGenerationMask - generation
+	used := uint64(0)
+	return collection.journal.Replay(
+		collection.journal.BaseGeneration(),
+		func(record storeio.RecoveryRecord) error {
+			if record.Kind != storeio.RecoveryRecordKindConditionalBatch {
+				return fmt.Errorf(
+					"%w: fixed member contains journal kind %d",
+					ErrCheckpointGroupCorrupt, record.Kind,
+				)
+			}
+			if resolve == nil {
+				return ErrCollectionInDoubt
+			}
+			committed, err := resolve(
+				record.Conditional.MarkerID,
+				record.Conditional.MarkerEpoch,
+				record.Conditional.TxnID,
+				record.Generation,
+			)
+			if err != nil || !committed {
+				return err
+			}
+			// A batch replay first attempts the atomic stage. If reopen-time
+			// limits force or discover its bounded ErrBatchTooLarge fallback,
+			// sequential recovery may then consume one point generation plus up
+			// to primaryStructuralRetryLimit topology generations per entry.
+			sequentialPerEntry := uint64(primaryStructuralRetryLimit + 1)
+			entries := uint64(len(record.Entries))
+			if entries > math.MaxUint64/sequentialPerEntry {
+				return ErrCheckpointGroupSequence
+			}
+			required := entries * sequentialPerEntry
+			if collection.atomicRecoveryBatchFitsUpdate(record) {
+				batch, ok := primaryBatchStageAttemptBudget(len(record.Entries))
+				if !ok || uint64(batch) > math.MaxUint64-required {
+					return ErrCheckpointGroupSequence
+				}
+				required += uint64(batch)
+			}
+			if used > remaining {
+				return ErrCheckpointGroupSequence
+			}
+			if required > remaining-used {
+				return ErrCheckpointGroupSequence
+			}
+			used += required
+			return nil
+		},
+	)
 }
 
 // validateCheckpointGroupJournalRecords rejects every ordinary journal kind.

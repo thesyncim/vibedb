@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -290,6 +291,126 @@ func TestSnapshotArtifactDoesNotFragmentRowAboveTarget(t *testing.T) {
 	}
 }
 
+func TestSnapshotArtifactExceptionalRowMatchesContiguousFraming(t *testing.T) {
+	key := bytes.Repeat([]byte{'k'}, 73)
+	value := bytes.Repeat([]byte{'v'}, MinSnapshotArtifactChunkBytes+211)
+	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	if !ok || rowBytes <= MinSnapshotArtifactChunkBytes {
+		t.Fatalf("exceptional row bytes = %d, %t", rowBytes, ok)
+	}
+	previous := sha256.Sum256([]byte("prior chunk"))
+
+	var referenceOutput bytes.Buffer
+	reference := snapshotArtifactWriter{
+		w:          &referenceOutput,
+		target:     MinSnapshotArtifactChunkBytes,
+		collection: SnapshotArtifactUser,
+		chunks:     7, userRows: 11, payloadBytes: 1234, encodedBytes: 5678,
+		previousDigest: previous,
+	}
+	reference.payload = make([]byte, 0, rowBytes)
+	reference.payload = binary.LittleEndian.AppendUint32(reference.payload, uint32(len(key)))
+	reference.payload = binary.LittleEndian.AppendUint32(reference.payload, uint32(len(value)))
+	reference.payload = append(reference.payload, key...)
+	reference.payload = append(reference.payload, value...)
+	reference.chunkRows = 1
+	if err := reference.flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	directOutput := &snapshotArtifactRecordingWriter{}
+	direct := snapshotArtifactWriter{
+		w: directOutput, target: MinSnapshotArtifactChunkBytes,
+		payload:    make([]byte, 0, MinSnapshotArtifactChunkBytes),
+		collection: SnapshotArtifactUser,
+		chunks:     7, userRows: 11, payloadBytes: 1234, encodedBytes: 5678,
+		previousDigest: previous,
+	}
+	if err := direct.writeExceptionalRow(key, value, rowBytes); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(referenceOutput.Bytes(), directOutput.Bytes()) {
+		t.Fatal("segmented exceptional row changed canonical chunk bytes")
+	}
+	wantSegments := []int{
+		snapshotArtifactChunkHeaderBytes,
+		snapshotArtifactRowHeaderBytes,
+		len(key),
+		len(value),
+		sha256.Size,
+	}
+	if !slices.Equal(directOutput.writes, wantSegments) {
+		t.Fatalf("exceptional write segments = %v, want %v", directOutput.writes, wantSegments)
+	}
+	if direct.chunks != reference.chunks || direct.userRows != reference.userRows ||
+		direct.payloadBytes != reference.payloadBytes ||
+		direct.encodedBytes != reference.encodedBytes ||
+		direct.previousDigest != reference.previousDigest {
+		t.Fatalf("segmented writer state = %+v, reference %+v", direct, reference)
+	}
+}
+
+func TestSnapshotArtifactMaximumRowDoesNotGrowAggregatePayload(t *testing.T) {
+	key := bytes.Repeat([]byte{'k'}, replication.MaxMutationKeyBytes)
+	value := bytes.Repeat([]byte{'v'}, replication.MaxMutationValueBytes)
+	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	if !ok || rowBytes != MaxSnapshotArtifactChunkBytes {
+		t.Fatalf("maximum row bytes = %d, %t", rowBytes, ok)
+	}
+	payload := make([]byte, 0, DefaultSnapshotArtifactChunkBytes)
+	payloadStart := &payload[:1][0]
+	writer := snapshotArtifactWriter{
+		w: io.Discard, target: DefaultSnapshotArtifactChunkBytes,
+		payload: payload, collection: SnapshotArtifactUser,
+	}
+	if err := writer.writeExceptionalRow(key, value, rowBytes); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.payload) != 0 || cap(writer.payload) != DefaultSnapshotArtifactChunkBytes ||
+		&writer.payload[:1][0] != payloadStart {
+		t.Fatalf("maximum row grew aggregate payload: len/cap %d/%d", len(writer.payload), cap(writer.payload))
+	}
+	if writer.chunks != 1 || writer.userRows != 1 ||
+		writer.payloadBytes != uint64(MaxSnapshotArtifactChunkBytes) {
+		t.Fatalf("maximum row counters = %+v", writer)
+	}
+}
+
+func TestSnapshotArtifactExceptionalRowHandlesEverySegmentShortWrite(t *testing.T) {
+	key := bytes.Repeat([]byte{'k'}, 41)
+	value := bytes.Repeat([]byte{'v'}, MinSnapshotArtifactChunkBytes+17)
+	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	if !ok {
+		t.Fatal("exceptional short-write row is invalid")
+	}
+	for _, test := range []struct {
+		name string
+		cut  int
+	}{
+		{name: "chunk-header", cut: 1},
+		{name: "row-header", cut: snapshotArtifactChunkHeaderBytes + 1},
+		{name: "key", cut: snapshotArtifactChunkHeaderBytes + snapshotArtifactRowHeaderBytes + 1},
+		{name: "value", cut: snapshotArtifactChunkHeaderBytes + snapshotArtifactRowHeaderBytes + len(key) + 1},
+		{name: "digest", cut: snapshotArtifactChunkHeaderBytes + rowBytes + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			short := &snapshotArtifactShortWriter{remaining: test.cut}
+			writer := snapshotArtifactWriter{
+				w: short, target: MinSnapshotArtifactChunkBytes,
+				payload:    make([]byte, 0, MinSnapshotArtifactChunkBytes),
+				collection: SnapshotArtifactUser,
+			}
+			if err := writer.writeExceptionalRow(key, value, rowBytes); !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short exceptional write = %v", err)
+			}
+			if writer.chunks != 0 || writer.userRows != 0 ||
+				writer.payloadBytes != 0 || writer.encodedBytes != 0 {
+				t.Fatalf("short exceptional write committed counters: %+v", writer)
+			}
+		})
+	}
+}
+
 func TestSnapshotArtifactResumesAtEveryVerifiedChunk(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	artifact, written := writeSnapshotArtifactFixture(t, snapshot)
@@ -519,6 +640,35 @@ func TestSnapshotArtifactBoundsAndCallbackFailures(t *testing.T) {
 	}
 }
 
+func TestRequiredSnapshotArtifactPayloadCapacity(t *testing.T) {
+	ordinary, err := RequiredSnapshotArtifactPayloadCapacity(0, 32, 4096)
+	if err != nil || ordinary != DefaultSnapshotArtifactChunkBytes {
+		t.Fatalf("ordinary payload capacity = %d, %v", ordinary, err)
+	}
+	maximum, err := RequiredSnapshotArtifactPayloadCapacity(
+		DefaultSnapshotArtifactChunkBytes,
+		replication.MaxMutationKeyBytes,
+		replication.MaxMutationValueBytes,
+	)
+	if err != nil || maximum != DefaultSnapshotArtifactChunkBytes {
+		t.Fatalf("maximum payload capacity = %d, %v", maximum, err)
+	}
+	for _, limits := range [][2]int{
+		{0, 1},
+		{1, 0},
+		{replication.MaxMutationKeyBytes + 1, 1},
+		{1, replication.MaxMutationValueBytes + 1},
+	} {
+		if _, err := RequiredSnapshotArtifactPayloadCapacity(
+			0,
+			limits[0],
+			limits[1],
+		); !errors.Is(err, ErrSnapshotArtifactBound) {
+			t.Fatalf("row bounds %v error = %v", limits, err)
+		}
+	}
+}
+
 func TestSnapshotArtifactWriterHandlesShortWrites(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	short := &snapshotArtifactShortWriter{remaining: 97}
@@ -538,6 +688,16 @@ func (w *snapshotArtifactShortWriter) Write(src []byte) (int, error) {
 	n := min(len(src), w.remaining)
 	w.remaining -= n
 	return n, nil
+}
+
+type snapshotArtifactRecordingWriter struct {
+	bytes.Buffer
+	writes []int
+}
+
+func (w *snapshotArtifactRecordingWriter) Write(src []byte) (int, error) {
+	w.writes = append(w.writes, len(src))
+	return w.Buffer.Write(src)
 }
 
 func corruptSnapshotArtifactByte(src []byte, offset int) []byte {

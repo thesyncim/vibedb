@@ -291,6 +291,494 @@ func TestCheckpointGroupZeroSyncApplyAndExclusiveOwnership(t *testing.T) {
 	}
 }
 
+func TestCheckpointGroupActivationRejectsRecycledGenericMarkerBase(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	retired := [16]byte{0x7f}
+	if _, err := log.marker.AppendRetirement(retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	header := log.marker.Header()
+	if err := log.marker.Recycle(header.Epoch + 1); err != nil {
+		t.Fatal(err)
+	}
+	if log.marker.Cursor() != 0 || log.marker.Header().BaseSequence == 0 {
+		t.Fatalf("recycled activation marker = %+v/%d", log.marker.Header(), log.marker.Cursor())
+	}
+	missingImage := copyCheckpointGroupDirectory(t, dir)
+	beforeMissing := checkpointGroupDirectoryBytes(t, missingImage)
+	requests, files := checkpointGroupTestOpenRequests(t, missingImage)
+	collections, recoveredLog, recoveredGroup, missingErr := OpenCollectionsWithCheckpointGroup(
+		missingImage,
+		TxnLogOptions{},
+		requests,
+		[]string{"system", "user"},
+		CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	for _, file := range files {
+		_ = file.Close()
+	}
+	if collections != nil || recoveredLog != nil || recoveredGroup != nil ||
+		!errors.Is(missingErr, ErrCheckpointGroupCorrupt) {
+		t.Fatalf(
+			"missing certificate recycled base = collections %v log %v group %v err %v",
+			collections, recoveredLog, recoveredGroup, missingErr,
+		)
+	}
+	requireCheckpointGroupDirectoryBytes(t, missingImage, beforeMissing)
+	beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+	group, err := NewCheckpointGroup(
+		log, members, CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	if group != nil || !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("recycled-base activation = group %v, err %v", group, err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+}
+
+func TestCheckpointGroupActivationBaselineResetsRecycledGenericMarker(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	retired := [16]byte{0x7f}
+	if _, err := log.marker.AppendRetirement(retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := log.marker.Header()
+	if err := log.marker.Recycle(before.Epoch + 1); err != nil {
+		t.Fatal(err)
+	}
+	before = log.marker.Header()
+	if before.BaseSequence == 0 || log.marker.Cursor() != 0 {
+		t.Fatalf("generic recycled marker = %+v/%d", before, log.marker.Cursor())
+	}
+
+	if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		t.Fatalf("ResetDischargedForCheckpointGroupActivation: %v", err)
+	}
+	after := log.marker.Header()
+	if after.MarkerID == before.MarkerID || after.Epoch != 1 ||
+		after.BaseSequence != 0 || after.RecycleCount != 1 ||
+		log.marker.Cursor() != 0 || log.marker.NextSequence() != 1 {
+		t.Fatalf("activation baseline = %+v cursor=%d next=%d, prior=%+v",
+			after, log.marker.Cursor(), log.marker.NextSequence(), before)
+	}
+
+	// A crash after the baseline but before descriptor/certificate publication is
+	// the canonical missing-certificate seam, never a recycled-owner rollback.
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+	collections, recoveredLog, recoveredGroup, err := OpenCollectionsWithCheckpointGroup(
+		crashImage, TxnLogOptions{}, requests, []string{"system", "user"},
+		CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	if collections != nil || recoveredLog != nil || recoveredGroup != nil ||
+		!errors.Is(err, ErrCheckpointGroupMissing) {
+		t.Fatalf("pre-certificate crash = %v,%v,%v,%v",
+			collections, recoveredLog, recoveredGroup, err)
+	}
+	collections, recoveredLog, err = OpenCollectionsWithTransactions(
+		crashImage, TxnLogOptions{}, requests,
+	)
+	if err != nil {
+		t.Fatalf("generic reopen after pre-certificate crash: %v", err)
+	}
+	for _, collection := range collections {
+		if closeErr := collection.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+	if err := recoveredLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	group, err := NewCheckpointGroup(
+		log, members, CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	if err != nil {
+		t.Fatalf("NewCheckpointGroup after baseline: %v", err)
+	}
+	t.Cleanup(func() { _ = group.Close() })
+}
+
+func TestCheckpointGroupActivationBaselineFoldsOrdinaryJournals(t *testing.T) {
+	tests := []struct {
+		name     string
+		recycled bool
+	}{
+		{name: "base-zero"},
+		{name: "recycled-marker", recycled: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+			for _, member := range members {
+				if err := log.AdoptCollection(member.Collection); err != nil {
+					t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+				}
+			}
+			if err := log.EnsureMinted(); err != nil {
+				t.Fatal(err)
+			}
+			if test.recycled {
+				if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+					t.Fatal(err)
+				}
+				if err := log.marker.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				header := log.marker.Header()
+				if err := log.marker.Recycle(header.Epoch + 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := log.marker.Header()
+			for i, member := range members {
+				key := []byte("ordinary-" + member.Name)
+				document := []byte(`{"n":` + strconv.Itoa(i+1) + `}`)
+				if _, err := member.Collection.Put(key, document); err != nil {
+					t.Fatalf("Put(%s): %v", member.Name, err)
+				}
+				if member.Collection.journal.Cursor() == 0 {
+					t.Fatalf("%s ordinary write did not retain a journal", member.Name)
+				}
+			}
+
+			if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+				t.Fatalf("ResetDischargedForCheckpointGroupActivation: %v", err)
+			}
+			after := log.marker.Header()
+			if test.recycled {
+				if after.MarkerID == before.MarkerID || after.BaseSequence != 0 ||
+					after.Epoch != 1 || after.RecycleCount != 1 {
+					t.Fatalf("recycled activation marker = %+v, prior %+v", after, before)
+				}
+			} else if after != before {
+				t.Fatalf("base-zero activation changed marker: before=%+v after=%+v",
+					before, after)
+			}
+			for i, member := range members {
+				if member.Collection.journal.Cursor() != 0 {
+					t.Fatalf("%s activation left journal cursor %d",
+						member.Name, member.Collection.journal.Cursor())
+				}
+				key := "ordinary-" + member.Name
+				want := `{"n":` + strconv.Itoa(i+1) + `}`
+				if got, ok := collectionDoc(t, member.Collection, key); !ok || got != want {
+					t.Fatalf("%s live row = %q,%v, want %q", member.Name, got, ok, want)
+				}
+			}
+
+			// A crash after the folds but before SQL publishes its descriptor must
+			// remain an ordinary generic image with the exact imported rows.
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+			reopened, recoveredLog, err := OpenCollectionsWithTransactions(
+				crashImage, TxnLogOptions{}, requests,
+			)
+			if err != nil {
+				t.Fatalf("generic reopen after activation folds: %v", err)
+			}
+			for i, collection := range reopened {
+				key := "ordinary-" + members[i].Name
+				want := `{"n":` + strconv.Itoa(i+1) + `}`
+				if got, ok := collectionDoc(t, collection, key); !ok || got != want {
+					t.Fatalf("reopened %s row = %q,%v, want %q",
+						members[i].Name, got, ok, want)
+				}
+				if err := collection.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := recoveredLog.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, file := range files {
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupActivationBaselineConditionalRefusalIsByteStable(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := members[0].Collection.Put(
+		[]byte("ordinary"), []byte(`{"n":1}`),
+	); err != nil {
+		t.Fatal(err)
+	}
+	header := log.marker.Header()
+	prepareUnpublishedOn(
+		t, members[1].Collection, header.MarkerID, header.Epoch, 1,
+		"conditional", `{"n":2}`,
+	)
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("conditional activation baseline = %v, want ErrCheckpointGroupCorrupt", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineFoldFailureReopensGeneric(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+		if _, err := member.Collection.Put(
+			[]byte("ordinary-"+member.Name), []byte(`{"n":1}`),
+		); err != nil {
+			t.Fatalf("Put(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	beforeMarker := log.marker.Header()
+	order := []*Collection{members[0].Collection, members[1].Collection}
+	sortCollectionSnapshotOrder(order)
+	fault := storeio.NewFaultJournal(order[1].journal)
+	fault.Program(storeio.JournalFaultPlan{Phase: storeio.JournalFaultENOSPCRecycle})
+
+	err := log.ResetDischargedForCheckpointGroupActivation()
+	if err == nil || !fault.Faulted() || order[1].PersistenceError() == nil ||
+		!errors.Is(err, order[1].PersistenceError()) {
+		t.Fatalf("activation fold fault = %v, faulted=%v", err, fault.Faulted())
+	}
+	if order[0].journal.Cursor() != 0 || order[1].journal.Cursor() == 0 {
+		t.Fatalf("partial activation fold cursors = %d,%d, want clean/live",
+			order[0].journal.Cursor(), order[1].journal.Cursor())
+	}
+	if after := log.marker.Header(); after != beforeMarker {
+		t.Fatalf("journal fold failure changed marker: before=%+v after=%+v",
+			beforeMarker, after)
+	}
+
+	// The first member may already be folded and the second member's root may
+	// already be durable when its recycle fails. The unchanged generic
+	// marker plus the retained second journal must still recover both rows.
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+	reopened, recoveredLog, openErr := OpenCollectionsWithTransactions(
+		crashImage, TxnLogOptions{}, requests,
+	)
+	if openErr != nil {
+		t.Fatalf("generic reopen after activation fold fault: %v", openErr)
+	}
+	for i, collection := range reopened {
+		key := "ordinary-" + members[i].Name
+		if got, ok := collectionDoc(t, collection, key); !ok || got != `{"n":1}` {
+			t.Fatalf("reopened %s row = %q,%v", members[i].Name, got, ok)
+		}
+		if err := collection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := recoveredLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCheckpointGroupActivationBaselineZeroBaseIsExactNoOp(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader := log.marker.Header()
+	beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		t.Fatal(err)
+	}
+	if after := log.marker.Header(); after != beforeHeader {
+		t.Fatalf("zero-base baseline changed marker: before=%+v after=%+v",
+			beforeHeader, after)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+}
+
+func TestCheckpointGroupActivationBaselineRefusesExistingCertificate(t *testing.T) {
+	dir, _, log := newCheckpointGroupTestResources(t, "system", "user")
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := os.OpenFile(
+		filepath.Join(dir, checkpointGroupFilename),
+		os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := certificate.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupRecoveryRequired) {
+		t.Fatalf("existing-certificate baseline = %v", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineRefusesLiveMarker(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := members[0].Collection.Put(
+		[]byte("ordinary"), []byte(`{"n":1}`),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if members[0].Collection.journal.Cursor() == 0 {
+		t.Fatal("ordinary refusal witness did not retain a journal")
+	}
+	if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.marker.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("live-marker baseline = %v, want ErrCheckpointGroupCorrupt", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineMintFaultsReopenGeneric(t *testing.T) {
+	fault := errors.New("injected crash after activation marker removal")
+	tests := []struct {
+		name  string
+		phase storeio.TxnMarkerFaultPhase
+		hook  bool
+	}{
+		{name: "after-remove", hook: true},
+		{name: "mint-header", phase: storeio.TxnMarkerFaultCreateHeaderWrite},
+		{name: "mint-file-sync", phase: storeio.TxnMarkerFaultCreateFileSync},
+		{name: "mint-directory-sync", phase: storeio.TxnMarkerFaultCreateParentDirSync},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+			for _, member := range members {
+				if err := log.AdoptCollection(member.Collection); err != nil {
+					t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+				}
+			}
+			if err := log.EnsureMinted(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.marker.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			header := log.marker.Header()
+			if err := log.marker.Recycle(header.Epoch + 1); err != nil {
+				t.Fatal(err)
+			}
+
+			previousHook := checkpointGroupAfterActivationBaselineRemoveHook
+			if test.hook {
+				checkpointGroupAfterActivationBaselineRemoveHook = func(*TxnLog) error {
+					return fault
+				}
+			} else {
+				storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{Phase: test.phase})
+			}
+			t.Cleanup(func() {
+				checkpointGroupAfterActivationBaselineRemoveHook = previousHook
+				storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			})
+			err := log.ResetDischargedForCheckpointGroupActivation()
+			createFaulted := storeio.TxnMarkerCreateFaulted()
+			checkpointGroupAfterActivationBaselineRemoveHook = previousHook
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			if !errors.Is(err, ErrCommitOutcomeUnknown) ||
+				(test.hook && !errors.Is(err, fault)) {
+				t.Fatalf("activation baseline fault = %v", err)
+			}
+			if !test.hook && !createFaulted {
+				t.Fatal("activation remint fault did not fire")
+			}
+			if log.marker != nil || !errors.Is(log.poison, ErrCommitOutcomeUnknown) {
+				t.Fatalf("faulted baseline owner = marker %v poison %v", log.marker, log.poison)
+			}
+			for _, member := range members {
+				if !errors.Is(member.Collection.PersistenceError(), ErrCommitOutcomeUnknown) {
+					t.Fatalf("member %q poison = %v", member.Name, member.Collection.PersistenceError())
+				}
+			}
+
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+			collections, recoveredLog, openErr := OpenCollectionsWithTransactions(
+				crashImage, TxnLogOptions{}, requests,
+			)
+			if openErr != nil {
+				t.Fatalf("generic reopen after activation remint fault: %v", openErr)
+			}
+			for _, collection := range collections {
+				if closeErr := collection.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+			}
+			if closeErr := recoveredLog.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			for _, file := range files {
+				if closeErr := file.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+			}
+		})
+	}
+}
+
 func TestCheckpointGroupUpdateConsecutiveSharesAtomicUpdateContract(t *testing.T) {
 	t.Run("single-entry parity", func(t *testing.T) {
 		_, ordinaryMembers, _, ordinary := newCheckpointGroupTestStore(t, 8)
@@ -1982,7 +2470,7 @@ func TestCheckpointGroupRecoveryUsesCertificateAndAbortsSuffix(t *testing.T) {
 	checkpointGroupPut(t, group, 3, members, "suffix-3")
 
 	crashImage := copyCheckpointGroupDirectory(t, dir)
-	collections, _, reopened := openCheckpointGroupTestCopy(t, crashImage)
+	collections, recoveredLog, reopened := openCheckpointGroupTestCopy(t, crashImage)
 	if reopened.AppliedIndex() != 1 || reopened.CheckpointAppliedIndex() != 1 {
 		t.Fatalf("reopened cuts = applied %d checkpoint %d",
 			reopened.AppliedIndex(), reopened.CheckpointAppliedIndex())
@@ -1995,6 +2483,398 @@ func TestCheckpointGroupRecoveryUsesCertificateAndAbortsSuffix(t *testing.T) {
 			if _, ok := collectionDoc(t, collection, key); ok {
 				t.Fatalf("uncertified suffix %q survived recovery", key)
 			}
+		}
+	}
+	if base := recoveredLog.marker.Header().BaseSequence; base != reopened.txnBase || base != 1 {
+		t.Fatalf("aborted-suffix recovery anchor = marker %d certificate %d", base, reopened.txnBase)
+	}
+	closeCheckpointGroupTestHandles(t, collections, recoveredLog, reopened)
+	secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, crashImage)
+	if base := secondLog.marker.Header().BaseSequence; base != second.txnBase || base != 1 {
+		t.Fatalf("second aborted-suffix recovery anchor = marker %d certificate %d", base, second.txnBase)
+	}
+	for _, collection := range secondCollections {
+		for _, key := range []string{"suffix-2", "suffix-3"} {
+			if _, ok := collectionDoc(t, collection, key); ok {
+				t.Fatalf("uncertified suffix %q survived second recovery", key)
+			}
+		}
+	}
+	closeCheckpointGroupTestHandles(t, secondCollections, secondLog, second)
+}
+
+func TestCheckpointGroupAnchoredRecoveryRecycleCrashCuts(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		markerPlan  storeio.TxnMarkerFaultPlan
+		faultPoint  checkpointGroupFaultPoint
+		markerFault bool
+	}{
+		{
+			name: "torn-marker-header",
+			markerPlan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultTornRecycle,
+			},
+			markerFault: true,
+		},
+		{
+			name: "marker-sync",
+			markerPlan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultSyncError,
+			},
+			markerFault: true,
+		},
+		{name: "after-marker-sync", faultPoint: checkpointGroupAfterMarkerSync},
+		{name: "certificate-write", faultPoint: checkpointGroupAfterCertificateWrite},
+		{name: "certificate-sync", faultPoint: checkpointGroupAfterCertificateSync},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "certified")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			checkpointGroupPut(t, group, 2, members[:1], "aborted")
+			damaged := copyCheckpointGroupDirectory(t, dir)
+			fault := errors.New("stop anchored marker recovery")
+			previousRecycleHook := checkpointGroupBeforeMarkerRecoveryRecycleHook
+			previousFaultHook := checkpointGroupFaultHook
+			t.Cleanup(func() {
+				checkpointGroupBeforeMarkerRecoveryRecycleHook = previousRecycleHook
+				checkpointGroupFaultHook = previousFaultHook
+			})
+			var markerFault *storeio.FaultTxnMarker
+			checkpointGroupBeforeMarkerRecoveryRecycleHook = func(marker *storeio.TxnMarker) {
+				if test.markerFault {
+					markerFault = storeio.NewFaultTxnMarker(marker)
+					markerFault.Program(test.markerPlan)
+				}
+			}
+			checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+				if test.faultPoint != 0 && point == test.faultPoint {
+					return fault
+				}
+				return nil
+			}
+			requests, files := checkpointGroupTestOpenRequests(t, damaged)
+			collections, log, recovered, err := OpenCollectionsWithCheckpointGroup(
+				damaged,
+				TxnLogOptions{},
+				requests,
+				[]string{"system", "user"},
+				CheckpointGroupOptions{CheckpointEvery: 8},
+			)
+			checkpointGroupBeforeMarkerRecoveryRecycleHook = previousRecycleHook
+			checkpointGroupFaultHook = previousFaultHook
+			for _, file := range files {
+				_ = file.Close()
+			}
+			if collections != nil || log != nil || recovered != nil || err == nil {
+				t.Fatalf(
+					"anchored recovery cut = collections %v log %v group %v err %v",
+					collections, log, recovered, err,
+				)
+			}
+			if test.markerFault && (markerFault == nil || !markerFault.Faulted()) {
+				t.Fatal("anchored marker fault did not fire")
+			}
+			if !test.markerFault && !errors.Is(err, fault) {
+				t.Fatalf("anchored recovery hook error = %v", err)
+			}
+
+			crashImage := copyCheckpointGroupDirectory(t, damaged)
+			for attempt := 0; attempt < 2; attempt++ {
+				opened, reopenedLog, reopened := openCheckpointGroupTestCopy(t, crashImage)
+				if reopened.AppliedIndex() != 1 || reopened.CheckpointAppliedIndex() != 1 {
+					t.Fatalf(
+						"anchored retry %d cut = %d/%d",
+						attempt, reopened.AppliedIndex(), reopened.CheckpointAppliedIndex(),
+					)
+				}
+				if base := reopenedLog.marker.Header().BaseSequence; base != 1 || base != reopened.txnBase {
+					t.Fatalf(
+						"anchored retry %d base = marker %d certificate %d",
+						attempt, base, reopened.txnBase,
+					)
+				}
+				for _, collection := range opened {
+					if _, found := collectionDoc(t, collection, "aborted"); found {
+						t.Fatalf("anchored retry %d retained aborted row", attempt)
+					}
+				}
+				closeCheckpointGroupTestHandles(t, opened, reopenedLog, reopened)
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupCutZeroRecoveryInvalidatesAbortedMarkerSuffix(t *testing.T) {
+	dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+	checkpointGroupPut(t, group, 1, members[:1], "aborted-cut-zero")
+	damaged := copyCheckpointGroupDirectory(t, dir)
+
+	firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, damaged)
+	if first.AppliedIndex() != 0 || first.CheckpointAppliedIndex() != 0 ||
+		firstLog.marker.Header().BaseSequence != 0 ||
+		firstLog.marker.Cursor() != 0 || firstLog.marker.NextSequence() != 1 {
+		t.Fatalf(
+			"first cut-zero recovery = applied %d checkpoint %d base %d cursor %d next %d",
+			first.AppliedIndex(), first.CheckpointAppliedIndex(),
+			firstLog.marker.Header().BaseSequence, firstLog.marker.Cursor(),
+			firstLog.marker.NextSequence(),
+		)
+	}
+	if got := first.Stats().MarkerSyncs; got != 2 {
+		t.Fatalf("equal-base recovery marker syncs = %d, want 2", got)
+	}
+	if _, found := collectionDoc(t, firstCollections[0], "aborted-cut-zero"); found {
+		t.Fatal("first cut-zero recovery retained aborted row")
+	}
+	closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
+
+	secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, damaged)
+	if secondLog.marker.Cursor() != 0 || secondLog.marker.NextSequence() != 1 {
+		t.Fatalf(
+			"second cut-zero recovery marker = cursor %d next %d",
+			secondLog.marker.Cursor(), secondLog.marker.NextSequence(),
+		)
+	}
+	if got := second.Stats().MarkerSyncs; got != 1 {
+		t.Fatalf("clean equal-base recovery marker syncs = %d, want 1", got)
+	}
+	if _, found := collectionDoc(t, secondCollections[0], "aborted-cut-zero"); found {
+		t.Fatal("second cut-zero recovery resurrected aborted row")
+	}
+	secondMembers := []NamedCollection{
+		{Name: "system", Collection: secondCollections[0]},
+		{Name: "user", Collection: secondCollections[1]},
+	}
+	checkpointGroupPut(t, second, 1, secondMembers[:1], "after-cut-zero-recovery")
+	if err := second.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint after cut-zero recovery: %v", err)
+	}
+	closeCheckpointGroupTestHandles(t, secondCollections, secondLog, second)
+
+	thirdCollections, thirdLog, third := openCheckpointGroupTestCopy(t, damaged)
+	if _, found := collectionDoc(t, thirdCollections[0], "after-cut-zero-recovery"); !found {
+		t.Fatal("post-cut-zero recovery update was not durable")
+	}
+	if _, found := collectionDoc(t, thirdCollections[0], "aborted-cut-zero"); found {
+		t.Fatal("post-cut-zero recovery reopen resurrected aborted row")
+	}
+	closeCheckpointGroupTestHandles(t, thirdCollections, thirdLog, third)
+}
+
+func TestCheckpointGroupCutZeroRecoveryInvalidationCrashCuts(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		plan storeio.TxnMarkerFaultPlan
+	}{
+		{
+			name: "invalidation-write",
+			plan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultRecoveryInvalidateError,
+			},
+		},
+		{
+			name: "torn-invalidation",
+			plan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultTornRecoveryInvalidate,
+			},
+		},
+		{
+			name: "invalidation-sync",
+			plan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultSyncError, SyncIndex: 0,
+			},
+		},
+		{
+			name: "torn-successor-header",
+			plan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultTornRecycle,
+			},
+		},
+		{
+			name: "successor-header-sync",
+			plan: storeio.TxnMarkerFaultPlan{
+				Phase: storeio.TxnMarkerFaultSyncError, SyncIndex: 1,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members[:1], "aborted-cut-zero")
+			damaged := copyCheckpointGroupDirectory(t, dir)
+			previousHook := checkpointGroupBeforeMarkerRecoveryRecycleHook
+			t.Cleanup(func() {
+				checkpointGroupBeforeMarkerRecoveryRecycleHook = previousHook
+			})
+			var markerFault *storeio.FaultTxnMarker
+			checkpointGroupBeforeMarkerRecoveryRecycleHook = func(marker *storeio.TxnMarker) {
+				markerFault = storeio.NewFaultTxnMarker(marker)
+				markerFault.Program(test.plan)
+			}
+			requests, files := checkpointGroupTestOpenRequests(t, damaged)
+			collections, log, recovered, err := OpenCollectionsWithCheckpointGroup(
+				damaged,
+				TxnLogOptions{},
+				requests,
+				[]string{"system", "user"},
+				CheckpointGroupOptions{CheckpointEvery: 8},
+			)
+			checkpointGroupBeforeMarkerRecoveryRecycleHook = previousHook
+			for _, file := range files {
+				_ = file.Close()
+			}
+			if collections != nil || log != nil || recovered != nil || err == nil ||
+				markerFault == nil || !markerFault.Faulted() {
+				t.Fatalf(
+					"cut-zero invalidation fault = collections %v log %v group %v faulted %v err %v",
+					collections, log, recovered,
+					markerFault != nil && markerFault.Faulted(), err,
+				)
+			}
+
+			crashImage := copyCheckpointGroupDirectory(t, damaged)
+			firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, crashImage)
+			if first.AppliedIndex() != 0 || first.CheckpointAppliedIndex() != 0 ||
+				firstLog.marker.Cursor() != 0 || firstLog.marker.NextSequence() != 1 {
+				t.Fatalf(
+					"cut-zero retry = applied %d checkpoint %d cursor %d next %d",
+					first.AppliedIndex(), first.CheckpointAppliedIndex(),
+					firstLog.marker.Cursor(), firstLog.marker.NextSequence(),
+				)
+			}
+			if _, found := collectionDoc(t, firstCollections[0], "aborted-cut-zero"); found {
+				t.Fatal("cut-zero retry retained aborted row")
+			}
+			closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
+
+			secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, crashImage)
+			if _, found := collectionDoc(t, secondCollections[0], "aborted-cut-zero"); found {
+				t.Fatal("second cut-zero retry resurrected aborted row")
+			}
+			secondMembers := []NamedCollection{
+				{Name: "system", Collection: secondCollections[0]},
+				{Name: "user", Collection: secondCollections[1]},
+			}
+			checkpointGroupPut(t, second, 1, secondMembers[:1], "after-cut-zero-retry")
+			if err := second.Checkpoint(); err != nil {
+				t.Fatalf("checkpoint after cut-zero retry: %v", err)
+			}
+			closeCheckpointGroupTestHandles(t, secondCollections, secondLog, second)
+
+			thirdCollections, thirdLog, third := openCheckpointGroupTestCopy(t, crashImage)
+			if _, found := collectionDoc(t, thirdCollections[0], "after-cut-zero-retry"); !found {
+				t.Fatal("post-crash cut-zero update was not durable")
+			}
+			closeCheckpointGroupTestHandles(t, thirdCollections, thirdLog, third)
+		})
+	}
+}
+
+func TestCheckpointGroupLiveMarkerSyncFaultPoisonsSplitOwner(t *testing.T) {
+	dir, members, log, group := checkpointGroupTestStoreWithMarkerCapacity(
+		t, 8, uint64(storeio.TxnMarkerMinSectorSize),
+	)
+	checkpointGroupPut(t, group, 1, members, "certified")
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if log.marker.Cursor() != log.marker.Header().Capacity {
+		t.Fatalf(
+			"marker-sync fixture cursor = %d/%d",
+			log.marker.Cursor(), log.marker.Header().Capacity,
+		)
+	}
+	beforeCertificate, err := os.ReadFile(filepath.Join(dir, checkpointGroupFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader := log.marker.Header()
+	beforeStats := group.Stats()
+	group.mu.Lock()
+	beforeOwner := group.certificateLocked()
+	group.mu.Unlock()
+
+	fault := errors.New("stop after live marker sync")
+	previousHook := checkpointGroupFaultHook
+	t.Cleanup(func() { checkpointGroupFaultHook = previousHook })
+	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+		if point == checkpointGroupAfterMarkerSync {
+			return fault
+		}
+		return nil
+	}
+	called := false
+	err = group.Update(2, members[:1], defaultTxnLimits(), func(batch *DatabaseBatch) error {
+		called = true
+		write, collectionErr := batch.Collection("system")
+		if collectionErr != nil {
+			return collectionErr
+		}
+		return write.Put([]byte("must-not-publish"), []byte(`{"n":2}`))
+	})
+	checkpointGroupFaultHook = previousHook
+	if !called || !errors.Is(err, fault) || !errors.Is(err, ErrCommitOutcomeUnknown) {
+		t.Fatalf("live marker-sync fault = called %v, err %v", called, err)
+	}
+	afterHeader := log.marker.Header()
+	if afterHeader.MarkerID != beforeHeader.MarkerID ||
+		afterHeader.Epoch != beforeHeader.Epoch+1 ||
+		afterHeader.RecycleCount != beforeHeader.RecycleCount+1 ||
+		afterHeader.BaseSequence != beforeOwner.txnHighWater || log.marker.Cursor() != 0 {
+		t.Fatalf("live marker-sync successor = before %+v after %+v cursor %d",
+			beforeHeader, afterHeader, log.marker.Cursor())
+	}
+	afterCertificate, readErr := os.ReadFile(filepath.Join(dir, checkpointGroupFilename))
+	if readErr != nil || !bytes.Equal(afterCertificate, beforeCertificate) {
+		t.Fatalf("live marker-sync fault changed certificate: %v", readErr)
+	}
+	afterStats := group.Stats()
+	if afterStats.MarkerSyncs != beforeStats.MarkerSyncs+1 ||
+		afterStats.CertificateSyncs != beforeStats.CertificateSyncs {
+		t.Fatalf("live marker-sync stats = before %+v after %+v", beforeStats, afterStats)
+	}
+	group.mu.Lock()
+	afterOwner := group.certificateLocked()
+	ownerPoison := group.poison
+	logPoison := group.log.poison
+	group.mu.Unlock()
+	if afterOwner.sequence != beforeOwner.sequence ||
+		!equalCheckpointGroupCertificateBody(afterOwner, beforeOwner) ||
+		!errors.Is(ownerPoison, ErrCommitOutcomeUnknown) ||
+		!errors.Is(logPoison, ErrCommitOutcomeUnknown) {
+		t.Fatalf(
+			"live marker-sync owner = before %+v after %+v poison %v/%v",
+			beforeOwner, afterOwner, ownerPoison, logPoison,
+		)
+	}
+	if _, found := collectionDoc(t, members[0].Collection, "must-not-publish"); found {
+		t.Fatal("live marker-sync fault published the requested update")
+	}
+	if err := group.Update(2, members[:1], defaultTxnLimits(), func(*DatabaseBatch) error {
+		return nil
+	}); !errors.Is(err, ErrCommitOutcomeUnknown) {
+		t.Fatalf("poisoned live marker-sync owner accepted another update: %v", err)
+	}
+
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	opened, reopenedLog, reopened := openCheckpointGroupTestCopy(t, crashImage)
+	if reopened.AppliedIndex() != 1 || reopened.CheckpointAppliedIndex() != 1 ||
+		reopenedLog.marker.Header().BaseSequence != 1 {
+		t.Fatalf(
+			"live marker-sync recovery = applied %d checkpoint %d base %d",
+			reopened.AppliedIndex(), reopened.CheckpointAppliedIndex(),
+			reopenedLog.marker.Header().BaseSequence,
+		)
+	}
+	for _, collection := range opened {
+		if _, found := collectionDoc(t, collection, "certified"); !found {
+			t.Fatal("live marker-sync recovery lost certified row")
+		}
+		if _, found := collectionDoc(t, collection, "must-not-publish"); found {
+			t.Fatal("live marker-sync recovery retained refused row")
 		}
 	}
 }
@@ -2034,7 +2914,7 @@ func TestCheckpointGroupCertificateDoesNotDependOnMarkerDecisionSync(t *testing.
 		t.Fatalf("erase marker implementation log: %v", err)
 	}
 
-	collections, _, reopened := openCheckpointGroupTestCopy(t, crashImage)
+	collections, recoveredLog, reopened := openCheckpointGroupTestCopy(t, crashImage)
 	if reopened.CheckpointAppliedIndex() != 1 {
 		t.Fatalf("checkpoint cut = %d, want 1", reopened.CheckpointAppliedIndex())
 	}
@@ -2043,6 +2923,20 @@ func TestCheckpointGroupCertificateDoesNotDependOnMarkerDecisionSync(t *testing.
 			t.Fatal("certificate-authorized journal prepare was not replayed")
 		}
 	}
+	if base := recoveredLog.marker.Header().BaseSequence; base != reopened.txnBase || base != 1 {
+		t.Fatalf("erased-prefix recovery anchor = marker %d certificate %d", base, reopened.txnBase)
+	}
+	closeCheckpointGroupTestHandles(t, collections, recoveredLog, reopened)
+	secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, crashImage)
+	if base := secondLog.marker.Header().BaseSequence; base != second.txnBase || base != 1 {
+		t.Fatalf("second erased-prefix recovery anchor = marker %d certificate %d", base, second.txnBase)
+	}
+	for _, collection := range secondCollections {
+		if _, ok := collectionDoc(t, collection, "certified"); !ok {
+			t.Fatal("certificate-authorized row missing after second recovery")
+		}
+	}
+	closeCheckpointGroupTestHandles(t, secondCollections, secondLog, second)
 }
 
 func TestCheckpointGroupRejectsNonContiguousSurvivingMarkerPrefix(t *testing.T) {
@@ -2356,6 +3250,7 @@ func TestCheckpointGroupMarkerRepairExhaustionDoesNotUnlinkMarker(t *testing.T) 
 			if err := group.Checkpoint(); err != nil {
 				t.Fatal(err)
 			}
+			checkpointGroupPut(t, group, 2, members[:1], "uncertified-dirty")
 			crashImage := copyCheckpointGroupDirectory(t, dir)
 
 			certificatePath := filepath.Join(crashImage, checkpointGroupFilename)
@@ -2393,6 +3288,7 @@ func TestCheckpointGroupMarkerRepairExhaustionDoesNotUnlinkMarker(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
+			beforeDirectory := checkpointGroupDirectoryBytes(t, crashImage)
 			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
 			collections, log, reopened, err := OpenCollectionsWithCheckpointGroup(
 				crashImage, TxnLogOptions{}, requests, []string{"system", "user"},
@@ -2410,16 +3306,89 @@ func TestCheckpointGroupMarkerRepairExhaustionDoesNotUnlinkMarker(t *testing.T) 
 			if err != nil || !bytes.Equal(markerAfter, markerBefore) {
 				t.Fatalf("marker changed before exhausted repair refusal: %v", err)
 			}
+			requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
 		})
 	}
 }
 
-func TestCheckpointGroupMarkerRepairTerminalTransactionAnchorIsExhausted(t *testing.T) {
+func TestCheckpointGroupMarkerRepairExactLastSuccessorsReopenReadOnly(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*checkpointGroupCertificate)
+		check  func(*testing.T, checkpointGroupCertificate, *TxnLog)
+	}{
+		{
+			name: "certificate-sequence",
+			mutate: func(certificate *checkpointGroupCertificate) {
+				certificate.sequence = math.MaxUint64 - 1
+			},
+			check: func(t *testing.T, certificate checkpointGroupCertificate, _ *TxnLog) {
+				if certificate.sequence != math.MaxUint64 {
+					t.Fatalf("repaired terminal certificate sequence = %d", certificate.sequence)
+				}
+			},
+		},
+		{
+			name: "marker-epoch",
+			mutate: func(certificate *checkpointGroupCertificate) {
+				certificate.markerEpoch = math.MaxUint64 - 1
+			},
+			check: func(t *testing.T, certificate checkpointGroupCertificate, log *TxnLog) {
+				if certificate.markerEpoch != math.MaxUint64 ||
+					log.marker.Header().Epoch != math.MaxUint64 {
+					t.Fatalf(
+						"repaired terminal marker epoch = certificate %d header %d",
+						certificate.markerEpoch, log.marker.Header().Epoch,
+					)
+				}
+			},
+		},
+		{
+			name: "transaction-high-water",
+			mutate: func(certificate *checkpointGroupCertificate) {
+				certificate.txnHighWater = math.MaxUint64 - 1
+			},
+			check: func(t *testing.T, certificate checkpointGroupCertificate, log *TxnLog) {
+				header := log.marker.Header()
+				if certificate.txnBase != math.MaxUint64-1 ||
+					certificate.txnHighWater != math.MaxUint64-1 ||
+					header.BaseSequence != math.MaxUint64-1 ||
+					log.marker.NextSequence() != math.MaxUint64 {
+					t.Fatalf(
+						"repaired terminal transaction anchor = certificate %d/%d marker %d next %d",
+						certificate.txnBase, certificate.txnHighWater,
+						header.BaseSequence, log.marker.NextSequence(),
+					)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, _, _, _ := newCheckpointGroupTestStore(t, 8)
+			damaged := copyCheckpointGroupDirectory(t, dir)
+			checkpointGroupTestRewriteSingleDiskCertificate(t, damaged, test.mutate)
+			if err := os.Remove(filepath.Join(damaged, txnMarkerFilename)); err != nil {
+				t.Fatal(err)
+			}
+
+			collections, log, group := openCheckpointGroupTestCopy(t, damaged)
+			group.mu.Lock()
+			certificate := group.certificateLocked()
+			group.mu.Unlock()
+			test.check(t, certificate, log)
+			closeCheckpointGroupTestHandles(t, collections, log, group)
+			checkpointGroupTestRequireTerminalReopenSucceeds(t, damaged)
+		})
+	}
+}
+
+func TestCheckpointGroupMarkerRepairTerminalTransactionAnchorFailsBeforeReplacement(t *testing.T) {
 	dir, members, _, group := newCheckpointGroupTestStore(t, 8)
 	checkpointGroupPut(t, group, 1, members, "certified")
 	if err := group.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
+	checkpointGroupPut(t, group, 2, members[:1], "uncertified-dirty")
 	crashImage := copyCheckpointGroupDirectory(t, dir)
 	certificatePath := filepath.Join(crashImage, checkpointGroupFilename)
 	raw, err := os.ReadFile(certificatePath)
@@ -2453,44 +3422,32 @@ func TestCheckpointGroupMarkerRepairTerminalTransactionAnchorIsExhausted(t *test
 	if err := os.Remove(filepath.Join(crashImage, txnMarkerFilename)); err != nil {
 		t.Fatal(err)
 	}
-
-	assertExhausted := func(
-		collections []*Collection,
-		log *TxnLog,
-		reopened *CheckpointGroup,
-	) {
-		t.Helper()
-		header := log.marker.Header()
-		if header.BaseSequence != math.MaxUint64 || log.marker.NextSequence() != 0 ||
-			log.nextTxnID != math.MaxUint64 || reopened.txn != math.MaxUint64 {
-			t.Fatalf("terminal repaired marker = header %+v marker next %d log next %d group txn %d",
-				header, log.marker.NextSequence(), log.nextTxnID, reopened.txn)
-		}
-		named := []NamedCollection{
-			{Name: "system", Collection: collections[0]},
-			{Name: "user", Collection: collections[1]},
-		}
-		err := reopened.Update(
-			2, named, defaultTxnLimits(), func(batch *DatabaseBatch) error {
-				write, collectionErr := batch.Collection("system")
-				if collectionErr != nil {
-					return collectionErr
-				}
-				return write.Put([]byte("must-not-append"), []byte(`{"n":2}`))
-			},
+	beforeDirectory := checkpointGroupDirectoryBytes(t, crashImage)
+	for attempt := 0; attempt < 2; attempt++ {
+		requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+		collections, log, reopened, err := OpenCollectionsWithCheckpointGroup(
+			crashImage,
+			TxnLogOptions{},
+			requests,
+			[]string{"system", "user"},
+			CheckpointGroupOptions{CheckpointEvery: 8},
 		)
-		if !errors.Is(err, ErrCheckpointGroupSequence) ||
-			log.marker.NextSequence() != 0 || log.nextTxnID != math.MaxUint64 {
-			t.Fatalf("terminal repaired update = %v marker next %d log next %d",
-				err, log.marker.NextSequence(), log.nextTxnID)
+		for _, file := range files {
+			_ = file.Close()
 		}
+		if collections != nil || log != nil || reopened != nil ||
+			!errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf(
+				"terminal repair attempt %d = collections %v log %v group %v err %v",
+				attempt,
+				collections,
+				log,
+				reopened,
+				err,
+			)
+		}
+		requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
 	}
-
-	firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, crashImage)
-	assertExhausted(firstCollections, firstLog, first)
-	closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
-	secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, crashImage)
-	assertExhausted(secondCollections, secondLog, second)
 }
 
 func TestCheckpointGroupMarkerRepairRetriesEveryAnchoredCreateFault(t *testing.T) {

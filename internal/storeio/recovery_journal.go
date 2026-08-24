@@ -1877,6 +1877,13 @@ func (rj *RecoveryJournal) GrowCapacity(
 			return fmt.Errorf("%w: journal growth capacity", ErrInvalidWrite)
 		}
 	}
+	// Growth publishes through the same alternating recycle generation as a
+	// header recycle. Refuse exhaustion before preallocation: growing the file
+	// and only then discovering the wrap would violate the method's
+	// fail-before-mutation contract.
+	if rj.header.RecycleCount == ^uint64(0) {
+		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
+	}
 	total := int64(recoveryJournalRegionStart) + int64(minimum)
 	if err := recoveryJournalPreallocate(rj.file, total); err != nil {
 		return err
@@ -2261,6 +2268,13 @@ func (rj *RecoveryJournal) RecycleCertifiedPrefix(
 func (rj *RecoveryJournal) recycleHeader(
 	baseGeneration uint64, powerSafe bool,
 ) error {
+	// An empty journal already anchored at the requested durable generation is
+	// the exact target header: cursor zero also proves nextSequence-1 equals the
+	// retained BaseSequence, including the terminal Max/zero-sentinel pair. Do
+	// not spend an alternating-slot generation or issue a redundant barrier.
+	if rj.cursor == 0 && baseGeneration == rj.header.BaseGeneration {
+		return nil
+	}
 	// Stage the advanced header and commit it to memory only after the write and
 	// its sync both succeed. On failure the live manager deliberately retains the
 	// old base and cursor, but the opposite header may already be observable or

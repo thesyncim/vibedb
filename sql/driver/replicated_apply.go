@@ -108,16 +108,17 @@ type ReplicatedApplyCapacityProfile struct {
 // SQL root. Its implementation deliberately does not expose the underlying
 // durable collections, transaction log, or replicated-state Machine.
 type ReplicatedApply struct {
-	owner             *dbConnector
-	database          *database
-	machine           *replicatedstate.Machine
-	table             *table
-	identity          ReplicatedApplyIdentity
-	closed            bool
-	attemptGeneration uint64
-	attemptActive     bool
-	attemptBatch      bool
-	attemptKeys       replicatedAttemptBinaryKeys
+	owner                *dbConnector
+	database             *database
+	machine              *replicatedstate.Machine
+	table                *table
+	identity             ReplicatedApplyIdentity
+	closed               bool
+	attemptGeneration    uint64
+	attemptActive        bool
+	attemptBatch         bool
+	attemptKeys          replicatedAttemptBinaryKeys
+	walBaseCaptureActive bool
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -550,6 +551,16 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 			)
 		}
 	}
+	// Generic detach recycles txn.vtm after discharging its conditional window.
+	// That clean recycle retains a nonzero monotonic BaseSequence. Reset it before
+	// publishing a new apply identity: the SQL descriptor is durable before the
+	// checkpoint certificate, and recovery must be able to distinguish that
+	// legitimate activation seam from deletion of an already-live certificate.
+	if err := d.txnLog.ResetDischargedForCheckpointGroupActivation(); err != nil {
+		return ReplicatedApplyIdentity{}, fmt.Errorf(
+			"vibedb: prepare replicated checkpoint activation baseline: %w", err,
+		)
+	}
 
 	identity, err := d.createReplicatedApplyStorageLocked(expected, options)
 	if err != nil {
@@ -917,6 +928,9 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 	if core.replicatedApplyClaim != a {
 		return ErrReplicatedApplyClosed
 	}
+	if a.walBaseCaptureActive {
+		return ErrReplicatedApplyBusy
+	}
 	connector.closed = true
 	connector.exclusive = false
 	return nil
@@ -937,6 +951,10 @@ func (a *ReplicatedApply) Close() error {
 	if core.replicatedApplyClaim != a {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
+	}
+	if a.walBaseCaptureActive {
+		core.mu.Unlock()
+		return ErrReplicatedApplyBusy
 	}
 	if core.checkpointGroup == nil {
 		core.mu.Unlock()

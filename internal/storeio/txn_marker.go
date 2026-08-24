@@ -155,10 +155,10 @@ type TxnMarkerOptions struct {
 	SealedCapacity bool
 }
 
-// TxnMarkerRecoveryAnchor identifies a clean replacement file for a recovery
-// authority that already authenticated the logical marker lineage. Epoch must
-// advance that authority's retained epoch. BaseSequence anchors the empty
-// replacement record region after its certified prefix.
+// TxnMarkerRecoveryAnchor identifies the empty marker successor authorized by
+// recovery after it has authenticated the logical lineage. Epoch advances the
+// retained epoch. BaseSequence anchors the empty record region after the
+// certified prefix.
 type TxnMarkerRecoveryAnchor struct {
 	MarkerID     [16]byte
 	Epoch        uint64
@@ -1643,9 +1643,51 @@ func (m *TxnMarker) Recycle(newEpoch uint64) error {
 	if newEpoch <= m.header.Epoch {
 		return fmt.Errorf("%w: recycle epoch did not advance", ErrTxnMarkerCorrupt)
 	}
+	return m.recycleTo(newEpoch, m.nextSequence-1)
+}
+
+// RecycleAtRecoveryAnchor resets the record region under authenticated recovery
+// authority. The identity must match, the epoch must be the exact successor,
+// and the base may discard a scanned suffix but cannot precede the selected
+// header's durable base. If the authenticated base equals the old base while a
+// suffix is present, the first record sector is zeroed and synced before the
+// successor header is published. This makes the old-header crash state empty
+// and prevents that aborted suffix from scanning under the new epoch.
+func (m *TxnMarker) RecycleAtRecoveryAnchor(anchor TxnMarkerRecoveryAnchor) error {
+	if anchor.MarkerID != m.header.MarkerID {
+		return fmt.Errorf("%w: recovery recycle marker identity", ErrTxnMarkerCorrupt)
+	}
+	if m.header.Epoch == ^uint64(0) || anchor.Epoch != m.header.Epoch+1 {
+		return fmt.Errorf("%w: recovery recycle epoch is not the successor", ErrTxnMarkerCorrupt)
+	}
+	if anchor.BaseSequence < m.header.BaseSequence {
+		return fmt.Errorf("%w: recovery recycle base moved backward", ErrTxnMarkerCorrupt)
+	}
+	// Qualify every fallible semantic bound before invalidating authenticated
+	// suffix bytes. RecycleTo repeats this guard as the generic defense.
+	if m.header.RecycleCount == ^uint64(0) {
+		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
+	}
+	if anchor.BaseSequence == m.header.BaseSequence && m.cursor != 0 {
+		sector := m.scratch[:TxnMarkerMinSectorSize]
+		clear(sector)
+		if err := writeTxnMarkerFull(m.writeAt, sector, txnMarkerRegionStart); err != nil {
+			return err
+		}
+		if err := m.markerSync(m.file); err != nil {
+			return err
+		}
+	}
+	return m.recycleTo(anchor.Epoch, anchor.BaseSequence)
+}
+
+func (m *TxnMarker) recycleTo(newEpoch, baseSequence uint64) error {
+	if m.header.RecycleCount == ^uint64(0) {
+		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
+	}
 	next := m.header
 	next.Epoch = newEpoch
-	next.BaseSequence = m.nextSequence - 1
+	next.BaseSequence = baseSequence
 	next.RecycleCount++
 	slot := m.headerSlot ^ 1
 	if err := m.writeHeader(slot, next); err != nil {
@@ -1657,6 +1699,7 @@ func (m *TxnMarker) Recycle(newEpoch uint64) error {
 	m.header = next
 	m.headerSlot = slot
 	m.cursor = 0
+	m.nextSequence = baseSequence + 1
 	m.lastTxnID = 0
 	m.retired = nil
 	return nil

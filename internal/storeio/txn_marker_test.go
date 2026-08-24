@@ -1,9 +1,11 @@
 package storeio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -451,6 +453,53 @@ func TestTxnMarkerRecycleSelectsGreaterRecycleCount(t *testing.T) {
 	}
 }
 
+func TestTxnMarkerRecycleCountExhaustionFailsBeforeMutation(t *testing.T) {
+	m, path := createTestTxnMarker(t, 8*TxnMarkerMinSectorSize)
+	defer m.Close()
+	beforeFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.header.RecycleCount = ^uint64(0)
+	beforeHeader := m.header
+	beforeSlot := m.headerSlot
+	beforeCursor := m.cursor
+	beforeSequence := m.nextSequence
+	writes, syncs := 0, 0
+	originalWrite := m.writeAt
+	originalSync := m.markerSync
+	m.writeAt = func(p []byte, off int64) (int, error) {
+		writes++
+		return originalWrite(p, off)
+	}
+	m.markerSync = func(file *os.File) error {
+		syncs++
+		return originalSync(file)
+	}
+
+	err = m.Recycle(m.header.Epoch + 1)
+	if !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("terminal recycle count = %v", err)
+	}
+	afterFile, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if writes != 0 || syncs != 0 || !bytes.Equal(afterFile, beforeFile) ||
+		m.header != beforeHeader || m.headerSlot != beforeSlot ||
+		m.cursor != beforeCursor || m.nextSequence != beforeSequence {
+		t.Fatalf(
+			"terminal recycle mutated marker: writes=%d syncs=%d header=%+v slot=%d cursor=%d sequence=%d",
+			writes,
+			syncs,
+			m.header,
+			m.headerSlot,
+			m.cursor,
+			m.nextSequence,
+		)
+	}
+}
+
 func TestTxnMarkerTornRecycleFallsBack(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	fm := NewFaultTxnMarker(m)
@@ -481,6 +530,338 @@ func TestTxnMarkerTornRecycleFallsBack(t *testing.T) {
 	}
 	if _, ok := decisions.Lookup(m.Header().MarkerID, 1, 1); !ok {
 		t.Fatal("fallback lost the pre-recycle decision")
+	}
+}
+
+func TestTxnMarkerRecoveryRecycleAnchorsSelectedBase(t *testing.T) {
+	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+	for txnID := uint64(1); txnID <= 2; txnID++ {
+		if _, err := m.AppendDecision(txnID, testTxnParticipants(1)); err != nil {
+			t.Fatalf("AppendDecision(%d): %v", txnID, err)
+		}
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := m.Header()
+	if err := m.RecycleAtRecoveryAnchor(TxnMarkerRecoveryAnchor{
+		MarkerID: before.MarkerID, Epoch: before.Epoch + 1, BaseSequence: 1,
+	}); err != nil {
+		t.Fatalf("RecycleAtRecoveryAnchor: %v", err)
+	}
+	if header := m.Header(); header.BaseSequence != 1 ||
+		header.Epoch != before.Epoch+1 ||
+		header.RecycleCount != before.RecycleCount+1 ||
+		m.NextSequence() != 2 || m.Cursor() != 0 {
+		t.Fatalf(
+			"recovery recycle = header %+v next %d cursor %d",
+			header, m.NextSequence(), m.Cursor(),
+		)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, decisions := reopenTestTxnMarker(t, path)
+	defer m.Close()
+	if header := m.Header(); header.BaseSequence != 1 ||
+		m.NextSequence() != 2 || m.Cursor() != 0 || decisions.MaxTxnID() != 0 {
+		t.Fatalf(
+			"reopened recovery recycle = header %+v next %d cursor %d max txn %d",
+			header, m.NextSequence(), m.Cursor(), decisions.MaxTxnID(),
+		)
+	}
+}
+
+func TestTxnMarkerRecoveryRecycleInvalidatesEqualBaseSuffix(t *testing.T) {
+	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before := m.Header()
+	fm := NewFaultTxnMarker(m)
+	if err := m.RecycleAtRecoveryAnchor(TxnMarkerRecoveryAnchor{
+		MarkerID: before.MarkerID, Epoch: before.Epoch + 1,
+		BaseSequence: before.BaseSequence,
+	}); err != nil {
+		t.Fatalf("equal-base recovery recycle: %v", err)
+	}
+	if fm.Invalidations() != 1 || fm.Recycles() != 1 || fm.Syncs() != 2 {
+		t.Fatalf(
+			"equal-base recovery barriers = invalidations %d headers %d syncs %d",
+			fm.Invalidations(), fm.Recycles(), fm.Syncs(),
+		)
+	}
+	if header := m.Header(); header.Epoch != before.Epoch+1 ||
+		header.BaseSequence != before.BaseSequence || m.Cursor() != 0 ||
+		m.NextSequence() != before.BaseSequence+1 {
+		t.Fatalf(
+			"equal-base recovery state = header %+v cursor %d next %d",
+			header, m.Cursor(), m.NextSequence(),
+		)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m, decisions := reopenTestTxnMarker(t, path)
+	if decisions.MaxDCSN() != 0 || decisions.MaxTxnID() != 0 || m.Cursor() != 0 {
+		_ = m.Close()
+		t.Fatalf(
+			"equal-base recovery retained suffix = dcsn %d txn %d cursor %d",
+			decisions.MaxDCSN(), decisions.MaxTxnID(), m.Cursor(),
+		)
+	}
+	if dcsn, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil || dcsn != 1 {
+		_ = m.Close()
+		t.Fatalf("post-recovery decision = dcsn %d err %v", dcsn, err)
+	}
+	if err := errors.Join(m.Sync(), m.Close()); err != nil {
+		t.Fatal(err)
+	}
+	m, decisions = reopenTestTxnMarker(t, path)
+	defer m.Close()
+	if _, found := decisions.Lookup(before.MarkerID, before.Epoch+1, 1); !found {
+		t.Fatal("post-recovery decision did not survive reopen")
+	}
+}
+
+func TestTxnMarkerRecoveryInvalidateCrashCuts(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		plan              TxnMarkerFaultPlan
+		wantInvalidations int
+		wantRecycles      int
+		wantSyncs         int
+	}{
+		{
+			name:              "invalidation-write",
+			plan:              TxnMarkerFaultPlan{Phase: TxnMarkerFaultRecoveryInvalidateError},
+			wantInvalidations: 1,
+		},
+		{
+			name:              "torn-invalidation",
+			plan:              TxnMarkerFaultPlan{Phase: TxnMarkerFaultTornRecoveryInvalidate},
+			wantInvalidations: 1,
+		},
+		{
+			name:              "invalidation-sync",
+			plan:              TxnMarkerFaultPlan{Phase: TxnMarkerFaultSyncError, SyncIndex: 0},
+			wantInvalidations: 1,
+			wantSyncs:         1,
+		},
+		{
+			name:              "torn-successor-header",
+			plan:              TxnMarkerFaultPlan{Phase: TxnMarkerFaultTornRecycle},
+			wantInvalidations: 1,
+			wantRecycles:      1,
+			wantSyncs:         1,
+		},
+		{
+			name:              "successor-header-sync",
+			plan:              TxnMarkerFaultPlan{Phase: TxnMarkerFaultSyncError, SyncIndex: 1},
+			wantInvalidations: 1,
+			wantRecycles:      1,
+			wantSyncs:         2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+			if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			beforeHeader := m.Header()
+			beforeCursor := m.Cursor()
+			beforeNext := m.NextSequence()
+			fm := NewFaultTxnMarker(m)
+			fm.Program(test.plan)
+			err := m.RecycleAtRecoveryAnchor(TxnMarkerRecoveryAnchor{
+				MarkerID: beforeHeader.MarkerID, Epoch: beforeHeader.Epoch + 1,
+				BaseSequence: beforeHeader.BaseSequence,
+			})
+			if err == nil || !fm.Faulted() {
+				t.Fatalf("recovery invalidation fault = faulted %v err %v", fm.Faulted(), err)
+			}
+			if fm.Invalidations() != test.wantInvalidations ||
+				fm.Recycles() != test.wantRecycles || fm.Syncs() != test.wantSyncs {
+				t.Fatalf(
+					"recovery invalidation cut = invalidations %d/%d headers %d/%d syncs %d/%d",
+					fm.Invalidations(), test.wantInvalidations,
+					fm.Recycles(), test.wantRecycles, fm.Syncs(), test.wantSyncs,
+				)
+			}
+			if m.Header() != beforeHeader || m.Cursor() != beforeCursor ||
+				m.NextSequence() != beforeNext {
+				t.Fatalf(
+					"faulted recovery invalidation advanced memory = header %+v cursor %d next %d",
+					m.Header(), m.Cursor(), m.NextSequence(),
+				)
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			m, decisions := reopenTestTxnMarker(t, path)
+			header := m.Header()
+			if header.Epoch == beforeHeader.Epoch {
+				if err := m.RecycleAtRecoveryAnchor(TxnMarkerRecoveryAnchor{
+					MarkerID: header.MarkerID, Epoch: header.Epoch + 1,
+					BaseSequence: header.BaseSequence,
+				}); err != nil {
+					_ = m.Close()
+					t.Fatalf("retry recovery invalidation: %v", err)
+				}
+			} else if header.Epoch != beforeHeader.Epoch+1 ||
+				header.BaseSequence != beforeHeader.BaseSequence ||
+				m.Cursor() != 0 || decisions.MaxDCSN() != 0 {
+				_ = m.Close()
+				t.Fatalf(
+					"selected recovery successor = header %+v cursor %d dcsn %d",
+					header, m.Cursor(), decisions.MaxDCSN(),
+				)
+			}
+			if m.Cursor() != 0 || m.NextSequence() != 1 {
+				_ = m.Close()
+				t.Fatalf("retried recovery state = cursor %d next %d", m.Cursor(), m.NextSequence())
+			}
+			if dcsn, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil || dcsn != 1 {
+				_ = m.Close()
+				t.Fatalf("post-crash recovery decision = dcsn %d err %v", dcsn, err)
+			}
+			if err := errors.Join(m.Sync(), m.Close()); err != nil {
+				t.Fatal(err)
+			}
+			m, decisions = reopenTestTxnMarker(t, path)
+			defer m.Close()
+			if _, found := decisions.Lookup(beforeHeader.MarkerID, beforeHeader.Epoch+1, 1); !found {
+				t.Fatal("post-crash recovery decision missing")
+			}
+		})
+	}
+}
+
+func TestTxnMarkerRecoveryAnchorRefusalsAreSideEffectFree(t *testing.T) {
+	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
+	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Recycle(m.Header().Epoch + 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AppendDecision(2, testTxnParticipants(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	header := m.Header()
+	beforeFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSlot := m.headerSlot
+	beforeCursor := m.cursor
+	beforeSequence := m.nextSequence
+	fm := NewFaultTxnMarker(m)
+	originalWrite := m.writeAt
+	originalSync := m.markerSync
+	writes, syncs := 0, 0
+	m.writeAt = func(p []byte, off int64) (int, error) {
+		writes++
+		return originalWrite(p, off)
+	}
+	m.markerSync = func(file *os.File) error {
+		syncs++
+		return originalSync(file)
+	}
+	for _, test := range []struct {
+		name          string
+		anchor        TxnMarkerRecoveryAnchor
+		terminalCount bool
+		terminalEpoch bool
+		want          error
+	}{
+		{
+			name: "wrong-marker-id",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: [16]byte{0xff}, Epoch: header.Epoch + 1,
+				BaseSequence: header.BaseSequence,
+			},
+			want: ErrTxnMarkerCorrupt,
+		},
+		{
+			name: "wrong-epoch",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: header.MarkerID, Epoch: header.Epoch + 2,
+				BaseSequence: header.BaseSequence,
+			},
+			want: ErrTxnMarkerCorrupt,
+		},
+		{
+			name: "regressed-base",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: header.MarkerID, Epoch: header.Epoch + 1,
+				BaseSequence: header.BaseSequence - 1,
+			},
+			want: ErrTxnMarkerCorrupt,
+		},
+		{
+			name: "terminal-recycle-count",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: header.MarkerID, Epoch: header.Epoch + 1,
+				BaseSequence: header.BaseSequence,
+			},
+			terminalCount: true,
+			want:          ErrInvalidWrite,
+		},
+		{
+			name: "terminal-epoch",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: header.MarkerID, Epoch: math.MaxUint64,
+				BaseSequence: header.BaseSequence,
+			},
+			terminalEpoch: true,
+			want:          ErrTxnMarkerCorrupt,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writes, syncs = 0, 0
+			if test.terminalCount {
+				m.header.RecycleCount = ^uint64(0)
+				defer func() { m.header = header }()
+			}
+			if test.terminalEpoch {
+				m.header.Epoch = math.MaxUint64
+				defer func() { m.header = header }()
+			}
+			beforeStateHeader := m.header
+			beforeInvalidations := fm.Invalidations()
+			err := m.RecycleAtRecoveryAnchor(test.anchor)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("invalid recovery anchor = %v", err)
+			}
+			afterFile, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if writes != 0 || syncs != 0 || !bytes.Equal(afterFile, beforeFile) ||
+				fm.Invalidations() != beforeInvalidations ||
+				m.header != beforeStateHeader || m.headerSlot != beforeSlot ||
+				m.cursor != beforeCursor || m.nextSequence != beforeSequence {
+				t.Fatalf(
+					"invalid recovery anchor mutated marker: writes=%d syncs=%d header=%+v slot=%d cursor=%d next=%d",
+					writes, syncs, m.header, m.headerSlot, m.cursor, m.nextSequence,
+				)
+			}
+		})
 	}
 }
 

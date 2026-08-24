@@ -140,7 +140,7 @@ requires exact exhaustion and rejects overlong, overflowing, or truncated
 varints. The codec sentinel selects the sole current grammar; it is not a
 released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
-v2/v3 decoder or migration ladder.
+alternate decoder or migration ladder.
 
 ## Replicated checkpoint-group certificate
 
@@ -173,15 +173,24 @@ and a 32-byte SHA-256 checksum. Its canonical fields are:
 | 144 | 24 | Truncated membership digest |
 
 The member bank begins at byte 168. At the maximum 60 members it ends at byte
-4008. Bytes 4008 through 4039 are required zero padding. The final
-authenticated tail before the checksum is:
+4008. The final authenticated tail before the checksum is:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
+| 4008 | 8 | Retention applied floor, or zero |
+| 4016 | 24 | Retention commitment, or zero |
 | 4040 | 8 | Maximum-span witness transaction |
 | 4048 | 8 | Maximum-span witness first applied index |
 | 4056 | 8 | Maximum-span witness last applied index |
 | 4064 | 32 | Slot checksum |
+
+A zero retention floor requires a zero commitment. A nonzero floor must not
+exceed the certificate applied cut and its commitment must equal the first 24
+bytes of SHA-256 over
+`vibedb/checkpoint-group/retention-seal/format-0\0`, the floor, marker ID, and
+the fixed seed and member-lineage digest. The commitment excludes mutable
+transaction, epoch, and maximum-span fields so every later certificate can
+revalidate and carry the exact seal unchanged.
 
 Encoded maximum span zero is the sole canonical representation of effective
 span one and requires all three witness fields to be zero. Encoded one is
@@ -198,6 +207,15 @@ applied cut and its last index must not exceed the selected applied cut. These
 rules prove that a newly advertised maximum came from one exact consecutive
 transaction rather than from an accumulation of singleton transactions.
 
+Every adjacent ordinary transaction certificate and marker rollover must
+retain the exact retention tuple. A same-cut, same-marker-epoch certificate may
+install or advance a retention floor only to its exact current applied cut with
+the canonical commitment above. The next same-cut certificate may mirror that
+exact nonzero tuple into the other slot. A zero-seal duplicate, changed or
+regressed seal, same-cut maximum-span change, or combined seal and span change
+is corruption. This successor grammar is shared by reopen and live two-slot
+qualification.
+
 Each member record binds the SHA-256 logical-name digest, store ID, and
 recovery-journal ID. The checksum is SHA-256 over the domain
 `vibedb/checkpoint-group/format-0\0` followed by every preceding byte in the
@@ -209,6 +227,51 @@ requires byte-for-byte canonical equality. A checksum-invalid newest slot may
 be a torn write and falls back to the other authenticated slot. A
 checksum-valid but noncanonical slot, wrong parity, or nonconsecutive history
 is corruption and never grants rollback authority.
+
+Every monotonic domain is independent and never wraps. Certificate sequence
+zero is noncanonical. At certificate sequence `2^64-1`, any checkpoint, marker
+rollover, seal, or recovery transition that requires a successor fails with
+`ErrCheckpointGroupSequence` before journal or marker Sync, certificate-slot
+writes, or owner mutation. An aligned mutation-terminal owner is different.
+After recovery has folded the authenticated member prefix and discarded every
+later suffix, it attaches the selected marker and certificate read-only without
+rewriting either one. Repeated opens therefore consume no successor. A new
+retention seal reserves both slot generations, plus any required checkpoint
+generation, before doing work. Mutation admission likewise retains its future
+certificate generation and reserves any worst-case pressure checkpoint and
+marker-rollover generations before invoking the update callback.
+
+The transaction marker has separate DCSN, epoch, and header recycle-count
+domains. DCSN successor zero is an exhausted append endpoint. Epoch or recycle
+count `2^64-1` remains a valid readable header while no rollover is required.
+A required rollover refuses before callback, replay, marker write, or Sync.
+The selected same-epoch marker has `Header.BaseSequence` equal to the
+certificate transaction base. The sole accepted transitional marker is one
+empty epoch ahead and has `Header.BaseSequence` equal to the certificate
+transaction high-water. Normal recovery reanchors the empty successor marker
+at that authenticated high-water before publishing its same-cut certificate,
+so scanned aborted decisions cannot launder their DCSN into owner lineage. If
+the old and authenticated bases are equal while an aborted suffix remains,
+recovery first zeroes and Syncs the aligned first-record sector. Only then does
+it publish and Sync the successor header. Either crash side therefore scans an
+empty suffix.
+
+Participant recovery journals have their own DCSN and header recycle count. A
+legal final DCSN `2^64-1` may still be certified and folded, leaving an empty
+`BaseSequence=2^64-1` journal whose next DCSN is the zero sentinel. Only a later
+append is refused. Recycling an already-empty journal to its existing base is
+an exact no-op and consumes neither a header generation nor a barrier. Any
+header-changing recycle or capacity growth reserves a nonzero recycle-count
+successor before changing file size, root state, or a header slot.
+
+Collection generations occupy the canonical 48-bit range `1..2^48-1`.
+Admission reserves the bounded topology-stage and journal-recycle budget of the
+largest permitted participant batch before callback execution. Recovery sums
+the atomic-stage and sequential-fallback generation budgets of every committed
+conditional record before replaying the first member. Exhaustion in any of
+these domains is reported as `ErrCheckpointGroupSequence`. It is never
+laundered into sequence zero, a torn-slot ambiguity, or a partially folded
+group.
 
 The certificate, rather than `txn.vtm`, is commit authority for this lane. It
 commits the consecutive conditional-journal prefix through its transaction

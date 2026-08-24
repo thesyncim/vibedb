@@ -1,9 +1,11 @@
 package storeio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -661,6 +663,73 @@ func TestRecoveryJournalGrowCapacityPreservesLivePrefix(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalGrowCapacityRecycleCountExhaustionIsSideEffectFree(t *testing.T) {
+	const initial = uint64(2 * RecoveryJournalMinSectorSize)
+	rj, path := createTestJournal(t, initial)
+	defer rj.Close()
+	appendPut(t, rj, 2, "a", "before")
+	rj.header.RecycleCount = ^uint64(0)
+
+	beforeBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader := rj.Header()
+	beforeCursor := rj.Cursor()
+	beforeSequence := rj.NextSequence()
+	beforeSlot := rj.headerSlot
+	writes := 0
+	syncs := 0
+	originalWriteAt := rj.writeAt
+	originalSync := rj.journalSync
+	originalDataSync := rj.journalDataSync
+	rj.writeAt = func(p []byte, off int64) (int, error) {
+		writes++
+		return originalWriteAt(p, off)
+	}
+	rj.journalSync = func(file *os.File) error {
+		syncs++
+		return originalSync(file)
+	}
+	rj.journalDataSync = func(file *os.File) error {
+		syncs++
+		return originalDataSync(file)
+	}
+
+	err = rj.GrowCapacity(4*RecoveryJournalMinSectorSize, true)
+	if !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("terminal GrowCapacity = %v, want ErrInvalidWrite", err)
+	}
+	afterBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writes != 0 || syncs != 0 {
+		t.Fatalf("terminal GrowCapacity issued writes=%d syncs=%d", writes, syncs)
+	}
+	if afterInfo.Size() != beforeInfo.Size() || !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatalf(
+			"terminal GrowCapacity changed file: size %d -> %d, bytesEqual=%t",
+			beforeInfo.Size(), afterInfo.Size(), bytes.Equal(afterBytes, beforeBytes),
+		)
+	}
+	if rj.Header() != beforeHeader || rj.Cursor() != beforeCursor ||
+		rj.NextSequence() != beforeSequence || rj.headerSlot != beforeSlot {
+		t.Fatalf(
+			"terminal GrowCapacity changed manager: header=%+v cursor=%d sequence=%d slot=%d",
+			rj.Header(), rj.Cursor(), rj.NextSequence(), rj.headerSlot,
+		)
+	}
+}
+
 func TestRecoveryJournalGrowCapacityCrashFallsBack(t *testing.T) {
 	const initial = uint64(4 * RecoveryJournalMinSectorSize)
 	rj, path := createTestJournal(t, initial)
@@ -758,6 +827,63 @@ func TestRecoveryJournalRecycleRequiresLiveGenerationCoverage(t *testing.T) {
 		t.Fatalf(
 			"covered recycle state: base=%d cursor=%d live-end=%d",
 			rj.BaseGeneration(), rj.Cursor(), rj.LiveEndGeneration(),
+		)
+	}
+}
+
+func TestRecoveryJournalExactRecycleNoOpAndTerminalRefusalAreSideEffectFree(t *testing.T) {
+	rj, path := createTestJournal(t, 8*RecoveryJournalMinSectorSize)
+	defer rj.Close()
+	fault := NewFaultJournal(rj)
+	beforeBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader := rj.Header()
+	beforeCursor := rj.Cursor()
+	beforeSequence := rj.NextSequence()
+	beforeSlot := rj.headerSlot
+	if err := rj.Recycle(rj.BaseGeneration(), true); err != nil {
+		t.Fatalf("exact clean recycle: %v", err)
+	}
+	if fault.Syncs() != 0 {
+		t.Fatalf("exact clean recycle issued %d syncs", fault.Syncs())
+	}
+	afterBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) || rj.Header() != beforeHeader ||
+		rj.Cursor() != beforeCursor || rj.NextSequence() != beforeSequence ||
+		rj.headerSlot != beforeSlot {
+		t.Fatalf(
+			"exact clean recycle changed state: header=%+v cursor=%d sequence=%d slot=%d bytes=%t",
+			rj.Header(), rj.Cursor(), rj.NextSequence(), rj.headerSlot,
+			bytes.Equal(afterBytes, beforeBytes),
+		)
+	}
+
+	// Exhaustion does not invalidate the already-exact target header. Advancing
+	// its base still requires a successor and must fail before any file action.
+	rj.header.RecycleCount = math.MaxUint64
+	terminalHeader := rj.Header()
+	if err := rj.Recycle(rj.BaseGeneration(), true); err != nil {
+		t.Fatalf("terminal exact clean recycle: %v", err)
+	}
+	if err := rj.Recycle(rj.BaseGeneration()+1, true); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("terminal advancing recycle = %v, want ErrInvalidWrite", err)
+	}
+	afterBytes, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fault.Syncs() != 0 || !bytes.Equal(afterBytes, beforeBytes) ||
+		rj.Header() != terminalHeader || rj.Cursor() != beforeCursor ||
+		rj.NextSequence() != beforeSequence || rj.headerSlot != beforeSlot {
+		t.Fatalf(
+			"terminal recycle changed state: syncs=%d header=%+v cursor=%d sequence=%d slot=%d bytes=%t",
+			fault.Syncs(), rj.Header(), rj.Cursor(), rj.NextSequence(),
+			rj.headerSlot, bytes.Equal(afterBytes, beforeBytes),
 		)
 	}
 }
