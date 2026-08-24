@@ -252,10 +252,25 @@ after the durable cut is already established.
 `AppliedIndex` is the newest reader-visible local transition.
 `CheckpointAppliedIndex` is the greatest certificate-backed contiguous cut and
 the only index currently exposed as safe input to Raft-WAL retention. They may
-differ between checkpoints. The repository does not yet compact or replace the
-Raft WAL from that input; a replacement must additionally bind the exact term,
-configuration state, member lineage, certificate witness, and retained log
-suffix before any old generation can be discarded.
+differ between checkpoints. The WAL can now capture one immutable selected
+current-slot cut and build a fully synced, strictly reopened compacted sibling
+around a newer snapshot base. Its generation seal binds the exact source file
+and cut, placement identity, topology epoch, snapshot term and configuration,
+checkpoint-retention commitment, HardState, and retained suffix. The sibling
+is not authority: no family manifest selects it, `Open` of the logical source
+path still selects the source, and no old generation is discarded. Activation
+must revalidate the live checkpoint witness and publish an authenticated family
+selection before reclamation can begin.
+
+The builder has a strict two-image disk budget and a sealed record/chunk heap
+budget: the live source and one deterministic preallocated stage may coexist.
+Replay authenticates every source record but projects only entries above the
+certified checkpoint base into the stage, so a large checkpointed prefix costs
+read/authentication bandwidth but no target write amplification. Historical
+HardState and the changing presence/term of the future base remain separate
+from the projected suffix until the exact final cut is proved. The
+per-generation build lease and deterministic stage name bound crash debris to
+one reclaimable image instead of an unbounded set of randomized WAL files.
 
 This lane is still part of the non-serving replication kernel. It does not yet
 provide RF3 request serving, Host-integrated peer transport, or acknowledged

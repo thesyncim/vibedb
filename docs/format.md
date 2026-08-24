@@ -309,6 +309,83 @@ authority: term, configuration state, member lineage, certificate witness, and
 the required retained suffix must also be bound. No ordinary replicated
 transition performs a local Sync.
 
+## Offline Raft-WAL generation candidate
+
+An open legacy Raft WAL can capture an authenticated selected-current cut and
+construct generation 1 at the deterministic sibling name
+`.vibedb-raft-<32 lowercase family hex>.g0000000000000001.wal`. The 128-bit
+family value hashes the logical source leaf and complete sealed member
+placement identity. Construction is serialized by the zero-length persistent
+`.build.lock` sibling. The sole full-size construction image is the exact
+deterministic `.stage` sibling. A retry takes the build lease, locks and removes
+an abandoned stage by inode identity, and syncs the directory before creating a
+replacement. A crash therefore cannot accumulate randomized preallocated
+files; at most one stage exists for the family/generation.
+
+The sibling uses the existing encrypted, preallocated WAL envelope with a newer
+immutable snapshot-base bootstrap record. Zero or more retained-entry records
+follow it. Each retained record contains a fixed 24-byte header and one to the
+ordinary Ready-entry limit of exact 32-byte entry headers plus their raw data.
+It has no Ready ID: Ready IDs identify one process-local node lifetime, not a
+durable log entry. Records are chunked by the sealed record bound, the ordinary
+Ready-entry bound, and a 4 MiB preferred plaintext target; one individually
+legal larger entry remains a single bounded record.
+
+Source replay authenticates and canonically decodes every record through the
+captured current-slot cut, but writes only the evolving suffix above the future
+checkpoint base. Historical HardState and full-log last index are tracked
+separately from that projection. The projected base term is allowed to be
+absent or change while historical Ready records truncate and regrow the future
+base; the final term, HardState, source bounds, and selected current slot must
+match exactly. Sequential suffix entries coalesce in memory, and conflicting
+uncommitted suffixes truncate the stage scratch in place. The checkpointed
+prefix is never encrypted or written into target scratch.
+
+Peak heap is explicitly bounded by one fixed 64 KiB sequential scan buffer,
+one sealed source-record ciphertext, its plaintext, one pending logical
+retained chunk (normally 4 MiB, or one legal larger entry), one retained
+plaintext encoding, one encrypted retained record, and
+`O(MaxReadyEntries)` scalar entry descriptors. Every byte component is also
+bounded by the sealed record/proposal limits. There is no source-sized entry
+arena or second scratch file. After the captured cut is proved, the builder
+uses exactly two ordered file durability barriers: the already-canonical
+projected record chain plus its terminal seal, then the new current slot.
+Finalization does not rewrite the retained records. An abandoned stage is
+never resumed as a candidate.
+
+Building still requires capacity for the authoritative source and one complete
+preallocated target WAL simultaneously: operators must reserve at least twice
+the sealed `MaxFileBytes`, plus filesystem metadata and operational free-space
+headroom. The target replaces that temporary headroom only after a later
+activation protocol makes reclamation safe.
+
+One fixed 440-byte generation seal terminates the offline image. The encrypted
+record chain and seal together bind:
+
+- family and generation;
+- complete member-identity digest;
+- source file ID, static-header digest, selected current generation, WAL end,
+  record count, record-chain digest, and node incarnation;
+- topology recovery epoch;
+- snapshot-base index, term, bootstrap digest, and stable ConfState digest;
+- the 32-byte checkpoint-retention witness commitment;
+- exact HardState;
+- retained first/last index, count, logical footprint, and semantic suffix
+  digest; and
+- the source first/last index and final binding digest.
+
+Decode requires canonical record order: bootstrap, retained-entry records,
+seal, then only Ready records from a strictly newer node incarnation. A retained
+suffix without its seal, a repeated or late seal, a source-incarnation reuse,
+or any mismatch with the authenticated current slot is corruption.
+
+This candidate name is not a family manifest and grants no serving, deletion,
+or replacement authority. Exact rebuild is idempotent; a different or corrupt
+occupant is never overwritten, and idempotent validation requires the seal to
+remain terminal (an independently advanced candidate is not the exact build
+result). The source logical path remains authoritative until a later
+authenticated activation protocol says otherwise.
+
 ## Database directory names
 
 The durable database encodes a logical collection name as:

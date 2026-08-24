@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -14,11 +15,21 @@ import (
 )
 
 const (
-	recordPrefixBytes         = 160
-	recordChecksumBytes       = 8
-	recordDamageGranule       = 4096
-	recordKindBootstrap uint8 = 1
-	recordKindReady     uint8 = 2
+	recordPrefixBytes           = 160
+	recordChecksumBytes         = 8
+	recordDamageGranule         = 4096
+	recordTagContextBytes       = 78
+	recordKindBootstrap   uint8 = 1
+	recordKindReady       uint8 = 2
+	// Retained-entry records carry exact Raft entries into an offline WAL
+	// generation. They deliberately have no ReadyID: Ready IDs belong to one
+	// process-local Node lifecycle and are not durable log identity.
+	recordKindRetainedEntries uint8 = 3
+	// A generation seal follows every retained-entry record and binds the
+	// complete compacted image to its source current slot and SQL retention
+	// commitment. Normal Ready records may follow only after activation and a
+	// fresh BeginIncarnation.
+	recordKindGenerationSeal uint8 = 4
 )
 
 var recordMagic = [8]byte{'V', 'D', 'B', 'R', 'R', 'E', 'C', 0}
@@ -44,6 +55,19 @@ type decodedRecord struct {
 	digest   [32]byte
 }
 
+type recordDecodeWorkspace struct {
+	aad        []byte
+	plaintext  []byte
+	crypto     objectCryptoWorkspace
+	tagContext [recordTagContextBytes]byte
+}
+
+func newRecordDecodeWorkspace(header headerState) recordDecodeWorkspace {
+	return recordDecodeWorkspace{
+		crypto: newObjectCryptoWorkspace(header.dataKey, header.nonceKey),
+	}
+}
+
 type readyPayload struct {
 	hard     *pb.HardState
 	entries  []*pb.Entry
@@ -51,7 +75,9 @@ type readyPayload struct {
 }
 
 func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint64, previous [32]byte, payload []byte, header headerState, options normalizedOptions) ([]byte, [32]byte, [12]byte, error) {
-	if (kind != recordKindBootstrap && kind != recordKindReady) || sequence == 0 || len(payload) == 0 {
+	if (kind != recordKindBootstrap && kind != recordKindReady &&
+		kind != recordKindRetainedEntries && kind != recordKindGenerationSeal) ||
+		sequence == 0 || len(payload) == 0 {
 		return nil, [32]byte{}, [12]byte{}, fmt.Errorf("%w: invalid record input", ErrInvalid)
 	}
 	if kind == recordKindBootstrap && (incarnation != 0 || readyID != 0 || flags != 0) {
@@ -59,6 +85,10 @@ func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint6
 	}
 	if kind == recordKindReady && (incarnation == 0 || readyID == 0 || flags&^uint8(1) != 0) {
 		return nil, [32]byte{}, [12]byte{}, fmt.Errorf("%w: invalid Ready envelope", ErrInvalid)
+	}
+	if (kind == recordKindRetainedEntries || kind == recordKindGenerationSeal) &&
+		(incarnation == 0 || readyID != 0 || flags != 0) {
+		return nil, [32]byte{}, [12]byte{}, fmt.Errorf("%w: invalid generation envelope", ErrInvalid)
 	}
 	cipherLength := len(payload) + 16
 	rawLength := recordPrefixBytes + len(header.keyID) + cipherLength + recordChecksumBytes
@@ -105,6 +135,18 @@ func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint6
 }
 
 func inspectRecordPrefix(prefix []byte, header headerState, options normalizedOptions) (recordEnvelope, error) {
+	return inspectRecordPrefixWithWorkspace(prefix, header, options, nil)
+}
+
+// inspectRecordPrefixWithWorkspace is the GenerationBuilder-only variant. Its
+// workspace owns mutable keyed HMAC state and therefore belongs to exactly one
+// sequential scanner.
+func inspectRecordPrefixWithWorkspace(
+	prefix []byte,
+	header headerState,
+	options normalizedOptions,
+	workspace *recordDecodeWorkspace,
+) (recordEnvelope, error) {
 	if len(prefix) != recordPrefixBytes || !bytes.Equal(prefix[0:8], recordMagic[:]) ||
 		binary.LittleEndian.Uint16(prefix[8:10]) != codecVersion || binary.LittleEndian.Uint16(prefix[12:14]) != recordPrefixBytes ||
 		binary.LittleEndian.Uint32(prefix[28:32]) != 0 || !allZero(prefix[148:160]) {
@@ -121,7 +163,9 @@ func inspectRecordPrefix(prefix []byte, header headerState, options normalizedOp
 	copy(envelope.payloadDigest[:], prefix[100:132])
 	copy(envelope.fileID[:], prefix[132:148])
 	keyLength := int(binary.LittleEndian.Uint16(prefix[14:16]))
-	if (envelope.kind != recordKindBootstrap && envelope.kind != recordKindReady) || envelope.flags&^uint8(1) != 0 ||
+	if (envelope.kind != recordKindBootstrap && envelope.kind != recordKindReady &&
+		envelope.kind != recordKindRetainedEntries && envelope.kind != recordKindGenerationSeal) ||
+		envelope.flags&^uint8(1) != 0 ||
 		envelope.sequence == 0 || envelope.fileID != header.fileID || keyLength != len(header.keyID) ||
 		envelope.plainLength <= 0 || envelope.cipherLength != envelope.plainLength+16 ||
 		envelope.total != alignRecordLength(recordPrefixBytes+keyLength+envelope.cipherLength+recordChecksumBytes) || envelope.total%recordDamageGranule != 0 ||
@@ -134,7 +178,21 @@ func inspectRecordPrefix(prefix []byte, header headerState, options normalizedOp
 	if envelope.kind == recordKindReady && (envelope.incarnation == 0 || envelope.readyID == 0) {
 		return recordEnvelope{}, fmt.Errorf("%w: Ready record identity", ErrCorrupt)
 	}
-	if envelope.nonce != deriveObjectNonce(header.nonceKey, "wal-record", envelope.sequence, envelope.payloadDigest) {
+	if (envelope.kind == recordKindRetainedEntries || envelope.kind == recordKindGenerationSeal) &&
+		(envelope.incarnation == 0 || envelope.readyID != 0 || envelope.flags != 0) {
+		return recordEnvelope{}, fmt.Errorf("%w: generation record identity", ErrCorrupt)
+	}
+	var wantNonce [12]byte
+	if workspace != nil && workspace.crypto.authMAC != nil {
+		wantNonce = workspace.crypto.deriveObjectNonce(
+			"wal-record", envelope.sequence, envelope.payloadDigest,
+		)
+	} else {
+		wantNonce = deriveObjectNonce(
+			header.nonceKey, "wal-record", envelope.sequence, envelope.payloadDigest,
+		)
+	}
+	if envelope.nonce != wantNonce {
 		return recordEnvelope{}, fmt.Errorf("%w: invalid record nonce", ErrCorrupt)
 	}
 	return envelope, nil
@@ -148,6 +206,19 @@ func unmarshalRecord(data []byte, header headerState, options normalizedOptions)
 	if err != nil {
 		return decodedRecord{}, err
 	}
+	return unmarshalInspectedRecord(data, envelope, header, nil)
+}
+
+// unmarshalInspectedRecord avoids re-parsing and re-deriving the authenticated
+// prefix when a bounded sequential scanner already inspected these exact
+// bytes. workspace is caller-owned and may be reused after the returned payload
+// is no longer referenced.
+func unmarshalInspectedRecord(
+	data []byte,
+	envelope recordEnvelope,
+	header headerState,
+	workspace *recordDecodeWorkspace,
+) (decodedRecord, error) {
 	if len(data) != envelope.total {
 		return decodedRecord{}, fmt.Errorf("%w: record length", ErrCorrupt)
 	}
@@ -155,7 +226,7 @@ func unmarshalRecord(data []byte, header headerState, options normalizedOptions)
 		return decodedRecord{}, fmt.Errorf("%w: record checksum", ErrCorrupt)
 	}
 	keyEnd := recordPrefixBytes + len(header.keyID)
-	if string(data[recordPrefixBytes:keyEnd]) != header.keyID {
+	if !bytes.Equal(data[recordPrefixBytes:keyEnd], []byte(header.keyID)) {
 		return decodedRecord{}, fmt.Errorf("%w: record key ID", ErrKeyMismatch)
 	}
 	cipherEnd := keyEnd + envelope.cipherLength
@@ -163,19 +234,70 @@ func unmarshalRecord(data []byte, header headerState, options normalizedOptions)
 	if !allZero(padding) {
 		return decodedRecord{}, fmt.Errorf("%w: record padding", ErrCorrupt)
 	}
-	aad := make([]byte, 0, keyEnd+len(header.headerDigest)+len(padding))
+	aadCapacity := keyEnd + len(header.headerDigest) + len(padding)
+	var aad []byte
+	if workspace == nil {
+		aad = make([]byte, 0, aadCapacity)
+	} else {
+		if cap(workspace.aad) < aadCapacity {
+			clear(workspace.aad[:cap(workspace.aad)])
+			workspace.aad = make([]byte, 0, aadCapacity)
+		} else {
+			workspace.aad = workspace.aad[:0]
+		}
+		aad = workspace.aad
+	}
 	aad = append(aad, data[:keyEnd]...)
 	aad = append(aad, header.headerDigest[:]...)
 	aad = append(aad, padding...)
-	aead, err := makeObjectAEAD(header.dataKey, "wal-record", envelope.sequence, envelope.payloadDigest)
+	if workspace != nil {
+		workspace.aad = aad
+	}
+	var aead cipher.AEAD
+	var err error
+	if workspace != nil && workspace.crypto.objectKeyMAC != nil {
+		derived := workspace.crypto.deriveObjectKey(
+			"wal-record", envelope.sequence, envelope.payloadDigest,
+		)
+		aead, err = makeObjectAEADFromKey(derived)
+	} else {
+		aead, err = makeObjectAEAD(
+			header.dataKey, "wal-record", envelope.sequence, envelope.payloadDigest,
+		)
+	}
 	if err != nil {
 		return decodedRecord{}, err
 	}
-	plaintext, err := aead.Open(nil, envelope.nonce[:], data[keyEnd:cipherEnd], aad)
+	var destination []byte
+	if workspace != nil {
+		if cap(workspace.plaintext) < envelope.plainLength {
+			clear(workspace.plaintext[:cap(workspace.plaintext)])
+			workspace.plaintext = make([]byte, 0, envelope.plainLength)
+		} else {
+			workspace.plaintext = workspace.plaintext[:0]
+		}
+		destination = workspace.plaintext
+	}
+	plaintext, err := aead.Open(destination, envelope.nonce[:], data[keyEnd:cipherEnd], aad)
 	if err != nil {
 		return decodedRecord{}, errors.Join(ErrKeyMismatch, ErrCorrupt, fmt.Errorf("authenticate record: %w", err))
 	}
-	if len(plaintext) != envelope.plainLength || makeObjectTag(header.nonceKey, "wal-record", envelope.sequence, recordTagContext(envelope), plaintext) != envelope.payloadDigest {
+	if workspace != nil {
+		workspace.plaintext = plaintext
+	}
+	var payloadDigest [sha256.Size]byte
+	if workspace != nil && workspace.crypto.authMAC != nil {
+		payloadDigest = workspace.crypto.makeObjectTag(
+			"wal-record", envelope.sequence,
+			putRecordTagContext(&workspace.tagContext, envelope), plaintext,
+		)
+	} else {
+		payloadDigest = makeObjectTag(
+			header.nonceKey, "wal-record", envelope.sequence,
+			recordTagContext(envelope), plaintext,
+		)
+	}
+	if len(plaintext) != envelope.plainLength || payloadDigest != envelope.payloadDigest {
 		return decodedRecord{}, fmt.Errorf("%w: record payload digest", ErrCorrupt)
 	}
 	return decodedRecord{envelope: envelope, payload: plaintext, digest: sha256.Sum256(data)}, nil
@@ -220,6 +342,21 @@ func marshalReadyPayload(batch raftmodel.PersistBatch) ([]byte, error) {
 }
 
 func unmarshalReadyPayload(data []byte, options normalizedOptions) (readyPayload, error) {
+	return unmarshalReadyPayloadMode(data, options, true)
+}
+
+// unmarshalReadyPayloadView is the bounded-replay variant used while building
+// an offline generation. Entry data aliases data and is valid only until the
+// caller releases that authenticated record buffer.
+func unmarshalReadyPayloadView(data []byte, options normalizedOptions) (readyPayload, error) {
+	return unmarshalReadyPayloadMode(data, options, false)
+}
+
+func unmarshalReadyPayloadMode(
+	data []byte,
+	options normalizedOptions,
+	detach bool,
+) (readyPayload, error) {
 	reader := decoder{data: data}
 	version, err := reader.u16()
 	if err != nil || version != codecVersion {
@@ -296,7 +433,14 @@ func unmarshalReadyPayload(data []byte, options normalizedOptions) (readyPayload
 			return readyPayload{}, decodeErr
 		}
 		typeValue := pb.EntryType(entryType)
-		result.entries[position] = &pb.Entry{Type: entryTypePointer(typeValue), Term: uint64Pointer(entryTerm), Index: uint64Pointer(entryIndex), Data: append([]byte(nil), payload...)}
+		entryData := payload
+		if detach {
+			entryData = append([]byte(nil), payload...)
+		}
+		result.entries[position] = &pb.Entry{
+			Type: entryTypePointer(typeValue), Term: uint64Pointer(entryTerm),
+			Index: uint64Pointer(entryIndex), Data: entryData,
+		}
 		totalData += int64(dataLength)
 	}
 	if err := reader.done(); err != nil {
@@ -328,14 +472,22 @@ func alignRecordLength(length int) int {
 }
 
 func recordTagContext(envelope recordEnvelope) []byte {
-	result := make([]byte, 0, 92)
-	result = append(result, envelope.kind, envelope.flags)
-	result = appendUint32(result, uint32(envelope.total))
-	result = appendUint32(result, uint32(envelope.plainLength))
-	result = appendUint32(result, uint32(envelope.cipherLength))
-	result = appendUint64(result, envelope.incarnation)
-	result = appendUint64(result, envelope.readyID)
-	result = append(result, envelope.previous[:]...)
-	result = append(result, envelope.fileID[:]...)
-	return result
+	var result [recordTagContextBytes]byte
+	return append([]byte(nil), putRecordTagContext(&result, envelope)...)
+}
+
+func putRecordTagContext(
+	destination *[recordTagContextBytes]byte,
+	envelope recordEnvelope,
+) []byte {
+	destination[0] = envelope.kind
+	destination[1] = envelope.flags
+	binary.LittleEndian.PutUint32(destination[2:6], uint32(envelope.total))
+	binary.LittleEndian.PutUint32(destination[6:10], uint32(envelope.plainLength))
+	binary.LittleEndian.PutUint32(destination[10:14], uint32(envelope.cipherLength))
+	binary.LittleEndian.PutUint64(destination[14:22], envelope.incarnation)
+	binary.LittleEndian.PutUint64(destination[22:30], envelope.readyID)
+	copy(destination[30:62], envelope.previous[:])
+	copy(destination[62:78], envelope.fileID[:])
+	return destination[:]
 }

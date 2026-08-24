@@ -35,10 +35,11 @@ type Store struct {
 	fileInfo      os.FileInfo
 	locked        bool
 
-	options normalizedOptions
-	header  headerState
-	current currentState
-	image   logImage
+	options    normalizedOptions
+	header     headerState
+	current    currentState
+	image      logImage
+	generation generationRecovery
 
 	poisoned             error
 	poisonUnknown        bool
@@ -296,7 +297,7 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 		cleanup()
 		return nil, err
 	}
-	image, err := recoverRecords(file, &header, current, normalized)
+	image, generation, err := recoverRecords(file, &header, current, normalized)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -325,7 +326,7 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 	store := &Store{
 		path: absPath, parentPath: parentPath, base: base, root: root, directoryInfo: directoryInfo,
 		file: file, fileInfo: fileInfo, locked: true, options: normalized, header: header,
-		current: current, image: image, recoveredTornSlot: recoveredTorn,
+		current: current, image: image, generation: generation, recoveredTornSlot: recoveredTorn,
 	}
 	keepRoot = true
 	return store, nil

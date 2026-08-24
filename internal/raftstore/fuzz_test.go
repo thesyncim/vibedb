@@ -1,6 +1,10 @@
 package raftstore
 
-import "testing"
+import (
+	"testing"
+
+	pb "go.etcd.io/raft/v3/raftpb"
+)
 
 func FuzzRecordDecoderFailsClosed(f *testing.F) {
 	options, err := normalizeOptions(testFormatOptions())
@@ -37,6 +41,38 @@ func FuzzCurrentSlotDecoderFailsClosed(f *testing.F) {
 	f.Add(seed)
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = unmarshalCurrentSlot(data, 0, header)
+	})
+}
+
+func FuzzGenerationSealDecoderFailsClosed(f *testing.F) {
+	_, _, _, builder := prepareGenerationSource(f)
+	if _, err := builder.Build(); err != nil {
+		f.Fatal(err)
+	}
+	seed, err := marshalGenerationSeal(builder.seal)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = unmarshalGenerationSeal(data)
+	})
+}
+
+func FuzzRetainedEntryDecoderFailsClosed(f *testing.F) {
+	options, err := normalizeOptions(testOptions())
+	if err != nil {
+		f.Fatal(err)
+	}
+	seed, err := marshalRetainedEntries([]*pb.Entry{
+		entry(2, 2, "retained-seed"),
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = unmarshalRetainedEntries(data, options)
 	})
 }
 
