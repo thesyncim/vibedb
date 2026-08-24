@@ -3,6 +3,8 @@ package query
 import (
 	"math"
 	"testing"
+
+	"github.com/thesyncim/vibejson"
 )
 
 func TestNumberLiteralUsesExactJSONNumberGrammar(t *testing.T) {
@@ -23,6 +25,22 @@ func TestNumberLiteralUsesExactJSONNumberGrammar(t *testing.T) {
 		if _, err := compiler.numberLiteral(spelling); err != nil {
 			t.Errorf("Number(%q): %v", spelling, err)
 		}
+	}
+}
+
+func TestRawNumberLiteralUsesBorrowedExactSpelling(t *testing.T) {
+	var compiler compiler
+	defer compiler.release()
+
+	literal, err := compiler.makeLiteral(vibejson.RawValue{Src: []byte("9007199254740993")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if literal.kind != kindNumber || string(literal.num) != "9007199254740993" {
+		t.Fatalf("literal = %#v, want exact numeric spelling", literal)
+	}
+	if _, err := compiler.makeLiteral(vibejson.RawValue{Src: []byte("01")}); err == nil {
+		t.Fatal("invalid raw JSON number compiled")
 	}
 }
 

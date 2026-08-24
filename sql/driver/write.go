@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
-	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -1508,8 +1507,6 @@ func flatScalarEncodedCapacity(value any, limit uint64) (uint64, error) {
 		return flatJSONStringEncodedBytes(byteview.String(value), limit)
 	case query.Number:
 		encoded = uint64(len(value))
-	case stdjson.Number:
-		encoded = uint64(len(value))
 	case vibejson.RawValue:
 		raw, ok := value.NumberBytes()
 		if !ok {
@@ -1560,8 +1557,8 @@ func addFlatEncodedBytes(total *uint64, additional, limit uint64) bool {
 }
 
 // flatJSONStringEncodedBytes validates UTF-8 and returns the exact byte count
-// emitted by TrustedAppender.String under encoding/json-compatible HTML
-// escaping. One scanner pass therefore replaces a separate validation pass and
+// emitted by TrustedAppender.String under HTML-safe JSON escaping. One scanner
+// pass therefore replaces a separate validation pass and
 // a conservative capacity guess.
 func flatJSONStringEncodedBytes(value string, limit uint64) (uint64, error) {
 	encoded := uint64(2)
@@ -1660,8 +1657,6 @@ func appendFlatInsertScalar(
 	case []byte:
 		return w.String(byteview.String(value)), nil
 	case query.Number:
-		return appendFlatInsertNumber(w, byteview.Bytes(string(value)))
-	case stdjson.Number:
 		return appendFlatInsertNumber(w, byteview.Bytes(string(value)))
 	case vibejson.RawValue:
 		// RawValue is the zero-copy exact-number carrier accepted by the SQL
@@ -1774,7 +1769,7 @@ func operandValueWithUTF8(
 					"vibedb: a flat INSERT string must be valid UTF-8")
 			}
 			return arg, nil
-		case query.Number, stdjson.Number:
+		case query.Number:
 			return arg, nil
 		case vibejson.RawValue:
 			if _, ok := value.NumberBytes(); !ok {
