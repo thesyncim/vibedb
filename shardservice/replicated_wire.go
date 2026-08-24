@@ -1,8 +1,10 @@
 package shardservice
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -107,6 +109,34 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		return e.err
 	}
 	return writeEncodedFrame(w, tagReplicatedRequest, e.b)
+}
+
+// EncodeReplicatedRequestVectored emits the fixed request prefix and borrows
+// the immutable canonical command as a second write vector. TCP connections
+// use writev, avoiding a command-sized copy and allocation on every retry.
+func EncodeReplicatedRequestVectored(w io.Writer, request *ReplicatedRequest) error {
+	if w == nil || !validReplicatedRequest(request) {
+		return ErrReplicatedWire
+	}
+	e := newFrameEncoder(0)
+	e.u8(replicatedWireVersion)
+	e.u8(uint8(request.Operation))
+	encodeReplicatedFence(&e, request.Fence)
+	e.u32(uint32(len(request.Command)))
+	if e.err != nil || len(e.b)+len(request.Command)-5 > maxFrameBody {
+		return errFrameTooLarge
+	}
+	e.b[0] = tagReplicatedRequest
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(request.Command)-1))
+	buffers := net.Buffers{e.b}
+	if len(request.Command) != 0 {
+		buffers = append(buffers, request.Command)
+	}
+	written, err := buffers.WriteTo(w)
+	if err == nil && written != int64(len(e.b)+len(request.Command)) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // DecodeReplicatedRequest decodes and validates one bounded native request.

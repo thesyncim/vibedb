@@ -3,6 +3,7 @@ package shardservice
 import (
 	"bytes"
 	"crypto/sha256"
+	"io"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -10,6 +11,30 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
+
+func BenchmarkReplicatedRequestEncodingOneMiB(b *testing.B) {
+	fence := testReplicatedFence()
+	request := &ReplicatedRequest{Operation: ReplicatedPropose, Fence: fence,
+		Command: testReplicatedCommandValue(b, fence, bytes.Repeat([]byte{'x'}, 1<<20))}
+	b.Run("contiguous", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(request.Command)))
+		for index := 0; index < b.N; index++ {
+			if err := EncodeReplicatedRequest(io.Discard, request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("vectored", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(request.Command)))
+		for index := 0; index < b.N; index++ {
+			if err := EncodeReplicatedRequestVectored(io.Discard, request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
 
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
@@ -23,6 +48,13 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		var encoded bytes.Buffer
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
 			t.Fatal(err)
+		}
+		var vectored bytes.Buffer
+		if err := EncodeReplicatedRequestVectored(&vectored, request); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(vectored.Bytes(), encoded.Bytes()) {
+			t.Fatal("vectored request differs from canonical contiguous frame")
 		}
 		decoded, err := DecodeReplicatedRequest(&encoded)
 		if err != nil {
@@ -222,6 +254,10 @@ func testReplicatedFence() ReplicatedFence {
 }
 
 func testReplicatedCommand(t testing.TB, fence ReplicatedFence) []byte {
+	return testReplicatedCommandValue(t, fence, []byte(`{"id":1}`))
+}
+
+func testReplicatedCommandValue(t testing.TB, fence ReplicatedFence, value []byte) []byte {
 	t.Helper()
 	command := replication.Command{
 		ClusterID:             fence.Group.ClusterID,
@@ -237,7 +273,7 @@ func testReplicatedCommand(t testing.TB, fence ReplicatedFence) []byte {
 		Fingerprint: sha256.Sum256([]byte("native-wire")),
 		Batches: []replication.RelationMutationBatch{{Relation: 1,
 			Mutations: []replication.Mutation{{Kind: replication.MutationPut,
-				Key: []byte{1}, Value: []byte(`{"id":1}`)}}}},
+				Key: []byte{1}, Value: value}}}},
 	}
 	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
