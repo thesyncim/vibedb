@@ -135,6 +135,39 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 	}
 }
 
+func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
+	fence := testReplicatedFence()
+	request := &ReplicatedRequest{
+		Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+		Key: []byte{0, 1, 2}, MinimumApplied: 17, MaxValueBytes: 4096,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil || decoded.Operation != request.Operation || decoded.Fence != fence ||
+		decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+		decoded.MinimumApplied != request.MinimumApplied || decoded.MaxValueBytes != request.MaxValueBytes {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+	state := ReplicatedMemberState{Fence: fence, LeaderID: 9, Commit: 21, Applied: 20,
+		CheckpointApplied: 19}
+	for _, response := range []*ReplicatedResponse{
+		{Kind: ReplicatedReadFound, HasState: true, State: state, ReadApplied: 20, Value: []byte{}},
+		{Kind: ReplicatedReadMissing, HasState: true, State: state, ReadApplied: 20},
+	} {
+		encoded.Reset()
+		if err := EncodeReplicatedResponse(&encoded, response); err != nil {
+			t.Fatal(err)
+		}
+		got, decodeErr := DecodeReplicatedResponse(bytes.NewReader(encoded.Bytes()))
+		if decodeErr != nil || got.Kind != response.Kind || got.ReadApplied != 20 || len(got.Value) != 0 {
+			t.Fatalf("response=%+v err=%v", got, decodeErr)
+		}
+	}
+}
+
 func FuzzReplicatedNativeRequestCanonical(f *testing.F) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(f, fence)

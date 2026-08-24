@@ -19,6 +19,8 @@ type fakeReplicatedOwner struct {
 	result      raftservice.Result
 	err         error
 	blockSubmit bool
+	readResult  raftservice.PointReadResult
+	readErr     error
 }
 
 func (owner *fakeReplicatedOwner) Probe(
@@ -38,6 +40,47 @@ func (owner *fakeReplicatedOwner) SubmitOwned(
 		return raftservice.Result{}, context.Cause(ctx)
 	}
 	return owner.result, owner.err
+}
+
+func (owner *fakeReplicatedOwner) ReadPoint(
+	context.Context,
+	raftservice.PointReadRequest,
+) (raftservice.PointReadResult, error) {
+	return owner.readResult, owner.readErr
+}
+
+func testReplicatedServingState() raftservice.ServingState {
+	fence := testReplicatedFence()
+	return raftservice.ServingState{
+		Identity: raftmember.RuntimeIdentity{Group: fence.Group,
+			AllocationGeneration: fence.AllocationGeneration, MemberID: fence.MemberID,
+			StoreID: fence.StoreID, NodeIncarnation: fence.NodeIncarnation},
+		Command: fence.Command,
+		Status: raftmember.RuntimeStatus{MemberID: fence.MemberID, LeaderID: fence.MemberID,
+			Term: fence.Term, Commit: 11, Applied: 11, CheckpointApplied: 10},
+	}
+}
+
+func TestReplicatedServerServesFoundEmptyReadWithoutConflatingMiss(t *testing.T) {
+	state := testReplicatedServingState()
+	owner := &fakeReplicatedOwner{state: state, readResult: raftservice.PointReadResult{
+		Applied: 11, Found: true, Value: []byte{},
+	}}
+	server := &ReplicatedServer{owner: owner}
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
+		Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
+		MinimumApplied: 10, MaxValueBytes: 1024}
+	response := server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedReadFound || response.ReadApplied != 11 ||
+		len(response.Value) != 0 || !validReplicatedResponse(response) {
+		t.Fatalf("response=%+v", response)
+	}
+	owner.readResult.Found = false
+	response = server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 11 ||
+		!validReplicatedResponse(response) {
+		t.Fatalf("miss response=%+v", response)
+	}
 }
 
 func testReplicatedServer(owner replicatedOwner) *ReplicatedServer {

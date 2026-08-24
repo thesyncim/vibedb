@@ -88,6 +88,83 @@ func TestReplicatedExecutorFollowsLeaderAndRetriesExactBytesAfterUnknown(t *test
 	}
 }
 
+type pointReadClient struct {
+	states        map[string]shardservice.ReplicatedMemberState
+	readAddress   string
+	readOperation shardservice.ReplicatedOperation
+}
+
+func (client *pointReadClient) DoReplicated(
+	_ context.Context,
+	address string,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: state}, nil
+	}
+	client.readAddress, client.readOperation = address, request.Operation
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadFound,
+		HasState: true, State: state, ReadApplied: state.Applied,
+		Value: []byte{}}, nil
+}
+
+func TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	for address, state := range states {
+		state.Applied, state.Commit, state.CheckpointApplied = 10, 10, 9
+		states[address] = state
+	}
+	executor, err := NewReplicatedExecutor(&pointReadClient{states: states}, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	followerClient := executor.client.(*pointReadClient)
+	result, err := executor.ReadPoint(context.Background(), route, ReplicatedPointRead{
+		Relation: 1, Key: []byte{0, 1}, MinimumApplied: 9,
+		MaxValueBytes: 1024,
+	})
+	if err != nil || !result.Found || result.Applied != 10 ||
+		followerClient.readAddress != "m1" ||
+		followerClient.readOperation != shardservice.ReplicatedReadFollower {
+		t.Fatalf("follower result=%+v address=%q op=%d err=%v",
+			result, followerClient.readAddress, followerClient.readOperation, err)
+	}
+	leaderClient := &pointReadClient{states: states}
+	executor.client = leaderClient
+	result, err = executor.ReadPoint(context.Background(), route, ReplicatedPointRead{
+		Relation: 1, Key: []byte{0, 1}, MinimumApplied: 9,
+		MaxValueBytes: 1024, Linearizable: true,
+	})
+	if err != nil || leaderClient.readAddress != "m2" ||
+		leaderClient.readOperation != shardservice.ReplicatedReadLeader {
+		t.Fatalf("leader result=%+v address=%q op=%d err=%v",
+			result, leaderClient.readAddress, leaderClient.readOperation, err)
+	}
+}
+
+func BenchmarkReplicatedPointReadAppliedFollower(b *testing.B) {
+	route, _, states := testReplicatedRouteCommand(b)
+	for address, state := range states {
+		state.Applied, state.Commit, state.CheckpointApplied = 10, 10, 9
+		states[address] = state
+	}
+	client := &pointReadClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		b.Fatal(err)
+	}
+	read := ReplicatedPointRead{Relation: 1, Key: []byte{0, 1}, MinimumApplied: 9,
+		MaxValueBytes: 1024}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := executor.ReadPoint(context.Background(), route, read); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 type failingReplicatedClient struct {
 	state   shardservice.ReplicatedMemberState
 	command []byte

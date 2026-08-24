@@ -21,9 +21,10 @@ const (
 )
 
 var (
-	ErrReplicatedRoute  = errors.New("gateway: invalid replicated shard route")
-	ErrReplicatedLeader = errors.New("gateway: replicated shard has no reachable leader")
-	ErrReplicatedDial   = errors.New("gateway: replicated shard dial is not configured")
+	ErrReplicatedRoute      = errors.New("gateway: invalid replicated shard route")
+	ErrReplicatedLeader     = errors.New("gateway: replicated shard has no reachable leader")
+	ErrReplicatedDial       = errors.New("gateway: replicated shard dial is not configured")
+	ErrReplicatedReadBehind = errors.New("gateway: replica is below the requested applied index")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -108,6 +109,135 @@ type ReplicatedResult struct {
 	Retries    int
 }
 
+// ReplicatedPointRead selects one explicit consistency contract. A
+// linearizable read is leader-only and ReadIndex-fenced. A follower read is
+// bounded solely by MinimumApplied and may fall back to any replica that has
+// reached that index.
+type ReplicatedPointRead struct {
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  uint32
+	Linearizable   bool
+}
+
+type ReplicatedPointResult struct {
+	Applied uint64
+	Found   bool
+	Value   []byte
+	State   shardservice.ReplicatedMemberState
+	Retries int
+}
+
+func (executor *ReplicatedExecutor) ReadPoint(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedPointRead,
+) (ReplicatedPointResult, error) {
+	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
+		read.Relation == 0 || read.Relation > replication.MaxRelationID ||
+		len(read.Key) == 0 || len(read.Key) > replication.MaxMutationKeyBytes ||
+		read.MinimumApplied == 0 || read.MaxValueBytes == 0 ||
+		read.MaxValueBytes > replication.MaxMutationValueBytes {
+		return ReplicatedPointResult{}, ErrReplicatedRoute
+	}
+	preferred := route.Replicas[0].Member
+	var joined error
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		endpoint, state, err := executor.readEndpoint(ctx, route, preferred, read)
+		if err != nil {
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		operation := shardservice.ReplicatedReadFollower
+		if read.Linearizable {
+			operation = shardservice.ReplicatedReadLeader
+		}
+		response, err := executor.doReplicated(ctx, endpoint.Address, &shardservice.ReplicatedRequest{
+			Operation: operation, Fence: state.Fence, Relation: read.Relation,
+			Key: read.Key, MinimumApplied: read.MinimumApplied, MaxValueBytes: read.MaxValueBytes,
+		})
+		if err != nil {
+			joined = errors.Join(joined, err)
+			preferred = 0
+			continue
+		}
+		if !validReplicatedResponseState(response) ||
+			response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.Command != route.Command ||
+			response.State.Fence.MemberID != endpoint.Member {
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+			continue
+		}
+		switch response.Kind {
+		case shardservice.ReplicatedReadFound, shardservice.ReplicatedReadMissing:
+			if response.Refusal != shardservice.ReplicatedRefusalNone ||
+				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
+				response.ReadApplied < read.MinimumApplied ||
+				response.State.Applied < response.ReadApplied ||
+				len(response.Value) > int(read.MaxValueBytes) ||
+				(response.Kind == shardservice.ReplicatedReadMissing && len(response.Value) != 0) {
+				joined = errors.Join(joined, ErrReplicatedRoute)
+				continue
+			}
+			return ReplicatedPointResult{Applied: response.ReadApplied,
+				Found: response.Kind == shardservice.ReplicatedReadFound,
+				Value: response.Value, State: response.State, Retries: attempt}, nil
+		case shardservice.ReplicatedNotLeader:
+			preferred = response.State.LeaderID
+			joined = errors.Join(joined, raftmodel.ErrNotLeader)
+		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+		default:
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			preferred = 0
+		}
+	}
+	return ReplicatedPointResult{}, errors.Join(ErrReplicatedLeader, joined)
+}
+
+func (executor *ReplicatedExecutor) readEndpoint(
+	ctx context.Context,
+	route ReplicatedRoute,
+	preferred uint64,
+	read ReplicatedPointRead,
+) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	if read.Linearizable {
+		return executor.discoverLeader(ctx, route, preferred)
+	}
+	// Applied-bounded reads deliberately prefer followers to preserve leader
+	// capacity. Every candidate is authenticated by a fresh exact probe.
+	var joined error
+	for _, endpoint := range route.Replicas {
+		response, err := executor.doReplicated(ctx, endpoint.Address, &shardservice.ReplicatedRequest{
+			Operation: shardservice.ReplicatedProbe,
+			Fence: shardservice.ReplicatedFence{Group: route.Group,
+				AllocationGeneration: route.AllocationGeneration},
+		})
+		if err != nil || response == nil || response.Kind != shardservice.ReplicatedHandshake ||
+			!validReplicatedResponseState(response) || response.State.Fence.MemberID != endpoint.Member ||
+			response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.Command != route.Command {
+			joined = errors.Join(joined, err, ErrReplicatedRoute)
+			continue
+		}
+		if response.State.Applied >= read.MinimumApplied &&
+			response.State.Fence.MemberID != response.State.LeaderID {
+			return endpoint, response.State, nil
+		}
+	}
+	// A leader is also a valid index-bounded replica.
+	return executor.discoverLeader(ctx, route, preferred)
+}
+
 // ReplicatedRefusalError preserves one typed shard refusal.
 type ReplicatedRefusalError struct {
 	Code    shardservice.ReplicatedRefusalCode
@@ -130,6 +260,9 @@ func (e *ReplicatedRefusalError) Unwrap() error {
 	}
 	if e.Code == shardservice.ReplicatedRefusalProposalRefused {
 		return raftserve.ErrProposalRefused
+	}
+	if e.Code == shardservice.ReplicatedRefusalReadBehind {
+		return ErrReplicatedReadBehind
 	}
 	return ErrReplicatedLeader
 }
@@ -428,7 +561,8 @@ func validReplicatedPreAdmissionRefusal(
 	case shardservice.ReplicatedRefusalStaleFence,
 		shardservice.ReplicatedRefusalAdmissionBound,
 		shardservice.ReplicatedRefusalProposalRefused,
-		shardservice.ReplicatedRefusalUnavailable:
+		shardservice.ReplicatedRefusalUnavailable,
+		shardservice.ReplicatedRefusalReadBehind:
 		return true
 	default:
 		return false

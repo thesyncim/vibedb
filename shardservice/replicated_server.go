@@ -13,11 +13,13 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
+	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, error)
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
@@ -239,6 +241,53 @@ func (server *ReplicatedServer) executeReplicated(
 	}
 	if request.Operation == ReplicatedProbe {
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
+	}
+	if request.Operation == ReplicatedReadLeader || request.Operation == ReplicatedReadFollower {
+		result, readErr := server.owner.ReadPoint(ctx, raftservice.PointReadRequest{
+			Fence: raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+				Term: request.Fence.Term,
+			},
+			Relation: request.Relation, Key: request.Key,
+			MinimumApplied: request.MinimumApplied, MaxValueBytes: int(request.MaxValueBytes),
+			Linearizable: request.Operation == ReplicatedReadLeader,
+		})
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if readErr == nil {
+			kind := ReplicatedReadMissing
+			if result.Found {
+				kind = ReplicatedReadFound
+			}
+			response := &ReplicatedResponse{Kind: kind, HasState: true, State: wireState,
+				ReadApplied: result.Applied, Value: result.Value}
+			if validReplicatedResponse(response) {
+				return response
+			}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+				HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(readErr, raftmodel.ErrNotLeader),
+			errors.Is(readErr, raftmodel.ErrReadLeadershipLost):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingFence):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBehind):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrIngressFull),
+			errors.Is(readErr, raftservice.ErrPendingReadsFull):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,
+				HasState: true, State: wireState}
+		default:
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+				HasState: true, State: wireState}
+		}
 	}
 
 	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
