@@ -127,13 +127,22 @@ func TestServingHostTerminalSettlementFailureCanCloseRealRuntime(t *testing.T) {
 	want := errors.New("terminal serving settlement failure")
 	var admissions []multiraft.ProposalAdmission
 	var terminations []multiraft.ProposalGroupTermination
+	clientSettlements := 0
 	host, err := multiraft.NewHostWithServingSinks(
 		testServingHostLimits(), multiraft.ServingSinks{
 			Settle: func(
-				raftmember.AppliedSourceOwner,
-				raftmember.AppliedSourceToken,
-				raftmember.AppliedBatch,
+				_ raftmember.AppliedSourceOwner,
+				_ raftmember.AppliedSourceToken,
+				batch raftmember.AppliedBatch,
 			) error {
+				hasCommand, scanErr := servingBatchHasClientCommand(batch)
+				if scanErr != nil {
+					return scanErr
+				}
+				if !hasCommand {
+					return nil
+				}
+				clientSettlements++
 				return want
 			},
 			Proposals: func(admission multiraft.ProposalAdmission) {
@@ -199,6 +208,9 @@ func TestServingHostTerminalSettlementFailureCanCloseRealRuntime(t *testing.T) {
 	if !faulted {
 		t.Fatal("Host did not surface terminal settlement failure")
 	}
+	if clientSettlements != 1 {
+		t.Fatalf("terminal client settlements = %d, want 1", clientSettlements)
+	}
 	if len(admissions) != 0 || len(terminations) != 1 ||
 		terminations[0].Group != group ||
 		terminations[0].Reason != multiraft.ProposalGroupFaulted {
@@ -219,9 +231,18 @@ func TestServingHostRetryableSettlementStillBlocksCloseUntilRealRetry(t *testing
 	group := runtime.Identity().Group
 	want := errors.New("retryable serving settlement failure")
 	retry := true
+	clientSettlements := 0
 	host, err := multiraft.NewHostWithResultSettlementSink(
 		testServingHostLimits(),
-		func(raftmember.AppliedBatch) error {
+		func(batch raftmember.AppliedBatch) error {
+			hasCommand, scanErr := servingBatchHasClientCommand(batch)
+			if scanErr != nil {
+				return scanErr
+			}
+			if !hasCommand {
+				return nil
+			}
+			clientSettlements++
 			if retry {
 				return raftmember.RetryResultSettlement(want)
 			}
@@ -268,6 +289,9 @@ func TestServingHostRetryableSettlementStillBlocksCloseUntilRealRetry(t *testing
 	if !rejected {
 		t.Fatal("Host did not surface retryable settlement failure")
 	}
+	if clientSettlements != 1 {
+		t.Fatalf("rejected client settlements = %d, want 1", clientSettlements)
+	}
 	if err := host.Close(); !errors.Is(err, multiraft.ErrGroupBusy) ||
 		!errors.Is(err, raftmember.ErrResultSettlementPending) {
 		t.Fatalf("Host close during retryable settlement = %v", err)
@@ -277,10 +301,29 @@ func TestServingHostRetryableSettlementStillBlocksCloseUntilRealRetry(t *testing
 	}
 	retry = false
 	driveServingHostIdle(t, host)
+	if clientSettlements != 2 {
+		t.Fatalf("retried client settlements = %d, want 2", clientSettlements)
+	}
 	if err := host.Close(); err != nil {
 		t.Fatalf("Host close after settlement retry = %v", err)
 	}
 	closed = true
+}
+
+func servingBatchHasClientCommand(batch raftmember.AppliedBatch) (bool, error) {
+	if batch.Len() <= 0 {
+		return false, errors.New("empty applied settlement batch")
+	}
+	for index := 0; index < batch.Len(); index++ {
+		entry, ok := batch.Entry(index)
+		if !ok {
+			return false, errors.New("invalid applied settlement entry")
+		}
+		if len(entry.Data) != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func servingOpenCommand(

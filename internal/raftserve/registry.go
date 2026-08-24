@@ -802,8 +802,7 @@ func (registry *Registry) terminateGroupLocked(
 		return nil
 	}
 	groupRecord := &registry.groupTable[groupIndex]
-	if groupRecord.identityCount == 0 ||
-		int(groupRecord.identityCount) > registry.stats.OutstandingIdentities ||
+	if int(groupRecord.identityCount) > registry.stats.OutstandingIdentities ||
 		int(groupRecord.identityCount) > registry.limits.MaxOutstandingIdentities ||
 		(groupRecord.pendingAttempts == 0) != (groupRecord.pendingHead == noIndex) {
 		return ErrRegistryCorrupt
@@ -811,7 +810,8 @@ func (registry *Registry) terminateGroupLocked(
 	if groupRecord.pendingAttempts == 0 {
 		return nil
 	}
-	if groupRecord.entryHead == noIndex || groupRecord.pendingHead == noIndex ||
+	if groupRecord.identityCount == 0 || groupRecord.entryHead == noIndex ||
+		groupRecord.pendingHead == noIndex ||
 		registry.stats.PendingGroups <= 0 || registry.stats.PendingGroups > registry.limits.MaxGroups ||
 		registry.stats.PendingAdmittedAttempts < int(groupRecord.pendingAttempts) {
 		return ErrRegistryCorrupt

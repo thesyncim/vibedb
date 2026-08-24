@@ -102,6 +102,72 @@ func TestRegistryAppliedSourceClaimRejectsUnresolvedProposalLifecycle(t *testing
 	}
 }
 
+func TestRegistryOwnedEmptyGroupTerminationPreservesSourceOwner(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	group := testGroup(213)
+	owner := testAppliedSourceOwner(group)
+	token, err := registry.claimAppliedSource(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry.settleProposalGroupTermination(multiraft.ProposalGroupTermination{
+		Group: group, SourceOwner: owner, SourceToken: token,
+		Reason: multiraft.ProposalHostClosed,
+	})
+	if stats := registry.Stats(); stats.LiveSourceOwners != 1 ||
+		stats.OutstandingGroups != 1 || stats.OutstandingIdentities != 0 ||
+		stats.PendingGroups != 0 || stats.PendingAdmittedAttempts != 0 {
+		t.Fatalf("owned empty termination stats = %+v", stats)
+	}
+	if err := registry.releaseAppliedSource(owner, token); err != nil {
+		t.Fatalf("release after owned empty termination = %v", err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistryOwnedTerminationRejectsZeroIdentityPendingAttempt(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	group := testGroup(214)
+	owner := testAppliedSourceOwner(group)
+	token, err := registry.claimAppliedSource(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &delayedProposalHost{registry: registry}
+	data := encodeTestCommand(t, testCommand(group, 19, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.settleProposalAdmission(multiraft.ProposalAdmission{
+		Group: group, SourceOwner: owner, SourceToken: token,
+		Token: host.token, Admitted: true,
+	})
+	if stats := registry.Stats(); stats.OutstandingIdentities != 1 ||
+		stats.PendingGroups != 1 || stats.PendingAdmittedAttempts != 1 {
+		t.Fatalf("admitted owner stats = %+v", stats)
+	}
+
+	registry.mu.Lock()
+	groupIndex, found, findErr := registry.findGroupLocked(group)
+	if findErr != nil || !found {
+		registry.mu.Unlock()
+		t.Fatalf("find owned group = %v, %v", found, findErr)
+	}
+	registry.groupTable[groupIndex].identityCount = 0
+	registry.mu.Unlock()
+	registry.settleProposalGroupTermination(multiraft.ProposalGroupTermination{
+		Group: group, SourceOwner: owner, SourceToken: token,
+		Reason: multiraft.ProposalHostClosed,
+	})
+	if _, _, err := waiter.Poll(); !errors.Is(err, ErrRegistryCorrupt) {
+		t.Fatalf("zero-identity pending termination = %v", err)
+	}
+}
+
 func TestRegistryAppliedSourceClaimFencesIdentityRegistryAndABA(t *testing.T) {
 	registry := testRegistry(t, 4, 8, 8)
 	group := testGroup(210)
