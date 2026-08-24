@@ -94,7 +94,7 @@ func (d *Database) OpenReplicatedChildStage(
 		return nil, ErrReplicatedChildStageBusy
 	}
 	if core.catalog.ReplicatedShardStore == nil ||
-		*core.catalog.ReplicatedShardStore != expected {
+		!core.catalog.ReplicatedShardStore.Equal(expected) {
 		return nil, ErrReplicatedShardStoreIdentityMismatch
 	}
 	if err := core.settleCatalogLocked(); err != nil {
@@ -288,7 +288,7 @@ func (s *ReplicatedChildStage) activate(
 	if connector.closed || connector.db != core || !connector.exclusive ||
 		connector.refs != 1 || core.closed || core.replicatedChildStageClaim != s ||
 		core.replicatedApplyClaim != nil || core.catalog.ReplicatedShardStore == nil ||
-		*core.catalog.ReplicatedShardStore != s.base ||
+		!core.catalog.ReplicatedShardStore.Equal(s.base) ||
 		core.tables[s.base.UserTable] != s.table {
 		return ReplicatedChildActivation{}, ErrReplicatedChildStageClosed
 	}

@@ -115,7 +115,7 @@ func TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenBoundSQLForSettlement(first): %v", err)
 	}
-	if settled != first {
+	if !settled.Equal(first) {
 		t.Fatalf("settled identity = %+v, want bound identity %+v", settled, first)
 	}
 	if err := settledDB.Close(); err != nil {

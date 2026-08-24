@@ -225,17 +225,25 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		for iterator.Next() {
 			mutation := iterator.Mutation()
 			if len(mutation.Key) == 0 || len(mutation.Key) > MaxMutationKeyBytes ||
-				cap(mutation.Key) != len(mutation.Key) || cap(mutation.Value) != len(mutation.Value) {
+				cap(mutation.Key) != len(mutation.Key) || cap(mutation.Value) != len(mutation.Value) ||
+				cap(mutation.Compare) != len(mutation.Compare) {
 				t.Fatal("accepted invalid or unclamped mutation")
 			}
 			switch mutation.Kind {
-			case MutationPut:
+			case MutationPut, MutationPutAbsentOrEqual:
 				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 					t.Fatal("accepted invalid put")
 				}
 			case MutationDelete:
-				if len(mutation.Value) != 0 {
+				if len(mutation.Value) != 0 || len(mutation.Compare) != 0 {
 					t.Fatal("accepted invalid delete")
+				}
+			case MutationDeleteDigestEqual:
+				if len(mutation.Value) != 0 || len(mutation.Compare) != MutationDigestCompareBytes ||
+					mutation.ExpectedValueLength == 0 ||
+					mutation.ExpectedValueLength > MaxMutationValueBytes ||
+					mutation.ExpectedValueDigest == (Digest{}) {
+					t.Fatal("accepted invalid compare delete")
 				}
 			default:
 				t.Fatal("accepted unknown mutation kind")

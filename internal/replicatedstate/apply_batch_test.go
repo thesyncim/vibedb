@@ -300,21 +300,32 @@ func normalBatchRetainedCapacityBytes(m *Machine) uint64 {
 
 func assertNormalBatchWorkspaceReleased(t testing.TB, workspace *normalBatchWorkspace) {
 	t.Helper()
-	if workspace == nil || workspace.system.base != nil || workspace.user.base != nil ||
-		workspace.attempted.base != nil || len(workspace.system.entries) != 0 ||
-		len(workspace.system.arena) != 0 || len(workspace.system.probe) != 0 ||
-		len(workspace.system.order) != 0 || len(workspace.system.undo) != 0 ||
-		len(workspace.user.entries) != 0 || len(workspace.user.arena) != 0 ||
-		len(workspace.user.probe) != 0 || len(workspace.user.order) != 0 ||
-		len(workspace.user.undo) != 0 || len(workspace.attempted.entries) != 0 ||
-		len(workspace.attempted.arena) != 0 || len(workspace.attempted.probe) != 0 ||
-		len(workspace.attempted.order) != 0 || len(workspace.attempted.undo) != 0 ||
+	releasedOverlay := func(overlay *logicalOverlay) bool {
+		return overlay != nil && overlay.base == nil && len(overlay.entries) == 0 &&
+			len(overlay.arena) == 0 && len(overlay.probe) == 0 &&
+			len(overlay.order) == 0 && len(overlay.undo) == 0 &&
+			overlay.netDocuments == 0 && overlay.netBytes == 0
+	}
+	if workspace == nil || !releasedOverlay(&workspace.system) ||
+		!releasedOverlay(&workspace.user) || !releasedOverlay(&workspace.attempted) ||
+		len(workspace.relationExtra) != 0 || len(workspace.attemptedExtra) != 0 ||
+		len(workspace.relationMarks) != 0 || len(workspace.attemptedMarks) != 0 ||
 		len(workspace.plan.sessionRead) != 0 || len(workspace.plan.slotRead) != 0 ||
 		len(workspace.plan.sessionRecord) != 0 || len(workspace.plan.slotRecord) != 0 ||
 		len(workspace.plan.currentValue) != 0 || len(workspace.plan.descriptors) != 0 ||
 		len(workspace.state) != 0 ||
 		len(workspace.keys) != 0 {
 		t.Fatal("normal-batch scratch retained live keys, values, snapshots, or undo state")
+	}
+	for i := range workspace.relationExtra[:cap(workspace.relationExtra)] {
+		if !releasedOverlay(&workspace.relationExtra[:cap(workspace.relationExtra)][i]) {
+			t.Fatal("normal-batch relation scratch retained live state")
+		}
+	}
+	for i := range workspace.attemptedExtra[:cap(workspace.attemptedExtra)] {
+		if !releasedOverlay(&workspace.attemptedExtra[:cap(workspace.attemptedExtra)][i]) {
+			t.Fatal("normal-batch attempted-relation scratch retained live state")
+		}
 	}
 }
 
@@ -478,7 +489,7 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 	workspaceBytes := unsafe.Sizeof(normalBatchWorkspace{})
 	batchFieldBytes := unsafe.Offsetof(Machine{}.txnLog) -
 		unsafe.Offsetof(Machine{}.batchTelemetry)
-	legacyEquivalentMachineBytes := machineBytes - batchFieldBytes
+	baselineMachineBytes := machineBytes - batchFieldBytes
 	if telemetryBytes > 32 {
 		t.Fatalf("per-Machine batch telemetry = %d bytes, want <= 32", telemetryBytes)
 	}
@@ -549,8 +560,8 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 	if exerciseErr != nil {
 		t.Fatal(exerciseErr)
 	}
-	t.Logf("Machine old-equivalent=%dB new=%dB delta=%dB final-mutation=%dB inline=%dB pooled-workspace-header=%dB retained=%dB 4096-shard-delta=%dB",
-		legacyEquivalentMachineBytes, machineBytes, batchFieldBytes,
+	t.Logf("Machine baseline=%dB batched=%dB delta=%dB final-mutation=%dB inline=%dB pooled-workspace-header=%dB retained=%dB 4096-shard-delta=%dB",
+		baselineMachineBytes, machineBytes, batchFieldBytes,
 		unsafe.Sizeof(finalMutation{}), unsafe.Sizeof(Machine{}.mutationInline),
 		workspaceBytes, retained, batchFieldBytes*4096)
 }
@@ -1310,7 +1321,7 @@ func TestApplyNormalBatchCleanBoundariesAndEmptyEntries(t *testing.T) {
 		}
 	})
 
-	t.Run("already published normal is a clean singleton fallback", func(t *testing.T) {
+	t.Run("already published normal is a clean replay boundary", func(t *testing.T) {
 		fixture := newNormalBatchFixture(t, 0, 8)
 		if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 			t.Fatal(err)
@@ -1325,7 +1336,7 @@ func TestApplyNormalBatchCleanBoundariesAndEmptyEntries(t *testing.T) {
 			entries, normalBatchWitnesses(entries),
 		); err != nil || applied != 0 || publication != (raftmodel.Publication{}) ||
 			fixture.group.Stats() != before {
-			t.Fatalf("published fallback = %d, %+v, %v", applied, publication, err)
+			t.Fatalf("published replay boundary = %d, %+v, %v", applied, publication, err)
 		}
 		if publication, err := fixture.machine.ApplyNormal(meta, nil); err != nil || publication.Applied != meta.Index {
 			t.Fatalf("singleton replay = %+v, %v", publication, err)

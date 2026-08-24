@@ -821,6 +821,23 @@ func (s DatabaseSnapshot) Collection(name string) (*Snapshot, bool) {
 	return s.entries[i].snapshot, true
 }
 
+// CollectionHandle returns the captured view for an exact pre-opened durable
+// handle. It performs no string construction or comparison. Database-wide
+// captures are catalog-bounded, so a compact linear probe keeps relation-aware
+// replicated planning allocation-free without adding another lookup map.
+func (s DatabaseSnapshot) CollectionHandle(collection *Collection) (*Snapshot, bool) {
+	if collection == nil {
+		return nil, false
+	}
+	for i := range s.entries {
+		snapshot := s.entries[i].snapshot
+		if snapshot != nil && snapshot.collection == collection {
+			return snapshot, true
+		}
+	}
+	return nil, false
+}
+
 // Len returns the number of collections the snapshot captured.
 func (s DatabaseSnapshot) Len() int { return len(s.entries) }
 

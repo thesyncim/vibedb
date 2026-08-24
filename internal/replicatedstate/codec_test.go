@@ -21,8 +21,8 @@ const (
 	_resultAppliedAtMostExact            = uint32(1) - ResultApplied
 	_resultStaleFenceAtLeastExact        = ResultStaleFence - 2
 	_resultStaleFenceAtMostExact         = uint32(2) - ResultStaleFence
-	_resultUnknownCollectionAtLeastExact = ResultUnknownCollection - 3
-	_resultUnknownCollectionAtMostExact  = uint32(3) - ResultUnknownCollection
+	_resultUnknownRelationAtLeastExact = ResultUnknownRelation - 3
+	_resultUnknownRelationAtMostExact  = uint32(3) - ResultUnknownRelation
 	_resultInvalidDocumentAtLeastExact   = ResultInvalidDocument - 4
 	_resultInvalidDocumentAtMostExact    = uint32(4) - ResultInvalidDocument
 	_resultTargetBoundAtLeastExact       = ResultTargetBound - 5
@@ -262,14 +262,14 @@ func openCodecLogicalCommand(t testing.TB, command replication.Command) replicat
 func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 	if ValidationOpaqueBinary != 1 || ValidationDeterministicMutation != 2 ||
 		ResultFormatMutation != 1 ||
-		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownCollection != 3 ||
+		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownRelation != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
 		ResultSessionRetired != 7 || ResultSessionOpened != 8 ||
 		ResultSessionRenewed != 9 || ResultSessionRevoked != 10 {
 		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
-			ResultApplied, ResultStaleFence, ResultUnknownCollection,
+			ResultApplied, ResultStaleFence, ResultUnknownRelation,
 			ResultInvalidDocument, ResultTargetBound, ResultWrongShard,
 			ResultSessionRetired, ResultSessionOpened, ResultSessionRenewed,
 			ResultSessionRevoked)

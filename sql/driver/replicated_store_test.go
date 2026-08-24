@@ -1,10 +1,13 @@
 package driver
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	stdsql "database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -100,7 +104,7 @@ func skipReplicatedStrictAllocationUnsupported(
 	core := database.connector.db
 	core.mu.RLock()
 	table := core.tables["docs"]
-	invalid := identity != (ReplicatedShardStoreIdentity{}) ||
+	invalid := !identity.IsZero() ||
 		core.catalog.ReplicatedShardStore != nil || core.catalogWritePending ||
 		table == nil || table.meta.Materialized ||
 		table.meta.SealedRecoveryJournalBytes != 0 ||
@@ -149,7 +153,7 @@ func TestReplicatedShardStoreSealedBindPlatformGatePrecedesPublication(t *testin
 		core := database.connector.db
 		core.mu.RLock()
 		defer core.mu.RUnlock()
-		if identity != (ReplicatedShardStoreIdentity{}) ||
+		if !identity.IsZero() ||
 			core.catalog.ReplicatedShardStore != nil ||
 			core.catalog.Tables["docs"].Materialized ||
 			core.tables["docs"].collection != nil || core.tables["docs"].file != nil {
@@ -337,10 +341,10 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 		t.Fatalf("bound storage did not retain exact sealed sidecar profile")
 	}
 	core.mu.RUnlock()
-	if retried, err := database.BindReplicatedShardStore(binding, "docs"); err != nil || retried != identity {
+	if retried, err := database.BindReplicatedShardStore(binding, "docs"); err != nil || !retried.Equal(identity) {
 		t.Fatalf("exact bind retry = %+v, %v; want %+v", retried, err, identity)
 	}
-	if got, err := database.RequireReplicatedShardStore(identity); err != nil || got != identity {
+	if got, err := database.RequireReplicatedShardStore(identity); err != nil || !got.Equal(identity) {
 		t.Fatalf("RequireReplicatedShardStore = %+v, %v", got, err)
 	}
 	if _, err := database.ShardStoreIdentity(); !errors.Is(err, ErrDirectWriteFenced) {
@@ -382,15 +386,21 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 			} else {
 				i.UserStorage = "0" + i.UserStorage[1:]
 			}
+			i.Relations[0].Storage = i.UserStorage
+			i.RelationManifestDigest = replicatedRelationManifestDigest(*i)
 		}, ErrReplicatedShardStoreIdentityMismatch},
 		{"primary", func(i *ReplicatedShardStoreIdentity) { i.UserPrimaryKey = "/other" }, ErrReplicatedShardStoreIdentityMismatch},
-		{"limits", func(i *ReplicatedShardStoreIdentity) { i.UserLimits.MaxBatchBytes-- }, ErrReplicatedShardStoreIdentityMismatch},
+		{"limits", func(i *ReplicatedShardStoreIdentity) {
+			i.UserLimits.MaxBatchBytes--
+			i.Relations[0].Limits = i.UserLimits
+			i.RelationManifestDigest = replicatedRelationManifestDigest(*i)
+		}, ErrReplicatedShardStoreIdentityMismatch},
 		{"user_journal", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.UserRecoveryJournalBytes-- }, ErrReplicatedShardStoreProfile},
 		{"transaction_marker", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.TransactionMarkerBytes++ }, ErrReplicatedShardStoreProfile},
 	}
 	for _, test := range mismatches {
 		t.Run("mismatch_"+test.name, func(t *testing.T) {
-			expected := identity
+			expected := identity.Clone()
 			test.mutate(&expected)
 			if _, err := OpenReplicatedShardStore(path, expected); !errors.Is(err, test.want) {
 				t.Fatalf("OpenReplicatedShardStore = %v, want %v", err, test.want)
@@ -639,7 +649,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			return false, injected
 		})
 		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
-		if !errors.Is(err, injected) || identity != (ReplicatedShardStoreIdentity{}) {
+		if !errors.Is(err, injected) || !identity.IsZero() {
 			t.Fatalf("definite bind = %+v, %v", identity, err)
 		}
 		if _, err := db.ReplicatedShardStoreIdentity(); !errors.Is(err, ErrReplicatedShardStoreUnbound) {
@@ -681,7 +691,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			return false, durable.ErrCommitOutcomeUnknown
 		})
 		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
-		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || identity == (ReplicatedShardStoreIdentity{}) {
+		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || identity.IsZero() {
 			t.Fatalf("unknown hook bind = %+v, %v", identity, err)
 		}
 		markerPath := filepath.Join(db.connector.db.dataDir, "txn.vtm")
@@ -689,7 +699,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			t.Fatalf("unknown catalog outcome minted transaction marker: %v", statErr)
 		}
 		retried, err := db.BindReplicatedShardStore(binding, "docs")
-		if err != nil || retried != identity {
+		if err != nil || !retried.Equal(identity) {
 			t.Fatalf("unknown hook exact retry = %+v, %v; want %+v", retried, err, identity)
 		}
 		markerInfo, err := os.Stat(markerPath)
@@ -730,7 +740,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		identity, err := database.BindReplicatedShardStore(binding, "docs")
 		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
 		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, injected) ||
-			identity == (ReplicatedShardStoreIdentity{}) {
+			identity.IsZero() {
 			t.Fatalf("unknown bind = %+v, %v", identity, err)
 		}
 		core.syncDir = nil
@@ -801,7 +811,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("settlement reopen without full return identity: %v", err)
 		}
-		if settled != identity {
+		if !settled.Equal(identity) {
 			t.Fatalf("settled identity = %+v, want proposed %+v", settled, identity)
 		}
 		if err := reopened.Close(); err != nil {
@@ -827,7 +837,7 @@ func TestBindReplicatedShardStoreRejectsLivePreexistingMarker(t *testing.T) {
 			return true, nil
 		},
 	)
-	if identity != (ReplicatedShardStoreIdentity{}) ||
+	if !identity.IsZero() ||
 		!errors.Is(err, ErrReplicatedShardStoreProfile) ||
 		!errors.Is(err, durable.ErrTransactionLogRecoveryRequired) {
 		t.Fatalf("bind with live ordinary marker = %+v, %v", identity, err)
@@ -863,7 +873,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 		}
 		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
 	}
-	if identity == (ReplicatedShardStoreIdentity{}) || !errors.Is(err, syscall.EIO) ||
+	if identity.IsZero() || !errors.Is(err, syscall.EIO) ||
 		!storeio.TxnMarkerCreateFaulted() {
 		t.Fatalf("post-catalog marker mint fault = %+v, %v; fired=%t",
 			identity, err, storeio.TxnMarkerCreateFaulted())
@@ -878,7 +888,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 	core.mu.RLock()
 	published := core.catalog.ReplicatedShardStore
 	table := core.tables["docs"]
-	publishedExactly := published != nil && *published == identity &&
+	publishedExactly := published != nil && published.Equal(identity) &&
 		table != nil && table.meta.Materialized &&
 		table.meta.Storage == identity.UserStorage &&
 		table.meta.SealedRecoveryJournalBytes == ReplicatedUserRecoveryJournalBytes &&
@@ -902,7 +912,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 	settled, settledIdentity, err := OpenReplicatedShardStoreForSettlement(
 		path, binding, local.LogID, "docs",
 	)
-	if err != nil || settledIdentity != identity {
+	if err != nil || !settledIdentity.Equal(identity) {
 		if settled != nil {
 			_ = settled.Close()
 		}
@@ -967,7 +977,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 				},
 			)
 			skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
-			if identity == (ReplicatedShardStoreIdentity{}) ||
+			if identity.IsZero() ||
 				!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 				t.Fatalf("published unminted bind = %+v, %v", identity, err)
 			}
@@ -993,7 +1003,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 				!storeio.TxnMarkerCreateFaulted() {
 				t.Skipf("sealed transaction marker requires strict allocation support: %v", err)
 			}
-			if failed != nil || failedIdentity != (ReplicatedShardStoreIdentity{}) ||
+			if failed != nil || !failedIdentity.IsZero() ||
 				!errors.Is(err, test.wantErr) ||
 				errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
 				!storeio.TxnMarkerCreateFaulted() {
@@ -1026,7 +1036,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 			settled, settledIdentity, err := OpenReplicatedShardStoreForSettlement(
 				path, binding, local.LogID, "docs",
 			)
-			if err != nil || settledIdentity != identity {
+			if err != nil || !settledIdentity.Equal(identity) {
 				if settled != nil {
 					_ = settled.Close()
 				}
@@ -1125,11 +1135,6 @@ func TestReplicatedShardStoreProfileAndBindConnectExclusion(t *testing.T) {
 	}{
 		{"multiple_tables", func(t *testing.T, session *Session) {
 			if err := testRuntimeExec(session, `CREATE TABLE other (PRIMARY KEY (id))`, nil); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"index", func(t *testing.T, session *Session) {
-			if err := testRuntimeExec(session, `CREATE INDEX by_id ON docs (id)`, nil); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -1242,14 +1247,91 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 			MaxKeyBytes: replicatedMaxKeyBytes, MaxDocumentBytes: replicatedMaxDocumentBytes,
 			MaxBatchDocuments: replicatedMaxDistinctMutations, MaxBatchBytes: replicatedMaxBatchBytes,
 		},
-		Sidecars: canonicalReplicatedShardStoreSidecars(),
+		Sidecars: canonicalReplicatedShardStoreSidecars(), RelationCount: 1,
+		Relations: make([]ReplicatedShardRelationIdentity, 1),
 	}
+	identity.RelationSchemaGeneration = identity.Binding.Authority.SchemaGeneration
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	raw, err := json.Marshal(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(raw, new(ReplicatedShardStoreIdentity)); err != nil {
+	for _, extension := range [][]byte{
+		[]byte(`"relation_schema_generation"`),
+		[]byte(`"relation_manifest_digest"`),
+		[]byte(`"relations"`),
+	} {
+		if !bytes.Contains(raw, extension) {
+			t.Fatalf("singleton identity omitted relation field %s: %s", extension, raw)
+		}
+	}
+	var decoded ReplicatedShardStoreIdentity
+	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("valid decode: %v", err)
+	}
+	if !decoded.Equal(identity) {
+		t.Fatalf("singleton relation model changed on decode: %+v", decoded)
+	}
+	if cap(decoded.Relations) != len(decoded.Relations) {
+		t.Fatalf("decoded relation capacity = %d, want exact %d", cap(decoded.Relations), len(decoded.Relations))
+	}
+	cloned := decoded.Clone()
+	if cap(cloned.Relations) != len(cloned.Relations) {
+		t.Fatalf("cloned relation capacity = %d, want exact %d", cap(cloned.Relations), len(cloned.Relations))
+	}
+	cloned.Relations[0].Table = "mutated"
+	if decoded.Relations[0].Table != identity.Relations[0].Table {
+		t.Fatal("identity clone retained caller-owned relation storage")
+	}
+	if reencoded, err := json.Marshal(decoded); err != nil || !bytes.Equal(reencoded, raw) {
+		t.Fatalf("singleton canonical re-encode = %s, %v; want %s", reencoded, err, raw)
+	}
+	direct, err := identity.MarshalJSON()
+	if err != nil || !bytes.Equal(direct, raw) {
+		t.Fatalf("direct canonical image = %s, %v; want %s", direct, err, raw)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(direct)); digest !=
+		"b43b74109c809e7107998b32f24ac399a0cf68ff181b3aac0f6aa402bba6ef72" {
+		t.Fatalf("singleton identity golden digest = %s", digest)
+	}
+	ownedInput := bytes.Clone(direct)
+	var owned ReplicatedShardStoreIdentity
+	if err := owned.UnmarshalJSON(ownedInput); err != nil {
+		t.Fatalf("direct owned decode: %v", err)
+	}
+	for index := range ownedInput {
+		ownedInput[index] = 'x'
+	}
+	if !owned.Equal(identity) {
+		t.Fatal("decoded identity retained caller-owned catalog bytes")
+	}
+
+	var encoded []byte
+	var codecErr error
+	encodeAllocs := testing.AllocsPerRun(100, func() {
+		encoded, codecErr = identity.MarshalJSON()
+	})
+	if codecErr != nil {
+		t.Fatalf("allocation encode: %v", codecErr)
+	}
+	runtime.KeepAlive(encoded)
+	var allocationDecoded ReplicatedShardStoreIdentity
+	decodeAllocs := testing.AllocsPerRun(100, func() {
+		allocationDecoded = ReplicatedShardStoreIdentity{}
+		codecErr = allocationDecoded.UnmarshalJSON(direct)
+	})
+	if codecErr != nil || !allocationDecoded.Equal(identity) {
+		t.Fatalf("allocation decode = %+v, %v", allocationDecoded, codecErr)
+	}
+	if encodeAllocs > 12 || decodeAllocs > 24 {
+		t.Fatalf(
+			"singleton identity codec allocations = encode %.1f, decode %.1f",
+			encodeAllocs, decodeAllocs,
+		)
 	}
 	var identityFields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &identityFields); err != nil {
@@ -1281,19 +1363,249 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 			`"user_recovery_journal_bytes":16794112`, 1,
 		)),
 		"sidecars_missing": missingSidecars,
+		"trailing":         append(bytes.Clone(raw), []byte(` {}`)...),
+		"truncated":        bytes.Clone(raw[:len(raw)-1]),
 	}
+	oversizedBindingText := `"` + strings.Repeat(`\u0061`, maxReplicatedBindingJSONBytes) + `"`
+	cases["oversized_binding"] = []byte(strings.Replace(
+		string(raw), `"distribution":"accounts"`,
+		`"distribution":`+oversizedBindingText, 1,
+	))
+	relationRaw, err := identity.Relations[0].MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relationStart := bytes.Index(raw, relationRaw)
+	if relationStart < 0 {
+		t.Fatalf("canonical relation missing from identity: %s", raw)
+	}
+	relationEnd := relationStart + len(relationRaw)
+	// The relations member is last in the canonical image, so removing its sole
+	// element produces an exact, syntactically valid empty-array fixture.
+	cases["empty_relations"] = append(
+		bytes.Clone(raw[:relationStart]), raw[relationEnd:]...,
+	)
+	oversizedTable := `"` + strings.Repeat(`\u0061`, maxReplicatedRelationJSONBytes) + `"`
+	oversizedRelation := bytes.Replace(
+		relationRaw, []byte(`"table":"docs"`), []byte(`"table":`+oversizedTable), 1,
+	)
+	if len(oversizedRelation) <= maxReplicatedRelationJSONBytes {
+		t.Fatal("oversized relation fixture stayed within its byte bound")
+	}
+	cases["oversized_relation"] = append(
+		append(bytes.Clone(raw[:relationStart]), oversizedRelation...), raw[relationEnd:]...,
+	)
+	repeatedRelations := make([][]byte, replication.MaxRelationsPerBundle+1)
+	for index := range repeatedRelations {
+		repeatedRelations[index] = relationRaw
+	}
+	cases["too_many_relations"] = append(
+		append(bytes.Clone(raw[:relationStart]), bytes.Join(repeatedRelations, []byte{','})...),
+		raw[relationEnd:]...,
+	)
 	for name, image := range cases {
 		t.Run(name, func(t *testing.T) {
 			var decoded ReplicatedShardStoreIdentity
-			if err := json.Unmarshal(image, &decoded); err == nil {
+			err := decoded.UnmarshalJSON(image)
+			if err == nil {
 				t.Fatalf("accepted noncanonical image: %s", image)
 			}
+			if name == "oversized_relation" &&
+				!strings.Contains(err.Error(), "relation exceeds its byte bound") {
+				t.Fatalf("oversized relation error = %v", err)
+			}
+			if name == "oversized_binding" &&
+				!strings.Contains(err.Error(), "binding exceeds its byte bound") {
+				t.Fatalf("oversized binding error = %v", err)
+			}
 		})
+	}
+	if err := decoded.UnmarshalJSON(bytes.Repeat(
+		[]byte{' '}, maxReplicatedStoreJSONBytes+1,
+	)); err == nil || !strings.Contains(err.Error(), "identity exceeds its byte bound") {
+		t.Fatalf("oversized identity error = %v", err)
 	}
 	reserved := identity.Binding
 	reserved.MemberID = ^uint64(0)
 	if err := validateReplicatedShardStoreBinding(reserved); err == nil {
 		t.Fatal("accepted reserved local-message member id")
+	}
+}
+
+func TestReplicatedShardRelationManifestCanonicalRoundTripAndRejection(t *testing.T) {
+	identity := ReplicatedShardStoreIdentity{
+		Format: ReplicatedShardStoreFormat, Binding: testReplicatedBinding(78),
+		LogID: [16]byte{0xac, 1}, UserTable: "docs",
+		UserStorage: strings.Repeat("a", storageIdentityBytes*2), UserPrimaryKey: "/id",
+		UserLimits: ReplicatedShardStoreLimits{
+			MaxKeyBytes: replicatedMaxKeyBytes, MaxDocumentBytes: replicatedMaxDocumentBytes,
+			MaxBatchDocuments: replicatedMaxDistinctMutations, MaxBatchBytes: replicatedMaxBatchBytes,
+		},
+		Sidecars: canonicalReplicatedShardStoreSidecars(), RelationCount: 2,
+		Relations: make([]ReplicatedShardRelationIdentity, 2),
+	}
+	identity.RelationSchemaGeneration = identity.Binding.Authority.SchemaGeneration
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+		LocalIndexDigest: sha256.Sum256([]byte("by_email:/email")),
+	}
+	identity.Relations[1] = ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+		Table: "email_claims", Storage: strings.Repeat("b", storageIdentityBytes*2),
+		Limits: identity.UserLimits, IndexID: 41, Incarnation: 7,
+		LocatorCount: 1, Unique: true,
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
+	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
+	logicalManifest := replicatedRelationApplyManifestDigest(identity)
+	otherReplica := identity.Clone()
+	otherReplica.UserStorage = strings.Repeat("c", storageIdentityBytes*2)
+	otherReplica.Relations[0].Storage = otherReplica.UserStorage
+	otherReplica.Relations[1].Storage = strings.Repeat("d", storageIdentityBytes*2)
+	otherReplica.RelationManifestDigest = replicatedRelationManifestDigest(otherReplica)
+	if otherReplica.RelationManifestDigest == identity.RelationManifestDigest ||
+		replicatedRelationApplyManifestDigest(otherReplica) != logicalManifest {
+		t.Fatal("replica-local storage identity leaked into the portable apply manifest")
+	}
+	placement := testReplicatedApplyOptions().Placement
+	if replicatedApplyProfileDigest(identity, placement) !=
+		replicatedApplyProfileDigest(otherReplica, placement) ||
+		replicatedGlobalIndexValidationDigest(
+			identity, identity.Relations[1], logicalManifest,
+		) != replicatedGlobalIndexValidationDigest(
+			otherReplica, otherReplica.Relations[1], logicalManifest,
+		) {
+		t.Fatal("replica-local storage identity changed a replicated validation contract")
+	}
+	otherSchema := identity.Clone()
+	otherSchema.Relations[1].IndexID++
+	otherSchema.RelationManifestDigest = replicatedRelationManifestDigest(otherSchema)
+	if replicatedRelationApplyManifestDigest(otherSchema) == logicalManifest {
+		t.Fatal("logical global-index identity was omitted from the portable apply manifest")
+	}
+	raw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ReplicatedShardStoreIdentity
+	if err := json.Unmarshal(raw, &decoded); err != nil || !decoded.Equal(identity) {
+		t.Fatalf("round trip = %+v, %v", decoded, err)
+	}
+	if reencoded, err := json.Marshal(decoded); err != nil || !bytes.Equal(reencoded, raw) {
+		t.Fatalf("canonical re-encode differs: %s, %v", reencoded, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*ReplicatedShardStoreIdentity)
+	}{
+		{"reordered", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations[0], i.Relations[1] = i.Relations[1], i.Relations[0]
+		}},
+		{"duplicate", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations[1].Table = i.Relations[0].Table
+		}},
+		{"sparse", func(i *ReplicatedShardStoreIdentity) { i.Relations[1].Relation = 3 }},
+		{"schema_generation", func(i *ReplicatedShardStoreIdentity) {
+			i.RelationSchemaGeneration++
+		}},
+		{"digest", func(i *ReplicatedShardStoreIdentity) { i.RelationManifestDigest[0] ^= 1 }},
+		{"count_mismatch", func(i *ReplicatedShardStoreIdentity) {
+			i.Relations = append(i.Relations, ReplicatedShardRelationIdentity{Relation: 3})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := identity.Clone()
+			test.mutate(&candidate)
+			if err := validateReplicatedShardStoreIdentity(candidate); err == nil {
+				t.Fatal("accepted malformed relation manifest")
+			}
+		})
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "relation_manifest_digest")
+	partial, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(partial, new(ReplicatedShardStoreIdentity)); err == nil {
+		t.Fatal("accepted partial relation-manifest extension")
+	}
+}
+
+func TestReplicatedShardStoreIdentityMarshalRejectsOversizedRelationCountWithoutPanic(t *testing.T) {
+	identity := ReplicatedShardStoreIdentity{
+		Format:    ReplicatedShardStoreFormat,
+		Binding:   testReplicatedBinding(79),
+		LogID:     [16]byte{0xad, 1},
+		UserTable: "docs", UserStorage: strings.Repeat("a", storageIdentityBytes*2),
+		UserPrimaryKey: "/id",
+		UserLimits: ReplicatedShardStoreLimits{
+			MaxKeyBytes: replicatedMaxKeyBytes, MaxDocumentBytes: replicatedMaxDocumentBytes,
+			MaxBatchDocuments: replicatedMaxDistinctMutations, MaxBatchBytes: replicatedMaxBatchBytes,
+		},
+		Sidecars:      canonicalReplicatedShardStoreSidecars(),
+		RelationCount: replication.MaxRelationsPerBundle + 1,
+	}
+	deferred := func() (raw []byte, err error, recovered any) {
+		defer func() { recovered = recover() }()
+		raw, err = json.Marshal(identity)
+		return raw, err, nil
+	}
+	raw, err, recovered := deferred()
+	if recovered != nil || err == nil || raw != nil {
+		t.Fatalf("oversized relation marshal = %q, %v, panic=%v", raw, err, recovered)
+	}
+}
+
+func TestBindReplicatedShardStoreBundleRejectsOverlongRelationBeforeMutation(t *testing.T) {
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "bundle-long-name", false)
+	defer database.Close()
+	name := strings.Repeat("g", replication.MaxIdentityBytes+1)
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testRuntimeExec(
+		session, fmt.Sprintf("CREATE TABLE %s (PRIMARY KEY (key))", name), nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	beforeOptions := core.txnLog.Options()
+	baseBefore := core.tables["docs"].collection
+	globalBefore := core.tables[name].collection
+	core.mu.RUnlock()
+	if baseBefore != nil || globalBefore != nil {
+		t.Fatal("fixture relations were materialized before bundle bind")
+	}
+	_, err = database.BindReplicatedShardStoreBundle(
+		binding, "docs", []ReplicatedGlobalIndexRelation{{
+			Relation: 2, Table: name, IndexID: 41, Incarnation: 7,
+			LocatorCount: 1, Unique: true,
+		}},
+	)
+	if !errors.Is(err, ErrReplicatedShardStoreProfile) {
+		t.Fatalf("overlong bundle relation bind = %v", err)
+	}
+	core.mu.RLock()
+	defer core.mu.RUnlock()
+	if core.catalog.ReplicatedShardStore != nil ||
+		core.tables["docs"].collection != baseBefore ||
+		core.tables[name].collection != globalBefore ||
+		core.txnLog.Options() != beforeOptions {
+		t.Fatal("rejected overlong relation changed catalog, storage, or transaction-log profile")
 	}
 }
 

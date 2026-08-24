@@ -62,7 +62,7 @@ func PrepareStagedSnapshot(
 	artifactOptions SnapshotArtifactOptions,
 ) (*StagedSnapshotPreparation, error) {
 	prepared, err := prepareOpenInputs(
-		binding, bootstrap, system, user, txnLog, options,
+		binding, bootstrap, system, user, txnLog, options, false,
 	)
 	_, artifactErr := normalizeSnapshotArtifactOptions(artifactOptions)
 	auditValid := (cut.ImageAudit.Visit == nil) == (cut.ImageAudit.Finish == nil)
@@ -323,6 +323,9 @@ func (p *StagedSnapshotPreparation) Finish(
 	machine.openedImageDigest = p.imageDigest
 	machine.openedImageApplied = p.state.Applied
 	machine.openedImageGeneration = p.userGeneration
+	machine.relations[0].openedImage = p.imageDigest
+	machine.relations[0].openedApplied = p.state.Applied
+	machine.relations[0].openedGen = p.userGeneration
 	machine.binding = p.state.Binding
 	machine.distribution = []byte(p.state.Binding.Distribution)
 	machine.shard = []byte(p.state.Binding.Shard)
