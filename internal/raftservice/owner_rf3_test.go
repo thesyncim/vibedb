@@ -369,6 +369,7 @@ func waitRF3Leader(
 	t.Helper()
 	for ctx.Err() == nil {
 		leader := -1
+		var term uint64
 		consistent := true
 		for index, owner := range owners {
 			if removed[index] {
@@ -387,7 +388,8 @@ func waitRF3Leader(
 			}
 			if leader == -1 {
 				leader = candidate
-			} else if leader != candidate {
+				term = status.Term
+			} else if leader != candidate || term != status.Term {
 				consistent = false
 				break
 			}
@@ -395,7 +397,7 @@ func waitRF3Leader(
 		if consistent && leader >= 0 {
 			state, err := owners[leader].Probe(ctx, group)
 			status := state.Status
-			if err == nil && status.MemberID == status.LeaderID {
+			if err == nil && status.MemberID == status.LeaderID && status.Term == term {
 				return leader
 			}
 		}
