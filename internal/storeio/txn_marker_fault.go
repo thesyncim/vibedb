@@ -33,6 +33,12 @@ const (
 	// TxnMarkerFaultSyncError returns EIO in place of the marker sync barrier
 	// at SyncIndex, once.
 	TxnMarkerFaultSyncError
+	// TxnMarkerFaultRecoveryInvalidateError returns EIO before the recovery-only
+	// first-record invalidation writes any bytes.
+	TxnMarkerFaultRecoveryInvalidateError
+	// TxnMarkerFaultTornRecoveryInvalidate writes half of the recovery-only zero
+	// sector and returns a short write while the old header remains authoritative.
+	TxnMarkerFaultTornRecoveryInvalidate
 	// TxnMarkerFaultCreateHeaderWrite stops during the mint's header-sector
 	// writes, leaving no usable sealed header pair.
 	TxnMarkerFaultCreateHeaderWrite
@@ -120,12 +126,13 @@ func runTxnMarkerCreateParentDirSync(root *os.Root) error {
 type FaultTxnMarker struct {
 	file *os.File
 
-	mu       sync.Mutex
-	plan     TxnMarkerFaultPlan
-	appends  int
-	recycles int
-	syncs    int
-	faulted  bool
+	mu            sync.Mutex
+	plan          TxnMarkerFaultPlan
+	appends       int
+	recycles      int
+	invalidations int
+	syncs         int
+	faulted       bool
 }
 
 // NewFaultTxnMarker wraps the file backing m and installs its write and sync
@@ -165,6 +172,22 @@ func (fm *FaultTxnMarker) Appends() int {
 	return fm.appends
 }
 
+// Invalidations reports how many recovery-only first-record invalidations were
+// observed since the wrapper was created.
+func (fm *FaultTxnMarker) Invalidations() int {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	return fm.invalidations
+}
+
+// Recycles reports how many marker-header writes were observed since the
+// wrapper was created.
+func (fm *FaultTxnMarker) Recycles() int {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	return fm.recycles
+}
+
 // Syncs reports how many sync barriers were observed since the wrapper was
 // created.
 func (fm *FaultTxnMarker) Syncs() int {
@@ -192,8 +215,13 @@ func (fm *FaultTxnMarker) writeAt(p []byte, off int64) (int, error) {
 	fm.mu.Lock()
 	plan := fm.plan
 	header := off < txnMarkerRegionStart
+	invalidation := off == txnMarkerRegionStart &&
+		len(p) == TxnMarkerMinSectorSize && allZero(p)
 	var index int
-	if header {
+	if invalidation {
+		index = fm.invalidations
+		fm.invalidations++
+	} else if header {
 		index = fm.recycles
 		fm.recycles++
 	} else {
@@ -201,6 +229,21 @@ func (fm *FaultTxnMarker) writeAt(p []byte, off int64) (int, error) {
 		fm.appends++
 	}
 	fm.mu.Unlock()
+
+	if invalidation {
+		switch plan.Phase {
+		case TxnMarkerFaultRecoveryInvalidateError:
+			return fm.fault(0, syscall.EIO)
+		case TxnMarkerFaultTornRecoveryInvalidate:
+			prefix := max(len(p)/2, 1)
+			n, err := fm.file.WriteAt(p[:prefix], off)
+			if err != nil {
+				return fm.fault(n, err)
+			}
+			return fm.fault(prefix, io.ErrShortWrite)
+		}
+		return fm.file.WriteAt(p, off)
+	}
 
 	if header {
 		switch plan.Phase {
