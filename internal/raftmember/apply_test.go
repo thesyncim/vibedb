@@ -69,9 +69,11 @@ func testApplyCommandValue(
 		RouteGeneration:        b.Authority.RouteGeneration,
 		Tenant:                 []byte("tenant"), ClientID: replication.ID128{3},
 		ClientEpoch: clientEpoch, ClientSequence: sequence, Fingerprint: fingerprint,
-		Collection: identity.UserTable,
-		Mutations: []replication.Mutation{{
-			Kind: replication.MutationPut, Key: key, Value: document,
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: key, Value: document,
+			}},
 		}},
 	}
 }
@@ -81,7 +83,7 @@ func testApplySessionOpen(identity sqldriver.ReplicatedShardStoreIdentity) []byt
 	command.Kind = replication.CommandSessionOpen
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("raftmember/test-session-open"))
-	command.Mutations = nil
+	command.Batches = nil
 	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)

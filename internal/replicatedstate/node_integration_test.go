@@ -90,9 +90,9 @@ func TestRaftModelNodeRestartUsesMachineAppliedWatermark(t *testing.T) {
 			openCompletion, openLookup, machine.state, err)
 	}
 	prototype.ClientEpoch = openCompletion.ClientEpoch
-	prototype.Mutations = []replication.Mutation{{
+	prototype.Batches = []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
 		Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`),
-	}}
+	}}}}
 	command := encodeCommand(t, prototype)
 	if err := node.Propose(command); err != nil {
 		t.Fatal(err)

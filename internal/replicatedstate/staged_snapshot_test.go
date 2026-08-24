@@ -200,7 +200,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	epoch := completion.ClientEpoch
 	userCommand := commandValue(binding, 1)
 	userCommand.ClientEpoch = epoch
-	userCommand.Mutations = []replication.Mutation{{
+	userCommand.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: []byte("c"), Value: []byte(`{"n":3}`),
 	}}
 	command := encodeCommand(t, userCommand)

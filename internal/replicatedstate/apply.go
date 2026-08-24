@@ -753,14 +753,18 @@ func (m *Machine) planCommand(
 			next.LeaseDeadlineUnixNano = 0
 		}
 	default:
+		relations := command.RelationBatches()
+		hasRelation := relations.Next()
+		relation := relations.Batch()
 		switch {
 		case !m.mutableBindingMatchesState(command, state):
 			plan.resultCode = ResultStaleFence
-		case !bytes.Equal(command.Collection, m.userNameBytes):
+		case command.RelationCount() != 1 || !hasRelation ||
+			relation.Relation != replication.RelationID(1):
 			plan.resultCode = ResultUnknownCollection
 		default:
 			plan.changes, plan.resultCode, err = m.planMutations(
-				command, userSnapshot, scratch,
+				relation, userSnapshot, scratch,
 			)
 			if err != nil {
 				return commandPlan{}, err
@@ -1117,7 +1121,7 @@ func sessionRetryFloor(session SessionView) uint64 {
 }
 
 func (m *Machine) planMutations(
-	command replication.CommandView,
+	batch replication.RelationBatchView,
 	snapshot pointSnapshot,
 	scratch *commandPlanScratch,
 ) ([]finalMutation, uint32, error) {
@@ -1127,7 +1131,7 @@ func (m *Machine) planMutations(
 	clear(m.mutationPlan)
 	ordered := m.mutationPlan[:0]
 	defer func() { m.mutationPlan = ordered }()
-	iterator := command.Mutations()
+	iterator := batch.Mutations()
 	for iterator.Next() {
 		mutation := iterator.Mutation()
 		at := -1

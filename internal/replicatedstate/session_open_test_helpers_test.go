@@ -19,7 +19,7 @@ func sessionOpenFor(prototype replication.Command) replication.Command {
 	prototype.AckThrough = 0
 	prototype.ExpectedDeadlineUnixNano = 0
 	prototype.NextDeadlineUnixNano = testSessionLeaseDeadlineUnixNano
-	prototype.Mutations = nil
+	prototype.Batches = nil
 	seed := make([]byte, 0, len("replicatedstate/test-session-open/")+len(prototype.Tenant)+len(prototype.ClientID))
 	seed = append(seed, "replicatedstate/test-session-open/"...)
 	seed = append(seed, prototype.Tenant...)

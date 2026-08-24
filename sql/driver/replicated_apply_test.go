@@ -137,7 +137,7 @@ func testReplicatedApplyCommandValue(
 		RouteGeneration:        binding.Authority.RouteGeneration,
 		Tenant:                 []byte("tenant"), ClientID: replication.ID128{9},
 		ClientEpoch: clientEpoch, ClientSequence: sequence, Fingerprint: fingerprint,
-		Collection: identity.UserTable, Mutations: mutations,
+		Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
 	}
 }
 
@@ -146,6 +146,7 @@ func testReplicatedApplySessionOpen(identity ReplicatedShardStoreIdentity) []byt
 	command.Kind = replication.CommandSessionOpen
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("driver/test-session-open"))
+	command.Batches = nil
 	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)

@@ -41,7 +41,6 @@ type Machine struct {
 	bootstrapDigest [32]byte
 	system          CollectionTarget
 	userName        string
-	userNameBytes   []byte
 	user            CollectionTarget
 	distribution    []byte
 	shard           []byte
@@ -241,7 +240,7 @@ func newMachineFromOpenInputs(prepared openInputs) *Machine {
 	return &Machine{
 		binding: binding, bootstrap: prepared.bootstrap,
 		bootstrapDigest: prepared.bootstrapDigest, system: prepared.system,
-		userName: prepared.userName, userNameBytes: []byte(prepared.userName),
+		userName:     prepared.userName,
 		user:         prepared.user,
 		distribution: []byte(binding.Distribution), shard: []byte(binding.Shard),
 		applyContract: prepared.applyContract,

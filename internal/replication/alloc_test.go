@@ -26,12 +26,42 @@ func TestHotPathsAllocateZero(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		iterator := view.Mutations()
-		for iterator.Next() {
-			allocationIntSink += len(iterator.Mutation().Key)
+		relations := view.RelationBatches()
+		for relations.Next() {
+			iterator := relations.Batch().Mutations()
+			for iterator.Next() {
+				allocationIntSink += len(iterator.Mutation().Key)
+			}
 		}
 	}); allocations != 0 {
 		t.Fatalf("OpenCommand + iteration allocations = %v, want 0", allocations)
+	}
+	multi := testMultiRelationCommand()
+	encodedMulti := encodeCommand(t, multi)
+	multiScratch := make([]byte, 0, len(encodedMulti))
+	if allocations := testing.AllocsPerRun(1000, func() {
+		var err error
+		allocationBytesSink, err = AppendCommand(multiScratch[:0], multi)
+		if err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("pre-sized multi-relation AppendCommand allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		view, err := OpenCommand(encodedMulti)
+		if err != nil {
+			panic(err)
+		}
+		relations := view.RelationBatches()
+		for relations.Next() {
+			iterator := relations.Batch().Mutations()
+			for iterator.Next() {
+				allocationIntSink += len(iterator.Mutation().Key)
+			}
+		}
+	}); allocations != 0 {
+		t.Fatalf("multi-relation OpenCommand + iteration allocations = %v, want 0", allocations)
 	}
 	retire := testSessionRetireCommand()
 	encodedRetire := encodeCommand(t, retire)
@@ -168,9 +198,46 @@ func BenchmarkOpenCommand(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		iterator := view.Mutations()
-		for iterator.Next() {
-			allocationIntSink += len(iterator.Mutation().Key)
+		relations := view.RelationBatches()
+		for relations.Next() {
+			iterator := relations.Batch().Mutations()
+			for iterator.Next() {
+				allocationIntSink += len(iterator.Mutation().Key)
+			}
+		}
+	}
+}
+
+func BenchmarkAppendMultiRelationCommand(b *testing.B) {
+	command := testMultiRelationCommand()
+	encoded := encodeCommand(b, command)
+	scratch := make([]byte, 0, len(encoded))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(encoded)))
+	for b.Loop() {
+		var err error
+		allocationBytesSink, err = AppendCommand(scratch[:0], command)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpenMultiRelationCommand(b *testing.B) {
+	encoded := encodeCommand(b, testMultiRelationCommand())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(encoded)))
+	for b.Loop() {
+		view, err := OpenCommand(encoded)
+		if err != nil {
+			b.Fatal(err)
+		}
+		relations := view.RelationBatches()
+		for relations.Next() {
+			iterator := relations.Batch().Mutations()
+			for iterator.Next() {
+				allocationIntSink += len(iterator.Mutation().Key)
+			}
 		}
 	}
 }

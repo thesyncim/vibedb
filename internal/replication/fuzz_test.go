@@ -14,7 +14,7 @@ func FuzzOpenCommand(f *testing.F) {
 	renew := testSessionRenewCommand()
 	revoke := testSessionRevokeCommand()
 	ordered := testCommand()
-	ordered.Mutations = []Mutation{
+	ordered.Batches[0].Mutations = []Mutation{
 		{Kind: MutationPut, Key: []byte("z"), Value: []byte("first")},
 		{Kind: MutationDelete, Key: []byte("z")},
 		{Kind: MutationPut, Key: []byte("a"), Value: []byte("descending")},
@@ -26,6 +26,13 @@ func FuzzOpenCommand(f *testing.F) {
 	f.Add(encodeCommand(f, renew))
 	f.Add(encodeCommand(f, revoke))
 	f.Add(encodeCommand(f, ordered))
+	multi := testCommand()
+	multi.Batches = []RelationMutationBatch{
+		{Relation: 1, Mutations: []Mutation{{Kind: MutationDelete, Key: []byte("a")}}},
+		{Relation: 7, Mutations: []Mutation{{Kind: MutationPut, Key: []byte("b"), Value: []byte("value")}}},
+		{Relation: MaxRelationID, Mutations: []Mutation{{Kind: MutationDelete, Key: []byte("c")}}},
+	}
+	f.Add(encodeCommand(f, multi))
 	f.Add(valid[:len(valid)-1])
 	f.Add([]byte{})
 	f.Add(bytes.Repeat([]byte{0}, commandHeaderBytes+envelopeChecksumBytes))
@@ -55,7 +62,7 @@ func FuzzOpenSessionLeaseResealedFields(f *testing.F) {
 			testSessionOpenCommand(), testSessionRenewCommand(), testSessionRevokeCommand(),
 		}
 		candidate := encodeCommand(t, commands[selector%uint8(len(commands))])
-		lease := commandMutationOffset(candidate)
+		lease := commandPayloadOffset(candidate)
 		binary.LittleEndian.PutUint64(candidate[lease:lease+8], expected)
 		binary.LittleEndian.PutUint64(candidate[lease+8:lease+16], next)
 		sealEnvelope(candidate)
@@ -68,7 +75,7 @@ func FuzzOpenSessionLeaseResealedFields(f *testing.F) {
 
 func FuzzOpenCommandResealedFields(f *testing.F) {
 	valid := encodeCommand(f, testCommand())
-	mutation := commandMutationOffset(valid)
+	mutation := commandPayloadOffset(valid)
 	distribution := commandHeaderBytes + len(testCommand().Tenant)
 	for _, seed := range []struct {
 		field uint8
@@ -76,14 +83,15 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 	}{
 		{0, 0}, {2, commandHeaderBytes}, {3, uint64(len(valid))},
 		{5, MaxMutations + 1}, {8, MaxIdentityBytes + 1},
-		{6, testCommand().ClientSequence},
-		{14, MaxMutationKeyBytes + 1}, {15, MaxMutationValueBytes + 1},
+		{6, testCommand().ClientSequence}, {11, MaxRelationBatches + 1},
+		{12, MaxRelationID + 1}, {13, 1},
+		{16, MaxMutationKeyBytes + 1}, {17, MaxMutationValueBytes + 1},
 	} {
 		f.Add(seed.field, seed.value)
 	}
 	f.Fuzz(func(t *testing.T, field uint8, value uint64) {
 		candidate := append([]byte(nil), valid...)
-		switch field % 18 {
+		switch field % 20 {
 		case 0:
 			candidate[10] = byte(value)
 		case 1:
@@ -109,18 +117,22 @@ func FuzzOpenCommandResealedFields(f *testing.F) {
 		case 10:
 			binary.LittleEndian.PutUint16(candidate[244:246], uint16(value))
 		case 11:
-			binary.LittleEndian.PutUint16(candidate[246:248], uint16(value))
+			binary.LittleEndian.PutUint16(candidate[28:30], uint16(value))
 		case 12:
-			candidate[mutation] = byte(value)
+			binary.LittleEndian.PutUint16(candidate[30:32], uint16(value))
 		case 13:
-			candidate[mutation+1] = byte(value)
+			candidate[246] = byte(value)
 		case 14:
-			binary.LittleEndian.PutUint16(candidate[mutation+2:mutation+4], uint16(value))
+			candidate[mutation] = byte(value)
 		case 15:
-			binary.LittleEndian.PutUint32(candidate[mutation+4:mutation+8], uint32(value))
+			candidate[mutation+1] = byte(value)
 		case 16:
-			candidate[distribution] = byte(value)
+			binary.LittleEndian.PutUint16(candidate[mutation+2:mutation+4], uint16(value))
 		case 17:
+			binary.LittleEndian.PutUint32(candidate[mutation+4:mutation+8], uint32(value))
+		case 18:
+			candidate[distribution] = byte(value)
+		case 19:
 			candidate[200+int(value%32)] = byte(value >> 8)
 		}
 		sealEnvelope(candidate)
@@ -143,7 +155,8 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 			view.NextDeadlineUnixNano != 0 {
 			t.Fatal("accepted mutation batch has invalid client tuple")
 		}
-		if view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
+		if view.RelationCount() < 1 || view.RelationCount() > MaxRelationBatches ||
+			view.MutationCount() < 1 || view.MutationCount() > MaxMutations {
 			t.Fatal("accepted mutation batch has invalid mutation count")
 		}
 	case CommandSessionRetire, CommandSessionRelease:
@@ -152,7 +165,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 			view.NextDeadlineUnixNano != 0 {
 			t.Fatal("accepted session lifecycle command has invalid client tuple")
 		}
-		if view.MutationCount() != 0 {
+		if view.RelationCount() != 0 || view.MutationCount() != 0 {
 			t.Fatal("accepted session lifecycle command carries mutations")
 		}
 	case CommandSessionOpen:
@@ -162,7 +175,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 		if view.ExpectedDeadlineUnixNano != 0 || view.NextDeadlineUnixNano <= 0 {
 			t.Fatal("accepted session open has invalid lease deadlines")
 		}
-		if view.MutationCount() != 0 {
+		if view.RelationCount() != 0 || view.MutationCount() != 0 {
 			t.Fatal("accepted session open carries mutations")
 		}
 	case CommandSessionRenew:
@@ -171,7 +184,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 			view.NextDeadlineUnixNano <= view.ExpectedDeadlineUnixNano {
 			t.Fatal("accepted session renew has invalid tuple or lease deadlines")
 		}
-		if view.MutationCount() != 0 {
+		if view.RelationCount() != 0 || view.MutationCount() != 0 {
 			t.Fatal("accepted session renew carries mutations")
 		}
 	case CommandSessionRevoke:
@@ -180,46 +193,66 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 			view.NextDeadlineUnixNano != 0 {
 			t.Fatal("accepted session revoke has invalid tuple or lease deadlines")
 		}
-		if view.MutationCount() != 0 {
+		if view.RelationCount() != 0 || view.MutationCount() != 0 {
 			t.Fatal("accepted session revoke carries mutations")
 		}
 	default:
 		t.Fatal("accepted unknown command kind")
 	}
-	for _, borrowed := range [][]byte{view.Tenant, view.Distribution, view.Shard, view.Collection} {
+	for _, borrowed := range [][]byte{view.Tenant, view.Distribution, view.Shard} {
 		if cap(borrowed) != len(borrowed) {
 			t.Fatal("accepted command field is not capacity-clamped")
 		}
 	}
-	iterator := view.Mutations()
-	if cap(iterator.b) != len(iterator.b) {
-		t.Fatal("accepted mutation iterator is not capacity-clamped")
+	relations := view.RelationBatches()
+	if cap(relations.b) != len(relations.b) {
+		t.Fatal("accepted relation iterator is not capacity-clamped")
 	}
 	count := 0
-	for iterator.Next() {
-		mutation := iterator.Mutation()
-		if len(mutation.Key) == 0 || len(mutation.Key) > MaxMutationKeyBytes ||
-			cap(mutation.Key) != len(mutation.Key) || cap(mutation.Value) != len(mutation.Value) {
-			t.Fatal("accepted invalid or unclamped mutation")
+	batchCount := 0
+	var previous RelationID
+	for relations.Next() {
+		batch := relations.Batch()
+		if batch.Relation == 0 || batch.Relation > MaxRelationID ||
+			batchCount != 0 && batch.Relation <= previous || batch.MutationCount() == 0 {
+			t.Fatal("accepted invalid relation batch")
 		}
-		switch mutation.Kind {
-		case MutationPut:
-			if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
-				t.Fatal("accepted invalid put")
-			}
-		case MutationDelete:
-			if len(mutation.Value) != 0 {
-				t.Fatal("accepted invalid delete")
-			}
-		default:
-			t.Fatal("accepted unknown mutation kind")
-		}
+		iterator := batch.Mutations()
 		if cap(iterator.b) != len(iterator.b) {
-			t.Fatal("advanced mutation iterator is not capacity-clamped")
+			t.Fatal("accepted mutation iterator is not capacity-clamped")
 		}
-		count++
+		batchMutations := 0
+		for iterator.Next() {
+			mutation := iterator.Mutation()
+			if len(mutation.Key) == 0 || len(mutation.Key) > MaxMutationKeyBytes ||
+				cap(mutation.Key) != len(mutation.Key) || cap(mutation.Value) != len(mutation.Value) {
+				t.Fatal("accepted invalid or unclamped mutation")
+			}
+			switch mutation.Kind {
+			case MutationPut:
+				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
+					t.Fatal("accepted invalid put")
+				}
+			case MutationDelete:
+				if len(mutation.Value) != 0 {
+					t.Fatal("accepted invalid delete")
+				}
+			default:
+				t.Fatal("accepted unknown mutation kind")
+			}
+			if cap(iterator.b) != len(iterator.b) {
+				t.Fatal("advanced mutation iterator is not capacity-clamped")
+			}
+			count++
+			batchMutations++
+		}
+		if batchMutations != batch.MutationCount() {
+			t.Fatal("relation batch count disagrees with iterator")
+		}
+		previous = batch.Relation
+		batchCount++
 	}
-	if count != view.MutationCount() {
+	if count != view.MutationCount() || batchCount != view.RelationCount() {
 		t.Fatalf("iterated %d mutations, header declares %d", count, view.MutationCount())
 	}
 }
