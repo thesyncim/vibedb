@@ -53,6 +53,7 @@ type commandPlan struct {
 type commandPlanScratch struct {
 	sessionRead   []byte
 	slotRead      []byte
+	decodeRead    []byte
 	sessionRecord []byte
 	slotRecord    []byte
 	currentValue  []byte
@@ -89,12 +90,14 @@ func (s *commandPlanScratch) release() {
 	}
 	clear(s.sessionRead)
 	clear(s.slotRead)
+	clear(s.decodeRead)
 	clear(s.sessionRecord)
 	clear(s.slotRecord)
 	clear(s.currentValue)
 	clear(s.descriptors)
 	s.sessionRead = s.sessionRead[:0]
 	s.slotRead = s.slotRead[:0]
+	s.decodeRead = s.decodeRead[:0]
 	s.sessionRecord = s.sessionRecord[:0]
 	s.slotRecord = s.slotRecord[:0]
 	s.descriptors = s.descriptors[:0]
@@ -103,6 +106,9 @@ func (s *commandPlanScratch) release() {
 	}
 	if cap(s.slotRead) > maxNormalBatchRetainedBufferBytes {
 		s.slotRead = nil
+	}
+	if cap(s.decodeRead) > maxNormalBatchRetainedBufferBytes {
+		s.decodeRead = nil
 	}
 	if cap(s.sessionRecord) > maxNormalBatchRetainedBufferBytes {
 		s.sessionRecord = nil
@@ -1369,15 +1375,28 @@ func sessionAt(
 	scratch *commandPlanScratch,
 ) (SessionView, bool, error) {
 	var dst []byte
+	decodeCopy := false
 	if scratch != nil {
 		dst = scratch.sessionRead[:0]
+		if cap(scratch.decodeRead) != 0 {
+			dst = scratch.decodeRead[:0]
+			decodeCopy = true
+		}
 	}
 	record, found, err := snapshot.appendRaw(dst, key[:])
 	if err != nil || !found {
 		return SessionView{}, found, err
 	}
 	if scratch != nil {
-		scratch.sessionRead = record
+		if decodeCopy {
+			if len(record) > cap(scratch.sessionRead) {
+				return SessionView{}, false, ErrSessionCorrupt
+			}
+			scratch.sessionRead = append(scratch.sessionRead[:0], record...)
+			record = scratch.sessionRead
+		} else {
+			scratch.sessionRead = record
+		}
 	}
 	view, err := OpenSessionRecord(record)
 	if err != nil {
@@ -1395,15 +1414,28 @@ func sessionSlotAt(
 	scratch *commandPlanScratch,
 ) (SessionSlotView, bool, error) {
 	var dst []byte
+	decodeCopy := false
 	if scratch != nil {
 		dst = scratch.slotRead[:0]
+		if cap(scratch.decodeRead) != 0 {
+			dst = scratch.decodeRead[:0]
+			decodeCopy = true
+		}
 	}
 	record, found, err := snapshot.appendRaw(dst, key[:])
 	if err != nil || !found {
 		return SessionSlotView{}, found, err
 	}
 	if scratch != nil {
-		scratch.slotRead = record
+		if decodeCopy {
+			if len(record) > cap(scratch.slotRead) {
+				return SessionSlotView{}, false, ErrSessionCorrupt
+			}
+			scratch.slotRead = append(scratch.slotRead[:0], record...)
+			record = scratch.slotRead
+		} else {
+			scratch.slotRead = record
+		}
 	}
 	view, err := OpenSessionSlot(record)
 	if err != nil {
