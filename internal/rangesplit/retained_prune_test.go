@@ -428,7 +428,8 @@ func retainedPruneCommand(
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("split-controller"),
 		ClientID: sourceCaptureID(30), ClientEpoch: fixture.retainedPruneEpoch,
 		ClientSequence: sequence,
-		Fingerprint:    fingerprint, Collection: "docs", Mutations: mutations,
+		Fingerprint:    fingerprint,
+		Batches:        []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
 	})
 	if err != nil {
 		t.Fatal(err)

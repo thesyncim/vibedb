@@ -20,7 +20,7 @@ func sessionRenewal(
 ) replication.Command {
 	command := commandValue(binding, sequence-1)
 	command.Kind = replication.CommandSessionRenew
-	command.Mutations = nil
+	command.Batches = nil
 	command.ExpectedDeadlineUnixNano = expected
 	command.NextDeadlineUnixNano = next
 	return command
@@ -34,7 +34,7 @@ func sessionRevocation(
 	command := commandValue(binding, sequence-1)
 	command.Kind = replication.CommandSessionRevoke
 	command.AckThrough = ackThrough
-	command.Mutations = nil
+	command.Batches = nil
 	command.ExpectedDeadlineUnixNano = expected
 	command.NextDeadlineUnixNano = 0
 	return command

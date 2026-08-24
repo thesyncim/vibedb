@@ -806,7 +806,8 @@ func replicatedChildCommandValue(
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
 		ClientID: replicatedChildID(40), ClientEpoch: clientEpoch, ClientSequence: sequence,
-		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
+		Fingerprint: fingerprint,
+		Batches:     []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
 	}
 }
 
@@ -815,6 +816,7 @@ func replicatedChildSessionOpen(binding replicatedstate.Binding) []byte {
 	command.Kind = replication.CommandSessionOpen
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
 	command.Fingerprint = sha256.Sum256([]byte("driver/child-test-session-open"))
+	command.Batches = nil
 	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)

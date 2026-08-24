@@ -233,7 +233,7 @@ func (f *applyComplexityFixture) command(t testing.TB, sequence uint64, value []
 	command.ClientEpoch = f.clientEpoch
 	command.ClientSequence = sequence
 	command.Fingerprint = sha256.Sum256([]byte(fmt.Sprintf("p01-point-update-%d", sequence)))
-	command.Mutations = []replication.Mutation{{
+	command.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: f.targetKey, Value: value,
 	}}
 	return encodeCommand(t, command)

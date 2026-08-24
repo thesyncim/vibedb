@@ -282,8 +282,11 @@ func snapshotBaseTestCommand(
 		// The configuration entry occupies index 2 and the explicit session open
 		// mints epoch 3. Callers pass the zero-based user-request ordinal.
 		ClientID: id128(70), ClientEpoch: 3, ClientSequence: sequence + 1,
-		Fingerprint: fingerprint, Collection: "docs",
-		Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: value}},
+		Fingerprint: fingerprint,
+		Batches: []replication.RelationMutationBatch{{
+			Relation:  1,
+			Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: value}},
+		}},
 	})
 	if err != nil {
 		panic(err)

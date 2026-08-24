@@ -151,7 +151,7 @@ func lifecycleDeleteCommand(
 	command := commandValue(binding, sequence-1)
 	command.ClientEpoch = epoch
 	command.AckThrough = 0
-	command.Mutations = []replication.Mutation{{
+	command.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationDelete,
 		Key:  []byte("permanently-absent"),
 	}}

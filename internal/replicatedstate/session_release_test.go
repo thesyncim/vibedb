@@ -97,7 +97,7 @@ func applySessionReleaseCommand(
 func sessionRetirement(command replication.Command) replication.Command {
 	command.Kind = replication.CommandSessionRetire
 	command.AckThrough = command.ClientSequence - 1
-	command.Mutations = nil
+	command.Batches = nil
 	return command
 }
 
@@ -275,7 +275,7 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 		applySessionOpen(t, fixture.machine, 2, active)
 		applySessionReleaseCommand(t, fixture.machine, 3, active)
 		release := sessionRelease(active)
-		release.Mutations = nil
+		release.Batches = nil
 		releaseBytes := encodeCommand(t, release)
 		if err := fixture.machine.AdmitCommand(releaseBytes); !errors.Is(err, ErrSessionActive) {
 			t.Fatalf("active release admission = %v, want ErrSessionActive", err)

@@ -8,14 +8,15 @@ import (
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
-// Command is one deterministic, single-collection state-machine operation.
+// Command is one deterministic relation-bundle state-machine operation.
 // It contains no Raft term, index, physical root generation, SQL text, local
 // clock reading, or serialized execution plan. Lease deadlines are explicit
 // replicated inputs; this codec never samples time. Fingerprint is the already-
 // canonical request fingerprint minted by the request layer; this codec treats
 // it as opaque.
-// Mutation-batch order, including duplicate keys, is semantic and preserved
-// exactly; upstream fingerprinting must bind every mutation ordinal. A session
+// Relation batches are strictly identity ordered. Mutation order within each
+// batch, including duplicate keys, is semantic and preserved exactly; upstream
+// fingerprinting must bind every relation and mutation ordinal. A session
 // retirement, release, open, renew, or revoke carries no mutations. AckThrough
 // is the greatest earlier client sequence that will never be retried; zero
 // acknowledges nothing. A session-open request has the canonical client tuple
@@ -56,8 +57,7 @@ type Command struct {
 	// NextDeadlineUnixNano is the deadline to publish, or zero for revoke.
 	NextDeadlineUnixNano int64
 
-	Collection string
-	Mutations  []Mutation
+	Batches []RelationMutationBatch
 }
 
 // CommandView is a checksum- and semantics-validated borrowed command. Its
@@ -93,11 +93,12 @@ type CommandView struct {
 	RetryHome                RetryHome
 	ExpectedDeadlineUnixNano int64
 	NextDeadlineUnixNano     int64
-	Collection               []byte
 
-	raw           []byte
-	mutationBytes []byte
-	mutationCount uint32
+	raw              []byte
+	relationBytes    []byte
+	mutationCount    uint32
+	relationCount    uint16
+	inlineRelationID RelationID
 }
 
 // Bytes returns the exact validated envelope. The result aliases the decoder
@@ -106,11 +107,27 @@ func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
 }
 
-// Kind reports the collection or session-lifecycle operation.
+// Kind reports the relation-bundle or session-lifecycle operation.
 func (v CommandView) Kind() CommandKind { return v.kind }
 
-// MutationCount reports the number of mutations the iterator will produce.
+// MutationCount reports the total number of mutations across all relation
+// batches.
 func (v CommandView) MutationCount() int { return int(v.mutationCount) }
+
+// RelationCount reports the number of ordered relation batches in the command.
+// Session lifecycle commands always report zero.
+func (v CommandView) RelationCount() int { return int(v.relationCount) }
+
+// RelationBatchView is one borrowed relation batch. Its mutation bytes alias
+// the validated command envelope and remain read-only for the view's lifetime.
+type RelationBatchView struct {
+	Relation      RelationID
+	mutationBytes []byte
+	mutationCount uint32
+}
+
+// MutationCount reports the number of mutations in this relation batch.
+func (v RelationBatchView) MutationCount() int { return int(v.mutationCount) }
 
 // MutationView is one borrowed, validated mutation. Key and Value are
 // capacity-clamped, read-only aliases into the command envelope.
@@ -127,13 +144,75 @@ type MutationIterator struct {
 	current   MutationView
 }
 
-// Mutations returns a fresh iterator positioned before the first mutation.
-func (v CommandView) Mutations() MutationIterator {
+// Mutations returns a fresh iterator positioned before the first mutation in
+// this relation batch.
+func (v RelationBatchView) Mutations() MutationIterator {
 	b := v.mutationBytes
 	return MutationIterator{
 		remaining: v.mutationCount,
 		b:         b[:len(b):len(b)],
 	}
+}
+
+// RelationBatchIterator walks validated relation batches without materializing
+// a slice. Multi-relation framing carries exact payload lengths, so advancing
+// between batches is constant time and does not rescan mutation frames.
+type RelationBatchIterator struct {
+	remaining uint16
+	b         []byte
+	inlineID  RelationID
+	inlineN   uint32
+	current   RelationBatchView
+}
+
+// RelationBatches returns a fresh iterator positioned before the first batch.
+func (v CommandView) RelationBatches() RelationBatchIterator {
+	b := v.relationBytes
+	return RelationBatchIterator{
+		remaining: v.relationCount,
+		b:         b[:len(b):len(b)],
+		inlineID:  v.inlineRelationID,
+		inlineN:   v.mutationCount,
+	}
+}
+
+// Next advances and reports whether one relation batch is available.
+func (i *RelationBatchIterator) Next() bool {
+	if i == nil || i.remaining == 0 {
+		return false
+	}
+	if i.inlineID != 0 {
+		i.current = RelationBatchView{
+			Relation: i.inlineID, mutationBytes: i.b, mutationCount: i.inlineN,
+		}
+		i.b = i.b[len(i.b):len(i.b):len(i.b)]
+		i.inlineID = 0
+		i.inlineN = 0
+		i.remaining--
+		return true
+	}
+	header := i.b[:relationBatchHeaderBytes]
+	count := binary.LittleEndian.Uint16(header[2:4])
+	payloadBytes := int(binary.LittleEndian.Uint32(header[4:8]))
+	start := relationBatchHeaderBytes
+	end := start + payloadBytes
+	i.current = RelationBatchView{
+		Relation:      RelationID(binary.LittleEndian.Uint16(header[0:2])),
+		mutationBytes: i.b[start:end:end],
+		mutationCount: uint32(count),
+	}
+	i.b = i.b[end:len(i.b):len(i.b)]
+	i.remaining--
+	return true
+}
+
+// Batch returns the current relation batch. It is zero before the first
+// successful Next and remains the final batch after exhaustion.
+func (i *RelationBatchIterator) Batch() RelationBatchView {
+	if i == nil {
+		return RelationBatchView{}
+	}
+	return i.current
 }
 
 // Next advances and reports whether one mutation is available.
@@ -183,12 +262,17 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	frame := dst[start:]
 
 	copy(frame[0:8], commandMagic[:])
-	appendU16(frame, 8, commandCodecFormat)
+	appendU16(frame, 8, commandCodecSentinel)
 	frame[10] = commandWireKind(command.Kind)
 	appendU16(frame, 12, commandHeaderBytes)
 	appendU32(frame, 16, uint32(total))
 	appendU32(frame, 20, uint32(total-commandHeaderBytes-envelopeChecksumBytes))
-	appendU32(frame, 24, uint32(len(command.Mutations)))
+	mutationCount := commandMutationCount(command)
+	appendU32(frame, 24, uint32(mutationCount))
+	appendU16(frame, 28, uint16(len(command.Batches)))
+	if len(command.Batches) == 1 {
+		appendU16(frame, 30, uint16(command.Batches[0].Relation))
+	}
 	copy(frame[32:48], command.ClusterID[:])
 	copy(frame[48:64], command.ClusterIncarnation[:])
 	appendU64(frame, 64, command.TopologyRecoveryEpoch)
@@ -210,27 +294,40 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	appendU16(frame, 240, uint16(len(command.Tenant)))
 	appendU16(frame, 242, uint16(len(command.Distribution)))
 	appendU16(frame, 244, uint16(len(command.Shard)))
-	appendU16(frame, 246, uint16(len(command.Collection)))
 	appendU64(frame, 248, command.AckThrough)
 
 	cursor := commandHeaderBytes
 	cursor += copy(frame[cursor:], command.Tenant)
 	cursor += copy(frame[cursor:], command.Distribution)
 	cursor += copy(frame[cursor:], command.Shard)
-	cursor += copy(frame[cursor:], command.Collection)
 	if commandCarriesLeaseBody(command.Kind) {
 		appendU64(frame, cursor, uint64(command.ExpectedDeadlineUnixNano))
 		appendU64(frame, cursor+8, uint64(command.NextDeadlineUnixNano))
 		cursor += sessionLeaseBodyBytes
 	}
-	for index := range command.Mutations {
-		mutation := &command.Mutations[index]
-		frame[cursor] = byte(mutation.Kind)
-		appendU16(frame, cursor+2, uint16(len(mutation.Key)))
-		appendU32(frame, cursor+4, uint32(len(mutation.Value)))
-		cursor += mutationHeaderBytes
-		cursor += copy(frame[cursor:], mutation.Key)
-		cursor += copy(frame[cursor:], mutation.Value)
+	for batchIndex := range command.Batches {
+		batch := &command.Batches[batchIndex]
+		headerAt := -1
+		if len(command.Batches) > 1 {
+			headerAt = cursor
+			appendU16(frame, cursor, uint16(batch.Relation))
+			appendU16(frame, cursor+2, uint16(len(batch.Mutations)))
+			cursor += relationBatchHeaderBytes
+		}
+		for mutationIndex := range batch.Mutations {
+			mutation := &batch.Mutations[mutationIndex]
+			frame[cursor] = byte(mutation.Kind)
+			appendU16(frame, cursor+2, uint16(len(mutation.Key)))
+			appendU32(frame, cursor+4, uint32(len(mutation.Value)))
+			cursor += mutationHeaderBytes
+			cursor += copy(frame[cursor:], mutation.Key)
+			cursor += copy(frame[cursor:], mutation.Value)
+		}
+		if headerAt >= 0 {
+			appendU32(
+				frame, headerAt+4, uint32(cursor-headerAt-relationBatchHeaderBytes),
+			)
+		}
 	}
 	if cursor != total-envelopeChecksumBytes {
 		panic("replication: measured command size diverged during encode")
@@ -247,13 +344,19 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	if byteSlicesOverlap(region, command.Tenant) ||
 		byteSliceStringOverlap(region, command.Distribution) ||
 		byteSliceStringOverlap(region, command.Shard) ||
-		byteSliceStringOverlap(region, command.Collection) {
+		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
-	for index := range command.Mutations {
-		if byteSlicesOverlap(region, command.Mutations[index].Key) ||
-			byteSlicesOverlap(region, command.Mutations[index].Value) {
+	for batchIndex := range command.Batches {
+		if typedSliceOverlapsBytes(region, command.Batches[batchIndex].Mutations) {
 			return true
+		}
+		for mutationIndex := range command.Batches[batchIndex].Mutations {
+			mutation := &command.Batches[batchIndex].Mutations[mutationIndex]
+			if byteSlicesOverlap(region, mutation.Key) ||
+				byteSlicesOverlap(region, mutation.Value) {
+				return true
+			}
 		}
 	}
 	return false
@@ -285,7 +388,7 @@ func measureCommand(command Command) (int, error) {
 	total := uint64(commandHeaderBytes + envelopeChecksumBytes)
 	for _, size := range [...]int{
 		len(command.Tenant), len(command.Distribution),
-		len(command.Shard), len(command.Collection),
+		len(command.Shard),
 	} {
 		var ok bool
 		total, ok = checkedAdd(total, uint64(size), MaxCommandBytes)
@@ -300,21 +403,33 @@ func measureCommand(command Command) (int, error) {
 			return 0, ErrEnvelopeTooLarge
 		}
 	}
-	for index := range command.Mutations {
-		mutation := &command.Mutations[index]
-		if err := validateMutation(*mutation); err != nil {
-			return 0, err
-		}
+	if len(command.Batches) > 1 {
 		var ok bool
-		total, ok = checkedAdd(total, mutationHeaderBytes, MaxCommandBytes)
-		if ok {
-			total, ok = checkedAdd(total, uint64(len(mutation.Key)), MaxCommandBytes)
-		}
-		if ok {
-			total, ok = checkedAdd(total, uint64(len(mutation.Value)), MaxCommandBytes)
-		}
+		total, ok = checkedAdd(
+			total, uint64(len(command.Batches)*relationBatchHeaderBytes), MaxCommandBytes,
+		)
 		if !ok {
 			return 0, ErrEnvelopeTooLarge
+		}
+	}
+	for batchIndex := range command.Batches {
+		batch := &command.Batches[batchIndex]
+		for mutationIndex := range batch.Mutations {
+			mutation := &batch.Mutations[mutationIndex]
+			if err := validateMutation(*mutation); err != nil {
+				return 0, err
+			}
+			var ok bool
+			total, ok = checkedAdd(total, mutationHeaderBytes, MaxCommandBytes)
+			if ok {
+				total, ok = checkedAdd(total, uint64(len(mutation.Key)), MaxCommandBytes)
+			}
+			if ok {
+				total, ok = checkedAdd(total, uint64(len(mutation.Value)), MaxCommandBytes)
+			}
+			if !ok {
+				return 0, ErrEnvelopeTooLarge
+			}
 		}
 	}
 	return int(total), nil
@@ -323,13 +438,29 @@ func measureCommand(command Command) (int, error) {
 func validateCommandHeader(command Command) error {
 	switch command.Kind {
 	case CommandMutationBatch:
-		if len(command.Mutations) == 0 || len(command.Mutations) > MaxMutations {
-			return semantic("mutation count")
+		if len(command.Batches) == 0 || len(command.Batches) > MaxRelationBatches {
+			return semantic("relation batch count")
+		}
+		mutations := 0
+		var previous RelationID
+		for index := range command.Batches {
+			batch := &command.Batches[index]
+			if batch.Relation == 0 || batch.Relation > MaxRelationID ||
+				index != 0 && batch.Relation <= previous {
+				return semantic("relation batch order or identity")
+			}
+			if len(batch.Mutations) == 0 ||
+				len(command.Batches) > 1 && len(batch.Mutations) > 1<<16-1 ||
+				len(batch.Mutations) > MaxMutations-mutations {
+				return semantic("mutation count")
+			}
+			mutations += len(batch.Mutations)
+			previous = batch.Relation
 		}
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
-		if len(command.Mutations) != 0 {
-			return semantic("session lifecycle command carries mutations")
+		if len(command.Batches) != 0 {
+			return semantic("session lifecycle command carries relation batches")
 		}
 	default:
 		return semantic("unknown command kind")
@@ -368,10 +499,15 @@ func validateCommandHeader(command Command) error {
 	if err := validateTextIdentity("shard", command.Shard, MaxIdentityBytes); err != nil {
 		return err
 	}
-	if err := validateTextIdentity("collection", command.Collection, MaxCollectionBytes); err != nil {
-		return err
-	}
 	return nil
+}
+
+func commandMutationCount(command Command) int {
+	count := 0
+	for index := range command.Batches {
+		count += len(command.Batches[index].Mutations)
+	}
+	return count
 }
 
 func validateTextIdentity(field, value string, limit int) error {
@@ -415,9 +551,9 @@ func OpenCommand(src []byte) (CommandView, error) {
 	if !bytes.Equal(src[:8], commandMagic[:]) {
 		return CommandView{}, corrupt("command magic")
 	}
-	format := binary.LittleEndian.Uint16(src[8:10])
-	if format != commandCodecFormat {
-		return CommandView{}, unsupported("command", format)
+	sentinel := binary.LittleEndian.Uint16(src[8:10])
+	if sentinel != commandCodecSentinel {
+		return CommandView{}, unsupportedCommandSentinel(sentinel)
 	}
 	if binary.LittleEndian.Uint16(src[12:14]) != commandHeaderBytes {
 		return CommandView{}, corrupt("command header size")
@@ -434,19 +570,24 @@ func OpenCommand(src []byte) (CommandView, error) {
 	kind, ok := openCommandKind(src[10])
 	if !ok || src[11] != 0 ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
-		binary.LittleEndian.Uint32(src[28:32]) != 0 {
+		binary.LittleEndian.Uint16(src[246:248]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
 	}
 	count := binary.LittleEndian.Uint32(src[24:28])
+	relationCount := binary.LittleEndian.Uint16(src[28:30])
+	inlineRelationID := RelationID(binary.LittleEndian.Uint16(src[30:32]))
 	switch kind {
 	case CommandMutationBatch:
-		if count == 0 || uint64(count) > MaxMutations {
-			return CommandView{}, semantic("mutation count")
+		if count == 0 || uint64(count) > MaxMutations || relationCount == 0 ||
+			relationCount > MaxRelationBatches ||
+			(relationCount == 1) != (inlineRelationID != 0) ||
+			inlineRelationID > MaxRelationID {
+			return CommandView{}, semantic("mutation or relation batch count")
 		}
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
-		if count != 0 {
-			return CommandView{}, semantic("session lifecycle command carries mutations")
+		if count != 0 || relationCount != 0 || inlineRelationID != 0 {
+			return CommandView{}, semantic("session lifecycle command carries relation batches")
 		}
 	}
 
@@ -474,12 +615,11 @@ func OpenCommand(src []byte) (CommandView, error) {
 	tenantLen := int(binary.LittleEndian.Uint16(src[240:242]))
 	distributionLen := int(binary.LittleEndian.Uint16(src[242:244]))
 	shardLen := int(binary.LittleEndian.Uint16(src[244:246]))
-	collectionLen := int(binary.LittleEndian.Uint16(src[246:248]))
-	identityBytes := tenantLen + distributionLen + shardLen + collectionLen
+	identityBytes := tenantLen + distributionLen + shardLen
 	bodyEnd := len(src) - envelopeChecksumBytes
 	if tenantLen == 0 || tenantLen > MaxIdentityBytes ||
 		distributionLen == 0 || distributionLen > MaxIdentityBytes ||
-		shardLen == 0 || shardLen > MaxIdentityBytes || collectionLen == 0 ||
+		shardLen == 0 || shardLen > MaxIdentityBytes ||
 		identityBytes < 0 || identityBytes > bodyEnd-commandHeaderBytes {
 		return CommandView{}, semantic("command identity lengths")
 	}
@@ -493,11 +633,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 	end = cursor + shardLen
 	view.Shard = src[cursor:end:end]
 	cursor = end
-	end = cursor + collectionLen
-	view.Collection = src[cursor:end:end]
-	cursor = end
-	if !utf8.Valid(view.Distribution) || !utf8.Valid(view.Shard) ||
-		!utf8.Valid(view.Collection) {
+	if !utf8.Valid(view.Distribution) || !utf8.Valid(view.Shard) {
 		return CommandView{}, semantic("command text identity is not valid UTF-8")
 	}
 	if err := validateDecodedCommandScalars(view); err != nil {
@@ -506,10 +642,12 @@ func OpenCommand(src []byte) (CommandView, error) {
 	payload := src[cursor:bodyEnd:bodyEnd]
 	switch kind {
 	case CommandMutationBatch:
-		if err := validateMutationBytes(payload, count); err != nil {
+		if err := validateRelationBytes(
+			payload, count, relationCount, inlineRelationID,
+		); err != nil {
 			return CommandView{}, err
 		}
-		view.mutationBytes = payload
+		view.relationBytes = payload
 	case CommandSessionOpen, CommandSessionRenew, CommandSessionRevoke:
 		if len(payload) != sessionLeaseBodyBytes {
 			return CommandView{}, semantic("session lease body length")
@@ -528,6 +666,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
+	view.relationCount = relationCount
+	view.inlineRelationID = inlineRelationID
 	return view, nil
 }
 
@@ -655,6 +795,61 @@ func validateMutationBytes(src []byte, count uint32) error {
 	}
 	if cursor != len(src) {
 		return corrupt("command body has trailing mutation bytes")
+	}
+	return nil
+}
+
+func validateRelationBytes(
+	src []byte,
+	totalMutations uint32,
+	relationCount uint16,
+	inlineRelationID RelationID,
+) error {
+	if relationCount == 1 {
+		if inlineRelationID == 0 || inlineRelationID > MaxRelationID {
+			return semantic("inline relation identity")
+		}
+		return validateMutationBytes(src, totalMutations)
+	}
+	if relationCount < 2 || relationCount > MaxRelationBatches || inlineRelationID != 0 {
+		return semantic("relation batch count")
+	}
+	cursor := 0
+	mutations := uint32(0)
+	var previous RelationID
+	for ordinal := uint16(0); ordinal < relationCount; ordinal++ {
+		if len(src)-cursor < relationBatchHeaderBytes {
+			return corrupt("relation batch header overruns command body")
+		}
+		header := src[cursor : cursor+relationBatchHeaderBytes]
+		relation := RelationID(binary.LittleEndian.Uint16(header[0:2]))
+		count := binary.LittleEndian.Uint16(header[2:4])
+		payloadBytes64 := uint64(binary.LittleEndian.Uint32(header[4:8]))
+		if relation == 0 || relation > MaxRelationID ||
+			ordinal != 0 && relation <= previous || count == 0 {
+			return semantic("relation batch order, identity, or mutation count")
+		}
+		remaining := uint64(len(src) - cursor - relationBatchHeaderBytes)
+		if payloadBytes64 > remaining {
+			return corrupt("relation batch payload overruns command body")
+		}
+		cursor += relationBatchHeaderBytes
+		end := cursor + int(payloadBytes64)
+		if err := validateMutationBytes(src[cursor:end], uint32(count)); err != nil {
+			return err
+		}
+		if mutations > uint32(MaxMutations)-uint32(count) {
+			return semantic("mutation count")
+		}
+		mutations += uint32(count)
+		cursor = end
+		previous = relation
+	}
+	if cursor != len(src) {
+		return corrupt("command body has trailing relation bytes")
+	}
+	if mutations != totalMutations {
+		return semantic("relation mutation count disagrees with command header")
 	}
 	return nil
 }

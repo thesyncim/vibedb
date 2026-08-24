@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	// The wire header retains one private format sentinel so corrupt or foreign
-	// envelopes fail closed. There is exactly one supported grammar.
-	commandCodecFormat    = uint16(1)
+	// The command wire header retains one private zero sentinel so corrupt,
+	// foreign, or pre-grammar envelopes fail closed. It is not a version: there
+	// is exactly one supported command grammar and no compatibility decoder.
+	commandCodecSentinel  = uint16(0)
 	completionCodecFormat = uint16(1)
 
 	// MaxCommandBytes is the intentionally narrower replicated-admission limit
@@ -28,8 +29,21 @@ const (
 	MaxCompletionResultBytes = 16 << 20
 	MaxInlineCompletionBytes = 64 << 10
 
-	MaxIdentityBytes      = 255
-	MaxCollectionBytes    = 1<<16 - 1
+	MaxIdentityBytes   = 255
+	MaxCollectionBytes = 1<<16 - 1
+	// MaxRelationsPerBundle is the fixed dense user-relation slot count for one
+	// replicated shard group. Relation zero is reserved for hidden state; the
+	// durable checkpoint certificate has room for that state plus 59 relations.
+	// Slot reuse or remapping is legal only behind SchemaGeneration and the
+	// authenticated bundle manifest; RelationID is deliberately not a sparse,
+	// long-lived catalog identity.
+	MaxRelationsPerBundle = 59
+	// MaxRelationBatches bounds the number of distinct relation slots touched by
+	// one command.
+	MaxRelationBatches = MaxRelationsPerBundle
+	// MaxRelationID is the largest dense physical bundle ordinal.
+	MaxRelationID = MaxRelationsPerBundle
+	// MaxMutations bounds the sum across every relation batch in one command.
 	MaxMutations          = 1 << 16
 	MaxMutationKeyBytes   = 256
 	MaxMutationValueBytes = 4 << 20
@@ -38,6 +52,7 @@ const (
 	completionHeaderBytes     = 288
 	envelopeChecksumBytes     = 8
 	mutationHeaderBytes       = 8
+	relationBatchHeaderBytes  = 8
 	commandWireMutationBatch  = uint8(1)
 	commandWireSessionRetire  = uint8(2)
 	commandWireSessionRelease = uint8(3)
@@ -59,13 +74,19 @@ type Digest [32]byte
 // state across route changes and range movement. Zero is a valid keyspace point.
 type RetryHome [8]byte
 
+// RelationID is one compact, dense bundle-local physical slot ordinal in
+// [1, MaxRelationID]. Zero is reserved for the replicated state machine's
+// hidden system collection and is never legal in a client mutation command.
+// It is interpreted only under the command's SchemaGeneration.
+type RelationID uint16
+
 // CommandKind selects the command's state-machine operation. The zero value is
 // the ordinary mutation batch so command producers remain explicit for session
 // lifecycle operations.
 type CommandKind uint8
 
 const (
-	// CommandMutationBatch applies one nonempty ordered mutation batch.
+	// CommandMutationBatch applies one or more ordered nonempty relation batches.
 	CommandMutationBatch CommandKind = iota
 	// CommandSessionRetire seals the command's client epoch and carries no
 	// mutations. The compact identity high-water remains durable so delayed
@@ -87,7 +108,7 @@ const (
 	CommandSessionRevoke
 )
 
-// MutationKind selects one logical collection mutation.
+// MutationKind selects one logical relation mutation.
 type MutationKind uint8
 
 const (
@@ -102,6 +123,14 @@ type Mutation struct {
 	Kind  MutationKind
 	Key   []byte
 	Value []byte
+}
+
+// RelationMutationBatch is one nonempty, caller-owned mutation sequence for a
+// single relation. Command batches are strictly ordered by Relation and may
+// not repeat an identity. Mutation order and duplicate keys remain semantic.
+type RelationMutationBatch struct {
+	Relation  RelationID
+	Mutations []Mutation
 }
 
 // CompletionStorage selects the only two completion representations. Results
@@ -135,6 +164,12 @@ func unsupported(kind string, format uint16) error {
 	return fmt.Errorf("%w: %s format %d", ErrUnsupportedFormat, kind, format)
 }
 
+func unsupportedCommandSentinel(sentinel uint16) error {
+	return fmt.Errorf(
+		"%w: command grammar sentinel %d", ErrUnsupportedFormat, sentinel,
+	)
+}
+
 func nonzero128(id ID128) bool    { return id != (ID128{}) }
 func nonzeroDigest(d Digest) bool { return d != (Digest{}) }
 
@@ -163,6 +198,18 @@ func byteSlicesOverlap(left, right []byte) bool {
 	return addressRangesOverlap(
 		uintptr(unsafe.Pointer(unsafe.SliceData(left))), uintptr(len(left)),
 		uintptr(unsafe.Pointer(unsafe.SliceData(right))), uintptr(len(right)),
+	)
+}
+
+func typedSliceOverlapsBytes[T any](left []byte, right []T) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	var element T
+	return addressRangesOverlap(
+		uintptr(unsafe.Pointer(unsafe.SliceData(left))), uintptr(len(left)),
+		uintptr(unsafe.Pointer(unsafe.SliceData(right))),
+		uintptr(len(right))*unsafe.Sizeof(element),
 	)
 }
 

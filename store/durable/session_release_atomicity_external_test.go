@@ -210,7 +210,7 @@ func newSessionReleaseCrashFixture(
 	open.ClientSequence = 1
 	open.AckThrough = 0
 	open.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-	open.Mutations = nil
+	open.Batches = nil
 	open.Fingerprint = replication.Digest{1, 2, 3, 4}
 	openBytes := sessionCrashEncode(t, open)
 	if _, err := fixture.machine.ApplyNormal(sessionCrashMeta(2), openBytes); err != nil {
@@ -221,7 +221,7 @@ func newSessionReleaseCrashFixture(
 	retirement.ClientEpoch = 2
 	retirement.ClientSequence = 2
 	retirement.AckThrough = 1
-	retirement.Mutations = nil
+	retirement.Batches = nil
 	retirement.Fingerprint = replication.Digest{5, 6, 7, 8}
 	retirementBytes := sessionCrashEncode(t, retirement)
 	if _, err := fixture.machine.ApplyNormal(
@@ -543,7 +543,7 @@ func sessionCrashCommand(binding replicatedstate.Binding) replication.Command {
 		ProtectionEpoch: binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
 		SchemaGeneration: binding.SchemaGeneration, RoutingVersion: binding.RoutingVersion,
 		RouteGeneration: binding.RouteGeneration, Tenant: []byte("tenant"),
-		ClientID: sessionCrashID(77), Collection: "docs",
+		ClientID: sessionCrashID(77),
 	}
 }
 

@@ -928,7 +928,8 @@ func (f sourceCaptureFixture) command(
 		SchemaGeneration: f.binding.SchemaGeneration, RoutingVersion: f.binding.RoutingVersion,
 		RouteGeneration: f.binding.RouteGeneration, Tenant: []byte("tenant"),
 		ClientID: sourceCaptureID(20), ClientEpoch: f.clientEpoch, ClientSequence: sequence,
-		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
+		Fingerprint: fingerprint,
+		Batches:     []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
 	})
 	if err != nil {
 		panic(err)
@@ -969,7 +970,6 @@ func (f sourceCaptureFixture) openSession(
 		ClientSequence:         1,
 		NextDeadlineUnixNano:   2_000_000_000_000_000_000,
 		Fingerprint:            sha256.Sum256(seed),
-		Collection:             "docs",
 	})
 	if err != nil {
 		t.Fatal(err)

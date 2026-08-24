@@ -29,10 +29,13 @@ func commandValue(binding Binding, sequence uint64) replication.Command {
 		// a zero-based user-request ordinal: the open owns sequence 1, so the
 		// first mutation is sequence 2.
 		ClientID: id128(77), ClientEpoch: 2, ClientSequence: sequence + 1,
-		Fingerprint: fingerprint, Collection: "docs",
-		Mutations: []replication.Mutation{{
-			Kind: replication.MutationPut, Key: []byte(fmt.Sprintf("k%d", sequence)),
-			Value: []byte(`{"n":1}`),
+		Fingerprint: fingerprint,
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: []byte(fmt.Sprintf("k%d", sequence)),
+				Value: []byte(`{"n":1}`),
+			}},
 		}},
 	}
 }
@@ -133,12 +136,18 @@ func TestDeterministicResultCodeMatrix(t *testing.T) {
 		edit func(*replication.Command)
 	}{
 		{"applied", ResultApplied, func(*replication.Command) {}},
-		{"unknown collection", ResultUnknownCollection, func(c *replication.Command) { c.Collection = "missing" }},
-		{"invalid document", ResultInvalidDocument, func(c *replication.Command) { c.Mutations[0].Value = []byte("{") }},
+		{"unknown relation", ResultUnknownCollection, func(c *replication.Command) { c.Batches[0].Relation = 2 }},
+		{"multiple relations", ResultUnknownCollection, func(c *replication.Command) {
+			c.Batches = append(c.Batches, replication.RelationMutationBatch{
+				Relation:  2,
+				Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("other")}},
+			})
+		}},
+		{"invalid document", ResultInvalidDocument, func(c *replication.Command) { c.Batches[0].Mutations[0].Value = []byte("{") }},
 		{"target bound", ResultTargetBound, func(c *replication.Command) {
-			c.Mutations = make([]replication.Mutation, MaxDistinctMutations+1)
-			for i := range c.Mutations {
-				c.Mutations[i] = replication.Mutation{Kind: replication.MutationPut, Key: []byte{byte(i + 1)}, Value: []byte("null")}
+			c.Batches[0].Mutations = make([]replication.Mutation, MaxDistinctMutations+1)
+			for i := range c.Batches[0].Mutations {
+				c.Batches[0].Mutations[i] = replication.Mutation{Kind: replication.MutationPut, Key: []byte{byte(i + 1)}, Value: []byte("null")}
 			}
 		}},
 	}

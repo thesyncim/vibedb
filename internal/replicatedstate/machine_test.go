@@ -142,7 +142,8 @@ func testCommand(binding Binding, sequence uint64, mutations ...replication.Muta
 		// a zero-based user-request ordinal: the open owns sequence 1, so the
 		// first mutation is sequence 2.
 		ClientID: id128(77), ClientEpoch: 2, ClientSequence: sequence + 1,
-		Fingerprint: fingerprint, Collection: "docs", Mutations: mutations,
+		Fingerprint: fingerprint,
+		Batches:     []replication.RelationMutationBatch{{Relation: 1, Mutations: mutations}},
 	})
 	if err != nil {
 		panic(err)
@@ -215,8 +216,11 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		SchemaGeneration: fixture.binding.SchemaGeneration, RoutingVersion: fixture.binding.RoutingVersion,
 		RouteGeneration: fixture.binding.RouteGeneration, Tenant: bytes.Clone(view.Tenant),
 		ClientID: view.ClientID, ClientEpoch: view.ClientEpoch, ClientSequence: view.ClientSequence,
-		Fingerprint: view.Fingerprint, RetryHome: view.RetryHome, Collection: "docs",
-		Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
+		Fingerprint: view.Fingerprint, RetryHome: view.RetryHome,
+		Batches: []replication.RelationMutationBatch{{
+			Relation:  1,
+			Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
+		}},
 	}
 	conflict, err = replication.AppendCommand(conflict[:0], conflictingCommand)
 	if err != nil {
@@ -250,7 +254,10 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 		RouteGeneration: fixture.binding.RouteGeneration, Tenant: staleView.Tenant,
 		ClientID: staleView.ClientID, ClientEpoch: staleView.ClientEpoch,
 		ClientSequence: staleView.ClientSequence, Fingerprint: staleView.Fingerprint,
-		Collection: "docs", Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
+		Batches: []replication.RelationMutationBatch{{
+			Relation:  1,
+			Mutations: []replication.Mutation{{Kind: replication.MutationDelete, Key: []byte("k")}},
+		}},
 	}
 	stale, err = replication.AppendCommand(nil, staleCommand)
 	if err != nil {

@@ -85,7 +85,7 @@ func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	retire := commandValue(fixture.binding, 13)
 	retire.Kind = replication.CommandSessionRetire
 	retire.AckThrough = 13
-	retire.Mutations = nil
+	retire.Batches = nil
 	retireBytes := encodeCommand(t, retire)
 	if err := fixture.machine.AdmitCommand(retireBytes); err != nil {
 		t.Fatalf("retire admission: %v", err)
@@ -165,7 +165,7 @@ func TestStaleSessionRetireDoesNotSealLiveEpoch(t *testing.T) {
 	stale := commandValue(fixture.binding, 2)
 	stale.Kind = replication.CommandSessionRetire
 	stale.AckThrough = 2
-	stale.Mutations = nil
+	stale.Batches = nil
 	stale.RoutingVersion++
 	stale.RouteGeneration++
 	staleBytes := encodeCommand(t, stale)
@@ -297,7 +297,7 @@ func testTerminalSessionCommandRetriesWithoutStrandingEpoch(
 	terminal := commandValue(fixture.binding, math.MaxUint64-1)
 	terminal.Kind = kind
 	terminal.AckThrough = high
-	terminal.Mutations = nil
+	terminal.Batches = nil
 	if kind == replication.CommandSessionRevoke {
 		terminal.ExpectedDeadlineUnixNano = testSessionLeaseDeadlineUnixNano
 	}
@@ -423,8 +423,9 @@ func TestLogicalCommandDigestIgnoresAckAndMutableRoutingOnly(t *testing.T) {
 	}
 
 	changed := base
-	changed.Mutations = append([]replication.Mutation(nil), base.Mutations...)
-	changed.Mutations[0].Value = []byte(`{"n":2}`)
+	changed.Batches = append([]replication.RelationMutationBatch(nil), base.Batches...)
+	changed.Batches[0].Mutations = append([]replication.Mutation(nil), base.Batches[0].Mutations...)
+	changed.Batches[0].Mutations[0].Value = []byte(`{"n":2}`)
 	changedBytes := encodeCommand(t, changed)
 	changedView, _ := replication.OpenCommand(changedBytes)
 	if got := LogicalCommandDigest(changedView); got == want {

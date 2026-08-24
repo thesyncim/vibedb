@@ -236,11 +236,13 @@ func codecLogicalCommand() replication.Command {
 		ClientID: id128(44), ClientEpoch: 2, ClientSequence: 3, AckThrough: 1,
 		Fingerprint: sha256.Sum256([]byte("logical-fingerprint")),
 		RetryHome:   replication.RetryHome{7, 6, 5, 4, 3, 2, 1, 0},
-		Collection:  "docs",
-		Mutations: []replication.Mutation{
-			{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
-			{Kind: replication.MutationDelete, Key: []byte("z")},
-		},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{
+				{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+				{Kind: replication.MutationDelete, Key: []byte("z")},
+			},
+		}},
 	}
 }
 
@@ -307,7 +309,7 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 
 	command := codecLogicalCommand()
 	digest := LogicalCommandDigest(openCodecLogicalCommand(t, command))
-	const wantLogical = "5619b831e41a1e0ee94744335e14d027c5b06d6c097f9e50367a8fb875233481"
+	const wantLogical = "6a73992470f3248facb555641d34d0e215a9618b9eb430705e25430c97563c68"
 	if got := hex.EncodeToString(digest[:]); got != wantLogical {
 		t.Fatalf("LogicalCommandDigest = %s, want %s", got, wantLogical)
 	}
@@ -320,14 +322,31 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 		t.Fatalf("logical digest changed across acknowledgement/fence refresh: %x != %x", got, digest)
 	}
 	changed := command
-	changed.Mutations = append([]replication.Mutation(nil), command.Mutations...)
-	changed.Mutations[0].Key = []byte("other")
+	changed.Batches = append([]replication.RelationMutationBatch(nil), command.Batches...)
+	changed.Batches[0].Mutations = append([]replication.Mutation(nil), command.Batches[0].Mutations...)
+	changed.Batches[0].Mutations[0].Key = []byte("other")
 	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changed)); got == digest {
 		t.Fatal("logical digest did not bind exact mutation bytes")
 	}
+	changedRelation := command
+	changedRelation.Batches = append(
+		[]replication.RelationMutationBatch(nil), command.Batches...,
+	)
+	changedRelation.Batches[0].Relation = 2
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedRelation)); got == digest {
+		t.Fatal("logical digest did not bind the numeric relation identity")
+	}
+	changedPartition := command
+	changedPartition.Batches = []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: command.Batches[0].Mutations[:1]},
+		{Relation: 2, Mutations: command.Batches[0].Mutations[1:]},
+	}
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedPartition)); got == digest {
+		t.Fatal("logical digest did not bind relation-batch boundaries")
+	}
 	lease := command
 	lease.Kind = replication.CommandSessionRenew
-	lease.Mutations = nil
+	lease.Batches = nil
 	lease.ExpectedDeadlineUnixNano = 100
 	lease.NextDeadlineUnixNano = 200
 	leaseDigest := LogicalCommandDigest(openCodecLogicalCommand(t, lease))

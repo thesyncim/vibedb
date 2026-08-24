@@ -351,7 +351,7 @@ func runtimeReplaySessionOpen(
 	command.ClientID = replication.ID128{client}
 	command.Fingerprint = replication.Digest{client, 0xa5}
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-	command.Mutations = nil
+	command.Batches = nil
 	encoded, err := replication.AppendCommand(nil, command)
 	if err != nil {
 		panic(err)

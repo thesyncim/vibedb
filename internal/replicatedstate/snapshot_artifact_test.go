@@ -60,7 +60,7 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	const golden = "d24db94e9d9cd6b49486364fad4d9dd8e35db9c3ef346c9971118ea5e8a10e08"
+	const golden = "db9a35618a1b1b0e60e05b1263295ca6785bc2781fc1a4d869cf06f75c5ae2f1"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}

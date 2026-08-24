@@ -261,7 +261,7 @@ func normalBatchRetryCommands(
 	for index := range commands {
 		sequence := firstSequence + uint64(index)
 		command := commandValue(binding, sequence)
-		command.Mutations = []replication.Mutation{{
+		command.Batches[0].Mutations = []replication.Mutation{{
 			Kind:  replication.MutationPut,
 			Key:   []byte{0, byte(sequence % 4), 0xff},
 			Value: []byte{'{', '"', 'n', '"', ':', byte('0' + sequence%10), '}'},
@@ -336,7 +336,7 @@ func TestApplyNormalBatchOnePhysicalUpdateZeroSyncAndBoundedWarmScratch(t *testi
 			command := commandValue(fixture.binding, commandOrdinal)
 			command.ClientID = sessions[index].ClientID
 			command.ClientEpoch = sessions[index].ClientEpoch
-			command.Mutations = []replication.Mutation{{
+			command.Batches[0].Mutations = []replication.Mutation{{
 				Kind:  replication.MutationPut,
 				Key:   []byte{0, byte(index % 4), 0xff},
 				Value: []byte{'{', '"', 'n', '"', ':', byte('0' + (index+int(commandOrdinal))%10), '}'},
@@ -431,7 +431,7 @@ func TestApplyNormalBatchFull128CommandWorkspaceIsWarmStable(t *testing.T) {
 			command := commandValue(fixture.binding, sequence)
 			command.ClientID = prototypes[index].ClientID
 			command.ClientEpoch = 2 + uint64(index)
-			command.Mutations = []replication.Mutation{{
+			command.Batches[0].Mutations = []replication.Mutation{{
 				Kind: replication.MutationPut,
 				Key:  []byte{0, 'f', 'u', 'l', 'l', byte(index % MaxDistinctMutations)},
 				Value: []byte{
@@ -671,10 +671,10 @@ func TestApplyNormalBatchLargeDeletesBoundPeakAndDropColdBuffers(t *testing.T) {
 	)
 	largeValue = append(largeValue, '"', '}')
 	put := commandValue(fixture.binding, 1)
-	put.Mutations = make([]replication.Mutation, documents)
+	put.Batches[0].Mutations = make([]replication.Mutation, documents)
 	for index := range keys {
 		keys[index] = []byte{0, 'l', 'a', 'r', 'g', 'e', byte(index)}
-		put.Mutations[index] = replication.Mutation{
+		put.Batches[0].Mutations[index] = replication.Mutation{
 			Kind: replication.MutationPut, Key: keys[index], Value: largeValue,
 		}
 	}
@@ -710,9 +710,9 @@ func TestApplyNormalBatchLargeDeletesBoundPeakAndDropColdBuffers(t *testing.T) {
 	}
 
 	remove := commandValue(fixture.binding, 2)
-	remove.Mutations = make([]replication.Mutation, documents)
+	remove.Batches[0].Mutations = make([]replication.Mutation, documents)
 	for index := range keys {
-		remove.Mutations[index] = replication.Mutation{
+		remove.Batches[0].Mutations[index] = replication.Mutation{
 			Kind: replication.MutationDelete, Key: keys[index],
 		}
 	}
@@ -754,10 +754,10 @@ func TestApplyNormalBatchEqualPutSkipsBeforeValueHash(t *testing.T) {
 	}
 	before := fixture.machine.Published()
 	equal := commandValue(fixture.binding, 2)
-	equal.Mutations = []replication.Mutation{{
+	equal.Batches[0].Mutations = []replication.Mutation{{
 		Kind:  replication.MutationPut,
-		Key:   bytes.Clone(seed.Mutations[0].Key),
-		Value: bytes.Clone(seed.Mutations[0].Value),
+		Key:   bytes.Clone(seed.Batches[0].Mutations[0].Key),
+		Value: bytes.Clone(seed.Batches[0].Mutations[0].Value),
 	}}
 	entries := normalBatchEntries(4, encodeCommand(t, equal), nil)
 	witnesses := normalBatchWitnesses(entries)
@@ -799,16 +799,16 @@ func TestApplyNormalBatchHybridAdmissionRejectsBeforeDescriptorHashing(t *testin
 		return append(value, '"', '}')
 	}
 	command := commandValue(fixture.binding, 1)
-	command.Mutations = nil
+	command.Batches[0].Mutations = nil
 	for index, fill := range []byte{'a', 'b', 'c'} {
-		command.Mutations = append(command.Mutations, replication.Mutation{
+		command.Batches[0].Mutations = append(command.Batches[0].Mutations, replication.Mutation{
 			Kind:  replication.MutationPut,
 			Key:   []byte{0, 'h', 'y', 'b', 'r', 'i', 'd', byte(index)},
 			Value: document(fill),
 		})
 	}
-	if firstTwo := len(command.Mutations[0].Key) + len(command.Mutations[0].Value) +
-		len(command.Mutations[1].Key) + len(command.Mutations[1].Value); firstTwo > fixture.user.Limits.MaxBatchBytes {
+	if firstTwo := len(command.Batches[0].Mutations[0].Key) + len(command.Batches[0].Mutations[0].Value) +
+		len(command.Batches[0].Mutations[1].Key) + len(command.Batches[0].Mutations[1].Value); firstTwo > fixture.user.Limits.MaxBatchBytes {
 		t.Fatalf("first two mutations already exceed batch limit: %d > %d",
 			firstTwo, fixture.user.Limits.MaxBatchBytes)
 	}
@@ -864,7 +864,7 @@ func TestApplyNormalBatchHybridAdmissionRereadsOnlyAcceptedChanges(t *testing.T)
 	seedValues := [][]byte{document('a'), document('b'), document('c')}
 	for index := range keys {
 		seed := commandValue(fixture.binding, uint64(index+1))
-		seed.Mutations = []replication.Mutation{{
+		seed.Batches[0].Mutations = []replication.Mutation{{
 			Kind: replication.MutationPut, Key: keys[index], Value: seedValues[index],
 		}}
 		if _, err := fixture.machine.ApplyNormal(
@@ -875,7 +875,7 @@ func TestApplyNormalBatchHybridAdmissionRereadsOnlyAcceptedChanges(t *testing.T)
 	}
 
 	command := commandValue(fixture.binding, 4)
-	command.Mutations = []replication.Mutation{
+	command.Batches[0].Mutations = []replication.Mutation{
 		{Kind: replication.MutationPut, Key: keys[0], Value: seedValues[0]},
 		{Kind: replication.MutationPut, Key: keys[1], Value: seedValues[1]},
 		{Kind: replication.MutationPut, Key: keys[2], Value: document('d')},
@@ -914,7 +914,7 @@ func TestApplyNormalBatchDescriptorsRestoreLargeBaseWithoutReread(t *testing.T) 
 	original, changed := makeValue('a'), makeValue('b')
 	seed := commandValue(fixture.binding, 1)
 	seed.ClientID, seed.ClientEpoch = sessions[0].ClientID, sessions[0].ClientEpoch
-	seed.Mutations = []replication.Mutation{{
+	seed.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: key, Value: original,
 	}}
 	if _, err := fixture.machine.ApplyNormal(normalMeta(4), encodeCommand(t, seed)); err != nil {
@@ -926,12 +926,12 @@ func TestApplyNormalBatchDescriptorsRestoreLargeBaseWithoutReread(t *testing.T) 
 
 	first := commandValue(fixture.binding, 2)
 	first.ClientID, first.ClientEpoch = sessions[0].ClientID, sessions[0].ClientEpoch
-	first.Mutations = []replication.Mutation{{
+	first.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: key, Value: changed,
 	}}
 	second := commandValue(fixture.binding, 1)
 	second.ClientID, second.ClientEpoch = sessions[1].ClientID, sessions[1].ClientEpoch
-	second.Mutations = []replication.Mutation{{
+	second.Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: key, Value: original,
 	}}
 	entries := normalBatchEntries(5, encodeCommand(t, first), encodeCommand(t, second))
@@ -976,13 +976,13 @@ func TestApplyNormalBatchMatchesSequentialLogicalPublicationsAndNetState(t *test
 	key := []byte{'b', 0, 0xff, 'k'}
 	commands := openDistinctBatchSessions(t, batched.machine, batched.binding, 2, 3)
 	_ = openDistinctBatchSessions(t, sequential.machine, sequential.binding, 2, 3)
-	commands[0].Mutations = []replication.Mutation{{
+	commands[0].Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: key, Value: []byte(`{"n":1}`),
 	}}
-	commands[1].Mutations = []replication.Mutation{{
+	commands[1].Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationPut, Key: key, Value: []byte(`{"n":2}`),
 	}}
-	commands[2].Mutations = []replication.Mutation{{
+	commands[2].Batches[0].Mutations = []replication.Mutation{{
 		Kind: replication.MutationDelete, Key: key,
 	}}
 	encoded := make([][]byte, len(commands))
@@ -1175,9 +1175,9 @@ func TestApplyNormalBatchReturnsExactCapacityPrefix(t *testing.T) {
 	}
 	commands := openDistinctBatchSessions(t, fixture.machine, fixture.binding, 2, 2)
 	first := commands[0]
-	first.Mutations[0].Key = []byte("first")
+	first.Batches[0].Mutations[0].Key = []byte("first")
 	second := commands[1]
-	second.Mutations[0].Key = []byte("second")
+	second.Batches[0].Mutations[0].Key = []byte("second")
 	entries := normalBatchEntries(
 		4, encodeCommand(t, first), encodeCommand(t, second),
 	)
@@ -1620,7 +1620,7 @@ func benchmarkApplyNormalBatchCommittedRun(b *testing.B, entriesPerBatch int) {
 			command := commandValue(fixture.binding, commandOrdinal)
 			command.ClientID = sessions[index].ClientID
 			command.ClientEpoch = sessions[index].ClientEpoch
-			command.Mutations = []replication.Mutation{{
+			command.Batches[0].Mutations = []replication.Mutation{{
 				Kind:  replication.MutationPut,
 				Key:   []byte{0, byte(index % MaxDistinctMutations), 0xff},
 				Value: []byte{'{', '"', 'n', '"', ':', byte('0' + (index+int(commandOrdinal))%10), '}'},
@@ -1677,9 +1677,9 @@ func BenchmarkApplyNormalBatchLargeDeletePlanning(b *testing.B) {
 	for iteration := 0; iteration < b.N; iteration++ {
 		b.StopTimer()
 		put := commandValue(fixture.binding, commandOrdinal)
-		put.Mutations = make([]replication.Mutation, documents)
+		put.Batches[0].Mutations = make([]replication.Mutation, documents)
 		for index := range keys {
-			put.Mutations[index] = replication.Mutation{
+			put.Batches[0].Mutations[index] = replication.Mutation{
 				Kind: replication.MutationPut, Key: keys[index], Value: largeValue,
 			}
 		}
@@ -1694,9 +1694,9 @@ func BenchmarkApplyNormalBatchLargeDeletePlanning(b *testing.B) {
 			b.Fatal(err)
 		}
 		remove := commandValue(fixture.binding, commandOrdinal)
-		remove.Mutations = make([]replication.Mutation, documents)
+		remove.Batches[0].Mutations = make([]replication.Mutation, documents)
 		for index := range keys {
-			remove.Mutations[index] = replication.Mutation{
+			remove.Batches[0].Mutations[index] = replication.Mutation{
 				Kind: replication.MutationDelete, Key: keys[index],
 			}
 		}
