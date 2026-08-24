@@ -21,18 +21,17 @@ const (
 	ResultFormatMutation uint16 = 1
 
 	// Zero and unknown result codes are invalid.
-	ResultApplied           uint32 = 1
-	ResultStaleFence        uint32 = 2
-	ResultUnknownCollection uint32 = 3
-	ResultInvalidDocument   uint32 = 4
-	ResultTargetBound       uint32 = 5
-	ResultWrongShard        uint32 = 6
-	ResultSessionRetired    uint32 = 7
-	ResultSessionOpened     uint32 = 8
-	ResultSessionRenewed    uint32 = 9
-	ResultSessionRevoked    uint32 = 10
-	ResultUnknownRelation   uint32 = 11
-	ResultIndexConflict     uint32 = 12
+	ResultApplied         uint32 = 1
+	ResultStaleFence      uint32 = 2
+	ResultUnknownRelation uint32 = 3
+	ResultInvalidDocument uint32 = 4
+	ResultTargetBound     uint32 = 5
+	ResultWrongShard      uint32 = 6
+	ResultSessionRetired  uint32 = 7
+	ResultSessionOpened   uint32 = 8
+	ResultSessionRenewed  uint32 = 9
+	ResultSessionRevoked  uint32 = 10
+	ResultIndexConflict   uint32 = 11
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf

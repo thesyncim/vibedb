@@ -45,6 +45,23 @@ func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
 		t.Fatalf("leader mismatch error = %v", err)
 	}
 
+	// The plan deeply owns the exact-length cold SQL relation manifest.
+	withRelation := target
+	withRelation.SQL.Relations = []sqldriver.ReplicatedShardRelationIdentity{{
+		Relation: 1, Table: "docs",
+	}}
+	ownedPlan, err := NewPlan(
+		plan.sourceSnapshotForTest(t), split, plan.partitioner, []ChildTarget{withRelation},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRelation.SQL.Relations[0].Table = "mutated"
+	retained, ok := ownedPlan.Target(1)
+	if !ok || retained.SQL.Relations[0].Table == "mutated" {
+		t.Fatalf("plan retained caller-owned SQL relation storage: %+v", retained.SQL.Relations)
+	}
+
 	// Caller-owned plan headers cannot relabel the accepted operation afterward.
 	split.Source.Shard = "mutated"
 	split.ChildCount = 3

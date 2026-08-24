@@ -16,12 +16,16 @@ import (
 var _ raftmodel.NormalBatchStateMachine = (*Machine)(nil)
 
 type normalBatchWorkspace struct {
-	system    logicalOverlay
-	user      logicalOverlay
-	attempted logicalOverlay
-	plan      commandPlanScratch
-	state     []byte
-	keys      []finalMutation
+	system         logicalOverlay
+	user           logicalOverlay
+	attempted      logicalOverlay
+	relationExtra  []logicalOverlay
+	attemptedExtra []logicalOverlay
+	relationMarks  []logicalOverlayMark
+	attemptedMarks []logicalOverlayMark
+	plan           commandPlanScratch
+	state          []byte
+	keys           []finalMutation
 }
 
 type normalBatchTelemetry struct {
@@ -47,7 +51,19 @@ func (workspace *normalBatchWorkspace) release() uint64 {
 	workspace.system.release()
 	workspace.user.release()
 	workspace.attempted.release()
+	relationBank := workspace.relationExtra[:cap(workspace.relationExtra)]
+	attemptedBank := workspace.attemptedExtra[:cap(workspace.attemptedExtra)]
+	for i := range relationBank {
+		relationBank[i].release()
+	}
+	for i := range attemptedBank {
+		attemptedBank[i].release()
+	}
 	workspace.plan.release()
+	clear(workspace.relationMarks)
+	clear(workspace.attemptedMarks)
+	workspace.relationMarks = workspace.relationMarks[:0]
+	workspace.attemptedMarks = workspace.attemptedMarks[:0]
 	clear(workspace.state)
 	workspace.state = workspace.state[:0]
 	if cap(workspace.state) > maxNormalBatchRetainedBufferBytes {
@@ -56,7 +72,10 @@ func (workspace *normalBatchWorkspace) release() uint64 {
 	if cap(workspace.keys) > maxNormalBatchRetainedOverlayEntries {
 		workspace.keys = nil
 	}
-	return uint64(workspace.retainedBytes())
+	retained := uint64(workspace.retainedBytes())
+	workspace.relationExtra = workspace.relationExtra[:0]
+	workspace.attemptedExtra = workspace.attemptedExtra[:0]
+	return retained
 }
 
 func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
@@ -71,12 +90,95 @@ func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
 			uintptr(cap(overlay.undo))*unsafe.Sizeof(logicalOverlayUndo{})
 	}
 	plan := &workspace.plan
-	return overlayBytes(&workspace.system) + overlayBytes(&workspace.user) +
-		overlayBytes(&workspace.attempted) +
+	retained := overlayBytes(&workspace.system) + overlayBytes(&workspace.user) +
+		overlayBytes(&workspace.attempted)
+	relationBank := workspace.relationExtra[:cap(workspace.relationExtra)]
+	attemptedBank := workspace.attemptedExtra[:cap(workspace.attemptedExtra)]
+	for i := range relationBank {
+		retained += overlayBytes(&relationBank[i])
+	}
+	for i := range attemptedBank {
+		retained += overlayBytes(&attemptedBank[i])
+	}
+	return retained +
 		uintptr(cap(plan.sessionRead)+cap(plan.slotRead)+cap(plan.sessionRecord)+
 			cap(plan.slotRecord)+cap(plan.currentValue)+cap(workspace.state)) +
 		uintptr(cap(plan.descriptors))*unsafe.Sizeof(mutationValueDescriptor{}) +
+		uintptr(cap(workspace.relationMarks)+cap(workspace.attemptedMarks))*
+			unsafe.Sizeof(logicalOverlayMark{}) +
 		uintptr(cap(workspace.keys))*unsafe.Sizeof(finalMutation{})
+}
+
+func (workspace *normalBatchWorkspace) prepareRelationOverlays(
+	snapshots relationPointSnapshots,
+) bool {
+	if workspace == nil || snapshots.count == 0 ||
+		int(snapshots.count) > replication.MaxRelationsPerBundle {
+		return false
+	}
+	extra := int(snapshots.count) - 1
+	if cap(workspace.relationExtra) < extra {
+		workspace.relationExtra = append(
+			workspace.relationExtra[:cap(workspace.relationExtra)],
+			make([]logicalOverlay, extra-cap(workspace.relationExtra))...,
+		)
+	} else {
+		workspace.relationExtra = workspace.relationExtra[:extra]
+	}
+	if cap(workspace.attemptedExtra) < extra {
+		workspace.attemptedExtra = append(
+			workspace.attemptedExtra[:cap(workspace.attemptedExtra)],
+			make([]logicalOverlay, extra-cap(workspace.attemptedExtra))...,
+		)
+	} else {
+		workspace.attemptedExtra = workspace.attemptedExtra[:extra]
+	}
+	count := int(snapshots.count)
+	if cap(workspace.relationMarks) < count {
+		workspace.relationMarks = make([]logicalOverlayMark, count)
+	} else {
+		workspace.relationMarks = workspace.relationMarks[:count]
+	}
+	if cap(workspace.attemptedMarks) < count {
+		workspace.attemptedMarks = make([]logicalOverlayMark, count)
+	} else {
+		workspace.attemptedMarks = workspace.attemptedMarks[:count]
+	}
+	workspace.user.reset(snapshots.values[0].value)
+	workspace.attempted.reset(nil)
+	for i := range extra {
+		workspace.relationExtra[i].reset(snapshots.values[i+1].value)
+		workspace.attemptedExtra[i].reset(nil)
+	}
+	return true
+}
+
+func (workspace *normalBatchWorkspace) relationOverlay(ordinal int) *logicalOverlay {
+	if workspace == nil || ordinal < 0 {
+		return nil
+	}
+	if ordinal == 0 {
+		return &workspace.user
+	}
+	ordinal--
+	if ordinal >= len(workspace.relationExtra) {
+		return nil
+	}
+	return &workspace.relationExtra[ordinal]
+}
+
+func (workspace *normalBatchWorkspace) attemptedOverlay(ordinal int) *logicalOverlay {
+	if workspace == nil || ordinal < 0 {
+		return nil
+	}
+	if ordinal == 0 {
+		return &workspace.attempted
+	}
+	ordinal--
+	if ordinal >= len(workspace.attemptedExtra) {
+		return nil
+	}
+	return &workspace.attemptedExtra[ordinal]
 }
 
 // ApplyNormalBatch plans a bounded consecutive normal-entry run against one
@@ -114,7 +216,7 @@ func (m *Machine) ApplyNormalBatch(
 		}
 		totalBytes += len(entries[i].Data)
 	}
-	if m.checkpointGroup == nil || m.capture != nil || len(m.relations) != 1 {
+	if m.checkpointGroup == nil || m.capture != nil || len(m.relations) == 0 {
 		return 0, raftmodel.Publication{}, nil
 	}
 	first := entries[0]
@@ -134,7 +236,6 @@ func (m *Machine) ApplyNormalBatch(
 	if err != nil {
 		return 0, raftmodel.Publication{}, m.fail(err)
 	}
-	userSnapshot := relationSnapshots.values[0].value
 	batch := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 	defer func() {
 		telemetry := normalBatchTelemetry{
@@ -150,8 +251,15 @@ func (m *Machine) ApplyNormalBatch(
 		normalBatchWorkspacePool.Put(batch)
 	}()
 	batch.system.reset(systemSnapshot)
-	batch.user.reset(userSnapshot)
-	batch.attempted.reset(nil)
+	if !batch.prepareRelationOverlays(relationSnapshots) {
+		return 0, raftmodel.Publication{}, m.fail(errors.Join(
+			ErrInconsistentSnapshot, m.applyCut.Close(),
+		))
+	}
+	planningSnapshots := relationSnapshots
+	for ordinal := range m.relations {
+		planningSnapshots.values[ordinal].overlay = batch.relationOverlay(ordinal)
+	}
 	var found bool
 	var stateErr error
 	batch.state, found, stateErr = batch.system.appendRaw(
@@ -226,10 +334,10 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			selectedSessionDigests[selectedSessions] = sessionDigest
 			selectedSessions++
-			plan, deferredErr = m.planCommand(
+			plan, deferredErr = m.planBundleCommand(
 				command, meta.Index, working,
 				pointSnapshot{value: systemSnapshot, overlay: &batch.system},
-				pointSnapshot{value: userSnapshot, overlay: &batch.user},
+				planningSnapshots,
 				&batch.plan,
 			)
 			if deferredErr != nil {
@@ -241,24 +349,32 @@ func (m *Machine) ApplyNormalBatch(
 		}
 
 		systemMark := batch.system.mark()
-		userMark := batch.user.mark()
-		attemptedMark := batch.attempted.mark()
+		for ordinal := range m.relations {
+			batch.relationMarks[ordinal] = batch.relationOverlay(ordinal).mark()
+			batch.attemptedMarks[ordinal] = batch.attemptedOverlay(ordinal).mark()
+		}
 		if deferredErr = m.recordBatchPlan(batch, plan); deferredErr != nil {
 			batch.system.rollback(systemMark)
-			batch.user.rollback(userMark)
-			batch.attempted.rollback(attemptedMark)
+			for ordinal := range m.relations {
+				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
+				batch.attemptedOverlay(ordinal).rollback(batch.attemptedMarks[ordinal])
+			}
 			break
 		}
 		if !m.batchFits(batch, 1, len(stateKey)+stateEnvelopeBytes) {
 			batch.system.rollback(systemMark)
-			batch.user.rollback(userMark)
-			batch.attempted.rollback(attemptedMark)
+			for ordinal := range m.relations {
+				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
+				batch.attemptedOverlay(ordinal).rollback(batch.attemptedMarks[ordinal])
+			}
 			deferredErr = ErrAdmissionBound
 			break
 		}
 		batch.system.commit(systemMark)
-		batch.user.commit(userMark)
-		batch.attempted.commit(attemptedMark)
+		for ordinal := range m.relations {
+			batch.relationOverlay(ordinal).commit(batch.relationMarks[ordinal])
+			batch.attemptedOverlay(ordinal).commit(batch.attemptedMarks[ordinal])
+		}
 		working = next
 		dataChainWitnesses[planned] = working.DataChainDigest
 		planned++
@@ -290,55 +406,92 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, m.fail(deferredErr)
 	}
 
-	var memberStorage [2]durable.NamedCollection
-	memberStorage[0] = durable.NamedCollection{
+	m.transitionMembers = m.transitionMembers[:0]
+	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
 		BatchDocumentsHint: batch.system.netDocuments,
-	}
-	memberCount := 1
-	if batch.user.netDocuments != 0 {
-		memberStorage[memberCount] = durable.NamedCollection{
-			Name: m.userName, Collection: m.user.Collection,
-			BatchDocumentsHint: batch.user.netDocuments,
+	})
+	for ordinal := range m.relations {
+		overlay := batch.relationOverlay(ordinal)
+		if overlay.netDocuments == 0 {
+			continue
 		}
-		memberCount++
+		relation := &m.relations[ordinal]
+		m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
+			Name: relation.name, Collection: relation.target.Collection,
+			BatchDocumentsHint: overlay.netDocuments,
+		})
 	}
 	updateErr := m.checkpointGroup.UpdateConsecutive(
-		entries[0].Meta.Index, working.Applied, memberStorage[:memberCount],
+		entries[0].Meta.Index, working.Applied, m.transitionMembers,
 		m.options.TxnLimits,
 		func(transaction *durable.DatabaseBatch) error {
-			systemBatch, batchErr := transaction.Collection(systemCollectionName)
+			systemBatch, batchErr := transaction.CollectionHandle(m.system.Collection)
 			if batchErr != nil {
 				return batchErr
 			}
 			if batchErr = batch.system.writeNet(systemBatch); batchErr != nil {
 				return batchErr
 			}
-			if batch.user.netDocuments == 0 {
-				return nil
+			for ordinal := range m.relations {
+				overlay := batch.relationOverlay(ordinal)
+				if overlay.netDocuments == 0 {
+					continue
+				}
+				relationBatch, relationErr := transaction.CollectionHandle(
+					m.relations[ordinal].target.Collection,
+				)
+				if relationErr != nil {
+					return relationErr
+				}
+				if relationErr = overlay.writeNet(relationBatch); relationErr != nil {
+					return relationErr
+				}
 			}
-			userBatch, batchErr := transaction.Collection(m.userName)
-			if batchErr != nil {
-				return batchErr
-			}
-			return batch.user.writeNet(userBatch)
+			return nil
 		},
 	)
-	if len(batch.attempted.entries) != 0 && m.user.ObserveMutationAttempt != nil {
-		batch.keys = batch.attempted.appendAttempted(batch.keys[:0])
-		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: batch.keys}, updateErr)
+	anyAttempted := false
+	for ordinal := range m.relations {
+		attempted := batch.attemptedOverlay(ordinal)
+		if len(attempted.entries) == 0 {
+			continue
+		}
+		anyAttempted = true
+		observer := m.relations[ordinal].target.ObserveMutationAttempt
+		if ordinal == 0 {
+			// user remains the canonical singleton integration handle. Tests and
+			// internal integrations may install its synchronous observer after
+			// Open; the dense first-relation mirror is otherwise immutable.
+			observer = m.user.ObserveMutationAttempt
+		}
+		if observer == nil {
+			continue
+		}
+		batch.keys = attempted.appendAttempted(batch.keys[:0])
+		observer(AttemptedMutationKeys{changes: batch.keys}, updateErr)
 	}
 	if updateErr != nil {
 		clear(dataChainWitnesses[:planned])
 		return 0, raftmodel.Publication{}, m.fail(updateErr)
 	}
 
-	if len(batch.attempted.entries) == 0 && m.openedImageGeneration != 0 &&
-		m.user.Collection.Generation() == m.openedImageGeneration {
+	if !anyAttempted && m.openedBundleImageCurrent() {
 		m.openedImageApplied = working.Applied
+		for ordinal := range m.relations {
+			m.relations[ordinal].openedApplied = working.Applied
+		}
 	} else {
 		m.openedImageApplied = 0
 		m.openedImageGeneration = 0
+		for ordinal := range m.relations {
+			if len(batch.attemptedOverlay(ordinal).entries) == 0 {
+				continue
+			}
+			m.relations[ordinal].openedImage = [32]byte{}
+			m.relations[ordinal].openedApplied = 0
+			m.relations[ordinal].openedGen = 0
+		}
 	}
 	m.state = working
 	m.initialized = true
@@ -369,6 +522,9 @@ func (m *Machine) recordBatchPlan(
 	batch *normalBatchWorkspace,
 	plan commandPlan,
 ) error {
+	if batch == nil {
+		return ErrInvalidCollection
+	}
 	if plan.writeSession {
 		if err := batch.system.record(plan.sessionKey[:], plan.sessionRecord, false); err != nil {
 			return err
@@ -393,12 +549,25 @@ func (m *Machine) recordBatchPlan(
 			}
 		}
 	}
-	for _, mutation := range plan.changes {
-		if err := batch.user.recordMutation(mutation, batch.plan.descriptors); err != nil {
-			return err
+	if err := m.validateRelationChangePlan(plan.changes, plan.relations); err != nil {
+		return err
+	}
+	for i := range plan.relations {
+		span := plan.relations[i]
+		ordinal := int(span.ordinal)
+		relation := batch.relationOverlay(ordinal)
+		attempted := batch.attemptedOverlay(ordinal)
+		if relation == nil || attempted == nil {
+			return ErrInvalidCollection
 		}
-		if err := batch.attempted.record(mutation.key, nil, false); err != nil {
-			return err
+		for mutationIndex := span.start; mutationIndex < span.end; mutationIndex++ {
+			mutation := plan.changes[mutationIndex]
+			if err := relation.recordMutation(mutation, batch.plan.descriptors); err != nil {
+				return err
+			}
+			if err := attempted.record(mutation.key, nil, false); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -418,21 +587,31 @@ func (m *Machine) batchFits(
 	systemBytes := batch.system.netBytes + systemExtraBytes
 	if systemDocuments == 0 ||
 		systemDocuments > m.system.Limits.MaxDistinctMutations ||
-		systemBytes > m.system.Limits.MaxBatchBytes ||
-		batch.user.netDocuments > m.user.Limits.MaxDistinctMutations ||
-		batch.user.netBytes > m.user.Limits.MaxBatchBytes {
+		systemBytes > m.system.Limits.MaxBatchBytes {
 		return false
 	}
 	collections := 1
-	if batch.user.netDocuments != 0 {
-		collections++
+	documents := systemDocuments
+	bytes := systemBytes
+	for ordinal := range m.relations {
+		overlay := batch.relationOverlay(ordinal)
+		if overlay == nil || overlay.netDocuments < 0 || overlay.netBytes < 0 {
+			return false
+		}
+		limits := m.relations[ordinal].target.Limits
+		if overlay.netDocuments > limits.MaxDistinctMutations ||
+			overlay.netBytes > limits.MaxBatchBytes ||
+			documents > math.MaxInt-overlay.netDocuments ||
+			bytes > math.MaxInt-overlay.netBytes {
+			return false
+		}
+		if overlay.netDocuments != 0 {
+			collections++
+		}
+		documents += overlay.netDocuments
+		bytes += overlay.netBytes
 	}
-	documents := systemDocuments + batch.user.netDocuments
-	if collections > m.options.TxnLimits.MaxCollections ||
-		documents > m.options.TxnLimits.MaxDocuments ||
-		systemBytes > math.MaxInt-batch.user.netBytes {
-		return false
-	}
-	bytes := systemBytes + batch.user.netBytes
-	return int64(bytes) <= m.options.TxnLimits.MaxBytes
+	return collections <= m.options.TxnLimits.MaxCollections &&
+		documents <= m.options.TxnLimits.MaxDocuments &&
+		int64(bytes) <= m.options.TxnLimits.MaxBytes
 }

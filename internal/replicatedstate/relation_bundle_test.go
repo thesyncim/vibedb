@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -33,6 +34,14 @@ type relationBundleFixture struct {
 }
 
 func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixture {
+	return newRelationBundleFixtureWithGlobalOptions(t, checkpoint, durable.Options{})
+}
+
+func newRelationBundleFixtureWithGlobalOptions(
+	t testing.TB,
+	checkpoint bool,
+	globalOptions durable.Options,
+) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
 	open := func(name string, options durable.Options) CollectionTarget {
@@ -56,7 +65,7 @@ func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixtu
 	})
 	system = systemTargetOf(system.Collection)
 	base := open("base", durable.Options{Indexes: []store.IndexDefinition{index}})
-	global := open("global", durable.Options{})
+	global := open("global", globalOptions)
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +183,140 @@ func exactIndexKeys(
 		t.Fatal(err)
 	}
 	return keys
+}
+
+func TestSingletonApplyContractAuthenticatesNativeExactIndexes(t *testing.T) {
+	target := CollectionTarget{
+		Validation:       ValidationDeterministicMutation,
+		ValidationDigest: [sha256.Size]byte{1},
+		Limits: CollectionLimits{
+			MaxKeyBytes: 64, MaxDocumentBytes: 1024,
+			MaxDistinctMutations: 8, MaxBatchBytes: 8192,
+		},
+	}
+	var contracts [2][sha256.Size]byte
+	for _, indexes := range [][]store.IndexDefinition{
+		nil,
+		{{Name: "by_email", Paths: []string{"/email"}}},
+	} {
+		ordinal := 0
+		if len(indexes) != 0 {
+			ordinal = 1
+		}
+		relations := []relationCollection{{
+			id: 1, kind: RelationJSON, name: "base", target: target,
+			localIndexes: indexes,
+		}}
+		contract, digestErr := bundleApplyContractDigest(
+			relationManifestDigest(7, relations), relations, 128, 8,
+		)
+		if digestErr != nil || contract == ([sha256.Size]byte{}) {
+			t.Fatalf("singleton contract indexes=%v = %x, %v", indexes, contract, digestErr)
+		}
+		contracts[ordinal] = contract
+	}
+	if contracts[0] == contracts[1] {
+		t.Fatal("singleton apply contract did not authenticate the native exact-index manifest")
+	}
+}
+
+func TestRelationBundleBatchPublishesOnePhysicalUpdateAndUsesLogicalIndexOverlay(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	sessions := openDistinctBatchSessions(t, fixture.machine, fixture.binding, 3, 2)
+	globalKey := []byte{0x91, 0x01, 'a'}
+	commands := make([][]byte, len(sessions))
+	for i := range sessions {
+		command := commandValue(fixture.binding, 1)
+		command.ClientID = sessions[i].ClientID
+		command.ClientEpoch = sessions[i].ClientEpoch
+		command.Fingerprint = sha256.Sum256([]byte{0xb1, byte(i)})
+		key := []byte(fmt.Sprintf("doc-%d", i+1))
+		document := []byte(fmt.Sprintf(`{"email":"a","n":%d}`, i+1))
+		locator := []byte(fmt.Sprintf(`["doc-%d"]`, i+1))
+		command.Batches = []replication.RelationMutationBatch{
+			{Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: key, Value: document,
+			}}},
+			{Relation: 2, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: locator,
+			}}},
+		}
+		commands[i] = encodeCommand(t, command)
+	}
+	entries := []raftmodel.NormalApply{
+		{Meta: normalMeta(5), Data: commands[0]},
+		{Meta: normalMeta(6), Data: commands[1]},
+	}
+	witnesses := make([][sha256.Size]byte, len(entries))
+	before := fixture.group.Stats()
+	applied, publication, err := fixture.machine.ApplyNormalBatch(entries, witnesses)
+	if err != nil || applied != len(entries) || publication.Applied != 6 {
+		t.Fatalf("bundle batch = %d, %+v, %v", applied, publication, err)
+	}
+	after := fixture.group.Stats()
+	if after.Updates != before.Updates+1 ||
+		after.TransactionHighWater != before.TransactionHighWater+1 {
+		t.Fatalf("bundle batch was not one physical update: %+v -> %+v", before, after)
+	}
+	if witnesses[0] == ([sha256.Size]byte{}) || witnesses[1] != witnesses[0] {
+		t.Fatalf("bundle witnesses = %x / %x", witnesses[0], witnesses[1])
+	}
+	if got := bundleCompletionResult(t, fixture.machine, commands[0]); got != ResultApplied {
+		t.Fatalf("first bundle result = %d", got)
+	}
+	if got := bundleCompletionResult(t, fixture.machine, commands[1]); got != ResultIndexConflict {
+		t.Fatalf("overlay uniqueness result = %d", got)
+	}
+	if value, found, readErr := fixture.base.Collection.AppendRaw(nil, []byte("doc-1")); readErr != nil || !found || !bytes.Equal(value, []byte(`{"email":"a","n":1}`)) {
+		t.Fatalf("first base row = %q,%v,%v", value, found, readErr)
+	}
+	if _, found, readErr := fixture.base.Collection.AppendRaw(nil, []byte("doc-2")); readErr != nil || found {
+		t.Fatalf("conflicting base row escaped bundle = %v,%v", found, readErr)
+	}
+	if value, found, readErr := fixture.global.Collection.AppendRaw(nil, globalKey); readErr != nil || !found || !bytes.Equal(value, []byte(`["doc-1"]`)) {
+		t.Fatalf("global claim = %q,%v,%v", value, found, readErr)
+	}
+	if keys := exactIndexKeys(
+		t, fixture.base.Collection, fixture.index.Name, []byte(`"a"`),
+	); len(keys) != 1 || !bytes.Equal(keys[0], []byte("doc-1")) {
+		t.Fatalf("local exact index keys = %q", keys)
+	}
+	workspace := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
+	assertNormalBatchWorkspaceReleased(t, workspace)
+	normalBatchWorkspacePool.Put(workspace)
+}
+
+func TestGlobalConditionalDeleteCompareDoesNotConsumeDocumentCapacity(t *testing.T) {
+	fixture := newRelationBundleFixtureWithGlobalOptions(
+		t, true, durable.Options{InlineValueBytes: 3, MaxDocumentBytes: 3},
+	)
+	key := []byte{0x91, 1}
+	locator := []byte(`[1]`)
+	put := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: locator,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), put); err != nil ||
+		bundleCompletionResult(t, fixture.machine, put) != ResultApplied {
+		t.Fatalf("bounded global put = %v", err)
+	}
+	digest := sha256.Sum256(locator)
+	remove := fixture.command(t, 2, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationDeleteDigestEqual, Key: key,
+			ExpectedValueLength: uint64(len(locator)), ExpectedValueDigest: digest,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), remove); err != nil ||
+		bundleCompletionResult(t, fixture.machine, remove) != ResultApplied {
+		t.Fatalf("bounded global delete = %v", err)
+	}
+	if _, found, err := fixture.global.Collection.AppendRaw(nil, key); err != nil || found {
+		t.Fatalf("bounded global delete left row: found=%v err=%v", found, err)
+	}
 }
 
 func TestRelationBundleAtomicBaseLocalAndGlobalIndexApply(t *testing.T) {
@@ -575,6 +718,9 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 		{"duplicate", func(m *SnapshotArtifactManifest) {
 			m.Relations[1].Relation = m.Relations[0].Relation
 		}},
+		{"duplicate_name", func(m *SnapshotArtifactManifest) {
+			m.Relations[1].Collection = bytes.Clone(m.Relations[0].Collection)
+		}},
 		{"sparse", func(m *SnapshotArtifactManifest) {
 			m.Relations[1].Relation = 3
 		}},
@@ -606,6 +752,81 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 		}, fixture.log, fixture.machine.options,
 	); err == nil {
 		t.Fatal("reopen accepted an unknown schema generation")
+	}
+}
+
+func TestSingletonRelationSnapshotCanonicalModelAndReencode(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	base, manifest, err := fixture.machine.BuildBundleSnapshotBase()
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenSnapshotBase(base)
+	if err != nil || !equalSnapshotArtifactManifest(opened.Manifest, manifest) {
+		t.Fatalf("open singleton relation certificate = %+v, %v", opened.Manifest, err)
+	}
+	if !opened.Manifest.Bundle || len(opened.Manifest.Relations) != 1 {
+		t.Fatalf("singleton relation model = bundle=%t relations=%d",
+			opened.Manifest.Bundle, len(opened.Manifest.Relations))
+	}
+	relation := opened.Manifest.Relations[0]
+	if relation.Relation != 1 || relation.Kind != RelationJSON ||
+		!bytes.Equal(relation.Collection, opened.Manifest.UserCollection) ||
+		relation.Rows != opened.Manifest.UserRows ||
+		relation.ImageDigest != opened.Manifest.ImageDigest ||
+		opened.Manifest.RelationManifestDigest != fixture.machine.manifestDigest {
+		t.Fatalf("singleton relation descriptor differs from canonical manifest: %+v", relation)
+	}
+	reencoded, err := BuildSnapshotBase(opened.Manifest, fixture.bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := proto.MarshalOptions{Deterministic: true}.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := proto.MarshalOptions{Deterministic: true}.Marshal(reencoded)
+	if err != nil || !bytes.Equal(first, second) {
+		t.Fatalf("singleton relation certificate canonical re-encode differs: %v", err)
+	}
+	publication, err := fixture.machine.InstallSnapshot(base)
+	if err != nil || publication.Applied != manifest.State.Applied ||
+		fixture.machine.state.SnapshotBaseDigest != opened.Digest {
+		t.Fatalf("install singleton relation certificate = %+v, %v", publication, err)
+	}
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+		fixture.machine.options,
+	)
+	if err != nil {
+		t.Fatalf("reopen singleton relation certificate: %v", err)
+	}
+	if reopened.Applied() != manifest.State.Applied ||
+		reopened.state.SnapshotBaseDigest != opened.Digest ||
+		reopened.Published().DataChainDigest != fixture.machine.Published().DataChainDigest {
+		t.Fatalf("reopen singleton relation certificate = applied %d", reopened.Applied())
+	}
+
+	wrongManifest := cloneSnapshotArtifactManifest(manifest)
+	wrongManifest.RelationManifestDigest[0] ^= 1
+	stateEnvelope, err := AppendState(nil, wrongManifest.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongManifest.Digest = bundleSnapshotManifestDigest(
+		stateEnvelope, wrongManifest.RelationManifestDigest,
+		wrongManifest.SystemRows, wrongManifest.Relations, wrongManifest.ImageDigest,
+	)
+	wrongBase, err := BuildSnapshotBase(wrongManifest, fixture.bootstrap)
+	if err != nil {
+		t.Fatalf("build well-formed unknown singleton manifest: %v", err)
+	}
+	if _, err := reopened.InstallSnapshot(wrongBase); !errors.Is(err, ErrSnapshotBase) {
+		t.Fatalf("install unknown singleton manifest = %v", err)
 	}
 }
 

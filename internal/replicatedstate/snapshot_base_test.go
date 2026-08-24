@@ -32,17 +32,6 @@ func TestSnapshotBaseCertificateDeterministicStrictAndBounded(t *testing.T) {
 	}
 	firstBytes, _ := proto.MarshalOptions{Deterministic: true}.Marshal(first)
 	secondBytes, _ := proto.MarshalOptions{Deterministic: true}.Marshal(second)
-	// This is the exact singleton certificate emitted by the pre-bundle format.
-	// The bundle extension owns only formerly reserved fields and an absent body,
-	// so the legacy protobuf and raw certificate bytes must remain identical.
-	if len(firstBytes) != 760 || len(first.GetData()) != 747 {
-		t.Fatalf("legacy singleton certificate geometry = protobuf %d data %d",
-			len(firstBytes), len(first.GetData()))
-	}
-	assertDigestHex(t, "legacy singleton snapshot protobuf", sha256.Sum256(firstBytes),
-		"823cc60e31141d237ff8063e1823151b15d62465629f38fb732f5f843c4a24b1")
-	assertDigestHex(t, "legacy singleton snapshot data", sha256.Sum256(first.GetData()),
-		"1422e3f935d4479440bfb8c4d067d96f34c93c5e740d2941ea4bf6a065c50890")
 	if !bytes.Equal(firstBytes, secondBytes) || len(first.GetData()) > MaxSnapshotBaseCertificateBytes {
 		t.Fatalf("certificate deterministic=%t bytes=%d/%d",
 			bytes.Equal(firstBytes, secondBytes), len(first.GetData()), MaxSnapshotBaseCertificateBytes)

@@ -215,7 +215,7 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	if err := m.checkUsable(); err != nil {
 		return nil, SnapshotArtifactManifest{}, err
 	}
-	if !m.initialized || len(m.relations) < 2 {
+	if !m.initialized || len(m.relations) == 0 {
 		return nil, SnapshotArtifactManifest{}, ErrSnapshotBase
 	}
 	cut, err := durable.SnapshotCollections(m.members)
@@ -323,7 +323,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 			uint64(snapshotBaseRelationFixedBytes+1)
 		maximum := uint64(snapshotBaseRelationDigestBytes) + relationCount*
 			uint64(snapshotBaseRelationFixedBytes+replication.MaxIdentityBytes)
-		if relationCount < 2 || userBytes > replication.MaxIdentityBytes ||
+		if relationCount < 1 || userBytes > replication.MaxIdentityBytes ||
 			relationBodyBytes < minimum || relationBodyBytes > maximum {
 			return SnapshotBaseCertificate{}, fmt.Errorf(
 				"%w: aggregate relation geometry", ErrSnapshotBase,
@@ -473,7 +473,7 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 }
 
 func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
-	if manifest.Seeded || len(manifest.Relations) < 2 ||
+	if manifest.Seeded || len(manifest.Relations) < 1 ||
 		len(manifest.Relations) > replication.MaxRelationsPerBundle ||
 		manifest.RelationManifestDigest == ([sha256.Size]byte{}) ||
 		manifest.TargetChunkBytes != 0 || manifest.Chunks != 0 ||
@@ -493,7 +493,6 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 	if err := validateState(manifest.State); err != nil {
 		return fmt.Errorf("%w: bundle state: %v", ErrSnapshotBase, err)
 	}
-	seenNames := make(map[string]struct{}, len(manifest.Relations))
 	var rows uint64
 	for i := range manifest.Relations {
 		relation := &manifest.Relations[i]
@@ -507,11 +506,11 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 			relation.ImageDigest == ([sha256.Size]byte{}) || rows > math.MaxUint64-relation.Rows {
 			return fmt.Errorf("%w: bundle relation %d", ErrSnapshotBase, i+1)
 		}
-		name := string(relation.Collection)
-		if _, exists := seenNames[name]; exists {
-			return fmt.Errorf("%w: duplicate bundle relation", ErrSnapshotBase)
+		for prior := 0; prior < i; prior++ {
+			if bytes.Equal(relation.Collection, manifest.Relations[prior].Collection) {
+				return fmt.Errorf("%w: duplicate bundle relation", ErrSnapshotBase)
+			}
 		}
-		seenNames[name] = struct{}{}
 		rows += relation.Rows
 	}
 	if !bytes.Equal(manifest.UserCollection, manifest.Relations[0].Collection) ||

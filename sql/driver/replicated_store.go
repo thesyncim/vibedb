@@ -1,15 +1,11 @@
 package driver
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"slices"
@@ -143,12 +139,51 @@ type ReplicatedShardStoreIdentity struct {
 	UserLimits     ReplicatedShardStoreLimits
 	Sidecars       ReplicatedShardStoreSidecarProfile
 
-	// RelationCount zero is the byte-identical legacy singleton catalog. A
-	// value of two or more activates the fixed dense relation manifest below.
+	// Every store carries the same dense relation manifest. Relations is an
+	// exact-length, deeply owned cold slice: a singleton retains one descriptor,
+	// not the maximum 59-slot capacity in every copied routing/control record.
 	RelationCount            uint16
 	RelationSchemaGeneration uint64
 	RelationManifestDigest   [sha256.Size]byte
-	Relations                [replication.MaxRelationsPerBundle]ReplicatedShardRelationIdentity
+	Relations                []ReplicatedShardRelationIdentity
+}
+
+// Equal compares the complete logical identity, including every relation
+// descriptor. Slice backing storage and capacity are deliberately irrelevant.
+func (i ReplicatedShardStoreIdentity) Equal(other ReplicatedShardStoreIdentity) bool {
+	return i.Format == other.Format && i.Binding == other.Binding && i.LogID == other.LogID &&
+		i.UserTable == other.UserTable && i.UserStorage == other.UserStorage &&
+		i.UserPrimaryKey == other.UserPrimaryKey && i.UserLimits == other.UserLimits &&
+		i.Sidecars == other.Sidecars && i.RelationCount == other.RelationCount &&
+		i.RelationSchemaGeneration == other.RelationSchemaGeneration &&
+		i.RelationManifestDigest == other.RelationManifestDigest &&
+		slices.Equal(i.Relations, other.Relations)
+}
+
+// IsZero reports whether no retained identity is present.
+func (i ReplicatedShardStoreIdentity) IsZero() bool {
+	return i.Equal(ReplicatedShardStoreIdentity{})
+}
+
+// Clone returns an independently owned identity suitable for retention across
+// caller mutation or catalog publication.
+func (i ReplicatedShardStoreIdentity) Clone() ReplicatedShardStoreIdentity {
+	i.Binding = ownedReplicatedShardStoreBinding(i.Binding)
+	i.UserTable = strings.Clone(i.UserTable)
+	i.UserStorage = strings.Clone(i.UserStorage)
+	i.UserPrimaryKey = strings.Clone(i.UserPrimaryKey)
+	if len(i.Relations) == 0 {
+		i.Relations = nil
+		return i
+	}
+	relations := make([]ReplicatedShardRelationIdentity, len(i.Relations))
+	copy(relations, i.Relations)
+	for ordinal := range relations {
+		relations[ordinal].Table = strings.Clone(relations[ordinal].Table)
+		relations[ordinal].Storage = strings.Clone(relations[ordinal].Storage)
+	}
+	i.Relations = relations
+	return i
 }
 
 // BindReplicatedShardStore permanently converts one opened, prepared local
@@ -174,8 +209,7 @@ func (d *Database) BindReplicatedShardStore(
 // dense list of independently stored global-index relations to one replicated
 // shard group. All named tables must be the complete, unmaterialized catalog;
 // they are created, transaction-log adopted, and catalog-published as one
-// activation. The legacy singleton binder remains byte-identical when this API
-// is not used.
+// activation.
 func (d *Database) BindReplicatedShardStoreBundle(
 	binding ReplicatedShardStoreBinding,
 	userTable string,
@@ -193,7 +227,7 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if err := validateReplicatedUserTableName(userTable); err != nil {
+	if err := validateReplicatedBundleRelationName(userTable); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
 	if len(globalIndexes) == 0 || len(globalIndexes)+1 > replication.MaxRelationsPerBundle {
@@ -202,23 +236,25 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		)
 	}
 	ownedGlobals := make([]ReplicatedGlobalIndexRelation, len(globalIndexes))
-	seenTables := map[string]struct{}{userTable: {}}
 	for i := range globalIndexes {
 		relation := globalIndexes[i]
 		if relation.Relation != uint16(i+2) ||
-			validateReplicatedUserTableName(relation.Table) != nil ||
+			validateReplicatedBundleRelationName(relation.Table) != nil ||
 			relation.IndexID == 0 || relation.Incarnation == 0 ||
 			relation.LocatorCount == 0 || relation.LocatorCount > 8 {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: invalid global relation slot %d", ErrReplicatedShardStoreProfile, i+2,
 			)
 		}
-		if _, duplicate := seenTables[relation.Table]; duplicate {
+		duplicate := relation.Table == userTable
+		for prior := 0; !duplicate && prior < i; prior++ {
+			duplicate = relation.Table == ownedGlobals[prior].Table
+		}
+		if duplicate {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: duplicate relation table", ErrReplicatedShardStoreProfile,
 			)
 		}
-		seenTables[relation.Table] = struct{}{}
 		relation.Table = strings.Clone(relation.Table)
 		ownedGlobals[i] = relation
 	}
@@ -422,6 +458,7 @@ func (d *Database) bindReplicatedShardStoreBundle(
 	}
 	identity.RelationCount = uint16(len(pending))
 	identity.RelationSchemaGeneration = binding.Authority.SchemaGeneration
+	identity.Relations = make([]ReplicatedShardRelationIdentity, len(pending))
 	for i := range pending {
 		candidate := pending[i].candidate
 		relation := ReplicatedShardRelationIdentity{
@@ -536,7 +573,7 @@ func (d *Database) bindReplicatedShardStore(
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if err := validateReplicatedUserTableName(userTable); err != nil {
+	if err := validateReplicatedBundleRelationName(userTable); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
 	sidecars := canonicalReplicatedShardStoreSidecars()
@@ -939,7 +976,7 @@ func (d *Database) RequireReplicatedShardStore(
 	if err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
-	if actual != expected {
+	if !actual.Equal(expected) {
 		return ReplicatedShardStoreIdentity{}, ErrReplicatedShardStoreIdentityMismatch
 	}
 	return actual, nil
@@ -976,15 +1013,24 @@ func replicatedIdentityForTable(
 		MaxBatchBytes:     t.collection.MaxBatchBytes(),
 	}
 	identity := ReplicatedShardStoreIdentity{
-		Format:         ReplicatedShardStoreFormat,
-		Binding:        binding,
-		LogID:          logID,
-		UserTable:      strings.Clone(name),
-		UserStorage:    strings.Clone(t.meta.Storage),
-		UserPrimaryKey: strings.Clone(t.meta.PrimaryKey),
-		UserLimits:     limits,
-		Sidecars:       sidecars,
+		Format:                   ReplicatedShardStoreFormat,
+		Binding:                  binding,
+		LogID:                    logID,
+		UserTable:                strings.Clone(name),
+		UserStorage:              strings.Clone(t.meta.Storage),
+		UserPrimaryKey:           strings.Clone(t.meta.PrimaryKey),
+		UserLimits:               limits,
+		Sidecars:                 sidecars,
+		RelationCount:            1,
+		RelationSchemaGeneration: binding.Authority.SchemaGeneration,
+		Relations:                make([]ReplicatedShardRelationIdentity, 1),
 	}
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+		LocalIndexDigest: replicatedLocalIndexDigest(t.meta.Indexes),
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 			"%w: %v", ErrReplicatedShardStoreProfile, err,
@@ -1016,10 +1062,7 @@ func validateReplicatedCatalog(catalog catalogFile) error {
 		r.Binding.AllocationGeneration != uint64(local.AllocationGeneration) {
 		return ErrReplicatedShardStoreIdentityMismatch
 	}
-	wantTables := 1
-	if r.RelationCount != 0 {
-		wantTables = int(r.RelationCount)
-	}
+	wantTables := int(r.RelationCount)
 	if len(catalog.Tables) != wantTables || len(catalog.Views) != 0 {
 		return fmt.Errorf(
 			"%w: relation manifest must name the complete table catalog",
@@ -1058,23 +1101,9 @@ func validateReplicatedCatalog(catalog catalogFile) error {
 		}
 		return nil
 	}
-	if r.RelationCount == 0 {
-		var localIndexDigest [sha256.Size]byte
-		if meta := catalog.Tables[r.UserTable]; meta != nil {
-			localIndexDigest = replicatedLocalIndexDigest(meta.Indexes)
-		}
-		if err := validateRelation(ReplicatedShardRelationIdentity{
-			Relation: 1, Kind: ReplicatedShardRelationJSON,
-			Table: r.UserTable, Storage: r.UserStorage, Limits: r.UserLimits,
-			LocalIndexDigest: localIndexDigest,
-		}); err != nil {
+	for ordinal := 0; ordinal < int(r.RelationCount); ordinal++ {
+		if err := validateRelation(r.Relations[ordinal]); err != nil {
 			return err
-		}
-	} else {
-		for ordinal := 0; ordinal < int(r.RelationCount); ordinal++ {
-			if err := validateRelation(r.Relations[ordinal]); err != nil {
-				return err
-			}
 		}
 	}
 	if err := validateReplicatedApplyMeta(catalog.ReplicatedApply, r); err != nil {
@@ -1095,34 +1124,29 @@ func validateOpenedReplicatedCatalog(d *database) error {
 	if err != nil {
 		return err
 	}
-	if r.RelationCount != 0 {
+	if r.RelationCount > 1 {
 		actual.RelationCount = r.RelationCount
 		actual.RelationSchemaGeneration = r.RelationSchemaGeneration
 		actual.RelationManifestDigest = r.RelationManifestDigest
-		actual.Relations = r.Relations
+		actual.Relations = make([]ReplicatedShardRelationIdentity, len(r.Relations))
+		copy(actual.Relations, r.Relations)
 	}
-	if actual != r {
+	if !actual.Equal(r) {
 		return ErrReplicatedShardStoreIdentityMismatch
 	}
-	members := make([]durable.NamedCollection, 0, max(1, int(r.RelationCount))+1)
-	if r.RelationCount == 0 {
-		members = append(members, durable.NamedCollection{
-			Name: r.UserTable, Collection: t.collection,
-		})
-	} else {
-		for ordinal := 0; ordinal < int(r.RelationCount); ordinal++ {
-			relation := r.Relations[ordinal]
-			table := d.tables[relation.Table]
-			if !openedReplicatedRelationMatches(table, relation, r.Sidecars) {
-				return fmt.Errorf(
-					"%w: opened relation %q differs",
-					ErrReplicatedShardStoreProfile, relation.Table,
-				)
-			}
-			members = append(members, durable.NamedCollection{
-				Name: relation.Table, Collection: table.collection,
-			})
+	members := make([]durable.NamedCollection, 0, int(r.RelationCount)+1)
+	for ordinal := 0; ordinal < int(r.RelationCount); ordinal++ {
+		relation := r.Relations[ordinal]
+		table := d.tables[relation.Table]
+		if !openedReplicatedRelationMatches(table, relation, r.Sidecars) {
+			return fmt.Errorf(
+				"%w: opened relation %q differs",
+				ErrReplicatedShardStoreProfile, relation.Table,
+			)
 		}
+		members = append(members, durable.NamedCollection{
+			Name: relation.Table, Collection: table.collection,
+		})
 	}
 	if d.catalog.ReplicatedApply != nil {
 		if err := validateReplicatedApplyCollection(
@@ -1191,11 +1215,19 @@ func validateReplicatedShardStoreBinding(b ReplicatedShardStoreBinding) error {
 		a.RoutingVersion == 0 || a.RouteGeneration == 0 {
 		return errors.New("vibedb: replicated shard store binding contains a zero identity or generation")
 	}
-	for label, value := range map[string]string{"distribution": b.Distribution, "shard": b.Shard} {
-		if value == "" || len(value) > replicatedMaxIdentityBytes ||
-			!utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
-			return fmt.Errorf("vibedb: replicated %s is not a valid bounded identity", label)
-		}
+	if err := validateReplicatedBindingText("distribution", b.Distribution); err != nil {
+		return err
+	}
+	if err := validateReplicatedBindingText("shard", b.Shard); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateReplicatedBindingText(label, value string) error {
+	if value == "" || len(value) > replicatedMaxIdentityBytes ||
+		!utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("vibedb: replicated %s is not a valid bounded identity", label)
 	}
 	return nil
 }
@@ -1206,6 +1238,19 @@ func validateReplicatedUserTableName(name string) error {
 	}
 	if strings.IndexByte(name, 0) >= 0 {
 		return fmt.Errorf("%w: table name contains NUL", ErrReplicatedShardStoreProfile)
+	}
+	return nil
+}
+
+func validateReplicatedBundleRelationName(name string) error {
+	if err := validateReplicatedUserTableName(name); err != nil {
+		return err
+	}
+	if len(name) > replication.MaxIdentityBytes {
+		return fmt.Errorf(
+			"%w: relation name is %d bytes, maximum %d",
+			ErrReplicatedShardStoreProfile, len(name), replication.MaxIdentityBytes,
+		)
 	}
 	return nil
 }
@@ -1255,36 +1300,25 @@ var replicatedLocalIndexManifestDomain = []byte(
 
 func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) error {
 	count := int(identity.RelationCount)
-	if count == 0 {
-		if identity.RelationSchemaGeneration != 0 ||
-			identity.RelationManifestDigest != ([sha256.Size]byte{}) {
-			return fmt.Errorf("%w: partial singleton relation manifest", ErrReplicatedShardStoreProfile)
-		}
-		for i := range identity.Relations {
-			if identity.Relations[i] != (ReplicatedShardRelationIdentity{}) {
-				return fmt.Errorf("%w: singleton relation manifest residue", ErrReplicatedShardStoreProfile)
-			}
-		}
-		return nil
-	}
-	if count < 2 || count > replication.MaxRelationsPerBundle ||
+	if count < 1 || count > replication.MaxRelationsPerBundle ||
+		len(identity.Relations) != count ||
 		identity.RelationSchemaGeneration != identity.Binding.Authority.SchemaGeneration ||
 		identity.RelationManifestDigest == ([sha256.Size]byte{}) {
 		return fmt.Errorf("%w: invalid relation manifest header", ErrReplicatedShardStoreProfile)
 	}
-	seen := make(map[string]struct{}, count)
 	for ordinal := 0; ordinal < count; ordinal++ {
 		relation := identity.Relations[ordinal]
 		if relation.Relation != uint16(ordinal+1) ||
-			validateReplicatedUserTableName(relation.Table) != nil ||
+			validateReplicatedBundleRelationName(relation.Table) != nil ||
 			relation.Storage == "" || validateStorageIdentity(relation.Storage) != nil ||
 			validateReplicatedShardStoreLimits(relation.Limits) != nil {
 			return fmt.Errorf("%w: invalid relation slot %d", ErrReplicatedShardStoreProfile, ordinal+1)
 		}
-		if _, duplicate := seen[relation.Table]; duplicate {
-			return fmt.Errorf("%w: duplicate relation table", ErrReplicatedShardStoreProfile)
+		for prior := 0; prior < ordinal; prior++ {
+			if relation.Table == identity.Relations[prior].Table {
+				return fmt.Errorf("%w: duplicate relation table", ErrReplicatedShardStoreProfile)
+			}
 		}
-		seen[relation.Table] = struct{}{}
 		switch relation.Kind {
 		case ReplicatedShardRelationJSON:
 			if ordinal != 0 || relation.Table != identity.UserTable ||
@@ -1301,11 +1335,6 @@ func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) e
 			}
 		default:
 			return fmt.Errorf("%w: unknown relation kind", ErrReplicatedShardStoreProfile)
-		}
-	}
-	for ordinal := count; ordinal < len(identity.Relations); ordinal++ {
-		if identity.Relations[ordinal] != (ReplicatedShardRelationIdentity{}) {
-			return fmt.Errorf("%w: trailing relation manifest residue", ErrReplicatedShardStoreProfile)
 		}
 	}
 	if replicatedRelationManifestDigest(identity) != identity.RelationManifestDigest {
@@ -1414,406 +1443,5 @@ func ownedReplicatedShardStoreBinding(b ReplicatedShardStoreBinding) ReplicatedS
 }
 
 func ownedReplicatedShardStoreIdentity(i ReplicatedShardStoreIdentity) ReplicatedShardStoreIdentity {
-	i.Binding = ownedReplicatedShardStoreBinding(i.Binding)
-	i.UserTable = strings.Clone(i.UserTable)
-	i.UserStorage = strings.Clone(i.UserStorage)
-	i.UserPrimaryKey = strings.Clone(i.UserPrimaryKey)
-	for ordinal := 0; ordinal < int(i.RelationCount); ordinal++ {
-		i.Relations[ordinal].Table = strings.Clone(i.Relations[ordinal].Table)
-		i.Relations[ordinal].Storage = strings.Clone(i.Relations[ordinal].Storage)
-	}
-	return i
-}
-
-func decodeReplicatedHex128(label, encoded string, dst *[16]byte) error {
-	if len(encoded) != 32 || encoded != strings.ToLower(encoded) {
-		return fmt.Errorf("vibedb: replicated %s must be 128-bit lowercase hexadecimal", label)
-	}
-	if _, err := hex.Decode(dst[:], []byte(encoded)); err != nil {
-		return fmt.Errorf("vibedb: replicated %s is not hexadecimal: %w", label, err)
-	}
-	return nil
-}
-
-func decodeReplicatedHex256(label, encoded string, dst *[sha256.Size]byte) error {
-	if len(encoded) != sha256.Size*2 || encoded != strings.ToLower(encoded) {
-		return fmt.Errorf("vibedb: replicated %s must be 256-bit lowercase hexadecimal", label)
-	}
-	if _, err := hex.Decode(dst[:], []byte(encoded)); err != nil {
-		return fmt.Errorf("vibedb: replicated %s is not hexadecimal: %w", label, err)
-	}
-	return nil
-}
-
-func (a ReplicatedAuthorityProfile) MarshalJSON() ([]byte, error) {
-	type encoded struct {
-		ActivePolicyGeneration uint64 `json:"active_policy_generation"`
-		ProtectionEpoch        uint64 `json:"protection_epoch"`
-		OwnershipEpoch         uint64 `json:"ownership_epoch"`
-		SchemaGeneration       uint64 `json:"schema_generation"`
-		RoutingVersion         uint64 `json:"routing_version"`
-		RouteGeneration        uint64 `json:"route_generation"`
-	}
-	return json.Marshal(encoded(a))
-}
-
-func (a *ReplicatedAuthorityProfile) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedAuthorityProfile
-	present := make(map[string]bool, 6)
-	err := decodeCatalogObject(data, "replicated authority profile", func(name string, d *json.Decoder) error {
-		present[name] = true
-		switch name {
-		case "active_policy_generation":
-			return d.Decode(&decoded.ActivePolicyGeneration)
-		case "protection_epoch":
-			return d.Decode(&decoded.ProtectionEpoch)
-		case "ownership_epoch":
-			return d.Decode(&decoded.OwnershipEpoch)
-		case "schema_generation":
-			return d.Decode(&decoded.SchemaGeneration)
-		case "routing_version":
-			return d.Decode(&decoded.RoutingVersion)
-		case "route_generation":
-			return d.Decode(&decoded.RouteGeneration)
-		default:
-			return unknownCatalogMember("replicated authority profile", name)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{"active_policy_generation", "protection_epoch", "ownership_epoch", "schema_generation", "routing_version", "route_generation"} {
-		if !present[name] {
-			return fmt.Errorf("vibedb: replicated authority profile is missing member %q", name)
-		}
-	}
-	if decoded.ActivePolicyGeneration == 0 || decoded.ProtectionEpoch == 0 ||
-		decoded.OwnershipEpoch == 0 || decoded.SchemaGeneration == 0 ||
-		decoded.RoutingVersion == 0 || decoded.RouteGeneration == 0 {
-		return errors.New("vibedb: replicated authority profile contains a zero generation")
-	}
-	*a = decoded
-	return nil
-}
-
-func (b ReplicatedShardStoreBinding) MarshalJSON() ([]byte, error) {
-	type encoded struct {
-		ClusterID             string                     `json:"cluster_id"`
-		ClusterIncarnation    string                     `json:"cluster_incarnation"`
-		TopologyRecoveryEpoch uint64                     `json:"topology_recovery_epoch"`
-		Distribution          string                     `json:"distribution"`
-		Shard                 string                     `json:"shard"`
-		AllocationGeneration  uint64                     `json:"allocation_generation"`
-		ShardIncarnation      string                     `json:"shard_incarnation"`
-		GroupID               string                     `json:"group_id"`
-		MemberID              uint64                     `json:"member_id"`
-		StoreID               string                     `json:"store_id"`
-		Authority             ReplicatedAuthorityProfile `json:"authority"`
-	}
-	return json.Marshal(encoded{
-		ClusterID: hex.EncodeToString(b.ClusterID[:]), ClusterIncarnation: hex.EncodeToString(b.ClusterIncarnation[:]),
-		TopologyRecoveryEpoch: b.TopologyRecoveryEpoch, Distribution: b.Distribution, Shard: b.Shard,
-		AllocationGeneration: b.AllocationGeneration, ShardIncarnation: hex.EncodeToString(b.ShardIncarnation[:]),
-		GroupID: hex.EncodeToString(b.GroupID[:]), MemberID: b.MemberID, StoreID: hex.EncodeToString(b.StoreID[:]),
-		Authority: b.Authority,
-	})
-}
-
-func (b *ReplicatedShardStoreBinding) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedShardStoreBinding
-	present := make(map[string]bool, 11)
-	err := decodeCatalogObject(data, "replicated shard store binding", func(name string, d *json.Decoder) error {
-		present[name] = true
-		decodeID := func(label string, dst *[16]byte) error {
-			var value string
-			if err := d.Decode(&value); err != nil {
-				return err
-			}
-			return decodeReplicatedHex128(label, value, dst)
-		}
-		switch name {
-		case "cluster_id":
-			return decodeID(name, &decoded.ClusterID)
-		case "cluster_incarnation":
-			return decodeID(name, &decoded.ClusterIncarnation)
-		case "topology_recovery_epoch":
-			return d.Decode(&decoded.TopologyRecoveryEpoch)
-		case "distribution":
-			return d.Decode(&decoded.Distribution)
-		case "shard":
-			return d.Decode(&decoded.Shard)
-		case "allocation_generation":
-			return d.Decode(&decoded.AllocationGeneration)
-		case "shard_incarnation":
-			return decodeID(name, &decoded.ShardIncarnation)
-		case "group_id":
-			return decodeID(name, &decoded.GroupID)
-		case "member_id":
-			return d.Decode(&decoded.MemberID)
-		case "store_id":
-			return decodeID(name, &decoded.StoreID)
-		case "authority":
-			return d.Decode(&decoded.Authority)
-		default:
-			return unknownCatalogMember("replicated shard store binding", name)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{"cluster_id", "cluster_incarnation", "topology_recovery_epoch", "distribution", "shard", "allocation_generation", "shard_incarnation", "group_id", "member_id", "store_id", "authority"} {
-		if !present[name] {
-			return fmt.Errorf("vibedb: replicated shard store binding is missing member %q", name)
-		}
-	}
-	if err := validateReplicatedShardStoreBinding(decoded); err != nil {
-		return err
-	}
-	*b = ownedReplicatedShardStoreBinding(decoded)
-	return nil
-}
-
-func (l ReplicatedShardStoreLimits) MarshalJSON() ([]byte, error) {
-	type encoded struct {
-		MaxKeyBytes       int `json:"max_key_bytes"`
-		MaxDocumentBytes  int `json:"max_document_bytes"`
-		MaxBatchDocuments int `json:"max_batch_documents"`
-		MaxBatchBytes     int `json:"max_batch_bytes"`
-	}
-	return json.Marshal(encoded(l))
-}
-
-func (l *ReplicatedShardStoreLimits) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedShardStoreLimits
-	present := make(map[string]bool, 4)
-	err := decodeCatalogObject(data, "replicated shard store limits", func(name string, d *json.Decoder) error {
-		present[name] = true
-		switch name {
-		case "max_key_bytes":
-			return d.Decode(&decoded.MaxKeyBytes)
-		case "max_document_bytes":
-			return d.Decode(&decoded.MaxDocumentBytes)
-		case "max_batch_documents":
-			return d.Decode(&decoded.MaxBatchDocuments)
-		case "max_batch_bytes":
-			return d.Decode(&decoded.MaxBatchBytes)
-		default:
-			return unknownCatalogMember("replicated shard store limits", name)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{"max_key_bytes", "max_document_bytes", "max_batch_documents", "max_batch_bytes"} {
-		if !present[name] {
-			return fmt.Errorf("vibedb: replicated shard store limits are missing member %q", name)
-		}
-	}
-	if err := validateReplicatedShardStoreLimits(decoded); err != nil {
-		return err
-	}
-	*l = decoded
-	return nil
-}
-
-func (r ReplicatedShardRelationIdentity) MarshalJSON() ([]byte, error) {
-	type encoded struct {
-		Relation         uint16                      `json:"relation"`
-		Kind             ReplicatedShardRelationKind `json:"kind"`
-		Table            string                      `json:"table"`
-		Storage          string                      `json:"storage"`
-		Limits           ReplicatedShardStoreLimits  `json:"limits"`
-		LocalIndexDigest string                      `json:"local_index_digest"`
-		IndexID          uint64                      `json:"index_id"`
-		Incarnation      uint64                      `json:"incarnation"`
-		LocatorCount     uint8                       `json:"locator_count"`
-		Unique           bool                        `json:"unique"`
-	}
-	return json.Marshal(encoded{
-		Relation: r.Relation, Kind: r.Kind, Table: r.Table, Storage: r.Storage,
-		Limits: r.Limits, LocalIndexDigest: hex.EncodeToString(r.LocalIndexDigest[:]),
-		IndexID: r.IndexID, Incarnation: r.Incarnation,
-		LocatorCount: r.LocatorCount, Unique: r.Unique,
-	})
-}
-
-func (r *ReplicatedShardRelationIdentity) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedShardRelationIdentity
-	present := make(map[string]bool, 10)
-	err := decodeCatalogObject(data, "replicated shard relation", func(name string, d *json.Decoder) error {
-		present[name] = true
-		switch name {
-		case "relation":
-			return d.Decode(&decoded.Relation)
-		case "kind":
-			return d.Decode(&decoded.Kind)
-		case "table":
-			return d.Decode(&decoded.Table)
-		case "storage":
-			return d.Decode(&decoded.Storage)
-		case "limits":
-			return d.Decode(&decoded.Limits)
-		case "local_index_digest":
-			var value string
-			if err := d.Decode(&value); err != nil {
-				return err
-			}
-			return decodeReplicatedHex256(name, value, &decoded.LocalIndexDigest)
-		case "index_id":
-			return d.Decode(&decoded.IndexID)
-		case "incarnation":
-			return d.Decode(&decoded.Incarnation)
-		case "locator_count":
-			return d.Decode(&decoded.LocatorCount)
-		case "unique":
-			return d.Decode(&decoded.Unique)
-		default:
-			return unknownCatalogMember("replicated shard relation", name)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{
-		"relation", "kind", "table", "storage", "limits", "local_index_digest",
-		"index_id", "incarnation", "locator_count", "unique",
-	} {
-		if !present[name] {
-			return fmt.Errorf("vibedb: replicated shard relation is missing member %q", name)
-		}
-	}
-	*r = decoded
-	return nil
-}
-
-type replicatedShardRelationList struct {
-	count uint16
-	items [replication.MaxRelationsPerBundle]ReplicatedShardRelationIdentity
-}
-
-func (list *replicatedShardRelationList) UnmarshalJSON(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	opening, err := decoder.Token()
-	if err != nil || opening != json.Delim('[') {
-		return fmt.Errorf("vibedb: replicated relations must be an array")
-	}
-	var decoded replicatedShardRelationList
-	for decoder.More() {
-		if int(decoded.count) >= len(decoded.items) {
-			return fmt.Errorf(
-				"vibedb: replicated relation manifest exceeds %d slots", len(decoded.items),
-			)
-		}
-		if err := decoder.Decode(&decoded.items[decoded.count]); err != nil {
-			return err
-		}
-		decoded.count++
-	}
-	closing, err := decoder.Token()
-	if err != nil || closing != json.Delim(']') {
-		return fmt.Errorf("vibedb: replicated relations have invalid framing")
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("vibedb: replicated relations have trailing bytes")
-	}
-	*list = decoded
-	return nil
-}
-
-func (i ReplicatedShardStoreIdentity) MarshalJSON() ([]byte, error) {
-	type encoded struct {
-		Format                   uint16                             `json:"format"`
-		Binding                  ReplicatedShardStoreBinding        `json:"binding"`
-		LogID                    string                             `json:"log_id"`
-		UserTable                string                             `json:"user_table"`
-		UserStorage              string                             `json:"user_storage"`
-		UserPrimaryKey           string                             `json:"user_primary_key"`
-		UserLimits               ReplicatedShardStoreLimits         `json:"user_limits"`
-		Sidecars                 ReplicatedShardStoreSidecarProfile `json:"sidecars"`
-		RelationSchemaGeneration uint64                             `json:"relation_schema_generation,omitempty"`
-		RelationManifestDigest   string                             `json:"relation_manifest_digest,omitempty"`
-		Relations                []ReplicatedShardRelationIdentity  `json:"relations,omitempty"`
-	}
-	value := encoded{
-		Format: i.Format, Binding: i.Binding, LogID: hex.EncodeToString(i.LogID[:]),
-		UserTable: i.UserTable, UserStorage: i.UserStorage,
-		UserPrimaryKey: i.UserPrimaryKey, UserLimits: i.UserLimits,
-		Sidecars: i.Sidecars,
-	}
-	if i.RelationCount != 0 {
-		value.RelationSchemaGeneration = i.RelationSchemaGeneration
-		value.RelationManifestDigest = hex.EncodeToString(i.RelationManifestDigest[:])
-		value.Relations = make([]ReplicatedShardRelationIdentity, int(i.RelationCount))
-		copy(value.Relations, i.Relations[:i.RelationCount])
-	}
-	return json.Marshal(value)
-}
-
-func (i *ReplicatedShardStoreIdentity) UnmarshalJSON(data []byte) error {
-	var decoded ReplicatedShardStoreIdentity
-	present := make(map[string]bool, 11)
-	err := decodeCatalogObject(data, "replicated shard store identity", func(name string, d *json.Decoder) error {
-		present[name] = true
-		switch name {
-		case "format":
-			return decodeRequiredCatalogUint16(
-				d, "replicated shard store format", &decoded.Format,
-			)
-		case "binding":
-			return d.Decode(&decoded.Binding)
-		case "log_id":
-			var value string
-			if err := d.Decode(&value); err != nil {
-				return err
-			}
-			return decodeReplicatedHex128(name, value, &decoded.LogID)
-		case "user_table":
-			return d.Decode(&decoded.UserTable)
-		case "user_storage":
-			return d.Decode(&decoded.UserStorage)
-		case "user_primary_key":
-			return d.Decode(&decoded.UserPrimaryKey)
-		case "user_limits":
-			return d.Decode(&decoded.UserLimits)
-		case "sidecars":
-			return d.Decode(&decoded.Sidecars)
-		case "relation_schema_generation":
-			return d.Decode(&decoded.RelationSchemaGeneration)
-		case "relation_manifest_digest":
-			var value string
-			if err := d.Decode(&value); err != nil {
-				return err
-			}
-			return decodeReplicatedHex256(name, value, &decoded.RelationManifestDigest)
-		case "relations":
-			var relations replicatedShardRelationList
-			if err := d.Decode(&relations); err != nil {
-				return err
-			}
-			decoded.RelationCount = relations.count
-			decoded.Relations = relations.items
-			return nil
-		default:
-			return unknownCatalogMember("replicated shard store identity", name)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{"format", "binding", "log_id", "user_table", "user_storage", "user_primary_key", "user_limits", "sidecars"} {
-		if !present[name] {
-			return fmt.Errorf("vibedb: replicated shard store identity is missing member %q", name)
-		}
-	}
-	extension := present["relation_schema_generation"] ||
-		present["relation_manifest_digest"] || present["relations"]
-	if extension && (!present["relation_schema_generation"] ||
-		!present["relation_manifest_digest"] || !present["relations"]) {
-		return errors.New("vibedb: replicated shard relation manifest is partial")
-	}
-	if err := validateReplicatedShardStoreIdentity(decoded); err != nil {
-		return err
-	}
-	*i = ownedReplicatedShardStoreIdentity(decoded)
-	return nil
+	return i.Clone()
 }

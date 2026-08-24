@@ -404,7 +404,7 @@ func (d *Database) openReplicatedApply(
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedApplyBusy
 	}
 	if core.catalog.ReplicatedShardStore == nil ||
-		*core.catalog.ReplicatedShardStore != expected {
+		!core.catalog.ReplicatedShardStore.Equal(expected) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedShardStoreIdentityMismatch
 	}
 	if err := core.settleCatalogLocked(); err != nil {
@@ -436,23 +436,14 @@ func (d *Database) openReplicatedApply(
 		)
 	}
 	if core.catalog.ReplicatedApply == nil {
-		if expected.RelationCount == 0 {
-			if t.collection.Len() != 0 {
+		for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
+			relation := expected.Relations[ordinal]
+			table := core.tables[relation.Table]
+			if table == nil || table.collection == nil || table.collection.Len() != 0 {
 				return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-					"%w: first activation requires an empty user collection",
-					ErrReplicatedApplyMismatch,
+					"%w: first activation requires empty relation %q",
+					ErrReplicatedApplyMismatch, relation.Table,
 				)
-			}
-		} else {
-			for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
-				relation := expected.Relations[ordinal]
-				table := core.tables[relation.Table]
-				if table == nil || table.collection == nil || table.collection.Len() != 0 {
-					return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-						"%w: first activation requires empty relation %q",
-						ErrReplicatedApplyMismatch, relation.Table,
-					)
-				}
 			}
 		}
 	}
@@ -465,28 +456,22 @@ func (d *Database) openReplicatedApply(
 			"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
 		)
 	}
-	groupMembers := make([]durable.NamedCollection, 1, max(2, int(expected.RelationCount)+1))
+	groupMembers := make([]durable.NamedCollection, 1, int(expected.RelationCount)+1)
 	groupMembers[0] = durable.NamedCollection{
 		Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection,
 	}
-	if expected.RelationCount == 0 {
-		groupMembers = append(groupMembers, durable.NamedCollection{
-			Name: expected.UserTable, Collection: t.collection,
-		})
-	} else {
-		for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
-			relation := expected.Relations[ordinal]
-			table := core.tables[relation.Table]
-			if table == nil || table.collection == nil {
-				return nil, identity, fmt.Errorf(
-					"%w: relation %q is unavailable",
-					ErrReplicatedApplyMismatch, relation.Table,
-				)
-			}
-			groupMembers = append(groupMembers, durable.NamedCollection{
-				Name: relation.Table, Collection: table.collection,
-			})
+	for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
+		relation := expected.Relations[ordinal]
+		table := core.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return nil, identity, fmt.Errorf(
+				"%w: relation %q is unavailable",
+				ErrReplicatedApplyMismatch, relation.Table,
+			)
 		}
+		groupMembers = append(groupMembers, durable.NamedCollection{
+			Name: relation.Table, Collection: table.collection,
+		})
 	}
 	if core.checkpointGroup == nil {
 		core.checkpointGroup, err = durable.NewCheckpointGroup(
@@ -569,12 +554,6 @@ func replicatedApplyRelations(
 		ObserveMutationAttempt: claim.observeMutationAttempt,
 		Limits:                 replicatedStateCollectionLimits(base.UserLimits),
 	}
-	if base.RelationCount == 0 {
-		return []replicatedstate.RelationCollection{{
-			Relation: 1, Kind: replicatedstate.RelationJSON, Name: base.UserTable,
-			Target: baseTarget, LocalIndexes: replicatedApplyLocalIndexes(baseTable),
-		}}, nil
-	}
 	logicalManifest := replicatedRelationApplyManifestDigest(base)
 	result := make([]replicatedstate.RelationCollection, int(base.RelationCount))
 	for ordinal := range result {
@@ -632,9 +611,6 @@ var replicatedRelationApplyManifestDomain = []byte(
 func replicatedRelationApplyManifestDigest(
 	identity ReplicatedShardStoreIdentity,
 ) [sha256.Size]byte {
-	if identity.RelationCount == 0 {
-		return [sha256.Size]byte{}
-	}
 	h := sha256.New()
 	_, _ = h.Write(replicatedRelationApplyManifestDomain)
 	writeReplicatedRelationDescriptors(h, identity, false)
@@ -1225,7 +1201,7 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 	if base == nil || base.UserTable == "" {
 		return nil, ErrReplicatedApplyMismatch
 	}
-	if base.RelationCount != 0 {
+	if base.RelationCount != 1 {
 		return nil, fmt.Errorf(
 			"%w: relation bundles require one certified multi-image snapshot base",
 			replicatedstate.ErrSnapshotArtifact,
@@ -1255,7 +1231,7 @@ func (a *ReplicatedApply) BuildBundleSnapshotBase() (
 		return nil, replicatedstate.SnapshotArtifactManifest{}, err
 	}
 	base := a.database.catalog.ReplicatedShardStore
-	if base == nil || base.RelationCount < 2 {
+	if base == nil || base.RelationCount == 0 {
 		return nil, replicatedstate.SnapshotArtifactManifest{}, ErrReplicatedApplyMismatch
 	}
 	return a.machine.BuildBundleSnapshotBase()
@@ -1474,16 +1450,14 @@ func replicatedApplyProfileDigest(
 	} else {
 		_, _ = h.Write([]byte{0})
 	}
-	if identity.RelationCount != 0 {
-		var relationHeader [10]byte
-		binary.LittleEndian.PutUint16(relationHeader[0:2], identity.RelationCount)
-		binary.LittleEndian.PutUint64(
-			relationHeader[2:10], identity.RelationSchemaGeneration,
-		)
-		_, _ = h.Write(relationHeader[:])
-		logicalManifest := replicatedRelationApplyManifestDigest(identity)
-		_, _ = h.Write(logicalManifest[:])
-	}
+	var relationHeader [10]byte
+	binary.LittleEndian.PutUint16(relationHeader[0:2], identity.RelationCount)
+	binary.LittleEndian.PutUint64(
+		relationHeader[2:10], identity.RelationSchemaGeneration,
+	)
+	_, _ = h.Write(relationHeader[:])
+	logicalManifest := replicatedRelationApplyManifestDigest(identity)
+	_, _ = h.Write(logicalManifest[:])
 	var digest [32]byte
 	_ = h.Sum(digest[:0])
 	return digest
@@ -1528,21 +1502,17 @@ func validateReplicatedApplyOptions(
 		)
 	}
 	systemLimits := replicatedApplySystemLimits(options.RetryWindow)
-	relationCount := max(1, int(identity.RelationCount))
-	relationDocuments := identity.UserLimits.MaxBatchDocuments
-	relationBytes := int64(identity.UserLimits.MaxBatchBytes)
-	if identity.RelationCount != 0 {
-		relationDocuments = 0
-		relationBytes = 0
-		for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
-			limits := identity.Relations[ordinal].Limits
-			relationDocuments = min(
-				replication.MaxMutations, relationDocuments+limits.MaxBatchDocuments,
-			)
-			relationBytes = min(
-				int64(replication.MaxCommandBytes), relationBytes+int64(limits.MaxBatchBytes),
-			)
-		}
+	relationCount := int(identity.RelationCount)
+	relationDocuments := 0
+	relationBytes := int64(0)
+	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
+		limits := identity.Relations[ordinal].Limits
+		relationDocuments = min(
+			replication.MaxMutations, relationDocuments+limits.MaxBatchDocuments,
+		)
+		relationBytes = min(
+			int64(replication.MaxCommandBytes), relationBytes+int64(limits.MaxBatchBytes),
+		)
 	}
 	maxTxnDocuments := max(
 		relationDocuments+4,

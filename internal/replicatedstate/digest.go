@@ -23,10 +23,8 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
 	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
 
-// deterministicBundleApplySemantics extends, but never changes, the legacy
-// singleton contract above. Bundle-only relation and compare behavior must be
-// authenticated independently so adding the vertical slice cannot alter an
-// already-persisted singleton ApplyContractDigest.
+// deterministicRelationApplySemantics freezes the relation and conditional
+// mutation behavior shared by compact singleton and multi-relation commands.
 const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
 	"one-checkpoint-group-publication;all-relations-or-none;" +
 	"global-put-absent-or-vibejson-semantic-equal;" +
@@ -323,71 +321,16 @@ func dataChainTransitionDigest(
 	return workspace.result, nil
 }
 
-// applyContractDigest binds every frozen input that can change deterministic
-// command results. Local capture and checkpoint plumbing is deliberately
-// excluded because replicas may configure it independently.
-func applyContractDigest(
-	name string,
-	target CollectionTarget,
-	maxSessions uint64,
-	retryWindow uint16,
-) ([32]byte, error) {
-	if name == "" || target.Validation != ValidationDeterministicMutation ||
-		target.ValidationDigest == ([32]byte{}) || maxSessions == 0 || retryWindow == 0 ||
-		target.Limits.MaxKeyBytes <= 0 || target.Limits.MaxDocumentBytes <= 0 ||
-		target.Limits.MaxDistinctMutations <= 0 || target.Limits.MaxBatchBytes <= 0 {
-		return [32]byte{}, ErrInvalidCollection
-	}
-	h := sha256.New()
-	_, _ = h.Write(applyContractDigestDomain)
-	writeHashFrame(h, []byte(name))
-	_, _ = h.Write([]byte{byte(target.Validation)})
-	_, _ = h.Write(target.ValidationDigest[:])
-	_, _ = h.Write(applySemanticsDigest[:])
-	var grammar [2 + 11*4]byte
-	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
-	for index, code := range [...]uint32{
-		ResultApplied,
-		ResultStaleFence,
-		ResultUnknownCollection,
-		ResultInvalidDocument,
-		ResultTargetBound,
-		ResultWrongShard,
-		ResultSessionRetired,
-		ResultSessionOpened,
-		ResultSessionRenewed,
-		ResultSessionRevoked,
-		MaxDistinctMutations,
-	} {
-		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)
-	}
-	_, _ = h.Write(grammar[:])
-	var fixed [50]byte
-	binary.LittleEndian.PutUint64(fixed[0:8], uint64(target.Limits.MaxKeyBytes))
-	binary.LittleEndian.PutUint64(fixed[8:16], uint64(target.Limits.MaxDocumentBytes))
-	binary.LittleEndian.PutUint64(fixed[16:24], uint64(target.Limits.MaxDistinctMutations))
-	binary.LittleEndian.PutUint64(fixed[24:32], uint64(target.Limits.MaxBatchBytes))
-	binary.LittleEndian.PutUint64(fixed[32:40], maxSessions)
-	binary.LittleEndian.PutUint16(fixed[40:42], retryWindow)
-	binary.LittleEndian.PutUint64(fixed[42:50], MaxSessionRetryWindow)
-	_, _ = h.Write(fixed[:])
-	var result [32]byte
-	_ = h.Sum(result[:0])
-	return result, nil
-}
-
+// bundleApplyContractDigest binds the sole deterministic relation model used
+// by compact singleton and multi-relation commands. Local capture and
+// checkpoint plumbing is excluded because replicas may configure it
+// independently.
 func bundleApplyContractDigest(
 	manifest [sha256.Size]byte,
 	relations []relationCollection,
 	maxSessions uint64,
 	retryWindow uint16,
 ) ([sha256.Size]byte, error) {
-	if len(relations) == 1 && relations[0].kind == RelationJSON &&
-		len(relations[0].localIndexes) == 0 {
-		return applyContractDigest(
-			relations[0].name, relations[0].target, maxSessions, retryWindow,
-		)
-	}
 	if manifest == ([sha256.Size]byte{}) || len(relations) == 0 ||
 		maxSessions == 0 || retryWindow == 0 {
 		return [sha256.Size]byte{}, ErrInvalidCollection
@@ -397,12 +340,12 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 18*4]byte
+	var grammar [2 + 17*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
 		ResultStaleFence,
-		ResultUnknownCollection,
+		ResultUnknownRelation,
 		ResultInvalidDocument,
 		ResultTargetBound,
 		ResultWrongShard,
@@ -410,7 +353,6 @@ func bundleApplyContractDigest(
 		ResultSessionOpened,
 		ResultSessionRenewed,
 		ResultSessionRevoked,
-		ResultUnknownRelation,
 		ResultIndexConflict,
 		MaxDistinctMutations,
 		uint32(replication.MutationPut),

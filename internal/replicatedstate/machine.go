@@ -459,17 +459,10 @@ func prepareOpenInputs(
 	}
 	binding.Distribution = strings.Clone(binding.Distribution)
 	binding.Shard = strings.Clone(binding.Shard)
-	contractDigest, err := applyContractDigest(
-		userName, user, options.MaxSessions, options.RetryWindow,
-	)
-	if err != nil {
-		return openInputs{}, err
-	}
 	prepared := openInputs{
 		binding: binding, bootstrap: bootstrapBytes, bootstrapDigest: bootstrapDigest,
 		system: system, userName: strings.Clone(userName), user: user,
-		applyContract: contractDigest,
-		txnLog:        txnLog, checkpointGroup: options.CheckpointGroup, options: options,
+		txnLog: txnLog, checkpointGroup: options.CheckpointGroup, options: options,
 	}
 	if !deferBundleMembership {
 		relations, manifest, relationErr := prepareRelationCollections(binding, []RelationCollection{{
@@ -481,6 +474,12 @@ func prepareOpenInputs(
 		}
 		prepared.relations = relations
 		prepared.manifestDigest = manifest
+		prepared.applyContract, relationErr = bundleApplyContractDigest(
+			manifest, relations, options.MaxSessions, options.RetryWindow,
+		)
+		if relationErr != nil {
+			return openInputs{}, relationErr
+		}
 		prepared.members = []durable.NamedCollection{
 			{Name: systemCollectionName, Collection: system.Collection},
 			{Name: userName, Collection: user.Collection},

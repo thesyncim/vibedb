@@ -207,7 +207,7 @@ func (s *Session) LookupGlobalIndex(
 
 // LookupGlobalIndexKeys reads a strictly ordered, deduplicated finite key set
 // from one gateway-maintained global index relation at one durable snapshot.
-// Incarnation validation (legacy marker or replicated manifest), snapshot
+// Incarnation validation (standalone marker or replicated manifest), snapshot
 // acquisition, cancellation, and result bounds are shared across the batch.
 // This is the finite-domain locator-projection lane;
 // it avoids one local snapshot and one network request per IN-list element.
@@ -376,7 +376,7 @@ func (s *Session) LookupGlobalIndexKeys(
 // identity. Replicated command/apply paths never call this helper: they resolve
 // dense relation IDs directly to pre-opened handles. A catalog-bound global
 // relation carries its incarnation fence once in the manifest, so reads avoid
-// the legacy marker point probe and its per-relation storage tax.
+// the standalone marker point probe and its per-relation storage tax.
 func replicatedGlobalIndexRelation(
 	identity *ReplicatedShardStoreIdentity,
 	table string,

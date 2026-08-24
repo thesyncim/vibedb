@@ -395,7 +395,7 @@ func openDatabaseWithShardStorePolicy(
 				"%w: %s", ErrReplicatedShardStoreUnbound, absolute,
 			)
 		}
-		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated {
+		if !d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) {
 			return nil, fmt.Errorf(
 				"%w: %s", ErrReplicatedShardStoreIdentityMismatch, absolute,
 			)
@@ -431,7 +431,7 @@ func openDatabaseWithShardStorePolicy(
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
 		}
-		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated ||
+		if !d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) ||
 			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
 		}
@@ -439,7 +439,7 @@ func openDatabaseWithShardStorePolicy(
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
 		}
-		if *d.catalog.ReplicatedShardStore != shardPolicy.expectedReplicated ||
+		if !d.catalog.ReplicatedShardStore.Equal(shardPolicy.expectedReplicated) ||
 			!replicatedApplyMetaMatchesOptions(
 				d.catalog.ReplicatedApply,
 				*d.catalog.ReplicatedShardStore,

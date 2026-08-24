@@ -76,28 +76,24 @@ func prepareRelationCollections(
 		return nil, [sha256.Size]byte{}, ErrInvalidCollection
 	}
 	relations := make([]relationCollection, len(input))
-	seenNames := make(map[string]struct{}, len(input))
 	for ordinal := range input {
 		spec := &input[ordinal]
 		wantID := replication.RelationID(ordinal + 1)
-		maxNameBytes := replication.MaxCollectionBytes
-		if len(input) > 1 {
-			maxNameBytes = replication.MaxIdentityBytes
-		}
 		if spec.Relation != wantID || spec.Name == "" ||
-			len(spec.Name) > maxNameBytes ||
+			len(spec.Name) > replication.MaxIdentityBytes ||
 			!utf8.ValidString(spec.Name) || strings.IndexByte(spec.Name, 0) >= 0 ||
 			spec.Name == systemCollectionName {
 			return nil, [sha256.Size]byte{}, fmt.Errorf(
 				"%w: relation slot %d identity", ErrInvalidCollection, ordinal+1,
 			)
 		}
-		if _, exists := seenNames[spec.Name]; exists {
-			return nil, [sha256.Size]byte{}, fmt.Errorf(
-				"%w: duplicate relation name", ErrInvalidCollection,
-			)
+		for prior := 0; prior < ordinal; prior++ {
+			if spec.Name == input[prior].Name {
+				return nil, [sha256.Size]byte{}, fmt.Errorf(
+					"%w: duplicate relation name", ErrInvalidCollection,
+				)
+			}
 		}
-		seenNames[spec.Name] = struct{}{}
 		if err := validateRelationTarget(*spec); err != nil {
 			return nil, [sha256.Size]byte{}, fmt.Errorf(
 				"relation %d: %w", spec.Relation, err,

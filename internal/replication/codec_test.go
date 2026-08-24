@@ -415,6 +415,10 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 func TestSingletonRelationCommandElidesBodyBatchHeader(t *testing.T) {
 	command := testCommand()
 	encoded := encodeCommand(t, command)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mutationOffset := commandPayloadOffset(encoded)
 	payloadBytes := 0
 	for _, mutation := range command.Batches[0].Mutations {
@@ -432,6 +436,28 @@ func TestSingletonRelationCommandElidesBodyBatchHeader(t *testing.T) {
 	if got, want := len(encoded), mutationOffset+payloadBytes+envelopeChecksumBytes; got != want {
 		t.Fatalf("singleton bytes = %d, want %d without %d-byte body header",
 			got, want, relationBatchHeaderBytes)
+	}
+	relations := view.RelationBatches()
+	if !relations.Next() {
+		t.Fatal("compact singleton did not decode to one relation batch")
+	}
+	batchView := relations.Batch()
+	decoded := command
+	decoded.Batches = []RelationMutationBatch{{Relation: batchView.Relation}}
+	mutations := batchView.Mutations()
+	for mutations.Next() {
+		mutation := mutations.Mutation()
+		decoded.Batches[0].Mutations = append(decoded.Batches[0].Mutations, Mutation{
+			Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+			ExpectedValueLength: mutation.ExpectedValueLength,
+			ExpectedValueDigest: mutation.ExpectedValueDigest,
+		})
+	}
+	if relations.Next() || len(decoded.Batches[0].Mutations) != len(command.Batches[0].Mutations) {
+		t.Fatal("compact singleton decoded to a different relation model")
+	}
+	if reencoded := encodeCommand(t, decoded); !bytes.Equal(reencoded, encoded) {
+		t.Fatalf("compact singleton canonical re-encode differs: %x != %x", reencoded, encoded)
 	}
 }
 

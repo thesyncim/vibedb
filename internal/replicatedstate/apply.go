@@ -395,6 +395,7 @@ func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
 		return [32]byte{}, err
 	}
 	relationImages := make([]SnapshotArtifactRelation, len(m.relations))
+	var relationGenerations [replication.MaxRelationsPerBundle]uint64
 	var scanErr error
 	for i := range m.relations {
 		relation := &m.relations[i]
@@ -415,15 +416,18 @@ func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
 			Relation: relation.id, Kind: relation.kind,
 			Collection: []byte(relation.name), Rows: snapshot.Len(), ImageDigest: digest,
 		}
-		relation.openedImage = digest
-		relation.openedGen = snapshot.Generation()
-		relation.openedApplied = m.state.Applied
+		relationGenerations[i] = snapshot.Generation()
 	}
 	closeErr := cut.Close()
 	if scanErr != nil || closeErr != nil {
 		return [32]byte{}, errors.Join(ErrInconsistentSnapshot, scanErr, closeErr)
 	}
 	digest := canonicalBundleImageDigest(relationImages)
+	for i := range m.relations {
+		m.relations[i].openedImage = relationImages[i].ImageDigest
+		m.relations[i].openedGen = relationGenerations[i]
+		m.relations[i].openedApplied = m.state.Applied
+	}
 	m.openedImageDigest = digest
 	m.openedImageApplied = m.state.Applied
 	m.openedImageGeneration = m.relations[0].openedGen
@@ -432,7 +436,7 @@ func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
 
 func (m *Machine) bundleSnapshotManifestMatches(manifest SnapshotArtifactManifest) bool {
 	if !manifest.Bundle || manifest.RelationManifestDigest != m.manifestDigest ||
-		len(manifest.Relations) != len(m.relations) || len(m.relations) < 2 ||
+		len(manifest.Relations) != len(m.relations) || len(m.relations) == 0 ||
 		!bytes.Equal(manifest.UserCollection, []byte(m.relations[0].name)) {
 		return false
 	}
@@ -914,14 +918,7 @@ func (m *Machine) planBundleCommand(
 			batch := relationBatches.Batch()
 			ordinal := int(batch.Relation) - 1
 			if ordinal < 0 || ordinal >= len(m.relations) {
-				// The unreleased bundle grammar distinguishes an unknown dense
-				// relation from the legacy singleton's unknown-collection result.
-				// Keeping the singleton behavior preserves its authenticated apply
-				// contract while bundles gain an operationally precise result.
 				plan.resultCode = ResultUnknownRelation
-				if len(m.relations) == 1 {
-					plan.resultCode = ResultUnknownCollection
-				}
 				break
 			}
 			relation := &m.relations[ordinal]
@@ -947,12 +944,8 @@ func (m *Machine) planBundleCommand(
 			if scratch != nil {
 				descriptors = scratch.descriptors
 			}
-			contract := relation.contract
-			if len(m.relations) == 1 {
-				contract = m.applyContract
-			}
 			plan.dataChainDigest, planErr = dataChainTransitionDigest(
-				m.dataChainHash, plan.dataChainDigest, contract,
+				m.dataChainHash, plan.dataChainDigest, relation.contract,
 				m.bundlePlan[start:], descriptors,
 			)
 			if planErr != nil {
@@ -1383,8 +1376,11 @@ func (m *Machine) planMutations(
 	stagedBytes := 0
 	changes := ordered[:0]
 	for _, mutation := range ordered {
+		// A conditional delete carries a fixed length+digest comparison payload
+		// in mutation.value. It is command metadata, never a stored document, so
+		// only puts are constrained by the target document bound.
 		if len(mutation.key) > target.Limits.MaxKeyBytes ||
-			len(mutation.value) > target.Limits.MaxDocumentBytes {
+			!mutation.delete && len(mutation.value) > target.Limits.MaxDocumentBytes {
 			return nil, ResultTargetBound, nil
 		}
 		if !mutation.delete {

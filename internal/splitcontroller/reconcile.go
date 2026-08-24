@@ -733,11 +733,7 @@ func cloneChildTarget(target ChildTarget) ChildTarget {
 	target.Endpoint = distribution.EndpointID(strings.Clone(string(target.Endpoint)))
 	target.WAL.Distribution = strings.Clone(target.WAL.Distribution)
 	target.WAL.Shard = strings.Clone(target.WAL.Shard)
-	target.SQL.Binding.Distribution = strings.Clone(target.SQL.Binding.Distribution)
-	target.SQL.Binding.Shard = strings.Clone(target.SQL.Binding.Shard)
-	target.SQL.UserTable = strings.Clone(target.SQL.UserTable)
-	target.SQL.UserStorage = strings.Clone(target.SQL.UserStorage)
-	target.SQL.UserPrimaryKey = strings.Clone(target.SQL.UserPrimaryKey)
+	target.SQL = target.SQL.Clone()
 	return target
 }
 

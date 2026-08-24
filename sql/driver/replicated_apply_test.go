@@ -487,6 +487,11 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		}
 		t.Fatalf("partial singleton snapshot of bundle = %p,%v", partial, err)
 	}
+	if partial, err := claim.CaptureWALBase(WALBaseCaptureOptions{
+		Workspace: walBaseWorkspace(),
+	}); partial != nil || !errors.Is(err, replicatedstate.ErrSnapshotArtifact) {
+		t.Fatalf("partial singleton WAL base of bundle = %p,%v", partial, err)
+	}
 	if err := group.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +553,7 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		t.Fatal(err)
 	}
 	if _, found, readErr := reopenedGlobal.AppendRaw(nil, []byte(globalIndexMarkerKey)); readErr != nil || found {
-		t.Fatalf("replicated global relation retained legacy marker: found=%v err=%v",
+		t.Fatalf("replicated global relation retained standalone marker: found=%v err=%v",
 			found, readErr)
 	}
 	reader, err := reopened.NewSession(context.Background())
@@ -2322,7 +2327,9 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		Binding: ReplicatedShardStoreBinding{
 			Distribution: "dist", Shard: "shard", AllocationGeneration: 11,
 			MemberID: 19, StoreID: [16]byte{20},
-			Authority: ReplicatedAuthorityProfile{RoutingVersion: 12, RouteGeneration: 13},
+			Authority: ReplicatedAuthorityProfile{
+				SchemaGeneration: 17, RoutingVersion: 12, RouteGeneration: 13,
+			},
 		},
 		LogID: [16]byte{21}, UserTable: "docs", UserStorage: "local-storage",
 		UserPrimaryKey: "/id",
@@ -2330,8 +2337,16 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 			MaxKeyBytes: 123, MaxDocumentBytes: 456,
 			MaxBatchDocuments: 7, MaxBatchBytes: 890,
 		},
-		Sidecars: canonicalReplicatedShardStoreSidecars(),
+		Sidecars:      canonicalReplicatedShardStoreSidecars(),
+		RelationCount: 1, RelationSchemaGeneration: 17,
+		Relations: make([]ReplicatedShardRelationIdentity, 1),
 	}
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+		LocalIndexDigest: sha256.Sum256([]byte("by_email:/email")),
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	placement := ReplicatedPlacementProfile{
 		Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
 		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
@@ -2341,7 +2356,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "0561d23db26f2c8bd320819912c71aba1f9292c6c78dc3929c02ec55c11e4496"
+	const wantDigest = "885cdd7ffa5c04b7d2f1d8872b1a163be260c71038ea66ecf62b7b43a8be25b7"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -2356,6 +2371,12 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
 			i.Binding.Authority.RouteGeneration++
 		},
+		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
+			i.RelationSchemaGeneration++
+		},
+		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
+			i.Relations[0].LocalIndexDigest[0]++
+		},
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.Format++ },
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.ShardKey += "x" },
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.TupleVersion++ },
@@ -2365,7 +2386,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.Range.End.Max = true },
 	}
 	for index, mutate := range boundMutations {
-		changedIdentity, changedPlacement := identity, placement
+		changedIdentity, changedPlacement := identity.Clone(), placement
 		mutate(&changedIdentity, &changedPlacement)
 		if digest := replicatedApplyProfileDigest(changedIdentity, changedPlacement); digest == got {
 			t.Fatalf("bound mutation %d did not change digest", index)
@@ -2376,9 +2397,10 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.LogID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.UserStorage += "x" },
+		func(i *ReplicatedShardStoreIdentity) { i.Relations[0].Storage += "x" },
 	}
 	for index, mutate := range localMutations {
-		changed := identity
+		changed := identity.Clone()
 		mutate(&changed)
 		if digest := replicatedApplyProfileDigest(changed, placement); digest != got {
 			t.Fatalf("member-local mutation %d changed digest: %x != %x", index, digest, got)
