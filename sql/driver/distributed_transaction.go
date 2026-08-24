@@ -2,25 +2,38 @@ package driver
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/store/durable"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 const (
 	distributedTransactionStateFile = "distributed-transaction-state.vjc"
 	distributedTransactionMember    = "\x00distributed-transaction-state"
+
+	// The participant apply record belongs to the repository's single
+	// unreleased format-0 image. The codec byte selects its sole current
+	// grammar; it is a corruption sentinel, not a released format version.
+	distributedParticipantStateCodecSentinel = uint8(0)
+	distributedParticipantStateHeaderBytes   = 8
+	distributedParticipantStateMaxBytes      = distributedParticipantStateHeaderBytes +
+		binary.MaxVarintLen64 + 9 // uint64 revision plus MaxInt64 rows: 8+10+9 = 27.
+	distributedTransactionStateKeyBytes   = len(distributedtxn.ID{})
+	distributedTransactionStateBatchBytes = distributedTransactionStateKeyBytes +
+		distributedParticipantStateMaxBytes
 )
 
 var (
 	ErrDistributedTransactionConflict = errors.New("vibedb: distributed transaction state conflicts with durable state")
 	errDistributedAlreadyApplied      = errors.New("vibedb: distributed participant was already applied")
+	distributedParticipantStateMagic  = [4]byte{'V', 'D', 'P', 'A'}
 )
 
 type distributedParticipantCommit struct {
@@ -28,6 +41,7 @@ type distributedParticipantCommit struct {
 	revision     uint64
 	rowsAffected int64
 	document     []byte
+	documentBuf  [distributedParticipantStateMaxBytes]byte
 }
 
 func (t *tx) checkDistributedParticipantLocked() error {
@@ -39,7 +53,8 @@ func (t *tx) checkDistributedParticipantLocked() error {
 	if collection == nil {
 		return errors.New("vibedb: distributed transaction state collection is not open")
 	}
-	raw, found, err := collection.AppendRaw(nil, commit.id[:])
+	var rawBuf [distributedParticipantStateMaxBytes]byte
+	raw, found, err := collection.AppendRaw(rawBuf[:0], commit.id[:])
 	if err != nil {
 		return err
 	}
@@ -56,17 +71,24 @@ func (t *tx) checkDistributedParticipantLocked() error {
 
 func distributedTransactionStateOptions() durable.Options {
 	return durable.Options{
-		Durability:  durable.DurabilitySync,
-		MaxKeyBytes: 16, InlineValueBytes: 64, MaxDocumentBytes: 64,
-		MaxBatchDocuments: 1, MaxBatchBytes: 80,
+		Durability:        durable.DurabilitySync,
+		OpaqueValues:      true,
+		MaxKeyBytes:       distributedTransactionStateKeyBytes,
+		InlineValueBytes:  distributedParticipantStateMaxBytes,
+		MaxDocumentBytes:  distributedParticipantStateMaxBytes,
+		MaxBatchDocuments: 1,
+		MaxBatchBytes:     distributedTransactionStateBatchBytes,
 	}
 }
 
 func validateDistributedTransactionStateCollection(collection *durable.Collection) error {
-	if collection == nil || collection.HasSchema() || collection.HasIndexes() ||
+	if collection == nil || !collection.HasOpaqueValues() ||
+		collection.HasSchema() || collection.HasIndexes() ||
 		!collection.HasSynchronousDurability() || !collection.SupportsUpdate() ||
-		collection.MaxKeyBytes() != 16 || collection.MaxDocumentBytes() != 64 ||
-		collection.MaxBatchDocuments() != 1 || collection.MaxBatchBytes() != 80 {
+		collection.MaxKeyBytes() != distributedTransactionStateKeyBytes ||
+		collection.MaxDocumentBytes() != distributedParticipantStateMaxBytes ||
+		collection.MaxBatchDocuments() != 1 ||
+		collection.MaxBatchBytes() != distributedTransactionStateBatchBytes {
 		return errors.New("vibedb: distributed transaction state collection profile mismatch")
 	}
 	return nil
@@ -121,37 +143,45 @@ func (d *database) ensureDistributedTransactionStateLocked() error {
 }
 
 func appendDistributedParticipantState(dst []byte, revision uint64, rowsAffected int64) []byte {
-	dst = append(dst, '[', byte('0'+distributedtxn.ParticipantApplied), ',')
-	dst = strconv.AppendUint(dst, revision, 10)
-	dst = append(dst, ',')
-	dst = strconv.AppendInt(dst, rowsAffected, 10)
-	return append(dst, ']')
+	dst = append(dst, distributedParticipantStateMagic[:]...)
+	dst = append(dst,
+		distributedParticipantStateCodecSentinel,
+		byte(distributedtxn.ParticipantApplied),
+		0, 0,
+	)
+	dst = binary.AppendUvarint(dst, revision)
+	return binary.AppendUvarint(dst, uint64(rowsAffected))
 }
 
 func openDistributedParticipantState(src []byte) (revision uint64, rowsAffected int64, err error) {
-	if len(src) < 7 || src[0] != '[' || src[1] != byte('0'+distributedtxn.ParticipantApplied) ||
-		src[2] != ',' || src[len(src)-1] != ']' {
+	if len(src) < distributedParticipantStateHeaderBytes+2 ||
+		len(src) > distributedParticipantStateMaxBytes ||
+		src[0] != distributedParticipantStateMagic[0] ||
+		src[1] != distributedParticipantStateMagic[1] ||
+		src[2] != distributedParticipantStateMagic[2] ||
+		src[3] != distributedParticipantStateMagic[3] ||
+		src[4] != distributedParticipantStateCodecSentinel ||
+		src[5] != byte(distributedtxn.ParticipantApplied) ||
+		src[6] != 0 || src[7] != 0 {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	comma := -1
-	for i := 3; i < len(src)-1; i++ {
-		if src[i] == ',' {
-			comma = i
-			break
-		}
-	}
-	if comma < 0 {
+	revision, n := binary.Uvarint(src[distributedParticipantStateHeaderBytes:])
+	if n <= 0 || revision == 0 || n != distributedParticipantUvarintBytes(revision) {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	revision, err = strconv.ParseUint(byteview.String(src[3:comma]), 10, 64)
-	if err != nil || revision == 0 {
+	position := distributedParticipantStateHeaderBytes + n
+	rows, n := binary.Uvarint(src[position:])
+	if n <= 0 || rows > math.MaxInt64 || n != distributedParticipantUvarintBytes(rows) {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	rowsAffected, err = strconv.ParseInt(byteview.String(src[comma+1:len(src)-1]), 10, 64)
-	if err != nil || rowsAffected < 0 {
+	if position+n != len(src) {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	return revision, rowsAffected, nil
+	return revision, int64(rows), nil
+}
+
+func distributedParticipantUvarintBytes(value uint64) int {
+	return max(1, (bits.Len64(value)+6)/7)
 }
 
 // OpenDistributedTransactionJournal opens the shard-local transaction journal
@@ -189,7 +219,8 @@ func (d *Database) OpenDistributedTransactionJournal() (*distributedtxn.Journal,
 }
 
 // DistributedParticipantStatus reads the SQL-atomic participant state by raw
-// transaction ID. It allocates only the tiny state document copy-out.
+// transaction ID. Warm inline reads decode through bounded stack scratch and
+// do not allocate a payload copy.
 func (d *Database) DistributedParticipantStatus(id distributedtxn.ID) (revision uint64, rowsAffected int64, found bool, err error) {
 	if d == nil || d.connector == nil {
 		return 0, 0, false, ErrDatabaseClosed
@@ -206,7 +237,8 @@ func (d *Database) DistributedParticipantStatus(id distributedtxn.ID) (revision 
 	if core.closed || core.distributedTxnCollection == nil {
 		return 0, 0, false, ErrDatabaseClosed
 	}
-	raw, found, err := core.distributedTxnCollection.AppendRaw(nil, id[:])
+	var rawBuf [distributedParticipantStateMaxBytes]byte
+	raw, found, err := core.distributedTxnCollection.AppendRaw(rawBuf[:0], id[:])
 	if err != nil || !found {
 		return 0, 0, found, err
 	}
@@ -226,7 +258,7 @@ func (s *Session) CommitDistributedParticipant(
 	if err := s.live(); err != nil {
 		return 0, err
 	}
-	if id.IsZero() || expectedRevision == 0 || rowsAffected < 0 {
+	if id.IsZero() || expectedRevision == 0 || expectedRevision == math.MaxUint64 || rowsAffected < 0 {
 		return 0, ErrDistributedTransactionConflict
 	}
 	if s.current != nil {
@@ -242,7 +274,9 @@ func (s *Session) CommitDistributedParticipant(
 	commit := &distributedParticipantCommit{
 		id: id, revision: expectedRevision + 1, rowsAffected: rowsAffected,
 	}
-	commit.document = appendDistributedParticipantState(nil, commit.revision, rowsAffected)
+	commit.document = appendDistributedParticipantState(
+		commit.documentBuf[:0], commit.revision, rowsAffected,
+	)
 	tx := s.conn.tx
 	tx.distributedParticipant = commit
 	err := tx.Commit()
