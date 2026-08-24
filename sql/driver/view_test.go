@@ -618,7 +618,7 @@ func TestCatalogViewMetadataStrictDecodeAndSemanticReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	corrupt := strings.Replace(
-		string(raw), `"outputs": [`, `"unknown": true, "outputs": [`, 1,
+		string(raw), `"outputs":[`, `"unknown":true,"outputs":[`, 1,
 	)
 	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
 		t.Fatal(err)

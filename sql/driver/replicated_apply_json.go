@@ -12,7 +12,7 @@ import (
 )
 
 // The retained replicated-apply identity uses vibejson's native hooks rather
-// than routing catalog metadata through encoding/json. The hooks keep the
+// rather than routing catalog metadata through a reflective codec. The hooks keep the
 // canonical field order stable, append fixed-width hexadecimal fields directly
 // from bytes, and reject unknown, duplicate, or missing members in one pass.
 
