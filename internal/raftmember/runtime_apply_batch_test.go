@@ -212,7 +212,7 @@ func memoryRuntimeAtApplyBoundary(
 	return nil, nil
 }
 
-func driveRuntimeToSnapshotInstalled(
+func driveRuntimeToNormalApplyBoundary(
 	t *testing.T,
 	runtime *Runtime,
 	workspace *ReadyWorkspace,
@@ -220,7 +220,13 @@ func driveRuntimeToSnapshotInstalled(
 	t.Helper()
 	for step := 0; step < 1000; step++ {
 		if runtime.node.Phase() == raftmodel.PhaseSnapshotInstalled {
-			return
+			requiresSettlement, err := runtime.node.NextApplyRequiresResultSettlement()
+			if err != nil {
+				t.Fatalf("normal apply preflight step %d = %v", step, err)
+			}
+			if requiresSettlement {
+				return
+			}
 		}
 		result, err := runtime.DriveReady(
 			workspace, func(OutboundMessage) error { return nil }, settleTestApplied,
@@ -232,7 +238,7 @@ func driveRuntimeToSnapshotInstalled(
 			t.Fatal("Runtime became idle before the apply boundary")
 		}
 	}
-	t.Fatal("Runtime did not reach the apply boundary")
+	t.Fatal("Runtime did not reach a normal apply boundary")
 }
 
 func TestRuntimeDoesNotEmbedReadyBatchWorkspace(t *testing.T) {
@@ -336,7 +342,7 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var workspace ReadyWorkspace
-	driveRuntimeToSnapshotInstalled(t, fixture.runtime, &workspace)
+	driveRuntimeToNormalApplyBoundary(t, fixture.runtime, &workspace)
 	beforeApplied := fixture.apply.Applied()
 	if result, err := fixture.runtime.DriveReady(&workspace, nil, nil); result.Progressed() ||
 		!errors.Is(err, ErrResultSettlementRequired) {
@@ -434,7 +440,7 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 	}
 }
 
-func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
+func TestRuntimeBatchesEightCommittedCommandsIntoCapturedResultRanges(t *testing.T) {
 	fixture := newRuntimeFixture(t, 182, nil)
 	drainRuntime(t, fixture.runtime, nil)
 	if err := fixture.runtime.Campaign(); err != nil {
@@ -443,6 +449,9 @@ func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
 	drainRuntime(t, fixture.runtime, nil)
 
 	const commandCount = 8
+	// RetryWindow=8 freezes ten system documents. The state row plus two
+	// records per distinct command makes four the exact legal prefix.
+	const expectedPrefixEntries = 4
 	var epochs [commandCount]uint64
 	for index := range commandCount {
 		open := runtimeReplaySessionOpen(fixture.base, byte(index+10))
@@ -479,7 +488,6 @@ func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
 		commands[index] = encoded
 	}
 	beforeApplied := fixture.apply.Applied()
-	beforeCheckpoint := fixture.apply.CheckpointAppliedIndex()
 	beforeStats, err := fixture.apply.DurabilityStats()
 	if err != nil {
 		t.Fatal(err)
@@ -491,22 +499,31 @@ func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
 	}
 
 	var workspace ReadyWorkspace
-	sinkCalls := 0
-	var appliedResult DriveResult
+	settlementRanges := 0
+	settledCommands := 0
+	nextApplied := beforeApplied + 1
 	for step := 0; step < 1000; step++ {
+		stepStats, err := fixture.apply.DurabilityStats()
+		if err != nil {
+			t.Fatal(err)
+		}
 		result, err := fixture.runtime.DriveReady(
 			&workspace,
 			func(OutboundMessage) error { return nil },
 			func(batch AppliedBatch) error {
-				sinkCalls++
-				if batch.Len() != commandCount ||
-					batch.LastIndex()-batch.FirstIndex()+1 != commandCount {
+				settlementRanges++
+				if batch.Len() != expectedPrefixEntries ||
+					batch.LastIndex()-batch.FirstIndex()+1 != uint64(batch.Len()) ||
+					batch.FirstIndex() != nextApplied ||
+					batch.FinalPublication().Applied != batch.LastIndex() ||
+					settledCommands+batch.Len() > commandCount {
 					t.Fatalf("settlement batch = len %d range %d..%d",
 						batch.Len(), batch.FirstIndex(), batch.LastIndex())
 				}
-				for index := range commandCount {
+				for index := 0; index < batch.Len(); index++ {
 					entry, ok := batch.Entry(index)
-					if !ok || !bytes.Equal(entry.Data, commands[index]) {
+					commandIndex := settledCommands + index
+					if !ok || !bytes.Equal(entry.Data, commands[commandIndex]) {
 						t.Fatalf("settlement entry %d = %+v, %v", index, entry, ok)
 					}
 					lookup, hasCommand, lookupErr := batch.LookupCompletion(index)
@@ -515,10 +532,20 @@ func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
 							index, lookup, hasCommand, lookupErr)
 					}
 					completion, openErr := replication.OpenCompletion(lookup.Bytes)
-					if openErr != nil || completion.ResultCode != replicatedstate.ResultApplied {
-						t.Fatalf("completion %d envelope = %+v, %v", index, completion, openErr)
+					command, commandErr := replication.OpenCommand(commands[commandIndex])
+					if openErr != nil || commandErr != nil ||
+						completion.ResultCode != replicatedstate.ResultApplied ||
+						completion.ClientID != command.ClientID ||
+						completion.ClientEpoch != command.ClientEpoch ||
+						completion.ClientSequence != command.ClientSequence ||
+						completion.Fingerprint != command.Fingerprint ||
+						completion.AppliedSequence != batch.FirstIndex()+uint64(index) {
+						t.Fatalf("completion %d envelope = %+v, completion %v command %v",
+							index, completion, openErr, commandErr)
 					}
 				}
+				settledCommands += batch.Len()
+				nextApplied = batch.LastIndex() + 1
 				return nil
 			},
 		)
@@ -526,35 +553,47 @@ func TestRuntimeBatchesEightCommittedCommandsIntoOneResultRange(t *testing.T) {
 			t.Fatalf("DriveReady batch step %d = %+v, %v", step, result, err)
 		}
 		if result.Kind == DriveNormalBatch {
-			appliedResult = result
-			break
+			afterStepStats, statsErr := fixture.apply.DurabilityStats()
+			if statsErr != nil {
+				t.Fatal(statsErr)
+			}
+			if result.Applied.Len() != expectedPrefixEntries ||
+				afterStepStats.Updates != stepStats.Updates+1 ||
+				afterStepStats.TransactionHighWater != stepStats.TransactionHighWater+1 ||
+				afterStepStats.LargestUpdateSpan < uint64(result.Applied.Len()) {
+				t.Fatalf("captured prefix transaction = range %d..%d before %+v after %+v",
+					result.Applied.FirstIndex(), result.Applied.LastIndex(), stepStats, afterStepStats)
+			}
+			if settledCommands == commandCount {
+				break
+			}
 		}
 		if result.Kind == DriveIdle {
 			t.Fatal("Runtime became idle before applying the command batch")
 		}
 	}
-	if appliedResult.Kind != DriveNormalBatch || appliedResult.Applied.Len() != commandCount ||
-		sinkCalls != 1 || appliedResult.Applied.FirstIndex() != beforeApplied+1 ||
-		appliedResult.Applied.LastIndex() != beforeApplied+commandCount ||
-		appliedResult.Applied.FinalPublication().Applied != beforeApplied+commandCount {
-		t.Fatalf("applied batch result = %+v sink calls %d", appliedResult, sinkCalls)
+	if settledCommands != commandCount ||
+		settlementRanges != commandCount/expectedPrefixEntries ||
+		settlementRanges >= commandCount || nextApplied != beforeApplied+commandCount+1 {
+		t.Fatalf("settled commands = %d ranges %d next applied %d",
+			settledCommands, settlementRanges, nextApplied)
 	}
 	if fixture.apply.Applied() != beforeApplied+commandCount ||
-		fixture.apply.CheckpointAppliedIndex() != beforeCheckpoint {
-		t.Fatalf("apply/checkpoint = %d/%d, want %d/%d",
+		fixture.apply.CheckpointAppliedIndex() != beforeApplied+commandCount {
+		t.Fatalf("apply/certificate = %d/%d, want %d",
 			fixture.apply.Applied(), fixture.apply.CheckpointAppliedIndex(),
-			beforeApplied+commandCount, beforeCheckpoint)
+			beforeApplied+commandCount)
 	}
 	afterStats, err := fixture.apply.DurabilityStats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterStats.Updates != beforeStats.Updates+1 ||
-		afterStats.TransactionHighWater != beforeStats.TransactionHighWater+1 ||
-		afterStats.LargestUpdateSpan != commandCount ||
-		afterStats.BarrierSyncs != beforeStats.BarrierSyncs ||
-		afterStats.PhysicalCheckpoints != beforeStats.PhysicalCheckpoints {
-		t.Fatalf("one physical batch transaction = before %+v after %+v",
-			beforeStats, afterStats)
+	if afterStats.Updates != beforeStats.Updates+uint64(settlementRanges) ||
+		afterStats.TransactionHighWater != beforeStats.TransactionHighWater+uint64(settlementRanges) ||
+		afterStats.Updates-beforeStats.Updates >= commandCount {
+		t.Fatalf("one transaction per captured prefix = ranges %d before %+v after %+v",
+			settlementRanges, beforeStats, afterStats)
 	}
+	t.Logf("settled %d commands as %d exact %d-entry committed prefixes",
+		settledCommands, settlementRanges, expectedPrefixEntries)
 }
