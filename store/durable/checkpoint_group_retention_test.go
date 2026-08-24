@@ -454,10 +454,15 @@ func TestCheckpointGroupRetentionMirrorEveryShortWriteFailsClosed(t *testing.T) 
 			if decodeErr != nil || decoded.sequence != oldSequence-1 {
 				t.Fatalf("unchanged mirror prefix %d = sequence %d, %v", cut, decoded.sequence, decodeErr)
 			}
-		case cut == checkpointGroupSlotBytes:
+		case bytes.Equal(mixed, newBytes):
+			// A physical short write can still produce the complete target image
+			// when every unwritten suffix byte already equals its replacement. That
+			// is not a torn certificate and must remain accepted; checksum bytes in
+			// particular have a legitimate 1/256 last-byte collision probability.
 			if decodeErr != nil || decoded.sequence != candidate.sequence ||
 				!equalCheckpointGroupCertificateBody(decoded, candidate) {
-				t.Fatalf("complete mirror = sequence %d, %v", decoded.sequence, decodeErr)
+				t.Fatalf("complete mirror at cut %d = sequence %d, %v",
+					cut, decoded.sequence, decodeErr)
 			}
 		default:
 			if decodeErr == nil || checkpointGroupCertificateChecksumValid(mixed) {

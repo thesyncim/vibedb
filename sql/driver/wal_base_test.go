@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -24,8 +25,16 @@ func newWALBaseTestClaim(
 	t testing.TB,
 	name string,
 ) (string, *Database, *ReplicatedApply, ReplicatedShardStoreIdentity) {
+	return newWALBaseTestClaimWithBinding(t, name, testReplicatedBinding(31))
+}
+
+func newWALBaseTestClaimWithBinding(
+	t testing.TB,
+	name string,
+	binding ReplicatedShardStoreBinding,
+) (string, *Database, *ReplicatedApply, ReplicatedShardStoreIdentity) {
 	t.Helper()
-	path, database, binding, _ := prepareReplicatedTestRoot(t, name, false)
+	path, database, _, _ := prepareReplicatedTestRoot(t, name, false)
 	t.Cleanup(func() {
 		if err := database.Close(); err != nil {
 			t.Errorf("close WAL-base database: %v", err)
@@ -50,6 +59,19 @@ func newWALBaseTestClaim(
 		t.Fatalf("InstallSnapshot: %v", err)
 	}
 	return path, database, claim, identity
+}
+
+func walBaseMachineState(t testing.TB, claim *ReplicatedApply) replicatedstate.State {
+	t.Helper()
+	cut, err := claim.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func walBaseWorkspace() []byte {
@@ -204,6 +226,223 @@ func TestReplicatedApplyCaptureWALBaseSealsOneScanWithoutArtifact(t *testing.T) 
 	}
 	if got := group.Stats(); got != afterStats {
 		t.Fatalf("idempotent seal changed group stats: got %+v want %+v", got, afterStats)
+	}
+}
+
+func TestReplicatedApplySettlesExactWALGenerationBeforeReclaim(t *testing.T) {
+	_, _, claim, _ := newWALBaseTestClaim(t, "settle-generation")
+	preparation, err := claim.CaptureWALBase(WALBaseCaptureOptions{
+		Workspace: walBaseWorkspace(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := preparation.GenerationInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(input.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input.SnapshotBaseDigest != certificate.Digest {
+		t.Fatalf("generation input snapshot-base digest = %x, want %x",
+			input.SnapshotBaseDigest, certificate.Digest)
+	}
+	before, err := claim.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeState := before.State()
+	if err := before.Close(); err != nil {
+		t.Fatal(err)
+	}
+	activation := raftstore.GenerationActivation{
+		Snapshot: input.Snapshot,
+		Info: raftstore.GenerationInfo{
+			FamilyID: [16]byte{1}, Generation: 1, BindingDigest: [32]byte{1},
+			SnapshotBaseDigest:  certificate.Digest,
+			RetentionCommitment: input.RetentionCommitment,
+			BaseIndex:           input.Snapshot.GetMetadata().GetIndex(),
+			BaseTerm:            input.Snapshot.GetMetadata().GetTerm(),
+			HardCommit:          input.Snapshot.GetMetadata().GetIndex(),
+		},
+	}
+	beforeSettlement, err := claim.DurabilityStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.SettleGenerationActivation(activation); !errors.Is(
+		err, ErrReplicatedApplyBusy,
+	) {
+		t.Fatalf("unlatched generation settlement = %v", err)
+	}
+	afterUnlatched, err := claim.DurabilityStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterUnlatched != beforeSettlement {
+		t.Fatalf("unlatched settlement mutated durability: before=%+v after=%+v",
+			beforeSettlement, afterUnlatched)
+	}
+	if err := claim.LatchGenerationActivation(activation); err != nil {
+		t.Fatalf("latch generation: %v", err)
+	}
+	foreignIdentities := []struct {
+		name   string
+		mutate func(*raftstore.GenerationActivation)
+	}{
+		{name: "family", mutate: func(value *raftstore.GenerationActivation) {
+			value.Info.FamilyID[0] ^= 0x80
+		}},
+		{name: "generation", mutate: func(value *raftstore.GenerationActivation) {
+			value.Info.Generation++
+		}},
+		{name: "binding", mutate: func(value *raftstore.GenerationActivation) {
+			value.Info.BindingDigest[0] ^= 0x80
+		}},
+		{name: "retention", mutate: func(value *raftstore.GenerationActivation) {
+			value.Info.RetentionCommitment[0] ^= 0x80
+		}},
+	}
+	for _, test := range foreignIdentities {
+		t.Run("reject_pending_"+test.name, func(t *testing.T) {
+			foreign := activation
+			test.mutate(&foreign)
+			if err := claim.LatchGenerationActivation(foreign); !errors.Is(
+				err, ErrReplicatedApplyMismatch,
+			) {
+				t.Fatalf("foreign latch = %v", err)
+			}
+			if err := claim.SettleGenerationActivation(foreign); !errors.Is(
+				err, ErrReplicatedApplyMismatch,
+			) {
+				t.Fatalf("foreign settlement = %v", err)
+			}
+		})
+	}
+	if unsettled, err := claim.SnapshotArtifactCut(); unsettled != nil || !errors.Is(
+		err, ErrReplicatedApplyBusy,
+	) {
+		t.Fatalf("public snapshot crossed selected-generation fence = %v, %v", unsettled, err)
+	}
+	unsettledState := walBaseMachineState(t, claim)
+	if unsettledState.SnapshotBaseDigest != beforeState.SnapshotBaseDigest {
+		t.Fatalf("rejected settlement changed base: before=%x after=%x",
+			beforeState.SnapshotBaseDigest, unsettledState.SnapshotBaseDigest)
+	}
+	if err := claim.SettleGenerationActivation(activation); err != nil {
+		t.Fatalf("settle generation: %v", err)
+	}
+	if settled, err := claim.SnapshotArtifactCut(); settled != nil || !errors.Is(
+		err, ErrReplicatedApplyBusy,
+	) {
+		t.Fatalf("settled base escaped before WAL completion = %v, %v", settled, err)
+	}
+	settledState := walBaseMachineState(t, claim)
+	if settledState.SnapshotBaseDigest != certificate.Digest ||
+		settledState.Applied != certificate.Manifest.State.Applied {
+		t.Fatalf("settled state = %+v, certificate = %+v", settledState, certificate)
+	}
+	if err := claim.SettleGenerationActivation(activation); err != nil {
+		t.Fatalf("idempotent settlement: %v", err)
+	}
+}
+
+func TestPendingWALGenerationCloseRetiresDatabaseBeforeClaimRelease(t *testing.T) {
+	_, database, claim, identity := newWALBaseTestClaim(t, "pending-close")
+	preparation, err := claim.CaptureWALBase(WALBaseCaptureOptions{
+		Workspace: walBaseWorkspace(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := preparation.GenerationInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(input.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := raftstore.GenerationActivation{
+		Snapshot: input.Snapshot,
+		Info: raftstore.GenerationInfo{
+			FamilyID:            [16]byte{1},
+			Generation:          1,
+			BindingDigest:       [32]byte{1},
+			SnapshotBaseDigest:  certificate.Digest,
+			RetentionCommitment: input.RetentionCommitment,
+			BaseIndex:           input.Snapshot.GetMetadata().GetIndex(),
+			BaseTerm:            input.Snapshot.GetMetadata().GetTerm(),
+			HardCommit:          input.Snapshot.GetMetadata().GetIndex(),
+		},
+	}
+	if err := claim.LatchGenerationActivation(activation); err != nil {
+		t.Fatalf("latch generation: %v", err)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatalf("close pending claim: %v", err)
+	}
+	if !database.connector.closed {
+		t.Fatal("pending claim release did not retire its connector")
+	}
+	if replacement, _, err := database.OpenReplicatedApply(
+		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	); replacement != nil || !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("same-root replacement claim = %v, %v", replacement, err)
+	}
+	if session, err := database.NewSession(t.Context()); session != nil ||
+		!errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("retired database session = %v, %v", session, err)
+	}
+}
+
+func TestGenerationSettlementRejectsWrongBindingBeforeCheckpointMutation(t *testing.T) {
+	_, _, source, _ := newWALBaseTestClaim(t, "settle-binding-source")
+	_, _, target, _ := newWALBaseTestClaimWithBinding(
+		t, "settle-binding-target", testReplicatedBinding(32),
+	)
+	preparation, err := source.CaptureWALBase(WALBaseCaptureOptions{
+		Workspace: walBaseWorkspace(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := preparation.GenerationInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(input.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := raftstore.GenerationActivation{
+		Snapshot: input.Snapshot,
+		Info: raftstore.GenerationInfo{
+			FamilyID: [16]byte{1}, Generation: 1, BindingDigest: [32]byte{1},
+			SnapshotBaseDigest:  certificate.Digest,
+			RetentionCommitment: input.RetentionCommitment,
+			BaseIndex:           input.Snapshot.GetMetadata().GetIndex(),
+			BaseTerm:            input.Snapshot.GetMetadata().GetTerm(),
+			HardCommit:          input.Snapshot.GetMetadata().GetIndex(),
+		},
+	}
+	before, err := target.DurabilityStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.SettleGenerationActivation(activation); !errors.Is(
+		err, ErrReplicatedApplyMismatch,
+	) {
+		t.Fatalf("wrong-binding settlement = %v", err)
+	}
+	after, err := target.DurabilityStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("wrong-binding settlement mutated durability: before=%+v after=%+v", before, after)
 	}
 }
 
