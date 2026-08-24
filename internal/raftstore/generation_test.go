@@ -126,7 +126,7 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 			peer, peerErr, peerBuilder.source, candidate)
 	}
 
-	generated, err := Open(
+	generated, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -182,7 +182,7 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 	if err != nil || len(sourceFive) != 1 || string(sourceFive[0].GetData()) != "source-five" {
 		t.Fatalf("source suffix after candidate build = %+v, %v", sourceFive, err)
 	}
-	reopenedCandidate, err := Open(
+	reopenedCandidate, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -195,7 +195,7 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 		t.Fatalf("candidate suffix after restart = %+v, %v", candidateFive, err)
 	}
 	if _, err := reopenedSource.GenerationInfo(); !errors.Is(err, ErrGenerationCandidate) {
-		t.Fatalf("legacy source GenerationInfo = %v", err)
+		t.Fatalf("initial source GenerationInfo = %v", err)
 	}
 }
 
@@ -233,7 +233,7 @@ func TestGenerationCandidateSupportsFullyCheckpointedSuffix(t *testing.T) {
 		candidate.Info.RetainedEntries != 0 || candidate.Info.RetainedBytes != 0 {
 		t.Fatalf("fully checkpointed generation info = %+v", candidate.Info)
 	}
-	opened, err := Open(
+	opened, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -435,7 +435,7 @@ func TestGenerationReplayCompactsOverwrittenSourceSuffix(t *testing.T) {
 		candidate.Info.RetainedEntries != 2 {
 		t.Fatalf("overwritten generation info = %+v", candidate.Info)
 	}
-	opened, err := Open(
+	opened, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -678,7 +678,7 @@ func TestGenerationReplayOverwritesAcrossFlushedAndPendingChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	generated, err := Open(
+	generated, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -806,7 +806,7 @@ func TestGenerationReplayCoalescesSequentialReadyRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := Open(
+	opened, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -862,8 +862,12 @@ func TestGenerationBuildReclaimsOneDeterministicAbandonedStage(t *testing.T) {
 
 func TestGenerationBuildReclaimsPublishedStageLinkBeforeIdempotentValidation(t *testing.T) {
 	_, _, _, builder := prepareGenerationSource(t)
+	if err := builder.acquireSource(); err != nil {
+		t.Fatal(err)
+	}
 	lease, err := builder.acquireBuildLease()
 	if err != nil {
+		_ = builder.releaseSource()
 		t.Fatal(err)
 	}
 	stage, err := builder.createStage()
@@ -882,6 +886,9 @@ func TestGenerationBuildReclaimsPublishedStageLinkBeforeIdempotentValidation(t *
 		err = closeErr
 	}
 	if closeErr := lease.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := builder.releaseSource(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
@@ -998,7 +1005,7 @@ func TestGenerationValidationRejectsAdvancedCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := Open(
+	opened, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -1029,13 +1036,50 @@ func TestGenerationValidationRejectsAdvancedCandidate(t *testing.T) {
 	}
 }
 
+func TestGenerationBuildReclaimsStaleUnselectedCandidate(t *testing.T) {
+	_, source, _, first := prepareGenerationSource(t)
+	stale, err := first.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	incarnation := source.CurrentIncarnation()
+	if err := source.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation,
+		ReadyID:         3,
+		HardState:       hard(4, 5),
+		Entries:         []*pb.Entry{entry(5, 4, "five")},
+		MustSync:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := source.PrepareGeneration(GenerationInput{
+		Snapshot:            testGenerationSnapshot(3, 2, "checkpoint-three"),
+		RetentionCommitment: testRetentionCommitment(),
+	}, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	rebuilt, err := fresh.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Path != stale.Path || rebuilt.Info.LastIndex != 5 ||
+		rebuilt.Info.SourceCutDigest == stale.Info.SourceCutDigest {
+		t.Fatalf("stale/rebuilt candidate = %+v / %+v", stale.Info, rebuilt.Info)
+	}
+	if validated, err := fresh.ValidateCandidate(); err != nil || validated != rebuilt {
+		t.Fatalf("rebuilt candidate validation = %+v, %v", validated, err)
+	}
+}
+
 func TestGenerationCandidateStrictReopenRejectsCiphertextDamage(t *testing.T) {
 	_, _, options, builder := prepareGenerationSource(t)
 	candidate, err := builder.Build()
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := Open(
+	opened, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -1139,10 +1183,10 @@ func TestGenerationSealCodecBindsEveryByte(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x46, 0x71, 0xee, 0x3a, 0x73, 0xa8, 0x76, 0xdf,
-		0x97, 0x0f, 0xe0, 0x94, 0x59, 0xb4, 0x75, 0xb2,
-		0xe6, 0x0a, 0x4f, 0x18, 0xaf, 0x17, 0xba, 0x30,
-		0xbe, 0x72, 0x67, 0xd7, 0x44, 0x4a, 0x53, 0x8f,
+		0x97, 0xf0, 0x58, 0xc9, 0x4f, 0x00, 0xf4, 0xf5,
+		0x3a, 0x22, 0xaf, 0xb0, 0x9e, 0x77, 0xc5, 0xa6,
+		0xce, 0xf8, 0xfc, 0x43, 0xff, 0x85, 0x55, 0xa9,
+		0x9a, 0x92, 0x36, 0xa0, 0x26, 0xab, 0x16, 0x30,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("generation seal golden SHA-256 = %x, want %x", got, wantGolden)
@@ -1303,7 +1347,9 @@ func requireGenerationCandidateMatchesSourceCut(
 		!proto.Equal(seal.hard, sourceHard) {
 		t.Fatalf("projected generation seal = %+v, captured current = %+v", seal, captured)
 	}
-	if candidate.Info != generationInfo(candidate.Path, seal) ||
+	if candidate.Info != generationInfo(
+		candidate.Path, seal, builder.candidateFileID, builder.candidateHeaderDigest,
+	) ||
 		candidate.Info.BaseIndex != baseIndex || candidate.Info.BaseTerm != baseTerm ||
 		candidate.Info.LastIndex != sourceLast ||
 		candidate.Info.RetainedEntries != uint64(len(retained)) ||
@@ -1314,7 +1360,7 @@ func requireGenerationCandidateMatchesSourceCut(
 		t.Fatalf("projected candidate info = %+v", candidate.Info)
 	}
 
-	generated, err := Open(
+	generated, err := openUnselectedGenerationForTest(
 		candidate.Path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
 		testKey(), options,
 	)
@@ -1530,12 +1576,12 @@ func TestGenerationRecordCryptoWorkspaceEquivalentAndAllocationBounded(t *testin
 			bytes.Equal(gotRecord.payload, wantRecord.payload), err)
 	}
 
-	legacyPrefixAllocations := testing.AllocsPerRun(1000, func() {
+	baselinePrefixAllocations := testing.AllocsPerRun(1000, func() {
 		envelope, inspectErr := inspectRecordPrefix(
 			record[:recordPrefixBytes], store.header, store.options,
 		)
 		if inspectErr != nil || envelope != wantEnvelope {
-			panic("legacy prefix inspection failed")
+			panic("baseline prefix inspection failed")
 		}
 	})
 	workspacePrefixAllocations := testing.AllocsPerRun(1000, func() {
@@ -1546,15 +1592,15 @@ func TestGenerationRecordCryptoWorkspaceEquivalentAndAllocationBounded(t *testin
 			panic("workspace prefix inspection failed")
 		}
 	})
-	if workspacePrefixAllocations >= legacyPrefixAllocations {
-		t.Fatalf("workspace prefix inspection allocations = %.2f, legacy %.2f",
-			workspacePrefixAllocations, legacyPrefixAllocations)
+	if workspacePrefixAllocations >= baselinePrefixAllocations {
+		t.Fatalf("workspace prefix inspection allocations = %.2f, baseline %.2f",
+			workspacePrefixAllocations, baselinePrefixAllocations)
 	}
-	legacyAllocations := testing.AllocsPerRun(1000, func() {
+	baselineAllocations := testing.AllocsPerRun(1000, func() {
 		if _, decodeErr := unmarshalInspectedRecord(
 			record, wantEnvelope, store.header, nil,
 		); decodeErr != nil {
-			panic("legacy record decode failed")
+			panic("baseline record decode failed")
 		}
 	})
 	workspaceAllocations := testing.AllocsPerRun(1000, func() {
@@ -1564,14 +1610,14 @@ func TestGenerationRecordCryptoWorkspaceEquivalentAndAllocationBounded(t *testin
 			panic("workspace record decode failed")
 		}
 	})
-	if workspaceAllocations >= legacyAllocations {
-		t.Fatalf("workspace record decode allocations = %.2f, legacy %.2f",
-			workspaceAllocations, legacyAllocations)
+	if workspaceAllocations >= baselineAllocations {
+		t.Fatalf("workspace record decode allocations = %.2f, baseline %.2f",
+			workspaceAllocations, baselineAllocations)
 	}
-	t.Logf("record decode allocations: workspace %.2f, legacy %.2f",
-		workspaceAllocations, legacyAllocations)
-	t.Logf("record prefix allocations: workspace %.2f, legacy %.2f",
-		workspacePrefixAllocations, legacyPrefixAllocations)
+	t.Logf("record decode allocations: workspace %.2f, baseline %.2f",
+		workspaceAllocations, baselineAllocations)
+	t.Logf("record prefix allocations: workspace %.2f, baseline %.2f",
+		workspacePrefixAllocations, baselinePrefixAllocations)
 }
 
 func requireNoGenerationConstructionNames(t *testing.T, directory string) {

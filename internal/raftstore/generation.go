@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,9 +19,8 @@ import (
 )
 
 const (
-	// FirstWALGeneration is the deterministic first compacted sibling of a
-	// legacy single-file WAL. This safe point deliberately does not publish a
-	// family manifest or make the sibling authoritative.
+	// FirstWALGeneration is the deterministic first compacted child of the
+	// mandatory source family state.
 	FirstWALGeneration uint64 = 1
 
 	// DefaultGenerationRetainedChunkBytes bounds ordinary builder workspace and
@@ -30,10 +30,13 @@ const (
 )
 
 var (
-	ErrGenerationCandidate = errors.New("raftstore: invalid WAL generation candidate")
-	ErrGenerationConflict  = errors.New("raftstore: WAL generation name is occupied by another image")
-	ErrGenerationSource    = errors.New("raftstore: WAL generation source is not a canonical live cut")
-	errGenerationContended = errors.New("raftstore: WAL generation publication contended")
+	ErrGenerationCandidate         = errors.New("raftstore: invalid WAL generation candidate")
+	ErrGenerationConflict          = errors.New("raftstore: WAL generation name is occupied by another image")
+	ErrGenerationSource            = errors.New("raftstore: WAL generation source is not a canonical live cut")
+	ErrGenerationActivationPending = errors.New("raftstore: WAL generation activation requires settlement")
+	ErrGenerationFamilyQuarantined = errors.New("raftstore: WAL generation family requires quarantine")
+	errGenerationContended         = errors.New("raftstore: WAL generation publication contended")
+	errGenerationCandidateStale    = errors.New("raftstore: stale unselected WAL generation candidate")
 )
 
 func linkGenerationName(root *os.Root, oldName, newName string) error {
@@ -56,6 +59,10 @@ type GenerationInfo struct {
 	Path                     string
 	FamilyID                 [16]byte
 	Generation               uint64
+	ParentBindingDigest      [sha256.Size]byte
+	FileID                   [16]byte
+	HeaderDigest             [sha256.Size]byte
+	BindingDigest            [sha256.Size]byte
 	SourceFileID             [16]byte
 	SourceCutDigest          [sha256.Size]byte
 	SnapshotBaseDigest       [sha256.Size]byte
@@ -72,27 +79,30 @@ type GenerationInfo struct {
 }
 
 // GenerationCandidate is a fully synced and strictly reopened sibling. It is
-// not serving or deletion authority: Open(path, ...) still selects the legacy
-// path and no family manifest is created by this safe point.
+// not serving or deletion authority until the family selection and settlement
+// protocol publishes it through the logical WAL path.
 type GenerationCandidate struct {
 	Path string
 	Info GenerationInfo
 }
 
-// GenerationBuilder owns an immutable duplicate descriptor for one selected
-// source cut. PrepareGeneration holds the live Store lock only long enough to
-// capture and fence that descriptor; WAL replay, suffix selection, encoding,
-// preallocation, and candidate validation happen later through Build.
+// GenerationBuilder owns immutable metadata for one selected source cut.
+// PrepareGeneration holds the live Store lock only long enough to capture that
+// cut. Build transiently opens and proves the still-named source inode, then
+// closes it before returning; an abandoned builder therefore cannot pin a
+// retired full-size WAL generation.
 //
-// A builder is single-threaded. Close is idempotent and releases an unconsumed
-// source descriptor. Build consumes the descriptor automatically.
+// A builder is single-threaded. Close is idempotent.
 type GenerationBuilder struct {
+	owner         *Store
 	logicalPath   string
 	parentPath    string
 	base          string
 	candidatePath string
 	candidateBase string
 	familyID      [16]byte
+	generation    uint64
+	parentBinding [sha256.Size]byte
 
 	directoryInfo os.FileInfo
 	sourceInfo    os.FileInfo
@@ -104,14 +114,16 @@ type GenerationBuilder struct {
 	input         GenerationInput
 	link          func(*os.Root, string, string) error
 
-	loaded bool
-	closed bool
-	seal   generationSeal
+	loaded                bool
+	closed                bool
+	seal                  generationSeal
+	candidateFileID       [16]byte
+	candidateHeaderDigest [sha256.Size]byte
 }
 
-// PrepareGeneration captures an immutable source current-slot cut and duplicate
-// read descriptor without replaying or copying the live log. The source must be
-// a healthy, begun legacy WAL with no unsettled mutation. key must open that
+// PrepareGeneration captures an immutable source current-slot cut without
+// replaying or copying the live log. The source must be a healthy, begun WAL
+// with no unsettled mutation. key must open that
 // exact WAL; its wrapped metadata may be omitted and is filled from the source.
 func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*GenerationBuilder, error) {
 	if store == nil {
@@ -122,7 +134,7 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 	if err := store.checkLocked(); err != nil {
 		return nil, err
 	}
-	if store.recoveredTornSlot || store.generation.present || !store.begun ||
+	if store.recoveredTornSlot || !store.begun ||
 		store.current.currentIncarnation == 0 {
 		return nil, ErrGenerationSource
 	}
@@ -151,31 +163,34 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		key.Wrapped = slices.Clone(key.Wrapped)
 	}
 	key.ID = strings.Clone(key.ID)
-	reader, err := store.root.OpenFile(store.base, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
 	if err := proveNamedFile(
-		store.root, store.parentPath, store.directoryInfo, store.base, reader,
+		store.root, store.parentPath, store.directoryInfo, store.base, store.file,
 		store.options.maxFileBytes,
 	); err != nil {
-		_ = reader.Close()
-		return nil, err
-	}
-	sourceInfo, err := reader.Stat()
-	if err != nil {
-		_ = reader.Close()
 		return nil, err
 	}
 	header := cloneGenerationHeader(store.header)
 	current := cloneGenerationCurrent(store.current)
 	familyID := generationFamilyID(store.base, header.identity)
-	candidateBase := generationCandidateBase(familyID, FirstWALGeneration)
+	generation := FirstWALGeneration
+	var parentBinding [sha256.Size]byte
+	if store.generation.present {
+		if store.generation.seal.familyID == ([16]byte{}) ||
+			store.generation.seal.familyID != familyID ||
+			store.generation.seal.generation == math.MaxUint64 {
+			return nil, ErrGenerationSource
+		}
+		generation = store.generation.seal.generation + 1
+		parentBinding = store.generation.seal.bindingDigest
+	}
+	candidateBase := generationCandidateBase(familyID, generation)
 	return &GenerationBuilder{
-		logicalPath: store.path, parentPath: store.parentPath, base: store.base,
+		owner:       store,
+		logicalPath: store.logicalPath, parentPath: store.parentPath, base: store.base,
 		candidatePath: filepath.Join(store.parentPath, candidateBase), candidateBase: candidateBase,
-		familyID: familyID, directoryInfo: store.directoryInfo, sourceInfo: sourceInfo,
-		source: reader, header: header, current: current, options: store.options,
+		familyID: familyID, generation: generation, parentBinding: parentBinding,
+		directoryInfo: store.directoryInfo, sourceInfo: store.fileInfo,
+		header: header, current: current, options: store.options,
 		link: linkGenerationName,
 		key:  key, input: GenerationInput{
 			Snapshot: cloneSnapshot(input.Snapshot), RetentionCommitment: input.RetentionCommitment,
@@ -192,6 +207,15 @@ func (builder *GenerationBuilder) CandidatePath() string {
 	return builder.candidatePath
 }
 
+// BindsInput reports whether this builder captured the exact snapshot and
+// retention commitment. It grants no build, selection, or deletion authority.
+func (builder *GenerationBuilder) BindsInput(input GenerationInput) bool {
+	return builder != nil && !builder.closed && input.Snapshot != nil &&
+		input.RetentionCommitment != ([sha256.Size]byte{}) &&
+		input.RetentionCommitment == builder.input.RetentionCommitment &&
+		proto.Equal(input.Snapshot, builder.input.Snapshot)
+}
+
 // Build replays the captured source cut from its immutable descriptor, writes
 // one offline compacted image, syncs it completely, publishes only the
 // deterministic non-authoritative sibling name, and strictly reopens it.
@@ -204,6 +228,10 @@ func (builder *GenerationBuilder) Build() (
 	if builder == nil || builder.closed {
 		return GenerationCandidate{}, ErrClosed
 	}
+	if err := builder.acquireSource(); err != nil {
+		return GenerationCandidate{}, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, builder.releaseSource()) }()
 	lease, err := builder.acquireBuildLease()
 	if err != nil {
 		return GenerationCandidate{}, err
@@ -213,7 +241,13 @@ func (builder *GenerationBuilder) Build() (
 		return GenerationCandidate{}, err
 	}
 	if candidate, found, err := builder.validateExistingCandidate(); found || err != nil {
-		return candidate, err
+		if errors.Is(err, errGenerationCandidateStale) {
+			if reclaimErr := builder.reclaimStaleCandidate(); reclaimErr != nil {
+				return GenerationCandidate{}, reclaimErr
+			}
+		} else {
+			return candidate, err
+		}
 	}
 	stage, err := builder.createStage()
 	if err != nil {
@@ -261,13 +295,45 @@ func (builder *GenerationBuilder) Build() (
 				ErrGenerationConflict, publicationErr, validationErr,
 			)
 		}
-		return candidate, builder.releaseSource()
+		return candidate, nil
 	}
 	candidate, err = builder.ValidateCandidate()
 	if err != nil {
 		return GenerationCandidate{}, err
 	}
-	return candidate, builder.releaseSource()
+	return candidate, nil
+}
+
+func (builder *GenerationBuilder) acquireSource() error {
+	if builder == nil || builder.closed || builder.source != nil {
+		return ErrClosed
+	}
+	_, parentPath, base, root, directoryInfo, err := openNamespace(builder.logicalPath)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if parentPath != builder.parentPath || base != builder.base ||
+		builder.directoryInfo == nil || !os.SameFile(builder.directoryInfo, directoryInfo) {
+		return ErrNamespaceChanged
+	}
+	file, err := root.OpenFile(base, os.O_RDONLY, 0)
+	if err != nil {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	if err := proveNamedFile(
+		root, parentPath, directoryInfo, base, file, builder.options.maxFileBytes,
+	); err != nil {
+		_ = file.Close()
+		return err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil || builder.sourceInfo == nil || !os.SameFile(fileInfo, builder.sourceInfo) {
+		_ = file.Close()
+		return errors.Join(ErrGenerationSource, err)
+	}
+	builder.source = file
+	return nil
 }
 
 func (builder *GenerationBuilder) releaseSource() error {
@@ -286,18 +352,11 @@ func (builder *GenerationBuilder) ValidateCandidate() (GenerationCandidate, erro
 	if builder == nil || builder.closed {
 		return GenerationCandidate{}, ErrClosed
 	}
-	seal, snapshot, err := builder.readGenerationCandidate()
+	locked, candidate, err := builder.lockValidatedGenerationCandidate()
 	if err != nil {
 		return GenerationCandidate{}, errors.Join(ErrGenerationCandidate, err)
 	}
-	if builder.loaded && !equalGenerationSeal(seal, builder.seal) ||
-		!builder.candidateSealMatches(seal, snapshot) {
-		return GenerationCandidate{}, ErrGenerationCandidate
-	}
-	builder.seal = seal
-	builder.loaded = true
-	info := generationInfo(builder.candidatePath, seal)
-	return GenerationCandidate{Path: builder.candidatePath, Info: info}, builder.releaseSource()
+	return candidate, locked.close()
 }
 
 // Close releases an unconsumed source descriptor and clears retained builder
@@ -321,12 +380,15 @@ func (builder *GenerationBuilder) Close() error {
 	builder.header = headerState{}
 	builder.current = currentState{}
 	builder.input = GenerationInput{}
+	builder.owner = nil
 	builder.seal = generationSeal{}
+	builder.candidateFileID = [16]byte{}
+	builder.candidateHeaderDigest = [sha256.Size]byte{}
 	return err
 }
 
-// GenerationInfo returns the intrinsic recovered seal for an open generation.
-// A legacy WAL returns ErrGenerationCandidate.
+// GenerationInfo returns the intrinsic recovered seal for an open compacted
+// generation. The initial source state returns ErrGenerationCandidate.
 func (store *Store) GenerationInfo() (GenerationInfo, error) {
 	if store == nil {
 		return GenerationInfo{}, ErrClosed
@@ -339,16 +401,42 @@ func (store *Store) GenerationInfo() (GenerationInfo, error) {
 	if !store.generation.present {
 		return GenerationInfo{}, ErrGenerationCandidate
 	}
-	return generationInfo(store.path, store.generation.seal), nil
+	return generationInfo(
+		store.path, store.generation.seal,
+		store.header.fileID, store.header.headerDigest,
+	), nil
 }
 
 func (builder *GenerationBuilder) validateExistingCandidate() (GenerationCandidate, bool, error) {
 	_, err := os.Lstat(builder.candidatePath)
 	switch {
 	case err == nil:
-		candidate, validationErr := builder.ValidateCandidate()
+		locked, seal, snapshot, validationErr := builder.lockGenerationCandidate()
 		if validationErr != nil {
 			return GenerationCandidate{}, true, errors.Join(ErrGenerationConflict, validationErr)
+		}
+		if !builder.candidateSealMatches(seal, snapshot) {
+			closeErr := locked.close()
+			if builder.sameGenerationLineage(seal) {
+				return GenerationCandidate{}, true, errors.Join(
+					errGenerationCandidateStale, closeErr,
+				)
+			}
+			return GenerationCandidate{}, true, errors.Join(
+				ErrGenerationConflict, ErrGenerationCandidate, closeErr,
+			)
+		}
+		builder.seal = seal
+		builder.loaded = true
+		candidate := GenerationCandidate{
+			Path: builder.candidatePath,
+			Info: generationInfo(
+				builder.candidatePath, seal,
+				builder.candidateFileID, builder.candidateHeaderDigest,
+			),
+		}
+		if closeErr := locked.close(); closeErr != nil {
+			return GenerationCandidate{}, true, closeErr
 		}
 		// This also settles a prior publish whose directory sync outcome was
 		// unknown. Build reports success only after the candidate name is durable
@@ -364,6 +452,87 @@ func (builder *GenerationBuilder) validateExistingCandidate() (GenerationCandida
 	default:
 		return GenerationCandidate{}, true, err
 	}
+}
+
+func (builder *GenerationBuilder) sameGenerationLineage(seal generationSeal) bool {
+	return builder != nil && seal.familyID == builder.familyID &&
+		seal.generation == builder.generation &&
+		seal.parentBindingDigest == builder.parentBinding &&
+		seal.identityDigest == generationIdentityDigest(builder.header.identity) &&
+		seal.sourceFileID == builder.header.fileID &&
+		seal.sourceHeaderDigest == builder.header.headerDigest
+}
+
+func (builder *GenerationBuilder) reclaimStaleCandidate() (resultErr error) {
+	if builder == nil || builder.owner == nil {
+		return ErrGenerationConflict
+	}
+	store := builder.owner
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.checkLocked(); err != nil || store.family == nil ||
+		(store.family.state.phase != familyPhaseSource &&
+			store.family.state.phase != familyPhaseActive) ||
+		store.logicalPath != builder.logicalPath || store.base != builder.base ||
+		store.fileInfo == nil || builder.sourceInfo == nil ||
+		!os.SameFile(store.fileInfo, builder.sourceInfo) ||
+		store.header.fileID != builder.header.fileID ||
+		store.header.headerDigest != builder.header.headerDigest ||
+		!sameGenerationCurrent(store.current, builder.current) {
+		return errors.Join(ErrGenerationConflict, err)
+	}
+	if store.family.state.phase == familyPhaseSource {
+		if store.generation.present || builder.generation != FirstWALGeneration ||
+			builder.parentBinding != ([sha256.Size]byte{}) {
+			return ErrGenerationConflict
+		}
+	} else if !store.generation.present ||
+		builder.generation != store.generation.seal.generation+1 ||
+		builder.parentBinding != store.generation.seal.bindingDigest {
+		return ErrGenerationConflict
+	}
+	if err := store.proveCurrentNamespace(); err != nil {
+		return err
+	}
+	locked, seal, snapshot, err := builder.lockGenerationCandidate()
+	if err != nil {
+		return errors.Join(ErrGenerationConflict, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, locked.close()) }()
+	if !builder.sameGenerationLineage(seal) || builder.candidateSealMatches(seal, snapshot) {
+		return ErrGenerationConflict
+	}
+	entry, err := store.root.Lstat(builder.candidateBase)
+	fileInfo, fileErr := locked.file.Stat()
+	if err != nil || fileErr != nil || !entry.Mode().IsRegular() ||
+		!os.SameFile(entry, fileInfo) {
+		return errors.Join(ErrNamespaceChanged, err, fileErr)
+	}
+	if err := store.root.Remove(builder.candidateBase); err != nil {
+		return err
+	}
+	if err := store.options.ops.syncDirectory(store.root); err != nil {
+		return persistenceError("reclaim stale WAL generation candidate", true, err)
+	}
+	if _, err := store.root.Lstat(builder.candidateBase); !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	return store.proveCurrentNamespace()
+}
+
+func sameGenerationCurrent(left, right currentState) bool {
+	return left.activeSlot == right.activeSlot && left.generation == right.generation &&
+		left.walEnd == right.walEnd && left.recordSequence == right.recordSequence &&
+		left.chainDigest == right.chainDigest &&
+		left.currentIncarnation == right.currentIncarnation &&
+		proto.Equal(left.hard, right.hard) && left.first == right.first &&
+		left.last == right.last && left.retryPresent == right.retryPresent &&
+		left.retry == right.retry && left.retryDigest == right.retryDigest &&
+		left.snapshotID == right.snapshotID && left.snapshotIndex == right.snapshotIndex &&
+		left.snapshotTerm == right.snapshotTerm && left.snapshotSize == right.snapshotSize &&
+		left.snapshotChunks == right.snapshotChunks &&
+		left.snapshotDigest == right.snapshotDigest &&
+		left.topologyRecoveryEpoch == right.topologyRecoveryEpoch
 }
 
 func (builder *GenerationBuilder) publishStage(stage *Store) error {
@@ -482,10 +651,17 @@ func generationRecordBytes(plainBytes, keyBytes int) int {
 	return alignRecordLength(recordPrefixBytes + keyBytes + plainBytes + 16 + recordChecksumBytes)
 }
 
-func generationInfo(path string, seal generationSeal) GenerationInfo {
+func generationInfo(
+	path string,
+	seal generationSeal,
+	fileID [16]byte,
+	headerDigest [sha256.Size]byte,
+) GenerationInfo {
 	return GenerationInfo{
 		Path: path, FamilyID: seal.familyID, Generation: seal.generation,
-		SourceFileID: seal.sourceFileID, SourceCutDigest: seal.bindingDigest,
+		ParentBindingDigest: seal.parentBindingDigest,
+		FileID:              fileID, HeaderDigest: headerDigest, BindingDigest: seal.bindingDigest,
+		SourceFileID: seal.sourceFileID, SourceCutDigest: seal.sourceChainDigest,
 		SnapshotBaseDigest: seal.baseDigest, RetentionCommitment: seal.retentionCommitment,
 		BaseIndex: seal.baseIndex, BaseTerm: seal.baseTerm, LastIndex: seal.suffixLast,
 		HardTerm: seal.hard.GetTerm(), HardVote: seal.hard.GetVote(), HardCommit: seal.hard.GetCommit(),
@@ -550,6 +726,10 @@ func validateGenerationKey(key Key, header headerState) error {
 func generationCandidateBase(familyID [16]byte, generation uint64) string {
 	var encodedGeneration [8]byte
 	binary.BigEndian.PutUint64(encodedGeneration[:], generation)
-	return ".vibedb-raft-" + hex.EncodeToString(familyID[:]) +
+	return generationFamilyPrefix(familyID) +
 		".g" + hex.EncodeToString(encodedGeneration[:]) + ".wal"
+}
+
+func generationFamilyPrefix(familyID [16]byte) string {
+	return ".vibedb-raft-" + hex.EncodeToString(familyID[:])
 }

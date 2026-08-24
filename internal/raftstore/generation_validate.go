@@ -13,79 +13,129 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// readGenerationCandidate streams one immutable freshly-built candidate. It
-// intentionally rejects later Ready records: the deterministic candidate name
-// is idempotent only for the exact offline image, not an independently advanced
-// descendant. Peak heap is one authenticated retained record.
-func (builder *GenerationBuilder) readGenerationCandidate() (
+type generationCandidateLock struct {
+	root   *os.Root
+	file   *os.File
+	locked bool
+}
+
+func (candidate *generationCandidateLock) close() error {
+	if candidate == nil {
+		return nil
+	}
+	var err error
+	if candidate.locked {
+		err = storeio.UnlockWriter(candidate.file)
+		candidate.locked = false
+	}
+	if candidate.file != nil {
+		err = errors.Join(err, candidate.file.Close())
+		candidate.file = nil
+	}
+	if candidate.root != nil {
+		err = errors.Join(err, candidate.root.Close())
+		candidate.root = nil
+	}
+	return err
+}
+
+// lockGenerationCandidate streams and writer-locks one immutable freshly-built
+// candidate. It intentionally rejects later Ready records: the deterministic
+// candidate name is idempotent only for the exact offline image, not an
+// independently advanced descendant. Peak heap is one authenticated retained
+// record. The lock lets selection close the validation/publication race.
+func (builder *GenerationBuilder) lockGenerationCandidate() (
+	*generationCandidateLock,
 	generationSeal,
 	*pb.Snapshot,
 	error,
 ) {
 	_, parentPath, base, root, directoryInfo, err := openNamespace(builder.candidatePath)
 	if err != nil {
-		return generationSeal{}, nil, err
+		return nil, generationSeal{}, nil, err
 	}
-	defer root.Close()
+	candidate := &generationCandidateLock{root: root}
+	fail := func(cause error) (*generationCandidateLock, generationSeal, *pb.Snapshot, error) {
+		return nil, generationSeal{}, nil, errors.Join(cause, candidate.close())
+	}
 	if parentPath != builder.parentPath || builder.directoryInfo == nil ||
 		!os.SameFile(builder.directoryInfo, directoryInfo) || base != builder.candidateBase {
-		return generationSeal{}, nil, ErrNamespaceChanged
+		return fail(ErrNamespaceChanged)
 	}
 	entryInfo, err := root.Lstat(base)
 	if err != nil || !entryInfo.Mode().IsRegular() {
-		return generationSeal{}, nil, errors.Join(ErrGenerationCandidate, err)
+		return fail(errors.Join(ErrGenerationCandidate, err))
 	}
 	file, err := root.OpenFile(base, os.O_RDWR, 0)
 	if err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
-	locked := false
-	defer func() {
-		if locked {
-			_ = storeio.UnlockWriter(file)
-		}
-		_ = file.Close()
-	}()
+	candidate.file = file
 	if err := storeio.LockWriter(file); err != nil {
-		return generationSeal{}, nil, errors.Join(ErrLocked, err)
+		return fail(errors.Join(ErrLocked, err))
 	}
-	locked = true
+	candidate.locked = true
 	if err := proveNamedFile(
 		root, parentPath, directoryInfo, base, file, builder.options.maxFileBytes,
 	); err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
 	staticBytes := make([]byte, StaticHeaderBytes)
 	if _, err := file.ReadAt(staticBytes, 0); err != nil {
-		return generationSeal{}, nil, fmt.Errorf("%w: read candidate static header: %v",
-			ErrCorrupt, err)
+		return fail(fmt.Errorf("%w: read candidate static header: %v", ErrCorrupt, err))
 	}
 	header, _, err := unmarshalStaticHeader(
 		staticBytes, builder.header.identity, builder.key, builder.options,
 	)
 	if err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
 	current, recoveredTorn, err := recoverCurrent(file, header, builder.options)
 	if err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
 	if recoveredTorn {
-		return generationSeal{}, nil, ErrGenerationCandidate
+		return fail(ErrGenerationCandidate)
 	}
 	seal, err := streamFreshGenerationRecords(file, &header, current, builder.options)
 	if err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
 	if header.topologyRecoveryEpoch != builder.header.topologyRecoveryEpoch {
-		return generationSeal{}, nil, ErrIdentityMismatch
+		return fail(ErrIdentityMismatch)
 	}
 	if err := proveNamedFile(
 		root, parentPath, directoryInfo, base, file, builder.options.maxFileBytes,
 	); err != nil {
-		return generationSeal{}, nil, err
+		return fail(err)
 	}
-	return seal, cloneSnapshot(header.snapshot), nil
+	builder.candidateFileID = header.fileID
+	builder.candidateHeaderDigest = header.headerDigest
+	return candidate, seal, cloneSnapshot(header.snapshot), nil
+}
+
+func (builder *GenerationBuilder) lockValidatedGenerationCandidate() (
+	*generationCandidateLock,
+	GenerationCandidate,
+	error,
+) {
+	locked, seal, snapshot, err := builder.lockGenerationCandidate()
+	if err != nil {
+		return nil, GenerationCandidate{}, err
+	}
+	if builder.loaded && !equalGenerationSeal(seal, builder.seal) ||
+		!builder.candidateSealMatches(seal, snapshot) {
+		return nil, GenerationCandidate{}, errors.Join(
+			ErrGenerationCandidate, locked.close(),
+		)
+	}
+	builder.seal = seal
+	builder.loaded = true
+	info := generationInfo(
+		builder.candidatePath, seal,
+		builder.candidateFileID, builder.candidateHeaderDigest,
+	)
+	return locked, GenerationCandidate{Path: builder.candidatePath, Info: info}, nil
 }
 
 func streamFreshGenerationRecords(
@@ -248,7 +298,8 @@ func (builder *GenerationBuilder) candidateSealMatches(
 	}
 	baseIndex := builder.input.Snapshot.GetMetadata().GetIndex()
 	baseTerm := builder.input.Snapshot.GetMetadata().GetTerm()
-	return seal.familyID == builder.familyID && seal.generation == FirstWALGeneration &&
+	return seal.familyID == builder.familyID && seal.generation == builder.generation &&
+		seal.parentBindingDigest == builder.parentBinding &&
 		seal.identityDigest == generationIdentityDigest(builder.header.identity) &&
 		seal.sourceFileID == builder.header.fileID &&
 		seal.sourceHeaderDigest == builder.header.headerDigest &&

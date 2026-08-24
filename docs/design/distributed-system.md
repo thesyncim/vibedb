@@ -256,11 +256,18 @@ differ between checkpoints. The WAL can now capture one immutable selected
 current-slot cut and build a fully synced, strictly reopened compacted sibling
 around a newer snapshot base. Its generation seal binds the exact source file
 and cut, placement identity, topology epoch, snapshot term and configuration,
-checkpoint-retention commitment, HardState, and retained suffix. The sibling
-is not authority: no family manifest selects it, `Open` of the logical source
-path still selects the source, and no old generation is discarded. Activation
-must revalidate the live checkpoint witness and publish an authenticated family
-selection before reclamation can begin.
+checkpoint-retention commitment, HardState, and retained suffix.
+
+Every WAL has one mandatory authenticated family manifest. Publishing a
+candidate records one selecting generation and atomically returns its complete
+fixed-width identity, including snapshot-base and retention commitments, so an
+outcome-unknown publication still fences SQL. Activation revalidates and
+checkpoints that exact SQL base before replacing the logical WAL leaf, Syncs
+the parent, proves the selected inode, publishes the active family slot, and
+proves the logical name again before releasing the opaque SQL completion.
+Failure remains fail-closed and retryable at its ordered boundary. The retired
+source then has no namespace link; later compactions repeat the same protocol
+and authenticate the preceding generation digest.
 
 The builder has a strict two-image disk budget and a sealed record/chunk heap
 budget: the live source and one deterministic preallocated stage may coexist.

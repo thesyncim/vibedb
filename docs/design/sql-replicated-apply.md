@@ -9,6 +9,15 @@ command.
 A runtime adopts one healthy WAL, one bound SQL database, and one apply claim.
 Direct SQL mutation remains fenced while the claim is active.
 
+Publishing or recovering a selected WAL generation latches its complete family,
+generation, binding, snapshot-base, and retention identity on the apply claim.
+That claim remains the only apply/snapshot capability until raftstore has made
+the family active and returned its opaque completion. Closing a claim while
+this selection is pending atomically retires its connector before releasing the
+claim reference; the same `Database` cannot manufacture an unfenced successor.
+Only a complete root close and authenticated WAL/SQL reopen may reconstruct and
+resume an interrupted activation.
+
 ## Staged child activation
 
 `OpenReplicatedChildStage` claims one bound user collection before any child
@@ -178,6 +187,21 @@ The member runtime persists a Raft `Ready` before it sends related messages. It
 then applies committed entries, records read states, and advances Raft.
 
 A deterministic WAL or apply failure latches terminal runtime failure.
+
+WAL generation selection is also an apply fence. The live capture binds one
+snapshot-base certificate and checkpoint-retention witness to the exact WAL,
+topology epoch, shard-store binding, schema state, and applied cut. Selection
+returns its authenticated fixed-width generation identity in the same API result
+as any persistence error, so an outcome-unknown family write cannot race WAL
+close and leave SQL serving.
+
+A selecting reopen latches that same family/generation/binding identity before
+returning the apply claim. Settlement re-authenticates the snapshot and SQL
+binding, seals the matching retention floor, installs the base idempotently,
+and checkpoints the complete group. The apply fence is released only by the
+opaque capability minted after the WAL logical-leaf barrier and active-family
+publication. Keeping the SQL apply claim open while closing and reopening only
+the WAL is supported; it receives the same exact completion.
 
 `ValidateImmutableBaseApplyCapacity` checks the live WAL cut, retained session
 and slot counts, retry-window ceiling, and epoch high-water. `AdoptRuntime`

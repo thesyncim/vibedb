@@ -536,6 +536,12 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 	var sourceLastTerm uint64
 	var lastReady retryKey
 	var lastReadyDigest [sha256.Size]byte
+	retainedHash := newRetainedSuffixHash(header.reference.index, header.reference.term)
+	var retainedIncarnation uint64
+	var retainedCount uint64
+	var retainedBytes uint64
+	var sourceGeneration generationSeal
+	sourceGenerationSeen := false
 	for sequence := uint64(1); sequence <= builder.current.recordSequence; sequence++ {
 		if _, err := io.ReadFull(sourceReader, prefix[:]); err != nil {
 			return nil, headerState{}, fmt.Errorf("%w: read source record %d prefix: %v",
@@ -614,9 +620,88 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 				return nil, headerState{}, err
 			}
 
+		case record.envelope.kind == recordKindRetainedEntries && scratch != nil:
+			if builder.parentBinding == ([sha256.Size]byte{}) || sourceGenerationSeen ||
+				lastReady != (retryKey{}) {
+				return nil, headerState{}, fmt.Errorf("%w: retained source record order",
+					ErrGenerationSource)
+			}
+			if retainedIncarnation == 0 {
+				retainedIncarnation = record.envelope.incarnation
+			} else if retainedIncarnation != record.envelope.incarnation {
+				return nil, headerState{}, fmt.Errorf("%w: retained source incarnation",
+					ErrGenerationSource)
+			}
+			entries, decodeErr := unmarshalRetainedEntriesView(record.payload, builder.options)
+			if decodeErr != nil || len(entries) == 0 ||
+				entries[0].GetIndex() != sourceLast+1 {
+				return nil, headerState{}, errors.Join(ErrGenerationSource, decodeErr)
+			}
+			if validateErr := validateGenerationReadyEntries(entries, builder.options); validateErr != nil {
+				return nil, headerState{}, errors.Join(ErrGenerationSource, validateErr)
+			}
+			if entries[0].GetTerm() < sourceLastTerm {
+				return nil, headerState{}, fmt.Errorf("%w: retained source term regression",
+					ErrGenerationSource)
+			}
+			if projectErr := scratch.project(entries, sourceHard.GetCommit()); projectErr != nil {
+				return nil, headerState{}, errors.Join(ErrGenerationSource, projectErr)
+			}
+			for _, entry := range entries {
+				footprint := uint64(32 + len(entry.GetData()))
+				if retainedCount == math.MaxUint64 ||
+					retainedBytes > math.MaxUint64-footprint {
+					return nil, headerState{}, ErrBounds
+				}
+				retainedHash.add(entry)
+				retainedCount++
+				retainedBytes += footprint
+			}
+			sourceLast = entries[len(entries)-1].GetIndex()
+			sourceLastTerm = entries[len(entries)-1].GetTerm()
+
+		case record.envelope.kind == recordKindGenerationSeal && scratch != nil:
+			if builder.parentBinding == ([sha256.Size]byte{}) || sourceGenerationSeen ||
+				lastReady != (retryKey{}) {
+				return nil, headerState{}, fmt.Errorf("%w: source generation seal order",
+					ErrGenerationSource)
+			}
+			seal, decodeErr := unmarshalGenerationSeal(record.payload)
+			if decodeErr != nil {
+				return nil, headerState{}, decodeErr
+			}
+			if seal.bindingDigest != builder.parentBinding ||
+				seal.familyID != builder.familyID || seal.generation == math.MaxUint64 ||
+				seal.generation+1 != builder.generation ||
+				seal.identityDigest != generationIdentityDigest(header.identity) ||
+				seal.topologyRecoveryEpoch != header.topologyRecoveryEpoch ||
+				seal.baseIndex != header.reference.index || seal.baseTerm != header.reference.term ||
+				seal.baseDigest != header.reference.digest ||
+				seal.confDigest != generationConfDigest(header.snapshot.GetMetadata().GetConfState()) ||
+				seal.suffixFirst != sourceFirst || seal.suffixLast != sourceLast ||
+				seal.suffixCount != retainedCount || seal.suffixBytes != retainedBytes ||
+				seal.suffixDigest != retainedHash.finish() ||
+				record.envelope.incarnation != seal.sourceCurrentIncarnation ||
+				(retainedIncarnation != 0 && retainedIncarnation != seal.sourceCurrentIncarnation) ||
+				seal.hard.GetTerm() < sourceLastTerm ||
+				seal.hard.GetCommit() < header.reference.index ||
+				seal.hard.GetCommit() > sourceLast {
+				return nil, headerState{}, fmt.Errorf("%w: source generation seal binding",
+					ErrGenerationSource)
+			}
+			sourceHard = cloneHardState(seal.hard)
+			sourceGeneration = seal
+			sourceGenerationSeen = true
+
 		case record.envelope.kind == recordKindReady && scratch != nil:
+			if builder.parentBinding != ([sha256.Size]byte{}) && !sourceGenerationSeen {
+				return nil, headerState{}, fmt.Errorf("%w: Ready precedes source generation seal",
+					ErrGenerationSource)
+			}
 			if builder.current.currentIncarnation == 0 ||
 				record.envelope.incarnation > builder.current.currentIncarnation ||
+				(sourceGenerationSeen &&
+					record.envelope.incarnation <= sourceGeneration.sourceCurrentIncarnation) ||
 				(lastReady.incarnation != 0 &&
 					(record.envelope.incarnation < lastReady.incarnation ||
 						(record.envelope.incarnation == lastReady.incarnation &&
@@ -704,7 +789,9 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 		previousDigest = record.digest
 		offset = end
 	}
-	if scratch == nil || sourceHard == nil || offset != builder.current.walEnd ||
+	if scratch == nil || sourceHard == nil ||
+		(builder.parentBinding != ([sha256.Size]byte{})) != sourceGenerationSeen ||
+		offset != builder.current.walEnd ||
 		previousDigest != builder.current.chainDigest ||
 		sourceFirst != builder.current.first || sourceLast != builder.current.last ||
 		!proto.Equal(sourceHard, builder.current.hard) ||
@@ -796,9 +883,10 @@ func (builder *GenerationBuilder) finishGenerationScratch(
 		return fmt.Errorf("%w: retained suffix geometry", ErrCorrupt)
 	}
 	seal := generationSeal{
-		familyID: builder.familyID, generation: FirstWALGeneration,
-		identityDigest: generationIdentityDigest(sourceHeader.identity),
-		sourceFileID:   sourceHeader.fileID, sourceHeaderDigest: sourceHeader.headerDigest,
+		familyID: builder.familyID, generation: builder.generation,
+		parentBindingDigest: builder.parentBinding,
+		identityDigest:      generationIdentityDigest(sourceHeader.identity),
+		sourceFileID:        sourceHeader.fileID, sourceHeaderDigest: sourceHeader.headerDigest,
 		sourceCurrentGeneration:  builder.current.generation,
 		sourceWALEnd:             uint64(builder.current.walEnd),
 		sourceRecordSequence:     builder.current.recordSequence,

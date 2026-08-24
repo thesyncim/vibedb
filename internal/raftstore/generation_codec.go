@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	generationSealPayloadBytes = 440
+	generationSealPayloadBytes = 472
 	retainedPayloadHeaderBytes = 24
 )
 
@@ -39,13 +39,14 @@ var (
 )
 
 // generationSeal is the authenticated, fixed-width handoff from one selected
-// source cut to one non-authoritative compacted generation. The target static
+// source cut to one staged compacted generation. The target static
 // header independently seals the complete member identity, bounds, key
 // locator, topology epoch, and snapshot base. This record binds those target
 // facts to the exact source current slot and retained semantic suffix.
 type generationSeal struct {
 	familyID                 [16]byte
 	generation               uint64
+	parentBindingDigest      [sha256.Size]byte
 	identityDigest           [sha256.Size]byte
 	sourceFileID             [16]byte
 	sourceHeaderDigest       [sha256.Size]byte
@@ -85,6 +86,7 @@ func marshalGenerationSeal(seal generationSeal) ([]byte, error) {
 	result = appendUint16(result, 0)
 	result = append(result, seal.familyID[:]...)
 	result = appendUint64(result, seal.generation)
+	result = append(result, seal.parentBindingDigest[:]...)
 	result = append(result, seal.identityDigest[:]...)
 	result = append(result, seal.sourceFileID[:]...)
 	result = append(result, seal.sourceHeaderDigest[:]...)
@@ -136,6 +138,9 @@ func unmarshalGenerationSeal(data []byte) (generationSeal, error) {
 	}
 	seal.generation, err = reader.u64()
 	if err != nil {
+		return generationSeal{}, err
+	}
+	if err := readGenerationFixed(&reader, seal.parentBindingDigest[:]); err != nil {
 		return generationSeal{}, err
 	}
 	if err := readGenerationFixed(&reader, seal.identityDigest[:]); err != nil {
@@ -274,6 +279,13 @@ func validateGenerationSealStatic(seal generationSeal) error {
 		seal.sourceLast < seal.suffixLast || seal.bindingDigest == ([sha256.Size]byte{}) {
 		return fmt.Errorf("%w: impossible generation seal", ErrInvalid)
 	}
+	if seal.generation == FirstWALGeneration {
+		if seal.parentBindingDigest != ([sha256.Size]byte{}) {
+			return fmt.Errorf("%w: first generation has a parent", ErrInvalid)
+		}
+	} else if seal.parentBindingDigest == ([sha256.Size]byte{}) {
+		return fmt.Errorf("%w: later generation lacks a parent", ErrInvalid)
+	}
 	if seal.hard.GetVote() != 0 && raft.IsLocalMsgTarget(seal.hard.GetVote()) {
 		return fmt.Errorf("%w: generation HardState vote", ErrInvalid)
 	}
@@ -285,6 +297,7 @@ func generationBindingDigest(seal generationSeal) [sha256.Size]byte {
 	_, _ = h.Write(generationBindingDomain)
 	_, _ = h.Write(seal.familyID[:])
 	writeGenerationU64(h, seal.generation)
+	_, _ = h.Write(seal.parentBindingDigest[:])
 	_, _ = h.Write(seal.identityDigest[:])
 	_, _ = h.Write(seal.sourceFileID[:])
 	_, _ = h.Write(seal.sourceHeaderDigest[:])

@@ -26,7 +26,7 @@ func (builder *GenerationBuilder) stageBase() string {
 }
 
 func (builder *GenerationBuilder) buildLockBase() string {
-	return builder.candidateBase + ".build.lock"
+	return generationFamilyPrefix(builder.familyID) + ".build.lock"
 }
 
 func (builder *GenerationBuilder) acquireBuildLease() (*generationBuildLease, error) {
@@ -259,8 +259,8 @@ func (builder *GenerationBuilder) createStage() (*Store, error) {
 		return nil, cleanup(err)
 	}
 	stage := &Store{
-		path:       filepath.Join(builder.parentPath, base),
-		parentPath: builder.parentPath, base: base,
+		path: filepath.Join(builder.parentPath, base), logicalPath: filepath.Join(builder.parentPath, base),
+		parentPath: builder.parentPath, base: base, logicalBase: base,
 		root: root, directoryInfo: directoryInfo, file: file, fileInfo: fileInfo,
 		locked: true, options: options, header: header, current: current,
 		image: bootstrapImage(bootstrap.Snapshot),

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -44,6 +45,8 @@ type WALBasePreparation struct {
 	scanPasses         uint8
 }
 
+var _ raftstore.GenerationActivationSettler = (*ReplicatedApply)(nil)
+
 // SnapshotBase returns an owned copy of the compact base certificate. The
 // streamed artifact itself is deliberately not retained locally.
 func (p *WALBasePreparation) SnapshotBase() (*pb.Snapshot, error) {
@@ -51,6 +54,29 @@ func (p *WALBasePreparation) SnapshotBase() (*pb.Snapshot, error) {
 		return nil, ErrWALBasePreparation
 	}
 	return proto.Clone(p.snapshotBase).(*pb.Snapshot), nil
+}
+
+// GenerationInput returns a detached, sealed input for raftstore generation
+// construction. The retention commitment is not deletion authority by itself:
+// the originating apply owner must still pass ValidateWALBasePreparation before
+// selection, and SettleGenerationActivation re-derives the live witness before
+// the old logical WAL leaf can be replaced.
+func (p *WALBasePreparation) GenerationInput() (
+	raftstore.GenerationInput,
+	error,
+) {
+	if p == nil || p.snapshotBase == nil || p.retention.IsZero() ||
+		p.scanPasses != 1 || p.binding == ([sha256.Size]byte{}) {
+		return raftstore.GenerationInput{}, ErrWALBasePreparation
+	}
+	commitment := p.retention.Commitment()
+	if commitment == ([sha256.Size]byte{}) {
+		return raftstore.GenerationInput{}, ErrWALBasePreparation
+	}
+	return raftstore.GenerationInput{
+		Snapshot:            proto.Clone(p.snapshotBase).(*pb.Snapshot),
+		RetentionCommitment: commitment,
+	}, nil
 }
 
 // captureWALBaseScanHook is a test seam immediately before the sole bounded
@@ -231,24 +257,9 @@ func (a *ReplicatedApply) ValidateWALBasePreparation(
 	if a == nil || a.database == nil {
 		return ErrReplicatedApplyClosed
 	}
-	if preparation == nil || preparation.owner != a || preparation.snapshotBase == nil ||
-		preparation.retention.IsZero() || preparation.scanPasses != 1 {
-		return ErrWALBasePreparation
-	}
-	certificate, err := replicatedstate.OpenSnapshotBase(preparation.snapshotBase)
+	certificate, err := a.openWALBasePreparation(preparation)
 	if err != nil {
-		return errors.Join(ErrWALBasePreparation, err)
-	}
-	if certificate.Digest != preparation.snapshotBaseDigest ||
-		certificate.Manifest.Digest != preparation.artifactDigest ||
-		certificate.Manifest.ImageDigest != preparation.imageDigest ||
-		certificate.Manifest.EncodedBytes != preparation.encodedBytes ||
-		!preparation.retention.BindsAppliedIndex(certificate.Manifest.State.Applied) ||
-		preparation.binding != bindWALBasePreparation(
-			certificate.Digest,
-			preparation.retention,
-		) {
-		return ErrWALBasePreparation
+		return err
 	}
 
 	core := a.database
@@ -269,6 +280,270 @@ func (a *ReplicatedApply) ValidateWALBasePreparation(
 		return errors.Join(ErrWALBasePreparation, err)
 	}
 	return nil
+}
+
+func (a *ReplicatedApply) openWALBasePreparation(
+	preparation *WALBasePreparation,
+) (replicatedstate.SnapshotBaseCertificate, error) {
+	if preparation == nil || preparation.owner != a || preparation.snapshotBase == nil ||
+		preparation.retention.IsZero() || preparation.scanPasses != 1 {
+		return replicatedstate.SnapshotBaseCertificate{}, ErrWALBasePreparation
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(preparation.snapshotBase)
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, errors.Join(ErrWALBasePreparation, err)
+	}
+	if certificate.Digest != preparation.snapshotBaseDigest ||
+		certificate.Manifest.Digest != preparation.artifactDigest ||
+		certificate.Manifest.ImageDigest != preparation.imageDigest ||
+		certificate.Manifest.EncodedBytes != preparation.encodedBytes ||
+		!preparation.retention.BindsAppliedIndex(certificate.Manifest.State.Applied) ||
+		preparation.binding != bindWALBasePreparation(
+			certificate.Digest,
+			preparation.retention,
+		) {
+		return replicatedstate.SnapshotBaseCertificate{}, ErrWALBasePreparation
+	}
+	return certificate, nil
+}
+
+// PublishWALGenerationSelection creates one short SQL/WAL quiescence lease.
+// The exact preparation must be the one captured by builder, and SQL Applied
+// must still equal that certificate while selection is published. Concurrent
+// apply/snapshot/close calls fail busy rather than racing the durable cut.
+func (a *ReplicatedApply) PublishWALGenerationSelection(
+	preparation *WALBasePreparation,
+	wal *raftstore.Store,
+	builder *raftstore.GenerationBuilder,
+) (resultErr error) {
+	if a == nil || a.database == nil {
+		return ErrReplicatedApplyClosed
+	}
+	if wal == nil || builder == nil {
+		return ErrWALBasePreparation
+	}
+	walIdentity := wal.Identity()
+	walTopologyRecoveryEpoch := wal.TopologyRecoveryEpoch()
+	certificate, err := a.openWALBasePreparation(preparation)
+	if err != nil {
+		return err
+	}
+	input, err := preparation.GenerationInput()
+	if err != nil || !builder.BindsInput(input) {
+		return errors.Join(ErrWALBasePreparation, err)
+	}
+	core := a.database
+	core.mu.Lock()
+	if err := a.checkLocked(); err != nil {
+		core.mu.Unlock()
+		return err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		core.mu.Unlock()
+		return err
+	}
+	if a.walBaseCaptureActive || a.walBaseSelectActive || a.walBaseSelectPending {
+		core.mu.Unlock()
+		return ErrReplicatedApplyBusy
+	}
+	base := core.catalog.ReplicatedShardStore
+	if core.checkpointGroup == nil || base == nil ||
+		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) {
+		core.mu.Unlock()
+		return ErrReplicatedApplyMismatch
+	}
+	if !walMatchesReplicatedBinding(
+		walIdentity, walTopologyRecoveryEpoch, base.Binding,
+	) {
+		core.mu.Unlock()
+		return ErrReplicatedApplyMismatch
+	}
+	if err := core.checkpointGroup.ValidateRetentionWitness(preparation.retention); err != nil {
+		core.mu.Unlock()
+		return errors.Join(ErrWALBasePreparation, err)
+	}
+	if a.machine.Applied() != certificate.Manifest.State.Applied {
+		core.mu.Unlock()
+		return ErrWALBasePreparation
+	}
+	a.walBaseSelectActive = true
+	core.mu.Unlock()
+	selectionIdentity, selectionErr := wal.PublishGenerationSelection(builder)
+	core.mu.Lock()
+	a.walBaseSelectActive = false
+	if selectionIdentity.Valid() {
+		a.walBaseSelectPending = true
+		a.walBasePending = selectionIdentity
+	}
+	core.mu.Unlock()
+	return selectionErr
+}
+
+func walMatchesReplicatedBinding(
+	identity raftstore.Identity,
+	topologyRecoveryEpoch uint64,
+	binding ReplicatedShardStoreBinding,
+) bool {
+	return identity.ClusterID == binding.ClusterID &&
+		identity.ClusterIncarnation == binding.ClusterIncarnation &&
+		topologyRecoveryEpoch == binding.TopologyRecoveryEpoch &&
+		identity.Distribution == binding.Distribution && identity.Shard == binding.Shard &&
+		identity.AllocationGeneration == binding.AllocationGeneration &&
+		identity.ShardIncarnation == binding.ShardIncarnation &&
+		identity.GroupID == binding.GroupID && identity.MemberID == binding.MemberID &&
+		identity.StoreID == binding.StoreID
+}
+
+// SettleGenerationActivation implements raftstore's durable state-machine
+// half of generation replacement. It reconstructs and authenticates the exact
+// retained SQL floor, installs the selected compact snapshot base idempotently,
+// and checkpoints the complete group before returning. raftstore keeps the old
+// logical WAL leaf until this method succeeds.
+func (a *ReplicatedApply) SettleGenerationActivation(
+	activation raftstore.GenerationActivation,
+) error {
+	if a == nil || a.database == nil {
+		return ErrReplicatedApplyClosed
+	}
+	certificate, err := openGenerationActivation(activation)
+	if err != nil {
+		return err
+	}
+
+	core := a.database
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if err := a.checkLocked(); err != nil {
+		return err
+	}
+	if a.activationBasePending != ([sha256.Size]byte{}) {
+		return ErrReplicatedApplyBasePending
+	}
+	if a.walBaseCaptureActive || a.walBaseSelectActive {
+		return ErrReplicatedApplyBusy
+	}
+	group := core.checkpointGroup
+	base := core.catalog.ReplicatedShardStore
+	if group == nil || base == nil || base.UserTable == "" ||
+		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) ||
+		certificate.Manifest.State.Binding != replicatedStateBinding(*base) {
+		return ErrReplicatedApplyMismatch
+	}
+	if !a.walBaseSelectPending {
+		return ErrReplicatedApplyBusy
+	}
+	if !a.walBasePending.Matches(activation.Info) {
+		return ErrReplicatedApplyMismatch
+	}
+	witness, err := group.SealRetentionFloor(certificate.Manifest.State.Applied)
+	if err != nil {
+		return errors.Join(ErrWALBasePreparation, err)
+	}
+	if witness.Commitment() != activation.Info.RetentionCommitment {
+		return ErrWALBasePreparation
+	}
+	publication, err := a.machine.InstallSnapshot(activation.Snapshot)
+	if err != nil || publication.Applied != certificate.Manifest.State.Applied {
+		return errors.Join(ErrWALBasePreparation, err)
+	}
+	if err := group.Checkpoint(); err != nil {
+		return err
+	}
+	if err := group.ValidateRetentionWitness(witness); err != nil {
+		return errors.Join(ErrWALBasePreparation, err)
+	}
+	return nil
+}
+
+// LatchGenerationActivation fences a specially reopened SQL apply claim before
+// it is returned to the activation coordinator. The fence remains through all
+// WAL rename and family-publication barriers.
+func (a *ReplicatedApply) LatchGenerationActivation(
+	activation raftstore.GenerationActivation,
+) error {
+	if a == nil || a.database == nil {
+		return ErrReplicatedApplyClosed
+	}
+	certificate, err := openGenerationActivation(activation)
+	if err != nil {
+		return err
+	}
+	core := a.database
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if err := a.checkLocked(); err != nil {
+		return err
+	}
+	if a.walBaseCaptureActive || a.walBaseSelectActive {
+		return ErrReplicatedApplyBusy
+	}
+	base := core.catalog.ReplicatedShardStore
+	if core.checkpointGroup == nil || base == nil || base.UserTable == "" ||
+		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) ||
+		certificate.Manifest.State.Binding != replicatedStateBinding(*base) ||
+		a.machine.Applied() != certificate.Manifest.State.Applied {
+		return ErrReplicatedApplyMismatch
+	}
+	if a.walBaseSelectPending {
+		if a.walBasePending.Matches(activation.Info) {
+			return nil
+		}
+		return ErrReplicatedApplyMismatch
+	}
+	a.walBaseSelectPending = true
+	a.walBasePending = raftstore.GenerationActivationIdentity{
+		FamilyID:            activation.Info.FamilyID,
+		Generation:          activation.Info.Generation,
+		BindingDigest:       activation.Info.BindingDigest,
+		SnapshotBaseDigest:  activation.Info.SnapshotBaseDigest,
+		RetentionCommitment: activation.Info.RetentionCommitment,
+	}
+	return nil
+}
+
+func openGenerationActivation(
+	activation raftstore.GenerationActivation,
+) (replicatedstate.SnapshotBaseCertificate, error) {
+	if activation.Snapshot == nil || activation.Info.Generation == 0 ||
+		activation.Info.FamilyID == ([16]byte{}) ||
+		activation.Info.BindingDigest == ([sha256.Size]byte{}) ||
+		activation.Info.SnapshotBaseDigest == ([sha256.Size]byte{}) ||
+		activation.Info.RetentionCommitment == ([sha256.Size]byte{}) ||
+		activation.Info.BaseIndex != activation.Snapshot.GetMetadata().GetIndex() ||
+		activation.Info.BaseTerm != activation.Snapshot.GetMetadata().GetTerm() ||
+		activation.Info.HardCommit < activation.Info.BaseIndex {
+		return replicatedstate.SnapshotBaseCertificate{}, ErrWALBasePreparation
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(activation.Snapshot)
+	if err != nil || certificate.Digest != activation.Info.SnapshotBaseDigest ||
+		certificate.Manifest.State.Applied != activation.Info.BaseIndex {
+		return replicatedstate.SnapshotBaseCertificate{}, errors.Join(
+			ErrWALBasePreparation, err,
+		)
+	}
+	return certificate, nil
+}
+
+// CompleteGenerationActivation releases the in-memory SQL fence only after
+// raftstore has durably published the exact selected generation as active.
+// A zero, stale, foreign, or replayed capability cannot release the fence.
+func (a *ReplicatedApply) CompleteGenerationActivation(
+	completion raftstore.GenerationActivationCompletion,
+) {
+	if a == nil || a.database == nil {
+		return
+	}
+	core := a.database
+	core.mu.Lock()
+	if a.checkLocked() == nil && a.walBaseSelectPending && completion.Matches(
+		a.walBasePending.FamilyID,
+		a.walBasePending.Generation,
+		a.walBasePending.BindingDigest,
+	) {
+		a.walBaseSelectPending = false
+		a.walBasePending = raftstore.GenerationActivationIdentity{}
+	}
+	core.mu.Unlock()
 }
 
 func bindWALBasePreparation(
