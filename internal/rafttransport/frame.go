@@ -32,8 +32,8 @@ const (
 	// FrameHeaderBytes is the fixed current frame-header size. The numeric
 	// codec discriminator is a fail-closed sentinel, not a compatibility API.
 	FrameHeaderBytes = 132
-	// MaxFrameBytes lets a future authenticated stream reader reject a declared
-	// length before allocating a frame buffer.
+	// MaxFrameBytes lets an authenticated stream reader reject a declared length
+	// before allocating a frame buffer.
 	MaxFrameBytes = FrameHeaderBytes + raftmodel.MaxInboundMessageBytes
 
 	frameCodecFormat  uint16 = 1
@@ -59,8 +59,8 @@ type frameHeader struct {
 // EncodeOutbound appends a canonical current-format frame to dst and returns
 // the registered destination node. dst remains unchanged on error.
 //
-// The frame carries no node identity or authentication material. A later
-// mutually authenticated connection supplies that identity out of band.
+// The frame carries no node identity or authentication material. PeerTLS
+// supplies the certificate-derived NodeID out of band.
 func (registry *StaticRegistry) EncodeOutbound(
 	dst []byte,
 	outbound raftmember.OutboundMessage,
@@ -131,9 +131,9 @@ func (registry *StaticRegistry) EncodeOutbound(
 	return dst, destination, nil
 }
 
-// DecodeInbound authenticates and decodes one complete canonical frame. The
-// authenticated node is supplied by a future secure connection; this method
-// neither performs TLS nor derives identity from frame bytes.
+// DecodeInbound admits and decodes one complete canonical frame. The
+// authenticated node comes from PeerTLS. This method neither performs TLS nor
+// derives identity from frame bytes.
 func (registry *StaticRegistry) DecodeInbound(authenticated NodeID, frame []byte) (Inbound, error) {
 	header, payload, err := parseFrame(frame)
 	if err != nil {
@@ -171,11 +171,18 @@ func (registry *StaticRegistry) DecodeInbound(authenticated NodeID, frame []byte
 	if err := registry.validateStaticMessage(header.group, message); err != nil {
 		return Inbound{}, err
 	}
-	canonical, err := (proto.MarshalOptions{Deterministic: true}).Marshal(message)
+	scratch := registry.canonical.get(len(payload))
+	canonical, err := (proto.MarshalOptions{Deterministic: true}).MarshalAppend(
+		scratch.bytes[:0], message,
+	)
 	if err != nil {
+		registry.canonical.put(scratch)
 		return Inbound{}, fmt.Errorf("%w: re-encode protobuf: %w", ErrInvalidFrame, err)
 	}
-	if !bytes.Equal(payload, canonical) {
+	scratch.bytes = canonical
+	equal := bytes.Equal(payload, canonical)
+	registry.canonical.put(scratch)
+	if !equal {
 		return Inbound{}, fmt.Errorf("%w: noncanonical protobuf payload", ErrInvalidFrame)
 	}
 	return Inbound{Group: header.group, Message: message}, nil

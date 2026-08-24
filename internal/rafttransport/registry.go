@@ -1,9 +1,10 @@
-// Package rafttransport provides a bounded static identity registry and a
-// current-format ordinary-message frame boundary for Multi-Raft.
+// Package rafttransport provides a bounded static identity registry, a
+// current-format ordinary-message frame boundary, and a composable
+// authenticated peer-stream foundation for Multi-Raft.
 //
-// It does not implement authentication or a network transport. A future
-// authenticated connection supplies the enrolled NodeID presented to frame
-// admission.
+// The transport foundation is not wired into multiraft.Host serving. Callers
+// must supply connection discovery, enrolled certificates, listener ownership,
+// and the exact trusted topology snapshot.
 package rafttransport
 
 import (
@@ -39,8 +40,8 @@ var (
 	ErrNodeNotFound    = errors.New("rafttransport: node not found")
 )
 
-// NodeID identifies one enrolled endpoint. A future authenticated transport
-// must independently bind its peer principal to this value.
+// NodeID identifies one enrolled endpoint. PeerTLS derives this exact binary
+// principal from a verified critical certificate extension.
 type NodeID [16]byte
 
 // MemberRole is the immutable static Raft role authorized by a roster.
@@ -94,6 +95,7 @@ type StaticRegistry struct {
 	members      map[nodeKey]uint64
 	localMembers map[raftmember.GroupKey]uint64
 	digests      map[raftmember.GroupKey][sha256.Size]byte
+	canonical    frameBufferPool
 }
 
 // NewStaticRegistry validates and copies one current static roster before
@@ -117,6 +119,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		members:      make(map[nodeKey]uint64, len(members)),
 		localMembers: make(map[raftmember.GroupKey]uint64),
 		digests:      make(map[raftmember.GroupKey][sha256.Size]byte),
+		canonical:    frameBufferPool{retain: DefaultRetainedFrameBytes},
 	}
 	groups := make(map[raftmember.GroupKey]struct{})
 	groupMembers := make(map[raftmember.GroupKey]int)
