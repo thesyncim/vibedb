@@ -41,10 +41,18 @@ type AuthenticatedReplicatedClientOptions struct {
 
 type pooledReplicatedConn struct {
 	conn       rafttransport.PeerConnection
-	endpoint   ReplicatedEndpoint
+	endpoint   replicatedTransportEndpoint
 	created    time.Time
 	lastUsed   time.Time
 	generation uint64
+}
+
+// replicatedTransportEndpoint is the physical authenticated pool key. Shard
+// membership and store-incarnation fences are checked per response and do not
+// fragment transport reuse across shards served by the same node endpoint.
+type replicatedTransportEndpoint struct {
+	node    rafttransport.NodeID
+	address string
 }
 
 // AuthenticatedReplicatedClient owns a bounded exclusive LIFO connection pool.
@@ -66,8 +74,9 @@ type AuthenticatedReplicatedClient struct {
 	closed             bool
 	total              int
 	waiters            int
-	perEndpoint        map[rafttransport.NodeID]int
-	idle               map[rafttransport.NodeID][]*pooledReplicatedConn
+	perEndpoint        map[replicatedTransportEndpoint]int
+	idle               map[replicatedTransportEndpoint][]*pooledReplicatedConn
+	active             map[*pooledReplicatedConn]struct{}
 	wake               chan struct{}
 
 	dials    atomic.Uint64
@@ -100,8 +109,9 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 		maxConnections: options.MaxConnections, maxPerEndpoint: options.MaxPerEndpoint,
 		maxIdlePerEndpoint: options.MaxIdlePerEndpoint, maxWaiters: options.MaxWaiters,
 		maxIdleAge: options.MaxIdleAge, maxLifetime: options.MaxLifetime, generation: 1,
-		perEndpoint: make(map[rafttransport.NodeID]int),
-		idle:        make(map[rafttransport.NodeID][]*pooledReplicatedConn), wake: make(chan struct{}),
+		perEndpoint: make(map[replicatedTransportEndpoint]int),
+		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), wake: make(chan struct{}),
+		active: make(map[*pooledReplicatedConn]struct{}),
 	}, nil
 }
 
@@ -124,9 +134,9 @@ func (client *AuthenticatedReplicatedClient) closeLocked(connection *pooledRepli
 	}
 	_ = connection.conn.Close()
 	client.total--
-	client.perEndpoint[connection.endpoint.Node]--
-	if client.perEndpoint[connection.endpoint.Node] == 0 {
-		delete(client.perEndpoint, connection.endpoint.Node)
+	client.perEndpoint[connection.endpoint]--
+	if client.perEndpoint[connection.endpoint] == 0 {
+		delete(client.perEndpoint, connection.endpoint)
 	}
 	client.signalLocked()
 }
@@ -135,6 +145,7 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 	if client == nil || ctx == nil || !validAuthenticatedEndpoint(endpoint) {
 		return nil, ErrReplicatedTLSProfile
 	}
+	physical := replicatedTransportEndpoint{node: endpoint.Node, address: endpoint.Address}
 	for {
 		now := time.Now()
 		client.mu.Lock()
@@ -142,25 +153,26 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 			client.mu.Unlock()
 			return nil, ErrReplicatedTLSProfile
 		}
-		stack := client.idle[endpoint.Node]
+		stack := client.idle[physical]
 		for len(stack) != 0 {
 			last := len(stack) - 1
 			connection := stack[last]
 			stack = stack[:last]
-			if connection.endpoint != endpoint || connection.generation != client.generation ||
+			if connection.generation != client.generation ||
 				now.Sub(connection.lastUsed) > client.maxIdleAge || now.Sub(connection.created) > client.maxLifetime {
 				client.closeLocked(connection)
 				continue
 			}
-			client.idle[endpoint.Node] = stack
+			client.idle[physical] = stack
+			client.active[connection] = struct{}{}
 			client.reuses.Add(1)
 			client.mu.Unlock()
 			return connection, nil
 		}
-		client.idle[endpoint.Node] = stack
-		if client.total < client.maxConnections && client.perEndpoint[endpoint.Node] < client.maxPerEndpoint {
+		client.idle[physical] = stack
+		if client.total < client.maxConnections && client.perEndpoint[physical] < client.maxPerEndpoint {
 			client.total++
-			client.perEndpoint[endpoint.Node]++
+			client.perEndpoint[physical]++
 			authenticate, generation := client.authenticate, client.generation
 			client.mu.Unlock()
 			raw, err := client.dial(ctx, endpoint.Address)
@@ -173,9 +185,9 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 				}
 				client.mu.Lock()
 				client.total--
-				client.perEndpoint[endpoint.Node]--
-				if client.perEndpoint[endpoint.Node] == 0 {
-					delete(client.perEndpoint, endpoint.Node)
+				client.perEndpoint[physical]--
+				if client.perEndpoint[physical] == 0 {
+					delete(client.perEndpoint, physical)
 				}
 				client.signalLocked()
 				client.mu.Unlock()
@@ -192,16 +204,31 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 			if err != nil {
 				client.mu.Lock()
 				client.total--
-				client.perEndpoint[endpoint.Node]--
-				if client.perEndpoint[endpoint.Node] == 0 {
-					delete(client.perEndpoint, endpoint.Node)
+				client.perEndpoint[physical]--
+				if client.perEndpoint[physical] == 0 {
+					delete(client.perEndpoint, physical)
 				}
 				client.signalLocked()
 				client.mu.Unlock()
 				return nil, err
 			}
+			client.mu.Lock()
+			if client.closed || generation != client.generation {
+				_ = authenticated.Close()
+				client.total--
+				client.perEndpoint[physical]--
+				if client.perEndpoint[physical] == 0 {
+					delete(client.perEndpoint, physical)
+				}
+				client.signalLocked()
+				client.mu.Unlock()
+				return nil, ErrReplicatedTLSProfile
+			}
+			connection := &pooledReplicatedConn{conn: authenticated, endpoint: physical, created: now, lastUsed: now, generation: generation}
+			client.active[connection] = struct{}{}
+			client.mu.Unlock()
 			client.dials.Add(1)
-			return &pooledReplicatedConn{conn: authenticated, endpoint: endpoint, created: now, lastUsed: now, generation: generation}, nil
+			return connection, nil
 		}
 		if client.waiters >= client.maxWaiters {
 			client.rejected.Add(1)
@@ -234,8 +261,9 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 	}
 	now := time.Now()
 	client.mu.Lock()
+	delete(client.active, connection)
 	if !healthy || connection.generation != client.generation || now.Sub(connection.created) > client.maxLifetime ||
-		len(client.idle[connection.endpoint.Node]) >= client.maxIdlePerEndpoint {
+		len(client.idle[connection.endpoint]) >= client.maxIdlePerEndpoint {
 		client.closeLocked(connection)
 		client.mu.Unlock()
 		if !healthy {
@@ -244,7 +272,7 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 		return
 	}
 	connection.lastUsed = now
-	client.idle[connection.endpoint.Node] = append(client.idle[connection.endpoint.Node], connection)
+	client.idle[connection.endpoint] = append(client.idle[connection.endpoint], connection)
 	client.signalLocked()
 	client.mu.Unlock()
 }
@@ -284,6 +312,9 @@ func (client *AuthenticatedReplicatedClient) RotateTLS(profile *rafttransport.Pe
 	client.tls = profile
 	client.authenticate = profile.Client
 	client.generation++
+	for connection := range client.active {
+		_ = connection.conn.Close()
+	}
 	for node, stack := range client.idle {
 		for _, connection := range stack {
 			client.closeLocked(connection)
@@ -308,6 +339,9 @@ func (client *AuthenticatedReplicatedClient) Close() error {
 	}
 	client.closed = true
 	client.generation++
+	for connection := range client.active {
+		_ = connection.conn.Close()
+	}
 	for node, stack := range client.idle {
 		for _, connection := range stack {
 			client.closeLocked(connection)

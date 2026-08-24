@@ -2,38 +2,97 @@ package shardservice
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"io"
+	"net"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
-func BenchmarkReplicatedRequestEncodingOneMiB(b *testing.B) {
+type replicatedTLSWriteMeter struct {
+	net.Conn
+	writes atomic.Uint64
+}
+
+func (meter *replicatedTLSWriteMeter) Write(p []byte) (int, error) {
+	meter.writes.Add(1)
+	return meter.Conn.Write(p)
+}
+
+func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{Operation: ReplicatedPropose, Fence: fence,
 		Command: testReplicatedCommandValue(b, fence, bytes.Repeat([]byte{'x'}, 1<<20))}
-	b.Run("contiguous", func(b *testing.B) {
-		b.ReportAllocs()
-		b.SetBytes(int64(len(request.Command)))
-		for index := 0; index < b.N; index++ {
-			if err := EncodeReplicatedRequest(io.Discard, request); err != nil {
+	authority := newShardTLSAuthority(b)
+	serverIdentity := shardPeerIdentity(19, 41)
+	clientIdentity := shardPeerIdentity(19, 61)
+	serverProfile := authority.profile(b, serverIdentity)
+	clientProfile := authority.profile(b, clientIdentity)
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	benchmarks := []struct {
+		name   string
+		encode func(io.Writer, *ReplicatedRequest) error
+	}{
+		{"contiguous", EncodeReplicatedRequest},
+		{"borrowed_two_write_tls", EncodeReplicatedRequestBorrowed},
+	}
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
 				b.Fatal(err)
 			}
-		}
-	})
-	b.Run("vectored", func(b *testing.B) {
-		b.ReportAllocs()
-		b.SetBytes(int64(len(request.Command)))
-		for index := 0; index < b.N; index++ {
-			if err := EncodeReplicatedRequestVectored(io.Discard, request); err != nil {
+			serverDone := make(chan error, 1)
+			go func() {
+				raw, err := listener.Accept()
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				connection, err := serverProfile.Server(context.Background(), raw, rafttransport.TrafficShardNative, deadline)
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				_, err = io.Copy(io.Discard, connection)
+				_ = connection.Close()
+				serverDone <- err
+			}()
+			raw, err := net.Dial("tcp", listener.Addr().String())
+			if err != nil {
 				b.Fatal(err)
 			}
-		}
-	})
+			meter := &replicatedTLSWriteMeter{Conn: raw}
+			connection, err := clientProfile.Client(context.Background(), meter, serverIdentity.Node, rafttransport.TrafficShardNative, deadline)
+			if err != nil {
+				b.Fatal(err)
+			}
+			baselineWrites := meter.writes.Load()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(request.Command)))
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				if err := benchmark.encode(connection, request); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(meter.writes.Load()-baselineWrites)/float64(b.N), "tlswrites/op")
+			_ = connection.Close()
+			_ = listener.Close()
+			if err := <-serverDone; err != nil {
+				b.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
@@ -49,12 +108,12 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
 			t.Fatal(err)
 		}
-		var vectored bytes.Buffer
-		if err := EncodeReplicatedRequestVectored(&vectored, request); err != nil {
+		var borrowed bytes.Buffer
+		if err := EncodeReplicatedRequestBorrowed(&borrowed, request); err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(vectored.Bytes(), encoded.Bytes()) {
-			t.Fatal("vectored request differs from canonical contiguous frame")
+		if !bytes.Equal(borrowed.Bytes(), encoded.Bytes()) {
+			t.Fatal("borrowed request differs from canonical contiguous frame")
 		}
 		decoded, err := DecodeReplicatedRequest(&encoded)
 		if err != nil {

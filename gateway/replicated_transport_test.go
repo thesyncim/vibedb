@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -54,7 +55,7 @@ func testPooledClient(t *testing.T, endpoint ReplicatedEndpoint, serve func(net.
 		handshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
 		maxConnections:    1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxWaiters: 1,
 		maxIdleAge: time.Minute, maxLifetime: time.Hour, generation: 1,
-		perEndpoint: make(map[rafttransport.NodeID]int), idle: make(map[rafttransport.NodeID][]*pooledReplicatedConn), wake: make(chan struct{}),
+		perEndpoint: make(map[replicatedTransportEndpoint]int), idle: make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	return client, &dials
 }
@@ -156,13 +157,142 @@ func TestAuthenticatedReplicatedClientCloseWakesWaiterAndRefusesReuse(t *testing
 	}
 }
 
+func TestAuthenticatedReplicatedClientSharesPhysicalNodeAcrossShardFences(t *testing.T) {
+	route, _, _ := testReplicatedRouteCommand(t)
+	first := route.Replicas[0]
+	second := first
+	second.Member++
+	second.StoreID[0]++
+	second.NodeIncarnation++
+	block := make(chan struct{})
+	client, dials := testPooledClient(t, first, func(server net.Conn) { <-block; _ = server.Close() })
+	connection, err := client.acquire(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.release(connection, true)
+	reused, err := client.acquire(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != connection || dials.Load() != 1 {
+		t.Fatalf("connection=%p reused=%p dials=%d", connection, reused, dials.Load())
+	}
+	client.release(reused, false)
+	close(block)
+}
+
+func TestAuthenticatedReplicatedClientCloseRejectsHandshakeCompletedAfterReturn(t *testing.T) {
+	testBlockedAuthenticatedPublish(t, false)
+}
+
+func TestAuthenticatedReplicatedClientRotateRejectsOldHandshakeCompletedAfterReturn(t *testing.T) {
+	testBlockedAuthenticatedPublish(t, true)
+}
+
+func TestAuthenticatedReplicatedClientRotateClosesCheckedOutOldGeneration(t *testing.T) {
+	authority := newGatewayTLSAuthority(t)
+	identity := gatewayPeerIdentity(13, 51)
+	profile := authority.profile(t, identity)
+	replacement := authority.profile(t, identity)
+	peerDone := make(chan struct{})
+	client, err := NewAuthenticatedReplicatedClient(AuthenticatedReplicatedClientOptions{
+		TLS: profile,
+		Dial: func(context.Context, string) (net.Conn, error) {
+			local, peer := net.Pipe()
+			go func() { defer close(peerDone); defer peer.Close(); _, _ = io.Copy(io.Discard, peer) }()
+			return local, nil
+		},
+		HandshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		MaxConnections:    1, MaxPerEndpoint: 1, MaxIdlePerEndpoint: 1,
+		MaxWaiters: 1, MaxIdleAge: time.Minute, MaxLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.authenticate = func(_ context.Context, raw net.Conn, node rafttransport.NodeID, _ rafttransport.TrafficClass, _ rafttransport.DeadlineFunc) (rafttransport.PeerConnection, error) {
+		return &testAuthenticatedConnection{Conn: raw, identity: rafttransport.PeerIdentity{Node: node}}, nil
+	}
+	endpoint := ReplicatedEndpoint{Member: 1, Node: identity.Node, StoreID: [16]byte{1}, NodeIncarnation: 1, Address: "active"}
+	connection, err := client.acquire(context.Background(), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RotateTLS(replacement); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Fatal("rotation returned before old active stream closed")
+	}
+	if _, err := connection.conn.Write([]byte{1}); err == nil {
+		t.Fatal("old active stream remained writable after rotation")
+	}
+	client.release(connection, false)
+}
+
+func testBlockedAuthenticatedPublish(t *testing.T, rotate bool) {
+	t.Helper()
+	authority := newGatewayTLSAuthority(t)
+	identity := gatewayPeerIdentity(11, 31)
+	profile := authority.profile(t, identity)
+	replacement := authority.profile(t, identity)
+	peerDone := make(chan struct{})
+	client, err := NewAuthenticatedReplicatedClient(AuthenticatedReplicatedClientOptions{
+		TLS: profile,
+		Dial: func(context.Context, string) (net.Conn, error) {
+			local, peer := net.Pipe()
+			go func() { defer close(peerDone); defer peer.Close(); var one [1]byte; _, _ = peer.Read(one[:]) }()
+			return local, nil
+		},
+		HandshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		MaxConnections:    1, MaxPerEndpoint: 1, MaxIdlePerEndpoint: 1,
+		MaxWaiters: 1, MaxIdleAge: time.Minute, MaxLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	client.authenticate = func(_ context.Context, raw net.Conn, node rafttransport.NodeID, class rafttransport.TrafficClass, _ rafttransport.DeadlineFunc) (rafttransport.PeerConnection, error) {
+		close(entered)
+		<-unblock
+		return &testAuthenticatedConnection{Conn: raw, identity: rafttransport.PeerIdentity{Node: node}}, nil
+	}
+	endpoint := ReplicatedEndpoint{Member: 1, Node: identity.Node, StoreID: [16]byte{1}, NodeIncarnation: 1, Address: "blocked"}
+	result := make(chan error, 1)
+	go func() { _, err := client.acquire(context.Background(), endpoint); result <- err }()
+	<-entered
+	if rotate {
+		if err := client.RotateTLS(replacement); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(unblock)
+	if err := <-result; !errors.Is(err, ErrReplicatedTLSProfile) {
+		t.Fatalf("late authentication error = %v", err)
+	}
+	if stats := client.Stats(); stats.Connections != 0 || stats.Idle != 0 {
+		t.Fatalf("late authentication published: %+v", stats)
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Fatal("rejected authenticated connection remained open")
+	}
+}
+
 func BenchmarkAuthenticatedReplicatedPoolAcquireRelease(b *testing.B) {
 	endpoint := ReplicatedEndpoint{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{2}, NodeIncarnation: 3, Address: "fixed"}
+	physical := replicatedTransportEndpoint{node: endpoint.Node, address: endpoint.Address}
 	left, right := net.Pipe()
 	defer left.Close()
 	defer right.Close()
-	connection := &pooledReplicatedConn{conn: &testAuthenticatedConnection{Conn: left}, endpoint: endpoint, created: time.Now(), lastUsed: time.Now(), generation: 1}
-	client := &AuthenticatedReplicatedClient{maxConnections: 1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxIdleAge: time.Hour, maxLifetime: time.Hour, generation: 1, total: 1, perEndpoint: map[rafttransport.NodeID]int{endpoint.Node: 1}, idle: map[rafttransport.NodeID][]*pooledReplicatedConn{endpoint.Node: {connection}}, wake: make(chan struct{})}
+	connection := &pooledReplicatedConn{conn: &testAuthenticatedConnection{Conn: left}, endpoint: physical, created: time.Now(), lastUsed: time.Now(), generation: 1}
+	client := &AuthenticatedReplicatedClient{maxConnections: 1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxIdleAge: time.Hour, maxLifetime: time.Hour, generation: 1, total: 1, perEndpoint: map[replicatedTransportEndpoint]int{physical: 1}, idle: map[replicatedTransportEndpoint][]*pooledReplicatedConn{physical: {connection}}, active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{})}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {

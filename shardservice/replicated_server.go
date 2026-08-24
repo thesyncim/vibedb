@@ -361,7 +361,7 @@ func RoundTripReplicated(
 			<-cancelDone
 		}
 	}()
-	if err := EncodeReplicatedRequestVectored(conn, request); err != nil {
+	if err := EncodeReplicatedRequestBorrowed(conn, request); err != nil {
 		if request.Operation == ReplicatedPropose {
 			return nil, &raftservice.UnknownOutcomeError{
 				Command: append([]byte(nil), request.Command...), Cause: err,

@@ -111,10 +111,11 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	return writeEncodedFrame(w, tagReplicatedRequest, e.b)
 }
 
-// EncodeReplicatedRequestVectored emits the fixed request prefix and borrows
-// the immutable canonical command as a second write vector. TCP connections
-// use writev, avoiding a command-sized copy and allocation on every retry.
-func EncodeReplicatedRequestVectored(w io.Writer, request *ReplicatedRequest) error {
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
+// the immutable canonical command as a second buffer, avoiding a command-sized
+// userspace copy and allocation on every retry. A TLS stream may encode the two
+// writes as separate record sequences; this function does not claim writev.
+func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
