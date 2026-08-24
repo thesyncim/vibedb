@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -10,6 +11,252 @@ import (
 	"time"
 	"unsafe"
 )
+
+func TestCheckpointGroupRetentionSuccessorCanonicalGrammar(t *testing.T) {
+	_, _, _, group := newCheckpointGroupTestStore(t, 8)
+	base := group.certificateLocked()
+
+	ordinary := base
+	ordinary.sequence++
+	ordinary.applied++
+	ordinary.txnHighWater++
+	if !validCheckpointGroupCertificateSuccessor(base, ordinary) {
+		t.Fatal("ordinary zero-seal successor was rejected")
+	}
+
+	sealed := ordinary
+	sealed.sequence++
+	sealed.retentionApplied = sealed.applied
+	sealed.retentionCommitment = checkpointRetentionSealCommitment(
+		sealed,
+		sealed.retentionApplied,
+	)
+	if !validCheckpointGroupCertificateSuccessor(ordinary, sealed) {
+		t.Fatal("first exact retention seal was rejected")
+	}
+
+	mirrored := sealed
+	mirrored.sequence++
+	if !validCheckpointGroupCertificateSuccessor(sealed, mirrored) {
+		t.Fatal("exact retention mirror was rejected")
+	}
+
+	later := mirrored
+	later.sequence++
+	later.applied++
+	later.txnHighWater++
+	if !validCheckpointGroupCertificateSuccessor(mirrored, later) {
+		t.Fatal("ordinary checkpoint carrying an exact seal was rejected")
+	}
+
+	higher := later
+	higher.sequence++
+	higher.retentionApplied = higher.applied
+	higher.retentionCommitment = checkpointRetentionSealCommitment(
+		higher,
+		higher.retentionApplied,
+	)
+	if !validCheckpointGroupCertificateSuccessor(later, higher) {
+		t.Fatal("higher exact retention seal was rejected")
+	}
+
+	rollover := higher
+	rollover.sequence++
+	rollover.markerEpoch++
+	rollover.txnBase = higher.txnHighWater
+	if !validCheckpointGroupCertificateSuccessor(higher, rollover) {
+		t.Fatal("marker rollover carrying an exact seal was rejected")
+	}
+
+	widened := rollover
+	widened.sequence++
+	widened.txnHighWater++
+	widened.applied += 2
+	checkpointGroupTestSetMaxSpan(
+		&widened,
+		2,
+		widened.txnHighWater,
+		widened.applied,
+	)
+	if !validCheckpointGroupCertificateSuccessor(rollover, widened) {
+		t.Fatal("proven max-span widening carrying an exact seal was rejected")
+	}
+
+	changedCommitment := sealed
+	changedCommitment.retentionCommitment[0] ^= 0xff
+	changedCommitment.sequence = ordinary.sequence + 1
+	ordinaryDuplicate := ordinary
+	ordinaryDuplicate.sequence++
+	sameFloorChanged := mirrored
+	sameFloorChanged.retentionCommitment[0] ^= 0xff
+	ordinarySealChange := later
+	ordinarySealChange.retentionCommitment[0] ^= 0xff
+	rolloverSealChange := rollover
+	rolloverSealChange.retentionCommitment[0] ^= 0xff
+	regressed := higher
+	regressed.sequence++
+	regressed.retentionApplied = sealed.retentionApplied
+	regressed.retentionCommitment = checkpointRetentionSealCommitment(
+		regressed,
+		regressed.retentionApplied,
+	)
+	combinedTransition := later
+	combinedTransition.sequence++
+	combinedTransition.retentionApplied = combinedTransition.applied
+	combinedTransition.retentionCommitment = checkpointRetentionSealCommitment(
+		combinedTransition,
+		combinedTransition.retentionApplied,
+	)
+	checkpointGroupTestSetMaxSpan(
+		&combinedTransition,
+		2,
+		combinedTransition.txnHighWater,
+		combinedTransition.applied,
+	)
+
+	for _, test := range []struct {
+		name     string
+		previous checkpointGroupCertificate
+		selected checkpointGroupCertificate
+	}{
+		{name: "zero-seal duplicate", previous: ordinary, selected: ordinaryDuplicate},
+		{name: "arbitrary first commitment", previous: ordinary, selected: changedCommitment},
+		{name: "same-floor changed commitment", previous: sealed, selected: sameFloorChanged},
+		{name: "ordinary checkpoint seal change", previous: mirrored, selected: ordinarySealChange},
+		{name: "rollover seal change", previous: higher, selected: rolloverSealChange},
+		{name: "retention regression", previous: higher, selected: regressed},
+		{name: "same-cut seal and span change", previous: later, selected: combinedTransition},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if validCheckpointGroupCertificateSuccessor(test.previous, test.selected) {
+				t.Fatal("invalid combined certificate transition was accepted")
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupSealRetentionFloorCannotLaunderForgedCurrentSeal(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name      string
+		canonical bool
+		dirty     bool
+	}{
+		{name: "arbitrary-clean"},
+		{name: "arbitrary-dirty-suffix", dirty: true},
+		{name: "canonical-clean", canonical: true},
+		{name: "canonical-dirty-suffix", canonical: true, dirty: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "one")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			if test.dirty {
+				checkpointGroupPut(t, group, 2, members, "dirty-suffix")
+			}
+			before := group.Stats()
+			wantApplied := uint64(1)
+			if test.dirty {
+				wantApplied = 2
+			}
+			if before.CheckpointAppliedIndex != 1 ||
+				before.AppliedIndex != wantApplied {
+				t.Fatalf("forged-seal cut precondition = %+v", before)
+			}
+
+			group.mu.Lock()
+			currentSlot := int(group.sequence % checkpointGroupSlots)
+			otherSlot := 1 - currentSlot
+			var forged [checkpointGroupSlotBytes]byte
+			var previousRaw [checkpointGroupSlotBytes]byte
+			_, readErr := group.file.ReadAt(
+				forged[:],
+				int64(currentSlot*checkpointGroupSlotBytes),
+			)
+			if readErr == nil {
+				_, readErr = group.file.ReadAt(
+					previousRaw[:],
+					int64(otherSlot*checkpointGroupSlotBytes),
+				)
+			}
+			current, decodeErr := decodeCheckpointGroupCertificate(forged[:])
+			previous, previousErr := decodeCheckpointGroupCertificate(previousRaw[:])
+			if readErr != nil || decodeErr != nil || previousErr != nil {
+				group.mu.Unlock()
+				t.Fatalf("read forge source = %v, %v, %v", readErr, decodeErr, previousErr)
+			}
+			current.retentionApplied = current.applied
+			if test.canonical {
+				current.retentionCommitment = checkpointRetentionSealCommitment(
+					current,
+					current.retentionApplied,
+				)
+				encoded, encodeErr := encodeCheckpointGroupCertificate(current)
+				if encodeErr != nil {
+					group.mu.Unlock()
+					t.Fatal(encodeErr)
+				}
+				copy(forged[:], encoded)
+			} else {
+				binary.LittleEndian.PutUint64(
+					forged[checkpointGroupRetentionAppliedOffset:checkpointGroupRetentionCommitOffset],
+					current.retentionApplied,
+				)
+				copy(
+					forged[checkpointGroupRetentionCommitOffset:checkpointGroupRetentionEndOffset],
+					bytes.Repeat(
+						[]byte{0x5a},
+						checkpointGroupRetentionEndOffset-checkpointGroupRetentionCommitOffset,
+					),
+				)
+				h := sha256.New()
+				_, _ = h.Write(checkpointGroupDigestDomain)
+				_, _ = h.Write(forged[:checkpointGroupChecksumOffset])
+				copy(forged[checkpointGroupChecksumOffset:], h.Sum(nil))
+			}
+			decoded, forgedDecodeErr := decodeCheckpointGroupCertificate(forged[:])
+			if test.canonical {
+				if forgedDecodeErr != nil {
+					group.mu.Unlock()
+					t.Fatalf("canonical forged slot did not decode: %v", forgedDecodeErr)
+				}
+				if validCheckpointGroupCertificateSuccessor(previous, decoded) {
+					group.mu.Unlock()
+					t.Fatal("canonical forged slot passed adjacent successor validation")
+				}
+			} else if !errors.Is(forgedDecodeErr, ErrCheckpointGroupCorrupt) {
+				group.mu.Unlock()
+				t.Fatalf("arbitrary forged slot decoded as canonical: %v", forgedDecodeErr)
+			}
+			_, writeErr := group.file.WriteAt(
+				forged[:],
+				int64(currentSlot*checkpointGroupSlotBytes),
+			)
+			if writeErr == nil {
+				writeErr = group.file.Sync()
+			}
+			group.mu.Unlock()
+			if writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			if !checkpointGroupCertificateChecksumValid(forged[:]) {
+				t.Fatal("forged regression did not retain a valid checksum")
+			}
+
+			witness, err := group.SealRetentionFloor(before.AppliedIndex)
+			if !witness.IsZero() || !errors.Is(err, ErrCheckpointGroupCorrupt) {
+				t.Fatalf("forged current seal was laundered: witness %+v err %v", witness, err)
+			}
+			after := group.Stats()
+			if after.CertificateSyncs != before.CertificateSyncs {
+				t.Fatalf("forged seal triggered a certificate write: before %+v after %+v", before, after)
+			}
+		})
+	}
+}
 
 func TestCheckpointGroupSealRetentionFloorIsExactAndIdempotent(t *testing.T) {
 	dir, members, _, group := newCheckpointGroupTestStore(t, 8)

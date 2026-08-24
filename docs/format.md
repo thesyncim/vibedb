@@ -173,15 +173,24 @@ and a 32-byte SHA-256 checksum. Its canonical fields are:
 | 144 | 24 | Truncated membership digest |
 
 The member bank begins at byte 168. At the maximum 60 members it ends at byte
-4008. Bytes 4008 through 4039 are required zero padding. The final
-authenticated tail before the checksum is:
+4008. The final authenticated tail before the checksum is:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
+| 4008 | 8 | Retention applied floor, or zero |
+| 4016 | 24 | Retention commitment, or zero |
 | 4040 | 8 | Maximum-span witness transaction |
 | 4048 | 8 | Maximum-span witness first applied index |
 | 4056 | 8 | Maximum-span witness last applied index |
 | 4064 | 32 | Slot checksum |
+
+A zero retention floor requires a zero commitment. A nonzero floor must not
+exceed the certificate applied cut and its commitment must equal the first 24
+bytes of SHA-256 over
+`vibedb/checkpoint-group/retention-seal/format-0\0`, the floor, marker ID, and
+the fixed seed and member-lineage digest. The commitment excludes mutable
+transaction, epoch, and maximum-span fields so every later certificate can
+revalidate and carry the exact seal unchanged.
 
 Encoded maximum span zero is the sole canonical representation of effective
 span one and requires all three witness fields to be zero. Encoded one is
@@ -197,6 +206,15 @@ than the selected high-water. Its first index must be newer than the previous
 applied cut and its last index must not exceed the selected applied cut. These
 rules prove that a newly advertised maximum came from one exact consecutive
 transaction rather than from an accumulation of singleton transactions.
+
+Every adjacent ordinary transaction certificate and marker rollover must
+retain the exact retention tuple. A same-cut, same-marker-epoch certificate may
+install or advance a retention floor only to its exact current applied cut with
+the canonical commitment above. The next same-cut certificate may mirror that
+exact nonzero tuple into the other slot. A zero-seal duplicate, changed or
+regressed seal, same-cut maximum-span change, or combined seal and span change
+is corruption. This successor grammar is shared by reopen and live two-slot
+qualification.
 
 Each member record binds the SHA-256 logical-name digest, store ID, and
 recovery-journal ID. The checksum is SHA-256 over the domain
