@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -142,6 +143,46 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		tag = tagReplicatedMembershipRequest
 	}
 	return writeEncodedFrame(w, tag, e.b)
+}
+
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
+// the immutable canonical command as a second buffer, avoiding a command-sized
+// userspace copy and allocation on every retry. A TLS stream may encode the two
+// writes as separate record sequences; this function does not claim writev.
+func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
+	if w == nil || !validReplicatedRequest(request) {
+		return ErrReplicatedWire
+	}
+	payloadHint := 0
+	if request.Operation == ReplicatedMembership {
+		payloadHint = 65
+	}
+	e := newFrameEncoder(payloadHint)
+	e.u8(replicatedWireVersion)
+	e.u8(uint8(request.Operation))
+	encodeReplicatedFence(&e, request.Fence)
+	e.u32(uint32(len(request.Command)))
+	if request.Operation == ReplicatedMembership {
+		encodeReplicatedMembership(&e, request.Membership)
+	}
+	if e.err != nil || len(e.b)+len(request.Command)-5 > maxFrameBody {
+		return errFrameTooLarge
+	}
+	tag := byte(tagReplicatedRequest)
+	if request.Operation == ReplicatedMembership {
+		tag = tagReplicatedMembershipRequest
+	}
+	e.b[0] = tag
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(request.Command)-1))
+	buffers := net.Buffers{e.b}
+	if len(request.Command) != 0 {
+		buffers = append(buffers, request.Command)
+	}
+	written, err := buffers.WriteTo(w)
+	if err == nil && written != int64(len(e.b)+len(request.Command)) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // DecodeReplicatedRequest decodes and validates one bounded native request.

@@ -43,6 +43,8 @@ type fakeRuntime struct {
 	closeHook           func()
 	closeCalls          int
 	driveCalls          int
+	driveHook           func()
+	tickHook            func()
 	statusCalls         int
 	readyWorkspace      *raftmember.ReadyWorkspace
 	settlementSink      bool
@@ -199,6 +201,9 @@ func (runtime *fakeRuntime) StepMessage(message *pb.Message) error {
 }
 
 func (runtime *fakeRuntime) Tick() error {
+	if runtime.tickHook != nil {
+		runtime.tickHook()
+	}
 	runtime.inputs = append(runtime.inputs, ProgressTick)
 	return runtime.inputErr
 }
@@ -214,6 +219,9 @@ func (runtime *fakeRuntime) DriveReady(
 	settle raftmember.ResultSettlementSink,
 ) (raftmember.DriveResult, error) {
 	runtime.driveCalls++
+	if runtime.driveHook != nil {
+		runtime.driveHook()
+	}
 	runtime.readyWorkspace = workspace
 	runtime.settlementSink = settle != nil
 	if len(runtime.ready) == 0 {

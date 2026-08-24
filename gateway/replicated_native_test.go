@@ -25,9 +25,10 @@ type scriptedReplicatedClient struct {
 
 func (client *scriptedReplicatedClient) DoReplicated(
 	_ context.Context,
-	address string,
+	endpoint ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
+	address := endpoint.Address
 	state := client.states[address]
 	if request.Operation == shardservice.ReplicatedProbe {
 		return &shardservice.ReplicatedResponse{
@@ -102,7 +103,7 @@ type membershipReplicatedClient struct {
 
 func (client *membershipReplicatedClient) DoReplicated(
 	_ context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -121,9 +122,10 @@ type transferReplicatedClient struct {
 
 func (client *transferReplicatedClient) DoReplicated(
 	_ context.Context,
-	address string,
+	endpoint ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
+	address := endpoint.Address
 	state := client.states[address]
 	if request.Operation == shardservice.ReplicatedProbe {
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
@@ -201,7 +203,7 @@ func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.
 
 func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	state := states["m2"]
 	membership := shardservice.ReplicatedMembershipRequest{
 		Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{8},
@@ -230,7 +232,7 @@ func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T)
 
 func (client *failingReplicatedClient) DoReplicated(
 	_ context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -246,7 +248,7 @@ func TestReplicatedExecutorExhaustedUnknownOwnsExactRetryCommand(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	client := &failingReplicatedClient{state: states["m2"]}
 	// Route directly to the state this one-endpoint fake reports.
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	executor, err := NewReplicatedExecutor(client, 1, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -273,7 +275,7 @@ type sequenceReplicatedClient struct {
 
 func (client *sequenceReplicatedClient) DoReplicated(
 	_ context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -292,7 +294,7 @@ func (client *sequenceReplicatedClient) DoReplicated(
 func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	state := states["m2"]
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	unknown := &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: state,
 	}
@@ -359,7 +361,7 @@ func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) 
 func TestReplicatedExecutorAppliedDeterministicRefusalResolvesUnknown(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	state := states["m2"]
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	state.Commit, state.Applied = 12, 12
 	client := &sequenceReplicatedClient{
 		state: state,
@@ -387,7 +389,7 @@ func TestReplicatedExecutorAppliedDeterministicRefusalResolvesUnknown(t *testing
 func TestReplicatedExecutorPreAdmissionRefusalIsDefiniteWithoutPriorUnknown(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	state := states["m2"]
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	tests := []struct {
 		name string
 		code shardservice.ReplicatedRefusalCode
@@ -424,7 +426,7 @@ type deadlineReplicatedClient struct {
 
 func (client deadlineReplicatedClient) DoReplicated(
 	ctx context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -438,7 +440,7 @@ func (client deadlineReplicatedClient) DoReplicated(
 
 func TestReplicatedExecutorRequiresAndEnforcesPerAttemptTimeout(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
-	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
 	if _, err := NewReplicatedExecutor(deadlineReplicatedClient{}, 1, 0); !errors.Is(err, ErrReplicatedRoute) {
 		t.Fatalf("zero attempt timeout = %v", err)
 	}
@@ -462,7 +464,7 @@ func TestReplicatedExecutorRequiresAndEnforcesPerAttemptTimeout(t *testing.T) {
 
 func TestTCPReplicatedClientRequiresExplicitDial(t *testing.T) {
 	_, err := (TCPReplicatedClient{}).DoReplicated(
-		context.Background(), "127.0.0.1:1", &shardservice.ReplicatedRequest{},
+		context.Background(), ReplicatedEndpoint{Address: "127.0.0.1:1"}, &shardservice.ReplicatedRequest{},
 	)
 	if !errors.Is(err, ErrReplicatedDial) {
 		t.Fatalf("nil Dial = %v", err)
@@ -471,7 +473,7 @@ func TestTCPReplicatedClientRequiresExplicitDial(t *testing.T) {
 
 func (client *staleFenceReplicatedClient) DoReplicated(
 	_ context.Context,
-	_ string,
+	_ ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -523,17 +525,20 @@ func testReplicatedRouteCommand(
 			RelationManifestDigest: [32]byte{1},
 			RoutingVersion:         1, RouteGeneration: 1,
 		},
-		Replicas: []ReplicatedEndpoint{{Member: 1, Address: "m1"},
-			{Member: 2, Address: "m2"}, {Member: 3, Address: "m3"}},
+		Replicas: []ReplicatedEndpoint{
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, Address: "m1"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, Address: "m2"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{3}, NodeIncarnation: 13, Address: "m3"},
+		},
 	}
 	states := make(map[string]shardservice.ReplicatedMemberState, 3)
-	for index, endpoint := range route.Replicas {
+	for _, endpoint := range route.Replicas {
 		fence := shardservice.ReplicatedFence{
 			Group: group, AllocationGeneration: route.AllocationGeneration,
 			Command:  route.Command,
 			MemberID: endpoint.Member, NodeIncarnation: 10 + endpoint.Member, Term: 7,
 		}
-		fence.StoreID[0] = byte(index + 1)
+		fence.StoreID = endpoint.StoreID
 		states[endpoint.Address] = shardservice.ReplicatedMemberState{
 			Fence: fence, LeaderID: 2, Commit: 8, Applied: 8, CheckpointApplied: 8,
 		}

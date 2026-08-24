@@ -6,6 +6,8 @@ import (
 	"math"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // ErrParameterType reports a bound SQL parameter whose runtime type is not
@@ -384,6 +386,22 @@ func (s *Statement) count(o sqlast.Operand, args []any, clause string) (int, err
 			return 0, fmt.Errorf(
 				"query: %s was bound to %q, which is not a non-negative count",
 				clause, *v,
+			)
+		}
+		return int(n), nil
+	case vibejson.RawValue:
+		raw, valid := v.NumberBytes()
+		if !valid {
+			return 0, fmt.Errorf(
+				"query: %s was bound to a non-number vibejson.RawValue; a row count must be a non-negative integer",
+				clause,
+			)
+		}
+		n, ok := int64Spelling(byteview.String(raw))
+		if !ok || n < 0 || int64(int(n)) != n {
+			return 0, fmt.Errorf(
+				"query: %s was bound to %q, which is not a non-negative count",
+				clause, raw,
 			)
 		}
 		return int(n), nil
@@ -1122,10 +1140,18 @@ func (s *Statement) argument(arg any) (any, bool, error) {
 		box := s.c.nums.one()
 		*box = Number(s.c.internString(string(v)))
 		return box, true, nil
+	case vibejson.RawValue:
+		raw, ok := v.NumberBytes()
+		if !ok {
+			return nil, false, fmt.Errorf("query: raw SQL literal is not a JSON number")
+		}
+		box := s.c.nums.one()
+		*box = Number(s.c.intern(raw))
+		return box, true, nil
 	default:
 		return nil, false, fmt.Errorf(
 			"query: cannot bind %T as a SQL literal; bind a bool, an integer, a float, "+
-				"a string, a []byte, a query.Number, their pointer-shaped zero-copy "+
+				"a string, a []byte, a query.Number, a vibejson.RawValue number, their pointer-shaped zero-copy "+
 				"forms, or nil", arg)
 	}
 }

@@ -126,6 +126,31 @@ func TestReplicatedCatalogServingFenceMonotonicAndRosterFrozen(t *testing.T) {
 	if _, err := advanceCatalogState(current, next); err == nil {
 		t.Fatal("catalog implied an unsupported membership transition")
 	}
+
+	identityChanges := []struct {
+		name   string
+		mutate func(*ReplicatedReplicaDescriptor)
+	}{
+		{"node", func(replica *ReplicatedReplicaDescriptor) { replica.Node[0]++ }},
+		{"store", func(replica *ReplicatedReplicaDescriptor) { replica.StoreID[0]++ }},
+		{"incarnation", func(replica *ReplicatedReplicaDescriptor) { replica.NodeIncarnation++ }},
+	}
+	for _, test := range identityChanges {
+		t.Run(test.name, func(t *testing.T) {
+			changed := descriptor
+			changed.Replicas = append([]ReplicatedReplicaDescriptor(nil), descriptor.Replicas...)
+			test.mutate(&changed.Replicas[0])
+			next, err := NewSnapshotWithReplicatedMetadata(
+				config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{changed},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := advanceCatalogState(current, next); err == nil {
+				t.Fatal("catalog changed authenticated endpoint identity within one allocation")
+			}
+		})
+	}
 }
 
 func TestReplicatedCommandFenceRegressionChecksEveryGeneration(t *testing.T) {
@@ -279,9 +304,9 @@ func testReplicatedCatalogInput(
 			RoutingVersion:         uint64(manifest.Version()), RouteGeneration: 10,
 		},
 		Replicas: []ReplicatedReplicaDescriptor{
-			{Member: 1, Endpoint: "ep-a"},
-			{Member: 2, Endpoint: "ep-c"},
-			{Member: 3, Endpoint: "ep-d"},
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21, Endpoint: "ep-a"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "ep-c"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23, Endpoint: "ep-d"},
 		},
 	}
 	return config, endpoints, descriptor

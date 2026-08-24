@@ -2,7 +2,6 @@ package driver
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -328,12 +328,15 @@ func appendBoundedPrimaryScalarKey(
 		return appendBoundedPrimaryNumber(
 			dst, strconv.AppendFloat(text[:0], *value, 'g', -1, 64),
 			maxKeyBytes)
-	case json.Number:
-		return appendBoundedPrimaryNumber(
-			dst, byteview.Bytes(string(value)), maxKeyBytes)
 	case query.Number:
 		return appendBoundedPrimaryNumber(
 			dst, byteview.Bytes(string(value)), maxKeyBytes)
+	case vibejson.RawValue:
+		spelling, ok := value.NumberBytes()
+		if !ok {
+			return dst, false, errors.New("a raw primary key must be a JSON number")
+		}
+		return appendBoundedPrimaryNumber(dst, spelling, maxKeyBytes)
 	case *query.Number:
 		if value == nil {
 			return dst, false, errors.New("a primary key cannot be NULL")
