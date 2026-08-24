@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var (
@@ -36,7 +37,11 @@ var (
 	// ErrOutcomeUnknown reports cancellation or owner loss after the exact
 	// command entered the serving registry. Retrying the same command bytes is
 	// safe; changing its request identity is not.
-	ErrOutcomeUnknown = errors.New("raftservice: admitted command outcome is unknown")
+	ErrOutcomeUnknown         = errors.New("raftservice: admitted command outcome is unknown")
+	ErrMembershipUnauthorized = errors.New("raftservice: membership transition is not authorized")
+	ErrMembershipStale        = errors.New("raftservice: membership transition is stale")
+	ErrMembershipMalformed    = errors.New("raftservice: membership transition is malformed")
+	ErrMembershipNotCaughtUp  = errors.New("raftservice: membership target is not caught up")
 )
 
 // Limits bounds every object retained outside Host and rafttransport. Host and
@@ -60,13 +65,14 @@ type OutboundSink interface {
 // and also retries a retained outbound message after transport backpressure.
 // Core never samples wall-clock time.
 type Options struct {
-	Registry      *raftserve.Registry
-	Host          *multiraft.Host
-	Members       []raftmember.RuntimeIdentity
-	CommandFences []CommandFence
-	Outbound      OutboundSink
-	Pulse         <-chan struct{}
-	Limits        Limits
+	Registry                 *raftserve.Registry
+	Host                     *multiraft.Host
+	Members                  []raftmember.RuntimeIdentity
+	CommandFences            []CommandFence
+	MembershipAuthorizations []MembershipAuthorization
+	Outbound                 OutboundSink
+	Pulse                    <-chan struct{}
+	Limits                   Limits
 }
 
 type requestKind uint8
@@ -76,6 +82,7 @@ const (
 	requestInbound
 	requestCampaign
 	requestStatus
+	requestMembership
 )
 
 const (
@@ -91,15 +98,16 @@ type proposalDelivery struct {
 }
 
 type ownerRequest struct {
-	kind     requestKind
-	group    raftmember.GroupKey
-	data     []byte
-	fence    ServingFence
-	inbound  rafttransport.Inbound
-	reply    chan ownerReply
-	bytes    int64
-	async    bool
-	delivery *proposalDelivery
+	kind       requestKind
+	group      raftmember.GroupKey
+	data       []byte
+	fence      ServingFence
+	inbound    rafttransport.Inbound
+	reply      chan ownerReply
+	bytes      int64
+	async      bool
+	delivery   *proposalDelivery
+	membership MembershipRequest
 }
 
 type ownerReply struct {
@@ -225,8 +233,47 @@ type Owner struct {
 }
 
 type ownerMember struct {
-	identity raftmember.RuntimeIdentity
-	command  CommandFence
+	identity  raftmember.RuntimeIdentity
+	command   CommandFence
+	authority MembershipAuthorization
+}
+
+type MembershipKind uint8
+
+const (
+	MembershipAddLearner MembershipKind = iota + 1
+	MembershipPromoteVoter
+	MembershipRemoveVoter
+	MembershipTransferLeader
+)
+
+// MembershipAuthorization is the fixed metadata grant for one replica move.
+// It is configured locally from the authenticated metadata cut and cannot be
+// widened by a network request.
+type MembershipAuthorization struct {
+	TransitionID      [16]byte
+	MetadataEpoch     uint64
+	CatalogGeneration uint64
+	SourceMember      uint64
+	TargetMember      uint64
+}
+
+func (a MembershipAuthorization) Valid() bool {
+	return a.TransitionID != ([16]byte{}) && a.MetadataEpoch != 0 &&
+		a.CatalogGeneration != 0 && a.SourceMember != 0 && a.TargetMember != 0 &&
+		a.SourceMember != a.TargetMember
+}
+
+// MembershipRequest carries no variable-sized data and is retained by value.
+type MembershipRequest struct {
+	Fence                     ServingFence
+	Kind                      MembershipKind
+	TransitionID              [16]byte
+	MetadataEpoch             uint64
+	CatalogGeneration         uint64
+	ExpectedReplicaSetVersion uint64
+	SourceMember              uint64
+	TargetMember              uint64
 }
 
 // NewOwner validates and detaches one lane configuration. Runtime adoption and
@@ -235,6 +282,8 @@ func NewOwner(options Options) (*Owner, error) {
 	limits := options.Limits
 	if options.Registry == nil || options.Host == nil || len(options.Members) == 0 ||
 		len(options.CommandFences) != len(options.Members) ||
+		(len(options.MembershipAuthorizations) != 0 &&
+			len(options.MembershipAuthorizations) != len(options.Members)) ||
 		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
 		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingProposalItems <= 0 ||
@@ -265,7 +314,15 @@ func NewOwner(options Options) (*Owner, error) {
 		}
 		seen[group] = struct{}{}
 		groups[index] = group
-		members[group] = ownerMember{identity: identity, command: options.CommandFences[index]}
+		var authority MembershipAuthorization
+		if len(options.MembershipAuthorizations) != 0 {
+			authority = options.MembershipAuthorizations[index]
+			if !authority.Valid() {
+				return nil, ErrInvalidOwner
+			}
+		}
+		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
+			authority: authority}
 	}
 	return &Owner{
 		registry: options.Registry, host: options.Host, groups: groups, members: members,
@@ -418,6 +475,18 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.state.Identity = member.identity
 		reply.state.Command = member.command
 		reply.state.Status, reply.err = owner.host.Status(request.group)
+		if reply.err == nil {
+			publication, publicationErr := owner.host.Publication(request.group)
+			if publicationErr != nil {
+				reply.err = publicationErr
+			} else if publication.ReplicaSetVersion != 0 {
+				member.command.ReplicaSetVersion = publication.ReplicaSetVersion
+				owner.members[request.group] = member
+				reply.state.Command = member.command
+			}
+		}
+	case requestMembership:
+		reply.err = owner.applyMembership(request.membership)
 	default:
 		reply.err = ErrInvalidOwner
 	}
@@ -464,6 +533,149 @@ func commandMatchesFence(command replication.CommandView, fence ServingFence) bo
 		command.SchemaGeneration == fence.Command.SchemaGeneration &&
 		command.RoutingVersion == fence.Command.RoutingVersion &&
 		command.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) applyMembership(request MembershipRequest) error {
+	member, found := owner.members[request.Fence.Group]
+	if !found || !member.authority.Valid() {
+		return ErrMembershipUnauthorized
+	}
+	authority := member.authority
+	if err := validateMembershipIdentity(request, authority); err != nil {
+		return err
+	}
+	publication, err := owner.host.Publication(request.Fence.Group)
+	if err != nil {
+		return err
+	}
+	member.command.ReplicaSetVersion = publication.ReplicaSetVersion
+	owner.members[request.Fence.Group] = member
+	if !servingFenceMatchesIdentity(request.Fence, member) ||
+		request.ExpectedReplicaSetVersion != publication.ReplicaSetVersion {
+		return ErrMembershipStale
+	}
+	status, err := owner.host.Status(request.Fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+		status.Term != request.Fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	var progress raftmodel.MemberProgress
+	var progressFound bool
+	if request.Kind == MembershipPromoteVoter || request.Kind == MembershipTransferLeader {
+		progress, progressFound, err = owner.host.Progress(request.Fence.Group, request.TargetMember)
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMembershipTransition(request, authority, publication, status,
+		progress, progressFound); err != nil {
+		return err
+	}
+	switch request.Kind {
+	case MembershipAddLearner:
+		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
+			Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &request.TargetMember,
+		})
+	case MembershipPromoteVoter:
+		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
+			Type: pb.ConfChangeAddNode.Enum(), NodeId: &request.TargetMember,
+		})
+	case MembershipTransferLeader:
+		return owner.host.TransferLeader(request.Fence.Group, request.TargetMember)
+	case MembershipRemoveVoter:
+		// Removal is authorized only after the target is the observed leader.
+		// This makes deleting the active leader unrepresentable on this wire.
+		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
+			Type: pb.ConfChangeRemoveNode.Enum(), NodeId: &request.SourceMember,
+		})
+	default:
+		return ErrMembershipMalformed
+	}
+}
+
+func validateMembershipTransition(
+	request MembershipRequest,
+	authority MembershipAuthorization,
+	publication raftmodel.Publication,
+	status raftmember.RuntimeStatus,
+	progress raftmodel.MemberProgress,
+	progressFound bool,
+) error {
+	if err := validateMembershipIdentity(request, authority); err != nil {
+		return err
+	}
+	if publication.ConfState == nil || request.ExpectedReplicaSetVersion != publication.ReplicaSetVersion ||
+		!containsSorted(publication.ConfState.GetVoters(), request.SourceMember) {
+		return ErrMembershipStale
+	}
+	voters := publication.ConfState.GetVoters()
+	learners := publication.ConfState.GetLearners()
+	switch request.Kind {
+	case MembershipAddLearner:
+		if containsSorted(voters, request.TargetMember) || containsSorted(learners, request.TargetMember) {
+			return ErrMembershipStale
+		}
+	case MembershipPromoteVoter:
+		if !containsSorted(learners, request.TargetMember) || containsSorted(voters, request.TargetMember) {
+			return ErrMembershipStale
+		}
+		if !caughtUp(progress, progressFound, status.Commit, true) {
+			return ErrMembershipNotCaughtUp
+		}
+	case MembershipTransferLeader:
+		if status.LeaderID != request.SourceMember || !containsSorted(voters, request.TargetMember) {
+			return ErrMembershipStale
+		}
+		if !caughtUp(progress, progressFound, status.Commit, false) {
+			return ErrMembershipNotCaughtUp
+		}
+	case MembershipRemoveVoter:
+		if status.LeaderID != request.TargetMember || status.MemberID != request.TargetMember ||
+			!containsSorted(voters, request.TargetMember) {
+			return ErrMembershipStale
+		}
+	}
+	return nil
+}
+
+func validateMembershipIdentity(
+	request MembershipRequest,
+	authority MembershipAuthorization,
+) error {
+	if request.Kind < MembershipAddLearner || request.Kind > MembershipTransferLeader ||
+		request.ExpectedReplicaSetVersion == 0 || request.SourceMember == 0 ||
+		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
+		return ErrMembershipMalformed
+	}
+	if request.TransitionID != authority.TransitionID ||
+		request.MetadataEpoch != authority.MetadataEpoch ||
+		request.CatalogGeneration != authority.CatalogGeneration ||
+		request.SourceMember != authority.SourceMember ||
+		request.TargetMember != authority.TargetMember {
+		return ErrMembershipUnauthorized
+	}
+	return nil
+}
+
+func caughtUp(progress raftmodel.MemberProgress, found bool, commit uint64, learner bool) bool {
+	return found && progress.Learner == learner && progress.RecentActive &&
+		progress.PendingSnapshot == 0 && progress.Match >= commit
+}
+
+func containsSorted(values []uint64, member uint64) bool {
+	low, high := 0, len(values)
+	for low < high {
+		middle := int(uint(low+high) >> 1)
+		if values[middle] < member {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low < len(values) && values[low] == member
 }
 
 func (owner *Owner) stop(cause error) error {
@@ -728,6 +940,27 @@ func (owner *Owner) Campaign(ctx context.Context, group raftmember.GroupKey) err
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestCampaign, group: group, reply: make(chan ownerReply, 1),
 	})
+	return err
+}
+
+// ApplyMembership serializes one fixed-size metadata-authorized control
+// request with proposals, Ready handling, and peer ingress. A nil error means
+// Raft accepted the control input; the caller must observe its exact applied
+// ReplicaSetVersion before issuing the next transition.
+func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipRequest) error {
+	if ctx == nil {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestMembership, group: request.Fence.Group,
+		membership: request, reply: make(chan ownerReply, 1),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
 	return err
 }
 

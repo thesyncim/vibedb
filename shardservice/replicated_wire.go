@@ -25,6 +25,7 @@ type ReplicatedOperation uint8
 const (
 	ReplicatedProbe ReplicatedOperation = iota + 1
 	ReplicatedPropose
+	ReplicatedMembership
 )
 
 // ReplicatedFence identifies one exact live Runtime and leadership term. Probe
@@ -42,9 +43,22 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation ReplicatedOperation
-	Fence     ReplicatedFence
-	Command   []byte
+	Operation  ReplicatedOperation
+	Fence      ReplicatedFence
+	Command    []byte
+	Membership ReplicatedMembershipRequest
+}
+
+// ReplicatedMembershipRequest is a fixed-width control envelope. It contains
+// no protobuf and no peer-sized repeated field.
+type ReplicatedMembershipRequest struct {
+	Kind                      raftservice.MembershipKind
+	TransitionID              [16]byte
+	MetadataEpoch             uint64
+	CatalogGeneration         uint64
+	ExpectedReplicaSetVersion uint64
+	SourceMember              uint64
+	TargetMember              uint64
 }
 
 // ReplicatedResponseKind separates definite pre-admission refusals from an
@@ -57,6 +71,7 @@ const (
 	ReplicatedNotLeader
 	ReplicatedOutcomeUnknown
 	ReplicatedRefusal
+	ReplicatedMembershipAccepted
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -70,6 +85,10 @@ const (
 	ReplicatedRefusalProposalRefused
 	ReplicatedRefusalDeterministic
 	ReplicatedRefusalUnavailable
+	ReplicatedRefusalMembershipUnauthorized
+	ReplicatedRefusalMembershipStale
+	ReplicatedRefusalMembershipMalformed
+	ReplicatedRefusalMembershipNotCaughtUp
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -98,11 +117,18 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(len(request.Command))
+	payloadHint := len(request.Command)
+	if request.Operation == ReplicatedMembership {
+		payloadHint += 57
+	}
+	e := newFrameEncoder(payloadHint)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	encodeReplicatedFence(&e, request.Fence)
 	e.bytes(request.Command)
+	if request.Operation == ReplicatedMembership {
+		encodeReplicatedMembership(&e, request.Membership)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -133,6 +159,9 @@ func decodeReplicatedRequest(
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
 	request.Fence = decodeReplicatedFence(&d)
 	request.Command = d.slice()
+	if request.Operation == ReplicatedMembership {
+		request.Membership = decodeReplicatedMembership(&d)
+	}
 	if err := d.end(); err != nil {
 		if budget != nil {
 			budget.release(charged)
@@ -264,6 +293,24 @@ func decodeReplicatedDigest(d *deccur) (digest [32]byte) {
 	return digest
 }
 
+func encodeReplicatedMembership(e *encbuf, request ReplicatedMembershipRequest) {
+	e.u8(uint8(request.Kind))
+	e.fixed16(request.TransitionID)
+	e.u64(request.MetadataEpoch)
+	e.u64(request.CatalogGeneration)
+	e.u64(request.ExpectedReplicaSetVersion)
+	e.u64(request.SourceMember)
+	e.u64(request.TargetMember)
+}
+
+func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
+	return ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipKind(d.u8()), TransitionID: d.fixed16(),
+		MetadataEpoch: d.u64(), CatalogGeneration: d.u64(),
+		ExpectedReplicaSetVersion: d.u64(), SourceMember: d.u64(), TargetMember: d.u64(),
+	}
+}
+
 func encodeReplicatedMemberState(e *encbuf, state ReplicatedMemberState) {
 	encodeReplicatedFence(e, state.Fence)
 	e.u64(state.LeaderID)
@@ -305,8 +352,12 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	}
 	switch request.Operation {
 	case ReplicatedProbe:
-		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0
+		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{})
 	case ReplicatedPropose:
+		if request.Membership != (ReplicatedMembershipRequest{}) {
+			return false
+		}
 		if !validReplicatedFence(request.Fence, true) || len(request.Command) == 0 ||
 			len(request.Command) > replication.MaxCommandBytes {
 			return false
@@ -325,6 +376,10 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			command.SchemaGeneration == request.Fence.Command.SchemaGeneration &&
 			command.RoutingVersion == request.Fence.Command.RoutingVersion &&
 			command.RouteGeneration == request.Fence.Command.RouteGeneration
+	case ReplicatedMembership:
+		// Semantic validation is deliberately performed by the serialized owner
+		// so malformed control requests receive a deterministic refusal class.
+		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0
 	default:
 		return false
 	}
@@ -368,6 +423,9 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 	case ReplicatedNotLeader, ReplicatedOutcomeUnknown:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
+	case ReplicatedMembershipAccepted:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
 	case ReplicatedRefusal:
 		if response.Refusal == ReplicatedRefusalNone || len(response.Completion) != 0 {
 			return false
@@ -382,7 +440,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		return response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
-			response.Refusal <= ReplicatedRefusalUnavailable
+			response.Refusal <= ReplicatedRefusalMembershipNotCaughtUp
 	default:
 		return false
 	}

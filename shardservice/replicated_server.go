@@ -18,6 +18,7 @@ import (
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
+	ApplyMembership(context.Context, raftservice.MembershipRequest) error
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
@@ -240,6 +241,48 @@ func (server *ReplicatedServer) executeReplicated(
 	if request.Operation == ReplicatedProbe {
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
 	}
+	if request.Operation == ReplicatedMembership {
+		err := server.owner.ApplyMembership(ctx, raftservice.MembershipRequest{
+			Fence: raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+				Term: request.Fence.Term,
+			},
+			Kind: request.Membership.Kind, TransitionID: request.Membership.TransitionID,
+			MetadataEpoch:             request.Membership.MetadataEpoch,
+			CatalogGeneration:         request.Membership.CatalogGeneration,
+			ExpectedReplicaSetVersion: request.Membership.ExpectedReplicaSetVersion,
+			SourceMember:              request.Membership.SourceMember,
+			TargetMember:              request.Membership.TargetMember,
+		})
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if err == nil {
+			return &ReplicatedResponse{Kind: ReplicatedMembershipAccepted, HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(err, raftmodel.ErrNotLeader):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(err, raftservice.ErrOutcomeUnknown), errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+		case errors.Is(err, raftservice.ErrMembershipUnauthorized):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipUnauthorized)
+		case errors.Is(err, raftservice.ErrMembershipStale), errors.Is(err, raftservice.ErrServingFence):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipStale)
+		case errors.Is(err, raftservice.ErrMembershipMalformed):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipMalformed)
+		case errors.Is(err, raftservice.ErrMembershipNotCaughtUp):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipNotCaughtUp)
+		case errors.Is(err, raftmodel.ErrAdmissionBound), errors.Is(err, raftmodel.ErrConfChangePending),
+			errors.Is(err, raftmodel.ErrLeaderTransferPending):
+			return membershipRefusal(wireState, ReplicatedRefusalAdmissionBound)
+		default:
+			return membershipRefusal(wireState, ReplicatedRefusalUnavailable)
+		}
+	}
 
 	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
 		Group:                request.Fence.Group,
@@ -313,6 +356,10 @@ func (server *ReplicatedServer) executeReplicated(
 	}
 }
 
+func membershipRefusal(state ReplicatedMemberState, code ReplicatedRefusalCode) *ReplicatedResponse {
+	return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: state}
+}
+
 func replicatedWireState(state raftservice.ServingState) ReplicatedMemberState {
 	return ReplicatedMemberState{
 		Fence: ReplicatedFence{
@@ -352,6 +399,9 @@ func RoundTripReplicated(
 				Command: append([]byte(nil), request.Command...), Cause: err,
 			}
 		}
+		if request.Operation == ReplicatedMembership {
+			return nil, errors.Join(raftservice.ErrOutcomeUnknown, err)
+		}
 		return nil, err
 	}
 	response, err := DecodeReplicatedResponse(conn)
@@ -359,6 +409,9 @@ func RoundTripReplicated(
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: err,
 		}
+	}
+	if err != nil && request.Operation == ReplicatedMembership {
+		return nil, errors.Join(raftservice.ErrOutcomeUnknown, err)
 	}
 	return response, err
 }

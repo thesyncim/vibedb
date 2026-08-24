@@ -93,6 +93,55 @@ type failingReplicatedClient struct {
 	command []byte
 }
 
+type membershipReplicatedClient struct {
+	state      shardservice.ReplicatedMemberState
+	response   *shardservice.ReplicatedResponse
+	err        error
+	membership shardservice.ReplicatedMembershipRequest
+}
+
+func (client *membershipReplicatedClient) DoReplicated(
+	_ context.Context,
+	_ string,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: client.state}, nil
+	}
+	client.membership = request.Membership
+	return client.response, client.err
+}
+
+func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	state := states["m2"]
+	membership := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{8},
+		MetadataEpoch: 9, CatalogGeneration: 10,
+		ExpectedReplicaSetVersion: route.Command.ReplicaSetVersion,
+		SourceMember:              2, TargetMember: 3,
+	}
+	client := &membershipReplicatedClient{state: state,
+		response: &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedMembershipAccepted, HasState: true, State: state}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ApplyMembership(context.Background(), route, membership)
+	if err != nil || result.State != state || client.membership != membership {
+		t.Fatalf("accepted result=%+v err=%v sent=%+v", result, err, client.membership)
+	}
+	client.err = errors.New("lost after write")
+	client.response = nil
+	_, err = executor.ApplyMembership(context.Background(), route, membership)
+	if !errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("transport outcome = %v", err)
+	}
+}
+
 func (client *failingReplicatedClient) DoReplicated(
 	_ context.Context,
 	_ string,
