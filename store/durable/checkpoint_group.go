@@ -363,11 +363,13 @@ var (
 // make a crash in that seam indistinguishable from loss of a live certificate.
 //
 // The caller must invoke this before durably publishing checkpoint-group
-// activation intent. This method proves that no live marker record or recovery
-// journal can depend on the old marker identity, then namespace-safely removes
-// and remints only a nonzero-base marker. Base zero is an exact no-op after the
-// same discharge proof. Any uncertain remove/remint outcome poisons the live
-// log and every registered collection; reopen is then the only recovery path.
+// activation intent. This method first proves that no live marker record or
+// conditional journal can depend on the old marker identity. It then folds and
+// syncs every registered ordinary journal before namespace-safely removing and
+// reminting only a nonzero-base marker. A clean base-zero owner is an exact
+// no-op; a base-zero owner with ordinary staged data is folded without changing
+// marker identity. Any uncertain remove/remint outcome poisons the live log and
+// every registered collection; reopen is then the only recovery path.
 func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
 	if l == nil {
 		return fmt.Errorf("vibedb: transaction log directory is not open")
@@ -408,10 +410,45 @@ func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
 		}
 	}()
 	for _, collection := range registered {
-		if collection == nil || collection.closed || collection.journal == nil ||
-			collection.journal.Cursor() != 0 {
+		if collection == nil || collection.closed || collection.journal == nil {
 			return fmt.Errorf(
-				"%w: checkpoint activation requires clean registered journals",
+				"%w: checkpoint activation requires live registered journals",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	// Refuse a live marker before folding an unrelated ordinary journal. Besides
+	// minimizing work on a rejected activation, this keeps a marker-integrity
+	// refusal byte-stable and makes the ordering independently testable.
+	if l.marker != nil {
+		if err := l.verifyMarkerDirectoryLocked(); err != nil {
+			return err
+		}
+		decisions, err := rescanTxnLogMarker(l)
+		if err != nil {
+			return err
+		}
+		if decisions == nil || decisions.MaxTxnID() != 0 ||
+			decisions.MaxDCSN() != 0 || decisions.RetirementCount() != 0 ||
+			l.marker.Cursor() != 0 || l.undischarged != 0 {
+			return fmt.Errorf(
+				"%w: checkpoint activation requires a discharged transaction marker",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
+	// A nil resolver is legal only after a complete directory-wide scan proves
+	// that every live journal record is ordinary. All registered writers and the
+	// transaction commit fence remain held across the scan and folds, so no
+	// conditional can appear between proof and consumption.
+	for _, collection := range registered {
+		holds, err := collection.journalHoldsAnyConditional()
+		if err != nil {
+			return err
+		}
+		if holds {
+			return fmt.Errorf(
+				"%w: checkpoint activation registered journal retains a conditional",
 				ErrCheckpointGroupCorrupt,
 			)
 		}
@@ -426,6 +463,23 @@ func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
 			ErrCheckpointGroupCorrupt,
 		)
 	}
+	for _, collection := range registered {
+		if collection.journal.Cursor() == 0 {
+			continue
+		}
+		if err := collection.checkpointPastConditionalsLocked(nil, 0); err != nil {
+			return fmt.Errorf(
+				"vibedb: fold registered journal before checkpoint activation: %w",
+				err,
+			)
+		}
+		if collection.journal.Cursor() != 0 {
+			return fmt.Errorf(
+				"%w: checkpoint activation fold left a live registered journal",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+	}
 	if l.marker == nil {
 		if err := l.ensureMintedLocked(); err != nil {
 			return l.poisonCheckpointGroupActivationBaselineLocked(err)
@@ -434,21 +488,6 @@ func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
 			return l.poisonCheckpointGroupActivationBaselineLocked(err)
 		}
 		return nil
-	}
-	if err := l.verifyMarkerDirectoryLocked(); err != nil {
-		return err
-	}
-	decisions, err := rescanTxnLogMarker(l)
-	if err != nil {
-		return err
-	}
-	if decisions == nil || decisions.MaxTxnID() != 0 ||
-		decisions.MaxDCSN() != 0 || decisions.RetirementCount() != 0 ||
-		l.marker.Cursor() != 0 || l.undischarged != 0 {
-		return fmt.Errorf(
-			"%w: checkpoint activation requires a discharged transaction marker",
-			ErrCheckpointGroupCorrupt,
-		)
 	}
 	if l.marker.Header().BaseSequence == 0 {
 		return nil

@@ -1277,6 +1277,26 @@ func (c *Collection) journalHoldsConditional(
 	return found, err
 }
 
+// journalHoldsAnyConditional reports whether the live window contains any
+// database-transaction prepare. The caller holds writer. Checkpoint-group cold
+// activation uses this before folding ordinary journals with a nil decision
+// resolver; keeping the proof on the already-open journal also covers opaque
+// caller-owned filenames that a conservative directory namespace scan must
+// deliberately ignore.
+func (c *Collection) journalHoldsAnyConditional() (bool, error) {
+	if !c.journalEnabled() || c.journal.Cursor() == 0 {
+		return false, nil
+	}
+	found := false
+	err := c.journal.Replay(c.journal.BaseGeneration(), func(rec storeio.RecoveryRecord) error {
+		if rec.Kind == storeio.RecoveryRecordKindConditionalBatch {
+			found = true
+		}
+		return nil
+	})
+	return found, err
+}
+
 // checkpointPastConditionalsLocked performs one bounded foreground checkpoint
 // plus recycle that folds the live window past every conditional record. Used
 // by the collection-retirement barrier and laggard folding under decision-log

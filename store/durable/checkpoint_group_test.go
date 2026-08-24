@@ -420,6 +420,199 @@ func TestCheckpointGroupActivationBaselineResetsRecycledGenericMarker(t *testing
 	t.Cleanup(func() { _ = group.Close() })
 }
 
+func TestCheckpointGroupActivationBaselineFoldsOrdinaryJournals(t *testing.T) {
+	tests := []struct {
+		name     string
+		recycled bool
+	}{
+		{name: "base-zero"},
+		{name: "recycled-marker", recycled: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+			for _, member := range members {
+				if err := log.AdoptCollection(member.Collection); err != nil {
+					t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+				}
+			}
+			if err := log.EnsureMinted(); err != nil {
+				t.Fatal(err)
+			}
+			if test.recycled {
+				if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
+					t.Fatal(err)
+				}
+				if err := log.marker.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				header := log.marker.Header()
+				if err := log.marker.Recycle(header.Epoch + 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := log.marker.Header()
+			for i, member := range members {
+				key := []byte("ordinary-" + member.Name)
+				document := []byte(`{"n":` + strconv.Itoa(i+1) + `}`)
+				if _, err := member.Collection.Put(key, document); err != nil {
+					t.Fatalf("Put(%s): %v", member.Name, err)
+				}
+				if member.Collection.journal.Cursor() == 0 {
+					t.Fatalf("%s ordinary write did not retain a journal", member.Name)
+				}
+			}
+
+			if err := log.ResetDischargedForCheckpointGroupActivation(); err != nil {
+				t.Fatalf("ResetDischargedForCheckpointGroupActivation: %v", err)
+			}
+			after := log.marker.Header()
+			if test.recycled {
+				if after.MarkerID == before.MarkerID || after.BaseSequence != 0 ||
+					after.Epoch != 1 || after.RecycleCount != 1 {
+					t.Fatalf("recycled activation marker = %+v, prior %+v", after, before)
+				}
+			} else if after != before {
+				t.Fatalf("base-zero activation changed marker: before=%+v after=%+v",
+					before, after)
+			}
+			for i, member := range members {
+				if member.Collection.journal.Cursor() != 0 {
+					t.Fatalf("%s activation left journal cursor %d",
+						member.Name, member.Collection.journal.Cursor())
+				}
+				key := "ordinary-" + member.Name
+				want := `{"n":` + strconv.Itoa(i+1) + `}`
+				if got, ok := collectionDoc(t, member.Collection, key); !ok || got != want {
+					t.Fatalf("%s live row = %q,%v, want %q", member.Name, got, ok, want)
+				}
+			}
+
+			// A crash after the folds but before SQL publishes its descriptor must
+			// remain an ordinary generic image with the exact imported rows.
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+			reopened, recoveredLog, err := OpenCollectionsWithTransactions(
+				crashImage, TxnLogOptions{}, requests,
+			)
+			if err != nil {
+				t.Fatalf("generic reopen after activation folds: %v", err)
+			}
+			for i, collection := range reopened {
+				key := "ordinary-" + members[i].Name
+				want := `{"n":` + strconv.Itoa(i+1) + `}`
+				if got, ok := collectionDoc(t, collection, key); !ok || got != want {
+					t.Fatalf("reopened %s row = %q,%v, want %q",
+						members[i].Name, got, ok, want)
+				}
+				if err := collection.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := recoveredLog.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, file := range files {
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupActivationBaselineConditionalRefusalIsByteStable(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := members[0].Collection.Put(
+		[]byte("ordinary"), []byte(`{"n":1}`),
+	); err != nil {
+		t.Fatal(err)
+	}
+	header := log.marker.Header()
+	prepareUnpublishedOn(
+		t, members[1].Collection, header.MarkerID, header.Epoch, 1,
+		"conditional", `{"n":2}`,
+	)
+	before := checkpointGroupDirectoryBytes(t, dir)
+	if err := log.ResetDischargedForCheckpointGroupActivation(); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("conditional activation baseline = %v, want ErrCheckpointGroupCorrupt", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, before)
+}
+
+func TestCheckpointGroupActivationBaselineFoldFailureReopensGeneric(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	for _, member := range members {
+		if err := log.AdoptCollection(member.Collection); err != nil {
+			t.Fatalf("AdoptCollection(%s): %v", member.Name, err)
+		}
+		if _, err := member.Collection.Put(
+			[]byte("ordinary-"+member.Name), []byte(`{"n":1}`),
+		); err != nil {
+			t.Fatalf("Put(%s): %v", member.Name, err)
+		}
+	}
+	if err := log.EnsureMinted(); err != nil {
+		t.Fatal(err)
+	}
+	beforeMarker := log.marker.Header()
+	order := []*Collection{members[0].Collection, members[1].Collection}
+	sortCollectionSnapshotOrder(order)
+	fault := storeio.NewFaultJournal(order[1].journal)
+	fault.Program(storeio.JournalFaultPlan{Phase: storeio.JournalFaultENOSPCRecycle})
+
+	err := log.ResetDischargedForCheckpointGroupActivation()
+	if err == nil || !fault.Faulted() || order[1].PersistenceError() == nil ||
+		!errors.Is(err, order[1].PersistenceError()) {
+		t.Fatalf("activation fold fault = %v, faulted=%v", err, fault.Faulted())
+	}
+	if order[0].journal.Cursor() != 0 || order[1].journal.Cursor() == 0 {
+		t.Fatalf("partial activation fold cursors = %d,%d, want clean/live",
+			order[0].journal.Cursor(), order[1].journal.Cursor())
+	}
+	if after := log.marker.Header(); after != beforeMarker {
+		t.Fatalf("journal fold failure changed marker: before=%+v after=%+v",
+			beforeMarker, after)
+	}
+
+	// The first member may already be folded and the second member's root may
+	// already be durable when its recycle fails. The unchanged generic
+	// marker plus the retained second journal must still recover both rows.
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+	reopened, recoveredLog, openErr := OpenCollectionsWithTransactions(
+		crashImage, TxnLogOptions{}, requests,
+	)
+	if openErr != nil {
+		t.Fatalf("generic reopen after activation fold fault: %v", openErr)
+	}
+	for i, collection := range reopened {
+		key := "ordinary-" + members[i].Name
+		if got, ok := collectionDoc(t, collection, key); !ok || got != `{"n":1}` {
+			t.Fatalf("reopened %s row = %q,%v", members[i].Name, got, ok)
+		}
+		if err := collection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := recoveredLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestCheckpointGroupActivationBaselineZeroBaseIsExactNoOp(t *testing.T) {
 	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
 	for _, member := range members {
@@ -473,6 +666,14 @@ func TestCheckpointGroupActivationBaselineRefusesLiveMarker(t *testing.T) {
 	}
 	if err := log.EnsureMinted(); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := members[0].Collection.Put(
+		[]byte("ordinary"), []byte(`{"n":1}`),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if members[0].Collection.journal.Cursor() == 0 {
+		t.Fatal("ordinary refusal witness did not retain a journal")
 	}
 	if _, err := log.marker.AppendRetirement([16]byte{0x7f}); err != nil {
 		t.Fatal(err)
