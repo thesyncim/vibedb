@@ -21,7 +21,8 @@ const (
 	snapshotArtifactRowHeaderBytes   = 8
 
 	// DefaultSnapshotArtifactChunkBytes bounds the ordinary retained transfer
-	// buffer. A single larger row is emitted alone, up to the fixed row bound.
+	// buffer. A single larger row is emitted alone from borrowed row segments,
+	// up to the fixed row bound.
 	DefaultSnapshotArtifactChunkBytes = 4 << 20
 	// MinSnapshotArtifactChunkBytes prevents pathological framing overhead.
 	MinSnapshotArtifactChunkBytes = 4 << 10
@@ -61,10 +62,10 @@ type SnapshotArtifactCollection uint8
 
 // SnapshotArtifactOptions controls deterministic chunk packing and optional
 // caller-owned workspace. Zero TargetChunkBytes selects the default. Rows are
-// never fragmented. When PayloadBuffer is non-nil, its capacity must cover the
-// target and its contents are borrowed and overwritten for the call. Supplying
-// capacity through MaxSnapshotArtifactChunkBytes prevents even an exceptional
-// maximum-sized row from growing the buffer.
+// never split across logical chunks. When PayloadBuffer is non-nil, its
+// capacity must cover the target and its contents are borrowed and overwritten
+// for the call. A larger exceptional row is hashed and written directly from
+// its borrowed key and value without entering this buffer.
 type SnapshotArtifactOptions struct {
 	TargetChunkBytes int
 	PayloadBuffer    []byte
@@ -88,10 +89,10 @@ func ValidateSnapshotArtifactOptions(options SnapshotArtifactOptions) error {
 	return nil
 }
 
-// RequiredSnapshotArtifactPayloadCapacity returns the smallest payload-buffer
-// capacity that cannot grow while writing rows from one collection with the
-// supplied frozen key and document bounds. Zero targetChunkBytes selects the
-// default artifact target.
+// RequiredSnapshotArtifactPayloadCapacity validates one collection's frozen
+// key and document bounds and returns the fixed aggregate payload capacity.
+// Exceptional rows above that target are streamed directly and cannot grow the
+// aggregate. Zero targetChunkBytes selects the default artifact target.
 func RequiredSnapshotArtifactPayloadCapacity(
 	targetChunkBytes int,
 	maxKeyBytes int,
@@ -112,10 +113,7 @@ func RequiredSnapshotArtifactPayloadCapacity(
 			maxDocumentBytes,
 		)
 	}
-	return max(
-		target,
-		snapshotArtifactRowHeaderBytes+maxKeyBytes+maxDocumentBytes,
-	), nil
+	return target, nil
 }
 
 // SnapshotArtifactCheckpoint is emitted after one complete chunk has passed
@@ -137,7 +135,8 @@ type SnapshotArtifactCheckpoint struct {
 // immutable resume cursor; it must return only after the corresponding row
 // effects and cursor are durably ordered. PayloadBuffer is optional caller-owned
 // workspace and is overwritten for the call. Capacity through
-// MaxSnapshotArtifactChunkBytes prevents growth for every valid artifact.
+// MaxSnapshotArtifactChunkBytes prevents verifier growth for every valid
+// artifact.
 type SnapshotArtifactCallbacks struct {
 	BeginChunk    func(checkpoint SnapshotArtifactCheckpoint) error
 	Row           func(collection SnapshotArtifactCollection, key, value []byte) error
@@ -276,6 +275,9 @@ type snapshotArtifactWriter struct {
 	encodedBytes   uint64
 	headerDigest   [sha256.Size]byte
 	previousDigest [sha256.Size]byte
+	chunkHeader    [snapshotArtifactChunkHeaderBytes]byte
+	rowHeader      [snapshotArtifactRowHeaderBytes]byte
+	chunkDigest    [sha256.Size]byte
 	image          *canonicalImageHasher
 }
 
@@ -418,6 +420,9 @@ func (w *snapshotArtifactWriter) writeCollection(
 				return err
 			}
 		}
+		if rowBytes > w.target {
+			return w.writeExceptionalRow(key, value, rowBytes)
+		}
 		w.payload = binary.LittleEndian.AppendUint32(w.payload, uint32(len(key)))
 		w.payload = binary.LittleEndian.AppendUint32(w.payload, uint32(len(value)))
 		w.payload = append(w.payload, key...)
@@ -450,55 +455,127 @@ func (w *snapshotArtifactWriter) flush() error {
 		}
 		return nil
 	}
-	if w.chunkRows == 0 || len(w.payload) > MaxSnapshotArtifactChunkBytes ||
-		w.chunks == math.MaxUint64 {
-		return fmt.Errorf("%w: chunk counters", ErrSnapshotArtifactBound)
+	total, err := w.prepareChunk(len(w.payload), w.chunkRows)
+	if err != nil {
+		return err
 	}
-	total := snapshotArtifactChunkHeaderBytes + len(w.payload) + sha256.Size
-	var header [snapshotArtifactChunkHeaderBytes]byte
-	copy(header[0:8], snapshotArtifactChunkMagic[:])
-	binary.LittleEndian.PutUint16(header[8:10], snapshotArtifactFormat)
-	binary.LittleEndian.PutUint16(header[10:12], snapshotArtifactChunkHeaderBytes)
-	binary.LittleEndian.PutUint32(header[12:16], uint32(total))
-	binary.LittleEndian.PutUint64(header[16:24], w.chunks)
-	header[24] = byte(w.collection)
-	binary.LittleEndian.PutUint32(header[28:32], w.chunkRows)
-	binary.LittleEndian.PutUint32(header[32:36], uint32(len(w.payload)))
-	copy(header[48:80], w.previousDigest[:])
-	digest := snapshotArtifactDigestParts(snapshotArtifactChunkDomain, header[:], w.payload)
-	rows := uint64(w.chunkRows)
-	if w.collection == SnapshotArtifactSystem {
-		if w.systemRows > math.MaxUint64-rows {
-			return fmt.Errorf("%w: system rows", ErrSnapshotArtifactBound)
-		}
-		w.systemRows += rows
-	} else {
-		if w.userRows > math.MaxUint64-rows {
-			return fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
-		}
-		w.userRows += rows
-	}
-	payloadBytes := uint64(len(w.payload))
-	if w.payloadBytes > math.MaxUint64-payloadBytes ||
-		w.encodedBytes > math.MaxUint64-uint64(total) {
-		return fmt.Errorf("%w: artifact counters", ErrSnapshotArtifactBound)
-	}
-	if err := writeSnapshotArtifactBytes(w.w, header[:]); err != nil {
+	w.chunkDigest = snapshotArtifactDigestParts(
+		snapshotArtifactChunkDomain,
+		w.chunkHeader[:],
+		w.payload,
+	)
+	if err := writeSnapshotArtifactBytes(w.w, w.chunkHeader[:]); err != nil {
 		return err
 	}
 	if err := writeSnapshotArtifactBytes(w.w, w.payload); err != nil {
 		return err
 	}
-	if err := writeSnapshotArtifactBytes(w.w, digest[:]); err != nil {
+	if err := writeSnapshotArtifactBytes(w.w, w.chunkDigest[:]); err != nil {
 		return err
 	}
-	w.payloadBytes += payloadBytes
-	w.encodedBytes += uint64(total)
-	w.chunks++
-	w.previousDigest = digest
+	w.commitChunk(len(w.payload), w.chunkRows, total, w.chunkDigest)
 	w.payload = w.payload[:0]
 	w.chunkRows = 0
 	return nil
+}
+
+func (w *snapshotArtifactWriter) writeExceptionalRow(
+	key []byte,
+	value []byte,
+	rowBytes int,
+) error {
+	actualRowBytes, validRow := snapshotArtifactRowBytes(key, value)
+	if len(w.payload) != 0 || w.chunkRows != 0 || rowBytes <= w.target ||
+		!validRow || actualRowBytes != rowBytes {
+		return fmt.Errorf("%w: exceptional row state", ErrSnapshotArtifact)
+	}
+	total, err := w.prepareChunk(rowBytes, 1)
+	if err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint32(w.rowHeader[0:4], uint32(len(key)))
+	binary.LittleEndian.PutUint32(w.rowHeader[4:8], uint32(len(value)))
+	h := sha256.New()
+	_, _ = h.Write(snapshotArtifactChunkDomain)
+	_, _ = h.Write(w.chunkHeader[:])
+	_, _ = h.Write(w.rowHeader[:])
+	_, _ = h.Write(key)
+	_, _ = h.Write(value)
+	_ = h.Sum(w.chunkDigest[:0])
+	if err := writeSnapshotArtifactBytes(w.w, w.chunkHeader[:]); err != nil {
+		return err
+	}
+	if err := writeSnapshotArtifactBytes(w.w, w.rowHeader[:]); err != nil {
+		return err
+	}
+	if err := writeSnapshotArtifactBytes(w.w, key); err != nil {
+		return err
+	}
+	if err := writeSnapshotArtifactBytes(w.w, value); err != nil {
+		return err
+	}
+	if err := writeSnapshotArtifactBytes(w.w, w.chunkDigest[:]); err != nil {
+		return err
+	}
+	w.commitChunk(rowBytes, 1, total, w.chunkDigest)
+	return nil
+}
+
+func (w *snapshotArtifactWriter) prepareChunk(
+	payloadBytes int,
+	rows uint32,
+) (int, error) {
+	clear(w.chunkHeader[:])
+	if rows == 0 || payloadBytes <= 0 ||
+		payloadBytes > MaxSnapshotArtifactChunkBytes || w.chunks == math.MaxUint64 {
+		return 0, fmt.Errorf("%w: chunk counters", ErrSnapshotArtifactBound)
+	}
+	rowCount := uint64(rows)
+	switch w.collection {
+	case SnapshotArtifactSystem:
+		if w.systemRows > math.MaxUint64-rowCount {
+			return 0, fmt.Errorf("%w: system rows", ErrSnapshotArtifactBound)
+		}
+	case SnapshotArtifactUser:
+		if w.userRows > math.MaxUint64-rowCount {
+			return 0, fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
+		}
+	default:
+		return 0, fmt.Errorf("%w: chunk collection", ErrSnapshotArtifactBound)
+	}
+	total := snapshotArtifactChunkHeaderBytes + payloadBytes + sha256.Size
+	if uint64(total) > math.MaxUint32 ||
+		w.payloadBytes > math.MaxUint64-uint64(payloadBytes) ||
+		w.encodedBytes > math.MaxUint64-uint64(total) {
+		return 0, fmt.Errorf("%w: artifact counters", ErrSnapshotArtifactBound)
+	}
+	copy(w.chunkHeader[0:8], snapshotArtifactChunkMagic[:])
+	binary.LittleEndian.PutUint16(w.chunkHeader[8:10], snapshotArtifactFormat)
+	binary.LittleEndian.PutUint16(w.chunkHeader[10:12], snapshotArtifactChunkHeaderBytes)
+	binary.LittleEndian.PutUint32(w.chunkHeader[12:16], uint32(total))
+	binary.LittleEndian.PutUint64(w.chunkHeader[16:24], w.chunks)
+	w.chunkHeader[24] = byte(w.collection)
+	binary.LittleEndian.PutUint32(w.chunkHeader[28:32], rows)
+	binary.LittleEndian.PutUint32(w.chunkHeader[32:36], uint32(payloadBytes))
+	copy(w.chunkHeader[48:80], w.previousDigest[:])
+	return total, nil
+}
+
+func (w *snapshotArtifactWriter) commitChunk(
+	payloadBytes int,
+	rows uint32,
+	total int,
+	digest [sha256.Size]byte,
+) {
+	if w.collection == SnapshotArtifactSystem {
+		w.systemRows += uint64(rows)
+	} else {
+		w.userRows += uint64(rows)
+	}
+	w.payloadBytes += uint64(payloadBytes)
+	w.encodedBytes += uint64(total)
+	w.chunks++
+	w.previousDigest = digest
 }
 
 func (w *snapshotArtifactWriter) writeFooter(

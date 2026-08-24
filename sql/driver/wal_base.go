@@ -18,10 +18,11 @@ var walBasePreparationDomain = []byte("vibedb/sql/wal-base-preparation/fixed\x00
 
 // WALBaseCaptureOptions controls only caller-owned bounded scan workspace.
 // Artifact framing is fixed by CaptureWALBase and has no alternate grammar.
-// Workspace is required. Its capacity must cover the exact no-growth payload
-// bound derived from both collections' frozen key and document limits. Storage
-// checkpointing and raw overflow-row traversal use separate bounded engine
-// scratch.
+// Workspace is required. Both collections' frozen key and document limits are
+// validated before sealing, then its capacity must cover the fixed aggregate
+// chunk target. Exceptional rows stream directly from borrowed engine bytes.
+// Storage checkpointing and raw overflow-row traversal use separate bounded
+// engine scratch.
 type WALBaseCaptureOptions struct {
 	Workspace []byte
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/replication"
 )
 
 var (
@@ -252,7 +254,7 @@ func BenchmarkOpenSessionSlot(b *testing.B) {
 func BenchmarkWriteSnapshotArtifact(b *testing.B) {
 	_, snapshot := snapshotArtifactFixture(b)
 	options := SnapshotArtifactOptions{
-		PayloadBuffer: make([]byte, 0, MaxSnapshotArtifactChunkBytes),
+		PayloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
 	}
 	var err error
 	artifactSink, err = WriteSnapshotArtifact(io.Discard, snapshot, options)
@@ -265,6 +267,28 @@ func BenchmarkWriteSnapshotArtifact(b *testing.B) {
 	for b.Loop() {
 		artifactSink, err = WriteSnapshotArtifact(io.Discard, snapshot, options)
 		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteSnapshotArtifactExceptionalRow(b *testing.B) {
+	key := bytes.Repeat([]byte{'k'}, replication.MaxMutationKeyBytes)
+	value := bytes.Repeat([]byte{'v'}, replication.MaxMutationValueBytes)
+	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	if !ok || rowBytes != MaxSnapshotArtifactChunkBytes {
+		b.Fatalf("maximum exceptional row = %d, %t", rowBytes, ok)
+	}
+	writer := snapshotArtifactWriter{
+		w: io.Discard, target: DefaultSnapshotArtifactChunkBytes,
+		payload:    make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
+		collection: SnapshotArtifactUser,
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(rowBytes))
+	b.ResetTimer()
+	for b.Loop() {
+		if err := writer.writeExceptionalRow(key, value, rowBytes); err != nil {
 			b.Fatal(err)
 		}
 	}

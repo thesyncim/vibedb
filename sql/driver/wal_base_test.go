@@ -215,7 +215,7 @@ func TestReplicatedApplyCaptureWALBaseRejectsWorkspaceBeforeSeal(t *testing.T) {
 	core.mu.RUnlock()
 	before := group.Stats()
 	required := requiredWALBaseWorkspaceBytes(t, claim, base)
-	if required != replicatedstate.MaxSnapshotArtifactChunkBytes {
+	if required != replicatedstate.DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf("fixture workspace requirement = %d", required)
 	}
 	preparation, err := claim.CaptureWALBase(WALBaseCaptureOptions{
@@ -290,8 +290,8 @@ func TestReplicatedApplyCaptureWALBaseMaxLegalRowHasNoPayloadGrowth(t *testing.T
 	}
 
 	required := requiredWALBaseWorkspaceBytes(t, claim, base)
-	if required != len(key)+len(document)+8 ||
-		required != replicatedstate.MaxSnapshotArtifactChunkBytes {
+	if len(key)+len(document)+8 != replicatedstate.MaxSnapshotArtifactChunkBytes ||
+		required != replicatedstate.DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf(
 			"exact maximum-row workspace = %d, key/document = %d/%d",
 			required,
