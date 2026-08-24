@@ -96,7 +96,8 @@ func (t CapturedTransition) Bounds() TransitionCaptureBounds {
 // TransitionCapture encodes one exact publication into a private collection
 // row that the Machine commits atomically with its state and user mutations.
 // Implementations must be serial, deterministic, and must not retain the
-// borrowed transition. AppendTransition appends one valid JSON document.
+// borrowed transition. The target collection's value grammar belongs to the
+// implementation; AppendTransition appends one complete value.
 // Published runs after the source and capture record are durable; an error
 // poisons apply and requires reopen, but cannot roll back that publication.
 type TransitionCapture interface {

@@ -315,6 +315,7 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 		MaxDocumentBytes: 4096, MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
 	captureCollection := create("capture", durable.Options{
+		OpaqueValues:     true,
 		MaxDocumentBytes: 128 << 10, MaxBatchDocuments: 1, MaxBatchBytes: 256 << 10,
 	})
 	target := func(collection *durable.Collection) replicatedstate.CollectionTarget {

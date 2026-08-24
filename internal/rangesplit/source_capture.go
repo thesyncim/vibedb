@@ -3,18 +3,19 @@ package rangesplit
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"hash"
 	"math"
-	"strconv"
+	"slices"
 	"sync"
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 var ErrSourceCapture = errors.New("rangesplit: invalid source transition capture")
@@ -25,12 +26,32 @@ var (
 )
 
 const (
-	sourceCaptureHeaderKind   = uint64(1)
-	sourceCaptureEntryKind    = uint64(2)
-	sourceCaptureHeaderKey    = uint64(0)
-	sourceCaptureArrayFields  = 15
-	sourceCaptureHeaderFields = 14
+	// sourceCaptureFormat is the sole current-format corruption sentinel. Zero
+	// selects the only grammar; every other value fails closed rather than
+	// dispatching to a compatibility decoder.
+	sourceCaptureFormat = uint16(0)
+
+	sourceCaptureHeaderKind = uint8(1)
+	sourceCaptureEntryKind  = uint8(2)
+	sourceCaptureHeaderKey  = uint64(0)
+
+	sourceCaptureEnvelopeBytes         = 16
+	sourceCaptureHeaderFixedBytes      = 264
+	sourceCaptureEntryFixedBytes       = 248
+	sourceCaptureTransitionHeaderBytes = 16
+
+	sourceCaptureBeforePresent = uint8(1 << 0)
+	sourceCaptureAfterPresent  = uint8(1 << 1)
+	sourceCapturePresenceMask  = sourceCaptureBeforePresent | sourceCaptureAfterPresent
 )
+
+var sourceCaptureMagic = [8]byte{'V', 'D', 'B', 'C', 'A', 'P', 0, 0}
+
+// Both record kinds start with magic[8], format[2], kind[1], reserved[1], and
+// totalBytes[4]. Bytes 16:20 are the collection length or transition count;
+// bytes 20:24 are reserved. Header metadata occupies bytes 24:264 before the
+// collection. Entry metadata and all five digests occupy bytes 24:248 before
+// the packed transition frames.
 
 type sourceCapturePublication struct {
 	applied         uint64
@@ -43,8 +64,8 @@ type sourceCapturePublication struct {
 }
 
 // SourceCapture stores every exact before-and-after source transition in one
-// private durable collection. The replicated state machine commits the record
-// in the same multi-collection transaction as the source publication.
+// private opaque durable collection. The replicated state machine commits the
+// record in the same multi-collection transaction as the source publication.
 type SourceCapture struct {
 	mu sync.Mutex
 
@@ -60,17 +81,16 @@ type SourceCapture struct {
 	head        atomic.Uint64
 }
 
-// SourceCaptureWorkspace owns all decode, base64, transition, and SHA state.
-// Reuse it serially. Returned TailEntry slices remain valid until its next use.
+// SourceCaptureWorkspace owns all raw read, transition, and SHA state. Reuse it
+// serially. Returned TailEntry slices borrow its raw buffer and remain valid
+// until the workspace's next use.
 type SourceCaptureWorkspace struct {
 	raw         []byte
-	entries     []vibejson.IndexEntry
-	decoded     []byte
 	transitions []TailTransition
 	record      sourceCaptureEntry
 	hasher      hash.Hash
 	digest      [sha256.Size]byte
-	fixed       [72]byte
+	fixed       [144]byte
 	size        [8]byte
 	key         [8]byte
 }
@@ -81,7 +101,8 @@ func NewSourceCapture(
 	name string,
 	collection *durable.Collection,
 ) (*SourceCapture, error) {
-	if partitioner == nil || name == "" || collection == nil {
+	if partitioner == nil || name == "" || collection == nil ||
+		!collection.HasOpaqueValues() {
 		return nil, ErrSourceCapture
 	}
 	return &SourceCapture{
@@ -99,45 +120,26 @@ func (c *SourceCapture) Target() replicatedstate.TransitionCaptureTarget {
 	return c.target
 }
 
-// MaxEncodedBytes returns a conservative exact-format bound. Before and after
-// documents use raw base64 JSON strings so a valid maximum-depth user document
-// remains valid inside the capture envelope.
+// MaxEncodedBytes returns the exact raw-binary size implied by bounds.
 func (c *SourceCapture) MaxEncodedBytes(
 	bounds replicatedstate.TransitionCaptureBounds,
 ) (int, error) {
 	if c == nil || bounds.Transitions > replicatedstate.MaxDistinctMutations {
 		return 0, ErrSourceCapture
 	}
-	// Fixed metadata, punctuation, eight uint64 spellings, five digests, and
-	// one plan-independent safety margin for the compact array grammar.
-	total := uint64(640)
-	add := func(value uint64) bool {
-		if total > math.MaxUint64-value {
-			return false
+	total := uint64(sourceCaptureEntryFixedBytes)
+	for _, addition := range [...]uint64{
+		bounds.Transitions * sourceCaptureTransitionHeaderBytes,
+		bounds.KeyBytes,
+		bounds.BeforeBytes,
+		bounds.AfterBytes,
+	} {
+		if total > math.MaxUint32 || addition > math.MaxUint32-total {
+			return 0, ErrSourceCapture
 		}
-		total += value
-		return true
+		total += addition
 	}
-	encoded := func(raw, values uint64) (uint64, bool) {
-		if values > (math.MaxUint64-raw)/2 {
-			return 0, false
-		}
-		adjusted := raw + 2*values
-		if adjusted > math.MaxUint64/4*3 {
-			return 0, false
-		}
-		return 4 * (adjusted / 3), true
-	}
-	keys, ok := encoded(bounds.KeyBytes, bounds.Transitions)
-	if !ok || !add(keys) || !add(12*bounds.Transitions) {
-		return 0, ErrSourceCapture
-	}
-	before, ok := encoded(bounds.BeforeBytes, bounds.Transitions)
-	if !ok || !add(before) {
-		return 0, ErrSourceCapture
-	}
-	after, ok := encoded(bounds.AfterBytes, bounds.Transitions)
-	if !ok || !add(after) || total > uint64(math.MaxInt) {
+	if total > uint64(math.MaxInt) {
 		return 0, ErrSourceCapture
 	}
 	return int(total), nil
@@ -253,6 +255,7 @@ func (c *SourceCapture) NextTailEntry(
 	workspace.raw = raw
 	record, err := c.decodeEntry(raw, workspace)
 	if err != nil || record.Applied != next ||
+		record.Term < cursor.term ||
 		record.PreviousEntryDigest != cursor.entryDigest ||
 		record.BeforeDataChainDigest != cursor.dataChainDigest ||
 		record.BeforeOwnershipEpoch != cursor.ownershipEpoch ||
@@ -304,34 +307,35 @@ func (c *SourceCapture) appendHeader(
 		EntryDigest: state.LastEntryDigest, Applied: state.Applied,
 		Term: state.LastTerm, RouteGeneration: state.Binding.RouteGeneration,
 	}
-	if cut.Applied == 0 || cut.Term == 0 || cut.DataChainDigest == ([32]byte{}) ||
-		cut.BaseDigest == ([32]byte{}) || cut.EntryDigest == ([32]byte{}) {
+	collection := byteview.Bytes(c.partitioner.collection)
+	total := uint64(sourceCaptureHeaderFixedBytes) + uint64(len(collection))
+	if cut.Applied == 0 || cut.Applied == math.MaxUint64 ||
+		cut.Term == 0 || cut.Term == math.MaxUint64 ||
+		state.Binding.OwnershipEpoch == 0 || state.Binding.RoutingVersion == 0 ||
+		state.Binding.RouteGeneration == 0 || uint64(c.partitioner.target) == 0 ||
+		cut.DataChainDigest == ([32]byte{}) || cut.BaseDigest == ([32]byte{}) ||
+		cut.EntryDigest == ([32]byte{}) || len(collection) == 0 ||
+		len(collection) > replication.MaxCollectionBytes ||
+		total > math.MaxUint32 || total > uint64(math.MaxInt) {
 		return dst, ChildArtifactSourceCut{}, ErrSourceCapture
 	}
 	digest := c.hashHeader(state, workspace)
-	dst = append(dst, '[')
-	dst = strconv.AppendUint(dst, sourceCaptureHeaderKind, 10)
-	dst = append(dst, ',')
-	dst = appendBase64String(dst, c.partitioner.digest[:])
-	dst = append(dst, ',')
-	dst = appendBase64String(dst, c.placement[:])
-	dst = append(dst, ',')
-	dst = appendBase64String(dst, []byte(c.partitioner.collection))
-	for _, value := range [][32]byte{state.DataChainDigest, state.SnapshotBaseDigest, state.LastEntryDigest} {
-		dst = append(dst, ',')
-		dst = appendBase64String(dst, value[:])
-	}
-	for _, value := range []uint64{
-		state.Applied, state.LastTerm, state.Binding.OwnershipEpoch,
-		state.Binding.RoutingVersion, state.Binding.RouteGeneration,
-		uint64(c.partitioner.target),
-	} {
-		dst = append(dst, ',')
-		dst = strconv.AppendUint(dst, value, 10)
-	}
-	dst = append(dst, ',')
-	dst = appendBase64String(dst, digest[:])
-	dst = append(dst, ']')
+	var frame []byte
+	dst, frame = appendSourceCaptureEnvelope(dst, sourceCaptureHeaderKind, int(total))
+	binary.LittleEndian.PutUint32(frame[16:20], uint32(len(collection)))
+	copy(frame[24:56], c.partitioner.digest[:])
+	copy(frame[56:88], c.placement[:])
+	copy(frame[88:120], state.DataChainDigest[:])
+	copy(frame[120:152], state.SnapshotBaseDigest[:])
+	copy(frame[152:184], state.LastEntryDigest[:])
+	copy(frame[184:216], digest[:])
+	binary.LittleEndian.PutUint64(frame[216:224], state.Applied)
+	binary.LittleEndian.PutUint64(frame[224:232], state.LastTerm)
+	binary.LittleEndian.PutUint64(frame[232:240], state.Binding.OwnershipEpoch)
+	binary.LittleEndian.PutUint64(frame[240:248], state.Binding.RoutingVersion)
+	binary.LittleEndian.PutUint64(frame[248:256], state.Binding.RouteGeneration)
+	binary.LittleEndian.PutUint64(frame[256:264], uint64(c.partitioner.target))
+	copy(frame[sourceCaptureHeaderFixedBytes:], collection)
 	return dst, cut, nil
 }
 
@@ -340,44 +344,72 @@ func (c *SourceCapture) appendEntry(
 	transition replicatedstate.CapturedTransition,
 	workspace *SourceCaptureWorkspace,
 ) ([]byte, error) {
+	encodedBytes, err := c.MaxEncodedBytes(transition.Bounds())
+	if err != nil {
+		return dst, err
+	}
+	var previous []byte
+	for index := 0; index < transition.MutationCount(); index++ {
+		mutation := transition.Mutation(index)
+		if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes ||
+			previous != nil && bytes.Compare(previous, mutation.Key) >= 0 ||
+			mutation.Before == nil && mutation.After == nil ||
+			mutation.Before != nil && (len(mutation.Before) == 0 ||
+				len(mutation.Before) > replication.MaxMutationValueBytes) ||
+			mutation.After != nil && (len(mutation.After) == 0 ||
+				len(mutation.After) > replication.MaxMutationValueBytes) {
+			return dst, ErrSourceCapture
+		}
+		previous = mutation.Key
+	}
 	digest := c.hashTransition(transition, workspace)
-	dst = append(dst, '[')
+	clear(workspace.transitions)
+	workspace.transitions = workspace.transitions[:0]
+	workspace.record.Transitions = nil
+	var frame []byte
+	dst, frame = appendSourceCaptureEnvelope(dst, sourceCaptureEntryKind, encodedBytes)
+	binary.LittleEndian.PutUint32(frame[16:20], uint32(transition.MutationCount()))
 	values := [...]uint64{
-		sourceCaptureEntryKind, transition.Applied, transition.Term,
+		transition.Applied, transition.Term,
 		transition.BeforeOwnershipEpoch, transition.AfterOwnershipEpoch,
 		transition.BeforeRoutingVersion, transition.AfterRoutingVersion,
 		transition.BeforeRouteGeneration, transition.AfterRouteGeneration,
 	}
 	for index, value := range values {
-		if index != 0 {
-			dst = append(dst, ',')
-		}
-		dst = strconv.AppendUint(dst, value, 10)
+		start := 24 + index*8
+		binary.LittleEndian.PutUint64(frame[start:start+8], value)
 	}
-	for _, value := range [][32]byte{
+	for index, value := range [][32]byte{
 		transition.PreviousEntryDigest, transition.EntryDigest,
-		transition.BeforeDataChainDigest, transition.AfterDataChainDigest,
+		transition.BeforeDataChainDigest, transition.AfterDataChainDigest, digest,
 	} {
-		dst = append(dst, ',')
-		dst = appendBase64String(dst, value[:])
+		start := 88 + index*sha256.Size
+		copy(frame[start:start+sha256.Size], value[:])
 	}
-	dst = append(dst, ',', '[')
+	cursor := sourceCaptureEntryFixedBytes
 	for index := 0; index < transition.MutationCount(); index++ {
-		if index != 0 {
-			dst = append(dst, ',')
-		}
 		mutation := transition.Mutation(index)
-		dst = append(dst, '[')
-		dst = appendBase64String(dst, mutation.Key)
-		dst = append(dst, ',')
-		dst = appendOptionalBase64String(dst, mutation.Before)
-		dst = append(dst, ',')
-		dst = appendOptionalBase64String(dst, mutation.After)
-		dst = append(dst, ']')
+		header := frame[cursor : cursor+sourceCaptureTransitionHeaderBytes]
+		if mutation.Before != nil {
+			header[0] |= sourceCaptureBeforePresent
+		}
+		if mutation.After != nil {
+			header[0] |= sourceCaptureAfterPresent
+		}
+		binary.LittleEndian.PutUint32(header[4:8], uint32(len(mutation.Key)))
+		binary.LittleEndian.PutUint32(header[8:12], uint32(len(mutation.Before)))
+		binary.LittleEndian.PutUint32(header[12:16], uint32(len(mutation.After)))
+		cursor += sourceCaptureTransitionHeaderBytes
+		copy(frame[cursor:], mutation.Key)
+		cursor += len(mutation.Key)
+		copy(frame[cursor:], mutation.Before)
+		cursor += len(mutation.Before)
+		copy(frame[cursor:], mutation.After)
+		cursor += len(mutation.After)
 	}
-	dst = append(dst, ']', ',')
-	dst = appendBase64String(dst, digest[:])
-	dst = append(dst, ']')
+	if cursor != len(frame) {
+		panic("rangesplit: source capture size invariant")
+	}
 	return dst, nil
 }
 
@@ -409,6 +441,7 @@ func (c *SourceCapture) recover(
 		}
 		record, err := c.decodeEntry(value, workspace)
 		if err != nil || record.Applied != applied ||
+			record.Term < publication.term ||
 			record.PreviousEntryDigest != publication.entryDigest ||
 			record.BeforeDataChainDigest != publication.dataChainDigest ||
 			record.BeforeOwnershipEpoch != publication.ownershipEpoch ||
@@ -430,34 +463,45 @@ func (c *SourceCapture) decodeHeader(
 	raw []byte,
 	workspace *SourceCaptureWorkspace,
 ) (ChildArtifactSourceCut, sourceCapturePublication, error) {
-	root, err := buildCaptureIndex(raw, workspace)
-	if err != nil {
-		return ChildArtifactSourceCut{}, sourceCapturePublication{}, err
-	}
-	count, ok := root.ArrayLen()
-	if !ok || count != sourceCaptureHeaderFields || nodeUint(root, 0) != sourceCaptureHeaderKind {
+	if !validSourceCaptureEnvelope(raw, sourceCaptureHeaderKind, sourceCaptureHeaderFixedBytes) ||
+		binary.LittleEndian.Uint32(raw[20:24]) != 0 {
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
-	var plan, placement, dataChain, base, entry, digest [32]byte
-	if !decodeNodeDigest(root, 1, &plan) || !decodeNodeDigest(root, 2, &placement) ||
-		plan != c.partitioner.digest || placement != c.placement ||
-		!decodeNodeDigest(root, 4, &dataChain) || !decodeNodeDigest(root, 5, &base) ||
-		!decodeNodeDigest(root, 6, &entry) || nodeUint(root, 12) != uint64(c.partitioner.target) ||
-		!decodeNodeDigest(root, 13, &digest) {
+	collectionBytes := uint64(binary.LittleEndian.Uint32(raw[16:20]))
+	if collectionBytes == 0 || collectionBytes > replication.MaxCollectionBytes ||
+		collectionBytes != uint64(len(raw)-sourceCaptureHeaderFixedBytes) {
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
-	workspace.decoded = workspace.decoded[:0]
-	if cap(workspace.decoded) < len(raw) {
-		workspace.decoded = make([]byte, 0, len(raw))
+	collection := raw[sourceCaptureHeaderFixedBytes:len(raw):len(raw)]
+	if !bytes.Equal(collection, byteview.Bytes(c.partitioner.collection)) {
+		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
-	collection, collectionOK := decodeNodeBase64(root, 3, workspace)
-	if !collectionOK || !bytes.Equal(collection, []byte(c.partitioner.collection)) {
+	var plan, placement, dataChain, base, entry, digest [sha256.Size]byte
+	copy(plan[:], raw[24:56])
+	copy(placement[:], raw[56:88])
+	copy(dataChain[:], raw[88:120])
+	copy(base[:], raw[120:152])
+	copy(entry[:], raw[152:184])
+	copy(digest[:], raw[184:216])
+	if plan != c.partitioner.digest || placement != c.placement ||
+		binary.LittleEndian.Uint64(raw[256:264]) != uint64(c.partitioner.target) {
 		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
 	publication := sourceCapturePublication{
-		applied: nodeUint(root, 7), term: nodeUint(root, 8),
-		ownershipEpoch: nodeUint(root, 9), routingVersion: nodeUint(root, 10),
-		routeGeneration: nodeUint(root, 11), entryDigest: entry, dataChainDigest: dataChain,
+		applied:         binary.LittleEndian.Uint64(raw[216:224]),
+		term:            binary.LittleEndian.Uint64(raw[224:232]),
+		ownershipEpoch:  binary.LittleEndian.Uint64(raw[232:240]),
+		routingVersion:  binary.LittleEndian.Uint64(raw[240:248]),
+		routeGeneration: binary.LittleEndian.Uint64(raw[248:256]),
+		entryDigest:     entry,
+		dataChainDigest: dataChain,
+	}
+	if publication.applied == 0 || publication.applied == math.MaxUint64 ||
+		publication.term == 0 || publication.term == math.MaxUint64 ||
+		publication.ownershipEpoch == 0 || publication.routingVersion == 0 ||
+		publication.routeGeneration == 0 || dataChain == ([sha256.Size]byte{}) ||
+		base == ([sha256.Size]byte{}) || entry == ([sha256.Size]byte{}) {
+		return ChildArtifactSourceCut{}, sourceCapturePublication{}, ErrSourceCapture
 	}
 	state := replicatedstate.State{
 		Applied: publication.applied, LastTerm: publication.term,
@@ -483,89 +527,117 @@ func (c *SourceCapture) decodeEntry(
 	raw []byte,
 	workspace *SourceCaptureWorkspace,
 ) (sourceCaptureEntry, error) {
-	root, err := buildCaptureIndex(raw, workspace)
-	if err != nil {
-		return sourceCaptureEntry{}, err
+	if !validSourceCaptureEnvelope(raw, sourceCaptureEntryKind, sourceCaptureEntryFixedBytes) ||
+		binary.LittleEndian.Uint32(raw[20:24]) != 0 {
+		return sourceCaptureEntry{}, ErrSourceCapture
 	}
-	count, ok := root.ArrayLen()
-	if !ok || count != sourceCaptureArrayFields || nodeUint(root, 0) != sourceCaptureEntryKind {
+	transitionCount := uint64(binary.LittleEndian.Uint32(raw[16:20]))
+	if transitionCount > replicatedstate.MaxDistinctMutations {
 		return sourceCaptureEntry{}, ErrSourceCapture
 	}
 	record := &workspace.record
 	*record = sourceCaptureEntry{
-		Applied: nodeUint(root, 1), Term: nodeUint(root, 2),
-		BeforeOwnershipEpoch: nodeUint(root, 3), AfterOwnershipEpoch: nodeUint(root, 4),
-		BeforeRoutingVersion: nodeUint(root, 5), AfterRoutingVersion: nodeUint(root, 6),
-		BeforeRouteGeneration: nodeUint(root, 7), AfterRouteGeneration: nodeUint(root, 8),
+		Applied:               binary.LittleEndian.Uint64(raw[24:32]),
+		Term:                  binary.LittleEndian.Uint64(raw[32:40]),
+		BeforeOwnershipEpoch:  binary.LittleEndian.Uint64(raw[40:48]),
+		AfterOwnershipEpoch:   binary.LittleEndian.Uint64(raw[48:56]),
+		BeforeRoutingVersion:  binary.LittleEndian.Uint64(raw[56:64]),
+		AfterRoutingVersion:   binary.LittleEndian.Uint64(raw[64:72]),
+		BeforeRouteGeneration: binary.LittleEndian.Uint64(raw[72:80]),
+		AfterRouteGeneration:  binary.LittleEndian.Uint64(raw[80:88]),
 	}
-	if !decodeNodeDigest(root, 9, &record.PreviousEntryDigest) ||
-		!decodeNodeDigest(root, 10, &record.EntryDigest) ||
-		!decodeNodeDigest(root, 11, &record.BeforeDataChainDigest) ||
-		!decodeNodeDigest(root, 12, &record.AfterDataChainDigest) ||
-		!decodeNodeDigest(root, 14, &record.Digest) {
-		return sourceCaptureEntry{}, ErrSourceCapture
+	for index, target := range [...]*[sha256.Size]byte{
+		&record.PreviousEntryDigest,
+		&record.EntryDigest,
+		&record.BeforeDataChainDigest,
+		&record.AfterDataChainDigest,
+		&record.Digest,
+	} {
+		start := 88 + index*sha256.Size
+		copy(target[:], raw[start:start+sha256.Size])
 	}
-	array, ok := root.Index(13)
-	if !ok {
-		return sourceCaptureEntry{}, ErrSourceCapture
-	}
-	transitionCount, ok := array.ArrayLen()
-	if !ok || transitionCount > replicatedstate.MaxDistinctMutations {
-		return sourceCaptureEntry{}, ErrSourceCapture
-	}
-	workspace.decoded = workspace.decoded[:0]
-	if cap(workspace.decoded) < len(raw) {
-		workspace.decoded = make([]byte, 0, len(raw))
-	}
-	if cap(workspace.transitions) < transitionCount {
-		workspace.transitions = make([]TailTransition, transitionCount)
+	count := int(transitionCount)
+	clear(workspace.transitions)
+	if cap(workspace.transitions) < count {
+		workspace.transitions = make([]TailTransition, count)
 	} else {
-		workspace.transitions = workspace.transitions[:transitionCount]
+		workspace.transitions = workspace.transitions[:count]
 	}
+	cursor := sourceCaptureEntryFixedBytes
 	var previous []byte
-	for index := 0; index < transitionCount; index++ {
-		item, ok := array.Index(index)
-		itemCount, itemOK := item.ArrayLen()
-		if !ok || !itemOK || itemCount != 3 {
+	for index := 0; index < count; index++ {
+		if len(raw)-cursor < sourceCaptureTransitionHeaderBytes {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
-		key, ok := decodeNodeBase64(item, 0, workspace)
-		if !ok {
+		header := raw[cursor : cursor+sourceCaptureTransitionHeaderBytes]
+		flags := header[0]
+		keyBytes := uint64(binary.LittleEndian.Uint32(header[4:8]))
+		beforeBytes := uint64(binary.LittleEndian.Uint32(header[8:12]))
+		afterBytes := uint64(binary.LittleEndian.Uint32(header[12:16]))
+		beforePresent := flags&sourceCaptureBeforePresent != 0
+		afterPresent := flags&sourceCaptureAfterPresent != 0
+		if flags == 0 || flags&^sourceCapturePresenceMask != 0 ||
+			header[1] != 0 || binary.LittleEndian.Uint16(header[2:4]) != 0 ||
+			keyBytes == 0 || keyBytes > replication.MaxMutationKeyBytes ||
+			beforePresent != (beforeBytes != 0) || afterPresent != (afterBytes != 0) ||
+			beforeBytes > replication.MaxMutationValueBytes ||
+			afterBytes > replication.MaxMutationValueBytes {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
-		before, beforeOK := decodeOptionalNodeBase64(item, 1, workspace)
-		after, afterOK := decodeOptionalNodeBase64(item, 2, workspace)
-		if !beforeOK || !afterOK || before == nil && after == nil ||
-			previous != nil && bytes.Compare(previous, key) >= 0 ||
+		payloadBytes := keyBytes + beforeBytes + afterBytes
+		cursor += sourceCaptureTransitionHeaderBytes
+		if payloadBytes > uint64(len(raw)-cursor) {
+			return sourceCaptureEntry{}, ErrSourceCapture
+		}
+		keyEnd := cursor + int(keyBytes)
+		beforeEnd := keyEnd + int(beforeBytes)
+		afterEnd := beforeEnd + int(afterBytes)
+		key := raw[cursor:keyEnd:keyEnd]
+		var before, after []byte
+		if beforePresent {
+			before = raw[keyEnd:beforeEnd:beforeEnd]
+		}
+		if afterPresent {
+			after = raw[beforeEnd:afterEnd:afterEnd]
+		}
+		if previous != nil && bytes.Compare(previous, key) >= 0 ||
 			before != nil && vibejson.Validate(before) != nil ||
 			after != nil && vibejson.Validate(after) != nil {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
 		workspace.transitions[index] = TailTransition{Key: key, Before: before, After: after}
 		previous = key
+		cursor = afterEnd
 	}
-	record.Transitions = workspace.transitions
+	if cursor != len(raw) {
+		return sourceCaptureEntry{}, ErrSourceCapture
+	}
+	record.Transitions = workspace.transitions[:count:count]
 	if !validSourceCaptureEntry(record) || c.hashEntry(record, workspace) != record.Digest {
 		return sourceCaptureEntry{}, ErrSourceCapture
 	}
 	return *record, nil
 }
 
-func buildCaptureIndex(raw []byte, workspace *SourceCaptureWorkspace) (vibejson.Node, error) {
-	needed, err := vibejson.RequiredIndexEntries(raw)
-	if err != nil {
-		return vibejson.Node{}, ErrSourceCapture
-	}
-	if cap(workspace.entries) < needed {
-		workspace.entries = make([]vibejson.IndexEntry, needed)
-	} else {
-		workspace.entries = workspace.entries[:needed]
-	}
-	index, err := vibejson.BuildIndex(raw, workspace.entries)
-	if err != nil {
-		return vibejson.Node{}, ErrSourceCapture
-	}
-	return index.Root(), nil
+func appendSourceCaptureEnvelope(dst []byte, kind uint8, total int) ([]byte, []byte) {
+	start := len(dst)
+	dst = slices.Grow(dst, total)
+	dst = dst[:start+total]
+	frame := dst[start:]
+	clear(frame)
+	copy(frame[0:8], sourceCaptureMagic[:])
+	binary.LittleEndian.PutUint16(frame[8:10], sourceCaptureFormat)
+	frame[10] = kind
+	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
+	return dst, frame
+}
+
+func validSourceCaptureEnvelope(raw []byte, kind uint8, fixed int) bool {
+	return len(raw) >= sourceCaptureEnvelopeBytes && len(raw) >= fixed &&
+		uint64(len(raw)) <= math.MaxUint32 && bytes.Equal(raw[0:8], sourceCaptureMagic[:]) &&
+		binary.LittleEndian.Uint16(raw[8:10]) == sourceCaptureFormat &&
+		raw[10] == kind && raw[11] == 0 &&
+		binary.LittleEndian.Uint32(raw[12:16]) == uint32(len(raw))
 }
 
 func (c *SourceCapture) hashHeader(
@@ -576,11 +648,11 @@ func (c *SourceCapture) hashHeader(
 	_, _ = h.Write(sourceCaptureHeaderDomain)
 	_, _ = h.Write(c.partitioner.digest[:])
 	_, _ = h.Write(c.placement[:])
-	hashTailFrame(h, &workspace.size, []byte(c.partitioner.collection))
-	_, _ = h.Write(state.DataChainDigest[:])
-	_, _ = h.Write(state.SnapshotBaseDigest[:])
-	_, _ = h.Write(state.LastEntryDigest[:])
+	hashTailFrame(h, &workspace.size, byteview.Bytes(c.partitioner.collection))
 	fixed := workspace.fixed[:0]
+	fixed = append(fixed, state.DataChainDigest[:]...)
+	fixed = append(fixed, state.SnapshotBaseDigest[:]...)
+	fixed = append(fixed, state.LastEntryDigest[:]...)
 	fixed = binary.LittleEndian.AppendUint64(fixed, state.Applied)
 	fixed = binary.LittleEndian.AppendUint64(fixed, state.LastTerm)
 	fixed = binary.LittleEndian.AppendUint64(fixed, state.Binding.OwnershipEpoch)
@@ -610,6 +682,7 @@ func (c *SourceCapture) hashTransition(
 		BeforeDataChainDigest: transition.BeforeDataChainDigest,
 		AfterDataChainDigest:  transition.AfterDataChainDigest,
 	}
+	clear(workspace.transitions)
 	if cap(workspace.transitions) < transition.MutationCount() {
 		workspace.transitions = make([]TailTransition, transition.MutationCount())
 	} else {
@@ -675,80 +748,6 @@ func hashOptionalCaptureFrame(h hash.Hash, size *[8]byte, value []byte) {
 	size[0] = 1
 	_, _ = h.Write(size[:1])
 	hashTailFrame(h, size, value)
-}
-
-func appendBase64String(dst, raw []byte) []byte {
-	dst = append(dst, '"')
-	dst = base64.RawURLEncoding.AppendEncode(dst, raw)
-	return append(dst, '"')
-}
-
-func appendOptionalBase64String(dst, raw []byte) []byte {
-	if raw == nil {
-		return append(dst, 'n', 'u', 'l', 'l')
-	}
-	return appendBase64String(dst, raw)
-}
-
-func nodeUint(root vibejson.Node, index int) uint64 {
-	node, ok := root.Index(index)
-	if !ok {
-		return 0
-	}
-	value, _ := node.Uint64()
-	return value
-}
-
-func decodeNodeDigest(root vibejson.Node, index int, dst *[32]byte) bool {
-	node, ok := root.Index(index)
-	if !ok {
-		return false
-	}
-	raw, ok := node.StringBytes()
-	if !ok || base64.RawURLEncoding.DecodedLen(len(raw)) != len(dst) {
-		return false
-	}
-	n, err := base64.RawURLEncoding.Decode(dst[:], raw)
-	return err == nil && n == len(dst)
-}
-
-func decodeNodeBase64(
-	root vibejson.Node,
-	index int,
-	workspace *SourceCaptureWorkspace,
-) ([]byte, bool) {
-	node, ok := root.Index(index)
-	if !ok {
-		return nil, false
-	}
-	raw, ok := node.StringBytes()
-	if !ok {
-		return nil, false
-	}
-	decoded := base64.RawURLEncoding.DecodedLen(len(raw))
-	start := len(workspace.decoded)
-	workspace.decoded = workspace.decoded[:start+decoded]
-	n, err := base64.RawURLEncoding.Decode(workspace.decoded[start:], raw)
-	if err != nil || n != decoded {
-		workspace.decoded = workspace.decoded[:start]
-		return nil, false
-	}
-	return workspace.decoded[start : start+n : start+n], true
-}
-
-func decodeOptionalNodeBase64(
-	root vibejson.Node,
-	index int,
-	workspace *SourceCaptureWorkspace,
-) ([]byte, bool) {
-	node, ok := root.Index(index)
-	if !ok {
-		return nil, false
-	}
-	if node.IsNull() {
-		return nil, true
-	}
-	return decodeNodeBase64(root, index, workspace)
 }
 
 func (c *SourceCapture) transitionFollowsCurrent(

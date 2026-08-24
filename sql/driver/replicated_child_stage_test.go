@@ -375,6 +375,7 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 		MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
 	captureCollection := create("capture", durable.Options{
+		OpaqueValues:     true,
 		MaxDocumentBytes: 128 << 10, MaxBatchDocuments: 1, MaxBatchBytes: 256 << 10,
 	})
 	target := func(collection *durable.Collection) replicatedstate.CollectionTarget {
