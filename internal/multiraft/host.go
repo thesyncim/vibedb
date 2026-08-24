@@ -1373,11 +1373,8 @@ func (host *Host) Close() error {
 		return nil
 	}
 	if !host.closed {
-		for _, group := range host.order {
-			if group != nil && group.runtime != nil &&
-				group.runtime.HasPendingResultSettlement() {
-				return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
-			}
+		if host.hasPendingResultSettlement() {
+			return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
 		}
 		host.closed = true
 		host.clearQueues()
@@ -1407,4 +1404,20 @@ func (host *Host) Close() error {
 		host.order = nil
 	}
 	return closeErr
+}
+
+// hasPendingResultSettlement is a read-only close preflight. Callers must own
+// the Host. It intentionally does not inspect ordinary queued input: Close may
+// terminate inputs, but it may never discard a committed result awaiting its
+// exact settlement retry.
+func (host *Host) hasPendingResultSettlement() bool {
+	if host == nil {
+		return false
+	}
+	for _, group := range host.order {
+		if group != nil && group.runtime != nil && group.runtime.HasPendingResultSettlement() {
+			return true
+		}
+	}
+	return false
 }

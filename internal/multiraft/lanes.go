@@ -13,13 +13,21 @@ import (
 
 const AbsoluteMaxExecutionLanes = 64
 
+const (
+	executionLanesOpen uint32 = iota
+	executionLanesClosing
+	executionLanesClosed
+)
+
 var (
 	ErrInvalidExecutionLanes = errors.New("multiraft: invalid execution lane count")
 	ErrExecutionLane         = errors.New("multiraft: invalid execution lane")
 )
 
-// laneCounters occupies one cache line. executionLane has a 128-byte stride,
-// so independently updated lanes never place their counters in the same line.
+// laneCounters fits inside executionLane's 256-byte stride. On supported
+// amd64/arm64 targets with cache lines no larger than 128 bytes, the 192-byte
+// gap between adjacent counter regions prevents false sharing even when the
+// backing allocation itself is not cache-line aligned.
 type laneCounters struct {
 	calls      uint64
 	rejected   uint64
@@ -32,21 +40,27 @@ type executionLane struct {
 	mu       sync.Mutex
 	host     *Host
 	counters laneCounters
-	_        [48]byte
+	_        [176]byte
 }
 
 // ExecutionLanes routes each group to one immutable single-owner Host lane.
 // Different lanes may execute concurrently; operations for one group remain
-// serialized by its lane and retain Host's exact Raft/Ready ordering.
+// serialized by its lane and retain Host's exact Raft/Ready ordering. Limits
+// are per lane: worst-case aggregate retained input is
+// lane-count*MaxQueueBytes and aggregate retained outbox data is
+// lane-count*MaxOutboxBytes, in addition to bounded per-lane structure/runtime
+// ownership.
 type ExecutionLanes struct {
 	closeMu sync.Mutex
-	closed  atomic.Bool
+	state   atomic.Uint32
 	lanes   []executionLane
 }
 
 // ExecutionLaneStats is an allocation-free snapshot when supplied through
 // StatsInto with sufficient destination capacity. Queue and outbox bytes are
 // exact retained payload charges; structural Host/runtime memory is excluded.
+// A concurrent StatsInto is a per-lane exact vector cut in lane order, not one
+// globally atomic instant: work may progress on lanes not currently locked.
 type ExecutionLaneStats struct {
 	Lane        int
 	Groups      int
@@ -63,6 +77,7 @@ type ExecutionLaneStats struct {
 
 // NewExecutionLanes constructs non-serving lanes with identical independent
 // per-lane limits. Count must be a power of two so routing is one stable mask.
+// Every lane independently enforces MaxGroupBytes and aggregate MaxQueueBytes.
 func NewExecutionLanes(count int, limits Limits) (*ExecutionLanes, error) {
 	return newExecutionLanes(count, func() (*Host, error) { return NewHost(limits) })
 }
@@ -148,7 +163,7 @@ func (set *ExecutionLanes) laneFor(key raftmember.GroupKey) (*executionLane, err
 	if err != nil {
 		return nil, err
 	}
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		return nil, ErrHostClosed
 	}
 	return &set.lanes[index], nil
@@ -165,7 +180,7 @@ func (set *ExecutionLanes) addRuntime(runtime memberRuntime) error {
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return ErrHostClosed
 	}
@@ -195,7 +210,7 @@ func (set *ExecutionLanes) withGroup(
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return ErrHostClosed
 	}
@@ -260,7 +275,7 @@ func (set *ExecutionLanes) Publication(key raftmember.GroupKey) (raftmodel.Publi
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return raftmodel.Publication{}, ErrHostClosed
 	}
@@ -279,7 +294,7 @@ func (set *ExecutionLanes) SnapshotState(key raftmember.GroupKey) (replicatedsta
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return replicatedstate.State{}, ErrHostClosed
 	}
@@ -298,7 +313,7 @@ func (set *ExecutionLanes) Status(key raftmember.GroupKey) (raftmember.RuntimeSt
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return raftmember.RuntimeStatus{}, ErrHostClosed
 	}
@@ -320,7 +335,7 @@ func (set *ExecutionLanes) Progress(
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return raftmodel.MemberProgress{}, false, ErrHostClosed
 	}
@@ -341,7 +356,7 @@ func (set *ExecutionLanes) RunOne(index int) (Progress, bool, error) {
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return Progress{}, false, ErrHostClosed
 	}
@@ -365,7 +380,7 @@ func (set *ExecutionLanes) PopOutbound(index int) (raftmember.OutboundMessage, b
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	lane.counters.calls++
-	if set.closed.Load() {
+	if set.state.Load() != executionLanesOpen {
 		lane.counters.rejected++
 		return raftmember.OutboundMessage{}, false, ErrHostClosed
 	}
@@ -373,7 +388,10 @@ func (set *ExecutionLanes) PopOutbound(index int) (raftmember.OutboundMessage, b
 	return message, ok, nil
 }
 
-// StatsInto appends one exact snapshot per lane in lane order.
+// StatsInto appends one exact snapshot per lane in lane order. Under concurrent
+// work the returned slice is an exact per-lane vector cut, not a globally
+// atomic snapshot across lanes. Reusing capacity for every lane allocates no
+// memory.
 func (set *ExecutionLanes) StatsInto(dst []ExecutionLaneStats) []ExecutionLaneStats {
 	if set == nil {
 		return dst
@@ -396,25 +414,52 @@ func (set *ExecutionLanes) StatsInto(dst []ExecutionLaneStats) []ExecutionLaneSt
 	return dst
 }
 
-// Close atomically stops new admission, then closes every lane in lane order.
-// A failed underlying Runtime close remains owned and is retried by a later
-// Close call; concurrent operations either finish before their lane closes or
-// observe ErrHostClosed after acquiring that lane.
+// Close atomically stops new admission and locks every lane in ascending order.
+// Its first close attempt performs a read-only all-lane settlement preflight;
+// any pending settlement restores the open state with no Runtime, queue, or
+// lane mutation so RunOne can retry it. After a successful preflight, queues
+// and Runtimes close in lane order. A failed Runtime close leaves the set in
+// closing state, remains owned, and is retried by a later Close call.
 func (set *ExecutionLanes) Close() error {
 	if set == nil {
 		return nil
 	}
 	set.closeMu.Lock()
 	defer set.closeMu.Unlock()
-	set.closed.Store(true)
+	state := set.state.Load()
+	if state == executionLanesClosed {
+		return nil
+	}
+	firstAttempt := state == executionLanesOpen
+	if firstAttempt {
+		set.state.Store(executionLanesClosing)
+	}
+	for index := range set.lanes {
+		set.lanes[index].mu.Lock()
+	}
+	defer func() {
+		for index := len(set.lanes) - 1; index >= 0; index-- {
+			set.lanes[index].mu.Unlock()
+		}
+	}()
+	if firstAttempt {
+		for index := range set.lanes {
+			host := set.lanes[index].host
+			if host != nil && host.hasPendingResultSettlement() {
+				set.state.Store(executionLanesOpen)
+				return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
+			}
+		}
+	}
 	var joined error
 	for index := range set.lanes {
 		lane := &set.lanes[index]
-		lane.mu.Lock()
 		if lane.host != nil {
 			joined = errors.Join(joined, lane.host.Close())
 		}
-		lane.mu.Unlock()
+	}
+	if joined == nil {
+		set.state.Store(executionLanesClosed)
 	}
 	return joined
 }

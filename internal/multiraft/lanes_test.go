@@ -34,8 +34,16 @@ func runtimeForLane(t testing.TB, set *ExecutionLanes, lane int, start byte) *fa
 }
 
 func TestExecutionLanesDeterministicAssignmentAndValidation(t *testing.T) {
-	if size := unsafe.Sizeof(executionLane{}); size != 128 {
-		t.Fatalf("execution lane size=%d, want two cache lines", size)
+	if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
+		stride := unsafe.Sizeof(executionLane{})
+		if stride != 256 {
+			t.Fatalf("execution lane size=%d, want 256-byte stride", stride)
+		}
+		offset := unsafe.Offsetof(executionLane{}.counters)
+		counterSize := unsafe.Sizeof(laneCounters{})
+		if offset != 16 || counterSize != 64 || stride-counterSize < 128 {
+			t.Fatalf("counter layout offset=%d size=%d", offset, unsafe.Sizeof(laneCounters{}))
+		}
 	}
 	limits := testHostLimits()
 	for _, count := range []int{1, 2, 4, 8} {
@@ -89,6 +97,63 @@ func TestExecutionLanesDeterministicAssignmentAndValidation(t *testing.T) {
 		t.Fatalf("zero group lane error=%v", err)
 	}
 	_ = set.Close()
+}
+
+func TestExecutionLanesEnforceDistinctGroupAndAggregateByteBounds(t *testing.T) {
+	limits := testHostLimits()
+	limits.MaxGroupBytes = raftmodel.MaxInboundMessageBytes
+	limits.MaxQueueBytes = 2 * limits.MaxGroupBytes
+	set, err := NewExecutionLanes(2, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	first := runtimeForLane(t, set, 0, 1)
+	second := runtimeForLane(t, set, 0, 41)
+	third := runtimeForLane(t, set, 0, 81)
+	independent := runtimeForLane(t, set, 1, 121)
+	for _, member := range []*fakeRuntime{first, second, third, independent} {
+		if err := set.addRuntime(member); err != nil {
+			t.Fatal(err)
+		}
+	}
+	half := make([]byte, limits.MaxGroupBytes/2)
+	remainder := make([]byte, limits.MaxGroupBytes-int64(len(half)))
+	for _, payload := range [][]byte{half, remainder} {
+		if err := set.EnqueueProposal(first.identity.Group, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := set.EnqueueProposal(first.identity.Group, []byte{1}); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("group byte saturation=%v", err)
+	}
+	for _, payload := range [][]byte{half, remainder} {
+		if err := set.EnqueueProposal(second.identity.Group, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := set.EnqueueProposal(third.identity.Group, []byte{1}); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("aggregate byte saturation=%v", err)
+	}
+	if err := set.EnqueueProposal(independent.identity.Group, []byte{2}); err != nil {
+		t.Fatalf("independent lane admission=%v", err)
+	}
+	stats := set.StatsInto(make([]ExecutionLaneStats, 0, 2))
+	if stats[0].QueueBytes != limits.MaxQueueBytes || stats[1].QueueBytes != 1 {
+		t.Fatalf("saturated stats=%+v", stats)
+	}
+	progress, done, err := set.RunOne(0)
+	if err != nil || !done || progress.Kind != ProgressProposal ||
+		progress.ProposalBytes != int64(len(half)) {
+		t.Fatalf("release progress=%+v done=%t err=%v", progress, done, err)
+	}
+	if err := set.EnqueueProposal(third.identity.Group, []byte{3}); err != nil {
+		t.Fatalf("released aggregate capacity=%v", err)
+	}
+	stats = set.StatsInto(stats[:0])
+	if stats[0].QueueBytes != limits.MaxQueueBytes-int64(len(half))+1 {
+		t.Fatalf("released stats=%+v", stats)
+	}
 }
 
 func TestExecutionLanesEnforceIndependentQueueAndByteAdmission(t *testing.T) {
@@ -283,6 +348,85 @@ func TestExecutionLanesCloseWaitsForInFlightLaneOwnership(t *testing.T) {
 	}
 }
 
+func TestExecutionLanesClosePendingSettlementPreflightIsAtomic(t *testing.T) {
+	set, err := NewExecutionLanes(2, testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := runtimeForLane(t, set, 0, 71)
+	pending := runtimeForLane(t, set, 1, 171)
+	pending.pendingSettlement = true
+	if err := set.addRuntime(ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.addRuntime(pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.EnqueueProposal(ordinary.identity.Group, []byte("retained")); err != nil {
+		t.Fatal(err)
+	}
+	before := set.StatsInto(make([]ExecutionLaneStats, 0, 2))
+	if err := set.Close(); !errors.Is(err, ErrGroupBusy) ||
+		!errors.Is(err, raftmember.ErrResultSettlementPending) {
+		t.Fatalf("pending close=%v", err)
+	}
+	after := set.StatsInto(make([]ExecutionLaneStats, 0, 2))
+	if set.state.Load() != executionLanesOpen || ordinary.closeCalls != 0 || pending.closeCalls != 0 ||
+		after[0].QueueItems != before[0].QueueItems || after[0].QueueBytes != before[0].QueueBytes {
+		t.Fatalf("preflight mutated state=%d closes=%d/%d before=%+v after=%+v",
+			set.state.Load(), ordinary.closeCalls, pending.closeCalls, before, after)
+	}
+	pending.driveHook = func() { pending.pendingSettlement = false }
+	if _, _, err := set.RunOne(1); err != nil || pending.pendingSettlement {
+		t.Fatalf("settlement retry err=%v pending=%t", err, pending.pendingSettlement)
+	}
+	if err := set.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if set.state.Load() != executionLanesClosed || ordinary.closeCalls != 1 || pending.closeCalls != 1 {
+		t.Fatalf("terminal close state=%d closes=%d/%d", set.state.Load(), ordinary.closeCalls, pending.closeCalls)
+	}
+}
+
+func TestExecutionLanesClosePreflightWaitsForInFlightSettlementRetry(t *testing.T) {
+	set, err := NewExecutionLanes(1, testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := runtimeForLane(t, set, 0, 91)
+	pending.pendingSettlement = true
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	pending.driveHook = func() {
+		close(entered)
+		<-release
+		pending.pendingSettlement = false
+	}
+	if err := set.addRuntime(pending); err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		_, _, runErr := set.RunOne(0)
+		runDone <- runErr
+	}()
+	<-entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- set.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close bypassed in-flight lane: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil || set.state.Load() != executionLanesClosed || pending.closeCalls != 1 {
+		t.Fatalf("close=%v state=%d calls=%d", err, set.state.Load(), pending.closeCalls)
+	}
+}
+
 func TestExecutionLanesCloseOwnsEveryRuntimeAndRetriesFailures(t *testing.T) {
 	set, err := NewExecutionLanes(2, testHostLimits())
 	if err != nil {
@@ -316,11 +460,93 @@ func TestExecutionLanesCloseOwnsEveryRuntimeAndRetriesFailures(t *testing.T) {
 	if first.closeCalls != 1 || second.closeCalls != 1 {
 		t.Fatalf("close calls=%d/%d", first.closeCalls, second.closeCalls)
 	}
+	if set.state.Load() != executionLanesClosing {
+		t.Fatalf("failed close state=%d", set.state.Load())
+	}
 	if err := set.Close(); err != nil || first.closeCalls != 2 || second.closeCalls != 1 {
 		t.Fatalf("retry close=%v calls=%d/%d", err, first.closeCalls, second.closeCalls)
 	}
+	if set.state.Load() != executionLanesClosed {
+		t.Fatalf("retried close state=%d", set.state.Load())
+	}
 	if err := set.RequestTick(first.identity.Group); !errors.Is(err, ErrHostClosed) {
 		t.Fatalf("post-close admission=%v", err)
+	}
+}
+
+func TestExecutionLanesStatsIntoReusesCapacityWithoutAllocating(t *testing.T) {
+	set, err := NewExecutionLanes(4, testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	dst := make([]ExecutionLaneStats, 0, 4)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		dst = set.StatsInto(dst[:0])
+	}); allocations != 0 {
+		t.Fatalf("StatsInto allocations=%v", allocations)
+	}
+	if len(dst) != 4 {
+		t.Fatalf("stats length=%d", len(dst))
+	}
+}
+
+func TestExecutionLanesConcurrentStatsWorkAndClose(t *testing.T) {
+	set, err := NewExecutionLanes(2, testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []*fakeRuntime{runtimeForLane(t, set, 0, 101), runtimeForLane(t, set, 1, 201)}
+	for _, member := range members {
+		if err := set.addRuntime(member); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wait sync.WaitGroup
+	start := make(chan struct{})
+	for lane := range members {
+		wait.Add(1)
+		go func(lane int) {
+			defer wait.Done()
+			<-start
+			for {
+				if err := set.RequestTick(members[lane].identity.Group); err != nil {
+					if !errors.Is(err, ErrHostClosed) {
+						t.Errorf("tick lane=%d: %v", lane, err)
+					}
+					return
+				}
+				if _, _, err := set.RunOne(lane); err != nil {
+					if !errors.Is(err, ErrHostClosed) {
+						t.Errorf("run lane=%d: %v", lane, err)
+					}
+					return
+				}
+				members[lane].inputs = members[lane].inputs[:0]
+			}
+		}(lane)
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		dst := make([]ExecutionLaneStats, 0, 2)
+		for set.state.Load() == executionLanesOpen {
+			dst = set.StatsInto(dst[:0])
+			if len(dst) != 2 {
+				t.Errorf("stats length=%d", len(dst))
+				return
+			}
+		}
+	}()
+	close(start)
+	time.Sleep(10 * time.Millisecond)
+	if err := set.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wait.Wait()
+	if set.state.Load() != executionLanesClosed {
+		t.Fatalf("close state=%d", set.state.Load())
 	}
 }
 
