@@ -48,7 +48,7 @@ func TestServingRegistryHostChangedAckAttemptAdvancesDurableRetryFloor(t *testin
 	openValue.Kind = replication.CommandSessionOpen
 	openValue.AckThrough = 0
 	openValue.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-	openValue.Mutations = nil
+	openValue.Batches = nil
 	openData := encodeTestCommand(t, openValue)
 	openWaiter, err := registry.Enqueue(host, runtime.Identity().Group, openData)
 	if err != nil {
@@ -292,7 +292,7 @@ func servingOpenCommand(
 	command.Kind = replication.CommandSessionOpen
 	command.AckThrough = 0
 	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-	command.Mutations = nil
+	command.Batches = nil
 	return encodeTestCommand(t, command)
 }
 
@@ -365,10 +365,12 @@ func servingCommand(
 		Tenant:           []byte("tenant"), ClientID: replication.ID128{7},
 		ClientEpoch: epoch, ClientSequence: sequence,
 		Fingerprint: sha256.Sum256([]byte("serving-logical-request")),
-		Collection:  base.UserTable,
-		Mutations: []replication.Mutation{{
-			Kind: replication.MutationPut, Key: key,
-			Value: []byte(`{"id":"a","value":1}`),
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: key,
+				Value: []byte(`{"id":"a","value":1}`),
+			}},
 		}},
 	}
 }

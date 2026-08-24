@@ -36,9 +36,13 @@ func testCommand(group raftmember.GroupKey, client byte, sequence uint64) replic
 		Tenant: []byte("tenant"), ClientID: replication.ID128{client},
 		ClientEpoch: 9, ClientSequence: sequence, AckThrough: sequence - 1,
 		Fingerprint: fingerprint, RetryHome: replication.RetryHome{client},
-		Collection: "documents",
-		Mutations: []replication.Mutation{{
-			Kind: replication.MutationPut, Key: []byte{0, client}, Value: []byte{1, byte(sequence)},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind:  replication.MutationPut,
+				Key:   []byte{0, client},
+				Value: []byte{1, byte(sequence)},
+			}},
 		}},
 	}
 }
@@ -124,7 +128,7 @@ func TestAttemptDigestBindsEveryCommandViewFieldOnce(t *testing.T) {
 		{"route", func(c *replication.Command) { c.RouteGeneration++ }},
 		{"command-kind", func(c *replication.Command) {
 			c.Kind = replication.CommandSessionRetire
-			c.Mutations = nil
+			c.Batches = nil
 		}},
 		{"tenant", func(c *replication.Command) { c.Tenant = []byte("other-tenant") }},
 		{"client-id", func(c *replication.Command) { c.ClientID[1]++ }},
@@ -133,18 +137,29 @@ func TestAttemptDigestBindsEveryCommandViewFieldOnce(t *testing.T) {
 		{"ack-through", func(c *replication.Command) { c.AckThrough = 0 }},
 		{"fingerprint", func(c *replication.Command) { c.Fingerprint[1]++ }},
 		{"retry-home", func(c *replication.Command) { c.RetryHome[1]++ }},
-		{"collection", func(c *replication.Command) { c.Collection += "-next" }},
+		{"relation", func(c *replication.Command) { c.Batches[0].Relation++ }},
 		{"mutation-kind", func(c *replication.Command) {
-			c.Mutations[0] = replication.Mutation{Kind: replication.MutationDelete, Key: []byte{0, 4}}
+			c.Batches[0].Mutations[0] = replication.Mutation{
+				Kind: replication.MutationDelete, Key: []byte{0, 4},
+			}
 		}},
-		{"mutation-key", func(c *replication.Command) { c.Mutations[0].Key = []byte{0, 4, 1} }},
-		{"mutation-value", func(c *replication.Command) { c.Mutations[0].Value = []byte{1, 2, 3} }},
+		{"mutation-key", func(c *replication.Command) {
+			c.Batches[0].Mutations[0].Key = []byte{0, 4, 1}
+		}},
+		{"mutation-value", func(c *replication.Command) {
+			c.Batches[0].Mutations[0].Value = []byte{1, 2, 3}
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := base
 			candidate.Tenant = append([]byte(nil), base.Tenant...)
-			candidate.Mutations = append([]replication.Mutation(nil), base.Mutations...)
+			candidate.Batches = append(
+				[]replication.RelationMutationBatch(nil), base.Batches...,
+			)
+			candidate.Batches[0].Mutations = append(
+				[]replication.Mutation(nil), base.Batches[0].Mutations...,
+			)
 			test.mutate(&candidate)
 			view, openErr := replication.OpenCommand(encodeTestCommand(t, candidate))
 			if openErr != nil {
@@ -163,7 +178,7 @@ func TestAttemptDigestBindsLeaseDeadlineFields(t *testing.T) {
 	group := testGroup(4)
 	base := testCommand(group, 5, 2)
 	base.Kind = replication.CommandSessionRenew
-	base.Mutations = nil
+	base.Batches = nil
 	base.ExpectedDeadlineUnixNano = 100
 	base.NextDeadlineUnixNano = 200
 	baseView, err := replication.OpenCommand(encodeTestCommand(t, base))
@@ -261,7 +276,7 @@ func TestRequestNamespacesSeparateReleaseOnly(t *testing.T) {
 	ordinary := testCommand(group, 7, 2)
 	retire := ordinary
 	retire.Kind = replication.CommandSessionRetire
-	retire.Mutations = nil
+	retire.Batches = nil
 	retire.AckThrough = 1
 	release := retire
 	release.Kind = replication.CommandSessionRelease

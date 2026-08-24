@@ -196,7 +196,7 @@ func newRealAppliedBatchSettlementCycle(
 		command.Kind = replication.CommandSessionOpen
 		command.AckThrough = 0
 		command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-		command.Mutations = nil
+		command.Batches = nil
 		binary.BigEndian.PutUint16(command.ClientID[14:], uint16(index+1))
 		opens[index] = encodeTestCommand(tb, command)
 	}
