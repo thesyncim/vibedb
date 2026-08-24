@@ -2,7 +2,6 @@ package driver
 
 import (
 	stdsql "database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -719,7 +718,7 @@ func TestNumericPrimaryKeysUseExactCanonicalIdentity(t *testing.T) {
 	}
 	if err := db.QueryRow(
 		`SELECT value FROM docs WHERE id = ?`,
-		json.Number("0.1e9223372036854775809"),
+		query.Number("0.1e9223372036854775809"),
 	).Scan(&value); err != nil {
 		t.Fatal(err)
 	}

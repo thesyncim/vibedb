@@ -4,7 +4,6 @@ import (
 	"context"
 	stdsql "database/sql"
 	sqldriver "database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/conformance"
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 )
 
 type observedDoneContext struct {
@@ -842,8 +842,8 @@ func TestNamedValueRejectsParametersLargerThanAnySQLDocument(t *testing.T) {
 	}{
 		{name: "string", value: tooLarge},
 		{name: "bytes", value: []byte(tooLarge)},
-		{name: "json number", value: json.Number(tooLarge)},
 		{name: "query number", value: query.Number(tooLarge)},
+		{name: "raw number", value: vibejson.RawValue{Src: []byte(tooLarge)}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -862,5 +862,31 @@ func TestNamedValueRejectsParametersLargerThanAnySQLDocument(t *testing.T) {
 	}
 	if err := c.CheckNamedValue(&atLimit); err != nil {
 		t.Fatalf("maximum-size parameter: %v", err)
+	}
+}
+
+func TestNamedValueAcceptsRawNumberWithoutAllocation(t *testing.T) {
+	c := &conn{}
+	raw := vibejson.RawValue{Src: []byte("9007199254740993")}
+	value := sqldriver.NamedValue{Ordinal: 1, Value: raw}
+	if err := c.CheckNamedValue(&value); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := value.Value.(vibejson.RawValue); !ok || string(got.Bytes()) != "9007199254740993" {
+		t.Fatalf("checked value = %#v (%T), want borrowed RawValue", value.Value, value.Value)
+	}
+
+	allocs := testing.AllocsPerRun(1_000, func() {
+		if err := c.CheckNamedValue(&value); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("raw-number normalization allocated %.2f times, want zero", allocs)
+	}
+
+	value.Value = vibejson.RawValue{Src: []byte("01")}
+	if err := c.CheckNamedValue(&value); err == nil {
+		t.Fatal("invalid raw JSON number was accepted")
 	}
 }

@@ -62,11 +62,15 @@ type TrafficClass uint8
 const (
 	TrafficOrdinary TrafficClass = 1
 	TrafficSnapshot TrafficClass = 2
+	// TrafficShardNative is the mutually authenticated gateway-to-RF3 shard
+	// capability. It is deliberately distinct from Raft and snapshot streams.
+	TrafficShardNative TrafficClass = 3
 )
 
 const (
-	ordinaryALPN = "vibedb-raft-ordinary"
-	snapshotALPN = "vibedb-raft-snapshot"
+	ordinaryALPN    = "vibedb-raft-ordinary"
+	snapshotALPN    = "vibedb-raft-snapshot"
+	shardNativeALPN = "vibedb-shard-native"
 )
 
 func (class TrafficClass) alpn() (string, error) {
@@ -75,6 +79,8 @@ func (class TrafficClass) alpn() (string, error) {
 		return ordinaryALPN, nil
 	case TrafficSnapshot:
 		return snapshotALPN, nil
+	case TrafficShardNative:
+		return shardNativeALPN, nil
 	default:
 		return "", ErrWrongTrafficClass
 	}

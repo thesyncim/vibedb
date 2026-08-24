@@ -389,7 +389,7 @@ func TestReplicatedServerBoundsConnectionsWithoutUserSpaceQueue(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener, 1) }()
+	go func() { done <- server.ServeLoopbackDevelopment(ctx, listener, 1) }()
 	first, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)

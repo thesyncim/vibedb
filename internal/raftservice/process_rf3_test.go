@@ -293,7 +293,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 	peerDone := make(chan error, 1)
 	nativeDone := make(chan error, 1)
 	go func() { peerDone <- peer.Run(ctx) }()
-	go func() { nativeDone <- server.Serve(ctx, nativeListener, 64) }()
+	go func() { nativeDone <- server.ServeLoopbackDevelopment(ctx, nativeListener, 64) }()
 	select {
 	case <-peer.Started():
 	case <-time.After(15 * time.Second):
@@ -990,9 +990,10 @@ func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProce
 
 func (client *faultProcessClient) DoReplicated(
 	ctx context.Context,
-	address string,
+	endpoint gateway.ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
+	address := endpoint.Address
 	member := client.memberAt(address)
 	isMutation := false
 	if request != nil && request.Operation == shardservice.ReplicatedPropose {
@@ -1017,7 +1018,7 @@ func (client *faultProcessClient) DoReplicated(
 			Command: append([]byte(nil), request.Command...), Cause: io.ErrUnexpectedEOF,
 		}
 	}
-	response, err := client.base.DoReplicated(ctx, address, request)
+	response, err := client.base.DoReplicated(ctx, endpoint, request)
 	if stage == faultAfterDecodedResponseBeforeClientDelivery && err == nil && response != nil &&
 		response.Kind == shardservice.ReplicatedCompletion {
 		client.mu.Lock()
@@ -1585,7 +1586,9 @@ func processCatalogRoute(
 	for index := 0; index < processVoters; index++ {
 		endpoints[endpointIDs[index]] = addresses[index]
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{
-			Member: uint64(index + 1), Endpoint: endpointIDs[index],
+			Member: uint64(index + 1), Node: processNode(uint64(index + 1)),
+			StoreID:         processStoreIdentity(uint64(index + 1)).StoreID,
+			NodeIncarnation: 1, Endpoint: endpointIDs[index],
 		}
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(

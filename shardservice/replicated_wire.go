@@ -1,8 +1,10 @@
 package shardservice
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -133,6 +135,47 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		return e.err
 	}
 	return writeEncodedFrame(w, tagReplicatedRequest, e.b)
+}
+
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
+// the immutable command or point key as a second buffer, avoiding a payload-sized
+// userspace copy on every retry. A TLS stream may encode the two writes as
+// separate record sequences; this function does not claim writev.
+func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
+	if w == nil || !validReplicatedRequest(request) {
+		return ErrReplicatedWire
+	}
+	e := newFrameEncoder(0)
+	e.u8(replicatedWireVersion)
+	e.u8(uint8(request.Operation))
+	encodeReplicatedFence(&e, request.Fence)
+	var payload []byte
+	switch request.Operation {
+	case ReplicatedProbe:
+	case ReplicatedPropose:
+		payload = request.Command
+		e.u32(uint32(len(payload)))
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		e.u8(uint8(request.Relation))
+		e.u64(request.MinimumApplied)
+		e.u32(request.MaxValueBytes)
+		payload = request.Key
+		e.u32(uint32(len(payload)))
+	}
+	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
+		return errFrameTooLarge
+	}
+	e.b[0] = tagReplicatedRequest
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
+	buffers := net.Buffers{e.b}
+	if len(payload) != 0 {
+		buffers = append(buffers, payload)
+	}
+	written, err := buffers.WriteTo(w)
+	if err == nil && written != int64(len(e.b)+len(payload)) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // DecodeReplicatedRequest decodes and validates one bounded native request.

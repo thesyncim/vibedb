@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -31,8 +32,11 @@ var (
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
 // is fixed-width; Address is interpreted only by the dial boundary.
 type ReplicatedEndpoint struct {
-	Member  uint64
-	Address string
+	Member          uint64
+	Node            rafttransport.NodeID
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	Address         string
 }
 
 // ReplicatedRoute is one exact catalog allocation and its bounded replica set.
@@ -48,7 +52,7 @@ type ReplicatedRoute struct {
 type ReplicatedRoundTripper interface {
 	DoReplicated(
 		context.Context,
-		string,
+		ReplicatedEndpoint,
 		*shardservice.ReplicatedRequest,
 	) (*shardservice.ReplicatedResponse, error)
 }
@@ -65,13 +69,13 @@ type TCPReplicatedClient struct {
 
 func (client TCPReplicatedClient) DoReplicated(
 	ctx context.Context,
-	address string,
+	endpoint ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if client.Dial == nil {
 		return nil, ErrReplicatedDial
 	}
-	connection, err := client.Dial(ctx, address)
+	connection, err := client.Dial(ctx, endpoint.Address)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +159,7 @@ func (executor *ReplicatedExecutor) ReadPoint(
 		if read.Linearizable {
 			operation = shardservice.ReplicatedReadLeader
 		}
-		response, err := executor.doReplicated(ctx, endpoint.Address, &shardservice.ReplicatedRequest{
+		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 			Operation: operation, Fence: state.Fence, Relation: read.Relation,
 			Key: read.Key, MinimumApplied: read.MinimumApplied, MaxValueBytes: read.MaxValueBytes,
 		})
@@ -245,7 +249,7 @@ func (executor *ReplicatedExecutor) readEndpoint(
 	// capacity. Every candidate is authenticated by a fresh exact probe.
 	var joined error
 	for _, endpoint := range route.Replicas {
-		response, err := executor.doReplicated(ctx, endpoint.Address, &shardservice.ReplicatedRequest{
+		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 			Operation: shardservice.ReplicatedProbe,
 			Fence: shardservice.ReplicatedFence{Group: route.Group,
 				AllocationGeneration: route.AllocationGeneration},
@@ -366,7 +370,7 @@ func (executor *ReplicatedExecutor) propose(
 			}
 		}
 		preferred = state.LeaderID
-		response, err := executor.doReplicated(ctx, endpoint.Address,
+		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedPropose,
 				Fence:     state.Fence,
@@ -489,12 +493,19 @@ func (executor *ReplicatedExecutor) propose(
 
 func (executor *ReplicatedExecutor) doReplicated(
 	ctx context.Context,
-	address string,
+	endpoint ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
-	return executor.client.DoReplicated(attemptCtx, address, request)
+	response, err := executor.client.DoReplicated(attemptCtx, endpoint, request)
+	if err == nil && response != nil && response.HasState &&
+		(response.State.Fence.MemberID != endpoint.Member ||
+			response.State.Fence.StoreID != endpoint.StoreID ||
+			response.State.Fence.NodeIncarnation != endpoint.NodeIncarnation) {
+		return nil, ErrReplicatedRoute
+	}
+	return response, err
 }
 
 func validReplicatedLeaderHint(
@@ -527,7 +538,7 @@ func (executor *ReplicatedExecutor) discoverLeader(
 			}
 		}
 		visited |= uint64(1) << ordinal
-		response, err := executor.doReplicated(ctx, endpoint.Address,
+		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedProbe,
 				Fence: shardservice.ReplicatedFence{
@@ -654,11 +665,15 @@ func validReplicatedRoute(route ReplicatedRoute) bool {
 		return false
 	}
 	for index, endpoint := range route.Replicas {
-		if endpoint.Member == 0 || endpoint.Address == "" {
+		if endpoint.Member == 0 || endpoint.Node == (rafttransport.NodeID{}) ||
+			endpoint.StoreID == ([16]byte{}) || endpoint.NodeIncarnation == 0 ||
+			endpoint.Address == "" {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
 			if route.Replicas[prior].Member == endpoint.Member ||
+				route.Replicas[prior].Node == endpoint.Node ||
+				route.Replicas[prior].StoreID == endpoint.StoreID ||
 				route.Replicas[prior].Address == endpoint.Address {
 				return false
 			}

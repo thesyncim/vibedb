@@ -386,15 +386,21 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 			} else {
 				i.UserStorage = "0" + i.UserStorage[1:]
 			}
+			i.Relations[0].Storage = i.UserStorage
+			i.RelationManifestDigest = replicatedRelationManifestDigest(*i)
 		}, ErrReplicatedShardStoreIdentityMismatch},
 		{"primary", func(i *ReplicatedShardStoreIdentity) { i.UserPrimaryKey = "/other" }, ErrReplicatedShardStoreIdentityMismatch},
-		{"limits", func(i *ReplicatedShardStoreIdentity) { i.UserLimits.MaxBatchBytes-- }, ErrReplicatedShardStoreIdentityMismatch},
+		{"limits", func(i *ReplicatedShardStoreIdentity) {
+			i.UserLimits.MaxBatchBytes--
+			i.Relations[0].Limits = i.UserLimits
+			i.RelationManifestDigest = replicatedRelationManifestDigest(*i)
+		}, ErrReplicatedShardStoreIdentityMismatch},
 		{"user_journal", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.UserRecoveryJournalBytes-- }, ErrReplicatedShardStoreProfile},
 		{"transaction_marker", func(i *ReplicatedShardStoreIdentity) { i.Sidecars.TransactionMarkerBytes++ }, ErrReplicatedShardStoreProfile},
 	}
 	for _, test := range mismatches {
 		t.Run("mismatch_"+test.name, func(t *testing.T) {
-			expected := identity
+			expected := identity.Clone()
 			test.mutate(&expected)
 			if _, err := OpenReplicatedShardStore(path, expected); !errors.Is(err, test.want) {
 				t.Fatalf("OpenReplicatedShardStore = %v, want %v", err, test.want)
@@ -1611,14 +1617,14 @@ func TestReplicatedCatalogStrictRootAndProfileDecode(t *testing.T) {
 	}{
 		{"unknown_root", func(raw string) string { return `{"unknown":1,` + raw[1:] }, nil},
 		{"duplicate_root", func(raw string) string {
-			return strings.Replace(raw, `"version": 0`, `"version": 0,
+			return strings.Replace(raw, `"version":0`, `"version":0,
   "version": 0`, 1)
 		}, nil},
 		{"null_version", func(raw string) string {
-			return strings.Replace(raw, `"version": 0`, `"version": null`, 1)
+			return strings.Replace(raw, `"version":0`, `"version":null`, 1)
 		}, nil},
 		{"profile_primary", func(raw string) string {
-			return strings.Replace(raw, `"user_primary_key": "/id"`, `"user_primary_key": "/other"`, 1)
+			return strings.Replace(raw, `"user_primary_key":"/id"`, `"user_primary_key":"/other"`, 1)
 		}, ErrReplicatedShardStoreProfile},
 	}
 	for _, mutation := range mutations {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -18,6 +19,41 @@ func testShardStoreBinding() ShardStoreBinding {
 		Distribution:         "tenant_data",
 		Shard:                "-80",
 		AllocationGeneration: 7,
+	}
+}
+
+func TestShardStoreMaximumEscapedIdentityInitializeReopenAndRoundTrip(t *testing.T) {
+	name := strings.Repeat("\x01", maxCatalogTableNameBytes)
+	binding := ShardStoreBinding{Distribution: distribution.DistributionName(name), Shard: distribution.ShardID(name), AllocationGeneration: 1}
+	path := filepath.Join(t.TempDir(), "max-identity.vdb")
+	database, err := InitializeShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := *database.connector.db.catalog.ShardStore
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenShardStore(path, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > maxShardStoreIdentityJSONBytes {
+		t.Fatalf("identity bytes = %d, bound %d", len(raw), maxShardStoreIdentityJSONBytes)
+	}
+	var roundTrip ShardStoreIdentity
+	if err := json.Unmarshal(raw, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip != identity {
+		t.Fatal("standalone maximum identity round trip changed")
 	}
 }
 

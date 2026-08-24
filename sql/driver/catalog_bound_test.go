@@ -179,7 +179,9 @@ func TestOpenRejectsTableCountBeforeOpeningMaterializedHandles(t *testing.T) {
 		catalog.Tables[fmt.Sprintf("table_%03d", i)] =
 			boundedCatalogTableMeta(true)
 	}
-	raw, err := json.Marshal(catalog)
+	// Encode the deliberately invalid over-count image through the internal
+	// appender; the exported marshaler correctly rejects it before allocation.
+	raw, err := appendCatalogJSON(make([]byte, 0, maxCatalogBytes), catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
