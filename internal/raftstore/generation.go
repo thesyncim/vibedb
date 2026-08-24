@@ -485,7 +485,7 @@ func generationRecordBytes(plainBytes, keyBytes int) int {
 func generationInfo(path string, seal generationSeal) GenerationInfo {
 	return GenerationInfo{
 		Path: path, FamilyID: seal.familyID, Generation: seal.generation,
-		SourceFileID: seal.sourceFileID, SourceCutDigest: seal.bindingDigest,
+		SourceFileID: seal.sourceFileID, SourceCutDigest: seal.sourceChainDigest,
 		SnapshotBaseDigest: seal.baseDigest, RetentionCommitment: seal.retentionCommitment,
 		BaseIndex: seal.baseIndex, BaseTerm: seal.baseTerm, LastIndex: seal.suffixLast,
 		HardTerm: seal.hard.GetTerm(), HardVote: seal.hard.GetVote(), HardCommit: seal.hard.GetCommit(),
