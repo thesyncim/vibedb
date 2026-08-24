@@ -2,8 +2,6 @@ package driver
 
 import (
 	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 )
 
 // ShardStoreBinding is the topology-owned part of one local shard store's
@@ -553,115 +552,47 @@ func randomShardStoreIdentity(binding ShardStoreBinding) (ShardStoreIdentity, er
 // MarshalJSON keeps the 128-bit log identity compact and canonical in the SQL
 // catalog instead of encoding it as a sixteen-element JSON number array.
 func (i ShardStoreIdentity) MarshalJSON() ([]byte, error) {
-	type encodedIdentity struct {
-		Distribution         distribution.DistributionName          `json:"distribution"`
-		Shard                distribution.ShardID                   `json:"shard"`
-		AllocationGeneration distribution.ShardAllocationGeneration `json:"allocation_generation"`
-		LogID                string                                 `json:"log_id"`
+	if err := validateShardStoreIdentity(i); err != nil {
+		return nil, err
 	}
-	return json.Marshal(encodedIdentity{
-		Distribution: i.Distribution, Shard: i.Shard,
-		AllocationGeneration: i.AllocationGeneration,
-		LogID:                hex.EncodeToString(i.LogID[:]),
-	})
+	encoded := shardStoreIdentityVibe(i)
+	return vibejson.Marshal(&encoded)
 }
 
 // UnmarshalJSON is strict because this object is durable identity, not an
 // extensible request payload. Missing, duplicate, and unknown members fail the
 // same closed catalog boundary as the surrounding catalog.
 func (i *ShardStoreIdentity) UnmarshalJSON(data []byte) error {
-	var decoded ShardStoreIdentity
-	var distributionPresent, shardPresent, generationPresent, logIDPresent bool
-	err := decodeCatalogObject(data, "shard store identity", func(
-		name string,
-		decoder *json.Decoder,
-	) error {
-		switch name {
-		case "distribution":
-			distributionPresent = true
-			return decoder.Decode(&decoded.Distribution)
-		case "shard":
-			shardPresent = true
-			return decoder.Decode(&decoded.Shard)
-		case "allocation_generation":
-			generationPresent = true
-			return decoder.Decode(&decoded.AllocationGeneration)
-		case "log_id":
-			logIDPresent = true
-			var encoded string
-			if err := decoder.Decode(&encoded); err != nil {
-				return err
-			}
-			if len(encoded) != hex.EncodedLen(len(decoded.LogID)) {
-				return fmt.Errorf("vibedb: shard store log id must contain exactly 128 bits")
-			}
-			if encoded != strings.ToLower(encoded) {
-				return fmt.Errorf("vibedb: shard store log id must use canonical lowercase hexadecimal")
-			}
-			if _, err := hex.Decode(decoded.LogID[:], []byte(encoded)); err != nil {
-				return fmt.Errorf("vibedb: shard store log id is not hexadecimal: %w", err)
-			}
-			return nil
-		default:
-			return unknownCatalogMember("shard store identity", name)
-		}
-	})
-	if err != nil {
+	if len(data) > maxShardStoreIdentityJSONBytes {
+		return errors.New("vibedb: shard store identity exceeds its byte bound")
+	}
+	var decoded shardStoreIdentityVibe
+	if err := vibejson.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	for _, member := range []struct {
-		name    string
-		present bool
-	}{
-		{"distribution", distributionPresent},
-		{"shard", shardPresent},
-		{"allocation_generation", generationPresent},
-		{"log_id", logIDPresent},
-	} {
-		if !member.present {
-			return fmt.Errorf("vibedb: shard store identity is missing member %q", member.name)
-		}
-	}
-	if err := validateShardStoreIdentity(decoded); err != nil {
-		return err
-	}
-	*i = decoded
+	*i = ShardStoreIdentity(decoded)
 	return nil
 }
 
 // UnmarshalJSON keeps the mutable fence as strict as the immutable identity:
 // missing, duplicate, unknown, null, negative, overflowing, and zero
 // coordinates all fail the catalog boundary.
+func (f ShardStoreFence) MarshalJSON() ([]byte, error) {
+	if err := validateShardStoreFence(f); err != nil {
+		return nil, err
+	}
+	encoded := shardStoreFenceVibe(f)
+	return vibejson.Marshal(&encoded)
+}
+
 func (f *ShardStoreFence) UnmarshalJSON(data []byte) error {
-	var decoded ShardStoreFence
-	var ownershipPresent, routingPresent bool
-	err := decodeCatalogObject(data, "shard store fence", func(
-		name string,
-		decoder *json.Decoder,
-	) error {
-		switch name {
-		case "ownership_epoch":
-			ownershipPresent = true
-			return decoder.Decode(&decoded.OwnershipEpoch)
-		case "routing_version":
-			routingPresent = true
-			return decoder.Decode(&decoded.RoutingVersion)
-		default:
-			return unknownCatalogMember("shard store fence", name)
-		}
-	})
-	if err != nil {
+	if len(data) > maxShardStoreFenceJSONBytes {
+		return errors.New("vibedb: shard store fence exceeds its byte bound")
+	}
+	var decoded shardStoreFenceVibe
+	if err := vibejson.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	if !ownershipPresent {
-		return fmt.Errorf("vibedb: shard store fence is missing member %q", "ownership_epoch")
-	}
-	if !routingPresent {
-		return fmt.Errorf("vibedb: shard store fence is missing member %q", "routing_version")
-	}
-	if err := validateShardStoreFence(decoded); err != nil {
-		return err
-	}
-	*f = decoded
+	*f = ShardStoreFence(decoded)
 	return nil
 }

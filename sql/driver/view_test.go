@@ -618,12 +618,58 @@ func TestCatalogViewMetadataStrictDecodeAndSemanticReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	corrupt := strings.Replace(
-		string(raw), `"outputs": [`, `"unknown": true, "outputs": [`, 1,
+		string(raw), `"outputs":[`, `"unknown":true,"outputs":[`, 1,
 	)
 	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := openDatabase(path); err == nil || !strings.Contains(err.Error(), "unknown member") {
 		t.Fatalf("corrupt view metadata reopen = %v", err)
+	}
+}
+
+func TestCatalogEscapeHeavyMaximumQueryPersistsAndReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.vdb")
+	database, err := openDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createTree, err := sqlast.ParseStatement(`CREATE TABLE docs (id STRING PRIMARY KEY)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create, err := query.PrepareParsedDML("CREATE TABLE docs", createTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.createTableLocked(create); err != nil {
+		create.Release()
+		t.Fatal(err)
+	}
+	create.Release()
+	const base = `SELECT id FROM docs`
+	meta, err := buildViewMeta(context.Background(), nil, "escaped", base, nil, database.catalog.Views, database.tables, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Query = base + "/*" +
+		strings.Repeat("<", maxCatalogViewQueryBytes-len(base)-4) + "*/"
+	database.catalog.Views["escaped"] = meta
+	if _, err := database.persistCatalogLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.closeTerminal(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reopened.catalog.Views["escaped"].Query); got != maxCatalogViewQueryBytes {
+		_ = reopened.closeTerminal()
+		t.Fatalf("query bytes = %d", got)
+	}
+	if err := reopened.closeTerminal(); err != nil {
+		t.Fatal(err)
 	}
 }

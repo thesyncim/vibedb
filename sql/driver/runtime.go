@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -12,7 +11,6 @@ import (
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	vibejson "github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Database owns one SQL catalog and its exclusive durable writer lease.
@@ -1062,16 +1060,15 @@ func (c *conn) runtimeValues(kinds []ParamKind, values []any) ([]any, error) {
 				}
 				normalized = raw.Bytes()
 			} else {
-				spelling, number := raw.NumberBytes()
+				_, number := raw.NumberBytes()
 				if !number {
 					clear(c.args)
 					return nil, fmt.Errorf(
 						"vibedb: scalar parameter %d is not an exact JSON number", i+1)
 				}
-				// query.Number is the SQL runtime's exact-number discriminator. The
-				// string header aliases the immutable RawValue bytes; no text is
-				// materialized or copied.
-				normalized = query.Number(byteview.String(spelling))
+				// Keep the exact numeric spelling byte-native. Query compilation and
+				// mutation planning consume RawValue directly without materializing
+				// a string header or copying its borrowed bytes.
 			}
 		}
 		if err := addRuntimeArgumentBytes(&total, normalized); err != nil {
@@ -1136,8 +1133,6 @@ func normalizeRuntimeValue(argument any) (any, error) {
 			return nil, errors.New("vibedb: []byte parameters must be valid UTF-8")
 		}
 		return argument, nil
-	case json.Number:
-		return query.Number(value.String()), nil
 	case vibejson.RawValue:
 		return argument, nil
 	case query.Number:
@@ -1190,6 +1185,8 @@ func runtimeArgumentBytes(value any) int {
 		return len(value)
 	case query.Number:
 		return len(value)
+	case vibejson.RawValue:
+		return len(value.Bytes())
 	case *string:
 		if value == nil {
 			return 4

@@ -1,7 +1,6 @@
 package driver
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -338,8 +337,6 @@ func scalarFromValue(value any) (distribution.Scalar, bool, error) {
 			return distribution.Scalar{}, false, nil
 		}
 		return distribution.NewString(*v), true, nil
-	case json.Number:
-		return numberScalar(string(v))
 	case query.Number:
 		return numberScalar(string(v))
 	case *query.Number:
