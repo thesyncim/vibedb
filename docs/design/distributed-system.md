@@ -258,8 +258,9 @@ configuration state, member lineage, certificate witness, and retained log
 suffix before any old generation can be discarded.
 
 This lane is still part of the non-serving replication kernel. It does not yet
-provide RF3 request serving, authenticated peer transport, or acknowledged
-gateway failover. Transition capture is deliberately rejected while a
+provide RF3 request serving, Host-integrated peer transport, or acknowledged
+gateway failover. The separate internal transport foundation is not a serving
+integration. Transition capture is deliberately rejected while a
 `CheckpointGroup` owns the apply state; online range split must use the later
 publish-before-prune serving integration rather than adding another ordinary
 durable participant to this fixed zero-Sync path.
@@ -442,6 +443,7 @@ The internal replication kernel contains:
 - A deterministic replicated SQL state machine
 - A bounded single-owner Multi-Raft scheduler with normal-proposal coalescing
 - Static authenticated-identity frame validation
+- A composable mutual TLS ordinary-message stream foundation
 - Offline snapshot artifacts and resumable staging
 - A stateless replica-move reconciler
 
@@ -460,9 +462,11 @@ the `Ready`. The current non-serving Host supplies an explicit no-local-waiters
 sink. The kernel does not have a serving proposal-waiter registry. Outbound
 messages are still retained as individual frames.
 
-The kernel has no production socket transport, TLS, peer authentication,
-snapshot-transfer service, or serving integration. The frame decoder requires
-an externally authenticated node ID. The shipped commands do not provide it.
+The kernel has no production peer listener, address discovery, certificate
+operations, snapshot-transfer service, or serving integration. The internal
+transport foundation can derive the exact binary peer identity and cluster
+trust domain from a supplied raw mutual TLS connection. The shipped commands
+do not construct it.
 
 Do not describe this kernel as a turnkey replicated deployment.
 
@@ -492,5 +496,6 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/manifest.go` and `gateway/catalog_transition.go`
 - `internal/raftstore`, `internal/raftmember`, and `internal/multiraft`
 - `internal/rafttransport`, `internal/replicatedstate`, and `internal/rebalance`
+- `docs/design/raft-peer-transport.md`
 - `internal/replicatedstate/session_codec.go` and
   `internal/raftmember/apply_capacity.go`

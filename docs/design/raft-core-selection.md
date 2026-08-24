@@ -42,8 +42,10 @@ latches terminal runtime failure.
 ## Threat boundary
 
 `internal/rafttransport` validates deterministic frames and static identities.
-It does not create a socket or authenticate a peer. Decode needs a node ID that
-an external authenticated transport supplies.
+Its internal transport foundation authenticates supplied raw connections with
+mutual TLS. It derives the exact binary node ID and cluster trust domain from a
+critical private certificate extension. The caller still owns address
+discovery, raw socket creation, listener bounds, and certificate operations.
 
 The transport rejects snapshot messages, recursive response graphs,
 configuration entries, unknown protobuf fields, and oversized inputs. These
@@ -51,9 +53,9 @@ checks limit parser and graph amplification before allocation.
 
 The repository does not provide these components:
 
-- A Raft network service
-- TLS or peer authentication
-- A connection manager
+- A Host-integrated Raft network service
+- A production peer listener and address registry
+- Certificate enrollment, rotation, or revocation operations
 - Online snapshot transfer
 - A controller that connects the kernel to the shipped shard server
 
@@ -83,3 +85,5 @@ group, and 1 GiB of global queue and outbox bytes.
 - `internal/raftmember/runtime.go`
 - `internal/multiraft/host.go`
 - `internal/rafttransport/registry.go`, `frame.go`, and `preflight.go`
+- `internal/rafttransport/identity.go`, `stream.go`, and `transport.go`
+- `docs/design/raft-peer-transport.md`

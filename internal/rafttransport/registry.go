@@ -1,9 +1,10 @@
-// Package rafttransport provides a bounded static identity registry and a
-// current-format ordinary-message frame boundary for Multi-Raft.
+// Package rafttransport provides a bounded static identity registry, a
+// current-format ordinary-message frame boundary, and a composable
+// authenticated peer-stream foundation for Multi-Raft.
 //
-// It does not implement authentication or a network transport. A future
-// authenticated connection supplies the enrolled NodeID presented to frame
-// admission.
+// The transport foundation is not wired into multiraft.Host serving. Callers
+// must supply connection discovery, enrolled certificates, listener ownership,
+// and the exact trusted topology snapshot.
 package rafttransport
 
 import (
@@ -39,8 +40,8 @@ var (
 	ErrNodeNotFound    = errors.New("rafttransport: node not found")
 )
 
-// NodeID identifies one enrolled endpoint. A future authenticated transport
-// must independently bind its peer principal to this value.
+// NodeID identifies one enrolled endpoint. PeerTLS derives this exact binary
+// principal from a verified critical certificate extension.
 type NodeID [16]byte
 
 // MemberRole is the immutable static Raft role authorized by a roster.
@@ -90,10 +91,12 @@ type nodeKey struct {
 // serving authority.
 type StaticRegistry struct {
 	local        NodeID
+	trustDomain  TrustDomain
 	nodes        map[memberKey]memberRecord
 	members      map[nodeKey]uint64
 	localMembers map[raftmember.GroupKey]uint64
 	digests      map[raftmember.GroupKey][sha256.Size]byte
+	canonical    frameBufferPool
 }
 
 // NewStaticRegistry validates and copies one current static roster before
@@ -103,6 +106,9 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 	maxMembers, err := validateLimits(limits)
 	if err != nil {
 		return nil, err
+	}
+	if len(members) == 0 {
+		return nil, ErrInvalidGroup
 	}
 	if len(members) > limits.MaxMembers || len(members) > maxMembers {
 		return nil, fmt.Errorf("%w: members %d exceed %d", ErrRegistryBound, len(members), limits.MaxMembers)
@@ -117,6 +123,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		members:      make(map[nodeKey]uint64, len(members)),
 		localMembers: make(map[raftmember.GroupKey]uint64),
 		digests:      make(map[raftmember.GroupKey][sha256.Size]byte),
+		canonical:    frameBufferPool{retain: DefaultRetainedFrameBytes},
 	}
 	groups := make(map[raftmember.GroupKey]struct{})
 	groupMembers := make(map[raftmember.GroupKey]int)
@@ -127,6 +134,15 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		member := members[i]
 		if err := validateMember(member); err != nil {
 			return nil, fmt.Errorf("member %d: %w", i, err)
+		}
+		memberDomain := TrustDomain{
+			ClusterID:          member.Group.ClusterID,
+			ClusterIncarnation: member.Group.ClusterIncarnation,
+		}
+		if i == 0 {
+			registry.trustDomain = memberDomain
+		} else if memberDomain != registry.trustDomain {
+			return nil, fmt.Errorf("member %d: %w: mixed trust domain", i, ErrInvalidGroup)
 		}
 
 		memberKey := memberKey{group: member.Group, memberID: member.MemberID}
@@ -225,6 +241,15 @@ func (registry *StaticRegistry) LocalNode() NodeID {
 		return NodeID{}
 	}
 	return registry.local
+}
+
+// TrustDomain returns the single cluster identity bound to every group in the
+// immutable registry.
+func (registry *StaticRegistry) TrustDomain() TrustDomain {
+	if registry == nil {
+		return TrustDomain{}
+	}
+	return registry.trustDomain
 }
 
 // LocalMember returns the sole local member ID for group.

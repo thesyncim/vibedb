@@ -47,7 +47,9 @@ func TestDecodedTransportMessageTransfersIntoHostWithoutSecondClone(t *testing.T
 	if err != nil || destination != localNode {
 		t.Fatalf("EncodeOutbound = %x, %v", destination, err)
 	}
-	inbound, err := receiver.DecodeInbound(remoteNode, frame)
+	inbound, err := receiver.DecodeInbound(rafttransport.PeerIdentity{
+		TrustDomain: receiver.TrustDomain(), Node: remoteNode,
+	}, frame)
 	if err != nil {
 		t.Fatal(err)
 	}
