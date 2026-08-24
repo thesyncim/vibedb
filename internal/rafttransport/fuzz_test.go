@@ -20,8 +20,13 @@ func FuzzDecodeInbound(f *testing.F) {
 		pb.MsgHeartbeatResp,
 		pb.MsgPreVote,
 		pb.MsgPreVoteResp,
+		pb.MsgTimeoutNow,
 	} {
-		f.Add(frameTestEncode(f, sender, group, frameTestMessage(messageType, from, to)))
+		message := frameTestMessage(messageType, from, to)
+		if messageType == pb.MsgTimeoutNow {
+			message = frameTimeoutNow(from, to, 5)
+		}
+		f.Add(frameTestEncode(f, sender, group, message))
 	}
 	f.Add([]byte(nil))
 	f.Add([]byte("VDRF"))
@@ -52,8 +57,11 @@ func FuzzDecodeInbound(f *testing.F) {
 }
 
 func FuzzPreflightOrdinaryPayload(f *testing.F) {
-	for _, messageType := range []pb.MessageType{pb.MsgApp, pb.MsgHeartbeat, pb.MsgVote} {
+	for _, messageType := range []pb.MessageType{pb.MsgApp, pb.MsgHeartbeat, pb.MsgVote, pb.MsgTimeoutNow} {
 		frame := frameTestMessage(messageType, 12, 11)
+		if messageType == pb.MsgTimeoutNow {
+			frame = frameTimeoutNow(12, 11, 5)
+		}
 		encoded := frameTestEncode(f, mustFuzzSender(f), testGroup(32), frame)
 		f.Add(bytes.Clone(encoded[FrameHeaderBytes:]))
 	}
