@@ -48,6 +48,25 @@ missing participant at the initial revision.
 The durable coordinator commit is the commit point. Apply and cleanup can
 finish later.
 
+### SQL-atomic apply marker
+
+A SQL participant publishes its user-table mutation and one hidden applied
+marker through the same database transaction log. The marker is keyed by the
+raw 16-byte transaction ID and retains only the applied revision and affected
+row count; the larger staged mutation remains in the participant journal.
+
+Before publication, an existing marker is read under the catalog write lock.
+An exact revision match returns the retained affected-row count and discards
+the retry's SQL mutation. A different revision or malformed marker reports a
+distributed transaction conflict, so neither retry path republishes user
+data.
+
+The hidden collection uses raw opaque values. Its compact binary codec is part
+of the repository's unreleased format 0, not JSON and not a released protocol
+version. The sole codec sentinel admits only the current grammar; stale
+development text fails closed without a v2/v3 compatibility or migration
+ladder. `docs/format.md` records the exact envelope and storage bounds.
+
 Participant staging acquires scoped durable barriers. An overlapping
 participant fails fast. This behavior prevents a cross-shard deadlock.
 Disjoint bucket scopes can proceed concurrently.

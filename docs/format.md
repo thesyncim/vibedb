@@ -115,6 +115,33 @@ decision log has no matching decision, recovery presumes abort. A committed
 decision rolls all participants forward. Missing `txn.vtm` or a missing
 required participant fails closed when conditional records remain.
 
+## Distributed SQL participant apply state
+
+`distributed-transaction-state.vjc` is a private synchronous collection keyed
+by the exact 16-byte distributed transaction ID. Its values are raw opaque
+bytes, not JSON documents. The collection fixes both `InlineValueBytes` and
+`MaxDocumentBytes` at 27, admits one mutation per batch, and fixes
+`MaxBatchBytes` at 43: one 16-byte key plus one maximum 27-byte value.
+
+The apply value belongs to the single unreleased format-0 image and has this
+canonical grammar:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic `VDPA` |
+| 4 | 1 | Codec sentinel `0` |
+| 5 | 1 | Fixed `ParticipantApplied` state (`3`) |
+| 6 | 2 | Required zero reserved bytes |
+| 8 | 1-10 | Canonical unsigned-varint revision, greater than zero |
+| next | 1-9 | Canonical unsigned-varint affected-row count, at most `MaxInt64` |
+
+The record is exactly 10 to 27 bytes and has no trailing padding. Decode
+requires exact exhaustion and rejects overlong, overflowing, or truncated
+varints. The codec sentinel selects the sole current grammar; it is not a
+released version or a compatibility dispatch point. Earlier development
+decimal-JSON values fail closed. Format 0 replaces them in place and has no
+v2/v3 decoder or migration ladder.
+
 ## Database directory names
 
 The durable database encodes a logical collection name as:
