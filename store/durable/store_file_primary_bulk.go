@@ -38,6 +38,11 @@ func CreateFromRecords(
 	if file == nil {
 		return 0, fmt.Errorf("vibedb: CreateFromRecords requires a non-nil file")
 	}
+	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseNamespace()
 	if err := storeio.LockWriter(file); err != nil {
 		return 0, err
 	}
@@ -128,6 +133,11 @@ func CreateFromPrimary(
 			"vibedb: CreateFromPrimary requires non-nil collection and file",
 		)
 	}
+	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseNamespace()
 	if err := storeio.LockWriter(file); err != nil {
 		return 0, err
 	}

@@ -2192,6 +2192,72 @@ func (rj *RecoveryJournal) RecycleResolved(
 	return rj.recycleHeader(baseGeneration, powerSafe)
 }
 
+// RecycleCertifiedPrefix advances the journal head under a stronger prefix
+// authority than an ordinary transaction resolver. The live window must
+// contain only consecutive conditional prepares. Committed prepares form one
+// prefix covered by baseGeneration; every later prepare is an aborted suffix
+// whose physical generation is validated but need not be covered by the root.
+// This is the narrow primitive used by a checkpoint-group certificate: the
+// certificate, rather than txn.vtm, decides one contiguous transaction cut.
+func (rj *RecoveryJournal) RecycleCertifiedPrefix(
+	baseGeneration uint64,
+	powerSafe bool,
+	resolve RecoveryConditionalResolver,
+) error {
+	if baseGeneration < rj.header.BaseGeneration {
+		return fmt.Errorf("%w: recycle base generation regressed", ErrGenerationOrder)
+	}
+	if resolve == nil {
+		return fmt.Errorf(
+			"%w: certified-prefix recycle requires a resolver",
+			ErrInvalidWrite,
+		)
+	}
+	if rj.cursor != 0 {
+		preparedGeneration := rj.header.BaseGeneration
+		abortedSuffix := false
+		if err := rj.Replay(
+			rj.header.BaseGeneration, func(rec RecoveryRecord) error {
+				if rec.Kind != recoveryRecordKindConditionalBatch {
+					return recoveryJournalSemanticError(
+						"certified-prefix window contains a nonconditional record",
+					)
+				}
+				if preparedGeneration == ^uint64(0) ||
+					rec.Generation != preparedGeneration+1 {
+					return recoveryJournalSemanticError(
+						"certified-prefix prepares do not form one physical generation chain",
+					)
+				}
+				preparedGeneration = rec.Generation
+				committed, err := resolve(rec.Conditional, rec.Generation)
+				if err != nil {
+					return err
+				}
+				if !committed {
+					abortedSuffix = true
+					return nil
+				}
+				if abortedSuffix {
+					return recoveryJournalSemanticError(
+						"certified-prefix commit follows an aborted prepare",
+					)
+				}
+				if rec.Generation > baseGeneration {
+					return fmt.Errorf(
+						"%w: committed conditional generation %d is not covered by recycle generation %d",
+						ErrGenerationOrder, rec.Generation, baseGeneration,
+					)
+				}
+				return nil
+			},
+		); err != nil {
+			return err
+		}
+	}
+	return rj.recycleHeader(baseGeneration, powerSafe)
+}
+
 func (rj *RecoveryJournal) recycleHeader(
 	baseGeneration uint64, powerSafe bool,
 ) error {

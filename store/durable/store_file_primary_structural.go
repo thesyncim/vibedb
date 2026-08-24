@@ -346,6 +346,9 @@ func (c *Collection) commitPrimaryStructural(
 	kind primaryStructuralKind,
 	stage structuralLeafStager,
 ) (err error) {
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	start := time.Now()
 	generation := state.root.Generation + 1
 	if generation == 0 || generation >= uint64(1)<<48 {

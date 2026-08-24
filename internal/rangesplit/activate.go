@@ -25,7 +25,7 @@ type ChildActivationTarget struct {
 	ArtifactOptions replicatedstate.SnapshotArtifactOptions
 }
 
-// InitializeReplicatedChild binds a sealed, reverified child image to a
+// InitializeReplicatedChild binds an authenticated sealed child image to a
 // standard replicated-state snapshot base without a second durable user-row
 // copy. The returned base still must be installed into the child's Raft runtime;
 // this method grants no serving authority.
@@ -38,25 +38,48 @@ func (s *ChildStage) InitializeReplicatedChild(
 	manifest replicatedstate.SnapshotArtifactManifest,
 	err error,
 ) {
+	prepared, err := s.PrepareReplicatedChild(certificate, target)
+	if err != nil {
+		return nil, nil, replicatedstate.SnapshotArtifactManifest{}, err
+	}
+	return prepared.Initialize()
+}
+
+// PrepareReplicatedChild authenticates the sealed child and performs the sole
+// replicated-state image audit without mutation. The returned preparation can
+// first be bound to a seeded checkpoint-group certificate, then finished
+// without another child-image or canonical-image scan.
+func (s *ChildStage) PrepareReplicatedChild(
+	certificate CutoverCertificate,
+	target ChildActivationTarget,
+) (*replicatedstate.StagedSnapshotPreparation, error) {
 	if s == nil || target.User.Target.Collection == nil {
-		return nil, nil, replicatedstate.SnapshotArtifactManifest{}, ErrChildStage
+		return nil, ErrChildStage
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.validActivationLocked(certificate, target.Binding) ||
 		target.User.Name != s.partitioner.collection ||
 		target.User.Target.Collection != s.collection {
-		return nil, nil, replicatedstate.SnapshotArtifactManifest{}, ErrChildStage
+		return nil, ErrChildStage
 	}
+	var imageAudit childStageSealedImageAudit
+	if err := imageAudit.begin(s, s.cursor); err != nil {
+		return nil, err
+	}
+	defer imageAudit.close()
 	entryDigest := childActivationEntryDigest(
 		certificate, s.cursor.child, target.Binding,
 	)
-	return replicatedstate.InitializeStagedSnapshot(
+	return replicatedstate.PrepareStagedSnapshot(
 		target.Binding, target.StaticBootstrap, target.System, target.User,
 		target.TxnLog, target.MachineOptions,
 		replicatedstate.StagedSnapshotCut{
 			Applied: certificate.cut.Applied, Term: certificate.cut.Term,
 			EntryDigest: entryDigest,
+			ImageAudit: replicatedstate.StagedSnapshotImageAudit{
+				Visit: imageAudit.visit, Finish: imageAudit.finish,
+			},
 		},
 		target.ArtifactOptions,
 	)
@@ -67,12 +90,13 @@ func (s *ChildStage) validActivationLocked(
 	binding replicatedstate.Binding,
 ) bool {
 	return s.validActivationCoordinatesLocked(certificate, binding) &&
-		s.verifySealedImage(s.cursor) == nil
+		s.sealedVerified
 }
 
 // CheckActivationCoordinates validates the sealed cursor, cutover
 // certificate, and destination binding without rescanning the child image.
-// InitializeReplicatedChild performs the full image scan before mutation.
+// PrepareReplicatedChild performs the full replicated-state image audit before
+// mutation; the stage-layer sealed-image proof is reused from seal/reopen.
 func (s *ChildStage) CheckActivationCoordinates(
 	certificate CutoverCertificate,
 	binding replicatedstate.Binding,
@@ -82,7 +106,7 @@ func (s *ChildStage) CheckActivationCoordinates(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.validActivationCoordinatesLocked(certificate, binding) {
+	if !s.sealedVerified || !s.validActivationCoordinatesLocked(certificate, binding) {
 		return ErrChildStage
 	}
 	return nil

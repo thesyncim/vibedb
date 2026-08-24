@@ -103,6 +103,9 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 			c.durabilityWait.Done()
 		}
 	}()
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if c.closed {
 		return ErrClosed
 	}

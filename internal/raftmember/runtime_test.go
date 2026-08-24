@@ -208,6 +208,19 @@ func TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation(t *testing.T) {
 
 func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	fixture := newRuntimeFixture(t, 220, nil)
+	status, err := fixture.runtime.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence, err := fixture.runtime.WALRetentionInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CheckpointApplied != fence || fence != fixture.apply.CheckpointAppliedIndex() ||
+		fence > status.Applied {
+		t.Fatalf("runtime checkpoint fence = status %+v fence %d apply %d",
+			status, fence, fixture.apply.CheckpointAppliedIndex())
+	}
 	drainRuntime(t, fixture.runtime, nil)
 	if err := fixture.runtime.Campaign(); err != nil {
 		t.Fatal(err)

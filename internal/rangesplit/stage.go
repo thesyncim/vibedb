@@ -45,6 +45,11 @@ type ChildStage struct {
 	expected    ChildArtifactManifest
 	collection  *durable.Collection
 	cursor      *ChildStageCursor
+	// sealedVerified records the full image proof performed either while the
+	// sealed cursor was reopened or immediately before that cursor was durably
+	// published. Activation reuses this authenticated proof instead of scanning
+	// the same child-stage image a second time.
+	sealedVerified bool
 
 	checkpointBytes uint64
 	persistedOffset uint64
@@ -111,6 +116,7 @@ func NewChildStageWithOptions(
 		if cursor.phase == ChildStageSealed && stage.verifySealedImage(cursor) != nil {
 			return nil, ErrChildStage
 		}
+		stage.sealedVerified = cursor.phase == ChildStageSealed
 	}
 	return stage, nil
 }
@@ -289,13 +295,20 @@ func (s *ChildStage) ApplyTailBatch(
 	next.dataChainDigest = batch.AfterDataChainDigest
 	next.routeGeneration = batch.AfterRouteGeneration
 	next.lastBatchDigest = batch.Digest
-	if batch.beforeCoordinates() != batch.afterCoordinates() {
+	sealed := batch.beforeCoordinates() != batch.afterCoordinates()
+	if sealed {
 		next.phase = ChildStageSealed
 		if err := s.certifySealedImage(&next); err != nil {
 			return err
 		}
 	}
-	return s.persistCursor(&next, persist)
+	if err := s.persistCursor(&next, persist); err != nil {
+		return err
+	}
+	if sealed {
+		s.sealedVerified = true
+	}
+	return nil
 }
 
 func (s *ChildStage) validTailBatchCoordinates(

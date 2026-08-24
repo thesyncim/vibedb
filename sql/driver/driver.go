@@ -193,10 +193,10 @@ func (c *dbConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
-	if c.closed {
+	if c.closed || c.db == nil {
 		return nil, sqldriver.ErrBadConn
 	}
-	if c.exclusive {
+	if c.exclusive || c.db.replicatedSeedPending {
 		return nil, ErrReplicatedChildStageBusy
 	}
 	c.refs++

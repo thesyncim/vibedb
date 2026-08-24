@@ -58,6 +58,47 @@ func bindReplicatedApplyTestRoot(
 	return path, database, identity
 }
 
+// corruptReplicatedApplyCollectionForTest injects a deliberately invalid
+// logical image through the owning checkpoint group's same-applied transition.
+// Keeping this seam in test code preserves the production direct-write fence.
+func corruptReplicatedApplyCollectionForTest(
+	t *testing.T,
+	database *Database,
+	identity ReplicatedShardStoreIdentity,
+	limits durable.TxnLimits,
+	name string,
+	mutate func(*durable.WriteBatch) error,
+) {
+	t.Helper()
+	core := database.connector.db
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	table := core.tables[identity.UserTable]
+	if core.checkpointGroup == nil || core.replicatedApplyCollection == nil ||
+		table == nil || table.collection == nil {
+		t.Fatal("replicated apply checkpoint group is unavailable")
+	}
+	members := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: identity.UserTable, Collection: table.collection},
+	}
+	if !core.checkpointGroup.Owns(members) {
+		t.Fatal("replicated apply checkpoint group has unexpected membership")
+	}
+	if err := core.checkpointGroup.Update(
+		core.checkpointGroup.AppliedIndex(), members, limits,
+		func(batch *durable.DatabaseBatch) error {
+			collection, err := batch.Collection(name)
+			if err != nil {
+				return err
+			}
+			return mutate(collection)
+		},
+	); err != nil {
+		t.Fatalf("inject replicated apply corruption into %q: %v", name, err)
+	}
+}
+
 func testReplicatedApplyCommand(
 	identity ReplicatedShardStoreIdentity,
 	clientEpoch uint64,
@@ -155,6 +196,67 @@ func testReplicatedApplyKey(t *testing.T, database *Database, document []byte) [
 		t.Fatalf("documentKey(%s): %v", document, err)
 	}
 	return []byte(key)
+}
+
+func TestReplicatedApplyUsesReplayBackedCheckpointGroup(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "checkpoint-group")
+	bootstrap := testReplicatedApplyBootstrap()
+	claim, _, err := database.OpenReplicatedApply(
+		base, bootstrap, testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Applied() != 1 || claim.CheckpointAppliedIndex() != 0 {
+		t.Fatalf("bootstrap cuts = applied %d checkpoint %d",
+			claim.Applied(), claim.CheckpointAppliedIndex())
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	group := core.checkpointGroup
+	user := core.tables[base.UserTable].collection
+	core.mu.RUnlock()
+	if group == nil {
+		t.Fatal("replicated apply did not attach a checkpoint group")
+	}
+	stats := group.Stats()
+	if stats.Updates != 1 || stats.BarrierSyncs != 0 ||
+		stats.JournalSyncs != 0 || stats.MarkerSyncs != 0 ||
+		stats.CertificateSyncs != 0 {
+		t.Fatalf("bootstrap apply sync stats = %+v", stats)
+	}
+	if _, err := user.Put([]byte("direct"), []byte(`{"id":"direct"}`)); !errors.Is(err, durable.ErrCheckpointGroupOwned) {
+		t.Fatalf("direct replicated user Put = %v", err)
+	}
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if claim.CheckpointAppliedIndex() != 1 {
+		t.Fatalf("checkpoint cut = %d", claim.CheckpointAppliedIndex())
+	}
+	stats = group.Stats()
+	if stats.BarrierSyncs != 3 || stats.MarkerSyncs != 0 {
+		t.Fatalf("checkpoint sync stats = %+v", stats)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reacquired, _, err := database.OpenReplicatedApply(
+		base, bootstrap, testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatalf("reacquire checkpoint-owned apply: %v", err)
+	}
+	if reacquired.Applied() != 1 || reacquired.CheckpointAppliedIndex() != 1 {
+		t.Fatalf("reacquired cuts = applied %d checkpoint %d",
+			reacquired.Applied(), reacquired.CheckpointAppliedIndex())
+	}
+	if err := reacquired.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *testing.T) {
@@ -309,16 +411,32 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
 	}
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("uninitialized capacity profile = %+v, %v; want %+v", got, err, want)
+	checkpoint := uint64(0)
+	assertProfile := func(label string, want ReplicatedApplyCapacityProfile, maxCheckpoint uint64) {
+		t.Helper()
+		got, err := claim.CapacityQualificationProfile()
+		if err != nil {
+			t.Fatalf("%s capacity profile: %v", label, err)
+		}
+		if got.CheckpointApplied < checkpoint || got.CheckpointApplied > maxCheckpoint ||
+			got.CheckpointApplied > got.Applied {
+			t.Fatalf(
+				"%s checkpoint cut = %d, want monotonic [%d,%d] at applied %d",
+				label, got.CheckpointApplied, checkpoint, maxCheckpoint, got.Applied,
+			)
+		}
+		checkpoint = got.CheckpointApplied
+		got.CheckpointApplied = 0
+		if got != want {
+			t.Fatalf("%s capacity profile = %+v; want %+v", label, got, want)
+		}
 	}
+	assertProfile("uninitialized", want, 0)
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
 	want.Initialized, want.Applied = true, 1
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("bootstrap capacity profile = %+v, %v; want %+v", got, err, want)
-	}
+	assertProfile("bootstrap", want, 0)
 
 	document := []byte(`{"id":"capacity"}`)
 	key := testReplicatedApplyKey(t, database, document)
@@ -331,9 +449,10 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}
 	want.Applied, want.SessionCount, want.SessionSlotCount = 3, 1, 2
 	want.SessionEpochHighWater = epoch
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
-	}
+	// Pressure is deliberately a pre-publication barrier. Platform allocation
+	// geometry may make it certify either earlier prefix, but never the just-
+	// published index 3 transition and never a cut behind the prior observation.
+	assertProfile("applied", want, 2)
 
 	view, err := replication.OpenCommand(command)
 	if err != nil {
@@ -354,11 +473,12 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	} else {
 		document[8] = '0'
 	}
-	if err := core.replicatedApplyCollection.Update(func(batch *durable.WriteBatch) error {
-		return batch.Put(storageKey[:], document)
-	}); err != nil {
-		t.Fatal(err)
-	}
+	corruptReplicatedApplyCollectionForTest(
+		t, database, base, options.TxnLimits, replicatedstate.SystemCollectionName,
+		func(batch *durable.WriteBatch) error {
+			return batch.Put(storageKey[:], document)
+		},
+	)
 	if err := claim.AdmitCommand(command); !errors.Is(err, replicatedstate.ErrSessionCorrupt) ||
 		!errors.Is(err, replicatedstate.ErrApplyPoisoned) {
 		t.Fatalf("first corrupt admission = %v, want session corruption plus poison", err)
@@ -774,9 +894,10 @@ func TestReplicatedApplyPlacementRangeAndAdmissionParity(t *testing.T) {
 	// A forbidden out-of-band row is never followed by another apply. Capturing
 	// a coherent cut remains cheap; the explicit canonical audit independently
 	// re-routes the complete image and rejects the row.
-	if _, err := database.connector.db.tables["docs"].collection.Put(upper.key, upper.document); err != nil {
-		t.Fatal(err)
-	}
+	corruptReplicatedApplyCollectionForTest(
+		t, database, base, options.TxnLimits, base.UserTable,
+		func(batch *durable.WriteBatch) error { return batch.Put(upper.key, upper.document) },
+	)
 	snapshot, err := claim.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatalf("coherent snapshot = %v", err)
@@ -1358,11 +1479,12 @@ func TestReplicatedApplyOpenFullScanRejectsPrimaryMismatch(t *testing.T) {
 	}
 	// Simulate a forbidden out-of-band mutation to an individually valid JSON
 	// row whose document primary no longer matches its physical key.
-	if _, err := database.connector.db.tables["docs"].collection.Put(
-		key, []byte(`{"id":"other"}`),
-	); err != nil {
-		t.Fatal(err)
-	}
+	corruptReplicatedApplyCollectionForTest(
+		t, database, base, options.TxnLimits, base.UserTable,
+		func(batch *durable.WriteBatch) error {
+			return batch.Put(key, []byte(`{"id":"other"}`))
+		},
+	)
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1401,9 +1523,10 @@ func TestReplicatedApplyOpenFullScanRejectsWrongShard(t *testing.T) {
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.connector.db.tables["docs"].collection.Put(upper.key, upper.document); err != nil {
-		t.Fatal(err)
-	}
+	corruptReplicatedApplyCollectionForTest(
+		t, database, base, options.TxnLimits, base.UserTable,
+		func(batch *durable.WriteBatch) error { return batch.Put(upper.key, upper.document) },
+	)
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1585,8 +1708,6 @@ func TestReplicatedApplyClaimConnectorLifetime(t *testing.T) {
 
 func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing.T) {
 	_, database, binding, _ := prepareReplicatedTestRoot(t, "observer-unknown", false)
-	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
-	t.Cleanup(restore)
 	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	claim, _, err := database.OpenReplicatedApply(
 		base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
@@ -1607,10 +1728,15 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
+	// Fault this transition's completed decision append directly. There is no
+	// marker Sync on the steady group path, and adding one here would invalidate
+	// the durability contract this regression exercises.
+	restore := durable.InstallCheckpointGroupDecisionAppendFaultForFacadeTest()
+	t.Cleanup(restore)
 	clock := &database.connector.db.tables["docs"].conflicts
 	before := clock.observe()
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-		t.Fatalf("decision-sync apply = %v, want unknown outcome", err)
+		t.Fatalf("decision-append apply = %v, want unknown outcome", err)
 	}
 	if after := clock.observe(); after <= before {
 		t.Fatalf("unknown publication did not advance conflict clock: before=%d after=%d",

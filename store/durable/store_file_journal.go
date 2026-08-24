@@ -657,12 +657,37 @@ func (c *Collection) preflightRecoveryJournalResolved(
 	resolve recoveryJournalDecisionResolver,
 	markerEpoch uint64,
 ) error {
+	return c.preflightRecoveryJournalResolvedPolicy(resolve, markerEpoch, false)
+}
+
+// preflightRecoveryJournalCertifiedPrefix is the checkpoint-group variant.
+// Unlike ordinary transaction recovery, an aborted prepare still consumes its
+// physical prepare generation; all aborts must form one terminal suffix.
+func (c *Collection) preflightRecoveryJournalCertifiedPrefix(
+	resolve recoveryJournalDecisionResolver,
+	markerEpoch uint64,
+) error {
+	return c.preflightRecoveryJournalResolvedPolicy(resolve, markerEpoch, true)
+}
+
+func (c *Collection) preflightRecoveryJournalResolvedPolicy(
+	resolve recoveryJournalDecisionResolver,
+	markerEpoch uint64,
+	certifiedPrefix bool,
+) error {
 	if c == nil || !c.journalEnabled() || c.journal.Cursor() == 0 {
 		return nil
 	}
 	logicalGeneration := c.journal.BaseGeneration()
+	abortedSuffix := false
 	return c.journal.Replay(logicalGeneration, func(rec storeio.RecoveryRecord) error {
 		if rec.Kind == storeio.RecoveryRecordKindDeltaBatch {
+			if certifiedPrefix {
+				return fmt.Errorf(
+					"%w: certified-prefix journal contains a delta record",
+					storeio.ErrRecoveryJournalRecord,
+				)
+			}
 			return nil
 		}
 		if logicalGeneration == ^uint64(0) ||
@@ -674,6 +699,12 @@ func (c *Collection) preflightRecoveryJournalResolved(
 			)
 		}
 		if rec.Kind != storeio.RecoveryRecordKindConditionalBatch {
+			if certifiedPrefix {
+				return fmt.Errorf(
+					"%w: certified-prefix journal contains record kind %d",
+					storeio.ErrRecoveryJournalRecord, rec.Kind,
+				)
+			}
 			logicalGeneration = rec.Generation
 			return nil
 		}
@@ -696,7 +727,18 @@ func (c *Collection) preflightRecoveryJournalResolved(
 		if err != nil {
 			return err
 		}
-		if committed {
+		if certifiedPrefix {
+			if committed && abortedSuffix {
+				return fmt.Errorf(
+					"%w: certified-prefix commit follows an aborted prepare",
+					storeio.ErrRecoveryJournalRecord,
+				)
+			}
+			if !committed {
+				abortedSuffix = true
+			}
+			logicalGeneration = rec.Generation
+		} else if committed {
 			logicalGeneration = rec.Generation
 		}
 		return nil
@@ -713,6 +755,27 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 	resolve recoveryJournalDecisionResolver,
 	markerEpoch uint64,
 ) error {
+	return c.replayRecoveryJournalResolvedPolicyLocked(
+		rootGeneration, resolve, markerEpoch, false,
+	)
+}
+
+func (c *Collection) replayRecoveryJournalCertifiedPrefixLocked(
+	rootGeneration uint64,
+	resolve recoveryJournalDecisionResolver,
+	markerEpoch uint64,
+) error {
+	return c.replayRecoveryJournalResolvedPolicyLocked(
+		rootGeneration, resolve, markerEpoch, true,
+	)
+}
+
+func (c *Collection) replayRecoveryJournalResolvedPolicyLocked(
+	rootGeneration uint64,
+	resolve recoveryJournalDecisionResolver,
+	markerEpoch uint64,
+	certifiedPrefix bool,
+) error {
 	c.journalReplaying = true
 	defer func() { c.journalReplaying = false }()
 	// OpenRecoveryJournal has just validated the complete live region and
@@ -728,6 +791,7 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 	conditionalOutcomes := make(map[uint64]bool)
 	recycleOutcomes := make(map[recoveryConditionalOutcomeIdentity]bool)
 	logicalGeneration := replayAfter
+	abortedSuffix := false
 	// Resolve the whole atomic window and simulate its decision-aware generation
 	// chain before the first mutation. An aborted conditional does not consume
 	// its prepared generation, so a following record may reuse it; a committed
@@ -736,6 +800,12 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 	// pressure-checkpointed the collection.
 	if err := c.journal.Replay(replayAfter, func(rec storeio.RecoveryRecord) error {
 		if rec.Kind == storeio.RecoveryRecordKindDeltaBatch {
+			if certifiedPrefix {
+				return fmt.Errorf(
+					"%w: certified-prefix journal contains a delta record",
+					storeio.ErrRecoveryJournalRecord,
+				)
+			}
 			return nil
 		}
 		if logicalGeneration == ^uint64(0) ||
@@ -747,6 +817,12 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 			)
 		}
 		if rec.Kind != storeio.RecoveryRecordKindConditionalBatch {
+			if certifiedPrefix {
+				return fmt.Errorf(
+					"%w: certified-prefix journal contains record kind %d",
+					storeio.ErrRecoveryJournalRecord, rec.Kind,
+				)
+			}
 			logicalGeneration = rec.Generation
 			return nil
 		}
@@ -776,7 +852,18 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 			txnID:      rec.Conditional.TxnID,
 			generation: rec.Generation,
 		}] = committed
-		if committed {
+		if certifiedPrefix {
+			if committed && abortedSuffix {
+				return fmt.Errorf(
+					"%w: certified-prefix commit follows an aborted prepare",
+					storeio.ErrRecoveryJournalRecord,
+				)
+			}
+			if !committed {
+				abortedSuffix = true
+			}
+			logicalGeneration = rec.Generation
+		} else if committed {
 			logicalGeneration = rec.Generation
 		}
 		return nil
@@ -987,25 +1074,33 @@ func (c *Collection) replayRecoveryJournalResolvedLocked(
 	}
 	c.journalReplaying = false
 	physicalGeneration := c.committer.DurableGeneration()
-	if err := c.recycleRecoveryJournalResolvedLocked(
-		physicalGeneration,
-		func(
-			header storeio.RecoveryConditionalHeader, generation uint64,
-		) (bool, error) {
-			committed, ok := recycleOutcomes[recoveryConditionalOutcomeIdentity{
-				markerID: header.MarkerID, epoch: header.MarkerEpoch,
-				txnID: header.TxnID, generation: generation,
-			}]
-			if !ok {
-				return false, fmt.Errorf(
-					"%w: conditional transaction %d generation %d was not preflighted",
-					storeio.ErrRecoveryJournalRecord, header.TxnID, generation,
-				)
-			}
-			return committed, nil
-		},
-	); err != nil {
-		return err
+	recycleResolver := func(
+		header storeio.RecoveryConditionalHeader, generation uint64,
+	) (bool, error) {
+		committed, ok := recycleOutcomes[recoveryConditionalOutcomeIdentity{
+			markerID: header.MarkerID, epoch: header.MarkerEpoch,
+			txnID: header.TxnID, generation: generation,
+		}]
+		if !ok {
+			return false, fmt.Errorf(
+				"%w: conditional transaction %d generation %d was not preflighted",
+				storeio.ErrRecoveryJournalRecord, header.TxnID, generation,
+			)
+		}
+		return committed, nil
+	}
+	var recycleErr error
+	if certifiedPrefix {
+		recycleErr = c.recycleRecoveryJournalCertifiedPrefixLocked(
+			physicalGeneration, recycleResolver,
+		)
+	} else {
+		recycleErr = c.recycleRecoveryJournalResolvedLocked(
+			physicalGeneration, recycleResolver,
+		)
+	}
+	if recycleErr != nil {
+		return recycleErr
 	}
 	// Normal physical completion owns this hook. Recovery recycles directly
 	// after its final fold, so it performs the same one bounded pass explicitly.
@@ -1075,6 +1170,23 @@ func (c *Collection) recycleRecoveryJournalResolvedLocked(
 	return c.finishRecoveryJournalRecycleLocked(
 		baseGeneration,
 		c.journal.RecycleResolved(
+			baseGeneration, c.journalPowerSafe, resolve,
+		),
+	)
+}
+
+func (c *Collection) recycleRecoveryJournalCertifiedPrefixLocked(
+	baseGeneration uint64, resolve storeio.RecoveryConditionalResolver,
+) error {
+	if !c.journalEnabled() || baseGeneration == 0 {
+		return nil
+	}
+	if baseGeneration < c.journal.BaseGeneration() {
+		return nil
+	}
+	return c.finishRecoveryJournalRecycleLocked(
+		baseGeneration,
+		c.journal.RecycleCertifiedPrefix(
 			baseGeneration, c.journalPowerSafe, resolve,
 		),
 	)
@@ -1183,6 +1295,42 @@ func (c *Collection) checkpointPastConditionalsLocked(
 	}
 	physicalGeneration := c.committer.DurableGeneration()
 	if err := c.recycleRecoveryJournalResolvedLocked(
+		physicalGeneration,
+		func(
+			header storeio.RecoveryConditionalHeader, generation uint64,
+		) (bool, error) {
+			if resolve == nil {
+				return false, ErrCollectionInDoubt
+			}
+			return resolve(
+				header.MarkerID, header.MarkerEpoch, header.TxnID, generation,
+			)
+		},
+	); err != nil {
+		return err
+	}
+	c.automaticCheckpoints.Add(1)
+	return nil
+}
+
+// checkpointPastCertifiedPrefixConditionalsLocked is the fixed-group variant.
+// The authenticated certificate commits one prefix and aborts every later
+// prepare. Aborted physical generations are validated and discarded without
+// requiring the durable root to cover them.
+func (c *Collection) checkpointPastCertifiedPrefixConditionalsLocked(
+	resolve recoveryJournalDecisionResolver, markerEpoch uint64,
+) error {
+	if failure := c.PersistenceError(); failure != nil {
+		return failure
+	}
+	if err := c.preflightRecoveryJournalCertifiedPrefix(resolve, markerEpoch); err != nil {
+		return err
+	}
+	if err := c.checkpointBufferedLocked(); err != nil {
+		return err
+	}
+	physicalGeneration := c.committer.DurableGeneration()
+	if err := c.recycleRecoveryJournalCertifiedPrefixLocked(
 		physicalGeneration,
 		func(
 			header storeio.RecoveryConditionalHeader, generation uint64,

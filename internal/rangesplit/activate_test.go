@@ -217,6 +217,31 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 	}); allocs != 0 {
 		t.Fatalf("activation coordinate check allocations = %v, want 0", allocs)
 	}
+	afterSeal := documentForChild(t, partitioner, 1)
+	if _, err := userCollection.Put([]byte("valid-after-seal"), afterSeal); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := stage.InitializeReplicatedChild(
+		certificate, target,
+	); !errors.Is(err, ErrChildStage) || systemCollection.Len() != 0 {
+		t.Fatalf("post-seal insert activation err=%v systemRows=%d", err, systemCollection.Len())
+	}
+	if deleted, err := userCollection.Delete([]byte("valid-after-seal")); err != nil || !deleted {
+		t.Fatalf("restore post-seal insert deleted=%v err=%v", deleted, err)
+	}
+	replacement := append([]byte(nil), right[:len(right)-1]...)
+	replacement = append(replacement, []byte(`,"payload":"changed"}`)...)
+	if created, err := userCollection.Put([]byte("right"), replacement); err != nil || created {
+		t.Fatalf("post-seal replacement created=%v err=%v", created, err)
+	}
+	if _, _, _, err := stage.InitializeReplicatedChild(
+		certificate, target,
+	); !errors.Is(err, ErrChildStage) || systemCollection.Len() != 0 {
+		t.Fatalf("post-seal replacement activation err=%v systemRows=%d", err, systemCollection.Len())
+	}
+	if created, err := userCollection.Put([]byte("right"), right); err != nil || created {
+		t.Fatalf("restore post-seal replacement created=%v err=%v", created, err)
+	}
 	wrong := target
 	wrong.Binding.AllocationGeneration++
 	if _, _, _, err := stage.InitializeReplicatedChild(

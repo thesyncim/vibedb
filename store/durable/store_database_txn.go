@@ -105,10 +105,35 @@ type TxnLog struct {
 	// registered journal holds a current-epoch conditional.
 	undischarged int
 	poison       error
+	// checkpointGroup exclusively owns decision append/recycle while attached.
+	// It is protected by commitMu. Ordinary UpdateCollections must never borrow
+	// the marker during that interval.
+	checkpointGroup        *CheckpointGroup
+	checkpointGroupRetired bool
 
 	regMu       sync.Mutex
 	registered  map[*Collection]struct{}
 	collections []*Collection
+}
+
+func (l *TxnLog) checkpointGroupOwned() bool {
+	if l == nil {
+		return false
+	}
+	l.commitMu.Lock()
+	owned := l.checkpointGroup != nil
+	l.commitMu.Unlock()
+	return owned
+}
+
+func (l *TxnLog) checkpointGroupMutationFenced() bool {
+	if l == nil {
+		return false
+	}
+	l.commitMu.Lock()
+	fenced := l.checkpointGroup != nil || l.checkpointGroupRetired
+	l.commitMu.Unlock()
+	return fenced
 }
 
 // NewTxnLog constructs an unminted decision-log owner for a fresh catalog.
@@ -119,6 +144,10 @@ type TxnLog struct {
 func NewTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
 	log, err := newTxnLogDirectory(dir, options)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectCheckpointGroupCertificate(log.root); err != nil {
+		_ = log.Close()
 		return nil, err
 	}
 	if _, err := log.root.Lstat(txnMarkerFilename); err == nil {
@@ -205,6 +234,9 @@ func (l *TxnLog) ReconfigureUnminted(options TxnLogOptions) error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 
 	if err := ValidateTxnLogOptions(options); err != nil {
 		return err
@@ -248,6 +280,9 @@ func (l *TxnLog) EnsureMinted() error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 
 	if l.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
@@ -262,6 +297,46 @@ func (l *TxnLog) EnsureMinted() error {
 		return err
 	}
 	return l.verifyMarkerDirectoryLocked()
+}
+
+// QualifyMinted proves that the retained txn.vtm descriptor, pinned directory,
+// and complete registered catalog still name the exact live files opened by
+// this log. Unlike EnsureMinted it is strictly read-only: an absent marker is
+// an error, and an active CheckpointGroup is authenticated through its fixed
+// certificate and membership instead of being treated as permission to borrow
+// the group's mutation lane.
+func (l *TxnLog) QualifyMinted() error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	l.commitMu.Lock()
+	if l.checkpointGroupRetired {
+		l.commitMu.Unlock()
+		return ErrCheckpointGroupOwned
+	}
+	group := l.checkpointGroup
+	if group != nil {
+		// Preserve the group lock order. Close owns g.mu before commitMu and
+		// closes the certificate descriptor after releasing commitMu, so a
+		// qualifier must dispatch without retaining commitMu and let the group
+		// reacquire both locks in that same order.
+		l.commitMu.Unlock()
+		return group.qualifyLog(l)
+	}
+	defer l.commitMu.Unlock()
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil || l.marker == nil {
+		return fmt.Errorf("vibedb: transaction log marker is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func syncTxnLogDirectory(root *os.Root) error {
@@ -287,6 +362,9 @@ func (l *TxnLog) Close() error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil {
+		return ErrCheckpointGroupOwned
+	}
 	var markerErr, rootErr error
 	if l.marker != nil {
 		markerErr = l.marker.Close()
@@ -407,6 +485,19 @@ func (l *TxnLog) registerCollection(c *Collection) {
 	l.registerCollectionLocked(c)
 }
 
+func (l *TxnLog) registerCollectionUnlessCheckpointGroup(c *Collection) error {
+	if l == nil || c == nil {
+		return nil
+	}
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
+	l.registerCollectionLocked(c)
+	return nil
+}
+
 // AdoptCollection attaches a freshly published collection to an already-open
 // catalog transaction log. It is intentionally not a recovery API: the
 // collection must have an empty paired journal. The proof and registration run
@@ -418,6 +509,9 @@ func (l *TxnLog) AdoptCollection(c *Collection) error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 	if l.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
 	}
@@ -475,6 +569,9 @@ func (l *TxnLog) DetachCollection(c *Collection) error {
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 
 	l.regMu.Lock()
 	_, registered := l.registered[c]
@@ -590,6 +687,12 @@ func UpdateCollections(
 	}
 	if log == nil {
 		return fmt.Errorf("%w: nil transaction log", ErrTxnParticipant)
+	}
+	log.commitMu.Lock()
+	groupOwned := log.checkpointGroup != nil || log.checkpointGroupRetired
+	log.commitMu.Unlock()
+	if groupOwned {
+		return ErrCheckpointGroupOwned
 	}
 	ordered, err := validateTxnMembers(members)
 	if err != nil {
@@ -774,6 +877,9 @@ func (l *TxnLog) commitMulti(
 ) (err error) {
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
+	if l.checkpointGroup != nil || l.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 	if err := l.validateCollectionsLocked(members); err != nil {
 		return err
 	}
@@ -1145,7 +1251,9 @@ func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 	}
 	members := make([]NamedCollection, 0, len(d.order))
 	for _, entry := range d.order {
-		log.registerCollection(entry.collection)
+		if err := log.registerCollectionUnlessCheckpointGroup(entry.collection); err != nil {
+			return err
+		}
 		members = append(members, NamedCollection{
 			Name: entry.name, Collection: entry.collection,
 		})

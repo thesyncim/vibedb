@@ -1,6 +1,9 @@
 package durable
 
 func (c *Collection) checkpointBufferedLocked() error {
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	if failure := c.PersistenceError(); failure != nil {
 		return failure
 	}
@@ -26,6 +29,9 @@ func (c *Collection) flushBufferedPublishedLocked() error {
 // async-visible and chain-fence synchronous stores after publications have
 // been drained.
 func (c *Collection) flushPublishedPhysicalLocked() error {
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	if err := c.committer.Flush(); err != nil {
 		return err
 	}

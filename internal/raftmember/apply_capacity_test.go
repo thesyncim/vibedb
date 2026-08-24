@@ -21,7 +21,7 @@ func TestImmutableBaseApplyCapacityBoundary(t *testing.T) {
 		MaxSessions: 128,
 		RetryWindow: 8,
 		Initialized: true,
-		Applied:     1,
+		Applied:     1, CheckpointApplied: 1,
 	}
 	tests := []struct {
 		name      string
@@ -121,6 +121,11 @@ func TestImmutableBaseApplyCapacityBoundary(t *testing.T) {
 			result.Applied = 2
 			return result
 		}(), commit: 1, last: 2, wantError: true},
+		{name: "checkpoint ahead of apply", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
+			result := baseApply
+			result.CheckpointApplied = result.Applied + 1
+			return result
+		}(), commit: 2, last: 2, wantError: true},
 		{name: "commit ahead of last", profile: base, apply: baseApply, commit: 2, last: 1, wantError: true},
 		{name: "session capacity exceeded", profile: base, apply: func() sqldriver.ReplicatedApplyCapacityProfile {
 			result := baseApply
@@ -163,6 +168,7 @@ func TestImmutableBaseApplyCapacityAdvancedBase(t *testing.T) {
 		RetryWindow:           8,
 		Initialized:           true,
 		Applied:               100,
+		CheckpointApplied:     100,
 		SessionCount:          12,
 		SessionSlotCount:      64,
 		SessionEpochHighWater: 100,

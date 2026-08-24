@@ -202,8 +202,12 @@ func (c *SnapshotArtifactCursor) PrefixManifest() SnapshotArtifactManifest {
 // collection name is detached raw bytes; State is the canonical publication
 // embedded in both the header and hidden system row.
 type SnapshotArtifactManifest struct {
-	State            State
-	UserCollection   []byte
+	State          State
+	UserCollection []byte
+	// Seeded distinguishes a compact no-copy snapshot-base manifest from a
+	// streamed artifact manifest. Seeded manifests carry no artifact geometry;
+	// they bind the already durable user image directly.
+	Seeded           bool
 	TargetChunkBytes uint32
 	Chunks           uint64
 	SystemRows       uint64

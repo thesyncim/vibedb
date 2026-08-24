@@ -11,6 +11,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -192,6 +193,18 @@ type database struct {
 	// recovery opens the complete hidden+user collection set as one private
 	// phase before this handle becomes reachable.
 	txnLog *durable.TxnLog
+	// checkpointGroup exclusively owns the hidden replicated-state collection,
+	// its sole user collection, and txnLog after replicated apply activation.
+	// It is recovered before any collection becomes reachable and gracefully
+	// checkpointed before collection/TxnLog close.
+	checkpointGroup *durable.CheckpointGroup
+	// replicatedSeedRecovery authorizes only the exact child-stage reopen path
+	// to inspect a missing certificate beside a clean staged user image.
+	// replicatedSeedPending keeps that image non-serving until a sealed stage
+	// proves the seed and installs its exact immutable snapshot base through the
+	// group-owned same-index transition.
+	replicatedSeedRecovery bool
+	replicatedSeedPending  bool
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -268,8 +281,10 @@ func openDatabaseWithShardStorePolicy(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		layoutEpoch: newCatalogLayoutEpoch(nil, nil),
-		txnLimits:   defaultDriverTxnLimits(),
+		layoutEpoch:            newCatalogLayoutEpoch(nil, nil),
+		txnLimits:              defaultDriverTxnLimits(),
+		replicatedSeedRecovery: shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
+		replicatedSeedPending:  shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -420,7 +435,7 @@ func openDatabaseWithShardStorePolicy(
 			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
 		}
-	case shardStoreOpenReplicatedApplySettlement:
+	case shardStoreOpenReplicatedApplySettlement, shardStoreOpenReplicatedChildStageResume:
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
 		}
@@ -571,9 +586,21 @@ func openDatabaseWithShardStorePolicy(
 		if err := validateOpenedReplicatedCatalog(d); err != nil {
 			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
-		if err := d.txnLog.EnsureMinted(); err != nil {
+		// Bind publishes the complete catalog identity before it mints the
+		// transaction marker. An exact settlement open is the only reopen path
+		// allowed to finish that interrupted bind; every ordinary replicated open
+		// must continue to reject an absent marker. EnsureMinted retains the same
+		// pinned-directory and complete-catalog proofs as qualification before it
+		// creates the marker.
+		var markerErr error
+		if shardPolicy.mode == shardStoreOpenReplicatedSettlement {
+			markerErr = d.txnLog.EnsureMinted()
+		} else {
+			markerErr = d.txnLog.QualifyMinted()
+		}
+		if markerErr != nil {
 			return nil, fmt.Errorf(
-				"vibedb: qualify replicated transaction marker: %w", err,
+				"vibedb: qualify replicated transaction marker: %w", markerErr,
 			)
 		}
 	}
@@ -711,9 +738,50 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			SealedCapacity: true,
 		}
 	}
-	collections, txnLog, err := durable.OpenCollectionsWithTransactions(
-		d.dataDir, txnOptions, requests,
-	)
+	var collections []*durable.Collection
+	var txnLog *durable.TxnLog
+	var checkpointGroup *durable.CheckpointGroup
+	var err error
+	if d.catalog.ReplicatedApply != nil {
+		groupNames := make([]string, len(opened))
+		for i, entry := range opened {
+			switch {
+			case entry.apply:
+				groupNames[i] = replicatedstate.SystemCollectionName
+			case entry.name != "":
+				groupNames[i] = entry.name
+			default:
+				return abortFiles(fmt.Errorf(
+					"%w: unsupported checkpoint-group participant",
+					ErrReplicatedApplyMismatch,
+				))
+			}
+		}
+		if d.replicatedSeedRecovery {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithSeededCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					replicatedstate.SystemCollectionName,
+					durable.CheckpointGroupOptions{},
+				)
+		} else {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					durable.CheckpointGroupOptions{},
+				)
+		}
+		if errors.Is(err, durable.ErrCheckpointGroupMissing) {
+			d.replicatedSeedPending = d.replicatedSeedRecovery
+			collections, txnLog, err = durable.OpenCollectionsWithTransactions(
+				d.dataDir, txnOptions, requests,
+			)
+		}
+	} else {
+		collections, txnLog, err = durable.OpenCollectionsWithTransactions(
+			d.dataDir, txnOptions, requests,
+		)
+	}
 	if err != nil {
 		return abortFiles(err)
 	}
@@ -737,6 +805,10 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		entry.table.collection = collection
 	}
 	d.txnLog = txnLog
+	d.checkpointGroup = checkpointGroup
+	if checkpointGroup != nil && checkpointGroup.SeedActivationPending() {
+		d.replicatedSeedPending = true
+	}
 	for i := range opened {
 		entry := opened[i]
 		collection := collections[i]
@@ -1783,6 +1855,18 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			return err
 		}
 		result = errors.Join(result, err)
+	}
+	if d.checkpointGroup != nil {
+		closeErr := d.checkpointGroup.Close()
+		if closeErr != nil && !d.checkpointGroup.CloseCompleted() {
+			// A checkpoint failure precedes the terminal transition, so the group
+			// remains attached and member resource close is still forbidden.
+			return errors.Join(result, closeErr)
+		}
+		// A certificate-descriptor Close error is sticky but occurs after the
+		// retired fence. Preserve it while releasing every member resource.
+		result = errors.Join(result, closeErr)
+		d.checkpointGroup = nil
 	}
 	d.closed = true
 	retryable := false

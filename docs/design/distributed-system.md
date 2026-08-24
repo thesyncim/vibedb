@@ -232,6 +232,38 @@ Out-of-band row mutation is outside the storage contract. A serving candidate
 must pair a canonical `ImageDigest` with the same applied cut; snapshot staging
 does so before membership or serving authority can be granted.
 
+## Replay-backed local apply
+
+The replicated apply lane can exclusively attach its fixed system and user
+collections to one `CheckpointGroup`. After Raft persistence, each ordinary
+state-machine transition appends conditional redo to only the dirty members
+and appends one unsynced marker decision. It publishes the member snapshots and
+the new applied cut together without a local Sync. This is a local replay
+contract; it does not weaken the embedded database's ordinary durability
+profiles.
+
+Periodic or pressure-driven checkpoints Sync all `K` fixed-member journals and
+then Sync one authenticated `checkpoint.vgc` certificate. The marker remains a
+recyclable implementation log and is not part of the normal barrier. The
+certificate commits its exact transaction prefix, aborts any later prepared
+suffix after a crash, and permits physical collection folds to finish or retry
+after the durable cut is already established.
+
+`AppliedIndex` is the newest reader-visible local transition.
+`CheckpointAppliedIndex` is the greatest certificate-backed contiguous cut and
+the only index currently exposed as safe input to Raft-WAL retention. They may
+differ between checkpoints. The repository does not yet compact or replace the
+Raft WAL from that input; a replacement must additionally bind the exact term,
+configuration state, member lineage, certificate witness, and retained log
+suffix before any old generation can be discarded.
+
+This lane is still part of the non-serving replication kernel. It does not yet
+provide RF3 request serving, authenticated peer transport, or acknowledged
+gateway failover. Transition capture is deliberately rejected while a
+`CheckpointGroup` owns the apply state; online range split must use the later
+publish-before-prune serving integration rather than adding another ordinary
+durable participant to this fixed zero-Sync path.
+
 ## Autosplit boundary
 
 The `autosplit` package records fixed-memory pressure evidence and recommends a
@@ -345,17 +377,22 @@ checksum-protected certificate binds those non-retained child images and the
 exact cut but deliberately grants no serving authority.
 
 A sealed destination can be converted in place into the standard
-replicated-state snapshot base. The conversion validates the final image with
-the child's mutation contract, writes only the hidden state row, and does not
-rewrite user rows. The independent child Raft runtime must still install that
-small base before the child is eligible to serve.
+replicated-state snapshot base. The conversion reuses the sealed image proof,
+binds the exact state envelope in a cut-zero checkpoint-group certificate,
+then certifies and folds the one-row hidden-state seed. It does not rewrite,
+rescan, or serialize the user image again after the canonical preparation
+pass. The independent child Raft runtime must install that small base before
+the child is eligible to serve.
 
 The SQL driver owns this conversion. It prevents SQL sessions while the child
-image is incomplete. It stages into the final bound table, publishes the
-hidden apply participant, and transfers one exclusive claim to the normal
-replicated apply path. The user collection handle and storage identity do not
-change. An uncertain catalog publication retains the intended apply identity
-for exact settlement and retry.
+image is incomplete and while the activated claim still lacks its exact base.
+It stages into the final bound table, publishes the hidden apply participant,
+and transfers one exclusive claim to the normal replicated apply path. The
+user collection handle and storage identity do not change. An uncertain
+catalog publication retains the intended apply identity for exact settlement
+and retry. Explicit child-resume open remains fail-closed across missing,
+seed-only, and final-certificate crash intervals; ordinary open cannot treat a
+missing active certificate as a fresh image.
 
 The child WAL is not allocated twice. A validated immutable member identity
 provides the planned SQL binding before the WAL exists. After activation, the

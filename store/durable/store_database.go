@@ -237,6 +237,20 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 	if err := validateDatabaseLayout(root, items); err != nil {
 		return nil, err
 	}
+	// A format-0 certificate makes the special fixed-membership opener the only
+	// recovery authority. Fail before txn.vtm or any participant journal can be
+	// replayed, reconciled, or folded by ordinary database recovery.
+	if err := rejectCheckpointGroupCertificate(root); err != nil {
+		return nil, err
+	}
+	if checkpointGroupGenericDatabaseAfterPrecheckHook != nil {
+		checkpointGroupGenericDatabaseAfterPrecheckHook()
+	}
+	releaseNamespace, err := acquireCheckpointGroupGenericCatalogNamespace(root)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseNamespace()
 	txnRecovery, err := loadDatabaseTxnRecovery(dir, TxnLogOptions{})
 	if err != nil {
 		return nil, err
@@ -267,7 +281,7 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 				"vibedb: durable collection %q: %w", name, openErr,
 			))
 		}
-		cfg := collectionOpenConfig{}
+		cfg := collectionOpenConfig{checkpointGroupNamespaceHeld: true}
 		cfg.deferJournalReplay = true
 		if txnRecovery.absent {
 			cfg.absentLog = true
@@ -456,6 +470,9 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 	if d.closed {
 		return nil, ErrDatabaseClosed
 	}
+	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupMutationFenced() {
+		return nil, ErrCheckpointGroupOwned
+	}
 	if _, exists := d.collections[name]; exists {
 		return nil, ErrCollectionExists
 	}
@@ -479,7 +496,12 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 		return nil, err
 	}
 	if log := lookupDatabaseTxnLog(d); log != nil {
-		log.registerCollection(collection)
+		if err := log.registerCollectionUnlessCheckpointGroup(collection); err != nil {
+			_ = collection.closeResources()
+			_ = file.Close()
+			_ = os.Remove(path)
+			return nil, err
+		}
 	}
 	entry := &databaseEntry{
 		name: strings.Clone(name), filename: filename,
@@ -547,6 +569,9 @@ func (d *Database) DropCollection(name string) error {
 	defer d.mu.Unlock()
 	if d.closed {
 		return ErrDatabaseClosed
+	}
+	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupMutationFenced() {
+		return ErrCheckpointGroupOwned
 	}
 	entry, ok := d.collections[name]
 	if !ok {
@@ -655,6 +680,9 @@ func (d *Database) Close() error {
 	defer d.mu.Unlock()
 	if d.closeDone {
 		return d.closeErr
+	}
+	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupOwned() {
+		return ErrCheckpointGroupOwned
 	}
 	if !d.closed {
 		d.closed = true

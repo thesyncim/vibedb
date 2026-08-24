@@ -48,8 +48,14 @@ func (c *Collection) EnsurePhysicalAllocation(highWater uint64) error {
 	if c == nil {
 		return fmt.Errorf("%w: nil collection", ErrPhysicalCapacity)
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	c.writer.Lock()
 	defer c.writer.Unlock()
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if c.closed {
 		return ErrClosed
 	}

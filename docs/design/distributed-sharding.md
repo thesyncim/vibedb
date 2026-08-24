@@ -81,15 +81,22 @@ sealed stage rescans it and rejects changed files. Certification rereads and
 verifies the capture record, recomputes all child batch digests, binds every
 non-retained image digest, and refuses a source head that advanced past the
 seal. A sealed stage can initialize the standard replicated-state snapshot base
-in place without rewriting user rows. Raft must install that base before
-serving activation.
+in place without rewriting user rows. Its authenticated image proof is reused
+to admit one canonical state preparation; that preparation audits the image in
+one pass, and the compact seeded manifest and finish path do not scan or
+serialize it again. The checkpoint group certifies the one-row hidden-state
+seed before returning. Raft must install the exact returned base before
+proposal, apply, lookup, snapshot export, or SQL serving is admitted.
 
 The SQL adapter stages rows directly into the final bound user collection. It
 holds an exclusive connector claim, so SQL sessions cannot observe the image
-while artifact or tail work is active. Activation publishes the hidden apply
-participant, writes only the replicated state row, and transfers the same
-claim to `ReplicatedApply`. A crash after hidden-participant publication can
-settle and retry with the exact apply identity and sealed stage cursor.
+while artifact or tail work is active. Activation creates or requalifies the
+seeded checkpoint group, writes only the replicated state row, and transfers
+the same claim to `ReplicatedApply`. Crashes before the seed certificate or in
+the certified seed-only interval reopen only through the exact sealed-stage
+resume policy. Once transaction 2 durably certifies the snapshot-base binding,
+an exact-identity ordinary reopen is serving-safe; a later uncertified suffix
+rolls back to that certified cut.
 
 The destination does not need a provisional WAL. `BindingForNewWAL` derives a
 non-serving SQL binding from the intended immutable member identity.

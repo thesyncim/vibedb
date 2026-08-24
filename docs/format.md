@@ -142,6 +142,83 @@ released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
 v2/v3 decoder or migration ladder.
 
+## Replicated checkpoint-group certificate
+
+A replay-backed replicated tablet owns one fixed collection set and its
+transaction log through `checkpoint.vgc`. The file is exactly 8192 bytes: two
+alternate 4096-byte certificate slots. It has one unreleased grammar, format
+0, with no compatibility decoder.
+
+Each slot has an eight-byte `VIBECPG\0` identity, a 168-byte header, one to 60
+64-byte fixed-member records, required zero reserved bytes and padding,
+and a 32-byte SHA-256 checksum. Its canonical fields are:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | Identity `VIBECPG\0` |
+| 8 | 2 | Format sentinel `0` |
+| 10 | 2 | Header bytes (`168`) |
+| 12 | 2 | Fixed-member count (`1..60`) |
+| 14 | 2 | Required zero reserved bytes |
+| 16 | 8 | Certificate sequence |
+| 24 | 8 | Raft applied index |
+| 32 | 8 | Transaction high-water |
+| 40 | 8 | Transaction base |
+| 48 | 8 | Marker epoch |
+| 56 | 16 | Marker ID |
+| 72 | 8 | Seed applied index, or zero for an ordinary group |
+| 80 | 32 | Seed state-envelope commitment, or zero |
+| 112 | 32 | Seed-member logical-name digest, or zero |
+| 144 | 24 | Truncated membership digest |
+
+Each member record binds the SHA-256 logical-name digest, store ID, and
+recovery-journal ID. The checksum is SHA-256 over the domain
+`vibedb/checkpoint-group/format-0\0` followed by every preceding byte in the
+slot.
+
+The selected slot must be in `sequence % 2`; when both slots authenticate,
+their sequences must be consecutive. Decode re-encodes the complete slot and
+requires byte-for-byte canonical equality. A checksum-invalid newest slot may
+be a torn write and falls back to the other authenticated slot. A
+checksum-valid but noncanonical slot, wrong parity, or nonconsecutive history
+is corruption and never grants rollback authority.
+
+The certificate, rather than `txn.vtm`, is commit authority for this lane. It
+commits the consecutive conditional-journal prefix through its transaction
+high-water and aborts every later prepared suffix. Generic collection and
+database openers refuse a directory carrying `checkpoint.vgc`; recovery must
+open the certificate and exact fixed membership together before consulting or
+folding transaction state.
+
+A no-copy imported child starts from an authenticated cut-zero seed
+certificate. The seed commitment hashes the exact replicated-state envelope
+under `vibedb/checkpoint-group/seed-state-envelope/format-0\0`; it therefore
+binds the imported applied cut and complete state contract, not merely a
+last-entry digest. The seed member must be empty, while the already durable
+user-image member may be nonempty. Transaction 1 writes that single state row
+and is certified and folded before activation succeeds. A later same-applied
+transaction binds the immutable snapshot base; after that transition, the
+group transaction cut rather than the original envelope bytes is reopen
+authority.
+
+Only the explicit sealed-child resume opener accepts the pre-certificate
+profile: exact fixed membership, empty seed member, zero or more already
+durable imported rows in the other members, and clean marker and journals.
+Allowing zero rows preserves empty split children; the sealed child cursor and
+cutover certificate remain the image authority. The SQL root stays non-serving
+until that exact stage is reclaimed and its snapshot base is installed.
+Ordinary open treats the same missing certificate as corruption, so deleting a
+live certificate never becomes rollback authority.
+
+An ordinary checkpoint orders one Sync for each of its `K` participant
+journals followed by one certificate Sync. The normal `K+1` barrier does not
+Sync the recyclable marker. Once the certificate Sync succeeds, its applied
+index is an authenticated input to Raft-WAL retention even if subsequent
+physical collection folds must be retried. It is not standalone deletion
+authority: term, configuration state, member lineage, certificate witness, and
+the required retained suffix must also be bound. No ordinary replicated
+transition performs a local Sync.
+
 ## Database directory names
 
 The durable database encodes a logical collection name as:

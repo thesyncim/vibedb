@@ -43,6 +43,7 @@ var (
 	ErrReplicatedApplyMismatch      = errors.New("vibedb: replicated apply profile mismatch")
 	ErrReplicatedApplyBusy          = errors.New("vibedb: replicated apply already has an owner")
 	ErrReplicatedApplyClosed        = errors.New("vibedb: replicated apply is closed")
+	ErrReplicatedApplyBasePending   = errors.New("vibedb: replicated child snapshot base is not installed")
 )
 
 var replicatedApplyProfileDomain = []byte("vibedb/sql/replicated-apply-profile\x00")
@@ -97,6 +98,7 @@ type ReplicatedApplyCapacityProfile struct {
 	RetryWindow           uint16
 	Initialized           bool
 	Applied               uint64
+	CheckpointApplied     uint64
 	SessionCount          uint64
 	SessionSlotCount      uint64
 	SessionEpochHighWater uint64
@@ -118,6 +120,10 @@ type ReplicatedApply struct {
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
 	exclusiveConnector bool
+	// activationBasePending is the exact compact snapshot-base identity that
+	// must be installed before a no-copy child claim may propose, apply, look
+	// up completions, or export another snapshot.
+	activationBasePending [sha256.Size]byte
 }
 
 var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
@@ -202,6 +208,47 @@ func OpenReplicatedShardStoreWithApplyForSettlement(
 	}
 	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
 		mode:                      shardStoreOpenReplicatedApplySettlement,
+		expectedReplicated:        ownedReplicatedShardStoreIdentity(expected),
+		expectedReplicatedOptions: options,
+	})
+	if err != nil {
+		return nil, ReplicatedApplyIdentity{}, err
+	}
+	identity := core.catalog.ReplicatedApply.identity()
+	return &Database{connector: &dbConnector{db: core}}, identity, nil
+}
+
+// OpenReplicatedShardStoreForChildStageResume recovers only the non-serving
+// split-child activation interval after the apply descriptor is durable. It is
+// the sole SQL open policy allowed to admit a missing checkpoint certificate
+// beside an exact clean staged user image. NewSession and ordinary apply stay
+// fenced until OpenReplicatedChildStage reclaims a sealed cursor and completes
+// or reuses the authenticated seed transition.
+func OpenReplicatedShardStoreForChildStageResume(
+	path string,
+	expected ReplicatedShardStoreIdentity,
+	options ReplicatedApplyOptions,
+) (*Database, ReplicatedApplyIdentity, error) {
+	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
+		return nil, ReplicatedApplyIdentity{}, err
+	}
+	if err := validateReplicatedApplyOptions(expected, options); err != nil {
+		return nil, ReplicatedApplyIdentity{}, err
+	}
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return nil, ReplicatedApplyIdentity{}, err
+	}
+	if _, err := os.Stat(absolute); err != nil {
+		if os.IsNotExist(err) {
+			return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+				"%w: %s", ErrReplicatedApplyUninitialized, absolute,
+			)
+		}
+		return nil, ReplicatedApplyIdentity{}, err
+	}
+	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
+		mode:                      shardStoreOpenReplicatedChildStageResume,
 		expectedReplicated:        ownedReplicatedShardStoreIdentity(expected),
 		expectedReplicatedOptions: options,
 	})
@@ -329,6 +376,9 @@ func (d *Database) openReplicatedApply(
 	if core.closed {
 		return nil, ReplicatedApplyIdentity{}, ErrDatabaseClosed
 	}
+	if core.replicatedSeedPending {
+		return nil, ReplicatedApplyIdentity{}, ErrReplicatedChildStageBusy
+	}
 	if core.replicatedApplyClaim != nil {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedApplyBusy
 	}
@@ -350,10 +400,12 @@ func (d *Database) openReplicatedApply(
 			"%w: transaction-marker profile", ErrReplicatedApplyMismatch,
 		)
 	}
-	if err := core.txnLog.EnsureMinted(); err != nil {
-		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-			"vibedb: qualify replicated transaction marker: %w", err,
-		)
+	if core.checkpointGroup == nil {
+		if err := core.txnLog.EnsureMinted(); err != nil {
+			return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+				"vibedb: qualify replicated transaction marker: %w", err,
+			)
+		}
 	}
 
 	t := core.tables[expected.UserTable]
@@ -375,6 +427,24 @@ func (d *Database) openReplicatedApply(
 	if core.replicatedApplyCollection == nil {
 		return nil, identity, fmt.Errorf(
 			"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
+		)
+	}
+	groupMembers := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: expected.UserTable, Collection: t.collection},
+	}
+	if core.checkpointGroup == nil {
+		core.checkpointGroup, err = durable.NewCheckpointGroup(
+			core.txnLog, groupMembers, durable.CheckpointGroupOptions{},
+		)
+		if err != nil {
+			return nil, identity, fmt.Errorf(
+				"vibedb: activate replicated checkpoint group: %w", err,
+			)
+		}
+	} else if !core.checkpointGroup.Owns(groupMembers) {
+		return nil, identity, fmt.Errorf(
+			"%w: checkpoint-group membership", ErrReplicatedApplyMismatch,
 		)
 	}
 	claim := &ReplicatedApply{
@@ -402,7 +472,7 @@ func (d *Database) openReplicatedApply(
 		core.txnLog,
 		replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
-			RetryWindow: identity.RetryWindow,
+			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 		},
 	)
 	if err != nil {
@@ -707,16 +777,22 @@ func (v *replicatedSQLMutationValidator) pointForEncodedKeyLocked(
 	return point, true
 }
 
-func (a *ReplicatedApply) observeMutationAttempt(keys replicatedstate.AttemptedMutationKeys) {
+func (a *ReplicatedApply) observeMutationAttempt(
+	keys replicatedstate.AttemptedMutationKeys,
+	updateErr error,
+) {
 	if a == nil || a.table == nil || keys.Len() == 0 {
 		return
 	}
 	// The core invokes this only while the wrapper still holds database.mu.
 	// A generation move proves publication; a sticky persistence failure makes
-	// the in-process outcome uncertain and therefore advances conservatively.
+	// the in-process outcome uncertain. A checkpoint-group decision failure can
+	// report the same uncertainty without changing either collection signal, so
+	// its explicit outcome-unknown classification also advances conservatively.
 	if !a.attemptActive ||
 		(a.table.collection.Generation() == a.attemptGeneration &&
-			a.table.collection.PersistenceError() == nil) {
+			a.table.collection.PersistenceError() == nil &&
+			!errors.Is(updateErr, durable.ErrCommitOutcomeUnknown)) {
 		return
 	}
 	changed := make([]string, keys.Len())
@@ -730,6 +806,13 @@ func (a *ReplicatedApply) checkLocked() error {
 	if a == nil || a.database == nil || a.machine == nil || a.closed ||
 		a.database.closed || a.database.replicatedApplyClaim != a {
 		return ErrReplicatedApplyClosed
+	}
+	return nil
+}
+
+func (a *ReplicatedApply) checkActivationBaseLocked() error {
+	if a.activationBasePending != ([sha256.Size]byte{}) {
+		return ErrReplicatedApplyBasePending
 	}
 	return nil
 }
@@ -777,7 +860,8 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 		Binding:     ownedReplicatedShardStoreBinding(base.Binding),
 		ApplyFormat: a.identity.Format, MaxSessions: a.identity.MaxSessions,
 		RetryWindow: a.identity.RetryWindow, Initialized: state.Initialized,
-		Applied: state.Applied, SessionCount: state.SessionCount,
+		Applied: state.Applied, CheckpointApplied: a.machine.CheckpointAppliedIndex(),
+		SessionCount:          state.SessionCount,
 		SessionSlotCount:      state.SessionSlotCount,
 		SessionEpochHighWater: state.SessionEpochHighWater,
 	}, nil
@@ -836,6 +920,14 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
 	}
+	if core.checkpointGroup == nil {
+		core.mu.Unlock()
+		return ErrReplicatedApplyMismatch
+	}
+	if err := core.checkpointGroup.Checkpoint(); err != nil {
+		core.mu.Unlock()
+		return err
+	}
 	a.closed = true
 	core.replicatedApplyClaim = nil
 	core.mu.Unlock()
@@ -858,6 +950,21 @@ func (a *ReplicatedApply) Applied() uint64 {
 		return 0
 	}
 	return a.machine.Applied()
+}
+
+// CheckpointAppliedIndex is the authenticated durable apply cut supplied to
+// Raft WAL retention qualification. It may trail Applied by at most the fixed
+// checkpoint batch and is not standalone deletion authority.
+func (a *ReplicatedApply) CheckpointAppliedIndex() uint64 {
+	if a == nil || a.database == nil {
+		return 0
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if a.checkLocked() != nil {
+		return 0
+	}
+	return a.machine.CheckpointAppliedIndex()
 }
 
 // Published implements raftmodel.StateMachine.
@@ -885,6 +992,9 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 	if err := a.checkLocked(); err != nil {
 		return nil, err
 	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return nil, err
+	}
 	base := a.database.catalog.ReplicatedShardStore
 	if base == nil || base.UserTable == "" {
 		return nil, ErrReplicatedApplyMismatch
@@ -904,6 +1014,9 @@ func (a *ReplicatedApply) ApplyNormal(
 	a.database.mu.Lock()
 	defer a.database.mu.Unlock()
 	if err := a.checkLocked(); err != nil {
+		return raftmodel.Publication{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
 		return raftmodel.Publication{}, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
@@ -928,6 +1041,9 @@ func (a *ReplicatedApply) ApplyConfiguration(
 	if err := a.checkLocked(); err != nil {
 		return raftmodel.Publication{}, err
 	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return raftmodel.Publication{}, err
+	}
 	return a.machine.ApplyConfiguration(meta, conf)
 }
 
@@ -945,7 +1061,27 @@ func (a *ReplicatedApply) InstallSnapshot(
 	if err := a.checkLocked(); err != nil {
 		return raftmodel.Publication{}, err
 	}
-	return a.machine.InstallSnapshot(snapshot)
+	pending := a.activationBasePending
+	if pending != ([sha256.Size]byte{}) {
+		certificate, err := replicatedstate.OpenSnapshotBase(snapshot)
+		if err != nil || certificate.Digest != pending {
+			return raftmodel.Publication{}, errors.Join(
+				ErrReplicatedApplyBasePending, err,
+			)
+		}
+	}
+	publication, err := a.machine.InstallSnapshot(snapshot)
+	if err == nil && pending != ([sha256.Size]byte{}) {
+		if a.database.checkpointGroup == nil {
+			return publication, ErrReplicatedApplyMismatch
+		}
+		if err = a.database.checkpointGroup.Checkpoint(); err != nil {
+			return publication, err
+		}
+		a.activationBasePending = [sha256.Size]byte{}
+		a.database.replicatedSeedPending = false
+	}
+	return publication, err
 }
 
 // AdmitCommand delegates the bounded, non-reserving pre-proposal check. A nil
@@ -957,6 +1093,9 @@ func (a *ReplicatedApply) AdmitCommand(data []byte) error {
 	a.database.mu.RLock()
 	defer a.database.mu.RUnlock()
 	if err := a.checkLocked(); err != nil {
+		return err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
 		return err
 	}
 	err := a.machine.AdmitCommand(data)
@@ -983,6 +1122,9 @@ func (a *ReplicatedApply) LookupCompletion(
 	a.database.mu.RLock()
 	defer a.database.mu.RUnlock()
 	if err := a.checkLocked(); err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
 		return replicatedstate.CompletionLookup{}, err
 	}
 	return a.machine.LookupCompletion(data)

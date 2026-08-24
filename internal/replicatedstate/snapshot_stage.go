@@ -301,6 +301,7 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 
 func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	if err := validateState(expected.State); err != nil ||
+		expected.Seeded ||
 		len(expected.UserCollection) == 0 ||
 		len(expected.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(expected.UserCollection) || bytes.IndexByte(expected.UserCollection, 0) >= 0 ||
@@ -356,6 +357,7 @@ func snapshotArtifactPrefixMatchesExpected(
 func equalSnapshotArtifactManifest(left, right SnapshotArtifactManifest) bool {
 	return equalState(left.State, right.State) &&
 		bytes.Equal(left.UserCollection, right.UserCollection) &&
+		left.Seeded == right.Seeded &&
 		left.TargetChunkBytes == right.TargetChunkBytes &&
 		left.Chunks == right.Chunks && left.SystemRows == right.SystemRows &&
 		left.UserRows == right.UserRows && left.PayloadBytes == right.PayloadBytes &&

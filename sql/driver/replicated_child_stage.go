@@ -108,9 +108,16 @@ func (d *Database) OpenReplicatedChildStage(
 			"%w: transaction-marker profile", ErrReplicatedApplyMismatch,
 		)
 	}
-	if err := core.txnLog.EnsureMinted(); err != nil {
+	var markerErr error
+	if core.checkpointGroup != nil || core.replicatedSeedPending ||
+		core.catalog.ReplicatedApply != nil {
+		markerErr = core.txnLog.QualifyMinted()
+	} else {
+		markerErr = core.txnLog.EnsureMinted()
+	}
+	if markerErr != nil {
 		return nil, fmt.Errorf(
-			"vibedb: qualify replicated transaction marker: %w", err,
+			"vibedb: qualify replicated transaction marker: %w", markerErr,
 		)
 	}
 	t := core.tables[expected.UserTable]
@@ -293,15 +300,31 @@ func (s *ReplicatedChildStage) activate(
 	if core.txnLog == nil || core.txnLog.Options() != expectedTxnLogOptions(s.base) {
 		return ReplicatedChildActivation{}, ErrReplicatedApplyMismatch
 	}
-	if err := core.txnLog.EnsureMinted(); err != nil {
+	var markerErr error
+	if core.checkpointGroup != nil || core.replicatedSeedPending ||
+		core.catalog.ReplicatedApply != nil {
+		markerErr = core.txnLog.QualifyMinted()
+	} else {
+		markerErr = core.txnLog.EnsureMinted()
+	}
+	if markerErr != nil {
 		return ReplicatedChildActivation{}, fmt.Errorf(
-			"vibedb: qualify replicated transaction marker: %w", err,
+			"vibedb: qualify replicated transaction marker: %w", markerErr,
 		)
 	}
 	identity, err := core.prepareReplicatedApplyStorageLocked(
 		s.base, s.options, persist,
 	)
 	result := ReplicatedChildActivation{ApplyIdentity: identity}
+	// Once the apply descriptor is durable or its publication outcome is
+	// unknown, the staged user image has durable activation intent. Keep it
+	// non-serving even if this stage is later closed after any activation error.
+	// A zero identity means descriptor publication failed definitively and the
+	// unpublished participant was discharged, so that case remains resumable as
+	// an ordinary pre-activation stage.
+	if identity != (ReplicatedApplyIdentity{}) {
+		core.replicatedSeedPending = true
+	}
 	if err != nil {
 		return result, err
 	}
@@ -312,7 +335,11 @@ func (s *ReplicatedChildStage) activate(
 	validator := newReplicatedSQLMutationValidator(
 		s.base, s.table, identity.Placement,
 	)
-	machine, base, manifest, err := s.stage.InitializeReplicatedChild(
+	groupMembers := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: s.base.UserTable, Collection: s.table.collection},
+	}
+	prepared, err := s.stage.PrepareReplicatedChild(
 		certificate,
 		rangesplit.ChildActivationTarget{
 			Binding: replicatedStateBinding(s.base), StaticBootstrap: staticBootstrap,
@@ -334,7 +361,7 @@ func (s *ReplicatedChildStage) activate(
 			TxnLog: core.txnLog,
 			MachineOptions: replicatedstate.Options{
 				TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
-				RetryWindow: identity.RetryWindow,
+				RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 			},
 			ArtifactOptions: artifactOptions,
 		},
@@ -342,7 +369,44 @@ func (s *ReplicatedChildStage) activate(
 	if err != nil {
 		return result, fmt.Errorf("vibedb: activate replicated child: %w", err)
 	}
+	seedEnvelope := prepared.AppendSeedEnvelope(nil)
+	seedKey := prepared.AppendSeedKey(nil)
+	seed := durable.CheckpointGroupSeed{
+		Applied: prepared.AppliedIndex(), Member: prepared.SeedMember(),
+		Envelope: seedEnvelope,
+		Images: []durable.CheckpointGroupSeedImage{{
+			Collection: s.table.collection, Generation: prepared.UserGeneration(),
+		}},
+	}
+	if core.checkpointGroup == nil {
+		core.checkpointGroup, err = durable.NewSeededCheckpointGroup(
+			core.txnLog, groupMembers, seed, durable.CheckpointGroupOptions{},
+		)
+		if err != nil {
+			return result, fmt.Errorf(
+				"vibedb: certify replicated child seed: %w", err,
+			)
+		}
+	} else if !core.checkpointGroup.Owns(groupMembers) {
+		return result, fmt.Errorf(
+			"%w: checkpoint-group membership", ErrReplicatedApplyMismatch,
+		)
+	}
+	if err := core.checkpointGroup.Seed(
+		seed, groupMembers[0], identity.TxnLimits, seedKey,
+	); err != nil {
+		return result, fmt.Errorf("vibedb: publish replicated child seed: %w", err)
+	}
+	machine, base, manifest, err := prepared.Finish(core.checkpointGroup)
+	if err != nil {
+		return result, fmt.Errorf("vibedb: finish replicated child: %w", err)
+	}
+	baseCertificate, err := replicatedstate.OpenSnapshotBase(base)
+	if err != nil {
+		return result, fmt.Errorf("vibedb: authenticate replicated child base: %w", err)
+	}
 	claim.machine = machine
+	claim.activationBasePending = baseCertificate.Digest
 	core.replicatedChildStageClaim = nil
 	core.replicatedApplyClaim = claim
 	s.closed = true

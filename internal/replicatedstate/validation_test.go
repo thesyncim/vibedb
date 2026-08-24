@@ -41,23 +41,26 @@ func (validator mutationValidatorFuncs) ValidateDelete(
 }
 
 type observedMutationKeys struct {
-	mu    sync.Mutex
-	calls [][][]byte
+	mu         sync.Mutex
+	calls      [][][]byte
+	updateErrs []error
 }
 
-func (observed *observedMutationKeys) callback(keys AttemptedMutationKeys) {
+func (observed *observedMutationKeys) callback(keys AttemptedMutationKeys, updateErr error) {
 	call := make([][]byte, keys.Len())
 	for index := range call {
 		call[index] = bytes.Clone(keys.Key(index))
 	}
 	observed.mu.Lock()
 	observed.calls = append(observed.calls, call)
+	observed.updateErrs = append(observed.updateErrs, updateErr)
 	observed.mu.Unlock()
 }
 
 func (observed *observedMutationKeys) reset() {
 	observed.mu.Lock()
 	observed.calls = nil
+	observed.updateErrs = nil
 	observed.mu.Unlock()
 }
 
@@ -72,6 +75,12 @@ func (observed *observedMutationKeys) snapshot() [][][]byte {
 		}
 	}
 	return result
+}
+
+func (observed *observedMutationKeys) errorSnapshot() []error {
+	observed.mu.Lock()
+	defer observed.mu.Unlock()
+	return append([]error(nil), observed.updateErrs...)
 }
 
 func newValidatedMachineFixture(
@@ -203,7 +212,7 @@ func TestCollectionTargetValidationProfiles(t *testing.T) {
 
 	for _, mutateSystem := range []func(*CollectionTarget){
 		func(system *CollectionTarget) {
-			system.ObserveMutationAttempt = func(AttemptedMutationKeys) {}
+			system.ObserveMutationAttempt = func(AttemptedMutationKeys, error) {}
 		},
 		func(system *CollectionTarget) {
 			system.Validation = ValidationDeterministicMutation
@@ -548,6 +557,10 @@ func TestMutationAttemptObserverCoversDecisionSyncOutcomeUnknown(t *testing.T) {
 	if got := observed.snapshot(); !equalObservedMutationKeys(got, want) {
 		t.Fatalf("outcome-unknown observed keys = %q, want %q", got, want)
 	}
+	if got := observed.errorSnapshot(); len(got) != 1 ||
+		!errors.Is(got[0], durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("outcome-unknown observer errors = %v", got)
+	}
 }
 
 func TestMutationAttemptObserverCoversDefiniteTransactionSetupFailure(t *testing.T) {
@@ -578,6 +591,11 @@ func TestMutationAttemptObserverCoversDefiniteTransactionSetupFailure(t *testing
 	if got := observed.snapshot(); !equalObservedMutationKeys(got, want) {
 		t.Fatalf("definite-failure attempted keys = %q, want %q", got, want)
 	}
+	if got := observed.errorSnapshot(); len(got) != 1 || got[0] == nil ||
+		errors.Is(got[0], durable.ErrCommitOutcomeUnknown) ||
+		!errors.Is(got[0], storeio.ErrFaultInjected) {
+		t.Fatalf("definite-failure observer errors = %v", got)
+	}
 	if got := fixture.user.Collection.Generation(); got != beforeGeneration {
 		t.Fatalf("user generation = %d, want unchanged %d", got, beforeGeneration)
 	}
@@ -589,9 +607,12 @@ func TestMutationAttemptObserverCoversDefiniteTransactionSetupFailure(t *testing
 func TestMutationAttemptObserverIsSynchronousWithApply(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, func(keys AttemptedMutationKeys) {
+	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{}, func(keys AttemptedMutationKeys, updateErr error) {
 		if keys.Len() != 1 || !bytes.Equal(keys.Key(0), []byte("a")) {
 			panic("unexpected attempted mutation keys")
+		}
+		if updateErr != nil {
+			panic("unexpected mutation update error")
 		}
 		entered <- struct{}{}
 		<-release
