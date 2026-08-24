@@ -283,7 +283,7 @@ func validateRecoveredGenerationSeal(
 	if seal.identityDigest != generationIdentityDigest(header.identity) ||
 		seal.topologyRecoveryEpoch != header.topologyRecoveryEpoch ||
 		seal.baseIndex != header.reference.index || seal.baseTerm != header.reference.term ||
-		seal.baseDigest != header.reference.digest ||
+		seal.bootstrapDigest != header.reference.digest ||
 		seal.confDigest != generationConfDigest(header.snapshot.GetMetadata().GetConfState()) ||
 		seal.sourceWALEnd > uint64(options.maxFileBytes) ||
 		seal.sourceRecordSequence > options.maxRecords ||

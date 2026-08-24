@@ -676,7 +676,7 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 				seal.identityDigest != generationIdentityDigest(header.identity) ||
 				seal.topologyRecoveryEpoch != header.topologyRecoveryEpoch ||
 				seal.baseIndex != header.reference.index || seal.baseTerm != header.reference.term ||
-				seal.baseDigest != header.reference.digest ||
+				seal.bootstrapDigest != header.reference.digest ||
 				seal.confDigest != generationConfDigest(header.snapshot.GetMetadata().GetConfState()) ||
 				seal.suffixFirst != sourceFirst || seal.suffixLast != sourceLast ||
 				seal.suffixCount != retainedCount || seal.suffixBytes != retainedBytes ||
@@ -894,7 +894,8 @@ func (builder *GenerationBuilder) finishGenerationScratch(
 		sourceCurrentIncarnation: builder.current.currentIncarnation,
 		topologyRecoveryEpoch:    sourceHeader.topologyRecoveryEpoch,
 		baseIndex:                baseIndex, baseTerm: baseTerm,
-		baseDigest:          sha256.Sum256(bootstrapPayload),
+		bootstrapDigest:     sha256.Sum256(bootstrapPayload),
+		snapshotBaseDigest:  builder.input.SnapshotBaseDigest,
 		confDigest:          generationConfDigest(builder.input.Snapshot.GetMetadata().GetConfState()),
 		retentionCommitment: builder.input.RetentionCommitment,
 		hard:                cloneHardState(scratch.hard), suffixFirst: baseIndex + 1,

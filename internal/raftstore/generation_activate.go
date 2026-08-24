@@ -180,7 +180,7 @@ func (store *Store) PublishGenerationSelection(
 		parentBindingDigest: builder.parentBinding,
 		sourceFileID:        seal.sourceFileID,
 		sourceCutDigest:     seal.sourceChainDigest,
-		snapshotBaseDigest:  seal.baseDigest,
+		snapshotBaseDigest:  seal.snapshotBaseDigest,
 		retentionCommitment: seal.retentionCommitment,
 	}
 	identity = GenerationActivationIdentity{

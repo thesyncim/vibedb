@@ -44,11 +44,15 @@ func linkGenerationName(root *os.Root, oldName, newName string) error {
 }
 
 // GenerationInput is the compact SQL/Raft checkpoint bridge accepted by the
-// offline builder. RetentionCommitment must come from a currently validated
-// checkpoint retention witness. The builder seals it but cannot independently
-// revalidate its SQL owner; activation must perform that validation again.
+// offline builder. SnapshotBaseDigest is the state machine's authenticated
+// identity of Snapshot; it is deliberately distinct from the WAL bootstrap
+// record digest. RetentionCommitment must come from a currently validated
+// checkpoint retention witness. The builder seals both opaque proofs but
+// cannot independently revalidate their SQL owner; activation must perform
+// that validation again.
 type GenerationInput struct {
 	Snapshot            *pb.Snapshot
+	SnapshotBaseDigest  [sha256.Size]byte
 	RetentionCommitment [sha256.Size]byte
 }
 
@@ -138,8 +142,9 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		store.current.currentIncarnation == 0 {
 		return nil, ErrGenerationSource
 	}
-	if input.RetentionCommitment == ([sha256.Size]byte{}) {
-		return nil, fmt.Errorf("%w: zero retention commitment", ErrGenerationSource)
+	if input.SnapshotBaseDigest == ([sha256.Size]byte{}) ||
+		input.RetentionCommitment == ([sha256.Size]byte{}) {
+		return nil, fmt.Errorf("%w: zero snapshot-base or retention commitment", ErrGenerationSource)
 	}
 	if err := validateSnapshotBase(input.Snapshot, store.header.identity.MemberID); err != nil {
 		return nil, errors.Join(ErrGenerationSource, err)
@@ -193,7 +198,8 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		header: header, current: current, options: store.options,
 		link: linkGenerationName,
 		key:  key, input: GenerationInput{
-			Snapshot: cloneSnapshot(input.Snapshot), RetentionCommitment: input.RetentionCommitment,
+			Snapshot: cloneSnapshot(input.Snapshot), SnapshotBaseDigest: input.SnapshotBaseDigest,
+			RetentionCommitment: input.RetentionCommitment,
 		},
 	}, nil
 }
@@ -207,10 +213,13 @@ func (builder *GenerationBuilder) CandidatePath() string {
 	return builder.candidatePath
 }
 
-// BindsInput reports whether this builder captured the exact snapshot and
-// retention commitment. It grants no build, selection, or deletion authority.
+// BindsInput reports whether this builder captured the exact snapshot,
+// state-machine snapshot identity, and retention commitment. It grants no
+// build, selection, or deletion authority.
 func (builder *GenerationBuilder) BindsInput(input GenerationInput) bool {
 	return builder != nil && !builder.closed && input.Snapshot != nil &&
+		input.SnapshotBaseDigest != ([sha256.Size]byte{}) &&
+		input.SnapshotBaseDigest == builder.input.SnapshotBaseDigest &&
 		input.RetentionCommitment != ([sha256.Size]byte{}) &&
 		input.RetentionCommitment == builder.input.RetentionCommitment &&
 		proto.Equal(input.Snapshot, builder.input.Snapshot)
@@ -662,7 +671,7 @@ func generationInfo(
 		ParentBindingDigest: seal.parentBindingDigest,
 		FileID:              fileID, HeaderDigest: headerDigest, BindingDigest: seal.bindingDigest,
 		SourceFileID: seal.sourceFileID, SourceCutDigest: seal.sourceChainDigest,
-		SnapshotBaseDigest: seal.baseDigest, RetentionCommitment: seal.retentionCommitment,
+		SnapshotBaseDigest: seal.snapshotBaseDigest, RetentionCommitment: seal.retentionCommitment,
 		BaseIndex: seal.baseIndex, BaseTerm: seal.baseTerm, LastIndex: seal.suffixLast,
 		HardTerm: seal.hard.GetTerm(), HardVote: seal.hard.GetVote(), HardCommit: seal.hard.GetCommit(),
 		SourceCurrentIncarnation: seal.sourceCurrentIncarnation,

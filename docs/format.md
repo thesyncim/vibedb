@@ -377,13 +377,14 @@ ciphertext/plaintext pair, one retained chunk and encoding, one encrypted
 target record, and `O(MaxReadyEntries)` scalar descriptors. There is no
 source-sized entry arena or second scratch file.
 
-One fixed 472-byte generation seal terminates the candidate. Its authenticated
+One fixed 504-byte generation seal terminates the candidate. Its authenticated
 record chain binds:
 
 - family, generation, parent-generation binding, and complete member identity;
 - source file and static-header identity, selected current generation, WAL end,
   record count, record-chain digest, node incarnation, and topology epoch;
-- snapshot-base index, term, bootstrap digest, and stable ConfState digest;
+- snapshot-base index and term, the WAL bootstrap-record digest, the distinct
+  state-machine snapshot-certificate identity, and stable ConfState digest;
 - the exact checkpoint-retention witness commitment and HardState;
 - retained first/last index, count, logical bytes, and semantic suffix digest;
   and

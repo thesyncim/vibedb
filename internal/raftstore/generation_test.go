@@ -33,6 +33,26 @@ func testRetentionCommitment() [sha256.Size]byte {
 	return sha256.Sum256([]byte("checkpoint-retention-commitment"))
 }
 
+func testSnapshotBaseDigest(snapshot *pb.Snapshot) [sha256.Size]byte {
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil {
+		panic(err)
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte("vibedb/raftstore/test-snapshot-base\x00"))
+	_, _ = h.Write(encoded)
+	var digest [sha256.Size]byte
+	_ = h.Sum(digest[:0])
+	return digest
+}
+
+func testGenerationInput(snapshot *pb.Snapshot) GenerationInput {
+	return GenerationInput{
+		Snapshot: snapshot, SnapshotBaseDigest: testSnapshotBaseDigest(snapshot),
+		RetentionCommitment: testRetentionCommitment(),
+	}
+}
+
 func prepareGenerationSource(t testing.TB) (string, *Store, Options, *GenerationBuilder) {
 	t.Helper()
 	path, store, options := createTestStore(t)
@@ -63,10 +83,7 @@ func prepareGenerationSource(t testing.TB) (string, *Store, Options, *Generation
 	}
 	snapshot := testGenerationSnapshot(3, 2, "checkpoint-three")
 	key := testKey()
-	builder, err := store.PrepareGeneration(GenerationInput{
-		Snapshot:            snapshot,
-		RetentionCommitment: testRetentionCommitment(),
-	}, key)
+	builder, err := store.PrepareGeneration(testGenerationInput(snapshot), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,10 +99,17 @@ func prepareGenerationSource(t testing.TB) (string, *Store, Options, *Generation
 func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *testing.T) {
 	path, source, options, builder := prepareGenerationSource(t)
 	incarnation := source.CurrentIncarnation()
-	peerBuilder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            cloneSnapshot(builder.input.Snapshot),
-		RetentionCommitment: builder.input.RetentionCommitment,
-	}, testKey())
+	if !builder.BindsInput(builder.input) {
+		t.Fatal("builder rejected its exact snapshot-base identity")
+	}
+	foreignInput := builder.input
+	foreignInput.SnapshotBaseDigest[0] ^= 0x80
+	if builder.BindsInput(foreignInput) {
+		t.Fatal("builder accepted a foreign snapshot-base identity")
+	}
+	peerBuilder, err := source.PrepareGeneration(
+		testGenerationInput(cloneSnapshot(builder.input.Snapshot)), testKey(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +137,7 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 		candidate.Info.HardTerm != 3 || candidate.Info.HardCommit != 4 ||
 		candidate.Info.SourceCurrentIncarnation != incarnation ||
 		candidate.Info.RetainedEntries != 1 || candidate.Info.RetainedBytes == 0 ||
+		candidate.Info.SnapshotBaseDigest != builder.input.SnapshotBaseDigest ||
 		candidate.Info.RetentionCommitment != testRetentionCommitment() ||
 		candidate.Info.SourceCutDigest != builder.current.chainDigest {
 		t.Fatalf("candidate info = %+v", candidate.Info)
@@ -217,10 +242,9 @@ func TestGenerationCandidateSupportsFullyCheckpointedSuffix(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	builder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(3, 2, "checkpoint-through-three"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(3, 2, "checkpoint-through-three"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,10 +443,9 @@ func TestGenerationReplayCompactsOverwrittenSourceSuffix(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	builder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(4, 3, "checkpoint-four"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(4, 3, "checkpoint-four"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -666,10 +689,9 @@ func TestGenerationReplayOverwritesAcrossFlushedAndPendingChunks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	builder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(1, 1, "checkpoint-one"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(1, 1, "checkpoint-one"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,10 +764,9 @@ func TestGenerationReplayWritesOnlyProjectedSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseIndex := last - 7
-	builder, err := projectedSource.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(baseIndex, 2, "near-tail-checkpoint"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := projectedSource.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(baseIndex, 2, "near-tail-checkpoint"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,10 +809,9 @@ func TestGenerationReplayCoalescesSequentialReadyRecords(t *testing.T) {
 			t.Fatalf("Persist Ready %d: %v", readyID, err)
 		}
 	}
-	builder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(1, 1, "checkpoint-one"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(1, 1, "checkpoint-one"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1052,10 +1072,9 @@ func TestGenerationBuildReclaimsStaleUnselectedCandidate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	fresh, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(3, 2, "checkpoint-three"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	fresh, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(3, 2, "checkpoint-three"),
+	), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1130,10 +1149,7 @@ func TestGenerationCandidateStrictReopenRejectsCiphertextDamage(t *testing.T) {
 
 func TestPrepareGenerationRejectsUncertifiedOrInexactSources(t *testing.T) {
 	_, unbegun, _ := createTestStore(t)
-	valid := GenerationInput{
-		Snapshot:            testGenerationSnapshot(1, 1, "base"),
-		RetentionCommitment: testRetentionCommitment(),
-	}
+	valid := testGenerationInput(testGenerationSnapshot(1, 1, "base"))
 	if _, err := unbegun.PrepareGeneration(valid, testKey()); !errors.Is(err, ErrGenerationSource) {
 		t.Fatalf("unbegun PrepareGeneration = %v", err)
 	}
@@ -1145,13 +1161,18 @@ func TestPrepareGenerationRejectsUncertifiedOrInexactSources(t *testing.T) {
 		key   Key
 		want  error
 	}{
-		{name: "zero-commitment", input: GenerationInput{Snapshot: valid.Snapshot}, key: testKey(), want: ErrGenerationSource},
-		{name: "future-base", input: GenerationInput{
-			Snapshot: testGenerationSnapshot(5, 3, "future"), RetentionCommitment: testRetentionCommitment(),
+		{name: "zero-snapshot-base-digest", input: GenerationInput{
+			Snapshot: valid.Snapshot, RetentionCommitment: valid.RetentionCommitment,
 		}, key: testKey(), want: ErrGenerationSource},
-		{name: "term-mismatch", input: GenerationInput{
-			Snapshot: testGenerationSnapshot(3, 3, "wrong-term"), RetentionCommitment: testRetentionCommitment(),
+		{name: "zero-commitment", input: GenerationInput{
+			Snapshot: valid.Snapshot, SnapshotBaseDigest: valid.SnapshotBaseDigest,
 		}, key: testKey(), want: ErrGenerationSource},
+		{name: "future-base", input: testGenerationInput(
+			testGenerationSnapshot(5, 3, "future"),
+		), key: testKey(), want: ErrGenerationSource},
+		{name: "term-mismatch", input: testGenerationInput(
+			testGenerationSnapshot(3, 3, "wrong-term"),
+		), key: testKey(), want: ErrGenerationSource},
 	}
 	wrongKey := testKey()
 	wrongKey.Material[0] ^= 0xff
@@ -1178,15 +1199,18 @@ func TestGenerationSealCodecBindsEveryByte(t *testing.T) {
 	if _, err := builder.Build(); err != nil {
 		t.Fatal(err)
 	}
+	if builder.seal.bootstrapDigest == builder.seal.snapshotBaseDigest {
+		t.Fatal("generation seal conflated WAL bootstrap and state-machine base identities")
+	}
 	encoded, err := marshalGenerationSeal(builder.seal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x97, 0xf0, 0x58, 0xc9, 0x4f, 0x00, 0xf4, 0xf5,
-		0x3a, 0x22, 0xaf, 0xb0, 0x9e, 0x77, 0xc5, 0xa6,
-		0xce, 0xf8, 0xfc, 0x43, 0xff, 0x85, 0x55, 0xa9,
-		0x9a, 0x92, 0x36, 0xa0, 0x26, 0xab, 0x16, 0x30,
+		0x55, 0x73, 0x46, 0x2b, 0x7e, 0x07, 0x28, 0xe8,
+		0x54, 0x96, 0x5d, 0x2c, 0xc1, 0x51, 0x79, 0x84,
+		0xf0, 0x93, 0x60, 0x7a, 0xf7, 0x28, 0x7a, 0x1e,
+		0x68, 0xf4, 0x3b, 0x28, 0x99, 0xd0, 0x2a, 0x30,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("generation seal golden SHA-256 = %x, want %x", got, wantGolden)
@@ -1315,10 +1339,7 @@ func requireGenerationCandidateMatchesSourceCut(
 	source.mu.RUnlock()
 
 	wantSnapshot := cloneSnapshot(snapshot)
-	builder, err := source.PrepareGeneration(GenerationInput{
-		Snapshot:            snapshot,
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := source.PrepareGeneration(testGenerationInput(snapshot), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,10 +1490,9 @@ func BenchmarkGenerationReplay4096TinyReadyRecords(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		builder, err := source.PrepareGeneration(GenerationInput{
-			Snapshot:            testGenerationSnapshot(1, 1, "checkpoint-one"),
-			RetentionCommitment: testRetentionCommitment(),
-		}, testKey())
+		builder, err := source.PrepareGeneration(testGenerationInput(
+			testGenerationSnapshot(1, 1, "checkpoint-one"),
+		), testKey())
 		if err != nil {
 			_ = source.Close()
 			b.Fatal(err)

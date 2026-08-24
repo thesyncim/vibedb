@@ -25,8 +25,16 @@ func newWALBaseTestClaim(
 	t testing.TB,
 	name string,
 ) (string, *Database, *ReplicatedApply, ReplicatedShardStoreIdentity) {
+	return newWALBaseTestClaimWithBinding(t, name, testReplicatedBinding(31))
+}
+
+func newWALBaseTestClaimWithBinding(
+	t testing.TB,
+	name string,
+	binding ReplicatedShardStoreBinding,
+) (string, *Database, *ReplicatedApply, ReplicatedShardStoreIdentity) {
 	t.Helper()
-	path, database, binding, _ := prepareReplicatedTestRoot(t, name, false)
+	path, database, _, _ := prepareReplicatedTestRoot(t, name, false)
 	t.Cleanup(func() {
 		if err := database.Close(); err != nil {
 			t.Errorf("close WAL-base database: %v", err)
@@ -51,6 +59,19 @@ func newWALBaseTestClaim(
 		t.Fatalf("InstallSnapshot: %v", err)
 	}
 	return path, database, claim, identity
+}
+
+func walBaseMachineState(t testing.TB, claim *ReplicatedApply) replicatedstate.State {
+	t.Helper()
+	cut, err := claim.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := cut.State()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func walBaseWorkspace() []byte {
@@ -224,6 +245,10 @@ func TestReplicatedApplySettlesExactWALGenerationBeforeReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if input.SnapshotBaseDigest != certificate.Digest {
+		t.Fatalf("generation input snapshot-base digest = %x, want %x",
+			input.SnapshotBaseDigest, certificate.Digest)
+	}
 	before, err := claim.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
@@ -296,14 +321,12 @@ func TestReplicatedApplySettlesExactWALGenerationBeforeReclaim(t *testing.T) {
 			}
 		})
 	}
-	unsettled, err := claim.SnapshotArtifactCut()
-	if err != nil {
-		t.Fatal(err)
+	if unsettled, err := claim.SnapshotArtifactCut(); unsettled != nil || !errors.Is(
+		err, ErrReplicatedApplyBusy,
+	) {
+		t.Fatalf("public snapshot crossed selected-generation fence = %v, %v", unsettled, err)
 	}
-	unsettledState := unsettled.State()
-	if err := unsettled.Close(); err != nil {
-		t.Fatal(err)
-	}
+	unsettledState := walBaseMachineState(t, claim)
 	if unsettledState.SnapshotBaseDigest != beforeState.SnapshotBaseDigest {
 		t.Fatalf("rejected settlement changed base: before=%x after=%x",
 			beforeState.SnapshotBaseDigest, unsettledState.SnapshotBaseDigest)
@@ -311,14 +334,12 @@ func TestReplicatedApplySettlesExactWALGenerationBeforeReclaim(t *testing.T) {
 	if err := claim.SettleGenerationActivation(activation); err != nil {
 		t.Fatalf("settle generation: %v", err)
 	}
-	settled, err := claim.SnapshotArtifactCut()
-	if err != nil {
-		t.Fatal(err)
+	if settled, err := claim.SnapshotArtifactCut(); settled != nil || !errors.Is(
+		err, ErrReplicatedApplyBusy,
+	) {
+		t.Fatalf("settled base escaped before WAL completion = %v, %v", settled, err)
 	}
-	settledState := settled.State()
-	if err := settled.Close(); err != nil {
-		t.Fatal(err)
-	}
+	settledState := walBaseMachineState(t, claim)
 	if settledState.SnapshotBaseDigest != certificate.Digest ||
 		settledState.Applied != certificate.Manifest.State.Applied {
 		t.Fatalf("settled state = %+v, certificate = %+v", settledState, certificate)
@@ -379,7 +400,9 @@ func TestPendingWALGenerationCloseRetiresDatabaseBeforeClaimRelease(t *testing.T
 
 func TestGenerationSettlementRejectsWrongBindingBeforeCheckpointMutation(t *testing.T) {
 	_, _, source, _ := newWALBaseTestClaim(t, "settle-binding-source")
-	_, _, target, _ := newWALBaseTestClaim(t, "settle-binding-target")
+	_, _, target, _ := newWALBaseTestClaimWithBinding(
+		t, "settle-binding-target", testReplicatedBinding(32),
+	)
 	preparation, err := source.CaptureWALBase(WALBaseCaptureOptions{
 		Workspace: walBaseWorkspace(),
 	})

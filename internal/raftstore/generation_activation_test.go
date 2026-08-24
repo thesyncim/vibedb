@@ -84,6 +84,7 @@ func TestGenerationSelectionSettlesAndRotatesWithConstantNamespace(t *testing.T)
 	activation, err := selected.PendingGenerationActivation()
 	if err != nil || activation.Info.Generation != 1 ||
 		activation.Info.BindingDigest != firstCandidate.Info.BindingDigest ||
+		activation.Info.SnapshotBaseDigest != firstCandidate.Info.SnapshotBaseDigest ||
 		activation.Snapshot.GetMetadata().GetIndex() != 3 {
 		t.Fatalf("pending generation 1 = %+v, %v", activation, err)
 	}
@@ -133,10 +134,9 @@ func TestGenerationSelectionSettlesAndRotatesWithConstantNamespace(t *testing.T)
 	if _, err := selected.BeginIncarnation(); err != nil {
 		t.Fatal(err)
 	}
-	secondBuilder, err := selected.PrepareGeneration(GenerationInput{
-		Snapshot:            testGenerationSnapshot(4, 3, "checkpoint-four"),
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	secondBuilder, err := selected.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(4, 3, "checkpoint-four"),
+	), testKey())
 	if err != nil {
 		t.Fatalf("prepare generation 2: %v", err)
 	}
@@ -1156,10 +1156,7 @@ func TestOrdinarySourceOpenDefersCreateAliasBarrierUntilSelection(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder, err := reopened.PrepareGeneration(GenerationInput{
-		Snapshot:            snapshot,
-		RetentionCommitment: testRetentionCommitment(),
-	}, testKey())
+	builder, err := reopened.PrepareGeneration(testGenerationInput(snapshot), testKey())
 	if err != nil {
 		t.Fatal(err)
 	}

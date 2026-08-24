@@ -75,6 +75,7 @@ func (p *WALBasePreparation) GenerationInput() (
 	}
 	return raftstore.GenerationInput{
 		Snapshot:            proto.Clone(p.snapshotBase).(*pb.Snapshot),
+		SnapshotBaseDigest:  p.snapshotBaseDigest,
 		RetentionCommitment: commitment,
 	}, nil
 }

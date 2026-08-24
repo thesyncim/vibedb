@@ -846,7 +846,7 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 			header.headerDigest != state.activeHeaderDigest ||
 			generation.seal.sourceFileID != state.sourceFileID ||
 			generation.seal.sourceChainDigest != state.sourceCutDigest ||
-			generation.seal.baseDigest != state.snapshotBaseDigest ||
+			generation.seal.snapshotBaseDigest != state.snapshotBaseDigest ||
 			generation.seal.retentionCommitment != state.retentionCommitment ||
 			(state.phase == familyPhaseActive && base != logicalBase) {
 			cleanup()

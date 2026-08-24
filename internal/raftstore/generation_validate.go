@@ -246,7 +246,7 @@ func streamFreshGenerationRecords(
 				seal.identityDigest != generationIdentityDigest(header.identity) ||
 				seal.topologyRecoveryEpoch != header.topologyRecoveryEpoch ||
 				seal.baseIndex != header.reference.index || seal.baseTerm != header.reference.term ||
-				seal.baseDigest != header.reference.digest ||
+				seal.bootstrapDigest != header.reference.digest ||
 				seal.confDigest != generationConfDigest(header.snapshot.GetMetadata().GetConfState()) ||
 				seal.suffixFirst != header.reference.index+1 || seal.suffixLast != retainedLast ||
 				seal.suffixCount != retainedCount || seal.suffixBytes != retainedBytes ||
@@ -310,7 +310,8 @@ func (builder *GenerationBuilder) candidateSealMatches(
 		seal.sourceCurrentIncarnation == builder.current.currentIncarnation &&
 		seal.topologyRecoveryEpoch == builder.header.topologyRecoveryEpoch &&
 		seal.baseIndex == baseIndex && seal.baseTerm == baseTerm &&
-		seal.baseDigest == sha256.Sum256(bootstrapPayload) &&
+		seal.bootstrapDigest == sha256.Sum256(bootstrapPayload) &&
+		seal.snapshotBaseDigest == builder.input.SnapshotBaseDigest &&
 		seal.confDigest == generationConfDigest(
 			builder.input.Snapshot.GetMetadata().GetConfState(),
 		) && seal.retentionCommitment == builder.input.RetentionCommitment &&

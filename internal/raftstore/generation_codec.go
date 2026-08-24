@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	generationSealPayloadBytes = 472
+	generationSealPayloadBytes = 504
 	retainedPayloadHeaderBytes = 24
 )
 
@@ -58,7 +58,8 @@ type generationSeal struct {
 	topologyRecoveryEpoch    uint64
 	baseIndex                uint64
 	baseTerm                 uint64
-	baseDigest               [sha256.Size]byte
+	bootstrapDigest          [sha256.Size]byte
+	snapshotBaseDigest       [sha256.Size]byte
 	confDigest               [sha256.Size]byte
 	retentionCommitment      [sha256.Size]byte
 	hard                     *pb.HardState
@@ -98,7 +99,8 @@ func marshalGenerationSeal(seal generationSeal) ([]byte, error) {
 	result = appendUint64(result, seal.topologyRecoveryEpoch)
 	result = appendUint64(result, seal.baseIndex)
 	result = appendUint64(result, seal.baseTerm)
-	result = append(result, seal.baseDigest[:]...)
+	result = append(result, seal.bootstrapDigest[:]...)
+	result = append(result, seal.snapshotBaseDigest[:]...)
 	result = append(result, seal.confDigest[:]...)
 	result = append(result, seal.retentionCommitment[:]...)
 	result = appendUint64(result, seal.hard.GetTerm())
@@ -183,7 +185,10 @@ func unmarshalGenerationSeal(data []byte) (generationSeal, error) {
 	if err != nil {
 		return generationSeal{}, err
 	}
-	if err := readGenerationFixed(&reader, seal.baseDigest[:]); err != nil {
+	if err := readGenerationFixed(&reader, seal.bootstrapDigest[:]); err != nil {
+		return generationSeal{}, err
+	}
+	if err := readGenerationFixed(&reader, seal.snapshotBaseDigest[:]); err != nil {
 		return generationSeal{}, err
 	}
 	if err := readGenerationFixed(&reader, seal.confDigest[:]); err != nil {
@@ -270,7 +275,8 @@ func validateGenerationSealStatic(seal generationSeal) error {
 		seal.sourceRecordSequence == 0 || seal.sourceChainDigest == ([sha256.Size]byte{}) ||
 		seal.sourceCurrentIncarnation == 0 || seal.topologyRecoveryEpoch == 0 ||
 		seal.baseIndex == 0 || seal.baseIndex == math.MaxUint64 || seal.baseTerm == 0 ||
-		seal.baseTerm == math.MaxUint64 || seal.baseDigest == ([sha256.Size]byte{}) ||
+		seal.baseTerm == math.MaxUint64 || seal.bootstrapDigest == ([sha256.Size]byte{}) ||
+		seal.snapshotBaseDigest == ([sha256.Size]byte{}) ||
 		seal.confDigest == ([sha256.Size]byte{}) || seal.retentionCommitment == ([sha256.Size]byte{}) ||
 		seal.hard == nil || seal.hard.GetTerm() == 0 || seal.hard.GetTerm() == math.MaxUint64 ||
 		seal.hard.GetCommit() < seal.baseIndex || seal.suffixFirst != seal.baseIndex+1 ||
@@ -309,7 +315,8 @@ func generationBindingDigest(seal generationSeal) [sha256.Size]byte {
 	writeGenerationU64(h, seal.topologyRecoveryEpoch)
 	writeGenerationU64(h, seal.baseIndex)
 	writeGenerationU64(h, seal.baseTerm)
-	_, _ = h.Write(seal.baseDigest[:])
+	_, _ = h.Write(seal.bootstrapDigest[:])
+	_, _ = h.Write(seal.snapshotBaseDigest[:])
 	_, _ = h.Write(seal.confDigest[:])
 	_, _ = h.Write(seal.retentionCommitment[:])
 	writeGenerationU64(h, seal.hard.GetTerm())
