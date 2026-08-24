@@ -574,10 +574,11 @@ func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) 
 		switch result {
 		case replicatedstate.ResultApplied,
 			replicatedstate.ResultStaleFence,
-			replicatedstate.ResultUnknownCollection,
+			replicatedstate.ResultUnknownRelation,
 			replicatedstate.ResultInvalidDocument,
 			replicatedstate.ResultTargetBound,
-			replicatedstate.ResultWrongShard:
+			replicatedstate.ResultWrongShard,
+			replicatedstate.ResultIndexConflict:
 			return true
 		}
 	case replication.CommandSessionRetire:

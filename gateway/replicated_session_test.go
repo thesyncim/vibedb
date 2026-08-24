@@ -444,10 +444,11 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 	allResults := []uint32{
 		replicatedstate.ResultApplied,
 		replicatedstate.ResultStaleFence,
-		replicatedstate.ResultUnknownCollection,
+		replicatedstate.ResultUnknownRelation,
 		replicatedstate.ResultInvalidDocument,
 		replicatedstate.ResultTargetBound,
 		replicatedstate.ResultWrongShard,
+		replicatedstate.ResultIndexConflict,
 		replicatedstate.ResultSessionRetired,
 		replicatedstate.ResultSessionOpened,
 		replicatedstate.ResultSessionRenewed,
@@ -455,12 +456,13 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 	}
 	allowed := map[replication.CommandKind]map[uint32]bool{
 		replication.CommandMutationBatch: {
-			replicatedstate.ResultApplied:           true,
-			replicatedstate.ResultStaleFence:        true,
-			replicatedstate.ResultUnknownCollection: true,
-			replicatedstate.ResultInvalidDocument:   true,
-			replicatedstate.ResultTargetBound:       true,
-			replicatedstate.ResultWrongShard:        true,
+			replicatedstate.ResultApplied:         true,
+			replicatedstate.ResultStaleFence:      true,
+			replicatedstate.ResultUnknownRelation: true,
+			replicatedstate.ResultInvalidDocument: true,
+			replicatedstate.ResultTargetBound:     true,
+			replicatedstate.ResultWrongShard:      true,
+			replicatedstate.ResultIndexConflict:   true,
 		},
 		replication.CommandSessionRetire: {
 			replicatedstate.ResultStaleFence:     true,
