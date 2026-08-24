@@ -1626,13 +1626,15 @@ func TestReplicatedApplyActivationAdoptsWithoutReopen(t *testing.T) {
 func TestReplicatedApplyPreflightAndPreRecoveryFences(t *testing.T) {
 	t.Run("reserved name before mutation", func(t *testing.T) {
 		_, database, base := bindReplicatedApplyTestRoot(t, "reserved-apply")
-		reserved := base
+		reserved := base.Clone()
 		reserved.UserTable = replicatedstate.SystemCollectionName
+		reserved.Relations[0].Table = reserved.UserTable
+		reserved.RelationManifestDigest = replicatedRelationManifestDigest(reserved)
 		claim, identity, err := database.OpenReplicatedApply(
 			reserved, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 		)
 		if claim != nil || identity != (ReplicatedApplyIdentity{}) ||
-			!errors.Is(err, ErrReplicatedApplyMismatch) {
+			!errors.Is(err, ErrReplicatedShardStoreProfile) {
 			t.Fatalf("reserved activation = %p,%+v,%v", claim, identity, err)
 		}
 		core := database.connector.db
