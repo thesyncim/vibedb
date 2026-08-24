@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -22,6 +23,10 @@ var (
 	ErrInvalidOwner = errors.New("raftservice: invalid owner configuration")
 	// ErrIngressFull reports that the fixed owner ingress budget is exhausted.
 	ErrIngressFull = errors.New("raftservice: owner ingress is full")
+	// ErrPendingProposalsFull reports that commands retained by synchronous
+	// proposal callers have exhausted their independent item or byte budget.
+	// Raft peer ingress remains available when this client-facing budget fills.
+	ErrPendingProposalsFull = errors.New("raftservice: pending proposal budget is full")
 	// ErrOwnerClosed reports admission outside the serialized owner's live Run
 	// interval, including before the sole Host lane has started.
 	ErrOwnerClosed = errors.New("raftservice: owner is closed")
@@ -39,6 +44,8 @@ var (
 type Limits struct {
 	MaxIngressItems         int
 	MaxIngressBytes         int64
+	MaxPendingProposalItems int
+	MaxPendingProposalBytes int64
 	MaxPendingOutboundBytes int64
 }
 
@@ -71,15 +78,28 @@ const (
 	requestStatus
 )
 
+const (
+	proposalDeliveryPending uint32 = iota
+	proposalDeliveryAbandoned
+	proposalDeliveryReady
+)
+
+// proposalDelivery closes the cancellation race between a request goroutine
+// and the serialized Owner. Exactly one side wins waiter ownership.
+type proposalDelivery struct {
+	state atomic.Uint32
+}
+
 type ownerRequest struct {
-	kind    requestKind
-	group   raftmember.GroupKey
-	data    []byte
-	fence   ServingFence
-	inbound rafttransport.Inbound
-	reply   chan ownerReply
-	bytes   int64
-	async   bool
+	kind     requestKind
+	group    raftmember.GroupKey
+	data     []byte
+	fence    ServingFence
+	inbound  rafttransport.Inbound
+	reply    chan ownerReply
+	bytes    int64
+	async    bool
+	delivery *proposalDelivery
 }
 
 type ownerReply struct {
@@ -194,12 +214,14 @@ type Owner struct {
 	ready   chan struct{}
 	done    chan struct{}
 
-	mu           sync.Mutex
-	ingressItems int
-	ingressBytes int64
-	started      bool
-	closed       bool
-	failure      error
+	mu                   sync.Mutex
+	ingressItems         int
+	ingressBytes         int64
+	pendingProposalItems int
+	pendingProposalBytes int64
+	started              bool
+	closed               bool
+	failure              error
 }
 
 type ownerMember struct {
@@ -215,6 +237,10 @@ func NewOwner(options Options) (*Owner, error) {
 		len(options.CommandFences) != len(options.Members) ||
 		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
 		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
+		limits.MaxPendingProposalItems <= 0 ||
+		limits.MaxPendingProposalItems > raftserve.AbsoluteMaxWaiters ||
+		limits.MaxPendingProposalBytes <= 0 ||
+		limits.MaxPendingProposalBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingOutboundBytes <= 0 ||
 		limits.MaxPendingOutboundBytes > multiraft.AbsoluteMaxOutboxBytes {
 		return nil, ErrInvalidOwner
@@ -372,6 +398,9 @@ func (owner *Owner) handle(request ownerRequest) error {
 			break
 		}
 		reply.waiter, reply.err = owner.registry.Enqueue(owner.host, request.group, request.data)
+		if reply.err == nil {
+			reply.waiter, reply.err = handoffProposalWaiter(request.delivery, reply.waiter)
+		}
 	case requestInbound:
 		if request.inbound.Group != request.group || request.inbound.Message == nil {
 			reply.err = ErrInvalidOwner
@@ -394,6 +423,19 @@ func (owner *Owner) handle(request ownerRequest) error {
 	}
 	request.reply <- reply
 	return reply.err
+}
+
+func handoffProposalWaiter(
+	delivery *proposalDelivery,
+	waiter raftserve.Waiter,
+) (raftserve.Waiter, error) {
+	if delivery == nil || delivery.state.CompareAndSwap(
+		proposalDeliveryPending, proposalDeliveryReady,
+	) {
+		return waiter, nil
+	}
+	waiter.Cancel()
+	return raftserve.Waiter{}, ErrOutcomeUnknown
 }
 
 func servingFenceMatchesIdentity(
@@ -497,11 +539,33 @@ func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerRep
 	if err := owner.publish(request); err != nil {
 		return ownerReply{}, err
 	}
-	// Once queued, stop drains an explicit reply for this request. Waiting for
-	// that reply is what distinguishes a definite pre-admission refusal from an
-	// admitted outcome whose client context later expires.
-	reply := <-request.reply
-	return reply, reply.err
+	if request.delivery == nil {
+		select {
+		case reply := <-request.reply:
+			return reply, reply.err
+		case <-ctx.Done():
+			return ownerReply{}, context.Cause(ctx)
+		}
+	}
+	select {
+	case reply := <-request.reply:
+		return reply, reply.err
+	default:
+	}
+	select {
+	case reply := <-request.reply:
+		return reply, reply.err
+	case <-ctx.Done():
+		if request.delivery.state.CompareAndSwap(
+			proposalDeliveryPending, proposalDeliveryAbandoned,
+		) {
+			return ownerReply{}, errors.Join(ErrOutcomeUnknown, context.Cause(ctx))
+		}
+		// Owner won the handoff CAS and publishes to the buffered channel
+		// immediately afterward. This receive cannot wait on Raft or storage.
+		reply := <-request.reply
+		return reply, reply.err
+	}
 }
 
 // Submit registers and proposes one already-canonical command. Cancellation
@@ -512,18 +576,66 @@ func (owner *Owner) Submit(
 	fence ServingFence,
 	command []byte,
 ) (Result, error) {
+	return owner.submit(ctx, fence, command, false)
+}
+
+// SubmitOwned transfers one exact-length, capacity-clamped command allocation
+// into the synchronous serving path. It exists for the native server decoder,
+// which already owns its frame and retains its request bytes for the duration
+// of the call. Unlike Submit, an enqueue-time unknown does not copy retry bytes:
+// the gateway retains the canonical request and owns retry identity.
+func (owner *Owner) SubmitOwned(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) (Result, error) {
+	return owner.submit(ctx, fence, command, true)
+}
+
+func (owner *Owner) submit(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+	transfer bool,
+) (Result, error) {
 	if len(command) == 0 || len(command) > replication.MaxCommandBytes {
 		return Result{}, ErrInvalidOwner
 	}
+	if transfer && cap(command) != len(command) {
+		return Result{}, ErrInvalidOwner
+	}
+	if ctx == nil {
+		return Result{}, ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return Result{}, cause
+	}
+	if err := owner.reservePendingProposal(int64(len(command))); err != nil {
+		return Result{}, err
+	}
+	defer owner.releasePendingProposal(int64(len(command)))
 	// Exact-length allocation keeps the ingress byte charge equal to retained
 	// capacity instead of relying on append growth-class rounding.
-	owned := make([]byte, len(command))
-	copy(owned, command)
+	owned := command
+	if !transfer {
+		owned = make([]byte, len(command))
+		copy(owned, command)
+	}
+	delivery := &proposalDelivery{}
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestProposal, group: fence.Group, fence: fence, data: owned,
 		reply: make(chan ownerReply, 1), bytes: int64(cap(owned)),
+		delivery: delivery,
 	})
 	if err != nil {
+		if errors.Is(err, ErrOutcomeUnknown) {
+			if transfer {
+				return Result{}, err
+			}
+			return Result{}, &UnknownOutcomeError{
+				Command: append([]byte(nil), owned...), Cause: err,
+			}
+		}
 		return Result{}, err
 	}
 	waiter := reply.waiter
@@ -545,6 +657,34 @@ func (owner *Owner) Submit(
 		return result, outcomeErr
 	}
 	return result, nil
+}
+
+// reservePendingProposal runs before any command-sized allocation. The
+// reservation stays charged across registry admission, Wait, completion take,
+// cancellation, and exact unknown-outcome handoff.
+func (owner *Owner) reservePendingProposal(bytes int64) error {
+	if owner == nil || bytes <= 0 || bytes > owner.limits.MaxPendingProposalBytes {
+		return ErrPendingProposalsFull
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if !owner.started || owner.closed {
+		return errors.Join(ErrOwnerClosed, owner.failure)
+	}
+	if owner.pendingProposalItems == owner.limits.MaxPendingProposalItems ||
+		bytes > owner.limits.MaxPendingProposalBytes-owner.pendingProposalBytes {
+		return ErrPendingProposalsFull
+	}
+	owner.pendingProposalItems++
+	owner.pendingProposalBytes += bytes
+	return nil
+}
+
+func (owner *Owner) releasePendingProposal(bytes int64) {
+	owner.mu.Lock()
+	owner.pendingProposalItems--
+	owner.pendingProposalBytes -= bytes
+	owner.mu.Unlock()
 }
 
 // HandleInbound is the authenticated rafttransport receiver callback. Inbound

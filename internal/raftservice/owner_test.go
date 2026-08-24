@@ -12,6 +12,136 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
+func newDeliveryTestOwner() *Owner {
+	return &Owner{
+		limits:  Limits{MaxIngressItems: 1, MaxIngressBytes: 1},
+		ingress: make(chan ownerRequest, 1), started: true,
+	}
+}
+
+func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
+	owner := newDeliveryTestOwner()
+	ctx, cancel := context.WithCancel(context.Background())
+	delivery := &proposalDelivery{}
+	reply := make(chan ownerReply, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := owner.enqueue(ctx, ownerRequest{
+			reply: reply, bytes: 1, delivery: delivery,
+		})
+		done <- err
+	}()
+	request := <-owner.ingress
+	cancel()
+	if err := <-done; !errors.Is(err, ErrOutcomeUnknown) ||
+		!errors.Is(err, context.Canceled) {
+		t.Fatalf("abandoned delivery = %v", err)
+	}
+	if delivery.state.Load() != proposalDeliveryAbandoned {
+		t.Fatalf("delivery state = %d", delivery.state.Load())
+	}
+	// This is the exact CAS performed by handle after Registry.Enqueue. Losing
+	// it obligates handle to cancel the newly-created waiter rather than publish
+	// it to a caller that already returned.
+	if delivery.state.CompareAndSwap(proposalDeliveryPending, proposalDeliveryReady) {
+		t.Fatal("owner acquired an abandoned delivery")
+	}
+	owner.release(request.bytes)
+}
+
+func TestOwnerProposalDeliveryHandoffWinsBeforeCancellation(t *testing.T) {
+	owner := newDeliveryTestOwner()
+	ctx, cancel := context.WithCancel(context.Background())
+	delivery := &proposalDelivery{}
+	reply := make(chan ownerReply, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := owner.enqueue(ctx, ownerRequest{
+			reply: reply, bytes: 1, delivery: delivery,
+		})
+		done <- err
+	}()
+	request := <-owner.ingress
+	if !delivery.state.CompareAndSwap(proposalDeliveryPending, proposalDeliveryReady) {
+		t.Fatal("owner did not acquire pending delivery")
+	}
+	cancel()
+	reply <- ownerReply{}
+	if err := <-done; err != nil {
+		t.Fatalf("ready delivery = %v", err)
+	}
+	if delivery.state.Load() != proposalDeliveryReady {
+		t.Fatalf("delivery state = %d", delivery.state.Load())
+	}
+	owner.release(request.bytes)
+}
+
+type deliveryTestProposalHost struct{}
+
+func (deliveryTestProposalHost) EnqueueTrackedProposal(
+	raftmember.GroupKey,
+	[]byte,
+	multiraft.ProposalToken,
+) error {
+	return nil
+}
+
+func TestOwnerAbandonedDeliveryCancelsRegisteredWaiter(t *testing.T) {
+	registry, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 1, MaxOutstandingIdentities: 1,
+		MaxOutstandingAttempts: 1, MaxWaiters: 1,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: replication.MaxEmptyResultCompletionEnvelopeBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := peerServerTestGroup()
+	command := replication.Command{
+		Kind:                  replication.CommandMutationBatch,
+		ClusterID:             replication.ID128(group.ClusterID),
+		ClusterIncarnation:    replication.ID128(group.ClusterIncarnation),
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		Distribution:          "docs", Shard: "0000-ffff", AllocationGeneration: 1,
+		ShardIncarnation:  replication.ID128(group.ShardIncarnation),
+		GroupID:           replication.ID128(group.GroupID),
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RoutingVersion: 1, RouteGeneration: 1,
+		Tenant: []byte("tenant"), ClientID: replication.ID128{1},
+		ClientEpoch: 1, ClientSequence: 1, Fingerprint: replication.Digest{1},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: []byte("k"), Value: []byte("v"),
+			}},
+		}},
+	}
+	data, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter, err := registry.Enqueue(deliveryTestProposalHost{}, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats := registry.Stats(); stats.Waiters != 1 {
+		t.Fatalf("waiters before abandoned handoff = %d", stats.Waiters)
+	}
+	delivery := &proposalDelivery{}
+	delivery.state.Store(proposalDeliveryAbandoned)
+	returned, err := handoffProposalWaiter(delivery, waiter)
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("abandoned waiter handoff = %v", err)
+	}
+	if _, _, pollErr := returned.Poll(); !errors.Is(pollErr, raftserve.ErrWaiterClosed) {
+		t.Fatalf("returned waiter remained live: %v", pollErr)
+	}
+	if stats := registry.Stats(); stats.Waiters != 0 {
+		t.Fatalf("waiters after abandoned handoff = %d", stats.Waiters)
+	}
+}
+
 func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 	registry, err := raftserve.NewRegistry(raftserve.Limits{
 		MaxGroups: 1, MaxOutstandingIdentities: 1,
@@ -45,7 +175,9 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 			RoutingVersion:         1, RouteGeneration: 1,
 		}},
 		Limits: Limits{
-			MaxIngressItems: 1, MaxIngressBytes: 1, MaxPendingOutboundBytes: 1,
+			MaxIngressItems: 1, MaxIngressBytes: 1,
+			MaxPendingProposalItems: 1, MaxPendingProposalBytes: 1,
+			MaxPendingOutboundBytes: 1,
 		},
 	})
 	if err != nil {
@@ -54,5 +186,44 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 	_, err = owner.Probe(context.Background(), identity.Group)
 	if !errors.Is(err, ErrOwnerClosed) {
 		t.Fatalf("pre-Run Probe = %v", err)
+	}
+}
+
+func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
+	owner := &Owner{
+		limits:  Limits{MaxPendingProposalItems: 2, MaxPendingProposalBytes: 7},
+		started: true,
+	}
+	if err := owner.reservePendingProposal(4); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.reservePendingProposal(4); !errors.Is(err, ErrPendingProposalsFull) {
+		t.Fatalf("byte-bound reserve = %v", err)
+	}
+	if owner.pendingProposalItems != 1 || owner.pendingProposalBytes != 4 ||
+		owner.ingressItems != 0 || owner.ingressBytes != 0 {
+		t.Fatalf("accounting = pending %d/%d ingress %d/%d",
+			owner.pendingProposalItems, owner.pendingProposalBytes,
+			owner.ingressItems, owner.ingressBytes)
+	}
+	owner.releasePendingProposal(4)
+	if err := owner.reservePendingProposal(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.reservePendingProposal(4); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.reservePendingProposal(1); !errors.Is(err, ErrPendingProposalsFull) {
+		t.Fatalf("item-bound reserve = %v", err)
+	}
+	owner.releasePendingProposal(3)
+	owner.releasePendingProposal(4)
+	if owner.pendingProposalItems != 0 || owner.pendingProposalBytes != 0 {
+		t.Fatalf("released accounting = %d/%d",
+			owner.pendingProposalItems, owner.pendingProposalBytes)
+	}
+	owner.closed = true
+	if err := owner.reservePendingProposal(1); !errors.Is(err, ErrOwnerClosed) {
+		t.Fatalf("closed reserve = %v", err)
 	}
 }

@@ -123,6 +123,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 				CommandFences: []CommandFence{rf3CommandFence(bases[index])},
 				Pulse:         pulses[index],
 				Limits: Limits{MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
+					MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
 					MaxPendingOutboundBytes: 64 << 20},
 			},
 			Transport: rafttransport.OrdinaryTransportOptions{

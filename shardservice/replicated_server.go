@@ -17,23 +17,57 @@ import (
 
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
-	Submit(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
+	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
 // connection admission; connection authentication remains an explicit outer
 // listener capability.
 type ReplicatedServer struct {
-	owner replicatedOwner
-	state atomic.Uint32
+	owner          replicatedOwner
+	state          atomic.Uint32
+	requestTimeout time.Duration
+	frames         replicatedFrameByteBudget
 
-	accepted atomic.Uint64
-	rejected atomic.Uint64
-	failed   atomic.Uint64
-	active   atomic.Uint64
+	accepted      atomic.Uint64
+	rejected      atomic.Uint64
+	failed        atomic.Uint64
+	active        atomic.Uint64
+	frameRejected atomic.Uint64
 }
 
-const AbsoluteMaxReplicatedConnections = 65536
+const (
+	AbsoluteMaxReplicatedConnections        = 65536
+	AbsoluteMaxReplicatedInFlightFrameBytes = int64(1 << 30)
+	AbsoluteMaxReplicatedRequestTimeout     = 5 * time.Minute
+)
+
+type replicatedFrameByteBudget struct {
+	limit int64
+	used  atomic.Int64
+}
+
+func (budget *replicatedFrameByteBudget) reserve(bytes int64) bool {
+	if budget == nil || bytes <= 0 || bytes > budget.limit {
+		return false
+	}
+	for {
+		used := budget.used.Load()
+		if used < 0 || bytes > budget.limit-used {
+			return false
+		}
+		if budget.used.CompareAndSwap(used, used+bytes) {
+			return true
+		}
+	}
+}
+
+func (budget *replicatedFrameByteBudget) release(bytes int64) {
+	if budget == nil || bytes <= 0 {
+		return
+	}
+	budget.used.Add(-bytes)
+}
 
 const (
 	replicatedServerReady uint32 = iota
@@ -43,19 +77,29 @@ const (
 
 // ReplicatedServerStats is an allocation-free detached listener snapshot.
 type ReplicatedServerStats struct {
-	Accepted uint64
-	Rejected uint64
-	Failed   uint64
-	Active   uint64
+	Accepted           uint64
+	Rejected           uint64
+	Failed             uint64
+	Active             uint64
+	FrameRejected      uint64
+	InFlightFrameBytes int64
 }
 
-// NewReplicatedServer binds the shipped native protocol to one serialized
-// owner lane.
-func NewReplicatedServer(owner *raftservice.Owner) (*ReplicatedServer, error) {
-	if owner == nil {
+// NewReplicatedServer binds the native RF3 protocol to one serialized owner
+// lane. Command construction must still explicitly supply authenticated client
+// and peer listeners before this becomes a public serving boundary.
+func NewReplicatedServer(
+	owner *raftservice.Owner,
+	maxInFlightFrameBytes int64,
+	requestTimeout time.Duration,
+) (*ReplicatedServer, error) {
+	if owner == nil || maxInFlightFrameBytes <= 0 ||
+		maxInFlightFrameBytes > AbsoluteMaxReplicatedInFlightFrameBytes ||
+		requestTimeout <= 0 || requestTimeout > AbsoluteMaxReplicatedRequestTimeout {
 		return nil, ErrReplicatedWire
 	}
-	return &ReplicatedServer{owner: owner}, nil
+	return &ReplicatedServer{owner: owner, requestTimeout: requestTimeout,
+		frames: replicatedFrameByteBudget{limit: maxInFlightFrameBytes}}, nil
 }
 
 // Serve accepts a bounded number of native gateway connections. There is no
@@ -126,6 +170,8 @@ func (server *ReplicatedServer) Stats() ReplicatedServerStats {
 	return ReplicatedServerStats{
 		Accepted: server.accepted.Load(), Rejected: server.rejected.Load(),
 		Failed: server.failed.Load(), Active: server.active.Load(),
+		FrameRejected:      server.frameRejected.Load(),
+		InFlightFrameBytes: server.frames.used.Load(),
 	}
 }
 
@@ -135,24 +181,43 @@ func (server *ReplicatedServer) ServeReplicatedConn(
 	ctx context.Context,
 	conn net.Conn,
 ) error {
-	if server == nil || server.owner == nil || ctx == nil || conn == nil {
+	if server == nil || server.owner == nil || ctx == nil || conn == nil ||
+		server.requestTimeout <= 0 || server.frames.limit <= 0 {
 		return ErrReplicatedWire
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	for {
-		request, err := DecodeReplicatedRequest(conn)
+		err := server.serveReplicatedRequest(ctx, conn)
 		if err != nil {
+			if errors.Is(err, errFrameBudget) {
+				server.frameRejected.Add(1)
+			}
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
-		response := server.executeReplicated(ctx, request)
-		if err := EncodeReplicatedResponse(conn, response); err != nil {
-			return err
-		}
 	}
+}
+
+func (server *ReplicatedServer) serveReplicatedRequest(
+	ctx context.Context,
+	conn net.Conn,
+) error {
+	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
+	defer cancel()
+	deadline, _ := requestCtx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	request, charged, err := decodeReplicatedRequest(conn, &server.frames)
+	if err != nil {
+		return err
+	}
+	defer server.frames.release(charged)
+	response := server.executeReplicated(requestCtx, request)
+	return EncodeReplicatedResponse(conn, response)
 }
 
 func (server *ReplicatedServer) executeReplicated(
@@ -176,7 +241,7 @@ func (server *ReplicatedServer) executeReplicated(
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
 	}
 
-	result, err := server.owner.Submit(ctx, raftservice.ServingFence{
+	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
 		Group:                request.Fence.Group,
 		AllocationGeneration: request.Fence.AllocationGeneration,
 		Command:              request.Fence.Command,
@@ -187,10 +252,14 @@ func (server *ReplicatedServer) executeReplicated(
 		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
 			wireState = replicatedWireState(refreshed)
 		}
-		return &ReplicatedResponse{
+		response := &ReplicatedResponse{
 			Kind: ReplicatedCompletion, HasState: true, State: wireState,
 			Outcome: result.Outcome, Completion: result.Completion,
 		}
+		if validReplicatedResponse(response) {
+			return response
+		}
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	}
 	// Refresh the leader hint after a definite owner-lane refusal. The refresh
 	// cannot turn an admitted unknown result into a definite claim.
@@ -200,19 +269,38 @@ func (server *ReplicatedServer) executeReplicated(
 	switch {
 	case errors.Is(err, raftmodel.ErrNotLeader):
 		return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
-	case errors.Is(err, raftservice.ErrOutcomeUnknown):
+	case errors.Is(err, raftservice.ErrOutcomeUnknown),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		// SubmitOwned was entered with a complete canonical proposal. A local
+		// deadline cannot prove whether admission won the cancellation race.
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrServingFence):
 		return &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
 			HasState: true, State: wireState,
 		}
-	case result.Outcome.Code != raftserve.OutcomePending:
+	case result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
+		errors.Is(err, raftserve.ErrProposalAbandoned):
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+	case result.Outcome.Code == raftserve.OutcomeProposalRefused ||
+		errors.Is(err, raftserve.ErrProposalRefused):
 		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
+			HasState: true, State: wireState,
+		}
+	case result.Outcome.Code > raftserve.OutcomeCompletion &&
+		result.Outcome.Code < raftserve.OutcomeProposalRefused:
+		response := &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: wireState, Outcome: result.Outcome,
 		}
-	case errors.Is(err, raftservice.ErrIngressFull):
+		if validReplicatedResponse(response) {
+			return response
+		}
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+	case errors.Is(err, raftservice.ErrIngressFull),
+		errors.Is(err, raftservice.ErrPendingProposalsFull):
 		return &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,
 			HasState: true, State: wireState,

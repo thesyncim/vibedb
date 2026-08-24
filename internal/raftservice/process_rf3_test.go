@@ -74,11 +74,13 @@ var processPeerIdentityOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1
 
 var errProcessStrictAllocation = errors.New("RF3 process gate requires strict durable allocation")
 
-// TestRF3NativeServingThreeProcessFaultCuts exercises real OS process death
-// around the shipped byte-native gateway boundary. The two fresh RF3 clusters
-// are intentional: each destructive leader cut must retain a quorum and must
-// never rely on an unimplemented member-replacement path.
-func TestRF3NativeServingThreeProcessFaultCuts(t *testing.T) {
+// TestRF3NativeServingThreeProcessRecoveryEvidence exercises real OS process
+// isolation, follower catch-up, client-side response suppression, exact replay,
+// and acknowledged-result survival. It deliberately does not claim a child-side
+// cut between quorum/apply/socket write or natural election; those require the
+// next fault-hook and membership qualification. Two fresh clusters keep every
+// destructive kill within the implemented fixed-membership boundary.
+func TestRF3NativeServingThreeProcessRecoveryEvidence(t *testing.T) {
 	if os.Getenv(processHelperEnvironment) != "" {
 		return
 	}
@@ -125,7 +127,7 @@ func TestRF3NativeServingThreeProcessFaultCuts(t *testing.T) {
 
 		client.resetAttempts()
 		leader = cluster.waitLeader(t, ctx)
-		client.arm(leader, faultAfterApplyBeforeGatewayResponse)
+		client.arm(leader, faultAfterDecodedResponseBeforeClientDelivery)
 		secondKey := processOrderedKey(t, `"retry-exact"`)
 		started := time.Now()
 		second, err := session.Put(ctx, secondKey, []byte(`{"id":"retry-exact","value":2}`))
@@ -151,7 +153,7 @@ func TestRF3NativeServingThreeProcessFaultCuts(t *testing.T) {
 			t.Fatalf("Put result=%+v session=%+v", second, session.Status())
 		}
 
-		// Replaying the captured canonical bytes through the shipped executor is
+		// Replaying the captured canonical bytes through the native executor is
 		// another deterministic lookup, not a second logical application.
 		replayed, err := client.executor.Propose(ctx, cluster.route(), attempts[0])
 		if err != nil {
@@ -193,7 +195,7 @@ func TestRF3NativeServingThreeProcessFaultCuts(t *testing.T) {
 		}
 
 		client.resetAttempts()
-		client.arm(leader, faultBeforeAdmission)
+		client.arm(leader, faultKillBeforeClientProposal)
 		started := time.Now()
 		deleted, err := session.Delete(ctx, key)
 		if err != nil {
@@ -279,7 +281,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		sendStatus("E peer: %v", err)
 		t.Fatal(err)
 	}
-	server, err := shardservice.NewReplicatedServer(peer.Owner())
+	server, err := shardservice.NewReplicatedServer(peer.Owner(), 64<<20, 15*time.Second)
 	if err != nil {
 		_ = runtime.Close()
 		_ = nativeListener.Close()
@@ -951,8 +953,8 @@ type processFaultStage uint8
 
 const (
 	faultNone processFaultStage = iota
-	faultBeforeAdmission
-	faultAfterApplyBeforeGatewayResponse
+	faultKillBeforeClientProposal
+	faultAfterDecodedResponseBeforeClientDelivery
 )
 
 type faultProcessClient struct {
@@ -970,8 +972,15 @@ type faultProcessClient struct {
 
 func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProcessClient {
 	t.Helper()
-	client := &faultProcessClient{cluster: cluster, t: t}
-	executor, err := gateway.NewReplicatedExecutor(client, 8)
+	client := &faultProcessClient{cluster: cluster, t: t,
+		base: gateway.TCPReplicatedClient{Dial: func(
+			ctx context.Context, address string,
+		) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "tcp", address)
+		}},
+	}
+	executor, err := gateway.NewReplicatedExecutor(client, 8, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1002,14 +1011,14 @@ func (client *faultProcessClient) DoReplicated(
 		client.stage = faultNone
 	}
 	client.mu.Unlock()
-	if stage == faultBeforeAdmission {
+	if stage == faultKillBeforeClientProposal {
 		client.cluster.killAndElect(client.t, member)
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: io.ErrUnexpectedEOF,
 		}
 	}
 	response, err := client.base.DoReplicated(ctx, address, request)
-	if stage == faultAfterApplyBeforeGatewayResponse && err == nil && response != nil &&
+	if stage == faultAfterDecodedResponseBeforeClientDelivery && err == nil && response != nil &&
 		response.Kind == shardservice.ReplicatedCompletion {
 		client.mu.Lock()
 		client.hidden = append(client.hidden[:0], response.Completion...)
@@ -1296,6 +1305,7 @@ func buildProcessPeer(
 			Pulse:         pulse,
 			Limits: raftservice.Limits{
 				MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
+				MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
 				MaxPendingOutboundBytes: 64 << 20,
 			},
 		},

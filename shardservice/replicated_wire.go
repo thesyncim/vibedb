@@ -67,6 +67,7 @@ const (
 	ReplicatedRefusalNone ReplicatedRefusalCode = iota
 	ReplicatedRefusalStaleFence
 	ReplicatedRefusalAdmissionBound
+	ReplicatedRefusalProposalRefused
 	ReplicatedRefusalDeterministic
 	ReplicatedRefusalUnavailable
 )
@@ -110,25 +111,42 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 
 // DecodeReplicatedRequest decodes and validates one bounded native request.
 func DecodeReplicatedRequest(r io.Reader) (*ReplicatedRequest, error) {
-	body, err := readFrame(r, tagReplicatedRequest)
+	request, _, err := decodeReplicatedRequest(r, nil)
+	return request, err
+}
+
+func decodeReplicatedRequest(
+	r io.Reader,
+	budget *replicatedFrameByteBudget,
+) (*ReplicatedRequest, int64, error) {
+	body, charged, err := readFrameBudgeted(r, tagReplicatedRequest, budget)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	d := deccur{b: body}
 	if d.u8() != replicatedWireVersion {
-		return nil, errBadVersion
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, errBadVersion
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
 	request.Fence = decodeReplicatedFence(&d)
 	request.Command = d.slice()
 	if err := d.end(); err != nil {
-		return nil, err
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, err
 	}
 	request.Command = request.Command[:len(request.Command):len(request.Command)]
 	if !validReplicatedRequest(request) {
-		return nil, ErrReplicatedWire
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, ErrReplicatedWire
 	}
-	return request, nil
+	return request, charged, nil
 }
 
 // EncodeReplicatedResponse emits one canonical typed native response.
@@ -356,10 +374,15 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		if response.Refusal == ReplicatedRefusalDeterministic {
 			return response.HasState && response.Outcome.Code > raftserve.OutcomeCompletion &&
-				response.Outcome.Code < raftserve.OutcomeProposalRefused
+				response.Outcome.Code < raftserve.OutcomeProposalRefused &&
+				response.Outcome.AppliedIndex != 0 &&
+				response.State.Applied >= response.Outcome.AppliedIndex &&
+				response.Outcome.CompletionAppliedSequence == 0 &&
+				response.Outcome.CompletionBytes == 0
 		}
 		return response.Outcome == (raftserve.Outcome{}) &&
-			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable)
+			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
+			response.Refusal <= ReplicatedRefusalUnavailable
 	default:
 		return false
 	}

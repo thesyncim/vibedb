@@ -8,6 +8,7 @@ import (
 	"errors"
 	"math"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -43,7 +44,7 @@ type BundleResolver interface {
 }
 
 // BaseRelationResolver maps a native mutation to one dense relation. It is the
-// shipped base/local-index path; a global-index resolver can emit additional
+// base/local-index path; a global-index resolver can emit additional
 // authenticated dense relations without changing the session or wire grammar.
 type BaseRelationResolver struct {
 	Relation replication.RelationID
@@ -199,7 +200,7 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.InitialCommandBytes = 4 << 10
 	}
 	if options.Executor == nil || !validReplicatedRoute(options.Route) ||
-		options.Distribution == "" || options.Shard == "" || len(options.Tenant) == 0 ||
+		!validNativeSessionIdentity(options.Distribution, options.Shard, options.Tenant) ||
 		options.ClientID == (replication.ID128{}) || options.Resolver == nil ||
 		options.MaxRelationBatches <= 0 || options.MaxRelationBatches > replication.MaxRelationBatches ||
 		options.MaxMutations <= 0 || options.MaxMutations > replication.MaxMutations ||
@@ -235,14 +236,14 @@ func (session *NativeSession) Status() NativeSessionStatus {
 	}
 }
 
-// PendingCommand returns a read-only, capacity-clamped alias of the exact
-// outcome-unknown command. It remains valid until RetryPending succeeds or a
-// definite refusal is returned.
+// PendingCommand returns a detached copy of the exact outcome-unknown command.
+// Callers may mutate or retain it without changing the session's owned retry
+// bytes. The session keeps its private command until deterministic settlement.
 func (session *NativeSession) PendingCommand() []byte {
 	if session == nil || !session.pending {
 		return nil
 	}
-	return session.command[:len(session.command):len(session.command)]
+	return append([]byte(nil), session.command...)
 }
 
 func (session *NativeSession) Open(
@@ -262,9 +263,6 @@ func (session *NativeSession) Put(
 	ctx context.Context,
 	key, document []byte,
 ) (NativeResult, error) {
-	if !vibejson.Valid(document) {
-		return NativeResult{}, ErrNativeDocument
-	}
 	return session.mutate(ctx, NativeMutation{
 		Kind: replication.MutationPut, Key: key, Value: document,
 	})
@@ -281,9 +279,32 @@ func (session *NativeSession) mutate(
 	ctx context.Context,
 	mutation NativeMutation,
 ) (NativeResult, error) {
-	if session == nil || session.phase != nativeSessionActive || session.pending ||
-		len(mutation.Key) == 0 || session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
+	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
+		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
 		return NativeResult{}, sessionStateError(session)
+	}
+	// Reject byte bounds before vibejson validation, resolver fanout, command
+	// hashing, or buffer growth. An oversized value cannot fit this session's
+	// command even if the global mutation bound is larger.
+	if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes {
+		return NativeResult{}, ErrNativeBundleBound
+	}
+	switch mutation.Kind {
+	case replication.MutationPut:
+		if len(mutation.Value) == 0 ||
+			len(mutation.Value) > replication.MaxMutationValueBytes ||
+			len(mutation.Value) > session.maxCommand {
+			return NativeResult{}, ErrNativeBundleBound
+		}
+		if !vibejson.Valid(mutation.Value) {
+			return NativeResult{}, ErrNativeDocument
+		}
+	case replication.MutationDelete:
+		if len(mutation.Value) != 0 {
+			return NativeResult{}, ErrNativeBundleBound
+		}
+	default:
+		return NativeResult{}, ErrNativeBundleBound
 	}
 	session.bundle.reset()
 	if err := session.resolver.ResolveNative(&session.bundle, mutation); err != nil {
@@ -366,7 +387,7 @@ func (session *NativeSession) RetryPending(ctx context.Context) (NativeResult, e
 	if session == nil || !session.pending {
 		return NativeResult{}, ErrNativeSessionState
 	}
-	return session.executePending(ctx)
+	return session.executePending(ctx, true)
 }
 
 func (session *NativeSession) commandHeader(
@@ -422,15 +443,20 @@ func (session *NativeSession) prepareAndExecute(
 		return NativeResult{}, err
 	}
 	session.pending = true
-	return session.executePending(ctx)
+	return session.executePending(ctx, false)
 }
 
-func (session *NativeSession) executePending(ctx context.Context) (NativeResult, error) {
+func (session *NativeSession) executePending(
+	ctx context.Context,
+	priorUnknown bool,
+) (NativeResult, error) {
 	var hint *shardservice.ReplicatedMemberState
 	if session.leader != (shardservice.ReplicatedMemberState{}) {
 		hint = &session.leader
 	}
-	result, err := session.executor.propose(ctx, session.route, session.command, hint)
+	result, err := session.executor.propose(
+		ctx, session.route, session.command, hint, priorUnknown,
+	)
 	if err != nil {
 		if errors.Is(err, raftservice.ErrOutcomeUnknown) {
 			return NativeResult{}, err
@@ -508,9 +534,20 @@ func nativeCompletionMatches(
 	command replication.CommandView,
 	completion replication.CompletionView,
 ) bool {
+	if completion.ResultFormat != replicatedstate.ResultFormatMutation ||
+		completion.Storage != replication.CompletionInline ||
+		completion.ResultLength != 0 || len(completion.InlineResult) != 0 ||
+		!nativeCompletionResultMatches(command.Kind(), completion.ResultCode) {
+		return false
+	}
 	clientEpoch := command.ClientEpoch
 	if command.Kind() == replication.CommandSessionOpen {
 		clientEpoch = completion.ClientEpoch
+		if completion.AppliedSequence != completion.ClientEpoch {
+			return false
+		}
+	} else if completion.AppliedSequence <= completion.ClientEpoch {
+		return false
 	}
 	return completion.ClusterID == command.ClusterID &&
 		completion.ClusterIncarnation == command.ClusterIncarnation &&
@@ -529,6 +566,45 @@ func nativeCompletionMatches(
 		completion.ClientID == command.ClientID && completion.ClientEpoch == clientEpoch &&
 		completion.ClientSequence == command.ClientSequence &&
 		completion.Fingerprint == command.Fingerprint && completion.RetryHome == command.RetryHome
+}
+
+func nativeCompletionResultMatches(kind replication.CommandKind, result uint32) bool {
+	switch kind {
+	case replication.CommandMutationBatch:
+		switch result {
+		case replicatedstate.ResultApplied,
+			replicatedstate.ResultStaleFence,
+			replicatedstate.ResultUnknownCollection,
+			replicatedstate.ResultInvalidDocument,
+			replicatedstate.ResultTargetBound,
+			replicatedstate.ResultWrongShard:
+			return true
+		}
+	case replication.CommandSessionRetire:
+		return result == replicatedstate.ResultSessionRetired ||
+			result == replicatedstate.ResultStaleFence
+	case replication.CommandSessionOpen:
+		return result == replicatedstate.ResultSessionOpened
+	case replication.CommandSessionRenew:
+		return result == replicatedstate.ResultSessionRenewed ||
+			result == replicatedstate.ResultStaleFence
+	case replication.CommandSessionRevoke:
+		return result == replicatedstate.ResultSessionRevoked ||
+			result == replicatedstate.ResultStaleFence
+	case replication.CommandSessionRelease:
+		return false
+	}
+	return false
+}
+
+func validNativeSessionIdentity(distribution, shard string, tenant []byte) bool {
+	return validNativeTextIdentity(distribution) && validNativeTextIdentity(shard) &&
+		len(tenant) > 0 && len(tenant) <= replication.MaxIdentityBytes
+}
+
+func validNativeTextIdentity(value string) bool {
+	return len(value) > 0 && len(value) <= replication.MaxIdentityBytes &&
+		utf8.ValidString(value) && strings.IndexByte(value, 0) < 0
 }
 
 var nativeFingerprintDomain = []byte("vibedb/gateway/native-command\x00")

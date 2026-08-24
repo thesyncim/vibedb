@@ -12,7 +12,7 @@ import (
 )
 
 // ServingReplicaCount is the only replicated topology served by this first
-// shipped vertical. Learners and joint membership need their own completed
+// current native vertical. Learners and joint membership need their own completed
 // lifecycle before this catalog accepts any transitional shape.
 const ServingReplicaCount = 3
 

@@ -50,8 +50,11 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 				CompletionBytes: len(completion)}, Completion: completion},
 		{Kind: ReplicatedNotLeader, HasState: true, State: state},
 		{Kind: ReplicatedOutcomeUnknown, HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
+			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-			HasState: true, State: state, Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionEpoch}},
+			HasState: true, State: state, Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},
 	}
 	for _, response := range responses {
 		var encoded bytes.Buffer
@@ -67,6 +70,46 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			decoded.State != response.State || decoded.Outcome != response.Outcome ||
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
+		}
+	}
+}
+
+func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
+	state := ReplicatedMemberState{
+		Fence: testReplicatedFence(), LeaderID: testReplicatedFence().MemberID,
+		Commit: 8, Applied: 8, CheckpointApplied: 7,
+	}
+	for code := raftserve.OutcomePending; code <= raftserve.OutcomeProposalAbandoned; code++ {
+		response := &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
+			HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: code, AppliedIndex: 8},
+		}
+		valid := validReplicatedResponse(response)
+		want := code > raftserve.OutcomeCompletion && code < raftserve.OutcomeProposalRefused
+		if valid != want {
+			t.Fatalf("outcome %d valid=%t want=%t", code, valid, want)
+		}
+	}
+	valid := &ReplicatedResponse{
+		Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
+		HasState: true, State: state,
+		Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8},
+	}
+	invalid := []raftserve.Outcome{
+		{Code: raftserve.OutcomeSessionEpoch},
+		{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 9},
+		{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8, CompletionAppliedSequence: 1},
+		{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8, CompletionBytes: 1},
+	}
+	if !validReplicatedResponse(valid) {
+		t.Fatal("valid applied refusal was rejected")
+	}
+	for _, outcome := range invalid {
+		candidate := *valid
+		candidate.Outcome = outcome
+		if validReplicatedResponse(&candidate) {
+			t.Fatalf("invalid applied witness accepted: %+v", outcome)
 		}
 	}
 }
@@ -90,6 +133,70 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 			t.Fatalf("invalid request encoded: %+v", request)
 		}
 	}
+}
+
+func FuzzReplicatedNativeRequestCanonical(f *testing.F) {
+	fence := testReplicatedFence()
+	command := testReplicatedCommand(f, fence)
+	var seed bytes.Buffer
+	if err := EncodeReplicatedRequest(&seed, &ReplicatedRequest{
+		Operation: ReplicatedPropose, Fence: fence, Command: command,
+	}); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed.Bytes())
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			return
+		}
+		request, err := DecodeReplicatedRequest(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		var canonical bytes.Buffer
+		if err := EncodeReplicatedRequest(&canonical, request); err != nil {
+			t.Fatalf("accepted request did not re-encode: %v", err)
+		}
+		if !bytes.Equal(canonical.Bytes(), data) {
+			t.Fatal("accepted request has more than one wire representation")
+		}
+	})
+}
+
+func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
+	fence := testReplicatedFence()
+	state := ReplicatedMemberState{
+		Fence: fence, LeaderID: fence.MemberID, Commit: 8, Applied: 8,
+		CheckpointApplied: 7,
+	}
+	completion := testReplicatedCompletion(f, fence, 2)
+	var seed bytes.Buffer
+	if err := EncodeReplicatedResponse(&seed, &ReplicatedResponse{
+		Kind: ReplicatedCompletion, HasState: true, State: state,
+		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
+			AppliedIndex: 8, CompletionAppliedSequence: 2,
+			CompletionBytes: len(completion)},
+		Completion: completion,
+	}); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed.Bytes())
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			return
+		}
+		response, err := DecodeReplicatedResponse(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		var canonical bytes.Buffer
+		if err := EncodeReplicatedResponse(&canonical, response); err != nil {
+			t.Fatalf("accepted response did not re-encode: %v", err)
+		}
+		if !bytes.Equal(canonical.Bytes(), data) {
+			t.Fatal("accepted response has more than one wire representation")
+		}
+	})
 }
 
 func testReplicatedFence() ReplicatedFence {

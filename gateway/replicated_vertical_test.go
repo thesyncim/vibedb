@@ -39,7 +39,7 @@ func TestNativeSessionThreeEndpointFailoverRetriesExactBytesWithoutDuplicateAppl
 	route, _, initial := testReplicatedRouteCommand(t)
 	cluster := &logicalRF3Cluster{
 		states: make(map[uint64]shardservice.ReplicatedMemberState, 3),
-		leader: 2, nextIndex: 8, openEpoch: 100, failMutation: true,
+		leader: 2, nextIndex: 99, openEpoch: 100, failMutation: true,
 		results: make(map[replication.Digest]logicalRF3Result),
 	}
 	listeners := make([]net.Listener, 3)
@@ -76,7 +76,13 @@ func TestNativeSessionThreeEndpointFailoverRetriesExactBytesWithoutDuplicateAppl
 		}
 	})
 
-	executor, err := NewReplicatedExecutor(TCPReplicatedClient{}, 4)
+	executor, err := NewReplicatedExecutor(TCPReplicatedClient{Dial: func(
+		ctx context.Context,
+		address string,
+	) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "tcp", address)
+	}}, 4, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +203,7 @@ func (cluster *logicalRF3Cluster) execute(
 
 	cluster.nextIndex++
 	clientEpoch := command.ClientEpoch
-	appliedSequence := command.ClientSequence
+	appliedSequence := cluster.nextIndex
 	resultCode := uint32(replicatedstate.ResultApplied)
 	if command.Kind() == replication.CommandSessionOpen {
 		clientEpoch = cluster.openEpoch

@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"time"
+
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
@@ -12,7 +14,10 @@ type NativeGatewayOptions struct {
 	Catalog     *CatalogHolder
 	Client      ReplicatedRoundTripper
 	MaxAttempts int
-	Resolver    BundleResolver
+	// AttemptTimeout bounds each individual probe or proposal exchange. The
+	// caller context may impose a shorter end-to-end deadline.
+	AttemptTimeout time.Duration
+	Resolver       BundleResolver
 
 	MaxRelationBatches  int
 	MaxMutations        int
@@ -20,7 +25,7 @@ type NativeGatewayOptions struct {
 	MaxCommandBytes     int
 }
 
-// NativeGateway is the shipped in-process construction for byte-native RF3
+// NativeGateway is the in-process construction primitive for byte-native RF3
 // sessions. Each session pins one immutable catalog generation and exact route
 // for its lifecycle; catalog movement cannot silently rewrite an unknown
 // command or session identity.
@@ -50,7 +55,9 @@ func NewNativeGateway(options NativeGatewayOptions) (*NativeGateway, error) {
 	if options.Catalog == nil || options.Catalog.Current() == nil || options.Resolver == nil {
 		return nil, ErrNativeSession
 	}
-	executor, err := NewReplicatedExecutor(options.Client, options.MaxAttempts)
+	executor, err := NewReplicatedExecutor(
+		options.Client, options.MaxAttempts, options.AttemptTimeout,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -65,8 +72,10 @@ func NewNativeGateway(options NativeGatewayOptions) (*NativeGateway, error) {
 // Put/Delete/session command capability. A position without RF3 coordinates is
 // refused; it never falls back to the local SQL write path.
 func (gateway *NativeGateway) NewSession(request NativeSessionRequest) (*NativeSession, error) {
-	if gateway == nil || gateway.catalog == nil || request.Distribution == "" ||
-		request.Shard == "" || len(request.Tenant) == 0 ||
+	distributionName := string(request.Distribution)
+	shardID := string(request.Shard)
+	if gateway == nil || gateway.catalog == nil ||
+		!validNativeSessionIdentity(distributionName, shardID, request.Tenant) ||
 		request.ClientID == (replication.ID128{}) {
 		return nil, ErrNativeSession
 	}
@@ -83,7 +92,7 @@ func (gateway *NativeGateway) NewSession(request NativeSessionRequest) (*NativeS
 	}
 	return NewNativeSession(NativeSessionOptions{
 		Executor: gateway.executor, Route: route,
-		Distribution: string(request.Distribution), Shard: string(request.Shard),
+		Distribution: distributionName, Shard: shardID,
 		Tenant: request.Tenant, ClientID: request.ClientID, RetryHome: request.RetryHome,
 		Resolver:            gateway.resolver,
 		MaxRelationBatches:  gateway.maxRelationBatches,
