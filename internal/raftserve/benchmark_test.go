@@ -111,11 +111,28 @@ func TestRegistryWarmSettlementAllocationsAndFixedStorage(t *testing.T) {
 	if size := unsafe.Sizeof(waiterRecord{}); size > 48 {
 		t.Fatalf("waiter record exceeds fixed geometry: %dB", size)
 	}
+	maxGroupTableSlots := 1
+	for maxGroupTableSlots < 2*multiraft.AbsoluteMaxGroups {
+		maxGroupTableSlots <<= 1
+	}
+	attemptDelta := uintptr(0)
+	if size := unsafe.Sizeof(attemptRecord{}); size > 88 {
+		attemptDelta = size - 88
+	}
+	groupDelta := uintptr(0)
+	if size := unsafe.Sizeof(pendingGroupSlot{}); size > 96 {
+		groupDelta = size - 96
+	}
+	maxGeometryDelta := attemptDelta*AbsoluteMaxOutstandingAttempts +
+		groupDelta*uintptr(maxGroupTableSlots)
+	if maxGeometryDelta >= 1<<20 {
+		t.Fatalf("maximum ownership and pending-list geometry delta = %dB", maxGeometryDelta)
+	}
 	t.Logf(
-		"Registry=%dB entry=%dB attempt=%dB waiter=%dB group-slot=%dB source=%dB tenant-slot=%dB completion-slot=%dB",
+		"Registry=%dB entry=%dB attempt=%dB waiter=%dB group-slot=%dB max-delta=%dB source=%dB tenant-slot=%dB completion-slot=%dB",
 		unsafe.Sizeof(Registry{}), unsafe.Sizeof(entryRecord{}),
 		unsafe.Sizeof(attemptRecord{}), unsafe.Sizeof(waiterRecord{}),
-		unsafe.Sizeof(pendingGroupSlot{}),
+		unsafe.Sizeof(pendingGroupSlot{}), maxGeometryDelta,
 		unsafe.Sizeof(raftmember.AppliedBatchSource{}), tenantSlotBytes, completionSlotBytes,
 	)
 }
@@ -406,18 +423,25 @@ func BenchmarkRegistryRuntimeReplicatedApplySettlement(b *testing.B) {
 	}
 }
 
-func BenchmarkRegistryTerminateGroupWithUnrelatedPopulation(b *testing.B) {
-	for _, unrelated := range [...]int{0, AbsoluteMaxOutstandingIdentities - 1} {
-		b.Run(fmt.Sprintf("unrelated-%d", unrelated), func(b *testing.B) {
-			capacity := unrelated + 1
-			unrelatedGroups := min(unrelated, multiraft.AbsoluteMaxGroups-1)
+func BenchmarkRegistryTerminateGroupWithSameGroupNonpendingPopulation(b *testing.B) {
+	for _, nonpending := range [...]int{0, AbsoluteMaxOutstandingAttempts - 1} {
+		b.Run(fmt.Sprintf("same-group-nonpending-%d", nonpending), func(b *testing.B) {
+			staticNonpending := nonpending
+			if staticNonpending != 0 {
+				// Reserve one nonpending attempt as a newer same-identity
+				// predecessor of the hot waiterless attempt on every iteration.
+				staticNonpending--
+			}
+			identityCount := (staticNonpending+AbsoluteMaxAttemptsPerIdentity-1)/
+				AbsoluteMaxAttemptsPerIdentity + 1
+			attemptCapacity := nonpending + 1
 			registry, err := NewRegistry(Limits{
-				MaxGroups:                  unrelatedGroups + 1,
-				MaxOutstandingIdentities:   capacity,
-				MaxOutstandingAttempts:     capacity,
-				MaxWaiters:                 capacity,
-				MaxAttemptsPerIdentity:     1,
-				MaxRetainedCompletionBytes: int64(capacity * completionSlotBytes),
+				MaxGroups:                  1,
+				MaxOutstandingIdentities:   identityCount,
+				MaxOutstandingAttempts:     attemptCapacity,
+				MaxWaiters:                 identityCount,
+				MaxAttemptsPerIdentity:     min(AbsoluteMaxAttemptsPerIdentity, attemptCapacity),
+				MaxRetainedCompletionBytes: int64(identityCount * completionSlotBytes),
 			})
 			if err != nil {
 				b.Fatal(err)
@@ -431,67 +455,74 @@ func BenchmarkRegistryTerminateGroupWithUnrelatedPopulation(b *testing.B) {
 				}
 				return waiter, token
 			}
-			for index := 0; index < unrelated; index++ {
-				group := benchmarkGroup(uint64(index%unrelatedGroups + 1))
-				register(benchmarkIdentity(group, uint64(index+1)))
+			hotGroup := benchmarkGroup(1)
+			remaining := staticNonpending
+			attemptIdentity := uint64(1)
+			for identityIndex := 0; remaining != 0; identityIndex++ {
+				identity := benchmarkIdentity(hotGroup, uint64(identityIndex+1))
+				count := min(remaining, AbsoluteMaxAttemptsPerIdentity)
+				for range count {
+					candidate := identity
+					binary.LittleEndian.PutUint64(candidate.attempt[:8], attemptIdentity)
+					attemptIdentity++
+					waiter, _ := register(candidate)
+					if !waiter.Cancel() {
+						b.Fatal("cancel nonpending setup waiter")
+					}
+				}
+				remaining -= count
 			}
-			hotGroup := benchmarkGroup(uint64(unrelatedGroups + 1))
-			hotIdentity := benchmarkIdentity(hotGroup, uint64(capacity))
-			_, token := register(hotIdentity)
+			hotIdentity := benchmarkIdentity(hotGroup, uint64(identityCount))
+			binary.LittleEndian.PutUint64(hotIdentity.attempt[:8], attemptIdentity)
 			admit := func(token registrationToken) {
 				registry.settleProposalAdmission(multiraft.ProposalAdmission{
 					Group: hotGroup, Token: token.proposalToken(), Admitted: true,
 				})
 			}
-			admit(token)
+			prepareWaiterlessPending := func() registrationToken {
+				waiter, token := register(hotIdentity)
+				if !waiter.Cancel() {
+					b.Fatal("cancel hot setup waiter")
+				}
+				admit(token)
+				if nonpending == 0 {
+					return registrationToken{}
+				}
+				newer := hotIdentity
+				newer.attempt[8] ^= 0xff
+				newerWaiter, newerToken := register(newer)
+				if !newerWaiter.Cancel() {
+					b.Fatal("cancel newer same-identity setup waiter")
+				}
+				return newerToken
+			}
+			cleanupNewer := func(token registrationToken) {
+				if token == (registrationToken{}) {
+					return
+				}
+				registry.mu.Lock()
+				registry.rollbackRegistrationLocked(token)
+				registry.mu.Unlock()
+			}
+			newerToken := prepareWaiterlessPending()
 			b.ReportAllocs()
 			b.ResetTimer()
-			b.ReportMetric(float64(unrelated), "unrelated-identities")
-			b.ReportMetric(float64(unrelatedGroups), "unrelated-groups")
-			for range b.N {
+			b.ReportMetric(float64(nonpending), "same-group-nonpending-attempts")
+			for iteration := 0; iteration < b.N; iteration++ {
 				if err := registry.TerminateGroup(
 					hotGroup, multiraft.ProposalGroupLeadershipLost,
 				); err != nil {
 					b.Fatal(err)
 				}
-				// Restore the one hot attempt in place. This fixed work does not
-				// traverse either the identity table or an unrelated group list.
-				if !rearmTerminatedBenchmarkAttempt(registry, token, hotGroup) {
-					b.Fatal("rearm terminated benchmark attempt")
+				b.StopTimer()
+				cleanupNewer(newerToken)
+				if iteration+1 < b.N {
+					newerToken = prepareWaiterlessPending()
+					b.StartTimer()
 				}
 			}
 		})
 	}
-}
-
-func rearmTerminatedBenchmarkAttempt(
-	registry *Registry,
-	token registrationToken,
-	group raftmember.GroupKey,
-) bool {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	attempt, entry, ok := registry.validAttemptLocked(
-		token.attempt, token.attemptGeneration, attemptComplete,
-	)
-	if !ok || entry.position.group != group ||
-		attempt.outcome != OutcomeNotLeader || attempt.admitted ||
-		attempt.lifecyclePending || attempt.waiterCount != 1 ||
-		int(token.waiter) >= len(registry.waiters) {
-		return false
-	}
-	waiter := &registry.waiters[token.waiter]
-	if !waiter.active || waiter.generation != token.waiterGeneration {
-		return false
-	}
-	if !registry.addGroupPendingLocked(group) {
-		return false
-	}
-	drainSignal(waiter.wake)
-	attempt.outcome = 0
-	attempt.state = attemptPending
-	attempt.admitted = true
-	return true
 }
 
 func benchmarkGroup(identity uint64) raftmember.GroupKey {

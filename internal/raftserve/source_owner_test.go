@@ -71,6 +71,37 @@ func TestRegistryAttemptIdentityIncludesAppliedSourceEpoch(t *testing.T) {
 	}
 }
 
+func TestRegistryAppliedSourceClaimRejectsUnresolvedProposalLifecycle(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	group := testGroup(212)
+	identity, err := openCommandIdentity(
+		group, encodeTestCommand(t, testCommand(group, 18, 2)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.Lock()
+	_, registration, enqueue, registerErr := registry.registerLocked(identity)
+	registry.mu.Unlock()
+	if registerErr != nil || !enqueue {
+		t.Fatalf("register unresolved lifecycle = %v, %v", registerErr, enqueue)
+	}
+	owner := testAppliedSourceOwner(group)
+	if _, err := registry.claimAppliedSource(owner); !errors.Is(err, ErrSourceOwnersLive) {
+		t.Fatalf("claim with unresolved lifecycle = %v", err)
+	}
+	registry.mu.Lock()
+	registry.rollbackRegistrationLocked(registration)
+	registry.mu.Unlock()
+	token, err := registry.claimAppliedSource(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.releaseAppliedSource(owner, token); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRegistryAppliedSourceClaimFencesIdentityRegistryAndABA(t *testing.T) {
 	registry := testRegistry(t, 4, 8, 8)
 	group := testGroup(210)

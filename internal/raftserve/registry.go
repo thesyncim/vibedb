@@ -133,6 +133,8 @@ type pendingGroupSlot struct {
 	identityCount        uint32
 	pendingAttempts      uint32
 	entryHead            uint32
+	pendingHead          uint32
+	lifecycleAttempts    uint32
 	state                tableState
 }
 
@@ -160,24 +162,44 @@ const (
 	attemptComplete
 )
 
+type attemptFlags uint8
+
+const (
+	attemptHasCompletion attemptFlags = 1 << iota
+	attemptLifecyclePending
+	attemptAdmitted
+	attemptSettlementPinned
+	attemptActive
+)
+
 type attemptRecord struct {
-	digest           [32]byte
-	generation       uint64
-	ownerEpoch       uint64
-	appliedIndex     uint64
-	freeNext         uint32
-	next             uint32
-	waiterHead       uint32
-	entry            uint32
-	entryGeneration  uint64
-	waiterCount      uint32
-	outcome          OutcomeCode
-	state            attemptState
-	hasCompletion    bool
-	lifecyclePending bool
-	admitted         bool
-	settlementPinned bool
-	active           bool
+	digest            [32]byte
+	generation        uint64
+	ownerEpoch        uint64
+	appliedIndex      uint64
+	freeOrPendingNext uint32
+	next              uint32
+	waiterHead        uint32
+	entry             uint32
+	entryGeneration   uint64
+	waiterCount       uint32
+	outcome           OutcomeCode
+	state             attemptState
+	flags             attemptFlags
+	pendingPrevious   uint32
+	entryPrevious     uint32
+}
+
+func (attempt *attemptRecord) hasFlag(flag attemptFlags) bool {
+	return attempt.flags&flag != 0
+}
+
+func (attempt *attemptRecord) setFlag(flag attemptFlags) {
+	attempt.flags |= flag
+}
+
+func (attempt *attemptRecord) clearFlag(flag attemptFlags) {
+	attempt.flags &^= flag
 }
 
 type waiterRecord struct {
@@ -269,9 +291,12 @@ func NewRegistry(limits Limits) (*Registry, error) {
 		registry.entries[index].tableSlot = noIndex
 	}
 	for index := range registry.attempts {
-		registry.attempts[index].freeNext = nextFree(index, len(registry.attempts))
+		registry.attempts[index].freeOrPendingNext = nextFree(index, len(registry.attempts))
 		registry.attempts[index].next = noIndex
 		registry.attempts[index].waiterHead = noIndex
+		registry.attempts[index].entry = noIndex
+		registry.attempts[index].pendingPrevious = noIndex
+		registry.attempts[index].entryPrevious = noIndex
 	}
 	for index := range registry.waiters {
 		registry.waiters[index].freeNext = nextFree(index, len(registry.waiters))
@@ -446,6 +471,11 @@ func (registry *Registry) registerLocked(
 		attempt.digest = identity.attempt
 		waiterIndex, waiterGeneration, allocErr := registry.allocateWaiterLocked(attemptIndex)
 		if allocErr != nil {
+			if !registry.finishAttemptLifecycleLocked(attempt) {
+				return Waiter{}, registrationToken{}, false, registry.corruptLocked(
+					errors.New("failed waiter allocation lost attempt lifecycle"),
+				)
+			}
 			if !registry.removeAttemptLocked(attemptIndex) {
 				return Waiter{}, registrationToken{}, false, registry.failure
 			}
@@ -513,6 +543,11 @@ func (registry *Registry) registerLocked(
 	registry.attempts[attemptIndex].digest = identity.attempt
 	waiterIndex, waiterGeneration, allocErr := registry.allocateWaiterLocked(attemptIndex)
 	if allocErr != nil {
+		if !registry.finishAttemptLifecycleLocked(&registry.attempts[attemptIndex]) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(
+				errors.New("failed waiter allocation lost new attempt lifecycle"),
+			)
+		}
 		if !registry.removeAttemptLocked(attemptIndex) {
 			return Waiter{}, registrationToken{}, false, registry.failure
 		}
@@ -535,10 +570,10 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 	}
 	attempt := &registry.attempts[token.attempt]
 	entry := &registry.entries[token.entry]
-	if !attempt.active || attempt.generation != token.attemptGeneration ||
+	if !attempt.hasFlag(attemptActive) || attempt.generation != token.attemptGeneration ||
 		attempt.entry != token.entry || !entry.active ||
 		entry.generation != token.entryGeneration ||
-		!attempt.lifecyclePending || attempt.admitted {
+		!attempt.hasFlag(attemptLifecyclePending) || attempt.hasFlag(attemptAdmitted) {
 		return
 	}
 	if attempt.state != attemptPending && attempt.state != attemptSettling &&
@@ -546,7 +581,10 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 		registry.poisonLocked(errors.New("rollback found invalid proposal lifecycle state"))
 		return
 	}
-	attempt.lifecyclePending = false
+	if !registry.finishAttemptLifecycleLocked(attempt) {
+		registry.poisonLocked(errors.New("rollback lost proposal lifecycle count"))
+		return
+	}
 	if int(token.waiter) < len(registry.waiters) {
 		waiter := &registry.waiters[token.waiter]
 		if waiter.active && waiter.generation == token.waiterGeneration {
@@ -555,7 +593,7 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 			}
 		}
 	}
-	if attempt.active && attempt.generation == token.attemptGeneration {
+	if attempt.hasFlag(attemptActive) && attempt.generation == token.attemptGeneration {
 		switch attempt.state {
 		case attemptPending:
 			if attempt.waiterCount == 0 {
@@ -613,13 +651,17 @@ func (registry *Registry) settleProposalAdmission(
 	}
 	attempt := &registry.attempts[attemptIndex]
 	entry := &registry.entries[entryIndex]
-	if !attempt.active || attempt.generation != attemptGeneration ||
+	if !attempt.hasFlag(attemptActive) || attempt.generation != attemptGeneration ||
 		attempt.entry != entryIndex || !entry.active || entry.generation != entryGeneration ||
-		entry.position.group != admission.Group || !attempt.lifecyclePending {
+		entry.position.group != admission.Group ||
+		!attempt.hasFlag(attemptLifecyclePending) {
 		registry.poisonLocked(errors.New("stale or duplicate proposal lifecycle token"))
 		return
 	}
-	attempt.lifecyclePending = false
+	if !registry.finishAttemptLifecycleLocked(attempt) {
+		registry.poisonLocked(errors.New("proposal admission lost lifecycle count"))
+		return
+	}
 	if admission.Admitted {
 		switch attempt.state {
 		case attemptPending, attemptSettling:
@@ -627,11 +669,10 @@ func (registry *Registry) settleProposalAdmission(
 				registry.poisonLocked(errors.New("admitted proposal changed source epoch"))
 				return
 			}
-			if !registry.addGroupPendingLocked(entry.position.group) {
+			if !registry.linkGroupPendingAttemptLocked(attemptIndex) {
 				registry.poisonLocked(errors.New("admitted proposal has no group capacity record"))
 				return
 			}
-			attempt.admitted = true
 		case attemptComplete:
 		default:
 			registry.poisonLocked(errors.New("proposal admission found an invalid attempt state"))
@@ -652,7 +693,8 @@ func (registry *Registry) settleProposalAdmission(
 		}
 		return
 	}
-	if attempt.admitted || (attempt.state != attemptPending && attempt.state != attemptSettling) {
+	if attempt.hasFlag(attemptAdmitted) ||
+		(attempt.state != attemptPending && attempt.state != attemptSettling) {
 		registry.poisonLocked(errors.New("proposal refusal after local admission"))
 		return
 	}
@@ -762,95 +804,84 @@ func (registry *Registry) terminateGroupLocked(
 	groupRecord := &registry.groupTable[groupIndex]
 	if groupRecord.identityCount == 0 ||
 		int(groupRecord.identityCount) > registry.stats.OutstandingIdentities ||
-		int(groupRecord.identityCount) > registry.limits.MaxOutstandingIdentities {
+		int(groupRecord.identityCount) > registry.limits.MaxOutstandingIdentities ||
+		(groupRecord.pendingAttempts == 0) != (groupRecord.pendingHead == noIndex) {
 		return ErrRegistryCorrupt
 	}
 	if groupRecord.pendingAttempts == 0 {
 		return nil
 	}
-	if groupRecord.entryHead == noIndex || registry.stats.PendingGroups <= 0 ||
-		registry.stats.PendingGroups > registry.limits.MaxGroups {
+	if groupRecord.entryHead == noIndex || groupRecord.pendingHead == noIndex ||
+		registry.stats.PendingGroups <= 0 || registry.stats.PendingGroups > registry.limits.MaxGroups ||
+		registry.stats.PendingAdmittedAttempts < int(groupRecord.pendingAttempts) {
 		return ErrRegistryCorrupt
 	}
-	pendingToRelease := 0
-	visitedEntries := uint32(0)
-	previousEntry := noIndex
-	for entryIndex := groupRecord.entryHead; entryIndex != noIndex; {
-		if visitedEntries >= groupRecord.identityCount ||
-			visitedEntries >= uint32(len(registry.entries)) ||
-			int(entryIndex) >= len(registry.entries) {
+	visited := uint32(0)
+	previous := noIndex
+	for attemptIndex := groupRecord.pendingHead; attemptIndex != noIndex; {
+		if visited >= groupRecord.pendingAttempts || int(attemptIndex) >= len(registry.attempts) {
 			return ErrRegistryCorrupt
 		}
-		entry := &registry.entries[entryIndex]
-		if !entry.active || entry.position.group != group ||
-			entry.groupPrevious != previousEntry || entry.attemptCount == 0 ||
-			entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) {
+		attempt := &registry.attempts[attemptIndex]
+		if !attempt.hasFlag(attemptActive) || !attempt.hasFlag(attemptAdmitted) ||
+			attempt.hasFlag(attemptLifecyclePending) ||
+			attempt.hasFlag(attemptSettlementPinned) ||
+			attempt.state != attemptPending || attempt.ownerEpoch != groupRecord.ownerEpoch ||
+			attempt.pendingPrevious != previous || int(attempt.entry) >= len(registry.entries) ||
+			!registry.validateAttemptWaitersLocked(attemptIndex, attempt) {
 			return ErrRegistryCorrupt
 		}
-		visitedAttempts := uint16(0)
-		for attemptIndex := entry.attemptHead; attemptIndex != noIndex; {
-			if visitedAttempts >= entry.attemptCount ||
-				int(attemptIndex) >= len(registry.attempts) {
-				return ErrRegistryCorrupt
-			}
-			attempt := &registry.attempts[attemptIndex]
-			if !attempt.active || attempt.entry != entryIndex ||
-				attempt.entryGeneration != entry.generation {
-				return ErrRegistryCorrupt
-			}
-			visitedAttempts++
-			if attempt.state == attemptPending && attempt.admitted &&
-				!attempt.lifecyclePending {
-				if attempt.ownerEpoch != groupRecord.ownerEpoch {
-					return ErrRegistryCorrupt
-				}
-				pendingToRelease++
-			}
-			attemptIndex = attempt.next
-		}
-		if visitedAttempts != entry.attemptCount {
+		entry := &registry.entries[attempt.entry]
+		if !entry.active || entry.generation != attempt.entryGeneration ||
+			entry.position.group != group {
 			return ErrRegistryCorrupt
 		}
-		visitedEntries++
-		previousEntry = entryIndex
-		entryIndex = entry.freeOrGroupNext
+		if attempt.waiterCount == 0 &&
+			(!registry.validateAttemptEntryLinksLocked(attemptIndex, attempt) ||
+				registry.stats.OutstandingAttempts <= 0 ||
+				registry.stats.OutstandingAttempts > len(registry.attempts) ||
+				(registry.freeAttempt != noIndex &&
+					(int(registry.freeAttempt) >= len(registry.attempts) ||
+						registry.attempts[registry.freeAttempt].hasFlag(attemptActive)))) {
+			return ErrRegistryCorrupt
+		}
+		visited++
+		previous = attemptIndex
+		attemptIndex = attempt.freeOrPendingNext
 	}
-	if visitedEntries != groupRecord.identityCount ||
-		groupRecord.pendingAttempts != uint32(pendingToRelease) ||
-		registry.stats.PendingGroups == 0 ||
-		registry.stats.PendingAdmittedAttempts < pendingToRelease {
+	if visited != groupRecord.pendingAttempts {
 		return ErrRegistryCorrupt
 	}
-	for entryIndex := groupRecord.entryHead; entryIndex != noIndex; {
-		entry := &registry.entries[entryIndex]
-		nextEntry := entry.freeOrGroupNext
-		for attemptIndex := entry.attemptHead; attemptIndex != noIndex; {
-			attempt := &registry.attempts[attemptIndex]
-			next := attempt.next
-			if attempt.active && attempt.entryGeneration == entry.generation &&
-				attempt.state == attemptPending && attempt.admitted &&
-				!attempt.lifecyclePending {
-				if attempt.ownerEpoch != groupRecord.ownerEpoch {
-					return ErrRegistryCorrupt
-				}
-				if !registry.removeGroupPendingLocked(group) {
-					return ErrRegistryCorrupt
-				}
-				attempt.admitted = false
-				attempt.outcome = outcome
-				attempt.state = attemptComplete
-				if !registry.signalAttemptLocked(attemptIndex, attempt) {
-					return registry.failure
-				}
-				if attempt.waiterCount == 0 {
-					if !registry.removeAttemptLocked(attemptIndex) {
-						return registry.failure
-					}
-				}
-			}
-			attemptIndex = next
+	reapHead := noIndex
+	attemptIndex := groupRecord.pendingHead
+	for remaining := visited; remaining != 0; remaining-- {
+		attempt := &registry.attempts[attemptIndex]
+		next := attempt.freeOrPendingNext
+		if !registry.unlinkGroupPendingAttemptAtLocked(groupIndex, attemptIndex) {
+			return ErrRegistryCorrupt
 		}
-		entryIndex = nextEntry
+		attempt.outcome = outcome
+		attempt.state = attemptComplete
+		if !registry.signalAttemptLocked(attemptIndex, attempt) {
+			return registry.failure
+		}
+		if attempt.waiterCount == 0 {
+			attempt.freeOrPendingNext = reapHead
+			reapHead = attemptIndex
+		}
+		attemptIndex = next
+	}
+	if attemptIndex != noIndex {
+		return ErrRegistryCorrupt
+	}
+	for reapHead != noIndex {
+		attempt := &registry.attempts[reapHead]
+		next := attempt.freeOrPendingNext
+		attempt.freeOrPendingNext = noIndex
+		if !registry.removeAttemptLocked(reapHead) {
+			return registry.failure
+		}
+		reapHead = next
 	}
 	return nil
 }
@@ -952,6 +983,30 @@ func (registry *Registry) groupOwnerEpochLocked(group raftmember.GroupKey) (uint
 	return slot.ownerEpoch, nil
 }
 
+func (registry *Registry) finishAttemptLifecycleLocked(attempt *attemptRecord) bool {
+	if attempt == nil || !attempt.hasFlag(attemptActive) ||
+		!attempt.hasFlag(attemptLifecyclePending) ||
+		int(attempt.entry) >= len(registry.entries) {
+		return false
+	}
+	entry := &registry.entries[attempt.entry]
+	if !entry.active || entry.generation != attempt.entryGeneration {
+		return false
+	}
+	groupIndex, found, err := registry.findGroupLocked(entry.position.group)
+	if err != nil || !found {
+		return false
+	}
+	slot := &registry.groupTable[groupIndex]
+	if slot.lifecycleAttempts == 0 || slot.identityCount == 0 ||
+		slot.ownerEpoch != attempt.ownerEpoch {
+		return false
+	}
+	slot.lifecycleAttempts--
+	attempt.clearFlag(attemptLifecyclePending)
+	return true
+}
+
 func (registry *Registry) retainGroupIdentityLocked(
 	group raftmember.GroupKey,
 ) (uint32, error) {
@@ -974,7 +1029,10 @@ func (registry *Registry) retainGroupIdentityLocked(
 			int(slot.identityCount) > registry.stats.OutstandingIdentities ||
 			slot.identityCount >= uint32(registry.limits.MaxOutstandingIdentities) ||
 			(slot.identityCount == 0 && slot.ownerEpoch == 0) ||
-			(slot.identityCount == 0) != (slot.entryHead == noIndex) {
+			(slot.identityCount == 0) != (slot.entryHead == noIndex) ||
+			(slot.pendingAttempts == 0) != (slot.pendingHead == noIndex) ||
+			(slot.identityCount == 0 && slot.lifecycleAttempts != 0) ||
+			int(slot.lifecycleAttempts) > registry.stats.OutstandingAttempts {
 			return noIndex, ErrRegistryCorrupt
 		}
 		slot.identityCount++
@@ -986,7 +1044,7 @@ func (registry *Registry) retainGroupIdentityLocked(
 	hash := hashGroup(registry.seed, group) & registry.hashMask
 	registry.groupTable[index] = pendingGroupSlot{
 		group: group, hash: hash, identityCount: 1,
-		entryHead: noIndex, state: tableOccupied,
+		entryHead: noIndex, pendingHead: noIndex, state: tableOccupied,
 	}
 	registry.stats.OutstandingGroups++
 	registry.stats.PeakGroups = max(
@@ -1013,7 +1071,8 @@ func (registry *Registry) releaseGroupIdentityLocked(
 		return false
 	}
 	if slot.identityCount == 1 &&
-		(slot.pendingAttempts != 0 || slot.entryHead != noIndex) {
+		(slot.pendingAttempts != 0 || slot.pendingHead != noIndex ||
+			slot.lifecycleAttempts != 0 || slot.entryHead != noIndex) {
 		return false
 	}
 	if slot.identityCount > 1 && slot.entryHead == noIndex {
@@ -1127,6 +1186,10 @@ func (registry *Registry) claimAppliedSource(
 		if slot.ownerEpoch != 0 {
 			return raftmember.AppliedSourceToken{}, ErrSourceOwnerClaimed
 		}
+		if slot.pendingAttempts != 0 || slot.pendingHead != noIndex ||
+			slot.lifecycleAttempts != 0 {
+			return raftmember.AppliedSourceToken{}, ErrSourceOwnersLive
+		}
 		if slot.identityCount == 0 || slot.entryHead == noIndex ||
 			registry.stats.OutstandingGroups <= 0 {
 			return raftmember.AppliedSourceToken{}, registry.corruptLocked(
@@ -1139,7 +1202,7 @@ func (registry *Registry) claimAppliedSource(
 		}
 		registry.groupTable[index] = pendingGroupSlot{
 			group: owner.Group, hash: hashGroup(registry.seed, owner.Group) & registry.hashMask,
-			entryHead: noIndex, state: tableOccupied,
+			entryHead: noIndex, pendingHead: noIndex, state: tableOccupied,
 		}
 		registry.stats.OutstandingGroups++
 		registry.stats.PeakGroups = max(registry.stats.PeakGroups, registry.stats.OutstandingGroups)
@@ -1188,7 +1251,8 @@ func (registry *Registry) releaseAppliedSource(
 		return err
 	}
 	slot := &registry.groupTable[index]
-	if slot.pendingAttempts != 0 || registry.stats.LiveSourceOwners <= 0 {
+	if slot.pendingAttempts != 0 || slot.pendingHead != noIndex || slot.lifecycleAttempts != 0 ||
+		registry.stats.LiveSourceOwners <= 0 {
 		return ErrSourceOwnersLive
 	}
 	slot.allocationGeneration = 0
@@ -1207,42 +1271,118 @@ func (registry *Registry) releaseAppliedSource(
 	return nil
 }
 
-func (registry *Registry) addGroupPendingLocked(
-	group raftmember.GroupKey,
-) bool {
-	index, found, err := registry.findGroupLocked(group)
+func (registry *Registry) linkGroupPendingAttemptLocked(attemptIndex uint32) bool {
+	if int(attemptIndex) >= len(registry.attempts) {
+		return false
+	}
+	attempt := &registry.attempts[attemptIndex]
+	if !attempt.hasFlag(attemptActive) || attempt.hasFlag(attemptAdmitted) ||
+		attempt.hasFlag(attemptLifecyclePending) ||
+		(attempt.state != attemptPending && attempt.state != attemptSettling) ||
+		attempt.freeOrPendingNext != noIndex || attempt.pendingPrevious != noIndex ||
+		int(attempt.entry) >= len(registry.entries) {
+		return false
+	}
+	entry := &registry.entries[attempt.entry]
+	if !entry.active || entry.generation != attempt.entryGeneration {
+		return false
+	}
+	groupIndex, found, err := registry.findGroupLocked(entry.position.group)
 	if err != nil || !found {
 		return false
 	}
-	slot := &registry.groupTable[index]
-	if slot.identityCount == 0 || slot.group != group ||
+	slot := &registry.groupTable[groupIndex]
+	if slot.identityCount == 0 || slot.entryHead == noIndex ||
+		slot.ownerEpoch != attempt.ownerEpoch ||
 		slot.pendingAttempts >= uint32(registry.limits.MaxOutstandingAttempts) ||
-		uint(registry.stats.PendingAdmittedAttempts) >=
-			uint(registry.limits.MaxOutstandingAttempts) {
+		registry.stats.PendingAdmittedAttempts < 0 ||
+		registry.stats.PendingAdmittedAttempts >= registry.limits.MaxOutstandingAttempts ||
+		(slot.pendingAttempts == 0) != (slot.pendingHead == noIndex) {
 		return false
 	}
 	if slot.pendingAttempts == 0 {
-		if uint(registry.stats.PendingGroups) >= uint(registry.limits.MaxGroups) {
+		if registry.stats.PendingGroups < 0 ||
+			registry.stats.PendingGroups >= registry.limits.MaxGroups {
 			return false
 		}
 		registry.stats.PendingGroups++
-	} else if registry.stats.PendingGroups <= 0 {
-		return false
+	} else {
+		if registry.stats.PendingGroups <= 0 || int(slot.pendingHead) >= len(registry.attempts) {
+			return false
+		}
+		head := &registry.attempts[slot.pendingHead]
+		if !head.hasFlag(attemptActive) || !head.hasFlag(attemptAdmitted) ||
+			head.hasFlag(attemptLifecyclePending) ||
+			(head.state != attemptPending && head.state != attemptSettling) ||
+			head.pendingPrevious != noIndex || head.ownerEpoch != slot.ownerEpoch ||
+			int(head.entry) >= len(registry.entries) {
+			return false
+		}
+		headEntry := &registry.entries[head.entry]
+		if !headEntry.active || headEntry.generation != head.entryGeneration ||
+			headEntry.position.group != entry.position.group {
+			return false
+		}
 	}
+	attempt.freeOrPendingNext = slot.pendingHead
+	attempt.pendingPrevious = noIndex
+	if slot.pendingHead != noIndex {
+		registry.attempts[slot.pendingHead].pendingPrevious = attemptIndex
+	}
+	slot.pendingHead = attemptIndex
 	slot.pendingAttempts++
 	registry.stats.PendingAdmittedAttempts++
+	attempt.setFlag(attemptAdmitted)
 	return true
 }
 
-func (registry *Registry) removeGroupPendingLocked(
-	group raftmember.GroupKey,
-) bool {
-	index, found, err := registry.findGroupLocked(group)
+func (registry *Registry) unlinkGroupPendingAttemptLocked(attemptIndex uint32) bool {
+	if int(attemptIndex) >= len(registry.attempts) {
+		return false
+	}
+	attempt := &registry.attempts[attemptIndex]
+	if !attempt.hasFlag(attemptActive) || int(attempt.entry) >= len(registry.entries) {
+		return false
+	}
+	entry := &registry.entries[attempt.entry]
+	if !entry.active || entry.generation != attempt.entryGeneration {
+		return false
+	}
+	groupIndex, found, err := registry.findGroupLocked(entry.position.group)
 	if err != nil || !found {
 		return false
 	}
-	slot := &registry.groupTable[index]
-	if slot.identityCount == 0 || slot.pendingAttempts == 0 ||
+	return registry.unlinkGroupPendingAttemptAtLocked(groupIndex, attemptIndex)
+}
+
+func (registry *Registry) unlinkGroupPendingAttemptAtLocked(
+	groupIndex uint32,
+	attemptIndex uint32,
+) bool {
+	if int(attemptIndex) >= len(registry.attempts) {
+		return false
+	}
+	attempt := &registry.attempts[attemptIndex]
+	if !attempt.hasFlag(attemptActive) || !attempt.hasFlag(attemptAdmitted) ||
+		attempt.hasFlag(attemptLifecyclePending) ||
+		(attempt.state != attemptPending && attempt.state != attemptSettling) ||
+		int(attempt.entry) >= len(registry.entries) ||
+		attempt.pendingPrevious == attemptIndex || attempt.freeOrPendingNext == attemptIndex ||
+		(attempt.pendingPrevious != noIndex &&
+			attempt.pendingPrevious == attempt.freeOrPendingNext) {
+		return false
+	}
+	entry := &registry.entries[attempt.entry]
+	if !entry.active || entry.generation != attempt.entryGeneration {
+		return false
+	}
+	if int(groupIndex) >= len(registry.groupTable) {
+		return false
+	}
+	slot := &registry.groupTable[groupIndex]
+	if slot.state != tableOccupied || slot.group != entry.position.group ||
+		slot.identityCount == 0 || slot.pendingAttempts == 0 ||
+		slot.pendingHead == noIndex || slot.ownerEpoch != attempt.ownerEpoch ||
 		registry.stats.PendingAdmittedAttempts <= 0 ||
 		registry.stats.PendingAdmittedAttempts > registry.limits.MaxOutstandingAttempts ||
 		registry.stats.PendingGroups <= 0 ||
@@ -1250,9 +1390,68 @@ func (registry *Registry) removeGroupPendingLocked(
 		int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts {
 		return false
 	}
+	previous := attempt.pendingPrevious
+	next := attempt.freeOrPendingNext
+	if (slot.pendingAttempts == 1 && (previous != noIndex || next != noIndex)) ||
+		(slot.pendingAttempts > 1 && previous == noIndex && next == noIndex) {
+		return false
+	}
+	if previous == noIndex {
+		if slot.pendingHead != attemptIndex {
+			return false
+		}
+	} else {
+		if int(previous) >= len(registry.attempts) {
+			return false
+		}
+		previousAttempt := &registry.attempts[previous]
+		if !previousAttempt.hasFlag(attemptActive) ||
+			!previousAttempt.hasFlag(attemptAdmitted) ||
+			previousAttempt.ownerEpoch != attempt.ownerEpoch ||
+			previousAttempt.freeOrPendingNext != attemptIndex ||
+			int(previousAttempt.entry) >= len(registry.entries) {
+			return false
+		}
+		previousEntry := &registry.entries[previousAttempt.entry]
+		if !previousEntry.active || previousEntry.generation != previousAttempt.entryGeneration ||
+			previousEntry.position.group != entry.position.group {
+			return false
+		}
+	}
+	if next != noIndex {
+		if int(next) >= len(registry.attempts) {
+			return false
+		}
+		nextAttempt := &registry.attempts[next]
+		if !nextAttempt.hasFlag(attemptActive) || !nextAttempt.hasFlag(attemptAdmitted) ||
+			nextAttempt.ownerEpoch != attempt.ownerEpoch ||
+			nextAttempt.pendingPrevious != attemptIndex ||
+			int(nextAttempt.entry) >= len(registry.entries) {
+			return false
+		}
+		nextEntry := &registry.entries[nextAttempt.entry]
+		if !nextEntry.active || nextEntry.generation != nextAttempt.entryGeneration ||
+			nextEntry.position.group != entry.position.group {
+			return false
+		}
+	}
+	if previous == noIndex {
+		slot.pendingHead = next
+	} else {
+		registry.attempts[previous].freeOrPendingNext = next
+	}
+	if next != noIndex {
+		registry.attempts[next].pendingPrevious = previous
+	}
+	attempt.freeOrPendingNext = noIndex
+	attempt.pendingPrevious = noIndex
+	attempt.clearFlag(attemptAdmitted)
 	slot.pendingAttempts--
 	registry.stats.PendingAdmittedAttempts--
 	if slot.pendingAttempts == 0 {
+		if slot.pendingHead != noIndex {
+			return false
+		}
 		registry.stats.PendingGroups--
 	}
 	return true
@@ -1311,7 +1510,9 @@ func (registry *Registry) unlinkGroupEntryLocked(
 	}
 	group := &registry.groupTable[groupIndex]
 	if group.identityCount == 0 ||
-		(group.identityCount == 1 && group.pendingAttempts != 0) {
+		(group.identityCount == 1 &&
+			(group.pendingAttempts != 0 || group.pendingHead != noIndex ||
+				group.lifecycleAttempts != 0)) {
 		return false
 	}
 	previous := entry.groupPrevious
@@ -1386,20 +1587,23 @@ func (registry *Registry) findAttemptLocked(
 		return noIndex, false, ErrRegistryCorrupt
 	}
 	visited := uint16(0)
+	previous := noIndex
 	for index := entry.attemptHead; index != noIndex; {
 		if visited >= entry.attemptCount || int(index) >= len(registry.attempts) {
 			return noIndex, false, ErrRegistryCorrupt
 		}
 		attempt := &registry.attempts[index]
-		if !attempt.active || attempt.entryGeneration != entry.generation ||
+		if !attempt.hasFlag(attemptActive) ||
+			attempt.entryGeneration != entry.generation ||
 			attempt.entry >= uint32(len(registry.entries)) ||
-			&registry.entries[attempt.entry] != entry {
+			&registry.entries[attempt.entry] != entry || attempt.entryPrevious != previous {
 			return noIndex, false, ErrRegistryCorrupt
 		}
 		visited++
 		if attempt.digest == digest && attempt.ownerEpoch == ownerEpoch {
 			return index, true, nil
 		}
+		previous = index
 		index = attempt.next
 	}
 	if visited != entry.attemptCount {
@@ -1509,20 +1713,33 @@ func (registry *Registry) allocateAttemptLocked(
 		registry.stats.OutstandingAttempts >= registry.limits.MaxOutstandingAttempts {
 		return noIndex, 0, registry.corruptLocked(errors.New("invalid attempt allocation owner or count"))
 	}
+	groupIndex, found, groupErr := registry.findGroupLocked(entry.position.group)
+	if groupErr != nil || !found {
+		return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation lost its group"))
+	}
+	group := &registry.groupTable[groupIndex]
+	if group.identityCount == 0 || group.entryHead == noIndex ||
+		group.ownerEpoch != ownerEpoch ||
+		group.lifecycleAttempts >= uint32(registry.limits.MaxOutstandingAttempts) {
+		return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation has invalid lifecycle count"))
+	}
 	if entry.attemptHead != noIndex {
 		if int(entry.attemptHead) >= len(registry.attempts) {
 			return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation head is out of range"))
 		}
 		head := &registry.attempts[entry.attemptHead]
-		if !head.active || head.entry != entryIndex ||
-			head.entryGeneration != entry.generation {
+		if !head.hasFlag(attemptActive) || head.entry != entryIndex ||
+			head.entryGeneration != entry.generation || head.entryPrevious != noIndex {
 			return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation head is corrupt"))
 		}
 	}
 	index := registry.freeAttempt
 	record := &registry.attempts[index]
-	if record.active || record.freeNext == index ||
-		(record.freeNext != noIndex && int(record.freeNext) >= len(registry.attempts)) {
+	if record.flags != 0 || record.state != 0 || record.next != noIndex ||
+		record.waiterHead != noIndex || record.entry != noIndex ||
+		record.pendingPrevious != noIndex || record.entryPrevious != noIndex ||
+		record.freeOrPendingNext == index ||
+		(record.freeOrPendingNext != noIndex && int(record.freeOrPendingNext) >= len(registry.attempts)) {
 		return noIndex, 0, registry.corruptLocked(errors.New("corrupt attempt free-list record"))
 	}
 	generation, err := nextGeneration(record.generation)
@@ -1530,15 +1747,21 @@ func (registry *Registry) allocateAttemptLocked(
 		registry.poisonLocked(err)
 		return noIndex, 0, registry.failure
 	}
-	registry.freeAttempt = record.freeNext
+	registry.freeAttempt = record.freeOrPendingNext
 	*record = attemptRecord{
-		generation: generation, ownerEpoch: ownerEpoch, freeNext: noIndex,
+		generation: generation, ownerEpoch: ownerEpoch, freeOrPendingNext: noIndex,
 		next: entry.attemptHead, waiterHead: noIndex,
 		entry: entryIndex, entryGeneration: entry.generation,
-		state: attemptPending, lifecyclePending: true, active: true,
+		state:           attemptPending,
+		flags:           attemptLifecyclePending | attemptActive,
+		pendingPrevious: noIndex, entryPrevious: noIndex,
+	}
+	if entry.attemptHead != noIndex {
+		registry.attempts[entry.attemptHead].entryPrevious = index
 	}
 	entry.attemptHead = index
 	entry.attemptCount++
+	group.lifecycleAttempts++
 	registry.stats.OutstandingAttempts++
 	registry.stats.PeakAttempts = max(registry.stats.PeakAttempts, registry.stats.OutstandingAttempts)
 	return index, generation, nil
@@ -1560,7 +1783,7 @@ func (registry *Registry) allocateWaiterLocked(
 		return noIndex, 0, registry.corruptLocked(errors.New("invalid waiter free-list head"))
 	}
 	attempt := &registry.attempts[attemptIndex]
-	if !attempt.active || registry.stats.Waiters < 0 ||
+	if !attempt.hasFlag(attemptActive) || registry.stats.Waiters < 0 ||
 		registry.stats.Waiters >= registry.limits.MaxWaiters ||
 		attempt.waiterCount >= uint32(registry.limits.MaxWaiters) ||
 		int(attempt.waiterCount) > registry.stats.Waiters ||
@@ -1641,7 +1864,7 @@ func (registry *Registry) releaseWaiterLocked(index uint32) bool {
 	}
 	attemptIndex := waiter.attempt
 	attempt := &registry.attempts[attemptIndex]
-	if !attempt.active || attempt.generation != waiter.attemptGeneration ||
+	if !attempt.hasFlag(attemptActive) || attempt.generation != waiter.attemptGeneration ||
 		attempt.waiterCount == 0 ||
 		attempt.waiterCount > uint32(registry.limits.MaxWaiters) ||
 		registry.stats.Waiters <= 0 || registry.stats.Waiters > len(registry.waiters) ||
@@ -1731,23 +1954,71 @@ func (registry *Registry) requestWaiterReleaseLocked(index uint32) bool {
 }
 
 func (registry *Registry) attemptRemovableLocked(attempt *attemptRecord) bool {
-	if attempt == nil || !attempt.active {
+	if attempt == nil || !attempt.hasFlag(attemptActive) {
 		return false
 	}
-	if attempt.settlementPinned {
+	if attempt.hasFlag(attemptSettlementPinned) || attempt.hasFlag(attemptAdmitted) {
 		return false
 	}
 	switch attempt.state {
 	case attemptSettling:
 		return false
 	case attemptComplete:
-		return !attempt.lifecyclePending
+		return !attempt.hasFlag(attemptLifecyclePending)
 	case attemptPending:
-		return !attempt.lifecyclePending && !attempt.admitted
+		return !attempt.hasFlag(attemptLifecyclePending) &&
+			!attempt.hasFlag(attemptAdmitted)
 	default:
 		registry.corruptLocked(errors.New("attempt removal predicate found an invalid state"))
 		return false
 	}
+}
+
+func (registry *Registry) validateAttemptEntryLinksLocked(
+	index uint32,
+	attempt *attemptRecord,
+) bool {
+	if int(index) >= len(registry.attempts) || attempt == nil ||
+		&registry.attempts[index] != attempt || !attempt.hasFlag(attemptActive) ||
+		int(attempt.entry) >= len(registry.entries) || attempt.entryPrevious == index ||
+		attempt.next == index ||
+		(attempt.entryPrevious != noIndex && attempt.entryPrevious == attempt.next) {
+		return false
+	}
+	entry := &registry.entries[attempt.entry]
+	if !entry.active || entry.generation != attempt.entryGeneration ||
+		entry.attemptCount == 0 ||
+		entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) ||
+		int(entry.attemptCount) > registry.stats.OutstandingAttempts ||
+		(entry.attemptCount == 1) !=
+			(attempt.entryPrevious == noIndex && attempt.next == noIndex) {
+		return false
+	}
+	if attempt.entryPrevious == noIndex {
+		if entry.attemptHead != index {
+			return false
+		}
+	} else {
+		if entry.attemptHead == index || int(attempt.entryPrevious) >= len(registry.attempts) {
+			return false
+		}
+		previous := &registry.attempts[attempt.entryPrevious]
+		if !previous.hasFlag(attemptActive) || previous.entry != attempt.entry ||
+			previous.entryGeneration != entry.generation || previous.next != index {
+			return false
+		}
+	}
+	if attempt.next != noIndex {
+		if int(attempt.next) >= len(registry.attempts) {
+			return false
+		}
+		next := &registry.attempts[attempt.next]
+		if !next.hasFlag(attemptActive) || next.entry != attempt.entry ||
+			next.entryGeneration != entry.generation || next.entryPrevious != index {
+			return false
+		}
+	}
+	return true
 }
 
 func (registry *Registry) removeAttemptLocked(index uint32) bool {
@@ -1756,67 +2027,47 @@ func (registry *Registry) removeAttemptLocked(index uint32) bool {
 		return false
 	}
 	attempt := &registry.attempts[index]
-	if !attempt.active || attempt.admitted || attempt.settlementPinned || attempt.waiterCount != 0 ||
+	if !attempt.hasFlag(attemptActive) || attempt.hasFlag(attemptAdmitted) ||
+		attempt.hasFlag(attemptLifecyclePending) ||
+		attempt.hasFlag(attemptSettlementPinned) || attempt.waiterCount != 0 ||
 		attempt.waiterHead != noIndex || attempt.next == index ||
+		attempt.entryPrevious == index ||
+		attempt.freeOrPendingNext != noIndex || attempt.pendingPrevious != noIndex ||
 		int(attempt.entry) >= len(registry.entries) ||
 		(registry.freeAttempt != noIndex && int(registry.freeAttempt) >= len(registry.attempts)) ||
 		registry.freeAttempt == index {
 		registry.corruptLocked(errors.New("attempt removal found an invalid active record"))
 		return false
 	}
-	if registry.freeAttempt != noIndex && registry.attempts[registry.freeAttempt].active {
+	if registry.freeAttempt != noIndex &&
+		registry.attempts[registry.freeAttempt].hasFlag(attemptActive) {
 		registry.corruptLocked(errors.New("attempt removal found an active free-list head"))
+		return false
+	}
+	if !registry.validateAttemptEntryLinksLocked(index, attempt) ||
+		registry.stats.OutstandingAttempts <= 0 ||
+		registry.stats.OutstandingAttempts > len(registry.attempts) {
+		registry.corruptLocked(errors.New("attempt removal found invalid entry links or counts"))
 		return false
 	}
 	entryIndex := attempt.entry
 	entry := &registry.entries[entryIndex]
-	if !entry.active || entry.generation != attempt.entryGeneration ||
-		entry.attemptCount == 0 ||
-		entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) ||
-		int(entry.attemptCount) > registry.stats.OutstandingAttempts ||
-		registry.stats.OutstandingAttempts <= 0 ||
-		registry.stats.OutstandingAttempts > len(registry.attempts) {
-		registry.corruptLocked(errors.New("attempt removal found invalid ownership or counts"))
-		return false
+	previous := attempt.entryPrevious
+	next := attempt.next
+	if previous == noIndex {
+		entry.attemptHead = next
+	} else {
+		registry.attempts[previous].next = next
 	}
-	link := &entry.attemptHead
-	visited := uint16(0)
-	for *link != noIndex && *link != index {
-		if visited >= entry.attemptCount || int(*link) >= len(registry.attempts) {
-			registry.corruptLocked(errors.New("attempt removal found a corrupt or cyclic chain"))
-			return false
-		}
-		candidate := &registry.attempts[*link]
-		if !candidate.active || candidate.entry != entryIndex ||
-			candidate.entryGeneration != entry.generation {
-			registry.corruptLocked(errors.New("attempt removal found a foreign chain record"))
-			return false
-		}
-		visited++
-		link = &candidate.next
+	if next != noIndex {
+		registry.attempts[next].entryPrevious = previous
 	}
-	if *link != index {
-		registry.corruptLocked(errors.New("attempt removal lost its entry link"))
-		return false
-	}
-	if attempt.next != noIndex {
-		if int(attempt.next) >= len(registry.attempts) {
-			registry.corruptLocked(errors.New("attempt removal next link is out of range"))
-			return false
-		}
-		next := &registry.attempts[attempt.next]
-		if !next.active || next.entry != entryIndex ||
-			next.entryGeneration != entry.generation {
-			registry.corruptLocked(errors.New("attempt removal next link is foreign"))
-			return false
-		}
-	}
-	*link = attempt.next
 	entry.attemptCount--
 	generation := attempt.generation
 	*attempt = attemptRecord{
-		generation: generation, freeNext: registry.freeAttempt,
+		generation: generation, freeOrPendingNext: registry.freeAttempt,
 		next: noIndex, waiterHead: noIndex, entry: noIndex,
+		pendingPrevious: noIndex, entryPrevious: noIndex,
 	}
 	registry.freeAttempt = index
 	registry.stats.OutstandingAttempts--
@@ -1895,9 +2146,12 @@ func (registry *Registry) deleteGroupSlotLocked(hole uint32) bool {
 		}
 		if slot.state != tableOccupied || slot.group == (raftmember.GroupKey{}) ||
 			(slot.identityCount == 0) != (slot.entryHead == noIndex) ||
+			(slot.pendingAttempts == 0) != (slot.pendingHead == noIndex) ||
 			(slot.identityCount == 0 && slot.ownerEpoch == 0) ||
+			(slot.identityCount == 0 && slot.lifecycleAttempts != 0) ||
 			(slot.identityCount != 0 && int(slot.entryHead) >= len(registry.entries)) ||
 			int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts ||
+			int(slot.lifecycleAttempts) > registry.stats.OutstandingAttempts ||
 			(slot.pendingAttempts != 0 && slot.identityCount == 0) ||
 			(slot.ownerEpoch == 0 && (slot.allocationGeneration != 0 || slot.memberID != 0 ||
 				slot.storeID != ([16]byte{}) || slot.nodeIncarnation != 0)) ||
@@ -1910,6 +2164,25 @@ func (registry *Registry) deleteGroupSlotLocked(hole uint32) bool {
 			if !head.active || head.position.group != slot.group ||
 				head.groupPrevious != noIndex {
 				registry.corruptLocked(errors.New("group table deletion found a corrupt entry head"))
+				return false
+			}
+		}
+		if slot.pendingAttempts != 0 {
+			if int(slot.pendingHead) >= len(registry.attempts) {
+				registry.corruptLocked(errors.New("group table deletion found an invalid pending head"))
+				return false
+			}
+			pending := &registry.attempts[slot.pendingHead]
+			if !pending.hasFlag(attemptActive) || !pending.hasFlag(attemptAdmitted) ||
+				pending.pendingPrevious != noIndex ||
+				pending.ownerEpoch != slot.ownerEpoch || int(pending.entry) >= len(registry.entries) {
+				registry.corruptLocked(errors.New("group table deletion found a corrupt pending head"))
+				return false
+			}
+			pendingEntry := &registry.entries[pending.entry]
+			if !pendingEntry.active || pendingEntry.generation != pending.entryGeneration ||
+				pendingEntry.position.group != slot.group {
+				registry.corruptLocked(errors.New("group table deletion found a corrupt pending head"))
 				return false
 			}
 		}
@@ -2038,8 +2311,10 @@ func (registry *Registry) Close() error {
 	for index := range registry.attempts {
 		generation := registry.attempts[index].generation
 		registry.attempts[index] = attemptRecord{
-			generation: generation, freeNext: nextFree(index, len(registry.attempts)),
-			next: noIndex, waiterHead: noIndex, entry: noIndex,
+			generation:        generation,
+			freeOrPendingNext: nextFree(index, len(registry.attempts)),
+			next:              noIndex, waiterHead: noIndex, entry: noIndex,
+			pendingPrevious: noIndex, entryPrevious: noIndex,
 		}
 	}
 	for index := range registry.waiters {
@@ -2171,7 +2446,7 @@ func (registry *Registry) pollWaiterLocked(
 		)
 	}
 	attempt := &registry.attempts[record.attempt]
-	if !attempt.active || attempt.generation != record.attemptGeneration {
+	if !attempt.hasFlag(attemptActive) || attempt.generation != record.attemptGeneration {
 		return Outcome{}, false, registry.corruptLocked(
 			errors.New("waiter references an invalid attempt"),
 		)
@@ -2198,7 +2473,7 @@ func (registry *Registry) pollWaiterLocked(
 	}
 	completionBytes := 0
 	completionApplied := uint64(0)
-	if attempt.hasCompletion {
+	if attempt.hasFlag(attemptHasCompletion) {
 		if entry.completionLen == 0 || int(entry.completionLen) > completionSlotBytes {
 			return Outcome{}, false, registry.corruptLocked(
 				errors.New("waiter completion metadata is invalid"),
@@ -2243,7 +2518,7 @@ func (waiter Waiter) TakeCompletionInto(
 		return dst, outcome, ErrCompletionDestinationSmall
 	}
 	attempt := &registry.attempts[record.attempt]
-	if attempt.hasCompletion {
+	if attempt.hasFlag(attemptHasCompletion) {
 		entry := &registry.entries[attempt.entry]
 		slot := registry.completionSlot(attempt.entry)
 		dst = append(dst, slot[:entry.completionLen]...)
@@ -2306,7 +2581,8 @@ func (registry *Registry) signalAttemptLocked(
 	attemptIndex uint32,
 	attempt *attemptRecord,
 ) bool {
-	if attempt == nil || !attempt.active || int(attemptIndex) >= len(registry.attempts) ||
+	if attempt == nil || !attempt.hasFlag(attemptActive) ||
+		int(attemptIndex) >= len(registry.attempts) ||
 		&registry.attempts[attemptIndex] != attempt ||
 		attempt.waiterCount > uint32(len(registry.waiters)) ||
 		(attempt.waiterCount == 0) != (attempt.waiterHead == noIndex) {
@@ -2339,6 +2615,36 @@ func (registry *Registry) signalAttemptLocked(
 	return true
 }
 
+func (registry *Registry) validateAttemptWaitersLocked(
+	attemptIndex uint32,
+	attempt *attemptRecord,
+) bool {
+	if attempt == nil || !attempt.hasFlag(attemptActive) ||
+		int(attemptIndex) >= len(registry.attempts) ||
+		&registry.attempts[attemptIndex] != attempt ||
+		attempt.waiterCount > uint32(len(registry.waiters)) ||
+		(attempt.waiterCount == 0) != (attempt.waiterHead == noIndex) {
+		return false
+	}
+	visited := uint32(0)
+	previous := noIndex
+	for index := attempt.waiterHead; index != noIndex; {
+		if visited >= attempt.waiterCount || int(index) >= len(registry.waiters) {
+			return false
+		}
+		waiter := &registry.waiters[index]
+		if !waiter.active || waiter.attempt != attemptIndex ||
+			waiter.attemptGeneration != attempt.generation || waiter.previous != previous ||
+			waiter.wake == nil {
+			return false
+		}
+		visited++
+		previous = index
+		index = waiter.next
+	}
+	return visited == attempt.waiterCount
+}
+
 func (registry *Registry) validAttemptLocked(
 	index uint32,
 	generation uint64,
@@ -2348,7 +2654,8 @@ func (registry *Registry) validAttemptLocked(
 		return nil, nil, false
 	}
 	attempt := &registry.attempts[index]
-	if !attempt.active || attempt.generation != generation || attempt.state != state ||
+	if !attempt.hasFlag(attemptActive) || attempt.generation != generation ||
+		attempt.state != state ||
 		int(attempt.entry) >= len(registry.entries) {
 		return nil, nil, false
 	}

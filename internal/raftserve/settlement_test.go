@@ -500,7 +500,8 @@ func TestRegistrySettlementLookupDoesNotBlockUnrelatedGroupEnqueueAndWait(t *tes
 	mainRecord := registry.waiters[mainWaiter.index]
 	mainAttempt := registry.attempts[mainRecord.attempt]
 	registry.mu.Unlock()
-	if mainAttempt.state != attemptSettling || !mainAttempt.settlementPinned {
+	if mainAttempt.state != attemptSettling ||
+		!mainAttempt.hasFlag(attemptSettlementPinned) {
 		t.Fatalf("gated attempt = %+v", mainAttempt)
 	}
 

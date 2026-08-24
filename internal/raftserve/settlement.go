@@ -268,7 +268,8 @@ func stageSettlementLocked[Batch appliedBatchView](
 		}
 		attempt := &registry.attempts[attemptIndex]
 		if attempt.ownerEpoch != ownerEpoch {
-			if attempt.admitted || attempt.state == attemptPending || attempt.state == attemptSettling {
+			if attempt.hasFlag(attemptAdmitted) || attempt.state == attemptPending ||
+				attempt.state == attemptSettling {
 				return attemptCount, entryCount, lookupCount,
 					errors.Join(ErrRegistryCorrupt, errors.New("settlement found a foreign source epoch"))
 			}
@@ -280,19 +281,21 @@ func stageSettlementLocked[Batch appliedBatchView](
 
 		stagedAttempt, repeatedAttempt := settlementIndexLookup(attemptTable, attemptIndex)
 		if !repeatedAttempt {
-			if attempt.settlementPinned || attempt.entry != entryIndex ||
+			if attempt.hasFlag(attemptSettlementPinned) || attempt.entry != entryIndex ||
 				attempt.entryGeneration != logical.generation {
 				return attemptCount, entryCount, lookupCount,
 					errors.Join(ErrRegistryCorrupt, errors.New("settlement found an invalid attempt owner"))
 			}
 			switch attempt.state {
 			case attemptPending:
-				if attempt.lifecyclePending == attempt.admitted {
+				if attempt.hasFlag(attemptLifecyclePending) ==
+					attempt.hasFlag(attemptAdmitted) {
 					return attemptCount, entryCount, lookupCount,
 						errors.Join(ErrRegistryCorrupt, errors.New("pending settlement has an invalid lifecycle"))
 				}
 			case attemptComplete:
-				if attempt.admitted || attempt.hasCompletion && logical.completionLen == 0 {
+				if attempt.hasFlag(attemptAdmitted) ||
+					attempt.hasFlag(attemptHasCompletion) && logical.completionLen == 0 {
 					return attemptCount, entryCount, lookupCount,
 						errors.Join(ErrRegistryCorrupt, errors.New("complete settlement has invalid retained state"))
 				}
@@ -306,9 +309,9 @@ func stageSettlementLocked[Batch appliedBatchView](
 				entry: entryIndex, entryGeneration: logical.generation,
 				appliedIndex:    entry.Meta.Index,
 				originalOutcome: attempt.outcome, originalState: attempt.state,
-				originalCompletion: attempt.hasCompletion,
+				originalCompletion: attempt.hasFlag(attemptHasCompletion),
 			}
-			attempt.settlementPinned = true
+			attempt.setFlag(attemptSettlementPinned)
 			if attempt.state == attemptPending {
 				attempt.state = attemptSettling
 			}
@@ -320,7 +323,7 @@ func stageSettlementLocked[Batch appliedBatchView](
 			if wantState == attemptPending {
 				wantState = attemptSettling
 			}
-			if !attempt.settlementPinned || attempt.state != wantState ||
+			if !attempt.hasFlag(attemptSettlementPinned) || attempt.state != wantState ||
 				item.entry != entryIndex || item.entryGeneration != logical.generation {
 				return attemptCount, entryCount, lookupCount,
 					errors.Join(ErrRegistryCorrupt, errors.New("settlement duplicate lost its generation fence"))
@@ -479,15 +482,16 @@ func rollbackSettlementLocked(
 		if wantState == attemptPending {
 			wantState = attemptSettling
 		}
-		if !attempt.active || attempt.generation != item.attemptGeneration ||
+		if !attempt.hasFlag(attemptActive) || attempt.generation != item.attemptGeneration ||
 			attempt.entry != item.entry || attempt.entryGeneration != item.entryGeneration ||
 			!entry.active || entry.generation != item.entryGeneration ||
-			!attempt.settlementPinned || attempt.state != wantState {
+			!attempt.hasFlag(attemptSettlementPinned) || attempt.state != wantState {
 			return registry.corruptLocked(errors.New("settlement rollback lost its generation fence"))
 		}
-		attempt.settlementPinned = false
+		attempt.clearFlag(attemptSettlementPinned)
 		if item.originalState == attemptPending {
-			if !attempt.lifecyclePending && !attempt.admitted {
+			if !attempt.hasFlag(attemptLifecyclePending) &&
+				!attempt.hasFlag(attemptAdmitted) {
 				if attempt.outcome == OutcomePending {
 					return registry.corruptLocked(errors.New("settlement rollback lost proposal refusal outcome"))
 				}
@@ -503,7 +507,7 @@ func rollbackSettlementLocked(
 	for index := 0; index < attemptCount; index++ {
 		item := attempts[index]
 		attempt := &registry.attempts[item.attempt]
-		if attempt.active && attempt.generation == item.attemptGeneration &&
+		if attempt.hasFlag(attemptActive) && attempt.generation == item.attemptGeneration &&
 			attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
 			if !registry.removeAttemptLocked(item.attempt) {
 				return registry.failure
@@ -535,19 +539,20 @@ func commitSettlementLocked(
 		if wantState == attemptPending {
 			wantState = attemptSettling
 		}
-		if !attempt.active || attempt.generation != item.attemptGeneration ||
+		if !attempt.hasFlag(attemptActive) || attempt.generation != item.attemptGeneration ||
 			attempt.entry != item.entry || attempt.entryGeneration != item.entryGeneration ||
 			!entry.active || entry.generation != item.entryGeneration ||
-			!attempt.settlementPinned || attempt.state != wantState {
+			!attempt.hasFlag(attemptSettlementPinned) || attempt.state != wantState {
 			return errors.Join(ErrRegistryCorrupt, errors.New("settlement staged attempt changed ownership"))
 		}
 		if item.originalState == attemptComplete &&
 			(attempt.outcome != item.originalOutcome ||
-				attempt.hasCompletion != item.originalCompletion || attempt.admitted) {
+				attempt.hasFlag(attemptHasCompletion) != item.originalCompletion ||
+				attempt.hasFlag(attemptAdmitted)) {
 			return errors.Join(ErrRegistryCorrupt, errors.New("complete settlement changed while staged"))
 		}
-		if item.originalState == attemptPending && attempt.admitted {
-			if attempt.lifecyclePending {
+		if item.originalState == attemptPending && attempt.hasFlag(attemptAdmitted) {
+			if attempt.hasFlag(attemptLifecyclePending) {
 				return errors.Join(ErrRegistryCorrupt, errors.New("admitted settlement retained a lifecycle callback"))
 			}
 			pendingToRelease++
@@ -610,19 +615,22 @@ func commitSettlementLocked(
 		item := attempts[index]
 		attempt := &registry.attempts[item.attempt]
 		if item.originalState == attemptPending {
-			if attempt.admitted {
-				if !registry.removeGroupPendingLocked(group) {
+			if attempt.hasFlag(attemptAdmitted) {
+				if !registry.unlinkGroupPendingAttemptLocked(item.attempt) {
 					registry.poisonLocked(errors.New("settled attempt lost its pending group record"))
 					return registry.failure
 				}
-				attempt.admitted = false
 			}
 			attempt.appliedIndex = item.appliedIndex
 			attempt.outcome = item.outcome
-			attempt.hasCompletion = item.completionBytes != 0
+			if item.completionBytes != 0 {
+				attempt.setFlag(attemptHasCompletion)
+			} else {
+				attempt.clearFlag(attemptHasCompletion)
+			}
 			attempt.state = attemptComplete
 		}
-		attempt.settlementPinned = false
+		attempt.clearFlag(attemptSettlementPinned)
 	}
 	for index := 0; index < attemptCount; index++ {
 		item := attempts[index]
