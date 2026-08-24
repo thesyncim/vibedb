@@ -586,9 +586,21 @@ func openDatabaseWithShardStorePolicy(
 		if err := validateOpenedReplicatedCatalog(d); err != nil {
 			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
-		if err := d.txnLog.QualifyMinted(); err != nil {
+		// Bind publishes the complete catalog identity before it mints the
+		// transaction marker. An exact settlement open is the only reopen path
+		// allowed to finish that interrupted bind; every ordinary replicated open
+		// must continue to reject an absent marker. EnsureMinted retains the same
+		// pinned-directory and complete-catalog proofs as qualification before it
+		// creates the marker.
+		var markerErr error
+		if shardPolicy.mode == shardStoreOpenReplicatedSettlement {
+			markerErr = d.txnLog.EnsureMinted()
+		} else {
+			markerErr = d.txnLog.QualifyMinted()
+		}
+		if markerErr != nil {
 			return nil, fmt.Errorf(
-				"vibedb: qualify replicated transaction marker: %w", err,
+				"vibedb: qualify replicated transaction marker: %w", markerErr,
 			)
 		}
 	}

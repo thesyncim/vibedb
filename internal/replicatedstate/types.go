@@ -177,13 +177,14 @@ func (keys AttemptedMutationKeys) Len() int { return len(keys.changes) }
 func (keys AttemptedMutationKeys) Key(index int) []byte { return keys.changes[index].key }
 
 // MutationAttemptObserver is invoked synchronously before ApplyNormal returns
-// after UpdateCollections has been attempted with nonempty user changes. This
-// deliberately includes definite and outcome-unknown failures. A caller that
-// needs to publish conflict clocks only for actual or uncertain storage
-// publication must compare the collection Generation captured before Apply to
-// the value observed in this callback and also inspect PersistenceError.
+// after the configured durable update has been attempted with nonempty user
+// changes. This deliberately includes definite and outcome-unknown failures.
+// updateErr is the exact durable-update result. A caller that needs to publish
+// conflict clocks only for actual or uncertain storage publication must compare
+// the collection Generation captured before Apply, inspect PersistenceError,
+// and conservatively accept an updateErr classified ErrCommitOutcomeUnknown.
 // Implementations must not retain key slices or reenter the Machine.
-type MutationAttemptObserver func(AttemptedMutationKeys)
+type MutationAttemptObserver func(AttemptedMutationKeys, error)
 
 // CollectionLimits repeats the collection's frozen durable bounds at the
 // integration boundary. Open compares every value to the live handle, so a

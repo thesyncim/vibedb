@@ -33,6 +33,23 @@ func InstallTxnMarkerAppendFaultForFacadeTest(appendIndex int) (restore func()) 
 	return func() { databaseTxnAfterMintHook = previous }
 }
 
+// InstallCheckpointGroupDecisionAppendFaultForFacadeTest makes the next group
+// transition report an unknown outcome after its decision append completes.
+// Installing it immediately before the target transition avoids coupling a
+// facade regression to unrelated marker appends during storage preparation.
+func InstallCheckpointGroupDecisionAppendFaultForFacadeTest() (restore func()) {
+	previous := checkpointGroupFaultHook
+	fired := false
+	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+		if !fired && point == checkpointGroupAfterDecisionAppend {
+			fired = true
+			return ErrCommitOutcomeUnknown
+		}
+		return nil
+	}
+	return func() { checkpointGroupFaultHook = previous }
+}
+
 // InstallCheckpointGroupInitialCertificateFaultForFacadeTest makes the next
 // checkpoint-group creation report an unknown outcome immediately after the
 // initial certificate has been renamed into place. It exercises callers that

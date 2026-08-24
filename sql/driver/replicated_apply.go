@@ -777,16 +777,22 @@ func (v *replicatedSQLMutationValidator) pointForEncodedKeyLocked(
 	return point, true
 }
 
-func (a *ReplicatedApply) observeMutationAttempt(keys replicatedstate.AttemptedMutationKeys) {
+func (a *ReplicatedApply) observeMutationAttempt(
+	keys replicatedstate.AttemptedMutationKeys,
+	updateErr error,
+) {
 	if a == nil || a.table == nil || keys.Len() == 0 {
 		return
 	}
 	// The core invokes this only while the wrapper still holds database.mu.
 	// A generation move proves publication; a sticky persistence failure makes
-	// the in-process outcome uncertain and therefore advances conservatively.
+	// the in-process outcome uncertain. A checkpoint-group decision failure can
+	// report the same uncertainty without changing either collection signal, so
+	// its explicit outcome-unknown classification also advances conservatively.
 	if !a.attemptActive ||
 		(a.table.collection.Generation() == a.attemptGeneration &&
-			a.table.collection.PersistenceError() == nil) {
+			a.table.collection.PersistenceError() == nil &&
+			!errors.Is(updateErr, durable.ErrCommitOutcomeUnknown)) {
 		return
 	}
 	changed := make([]string, keys.Len())

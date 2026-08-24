@@ -713,6 +713,13 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		path, database, binding, local := prepareReplicatedTestRoot(t, "unknown", false)
 		injected := errors.New("directory fence failure")
 		core := database.connector.db
+		markerPath := filepath.Join(core.dataDir, "txn.vtm")
+		requireMarkerAbsent := func(label string) {
+			t.Helper()
+			if _, statErr := os.Lstat(markerPath); !os.IsNotExist(statErr) {
+				t.Fatalf("%s changed absent transaction marker: %v", label, statErr)
+			}
+		}
 		catalogParent := filepath.Clean(filepath.Dir(path))
 		core.syncDir = func(candidate string) error {
 			if filepath.Clean(candidate) == catalogParent {
@@ -730,27 +737,47 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		if err := database.Close(); err != nil {
 			t.Fatalf("close unknown-outcome root: %v", err)
 		}
+		requireMarkerAbsent("interrupted bind")
+		if ordinary, err := OpenReplicatedShardStore(path, identity); ordinary != nil || err == nil {
+			if ordinary != nil {
+				_ = ordinary.Close()
+			}
+			t.Fatalf("ordinary exact open with absent marker = %v, %v; want fail closed", ordinary, err)
+		}
+		requireMarkerAbsent("ordinary exact open")
 		wrongLogID := local.LogID
 		wrongLogID[0] ^= 0x80
-		if _, _, err := OpenReplicatedShardStoreForSettlement(
+		if wrong, _, err := OpenReplicatedShardStoreForSettlement(
 			path, binding, wrongLogID, "docs",
-		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		); wrong != nil || !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			if wrong != nil {
+				_ = wrong.Close()
+			}
 			t.Fatalf("settlement with wrong retained LogID = %v", err)
 		}
-		if _, _, err := OpenReplicatedShardStoreForSettlement(
+		requireMarkerAbsent("wrong-LogID settlement")
+		if wrong, _, err := OpenReplicatedShardStoreForSettlement(
 			path, binding, local.LogID, "other",
-		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		); wrong != nil || !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			if wrong != nil {
+				_ = wrong.Close()
+			}
 			t.Fatalf("settlement with wrong intended table = %v", err)
 		}
+		requireMarkerAbsent("wrong-table settlement")
 		wrongBinding := binding
 		wrongBinding.Authority.SchemaGeneration++
-		if _, _, err := OpenReplicatedShardStoreForSettlement(
+		if wrong, _, err := OpenReplicatedShardStoreForSettlement(
 			path, wrongBinding, local.LogID, "docs",
-		); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		); wrong != nil || !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			if wrong != nil {
+				_ = wrong.Close()
+			}
 			t.Fatalf("settlement with wrong WAL binding = %v", err)
 		}
+		requireMarkerAbsent("wrong-binding settlement")
 		recoveryCalls := 0
-		if _, err := openDatabaseWithShardStorePolicy(path, func(string) error {
+		if wrong, err := openDatabaseWithShardStorePolicy(path, func(string) error {
 			recoveryCalls++
 			return errors.New("recovery must not run")
 		}, shardStoreOpenPolicy{
@@ -758,12 +785,16 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			expectedReplicated:          ReplicatedShardStoreIdentity{Binding: wrongBinding},
 			expectedReplicatedLogID:     local.LogID,
 			expectedReplicatedUserTable: "docs",
-		}); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		}); wrong != nil || !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+			if wrong != nil {
+				_ = wrong.closeTerminal()
+			}
 			t.Fatalf("private wrong-binding settlement = %v", err)
 		}
 		if recoveryCalls != 0 {
 			t.Fatalf("wrong settlement identity reached %d recovery fence(s)", recoveryCalls)
 		}
+		requireMarkerAbsent("private wrong-binding settlement")
 		reopened, settled, err := OpenReplicatedShardStoreForSettlement(
 			path, binding, local.LogID, "docs",
 		)
@@ -904,6 +935,133 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
+	tests := []struct {
+		name         string
+		phase        storeio.TxnMarkerFaultPhase
+		wantErr      error
+		validResidue bool
+	}{
+		{
+			name: "header_write_unusable_residue", phase: storeio.TxnMarkerFaultCreateHeaderWrite,
+			wantErr: storeio.ErrFaultInjected,
+		},
+		{
+			name: "parent_directory_sync_valid_residue", phase: storeio.TxnMarkerFaultCreateParentDirSync,
+			wantErr: syscall.EIO, validResidue: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path, db, binding, local := prepareReplicatedTestRoot(t, "settlement-mint-"+test.name, false)
+			identity, err := db.bindReplicatedShardStore(
+				binding, "docs", func(core *database) (bool, error) {
+					published, persistErr := core.persistCatalogLocked()
+					if persistErr != nil {
+						return published, persistErr
+					}
+					return published, durable.ErrCommitOutcomeUnknown
+				},
+			)
+			skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
+			if identity == (ReplicatedShardStoreIdentity{}) ||
+				!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+				t.Fatalf("published unminted bind = %+v, %v", identity, err)
+			}
+			markerPath := filepath.Join(db.connector.db.dataDir, "txn.vtm")
+			if _, statErr := os.Lstat(markerPath); !os.IsNotExist(statErr) {
+				t.Fatalf("published unminted bind marker = %v, want absent", statErr)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close published unminted bind: %v", err)
+			}
+
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{Phase: test.phase})
+			t.Cleanup(func() {
+				storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			})
+			failed, failedIdentity, err := OpenReplicatedShardStoreForSettlement(
+				path, binding, local.LogID, "docs",
+			)
+			if failed != nil {
+				_ = failed.Close()
+			}
+			if errors.Is(err, storeio.ErrStrictAllocationUnsupported) &&
+				!storeio.TxnMarkerCreateFaulted() {
+				t.Skipf("sealed transaction marker requires strict allocation support: %v", err)
+			}
+			if failed != nil || failedIdentity != (ReplicatedShardStoreIdentity{}) ||
+				!errors.Is(err, test.wantErr) ||
+				errors.Is(err, durable.ErrCommitOutcomeUnknown) ||
+				!storeio.TxnMarkerCreateFaulted() {
+				t.Fatalf(
+					"faulted exact settlement = %v, %+v, %v; faulted=%t",
+					failed, failedIdentity, err, storeio.TxnMarkerCreateFaulted(),
+				)
+			}
+
+			inspection, decisions, inspectErr := storeio.InspectTxnMarker(markerPath)
+			if test.validResidue {
+				if inspectErr != nil || inspection == nil || decisions == nil ||
+					inspection.Header().Capacity != ReplicatedTransactionMarkerBytes ||
+					!inspection.Header().SealedCapacity || decisions.MaxTxnID() != 0 {
+					t.Fatalf(
+						"valid settlement mint residue = %v, %+v, %v",
+						inspection, decisions, inspectErr,
+					)
+				}
+			} else if !errors.Is(inspectErr, storeio.ErrTxnMarkerNoValidHeader) {
+				t.Fatalf("early settlement mint residue = %v, want no valid header", inspectErr)
+			}
+			if inspection != nil {
+				if err := inspection.Close(); err != nil {
+					t.Fatalf("close settlement mint residue inspection: %v", err)
+				}
+			}
+
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			settled, settledIdentity, err := OpenReplicatedShardStoreForSettlement(
+				path, binding, local.LogID, "docs",
+			)
+			if err != nil || settledIdentity != identity {
+				if settled != nil {
+					_ = settled.Close()
+				}
+				t.Fatalf("exact settlement retry = %+v, %v; want %+v", settledIdentity, err, identity)
+			}
+			markerInfo, err := os.Stat(markerPath)
+			wantMarkerSize := int64(2*storeio.TxnMarkerHeaderSize) +
+				int64(ReplicatedTransactionMarkerBytes)
+			markerOptions := settled.connector.db.txnLog.Options()
+			if err != nil || markerInfo.Size() != wantMarkerSize ||
+				markerOptions != (durable.TxnLogOptions{
+					Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+				}) {
+				_ = settled.Close()
+				t.Fatalf(
+					"retried settlement marker = %v, size %d, options %+v; want size %d sealed profile",
+					err, func() int64 {
+						if markerInfo == nil {
+							return -1
+						}
+						return markerInfo.Size()
+					}(), markerOptions, wantMarkerSize,
+				)
+			}
+			if err := settled.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenReplicatedShardStore(path, identity)
+			if err != nil {
+				t.Fatalf("ordinary exact open after settlement retry: %v", err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

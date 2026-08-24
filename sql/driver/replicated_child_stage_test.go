@@ -288,6 +288,10 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		t.Fatalf("initial-certificate child resume = %+v, %v", resumedIdentity, err)
 	}
 	db = resumed
+	core = db.connector.db
+	core.mu.RLock()
+	finalCollection = core.tables["docs"].collection
+	core.mu.RUnlock()
 	stage, err = db.OpenReplicatedChildStage(
 		base, fixture.partitioner, fixture.artifactManifest, persisted,
 		applyOptions, rangesplit.ChildStageOptions{},

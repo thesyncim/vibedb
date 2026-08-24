@@ -69,7 +69,7 @@ type applyComplexityObserver struct {
 	lastKey       []byte
 }
 
-func (o *applyComplexityObserver) observe(keys AttemptedMutationKeys) {
+func (o *applyComplexityObserver) observe(keys AttemptedMutationKeys, _ error) {
 	o.calls++
 	o.attemptedKeys += uint64(keys.Len())
 	if keys.Len() == 1 {

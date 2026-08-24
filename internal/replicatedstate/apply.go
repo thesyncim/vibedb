@@ -1315,7 +1315,7 @@ func (m *Machine) persistTransition(
 		)
 	}
 	if len(changes) != 0 && m.user.ObserveMutationAttempt != nil {
-		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: changes})
+		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: changes}, err)
 	}
 	if err != nil {
 		return err
