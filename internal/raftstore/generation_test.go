@@ -199,6 +199,41 @@ func TestGenerationCandidateCapturesExactCutAndLeavesSourceAuthoritative(t *test
 	}
 }
 
+func TestGenerationFamilyManifestIsAForwardServingFence(t *testing.T) {
+	path, source, options, builder := prepareGenerationSource(t)
+	defer builder.Close()
+	candidate, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(
+		filepath.Dir(path), generationFamilyManifestBase(builder.familyID),
+	)
+	manifest, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.Sync(); err != nil {
+		_ = manifest.Close()
+		t.Fatal(err)
+	}
+	if err := manifest.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, fencedPath := range []string{path, candidate.Path} {
+		opened, err := Open(
+			fencedPath, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
+			testKey(), options,
+		)
+		if opened != nil || !errors.Is(err, ErrGenerationActivationPending) {
+			t.Fatalf("Open(%q) across family fence = %v, %v", fencedPath, opened, err)
+		}
+	}
+}
+
 func TestGenerationCandidateSupportsFullyCheckpointedSuffix(t *testing.T) {
 	_, source, options := createTestStore(t)
 	incarnation, err := source.BeginIncarnation()

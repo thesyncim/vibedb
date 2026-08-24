@@ -116,6 +116,12 @@ func Create(path string, identity Identity, key Key, bootstrap Bootstrap, option
 			_ = root.Close()
 		}
 	}()
+	familyBase := generationFamilyManifestBase(generationFamilyID(base, identity))
+	if _, err := root.Lstat(familyBase); err == nil {
+		return nil, ErrGenerationActivationPending
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	if _, err := root.Lstat(base); err == nil {
 		return nil, fmt.Errorf("%w: WAL path already exists", ErrInvalid)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -255,6 +261,15 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 			_ = root.Close()
 		}
 	}()
+	logicalFamilyBase := generationFamilyManifestBase(generationFamilyID(base, expected))
+	if entry, err := root.Lstat(logicalFamilyBase); err == nil {
+		if !entry.Mode().IsRegular() {
+			return nil, ErrNamespaceChanged
+		}
+		return nil, ErrGenerationActivationPending
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	entryInfo, err := root.Lstat(base)
 	if err != nil {
 		return nil, err
@@ -301,6 +316,19 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 	if err != nil {
 		cleanup()
 		return nil, err
+	}
+	if generation.present {
+		familyBase := generationFamilyManifestBase(generation.seal.familyID)
+		if entry, familyErr := root.Lstat(familyBase); familyErr == nil {
+			cleanup()
+			if !entry.Mode().IsRegular() {
+				return nil, ErrNamespaceChanged
+			}
+			return nil, ErrGenerationActivationPending
+		} else if !errors.Is(familyErr, os.ErrNotExist) {
+			cleanup()
+			return nil, familyErr
+		}
 	}
 	if header.topologyRecoveryEpoch != expectedTopologyRecoveryEpoch {
 		cleanup()
