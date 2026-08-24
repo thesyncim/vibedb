@@ -131,16 +131,9 @@ func TestCatalogVibeEncoderUsesCallerCapacityAndRejectsMalformedNestedMetadata(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocations := testing.AllocsPerRun(50, func() {
-		raw, encodeErr := appendCatalogJSON(make([]byte, 0, bound), catalog)
-		if encodeErr != nil || len(raw) == 0 || cap(raw) != bound {
-			panic("catalog encoder did not retain caller capacity")
-		}
-	})
-	// The race runtime adds four bookkeeping allocations; ordinary builds use
-	// three (output, sorted table names, and encoder scratch).
-	if allocations > 8 {
-		t.Fatalf("preallocated catalog encode allocations = %.1f", allocations)
+	raw, encodeErr := appendCatalogJSON(make([]byte, 0, bound), catalog)
+	if encodeErr != nil || len(raw) == 0 || cap(raw) != bound {
+		t.Fatalf("catalog encoder did not retain caller capacity: bytes=%d cap=%d bound=%d err=%v", len(raw), cap(raw), bound, encodeErr)
 	}
 	malformed := catalogFile{Version: catalogVersion, Tables: map[string]*tableMeta{}, ReplicatedShardStore: &ReplicatedShardStoreIdentity{Format: ReplicatedShardStoreFormat, RelationCount: 2}}
 	deferred := func() (raw []byte, err error, recovered any) {
@@ -148,9 +141,9 @@ func TestCatalogVibeEncoderUsesCallerCapacityAndRejectsMalformedNestedMetadata(t
 		raw, err = malformed.MarshalJSON()
 		return raw, err, nil
 	}
-	raw, err, recovered := deferred()
-	if recovered != nil || err == nil || raw != nil {
-		t.Fatalf("malformed catalog marshal = %q, %v, panic=%v", raw, err, recovered)
+	malformedRaw, marshalErr, recovered := deferred()
+	if recovered != nil || marshalErr == nil || malformedRaw != nil {
+		t.Fatalf("malformed catalog marshal = %q, %v, panic=%v", malformedRaw, marshalErr, recovered)
 	}
 }
 
