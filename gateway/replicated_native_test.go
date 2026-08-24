@@ -95,6 +95,36 @@ type pointReadClient struct {
 	readRefusal   shardservice.ReplicatedRefusalCode
 }
 
+type fixedReplicatedResponseClient struct {
+	state         shardservice.ReplicatedMemberState
+	probeResponse *shardservice.ReplicatedResponse
+	response      *shardservice.ReplicatedResponse
+	operation     shardservice.ReplicatedOperation
+	probes        int
+	requests      int
+	command       []byte
+}
+
+func (client *fixedReplicatedResponseClient) DoReplicated(
+	_ context.Context,
+	_ string,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.probes++
+		if client.probeResponse != nil {
+			return client.probeResponse, nil
+		}
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: client.state,
+		}, nil
+	}
+	client.operation = request.Operation
+	client.requests++
+	client.command = append(client.command[:0], request.Command...)
+	return client.response, nil
+}
+
 func (client *pointReadClient) DoReplicated(
 	_ context.Context,
 	address string,
@@ -154,6 +184,110 @@ func TestReplicatedPointReadReturnsTypedBoundsWithoutLeaderMisclassification(t *
 				t.Fatalf("operation=%d", client.readOperation)
 			}
 		})
+	}
+}
+
+func TestReplicatedPointReadRejectsNonCanonicalCustomResponses(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	completion := testReplicatedCompletionResponse(t, command, state)
+	tests := []struct {
+		name     string
+		response *shardservice.ReplicatedResponse
+	}{
+		{"nonterminal refusal", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedNotLeader,
+			Refusal:  shardservice.ReplicatedRefusalAdmissionBound,
+			HasState: true, State: state,
+		}},
+		{"nonterminal read result", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedNotLeader, HasState: true, State: state,
+			ReadApplied: state.Applied,
+		}},
+		{"read refusal outcome", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalReadBehind,
+			HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased},
+		}},
+		{"read refusal value", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state, Value: []byte{1},
+		}},
+		{"write-only refusal", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalProposalRefused,
+			HasState: true, State: state,
+		}},
+		{"applied refusal", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalDeterministic,
+			HasState: true, State: state,
+			Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeSessionReleased, AppliedIndex: state.Applied,
+			},
+		}},
+		{"write completion", completion},
+		{"read found completion", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedReadFound, HasState: true, State: state,
+			ReadApplied: state.Applied, Completion: []byte{1},
+		}},
+		{"read missing value", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedReadMissing, HasState: true, State: state,
+			ReadApplied: state.Applied, Value: []byte{1},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fixedReplicatedResponseClient{state: state, response: test.response}
+			executor, err := NewReplicatedExecutor(client, 1, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.ReadPoint(context.Background(), route, ReplicatedPointRead{
+				Relation: 1, Key: []byte("k"), MinimumApplied: state.Applied,
+				MaxValueBytes: 1024, Linearizable: true,
+			})
+			if !errors.Is(err, ErrReplicatedRoute) ||
+				errors.Is(err, ErrReplicatedReadBehind) ||
+				errors.Is(err, ErrReplicatedReadBufferBound) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if client.requests != 1 || client.operation != shardservice.ReplicatedReadLeader {
+				t.Fatalf("requests=%d operation=%d", client.requests, client.operation)
+			}
+		})
+	}
+}
+
+func TestReplicatedPointReadTreatsChangedStaleFenceAsDefinite(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	refreshed := state
+	refreshed.Fence.Command.SchemaGeneration++
+	refreshed.Fence.Command.RelationManifestDigest[0]++
+	client := &fixedReplicatedResponseClient{state: state,
+		response: &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalStaleFence,
+			HasState: true, State: refreshed,
+		},
+	}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.ReadPoint(context.Background(), route, ReplicatedPointRead{
+		Relation: 1, Key: []byte("k"), MinimumApplied: state.Applied,
+		MaxValueBytes: 1024, Linearizable: true,
+	})
+	if !errors.Is(err, raftservice.ErrServingFence) ||
+		errors.Is(err, ErrReplicatedRoute) || errors.Is(err, ErrReplicatedLeader) ||
+		client.requests != 1 {
+		t.Fatalf("error=%T %v requests=%d", err, err, client.requests)
 	}
 }
 
@@ -310,6 +444,14 @@ func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) 
 			Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnavailable,
 			HasState: true, State: state,
 		}},
+		{"read behind", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalReadBehind,
+			HasState: true, State: state,
+		}},
+		{"read buffer bound", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state,
+		}},
 		{"unavailable without state", &shardservice.ReplicatedResponse{
 			Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnavailable,
 		}},
@@ -407,6 +549,125 @@ func TestReplicatedExecutorPreAdmissionRefusalIsDefiniteWithoutPriorUnknown(t *t
 	}
 }
 
+func TestReplicatedExecutorTreatsReadOnlyProposalRefusalsAsUnknown(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	for _, test := range []struct {
+		name string
+		code shardservice.ReplicatedRefusalCode
+	}{
+		{"read behind", shardservice.ReplicatedRefusalReadBehind},
+		{"read buffer bound", shardservice.ReplicatedRefusalReadBufferBound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := &shardservice.ReplicatedResponse{
+				Kind: shardservice.ReplicatedRefusal, Refusal: test.code,
+				HasState: true, State: state,
+			}
+			client := &fixedReplicatedResponseClient{state: state, response: response}
+			executor, err := NewReplicatedExecutor(client, 1, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sent := append([]byte(nil), command...)
+			want := append([]byte(nil), sent...)
+			_, err = executor.Propose(context.Background(), route, sent)
+			sent[0] ^= 0xff
+			var unknown *raftservice.UnknownOutcomeError
+			if !errors.As(err, &unknown) || !bytes.Equal(unknown.Command, want) ||
+				!bytes.Equal(client.command, want) ||
+				errors.Is(err, ErrReplicatedReadBehind) ||
+				errors.Is(err, ErrReplicatedReadBufferBound) {
+				t.Fatalf("error=%T %v unknown=%+v sent=%t", err, err,
+					unknown, bytes.Equal(client.command, want))
+			}
+			if client.requests != 1 || client.operation != shardservice.ReplicatedPropose {
+				t.Fatalf("requests=%d operation=%d", client.requests, client.operation)
+			}
+		})
+	}
+}
+
+func TestReplicatedExecutorRejectsNonCanonicalCustomWriteResponses(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	completion := testReplicatedCompletionResponse(t, command, state)
+	tests := []struct {
+		name     string
+		response *shardservice.ReplicatedResponse
+	}{
+		{"completion read applied", &shardservice.ReplicatedResponse{
+			Kind: completion.Kind, HasState: true, State: state,
+			Outcome: completion.Outcome, Completion: completion.Completion,
+			ReadApplied: state.Applied,
+		}},
+		{"completion value", &shardservice.ReplicatedResponse{
+			Kind: completion.Kind, HasState: true, State: state,
+			Outcome: completion.Outcome, Completion: completion.Completion, Value: []byte{1},
+		}},
+		{"completion refusal", &shardservice.ReplicatedResponse{
+			Kind: completion.Kind, Refusal: shardservice.ReplicatedRefusalAdmissionBound,
+			HasState: true, State: state,
+			Outcome: completion.Outcome, Completion: completion.Completion,
+		}},
+		{"not leader value", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedNotLeader, HasState: true, State: state,
+			Value: []byte{1},
+		}},
+		{"not leader outcome", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedNotLeader, HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased},
+		}},
+		{"outcome unknown read applied", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: state,
+			ReadApplied: state.Applied,
+		}},
+		{"refusal value", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalAdmissionBound,
+			HasState: true, State: state, Value: []byte{1},
+		}},
+		{"refusal completion", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalAdmissionBound,
+			HasState: true, State: state, Completion: []byte{1},
+		}},
+		{"deterministic read applied", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedRefusal,
+			Refusal:  shardservice.ReplicatedRefusalDeterministic,
+			HasState: true, State: state,
+			Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeSessionReleased, AppliedIndex: state.Applied,
+			},
+			ReadApplied: state.Applied,
+		}},
+		{"stateless unavailable value", &shardservice.ReplicatedResponse{
+			Kind:    shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalUnavailable, Value: []byte{1},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fixedReplicatedResponseClient{state: state, response: test.response}
+			executor, err := NewReplicatedExecutor(client, 1, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.Propose(context.Background(), route, command)
+			var unknown *raftservice.UnknownOutcomeError
+			if !errors.As(err, &unknown) || !bytes.Equal(unknown.Command, command) ||
+				!bytes.Equal(client.command, command) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if client.requests != 1 || client.operation != shardservice.ReplicatedPropose {
+				t.Fatalf("requests=%d operation=%d", client.requests, client.operation)
+			}
+		})
+	}
+}
+
 type deadlineReplicatedClient struct {
 	state shardservice.ReplicatedMemberState
 }
@@ -458,6 +719,77 @@ func TestTCPReplicatedClientRequiresExplicitDial(t *testing.T) {
 	}
 }
 
+func TestReplicatedExecutorRejectsNonCanonicalCustomHandshakes(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	followerState := states["m1"]
+	route.Replicas = []ReplicatedEndpoint{{Member: 2, Address: "m2"}}
+	tests := []struct {
+		name     string
+		response *shardservice.ReplicatedResponse
+	}{
+		{"refusal", &shardservice.ReplicatedResponse{
+			Kind:     shardservice.ReplicatedHandshake,
+			Refusal:  shardservice.ReplicatedRefusalAdmissionBound,
+			HasState: true, State: state,
+		}},
+		{"outcome", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased},
+		}},
+		{"completion", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+			Completion: []byte{1},
+		}},
+		{"read applied", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+			ReadApplied: state.Applied,
+		}},
+		{"value", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+			Value: []byte{1},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, operation := range []struct {
+				name string
+				read bool
+			}{{"leader discovery", false}, {"follower selection", true}} {
+				t.Run(operation.name, func(t *testing.T) {
+					selectedRoute, selectedState := route, state
+					response := *test.response
+					if operation.read {
+						selectedRoute.Replicas = []ReplicatedEndpoint{{Member: 1, Address: "m1"}}
+						selectedState = followerState
+						response.State = followerState
+					}
+					client := &fixedReplicatedResponseClient{
+						state: selectedState, probeResponse: &response,
+					}
+					executor, err := NewReplicatedExecutor(client, 1, time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if operation.read {
+						_, err = executor.ReadPoint(context.Background(), selectedRoute, ReplicatedPointRead{
+							Relation: 1, Key: []byte("k"), MinimumApplied: selectedState.Applied,
+							MaxValueBytes: 1024,
+						})
+					} else {
+						_, err = executor.Propose(context.Background(), selectedRoute, command)
+					}
+					if !errors.Is(err, ErrReplicatedRoute) || client.requests != 0 ||
+						client.probes == 0 {
+						t.Fatalf("error=%T %v probes=%d requests=%d",
+							err, err, client.probes, client.requests)
+					}
+				})
+			}
+		})
+	}
+}
+
 func (client *staleFenceReplicatedClient) DoReplicated(
 	_ context.Context,
 	_ string,
@@ -490,6 +822,32 @@ func TestReplicatedExecutorTreatsChangedStaleFenceAsDefinite(t *testing.T) {
 	if !errors.Is(err, raftservice.ErrServingFence) ||
 		errors.Is(err, raftservice.ErrOutcomeUnknown) || client.proposals != 1 {
 		t.Fatalf("error=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
+func testReplicatedCompletionResponse(
+	t testing.TB,
+	commandBytes []byte,
+	state shardservice.ReplicatedMemberState,
+) *shardservice.ReplicatedResponse {
+	t.Helper()
+	command, err := replication.OpenCommand(commandBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := appendNativeSessionCompletion(
+		nil, command, command.ClientEpoch, state.Applied, replicatedstate.ResultApplied,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		Outcome: raftserve.Outcome{
+			Code: raftserve.OutcomeCompletion, AppliedIndex: state.Applied,
+			CompletionAppliedSequence: state.Applied, CompletionBytes: len(completion),
+		},
+		Completion: completion,
 	}
 }
 

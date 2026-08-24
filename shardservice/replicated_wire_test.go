@@ -278,13 +278,19 @@ func BenchmarkDecodeReplicatedLargePointRead(b *testing.B) {
 func FuzzReplicatedNativeRequestCanonical(f *testing.F) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(f, fence)
-	var seed bytes.Buffer
-	if err := EncodeReplicatedRequest(&seed, &ReplicatedRequest{
-		Operation: ReplicatedPropose, Fence: fence, Command: command,
-	}); err != nil {
-		f.Fatal(err)
+	for _, request := range []*ReplicatedRequest{
+		{Operation: ReplicatedPropose, Fence: fence, Command: command},
+		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
+		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
+	} {
+		var seed bytes.Buffer
+		if err := EncodeReplicatedRequest(&seed, request); err != nil {
+			f.Fatal(err)
+		}
+		f.Add(seed.Bytes())
 	}
-	f.Add(seed.Bytes())
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 1<<20 {
 			return
@@ -310,17 +316,27 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 		CheckpointApplied: 7,
 	}
 	completion := testReplicatedCompletion(f, fence, 2)
-	var seed bytes.Buffer
-	if err := EncodeReplicatedResponse(&seed, &ReplicatedResponse{
-		Kind: ReplicatedCompletion, HasState: true, State: state,
-		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
-			AppliedIndex: 8, CompletionAppliedSequence: 2,
-			CompletionBytes: len(completion)},
-		Completion: completion,
-	}); err != nil {
-		f.Fatal(err)
+	for _, response := range []*ReplicatedResponse{
+		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
+				AppliedIndex: 8, CompletionAppliedSequence: 2,
+				CompletionBytes: len(completion)},
+			Completion: completion},
+		{Kind: ReplicatedReadFound, HasState: true, State: state,
+			ReadApplied: 8, Value: []byte{0, 1, 2}},
+		{Kind: ReplicatedReadMissing, HasState: true, State: state,
+			ReadApplied: 8},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state},
+	} {
+		var seed bytes.Buffer
+		if err := EncodeReplicatedResponse(&seed, response); err != nil {
+			f.Fatal(err)
+		}
+		f.Add(seed.Bytes())
 	}
-	f.Add(seed.Bytes())
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 1<<20 {
 			return

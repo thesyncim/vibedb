@@ -104,8 +104,11 @@ func (source *ownerTestReadSource) PointReadInto(
 	return source.result, source.err
 }
 
-func TestPointReadResponseBudgetSaturatesAcrossLiveLeases(t *testing.T) {
-	const maximum = 16
+func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testing.T) {
+	const (
+		maximum       = 3_366_913
+		allocatorSlop = (8 << 10) - 1
+	)
 	charge, ok := pointReadResponseCharge(maximum)
 	if !ok {
 		t.Fatal("response charge rejected")
@@ -130,7 +133,7 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveLeases(t *testing.T) {
 			RouteGeneration:        serving.Command.RouteGeneration,
 		}, RelationManifestDigest: serving.Command.RelationManifestDigest,
 			ReplicaSetVersion: serving.Command.ReplicaSetVersion, Applied: 9},
-		Found: true, Value: []byte{7},
+		Found: true, Value: make([]byte, maximum),
 	}}
 	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: 16,
@@ -147,8 +150,17 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveLeases(t *testing.T) {
 	request := PointReadRequest{Fence: serving, Relation: 1, Key: []byte("k"),
 		MinimumApplied: 9, MaxValueBytes: maximum}
 	result, lease, err := owner.ReadPoint(context.Background(), request)
-	if err != nil || !result.Found || lease == nil {
-		t.Fatalf("first result=%+v lease=%T err=%v", result, lease, err)
+	if err != nil || !result.Found || len(result.Value) != maximum || lease == nil {
+		t.Fatalf("first result found=%t bytes=%d lease=%T err=%v",
+			result.Found, len(result.Value), lease, err)
+	}
+	if cap(result.Value) != maximum {
+		t.Fatalf("first result capacity=%d want exact=%d", cap(result.Value), maximum)
+	}
+	retainedBound := int64(cap(result.Value)) + allocatorSlop + int64(maximum) +
+		pointReadEncodedFrameFixedBytes + allocatorSlop
+	if retainedBound != charge {
+		t.Fatalf("result plus rounded frame bound=%d charge=%d", retainedBound, charge)
 	}
 	if _, secondLease, err := owner.ReadPoint(context.Background(), request); !errors.Is(err, ErrPendingReadsFull) || secondLease != nil {
 		t.Fatalf("concurrent lease=%T err=%v", secondLease, err)
