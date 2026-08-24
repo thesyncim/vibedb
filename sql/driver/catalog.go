@@ -310,7 +310,7 @@ func openDatabaseWithShardStorePolicy(
 				absolute,
 			)
 		}
-		if err := vibejson.Unmarshal(raw, (*catalogFileVibe)(&d.catalog)); err != nil {
+		if err := decodeCatalogJSON(raw, (*catalogFileVibe)(&d.catalog)); err != nil {
 			return nil, fmt.Errorf("vibedb: read SQL catalog %s: %w", absolute, err)
 		}
 		if d.catalog.Version != catalogVersion || d.catalog.Tables == nil {

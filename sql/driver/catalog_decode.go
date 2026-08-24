@@ -21,7 +21,26 @@ type shardStoreFenceVibe ShardStoreFence
 const (
 	maxShardStoreIdentityJSONBytes = 256 << 10
 	maxShardStoreFenceJSONBytes    = 256
+	// The deepest canonical catalog value is currently six containers (root,
+	// tables, table metadata, schema, fields, field metadata). Two spare levels
+	// keep the bound explicit without coupling additions to that exact shape.
+	maxCatalogJSONDepth = 8
+	// Any decoded catalog map key is bounded by maxCatalogTableNameBytes.
+	// Six source bytes per decoded byte is JSON's worst escape expansion.
+	maxCatalogEncodedKeyBytes = 6 * maxCatalogTableNameBytes
 )
+
+var catalogVibeDecoder = func() vibejson.Decoder[catalogFileVibe] {
+	decoder, err := vibejson.CompileDecoder[catalogFileVibe](vibejson.DecoderOptions{
+		MaxDepth:      maxCatalogJSONDepth,
+		CaseSensitive: true,
+		Replace:       true,
+	})
+	if err != nil {
+		panic("driver: compile SQL catalog decoder: " + err.Error())
+	}
+	return decoder
+}()
 
 var (
 	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply")
@@ -173,14 +192,74 @@ func (c catalogFile) MarshalJSON() ([]byte, error) {
 }
 
 func (c *catalogFile) UnmarshalJSON(data []byte) error {
-	if len(data) > maxCatalogBytes {
-		return catalogSizeError(len(data))
-	}
 	var decoded catalogFileVibe
-	if err := vibejson.Unmarshal(data, &decoded); err != nil {
+	if err := decodeCatalogJSON(data, &decoded); err != nil {
 		return err
 	}
 	*c = catalogFile(decoded)
+	return nil
+}
+
+func decodeCatalogJSON(data []byte, dst *catalogFileVibe) error {
+	if len(data) > maxCatalogBytes {
+		return catalogSizeError(len(data))
+	}
+	if err := preflightCatalogJSON(data); err != nil {
+		return err
+	}
+	return catalogVibeDecoder.Decode(data, dst)
+}
+
+// preflightCatalogJSON is an allocation-free structural admission pass. The
+// compiled decoder remains the syntax authority; this pass exists so an
+// attacker cannot make it build a huge escaped-key arena or walk thousands of
+// nested containers before the catalog grammar rejects the value.
+func preflightCatalogJSON(data []byte) error {
+	var containers [maxCatalogJSONDepth]byte
+	var objectNeedsKey [maxCatalogJSONDepth]bool
+	depth := 0
+	for offset := 0; offset < len(data); offset++ {
+		switch data[offset] {
+		case '"':
+			key := depth != 0 && containers[depth-1] == '{' && objectNeedsKey[depth-1]
+			start := offset + 1
+			offset++
+			for ; offset < len(data); offset++ {
+				if key && offset-start > maxCatalogEncodedKeyBytes {
+					return errors.New("vibedb: SQL catalog member name exceeds its encoded byte bound")
+				}
+				if data[offset] == '\\' {
+					offset++
+					continue
+				}
+				if data[offset] == '"' {
+					break
+				}
+			}
+			if offset >= len(data) {
+				return errors.New("vibedb: SQL catalog contains an unterminated string")
+			}
+		case '{', '[':
+			if depth == maxCatalogJSONDepth {
+				return fmt.Errorf("vibedb: SQL catalog exceeds the maximum JSON depth of %d", maxCatalogJSONDepth)
+			}
+			containers[depth] = data[offset]
+			objectNeedsKey[depth] = data[offset] == '{'
+			depth++
+		case '}', ']':
+			if depth != 0 {
+				depth--
+			}
+		case ':':
+			if depth != 0 && containers[depth-1] == '{' {
+				objectNeedsKey[depth-1] = false
+			}
+		case ',':
+			if depth != 0 && containers[depth-1] == '{' {
+				objectNeedsKey[depth-1] = true
+			}
+		}
+	}
 	return nil
 }
 
@@ -444,15 +523,11 @@ func decodeCatalogTables(c *vibejson.DecodeCursor, dst *map[string]*tableMeta) e
 		if err := checkCatalogTableCount(len(decoded) + 1); err != nil {
 			return err
 		}
-		probe := *c
-		raw, err := probe.Raw()
+		null, err := c.Null()
 		if err != nil {
 			return err
 		}
-		if raw.IsNull() {
-			if _, err = c.Raw(); err != nil {
-				return err
-			}
+		if null {
 			decoded[strings.Clone(name)] = nil
 			continue
 		}
@@ -488,15 +563,11 @@ func decodeCatalogViews(c *vibejson.DecodeCursor, dst *map[string]*viewMeta) err
 		if err := checkCatalogViewCount(len(decoded) + 1); err != nil {
 			return err
 		}
-		probe := *c
-		raw, err := probe.Raw()
+		null, err := c.Null()
 		if err != nil {
 			return err
 		}
-		if raw.IsNull() {
-			if _, err = c.Raw(); err != nil {
-				return err
-			}
+		if null {
 			decoded[strings.Clone(name)] = nil
 			continue
 		}
