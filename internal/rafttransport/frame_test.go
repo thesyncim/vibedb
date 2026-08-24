@@ -31,6 +31,7 @@ func TestFrameCanonicalRoundTripRF2RF3(t *testing.T) {
 		pb.MsgHeartbeatResp,
 		pb.MsgPreVote,
 		pb.MsgPreVoteResp,
+		pb.MsgTimeoutNow,
 	}
 	for _, replicas := range []int{2, 3} {
 		group := testGroup(byte(40 + replicas))
@@ -38,6 +39,9 @@ func TestFrameCanonicalRoundTripRF2RF3(t *testing.T) {
 		for _, messageType := range types {
 			t.Run(messageType.String()+"/RF"+string(rune('0'+replicas)), func(t *testing.T) {
 				message := frameTestMessage(messageType, from, to)
+				if messageType == pb.MsgTimeoutNow {
+					message = frameTimeoutNow(from, to, 5)
+				}
 				prefix := []byte("preserved-prefix")
 				encoded, destination, err := sender.EncodeOutbound(
 					append([]byte(nil), prefix...),
@@ -99,6 +103,33 @@ func TestFrameGoldenHeartbeat(t *testing.T) {
 	const golden = "5644524600010100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000e189d5c58d02f5c295e58fc50c9e72272a3ed5fe4b6c03628814a0f57b73d63f000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
 	if got := hex.EncodeToString(frame); got != golden {
 		t.Fatalf("golden frame changed:\n got %s\nwant %s", got, golden)
+	}
+}
+
+func TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload(t *testing.T) {
+	group := testGroup(8)
+	sender, receiver, from, to := frameTestRegistries(t, 3, group)
+	frame := frameTestEncode(t, sender, group, frameTimeoutNow(from, to, 5))
+	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, testNode(2)), frame); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("wrong authenticated node = %v, want ErrUnauthorized", err)
+	}
+
+	payload := bytes.Clone(frame[FrameHeaderBytes:])
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "truncated", frame: bytes.Clone(frame[:len(frame)-1])},
+		{name: "trailing", frame: append(bytes.Clone(frame), 0)},
+		{name: "duplicate term", frame: frameTestReplaceRawPayload(frame, wireVarint(payload, 4, 5))},
+		{name: "unexpected index", frame: frameTestReplaceRawPayload(frame, wireVarint(payload, 6, 0))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), test.frame); !errors.Is(err, ErrInvalidFrame) {
+				t.Fatalf("error = %v, want ErrInvalidFrame", err)
+			}
+		})
 	}
 }
 
@@ -240,10 +271,14 @@ func TestStaticRoleTrafficMatrix(t *testing.T) {
 		{name: "learner app response to voter", messageType: pb.MsgAppResp, from: 11, to: 12},
 		{name: "voter heartbeat to learner", messageType: pb.MsgHeartbeat, from: 12, to: 11},
 		{name: "learner heartbeat response to voter", messageType: pb.MsgHeartbeatResp, from: 11, to: 12},
+		{name: "voter leader transfer to voter", messageType: pb.MsgTimeoutNow, from: 12, to: 13},
 	}
 	for _, test := range allowed {
 		t.Run("allows "+test.name, func(t *testing.T) {
 			message := frameTestMessage(test.messageType, test.from, test.to)
+			if test.messageType == pb.MsgTimeoutNow {
+				message = frameTimeoutNow(test.from, test.to, 5)
+			}
 			frame, _, err := registries[test.from].EncodeOutbound(nil, raftmember.OutboundMessage{
 				Group: group, From: test.from, To: test.to, Message: message,
 			})
@@ -271,10 +306,15 @@ func TestStaticRoleTrafficMatrix(t *testing.T) {
 		{name: "learner pre-vote response", messageType: pb.MsgPreVoteResp, from: 11, to: 12},
 		{name: "learner vote target", messageType: pb.MsgVote, from: 12, to: 11},
 		{name: "learner vote response target", messageType: pb.MsgVoteResp, from: 12, to: 11},
+		{name: "learner leader-transfer source", messageType: pb.MsgTimeoutNow, from: 11, to: 12},
+		{name: "learner leader-transfer target", messageType: pb.MsgTimeoutNow, from: 12, to: 11},
 	}
 	for _, test := range rejected {
 		t.Run("rejects "+test.name, func(t *testing.T) {
 			message := frameTestMessage(test.messageType, test.from, test.to)
+			if test.messageType == pb.MsgTimeoutNow {
+				message = frameTimeoutNow(test.from, test.to, 5)
+			}
 			_, _, err := registries[test.from].EncodeOutbound(nil, raftmember.OutboundMessage{
 				Group: group, From: test.from, To: test.to, Message: message,
 			})
@@ -694,6 +734,12 @@ func frameTestMessage(messageType pb.MessageType, from, to uint64) *pb.Message {
 		message.Context = []byte("ctx")
 	}
 	return message
+}
+
+func frameTimeoutNow(from, to, term uint64) *pb.Message {
+	return &pb.Message{
+		Type: pb.MsgTimeoutNow.Enum(), From: frameU64(from), To: frameU64(to), Term: frameU64(term),
+	}
 }
 
 func frameBaseMessage(messageType pb.MessageType, from, to uint64) *pb.Message {

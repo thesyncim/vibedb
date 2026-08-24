@@ -21,9 +21,14 @@ func TestPreflightAcceptsCanonicalOrdinaryPayloads(t *testing.T) {
 		pb.MsgHeartbeatResp,
 		pb.MsgPreVote,
 		pb.MsgPreVoteResp,
+		pb.MsgTimeoutNow,
 	} {
 		t.Run(messageType.String(), func(t *testing.T) {
-			payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(frameTestMessage(messageType, 12, 11))
+			message := frameTestMessage(messageType, 12, 11)
+			if messageType == pb.MsgTimeoutNow {
+				message = frameTimeoutNow(12, 11, 5)
+			}
+			payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(message)
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
@@ -31,6 +36,29 @@ func TestPreflightAcceptsCanonicalOrdinaryPayloads(t *testing.T) {
 				t.Fatalf("preflightOrdinaryPayload: %v", err)
 			}
 		})
+	}
+}
+
+func TestPreflightTimeoutNowRequiresExactCanonicalFields(t *testing.T) {
+	payload := wireVarint(nil, 1, uint64(pb.MsgTimeoutNow))
+	payload = wireVarint(payload, 2, 11)
+	payload = wireVarint(payload, 3, 12)
+	payload = wireVarint(payload, 4, 5)
+	if err := preflightOrdinaryPayload(payload); err != nil {
+		t.Fatalf("exact TimeoutNow: %v", err)
+	}
+	tests := [][]byte{
+		wireVarint(nil, 1, uint64(pb.MsgTimeoutNow)),
+		wireVarint(append([]byte(nil), payload...), 4, 5),
+		wireVarint(append([]byte(nil), payload...), 6, 0),
+		wireBytes(append([]byte(nil), payload...), 12, nil),
+		payload[:len(payload)-1],
+		append(append([]byte(nil), payload...), 0x80),
+	}
+	for index, malformed := range tests {
+		if err := preflightOrdinaryPayload(malformed); !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("case %d error = %v, want ErrInvalidFrame", index, err)
+		}
 	}
 }
 
