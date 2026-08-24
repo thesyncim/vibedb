@@ -69,7 +69,7 @@ func TestDecodedTransportMessageTransfersIntoHostWithoutSecondClone(t *testing.T
 	}
 }
 
-func TestDecodedLeaderTransferMessageReachesRF3Host(t *testing.T) {
+func TestDecodedLeaderTransferMessageReachesHostQueue(t *testing.T) {
 	host, err := NewHost(testHostLimits())
 	if err != nil {
 		t.Fatal(err)

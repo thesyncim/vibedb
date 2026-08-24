@@ -47,10 +47,15 @@ func TestPreflightTimeoutNowRequiresExactCanonicalFields(t *testing.T) {
 	if err := preflightOrdinaryPayload(payload); err != nil {
 		t.Fatalf("exact TimeoutNow: %v", err)
 	}
+	largeEntry := wireVarint(nil, 1, uint64(pb.EntryNormal))
+	largeEntry = wireVarint(largeEntry, 2, 5)
+	largeEntry = wireVarint(largeEntry, 3, 8)
+	largeEntry = wireBytes(largeEntry, 4, make([]byte, raftmodel.MaxProposalBytes))
 	tests := [][]byte{
 		wireVarint(nil, 1, uint64(pb.MsgTimeoutNow)),
 		wireVarint(append([]byte(nil), payload...), 4, 5),
 		wireVarint(append([]byte(nil), payload...), 6, 0),
+		wireBytes(append([]byte(nil), payload...), 7, largeEntry),
 		wireBytes(append([]byte(nil), payload...), 12, nil),
 		payload[:len(payload)-1],
 		append(append([]byte(nil), payload...), 0x80),

@@ -115,6 +115,7 @@ func TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload(t *testing.T) {
 	}
 
 	payload := bytes.Clone(frame[FrameHeaderBytes:])
+	largeEntry := wireBytes(nil, 4, make([]byte, raftmodel.MaxProposalBytes))
 	tests := []struct {
 		name  string
 		frame []byte
@@ -123,6 +124,7 @@ func TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload(t *testing.T) {
 		{name: "trailing", frame: append(bytes.Clone(frame), 0)},
 		{name: "duplicate term", frame: frameTestReplaceRawPayload(frame, wireVarint(payload, 4, 5))},
 		{name: "unexpected index", frame: frameTestReplaceRawPayload(frame, wireVarint(payload, 6, 0))},
+		{name: "unexpected large entry", frame: frameTestReplaceRawPayload(frame, wireBytes(payload, 7, largeEntry))},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

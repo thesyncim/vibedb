@@ -94,7 +94,7 @@ func preflightOrdinaryPayload(payload []byte) error {
 	}
 	if messageType == uint64(pb.MsgTimeoutNow) {
 		const timeoutNowFields = uint16(1<<1 | 1<<2 | 1<<3 | 1<<4)
-		if seen != timeoutNowFields || term == 0 {
+		if seen != timeoutNowFields || term == 0 || entryCount != 0 {
 			return fmt.Errorf("%w: malformed leader-transfer payload", ErrInvalidFrame)
 		}
 	}
