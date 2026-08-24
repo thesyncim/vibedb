@@ -1053,6 +1053,7 @@ func (a *ReplicatedApply) ApplyNormalBatch(
 	entries []raftmodel.NormalApply,
 	dataChainWitnesses [][32]byte,
 ) (int, raftmodel.Publication, error) {
+	clear(dataChainWitnesses[:min(len(entries), len(dataChainWitnesses))])
 	if a == nil || a.database == nil {
 		return 0, raftmodel.Publication{}, ErrReplicatedApplyClosed
 	}
@@ -1175,6 +1176,24 @@ func (a *ReplicatedApply) LookupCompletion(
 		return replicatedstate.CompletionLookup{}, err
 	}
 	return a.machine.LookupCompletion(data)
+}
+
+// DurabilityStats returns detached physical checkpoint-group counters for
+// apply batching and checkpoint observability. It exposes no storage handle or
+// serving authority.
+func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error) {
+	if a == nil || a.database == nil {
+		return durable.CheckpointGroupStats{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return durable.CheckpointGroupStats{}, err
+	}
+	if a.database.checkpointGroup == nil {
+		return durable.CheckpointGroupStats{}, ErrReplicatedApplyMismatch
+	}
+	return a.database.checkpointGroup.Stats(), nil
 }
 
 func replicatedApplyProfileDigest(

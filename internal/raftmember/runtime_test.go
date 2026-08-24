@@ -104,8 +104,9 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 	if send == nil {
 		send = func(OutboundMessage) error { return nil }
 	}
+	var workspace ReadyWorkspace
 	for step := 0; step < 10000; step++ {
-		result, err := runtime.DriveReady(send)
+		result, err := runtime.DriveReady(&workspace, send, settleTestApplied)
 		if err != nil {
 			t.Fatalf("DriveReady step %d: %v", step, err)
 		}
@@ -115,6 +116,8 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 	}
 	t.Fatal("Runtime Ready drain did not converge")
 }
+
+func settleTestApplied(AppliedBatch) error { return nil }
 
 func openRuntimeTestSession(
 	t testing.TB,
@@ -292,7 +295,7 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 		t.Fatalf("ProposeConfChange across proposal batch = %v", err)
 	}
 
-	captured, err := fixture.runtime.DriveReady(nil)
+	captured, err := fixture.runtime.DriveReady(new(ReadyWorkspace), nil, settleTestApplied)
 	if err != nil || captured.Kind != DriveCaptured {
 		t.Fatalf("DriveReady(capture) = %+v, %v", captured, err)
 	}
@@ -306,7 +309,7 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 	if !ok || progress.ReadyID != captured.ReadyID {
 		t.Fatalf("captured Ready progress = %+v, %t", progress, ok)
 	}
-	persisted, err := fixture.runtime.DriveReady(nil)
+	persisted, err := fixture.runtime.DriveReady(new(ReadyWorkspace), nil, settleTestApplied)
 	if err != nil || persisted.Kind != DrivePersisted || persisted.ReadyID != captured.ReadyID {
 		t.Fatalf("DriveReady(persist) = %+v, %v; capture=%+v", persisted, err, captured)
 	}
@@ -570,7 +573,9 @@ func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
 	context[0] = 'X'
 	var outcomes []raftmodel.ReadOutcome
 	for step := 0; step < 1000; step++ {
-		result, driveErr := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		result, driveErr := fixture.runtime.DriveReady(
+			new(ReadyWorkspace), func(OutboundMessage) error { return nil }, settleTestApplied,
+		)
 		if driveErr != nil {
 			t.Fatalf("DriveReady step %d: %v", step, driveErr)
 		}
@@ -605,7 +610,7 @@ func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 	failedOnce := false
 	persisted := false
 	for step := 0; step < 1000; step++ {
-		result, err := fixture.runtime.DriveReady(func(outbound OutboundMessage) error {
+		result, err := fixture.runtime.DriveReady(new(ReadyWorkspace), func(outbound OutboundMessage) error {
 			if !persisted {
 				t.Fatal("outbound callback ran before the Ready persistence phase")
 			}
@@ -618,7 +623,7 @@ func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 				t.Fatalf("retried message changed: first=%v retry=%v", first, outbound.Message)
 			}
 			return nil
-		})
+		}, settleTestApplied)
 		if errors.Is(err, retryErr) {
 			continue
 		}
@@ -686,7 +691,9 @@ func TestRuntimeTerminalWALCapacityFailureLatches(t *testing.T) {
 	}
 	var outcomes []raftmodel.ReadOutcome
 	for step := 0; step < 1000; step++ {
-		result, err := fixture.runtime.DriveReady(func(OutboundMessage) error { return nil })
+		result, err := fixture.runtime.DriveReady(
+			new(ReadyWorkspace), func(OutboundMessage) error { return nil }, settleTestApplied,
+		)
 		if err != nil {
 			t.Fatalf("ReadIndex DriveReady step %d: %v", step, err)
 		}

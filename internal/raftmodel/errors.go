@@ -21,6 +21,12 @@ var (
 	// ErrReadyPending identifies protocol input refused because RawNode already
 	// exposes Ready work that must be captured and advanced first.
 	ErrReadyPending = errors.New("raftmodel: Ready work pending capture")
+	// ErrAppliedSettlementRequired reports use of a legacy apply operation that
+	// cannot expose a normal-entry range for result settlement.
+	ErrAppliedSettlementRequired = errors.New("raftmodel: applied result settlement is required")
+	// ErrAppliedSettlementPending identifies a published normal-entry range
+	// whose deterministic results have not yet been acknowledged by the driver.
+	ErrAppliedSettlementPending = errors.New("raftmodel: applied result settlement pending")
 	// ErrConfChangePending identifies configuration admission while the core has
 	// outstanding Ready/log work whose predecessor is not yet fully applied.
 	ErrConfChangePending = errors.New("raftmodel: configuration change pending")

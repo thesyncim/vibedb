@@ -11,6 +11,7 @@ import (
 
 func driveReplicatedStateNode(t testing.TB, node *raftmodel.Node) {
 	t.Helper()
+	var workspace raftmodel.NormalApplyBatchWorkspace
 	for {
 		has, err := node.HasReady()
 		if err != nil {
@@ -32,7 +33,9 @@ func driveReplicatedStateNode(t testing.TB, node *raftmodel.Node) {
 		if err := node.InstallSnapshot(); err != nil {
 			t.Fatalf("InstallSnapshot: %v", err)
 		}
-		if err := node.ApplyCommitted(); err != nil {
+		if err := node.ApplyCommitted(
+			&workspace, func(raftmodel.AppliedNormalBatch) error { return nil },
+		); err != nil {
 			t.Fatalf("ApplyCommitted: %v", err)
 		}
 		if _, err := node.RecordReadStates(); err != nil {

@@ -159,7 +159,8 @@ and a 32-byte SHA-256 checksum. Its canonical fields are:
 | 8 | 2 | Format sentinel `0` |
 | 10 | 2 | Header bytes (`168`) |
 | 12 | 2 | Fixed-member count (`1..60`) |
-| 14 | 2 | Required zero reserved bytes |
+| 14 | 1 | Maximum logical apply span, with encoded zero meaning effective span one |
+| 15 | 1 | Required zero reserved byte |
 | 16 | 8 | Certificate sequence |
 | 24 | 8 | Raft applied index |
 | 32 | 8 | Transaction high-water |
@@ -170,6 +171,32 @@ and a 32-byte SHA-256 checksum. Its canonical fields are:
 | 80 | 32 | Seed state-envelope commitment, or zero |
 | 112 | 32 | Seed-member logical-name digest, or zero |
 | 144 | 24 | Truncated membership digest |
+
+The member bank begins at byte 168. At the maximum 60 members it ends at byte
+4008. Bytes 4008 through 4039 are required zero padding. The final
+authenticated tail before the checksum is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 4040 | 8 | Maximum-span witness transaction |
+| 4048 | 8 | Maximum-span witness first applied index |
+| 4056 | 8 | Maximum-span witness last applied index |
+| 4064 | 32 | Slot checksum |
+
+Encoded maximum span zero is the sole canonical representation of effective
+span one and requires all three witness fields to be zero. Encoded one is
+noncanonical. Values 2 through 128 require an exact nonzero witness tuple. Its
+inclusive first and last range has exactly the encoded length, its transaction
+does not exceed the transaction high-water, and its last index does not exceed
+the applied cut. Larger values are corruption.
+
+Across adjacent authenticated slots, an unchanged maximum span requires the
+witness tuple to remain identical. A widened maximum requires the witness
+transaction to be newer than the previous transaction high-water and no newer
+than the selected high-water. Its first index must be newer than the previous
+applied cut and its last index must not exceed the selected applied cut. These
+rules prove that a newly advertised maximum came from one exact consecutive
+transaction rather than from an accumulation of singleton transactions.
 
 Each member record binds the SHA-256 logical-name digest, store ID, and
 recovery-journal ID. The checksum is SHA-256 over the domain

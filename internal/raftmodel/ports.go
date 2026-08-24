@@ -70,6 +70,74 @@ type NormalApply struct {
 	Data []byte
 }
 
+// NormalApplyBatchWorkspace is zero-value scratch for one bounded committed
+// normal-entry apply. A serialized scheduler lane should reuse one workspace
+// across all of its Nodes so the fixed arrays do not scale with group count.
+// It must not be shared by concurrent calls.
+type NormalApplyBatchWorkspace struct {
+	entries   [MaxNormalApplyBatchEntries]NormalApply
+	witnesses [MaxNormalApplyBatchEntries][32]byte
+}
+
+// AppliedNormalBatch identifies one atomically published normal-entry range.
+// Its entry data and final ConfState borrow Node-owned storage. They remain
+// valid until the range is settled and the next Node lifecycle call begins.
+// Callers must not mutate or retain borrowed values.
+type AppliedNormalBatch struct {
+	owner       *Node
+	readyID     uint64
+	entries     []*pb.Entry
+	publication Publication
+}
+
+// Len returns the exact number of atomically published normal entries.
+func (batch AppliedNormalBatch) Len() int { return len(batch.entries) }
+
+// ReadyID identifies the Ready containing this applied range.
+func (batch AppliedNormalBatch) ReadyID() uint64 { return batch.readyID }
+
+// Entry returns one borrowed logical normal apply.
+func (batch AppliedNormalBatch) Entry(index int) (NormalApply, bool) {
+	if index < 0 || index >= len(batch.entries) || batch.entries[index] == nil {
+		return NormalApply{}, false
+	}
+	entry := batch.entries[index]
+	return NormalApply{
+		Meta: ApplyMeta{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType()},
+		Data: entry.GetData(),
+	}, true
+}
+
+// FirstIndex returns the first applied index, or zero for an empty value.
+func (batch AppliedNormalBatch) FirstIndex() uint64 {
+	entry, ok := batch.Entry(0)
+	if !ok {
+		return 0
+	}
+	return entry.Meta.Index
+}
+
+// LastIndex returns the final applied index, or zero for an empty value.
+func (batch AppliedNormalBatch) LastIndex() uint64 {
+	entry, ok := batch.Entry(len(batch.entries) - 1)
+	if !ok {
+		return 0
+	}
+	return entry.Meta.Index
+}
+
+// FinalPublication returns the sole reader-visible publication for the range.
+// Its ConfState is borrowed and immutable.
+func (batch AppliedNormalBatch) FinalPublication() Publication { return batch.publication }
+
+// ApplyBatchResult reports one bounded committed-entry apply operation. Applied
+// counts all consumed entries. Normal is nonempty only when the consumed range
+// contains normal entries whose results require settlement.
+type ApplyBatchResult struct {
+	Applied int
+	Normal  AppliedNormalBatch
+}
+
 // Publication is the state visible to readers after an apply operation
 // returns. ConfState is owned by the StateMachine and must be treated as
 // immutable by callers.

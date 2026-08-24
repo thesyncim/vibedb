@@ -490,6 +490,7 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 	value := []byte(`{"n":1}`)
 	var exerciseErr error
 	var retained uint64
+	var shape [8]int
 	exercise := func() {
 		workspace := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 		workspace.system.reset(nil)
@@ -526,6 +527,12 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 		}
 		workspace.state = append(workspace.state[:0], value...)
 		workspace.keys = workspace.attempted.appendAttempted(workspace.keys[:0])
+		shape = [8]int{
+			cap(workspace.system.entries), cap(workspace.system.slots),
+			cap(workspace.system.order), cap(workspace.system.undo),
+			cap(workspace.user.entries), cap(workspace.user.slots),
+			cap(workspace.attempted.entries), cap(workspace.attempted.slots),
+		}
 		retained = workspace.release()
 		normalBatchWorkspacePool.Put(workspace)
 	}
@@ -537,7 +544,7 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 	assertNormalBatchWorkspaceReleased(t, workspace)
 	normalBatchWorkspacePool.Put(workspace)
 	if allocations := testing.AllocsPerRun(100, exercise); allocations != 0 {
-		t.Fatalf("warm 128-command workspace allocations = %.2f", allocations)
+		t.Fatalf("warm 128-command workspace allocations = %.2f shape=%v", allocations, shape)
 	}
 	if exerciseErr != nil {
 		t.Fatal(exerciseErr)
@@ -628,6 +635,21 @@ func TestLogicalOverlayDropsColdStructuralChurn(t *testing.T) {
 	if overlay.entries != nil || overlay.slots != nil || overlay.order != nil ||
 		overlay.undo != nil {
 		t.Fatalf("cold structural scratch retained: entries %d slots %d order %d undo %d",
+			cap(overlay.entries), cap(overlay.slots), cap(overlay.order), cap(overlay.undo))
+	}
+}
+
+func TestLogicalOverlayDropsColdBackingCapacityAfterLogicalTruncation(t *testing.T) {
+	overlay := logicalOverlay{
+		entries: make([]logicalOverlayEntry, 1, maxNormalBatchRetainedOverlayEntries+1),
+		slots:   make([]uint32, 1, maxNormalBatchRetainedOverlaySlots+1),
+		order:   make([]int, 1, maxNormalBatchRetainedOverlayEntries+1),
+		undo:    make([]logicalOverlayUndo, 1, maxNormalBatchRetainedOverlayEntries+1),
+	}
+	overlay.release()
+	if overlay.entries != nil || overlay.slots != nil || overlay.order != nil ||
+		overlay.undo != nil {
+		t.Fatalf("cold truncated capacity retained: entries %d slots %d order %d undo %d",
 			cap(overlay.entries), cap(overlay.slots), cap(overlay.order), cap(overlay.undo))
 	}
 }

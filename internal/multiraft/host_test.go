@@ -1,9 +1,11 @@
 package multiraft
 
 import (
+	"encoding/binary"
 	"errors"
 	"slices"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -38,6 +40,8 @@ type fakeRuntime struct {
 	closeErrs           []error
 	closeCalls          int
 	driveCalls          int
+	readyWorkspace      *raftmember.ReadyWorkspace
+	settlementSink      bool
 }
 
 func newFakeRuntime(seed byte) *fakeRuntime {
@@ -117,9 +121,13 @@ func (runtime *fakeRuntime) Campaign() error {
 }
 
 func (runtime *fakeRuntime) DriveReady(
+	workspace *raftmember.ReadyWorkspace,
 	send func(raftmember.OutboundMessage) error,
+	settle raftmember.ResultSettlementSink,
 ) (raftmember.DriveResult, error) {
 	runtime.driveCalls++
+	runtime.readyWorkspace = workspace
+	runtime.settlementSink = settle != nil
 	if len(runtime.ready) == 0 {
 		return raftmember.DriveResult{}, nil
 	}
@@ -144,6 +152,40 @@ func (runtime *fakeRuntime) DriveReady(
 	return raftmember.DriveResult{
 		Kind: step.kind, ReadyID: 1, ReadOutcomes: step.readOutcomes,
 	}, nil
+}
+
+func TestHostUsesOneReadyWorkspaceAndExplicitSettlementSinkAtMaximumDensity(t *testing.T) {
+	limits := testHostLimits()
+	limits.MaxGroups = AbsoluteMaxGroups
+	host, err := NewHost(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimes := make([]*fakeRuntime, AbsoluteMaxGroups)
+	for index := range runtimes {
+		runtime := newFakeRuntime(byte(index))
+		binary.LittleEndian.PutUint64(runtime.identity.Group.GroupID[:8], uint64(index+1))
+		runtime.identity.MemberID = uint64(index + 1)
+		runtimes[index] = runtime
+		if err := host.addRuntime(runtime); err != nil {
+			t.Fatalf("add group %d = %v", index, err)
+		}
+	}
+	if progress, done, err := host.RunOne(); err != nil || done ||
+		progress.Kind != ProgressNone || progress.Group != (raftmember.GroupKey{}) ||
+		progress.ReadOutcomes != nil {
+		t.Fatalf("idle maximum-density run = %+v, %v, %v", progress, done, err)
+	}
+	for index, runtime := range runtimes {
+		if runtime.driveCalls != 1 || runtime.readyWorkspace != &host.ready ||
+			!runtime.settlementSink {
+			t.Fatalf("group %d lane = calls %d workspace %p want %p sink %v",
+				index, runtime.driveCalls, runtime.readyWorkspace, &host.ready,
+				runtime.settlementSink)
+		}
+	}
+	t.Logf("ReadyWorkspace=%dB Host=%dB groups=%d",
+		unsafe.Sizeof(raftmember.ReadyWorkspace{}), unsafe.Sizeof(Host{}), len(runtimes))
 }
 
 func (runtime *fakeRuntime) Close() error {

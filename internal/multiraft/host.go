@@ -83,6 +83,9 @@ type Progress struct {
 	ReadyKind     raftmember.DriveKind
 	ProposalCount int
 	ProposalBytes int64
+	AppliedCount  int
+	AppliedFirst  uint64
+	AppliedLast   uint64
 	ReadOutcomes  []raftmodel.ReadOutcome
 }
 
@@ -100,7 +103,11 @@ type memberRuntime interface {
 	StepMessage(*pb.Message) error
 	Tick() error
 	Campaign() error
-	DriveReady(func(raftmember.OutboundMessage) error) (raftmember.DriveResult, error)
+	DriveReady(
+		*raftmember.ReadyWorkspace,
+		func(raftmember.OutboundMessage) error,
+		raftmember.ResultSettlementSink,
+	) (raftmember.DriveResult, error)
 	Close() error
 }
 
@@ -303,6 +310,7 @@ type Host struct {
 	queueBytes  int64
 	outbox      outboundQueue
 	outboxBytes int64
+	ready       raftmember.ReadyWorkspace
 	closed      bool
 }
 
@@ -725,9 +733,13 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
 			continue
 		}
-		ready, err := group.runtime.DriveReady(func(outbound raftmember.OutboundMessage) error {
-			return host.enqueueOutbound(group, outbound)
-		})
+		ready, err := group.runtime.DriveReady(
+			&host.ready,
+			func(outbound raftmember.OutboundMessage) error {
+				return host.enqueueOutbound(group, outbound)
+			},
+			settleNoLocalWaiters,
+		)
 		if err != nil {
 			if errors.Is(err, ErrOutboxFull) {
 				blockedOutbox = true
@@ -753,6 +765,8 @@ func (host *Host) RunOne() (Progress, bool, error) {
 			host.wake(group)
 			return Progress{
 				Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind,
+				AppliedCount: ready.Applied.Len(), AppliedFirst: ready.Applied.FirstIndex(),
+				AppliedLast:  ready.Applied.LastIndex(),
 				ReadOutcomes: ready.ReadOutcomes,
 			}, true, nil
 		}
@@ -774,6 +788,25 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		return Progress{}, false, ErrOutboxFull
 	}
 	return Progress{}, false, nil
+}
+
+// settleNoLocalWaiters is the Host's explicit settlement sink while this
+// package remains non-serving. Host exposes no API that can register a local
+// command waiter, so validating and acknowledging the whole applied range is
+// sufficient. A serving layer must replace this sink with its waiter registry.
+func settleNoLocalWaiters(batch raftmember.AppliedBatch) error {
+	if batch.Len() <= 0 || batch.FirstIndex() == 0 ||
+		batch.LastIndex() < batch.FirstIndex() ||
+		batch.FinalPublication().Applied != batch.LastIndex() {
+		return errors.New("multiraft: invalid applied result range")
+	}
+	for index := 0; index < batch.Len(); index++ {
+		entry, ok := batch.Entry(index)
+		if !ok || entry.Meta.Index != batch.FirstIndex()+uint64(index) {
+			return errors.New("multiraft: invalid applied result entry")
+		}
+	}
+	return nil
 }
 
 func (host *Host) purgeGroup(group *groupState) {

@@ -26,6 +26,37 @@ func (n *Node) acceptNormalPublication(meta ApplyMeta, noop bool, returned Publi
 	return nil
 }
 
+func (n *Node) acceptNormalBatchPublication(
+	entries []NormalApply,
+	witnesses [][32]byte,
+	applied int,
+	returned Publication,
+) error {
+	previous := n.published
+	final := entries[applied-1].Meta
+	if err := n.validateObservedPublication(final.Index, returned); err != nil {
+		return err
+	}
+	if !proto.Equal(returned.ConfState, previous.ConfState) {
+		return errors.New("normal batch changed ConfState")
+	}
+	if returned.ReplicaSetVersion != previous.ReplicaSetVersion {
+		return errors.New("normal batch changed ReplicaSetVersion")
+	}
+	if err := validateNormalBatchDataChainWitnesses(
+		previous.DataChainDigest, entries, applied, witnesses, returned,
+	); err != nil {
+		return err
+	}
+	for index := applied; index < len(entries); index++ {
+		if witnesses[index] != ([32]byte{}) {
+			return fmt.Errorf("normal-batch unselected witness %d is nonzero", index)
+		}
+	}
+	n.published = clonePublication(returned)
+	return nil
+}
+
 func (n *Node) acceptConfigurationPublication(meta ApplyMeta, state *pb.ConfState, returned Publication) error {
 	previous := n.published
 	if err := n.validateObservedPublication(meta.Index, returned); err != nil {

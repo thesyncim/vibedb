@@ -1819,6 +1819,67 @@ func TestReplicatedApplyNormalBatchPublishesNetNoopConflictUnion(t *testing.T) {
 	}
 }
 
+func TestReplicatedApplyNormalBatchClearsWitnessesOnEveryWrapperEarlyReturn(t *testing.T) {
+	entries := []raftmodel.NormalApply{{}, {}}
+	assertCleared := func(t *testing.T, claim *ReplicatedApply) {
+		t.Helper()
+		witnesses := [][32]byte{{1}, {2}, {3}}
+		applied, publication, err := claim.ApplyNormalBatch(entries, witnesses)
+		if err == nil || applied != 0 || publication != (raftmodel.Publication{}) {
+			t.Fatalf("early ApplyNormalBatch = %d, %+v, %v", applied, publication, err)
+		}
+		if witnesses[0] != ([32]byte{}) || witnesses[1] != ([32]byte{}) ||
+			witnesses[2] != ([32]byte{3}) {
+			t.Fatalf("early witnesses = %x %x %x", witnesses[0], witnesses[1], witnesses[2])
+		}
+	}
+
+	t.Run("nil", func(t *testing.T) {
+		assertCleared(t, (*ReplicatedApply)(nil))
+	})
+	t.Run("missing-database", func(t *testing.T) {
+		assertCleared(t, &ReplicatedApply{})
+	})
+
+	core := &database{}
+	claim := &ReplicatedApply{database: core, machine: new(replicatedstate.Machine)}
+	core.replicatedApplyClaim = claim
+	t.Run("locked-check", func(t *testing.T) {
+		claim.closed = true
+		defer func() { claim.closed = false }()
+		assertCleared(t, claim)
+	})
+	t.Run("claim-mismatch", func(t *testing.T) {
+		core.mu.Lock()
+		owner := core.replicatedApplyClaim
+		core.replicatedApplyClaim = nil
+		core.mu.Unlock()
+		defer func() {
+			core.mu.Lock()
+			core.replicatedApplyClaim = owner
+			core.mu.Unlock()
+		}()
+		assertCleared(t, claim)
+	})
+	t.Run("nil-machine", func(t *testing.T) {
+		core.mu.Lock()
+		machine := claim.machine
+		claim.machine = nil
+		core.mu.Unlock()
+		defer func() {
+			core.mu.Lock()
+			claim.machine = machine
+			core.mu.Unlock()
+		}()
+		assertCleared(t, claim)
+	})
+	t.Run("activation-base", func(t *testing.T) {
+		claim.activationBasePending[0] = 1
+		defer func() { claim.activationBasePending = [sha256.Size]byte{} }()
+		assertCleared(t, claim)
+	})
+}
+
 func TestReplicatedApplyRetainsHiddenIncompleteClose(t *testing.T) {
 	_, database, base := bindReplicatedApplyTestRoot(t, "hidden-close")
 	claim, _, err := database.OpenReplicatedApply(

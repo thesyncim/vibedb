@@ -23,6 +23,18 @@ var (
 	// ErrRuntimeOwnership reports a WAL, database, or apply claim that cannot be
 	// transferred into one exclusive Runtime owner.
 	ErrRuntimeOwnership = errors.New("raftmember: runtime ownership mismatch")
+	// ErrResultSettlementRequired reports a result-bearing apply that cannot
+	// begin because no synchronous settlement sink was provided.
+	ErrResultSettlementRequired = errors.New("raftmember: applied result settlement sink is required")
+	// ErrResultSettlementPending reports a published applied range whose result
+	// sink has not yet acknowledged every entry.
+	ErrResultSettlementPending = errors.New("raftmember: applied result settlement is pending")
+	// ErrResultSettlementRejected marks a retryable settlement sink failure. The
+	// Runtime retains the exact applied range and performs no later Node work.
+	ErrResultSettlementRejected = errors.New("raftmember: applied result settlement rejected")
+	// ErrReadyWorkspaceRequired reports a result-bearing apply that cannot begin
+	// without the caller-owned bounded batch workspace.
+	ErrReadyWorkspaceRequired = errors.New("raftmember: Ready workspace is required")
 	// errOutboundRejected marks an error returned by the caller's Ready message
 	// sink. Only this class is retryable at the same message position.
 	errOutboundRejected = errors.New("raftmember: outbound sink rejected message")
@@ -58,6 +70,69 @@ type OutboundMessage struct {
 	Message *pb.Message
 }
 
+// ReadyWorkspace is zero-value scratch for one serialized DriveReady lane. A
+// scheduler should reuse one workspace across all of its Runtime groups.
+type ReadyWorkspace struct {
+	normal raftmodel.NormalApplyBatchWorkspace
+}
+
+// AppliedBatch is the exact atomically published normal-entry range offered to
+// a settlement sink. Entry data and the final ConfState are borrowed until the
+// next DriveReady call. A sink must not mutate or retain borrowed values.
+type AppliedBatch struct {
+	normal raftmodel.AppliedNormalBatch
+	apply  *sqldriver.ReplicatedApply
+}
+
+// Len returns the number of applied normal entries awaiting settlement.
+func (batch AppliedBatch) Len() int { return batch.normal.Len() }
+
+// ReadyID identifies the Ready containing the applied range.
+func (batch AppliedBatch) ReadyID() uint64 { return batch.normal.ReadyID() }
+
+// FirstIndex returns the first applied index, or zero for an empty value.
+func (batch AppliedBatch) FirstIndex() uint64 { return batch.normal.FirstIndex() }
+
+// LastIndex returns the final applied index, or zero for an empty value.
+func (batch AppliedBatch) LastIndex() uint64 { return batch.normal.LastIndex() }
+
+// Entry returns one borrowed normal-entry input.
+func (batch AppliedBatch) Entry(index int) (raftmodel.NormalApply, bool) {
+	return batch.normal.Entry(index)
+}
+
+// FinalPublication returns the sole reader-visible publication for the range.
+// Its ConfState is borrowed and immutable.
+func (batch AppliedBatch) FinalPublication() raftmodel.Publication {
+	return batch.normal.FinalPublication()
+}
+
+// LookupCompletion resolves the owned deterministic completion for one
+// nonempty command. hasCommand is false for an empty Raft no-op. The lookup is
+// intentionally performed only when a serving settlement sink needs it.
+func (batch AppliedBatch) LookupCompletion(
+	index int,
+) (lookup replicatedstate.CompletionLookup, hasCommand bool, err error) {
+	entry, ok := batch.normal.Entry(index)
+	if !ok {
+		return replicatedstate.CompletionLookup{}, false, errors.New("raftmember: applied result index out of range")
+	}
+	if len(entry.Data) == 0 {
+		return replicatedstate.CompletionLookup{}, false, nil
+	}
+	if batch.apply == nil {
+		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
+	}
+	lookup, err = batch.apply.LookupCompletion(entry.Data)
+	return lookup, true, err
+}
+
+// ResultSettlementSink runs synchronously after apply publication and before
+// read-state release or Ready advancement. A failure may be outcome-unknown and
+// retries the identical ReadyID and range, so sinks must be idempotent. A sink
+// must not retain borrowed values or re-enter the Runtime.
+type ResultSettlementSink func(AppliedBatch) error
+
 // DriveKind identifies the single Ready lifecycle operation performed by one
 // DriveReady call. DriveIdle means no Ready was available and no work occurred.
 type DriveKind uint8
@@ -70,6 +145,7 @@ const (
 	DriveMessagesFinished
 	DriveSnapshotFinished
 	DriveEntry
+	DriveNormalBatch
 	DriveEntriesFinished
 	DriveReadState
 	DriveReadStatesFinished
@@ -83,6 +159,7 @@ type DriveResult struct {
 	Kind         DriveKind
 	ReadyID      uint64
 	ReadOutcomes []raftmodel.ReadOutcome
+	Applied      AppliedBatch
 }
 
 // RuntimeStatus is a detached allocation-free control-plane view. It is
@@ -243,8 +320,18 @@ func (runtime *Runtime) fail(cause error) error {
 	return runtime.failure
 }
 
-func (runtime *Runtime) requireEmptyInputWindow() error {
+func (runtime *Runtime) checkNoPendingSettlement() error {
 	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if _, pending := runtime.pendingAppliedResults(); pending {
+		return ErrResultSettlementPending
+	}
+	return nil
+}
+
+func (runtime *Runtime) requireEmptyInputWindow() error {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
 		return err
 	}
 	if runtime.node.Phase() != raftmodel.PhaseIdle {
@@ -351,7 +438,7 @@ func (runtime *Runtime) Publication() (raftmodel.Publication, error) {
 // learner installation; callers do not receive collection handles or serving
 // authority.
 func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
-	if err := runtime.checkUsable(); err != nil {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
 		return replicatedstate.State{}, err
 	}
 	cut, err := runtime.apply.SnapshotArtifactCut()
@@ -385,7 +472,7 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 // compactor must additionally prove the exact term, configuration, member
 // lineage, certificate witness, and retained suffix before deleting anything.
 func (runtime *Runtime) WALRetentionInput() (uint64, error) {
-	if err := runtime.checkUsable(); err != nil {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
 		return 0, err
 	}
 	checkpoint := runtime.apply.CheckpointAppliedIndex()
@@ -472,11 +559,19 @@ func (runtime *Runtime) Campaign() error {
 // DriveReady performs at most one explicit Ready lifecycle operation. Message
 // callbacks run only after the Ready's stable-storage boundary. A callback
 // error leaves the exact message position unchanged for explicit retry.
+// Result settlement runs synchronously after a normal apply publishes and
+// before this Ready can release read states or advance. A settlement failure
+// retries the identical ReadyID and range on the next call.
 func (runtime *Runtime) DriveReady(
+	workspace *ReadyWorkspace,
 	send func(OutboundMessage) error,
+	settle ResultSettlementSink,
 ) (DriveResult, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return DriveResult{}, err
+	}
+	if _, pending := runtime.pendingAppliedResults(); pending {
+		return runtime.settleAppliedResults(settle)
 	}
 	switch runtime.node.Phase() {
 	case raftmodel.PhaseIdle:
@@ -562,13 +657,30 @@ func (runtime *Runtime) DriveReady(
 
 	case raftmodel.PhaseSnapshotInstalled:
 		readyID := runtime.node.ReadyID()
-		_, applied, err := runtime.node.ApplyNext()
+		requiresSettlement, err := runtime.node.NextApplyRequiresResultSettlement()
+		if err != nil {
+			return DriveResult{}, runtime.fail(err)
+		}
+		if requiresSettlement && settle == nil {
+			return DriveResult{}, ErrResultSettlementRequired
+		}
+		if requiresSettlement && workspace == nil {
+			return DriveResult{}, ErrReadyWorkspaceRequired
+		}
+		var normalWorkspace *raftmodel.NormalApplyBatchWorkspace
+		if workspace != nil {
+			normalWorkspace = &workspace.normal
+		}
+		appliedResult, err := runtime.node.ApplyNextBatch(normalWorkspace)
 		if err != nil {
 			return DriveResult{}, runtime.fail(err)
 		}
 		kind := DriveEntriesFinished
-		if applied {
+		if appliedResult.Applied != 0 {
 			kind = DriveEntry
+		}
+		if appliedResult.Normal.Len() != 0 {
+			return runtime.settleAppliedResults(settle)
 		}
 		return DriveResult{Kind: kind, ReadyID: readyID}, nil
 
@@ -608,6 +720,38 @@ func (runtime *Runtime) DriveReady(
 	default:
 		return DriveResult{}, runtime.fail(fmt.Errorf("unknown Ready phase %d", runtime.node.Phase()))
 	}
+}
+
+func (runtime *Runtime) settleAppliedResults(
+	settle ResultSettlementSink,
+) (DriveResult, error) {
+	batch, pending := runtime.pendingAppliedResults()
+	if !pending {
+		return DriveResult{}, runtime.fail(errors.New("settlement called without a pending applied range"))
+	}
+	if settle == nil {
+		return DriveResult{}, ErrResultSettlementRequired
+	}
+	if err := settle(batch); err != nil {
+		return DriveResult{}, errors.Join(ErrResultSettlementRejected, err)
+	}
+	if err := runtime.node.SettleAppliedNormalBatch(batch.normal); err != nil {
+		return DriveResult{}, runtime.fail(err)
+	}
+	return DriveResult{
+		Kind: DriveNormalBatch, ReadyID: batch.ReadyID(), Applied: batch,
+	}, nil
+}
+
+func (runtime *Runtime) pendingAppliedResults() (AppliedBatch, bool) {
+	if runtime == nil || runtime.node == nil {
+		return AppliedBatch{}, false
+	}
+	normal, pending := runtime.node.PendingAppliedNormalBatch()
+	if !pending {
+		return AppliedBatch{}, false
+	}
+	return AppliedBatch{normal: normal, apply: runtime.apply}, true
 }
 
 func deterministicPersistFailure(err error) bool {
@@ -724,6 +868,9 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 func (runtime *Runtime) Close() error {
 	if runtime == nil || runtime.closed {
 		return nil
+	}
+	if _, pending := runtime.pendingAppliedResults(); pending {
+		return ErrResultSettlementPending
 	}
 	runtime.stopping = true
 	runtime.node = nil

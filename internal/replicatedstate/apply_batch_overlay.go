@@ -19,7 +19,10 @@ const (
 	// hostile run can churn thousands of logical keys back to their base values.
 	// Retain enough for ordinary warmed batches, but do not permanently charge a
 	// shard for a one-off maximum command run.
-	maxNormalBatchRetainedOverlayEntries = 2*raftmodel.MaxNormalApplyBatchEntries + 1
+	// The logical bound is 2*MaxNormalApplyBatchEntries+1. Go's slice growth
+	// rounds that ordinary 257-entry system shape to a 512-entry backing array,
+	// so the retention gate is expressed in capacity classes.
+	maxNormalBatchRetainedOverlayEntries = 4 * raftmodel.MaxNormalApplyBatchEntries
 	maxNormalBatchRetainedOverlaySlots   = 4 * raftmodel.MaxNormalApplyBatchEntries
 )
 
@@ -98,10 +101,10 @@ func (o *logicalOverlay) reset(base *durable.Snapshot) {
 }
 
 func (o *logicalOverlay) release() {
-	coldEntries := len(o.entries) > maxNormalBatchRetainedOverlayEntries
-	coldSlots := len(o.slots) > maxNormalBatchRetainedOverlaySlots
-	coldOrder := len(o.order) > maxNormalBatchRetainedOverlayEntries
-	coldUndo := len(o.undo) > maxNormalBatchRetainedOverlayEntries
+	coldEntries := cap(o.entries) > maxNormalBatchRetainedOverlayEntries
+	coldSlots := cap(o.slots) > maxNormalBatchRetainedOverlaySlots
+	coldOrder := cap(o.order) > maxNormalBatchRetainedOverlayEntries
+	coldUndo := cap(o.undo) > maxNormalBatchRetainedOverlayEntries
 	o.reset(nil)
 	if coldEntries {
 		o.entries = nil
