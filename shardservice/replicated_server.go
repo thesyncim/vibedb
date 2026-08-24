@@ -102,18 +102,21 @@ func NewReplicatedServer(
 		frames: replicatedFrameByteBudget{limit: maxInFlightFrameBytes}}, nil
 }
 
-// Serve accepts a bounded number of native gateway connections. There is no
+// ServeLoopbackDevelopment accepts a bounded number of unauthenticated native
+// connections only on an explicit loopback listener. Production serving uses
+// ServeAuthenticated. There is no
 // user-space accept queue: a connection above maxConnections is closed
 // immediately. Each admitted connection decodes at most one bounded frame at a
 // time and submits through the sole Owner lane. The caller must provide either
 // an authenticated listener or a loopback-only development listener.
-func (server *ReplicatedServer) Serve(
+func (server *ReplicatedServer) ServeLoopbackDevelopment(
 	ctx context.Context,
 	listener net.Listener,
 	maxConnections int,
 ) error {
 	if server == nil || server.owner == nil || ctx == nil || listener == nil ||
 		maxConnections <= 0 || maxConnections > AbsoluteMaxReplicatedConnections ||
+		!replicatedLoopbackListener(listener) ||
 		!server.state.CompareAndSwap(replicatedServerReady, replicatedServerRunning) {
 		return ErrReplicatedWire
 	}
@@ -160,6 +163,11 @@ func (server *ReplicatedServer) Serve(
 			_ = connection.Close()
 		}
 	}
+}
+
+func replicatedLoopbackListener(listener net.Listener) bool {
+	address, ok := listener.Addr().(*net.TCPAddr)
+	return ok && address.IP != nil && address.IP.IsLoopback()
 }
 
 // Stats returns listener counters without touching the Owner lane.
@@ -342,11 +350,18 @@ func RoundTripReplicated(
 		if err := conn.SetDeadline(deadline); err != nil {
 			return nil, err
 		}
-		defer conn.SetDeadline(time.Time{})
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stop()
-	if err := EncodeReplicatedRequest(conn, request); err != nil {
+	cancelDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !stop() {
+			<-cancelDone
+		}
+	}()
+	if err := EncodeReplicatedRequestBorrowed(conn, request); err != nil {
 		if request.Operation == ReplicatedPropose {
 			return nil, &raftservice.UnknownOutcomeError{
 				Command: append([]byte(nil), request.Command...), Cause: err,
