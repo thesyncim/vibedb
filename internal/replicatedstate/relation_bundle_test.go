@@ -220,6 +220,72 @@ func TestSingletonApplyContractAuthenticatesNativeExactIndexes(t *testing.T) {
 	}
 }
 
+func TestPointReadIntoUsesDenseRelationAndExactPublicationCut(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	baseKey := []byte("doc")
+	baseValue := []byte(`{"email":"a","n":1}`)
+	globalKey := []byte{0x91, 0x01, 'a'}
+	globalValue := []byte(`["doc"]`)
+	command := fixture.command(t, 1,
+		replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: baseKey, Value: baseValue,
+		}}},
+		replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
+		}}},
+	)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		relation  replication.RelationID
+		key, want []byte
+		max       int
+	}{{1, baseKey, baseValue, fixture.base.Limits.MaxDocumentBytes},
+		{2, globalKey, globalValue, fixture.global.Limits.MaxDocumentBytes}} {
+		result, readErr := fixture.machine.PointReadInto(
+			test.relation, test.key, publication.Applied, test.max, nil,
+		)
+		if readErr != nil || !result.Found || !bytes.Equal(result.Value, test.want) ||
+			result.Fence.Applied != publication.Applied ||
+			result.Fence.Binding != fixture.binding ||
+			result.Fence.RelationManifestDigest != fixture.machine.manifestDigest {
+			t.Fatalf("relation %d result=%+v err=%v", test.relation, result, readErr)
+		}
+	}
+	missing, err := fixture.machine.PointReadInto(1, []byte("missing"), publication.Applied,
+		fixture.base.Limits.MaxDocumentBytes, nil)
+	if err != nil || missing.Found || len(missing.Value) != 0 {
+		t.Fatalf("missing=%+v err=%v", missing, err)
+	}
+	if _, err := fixture.machine.PointReadInto(1, baseKey, publication.Applied+1,
+		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrReadBehind) {
+		t.Fatalf("future applied floor error=%v", err)
+	}
+	if _, err := fixture.machine.PointReadInto(3, baseKey, publication.Applied,
+		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrInvalidCollection) {
+		t.Fatalf("unknown relation error=%v", err)
+	}
+}
+
+func BenchmarkPointReadIntoDenseRelationMiss(b *testing.B) {
+	fixture := newRelationBundleFixture(b, true)
+	key := []byte("absent")
+	maximum := fixture.base.Limits.MaxDocumentBytes
+	// Warm the reusable coherent-cut workspace before measuring.
+	if _, err := fixture.machine.PointReadInto(1, key, 2, maximum, nil); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := fixture.machine.PointReadInto(1, key, 2, maximum, nil)
+		if err != nil || result.Found {
+			b.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+}
+
 func TestRelationBundleBatchPublishesOnePhysicalUpdateAndUsesLogicalIndexOverlay(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	sessions := openDistinctBatchSessions(t, fixture.machine, fixture.binding, 3, 2)

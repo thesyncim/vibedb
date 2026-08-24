@@ -63,6 +63,24 @@ type readIssue struct {
 	sequence    uint64
 }
 
+// readContextKey keeps Raft correlation byte-native. The fixed array is
+// directly comparable, so duplicate detection and returned ReadState lookup
+// never allocate or convert attacker-controlled bytes to strings.
+type readContextKey struct {
+	bytes [MaxReadContextBytes]byte
+	len   uint16
+}
+
+func makeReadContextKey(context []byte) (readContextKey, bool) {
+	if len(context) == 0 || len(context) > MaxReadContextBytes {
+		return readContextKey{}, false
+	}
+	var key readContextKey
+	key.len = uint16(len(context))
+	copy(key.bytes[:], context)
+	return key, true
+}
+
 // ReadBarrier is a quorum-confirmed read cut bound to one leadership term and
 // process incarnation. Context is an exact defensive copy of the opaque value
 // supplied to ReadIndex.
@@ -104,18 +122,19 @@ func (n *Node) ReadIndex(context []byte) error {
 	if status.RaftState != raft.StateLeader || status.Lead != n.id {
 		return ErrNotLeader
 	}
-	key := string(context)
+	key, _ := makeReadContextKey(context)
 	if _, exists := n.issuedReads[key]; exists {
 		return ErrDuplicateReadContext
 	}
 	for _, barrier := range n.pendingReads {
-		if string(barrier.Context) == key {
+		barrierKey, ok := makeReadContextKey(barrier.Context)
+		if ok && barrierKey == key {
 			return ErrDuplicateReadContext
 		}
 	}
 	copyOfContext := append([]byte(nil), context...)
 	n.readSeq++
-	n.issuedReads[string(copyOfContext)] = readIssue{
+	n.issuedReads[key] = readIssue{
 		term:        status.GetTerm(),
 		incarnation: n.incarnation,
 		context:     copyOfContext,
@@ -140,7 +159,7 @@ func (n *Node) cancelStaleIssuedReads() []ReadOutcome {
 	}
 	status := n.raw.BasicStatus()
 	type staleRead struct {
-		key   string
+		key   readContextKey
 		issue readIssue
 	}
 	var stale []staleRead
