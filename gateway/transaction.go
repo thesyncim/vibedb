@@ -153,9 +153,15 @@ func (e *Executor) planTransaction(
 		if call == nil {
 			continue
 		}
+		if err := rejectReplicatedGlobalIndexSQLTargets(snapshot, bound); err != nil {
+			return nil, err
+		}
 		if len(prepared.writeGlobalIndexes) != 0 &&
 			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
 			if err := e.captureIndexedMutation(ctx, prepared, bound, *call, profile); err != nil {
+				return nil, err
+			}
+			if err := rejectReplicatedGlobalIndexSQLTargets(snapshot, bound); err != nil {
 				return nil, err
 			}
 		}
@@ -168,6 +174,24 @@ func (e *Executor) planTransaction(
 	}
 	sortTransactionParticipants(participants)
 	return participants, nil
+}
+
+func rejectReplicatedGlobalIndexSQLTargets(
+	snapshot *Snapshot,
+	bound *BoundWritePlan,
+) error {
+	if snapshot == nil || bound == nil {
+		return ErrReplicatedSQLWriteUnavailable
+	}
+	for index := range bound.globalIndexes {
+		mutation := &bound.globalIndexes[index]
+		if _, replicated := snapshot.replicatedShardAt(
+			mutation.distribution, mutation.target.Shard,
+		); replicated {
+			return ErrReplicatedSQLWriteUnavailable
+		}
+	}
+	return nil
 }
 
 func appendBoundWriteParticipants(

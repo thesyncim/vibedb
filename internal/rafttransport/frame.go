@@ -362,6 +362,10 @@ func (registry *StaticRegistry) validateStaticMessage(group raftmember.GroupKey,
 		if fromRole != MemberVoter || toRole != MemberVoter {
 			return fmt.Errorf("%w: vote traffic requires voters", ErrUnauthorized)
 		}
+	case pb.MsgTimeoutNow:
+		if fromRole != MemberVoter || toRole != MemberVoter {
+			return fmt.Errorf("%w: leader-transfer traffic requires voters", ErrUnauthorized)
+		}
 	default:
 		return fmt.Errorf("%w: ordinary type %s", ErrUnsupportedFrame, message.GetType())
 	}

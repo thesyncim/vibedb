@@ -102,6 +102,8 @@ type Snapshot struct {
 	plannerIndexSpans              []plannerIndexSpan
 	plannerIndexStrings            string
 	statistics                     *queryplanner.StatisticsCatalog
+	replicatedShards               []replicatedCatalogShard
+	replicatedReplicas             []ReplicatedEndpoint
 	indexLineage                   []plannerIndexLineageRef
 	shardLineage                   []plannerShardLineageRef
 	indexIDHighWater               uint64
@@ -350,6 +352,14 @@ func (s *Snapshot) CatalogTransitionMetadataBytes() uint64 {
 		uint64(cap(s.shardLineage))*uint64(unsafe.Sizeof(plannerShardLineageRef{})) +
 		uint64(cap(s.shardGenerationHighWaters))*uint64(unsafe.Sizeof(distribution.ShardAllocationGeneration(0))) +
 		uint64(unsafe.Sizeof(s.indexIDHighWater))
+}
+
+func retainedReplicatedMetadataBytes(
+	shards []replicatedCatalogShard,
+	replicas []ReplicatedEndpoint,
+) uint64 {
+	return uint64(cap(shards))*uint64(unsafe.Sizeof(replicatedCatalogShard{})) +
+		uint64(cap(replicas))*uint64(unsafe.Sizeof(ReplicatedEndpoint{}))
 }
 
 // plannerTableFor resolves a logical table to its placement, distribution spec,
@@ -869,15 +879,16 @@ func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64)
 // to identical bytes.
 
 type persistedCatalog struct {
-	Version       int                            `json:"version"`
-	Generation    uint64                         `json:"generation"`
-	Distributions []persistedDistribution        `json:"distributions"`
-	Placements    []persistedPlacement           `json:"placements,omitempty"`
-	Indexes       []persistedIndex               `json:"indexes,omitempty"`
-	Statistics    []queryplanner.TableStatistics `json:"statistics,omitempty"`
-	Manifests     []persistedManifest            `json:"manifests"`
-	Endpoints     []persistedEndpoint            `json:"endpoints"`
-	Lineage       *persistedCatalogLineage       `json:"lineage,omitempty"`
+	Version          int                            `json:"version"`
+	Generation       uint64                         `json:"generation"`
+	Distributions    []persistedDistribution        `json:"distributions"`
+	Placements       []persistedPlacement           `json:"placements,omitempty"`
+	Indexes          []persistedIndex               `json:"indexes,omitempty"`
+	Statistics       []queryplanner.TableStatistics `json:"statistics,omitempty"`
+	Manifests        []persistedManifest            `json:"manifests"`
+	Endpoints        []persistedEndpoint            `json:"endpoints"`
+	ReplicatedShards []persistedReplicatedShard     `json:"replicated_shards,omitempty"`
+	Lineage          *persistedCatalogLineage       `json:"lineage,omitempty"`
 }
 
 type persistedDistribution struct {
@@ -986,6 +997,7 @@ func toPersisted(s *Snapshot) persistedCatalog {
 		}
 	}
 	pc.Statistics = s.statistics.Descriptors()
+	pc.ReplicatedShards = persistedReplicatedDescriptors(s.replicatedDescriptors())
 	for _, m := range s.config.Manifests {
 		pm := persistedManifest{Distribution: string(m.Distribution()), Version: uint64(m.Version())}
 		for i := 0; i < m.ShardCount(); i++ {
@@ -1279,7 +1291,13 @@ func decodeSnapshotFile(file *os.File, label string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := NewSnapshotWithPlannerMetadata(config, endpoints, pc.Generation, indexes, statistics)
+	replicated, err := pc.replicatedDescriptors()
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, pc.Generation, indexes, statistics, replicated,
+	)
 	if err != nil {
 		return nil, err
 	}
