@@ -221,6 +221,31 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 	}
 }
 
+func TestLearnerWithoutCommittedPromotionWitnessCannotVote(t *testing.T) {
+	group := testGroup(34)
+	members := []Member{
+		{Group: group, ReplicaSetVersion: 6, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 3, Node: testNode(3), Role: MemberLearner},
+	}
+	registry, err := NewStaticRegistry(testNode(3), members,
+		Limits{MaxGroups: 1, MaxMembers: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.AuthorizeTransition(TransitionGrant{Group: group,
+		TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
+		SourceMember: 1, TargetMember: 3}); err != nil {
+		t.Fatal(err)
+	}
+	response := frameTestMessage(pb.MsgVoteResp, 3, 2)
+	frame, _, err := registry.EncodeOutbound(nil, raftmember.OutboundMessage{
+		Group: group, From: 3, To: 2, Message: response})
+	if err == nil || frame != nil || !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("unwitnessed learner vote frame=%x err=%v", frame, err)
+	}
+}
+
 func authorizedConfigurationMessage(
 	t testing.TB,
 	group raftmember.GroupKey,

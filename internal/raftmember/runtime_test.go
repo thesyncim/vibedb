@@ -635,6 +635,122 @@ func TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply(t *testing.T) {
 	}
 }
 
+func TestRuntimeRejectsDurableUncommittedPromotionAfterRestart(t *testing.T) {
+	identity := testWALIdentity(223)
+	peer := identity.MemberID + 1
+	target := peer + 1
+	fixture := newRuntimeFixture(t, 223, []uint64{identity.MemberID, peer})
+	drainRuntime(t, fixture.runtime, nil)
+	electRuntimeWithPeer(t, fixture.runtime, identity.MemberID, peer)
+	digest := MembershipTransitionDigest(fixture.runtime.identity.Group,
+		[16]byte{2}, 3, 4, identity.MemberID, target)
+	if err := fixture.runtime.ProposeConfChange(&pb.ConfChange{
+		Type: pb.ConfChangeAddNode.Enum(), NodeId: runtimeUint64Ptr(target),
+		Context: append([]byte(nil), digest[:]...),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var promotion *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgApp && outbound.To == peer &&
+			len(outbound.Message.GetEntries()) != 0 {
+			promotion = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if promotion == nil {
+		t.Fatal("promotion produced no durable append")
+	}
+	lastPromotion := promotion.GetEntries()[len(promotion.GetEntries())-1].GetIndex()
+	commit, err := fixture.wal.DurableCommit()
+	if err != nil || lastPromotion <= commit {
+		t.Fatalf("promotion index=%d durable commit=%d err=%v", lastPromotion, commit, err)
+	}
+	if proof, found, err := fixture.runtime.DurablePromotion(target); err != nil || found {
+		t.Fatalf("uncommitted proof=%+v found=%t err=%v", proof, found, err)
+	}
+	if err = fixture.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedWAL, err := raftstore.Open(fixture.walPath, fixture.walID,
+		testTopologyRecoveryEpoch, fixture.walKey, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, reopenedApply, err := OpenBoundSQLWithApply(fixture.sqlPath,
+		reopenedWAL, testAuthorityProfile(), fixture.base, fixture.applyID)
+	if err != nil {
+		_ = reopenedWAL.Close()
+		t.Fatal(err)
+	}
+	restarted, err := AdoptRuntime(reopenedWAL, reopenedDB, reopenedApply)
+	if err != nil {
+		if restarted != nil {
+			_ = restarted.Close()
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	if proof, found, err := restarted.DurablePromotion(target); err != nil || found {
+		t.Fatalf("reopened uncommitted proof=%+v found=%t err=%v", proof, found, err)
+	}
+}
+
+func electRuntimeWithPeer(t testing.TB, runtime *Runtime, local, peer uint64) {
+	t.Helper()
+	if err := runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	var preVote *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgPreVote && outbound.To == peer {
+			preVote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if preVote == nil {
+		t.Fatal("campaign produced no pre-vote")
+	}
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgPreVoteResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(preVote.GetTerm())}); err != nil {
+		t.Fatal(err)
+	}
+	var vote *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgVote && outbound.To == peer {
+			vote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if vote == nil {
+		t.Fatal("pre-vote produced no vote")
+	}
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgVoteResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(vote.GetTerm())}); err != nil {
+		t.Fatal(err)
+	}
+	var appendMessage *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgApp && outbound.To == peer &&
+			len(outbound.Message.GetEntries()) != 0 {
+			appendMessage = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if appendMessage == nil {
+		t.Fatal("election produced no leader append")
+	}
+	last := appendMessage.GetEntries()[len(appendMessage.GetEntries())-1].GetIndex()
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgAppResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(appendMessage.GetTerm()), Index: runtimeUint64Ptr(last)}); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, runtime, nil)
+}
+
 func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
 	identity := testWALIdentity(230)
 	peer := identity.MemberID + 1

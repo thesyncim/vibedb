@@ -393,6 +393,7 @@ type Runtime struct {
 type durablePromotionScan struct {
 	applied uint64
 	last    uint64
+	commit  uint64
 	target  uint64
 	proof   DurablePromotionProof
 	found   bool
@@ -651,20 +652,25 @@ func (runtime *Runtime) DurablePromotion(
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
-	if last <= publication.Applied {
+	commit, err := runtime.wal.DurableCommit()
+	if err != nil {
+		return DurablePromotionProof{}, false, err
+	}
+	if commit <= publication.Applied {
 		runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
-			last: last, target: target, valid: true}
+			last: last, commit: commit, target: target, valid: true}
 		return DurablePromotionProof{}, false, nil
 	}
 	if cached := runtime.promotionScan; cached.valid && cached.applied == publication.Applied &&
-		cached.last == last && cached.target == target {
+		cached.last == last && cached.commit == commit && cached.target == target {
 		return cached.proof, cached.found, nil
 	}
 	first := publication.Applied + 1
-	if span := last - first + 1; span > raftmodel.MaxMessageEntries {
-		first = last - raftmodel.MaxMessageEntries + 1
+	lastCommitted := min(last, commit)
+	if span := lastCommitted - first + 1; span > raftmodel.MaxMessageEntries {
+		first = lastCommitted - raftmodel.MaxMessageEntries + 1
 	}
-	for index := last; index >= first; index-- {
+	for index := lastCommitted; index >= first; index-- {
 		entries, readErr := runtime.wal.Entries(index, index+1, raftmodel.MaxInboundMessageBytes)
 		if readErr != nil {
 			return DurablePromotionProof{}, false, readErr
@@ -680,7 +686,7 @@ func (runtime *Runtime) DurablePromotion(
 			proof := DurablePromotionProof{Version: index, TargetMember: target,
 				AuthorizationDigest: digest}
 			runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
-				last: last, target: target, proof: proof, found: true, valid: true}
+				last: last, commit: commit, target: target, proof: proof, found: true, valid: true}
 			return proof, true, nil
 		}
 		if index == first {
@@ -688,7 +694,7 @@ func (runtime *Runtime) DurablePromotion(
 		}
 	}
 	runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
-		last: last, target: target, valid: true}
+		last: last, commit: commit, target: target, valid: true}
 	return DurablePromotionProof{}, false, nil
 }
 
