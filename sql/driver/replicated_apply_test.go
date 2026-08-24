@@ -1634,7 +1634,7 @@ func TestReplicatedApplyPreflightAndPreRecoveryFences(t *testing.T) {
 			reserved, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 		)
 		if claim != nil || identity != (ReplicatedApplyIdentity{}) ||
-			!errors.Is(err, ErrReplicatedShardStoreProfile) {
+			!errors.Is(err, ErrReplicatedApplyMismatch) {
 			t.Fatalf("reserved activation = %p,%+v,%v", claim, identity, err)
 		}
 		core := database.connector.db
