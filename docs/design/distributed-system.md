@@ -252,10 +252,32 @@ after the durable cut is already established.
 `AppliedIndex` is the newest reader-visible local transition.
 `CheckpointAppliedIndex` is the greatest certificate-backed contiguous cut and
 the only index currently exposed as safe input to Raft-WAL retention. They may
-differ between checkpoints. The repository does not yet compact or replace the
-Raft WAL from that input; a replacement must additionally bind the exact term,
-configuration state, member lineage, certificate witness, and retained log
-suffix before any old generation can be discarded.
+differ between checkpoints. The WAL can now capture one immutable selected
+current-slot cut and build a fully synced, strictly reopened compacted sibling
+around a newer snapshot base. Its generation seal binds the exact source file
+and cut, placement identity, topology epoch, snapshot term and configuration,
+checkpoint-retention commitment, HardState, and retained suffix.
+
+Every WAL has one mandatory authenticated family manifest. Publishing a
+candidate records one selecting generation and atomically returns its complete
+fixed-width identity, including snapshot-base and retention commitments, so an
+outcome-unknown publication still fences SQL. Activation revalidates and
+checkpoints that exact SQL base before replacing the logical WAL leaf, Syncs
+the parent, proves the selected inode, publishes the active family slot, and
+proves the logical name again before releasing the opaque SQL completion.
+Failure remains fail-closed and retryable at its ordered boundary. The retired
+source then has no namespace link; later compactions repeat the same protocol
+and authenticate the preceding generation digest.
+
+The builder has a strict two-image disk budget and a sealed record/chunk heap
+budget: the live source and one deterministic preallocated stage may coexist.
+Replay authenticates every source record but projects only entries above the
+certified checkpoint base into the stage, so a large checkpointed prefix costs
+read/authentication bandwidth but no target write amplification. Historical
+HardState and the changing presence/term of the future base remain separate
+from the projected suffix until the exact final cut is proved. The
+per-generation build lease and deterministic stage name bound crash debris to
+one reclaimable image instead of an unbounded set of randomized WAL files.
 
 This lane is still part of the non-serving replication kernel. It does not yet
 provide RF3 request serving, Host-integrated peer transport, or acknowledged
@@ -458,15 +480,37 @@ exact system and user mutation budgets. The 128-entry node workspace is a hard
 ceiling, not a guarantee that every persisted profile can publish 128
 independent-session commands. Each published prefix creates a synchronous
 result settlement gate before the runtime can release read states or advance
-the `Ready`. The current non-serving Host supplies an explicit no-local-waiters
-sink. The kernel does not have a serving proposal-waiter registry. Outbound
+the `Ready`. The default non-serving Host supplies an explicit no-local-waiters
+sink. An internal bounded waiter registry can instead inject proposal-lifecycle
+and result-settlement sinks. It validates canonical commands before Host
+enqueue, coalesces only exact attempt identities, and publishes owned results
+only after deterministic apply. Before Host ownership transfer, the registry
+claims the exact Runtime source identity: `Group`, `AllocationGeneration`,
+`MemberID`, `StoreID`, and `NodeIncarnation`. Settlement and proposal-lifecycle
+callbacks must also present the claim's nonzero `RegistryID` and `OwnerEpoch`,
+which prevents cross-registry and release/reclaim ABA. This is an internal
+lifecycle fence, not network or request authentication. Live Hosts sharing one
+registry must own disjoint group keys. Replacing a group owner requires fencing
+ingress, terminating its pending attempts, closing the old Runtime, and
+releasing the exact source capability before replacement admission. Outbound
 messages are still retained as individual frames.
 
+Wait cancellation releases only local waiter ownership. While a blocking
+claimant is between wake checks, its fixed slot and notification channel remain
+occupied until that claimant acknowledges the logical release; this bounded
+anti-reuse handshake may briefly delay replacement admission without allocating.
+An admitted attempt remains bounded until deterministic apply or a Host-observed
+leadership, fault, removal, or close boundary makes it retryable as an
+infrastructure outcome. A leader that stays live without quorum has no
+time-based abandonment policy in this non-serving safe point. A serving gateway
+still needs a leader-and-quorum lease policy around request deadlines.
+
 The kernel has no production peer listener, address discovery, certificate
-operations, snapshot-transfer service, or serving integration. The internal
-transport foundation can derive the exact binary peer identity and cluster
-trust domain from a supplied raw mutual TLS connection. The shipped commands
-do not construct it.
+operations, snapshot-transfer service, gateway serving integration, or request
+authentication. The internal transport foundation can derive the exact binary
+peer identity and cluster trust domain from a supplied raw mutual TLS
+connection. The shipped commands do not construct it. The internal waiter
+registry alone does not make this a served database.
 
 Do not describe this kernel as a turnkey replicated deployment.
 
@@ -485,6 +529,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
 - `internal/raftmodel/node.go`, `internal/raftmember/runtime.go`,
   `internal/multiraft/host.go`, and `internal/replicatedstate/apply_batch.go`
+- `internal/raftserve/identity.go`, `internal/raftserve/registry.go`, and
+  `internal/raftserve/settlement.go`
 - `internal/rangesplit/cutover.go`
 - `internal/rangesplit/stage_image.go` and `activate.go`
 - `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`

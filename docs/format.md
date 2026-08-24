@@ -309,6 +309,120 @@ authority: term, configuration state, member lineage, certificate witness, and
 the required retained suffix must also be bound. No ordinary replicated
 transition performs a local Sync.
 
+## Raft-WAL generation family and activation
+
+Every Raft WAL belongs to one mandatory authenticated generation family from
+its first creation. There is one format and one recovery contract. The 128-bit
+family ID hashes the logical WAL leaf and complete sealed member-placement
+identity. Its deterministic 4 KiB
+`.vibedb-raft-<32 lowercase family hex>.family` manifest contains two
+authenticated 512-byte slots; all remaining bytes are zero. Creation writes the
+same source state to both slots. A missing or invalid peer is therefore damage,
+not an older-format fallback, and quarantines serving until repaired by an
+explicit operator path.
+
+Family slots form one semantic state machine:
+
+```text
+source -> selecting generation 1 -> active generation 1
+       -> selecting generation 2 -> active generation 2 -> ...
+```
+
+The source state has slot generation 1. Selecting states use consecutive even
+slot generations and active states use the following odd slot generations.
+Each transition authenticates the family and member identity. Source-to-first
+selection binds the original file; selecting-to-active may change only phase
+and slot generation; every later selection increments the WAL generation by
+one and binds its parent generation digest and active source file. Two valid
+slots that do not describe one adjacent legal transition are corruption.
+
+WAL creation, family-manifest publication, and compacted-generation construction
+use deterministic `.create.stage`, `.family.stage`, and
+`.g<16 lowercase generation hex>.wal.stage` names. Publication uses hard-link
+witnesses plus parent-directory barriers. A source Open may retain one verified
+same-inode `.create.stage` witness without a directory Sync because that inode
+is still authoritative; the first source-to-selecting transition must
+unconditionally settle and remove it before the source can lose its logical
+link. Selecting and active recovery reject any such alias. Family and candidate
+stage retries settle outcome-unknown removals before accepting absence. One
+persistent zero-length `.create.lock`, derived only from the logical WAL leaf,
+serializes every initial creation attempt independently of caller-supplied
+identity. A separate persistent per-family `.build.lock` serializes compacted
+generation construction. Neither coordination inode is replaced. Under the
+family owner lock, an abandoned same-lineage stage or
+unselected candidate is proved by inode and authenticated contents, removed,
+and followed by a directory barrier. A foreign or corrupt occupant is never
+overwritten. These rules bound the namespace to one source, one candidate or
+construction image, one family manifest, and fixed coordination files rather
+than accumulating randomized preallocated WALs after crashes.
+
+A healthy serving generation can capture an authenticated current-slot cut and
+construct its next deterministic sibling. The builder does not retain a source
+descriptor: it transiently opens and proves the named source while replaying,
+then closes it; the owning Store's lifetime writer and family leases exclude a
+competing source owner. Source replay authenticates and canonically decodes
+every record through the captured cut but writes only the evolving suffix above
+the certified checkpoint base. Historical HardState and full-log last index are
+tracked separately from that projection. Sequential entries coalesce in bounded
+memory, conflicting uncommitted suffixes truncate scratch in place, and the
+checkpointed prefix is never copied to target scratch.
+
+Retained-entry records have a fixed 24-byte header and one to the ordinary
+Ready-entry limit of exact 32-byte entry headers plus raw data. They carry no
+Ready ID because Ready IDs identify a process lifetime, not a durable entry.
+Records are bounded by the sealed record and Ready-entry limits with a 4 MiB
+preferred plaintext chunk; one individually legal larger entry remains one
+bounded record. Peak heap is one fixed 64 KiB scan buffer, one source-record
+ciphertext/plaintext pair, one retained chunk and encoding, one encrypted
+target record, and `O(MaxReadyEntries)` scalar descriptors. There is no
+source-sized entry arena or second scratch file.
+
+One fixed 504-byte generation seal terminates the candidate. Its authenticated
+record chain binds:
+
+- family, generation, parent-generation binding, and complete member identity;
+- source file and static-header identity, selected current generation, WAL end,
+  record count, record-chain digest, node incarnation, and topology epoch;
+- snapshot-base index and term, the WAL bootstrap-record digest, the distinct
+  state-machine snapshot-certificate identity, and stable ConfState digest;
+- the exact checkpoint-retention witness commitment and HardState;
+- retained first/last index, count, logical bytes, and semantic suffix digest;
+  and
+- source first/last index and the resulting generation binding digest.
+
+Decode requires canonical record order: bootstrap, retained-entry records,
+seal, then only Ready records from a strictly newer node incarnation. A missing,
+repeated, or late seal, source-incarnation reuse, broken parent binding, or any
+mismatch with the authenticated current cut is corruption. Exact candidate
+rebuild is idempotent only while the seal remains terminal; an independently
+advanced candidate is not the same build.
+
+A candidate never grants serving or deletion authority. Selection first locks
+and reopens the exact candidate, proves the live source namespace, and publishes
+the selecting family slot while holding both authorities. That immediately
+fences the source WAL and its bound SQL apply claim. Recovery opens the selected
+candidate only through the logical family manifest and exposes just its
+activation evidence.
+
+Activation validates the exact SQL preparation, schema/shard binding, applied
+cut, and retention witness. It installs the certified snapshot base and
+checkpoints the complete SQL group before replacing the logical WAL leaf. The
+replacement then receives an unconditional parent-directory barrier and a
+namespace proof before the family active slot is written, followed by one final
+logical-name proof after active authority is durable. Only then does raftstore
+mint an opaque completion capability for the exact family, generation, and
+binding digest; zero, stale, foreign, or replayed values cannot release the SQL
+fence. A failed final proof keeps the same handle fenced and retries only that
+proof and completion; earlier failures remain selecting and retry the ordered
+settlement. Once active, the retired full WAL has no namespace link and repeated
+compaction continues through the authenticated parent-binding chain.
+
+Building temporarily requires the authoritative source and one complete
+preallocated target WAL simultaneously. Admission must reserve twice the sealed
+`MaxFileBytes`, plus fixed metadata and operational filesystem headroom. The
+activation protocol releases that temporary physical amplification without
+weakening immutable-generation recovery.
+
 ## Database directory names
 
 The durable database encodes a logical collection name as:

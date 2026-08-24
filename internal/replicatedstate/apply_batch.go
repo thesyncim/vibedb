@@ -102,7 +102,8 @@ func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
 	}
 	return retained +
 		uintptr(cap(plan.sessionRead)+cap(plan.slotRead)+cap(plan.sessionRecord)+
-			cap(plan.slotRecord)+cap(plan.currentValue)+cap(workspace.state)) +
+			cap(plan.slotRecord)+cap(plan.currentValue)+cap(plan.decodeRead)+
+			cap(workspace.state)) +
 		uintptr(cap(plan.descriptors))*unsafe.Sizeof(mutationValueDescriptor{}) +
 		uintptr(cap(workspace.relationMarks)+cap(workspace.attemptedMarks))*
 			unsafe.Sizeof(logicalOverlayMark{}) +

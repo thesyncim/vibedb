@@ -32,6 +32,9 @@ var (
 	// ErrResultSettlementRejected marks a retryable settlement sink failure. The
 	// Runtime retains the exact applied range and performs no later Node work.
 	ErrResultSettlementRejected = errors.New("raftmember: applied result settlement rejected")
+	// ErrRetryableResultSettlement identifies the sole sink error class that may
+	// retry the identical applied range. Every unwrapped sink error is terminal.
+	ErrRetryableResultSettlement = errors.New("raftmember: retryable applied result settlement")
 	// ErrReadyWorkspaceRequired reports a result-bearing apply that cannot begin
 	// without the caller-owned bounded batch workspace.
 	ErrReadyWorkspaceRequired = errors.New("raftmember: Ready workspace is required")
@@ -61,6 +64,35 @@ type RuntimeIdentity struct {
 	NodeIncarnation      uint64
 }
 
+// AppliedSourceOwner is the exact fixed-width identity of one Runtime whose
+// published apply batches may settle local serving attempts. Distribution and
+// shard labels are deliberately excluded: the sealed allocation generation,
+// member store, and node incarnation are the ABA-resistant ownership boundary.
+type AppliedSourceOwner struct {
+	Group                GroupKey
+	AllocationGeneration uint64
+	MemberID             uint64
+	StoreID              [16]byte
+	NodeIncarnation      uint64
+}
+
+// AppliedSourceToken is a registry-minted, fixed-width capability for one
+// AppliedSourceOwner claim. RegistryID fences different registries while
+// OwnerEpoch prevents same-registry release/reclaim ABA.
+type AppliedSourceToken struct {
+	RegistryID uint64
+	OwnerEpoch uint64
+}
+
+// AppliedSourceOwner returns the exact serving ownership identity.
+func (identity RuntimeIdentity) AppliedSourceOwner() AppliedSourceOwner {
+	return AppliedSourceOwner{
+		Group: identity.Group, AllocationGeneration: identity.AllocationGeneration,
+		MemberID: identity.MemberID, StoreID: identity.StoreID,
+		NodeIncarnation: identity.NodeIncarnation,
+	}
+}
+
 // OutboundMessage is borrowed only for the duration of the DriveReady callback.
 // A caller retaining it must clone Message before returning.
 type OutboundMessage struct {
@@ -82,10 +114,51 @@ type ReadyWorkspace struct {
 type AppliedBatch struct {
 	normal raftmodel.AppliedNormalBatch
 	apply  *sqldriver.ReplicatedApply
+	source AppliedBatchSource
+}
+
+// AppliedBatchCompletionWorkspace owns one reusable exact completion cut for a
+// serialized AppliedBatch settlement. The zero value is ready for use. It is
+// single-consumer, must not be copied, and retains only bounded snapshot
+// scratch between batches.
+type AppliedBatchCompletionWorkspace struct {
+	apply  sqldriver.CompletionLookupWorkspace
+	owner  *sqldriver.ReplicatedApply
+	source AppliedBatchSource
+}
+
+// AppliedBatchSource is the fixed identity of one applied Ready interval.
+// ReadyID is scoped by the exact local member store and Node incarnation.
+type AppliedBatchSource struct {
+	// Group is the exact GroupKey of the Runtime that published the interval.
+	Group                GroupKey
+	AllocationGeneration uint64
+	MemberID             uint64
+	StoreID              [16]byte
+	NodeIncarnation      uint64
+	ReadyID              uint64
+	FirstIndex           uint64
+	LastIndex            uint64
+	FinalDataChainDigest [32]byte
+}
+
+// Owner returns the exact Runtime identity that published this interval.
+func (source AppliedBatchSource) Owner() AppliedSourceOwner {
+	return AppliedSourceOwner{
+		Group: source.Group, AllocationGeneration: source.AllocationGeneration,
+		MemberID: source.MemberID, StoreID: source.StoreID,
+		NodeIncarnation: source.NodeIncarnation,
+	}
 }
 
 // Len returns the number of applied normal entries awaiting settlement.
 func (batch AppliedBatch) Len() int { return batch.normal.Len() }
+
+// Group returns the exact logical group whose entries were published.
+func (batch AppliedBatch) Group() GroupKey { return batch.source.Group }
+
+// Source returns the exact local member and applied Ready interval.
+func (batch AppliedBatch) Source() AppliedBatchSource { return batch.source }
 
 // ReadyID identifies the Ready containing the applied range.
 func (batch AppliedBatch) ReadyID() uint64 { return batch.normal.ReadyID() }
@@ -127,11 +200,119 @@ func (batch AppliedBatch) LookupCompletion(
 	return lookup, true, err
 }
 
+// LookupCompletionInto is LookupCompletion with caller-owned result storage.
+func (batch AppliedBatch) LookupCompletionInto(
+	index int,
+	dst []byte,
+) (lookup replicatedstate.CompletionLookup, hasCommand bool, err error) {
+	entry, ok := batch.normal.Entry(index)
+	if !ok {
+		return replicatedstate.CompletionLookup{}, false, errors.New("raftmember: applied result index out of range")
+	}
+	if len(entry.Data) == 0 {
+		return replicatedstate.CompletionLookup{}, false, nil
+	}
+	if batch.apply == nil {
+		return replicatedstate.CompletionLookup{}, true, ErrRuntimeClosed
+	}
+	lookup, err = batch.apply.LookupCompletionInto(entry.Data, dst)
+	return lookup, true, err
+}
+
+// BeginCompletionLookup captures one exact durable cut for every completion
+// lookup subsequently made through workspace for this AppliedBatch.
+func (batch AppliedBatch) BeginCompletionLookup(
+	workspace *AppliedBatchCompletionWorkspace,
+) error {
+	if batch.apply == nil {
+		return ErrRuntimeClosed
+	}
+	if workspace == nil || workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	if err := batch.apply.BeginCompletionLookupBatch(
+		&workspace.apply, batch.FinalPublication(),
+	); err != nil {
+		return err
+	}
+	workspace.owner = batch.apply
+	workspace.source = batch.source
+	return nil
+}
+
+// LookupCompletionIntoWorkspace is LookupCompletionInto through the exact cut
+// captured by BeginCompletionLookup.
+func (batch AppliedBatch) LookupCompletionIntoWorkspace(
+	workspace *AppliedBatchCompletionWorkspace,
+	index int,
+	dst []byte,
+) (lookup replicatedstate.CompletionLookup, hasCommand bool, err error) {
+	if workspace == nil || workspace.owner != batch.apply || workspace.source != batch.source {
+		return replicatedstate.CompletionLookup{}, false, replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	entry, ok := batch.normal.Entry(index)
+	if !ok {
+		return replicatedstate.CompletionLookup{}, false, errors.New("raftmember: applied result index out of range")
+	}
+	if len(entry.Data) == 0 {
+		return replicatedstate.CompletionLookup{}, false, nil
+	}
+	lookup, err = batch.apply.LookupCompletionIntoWorkspace(&workspace.apply, entry.Data, dst)
+	return lookup, true, err
+}
+
+// EndCompletionLookup releases the exact durable cut. The workspace remains
+// warm for a later AppliedBatch.
+func (batch AppliedBatch) EndCompletionLookup(
+	workspace *AppliedBatchCompletionWorkspace,
+) error {
+	if workspace == nil || workspace.owner != batch.apply || workspace.source != batch.source {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	workspace.owner = nil
+	workspace.source = AppliedBatchSource{}
+	return batch.apply.EndCompletionLookupBatch(&workspace.apply)
+}
+
+// Release drops every inactive reusable snapshot buffer retained by workspace.
+func (workspace *AppliedBatchCompletionWorkspace) Release() error {
+	if workspace == nil {
+		return nil
+	}
+	if workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	workspace.source = AppliedBatchSource{}
+	return workspace.apply.Release()
+}
+
 // ResultSettlementSink runs synchronously after apply publication and before
-// read-state release or Ready advancement. A failure may be outcome-unknown and
-// retries the identical ReadyID and range, so sinks must be idempotent. A sink
-// must not retain borrowed values or re-enter the Runtime.
+// read-state release or Ready advancement. A sink must not retain borrowed
+// values or re-enter the Runtime. Returning an error is terminal unless it was
+// produced by RetryResultSettlement. A retry receives the identical source and
+// range, so every sink must be idempotent.
 type ResultSettlementSink func(AppliedBatch) error
+
+type retryableResultSettlement struct {
+	cause error
+}
+
+func (failure retryableResultSettlement) Error() string {
+	return failure.cause.Error()
+}
+
+func (failure retryableResultSettlement) Unwrap() []error {
+	return []error{ErrRetryableResultSettlement, failure.cause}
+}
+
+// RetryResultSettlement marks a sink failure whose side effects may be
+// outcome-unknown and whose identical source and range must be retried.
+func RetryResultSettlement(cause error) error {
+	if cause == nil {
+		cause = errors.New("unspecified retryable settlement failure")
+	}
+	return retryableResultSettlement{cause: cause}
+}
 
 // DriveKind identifies the single Ready lifecycle operation performed by one
 // DriveReady call. DriveIdle means no Ready was available and no work occurred.
@@ -560,8 +741,9 @@ func (runtime *Runtime) Campaign() error {
 // callbacks run only after the Ready's stable-storage boundary. A callback
 // error leaves the exact message position unchanged for explicit retry.
 // Result settlement runs synchronously after a normal apply publishes and
-// before this Ready can release read states or advance. A settlement failure
-// retries the identical ReadyID and range on the next call.
+// before this Ready can release read states or advance. A failure marked by
+// RetryResultSettlement retries the identical ReadyID and range on the next
+// call. Any other settlement failure is terminal.
 func (runtime *Runtime) DriveReady(
 	workspace *ReadyWorkspace,
 	send func(OutboundMessage) error,
@@ -733,7 +915,10 @@ func (runtime *Runtime) settleAppliedResults(
 		return DriveResult{}, ErrResultSettlementRequired
 	}
 	if err := settle(batch); err != nil {
-		return DriveResult{}, errors.Join(ErrResultSettlementRejected, err)
+		if errors.Is(err, ErrRetryableResultSettlement) {
+			return DriveResult{}, errors.Join(ErrResultSettlementRejected, err)
+		}
+		return DriveResult{}, runtime.fail(err)
 	}
 	if err := runtime.node.SettleAppliedNormalBatch(batch.normal); err != nil {
 		return DriveResult{}, runtime.fail(err)
@@ -751,7 +936,30 @@ func (runtime *Runtime) pendingAppliedResults() (AppliedBatch, bool) {
 	if !pending {
 		return AppliedBatch{}, false
 	}
-	return AppliedBatch{normal: normal, apply: runtime.apply}, true
+	return AppliedBatch{
+		normal: normal,
+		apply:  runtime.apply,
+		source: AppliedBatchSource{
+			Group:                runtime.identity.Group,
+			AllocationGeneration: runtime.identity.AllocationGeneration,
+			MemberID:             runtime.identity.MemberID, StoreID: runtime.identity.StoreID,
+			NodeIncarnation: runtime.identity.NodeIncarnation,
+			ReadyID:         normal.ReadyID(), FirstIndex: normal.FirstIndex(), LastIndex: normal.LastIndex(),
+			FinalDataChainDigest: normal.FinalPublication().DataChainDigest,
+		},
+	}, true
+}
+
+// HasPendingResultSettlement reports whether Close and all later protocol work
+// are blocked on one live, retryable, already-published applied range. A
+// terminal Runtime failure may still retain an in-memory pending range, but it
+// cannot be retried and does not prevent resource teardown.
+func (runtime *Runtime) HasPendingResultSettlement() bool {
+	if runtime == nil || runtime.failure != nil {
+		return false
+	}
+	_, pending := runtime.pendingAppliedResults()
+	return pending
 }
 
 func deterministicPersistFailure(err error) bool {
@@ -869,7 +1077,7 @@ func (runtime *Runtime) Close() error {
 	if runtime == nil || runtime.closed {
 		return nil
 	}
-	if _, pending := runtime.pendingAppliedResults(); pending {
+	if _, pending := runtime.pendingAppliedResults(); pending && runtime.failure == nil {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true

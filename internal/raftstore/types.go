@@ -161,6 +161,7 @@ type fileOps struct {
 	ensureAllocated func(*os.File, int64) error
 	writeAt         func(*os.File, []byte, int64) (int, error)
 	sync            func(*os.File) error
+	syncDirectory   func(*os.Root) error
 }
 
 func normalizeOptions(options Options) (normalizedOptions, error) {
@@ -203,6 +204,9 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	}
 	if result.ops.sync == nil {
 		result.ops.sync = func(file *os.File) error { return file.Sync() }
+	}
+	if result.ops.syncDirectory == nil {
+		result.ops.syncDirectory = syncPinnedDirectory
 	}
 	if result.maxFileBytes < HeaderBytes+recordDamageGranule || result.maxFileBytes > AbsoluteMaxFileBytes || result.maxFileBytes%recordDamageGranule != 0 ||
 		result.maxRecordBytes < recordDamageGranule || result.maxRecordBytes > AbsoluteMaxRecordBytes || result.maxRecordBytes%recordDamageGranule != 0 ||

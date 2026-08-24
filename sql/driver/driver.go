@@ -235,6 +235,14 @@ func (c *dbConnector) Close() error {
 func (c *dbConnector) release() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.releaseLocked()
+}
+
+// releaseLocked drops one lifetime reference while c.mu is held. Keeping the
+// terminal transition in one helper lets owners that must atomically retire a
+// connector before releasing their reference preserve the connector ->
+// database lock order used by Connect and OpenReplicatedApply.
+func (c *dbConnector) releaseLocked() error {
 	if c.refs == 0 {
 		return errors.New("vibedb: connector connection reference underflow")
 	}
