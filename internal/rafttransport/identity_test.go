@@ -364,6 +364,40 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 	}
 }
 
+func TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 44)
+	clientIdentity := peerTLSTestIdentity(49, 21)
+	serverIdentity := peerTLSTestIdentity(49, 41)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	client, server, clientErr, serverErr := peerTLSTestHandshake(
+		t, clientTLS, serverTLS, serverIdentity.Node,
+		TrafficShardNative, TrafficShardNative,
+	)
+	if clientErr != nil || serverErr != nil {
+		t.Fatalf("shard-native handshake errors = client %v, server %v", clientErr, serverErr)
+	}
+	defer client.Close()
+	defer server.Close()
+	if client.TrafficClass() != TrafficShardNative || server.TrafficClass() != TrafficShardNative {
+		t.Fatalf("traffic classes = %d/%d", client.TrafficClass(), server.TrafficClass())
+	}
+
+	wrongClient, wrongServer, wrongClientErr, wrongServerErr := peerTLSTestHandshake(
+		t, clientTLS, serverTLS, serverIdentity.Node,
+		TrafficShardNative, TrafficOrdinary,
+	)
+	if wrongClient != nil {
+		_ = wrongClient.Close()
+	}
+	if wrongServer != nil {
+		_ = wrongServer.Close()
+	}
+	if !errors.Is(wrongClientErr, ErrPeerAuthentication) && !errors.Is(wrongServerErr, ErrPeerAuthentication) {
+		t.Fatalf("cross-capability errors = client %v server %v", wrongClientErr, wrongServerErr)
+	}
+}
+
 func TestPeerTLSServerRejectsLocalNodeCertificate(t *testing.T) {
 	authority := newPeerTLSTestAuthority(t, 6)
 	identity := peerTLSTestIdentity(17, 61)
