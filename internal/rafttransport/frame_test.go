@@ -100,7 +100,7 @@ func TestFrameGoldenHeartbeat(t *testing.T) {
 	if destination != receiver.LocalNode() {
 		t.Fatalf("destination = %x, want %x", destination, receiver.LocalNode())
 	}
-	const golden = "5644524600010100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000e189d5c58d02f5c295e58fc50c9e72272a3ed5fe4b6c03628814a0f57b73d63f000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
+	const golden = "5644524600010100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000810cf18386ac3345a53a17fb9c5756197adb0a55b2fd4f8e138c1c828dd175430000000000000001000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
 	if got := hex.EncodeToString(frame); got != golden {
 		t.Fatalf("golden frame changed:\n got %s\nwant %s", got, golden)
 	}
@@ -337,8 +337,8 @@ func TestStaticFrameRejectsConfigurationEntry(t *testing.T) {
 			_, _, err := sender.EncodeOutbound(nil, raftmember.OutboundMessage{
 				Group: group, From: from, To: to, Message: message,
 			})
-			if !errors.Is(err, ErrUnsupportedFrame) {
-				t.Fatalf("error = %v, want ErrUnsupportedFrame", err)
+			if !errors.Is(err, ErrUnauthorized) {
+				t.Fatalf("error = %v, want ErrUnauthorized", err)
 			}
 		})
 	}
@@ -354,16 +354,17 @@ func TestDecodeInboundRejectsChangedStaticRoster(t *testing.T) {
 		{Group: group, ReplicaSetVersion: 1, MemberID: 13, Node: testNode(3), Role: MemberVoter},
 	}
 	tests := []struct {
-		name   string
-		mutate func([]Member)
+		name             string
+		mutate           func([]Member)
+		wantUnauthorized bool
 	}{
 		{name: "role", mutate: func(members []Member) { members[1].Role = MemberLearner }},
-		{name: "node", mutate: func(members []Member) { members[1].Node = testNode(4) }},
+		{name: "node", mutate: func(members []Member) { members[1].Node = testNode(4) }, wantUnauthorized: true},
 		{name: "replica-set version", mutate: func(members []Member) {
 			for i := range members {
 				members[i].ReplicaSetVersion++
 			}
-		}},
+		}, wantUnauthorized: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -373,8 +374,9 @@ func TestDecodeInboundRejectsChangedStaticRoster(t *testing.T) {
 			if err != nil {
 				t.Fatalf("changed registry: %v", err)
 			}
-			if _, err := changed.DecodeInbound(testPeerIdentity(changed, sender.LocalNode()), frame); !errors.Is(err, ErrUnauthorized) {
-				t.Fatalf("error = %v, want ErrUnauthorized", err)
+			_, err = changed.DecodeInbound(testPeerIdentity(changed, sender.LocalNode()), frame)
+			if errors.Is(err, ErrUnauthorized) != test.wantUnauthorized {
+				t.Fatalf("error = %v, want unauthorized=%t", err, test.wantUnauthorized)
 			}
 		})
 	}

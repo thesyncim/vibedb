@@ -2,9 +2,9 @@
 // current-format ordinary-message frame boundary, and a composable
 // authenticated peer-stream foundation for Multi-Raft.
 //
-// The transport foundation is not wired into multiraft.Host serving. Callers
-// must supply connection discovery, enrolled certificates, listener ownership,
-// and the exact trusted topology snapshot.
+// Callers supply connection discovery, enrolled certificates, listener
+// ownership, and the exact trusted metadata grant. raftservice publishes each
+// durable ConfState cut into the bounded dynamic authority view.
 package rafttransport
 
 import (
@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 // AbsoluteMaxGroups is the process-wide hard ceiling for retained Raft groups.
@@ -44,12 +46,14 @@ var (
 // principal from a verified critical certificate extension.
 type NodeID [16]byte
 
-// MemberRole is the immutable static Raft role authorized by a roster.
+// MemberRole is dynamic committed Raft authority. MemberEnrolled carries only
+// stable authenticated identity and grants no Raft traffic role.
 type MemberRole uint8
 
 const (
-	MemberVoter   MemberRole = 1
-	MemberLearner MemberRole = 2
+	MemberEnrolled MemberRole = 0
+	MemberVoter    MemberRole = 1
+	MemberLearner  MemberRole = 2
 )
 
 // Member binds one Raft member ID to its transport node within one group.
@@ -74,7 +78,6 @@ type memberKey struct {
 
 type memberRecord struct {
 	node NodeID
-	role MemberRole
 }
 
 type nodeKey struct {
@@ -82,13 +85,11 @@ type nodeKey struct {
 	node  NodeID
 }
 
-// StaticRegistry is an immutable, bounded member-to-node snapshot. Its methods
-// are safe for concurrent use after construction.
+// StaticRegistry keeps immutable member-to-node enrollment plus atomically
+// published bounded dynamic ConfState authority. Its methods are concurrent.
 //
-// The roster is trusted caller-supplied bootstrap state. This package does not
-// inspect a live Runtime or Host ConfState. Its digest detects mismatched
-// static roster bytes; it is not authentication, topology authorization, or
-// serving authority.
+// The enrollment digest excludes roles and ReplicaSetVersion. Dynamic views
+// are advanced only from an exact committed ConfState and metadata grant.
 type StaticRegistry struct {
 	local        NodeID
 	trustDomain  TrustDomain
@@ -96,8 +97,28 @@ type StaticRegistry struct {
 	members      map[nodeKey]uint64
 	localMembers map[raftmember.GroupKey]uint64
 	digests      map[raftmember.GroupKey][sha256.Size]byte
+	authorities  map[raftmember.GroupKey]*authoritySlot
 	canonical    frameBufferPool
 }
+
+type TransitionGrant struct {
+	Group             raftmember.GroupKey
+	TransitionID      [16]byte
+	MetadataEpoch     uint64
+	CatalogGeneration uint64
+	SourceMember      uint64
+	TargetMember      uint64
+}
+
+type authorityView struct {
+	version       uint64
+	roles         map[uint64]MemberRole
+	previous      *authorityView
+	allowPrevious bool
+	grant         TransitionGrant
+}
+
+type authoritySlot struct{ view atomic.Pointer[authorityView] }
 
 // NewStaticRegistry validates and copies one current static roster before
 // publishing it. It accepts members in any order. The caller must derive every
@@ -123,6 +144,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		members:      make(map[nodeKey]uint64, len(members)),
 		localMembers: make(map[raftmember.GroupKey]uint64),
 		digests:      make(map[raftmember.GroupKey][sha256.Size]byte),
+		authorities:  make(map[raftmember.GroupKey]*authoritySlot),
 		canonical:    frameBufferPool{retain: DefaultRetainedFrameBytes},
 	}
 	groups := make(map[raftmember.GroupKey]struct{})
@@ -170,7 +192,7 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 			groupVoters[member.Group]++
 		}
 
-		registry.nodes[memberKey] = memberRecord{node: member.Node, role: member.Role}
+		registry.nodes[memberKey] = memberRecord{node: member.Node}
 		registry.members[nodeKey] = member.MemberID
 		if member.Node == local {
 			registry.localMembers[member.Group] = member.MemberID
@@ -190,7 +212,17 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		for last < len(detached) && detached[last].Group == detached[first].Group {
 			last++
 		}
-		registry.digests[detached[first].Group] = rosterDigest(detached[first:last])
+		group := detached[first].Group
+		registry.digests[group] = rosterDigest(detached[first:last])
+		roles := make(map[uint64]MemberRole, last-first)
+		for _, member := range detached[first:last] {
+			if member.Role != MemberEnrolled {
+				roles[member.MemberID] = member.Role
+			}
+		}
+		slot := &authoritySlot{}
+		slot.view.Store(&authorityView{version: detached[first].ReplicaSetVersion, roles: roles})
+		registry.authorities[group] = slot
 		first = last
 	}
 	return registry, nil
@@ -218,7 +250,7 @@ func validateMember(member Member) error {
 	if member.MemberID == 0 || raft.IsLocalMsgTarget(member.MemberID) {
 		return ErrInvalidMember
 	}
-	if member.Role != MemberVoter && member.Role != MemberLearner {
+	if member.Role != MemberEnrolled && member.Role != MemberVoter && member.Role != MemberLearner {
 		return ErrInvalidRole
 	}
 	if member.ReplicaSetVersion == 0 {
@@ -233,6 +265,144 @@ func validateMember(member Member) error {
 		return ErrInvalidGroup
 	}
 	return nil
+}
+
+func (registry *StaticRegistry) AuthorizeTransition(grant TransitionGrant) error {
+	if registry == nil || grant.Group == (raftmember.GroupKey{}) ||
+		grant.TransitionID == ([16]byte{}) || grant.MetadataEpoch == 0 ||
+		grant.CatalogGeneration == 0 || grant.SourceMember == 0 || grant.TargetMember == 0 ||
+		grant.SourceMember == grant.TargetMember {
+		return ErrInvalidMember
+	}
+	slot := registry.authorities[grant.Group]
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	if _, err := registry.Node(grant.Group, grant.SourceMember); err != nil {
+		return err
+	}
+	if _, err := registry.Node(grant.Group, grant.TargetMember); err != nil {
+		return err
+	}
+	for {
+		current := slot.view.Load()
+		if current.grant != (TransitionGrant{}) && current.grant != grant {
+			return ErrReplicaSet
+		}
+		next := *current
+		next.grant = grant
+		if slot.view.CompareAndSwap(current, &next) {
+			return nil
+		}
+	}
+}
+
+func (registry *StaticRegistry) PublishCommittedAuthority(
+	group raftmember.GroupKey,
+	version uint64,
+	conf *pb.ConfState,
+) error {
+	if registry == nil || version == 0 || conf == nil {
+		return ErrReplicaSet
+	}
+	slot := registry.authorities[group]
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	roles, err := registry.rolesFromConf(group, conf)
+	if err != nil {
+		return err
+	}
+	for {
+		current := slot.view.Load()
+		if version == current.version {
+			if equalRoles(current.roles, roles) {
+				return nil
+			}
+			return ErrReplicaSet
+		}
+		if version < current.version || !validAdjacentRoles(current, roles) {
+			return ErrReplicaSet
+		}
+		_, hadSource := current.roles[current.grant.SourceMember]
+		_, hasSource := roles[current.grant.SourceMember]
+		removed := current.grant.SourceMember != 0 && hadSource && !hasSource
+		var previous *authorityView
+		if !removed {
+			previous = &authorityView{version: current.version, roles: current.roles, grant: current.grant}
+		}
+		next := &authorityView{version: version, roles: roles, grant: current.grant,
+			previous: previous, allowPrevious: !removed}
+		if slot.view.CompareAndSwap(current, next) {
+			return nil
+		}
+	}
+}
+
+func (registry *StaticRegistry) rolesFromConf(
+	group raftmember.GroupKey,
+	conf *pb.ConfState,
+) (map[uint64]MemberRole, error) {
+	if len(conf.GetVotersOutgoing()) != 0 || len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() {
+		return nil, ErrReplicaSet
+	}
+	roles := make(map[uint64]MemberRole, len(conf.GetVoters())+len(conf.GetLearners()))
+	for _, member := range conf.GetVoters() {
+		if _, err := registry.Node(group, member); err != nil {
+			return nil, err
+		}
+		roles[member] = MemberVoter
+	}
+	for _, member := range conf.GetLearners() {
+		if _, err := registry.Node(group, member); err != nil || roles[member] != MemberEnrolled {
+			return nil, ErrReplicaSet
+		}
+		roles[member] = MemberLearner
+	}
+	return roles, nil
+}
+
+func validAdjacentRoles(current *authorityView, next map[uint64]MemberRole) bool {
+	grant := current.grant
+	if grant == (TransitionGrant{}) {
+		return false
+	}
+	sourceCurrent, sourceNext := current.roles[grant.SourceMember], next[grant.SourceMember]
+	targetCurrent, targetNext := current.roles[grant.TargetMember], next[grant.TargetMember]
+	if sourceCurrent != MemberVoter {
+		return false
+	}
+	switch {
+	case targetCurrent == MemberEnrolled:
+		return targetNext == MemberLearner && sourceNext == MemberVoter &&
+			onlyRoleChange(current.roles, next, grant.TargetMember)
+	case targetCurrent == MemberLearner:
+		return targetNext == MemberVoter && sourceNext == MemberVoter &&
+			onlyRoleChange(current.roles, next, grant.TargetMember)
+	case targetCurrent == MemberVoter:
+		return sourceNext == MemberEnrolled &&
+			onlyRoleChange(current.roles, next, grant.SourceMember)
+	default:
+		return false
+	}
+}
+
+func onlyRoleChange(current, next map[uint64]MemberRole, member uint64) bool {
+	for id, role := range current {
+		if id != member && next[id] != role {
+			return false
+		}
+	}
+	for id, role := range next {
+		if id != member && current[id] != role {
+			return false
+		}
+	}
+	return true
+}
+
+func equalRoles(left, right map[uint64]MemberRole) bool {
+	return len(left) == len(right) && onlyRoleChange(left, right, 0)
 }
 
 // LocalNode returns the registry's configured local node ID.
@@ -276,16 +446,29 @@ func (registry *StaticRegistry) Node(group raftmember.GroupKey, memberID uint64)
 	return record.node, nil
 }
 
-// Role returns memberID's immutable static role in group.
+// Role returns memberID's current committed dynamic role in group.
 func (registry *StaticRegistry) Role(group raftmember.GroupKey, memberID uint64) (MemberRole, error) {
-	if registry == nil {
-		return 0, ErrMemberNotFound
-	}
-	record, ok := registry.nodes[memberKey{group: group, memberID: memberID}]
+	view, ok := registry.currentAuthority(group)
 	if !ok {
 		return 0, ErrMemberNotFound
 	}
-	return record.role, nil
+	role, ok := view.roles[memberID]
+	if !ok {
+		return 0, ErrMemberNotFound
+	}
+	return role, nil
+}
+
+// ReplicaSetVersion returns the exact committed authority generation currently
+// used to authenticate group traffic.
+func (registry *StaticRegistry) ReplicaSetVersion(
+	group raftmember.GroupKey,
+) (uint64, bool) {
+	view, ok := registry.currentAuthority(group)
+	if !ok {
+		return 0, false
+	}
+	return view.version, true
 }
 
 // Member returns the member hosted by node in group.
@@ -306,6 +489,35 @@ func (registry *StaticRegistry) rosterDigest(group raftmember.GroupKey) ([sha256
 	}
 	digest, ok := registry.digests[group]
 	return digest, ok
+}
+
+func (registry *StaticRegistry) currentAuthority(group raftmember.GroupKey) (*authorityView, bool) {
+	if registry == nil {
+		return nil, false
+	}
+	slot := registry.authorities[group]
+	if slot == nil {
+		return nil, false
+	}
+	view := slot.view.Load()
+	return view, view != nil
+}
+
+func (registry *StaticRegistry) authorityAt(
+	group raftmember.GroupKey,
+	version uint64,
+) (*authorityView, bool) {
+	current, ok := registry.currentAuthority(group)
+	if !ok {
+		return nil, false
+	}
+	if current.version == version {
+		return current, true
+	}
+	if current.allowPrevious && current.previous != nil && current.previous.version == version {
+		return current.previous, true
+	}
+	return nil, false
 }
 
 func compareMembers(left, right Member) int {
@@ -333,16 +545,16 @@ func compareGroupKeys(left, right raftmember.GroupKey) int {
 
 func rosterDigest(members []Member) [sha256.Size]byte {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("vibedb/raft-transport/static-roster\x00"))
+	_, _ = hash.Write([]byte("vibedb/raft-transport/stable-enrollment\x00"))
 	var fixed [84]byte
 	appendGroupKey(fixed[0:72], members[0].Group)
-	binary.BigEndian.PutUint64(fixed[72:80], members[0].ReplicaSetVersion)
+	clear(fixed[72:80])
 	binary.BigEndian.PutUint32(fixed[80:84], uint32(len(members)))
 	_, _ = hash.Write(fixed[:])
 	var encoded [32]byte
 	for _, member := range members {
 		binary.BigEndian.PutUint64(encoded[0:8], member.MemberID)
-		encoded[8] = byte(member.Role)
+		encoded[8] = 0
 		clear(encoded[9:16])
 		copy(encoded[16:32], member.Node[:])
 		_, _ = hash.Write(encoded[:])

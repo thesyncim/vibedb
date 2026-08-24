@@ -31,7 +31,7 @@ var (
 const (
 	// FrameHeaderBytes is the fixed current frame-header size. The numeric
 	// codec discriminator is a fail-closed sentinel, not a compatibility API.
-	FrameHeaderBytes = 132
+	FrameHeaderBytes = 140
 	// MaxFrameBytes lets an authenticated stream reader reject a declared length
 	// before allocating a frame buffer.
 	MaxFrameBytes = FrameHeaderBytes + raftmodel.MaxInboundMessageBytes
@@ -51,6 +51,7 @@ type Inbound struct {
 type frameHeader struct {
 	group       raftmember.GroupKey
 	roster      [32]byte
+	version     uint64
 	from        uint64
 	to          uint64
 	payloadSize uint32
@@ -59,6 +60,7 @@ type frameHeader struct {
 type outboundFramePlan struct {
 	destination NodeID
 	roster      [32]byte
+	version     uint64
 	payloadSize int
 	frameSize   int
 }
@@ -112,7 +114,11 @@ func (registry *StaticRegistry) preflightOutbound(
 	if err != nil {
 		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
-	if err := registry.validateStaticMessage(outbound.Group, outbound.Message); err != nil {
+	view, ok := registry.currentAuthority(outbound.Group)
+	if !ok {
+		return outboundFramePlan{}, fmt.Errorf("%w: missing committed authority", ErrUnauthorized)
+	}
+	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
 		return outboundFramePlan{}, err
 	}
 	roster, ok := registry.rosterDigest(outbound.Group)
@@ -125,6 +131,7 @@ func (registry *StaticRegistry) preflightOutbound(
 	return outboundFramePlan{
 		destination: destination,
 		roster:      roster,
+		version:     view.version,
 		payloadSize: size,
 		frameSize:   FrameHeaderBytes + size,
 	}, nil
@@ -165,9 +172,10 @@ func (registry *StaticRegistry) appendOutbound(
 	header[7] = 0
 	appendGroupKey(header[8:80], outbound.Group)
 	copy(header[80:112], plan.roster[:])
-	binary.BigEndian.PutUint64(header[112:120], outbound.From)
-	binary.BigEndian.PutUint64(header[120:128], outbound.To)
-	binary.BigEndian.PutUint32(header[128:132], uint32(plan.payloadSize))
+	binary.BigEndian.PutUint64(header[112:120], plan.version)
+	binary.BigEndian.PutUint64(header[120:128], outbound.From)
+	binary.BigEndian.PutUint64(header[128:136], outbound.To)
+	binary.BigEndian.PutUint32(header[136:140], uint32(plan.payloadSize))
 	return dst, nil
 }
 
@@ -197,7 +205,7 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	}
 	roster, ok := registry.rosterDigest(header.group)
 	if !ok || roster != header.roster {
-		return Inbound{}, fmt.Errorf("%w: static roster digest differs", ErrUnauthorized)
+		return Inbound{}, fmt.Errorf("%w: stable enrollment digest differs", ErrUnauthorized)
 	}
 	if err := preflightOrdinaryPayload(payload); err != nil {
 		return Inbound{}, err
@@ -213,7 +221,14 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	if _, err := raftmember.MeasureOrdinaryMessage(message); err != nil {
 		return Inbound{}, classifyOrdinaryError(err)
 	}
-	if err := registry.validateStaticMessage(header.group, message); err != nil {
+	view, ok := registry.authorityAt(header.group, header.version)
+	if !ok {
+		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
+	}
+	if !ok {
+		return Inbound{}, fmt.Errorf("%w: replica-set generation is outside bounded authority", ErrUnauthorized)
+	}
+	if err := registry.validateAuthorizedMessage(header.group, view, message); err != nil {
 		return Inbound{}, err
 	}
 	scratch := registry.canonical.get(len(payload))
@@ -233,6 +248,45 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	return Inbound{Group: header.group, Message: message}, nil
 }
 
+func (registry *StaticRegistry) prospectiveAuthority(
+	group raftmember.GroupKey,
+	version uint64,
+	message *pb.Message,
+) (*authorityView, bool) {
+	current, ok := registry.currentAuthority(group)
+	if !ok || version <= current.version || message == nil {
+		return nil, false
+	}
+	for _, entry := range message.GetEntries() {
+		if entry == nil || entry.GetIndex() != version ||
+			(entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
+			continue
+		}
+		change, member, err := openSingleConfChange(entry)
+		if err != nil || !authorizedConfChange(current, change, member) {
+			return nil, false
+		}
+		roles := make(map[uint64]MemberRole, len(current.roles)+1)
+		for id, role := range current.roles {
+			roles[id] = role
+		}
+		switch change {
+		case pb.ConfChangeAddLearnerNode:
+			roles[member] = MemberLearner
+		case pb.ConfChangeAddNode:
+			roles[member] = MemberVoter
+		case pb.ConfChangeRemoveNode:
+			delete(roles, member)
+		default:
+			return nil, false
+		}
+		previous := &authorityView{version: current.version, roles: current.roles, grant: current.grant}
+		return &authorityView{version: version, roles: roles, grant: current.grant,
+			previous: previous}, true
+	}
+	return nil, false
+}
+
 func parseFrame(frame []byte) (frameHeader, []byte, error) {
 	if len(frame) < FrameHeaderBytes {
 		return frameHeader{}, nil, fmt.Errorf("%w: truncated header", ErrInvalidFrame)
@@ -247,15 +301,16 @@ func parseFrame(frame []byte) (frameHeader, []byte, error) {
 	}
 	header := frameHeader{
 		group:       openGroupKey(frame[8:80]),
-		from:        binary.BigEndian.Uint64(frame[112:120]),
-		to:          binary.BigEndian.Uint64(frame[120:128]),
-		payloadSize: binary.BigEndian.Uint32(frame[128:132]),
+		version:     binary.BigEndian.Uint64(frame[112:120]),
+		from:        binary.BigEndian.Uint64(frame[120:128]),
+		to:          binary.BigEndian.Uint64(frame[128:136]),
+		payloadSize: binary.BigEndian.Uint32(frame[136:140]),
 	}
 	copy(header.roster[:], frame[80:112])
 	if err := validateFrameGroup(header.group); err != nil {
 		return frameHeader{}, nil, err
 	}
-	if header.from == 0 || header.to == 0 || header.from == header.to {
+	if header.version == 0 || header.from == 0 || header.to == 0 || header.from == header.to {
 		return frameHeader{}, nil, fmt.Errorf("%w: invalid member IDs", ErrInvalidFrame)
 	}
 	if uint64(header.payloadSize) > uint64(raftmodel.MaxInboundMessageBytes) {
@@ -335,19 +390,32 @@ func byteSlicesOverlap(left, right []byte) bool {
 	return leftStart-rightStart < uintptr(len(right))
 }
 
-func (registry *StaticRegistry) validateStaticMessage(group raftmember.GroupKey, message *pb.Message) error {
-	fromRole, err := registry.Role(group, message.GetFrom())
-	if err != nil {
-		return fmt.Errorf("%w: source member role is not registered", ErrUnauthorized)
+func (registry *StaticRegistry) validateAuthorizedMessage(
+	group raftmember.GroupKey,
+	view *authorityView,
+	message *pb.Message,
+) error {
+	if view == nil {
+		return fmt.Errorf("%w: missing dynamic authority", ErrUnauthorized)
 	}
-	toRole, err := registry.Role(group, message.GetTo())
+	fromRole := view.roles[message.GetFrom()]
+	toRole := view.roles[message.GetTo()]
+	configuration, err := validateAuthorizedConfiguration(view, message.GetEntries())
 	if err != nil {
-		return fmt.Errorf("%w: destination member role is not registered", ErrUnauthorized)
+		return err
 	}
-	for _, entry := range message.GetEntries() {
-		if entry.GetType() != pb.EntryNormal {
-			return fmt.Errorf("%w: dynamic configuration entry", ErrUnsupportedFrame)
-		}
+	// During learner addition, stable enrollment permits only the exact target
+	// to receive the matching configuration append and answer replication. It
+	// grants no vote or leader role before committed publication.
+	if toRole == MemberEnrolled && configuration && message.GetTo() == view.grant.TargetMember {
+		toRole = MemberLearner
+	}
+	if fromRole == MemberEnrolled && message.GetFrom() == view.grant.TargetMember &&
+		(message.GetType() == pb.MsgAppResp || message.GetType() == pb.MsgHeartbeatResp) {
+		fromRole = MemberLearner
+	}
+	if fromRole == MemberEnrolled || toRole == MemberEnrolled {
+		return fmt.Errorf("%w: member lacks committed role", ErrUnauthorized)
 	}
 	switch message.GetType() {
 	case pb.MsgApp, pb.MsgHeartbeat:
@@ -370,4 +438,64 @@ func (registry *StaticRegistry) validateStaticMessage(group raftmember.GroupKey,
 		return fmt.Errorf("%w: ordinary type %s", ErrUnsupportedFrame, message.GetType())
 	}
 	return nil
+}
+
+func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (bool, error) {
+	found := false
+	for index := range entries {
+		entry := entries[index]
+		if entry.GetType() == pb.EntryNormal {
+			continue
+		}
+		if found || (entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
+			return false, fmt.Errorf("%w: unsupported configuration batch", ErrUnauthorized)
+		}
+		change, member, err := openSingleConfChange(entry)
+		authorized := err == nil && authorizedConfChange(view, change, member)
+		if !authorized && view.previous != nil {
+			authorized = err == nil && authorizedConfChange(view.previous, change, member)
+		}
+		if !authorized {
+			return false, fmt.Errorf("%w: configuration differs from metadata grant", ErrUnauthorized)
+		}
+		found = true
+	}
+	return found, nil
+}
+
+func openSingleConfChange(entry *pb.Entry) (pb.ConfChangeType, uint64, error) {
+	if entry == nil {
+		return 0, 0, ErrInvalidFrame
+	}
+	if entry.GetType() == pb.EntryConfChange {
+		var change pb.ConfChange
+		if err := proto.Unmarshal(entry.GetData(), &change); err != nil || len(change.GetContext()) != 0 {
+			return 0, 0, ErrInvalidFrame
+		}
+		return change.GetType(), change.GetNodeId(), nil
+	}
+	var change pb.ConfChangeV2
+	if err := proto.Unmarshal(entry.GetData(), &change); err != nil || len(change.GetContext()) != 0 ||
+		len(change.GetChanges()) != 1 || change.GetTransition() != pb.ConfChangeTransition_ConfChangeTransitionAuto {
+		return 0, 0, ErrInvalidFrame
+	}
+	return change.GetChanges()[0].GetType(), change.GetChanges()[0].GetNodeId(), nil
+}
+
+func authorizedConfChange(view *authorityView, change pb.ConfChangeType, member uint64) bool {
+	grant := view.grant
+	if grant == (TransitionGrant{}) {
+		return false
+	}
+	targetRole := view.roles[grant.TargetMember]
+	switch {
+	case targetRole == MemberEnrolled:
+		return change == pb.ConfChangeAddLearnerNode && member == grant.TargetMember
+	case targetRole == MemberLearner:
+		return change == pb.ConfChangeAddNode && member == grant.TargetMember
+	case targetRole == MemberVoter:
+		return change == pb.ConfChangeRemoveNode && member == grant.SourceMember
+	default:
+		return false
+	}
 }

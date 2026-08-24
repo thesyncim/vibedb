@@ -3,6 +3,8 @@ package shardservice
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -119,8 +121,35 @@ func TestReplicatedMembershipDecodeAllocationBound(t *testing.T) {
 			panic("membership decode")
 		}
 	})
-	if allocations > 3 {
-		t.Fatalf("membership decode allocations = %.1f, want <= 3", allocations)
+	if allocations > 4 {
+		t.Fatalf("membership decode allocations = %.1f, want <= 4", allocations)
+	}
+}
+
+func TestReplicatedMembershipPreflightsExactBodyBeforeAllocation(t *testing.T) {
+	var header [5]byte
+	header[0] = tagReplicatedMembershipRequest
+	binary.BigEndian.PutUint32(header[1:], uint32(4+replicatedMembershipRequestBodyBytes+1))
+	var reader bytes.Reader
+	allocations := testing.AllocsPerRun(1000, func() {
+		reader.Reset(header[:])
+		if _, err := DecodeReplicatedRequest(&reader); !errors.Is(err, ErrReplicatedWire) {
+			panic("membership preflight")
+		}
+	})
+	if allocations > 1 {
+		t.Fatalf("oversized membership preflight allocations = %.1f, want <= 1", allocations)
+	}
+	binary.BigEndian.PutUint32(header[1:], uint32(4+replicatedMembershipRequestBodyBytes))
+	badPrefix := append(header[:], replicatedWireVersion+1, byte(ReplicatedMembership))
+	allocations = testing.AllocsPerRun(1000, func() {
+		reader.Reset(badPrefix)
+		if _, err := DecodeReplicatedRequest(&reader); !errors.Is(err, ErrReplicatedWire) {
+			panic("membership prefix preflight")
+		}
+	})
+	if allocations > 2 {
+		t.Fatalf("bad membership prefix allocations = %.1f, want <= 2", allocations)
 	}
 }
 

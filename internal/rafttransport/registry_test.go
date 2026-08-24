@@ -182,7 +182,7 @@ func TestStaticRegistryConstructsAndDirectlyLooksUpAbsoluteGroupCount(t *testing
 	}
 }
 
-func TestStaticRegistryRosterDigestIsOrderIndependentAndBindsProfile(t *testing.T) {
+func TestStaticRegistryEnrollmentDigestIsOrderIndependentAndExcludesDynamicAuthority(t *testing.T) {
 	group := testGroup(1)
 	members := []Member{
 		{Group: group, ReplicaSetVersion: 7, MemberID: 1, Node: testNode(1), Role: MemberVoter},
@@ -212,13 +212,17 @@ func TestStaticRegistryRosterDigestIsOrderIndependentAndBindsProfile(t *testing.
 			rows[1].ReplicaSetVersion++
 		},
 		func(rows []Member) { rows[1].Role = MemberVoter },
-		func(rows []Member) { rows[1].Node = testNode(3) },
 	} {
 		changed := slices.Clone(members)
 		mutate(changed)
-		if got := open(changed); got == want {
-			t.Fatalf("profile mutation did not change roster digest: %x", got)
+		if got := open(changed); got != want {
+			t.Fatalf("dynamic authority changed stable enrollment digest: %x", got)
 		}
+	}
+	changed := slices.Clone(members)
+	changed[1].Node = testNode(3)
+	if got := open(changed); got == want {
+		t.Fatalf("stable node mutation did not change enrollment digest: %x", got)
 	}
 }
 

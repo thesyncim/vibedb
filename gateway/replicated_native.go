@@ -150,8 +150,37 @@ func (e *ReplicatedRefusalError) Unwrap() error {
 // request. Applied membership remains an observation barrier: the controller
 // must wait for ExpectedReplicaSetVersion to advance before the next step.
 type ReplicatedMembershipResult struct {
-	State   shardservice.ReplicatedMemberState
-	Retries int
+	State           shardservice.ReplicatedMemberState
+	Retries         int
+	TransferWitness MembershipTransferWitness
+}
+
+type MembershipTransferWitness struct {
+	TargetMember uint64
+	Term         uint64
+}
+
+// ObserveMembershipTransfer resolves a prior outcome-unknown transfer without
+// resending the transfer command. Success is an exact barrier: target is the
+// observed leader and its term is newer than the source term observed before
+// the original request. A controller must carry the returned term into the
+// subsequent remove-voter request.
+func (executor *ReplicatedExecutor) ObserveMembershipTransfer(
+	ctx context.Context,
+	route ReplicatedRoute,
+	target, afterTerm uint64,
+) (ReplicatedMembershipResult, error) {
+	if executor == nil || executor.client == nil || ctx == nil ||
+		!validReplicatedRoute(route) || target == 0 || afterTerm == 0 {
+		return ReplicatedMembershipResult{}, ErrReplicatedRoute
+	}
+	result, witnessed := executor.observeMembershipTransfer(ctx, route, target, afterTerm)
+	if !witnessed {
+		return ReplicatedMembershipResult{}, raftservice.ErrOutcomeUnknown
+	}
+	result.TransferWitness = MembershipTransferWitness{TargetMember: target,
+		Term: result.State.Fence.Term}
+	return result, nil
 }
 
 // ApplyMembership routes one fixed-width metadata-authorized transition. It
@@ -177,6 +206,14 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			&shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
 				Fence: state.Fence, Membership: membership})
 		if err != nil {
+			if membership.Kind == raftservice.MembershipTransferLeader {
+				if witness, observeErr := executor.ObserveMembershipTransfer(
+					ctx, route, membership.TargetMember, state.Fence.Term,
+				); observeErr == nil {
+					witness.Retries += attempt
+					return witness, nil
+				}
+			}
 			return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown, err)
 		}
 		if !validReplicatedResponseState(response) ||
@@ -192,7 +229,18 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 					ErrReplicatedRoute)
 			}
-			return ReplicatedMembershipResult{State: response.State, Retries: attempt}, nil
+			result := ReplicatedMembershipResult{State: response.State, Retries: attempt}
+			if membership.Kind == raftservice.MembershipTransferLeader {
+				witness, observeErr := executor.ObserveMembershipTransfer(
+					ctx, route, membership.TargetMember, state.Fence.Term,
+				)
+				if observeErr != nil {
+					return ReplicatedMembershipResult{}, raftservice.ErrOutcomeUnknown
+				}
+				result.State = witness.State
+				result.TransferWitness = witness.TransferWitness
+			}
+			return result, nil
 		case shardservice.ReplicatedNotLeader:
 			if !validReplicatedNonterminalResponse(response) {
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
@@ -201,6 +249,14 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			preferred = response.State.LeaderID
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
+			if membership.Kind == raftservice.MembershipTransferLeader {
+				if witness, observeErr := executor.ObserveMembershipTransfer(
+					ctx, route, membership.TargetMember, state.Fence.Term,
+				); observeErr == nil {
+					witness.Retries += attempt
+					return witness, nil
+				}
+			}
 			return ReplicatedMembershipResult{}, raftservice.ErrOutcomeUnknown
 		case shardservice.ReplicatedRefusal:
 			if !validReplicatedPreAdmissionRefusal(response, response.Refusal, true) {
@@ -214,6 +270,23 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 		}
 	}
 	return ReplicatedMembershipResult{}, ErrReplicatedLeader
+}
+
+func (executor *ReplicatedExecutor) observeMembershipTransfer(
+	ctx context.Context,
+	route ReplicatedRoute,
+	target, afterTerm uint64,
+) (ReplicatedMembershipResult, bool) {
+	preferred := target
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		endpoint, state, err := executor.discoverLeader(ctx, route, preferred)
+		if err == nil && endpoint.Member == target && state.LeaderID == target &&
+			state.Fence.MemberID == target && state.Fence.Term > afterTerm {
+			return ReplicatedMembershipResult{State: state, Retries: attempt}, true
+		}
+		preferred = target
+	}
+	return ReplicatedMembershipResult{}, false
 }
 
 // Propose discovers the live leader, submits the canonical command, and uses

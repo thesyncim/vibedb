@@ -70,6 +70,7 @@ type Options struct {
 	Members                  []raftmember.RuntimeIdentity
 	CommandFences            []CommandFence
 	MembershipAuthorizations []MembershipAuthorization
+	MembershipAuthority      MembershipAuthoritySink
 	Outbound                 OutboundSink
 	Pulse                    <-chan struct{}
 	Limits                   Limits
@@ -210,13 +211,14 @@ func (e *UnknownOutcomeError) Unwrap() []error {
 // message is never discarded on transport backpressure: the Owner does not pop
 // another Host message until the retained one is accepted.
 type Owner struct {
-	registry *raftserve.Registry
-	host     *multiraft.Host
-	groups   []raftmember.GroupKey
-	members  map[raftmember.GroupKey]ownerMember
-	outbound OutboundSink
-	pulse    <-chan struct{}
-	limits   Limits
+	registry  *raftserve.Registry
+	host      *multiraft.Host
+	groups    []raftmember.GroupKey
+	members   map[raftmember.GroupKey]ownerMember
+	outbound  OutboundSink
+	pulse     <-chan struct{}
+	limits    Limits
+	authority MembershipAuthoritySink
 
 	ingress chan ownerRequest
 	ready   chan struct{}
@@ -230,6 +232,10 @@ type Owner struct {
 	started              bool
 	closed               bool
 	failure              error
+}
+
+type MembershipAuthoritySink interface {
+	PublishCommittedAuthority(raftmember.GroupKey, uint64, *pb.ConfState) error
 }
 
 type ownerMember struct {
@@ -274,6 +280,7 @@ type MembershipRequest struct {
 	ExpectedReplicaSetVersion uint64
 	SourceMember              uint64
 	TargetMember              uint64
+	TransferTerm              uint64
 }
 
 // NewOwner validates and detaches one lane configuration. Runtime adoption and
@@ -284,6 +291,7 @@ func NewOwner(options Options) (*Owner, error) {
 		len(options.CommandFences) != len(options.Members) ||
 		(len(options.MembershipAuthorizations) != 0 &&
 			len(options.MembershipAuthorizations) != len(options.Members)) ||
+		(len(options.MembershipAuthorizations) != 0 && options.MembershipAuthority == nil) ||
 		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
 		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingProposalItems <= 0 ||
@@ -327,9 +335,10 @@ func NewOwner(options Options) (*Owner, error) {
 	return &Owner{
 		registry: options.Registry, host: options.Host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
-		ingress: make(chan ownerRequest, limits.MaxIngressItems),
-		ready:   make(chan struct{}),
-		done:    make(chan struct{}),
+		authority: options.MembershipAuthority,
+		ingress:   make(chan ownerRequest, limits.MaxIngressItems),
+		ready:     make(chan struct{}),
+		done:      make(chan struct{}),
 	}, nil
 }
 
@@ -347,6 +356,9 @@ func (owner *Owner) Run(ctx context.Context) error {
 	owner.started = true
 	close(owner.ready)
 	owner.mu.Unlock()
+	if err := owner.syncMembershipAuthorities(); err != nil {
+		return owner.stop(err)
+	}
 
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
@@ -397,6 +409,9 @@ func (owner *Owner) Run(ctx context.Context) error {
 				// sink: the next bounded ingress event or logical pulse retries it.
 				readyBlocked = true
 			case done:
+				if err := owner.syncMembershipAuthorities(); err != nil {
+					return owner.stop(err)
+				}
 				continue
 			}
 		}
@@ -424,6 +439,24 @@ func (owner *Owner) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (owner *Owner) syncMembershipAuthorities() error {
+	if owner.authority == nil {
+		return nil
+	}
+	for _, group := range owner.groups {
+		publication, err := owner.host.Publication(group)
+		if err != nil {
+			return err
+		}
+		if err := owner.authority.PublishCommittedAuthority(
+			group, publication.ReplicaSetVersion, publication.ConfState,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (owner *Owner) handle(request ownerRequest) error {
@@ -634,6 +667,7 @@ func validateMembershipTransition(
 		}
 	case MembershipRemoveVoter:
 		if status.LeaderID != request.TargetMember || status.MemberID != request.TargetMember ||
+			status.Term != request.TransferTerm ||
 			!containsSorted(voters, request.TargetMember) {
 			return ErrMembershipStale
 		}
@@ -648,6 +682,9 @@ func validateMembershipIdentity(
 	if request.Kind < MembershipAddLearner || request.Kind > MembershipTransferLeader ||
 		request.ExpectedReplicaSetVersion == 0 || request.SourceMember == 0 ||
 		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
+		return ErrMembershipMalformed
+	}
+	if (request.Kind == MembershipRemoveVoter) != (request.TransferTerm != 0) {
 		return ErrMembershipMalformed
 	}
 	if request.TransitionID != authority.TransitionID ||

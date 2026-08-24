@@ -68,15 +68,21 @@ func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
 	request := MembershipRequest{Kind: MembershipRemoveVoter,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 9,
-		SourceMember: 1, TargetMember: 3}
+		SourceMember: 1, TargetMember: 3, TransferTerm: 4}
 	publication := raftmodel.Publication{Applied: 9, ReplicaSetVersion: 9,
 		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}
-	status := raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Commit: 9, Applied: 9}
+	status := raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 4, Commit: 9, Applied: 9}
 	if err := validateMembershipTransition(request, authority, publication, status,
 		raftmodel.MemberProgress{}, false); !errors.Is(err, ErrMembershipStale) {
 		t.Fatalf("leader self-removal = %v", err)
 	}
 	status.MemberID, status.LeaderID = 3, 3
+	wrongTerm := request
+	wrongTerm.TransferTerm++
+	if err := validateMembershipTransition(wrongTerm, authority, publication, status,
+		raftmodel.MemberProgress{}, false); !errors.Is(err, ErrMembershipStale) {
+		t.Fatalf("wrong transfer witness = %v", err)
+	}
 	if err := validateMembershipTransition(request, authority, publication, status,
 		raftmodel.MemberProgress{}, false); err != nil {
 		t.Fatalf("target-leader removal: %v", err)

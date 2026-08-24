@@ -31,7 +31,7 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 	var commandIdentity sqldriver.ReplicatedShardStoreIdentity
 
 	for index := range replicas {
-		runtime, base := newRealTransferRuntime(t, identities[index], voters)
+		runtime, base, _ := newRealTransferRuntime(t, identities[index], voters)
 		host, err := NewHost(testHostLimits())
 		if err != nil {
 			t.Fatal(err)
@@ -61,6 +61,7 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 
 	cluster := realTransferCluster{
 		t: t, hosts: hosts, registries: registries,
+		group:       members[0].Group,
 		memberIndex: map[uint64]int{voters[0]: 0, voters[1]: 1, voters[2]: 2},
 	}
 	group := members[0].Group
@@ -105,10 +106,13 @@ type realTransferCluster struct {
 	hosts               []*Host
 	registries          []*rafttransport.StaticRegistry
 	memberIndex         map[uint64]int
+	inactive            map[int]bool
 	duplicateTimeoutNow bool
 	timeoutNowSeen      bool
 	duplicateRejected   bool
 	pendingDuplicate    int
+	syncAuthority       bool
+	group               raftmember.GroupKey
 }
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
@@ -119,6 +123,9 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 		}
 		progressed := false
 		for index, host := range cluster.hosts {
+			if cluster.inactive[index] {
+				continue
+			}
 			_, consumed, err := host.RunOne()
 			if err != nil {
 				if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
@@ -129,6 +136,17 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 				}
 			}
 			progressed = progressed || consumed
+			if cluster.syncAuthority && consumed {
+				publication, publishErr := host.Publication(cluster.group)
+				if publishErr != nil {
+					cluster.t.Fatal(publishErr)
+				}
+				if publishErr = cluster.registries[index].PublishCommittedAuthority(
+					cluster.group, publication.ReplicaSetVersion,
+					publication.ConfState); publishErr != nil {
+					cluster.t.Fatal(publishErr)
+				}
+			}
 			for {
 				outbound, ok := host.PopOutbound()
 				if !ok {
@@ -151,9 +169,18 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 	if !ok {
 		cluster.t.Fatalf("unknown outbound destination %d", outbound.To)
 	}
+	if cluster.inactive[receiverIndex] {
+		return
+	}
 	sender := cluster.registries[senderIndex]
 	receiver := cluster.registries[receiverIndex]
 	frame, destination, err := sender.EncodeOutbound(nil, outbound)
+	if errors.Is(err, rafttransport.ErrUnauthorized) {
+		publication, publicationErr := cluster.hosts[senderIndex].Publication(outbound.Group)
+		if publicationErr == nil && !confHasMember(publication.ConfState, outbound.From) {
+			return
+		}
+	}
 	if err != nil || destination != receiver.LocalNode() {
 		cluster.t.Fatalf("encode %s %d->%d = %x, %v",
 			outbound.Message.GetType(), outbound.From, outbound.To, destination, err)
@@ -180,6 +207,21 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 	}
 }
 
+func confHasMember(conf *pb.ConfState, member uint64) bool {
+	if conf == nil {
+		return false
+	}
+	for _, values := range [][]uint64{conf.GetVoters(), conf.GetLearners(),
+		conf.GetVotersOutgoing(), conf.GetLearnersNext()} {
+		for _, candidate := range values {
+			if candidate == member {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (cluster *realTransferCluster) allAppliedWithLeader(
 	group raftmember.GroupKey,
 	leader, minimumApplied uint64,
@@ -202,10 +244,16 @@ func newRealTransferRuntime(
 	t *testing.T,
 	identity raftstore.Identity,
 	voters []uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
 	index, term := uint64(1), uint64(1)
-	wal, err := raftstore.Create(filepath.Join(t.TempDir(), "member.wal"), identity, realTransferWALKey(), raftstore.Bootstrap{
+	walPath := filepath.Join(t.TempDir(), "member.wal")
+	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
+	options := raftstore.Options{
+		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
+	}
+	wal, err := raftstore.Create(walPath, identity, realTransferWALKey(), raftstore.Bootstrap{
 		TopologyRecoveryEpoch: 29,
 		Snapshot: &pb.Snapshot{
 			Data: []byte("multiraft-real-transfer-bootstrap"),
@@ -213,14 +261,11 @@ func newRealTransferRuntime(
 				Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: append([]uint64(nil), voters...)},
 			},
 		},
-	}, raftstore.Options{
-		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
-	})
+	}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	database, err := sqldriver.InitializeShardStore(filepath.Join(t.TempDir(), "member.vdb"), sqldriver.ShardStoreBinding{
+	database, err := sqldriver.InitializeShardStore(sqlPath, sqldriver.ShardStoreBinding{
 		Distribution:         distribution.DistributionName(identity.Distribution),
 		Shard:                distribution.ShardID(identity.Shard),
 		AllocationGeneration: distribution.ShardAllocationGeneration(identity.AllocationGeneration),
@@ -260,7 +305,7 @@ func newRealTransferRuntime(
 		_ = wal.Close()
 		t.Fatal(err)
 	}
-	apply, _, err := raftmember.OpenPreparedApply(wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
+	apply, applyID, err := raftmember.OpenPreparedApply(wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 		MaxSessions: 16, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 256, MaxBytes: 64 << 20},
 		Placement: sqldriver.ReplicatedPlacementProfile{
@@ -295,10 +340,36 @@ func newRealTransferRuntime(
 		}
 		t.Fatal(err)
 	}
-	return runtime, base
+	reopen := func() *raftmember.Runtime {
+		t.Helper()
+		reopenedWAL, openErr := raftstore.Open(walPath, identity, 29,
+			realTransferWALKey(), options)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		reopenedDB, reopenedApply, openErr := raftmember.OpenBoundSQLWithApply(
+			sqlPath, reopenedWAL, authority, base, applyID)
+		if openErr != nil {
+			_ = reopenedWAL.Close()
+			t.Fatal(openErr)
+		}
+		restarted, openErr := raftmember.AdoptRuntime(reopenedWAL, reopenedDB, reopenedApply)
+		if openErr != nil {
+			if restarted != nil {
+				_ = restarted.Close()
+			} else {
+				_ = reopenedApply.Close()
+				_ = reopenedDB.Close()
+				_ = reopenedWAL.Close()
+			}
+			t.Fatal(openErr)
+		}
+		return restarted
+	}
+	return runtime, base, reopen
 }
 
-func realTransferIdentities() [3]raftstore.Identity {
+func realTransferIdentities() [4]raftstore.Identity {
 	var shared raftstore.Identity
 	shared.Distribution = "orders"
 	shared.Shard = "0000-7fff"
@@ -312,7 +383,7 @@ func realTransferIdentities() [3]raftstore.Identity {
 	fill(&shared.ClusterIncarnation, 21)
 	fill(&shared.ShardIncarnation, 41)
 	fill(&shared.GroupID, 61)
-	var identities [3]raftstore.Identity
+	var identities [4]raftstore.Identity
 	for index := range identities {
 		identities[index] = shared
 		identities[index].MemberID = uint64(index + 1)
