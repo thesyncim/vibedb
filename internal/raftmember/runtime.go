@@ -626,8 +626,9 @@ func (runtime *Runtime) Campaign() error {
 // callbacks run only after the Ready's stable-storage boundary. A callback
 // error leaves the exact message position unchanged for explicit retry.
 // Result settlement runs synchronously after a normal apply publishes and
-// before this Ready can release read states or advance. A settlement failure
-// retries the identical ReadyID and range on the next call.
+// before this Ready can release read states or advance. A failure marked by
+// RetryResultSettlement retries the identical ReadyID and range on the next
+// call. Any other settlement failure is terminal.
 func (runtime *Runtime) DriveReady(
 	workspace *ReadyWorkspace,
 	send func(OutboundMessage) error,
@@ -835,9 +836,11 @@ func (runtime *Runtime) pendingAppliedResults() (AppliedBatch, bool) {
 }
 
 // HasPendingResultSettlement reports whether Close and all later protocol work
-// are blocked on one already-published applied range.
+// are blocked on one live, retryable, already-published applied range. A
+// terminal Runtime failure may still retain an in-memory pending range, but it
+// cannot be retried and does not prevent resource teardown.
 func (runtime *Runtime) HasPendingResultSettlement() bool {
-	if runtime == nil {
+	if runtime == nil || runtime.failure != nil {
 		return false
 	}
 	_, pending := runtime.pendingAppliedResults()
@@ -959,7 +962,7 @@ func (runtime *Runtime) Close() error {
 	if runtime == nil || runtime.closed {
 		return nil
 	}
-	if _, pending := runtime.pendingAppliedResults(); pending {
+	if _, pending := runtime.pendingAppliedResults(); pending && runtime.failure == nil {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true

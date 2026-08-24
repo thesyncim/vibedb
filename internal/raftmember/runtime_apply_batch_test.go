@@ -344,6 +344,16 @@ func TestRuntimeUnclassifiedSettlementFailureIsTerminal(t *testing.T) {
 		!errors.Is(failure, ErrRuntimeFailed) {
 		t.Fatalf("latched failure = %v", failure)
 	}
+	if runtime.HasPendingResultSettlement() {
+		t.Fatal("terminal settlement failure remained a retryable close gate")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("terminal settlement close = %v", err)
+	}
+	if !runtime.closed || runtime.node != nil || runtime.apply != nil ||
+		runtime.database != nil || runtime.wal != nil {
+		t.Fatalf("terminal settlement retained resources: %+v", runtime)
+	}
 }
 
 func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
@@ -399,6 +409,9 @@ func TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate(t *testing.T) {
 	if result, err := fixture.runtime.DriveReady(&workspace, nil, failedSink); result.Progressed() ||
 		!errors.Is(err, ErrResultSettlementRejected) || !errors.Is(err, wantSinkErr) {
 		t.Fatalf("failed settlement = %+v, %v", result, err)
+	}
+	if !fixture.runtime.HasPendingResultSettlement() {
+		t.Fatal("retryable settlement did not retain the close gate")
 	}
 	afterProgress, afterOK := fixture.runtime.node.CurrentReady()
 	pendingBatch, pending := fixture.runtime.pendingAppliedResults()

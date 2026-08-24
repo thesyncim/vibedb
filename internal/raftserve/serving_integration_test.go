@@ -121,6 +121,159 @@ func TestServingRegistryHostChangedAckAttemptAdvancesDurableRetryFloor(t *testin
 	closed = true
 }
 
+func TestServingHostTerminalSettlementFailureCanCloseRealRuntime(t *testing.T) {
+	runtime, base := newServingRuntime(t, 72)
+	group := runtime.Identity().Group
+	want := errors.New("terminal serving settlement failure")
+	var admissions []multiraft.ProposalAdmission
+	var terminations []multiraft.ProposalGroupTermination
+	host, err := multiraft.NewHostWithServingSinks(
+		testServingHostLimits(),
+		func(raftmember.AppliedBatch) error { return want },
+		func(admission multiraft.ProposalAdmission) {
+			admissions = append(admissions, admission)
+		},
+		func(termination multiraft.ProposalGroupTermination) {
+			terminations = append(terminations, termination)
+		},
+		func(raftmember.GroupKey) bool { return false },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = host.Close()
+		}
+	})
+	if err := host.Add(runtime); err != nil {
+		t.Fatal(err)
+	}
+	driveServingHostIdle(t, host)
+	if err := host.RequestCampaign(group); err != nil {
+		t.Fatal(err)
+	}
+	driveServingHostIdle(t, host)
+	if err := host.EnqueueProposal(group, servingOpenCommand(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	faulted := false
+	for step := 0; step < 20000; step++ {
+		progress, done, runErr := host.RunOne()
+		if runErr == nil {
+			if !done {
+				t.Fatal("Host became idle before terminal settlement")
+			}
+			continue
+		}
+		if !done || progress.Kind != multiraft.ProgressFault ||
+			!errors.Is(runErr, raftmember.ErrRuntimeFailed) || !errors.Is(runErr, want) {
+			t.Fatalf("terminal Host settlement = %+v, %v, %v", progress, done, runErr)
+		}
+		faulted = true
+		break
+	}
+	if !faulted {
+		t.Fatal("Host did not surface terminal settlement failure")
+	}
+	if len(admissions) != 0 || len(terminations) != 1 ||
+		terminations[0].Group != group ||
+		terminations[0].Reason != multiraft.ProposalGroupFaulted {
+		t.Fatalf("terminal Host lifecycle = admissions %+v terminations %+v",
+			admissions, terminations)
+	}
+	if err := host.Remove(group); err != nil {
+		t.Fatalf("Host remove after terminal settlement = %v", err)
+	}
+	if err := host.Close(); err != nil {
+		t.Fatalf("Host close after terminal settlement = %v", err)
+	}
+	closed = true
+}
+
+func TestServingHostRetryableSettlementStillBlocksCloseUntilRealRetry(t *testing.T) {
+	runtime, base := newServingRuntime(t, 73)
+	group := runtime.Identity().Group
+	want := errors.New("retryable serving settlement failure")
+	retry := true
+	host, err := multiraft.NewHostWithResultSettlementSink(
+		testServingHostLimits(),
+		func(raftmember.AppliedBatch) error {
+			if retry {
+				return raftmember.RetryResultSettlement(want)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		retry = false
+		if !closed {
+			_ = host.Close()
+		}
+	})
+	if err := host.Add(runtime); err != nil {
+		t.Fatal(err)
+	}
+	driveServingHostIdle(t, host)
+	if err := host.RequestCampaign(group); err != nil {
+		t.Fatal(err)
+	}
+	driveServingHostIdle(t, host)
+	if err := host.EnqueueProposal(group, servingOpenCommand(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	rejected := false
+	for step := 0; step < 20000; step++ {
+		_, done, runErr := host.RunOne()
+		if runErr == nil {
+			if !done {
+				t.Fatal("Host became idle before retryable settlement")
+			}
+			continue
+		}
+		if done || !errors.Is(runErr, raftmember.ErrResultSettlementRejected) ||
+			!errors.Is(runErr, want) {
+			t.Fatalf("retryable Host settlement = done %v, %v", done, runErr)
+		}
+		rejected = true
+		break
+	}
+	if !rejected {
+		t.Fatal("Host did not surface retryable settlement failure")
+	}
+	if err := host.Close(); !errors.Is(err, multiraft.ErrGroupBusy) ||
+		!errors.Is(err, raftmember.ErrResultSettlementPending) {
+		t.Fatalf("Host close during retryable settlement = %v", err)
+	}
+	if _, err := host.Status(group); err != nil {
+		t.Fatalf("blocked Host close mutated ownership: %v", err)
+	}
+	retry = false
+	driveServingHostIdle(t, host)
+	if err := host.Close(); err != nil {
+		t.Fatalf("Host close after settlement retry = %v", err)
+	}
+	closed = true
+}
+
+func servingOpenCommand(
+	t testing.TB,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) []byte {
+	t.Helper()
+	command := servingCommand(base, 0, 1)
+	command.Kind = replication.CommandSessionOpen
+	command.AckThrough = 0
+	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+	command.Mutations = nil
+	return encodeTestCommand(t, command)
+}
+
 func driveServingWaiter(
 	t testing.TB,
 	host *multiraft.Host,

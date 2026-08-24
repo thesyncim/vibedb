@@ -395,9 +395,12 @@ func NewHostWithResultSettlementSink(
 	return newHost(limits, settle, nil, nil, nil)
 }
 
-// NewHostWithServingSinks constructs a Host with exact result-settlement and
+// NewHostWithServingSinks constructs a Host with result-settlement and
 // tracked-proposal lifecycle sinks. Every callback runs on the serialized Host
-// owner and must not re-enter Host.
+// owner and must not re-enter Host. Hosts whose sinks share one serving
+// registry must own disjoint GroupKeys. Replacing an owner requires fencing
+// ingress and terminating and closing the old Host before replacement
+// admission; the sinks do not authenticate an applied source epoch.
 func NewHostWithServingSinks(
 	limits Limits,
 	settle raftmember.ResultSettlementSink,

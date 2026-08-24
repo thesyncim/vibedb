@@ -6,6 +6,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -17,6 +18,47 @@ type delayedProposalHost struct {
 	registry *Registry
 	calls    int
 	token    multiraft.ProposalToken
+}
+
+type settleThenRejectHost struct {
+	registry *Registry
+	batch    testAppliedBatch
+	settle   error
+}
+
+func (host *settleThenRejectHost) EnqueueTrackedProposal(
+	_ raftmember.GroupKey,
+	_ []byte,
+	_ multiraft.ProposalToken,
+) error {
+	host.settle = settleAppliedBatch(host.registry, host.batch)
+	return multiraft.ErrQueueFull
+}
+
+type gatedWaitContext struct {
+	entered     chan struct{}
+	proceed     chan struct{}
+	done        chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func newGatedWaitContext() *gatedWaitContext {
+	return &gatedWaitContext{
+		entered: make(chan struct{}), proceed: make(chan struct{}), done: make(chan struct{}),
+	}
+}
+
+func (ctx *gatedWaitContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *gatedWaitContext) Done() <-chan struct{} {
+	ctx.enterOnce.Do(func() { close(ctx.entered) })
+	<-ctx.proceed
+	return ctx.done
+}
+func (ctx *gatedWaitContext) Err() error    { return nil }
+func (ctx *gatedWaitContext) Value(any) any { return nil }
+func (ctx *gatedWaitContext) release() {
+	ctx.releaseOnce.Do(func() { close(ctx.proceed) })
 }
 
 func (host *delayedProposalHost) EnqueueTrackedProposal(
@@ -109,6 +151,147 @@ func TestRegistryCancelBeforeHostLifecycleReturnKeepsOneAttempt(t *testing.T) {
 		t.Fatalf("post-admission state = %+v", got)
 	}
 	second.Cancel()
+}
+
+func TestRegistryPrecompletionPreservesLifecycleUntilEveryAdmissionOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		admitted bool
+		mode     string
+	}{
+		{name: "admitted-consumed-waiter", admitted: true, mode: "consumed"},
+		{name: "refused-consumed-waiter", mode: "consumed"},
+		{name: "admitted-retained-waiter", admitted: true, mode: "retained"},
+		{name: "refused-retained-waiter", mode: "retained"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := testRegistry(t, 1, 1, 1)
+			host := &delayedProposalHost{registry: registry}
+			group := testGroup(45)
+			data := encodeTestCommand(t, testCommand(group, 18, 2))
+			waiter, err := registry.Enqueue(host, group, data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := host.token
+			batch := newTestAppliedBatch(group, 122, 18, data)
+			batch.lookups[0].lookup = testCompletion(t, group, data, 122)
+			if err := settleAppliedBatch(registry, batch); err != nil {
+				t.Fatal(err)
+			}
+			if test.mode == "consumed" {
+				if result, outcome, takeErr := waiter.TakeCompletionInto(
+					make([]byte, 0, completionSlotBytes),
+				); takeErr != nil || outcome.Code != OutcomeCompletion || len(result) == 0 {
+					t.Fatalf("consume precompletion = %d, %+v, %v",
+						len(result), outcome, takeErr)
+				}
+			}
+			wantWaiters := 1
+			if test.mode == "consumed" {
+				wantWaiters = 0
+			}
+			if got := registry.Stats(); got.OutstandingAttempts != 1 ||
+				got.OutstandingIdentities != 1 || got.Waiters != wantWaiters ||
+				got.PendingAdmittedAttempts != 0 {
+				t.Fatalf("precompleted lifecycle token was not retained: %+v", got)
+			}
+			admission := multiraft.ProposalAdmission{
+				Group: group, Token: token, Admitted: test.admitted,
+			}
+			if !test.admitted {
+				admission.Cause = multiraft.ErrQueueFull
+			}
+			registry.settleProposalAdmission(admission)
+			if test.mode == "retained" {
+				if outcome, ready, pollErr := waiter.Poll(); pollErr != nil || !ready ||
+					outcome.Code != OutcomeCompletion || outcome.AppliedIndex != 122 {
+					t.Fatalf("precompletion outcome changed at admission = %+v, %v, %v",
+						outcome, ready, pollErr)
+				}
+				if _, _, takeErr := waiter.TakeCompletionInto(
+					make([]byte, 0, completionSlotBytes),
+				); takeErr != nil {
+					t.Fatal(takeErr)
+				}
+			}
+			if got := registry.Stats(); got.OutstandingAttempts != 0 ||
+				got.OutstandingIdentities != 0 || got.OutstandingGroups != 0 ||
+				got.Waiters != 0 || got.PendingAdmittedAttempts != 0 {
+				t.Fatalf("post-admission precompletion cleanup = %+v", got)
+			}
+			registry.mu.Lock()
+			failure := registry.failure
+			registry.mu.Unlock()
+			if failure != nil {
+				t.Fatalf("valid late admission poisoned registry: %v", failure)
+			}
+		})
+	}
+}
+
+func TestRegistryZeroWaiterPrecompletionWaitsForAdmissionOutcome(t *testing.T) {
+	for _, admitted := range []bool{false, true} {
+		name := "refused"
+		if admitted {
+			name = "admitted"
+		}
+		t.Run(name, func(t *testing.T) {
+			registry := testRegistry(t, 1, 1, 1)
+			host := &delayedProposalHost{registry: registry}
+			group := testGroup(52)
+			data := encodeTestCommand(t, testCommand(group, 25, 2))
+			waiter, err := registry.Enqueue(host, group, data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !waiter.Cancel() {
+				t.Fatal("cancel before precompletion")
+			}
+			batch := newTestAppliedBatch(group, 125, 21, data)
+			batch.lookups[0].lookup = testCompletion(t, group, data, 125)
+			if err := settleAppliedBatch(registry, batch); err != nil {
+				t.Fatal(err)
+			}
+			if got := registry.Stats(); got.OutstandingAttempts != 1 || got.Waiters != 0 {
+				t.Fatalf("zero-waiter precompletion lost lifecycle = %+v", got)
+			}
+			admission := multiraft.ProposalAdmission{
+				Group: group, Token: host.token, Admitted: admitted,
+			}
+			if !admitted {
+				admission.Cause = multiraft.ErrQueueFull
+			}
+			registry.settleProposalAdmission(admission)
+			if got := registry.Stats(); got.OutstandingGroups != 0 ||
+				got.OutstandingIdentities != 0 || got.OutstandingAttempts != 0 ||
+				got.Waiters != 0 {
+				t.Fatalf("zero-waiter post-admission cleanup = %+v", got)
+			}
+		})
+	}
+}
+
+func TestRegistryFailedEnqueueRollsBackAttemptCompletedInFlight(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	group := testGroup(46)
+	data := encodeTestCommand(t, testCommand(group, 19, 2))
+	batch := newTestAppliedBatch(group, 123, 19, data)
+	batch.lookups[0].lookup = testCompletion(t, group, data, 123)
+	host := &settleThenRejectHost{registry: registry, batch: batch}
+	waiter, err := registry.Enqueue(host, group, data)
+	if waiter != (Waiter{}) || !errors.Is(err, multiraft.ErrQueueFull) {
+		t.Fatalf("precompleted failed enqueue = %+v, %v", waiter, err)
+	}
+	if host.settle != nil {
+		t.Fatalf("in-flight settlement = %v", host.settle)
+	}
+	if got := registry.Stats(); got.OutstandingGroups != 0 ||
+		got.OutstandingIdentities != 0 || got.OutstandingAttempts != 0 ||
+		got.Waiters != 0 || got.RetainedCompletionBytes != 0 ||
+		got.PendingGroups != 0 || got.PendingAdmittedAttempts != 0 {
+		t.Fatalf("precompleted rollback retained state = %+v", got)
+	}
 }
 
 func TestRegistryProposalRefusalAndMalformedLifecycleNeverHang(t *testing.T) {
@@ -271,6 +454,112 @@ func TestWaitContextSingleClaimCancellationAndCompletionRace(t *testing.T) {
 		t.Fatalf("completion-before-cancel = %+v, %v", outcome, err)
 	}
 	completed.Cancel()
+}
+
+func TestWaiterCancelDefersSlotReuseUntilBlockingClaimantAcknowledges(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	group := testGroup(43)
+	data := encodeTestCommand(t, testCommand(group, 16, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := newGatedWaitContext()
+	defer ctx.release()
+	done := make(chan error, 1)
+	go func() {
+		_, waitErr := waiter.Wait(ctx)
+		done <- waitErr
+	}()
+	<-ctx.entered
+	if !waiter.Cancel() {
+		t.Fatal("Cancel did not claim the blocking waiter")
+	}
+	if waiter.Cancel() {
+		t.Fatal("a deferred waiter release was claimed twice")
+	}
+	if got := registry.Stats(); got.Waiters != 1 {
+		t.Fatalf("blocking slot was physically released early: %+v", got)
+	}
+	if replacement, enqueueErr := registry.Enqueue(host, group, data); replacement != (Waiter{}) || !errors.Is(enqueueErr, ErrWaiterCapacity) {
+		t.Fatalf("replacement before blocker acknowledgement = %+v, %v", replacement, enqueueErr)
+	}
+	ctx.release()
+	select {
+	case waitErr := <-done:
+		if !errors.Is(waitErr, ErrWaiterClosed) {
+			t.Fatalf("deferred Cancel wait = %v", waitErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking waiter did not acknowledge deferred Cancel")
+	}
+	if got := registry.Stats(); got.Waiters != 0 {
+		t.Fatalf("acknowledged waiter retained its slot: %+v", got)
+	}
+	replacement, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.index != waiter.index || replacement.generation == waiter.generation {
+		t.Fatalf("slot reuse = old %+v new %+v", waiter, replacement)
+	}
+	batch := newTestAppliedBatch(group, 120, 16, data)
+	batch.lookups[0].lookup = testCompletion(t, group, data, 120)
+	if err := settleAppliedBatch(registry, batch); err != nil {
+		t.Fatal(err)
+	}
+	if outcome, ready, pollErr := replacement.Poll(); pollErr != nil || !ready ||
+		outcome.Code != OutcomeCompletion {
+		t.Fatalf("replacement completion = %+v, %v, %v", outcome, ready, pollErr)
+	}
+	replacement.Cancel()
+}
+
+func TestTakeCompletionIntoRejectsBlockingClaimantWithoutReleasingSlot(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	group := testGroup(44)
+	data := encodeTestCommand(t, testCommand(group, 17, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := newGatedWaitContext()
+	defer ctx.release()
+	done := make(chan error, 1)
+	go func() {
+		_, waitErr := waiter.Wait(ctx)
+		done <- waitErr
+	}()
+	<-ctx.entered
+	batch := newTestAppliedBatch(group, 121, 17, data)
+	batch.lookups[0].lookup = testCompletion(t, group, data, 121)
+	if err := settleAppliedBatch(registry, batch); err != nil {
+		t.Fatal(err)
+	}
+	dst := []byte{1, 2, 3}
+	if result, outcome, takeErr := waiter.TakeCompletionInto(dst); !errors.Is(takeErr, ErrWaiterBusy) || outcome != (Outcome{}) ||
+		len(result) != len(dst) || &result[0] != &dst[0] {
+		t.Fatalf("blocking TakeCompletionInto = %v, %+v, %v", result, outcome, takeErr)
+	}
+	if got := registry.Stats(); got.Waiters != 1 {
+		t.Fatalf("busy Take released the slot: %+v", got)
+	}
+	ctx.release()
+	select {
+	case waitErr := <-done:
+		if waitErr != nil {
+			t.Fatalf("completed blocking wait = %v", waitErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("completed blocking waiter did not wake")
+	}
+	result := make([]byte, 0, completionSlotBytes)
+	if result, outcome, takeErr := waiter.TakeCompletionInto(result); takeErr != nil ||
+		outcome.Code != OutcomeCompletion || len(result) == 0 {
+		t.Fatalf("post-Wait TakeCompletionInto = %d, %+v, %v", len(result), outcome, takeErr)
+	}
 }
 
 func TestRegistryCloseWakesWaitersClearsBoundsAndFailsClosed(t *testing.T) {
@@ -611,6 +900,143 @@ func TestRegistryGenerationExhaustionFailsClosedWithoutSkippingFreeSlots(t *test
 				t.Fatalf("later enqueue did not fail closed: %v", err)
 			}
 		})
+	}
+}
+
+func TestRegistryCorruptFreeListHeadsPoisonWithoutPanicking(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt func(*Registry)
+	}{
+		{
+			name: "identity",
+			corrupt: func(registry *Registry) {
+				registry.freeEntry = uint32(len(registry.entries))
+			},
+		},
+		{
+			name: "attempt",
+			corrupt: func(registry *Registry) {
+				registry.freeAttempt = uint32(len(registry.attempts))
+			},
+		},
+		{
+			name: "waiter",
+			corrupt: func(registry *Registry) {
+				registry.freeWaiter = uint32(len(registry.waiters))
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := testRegistry(t, 1, 1, 1)
+			host := &delayedProposalHost{registry: registry}
+			group := testGroup(47)
+			data := encodeTestCommand(t, testCommand(group, 20, 2))
+			test.corrupt(registry)
+			if waiter, err := registry.Enqueue(host, group, data); waiter != (Waiter{}) ||
+				!errors.Is(err, ErrRegistryCorrupt) {
+				t.Fatalf("corrupt free-list admission = %+v, %v", waiter, err)
+			}
+			if _, err := registry.Enqueue(host, group, data); !errors.Is(err, ErrRegistryCorrupt) {
+				t.Fatalf("corrupt free-list was not latched: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistryInvalidTableStateAndAttemptCyclePoison(t *testing.T) {
+	t.Run("table-state", func(t *testing.T) {
+		registry := testRegistry(t, 1, 1, 1)
+		host := &delayedProposalHost{registry: registry}
+		group := testGroup(48)
+		data := encodeTestCommand(t, testCommand(group, 21, 2))
+		waiter, err := registry.Enqueue(host, group, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry.mu.Lock()
+		entry := &registry.entries[uint32(host.token[0])]
+		registry.table[entry.tableSlot].state = tableState(255)
+		registry.mu.Unlock()
+		if _, err := registry.Enqueue(host, group, data); !errors.Is(err, ErrRegistryCorrupt) {
+			t.Fatalf("invalid table state = %v", err)
+		}
+		if _, _, err := waiter.Poll(); !errors.Is(err, ErrRegistryCorrupt) {
+			t.Fatalf("invalid table state did not poison waiter: %v", err)
+		}
+	})
+
+	t.Run("attempt-cycle", func(t *testing.T) {
+		registry := testRegistry(t, 1, 2, 2)
+		host := &delayedProposalHost{registry: registry}
+		group := testGroup(49)
+		command := testCommand(group, 22, 2)
+		data := encodeTestCommand(t, command)
+		waiter, err := registry.Enqueue(host, group, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attemptIndex := uint32(host.token[2])
+		registry.mu.Lock()
+		registry.attempts[attemptIndex].next = attemptIndex
+		registry.mu.Unlock()
+		command.AckThrough--
+		changed := encodeTestCommand(t, command)
+		if _, err := registry.Enqueue(host, group, changed); !errors.Is(err, ErrRegistryCorrupt) {
+			t.Fatalf("cyclic attempt chain = %v", err)
+		}
+		if _, _, err := waiter.Poll(); !errors.Is(err, ErrRegistryCorrupt) {
+			t.Fatalf("cyclic attempt chain did not poison waiter: %v", err)
+		}
+	})
+}
+
+func TestRegistryCyclicWaiterSignalPoisonsInsteadOfHanging(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	group := testGroup(50)
+	data := encodeTestCommand(t, testCommand(group, 23, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.Lock()
+	registry.waiters[waiter.index].next = waiter.index
+	registry.mu.Unlock()
+	batch := newTestAppliedBatch(group, 124, 20, data)
+	batch.lookups[0].lookup = testCompletion(t, group, data, 124)
+	if err := settleAppliedBatch(registry, batch); !errors.Is(err, ErrRegistryCorrupt) {
+		t.Fatalf("cyclic waiter settlement = %v", err)
+	}
+	if _, _, err := waiter.Poll(); !errors.Is(err, ErrRegistryCorrupt) {
+		t.Fatalf("cyclic waiter signal did not latch poison: %v", err)
+	}
+}
+
+func TestRegistryDirectTerminationLatchesDetectedCounterCorruption(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	group := testGroup(51)
+	data := encodeTestCommand(t, testCommand(group, 24, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.Lock()
+	groupIndex, found, findErr := registry.findGroupLocked(group)
+	if findErr != nil || !found {
+		registry.mu.Unlock()
+		t.Fatalf("find group = %v, %v", found, findErr)
+	}
+	registry.groupTable[groupIndex].pendingAttempts++
+	registry.mu.Unlock()
+	if err := registry.TerminateGroup(
+		group, multiraft.ProposalGroupLeadershipLost,
+	); !errors.Is(err, ErrRegistryCorrupt) {
+		t.Fatalf("direct corrupt termination = %v", err)
+	}
+	if _, _, err := waiter.Poll(); !errors.Is(err, ErrRegistryCorrupt) {
+		t.Fatalf("direct termination did not latch corruption: %v", err)
 	}
 }
 

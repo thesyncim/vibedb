@@ -163,6 +163,7 @@ type waiterRecord struct {
 	attempt           uint32
 	attemptGeneration uint64
 	blocking          bool
+	releasePending    bool
 	active            bool
 }
 
@@ -177,8 +178,11 @@ type ProposalEnqueuer interface {
 }
 
 // Registry owns bounded waiter identities for one or more serialized Host
-// lanes. Enqueue calls for a particular Host must obey that Host's single-owner
-// rule. Cancellation, waiting, result copying, and settlement are synchronized.
+// lanes. Live Hosts sharing a Registry must own disjoint GroupKeys. Replacing a
+// GroupKey owner requires fencing old ingress, terminating and closing the old
+// Host, and only then admitting through the replacement. The applied source is
+// trusted at that owner boundary; Registry does not authenticate a source
+// epoch. Cancellation, waiting, result copying, and settlement are synchronized.
 type Registry struct {
 	mu       sync.Mutex
 	settleMu sync.Mutex
@@ -302,7 +306,10 @@ func nextFree(index, count int) uint32 {
 // Enqueue validates and reserves one exact command attempt before Host queue
 // admission. Exact repeats share an attempt and do not amplify the Raft log.
 // A changed acknowledgement or mutable fence creates a distinct attempt and is
-// enqueued once while sharing the logical result identity.
+// enqueued once while sharing the logical result identity. The selected Host
+// must be the sole live owner of the group across every Host sharing this
+// Registry; an old owner must be fenced, terminated, and closed before
+// replacement admission.
 func (registry *Registry) Enqueue(
 	host ProposalEnqueuer,
 	group raftmember.GroupKey,
@@ -361,6 +368,9 @@ func (registry *Registry) registerLocked(
 	hash := hashPosition(registry.seed, identity.position, identity.tenant) & registry.hashMask
 	entryIndex, tableIndex, found, err := registry.findEntryLocked(identity, hash)
 	if err != nil {
+		if errors.Is(err, ErrRegistryCorrupt) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(err)
+		}
 		return Waiter{}, registrationToken{}, false, err
 	}
 	if found {
@@ -370,7 +380,11 @@ func (registry *Registry) registerLocked(
 				Key: identity.position.sessionDigest,
 			}
 		}
-		if attemptIndex, ok := registry.findAttemptLocked(entry, identity.attempt); ok {
+		attemptIndex, ok, findErr := registry.findAttemptLocked(entry, identity.attempt)
+		if findErr != nil {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(findErr)
+		}
+		if ok {
 			waiterIndex, waiterGeneration, allocErr := registry.allocateWaiterLocked(attemptIndex)
 			if allocErr != nil {
 				return Waiter{}, registrationToken{}, false, allocErr
@@ -390,7 +404,9 @@ func (registry *Registry) registerLocked(
 		attempt.digest = identity.attempt
 		waiterIndex, waiterGeneration, allocErr := registry.allocateWaiterLocked(attemptIndex)
 		if allocErr != nil {
-			registry.removeAttemptLocked(attemptIndex)
+			if !registry.removeAttemptLocked(attemptIndex) {
+				return Waiter{}, registrationToken{}, false, registry.failure
+			}
 			return Waiter{}, registrationToken{}, false, allocErr
 		}
 		token := registrationToken{
@@ -403,16 +419,34 @@ func (registry *Registry) registerLocked(
 		}, token, true, nil
 	}
 	if registry.freeEntry == noIndex {
+		if registry.stats.OutstandingIdentities != len(registry.entries) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(
+				errors.New("identity free list ended before capacity"),
+			)
+		}
 		return Waiter{}, registrationToken{}, false, ErrIdentityCapacity
 	}
 	if registry.freeAttempt == noIndex {
+		if registry.stats.OutstandingAttempts != len(registry.attempts) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(
+				errors.New("attempt free list ended before capacity"),
+			)
+		}
 		return Waiter{}, registrationToken{}, false, ErrAttemptCapacity
 	}
 	if registry.freeWaiter == noIndex {
+		if registry.stats.Waiters != len(registry.waiters) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(
+				errors.New("waiter free list ended before capacity"),
+			)
+		}
 		return Waiter{}, registrationToken{}, false, ErrWaiterCapacity
 	}
 	groupIndex, retainErr := registry.retainGroupIdentityLocked(identity.position.group)
 	if retainErr != nil {
+		if errors.Is(retainErr, ErrRegistryCorrupt) {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(retainErr)
+		}
 		return Waiter{}, registrationToken{}, false, retainErr
 	}
 	entryIndex, entryGeneration, allocErr := registry.allocateEntryLocked(
@@ -426,13 +460,17 @@ func (registry *Registry) registerLocked(
 	}
 	attemptIndex, attemptGeneration, allocErr := registry.allocateAttemptLocked(entryIndex)
 	if allocErr != nil {
-		registry.removeEntryLocked(entryIndex)
+		if !registry.removeEntryLocked(entryIndex) {
+			return Waiter{}, registrationToken{}, false, registry.failure
+		}
 		return Waiter{}, registrationToken{}, false, allocErr
 	}
 	registry.attempts[attemptIndex].digest = identity.attempt
 	waiterIndex, waiterGeneration, allocErr := registry.allocateWaiterLocked(attemptIndex)
 	if allocErr != nil {
-		registry.removeAttemptLocked(attemptIndex)
+		if !registry.removeAttemptLocked(attemptIndex) {
+			return Waiter{}, registrationToken{}, false, registry.failure
+		}
 		return Waiter{}, registrationToken{}, false, allocErr
 	}
 	token := registrationToken{
@@ -453,24 +491,37 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 	attempt := &registry.attempts[token.attempt]
 	entry := &registry.entries[token.entry]
 	if !attempt.active || attempt.generation != token.attemptGeneration ||
-		!entry.active || entry.generation != token.entryGeneration ||
-		attempt.state != attemptPending {
+		attempt.entry != token.entry || !entry.active ||
+		entry.generation != token.entryGeneration ||
+		!attempt.lifecyclePending || attempt.admitted {
+		return
+	}
+	if attempt.state != attemptPending && attempt.state != attemptComplete {
+		registry.poisonLocked(errors.New("rollback found invalid proposal lifecycle state"))
 		return
 	}
 	attempt.lifecyclePending = false
 	if int(token.waiter) < len(registry.waiters) {
 		waiter := &registry.waiters[token.waiter]
 		if waiter.active && waiter.generation == token.waiterGeneration {
-			registry.releaseWaiterLocked(token.waiter)
+			if !registry.releaseWaiterLocked(token.waiter) {
+				return
+			}
 		}
 	}
 	if attempt.active && attempt.generation == token.attemptGeneration {
-		if attempt.waiterCount == 0 {
-			registry.removeAttemptLocked(token.attempt)
-		} else {
+		if attempt.state == attemptPending {
+			if attempt.waiterCount == 0 {
+				registry.removeAttemptLocked(token.attempt)
+				return
+			}
 			attempt.outcome = OutcomeProposalRefused
 			attempt.state = attemptComplete
-			registry.signalAttemptLocked(attempt)
+			if !registry.signalAttemptLocked(token.attempt, attempt) {
+				return
+			}
+		} else if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
+			registry.removeAttemptLocked(token.attempt)
 		}
 	}
 }
@@ -520,13 +571,17 @@ func (registry *Registry) settleProposalAdmission(
 			attempt.admitted = true
 		}
 		if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
-			registry.removeAttemptLocked(attemptIndex)
+			if !registry.removeAttemptLocked(attemptIndex) {
+				return
+			}
 		}
 		return
 	}
 	if attempt.state == attemptComplete {
 		if attempt.waiterCount == 0 {
-			registry.removeAttemptLocked(attemptIndex)
+			if !registry.removeAttemptLocked(attemptIndex) {
+				return
+			}
 		}
 		return
 	}
@@ -541,7 +596,9 @@ func (registry *Registry) settleProposalAdmission(
 		attempt.outcome = deterministic
 	}
 	attempt.state = attemptComplete
-	registry.signalAttemptLocked(attempt)
+	if !registry.signalAttemptLocked(attemptIndex, attempt) {
+		return
+	}
 	if attempt.waiterCount == 0 {
 		registry.removeAttemptLocked(attemptIndex)
 	}
@@ -549,7 +606,8 @@ func (registry *Registry) settleProposalAdmission(
 
 // TerminateGroup resolves every admitted pending attempt whose local apply path
 // ended at one closed infrastructure boundary. The caller must linearize the
-// boundary after fencing old Host ingress and before new-epoch admission.
+// boundary after fencing old Host ingress, then close the old Host before any
+// replacement owner admits the GroupKey.
 func (registry *Registry) TerminateGroup(
 	group raftmember.GroupKey,
 	reason multiraft.ProposalGroupTerminationReason,
@@ -565,7 +623,11 @@ func (registry *Registry) TerminateGroup(
 	if registry.failure != nil {
 		return registry.failure
 	}
-	return registry.terminateGroupLocked(group, reason)
+	err := registry.terminateGroupLocked(group, reason)
+	if err != nil && errors.Is(err, ErrRegistryCorrupt) {
+		return registry.corruptLocked(err)
+	}
+	return err
 }
 
 func (registry *Registry) settleProposalGroupTermination(
@@ -611,27 +673,37 @@ func (registry *Registry) terminateGroupLocked(
 		return nil
 	}
 	groupRecord := &registry.groupTable[groupIndex]
+	if groupRecord.identityCount == 0 ||
+		int(groupRecord.identityCount) > registry.stats.OutstandingIdentities ||
+		int(groupRecord.identityCount) > registry.limits.MaxOutstandingIdentities {
+		return ErrRegistryCorrupt
+	}
 	if groupRecord.pendingAttempts == 0 {
 		return nil
 	}
-	if groupRecord.identityCount == 0 || groupRecord.entryHead == noIndex {
+	if groupRecord.entryHead == noIndex || registry.stats.PendingGroups <= 0 ||
+		registry.stats.PendingGroups > registry.limits.MaxGroups {
 		return ErrRegistryCorrupt
 	}
 	pendingToRelease := 0
 	visitedEntries := uint32(0)
 	previousEntry := noIndex
 	for entryIndex := groupRecord.entryHead; entryIndex != noIndex; {
-		if int(entryIndex) >= len(registry.entries) {
+		if visitedEntries >= groupRecord.identityCount ||
+			visitedEntries >= uint32(len(registry.entries)) ||
+			int(entryIndex) >= len(registry.entries) {
 			return ErrRegistryCorrupt
 		}
 		entry := &registry.entries[entryIndex]
 		if !entry.active || entry.position.group != group ||
-			entry.groupPrevious != previousEntry || entry.attemptCount == 0 {
+			entry.groupPrevious != previousEntry || entry.attemptCount == 0 ||
+			entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) {
 			return ErrRegistryCorrupt
 		}
 		visitedAttempts := uint16(0)
 		for attemptIndex := entry.attemptHead; attemptIndex != noIndex; {
-			if int(attemptIndex) >= len(registry.attempts) {
+			if visitedAttempts >= entry.attemptCount ||
+				int(attemptIndex) >= len(registry.attempts) {
 				return ErrRegistryCorrupt
 			}
 			attempt := &registry.attempts[attemptIndex]
@@ -640,9 +712,6 @@ func (registry *Registry) terminateGroupLocked(
 				return ErrRegistryCorrupt
 			}
 			visitedAttempts++
-			if visitedAttempts > entry.attemptCount {
-				return ErrRegistryCorrupt
-			}
 			if attempt.state == attemptPending && attempt.admitted &&
 				!attempt.lifecyclePending {
 				pendingToRelease++
@@ -653,9 +722,6 @@ func (registry *Registry) terminateGroupLocked(
 			return ErrRegistryCorrupt
 		}
 		visitedEntries++
-		if visitedEntries > groupRecord.identityCount {
-			return ErrRegistryCorrupt
-		}
 		previousEntry = entryIndex
 		entryIndex = entry.freeOrGroupNext
 	}
@@ -680,9 +746,13 @@ func (registry *Registry) terminateGroupLocked(
 				attempt.admitted = false
 				attempt.outcome = outcome
 				attempt.state = attemptComplete
-				registry.signalAttemptLocked(attempt)
+				if !registry.signalAttemptLocked(attemptIndex, attempt) {
+					return registry.failure
+				}
 				if attempt.waiterCount == 0 {
-					registry.removeAttemptLocked(attemptIndex)
+					if !registry.removeAttemptLocked(attemptIndex) {
+						return registry.failure
+					}
 				}
 			}
 			attemptIndex = next
@@ -702,6 +772,14 @@ func (registry *Registry) poisonLocked(cause error) {
 			notify(registry.waiters[index].wake)
 		}
 	}
+}
+
+func (registry *Registry) corruptLocked(cause error) error {
+	registry.poisonLocked(cause)
+	if registry.failure != nil {
+		return registry.failure
+	}
+	return errors.Join(ErrRegistryCorrupt, cause)
 }
 
 func (registry *Registry) findEntryLocked(
@@ -727,12 +805,18 @@ func (registry *Registry) findEntryLocked(
 			}
 			candidate := &registry.entries[slot.entry]
 			if !candidate.active || candidate.generation != slot.generation ||
-				candidate.tableSlot != index {
+				candidate.tableSlot != index ||
+				int(candidate.tenantLen) > tenantSlotBytes ||
+				int(candidate.completionLen) > completionSlotBytes ||
+				candidate.position.group == (raftmember.GroupKey{}) ||
+				(candidate.attemptCount == 0) != (candidate.attemptHead == noIndex) {
 				return noIndex, noIndex, false, ErrRegistryCorrupt
 			}
 			if slot.hash == hash && registry.entryPositionEqual(slot.entry, candidate, identity) {
 				return slot.entry, index, true, nil
 			}
+		default:
+			return noIndex, noIndex, false, ErrRegistryCorrupt
 		}
 	}
 	return noIndex, noIndex, false, ErrIdentityCapacity
@@ -766,13 +850,21 @@ func (registry *Registry) retainGroupIdentityLocked(
 	if group == (raftmember.GroupKey{}) {
 		return noIndex, ErrRegistryCorrupt
 	}
+	if registry.stats.OutstandingGroups < 0 ||
+		registry.stats.OutstandingGroups > registry.limits.MaxGroups ||
+		registry.stats.OutstandingIdentities < 0 ||
+		registry.stats.OutstandingIdentities > len(registry.entries) {
+		return noIndex, ErrRegistryCorrupt
+	}
 	index, found, err := registry.findGroupLocked(group)
 	if err != nil {
 		return noIndex, err
 	}
 	if found {
 		slot := &registry.groupTable[index]
-		if slot.identityCount == math.MaxUint32 {
+		if slot.identityCount == 0 || registry.stats.OutstandingGroups == 0 ||
+			int(slot.identityCount) > registry.stats.OutstandingIdentities ||
+			slot.identityCount >= uint32(registry.limits.MaxOutstandingIdentities) {
 			return noIndex, ErrRegistryCorrupt
 		}
 		slot.identityCount++
@@ -797,12 +889,17 @@ func (registry *Registry) retainGroupIdentityLocked(
 func (registry *Registry) releaseGroupIdentityLocked(
 	group raftmember.GroupKey,
 ) bool {
+	if registry.stats.OutstandingGroups <= 0 ||
+		registry.stats.OutstandingGroups > registry.limits.MaxGroups {
+		return false
+	}
 	index, found, err := registry.findGroupLocked(group)
 	if err != nil || !found {
 		return false
 	}
 	slot := &registry.groupTable[index]
-	if slot.identityCount == 0 {
+	if slot.identityCount == 0 ||
+		slot.identityCount > uint32(registry.limits.MaxOutstandingIdentities) {
 		return false
 	}
 	if slot.identityCount == 1 &&
@@ -816,7 +913,9 @@ func (registry *Registry) releaseGroupIdentityLocked(
 	if slot.identityCount != 0 {
 		return true
 	}
-	registry.deleteGroupSlotLocked(index)
+	if !registry.deleteGroupSlotLocked(index) {
+		return false
+	}
 	registry.stats.OutstandingGroups--
 	return true
 }
@@ -829,11 +928,19 @@ func (registry *Registry) addGroupPendingLocked(
 		return false
 	}
 	slot := &registry.groupTable[index]
-	if slot.identityCount == 0 || slot.pendingAttempts == math.MaxUint32 {
+	if slot.identityCount == 0 || slot.group != group ||
+		slot.pendingAttempts >= uint32(registry.limits.MaxOutstandingAttempts) ||
+		uint(registry.stats.PendingAdmittedAttempts) >=
+			uint(registry.limits.MaxOutstandingAttempts) {
 		return false
 	}
 	if slot.pendingAttempts == 0 {
+		if uint(registry.stats.PendingGroups) >= uint(registry.limits.MaxGroups) {
+			return false
+		}
 		registry.stats.PendingGroups++
+	} else if registry.stats.PendingGroups <= 0 {
+		return false
 	}
 	slot.pendingAttempts++
 	registry.stats.PendingAdmittedAttempts++
@@ -849,8 +956,11 @@ func (registry *Registry) removeGroupPendingLocked(
 	}
 	slot := &registry.groupTable[index]
 	if slot.identityCount == 0 || slot.pendingAttempts == 0 ||
-		registry.stats.PendingAdmittedAttempts == 0 ||
-		(slot.pendingAttempts == 1 && registry.stats.PendingGroups == 0) {
+		registry.stats.PendingAdmittedAttempts <= 0 ||
+		registry.stats.PendingAdmittedAttempts > registry.limits.MaxOutstandingAttempts ||
+		registry.stats.PendingGroups <= 0 ||
+		registry.stats.PendingGroups > registry.limits.MaxGroups ||
+		int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts {
 		return false
 	}
 	slot.pendingAttempts--
@@ -959,14 +1069,34 @@ func (registry *Registry) entryPositionEqual(
 func (registry *Registry) findAttemptLocked(
 	entry *entryRecord,
 	digest [32]byte,
-) (uint32, bool) {
-	for index := entry.attemptHead; index != noIndex; index = registry.attempts[index].next {
-		attempt := &registry.attempts[index]
-		if attempt.active && attempt.entryGeneration == entry.generation && attempt.digest == digest {
-			return index, true
-		}
+) (uint32, bool, error) {
+	if entry == nil || !entry.active ||
+		entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) ||
+		int(entry.attemptCount) > registry.stats.OutstandingAttempts ||
+		(entry.attemptCount == 0) != (entry.attemptHead == noIndex) {
+		return noIndex, false, ErrRegistryCorrupt
 	}
-	return noIndex, false
+	visited := uint16(0)
+	for index := entry.attemptHead; index != noIndex; {
+		if visited >= entry.attemptCount || int(index) >= len(registry.attempts) {
+			return noIndex, false, ErrRegistryCorrupt
+		}
+		attempt := &registry.attempts[index]
+		if !attempt.active || attempt.entryGeneration != entry.generation ||
+			attempt.entry >= uint32(len(registry.entries)) ||
+			&registry.entries[attempt.entry] != entry {
+			return noIndex, false, ErrRegistryCorrupt
+		}
+		visited++
+		if attempt.digest == digest {
+			return index, true, nil
+		}
+		index = attempt.next
+	}
+	if visited != entry.attemptCount {
+		return noIndex, false, ErrRegistryCorrupt
+	}
+	return noIndex, false, nil
 }
 
 func (registry *Registry) allocateEntryLocked(
@@ -976,28 +1106,44 @@ func (registry *Registry) allocateEntryLocked(
 	groupIndex uint32,
 ) (uint32, uint64, error) {
 	index := registry.freeEntry
-	if index == noIndex || int(index) >= len(registry.entries) {
+	if index == noIndex {
+		if registry.stats.OutstandingIdentities != len(registry.entries) {
+			return noIndex, 0, registry.corruptLocked(
+				errors.New("identity free list ended before capacity"),
+			)
+		}
 		return noIndex, 0, ErrIdentityCapacity
 	}
-	if int(groupIndex) >= len(registry.groupTable) {
-		return noIndex, 0, ErrRegistryCorrupt
+	if int(index) >= len(registry.entries) || int(tableIndex) >= len(registry.table) ||
+		int(groupIndex) >= len(registry.groupTable) {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid identity allocation index"))
+	}
+	if registry.stats.OutstandingIdentities < 0 ||
+		registry.stats.OutstandingIdentities >= len(registry.entries) ||
+		registry.table[tableIndex].state != tableEmpty {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid identity allocation count or table slot"))
 	}
 	groupSlot := &registry.groupTable[groupIndex]
 	if groupSlot.state != tableOccupied ||
-		groupSlot.group != identity.position.group || groupSlot.identityCount == 0 {
-		return noIndex, 0, ErrRegistryCorrupt
+		groupSlot.group != identity.position.group || groupSlot.identityCount == 0 ||
+		int(groupSlot.identityCount) > registry.stats.OutstandingIdentities+1 {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid identity allocation group"))
 	}
 	if groupSlot.entryHead != noIndex {
 		if int(groupSlot.entryHead) >= len(registry.entries) {
-			return noIndex, 0, ErrRegistryCorrupt
+			return noIndex, 0, registry.corruptLocked(errors.New("identity allocation group head is out of range"))
 		}
 		head := &registry.entries[groupSlot.entryHead]
 		if !head.active || head.position.group != identity.position.group ||
 			head.groupPrevious != noIndex {
-			return noIndex, 0, ErrRegistryCorrupt
+			return noIndex, 0, registry.corruptLocked(errors.New("identity allocation group head is corrupt"))
 		}
 	}
 	record := &registry.entries[index]
+	if record.active || record.freeOrGroupNext == index ||
+		(record.freeOrGroupNext != noIndex && int(record.freeOrGroupNext) >= len(registry.entries)) {
+		return noIndex, 0, registry.corruptLocked(errors.New("corrupt identity free-list record"))
+	}
 	generation, err := nextGeneration(record.generation)
 	if err != nil {
 		registry.poisonLocked(err)
@@ -1032,15 +1178,43 @@ func (registry *Registry) allocateEntryLocked(
 func (registry *Registry) allocateAttemptLocked(
 	entryIndex uint32,
 ) (uint32, uint64, error) {
-	if registry.freeAttempt == noIndex || int(entryIndex) >= len(registry.entries) {
+	if registry.freeAttempt == noIndex {
+		if registry.stats.OutstandingAttempts != len(registry.attempts) {
+			return noIndex, 0, registry.corruptLocked(
+				errors.New("attempt free list ended before capacity"),
+			)
+		}
 		return noIndex, 0, ErrAttemptCapacity
 	}
+	if int(registry.freeAttempt) >= len(registry.attempts) ||
+		int(entryIndex) >= len(registry.entries) {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid attempt free-list head"))
+	}
 	entry := &registry.entries[entryIndex]
-	if !entry.active {
-		return noIndex, 0, ErrRegistryCorrupt
+	if !entry.active ||
+		(entry.attemptCount == 0) != (entry.attemptHead == noIndex) ||
+		entry.attemptCount >= uint16(registry.limits.MaxAttemptsPerIdentity) ||
+		int(entry.attemptCount) > registry.stats.OutstandingAttempts ||
+		registry.stats.OutstandingAttempts < 0 ||
+		registry.stats.OutstandingAttempts >= registry.limits.MaxOutstandingAttempts {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid attempt allocation owner or count"))
+	}
+	if entry.attemptHead != noIndex {
+		if int(entry.attemptHead) >= len(registry.attempts) {
+			return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation head is out of range"))
+		}
+		head := &registry.attempts[entry.attemptHead]
+		if !head.active || head.entry != entryIndex ||
+			head.entryGeneration != entry.generation {
+			return noIndex, 0, registry.corruptLocked(errors.New("attempt allocation head is corrupt"))
+		}
 	}
 	index := registry.freeAttempt
 	record := &registry.attempts[index]
+	if record.active || record.freeNext == index ||
+		(record.freeNext != noIndex && int(record.freeNext) >= len(registry.attempts)) {
+		return noIndex, 0, registry.corruptLocked(errors.New("corrupt attempt free-list record"))
+	}
 	generation, err := nextGeneration(record.generation)
 	if err != nil {
 		registry.poisonLocked(err)
@@ -1063,15 +1237,43 @@ func (registry *Registry) allocateAttemptLocked(
 func (registry *Registry) allocateWaiterLocked(
 	attemptIndex uint32,
 ) (uint32, uint64, error) {
-	if registry.freeWaiter == noIndex || int(attemptIndex) >= len(registry.attempts) {
+	if registry.freeWaiter == noIndex {
+		if registry.stats.Waiters != len(registry.waiters) {
+			return noIndex, 0, registry.corruptLocked(
+				errors.New("waiter free list ended before capacity"),
+			)
+		}
 		return noIndex, 0, ErrWaiterCapacity
 	}
+	if int(registry.freeWaiter) >= len(registry.waiters) ||
+		int(attemptIndex) >= len(registry.attempts) {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid waiter free-list head"))
+	}
 	attempt := &registry.attempts[attemptIndex]
-	if !attempt.active {
-		return noIndex, 0, ErrRegistryCorrupt
+	if !attempt.active || registry.stats.Waiters < 0 ||
+		registry.stats.Waiters >= registry.limits.MaxWaiters ||
+		attempt.waiterCount >= uint32(registry.limits.MaxWaiters) ||
+		int(attempt.waiterCount) > registry.stats.Waiters ||
+		(attempt.waiterCount == 0) != (attempt.waiterHead == noIndex) {
+		return noIndex, 0, registry.corruptLocked(errors.New("invalid waiter allocation owner or count"))
+	}
+	if attempt.waiterHead != noIndex {
+		if int(attempt.waiterHead) >= len(registry.waiters) {
+			return noIndex, 0, registry.corruptLocked(errors.New("waiter allocation head is out of range"))
+		}
+		head := &registry.waiters[attempt.waiterHead]
+		if !head.active || head.attempt != attemptIndex ||
+			head.attemptGeneration != attempt.generation || head.previous != noIndex {
+			return noIndex, 0, registry.corruptLocked(errors.New("waiter allocation head is corrupt"))
+		}
 	}
 	index := registry.freeWaiter
 	record := &registry.waiters[index]
+	if record.active || record.blocking || record.releasePending || record.wake == nil ||
+		cap(record.wake) != 1 || record.freeNext == index ||
+		(record.freeNext != noIndex && int(record.freeNext) >= len(registry.waiters)) {
+		return noIndex, 0, registry.corruptLocked(errors.New("corrupt waiter free-list record"))
+	}
 	generation, err := nextGeneration(record.generation)
 	if err != nil {
 		registry.poisonLocked(err)
@@ -1117,18 +1319,63 @@ func notify(signal chan struct{}) {
 	}
 }
 
-func (registry *Registry) releaseWaiterLocked(index uint32) {
+func (registry *Registry) releaseWaiterLocked(index uint32) bool {
 	if int(index) >= len(registry.waiters) {
-		return
+		registry.corruptLocked(errors.New("waiter release index is out of range"))
+		return false
 	}
 	waiter := &registry.waiters[index]
-	if !waiter.active || int(waiter.attempt) >= len(registry.attempts) {
-		return
+	if !waiter.active || waiter.blocking || int(waiter.attempt) >= len(registry.attempts) {
+		registry.corruptLocked(errors.New("waiter release found an invalid active record"))
+		return false
 	}
 	attemptIndex := waiter.attempt
 	attempt := &registry.attempts[attemptIndex]
-	if !attempt.active || attempt.generation != waiter.attemptGeneration {
-		return
+	if !attempt.active || attempt.generation != waiter.attemptGeneration ||
+		attempt.waiterCount == 0 ||
+		attempt.waiterCount > uint32(registry.limits.MaxWaiters) ||
+		registry.stats.Waiters <= 0 || registry.stats.Waiters > len(registry.waiters) ||
+		int(attempt.waiterCount) > registry.stats.Waiters ||
+		waiter.wake == nil || cap(waiter.wake) != 1 ||
+		(registry.freeWaiter != noIndex && int(registry.freeWaiter) >= len(registry.waiters)) ||
+		registry.freeWaiter == index ||
+		waiter.previous == index || waiter.next == index ||
+		(waiter.previous != noIndex && waiter.previous == waiter.next) {
+		registry.corruptLocked(errors.New("waiter release found invalid ownership or counts"))
+		return false
+	}
+	if registry.freeWaiter != noIndex && registry.waiters[registry.freeWaiter].active {
+		registry.corruptLocked(errors.New("waiter release found an active free-list head"))
+		return false
+	}
+	if waiter.previous == noIndex {
+		if attempt.waiterHead != index {
+			registry.corruptLocked(errors.New("waiter release lost the attempt head"))
+			return false
+		}
+	} else {
+		if int(waiter.previous) >= len(registry.waiters) {
+			registry.corruptLocked(errors.New("waiter release previous link is out of range"))
+			return false
+		}
+		previous := &registry.waiters[waiter.previous]
+		if !previous.active || previous.attempt != attemptIndex ||
+			previous.attemptGeneration != attempt.generation || previous.next != index {
+			registry.corruptLocked(errors.New("waiter release previous link is corrupt"))
+			return false
+		}
+	}
+	if waiter.next != noIndex {
+		if int(waiter.next) >= len(registry.waiters) {
+			registry.corruptLocked(errors.New("waiter release next link is out of range"))
+			return false
+		}
+		next := &registry.waiters[waiter.next]
+		if !next.active || next.attempt != attemptIndex ||
+			next.attemptGeneration != attempt.generation || next.previous != index {
+			registry.corruptLocked(errors.New("waiter release next link is corrupt"))
+			return false
+		}
 	}
 	if waiter.previous == noIndex {
 		attempt.waiterHead = waiter.next
@@ -1148,39 +1395,108 @@ func (registry *Registry) releaseWaiterLocked(index uint32) {
 	registry.freeWaiter = index
 	registry.stats.Waiters--
 	if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
-		registry.removeAttemptLocked(attemptIndex)
+		return registry.removeAttemptLocked(attemptIndex)
 	}
+	return true
+}
+
+func (registry *Registry) requestWaiterReleaseLocked(index uint32) bool {
+	if int(index) >= len(registry.waiters) {
+		return false
+	}
+	waiter := &registry.waiters[index]
+	if !waiter.active || waiter.releasePending {
+		return false
+	}
+	if waiter.wake == nil || cap(waiter.wake) != 1 {
+		registry.corruptLocked(errors.New("waiter release request found an invalid notification channel"))
+		return false
+	}
+	if waiter.blocking {
+		waiter.releasePending = true
+		notify(waiter.wake)
+		return true
+	}
+	return registry.releaseWaiterLocked(index)
 }
 
 func (registry *Registry) attemptRemovableLocked(attempt *attemptRecord) bool {
-	if attempt == nil || !attempt.active || attempt.state == attemptSettling {
+	if attempt == nil || !attempt.active {
 		return false
 	}
-	if attempt.state == attemptComplete {
+	switch attempt.state {
+	case attemptSettling:
+		return false
+	case attemptComplete:
 		return !attempt.lifecyclePending
+	case attemptPending:
+		return !attempt.lifecyclePending && !attempt.admitted
+	default:
+		registry.corruptLocked(errors.New("attempt removal predicate found an invalid state"))
+		return false
 	}
-	return !attempt.lifecyclePending && !attempt.admitted
 }
 
-func (registry *Registry) removeAttemptLocked(index uint32) {
+func (registry *Registry) removeAttemptLocked(index uint32) bool {
 	if int(index) >= len(registry.attempts) {
-		return
+		registry.corruptLocked(errors.New("attempt removal index is out of range"))
+		return false
 	}
 	attempt := &registry.attempts[index]
-	if !attempt.active || attempt.waiterCount != 0 || int(attempt.entry) >= len(registry.entries) {
-		return
+	if !attempt.active || attempt.admitted || attempt.waiterCount != 0 ||
+		attempt.waiterHead != noIndex || attempt.next == index ||
+		int(attempt.entry) >= len(registry.entries) ||
+		(registry.freeAttempt != noIndex && int(registry.freeAttempt) >= len(registry.attempts)) ||
+		registry.freeAttempt == index {
+		registry.corruptLocked(errors.New("attempt removal found an invalid active record"))
+		return false
+	}
+	if registry.freeAttempt != noIndex && registry.attempts[registry.freeAttempt].active {
+		registry.corruptLocked(errors.New("attempt removal found an active free-list head"))
+		return false
 	}
 	entryIndex := attempt.entry
 	entry := &registry.entries[entryIndex]
-	if !entry.active || entry.generation != attempt.entryGeneration {
-		return
+	if !entry.active || entry.generation != attempt.entryGeneration ||
+		entry.attemptCount == 0 ||
+		entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) ||
+		int(entry.attemptCount) > registry.stats.OutstandingAttempts ||
+		registry.stats.OutstandingAttempts <= 0 ||
+		registry.stats.OutstandingAttempts > len(registry.attempts) {
+		registry.corruptLocked(errors.New("attempt removal found invalid ownership or counts"))
+		return false
 	}
 	link := &entry.attemptHead
+	visited := uint16(0)
 	for *link != noIndex && *link != index {
-		link = &registry.attempts[*link].next
+		if visited >= entry.attemptCount || int(*link) >= len(registry.attempts) {
+			registry.corruptLocked(errors.New("attempt removal found a corrupt or cyclic chain"))
+			return false
+		}
+		candidate := &registry.attempts[*link]
+		if !candidate.active || candidate.entry != entryIndex ||
+			candidate.entryGeneration != entry.generation {
+			registry.corruptLocked(errors.New("attempt removal found a foreign chain record"))
+			return false
+		}
+		visited++
+		link = &candidate.next
 	}
 	if *link != index {
-		return
+		registry.corruptLocked(errors.New("attempt removal lost its entry link"))
+		return false
+	}
+	if attempt.next != noIndex {
+		if int(attempt.next) >= len(registry.attempts) {
+			registry.corruptLocked(errors.New("attempt removal next link is out of range"))
+			return false
+		}
+		next := &registry.attempts[attempt.next]
+		if !next.active || next.entry != entryIndex ||
+			next.entryGeneration != entry.generation {
+			registry.corruptLocked(errors.New("attempt removal next link is foreign"))
+			return false
+		}
 	}
 	*link = attempt.next
 	entry.attemptCount--
@@ -1192,32 +1508,51 @@ func (registry *Registry) removeAttemptLocked(index uint32) {
 	registry.freeAttempt = index
 	registry.stats.OutstandingAttempts--
 	if entry.attemptCount == 0 {
-		registry.removeEntryLocked(entryIndex)
+		return registry.removeEntryLocked(entryIndex)
 	}
+	return true
 }
 
-func (registry *Registry) removeEntryLocked(index uint32) {
+func (registry *Registry) removeEntryLocked(index uint32) bool {
 	if int(index) >= len(registry.entries) {
-		return
+		registry.corruptLocked(errors.New("identity removal index is out of range"))
+		return false
 	}
 	entry := &registry.entries[index]
-	if !entry.active || entry.attemptCount != 0 || int(entry.tableSlot) >= len(registry.table) {
-		return
+	if !entry.active || entry.attemptCount != 0 || entry.attemptHead != noIndex ||
+		int(entry.tableSlot) >= len(registry.table) ||
+		registry.stats.OutstandingIdentities <= 0 ||
+		registry.stats.OutstandingIdentities > len(registry.entries) ||
+		(registry.freeEntry != noIndex && int(registry.freeEntry) >= len(registry.entries)) ||
+		registry.freeEntry == index || int(entry.tenantLen) > tenantSlotBytes ||
+		int(entry.completionLen) > completionSlotBytes ||
+		registry.stats.RetainedCompletionBytes < 0 ||
+		registry.stats.RetainedCompletionBytes > len(registry.completionArena) ||
+		int(entry.completionLen) > registry.stats.RetainedCompletionBytes {
+		registry.corruptLocked(errors.New("identity removal found invalid ownership or counts"))
+		return false
+	}
+	if registry.freeEntry != noIndex && registry.entries[registry.freeEntry].active {
+		registry.corruptLocked(errors.New("identity removal found an active free-list head"))
+		return false
 	}
 	slot := &registry.table[entry.tableSlot]
 	if slot.state != tableOccupied || slot.entry != index || slot.generation != entry.generation {
-		return
+		registry.corruptLocked(errors.New("identity removal found a corrupt table slot"))
+		return false
 	}
 	group := entry.position.group
 	if !registry.unlinkGroupEntryLocked(index, entry) {
 		registry.poisonLocked(errors.New("identity lost its group entry link"))
-		return
+		return false
 	}
 	if !registry.releaseGroupIdentityLocked(group) {
 		registry.poisonLocked(errors.New("identity lost its group capacity record"))
-		return
+		return false
 	}
-	registry.deleteTableSlotLocked(entry.tableSlot)
+	if !registry.deleteTableSlotLocked(entry.tableSlot) {
+		return false
+	}
 	clear(registry.tenantSlot(index))
 	clear(registry.completionSlot(index))
 	registry.stats.RetainedCompletionBytes -= int(entry.completionLen)
@@ -1229,15 +1564,34 @@ func (registry *Registry) removeEntryLocked(index uint32) {
 	}
 	registry.freeEntry = index
 	registry.stats.OutstandingIdentities--
+	return true
 }
 
-func (registry *Registry) deleteGroupSlotLocked(hole uint32) {
+func (registry *Registry) deleteGroupSlotLocked(hole uint32) bool {
+	if int(hole) >= len(registry.groupTable) ||
+		registry.groupTable[hole].state != tableOccupied {
+		registry.corruptLocked(errors.New("group table deletion hole is invalid"))
+		return false
+	}
 	mask := uint32(len(registry.groupTable) - 1)
-	for scan := (hole + 1) & mask; ; scan = (scan + 1) & mask {
+	for scanned, scan := 0, (hole+1)&mask; scanned < len(registry.groupTable); scanned, scan = scanned+1, (scan+1)&mask {
 		slot := registry.groupTable[scan]
 		if slot.state == tableEmpty {
 			registry.groupTable[hole] = pendingGroupSlot{}
-			return
+			return true
+		}
+		if slot.state != tableOccupied || slot.identityCount == 0 ||
+			slot.group == (raftmember.GroupKey{}) || slot.entryHead == noIndex ||
+			int(slot.entryHead) >= len(registry.entries) ||
+			int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts {
+			registry.corruptLocked(errors.New("group table deletion found a corrupt slot"))
+			return false
+		}
+		head := &registry.entries[slot.entryHead]
+		if !head.active || head.position.group != slot.group ||
+			head.groupPrevious != noIndex {
+			registry.corruptLocked(errors.New("group table deletion found a corrupt entry head"))
+			return false
 		}
 		home := uint32(slot.hash) & mask
 		toScan := (scan - home) & mask
@@ -1248,15 +1602,25 @@ func (registry *Registry) deleteGroupSlotLocked(hole uint32) {
 		registry.groupTable[hole] = slot
 		hole = scan
 	}
+	registry.corruptLocked(errors.New("group table deletion found no empty slot"))
+	return false
 }
 
-func (registry *Registry) deleteTableSlotLocked(hole uint32) {
+func (registry *Registry) deleteTableSlotLocked(hole uint32) bool {
+	if int(hole) >= len(registry.table) || registry.table[hole].state != tableOccupied {
+		registry.corruptLocked(errors.New("identity table deletion hole is invalid"))
+		return false
+	}
 	mask := uint32(len(registry.table) - 1)
-	for scan := (hole + 1) & mask; ; scan = (scan + 1) & mask {
+	for scanned, scan := 0, (hole+1)&mask; scanned < len(registry.table); scanned, scan = scanned+1, (scan+1)&mask {
 		slot := registry.table[scan]
 		if slot.state == tableEmpty {
 			registry.table[hole] = positionSlot{}
-			return
+			return true
+		}
+		if slot.state != tableOccupied {
+			registry.corruptLocked(errors.New("identity table deletion found an invalid state"))
+			return false
 		}
 		home := uint32(slot.hash) & mask
 		toScan := (scan - home) & mask
@@ -1264,14 +1628,21 @@ func (registry *Registry) deleteTableSlotLocked(hole uint32) {
 		if toHole >= toScan {
 			continue
 		}
-		registry.table[hole] = slot
 		if int(slot.entry) >= len(registry.entries) {
 			registry.poisonLocked(errors.New("table shift references unknown entry"))
-			return
+			return false
 		}
+		entry := &registry.entries[slot.entry]
+		if !entry.active || entry.generation != slot.generation || entry.tableSlot != scan {
+			registry.corruptLocked(errors.New("table shift references a corrupt entry"))
+			return false
+		}
+		registry.table[hole] = slot
 		registry.entries[slot.entry].tableSlot = hole
 		hole = scan
 	}
+	registry.corruptLocked(errors.New("identity table deletion found no empty slot"))
+	return false
 }
 
 func (registry *Registry) tenantSlot(index uint32) []byte {
@@ -1418,8 +1789,11 @@ func (waiter Waiter) Wait(ctx context.Context) (Outcome, error) {
 		if err != nil {
 			if int(waiter.index) < len(registry.waiters) {
 				record = &registry.waiters[waiter.index]
-				if record.active && record.generation == waiter.generation {
+				if record.active && record.generation == waiter.generation && record.blocking {
 					record.blocking = false
+					if record.releasePending && !registry.releaseWaiterLocked(waiter.index) {
+						err = registry.failure
+					}
 				}
 			}
 			registry.mu.Unlock()
@@ -1433,7 +1807,10 @@ func (waiter Waiter) Wait(ctx context.Context) (Outcome, error) {
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			record.blocking = false
-			registry.releaseWaiterLocked(waiter.index)
+			if !registry.releaseWaiterLocked(waiter.index) {
+				registry.mu.Unlock()
+				return Outcome{}, registry.failure
+			}
 			registry.mu.Unlock()
 			return Outcome{}, ctxErr
 		}
@@ -1451,24 +1828,51 @@ func (registry *Registry) pollWaiterLocked(
 		return Outcome{}, false, ErrWaiterClosed
 	}
 	record := &registry.waiters[waiter.index]
-	if !record.active || record.generation != waiter.generation ||
-		int(record.attempt) >= len(registry.attempts) {
+	if !record.active || record.generation != waiter.generation {
 		return Outcome{}, false, ErrWaiterClosed
+	}
+	if record.releasePending {
+		return Outcome{}, false, ErrWaiterClosed
+	}
+	if int(record.attempt) >= len(registry.attempts) {
+		return Outcome{}, false, registry.corruptLocked(
+			errors.New("waiter attempt index is out of range"),
+		)
 	}
 	attempt := &registry.attempts[record.attempt]
 	if !attempt.active || attempt.generation != record.attemptGeneration {
-		return Outcome{}, false, ErrRegistryCorrupt
+		return Outcome{}, false, registry.corruptLocked(
+			errors.New("waiter references an invalid attempt"),
+		)
 	}
-	if attempt.state != attemptComplete {
+	switch attempt.state {
+	case attemptPending:
 		return Outcome{}, false, nil
+	case attemptComplete:
+	default:
+		return Outcome{}, false, registry.corruptLocked(
+			errors.New("waiter observed an invalid attempt state"),
+		)
+	}
+	if int(attempt.entry) >= len(registry.entries) {
+		return Outcome{}, false, registry.corruptLocked(
+			errors.New("waiter attempt entry is out of range"),
+		)
 	}
 	entry := &registry.entries[attempt.entry]
 	if !entry.active || entry.generation != attempt.entryGeneration {
-		return Outcome{}, false, ErrRegistryCorrupt
+		return Outcome{}, false, registry.corruptLocked(
+			errors.New("waiter attempt references an invalid identity"),
+		)
 	}
 	completionBytes := 0
 	completionApplied := uint64(0)
 	if attempt.hasCompletion {
+		if entry.completionLen == 0 || int(entry.completionLen) > completionSlotBytes {
+			return Outcome{}, false, registry.corruptLocked(
+				errors.New("waiter completion metadata is invalid"),
+			)
+		}
 		completionBytes = int(entry.completionLen)
 		completionApplied = entry.completionApplied
 	}
@@ -1481,7 +1885,9 @@ func (registry *Registry) pollWaiterLocked(
 
 // TakeCompletionInto copies a ready canonical completion into dst and releases
 // this waiter. It returns ErrCompletionDestinationSmall without changing dst
-// or releasing ownership when caller capacity is insufficient.
+// or releasing ownership when caller capacity is insufficient. A concurrent
+// blocking Wait owns reclamation and makes TakeCompletionInto return
+// ErrWaiterBusy.
 func (waiter Waiter) TakeCompletionInto(
 	dst []byte,
 ) ([]byte, Outcome, error) {
@@ -1495,25 +1901,32 @@ func (waiter Waiter) TakeCompletionInto(
 	if err != nil {
 		return dst, Outcome{}, err
 	}
+	record := &registry.waiters[waiter.index]
+	if record.blocking {
+		return dst, Outcome{}, ErrWaiterBusy
+	}
 	if !ready {
 		return dst, Outcome{}, ErrWaiterPending
 	}
 	if outcome.CompletionBytes > cap(dst)-len(dst) {
 		return dst, outcome, ErrCompletionDestinationSmall
 	}
-	record := &registry.waiters[waiter.index]
 	attempt := &registry.attempts[record.attempt]
 	if attempt.hasCompletion {
 		entry := &registry.entries[attempt.entry]
 		slot := registry.completionSlot(attempt.entry)
 		dst = append(dst, slot[:entry.completionLen]...)
 	}
-	registry.releaseWaiterLocked(waiter.index)
+	if !registry.releaseWaiterLocked(waiter.index) {
+		return dst, Outcome{}, registry.failure
+	}
 	return dst, outcome, nil
 }
 
 // Cancel releases only this waiter's ownership. It never removes or blocks a
-// Raft proposal that has already entered Host.
+// Raft proposal that has already entered Host. If a Wait is blocking, physical
+// slot reuse is deferred until that claimant observes cancellation and
+// acknowledges the release.
 func (waiter Waiter) Cancel() bool {
 	registry := waiter.registry
 	if registry == nil {
@@ -1528,13 +1941,14 @@ func (waiter Waiter) Cancel() bool {
 	if !record.active || record.generation != waiter.generation {
 		return false
 	}
-	notify(record.wake)
-	registry.releaseWaiterLocked(waiter.index)
-	return true
+	return registry.requestWaiterReleaseLocked(waiter.index)
 }
 
-// NewHost constructs a Host wired to this registry's settlement sink. The
-// ordinary multiraft.NewHost constructor keeps its explicit no-waiter sink.
+// NewHost constructs a Host wired to this registry's settlement sink. Every
+// live Host constructed from one Registry must own disjoint GroupKeys. Before a
+// replacement Host admits the same GroupKey, callers must fence ingress,
+// terminate pending attempts, and close the old Host. The ordinary
+// multiraft.NewHost constructor keeps its explicit no-waiter sink.
 func (registry *Registry) NewHost(limits multiraft.Limits) (*multiraft.Host, error) {
 	if registry == nil {
 		return nil, ErrRegistryClosed
@@ -1556,13 +1970,41 @@ func (registry *Registry) NewHost(limits multiraft.Limits) (*multiraft.Host, err
 	)
 }
 
-func (registry *Registry) signalAttemptLocked(attempt *attemptRecord) {
-	if attempt == nil {
-		return
+func (registry *Registry) signalAttemptLocked(
+	attemptIndex uint32,
+	attempt *attemptRecord,
+) bool {
+	if attempt == nil || !attempt.active || int(attemptIndex) >= len(registry.attempts) ||
+		&registry.attempts[attemptIndex] != attempt ||
+		attempt.waiterCount > uint32(len(registry.waiters)) ||
+		(attempt.waiterCount == 0) != (attempt.waiterHead == noIndex) {
+		registry.corruptLocked(errors.New("attempt signal found an invalid owner or count"))
+		return false
 	}
-	for index := attempt.waiterHead; index != noIndex; index = registry.waiters[index].next {
-		notify(registry.waiters[index].wake)
+	visited := uint32(0)
+	previous := noIndex
+	for index := attempt.waiterHead; index != noIndex; {
+		if visited >= attempt.waiterCount || int(index) >= len(registry.waiters) {
+			registry.corruptLocked(errors.New("attempt signal found a corrupt or cyclic waiter chain"))
+			return false
+		}
+		waiter := &registry.waiters[index]
+		if !waiter.active || waiter.attempt != attemptIndex ||
+			waiter.attemptGeneration != attempt.generation || waiter.previous != previous ||
+			waiter.wake == nil {
+			registry.corruptLocked(errors.New("attempt signal found a foreign waiter record"))
+			return false
+		}
+		notify(waiter.wake)
+		visited++
+		previous = index
+		index = waiter.next
 	}
+	if visited != attempt.waiterCount {
+		registry.corruptLocked(errors.New("attempt signal waiter count mismatch"))
+		return false
+	}
+	return true
 }
 
 func (registry *Registry) validAttemptLocked(

@@ -76,6 +76,7 @@ func settleAppliedBatch[Batch appliedBatchView](
 	attemptCount := 0
 	entryCount := 0
 	pendingToRelease := 0
+	completionToRetain := 0
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	if registry.closed {
@@ -130,6 +131,9 @@ func settleAppliedBatch[Batch appliedBatchView](
 		}
 		if findErr != nil {
 			rollback()
+			if errors.Is(findErr, ErrRegistryCorrupt) {
+				return registry.corruptLocked(findErr)
+			}
 			return findErr
 		}
 		if !found {
@@ -139,7 +143,11 @@ func settleAppliedBatch[Batch appliedBatchView](
 		if logical.fingerprint != identity.fingerprint || logical.logical != identity.logical {
 			continue
 		}
-		attemptIndex, found := registry.findAttemptLocked(logical, identity.attempt)
+		attemptIndex, found, attemptErr := registry.findAttemptLocked(logical, identity.attempt)
+		if attemptErr != nil {
+			rollback()
+			return registry.corruptLocked(attemptErr)
+		}
 		if !found {
 			continue
 		}
@@ -162,11 +170,11 @@ func settleAppliedBatch[Batch appliedBatchView](
 				settlementIndexInsert(&attemptTable, attemptIndex, stagedAttempt)
 			default:
 				rollback()
-				return ErrRegistryCorrupt
+				return registry.corruptLocked(errors.New("settlement found an invalid attempt state"))
 			}
 		} else if attempt.state != attemptSettling {
 			rollback()
-			return ErrRegistryCorrupt
+			return registry.corruptLocked(errors.New("settlement duplicate lost its staged attempt state"))
 		}
 
 		lookup, outcome, lookupErr := settlementLookup(
@@ -236,7 +244,7 @@ func settleAppliedBatch[Batch appliedBatchView](
 	for index := 0; index < attemptCount; index++ {
 		if !attempts[index].observed {
 			rollback()
-			return ErrRegistryCorrupt
+			return registry.corruptLocked(errors.New("settlement staged an unobserved attempt"))
 		}
 		item := attempts[index]
 		attempt, _, ok := registry.validAttemptLocked(
@@ -244,12 +252,12 @@ func settleAppliedBatch[Batch appliedBatchView](
 		)
 		if !ok || attempt.entry != item.entry {
 			rollback()
-			return ErrRegistryCorrupt
+			return registry.corruptLocked(errors.New("settlement staged attempt changed ownership"))
 		}
 		if attempt.admitted {
 			if attempt.lifecyclePending {
 				rollback()
-				return ErrRegistryCorrupt
+				return registry.corruptLocked(errors.New("admitted settlement retained a lifecycle callback"))
 			}
 			pendingToRelease++
 		}
@@ -261,16 +269,35 @@ func settleAppliedBatch[Batch appliedBatchView](
 			registry.stats.PendingGroups == 0 ||
 			registry.stats.PendingAdmittedAttempts < pendingToRelease {
 			rollback()
-			return ErrRegistryCorrupt
+			return registry.corruptLocked(errors.New("settlement pending-group counters are inconsistent"))
 		}
 	}
 	for index := 0; index < entryCount; index++ {
 		item := entries[index]
+		if int(item.entry) >= len(registry.entries) || item.completionBytes == 0 ||
+			int(item.completionBytes) > completionSlotBytes ||
+			item.completionApplied == 0 {
+			rollback()
+			return registry.corruptLocked(errors.New("settlement staged invalid completion metadata"))
+		}
 		entry := &registry.entries[item.entry]
 		if !entry.active || entry.completionLen != 0 {
 			rollback()
-			return ErrRegistryCorrupt
+			return registry.corruptLocked(errors.New("settlement completion identity changed before commit"))
 		}
+		completionToRetain += int(item.completionBytes)
+	}
+	if registry.stats.RetainedCompletionBytes < 0 ||
+		registry.stats.RetainedCompletionBytes > len(registry.completionArena) ||
+		completionToRetain > len(registry.completionArena)-registry.stats.RetainedCompletionBytes ||
+		int64(completionToRetain) > registry.limits.MaxRetainedCompletionBytes-
+			int64(registry.stats.RetainedCompletionBytes) {
+		rollback()
+		return registry.corruptLocked(errors.New("settlement completion byte counter is inconsistent"))
+	}
+	for index := 0; index < entryCount; index++ {
+		item := entries[index]
+		entry := &registry.entries[item.entry]
 		entry.completionLen = item.completionBytes
 		entry.completionApplied = item.completionApplied
 		registry.stats.RetainedCompletionBytes += int(item.completionBytes)
@@ -299,9 +326,13 @@ func settleAppliedBatch[Batch appliedBatchView](
 	for index := 0; index < attemptCount; index++ {
 		item := attempts[index]
 		attempt := &registry.attempts[item.attempt]
-		registry.signalAttemptLocked(attempt)
-		if attempt.waiterCount == 0 {
-			registry.removeAttemptLocked(item.attempt)
+		if !registry.signalAttemptLocked(item.attempt, attempt) {
+			return registry.failure
+		}
+		if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
+			if !registry.removeAttemptLocked(item.attempt) {
+				return registry.failure
+			}
 		}
 	}
 	return nil

@@ -464,15 +464,20 @@ and result-settlement sinks. It validates canonical commands before Host
 enqueue, coalesces only exact attempt identities, and publishes owned results
 only after deterministic apply. Its applied-range source authority comes from
 the synchronous Host and Runtime boundary. The registry does not independently
-authenticate an untrusted applied-range source. Outbound messages are still
-retained as individual frames.
+authenticate an untrusted applied-range source. Live Hosts sharing one registry
+must own disjoint group keys. Replacing a group owner requires fencing ingress,
+terminating its pending attempts, and closing the old Host before replacement
+admission. Outbound messages are still retained as individual frames.
 
-Wait cancellation releases only local waiter ownership. An admitted attempt
-remains bounded until deterministic apply or a Host-observed leadership,
-fault, removal, or close boundary makes it retryable as an infrastructure
-outcome. A leader that stays live without quorum has no time-based abandonment
-policy in this non-serving safe point. A serving gateway still needs a
-leader-and-quorum lease policy around request deadlines.
+Wait cancellation releases only local waiter ownership. While a blocking
+claimant is between wake checks, its fixed slot and notification channel remain
+occupied until that claimant acknowledges the logical release; this bounded
+anti-reuse handshake may briefly delay replacement admission without allocating.
+An admitted attempt remains bounded until deterministic apply or a Host-observed
+leadership, fault, removal, or close boundary makes it retryable as an
+infrastructure outcome. A leader that stays live without quorum has no
+time-based abandonment policy in this non-serving safe point. A serving gateway
+still needs a leader-and-quorum lease policy around request deadlines.
 
 The kernel has no production peer listener, address discovery, certificate
 operations, snapshot-transfer service, gateway serving integration, or request
