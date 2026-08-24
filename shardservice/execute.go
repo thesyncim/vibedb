@@ -39,9 +39,30 @@ const pgOIDJSON = 114
 
 // shardConn is one served connection: the socket and the single Session it owns.
 type shardConn struct {
-	server *Server
-	nc     net.Conn
-	sess   *sqldriver.Session
+	server          *Server
+	nc              net.Conn
+	sess            *sqldriver.Session
+	writeCancel     context.CancelFunc
+	writeToken      uint64
+	responseBatched bool
+	writeActive     bool
+}
+
+func terminalResponse(resp *ShardResponse) bool {
+	return resp == nil || resp.Kind != ResponseRowBatch || resp.RowBatch.Final
+}
+
+func (c *shardConn) releaseWriteAdmission() {
+	if c == nil || !c.writeActive {
+		return
+	}
+	token := c.writeToken
+	cancel := c.writeCancel
+	c.writeToken = 0
+	c.writeCancel = nil
+	c.writeActive = false
+	c.server.readFences.leaveWrite(token)
+	cancel()
 }
 
 // loop serves requests until the peer disconnects or the framing desynchronizes.
@@ -65,11 +86,10 @@ func (c *shardConn) loop() error {
 			}
 			continue
 		}
-		write := c.writeResponse
-		if req.RowBatch.present() {
-			write = c.writeBatchedResponse
-		}
-		if werr := c.handle(req, write); werr != nil {
+		c.responseBatched = req.RowBatch.present()
+		werr := c.handle(req, c.writeRequestResponse)
+		c.responseBatched = false
+		if werr != nil {
 			if errors.Is(werr, errRowBatchTerminated) {
 				continue
 			}
@@ -98,25 +118,27 @@ func isFramingError(err error) bool {
 // resource-limit frame rather than dropped, because that refusal happens before
 // any bytes are written.
 func (c *shardConn) writeResponse(resp *ShardResponse) error {
-	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
-	err := EncodeResponse(c.nc, resp)
-	if err == nil {
-		return nil
-	}
-	if isEncodeRejection(err) {
-		setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
-		return EncodeResponse(c.nc, NewErrorResponse(ErrorResourceLimit, err.Error()))
-	}
-	return err
+	return c.writeResponseFrame(resp, false)
+}
+
+func (c *shardConn) writeRequestResponse(resp *ShardResponse) error {
+	return c.writeResponseFrame(resp, c.responseBatched)
 }
 
 var errRowBatchTerminated = errors.New("shardservice: row batch stream terminated by a typed error")
 
-// writeBatchedResponse preserves stream alignment when a batch is rejected
-// before any bytes are written. The substitute error frame is terminal for this
-// request, so the private sentinel stops execution without closing the healthy
-// connection.
-func (c *shardConn) writeBatchedResponse(resp *ShardResponse) error {
+// write publishes one response frame. A terminal frame releases any ordinary
+// write admission first, so a completed write cannot remain transiently busy
+// after its result is observable. A rejected batch is replaced with a terminal
+// error frame and the private sentinel stops the stream without closing the
+// healthy connection.
+func (c *shardConn) writeResponseFrame(resp *ShardResponse, batched bool) error {
+	if c == nil {
+		return errors.New("shardservice: nil response writer")
+	}
+	if terminalResponse(resp) {
+		c.releaseWriteAdmission()
+	}
 	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
 	err := EncodeResponse(c.nc, resp)
 	if err == nil {
@@ -125,11 +147,18 @@ func (c *shardConn) writeBatchedResponse(resp *ShardResponse) error {
 	if !isEncodeRejection(err) {
 		return err
 	}
+	// A codec rejection is converted into a terminal error frame. Release an
+	// admitted writer before that substitute response can become observable,
+	// including when the rejected row batch itself was nonterminal.
+	c.releaseWriteAdmission()
 	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
 	if writeErr := EncodeResponse(c.nc, NewErrorResponse(ErrorResourceLimit, err.Error())); writeErr != nil {
 		return writeErr
 	}
-	return errRowBatchTerminated
+	if batched {
+		return errRowBatchTerminated
+	}
+	return nil
 }
 
 // isEncodeRejection reports whether EncodeResponse rejected a response before
@@ -223,8 +252,10 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 				c.server.readFences.leaveWrite(writeToken)
 				continue
 			}
-			defer writeCancel()
-			defer c.server.readFences.leaveWrite(writeToken)
+			c.writeCancel = writeCancel
+			c.writeToken = writeToken
+			c.writeActive = true
+			defer c.releaseWriteAdmission()
 			break
 		}
 	} else {

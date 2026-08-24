@@ -101,6 +101,19 @@ type gatedCloseConn struct {
 	err     error
 }
 
+type gatedWriteConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedWriteConn) Write(payload []byte) (int, error) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return c.Conn.Write(payload)
+}
+
 func (c *gatedCloseConn) Close() error {
 	c.once.Do(func() {
 		close(c.entered)
@@ -844,6 +857,50 @@ func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
 		t.Fatal(err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("intersecting read did not resume after abort")
+	}
+}
+
+func TestWriteAdmissionReleasedBeforeTerminalResponse(t *testing.T) {
+	srv, _ := newServer(t, Options{})
+	setup := dial(t, srv)
+	exec(t, setup, ownedRequest(ddlDocs))
+
+	client, server := net.Pipe()
+	gated := &gatedWriteConn{
+		Conn: server, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseWrite := func() { releaseOnce.Do(func() { close(gated.release) }) }
+	t.Cleanup(func() {
+		releaseWrite()
+		_ = client.Close()
+	})
+	go srv.ServeConn(gated)
+	request := ownedRequest(
+		`INSERT INTO docs (id, name, n) VALUES (?, ?, ?)`,
+		StringParam("response-boundary"), StringParam("visible"), NumberParam("1"),
+	)
+	if err := EncodeRequest(client, request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gated.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("write response did not reach the transport boundary")
+	}
+
+	fenceID := testTransactionID(122)
+	if err := srv.readFences.acquire(fenceID, time.Second, 0, nil); err != nil {
+		t.Fatalf("terminal response retained write admission: %v", err)
+	}
+	defer srv.readFences.release(fenceID)
+	releaseWrite()
+	response, err := DecodeResponse(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Kind != ResponseCompletion || response.RowsAffected != 1 {
+		t.Fatalf("write response = %+v", response)
 	}
 }
 
