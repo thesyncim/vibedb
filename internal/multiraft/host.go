@@ -45,6 +45,9 @@ var (
 	ErrProposalSinkRequired      = errors.New("multiraft: proposal lifecycle sink is required")
 	ErrProposalGroupSinkRequired = errors.New("multiraft: proposal group lifecycle sink is required")
 	ErrProposalPendingRequired   = errors.New("multiraft: proposal group pending sink is required")
+	ErrSourceClaimSinkRequired   = errors.New("multiraft: applied source claim sink is required")
+	ErrSourceReleaseSinkRequired = errors.New("multiraft: applied source release sink is required")
+	ErrSourceOwnerMismatch       = errors.New("multiraft: applied source owner mismatch")
 	ErrProposalToken             = errors.New("multiraft: invalid tracked proposal token")
 )
 
@@ -55,10 +58,12 @@ type ProposalToken [4]uint64
 // ProposalAdmission is the terminal local-core admission result for one
 // consumed tracked queue item. Cause is borrowed for the callback only.
 type ProposalAdmission struct {
-	Group    raftmember.GroupKey
-	Token    ProposalToken
-	Admitted bool
-	Cause    error
+	Group       raftmember.GroupKey
+	SourceOwner raftmember.AppliedSourceOwner
+	SourceToken raftmember.AppliedSourceToken
+	Token       ProposalToken
+	Admitted    bool
+	Cause       error
 }
 
 // ProposalLifecycleSink is invoked synchronously after a tracked queue item is
@@ -78,8 +83,10 @@ const (
 
 // ProposalGroupTermination identifies one exact group infrastructure boundary.
 type ProposalGroupTermination struct {
-	Group  raftmember.GroupKey
-	Reason ProposalGroupTerminationReason
+	Group       raftmember.GroupKey
+	SourceOwner raftmember.AppliedSourceOwner
+	SourceToken raftmember.AppliedSourceToken
+	Reason      ProposalGroupTerminationReason
 }
 
 // ProposalGroupLifecycleSink terminates admitted attempts that no longer have
@@ -89,7 +96,42 @@ type ProposalGroupLifecycleSink func(ProposalGroupTermination)
 // ProposalGroupPendingSink reports whether a group retains at least one
 // locally admitted tracked attempt. It must be bounded, allocation-free, do no
 // external work, and be safe to call on the serialized Host owner.
-type ProposalGroupPendingSink func(raftmember.GroupKey) bool
+type ProposalGroupPendingSink func(
+	raftmember.AppliedSourceOwner,
+	raftmember.AppliedSourceToken,
+) bool
+
+// AppliedResultSettlementSink acknowledges one exact Runtime-owned applied
+// range. The source owner and capability are borrowed for the call only.
+type AppliedResultSettlementSink func(
+	raftmember.AppliedSourceOwner,
+	raftmember.AppliedSourceToken,
+	raftmember.AppliedBatch,
+) error
+
+// AppliedSourceClaimSink claims one exact Runtime source before Host ownership
+// transfers. A successful claim must return a nonzero registry/epoch token.
+type AppliedSourceClaimSink func(
+	raftmember.AppliedSourceOwner,
+) (raftmember.AppliedSourceToken, error)
+
+// AppliedSourceReleaseSink releases a claim only after the Runtime has closed.
+type AppliedSourceReleaseSink func(
+	raftmember.AppliedSourceOwner,
+	raftmember.AppliedSourceToken,
+) error
+
+// ServingSinks is an all-or-nothing serving boundary. Keeping ownership,
+// settlement, and proposal lifecycle hooks in one validated value prevents a
+// Host from accidentally constructing an epoch-unfenced serving path.
+type ServingSinks struct {
+	Settle          AppliedResultSettlementSink
+	Proposals       ProposalLifecycleSink
+	ProposalGroups  ProposalGroupLifecycleSink
+	ProposalPending ProposalGroupPendingSink
+	ClaimSource     AppliedSourceClaimSink
+	ReleaseSource   AppliedSourceReleaseSink
+}
 
 // Limits bounds every retained Host object. All fields are required; no zero
 // value is interpreted as an implicit default.
@@ -290,6 +332,9 @@ const (
 type groupState struct {
 	key               raftmember.GroupKey
 	memberID          uint64
+	sourceOwner       raftmember.AppliedSourceOwner
+	sourceToken       raftmember.AppliedSourceToken
+	sourceClaimed     bool
 	runtime           memberRuntime
 	runnable          bool
 	messages          messageQueue
@@ -362,23 +407,21 @@ type Host struct {
 	runnable     []*groupState
 	runnableHead int
 
-	queueItems      int
-	queueBytes      int64
-	outbox          outboundQueue
-	outboxBytes     int64
-	ready           raftmember.ReadyWorkspace
-	readyGroup      *groupState
-	readySend       func(raftmember.OutboundMessage) error
-	settle          raftmember.ResultSettlementSink
-	proposals       ProposalLifecycleSink
-	proposalGroups  ProposalGroupLifecycleSink
-	proposalPending ProposalGroupPendingSink
-	closed          bool
+	queueItems  int
+	queueBytes  int64
+	outbox      outboundQueue
+	outboxBytes int64
+	ready       raftmember.ReadyWorkspace
+	readyGroup  *groupState
+	readySend   func(raftmember.OutboundMessage) error
+	settle      raftmember.ResultSettlementSink
+	serving     ServingSinks
+	closed      bool
 }
 
 // NewHost validates every limit and relationship before allocating the Host.
 func NewHost(limits Limits) (*Host, error) {
-	return newHost(limits, settleNoLocalWaiters, nil, nil, nil)
+	return newHost(limits, settleNoLocalWaiters, ServingSinks{})
 }
 
 // NewHostWithResultSettlementSink constructs a Host whose published normal
@@ -392,43 +435,40 @@ func NewHostWithResultSettlementSink(
 	if settle == nil {
 		return nil, ErrSettlementSinkRequired
 	}
-	return newHost(limits, settle, nil, nil, nil)
+	return newHost(limits, settle, ServingSinks{})
 }
 
 // NewHostWithServingSinks constructs a Host with result-settlement and
 // tracked-proposal lifecycle sinks. Every callback runs on the serialized Host
-// owner and must not re-enter Host. Hosts whose sinks share one serving
-// registry must own disjoint GroupKeys. Replacing an owner requires fencing
-// ingress and terminating and closing the old Host before replacement
-// admission; the sinks do not authenticate an applied source epoch.
-func NewHostWithServingSinks(
-	limits Limits,
-	settle raftmember.ResultSettlementSink,
-	proposals ProposalLifecycleSink,
-	proposalGroups ProposalGroupLifecycleSink,
-	proposalPending ProposalGroupPendingSink,
-) (*Host, error) {
-	if settle == nil {
+// owner and must not re-enter Host. Add claims the Runtime's exact applied
+// source before ownership transfer; settlement and lifecycle callbacks carry
+// that registry/epoch capability until close succeeds and release completes.
+func NewHostWithServingSinks(limits Limits, sinks ServingSinks) (*Host, error) {
+	if sinks.Settle == nil {
 		return nil, ErrSettlementSinkRequired
 	}
-	if proposals == nil {
+	if sinks.Proposals == nil {
 		return nil, ErrProposalSinkRequired
 	}
-	if proposalGroups == nil {
+	if sinks.ProposalGroups == nil {
 		return nil, ErrProposalGroupSinkRequired
 	}
-	if proposalPending == nil {
+	if sinks.ProposalPending == nil {
 		return nil, ErrProposalPendingRequired
 	}
-	return newHost(limits, settle, proposals, proposalGroups, proposalPending)
+	if sinks.ClaimSource == nil {
+		return nil, ErrSourceClaimSinkRequired
+	}
+	if sinks.ReleaseSource == nil {
+		return nil, ErrSourceReleaseSinkRequired
+	}
+	return newHost(limits, nil, sinks)
 }
 
 func newHost(
 	limits Limits,
 	settle raftmember.ResultSettlementSink,
-	proposals ProposalLifecycleSink,
-	proposalGroups ProposalGroupLifecycleSink,
-	proposalPending ProposalGroupPendingSink,
+	serving ServingSinks,
 ) (*Host, error) {
 	if err := validateLimits(limits); err != nil {
 		return nil, err
@@ -436,8 +476,10 @@ func newHost(
 	host := &Host{
 		limits: limits,
 		groups: make(map[raftmember.GroupKey]*groupState),
-		settle: settle, proposals: proposals, proposalGroups: proposalGroups,
-		proposalPending: proposalPending,
+		settle: settle, serving: serving,
+	}
+	if serving.Settle != nil {
+		host.settle = host.settleOwnedBatch
 	}
 	host.readySend = host.enqueueReadyOutbound
 	return host, nil
@@ -489,7 +531,34 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 	if failure := runtime.Failure(); failure != nil {
 		return errors.Join(ErrGroupFaulted, failure)
 	}
-	group := &groupState{key: key, memberID: identity.MemberID, runtime: runtime}
+	owner := identity.AppliedSourceOwner()
+	var sourceToken raftmember.AppliedSourceToken
+	if host.serving.ClaimSource != nil {
+		if owner.AllocationGeneration == 0 || owner.StoreID == ([16]byte{}) {
+			return fmt.Errorf("%w: incomplete serving runtime identity", ErrSourceOwnerMismatch)
+		}
+		var claimErr error
+		sourceToken, claimErr = host.serving.ClaimSource(owner)
+		if claimErr != nil {
+			return claimErr
+		}
+		if sourceToken.RegistryID == 0 || sourceToken.OwnerEpoch == 0 {
+			releaseErr := host.serving.ReleaseSource(owner, sourceToken)
+			if releaseErr != nil {
+				host.groups[key] = &groupState{
+					key: key, memberID: identity.MemberID, sourceOwner: owner,
+					sourceToken: sourceToken, sourceClaimed: true, retiring: true,
+				}
+				host.order = append(host.order, host.groups[key])
+			}
+			return errors.Join(ErrSourceOwnerMismatch, releaseErr)
+		}
+	}
+	group := &groupState{
+		key: key, memberID: identity.MemberID, runtime: runtime,
+		sourceOwner: owner, sourceToken: sourceToken,
+		sourceClaimed: host.serving.ClaimSource != nil,
+	}
 	host.groups[key] = group
 	host.order = append(host.order, group)
 	host.wake(group)
@@ -544,6 +613,9 @@ func (host *Host) Remove(key raftmember.GroupKey) error {
 		}
 		group.runtime = nil
 	}
+	if err := host.releaseGroupSource(group); err != nil {
+		return err
+	}
 	delete(host.groups, key)
 	for index, candidate := range host.order {
 		if candidate != group {
@@ -554,6 +626,23 @@ func (host *Host) Remove(key raftmember.GroupKey) error {
 		host.order = host.order[:len(host.order)-1]
 		break
 	}
+	return nil
+}
+
+func (host *Host) releaseGroupSource(group *groupState) error {
+	if group == nil || !group.sourceClaimed {
+		return nil
+	}
+	if host.serving.ReleaseSource == nil ||
+		group.sourceOwner == (raftmember.AppliedSourceOwner{}) {
+		return ErrSourceOwnerMismatch
+	}
+	if err := host.serving.ReleaseSource(group.sourceOwner, group.sourceToken); err != nil {
+		return err
+	}
+	group.sourceOwner = raftmember.AppliedSourceOwner{}
+	group.sourceToken = raftmember.AppliedSourceToken{}
+	group.sourceClaimed = false
 	return nil
 }
 
@@ -635,8 +724,9 @@ func (host *Host) EnqueueTrackedProposal(
 	if token == (ProposalToken{}) {
 		return ErrProposalToken
 	}
-	if host == nil || host.proposals == nil || host.proposalGroups == nil ||
-		host.proposalPending == nil {
+	if host == nil || host.serving.Proposals == nil ||
+		host.serving.ProposalGroups == nil || host.serving.ProposalPending == nil ||
+		host.serving.ClaimSource == nil || host.serving.ReleaseSource == nil {
 		return ErrProposalSinkRequired
 	}
 	return host.enqueueProposal(key, data, token, true)
@@ -966,16 +1056,33 @@ func settleNoLocalWaiters(batch raftmember.AppliedBatch) error {
 	return nil
 }
 
+func (host *Host) settleOwnedBatch(batch raftmember.AppliedBatch) error {
+	if host == nil {
+		return ErrSourceOwnerMismatch
+	}
+	group := host.readyGroup
+	if group == nil || group.runtime == nil || group.retiring ||
+		host.serving.Settle == nil || !group.sourceClaimed ||
+		group.sourceOwner == (raftmember.AppliedSourceOwner{}) ||
+		group.sourceToken.RegistryID == 0 || group.sourceToken.OwnerEpoch == 0 ||
+		batch.Source().Owner() != group.sourceOwner || batch.Group() != group.key {
+		return ErrSourceOwnerMismatch
+	}
+	return host.serving.Settle(group.sourceOwner, group.sourceToken, batch)
+}
+
 func (host *Host) finishTrackedProposal(
 	group *groupState,
 	proposal queuedProposal,
 	cause error,
 ) {
-	if host == nil || group == nil || !proposal.tracked || host.proposals == nil {
+	if host == nil || group == nil || !proposal.tracked || host.serving.Proposals == nil {
 		return
 	}
-	host.proposals(ProposalAdmission{
-		Group: group.key, Token: proposal.token, Admitted: cause == nil, Cause: cause,
+	host.serving.Proposals(ProposalAdmission{
+		Group:       group.key,
+		SourceOwner: group.sourceOwner, SourceToken: group.sourceToken,
+		Token: proposal.token, Admitted: cause == nil, Cause: cause,
 	})
 }
 
@@ -983,26 +1090,29 @@ func (host *Host) finishTrackedGroup(
 	group *groupState,
 	reason ProposalGroupTerminationReason,
 ) {
-	if host == nil || group == nil || host.proposalGroups == nil {
+	if host == nil || group == nil || host.serving.ProposalGroups == nil {
 		return
 	}
-	host.proposalGroups(ProposalGroupTermination{Group: group.key, Reason: reason})
+	host.serving.ProposalGroups(ProposalGroupTermination{
+		Group:       group.key,
+		SourceOwner: group.sourceOwner, SourceToken: group.sourceToken, Reason: reason,
+	})
 	group.trackedLeaderTerm = 0
 }
 
 func (host *Host) refreshTrackedPending(group *groupState) {
 	if host == nil || group == nil || group.trackedLeaderTerm == 0 ||
-		host.proposalPending == nil {
+		host.serving.ProposalPending == nil {
 		return
 	}
-	if !host.proposalPending(group.key) {
+	if !host.serving.ProposalPending(group.sourceOwner, group.sourceToken) {
 		group.trackedLeaderTerm = 0
 	}
 }
 
 func (host *Host) observeTrackedLeadership(group *groupState) {
 	if host == nil || group == nil || group.runtime == nil ||
-		group.trackedLeaderTerm == 0 || host.proposalGroups == nil {
+		group.trackedLeaderTerm == 0 || host.serving.ProposalGroups == nil {
 		return
 	}
 	status, err := group.runtime.Status()
@@ -1221,6 +1331,9 @@ func (host *Host) clearQueues() {
 		if group == nil {
 			continue
 		}
+		if group.retiring && group.runtime == nil {
+			continue
+		}
 		group.messages.clear()
 		for {
 			proposal, ok := group.proposals.pop()
@@ -1269,18 +1382,26 @@ func (host *Host) Close() error {
 	var closeErr error
 	remaining := false
 	for _, group := range host.order {
-		if group == nil || group.runtime == nil {
+		if group == nil {
 			continue
 		}
-		if err := group.runtime.Close(); err != nil {
+		if group.runtime != nil {
+			if err := group.runtime.Close(); err != nil {
+				closeErr = errors.Join(closeErr, err)
+				remaining = true
+				continue
+			}
+			group.runtime = nil
+		}
+		if err := host.releaseGroupSource(group); err != nil {
 			closeErr = errors.Join(closeErr, err)
 			remaining = true
-			continue
 		}
-		group.runtime = nil
 	}
 	if !remaining {
 		clear(host.groups)
+		clear(host.order)
+		host.order = nil
 	}
 	return closeErr
 }

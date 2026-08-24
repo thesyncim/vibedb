@@ -11,6 +11,7 @@ import (
 	"hash/maphash"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -50,8 +51,25 @@ var (
 	ErrSettlementResult           = errors.New("raftserve: invalid applied settlement result")
 	ErrRegistryCorrupt            = errors.New("raftserve: registry invariant failure")
 	ErrGenerationExhausted        = errors.New("raftserve: registry generation exhausted")
+	ErrSourceOwnerClaimed         = errors.New("raftserve: applied source already has a live owner")
+	ErrSourceOwnerMismatch        = errors.New("raftserve: applied source owner mismatch")
+	ErrSourceOwnersLive           = errors.New("raftserve: applied source owners are still live")
 	ErrProposalRefused            = errors.New("raftserve: proposal refused before local core admission")
 )
+
+var nextRegistryID atomic.Uint64
+
+func allocateRegistryID() (uint64, error) {
+	for {
+		current := nextRegistryID.Load()
+		if current == math.MaxUint64 {
+			return 0, ErrGenerationExhausted
+		}
+		if nextRegistryID.CompareAndSwap(current, current+1) {
+			return current + 1, nil
+		}
+	}
+}
 
 // Limits fixes every retained registry dimension. All fields are required.
 type Limits struct {
@@ -83,6 +101,7 @@ type Stats struct {
 	GroupTableCapacity      int
 	PendingGroups           int
 	PendingAdmittedAttempts int
+	LiveSourceOwners        int
 	TenantArenaBytes        int
 	CompletionArenaBytes    int
 	LastLookupProbes        int
@@ -104,12 +123,17 @@ type positionSlot struct {
 }
 
 type pendingGroupSlot struct {
-	group           raftmember.GroupKey
-	hash            uint64
-	identityCount   uint32
-	pendingAttempts uint32
-	entryHead       uint32
-	state           tableState
+	group                raftmember.GroupKey
+	hash                 uint64
+	allocationGeneration uint64
+	memberID             uint64
+	storeID              [16]byte
+	nodeIncarnation      uint64
+	ownerEpoch           uint64
+	identityCount        uint32
+	pendingAttempts      uint32
+	entryHead            uint32
+	state                tableState
 }
 
 type entryRecord struct {
@@ -139,6 +163,7 @@ const (
 type attemptRecord struct {
 	digest           [32]byte
 	generation       uint64
+	ownerEpoch       uint64
 	appliedIndex     uint64
 	freeNext         uint32
 	next             uint32
@@ -181,15 +206,17 @@ type ProposalEnqueuer interface {
 // Registry owns bounded waiter identities for one or more serialized Host
 // lanes. Live Hosts sharing a Registry must own disjoint GroupKeys. Replacing a
 // GroupKey owner requires fencing old ingress, terminating and closing the old
-// Host, and only then admitting through the replacement. The applied source is
-// trusted at that owner boundary; Registry does not authenticate a source
-// epoch. Cancellation, waiting, result copying, and settlement are synchronized.
+// Host, and releasing its exact registry/epoch capability before replacement
+// admission. Cancellation, waiting, result copying, ownership, and settlement
+// are synchronized.
 type Registry struct {
-	mu       sync.Mutex
-	settleMu sync.Mutex
-	limits   Limits
-	seed     maphash.Seed
-	hashMask uint64
+	mu             sync.Mutex
+	settleMu       sync.Mutex
+	limits         Limits
+	seed           maphash.Seed
+	hashMask       uint64
+	registryID     uint64
+	nextOwnerEpoch uint64
 
 	table             []positionSlot
 	groupTable        []pendingGroupSlot
@@ -216,10 +243,15 @@ func NewRegistry(limits Limits) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	registryID, err := allocateRegistryID()
+	if err != nil {
+		return nil, err
+	}
 	registry := &Registry{
 		limits:            limits,
 		seed:              maphash.MakeSeed(),
 		hashMask:          math.MaxUint64,
+		registryID:        registryID,
 		table:             make([]positionSlot, tableSize),
 		groupTable:        make([]pendingGroupSlot, groupTableSize),
 		entries:           make([]entryRecord, limits.MaxOutstandingIdentities),
@@ -382,7 +414,13 @@ func (registry *Registry) registerLocked(
 				Key: identity.position.sessionDigest,
 			}
 		}
-		attemptIndex, ok, findErr := registry.findAttemptLocked(entry, identity.attempt)
+		ownerEpoch, sourceErr := registry.groupOwnerEpochLocked(identity.position.group)
+		if sourceErr != nil {
+			return Waiter{}, registrationToken{}, false, registry.corruptLocked(sourceErr)
+		}
+		attemptIndex, ok, findErr := registry.findAttemptLocked(
+			entry, identity.attempt, ownerEpoch,
+		)
 		if findErr != nil {
 			return Waiter{}, registrationToken{}, false, registry.corruptLocked(findErr)
 		}
@@ -398,7 +436,9 @@ func (registry *Registry) registerLocked(
 		if int(entry.attemptCount) >= registry.limits.MaxAttemptsPerIdentity {
 			return Waiter{}, registrationToken{}, false, ErrAttemptsPerIdentity
 		}
-		attemptIndex, attemptGeneration, allocErr := registry.allocateAttemptLocked(entryIndex)
+		attemptIndex, attemptGeneration, allocErr := registry.allocateAttemptLocked(
+			entryIndex, ownerEpoch,
+		)
 		if allocErr != nil {
 			return Waiter{}, registrationToken{}, false, allocErr
 		}
@@ -460,7 +500,10 @@ func (registry *Registry) registerLocked(
 		}
 		return Waiter{}, registrationToken{}, false, allocErr
 	}
-	attemptIndex, attemptGeneration, allocErr := registry.allocateAttemptLocked(entryIndex)
+	ownerEpoch := registry.groupTable[groupIndex].ownerEpoch
+	attemptIndex, attemptGeneration, allocErr := registry.allocateAttemptLocked(
+		entryIndex, ownerEpoch,
+	)
 	if allocErr != nil {
 		if !registry.removeEntryLocked(entryIndex) {
 			return Waiter{}, registrationToken{}, false, registry.failure
@@ -545,6 +588,13 @@ func (registry *Registry) settleProposalAdmission(
 	if registry.closed || registry.failure != nil {
 		return
 	}
+	ownerEpoch, sourceErr := registry.validateCallbackSourceLocked(
+		admission.Group, admission.SourceOwner, admission.SourceToken,
+	)
+	if sourceErr != nil {
+		registry.poisonLocked(errors.Join(errors.New("proposal admission source"), sourceErr))
+		return
+	}
 	entryIndex := uint32(admission.Token[0])
 	entryGeneration := admission.Token[1]
 	attemptIndex := uint32(admission.Token[2])
@@ -573,6 +623,10 @@ func (registry *Registry) settleProposalAdmission(
 	if admission.Admitted {
 		switch attempt.state {
 		case attemptPending, attemptSettling:
+			if attempt.ownerEpoch != ownerEpoch {
+				registry.poisonLocked(errors.New("admitted proposal changed source epoch"))
+				return
+			}
 			if !registry.addGroupPendingLocked(entry.position.group) {
 				registry.poisonLocked(errors.New("admitted proposal has no group capacity record"))
 				return
@@ -641,6 +695,11 @@ func (registry *Registry) TerminateGroup(
 	if registry.failure != nil {
 		return registry.failure
 	}
+	if groupIndex, found, findErr := registry.findGroupLocked(group); findErr != nil {
+		return findErr
+	} else if found && registry.groupTable[groupIndex].ownerEpoch != 0 {
+		return ErrSourceOwnerMismatch
+	}
 	err := registry.terminateGroupLocked(group, reason)
 	if err != nil && errors.Is(err, ErrRegistryCorrupt) {
 		return registry.corruptLocked(err)
@@ -661,7 +720,15 @@ func (registry *Registry) settleProposalGroupTermination(
 	if registry.closed || registry.failure != nil {
 		return
 	}
-	if err := registry.terminateGroupLocked(termination.Group, termination.Reason); err != nil {
+	if _, err := registry.validateCallbackSourceLocked(
+		termination.Group, termination.SourceOwner, termination.SourceToken,
+	); err != nil {
+		registry.poisonLocked(errors.Join(errors.New("proposal group termination source"), err))
+		return
+	}
+	if err := registry.terminateGroupLocked(
+		termination.Group, termination.Reason,
+	); err != nil {
 		registry.poisonLocked(err)
 	}
 }
@@ -734,6 +801,9 @@ func (registry *Registry) terminateGroupLocked(
 			visitedAttempts++
 			if attempt.state == attemptPending && attempt.admitted &&
 				!attempt.lifecyclePending {
+				if attempt.ownerEpoch != groupRecord.ownerEpoch {
+					return ErrRegistryCorrupt
+				}
 				pendingToRelease++
 			}
 			attemptIndex = attempt.next
@@ -760,6 +830,9 @@ func (registry *Registry) terminateGroupLocked(
 			if attempt.active && attempt.entryGeneration == entry.generation &&
 				attempt.state == attemptPending && attempt.admitted &&
 				!attempt.lifecyclePending {
+				if attempt.ownerEpoch != groupRecord.ownerEpoch {
+					return ErrRegistryCorrupt
+				}
 				if !registry.removeGroupPendingLocked(group) {
 					return ErrRegistryCorrupt
 				}
@@ -864,6 +937,21 @@ func (registry *Registry) findGroupLocked(
 	return noIndex, false, ErrGroupCapacity
 }
 
+func (registry *Registry) groupOwnerEpochLocked(group raftmember.GroupKey) (uint64, error) {
+	index, found, err := registry.findGroupLocked(group)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, ErrRegistryCorrupt
+	}
+	slot := &registry.groupTable[index]
+	if slot.identityCount == 0 || slot.entryHead == noIndex {
+		return 0, ErrRegistryCorrupt
+	}
+	return slot.ownerEpoch, nil
+}
+
 func (registry *Registry) retainGroupIdentityLocked(
 	group raftmember.GroupKey,
 ) (uint32, error) {
@@ -882,9 +970,11 @@ func (registry *Registry) retainGroupIdentityLocked(
 	}
 	if found {
 		slot := &registry.groupTable[index]
-		if slot.identityCount == 0 || registry.stats.OutstandingGroups == 0 ||
+		if registry.stats.OutstandingGroups == 0 ||
 			int(slot.identityCount) > registry.stats.OutstandingIdentities ||
-			slot.identityCount >= uint32(registry.limits.MaxOutstandingIdentities) {
+			slot.identityCount >= uint32(registry.limits.MaxOutstandingIdentities) ||
+			(slot.identityCount == 0 && slot.ownerEpoch == 0) ||
+			(slot.identityCount == 0) != (slot.entryHead == noIndex) {
 			return noIndex, ErrRegistryCorrupt
 		}
 		slot.identityCount++
@@ -933,11 +1023,188 @@ func (registry *Registry) releaseGroupIdentityLocked(
 	if slot.identityCount != 0 {
 		return true
 	}
+	if slot.ownerEpoch != 0 {
+		return true
+	}
 	if !registry.deleteGroupSlotLocked(index) {
 		return false
 	}
 	registry.stats.OutstandingGroups--
 	return true
+}
+
+func validAppliedSourceOwner(owner raftmember.AppliedSourceOwner) bool {
+	return owner.Group != (raftmember.GroupKey{}) && owner.AllocationGeneration != 0 &&
+		owner.MemberID != 0 && owner.StoreID != ([16]byte{}) && owner.NodeIncarnation != 0
+}
+
+func groupSlotOwner(slot *pendingGroupSlot) raftmember.AppliedSourceOwner {
+	if slot == nil || slot.ownerEpoch == 0 {
+		return raftmember.AppliedSourceOwner{}
+	}
+	return raftmember.AppliedSourceOwner{
+		Group: slot.group, AllocationGeneration: slot.allocationGeneration,
+		MemberID: slot.memberID, StoreID: slot.storeID,
+		NodeIncarnation: slot.nodeIncarnation,
+	}
+}
+
+func (registry *Registry) validateSourceOwnerLocked(
+	owner raftmember.AppliedSourceOwner,
+	token raftmember.AppliedSourceToken,
+) (uint32, error) {
+	if !validAppliedSourceOwner(owner) || token.RegistryID == 0 || token.OwnerEpoch == 0 ||
+		token.RegistryID != registry.registryID {
+		return noIndex, ErrSourceOwnerMismatch
+	}
+	index, found, err := registry.findGroupLocked(owner.Group)
+	if err != nil {
+		return noIndex, err
+	}
+	if !found {
+		return noIndex, ErrSourceOwnerMismatch
+	}
+	slot := &registry.groupTable[index]
+	if slot.ownerEpoch != token.OwnerEpoch || groupSlotOwner(slot) != owner {
+		return noIndex, ErrSourceOwnerMismatch
+	}
+	return index, nil
+}
+
+func (registry *Registry) validateCallbackSourceLocked(
+	group raftmember.GroupKey,
+	owner raftmember.AppliedSourceOwner,
+	token raftmember.AppliedSourceToken,
+) (uint64, error) {
+	if owner == (raftmember.AppliedSourceOwner{}) &&
+		token == (raftmember.AppliedSourceToken{}) {
+		if group == (raftmember.GroupKey{}) {
+			return 0, ErrSourceOwnerMismatch
+		}
+		index, found, err := registry.findGroupLocked(group)
+		if err != nil {
+			return 0, err
+		}
+		if found && registry.groupTable[index].ownerEpoch != 0 {
+			return 0, ErrSourceOwnerMismatch
+		}
+		return 0, nil
+	}
+	if owner.Group != group {
+		return 0, ErrSourceOwnerMismatch
+	}
+	if _, err := registry.validateSourceOwnerLocked(owner, token); err != nil {
+		return 0, err
+	}
+	return token.OwnerEpoch, nil
+}
+
+func (registry *Registry) claimAppliedSource(
+	owner raftmember.AppliedSourceOwner,
+) (raftmember.AppliedSourceToken, error) {
+	if registry == nil {
+		return raftmember.AppliedSourceToken{}, ErrRegistryClosed
+	}
+	if !validAppliedSourceOwner(owner) {
+		return raftmember.AppliedSourceToken{}, ErrSourceOwnerMismatch
+	}
+	registry.settleMu.Lock()
+	defer registry.settleMu.Unlock()
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closed {
+		return raftmember.AppliedSourceToken{}, ErrRegistryClosed
+	}
+	if registry.failure != nil {
+		return raftmember.AppliedSourceToken{}, registry.failure
+	}
+	index, found, err := registry.findGroupLocked(owner.Group)
+	if err != nil {
+		return raftmember.AppliedSourceToken{}, err
+	}
+	if found {
+		slot := &registry.groupTable[index]
+		if slot.ownerEpoch != 0 {
+			return raftmember.AppliedSourceToken{}, ErrSourceOwnerClaimed
+		}
+		if slot.identityCount == 0 || slot.entryHead == noIndex ||
+			registry.stats.OutstandingGroups <= 0 {
+			return raftmember.AppliedSourceToken{}, registry.corruptLocked(
+				errors.New("source claim found an ownerless empty group slot"),
+			)
+		}
+	} else {
+		if registry.stats.OutstandingGroups >= registry.limits.MaxGroups {
+			return raftmember.AppliedSourceToken{}, ErrGroupCapacity
+		}
+		registry.groupTable[index] = pendingGroupSlot{
+			group: owner.Group, hash: hashGroup(registry.seed, owner.Group) & registry.hashMask,
+			entryHead: noIndex, state: tableOccupied,
+		}
+		registry.stats.OutstandingGroups++
+		registry.stats.PeakGroups = max(registry.stats.PeakGroups, registry.stats.OutstandingGroups)
+	}
+	if registry.nextOwnerEpoch == math.MaxUint64 {
+		if !found && !registry.deleteGroupSlotLocked(index) {
+			return raftmember.AppliedSourceToken{}, registry.failure
+		}
+		if !found {
+			registry.stats.OutstandingGroups--
+		}
+		return raftmember.AppliedSourceToken{}, ErrGenerationExhausted
+	}
+	registry.nextOwnerEpoch++
+	slot := &registry.groupTable[index]
+	slot.allocationGeneration = owner.AllocationGeneration
+	slot.memberID = owner.MemberID
+	slot.storeID = owner.StoreID
+	slot.nodeIncarnation = owner.NodeIncarnation
+	slot.ownerEpoch = registry.nextOwnerEpoch
+	registry.stats.LiveSourceOwners++
+	return raftmember.AppliedSourceToken{
+		RegistryID: registry.registryID, OwnerEpoch: slot.ownerEpoch,
+	}, nil
+}
+
+func (registry *Registry) releaseAppliedSource(
+	owner raftmember.AppliedSourceOwner,
+	token raftmember.AppliedSourceToken,
+) error {
+	if registry == nil {
+		return ErrRegistryClosed
+	}
+	registry.settleMu.Lock()
+	defer registry.settleMu.Unlock()
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closed {
+		return ErrRegistryClosed
+	}
+	if registry.failure != nil {
+		return registry.failure
+	}
+	index, err := registry.validateSourceOwnerLocked(owner, token)
+	if err != nil {
+		return err
+	}
+	slot := &registry.groupTable[index]
+	if slot.pendingAttempts != 0 || registry.stats.LiveSourceOwners <= 0 {
+		return ErrSourceOwnersLive
+	}
+	slot.allocationGeneration = 0
+	slot.memberID = 0
+	slot.storeID = [16]byte{}
+	slot.nodeIncarnation = 0
+	slot.ownerEpoch = 0
+	registry.stats.LiveSourceOwners--
+	if slot.identityCount != 0 {
+		return nil
+	}
+	if slot.entryHead != noIndex || !registry.deleteGroupSlotLocked(index) {
+		return registry.corruptLocked(errors.New("released source retained an invalid empty group"))
+	}
+	registry.stats.OutstandingGroups--
+	return nil
 }
 
 func (registry *Registry) addGroupPendingLocked(
@@ -991,9 +1258,27 @@ func (registry *Registry) removeGroupPendingLocked(
 	return true
 }
 
-func (registry *Registry) hasPendingGroup(
-	group raftmember.GroupKey,
+func (registry *Registry) hasPendingOwnedGroup(
+	owner raftmember.AppliedSourceOwner,
+	token raftmember.AppliedSourceToken,
 ) bool {
+	if registry == nil {
+		return true
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closed || registry.failure != nil {
+		return true
+	}
+	index, err := registry.validateSourceOwnerLocked(owner, token)
+	if err != nil {
+		registry.poisonLocked(err)
+		return true
+	}
+	return registry.groupTable[index].pendingAttempts != 0
+}
+
+func (registry *Registry) hasPendingGroup(group raftmember.GroupKey) bool {
 	if registry == nil {
 		return true
 	}
@@ -1005,6 +1290,9 @@ func (registry *Registry) hasPendingGroup(
 	index, found, err := registry.findGroupLocked(group)
 	if err != nil {
 		registry.poisonLocked(err)
+		return true
+	}
+	if found && registry.groupTable[index].ownerEpoch != 0 {
 		return true
 	}
 	return found && registry.groupTable[index].pendingAttempts != 0
@@ -1089,6 +1377,7 @@ func (registry *Registry) entryPositionEqual(
 func (registry *Registry) findAttemptLocked(
 	entry *entryRecord,
 	digest [32]byte,
+	ownerEpoch uint64,
 ) (uint32, bool, error) {
 	if entry == nil || !entry.active ||
 		entry.attemptCount > uint16(registry.limits.MaxAttemptsPerIdentity) ||
@@ -1108,7 +1397,7 @@ func (registry *Registry) findAttemptLocked(
 			return noIndex, false, ErrRegistryCorrupt
 		}
 		visited++
-		if attempt.digest == digest {
+		if attempt.digest == digest && attempt.ownerEpoch == ownerEpoch {
 			return index, true, nil
 		}
 		index = attempt.next
@@ -1197,6 +1486,7 @@ func (registry *Registry) allocateEntryLocked(
 
 func (registry *Registry) allocateAttemptLocked(
 	entryIndex uint32,
+	ownerEpoch uint64,
 ) (uint32, uint64, error) {
 	if registry.freeAttempt == noIndex {
 		if registry.stats.OutstandingAttempts != len(registry.attempts) {
@@ -1242,7 +1532,7 @@ func (registry *Registry) allocateAttemptLocked(
 	}
 	registry.freeAttempt = record.freeNext
 	*record = attemptRecord{
-		generation: generation, freeNext: noIndex,
+		generation: generation, ownerEpoch: ownerEpoch, freeNext: noIndex,
 		next: entry.attemptHead, waiterHead: noIndex,
 		entry: entryIndex, entryGeneration: entry.generation,
 		state: attemptPending, lifecyclePending: true, active: true,
@@ -1603,18 +1893,25 @@ func (registry *Registry) deleteGroupSlotLocked(hole uint32) bool {
 			registry.groupTable[hole] = pendingGroupSlot{}
 			return true
 		}
-		if slot.state != tableOccupied || slot.identityCount == 0 ||
-			slot.group == (raftmember.GroupKey{}) || slot.entryHead == noIndex ||
-			int(slot.entryHead) >= len(registry.entries) ||
-			int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts {
+		if slot.state != tableOccupied || slot.group == (raftmember.GroupKey{}) ||
+			(slot.identityCount == 0) != (slot.entryHead == noIndex) ||
+			(slot.identityCount == 0 && slot.ownerEpoch == 0) ||
+			(slot.identityCount != 0 && int(slot.entryHead) >= len(registry.entries)) ||
+			int(slot.pendingAttempts) > registry.stats.PendingAdmittedAttempts ||
+			(slot.pendingAttempts != 0 && slot.identityCount == 0) ||
+			(slot.ownerEpoch == 0 && (slot.allocationGeneration != 0 || slot.memberID != 0 ||
+				slot.storeID != ([16]byte{}) || slot.nodeIncarnation != 0)) ||
+			(slot.ownerEpoch != 0 && !validAppliedSourceOwner(groupSlotOwner(&slot))) {
 			registry.corruptLocked(errors.New("group table deletion found a corrupt slot"))
 			return false
 		}
-		head := &registry.entries[slot.entryHead]
-		if !head.active || head.position.group != slot.group ||
-			head.groupPrevious != noIndex {
-			registry.corruptLocked(errors.New("group table deletion found a corrupt entry head"))
-			return false
+		if slot.identityCount != 0 {
+			head := &registry.entries[slot.entryHead]
+			if !head.active || head.position.group != slot.group ||
+				head.groupPrevious != noIndex {
+				registry.corruptLocked(errors.New("group table deletion found a corrupt entry head"))
+				return false
+			}
 		}
 		home := uint32(slot.hash) & mask
 		toScan := (scan - home) & mask
@@ -1703,14 +2000,21 @@ func (registry *Registry) Close() error {
 	}
 	registry.settleMu.Lock()
 	defer registry.settleMu.Unlock()
+	registry.mu.Lock()
+	if registry.closed {
+		registry.mu.Unlock()
+		return nil
+	}
+	if registry.stats.LiveSourceOwners != 0 {
+		registry.mu.Unlock()
+		return ErrSourceOwnersLive
+	}
+	registry.mu.Unlock()
 	if err := registry.settlementLookup.Release(); err != nil {
 		return err
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	if registry.closed {
-		return nil
-	}
 	registry.closed = true
 	for index := range registry.waiters {
 		if registry.waiters[index].active {
@@ -1757,6 +2061,7 @@ func (registry *Registry) Close() error {
 	registry.stats.RetainedCompletionBytes = 0
 	registry.stats.PendingGroups = 0
 	registry.stats.PendingAdmittedAttempts = 0
+	registry.stats.LiveSourceOwners = 0
 	return nil
 }
 
@@ -1987,13 +2292,14 @@ func (registry *Registry) NewHost(limits multiraft.Limits) (*multiraft.Host, err
 	if registry.failure != nil {
 		return nil, registry.failure
 	}
-	return multiraft.NewHostWithServingSinks(
-		limits,
-		registry.SettleAppliedBatch,
-		registry.settleProposalAdmission,
-		registry.settleProposalGroupTermination,
-		registry.hasPendingGroup,
-	)
+	return multiraft.NewHostWithServingSinks(limits, multiraft.ServingSinks{
+		Settle:          registry.settleOwnedAppliedBatch,
+		Proposals:       registry.settleProposalAdmission,
+		ProposalGroups:  registry.settleProposalGroupTermination,
+		ProposalPending: registry.hasPendingOwnedGroup,
+		ClaimSource:     registry.claimAppliedSource,
+		ReleaseSource:   registry.releaseAppliedSource,
+	})
 }
 
 func (registry *Registry) signalAttemptLocked(

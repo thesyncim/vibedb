@@ -105,7 +105,7 @@ func TestRegistryWarmSettlementAllocationsAndFixedStorage(t *testing.T) {
 	if size := unsafe.Sizeof(entryRecord{}); size > 248 {
 		t.Fatalf("entry record exceeds fixed geometry: %dB", size)
 	}
-	if size := unsafe.Sizeof(pendingGroupSlot{}); size > 96 {
+	if size := unsafe.Sizeof(pendingGroupSlot{}); size > 152 {
 		t.Fatalf("pending group slot exceeds fixed geometry: %dB", size)
 	}
 	if size := unsafe.Sizeof(waiterRecord{}); size > 48 {

@@ -40,6 +40,7 @@ type fakeRuntime struct {
 	failure             error
 	failureOnReadyError bool
 	closeErrs           []error
+	closeHook           func()
 	closeCalls          int
 	driveCalls          int
 	statusCalls         int
@@ -57,8 +58,13 @@ func newFakeRuntime(seed byte) *fakeRuntime {
 		key.ShardIncarnation[index] = seed + byte(index) + 33
 		key.GroupID[index] = seed + byte(index) + 49
 	}
+	var storeID [16]byte
+	for index := range storeID {
+		storeID[index] = seed + byte(index) + 65
+	}
 	runtime := &fakeRuntime{identity: raftmember.RuntimeIdentity{
-		Group: key, MemberID: uint64(seed) + 1, NodeIncarnation: 1,
+		Group: key, AllocationGeneration: uint64(seed) + 1,
+		MemberID: uint64(seed) + 1, StoreID: storeID, NodeIncarnation: 1,
 	}}
 	runtime.status = raftmember.RuntimeStatus{
 		MemberID: runtime.identity.MemberID, LeaderID: runtime.identity.MemberID,
@@ -69,6 +75,59 @@ func newFakeRuntime(seed byte) *fakeRuntime {
 
 func ignoreProposalGroupTermination(ProposalGroupTermination) {}
 func retainProposalGroupPending(raftmember.GroupKey) bool     { return true }
+
+func newTestServingHost(
+	limits Limits,
+	settle raftmember.ResultSettlementSink,
+	proposals ProposalLifecycleSink,
+	groups ProposalGroupLifecycleSink,
+	pending func(raftmember.GroupKey) bool,
+) (*Host, error) {
+	var epoch uint64
+	owners := make(map[raftmember.GroupKey]raftmember.AppliedSourceToken)
+	var settleOwned AppliedResultSettlementSink
+	if settle != nil {
+		settleOwned = func(
+			_ raftmember.AppliedSourceOwner,
+			_ raftmember.AppliedSourceToken,
+			batch raftmember.AppliedBatch,
+		) error {
+			return settle(batch)
+		}
+	}
+	var pendingOwned ProposalGroupPendingSink
+	if pending != nil {
+		pendingOwned = func(
+			owner raftmember.AppliedSourceOwner,
+			_ raftmember.AppliedSourceToken,
+		) bool {
+			return pending(owner.Group)
+		}
+	}
+	return NewHostWithServingSinks(limits, ServingSinks{
+		Settle: settleOwned, Proposals: proposals, ProposalGroups: groups,
+		ProposalPending: pendingOwned,
+		ClaimSource: func(owner raftmember.AppliedSourceOwner) (raftmember.AppliedSourceToken, error) {
+			if _, exists := owners[owner.Group]; exists {
+				return raftmember.AppliedSourceToken{}, ErrGroupExists
+			}
+			epoch++
+			token := raftmember.AppliedSourceToken{RegistryID: 1, OwnerEpoch: epoch}
+			owners[owner.Group] = token
+			return token, nil
+		},
+		ReleaseSource: func(
+			owner raftmember.AppliedSourceOwner,
+			token raftmember.AppliedSourceToken,
+		) error {
+			if owners[owner.Group] != token {
+				return ErrSourceOwnerMismatch
+			}
+			delete(owners, owner.Group)
+			return nil
+		},
+	})
+}
 
 func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity { return runtime.identity }
 func (runtime *fakeRuntime) Failure() error                       { return runtime.failure }
@@ -213,6 +272,9 @@ func TestHostUsesOneReadyWorkspaceAndExplicitSettlementSinkAtMaximumDensity(t *t
 
 func (runtime *fakeRuntime) Close() error {
 	runtime.closeCalls++
+	if runtime.closeHook != nil {
+		runtime.closeHook()
+	}
 	if len(runtime.closeErrs) == 0 {
 		return nil
 	}
@@ -968,9 +1030,142 @@ func TestHostRemoveRequiresQuiescenceRetriesCloseAndReusesCapacity(t *testing.T)
 	}
 }
 
+func TestServingHostRemoveTerminatesClosesThenRetriesSourceRelease(t *testing.T) {
+	var events []string
+	releaseErr := errors.New("retry source release")
+	releaseCalls := 0
+	host, err := NewHostWithServingSinks(testHostLimits(), ServingSinks{
+		Settle: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+			raftmember.AppliedBatch,
+		) error {
+			return nil
+		},
+		Proposals: func(ProposalAdmission) {},
+		ProposalGroups: func(ProposalGroupTermination) {
+			events = append(events, "terminate")
+		},
+		ProposalPending: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) bool {
+			return false
+		},
+		ClaimSource: func(
+			raftmember.AppliedSourceOwner,
+		) (raftmember.AppliedSourceToken, error) {
+			events = append(events, "claim")
+			return raftmember.AppliedSourceToken{RegistryID: 8, OwnerEpoch: 13}, nil
+		},
+		ReleaseSource: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) error {
+			events = append(events, "release")
+			releaseCalls++
+			if releaseCalls == 1 {
+				return releaseErr
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(72)
+	runtime.closeHook = func() { events = append(events, "close") }
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := host.RunOne(); done || err != nil {
+		t.Fatalf("initial probe = %t, %v", done, err)
+	}
+	if err := host.Remove(runtime.identity.Group); !errors.Is(err, releaseErr) {
+		t.Fatalf("first Remove = %v", err)
+	}
+	group := host.groups[runtime.identity.Group]
+	if group == nil || group.runtime != nil || !group.retiring || !group.sourceClaimed ||
+		runtime.closeCalls != 1 {
+		t.Fatalf("retained release owner = %+v, closes %d", group, runtime.closeCalls)
+	}
+	if want := []string{"claim", "terminate", "close", "release"}; !slices.Equal(events, want) {
+		t.Fatalf("first lifecycle = %v, want %v", events, want)
+	}
+	if err := host.Remove(runtime.identity.Group); err != nil {
+		t.Fatalf("retry Remove = %v", err)
+	}
+	if runtime.closeCalls != 1 || !slices.Equal(
+		events, []string{"claim", "terminate", "close", "release", "release"},
+	) {
+		t.Fatalf("retry lifecycle = %v, closes %d", events, runtime.closeCalls)
+	}
+}
+
+func TestServingHostMalformedClaimTokenIsTrackedUntilRelease(t *testing.T) {
+	releaseErr := errors.New("malformed claim release failed")
+	releaseCalls := 0
+	groupCallbacks := 0
+	host, err := NewHostWithServingSinks(testHostLimits(), ServingSinks{
+		Settle: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+			raftmember.AppliedBatch,
+		) error {
+			return nil
+		},
+		Proposals:      func(ProposalAdmission) {},
+		ProposalGroups: func(ProposalGroupTermination) { groupCallbacks++ },
+		ProposalPending: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) bool {
+			return false
+		},
+		ClaimSource: func(
+			raftmember.AppliedSourceOwner,
+		) (raftmember.AppliedSourceToken, error) {
+			return raftmember.AppliedSourceToken{OwnerEpoch: 9}, nil
+		},
+		ReleaseSource: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) error {
+			releaseCalls++
+			if releaseCalls == 1 {
+				return releaseErr
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(73)
+	if err := host.addRuntime(runtime); !errors.Is(err, ErrSourceOwnerMismatch) ||
+		!errors.Is(err, releaseErr) {
+		t.Fatalf("malformed Add = %v", err)
+	}
+	retained := host.groups[runtime.identity.Group]
+	if retained == nil || !retained.retiring || !retained.sourceClaimed ||
+		retained.runtime != nil || runtime.closeCalls != 0 {
+		t.Fatalf("malformed claim tombstone = %+v, closes %d", retained, runtime.closeCalls)
+	}
+	if err := host.Close(); err != nil {
+		t.Fatalf("claim cleanup Close = %v", err)
+	}
+	if releaseCalls != 2 || groupCallbacks != 0 || len(host.groups) != 0 {
+		t.Fatalf("claim cleanup = releases %d callbacks %d groups %d",
+			releaseCalls, groupCallbacks, len(host.groups))
+	}
+	if err := runtime.Close(); err != nil || runtime.closeCalls != 1 {
+		t.Fatalf("caller-owned runtime close = %v, calls %d", err, runtime.closeCalls)
+	}
+}
+
 func TestHostTrackedProposalLifecyclePreservesAcceptedPrefixAndProgress(t *testing.T) {
 	var admissions []ProposalAdmission
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
 		ignoreProposalGroupTermination,
@@ -1016,7 +1211,7 @@ func TestHostTrackedProposalLifecyclePreservesAcceptedPrefixAndProgress(t *testi
 
 func TestHostFaultPurgeTerminatesEveryTrackedQueueToken(t *testing.T) {
 	var admissions []ProposalAdmission
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
 		ignoreProposalGroupTermination,
@@ -1058,7 +1253,7 @@ func TestHostFaultPurgeTerminatesEveryTrackedQueueToken(t *testing.T) {
 
 func TestHostClosePendingSettlementPreflightLeavesEveryGroupRunnable(t *testing.T) {
 	var admissions []ProposalAdmission
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
 		ignoreProposalGroupTermination,
@@ -1142,31 +1337,71 @@ func TestHostTrackedProposalRequiresAtomicServingSinkAndQueueCapacity(t *testing
 	); !errors.Is(err, ErrProposalSinkRequired) {
 		t.Fatalf("ordinary tracked proposal = %v", err)
 	}
-	if host, err := NewHostWithServingSinks(
+	if host, err := newTestServingHost(
 		testHostLimits(), nil, func(ProposalAdmission) {}, ignoreProposalGroupTermination,
 		retainProposalGroupPending,
 	); host != nil ||
 		!errors.Is(err, ErrSettlementSinkRequired) {
 		t.Fatalf("nil settlement = %v, %v", host, err)
 	}
-	if host, err := NewHostWithServingSinks(
+	if host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters, nil, ignoreProposalGroupTermination,
 		retainProposalGroupPending,
 	); host != nil ||
 		!errors.Is(err, ErrProposalSinkRequired) {
 		t.Fatalf("nil lifecycle = %v, %v", host, err)
 	}
-	if host, err := NewHostWithServingSinks(
+	if host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters, func(ProposalAdmission) {}, nil,
 		retainProposalGroupPending,
 	); host != nil || !errors.Is(err, ErrProposalGroupSinkRequired) {
 		t.Fatalf("nil group lifecycle = %v, %v", host, err)
 	}
-	if host, err := NewHostWithServingSinks(
+	if host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters, func(ProposalAdmission) {},
 		ignoreProposalGroupTermination, nil,
 	); host != nil || !errors.Is(err, ErrProposalPendingRequired) {
 		t.Fatalf("nil group pending = %v, %v", host, err)
+	}
+	validSinks := ServingSinks{
+		Settle: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+			raftmember.AppliedBatch,
+		) error {
+			return nil
+		},
+		Proposals:      func(ProposalAdmission) {},
+		ProposalGroups: func(ProposalGroupTermination) {},
+		ProposalPending: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) bool {
+			return false
+		},
+		ClaimSource: func(
+			raftmember.AppliedSourceOwner,
+		) (raftmember.AppliedSourceToken, error) {
+			return raftmember.AppliedSourceToken{RegistryID: 1, OwnerEpoch: 1}, nil
+		},
+		ReleaseSource: func(
+			raftmember.AppliedSourceOwner,
+			raftmember.AppliedSourceToken,
+		) error {
+			return nil
+		},
+	}
+	missingClaim := validSinks
+	missingClaim.ClaimSource = nil
+	if host, err := NewHostWithServingSinks(testHostLimits(), missingClaim); host != nil ||
+		!errors.Is(err, ErrSourceClaimSinkRequired) {
+		t.Fatalf("nil source claim = %v, %v", host, err)
+	}
+	missingRelease := validSinks
+	missingRelease.ReleaseSource = nil
+	if host, err := NewHostWithServingSinks(testHostLimits(), missingRelease); host != nil ||
+		!errors.Is(err, ErrSourceReleaseSinkRequired) {
+		t.Fatalf("nil source release = %v, %v", host, err)
 	}
 
 	limits := testHostLimits()
@@ -1174,7 +1409,7 @@ func TestHostTrackedProposalRequiresAtomicServingSinkAndQueueCapacity(t *testing
 	limits.MaxGroupItems = 1
 	limits.MaxPendingTicks = 1
 	callbacks := 0
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		limits, settleNoLocalWaiters, func(ProposalAdmission) { callbacks++ },
 		ignoreProposalGroupTermination,
 		retainProposalGroupPending,
@@ -1202,7 +1437,7 @@ func TestHostTrackedProposalRequiresAtomicServingSinkAndQueueCapacity(t *testing
 func TestHostTrackedLeadershipFencesFollowerAndTerminatesOldLeaderBeforeRetry(t *testing.T) {
 	var admissions []ProposalAdmission
 	var terminations []ProposalGroupTermination
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(admission ProposalAdmission) { admissions = append(admissions, admission) },
 		func(termination ProposalGroupTermination) {
@@ -1288,7 +1523,7 @@ func TestHostTrackedLeadershipFencesFollowerAndTerminatesOldLeaderBeforeRetry(t 
 
 func TestHostTrackedLeadershipStopsStatusChecksAfterLastPendingAttempt(t *testing.T) {
 	pending := false
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(admission ProposalAdmission) {
 			if admission.Admitted {
@@ -1335,7 +1570,7 @@ func TestHostTrackedLeadershipStopsStatusChecksAfterLastPendingAttempt(t *testin
 }
 
 func TestHostTrackedProposalRunOneWarmAllocations(t *testing.T) {
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(ProposalAdmission) {}, ignoreProposalGroupTermination,
 		func(raftmember.GroupKey) bool { return false },
@@ -1376,7 +1611,7 @@ func TestHostTrackedProposalRunOneWarmAllocations(t *testing.T) {
 }
 
 func BenchmarkHostTrackedProposalRunOne(b *testing.B) {
-	host, err := NewHostWithServingSinks(
+	host, err := newTestServingHost(
 		testHostLimits(), settleNoLocalWaiters,
 		func(ProposalAdmission) {}, ignoreProposalGroupTermination,
 		func(raftmember.GroupKey) bool { return false },

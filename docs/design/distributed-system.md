@@ -462,12 +462,16 @@ the `Ready`. The default non-serving Host supplies an explicit no-local-waiters
 sink. An internal bounded waiter registry can instead inject proposal-lifecycle
 and result-settlement sinks. It validates canonical commands before Host
 enqueue, coalesces only exact attempt identities, and publishes owned results
-only after deterministic apply. Its applied-range source authority comes from
-the synchronous Host and Runtime boundary. The registry does not independently
-authenticate an untrusted applied-range source. Live Hosts sharing one registry
-must own disjoint group keys. Replacing a group owner requires fencing ingress,
-terminating its pending attempts, and closing the old Host before replacement
-admission. Outbound messages are still retained as individual frames.
+only after deterministic apply. Before Host ownership transfer, the registry
+claims the exact Runtime source identity: `Group`, `AllocationGeneration`,
+`MemberID`, `StoreID`, and `NodeIncarnation`. Settlement and proposal-lifecycle
+callbacks must also present the claim's nonzero `RegistryID` and `OwnerEpoch`,
+which prevents cross-registry and release/reclaim ABA. This is an internal
+lifecycle fence, not network or request authentication. Live Hosts sharing one
+registry must own disjoint group keys. Replacing a group owner requires fencing
+ingress, terminating its pending attempts, closing the old Runtime, and
+releasing the exact source capability before replacement admission. Outbound
+messages are still retained as individual frames.
 
 Wait cancellation releases only local waiter ownership. While a blocking
 claimant is between wake checks, its fixed slot and notification channel remain

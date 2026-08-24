@@ -64,6 +64,35 @@ type RuntimeIdentity struct {
 	NodeIncarnation      uint64
 }
 
+// AppliedSourceOwner is the exact fixed-width identity of one Runtime whose
+// published apply batches may settle local serving attempts. Distribution and
+// shard labels are deliberately excluded: the sealed allocation generation,
+// member store, and node incarnation are the ABA-resistant ownership boundary.
+type AppliedSourceOwner struct {
+	Group                GroupKey
+	AllocationGeneration uint64
+	MemberID             uint64
+	StoreID              [16]byte
+	NodeIncarnation      uint64
+}
+
+// AppliedSourceToken is a registry-minted, fixed-width capability for one
+// AppliedSourceOwner claim. RegistryID fences different registries while
+// OwnerEpoch prevents same-registry release/reclaim ABA.
+type AppliedSourceToken struct {
+	RegistryID uint64
+	OwnerEpoch uint64
+}
+
+// AppliedSourceOwner returns the exact serving ownership identity.
+func (identity RuntimeIdentity) AppliedSourceOwner() AppliedSourceOwner {
+	return AppliedSourceOwner{
+		Group: identity.Group, AllocationGeneration: identity.AllocationGeneration,
+		MemberID: identity.MemberID, StoreID: identity.StoreID,
+		NodeIncarnation: identity.NodeIncarnation,
+	}
+}
+
 // OutboundMessage is borrowed only for the duration of the DriveReady callback.
 // A caller retaining it must clone Message before returning.
 type OutboundMessage struct {
@@ -111,6 +140,15 @@ type AppliedBatchSource struct {
 	FirstIndex           uint64
 	LastIndex            uint64
 	FinalDataChainDigest [32]byte
+}
+
+// Owner returns the exact Runtime identity that published this interval.
+func (source AppliedBatchSource) Owner() AppliedSourceOwner {
+	return AppliedSourceOwner{
+		Group: source.Group, AllocationGeneration: source.AllocationGeneration,
+		MemberID: source.MemberID, StoreID: source.StoreID,
+		NodeIncarnation: source.NodeIncarnation,
+	}
 }
 
 // Len returns the number of applied normal entries awaiting settlement.

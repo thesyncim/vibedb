@@ -128,16 +128,38 @@ func TestServingHostTerminalSettlementFailureCanCloseRealRuntime(t *testing.T) {
 	var admissions []multiraft.ProposalAdmission
 	var terminations []multiraft.ProposalGroupTermination
 	host, err := multiraft.NewHostWithServingSinks(
-		testServingHostLimits(),
-		func(raftmember.AppliedBatch) error { return want },
-		func(admission multiraft.ProposalAdmission) {
-			admissions = append(admissions, admission)
-		},
-		func(termination multiraft.ProposalGroupTermination) {
-			terminations = append(terminations, termination)
-		},
-		func(raftmember.GroupKey) bool { return false },
-	)
+		testServingHostLimits(), multiraft.ServingSinks{
+			Settle: func(
+				raftmember.AppliedSourceOwner,
+				raftmember.AppliedSourceToken,
+				raftmember.AppliedBatch,
+			) error {
+				return want
+			},
+			Proposals: func(admission multiraft.ProposalAdmission) {
+				admissions = append(admissions, admission)
+			},
+			ProposalGroups: func(termination multiraft.ProposalGroupTermination) {
+				terminations = append(terminations, termination)
+			},
+			ProposalPending: func(
+				raftmember.AppliedSourceOwner,
+				raftmember.AppliedSourceToken,
+			) bool {
+				return false
+			},
+			ClaimSource: func(
+				raftmember.AppliedSourceOwner,
+			) (raftmember.AppliedSourceToken, error) {
+				return raftmember.AppliedSourceToken{RegistryID: 1, OwnerEpoch: 1}, nil
+			},
+			ReleaseSource: func(
+				raftmember.AppliedSourceOwner,
+				raftmember.AppliedSourceToken,
+			) error {
+				return nil
+			},
+		})
 	if err != nil {
 		t.Fatal(err)
 	}

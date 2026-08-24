@@ -77,9 +77,37 @@ func (registry *Registry) SettleAppliedBatch(batch raftmember.AppliedBatch) erro
 	return settleAppliedBatch(registry, batch)
 }
 
+func (registry *Registry) settleOwnedAppliedBatch(
+	owner raftmember.AppliedSourceOwner,
+	token raftmember.AppliedSourceToken,
+	batch raftmember.AppliedBatch,
+) error {
+	if batch.Source().Owner() != owner {
+		return ErrSourceOwnerMismatch
+	}
+	return settleAppliedBatchOwned(registry, batch, token)
+}
+
 func settleAppliedBatch[Batch appliedBatchView](
 	registry *Registry,
 	batch Batch,
+) error {
+	return settleAppliedBatchWithOwner(registry, batch, raftmember.AppliedSourceToken{}, false)
+}
+
+func settleAppliedBatchOwned[Batch appliedBatchView](
+	registry *Registry,
+	batch Batch,
+	token raftmember.AppliedSourceToken,
+) error {
+	return settleAppliedBatchWithOwner(registry, batch, token, true)
+}
+
+func settleAppliedBatchWithOwner[Batch appliedBatchView](
+	registry *Registry,
+	batch Batch,
+	token raftmember.AppliedSourceToken,
+	owned bool,
 ) error {
 	if registry == nil {
 		return ErrRegistryClosed
@@ -105,8 +133,22 @@ func settleAppliedBatch[Batch appliedBatchView](
 		registry.mu.Unlock()
 		return failure
 	}
+	ownerEpoch := uint64(0)
+	if owned {
+		if _, sourceErr := registry.validateSourceOwnerLocked(batch.Source().Owner(), token); sourceErr != nil {
+			registry.mu.Unlock()
+			return sourceErr
+		}
+		ownerEpoch = token.OwnerEpoch
+	} else if groupIndex, found, sourceErr := registry.findGroupLocked(batch.Group()); sourceErr != nil {
+		registry.mu.Unlock()
+		return sourceErr
+	} else if found && registry.groupTable[groupIndex].ownerEpoch != 0 {
+		registry.mu.Unlock()
+		return ErrSourceOwnerMismatch
+	}
 	attemptCount, entryCount, lookupCount, stageErr := stageSettlementLocked(
-		registry, batch, &attempts, &entries, &lookups, &attemptTable, &entryTable,
+		registry, batch, ownerEpoch, &attempts, &entries, &lookups, &attemptTable, &entryTable,
 	)
 	if stageErr != nil {
 		rollbackErr := rollbackSettlementLocked(
@@ -170,6 +212,7 @@ func settleAppliedBatch[Batch appliedBatchView](
 func stageSettlementLocked[Batch appliedBatchView](
 	registry *Registry,
 	batch Batch,
+	ownerEpoch uint64,
 	attempts *[raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem,
 	entries *[raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem,
 	lookups *[raftmodel.MaxNormalApplyBatchEntries]settlementLookupItem,
@@ -214,7 +257,9 @@ func stageSettlementLocked[Batch appliedBatchView](
 		if logical.fingerprint != identity.fingerprint || logical.logical != identity.logical {
 			continue
 		}
-		attemptIndex, found, attemptErr := registry.findAttemptLocked(logical, identity.attempt)
+		attemptIndex, found, attemptErr := registry.findAttemptLocked(
+			logical, identity.attempt, ownerEpoch,
+		)
 		if attemptErr != nil {
 			return attemptCount, entryCount, lookupCount, attemptErr
 		}
@@ -222,6 +267,13 @@ func stageSettlementLocked[Batch appliedBatchView](
 			continue
 		}
 		attempt := &registry.attempts[attemptIndex]
+		if attempt.ownerEpoch != ownerEpoch {
+			if attempt.admitted || attempt.state == attemptPending || attempt.state == attemptSettling {
+				return attemptCount, entryCount, lookupCount,
+					errors.Join(ErrRegistryCorrupt, errors.New("settlement found a foreign source epoch"))
+			}
+			continue
+		}
 		if attempt.state == attemptComplete && infrastructureOutcome(attempt.outcome) {
 			continue
 		}
