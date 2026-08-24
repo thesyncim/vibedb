@@ -519,6 +519,35 @@ func TestSnapshotArtifactBoundsAndCallbackFailures(t *testing.T) {
 	}
 }
 
+func TestRequiredSnapshotArtifactPayloadCapacity(t *testing.T) {
+	ordinary, err := RequiredSnapshotArtifactPayloadCapacity(0, 32, 4096)
+	if err != nil || ordinary != DefaultSnapshotArtifactChunkBytes {
+		t.Fatalf("ordinary payload capacity = %d, %v", ordinary, err)
+	}
+	maximum, err := RequiredSnapshotArtifactPayloadCapacity(
+		DefaultSnapshotArtifactChunkBytes,
+		replication.MaxMutationKeyBytes,
+		replication.MaxMutationValueBytes,
+	)
+	if err != nil || maximum != MaxSnapshotArtifactChunkBytes {
+		t.Fatalf("maximum payload capacity = %d, %v", maximum, err)
+	}
+	for _, limits := range [][2]int{
+		{0, 1},
+		{1, 0},
+		{replication.MaxMutationKeyBytes + 1, 1},
+		{1, replication.MaxMutationValueBytes + 1},
+	} {
+		if _, err := RequiredSnapshotArtifactPayloadCapacity(
+			0,
+			limits[0],
+			limits[1],
+		); !errors.Is(err, ErrSnapshotArtifactBound) {
+			t.Fatalf("row bounds %v error = %v", limits, err)
+		}
+	}
+}
+
 func TestSnapshotArtifactWriterHandlesShortWrites(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	short := &snapshotArtifactShortWriter{remaining: 97}

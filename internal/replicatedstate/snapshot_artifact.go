@@ -73,8 +73,49 @@ type SnapshotArtifactOptions struct {
 // ValidateSnapshotArtifactOptions validates deterministic artifact framing
 // bounds without opening a snapshot or writing output.
 func ValidateSnapshotArtifactOptions(options SnapshotArtifactOptions) error {
-	_, err := normalizeSnapshotArtifactOptions(options)
-	return err
+	target, err := normalizeSnapshotArtifactOptions(options)
+	if err != nil {
+		return err
+	}
+	if options.PayloadBuffer != nil && cap(options.PayloadBuffer) < target {
+		return fmt.Errorf(
+			"%w: payload-buffer capacity %d below target %d",
+			ErrSnapshotArtifactBound,
+			cap(options.PayloadBuffer),
+			target,
+		)
+	}
+	return nil
+}
+
+// RequiredSnapshotArtifactPayloadCapacity returns the smallest payload-buffer
+// capacity that cannot grow while writing rows from one collection with the
+// supplied frozen key and document bounds. Zero targetChunkBytes selects the
+// default artifact target.
+func RequiredSnapshotArtifactPayloadCapacity(
+	targetChunkBytes int,
+	maxKeyBytes int,
+	maxDocumentBytes int,
+) (int, error) {
+	target, err := normalizeSnapshotArtifactOptions(SnapshotArtifactOptions{
+		TargetChunkBytes: targetChunkBytes,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if maxKeyBytes <= 0 || maxKeyBytes > replication.MaxMutationKeyBytes ||
+		maxDocumentBytes <= 0 || maxDocumentBytes > replication.MaxMutationValueBytes {
+		return 0, fmt.Errorf(
+			"%w: collection row bounds %d/%d",
+			ErrSnapshotArtifactBound,
+			maxKeyBytes,
+			maxDocumentBytes,
+		)
+	}
+	return max(
+		target,
+		snapshotArtifactRowHeaderBytes+maxKeyBytes+maxDocumentBytes,
+	), nil
 }
 
 // SnapshotArtifactCheckpoint is emitted after one complete chunk has passed

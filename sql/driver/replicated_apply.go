@@ -108,16 +108,17 @@ type ReplicatedApplyCapacityProfile struct {
 // SQL root. Its implementation deliberately does not expose the underlying
 // durable collections, transaction log, or replicated-state Machine.
 type ReplicatedApply struct {
-	owner             *dbConnector
-	database          *database
-	machine           *replicatedstate.Machine
-	table             *table
-	identity          ReplicatedApplyIdentity
-	closed            bool
-	attemptGeneration uint64
-	attemptActive     bool
-	attemptBatch      bool
-	attemptKeys       replicatedAttemptBinaryKeys
+	owner                *dbConnector
+	database             *database
+	machine              *replicatedstate.Machine
+	table                *table
+	identity             ReplicatedApplyIdentity
+	closed               bool
+	attemptGeneration    uint64
+	attemptActive        bool
+	attemptBatch         bool
+	attemptKeys          replicatedAttemptBinaryKeys
+	walBaseCaptureActive bool
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -917,6 +918,9 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 	if core.replicatedApplyClaim != a {
 		return ErrReplicatedApplyClosed
 	}
+	if a.walBaseCaptureActive {
+		return ErrReplicatedApplyBusy
+	}
 	connector.closed = true
 	connector.exclusive = false
 	return nil
@@ -937,6 +941,10 @@ func (a *ReplicatedApply) Close() error {
 	if core.replicatedApplyClaim != a {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
+	}
+	if a.walBaseCaptureActive {
+		core.mu.Unlock()
+		return ErrReplicatedApplyBusy
 	}
 	if core.checkpointGroup == nil {
 		core.mu.Unlock()
