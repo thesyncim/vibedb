@@ -63,7 +63,9 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 			prefixPublication.Applied, fixture.apply.CheckpointAppliedIndex(),
 		)
 	}
-	prefixCompletion := captureRuntimeReplayCompletion(t, fixture.apply, prefixCommand)
+	prefixCompletion := captureRuntimeReplayCompletion(
+		t, fixture.apply, prefixCommand, replicatedstate.ResultApplied,
+	)
 	prefixImage := captureRuntimeReplayImage(t, fixture.apply, fixture.base.UserTable)
 	if fixture.apply.CheckpointAppliedIndex() != prefixPublication.Applied {
 		t.Fatalf(
@@ -73,14 +75,21 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	}
 
 	// The artifact cut establishes the exact durable SQL prefix. Admit several
-	// user/session transitions into one uncaptured Ready and one WAL record
-	// without advancing that certificate, then copy the still-live SQL files as
-	// the crash image.
+	// user/session transitions into one uncaptured Ready and one WAL record. The
+	// crash cut is the first micro-step where the WAL commit covers the suffix,
+	// before Runtime can apply any of its committed entries.
 	suffixCommands := [][]byte{
 		testApplyCommand(fixture.base, epoch, 3, key, []byte(`{"id":"counter","value":1}`)),
 		runtimeReplaySessionOpen(fixture.base, 4),
 		runtimeReplaySessionOpen(fixture.base, 5),
 	}
+	suffixResultCodes := []uint32{
+		replicatedstate.ResultApplied,
+		replicatedstate.ResultSessionOpened,
+		replicatedstate.ResultSessionOpened,
+	}
+	wantFinalApplied := prefixPublication.Applied + uint64(len(suffixCommands))
+	crashSQLPath := filepath.Join(t.TempDir(), "crash.vdb")
 	lastBefore, err := fixture.wal.LastIndex()
 	if err != nil {
 		t.Fatal(err)
@@ -96,6 +105,7 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	// the entry-bearing persistence boundary itself so a legitimate later
 	// HardState-only record cannot be mistaken for a split proposal batch.
 	suffixPersisted := false
+	commitPersisted := false
 	observedLast := lastBefore
 	for step := 0; step < 10_000; step++ {
 		result, driveErr := fixture.runtime.DriveReady(nil)
@@ -126,9 +136,33 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 					t.Fatalf("entry-bearing suffix WAL syncs = %d, want 2", syncs)
 				}
 			}
+			hardState, _, stateErr := fixture.wal.InitialState()
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			if hardState.GetCommit() > wantFinalApplied {
+				t.Fatalf(
+					"suffix WAL commit = %d, want at most %d",
+					hardState.GetCommit(), wantFinalApplied,
+				)
+			}
+			if hardState.GetCommit() == wantFinalApplied {
+				if fixture.apply.Applied() != prefixPublication.Applied ||
+					fixture.apply.CheckpointAppliedIndex() != prefixPublication.Applied {
+					t.Fatalf(
+						"commit-persisted crash cut = applied %d checkpoint %d, want %d",
+						fixture.apply.Applied(), fixture.apply.CheckpointAppliedIndex(),
+						prefixPublication.Applied,
+					)
+				}
+				copyRuntimeReplayPath(t, fixture.sqlPath, crashSQLPath)
+				copyRuntimeReplayPath(t, fixture.sqlPath+".tables", crashSQLPath+".tables")
+				commitPersisted = true
+				break
+			}
 		}
 		if result.Kind == DriveIdle {
-			break
+			t.Fatal("DriveReady(suffix) became idle before persisting the commit")
 		}
 		if step == 9_999 {
 			t.Fatal("DriveReady(suffix) did not become idle")
@@ -137,39 +171,52 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	if !suffixPersisted {
 		t.Fatal("suffix entries were not persisted")
 	}
+	if !commitPersisted {
+		t.Fatal("suffix commit was not persisted")
+	}
 	lastAfter, err := fixture.wal.LastIndex()
 	if err != nil || lastAfter-lastBefore != uint64(len(suffixCommands)) {
 		t.Fatalf("batched suffix WAL range = %d..%d, %v", lastBefore, lastAfter, err)
 	}
+	// Resume the live source only after the old-prefix SQL crash image is
+	// detached. Storage geometry may legitimately trigger a pressure checkpoint
+	// while applying this suffix; that cannot alter the copied crash cut.
+	drainRuntime(t, fixture.runtime, nil)
 	finalPublication, err := fixture.runtime.Publication()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantFinalApplied := prefixPublication.Applied + uint64(len(suffixCommands))
 	if finalPublication.Applied != wantFinalApplied {
 		t.Fatalf("visible suffix applied = %d, want %d",
 			finalPublication.Applied, wantFinalApplied)
 	}
-	assertRuntimeReplayStatus(t, fixture.runtime,
-		finalPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
+	sourceStatus, err := fixture.runtime.Status()
+	if err != nil || sourceStatus.Applied != finalPublication.Applied ||
+		sourceStatus.Commit != finalPublication.Applied ||
+		sourceStatus.CheckpointApplied < prefixPublication.Applied ||
+		sourceStatus.CheckpointApplied > finalPublication.Applied {
+		t.Fatalf("source runtime cuts = %+v, %v", sourceStatus, err)
+	}
 	retention, err := fixture.runtime.WALRetentionInput()
-	if err != nil || retention != prefixPublication.Applied {
-		t.Fatalf("source WAL retention cut = %d, %v", retention, err)
+	if err != nil || retention != sourceStatus.CheckpointApplied {
+		t.Fatalf(
+			"source WAL retention cut = %d, want %d: %v",
+			retention, sourceStatus.CheckpointApplied, err,
+		)
 	}
 	hardState, _, err := fixture.wal.InitialState()
 	if err != nil || hardState.GetCommit() != finalPublication.Applied {
 		t.Fatalf("source WAL commit = %d, %v", hardState.GetCommit(), err)
 	}
 
-	crashSQLPath := filepath.Join(t.TempDir(), "crash.vdb")
-	copyRuntimeReplayPath(t, fixture.sqlPath, crashSQLPath)
-	copyRuntimeReplayPath(t, fixture.sqlPath+".tables", crashSQLPath+".tables")
-	// Capture the exact expected logical result only after cloning the crash
-	// image. A full artifact cut may certify the live source as an intentional
-	// side effect, but it cannot alter the already-copied old-certificate image.
+	// Capture the exact expected logical result only after the crash image is
+	// detached. A full artifact cut may certify the live source as an intentional
+	// side effect, but it cannot alter the old-certificate image.
 	suffixCompletions := make([][]byte, len(suffixCommands))
 	for ordinal, command := range suffixCommands {
-		suffixCompletions[ordinal] = captureRuntimeReplayCompletion(t, fixture.apply, command)
+		suffixCompletions[ordinal] = captureRuntimeReplayCompletion(
+			t, fixture.apply, command, suffixResultCodes[ordinal],
+		)
 	}
 	finalImage := captureRuntimeReplayImage(t, fixture.apply, fixture.base.UserTable)
 	if err := fixture.runtime.Close(); err != nil {
@@ -193,7 +240,9 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	)
 	assertRuntimeReplayBytes(
 		t, "recovered prefix completion",
-		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
+		captureRuntimeReplayCompletion(
+			t, recovery.apply, prefixCommand, replicatedstate.ResultApplied,
+		), prefixCompletion,
 	)
 	for _, command := range suffixCommands {
 		assertRuntimeReplayCompletionMissing(t, recovery.apply, command)
@@ -209,12 +258,20 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	assertRuntimeReplayPublication(t, recoveryRuntime, prefixPublication)
 
 	drainRuntime(t, recoveryRuntime, nil)
-	afterReplay := assertRuntimeReplayStatus(t, recoveryRuntime,
-		finalPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
+	afterReplay, err := recoveryRuntime.Status()
+	if err != nil || afterReplay.Applied != finalPublication.Applied ||
+		afterReplay.Commit != finalPublication.Applied ||
+		afterReplay.CheckpointApplied < prefixPublication.Applied ||
+		afterReplay.CheckpointApplied > finalPublication.Applied {
+		t.Fatalf("post-replay runtime cuts = %+v, %v", afterReplay, err)
+	}
 	assertRuntimeReplayPublication(t, recoveryRuntime, finalPublication)
 	retention, err = recoveryRuntime.WALRetentionInput()
-	if err != nil || retention != prefixPublication.Applied {
-		t.Fatalf("replayed WAL retention cut = %d, %v", retention, err)
+	if err != nil || retention != afterReplay.CheckpointApplied {
+		t.Fatalf(
+			"replayed WAL retention cut = %d, want %d: %v",
+			retention, afterReplay.CheckpointApplied, err,
+		)
 	}
 
 	// A second drain must be a true idle observation. Full system/user image
@@ -229,12 +286,16 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	}
 	assertRuntimeReplayBytes(
 		t, "replayed prefix completion",
-		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
+		captureRuntimeReplayCompletion(
+			t, recovery.apply, prefixCommand, replicatedstate.ResultApplied,
+		), prefixCompletion,
 	)
 	for ordinal, command := range suffixCommands {
 		assertRuntimeReplayBytes(
 			t, "replayed suffix completion",
-			captureRuntimeReplayCompletion(t, recovery.apply, command), suffixCompletions[ordinal],
+			captureRuntimeReplayCompletion(
+				t, recovery.apply, command, suffixResultCodes[ordinal],
+			), suffixCompletions[ordinal],
 		)
 	}
 	// The exact-image audit comes last because it may advance the checkpoint.
@@ -422,6 +483,7 @@ func captureRuntimeReplayCompletion(
 	t testing.TB,
 	apply *sqldriver.ReplicatedApply,
 	command []byte,
+	wantResultCode uint32,
 ) []byte {
 	t.Helper()
 	lookup, err := apply.LookupCompletion(command)
@@ -429,7 +491,7 @@ func captureRuntimeReplayCompletion(
 		t.Fatalf("lookup replay completion: %v", err)
 	}
 	completion, err := replication.OpenCompletion(lookup.Bytes)
-	if err != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+	if err != nil || completion.ResultCode != wantResultCode ||
 		completion.AppliedSequence != lookup.AppliedSequence {
 		t.Fatalf("replay completion = %+v, lookup %+v, %v", completion, lookup, err)
 	}
