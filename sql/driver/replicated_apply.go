@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -119,6 +120,9 @@ type ReplicatedApply struct {
 	attemptBatch         bool
 	attemptKeys          replicatedAttemptBinaryKeys
 	walBaseCaptureActive bool
+	walBaseSelectActive  bool
+	walBaseSelectPending bool
+	walBasePending       raftstore.GenerationActivationIdentity
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -849,6 +853,9 @@ func (a *ReplicatedApply) checkLocked() error {
 }
 
 func (a *ReplicatedApply) checkActivationBaseLocked() error {
+	if a.walBaseSelectActive || a.walBaseSelectPending {
+		return ErrReplicatedApplyBusy
+	}
 	if a.activationBasePending != ([sha256.Size]byte{}) {
 		return ErrReplicatedApplyBasePending
 	}
@@ -937,7 +944,7 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 	if core.replicatedApplyClaim != a {
 		return ErrReplicatedApplyClosed
 	}
-	if a.walBaseCaptureActive {
+	if a.walBaseCaptureActive || a.walBaseSelectActive || a.walBaseSelectPending {
 		return ErrReplicatedApplyBusy
 	}
 	connector.closed = true
@@ -946,12 +953,22 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 }
 
 // Close releases the singleton apply claim and its connector lifetime
-// reference. It does not unbind or remove the durable hidden participant.
+// reference. It does not unbind or remove the durable hidden participant. A
+// pending WAL-generation selection retires the connector before releasing the
+// claim: only a complete root close/reopen may reconstruct that durable fence,
+// so the same Database can never mint an unfenced replacement claim.
 func (a *ReplicatedApply) Close() error {
-	if a == nil || a.database == nil {
+	if a == nil || a.database == nil || a.owner == nil {
 		return nil
 	}
+	connector := a.owner
 	core := a.database
+	// Connector -> database is the common ownership lock order used by Connect,
+	// OpenReplicatedApply, and ClaimRuntimeOwnership. Holding connector.mu keeps
+	// replacement sessions and claims out until a pending selection has made
+	// retirement irrevocable.
+	connector.mu.Lock()
+	defer connector.mu.Unlock()
 	core.mu.Lock()
 	if a.closed {
 		core.mu.Unlock()
@@ -961,7 +978,7 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
 	}
-	if a.walBaseCaptureActive {
+	if a.walBaseCaptureActive || a.walBaseSelectActive {
 		core.mu.Unlock()
 		return ErrReplicatedApplyBusy
 	}
@@ -973,15 +990,16 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return err
 	}
+	if a.walBaseSelectPending {
+		connector.closed = true
+	}
 	a.closed = true
 	core.replicatedApplyClaim = nil
 	core.mu.Unlock()
 	if a.exclusiveConnector {
-		a.owner.mu.Lock()
-		a.owner.exclusive = false
-		a.owner.mu.Unlock()
+		connector.exclusive = false
 	}
-	return a.owner.release()
+	return connector.releaseLocked()
 }
 
 // Applied implements raftmodel.StateMachine.
@@ -1135,6 +1153,9 @@ func (a *ReplicatedApply) InstallSnapshot(
 	defer a.database.mu.Unlock()
 	if err := a.checkLocked(); err != nil {
 		return raftmodel.Publication{}, err
+	}
+	if a.walBaseSelectActive || a.walBaseSelectPending {
+		return raftmodel.Publication{}, ErrReplicatedApplyBusy
 	}
 	pending := a.activationBasePending
 	if pending != ([sha256.Size]byte{}) {

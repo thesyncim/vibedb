@@ -477,12 +477,16 @@ func TestConcurrentCreatePublishesExactlyOneLockedWAL(t *testing.T) {
 		}
 		winner = store
 	}
-	if winner == nil {
-		t.Fatalf("no Create succeeded; errors=%d", len(errorsSeen))
+	loserErrors := make([]error, 0, creators)
+	for err := range errorsSeen {
+		loserErrors = append(loserErrors, err)
 	}
-	if len(errorsSeen) != creators-1 {
+	if winner == nil {
+		t.Fatalf("no Create succeeded; errors=%v", loserErrors)
+	}
+	if len(loserErrors) != creators-1 {
 		_ = winner.Close()
-		t.Fatalf("loser errors=%d, want %d", len(errorsSeen), creators-1)
+		t.Fatalf("loser errors=%v, want %d", loserErrors, creators-1)
 	}
 	options := testOptions()
 	if _, err := Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options); !errors.Is(err, ErrLocked) {

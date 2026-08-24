@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,23 +26,28 @@ type Store struct {
 	mu sync.RWMutex
 
 	path          string
+	logicalPath   string
 	parentPath    string
 	base          string
+	logicalBase   string
 	root          *os.Root
 	directoryInfo os.FileInfo
 	file          *os.File
 	fileInfo      os.FileInfo
 	locked        bool
 
-	options normalizedOptions
-	header  headerState
-	current currentState
-	image   logImage
+	options    normalizedOptions
+	header     headerState
+	current    currentState
+	image      logImage
+	generation generationRecovery
+	family     *familyManifest
 
 	poisoned             error
 	poisonUnknown        bool
 	closed               bool
 	recoveredTornSlot    bool
+	activationPending    bool
 	syncCount            uint64
 	begun                bool
 	observedReadyID      uint64
@@ -115,12 +119,58 @@ func Create(path string, identity Identity, key Key, bootstrap Bootstrap, option
 			_ = root.Close()
 		}
 	}()
-	if _, err := root.Lstat(base); err == nil {
-		return nil, fmt.Errorf("%w: WAL path already exists", ErrInvalid)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	familyID := generationFamilyID(base, identity)
+	createLease, err := acquireWALCreateLease(
+		root, directoryInfo, base,
+	)
+	if err != nil {
 		return nil, err
 	}
-	tempName := ".raftwal-" + hex.EncodeToString(header.fileID[:]) + ".tmp"
+	defer createLease.close()
+	familyBase := familyManifestBase(familyID)
+	familyEntry, familyErr := root.Lstat(familyBase)
+	if familyErr != nil && !errors.Is(familyErr, os.ErrNotExist) {
+		return nil, familyErr
+	}
+	entry, entryErr := root.Lstat(base)
+	if entryErr != nil && !errors.Is(entryErr, os.ErrNotExist) {
+		return nil, entryErr
+	}
+	if familyErr == nil {
+		if !familyEntry.Mode().IsRegular() {
+			return nil, ErrNamespaceChanged
+		}
+		// The official manifest has its own lifetime writer lease. Release the
+		// path-owned creation lease before entering that lock domain so Create
+		// never retains cold namespace coordination while opening live state.
+		if err := createLease.close(); err != nil {
+			return nil, err
+		}
+		// Create is deliberately resumable. Once both official names exist,
+		// strict Open plus an exact pristine-source check settles an outcome-
+		// unknown return without inventing a second creation grammar.
+		return openCreatedSource(path, identity, key, bootstrap, options)
+	}
+	if entryErr == nil {
+		if !entry.Mode().IsRegular() {
+			return nil, ErrNamespaceChanged
+		}
+		store, resumeErr := resumeCreatedSource(
+			absPath, parentPath, base, root, directoryInfo,
+			identity, key, bootstrap, normalized,
+		)
+		if resumeErr != nil {
+			return nil, resumeErr
+		}
+		keepRoot = true
+		return store, nil
+	}
+	tempName := walCreateStageBase(base)
+	if err := reclaimWALCreateStage(
+		root, directoryInfo, tempName, normalized,
+	); err != nil {
+		return nil, err
+	}
 	file, err := root.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create temporary WAL: %w", err)
@@ -198,12 +248,17 @@ func Create(path string, identity Identity, key Key, bootstrap Bootstrap, option
 		cleanup()
 		return nil, persistenceError("prove published WAL namespace", true, err)
 	}
-	if err := syncPinnedDirectory(root); err != nil {
+	if err := normalized.ops.syncDirectory(root); err != nil {
 		cleanup()
 		return nil, persistenceError("sync WAL parent directory", true, err)
 	}
-	if err := root.Remove(tempName); err == nil {
-		_ = syncPinnedDirectory(root)
+	if err := root.Remove(tempName); err != nil {
+		cleanup()
+		return nil, persistenceError("remove WAL creation stage", true, err)
+	}
+	if err := normalized.ops.syncDirectory(root); err != nil {
+		cleanup()
+		return nil, persistenceError("sync WAL creation stage removal", true, err)
 	}
 	if err := proveNamedFile(root, parentPath, directoryInfo, base, file, normalized.maxFileBytes); err != nil {
 		cleanup()
@@ -214,13 +269,466 @@ func Create(path string, identity Identity, key Key, bootstrap Bootstrap, option
 		cleanup()
 		return nil, persistenceError("stat published WAL", true, err)
 	}
+	family, err := createFamilyManifest(
+		root, parentPath, directoryInfo,
+		familyState{
+			slotGeneration: 1, phase: familyPhaseSource,
+			familyID:           familyID,
+			identityDigest:     generationIdentityDigest(identity),
+			activeFileID:       header.fileID,
+			activeHeaderDigest: header.headerDigest,
+		},
+		key, normalized,
+	)
+	if err != nil {
+		cleanup()
+		return nil, persistenceError("publish WAL family manifest", true, err)
+	}
 	store := &Store{
-		path: absPath, parentPath: parentPath, base: base, root: root, directoryInfo: directoryInfo,
+		path: absPath, logicalPath: absPath, parentPath: parentPath,
+		base: base, logicalBase: base, root: root, directoryInfo: directoryInfo,
 		file: file, fileInfo: fileInfo, locked: true, options: normalized, header: header,
-		current: current, image: bootstrapImage(bootstrap.Snapshot), syncCount: 1,
+		current: current, image: bootstrapImage(bootstrap.Snapshot), family: family,
+		syncCount: 1,
 	}
 	keepRoot = true
 	return store, nil
+}
+
+func openCreatedSource(
+	path string,
+	identity Identity,
+	key Key,
+	bootstrap Bootstrap,
+	options Options,
+) (*Store, error) {
+	store, err := Open(
+		path, identity, bootstrap.TopologyRecoveryEpoch, key, options,
+	)
+	if err != nil {
+		return nil, err
+	}
+	store.mu.Lock()
+	exact := store.pristineCreatedSourceLocked(bootstrap)
+	if exact {
+		err = store.settleCreatedSourceLocked()
+	}
+	store.mu.Unlock()
+	if !exact {
+		return nil, errors.Join(ErrInvalid, store.Close())
+	}
+	if err != nil {
+		return nil, errors.Join(err, store.Close())
+	}
+	return store, nil
+}
+
+func resumeCreatedSource(
+	absPath string,
+	parentPath string,
+	base string,
+	root *os.Root,
+	directoryInfo os.FileInfo,
+	identity Identity,
+	key Key,
+	bootstrap Bootstrap,
+	options normalizedOptions,
+) (*Store, error) {
+	file, err := root.OpenFile(base, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	locked := false
+	cleanup := func(cause error) (*Store, error) {
+		if locked {
+			cause = errors.Join(cause, storeio.UnlockWriter(file))
+		}
+		return nil, errors.Join(cause, file.Close())
+	}
+	if err := storeio.LockWriter(file); err != nil {
+		return cleanup(errors.Join(ErrLocked, err))
+	}
+	locked = true
+	if err := proveNamedFile(
+		root, parentPath, directoryInfo, base, file, options.maxFileBytes,
+	); err != nil {
+		return cleanup(err)
+	}
+	staticBytes := make([]byte, StaticHeaderBytes)
+	if _, err := file.ReadAt(staticBytes, 0); err != nil {
+		return cleanup(fmt.Errorf("%w: read static header: %v", ErrCorrupt, err))
+	}
+	header, _, err := unmarshalStaticHeader(staticBytes, identity, key, options)
+	if err != nil {
+		return cleanup(err)
+	}
+	current, recoveredTorn, err := recoverCurrent(file, header, options)
+	if err != nil {
+		return cleanup(err)
+	}
+	image, generation, err := recoverRecords(file, &header, current, options)
+	if err != nil {
+		return cleanup(err)
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return cleanup(err)
+	}
+	store := &Store{
+		path: absPath, logicalPath: absPath, parentPath: parentPath,
+		base: base, logicalBase: base, root: root, directoryInfo: directoryInfo,
+		file: file, fileInfo: fileInfo, locked: true, options: options, header: header,
+		current: current, image: image, generation: generation,
+		recoveredTornSlot: recoveredTorn, syncCount: 1,
+	}
+	if !store.pristineCreatedSourceLocked(bootstrap) {
+		return cleanup(ErrInvalid)
+	}
+	family, err := createFamilyManifest(
+		root, parentPath, directoryInfo,
+		familyState{
+			slotGeneration: 1, phase: familyPhaseSource,
+			familyID:           generationFamilyID(base, identity),
+			identityDigest:     generationIdentityDigest(identity),
+			activeFileID:       header.fileID,
+			activeHeaderDigest: header.headerDigest,
+		},
+		key, options,
+	)
+	if err != nil {
+		return cleanup(persistenceError("resume WAL family manifest", true, err))
+	}
+	store.family = family
+	if err := store.settleCreatedSourceLocked(); err != nil {
+		return nil, errors.Join(err, store.Close())
+	}
+	return store, nil
+}
+
+func (store *Store) settleCreatedSourceLocked() error {
+	if store == nil || store.root == nil || store.file == nil || store.family == nil ||
+		store.family.file == nil {
+		return ErrClosed
+	}
+	// This barrier is unconditional: Create may be settling an earlier return
+	// whose official family link landed but whose directory Sync failed.
+	if err := store.options.ops.syncDirectory(store.root); err != nil {
+		return persistenceError("settle WAL creation namespace", true, err)
+	}
+	if err := proveNamedFile(
+		store.root, store.parentPath, store.directoryInfo,
+		store.base, store.file, store.options.maxFileBytes,
+	); err != nil {
+		return err
+	}
+	if err := proveNamedSizedFile(
+		store.root, store.parentPath, store.directoryInfo,
+		store.family.base, store.family.file, familyManifestBytes,
+	); err != nil {
+		return err
+	}
+	stageBase := store.family.base + ".stage"
+	stage, err := store.root.Lstat(stageBase)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return err
+	case !stage.Mode().IsRegular() || store.family.fileInfo == nil ||
+		!os.SameFile(stage, store.family.fileInfo):
+		return ErrNamespaceChanged
+	default:
+		if err := store.root.Remove(stageBase); err != nil {
+			return err
+		}
+		if err := store.options.ops.syncDirectory(store.root); err != nil {
+			return persistenceError("settle WAL family stage removal", true, err)
+		}
+	}
+	if err := store.reclaimCreateAliasLocked(); err != nil {
+		return err
+	}
+	if err := proveNamedSizedFile(
+		store.root, store.parentPath, store.directoryInfo,
+		store.family.base, store.family.file, familyManifestBytes,
+	); err != nil {
+		return err
+	}
+	return proveNamedFile(
+		store.root, store.parentPath, store.directoryInfo,
+		store.base, store.file, store.options.maxFileBytes,
+	)
+}
+
+func (store *Store) reclaimCreateAliasLocked() error {
+	if store == nil || store.root == nil || store.file == nil || store.fileInfo == nil {
+		return ErrClosed
+	}
+	return settleWALCreateStage(
+		store.root, store.parentPath, store.directoryInfo, store.base,
+		store.file, store.fileInfo, store.family, store.options,
+	)
+}
+
+func settleWALCreateStage(
+	root *os.Root,
+	parentPath string,
+	directoryInfo os.FileInfo,
+	logicalBase string,
+	file *os.File,
+	fileInfo os.FileInfo,
+	family *familyManifest,
+	options normalizedOptions,
+) error {
+	if root == nil || directoryInfo == nil || file == nil || fileInfo == nil ||
+		family == nil || family.file == nil {
+		return ErrClosed
+	}
+	// This barrier is unconditional. A prior attempt may have removed the
+	// deterministic alias but returned outcome-unknown from the following
+	// directory Sync. Absence is not durable evidence until that barrier is
+	// retried by a later source-phase Create/Open.
+	if err := options.ops.syncDirectory(root); err != nil {
+		return persistenceError("settle WAL creation publication", true, err)
+	}
+	tempName := walCreateStageBase(logicalBase)
+	entry, err := root.Lstat(tempName)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := proveNamedSizedFile(
+			root, parentPath, directoryInfo, family.base, family.file, familyManifestBytes,
+		); err != nil {
+			return err
+		}
+		return proveNamedFile(
+			root, parentPath, directoryInfo, logicalBase, file, options.maxFileBytes,
+		)
+	}
+	if err != nil || !entry.Mode().IsRegular() || !os.SameFile(entry, fileInfo) {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	// The surviving hard link witnesses an unsettled prior publication or
+	// removal. Confirm both official names before dropping that witness.
+	if err := proveNamedFile(
+		root, parentPath, directoryInfo, logicalBase, file, options.maxFileBytes,
+	); err != nil {
+		return err
+	}
+	if err := proveNamedSizedFile(
+		root, parentPath, directoryInfo, family.base, family.file, familyManifestBytes,
+	); err != nil {
+		return err
+	}
+	if err := root.Remove(tempName); err != nil {
+		return err
+	}
+	if err := options.ops.syncDirectory(root); err != nil {
+		return persistenceError("reclaim WAL creation alias", true, err)
+	}
+	if err := proveNamedSizedFile(
+		root, parentPath, directoryInfo, family.base, family.file, familyManifestBytes,
+	); err != nil {
+		return err
+	}
+	return proveNamedFile(root, parentPath, directoryInfo, logicalBase, file, options.maxFileBytes)
+}
+
+// inspectWALCreateStage permits an exact same-inode creation witness while the
+// source remains authoritative. Ordinary source Open neither removes it nor
+// pays a directory barrier: first-generation selection is the irrevocable
+// boundary that must settle it before the source can lose its final link.
+func inspectWALCreateStage(
+	root *os.Root,
+	fileInfo os.FileInfo,
+	logicalBase string,
+) error {
+	if root == nil || fileInfo == nil || logicalBase == "" {
+		return ErrClosed
+	}
+	entry, err := root.Lstat(walCreateStageBase(logicalBase))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !entry.Mode().IsRegular() || !os.SameFile(entry, fileInfo) {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	return nil
+}
+
+func requireWALCreateStageAbsent(root *os.Root, logicalBase string) error {
+	if root == nil || logicalBase == "" {
+		return ErrClosed
+	}
+	_, err := root.Lstat(walCreateStageBase(logicalBase))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return errors.Join(ErrNamespaceChanged, err)
+}
+
+var walCreateNamespaceDomain = []byte("vibedb/raft-wal/create-namespace/fixed\x00")
+
+func walCreateNamespaceID(logicalBase string) [16]byte {
+	h := sha256.New()
+	_, _ = h.Write(walCreateNamespaceDomain)
+	var width [8]byte
+	binary.LittleEndian.PutUint64(width[:], uint64(len(logicalBase)))
+	_, _ = h.Write(width[:])
+	_, _ = h.Write([]byte(logicalBase))
+	var digest [sha256.Size]byte
+	_ = h.Sum(digest[:0])
+	var id [16]byte
+	copy(id[:], digest[:len(id)])
+	return id
+}
+
+func walCreateStageBase(logicalBase string) string {
+	return generationFamilyPrefix(walCreateNamespaceID(logicalBase)) + ".create.stage"
+}
+
+func walCreateLockBase(logicalBase string) string {
+	return generationFamilyPrefix(walCreateNamespaceID(logicalBase)) + ".create.lock"
+}
+
+type walCreateLease struct {
+	file   *os.File
+	locked bool
+}
+
+func acquireWALCreateLease(
+	root *os.Root,
+	directoryInfo os.FileInfo,
+	logicalBase string,
+) (*walCreateLease, error) {
+	if root == nil || directoryInfo == nil || logicalBase == "" {
+		return nil, ErrInvalid
+	}
+	base := walCreateLockBase(logicalBase)
+	file, err := root.OpenFile(base, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	lease := &walCreateLease{file: file}
+	fail := func(cause error) (*walCreateLease, error) {
+		return nil, errors.Join(cause, lease.close())
+	}
+	if err := storeio.LockWriter(file); err != nil {
+		return fail(errors.Join(ErrLocked, err))
+	}
+	lease.locked = true
+	entry, entryErr := root.Lstat(base)
+	fileInfo, fileErr := file.Stat()
+	parentInfo, parentErr := root.Stat(".")
+	if entryErr != nil || fileErr != nil || parentErr != nil ||
+		!entry.Mode().IsRegular() || !os.SameFile(entry, fileInfo) ||
+		fileInfo.Size() != 0 || !parentInfo.IsDir() ||
+		!os.SameFile(parentInfo, directoryInfo) {
+		return fail(errors.Join(
+			ErrNamespaceChanged, entryErr, fileErr, parentErr,
+		))
+	}
+	return lease, nil
+}
+
+func (lease *walCreateLease) close() error {
+	if lease == nil {
+		return nil
+	}
+	var err error
+	if lease.locked {
+		err = storeio.UnlockWriter(lease.file)
+		lease.locked = false
+	}
+	if lease.file != nil {
+		err = errors.Join(err, lease.file.Close())
+		lease.file = nil
+	}
+	return err
+}
+
+func reclaimWALCreateStage(
+	root *os.Root,
+	directoryInfo os.FileInfo,
+	base string,
+	options normalizedOptions,
+) error {
+	// Absence is reusable authority only after a parent barrier. A prior crash
+	// may have removed this deterministic name but lost or returned an unknown
+	// result from its directory Sync; creating a different inode before settling
+	// that unlink could resurrect the old name over the new construction image.
+	if err := options.ops.syncDirectory(root); err != nil {
+		return persistenceError("settle WAL creation stage namespace", true, err)
+	}
+	pinnedDirectory, err := root.Stat(".")
+	if err != nil || !os.SameFile(directoryInfo, pinnedDirectory) {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	entry, err := root.Lstat(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !entry.Mode().IsRegular() {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	file, err := root.OpenFile(base, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	locked := false
+	defer func() {
+		if locked {
+			_ = storeio.UnlockWriter(file)
+		}
+		_ = file.Close()
+	}()
+	if err := storeio.LockWriter(file); err != nil {
+		return errors.Join(ErrLocked, err)
+	}
+	locked = true
+	pinnedDirectory, err = root.Stat(".")
+	if err != nil || !os.SameFile(directoryInfo, pinnedDirectory) {
+		return errors.Join(ErrNamespaceChanged, err)
+	}
+	pinned, entryErr := root.Lstat(base)
+	fileInfo, fileErr := file.Stat()
+	if entryErr != nil || fileErr != nil || !pinned.Mode().IsRegular() ||
+		!os.SameFile(pinned, fileInfo) {
+		return errors.Join(ErrNamespaceChanged, entryErr, fileErr)
+	}
+	if err := root.Remove(base); err != nil {
+		return err
+	}
+	if err := options.ops.syncDirectory(root); err != nil {
+		return persistenceError("reclaim WAL creation stage", true, err)
+	}
+	return nil
+}
+
+func (store *Store) pristineCreatedSourceLocked(bootstrap Bootstrap) bool {
+	if store == nil || store.file == nil || store.family != nil &&
+		(store.family.recoveredTorn || store.family.state.phase != familyPhaseSource) ||
+		store.generation.present || store.recoveredTornSlot || store.begun ||
+		store.current.generation != 1 || store.current.recordSequence != 1 ||
+		store.current.currentIncarnation != 0 || store.current.retryPresent ||
+		store.current.retry != (retryKey{}) || store.current.retryDigest != ([32]byte{}) ||
+		store.current.chainDigest == ([32]byte{}) ||
+		store.current.first != store.header.reference.index+1 ||
+		store.current.last != store.header.reference.index ||
+		store.current.snapshotID != store.header.reference.id ||
+		store.current.snapshotIndex != store.header.reference.index ||
+		store.current.snapshotTerm != store.header.reference.term ||
+		store.current.snapshotSize != store.header.reference.size ||
+		store.current.snapshotChunks != 1 ||
+		store.current.snapshotDigest != store.header.reference.digest ||
+		store.current.topologyRecoveryEpoch != bootstrap.TopologyRecoveryEpoch ||
+		store.header.topologyRecoveryEpoch != bootstrap.TopologyRecoveryEpoch ||
+		!proto.Equal(store.header.snapshot, bootstrap.Snapshot) {
+		return false
+	}
+	want := bootstrapImage(bootstrap.Snapshot)
+	return proto.Equal(store.current.hard, want.hard) &&
+		proto.Equal(store.image.hard, want.hard) &&
+		store.image.first == want.first && store.image.last == want.last &&
+		store.image.baseTerm == want.baseTerm && len(store.image.entries) == 0 &&
+		store.image.liveBytes == 0
 }
 
 // Open locks and recovers one existing WAL. The topology recovery epoch must
@@ -254,6 +762,22 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 			_ = root.Close()
 		}
 	}()
+	logicalPath := absPath
+	logicalBase := base
+	family, selectedBase, err := openFamilyManifest(
+		root, parentPath, directoryInfo, logicalBase, expected, key, normalized,
+	)
+	if err != nil {
+		return nil, err
+	}
+	keepFamily := false
+	defer func() {
+		if !keepFamily && family != nil {
+			_ = family.close()
+		}
+	}()
+	base = selectedBase
+	absPath = filepath.Join(parentPath, base)
 	entryInfo, err := root.Lstat(base)
 	if err != nil {
 		return nil, err
@@ -296,7 +820,7 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 		cleanup()
 		return nil, err
 	}
-	image, err := recoverRecords(file, &header, current, normalized)
+	image, generation, err := recoverRecords(file, &header, current, normalized)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -304,6 +828,42 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 	if header.topologyRecoveryEpoch != expectedTopologyRecoveryEpoch {
 		cleanup()
 		return nil, fmt.Errorf("%w: expected topology recovery epoch %d, sealed %d", ErrIdentityMismatch, expectedTopologyRecoveryEpoch, header.topologyRecoveryEpoch)
+	}
+	state := family.state
+	switch state.phase {
+	case familyPhaseSource:
+		if generation.present || base != logicalBase || header.fileID != state.activeFileID ||
+			header.headerDigest != state.activeHeaderDigest {
+			cleanup()
+			return nil, fmt.Errorf("%w: WAL family source mismatch", ErrCorrupt)
+		}
+	case familyPhaseSelecting, familyPhaseActive:
+		if !generation.present || generation.seal.familyID != state.familyID ||
+			generation.seal.generation != state.activeGeneration ||
+			generation.seal.bindingDigest != state.activeBindingDigest ||
+			generation.seal.parentBindingDigest != state.parentBindingDigest ||
+			header.fileID != state.activeFileID ||
+			header.headerDigest != state.activeHeaderDigest ||
+			generation.seal.sourceFileID != state.sourceFileID ||
+			generation.seal.sourceChainDigest != state.sourceCutDigest ||
+			generation.seal.snapshotBaseDigest != state.snapshotBaseDigest ||
+			generation.seal.retentionCommitment != state.retentionCommitment ||
+			(state.phase == familyPhaseActive && base != logicalBase) {
+			cleanup()
+			return nil, fmt.Errorf("%w: WAL family selection mismatch", ErrCorrupt)
+		}
+	default:
+		cleanup()
+		return nil, ErrCorrupt
+	}
+	if state.phase == familyPhaseSource {
+		if err := inspectWALCreateStage(root, entryInfo, logicalBase); err != nil {
+			cleanup()
+			return nil, err
+		}
+	} else if err := requireWALCreateStageAbsent(root, logicalBase); err != nil {
+		cleanup()
+		return nil, err
 	}
 	if err := normalized.ops.ensureAllocated(file, normalized.maxFileBytes); err != nil {
 		cleanup()
@@ -323,11 +883,14 @@ func Open(path string, expected Identity, expectedTopologyRecoveryEpoch uint64, 
 		return nil, err
 	}
 	store := &Store{
-		path: absPath, parentPath: parentPath, base: base, root: root, directoryInfo: directoryInfo,
+		path: absPath, logicalPath: logicalPath, parentPath: parentPath,
+		base: base, logicalBase: logicalBase, root: root, directoryInfo: directoryInfo,
 		file: file, fileInfo: fileInfo, locked: true, options: normalized, header: header,
-		current: current, image: image, recoveredTornSlot: recoveredTorn,
+		current: current, image: image, generation: generation, recoveredTornSlot: recoveredTorn,
+		family: family, activationPending: family != nil && family.state.phase == familyPhaseSelecting,
 	}
 	keepRoot = true
+	keepFamily = true
 	return store, nil
 }
 
@@ -358,6 +921,10 @@ func openNamespace(path string) (string, string, string, *os.Root, os.FileInfo, 
 }
 
 func proveNamedFile(root *os.Root, parentPath string, directoryInfo os.FileInfo, base string, file *os.File, expectedSize int64) error {
+	return proveNamedSizedFile(root, parentPath, directoryInfo, base, file, expectedSize)
+}
+
+func proveNamedSizedFile(root *os.Root, parentPath string, directoryInfo os.FileInfo, base string, file *os.File, expectedSize int64) error {
 	if root == nil || directoryInfo == nil || file == nil {
 		return ErrNamespaceChanged
 	}
@@ -409,6 +976,12 @@ func (store *Store) checkBaseLocked() error {
 			return errors.Join(ErrPersistenceUnknown, store.poisoned)
 		}
 		return store.poisoned
+	}
+	if store.family != nil && store.family.recoveredTorn {
+		return ErrGenerationFamilyQuarantined
+	}
+	if store.activationPending {
+		return ErrGenerationActivationPending
 	}
 	return nil
 }
@@ -908,10 +1481,12 @@ func (store *Store) Close() error {
 		closeErr = store.file.Close()
 		store.file = nil
 	}
+	familyErr := store.family.close()
+	store.family = nil
 	var rootErr error
 	if store.root != nil {
 		rootErr = store.root.Close()
 		store.root = nil
 	}
-	return errors.Join(unlockErr, closeErr, rootErr)
+	return errors.Join(unlockErr, closeErr, familyErr, rootErr)
 }
