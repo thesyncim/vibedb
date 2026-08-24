@@ -424,6 +424,10 @@ func readRF3PointAtFreshFence(
 			if lease != nil {
 				t.Fatal("stale serving fence returned a read lease")
 			}
+			// Let the pulse/transport goroutines settle the term observed by
+			// Probe; a tight test retry loop can otherwise create its own
+			// scheduler starvation on small CI runners.
+			time.Sleep(time.Millisecond)
 			continue
 		}
 		return result, lease, state, err
