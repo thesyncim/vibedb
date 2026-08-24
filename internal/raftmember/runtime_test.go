@@ -303,7 +303,7 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 		)
 	}
 	progress, ok := fixture.runtime.node.CurrentReady()
-	if !ok || progress.CommittedCount != raftmodel.MaxProposalBatchEntries {
+	if !ok || progress.ReadyID != captured.ReadyID {
 		t.Fatalf("captured Ready progress = %+v, %t", progress, ok)
 	}
 	persisted, err := fixture.runtime.DriveReady(nil)

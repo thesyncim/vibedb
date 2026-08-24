@@ -78,8 +78,8 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	// the crash image.
 	suffixCommands := [][]byte{
 		testApplyCommand(fixture.base, epoch, 3, key, []byte(`{"id":"counter","value":1}`)),
-		testApplyCommand(fixture.base, epoch, 4, key, []byte(`{"id":"counter","value":2}`)),
-		testApplyCommand(fixture.base, epoch, 5, key, []byte(`{"id":"counter","value":3}`)),
+		runtimeReplaySessionOpen(fixture.base, 4),
+		runtimeReplaySessionOpen(fixture.base, 5),
 	}
 	lastBefore, err := fixture.wal.LastIndex()
 	if err != nil {
@@ -209,6 +209,23 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 		t.Fatalf("post-replay exact-image audit status = %+v, %v", postAudit, err)
 	}
 	assertRuntimeReplayPublication(t, recoveryRuntime, finalPublication)
+}
+
+func runtimeReplaySessionOpen(
+	identity sqldriver.ReplicatedShardStoreIdentity,
+	client byte,
+) []byte {
+	command := testApplyCommandValue(identity, 0, 1, nil, nil)
+	command.Kind = replication.CommandSessionOpen
+	command.ClientID = replication.ID128{client}
+	command.Fingerprint = replication.Digest{client, 0xa5}
+	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+	command.Mutations = nil
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
 }
 
 func openRuntimeReplayHandles(
