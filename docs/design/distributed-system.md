@@ -464,8 +464,9 @@ messages are still retained as individual frames.
 
 The kernel has no production peer listener, address discovery, certificate
 operations, snapshot-transfer service, or serving integration. The internal
-transport foundation can derive an authenticated node ID from a supplied raw
-mutual TLS connection. The shipped commands do not construct it.
+transport foundation can derive the exact binary peer identity and cluster
+trust domain from a supplied raw mutual TLS connection. The shipped commands
+do not construct it.
 
 Do not describe this kernel as a turnkey replicated deployment.
 

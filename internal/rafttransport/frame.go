@@ -56,52 +56,91 @@ type frameHeader struct {
 	payloadSize uint32
 }
 
+type outboundFramePlan struct {
+	destination NodeID
+	roster      [32]byte
+	payloadSize int
+	frameSize   int
+}
+
 // EncodeOutbound appends a canonical current-format frame to dst and returns
 // the registered destination node. dst remains unchanged on error.
 //
 // The frame carries no node identity or authentication material. PeerTLS
-// supplies the certificate-derived NodeID out of band.
+// supplies the certificate-derived peer identity out of band.
 func (registry *StaticRegistry) EncodeOutbound(
 	dst []byte,
 	outbound raftmember.OutboundMessage,
 ) ([]byte, NodeID, error) {
+	plan, err := registry.preflightOutbound(outbound)
+	if err != nil {
+		return dst, NodeID{}, err
+	}
+	encoded, err := registry.appendOutbound(dst, outbound, plan)
+	if err != nil {
+		return encoded, NodeID{}, err
+	}
+	return encoded, plan.destination, nil
+}
+
+func (registry *StaticRegistry) preflightOutbound(
+	outbound raftmember.OutboundMessage,
+) (outboundFramePlan, error) {
 	if registry == nil || outbound.Message == nil {
-		return dst, NodeID{}, fmt.Errorf("%w: nil registry or message", ErrInvalidFrame)
+		return outboundFramePlan{}, fmt.Errorf("%w: nil registry or message", ErrInvalidFrame)
 	}
 	if err := validateFrameGroup(outbound.Group); err != nil {
-		return dst, NodeID{}, err
+		return outboundFramePlan{}, err
+	}
+	if outbound.Group.ClusterID != registry.trustDomain.ClusterID ||
+		outbound.Group.ClusterIncarnation != registry.trustDomain.ClusterIncarnation {
+		return outboundFramePlan{}, fmt.Errorf("%w: group trust domain differs", ErrUnauthorized)
 	}
 	if outbound.From == 0 || outbound.To == 0 || outbound.From == outbound.To ||
 		outbound.Message.GetFrom() != outbound.From || outbound.Message.GetTo() != outbound.To {
-		return dst, NodeID{}, fmt.Errorf("%w: outer and protobuf member IDs differ", ErrInvalidFrame)
+		return outboundFramePlan{}, fmt.Errorf("%w: outer and protobuf member IDs differ", ErrInvalidFrame)
 	}
 	fromNode, err := registry.Node(outbound.Group, outbound.From)
 	if err != nil || fromNode != registry.LocalNode() {
-		return dst, NodeID{}, fmt.Errorf("%w: source member is not local", ErrUnauthorized)
+		return outboundFramePlan{}, fmt.Errorf("%w: source member is not local", ErrUnauthorized)
 	}
 	destination, err := registry.Node(outbound.Group, outbound.To)
 	if err != nil || destination == registry.LocalNode() {
-		return dst, NodeID{}, fmt.Errorf("%w: destination member is not remote", ErrUnauthorized)
+		return outboundFramePlan{}, fmt.Errorf("%w: destination member is not remote", ErrUnauthorized)
 	}
 	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
 	if err != nil {
-		return dst, NodeID{}, classifyOrdinaryError(err)
+		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
 	if err := registry.validateStaticMessage(outbound.Group, outbound.Message); err != nil {
-		return dst, NodeID{}, err
+		return outboundFramePlan{}, err
 	}
 	roster, ok := registry.rosterDigest(outbound.Group)
 	if !ok {
-		return dst, NodeID{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
+		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
 	}
 	if size > raftmodel.MaxInboundMessageBytes {
-		return dst, NodeID{}, fmt.Errorf("%w: payload bytes %d", ErrFrameTooLarge, size)
+		return outboundFramePlan{}, fmt.Errorf("%w: payload bytes %d", ErrFrameTooLarge, size)
 	}
-	if len(dst) > math.MaxInt-FrameHeaderBytes-size {
-		return dst, NodeID{}, ErrFrameTooLarge
+	return outboundFramePlan{
+		destination: destination,
+		roster:      roster,
+		payloadSize: size,
+		frameSize:   FrameHeaderBytes + size,
+	}, nil
+}
+
+func (registry *StaticRegistry) appendOutbound(
+	dst []byte,
+	outbound raftmember.OutboundMessage,
+	plan outboundFramePlan,
+) ([]byte, error) {
+	if plan.frameSize < FrameHeaderBytes || plan.payloadSize != plan.frameSize-FrameHeaderBytes ||
+		len(dst) > math.MaxInt-plan.frameSize {
+		return dst, ErrFrameTooLarge
 	}
-	if messageOverlapsAppendRegion(dst, FrameHeaderBytes+size, outbound.Message) {
-		return dst, NodeID{}, fmt.Errorf("%w: message aliases frame append region", ErrInvalidFrame)
+	if messageOverlapsAppendRegion(dst, plan.frameSize, outbound.Message) {
+		return dst, fmt.Errorf("%w: message aliases frame append region", ErrInvalidFrame)
 	}
 
 	start := len(dst)
@@ -109,14 +148,15 @@ func (registry *StaticRegistry) EncodeOutbound(
 	// allocation-free when the caller sized dst exactly, this prevents a
 	// header-only reuse of dst's old backing array from overwriting message
 	// slices before MarshalAppend relocates the payload.
-	dst = slices.Grow(dst, FrameHeaderBytes+size)
+	dst = slices.Grow(dst, plan.frameSize)
 	dst = append(dst, make([]byte, FrameHeaderBytes)...)
+	var err error
 	dst, err = (proto.MarshalOptions{Deterministic: true}).MarshalAppend(dst, outbound.Message)
 	if err != nil {
-		return dst[:start], NodeID{}, fmt.Errorf("%w: marshal ordinary message: %w", ErrInvalidFrame, err)
+		return dst[:start], fmt.Errorf("%w: marshal ordinary message: %w", ErrInvalidFrame, err)
 	}
-	if len(dst) != start+FrameHeaderBytes+size {
-		return dst[:start], NodeID{}, fmt.Errorf("%w: protobuf size changed during encode", ErrInvalidFrame)
+	if len(dst) != start+plan.frameSize {
+		return dst[:start], fmt.Errorf("%w: protobuf size changed during encode", ErrInvalidFrame)
 	}
 	header := dst[start : start+FrameHeaderBytes]
 	copy(header[0:4], frameMagic[:])
@@ -124,26 +164,31 @@ func (registry *StaticRegistry) EncodeOutbound(
 	header[6] = frameKindOrdinary
 	header[7] = 0
 	appendGroupKey(header[8:80], outbound.Group)
-	copy(header[80:112], roster[:])
+	copy(header[80:112], plan.roster[:])
 	binary.BigEndian.PutUint64(header[112:120], outbound.From)
 	binary.BigEndian.PutUint64(header[120:128], outbound.To)
-	binary.BigEndian.PutUint32(header[128:132], uint32(size))
-	return dst, destination, nil
+	binary.BigEndian.PutUint32(header[128:132], uint32(plan.payloadSize))
+	return dst, nil
 }
 
 // DecodeInbound admits and decodes one complete canonical frame. The
 // authenticated node comes from PeerTLS. This method neither performs TLS nor
 // derives identity from frame bytes.
-func (registry *StaticRegistry) DecodeInbound(authenticated NodeID, frame []byte) (Inbound, error) {
+func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame []byte) (Inbound, error) {
+	if registry == nil || !validPeerIdentity(authenticated) ||
+		authenticated.TrustDomain != registry.trustDomain {
+		return Inbound{}, fmt.Errorf("%w: missing registry or peer identity", ErrUnauthorized)
+	}
 	header, payload, err := parseFrame(frame)
 	if err != nil {
 		return Inbound{}, err
 	}
-	if registry == nil || authenticated == (NodeID{}) {
-		return Inbound{}, fmt.Errorf("%w: missing registry or peer identity", ErrUnauthorized)
+	if header.group.ClusterID != registry.trustDomain.ClusterID ||
+		header.group.ClusterIncarnation != registry.trustDomain.ClusterIncarnation {
+		return Inbound{}, fmt.Errorf("%w: frame trust domain differs", ErrUnauthorized)
 	}
 	source, err := registry.Node(header.group, header.from)
-	if err != nil || source != authenticated {
+	if err != nil || source != authenticated.Node {
 		return Inbound{}, fmt.Errorf("%w: authenticated source is not registered member", ErrUnauthorized)
 	}
 	destination, err := registry.Node(header.group, header.to)

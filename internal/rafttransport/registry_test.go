@@ -50,7 +50,7 @@ func TestStaticRegistryRF1RF2RF3(t *testing.T) {
 
 func TestStaticRegistryAcceptsUnsortedMultipleGroups(t *testing.T) {
 	group1 := testGroup(1)
-	group2 := testGroup(2)
+	group2 := testGroupInDomain(group1, 2)
 	members := []Member{
 		{Group: group2, ReplicaSetVersion: 1, MemberID: 22, Node: testNode(2), Role: MemberVoter},
 		{Group: group1, ReplicaSetVersion: 1, MemberID: 12, Node: testNode(2), Role: MemberVoter},
@@ -66,6 +66,49 @@ func TestStaticRegistryAcceptsUnsortedMultipleGroups(t *testing.T) {
 	}
 	if got, err := registry.LocalMember(group2); err != nil || got != 21 {
 		t.Fatalf("group 2 local = %d, %v; want 21, nil", got, err)
+	}
+}
+
+func TestStaticRegistryRequiresOneNonemptyTrustDomain(t *testing.T) {
+	limits := Limits{MaxGroups: 2, MaxMembers: 2}
+	if _, err := NewStaticRegistry(testNode(1), nil, limits); !errors.Is(err, ErrInvalidGroup) {
+		t.Fatalf("empty registry error = %v, want ErrInvalidGroup", err)
+	}
+	group := testGroup(7)
+	member := Member{
+		Group: group, ReplicaSetVersion: 1, MemberID: 11,
+		Node: testNode(1), Role: MemberVoter,
+	}
+	registry, err := NewStaticRegistry(testNode(1), []Member{member}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := TrustDomain{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+	}
+	if got := registry.TrustDomain(); got != want {
+		t.Fatalf("TrustDomain = %+v, want %+v", got, want)
+	}
+
+	for _, coordinate := range []string{"cluster ID", "cluster incarnation"} {
+		t.Run(coordinate, func(t *testing.T) {
+			other := testGroupInDomain(group, 8)
+			if coordinate == "cluster ID" {
+				other.ClusterID[0]++
+			} else {
+				other.ClusterIncarnation[0]++
+			}
+			_, err := NewStaticRegistry(testNode(1), []Member{
+				member,
+				{
+					Group: other, ReplicaSetVersion: 1, MemberID: 21,
+					Node: testNode(1), Role: MemberVoter,
+				},
+			}, limits)
+			if !errors.Is(err, ErrInvalidGroup) {
+				t.Fatalf("mixed domain error = %v, want ErrInvalidGroup", err)
+			}
+		})
 	}
 }
 
@@ -118,8 +161,9 @@ func TestStaticRegistryAcceptsAbsoluteBounds(t *testing.T) {
 
 func TestStaticRegistryConstructsAndDirectlyLooksUpAbsoluteGroupCount(t *testing.T) {
 	members := make([]Member, AbsoluteMaxGroups)
+	domain := testGroup(1)
 	for index := range members {
-		group := testGroup16(index + 1)
+		group := testGroupInDomain(domain, index+1)
 		members[index] = Member{
 			Group: group, ReplicaSetVersion: 1, MemberID: uint64(index + 1),
 			Node: testNode(1), Role: MemberVoter,
@@ -259,9 +303,10 @@ func TestStaticRegistryRejectsMixedReplicaSetVersions(t *testing.T) {
 }
 
 func TestStaticRegistryRequiresLocalMemberInEveryGroup(t *testing.T) {
+	group1 := testGroup(1)
 	members := []Member{
-		{Group: testGroup(1), ReplicaSetVersion: 1, MemberID: 11, Node: testNode(1), Role: MemberVoter},
-		{Group: testGroup(2), ReplicaSetVersion: 1, MemberID: 21, Node: testNode(2), Role: MemberVoter},
+		{Group: group1, ReplicaSetVersion: 1, MemberID: 11, Node: testNode(1), Role: MemberVoter},
+		{Group: testGroupInDomain(group1, 2), ReplicaSetVersion: 1, MemberID: 21, Node: testNode(2), Role: MemberVoter},
 	}
 	_, err := NewStaticRegistry(testNode(1), members, Limits{MaxGroups: 2, MaxMembers: 2})
 	if !errors.Is(err, ErrLocalMember) {
@@ -287,7 +332,7 @@ func TestStaticRegistryRequiresVoterButAllowsLocalLearner(t *testing.T) {
 
 func TestStaticRegistryEnforcesInputBounds(t *testing.T) {
 	group1 := testGroup(1)
-	group2 := testGroup(2)
+	group2 := testGroupInDomain(group1, 2)
 	_, err := NewStaticRegistry(testNode(1), []Member{
 		{Group: group1, ReplicaSetVersion: 1, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group2, ReplicaSetVersion: 1, MemberID: 1, Node: testNode(1), Role: MemberVoter},
@@ -364,6 +409,10 @@ func testGroup(seed byte) raftmember.GroupKey {
 
 func testNode(seed byte) NodeID { return NodeID{seed} }
 
+func testPeerIdentity(registry *StaticRegistry, node NodeID) PeerIdentity {
+	return PeerIdentity{TrustDomain: registry.TrustDomain(), Node: node}
+}
+
 func testNode16(seed int) NodeID {
 	return NodeID{byte(seed), byte(seed >> 8)}
 }
@@ -375,5 +424,12 @@ func testGroup16(seed int) raftmember.GroupKey {
 	group.ShardIncarnation[2] = byte(seed >> 8)
 	group.GroupID[2] = byte(seed >> 8)
 	group.TopologyRecoveryEpoch = uint64(seed)
+	return group
+}
+
+func testGroupInDomain(domain raftmember.GroupKey, seed int) raftmember.GroupKey {
+	group := testGroup16(seed)
+	group.ClusterID = domain.ClusterID
+	group.ClusterIncarnation = domain.ClusterIncarnation
 	return group
 }

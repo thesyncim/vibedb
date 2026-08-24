@@ -29,7 +29,7 @@ func TestOrdinaryReceiverReadsShortIOAndAdmitsBeforeOwnedDelivery(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	connection := newStreamTestConnection(sender.LocalNode(), stream)
+	connection := newStreamTestConnection(testPeerIdentity(registry, sender.LocalNode()), stream)
 	connection.maxRead = 1
 	var deadlineCalls atomic.Uint32
 	var delivered []Inbound
@@ -146,7 +146,7 @@ func TestOrdinaryReceiverRejectsStaticFrameBeforeDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newStreamTestConnection(sender.LocalNode(), stream)
+	connection := newStreamTestConnection(testPeerIdentity(registry, sender.LocalNode()), stream)
 	deliveries := 0
 	receiver := newStreamTestReceiver(t, registry, func(context.Context, Inbound) error {
 		deliveries++
@@ -157,6 +157,27 @@ func TestOrdinaryReceiverRejectsStaticFrameBeforeDelivery(t *testing.T) {
 	}
 	if deliveries != 0 {
 		t.Fatalf("invalid frame deliveries = %d", deliveries)
+	}
+}
+
+func TestOrdinaryReceiverRejectsCrossDomainConnectionBeforeRead(t *testing.T) {
+	group := testGroup(116)
+	sender, registry, _, _ := frameTestRegistries(t, 2, group)
+	identity := testPeerIdentity(registry, sender.LocalNode())
+	identity.TrustDomain.ClusterIncarnation[0]++
+	connection := newStreamTestConnection(identity, nil)
+	receiver := newStreamTestReceiver(t, registry, func(context.Context, Inbound) error {
+		t.Fatal("cross-domain connection reached handler")
+		return nil
+	})
+	if err := receiver.Serve(context.Background(), connection); !errors.Is(err, ErrInvalidTransport) {
+		t.Fatalf("error = %v, want ErrInvalidTransport", err)
+	}
+	connection.mu.Lock()
+	closed := connection.closed
+	connection.mu.Unlock()
+	if !closed {
+		t.Fatal("cross-domain connection was not closed")
 	}
 }
 
@@ -185,7 +206,7 @@ func TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			connection := newStreamTestConnection(test.node, test.stream)
+			connection := newStreamTestConnection(testPeerIdentity(registry, test.node), test.stream)
 			connection.class = test.class
 			receiver := newStreamTestReceiver(t, registry, func(context.Context, Inbound) error {
 				t.Fatal("invalid stream reached handler")
@@ -203,7 +224,7 @@ func TestOrdinaryReceiverCancellationClosesBlockedReadWithoutLeak(t *testing.T) 
 	sender, registry, _, _ := frameTestRegistries(t, 2, group)
 	local, remote := net.Pipe()
 	connection := &streamAuthenticatedConnection{
-		Conn: local, node: sender.LocalNode(), class: TrafficOrdinary,
+		Conn: local, identity: testPeerIdentity(registry, sender.LocalNode()), class: TrafficOrdinary,
 	}
 	receiver := newStreamTestReceiver(t, registry, func(context.Context, Inbound) error {
 		t.Fatal("blocked stream delivered a frame")
@@ -251,7 +272,7 @@ func TestWaitAndRawDialFailureCloseContracts(t *testing.T) {
 		t.Fatalf("nil-context wait error = %v", err)
 	}
 
-	raw := newStreamTestConnection(testNode(1), nil)
+	raw := newStreamTestConnection(PeerIdentity{Node: testNode(1)}, nil)
 	dialer := TLSOrdinaryDialer{
 		TLS: &PeerTLS{},
 		Dial: func(context.Context, NodeID) (net.Conn, error) {
@@ -312,24 +333,26 @@ func newStreamTestReceiver(
 }
 
 type streamTestConnection struct {
-	node    NodeID
-	class   TrafficClass
-	reader  *bytes.Reader
-	maxRead int
+	identity PeerIdentity
+	class    TrafficClass
+	reader   *bytes.Reader
+	maxRead  int
 
 	mu        sync.Mutex
 	closed    bool
 	deadlines int
 }
 
-func newStreamTestConnection(node NodeID, stream []byte) *streamTestConnection {
+func newStreamTestConnection(identity PeerIdentity, stream []byte) *streamTestConnection {
 	return &streamTestConnection{
-		node: node, class: TrafficOrdinary,
+		identity: identity, class: TrafficOrdinary,
 		reader: bytes.NewReader(bytes.Clone(stream)),
 	}
 }
 
-func (connection *streamTestConnection) PeerNode() NodeID { return connection.node }
+func (connection *streamTestConnection) PeerIdentity() PeerIdentity {
+	return connection.identity
+}
 func (connection *streamTestConnection) TrafficClass() TrafficClass {
 	return connection.class
 }
@@ -359,11 +382,13 @@ func (connection *streamTestConnection) SetWriteDeadline(time.Time) error { retu
 
 type streamAuthenticatedConnection struct {
 	net.Conn
-	node  NodeID
-	class TrafficClass
+	identity PeerIdentity
+	class    TrafficClass
 }
 
-func (connection *streamAuthenticatedConnection) PeerNode() NodeID { return connection.node }
+func (connection *streamAuthenticatedConnection) PeerIdentity() PeerIdentity {
+	return connection.identity
+}
 func (connection *streamAuthenticatedConnection) TrafficClass() TrafficClass {
 	return connection.class
 }

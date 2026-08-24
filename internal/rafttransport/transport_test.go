@@ -187,7 +187,8 @@ func TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frameBytes := int64(len(frame))
+	frameCapacity, _, _ := frameBufferCapacity(len(frame), DefaultRetainedFrameBytes)
+	frameBytes := int64(frameCapacity)
 	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
 		return nil, io.ErrClosedPipe
 	})
@@ -230,13 +231,348 @@ func TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds(t *testing.T) {
 	}
 }
 
+func TestOrdinaryTransportReservationsBoundConcurrentPreEncodeOwnership(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	dialer := ordinaryDialFunc(func(ctx context.Context, _ NodeID) (PeerConnection, error) {
+		<-ctx.Done()
+		return nil, context.Cause(ctx)
+	})
+	options := transportTestOptions(fixture, dialer)
+	options.Peers = options.Peers[:1]
+	options.Queue.PerPeerFrames = 4
+	options.Queue.GlobalFrames = 4
+	options.Coalesce.MaxFrames = 4
+	transport, err := NewOrdinaryTransport(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, options.Queue.GlobalFrames)
+	release := make(chan struct{})
+	transport.beforeEncode = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	cancel, done := runTransportTest(t, transport)
+
+	const senders = 32
+	results := make(chan error, senders)
+	for ordinal := range senders {
+		go func() {
+			results <- transport.Send(fixture.outbound(0, uint64(ordinal+1)))
+		}()
+	}
+	for range options.Queue.GlobalFrames {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("reserved Send did not reach encode seam")
+		}
+	}
+	plan, err := fixture.registry.preflightOutbound(fixture.outbound(0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedSize, _, _ := frameBufferCapacity(plan.frameSize, options.RetainedFrameBytes)
+	wantReservedBytes := int64(options.Queue.GlobalFrames * ownedSize)
+	stats, err := transport.Stats(fixture.remote[0].Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.QueuedFrames != 0 || stats.ReservedFrames != options.Queue.GlobalFrames ||
+		stats.ReservedBytes != wantReservedBytes || stats.DialAttempts != 0 {
+		t.Fatalf("in-flight reservation stats = %+v", stats)
+	}
+	if frames, bytes := transport.GlobalQueueStats(); frames != options.Queue.GlobalFrames || bytes != stats.ReservedBytes {
+		t.Fatalf("global reservation = %d/%d, peer = %+v", frames, bytes, stats)
+	}
+	ownedFrames, ownedBytes, freeFrames, closed := transport.frames.stats()
+	if ownedFrames != options.Queue.GlobalFrames || ownedBytes > options.Queue.GlobalBytes ||
+		freeFrames != 0 || closed {
+		t.Fatalf("cache ownership = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	assertTransportOwnershipInvariants(t, transport)
+
+	close(release)
+	succeeded, backpressured := 0, 0
+	for range senders {
+		switch err := <-results; {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrBackpressure):
+			backpressured++
+		default:
+			t.Fatalf("Send error = %v", err)
+		}
+	}
+	if succeeded != options.Queue.GlobalFrames || backpressured != senders-succeeded {
+		t.Fatalf("Send outcomes = %d success, %d backpressure", succeeded, backpressured)
+	}
+	stats, _ = transport.Stats(fixture.remote[0].Node)
+	if stats.QueuedFrames != succeeded || stats.ReservedFrames != 0 || stats.ReservedBytes != 0 {
+		t.Fatalf("published reservation stats = %+v", stats)
+	}
+	assertTransportOwnershipInvariants(t, transport)
+	stopTransportTest(t, transport, cancel, done)
+	ownedFrames, ownedBytes, freeFrames, closed = transport.frames.stats()
+	if ownedFrames != 0 || ownedBytes != 0 || freeFrames != 0 || !closed {
+		t.Fatalf("closed cache ownership = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	assertTransportOwnershipInvariants(t, transport)
+}
+
+func TestOrdinaryTransportCloseWaitsForInFlightEncodeReservation(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	dialer := ordinaryDialFunc(func(ctx context.Context, _ NodeID) (PeerConnection, error) {
+		<-ctx.Done()
+		return nil, context.Cause(ctx)
+	})
+	options := transportTestOptions(fixture, dialer)
+	options.Peers = options.Peers[:1]
+	options.Queue.PerPeerFrames = 2
+	options.Queue.GlobalFrames = 2
+	options.Coalesce.MaxFrames = 2
+	transport, err := NewOrdinaryTransport(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	transport.beforeEncode = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	cancel, done := runTransportTest(t, transport)
+	defer cancel()
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- transport.Send(fixture.outbound(0, 1)) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send did not reach encode seam")
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before active Send unwound: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	stats, _ := transport.Stats(fixture.remote[0].Node)
+	if stats.QueuedFrames != 0 || stats.ReservedFrames != 1 || stats.ReservedBytes <= 0 {
+		t.Fatalf("closing reservation stats = %+v", stats)
+	}
+	if frames, bytes := transport.GlobalQueueStats(); frames != 1 || bytes != stats.ReservedBytes {
+		t.Fatalf("closing global reservation = %d/%d, peer = %+v", frames, bytes, stats)
+	}
+	assertTransportOwnershipInvariants(t, transport)
+	close(release)
+	if err := <-sendDone; !errors.Is(err, ErrTransportClosed) {
+		t.Fatalf("closing Send error = %v, want ErrTransportClosed", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not quiesce after reservation unwind")
+	}
+	stats, _ = transport.Stats(fixture.remote[0].Node)
+	if stats.QueuedFrames != 0 || stats.QueuedBytes != 0 ||
+		stats.ReservedFrames != 0 || stats.ReservedBytes != 0 {
+		t.Fatalf("quiesced peer stats = %+v", stats)
+	}
+	if frames, bytes := transport.GlobalQueueStats(); frames != 0 || bytes != 0 {
+		t.Fatalf("quiesced global reservation = %d/%d", frames, bytes)
+	}
+	ownedFrames, ownedBytes, freeFrames, closed := transport.frames.stats()
+	if ownedFrames != 0 || ownedBytes != 0 || freeFrames != 0 || !closed {
+		t.Fatalf("quiesced cache = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	assertTransportOwnershipInvariants(t, transport)
+}
+
+func TestOrdinaryTransportEncodeFailureUnwindsReservationAndOwnership(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	outbound := fixture.outbound(0, 1)
+	transport.beforeEncode = func() {
+		outbound.Message.Context = []byte("changed after exact preflight")
+	}
+	if err := transport.Send(outbound); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("encode error = %v, want ErrInvalidFrame", err)
+	}
+	stats, _ := transport.Stats(fixture.remote[0].Node)
+	if stats.QueuedFrames != 0 || stats.QueuedBytes != 0 ||
+		stats.ReservedFrames != 0 || stats.ReservedBytes != 0 {
+		t.Fatalf("failed encode peer stats = %+v", stats)
+	}
+	if frames, bytes := transport.GlobalQueueStats(); frames != 0 || bytes != 0 {
+		t.Fatalf("failed encode global ownership = %d/%d", frames, bytes)
+	}
+	ownedFrames, ownedBytes, freeFrames, closed := transport.frames.stats()
+	if ownedFrames != 1 || ownedBytes <= 0 || freeFrames != 1 || closed {
+		t.Fatalf("failed encode cache = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	transport.state.Store(transportReady)
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ownedFrames, ownedBytes, freeFrames, closed = transport.frames.stats()
+	if ownedFrames != 0 || ownedBytes != 0 || freeFrames != 0 || !closed {
+		t.Fatalf("closed failed-encode cache = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+}
+
+func TestOrdinaryTransportReturnsBuffersOutsideGlobalQueueLock(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	if err := transport.Send(fixture.outbound(0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	peer := transport.byNode[fixture.remote[0].Node]
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	transport.beforeFrameReturn = func() {
+		close(entered)
+		<-release
+	}
+	committed := make(chan struct{})
+	go func() {
+		transport.commitPeerBatch(peer, 1)
+		close(committed)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit did not reach frame-return seam")
+	}
+	statsDone := make(chan struct{})
+	go func() {
+		stats, _ := transport.Stats(peer.node)
+		frames, bytes := transport.GlobalQueueStats()
+		if stats.QueuedFrames != 0 || frames != 0 || bytes != 0 {
+			t.Errorf("queue while frame return blocked = %+v, %d/%d", stats, frames, bytes)
+		}
+		close(statsDone)
+	}()
+	select {
+	case <-statsDone:
+	case <-time.After(time.Second):
+		t.Fatal("global queue lock remained held during frame return")
+	}
+	close(release)
+	select {
+	case <-committed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit did not finish")
+	}
+	transport.state.Store(transportReady)
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBoundedFrameBufferCacheBestFitAndHardOwnership(t *testing.T) {
+	cache := newBoundedFrameBufferCache(3, 1024, 1024)
+	first, err := cache.get(400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cache.get(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := cache.get(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.put(first)
+	cache.put(second)
+	cache.put(third)
+	best, err := cache.get(150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(best.bytes) != 256 {
+		t.Fatalf("best-fit class capacity = %d, want 256", cap(best.bytes))
+	}
+	next, err := cache.get(350)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(next.bytes) != 512 {
+		t.Fatalf("next class capacity = %d, want 512", cap(next.bytes))
+	}
+	if _, err := cache.get(500); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("physical ownership error = %v, want ErrBackpressure", err)
+	}
+	ownedFrames, ownedBytes, _, _ := cache.stats()
+	if ownedFrames > 3 || ownedBytes > 1024 {
+		t.Fatalf("cache exceeded ownership = %d/%d", ownedFrames, ownedBytes)
+	}
+	cache.put(best)
+	cache.put(next)
+	cache.close()
+	ownedFrames, ownedBytes, freeFrames, closed := cache.stats()
+	if ownedFrames != 0 || ownedBytes != 0 || freeFrames != 0 || !closed {
+		t.Fatalf("closed cache = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+}
+
+func TestFrameBufferCapacityClassesBoundRetainedOverhead(t *testing.T) {
+	tests := []struct {
+		size, retain int
+		capacity     int
+		cacheable    bool
+	}{
+		{size: FrameHeaderBytes, retain: DefaultRetainedFrameBytes, capacity: 256, cacheable: true},
+		{size: 256, retain: DefaultRetainedFrameBytes, capacity: 256, cacheable: true},
+		{size: 257, retain: DefaultRetainedFrameBytes, capacity: 512, cacheable: true},
+		{size: 400, retain: 500, capacity: 500, cacheable: true},
+		{size: 501, retain: 500, capacity: 501, cacheable: false},
+	}
+	for _, test := range tests {
+		capacity, _, cacheable := frameBufferCapacity(test.size, test.retain)
+		if capacity != test.capacity || cacheable != test.cacheable {
+			t.Fatalf("capacity(%d, %d) = %d/%v, want %d/%v",
+				test.size, test.retain, capacity, cacheable,
+				test.capacity, test.cacheable)
+		}
+	}
+	for size := FrameHeaderBytes; size <= DefaultRetainedFrameBytes; size++ {
+		capacity, _, cacheable := frameBufferCapacity(size, DefaultRetainedFrameBytes)
+		if !cacheable || capacity < size || capacity >= size*2 {
+			t.Fatalf("retained capacity(%d) = %d/%v", size, capacity, cacheable)
+		}
+	}
+}
+
 func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing.T) {
 	fixture := newTransportTestFixture(t)
-	connection := newTransportTestConnection(fixture.remote[0].Node)
+	connection := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	var attempts atomic.Uint32
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node != fixture.remote[0].Node {
-			return newTransportTestConnection(node), nil
+			return newTransportTestConnection(fixture.registry, node), nil
 		}
 		if attempts.Add(1) <= 2 {
 			return nil, io.ErrClosedPipe
@@ -292,15 +628,15 @@ func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing
 
 func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T) {
 	fixture := newTransportTestFixture(t)
-	failed := newTransportTestConnection(fixture.remote[0].Node)
+	failed := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	failed.maxWrite = 3
 	failed.failAfter = 17
-	succeeded := newTransportTestConnection(fixture.remote[0].Node)
+	succeeded := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	succeeded.maxWrite = 2
 	var dials atomic.Uint32
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node != fixture.remote[0].Node {
-			return newTransportTestConnection(node), nil
+			return newTransportTestConnection(fixture.registry, node), nil
 		}
 		if dials.Add(1) == 1 {
 			return failed, nil
@@ -334,11 +670,11 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 
 func TestOrdinaryTransportCoalescesInOrderWithinHardCount(t *testing.T) {
 	fixture := newTransportTestFixture(t)
-	connection := newTransportTestConnection(fixture.remote[0].Node)
+	connection := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	dialGate := make(chan struct{})
 	dialer := ordinaryDialFunc(func(ctx context.Context, node NodeID) (PeerConnection, error) {
 		if node != fixture.remote[0].Node {
-			return newTransportTestConnection(node), nil
+			return newTransportTestConnection(fixture.registry, node), nil
 		}
 		select {
 		case <-ctx.Done():
@@ -380,7 +716,9 @@ func TestOrdinaryTransportCoalescesInOrderWithinHardCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	for index, frame := range records {
-		inbound, err := receiver.DecodeInbound(fixture.local.Node, frame)
+		inbound, err := receiver.DecodeInbound(
+			testPeerIdentity(receiver, fixture.local.Node), frame,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -392,12 +730,12 @@ func TestOrdinaryTransportCoalescesInOrderWithinHardCount(t *testing.T) {
 
 func TestOrdinaryTransportCoalesceDelayIsInjectedAndWakesForNextFrame(t *testing.T) {
 	fixture := newTransportTestFixture(t)
-	connection := newTransportTestConnection(fixture.remote[0].Node)
+	connection := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node == fixture.remote[0].Node {
 			return connection, nil
 		}
-		return newTransportTestConnection(node), nil
+		return newTransportTestConnection(fixture.registry, node), nil
 	})
 	options := transportTestOptions(fixture, dialer)
 	options.Coalesce.MaxDelay = 7 * time.Millisecond
@@ -446,11 +784,11 @@ func TestOrdinaryTransportCoalescingHonorsHardByteBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newTransportTestConnection(fixture.remote[0].Node)
+	connection := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	dialGate := make(chan struct{})
 	dialer := ordinaryDialFunc(func(ctx context.Context, node NodeID) (PeerConnection, error) {
 		if node != fixture.remote[0].Node {
-			return newTransportTestConnection(node), nil
+			return newTransportTestConnection(fixture.registry, node), nil
 		}
 		select {
 		case <-ctx.Done():
@@ -486,9 +824,9 @@ func TestOrdinaryTransportCoalescingHonorsHardByteBound(t *testing.T) {
 
 func TestOrdinaryTransportPeerWritersAreIndependent(t *testing.T) {
 	fixture := newTransportTestFixture(t)
-	blocked := newTransportTestConnection(fixture.remote[0].Node)
+	blocked := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	blocked.writeGate = make(chan struct{})
-	ready := newTransportTestConnection(fixture.remote[1].Node)
+	ready := newTransportTestConnection(fixture.registry, fixture.remote[1].Node)
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node == fixture.remote[0].Node {
 			return blocked, nil
@@ -524,8 +862,8 @@ func TestOrdinaryTransportPeerWritersAreIndependent(t *testing.T) {
 func TestOrdinaryTransportConcurrentSendDrainsWithinExactBounds(t *testing.T) {
 	fixture := newTransportTestFixture(t)
 	connections := [2]*transportTestConnection{
-		newTransportTestConnection(fixture.remote[0].Node),
-		newTransportTestConnection(fixture.remote[1].Node),
+		newTransportTestConnection(fixture.registry, fixture.remote[0].Node),
+		newTransportTestConnection(fixture.registry, fixture.remote[1].Node),
 	}
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node == fixture.remote[0].Node {
@@ -589,16 +927,20 @@ func TestOrdinaryTransportConcurrentSendDrainsWithinExactBounds(t *testing.T) {
 func TestOrdinaryTransportRejectsWrongAuthenticatedDialResult(t *testing.T) {
 	fixture := newTransportTestFixture(t)
 	var attempts atomic.Uint32
-	valid := newTransportTestConnection(fixture.remote[0].Node)
+	valid := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	dialer := ordinaryDialFunc(func(_ context.Context, node NodeID) (PeerConnection, error) {
 		if node != fixture.remote[0].Node {
-			return newTransportTestConnection(node), nil
+			return newTransportTestConnection(fixture.registry, node), nil
 		}
 		switch attempts.Add(1) {
 		case 1:
-			return newTransportTestConnection(testNode(99)), nil
+			return newTransportTestConnection(fixture.registry, testNode(99)), nil
 		case 2:
-			wrongClass := newTransportTestConnection(node)
+			wrongDomain := newTransportTestConnection(fixture.registry, node)
+			wrongDomain.identity.TrustDomain.ClusterID[0]++
+			return wrongDomain, nil
+		case 3:
+			wrongClass := newTransportTestConnection(fixture.registry, node)
 			wrongClass.class = TrafficSnapshot
 			return wrongClass, nil
 		default:
@@ -619,14 +961,14 @@ func TestOrdinaryTransportRejectsWrongAuthenticatedDialResult(t *testing.T) {
 		return stats.SentFrames == 1
 	})
 	stats, _ := transport.Stats(fixture.remote[0].Node)
-	if stats.DialFailures != 2 || stats.DialAttempts != 3 {
+	if stats.DialFailures != 3 || stats.DialAttempts != 4 {
 		t.Fatalf("authentication retry stats = %+v", stats)
 	}
 }
 
 type transportTestConnection struct {
-	node  NodeID
-	class TrafficClass
+	identity PeerIdentity
+	class    TrafficClass
 
 	mu         sync.Mutex
 	written    bytes.Buffer
@@ -638,13 +980,19 @@ type transportTestConnection struct {
 	closeOnce  sync.Once
 }
 
-func newTransportTestConnection(node NodeID) *transportTestConnection {
+func newTransportTestConnection(
+	registry *StaticRegistry,
+	node NodeID,
+) *transportTestConnection {
 	return &transportTestConnection{
-		node: node, class: TrafficOrdinary, closed: make(chan struct{}),
+		identity: testPeerIdentity(registry, node),
+		class:    TrafficOrdinary, closed: make(chan struct{}),
 	}
 }
 
-func (connection *transportTestConnection) PeerNode() NodeID { return connection.node }
+func (connection *transportTestConnection) PeerIdentity() PeerIdentity {
+	return connection.identity
+}
 func (connection *transportTestConnection) TrafficClass() TrafficClass {
 	return connection.class
 }
@@ -722,4 +1070,36 @@ func transportTestRecords(t testing.TB, stream []byte) [][]byte {
 		stream = stream[length:]
 	}
 	return records
+}
+
+func assertTransportOwnershipInvariants(t testing.TB, transport *OrdinaryTransport) {
+	t.Helper()
+	transport.mu.Lock()
+	frames, bytes, activeSends := 0, int64(0), 0
+	for _, peer := range transport.peers {
+		if peer.count < 0 || peer.bytes < 0 ||
+			peer.reservedFrames < 0 || peer.reservedBytes < 0 {
+			transport.mu.Unlock()
+			t.Fatalf("negative peer ownership for %x", peer.node)
+		}
+		frames += peer.count + peer.reservedFrames
+		bytes += peer.bytes + peer.reservedBytes
+		activeSends += peer.reservedFrames
+	}
+	globalFrames, globalBytes := transport.globalFrames, transport.globalBytes
+	trackedSends := transport.activeSends
+	transport.mu.Unlock()
+	if frames != globalFrames || bytes != globalBytes || activeSends != trackedSends ||
+		globalFrames < 0 || globalBytes < 0 ||
+		globalFrames > transport.queueLimits.GlobalFrames ||
+		globalBytes > transport.queueLimits.GlobalBytes {
+		t.Fatalf("ownership invariant = peers %d/%d sends %d, global %d/%d sends %d",
+			frames, bytes, activeSends, globalFrames, globalBytes, trackedSends)
+	}
+	ownedFrames, ownedBytes, freeFrames, _ := transport.frames.stats()
+	if ownedFrames < 0 || ownedBytes < 0 || freeFrames < 0 ||
+		freeFrames > ownedFrames || ownedFrames > transport.queueLimits.GlobalFrames ||
+		ownedBytes > transport.queueLimits.GlobalBytes {
+		t.Fatalf("cache invariant = owned %d/%d free %d", ownedFrames, ownedBytes, freeFrames)
+	}
 }

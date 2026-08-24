@@ -28,7 +28,7 @@ func FuzzDecodeInbound(f *testing.F) {
 	f.Add(wireBytes(nil, 14, []byte{0x80}))
 
 	f.Fuzz(func(t *testing.T, frame []byte) {
-		inbound, err := receiver.DecodeInbound(sender.LocalNode(), frame)
+		inbound, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame)
 		if err != nil {
 			return
 		}

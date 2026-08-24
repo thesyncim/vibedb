@@ -204,12 +204,16 @@ func (receiver *OrdinaryReceiver) Serve(
 	ctx context.Context,
 	connection PeerConnection,
 ) error {
-	if receiver == nil || ctx == nil || connection == nil ||
-		connection.PeerNode() == (NodeID{}) ||
-		connection.TrafficClass() != TrafficOrdinary {
+	if receiver == nil || ctx == nil || connection == nil {
 		if connection != nil {
 			_ = connection.Close()
 		}
+		return ErrInvalidTransport
+	}
+	identity := connection.PeerIdentity()
+	if !validPeerIdentity(identity) || identity.TrustDomain != receiver.registry.TrustDomain() ||
+		connection.TrafficClass() != TrafficOrdinary {
+		_ = connection.Close()
 		return ErrInvalidTransport
 	}
 	defer connection.Close()
@@ -252,9 +256,7 @@ func (receiver *OrdinaryReceiver) Serve(
 			}
 			return fmt.Errorf("%w: stream record body: %w", ErrInvalidFrame, err)
 		}
-		inbound, decodeErr := receiver.registry.DecodeInbound(
-			connection.PeerNode(), frame,
-		)
+		inbound, decodeErr := receiver.registry.DecodeInbound(identity, frame)
 		receiver.frames.put(ownedFrame)
 		if decodeErr != nil {
 			return decodeErr
@@ -272,6 +274,7 @@ type frameBufferPool struct {
 
 type pooledFrameBuffer struct {
 	bytes []byte
+	next  *pooledFrameBuffer
 }
 
 func (pool *frameBufferPool) get(size int) *pooledFrameBuffer {

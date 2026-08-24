@@ -2,7 +2,9 @@ package rafttransport
 
 import (
 	"context"
+	"errors"
 	"math"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +23,8 @@ const (
 	AbsoluteMaxReconnectDelay = time.Minute
 )
 
-// QueueLimits bounds owned encoded frames before any network wait. A frame
+// QueueLimits bounds owned encoded frames before any network wait. Byte limits
+// charge retained buffer capacity, including any size-class rounding. A frame
 // that cannot fit is rejected synchronously with ErrBackpressure.
 type QueueLimits struct {
 	PerPeerFrames int
@@ -62,6 +65,157 @@ type outboundFrame struct {
 	buffer *pooledFrameBuffer
 }
 
+type boundedFrameBufferCache struct {
+	mu sync.Mutex
+
+	maxFrames  int
+	maxBytes   int64
+	retain     int
+	free       [bits.UintSize]*pooledFrameBuffer
+	freeFrames int
+
+	ownedFrames int
+	ownedBytes  int64
+	closed      bool
+}
+
+func newBoundedFrameBufferCache(maxFrames int, maxBytes int64, retain int) boundedFrameBufferCache {
+	return boundedFrameBufferCache{
+		maxFrames: maxFrames,
+		maxBytes:  maxBytes,
+		retain:    retain,
+	}
+}
+
+// frameBufferCapacity rounds retained buffers into a fixed power-of-two class.
+// The final class is capped at retain when retain is not a power of two.
+func frameBufferCapacity(size, retain int) (capacity int, class int, cacheable bool) {
+	if size <= 0 || retain <= 0 {
+		return 0, 0, false
+	}
+	if size > retain {
+		return size, 0, false
+	}
+	class = bits.Len(uint(size - 1))
+	capacity = 1 << class
+	if capacity > retain {
+		capacity = retain
+	}
+	return capacity, class, true
+}
+
+func (cache *boundedFrameBufferCache) get(size int) (*pooledFrameBuffer, error) {
+	if cache == nil || size <= 0 || int64(size) > cache.maxBytes {
+		return nil, ErrInvalidTransport
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.closed {
+		return nil, ErrTransportClosed
+	}
+	capacity, class, cacheable := frameBufferCapacity(size, cache.retain)
+	if int64(capacity) > cache.maxBytes {
+		return nil, ErrBackpressure
+	}
+	if cacheable && cache.free[class] != nil {
+		buffer := cache.free[class]
+		cache.free[class] = buffer.next
+		buffer.next = nil
+		cache.freeFrames--
+		buffer.bytes = buffer.bytes[:size]
+		return buffer, nil
+	}
+	for cache.freeFrames != 0 &&
+		(cache.ownedFrames == cache.maxFrames ||
+			int64(capacity) > cache.maxBytes-cache.ownedBytes) {
+		cache.evictFree()
+	}
+	if cache.ownedFrames == cache.maxFrames ||
+		int64(capacity) > cache.maxBytes-cache.ownedBytes {
+		return nil, ErrBackpressure
+	}
+	buffer := &pooledFrameBuffer{bytes: make([]byte, size, capacity)}
+	cache.ownedFrames++
+	cache.ownedBytes += int64(capacity)
+	return buffer, nil
+}
+
+func (cache *boundedFrameBufferCache) evictFree() {
+	for class := len(cache.free) - 1; class >= 0; class-- {
+		buffer := cache.free[class]
+		if buffer == nil {
+			continue
+		}
+		cache.free[class] = buffer.next
+		buffer.next = nil
+		cache.freeFrames--
+		cache.ownedFrames--
+		cache.ownedBytes -= int64(cap(buffer.bytes))
+		buffer.bytes = nil
+		return
+	}
+}
+
+func (cache *boundedFrameBufferCache) put(buffer *pooledFrameBuffer) {
+	if cache == nil || buffer == nil {
+		return
+	}
+	capacity := cap(buffer.bytes)
+	cacheable := capacity <= cache.retain
+	if cacheable {
+		clear(buffer.bytes)
+		buffer.bytes = buffer.bytes[:0]
+	}
+	cache.mu.Lock()
+	if cache.closed || !cacheable {
+		cache.ownedFrames--
+		cache.ownedBytes -= int64(capacity)
+		buffer.bytes = nil
+		cache.mu.Unlock()
+		return
+	}
+	_, class, validClass := frameBufferCapacity(capacity, cache.retain)
+	if !validClass {
+		cache.ownedFrames--
+		cache.ownedBytes -= int64(capacity)
+		buffer.bytes = nil
+		cache.mu.Unlock()
+		return
+	}
+	buffer.next = cache.free[class]
+	cache.free[class] = buffer
+	cache.freeFrames++
+	cache.mu.Unlock()
+}
+
+func (cache *boundedFrameBufferCache) close() {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	cache.closed = true
+	for cache.freeFrames != 0 {
+		cache.evictFree()
+	}
+	cache.mu.Unlock()
+}
+
+func (cache *boundedFrameBufferCache) stats() (
+	ownedFrames int,
+	ownedBytes int64,
+	freeFrames int,
+	closed bool,
+) {
+	if cache == nil {
+		return 0, 0, 0, true
+	}
+	cache.mu.Lock()
+	ownedFrames, ownedBytes = cache.ownedFrames, cache.ownedBytes
+	freeFrames, closed = cache.freeFrames, cache.closed
+	cache.mu.Unlock()
+	return ownedFrames, ownedBytes, freeFrames, closed
+}
+
 type ordinaryPeer struct {
 	node NodeID
 
@@ -69,11 +223,15 @@ type ordinaryPeer struct {
 	head  int
 	count int
 	bytes int64
-	wake  chan struct{}
 
-	writeBuffer []byte
-	batchFrames []*pooledFrameBuffer
-	connection  PeerConnection
+	reservedFrames int
+	reservedBytes  int64
+	wake           chan struct{}
+
+	writeBuffer   []byte
+	batchFrames   []*pooledFrameBuffer
+	releaseFrames []*pooledFrameBuffer
+	connection    PeerConnection
 
 	dialAttempts  atomic.Uint64
 	dialFailures  atomic.Uint64
@@ -101,14 +259,21 @@ type OrdinaryTransport struct {
 	backoff       ReconnectBackoff
 	maxBackoff    time.Duration
 	writeDeadline DeadlineFunc
-	frames        frameBufferPool
+	frames        boundedFrameBufferCache
 
 	peers  []*ordinaryPeer
 	byNode map[NodeID]*ordinaryPeer
 
 	mu           sync.Mutex
+	reservations *sync.Cond
+	activeSends  int
 	globalFrames int
 	globalBytes  int64
+
+	// beforeEncode is a test-only scheduling seam. Production leaves it nil.
+	beforeEncode func()
+	// beforeFrameReturn is a test-only scheduling seam after queue unlock.
+	beforeFrameReturn func()
 
 	state  atomic.Uint32
 	ctx    context.Context
@@ -131,16 +296,20 @@ func NewOrdinaryTransport(options OrdinaryTransportOptions) (*OrdinaryTransport,
 		queueLimits: options.Queue, coalesce: options.Coalesce,
 		wait: options.Wait, backoff: options.Backoff,
 		maxBackoff: options.MaxReconnectDelay, writeDeadline: options.WriteDeadline,
-		frames: frameBufferPool{retain: retain},
+		frames: newBoundedFrameBufferCache(
+			options.Queue.GlobalFrames, options.Queue.GlobalBytes, retain,
+		),
 		peers:  make([]*ordinaryPeer, 0, len(options.Peers)),
 		byNode: make(map[NodeID]*ordinaryPeer, len(options.Peers)),
 		ctx:    ctx, cancel: cancel,
 	}
+	transport.reservations = sync.NewCond(&transport.mu)
 	for _, node := range options.Peers {
 		peer := &ordinaryPeer{
 			node: node, queue: make([]outboundFrame, options.Queue.PerPeerFrames),
-			wake:        make(chan struct{}, 1),
-			batchFrames: make([]*pooledFrameBuffer, options.Coalesce.MaxFrames),
+			wake:          make(chan struct{}, 1),
+			batchFrames:   make([]*pooledFrameBuffer, options.Coalesce.MaxFrames),
+			releaseFrames: make([]*pooledFrameBuffer, options.Coalesce.MaxFrames),
 		}
 		transport.peers = append(transport.peers, peer)
 		transport.byNode[node] = peer
@@ -152,13 +321,14 @@ func validateOrdinaryTransportOptions(options OrdinaryTransportOptions, retain i
 	peers := len(options.Peers)
 	queue := options.Queue
 	coalesce := options.Coalesce
+	minimumOwnedBytes, _, _ := frameBufferCapacity(FrameHeaderBytes, retain)
 	if options.Registry == nil || options.Dialer == nil || options.Wait == nil ||
 		options.Backoff == nil || options.WriteDeadline == nil ||
 		peers == 0 || peers > AbsoluteMaxTransportPeers ||
 		queue.PerPeerFrames <= 0 || queue.PerPeerFrames > AbsoluteMaxQueuedFrames ||
 		queue.GlobalFrames < queue.PerPeerFrames || queue.GlobalFrames > AbsoluteMaxQueuedFrames ||
 		int64(peers)*int64(queue.PerPeerFrames) > int64(queue.GlobalFrames) ||
-		queue.PerPeerBytes < FrameHeaderBytes || queue.PerPeerBytes > AbsoluteMaxQueuedBytes ||
+		queue.PerPeerBytes < int64(minimumOwnedBytes) || queue.PerPeerBytes > AbsoluteMaxQueuedBytes ||
 		queue.GlobalBytes < queue.PerPeerBytes || queue.GlobalBytes > AbsoluteMaxQueuedBytes ||
 		coalesce.MaxFrames <= 0 || coalesce.MaxFrames > queue.PerPeerFrames ||
 		coalesce.MaxFrames > AbsoluteMaxCoalescedFrames ||
@@ -215,7 +385,9 @@ func (transport *OrdinaryTransport) Run(parent context.Context) error {
 	}
 	workers.Wait()
 	transport.state.Store(transportClosed)
+	transport.waitForActiveSends()
 	transport.drainQueues()
+	transport.frames.close()
 	cause := context.Cause(transport.ctx)
 	if cause == nil {
 		return ErrTransportClosed
@@ -237,6 +409,7 @@ func (transport *OrdinaryTransport) Close() error {
 			}
 			transport.cancel(ErrTransportClosed)
 			transport.drainQueues()
+			transport.frames.close()
 			return nil
 		case transportRunning:
 			if !transport.state.CompareAndSwap(transportRunning, transportClosed) {
@@ -257,58 +430,147 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 		context.Cause(transport.ctx) != nil {
 		return ErrTransportClosed
 	}
-	measured := 0
-	if outbound.Message != nil {
-		if size, err := raftmember.MeasureOrdinaryMessage(outbound.Message); err == nil &&
-			size <= MaxFrameBytes-FrameHeaderBytes {
-			measured = FrameHeaderBytes + size
-		}
-	}
-	if measured < FrameHeaderBytes {
-		measured = FrameHeaderBytes
-	}
-	storage := transport.frames.get(measured)
-	frame, destination, err := transport.registry.EncodeOutbound(storage.bytes[:0], outbound)
+	plan, err := transport.registry.preflightOutbound(outbound)
 	if err != nil {
+		return err
+	}
+	wireBytes := plan.frameSize + StreamRecordHeaderBytes
+	if wireBytes > transport.coalesce.MaxBytes {
+		return ErrFrameTooLarge
+	}
+	ownedSize, _, _ := frameBufferCapacity(plan.frameSize, transport.frames.retain)
+	peer, err := transport.reserveOutbound(plan, ownedSize)
+	if err != nil {
+		return err
+	}
+	storage, err := transport.frames.get(plan.frameSize)
+	if err != nil {
+		transport.unwindReservation(peer, ownedSize)
+		if !errors.Is(err, ErrTransportClosed) && !errors.Is(err, ErrBackpressure) {
+			transport.cancel(err)
+		}
+		return err
+	}
+	if transport.beforeEncode != nil {
+		transport.beforeEncode()
+	}
+	frame, err := transport.registry.appendOutbound(storage.bytes[:0], outbound, plan)
+	if err != nil {
+		transport.unwindReservation(peer, ownedSize)
 		transport.frames.put(storage)
 		return err
 	}
-	peer := transport.byNode[destination]
-	if peer == nil {
+	storage.bytes = frame
+	if err := transport.publishReservation(peer, storage, plan.frameSize, ownedSize); err != nil {
 		transport.frames.put(storage)
-		return ErrNodeNotFound
+		return err
 	}
-	frameBytes := int64(len(frame))
-	wireBytes := len(frame) + StreamRecordHeaderBytes
-	if wireBytes > transport.coalesce.MaxBytes {
-		transport.frames.put(storage)
-		return ErrFrameTooLarge
-	}
+	peer.notify()
+	return nil
+}
 
+func (transport *OrdinaryTransport) reserveOutbound(
+	plan outboundFramePlan,
+	ownedSize int,
+) (*ordinaryPeer, error) {
+	peer := transport.byNode[plan.destination]
+	if peer == nil {
+		return nil, ErrNodeNotFound
+	}
+	frameBytes := int64(ownedSize)
 	transport.mu.Lock()
 	closed := transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil
 	if closed ||
-		peer.count >= len(peer.queue) ||
-		frameBytes > transport.queueLimits.PerPeerBytes-peer.bytes ||
+		peer.count+peer.reservedFrames >= len(peer.queue) ||
+		frameBytes > transport.queueLimits.PerPeerBytes-peer.bytes-peer.reservedBytes ||
 		transport.globalFrames >= transport.queueLimits.GlobalFrames ||
 		frameBytes > transport.queueLimits.GlobalBytes-transport.globalBytes {
 		transport.mu.Unlock()
-		transport.frames.put(storage)
 		if closed {
-			return ErrTransportClosed
+			return nil, ErrTransportClosed
 		}
-		return ErrBackpressure
+		return nil, ErrBackpressure
 	}
-	tail := (peer.head + peer.count) % len(peer.queue)
-	storage.bytes = frame
-	peer.queue[tail] = outboundFrame{buffer: storage}
-	peer.count++
-	peer.bytes += frameBytes
+	peer.reservedFrames++
+	peer.reservedBytes += frameBytes
+	transport.activeSends++
 	transport.globalFrames++
 	transport.globalBytes += frameBytes
 	transport.mu.Unlock()
-	peer.notify()
+	return peer, nil
+}
+
+func (transport *OrdinaryTransport) publishReservation(
+	peer *ordinaryPeer,
+	storage *pooledFrameBuffer,
+	frameSize int,
+	ownedSize int,
+) error {
+	if storage == nil || len(storage.bytes) != frameSize || cap(storage.bytes) != ownedSize {
+		transport.unwindReservation(peer, ownedSize)
+		transport.cancel(ErrInvalidTransport)
+		return ErrInvalidTransport
+	}
+	frameBytes := int64(ownedSize)
+	transport.mu.Lock()
+	if peer.reservedFrames <= 0 || peer.reservedBytes < frameBytes ||
+		transport.activeSends <= 0 {
+		transport.mu.Unlock()
+		transport.cancel(ErrInvalidTransport)
+		return ErrInvalidTransport
+	}
+	peer.reservedFrames--
+	peer.reservedBytes -= frameBytes
+	transport.activeSends--
+	if transport.activeSends == 0 {
+		transport.reservations.Broadcast()
+	}
+	if transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil {
+		if transport.globalFrames <= 0 || transport.globalBytes < frameBytes {
+			transport.mu.Unlock()
+			transport.cancel(ErrInvalidTransport)
+			return ErrInvalidTransport
+		}
+		transport.globalFrames--
+		transport.globalBytes -= frameBytes
+		transport.mu.Unlock()
+		return ErrTransportClosed
+	}
+	tail := (peer.head + peer.count) % len(peer.queue)
+	peer.queue[tail] = outboundFrame{buffer: storage}
+	peer.count++
+	peer.bytes += frameBytes
+	transport.mu.Unlock()
 	return nil
+}
+
+func (transport *OrdinaryTransport) unwindReservation(peer *ordinaryPeer, ownedSize int) {
+	frameBytes := int64(ownedSize)
+	transport.mu.Lock()
+	if peer.reservedFrames <= 0 || peer.reservedBytes < frameBytes ||
+		transport.activeSends <= 0 ||
+		transport.globalFrames <= 0 || transport.globalBytes < frameBytes {
+		transport.mu.Unlock()
+		transport.cancel(ErrInvalidTransport)
+		return
+	}
+	peer.reservedFrames--
+	peer.reservedBytes -= frameBytes
+	transport.activeSends--
+	transport.globalFrames--
+	transport.globalBytes -= frameBytes
+	if transport.activeSends == 0 {
+		transport.reservations.Broadcast()
+	}
+	transport.mu.Unlock()
+}
+
+func (transport *OrdinaryTransport) waitForActiveSends() {
+	transport.mu.Lock()
+	for transport.activeSends != 0 {
+		transport.reservations.Wait()
+	}
+	transport.mu.Unlock()
 }
 
 func (peer *ordinaryPeer) notify() {
@@ -355,7 +617,13 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			}
 			peer.dialAttempts.Add(1)
 			candidate, err := transport.dialer.DialOrdinary(transport.ctx, peer.node)
-			if err != nil || candidate == nil || candidate.PeerNode() != peer.node ||
+			identity := PeerIdentity{}
+			if candidate != nil {
+				identity = candidate.PeerIdentity()
+			}
+			if err != nil || candidate == nil || !validPeerIdentity(identity) ||
+				identity.Node != peer.node ||
+				identity.TrustDomain != transport.registry.TrustDomain() ||
 				candidate.TrafficClass() != TrafficOrdinary {
 				if candidate != nil {
 					_ = candidate.Close()
@@ -494,26 +762,33 @@ func (transport *OrdinaryTransport) releasePeerBatch(peer *ordinaryPeer) {
 
 func (transport *OrdinaryTransport) commitPeerBatch(peer *ordinaryPeer, frames int) {
 	transport.mu.Lock()
-	if frames > peer.count {
+	if frames > peer.count || frames > len(peer.releaseFrames) {
 		transport.mu.Unlock()
 		transport.cancel(ErrInvalidTransport)
 		return
 	}
 	var sentBytes uint64
-	for range frames {
+	for index := range frames {
 		frame := peer.queue[peer.head].buffer
 		peer.queue[peer.head] = outboundFrame{}
 		peer.head = (peer.head + 1) % len(peer.queue)
 		peer.count--
-		frameBytes := int64(len(frame.bytes))
+		frameBytes := int64(cap(frame.bytes))
 		peer.bytes -= frameBytes
 		transport.globalFrames--
 		transport.globalBytes -= frameBytes
 		sentBytes += uint64(len(frame.bytes))
-		transport.frames.put(frame)
+		peer.releaseFrames[index] = frame
 	}
 	remaining := peer.count != 0
 	transport.mu.Unlock()
+	if transport.beforeFrameReturn != nil {
+		transport.beforeFrameReturn()
+	}
+	for index := range frames {
+		transport.frames.put(peer.releaseFrames[index])
+		peer.releaseFrames[index] = nil
+	}
 	peer.sentFrames.Add(uint64(frames))
 	peer.sentBytes.Add(sentBytes)
 	if remaining {
@@ -538,7 +813,9 @@ func (transport *OrdinaryTransport) clearConnection(peer *ordinaryPeer) {
 
 func (transport *OrdinaryTransport) drainQueues() {
 	var connections []PeerConnection
+	var buffers []*pooledFrameBuffer
 	transport.mu.Lock()
+	buffers = make([]*pooledFrameBuffer, 0, transport.globalFrames)
 	for _, peer := range transport.peers {
 		if peer.connection != nil {
 			connections = append(connections, peer.connection)
@@ -549,31 +826,38 @@ func (transport *OrdinaryTransport) drainQueues() {
 			peer.queue[peer.head] = outboundFrame{}
 			peer.head = (peer.head + 1) % len(peer.queue)
 			peer.count--
-			transport.frames.put(frame)
+			frameBytes := int64(cap(frame.bytes))
+			peer.bytes -= frameBytes
+			transport.globalFrames--
+			transport.globalBytes -= frameBytes
+			buffers = append(buffers, frame)
 		}
-		peer.bytes = 0
 		clear(peer.writeBuffer)
 		peer.writeBuffer = nil
 	}
-	transport.globalFrames = 0
-	transport.globalBytes = 0
 	transport.mu.Unlock()
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	for _, buffer := range buffers {
+		transport.frames.put(buffer)
+	}
 }
 
-// PeerStats is a point-in-time transport snapshot. SentBytes excludes stream
-// record headers.
+// PeerStats is a point-in-time transport snapshot. Queue byte fields charge
+// buffer capacity. SentFrames and SentBytes count successful local writes, not
+// receiver acknowledgement. SentBytes excludes stream record headers.
 type PeerStats struct {
-	QueuedFrames  int
-	QueuedBytes   int64
-	DialAttempts  uint64
-	DialFailures  uint64
-	WriteFailures uint64
-	Connections   uint64
-	SentFrames    uint64
-	SentBytes     uint64
+	QueuedFrames   int
+	QueuedBytes    int64
+	ReservedFrames int
+	ReservedBytes  int64
+	DialAttempts   uint64
+	DialFailures   uint64
+	WriteFailures  uint64
+	Connections    uint64
+	SentFrames     uint64
+	SentBytes      uint64
 }
 
 // Stats reports one configured peer without allocating.
@@ -587,16 +871,18 @@ func (transport *OrdinaryTransport) Stats(node NodeID) (PeerStats, error) {
 	}
 	transport.mu.Lock()
 	queuedFrames, queuedBytes := peer.count, peer.bytes
+	reservedFrames, reservedBytes := peer.reservedFrames, peer.reservedBytes
 	transport.mu.Unlock()
 	return PeerStats{
 		QueuedFrames: queuedFrames, QueuedBytes: queuedBytes,
+		ReservedFrames: reservedFrames, ReservedBytes: reservedBytes,
 		DialAttempts: peer.dialAttempts.Load(), DialFailures: peer.dialFailures.Load(),
 		WriteFailures: peer.writeFailures.Load(), Connections: peer.connections.Load(),
 		SentFrames: peer.sentFrames.Load(), SentBytes: peer.sentBytes.Load(),
 	}, nil
 }
 
-// GlobalQueueStats reports the exact current owned queue budget.
+// GlobalQueueStats reports the exact current queued and reserved frame budget.
 func (transport *OrdinaryTransport) GlobalQueueStats() (frames int, bytes int64) {
 	if transport == nil {
 		return 0, 0

@@ -3,6 +3,9 @@ package rafttransport
 import (
 	"context"
 	"io"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -33,6 +36,14 @@ func TestEncodeOutboundAndPreflightAllocateNothingWithCallerBuffer(t *testing.T)
 		}
 	}); got != 0 {
 		t.Fatalf("EncodeOutbound allocations = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		plan, preflightErr := sender.preflightOutbound(outbound)
+		if preflightErr != nil || plan.destination == (NodeID{}) || plan.frameSize == 0 {
+			panic(preflightErr)
+		}
+	}); got != 0 {
+		t.Fatalf("outbound preflight allocations = %v, want 0", got)
 	}
 	if got := testing.AllocsPerRun(1000, func() {
 		if preflightErr := preflightOrdinaryPayload(payload); preflightErr != nil {
@@ -107,6 +118,127 @@ func BenchmarkOrdinaryTransportWarmSendQueueRoundTrip(b *testing.B) {
 	}
 }
 
+func BenchmarkOrdinaryTransportFrameReturnWithConcurrentStats(b *testing.B) {
+	fixture := newTransportTestFixture(b)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		b.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	peer := transport.byNode[fixture.remote[0].Node]
+	outbound := fixture.outbound(0, 1)
+	if err := transport.Send(outbound); err != nil {
+		b.Fatal(err)
+	}
+	transport.commitPeerBatch(peer, 1)
+
+	var stop atomic.Bool
+	var readers sync.WaitGroup
+	for range max(1, runtime.GOMAXPROCS(0)-1) {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for !stop.Load() {
+				_, _ = transport.Stats(peer.node)
+				transport.GlobalQueueStats()
+			}
+		}()
+	}
+	b.Cleanup(func() {
+		stop.Store(true)
+		readers.Wait()
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := transport.Send(outbound); err != nil {
+			b.Fatal(err)
+		}
+		transport.commitPeerBatch(peer, 1)
+	}
+	b.StopTimer()
+	stop.Store(true)
+	readers.Wait()
+}
+
+func BenchmarkBoundedFrameBufferCacheParallelHeartbeat(b *testing.B) {
+	workers := max(1, runtime.GOMAXPROCS(0))
+	const size = FrameHeaderBytes + 19
+	capacity, _, _ := frameBufferCapacity(size, DefaultRetainedFrameBytes)
+	cache := newBoundedFrameBufferCache(
+		workers, int64(workers*capacity), DefaultRetainedFrameBytes,
+	)
+	buffers := make([]*pooledFrameBuffer, workers)
+	for index := range buffers {
+		buffer, err := cache.get(size)
+		if err != nil {
+			b.Fatal(err)
+		}
+		buffers[index] = buffer
+	}
+	for _, buffer := range buffers {
+		cache.put(buffer)
+	}
+	b.ReportAllocs()
+	b.SetBytes(size)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			buffer, err := cache.get(size)
+			if err != nil {
+				b.Fatal(err)
+			}
+			buffer.bytes[len(buffer.bytes)-1] = 1
+			cache.put(buffer)
+		}
+	})
+}
+
+func BenchmarkBoundedFrameBufferCacheParallelMixed64KiBHeartbeat(b *testing.B) {
+	workers := max(1, runtime.GOMAXPROCS(0))
+	const heartbeat = FrameHeaderBytes + 19
+	heartbeatCapacity, _, _ := frameBufferCapacity(heartbeat, DefaultRetainedFrameBytes)
+	cache := newBoundedFrameBufferCache(
+		workers*2,
+		int64(workers*(DefaultRetainedFrameBytes+heartbeatCapacity)),
+		DefaultRetainedFrameBytes,
+	)
+	buffers := make([]*pooledFrameBuffer, workers*2)
+	for index := range buffers {
+		size := heartbeat
+		if index%2 == 0 {
+			size = DefaultRetainedFrameBytes
+		}
+		buffer, err := cache.get(size)
+		if err != nil {
+			b.Fatal(err)
+		}
+		buffers[index] = buffer
+	}
+	for _, buffer := range buffers {
+		cache.put(buffer)
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		ordinal := 0
+		for pb.Next() {
+			size := heartbeat
+			if ordinal&15 == 0 {
+				size = DefaultRetainedFrameBytes
+			}
+			buffer, err := cache.get(size)
+			if err != nil {
+				b.Fatal(err)
+			}
+			buffer.bytes[len(buffer.bytes)-1] = 1
+			cache.put(buffer)
+			ordinal++
+		}
+	})
+}
+
 func BenchmarkStaticRegistryDecodeInboundCanonical(b *testing.B) {
 	group := testGroup(92)
 	sender, receiver, from, to := frameTestRegistries(b, 3, group)
@@ -122,7 +254,7 @@ func BenchmarkStaticRegistryDecodeInboundCanonical(b *testing.B) {
 	b.SetBytes(int64(len(frame)))
 	b.ResetTimer()
 	for b.Loop() {
-		allocationInboundSink, err = receiver.DecodeInbound(sender.LocalNode(), frame)
+		allocationInboundSink, err = receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame)
 		if err != nil {
 			b.Fatal(err)
 		}

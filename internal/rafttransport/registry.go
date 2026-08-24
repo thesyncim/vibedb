@@ -91,6 +91,7 @@ type nodeKey struct {
 // serving authority.
 type StaticRegistry struct {
 	local        NodeID
+	trustDomain  TrustDomain
 	nodes        map[memberKey]memberRecord
 	members      map[nodeKey]uint64
 	localMembers map[raftmember.GroupKey]uint64
@@ -105,6 +106,9 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 	maxMembers, err := validateLimits(limits)
 	if err != nil {
 		return nil, err
+	}
+	if len(members) == 0 {
+		return nil, ErrInvalidGroup
 	}
 	if len(members) > limits.MaxMembers || len(members) > maxMembers {
 		return nil, fmt.Errorf("%w: members %d exceed %d", ErrRegistryBound, len(members), limits.MaxMembers)
@@ -130,6 +134,15 @@ func NewStaticRegistry(local NodeID, members []Member, limits Limits) (*StaticRe
 		member := members[i]
 		if err := validateMember(member); err != nil {
 			return nil, fmt.Errorf("member %d: %w", i, err)
+		}
+		memberDomain := TrustDomain{
+			ClusterID:          member.Group.ClusterID,
+			ClusterIncarnation: member.Group.ClusterIncarnation,
+		}
+		if i == 0 {
+			registry.trustDomain = memberDomain
+		} else if memberDomain != registry.trustDomain {
+			return nil, fmt.Errorf("member %d: %w: mixed trust domain", i, ErrInvalidGroup)
 		}
 
 		memberKey := memberKey{group: member.Group, memberID: member.MemberID}
@@ -228,6 +241,15 @@ func (registry *StaticRegistry) LocalNode() NodeID {
 		return NodeID{}
 	}
 	return registry.local
+}
+
+// TrustDomain returns the single cluster identity bound to every group in the
+// immutable registry.
+func (registry *StaticRegistry) TrustDomain() TrustDomain {
+	if registry == nil {
+		return TrustDomain{}
+	}
+	return registry.trustDomain
 }
 
 // LocalMember returns the sole local member ID for group.

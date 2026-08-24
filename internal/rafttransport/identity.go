@@ -1,7 +1,9 @@
 package rafttransport
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -161,9 +163,10 @@ func ParsePeerIdentity(
 
 // PeerTLSOptions owns the trust and local credential inputs for one peer TLS
 // foundation. Roots and certificate DER are copied by NewPeerTLS. PrivateKey
-// must remain immutable for the returned object's lifetime. IdentityOID must
-// belong to the operator. Now is required so certificate-time verification is
-// explicit even though DNS-name verification is deliberately disabled.
+// must be a crypto.Signer whose public key matches the leaf, and it must remain
+// immutable for the returned object's lifetime. IdentityOID must belong to the
+// operator. Now is required so certificate-time verification is explicit even
+// though DNS-name verification is deliberately disabled.
 type PeerTLSOptions struct {
 	IdentityOID asn1.ObjectIdentifier
 	Identity    PeerIdentity
@@ -173,7 +176,7 @@ type PeerTLSOptions struct {
 }
 
 // PeerTLS constructs mutually authenticated TLS configurations and derives the
-// peer NodeID after a completed handshake.
+// complete peer identity after a completed handshake.
 type PeerTLS struct {
 	identityOID asn1.ObjectIdentifier
 	identity    PeerIdentity
@@ -199,9 +202,11 @@ func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 	if err != nil || identity != options.Identity {
 		return nil, errors.Join(ErrInvalidPeerIdentity, err)
 	}
-	if !hasExplicitExtendedKeyUsage(chain[0], x509.ExtKeyUsageClientAuth) ||
-		!hasExplicitExtendedKeyUsage(chain[0], x509.ExtKeyUsageServerAuth) {
-		return nil, fmt.Errorf("%w: local leaf must allow client and server authentication", ErrInvalidPeerIdentity)
+	if !validPeerLeaf(chain[0]) {
+		return nil, fmt.Errorf("%w: local leaf profile", ErrInvalidPeerIdentity)
+	}
+	if err := validatePeerTLS13Signer(certificate, chain[0]); err != nil {
+		return nil, err
 	}
 	peerTLS := &PeerTLS{
 		identityOID: slices.Clone(options.IdentityOID),
@@ -216,6 +221,41 @@ func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 		}
 	}
 	return peerTLS, nil
+}
+
+var peerTLS13SignatureSchemes = []tls.SignatureScheme{
+	tls.Ed25519,
+	tls.ECDSAWithP256AndSHA256,
+	tls.ECDSAWithP384AndSHA384,
+	tls.ECDSAWithP521AndSHA512,
+	tls.PSSWithSHA256,
+	tls.PSSWithSHA384,
+	tls.PSSWithSHA512,
+}
+
+// validatePeerTLS13Signer rejects an unusable local credential before any
+// listener or dialer can publish it. The public-key comparison is independent
+// of the concrete private-key type, so hardware-backed crypto.Signer values
+// remain supported.
+func validatePeerTLS13Signer(certificate tls.Certificate, leaf *x509.Certificate) error {
+	signer, ok := certificate.PrivateKey.(crypto.Signer)
+	if !ok || signer.Public() == nil || leaf == nil {
+		return fmt.Errorf("%w: local private key is not a signer", ErrInvalidPeerIdentity)
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil || !bytes.Equal(publicDER, leaf.RawSubjectPublicKeyInfo) {
+		return fmt.Errorf("%w: local private key differs from leaf", ErrInvalidPeerIdentity)
+	}
+	candidate := certificate
+	candidate.Leaf = leaf
+	hello := tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		SignatureSchemes:  peerTLS13SignatureSchemes,
+	}
+	if err := hello.SupportsCertificate(&candidate); err != nil {
+		return fmt.Errorf("%w: local private key cannot sign TLS 1.3: %v", ErrInvalidPeerIdentity, err)
+	}
+	return nil
 }
 
 func cloneTLSCertificate(source tls.Certificate) tls.Certificate {
@@ -272,6 +312,13 @@ func hasExplicitExtendedKeyUsage(certificate *x509.Certificate, usage x509.ExtKe
 	return false
 }
 
+func validPeerLeaf(certificate *x509.Certificate) bool {
+	return certificate != nil && !certificate.IsCA &&
+		certificate.KeyUsage&x509.KeyUsageDigitalSignature != 0 &&
+		hasExplicitExtendedKeyUsage(certificate, x509.ExtKeyUsageClientAuth) &&
+		hasExplicitExtendedKeyUsage(certificate, x509.ExtKeyUsageServerAuth)
+}
+
 func handledPeerIdentityLeaf(
 	source *x509.Certificate,
 	oid asn1.ObjectIdentifier,
@@ -304,9 +351,8 @@ func (peerTLS *PeerTLS) verifyCertificateChain(
 	if err != nil {
 		return PeerIdentity{}, errors.Join(ErrPeerAuthentication, err)
 	}
-	if !hasExplicitExtendedKeyUsage(chain[0], x509.ExtKeyUsageClientAuth) ||
-		!hasExplicitExtendedKeyUsage(chain[0], x509.ExtKeyUsageServerAuth) {
-		return PeerIdentity{}, fmt.Errorf("%w: peer leaf lacks client or server extended key usage", ErrPeerAuthentication)
+	if !validPeerLeaf(chain[0]) {
+		return PeerIdentity{}, fmt.Errorf("%w: peer leaf profile", ErrPeerAuthentication)
 	}
 	intermediates := x509.NewCertPool()
 	for _, certificate := range chain[1:] {
@@ -316,9 +362,11 @@ func (peerTLS *PeerTLS) verifyCertificateChain(
 		Roots: peerTLS.roots, Intermediates: intermediates,
 		KeyUsages: []x509.ExtKeyUsage{usage},
 	}
-	if peerTLS.now != nil {
-		verifyOptions.CurrentTime = peerTLS.now()
+	now := peerTLS.now()
+	if now.IsZero() {
+		return PeerIdentity{}, fmt.Errorf("%w: zero certificate time", ErrPeerAuthentication)
 	}
+	verifyOptions.CurrentTime = now
 	if _, err := handledPeerIdentityLeaf(chain[0], peerTLS.identityOID).Verify(verifyOptions); err != nil {
 		return PeerIdentity{}, errors.Join(ErrPeerAuthentication, err)
 	}
@@ -376,8 +424,8 @@ func (peerTLS *PeerTLS) ClientConfig(expected NodeID, class TrafficClass) (*tls.
 
 // ServerConfig returns a detached TLS 1.3 configuration that requires and
 // verifies one client certificate under the exact trust domain and traffic
-// class. StaticRegistry frame admission later binds that NodeID to each source
-// member.
+// class. StaticRegistry frame admission later binds that complete identity to
+// each source member and frame group.
 func (peerTLS *PeerTLS) ServerConfig(class TrafficClass) (*tls.Config, error) {
 	protocol, err := class.alpn()
 	if peerTLS == nil || err != nil {
@@ -406,21 +454,21 @@ type DeadlineFunc func() time.Time
 // Tests can implement this interface with bounded in-memory connections.
 type PeerConnection interface {
 	net.Conn
-	PeerNode() NodeID
+	PeerIdentity() PeerIdentity
 	TrafficClass() TrafficClass
 }
 
 type authenticatedPeerConnection struct {
 	net.Conn
-	node  NodeID
-	class TrafficClass
+	identity PeerIdentity
+	class    TrafficClass
 }
 
-func (connection *authenticatedPeerConnection) PeerNode() NodeID {
+func (connection *authenticatedPeerConnection) PeerIdentity() PeerIdentity {
 	if connection == nil {
-		return NodeID{}
+		return PeerIdentity{}
 	}
-	return connection.node
+	return connection.identity
 }
 
 func (connection *authenticatedPeerConnection) TrafficClass() TrafficClass {
@@ -456,7 +504,7 @@ func (peerTLS *PeerTLS) Client(
 }
 
 // Server authenticates an owned raw connection as one peer in the local trust
-// domain. Static frame admission decides whether that node can send a given
+// domain. Static frame admission decides whether that identity can send a given
 // group member's traffic.
 func (peerTLS *PeerTLS) Server(
 	ctx context.Context,
@@ -527,6 +575,6 @@ func (peerTLS *PeerTLS) handshake(
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
 	return &authenticatedPeerConnection{
-		Conn: connection, node: identity.Node, class: class,
+		Conn: connection, identity: identity, class: class,
 	}, nil
 }

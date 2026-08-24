@@ -2,6 +2,7 @@ package rafttransport
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -20,6 +21,13 @@ var peerTLSTestNow = time.Date(2031, 4, 5, 6, 7, 8, 0, time.UTC)
 
 // PEN 32473 is reserved for examples and documentation.
 var peerTLSTestIdentityOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1}
+
+// peerTLSTestExternalSigner exercises the crypto.Signer contract used by
+// hardware-backed and process-external private keys without exposing a
+// concrete key type to PeerTLS.
+type peerTLSTestExternalSigner struct {
+	crypto.Signer
+}
 
 type peerTLSTestAuthority struct {
 	certificate *x509.Certificate
@@ -90,6 +98,22 @@ func (authority *peerTLSTestAuthority) issueWithProfile(
 	usages []x509.ExtKeyUsage,
 	extraExtensions ...pkix.Extension,
 ) tls.Certificate {
+	return authority.issueWithLeafProfile(
+		t, identity, oid, notBefore, notAfter,
+		x509.KeyUsageDigitalSignature, false, usages, extraExtensions...,
+	)
+}
+
+func (authority *peerTLSTestAuthority) issueWithLeafProfile(
+	t testing.TB,
+	identity PeerIdentity,
+	oid asn1.ObjectIdentifier,
+	notBefore, notAfter time.Time,
+	keyUsage x509.KeyUsage,
+	isCA bool,
+	usages []x509.ExtKeyUsage,
+	extraExtensions ...pkix.Extension,
+) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -102,14 +126,16 @@ func (authority *peerTLSTestAuthority) issueWithProfile(
 	extension.Id = append(asn1.ObjectIdentifier(nil), oid...)
 	authority.serial++
 	template := &x509.Certificate{
-		SerialNumber:    big.NewInt(authority.serial),
-		Subject:         pkix.Name{CommonName: "must-not-be-a-node-identity"},
-		DNSNames:        []string{"must-not-be-a-node-identity.invalid"},
-		NotBefore:       notBefore,
-		NotAfter:        notAfter,
-		KeyUsage:        x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:     append([]x509.ExtKeyUsage(nil), usages...),
-		ExtraExtensions: append([]pkix.Extension{extension}, extraExtensions...),
+		SerialNumber:          big.NewInt(authority.serial),
+		Subject:               pkix.Name{CommonName: "must-not-be-a-node-identity"},
+		DNSNames:              []string{"must-not-be-a-node-identity.invalid"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              keyUsage,
+		ExtKeyUsage:           append([]x509.ExtKeyUsage(nil), usages...),
+		ExtraExtensions:       append([]pkix.Extension{extension}, extraExtensions...),
+		IsCA:                  isCA,
+		BasicConstraintsValid: isCA,
 	}
 	encoded, err := x509.CreateCertificate(
 		rand.Reader, template, authority.certificate, &key.PublicKey, authority.key,
@@ -153,6 +179,19 @@ func newPeerTLSTestProfile(
 		t.Fatalf("NewPeerTLS: %v", err)
 	}
 	return profile
+}
+
+func uncheckedPeerTLSTestProfile(
+	authority *peerTLSTestAuthority,
+	identity PeerIdentity,
+	certificate tls.Certificate,
+	now func() time.Time,
+) *PeerTLS {
+	return &PeerTLS{
+		identityOID: append(asn1.ObjectIdentifier(nil), peerTLSTestIdentityOID...),
+		identity:    identity, certificate: cloneTLSCertificate(certificate),
+		roots: authority.roots.Clone(), now: now,
+	}
 }
 
 func TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed(t *testing.T) {
@@ -318,10 +357,10 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 	}
 	defer client.Close()
 	defer server.Close()
-	if client.PeerNode() != serverIdentity.Node || server.PeerNode() != clientIdentity.Node ||
+	if client.PeerIdentity() != serverIdentity || server.PeerIdentity() != clientIdentity ||
 		client.TrafficClass() != TrafficOrdinary || server.TrafficClass() != TrafficOrdinary {
-		t.Fatalf("derived peers = client %x/%d server %x/%d",
-			client.PeerNode(), client.TrafficClass(), server.PeerNode(), server.TrafficClass())
+		t.Fatalf("derived peers = client %+v/%d server %+v/%d",
+			client.PeerIdentity(), client.TrafficClass(), server.PeerIdentity(), server.TrafficClass())
 	}
 }
 
@@ -380,6 +419,108 @@ func TestPeerTLSRechecksCertificateTimeAtHandshake(t *testing.T) {
 	if !errors.Is(clientErr, ErrPeerAuthentication) &&
 		!errors.Is(serverErr, ErrPeerAuthentication) {
 		t.Fatalf("expired handshake errors = client %v, server %v", clientErr, serverErr)
+	}
+}
+
+func TestPeerTLSRejectsZeroExplicitClockWithoutWallClockFallback(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 41)
+	clientIdentity := peerTLSTestIdentity(42, 21)
+	serverIdentity := peerTLSTestIdentity(42, 41)
+	certificate := authority.issue(
+		t, clientIdentity, peerTLSTestNow.Add(-time.Hour), peerTLSTestNow.Add(time.Hour),
+	)
+	if _, err := NewPeerTLS(PeerTLSOptions{
+		IdentityOID: peerTLSTestIdentityOID,
+		Identity:    clientIdentity, Certificate: certificate, Roots: authority.roots,
+		Now: func() time.Time { return time.Time{} },
+	}); !errors.Is(err, ErrPeerAuthentication) {
+		t.Fatalf("zero construction clock error = %v, want ErrPeerAuthentication", err)
+	}
+
+	current := peerTLSTestNow
+	newProfile := func(identity PeerIdentity) *PeerTLS {
+		profile, err := NewPeerTLS(PeerTLSOptions{
+			IdentityOID: peerTLSTestIdentityOID,
+			Identity:    identity,
+			Certificate: authority.issue(
+				t, identity, peerTLSTestNow.Add(-time.Hour), peerTLSTestNow.Add(time.Hour),
+			),
+			Roots: authority.roots, Now: func() time.Time { return current },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return profile
+	}
+	clientTLS := newProfile(clientIdentity)
+	serverTLS := newProfile(serverIdentity)
+	current = time.Time{}
+	client, server, clientErr, serverErr := peerTLSTestHandshake(
+		t, clientTLS, serverTLS, serverIdentity.Node,
+		TrafficOrdinary, TrafficOrdinary,
+	)
+	if client != nil {
+		_ = client.Close()
+	}
+	if server != nil {
+		_ = server.Close()
+	}
+	if !errors.Is(clientErr, ErrPeerAuthentication) &&
+		!errors.Is(serverErr, ErrPeerAuthentication) {
+		t.Fatalf("zero handshake clock errors = client %v, server %v", clientErr, serverErr)
+	}
+}
+
+func TestPeerTLSRejectsCAAndNonSigningEndpointLeaves(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 43)
+	clientIdentity := peerTLSTestIdentity(44, 21)
+	serverIdentity := peerTLSTestIdentity(44, 41)
+	validClient := newPeerTLSTestProfile(t, authority, clientIdentity)
+	usages := []x509.ExtKeyUsage{
+		x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth,
+	}
+	tests := []struct {
+		name     string
+		keyUsage x509.KeyUsage
+		isCA     bool
+	}{
+		{name: "CA endpoint", keyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, isCA: true},
+		{name: "no digital signature", keyUsage: x509.KeyUsageKeyEncipherment},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			certificate := authority.issueWithLeafProfile(
+				t, serverIdentity, peerTLSTestIdentityOID,
+				peerTLSTestNow.Add(-time.Hour), peerTLSTestNow.Add(time.Hour),
+				test.keyUsage, test.isCA, usages,
+			)
+			if _, err := NewPeerTLS(PeerTLSOptions{
+				IdentityOID: peerTLSTestIdentityOID,
+				Identity:    serverIdentity, Certificate: certificate, Roots: authority.roots,
+				Now: func() time.Time { return peerTLSTestNow },
+			}); !errors.Is(err, ErrInvalidPeerIdentity) {
+				t.Fatalf("local profile error = %v, want ErrInvalidPeerIdentity", err)
+			}
+
+			unchecked := uncheckedPeerTLSTestProfile(
+				authority, serverIdentity, certificate,
+				func() time.Time { return peerTLSTestNow },
+			)
+			client, server, clientErr, serverErr := peerTLSTestHandshake(
+				t, validClient, unchecked, serverIdentity.Node,
+				TrafficOrdinary, TrafficOrdinary,
+			)
+			if client != nil {
+				_ = client.Close()
+			}
+			if server != nil {
+				_ = server.Close()
+			}
+			if !errors.Is(clientErr, ErrPeerAuthentication) &&
+				!errors.Is(serverErr, ErrPeerAuthentication) {
+				t.Fatalf("remote leaf errors = client %v, server %v", clientErr, serverErr)
+			}
+		})
 	}
 }
 
@@ -531,6 +672,45 @@ func TestPeerTLSRejectsExpiredLocalCertificateAndSubjectOnlyIdentity(t *testing.
 		Roots: authority.roots, Now: func() time.Time { return peerTLSTestNow },
 	}); !errors.Is(err, ErrInvalidPeerIdentity) {
 		t.Fatalf("subject-only identity error = %v", err)
+	}
+}
+
+func TestPeerTLSValidatesLocalSignerBeforeHandshake(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 33)
+	identity := peerTLSTestIdentity(34, 72)
+	certificate := authority.issue(
+		t, identity, peerTLSTestNow.Add(-time.Hour), peerTLSTestNow.Add(time.Hour),
+	)
+	options := PeerTLSOptions{
+		IdentityOID: peerTLSTestIdentityOID,
+		Identity:    identity,
+		Certificate: certificate,
+		Roots:       authority.roots,
+		Now:         func() time.Time { return peerTLSTestNow },
+	}
+
+	wrapped := options
+	wrapped.Certificate.PrivateKey = peerTLSTestExternalSigner{
+		Signer: certificate.PrivateKey.(crypto.Signer),
+	}
+	if _, err := NewPeerTLS(wrapped); err != nil {
+		t.Fatalf("external crypto.Signer rejected: %v", err)
+	}
+
+	nonSigner := options
+	nonSigner.Certificate.PrivateKey = struct{}{}
+	if _, err := NewPeerTLS(nonSigner); !errors.Is(err, ErrInvalidPeerIdentity) {
+		t.Fatalf("non-signer error = %v", err)
+	}
+
+	wrongKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatch := options
+	mismatch.Certificate.PrivateKey = wrongKey
+	if _, err := NewPeerTLS(mismatch); !errors.Is(err, ErrInvalidPeerIdentity) {
+		t.Fatalf("mismatched signer error = %v", err)
 	}
 }
 

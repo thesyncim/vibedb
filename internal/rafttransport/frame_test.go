@@ -68,7 +68,7 @@ func TestFrameCanonicalRoundTripRF2RF3(t *testing.T) {
 					t.Fatalf("encoding is not deterministic")
 				}
 
-				inbound, err := receiver.DecodeInbound(sender.LocalNode(), frame)
+				inbound, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame)
 				if err != nil {
 					t.Fatalf("DecodeInbound: %v", err)
 				}
@@ -99,6 +99,28 @@ func TestFrameGoldenHeartbeat(t *testing.T) {
 	const golden = "5644524600010100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000e189d5c58d02f5c295e58fc50c9e72272a3ed5fe4b6c03628814a0f57b73d63f000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
 	if got := hex.EncodeToString(frame); got != golden {
 		t.Fatalf("golden frame changed:\n got %s\nwant %s", got, golden)
+	}
+}
+
+func TestFrameRejectsCrossDomainPeerAndOutboundGroup(t *testing.T) {
+	group := testGroup(73)
+	sender, receiver, from, to := frameTestRegistries(t, 2, group)
+	outbound := raftmember.OutboundMessage{
+		Group: group, From: from, To: to,
+		Message: frameTestMessage(pb.MsgHeartbeat, from, to),
+	}
+	frame, _, err := sender.EncodeOutbound(nil, outbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testPeerIdentity(receiver, sender.LocalNode())
+	identity.TrustDomain.ClusterID[0]++
+	if _, err := receiver.DecodeInbound(identity, frame); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-domain peer error = %v, want ErrUnauthorized", err)
+	}
+	outbound.Group.ClusterIncarnation[0]++
+	if _, _, err := sender.EncodeOutbound(nil, outbound); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-domain outbound error = %v, want ErrUnauthorized", err)
 	}
 }
 
@@ -228,7 +250,9 @@ func TestStaticRoleTrafficMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatalf("EncodeOutbound: %v", err)
 			}
-			if _, err := registries[test.to].DecodeInbound(testNode(byte(test.from-10)), frame); err != nil {
+			if _, err := registries[test.to].DecodeInbound(
+				testPeerIdentity(registries[test.to], testNode(byte(test.from-10))), frame,
+			); err != nil {
 				t.Fatalf("DecodeInbound: %v", err)
 			}
 		})
@@ -307,7 +331,7 @@ func TestDecodeInboundRejectsChangedStaticRoster(t *testing.T) {
 			if err != nil {
 				t.Fatalf("changed registry: %v", err)
 			}
-			if _, err := changed.DecodeInbound(sender.LocalNode(), frame); !errors.Is(err, ErrUnauthorized) {
+			if _, err := changed.DecodeInbound(testPeerIdentity(changed, sender.LocalNode()), frame); !errors.Is(err, ErrUnauthorized) {
 				t.Fatalf("error = %v, want ErrUnauthorized", err)
 			}
 		})
@@ -359,7 +383,7 @@ func TestEncodeOutboundRelocatesBeforePartialCapacityCanOverwriteMessage(t *test
 	if len(frame) <= cap(backing) || &frame[0] == &backing[0] {
 		t.Fatal("partial-capacity encode did not relocate complete frame")
 	}
-	inbound, err := receiver.DecodeInbound(sender.LocalNode(), frame)
+	inbound, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame)
 	if err != nil {
 		t.Fatalf("DecodeInbound: %v", err)
 	}
@@ -374,12 +398,12 @@ func TestDecodeInboundRejectsForgedPeerGroupAndMember(t *testing.T) {
 	frame := frameTestEncode(t, sender, group, frameTestMessage(pb.MsgHeartbeat, from, to))
 
 	t.Run("authenticated node", func(t *testing.T) {
-		if _, err := receiver.DecodeInbound(testNode(2), frame); !errors.Is(err, ErrUnauthorized) {
+		if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, testNode(2)), frame); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("error = %v, want ErrUnauthorized", err)
 		}
 	})
 	t.Run("missing authenticated node", func(t *testing.T) {
-		if _, err := receiver.DecodeInbound(NodeID{}, frame); !errors.Is(err, ErrUnauthorized) {
+		if _, err := receiver.DecodeInbound(PeerIdentity{}, frame); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("error = %v, want ErrUnauthorized", err)
 		}
 	})
@@ -398,7 +422,7 @@ func TestDecodeInboundRejectsForgedPeerGroupAndMember(t *testing.T) {
 		t.Run(coordinate.name, func(t *testing.T) {
 			forged := bytes.Clone(frame)
 			forged[coordinate.start] ^= 0x80
-			if _, err := receiver.DecodeInbound(sender.LocalNode(), forged); !errors.Is(err, ErrUnauthorized) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), forged); !errors.Is(err, ErrUnauthorized) {
 				t.Fatalf("error = %v, want ErrUnauthorized", err)
 			}
 		})
@@ -453,7 +477,7 @@ func TestDecodeInboundRejectsForgedPeerGroupAndMember(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			forged := bytes.Clone(frame)
 			test.mutate(forged)
-			if _, err := receiver.DecodeInbound(test.authenticated, forged); !errors.Is(err, test.want) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, test.authenticated), forged); !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
 		})
@@ -477,7 +501,7 @@ func TestDecodeInboundRejectsOuterInnerMismatch(t *testing.T) {
 			message := frameTestMessage(pb.MsgHeartbeat, from, to)
 			test.mutate(message)
 			forged := frameTestReplacePayload(t, frame, message)
-			if _, err := receiver.DecodeInbound(sender.LocalNode(), forged); !errors.Is(err, ErrInvalidFrame) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), forged); !errors.Is(err, ErrInvalidFrame) {
 				t.Fatalf("error = %v, want ErrInvalidFrame", err)
 			}
 		})
@@ -491,7 +515,7 @@ func TestDecodeInboundClassifiesCanonicalMalformedMessage(t *testing.T) {
 	malformed := frameTestMessage(pb.MsgHeartbeat, from, to)
 	malformed.Term = frameU64(0)
 	frame := frameTestReplacePayload(t, valid, malformed)
-	if _, err := receiver.DecodeInbound(sender.LocalNode(), frame); !errors.Is(err, ErrInvalidFrame) {
+	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("error = %v, want ErrInvalidFrame", err)
 	}
 }
@@ -502,14 +526,14 @@ func TestDecodeInboundRejectsEveryTruncationAndHeaderDamage(t *testing.T) {
 	frame := frameTestEncode(t, sender, group, frameTestMessage(pb.MsgHeartbeat, from, to))
 
 	for length := 0; length < len(frame); length++ {
-		if _, err := receiver.DecodeInbound(sender.LocalNode(), frame[:length]); err == nil {
+		if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame[:length]); err == nil {
 			t.Fatalf("prefix length %d unexpectedly accepted", length)
 		}
 	}
-	if _, err := receiver.DecodeInbound(sender.LocalNode(), append(bytes.Clone(frame), 0)); !errors.Is(err, ErrInvalidFrame) {
+	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), append(bytes.Clone(frame), 0)); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("trailing byte error = %v, want ErrInvalidFrame", err)
 	}
-	if _, err := receiver.DecodeInbound(sender.LocalNode(), make([]byte, MaxFrameBytes+1)); !errors.Is(err, ErrFrameTooLarge) {
+	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), make([]byte, MaxFrameBytes+1)); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("oversized complete frame error = %v, want ErrFrameTooLarge", err)
 	}
 
@@ -546,7 +570,7 @@ func TestDecodeInboundRejectsEveryTruncationAndHeaderDamage(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			corrupt := bytes.Clone(frame)
 			test.mutate(corrupt)
-			if _, err := receiver.DecodeInbound(sender.LocalNode(), corrupt); !errors.Is(err, test.want) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), corrupt); !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
 		})
@@ -591,7 +615,7 @@ func TestDecodeInboundRejectsHostileProtobuf(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			frame := frameTestReplaceRawPayload(valid, test.payload)
-			if _, err := receiver.DecodeInbound(sender.LocalNode(), frame); !errors.Is(err, test.want) {
+			if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame); !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
 		})
@@ -610,7 +634,7 @@ func TestFrameOwnershipIsDetached(t *testing.T) {
 	message.Entries[0].Data[0] ^= 0xff
 	message.Context = []byte("mutated")
 
-	inbound, err := receiver.DecodeInbound(sender.LocalNode(), frame)
+	inbound, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frame)
 	if err != nil {
 		t.Fatalf("DecodeInbound: %v", err)
 	}
