@@ -794,6 +794,12 @@ func checkpointGroupFromCertificateLocked(
 	group.certTxn.Store(certificate.txnHighWater)
 	group.visibleApplied.Store(certificate.applied)
 	group.visibleTxn.Store(certificate.txnHighWater)
+	if certificate.txnHighWater == math.MaxUint64 {
+		// An empty marker anchored at the terminal transaction has no record
+		// whose ID can seed generic marker recovery. Preserve the checkpoint
+		// certificate's exhausted durable counter instead of wrapping to one.
+		log.nextTxnID = math.MaxUint64
+	}
 	return group, nil
 }
 
@@ -1872,7 +1878,13 @@ func validateCheckpointMarkerRecords(
 	}
 	expected := base + 1
 	if expected == 0 {
-		return fmt.Errorf("%w: exhausted marker transaction prefix", ErrCheckpointGroupCorrupt)
+		if decisions.MaxDCSN() != 0 || decisions.MaxTxnID() != 0 {
+			return fmt.Errorf(
+				"%w: exhausted marker transaction prefix is not empty",
+				ErrCheckpointGroupCorrupt,
+			)
+		}
+		return nil
 	}
 	var result error
 	decisions.RangeDecisions(func(txnID uint64, participants []storeio.TxnParticipant) bool {
