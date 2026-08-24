@@ -142,6 +142,43 @@ released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
 v2/v3 decoder or migration ladder.
 
+## Replicated checkpoint-group certificate
+
+A replay-backed replicated tablet owns one fixed collection set and its
+transaction log through `checkpoint.vgc`. The file is exactly 8192 bytes: two
+alternate 4096-byte certificate slots. It has one unreleased grammar, format
+0, with no compatibility decoder.
+
+Each slot has an eight-byte `VIBECPG\0` identity, a 96-byte header, one or more
+64-byte fixed-member records, required zero reserved bytes and padding,
+and a 32-byte SHA-256 checksum. The header binds the certificate sequence,
+Raft applied index, transaction high-water and base, marker epoch and ID,
+member count, and a truncated membership digest. Each member record binds the
+SHA-256 logical-name digest, store ID, and recovery-journal ID. The checksum is
+SHA-256 over the domain `vibedb/checkpoint-group/format-0\0` followed by every
+preceding byte in the slot.
+
+The selected slot must be in `sequence % 2`; when both slots authenticate,
+their sequences must be consecutive. Decode re-encodes the complete slot and
+requires byte-for-byte canonical equality. A checksum-invalid newest slot may
+be a torn write and falls back to the other authenticated slot. A
+checksum-valid but noncanonical slot, wrong parity, or nonconsecutive history
+is corruption and never grants rollback authority.
+
+The certificate, rather than `txn.vtm`, is commit authority for this lane. It
+commits the consecutive conditional-journal prefix through its transaction
+high-water and aborts every later prepared suffix. Generic collection and
+database openers refuse a directory carrying `checkpoint.vgc`; recovery must
+open the certificate and exact fixed membership together before consulting or
+folding transaction state.
+
+An ordinary checkpoint orders one Sync for each of its `K` participant
+journals followed by one certificate Sync. The normal `K+1` barrier does not
+Sync the recyclable marker. Once the certificate Sync succeeds, its applied
+index is the durable Raft-WAL retention fence even if subsequent physical
+collection folds must be retried. No ordinary replicated transition performs
+a local Sync.
+
 ## Database directory names
 
 The durable database encodes a logical collection name as:

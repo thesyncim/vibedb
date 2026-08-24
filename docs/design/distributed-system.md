@@ -232,6 +232,38 @@ Out-of-band row mutation is outside the storage contract. A serving candidate
 must pair a canonical `ImageDigest` with the same applied cut; snapshot staging
 does so before membership or serving authority can be granted.
 
+## Replay-backed local apply
+
+The replicated apply lane can exclusively attach its fixed system and user
+collections to one `CheckpointGroup`. After Raft persistence, each ordinary
+state-machine transition appends conditional redo to only the dirty members
+and appends one unsynced marker decision. It publishes the member snapshots and
+the new applied cut together without a local Sync. This is a local replay
+contract; it does not weaken the embedded database's ordinary durability
+profiles.
+
+Periodic or pressure-driven checkpoints Sync all `K` fixed-member journals and
+then Sync one authenticated `checkpoint.vgc` certificate. The marker remains a
+recyclable implementation log and is not part of the normal barrier. The
+certificate commits its exact transaction prefix, aborts any later prepared
+suffix after a crash, and permits physical collection folds to finish or retry
+after the durable cut is already established.
+
+`AppliedIndex` is the newest reader-visible local transition.
+`CheckpointAppliedIndex` is the greatest certificate-backed contiguous cut and
+the only index currently exposed as safe input to Raft-WAL retention. They may
+differ between checkpoints. The repository does not yet compact or replace the
+Raft WAL from that fence; a replacement must additionally bind the exact term,
+configuration state, member lineage, certificate witness, and retained log
+suffix before any old generation can be discarded.
+
+This lane is still part of the non-serving replication kernel. It does not yet
+provide RF3 request serving, authenticated peer transport, or acknowledged
+gateway failover. Transition capture is deliberately rejected while a
+`CheckpointGroup` owns the apply state; online range split must use the later
+publish-before-prune serving integration rather than adding another ordinary
+durable participant to this fixed zero-Sync path.
+
 ## Autosplit boundary
 
 The `autosplit` package records fixed-memory pressure evidence and recommends a
