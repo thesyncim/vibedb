@@ -33,11 +33,7 @@ var (
 	ErrGenerationCandidate = errors.New("raftstore: invalid WAL generation candidate")
 	ErrGenerationConflict  = errors.New("raftstore: WAL generation name is occupied by another image")
 	ErrGenerationSource    = errors.New("raftstore: WAL generation source is not a canonical live cut")
-	// ErrGenerationActivationPending is a forward-compatibility fence. This
-	// candidate-only safe point never creates a family manifest, but it refuses
-	// to serve any path once a newer binary has durably selected a generation.
-	ErrGenerationActivationPending = errors.New("raftstore: WAL generation activation requires settlement")
-	errGenerationContended         = errors.New("raftstore: WAL generation publication contended")
+	errGenerationContended = errors.New("raftstore: WAL generation publication contended")
 )
 
 func linkGenerationName(root *os.Root, oldName, newName string) error {
@@ -554,14 +550,6 @@ func validateGenerationKey(key Key, header headerState) error {
 func generationCandidateBase(familyID [16]byte, generation uint64) string {
 	var encodedGeneration [8]byte
 	binary.BigEndian.PutUint64(encodedGeneration[:], generation)
-	return generationFamilyPrefix(familyID) +
+	return ".vibedb-raft-" + hex.EncodeToString(familyID[:]) +
 		".g" + hex.EncodeToString(encodedGeneration[:]) + ".wal"
-}
-
-func generationFamilyPrefix(familyID [16]byte) string {
-	return ".vibedb-raft-" + hex.EncodeToString(familyID[:])
-}
-
-func generationFamilyManifestBase(familyID [16]byte) string {
-	return generationFamilyPrefix(familyID) + ".family"
 }
