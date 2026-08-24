@@ -96,6 +96,7 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	// the entry-bearing persistence boundary itself so a legitimate later
 	// HardState-only record cannot be mistaken for a split proposal batch.
 	suffixPersisted := false
+	observedLast := lastBefore
 	for step := 0; step < 10_000; step++ {
 		result, driveErr := fixture.runtime.DriveReady(nil)
 		if driveErr != nil {
@@ -106,11 +107,15 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 			if lastErr != nil {
 				t.Fatal(lastErr)
 			}
-			if persistedLast > lastBefore {
+			if persistedLast < observedLast {
+				t.Fatalf("suffix WAL last index regressed: %d -> %d", observedLast, persistedLast)
+			}
+			if persistedLast > observedLast {
 				if suffixPersisted {
 					t.Fatalf("suffix entries crossed multiple persisted Ready records")
 				}
 				suffixPersisted = true
+				observedLast = persistedLast
 				if persistedLast-lastBefore != uint64(len(suffixCommands)) {
 					t.Fatalf(
 						"entry-bearing suffix WAL range = %d..%d, want %d entries",
