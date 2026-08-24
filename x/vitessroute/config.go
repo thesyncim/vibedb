@@ -2,14 +2,16 @@ package vitessroute
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // ErrUnsupportedVSchema is the sentinel every strict-subset rejection matches
@@ -32,6 +34,9 @@ const (
 	paramColumnCount  = "column_count"
 	paramColumnBytes  = "column_bytes"
 	paramColumnVindex = "column_vindex"
+
+	maxVSchemaJSONBytes = 1 << 20
+	maxVSchemaJSONDepth = 8
 )
 
 // The JSON subset. Every struct disallows unknown fields during decode, so a
@@ -59,6 +64,19 @@ type rawColumnVindex struct {
 	Name    string   `json:"name"`
 }
 
+var rawKeyspaceDecoder = func() vibejson.Decoder[rawKeyspace] {
+	decoder, err := vibejson.CompileDecoder[rawKeyspace](vibejson.DecoderOptions{
+		MaxDepth:              maxVSchemaJSONDepth,
+		DisallowUnknownFields: true,
+		CaseSensitive:         true,
+		Replace:               true,
+	})
+	if err != nil {
+		panic("vitessroute: compile VSchema decoder: " + err.Error())
+	}
+	return decoder
+}()
+
 // Keyspace is a strictly validated subset of a Vitess VSchema for one sharded
 // keyspace. It resolves each supported vindex to a distribution.Mapper and each
 // table to its single primary vindex. No upstream Vitess type is part of its
@@ -75,16 +93,27 @@ type Keyspace struct {
 // auto-increment behavior, cross-keyspace plans, and any destination width
 // other than the fixed 8 bytes — with a typed *ConfigError.
 func LoadKeyspace(data []byte) (*Keyspace, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var raw rawKeyspace
-	if err := dec.Decode(&raw); err != nil {
+	if len(data) > maxVSchemaJSONBytes {
+		return nil, &ConfigError{Reason: fmt.Sprintf("VSchema JSON exceeds %d bytes", maxVSchemaJSONBytes)}
+	}
+	if !utf8.Valid(data) {
+		return nil, &ConfigError{Reason: "malformed VSchema JSON: invalid UTF-8"}
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return nil, &ConfigError{Reason: "malformed VSchema JSON: NUL byte"}
+	}
+	if err := validateVSchemaJSON(data); err != nil {
 		return nil, &ConfigError{Reason: "malformed VSchema JSON: " + err.Error()}
 	}
-	if dec.More() {
-		return nil, &ConfigError{Reason: "trailing data after the VSchema JSON object"}
-	}
 
+	var raw rawKeyspace
+	if err := rawKeyspaceDecoder.Decode(data, &raw); err != nil {
+		return nil, &ConfigError{Reason: "malformed VSchema JSON: " + err.Error()}
+	}
+	return buildKeyspace(raw)
+}
+
+func buildKeyspace(raw rawKeyspace) (*Keyspace, error) {
 	if raw.Sharded == nil || !*raw.Sharded {
 		return nil, &ConfigError{Reason: `keyspace must set "sharded": true`}
 	}
@@ -122,6 +151,113 @@ func LoadKeyspace(data []byte) (*Keyspace, error) {
 	}
 
 	return ks, nil
+}
+
+// validateVSchemaJSON performs the canonical checks that a typed decoder does
+// not own: duplicate-member rejection and NUL-free decoded strings. The index
+// is byte-backed and bounded; decoded-key hashes are computed directly from
+// string tokens, so identities are never materialized as Go strings.
+func validateVSchemaJSON(data []byte) error {
+	needed, err := vibejson.RequiredIndexEntries(data)
+	if err != nil {
+		return err
+	}
+	index, err := vibejson.BuildIndexOptions(data, make([]vibejson.IndexEntry, needed), document.IndexOptions{
+		MaxDepth: maxVSchemaJSONDepth,
+		HashKeys: false,
+	})
+	if err != nil {
+		return err
+	}
+	return validateVSchemaNode(index.Root())
+}
+
+func validateVSchemaNode(node vibejson.Node) error {
+	switch node.Kind() {
+	case document.String:
+		if jsonStringContainsNUL(node) {
+			return errors.New("NUL in decoded string")
+		}
+	case document.Array:
+		iter, _ := node.ArrayIter()
+		for value, ok := iter.Next(); ok; value, ok = iter.Next() {
+			if err := validateVSchemaNode(value); err != nil {
+				return err
+			}
+		}
+	case document.Object:
+		count, _ := node.ObjectLen()
+		seen := make(map[uint32]vibejson.Node, count)
+		iter, _ := node.ObjectIter()
+		for key, value, ok := iter.Next(); ok; key, value, ok = iter.Next() {
+			if jsonStringContainsNUL(key) {
+				return errors.New("NUL in decoded object member")
+			}
+			hash := hashDecodedJSONString(key)
+			if previous, exists := seen[hash]; exists {
+				if duplicateVSchemaKey(node, key, previous) {
+					return fmt.Errorf("duplicate object member %s", key.Raw().Bytes())
+				}
+			} else {
+				seen[hash] = key
+			}
+			if err := validateVSchemaNode(value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func duplicateVSchemaKey(object, current, first vibejson.Node) bool {
+	currentRaw := current.Raw().Bytes()
+	if vibejson.RawJSONStringEqual(currentRaw, current.Entry.Flags(), first.Raw().Bytes(), first.Entry.Flags()) {
+		return true
+	}
+	// A hash collision is rare, but all earlier keys in the same object must be
+	// checked so a later duplicate of either colliding spelling is still closed.
+	iter, _ := object.ObjectIter()
+	for key, _, ok := iter.Next(); ok && key.Entry != current.Entry; key, _, ok = iter.Next() {
+		if hashDecodedJSONString(key) == hashDecodedJSONString(current) &&
+			vibejson.RawJSONStringEqual(currentRaw, current.Entry.Flags(), key.Raw().Bytes(), key.Entry.Flags()) {
+			return true
+		}
+	}
+	return false
+}
+
+func hashDecodedJSONString(node vibejson.Node) uint32 {
+	const (
+		offset32 = uint32(2166136261)
+		prime32  = uint32(16777619)
+	)
+	raw := node.Raw().Bytes()
+	hash := offset32
+	if node.Entry.Flags()&vibejson.TapeFlagEscaped == 0 {
+		for _, b := range raw[1 : len(raw)-1] {
+			hash = (hash ^ uint32(b)) * prime32
+		}
+		return hash
+	}
+	iter := vibejson.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
+	for b, ok := iter.Next(); ok; b, ok = iter.Next() {
+		hash = (hash ^ uint32(b)) * prime32
+	}
+	return hash
+}
+
+func jsonStringContainsNUL(node vibejson.Node) bool {
+	raw := node.Raw().Bytes()
+	if node.Entry.Flags()&vibejson.TapeFlagEscaped == 0 {
+		return bytes.IndexByte(raw[1:len(raw)-1], 0) >= 0
+	}
+	iter := vibejson.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
+	for b, ok := iter.Next(); ok; b, ok = iter.Next() {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // buildVindex resolves one supported vindex definition to a mapper.
