@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,6 +104,67 @@ func TestCatalogVibeJSONMalformedNestedValue(t *testing.T) {
 		var decoded catalogFileVibe
 		if err := decodeCatalogJSON(raw, &decoded); err == nil {
 			t.Fatalf("accepted malformed nested catalog %q", raw)
+		}
+	}
+}
+
+func TestCatalogVibeJSONRejectsNullVersionDirectly(t *testing.T) {
+	var decoded catalogFileVibe
+	err := decodeCatalogJSON([]byte(`{"version":null,"tables":{}}`), &decoded)
+	if err == nil || !strings.Contains(err.Error(), "version must not be null") {
+		t.Fatalf("null version decode = %v", err)
+	}
+}
+
+func representativeLargeCatalog() catalogFile {
+	catalog := catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta, maxCatalogTables)}
+	for i := 0; i < maxCatalogTables; i++ {
+		name := fmt.Sprintf("table_%03d", i)
+		catalog.Tables[name] = &tableMeta{PrimaryKey: "/id", Indexes: []indexMeta{{Name: "by_payload", Paths: []string{"/payload", "/kind"}}}, Storage: name + "-0000000000000001", Materialized: true}
+	}
+	return catalog
+}
+
+func TestCatalogVibeEncoderUsesCallerCapacityAndRejectsMalformedNestedMetadata(t *testing.T) {
+	catalog := representativeLargeCatalog()
+	bound, err := catalogSizeUpperBound(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(50, func() {
+		raw, encodeErr := appendCatalogJSON(make([]byte, 0, bound), catalog)
+		if encodeErr != nil || len(raw) == 0 || cap(raw) != bound {
+			panic("catalog encoder did not retain caller capacity")
+		}
+	})
+	// The race runtime adds four bookkeeping allocations; ordinary builds use
+	// three (output, sorted table names, and encoder scratch).
+	if allocations > 8 {
+		t.Fatalf("preallocated catalog encode allocations = %.1f", allocations)
+	}
+	malformed := catalogFile{Version: catalogVersion, Tables: map[string]*tableMeta{}, ReplicatedShardStore: &ReplicatedShardStoreIdentity{Format: ReplicatedShardStoreFormat, RelationCount: 2}}
+	deferred := func() (raw []byte, err error, recovered any) {
+		defer func() { recovered = recover() }()
+		raw, err = malformed.MarshalJSON()
+		return raw, err, nil
+	}
+	raw, err, recovered := deferred()
+	if recovered != nil || err == nil || raw != nil {
+		t.Fatalf("malformed catalog marshal = %q, %v, panic=%v", raw, err, recovered)
+	}
+}
+
+func BenchmarkCatalogVibeEncoderPreallocated(b *testing.B) {
+	catalog := representativeLargeCatalog()
+	bound, err := catalogSizeUpperBound(catalog)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		raw, err := appendCatalogJSON(make([]byte, 0, bound), catalog)
+		if err != nil || len(raw) == 0 {
+			b.Fatal(err)
 		}
 	}
 }

@@ -1420,11 +1420,11 @@ func (d *database) persistCatalogLocked() (published bool, err error) {
 	if err := d.retryNamespaceFencesLocked(); err != nil {
 		return false, err
 	}
-	if err := checkCatalogSize(d.catalog); err != nil {
+	bound, err := catalogSizeUpperBound(d.catalog)
+	if err != nil {
 		return false, err
 	}
-	encoded := catalogFileVibe(d.catalog)
-	raw, err := vibejson.Marshal(&encoded)
+	raw, err := appendCatalogJSON(make([]byte, 0, bound), d.catalog)
 	if err != nil {
 		return false, err
 	}

@@ -19,8 +19,9 @@ type shardStoreIdentityVibe ShardStoreIdentity
 type shardStoreFenceVibe ShardStoreFence
 
 const (
-	maxShardStoreIdentityJSONBytes = 256 << 10
-	maxShardStoreFenceJSONBytes    = 256
+	maxCanonicalJSONStringExpansion = 6
+	maxShardStoreIdentityJSONBytes  = 2*(maxCanonicalJSONStringExpansion*maxCatalogTableNameBytes+2) + 256
+	maxShardStoreFenceJSONBytes     = 256
 	// The deepest canonical catalog value is currently six containers (root,
 	// tables, table metadata, schema, fields, field metadata). Two spare levels
 	// keep the bound explicit without coupling additions to that exact shape.
@@ -40,6 +41,14 @@ var catalogVibeDecoder = func() vibejson.Decoder[catalogFileVibe] {
 		panic("driver: compile SQL catalog decoder: " + err.Error())
 	}
 	return decoder
+}()
+
+var catalogVibeEncoder = func() vibejson.Encoder[catalogFileVibe] {
+	encoder, err := vibejson.CompileEncoder[catalogFileVibe](vibejson.EncoderOptions{})
+	if err != nil {
+		panic("driver: compile SQL catalog encoder: " + err.Error())
+	}
+	return encoder
 }()
 
 var (
@@ -187,8 +196,16 @@ func decodeShardStoreFenceVibe(c *vibejson.DecodeCursor, dst *ShardStoreFence) e
 }
 
 func (c catalogFile) MarshalJSON() ([]byte, error) {
-	encoded := catalogFileVibe(c)
-	return vibejson.Marshal(&encoded)
+	bound, err := catalogSizeUpperBound(c)
+	if err != nil {
+		return nil, err
+	}
+	return appendCatalogJSON(make([]byte, 0, bound), c)
+}
+
+func appendCatalogJSON(dst []byte, catalog catalogFile) ([]byte, error) {
+	encoded := catalogFileVibe(catalog)
+	return catalogVibeEncoder.AppendJSON(dst, &encoded)
 }
 
 func (c *catalogFile) UnmarshalJSON(data []byte) error {
@@ -449,6 +466,13 @@ func decodeCatalogFile(c *vibejson.DecodeCursor, dst *catalogFile) error {
 		}
 		switch index {
 		case 0:
+			null, nullErr := c.Null()
+			if nullErr != nil {
+				return nullErr
+			}
+			if null {
+				return errors.New("vibedb: SQL catalog version must not be null")
+			}
 			var value int64
 			err = c.Int64(&value)
 			if err == nil && (value < 0 || int64(int(value)) != value) {
@@ -856,12 +880,16 @@ func decodeStringListVibe(c *vibejson.DecodeCursor, dst *[]string, limit int, ki
 }
 
 func decodeBoundedCatalogString(c *vibejson.DecodeCursor, dst *string, maximum int, kind string) error {
-	if err := checkReplicatedValueByteBound(c, maximum+2, fmt.Sprintf("vibedb: SQL catalog %s exceeds its byte bound", kind)); err != nil {
+	encodedMaximum := maximum*maxCanonicalJSONStringExpansion + 2
+	if err := checkReplicatedValueByteBound(c, encodedMaximum, fmt.Sprintf("vibedb: SQL catalog %s exceeds its encoded byte bound", kind)); err != nil {
 		return err
 	}
 	var decoded string
 	if err := c.String(&decoded); err != nil {
 		return err
+	}
+	if len(decoded) > maximum {
+		return fmt.Errorf("vibedb: SQL catalog %s exceeds its decoded byte bound", kind)
 	}
 	*dst = strings.Clone(decoded)
 	return nil
