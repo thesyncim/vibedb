@@ -146,6 +146,34 @@ func BuildManifestTransitions(
 	nextManifests []*distribution.Manifest,
 	nextGeneration uint64,
 ) (*Snapshot, error) {
+	if current == nil {
+		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
+	}
+	return buildManifestTransitions(
+		current, nextManifests, nextGeneration, current.replicatedDescriptors(),
+	)
+}
+
+// BuildManifestTransitionsWithReplicatedMetadata is the cold publication
+// boundary for a control plane that has already installed exact serving fences
+// on every affected RF3 Runtime. It grants no membership authority: the cross-
+// generation validator still freezes rosters until a learner/joint-consensus
+// executor exists.
+func BuildManifestTransitionsWithReplicatedMetadata(
+	current *Snapshot,
+	nextManifests []*distribution.Manifest,
+	nextGeneration uint64,
+	replicated []ReplicatedShardDescriptor,
+) (*Snapshot, error) {
+	return buildManifestTransitions(current, nextManifests, nextGeneration, replicated)
+}
+
+func buildManifestTransitions(
+	current *Snapshot,
+	nextManifests []*distribution.Manifest,
+	nextGeneration uint64,
+	replicated []ReplicatedShardDescriptor,
+) (*Snapshot, error) {
 	if current == nil || len(nextManifests) == 0 ||
 		len(nextManifests) > len(current.config.Manifests) {
 		return nil, &CatalogError{Reason: "manifest transition requires current and next snapshots"}
@@ -188,8 +216,9 @@ func BuildManifestTransitions(
 	}
 	indexes := current.indexDescriptors()
 	statistics := current.statistics.Descriptors()
-	next, err := NewSnapshotWithPlannerMetadata(
+	next, err := NewSnapshotWithReplicatedMetadata(
 		config, current.endpoints, nextGeneration, indexes, statistics,
+		replicated,
 	)
 	if err != nil {
 		return nil, err
@@ -410,6 +439,9 @@ func advanceCatalogState(current, next *Snapshot) (*Snapshot, error) {
 	if err := validateRoutingTransition(current, next); err != nil {
 		return nil, err
 	}
+	if err := validateReplicatedCatalogTransition(current, next); err != nil {
+		return nil, err
+	}
 	indexHighWater, err := advanceIndexIDHighWater(current, next)
 	if err != nil {
 		return nil, err
@@ -444,6 +476,8 @@ func snapshotWithCatalogLineage(
 		plannerIndexSpans:              snapshot.plannerIndexSpans,
 		plannerIndexStrings:            snapshot.plannerIndexStrings,
 		statistics:                     snapshot.statistics,
+		replicatedShards:               snapshot.replicatedShards,
+		replicatedReplicas:             snapshot.replicatedReplicas,
 		indexLineage:                   snapshot.indexLineage,
 		shardLineage:                   snapshot.shardLineage,
 		indexIDHighWater:               indexHighWater,

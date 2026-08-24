@@ -355,6 +355,13 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	return dst, nil
 }
 
+// CommandSize returns the exact canonical envelope size without allocating or
+// encoding. Callers with bounded reusable buffers can fail admission before an
+// append would grow beyond their local byte budget.
+func CommandSize(command Command) (int, error) {
+	return measureCommand(command)
+}
+
 func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	region := writableAppendRegion(dst, total)
 	if len(region) == 0 {

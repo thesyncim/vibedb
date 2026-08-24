@@ -70,6 +70,10 @@ var errBadLength = errors.New("shardservice: frame length field is not a valid l
 // errFrameTooLarge reports a body larger than this codec accepts.
 var errFrameTooLarge = errors.New("shardservice: frame body is larger than this service accepts")
 
+// errFrameBudget reports aggregate native-frame pressure after the peer's
+// length header was validated but before a body allocation was made.
+var errFrameBudget = errors.New("shardservice: in-flight frame byte budget is full")
+
 // errBadTag reports a frame whose tag is not the one expected for its direction.
 var errBadTag = errors.New("shardservice: frame has an unexpected tag byte")
 
@@ -410,29 +414,48 @@ func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
 // readFrame reads one framed body, validating the tag and bounding the length
 // before any allocation sized by it.
 func readFrame(r io.Reader, tag byte) ([]byte, error) {
+	body, _, err := readFrameBudgeted(r, tag, nil)
+	return body, err
+}
+
+// readFrameBudgeted reserves aggregate body bytes after validating the fixed
+// header and before allocating. On every read error it releases the reservation;
+// on success the caller owns charged until it has finished processing the frame.
+func readFrameBudgeted(
+	r io.Reader,
+	tag byte,
+	budget *replicatedFrameByteBudget,
+) (body []byte, charged int64, err error) {
 	var hdr [5]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if hdr[0] != tag {
-		return nil, errBadTag
+		return nil, 0, errBadTag
 	}
 	length := int32(binary.BigEndian.Uint32(hdr[1:]))
 	if length < 4 {
-		return nil, errBadLength
+		return nil, 0, errBadLength
 	}
 	if int64(length)-4 > int64(maxFrameBody) {
-		return nil, errFrameTooLarge
+		return nil, 0, errFrameTooLarge
 	}
 	size := int(length) - 4
 	if size == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
-	body := make([]byte, size)
+	charged = int64(size)
+	if budget != nil && !budget.reserve(charged) {
+		return nil, 0, errFrameBudget
+	}
+	body = make([]byte, size)
 	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, err
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, err
 	}
-	return body, nil
+	return body, charged, nil
 }
 
 func validateTransactionRequest(tx TransactionRequest) error {

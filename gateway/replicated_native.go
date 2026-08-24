@@ -1,0 +1,510 @@
+package gateway
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/shardservice"
+)
+
+const (
+	AbsoluteMaxReplicatedRouteMembers   = 64
+	AbsoluteMaxReplicatedAttemptTimeout = 5 * time.Minute
+)
+
+var (
+	ErrReplicatedRoute  = errors.New("gateway: invalid replicated shard route")
+	ErrReplicatedLeader = errors.New("gateway: replicated shard has no reachable leader")
+	ErrReplicatedDial   = errors.New("gateway: replicated shard dial is not configured")
+)
+
+// ReplicatedEndpoint binds one Raft member to its cold network address. Member
+// is fixed-width; Address is interpreted only by the dial boundary.
+type ReplicatedEndpoint struct {
+	Member  uint64
+	Address string
+}
+
+// ReplicatedRoute is one exact catalog allocation and its bounded replica set.
+type ReplicatedRoute struct {
+	Group                raftmember.GroupKey
+	AllocationGeneration uint64
+	Command              raftservice.CommandFence
+	Replicas             []ReplicatedEndpoint
+}
+
+// ReplicatedRoundTripper performs one native request. Implementations must not
+// reinterpret or rebuild request.Command.
+type ReplicatedRoundTripper interface {
+	DoReplicated(
+		context.Context,
+		string,
+		*shardservice.ReplicatedRequest,
+	) (*shardservice.ReplicatedResponse, error)
+}
+
+// ReplicatedDial opens one native shard connection.
+type ReplicatedDial func(context.Context, string) (net.Conn, error)
+
+// TCPReplicatedClient is the minimal connection boundary. Dial is required:
+// authentication and endpoint authorization belong to the caller's explicit
+// transport policy, so this boundary never silently falls back to raw TCP.
+type TCPReplicatedClient struct {
+	Dial ReplicatedDial
+}
+
+func (client TCPReplicatedClient) DoReplicated(
+	ctx context.Context,
+	address string,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if client.Dial == nil {
+		return nil, ErrReplicatedDial
+	}
+	connection, err := client.Dial(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+	return shardservice.RoundTripReplicated(ctx, connection, request)
+}
+
+// ReplicatedExecutor performs leader discovery and retries only the exact
+// original command bytes. MaxAttempts includes the first proposal and is
+// required, so no implicit unbounded retry policy exists.
+type ReplicatedExecutor struct {
+	client         ReplicatedRoundTripper
+	maxAttempts    int
+	attemptTimeout time.Duration
+}
+
+func NewReplicatedExecutor(
+	client ReplicatedRoundTripper,
+	maxAttempts int,
+	attemptTimeout time.Duration,
+) (*ReplicatedExecutor, error) {
+	if client == nil || maxAttempts <= 0 || maxAttempts > 16 ||
+		attemptTimeout <= 0 || attemptTimeout > AbsoluteMaxReplicatedAttemptTimeout {
+		return nil, ErrReplicatedRoute
+	}
+	return &ReplicatedExecutor{
+		client: client, maxAttempts: maxAttempts, attemptTimeout: attemptTimeout,
+	}, nil
+}
+
+// ReplicatedResult is the deterministic native completion plus routing facts.
+type ReplicatedResult struct {
+	Outcome    raftserve.Outcome
+	Completion []byte
+	State      shardservice.ReplicatedMemberState
+	Retries    int
+}
+
+// ReplicatedRefusalError preserves one typed shard refusal.
+type ReplicatedRefusalError struct {
+	Code    shardservice.ReplicatedRefusalCode
+	Outcome raftserve.Outcome
+}
+
+func (e *ReplicatedRefusalError) Error() string {
+	return fmt.Sprintf("gateway: replicated shard refusal %d", e.Code)
+}
+
+func (e *ReplicatedRefusalError) Unwrap() error {
+	if e.Code == shardservice.ReplicatedRefusalDeterministic {
+		return e.Outcome.Err()
+	}
+	if e.Code == shardservice.ReplicatedRefusalAdmissionBound {
+		return raftmodel.ErrAdmissionBound
+	}
+	if e.Code == shardservice.ReplicatedRefusalStaleFence {
+		return raftservice.ErrServingFence
+	}
+	if e.Code == shardservice.ReplicatedRefusalProposalRefused {
+		return raftserve.ErrProposalRefused
+	}
+	return ErrReplicatedLeader
+}
+
+// Propose discovers the live leader, submits the canonical command, and uses
+// at most MaxAttempts proposals. NotLeader and outcome-unknown retries always
+// resend the byte-identical envelope; deterministic refusals are never retried.
+func (executor *ReplicatedExecutor) Propose(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, false)
+}
+
+// RetryUnknown retries exact bytes retained from an earlier UnknownOutcomeError.
+// Pre-admission refusals cannot resolve that earlier attempt; only a validated
+// completion or an applied deterministic refusal may settle the command.
+func (executor *ReplicatedExecutor) RetryUnknown(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, true)
+}
+
+func (executor *ReplicatedExecutor) propose(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+	hint *shardservice.ReplicatedMemberState,
+	priorUnknown bool,
+) (ReplicatedResult, error) {
+	if executor == nil || executor.client == nil || ctx == nil ||
+		!validReplicatedRoute(route) || len(command) == 0 ||
+		len(command) > replication.MaxCommandBytes || !commandMatchesRoute(command, route) {
+		return ReplicatedResult{}, ErrReplicatedRoute
+	}
+	original := command[:len(command):len(command)]
+	preferred := route.Replicas[0].Member
+	var lastUnknown error
+	if priorUnknown {
+		lastUnknown = raftservice.ErrOutcomeUnknown
+	}
+	hintPending := hint != nil
+	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
+		var endpoint ReplicatedEndpoint
+		var state shardservice.ReplicatedMemberState
+		var err error
+		if hintPending {
+			hintPending = false
+			state = *hint
+			endpoint, _, _ = replicatedEndpoint(route, state.Fence.MemberID)
+			if !validReplicatedLeaderHint(route, endpoint, state) {
+				state = shardservice.ReplicatedMemberState{}
+			}
+		}
+		if state == (shardservice.ReplicatedMemberState{}) {
+			endpoint, state, err = executor.discoverLeader(ctx, route, preferred)
+			if err != nil {
+				if lastUnknown != nil {
+					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+						Command: append([]byte(nil), original...), Cause: errors.Join(lastUnknown, err),
+					}
+				}
+				return ReplicatedResult{}, err
+			}
+		}
+		preferred = state.LeaderID
+		response, err := executor.doReplicated(ctx, endpoint.Address,
+			&shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedPropose,
+				Fence:     state.Fence,
+				Command:   original,
+			})
+		if err != nil {
+			if errors.Is(err, raftservice.ErrOutcomeUnknown) {
+				lastUnknown = errors.Join(lastUnknown, err)
+				continue
+			}
+			// A transport implementation might not wrap a proposal failure;
+			// fail closed because the complete command could have reached admission.
+			lastUnknown = errors.Join(lastUnknown, err)
+			continue
+		}
+		// Unavailable without a member state is a definite owner-probe failure
+		// only when no earlier attempt could have been admitted. Once an outcome
+		// is unknown, no later pre-admission response can resolve it.
+		if validReplicatedUnavailableWithoutState(response) {
+			if lastUnknown != nil {
+				continue
+			}
+			return ReplicatedResult{}, &ReplicatedRefusalError{
+				Code: response.Refusal, Outcome: response.Outcome,
+			}
+		}
+		if !validReplicatedResponseState(response) ||
+			response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.MemberID != endpoint.Member {
+			lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+			continue
+		}
+		if response.State.Fence.Command != route.Command {
+			// A typed stale-fence refusal is definite pre-admission and may
+			// legitimately carry the newly installed command contract. Every
+			// other mismatched post-proposal response remains outcome-unknown.
+			if validReplicatedPreAdmissionRefusal(
+				response, shardservice.ReplicatedRefusalStaleFence,
+			) && lastUnknown == nil {
+				return ReplicatedResult{}, &ReplicatedRefusalError{
+					Code: response.Refusal, Outcome: response.Outcome,
+				}
+			}
+			if lastUnknown == nil {
+				lastUnknown = ErrReplicatedRoute
+			}
+			continue
+		}
+		switch response.Kind {
+		case shardservice.ReplicatedCompletion:
+			commandView, commandErr := replication.OpenCommand(original)
+			completion, completionErr := replication.OpenCompletion(response.Completion)
+			if commandErr != nil || completionErr != nil ||
+				response.Refusal != shardservice.ReplicatedRefusalNone ||
+				response.Outcome.Code != raftserve.OutcomeCompletion ||
+				response.Outcome.AppliedIndex == 0 ||
+				response.Outcome.CompletionBytes != len(response.Completion) ||
+				!nativeCompletionMatches(commandView, completion) ||
+				completion.AppliedSequence != response.Outcome.CompletionAppliedSequence ||
+				response.State.Applied < response.Outcome.AppliedIndex {
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			return ReplicatedResult{
+				Outcome: response.Outcome, Completion: response.Completion,
+				State: response.State, Retries: attempt,
+			}, nil
+		case shardservice.ReplicatedNotLeader:
+			if !validReplicatedNonterminalResponse(response) {
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			preferred = response.State.LeaderID
+			continue
+		case shardservice.ReplicatedOutcomeUnknown:
+			if !validReplicatedNonterminalResponse(response) {
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			lastUnknown = errors.Join(lastUnknown, raftservice.ErrOutcomeUnknown)
+			preferred = response.State.LeaderID
+			continue
+		case shardservice.ReplicatedRefusal:
+			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
+				if validReplicatedAppliedRefusal(response) {
+					return ReplicatedResult{}, &ReplicatedRefusalError{
+						Code: response.Refusal, Outcome: response.Outcome,
+					}
+				}
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			if !validReplicatedPreAdmissionRefusal(response, response.Refusal) {
+				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			if lastUnknown != nil {
+				continue
+			}
+			return ReplicatedResult{}, &ReplicatedRefusalError{
+				Code: response.Refusal, Outcome: response.Outcome,
+			}
+		default:
+			lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+			continue
+		}
+	}
+	if lastUnknown != nil {
+		return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+			Command: append([]byte(nil), original...), Cause: lastUnknown,
+		}
+	}
+	return ReplicatedResult{}, ErrReplicatedLeader
+}
+
+func (executor *ReplicatedExecutor) doReplicated(
+	ctx context.Context,
+	address string,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
+	defer cancel()
+	return executor.client.DoReplicated(attemptCtx, address, request)
+}
+
+func validReplicatedLeaderHint(
+	route ReplicatedRoute,
+	endpoint ReplicatedEndpoint,
+	state shardservice.ReplicatedMemberState,
+) bool {
+	return endpoint.Member != 0 && endpoint.Member == state.Fence.MemberID &&
+		validReplicatedMemberState(state) &&
+		state.LeaderID == state.Fence.MemberID &&
+		state.Fence.Group == route.Group &&
+		state.Fence.AllocationGeneration == route.AllocationGeneration &&
+		state.Fence.Command == route.Command && state.Fence.Term != 0
+}
+
+func (executor *ReplicatedExecutor) discoverLeader(
+	ctx context.Context,
+	route ReplicatedRoute,
+	preferred uint64,
+) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	visited := uint64(0)
+	member := preferred
+	var joined error
+	for probes := 0; probes < len(route.Replicas); probes++ {
+		endpoint, ordinal, ok := replicatedEndpoint(route, member)
+		if !ok || visited&(uint64(1)<<ordinal) != 0 {
+			endpoint, ordinal, ok = firstUnvisitedReplicatedEndpoint(route, visited)
+			if !ok {
+				break
+			}
+		}
+		visited |= uint64(1) << ordinal
+		response, err := executor.doReplicated(ctx, endpoint.Address,
+			&shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedProbe,
+				Fence: shardservice.ReplicatedFence{
+					Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+				},
+			})
+		if err != nil {
+			joined = errors.Join(joined, err)
+			member = 0
+			continue
+		}
+		if response == nil || response.Kind != shardservice.ReplicatedHandshake ||
+			!validReplicatedResponseState(response) ||
+			!validReplicatedNonterminalResponse(response) ||
+			response.State.Fence.Group != route.Group ||
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.Command != route.Command ||
+			response.State.Fence.MemberID != endpoint.Member {
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			member = 0
+			continue
+		}
+		if response.State.LeaderID == response.State.Fence.MemberID {
+			return endpoint, response.State, nil
+		}
+		member = response.State.LeaderID
+	}
+	return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
+		errors.Join(ErrReplicatedLeader, joined)
+}
+
+func validReplicatedResponseState(response *shardservice.ReplicatedResponse) bool {
+	return response != nil && response.HasState &&
+		validReplicatedMemberState(response.State)
+}
+
+func validReplicatedMemberState(state shardservice.ReplicatedMemberState) bool {
+	return validReplicatedCatalogGroup(state.Fence.Group) &&
+		state.Fence.AllocationGeneration != 0 && state.Fence.Command.Valid() &&
+		state.Fence.MemberID != 0 && state.Fence.StoreID != ([16]byte{}) &&
+		state.Fence.NodeIncarnation != 0 && state.Fence.Term != 0 &&
+		state.Commit >= state.Applied && state.Applied >= state.CheckpointApplied
+}
+
+func validReplicatedNonterminalResponse(response *shardservice.ReplicatedResponse) bool {
+	return response != nil && response.Refusal == shardservice.ReplicatedRefusalNone &&
+		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
+}
+
+func validReplicatedUnavailableWithoutState(
+	response *shardservice.ReplicatedResponse,
+) bool {
+	return response != nil && response.Kind == shardservice.ReplicatedRefusal &&
+		response.Refusal == shardservice.ReplicatedRefusalUnavailable &&
+		!response.HasState && response.State == (shardservice.ReplicatedMemberState{}) &&
+		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
+}
+
+func validReplicatedPreAdmissionRefusal(
+	response *shardservice.ReplicatedResponse,
+	code shardservice.ReplicatedRefusalCode,
+) bool {
+	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
+		response.Refusal != code || response.Outcome != (raftserve.Outcome{}) ||
+		len(response.Completion) != 0 {
+		return false
+	}
+	switch code {
+	case shardservice.ReplicatedRefusalStaleFence,
+		shardservice.ReplicatedRefusalAdmissionBound,
+		shardservice.ReplicatedRefusalProposalRefused,
+		shardservice.ReplicatedRefusalUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func validReplicatedAppliedRefusal(response *shardservice.ReplicatedResponse) bool {
+	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
+		response.Refusal != shardservice.ReplicatedRefusalDeterministic ||
+		len(response.Completion) != 0 || response.Outcome.AppliedIndex == 0 ||
+		response.Outcome.CompletionAppliedSequence != 0 ||
+		response.Outcome.CompletionBytes != 0 ||
+		response.State.Applied < response.Outcome.AppliedIndex {
+		return false
+	}
+	return response.Outcome.Code > raftserve.OutcomeCompletion &&
+		response.Outcome.Code < raftserve.OutcomeProposalRefused
+}
+
+func validReplicatedRoute(route ReplicatedRoute) bool {
+	if !validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
+		!route.Command.Valid() ||
+		len(route.Replicas) == 0 || len(route.Replicas) > AbsoluteMaxReplicatedRouteMembers {
+		return false
+	}
+	for index, endpoint := range route.Replicas {
+		if endpoint.Member == 0 || endpoint.Address == "" {
+			return false
+		}
+		for prior := 0; prior < index; prior++ {
+			if route.Replicas[prior].Member == endpoint.Member ||
+				route.Replicas[prior].Address == endpoint.Address {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
+	view, err := replication.OpenCommand(command)
+	return err == nil && view.ClusterID == route.Group.ClusterID &&
+		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
+		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&
+		view.ShardIncarnation == route.Group.ShardIncarnation &&
+		view.GroupID == route.Group.GroupID &&
+		view.AllocationGeneration == route.AllocationGeneration &&
+		view.ReplicaSetVersion == route.Command.ReplicaSetVersion &&
+		view.ActivePolicyGeneration == route.Command.ActivePolicyGeneration &&
+		view.ProtectionEpoch == route.Command.ProtectionEpoch &&
+		view.OwnershipEpoch == route.Command.OwnershipEpoch &&
+		view.SchemaGeneration == route.Command.SchemaGeneration &&
+		view.RoutingVersion == route.Command.RoutingVersion &&
+		view.RouteGeneration == route.Command.RouteGeneration
+}
+
+func replicatedEndpoint(
+	route ReplicatedRoute,
+	member uint64,
+) (ReplicatedEndpoint, int, bool) {
+	for index, endpoint := range route.Replicas {
+		if endpoint.Member == member {
+			return endpoint, index, true
+		}
+	}
+	return ReplicatedEndpoint{}, 0, false
+}
+
+func firstUnvisitedReplicatedEndpoint(
+	route ReplicatedRoute,
+	visited uint64,
+) (ReplicatedEndpoint, int, bool) {
+	for index, endpoint := range route.Replicas {
+		if visited&(uint64(1)<<index) == 0 {
+			return endpoint, index, true
+		}
+	}
+	return ReplicatedEndpoint{}, 0, false
+}

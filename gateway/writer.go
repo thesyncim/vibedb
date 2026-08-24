@@ -43,6 +43,11 @@ import (
 // semantically incomplete scatter.
 var ErrDistributedWriteUnsupported = errors.New("gateway: distributed write plan is unsupported")
 
+// ErrReplicatedSQLWriteUnavailable fences the legacy SQL mutation path from an
+// RF3 allocation. Replicated writes require canonical native commands and
+// deterministic completion semantics; SQL text is never copied into Raft.
+var ErrReplicatedSQLWriteUnavailable = errors.New("gateway: SQL writes are unavailable for replicated shards")
+
 // ErrWriteScatter reports an UPDATE or DELETE whose predicate does not resolve
 // to exactly one shard.
 var ErrWriteScatter = errors.New("gateway: write predicate does not resolve to a single shard")

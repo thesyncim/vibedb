@@ -275,9 +275,10 @@ type OrdinaryTransport struct {
 	// beforeFrameReturn is a test-only scheduling seam after queue unlock.
 	beforeFrameReturn func()
 
-	state  atomic.Uint32
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	state   atomic.Uint32
+	started chan struct{}
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
 }
 
 // NewOrdinaryTransport allocates only bounded peer rings and control channels.
@@ -299,9 +300,9 @@ func NewOrdinaryTransport(options OrdinaryTransportOptions) (*OrdinaryTransport,
 		frames: newBoundedFrameBufferCache(
 			options.Queue.GlobalFrames, options.Queue.GlobalBytes, retain,
 		),
-		peers:  make([]*ordinaryPeer, 0, len(options.Peers)),
-		byNode: make(map[NodeID]*ordinaryPeer, len(options.Peers)),
-		ctx:    ctx, cancel: cancel,
+		peers:   make([]*ordinaryPeer, 0, len(options.Peers)),
+		byNode:  make(map[NodeID]*ordinaryPeer, len(options.Peers)),
+		started: make(chan struct{}), ctx: ctx, cancel: cancel,
 	}
 	transport.reservations = sync.NewCond(&transport.mu)
 	for _, node := range options.Peers {
@@ -363,6 +364,7 @@ func (transport *OrdinaryTransport) Run(parent context.Context) error {
 		!transport.state.CompareAndSwap(transportReady, transportRunning) {
 		return ErrTransportClosed
 	}
+	close(transport.started)
 	stopParent := context.AfterFunc(parent, func() {
 		cause := context.Cause(parent)
 		if cause == nil {
@@ -408,6 +410,7 @@ func (transport *OrdinaryTransport) Close() error {
 				continue
 			}
 			transport.cancel(ErrTransportClosed)
+			close(transport.started)
 			transport.drainQueues()
 			transport.frames.close()
 			return nil
@@ -421,6 +424,21 @@ func (transport *OrdinaryTransport) Close() error {
 			return nil
 		}
 	}
+}
+
+// Started closes exactly once when Run acquires the transport or Close retires
+// it before start. After receiving, Running distinguishes those two states.
+func (transport *OrdinaryTransport) Started() <-chan struct{} {
+	if transport == nil {
+		return nil
+	}
+	return transport.started
+}
+
+// Running reports whether Run owns the outbound workers.
+func (transport *OrdinaryTransport) Running() bool {
+	return transport != nil && transport.state.Load() == transportRunning &&
+		context.Cause(transport.ctx) == nil
 }
 
 // Send encodes and takes ownership of one ordinary frame during the call. The
