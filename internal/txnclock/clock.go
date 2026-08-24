@@ -4,11 +4,14 @@
 // Record is gated by Arm/Disarm: when the armed count is zero, RecordKeys is an
 // atomic fast-path check and a return. Begin, Finish, and Conflict stay live so a
 // validation edge can observe publications that raced the arm. The SQL driver
-// keeps its clocks always-armed under database.mu; the facade arms only while
+// keeps its clocks always-armed under database.mu. The facade arms only while
 // at least one read-write transaction is open.
 package txnclock
 
-import "sync/atomic"
+import (
+	"hash/maphash"
+	"sync/atomic"
+)
 
 // HistoryKeys caps retained per-collection conflict history independently of
 // collection size or transaction lifetime. Reaching it is deliberately rare:
@@ -20,12 +23,15 @@ const HistoryKeys = 4096
 // Clock is a bounded, internally revisioned first-committer-wins conflict
 // clock. ExternalHistory is the externally revisioned alternative.
 //
-// Writes retains only the newest write revision for keys that can still
-// conflict with an active transaction. Once the oldest transaction finishes,
-// Finish rebuilds the map without obsolete entries; once the last transaction
+// Writes retains only the newest write revision for keyed, process-local
+// fingerprints that can still conflict with an active transaction. A hash
+// collision is deliberately conservative: both keys share one newest revision,
+// which can create a false conflict but cannot hide a real one. The clock never
+// retains caller strings or byte slices. Once the oldest transaction finishes,
+// Finish rebuilds the map without obsolete entries. Once the last transaction
 // finishes, it releases the map entirely. Live memory is therefore proportional
 // to keys changed since the oldest active transaction began, rather than to the
-// collection's lifetime.
+// collection's lifetime or key byte size.
 //
 // Active and Writes are exported so in-module adapters can mirror them for
 // white-box tests without duplicating clock state.
@@ -34,8 +40,18 @@ type Clock struct {
 	revision        uint64
 	revisionStopped bool
 	historyFloor    uint64
+	seed            maphash.Seed
+	seeded          bool
 	Active          map[uint64]uint32
-	Writes          map[string]uint64
+	Writes          map[uint64]uint64
+}
+
+// BinaryKeys is a borrowed binary-key set. Implementations retain ownership of
+// every returned slice. Clock hashes each key synchronously and never stores or
+// converts the bytes to strings.
+type BinaryKeys interface {
+	Len() int
+	Key(index int) []byte
 }
 
 const (
@@ -125,11 +141,43 @@ func (c *Clock) Conflict(
 		return "", false, false
 	}
 	for _, key := range keys {
-		if c.Writes[key] > begin {
+		if c.Writes[c.fingerprintString(key)] > begin {
 			return key, false, true
 		}
 	}
 	return "", false, false
+}
+
+// ConflictBinary is Conflict for borrowed binary keys. On an exact or
+// fingerprint-collision match it returns the caller's borrowed key. It never
+// exposes or retains history-owned key material because history stores only
+// fixed fingerprints.
+func (c *Clock) ConflictBinary(
+	begin uint64,
+	keys BinaryKeys,
+) (key []byte, historyOverflow, conflict bool) {
+	if c.revisionStopped {
+		return nil, true, true
+	}
+	if begin < c.historyFloor {
+		return nil, true, true
+	}
+	if begin == c.revision {
+		if begin == maxRevision {
+			return nil, true, true
+		}
+		return nil, false, false
+	}
+	if keys == nil {
+		return nil, false, false
+	}
+	for index := 0; index < keys.Len(); index++ {
+		key := keys.Key(index)
+		if c.Writes[c.fingerprintBytes(key)] > begin {
+			return key, false, true
+		}
+	}
+	return nil, false, false
 }
 
 // ChangedSince reports whether any write was recorded after begin. Unlike
@@ -142,7 +190,7 @@ func (c *Clock) ChangedSince(begin uint64) bool {
 
 // Observe returns the current revision without registering another active
 // holder. Callers use it to stamp work derived from a cut captured while their
-// publication mutex is held; the transaction's original Begin token remains
+// publication mutex is held. The transaction's original Begin token remains
 // active and retains every exact-key history entry the newer stamp may need.
 func (c *Clock) Observe() uint64 {
 	return c.revision
@@ -217,7 +265,7 @@ func (c *Clock) Finish(begin uint64) {
 	}
 	// Rebuild instead of deleting in place so obsolete key storage becomes
 	// collectible and the clock remains bounded by currently relevant writes.
-	writes := make(map[string]uint64, remaining)
+	writes := make(map[uint64]uint64, remaining)
 	for key, revision := range c.Writes {
 		if revision > oldest {
 			writes[key] = revision
@@ -232,39 +280,88 @@ func (c *Clock) RecordKeys(keys []string) {
 	if c.armed.Load() == 0 {
 		return
 	}
-	c.recordKeys(keys)
-}
-
-func (c *Clock) recordKeys(keys []string) {
 	if len(keys) == 0 || c.revisionStopped {
 		return
 	}
-	newKeys := 0
-	for i, key := range keys {
-		if _, exists := c.Writes[key]; exists {
-			continue
-		}
-		duplicate := false
-		for j := 0; j < i; j++ {
-			if keys[j] == key {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
-			newKeys++
-		}
-	}
-	revision, retained := c.nextWrite(newKeys)
+	revision, retained := c.nextWrite()
 	if !retained {
 		return
 	}
 	for _, key := range keys {
-		c.Writes[key] = revision
+		if !c.recordFingerprint(revision, c.fingerprintString(key)) {
+			return
+		}
 	}
 }
 
-func (c *Clock) nextWrite(newKeys int) (uint64, bool) {
+// RecordBinary records a committed borrowed binary-key set without converting
+// keys to strings or retaining caller storage. When the clock is unarmed this
+// is an atomic fast-path check and a return without invoking keys.
+func (c *Clock) RecordBinary(keys BinaryKeys) {
+	if c.armed.Load() == 0 {
+		return
+	}
+	if keys == nil || keys.Len() == 0 || c.revisionStopped {
+		return
+	}
+	revision, retained := c.nextWrite()
+	if !retained {
+		return
+	}
+	for index := 0; index < keys.Len(); index++ {
+		if !c.recordFingerprint(revision, c.fingerprintBytes(keys.Key(index))) {
+			return
+		}
+	}
+}
+
+// RecordWriteIfNoActive advances the committed-write revision without key
+// material when no transaction can observe exact history. It returns false if
+// an active transaction requires the caller to provide RecordKeys instead.
+// Like RecordKeys, an unarmed or permanently stopped clock is a successful
+// no-op.
+func (c *Clock) RecordWriteIfNoActive() bool {
+	if c.armed.Load() == 0 || c.revisionStopped {
+		return true
+	}
+	if len(c.Active) != 0 {
+		return false
+	}
+	_, _ = c.nextWrite()
+	return true
+}
+
+func (c *Clock) fingerprintString(key string) uint64 {
+	if !c.seeded {
+		c.seed = maphash.MakeSeed()
+		c.seeded = true
+	}
+	return maphash.String(c.seed, key)
+}
+
+func (c *Clock) fingerprintBytes(key []byte) uint64 {
+	if !c.seeded {
+		c.seed = maphash.MakeSeed()
+		c.seeded = true
+	}
+	return maphash.Bytes(c.seed, key)
+}
+
+func (c *Clock) recordFingerprint(revision, fingerprint uint64) bool {
+	if _, exists := c.Writes[fingerprint]; !exists && len(c.Writes) == HistoryKeys {
+		// Transactions already active cannot distinguish a key overwritten
+		// before this reset from one never touched. Doom exactly those older
+		// transactions, release their fingerprint history, and let transactions
+		// begun at or after this revision proceed with a fresh exact history.
+		c.historyFloor = revision
+		c.Writes = nil
+		return false
+	}
+	c.Writes[fingerprint] = revision
+	return true
+}
+
+func (c *Clock) nextWrite() (uint64, bool) {
 	if c.revision == maxRevision {
 		if c.Active[maxRevision] != 0 {
 			// A transaction begun at MaxUint64 cannot distinguish any later
@@ -285,17 +382,8 @@ func (c *Clock) nextWrite(newKeys int) (uint64, bool) {
 		c.historyFloor = 0
 		return c.revision, false
 	}
-	if len(c.Writes)+newKeys > HistoryKeys {
-		// Transactions already active cannot distinguish a key overwritten
-		// before this reset from one never touched. Doom exactly those older
-		// transactions, release their key history, and let transactions begun
-		// at or after this revision proceed with a fresh exact history.
-		c.historyFloor = c.revision
-		c.Writes = nil
-		return c.revision, false
-	}
 	if c.Writes == nil {
-		c.Writes = make(map[string]uint64, newKeys)
+		c.Writes = make(map[uint64]uint64)
 	}
 	return c.revision, true
 }

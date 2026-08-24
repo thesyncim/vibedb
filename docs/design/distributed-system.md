@@ -450,9 +450,15 @@ most 64 entries and 1 MiB for a multi-entry batch. A valid proposal up to the
 16 MiB command limit occupies a turn alone when it exceeds that target. The
 next fair group turn captures `Ready`; there is no timer or wall-clock hold.
 Configuration changes and read barriers remain strict boundaries. Committed
-entries are still applied and published one at a time, outbound messages are
-still retained as individual frames, and the kernel has no serving proposal
-waiters.
+normal entries can be applied as a bounded consecutive prefix in one atomic
+state-machine publication. Prefix selection also obeys the replicated state's
+exact system and user mutation budgets. The 128-entry node workspace is a hard
+ceiling, not a guarantee that every persisted profile can publish 128
+independent-session commands. Each published prefix creates a synchronous
+result settlement gate before the runtime can release read states or advance
+the `Ready`. The current non-serving Host supplies an explicit no-local-waiters
+sink. The kernel does not have a serving proposal-waiter registry. Outbound
+messages are still retained as individual frames.
 
 The kernel has no production socket transport, TLS, peer authentication,
 snapshot-transfer service, or serving integration. The frame decoder requires
@@ -473,6 +479,8 @@ Do not describe this kernel as a turnkey replicated deployment.
 - `internal/rangesplit/partition.go`, `artifact.go`, `tail.go`, and `stage.go`
 - `internal/rangesplit/stage_cursor.go` and `stage_cursor_store.go`
 - `internal/rangesplit/source_capture.go` and `internal/replicatedstate/capture.go`
+- `internal/raftmodel/node.go`, `internal/raftmember/runtime.go`,
+  `internal/multiraft/host.go`, and `internal/replicatedstate/apply_batch.go`
 - `internal/rangesplit/cutover.go`
 - `internal/rangesplit/stage_image.go` and `activate.go`
 - `internal/rangesplit/retained_prune.go` and `retained_prune_cursor.go`

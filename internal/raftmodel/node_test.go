@@ -999,7 +999,7 @@ func TestReadIndexWaitsForOrderedPublication(t *testing.T) {
 	if err := node.InstallSnapshot(); err != nil {
 		t.Fatalf("InstallSnapshot() error = %v", err)
 	}
-	if err := node.ApplyCommitted(); err != nil {
+	if err := applyCommittedForTest(node); err != nil {
 		t.Fatalf("ApplyCommitted() error = %v", err)
 	}
 	recorded, err := node.RecordNextReadState()
@@ -1103,7 +1103,7 @@ func TestApplyFailureIsFailStop(t *testing.T) {
 	}
 	wantErr := errors.New("injected apply failure")
 	machine.fail = wantErr
-	if err := node.ApplyCommitted(); !errors.Is(err, wantErr) {
+	if err := applyCommittedForTest(node); !errors.Is(err, wantErr) {
 		t.Fatalf("ApplyCommitted() error = %v, want injected error", err)
 	}
 	if node.Phase() != PhaseFailed || !errors.Is(node.Failure(), wantErr) {
@@ -1137,16 +1137,24 @@ func TestApplyNextExposesEntryLevelCrashCuts(t *testing.T) {
 	if err := node.InstallSnapshot(); err != nil {
 		t.Fatalf("InstallSnapshot() error = %v", err)
 	}
-	first, applied, err := node.ApplyNext()
-	if err != nil || !applied {
-		t.Fatalf("ApplyNext(first) = %+v, %v, %v", first, applied, err)
+	firstResult, err := node.ApplyNextBatch(nil)
+	if err != nil || firstResult.Applied != 1 || firstResult.Normal.Len() != 1 {
+		t.Fatalf("ApplyNextBatch(first) = %+v, %v", firstResult, err)
+	}
+	first := firstResult.Normal.FinalPublication()
+	if err := node.SettleAppliedNormalBatch(firstResult.Normal); err != nil {
+		t.Fatalf("settle first = %v", err)
 	}
 	if node.Phase() != PhaseSnapshotInstalled {
 		t.Fatalf("phase after first of two entries = %s", node.Phase())
 	}
-	second, applied, err := node.ApplyNext()
-	if err != nil || !applied {
-		t.Fatalf("ApplyNext(second) = %+v, %v, %v", second, applied, err)
+	secondResult, err := node.ApplyNextBatch(nil)
+	if err != nil || secondResult.Applied != 1 || secondResult.Normal.Len() != 1 {
+		t.Fatalf("ApplyNextBatch(second) = %+v, %v", secondResult, err)
+	}
+	second := secondResult.Normal.FinalPublication()
+	if err := node.SettleAppliedNormalBatch(secondResult.Normal); err != nil {
+		t.Fatalf("settle second = %v", err)
 	}
 	if second.Applied != first.Applied+1 || node.Phase() != PhaseEntriesApplied {
 		t.Fatalf("micro-step publications %d -> %d, phase %s", first.Applied, second.Applied, node.Phase())
@@ -1203,7 +1211,7 @@ func TestSnapshotPersistsBeforeOrderedInstall(t *testing.T) {
 	if machine.Applied() != index || node.Published().Applied != index {
 		t.Fatalf("installed snapshot machine=%d publication=%d", machine.Applied(), node.Published().Applied)
 	}
-	if err := node.ApplyCommitted(); err != nil {
+	if err := applyCommittedForTest(node); err != nil {
 		t.Fatalf("ApplyCommitted() error = %v", err)
 	}
 	if _, err := node.FinishReadStates(); err != nil {
@@ -1659,7 +1667,7 @@ func driveOneReady(t *testing.T, node *Node, send func(*pb.Message) error) []Rea
 	if err := node.InstallSnapshot(); err != nil {
 		t.Fatalf("InstallSnapshot() error = %v", err)
 	}
-	if err := node.ApplyCommitted(); err != nil {
+	if err := applyCommittedForTest(node); err != nil {
 		t.Fatalf("ApplyCommitted() error = %v", err)
 	}
 	outcomes, err := node.RecordReadStates()
@@ -1696,7 +1704,7 @@ func driveAllReady(t *testing.T, node *Node) []ReadOutcome {
 		if err := node.InstallSnapshot(); err != nil {
 			t.Fatalf("InstallSnapshot() error = %v", err)
 		}
-		if err := node.ApplyCommitted(); err != nil {
+		if err := applyCommittedForTest(node); err != nil {
 			t.Fatalf("ApplyCommitted() error = %v", err)
 		}
 		readyOutcomes, err := node.RecordReadStates()
@@ -1740,7 +1748,7 @@ func captureCommittedReady(t *testing.T, node *Node, data []byte) {
 		if err := node.InstallSnapshot(); err != nil {
 			t.Fatalf("InstallSnapshot() error = %v", err)
 		}
-		if err := node.ApplyCommitted(); err != nil {
+		if err := applyCommittedForTest(node); err != nil {
 			t.Fatalf("ApplyCommitted() error = %v", err)
 		}
 		if _, err := node.RecordReadStates(); err != nil {
@@ -1751,6 +1759,11 @@ func captureCommittedReady(t *testing.T, node *Node, data []byte) {
 		}
 	}
 	t.Fatalf("committed data %q did not appear", data)
+}
+
+func applyCommittedForTest(node *Node) error {
+	var workspace NormalApplyBatchWorkspace
+	return node.ApplyCommitted(&workspace, func(AppliedNormalBatch) error { return nil })
 }
 
 func clonePersistBatch(batch PersistBatch) PersistBatch {

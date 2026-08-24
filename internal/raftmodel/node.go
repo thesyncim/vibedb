@@ -38,6 +38,10 @@ type Node struct {
 	readBytes    int
 	readSeq      uint64
 
+	settlementReadyID uint64
+	settlementStart   int
+	settlementCount   int
+
 	readyFromInput    bool
 	pendingInputCalls int
 	pendingInputUnits int
@@ -56,6 +60,7 @@ type ReadyProgress struct {
 	ReadStateCount     int
 	ReadStatesRecorded int
 	HasSnapshot        bool
+	SettlementPending  bool
 }
 
 // MemberProgress is an allocation-free detached observation of one member in
@@ -251,7 +256,8 @@ func (n *Node) CurrentReady() (ReadyProgress, bool) {
 		MessageCount: len(n.ready.Messages), MessagesSent: n.messagePos,
 		CommittedCount: len(n.ready.CommittedEntries), CommittedApplied: n.entryPos,
 		ReadStateCount: len(n.ready.ReadStates), ReadStatesRecorded: n.readPos,
-		HasSnapshot: !raft.IsEmptySnap(n.ready.Snapshot),
+		HasSnapshot:       !raft.IsEmptySnap(n.ready.Snapshot),
+		SettlementPending: n.settlementCount != 0,
 	}, true
 }
 
@@ -433,18 +439,25 @@ func (n *Node) InstallSnapshot() error {
 	return nil
 }
 
-// ApplyNext applies at most one committed entry in exact index order, exposing
-// a deterministic crash cut between entries. The boolean reports whether an
-// entry was applied. Normal no-op entries still advance and publish Applied.
+// ApplyNext applies at most one configuration entry in exact index order. A
+// normal entry is refused before apply because this legacy result shape cannot
+// expose the range token required for settlement. Drivers must use
+// ApplyNextBatch for normal entries.
 func (n *Node) ApplyNext() (Publication, bool, error) {
 	if err := n.requirePhase("ApplyNext", PhaseSnapshotInstalled); err != nil {
 		return Publication{}, false, err
+	}
+	if n.settlementCount != 0 {
+		return Publication{}, false, ErrAppliedSettlementPending
 	}
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
 		return n.Published(), false, nil
 	}
 	entry := n.ready.CommittedEntries[n.entryPos]
+	if entry != nil && entry.GetType() == pb.EntryType_EntryNormal {
+		return Publication{}, false, ErrAppliedSettlementRequired
+	}
 	if err := n.applyEntry(entry); err != nil {
 		return Publication{}, false, err
 	}
@@ -455,12 +468,248 @@ func (n *Node) ApplyNext() (Publication, bool, error) {
 	return n.Published(), true, nil
 }
 
-// ApplyCommitted is a convenience wrapper over ApplyNext. Simulators should
-// call ApplyNext directly when they need every entry-level crash boundary.
-func (n *Node) ApplyCommitted() error {
+// NextApplyRequiresResultSettlement reports whether the next committed entry
+// is normal. Drivers use this preflight to refuse result-bearing progress
+// before apply when no settlement sink or batch workspace is available.
+func (n *Node) NextApplyRequiresResultSettlement() (bool, error) {
+	if err := n.requirePhase("NextApplyRequiresResultSettlement", PhaseSnapshotInstalled); err != nil {
+		return false, err
+	}
+	if n.settlementCount != 0 {
+		return false, ErrAppliedSettlementPending
+	}
+	if n.entryPos == len(n.ready.CommittedEntries) {
+		return false, nil
+	}
+	entry := n.ready.CommittedEntries[n.entryPos]
+	return entry != nil && entry.GetType() == pb.EntryType_EntryNormal, nil
+}
+
+// ApplyNextBatch applies one configuration entry, one fallback normal entry,
+// or a bounded consecutive normal prefix. A published normal range remains a
+// hard lifecycle boundary until SettleAppliedNormalBatch acknowledges it.
+func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchResult, error) {
+	if err := n.requirePhase("ApplyNextBatch", PhaseSnapshotInstalled); err != nil {
+		return ApplyBatchResult{}, err
+	}
+	if n.settlementCount != 0 {
+		return ApplyBatchResult{}, ErrAppliedSettlementPending
+	}
+	if n.entryPos == len(n.ready.CommittedEntries) {
+		n.phase = PhaseEntriesApplied
+		return ApplyBatchResult{}, nil
+	}
+
+	start := n.entryPos
+	first := n.ready.CommittedEntries[start]
+	batchMachine, canBatch := n.machine.(NormalBatchStateMachine)
+	if workspace != nil && canBatch && first != nil &&
+		first.GetType() == pb.EntryType_EntryNormal {
+		count := n.selectNormalApplyBatch(workspace)
+		if count > 0 {
+			entries := workspace.entries[:count]
+			witnesses := workspace.witnesses[:count]
+			applied, publication, err := batchMachine.ApplyNormalBatch(entries, witnesses)
+			if err != nil {
+				clear(entries)
+				clear(witnesses)
+				return ApplyBatchResult{}, n.fail(PhaseEntriesApplied, first.GetIndex(), err)
+			}
+			if applied < 0 || applied > count {
+				clear(entries)
+				clear(witnesses)
+				return ApplyBatchResult{}, n.fail(
+					PhaseEntriesApplied, first.GetIndex(),
+					fmt.Errorf("normal batch applied %d entries from candidate length %d", applied, count),
+				)
+			}
+			if applied > 0 {
+				if err := n.acceptNormalBatchPublication(
+					entries, witnesses, applied, publication,
+				); err != nil {
+					clear(entries)
+					clear(witnesses)
+					return ApplyBatchResult{}, n.fail(PhaseEntriesApplied, first.GetIndex(), err)
+				}
+				clear(entries)
+				clear(witnesses)
+				n.entryPos += applied
+				n.settlementReadyID = n.readyID
+				n.settlementStart = start
+				n.settlementCount = applied
+				return ApplyBatchResult{
+					Applied: applied,
+					Normal:  n.pendingAppliedNormalBatch(),
+				}, nil
+			}
+			for witnessIndex := range count {
+				if witnesses[witnessIndex] != ([32]byte{}) {
+					clear(entries)
+					clear(witnesses)
+					return ApplyBatchResult{}, n.fail(
+						PhaseEntriesApplied, first.GetIndex(),
+						fmt.Errorf("clean normal-batch boundary left witness %d nonzero", witnessIndex),
+					)
+				}
+			}
+			clear(entries)
+			clear(witnesses)
+			if publication != (Publication{}) {
+				return ApplyBatchResult{}, n.fail(
+					PhaseEntriesApplied, first.GetIndex(),
+					errors.New("clean normal-batch boundary returned a publication"),
+				)
+			}
+			if appliedIndex := n.machine.Applied(); appliedIndex != n.published.Applied ||
+				!equalPublication(n.machine.Published(), n.published) {
+				return ApplyBatchResult{}, n.fail(
+					PhaseEntriesApplied, first.GetIndex(),
+					errors.New("clean normal-batch boundary changed publication"),
+				)
+			}
+		}
+	}
+
+	if err := n.applyEntry(first); err != nil {
+		return ApplyBatchResult{}, err
+	}
+	n.entryPos++
+	result := ApplyBatchResult{Applied: 1}
+	if first != nil && first.GetType() == pb.EntryType_EntryNormal {
+		n.settlementReadyID = n.readyID
+		n.settlementStart = start
+		n.settlementCount = 1
+		result.Normal = n.pendingAppliedNormalBatch()
+		return result, nil
+	}
+	if n.entryPos == len(n.ready.CommittedEntries) {
+		n.phase = PhaseEntriesApplied
+	}
+	return result, nil
+}
+
+func (n *Node) selectNormalApplyBatch(workspace *NormalApplyBatchWorkspace) int {
+	count := 0
+	totalBytes := 0
+	for position := n.entryPos; position < len(n.ready.CommittedEntries) &&
+		count < MaxNormalApplyBatchEntries; position++ {
+		entry := n.ready.CommittedEntries[position]
+		if entry == nil || entry.GetType() != pb.EntryType_EntryNormal {
+			break
+		}
+		if n.published.Applied > math.MaxUint64-uint64(count)-1 {
+			break
+		}
+		expected := n.published.Applied + uint64(count) + 1
+		if entry.GetIndex() != expected || entry.GetTerm() == 0 {
+			break
+		}
+		entryBytes := len(entry.GetData())
+		if entryBytes > MaxNormalApplyBatchBytes-totalBytes {
+			break
+		}
+		workspace.entries[count] = NormalApply{
+			Meta: ApplyMeta{
+				Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType(),
+			},
+			Data: entry.GetData(),
+		}
+		totalBytes += entryBytes
+		count++
+	}
+	return count
+}
+
+func (n *Node) pendingAppliedNormalBatch() AppliedNormalBatch {
+	end := n.settlementStart + n.settlementCount
+	return AppliedNormalBatch{
+		owner: n, readyID: n.settlementReadyID,
+		entries:     n.ready.CommittedEntries[n.settlementStart:end],
+		publication: n.published,
+	}
+}
+
+// PendingAppliedNormalBatch returns the exact published normal range awaiting
+// settlement. The boolean is false when no range is pending.
+func (n *Node) PendingAppliedNormalBatch() (AppliedNormalBatch, bool) {
+	if n == nil || n.settlementCount == 0 {
+		return AppliedNormalBatch{}, false
+	}
+	return n.pendingAppliedNormalBatch(), true
+}
+
+// SettleAppliedNormalBatch acknowledges synchronous delivery of every result
+// in the exact applied normal range. Only then may the Node apply another entry
+// or release read states and advance the Ready.
+func (n *Node) SettleAppliedNormalBatch(batch AppliedNormalBatch) error {
+	if err := n.requirePhase("SettleAppliedNormalBatch", PhaseSnapshotInstalled); err != nil {
+		return err
+	}
+	if n.settlementCount == 0 {
+		return errors.New("raftmodel: no applied normal batch awaits settlement")
+	}
+	pending := n.pendingAppliedNormalBatch()
+	if batch.owner != n || batch.readyID != pending.readyID ||
+		len(batch.entries) != len(pending.entries) ||
+		batch.FirstIndex() != pending.FirstIndex() || batch.LastIndex() != pending.LastIndex() ||
+		!equalPublication(batch.publication, pending.publication) {
+		return errors.New("raftmodel: applied normal batch settlement mismatch")
+	}
+	for index := range batch.entries {
+		if batch.entries[index] != pending.entries[index] {
+			return errors.New("raftmodel: applied normal batch settlement mismatch")
+		}
+	}
+	n.settlementReadyID = 0
+	n.settlementStart = 0
+	n.settlementCount = 0
+	if n.entryPos == len(n.ready.CommittedEntries) {
+		n.phase = PhaseEntriesApplied
+	}
+	return nil
+}
+
+// ApplyCommitted drains committed entries while synchronously settling every
+// normal range. A sink error leaves the exact range pending for retry.
+func (n *Node) ApplyCommitted(
+	workspace *NormalApplyBatchWorkspace,
+	settle func(AppliedNormalBatch) error,
+) error {
 	for n.phase == PhaseSnapshotInstalled {
-		if _, _, err := n.ApplyNext(); err != nil {
+		if n.settlementCount != 0 {
+			if settle == nil {
+				return ErrAppliedSettlementRequired
+			}
+			batch := n.pendingAppliedNormalBatch()
+			if err := settle(batch); err != nil {
+				return err
+			}
+			if err := n.SettleAppliedNormalBatch(batch); err != nil {
+				return err
+			}
+			continue
+		}
+		requiresSettlement, err := n.NextApplyRequiresResultSettlement()
+		if err != nil {
 			return err
+		}
+		if requiresSettlement && settle == nil {
+			return ErrAppliedSettlementRequired
+		}
+		if requiresSettlement && workspace == nil {
+			return errors.New("raftmodel: normal apply batch workspace is required")
+		}
+		result, err := n.ApplyNextBatch(workspace)
+		if err != nil {
+			return err
+		}
+		if result.Normal.Len() != 0 {
+			if err := settle(result.Normal); err != nil {
+				return err
+			}
+			if err := n.SettleAppliedNormalBatch(result.Normal); err != nil {
+				return err
+			}
 		}
 	}
 	if n.phase != PhaseEntriesApplied {

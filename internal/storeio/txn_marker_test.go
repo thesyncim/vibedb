@@ -91,6 +91,146 @@ func TestTxnMarkerHeaderRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTxnMarkerRecoveryAnchorRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	anchor := TxnMarkerRecoveryAnchor{
+		MarkerID: [16]byte{1, 2, 3, 4}, Epoch: 7, BaseSequence: 41,
+	}
+	marker, err := CreateTxnMarkerAtRecoveryAnchor(
+		root, "txn.vtm",
+		TxnMarkerOptions{Capacity: 8 * TxnMarkerMinSectorSize},
+		anchor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHeader := TxnMarkerHeader{
+		Format: TxnMarkerFormat, MarkerID: anchor.MarkerID,
+		Epoch: anchor.Epoch, BaseSequence: anchor.BaseSequence,
+		Capacity: 8 * TxnMarkerMinSectorSize, RecycleCount: 1,
+	}
+	if marker.Header() != wantHeader || marker.Cursor() != 0 {
+		t.Fatalf("anchored marker = %+v cursor %d", marker.Header(), marker.Cursor())
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, decisions, err := OpenTxnMarker(
+		filepath.Join(dir, "txn.vtm"), TxnMarkerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Header() != wantHeader || decisions.MaxDCSN() != 0 ||
+		decisions.MaxTxnID() != 0 {
+		t.Fatalf("reopened anchor = %+v decisions %+v", reopened.Header(), decisions)
+	}
+	sequence, err := reopened.AppendDecision(
+		anchor.BaseSequence+1, testTxnParticipants(1),
+	)
+	if err != nil || sequence != anchor.BaseSequence+1 {
+		t.Fatalf("first anchored decision sequence = %d, %v", sequence, err)
+	}
+}
+
+func TestTxnMarkerRecoveryAnchorRejectsInvalidHeaderBeforeCreate(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		anchor TxnMarkerRecoveryAnchor
+		want   error
+	}{
+		{
+			name: "fresh-epoch",
+			anchor: TxnMarkerRecoveryAnchor{
+				MarkerID: [16]byte{1}, Epoch: 1, BaseSequence: 9,
+			},
+			want: ErrInvalidWrite,
+		},
+		{
+			name: "zero-marker-id",
+			anchor: TxnMarkerRecoveryAnchor{
+				Epoch: 2, BaseSequence: 9,
+			},
+			want: ErrTxnMarkerCorrupt,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			marker, err := CreateTxnMarkerAtRecoveryAnchor(
+				root, "txn.vtm",
+				TxnMarkerOptions{Capacity: 8 * TxnMarkerMinSectorSize},
+				test.anchor,
+			)
+			if marker != nil || !errors.Is(err, test.want) {
+				t.Fatalf("invalid recovery anchor = marker %v err %v", marker, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "txn.vtm")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid recovery anchor created a file: %v", err)
+			}
+		})
+	}
+}
+
+func TestTxnMarkerRecoveryAnchorTerminalBaseIsExhausted(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	marker, err := CreateTxnMarkerAtRecoveryAnchor(
+		root, "txn.vtm",
+		TxnMarkerOptions{Capacity: 8 * TxnMarkerMinSectorSize},
+		TxnMarkerRecoveryAnchor{
+			MarkerID: [16]byte{1}, Epoch: 2, BaseSequence: ^uint64(0),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExhausted := func(marker *TxnMarker) {
+		t.Helper()
+		if marker.NextSequence() != 0 || marker.Cursor() != 0 || marker.FitsRetirement() {
+			t.Fatalf("terminal anchor = next %d cursor %d retirement room %v",
+				marker.NextSequence(), marker.Cursor(), marker.FitsRetirement())
+		}
+		if sequence, appendErr := marker.AppendDecision(1, testTxnParticipants(1)); sequence != 0 || !errors.Is(appendErr, ErrTxnMarkerFull) {
+			t.Fatalf("terminal decision append = %d, %v", sequence, appendErr)
+		}
+		if sequence, appendErr := marker.AppendRetirement([16]byte{1}); sequence != 0 || !errors.Is(appendErr, ErrTxnMarkerFull) {
+			t.Fatalf("terminal retirement append = %d, %v", sequence, appendErr)
+		}
+	}
+	assertExhausted(marker)
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, decisions, err := OpenTxnMarker(
+		filepath.Join(dir, "txn.vtm"), TxnMarkerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if decisions.MaxDCSN() != 0 || decisions.MaxTxnID() != 0 {
+		t.Fatalf("terminal anchor recovered decisions = %+v", decisions)
+	}
+	assertExhausted(reopened)
+}
+
 func TestTxnMarkerCreateOpenEmpty(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	header := m.Header()
@@ -566,53 +706,84 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 }
 
 func TestTxnMarkerCreationFence(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		phase TxnMarkerFaultPhase
+	for _, create := range []struct {
+		name string
+		open func(*testing.T, string, string) (*TxnMarker, error)
 	}{
-		{"header-write", TxnMarkerFaultCreateHeaderWrite},
-		{"file-sync", TxnMarkerFaultCreateFileSync},
-		{"parent-dir-sync", TxnMarkerFaultCreateParentDirSync},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ProgramTxnMarkerCreateFault(TxnMarkerFaultPlan{Phase: tc.phase})
-			t.Cleanup(func() { ProgramTxnMarkerCreateFault(TxnMarkerFaultPlan{}) })
-
-			dir := t.TempDir()
-			path := filepath.Join(dir, "txn.vtm")
-			m, err := CreateTxnMarker(path, TxnMarkerOptions{
-				Capacity: 8 * TxnMarkerMinSectorSize,
-			})
-			if err == nil {
-				m.Close()
-				t.Fatal("CreateTxnMarker succeeded under creation fault")
-			}
-			if !TxnMarkerCreateFaulted() {
-				t.Fatal("creation fault did not fire")
-			}
-
-			_, err = os.Stat(path)
-			switch {
-			case errors.Is(err, os.ErrNotExist):
-			case err != nil:
-				t.Fatalf("stat mint residue: %v", err)
-			default:
-				opened, decisions, openErr := OpenTxnMarker(path, TxnMarkerOptions{})
-				switch {
-				case errors.Is(openErr, ErrTxnMarkerNoValidHeader):
-				case openErr == nil:
-					if decisions.MaxDCSN() != 0 {
-						opened.Close()
-						t.Fatalf("creation fault left a decodable partial log: max dcsn=%d", decisions.MaxDCSN())
-					}
-					if len(decisions.decisions) != 0 || len(decisions.retired) != 0 {
-						opened.Close()
-						t.Fatal("creation fault left non-empty decisions")
-					}
-					opened.Close()
-				default:
-					t.Fatalf("reopen mint residue = %v", openErr)
+		{
+			name: "fresh",
+			open: func(_ *testing.T, _ string, path string) (*TxnMarker, error) {
+				return CreateTxnMarker(path, TxnMarkerOptions{
+					Capacity: 8 * TxnMarkerMinSectorSize,
+				})
+			},
+		},
+		{
+			name: "recovery-anchor",
+			open: func(t *testing.T, dir, _ string) (*TxnMarker, error) {
+				root, err := os.OpenRoot(dir)
+				if err != nil {
+					return nil, err
 				}
+				defer root.Close()
+				return CreateTxnMarkerAtRecoveryAnchor(
+					root, "txn.vtm",
+					TxnMarkerOptions{Capacity: 8 * TxnMarkerMinSectorSize},
+					TxnMarkerRecoveryAnchor{
+						MarkerID: [16]byte{1}, Epoch: 2, BaseSequence: 9,
+					},
+				)
+			},
+		},
+	} {
+		t.Run(create.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name  string
+				phase TxnMarkerFaultPhase
+			}{
+				{"header-write", TxnMarkerFaultCreateHeaderWrite},
+				{"file-sync", TxnMarkerFaultCreateFileSync},
+				{"parent-dir-sync", TxnMarkerFaultCreateParentDirSync},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ProgramTxnMarkerCreateFault(TxnMarkerFaultPlan{Phase: tc.phase})
+					t.Cleanup(func() { ProgramTxnMarkerCreateFault(TxnMarkerFaultPlan{}) })
+
+					dir := t.TempDir()
+					path := filepath.Join(dir, "txn.vtm")
+					m, err := create.open(t, dir, path)
+					if err == nil {
+						m.Close()
+						t.Fatal("CreateTxnMarker succeeded under creation fault")
+					}
+					if !TxnMarkerCreateFaulted() {
+						t.Fatal("creation fault did not fire")
+					}
+
+					_, err = os.Stat(path)
+					switch {
+					case errors.Is(err, os.ErrNotExist):
+					case err != nil:
+						t.Fatalf("stat mint residue: %v", err)
+					default:
+						opened, decisions, openErr := OpenTxnMarker(path, TxnMarkerOptions{})
+						switch {
+						case errors.Is(openErr, ErrTxnMarkerNoValidHeader):
+						case openErr == nil:
+							if decisions.MaxDCSN() != 0 {
+								opened.Close()
+								t.Fatalf("creation fault left a decodable partial log: max dcsn=%d", decisions.MaxDCSN())
+							}
+							if len(decisions.decisions) != 0 || len(decisions.retired) != 0 {
+								opened.Close()
+								t.Fatal("creation fault left non-empty decisions")
+							}
+							opened.Close()
+						default:
+							t.Fatalf("reopen mint residue = %v", openErr)
+						}
+					}
+				})
 			}
 		})
 	}

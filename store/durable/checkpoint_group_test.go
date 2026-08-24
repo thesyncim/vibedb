@@ -3,8 +3,10 @@ package durable
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,6 +39,34 @@ func newCheckpointGroupTestResources(
 	}
 	t.Cleanup(func() { _ = log.Close() })
 	return dir, members, log
+}
+
+func checkpointGroupTestSetMaxSpan(
+	certificate *checkpointGroupCertificate,
+	span uint8,
+	txn, last uint64,
+) {
+	certificate.maxApplySpan = span
+	certificate.maxSpanTxn = 0
+	certificate.maxSpanFirst = 0
+	certificate.maxSpanLast = 0
+	if span > 1 {
+		certificate.maxSpanTxn = txn
+		certificate.maxSpanLast = last
+		width := uint64(span)
+		if last >= width {
+			certificate.maxSpanFirst = last - width + 1
+		}
+	}
+}
+
+func checkpointGroupTestAllZero(data []byte) bool {
+	for _, value := range data {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCheckpointGroupFileCertificateCheckPinsExactRegularEntry(t *testing.T) {
@@ -261,6 +291,459 @@ func TestCheckpointGroupZeroSyncApplyAndExclusiveOwnership(t *testing.T) {
 	}
 }
 
+func TestCheckpointGroupUpdateConsecutiveSharesAtomicUpdateContract(t *testing.T) {
+	t.Run("single-entry parity", func(t *testing.T) {
+		_, ordinaryMembers, _, ordinary := newCheckpointGroupTestStore(t, 8)
+		_, batchMembers, _, batch := newCheckpointGroupTestStore(t, 8)
+		write := func(members []NamedCollection) func(*DatabaseBatch) error {
+			return func(database *DatabaseBatch) error {
+				for _, member := range members {
+					collection, err := database.Collection(member.Name)
+					if err != nil {
+						return err
+					}
+					if err := collection.Put([]byte("key"), []byte(`{"n":1}`)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		if err := ordinary.Update(
+			1, ordinaryMembers, defaultTxnLimits(), write(ordinaryMembers),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.UpdateConsecutive(
+			1, 1, batchMembers, defaultTxnLimits(), write(batchMembers),
+		); err != nil {
+			t.Fatal(err)
+		}
+		ordinaryStats, batchStats := ordinary.Stats(), batch.Stats()
+		if ordinaryStats != batchStats || ordinaryStats.Updates != 1 ||
+			ordinaryStats.TransactionHighWater != 1 || ordinaryStats.LargestUpdateSpan != 1 {
+			t.Fatalf("ordinary=%+v consecutive=%+v", ordinaryStats, batchStats)
+		}
+		for index := range ordinaryMembers {
+			left, leftOK := collectionDoc(t, ordinaryMembers[index].Collection, "key")
+			right, rightOK := collectionDoc(t, batchMembers[index].Collection, "key")
+			if !leftOK || !rightOK || left != right {
+				t.Fatalf("member %d parity = %q/%v %q/%v", index, left, leftOK, right, rightOK)
+			}
+		}
+	})
+
+	t.Run("bounded range is one transaction", func(t *testing.T) {
+		_, members, _, group := newCheckpointGroupTestStore(t, 8)
+		if err := group.UpdateConsecutive(
+			1, 3, members, defaultTxnLimits(), func(database *DatabaseBatch) error {
+				for _, member := range members {
+					collection, err := database.Collection(member.Name)
+					if err != nil {
+						return err
+					}
+					if err := collection.Put([]byte("final"), []byte(`{"n":3}`)); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		stats := group.Stats()
+		if stats.AppliedIndex != 3 || stats.TransactionHighWater != 1 ||
+			stats.Updates != 1 || stats.CheckpointAppliedIndex != 0 ||
+			stats.BarrierSyncs != 0 || stats.LargestUpdateSpan != 3 {
+			t.Fatalf("batch stats = %+v", stats)
+		}
+		checkpointGroupPut(t, group, 4, members, "tail")
+		if stats = group.Stats(); stats.AppliedIndex != 4 ||
+			stats.TransactionHighWater != 2 || stats.Updates != 2 {
+			t.Fatalf("tail stats = %+v", stats)
+		}
+	})
+
+	t.Run("callback failure parity", func(t *testing.T) {
+		injected := errors.New("injected callback failure")
+		for _, consecutive := range []bool{false, true} {
+			name := "update"
+			if consecutive {
+				name = "consecutive"
+			}
+			t.Run(name, func(t *testing.T) {
+				_, members, _, group := newCheckpointGroupTestStore(t, 8)
+				write := func(database *DatabaseBatch) error {
+					collection, err := database.Collection(members[0].Name)
+					if err != nil {
+						return err
+					}
+					if err := collection.Put([]byte("key"), []byte(`{"n":1}`)); err != nil {
+						return err
+					}
+					return injected
+				}
+				var err error
+				if consecutive {
+					err = group.UpdateConsecutive(1, 3, members[:1], defaultTxnLimits(), write)
+				} else {
+					err = group.Update(1, members[:1], defaultTxnLimits(), write)
+				}
+				if !errors.Is(err, injected) {
+					t.Fatalf("callback failure = %v", err)
+				}
+				if stats := group.Stats(); stats.AppliedIndex != 0 ||
+					stats.TransactionHighWater != 0 || stats.Updates != 0 ||
+					stats.LargestUpdateSpan != 0 {
+					t.Fatalf("callback failure stats = %+v", stats)
+				}
+				if _, found := collectionDoc(t, members[0].Collection, "key"); found {
+					t.Fatal("callback failure published a row")
+				}
+			})
+		}
+	})
+}
+
+func TestCheckpointGroupUpdateConsecutiveRejectsEverySequenceGapBeforeCallback(t *testing.T) {
+	tests := []struct {
+		name        string
+		first, last uint64
+	}{
+		{name: "zero first", first: 0, last: 1},
+		{name: "skipped first", first: 2, last: 2},
+		{name: "reversed", first: 1, last: 0},
+		{name: "maximum final", first: 1, last: ^uint64(0)},
+		{name: "one over span", first: 1, last: MaxCheckpointGroupUpdateEntries + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, members, _, group := newCheckpointGroupTestStore(t, 8)
+			called := false
+			err := group.UpdateConsecutive(
+				test.first, test.last, members, defaultTxnLimits(),
+				func(*DatabaseBatch) error { called = true; return nil },
+			)
+			if !errors.Is(err, ErrCheckpointGroupSequence) || called {
+				t.Fatalf("range [%d,%d] = %v called=%v", test.first, test.last, err, called)
+			}
+			if stats := group.Stats(); stats.AppliedIndex != 0 ||
+				stats.TransactionHighWater != 0 || stats.Updates != 0 {
+				t.Fatalf("rejected stats = %+v", stats)
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupUpdateConsecutiveCrashRecoveryIsOldOrComplete(t *testing.T) {
+	for _, span := range []uint64{1, 2, MaxCheckpointGroupUpdateEntries} {
+		for _, checkpoint := range []bool{false, true} {
+			name := "uncertified-span-" + strconv.FormatUint(span, 10)
+			if checkpoint {
+				name = "certified-span-" + strconv.FormatUint(span, 10)
+			}
+			t.Run(name, func(t *testing.T) {
+				dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+				if err := group.UpdateConsecutive(
+					1, span, members, defaultTxnLimits(), func(database *DatabaseBatch) error {
+						for _, member := range members {
+							collection, err := database.Collection(member.Name)
+							if err != nil {
+								return err
+							}
+							if err := collection.Put([]byte("batch"), []byte(`{"n":5}`)); err != nil {
+								return err
+							}
+						}
+						return nil
+					},
+				); err != nil {
+					t.Fatal(err)
+				}
+				if checkpoint {
+					if err := group.Checkpoint(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				crashImage := copyCheckpointGroupDirectory(t, dir)
+				collections, _, reopened := openCheckpointGroupTestCopy(t, crashImage)
+				wantApplied := uint64(0)
+				if checkpoint {
+					wantApplied = span
+				}
+				if reopened.AppliedIndex() != wantApplied ||
+					reopened.CheckpointAppliedIndex() != wantApplied {
+					t.Fatalf("recovered cut = %d/%d want %d",
+						reopened.AppliedIndex(), reopened.CheckpointAppliedIndex(), wantApplied)
+				}
+				wantStoredSpan := uint8(0)
+				if checkpoint && span > 1 {
+					wantStoredSpan = uint8(span)
+				}
+				if reopened.maxApplySpan != wantStoredSpan {
+					t.Fatalf("recovered max span = %d, want %d",
+						reopened.maxApplySpan, wantStoredSpan)
+				}
+				if wantStoredSpan > 1 {
+					if reopened.maxSpanTxn != 1 || reopened.maxSpanFirst != 1 ||
+						reopened.maxSpanLast != span {
+						t.Fatalf("recovered max-span witness = txn %d [%d,%d]",
+							reopened.maxSpanTxn, reopened.maxSpanFirst, reopened.maxSpanLast)
+					}
+				} else if reopened.maxSpanTxn != 0 || reopened.maxSpanFirst != 0 ||
+					reopened.maxSpanLast != 0 {
+					t.Fatalf("legacy span recovered a witness = txn %d [%d,%d]",
+						reopened.maxSpanTxn, reopened.maxSpanFirst, reopened.maxSpanLast)
+				}
+				wantLargestSpan := uint64(0)
+				if checkpoint {
+					wantLargestSpan = span
+				}
+				if got := reopened.Stats().LargestUpdateSpan; got != wantLargestSpan {
+					t.Fatalf("recovered largest span = %d, want %d", got, wantLargestSpan)
+				}
+				for index, collection := range collections {
+					_, found := collectionDoc(t, collection, "batch")
+					if found != checkpoint {
+						t.Fatalf("member %d found=%v want=%v", index, found, checkpoint)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCheckpointGroupUpdateConsecutiveDecisionFailureMatchesUpdate(t *testing.T) {
+	for _, consecutive := range []bool{false, true} {
+		name := "update"
+		if consecutive {
+			name = "consecutive"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, members, _, group := newCheckpointGroupTestStore(t, 8)
+			previous := checkpointGroupFaultHook
+			t.Cleanup(func() { checkpointGroupFaultHook = previous })
+			checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+				if point == checkpointGroupAfterDecisionAppend {
+					return ErrCommitOutcomeUnknown
+				}
+				return nil
+			}
+			write := func(database *DatabaseBatch) error {
+				collection, err := database.Collection(members[0].Name)
+				if err != nil {
+					return err
+				}
+				return collection.Put([]byte("uncertain"), []byte(`{"n":1}`))
+			}
+			var err error
+			if consecutive {
+				err = group.UpdateConsecutive(1, 3, members[:1], defaultTxnLimits(), write)
+			} else {
+				err = group.Update(1, members[:1], defaultTxnLimits(), write)
+			}
+			if !errors.Is(err, ErrCommitOutcomeUnknown) {
+				t.Fatalf("fault = %v", err)
+			}
+			if stats := group.Stats(); stats.AppliedIndex != 0 ||
+				stats.TransactionHighWater != 0 || stats.Updates != 0 {
+				t.Fatalf("uncertain stats = %+v", stats)
+			}
+			if _, found := collectionDoc(t, members[0].Collection, "uncertain"); found {
+				t.Fatal("decision-fault suffix became reader-visible")
+			}
+			if err := group.Update(1, members[:1], defaultTxnLimits(), write); err == nil {
+				t.Fatal("poisoned group accepted another update")
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupCertificateMaxApplySpanCanonicalGrammar(t *testing.T) {
+	_, _, _, group := newCheckpointGroupTestStore(t, 8)
+	base := group.certificateLocked()
+
+	t.Run("legacy zero bytes round trip", func(t *testing.T) {
+		encoded, err := encodeCheckpointGroupCertificate(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := encoded[checkpointGroupMaxApplySpanOffset]; got != 0 {
+			t.Fatalf("legacy reserved bytes = %d", got)
+		}
+		if !checkpointGroupTestAllZero(encoded[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupChecksumOffset]) {
+			t.Fatal("legacy format-0 certificate populated max-span witness tail")
+		}
+		legacyHeader := [16]byte{
+			'V', 'I', 'B', 'E', 'C', 'P', 'G', 0,
+			0, 0, 168, 0, 2, 0, 0, 0,
+		}
+		if !bytes.Equal(encoded[:len(legacyHeader)], legacyHeader[:]) {
+			t.Fatalf("legacy format-0 header = %x, want %x",
+				encoded[:len(legacyHeader)], legacyHeader)
+		}
+		decoded, err := decodeCheckpointGroupCertificate(encoded)
+		if err != nil || decoded.maxApplySpan != 0 {
+			t.Fatalf("legacy decode = %+v, %v", decoded, err)
+		}
+		roundTrip, err := encodeCheckpointGroupCertificate(decoded)
+		if err != nil || !bytes.Equal(encoded, roundTrip) {
+			t.Fatalf("legacy round trip changed bytes: %v", err)
+		}
+	})
+
+	t.Run("maximum membership remains disjoint from witness tail", func(t *testing.T) {
+		certificate := base
+		certificate.members = make([]checkpointGroupMember, checkpointGroupMaxMembers)
+		for index := range certificate.members {
+			name := sha256.Sum256([]byte("member-" + strconv.Itoa(index)))
+			store := sha256.Sum256([]byte("store-" + strconv.Itoa(index)))
+			journal := sha256.Sum256([]byte("journal-" + strconv.Itoa(index)))
+			certificate.members[index].nameDigest = name
+			copy(certificate.members[index].storeID[:], store[:])
+			copy(certificate.members[index].journalID[:], journal[:])
+		}
+		encoded, err := encodeCheckpointGroupCertificate(certificate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		memberEnd := checkpointGroupHeaderBytes +
+			checkpointGroupMaxMembers*checkpointGroupMemberBytes
+		if memberEnd > checkpointGroupMaxSpanWitnessTxnOffset ||
+			!checkpointGroupTestAllZero(encoded[memberEnd:checkpointGroupMaxSpanWitnessTxnOffset]) ||
+			!checkpointGroupTestAllZero(encoded[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupChecksumOffset]) {
+			t.Fatalf("max member bank overlaps noncanonical tail: end=%d witness=%d",
+				memberEnd, checkpointGroupMaxSpanWitnessTxnOffset)
+		}
+		decoded, err := decodeCheckpointGroupCertificate(encoded)
+		if err != nil || len(decoded.members) != checkpointGroupMaxMembers {
+			t.Fatalf("max-member decode = %d, %v", len(decoded.members), err)
+		}
+	})
+
+	for _, test := range []struct {
+		name       string
+		span       uint8
+		applied    uint64
+		txn        uint64
+		wantErr    bool
+		wantStored uint8
+	}{
+		{name: "two", span: 2, applied: 2, txn: 1, wantStored: 2},
+		{name: "maximum", span: MaxCheckpointGroupUpdateEntries, applied: MaxCheckpointGroupUpdateEntries, txn: 1, wantStored: MaxCheckpointGroupUpdateEntries},
+		{name: "explicit one is noncanonical", span: 1, applied: 1, txn: 1, wantErr: true},
+		{name: "one over maximum", span: MaxCheckpointGroupUpdateEntries + 1, applied: MaxCheckpointGroupUpdateEntries + 1, txn: 1, wantErr: true},
+		{name: "span exceeds history", span: 2, applied: 1, txn: 1, wantErr: true},
+		{name: "apply exceeds span envelope", span: 2, applied: 3, txn: 1, wantErr: true},
+		{name: "c0 cannot advertise batching", span: 2, applied: 0, txn: 0, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			certificate := base
+			checkpointGroupTestSetMaxSpan(
+				&certificate, test.span, test.txn, test.applied,
+			)
+			certificate.applied = test.applied
+			certificate.txnHighWater = test.txn
+			encoded, err := encodeCheckpointGroupCertificate(certificate)
+			if test.wantErr {
+				if !errors.Is(err, ErrCheckpointGroupCorrupt) {
+					t.Fatalf("encode = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeCheckpointGroupCertificate(encoded)
+			if err != nil || decoded.maxApplySpan != test.wantStored ||
+				(test.wantStored > 1 &&
+					(decoded.maxSpanTxn != test.txn || decoded.maxSpanLast != test.applied ||
+						decoded.maxSpanFirst+uint64(test.wantStored)-1 != decoded.maxSpanLast)) {
+				t.Fatalf("decode span/witness = %d/%d:[%d,%d], %v",
+					decoded.maxApplySpan, decoded.maxSpanTxn,
+					decoded.maxSpanFirst, decoded.maxSpanLast, err)
+			}
+		})
+	}
+
+	if !checkpointGroupAppliedWithin(math.MaxUint64-1, math.MaxUint64, 128) ||
+		checkpointGroupAppliedWithin(257, 2, 128) {
+		t.Fatal("overflow-safe applied/transaction span sanity changed")
+	}
+
+	seeded := base
+	seeded.seedApplied = 9
+	seeded.seedState = sha256.Sum256([]byte("seed-state"))
+	seeded.seedMember = sha256.Sum256([]byte("seed-member"))
+	seeded.applied = 11
+	seeded.txnHighWater = 3
+	checkpointGroupTestSetMaxSpan(&seeded, 2, 3, 11)
+	if !validCheckpointGroupSeedCertificate(seeded) {
+		t.Fatalf("reachable seeded batch rejected: %+v", seeded)
+	}
+	belowSeed := seeded
+	belowSeed.maxSpanFirst = 1
+	belowSeed.maxSpanLast = 2
+	if validCheckpointGroupSeedCertificate(belowSeed) {
+		t.Fatal("seeded certificate accepted a max-span witness below the imported cut")
+	}
+	baseBinding := seeded
+	baseBinding.maxSpanTxn = 2
+	if validCheckpointGroupSeedCertificate(baseBinding) {
+		t.Fatal("seeded certificate treated the same-index base binding as a batch witness")
+	}
+	seeded.applied = 0
+	seeded.txnHighWater = 0
+	if validCheckpointGroupSeedCertificate(seeded) {
+		t.Fatal("seed cut zero advertised a batched history")
+	}
+}
+
+func TestCheckpointGroupCertificateMaxApplySpanTamperIsAuthenticatedCorruption(t *testing.T) {
+	_, _, _, group := newCheckpointGroupTestStore(t, 8)
+	certificate := group.certificateLocked()
+	certificate.applied = 2
+	certificate.txnHighWater = 1
+	checkpointGroupTestSetMaxSpan(&certificate, 2, 1, 2)
+	encoded, err := encodeCheckpointGroupCertificate(certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, span := range []uint8{0, 1, MaxCheckpointGroupUpdateEntries + 1} {
+		tampered := bytes.Clone(encoded)
+		tampered[checkpointGroupMaxApplySpanOffset] = span
+		h := sha256.New()
+		_, _ = h.Write(checkpointGroupDigestDomain)
+		_, _ = h.Write(tampered[:checkpointGroupChecksumOffset])
+		copy(tampered[checkpointGroupChecksumOffset:], h.Sum(nil))
+		if _, err := decodeCheckpointGroupCertificate(tampered); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("checksum-valid malformed span %d = %v", span, err)
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		offset int
+		value  uint64
+	}{
+		{name: "zero transaction", offset: checkpointGroupMaxSpanWitnessTxnOffset, value: 0},
+		{name: "future transaction", offset: checkpointGroupMaxSpanWitnessTxnOffset, value: 2},
+		{name: "zero first", offset: checkpointGroupMaxSpanWitnessFirstOffset, value: 0},
+		{name: "short range", offset: checkpointGroupMaxSpanWitnessLastOffset, value: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tampered := bytes.Clone(encoded)
+			binary.LittleEndian.PutUint64(tampered[test.offset:test.offset+8], test.value)
+			h := sha256.New()
+			_, _ = h.Write(checkpointGroupDigestDomain)
+			_, _ = h.Write(tampered[:checkpointGroupChecksumOffset])
+			copy(tampered[checkpointGroupChecksumOffset:], h.Sum(nil))
+			if _, err := decodeCheckpointGroupCertificate(tampered); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+				t.Fatalf("checksum-valid malformed witness = %v", err)
+			}
+		})
+	}
+}
+
 func TestCheckpointGroupThreeMemberBarrierAndRecovery(t *testing.T) {
 	names := []string{"system", "user", "aux"}
 	dir, members, _, group := newCheckpointGroupTestStoreWithNames(
@@ -378,6 +861,30 @@ func TestCheckpointGroupCertificateCanonicalSlots(t *testing.T) {
 		start := newer.slot * checkpointGroupSlotBytes
 		return data[start : start+checkpointGroupSlotBytes]
 	}
+	pairImage := func(
+		t *testing.T,
+		previous, selected checkpointGroupCertificate,
+	) []byte {
+		t.Helper()
+		image := make([]byte, checkpointGroupFileBytes)
+		for _, item := range []struct {
+			slot        int
+			certificate checkpointGroupCertificate
+		}{
+			{slot: older.slot, certificate: previous},
+			{slot: newer.slot, certificate: selected},
+		} {
+			encoded, err := encodeCheckpointGroupCertificate(item.certificate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			copy(
+				image[item.slot*checkpointGroupSlotBytes:(item.slot+1)*checkpointGroupSlotBytes],
+				encoded,
+			)
+		}
+		return image
+	}
 
 	t.Run("authenticated-reserved", func(t *testing.T) {
 		image := bytes.Clone(raw)
@@ -386,6 +893,15 @@ func TestCheckpointGroupCertificateCanonicalSlots(t *testing.T) {
 		resign(slot)
 		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
 			t.Fatalf("reserved-byte certificate = %v", err)
+		}
+	})
+	t.Run("authenticated-reserved-tail", func(t *testing.T) {
+		image := bytes.Clone(raw)
+		slot := newestBytes(image)
+		slot[15] = 1
+		resign(slot)
+		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("reserved-tail certificate = %v", err)
 		}
 	})
 	t.Run("authenticated-padding", func(t *testing.T) {
@@ -397,6 +913,34 @@ func TestCheckpointGroupCertificateCanonicalSlots(t *testing.T) {
 		resign(slot)
 		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
 			t.Fatalf("padding-byte certificate = %v", err)
+		}
+	})
+	t.Run("authenticated-witness-neighbor-padding", func(t *testing.T) {
+		image := bytes.Clone(raw)
+		slot := newestBytes(image)
+		slot[checkpointGroupMaxSpanWitnessTxnOffset-1] = 1
+		resign(slot)
+		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("witness-neighbor padding certificate = %v", err)
+		}
+	})
+	t.Run("authenticated-witness-with-legacy-span", func(t *testing.T) {
+		image := bytes.Clone(raw)
+		slot := newestBytes(image)
+		binary.LittleEndian.PutUint64(
+			slot[checkpointGroupMaxSpanWitnessTxnOffset:checkpointGroupMaxSpanWitnessFirstOffset],
+			1,
+		)
+		resign(slot)
+		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("legacy span with witness = %v", err)
+		}
+	})
+	t.Run("checksum-boundary-is-not-padding", func(t *testing.T) {
+		slot := bytes.Clone(newestBytes(raw))
+		slot[checkpointGroupChecksumOffset] ^= 1
+		if _, err := decodeCheckpointGroupCertificate(slot); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("checksum boundary tamper = %v", err)
 		}
 	})
 	t.Run("slot-parity", func(t *testing.T) {
@@ -421,6 +965,134 @@ func TestCheckpointGroupCertificateCanonicalSlots(t *testing.T) {
 		copy(newestBytes(image), encoded)
 		if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
 			t.Fatalf("gapped certificate history = %v", err)
+		}
+	})
+	for _, test := range []struct {
+		name string
+		span uint8
+	}{
+		{name: "two", span: 2},
+		{name: "legacy-zero", span: 0},
+	} {
+		t.Run("max-apply-span-regression-"+test.name, func(t *testing.T) {
+			image := make([]byte, checkpointGroupFileBytes)
+			historical := older.certificate
+			historical.applied = MaxCheckpointGroupUpdateEntries
+			historical.txnHighWater = 1
+			historical.txnBase = 0
+			checkpointGroupTestSetMaxSpan(
+				&historical, MaxCheckpointGroupUpdateEntries, 1,
+				MaxCheckpointGroupUpdateEntries,
+			)
+			encoded, err := encodeCheckpointGroupCertificate(historical)
+			if err != nil {
+				t.Fatal(err)
+			}
+			copy(
+				image[older.slot*checkpointGroupSlotBytes:(older.slot+1)*checkpointGroupSlotBytes],
+				encoded,
+			)
+
+			regressed := newer.certificate
+			regressed.applied = MaxCheckpointGroupUpdateEntries
+			regressed.txnHighWater = MaxCheckpointGroupUpdateEntries
+			regressed.txnBase = 0
+			checkpointGroupTestSetMaxSpan(
+				&regressed, test.span, MaxCheckpointGroupUpdateEntries,
+				MaxCheckpointGroupUpdateEntries,
+			)
+			encoded, err = encodeCheckpointGroupCertificate(regressed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			copy(
+				image[newer.slot*checkpointGroupSlotBytes:(newer.slot+1)*checkpointGroupSlotBytes],
+				encoded,
+			)
+			if _, err := openRaw(t, image); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+				t.Fatalf("regressed max apply span %d = %v", test.span, err)
+			}
+		})
+	}
+	t.Run("max-apply-span-first-widening-needs-new-range-witness", func(t *testing.T) {
+		historical := older.certificate
+		historical.applied = 100
+		historical.txnHighWater = 100
+		historical.txnBase = 0
+		selected := newer.certificate
+		selected.applied = MaxCheckpointGroupUpdateEntries
+		selected.txnHighWater = 101
+		selected.txnBase = 0
+		checkpointGroupTestSetMaxSpan(
+			&selected, MaxCheckpointGroupUpdateEntries, 101,
+			MaxCheckpointGroupUpdateEntries,
+		)
+		if _, err := openRaw(t, pairImage(t, historical, selected)); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("stale max-span witness = %v", err)
+		}
+	})
+	t.Run("max-apply-span-exact-new-range-witness", func(t *testing.T) {
+		historical := older.certificate
+		historical.applied = 100
+		historical.txnHighWater = 100
+		historical.txnBase = 0
+		selected := newer.certificate
+		selected.applied = 100 + MaxCheckpointGroupUpdateEntries
+		selected.txnHighWater = 101
+		selected.txnBase = 0
+		checkpointGroupTestSetMaxSpan(
+			&selected, MaxCheckpointGroupUpdateEntries, 101,
+			selected.applied,
+		)
+		certificate, err := openRaw(t, pairImage(t, historical, selected))
+		if err != nil || certificate.maxSpanFirst != 101 ||
+			certificate.maxSpanLast != selected.applied {
+			t.Fatalf("exact max-span witness = %+v, %v", certificate, err)
+		}
+	})
+	t.Run("max-apply-span-witness-respects-transaction-partition", func(t *testing.T) {
+		historical := older.certificate
+		historical.applied = 100
+		historical.txnHighWater = 100
+		historical.txnBase = 0
+		selected := newer.certificate
+		selected.applied = 101 + MaxCheckpointGroupUpdateEntries
+		selected.txnHighWater = 102
+		selected.txnBase = 0
+		checkpointGroupTestSetMaxSpan(
+			&selected, MaxCheckpointGroupUpdateEntries, 101,
+			selected.applied,
+		)
+		if _, err := openRaw(t, pairImage(t, historical, selected)); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("chronologically false max-span witness = %v", err)
+		}
+	})
+	t.Run("marker-rollover-cannot-combine-new-transaction", func(t *testing.T) {
+		historical := older.certificate
+		historical.applied = 10
+		historical.txnHighWater = 10
+		historical.txnBase = 0
+		selected := newer.certificate
+		selected.applied = 11
+		selected.txnHighWater = 11
+		selected.txnBase = 10
+		selected.markerEpoch = historical.markerEpoch + 1
+		if _, err := openRaw(t, pairImage(t, historical, selected)); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("combined rollover transaction = %v", err)
+		}
+	})
+	t.Run("exact-empty-marker-rollover", func(t *testing.T) {
+		historical := older.certificate
+		historical.applied = 10
+		historical.txnHighWater = 10
+		historical.txnBase = 0
+		selected := newer.certificate
+		selected.applied = historical.applied
+		selected.txnHighWater = historical.txnHighWater
+		selected.txnBase = historical.txnHighWater
+		selected.markerEpoch = historical.markerEpoch + 1
+		if _, err := openRaw(t, pairImage(t, historical, selected)); err != nil {
+			t.Fatalf("exact rollover = %v", err)
 		}
 	})
 	t.Run("torn-newest-falls-back", func(t *testing.T) {
@@ -1246,6 +1918,30 @@ func openCheckpointGroupTestCopyNames(
 	return collections, log, group
 }
 
+func closeCheckpointGroupTestHandles(
+	t testing.TB,
+	collections []*Collection,
+	log *TxnLog,
+	group *CheckpointGroup,
+) {
+	t.Helper()
+	var err error
+	if group != nil {
+		err = errors.Join(err, group.Close())
+	}
+	for _, collection := range collections {
+		if collection != nil {
+			err = errors.Join(err, collection.Close())
+		}
+	}
+	if log != nil {
+		err = errors.Join(err, log.Close())
+	}
+	if err != nil {
+		t.Fatalf("close checkpoint-group test handles: %v", err)
+	}
+}
+
 func checkpointGroupTestOpenRequests(
 	t *testing.T, dir string,
 ) ([]TransactionCollectionOpen, []*os.File) {
@@ -1407,6 +2103,11 @@ func TestCheckpointGroupRecoveryRepairsMissingOrTornMarker(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
 			checkpointGroupPut(t, group, 1, members, "certified")
+			group.mu.Lock()
+			wantMarkerID := group.markerID
+			wantMarkerEpoch := group.markerEpoch + 1
+			wantBaseSequence := group.txn
+			group.mu.Unlock()
 			fault := errors.New("stop after certificate sync")
 			previousHook := checkpointGroupFaultHook
 			checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
@@ -1424,9 +2125,15 @@ func TestCheckpointGroupRecoveryRepairsMissingOrTornMarker(t *testing.T) {
 			crashImage := copyCheckpointGroupDirectory(t, dir)
 			clearCheckpointGroupTestPoison(group)
 			test.damage(t, filepath.Join(crashImage, txnMarkerFilename))
-			collections, _, reopened := openCheckpointGroupTestCopy(t, crashImage)
+			collections, recoveredLog, reopened := openCheckpointGroupTestCopy(t, crashImage)
 			if reopened.CheckpointAppliedIndex() != 1 {
 				t.Fatalf("repaired checkpoint cut = %d", reopened.CheckpointAppliedIndex())
+			}
+			header := recoveredLog.marker.Header()
+			if header.MarkerID != wantMarkerID || header.Epoch != wantMarkerEpoch ||
+				header.BaseSequence != wantBaseSequence {
+				t.Fatalf("anchored replacement marker = %+v, want id %x epoch %d base %d",
+					header, wantMarkerID, wantMarkerEpoch, wantBaseSequence)
 			}
 			for _, collection := range collections {
 				if _, ok := collectionDoc(t, collection, "certified"); !ok {
@@ -1435,6 +2142,413 @@ func TestCheckpointGroupRecoveryRepairsMissingOrTornMarker(t *testing.T) {
 			}
 			if info, statErr := os.Stat(filepath.Join(crashImage, txnMarkerFilename)); statErr != nil || !info.Mode().IsRegular() {
 				t.Fatalf("replacement marker = %v, %v", info, statErr)
+			}
+			closeCheckpointGroupTestHandles(t, collections, recoveredLog, reopened)
+
+			secondCollections, _, second := openCheckpointGroupTestCopy(t, crashImage)
+			secondMembers := make([]NamedCollection, len(secondCollections))
+			for index, collection := range secondCollections {
+				secondMembers[index] = NamedCollection{
+					Name: []string{"system", "user"}[index], Collection: collection,
+				}
+			}
+			checkpointGroupPut(t, second, 2, secondMembers, "after-repair")
+			if err := second.Checkpoint(); err != nil {
+				t.Fatalf("checkpoint after second reopen: %v", err)
+			}
+		})
+	}
+}
+
+func corruptNewestCheckpointGroupCertificateSlot(t testing.TB, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, checkpointGroupFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newestSlot := -1
+	var newestSequence uint64
+	for slot := 0; slot < checkpointGroupSlots; slot++ {
+		start := slot * checkpointGroupSlotBytes
+		certificate, decodeErr := decodeCheckpointGroupCertificate(
+			data[start : start+checkpointGroupSlotBytes],
+		)
+		if decodeErr == nil && (newestSlot < 0 || certificate.sequence > newestSequence) {
+			newestSlot = slot
+			newestSequence = certificate.sequence
+		}
+	}
+	if newestSlot < 0 {
+		t.Fatal("no valid certificate slot to tear")
+	}
+	data[newestSlot*checkpointGroupSlotBytes] ^= 0x80
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointGroupMarkerRepairCrashCutsReopenTwiceAndAdvance(t *testing.T) {
+	for _, test := range []struct {
+		name                      string
+		capturePoint              checkpointGroupFaultPoint
+		captureAfterMarker        bool
+		tearNewCertificate        bool
+		selectedRepairCertificate bool
+	}{
+		{
+			name: "anchored-marker-before-certificate", captureAfterMarker: true,
+		},
+		{
+			name:                      "full-certificate-write-before-sync",
+			capturePoint:              checkpointGroupAfterCertificateWrite,
+			selectedRepairCertificate: true,
+		},
+		{
+			name:               "torn-certificate-write-before-sync",
+			capturePoint:       checkpointGroupAfterCertificateWrite,
+			tearNewCertificate: true,
+		},
+		{
+			name:                      "after-certificate-sync",
+			capturePoint:              checkpointGroupAfterCertificateSync,
+			selectedRepairCertificate: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "certified")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			group.mu.Lock()
+			wantMarkerID := group.markerID
+			group.mu.Unlock()
+
+			damaged := copyCheckpointGroupDirectory(t, dir)
+			if err := os.Remove(filepath.Join(damaged, txnMarkerFilename)); err != nil {
+				t.Fatal(err)
+			}
+			var crashImage string
+			fault := errors.New("stop marker repair recovery")
+			previousMintHook := databaseTxnAfterMintHook
+			previousCheckpointHook := checkpointGroupFaultHook
+			defer func() {
+				databaseTxnAfterMintHook = previousMintHook
+				checkpointGroupFaultHook = previousCheckpointHook
+			}()
+			if test.captureAfterMarker {
+				databaseTxnAfterMintHook = func(*TxnLog) {
+					if crashImage == "" {
+						crashImage = copyCheckpointGroupDirectory(t, damaged)
+					}
+				}
+			}
+			checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+				if test.captureAfterMarker {
+					if point == checkpointGroupAfterCertificateWrite {
+						return fault
+					}
+					return nil
+				}
+				if point == test.capturePoint {
+					crashImage = copyCheckpointGroupDirectory(t, damaged)
+					return fault
+				}
+				return nil
+			}
+
+			requests, files := checkpointGroupTestOpenRequests(t, damaged)
+			collections, log, recovered, err := OpenCollectionsWithCheckpointGroup(
+				damaged, TxnLogOptions{}, requests, []string{"system", "user"},
+				CheckpointGroupOptions{CheckpointEvery: 8},
+			)
+			databaseTxnAfterMintHook = previousMintHook
+			checkpointGroupFaultHook = previousCheckpointHook
+			if recovered != nil || log != nil || collections != nil || !errors.Is(err, fault) {
+				t.Fatalf("faulted marker repair = collections %v log %v group %v err %v",
+					collections, log, recovered, err)
+			}
+			for _, file := range files {
+				_ = file.Close()
+			}
+			if crashImage == "" {
+				t.Fatal("marker repair crash image was not captured")
+			}
+			if test.tearNewCertificate {
+				corruptNewestCheckpointGroupCertificateSlot(t, crashImage)
+			}
+			anchoredMarker, _, err := storeio.OpenTxnMarker(
+				filepath.Join(crashImage, txnMarkerFilename), storeio.TxnMarkerOptions{},
+			)
+			if err != nil {
+				t.Fatalf("open anchored crash marker: %v", err)
+			}
+			anchoredHeader := anchoredMarker.Header()
+			if err := anchoredMarker.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if anchoredHeader.MarkerID != wantMarkerID ||
+				anchoredHeader.BaseSequence != 1 || anchoredHeader.RecycleCount != 1 {
+				t.Fatalf("anchored crash marker = %+v", anchoredHeader)
+			}
+			wantFirstEpoch := anchoredHeader.Epoch
+			wantFirstRecycleCount := anchoredHeader.RecycleCount
+			if test.selectedRepairCertificate {
+				wantFirstEpoch++
+				wantFirstRecycleCount++
+			}
+
+			firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, crashImage)
+			if first.AppliedIndex() != 1 || first.CheckpointAppliedIndex() != 1 {
+				t.Fatalf("first crash reopen cut = %d/%d",
+					first.AppliedIndex(), first.CheckpointAppliedIndex())
+			}
+			firstHeader := firstLog.marker.Header()
+			if firstHeader.MarkerID != wantMarkerID ||
+				firstHeader.Epoch != wantFirstEpoch || firstHeader.BaseSequence != 1 ||
+				firstHeader.RecycleCount != wantFirstRecycleCount {
+				t.Fatalf("first crash reopen marker = %+v, anchored %+v",
+					firstHeader, anchoredHeader)
+			}
+			closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
+
+			secondCollections, _, second := openCheckpointGroupTestCopy(t, crashImage)
+			secondMembers := []NamedCollection{
+				{Name: "system", Collection: secondCollections[0]},
+				{Name: "user", Collection: secondCollections[1]},
+			}
+			checkpointGroupPut(t, second, 2, secondMembers, "after-crash-repair")
+			if err := second.Checkpoint(); err != nil {
+				t.Fatalf("checkpoint after second crash reopen: %v", err)
+			}
+			for _, collection := range secondCollections {
+				if _, found := collectionDoc(t, collection, "after-crash-repair"); !found {
+					t.Fatal("post-repair update is missing")
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupMarkerRepairExhaustionDoesNotUnlinkMarker(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*checkpointGroupCertificate)
+	}{
+		{
+			name: "certificate-sequence",
+			mutate: func(certificate *checkpointGroupCertificate) {
+				certificate.sequence = math.MaxUint64
+				certificate.markerID[0] ^= 0xff
+			},
+		},
+		{
+			name: "marker-epoch",
+			mutate: func(certificate *checkpointGroupCertificate) {
+				certificate.markerEpoch = math.MaxUint64
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "certified")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+
+			certificatePath := filepath.Join(crashImage, checkpointGroupFilename)
+			raw, err := os.ReadFile(certificatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var selected checkpointGroupCertificate
+			for slot := 0; slot < checkpointGroupSlots; slot++ {
+				start := slot * checkpointGroupSlotBytes
+				candidate, decodeErr := decodeCheckpointGroupCertificate(
+					raw[start : start+checkpointGroupSlotBytes],
+				)
+				if decodeErr == nil && candidate.sequence > selected.sequence {
+					selected = candidate
+				}
+			}
+			if selected.sequence == 0 {
+				t.Fatal("test certificate has no valid slot")
+			}
+			test.mutate(&selected)
+			encoded, err := encodeCheckpointGroupCertificate(selected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clear(raw)
+			start := int(selected.sequence%checkpointGroupSlots) * checkpointGroupSlotBytes
+			copy(raw[start:start+checkpointGroupSlotBytes], encoded)
+			if err := os.WriteFile(certificatePath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			markerPath := filepath.Join(crashImage, txnMarkerFilename)
+			markerBefore, err := os.ReadFile(markerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+			collections, log, reopened, err := OpenCollectionsWithCheckpointGroup(
+				crashImage, TxnLogOptions{}, requests, []string{"system", "user"},
+				CheckpointGroupOptions{CheckpointEvery: 8},
+			)
+			if collections != nil || log != nil || reopened != nil ||
+				!errors.Is(err, ErrCheckpointGroupSequence) {
+				t.Fatalf("exhausted repair = collections %v log %v group %v err %v",
+					collections, log, reopened, err)
+			}
+			for _, file := range files {
+				_ = file.Close()
+			}
+			markerAfter, err := os.ReadFile(markerPath)
+			if err != nil || !bytes.Equal(markerAfter, markerBefore) {
+				t.Fatalf("marker changed before exhausted repair refusal: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupMarkerRepairTerminalTransactionAnchorIsExhausted(t *testing.T) {
+	dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+	checkpointGroupPut(t, group, 1, members, "certified")
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	certificatePath := filepath.Join(crashImage, checkpointGroupFilename)
+	raw, err := os.ReadFile(certificatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected checkpointGroupCertificate
+	for slot := 0; slot < checkpointGroupSlots; slot++ {
+		start := slot * checkpointGroupSlotBytes
+		candidate, decodeErr := decodeCheckpointGroupCertificate(
+			raw[start : start+checkpointGroupSlotBytes],
+		)
+		if decodeErr == nil && candidate.sequence > selected.sequence {
+			selected = candidate
+		}
+	}
+	if selected.sequence == 0 {
+		t.Fatal("test certificate has no valid slot")
+	}
+	selected.txnHighWater = math.MaxUint64
+	encoded, err := encodeCheckpointGroupCertificate(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(raw)
+	start := int(selected.sequence%checkpointGroupSlots) * checkpointGroupSlotBytes
+	copy(raw[start:start+checkpointGroupSlotBytes], encoded)
+	if err := os.WriteFile(certificatePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(crashImage, txnMarkerFilename)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertExhausted := func(
+		collections []*Collection,
+		log *TxnLog,
+		reopened *CheckpointGroup,
+	) {
+		t.Helper()
+		header := log.marker.Header()
+		if header.BaseSequence != math.MaxUint64 || log.marker.NextSequence() != 0 ||
+			log.nextTxnID != math.MaxUint64 || reopened.txn != math.MaxUint64 {
+			t.Fatalf("terminal repaired marker = header %+v marker next %d log next %d group txn %d",
+				header, log.marker.NextSequence(), log.nextTxnID, reopened.txn)
+		}
+		named := []NamedCollection{
+			{Name: "system", Collection: collections[0]},
+			{Name: "user", Collection: collections[1]},
+		}
+		err := reopened.Update(
+			2, named, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+				write, collectionErr := batch.Collection("system")
+				if collectionErr != nil {
+					return collectionErr
+				}
+				return write.Put([]byte("must-not-append"), []byte(`{"n":2}`))
+			},
+		)
+		if !errors.Is(err, ErrCheckpointGroupSequence) ||
+			log.marker.NextSequence() != 0 || log.nextTxnID != math.MaxUint64 {
+			t.Fatalf("terminal repaired update = %v marker next %d log next %d",
+				err, log.marker.NextSequence(), log.nextTxnID)
+		}
+	}
+
+	firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, crashImage)
+	assertExhausted(firstCollections, firstLog, first)
+	closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
+	secondCollections, secondLog, second := openCheckpointGroupTestCopy(t, crashImage)
+	assertExhausted(secondCollections, secondLog, second)
+}
+
+func TestCheckpointGroupMarkerRepairRetriesEveryAnchoredCreateFault(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		phase storeio.TxnMarkerFaultPhase
+	}{
+		{"header-write", storeio.TxnMarkerFaultCreateHeaderWrite},
+		{"file-sync", storeio.TxnMarkerFaultCreateFileSync},
+		{"parent-directory-sync", storeio.TxnMarkerFaultCreateParentDirSync},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "certified")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			group.mu.Lock()
+			wantMarkerID := group.markerID
+			group.mu.Unlock()
+			damaged := copyCheckpointGroupDirectory(t, dir)
+			if err := os.Remove(filepath.Join(damaged, txnMarkerFilename)); err != nil {
+				t.Fatal(err)
+			}
+
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{Phase: test.phase})
+			defer storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+			requests, files := checkpointGroupTestOpenRequests(t, damaged)
+			collections, log, recovered, err := OpenCollectionsWithCheckpointGroup(
+				damaged, TxnLogOptions{}, requests, []string{"system", "user"},
+				CheckpointGroupOptions{CheckpointEvery: 8},
+			)
+			if collections != nil || log != nil || recovered != nil || err == nil ||
+				!storeio.TxnMarkerCreateFaulted() {
+				t.Fatalf("anchored create fault = collections %v log %v group %v err %v fired %v",
+					collections, log, recovered, err, storeio.TxnMarkerCreateFaulted())
+			}
+			for _, file := range files {
+				_ = file.Close()
+			}
+			storeio.ProgramTxnMarkerCreateFault(storeio.TxnMarkerFaultPlan{})
+
+			firstCollections, firstLog, first := openCheckpointGroupTestCopy(t, damaged)
+			if first.AppliedIndex() != 1 || first.CheckpointAppliedIndex() != 1 ||
+				firstLog.marker.Header().MarkerID != wantMarkerID {
+				t.Fatalf("retry after anchored create fault = cut %d/%d marker %+v",
+					first.AppliedIndex(), first.CheckpointAppliedIndex(), firstLog.marker.Header())
+			}
+			closeCheckpointGroupTestHandles(t, firstCollections, firstLog, first)
+
+			secondCollections, _, second := openCheckpointGroupTestCopy(t, damaged)
+			secondMembers := []NamedCollection{
+				{Name: "system", Collection: secondCollections[0]},
+				{Name: "user", Collection: secondCollections[1]},
+			}
+			checkpointGroupPut(t, second, 2, secondMembers, "after-create-fault")
+			if err := second.Checkpoint(); err != nil {
+				t.Fatalf("checkpoint after anchored create retry: %v", err)
 			}
 		})
 	}

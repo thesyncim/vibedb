@@ -3,6 +3,7 @@ package durable
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -226,7 +227,21 @@ func openCollectionsWithCheckpointGroup(
 
 	markerRepaired := false
 	if markerRepair {
-		if err := replaceCheckpointGroupMarker(recovery.log); err != nil {
+		if certificate.sequence == math.MaxUint64 ||
+			certificate.markerEpoch == math.MaxUint64 {
+			return abort(collections, fmt.Errorf(
+				"%w: marker repair exhausted certificate sequence or epoch",
+				ErrCheckpointGroupSequence,
+			))
+		}
+		if err := replaceCheckpointGroupMarker(
+			recovery.log,
+			storeio.TxnMarkerRecoveryAnchor{
+				MarkerID:     certificate.markerID,
+				Epoch:        certificate.markerEpoch + 1,
+				BaseSequence: certificate.txnHighWater,
+			},
+		); err != nil {
 			return abort(collections, err)
 		}
 		header = recovery.log.marker.Header()
@@ -389,7 +404,10 @@ func checkpointGroupMarkerRepairable(err error) bool {
 		errors.Is(err, storeio.ErrTxnMarkerRecord)
 }
 
-func replaceCheckpointGroupMarker(log *TxnLog) error {
+func replaceCheckpointGroupMarker(
+	log *TxnLog,
+	anchor storeio.TxnMarkerRecoveryAnchor,
+) error {
 	if log == nil || log.root == nil {
 		return ErrCheckpointGroupCorrupt
 	}
@@ -429,10 +447,26 @@ func replaceCheckpointGroupMarker(log *TxnLog) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := log.ensureMintedLocked(); err != nil {
+	marker, err := storeio.CreateTxnMarkerAtRecoveryAnchor(
+		log.root, txnMarkerFilename,
+		storeio.TxnMarkerOptions{
+			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity,
+		},
+		anchor,
+	)
+	if err != nil {
 		return err
 	}
+	log.marker = marker
+	if anchor.BaseSequence == math.MaxUint64 {
+		log.nextTxnID = math.MaxUint64
+	} else {
+		log.nextTxnID = anchor.BaseSequence + 1
+	}
 	log.undischarged = 0
+	if databaseTxnAfterMintHook != nil {
+		databaseTxnAfterMintHook(log)
+	}
 	return nil
 }
 

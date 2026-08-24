@@ -116,6 +116,8 @@ type ReplicatedApply struct {
 	closed            bool
 	attemptGeneration uint64
 	attemptActive     bool
+	attemptBatch      bool
+	attemptKeys       replicatedAttemptBinaryKeys
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -126,7 +128,21 @@ type ReplicatedApply struct {
 	activationBasePending [sha256.Size]byte
 }
 
+// replicatedAttemptBinaryKeys is stable storage for the interface value passed
+// into txnclock. Pointing the interface at this claim-owned adapter keeps the
+// synchronous borrowed-key call allocation-free. Keys is cleared immediately
+// after publication and is never retained by the clock.
+type replicatedAttemptBinaryKeys struct {
+	keys replicatedstate.AttemptedMutationKeys
+}
+
+func (keys *replicatedAttemptBinaryKeys) Len() int { return keys.keys.Len() }
+func (keys *replicatedAttemptBinaryKeys) Key(index int) []byte {
+	return keys.keys.Key(index)
+}
+
 var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
+var _ raftmodel.NormalBatchStateMachine = (*ReplicatedApply)(nil)
 
 type replicatedApplyMeta struct {
 	Format            uint16
@@ -792,14 +808,16 @@ func (a *ReplicatedApply) observeMutationAttempt(
 	if !a.attemptActive ||
 		(a.table.collection.Generation() == a.attemptGeneration &&
 			a.table.collection.PersistenceError() == nil &&
-			!errors.Is(updateErr, durable.ErrCommitOutcomeUnknown)) {
+			!errors.Is(updateErr, durable.ErrCommitOutcomeUnknown) &&
+			!(a.attemptBatch && updateErr == nil)) {
 		return
 	}
-	changed := make([]string, keys.Len())
-	for i := range changed {
-		changed[i] = string(keys.Key(i))
+	if a.table.conflicts.recordWriteIfNoActive() {
+		return
 	}
-	a.table.conflicts.recordKeys(changed)
+	a.attemptKeys.keys = keys
+	a.table.conflicts.recordBinary(&a.attemptKeys)
+	a.attemptKeys.keys = replicatedstate.AttemptedMutationKeys{}
 }
 
 func (a *ReplicatedApply) checkLocked() error {
@@ -1027,6 +1045,36 @@ func (a *ReplicatedApply) ApplyNormal(
 	return publication, err
 }
 
+// ApplyNormalBatch implements raftmodel.NormalBatchStateMachine under one SQL
+// publication lock. The underlying Machine publishes an exact prefix through
+// one checkpoint-group transaction and reports the union of its logically
+// attempted user keys to the conflict clock.
+func (a *ReplicatedApply) ApplyNormalBatch(
+	entries []raftmodel.NormalApply,
+	dataChainWitnesses [][32]byte,
+) (int, raftmodel.Publication, error) {
+	clear(dataChainWitnesses[:min(len(entries), len(dataChainWitnesses))])
+	if a == nil || a.database == nil {
+		return 0, raftmodel.Publication{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.Lock()
+	defer a.database.mu.Unlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, raftmodel.Publication{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return 0, raftmodel.Publication{}, err
+	}
+	a.attemptGeneration = a.table.collection.Generation()
+	a.attemptActive = true
+	a.attemptBatch = true
+	applied, publication, err := a.machine.ApplyNormalBatch(entries, dataChainWitnesses)
+	a.attemptBatch = false
+	a.attemptActive = false
+	a.attemptGeneration = 0
+	return applied, publication, err
+}
+
 // ApplyConfiguration implements raftmodel.StateMachine under the SQL
 // publication lock.
 func (a *ReplicatedApply) ApplyConfiguration(
@@ -1128,6 +1176,24 @@ func (a *ReplicatedApply) LookupCompletion(
 		return replicatedstate.CompletionLookup{}, err
 	}
 	return a.machine.LookupCompletion(data)
+}
+
+// DurabilityStats returns detached physical checkpoint-group counters for
+// apply batching and checkpoint observability. It exposes no storage handle or
+// serving authority.
+func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error) {
+	if a == nil || a.database == nil {
+		return durable.CheckpointGroupStats{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return durable.CheckpointGroupStats{}, err
+	}
+	if a.database.checkpointGroup == nil {
+		return durable.CheckpointGroupStats{}, ErrReplicatedApplyMismatch
+	}
+	return a.database.checkpointGroup.Stats(), nil
 }
 
 func replicatedApplyProfileDigest(

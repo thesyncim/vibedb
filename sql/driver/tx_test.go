@@ -16,6 +16,11 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
+type transactionBinaryKeys [][]byte
+
+func (keys transactionBinaryKeys) Len() int             { return len(keys) }
+func (keys transactionBinaryKeys) Key(index int) []byte { return keys[index] }
+
 // Transaction reads include their own staged inserts and replacements.
 func TestTransactionSelectReadsStagedInsertAndUpdate(t *testing.T) {
 	db := openTestDB(t)
@@ -644,6 +649,42 @@ func TestTransactionConflictClockIsHardBounded(t *testing.T) {
 			len(clock.writes), len(clock.active),
 		)
 	}
+}
+
+func TestTransactionConflictClockInactiveWriteIsAllocationFree(t *testing.T) {
+	var clock txConflictClock
+	if !clock.recordWriteIfNoActive() {
+		t.Fatal("inactive clock requested exact keys")
+	}
+	before := clock.observe()
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if !clock.recordWriteIfNoActive() {
+			panic("inactive clock requested exact keys")
+		}
+	}); allocations != 0 {
+		t.Fatalf("inactive clock write allocations = %.2f", allocations)
+	}
+	if clock.observe() <= before || clock.writes != nil || clock.active != nil {
+		t.Fatalf("inactive clock = revision %d writes %v active %v",
+			clock.observe(), clock.writes, clock.active)
+	}
+	active := clock.begin()
+	if clock.recordWriteIfNoActive() {
+		t.Fatal("active clock omitted exact keys")
+	}
+	keys := transactionBinaryKeys{[]byte("binary-a"), []byte("binary-b")}
+	clock.recordBinary(&keys)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		clock.recordBinary(&keys)
+	}); allocations != 0 {
+		t.Fatalf("active binary clock allocations = %.2f", allocations)
+	}
+	if key, overflow, conflict := clock.conflict(
+		active, []string{"binary-b"},
+	); !conflict || overflow || key != "binary-b" {
+		t.Fatalf("active binary conflict = %q, %v, %v", key, overflow, conflict)
+	}
+	clock.finish(active)
 }
 
 // Rollback discards rows that were visible through the transaction overlay.

@@ -114,7 +114,9 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 	var crashIncarnation uint64
 	observedLast := lastBefore
 	for step := 0; step < 10_000; step++ {
-		result, driveErr := fixture.runtime.DriveReady(nil)
+		result, driveErr := fixture.runtime.DriveReady(
+			new(ReadyWorkspace), nil, settleTestApplied,
+		)
 		if driveErr != nil {
 			t.Fatalf("DriveReady(suffix) step %d: %v", step, driveErr)
 		}
@@ -300,7 +302,9 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 
 	// A second drain must be a true idle observation. Full system/user image
 	// equality also proves the replay did not advance the session ring twice.
-	idle, err := recoveryRuntime.DriveReady(func(OutboundMessage) error { return nil })
+	idle, err := recoveryRuntime.DriveReady(
+		new(ReadyWorkspace), func(OutboundMessage) error { return nil }, settleTestApplied,
+	)
 	if err != nil || idle.Progressed() {
 		t.Fatalf("post-replay DriveReady = %+v, %v", idle, err)
 	}

@@ -5,7 +5,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
+
+type clockBinaryKeys [][]byte
+
+func (keys clockBinaryKeys) Len() int             { return len(keys) }
+func (keys clockBinaryKeys) Key(index int) []byte { return keys[index] }
 
 func TestClockHistoryIsHardBounded(t *testing.T) {
 	var clock Clock
@@ -49,6 +55,51 @@ func TestClockHistoryIsHardBounded(t *testing.T) {
 			len(clock.Writes), len(clock.Active),
 		)
 	}
+}
+
+func TestClockRecordWriteIfNoActiveAvoidsKeyHistory(t *testing.T) {
+	var clock Clock
+	if !clock.RecordWriteIfNoActive() || clock.Observe() != 0 {
+		t.Fatalf("unarmed write = revision %d", clock.Observe())
+	}
+	clock.Arm()
+	if !clock.RecordWriteIfNoActive() || clock.Observe() != 1 ||
+		clock.Active != nil || clock.Writes != nil {
+		t.Fatalf("inactive write = revision %d active %v writes %v",
+			clock.Observe(), clock.Active, clock.Writes)
+	}
+	begin := clock.Begin()
+	if clock.RecordWriteIfNoActive() || clock.Observe() != begin {
+		t.Fatalf("active write omitted keys at revision %d", clock.Observe())
+	}
+	clock.RecordKeys([]string{"key"})
+	if key, overflow, conflict := clock.Conflict(begin, []string{"key"}); !conflict || overflow || key != "key" {
+		t.Fatalf("active exact conflict = %q, %v, %v", key, overflow, conflict)
+	}
+	clock.Finish(begin)
+}
+
+func TestClockBinaryKeysAreBorrowedAndCrossMatchStrings(t *testing.T) {
+	var clock Clock
+	clock.Arm()
+	begin := clock.Begin()
+	borrowed := []byte("watched")
+	clock.RecordBinary(clockBinaryKeys{borrowed})
+	borrowed[0] = 'X'
+
+	query := clockBinaryKeys{[]byte("watched")}
+	key, overflow, conflict := clock.ConflictBinary(begin, query)
+	if !conflict || overflow || string(key) != "watched" ||
+		len(key) == 0 || &key[0] != &query[0][0] {
+		t.Fatalf("binary conflict = %q, overflow %v, conflict %v", key, overflow, conflict)
+	}
+	if key, overflow, conflict := clock.Conflict(
+		begin, []string{"watched"},
+	); !conflict || overflow || key != "watched" {
+		t.Fatalf("cross string conflict = %q, overflow %v, conflict %v",
+			key, overflow, conflict)
+	}
+	clock.Finish(begin)
 }
 
 func TestClockPostOverflowObservationsRetainExactHistory(t *testing.T) {
@@ -160,10 +211,10 @@ func TestClockRevisionWindows(t *testing.T) {
 	}
 
 	clock.Finish(first)
-	if _, ok := clock.Writes["a"]; ok {
+	if _, ok := clock.Writes[clock.fingerprintString("a")]; ok {
 		t.Fatalf("finish retained key a after the only observer finished")
 	}
-	if _, ok := clock.Writes["b"]; !ok {
+	if _, ok := clock.Writes[clock.fingerprintString("b")]; !ok {
 		t.Fatalf("finish dropped key b still observable by second")
 	}
 	clock.Finish(second)
@@ -463,7 +514,7 @@ func TestClockArmDisarmQuiescence(t *testing.T) {
 		t.Fatalf("armed count after Disarm = %d, want 0", clock.Armed())
 	}
 	clock.RecordKeys([]string{"b"})
-	if _, ok := clock.Writes["b"]; ok {
+	if _, ok := clock.Writes[clock.fingerprintString("b")]; ok {
 		t.Fatalf("RecordKeys after Disarm quiescence retained b")
 	}
 	if key, overflow, conflict := clock.Conflict(begin, []string{"a"}); !conflict || overflow || key != "a" {
@@ -577,6 +628,43 @@ func BenchmarkClockRecordKeysUnarmed(b *testing.B) {
 	for b.Loop() {
 		clock.RecordKeys(keys)
 	}
+}
+
+func BenchmarkClockRecordCommittedKeys(b *testing.B) {
+	strings := make([]string, 8)
+	binary := make(clockBinaryKeys, len(strings))
+	for index := range strings {
+		strings[index] = fmt.Sprintf("binary-key-%02d", index)
+		binary[index] = []byte(strings[index])
+	}
+	b.Run("strings", func(b *testing.B) {
+		var clock Clock
+		clock.Arm()
+		begin := clock.Begin()
+		clock.RecordKeys(strings)
+		b.ReportAllocs()
+		b.SetBytes(int64(len(strings) * len(strings[0])))
+		b.ResetTimer()
+		for b.Loop() {
+			clock.RecordKeys(strings)
+		}
+		b.ReportMetric(float64(2*unsafe.Sizeof(uint64(0))), "history-payload-B/key")
+		clock.Finish(begin)
+	})
+	b.Run("borrowed-binary", func(b *testing.B) {
+		var clock Clock
+		clock.Arm()
+		begin := clock.Begin()
+		clock.RecordBinary(&binary)
+		b.ReportAllocs()
+		b.SetBytes(int64(len(binary) * len(binary[0])))
+		b.ResetTimer()
+		for b.Loop() {
+			clock.RecordBinary(&binary)
+		}
+		b.ReportMetric(float64(2*unsafe.Sizeof(uint64(0))), "history-payload-B/key")
+		clock.Finish(begin)
+	})
 }
 
 var (

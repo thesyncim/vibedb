@@ -155,6 +155,16 @@ type TxnMarkerOptions struct {
 	SealedCapacity bool
 }
 
+// TxnMarkerRecoveryAnchor identifies a clean replacement file for a recovery
+// authority that already authenticated the logical marker lineage. Epoch must
+// advance that authority's retained epoch. BaseSequence anchors the empty
+// replacement record region after its certified prefix.
+type TxnMarkerRecoveryAnchor struct {
+	MarkerID     [16]byte
+	Epoch        uint64
+	BaseSequence uint64
+}
+
 // TxnMarker is the single-writer file-backed manager for txn.vtm. It is not
 // safe for concurrent use.
 type TxnMarker struct {
@@ -849,7 +859,7 @@ func CreateTxnMarker(path string, opts TxnMarkerOptions) (*TxnMarker, error) {
 		return nil, err
 	}
 	return createTxnMarkerInRoot(
-		root, path, filepath.Base(path), sourceDir, opts,
+		root, path, filepath.Base(path), sourceDir, opts, nil,
 	)
 }
 
@@ -867,7 +877,35 @@ func CreateTxnMarkerAt(
 	}
 	sourceDir := filepath.Clean(root.Name())
 	return createTxnMarkerInRoot(
-		child, filepath.Join(sourceDir, name), name, sourceDir, opts,
+		child, filepath.Join(sourceDir, name), name, sourceDir, opts, nil,
+	)
+}
+
+// CreateTxnMarkerAtRecoveryAnchor creates a clean marker through the ordinary
+// exclusive-create and durability fence while retaining an authenticated
+// logical marker identity. The caller must prove the anchor from an external
+// recovery authority before this call.
+func CreateTxnMarkerAtRecoveryAnchor(
+	root *os.Root,
+	name string,
+	opts TxnMarkerOptions,
+	anchor TxnMarkerRecoveryAnchor,
+) (*TxnMarker, error) {
+	if root == nil || !validTxnMarkerName(name) {
+		return nil, fmt.Errorf("%w: invalid decision log root or name", ErrInvalidWrite)
+	}
+	if anchor.Epoch <= 1 {
+		return nil, fmt.Errorf(
+			"%w: recovery anchor epoch must exceed one", ErrInvalidWrite,
+		)
+	}
+	child, err := root.OpenRoot(".")
+	if err != nil {
+		return nil, err
+	}
+	sourceDir := filepath.Clean(root.Name())
+	return createTxnMarkerInRoot(
+		child, filepath.Join(sourceDir, name), name, sourceDir, opts, &anchor,
 	)
 }
 
@@ -877,6 +915,7 @@ func createTxnMarkerInRoot(
 	name string,
 	sourceDir string,
 	opts TxnMarkerOptions,
+	recoveryAnchor *TxnMarkerRecoveryAnchor,
 ) (*TxnMarker, error) {
 	cleanupRoot := true
 	defer func() {
@@ -887,6 +926,17 @@ func createTxnMarkerInRoot(
 	capacity, err := normalizeTxnMarkerOptionCapacity(opts, true)
 	if err != nil {
 		return nil, err
+	}
+	var header TxnMarkerHeader
+	if recoveryAnchor != nil {
+		header = TxnMarkerHeader{
+			Format: TxnMarkerFormat, MarkerID: recoveryAnchor.MarkerID,
+			Epoch: recoveryAnchor.Epoch, BaseSequence: recoveryAnchor.BaseSequence,
+			Capacity: capacity, SealedCapacity: opts.SealedCapacity, RecycleCount: 1,
+		}
+		if err := validateTxnMarkerHeader(header); err != nil {
+			return nil, err
+		}
 	}
 
 	file, sourceDirInfo, err := openTxnMarkerEntry(
@@ -901,22 +951,18 @@ func createTxnMarkerInRoot(
 			_ = file.Close()
 		}
 	}()
-
-	var markerID [16]byte
-	if _, err := rand.Read(markerID[:]); err != nil {
-		return nil, err
-	}
-	header := TxnMarkerHeader{
-		Format:         TxnMarkerFormat,
-		MarkerID:       markerID,
-		Epoch:          1,
-		BaseSequence:   0,
-		Capacity:       capacity,
-		SealedCapacity: opts.SealedCapacity,
-		RecycleCount:   1,
-	}
-	if err := validateTxnMarkerHeader(header); err != nil {
-		return nil, err
+	if recoveryAnchor == nil {
+		if _, err := rand.Read(header.MarkerID[:]); err != nil {
+			return nil, err
+		}
+		header.Format = TxnMarkerFormat
+		header.Epoch = 1
+		header.Capacity = capacity
+		header.SealedCapacity = opts.SealedCapacity
+		header.RecycleCount = 1
+		if err := validateTxnMarkerHeader(header); err != nil {
+			return nil, err
+		}
 	}
 
 	total := int64(txnMarkerRegionStart) + int64(capacity)

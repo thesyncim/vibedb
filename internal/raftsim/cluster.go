@@ -370,9 +370,17 @@ func (c *Cluster) applyEntry(member *clusterMember, readyID, expectedIndex uint6
 	if member.node == nil || member.node.ReadyID() != readyID {
 		return ErrInvalidEvent
 	}
-	publication, applied, err := member.node.ApplyNext()
+	result, err := member.node.ApplyNextBatch(nil)
 	if err != nil {
 		return err
+	}
+	applied := result.Applied != 0
+	publication := member.node.Published()
+	if result.Normal.Len() != 0 {
+		publication = result.Normal.FinalPublication()
+		if err := member.node.SettleAppliedNormalBatch(result.Normal); err != nil {
+			return err
+		}
 	}
 	if expectedIndex == 0 {
 		if applied {
