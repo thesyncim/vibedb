@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
 func TestCheckpointGroupRetentionSuccessorCanonicalGrammar(t *testing.T) {
@@ -737,5 +740,1157 @@ func TestCheckpointGroupRetentionSealSerializesConcurrentTransition(t *testing.T
 	checkpointGroupFaultHook = previous
 	if err := group.ValidateRetentionWitness(result.witness); err != nil {
 		t.Fatalf("uncertified concurrent suffix invalidated sealed floor: %v", err)
+	}
+}
+
+func TestCheckpointGroupRetentionSealReservesTerminalSequenceBudget(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		sequence uint64
+		dirty    bool
+	}{
+		{name: "checkpoint-plus-two-slots", sequence: math.MaxUint64 - 2, dirty: true},
+		{name: "one-sequence-left", sequence: math.MaxUint64 - 1},
+		{name: "sequence-exhausted", sequence: math.MaxUint64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+			checkpointGroupPut(t, group, 1, members, "one")
+			if err := group.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			checkpointGroupTestRewriteCertificateSequences(
+				t,
+				group,
+				test.sequence-1,
+				test.sequence,
+			)
+			applied := uint64(1)
+			if test.dirty {
+				group.mu.Lock()
+				originalTxn, originalApplied := group.txn, group.applied
+				group.txn++
+				group.applied++
+				applied = group.applied
+				group.mu.Unlock()
+				t.Cleanup(func() {
+					group.mu.Lock()
+					group.txn = originalTxn
+					group.applied = originalApplied
+					group.poison = nil
+					group.log.poison = nil
+					group.mu.Unlock()
+				})
+			}
+
+			beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+			beforeStats := group.Stats()
+			group.mu.Lock()
+			beforeOwner := group.certificateLocked()
+			group.mu.Unlock()
+			faults := 0
+			previousHook := checkpointGroupFaultHook
+			checkpointGroupFaultHook = func(checkpointGroupFaultPoint) error {
+				faults++
+				return nil
+			}
+			t.Cleanup(func() { checkpointGroupFaultHook = previousHook })
+
+			witness, err := group.SealRetentionFloor(applied)
+			checkpointGroupFaultHook = previousHook
+			if !witness.IsZero() || !errors.Is(err, ErrCheckpointGroupSequence) {
+				t.Fatalf("terminal seal = %+v, %v", witness, err)
+			}
+			if faults != 0 {
+				t.Fatalf("terminal seal crossed %d write/Sync fault points", faults)
+			}
+			if afterStats := group.Stats(); afterStats != beforeStats {
+				t.Fatalf("terminal seal stats: before=%+v after=%+v", beforeStats, afterStats)
+			}
+			requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+			group.mu.Lock()
+			afterOwner := group.certificateLocked()
+			ownerPoison := group.poison
+			logPoison := group.log.poison
+			group.mu.Unlock()
+			if afterOwner.sequence != beforeOwner.sequence ||
+				!equalCheckpointGroupCertificateBody(afterOwner, beforeOwner) ||
+				ownerPoison != nil || logPoison != nil {
+				t.Fatalf(
+					"terminal seal mutated owner: before=%+v after=%+v poison=%v/%v",
+					beforeOwner,
+					afterOwner,
+					ownerPoison,
+					logPoison,
+				)
+			}
+		})
+	}
+}
+
+func TestCheckpointGroupTerminalSequenceExactLastSuccessors(t *testing.T) {
+	t.Run("new-seal-consumes-two", func(t *testing.T) {
+		dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		if err := group.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-3,
+			math.MaxUint64-2,
+		)
+		before := group.Stats()
+
+		witness, err := group.SealRetentionFloor(1)
+		if err != nil {
+			t.Fatalf("last two certificate successors: %v", err)
+		}
+		after := group.Stats()
+		if after.CertificateSyncs-before.CertificateSyncs != 2 {
+			t.Fatalf(
+				"last seal certificate Syncs = %d, want 2",
+				after.CertificateSyncs-before.CertificateSyncs,
+			)
+		}
+		checkpointGroupTestRequireTerminalPair(t, group, witness, func(previous, current checkpointGroupCertificate) {
+			if !equalCheckpointGroupCertificateBody(previous, current) {
+				t.Fatal("terminal mirrored retention certificates differ")
+			}
+		})
+		checkpointGroupTestRequireTerminalSuccessorRejected(t, dir, group)
+		checkpointGroupTestRequireTerminalReopenSucceeds(t, dir)
+	})
+
+	t.Run("dirty-checkpoint-consumes-one", func(t *testing.T) {
+		dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		witness, err := group.SealRetentionFloor(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-2,
+			math.MaxUint64-1,
+		)
+		checkpointGroupPut(t, group, 2, members, "two")
+		before := group.Stats()
+		if err := group.Checkpoint(); err != nil {
+			t.Fatalf("last checkpoint successor: %v", err)
+		}
+		after := group.Stats()
+		if after.CertificateSyncs-before.CertificateSyncs != 1 ||
+			after.Checkpoints-before.Checkpoints != 1 {
+			t.Fatalf("last checkpoint stats: before=%+v after=%+v", before, after)
+		}
+		checkpointGroupTestRequireTerminalPair(t, group, witness, func(previous, current checkpointGroupCertificate) {
+			if previous.applied != 1 || current.applied != 2 ||
+				previous.txnHighWater+1 != current.txnHighWater {
+				t.Fatalf(
+					"terminal dirty checkpoint pair = previous %+v current %+v",
+					previous,
+					current,
+				)
+			}
+		})
+		checkpointGroupTestRequireTerminalSuccessorRejected(t, dir, group)
+		checkpointGroupTestRequireTerminalReopenSucceeds(t, dir)
+	})
+
+	t.Run("marker-recycle-consumes-one", func(t *testing.T) {
+		dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		witness, err := group.SealRetentionFloor(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-2,
+			math.MaxUint64-1,
+		)
+		before := group.Stats()
+		group.mu.Lock()
+		err = group.recycleMarkerLocked()
+		group.mu.Unlock()
+		if err != nil {
+			t.Fatalf("last marker-recycle successor: %v", err)
+		}
+		after := group.Stats()
+		if after.CertificateSyncs-before.CertificateSyncs != 1 ||
+			after.MarkerSyncs-before.MarkerSyncs != 1 {
+			t.Fatalf("last marker-recycle stats: before=%+v after=%+v", before, after)
+		}
+		checkpointGroupTestRequireTerminalPair(t, group, witness, func(previous, current checkpointGroupCertificate) {
+			if current.markerEpoch != previous.markerEpoch+1 ||
+				current.txnBase != current.txnHighWater ||
+				previous.applied != current.applied ||
+				previous.txnHighWater != current.txnHighWater {
+				t.Fatalf(
+					"terminal marker successor = previous %+v current %+v",
+					previous,
+					current,
+				)
+			}
+		})
+		checkpointGroupTestRequireTerminalSuccessorRejected(t, dir, group)
+		checkpointGroupTestRequireTerminalReopenSucceeds(t, dir)
+	})
+}
+
+func TestCheckpointGroupTerminalSequenceFailsBeforeCheckpointAndMarkerMutation(t *testing.T) {
+	t.Run("checkpoint", func(t *testing.T) {
+		dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		witness, err := group.SealRetentionFloor(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-1,
+			math.MaxUint64,
+		)
+
+		group.mu.Lock()
+		originalTxn, originalApplied := group.txn, group.applied
+		group.txn++
+		group.applied++
+		dirtyOwner := group.certificateLocked()
+		group.mu.Unlock()
+		t.Cleanup(func() {
+			group.mu.Lock()
+			group.txn = originalTxn
+			group.applied = originalApplied
+			group.poison = nil
+			group.log.poison = nil
+			group.mu.Unlock()
+		})
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		faults := 0
+		previousHook := checkpointGroupFaultHook
+		checkpointGroupFaultHook = func(checkpointGroupFaultPoint) error {
+			faults++
+			return nil
+		}
+		t.Cleanup(func() { checkpointGroupFaultHook = previousHook })
+
+		err = group.Checkpoint()
+		checkpointGroupFaultHook = previousHook
+		if !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("terminal checkpoint = %v", err)
+		}
+		if faults != 0 {
+			t.Fatalf("terminal checkpoint crossed %d write/Sync fault points", faults)
+		}
+		if afterStats := group.Stats(); afterStats != beforeStats {
+			t.Fatalf("terminal checkpoint stats: before=%+v after=%+v", beforeStats, afterStats)
+		}
+		requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+		group.mu.Lock()
+		afterOwner := group.certificateLocked()
+		ownerPoison := group.poison
+		logPoison := group.log.poison
+		group.mu.Unlock()
+		if afterOwner.sequence != dirtyOwner.sequence ||
+			!equalCheckpointGroupCertificateBody(afterOwner, dirtyOwner) ||
+			ownerPoison != nil || logPoison != nil {
+			t.Fatalf(
+				"terminal checkpoint mutated owner: before=%+v after=%+v poison=%v/%v",
+				dirtyOwner,
+				afterOwner,
+				ownerPoison,
+				logPoison,
+			)
+		}
+		if err := group.ValidateRetentionWitness(witness); err != nil {
+			t.Fatalf("terminal checkpoint invalidated retained floor: %v", err)
+		}
+	})
+
+	t.Run("marker-recycle", func(t *testing.T) {
+		dir, members, log, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		witness, err := group.SealRetentionFloor(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-1,
+			math.MaxUint64,
+		)
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		err = group.recycleMarkerLocked()
+		afterOwner := group.certificateLocked()
+		ownerPoison := group.poison
+		logPoison := group.log.poison
+		group.mu.Unlock()
+
+		if !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("terminal marker recycle = %v", err)
+		}
+		if afterStats := group.Stats(); afterStats != beforeStats {
+			t.Fatalf("terminal recycle stats: before=%+v after=%+v", beforeStats, afterStats)
+		}
+		requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+		if afterHeader := log.marker.Header(); afterHeader != beforeHeader ||
+			log.marker.Cursor() != beforeCursor {
+			t.Fatalf(
+				"terminal recycle mutated marker: before=%+v/%d after=%+v/%d",
+				beforeHeader,
+				beforeCursor,
+				afterHeader,
+				log.marker.Cursor(),
+			)
+		}
+		if afterOwner.sequence != beforeOwner.sequence ||
+			!equalCheckpointGroupCertificateBody(afterOwner, beforeOwner) ||
+			ownerPoison != nil || logPoison != nil {
+			t.Fatalf(
+				"terminal recycle mutated owner: before=%+v after=%+v poison=%v/%v",
+				beforeOwner,
+				afterOwner,
+				ownerPoison,
+				logPoison,
+			)
+		}
+		if err := group.ValidateRetentionWitness(witness); err != nil {
+			t.Fatalf("terminal recycle invalidated retained floor: %v", err)
+		}
+	})
+}
+
+func TestCheckpointGroupTerminalSequenceRejectsMutationAdmission(t *testing.T) {
+	t.Run("update", func(t *testing.T) {
+		dir, members, log, group := newCheckpointGroupTestStore(t, 8)
+		checkpointGroupPut(t, group, 1, members, "one")
+		if _, err := group.SealRetentionFloor(1); err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-1,
+			math.MaxUint64,
+		)
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		group.mu.Unlock()
+		called := false
+		err := group.Update(2, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("terminal"), []byte(`{"n":2}`))
+		})
+		if called || !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("terminal update = called %v, err %v", called, err)
+		}
+		checkpointGroupTestRequireUnchangedOwner(
+			t, dir, group, beforeDirectory, beforeStats, beforeHeader, beforeCursor, beforeOwner,
+		)
+		if _, found, err := members[0].Collection.AppendRaw(nil, []byte("terminal")); err != nil || found {
+			t.Fatalf("terminal update row = found %v, err %v", found, err)
+		}
+	})
+
+	t.Run("transaction-high-water", func(t *testing.T) {
+		dir, members, log, group := newCheckpointGroupTestStore(t, 8)
+		group.mu.Lock()
+		group.txn = math.MaxUint64 - 1
+		group.visibleTxn.Store(group.txn)
+		group.mu.Unlock()
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		group.mu.Unlock()
+		called := false
+		err := group.Update(1, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("terminal-txn"), []byte(`{"n":1}`))
+		})
+		if called || !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("terminal transaction update = called %v, err %v", called, err)
+		}
+		checkpointGroupTestRequireUnchangedOwner(
+			t, dir, group, beforeDirectory, beforeStats, beforeHeader, beforeCursor, beforeOwner,
+		)
+	})
+
+	t.Run("ordinary-small-marker-admits-sparse-declared-set", func(t *testing.T) {
+		_, members, log, group := checkpointGroupTestStoreWithMarkerCapacity(
+			t, 8, uint64(storeio.TxnMarkerMinSectorSize),
+		)
+		called := false
+		err := group.Update(1, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("sparse"), []byte(`{"n":1}`))
+		})
+		if err != nil || !called {
+			t.Fatalf("ordinary sparse update = called %v, err %v", called, err)
+		}
+		if log.marker.Cursor() != log.marker.Header().Capacity {
+			t.Fatalf(
+				"ordinary sparse marker charge = %d/%d",
+				log.marker.Cursor(),
+				log.marker.Header().Capacity,
+			)
+		}
+		if _, found, err := members[0].Collection.AppendRaw(nil, []byte("sparse")); err != nil || !found {
+			t.Fatalf("ordinary sparse row = found %v, err %v", found, err)
+		}
+	})
+
+	t.Run("marker-full-reserves-rollover-and-future-certificate", func(t *testing.T) {
+		dir, members, log, group := checkpointGroupTestStoreWithMarkerCapacity(
+			t, 8, uint64(storeio.TxnMarkerMinSectorSize),
+		)
+		checkpointGroupPut(t, group, 1, members, "one")
+		if log.marker.Cursor() != log.marker.Header().Capacity {
+			t.Fatalf(
+				"marker-full fixture cursor = %d/%d",
+				log.marker.Cursor(),
+				log.marker.Header().Capacity,
+			)
+		}
+		if err := group.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-2,
+			math.MaxUint64-1,
+		)
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		group.mu.Unlock()
+		called := false
+		err := group.Update(2, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("terminal"), []byte(`{"n":2}`))
+		})
+		if called || !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("last-generation marker-full admission = called %v, err %v", called, err)
+		}
+		checkpointGroupTestRequireUnchangedOwner(
+			t, dir, group, beforeDirectory, beforeStats, beforeHeader, beforeCursor, beforeOwner,
+		)
+	})
+
+	t.Run("empty-small-marker-admits-sparse-last-update", func(t *testing.T) {
+		_, members, log, group := checkpointGroupTestStoreWithMarkerCapacity(
+			t, 8, uint64(storeio.TxnMarkerMinSectorSize),
+		)
+		group.mu.Lock()
+		err := group.recycleMarkerLocked()
+		group.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-2,
+			math.MaxUint64-1,
+		)
+		called := false
+		err = group.Update(1, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("sparse"), []byte(`{"n":1}`))
+		})
+		if err != nil || !called {
+			t.Fatalf("sparse last-generation update = called %v, err %v", called, err)
+		}
+		if log.marker.Cursor() != log.marker.Header().Capacity {
+			t.Fatalf(
+				"sparse marker charge = %d/%d",
+				log.marker.Cursor(),
+				log.marker.Header().Capacity,
+			)
+		}
+		before := group.Stats()
+		if err := group.Checkpoint(); err != nil {
+			t.Fatalf("sparse last certificate: %v", err)
+		}
+		after := group.Stats()
+		if after.CertificateSyncs-before.CertificateSyncs != 1 ||
+			after.Checkpoints-before.Checkpoints != 1 {
+			t.Fatalf("sparse last certificate stats: before=%+v after=%+v", before, after)
+		}
+		group.mu.Lock()
+		slots, currentSlot, err := group.retentionSlotsLocked()
+		group.mu.Unlock()
+		if err != nil || !slots[1-currentSlot].valid || !slots[currentSlot].valid ||
+			slots[1-currentSlot].certificate.sequence != math.MaxUint64-1 ||
+			slots[currentSlot].certificate.sequence != math.MaxUint64 ||
+			!validCheckpointGroupCertificateSuccessor(
+				slots[1-currentSlot].certificate,
+				slots[currentSlot].certificate,
+			) {
+			t.Fatalf("sparse terminal pair = slots %+v current %d err %v", slots, currentSlot, err)
+		}
+		if _, found, err := members[0].Collection.AppendRaw(nil, []byte("sparse")); err != nil || !found {
+			t.Fatalf("sparse terminal row = found %v, err %v", found, err)
+		}
+	})
+
+	t.Run("periodic-admission-reserves-future-certificate", func(t *testing.T) {
+		dir, members, log, group := newCheckpointGroupTestStore(t, 1)
+		checkpointGroupPut(t, group, 1, members, "one")
+		if err := group.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		checkpointGroupPut(t, group, 2, members, "two")
+		checkpointGroupTestRewriteCertificateSequences(
+			t,
+			group,
+			math.MaxUint64-2,
+			math.MaxUint64-1,
+		)
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		group.mu.Unlock()
+		called := false
+		err := group.Update(3, members, defaultTxnLimits(), func(batch *DatabaseBatch) error {
+			called = true
+			write, collectionErr := batch.Collection("system")
+			if collectionErr != nil {
+				return collectionErr
+			}
+			return write.Put([]byte("terminal"), []byte(`{"n":3}`))
+		})
+		if called || !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("last-generation periodic admission = called %v, err %v", called, err)
+		}
+		checkpointGroupTestRequireUnchangedOwner(
+			t, dir, group, beforeDirectory, beforeStats, beforeHeader, beforeCursor, beforeOwner,
+		)
+	})
+
+	t.Run("seed", func(t *testing.T) {
+		dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+		if _, err := members[1].Collection.Put(
+			[]byte("row"), []byte(`{"value":"staged"}`),
+		); err != nil {
+			t.Fatal(err)
+		}
+		seed := CheckpointGroupSeed{
+			Applied: 9, Member: "system", Envelope: []byte(`{"state":"imported"}`),
+		}
+		seed.Images = checkpointGroupSeedImagesForTest(members, seed.Member)
+		group, err := NewSeededCheckpointGroup(
+			log, members, seed, CheckpointGroupOptions{CheckpointEvery: 8},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = group.Close() })
+		checkpointGroupTestRewriteSingleCertificateSequence(t, group, math.MaxUint64)
+		beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+		beforeStats := group.Stats()
+		beforeHeader := log.marker.Header()
+		beforeCursor := log.marker.Cursor()
+		group.mu.Lock()
+		beforeOwner := group.certificateLocked()
+		group.mu.Unlock()
+		err = group.Seed(seed, members[0], defaultTxnLimits(), []byte("state"))
+		if !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf("terminal seed = %v", err)
+		}
+		checkpointGroupTestRequireUnchangedOwner(
+			t, dir, group, beforeDirectory, beforeStats, beforeHeader, beforeCursor, beforeOwner,
+		)
+		if _, found, err := members[0].Collection.AppendRaw(nil, []byte("state")); err != nil || found {
+			t.Fatalf("terminal seed row = found %v, err %v", found, err)
+		}
+	})
+}
+
+func TestCheckpointGroupTerminalMarkerStateReopensReadOnly(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		mutateCertificate func(*checkpointGroupCertificate)
+		mutateHeader      func(*storeio.TxnMarkerHeader)
+	}{
+		{
+			name: "epoch",
+			mutateCertificate: func(certificate *checkpointGroupCertificate) {
+				certificate.markerEpoch = math.MaxUint64
+			},
+			mutateHeader: func(header *storeio.TxnMarkerHeader) {
+				header.Epoch = math.MaxUint64
+			},
+		},
+		{
+			name: "recycle-count",
+			mutateHeader: func(header *storeio.TxnMarkerHeader) {
+				header.RecycleCount = math.MaxUint64
+			},
+		},
+		{
+			name: "zero-dcsn-successor",
+			mutateCertificate: func(certificate *checkpointGroupCertificate) {
+				certificate.txnBase = math.MaxUint64
+				certificate.txnHighWater = math.MaxUint64
+			},
+			mutateHeader: func(header *storeio.TxnMarkerHeader) {
+				header.BaseSequence = math.MaxUint64
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, _, _, _ := newCheckpointGroupTestStore(t, 8)
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			if test.mutateCertificate != nil {
+				checkpointGroupTestRewriteSingleDiskCertificate(
+					t, crashImage, test.mutateCertificate,
+				)
+			}
+			checkpointGroupTestRewriteMarkerHeader(
+				t, crashImage, test.mutateHeader,
+			)
+			checkpointGroupTestRequireTerminalReopenSucceeds(t, crashImage)
+		})
+	}
+}
+
+func TestCheckpointGroupTerminalMarkerTransitionalBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		mutateCertificate func(*checkpointGroupCertificate)
+		mutateHeader      func(*storeio.TxnMarkerHeader)
+	}{
+		{
+			name: "recycle-count",
+			mutateHeader: func(header *storeio.TxnMarkerHeader) {
+				header.Epoch++
+				header.RecycleCount = math.MaxUint64
+			},
+		},
+		{
+			name: "epoch",
+			mutateCertificate: func(certificate *checkpointGroupCertificate) {
+				certificate.markerEpoch = math.MaxUint64 - 1
+			},
+			mutateHeader: func(header *storeio.TxnMarkerHeader) {
+				header.Epoch = math.MaxUint64
+				header.RecycleCount++
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, _, _, _ := checkpointGroupTestStoreWithMarkerCapacity(
+				t, 8, uint64(storeio.TxnMarkerMinSectorSize),
+			)
+			crashImage := copyCheckpointGroupDirectory(t, dir)
+			if test.mutateCertificate != nil {
+				checkpointGroupTestRewriteSingleDiskCertificate(
+					t, crashImage, test.mutateCertificate,
+				)
+			}
+			checkpointGroupTestRewriteMarkerHeader(
+				t, crashImage, test.mutateHeader,
+			)
+			collections, log, group := openCheckpointGroupTestCopy(t, crashImage)
+			reopenedDir := log.dir
+			named := []NamedCollection{
+				{Name: "system", Collection: collections[0]},
+				{Name: "user", Collection: collections[1]},
+			}
+			checkpointGroupTestRequireRejectedParticipantUpdate(
+				t, reopenedDir, group, log, named[:1], group.AppliedIndex(),
+			)
+			closeCheckpointGroupTestHandles(t, collections, log, group)
+			checkpointGroupTestRequireTerminalReopenSucceeds(t, reopenedDir)
+		})
+	}
+}
+
+func TestCheckpointGroupTerminalTransitionalRecoveryDoesNotWrap(t *testing.T) {
+	dir, members, _, group := newCheckpointGroupTestStore(t, 8)
+	checkpointGroupPut(t, group, 1, members, "one")
+	if _, err := group.SealRetentionFloor(1); err != nil {
+		t.Fatal(err)
+	}
+	group.mu.Lock()
+	err := group.recycleMarkerLocked()
+	group.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointGroupTestRewriteCertificateSequences(
+		t,
+		group,
+		math.MaxUint64-1,
+		math.MaxUint64,
+	)
+
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	marker, _, err := storeio.OpenTxnMarker(
+		filepath.Join(crashImage, txnMarkerFilename),
+		storeio.TxnMarkerOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := marker.Header()
+	markerCursor := marker.Cursor()
+	if markerCursor != 0 {
+		_ = marker.Close()
+		t.Fatalf("terminal transition fixture marker cursor = %d", markerCursor)
+	}
+	if err := marker.Recycle(header.Epoch + 1); err != nil {
+		_ = marker.Close()
+		t.Fatal(err)
+	}
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beforeDirectory := checkpointGroupDirectoryBytes(t, crashImage)
+	requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+	collections, log, recovered, err := OpenCollectionsWithCheckpointGroup(
+		crashImage,
+		TxnLogOptions{},
+		requests,
+		[]string{"system", "user"},
+		CheckpointGroupOptions{CheckpointEvery: 8},
+	)
+	for _, file := range files {
+		_ = file.Close()
+	}
+	if collections != nil || log != nil || recovered != nil ||
+		!errors.Is(err, ErrCheckpointGroupSequence) {
+		t.Fatalf(
+			"terminal transitional recovery = collections %v log %v group %v err %v",
+			collections,
+			log,
+			recovered,
+			err,
+		)
+	}
+	requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
+}
+
+func checkpointGroupTestRewriteCertificateSequences(
+	t testing.TB,
+	group *CheckpointGroup,
+	previousSequence uint64,
+	currentSequence uint64,
+) {
+	t.Helper()
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	slots, currentSlot, err := group.retentionSlotsLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slots[1-currentSlot].valid || previousSequence == math.MaxUint64 ||
+		previousSequence+1 != currentSequence {
+		t.Fatalf(
+			"terminal sequence fixture = previous %d current %d slots %+v",
+			previousSequence,
+			currentSequence,
+			slots,
+		)
+	}
+	previous := slots[1-currentSlot].certificate
+	current := slots[currentSlot].certificate
+	previous.sequence = previousSequence
+	current.sequence = currentSequence
+	if !validCheckpointGroupCertificateSuccessor(previous, current) {
+		t.Fatal("terminal sequence fixture is not a canonical successor pair")
+	}
+	previousRaw, err := encodeCheckpointGroupCertificate(previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRaw, err := encodeCheckpointGroupCertificate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := group.file.WriteAt(
+		previousRaw,
+		int64((previous.sequence%checkpointGroupSlots)*checkpointGroupSlotBytes),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := group.file.WriteAt(
+		currentRaw,
+		int64((current.sequence%checkpointGroupSlots)*checkpointGroupSlotBytes),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := group.file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	group.sequence = currentSequence
+	if _, _, err := group.retentionSlotsLocked(); err != nil {
+		t.Fatalf("terminal sequence fixture did not qualify: %v", err)
+	}
+}
+
+func checkpointGroupTestRewriteSingleDiskCertificate(
+	t testing.TB,
+	dir string,
+	mutate func(*checkpointGroupCertificate),
+) {
+	t.Helper()
+	path := filepath.Join(dir, checkpointGroupFilename)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := 0
+	selectedSlot := -1
+	var selected checkpointGroupCertificate
+	for slot := 0; slot < checkpointGroupSlots; slot++ {
+		start := slot * checkpointGroupSlotBytes
+		candidate, decodeErr := decodeCheckpointGroupCertificate(
+			raw[start : start+checkpointGroupSlotBytes],
+		)
+		if decodeErr != nil {
+			continue
+		}
+		valid++
+		selectedSlot = slot
+		selected = candidate
+	}
+	if valid != 1 || selectedSlot < 0 {
+		t.Fatalf("single-certificate fixture has %d valid slots", valid)
+	}
+	mutate(&selected)
+	encoded, err := encodeCheckpointGroupCertificate(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(raw)
+	targetSlot := int(selected.sequence % checkpointGroupSlots)
+	copy(raw[targetSlot*checkpointGroupSlotBytes:(targetSlot+1)*checkpointGroupSlotBytes], encoded)
+	if n, writeErr := file.WriteAt(raw, 0); writeErr != nil || n != len(raw) {
+		_ = file.Close()
+		t.Fatalf("rewrite certificate = %d,%v", n, writeErr)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkpointGroupTestRewriteMarkerHeader(
+	t testing.TB,
+	dir string,
+	mutate func(*storeio.TxnMarkerHeader),
+) {
+	t.Helper()
+	path := filepath.Join(dir, txnMarkerFilename)
+	marker, _, err := storeio.OpenTxnMarker(path, storeio.TxnMarkerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := marker.Header()
+	if err := marker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&header)
+	encoded := make([]byte, storeio.TxnMarkerHeaderSize)
+	if _, err := storeio.EncodeTxnMarkerHeader(encoded, header); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := 0; slot < 2; slot++ {
+		offset := int64(slot * storeio.TxnMarkerHeaderSize)
+		if n, writeErr := file.WriteAt(encoded, offset); writeErr != nil || n != len(encoded) {
+			_ = file.Close()
+			t.Fatalf("rewrite marker slot %d = %d,%v", slot, n, writeErr)
+		}
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkpointGroupTestStoreWithMarkerCapacity(
+	t testing.TB,
+	checkpointEvery uint64,
+	markerCapacity uint64,
+) (string, []NamedCollection, *TxnLog, *CheckpointGroup) {
+	t.Helper()
+	dir := t.TempDir()
+	members := make([]NamedCollection, 0, 2)
+	for _, name := range []string{"system", "user"} {
+		members = append(members, openTxnNamedCollection(t, dir, name, txnTestOptions()))
+	}
+	log, err := NewTxnLog(dir, TxnLogOptions{Capacity: markerCapacity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	group, err := NewCheckpointGroup(
+		log, members, CheckpointGroupOptions{CheckpointEvery: checkpointEvery},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = group.Close() })
+	return dir, members, log, group
+}
+
+func checkpointGroupTestRewriteSingleCertificateSequence(
+	t testing.TB,
+	group *CheckpointGroup,
+	sequence uint64,
+) {
+	t.Helper()
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	slots, currentSlot, err := group.retentionSlotsLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slots[currentSlot].valid || sequence%checkpointGroupSlots != uint64(currentSlot) {
+		t.Fatalf("single terminal sequence fixture = sequence %d slots %+v", sequence, slots)
+	}
+	certificate := slots[currentSlot].certificate
+	certificate.sequence = sequence
+	raw, err := encodeCheckpointGroupCertificate(certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := group.file.WriteAt(
+		raw,
+		int64(currentSlot*checkpointGroupSlotBytes),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := group.file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	group.sequence = sequence
+}
+
+func checkpointGroupTestRequireTerminalPair(
+	t testing.TB,
+	group *CheckpointGroup,
+	witness CheckpointRetentionWitness,
+	check func(checkpointGroupCertificate, checkpointGroupCertificate),
+) {
+	t.Helper()
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	slots, currentSlot, err := group.retentionSlotsLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := slots[1-currentSlot]
+	current := slots[currentSlot]
+	if !previous.valid || !current.valid ||
+		previous.certificate.sequence != math.MaxUint64-1 ||
+		current.certificate.sequence != math.MaxUint64 ||
+		!validCheckpointGroupCertificateSuccessor(previous.certificate, current.certificate) ||
+		!checkpointRetentionSealMatches(previous.certificate, witness) ||
+		!checkpointRetentionSealMatches(current.certificate, witness) {
+		t.Fatalf("terminal certificate pair = previous %+v current %+v", previous, current)
+	}
+	check(previous.certificate, current.certificate)
+}
+
+func checkpointGroupTestRequireTerminalSuccessorRejected(
+	t testing.TB,
+	dir string,
+	group *CheckpointGroup,
+) {
+	t.Helper()
+	beforeDirectory := checkpointGroupDirectoryBytes(t, dir)
+	beforeStats := group.Stats()
+	beforeHeader := group.log.marker.Header()
+	beforeCursor := group.log.marker.Cursor()
+	group.mu.Lock()
+	beforeOwner := group.certificateLocked()
+	err := group.recycleMarkerLocked()
+	afterOwner := group.certificateLocked()
+	ownerPoison := group.poison
+	logPoison := group.log.poison
+	group.mu.Unlock()
+	if !errors.Is(err, ErrCheckpointGroupSequence) {
+		t.Fatalf("successor after terminal sequence = %v", err)
+	}
+	if afterStats := group.Stats(); afterStats != beforeStats {
+		t.Fatalf("terminal successor stats: before=%+v after=%+v", beforeStats, afterStats)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+	if afterHeader := group.log.marker.Header(); afterHeader != beforeHeader ||
+		group.log.marker.Cursor() != beforeCursor {
+		t.Fatalf(
+			"terminal successor mutated marker: before=%+v/%d after=%+v/%d",
+			beforeHeader,
+			beforeCursor,
+			afterHeader,
+			group.log.marker.Cursor(),
+		)
+	}
+	if afterOwner.sequence != beforeOwner.sequence ||
+		!equalCheckpointGroupCertificateBody(afterOwner, beforeOwner) ||
+		ownerPoison != nil || logPoison != nil {
+		t.Fatalf(
+			"terminal successor mutated owner: before=%+v after=%+v poison=%v/%v",
+			beforeOwner,
+			afterOwner,
+			ownerPoison,
+			logPoison,
+		)
+	}
+}
+
+func checkpointGroupTestRequireUnchangedOwner(
+	t testing.TB,
+	dir string,
+	group *CheckpointGroup,
+	beforeDirectory map[string][]byte,
+	beforeStats CheckpointGroupStats,
+	beforeHeader storeio.TxnMarkerHeader,
+	beforeCursor uint64,
+	beforeOwner checkpointGroupCertificate,
+) {
+	t.Helper()
+	if afterStats := group.Stats(); afterStats != beforeStats {
+		t.Fatalf("terminal admission stats: before=%+v after=%+v", beforeStats, afterStats)
+	}
+	requireCheckpointGroupDirectoryBytes(t, dir, beforeDirectory)
+	if afterHeader := group.log.marker.Header(); afterHeader != beforeHeader ||
+		group.log.marker.Cursor() != beforeCursor {
+		t.Fatalf(
+			"terminal admission mutated marker: before=%+v/%d after=%+v/%d",
+			beforeHeader,
+			beforeCursor,
+			afterHeader,
+			group.log.marker.Cursor(),
+		)
+	}
+	group.mu.Lock()
+	afterOwner := group.certificateLocked()
+	ownerPoison := group.poison
+	logPoison := group.log.poison
+	group.mu.Unlock()
+	if afterOwner.sequence != beforeOwner.sequence ||
+		!equalCheckpointGroupCertificateBody(afterOwner, beforeOwner) ||
+		ownerPoison != nil || logPoison != nil {
+		t.Fatalf(
+			"terminal admission mutated owner: before=%+v after=%+v poison=%v/%v",
+			beforeOwner,
+			afterOwner,
+			ownerPoison,
+			logPoison,
+		)
+	}
+}
+
+func checkpointGroupTestRequireTerminalReopenSucceeds(t *testing.T, dir string) {
+	t.Helper()
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	beforeDirectory := checkpointGroupDirectoryBytes(t, crashImage)
+	for attempt := 0; attempt < 2; attempt++ {
+		requests, files := checkpointGroupTestOpenRequests(t, crashImage)
+		collections, log, group, err := OpenCollectionsWithCheckpointGroup(
+			crashImage,
+			TxnLogOptions{},
+			requests,
+			[]string{"system", "user"},
+			CheckpointGroupOptions{CheckpointEvery: 8},
+		)
+		if err != nil || len(collections) != 2 || log == nil || group == nil {
+			t.Fatalf(
+				"terminal reopen %d = collections %v log %v group %v err %v",
+				attempt, collections, log, group, err,
+			)
+		}
+		requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
+		applied := group.AppliedIndex()
+		if applied == math.MaxUint64 {
+			t.Fatal("terminal reopen fixture has no legal next applied index")
+		}
+		named := []NamedCollection{
+			{Name: "system", Collection: collections[0]},
+			{Name: "user", Collection: collections[1]},
+		}
+		called := false
+		err = group.Update(
+			applied+1, named[:1], defaultTxnLimits(),
+			func(*DatabaseBatch) error {
+				called = true
+				return nil
+			},
+		)
+		if called || !errors.Is(err, ErrCheckpointGroupSequence) {
+			t.Fatalf(
+				"terminal reopen %d update = called %v, err %v",
+				attempt, called, err,
+			)
+		}
+		closeCheckpointGroupTestHandles(t, collections, log, group)
+		for _, file := range files {
+			_ = file.Close()
+		}
+		requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
 	}
 }

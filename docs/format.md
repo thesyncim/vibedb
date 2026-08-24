@@ -140,7 +140,7 @@ requires exact exhaustion and rejects overlong, overflowing, or truncated
 varints. The codec sentinel selects the sole current grammar; it is not a
 released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
-v2/v3 decoder or migration ladder.
+alternate decoder or migration ladder.
 
 ## Replicated checkpoint-group certificate
 
@@ -227,6 +227,51 @@ requires byte-for-byte canonical equality. A checksum-invalid newest slot may
 be a torn write and falls back to the other authenticated slot. A
 checksum-valid but noncanonical slot, wrong parity, or nonconsecutive history
 is corruption and never grants rollback authority.
+
+Every monotonic domain is independent and never wraps. Certificate sequence
+zero is noncanonical. At certificate sequence `2^64-1`, any checkpoint, marker
+rollover, seal, or recovery transition that requires a successor fails with
+`ErrCheckpointGroupSequence` before journal or marker Sync, certificate-slot
+writes, or owner mutation. An aligned mutation-terminal owner is different.
+After recovery has folded the authenticated member prefix and discarded every
+later suffix, it attaches the selected marker and certificate read-only without
+rewriting either one. Repeated opens therefore consume no successor. A new
+retention seal reserves both slot generations, plus any required checkpoint
+generation, before doing work. Mutation admission likewise retains its future
+certificate generation and reserves any worst-case pressure checkpoint and
+marker-rollover generations before invoking the update callback.
+
+The transaction marker has separate DCSN, epoch, and header recycle-count
+domains. DCSN successor zero is an exhausted append endpoint. Epoch or recycle
+count `2^64-1` remains a valid readable header while no rollover is required.
+A required rollover refuses before callback, replay, marker write, or Sync.
+The selected same-epoch marker has `Header.BaseSequence` equal to the
+certificate transaction base. The sole accepted transitional marker is one
+empty epoch ahead and has `Header.BaseSequence` equal to the certificate
+transaction high-water. Normal recovery reanchors the empty successor marker
+at that authenticated high-water before publishing its same-cut certificate,
+so scanned aborted decisions cannot launder their DCSN into owner lineage. If
+the old and authenticated bases are equal while an aborted suffix remains,
+recovery first zeroes and Syncs the aligned first-record sector. Only then does
+it publish and Sync the successor header. Either crash side therefore scans an
+empty suffix.
+
+Participant recovery journals have their own DCSN and header recycle count. A
+legal final DCSN `2^64-1` may still be certified and folded, leaving an empty
+`BaseSequence=2^64-1` journal whose next DCSN is the zero sentinel. Only a later
+append is refused. Recycling an already-empty journal to its existing base is
+an exact no-op and consumes neither a header generation nor a barrier. Any
+header-changing recycle or capacity growth reserves a nonzero recycle-count
+successor before changing file size, root state, or a header slot.
+
+Collection generations occupy the canonical 48-bit range `1..2^48-1`.
+Admission reserves the bounded topology-stage and journal-recycle budget of the
+largest permitted participant batch before callback execution. Recovery sums
+the atomic-stage and sequential-fallback generation budgets of every committed
+conditional record before replaying the first member. Exhaustion in any of
+these domains is reported as `ErrCheckpointGroupSequence`. It is never
+laundered into sequence zero, a torn-slot ambiguity, or a partially folded
+group.
 
 The certificate, rather than `txn.vtm`, is commit authority for this lane. It
 commits the consecutive conditional-journal prefix through its transaction

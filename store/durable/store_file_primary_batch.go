@@ -212,7 +212,10 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 	// Each split strictly grows its tablet and each capacity checkpoint drains the
 	// pending set, so both make monotonic progress; the budget bounds a pathological
 	// placement loop the way primaryStructuralRetryLimit does for a single Put.
-	budget := 2*len(batch.entries) + primaryStructuralRetryLimit + 8
+	budget, ok := primaryBatchStageAttemptBudget(len(batch.entries))
+	if !ok {
+		return stagedPrimaryBatch{}, ErrBatchTooLarge
+	}
 	var lastErr error
 	for attempt := 0; attempt < budget; attempt++ {
 		// A topology or checkpoint retry starts from no staged frames and no
@@ -295,6 +298,14 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		lastErr = ErrPrimaryLeafSplitRequired
 	}
 	return stagedPrimaryBatch{}, lastErr
+}
+
+func primaryBatchStageAttemptBudget(documents int) (int, bool) {
+	constant := primaryStructuralRetryLimit + 8
+	if documents < 0 || documents > (math.MaxInt-constant)/2 {
+		return 0, false
+	}
+	return 2*documents + constant, true
 }
 
 // unwindStagedPrimaryBatch discards every dirty frame and exact-index record
