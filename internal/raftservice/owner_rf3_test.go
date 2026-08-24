@@ -227,22 +227,19 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
-	followerState, err := owners[follower].Probe(ctx, group)
-	if err != nil {
-		t.Fatal(err)
-	}
-	followerRead, followerLease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
-		Fence: followerState.Fence(), Relation: 1, Key: key,
-		MinimumApplied: acknowledged.Outcome.AppliedIndex,
-		MaxValueBytes:  replication.MaxMutationValueBytes,
-	})
+	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
+		t, ctx, owners[follower], group, PointReadRequest{Relation: 1, Key: key,
+			MinimumApplied: acknowledged.Outcome.AppliedIndex,
+			MaxValueBytes:  replication.MaxMutationValueBytes,
+		})
 	if err != nil || !followerRead.Found ||
 		!bytes.Equal(followerRead.Value, []byte(`{"id":"alpha","value":1}`)) {
 		t.Fatalf("applied-bounded follower read=%+v err=%v", followerRead, err)
 	}
 	followerLease.Release()
-	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
-		Fence: followerState.Fence(), Relation: 1, Key: key,
+	var lease PointReadLease
+	if _, lease, _, err := readRF3PointAtFreshFence(t, ctx, owners[follower], group, PointReadRequest{
+		Relation: 1, Key: key,
 		MinimumApplied: acknowledged.Outcome.AppliedIndex,
 		MaxValueBytes:  len(followerRead.Value),
 	}); !errors.Is(err, replicatedstate.ErrReadBufferBound) {
@@ -250,8 +247,8 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	} else if lease != nil {
 		t.Fatal("response-bound refusal returned a lease")
 	}
-	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
-		Fence: followerState.Fence(), Relation: 1, Key: key,
+	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], group, PointReadRequest{
+		Relation: 1, Key: key,
 		MinimumApplied: followerRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes,
 	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
@@ -281,17 +278,18 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	} else if lease != nil {
 		t.Fatal("stale replica-set read returned a lease")
 	}
-	linearRead, linearLease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
-		Fence: leaderState.Fence(), Relation: 1, Key: key,
-		MinimumApplied: acknowledged.Outcome.AppliedIndex,
-		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
-	})
+	leader = waitRF3Leader(t, ctx, owners, nil, group)
+	linearRead, linearLease, leaderState, err := readRF3PointAtFreshFence(
+		t, ctx, owners[leader], group, PointReadRequest{Relation: 1, Key: key,
+			MinimumApplied: acknowledged.Outcome.AppliedIndex,
+			MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
+		})
 	if err != nil || !linearRead.Found || !bytes.Equal(linearRead.Value, followerRead.Value) {
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
-	if _, lease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
-		Fence: leaderState.Fence(), Relation: 1, Key: key,
+	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], group, PointReadRequest{
+		Relation: 1, Key: key,
 		MinimumApplied: linearRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
 	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
@@ -405,6 +403,32 @@ func waitRF3Leader(
 	}
 	t.Fatalf("RF3 leader election: %v", context.Cause(ctx))
 	return -1
+}
+
+func readRF3PointAtFreshFence(
+	t testing.TB,
+	ctx context.Context,
+	owner *Owner,
+	group raftmember.GroupKey,
+	request PointReadRequest,
+) (PointReadResult, PointReadLease, ServingState, error) {
+	t.Helper()
+	for ctx.Err() == nil {
+		state, err := owner.Probe(ctx, group)
+		if err != nil {
+			return PointReadResult{}, nil, ServingState{}, err
+		}
+		request.Fence = state.Fence()
+		result, lease, err := owner.ReadPoint(ctx, request)
+		if errors.Is(err, ErrServingFence) {
+			if lease != nil {
+				t.Fatal("stale serving fence returned a read lease")
+			}
+			continue
+		}
+		return result, lease, state, err
+	}
+	return PointReadResult{}, nil, ServingState{}, context.Cause(ctx)
 }
 
 func waitRF3Applied(

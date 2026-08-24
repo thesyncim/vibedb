@@ -220,7 +220,17 @@ func (executor *ReplicatedExecutor) ReadPoint(
 				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
-				return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+				// A command-fence change was handled above and is a definite
+				// catalog refusal. With the same command fence this is only a
+				// member/term incarnation race between probe and read admission;
+				// refresh the handshake within the caller's bounded attempt budget.
+				joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+				if read.Linearizable {
+					preferred = response.State.LeaderID
+				} else {
+					preferred = endpoint.Member
+				}
+				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
 				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound {
