@@ -1306,6 +1306,7 @@ func buildProcessPeer(
 			Limits: raftservice.Limits{
 				MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
 				MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
+				MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
 				MaxPendingOutboundBytes: 64 << 20,
 			},
 		},

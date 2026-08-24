@@ -49,6 +49,38 @@ func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
 	owner.release(request.bytes)
 }
 
+func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *testing.T) {
+	owner := &Owner{pendingReads: make(map[[16]byte]*readDelivery)}
+	var contextKey [16]byte
+	contextKey[0], contextKey[15] = 3, 9
+	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	owner.pendingReads[contextKey] = delivery
+	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+		Context: contextKey[:], Index: 17,
+	}}})
+	select {
+	case reply := <-delivery.reply:
+		if reply.err != nil || reply.read.minimumApplied != 17 {
+			t.Fatalf("reply=%+v", reply)
+		}
+	default:
+		t.Fatal("read outcome was discarded")
+	}
+	if len(owner.pendingReads) != 0 {
+		t.Fatal("settled read retained")
+	}
+
+	abandoned := &readDelivery{reply: make(chan ownerReply, 1)}
+	abandoned.state.Store(readDeliveryAbandoned)
+	owner.pendingReads[contextKey] = abandoned
+	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+		Context: contextKey[:], Index: 18,
+	}}})
+	if len(owner.pendingReads) != 0 || len(abandoned.reply) != 0 {
+		t.Fatal("canceled read was retained or redelivered")
+	}
+}
+
 func TestOwnerProposalDeliveryHandoffWinsBeforeCancellation(t *testing.T) {
 	owner := newDeliveryTestOwner()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -177,6 +209,7 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 		Limits: Limits{
 			MaxIngressItems: 1, MaxIngressBytes: 1,
 			MaxPendingProposalItems: 1, MaxPendingProposalBytes: 1,
+			MaxPendingReadItems: 1, MaxPendingReadBytes: 1,
 			MaxPendingOutboundBytes: 1,
 		},
 	})

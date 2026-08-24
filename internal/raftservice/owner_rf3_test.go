@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -28,8 +29,9 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	const voters = 3
 	runtimes := make([]*raftmember.Runtime, voters)
 	bases := make([]sqldriver.ReplicatedShardStoreIdentity, voters)
+	readSources := make([]*sqldriver.ReplicatedApply, voters)
 	for index := range voters {
-		runtimes[index], bases[index] = newRF3Runtime(t, uint64(index+1))
+		runtimes[index], bases[index], readSources[index] = newRF3Runtime(t, uint64(index+1))
 	}
 	group := runtimes[0].Identity().Group
 
@@ -121,9 +123,11 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 				Registry: serving, Host: host,
 				Members:       []raftmember.RuntimeIdentity{runtimes[index].Identity()},
 				CommandFences: []CommandFence{rf3CommandFence(bases[index])},
+				ReadSources:   []ReadSource{readSources[index]},
 				Pulse:         pulses[index],
 				Limits: Limits{MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
 					MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
+					MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
 					MaxPendingOutboundBytes: 64 << 20},
 			},
 			Transport: rafttransport.OrdinaryTransportOptions{
@@ -222,6 +226,44 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("RF3 Put: %v", err)
 	}
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
+	follower := (leader + 1) % voters
+	followerState, err := owners[follower].Probe(ctx, group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	followerRead, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: followerState.Fence(), Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	})
+	if err != nil || !followerRead.Found ||
+		!bytes.Equal(followerRead.Value, []byte(`{"id":"alpha","value":1}`)) {
+		t.Fatalf("applied-bounded follower read=%+v err=%v", followerRead, err)
+	}
+	if _, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: followerState.Fence(), Relation: 1, Key: key,
+		MinimumApplied: followerRead.Applied + 1,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
+		t.Fatalf("future follower floor error=%v", err)
+	}
+	staleFence := followerState.Fence()
+	staleFence.Command.RelationManifestDigest[0] ^= 1
+	if _, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: staleFence, Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	}); !errors.Is(err, ErrServingFence) {
+		t.Fatalf("stale manifest fence error=%v", err)
+	}
+	linearRead, err := owners[leader].ReadPoint(ctx, PointReadRequest{
+		Fence: leaderState.Fence(), Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
+	})
+	if err != nil || !linearRead.Found || !bytes.Equal(linearRead.Value, followerRead.Value) {
+		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
+	}
 
 	// Kill the exact serving leader after its acknowledged response. Remaining
 	// voters elect another leader and replaying identical bytes returns the same
@@ -254,12 +296,10 @@ func rf3CommandFence(base sqldriver.ReplicatedShardStoreIdentity) CommandFence {
 	return CommandFence{
 		ReplicaSetVersion: 1, ActivePolicyGeneration: authority.ActivePolicyGeneration,
 		ProtectionEpoch: authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
-		SchemaGeneration: authority.SchemaGeneration,
-		RelationManifestDigest: sha256.Sum256(
-			[]byte("rf3-test-portable-logical-relation-manifest"),
-		),
-		RoutingVersion:  authority.RoutingVersion,
-		RouteGeneration: authority.RouteGeneration,
+		SchemaGeneration:       authority.SchemaGeneration,
+		RelationManifestDigest: base.RelationManifestDigest,
+		RoutingVersion:         authority.RoutingVersion,
+		RouteGeneration:        authority.RouteGeneration,
 	}
 }
 
@@ -403,7 +443,7 @@ func rf3Command(
 func newRF3Runtime(
 	t testing.TB,
 	memberID uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
 	identity := raftstore.Identity{
 		Distribution: "orders", Shard: "0000-ffff",
@@ -500,7 +540,7 @@ func newRF3Runtime(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return runtime, base
+	return runtime, base, apply
 }
 
 func rf3HostLimits() multiraft.Limits {
