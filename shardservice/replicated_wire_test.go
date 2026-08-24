@@ -106,6 +106,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
 		{Operation: ReplicatedPropose, Fence: fence, Command: command},
+		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
+		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
@@ -123,7 +127,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		if decoded.Operation != request.Operation || decoded.Fence != request.Fence ||
-			!bytes.Equal(decoded.Command, request.Command) {
+			!bytes.Equal(decoded.Command, request.Command) ||
+			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+			decoded.MinimumApplied != request.MinimumApplied ||
+			decoded.MaxValueBytes != request.MaxValueBytes {
 			t.Fatalf("request round trip = %+v", decoded)
 		}
 		if len(decoded.Command) != 0 && cap(decoded.Command) != len(decoded.Command) {
