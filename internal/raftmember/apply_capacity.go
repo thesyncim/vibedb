@@ -38,7 +38,7 @@ func validateLiveApplyCapacity(
 	if err != nil {
 		return fmt.Errorf("%w: inspect capacity profile: %w", ErrWALUnavailable, err)
 	}
-	if wal.RecoveredTornCurrentSlot() {
+	if wal.RecoveredTornCurrentSlot() || wal.RecoveredTornFamilySlot() {
 		return ErrWALQuarantined
 	}
 	if apply == nil {

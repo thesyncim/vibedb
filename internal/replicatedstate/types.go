@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -20,16 +21,17 @@ const (
 	ResultFormatMutation uint16 = 1
 
 	// Zero and unknown result codes are invalid.
-	ResultApplied           uint32 = 1
-	ResultStaleFence        uint32 = 2
-	ResultUnknownCollection uint32 = 3
-	ResultInvalidDocument   uint32 = 4
-	ResultTargetBound       uint32 = 5
-	ResultWrongShard        uint32 = 6
-	ResultSessionRetired    uint32 = 7
-	ResultSessionOpened     uint32 = 8
-	ResultSessionRenewed    uint32 = 9
-	ResultSessionRevoked    uint32 = 10
+	ResultApplied         uint32 = 1
+	ResultStaleFence      uint32 = 2
+	ResultUnknownRelation uint32 = 3
+	ResultInvalidDocument uint32 = 4
+	ResultTargetBound     uint32 = 5
+	ResultWrongShard      uint32 = 6
+	ResultSessionRetired  uint32 = 7
+	ResultSessionOpened   uint32 = 8
+	ResultSessionRenewed  uint32 = 9
+	ResultSessionRevoked  uint32 = 10
+	ResultIndexConflict   uint32 = 11
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf
@@ -215,12 +217,13 @@ type CollectionTarget struct {
 
 // UserCollection is the single logical collection owned by a Machine.
 type UserCollection struct {
-	Name   string
-	Target CollectionTarget
+	Name         string
+	Target       CollectionTarget
+	LocalIndexes []store.IndexDefinition
 }
 
 func (t CollectionTarget) validate() error {
-	if t.Collection == nil || t.Collection.HasSchema() || t.Collection.HasIndexes() ||
+	if t.Collection == nil || t.Collection.HasSchema() ||
 		!t.Collection.HasSynchronousDurability() || !t.Collection.SupportsUpdate() {
 		return ErrSchemaProfile
 	}
@@ -311,5 +314,5 @@ func isSessionTerminalResult(code uint32) bool {
 }
 
 func isSessionResultCode(code uint32) bool {
-	return code >= ResultApplied && code <= ResultSessionRevoked
+	return code >= ResultApplied && code <= ResultIndexConflict
 }

@@ -42,6 +42,44 @@ a caller from replacing an uncertain record with different data.
 The active WAL is append-only. Compaction creates an offline generation. It
 does not rewrite the active file in place.
 
+## Generation family
+
+Every WAL is born with one mandatory authenticated 4 KiB family manifest; an
+absent manifest is corruption, not a compatibility path. Its two fixed slots
+start with the same source authority and thereafter admit only the adjacent
+semantic sequence `source -> selecting 1 -> active 1 -> selecting 2 -> active
+2 ...`. A missing/invalid peer or a pair that does not encode one legal
+transition quarantines serving.
+
+The offline builder streams the exact authenticated source cut into one
+deterministic preallocated stage and retains only the suffix above the certified
+SQL checkpoint. It holds no source descriptor between calls. Candidate build,
+family creation, and initial WAL creation use deterministic stage witnesses.
+One persistent lock derived only from the logical WAL leaf serializes initial
+creation across every caller identity; a separate persistent per-family build
+lease serializes later generation construction. A
+clean source Open only proves an optional same-inode creation witness and pays
+no directory barrier; first selection unconditionally settles that witness
+before the source can be reclaimed. Selection also removes a same-inode
+candidate stage under the candidate writer lock before publishing authority.
+Selecting and active recovery reject a surviving creation alias. Repeated
+crashes therefore cannot accumulate full-size construction files.
+
+Selection returns the fixed-width family/generation/binding identity atomically
+with its persistence result. Even an outcome-unknown family-slot write can
+therefore fence SQL without a post-return query or a race with WAL close. The
+source and SQL apply remain non-serving while the family is selecting.
+
+Activation orders the exact SQL snapshot install and checkpoint before logical
+WAL replacement, an unconditional parent-directory barrier, namespace proof,
+the authenticated active family slot, and a final logical-name proof after that
+authority is durable. Only then does raftstore mint an opaque completion
+capability for that exact generation. A failed final proof keeps the same
+handle fenced and retries without repeating SQL settlement. A zero, stale,
+foreign, or replayed capability cannot release SQL. The old full WAL loses its
+final namespace link only inside this ordered protocol, and later generations
+bind the preceding generation digest.
+
 ## Staged child base
 
 A split child can start from a certified snapshot base whose index is newer
@@ -78,6 +116,8 @@ controls must protect physical root ownership.
 ## Implementation references
 
 - `internal/raftstore/types.go`, `store.go`, and `recovery.go`
+- `internal/raftstore/family.go`, `family_codec.go`, and
+  `generation_activate.go`
 - `sql/driver/replicated_store.go`
 - `internal/raftstore/store_test.go`
 - `sql/driver/replicated_store_test.go`

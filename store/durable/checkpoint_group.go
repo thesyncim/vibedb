@@ -1584,8 +1584,12 @@ func (g *CheckpointGroup) updateLocked(
 		}
 	}
 
-	batch := &DatabaseBatch{byName: make(map[string]*WriteBatch, len(ordered))}
+	batch := &DatabaseBatch{
+		byName:  make(map[string]*WriteBatch, len(ordered)),
+		members: ordered,
+	}
 	batches := make([]*WriteBatch, len(ordered))
+	batch.batches = batches
 	for i, member := range ordered {
 		hint := member.BatchDocumentsHint
 		if hint == 0 {

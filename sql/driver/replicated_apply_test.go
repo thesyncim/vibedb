@@ -260,6 +260,331 @@ func TestReplicatedApplyUsesReplayBackedCheckpointGroup(t *testing.T) {
 	}
 }
 
+func TestReplicatedApplyAuthenticatesAndMaintainsNativeExactIndexes(t *testing.T) {
+	path, database, binding, _ := prepareReplicatedTestRoot(t, "native-exact-index", false)
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testRuntimeExec(session, `CREATE INDEX by_email ON docs (email)`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
+	bootstrap := testReplicatedApplyBootstrap()
+	options := testReplicatedApplyOptions()
+	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+
+	document := []byte(`{"id":"indexed","email":"a"}`)
+	key := testReplicatedApplyKey(t, database, document)
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
+		Kind: replication.MutationPut, Key: key, Value: document,
+	})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	group := core.checkpointGroup
+	core.mu.RUnlock()
+	if group == nil {
+		t.Fatal("native exact index apply has no checkpoint group")
+	}
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := func(raw []byte) [][]byte {
+		t.Helper()
+		core.mu.RLock()
+		collection := core.tables[base.UserTable].collection
+		core.mu.RUnlock()
+		snapshot, err := collection.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := snapshot.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		var entries [1]vibejson.IndexEntry
+		needle, err := vibejson.BuildIndex(raw, entries[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		masks, err := snapshot.AppendIndexMasks(nil, "by_email", needle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keys [][]byte
+		if err := snapshot.RangeMasksRaw(masks, func(indexedKey, _ []byte) error {
+			keys = append(keys, bytes.Clone(indexedKey))
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return keys
+	}
+	if keys := probe([]byte(`"a"`)); len(keys) != 1 || !bytes.Equal(keys[0], key) {
+		t.Fatalf("native exact index keys = %q, want %q", keys, key)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedClaim, reopenedIdentity, err := reopened.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil || reopenedIdentity != identity || reopenedClaim.Applied() != 3 {
+		t.Fatalf("indexed replicated reopen = %+v, %v", reopenedIdentity, err)
+	}
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testing.T) {
+	path, database, binding, _ := prepareReplicatedTestRoot(t, "global-relation-bundle", false)
+	session, err := database.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE INDEX by_email ON docs (email)`,
+		`CREATE TABLE email_claims (PRIMARY KEY (key))`,
+	} {
+		if err := testRuntimeExec(session, statement, nil); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	base, err := database.BindReplicatedShardStoreBundle(
+		binding, "docs", []ReplicatedGlobalIndexRelation{{
+			Relation: 2, Table: "email_claims", IndexID: 41,
+			Incarnation: 7, LocatorCount: 1, Unique: true,
+		}},
+	)
+	skipReplicatedStrictAllocationUnsupported(t, database, base, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.RelationCount != 2 ||
+		base.RelationSchemaGeneration != binding.Authority.SchemaGeneration ||
+		base.RelationManifestDigest == ([sha256.Size]byte{}) ||
+		base.Relations[0].Kind != ReplicatedShardRelationJSON ||
+		base.Relations[0].LocalIndexDigest == ([sha256.Size]byte{}) ||
+		base.Relations[1].Kind != ReplicatedShardRelationGlobalIndex ||
+		base.Relations[1].IndexID != 41 || base.Relations[1].Incarnation != 7 {
+		t.Fatalf("bundle identity = %+v", base)
+	}
+	bootstrap := testReplicatedApplyBootstrap()
+	options := testReplicatedApplyOptions()
+	claim, applyIdentity, err := database.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+	document := []byte(`{"email":"a","id":"doc-1"}`)
+	baseKey := testReplicatedApplyKey(t, database, document)
+	globalKey := []byte{0x91, 0x01, 'a'}
+	locator := []byte(`["doc-1"]`)
+	commandValue := testReplicatedApplyCommandValue(base, epoch, 2, nil)
+	commandValue.Fingerprint = sha256.Sum256([]byte("sql-global-relation-bundle-put"))
+	commandValue.Batches = []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: baseKey, Value: document,
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: locator,
+		}}},
+	}
+	command, err := replication.AppendCommand(nil, commandValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	if got := completionResultCode(t, claim, command); got != replicatedstate.ResultApplied {
+		t.Fatalf("bundle result = %d", got)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	baseCollection := core.tables["docs"].collection
+	globalCollection := core.tables["email_claims"].collection
+	systemCollection := core.replicatedApplyCollection
+	group := core.checkpointGroup
+	core.mu.RUnlock()
+	if group == nil || !group.Owns([]durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: systemCollection},
+		{Name: "docs", Collection: baseCollection},
+		{Name: "email_claims", Collection: globalCollection},
+	}) {
+		t.Fatal("bundle was not activated as one checkpoint group")
+	}
+	if value, found, err := baseCollection.AppendRaw(nil, baseKey); err != nil || !found ||
+		!bytes.Equal(value, document) {
+		t.Fatalf("base value = %q,%v,%v", value, found, err)
+	}
+	if value, found, err := globalCollection.AppendRaw(nil, globalKey); err != nil || !found ||
+		!bytes.Equal(value, locator) {
+		t.Fatalf("global value = %q,%v,%v", value, found, err)
+	}
+
+	conflictDocument := []byte(`{"email":"a","id":"doc-2"}`)
+	conflictKey := testReplicatedApplyKey(t, database, conflictDocument)
+	conflictValue := testReplicatedApplyCommandValue(base, epoch, 3, nil)
+	conflictValue.Fingerprint = sha256.Sum256([]byte("sql-global-relation-bundle-conflict"))
+	conflictValue.Batches = []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: conflictKey, Value: conflictDocument,
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey,
+			Value: []byte(`["doc-2"]`),
+		}}},
+	}
+	conflict, err := replication.AppendCommand(nil, conflictValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(4), conflict); err != nil {
+		t.Fatal(err)
+	}
+	if got := completionResultCode(t, claim, conflict); got != replicatedstate.ResultIndexConflict {
+		t.Fatalf("conflict result = %d", got)
+	}
+	if _, found, err := baseCollection.AppendRaw(nil, conflictKey); err != nil || found {
+		t.Fatalf("conflicting base row escaped atomic bundle: found=%v err=%v", found, err)
+	}
+	if partial, err := claim.SnapshotArtifactCut(); partial != nil ||
+		!errors.Is(err, replicatedstate.ErrSnapshotArtifact) {
+		if partial != nil {
+			_ = partial.Close()
+		}
+		t.Fatalf("partial singleton snapshot of bundle = %p,%v", partial, err)
+	}
+	if partial, err := claim.CaptureWALBase(WALBaseCaptureOptions{
+		Workspace: walBaseWorkspace(),
+	}); partial != nil || !errors.Is(err, replicatedstate.ErrSnapshotArtifact) {
+		t.Fatalf("partial singleton WAL base of bundle = %p,%v", partial, err)
+	}
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	snapshotBase, bundleManifest, err := claim.BuildBundleSnapshotBase()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(snapshotBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity, err := claim.CapacityQualificationProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group.CheckpointAppliedIndex() != 4 || !bundleManifest.Bundle ||
+		bundleManifest.State.Applied != 4 || len(bundleManifest.Relations) != 2 ||
+		bundleManifest.Relations[0].Rows != 1 || bundleManifest.Relations[1].Rows != 1 ||
+		certificate.Manifest.Digest != bundleManifest.Digest ||
+		certificate.Manifest.RelationManifestDigest != bundleManifest.RelationManifestDigest ||
+		capacity.RelationManifestDigest != bundleManifest.RelationManifestDigest ||
+		capacity.Binding.Authority.SchemaGeneration != base.RelationSchemaGeneration {
+		t.Fatalf("bundle checkpoint/certificate cut = group=%d manifest=%+v cert=%+v",
+			group.CheckpointAppliedIndex(), bundleManifest, certificate.Manifest)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenReplicatedShardStoreWithApply(path, base, applyIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedClaim, reopenedIdentity, err := reopened.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil || reopenedIdentity != applyIdentity || reopenedClaim.Applied() != 4 {
+		t.Fatalf("bundle reopen = %+v,%v", reopenedIdentity, err)
+	}
+	reopenedCore := reopened.connector.db
+	reopenedCore.mu.RLock()
+	reopenedBase := reopenedCore.tables["docs"].collection
+	reopenedGlobal := reopenedCore.tables["email_claims"].collection
+	reopenedGroup := reopenedCore.checkpointGroup
+	reopenedCore.mu.RUnlock()
+	if value, found, readErr := reopenedBase.AppendRaw(nil, baseKey); readErr != nil ||
+		!found || !bytes.Equal(value, document) {
+		t.Fatalf("reopened base value = %q,%v,%v", value, found, readErr)
+	}
+	if value, found, readErr := reopenedGlobal.AppendRaw(nil, globalKey); readErr != nil ||
+		!found || !bytes.Equal(value, locator) {
+		t.Fatalf("reopened global value = %q,%v,%v", value, found, readErr)
+	}
+	if reopenedGroup == nil || reopenedGroup.CheckpointAppliedIndex() != 4 {
+		t.Fatalf("reopened checkpoint cut = %v", reopenedGroup)
+	}
+	if err := reopenedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, readErr := reopenedGlobal.AppendRaw(nil, []byte(globalIndexMarkerKey)); readErr != nil || found {
+		t.Fatalf("replicated global relation retained standalone marker: found=%v err=%v",
+			found, readErr)
+	}
+	reader, err := reopened.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var locators [][]byte
+	collect := func(value []byte) error {
+		locators = append(locators, bytes.Clone(value))
+		return nil
+	}
+	if err := reader.LookupGlobalIndex(
+		context.Background(), "email_claims", 41, 7, globalKey, 1, true,
+		8, 1024, collect,
+	); err != nil || len(locators) != 1 || !bytes.Equal(locators[0], locator) {
+		t.Fatalf("replicated global lookup = %q,%v", locators, err)
+	}
+	if err := reader.LookupGlobalIndex(
+		context.Background(), "email_claims", 41, 8, globalKey, 1, true,
+		8, 1024, collect,
+	); !errors.Is(err, ErrGlobalIndexFence) {
+		t.Fatalf("replicated global stale-incarnation lookup = %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "ownership-transition")
 	bootstrap := testReplicatedApplyBootstrap()
@@ -411,6 +736,11 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	want := ReplicatedApplyCapacityProfile{
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
+	}
+	want.RelationManifestDigest, err = claim.machine.RelationManifestDigest()
+	if err != nil || want.RelationManifestDigest == ([sha256.Size]byte{}) {
+		t.Fatalf("portable relation manifest digest = %x,%v",
+			want.RelationManifestDigest, err)
 	}
 	checkpoint := uint64(0)
 	assertProfile := func(label string, want ReplicatedApplyCapacityProfile, maxCheckpoint uint64) {
@@ -1997,7 +2327,9 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		Binding: ReplicatedShardStoreBinding{
 			Distribution: "dist", Shard: "shard", AllocationGeneration: 11,
 			MemberID: 19, StoreID: [16]byte{20},
-			Authority: ReplicatedAuthorityProfile{RoutingVersion: 12, RouteGeneration: 13},
+			Authority: ReplicatedAuthorityProfile{
+				SchemaGeneration: 17, RoutingVersion: 12, RouteGeneration: 13,
+			},
 		},
 		LogID: [16]byte{21}, UserTable: "docs", UserStorage: "local-storage",
 		UserPrimaryKey: "/id",
@@ -2005,8 +2337,16 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 			MaxKeyBytes: 123, MaxDocumentBytes: 456,
 			MaxBatchDocuments: 7, MaxBatchBytes: 890,
 		},
-		Sidecars: canonicalReplicatedShardStoreSidecars(),
+		Sidecars:      canonicalReplicatedShardStoreSidecars(),
+		RelationCount: 1, RelationSchemaGeneration: 17,
+		Relations: make([]ReplicatedShardRelationIdentity, 1),
 	}
+	identity.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: identity.UserTable, Storage: identity.UserStorage, Limits: identity.UserLimits,
+		LocalIndexDigest: sha256.Sum256([]byte("by_email:/email")),
+	}
+	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	placement := ReplicatedPlacementProfile{
 		Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
 		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
@@ -2016,7 +2356,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "0561d23db26f2c8bd320819912c71aba1f9292c6c78dc3929c02ec55c11e4496"
+	const wantDigest = "885cdd7ffa5c04b7d2f1d8872b1a163be260c71038ea66ecf62b7b43a8be25b7"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -2031,6 +2371,12 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
 			i.Binding.Authority.RouteGeneration++
 		},
+		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
+			i.RelationSchemaGeneration++
+		},
+		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
+			i.Relations[0].LocalIndexDigest[0]++
+		},
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.Format++ },
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.ShardKey += "x" },
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.TupleVersion++ },
@@ -2040,7 +2386,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(_ *ReplicatedShardStoreIdentity, p *ReplicatedPlacementProfile) { p.Range.End.Max = true },
 	}
 	for index, mutate := range boundMutations {
-		changedIdentity, changedPlacement := identity, placement
+		changedIdentity, changedPlacement := identity.Clone(), placement
 		mutate(&changedIdentity, &changedPlacement)
 		if digest := replicatedApplyProfileDigest(changedIdentity, changedPlacement); digest == got {
 			t.Fatalf("bound mutation %d did not change digest", index)
@@ -2051,9 +2397,10 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.LogID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.UserStorage += "x" },
+		func(i *ReplicatedShardStoreIdentity) { i.Relations[0].Storage += "x" },
 	}
 	for index, mutate := range localMutations {
-		changed := identity
+		changed := identity.Clone()
 		mutate(&changed)
 		if digest := replicatedApplyProfileDigest(changed, placement); digest != got {
 			t.Fatalf("member-local mutation %d changed digest: %x != %x", index, digest, got)

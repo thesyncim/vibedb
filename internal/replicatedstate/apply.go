@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
+	jsondoc "github.com/thesyncim/vibejson/document"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -31,6 +32,7 @@ type commandPlan struct {
 	sessionRecord   []byte
 	slotRecord      []byte
 	changes         []finalMutation
+	relations       []plannedRelationChanges
 	dataChainDigest [32]byte
 	resultCode      uint32
 	refusal         error
@@ -44,6 +46,17 @@ type commandPlan struct {
 	release         bool
 	exactDuplicate  bool
 	conflict        bool
+}
+
+type plannedRelationChanges struct {
+	ordinal uint16
+	start   uint32
+	end     uint32
+}
+
+type relationPointSnapshots struct {
+	values [replication.MaxRelationsPerBundle]pointSnapshot
+	count  uint16
 }
 
 // commandPlanScratch is optional caller-owned storage for the bounded raw
@@ -216,16 +229,16 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if !m.immutableBindingMatches(command) {
 		return raftmodel.Publication{}, m.fail(ErrWrongBinding)
 	}
-	cut, systemSnapshot, userSnapshot, err := m.captureApplyCut()
+	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
-	plan, planErr := m.planCommand(
+	plan, planErr := m.planBundleCommand(
 		command, meta.Index, m.state,
-		pointSnapshot{value: systemSnapshot}, pointSnapshot{value: userSnapshot},
+		pointSnapshot{value: systemSnapshot}, relationSnapshots,
 		nil,
 	)
-	err = errors.Join(planErr, cut.Close())
+	err = errors.Join(planErr, m.applyCut.Close())
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
@@ -320,10 +333,17 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	if err != nil || certBootstrapDigest != m.bootstrapDigest ||
 		!bytes.Equal(certBootstrap, m.bootstrap) || !m.initialized ||
 		certificate.Manifest.State.Binding != m.binding ||
-		!bytes.Equal(certificate.Manifest.UserCollection, []byte(m.userName)) ||
-		certificate.Manifest.UserRows != m.user.Collection.Len() ||
 		certificate.Manifest.State.BootstrapDigest != m.bootstrapDigest ||
 		!equalStateExceptSnapshotBaseDigest(certificate.Manifest.State, m.state) {
+		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+	}
+	if certificate.Manifest.Bundle {
+		if !m.bundleSnapshotManifestMatches(certificate.Manifest) {
+			return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+		}
+	} else if len(m.relations) != 1 ||
+		!bytes.Equal(certificate.Manifest.UserCollection, []byte(m.userName)) ||
+		certificate.Manifest.UserRows != m.user.Collection.Len() {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
 	imageDigest, imageErr := m.snapshotBaseImageDigest()
@@ -349,30 +369,96 @@ func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
 	if m == nil || m.user.Collection == nil {
 		return [32]byte{}, ErrSnapshotBase
 	}
-	currentGeneration := m.user.Collection.Generation()
-	if currentGeneration != 0 && m.openedImageApplied == m.state.Applied &&
-		m.openedImageGeneration == currentGeneration &&
-		m.openedImageDigest != ([32]byte{}) {
+	if m.openedImageApplied == m.state.Applied && m.openedBundleImageCurrent() {
 		return m.openedImageDigest, nil
 	}
-	snapshot, err := m.user.Collection.Snapshot()
+	if len(m.relations) == 1 {
+		currentGeneration := m.user.Collection.Generation()
+		snapshot, err := m.user.Collection.Snapshot()
+		if err != nil {
+			return [32]byte{}, err
+		}
+		generation := snapshot.Generation()
+		digest, scanErr := canonicalImageDigest(
+			m.userName, m.user.Validation, m.user.ValidationDigest,
+			m.user.Validator, snapshot, nil,
+		)
+		closeErr := snapshot.Close()
+		if scanErr != nil || closeErr != nil || generation == 0 ||
+			m.user.Collection.Generation() != generation || currentGeneration != generation {
+			return [32]byte{}, errors.Join(ErrInconsistentSnapshot, scanErr, closeErr)
+		}
+		m.openedImageDigest = digest
+		m.openedImageApplied = m.state.Applied
+		m.openedImageGeneration = generation
+		m.relations[0].openedImage = digest
+		m.relations[0].openedApplied = m.state.Applied
+		m.relations[0].openedGen = generation
+		return digest, nil
+	}
+	cut, err := durable.SnapshotCollections(m.members)
 	if err != nil {
 		return [32]byte{}, err
 	}
-	generation := snapshot.Generation()
-	digest, scanErr := canonicalImageDigest(
-		m.userName, m.user.Validation, m.user.ValidationDigest,
-		m.user.Validator, snapshot, nil,
-	)
-	closeErr := snapshot.Close()
-	if scanErr != nil || closeErr != nil || generation == 0 ||
-		m.user.Collection.Generation() != generation {
+	relationImages := make([]SnapshotArtifactRelation, len(m.relations))
+	var relationGenerations [replication.MaxRelationsPerBundle]uint64
+	var scanErr error
+	for i := range m.relations {
+		relation := &m.relations[i]
+		snapshot, ok := cut.Collection(relation.name)
+		if !ok || snapshot == nil || snapshot.Generation() == 0 {
+			scanErr = ErrInconsistentSnapshot
+			break
+		}
+		digest, digestErr := canonicalImageDigest(
+			relation.name, relation.target.Validation, relation.target.ValidationDigest,
+			relation.target.Validator, snapshot, nil,
+		)
+		if digestErr != nil {
+			scanErr = digestErr
+			break
+		}
+		relationImages[i] = SnapshotArtifactRelation{
+			Relation: relation.id, Kind: relation.kind,
+			Collection: []byte(relation.name), Rows: snapshot.Len(), ImageDigest: digest,
+		}
+		relationGenerations[i] = snapshot.Generation()
+	}
+	closeErr := cut.Close()
+	if scanErr != nil || closeErr != nil {
 		return [32]byte{}, errors.Join(ErrInconsistentSnapshot, scanErr, closeErr)
+	}
+	digest := canonicalBundleImageDigest(relationImages)
+	for i := range m.relations {
+		m.relations[i].openedImage = relationImages[i].ImageDigest
+		m.relations[i].openedGen = relationGenerations[i]
+		m.relations[i].openedApplied = m.state.Applied
 	}
 	m.openedImageDigest = digest
 	m.openedImageApplied = m.state.Applied
-	m.openedImageGeneration = generation
+	m.openedImageGeneration = m.relations[0].openedGen
 	return digest, nil
+}
+
+func (m *Machine) bundleSnapshotManifestMatches(manifest SnapshotArtifactManifest) bool {
+	if !manifest.Bundle || manifest.RelationManifestDigest != m.manifestDigest ||
+		len(manifest.Relations) != len(m.relations) || len(m.relations) == 0 ||
+		!bytes.Equal(manifest.UserCollection, []byte(m.relations[0].name)) {
+		return false
+	}
+	var rows uint64
+	for i := range m.relations {
+		want := &m.relations[i]
+		got := &manifest.Relations[i]
+		if got.Relation != want.id || got.Kind != want.kind ||
+			!bytes.Equal(got.Collection, []byte(want.name)) ||
+			got.Rows != want.target.Collection.Len() || rows > math.MaxUint64-got.Rows {
+			return false
+		}
+		rows += got.Rows
+	}
+	return rows == manifest.UserRows &&
+		manifest.SystemRows == m.system.Collection.Len()
 }
 
 // AdmitCommand performs the complete non-reserving pre-proposal check.
@@ -418,16 +504,16 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if !m.immutableBindingMatches(command) {
 		return ErrWrongBinding
 	}
-	cut, systemSnapshot, userSnapshot, err := m.captureApplyCutLocked()
+	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
 	if err != nil {
 		return m.fail(err)
 	}
-	plan, planErr := m.planCommand(
+	plan, planErr := m.planBundleCommand(
 		command, m.state.Applied+1, m.state,
-		pointSnapshot{value: systemSnapshot}, pointSnapshot{value: userSnapshot},
+		pointSnapshot{value: systemSnapshot}, relationSnapshots,
 		nil,
 	)
-	closeErr := cut.Close()
+	closeErr := m.applyCut.Close()
 	if planErr != nil || closeErr != nil {
 		joined := errors.Join(planErr, closeErr)
 		if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
@@ -563,20 +649,66 @@ func (m *Machine) captureApplyCut() (durable.DatabaseSnapshot, *durable.Snapshot
 }
 
 func (m *Machine) captureApplyCutLocked() (durable.DatabaseSnapshot, *durable.Snapshot, *durable.Snapshot, error) {
-	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
-		{Name: systemCollectionName, Collection: m.system.Collection},
-		{Name: m.userName, Collection: m.user.Collection},
-	})
+	cut, systemSnapshot, relations, err := m.captureBundleApplyCutLocked()
 	if err != nil {
 		return durable.DatabaseSnapshot{}, nil, nil, err
 	}
-	systemSnapshot, systemOK := cut.Collection(systemCollectionName)
-	userSnapshot, userOK := cut.Collection(m.userName)
-	if !systemOK || !userOK || systemSnapshot == nil || userSnapshot == nil {
-		return durable.DatabaseSnapshot{}, nil, nil,
-			errors.Join(ErrInconsistentSnapshot, cut.Close())
+	return cut, systemSnapshot, relations.values[0].value, nil
+}
+
+func (m *Machine) captureBundleApplyCutLocked() (
+	durable.DatabaseSnapshot,
+	*durable.Snapshot,
+	relationPointSnapshots,
+	error,
+) {
+	cut, err := durable.SnapshotCollections(m.members)
+	if err != nil {
+		return durable.DatabaseSnapshot{}, nil, relationPointSnapshots{}, err
 	}
-	return cut, systemSnapshot, userSnapshot, nil
+	systemSnapshot, snapshots, err := m.bundleSnapshotsFromCutLocked(&cut)
+	if err != nil {
+		return durable.DatabaseSnapshot{}, nil, relationPointSnapshots{},
+			errors.Join(err, cut.Close())
+	}
+	return cut, systemSnapshot, snapshots, nil
+}
+
+func (m *Machine) captureHotBundleApplyCutLocked() (
+	*durable.Snapshot,
+	relationPointSnapshots,
+	error,
+) {
+	if err := durable.SnapshotCollectionsInto(&m.applyCut, m.members); err != nil {
+		return nil, relationPointSnapshots{}, err
+	}
+	systemSnapshot, snapshots, err := m.bundleSnapshotsFromCutLocked(&m.applyCut)
+	if err != nil {
+		return nil, relationPointSnapshots{}, errors.Join(err, m.applyCut.Close())
+	}
+	return systemSnapshot, snapshots, nil
+}
+
+func (m *Machine) bundleSnapshotsFromCutLocked(
+	cut *durable.DatabaseSnapshot,
+) (*durable.Snapshot, relationPointSnapshots, error) {
+	if cut == nil {
+		return nil, relationPointSnapshots{}, ErrInconsistentSnapshot
+	}
+	systemSnapshot, systemOK := cut.CollectionHandle(m.system.Collection)
+	if !systemOK || systemSnapshot == nil {
+		return nil, relationPointSnapshots{}, ErrInconsistentSnapshot
+	}
+	var snapshots relationPointSnapshots
+	snapshots.count = uint16(len(m.relations))
+	for i := range m.relations {
+		snapshot, ok := cut.CollectionHandle(m.relations[i].target.Collection)
+		if !ok || snapshot == nil {
+			return nil, relationPointSnapshots{}, ErrInconsistentSnapshot
+		}
+		snapshots.values[i] = pointSnapshot{value: snapshot}
+	}
+	return systemSnapshot, snapshots, nil
 }
 
 func (m *Machine) planCommand(
@@ -584,6 +716,22 @@ func (m *Machine) planCommand(
 	applied uint64,
 	state State,
 	systemSnapshot, userSnapshot pointSnapshot,
+	scratch *commandPlanScratch,
+) (commandPlan, error) {
+	var relations relationPointSnapshots
+	relations.count = 1
+	relations.values[0] = userSnapshot
+	return m.planBundleCommand(
+		command, applied, state, systemSnapshot, relations, scratch,
+	)
+}
+
+func (m *Machine) planBundleCommand(
+	command replication.CommandView,
+	applied uint64,
+	state State,
+	systemSnapshot pointSnapshot,
+	relationSnapshots relationPointSnapshots,
 	scratch *commandPlanScratch,
 ) (commandPlan, error) {
 	scratch.begin()
@@ -759,35 +907,66 @@ func (m *Machine) planCommand(
 			next.LeaseDeadlineUnixNano = 0
 		}
 	default:
-		relations := command.RelationBatches()
-		hasRelation := relations.Next()
-		relation := relations.Batch()
-		switch {
-		case !m.mutableBindingMatchesState(command, state):
+		if !m.mutableBindingMatchesState(command, state) {
 			plan.resultCode = ResultStaleFence
-		case command.RelationCount() != 1 || !hasRelation ||
-			relation.Relation != replication.RelationID(1):
-			plan.resultCode = ResultUnknownCollection
-		default:
-			plan.changes, plan.resultCode, err = m.planMutations(
-				relation, userSnapshot, scratch,
+			break
+		}
+		if relationSnapshots.count != uint16(len(m.relations)) {
+			return commandPlan{}, ErrInconsistentSnapshot
+		}
+		clear(m.bundlePlan)
+		m.bundlePlan = m.bundlePlan[:0]
+		clear(m.bundleRelations)
+		m.bundleRelations = m.bundleRelations[:0]
+		plan.resultCode = ResultApplied
+		relationBatches := command.RelationBatches()
+		for relationBatches.Next() {
+			batch := relationBatches.Batch()
+			ordinal := int(batch.Relation) - 1
+			if ordinal < 0 || ordinal >= len(m.relations) {
+				plan.resultCode = ResultUnknownRelation
+				break
+			}
+			relation := &m.relations[ordinal]
+			changes, code, planErr := m.planMutations(
+				relation, batch, relationSnapshots.values[ordinal], scratch,
 			)
-			if err != nil {
-				return commandPlan{}, err
+			if planErr != nil {
+				return commandPlan{}, planErr
 			}
-			if plan.resultCode == ResultApplied && len(plan.changes) != 0 {
-				var descriptors []mutationValueDescriptor
-				if scratch != nil {
-					descriptors = scratch.descriptors
-				}
-				plan.dataChainDigest, err = dataChainTransitionDigest(
-					m.dataChainHash, state.DataChainDigest, m.applyContract,
-					plan.changes, descriptors,
-				)
-				if err != nil {
-					return commandPlan{}, err
-				}
+			if code != ResultApplied {
+				plan.resultCode = code
+				break
 			}
+			if len(changes) == 0 {
+				continue
+			}
+			start := len(m.bundlePlan)
+			m.bundlePlan = append(m.bundlePlan, changes...)
+			m.bundleRelations = append(m.bundleRelations, plannedRelationChanges{
+				ordinal: uint16(ordinal), start: uint32(start), end: uint32(len(m.bundlePlan)),
+			})
+			var descriptors []mutationValueDescriptor
+			if scratch != nil {
+				descriptors = scratch.descriptors
+			}
+			plan.dataChainDigest, planErr = dataChainTransitionDigest(
+				m.dataChainHash, plan.dataChainDigest, relation.contract,
+				m.bundlePlan[start:], descriptors,
+			)
+			if planErr != nil {
+				return commandPlan{}, planErr
+			}
+		}
+		if plan.resultCode == ResultApplied {
+			plan.changes = m.bundlePlan
+			plan.relations = m.bundleRelations
+		} else {
+			clear(m.bundlePlan)
+			m.bundlePlan = m.bundlePlan[:0]
+			clear(m.bundleRelations)
+			m.bundleRelations = m.bundleRelations[:0]
+			plan.dataChainDigest = state.DataChainDigest
 		}
 	}
 
@@ -1127,10 +1306,15 @@ func sessionRetryFloor(session SessionView) uint64 {
 }
 
 func (m *Machine) planMutations(
+	relation *relationCollection,
 	batch replication.RelationBatchView,
 	snapshot pointSnapshot,
 	scratch *commandPlanScratch,
 ) ([]finalMutation, uint32, error) {
+	if relation == nil || relation.target.Collection == nil {
+		return nil, 0, ErrInvalidCollection
+	}
+	target := relation.target
 	if cap(m.mutationPlan) == 0 {
 		m.mutationPlan = m.mutationInline[:0]
 	}
@@ -1140,6 +1324,14 @@ func (m *Machine) planMutations(
 	iterator := batch.Mutations()
 	for iterator.Next() {
 		mutation := iterator.Mutation()
+		if relation.kind == RelationJSON &&
+			mutation.Kind != replication.MutationPut &&
+			mutation.Kind != replication.MutationDelete ||
+			relation.kind == RelationGlobalIndex &&
+				mutation.Kind != replication.MutationPutAbsentOrEqual &&
+				mutation.Kind != replication.MutationDeleteDigestEqual {
+			return nil, ResultInvalidDocument, nil
+		}
 		at := -1
 		for index := range ordered {
 			if bytes.Equal(ordered[index].key, mutation.Key) {
@@ -1148,31 +1340,41 @@ func (m *Machine) planMutations(
 			}
 		}
 		if at >= 0 {
+			if relation.kind == RelationGlobalIndex {
+				return nil, ResultIndexConflict, nil
+			}
 			ordered[at].delete = mutation.Kind == replication.MutationDelete
 			ordered[at].value = mutation.Value
 			continue
 		}
+		value := mutation.Value
+		if mutation.Kind == replication.MutationDeleteDigestEqual {
+			value = mutation.Compare
+		}
 		ordered = append(ordered, finalMutation{
-			key: mutation.Key, value: mutation.Value,
-			delete: mutation.Kind == replication.MutationDelete,
+			key: mutation.Key, value: value,
+			delete: mutation.Kind == replication.MutationDelete ||
+				mutation.Kind == replication.MutationDeleteDigestEqual,
 		})
-		if len(ordered) > m.user.Limits.MaxDistinctMutations {
+		if len(ordered) > target.Limits.MaxDistinctMutations {
 			return nil, ResultTargetBound, nil
 		}
 	}
 	rawUpperBytes := 0
 	rawUpperExceeds := false
 	for _, mutation := range ordered {
-		if len(mutation.key) > m.user.Limits.MaxBatchBytes-rawUpperBytes {
+		if len(mutation.key) > target.Limits.MaxBatchBytes-rawUpperBytes {
 			rawUpperExceeds = true
 			break
 		}
 		rawUpperBytes += len(mutation.key)
-		if len(mutation.value) > m.user.Limits.MaxBatchBytes-rawUpperBytes {
+		if !mutation.delete && len(mutation.value) > target.Limits.MaxBatchBytes-rawUpperBytes {
 			rawUpperExceeds = true
 			break
 		}
-		rawUpperBytes += len(mutation.value)
+		if !mutation.delete {
+			rawUpperBytes += len(mutation.value)
+		}
 	}
 	if rawUpperExceeds && scratch != nil {
 		scratch.hybridClassificationPasses++
@@ -1180,26 +1382,36 @@ func (m *Machine) planMutations(
 	stagedBytes := 0
 	changes := ordered[:0]
 	for _, mutation := range ordered {
-		if len(mutation.key) > m.user.Limits.MaxKeyBytes ||
-			len(mutation.value) > m.user.Limits.MaxDocumentBytes {
+		// A conditional delete carries a fixed length+digest comparison payload
+		// in mutation.value. It is command metadata, never a stored document, so
+		// only puts are constrained by the target document bound.
+		if len(mutation.key) > target.Limits.MaxKeyBytes ||
+			!mutation.delete && len(mutation.value) > target.Limits.MaxDocumentBytes {
 			return nil, ResultTargetBound, nil
 		}
 		if !mutation.delete {
 			if err := vibejson.Validate(mutation.value); err != nil {
 				return nil, ResultInvalidDocument, nil
 			}
+			if relation.kind == RelationGlobalIndex &&
+				!validGlobalIndexLocator(mutation.value, relation.globalIndex.LocatorCount) {
+				return nil, ResultInvalidDocument, nil
+			}
+		} else if relation.kind == RelationGlobalIndex &&
+			len(mutation.value) != replication.MutationDigestCompareBytes {
+			return nil, ResultInvalidDocument, nil
 		}
 		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 		if err != nil {
 			return nil, 0, err
 		}
 		mutation.beforeFound = found
-		if m.user.Validation == ValidationDeterministicMutation {
+		if target.Validation == ValidationDeterministicMutation {
 			validation := MutationValidation(0)
 			if mutation.delete {
-				validation = m.user.Validator.ValidateDelete(mutation.key, current, found)
+				validation = target.Validator.ValidateDelete(mutation.key, current, found)
 			} else {
-				validation = m.user.Validator.ValidatePut(mutation.key, mutation.value)
+				validation = target.Validator.ValidatePut(mutation.key, mutation.value)
 			}
 			switch validation {
 			case MutationValidationAccept:
@@ -1215,14 +1427,37 @@ func (m *Machine) planMutations(
 				)
 			}
 		}
+		if relation.kind == RelationGlobalIndex {
+			if !mutation.delete {
+				if found {
+					if globalIndexLocatorsEqual(
+						current, mutation.value, relation.globalIndex.LocatorCount,
+					) {
+						continue
+					}
+					return nil, ResultIndexConflict, nil
+				}
+			} else {
+				if !found {
+					continue
+				}
+				expectedLength := binary.LittleEndian.Uint64(mutation.value[:8])
+				currentDigest := sha256.Sum256(current)
+				if uint64(len(current)) != expectedLength ||
+					!bytes.Equal(currentDigest[:], mutation.value[8:]) {
+					return nil, ResultIndexConflict, nil
+				}
+				mutation.value = nil
+			}
+		}
 		if mutation.delete && !found || !mutation.delete && found && bytes.Equal(current, mutation.value) {
 			continue
 		}
-		if len(mutation.key) > m.user.Limits.MaxBatchBytes-stagedBytes {
+		if len(mutation.key) > target.Limits.MaxBatchBytes-stagedBytes {
 			return nil, ResultTargetBound, nil
 		}
 		stagedBytes += len(mutation.key)
-		if len(mutation.value) > m.user.Limits.MaxBatchBytes-stagedBytes {
+		if len(mutation.value) > target.Limits.MaxBatchBytes-stagedBytes {
 			return nil, ResultTargetBound, nil
 		}
 		stagedBytes += len(mutation.value)
@@ -1255,6 +1490,75 @@ func (m *Machine) planMutations(
 		return bytes.Compare(left.key, right.key)
 	})
 	return changes, ResultApplied, nil
+}
+
+func validGlobalIndexLocator(value []byte, count uint8) bool {
+	if len(value) == 0 || count == 0 || count > 8 {
+		return false
+	}
+	var entries [9]vibejson.IndexEntry
+	index, err := vibejson.BuildIndex(value, entries[:])
+	if err != nil {
+		return false
+	}
+	root := index.Root()
+	length, ok := root.ArrayLen()
+	if !ok || length != int(count) {
+		return false
+	}
+	for i := 0; i < length; i++ {
+		node, _ := root.Index(i)
+		if node.Kind() != jsondoc.String && node.Kind() != jsondoc.Number {
+			return false
+		}
+	}
+	return true
+}
+
+func globalIndexLocatorsEqual(left, right []byte, count uint8) bool {
+	if count == 0 || count > 8 {
+		return false
+	}
+	var leftEntries, rightEntries [9]vibejson.IndexEntry
+	leftIndex, leftErr := vibejson.BuildIndex(left, leftEntries[:])
+	rightIndex, rightErr := vibejson.BuildIndex(right, rightEntries[:])
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftRoot, rightRoot := leftIndex.Root(), rightIndex.Root()
+	leftLength, leftArray := leftRoot.ArrayLen()
+	rightLength, rightArray := rightRoot.ArrayLen()
+	if !leftArray || !rightArray || leftLength != int(count) || rightLength != int(count) {
+		return false
+	}
+	for i := 0; i < int(count); i++ {
+		leftNode, leftOK := leftRoot.Index(i)
+		rightNode, rightOK := rightRoot.Index(i)
+		if !leftOK || !rightOK {
+			return false
+		}
+		if leftNode.Kind() != rightNode.Kind() {
+			return false
+		}
+		switch leftNode.Kind() {
+		case jsondoc.String:
+			if !vibejson.RawJSONStringEqual(
+				leftNode.Raw().Bytes(), leftNode.Entry.Flags(),
+				rightNode.Raw().Bytes(), rightNode.Entry.Flags(),
+			) {
+				return false
+			}
+		case jsondoc.Number:
+			if !vibejson.JSONNumberEqual(
+				leftNode.Raw().Bytes(), rightNode.Raw().Bytes(),
+			) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func describeFinalMutation(
@@ -1292,6 +1596,10 @@ func describeFinalMutation(
 func (m *Machine) releaseMutationPlan() {
 	clear(m.mutationPlan)
 	m.mutationPlan = m.mutationPlan[:0]
+	clear(m.bundlePlan)
+	m.bundlePlan = m.bundlePlan[:0]
+	clear(m.bundleRelations)
+	m.bundleRelations = m.bundleRelations[:0]
 }
 
 // pointSnapshot is the planning capability. It exposes point reads plus one
@@ -1512,24 +1820,27 @@ func (m *Machine) persistTransition(
 	if plan.deleteSession {
 		systemDocuments += 1 + int(plan.deleteSlots)
 	}
-	members := []durable.NamedCollection{{
+	m.transitionMembers = m.transitionMembers[:0]
+	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
 		BatchDocumentsHint: systemDocuments,
-	}}
-	if len(changes) != 0 {
-		members = append(members, durable.NamedCollection{
-			Name: m.userName, Collection: m.user.Collection,
-			BatchDocumentsHint: len(changes),
+	})
+	for i := range plan.relations {
+		span := plan.relations[i]
+		relation := &m.relations[span.ordinal]
+		m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
+			Name: relation.name, Collection: relation.target.Collection,
+			BatchDocumentsHint: int(span.end - span.start),
 		})
 	}
 	if len(captureRecord) != 0 {
-		members = append(members, durable.NamedCollection{
+		m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 			Name: m.captureTarget.Name, Collection: m.captureTarget.Collection,
 			BatchDocumentsHint: 1,
 		})
 	}
 	writeTransition := func(batch *durable.DatabaseBatch) error {
-		systemBatch, err := batch.Collection(systemCollectionName)
+		systemBatch, err := batch.CollectionHandle(m.system.Collection)
 		if err != nil {
 			return err
 		}
@@ -1561,7 +1872,7 @@ func (m *Machine) persistTransition(
 			}
 		}
 		if len(captureRecord) != 0 {
-			captureBatch, captureErr := batch.Collection(m.captureTarget.Name)
+			captureBatch, captureErr := batch.CollectionHandle(m.captureTarget.Collection)
 			if captureErr != nil {
 				return captureErr
 			}
@@ -1570,46 +1881,62 @@ func (m *Machine) persistTransition(
 				return captureErr
 			}
 		}
-		if len(changes) == 0 {
-			return nil
-		}
-		userBatch, err := batch.Collection(m.userName)
-		if err != nil {
-			return err
-		}
-		for _, mutation := range changes {
-			if mutation.delete {
-				err = userBatch.Delete(mutation.key)
-			} else {
-				err = userBatch.Put(mutation.key, mutation.value)
+		for i := range plan.relations {
+			span := plan.relations[i]
+			relation := &m.relations[span.ordinal]
+			relationBatch, batchErr := batch.CollectionHandle(relation.target.Collection)
+			if batchErr != nil {
+				return batchErr
 			}
-			if err != nil {
-				return err
+			for mutationIndex := span.start; mutationIndex < span.end; mutationIndex++ {
+				mutation := &changes[mutationIndex]
+				if mutation.delete {
+					batchErr = relationBatch.Delete(mutation.key)
+				} else {
+					batchErr = relationBatch.Put(mutation.key, mutation.value)
+				}
+				if batchErr != nil {
+					return batchErr
+				}
 			}
 		}
 		return nil
 	}
 	if m.checkpointGroup != nil {
 		err = m.checkpointGroup.Update(
-			next.Applied, members, m.options.TxnLimits, writeTransition,
+			next.Applied, m.transitionMembers, m.options.TxnLimits, writeTransition,
 		)
 	} else {
 		err = durable.UpdateCollections(
-			m.txnLog, members, m.options.TxnLimits, writeTransition,
+			m.txnLog, m.transitionMembers, m.options.TxnLimits, writeTransition,
 		)
 	}
-	if len(changes) != 0 && m.user.ObserveMutationAttempt != nil {
-		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: changes}, err)
+	for i := range plan.relations {
+		span := plan.relations[i]
+		relation := &m.relations[span.ordinal]
+		if relation.target.ObserveMutationAttempt != nil {
+			relation.target.ObserveMutationAttempt(AttemptedMutationKeys{
+				changes: changes[span.start:span.end],
+			}, err)
+		}
 	}
 	if err != nil {
 		return err
 	}
-	if len(changes) == 0 && m.openedImageGeneration != 0 &&
-		m.user.Collection.Generation() == m.openedImageGeneration {
+	if len(changes) == 0 && m.openedBundleImageCurrent() {
 		m.openedImageApplied = next.Applied
+		for i := range m.relations {
+			m.relations[i].openedApplied = next.Applied
+		}
 	} else {
 		m.openedImageApplied = 0
 		m.openedImageGeneration = 0
+		for i := range plan.relations {
+			relation := &m.relations[plan.relations[i].ordinal]
+			relation.openedApplied = 0
+			relation.openedGen = 0
+			relation.openedImage = [sha256.Size]byte{}
+		}
 	}
 	m.state = next
 	if m.binding.Distribution != next.Binding.Distribution {
@@ -1696,31 +2023,92 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 		stateBytes > m.system.Limits.MaxBatchBytes {
 		return ErrAdmissionBound
 	}
-	userBytes := 0
-	for _, mutation := range changes {
-		userBytes += len(mutation.key) + len(mutation.value)
+	if err := m.validateRelationChangePlan(changes, plan.relations); err != nil {
+		return err
 	}
-	if len(changes) > m.user.Limits.MaxDistinctMutations || userBytes > m.user.Limits.MaxBatchBytes {
-		return ErrAdmissionBound
+	relationBytes := 0
+	for i := range plan.relations {
+		span := plan.relations[i]
+		relation := &m.relations[span.ordinal]
+		spanBytes := 0
+		for mutationIndex := span.start; mutationIndex < span.end; mutationIndex++ {
+			mutation := &changes[mutationIndex]
+			if len(mutation.key) > math.MaxInt-len(mutation.value) ||
+				spanBytes > math.MaxInt-len(mutation.key)-len(mutation.value) {
+				return ErrAdmissionBound
+			}
+			spanBytes += len(mutation.key) + len(mutation.value)
+		}
+		if int(span.end-span.start) > relation.target.Limits.MaxDistinctMutations ||
+			spanBytes > relation.target.Limits.MaxBatchBytes ||
+			relationBytes > math.MaxInt-spanBytes {
+			return ErrAdmissionBound
+		}
+		relationBytes += spanBytes
 	}
 	collections := 1
-	if len(changes) != 0 {
-		collections++
-	}
+	collections += len(plan.relations)
 	if captureBytes != 0 {
 		if captureBytes > m.captureTarget.Collection.MaxBatchBytes()-8 ||
-			userBytes > math.MaxInt-captureBytes-8 {
+			relationBytes > math.MaxInt-captureBytes-8 {
 			return ErrAdmissionBound
 		}
 		collections++
-		userBytes += 8 + captureBytes
+		relationBytes += 8 + captureBytes
 		systemDocs++
 	}
 	if collections > m.options.TxnLimits.MaxCollections ||
 		systemDocs+len(changes) > m.options.TxnLimits.MaxDocuments ||
-		int64(stateBytes) > math.MaxInt64-int64(userBytes) ||
-		int64(stateBytes)+int64(userBytes) > m.options.TxnLimits.MaxBytes {
+		int64(stateBytes) > math.MaxInt64-int64(relationBytes) ||
+		int64(stateBytes)+int64(relationBytes) > m.options.TxnLimits.MaxBytes {
 		return ErrAdmissionBound
 	}
 	return nil
+}
+
+func (m *Machine) validateRelationChangePlan(
+	changes []finalMutation,
+	spans []plannedRelationChanges,
+) error {
+	if len(changes) == 0 {
+		if len(spans) != 0 {
+			return ErrAdmissionBound
+		}
+		return nil
+	}
+	if len(spans) == 0 || len(m.relations) == 0 {
+		return ErrAdmissionBound
+	}
+	next := uint32(0)
+	previous := -1
+	for i := range spans {
+		span := spans[i]
+		ordinal := int(span.ordinal)
+		if ordinal <= previous || ordinal >= len(m.relations) ||
+			span.start != next || span.end <= span.start ||
+			uint64(span.end) > uint64(len(changes)) {
+			return ErrAdmissionBound
+		}
+		previous = ordinal
+		next = span.end
+	}
+	if uint64(next) != uint64(len(changes)) {
+		return ErrAdmissionBound
+	}
+	return nil
+}
+
+func (m *Machine) openedBundleImageCurrent() bool {
+	if m.openedImageDigest == ([sha256.Size]byte{}) ||
+		m.openedImageGeneration == 0 || len(m.relations) == 0 {
+		return false
+	}
+	for i := range m.relations {
+		relation := &m.relations[i]
+		if relation.openedImage == ([sha256.Size]byte{}) || relation.openedGen == 0 ||
+			relation.target.Collection.Generation() != relation.openedGen {
+			return false
+		}
+	}
+	return true
 }

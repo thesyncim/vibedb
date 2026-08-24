@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"slices"
@@ -88,6 +89,77 @@ type fileCrypto struct {
 	nonceKey [32]byte
 }
 
+// objectCryptoWorkspace owns keyed HMAC state for one single-threaded record
+// scanner. Reset preserves each HMAC's key schedule, while sequence and sum
+// storage stay caller-owned. It must never be shared between goroutines.
+type objectCryptoWorkspace struct {
+	objectKeyMAC hash.Hash
+	authMAC      hash.Hash
+	sequence     [8]byte
+	sum          [sha256.Size]byte
+}
+
+func newObjectCryptoWorkspace(
+	dataKey [sha256.Size]byte,
+	nonceKey [sha256.Size]byte,
+) objectCryptoWorkspace {
+	return objectCryptoWorkspace{
+		objectKeyMAC: hmac.New(sha256.New, dataKey[:]),
+		authMAC:      hmac.New(sha256.New, nonceKey[:]),
+	}
+}
+
+func (workspace *objectCryptoWorkspace) deriveObjectKey(
+	domain string,
+	sequence uint64,
+	digest [sha256.Size]byte,
+) [sha256.Size]byte {
+	mac := workspace.objectKeyMAC
+	mac.Reset()
+	_, _ = mac.Write([]byte("vibedb/raft-wal/object/"))
+	_, _ = mac.Write([]byte(domain))
+	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
+	_, _ = mac.Write(workspace.sequence[:])
+	_, _ = mac.Write(digest[:])
+	_ = mac.Sum(workspace.sum[:0])
+	return workspace.sum
+}
+
+func (workspace *objectCryptoWorkspace) makeObjectTag(
+	domain string,
+	sequence uint64,
+	context, payload []byte,
+) [sha256.Size]byte {
+	mac := workspace.authMAC
+	mac.Reset()
+	_, _ = mac.Write([]byte("tag/"))
+	_, _ = mac.Write([]byte(domain))
+	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
+	_, _ = mac.Write(workspace.sequence[:])
+	_, _ = mac.Write(context)
+	_, _ = mac.Write(payload)
+	_ = mac.Sum(workspace.sum[:0])
+	return workspace.sum
+}
+
+func (workspace *objectCryptoWorkspace) deriveObjectNonce(
+	domain string,
+	sequence uint64,
+	digest [sha256.Size]byte,
+) [12]byte {
+	mac := workspace.authMAC
+	mac.Reset()
+	_, _ = mac.Write([]byte("object/"))
+	_, _ = mac.Write([]byte(domain))
+	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
+	_, _ = mac.Write(workspace.sequence[:])
+	_, _ = mac.Write(digest[:])
+	_ = mac.Sum(workspace.sum[:0])
+	var result [12]byte
+	copy(result[:], workspace.sum[:])
+	return result
+}
+
 func makeFileCrypto(key Key, fileID [16]byte) (fileCrypto, error) {
 	if err := validateKey(key, false); err != nil {
 		return fileCrypto{}, err
@@ -113,6 +185,10 @@ func makeFileCrypto(key Key, fileID [16]byte) (fileCrypto, error) {
 
 func makeObjectAEAD(dataKey [32]byte, domain string, sequence uint64, digest [32]byte) (cipher.AEAD, error) {
 	derived := deriveObjectKey(dataKey, domain, sequence, digest)
+	return makeObjectAEADFromKey(derived)
+}
+
+func makeObjectAEADFromKey(derived [32]byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(derived[:])
 	if err != nil {
 		return nil, err

@@ -135,6 +135,12 @@ type MutationView struct {
 	Kind  MutationKind
 	Key   []byte
 	Value []byte
+	// Compare aliases the canonical fixed compare payload for
+	// MutationDeleteDigestEqual and is empty for every other mutation.
+	Compare []byte
+
+	ExpectedValueLength uint64
+	ExpectedValueDigest Digest
 }
 
 // MutationIterator walks a validated command without materializing a slice.
@@ -231,6 +237,12 @@ func (i *MutationIterator) Next() bool {
 		Key:   i.b[keyStart:valueStart:valueStart],
 		Value: i.b[valueStart:end:end],
 	}
+	if kind == MutationDeleteDigestEqual {
+		i.current.Compare = i.b[valueStart:end:end]
+		i.current.Value = nil
+		i.current.ExpectedValueLength = binary.LittleEndian.Uint64(i.b[valueStart : valueStart+8])
+		copy(i.current.ExpectedValueDigest[:], i.b[valueStart+8:end])
+	}
 	i.b = i.b[end:len(i.b):len(i.b)]
 	i.remaining--
 	return true
@@ -316,12 +328,19 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 		}
 		for mutationIndex := range batch.Mutations {
 			mutation := &batch.Mutations[mutationIndex]
+			valueBytes := mutationWireValueBytes(*mutation)
 			frame[cursor] = byte(mutation.Kind)
 			appendU16(frame, cursor+2, uint16(len(mutation.Key)))
-			appendU32(frame, cursor+4, uint32(len(mutation.Value)))
+			appendU32(frame, cursor+4, uint32(valueBytes))
 			cursor += mutationHeaderBytes
 			cursor += copy(frame[cursor:], mutation.Key)
-			cursor += copy(frame[cursor:], mutation.Value)
+			if mutation.Kind == MutationDeleteDigestEqual {
+				appendU64(frame, cursor, mutation.ExpectedValueLength)
+				copy(frame[cursor+8:cursor+mutationDigestCompareBytes], mutation.ExpectedValueDigest[:])
+				cursor += mutationDigestCompareBytes
+			} else {
+				cursor += copy(frame[cursor:], mutation.Value)
+			}
 		}
 		if headerAt >= 0 {
 			appendU32(
@@ -432,7 +451,7 @@ func measureCommand(command Command) (int, error) {
 				total, ok = checkedAdd(total, uint64(len(mutation.Key)), MaxCommandBytes)
 			}
 			if ok {
-				total, ok = checkedAdd(total, uint64(len(mutation.Value)), MaxCommandBytes)
+				total, ok = checkedAdd(total, uint64(mutationWireValueBytes(*mutation)), MaxCommandBytes)
 			}
 			if !ok {
 				return 0, ErrEnvelopeTooLarge
@@ -531,19 +550,37 @@ func validateMutation(mutation Mutation) error {
 	if len(mutation.Key) == 0 || len(mutation.Key) > MaxMutationKeyBytes {
 		return semantic("mutation key length")
 	}
+	zeroExpected := mutation.ExpectedValueLength == 0 &&
+		mutation.ExpectedValueDigest == (Digest{})
 	switch mutation.Kind {
-	case MutationPut:
+	case MutationPut, MutationPutAbsentOrEqual:
 		if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 			return semantic("put value length")
 		}
+		if !zeroExpected {
+			return semantic("put carries delete compare")
+		}
 	case MutationDelete:
-		if len(mutation.Value) != 0 {
+		if len(mutation.Value) != 0 || !zeroExpected {
 			return semantic("delete carries value bytes")
+		}
+	case MutationDeleteDigestEqual:
+		if len(mutation.Value) != 0 || mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueLength > MaxMutationValueBytes ||
+			mutation.ExpectedValueDigest == (Digest{}) {
+			return semantic("delete compare value identity")
 		}
 	default:
 		return semantic("unknown mutation kind")
 	}
 	return nil
+}
+
+func mutationWireValueBytes(mutation Mutation) int {
+	if mutation.Kind == MutationDeleteDigestEqual {
+		return mutationDigestCompareBytes
+	}
+	return len(mutation.Value)
 }
 
 // OpenCommand validates one exact command envelope and returns a borrowed
@@ -787,13 +824,20 @@ func validateMutationBytes(src []byte, count uint32) error {
 		end := cursor + int(payload)
 		value := src[cursor+keyLen : end]
 		switch kind {
-		case MutationPut:
+		case MutationPut, MutationPutAbsentOrEqual:
 			if len(value) == 0 {
 				return semantic("put value length")
 			}
 		case MutationDelete:
 			if len(value) != 0 {
 				return semantic("delete carries value bytes")
+			}
+		case MutationDeleteDigestEqual:
+			if len(value) != mutationDigestCompareBytes ||
+				binary.LittleEndian.Uint64(value[:8]) == 0 ||
+				binary.LittleEndian.Uint64(value[:8]) > MaxMutationValueBytes ||
+				allZero(value[8:]) {
+				return semantic("delete compare value identity")
 			}
 		default:
 			return semantic("unknown mutation kind")

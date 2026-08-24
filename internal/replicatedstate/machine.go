@@ -36,27 +36,34 @@ var (
 type Machine struct {
 	mu sync.RWMutex
 
-	binding         Binding
-	bootstrap       []byte
-	bootstrapDigest [32]byte
-	system          CollectionTarget
-	userName        string
-	user            CollectionTarget
-	distribution    []byte
-	shard           []byte
-	applyContract   [32]byte
-	dataChainHash   *dataChainHasher
-	mutationPlan    []finalMutation
-	mutationInline  [8]finalMutation
-	batchTelemetry  normalBatchTelemetry
-	txnLog          *durable.TxnLog
-	checkpointGroup *durable.CheckpointGroup
-	options         Options
-	capture         TransitionCapture
-	captureTarget   TransitionCaptureTarget
-	captureBuffer   []byte
-	captureChanges  []finalMutation
-	captureKey      [8]byte
+	binding           Binding
+	bootstrap         []byte
+	bootstrapDigest   [32]byte
+	system            CollectionTarget
+	userName          string
+	user              CollectionTarget
+	relations         []relationCollection
+	manifestDigest    [sha256.Size]byte
+	members           []durable.NamedCollection
+	distribution      []byte
+	shard             []byte
+	applyContract     [32]byte
+	dataChainHash     *dataChainHasher
+	mutationPlan      []finalMutation
+	mutationInline    [8]finalMutation
+	bundlePlan        []finalMutation
+	bundleRelations   []plannedRelationChanges
+	transitionMembers []durable.NamedCollection
+	batchTelemetry    normalBatchTelemetry
+	txnLog            *durable.TxnLog
+	checkpointGroup   *durable.CheckpointGroup
+	options           Options
+	applyCut          durable.DatabaseSnapshot
+	capture           TransitionCapture
+	captureTarget     TransitionCaptureTarget
+	captureBuffer     []byte
+	captureChanges    []finalMutation
+	captureKey        [8]byte
 
 	state                 State
 	publication           raftmodel.Publication
@@ -85,6 +92,9 @@ type openInputs struct {
 	system          CollectionTarget
 	userName        string
 	user            CollectionTarget
+	relations       []relationCollection
+	manifestDigest  [sha256.Size]byte
+	members         []durable.NamedCollection
 	applyContract   [32]byte
 	txnLog          *durable.TxnLog
 	checkpointGroup *durable.CheckpointGroup
@@ -102,20 +112,78 @@ func Open(
 	txnLog *durable.TxnLog,
 	options Options,
 ) (result *Machine, resultErr error) {
+	return OpenBundle(
+		binding, bootstrap, system,
+		[]RelationCollection{{
+			Relation: 1, Kind: RelationJSON, Name: userSpec.Name, Target: userSpec.Target,
+			LocalIndexes: userSpec.LocalIndexes,
+		}},
+		txnLog, options,
+	)
+}
+
+// OpenBundle validates and freezes one hidden system collection plus a dense,
+// schema-generation-bound relation bundle. Every relation handle is included
+// in the fixed transaction/checkpoint membership before committed input can be
+// admitted.
+func OpenBundle(
+	binding Binding,
+	bootstrap *pb.Snapshot,
+	system CollectionTarget,
+	relationSpecs []RelationCollection,
+	txnLog *durable.TxnLog,
+	options Options,
+) (result *Machine, resultErr error) {
+	if len(relationSpecs) == 0 {
+		return nil, ErrInvalidCollection
+	}
+	if len(relationSpecs) > 1 && options.TransitionCapture != nil {
+		return nil, ErrTransitionCapture
+	}
 	prepared, err := prepareOpenInputs(
-		binding, bootstrap, system, userSpec, txnLog, options,
+		binding, bootstrap, system,
+		UserCollection{Name: relationSpecs[0].Name, Target: relationSpecs[0].Target},
+		txnLog, options, true,
 	)
 	if err != nil {
 		return nil, err
 	}
+	relations, manifest, err := prepareRelationCollections(binding, relationSpecs)
+	if err != nil {
+		return nil, err
+	}
+	contract, err := bundleApplyContractDigest(
+		manifest, relations, options.MaxSessions, options.RetryWindow,
+	)
+	if err != nil {
+		return nil, err
+	}
+	prepared.relations = relations
+	prepared.manifestDigest = manifest
+	prepared.applyContract = contract
+	prepared.members = make([]durable.NamedCollection, 1, len(relations)+1)
+	prepared.members[0] = durable.NamedCollection{
+		Name: systemCollectionName, Collection: system.Collection,
+	}
+	for i := range relations {
+		prepared.members = append(prepared.members, durable.NamedCollection{
+			Name: relations[i].name, Collection: relations[i].target.Collection,
+		})
+	}
+	if options.CheckpointGroup != nil && !options.CheckpointGroup.Owns(prepared.members) {
+		return nil, fmt.Errorf("%w: checkpoint-group bundle ownership", ErrInvalidOptions)
+	}
+	if err := txnLog.ValidateCollections(prepared.members); err != nil {
+		return nil, fmt.Errorf("%w: transaction-log bundle binding: %w", ErrInvalidCollection, err)
+	}
+	if err := validateBundleTransactionProfile(system, relations, options); err != nil {
+		return nil, fmt.Errorf("%w: bundle transaction profile", err)
+	}
 	binding, system = prepared.binding, prepared.system
-	userName, user := prepared.userName, prepared.user
+	userName := prepared.userName
 	bootstrapDigest := prepared.bootstrapDigest
 	m := newMachineFromOpenInputs(prepared)
-	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
-		{Name: systemCollectionName, Collection: system.Collection},
-		{Name: userName, Collection: user.Collection},
-	})
+	cut, err := durable.SnapshotCollections(prepared.members)
 	if err != nil {
 		return nil, err
 	}
@@ -129,15 +197,28 @@ func Open(
 	if !ok || userSnapshot == nil {
 		return nil, fmt.Errorf("%w: missing user snapshot", ErrInconsistentSnapshot)
 	}
-	imageDigest, err := canonicalImageDigest(
-		userName, user.Validation, user.ValidationDigest, user.Validator, userSnapshot, nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("user collection %q: %w", userName, err)
-	}
 	imageGeneration := userSnapshot.Generation()
 	if imageGeneration == 0 {
 		return nil, fmt.Errorf("%w: missing user image generation", ErrInconsistentSnapshot)
+	}
+	for i := range m.relations {
+		snapshot, exists := cut.Collection(m.relations[i].name)
+		if !exists || snapshot == nil || snapshot.Generation() == 0 {
+			return nil, fmt.Errorf("%w: missing relation snapshot", ErrInconsistentSnapshot)
+		}
+		if err := validateRelationIndexCatalog(snapshot, m.relations[i].localIndexes); err != nil {
+			return nil, fmt.Errorf("relation %d index catalog: %w", m.relations[i].id, err)
+		}
+		relationImage, relationErr := openedRelationImageDigest(&m.relations[i], snapshot)
+		if relationErr != nil {
+			return nil, fmt.Errorf("relation %d image: %w", m.relations[i].id, relationErr)
+		}
+		m.relations[i].openedImage = relationImage
+		m.relations[i].openedGen = snapshot.Generation()
+	}
+	imageDigest, err := canonicalRelationImageDigest(m.relations)
+	if err != nil {
+		return nil, err
 	}
 	seedDigest, err := dataChainSeedDigest(prepared.applyContract, imageDigest)
 	if err != nil {
@@ -163,7 +244,12 @@ func Open(
 		if options.TransitionCapture != nil {
 			return nil, ErrTransitionCapture
 		}
-		if sessionCount != 0 || slotCount != 0 || userSnapshot.Len() != 0 {
+		relationRowsPresent := false
+		for i := range m.relations {
+			snapshot, _ := cut.Collection(m.relations[i].name)
+			relationRowsPresent = relationRowsPresent || snapshot.Len() != 0
+		}
+		if sessionCount != 0 || slotCount != 0 || relationRowsPresent {
 			return nil, fmt.Errorf("%w: uninitialized system with durable rows", ErrStateCorrupt)
 		}
 		m.state = State{
@@ -174,6 +260,9 @@ func Open(
 		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
 		m.openedImageDigest = imageDigest
 		m.openedImageGeneration = imageGeneration
+		for i := range m.relations {
+			m.relations[i].openedApplied = 0
+		}
 		return m, nil
 	}
 	if m.checkpointGroup != nil && m.checkpointGroup.SeedStateAuthoritative() {
@@ -222,6 +311,9 @@ func Open(
 	m.openedImageDigest = imageDigest
 	m.openedImageApplied = state.Applied
 	m.openedImageGeneration = imageGeneration
+	for i := range m.relations {
+		m.relations[i].openedApplied = state.Applied
+	}
 	m.binding = state.Binding
 	m.distribution = []byte(state.Binding.Distribution)
 	m.shard = []byte(state.Binding.Shard)
@@ -240,13 +332,15 @@ func newMachineFromOpenInputs(prepared openInputs) *Machine {
 	return &Machine{
 		binding: binding, bootstrap: prepared.bootstrap,
 		bootstrapDigest: prepared.bootstrapDigest, system: prepared.system,
-		userName:     prepared.userName,
-		user:         prepared.user,
+		userName: prepared.userName, user: prepared.user,
+		relations: prepared.relations, manifestDigest: prepared.manifestDigest,
+		members:      prepared.members,
 		distribution: []byte(binding.Distribution), shard: []byte(binding.Shard),
 		applyContract: prepared.applyContract,
 		dataChainHash: newDataChainHasher(),
 		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
-		options: prepared.options,
+		options:           prepared.options,
+		transitionMembers: make([]durable.NamedCollection, 0, len(prepared.relations)+2),
 	}
 }
 
@@ -257,6 +351,7 @@ func prepareOpenInputs(
 	userSpec UserCollection,
 	txnLog *durable.TxnLog,
 	options Options,
+	deferBundleMembership bool,
 ) (openInputs, error) {
 	if err := binding.validate(); err != nil {
 		return openInputs{}, err
@@ -304,7 +399,7 @@ func prepareOpenInputs(
 			"%w: system and user handles alias", ErrInvalidCollection,
 		)
 	}
-	if options.CheckpointGroup != nil {
+	if options.CheckpointGroup != nil && !deferBundleMembership {
 		if options.TransitionCapture != nil || !options.CheckpointGroup.Owns([]durable.NamedCollection{
 			{Name: systemCollectionName, Collection: system.Collection},
 			{Name: userName, Collection: user.Collection},
@@ -348,13 +443,15 @@ func prepareOpenInputs(
 			"%w: transaction limits do not cover the frozen apply profile", ErrInvalidOptions,
 		)
 	}
-	if err := txnLog.ValidateCollections([]durable.NamedCollection{
-		{Name: systemCollectionName, Collection: system.Collection},
-		{Name: userName, Collection: user.Collection},
-	}); err != nil {
-		return openInputs{}, fmt.Errorf(
-			"%w: transaction-log binding: %w", ErrInvalidCollection, err,
-		)
+	if !deferBundleMembership {
+		if err := txnLog.ValidateCollections([]durable.NamedCollection{
+			{Name: systemCollectionName, Collection: system.Collection},
+			{Name: userName, Collection: user.Collection},
+		}); err != nil {
+			return openInputs{}, fmt.Errorf(
+				"%w: transaction-log binding: %w", ErrInvalidCollection, err,
+			)
+		}
 	}
 	bootstrapBytes, bootstrapDigest, err := validateBootstrap(bootstrap)
 	if err != nil {
@@ -362,18 +459,33 @@ func prepareOpenInputs(
 	}
 	binding.Distribution = strings.Clone(binding.Distribution)
 	binding.Shard = strings.Clone(binding.Shard)
-	contractDigest, err := applyContractDigest(
-		userName, user, options.MaxSessions, options.RetryWindow,
-	)
-	if err != nil {
-		return openInputs{}, err
-	}
-	return openInputs{
+	prepared := openInputs{
 		binding: binding, bootstrap: bootstrapBytes, bootstrapDigest: bootstrapDigest,
 		system: system, userName: strings.Clone(userName), user: user,
-		applyContract: contractDigest,
-		txnLog:        txnLog, checkpointGroup: options.CheckpointGroup, options: options,
-	}, nil
+		txnLog: txnLog, checkpointGroup: options.CheckpointGroup, options: options,
+	}
+	if !deferBundleMembership {
+		relations, manifest, relationErr := prepareRelationCollections(binding, []RelationCollection{{
+			Relation: 1, Kind: RelationJSON, Name: userName, Target: user,
+			LocalIndexes: userSpec.LocalIndexes,
+		}})
+		if relationErr != nil {
+			return openInputs{}, relationErr
+		}
+		prepared.relations = relations
+		prepared.manifestDigest = manifest
+		prepared.applyContract, relationErr = bundleApplyContractDigest(
+			manifest, relations, options.MaxSessions, options.RetryWindow,
+		)
+		if relationErr != nil {
+			return openInputs{}, relationErr
+		}
+		prepared.members = []durable.NamedCollection{
+			{Name: systemCollectionName, Collection: system.Collection},
+			{Name: userName, Collection: user.Collection},
+		}
+	}
+	return prepared, nil
 }
 
 // bindingAdvancesFrom permits reopen through the write-once SQL/WAL binding
@@ -795,6 +907,26 @@ func (m *Machine) CheckpointAppliedIndex() uint64 {
 		return m.checkpointGroup.CheckpointAppliedIndex()
 	}
 	return m.state.Applied
+}
+
+// RelationManifestDigest returns the immutable, schema-generation-bound
+// logical relation manifest opened by this machine. It deliberately excludes
+// replica-local storage identities, so RF3 registration can reject replicas
+// that advertise the same schema generation but opened different relation
+// semantics. It grants no serving authority.
+func (m *Machine) RelationManifestDigest() ([sha256.Size]byte, error) {
+	if m == nil {
+		return [sha256.Size]byte{}, ErrApplyPoisoned
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.checkUsable(); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	if m.manifestDigest == ([sha256.Size]byte{}) {
+		return [sha256.Size]byte{}, ErrStateCorrupt
+	}
+	return m.manifestDigest, nil
 }
 
 // SessionCapacityState returns a read-only, constant-size view of the machine

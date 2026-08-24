@@ -52,7 +52,7 @@ func BindingFromWAL(
 			"%w: inspect stable state: %w", ErrWALUnavailable, err,
 		)
 	}
-	if wal.RecoveredTornCurrentSlot() {
+	if wal.RecoveredTornCurrentSlot() || wal.RecoveredTornFamilySlot() {
 		return sqldriver.ReplicatedShardStoreBinding{}, ErrWALQuarantined
 	}
 

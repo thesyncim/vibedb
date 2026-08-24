@@ -19,8 +19,9 @@ var (
 	// key in one globally unique index incarnation.
 	ErrGlobalIndexUniqueConflict = errors.New("vibedb: global unique index key is already claimed")
 	// ErrGlobalIndexFence reports a command whose index ID/incarnation does not
-	// match the shard-local relation marker. It fences delayed gateways and
-	// physical-relation reuse without a per-entry identity tax.
+	// match the shard-local relation marker or the replicated relation manifest.
+	// It fences delayed gateways and physical-relation reuse without a per-entry
+	// identity tax.
 	ErrGlobalIndexFence = errors.New("vibedb: global index relation incarnation conflicts")
 	// ErrGlobalIndexRelation reports a physical relation that is not suitable
 	// for raw canonical index keys and compact locator-array documents.
@@ -206,8 +207,9 @@ func (s *Session) LookupGlobalIndex(
 
 // LookupGlobalIndexKeys reads a strictly ordered, deduplicated finite key set
 // from one gateway-maintained global index relation at one durable snapshot.
-// Marker validation, snapshot acquisition, cancellation, and result bounds are
-// shared across the batch. This is the finite-domain locator-projection lane;
+// Incarnation validation (standalone marker or replicated manifest), snapshot
+// acquisition, cancellation, and result bounds are shared across the batch.
+// This is the finite-domain locator-projection lane;
 // it avoids one local snapshot and one network request per IN-list element.
 func (s *Session) LookupGlobalIndexKeys(
 	ctx context.Context,
@@ -259,6 +261,20 @@ func (s *Session) LookupGlobalIndexKeys(
 			ErrGlobalIndexRelation, relation,
 		)
 	}
+	replicatedRelation, replicated := replicatedGlobalIndexRelation(
+		core.catalog.ReplicatedShardStore, relation,
+	)
+	if replicated && replicatedRelation.Kind != ReplicatedShardRelationGlobalIndex {
+		core.mu.RUnlock()
+		return fmt.Errorf("%w: relation %q", ErrGlobalIndexRelation, relation)
+	}
+	if replicated && (replicatedRelation.IndexID != indexID ||
+		replicatedRelation.Incarnation != incarnation ||
+		replicatedRelation.LocatorCount != locatorCount ||
+		replicatedRelation.Unique != unique) {
+		core.mu.RUnlock()
+		return fmt.Errorf("%w: relation %q", ErrGlobalIndexFence, relation)
+	}
 	// A freshly provisioned physical index relation has no durable collection
 	// until its first claim is written. Under the shard-level read fence this is
 	// an exact empty answer: a concurrent first writer cannot publish until the
@@ -286,18 +302,25 @@ func (s *Session) LookupGlobalIndexKeys(
 	}
 	defer snapshot.Close()
 
-	var markerStorage [43]byte
-	marker := appendGlobalIndexMarker(markerStorage[:0], indexID, incarnation)
-	scratch, found, err := snapshot.AppendRaw(s.conn.pointRaw[:0], []byte(globalIndexMarkerKey))
-	if err != nil {
+	var scratch []byte
+	var found bool
+	var err error
+	if !replicated {
+		var markerStorage [43]byte
+		marker := appendGlobalIndexMarker(markerStorage[:0], indexID, incarnation)
+		scratch, found, err = snapshot.AppendRaw(
+			s.conn.pointRaw[:0], []byte(globalIndexMarkerKey),
+		)
+		if err != nil {
+			s.conn.pointRaw = scratch[:0]
+			return err
+		}
+		if !found || !bytes.Equal(scratch, marker) {
+			s.conn.pointRaw = scratch[:0]
+			return fmt.Errorf("%w: relation %q", ErrGlobalIndexFence, relation)
+		}
 		s.conn.pointRaw = scratch[:0]
-		return err
 	}
-	if !found || !bytes.Equal(scratch, marker) {
-		s.conn.pointRaw = scratch[:0]
-		return fmt.Errorf("%w: relation %q", ErrGlobalIndexFence, relation)
-	}
-	s.conn.pointRaw = scratch[:0]
 
 	rows := 0
 	var resultBytes int64
@@ -347,6 +370,27 @@ func (s *Session) LookupGlobalIndexKeys(
 		}
 	}
 	return nil
+}
+
+// replicatedGlobalIndexRelation resolves only cold, authenticated catalog
+// identity. Replicated command/apply paths never call this helper: they resolve
+// dense relation IDs directly to pre-opened handles. A catalog-bound global
+// relation carries its incarnation fence once in the manifest, so reads avoid
+// the standalone marker point probe and its per-relation storage tax.
+func replicatedGlobalIndexRelation(
+	identity *ReplicatedShardStoreIdentity,
+	table string,
+) (ReplicatedShardRelationIdentity, bool) {
+	if identity == nil || identity.RelationCount < 2 || table == "" {
+		return ReplicatedShardRelationIdentity{}, false
+	}
+	for ordinal := 1; ordinal < int(identity.RelationCount); ordinal++ {
+		relation := identity.Relations[ordinal]
+		if relation.Table == table {
+			return relation, true
+		}
+	}
+	return ReplicatedShardRelationIdentity{}, false
 }
 
 func admitGlobalIndexStaged(

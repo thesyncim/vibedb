@@ -88,6 +88,21 @@ func TestSnapshotCollectionsIntoMatchesSnapshotCollections(t *testing.T) {
 						wantView.Generation(), wantView.Len())
 				}
 			}
+			for i := range test.collections {
+				member := test.collections[i]
+				byHandle, handleOK := got.CollectionHandle(member.Collection)
+				byName, nameOK := got.Collection(member.Name)
+				if member.Collection == nil {
+					if handleOK || byHandle != nil {
+						t.Fatalf("nil CollectionHandle = (%p,%v)", byHandle, handleOK)
+					}
+					continue
+				}
+				if !handleOK || !nameOK || byHandle != byName {
+					t.Fatalf("CollectionHandle(%q) = (%p,%v), name = (%p,%v)",
+						member.Name, byHandle, handleOK, byName, nameOK)
+				}
+			}
 
 			// The returned catalog owns its names, just as SnapshotCollections does.
 			if len(test.collections) != 0 {

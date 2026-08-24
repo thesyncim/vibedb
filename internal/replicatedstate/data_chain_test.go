@@ -177,14 +177,20 @@ func TestDataChainSeedDigestBindsContractAndCanonicalImage(t *testing.T) {
 
 func TestReplicatedDigestGoldenVectors(t *testing.T) {
 	validationDigest := sha256.Sum256([]byte("validation profile"))
-	contract, err := applyContractDigest("docs", CollectionTarget{
+	target := CollectionTarget{
 		Validation:       ValidationDeterministicMutation,
 		ValidationDigest: validationDigest,
 		Limits: CollectionLimits{
 			MaxKeyBytes: 256, MaxDocumentBytes: 1 << 20,
 			MaxDistinctMutations: 64, MaxBatchBytes: 8 << 20,
 		},
-	}, 1024, 8)
+	}
+	relations := []relationCollection{{
+		id: 1, kind: RelationJSON, name: "docs", target: target,
+	}}
+	contract, err := bundleApplyContractDigest(
+		relationManifestDigest(1, relations), relations, 1024, 8,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,11 +210,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"428a5b40a86e0d39f987def4d81cb6c0c25b4e26eac90124a80cdbc40008c98c")
+		"cd6887276b0b0a1299b138b3402162b19484053dbd46b39fa741b5a7ce0bdfad")
 	assertDigestHex(t, "data-chain seed", seed,
-		"d29b649eb41266c8d9611fe18cd8989bb5abac50e31698c04bb5dcc80d4a51d9")
+		"c2a0ef00cf2e2cb6e168b2f82733ce1ebe8ef062a2d7eb6f286ec786e97ec755")
 	assertDigestHex(t, "data-chain transition", transition,
-		"4eeaadfd5a9bfca12f6fad09a1a10adc2baef9f4eb79dcac2cb2b4050e01ce0e")
+		"67f27f51b15a91334fcf2bf31f4c0d6cfaf004677e371dadfb432d0cb4f6d71b")
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {
