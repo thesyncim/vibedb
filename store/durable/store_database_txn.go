@@ -652,9 +652,13 @@ func (l *TxnLog) registeredCollections() []*Collection {
 }
 
 // DatabaseBatch is the per-commit staging handle passed to UpdateCollections /
-// Database.Update. Collection returns the WriteBatch for a member name.
+// Database.Update. Collection returns the WriteBatch for a member name;
+// CollectionHandle avoids a name lookup when the caller already owns the
+// authenticated, pre-opened durable handle.
 type DatabaseBatch struct {
-	byName map[string]*WriteBatch
+	byName  map[string]*WriteBatch
+	members []NamedCollection
+	batches []*WriteBatch
 }
 
 // Collection returns the member WriteBatch for name.
@@ -667,6 +671,22 @@ func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
 		return nil, fmt.Errorf("%w: %q", ErrTxnParticipant, name)
 	}
 	return batch, nil
+}
+
+// CollectionHandle returns the member WriteBatch for an exact pre-opened
+// handle. It performs no string construction or conversion. The participant
+// count is transaction-bounded, so a compact linear probe avoids allocating a
+// second map on every commit.
+func (b *DatabaseBatch) CollectionHandle(collection *Collection) (*WriteBatch, error) {
+	if b == nil || collection == nil || len(b.members) != len(b.batches) {
+		return nil, ErrTxnParticipant
+	}
+	for i := range b.members {
+		if b.members[i].Collection == collection && b.batches[i] != nil {
+			return b.batches[i], nil
+		}
+	}
+	return nil, ErrTxnParticipant
 }
 
 // UpdateCollections stages per-collection mutations via fn, then commits the
@@ -699,8 +719,12 @@ func UpdateCollections(
 		return err
 	}
 
-	batch := &DatabaseBatch{byName: make(map[string]*WriteBatch, len(ordered))}
+	batch := &DatabaseBatch{
+		byName:  make(map[string]*WriteBatch, len(ordered)),
+		members: ordered,
+	}
 	batches := make([]*WriteBatch, len(ordered))
+	batch.batches = batches
 	for i, member := range ordered {
 		initialDocuments := member.BatchDocumentsHint
 		if initialDocuments == 0 {

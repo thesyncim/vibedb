@@ -122,6 +122,13 @@ func (a *ReplicatedApply) CaptureWALBase(
 		core.mu.Unlock()
 		return nil, ErrReplicatedApplyMismatch
 	}
+	if base.RelationCount != 1 {
+		core.mu.Unlock()
+		return nil, fmt.Errorf(
+			"%w: relation bundles require one certified multi-image snapshot base",
+			replicatedstate.ErrSnapshotArtifact,
+		)
+	}
 	systemWorkspaceBytes, err := replicatedstate.RequiredSnapshotArtifactPayloadCapacity(
 		replicatedstate.DefaultSnapshotArtifactChunkBytes,
 		a.identity.SystemLimits.MaxKeyBytes,

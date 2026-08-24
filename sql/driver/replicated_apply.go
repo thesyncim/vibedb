@@ -19,6 +19,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -91,18 +92,21 @@ type ReplicatedApplyIdentity struct {
 // to qualify a fixed no-compaction WAL. Binding is the exact catalog-owned WAL
 // and authority lineage; ApplyFormat freezes the result/session grammar; all
 // counters come from the same locked machine publication.
+// RelationManifestDigest is the portable logical digest: it excludes every
+// replica-local storage name and is safe to compare during RF3 registration.
 // This profile does not reserve physical storage or grant serving authority.
 type ReplicatedApplyCapacityProfile struct {
-	Binding               ReplicatedShardStoreBinding
-	ApplyFormat           uint16
-	MaxSessions           uint64
-	RetryWindow           uint16
-	Initialized           bool
-	Applied               uint64
-	CheckpointApplied     uint64
-	SessionCount          uint64
-	SessionSlotCount      uint64
-	SessionEpochHighWater uint64
+	Binding                ReplicatedShardStoreBinding
+	ApplyFormat            uint16
+	RelationManifestDigest [sha256.Size]byte
+	MaxSessions            uint64
+	RetryWindow            uint16
+	Initialized            bool
+	Applied                uint64
+	CheckpointApplied      uint64
+	SessionCount           uint64
+	SessionSlotCount       uint64
+	SessionEpochHighWater  uint64
 }
 
 // ReplicatedApply is the opaque, singleton trusted apply claim over one bound
@@ -413,7 +417,7 @@ func (d *Database) openReplicatedApply(
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedApplyBusy
 	}
 	if core.catalog.ReplicatedShardStore == nil ||
-		*core.catalog.ReplicatedShardStore != expected {
+		!core.catalog.ReplicatedShardStore.Equal(expected) {
 		return nil, ReplicatedApplyIdentity{}, ErrReplicatedShardStoreIdentityMismatch
 	}
 	if err := core.settleCatalogLocked(); err != nil {
@@ -444,11 +448,17 @@ func (d *Database) openReplicatedApply(
 			"%w: replicated user collection is unavailable", ErrReplicatedApplyMismatch,
 		)
 	}
-	if core.catalog.ReplicatedApply == nil && t.collection.Len() != 0 {
-		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-			"%w: first activation requires an empty user collection",
-			ErrReplicatedApplyMismatch,
-		)
+	if core.catalog.ReplicatedApply == nil {
+		for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
+			relation := expected.Relations[ordinal]
+			table := core.tables[relation.Table]
+			if table == nil || table.collection == nil || table.collection.Len() != 0 {
+				return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+					"%w: first activation requires empty relation %q",
+					ErrReplicatedApplyMismatch, relation.Table,
+				)
+			}
+		}
 	}
 	identity, err := core.prepareReplicatedApplyStorageLocked(expected, options, persist)
 	if err != nil {
@@ -459,9 +469,22 @@ func (d *Database) openReplicatedApply(
 			"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
 		)
 	}
-	groupMembers := []durable.NamedCollection{
-		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
-		{Name: expected.UserTable, Collection: t.collection},
+	groupMembers := make([]durable.NamedCollection, 1, int(expected.RelationCount)+1)
+	groupMembers[0] = durable.NamedCollection{
+		Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection,
+	}
+	for ordinal := 0; ordinal < int(expected.RelationCount); ordinal++ {
+		relation := expected.Relations[ordinal]
+		table := core.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return nil, identity, fmt.Errorf(
+				"%w: relation %q is unavailable",
+				ErrReplicatedApplyMismatch, relation.Table,
+			)
+		}
+		groupMembers = append(groupMembers, durable.NamedCollection{
+			Name: relation.Table, Collection: table.collection,
+		})
 	}
 	if core.checkpointGroup == nil {
 		core.checkpointGroup, err = durable.NewCheckpointGroup(
@@ -480,25 +503,18 @@ func (d *Database) openReplicatedApply(
 	claim := &ReplicatedApply{
 		owner: d.connector, database: core, table: t, identity: identity,
 	}
-	validator := newReplicatedSQLMutationValidator(expected, t, identity.Placement)
-	machine, err := replicatedstate.Open(
+	relations, err := replicatedApplyRelations(expected, identity, core, claim)
+	if err != nil {
+		return nil, identity, err
+	}
+	machine, err := replicatedstate.OpenBundle(
 		replicatedStateBinding(expected), bootstrap,
 		replicatedstate.CollectionTarget{
 			Collection: core.replicatedApplyCollection,
 			Validation: replicatedstate.ValidationOpaqueBinary,
 			Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
 		},
-		replicatedstate.UserCollection{
-			Name: expected.UserTable,
-			Target: replicatedstate.CollectionTarget{
-				Collection:             t.collection,
-				Validation:             replicatedstate.ValidationProfile(identity.ValidationProfile),
-				ValidationDigest:       identity.ValidationDigest,
-				Validator:              validator,
-				ObserveMutationAttempt: claim.observeMutationAttempt,
-				Limits:                 replicatedStateCollectionLimits(expected.UserLimits),
-			},
-		},
+		relations,
 		core.txnLog,
 		replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
@@ -512,6 +528,151 @@ func (d *Database) openReplicatedApply(
 	core.replicatedApplyClaim = claim
 	d.connector.refs++
 	return claim, identity, nil
+}
+
+// replicatedApplyLocalIndexes converts the cold SQL catalog into the native
+// exact-index manifest consumed by replicatedstate.Open. No name or pointer is
+// resolved while applying a command: Open canonicalizes these definitions,
+// authenticates them in the schema-generation contract, and binds them to the
+// already-open collection handle.
+func replicatedApplyLocalIndexes(t *table) []store.IndexDefinition {
+	if t == nil || t.meta == nil || len(t.meta.Indexes) == 0 {
+		return nil
+	}
+	result := make([]store.IndexDefinition, len(t.meta.Indexes))
+	for i := range t.meta.Indexes {
+		result[i] = store.IndexDefinition{
+			Name:  strings.Clone(t.meta.Indexes[i].Name),
+			Paths: append([]string(nil), t.meta.Indexes[i].Paths...),
+		}
+	}
+	return result
+}
+
+func replicatedApplyRelations(
+	base ReplicatedShardStoreIdentity,
+	apply ReplicatedApplyIdentity,
+	database *database,
+	claim *ReplicatedApply,
+) ([]replicatedstate.RelationCollection, error) {
+	baseTable := database.tables[base.UserTable]
+	if baseTable == nil || baseTable.collection == nil {
+		return nil, ErrReplicatedApplyMismatch
+	}
+	baseTarget := replicatedstate.CollectionTarget{
+		Collection:             baseTable.collection,
+		Validation:             replicatedstate.ValidationProfile(apply.ValidationProfile),
+		ValidationDigest:       apply.ValidationDigest,
+		Validator:              newReplicatedSQLMutationValidator(base, baseTable, apply.Placement),
+		ObserveMutationAttempt: claim.observeMutationAttempt,
+		Limits:                 replicatedStateCollectionLimits(base.UserLimits),
+	}
+	logicalManifest := replicatedRelationApplyManifestDigest(base)
+	result := make([]replicatedstate.RelationCollection, int(base.RelationCount))
+	for ordinal := range result {
+		relation := base.Relations[ordinal]
+		table := database.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return nil, fmt.Errorf(
+				"%w: relation %q is unavailable", ErrReplicatedApplyMismatch, relation.Table,
+			)
+		}
+		spec := replicatedstate.RelationCollection{
+			Relation: replication.RelationID(relation.Relation), Name: relation.Table,
+			Target: replicatedstate.CollectionTarget{
+				Collection: table.collection,
+				Validation: replicatedstate.ValidationDeterministicMutation,
+				Limits:     replicatedStateCollectionLimits(relation.Limits),
+			},
+		}
+		switch relation.Kind {
+		case ReplicatedShardRelationJSON:
+			spec.Kind = replicatedstate.RelationJSON
+			spec.Target = baseTarget
+			spec.LocalIndexes = replicatedApplyLocalIndexes(table)
+		case ReplicatedShardRelationGlobalIndex:
+			spec.Kind = replicatedstate.RelationGlobalIndex
+			spec.Target.ValidationDigest = replicatedGlobalIndexValidationDigest(
+				base, relation, logicalManifest,
+			)
+			spec.Target.Validator = replicatedGlobalIndexMutationValidator{}
+			spec.GlobalIndex = replicatedstate.GlobalIndexProfile{
+				IndexID: relation.IndexID, Incarnation: relation.Incarnation,
+				LocatorCount: relation.LocatorCount, Unique: relation.Unique,
+			}
+		default:
+			return nil, ErrReplicatedApplyMismatch
+		}
+		result[ordinal] = spec
+	}
+	return result, nil
+}
+
+var replicatedGlobalIndexValidationDomain = []byte(
+	"vibedb/sql/replicated-global-index-validation\x00",
+)
+
+var replicatedRelationApplyManifestDomain = []byte(
+	"vibedb/sql/replicated-relation-apply-manifest\x00",
+)
+
+// replicatedRelationApplyManifestDigest is the portable deterministic schema
+// contract shared by every replica. The retained catalog manifest separately
+// authenticates each replica's local storage identities; those physical names
+// must never enter replicated results, data-chain witnesses, or snapshot
+// identities because healthy replicas necessarily use different files.
+func replicatedRelationApplyManifestDigest(
+	identity ReplicatedShardStoreIdentity,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(replicatedRelationApplyManifestDomain)
+	writeReplicatedRelationDescriptors(h, identity, false)
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+func replicatedGlobalIndexValidationDigest(
+	base ReplicatedShardStoreIdentity,
+	relation ReplicatedShardRelationIdentity,
+	logicalManifest [sha256.Size]byte,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(replicatedGlobalIndexValidationDomain)
+	_, _ = h.Write(logicalManifest[:])
+	var fixed [32]byte
+	binary.LittleEndian.PutUint64(fixed[0:8], base.RelationSchemaGeneration)
+	binary.LittleEndian.PutUint16(fixed[8:10], relation.Relation)
+	fixed[10] = relation.LocatorCount
+	if relation.Unique {
+		fixed[11] = 1
+	}
+	binary.LittleEndian.PutUint64(fixed[16:24], relation.IndexID)
+	binary.LittleEndian.PutUint64(fixed[24:32], relation.Incarnation)
+	_, _ = h.Write(fixed[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
+}
+
+type replicatedGlobalIndexMutationValidator struct{}
+
+func (replicatedGlobalIndexMutationValidator) ValidatePut(
+	key, _ []byte,
+) replicatedstate.MutationValidation {
+	if len(key) == 0 || key[0] == 0 {
+		return replicatedstate.MutationValidationInvalid
+	}
+	return replicatedstate.MutationValidationAccept
+}
+
+func (replicatedGlobalIndexMutationValidator) ValidateDelete(
+	key, _ []byte, _ bool,
+) replicatedstate.MutationValidation {
+	if len(key) == 0 || key[0] == 0 {
+		return replicatedstate.MutationValidationInvalid
+	}
+	return replicatedstate.MutationValidationAccept
 }
 
 // prepareReplicatedApplyStorageLocked makes the hidden participant and its
@@ -901,10 +1062,15 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 	if err != nil {
 		return ReplicatedApplyCapacityProfile{}, err
 	}
+	manifestDigest, err := a.machine.RelationManifestDigest()
+	if err != nil {
+		return ReplicatedApplyCapacityProfile{}, err
+	}
 	return ReplicatedApplyCapacityProfile{
 		Binding:     ownedReplicatedShardStoreBinding(base.Binding),
 		ApplyFormat: a.identity.Format, MaxSessions: a.identity.MaxSessions,
-		RetryWindow: a.identity.RetryWindow, Initialized: state.Initialized,
+		RelationManifestDigest: manifestDigest,
+		RetryWindow:            a.identity.RetryWindow, Initialized: state.Initialized,
 		Applied: state.Applied, CheckpointApplied: a.machine.CheckpointAppliedIndex(),
 		SessionCount:          state.SessionCount,
 		SessionSlotCount:      state.SessionSlotCount,
@@ -1062,7 +1228,40 @@ func (a *ReplicatedApply) SnapshotArtifactCut() (*replicatedstate.ReadSnapshot, 
 	if base == nil || base.UserTable == "" {
 		return nil, ErrReplicatedApplyMismatch
 	}
+	if base.RelationCount != 1 {
+		return nil, fmt.Errorf(
+			"%w: relation bundles require one certified multi-image snapshot base",
+			replicatedstate.ErrSnapshotArtifact,
+		)
+	}
 	return a.machine.Snapshot(base.UserTable)
+}
+
+// BuildBundleSnapshotBase captures and certifies the hidden apply image plus
+// every fixed bundle relation at one database-snapshot cut. The certificate is
+// small; the durable member images are transported under its authenticated
+// relation manifest and checkpoint-group membership.
+func (a *ReplicatedApply) BuildBundleSnapshotBase() (
+	*pb.Snapshot,
+	replicatedstate.SnapshotArtifactManifest,
+	error,
+) {
+	if a == nil || a.database == nil {
+		return nil, replicatedstate.SnapshotArtifactManifest{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return nil, replicatedstate.SnapshotArtifactManifest{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return nil, replicatedstate.SnapshotArtifactManifest{}, err
+	}
+	base := a.database.catalog.ReplicatedShardStore
+	if base == nil || base.RelationCount == 0 {
+		return nil, replicatedstate.SnapshotArtifactManifest{}, ErrReplicatedApplyMismatch
+	}
+	return a.machine.BuildBundleSnapshotBase()
 }
 
 // ApplyNormal implements raftmodel.StateMachine under the SQL publication
@@ -1370,6 +1569,14 @@ func replicatedApplyProfileDigest(
 	} else {
 		_, _ = h.Write([]byte{0})
 	}
+	var relationHeader [10]byte
+	binary.LittleEndian.PutUint16(relationHeader[0:2], identity.RelationCount)
+	binary.LittleEndian.PutUint64(
+		relationHeader[2:10], identity.RelationSchemaGeneration,
+	)
+	_, _ = h.Write(relationHeader[:])
+	logicalManifest := replicatedRelationApplyManifestDigest(identity)
+	_, _ = h.Write(logicalManifest[:])
 	var digest [32]byte
 	_ = h.Sum(digest[:0])
 	return digest
@@ -1414,24 +1621,35 @@ func validateReplicatedApplyOptions(
 		)
 	}
 	systemLimits := replicatedApplySystemLimits(options.RetryWindow)
+	relationCount := int(identity.RelationCount)
+	relationDocuments := 0
+	relationBytes := int64(0)
+	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
+		limits := identity.Relations[ordinal].Limits
+		relationDocuments = min(
+			replication.MaxMutations, relationDocuments+limits.MaxBatchDocuments,
+		)
+		relationBytes = min(
+			int64(replication.MaxCommandBytes), relationBytes+int64(limits.MaxBatchBytes),
+		)
+	}
 	maxTxnDocuments := max(
-		identity.UserLimits.MaxBatchDocuments+4,
+		relationDocuments+4,
 		systemLimits.MaxBatchDocuments+1,
 	)
 	if options.MaxSessions == 0 ||
 		options.MaxSessions > replicatedstate.MaxRetainedSessions ||
 		options.RetryWindow == 0 ||
 		options.RetryWindow > replicatedstate.MaxSessionRetryWindow ||
-		options.TxnLimits.MaxCollections < 2 ||
+		options.TxnLimits.MaxCollections < relationCount+1 ||
 		options.TxnLimits.MaxDocuments < maxTxnDocuments ||
 		options.TxnLimits.MaxBytes <= 0 {
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
-	userBytes := min(identity.UserLimits.MaxBatchBytes, replication.MaxCommandBytes)
 	systemBytes := systemLimits.MaxBatchBytes
-	if userBytes < 0 || systemBytes < 0 ||
-		int64(userBytes) > math.MaxInt64-int64(systemBytes) ||
-		options.TxnLimits.MaxBytes < int64(userBytes)+int64(systemBytes) {
+	if relationBytes < 0 || systemBytes < 0 ||
+		relationBytes > math.MaxInt64-int64(systemBytes) ||
+		options.TxnLimits.MaxBytes < relationBytes+int64(systemBytes) {
 		return fmt.Errorf("%w: transaction byte limit does not cover one apply", ErrReplicatedApplyMismatch)
 	}
 	if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
