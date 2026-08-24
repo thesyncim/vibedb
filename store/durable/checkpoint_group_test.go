@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -36,6 +37,142 @@ func newCheckpointGroupTestResources(
 	}
 	t.Cleanup(func() { _ = log.Close() })
 	return dir, members, log
+}
+
+func TestCheckpointGroupFileCertificateCheckPinsExactRegularEntry(t *testing.T) {
+	t.Run("sibling certificate", func(t *testing.T) {
+		dir := t.TempDir()
+		file, err := os.OpenFile(
+			filepath.Join(dir, "data.vjc"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
+			t.Fatalf("certificate-free entry: %v", err)
+		}
+		certificate, err := os.OpenFile(
+			filepath.Join(dir, checkpointGroupFilename),
+			os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := certificate.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rejectCheckpointGroupCertificateForFile(file); !errors.Is(err, ErrCheckpointGroupRecoveryRequired) {
+			t.Fatalf("sibling certificate = %v", err)
+		}
+	})
+
+	t.Run("leaf symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.vjc")
+		created, err := os.OpenFile(target, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := created.Close(); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(dir, "alias.vjc")
+		if err := os.Symlink(target, alias); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		file, err := os.OpenFile(alias, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := rejectCheckpointGroupCertificateForFile(file); !errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+			t.Fatalf("leaf symlink = %v", err)
+		}
+	})
+
+	t.Run("retargeted parent", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "live")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "data.vjc")
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if err := os.Rename(dir, filepath.Join(root, "moved")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		replacement, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := replacement.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rejectCheckpointGroupCertificateForFile(file); !errors.Is(err, ErrTransactionLogDirectoryMismatch) {
+			t.Fatalf("retargeted parent = %v", err)
+		}
+	})
+}
+
+func TestCheckpointGroupCertificateMemberCapacity(t *testing.T) {
+	names := func(count int) []string {
+		result := make([]string, count)
+		for i := range result {
+			result[i] = "member-" + strconv.Itoa(i)
+		}
+		return result
+	}
+
+	t.Run("maximum", func(t *testing.T) {
+		_, members, log := newCheckpointGroupTestResources(
+			t, names(checkpointGroupMaxMembers)...,
+		)
+		group, err := NewCheckpointGroup(log, members, CheckpointGroupOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = group.Close() })
+	})
+
+	t.Run("one-over", func(t *testing.T) {
+		requests := make([]TransactionCollectionOpen, checkpointGroupMaxMembers+1)
+		if _, _, _, err := OpenCollectionsWithCheckpointGroup(
+			filepath.Join(t.TempDir(), "must-not-open"), TxnLogOptions{},
+			requests, names(checkpointGroupMaxMembers+1), CheckpointGroupOptions{},
+		); !errors.Is(err, ErrTxnParticipant) {
+			t.Fatalf("oversized recovery admission = %v", err)
+		}
+		dir, members, log := newCheckpointGroupTestResources(
+			t, names(checkpointGroupMaxMembers+1)...,
+		)
+		group, err := NewCheckpointGroup(log, members, CheckpointGroupOptions{})
+		if group != nil || !errors.Is(err, ErrTxnParticipant) {
+			t.Fatalf("oversized group=%v err=%v", group, err)
+		}
+		log.regMu.Lock()
+		registered := len(log.registered)
+		log.regMu.Unlock()
+		if registered != 0 || log.checkpointGroup != nil {
+			t.Fatalf("oversized group side effects: registered=%d owner=%v", registered, log.checkpointGroup)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, checkpointGroupFilename)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("oversized group certificate = %v", statErr)
+		}
+		for _, member := range members {
+			if member.Collection.checkpointGroup.Load() != nil ||
+				member.Collection.checkpointGroupRetired.Load() {
+				t.Fatalf("oversized group fenced member %q", member.Name)
+			}
+		}
+	})
 }
 
 func newCheckpointGroupTestStoreWithNames(
@@ -386,7 +523,45 @@ func TestCheckpointGroupCloseRacesGenericMutationFence(t *testing.T) {
 	}
 }
 
-func TestCheckpointGroupStandaloneOpenRechecksAfterWriterLock(t *testing.T) {
+func TestCheckpointGroupQualifyMintedRacesClose(t *testing.T) {
+	_, _, log, group := newCheckpointGroupTestStore(t, 8)
+	const qualifiers = 32
+	start := make(chan struct{})
+	errorsOut := make(chan error, qualifiers)
+	var wait sync.WaitGroup
+	for range qualifiers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for attempt := 0; attempt < 64; attempt++ {
+				err := log.QualifyMinted()
+				if err == nil {
+					continue
+				}
+				errorsOut <- err
+				return
+			}
+			errorsOut <- nil
+		}()
+	}
+	close(start)
+	if err := group.Close(); err != nil {
+		t.Fatalf("CheckpointGroup.Close: %v", err)
+	}
+	wait.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		if err != nil && !errors.Is(err, ErrCheckpointGroupOwned) {
+			t.Fatalf("concurrent QualifyMinted = %v", err)
+		}
+	}
+	if err := log.QualifyMinted(); !errors.Is(err, ErrCheckpointGroupOwned) {
+		t.Fatalf("post-close QualifyMinted = %v", err)
+	}
+}
+
+func TestCheckpointGroupStandaloneOpenRechecksAtNamespaceAdmission(t *testing.T) {
 	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
 	file, err := os.OpenFile(filepath.Join(dir, "system.vjc"), os.O_RDWR, 0)
 	if err != nil {
@@ -396,12 +571,12 @@ func TestCheckpointGroupStandaloneOpenRechecksAfterWriterLock(t *testing.T) {
 
 	prechecked := make(chan struct{})
 	resume := make(chan struct{})
-	previousHook := checkpointGroupGenericOpenAfterPrecheckHook
-	checkpointGroupGenericOpenAfterPrecheckHook = func() {
+	previousHook := checkpointGroupGenericOpenBeforeNamespaceHook
+	checkpointGroupGenericOpenBeforeNamespaceHook = func() {
 		close(prechecked)
 		<-resume
 	}
-	t.Cleanup(func() { checkpointGroupGenericOpenAfterPrecheckHook = previousHook })
+	t.Cleanup(func() { checkpointGroupGenericOpenBeforeNamespaceHook = previousHook })
 	type openResult struct {
 		collection *Collection
 		err        error
@@ -690,9 +865,9 @@ func TestCheckpointGroupActivationLeaseClosesDirectoryScanRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	createPrechecked := make(chan struct{})
-	previousCreateHook := checkpointGroupGenericCreateAfterPrecheckHook
-	checkpointGroupGenericCreateAfterPrecheckHook = func() { close(createPrechecked) }
-	t.Cleanup(func() { checkpointGroupGenericCreateAfterPrecheckHook = previousCreateHook })
+	previousCreateHook := checkpointGroupGenericCreateBeforeNamespaceHook
+	checkpointGroupGenericCreateBeforeNamespaceHook = func() { close(createPrechecked) }
+	t.Cleanup(func() { checkpointGroupGenericCreateBeforeNamespaceHook = previousCreateHook })
 	type createResult struct {
 		collection *Collection
 		err        error

@@ -33,9 +33,14 @@ type childStageImageScan struct {
 	bytes     uint64
 }
 
+type childStageSealedImageAudit struct {
+	stage  *ChildStage
+	cursor *ChildStageCursor
+	active bool
+}
+
 func (s *ChildStage) certifySealedImage(cursor *ChildStageCursor) (resultErr error) {
-	if s == nil || cursor == nil || cursor.phase != ChildStageSealed ||
-		cursor.lastBatchDigest == ([sha256.Size]byte{}) {
+	if s == nil || s.collection == nil {
 		return ErrChildStage
 	}
 	workspace := &s.image
@@ -45,6 +50,30 @@ func (s *ChildStage) certifySealedImage(cursor *ChildStageCursor) (resultErr err
 	defer func() {
 		resultErr = errors.Join(resultErr, workspace.snapshot.Close())
 	}()
+	if err := s.beginImageProof(cursor); err != nil {
+		return err
+	}
+	defer s.cancelImageProof()
+	buffer, err := workspace.snapshot.RangeRawBuffer(workspace.scratch, workspace.visit)
+	workspace.scratch = buffer
+	if err != nil {
+		return err
+	}
+	rows, bytesCount, digest, err := s.finishImageProof()
+	if err != nil {
+		return err
+	}
+	cursor.imageRows, cursor.imageBytes = rows, bytesCount
+	cursor.imageDigest = digest
+	return nil
+}
+
+func (s *ChildStage) beginImageProof(cursor *ChildStageCursor) error {
+	if s == nil || cursor == nil || cursor.phase != ChildStageSealed ||
+		cursor.lastBatchDigest == ([sha256.Size]byte{}) {
+		return ErrChildStage
+	}
+	workspace := &s.image
 	h := workspace.hasher
 	if h == nil {
 		h = sha256.New()
@@ -74,21 +103,38 @@ func (s *ChildStage) certifySealedImage(cursor *ChildStageCursor) (resultErr err
 		workspace.visit = workspace.scan.visitRow
 		workspace.bound = &workspace.scan
 	}
-	buffer, err := workspace.snapshot.RangeRawBuffer(workspace.scratch, workspace.visit)
-	workspace.scratch = buffer
-	rows, bytesCount := workspace.scan.rows, workspace.scan.bytes
-	workspace.scan.stage, workspace.scan.workspace = nil, nil
-	if err != nil {
-		return err
+	return nil
+}
+
+func (s *ChildStage) finishImageProof() (
+	rows uint64,
+	bytesCount uint64,
+	digest [sha256.Size]byte,
+	err error,
+) {
+	if s == nil {
+		return 0, 0, digest, ErrChildStage
 	}
+	workspace := &s.image
+	if workspace.scan.stage != s || workspace.scan.workspace != workspace ||
+		workspace.hasher == nil {
+		return 0, 0, digest, ErrChildStage
+	}
+	rows, bytesCount = workspace.scan.rows, workspace.scan.bytes
+	workspace.scan.stage, workspace.scan.workspace = nil, nil
 	workspace.fixed = [56]byte{}
 	binary.LittleEndian.PutUint64(workspace.fixed[0:8], rows)
 	binary.LittleEndian.PutUint64(workspace.fixed[8:16], bytesCount)
-	_, _ = h.Write(workspace.fixed[:16])
-	_ = h.Sum(workspace.digest[:0])
-	cursor.imageRows, cursor.imageBytes = rows, bytesCount
-	cursor.imageDigest = workspace.digest
-	return nil
+	_, _ = workspace.hasher.Write(workspace.fixed[:16])
+	_ = workspace.hasher.Sum(workspace.digest[:0])
+	return rows, bytesCount, workspace.digest, nil
+}
+
+func (s *ChildStage) cancelImageProof() {
+	if s == nil {
+		return
+	}
+	s.image.scan.stage, s.image.scan.workspace = nil, nil
 }
 
 func (s *ChildStage) verifySealedImage(cursor *ChildStageCursor) error {
@@ -102,6 +148,51 @@ func (s *ChildStage) verifySealedImage(cursor *ChildStageCursor) error {
 		return errors.Join(ErrChildStage, err)
 	}
 	return nil
+}
+
+func (a *childStageSealedImageAudit) begin(
+	stage *ChildStage,
+	cursor *ChildStageCursor,
+) error {
+	if a == nil || stage == nil || cursor == nil || a.active {
+		return ErrChildStage
+	}
+	if err := stage.beginImageProof(cursor); err != nil {
+		return err
+	}
+	a.stage, a.cursor, a.active = stage, cursor, true
+	return nil
+}
+
+func (a *childStageSealedImageAudit) visit(key, value []byte) error {
+	if a == nil || !a.active || a.stage == nil || a.cursor == nil {
+		return ErrChildStage
+	}
+	return a.stage.image.scan.visitRow(key, value)
+}
+
+func (a *childStageSealedImageAudit) finish() error {
+	if a == nil || !a.active || a.stage == nil || a.cursor == nil {
+		return ErrChildStage
+	}
+	stage, cursor := a.stage, a.cursor
+	rows, bytesCount, digest, err := stage.finishImageProof()
+	a.stage, a.cursor, a.active = nil, nil, false
+	if err != nil || rows != cursor.imageRows || bytesCount != cursor.imageBytes ||
+		digest != cursor.imageDigest {
+		return errors.Join(ErrChildStage, err)
+	}
+	return nil
+}
+
+func (a *childStageSealedImageAudit) close() {
+	if a == nil {
+		return
+	}
+	if a.active && a.stage != nil {
+		a.stage.cancelImageProof()
+	}
+	a.stage, a.cursor, a.active = nil, nil, false
 }
 
 func (s *childStageImageScan) visitRow(key, document []byte) error {

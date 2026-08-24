@@ -78,6 +78,74 @@ func TestSnapshotBaseCertificateDeterministicStrictAndBounded(t *testing.T) {
 	}
 }
 
+func TestSnapshotBaseInstallBindsExactOpenedImage(t *testing.T) {
+	source, snapshot := snapshotArtifactFixture(t)
+	_, manifest := writeSnapshotArtifactFixture(t, snapshot)
+
+	for name, mutate := range map[string]func(*SnapshotArtifactManifest){
+		"image digest": func(m *SnapshotArtifactManifest) { m.ImageDigest[0] ^= 1 },
+		"user rows":    func(m *SnapshotArtifactManifest) { m.UserRows++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			forged := cloneSnapshotArtifactManifest(manifest)
+			mutate(&forged)
+			_, forged.Digest = makeSnapshotArtifactFooter(
+				forged.Chunks, forged.SystemRows, forged.UserRows,
+				forged.PayloadBytes, forged.EncodedBytes,
+				forged.LastChunkDigest, forged.HeaderDigest, forged.ImageDigest,
+			)
+			base, err := BuildSnapshotBase(forged, source.bootstrap)
+			if err != nil {
+				t.Fatalf("self-consistent forged base build: %v", err)
+			}
+			candidate, err := Open(
+				source.binding, source.bootstrap, source.system,
+				UserCollection{Name: "docs", Target: source.user},
+				source.log, machineOptionsFor(source.user),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := candidate.InstallSnapshot(base); !errors.Is(err, ErrSnapshotBase) {
+				t.Fatalf("forged %s InstallSnapshot = %v", name, err)
+			}
+		})
+	}
+}
+
+func TestSnapshotBaseInstallAuditsImageAfterLiveApply(t *testing.T) {
+	t.Run("exact", func(t *testing.T) {
+		machine, snapshot := snapshotArtifactFixture(t)
+		_, manifest := writeSnapshotArtifactFixture(t, snapshot)
+		base, err := BuildSnapshotBase(manifest, machine.bootstrap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := machine.machine.InstallSnapshot(base); err != nil {
+			t.Fatalf("post-apply exact base = %v", err)
+		}
+	})
+
+	t.Run("self-consistent-forgery", func(t *testing.T) {
+		machine, snapshot := snapshotArtifactFixture(t)
+		_, manifest := writeSnapshotArtifactFixture(t, snapshot)
+		forged := cloneSnapshotArtifactManifest(manifest)
+		forged.ImageDigest[0] ^= 1
+		_, forged.Digest = makeSnapshotArtifactFooter(
+			forged.Chunks, forged.SystemRows, forged.UserRows,
+			forged.PayloadBytes, forged.EncodedBytes,
+			forged.LastChunkDigest, forged.HeaderDigest, forged.ImageDigest,
+		)
+		base, err := BuildSnapshotBase(forged, machine.bootstrap)
+		if err != nil {
+			t.Fatalf("self-consistent forged base build: %v", err)
+		}
+		if _, err := machine.machine.InstallSnapshot(base); !errors.Is(err, ErrSnapshotBase) {
+			t.Fatalf("post-apply forged image InstallSnapshot = %v", err)
+		}
+	})
+}
+
 func TestCertifiedLearnerBaseCatchesUpOnlyThroughAppendEntries(t *testing.T) {
 	source := newMachineFixture(t)
 	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {

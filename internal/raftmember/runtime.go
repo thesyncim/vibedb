@@ -350,10 +350,11 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 	}, nil
 }
 
-// WALRetentionFence returns the authenticated contiguous apply cut. A future
-// online WAL compactor may retain entries strictly after this index; the
-// current fixed append-only store uses it only as qualification evidence.
-func (runtime *Runtime) WALRetentionFence() (uint64, error) {
+// WALRetentionInput returns the certificate-backed contiguous apply cut. The
+// current append-only store uses it only as qualification evidence; a future
+// compactor must additionally prove the exact term, configuration, member
+// lineage, certificate witness, and retained suffix before deleting anything.
+func (runtime *Runtime) WALRetentionInput() (uint64, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return 0, err
 	}

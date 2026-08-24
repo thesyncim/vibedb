@@ -38,9 +38,6 @@ func CreateFromRecords(
 	if file == nil {
 		return 0, fmt.Errorf("vibedb: CreateFromRecords requires a non-nil file")
 	}
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return 0, err
-	}
 	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
 	if err != nil {
 		return 0, err
@@ -54,9 +51,6 @@ func CreateFromRecords(
 			err = errors.Join(err, unlockErr)
 		}
 	}()
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return 0, err
-	}
 	info, err := file.Stat()
 	if err != nil {
 		return 0, err
@@ -139,9 +133,6 @@ func CreateFromPrimary(
 			"vibedb: CreateFromPrimary requires non-nil collection and file",
 		)
 	}
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return 0, err
-	}
 	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
 	if err != nil {
 		return 0, err
@@ -155,9 +146,6 @@ func CreateFromPrimary(
 			err = errors.Join(err, unlockErr)
 		}
 	}()
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return 0, err
-	}
 	info, err := file.Stat()
 	if err != nil {
 		return 0, err

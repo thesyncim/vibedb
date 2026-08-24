@@ -58,12 +58,13 @@ type Machine struct {
 	captureChanges  []finalMutation
 	captureKey      [8]byte
 
-	state              State
-	publication        raftmodel.Publication
-	openedImageDigest  [32]byte
-	openedImageApplied uint64
-	initialized        bool
-	poison             error
+	state                 State
+	publication           raftmodel.Publication
+	openedImageDigest     [32]byte
+	openedImageApplied    uint64
+	openedImageGeneration uint64
+	initialized           bool
+	poison                error
 }
 
 // SessionCapacityState is the constant-size durable apply cut exposed to the
@@ -109,17 +110,8 @@ func Open(
 	}
 	binding, system = prepared.binding, prepared.system
 	userName, user := prepared.userName, prepared.user
-	bootstrapBytes, bootstrapDigest := prepared.bootstrap, prepared.bootstrapDigest
-	m := &Machine{
-		binding: binding, bootstrap: bootstrapBytes,
-		bootstrapDigest: bootstrapDigest, system: system,
-		userName: userName, userNameBytes: []byte(userName), user: user,
-		distribution: []byte(binding.Distribution), shard: []byte(binding.Shard),
-		applyContract: prepared.applyContract,
-		dataChainHash: newDataChainHasher(),
-		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
-		options: prepared.options,
-	}
+	bootstrapDigest := prepared.bootstrapDigest
+	m := newMachineFromOpenInputs(prepared)
 	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
 		{Name: systemCollectionName, Collection: system.Collection},
 		{Name: userName, Collection: user.Collection},
@@ -142,6 +134,10 @@ func Open(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("user collection %q: %w", userName, err)
+	}
+	imageGeneration := userSnapshot.Generation()
+	if imageGeneration == 0 {
+		return nil, fmt.Errorf("%w: missing user image generation", ErrInconsistentSnapshot)
 	}
 	seedDigest, err := dataChainSeedDigest(prepared.applyContract, imageDigest)
 	if err != nil {
@@ -177,7 +173,26 @@ func Open(
 		}
 		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
 		m.openedImageDigest = imageDigest
+		m.openedImageGeneration = imageGeneration
 		return m, nil
+	}
+	if m.checkpointGroup != nil && m.checkpointGroup.SeedStateAuthoritative() {
+		if seedApplied, seeded := m.checkpointGroup.SeedAppliedIndex(); seeded &&
+			state.Applied == seedApplied {
+			envelope, encodeErr := AppendState(nil, state)
+			if encodeErr != nil {
+				return nil, encodeErr
+			}
+			matched, seedErr := m.checkpointGroup.ValidateSeedState(
+				state.Applied, systemCollectionName, envelope,
+			)
+			if seedErr != nil || !matched || state.LastKind != RecordImportedSnapshot {
+				return nil, errors.Join(
+					fmt.Errorf("%w: imported state seed commitment", ErrStateCorrupt),
+					seedErr,
+				)
+			}
+		}
 	}
 	if m.checkpointGroup != nil &&
 		(state.Applied != m.checkpointGroup.CheckpointAppliedIndex() ||
@@ -206,6 +221,7 @@ func Open(
 	m.state = state
 	m.openedImageDigest = imageDigest
 	m.openedImageApplied = state.Applied
+	m.openedImageGeneration = imageGeneration
 	m.binding = state.Binding
 	m.distribution = []byte(state.Binding.Distribution)
 	m.shard = []byte(state.Binding.Shard)
@@ -217,6 +233,21 @@ func Open(
 		}
 	}
 	return m, nil
+}
+
+func newMachineFromOpenInputs(prepared openInputs) *Machine {
+	binding := prepared.binding
+	return &Machine{
+		binding: binding, bootstrap: prepared.bootstrap,
+		bootstrapDigest: prepared.bootstrapDigest, system: prepared.system,
+		userName: prepared.userName, userNameBytes: []byte(prepared.userName),
+		user:         prepared.user,
+		distribution: []byte(binding.Distribution), shard: []byte(binding.Shard),
+		applyContract: prepared.applyContract,
+		dataChainHash: newDataChainHasher(),
+		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
+		options: prepared.options,
+	}
 }
 
 func prepareOpenInputs(
@@ -747,9 +778,10 @@ func (m *Machine) Applied() uint64 {
 	return m.publication.Applied
 }
 
-// CheckpointAppliedIndex is the durable contiguous cut safe for Raft WAL
-// retention. Replay-backed machines return their authenticated group
-// certificate cut; ordinary synchronous machines retain their applied cut.
+// CheckpointAppliedIndex is the durable contiguous apply cut supplied to WAL
+// retention qualification. Replay-backed machines return their authenticated
+// group certificate cut; ordinary synchronous machines retain their applied
+// cut. The index alone never authorizes WAL deletion.
 func (m *Machine) CheckpointAppliedIndex() uint64 {
 	if m == nil {
 		return 0

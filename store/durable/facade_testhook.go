@@ -16,3 +16,36 @@ func InstallTxnMarkerSyncFaultForFacadeTest() (restore func()) {
 	}
 	return func() { databaseTxnAfterMintHook = previous }
 }
+
+// InstallTxnMarkerAppendFaultForFacadeTest programs one decision append to
+// fail with the conservative unknown-outcome classification. It is the
+// zero-Sync CheckpointGroup counterpart of InstallTxnMarkerSyncFaultForFacadeTest:
+// ordinary group transitions append their implementation decision without a
+// marker Sync, so the append itself is the only per-transition marker I/O.
+func InstallTxnMarkerAppendFaultForFacadeTest(appendIndex int) (restore func()) {
+	previous := databaseTxnAfterMintHook
+	databaseTxnAfterMintHook = func(l *TxnLog) {
+		fm := storeio.NewFaultTxnMarker(l.marker)
+		fm.Program(storeio.TxnMarkerFaultPlan{
+			Phase: storeio.TxnMarkerFaultAppendError, AppendIndex: appendIndex,
+		})
+	}
+	return func() { databaseTxnAfterMintHook = previous }
+}
+
+// InstallCheckpointGroupInitialCertificateFaultForFacadeTest makes the next
+// checkpoint-group creation report an unknown outcome immediately after the
+// initial certificate has been renamed into place. It exercises callers that
+// must remain fail-closed between durable activation intent and group reopen.
+func InstallCheckpointGroupInitialCertificateFaultForFacadeTest() (restore func()) {
+	previous := checkpointGroupFaultHook
+	fired := false
+	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
+		if !fired && point == checkpointGroupAfterCertificateRename {
+			fired = true
+			return ErrCommitOutcomeUnknown
+		}
+		return nil
+	}
+	return func() { checkpointGroupFaultHook = previous }
+}

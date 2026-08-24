@@ -29,14 +29,16 @@ const (
 	checkpointGroupSlotBytes             = 4096
 	checkpointGroupSlots                 = 2
 	checkpointGroupFileBytes             = checkpointGroupSlotBytes * checkpointGroupSlots
-	checkpointGroupHeaderBytes           = 96
+	checkpointGroupHeaderBytes           = 168
 	checkpointGroupMemberBytes           = 64
 	checkpointGroupChecksumOffset        = checkpointGroupSlotBytes - sha256.Size
+	checkpointGroupMaxMembers            = (checkpointGroupChecksumOffset - checkpointGroupHeaderBytes) / checkpointGroupMemberBytes
 	defaultCheckpointEvery               = 128
 )
 
 var checkpointGroupMagic = [8]byte{'V', 'I', 'B', 'E', 'C', 'P', 'G', 0}
 var checkpointGroupDigestDomain = []byte("vibedb/checkpoint-group/format-0\x00")
+var checkpointGroupSeedDomain = []byte("vibedb/checkpoint-group/seed-state-envelope/format-0\x00")
 
 var (
 	// ErrCheckpointGroupOwned reports a direct generic mutation, Flush, Close,
@@ -76,6 +78,12 @@ var (
 	ErrCheckpointGroupSequence = errors.New(
 		"vibedb: invalid checkpoint group apply sequence",
 	)
+	// ErrCheckpointGroupSeedChanged reports that an imported member image moved
+	// after it was authenticated but before fixed group ownership could be
+	// attached. No certificate is published for this pre-activation refusal.
+	ErrCheckpointGroupSeedChanged = errors.New(
+		"vibedb: checkpoint group seed image changed before activation",
+	)
 )
 
 // CheckpointGroupOptions fixes the periodic certificate cadence. Zero selects
@@ -83,6 +91,32 @@ var (
 // publishing the mutation that encountered pressure.
 type CheckpointGroupOptions struct {
 	CheckpointEvery uint64
+}
+
+// CheckpointGroupSeed binds already durable member images to the one imported
+// replicated-state row that may establish a group above cut one.
+// Envelope is borrowed only for the constructor call. Its domain-separated
+// commitment, the exact member name, and Applied are authenticated by the
+// format-0 certificate before any group-owned mutation is admitted.
+type CheckpointGroupSeed struct {
+	Applied  uint64
+	Member   string
+	Envelope []byte
+	// Images form the transient activation fence for every already durable
+	// imported member. They are never encoded in format 0: the constructor checks
+	// the exact generations while it holds every member writer, then publishes
+	// group ownership before releasing those writers. Images must name every fixed
+	// member except Member exactly once. The slice is borrowed for the constructor
+	// call and is ignored by Seed and ValidateSeedState.
+	Images []CheckpointGroupSeedImage
+}
+
+// CheckpointGroupSeedImage binds one imported collection handle to the exact
+// generation authenticated by its preparation scan. Collection identity avoids
+// a second string-keyed membership domain at the scan-to-ownership handoff.
+type CheckpointGroupSeedImage struct {
+	Collection *Collection
+	Generation uint64
 }
 
 func (o CheckpointGroupOptions) normalized() (CheckpointGroupOptions, error) {
@@ -93,6 +127,27 @@ func (o CheckpointGroupOptions) normalized() (CheckpointGroupOptions, error) {
 		return CheckpointGroupOptions{}, ErrCheckpointGroupSequence
 	}
 	return o, nil
+}
+
+func checkpointGroupSeedProfile(seed CheckpointGroupSeed) (
+	applied uint64,
+	state [sha256.Size]byte,
+	member [sha256.Size]byte,
+	err error,
+) {
+	if seed.Applied <= 1 || seed.Applied == math.MaxUint64 ||
+		seed.Member == "" || len(seed.Envelope) == 0 {
+		return 0, [sha256.Size]byte{}, [sha256.Size]byte{}, ErrCheckpointGroupSequence
+	}
+	h := sha256.New()
+	_, _ = h.Write(checkpointGroupSeedDomain)
+	var length [8]byte
+	binary.LittleEndian.PutUint64(length[:], uint64(len(seed.Envelope)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write(seed.Envelope)
+	_ = h.Sum(state[:0])
+	member = sha256.Sum256([]byte(seed.Member))
+	return seed.Applied, state, member, nil
 }
 
 // CheckpointGroupStats is a detached counter snapshot. BarrierSyncs counts the
@@ -129,6 +184,9 @@ type checkpointGroupCertificate struct {
 	txnBase      uint64
 	markerEpoch  uint64
 	markerID     [16]byte
+	seedApplied  uint64
+	seedState    [sha256.Size]byte
+	seedMember   [sha256.Size]byte
 	members      []checkpointGroupMember
 }
 
@@ -153,6 +211,9 @@ type CheckpointGroup struct {
 	txn         uint64
 	applied     uint64
 	foldedTxn   uint64
+	seedApplied uint64
+	seedState   [sha256.Size]byte
+	seedMember  [sha256.Size]byte
 	closed      bool
 	closeErr    error
 	poison      error
@@ -182,6 +243,8 @@ const (
 	checkpointGroupAfterCertificateSync
 	checkpointGroupAfterPhysicalCheckpoint
 	checkpointGroupAfterCertificateRename
+	checkpointGroupAfterPrepareAppend
+	checkpointGroupAfterDecisionAppend
 )
 
 var (
@@ -233,15 +296,18 @@ func rejectCheckpointGroupCertificateForFile(file *os.File) error {
 		return err
 	}
 	defer root.Close()
-	directory, err := root.Stat(".")
+	entry, err := root.Lstat(filepath.Base(file.Name()))
 	if err != nil {
 		return err
 	}
-	matches, err := storeio.FileMatchesDirectory(directory, file)
+	if !entry.Mode().IsRegular() {
+		return ErrTransactionLogDirectoryMismatch
+	}
+	opened, err := file.Stat()
 	if err != nil {
 		return err
 	}
-	if !matches {
+	if !os.SameFile(opened, entry) {
 		return ErrTransactionLogDirectoryMismatch
 	}
 	return rejectCheckpointGroupCertificate(root)
@@ -281,6 +347,30 @@ func NewCheckpointGroup(
 	members []NamedCollection,
 	options CheckpointGroupOptions,
 ) (*CheckpointGroup, error) {
+	return newCheckpointGroup(log, members, options, nil)
+}
+
+// NewSeededCheckpointGroup creates format 0 at certified cut zero around clean,
+// already durable imported images. The named seed member itself must be empty;
+// every other fixed member is covered by an exact generation witness and may
+// already contain durable rows. The seed's exact state envelope is committed to
+// the initial certificate, but is not written until Seed publishes it through
+// the exclusively attached group.
+func NewSeededCheckpointGroup(
+	log *TxnLog,
+	members []NamedCollection,
+	seed CheckpointGroupSeed,
+	options CheckpointGroupOptions,
+) (*CheckpointGroup, error) {
+	return newCheckpointGroup(log, members, options, &seed)
+}
+
+func newCheckpointGroup(
+	log *TxnLog,
+	members []NamedCollection,
+	options CheckpointGroupOptions,
+	seed *CheckpointGroupSeed,
+) (*CheckpointGroup, error) {
 	options, err := options.normalized()
 	if err != nil {
 		return nil, err
@@ -294,6 +384,59 @@ func NewCheckpointGroup(
 	}
 	if err := log.ValidateCollections(members); err != nil {
 		return nil, err
+	}
+	var seedApplied uint64
+	var seedState, seedMember [sha256.Size]byte
+	if seed != nil {
+		seedApplied, seedState, seedMember, err = checkpointGroupSeedProfile(*seed)
+		if err != nil {
+			return nil, err
+		}
+		var seedCollection *Collection
+		for _, member := range ordered {
+			if member.name == seed.Member && member.nameDigest == seedMember {
+				seedCollection = member.collection
+			}
+		}
+		if seedCollection == nil {
+			return nil, fmt.Errorf("%w: seed member is outside fixed membership", ErrCheckpointGroupOwned)
+		}
+		if len(seed.Images) != len(ordered)-1 {
+			return nil, fmt.Errorf("%w: imported image witness count", ErrCheckpointGroupSeedChanged)
+		}
+		for i, image := range seed.Images {
+			if image.Collection == nil || image.Collection == seedCollection || image.Generation == 0 {
+				return nil, fmt.Errorf("%w: invalid imported image witness", ErrCheckpointGroupSeedChanged)
+			}
+			owned := false
+			for _, member := range ordered {
+				if member.collection == image.Collection {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				return nil, fmt.Errorf("%w: imported image witness is outside fixed membership", ErrCheckpointGroupSeedChanged)
+			}
+			for prior := range i {
+				if seed.Images[prior].Collection == image.Collection {
+					return nil, fmt.Errorf("%w: duplicate imported image witness", ErrCheckpointGroupSeedChanged)
+				}
+			}
+		}
+		// Staging uses ordinary single-collection journaled writes. Fold only a
+		// member that actually carries such a suffix before fixed-group
+		// activation; already-clean images incur no redundant Flush or scan.
+		for _, member := range ordered {
+			member.collection.writer.Lock()
+			pending := member.collection.journal == nil || member.collection.journal.Cursor() != 0
+			member.collection.writer.Unlock()
+			if pending {
+				if err := member.collection.Flush(); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	if checkpointGroupAfterInitialValidationHook != nil {
 		checkpointGroupAfterInitialValidationHook()
@@ -320,12 +463,6 @@ func NewCheckpointGroup(
 	if err := log.validateCollectionsLocked(members); err != nil {
 		return nil, err
 	}
-	if err := claimCheckpointGroupCatalogLocked(log, ordered); err != nil {
-		return nil, err
-	}
-	if checkpointGroupAfterDirectoryMembershipHook != nil {
-		checkpointGroupAfterDirectoryMembershipHook()
-	}
 	if log.marker == nil {
 		return nil, fmt.Errorf("%w: transaction marker is not open", ErrCheckpointGroupCorrupt)
 	}
@@ -347,6 +484,19 @@ func NewCheckpointGroup(
 			collection.checkpointGroupRetired.Load() {
 			return nil, ErrCheckpointGroupOwned
 		}
+	}
+	if seed != nil {
+		for _, image := range seed.Images {
+			if image.Collection.Generation() != image.Generation {
+				return nil, ErrCheckpointGroupSeedChanged
+			}
+		}
+	}
+	if err := claimCheckpointGroupCatalogLocked(log, ordered); err != nil {
+		return nil, err
+	}
+	if checkpointGroupAfterDirectoryMembershipHook != nil {
+		checkpointGroupAfterDirectoryMembershipHook()
 	}
 	file, certificate, openErr := openCheckpointGroupCertificate(log)
 	if openErr == nil {
@@ -371,10 +521,13 @@ func NewCheckpointGroup(
 		return nil, fmt.Errorf("%w: missing certificate beside a non-empty marker", ErrCheckpointGroupCorrupt)
 	}
 	for _, member := range ordered {
-		nonempty := member.collection.Len() != 0 ||
-			member.collection.journal == nil || member.collection.journal.Cursor() != 0
-		if nonempty {
-			return nil, fmt.Errorf("%w: missing certificate beside non-empty member %q", ErrCheckpointGroupCorrupt, member.name)
+		if member.collection.journal == nil || member.collection.journal.Cursor() != 0 {
+			return nil, fmt.Errorf("%w: missing certificate beside live member journal %q", ErrCheckpointGroupCorrupt, member.name)
+		}
+		if seed == nil || member.nameDigest == seedMember {
+			if member.collection.Len() != 0 {
+				return nil, fmt.Errorf("%w: missing certificate beside non-empty member %q", ErrCheckpointGroupCorrupt, member.name)
+			}
 		}
 	}
 	holds, holdsErr := directoryHoldsAnyConditional(log.root)
@@ -390,6 +543,7 @@ func NewCheckpointGroup(
 	certificate = checkpointGroupCertificate{
 		sequence: 1, markerID: log.marker.Header().MarkerID,
 		markerEpoch: log.marker.Header().Epoch, members: ordered,
+		seedApplied: seedApplied, seedState: seedState, seedMember: seedMember,
 	}
 	file, published, openErr = createCheckpointGroupCertificate(log, certificate)
 	if openErr != nil {
@@ -540,11 +694,14 @@ func terminalFenceCheckpointGroupActivationLocked(
 }
 
 func checkpointGroupMembers(members []NamedCollection) ([]checkpointGroupMember, error) {
+	if len(members) == 0 || len(members) > checkpointGroupMaxMembers {
+		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnParticipant, len(members))
+	}
 	validated, err := validateTxnMembers(members)
 	if err != nil {
 		return nil, err
 	}
-	if len(validated) == 0 || len(validated) > storeio.TxnMarkerMaxParticipants {
+	if len(validated) == 0 || len(validated) > checkpointGroupMaxMembers {
 		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnParticipant, len(validated))
 	}
 	slices.SortFunc(validated, func(a, b NamedCollection) int {
@@ -591,6 +748,8 @@ func checkpointGroupFromCertificateLocked(
 		txnBase: certificate.txnBase, markerEpoch: certificate.markerEpoch,
 		markerID: certificate.markerID, txn: certificate.txnHighWater,
 		applied: certificate.applied, foldedTxn: certificate.txnHighWater,
+		seedApplied: certificate.seedApplied, seedState: certificate.seedState,
+		seedMember: certificate.seedMember,
 	}
 	group.certApplied.Store(certificate.applied)
 	group.certTxn.Store(certificate.txnHighWater)
@@ -679,6 +838,148 @@ func (g *CheckpointGroup) Owns(members []NamedCollection) bool {
 	return true
 }
 
+// SeedPending reports an authenticated format-0 seed certificate whose state
+// transition has not yet reached the certified cut. It performs no I/O and is
+// used only to keep staged images non-serving until exact activation resumes.
+func (g *CheckpointGroup) SeedPending() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	pending := !g.closed && g.seedApplied > 1 && g.certApplied.Load() == 0
+	g.mu.Unlock()
+	return pending
+}
+
+// SeedAppliedIndex reports the imported cut authenticated by this group. The
+// boolean is false for an ordinary format-0 group.
+func (g *CheckpointGroup) SeedAppliedIndex() (uint64, bool) {
+	if g == nil {
+		return 0, false
+	}
+	g.mu.Lock()
+	applied := g.seedApplied
+	seeded := !g.closed && applied > 1
+	g.mu.Unlock()
+	return applied, seeded
+}
+
+// SeedStateAuthoritative reports the unique certified transaction that wrote
+// the seed envelope itself. The later snapshot-base binding is a second
+// same-Applied group transition, so its State envelope must not be compared to
+// the original seed commitment.
+func (g *CheckpointGroup) SeedStateAuthoritative() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	authoritative := !g.closed && g.seedApplied > 1 &&
+		g.applied == g.seedApplied && g.txn == 1 &&
+		g.certApplied.Load() == g.seedApplied && g.certTxn.Load() == 1
+	g.mu.Unlock()
+	return authoritative
+}
+
+// SeedActivationPending reports either the C0 seed interval or a certified
+// prefix that does not yet include the required second same-index immutable
+// snapshot-base transition. It deliberately reads certificate high-water, not
+// the newer visible suffix: a crash discards any published but uncertified
+// second transition and must reopen non-serving.
+func (g *CheckpointGroup) SeedActivationPending() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	pending := !g.closed && g.seedApplied > 1 &&
+		(g.certTxn.Load() < 2 || g.certApplied.Load() < g.seedApplied)
+	g.mu.Unlock()
+	return pending
+}
+
+// ValidateSeedState proves that an imported State envelope is exactly the one
+// committed by this group's seed certificate. seeded is false for an ordinary
+// format-0 group; callers must not infer seed authority from cut shape alone.
+func (g *CheckpointGroup) ValidateSeedState(
+	applied uint64,
+	member string,
+	envelope []byte,
+) (seeded bool, err error) {
+	if g == nil {
+		return false, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return false, err
+	}
+	if g.seedApplied == 0 {
+		return false, nil
+	}
+	wantApplied, wantState, wantMember, err := checkpointGroupSeedProfile(
+		CheckpointGroupSeed{Applied: applied, Member: member, Envelope: envelope},
+	)
+	if err != nil || wantApplied != g.seedApplied || wantState != g.seedState ||
+		wantMember != g.seedMember {
+		return true, fmt.Errorf("%w: imported state differs from seed certificate", ErrCheckpointGroupCorrupt)
+	}
+	return true, nil
+}
+
+// qualifyLog is the read-only qualification half of TxnLog.EnsureMinted for an
+// authenticated active group. It retains the canonical g.mu -> log.commitMu
+// order through every certificate descriptor and membership read, including
+// the close interval after terminal retirement releases commitMu but before it
+// closes and clears the certificate descriptor.
+func (g *CheckpointGroup) qualifyLog(log *TxnLog) error {
+	if g == nil || log == nil {
+		return ErrCheckpointGroupOwned
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	log.commitMu.Lock()
+	defer log.commitMu.Unlock()
+	if g == nil || log == nil || g.log != log || log.checkpointGroup != g ||
+		g.file == nil || g.fileInfo == nil || log.marker == nil {
+		return ErrCheckpointGroupOwned
+	}
+	if err := g.checkUsableLocked(); err != nil {
+		return err
+	}
+	header := log.marker.Header()
+	if header.MarkerID != g.markerID || header.Epoch != g.markerEpoch {
+		return fmt.Errorf("%w: transaction marker identity", ErrCheckpointGroupCorrupt)
+	}
+	current, err := log.root.Lstat(checkpointGroupFilename)
+	if err != nil {
+		return err
+	}
+	descriptor, err := g.file.Stat()
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !descriptor.Mode().IsRegular() ||
+		!os.SameFile(current, descriptor) || !os.SameFile(current, g.fileInfo) {
+		return fmt.Errorf("%w: certificate entry changed", ErrCheckpointGroupCorrupt)
+	}
+	log.regMu.Lock()
+	if len(log.registered) != len(g.members) {
+		log.regMu.Unlock()
+		return fmt.Errorf("%w: fixed checkpoint registration count", ErrTxnParticipant)
+	}
+	for _, member := range g.members {
+		if _, ok := log.registered[member.collection]; !ok ||
+			member.collection.checkpointGroup.Load() != g {
+			log.regMu.Unlock()
+			return fmt.Errorf("%w: fixed checkpoint member %q", ErrTxnParticipant, member.name)
+		}
+	}
+	log.regMu.Unlock()
+	if err := log.validateCollectionsLocked(checkpointNamedMembers(g.members)); err != nil {
+		return err
+	}
+	return validateCheckpointGroupDirectoryMembership(log, g.members)
+}
+
 // AppliedIndex is the current reader-visible group cut.
 func (g *CheckpointGroup) AppliedIndex() uint64 {
 	if g == nil {
@@ -687,10 +988,11 @@ func (g *CheckpointGroup) AppliedIndex() uint64 {
 	return g.visibleApplied.Load()
 }
 
-// CheckpointAppliedIndex is the only cut safe for Raft WAL retention. It moves
-// immediately after the authenticated certificate Sync, even if a later
+// CheckpointAppliedIndex is the certificate-backed contiguous apply cut. It
+// moves immediately after the authenticated certificate Sync, even if a later
 // physical fold must be retried; the synced participant journals and decision
-// prefix already make that cut replayable.
+// prefix already make that cut replayable. WAL deletion requires additional
+// Raft term, configuration, lineage, witness, and retained-suffix proofs.
 func (g *CheckpointGroup) CheckpointAppliedIndex() uint64 {
 	if g == nil {
 		return 0
@@ -719,6 +1021,102 @@ func (g *CheckpointGroup) Stats() CheckpointGroupStats {
 	}
 }
 
+// Seed publishes the sole non-consecutive first transition admitted by a
+// seeded format-0 group. The certificate already binds Applied, Member, and
+// the exact Envelope. Seed writes exactly one key in that member, then
+// certifies and physically folds the transition before returning success.
+// Retrying after a certified outcome is idempotent only when the rooted value
+// is byte-identical to the certificate commitment.
+func (g *CheckpointGroup) Seed(
+	seed CheckpointGroupSeed,
+	member NamedCollection,
+	limits TxnLimits,
+	key []byte,
+) error {
+	if g == nil || member.Collection == nil || len(key) == 0 {
+		return ErrCheckpointGroupOwned
+	}
+	applied, stateCommitment, memberDigest, err := checkpointGroupSeedProfile(seed)
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.checkUsableLocked(); err != nil {
+		return err
+	}
+	owned := g.byName[member.Name]
+	if owned == nil || owned != member.Collection || member.Name != seed.Member ||
+		g.seedApplied != applied || g.seedState != stateCommitment ||
+		g.seedMember != memberDigest {
+		return fmt.Errorf("%w: seed profile or member", ErrCheckpointGroupCorrupt)
+	}
+	if g.applied == applied && g.certApplied.Load() == applied {
+		value, found, readErr := owned.AppendRaw(nil, key)
+		if readErr != nil || !found || !slices.Equal(value, seed.Envelope) {
+			return errors.Join(
+				fmt.Errorf("%w: certified seed row differs", ErrCheckpointGroupCorrupt),
+				readErr,
+			)
+		}
+		return g.checkpointLocked()
+	}
+	if g.applied != 0 || g.txn != 0 || g.foldedTxn != 0 ||
+		g.certApplied.Load() != 0 || g.certTxn.Load() != 0 {
+		return fmt.Errorf("%w: seed requires cut zero", ErrCheckpointGroupSequence)
+	}
+
+	wb := &WriteBatch{
+		collection: owned,
+		position:   make(map[string]int, 1),
+		active:     true,
+	}
+	defer closeDurableWriteBatches([]*WriteBatch{wb})
+	if err := wb.Put(key, seed.Envelope); err != nil {
+		return err
+	}
+	if wb.Len() != 1 {
+		return fmt.Errorf("%w: seed must contain exactly one state row", ErrCheckpointGroupSequence)
+	}
+	if err := checkTxnLimits(
+		limits, 1, 1, int64(len(wb.keys)+len(wb.values)),
+	); err != nil {
+		return err
+	}
+	dirty := []NamedCollection{{Name: member.Name, Collection: owned}}
+	byName := map[string]*WriteBatch{member.Name: wb}
+	for attempt := 0; attempt < 2; attempt++ {
+		room, roomErr := g.markerRoomLocked(1)
+		if roomErr != nil {
+			return roomErr
+		}
+		if !room {
+			if err := g.checkpointLocked(); err != nil {
+				return err
+			}
+			if err := g.recycleMarkerLocked(); err != nil {
+				return err
+			}
+			continue
+		}
+		err = g.commitTransitionLocked(1, applied, dirty, byName)
+		if errors.Is(err, ErrCheckpointGroupPressure) {
+			if err := g.checkpointLocked(); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		g.txn = 1
+		g.applied = applied
+		g.updates.Add(1)
+		return g.checkpointLocked()
+	}
+	return ErrCheckpointGroupPressure
+}
+
 // Update publishes one fixed-group transition. The normal per-transition path
 // appends conditional participant records and one decision with zero Sync. All
 // fallible work precedes the simultaneous snapshot-gate publication.
@@ -735,6 +1133,25 @@ func (g *CheckpointGroup) Update(
 	defer g.mu.Unlock()
 	if err := g.checkUsableLocked(); err != nil {
 		return err
+	}
+	if g.seedApplied > 1 {
+		switch {
+		case g.txn == 0:
+			// The cut-zero certificate grants exactly one mutation authority:
+			// Seed must publish the committed state envelope. Letting ordinary
+			// Update consume txn 1 would strand or replace that proof.
+			return fmt.Errorf(
+				"%w: seeded cut zero requires Seed", ErrCheckpointGroupSequence,
+			)
+		case g.txn == 1 && g.applied == g.seedApplied && applied != g.seedApplied:
+			// The first transition after Seed binds the immutable snapshot
+			// base at the imported cut. It cannot advance apply and thereby
+			// make an unbound child appear activation-complete.
+			return fmt.Errorf(
+				"%w: seeded snapshot-base binding must remain at applied %d",
+				ErrCheckpointGroupSequence, g.seedApplied,
+			)
+		}
 	}
 	// Periodic barriers are admission work for the next transition. This keeps
 	// every checkpoint failure pre-mutation: a caller never receives a terminal
@@ -915,11 +1332,24 @@ func (g *CheckpointGroup) commitTransitionLocked(
 			PreparedGeneration: staged[i].generation,
 		}
 	}
+	if checkpointGroupFaultHook != nil {
+		if err := checkpointGroupFaultHook(checkpointGroupAfterPrepareAppend); err != nil {
+			return err
+		}
+	}
 	if _, appendErr := log.marker.AppendDecision(txnID, participants); appendErr != nil {
 		poisoned := journalCommitOutcomeUnknown(appendErr)
 		log.poison = poisoned
 		g.poison = poisoned
 		return poisoned
+	}
+	if checkpointGroupFaultHook != nil {
+		if hookErr := checkpointGroupFaultHook(checkpointGroupAfterDecisionAppend); hookErr != nil {
+			poisoned := journalCommitOutcomeUnknown(hookErr)
+			log.poison = poisoned
+			g.poison = poisoned
+			return poisoned
+		}
 	}
 
 	for _, c := range order {
@@ -1118,6 +1548,7 @@ func (g *CheckpointGroup) certificateLocked() checkpointGroupCertificate {
 		sequence: g.sequence, applied: g.applied,
 		txnHighWater: g.txn, txnBase: g.txnBase,
 		markerEpoch: g.markerEpoch, markerID: g.markerID,
+		seedApplied: g.seedApplied, seedState: g.seedState, seedMember: g.seedMember,
 		members: g.members,
 	}
 }
@@ -1371,10 +1802,10 @@ func validateCheckpointMarkerRecords(
 }
 
 func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, error) {
-	if len(c.members) == 0 || len(c.members) > storeio.TxnMarkerMaxParticipants ||
+	if len(c.members) == 0 || len(c.members) > checkpointGroupMaxMembers ||
 		checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes > checkpointGroupChecksumOffset ||
 		c.sequence == 0 || c.markerID == ([16]byte{}) || c.markerEpoch == 0 ||
-		c.txnBase > c.txnHighWater {
+		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) {
 		return nil, ErrCheckpointGroupCorrupt
 	}
 	buf := make([]byte, checkpointGroupSlotBytes)
@@ -1388,6 +1819,9 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 	binary.LittleEndian.PutUint64(buf[40:48], c.txnBase)
 	binary.LittleEndian.PutUint64(buf[48:56], c.markerEpoch)
 	copy(buf[56:72], c.markerID[:])
+	binary.LittleEndian.PutUint64(buf[72:80], c.seedApplied)
+	copy(buf[80:112], c.seedState[:])
+	copy(buf[112:144], c.seedMember[:])
 	membership := sha256.New()
 	for i, member := range c.members {
 		off := checkpointGroupHeaderBytes + i*checkpointGroupMemberBytes
@@ -1396,7 +1830,7 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 		copy(buf[off+48:off+64], member.journalID[:])
 		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
-	copy(buf[72:96], membership.Sum(nil)[:24])
+	copy(buf[144:168], membership.Sum(nil)[:24])
 	h := sha256.New()
 	_, _ = h.Write(checkpointGroupDigestDomain)
 	_, _ = h.Write(buf[:checkpointGroupChecksumOffset])
@@ -1418,7 +1852,7 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	count := int(binary.LittleEndian.Uint16(buf[12:14]))
-	if count == 0 || count > storeio.TxnMarkerMaxParticipants ||
+	if count == 0 || count > checkpointGroupMaxMembers ||
 		checkpointGroupHeaderBytes+count*checkpointGroupMemberBytes > checkpointGroupChecksumOffset {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
@@ -1428,10 +1862,14 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		txnHighWater: binary.LittleEndian.Uint64(buf[32:40]),
 		txnBase:      binary.LittleEndian.Uint64(buf[40:48]),
 		markerEpoch:  binary.LittleEndian.Uint64(buf[48:56]),
+		seedApplied:  binary.LittleEndian.Uint64(buf[72:80]),
 		members:      make([]checkpointGroupMember, count),
 	}
 	copy(c.markerID[:], buf[56:72])
-	if c.sequence == 0 || c.markerEpoch == 0 || c.markerID == ([16]byte{}) || c.txnBase > c.txnHighWater {
+	copy(c.seedState[:], buf[80:112])
+	copy(c.seedMember[:], buf[112:144])
+	if c.sequence == 0 || c.markerEpoch == 0 || c.markerID == ([16]byte{}) ||
+		c.txnBase > c.txnHighWater || !validCheckpointGroupSeedCertificate(c) {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	membership := sha256.New()
@@ -1442,7 +1880,7 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		copy(c.members[i].journalID[:], buf[off+48:off+64])
 		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
-	if !slices.Equal(buf[72:96], membership.Sum(nil)[:24]) {
+	if !slices.Equal(buf[144:168], membership.Sum(nil)[:24]) {
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	canonical, err := encodeCheckpointGroupCertificate(c)
@@ -1450,6 +1888,24 @@ func decodeCheckpointGroupCertificate(buf []byte) (checkpointGroupCertificate, e
 		return checkpointGroupCertificate{}, ErrCheckpointGroupCorrupt
 	}
 	return c, nil
+}
+
+func validCheckpointGroupSeedCertificate(c checkpointGroupCertificate) bool {
+	zeroState := c.seedState == ([sha256.Size]byte{})
+	zeroMember := c.seedMember == ([sha256.Size]byte{})
+	if c.seedApplied == 0 {
+		return zeroState && zeroMember && c.applied != math.MaxUint64 &&
+			c.applied <= c.txnHighWater
+	}
+	if c.seedApplied <= 1 || c.seedApplied == math.MaxUint64 || zeroState || zeroMember {
+		return false
+	}
+	if c.applied == 0 {
+		return c.txnHighWater == 0 && c.txnBase == 0
+	}
+	return c.applied != math.MaxUint64 && c.applied >= c.seedApplied &&
+		c.txnHighWater > 0 &&
+		c.applied-c.seedApplied <= c.txnHighWater-1
 }
 
 // checkpointGroupCertificateChecksumValid distinguishes an unauthenticated
@@ -1497,6 +1953,20 @@ func validateCheckpointGroupCertificateMembers(
 			c.members[i].storeID != members[i].storeID ||
 			c.members[i].journalID != members[i].journalID {
 			return fmt.Errorf("%w: member %d", ErrCheckpointGroupCorrupt, i)
+		}
+	}
+	if c.seedApplied != 0 {
+		found := false
+		for i := range members {
+			if members[i].nameDigest == c.seedMember {
+				if found {
+					return fmt.Errorf("%w: duplicate seed member", ErrCheckpointGroupCorrupt)
+				}
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: seed member", ErrCheckpointGroupCorrupt)
 		}
 	}
 	return nil

@@ -211,6 +211,7 @@ const (
 	shardStoreOpenReplicatedSettlement
 	shardStoreOpenReplicatedApplyExisting
 	shardStoreOpenReplicatedApplySettlement
+	shardStoreOpenReplicatedChildStageResume
 )
 
 type shardStoreOpenPolicy struct {

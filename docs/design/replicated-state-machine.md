@@ -213,13 +213,20 @@ state, session headers, ring slots, placement, all user rows, and the artifact
 `ImageDigest`. Opening a candidate does not grant membership or serving
 authority.
 
-The separate range-split child artifact currently transfers user rows and an
-empty child session image. Initialization seeds the child
-`SessionEpochHighWater` to the certified source cut's applied index. This is the
-deliberate exception to the normal Open-issued high-water. Every source-issued
-token that could predate that cut is therefore fenced on the child even though
-no session rows are copied; the first child Open receives a later child apply
-index. The artifact does not partition retained headers or slots by
+The separate range-split child artifact transfers user rows and proves an empty
+child session image. Activation reuses that sealed image in place: one scan
+produces the authenticated state envelope and image proof, then a checkpoint
+group seed transaction writes only the hidden state row. Its compact seeded
+snapshot manifest carries no artifact geometry or duplicate user payload. The
+returned immutable base must be installed before proposals, apply, completion
+lookups, snapshot export, or SQL serving are admitted.
+
+Initialization sets the child `SessionEpochHighWater` to the certified source
+cut's applied index. This is the deliberate exception to the normal
+Open-issued high-water. Every source-issued token that could predate that cut
+is therefore fenced on the child even though no session rows are copied; the
+first child Open receives a later child apply index. The artifact does not
+partition retained headers or slots by
 `RetryHome`, so split-safe retained retries remain unimplemented. A source with
 any retained session header or slot cannot pass the split controller's
 source-seal or catalog-publication gates, and direct transition construction

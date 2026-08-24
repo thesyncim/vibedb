@@ -80,10 +80,11 @@ type StateMachine interface {
 	InstallSnapshot(*pb.Snapshot) (Publication, error)
 }
 
-// CheckpointedStateMachine optionally exposes the authenticated contiguous cut
-// safe for WAL retention. It may trail StateMachine.Applied when local apply is
-// replay-backed; implementations without it retain their existing per-entry
-// durability contract.
+// CheckpointedStateMachine optionally exposes the authenticated contiguous
+// apply cut used as one input to WAL retention. It may trail
+// StateMachine.Applied when local apply is replay-backed. The index alone is
+// not deletion authority: a compactor must also bind term, configuration,
+// member lineage, certificate witness, and the retained suffix.
 type CheckpointedStateMachine interface {
 	CheckpointAppliedIndex() uint64
 }

@@ -253,7 +253,7 @@ after the durable cut is already established.
 `CheckpointAppliedIndex` is the greatest certificate-backed contiguous cut and
 the only index currently exposed as safe input to Raft-WAL retention. They may
 differ between checkpoints. The repository does not yet compact or replace the
-Raft WAL from that fence; a replacement must additionally bind the exact term,
+Raft WAL from that input; a replacement must additionally bind the exact term,
 configuration state, member lineage, certificate witness, and retained log
 suffix before any old generation can be discarded.
 
@@ -377,17 +377,22 @@ checksum-protected certificate binds those non-retained child images and the
 exact cut but deliberately grants no serving authority.
 
 A sealed destination can be converted in place into the standard
-replicated-state snapshot base. The conversion validates the final image with
-the child's mutation contract, writes only the hidden state row, and does not
-rewrite user rows. The independent child Raft runtime must still install that
-small base before the child is eligible to serve.
+replicated-state snapshot base. The conversion reuses the sealed image proof,
+binds the exact state envelope in a cut-zero checkpoint-group certificate,
+then certifies and folds the one-row hidden-state seed. It does not rewrite,
+rescan, or serialize the user image again after the canonical preparation
+pass. The independent child Raft runtime must install that small base before
+the child is eligible to serve.
 
 The SQL driver owns this conversion. It prevents SQL sessions while the child
-image is incomplete. It stages into the final bound table, publishes the
-hidden apply participant, and transfers one exclusive claim to the normal
-replicated apply path. The user collection handle and storage identity do not
-change. An uncertain catalog publication retains the intended apply identity
-for exact settlement and retry.
+image is incomplete and while the activated claim still lacks its exact base.
+It stages into the final bound table, publishes the hidden apply participant,
+and transfers one exclusive claim to the normal replicated apply path. The
+user collection handle and storage identity do not change. An uncertain
+catalog publication retains the intended apply identity for exact settlement
+and retry. Explicit child-resume open remains fail-closed across missing,
+seed-only, and final-certificate crash intervals; ordinary open cannot treat a
+missing active certificate as a fresh image.
 
 The child WAL is not allocated twice. A validated immutable member identity
 provides the planned SQL binding before the WAL exists. After activation, the

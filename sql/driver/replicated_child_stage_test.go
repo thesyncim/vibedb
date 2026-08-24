@@ -199,8 +199,12 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	unknown, err := stage.activate(
 		certificate, fixture.targetBootstrap,
 		replicatedstate.SnapshotArtifactOptions{},
-		func(*database) (bool, error) {
-			return false, durable.ErrCommitOutcomeUnknown
+		func(database *database) (bool, error) {
+			published, persistErr := database.persistCatalogLocked()
+			if persistErr != nil {
+				return published, persistErr
+			}
+			return true, durable.ErrCommitOutcomeUnknown
 		},
 	)
 	if unknown.Apply != nil || unknown.ApplyIdentity == (ReplicatedApplyIdentity{}) ||
@@ -210,6 +214,86 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	if opened, err := db.NewSession(context.Background()); opened != nil ||
 		!errors.Is(err, ErrReplicatedChildStageBusy) {
 		t.Fatalf("SQL session after unknown publication = %v, %v", opened, err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := db.NewSession(context.Background()); opened != nil ||
+		!errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("SQL session after unknown publication and stage close = %v, %v", opened, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ordinary, _, err := OpenReplicatedShardStoreWithApplyForSettlement(
+		path, base, applyOptions,
+	); ordinary != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
+		if ordinary != nil {
+			_ = ordinary.Close()
+		}
+		t.Fatalf("ordinary open of seed-pending image = %v, %v", ordinary, err)
+	}
+	resumed, resumedIdentity, err := OpenReplicatedShardStoreForChildStageResume(
+		path, base, applyOptions,
+	)
+	if err != nil || resumedIdentity != unknown.ApplyIdentity {
+		t.Fatalf("child-stage resume open = %+v, %v", resumedIdentity, err)
+	}
+	db = resumed
+	if opened, err := db.NewSession(context.Background()); opened != nil ||
+		!errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("SQL session before sealed-stage reclaim = %v, %v", opened, err)
+	}
+	if apply, _, err := db.OpenReplicatedApply(
+		base, fixture.targetBootstrap, applyOptions,
+	); apply != nil || !errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("ordinary apply before sealed-stage reclaim = %v, %v", apply, err)
+	}
+	core = db.connector.db
+	core.mu.RLock()
+	finalCollection = core.tables["docs"].collection
+	core.mu.RUnlock()
+	stage, err = db.OpenReplicatedChildStage(
+		base, fixture.partitioner, fixture.artifactManifest, persisted,
+		applyOptions, rangesplit.ChildStageOptions{},
+	)
+	if err != nil {
+		t.Fatalf("reclaim sealed child stage: %v", err)
+	}
+
+	restoreSeedFault := durable.InstallCheckpointGroupInitialCertificateFaultForFacadeTest()
+	uncertainSeed, err := stage.Activate(
+		certificate, fixture.targetBootstrap,
+		replicatedstate.SnapshotArtifactOptions{},
+	)
+	restoreSeedFault()
+	if uncertainSeed.Apply != nil || uncertainSeed.ApplyIdentity != unknown.ApplyIdentity ||
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("unknown initial seed certificate = %+v, %v", uncertainSeed, err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := db.NewSession(context.Background()); opened != nil ||
+		!errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("SQL session after unknown seed certificate and stage close = %v, %v", opened, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resumed, resumedIdentity, err = OpenReplicatedShardStoreForChildStageResume(
+		path, base, applyOptions,
+	)
+	if err != nil || resumedIdentity != unknown.ApplyIdentity {
+		t.Fatalf("initial-certificate child resume = %+v, %v", resumedIdentity, err)
+	}
+	db = resumed
+	stage, err = db.OpenReplicatedChildStage(
+		base, fixture.partitioner, fixture.artifactManifest, persisted,
+		applyOptions, rangesplit.ChildStageOptions{},
+	)
+	if err != nil {
+		t.Fatalf("reclaim stage after initial seed certificate: %v", err)
 	}
 
 	activated, err := stage.Activate(
@@ -223,6 +307,34 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		activated.SnapshotBase == nil || activated.ArtifactManifest.UserRows != 1 ||
 		activated.ArtifactManifest.State.Applied != certificate.SourceCut().Applied {
 		t.Fatalf("activation = %+v", activated)
+	}
+	if err := activated.Apply.AdmitCommand(nil); !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("AdmitCommand before base install = %v", err)
+	}
+	if _, err := activated.Apply.ApplyNormal(raftmodel.ApplyMeta{
+		Index: certificate.SourceCut().Applied + 1, Term: certificate.SourceCut().Term,
+		Type: pb.EntryNormal,
+	}, nil); !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("ApplyNormal before base install = %v", err)
+	}
+	if _, err := activated.Apply.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: certificate.SourceCut().Applied + 1, Term: certificate.SourceCut().Term,
+		Type: pb.EntryConfChange,
+	}, new(pb.ConfState)); !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("ApplyConfiguration before base install = %v", err)
+	}
+	if _, err := activated.Apply.LookupCompletion(nil); !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("LookupCompletion before base install = %v", err)
+	}
+	if snapshot, err := activated.Apply.SnapshotArtifactCut(); snapshot != nil ||
+		!errors.Is(err, ErrReplicatedApplyBasePending) {
+		if snapshot != nil {
+			_ = snapshot.Close()
+		}
+		t.Fatalf("SnapshotArtifactCut before base install = %v, %v", snapshot, err)
+	}
+	if _, err := activated.Apply.InstallSnapshot(fixture.targetBootstrap); !errors.Is(err, ErrReplicatedApplyBasePending) {
+		t.Fatalf("wrong InstallSnapshot before base install = %v", err)
 	}
 	core.mu.RLock()
 	if core.tables["docs"].collection != finalCollection ||
@@ -240,6 +352,48 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		openedBase.Manifest.State.Binding != replicatedStateBinding(base) {
 		t.Fatalf("snapshot base = %+v, %v", openedBase, err)
 	}
+	firstBaseDigest := openedBase.Digest
+	if err := activated.Apply.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resumed, resumedIdentity, err = OpenReplicatedShardStoreForChildStageResume(
+		path, base, applyOptions,
+	)
+	if err != nil || resumedIdentity != activated.ApplyIdentity {
+		t.Fatalf("final-certificate child resume = %+v, %v", resumedIdentity, err)
+	}
+	db = resumed
+	if opened, err := db.NewSession(context.Background()); opened != nil ||
+		!errors.Is(err, ErrReplicatedChildStageBusy) {
+		t.Fatalf("SQL session after final seed certificate = %v, %v", opened, err)
+	}
+	stage, err = db.OpenReplicatedChildStage(
+		base, fixture.partitioner, fixture.artifactManifest, persisted,
+		applyOptions, rangesplit.ChildStageOptions{},
+	)
+	if err != nil {
+		t.Fatalf("reclaim stage after final seed certificate: %v", err)
+	}
+	retried, err := stage.Activate(
+		certificate, fixture.targetBootstrap,
+		replicatedstate.SnapshotArtifactOptions{},
+	)
+	if err != nil || retried.ApplyIdentity != activated.ApplyIdentity ||
+		retried.ArtifactManifest.Digest != activated.ArtifactManifest.Digest {
+		t.Fatalf("retry after final seed certificate = %+v, %v", retried, err)
+	}
+	retriedBase, err := replicatedstate.OpenSnapshotBase(retried.SnapshotBase)
+	if err != nil || retriedBase.Digest != firstBaseDigest {
+		t.Fatalf("retried snapshot base = %+v, %v", retriedBase, err)
+	}
+	activated = retried
+	core = db.connector.db
+	core.mu.RLock()
+	finalCollection = core.tables["docs"].collection
+	core.mu.RUnlock()
 	if _, err := activated.Apply.InstallSnapshot(activated.SnapshotBase); err != nil {
 		t.Fatal(err)
 	}

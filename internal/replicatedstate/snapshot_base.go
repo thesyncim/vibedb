@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -27,12 +28,16 @@ var (
 	snapshotBaseIdentityDomain = []byte(
 		"vibedb/replicated-state/snapshot-base-identity\x00",
 	)
+	seededSnapshotManifestDomain = []byte(
+		"vibedb/replicated-state/seeded-snapshot-manifest\x00",
+	)
 )
 
 // SnapshotBaseCertificate is the small authenticated bridge between an
-// already verified collection artifact and an immutable Raft WAL base. It
-// never contains collection rows. StaticBootstrap is the original index-one
-// identity required to reopen the replicated apply layer.
+// already verified collection image and an immutable Raft WAL base. The image
+// may be a streamed artifact or an exclusively owned no-copy seed; the
+// certificate never contains collection rows. StaticBootstrap is the original
+// index-one identity required to reopen the replicated apply layer.
 type SnapshotBaseCertificate struct {
 	Manifest        SnapshotArtifactManifest
 	StaticBootstrap *pb.Snapshot
@@ -40,13 +45,13 @@ type SnapshotBaseCertificate struct {
 }
 
 // BuildSnapshotBase constructs the bounded Raft snapshot certificate for a
-// completely verified artifact. Bulk state remains in the staged collection
-// files. The returned protobuf is detached from every input.
+// completely verified image manifest. Bulk state remains in the staged
+// collection files. The returned protobuf is detached from every input.
 func BuildSnapshotBase(
 	manifest SnapshotArtifactManifest,
 	staticBootstrap *pb.Snapshot,
 ) (*pb.Snapshot, error) {
-	if err := validateExpectedSnapshotArtifact(manifest); err != nil {
+	if err := validateSnapshotBaseManifest(manifest); err != nil {
 		return nil, fmt.Errorf("%w: manifest: %v", ErrSnapshotBase, err)
 	}
 	bootstrapBytes, bootstrapDigest, err := validateBootstrap(staticBootstrap)
@@ -70,6 +75,9 @@ func BuildSnapshotBase(
 	binary.LittleEndian.PutUint32(result[16:20], uint32(len(stateBytes)))
 	binary.LittleEndian.PutUint32(result[20:24], uint32(len(bootstrapBytes)))
 	binary.LittleEndian.PutUint16(result[24:26], uint16(len(manifest.UserCollection)))
+	if manifest.Seeded {
+		binary.LittleEndian.PutUint16(result[26:28], 1)
+	}
 	binary.LittleEndian.PutUint32(result[28:32], manifest.TargetChunkBytes)
 	binary.LittleEndian.PutUint64(result[32:40], manifest.Chunks)
 	binary.LittleEndian.PutUint64(result[40:48], manifest.SystemRows)
@@ -108,7 +116,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 		binary.LittleEndian.Uint16(data[8:10]) != snapshotBaseFormat ||
 		binary.LittleEndian.Uint16(data[10:12]) != snapshotBaseHeaderBytes ||
 		binary.LittleEndian.Uint32(data[12:16]) != uint32(len(data)) ||
-		binary.LittleEndian.Uint16(data[26:28]) != 0 ||
+		binary.LittleEndian.Uint16(data[26:28]) > 1 ||
 		binary.LittleEndian.Uint64(data[72:80]) != 0 ||
 		!verifyRecord(data, snapshotBaseChecksumDomain) {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: certificate envelope", ErrSnapshotBase)
@@ -151,6 +159,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	}
 	manifest := SnapshotArtifactManifest{
 		State: state, UserCollection: bytes.Clone(data[bootstrapEnd:userEnd]),
+		Seeded:           binary.LittleEndian.Uint16(data[26:28]) == 1,
 		TargetChunkBytes: binary.LittleEndian.Uint32(data[28:32]),
 		Chunks:           binary.LittleEndian.Uint64(data[32:40]),
 		SystemRows:       binary.LittleEndian.Uint64(data[40:48]),
@@ -162,7 +171,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	copy(manifest.LastChunkDigest[:], data[112:144])
 	copy(manifest.Digest[:], data[144:176])
 	copy(manifest.ImageDigest[:], data[176:208])
-	if err := validateExpectedSnapshotArtifact(manifest); err != nil {
+	if err := validateSnapshotBaseManifest(manifest); err != nil {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: manifest: %v", ErrSnapshotBase, err)
 	}
 	metadata := snapshot.GetMetadata()
@@ -179,6 +188,62 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	return SnapshotBaseCertificate{
 		Manifest: manifest, StaticBootstrap: proto.Clone(bootstrap).(*pb.Snapshot), Digest: digest,
 	}, nil
+}
+
+func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
+	if !manifest.Seeded {
+		return validateExpectedSnapshotArtifact(manifest)
+	}
+	if err := validateState(manifest.State); err != nil ||
+		manifest.State.LastKind != RecordImportedSnapshot ||
+		manifest.State.SessionCount != 0 || manifest.State.SessionSlotCount != 0 ||
+		len(manifest.UserCollection) == 0 ||
+		len(manifest.UserCollection) > replication.MaxCollectionBytes ||
+		!utf8.Valid(manifest.UserCollection) ||
+		bytes.IndexByte(manifest.UserCollection, 0) >= 0 ||
+		bytes.Equal(manifest.UserCollection, []byte(systemCollectionName)) ||
+		manifest.TargetChunkBytes != 0 || manifest.Chunks != 0 ||
+		manifest.SystemRows != 0 || manifest.PayloadBytes != 0 ||
+		manifest.EncodedBytes != 0 || manifest.HeaderDigest != ([sha256.Size]byte{}) ||
+		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
+		manifest.ImageDigest == ([sha256.Size]byte{}) ||
+		manifest.Digest == ([sha256.Size]byte{}) {
+		return fmt.Errorf("%w: seeded manifest", ErrSnapshotBase)
+	}
+	stateEnvelope, err := AppendState(nil, manifest.State)
+	if err != nil {
+		return fmt.Errorf("%w: seeded state", ErrSnapshotBase)
+	}
+	wantDataChain, err := dataChainSeedDigest(
+		manifest.State.ApplyContractDigest, manifest.ImageDigest,
+	)
+	if err != nil || wantDataChain != manifest.State.DataChainDigest {
+		return fmt.Errorf("%w: seeded image differs from state chain", ErrSnapshotBase)
+	}
+	if manifest.Digest != seededSnapshotManifestDigest(
+		stateEnvelope, manifest.UserCollection, manifest.ImageDigest, manifest.UserRows,
+	) {
+		return fmt.Errorf("%w: seeded manifest identity", ErrSnapshotBase)
+	}
+	return nil
+}
+
+func seededSnapshotManifestDigest(
+	stateEnvelope, userCollection []byte,
+	imageDigest [sha256.Size]byte,
+	userRows uint64,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(seededSnapshotManifestDomain)
+	writeHashFrame(h, stateEnvelope)
+	writeHashFrame(h, userCollection)
+	_, _ = h.Write(imageDigest[:])
+	var rows [8]byte
+	binary.LittleEndian.PutUint64(rows[:], userRows)
+	_, _ = h.Write(rows[:])
+	var digest [sha256.Size]byte
+	_ = h.Sum(digest[:0])
+	return digest
 }
 
 // StaticBootstrapForSnapshot returns the original index-one bootstrap for

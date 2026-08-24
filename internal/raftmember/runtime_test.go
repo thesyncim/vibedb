@@ -212,7 +212,7 @@ func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence, err := fixture.runtime.WALRetentionFence()
+	fence, err := fixture.runtime.WALRetentionInput()
 	if err != nil {
 		t.Fatal(err)
 	}

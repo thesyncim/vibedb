@@ -8,10 +8,10 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
-// checkpointGroupGenericOpenAfterPrecheckHook is a package-test seam for the
-// activation check-to-writer-lock interval. Production leaves it nil.
-var checkpointGroupGenericOpenAfterPrecheckHook func()
-var checkpointGroupGenericCreateAfterPrecheckHook func()
+// checkpointGroupGenericOpenBeforeNamespaceHook is a package-test seam for the
+// activation-to-generic-namespace admission race. Production leaves it nil.
+var checkpointGroupGenericOpenBeforeNamespaceHook func()
+var checkpointGroupGenericCreateBeforeNamespaceHook func()
 
 // collectionOpenConfig threads the decision resolver into the shared open path.
 // Standalone Open leaves every field zero.
@@ -50,11 +50,8 @@ func createCollection(
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return nil, err
-	}
-	if checkpointGroupGenericCreateAfterPrecheckHook != nil {
-		checkpointGroupGenericCreateAfterPrecheckHook()
+	if checkpointGroupGenericCreateBeforeNamespaceHook != nil {
+		checkpointGroupGenericCreateBeforeNamespaceHook()
 	}
 	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
 	if err != nil {
@@ -70,9 +67,6 @@ func createCollection(
 			_ = storeio.UnlockWriter(file)
 		}
 	}()
-	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-		return nil, err
-	}
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -129,11 +123,8 @@ func openCollection(
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
 	if !cfg.checkpointGroupRecovery && !cfg.checkpointGroupNamespaceHeld {
-		if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
-			return nil, err
-		}
-		if checkpointGroupGenericOpenAfterPrecheckHook != nil {
-			checkpointGroupGenericOpenAfterPrecheckHook()
+		if checkpointGroupGenericOpenBeforeNamespaceHook != nil {
+			checkpointGroupGenericOpenBeforeNamespaceHook()
 		}
 	}
 	var releaseNamespace func()
@@ -154,11 +145,11 @@ func openCollection(
 			_ = storeio.UnlockWriter(file)
 		}
 	}()
-	// Close the check-to-lock interval. A first activation publishes the
-	// certificate before attaching its in-memory owner; any opener admitted
-	// before that rename must observe the certificate once it obtains the
-	// collection writer lock and still fail before recovery.
-	if !cfg.checkpointGroupRecovery {
+	// A catalog-held opener already owns the process namespace lease but still
+	// proves that this caller descriptor names an entry in the pinned catalog
+	// directory. A standalone opener performed the same proof atomically inside
+	// acquireCheckpointGroupGenericNamespace and retains that lease here.
+	if !cfg.checkpointGroupRecovery && cfg.checkpointGroupNamespaceHeld {
 		if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
 			return nil, err
 		}

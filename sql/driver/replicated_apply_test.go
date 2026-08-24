@@ -370,16 +370,32 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 		Binding: base.Binding, ApplyFormat: ReplicatedApplyFormat,
 		MaxSessions: options.MaxSessions, RetryWindow: options.RetryWindow,
 	}
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("uninitialized capacity profile = %+v, %v; want %+v", got, err, want)
+	checkpoint := uint64(0)
+	assertProfile := func(label string, want ReplicatedApplyCapacityProfile, maxCheckpoint uint64) {
+		t.Helper()
+		got, err := claim.CapacityQualificationProfile()
+		if err != nil {
+			t.Fatalf("%s capacity profile: %v", label, err)
+		}
+		if got.CheckpointApplied < checkpoint || got.CheckpointApplied > maxCheckpoint ||
+			got.CheckpointApplied > got.Applied {
+			t.Fatalf(
+				"%s checkpoint cut = %d, want monotonic [%d,%d] at applied %d",
+				label, got.CheckpointApplied, checkpoint, maxCheckpoint, got.Applied,
+			)
+		}
+		checkpoint = got.CheckpointApplied
+		got.CheckpointApplied = 0
+		if got != want {
+			t.Fatalf("%s capacity profile = %+v; want %+v", label, got, want)
+		}
 	}
+	assertProfile("uninitialized", want, 0)
 	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
 	want.Initialized, want.Applied = true, 1
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("bootstrap capacity profile = %+v, %v; want %+v", got, err, want)
-	}
+	assertProfile("bootstrap", want, 0)
 
 	document := []byte(`{"id":"capacity"}`)
 	key := testReplicatedApplyKey(t, database, document)
@@ -392,9 +408,10 @@ func TestReplicatedApplyCapacityQualificationProfile(t *testing.T) {
 	}
 	want.Applied, want.SessionCount, want.SessionSlotCount = 3, 1, 2
 	want.SessionEpochHighWater = epoch
-	if got, err := claim.CapacityQualificationProfile(); err != nil || got != want {
-		t.Fatalf("applied capacity profile = %+v, %v; want %+v", got, err, want)
-	}
+	// Pressure is deliberately a pre-publication barrier. Platform allocation
+	// geometry may make it certify either earlier prefix, but never the just-
+	// published index 3 transition and never a cut behind the prior observation.
+	assertProfile("applied", want, 2)
 
 	view, err := replication.OpenCommand(command)
 	if err != nil {
@@ -1646,7 +1663,11 @@ func TestReplicatedApplyClaimConnectorLifetime(t *testing.T) {
 
 func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing.T) {
 	_, database, binding, _ := prepareReplicatedTestRoot(t, "observer-unknown", false)
-	restore := durable.InstallTxnMarkerSyncFaultForFacadeTest()
+	// Bootstrap and session-open consume the first two zero-Sync group decision
+	// appends. Fault the user mutation's append: no marker Sync exists on the
+	// steady path, and adding one here would invalidate the group durability
+	// contract this regression is meant to exercise.
+	restore := durable.InstallTxnMarkerAppendFaultForFacadeTest(2)
 	t.Cleanup(restore)
 	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
 	claim, _, err := database.OpenReplicatedApply(
@@ -1671,7 +1692,7 @@ func TestReplicatedApplyObserverConservativelyPublishesUnknownOutcome(t *testing
 	clock := &database.connector.db.tables["docs"].conflicts
 	before := clock.observe()
 	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(3), command); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-		t.Fatalf("decision-sync apply = %v, want unknown outcome", err)
+		t.Fatalf("decision-append apply = %v, want unknown outcome", err)
 	}
 	if after := clock.observe(); after <= before {
 		t.Fatalf("unknown publication did not advance conflict clock: before=%d after=%d",

@@ -227,9 +227,14 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		!bytes.Equal(certBootstrap, m.bootstrap) || !m.initialized ||
 		certificate.Manifest.State.Binding != m.binding ||
 		!bytes.Equal(certificate.Manifest.UserCollection, []byte(m.userName)) ||
+		certificate.Manifest.UserRows != m.user.Collection.Len() ||
 		certificate.Manifest.State.BootstrapDigest != m.bootstrapDigest ||
 		!equalStateExceptSnapshotBaseDigest(certificate.Manifest.State, m.state) {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+	}
+	imageDigest, imageErr := m.snapshotBaseImageDigest()
+	if imageErr != nil || certificate.Manifest.ImageDigest != imageDigest {
+		return raftmodel.Publication{}, m.fail(errors.Join(ErrSnapshotBase, imageErr))
 	}
 	switch m.state.SnapshotBaseDigest {
 	case certificate.Digest:
@@ -244,6 +249,36 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	default:
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
+}
+
+func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
+	if m == nil || m.user.Collection == nil {
+		return [32]byte{}, ErrSnapshotBase
+	}
+	currentGeneration := m.user.Collection.Generation()
+	if currentGeneration != 0 && m.openedImageApplied == m.state.Applied &&
+		m.openedImageGeneration == currentGeneration &&
+		m.openedImageDigest != ([32]byte{}) {
+		return m.openedImageDigest, nil
+	}
+	snapshot, err := m.user.Collection.Snapshot()
+	if err != nil {
+		return [32]byte{}, err
+	}
+	generation := snapshot.Generation()
+	digest, scanErr := canonicalImageDigest(
+		m.userName, m.user.Validation, m.user.ValidationDigest,
+		m.user.Validator, snapshot, nil,
+	)
+	closeErr := snapshot.Close()
+	if scanErr != nil || closeErr != nil || generation == 0 ||
+		m.user.Collection.Generation() != generation {
+		return [32]byte{}, errors.Join(ErrInconsistentSnapshot, scanErr, closeErr)
+	}
+	m.openedImageDigest = digest
+	m.openedImageApplied = m.state.Applied
+	m.openedImageGeneration = generation
+	return digest, nil
 }
 
 // AdmitCommand performs the complete non-reserving pre-proposal check.
@@ -1284,6 +1319,13 @@ func (m *Machine) persistTransition(
 	}
 	if err != nil {
 		return err
+	}
+	if len(changes) == 0 && m.openedImageGeneration != 0 &&
+		m.user.Collection.Generation() == m.openedImageGeneration {
+		m.openedImageApplied = next.Applied
+	} else {
+		m.openedImageApplied = 0
+		m.openedImageGeneration = 0
 	}
 	m.state = next
 	if m.binding.Distribution != next.Binding.Distribution {

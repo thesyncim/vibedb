@@ -26,8 +26,43 @@ func OpenCollectionsWithCheckpointGroup(
 	names []string,
 	options CheckpointGroupOptions,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
+	return openCollectionsWithCheckpointGroup(
+		dir, txnOptions, requests, names, "", options,
+	)
+}
+
+// OpenCollectionsWithSeededCheckpointGroup is the explicit crash-recovery
+// entry point for child-image activation. Only when the certificate is absent
+// may seedMember be empty while another exact fixed member is non-empty; the
+// marker and every journal must still be clean. No collection is replayed in
+// that interval, and the returned ErrCheckpointGroupMissing remains the
+// caller's non-serving seed-pending signal.
+func OpenCollectionsWithSeededCheckpointGroup(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+	names []string,
+	seedMember string,
+	options CheckpointGroupOptions,
+) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
+	if seedMember == "" {
+		return nil, nil, nil, fmt.Errorf("%w: empty seed member", ErrTxnParticipant)
+	}
+	return openCollectionsWithCheckpointGroup(
+		dir, txnOptions, requests, names, seedMember, options,
+	)
+}
+
+func openCollectionsWithCheckpointGroup(
+	dir string,
+	txnOptions TxnLogOptions,
+	requests []TransactionCollectionOpen,
+	names []string,
+	seedPendingMember string,
+	options CheckpointGroupOptions,
+) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	if len(requests) != len(names) || len(requests) == 0 ||
-		len(requests) > storeio.TxnMarkerMaxParticipants {
+		len(requests) > checkpointGroupMaxMembers {
 		return nil, nil, nil, fmt.Errorf(
 			"%w: checkpoint request/name membership", ErrTxnParticipant,
 		)
@@ -54,8 +89,10 @@ func OpenCollectionsWithCheckpointGroup(
 	defer releaseNamespace()
 	certificateFile, certificate, err := openCheckpointGroupCertificate(log)
 	if errors.Is(err, os.ErrNotExist) {
-		if cleanErr := validateMissingCheckpointGroupActivation(log, requests); cleanErr != nil {
-			return nil, nil, nil, cleanErr
+		if cleanErr := validateMissingCheckpointGroupActivation(
+			log, requests, names, seedPendingMember,
+		); cleanErr != nil {
+			return nil, nil, nil, errors.Join(cleanErr, log.Close())
 		}
 		return nil, nil, nil, ErrCheckpointGroupMissing
 	}
@@ -256,7 +293,29 @@ func OpenCollectionsWithCheckpointGroup(
 func validateMissingCheckpointGroupActivation(
 	log *TxnLog,
 	requests []TransactionCollectionOpen,
+	names []string,
+	seedPendingMember string,
 ) error {
+	if len(requests) != len(names) {
+		return fmt.Errorf("%w: missing-certificate membership", ErrCheckpointGroupCorrupt)
+	}
+	seedIndex := -1
+	seenNames := make(map[string]struct{}, len(names))
+	for i, name := range names {
+		if name == "" {
+			return fmt.Errorf("%w: empty missing-certificate member name", ErrCheckpointGroupCorrupt)
+		}
+		if _, duplicate := seenNames[name]; duplicate {
+			return fmt.Errorf("%w: duplicate missing-certificate member name", ErrCheckpointGroupCorrupt)
+		}
+		seenNames[name] = struct{}{}
+		if name == seedPendingMember {
+			seedIndex = i
+		}
+	}
+	if seedPendingMember != "" && seedIndex < 0 {
+		return fmt.Errorf("%w: seed member is outside missing-certificate membership", ErrCheckpointGroupCorrupt)
+	}
 	recovery, err := loadDatabaseTxnRecoveryFromLog(log, requests)
 	if err != nil {
 		return fmt.Errorf("%w: missing certificate has recovery state: %v", ErrCheckpointGroupCorrupt, err)
@@ -309,7 +368,8 @@ func validateMissingCheckpointGroupActivation(
 			)
 		}
 		collections = append(collections, collection)
-		if collection.Len() != 0 || collection.journal == nil || collection.journal.Cursor() != 0 {
+		if (seedPendingMember == "" || i == seedIndex) && collection.Len() != 0 ||
+			collection.journal == nil || collection.journal.Cursor() != 0 {
 			return errors.Join(
 				fmt.Errorf("%w: missing certificate beside non-empty member %d", ErrCheckpointGroupCorrupt, i),
 				cleanup(collections),

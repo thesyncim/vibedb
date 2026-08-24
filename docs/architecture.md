@@ -147,11 +147,14 @@ rechecks that image on reopen before a fixed-size cutover certificate can be
 issued. The certificate binds every non-retained child image. A sealed stage
 can initialize the standard replicated-state snapshot base in place without a
 second durable user-row copy. The SQL driver holds an exclusive non-serving
-claim while it receives the child. Activation converts that claim to the
-normal replicated apply owner without changing the user collection
-incarnation. A planned WAL identity breaks the bootstrap cycle. The final WAL
-is allocated once from the newer snapshot base and is rechecked against the
-SQL binding before the existing Raft runtime can adopt it.
+claim while it receives the child. Activation converts that claim to a
+base-pending replicated apply owner without changing the user collection
+incarnation. That owner rejects proposal, apply, lookup, export, and SQL
+serving; it accepts only the exact authenticated snapshot base. Transaction 2
+certifies the base binding before the ordinary replicated apply owner is
+exposed. A planned WAL identity breaks the bootstrap cycle. The final WAL is
+allocated once from the newer snapshot base and is rechecked against the SQL
+binding before the existing Raft runtime can adopt it.
 
 The certificate is evidence, not topology authority. Retained cleanup plans
 bounded ordered key batches, checkpoints each batch before proposal, and

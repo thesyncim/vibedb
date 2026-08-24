@@ -18,10 +18,13 @@ and apply profile. The claim accepts verified artifact chunks and consecutive
 tail batches. It does not expose the collection or the state machine.
 
 `Activate` requires a sealed cutover certificate. It publishes or reuses the
-hidden apply collection, initializes the replicated state row, and transfers
-the exclusive connector reference to `ReplicatedApply`. It does not copy the
-user rows or replace their storage incarnation. SQL sessions remain refused
-until a runtime claims the apply owner or the owner closes explicitly.
+hidden apply collection, attaches both collections to one seeded checkpoint
+group, certifies the single replicated-state row, and transfers the exclusive
+connector reference to a base-pending `ReplicatedApply`. It does not copy the
+user rows or replace their storage incarnation. The base-pending owner accepts
+only the exact authenticated snapshot base; proposal, apply, lookup, export,
+and SQL serving remain refused until transaction 2 certifies that binding and a
+runtime claims the ordinary apply owner.
 
 An invalid artifact-output profile fails before hidden storage publication. An
 uncertain catalog publication returns the intended apply identity and keeps the
@@ -149,15 +152,22 @@ Release.
 
 An invariant or corruption error poisons the machine until reopen.
 
-Range-split child activation initializes an empty session image and seeds the
-child `SessionEpochHighWater` to the certified source cut's applied index. This
-is the deliberate exception to the normal Open-issued high-water: it fences
-every source-issued token that could predate the child, so a delayed mutation
-cannot create a child-local session. The first successful child Open is ordered
-after that cut and receives its later child apply index. The current artifact
-still does not transfer retained headers or slots. It therefore cannot preserve
-retries whose `RetryHome` moves to a non-retained child or reconstruct an old
-completion from the child's new immutable binding. The split controller
+Range-split child activation authenticates the sealed user image once and
+seeds its empty hidden session image through the checkpoint group. The seed
+transaction writes one state row, certifies and folds it, and returns a compact
+snapshot base that references the already durable image rather than copying it.
+The activation claim remains non-serving and rejects proposal, apply,
+completion lookup, and snapshot export until the exact returned base is
+installed and durably bound.
+
+The child `SessionEpochHighWater` is the certified source cut's applied index.
+This is the deliberate exception to the normal Open-issued high-water: it
+fences every source-issued token that could predate the child, so a delayed
+mutation cannot create a child-local session. The first successful child Open
+is ordered after that cut and receives its later child apply index. The current
+artifact still does not transfer retained headers or slots. It therefore cannot
+preserve retries whose `RetryHome` moves to a non-retained child or reconstruct
+an old completion from the child's new immutable binding. The split controller
 continues to require the source session image to be empty before sealing and
 publication; serving split retries need a certified transfer contract before
 that gate can be relaxed.

@@ -299,6 +299,46 @@ func (l *TxnLog) EnsureMinted() error {
 	return l.verifyMarkerDirectoryLocked()
 }
 
+// QualifyMinted proves that the retained txn.vtm descriptor, pinned directory,
+// and complete registered catalog still name the exact live files opened by
+// this log. Unlike EnsureMinted it is strictly read-only: an absent marker is
+// an error, and an active CheckpointGroup is authenticated through its fixed
+// certificate and membership instead of being treated as permission to borrow
+// the group's mutation lane.
+func (l *TxnLog) QualifyMinted() error {
+	if l == nil {
+		return fmt.Errorf("vibedb: transaction log directory is not open")
+	}
+	l.commitMu.Lock()
+	if l.checkpointGroupRetired {
+		l.commitMu.Unlock()
+		return ErrCheckpointGroupOwned
+	}
+	group := l.checkpointGroup
+	if group != nil {
+		// Preserve the group lock order. Close owns g.mu before commitMu and
+		// closes the certificate descriptor after releasing commitMu, so a
+		// qualifier must dispatch without retaining commitMu and let the group
+		// reacquire both locks in that same order.
+		l.commitMu.Unlock()
+		return group.qualifyLog(l)
+	}
+	defer l.commitMu.Unlock()
+	if l.poison != nil {
+		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, l.poison)
+	}
+	if l.root == nil || l.rootInfo == nil || l.marker == nil {
+		return fmt.Errorf("vibedb: transaction log marker is not open")
+	}
+	if err := l.verifyRootDirectoryLocked(); err != nil {
+		return err
+	}
+	if err := l.verifyMarkerDirectoryLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func syncTxnLogDirectory(root *os.Root) error {
 	if runtime.GOOS == "windows" {
 		return nil

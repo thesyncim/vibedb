@@ -198,6 +198,13 @@ type database struct {
 	// It is recovered before any collection becomes reachable and gracefully
 	// checkpointed before collection/TxnLog close.
 	checkpointGroup *durable.CheckpointGroup
+	// replicatedSeedRecovery authorizes only the exact child-stage reopen path
+	// to inspect a missing certificate beside a clean staged user image.
+	// replicatedSeedPending keeps that image non-serving until a sealed stage
+	// proves the seed and installs its exact immutable snapshot base through the
+	// group-owned same-index transition.
+	replicatedSeedRecovery bool
+	replicatedSeedPending  bool
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -274,8 +281,10 @@ func openDatabaseWithShardStorePolicy(
 		path: absolute, dataDir: absolute + ".tables", lockFile: lockFile,
 		catalog: catalogFile{Version: catalogVersion, Tables: make(map[string]*tableMeta)},
 		tables:  make(map[string]*table), syncDir: syncDir,
-		layoutEpoch: newCatalogLayoutEpoch(nil, nil),
-		txnLimits:   defaultDriverTxnLimits(),
+		layoutEpoch:            newCatalogLayoutEpoch(nil, nil),
+		txnLimits:              defaultDriverTxnLimits(),
+		replicatedSeedRecovery: shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
+		replicatedSeedPending:  shardPolicy.mode == shardStoreOpenReplicatedChildStageResume,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
 	opened := false
@@ -426,7 +435,7 @@ func openDatabaseWithShardStorePolicy(
 			d.catalog.ReplicatedApply.identity() != shardPolicy.expectedReplicatedApply {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyMismatch, absolute)
 		}
-	case shardStoreOpenReplicatedApplySettlement:
+	case shardStoreOpenReplicatedApplySettlement, shardStoreOpenReplicatedChildStageResume:
 		if !exists || d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)
 		}
@@ -577,7 +586,7 @@ func openDatabaseWithShardStorePolicy(
 		if err := validateOpenedReplicatedCatalog(d); err != nil {
 			return nil, fmt.Errorf("vibedb: open replicated SQL catalog: %w", err)
 		}
-		if err := d.txnLog.EnsureMinted(); err != nil {
+		if err := d.txnLog.QualifyMinted(); err != nil {
 			return nil, fmt.Errorf(
 				"vibedb: qualify replicated transaction marker: %w", err,
 			)
@@ -736,12 +745,22 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 				))
 			}
 		}
-		collections, txnLog, checkpointGroup, err =
-			durable.OpenCollectionsWithCheckpointGroup(
-				d.dataDir, txnOptions, requests, groupNames,
-				durable.CheckpointGroupOptions{},
-			)
+		if d.replicatedSeedRecovery {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithSeededCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					replicatedstate.SystemCollectionName,
+					durable.CheckpointGroupOptions{},
+				)
+		} else {
+			collections, txnLog, checkpointGroup, err =
+				durable.OpenCollectionsWithCheckpointGroup(
+					d.dataDir, txnOptions, requests, groupNames,
+					durable.CheckpointGroupOptions{},
+				)
+		}
 		if errors.Is(err, durable.ErrCheckpointGroupMissing) {
+			d.replicatedSeedPending = d.replicatedSeedRecovery
 			collections, txnLog, err = durable.OpenCollectionsWithTransactions(
 				d.dataDir, txnOptions, requests,
 			)
@@ -775,6 +794,9 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 	}
 	d.txnLog = txnLog
 	d.checkpointGroup = checkpointGroup
+	if checkpointGroup != nil && checkpointGroup.SeedActivationPending() {
+		d.replicatedSeedPending = true
+	}
 	for i := range opened {
 		entry := opened[i]
 		collection := collections[i]
