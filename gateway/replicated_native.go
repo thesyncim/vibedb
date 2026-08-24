@@ -21,10 +21,11 @@ const (
 )
 
 var (
-	ErrReplicatedRoute      = errors.New("gateway: invalid replicated shard route")
-	ErrReplicatedLeader     = errors.New("gateway: replicated shard has no reachable leader")
-	ErrReplicatedDial       = errors.New("gateway: replicated shard dial is not configured")
-	ErrReplicatedReadBehind = errors.New("gateway: replica is below the requested applied index")
+	ErrReplicatedRoute           = errors.New("gateway: invalid replicated shard route")
+	ErrReplicatedLeader          = errors.New("gateway: replicated shard has no reachable leader")
+	ErrReplicatedDial            = errors.New("gateway: replicated shard dial is not configured")
+	ErrReplicatedReadBehind      = errors.New("gateway: replica is below the requested applied index")
+	ErrReplicatedReadBufferBound = errors.New("gateway: point-read response bound is below the relation limit")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -193,6 +194,10 @@ func (executor *ReplicatedExecutor) ReadPoint(
 			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
 				return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
 			}
+			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
+				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound {
+				return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+			}
 			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
 			preferred = 0
 		default:
@@ -263,6 +268,9 @@ func (e *ReplicatedRefusalError) Unwrap() error {
 	}
 	if e.Code == shardservice.ReplicatedRefusalReadBehind {
 		return ErrReplicatedReadBehind
+	}
+	if e.Code == shardservice.ReplicatedRefusalReadBufferBound {
+		return ErrReplicatedReadBufferBound
 	}
 	return ErrReplicatedLeader
 }
@@ -562,7 +570,8 @@ func validReplicatedPreAdmissionRefusal(
 		shardservice.ReplicatedRefusalAdmissionBound,
 		shardservice.ReplicatedRefusalProposalRefused,
 		shardservice.ReplicatedRefusalUnavailable,
-		shardservice.ReplicatedRefusalReadBehind:
+		shardservice.ReplicatedRefusalReadBehind,
+		shardservice.ReplicatedRefusalReadBufferBound:
 		return true
 	default:
 		return false

@@ -243,6 +243,15 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	followerLease.Release()
 	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
 		Fence: followerState.Fence(), Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  len(followerRead.Value),
+	}); !errors.Is(err, replicatedstate.ErrReadBufferBound) {
+		t.Fatalf("request-relative response bound error=%v", err)
+	} else if lease != nil {
+		t.Fatal("response-bound refusal returned a lease")
+	}
+	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: followerState.Fence(), Relation: 1, Key: key,
 		MinimumApplied: followerRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes,
 	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
@@ -281,6 +290,15 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
+	if _, lease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
+		Fence: leaderState.Fence(), Relation: 1, Key: key,
+		MinimumApplied: linearRead.Applied + 1,
+		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
+	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
+		t.Fatalf("future ReadIndex floor error=%v", err)
+	} else if lease != nil {
+		t.Fatal("future ReadIndex floor returned a lease")
+	}
 
 	// Kill the exact serving leader after its acknowledged response. Remaining
 	// voters elect another leader and replaying identical bytes returns the same

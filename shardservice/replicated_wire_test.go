@@ -56,6 +56,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		{Kind: ReplicatedOutcomeUnknown, HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
 			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: state, Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},

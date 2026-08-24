@@ -290,6 +290,9 @@ func (server *ReplicatedServer) executeReplicated(
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
 				HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBufferBound):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+				HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrIngressFull),
 			errors.Is(readErr, raftservice.ErrPendingReadsFull):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,

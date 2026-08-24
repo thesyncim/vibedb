@@ -54,14 +54,15 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	owner := &Owner{pendingReads: make(map[[16]byte]*readDelivery)}
 	var contextKey [16]byte
 	contextKey[0], contextKey[15] = 3, 9
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	source := &ownerTestReadSource{}
+	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 23}
 	owner.pendingReads[contextKey] = delivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 17,
 	}}})
 	select {
 	case reply := <-delivery.reply:
-		if reply.err != nil || reply.read.minimumApplied != 17 {
+		if reply.err != nil || reply.read.minimumApplied != 23 || reply.read.source != source {
 			t.Fatalf("reply=%+v", reply)
 		}
 	default:
@@ -69,6 +70,16 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	}
 	if len(owner.pendingReads) != 0 {
 		t.Fatal("settled read retained")
+	}
+
+	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source, minimumApplied: 11}
+	owner.pendingReads[contextKey] = barrierDelivery
+	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+		Context: contextKey[:], Index: 19,
+	}}})
+	if reply := <-barrierDelivery.reply; reply.err != nil ||
+		reply.read.minimumApplied != 19 || reply.read.source != source {
+		t.Fatalf("barrier-ahead reply=%+v", reply)
 	}
 
 	abandoned := &readDelivery{reply: make(chan ownerReply, 1)}
@@ -82,23 +93,99 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	}
 }
 
-func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
-	owner := &Owner{started: true, limits: Limits{
-		MaxPendingReadItems: 1, MaxPendingReadBytes: 8,
+type ownerTestReadSource struct {
+	result replicatedstate.PointReadResult
+	err    error
+}
+
+func (source *ownerTestReadSource) PointReadInto(
+	replication.RelationID, []byte, uint64, int, []byte,
+) (replicatedstate.PointReadResult, error) {
+	return source.result, source.err
+}
+
+func TestPointReadResponseBudgetSaturatesAcrossLiveLeases(t *testing.T) {
+	const maximum = 16
+	charge, ok := pointReadResponseCharge(maximum)
+	if !ok {
+		t.Fatal("response charge rejected")
+	}
+	group := peerServerTestGroup()
+	serving := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11},
+		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 5}
+	source := &ownerTestReadSource{result: replicatedstate.PointReadResult{
+		Fence: replicatedstate.SnapshotFence{Binding: replicatedstate.Binding{
+			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+			TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			AllocationGeneration:  serving.AllocationGeneration,
+			ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+			ActivePolicyGeneration: serving.Command.ActivePolicyGeneration,
+			ProtectionEpoch:        serving.Command.ProtectionEpoch,
+			OwnershipEpoch:         serving.Command.OwnershipEpoch,
+			SchemaGeneration:       serving.Command.SchemaGeneration,
+			RoutingVersion:         serving.Command.RoutingVersion,
+			RouteGeneration:        serving.Command.RouteGeneration,
+		}, RelationManifestDigest: serving.Command.RelationManifestDigest,
+			ReplicaSetVersion: serving.Command.ReplicaSetVersion, Applied: 9},
+		Found: true, Value: []byte{7},
 	}}
-	if err := owner.reservePendingRead(8); err != nil {
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: 16,
+		MaxPendingReadItems: 2, MaxPendingReadBytes: charge,
+	}}
+	authorize := func() {
+		request := <-owner.ingress
+		request.reply <- ownerReply{read: readAuthorization{
+			source: source, minimumApplied: request.read.minimumApplied,
+		}}
+		owner.release(request.bytes)
+	}
+	go authorize()
+	request := PointReadRequest{Fence: serving, Relation: 1, Key: []byte("k"),
+		MinimumApplied: 9, MaxValueBytes: maximum}
+	result, lease, err := owner.ReadPoint(context.Background(), request)
+	if err != nil || !result.Found || lease == nil {
+		t.Fatalf("first result=%+v lease=%T err=%v", result, lease, err)
+	}
+	if _, secondLease, err := owner.ReadPoint(context.Background(), request); !errors.Is(err, ErrPendingReadsFull) || secondLease != nil {
+		t.Fatalf("concurrent lease=%T err=%v", secondLease, err)
+	}
+	lease.Release()
+	go authorize()
+	if _, nextLease, err := owner.ReadPoint(context.Background(), request); err != nil {
+		t.Fatalf("read after release=%v", err)
+	} else {
+		nextLease.Release()
+	}
+	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
+		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
+	}
+}
+
+func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
+	charge, ok := pointReadResponseCharge(4 << 20)
+	if !ok || charge <= 2*(4<<20)+8_211 {
+		t.Fatalf("resident response charge=%d ok=%t", charge, ok)
+	}
+	owner := &Owner{started: true, limits: Limits{
+		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
+	}}
+	if err := owner.reservePendingRead(charge); err != nil {
 		t.Fatal(err)
 	}
-	lease := &pointReadLease{owner: owner, bytes: 8}
+	lease := &pointReadLease{owner: owner, bytes: charge}
 	if err := owner.reservePendingRead(1); !errors.Is(err, ErrPendingReadsFull) {
 		t.Fatalf("concurrent reservation error=%v", err)
 	}
 	lease.Release()
 	lease.Release()
-	if err := owner.reservePendingRead(8); err != nil {
+	if err := owner.reservePendingRead(charge); err != nil {
 		t.Fatalf("reservation after release=%v", err)
 	}
-	owner.releasePendingRead(8)
+	owner.releasePendingRead(charge)
 	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
 		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
 	}

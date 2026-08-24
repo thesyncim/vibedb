@@ -84,6 +84,7 @@ const (
 	ReplicatedRefusalDeterministic
 	ReplicatedRefusalUnavailable
 	ReplicatedRefusalReadBehind
+	ReplicatedRefusalReadBufferBound
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -463,7 +464,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		return response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
-			response.Refusal <= ReplicatedRefusalReadBehind
+			response.Refusal <= ReplicatedRefusalReadBufferBound
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&

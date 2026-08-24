@@ -264,6 +264,10 @@ func TestPointReadIntoUsesDenseRelationAndExactPublicationCut(t *testing.T) {
 		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrReadBehind) {
 		t.Fatalf("future applied floor error=%v", err)
 	}
+	if _, err := fixture.machine.PointReadInto(1, baseKey, publication.Applied,
+		len(baseValue), nil); !errors.Is(err, ErrReadBufferBound) {
+		t.Fatalf("request-relative bound below relation maximum error=%v", err)
+	}
 	if _, err := fixture.machine.PointReadInto(3, baseKey, publication.Applied,
 		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrInvalidCollection) {
 		t.Fatalf("unknown relation error=%v", err)

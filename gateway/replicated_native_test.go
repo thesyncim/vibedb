@@ -92,6 +92,7 @@ type pointReadClient struct {
 	states        map[string]shardservice.ReplicatedMemberState
 	readAddress   string
 	readOperation shardservice.ReplicatedOperation
+	readRefusal   shardservice.ReplicatedRefusalCode
 }
 
 func (client *pointReadClient) DoReplicated(
@@ -105,9 +106,55 @@ func (client *pointReadClient) DoReplicated(
 			HasState: true, State: state}, nil
 	}
 	client.readAddress, client.readOperation = address, request.Operation
+	refusal := client.readRefusal
+	if refusal == shardservice.ReplicatedRefusalNone && request.MinimumApplied > state.Applied {
+		refusal = shardservice.ReplicatedRefusalReadBehind
+	}
+	if refusal != shardservice.ReplicatedRefusalNone {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: refusal, HasState: true, State: state}, nil
+	}
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadFound,
 		HasState: true, State: state, ReadApplied: state.Applied,
 		Value: []byte{}}, nil
+}
+
+func TestReplicatedPointReadReturnsTypedBoundsWithoutLeaderMisclassification(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	for address, state := range states {
+		state.Applied, state.Commit, state.CheckpointApplied = 10, 10, 9
+		states[address] = state
+	}
+	for _, test := range []struct {
+		name      string
+		read      ReplicatedPointRead
+		refusal   shardservice.ReplicatedRefusalCode
+		want      error
+		operation shardservice.ReplicatedOperation
+	}{{name: "future-applied-floor", read: ReplicatedPointRead{
+		Relation: 1, Key: []byte{0, 1}, MinimumApplied: 11,
+		MaxValueBytes: 1024, Linearizable: true,
+	}, want: ErrReplicatedReadBehind, operation: shardservice.ReplicatedReadLeader},
+		{name: "response-buffer", read: ReplicatedPointRead{
+			Relation: 1, Key: []byte{0, 1}, MinimumApplied: 9, MaxValueBytes: 8,
+		}, refusal: shardservice.ReplicatedRefusalReadBufferBound,
+			want: ErrReplicatedReadBufferBound, operation: shardservice.ReplicatedReadFollower}} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &pointReadClient{states: states, readRefusal: test.refusal}
+			executor, err := NewReplicatedExecutor(client, 3, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.ReadPoint(context.Background(), route, test.read)
+			if !errors.Is(err, test.want) || errors.Is(err, ErrReplicatedLeader) ||
+				errors.Is(err, ErrReplicatedRoute) {
+				t.Fatalf("bound error=%T %v", err, err)
+			}
+			if client.readOperation != test.operation {
+				t.Fatalf("operation=%d", client.readOperation)
+			}
+		})
+	}
 }
 
 func TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict(t *testing.T) {

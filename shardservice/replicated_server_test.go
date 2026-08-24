@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 type fakeReplicatedOwner struct {
@@ -94,6 +95,30 @@ func TestReplicatedServerServesFoundEmptyReadWithoutConflatingMiss(t *testing.T)
 	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 11 ||
 		!validReplicatedResponse(response) {
 		t.Fatalf("miss response=%+v", response)
+	}
+}
+
+func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
+	state := testReplicatedServingState()
+	for _, test := range []struct {
+		name    string
+		err     error
+		refusal ReplicatedRefusalCode
+	}{{"future-applied-floor", replicatedstate.ErrReadBehind, ReplicatedRefusalReadBehind},
+		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound}} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := &fakeReplicatedOwner{state: state, readErr: test.err}
+			server := &ReplicatedServer{owner: owner}
+			request := &ReplicatedRequest{Operation: ReplicatedReadLeader,
+				Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
+				MinimumApplied: state.Status.Commit + 1, MaxValueBytes: 1024}
+			response := server.executeReplicated(context.Background(), request)
+			if response.Kind != ReplicatedRefusal || response.Refusal != test.refusal ||
+				!response.HasState || response.State.Applied != state.Status.Applied ||
+				!validReplicatedResponse(response) {
+				t.Fatalf("response=%+v", response)
+			}
+		})
 	}
 }
 

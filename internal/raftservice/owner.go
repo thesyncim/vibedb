@@ -132,9 +132,10 @@ type readAuthorization struct {
 }
 
 type readDelivery struct {
-	state  atomic.Uint32
-	reply  chan ownerReply
-	source ReadSource
+	state          atomic.Uint32
+	reply          chan ownerReply
+	source         ReadSource
+	minimumApplied uint64
 }
 
 const (
@@ -180,6 +181,28 @@ type PointReadResult struct {
 // serving boundary has finished encoding and writing the result.
 type PointReadLease interface {
 	Release()
+}
+
+const (
+	// Native read responses retain a five-byte frame header and a 277-byte
+	// fixed body in addition to the detached store value. Charge each of the
+	// two variable-sized allocations for worst-case 8 KiB allocator rounding;
+	// this keeps the resident-memory contract conservative across size classes.
+	pointReadEncodedFrameFixedBytes int64 = 5 + 277
+	pointReadAllocatorSlopBytes     int64 = 2 * ((8 << 10) - 1)
+)
+
+func pointReadResponseCharge(maximum int) (int64, bool) {
+	if maximum <= 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	fixed := pointReadEncodedFrameFixedBytes + pointReadAllocatorSlopBytes
+	payload := int64(maximum)
+	if payload > (maxInt64-fixed)/2 {
+		return 0, false
+	}
+	return payload*2 + fixed, true
 }
 
 type pointReadLease struct {
@@ -551,6 +574,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			break
 		}
 		request.read.delivery.source = member.read
+		request.read.delivery.minimumApplied = request.read.minimumApplied
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
@@ -591,7 +615,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 		delete(owner.pendingReads, key)
 		reply := ownerReply{err: outcome.Err}
 		if outcome.Err == nil {
-			reply.read.minimumApplied = outcome.Barrier.Index
+			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
 			// Source was authenticated at admission and remains bound to the
 			// immutable owner member for this allocation.
 			reply.read.source = delivery.source
@@ -691,8 +715,12 @@ func (owner *Owner) ReadPoint(
 		return PointReadResult{}, nil, ErrInvalidOwner
 	}
 	// The server briefly owns the detached store result and its encoded frame.
-	// Charge both copies before either can exist.
-	responseCharge := int64(request.MaxValueBytes) * 2
+	// Charge both rounded allocations and exact wire overhead before either can
+	// exist.
+	responseCharge, ok := pointReadResponseCharge(request.MaxValueBytes)
+	if !ok {
+		return PointReadResult{}, nil, ErrInvalidOwner
+	}
 	if err := owner.reservePendingRead(responseCharge); err != nil {
 		return PointReadResult{}, nil, err
 	}
