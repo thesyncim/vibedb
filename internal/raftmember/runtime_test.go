@@ -20,6 +20,9 @@ import (
 type runtimeFixture struct {
 	runtime  *Runtime
 	wal      *raftstore.Store
+	walPath  string
+	walKey   raftstore.Key
+	walID    raftstore.Identity
 	database *sqldriver.Database
 	apply    *sqldriver.ReplicatedApply
 	base     sqldriver.ReplicatedShardStoreIdentity
@@ -90,7 +93,8 @@ func newRuntimeFixtureWithOptions(
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
 	return runtimeFixture{
-		runtime: runtime, wal: wal, database: database, apply: apply, base: base,
+		runtime: runtime, wal: wal, walPath: walPath, walKey: key, walID: identity,
+		database: database, apply: apply, base: base,
 		applyID: applyID, sqlPath: sqlPath, options: options,
 	}
 }

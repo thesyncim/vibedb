@@ -1,0 +1,420 @@
+package raftmember
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"google.golang.org/protobuf/proto"
+)
+
+type runtimeReplayImage struct {
+	state       []byte
+	publication raftmodel.Publication
+	system      []byte
+	user        []byte
+}
+
+type runtimeReplayHandles struct {
+	runtime  *Runtime
+	wal      *raftstore.Store
+	database *sqldriver.Database
+	apply    *sqldriver.ReplicatedApply
+}
+
+func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T) {
+	fixture := newRuntimeFixture(t, 247, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	epoch := openRuntimeTestSession(t, fixture.runtime, fixture.apply, fixture.base)
+	key, ok := orderedkey.AppendJSONString(nil, []byte(`"counter"`), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode replay key")
+	}
+	prefixCommand := testApplyCommand(
+		fixture.base, epoch, 2, key, []byte(`{"id":"counter","value":0}`),
+	)
+	if err := fixture.runtime.Propose(prefixCommand); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	prefixPublication, err := fixture.runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixPublication.Applied <= 1 ||
+		fixture.apply.CheckpointAppliedIndex() >= prefixPublication.Applied {
+		t.Fatalf(
+			"prefix command did not leave a visible uncertified cut: publication %d checkpoint %d",
+			prefixPublication.Applied, fixture.apply.CheckpointAppliedIndex(),
+		)
+	}
+	prefixCompletion := captureRuntimeReplayCompletion(t, fixture.apply, prefixCommand)
+	prefixImage := captureRuntimeReplayImage(t, fixture.apply, fixture.base.UserTable)
+	if fixture.apply.CheckpointAppliedIndex() != prefixPublication.Applied {
+		t.Fatalf(
+			"prefix artifact cut checkpoint = %d, want %d",
+			fixture.apply.CheckpointAppliedIndex(), prefixPublication.Applied,
+		)
+	}
+
+	// The artifact cut establishes the exact durable SQL prefix. Commit one
+	// more user/session transition through the real WAL without advancing that
+	// certificate, then copy the still-live SQL files as the crash image.
+	suffixOne := testApplyCommand(
+		fixture.base, epoch, 3, key, []byte(`{"id":"counter","value":1}`),
+	)
+	if err := fixture.runtime.Propose(suffixOne); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	finalPublication, err := fixture.runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalPublication.Applied != prefixPublication.Applied+1 {
+		t.Fatalf("visible suffix applied = %d, want %d",
+			finalPublication.Applied, prefixPublication.Applied+1)
+	}
+	assertRuntimeReplayStatus(t, fixture.runtime,
+		finalPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
+	retention, err := fixture.runtime.WALRetentionInput()
+	if err != nil || retention != prefixPublication.Applied {
+		t.Fatalf("source WAL retention cut = %d, %v", retention, err)
+	}
+	hardState, _, err := fixture.wal.InitialState()
+	if err != nil || hardState.GetCommit() != finalPublication.Applied {
+		t.Fatalf("source WAL commit = %d, %v", hardState.GetCommit(), err)
+	}
+
+	crashSQLPath := filepath.Join(t.TempDir(), "crash.vdb")
+	copyRuntimeReplayPath(t, fixture.sqlPath, crashSQLPath)
+	copyRuntimeReplayPath(t, fixture.sqlPath+".tables", crashSQLPath+".tables")
+	// Capture the exact expected logical result only after cloning the crash
+	// image. A full artifact cut may certify the live source as an intentional
+	// side effect, but it cannot alter the already-copied old-certificate image.
+	suffixOneCompletion := captureRuntimeReplayCompletion(t, fixture.apply, suffixOne)
+	finalImage := captureRuntimeReplayImage(t, fixture.apply, fixture.base.UserTable)
+	if err := fixture.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery := openRuntimeReplayHandles(t, crashSQLPath, fixture)
+
+	// Certificate-authoritative SQL recovery must discard the copied visible
+	// suffix before Runtime construction. The durable WAL still commits it.
+	if recovery.apply.Applied() != prefixPublication.Applied ||
+		recovery.apply.CheckpointAppliedIndex() != prefixPublication.Applied {
+		t.Fatalf(
+			"crash recovery cuts = applied %d checkpoint %d, want %d",
+			recovery.apply.Applied(), recovery.apply.CheckpointAppliedIndex(),
+			prefixPublication.Applied,
+		)
+	}
+	assertRuntimeReplayImage(t,
+		captureRuntimeReplayImage(t, recovery.apply, fixture.base.UserTable), prefixImage,
+	)
+	assertRuntimeReplayBytes(
+		t, "recovered prefix completion",
+		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
+	)
+	assertRuntimeReplayCompletionMissing(t, recovery.apply, suffixOne)
+	hardState, _, err = recovery.wal.InitialState()
+	if err != nil || hardState.GetCommit() != finalPublication.Applied {
+		t.Fatalf("recovery WAL commit = %d, %v", hardState.GetCommit(), err)
+	}
+
+	recoveryRuntime := recovery.adopt(t)
+	assertRuntimeReplayStatus(t, recoveryRuntime,
+		prefixPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
+	assertRuntimeReplayPublication(t, recoveryRuntime, prefixPublication)
+
+	drainRuntime(t, recoveryRuntime, nil)
+	afterReplay := assertRuntimeReplayStatus(t, recoveryRuntime,
+		finalPublication.Applied, finalPublication.Applied, prefixPublication.Applied)
+	assertRuntimeReplayPublication(t, recoveryRuntime, finalPublication)
+	retention, err = recoveryRuntime.WALRetentionInput()
+	if err != nil || retention != prefixPublication.Applied {
+		t.Fatalf("replayed WAL retention cut = %d, %v", retention, err)
+	}
+
+	// A second drain must be a true idle observation. Full system/user image
+	// equality also proves the replay did not advance the session ring twice.
+	idle, err := recoveryRuntime.DriveReady(func(OutboundMessage) error { return nil })
+	if err != nil || idle.Progressed() {
+		t.Fatalf("post-replay DriveReady = %+v, %v", idle, err)
+	}
+	afterIdle, err := recoveryRuntime.Status()
+	if err != nil || afterIdle != afterReplay {
+		t.Fatalf("post-replay status = %+v, %v; want %+v", afterIdle, err, afterReplay)
+	}
+	assertRuntimeReplayBytes(
+		t, "replayed prefix completion",
+		captureRuntimeReplayCompletion(t, recovery.apply, prefixCommand), prefixCompletion,
+	)
+	assertRuntimeReplayBytes(
+		t, "replayed suffix completion",
+		captureRuntimeReplayCompletion(t, recovery.apply, suffixOne), suffixOneCompletion,
+	)
+	// The exact-image audit comes last because it may advance the checkpoint.
+	// It must not change apply/publication state, and every user and bounded
+	// session byte must equal the pre-crash source image.
+	assertRuntimeReplayImage(t,
+		captureRuntimeReplayImage(t, recovery.apply, fixture.base.UserTable), finalImage,
+	)
+	postAudit, err := recoveryRuntime.Status()
+	if err != nil || postAudit.Applied != finalPublication.Applied ||
+		postAudit.Commit != finalPublication.Applied ||
+		postAudit.CheckpointApplied < prefixPublication.Applied ||
+		postAudit.CheckpointApplied > finalPublication.Applied {
+		t.Fatalf("post-replay exact-image audit status = %+v, %v", postAudit, err)
+	}
+	assertRuntimeReplayPublication(t, recoveryRuntime, finalPublication)
+}
+
+func openRuntimeReplayHandles(
+	t testing.TB,
+	sqlPath string,
+	fixture runtimeFixture,
+) *runtimeReplayHandles {
+	t.Helper()
+	wal, err := raftstore.Open(
+		fixture.walPath, fixture.walID, testTopologyRecoveryEpoch,
+		fixture.walKey, fixture.options,
+	)
+	if err != nil {
+		t.Fatalf("open replay WAL: %v", err)
+	}
+	database, apply, err := OpenBoundSQLWithApply(
+		sqlPath, wal, testAuthorityProfile(), fixture.base, fixture.applyID,
+	)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatalf("open replay SQL: %v", err)
+	}
+	handles := &runtimeReplayHandles{wal: wal, database: database, apply: apply}
+	t.Cleanup(func() { _ = handles.close() })
+	return handles
+}
+
+func (h *runtimeReplayHandles) adopt(t testing.TB) *Runtime {
+	t.Helper()
+	runtime, err := AdoptRuntime(h.wal, h.database, h.apply)
+	if err != nil {
+		if runtime != nil {
+			_ = runtime.Close()
+		}
+		t.Fatal(err)
+	}
+	h.runtime = runtime
+	return runtime
+}
+
+func (h *runtimeReplayHandles) close() error {
+	if h.runtime != nil {
+		return h.runtime.Close()
+	}
+	return errors.Join(h.apply.Close(), h.database.Close(), h.wal.Close())
+}
+
+func captureRuntimeReplayImage(
+	t testing.TB,
+	apply *sqldriver.ReplicatedApply,
+	userTable string,
+) runtimeReplayImage {
+	t.Helper()
+	cut, err := apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatalf("capture apply image: %v", err)
+	}
+	image := runtimeReplayImage{publication: cut.Publication()}
+	image.state, err = replicatedstate.AppendState(nil, cut.State())
+	if err == nil {
+		err = cut.RangeSystem(func(key, value []byte) error {
+			image.system = appendRuntimeReplayRow(image.system, key, value)
+			return nil
+		})
+	}
+	if err == nil {
+		user, ok := cut.Collection(userTable)
+		if !ok || user == nil {
+			err = replicatedstate.ErrInconsistentSnapshot
+		} else {
+			err = user.RangeRaw(func(key, value []byte) error {
+				image.user = appendRuntimeReplayRow(image.user, key, value)
+				return nil
+			})
+		}
+	}
+	err = errors.Join(err, cut.Close())
+	if err != nil {
+		t.Fatalf("read apply image: %v", err)
+	}
+	return image
+}
+
+func appendRuntimeReplayRow(dst, key, value []byte) []byte {
+	var lengths [8]byte
+	binary.LittleEndian.PutUint32(lengths[0:4], uint32(len(key)))
+	binary.LittleEndian.PutUint32(lengths[4:8], uint32(len(value)))
+	dst = append(dst, lengths[:]...)
+	dst = append(dst, key...)
+	return append(dst, value...)
+}
+
+func assertRuntimeReplayImage(
+	t testing.TB,
+	got, want runtimeReplayImage,
+) {
+	t.Helper()
+	if !bytes.Equal(got.state, want.state) {
+		t.Fatal("replayed durable State envelope differs from the original image")
+	}
+	assertRuntimeReplayPublicationValue(t, got.publication, want.publication)
+	if !bytes.Equal(got.system, want.system) || !bytes.Equal(got.user, want.user) {
+		t.Fatal("replayed system/user rows differ from the original image")
+	}
+}
+
+func assertRuntimeReplayPublication(
+	t testing.TB,
+	runtime *Runtime,
+	want raftmodel.Publication,
+) {
+	t.Helper()
+	got, err := runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRuntimeReplayPublicationValue(t, got, want)
+}
+
+func assertRuntimeReplayStatus(
+	t testing.TB,
+	runtime *Runtime,
+	applied, commit, checkpoint uint64,
+) RuntimeStatus {
+	t.Helper()
+	status, err := runtime.Status()
+	if err != nil || status.Applied != applied || status.Commit != commit ||
+		status.CheckpointApplied != checkpoint {
+		t.Fatalf(
+			"runtime cuts = applied %d commit %d checkpoint %d, want %d/%d/%d: %v",
+			status.Applied, status.Commit, status.CheckpointApplied,
+			applied, commit, checkpoint, err,
+		)
+	}
+	return status
+}
+
+func assertRuntimeReplayPublicationValue(
+	t testing.TB,
+	got, want raftmodel.Publication,
+) {
+	t.Helper()
+	if got.Applied != want.Applied ||
+		got.DataChainDigest != want.DataChainDigest ||
+		got.ReplicaSetVersion != want.ReplicaSetVersion ||
+		!proto.Equal(got.ConfState, want.ConfState) {
+		t.Fatalf("publication = %+v, want %+v", got, want)
+	}
+}
+
+func captureRuntimeReplayCompletion(
+	t testing.TB,
+	apply *sqldriver.ReplicatedApply,
+	command []byte,
+) []byte {
+	t.Helper()
+	lookup, err := apply.LookupCompletion(command)
+	if err != nil {
+		t.Fatalf("lookup replay completion: %v", err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+		completion.AppliedSequence != lookup.AppliedSequence {
+		t.Fatalf("replay completion = %+v, lookup %+v, %v", completion, lookup, err)
+	}
+	return bytes.Clone(lookup.Bytes)
+}
+
+func assertRuntimeReplayBytes(
+	t testing.TB,
+	name string,
+	got, want []byte,
+) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s = %x, want %x", name, got, want)
+	}
+}
+
+func assertRuntimeReplayCompletionMissing(
+	t testing.TB,
+	apply *sqldriver.ReplicatedApply,
+	command []byte,
+) {
+	t.Helper()
+	if _, err := apply.LookupCompletion(command); !errors.Is(
+		err, replicatedstate.ErrCompletionNotFound,
+	) {
+		t.Fatalf("uncertified suffix completion survived SQL recovery: %v", err)
+	}
+}
+
+func copyRuntimeReplayPath(t testing.TB, source, destination string) {
+	t.Helper()
+	info, err := os.Lstat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IsDir() {
+		if err := os.Mkdir(destination, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			copyRuntimeReplayPath(
+				t, filepath.Join(source, entry.Name()),
+				filepath.Join(destination, entry.Name()),
+			)
+		}
+		return
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("crash fixture %s is not a regular file", source)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.OpenFile(
+		destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm(),
+	)
+	if err != nil {
+		_ = input.Close()
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(output, input)
+	copyErr = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+}
