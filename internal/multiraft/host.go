@@ -1,10 +1,13 @@
-// Package multiraft provides a bounded, single-owner in-process scheduler for
-// non-serving raftmember runtimes. One Runtime is one range/shard Raft group;
-// one-range and many-range deployments use the same Host path. Host contains no
-// goroutines, wall clock, sockets, peer authentication, snapshot transfer, or
-// client serving API. It scans only a runnable queue, so a group with no Ready,
-// input, or queued logical tick consumes no scheduler-scan CPU after its initial
-// probe, though it still owns ordinary Runtime, memory, and WAL state.
+// Package multiraft provides bounded in-process scheduling for raftmember
+// runtimes. Host is one strict single-owner lane; ExecutionLanes deterministically
+// partitions groups across independent Hosts so callers can drive lanes on
+// separate cores without changing any group's Raft ordering. One Runtime is one
+// range/shard Raft group; one-range and many-range deployments use the same Host
+// path. The scheduler contains no hidden goroutines, wall clock, sockets, peer
+// authentication, snapshot transfer, or client serving API. It scans only a
+// runnable queue, so a group with no Ready, input, or queued logical tick consumes
+// no scheduler-scan CPU after its initial probe, though it still owns ordinary
+// Runtime, memory, and WAL state.
 package multiraft
 
 import (
