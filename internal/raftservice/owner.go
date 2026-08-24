@@ -1,0 +1,627 @@
+// Package raftservice connects the synchronous Multi-Raft kernel to bounded
+// serving and transport queues. One Owner goroutine is the sole caller of its
+// Host; request handlers never enter Raft or its Runtime directly.
+package raftservice
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/thesyncim/vibedb/internal/multiraft"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
+)
+
+var (
+	// ErrInvalidOwner reports an incomplete or unbounded owner configuration.
+	ErrInvalidOwner = errors.New("raftservice: invalid owner configuration")
+	// ErrIngressFull reports that the fixed owner ingress budget is exhausted.
+	ErrIngressFull = errors.New("raftservice: owner ingress is full")
+	// ErrOwnerClosed reports admission outside the serialized owner's live Run
+	// interval, including before the sole Host lane has started.
+	ErrOwnerClosed = errors.New("raftservice: owner is closed")
+	// ErrServingFence reports a request addressed to another local Runtime
+	// incarnation, allocation, or leadership term.
+	ErrServingFence = errors.New("raftservice: stale serving fence")
+	// ErrOutcomeUnknown reports cancellation or owner loss after the exact
+	// command entered the serving registry. Retrying the same command bytes is
+	// safe; changing its request identity is not.
+	ErrOutcomeUnknown = errors.New("raftservice: admitted command outcome is unknown")
+)
+
+// Limits bounds every object retained outside Host and rafttransport. Host and
+// transport keep their own independent item and byte bounds.
+type Limits struct {
+	MaxIngressItems         int
+	MaxIngressBytes         int64
+	MaxPendingOutboundBytes int64
+}
+
+// OutboundSink accepts one detached Host message into a bounded transport
+// queue. Success transfers no protobuf ownership: the sink must detach before
+// returning. OrdinaryTransport satisfies this contract.
+type OutboundSink interface {
+	Send(raftmember.OutboundMessage) error
+}
+
+// Options fixes one serialized serving lane. Pulse supplies logical Raft ticks
+// and also retries a retained outbound message after transport backpressure.
+// Core never samples wall-clock time.
+type Options struct {
+	Registry      *raftserve.Registry
+	Host          *multiraft.Host
+	Members       []raftmember.RuntimeIdentity
+	CommandFences []CommandFence
+	Outbound      OutboundSink
+	Pulse         <-chan struct{}
+	Limits        Limits
+}
+
+type requestKind uint8
+
+const (
+	requestProposal requestKind = iota + 1
+	requestInbound
+	requestCampaign
+	requestStatus
+)
+
+type ownerRequest struct {
+	kind    requestKind
+	group   raftmember.GroupKey
+	data    []byte
+	fence   ServingFence
+	inbound rafttransport.Inbound
+	reply   chan ownerReply
+	bytes   int64
+	async   bool
+}
+
+type ownerReply struct {
+	waiter raftserve.Waiter
+	state  ServingState
+	err    error
+}
+
+// Result is one terminal deterministic apply result. Completion is the exact
+// canonical completion envelope, not JSON and not a formatted string.
+type Result struct {
+	Outcome    raftserve.Outcome
+	Completion []byte
+}
+
+// CommandFence is the exact command/catalog contract served by one Runtime.
+// SchemaGeneration authenticates dense relation IDs; the other scalars fence
+// topology, protection, ownership, and routing interpretation before Raft
+// admission.
+type CommandFence struct {
+	ReplicaSetVersion      uint64
+	ActivePolicyGeneration uint64
+	ProtectionEpoch        uint64
+	OwnershipEpoch         uint64
+	SchemaGeneration       uint64
+	// RelationManifestDigest is the portable logical relation manifest for
+	// SchemaGeneration. It must come from replicatedstate.Machine or the SQL
+	// apply capacity profile and must never be the replica-local storage-bound
+	// catalog digest.
+	RelationManifestDigest [32]byte
+	RoutingVersion         uint64
+	RouteGeneration        uint64
+}
+
+// Valid reports whether every generation in the serving contract is present.
+func (fence CommandFence) Valid() bool {
+	return fence.ReplicaSetVersion != 0 && fence.ActivePolicyGeneration != 0 &&
+		fence.ProtectionEpoch != 0 && fence.OwnershipEpoch != 0 &&
+		fence.SchemaGeneration != 0 && fence.RelationManifestDigest != ([32]byte{}) &&
+		fence.RoutingVersion != 0 &&
+		fence.RouteGeneration != 0
+}
+
+// ServingFence is the exact live local-member and leader incarnation observed
+// by a gateway handshake. It is checked on the serialized owner immediately
+// before registry admission.
+type ServingFence struct {
+	Group                raftmember.GroupKey
+	AllocationGeneration uint64
+	Command              CommandFence
+	MemberID             uint64
+	StoreID              [16]byte
+	NodeIncarnation      uint64
+	Term                 uint64
+}
+
+// ServingState is one allocation-free owner handshake result.
+type ServingState struct {
+	Identity raftmember.RuntimeIdentity
+	Command  CommandFence
+	Status   raftmember.RuntimeStatus
+}
+
+// Fence returns the exact proposal fence represented by state.
+func (state ServingState) Fence() ServingFence {
+	return ServingFence{
+		Group:                state.Identity.Group,
+		AllocationGeneration: state.Identity.AllocationGeneration,
+		Command:              state.Command,
+		MemberID:             state.Identity.MemberID, StoreID: state.Identity.StoreID,
+		NodeIncarnation: state.Identity.NodeIncarnation, Term: state.Status.Term,
+	}
+}
+
+// NotLeaderError is a definite pre-admission refusal. Status carries the
+// current term and leader hint observed on the serialized owner.
+type NotLeaderError struct {
+	Status raftmember.RuntimeStatus
+}
+
+func (e *NotLeaderError) Error() string { return raftmodel.ErrNotLeader.Error() }
+func (e *NotLeaderError) Unwrap() error { return raftmodel.ErrNotLeader }
+
+// UnknownOutcomeError preserves the exact command bytes required for a safe
+// retry after local admission. Command is capacity-clamped and owned.
+type UnknownOutcomeError struct {
+	Command []byte
+	Cause   error
+}
+
+func (e *UnknownOutcomeError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrOutcomeUnknown, e.Cause)
+}
+
+func (e *UnknownOutcomeError) Unwrap() []error {
+	return []error{ErrOutcomeUnknown, e.Cause}
+}
+
+// Owner serializes Host access and owns one bounded pending outbound slot. A
+// message is never discarded on transport backpressure: the Owner does not pop
+// another Host message until the retained one is accepted.
+type Owner struct {
+	registry *raftserve.Registry
+	host     *multiraft.Host
+	groups   []raftmember.GroupKey
+	members  map[raftmember.GroupKey]ownerMember
+	outbound OutboundSink
+	pulse    <-chan struct{}
+	limits   Limits
+
+	ingress chan ownerRequest
+	ready   chan struct{}
+	done    chan struct{}
+
+	mu           sync.Mutex
+	ingressItems int
+	ingressBytes int64
+	started      bool
+	closed       bool
+	failure      error
+}
+
+type ownerMember struct {
+	identity raftmember.RuntimeIdentity
+	command  CommandFence
+}
+
+// NewOwner validates and detaches one lane configuration. Runtime adoption and
+// Host group addition must be complete before construction.
+func NewOwner(options Options) (*Owner, error) {
+	limits := options.Limits
+	if options.Registry == nil || options.Host == nil || len(options.Members) == 0 ||
+		len(options.CommandFences) != len(options.Members) ||
+		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
+		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
+		limits.MaxPendingOutboundBytes <= 0 ||
+		limits.MaxPendingOutboundBytes > multiraft.AbsoluteMaxOutboxBytes {
+		return nil, ErrInvalidOwner
+	}
+	seen := make(map[raftmember.GroupKey]struct{}, len(options.Members))
+	groups := make([]raftmember.GroupKey, len(options.Members))
+	members := make(map[raftmember.GroupKey]ownerMember, len(options.Members))
+	for index, identity := range options.Members {
+		group := identity.Group
+		if group == (raftmember.GroupKey{}) {
+			return nil, ErrInvalidOwner
+		}
+		if identity.AllocationGeneration == 0 || identity.MemberID == 0 ||
+			identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 {
+			return nil, ErrInvalidOwner
+		}
+		if !options.CommandFences[index].Valid() {
+			return nil, ErrInvalidOwner
+		}
+		if _, duplicate := seen[group]; duplicate {
+			return nil, ErrInvalidOwner
+		}
+		seen[group] = struct{}{}
+		groups[index] = group
+		members[group] = ownerMember{identity: identity, command: options.CommandFences[index]}
+	}
+	return &Owner{
+		registry: options.Registry, host: options.Host, groups: groups, members: members,
+		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
+		ingress: make(chan ownerRequest, limits.MaxIngressItems),
+		ready:   make(chan struct{}),
+		done:    make(chan struct{}),
+	}, nil
+}
+
+// Run becomes the sole Host owner until ctx is canceled or a terminal lane
+// failure occurs. It may be called exactly once.
+func (owner *Owner) Run(ctx context.Context) error {
+	if owner == nil || ctx == nil {
+		return ErrInvalidOwner
+	}
+	owner.mu.Lock()
+	if owner.started || owner.closed {
+		owner.mu.Unlock()
+		return ErrOwnerClosed
+	}
+	owner.started = true
+	close(owner.ready)
+	owner.mu.Unlock()
+
+	var pending raftmember.OutboundMessage
+	readyBlocked := false
+	for {
+		transportBlocked := false
+		if pending.Message != nil {
+			if owner.outbound == nil {
+				return owner.stop(errors.New("raftservice: outbound message has no transport"))
+			}
+			err := owner.outbound.Send(pending)
+			switch {
+			case err == nil:
+				pending = raftmember.OutboundMessage{}
+			case errors.Is(err, rafttransport.ErrBackpressure):
+				// Retain exact ownership and continue serving bounded ingress. A
+				// later pulse or request retries before another Host pop.
+				transportBlocked = true
+			default:
+				return owner.stop(err)
+			}
+		}
+
+		if pending.Message == nil {
+			if outbound, ok := owner.host.PopOutbound(); ok {
+				size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
+				if err != nil || int64(size) > owner.limits.MaxPendingOutboundBytes {
+					return owner.stop(errors.Join(ErrInvalidOwner, err))
+				}
+				pending = outbound
+				continue
+			}
+		}
+
+		if !transportBlocked && !readyBlocked {
+			_, done, err := owner.host.RunOne()
+			switch {
+			case errors.Is(err, multiraft.ErrOutboxFull):
+				// The next loop transfers one Host-owned message into the retained
+				// slot before entering RunOne again.
+				continue
+			case errors.Is(err, raftmember.ErrRuntimeFailed),
+				errors.Is(err, raftmember.ErrRuntimeClosed),
+				errors.Is(err, multiraft.ErrHostClosed):
+				return owner.stop(err)
+			case err != nil:
+				// Runtime persistence and retryable result-settlement boundaries
+				// retain the exact Ready phase. Do not spin on a failed device or
+				// sink: the next bounded ingress event or logical pulse retries it.
+				readyBlocked = true
+			case done:
+				continue
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return owner.stop(context.Cause(ctx))
+		case request := <-owner.ingress:
+			readyBlocked = false
+			handleErr := owner.handle(request)
+			owner.release(request.bytes)
+			if request.async && handleErr != nil {
+				return owner.stop(handleErr)
+			}
+		case _, ok := <-owner.pulse:
+			readyBlocked = false
+			if !ok {
+				owner.pulse = nil
+				continue
+			}
+			for _, group := range owner.groups {
+				if err := owner.host.RequestTick(group); err != nil {
+					return owner.stop(err)
+				}
+			}
+		}
+	}
+}
+
+func (owner *Owner) handle(request ownerRequest) error {
+	reply := ownerReply{}
+	switch request.kind {
+	case requestProposal:
+		member, found := owner.members[request.group]
+		if !found || !servingFenceMatchesIdentity(request.fence, member) {
+			reply.err = ErrServingFence
+			break
+		}
+		command, err := replication.OpenCommand(request.data)
+		if err != nil {
+			reply.err = err
+			break
+		}
+		if !commandMatchesFence(command, request.fence) {
+			reply.err = ErrServingFence
+			break
+		}
+		status, err := owner.host.Status(request.group)
+		if err != nil {
+			reply.err = err
+			break
+		}
+		if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+			status.Term != request.fence.Term {
+			reply.err = &NotLeaderError{Status: status}
+			break
+		}
+		reply.waiter, reply.err = owner.registry.Enqueue(owner.host, request.group, request.data)
+	case requestInbound:
+		if request.inbound.Group != request.group || request.inbound.Message == nil {
+			reply.err = ErrInvalidOwner
+		} else {
+			reply.err = owner.host.AdoptMessage(request.group, request.inbound.Message)
+		}
+	case requestCampaign:
+		reply.err = owner.host.RequestCampaign(request.group)
+	case requestStatus:
+		member, found := owner.members[request.group]
+		if !found {
+			reply.err = multiraft.ErrGroupNotFound
+			break
+		}
+		reply.state.Identity = member.identity
+		reply.state.Command = member.command
+		reply.state.Status, reply.err = owner.host.Status(request.group)
+	default:
+		reply.err = ErrInvalidOwner
+	}
+	request.reply <- reply
+	return reply.err
+}
+
+func servingFenceMatchesIdentity(
+	fence ServingFence,
+	member ownerMember,
+) bool {
+	identity := member.identity
+	return fence.Group == identity.Group &&
+		fence.AllocationGeneration == identity.AllocationGeneration &&
+		fence.Command == member.command &&
+		fence.MemberID == identity.MemberID && fence.StoreID == identity.StoreID &&
+		fence.NodeIncarnation == identity.NodeIncarnation && fence.Term != 0
+}
+
+func commandMatchesFence(command replication.CommandView, fence ServingFence) bool {
+	return command.ClusterID == fence.Group.ClusterID &&
+		command.ClusterIncarnation == fence.Group.ClusterIncarnation &&
+		command.TopologyRecoveryEpoch == fence.Group.TopologyRecoveryEpoch &&
+		command.ShardIncarnation == fence.Group.ShardIncarnation &&
+		command.GroupID == fence.Group.GroupID &&
+		command.AllocationGeneration == fence.AllocationGeneration &&
+		command.ReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		command.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
+		command.ProtectionEpoch == fence.Command.ProtectionEpoch &&
+		command.OwnershipEpoch == fence.Command.OwnershipEpoch &&
+		command.SchemaGeneration == fence.Command.SchemaGeneration &&
+		command.RoutingVersion == fence.Command.RoutingVersion &&
+		command.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) stop(cause error) error {
+	if cause == nil {
+		cause = ErrOwnerClosed
+	}
+	// Close is serialized with every earlier Host call. Its serving lifecycle
+	// callbacks resolve queued proposals and terminate admitted attempts that
+	// can no longer apply locally before Done becomes observable.
+	cause = errors.Join(cause, owner.host.Close())
+	owner.mu.Lock()
+	if !owner.closed {
+		owner.closed = true
+		owner.failure = cause
+		close(owner.done)
+	}
+	owner.mu.Unlock()
+	for {
+		select {
+		case request := <-owner.ingress:
+			request.reply <- ownerReply{err: errors.Join(ErrOwnerClosed, cause)}
+			owner.release(request.bytes)
+		default:
+			return cause
+		}
+	}
+}
+
+// publish reserves and enqueues atomically under the lifecycle mutex. Because
+// channel capacity equals the item budget, a successful reservation always has
+// one immediate slot. This prevents a producer that raced stop from publishing
+// after the final drain and waiting forever for a reply.
+func (owner *Owner) publish(request ownerRequest) error {
+	bytes := request.bytes
+	if owner == nil || request.reply == nil || bytes < 0 || bytes > owner.limits.MaxIngressBytes {
+		return ErrIngressFull
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if !owner.started || owner.closed {
+		return errors.Join(ErrOwnerClosed, owner.failure)
+	}
+	if owner.ingressItems == owner.limits.MaxIngressItems ||
+		bytes > owner.limits.MaxIngressBytes-owner.ingressBytes {
+		return ErrIngressFull
+	}
+	owner.ingressItems++
+	owner.ingressBytes += bytes
+	select {
+	case owner.ingress <- request:
+		return nil
+	default:
+		owner.ingressItems--
+		owner.ingressBytes -= bytes
+		return errors.Join(ErrInvalidOwner, ErrIngressFull)
+	}
+}
+
+func (owner *Owner) release(bytes int64) {
+	owner.mu.Lock()
+	owner.ingressItems--
+	owner.ingressBytes -= bytes
+	owner.mu.Unlock()
+}
+
+func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerReply, error) {
+	if ctx == nil {
+		return ownerReply{}, ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return ownerReply{}, cause
+	}
+	if err := owner.publish(request); err != nil {
+		return ownerReply{}, err
+	}
+	// Once queued, stop drains an explicit reply for this request. Waiting for
+	// that reply is what distinguishes a definite pre-admission refusal from an
+	// admitted outcome whose client context later expires.
+	reply := <-request.reply
+	return reply, reply.err
+}
+
+// Submit registers and proposes one already-canonical command. Cancellation
+// after registry admission returns UnknownOutcomeError with an owned exact-byte
+// retry payload.
+func (owner *Owner) Submit(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) (Result, error) {
+	if len(command) == 0 || len(command) > replication.MaxCommandBytes {
+		return Result{}, ErrInvalidOwner
+	}
+	// Exact-length allocation keeps the ingress byte charge equal to retained
+	// capacity instead of relying on append growth-class rounding.
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestProposal, group: fence.Group, fence: fence, data: owned,
+		reply: make(chan ownerReply, 1), bytes: int64(cap(owned)),
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	waiter := reply.waiter
+	outcome, waitErr := waiter.Wait(ctx)
+	if waitErr != nil {
+		waiter.Cancel()
+		return Result{}, &UnknownOutcomeError{Command: owned[:len(owned):len(owned)], Cause: waitErr}
+	}
+	completion := make([]byte, 0, outcome.CompletionBytes)
+	completion, taken, takeErr := waiter.TakeCompletionInto(completion)
+	if takeErr != nil {
+		waiter.Cancel()
+		return Result{}, &UnknownOutcomeError{
+			Command: owned[:len(owned):len(owned)], Cause: takeErr,
+		}
+	}
+	result := Result{Outcome: taken, Completion: completion}
+	if outcomeErr := taken.Err(); outcomeErr != nil {
+		return result, outcomeErr
+	}
+	return result, nil
+}
+
+// HandleInbound is the authenticated rafttransport receiver callback. Inbound
+// already owns its protobuf message, so ingress transfers it without a clone.
+func (owner *Owner) HandleInbound(ctx context.Context, inbound rafttransport.Inbound) error {
+	if inbound.Message == nil {
+		return ErrInvalidOwner
+	}
+	size, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
+	if err != nil {
+		return err
+	}
+	_, err = owner.enqueue(ctx, ownerRequest{
+		kind: requestInbound, group: inbound.Group, inbound: inbound,
+		reply: make(chan ownerReply, 1), bytes: int64(size),
+	})
+	return err
+}
+
+// TryInbound transfers one authenticated inbound message into the fixed owner
+// queue without waiting for Host adoption. It is the transport-style contract:
+// acceptance means bounded local ownership, not Raft processing. A later Host
+// refusal is a lane invariant failure and stops the Owner.
+func (owner *Owner) TryInbound(inbound rafttransport.Inbound) error {
+	if inbound.Message == nil {
+		return ErrInvalidOwner
+	}
+	size, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
+	if err != nil {
+		return err
+	}
+	request := ownerRequest{
+		kind: requestInbound, group: inbound.Group, inbound: inbound,
+		reply: make(chan ownerReply, 1), bytes: int64(size), async: true,
+	}
+	return owner.publish(request)
+}
+
+// Campaign requests an election through the serialized lane.
+func (owner *Owner) Campaign(ctx context.Context, group raftmember.GroupKey) error {
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestCampaign, group: group, reply: make(chan ownerReply, 1),
+	})
+	return err
+}
+
+// Status reads detached Raft status through the serialized lane.
+func (owner *Owner) Probe(ctx context.Context, group raftmember.GroupKey) (ServingState, error) {
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestStatus, group: group, reply: make(chan ownerReply, 1),
+	})
+	return reply.state, err
+}
+
+// Done closes when the lane stops.
+func (owner *Owner) Done() <-chan struct{} {
+	if owner == nil {
+		return nil
+	}
+	return owner.done
+}
+
+// Started closes after Run becomes the sole Host caller.
+func (owner *Owner) Started() <-chan struct{} {
+	if owner == nil {
+		return nil
+	}
+	return owner.ready
+}
+
+// Running reports whether Run owns the Host and has not stopped.
+func (owner *Owner) Running() bool {
+	if owner == nil {
+		return false
+	}
+	owner.mu.Lock()
+	running := owner.started && !owner.closed
+	owner.mu.Unlock()
+	return running
+}

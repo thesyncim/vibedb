@@ -185,6 +185,16 @@ type PeerTLS struct {
 	now         func() time.Time
 }
 
+// LocalIdentity returns the exact certificate-bound identity authenticated by
+// this profile. The value contains no credential material and is safe to use
+// when composing TLS with a static transport registry.
+func (peerTLS *PeerTLS) LocalIdentity() PeerIdentity {
+	if peerTLS == nil {
+		return PeerIdentity{}
+	}
+	return peerTLS.identity
+}
+
 // NewPeerTLS validates and detaches the local current-format TLS profile.
 func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 	if !validPeerIdentityOID(options.IdentityOID) || !validPeerIdentity(options.Identity) ||

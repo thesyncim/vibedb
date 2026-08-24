@@ -323,6 +323,9 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := rejectReplicatedGlobalIndexSQLTargets(snap, bound); err != nil {
+			return nil, err
+		}
 		if call != nil && len(prepared.writeGlobalIndexes) != 0 &&
 			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
 			err = e.captureIndexedMutation(opctx, prepared, bound, *call, profile)
@@ -332,6 +335,9 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 					e.metrics.observeRetry()
 					continue
 				}
+				return nil, err
+			}
+			if err := rejectReplicatedGlobalIndexSQLTargets(snap, bound); err != nil {
 				return nil, err
 			}
 		}
@@ -434,6 +440,9 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 		if err := e.writeDocShardKeyMatchesTarget(bound, mapper, targets[0]); err != nil {
 			return nil, kind, ScatterNone, err
 		}
+	}
+	if _, replicated := snap.replicatedShardAt(bound.distribution, targets[0].Shard); replicated {
+		return nil, kind, ScatterNone, ErrReplicatedSQLWriteUnavailable
 	}
 
 	addr, err := snap.Address(targets[0].Endpoint)
