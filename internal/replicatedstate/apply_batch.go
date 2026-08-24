@@ -74,7 +74,8 @@ func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
 	return overlayBytes(&workspace.system) + overlayBytes(&workspace.user) +
 		overlayBytes(&workspace.attempted) +
 		uintptr(cap(plan.sessionRead)+cap(plan.slotRead)+cap(plan.sessionRecord)+
-			cap(plan.slotRecord)+cap(plan.currentValue)+cap(workspace.state)) +
+			cap(plan.slotRecord)+cap(plan.currentValue)+cap(plan.decodeRead)+
+			cap(workspace.state)) +
 		uintptr(cap(plan.descriptors))*unsafe.Sizeof(mutationValueDescriptor{}) +
 		uintptr(cap(workspace.keys))*unsafe.Sizeof(finalMutation{})
 }

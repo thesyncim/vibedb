@@ -307,6 +307,147 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	}
 }
 
+func TestMachineLookupCompletionIntoUsesExactCallerStorage(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	command := testCommand(fixture.binding, 1,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+	)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	short := make([]byte, 7, replication.MaxEmptyResultCompletionEnvelopeBytes-1)
+	if lookup, err := fixture.machine.LookupCompletionInto(command, short); !errors.Is(err, ErrCompletionBufferSmall) ||
+		lookup.Key != ([32]byte{}) || len(lookup.Bytes) != 0 ||
+		lookup.AppliedSequence != 0 || len(short) != 7 {
+		t.Fatalf("short lookup = %+v, %v, len %d", lookup, err, len(short))
+	}
+	scratch := make([]byte, 9, replication.MaxEmptyResultCompletionEnvelopeBytes+32)
+	lookup, err := fixture.machine.LookupCompletionInto(command, scratch)
+	if err != nil || len(lookup.Bytes) == 0 || lookup.AppliedSequence != 3 ||
+		&lookup.Bytes[0] != &scratch[:cap(scratch)][0] {
+		t.Fatalf("caller-backed lookup = %+v, %v", lookup, err)
+	}
+	want := bytes.Clone(lookup.Bytes)
+	lookup.Bytes[0] ^= 0xff
+	again, err := fixture.machine.LookupCompletionInto(command, scratch)
+	if err != nil || !bytes.Equal(again.Bytes, want) || &again.Bytes[0] != &scratch[:cap(scratch)][0] {
+		t.Fatalf("reused lookup = %+v, %v", again, err)
+	}
+}
+
+func TestMachineCompletionLookupWorkspaceIsExactReusableAndAllocationFree(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	command := testCommand(fixture.binding, 1,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+	)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace CompletionLookupWorkspace
+	scratch := make([]byte, 0, replication.MaxEmptyResultCompletionEnvelopeBytes)
+	lookup := func() {
+		if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+			panic(err)
+		}
+		result, lookupErr := fixture.machine.LookupCompletionIntoWorkspace(
+			&workspace, command, scratch[:0],
+		)
+		if lookupErr != nil || len(result.Bytes) == 0 || result.AppliedSequence != 3 ||
+			&result.Bytes[0] != &scratch[:cap(scratch)][0] {
+			panic("unexpected workspace completion")
+		}
+		if len(workspace.scratch.sessionRead) == 0 || len(workspace.scratch.slotRead) == 0 ||
+			&workspace.scratch.sessionRead[0] != &workspace.sessionRead[0] ||
+			&workspace.scratch.slotRead[0] != &workspace.slotRead[0] ||
+			cap(workspace.scratch.decodeRead) != len(workspace.decodeRead) ||
+			&workspace.scratch.decodeRead[:cap(workspace.scratch.decodeRead)][0] !=
+				&workspace.decodeRead[0] {
+			panic("completion lookup escaped fixed decode storage")
+		}
+		if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+			panic(err)
+		}
+	}
+	lookup()
+	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); !errors.Is(err, ErrCompletionWorkspaceBusy) {
+		t.Fatalf("nested begin = %v", err)
+	}
+	if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+		t.Fatal(err)
+	}
+	stale := publication
+	stale.Applied--
+	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, stale); !errors.Is(err, ErrCompletionPublication) {
+		t.Fatalf("stale publication = %v", err)
+	}
+	allocs := testing.AllocsPerRun(1_000, lookup)
+	if allocs != 0 {
+		t.Fatalf("warm exact-cut completion lookup allocations = %v, want 0", allocs)
+	}
+	if err := workspace.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkMachineCompletionLookupWorkspace(b *testing.B) {
+	fixture := newMachineFixture(b)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		b.Fatal(err)
+	}
+	applySessionOpen(b, fixture.machine, 2, commandValue(fixture.binding, 1))
+	command := testCommand(fixture.binding, 1,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("k"), Value: []byte(`{"n":1}`)},
+	)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var workspace CompletionLookupWorkspace
+	scratch := make([]byte, 0, replication.MaxEmptyResultCompletionEnvelopeBytes)
+	if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := fixture.machine.LookupCompletionIntoWorkspace(
+		&workspace, command, scratch[:0],
+	); err != nil {
+		b.Fatal(err)
+	}
+	if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := fixture.machine.LookupCompletionIntoWorkspace(
+			&workspace, command, scratch[:0],
+		); err != nil {
+			b.Fatal(err)
+		}
+		if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if err := workspace.Release(); err != nil {
+		b.Fatal(err)
+	}
+}
+
 func TestMachineConfigurationAndEmptyNormalPreserveDataChainDigest(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {

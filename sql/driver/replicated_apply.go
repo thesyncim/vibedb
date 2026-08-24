@@ -133,6 +133,15 @@ type ReplicatedApply struct {
 	activationBasePending [sha256.Size]byte
 }
 
+// CompletionLookupWorkspace owns one reusable exact completion snapshot for a
+// serialized ReplicatedApply batch. The zero value is ready for use. It is
+// single-consumer, must not be copied, and retains only bounded snapshot
+// scratch between batches.
+type CompletionLookupWorkspace struct {
+	machine replicatedstate.CompletionLookupWorkspace
+	owner   *ReplicatedApply
+}
+
 // replicatedAttemptBinaryKeys is stable storage for the interface value passed
 // into txnclock. Pointing the interface at this claim-owned adapter keeps the
 // synchronous borrowed-key call allocation-free. Keys is cleared immediately
@@ -1215,6 +1224,95 @@ func (a *ReplicatedApply) LookupCompletion(
 		return replicatedstate.CompletionLookup{}, err
 	}
 	return a.machine.LookupCompletion(data)
+}
+
+// LookupCompletionInto returns an exact completion in caller-owned storage.
+// The destination contract is defined by
+// [replicatedstate.Machine.LookupCompletionInto].
+func (a *ReplicatedApply) LookupCompletionInto(
+	data []byte,
+	dst []byte,
+) (replicatedstate.CompletionLookup, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.CompletionLookup{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.CompletionLookup{}, err
+	}
+	return a.machine.LookupCompletionInto(data, dst)
+}
+
+// BeginCompletionLookupBatch captures one exact completion snapshot and holds
+// the SQL publication fence until EndCompletionLookupBatch. Every lookup in
+// the batch observes the same activated ReplicatedApply owner and durable cut.
+func (a *ReplicatedApply) BeginCompletionLookupBatch(
+	workspace *CompletionLookupWorkspace,
+	expected raftmodel.Publication,
+) error {
+	if a == nil || a.database == nil {
+		return ErrReplicatedApplyClosed
+	}
+	if workspace == nil || workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	a.database.mu.RLock()
+	if err := a.checkLocked(); err != nil {
+		a.database.mu.RUnlock()
+		return err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		a.database.mu.RUnlock()
+		return err
+	}
+	if err := a.machine.BeginCompletionLookupBatch(&workspace.machine, expected); err != nil {
+		a.database.mu.RUnlock()
+		return err
+	}
+	workspace.owner = a
+	return nil
+}
+
+// LookupCompletionIntoWorkspace resolves one command through the exact cut
+// held by BeginCompletionLookupBatch into caller-owned result storage.
+func (a *ReplicatedApply) LookupCompletionIntoWorkspace(
+	workspace *CompletionLookupWorkspace,
+	data []byte,
+	dst []byte,
+) (replicatedstate.CompletionLookup, error) {
+	if workspace == nil || workspace.owner != a {
+		return replicatedstate.CompletionLookup{}, replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	return a.machine.LookupCompletionIntoWorkspace(&workspace.machine, data, dst)
+}
+
+// EndCompletionLookupBatch releases the exact completion snapshot and SQL
+// publication fence. The workspace remains warm for a later batch.
+func (a *ReplicatedApply) EndCompletionLookupBatch(
+	workspace *CompletionLookupWorkspace,
+) error {
+	if a == nil || a.database == nil || workspace == nil || workspace.owner != a {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	workspace.owner = nil
+	err := a.machine.EndCompletionLookupBatch(&workspace.machine)
+	a.database.mu.RUnlock()
+	return err
+}
+
+// Release drops every inactive reusable snapshot buffer retained by workspace.
+func (workspace *CompletionLookupWorkspace) Release() error {
+	if workspace == nil {
+		return nil
+	}
+	if workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	return workspace.machine.Release()
 }
 
 // DurabilityStats returns detached physical checkpoint-group counters for

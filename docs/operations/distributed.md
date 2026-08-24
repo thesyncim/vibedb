@@ -11,9 +11,12 @@ catalog file.
 The shipped commands do not start Raft replication. One `vibedb-shard` process
 serves one local store with one static ownership identity. The Raft and
 replicated-state packages are a separate non-serving kernel. That kernel can
-coalesce a currently queued normal-proposal prefix into one `Ready` under
-fixed entry and byte targets, but still has no serving result waiters,
-committed-entry apply batch, or outbound-frame batch.
+coalesce a currently queued normal-proposal prefix under fixed entry and byte
+targets and atomically apply a bounded committed-normal prefix. An internal
+bounded waiter registry can synchronously settle those published results, but
+it has no listener or shipped gateway integration. The bounded Host outbox and
+append-oriented canonical frame encoder are an outbound coalescing foundation.
+Frames remain individual and no production transport loop is shipped.
 
 ## Build the commands
 
