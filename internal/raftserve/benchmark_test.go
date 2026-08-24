@@ -1,13 +1,19 @@
 package raftserve
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"testing"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 type immediateProposalHost struct {
@@ -131,6 +137,272 @@ func BenchmarkRegistryWarmRegisterSettleTake(b *testing.B) {
 		if err := cycle.run(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+type realAppliedBatchSettlementCycle struct {
+	runtime   *raftmember.Runtime
+	workspace raftmember.ReadyWorkspace
+	registry  *Registry
+	host      immediateProposalHost
+	group     raftmember.GroupKey
+	commands  [][]byte
+	waiters   []Waiter
+	batch     raftmember.AppliedBatch
+}
+
+func newRealAppliedBatchSettlementCycle(
+	tb testing.TB,
+	matched int,
+) *realAppliedBatchSettlementCycle {
+	tb.Helper()
+	if matched <= 0 || matched > raftmodel.MaxNormalApplyBatchEntries {
+		tb.Fatalf("invalid real settlement match count %d", matched)
+	}
+	seed := byte(100 + matched%100)
+	memberID := uint64(seed) + 1
+	leaderID := memberID + 1
+	runtime, base := newServingRuntimeWithVoters(
+		tb, seed, replicatedstate.MaxSessionRetryWindow,
+		uint64(max(16, matched)),
+		[]uint64{memberID, leaderID},
+	)
+	cycle := &realAppliedBatchSettlementCycle{runtime: runtime, group: runtime.Identity().Group}
+	driveRealSettlementRuntimeIdle(tb, cycle, func(raftmember.AppliedBatch) error { return nil })
+
+	opens := make([][]byte, matched)
+	for index := range opens {
+		command := servingCommand(base, 0, 1)
+		command.Tenant = bytes.Repeat(
+			[]byte{'t'}, 1+(index*131)%replication.MaxIdentityBytes,
+		)
+		command.Kind = replication.CommandSessionOpen
+		command.AckThrough = 0
+		command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
+		command.Mutations = nil
+		binary.BigEndian.PutUint16(command.ClientID[14:], uint16(index+1))
+		opens[index] = encodeTestCommand(tb, command)
+	}
+	stepRealSettlementAppend(tb, cycle, leaderID, 1, 1, opens)
+	epochs := make([]uint64, 0, matched)
+	driveRealSettlementRuntimeIdle(tb, cycle, func(batch raftmember.AppliedBatch) error {
+		for index := 0; index < batch.Len(); index++ {
+			lookup, hasCommand, lookupErr := batch.LookupCompletion(index)
+			if lookupErr != nil || !hasCommand {
+				return errors.Join(errors.New("open completion lookup failed"), lookupErr)
+			}
+			completion, completionErr := replication.OpenCompletion(lookup.Bytes)
+			if completionErr != nil {
+				return completionErr
+			}
+			if completion.ResultCode != replicatedstate.ResultSessionOpened ||
+				completion.ClientEpoch == 0 {
+				return fmt.Errorf("open completion %d = %+v", index, completion)
+			}
+			epochs = append(epochs, completion.ClientEpoch)
+		}
+		return nil
+	})
+	if len(epochs) != matched {
+		tb.Fatalf("real settlement opened %d sessions, want %d", len(epochs), matched)
+	}
+
+	cycle.commands = make([][]byte, matched)
+	for index := range cycle.commands {
+		// Prime one retained completion in each distinct session. The first
+		// execution may split at the system-collection physical batch limit; the
+		// replay below has no per-session writes and forms one 128-entry batch.
+		command := servingCommand(base, epochs[index], 2)
+		command.Tenant = bytes.Repeat(
+			[]byte{'t'}, 1+(index*131)%replication.MaxIdentityBytes,
+		)
+		binary.BigEndian.PutUint16(command.ClientID[14:], uint16(index+1))
+		cycle.commands[index] = encodeTestCommand(tb, command)
+	}
+	stepRealSettlementAppend(
+		tb, cycle, leaderID, 1+uint64(matched), 2, cycle.commands,
+	)
+	driveRealSettlementRuntimeIdle(
+		tb, cycle, func(raftmember.AppliedBatch) error { return nil },
+	)
+	stepRealSettlementAppend(
+		tb, cycle, leaderID, 1+2*uint64(matched), 2, cycle.commands,
+	)
+	wantRetry := errors.New("retain real applied batch for settlement benchmark")
+	for step := 0; step < 20000; step++ {
+		result, err := runtime.DriveReady(
+			&cycle.workspace,
+			func(raftmember.OutboundMessage) error { return nil },
+			func(batch raftmember.AppliedBatch) error {
+				cycle.batch = batch
+				return raftmember.RetryResultSettlement(wantRetry)
+			},
+		)
+		if errors.Is(err, raftmember.ErrResultSettlementRejected) && errors.Is(err, wantRetry) {
+			break
+		}
+		if err != nil {
+			tb.Fatalf("capture real applied batch step %d: %v", step, err)
+		}
+		if !result.Progressed() {
+			tb.Fatal("real Runtime became idle before result settlement")
+		}
+	}
+	if cycle.batch.Len() != matched {
+		tb.Fatalf("real applied batch length = %d, want %d", cycle.batch.Len(), matched)
+	}
+	for index := range cycle.commands {
+		entry, ok := cycle.batch.Entry(index)
+		if !ok || !bytes.Equal(entry.Data, cycle.commands[index]) {
+			tb.Fatalf("real applied entry %d mismatch", index)
+		}
+	}
+	registry, err := NewRegistry(Limits{
+		MaxGroups:                  1,
+		MaxOutstandingIdentities:   matched,
+		MaxOutstandingAttempts:     matched,
+		MaxWaiters:                 matched,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: int64(matched * completionSlotBytes),
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	cycle.registry = registry
+	cycle.host.registry = cycle.registry
+	cycle.waiters = make([]Waiter, matched)
+	tb.Cleanup(func() {
+		_ = cycle.registry.Close()
+		_, _ = cycle.runtime.DriveReady(
+			&cycle.workspace,
+			func(raftmember.OutboundMessage) error { return nil },
+			func(raftmember.AppliedBatch) error { return nil },
+		)
+		_ = cycle.runtime.Close()
+	})
+	return cycle
+}
+
+func stepRealSettlementAppend(
+	tb testing.TB,
+	cycle *realAppliedBatchSettlementCycle,
+	leaderID, previousIndex, previousTerm uint64,
+	data [][]byte,
+) {
+	tb.Helper()
+	const term = uint64(2)
+	entries := make([]*pb.Entry, len(data))
+	for index := range data {
+		entryIndex := previousIndex + uint64(index) + 1
+		entryTerm := term
+		entryType := pb.EntryNormal
+		entries[index] = &pb.Entry{
+			Term: &entryTerm, Index: &entryIndex, Type: &entryType, Data: data[index],
+		}
+	}
+	messageType := pb.MsgApp
+	memberID := cycle.runtime.Identity().MemberID
+	commit := previousIndex + uint64(len(entries))
+	messageTerm := term
+	message := &pb.Message{
+		Type: &messageType, To: &memberID, From: &leaderID, Term: &messageTerm,
+		LogTerm: &previousTerm, Index: &previousIndex, Entries: entries, Commit: &commit,
+	}
+	if err := cycle.runtime.StepMessage(message); err != nil {
+		tb.Fatalf("step real settlement append %d..%d: %v",
+			previousIndex+1, commit, err)
+	}
+}
+
+func driveRealSettlementRuntimeIdle(
+	tb testing.TB,
+	cycle *realAppliedBatchSettlementCycle,
+	settle raftmember.ResultSettlementSink,
+) {
+	tb.Helper()
+	for step := 0; step < 20000; step++ {
+		result, err := cycle.runtime.DriveReady(
+			&cycle.workspace,
+			func(raftmember.OutboundMessage) error { return nil },
+			settle,
+		)
+		if err != nil {
+			tb.Fatalf("drive real settlement Runtime step %d: %v", step, err)
+		}
+		if !result.Progressed() {
+			return
+		}
+	}
+	tb.Fatal("real settlement Runtime did not become idle")
+}
+
+func (cycle *realAppliedBatchSettlementCycle) run() error {
+	for index := range cycle.commands {
+		waiter, err := cycle.registry.Enqueue(
+			&cycle.host, cycle.group, cycle.commands[index],
+		)
+		if err != nil {
+			return err
+		}
+		cycle.waiters[index] = waiter
+	}
+	if err := cycle.registry.SettleAppliedBatch(cycle.batch); err != nil {
+		return err
+	}
+	for index := range cycle.waiters {
+		outcome, ready, err := cycle.waiters[index].Poll()
+		if err != nil {
+			return err
+		}
+		if !ready || outcome.Code != OutcomeCompletion {
+			return fmt.Errorf("real settlement outcome %d = %+v, ready %v", index, outcome, ready)
+		}
+		if !cycle.waiters[index].Cancel() {
+			return fmt.Errorf("real settlement waiter %d did not cancel", index)
+		}
+	}
+	return nil
+}
+
+func TestRegistryRealAppliedBatchSettlementWarmAllocations(t *testing.T) {
+	for _, matched := range [...]int{1, raftmodel.MaxNormalApplyBatchEntries} {
+		t.Run(fmt.Sprintf("matched-%d", matched), func(t *testing.T) {
+			cycle := newRealAppliedBatchSettlementCycle(t, matched)
+			if err := cycle.run(); err != nil {
+				t.Fatal(err)
+			}
+			runs := 1_000
+			if matched > 1 {
+				runs = 100
+			}
+			allocs := testing.AllocsPerRun(runs, func() {
+				if err := cycle.run(); err != nil {
+					panic(err)
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("real warm settlement allocations = %v, want 0", allocs)
+			}
+		})
+	}
+}
+
+func BenchmarkRegistryRuntimeReplicatedApplySettlement(b *testing.B) {
+	for _, matched := range [...]int{1, raftmodel.MaxNormalApplyBatchEntries} {
+		b.Run(fmt.Sprintf("matched-%d", matched), func(b *testing.B) {
+			cycle := newRealAppliedBatchSettlementCycle(b, matched)
+			if err := cycle.run(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ReportMetric(float64(matched), "matched-entries")
+			b.ResetTimer()
+			for range b.N {
+				if err := cycle.run(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

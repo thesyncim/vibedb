@@ -15,20 +15,34 @@ import (
 const settlementIndexSlots = 2 * raftmodel.MaxNormalApplyBatchEntries
 
 type settlementAttemptItem struct {
-	attempt           uint32
-	attemptGeneration uint64
-	entry             uint32
-	appliedIndex      uint64
-	completionApplied uint64
-	completionBytes   uint16
-	outcome           OutcomeCode
-	observed          bool
+	attempt            uint32
+	attemptGeneration  uint64
+	entry              uint32
+	entryGeneration    uint64
+	appliedIndex       uint64
+	completionApplied  uint64
+	completionBytes    uint16
+	outcome            OutcomeCode
+	originalOutcome    OutcomeCode
+	originalState      attemptState
+	originalCompletion bool
+	observed           bool
 }
 
 type settlementEntryItem struct {
-	entry             uint32
-	completionApplied uint64
-	completionBytes   uint16
+	entry                     uint32
+	entryGeneration           uint64
+	originalCompletionApplied uint64
+	completionApplied         uint64
+	originalCompletionBytes   uint16
+	completionBytes           uint16
+	touched                   bool
+}
+
+type settlementLookupItem struct {
+	offset  uint16
+	attempt uint16
+	entry   uint16
 }
 
 type settlementIndexSlot struct {
@@ -47,6 +61,13 @@ type appliedBatchView interface {
 	Entry(int) (raftmodel.NormalApply, bool)
 	FinalPublication() raftmodel.Publication
 	LookupCompletionInto(int, []byte) (replicatedstate.CompletionLookup, bool, error)
+	BeginCompletionLookup(*raftmember.AppliedBatchCompletionWorkspace) error
+	LookupCompletionIntoWorkspace(
+		*raftmember.AppliedBatchCompletionWorkspace,
+		int,
+		[]byte,
+	) (replicatedstate.CompletionLookup, bool, error)
+	EndCompletionLookup(*raftmember.AppliedBatchCompletionWorkspace) error
 }
 
 // SettleAppliedBatch resolves locally registered attempts in one exact
@@ -71,57 +92,111 @@ func settleAppliedBatch[Batch appliedBatchView](
 
 	var attempts [raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem
 	var entries [raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem
+	var lookups [raftmodel.MaxNormalApplyBatchEntries]settlementLookupItem
 	var attemptTable [settlementIndexSlots]settlementIndexSlot
 	var entryTable [settlementIndexSlots]settlementIndexSlot
-	attemptCount := 0
-	entryCount := 0
-	pendingToRelease := 0
-	completionToRetain := 0
 	registry.mu.Lock()
-	defer registry.mu.Unlock()
 	if registry.closed {
+		registry.mu.Unlock()
 		return ErrRegistryClosed
 	}
 	if registry.failure != nil {
-		return registry.failure
+		failure := registry.failure
+		registry.mu.Unlock()
+		return failure
 	}
-	rollback := func() {
-		for index := 0; index < attemptCount; index++ {
-			item := attempts[index]
-			attempt, _, ok := registry.validAttemptLocked(
-				item.attempt, item.attemptGeneration, attemptSettling,
-			)
-			if ok {
-				attempt.state = attemptPending
+	attemptCount, entryCount, lookupCount, stageErr := stageSettlementLocked(
+		registry, batch, &attempts, &entries, &lookups, &attemptTable, &entryTable,
+	)
+	if stageErr != nil {
+		rollbackErr := rollbackSettlementLocked(
+			registry, &attempts, attemptCount, &entries, entryCount,
+		)
+		if rollbackErr == nil && errors.Is(stageErr, ErrRegistryCorrupt) {
+			stageErr = registry.corruptLocked(stageErr)
+		}
+		registry.mu.Unlock()
+		if rollbackErr != nil {
+			return rollbackErr
+		}
+		return stageErr
+	}
+	if lookupCount == 0 {
+		registry.mu.Unlock()
+		return nil
+	}
+	registry.mu.Unlock()
+
+	lookupErr := lookupSettlementBatch(
+		registry, batch, &attempts, &entries, &lookups, lookupCount,
+	)
+
+	registry.mu.Lock()
+	if lookupErr != nil || registry.closed || registry.failure != nil {
+		rollbackErr := rollbackSettlementLocked(
+			registry, &attempts, attemptCount, &entries, entryCount,
+		)
+		if lookupErr == nil {
+			switch {
+			case registry.failure != nil:
+				lookupErr = registry.failure
+			case registry.closed:
+				lookupErr = ErrRegistryClosed
 			}
 		}
-		for index := 0; index < entryCount; index++ {
-			clear(registry.completionSlot(entries[index].entry))
+		registry.mu.Unlock()
+		if rollbackErr != nil {
+			return rollbackErr
+		}
+		return lookupErr
+	}
+	commitErr := commitSettlementLocked(
+		registry, batch.Group(), &attempts, attemptCount, &entries, entryCount,
+	)
+	if commitErr != nil && registry.failure == nil {
+		rollbackErr := rollbackSettlementLocked(
+			registry, &attempts, attemptCount, &entries, entryCount,
+		)
+		if rollbackErr != nil {
+			commitErr = rollbackErr
+		} else if errors.Is(commitErr, ErrRegistryCorrupt) {
+			commitErr = registry.corruptLocked(commitErr)
 		}
 	}
+	registry.mu.Unlock()
+	return commitErr
+}
 
+func stageSettlementLocked[Batch appliedBatchView](
+	registry *Registry,
+	batch Batch,
+	attempts *[raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem,
+	entries *[raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem,
+	lookups *[raftmodel.MaxNormalApplyBatchEntries]settlementLookupItem,
+	attemptTable *[settlementIndexSlots]settlementIndexSlot,
+	entryTable *[settlementIndexSlots]settlementIndexSlot,
+) (attemptCount, entryCount, lookupCount int, err error) {
 	for offset := 0; offset < batch.Len(); offset++ {
 		entry, ok := batch.Entry(offset)
 		if !ok || entry.Meta.Type != pb.EntryNormal ||
 			entry.Meta.Index != batch.FirstIndex()+uint64(offset) {
-			rollback()
-			return ErrSettlementRange
+			return attemptCount, entryCount, lookupCount, ErrSettlementRange
 		}
 		if len(entry.Data) == 0 {
 			continue
 		}
 		if replicatedstate.IsOwnershipTransition(entry.Data) {
-			transition, err := replicatedstate.OpenOwnershipTransition(entry.Data)
-			if err != nil || !transitionMatchesGroup(transition, batch.Group()) {
-				rollback()
-				return fmt.Errorf("%w: ownership transition", ErrSettlementResult)
+			transition, transitionErr := replicatedstate.OpenOwnershipTransition(entry.Data)
+			if transitionErr != nil || !transitionMatchesGroup(transition, batch.Group()) {
+				return attemptCount, entryCount, lookupCount,
+					fmt.Errorf("%w: ownership transition", ErrSettlementResult)
 			}
 			continue
 		}
-		identity, err := openCommandIdentity(batch.Group(), entry.Data)
-		if err != nil {
-			rollback()
-			return fmt.Errorf("%w: command: %v", ErrSettlementResult, err)
+		identity, identityErr := openCommandIdentity(batch.Group(), entry.Data)
+		if identityErr != nil {
+			return attemptCount, entryCount, lookupCount,
+				fmt.Errorf("%w: command: %v", ErrSettlementResult, identityErr)
 		}
 		hash := hashPosition(registry.seed, identity.position, identity.tenant) & registry.hashMask
 		entryIndex, _, found, findErr := registry.findEntryLocked(identity, hash)
@@ -130,11 +205,7 @@ func settleAppliedBatch[Batch appliedBatchView](
 			findErr = nil
 		}
 		if findErr != nil {
-			rollback()
-			if errors.Is(findErr, ErrRegistryCorrupt) {
-				return registry.corruptLocked(findErr)
-			}
-			return findErr
+			return attemptCount, entryCount, lookupCount, findErr
 		}
 		if !found {
 			continue
@@ -145,8 +216,7 @@ func settleAppliedBatch[Batch appliedBatchView](
 		}
 		attemptIndex, found, attemptErr := registry.findAttemptLocked(logical, identity.attempt)
 		if attemptErr != nil {
-			rollback()
-			return registry.corruptLocked(attemptErr)
+			return attemptCount, entryCount, lookupCount, attemptErr
 		}
 		if !found {
 			continue
@@ -155,135 +225,311 @@ func settleAppliedBatch[Batch appliedBatchView](
 		if attempt.state == attemptComplete && infrastructureOutcome(attempt.outcome) {
 			continue
 		}
-		stagedAttempt, repeated := settlementIndexLookup(&attemptTable, attemptIndex)
-		if !repeated {
-			switch attempt.state {
-			case attemptComplete:
-			case attemptPending:
-				attempt.state = attemptSettling
-				stagedAttempt = uint16(attemptCount)
-				attempts[attemptCount] = settlementAttemptItem{
-					attempt: attemptIndex, attemptGeneration: attempt.generation,
-					entry: entryIndex, appliedIndex: entry.Meta.Index,
-				}
-				attemptCount++
-				settlementIndexInsert(&attemptTable, attemptIndex, stagedAttempt)
-			default:
-				rollback()
-				return registry.corruptLocked(errors.New("settlement found an invalid attempt state"))
+
+		stagedAttempt, repeatedAttempt := settlementIndexLookup(attemptTable, attemptIndex)
+		if !repeatedAttempt {
+			if attempt.settlementPinned || attempt.entry != entryIndex ||
+				attempt.entryGeneration != logical.generation {
+				return attemptCount, entryCount, lookupCount,
+					errors.Join(ErrRegistryCorrupt, errors.New("settlement found an invalid attempt owner"))
 			}
-		} else if attempt.state != attemptSettling {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement duplicate lost its staged attempt state"))
+			switch attempt.state {
+			case attemptPending:
+				if attempt.lifecyclePending == attempt.admitted {
+					return attemptCount, entryCount, lookupCount,
+						errors.Join(ErrRegistryCorrupt, errors.New("pending settlement has an invalid lifecycle"))
+				}
+			case attemptComplete:
+				if attempt.admitted || attempt.hasCompletion && logical.completionLen == 0 {
+					return attemptCount, entryCount, lookupCount,
+						errors.Join(ErrRegistryCorrupt, errors.New("complete settlement has invalid retained state"))
+				}
+			default:
+				return attemptCount, entryCount, lookupCount,
+					errors.Join(ErrRegistryCorrupt, errors.New("settlement found an invalid attempt state"))
+			}
+			stagedAttempt = uint16(attemptCount)
+			attempts[attemptCount] = settlementAttemptItem{
+				attempt: attemptIndex, attemptGeneration: attempt.generation,
+				entry: entryIndex, entryGeneration: logical.generation,
+				appliedIndex:    entry.Meta.Index,
+				originalOutcome: attempt.outcome, originalState: attempt.state,
+				originalCompletion: attempt.hasCompletion,
+			}
+			attempt.settlementPinned = true
+			if attempt.state == attemptPending {
+				attempt.state = attemptSettling
+			}
+			settlementIndexInsert(attemptTable, attemptIndex, stagedAttempt)
+			attemptCount++
+		} else {
+			item := &attempts[stagedAttempt]
+			wantState := item.originalState
+			if wantState == attemptPending {
+				wantState = attemptSettling
+			}
+			if !attempt.settlementPinned || attempt.state != wantState ||
+				item.entry != entryIndex || item.entryGeneration != logical.generation {
+				return attemptCount, entryCount, lookupCount,
+					errors.Join(ErrRegistryCorrupt, errors.New("settlement duplicate lost its generation fence"))
+			}
 		}
 
-		lookup, outcome, lookupErr := settlementLookup(
-			batch, offset, registry.settlementScratch[:0], identity,
+		stagedEntry, repeatedEntry := settlementIndexLookup(entryTable, entryIndex)
+		if !repeatedEntry {
+			if (logical.completionLen == 0) != (logical.completionApplied == 0) {
+				return attemptCount, entryCount, lookupCount,
+					errors.Join(ErrRegistryCorrupt, errors.New("settlement found invalid retained completion metadata"))
+			}
+			stagedEntry = uint16(entryCount)
+			entries[entryCount] = settlementEntryItem{
+				entry: entryIndex, entryGeneration: logical.generation,
+				originalCompletionApplied: logical.completionApplied,
+				originalCompletionBytes:   logical.completionLen,
+			}
+			settlementIndexInsert(entryTable, entryIndex, stagedEntry)
+			entryCount++
+		} else if entries[stagedEntry].entryGeneration != logical.generation {
+			return attemptCount, entryCount, lookupCount,
+				errors.Join(ErrRegistryCorrupt, errors.New("settlement entry generation changed while staging"))
+		}
+		lookups[lookupCount] = settlementLookupItem{
+			offset: uint16(offset), attempt: stagedAttempt, entry: stagedEntry,
+		}
+		lookupCount++
+	}
+	return attemptCount, entryCount, lookupCount, nil
+}
+
+func lookupSettlementBatch[Batch appliedBatchView](
+	registry *Registry,
+	batch Batch,
+	attempts *[raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem,
+	entries *[raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem,
+	lookups *[raftmodel.MaxNormalApplyBatchEntries]settlementLookupItem,
+	lookupCount int,
+) error {
+	if err := batch.BeginCompletionLookup(&registry.settlementLookup); err != nil {
+		return unexpectedSettlementError(err)
+	}
+	var lookupErr error
+	for index := 0; index < lookupCount; index++ {
+		item := lookups[index]
+		entry, ok := batch.Entry(int(item.offset))
+		if !ok || len(entry.Data) == 0 {
+			lookupErr = ErrSettlementRange
+			break
+		}
+		identity, identityErr := openCommandIdentity(batch.Group(), entry.Data)
+		if identityErr != nil {
+			lookupErr = fmt.Errorf("%w: command: %v", ErrSettlementResult, identityErr)
+			break
+		}
+		stagedEntry := &entries[item.entry]
+		dst := registry.settlementScratch[:0]
+		direct := stagedEntry.originalCompletionBytes == 0 && stagedEntry.completionBytes == 0
+		if direct {
+			dst = registry.completionSlot(stagedEntry.entry)[:0]
+			stagedEntry.touched = true
+		}
+		lookup, outcome, resultErr := settlementLookup(
+			batch, &registry.settlementLookup, int(item.offset), dst, identity,
 		)
-		if lookupErr != nil {
+		if resultErr == nil && len(lookup.Bytes) != 0 &&
+			(len(dst) != 0 || cap(dst) == 0 || &lookup.Bytes[0] != &dst[:cap(dst)][0]) {
+			resultErr = ErrSettlementResult
+		}
+		if resultErr != nil {
 			clear(registry.settlementScratch)
-			rollback()
-			return lookupErr
+			lookupErr = resultErr
+			break
 		}
 		completionBytes := uint16(len(lookup.Bytes))
-		if attempt.state == attemptComplete {
-			if attempt.outcome != outcome || attempt.hasCompletion != (completionBytes != 0) ||
-				!registry.completionMatchesLocked(logical, lookup) {
-				clear(registry.settlementScratch)
-				rollback()
-				return ErrSettlementResult
-			}
-			clear(registry.settlementScratch)
-			continue
-		}
-
-		item := &attempts[stagedAttempt]
-		if item.observed {
-			if item.outcome != outcome || item.completionBytes != completionBytes ||
-				item.completionApplied != lookup.AppliedSequence {
-				clear(registry.settlementScratch)
-				rollback()
-				return ErrSettlementResult
+		stagedAttempt := &attempts[item.attempt]
+		if stagedAttempt.observed {
+			if stagedAttempt.outcome != outcome ||
+				stagedAttempt.completionBytes != completionBytes ||
+				stagedAttempt.completionApplied != lookup.AppliedSequence {
+				lookupErr = ErrSettlementResult
 			}
 		} else {
-			item.outcome = outcome
-			item.completionBytes = completionBytes
-			item.completionApplied = lookup.AppliedSequence
-			item.observed = true
+			stagedAttempt.outcome = outcome
+			stagedAttempt.completionBytes = completionBytes
+			stagedAttempt.completionApplied = lookup.AppliedSequence
+			stagedAttempt.observed = true
 		}
-		if completionBytes != 0 {
-			if logical.completionLen != 0 {
-				if !registry.completionMatchesLocked(logical, lookup) {
-					clear(registry.settlementScratch)
-					rollback()
-					return ErrSettlementResult
+		if lookupErr == nil && stagedAttempt.originalState == attemptComplete &&
+			(stagedAttempt.originalOutcome != outcome ||
+				stagedAttempt.originalCompletion != (completionBytes != 0)) {
+			lookupErr = ErrSettlementResult
+		}
+		if lookupErr == nil && completionBytes != 0 {
+			slot := registry.completionSlot(stagedEntry.entry)
+			switch {
+			case stagedEntry.originalCompletionBytes != 0:
+				if stagedEntry.originalCompletionApplied != lookup.AppliedSequence ||
+					stagedEntry.originalCompletionBytes != completionBytes ||
+					!bytes.Equal(slot[:stagedEntry.originalCompletionBytes], lookup.Bytes) {
+					lookupErr = ErrSettlementResult
 				}
-			} else if stagedEntry, exists := settlementIndexLookup(&entryTable, entryIndex); exists {
-				stored := entries[stagedEntry]
-				slot := registry.completionSlot(entryIndex)
-				if stored.completionApplied != lookup.AppliedSequence ||
-					stored.completionBytes != completionBytes ||
-					!bytes.Equal(slot[:stored.completionBytes], lookup.Bytes) {
-					clear(registry.settlementScratch)
-					rollback()
-					return ErrSettlementResult
+			case stagedEntry.completionBytes != 0:
+				if stagedEntry.completionApplied != lookup.AppliedSequence ||
+					stagedEntry.completionBytes != completionBytes ||
+					!bytes.Equal(slot[:stagedEntry.completionBytes], lookup.Bytes) {
+					lookupErr = ErrSettlementResult
 				}
-			} else {
-				entries[entryCount] = settlementEntryItem{
-					entry: entryIndex, completionApplied: lookup.AppliedSequence,
-					completionBytes: completionBytes,
+			default:
+				if !direct || lookup.AppliedSequence == 0 {
+					lookupErr = ErrSettlementResult
+				} else {
+					stagedEntry.completionApplied = lookup.AppliedSequence
+					stagedEntry.completionBytes = completionBytes
 				}
-				copy(registry.completionSlot(entryIndex), lookup.Bytes)
-				settlementIndexInsert(&entryTable, entryIndex, uint16(entryCount))
-				entryCount++
 			}
 		}
 		clear(registry.settlementScratch)
+		if lookupErr != nil {
+			break
+		}
 	}
+	endErr := batch.EndCompletionLookup(&registry.settlementLookup)
+	if endErr != nil {
+		endErr = unexpectedSettlementError(endErr)
+	}
+	return errors.Join(lookupErr, endErr)
+}
 
+func rollbackSettlementLocked(
+	registry *Registry,
+	attempts *[raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem,
+	attemptCount int,
+	entries *[raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem,
+	entryCount int,
+) error {
+	for index := 0; index < entryCount; index++ {
+		item := entries[index]
+		if item.touched {
+			if item.originalCompletionBytes != 0 {
+				return registry.corruptLocked(errors.New("settlement touched a published completion"))
+			}
+			clear(registry.completionSlot(item.entry))
+		}
+	}
 	for index := 0; index < attemptCount; index++ {
-		if !attempts[index].observed {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement staged an unobserved attempt"))
-		}
 		item := attempts[index]
-		attempt, _, ok := registry.validAttemptLocked(
-			item.attempt, item.attemptGeneration, attemptSettling,
-		)
-		if !ok || attempt.entry != item.entry {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement staged attempt changed ownership"))
+		if int(item.attempt) >= len(registry.attempts) ||
+			int(item.entry) >= len(registry.entries) {
+			return registry.corruptLocked(errors.New("settlement rollback index is out of range"))
 		}
-		if attempt.admitted {
+		attempt := &registry.attempts[item.attempt]
+		entry := &registry.entries[item.entry]
+		wantState := item.originalState
+		if wantState == attemptPending {
+			wantState = attemptSettling
+		}
+		if !attempt.active || attempt.generation != item.attemptGeneration ||
+			attempt.entry != item.entry || attempt.entryGeneration != item.entryGeneration ||
+			!entry.active || entry.generation != item.entryGeneration ||
+			!attempt.settlementPinned || attempt.state != wantState {
+			return registry.corruptLocked(errors.New("settlement rollback lost its generation fence"))
+		}
+		attempt.settlementPinned = false
+		if item.originalState == attemptPending {
+			if !attempt.lifecyclePending && !attempt.admitted {
+				if attempt.outcome == OutcomePending {
+					return registry.corruptLocked(errors.New("settlement rollback lost proposal refusal outcome"))
+				}
+				attempt.state = attemptComplete
+				if !registry.signalAttemptLocked(item.attempt, attempt) {
+					return registry.failure
+				}
+			} else {
+				attempt.state = attemptPending
+			}
+		}
+	}
+	for index := 0; index < attemptCount; index++ {
+		item := attempts[index]
+		attempt := &registry.attempts[item.attempt]
+		if attempt.active && attempt.generation == item.attemptGeneration &&
+			attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
+			if !registry.removeAttemptLocked(item.attempt) {
+				return registry.failure
+			}
+		}
+	}
+	return nil
+}
+
+func commitSettlementLocked(
+	registry *Registry,
+	group raftmember.GroupKey,
+	attempts *[raftmodel.MaxNormalApplyBatchEntries]settlementAttemptItem,
+	attemptCount int,
+	entries *[raftmodel.MaxNormalApplyBatchEntries]settlementEntryItem,
+	entryCount int,
+) error {
+	pendingToRelease := 0
+	completionToRetain := 0
+	for index := 0; index < attemptCount; index++ {
+		item := attempts[index]
+		if !item.observed || int(item.attempt) >= len(registry.attempts) ||
+			int(item.entry) >= len(registry.entries) {
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement staged an invalid attempt"))
+		}
+		attempt := &registry.attempts[item.attempt]
+		entry := &registry.entries[item.entry]
+		wantState := item.originalState
+		if wantState == attemptPending {
+			wantState = attemptSettling
+		}
+		if !attempt.active || attempt.generation != item.attemptGeneration ||
+			attempt.entry != item.entry || attempt.entryGeneration != item.entryGeneration ||
+			!entry.active || entry.generation != item.entryGeneration ||
+			!attempt.settlementPinned || attempt.state != wantState {
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement staged attempt changed ownership"))
+		}
+		if item.originalState == attemptComplete &&
+			(attempt.outcome != item.originalOutcome ||
+				attempt.hasCompletion != item.originalCompletion || attempt.admitted) {
+			return errors.Join(ErrRegistryCorrupt, errors.New("complete settlement changed while staged"))
+		}
+		if item.originalState == attemptPending && attempt.admitted {
 			if attempt.lifecyclePending {
-				rollback()
-				return registry.corruptLocked(errors.New("admitted settlement retained a lifecycle callback"))
+				return errors.Join(ErrRegistryCorrupt, errors.New("admitted settlement retained a lifecycle callback"))
 			}
 			pendingToRelease++
 		}
 	}
 	if pendingToRelease != 0 {
-		groupIndex, found, groupErr := registry.findGroupLocked(batch.Group())
+		groupIndex, found, groupErr := registry.findGroupLocked(group)
 		if groupErr != nil || !found ||
 			registry.groupTable[groupIndex].pendingAttempts < uint32(pendingToRelease) ||
 			registry.stats.PendingGroups == 0 ||
 			registry.stats.PendingAdmittedAttempts < pendingToRelease {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement pending-group counters are inconsistent"))
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement pending-group counters are inconsistent"))
 		}
 	}
 	for index := 0; index < entryCount; index++ {
 		item := entries[index]
-		if int(item.entry) >= len(registry.entries) || item.completionBytes == 0 ||
-			int(item.completionBytes) > completionSlotBytes ||
-			item.completionApplied == 0 {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement staged invalid completion metadata"))
+		if int(item.entry) >= len(registry.entries) {
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement entry index is out of range"))
 		}
 		entry := &registry.entries[item.entry]
-		if !entry.active || entry.completionLen != 0 {
-			rollback()
-			return registry.corruptLocked(errors.New("settlement completion identity changed before commit"))
+		if !entry.active || entry.generation != item.entryGeneration ||
+			entry.completionLen != item.originalCompletionBytes ||
+			entry.completionApplied != item.originalCompletionApplied {
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement completion identity changed before commit"))
+		}
+		if item.completionBytes == 0 {
+			if item.touched {
+				clear(registry.completionSlot(item.entry))
+			}
+			continue
+		}
+		if item.originalCompletionBytes != 0 || !item.touched ||
+			int(item.completionBytes) > completionSlotBytes || item.completionApplied == 0 {
+			return errors.Join(ErrRegistryCorrupt, errors.New("settlement staged invalid completion metadata"))
 		}
 		completionToRetain += int(item.completionBytes)
 	}
@@ -292,11 +538,13 @@ func settleAppliedBatch[Batch appliedBatchView](
 		completionToRetain > len(registry.completionArena)-registry.stats.RetainedCompletionBytes ||
 		int64(completionToRetain) > registry.limits.MaxRetainedCompletionBytes-
 			int64(registry.stats.RetainedCompletionBytes) {
-		rollback()
-		return registry.corruptLocked(errors.New("settlement completion byte counter is inconsistent"))
+		return errors.Join(ErrRegistryCorrupt, errors.New("settlement completion byte counter is inconsistent"))
 	}
 	for index := 0; index < entryCount; index++ {
 		item := entries[index]
+		if item.completionBytes == 0 {
+			continue
+		}
 		entry := &registry.entries[item.entry]
 		entry.completionLen = item.completionBytes
 		entry.completionApplied = item.completionApplied
@@ -308,25 +556,27 @@ func settleAppliedBatch[Batch appliedBatchView](
 	}
 	for index := 0; index < attemptCount; index++ {
 		item := attempts[index]
-		attempt, _, _ := registry.validAttemptLocked(
-			item.attempt, item.attemptGeneration, attemptSettling,
-		)
-		if attempt.admitted {
-			if !registry.removeGroupPendingLocked(batch.Group()) {
-				registry.poisonLocked(errors.New("settled attempt lost its pending group record"))
-				return registry.failure
+		attempt := &registry.attempts[item.attempt]
+		if item.originalState == attemptPending {
+			if attempt.admitted {
+				if !registry.removeGroupPendingLocked(group) {
+					registry.poisonLocked(errors.New("settled attempt lost its pending group record"))
+					return registry.failure
+				}
+				attempt.admitted = false
 			}
-			attempt.admitted = false
+			attempt.appliedIndex = item.appliedIndex
+			attempt.outcome = item.outcome
+			attempt.hasCompletion = item.completionBytes != 0
+			attempt.state = attemptComplete
 		}
-		attempt.appliedIndex = item.appliedIndex
-		attempt.outcome = item.outcome
-		attempt.hasCompletion = item.completionBytes != 0
-		attempt.state = attemptComplete
+		attempt.settlementPinned = false
 	}
 	for index := 0; index < attemptCount; index++ {
 		item := attempts[index]
 		attempt := &registry.attempts[item.attempt]
-		if !registry.signalAttemptLocked(item.attempt, attempt) {
+		if item.originalState == attemptPending &&
+			!registry.signalAttemptLocked(item.attempt, attempt) {
 			return registry.failure
 		}
 		if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
@@ -393,11 +643,14 @@ func settlementIndexInsert(
 
 func settlementLookup[Batch appliedBatchView](
 	batch Batch,
+	workspace *raftmember.AppliedBatchCompletionWorkspace,
 	offset int,
 	dst []byte,
 	identity commandIdentity,
 ) (replicatedstate.CompletionLookup, OutcomeCode, error) {
-	lookup, hasCommand, lookupErr := batch.LookupCompletionInto(offset, dst)
+	lookup, hasCommand, lookupErr := batch.LookupCompletionIntoWorkspace(
+		workspace, offset, dst,
+	)
 	if !hasCommand {
 		return replicatedstate.CompletionLookup{}, OutcomePending, ErrSettlementResult
 	}
@@ -416,31 +669,6 @@ func settlementLookup[Batch appliedBatchView](
 		return replicatedstate.CompletionLookup{}, OutcomePending, ErrSettlementResult
 	}
 	return lookup, outcome, nil
-}
-
-func (registry *Registry) completionMatchesLocked(
-	entry *entryRecord,
-	lookup replicatedstate.CompletionLookup,
-) bool {
-	if len(lookup.Bytes) == 0 {
-		return true
-	}
-	if entry == nil || entry.completionLen == 0 ||
-		entry.completionApplied != lookup.AppliedSequence ||
-		int(entry.completionLen) != len(lookup.Bytes) {
-		return false
-	}
-	// tableSlot is not the arena index. Resolve the table's generation-fenced
-	// entry index before reading its completion slot.
-	if int(entry.tableSlot) >= len(registry.table) {
-		return false
-	}
-	table := registry.table[entry.tableSlot]
-	if table.state != tableOccupied || table.generation != entry.generation {
-		return false
-	}
-	slot := registry.completionSlot(table.entry)
-	return bytes.Equal(slot[:entry.completionLen], lookup.Bytes)
 }
 
 func transitionMatchesGroup(

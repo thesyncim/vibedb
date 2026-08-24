@@ -88,6 +88,16 @@ type AppliedBatch struct {
 	source AppliedBatchSource
 }
 
+// AppliedBatchCompletionWorkspace owns one reusable exact completion cut for a
+// serialized AppliedBatch settlement. The zero value is ready for use. It is
+// single-consumer, must not be copied, and retains only bounded snapshot
+// scratch between batches.
+type AppliedBatchCompletionWorkspace struct {
+	apply  sqldriver.CompletionLookupWorkspace
+	owner  *sqldriver.ReplicatedApply
+	source AppliedBatchSource
+}
+
 // AppliedBatchSource is the fixed identity of one applied Ready interval.
 // ReadyID is scoped by the exact local member store and Node incarnation.
 type AppliedBatchSource struct {
@@ -169,6 +179,73 @@ func (batch AppliedBatch) LookupCompletionInto(
 	}
 	lookup, err = batch.apply.LookupCompletionInto(entry.Data, dst)
 	return lookup, true, err
+}
+
+// BeginCompletionLookup captures one exact durable cut for every completion
+// lookup subsequently made through workspace for this AppliedBatch.
+func (batch AppliedBatch) BeginCompletionLookup(
+	workspace *AppliedBatchCompletionWorkspace,
+) error {
+	if batch.apply == nil {
+		return ErrRuntimeClosed
+	}
+	if workspace == nil || workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	if err := batch.apply.BeginCompletionLookupBatch(
+		&workspace.apply, batch.FinalPublication(),
+	); err != nil {
+		return err
+	}
+	workspace.owner = batch.apply
+	workspace.source = batch.source
+	return nil
+}
+
+// LookupCompletionIntoWorkspace is LookupCompletionInto through the exact cut
+// captured by BeginCompletionLookup.
+func (batch AppliedBatch) LookupCompletionIntoWorkspace(
+	workspace *AppliedBatchCompletionWorkspace,
+	index int,
+	dst []byte,
+) (lookup replicatedstate.CompletionLookup, hasCommand bool, err error) {
+	if workspace == nil || workspace.owner != batch.apply || workspace.source != batch.source {
+		return replicatedstate.CompletionLookup{}, false, replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	entry, ok := batch.normal.Entry(index)
+	if !ok {
+		return replicatedstate.CompletionLookup{}, false, errors.New("raftmember: applied result index out of range")
+	}
+	if len(entry.Data) == 0 {
+		return replicatedstate.CompletionLookup{}, false, nil
+	}
+	lookup, err = batch.apply.LookupCompletionIntoWorkspace(&workspace.apply, entry.Data, dst)
+	return lookup, true, err
+}
+
+// EndCompletionLookup releases the exact durable cut. The workspace remains
+// warm for a later AppliedBatch.
+func (batch AppliedBatch) EndCompletionLookup(
+	workspace *AppliedBatchCompletionWorkspace,
+) error {
+	if workspace == nil || workspace.owner != batch.apply || workspace.source != batch.source {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	workspace.owner = nil
+	workspace.source = AppliedBatchSource{}
+	return batch.apply.EndCompletionLookupBatch(&workspace.apply)
+}
+
+// Release drops every inactive reusable snapshot buffer retained by workspace.
+func (workspace *AppliedBatchCompletionWorkspace) Release() error {
+	if workspace == nil {
+		return nil
+	}
+	if workspace.owner != nil {
+		return replicatedstate.ErrCompletionWorkspaceBusy
+	}
+	workspace.source = AppliedBatchSource{}
+	return workspace.apply.Release()
 }
 
 // ResultSettlementSink runs synchronously after apply publication and before

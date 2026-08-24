@@ -352,8 +352,26 @@ func servingCommand(
 }
 
 func newServingRuntime(
-	t *testing.T,
+	t testing.TB,
 	seed byte,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+	return newServingRuntimeWithRetryWindow(t, seed, 8)
+}
+
+func newServingRuntimeWithRetryWindow(
+	t testing.TB,
+	seed byte,
+	retryWindow uint16,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+	return newServingRuntimeWithVoters(t, seed, retryWindow, 16, nil)
+}
+
+func newServingRuntimeWithVoters(
+	t testing.TB,
+	seed byte,
+	retryWindow uint16,
+	maxSessions uint64,
+	voters []uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
 	t.Helper()
 	identity := raftstore.Identity{
@@ -367,6 +385,9 @@ func newServingRuntime(
 		identity.ShardIncarnation[index] = seed + byte(index) + 37
 		identity.GroupID[index] = seed + byte(index) + 55
 		identity.StoreID[index] = seed + byte(index) + 73
+	}
+	if len(voters) == 0 {
+		voters = []uint64{identity.MemberID}
 	}
 	key := raftstore.Key{ID: "raftserve-test-key", Wrapped: []byte("opaque-test-wrapped-key")}
 	for index := range key.Material {
@@ -386,7 +407,7 @@ func newServingRuntime(
 				Data: []byte("raftserve-static-bootstrap"),
 				Metadata: &pb.SnapshotMetadata{
 					Index: &index, Term: &term,
-					ConfState: &pb.ConfState{Voters: []uint64{identity.MemberID}},
+					ConfState: &pb.ConfState{Voters: voters},
 				},
 			},
 		}, options,
@@ -437,9 +458,9 @@ func newServingRuntime(
 	apply, _, err := raftmember.OpenPreparedApply(
 		wal, database, authority, base,
 		sqldriver.ReplicatedApplyOptions{
-			MaxSessions: 16, RetryWindow: 8,
+			MaxSessions: maxSessions, RetryWindow: retryWindow,
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 16, MaxDocuments: 256, MaxBytes: 64 << 20,
+				MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 64 << 20,
 			},
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format:   sqldriver.ReplicatedPlacementProfileFormat,

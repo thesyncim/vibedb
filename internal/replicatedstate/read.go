@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 // LookupCompletion resolves data through the bounded session ring. A conflict
@@ -39,6 +41,175 @@ func (m *Machine) LookupCompletionInto(
 	return result, err
 }
 
+// CompletionLookupWorkspace owns one reusable, exact system-collection cut for
+// a serialized batch of completion lookups. The zero value is ready for use.
+// It is single-consumer, must not be copied, and retains only bounded durable
+// snapshot scratch after EndCompletionLookupBatch.
+type CompletionLookupWorkspace struct {
+	cut         durable.DatabaseSnapshot
+	catalog     [1]durable.NamedCollection
+	snapshot    *durable.Snapshot
+	owner       *Machine
+	scratch     commandPlanScratch
+	sessionRead [MaxSessionRecordBytes]byte
+	slotRead    [MaxSessionSlotRecordBytes]byte
+	// The compact opaque-value point decoder may first materialize another
+	// row's front-compression restart value before shrinking to the requested
+	// session or slot record. Every value the private system collection writes
+	// is bounded by maxCompletionLookupDecodeBytes.
+	decodeRead [maxCompletionLookupDecodeBytes]byte
+}
+
+const maxCompletionLookupDecodeBytes = max(
+	MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
+)
+
+// BeginCompletionLookupBatch captures one exact system-collection generation
+// and holds the Machine publication lock until EndCompletionLookupBatch. Every
+// lookup in the batch therefore observes the same durable session-ring cut.
+func (m *Machine) BeginCompletionLookupBatch(
+	workspace *CompletionLookupWorkspace,
+	expected raftmodel.Publication,
+) error {
+	return m.beginCompletionLookupBatch(workspace, expected, true)
+}
+
+func (m *Machine) beginCompletionLookupBatch(
+	workspace *CompletionLookupWorkspace,
+	expected raftmodel.Publication,
+	validatePublication bool,
+) error {
+	if m == nil || workspace == nil {
+		return ErrCompletionWorkspaceBusy
+	}
+	if workspace.owner != nil {
+		return ErrCompletionWorkspaceBusy
+	}
+	m.mu.Lock()
+	if err := m.checkUsable(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	if !m.initialized {
+		m.mu.Unlock()
+		return ErrWrongBinding
+	}
+	if validatePublication && (m.state.Applied != expected.Applied ||
+		m.state.DataChainDigest != expected.DataChainDigest ||
+		m.state.ReplicaSetVersion != expected.ReplicaSetVersion ||
+		!equalCompletionConfState(m.state.ConfState, expected.ConfState)) {
+		m.mu.Unlock()
+		return ErrCompletionPublication
+	}
+	workspace.catalog[0] = durable.NamedCollection{
+		Name: systemCollectionName, Collection: m.system.Collection,
+	}
+	if err := durable.SnapshotCollectionsInto(&workspace.cut, workspace.catalog[:]); err != nil {
+		clear(workspace.catalog[:])
+		err = m.fail(err)
+		m.mu.Unlock()
+		return err
+	}
+	snapshot, ok := workspace.cut.Collection(systemCollectionName)
+	if !ok || snapshot == nil {
+		err := m.fail(errors.Join(ErrInconsistentSnapshot, workspace.cut.Close()))
+		clear(workspace.catalog[:])
+		m.mu.Unlock()
+		return err
+	}
+	workspace.scratch.sessionRead = workspace.sessionRead[:0]
+	workspace.scratch.slotRead = workspace.slotRead[:0]
+	workspace.scratch.decodeRead = workspace.decodeRead[:0]
+	workspace.snapshot = snapshot
+	workspace.owner = m
+	return nil
+}
+
+func equalCompletionConfState(left, right *pb.ConfState) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if (left.AutoLeave == nil) != (right.AutoLeave == nil) ||
+		left.AutoLeave != nil && *left.AutoLeave != *right.AutoLeave {
+		return false
+	}
+	return slices.Equal(left.Voters, right.Voters) &&
+		slices.Equal(left.Learners, right.Learners) &&
+		slices.Equal(left.VotersOutgoing, right.VotersOutgoing) &&
+		slices.Equal(left.LearnersNext, right.LearnersNext) &&
+		slices.Equal(left.ProtoReflect().GetUnknown(), right.ProtoReflect().GetUnknown())
+}
+
+// LookupCompletionIntoWorkspace resolves one command through the exact cut
+// held by BeginCompletionLookupBatch. Result bytes are detached into dst.
+func (m *Machine) LookupCompletionIntoWorkspace(
+	workspace *CompletionLookupWorkspace,
+	data []byte,
+	dst []byte,
+) (CompletionLookup, error) {
+	if workspace == nil || workspace.owner != m || workspace.snapshot == nil {
+		return CompletionLookup{}, ErrCompletionWorkspaceBusy
+	}
+	if cap(dst) < replication.MaxEmptyResultCompletionEnvelopeBytes {
+		return CompletionLookup{}, ErrCompletionBufferSmall
+	}
+	command, err := replication.OpenCommand(data)
+	if err != nil {
+		return CompletionLookup{}, err
+	}
+	if !m.immutableBindingMatches(command) {
+		return CompletionLookup{}, ErrWrongBinding
+	}
+	result, err := m.lookupCompletionAtSnapshot(
+		command,
+		dst[:0:replication.MaxEmptyResultCompletionEnvelopeBytes],
+		workspace,
+	)
+	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
+		return CompletionLookup{}, ErrCompletionCorrupt
+	}
+	return result, err
+}
+
+// EndCompletionLookupBatch releases the exact cut and Machine publication
+// lock. The workspace remains warm for a later batch.
+func (m *Machine) EndCompletionLookupBatch(
+	workspace *CompletionLookupWorkspace,
+) error {
+	if workspace == nil || workspace.owner != m {
+		return ErrCompletionWorkspaceBusy
+	}
+	workspace.owner = nil
+	workspace.snapshot = nil
+	clear(workspace.catalog[:])
+	workspace.scratch.sessionRead = workspace.sessionRead[:0]
+	workspace.scratch.slotRead = workspace.slotRead[:0]
+	workspace.scratch.decodeRead = workspace.decodeRead[:0]
+	err := workspace.cut.Close()
+	if err != nil {
+		err = m.fail(err)
+	}
+	m.mu.Unlock()
+	return err
+}
+
+// Release drops every inactive reusable snapshot buffer retained by workspace.
+func (workspace *CompletionLookupWorkspace) Release() error {
+	if workspace == nil {
+		return nil
+	}
+	if workspace.owner != nil {
+		return ErrCompletionWorkspaceBusy
+	}
+	workspace.snapshot = nil
+	clear(workspace.catalog[:])
+	workspace.scratch = commandPlanScratch{}
+	clear(workspace.sessionRead[:])
+	clear(workspace.slotRead[:])
+	clear(workspace.decodeRead[:])
+	return workspace.cut.Release()
+}
+
 func (m *Machine) lookupCompletion(
 	data []byte,
 	completionScratch []byte,
@@ -47,27 +218,41 @@ func (m *Machine) lookupCompletion(
 	if err != nil {
 		return CompletionLookup{}, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := m.checkUsable(); err != nil {
+	var workspace CompletionLookupWorkspace
+	if err := m.beginCompletionLookupBatch(
+		&workspace, raftmodel.Publication{}, false,
+	); err != nil {
 		return CompletionLookup{}, err
 	}
-	if !m.initialized || !m.immutableBindingMatches(command) {
+	if !m.immutableBindingMatches(command) {
+		endErr := m.EndCompletionLookupBatch(&workspace)
+		_ = workspace.Release()
+		if endErr != nil {
+			return CompletionLookup{}, endErr
+		}
 		return CompletionLookup{}, ErrWrongBinding
 	}
-	cut, err := durable.SnapshotCollections([]durable.NamedCollection{{
-		Name: systemCollectionName, Collection: m.system.Collection,
-	}})
-	if err != nil {
-		return CompletionLookup{}, m.fail(err)
+	result, lookupErr := m.lookupCompletionAtSnapshot(
+		command, completionScratch, &workspace,
+	)
+	endErr := m.EndCompletionLookupBatch(&workspace)
+	_ = workspace.Release()
+	if endErr != nil {
+		return CompletionLookup{}, errors.Join(lookupErr, endErr)
 	}
-	snapshot, ok := cut.Collection(systemCollectionName)
-	if !ok || snapshot == nil {
-		return CompletionLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
-	}
+	return result, lookupErr
+}
+
+func (m *Machine) lookupCompletionAtSnapshot(
+	command replication.CommandView,
+	completionScratch []byte,
+	workspace *CompletionLookupWorkspace,
+) (CompletionLookup, error) {
+	snapshot := workspace.snapshot
+	scratch := &workspace.scratch
 	digest := SessionKey(command.Tenant, command.ClientID)
 	key := SessionStorageKey(digest)
-	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, nil)
+	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, scratch)
 	if readErr == nil && found &&
 		(session.Digest != digest || !bytes.Equal(session.Tenant, command.Tenant) ||
 			session.ClientID != command.ClientID) {
@@ -77,33 +262,26 @@ func (m *Machine) lookupCompletion(
 		readErr = fmt.Errorf("%w: retry-window mismatch", ErrSessionCorrupt)
 	}
 	if readErr != nil {
-		err = errors.Join(readErr, cut.Close())
-		if err != nil {
-			return CompletionLookup{}, m.fail(err)
-		}
+		return CompletionLookup{}, m.fail(readErr)
 	}
 	if !found {
 		orphanErr := ensureNoSessionSlots(
 			pointSnapshot{value: snapshot}, digest, m.options.RetryWindow,
 		)
 		if orphanErr != nil {
-			return CompletionLookup{}, m.fail(errors.Join(orphanErr, cut.Close()))
+			return CompletionLookup{}, m.fail(orphanErr)
 		}
 	}
 	if command.Kind() == replication.CommandSessionOpen {
 		if !found {
-			if closeErr := cut.Close(); closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			return CompletionLookup{}, ErrCompletionNotFound
 		}
 		openKey, keyErr := SessionSlotStorageKey(digest, 0)
 		if keyErr != nil {
-			_ = cut.Close()
 			return CompletionLookup{}, m.fail(keyErr)
 		}
 		record, slotFound, slotErr := sessionSlotAt(
-			pointSnapshot{value: snapshot}, openKey, nil,
+			pointSnapshot{value: snapshot}, openKey, scratch,
 		)
 		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 			record.Slot != 0 || record.ClientEpoch != session.ClientEpoch) {
@@ -123,9 +301,8 @@ func (m *Machine) lookupCompletion(
 				completionScratch[:0], session, record,
 			)
 		}
-		closeErr := cut.Close()
-		if slotErr != nil || closeErr != nil {
-			return CompletionLookup{}, m.fail(errors.Join(slotErr, closeErr))
+		if slotErr != nil {
+			return CompletionLookup{}, m.fail(slotErr)
 		}
 		if !currentOpen {
 			// A canonical later result now occupies physical slot zero, so the
@@ -156,47 +333,30 @@ func (m *Machine) lookupCompletion(
 	}
 	if command.Kind() == replication.CommandSessionRelease {
 		if !found || command.ClientEpoch < session.ClientEpoch {
-			closeErr := cut.Close()
-			if closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			if command.ClientEpoch <= m.state.SessionEpochHighWater {
 				return CompletionLookup{}, ErrSessionReleased
 			}
 			return CompletionLookup{}, ErrCompletionNotFound
 		}
 		if command.ClientEpoch > session.ClientEpoch {
-			if closeErr := cut.Close(); closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			return CompletionLookup{}, ErrCompletionNotFound
 		}
 		if session.Status != SessionRetired {
-			if closeErr := cut.Close(); closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			return CompletionLookup{}, ErrSessionActive
 		}
 		if command.ClientSequence != session.HighSequence {
-			if closeErr := cut.Close(); closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			return CompletionLookup{}, ErrSessionSequence
 		}
 		if command.AckThrough != session.HighSequence-1 {
-			if closeErr := cut.Close(); closeErr != nil {
-				return CompletionLookup{}, m.fail(closeErr)
-			}
 			return CompletionLookup{}, ErrSessionAck
 		}
 		retirementSlot := uint16((session.HighSequence - 1) % uint64(session.RetryWindow))
 		retirementKey, keyErr := SessionSlotStorageKey(digest, retirementSlot)
 		if keyErr != nil {
-			_ = cut.Close()
 			return CompletionLookup{}, m.fail(keyErr)
 		}
 		record, slotFound, slotErr := sessionSlotAt(
-			pointSnapshot{value: snapshot}, retirementKey, nil,
+			pointSnapshot{value: snapshot}, retirementKey, scratch,
 		)
 		if slotErr == nil && (!slotFound || record.SessionDigest != digest ||
 			record.Slot != retirementSlot || record.ClientEpoch != session.ClientEpoch ||
@@ -210,9 +370,8 @@ func (m *Machine) lookupCompletion(
 		if slotErr == nil {
 			slotErr = validateSessionSlotAgainstHeader(session, record)
 		}
-		closeErr := cut.Close()
-		if slotErr != nil || closeErr != nil {
-			return CompletionLookup{}, m.fail(errors.Join(slotErr, closeErr))
+		if slotErr != nil {
+			return CompletionLookup{}, m.fail(slotErr)
 		}
 		if session.RetryHome != command.RetryHome || record.Fingerprint != command.Fingerprint {
 			return CompletionLookup{Key: digest}, &RequestConflictError{Key: digest}
@@ -220,10 +379,6 @@ func (m *Machine) lookupCompletion(
 		return CompletionLookup{}, ErrCompletionNotFound
 	}
 	if !found {
-		err = cut.Close()
-		if err != nil {
-			return CompletionLookup{}, m.fail(err)
-		}
 		if command.ClientEpoch <= m.state.SessionEpochHighWater {
 			return CompletionLookup{}, ErrRetryRetired
 		}
@@ -232,17 +387,9 @@ func (m *Machine) lookupCompletion(
 	if command.ClientEpoch < session.ClientEpoch ||
 		command.ClientEpoch == session.ClientEpoch &&
 			command.ClientSequence <= sessionRetryFloor(session) {
-		err = cut.Close()
-		if err != nil {
-			return CompletionLookup{}, m.fail(err)
-		}
 		return CompletionLookup{}, ErrRetryRetired
 	}
 	if command.ClientEpoch > session.ClientEpoch || command.ClientSequence > session.HighSequence {
-		err = cut.Close()
-		if err != nil {
-			return CompletionLookup{}, m.fail(err)
-		}
 		if command.ClientEpoch == session.ClientEpoch && session.Status == SessionRetired {
 			return CompletionLookup{}, ErrSessionRetired
 		}
@@ -251,11 +398,10 @@ func (m *Machine) lookupCompletion(
 	slot := uint16((command.ClientSequence - 1) % uint64(session.RetryWindow))
 	slotKey, keyErr := SessionSlotStorageKey(digest, slot)
 	if keyErr != nil {
-		_ = cut.Close()
 		return CompletionLookup{}, m.fail(keyErr)
 	}
 	record, slotFound, slotErr := sessionSlotAt(
-		pointSnapshot{value: snapshot}, slotKey, nil,
+		pointSnapshot{value: snapshot}, slotKey, scratch,
 	)
 	if slotErr == nil && (!slotFound || record.SessionDigest != digest || record.Slot != slot ||
 		record.ClientEpoch != command.ClientEpoch || record.ClientSequence != command.ClientSequence) {
@@ -276,9 +422,8 @@ func (m *Machine) lookupCompletion(
 			slotErr = fmt.Errorf("%w: reconstruct completion: %v", ErrSessionCorrupt, slotErr)
 		}
 	}
-	err = errors.Join(slotErr, cut.Close())
-	if err != nil {
-		return CompletionLookup{}, m.fail(err)
+	if slotErr != nil {
+		return CompletionLookup{}, m.fail(slotErr)
 	}
 	result := CompletionLookup{
 		Key: digest, Bytes: completionBytes,

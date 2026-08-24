@@ -151,6 +151,7 @@ type attemptRecord struct {
 	hasCompletion    bool
 	lifecyclePending bool
 	admitted         bool
+	settlementPinned bool
 	active           bool
 }
 
@@ -198,6 +199,7 @@ type Registry struct {
 	tenantArena       []byte
 	completionArena   []byte
 	settlementScratch []byte
+	settlementLookup  raftmember.AppliedBatchCompletionWorkspace
 
 	freeEntry   uint32
 	freeAttempt uint32
@@ -496,7 +498,8 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 		!attempt.lifecyclePending || attempt.admitted {
 		return
 	}
-	if attempt.state != attemptPending && attempt.state != attemptComplete {
+	if attempt.state != attemptPending && attempt.state != attemptSettling &&
+		attempt.state != attemptComplete {
 		registry.poisonLocked(errors.New("rollback found invalid proposal lifecycle state"))
 		return
 	}
@@ -510,7 +513,8 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 		}
 	}
 	if attempt.active && attempt.generation == token.attemptGeneration {
-		if attempt.state == attemptPending {
+		switch attempt.state {
+		case attemptPending:
 			if attempt.waiterCount == 0 {
 				registry.removeAttemptLocked(token.attempt)
 				return
@@ -520,8 +524,12 @@ func (registry *Registry) rollbackRegistrationLocked(token registrationToken) {
 			if !registry.signalAttemptLocked(token.attempt, attempt) {
 				return
 			}
-		} else if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
-			registry.removeAttemptLocked(token.attempt)
+		case attemptSettling:
+			attempt.outcome = OutcomeProposalRefused
+		case attemptComplete:
+			if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
+				registry.removeAttemptLocked(token.attempt)
+			}
 		}
 	}
 }
@@ -563,12 +571,17 @@ func (registry *Registry) settleProposalAdmission(
 	}
 	attempt.lifecyclePending = false
 	if admission.Admitted {
-		if attempt.state == attemptPending {
+		switch attempt.state {
+		case attemptPending, attemptSettling:
 			if !registry.addGroupPendingLocked(entry.position.group) {
 				registry.poisonLocked(errors.New("admitted proposal has no group capacity record"))
 				return
 			}
 			attempt.admitted = true
+		case attemptComplete:
+		default:
+			registry.poisonLocked(errors.New("proposal admission found an invalid attempt state"))
+			return
 		}
 		if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
 			if !registry.removeAttemptLocked(attemptIndex) {
@@ -578,14 +591,14 @@ func (registry *Registry) settleProposalAdmission(
 		return
 	}
 	if attempt.state == attemptComplete {
-		if attempt.waiterCount == 0 {
+		if attempt.waiterCount == 0 && registry.attemptRemovableLocked(attempt) {
 			if !registry.removeAttemptLocked(attemptIndex) {
 				return
 			}
 		}
 		return
 	}
-	if attempt.state != attemptPending || attempt.admitted {
+	if attempt.admitted || (attempt.state != attemptPending && attempt.state != attemptSettling) {
 		registry.poisonLocked(errors.New("proposal refusal after local admission"))
 		return
 	}
@@ -594,6 +607,9 @@ func (registry *Registry) settleProposalAdmission(
 		attempt.outcome = OutcomeNotLeader
 	} else if deterministic, known := outcomeCode(admission.Cause); known {
 		attempt.outcome = deterministic
+	}
+	if attempt.state == attemptSettling {
+		return
 	}
 	attempt.state = attemptComplete
 	if !registry.signalAttemptLocked(attemptIndex, attempt) {
@@ -615,6 +631,8 @@ func (registry *Registry) TerminateGroup(
 	if registry == nil {
 		return ErrRegistryClosed
 	}
+	registry.settleMu.Lock()
+	defer registry.settleMu.Unlock()
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	if registry.closed {
@@ -636,6 +654,8 @@ func (registry *Registry) settleProposalGroupTermination(
 	if registry == nil {
 		return
 	}
+	registry.settleMu.Lock()
+	defer registry.settleMu.Unlock()
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	if registry.closed || registry.failure != nil {
@@ -1424,6 +1444,9 @@ func (registry *Registry) attemptRemovableLocked(attempt *attemptRecord) bool {
 	if attempt == nil || !attempt.active {
 		return false
 	}
+	if attempt.settlementPinned {
+		return false
+	}
 	switch attempt.state {
 	case attemptSettling:
 		return false
@@ -1443,7 +1466,7 @@ func (registry *Registry) removeAttemptLocked(index uint32) bool {
 		return false
 	}
 	attempt := &registry.attempts[index]
-	if !attempt.active || attempt.admitted || attempt.waiterCount != 0 ||
+	if !attempt.active || attempt.admitted || attempt.settlementPinned || attempt.waiterCount != 0 ||
 		attempt.waiterHead != noIndex || attempt.next == index ||
 		int(attempt.entry) >= len(registry.entries) ||
 		(registry.freeAttempt != noIndex && int(registry.freeAttempt) >= len(registry.attempts)) ||
@@ -1680,6 +1703,9 @@ func (registry *Registry) Close() error {
 	}
 	registry.settleMu.Lock()
 	defer registry.settleMu.Unlock()
+	if err := registry.settlementLookup.Release(); err != nil {
+		return err
+	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	if registry.closed {
@@ -1846,7 +1872,7 @@ func (registry *Registry) pollWaiterLocked(
 		)
 	}
 	switch attempt.state {
-	case attemptPending:
+	case attemptPending, attemptSettling:
 		return Outcome{}, false, nil
 	case attemptComplete:
 	default:

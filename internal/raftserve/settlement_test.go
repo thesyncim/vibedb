@@ -2,10 +2,15 @@ package raftserve
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -24,6 +29,66 @@ type testAppliedBatch struct {
 	entries []raftmodel.NormalApply
 	pub     raftmodel.Publication
 	lookups []testBatchLookup
+}
+
+type gatedTestAppliedBatch struct {
+	testAppliedBatch
+	gate *testBatchLookupGate
+}
+
+type testBatchLookupGate struct {
+	entered   chan struct{}
+	proceed   chan struct{}
+	beginErr  error
+	endErr    error
+	enterOnce sync.Once
+	begins    atomic.Int32
+	lookups   atomic.Int32
+	ends      atomic.Int32
+}
+
+func newTestBatchLookupGate() *testBatchLookupGate {
+	return &testBatchLookupGate{entered: make(chan struct{}), proceed: make(chan struct{})}
+}
+
+func (batch gatedTestAppliedBatch) BeginCompletionLookup(
+	*raftmember.AppliedBatchCompletionWorkspace,
+) error {
+	batch.gate.begins.Add(1)
+	batch.gate.enterOnce.Do(func() { close(batch.gate.entered) })
+	<-batch.gate.proceed
+	return batch.gate.beginErr
+}
+
+func (batch gatedTestAppliedBatch) LookupCompletionIntoWorkspace(
+	_ *raftmember.AppliedBatchCompletionWorkspace,
+	index int,
+	dst []byte,
+) (replicatedstate.CompletionLookup, bool, error) {
+	batch.gate.lookups.Add(1)
+	return batch.testAppliedBatch.LookupCompletionInto(index, dst)
+}
+
+func (batch gatedTestAppliedBatch) EndCompletionLookup(
+	*raftmember.AppliedBatchCompletionWorkspace,
+) error {
+	batch.gate.ends.Add(1)
+	return batch.gate.endErr
+}
+
+type refusingProposalHost struct {
+	registry *Registry
+}
+
+func (host *refusingProposalHost) EnqueueTrackedProposal(
+	group raftmember.GroupKey,
+	_ []byte,
+	token multiraft.ProposalToken,
+) error {
+	host.registry.settleProposalAdmission(multiraft.ProposalAdmission{
+		Group: group, Token: token, Cause: multiraft.ErrQueueFull,
+	})
+	return nil
 }
 
 func (batch testAppliedBatch) Len() int                                { return len(batch.entries) }
@@ -52,6 +117,26 @@ func (batch testAppliedBatch) LookupCompletionInto(
 	result := lookup.lookup
 	result.Bytes = append(dst[:0], result.Bytes...)
 	return result, true, lookup.err
+}
+
+func (batch testAppliedBatch) BeginCompletionLookup(
+	*raftmember.AppliedBatchCompletionWorkspace,
+) error {
+	return nil
+}
+
+func (batch testAppliedBatch) LookupCompletionIntoWorkspace(
+	_ *raftmember.AppliedBatchCompletionWorkspace,
+	index int,
+	dst []byte,
+) (replicatedstate.CompletionLookup, bool, error) {
+	return batch.LookupCompletionInto(index, dst)
+}
+
+func (batch testAppliedBatch) EndCompletionLookup(
+	*raftmember.AppliedBatchCompletionWorkspace,
+) error {
+	return nil
 }
 
 func newTestAppliedBatch(
@@ -391,5 +476,189 @@ func TestRegistrySettlementMixedCompletionAndRefusalIsAtomic(t *testing.T) {
 	if got := registry.Stats(); got.RetainedCompletionBytes != len(completion.Bytes) ||
 		got.PendingGroups != 0 || got.PendingAdmittedAttempts != 0 {
 		t.Fatalf("mixed completion accounting = %+v", got)
+	}
+}
+
+func TestRegistrySettlementLookupDoesNotBlockUnrelatedGroupEnqueueAndWait(t *testing.T) {
+	registry := testRegistry(t, 2, 2, 2)
+	mainHost := &testProposalHost{registry: registry, admit: true}
+	mainGroup := testGroup(51)
+	mainData := encodeTestCommand(t, testCommand(mainGroup, 31, 2))
+	mainWaiter, err := registry.Enqueue(mainHost, mainGroup, mainData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := newTestAppliedBatch(mainGroup, 180, 21, mainData)
+	batch.lookups[0].lookup = testCompletion(t, mainGroup, mainData, 180)
+	gate := newTestBatchLookupGate()
+	gated := gatedTestAppliedBatch{testAppliedBatch: batch, gate: gate}
+	settled := make(chan error, 1)
+	go func() { settled <- settleAppliedBatch(registry, gated) }()
+	<-gate.entered
+
+	registry.mu.Lock()
+	mainRecord := registry.waiters[mainWaiter.index]
+	mainAttempt := registry.attempts[mainRecord.attempt]
+	registry.mu.Unlock()
+	if mainAttempt.state != attemptSettling || !mainAttempt.settlementPinned {
+		t.Fatalf("gated attempt = %+v", mainAttempt)
+	}
+
+	type waitResult struct {
+		outcome Outcome
+		err     error
+	}
+	unrelatedDone := make(chan waitResult, 1)
+	go func() {
+		group := testGroup(52)
+		data := encodeTestCommand(t, testCommand(group, 32, 2))
+		waiter, enqueueErr := registry.Enqueue(
+			&refusingProposalHost{registry: registry}, group, data,
+		)
+		if enqueueErr != nil {
+			unrelatedDone <- waitResult{err: enqueueErr}
+			return
+		}
+		outcome, waitErr := waiter.Wait(context.Background())
+		unrelatedDone <- waitResult{outcome: outcome, err: waitErr}
+	}()
+	select {
+	case result := <-unrelatedDone:
+		if result.err != nil || result.outcome.Code != OutcomeProposalRefused {
+			t.Fatalf("unrelated enqueue/wait = %+v, %v", result.outcome, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated group Enqueue/Wait blocked behind completion lookup")
+	}
+
+	close(gate.proceed)
+	if err := <-settled; err != nil {
+		t.Fatal(err)
+	}
+	if gate.begins.Load() != 1 || gate.lookups.Load() != 1 || gate.ends.Load() != 1 {
+		t.Fatalf("workspace calls = begin %d lookup %d end %d",
+			gate.begins.Load(), gate.lookups.Load(), gate.ends.Load())
+	}
+	if outcome, ready, pollErr := mainWaiter.Poll(); pollErr != nil || !ready ||
+		outcome.Code != OutcomeCompletion {
+		t.Fatalf("main settlement = %+v, %v, %v", outcome, ready, pollErr)
+	}
+}
+
+func TestRegistrySettlementLifecycleCallbacksWhileLookupIsStaged(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		admitted   bool
+		endFailure bool
+	}{
+		{name: "admitted-success", admitted: true},
+		{name: "refused-success"},
+		{name: "admitted-end-failure", admitted: true, endFailure: true},
+		{name: "refused-end-failure", endFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := testRegistry(t, 1, 1, 1)
+			host := &delayedProposalHost{registry: registry}
+			group := testGroup(53)
+			data := encodeTestCommand(t, testCommand(group, 33, 2))
+			waiter, err := registry.Enqueue(host, group, data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch := newTestAppliedBatch(group, 190, 22, data)
+			batch.lookups[0].lookup = testCompletion(t, group, data, 190)
+			gate := newTestBatchLookupGate()
+			if test.endFailure {
+				gate.endErr = errors.New("injected completion-cut close failure")
+			}
+			settled := make(chan error, 1)
+			go func() {
+				settled <- settleAppliedBatch(
+					registry,
+					gatedTestAppliedBatch{testAppliedBatch: batch, gate: gate},
+				)
+			}()
+			<-gate.entered
+
+			admission := multiraft.ProposalAdmission{
+				Group: group, Token: host.token, Admitted: test.admitted,
+			}
+			if !test.admitted {
+				admission.Cause = multiraft.ErrQueueFull
+			}
+			registry.settleProposalAdmission(admission)
+			close(gate.proceed)
+			settleErr := <-settled
+			if test.endFailure {
+				if !errors.Is(settleErr, ErrSettlementResult) {
+					t.Fatalf("settlement error = %v", settleErr)
+				}
+				outcome, ready, pollErr := waiter.Poll()
+				if test.admitted {
+					if pollErr != nil || ready || outcome != (Outcome{}) ||
+						registry.Stats().PendingAdmittedAttempts != 1 {
+						t.Fatalf("admitted rollback = %+v, %v, %v, stats %+v",
+							outcome, ready, pollErr, registry.Stats())
+					}
+				} else if pollErr != nil || !ready || outcome.Code != OutcomeProposalRefused ||
+					registry.Stats().PendingAdmittedAttempts != 0 {
+					t.Fatalf("refused rollback = %+v, %v, %v, stats %+v",
+						outcome, ready, pollErr, registry.Stats())
+				}
+				return
+			}
+			if settleErr != nil {
+				t.Fatal(settleErr)
+			}
+			outcome, ready, pollErr := waiter.Poll()
+			if pollErr != nil || !ready || outcome.Code != OutcomeCompletion ||
+				outcome.AppliedIndex != 190 || registry.Stats().PendingAdmittedAttempts != 0 {
+				t.Fatalf("successful callback race = %+v, %v, %v, stats %+v",
+					outcome, ready, pollErr, registry.Stats())
+			}
+		})
+	}
+}
+
+func TestRegistryTerminateGroupWaitsForStagedSettlement(t *testing.T) {
+	registry := testRegistry(t, 1, 1, 1)
+	host := &testProposalHost{registry: registry, admit: true}
+	group := testGroup(54)
+	data := encodeTestCommand(t, testCommand(group, 34, 2))
+	waiter, err := registry.Enqueue(host, group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := newTestAppliedBatch(group, 200, 23, data)
+	batch.lookups[0].lookup = testCompletion(t, group, data, 200)
+	gate := newTestBatchLookupGate()
+	settled := make(chan error, 1)
+	go func() {
+		settled <- settleAppliedBatch(
+			registry, gatedTestAppliedBatch{testAppliedBatch: batch, gate: gate},
+		)
+	}()
+	<-gate.entered
+	terminated := make(chan error, 1)
+	go func() {
+		terminated <- registry.TerminateGroup(
+			group, multiraft.ProposalGroupLeadershipLost,
+		)
+	}()
+	select {
+	case err := <-terminated:
+		t.Fatalf("termination crossed staged settlement: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(gate.proceed)
+	if err := <-settled; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-terminated; err != nil {
+		t.Fatal(err)
+	}
+	if outcome, ready, pollErr := waiter.Poll(); pollErr != nil || !ready ||
+		outcome.Code != OutcomeCompletion {
+		t.Fatalf("settlement lost to termination = %+v, %v, %v", outcome, ready, pollErr)
 	}
 }
