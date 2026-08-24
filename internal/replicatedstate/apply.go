@@ -1389,6 +1389,9 @@ func sessionAt(
 	}
 	if scratch != nil {
 		if decodeCopy {
+			if len(record) > cap(scratch.sessionRead) {
+				return SessionView{}, false, ErrSessionCorrupt
+			}
 			scratch.sessionRead = append(scratch.sessionRead[:0], record...)
 			record = scratch.sessionRead
 		} else {
@@ -1425,6 +1428,9 @@ func sessionSlotAt(
 	}
 	if scratch != nil {
 		if decodeCopy {
+			if len(record) > cap(scratch.slotRead) {
+				return SessionSlotView{}, false, ErrSessionCorrupt
+			}
 			scratch.slotRead = append(scratch.slotRead[:0], record...)
 			record = scratch.slotRead
 		} else {
