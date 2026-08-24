@@ -79,3 +79,11 @@ type StateMachine interface {
 	ApplyConfiguration(ApplyMeta, *pb.ConfState) (Publication, error)
 	InstallSnapshot(*pb.Snapshot) (Publication, error)
 }
+
+// CheckpointedStateMachine optionally exposes the authenticated contiguous cut
+// safe for WAL retention. It may trail StateMachine.Applied when local apply is
+// replay-backed; implementations without it retain their existing per-entry
+// durability contract.
+type CheckpointedStateMachine interface {
+	CheckpointAppliedIndex() uint64
+}

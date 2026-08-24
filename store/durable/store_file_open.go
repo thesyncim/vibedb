@@ -8,10 +8,25 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
+// checkpointGroupGenericOpenAfterPrecheckHook is a package-test seam for the
+// activation check-to-writer-lock interval. Production leaves it nil.
+var checkpointGroupGenericOpenAfterPrecheckHook func()
+var checkpointGroupGenericCreateAfterPrecheckHook func()
+
 // collectionOpenConfig threads the decision resolver into the shared open path.
 // Standalone Open leaves every field zero.
 type collectionOpenConfig struct {
 	decisions *storeio.TxnDecisions
+	// checkpointGroupRecovery is set only after the authenticated format-0
+	// certificate has been opened and selected. Every ordinary opener rejects a
+	// sibling certificate before journal replay or physical publication.
+	checkpointGroupRecovery bool
+	// checkpointGroupNamespaceHeld tells the shared generic open path that its
+	// caller already holds checkpointGroupNamespaceLease.RLock across the whole
+	// catalog recovery. It prevents a recursive read acquisition, which can
+	// deadlock behind a queued activation writer. The post-LockWriter
+	// certificate and descriptor-identity recheck still runs.
+	checkpointGroupNamespaceHeld bool
 	// deferJournalReplay leaves an already paired and scan-validated journal
 	// unopened for mutation until a catalog-wide transaction preflight succeeds.
 	// OpenDatabase owns the returned private collection and runs phase two before
@@ -35,6 +50,17 @@ func createCollection(
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
+	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
+		return nil, err
+	}
+	if checkpointGroupGenericCreateAfterPrecheckHook != nil {
+		checkpointGroupGenericCreateAfterPrecheckHook()
+	}
+	releaseNamespace, err := acquireCheckpointGroupGenericNamespace(file)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseNamespace()
 	if err := storeio.LockWriter(file); err != nil {
 		return nil, err
 	}
@@ -44,6 +70,9 @@ func createCollection(
 			_ = storeio.UnlockWriter(file)
 		}
 	}()
+	if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
+		return nil, err
+	}
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -99,6 +128,23 @@ func openCollection(
 	if file == nil {
 		return nil, fmt.Errorf("vibedb: nil collection file")
 	}
+	if !cfg.checkpointGroupRecovery && !cfg.checkpointGroupNamespaceHeld {
+		if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
+			return nil, err
+		}
+		if checkpointGroupGenericOpenAfterPrecheckHook != nil {
+			checkpointGroupGenericOpenAfterPrecheckHook()
+		}
+	}
+	var releaseNamespace func()
+	if !cfg.checkpointGroupRecovery && !cfg.checkpointGroupNamespaceHeld {
+		var err error
+		releaseNamespace, err = acquireCheckpointGroupGenericNamespace(file)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseNamespace()
+	}
 	if err := storeio.LockWriter(file); err != nil {
 		return nil, err
 	}
@@ -108,6 +154,15 @@ func openCollection(
 			_ = storeio.UnlockWriter(file)
 		}
 	}()
+	// Close the check-to-lock interval. A first activation publishes the
+	// certificate before attaching its in-memory owner; any opener admitted
+	// before that rename must observe the certificate once it obtains the
+	// collection writer lock and still fail before recovery.
+	if !cfg.checkpointGroupRecovery {
+		if err := rejectCheckpointGroupCertificateForFile(file); err != nil {
+			return nil, err
+		}
+	}
 	bootstrap, err := storeio.DiscoverMutableInlineBootstrap(file)
 	if err != nil {
 		return nil, err

@@ -118,6 +118,9 @@ func (c *Collection) CreateIndexContext(
 	if c == nil {
 		return store.IndexInfo{}, ErrClosed
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return store.IndexInfo{}, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -223,6 +226,10 @@ func (c *Collection) CreateIndexContext(
 			return store.IndexInfo{}, err
 		}
 		c.writer.Lock()
+		if err := c.rejectCheckpointGroupOwner(); err != nil {
+			c.writer.Unlock()
+			return store.IndexInfo{}, err
+		}
 		complete, reconcileErr := build.reconcileOneLocked(c)
 		validatedRouter := c.primaryRouter.Load()
 		if reconcileErr != nil {
@@ -893,6 +900,9 @@ func (c *Collection) publishOnlineIndexLocked(
 	prepared *primaryExactPrepared,
 	targetID uint32,
 ) (err error) {
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if c.closed {
 		return ErrClosed
 	}

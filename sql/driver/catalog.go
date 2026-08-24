@@ -11,6 +11,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -192,6 +193,11 @@ type database struct {
 	// recovery opens the complete hidden+user collection set as one private
 	// phase before this handle becomes reachable.
 	txnLog *durable.TxnLog
+	// checkpointGroup exclusively owns the hidden replicated-state collection,
+	// its sole user collection, and txnLog after replicated apply activation.
+	// It is recovered before any collection becomes reachable and gracefully
+	// checkpointed before collection/TxnLog close.
+	checkpointGroup *durable.CheckpointGroup
 	// txnLimits is the driver's normalized cross-table commit bound, matching
 	// durable's package defaults. UpdateCollections is fail-closed at zero.
 	txnLimits durable.TxnLimits
@@ -711,9 +717,40 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			SealedCapacity: true,
 		}
 	}
-	collections, txnLog, err := durable.OpenCollectionsWithTransactions(
-		d.dataDir, txnOptions, requests,
-	)
+	var collections []*durable.Collection
+	var txnLog *durable.TxnLog
+	var checkpointGroup *durable.CheckpointGroup
+	var err error
+	if d.catalog.ReplicatedApply != nil {
+		groupNames := make([]string, len(opened))
+		for i, entry := range opened {
+			switch {
+			case entry.apply:
+				groupNames[i] = replicatedstate.SystemCollectionName
+			case entry.name != "":
+				groupNames[i] = entry.name
+			default:
+				return abortFiles(fmt.Errorf(
+					"%w: unsupported checkpoint-group participant",
+					ErrReplicatedApplyMismatch,
+				))
+			}
+		}
+		collections, txnLog, checkpointGroup, err =
+			durable.OpenCollectionsWithCheckpointGroup(
+				d.dataDir, txnOptions, requests, groupNames,
+				durable.CheckpointGroupOptions{},
+			)
+		if errors.Is(err, durable.ErrCheckpointGroupMissing) {
+			collections, txnLog, err = durable.OpenCollectionsWithTransactions(
+				d.dataDir, txnOptions, requests,
+			)
+		}
+	} else {
+		collections, txnLog, err = durable.OpenCollectionsWithTransactions(
+			d.dataDir, txnOptions, requests,
+		)
+	}
 	if err != nil {
 		return abortFiles(err)
 	}
@@ -737,6 +774,7 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		entry.table.collection = collection
 	}
 	d.txnLog = txnLog
+	d.checkpointGroup = checkpointGroup
 	for i := range opened {
 		entry := opened[i]
 		collection := collections[i]
@@ -1783,6 +1821,18 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			return err
 		}
 		result = errors.Join(result, err)
+	}
+	if d.checkpointGroup != nil {
+		closeErr := d.checkpointGroup.Close()
+		if closeErr != nil && !d.checkpointGroup.CloseCompleted() {
+			// A checkpoint failure precedes the terminal transition, so the group
+			// remains attached and member resource close is still forbidden.
+			return errors.Join(result, closeErr)
+		}
+		// A certificate-descriptor Close error is sticky but occurs after the
+		// retired fence. Preserve it while releasing every member resource.
+		result = errors.Join(result, closeErr)
+		d.checkpointGroup = nil
 	}
 	d.closed = true
 	retryable := false

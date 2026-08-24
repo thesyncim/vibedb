@@ -631,6 +631,62 @@ func TestRecoveryJournalRecycleResolvedDropsOnlyProvenAbort(t *testing.T) {
 	})
 }
 
+func TestRecoveryJournalRecycleCertifiedPrefixDropsMultiPrepareSuffix(t *testing.T) {
+	entries := testConditionalEntries()[:1]
+	conditional := testConditionalHeader(t)
+	appendWindow := func(t *testing.T, rj *RecoveryJournal) {
+		t.Helper()
+		for offset := uint64(0); offset < 3; offset++ {
+			if _, err := rj.AppendConditionalBatch(
+				2+offset, conditional.MarkerID, conditional.MarkerEpoch,
+				conditional.TxnID+offset, entries,
+			); err != nil {
+				t.Fatalf("AppendConditionalBatch(%d): %v", offset, err)
+			}
+		}
+	}
+
+	t.Run("commit-then-two-aborts", func(t *testing.T) {
+		rj, _ := createTestJournal(t, 16*RecoveryJournalMinSectorSize)
+		defer rj.Close()
+		appendWindow(t, rj)
+		if err := rj.RecycleCertifiedPrefix(
+			2, false,
+			func(header RecoveryConditionalHeader, _ uint64) (bool, error) {
+				return header.TxnID == conditional.TxnID, nil
+			},
+		); err != nil {
+			t.Fatalf("RecycleCertifiedPrefix: %v", err)
+		}
+		if rj.BaseGeneration() != 2 || rj.Cursor() != 0 || rj.LiveEndGeneration() != 2 {
+			t.Fatalf("certified recycle state: base=%d cursor=%d live-end=%d",
+				rj.BaseGeneration(), rj.Cursor(), rj.LiveEndGeneration())
+		}
+	})
+
+	t.Run("commit-after-abort", func(t *testing.T) {
+		rj, _ := createTestJournal(t, 16*RecoveryJournalMinSectorSize)
+		defer rj.Close()
+		appendWindow(t, rj)
+		beforeCursor := rj.Cursor()
+		beforeCount := rj.Header().RecycleCount
+		err := rj.RecycleCertifiedPrefix(
+			4, false,
+			func(header RecoveryConditionalHeader, _ uint64) (bool, error) {
+				return header.TxnID != conditional.TxnID+1, nil
+			},
+		)
+		if !errors.Is(err, ErrRecoveryJournalRecord) {
+			t.Fatalf("commit after abort = %v, want %v", err, ErrRecoveryJournalRecord)
+		}
+		if rj.BaseGeneration() != 1 || rj.Cursor() != beforeCursor ||
+			rj.Header().RecycleCount != beforeCount {
+			t.Fatalf("refused certified recycle changed state: base=%d cursor=%d count=%d",
+				rj.BaseGeneration(), rj.Cursor(), rj.Header().RecycleCount)
+		}
+	})
+}
+
 // TestRecoveryConditionalBatchAppendAllocationsMatchBatch proves appending a
 // kind-4 record allocates within the same budget as an equivalent kind-3 batch
 // on a warm scratch buffer.

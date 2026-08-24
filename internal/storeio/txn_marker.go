@@ -374,6 +374,16 @@ func (d *TxnDecisions) Retired(storeID [16]byte) bool {
 	return ok
 }
 
+// RetirementCount reports how many participant-retirement records survived
+// the selected marker epoch. Fixed-membership checkpoint groups reject any
+// such record; ordinary transaction recovery retains its existing semantics.
+func (d *TxnDecisions) RetirementCount() int {
+	if d == nil {
+		return 0
+	}
+	return len(d.retired)
+}
+
 func validateTxnMarkerHeader(h TxnMarkerHeader) error {
 	if h.Format != TxnMarkerFormat {
 		return fmt.Errorf("%w: format", ErrTxnMarkerCorrupt)

@@ -50,6 +50,7 @@ type Machine struct {
 	mutationPlan    []finalMutation
 	mutationInline  [8]finalMutation
 	txnLog          *durable.TxnLog
+	checkpointGroup *durable.CheckpointGroup
 	options         Options
 	capture         TransitionCapture
 	captureTarget   TransitionCaptureTarget
@@ -85,6 +86,7 @@ type openInputs struct {
 	user            CollectionTarget
 	applyContract   [32]byte
 	txnLog          *durable.TxnLog
+	checkpointGroup *durable.CheckpointGroup
 	options         Options
 }
 
@@ -115,7 +117,8 @@ func Open(
 		distribution: []byte(binding.Distribution), shard: []byte(binding.Shard),
 		applyContract: prepared.applyContract,
 		dataChainHash: newDataChainHasher(),
-		txnLog:        prepared.txnLog, options: prepared.options,
+		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
+		options: prepared.options,
 	}
 	cut, err := durable.SnapshotCollections([]durable.NamedCollection{
 		{Name: systemCollectionName, Collection: system.Collection},
@@ -155,6 +158,12 @@ func Open(
 		return nil, err
 	}
 	if !present {
+		if m.checkpointGroup != nil && m.checkpointGroup.CheckpointAppliedIndex() != 0 {
+			return nil, fmt.Errorf(
+				"%w: empty system at checkpoint cut %d",
+				ErrStateCorrupt, m.checkpointGroup.CheckpointAppliedIndex(),
+			)
+		}
 		if options.TransitionCapture != nil {
 			return nil, ErrTransitionCapture
 		}
@@ -169,6 +178,15 @@ func Open(
 		m.publication = raftmodel.Publication{DataChainDigest: seedDigest, ConfState: new(pb.ConfState)}
 		m.openedImageDigest = imageDigest
 		return m, nil
+	}
+	if m.checkpointGroup != nil &&
+		(state.Applied != m.checkpointGroup.CheckpointAppliedIndex() ||
+			state.Applied != m.checkpointGroup.AppliedIndex()) {
+		return nil, fmt.Errorf(
+			"%w: state applied %d disagrees with checkpoint cut %d",
+			ErrStateCorrupt, state.Applied,
+			m.checkpointGroup.CheckpointAppliedIndex(),
+		)
 	}
 	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
 		state.ApplyContractDigest != prepared.applyContract ||
@@ -255,6 +273,16 @@ func prepareOpenInputs(
 			"%w: system and user handles alias", ErrInvalidCollection,
 		)
 	}
+	if options.CheckpointGroup != nil {
+		if options.TransitionCapture != nil || !options.CheckpointGroup.Owns([]durable.NamedCollection{
+			{Name: systemCollectionName, Collection: system.Collection},
+			{Name: userName, Collection: user.Collection},
+		}) {
+			return openInputs{}, fmt.Errorf(
+				"%w: checkpoint-group ownership", ErrInvalidOptions,
+			)
+		}
+	}
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
 	)
@@ -313,7 +341,7 @@ func prepareOpenInputs(
 		binding: binding, bootstrap: bootstrapBytes, bootstrapDigest: bootstrapDigest,
 		system: system, userName: strings.Clone(userName), user: user,
 		applyContract: contractDigest,
-		txnLog:        txnLog, options: options,
+		txnLog:        txnLog, checkpointGroup: options.CheckpointGroup, options: options,
 	}, nil
 }
 
@@ -717,6 +745,24 @@ func (m *Machine) Applied() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.publication.Applied
+}
+
+// CheckpointAppliedIndex is the durable contiguous cut safe for Raft WAL
+// retention. Replay-backed machines return their authenticated group
+// certificate cut; ordinary synchronous machines retain their applied cut.
+func (m *Machine) CheckpointAppliedIndex() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.poison != nil {
+		return 0
+	}
+	if m.checkpointGroup != nil {
+		return m.checkpointGroup.CheckpointAppliedIndex()
+	}
+	return m.state.Applied
 }
 
 // SessionCapacityState returns a read-only, constant-size view of the machine

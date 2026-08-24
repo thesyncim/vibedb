@@ -97,6 +97,7 @@ type ReplicatedApplyCapacityProfile struct {
 	RetryWindow           uint16
 	Initialized           bool
 	Applied               uint64
+	CheckpointApplied     uint64
 	SessionCount          uint64
 	SessionSlotCount      uint64
 	SessionEpochHighWater uint64
@@ -350,10 +351,12 @@ func (d *Database) openReplicatedApply(
 			"%w: transaction-marker profile", ErrReplicatedApplyMismatch,
 		)
 	}
-	if err := core.txnLog.EnsureMinted(); err != nil {
-		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
-			"vibedb: qualify replicated transaction marker: %w", err,
-		)
+	if core.checkpointGroup == nil {
+		if err := core.txnLog.EnsureMinted(); err != nil {
+			return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
+				"vibedb: qualify replicated transaction marker: %w", err,
+			)
+		}
 	}
 
 	t := core.tables[expected.UserTable]
@@ -375,6 +378,24 @@ func (d *Database) openReplicatedApply(
 	if core.replicatedApplyCollection == nil {
 		return nil, identity, fmt.Errorf(
 			"%w: hidden collection is not open", ErrReplicatedApplyMismatch,
+		)
+	}
+	groupMembers := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: expected.UserTable, Collection: t.collection},
+	}
+	if core.checkpointGroup == nil {
+		core.checkpointGroup, err = durable.NewCheckpointGroup(
+			core.txnLog, groupMembers, durable.CheckpointGroupOptions{},
+		)
+		if err != nil {
+			return nil, identity, fmt.Errorf(
+				"vibedb: activate replicated checkpoint group: %w", err,
+			)
+		}
+	} else if !core.checkpointGroup.Owns(groupMembers) {
+		return nil, identity, fmt.Errorf(
+			"%w: checkpoint-group membership", ErrReplicatedApplyMismatch,
 		)
 	}
 	claim := &ReplicatedApply{
@@ -402,7 +423,7 @@ func (d *Database) openReplicatedApply(
 		core.txnLog,
 		replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
-			RetryWindow: identity.RetryWindow,
+			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
 		},
 	)
 	if err != nil {
@@ -777,7 +798,8 @@ func (a *ReplicatedApply) CapacityQualificationProfile() (
 		Binding:     ownedReplicatedShardStoreBinding(base.Binding),
 		ApplyFormat: a.identity.Format, MaxSessions: a.identity.MaxSessions,
 		RetryWindow: a.identity.RetryWindow, Initialized: state.Initialized,
-		Applied: state.Applied, SessionCount: state.SessionCount,
+		Applied: state.Applied, CheckpointApplied: a.machine.CheckpointAppliedIndex(),
+		SessionCount:          state.SessionCount,
 		SessionSlotCount:      state.SessionSlotCount,
 		SessionEpochHighWater: state.SessionEpochHighWater,
 	}, nil
@@ -836,6 +858,14 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
 	}
+	if core.checkpointGroup == nil {
+		core.mu.Unlock()
+		return ErrReplicatedApplyMismatch
+	}
+	if err := core.checkpointGroup.Checkpoint(); err != nil {
+		core.mu.Unlock()
+		return err
+	}
 	a.closed = true
 	core.replicatedApplyClaim = nil
 	core.mu.Unlock()
@@ -858,6 +888,20 @@ func (a *ReplicatedApply) Applied() uint64 {
 		return 0
 	}
 	return a.machine.Applied()
+}
+
+// CheckpointAppliedIndex is the authenticated durable cut safe for Raft WAL
+// retention. It may trail Applied by at most the fixed checkpoint batch.
+func (a *ReplicatedApply) CheckpointAppliedIndex() uint64 {
+	if a == nil || a.database == nil {
+		return 0
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if a.checkLocked() != nil {
+		return 0
+	}
+	return a.machine.CheckpointAppliedIndex()
 }
 
 // Published implements raftmodel.StateMachine.

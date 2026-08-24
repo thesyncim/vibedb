@@ -619,6 +619,9 @@ func (c *Collection) putPrimary(
 			c.durabilityWait.Done()
 		}
 	}()
+	if ownerErr := c.rejectCheckpointGroupOwner(); ownerErr != nil {
+		return false, ownerErr
+	}
 	if c.closed {
 		return false, ErrClosed
 	}
@@ -991,6 +994,9 @@ func (c *Collection) deletePrimary(
 			c.durabilityWait.Done()
 		}
 	}()
+	if ownerErr := c.rejectCheckpointGroupOwner(); ownerErr != nil {
+		return false, ownerErr
+	}
 	if c.closed {
 		return false, ErrClosed
 	}
@@ -1895,6 +1901,9 @@ const (
 func (c *Collection) materializePrimaryParentsLocked(
 	reason primaryMaterializationReason,
 ) (err error) {
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	overlayPending := c.primaryUnifiedOverlay.hasPending()
 	if overlayPending {
 		started := time.Now()

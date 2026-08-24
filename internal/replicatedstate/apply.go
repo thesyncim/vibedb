@@ -1209,7 +1209,7 @@ func (m *Machine) persistTransition(
 			BatchDocumentsHint: 1,
 		})
 	}
-	err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, func(batch *durable.DatabaseBatch) error {
+	writeTransition := func(batch *durable.DatabaseBatch) error {
 		systemBatch, err := batch.Collection(systemCollectionName)
 		if err != nil {
 			return err
@@ -1269,7 +1269,16 @@ func (m *Machine) persistTransition(
 			}
 		}
 		return nil
-	})
+	}
+	if m.checkpointGroup != nil {
+		err = m.checkpointGroup.Update(
+			next.Applied, members, m.options.TxnLimits, writeTransition,
+		)
+	} else {
+		err = durable.UpdateCollections(
+			m.txnLog, members, m.options.TxnLimits, writeTransition,
+		)
+	}
 	if len(changes) != 0 && m.user.ObserveMutationAttempt != nil {
 		m.user.ObserveMutationAttempt(AttemptedMutationKeys{changes: changes})
 	}

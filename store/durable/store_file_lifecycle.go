@@ -20,6 +20,9 @@ func (c *Collection) ensureDirtyCapacityFor(
 		!c.committer.NeedsFrameCheckpointFor(transactionPages) {
 		return nil
 	}
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	var err error
 	if c.buffered() {
 		err = c.checkpointBufferedLocked()
@@ -83,6 +86,9 @@ func (c *Collection) absorbRetirementPressure(err error) error {
 // set, and retries the retirement once. It reports ErrRetiredExtentCapacity
 // when no reader is present to free anything.
 func (c *Collection) retryRetirementAfterPressure() error {
+	if err := c.checkpointGroupPhysicalFence(); err != nil {
+		return err
+	}
 	current := c.visibleLogicalViewNoError().generation
 	if c.readerSummary(current).active == 0 {
 		return storeio.ErrRetiredExtentCapacity
@@ -147,12 +153,18 @@ func (c *Collection) Flush() error {
 	if c == nil || c.committer == nil {
 		return ErrClosed
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if c.buffered() {
 		if concurrentPrimaryExclusiveWaitHook != nil {
 			concurrentPrimaryExclusiveWaitHook("flush")
 		}
 		c.writer.Lock()
 		defer c.writer.Unlock()
+		if err := c.rejectCheckpointGroupOwner(); err != nil {
+			return err
+		}
 		if c.closed {
 			return ErrClosed
 		}
@@ -172,6 +184,9 @@ func (c *Collection) Flush() error {
 	if c.syncJournalLane() {
 		c.writer.Lock()
 		defer c.writer.Unlock()
+		if err := c.rejectCheckpointGroupOwner(); err != nil {
+			return err
+		}
 		if c.closed {
 			return ErrClosed
 		}
@@ -189,6 +204,9 @@ func (c *Collection) Flush() error {
 	// journal-backed synchronous open selected syncJournalLane above).
 	c.writer.Lock()
 	defer c.writer.Unlock()
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if c.closed {
 		return ErrClosed
 	}
@@ -201,7 +219,14 @@ func (c *Collection) Close() error {
 	if c == nil {
 		return nil
 	}
+	if err := c.rejectActiveCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	c.writer.Lock()
+	if err := c.rejectActiveCheckpointGroupOwner(); err != nil {
+		c.writer.Unlock()
+		return err
+	}
 	if c.closeDone {
 		result := c.closeErr
 		c.writer.Unlock()

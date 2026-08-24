@@ -53,6 +53,15 @@ type Collection struct {
 	// physical allocation has been strictly proved and synced. It is writer
 	// protected and remains zero for elastic collections.
 	physicalHighWater uint64
+	// checkpointGroup is the exclusive replicated-apply owner, when present.
+	// The pointer is published only while the group owns this collection and its
+	// transaction log. Public mutation/checkpoint entry points reject while it
+	// is non-nil; the group uses the existing private stage/publish primitives.
+	checkpointGroup atomic.Pointer[CheckpointGroup]
+	// checkpointGroupRetired is the terminal local fence left by a gracefully
+	// closed group. The persistent format-0 certificate makes resuming generic
+	// mutation on this handle unsafe. Resource Close remains permitted.
+	checkpointGroupRetired atomic.Bool
 
 	// writer is the collection-wide mutation gate. Ordinary mutation,
 	// checkpoint, structural, and lifecycle paths retain its exclusive side;

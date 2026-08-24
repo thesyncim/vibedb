@@ -157,6 +157,67 @@ func testReplicatedApplyKey(t *testing.T, database *Database, document []byte) [
 	return []byte(key)
 }
 
+func TestReplicatedApplyUsesReplayBackedCheckpointGroup(t *testing.T) {
+	_, database, base := bindReplicatedApplyTestRoot(t, "checkpoint-group")
+	bootstrap := testReplicatedApplyBootstrap()
+	claim, _, err := database.OpenReplicatedApply(
+		base, bootstrap, testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Applied() != 1 || claim.CheckpointAppliedIndex() != 0 {
+		t.Fatalf("bootstrap cuts = applied %d checkpoint %d",
+			claim.Applied(), claim.CheckpointAppliedIndex())
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	group := core.checkpointGroup
+	user := core.tables[base.UserTable].collection
+	core.mu.RUnlock()
+	if group == nil {
+		t.Fatal("replicated apply did not attach a checkpoint group")
+	}
+	stats := group.Stats()
+	if stats.Updates != 1 || stats.BarrierSyncs != 0 ||
+		stats.JournalSyncs != 0 || stats.MarkerSyncs != 0 ||
+		stats.CertificateSyncs != 0 {
+		t.Fatalf("bootstrap apply sync stats = %+v", stats)
+	}
+	if _, err := user.Put([]byte("direct"), []byte(`{"id":"direct"}`)); !errors.Is(err, durable.ErrCheckpointGroupOwned) {
+		t.Fatalf("direct replicated user Put = %v", err)
+	}
+	if err := group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if claim.CheckpointAppliedIndex() != 1 {
+		t.Fatalf("checkpoint cut = %d", claim.CheckpointAppliedIndex())
+	}
+	stats = group.Stats()
+	if stats.BarrierSyncs != 3 || stats.MarkerSyncs != 0 {
+		t.Fatalf("checkpoint sync stats = %+v", stats)
+	}
+	if err := claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reacquired, _, err := database.OpenReplicatedApply(
+		base, bootstrap, testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatalf("reacquire checkpoint-owned apply: %v", err)
+	}
+	if reacquired.Applied() != 1 || reacquired.CheckpointAppliedIndex() != 1 {
+		t.Fatalf("reacquired cuts = applied %d checkpoint %d",
+			reacquired.Applied(), reacquired.CheckpointAppliedIndex())
+	}
+	if err := reacquired.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "ownership-transition")
 	bootstrap := testReplicatedApplyBootstrap()

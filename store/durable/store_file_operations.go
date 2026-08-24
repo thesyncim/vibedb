@@ -24,6 +24,9 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 	if c == nil {
 		return false, ErrClosed
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return false, err
+	}
 	handled, concurrentCreated, concurrentErr :=
 		c.tryConcurrentPrimaryPut(key, src)
 	if handled {
@@ -70,6 +73,9 @@ func (c *Collection) Put(key []byte, src []byte) (created bool, err error) {
 func (c *Collection) Delete(key []byte) (deleted bool, err error) {
 	if c == nil {
 		return false, ErrClosed
+	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return false, err
 	}
 	handled, concurrentDeleted, concurrentErr :=
 		c.tryConcurrentPrimaryDelete(key)

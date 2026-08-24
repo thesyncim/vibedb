@@ -204,6 +204,9 @@ func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 	if c == nil {
 		return ErrClosed
 	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return err
+	}
 	if fn == nil {
 		return errors.New("vibedb: collection Update requires a function")
 	}

@@ -251,6 +251,11 @@ type Options struct {
 	MaxSessions       uint64
 	RetryWindow       uint16
 	TransitionCapture TransitionCapture
+	// CheckpointGroup selects the replay-backed replicated apply lane. The
+	// group must exclusively own the exact system and user collections before
+	// Open. Ordinary callers leave it nil and retain per-transition synchronous
+	// UpdateCollections semantics.
+	CheckpointGroup *durable.CheckpointGroup
 }
 
 func (o Options) validate() error {

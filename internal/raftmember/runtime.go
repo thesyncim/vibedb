@@ -88,13 +88,14 @@ type DriveResult struct {
 // RuntimeStatus is a detached allocation-free control-plane view. It is
 // evidence only; serving authority still requires topology ownership fences.
 type RuntimeStatus struct {
-	MemberID       uint64
-	LeaderID       uint64
-	Term           uint64
-	Commit         uint64
-	Applied        uint64
-	LeadTransferee uint64
-	RaftState      raft.StateType
+	MemberID          uint64
+	LeaderID          uint64
+	Term              uint64
+	Commit            uint64
+	Applied           uint64
+	CheckpointApplied uint64
+	LeadTransferee    uint64
+	RaftState         raft.StateType
 }
 
 // Progressed reports whether DriveReady performed one lifecycle operation.
@@ -344,8 +345,27 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 	return RuntimeStatus{
 		MemberID: status.ID, LeaderID: status.Lead, Term: status.GetTerm(),
 		Commit: status.GetCommit(), Applied: status.Applied,
-		LeadTransferee: status.LeadTransferee, RaftState: status.RaftState,
+		CheckpointApplied: runtime.apply.CheckpointAppliedIndex(),
+		LeadTransferee:    status.LeadTransferee, RaftState: status.RaftState,
 	}, nil
+}
+
+// WALRetentionFence returns the authenticated contiguous apply cut. A future
+// online WAL compactor may retain entries strictly after this index; the
+// current fixed append-only store uses it only as qualification evidence.
+func (runtime *Runtime) WALRetentionFence() (uint64, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return 0, err
+	}
+	checkpoint := runtime.apply.CheckpointAppliedIndex()
+	applied := runtime.apply.Applied()
+	if checkpoint > applied {
+		return 0, runtime.fail(fmt.Errorf(
+			"%w: checkpoint applied %d exceeds visible applied %d",
+			ErrRuntimeFailed, checkpoint, applied,
+		))
+	}
+	return checkpoint, nil
 }
 
 // Progress returns one allocation-free detached follower progress record from

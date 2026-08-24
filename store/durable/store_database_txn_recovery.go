@@ -57,6 +57,11 @@ type TransactionCollectionOpen struct {
 	Options Options
 }
 
+// checkpointGroupGenericCatalogAfterPrecheckHook is a package-test seam for
+// the directory-certificate check to marker-open interval. Production leaves
+// it nil.
+var checkpointGroupGenericCatalogAfterPrecheckHook func()
+
 // OpenCollectionsWithTransactions is the sole current recovery entry point for
 // a caller-owned catalog. It proves every descriptor belongs to dir, opens and
 // scan-validates the complete set without replay, validates every decision and
@@ -83,6 +88,25 @@ func OpenCollectionsWithTransactions(
 	if err := validateTransactionCollectionRequests(log.rootInfo, requests); err != nil {
 		return nil, nil, errors.Join(err, log.Close())
 	}
+	// Format 0 replaces txn.vtm as the commit authority. Reject before loading
+	// marker recovery: that load may otherwise reconcile or recycle records
+	// whose certified suffix must instead be presumed aborted.
+	if err := rejectCheckpointGroupCertificate(log.root); err != nil {
+		return nil, nil, errors.Join(err, log.Close())
+	}
+	if checkpointGroupGenericCatalogAfterPrecheckHook != nil {
+		checkpointGroupGenericCatalogAfterPrecheckHook()
+	}
+	// Close the precheck-to-recovery interval with one non-recursive read lease.
+	// It remains held through marker reconciliation and all participant opens,
+	// so generic recovery cannot mutate txn.vtm or a member journal after a
+	// certificate has been published. Member opens are told the outer lease is
+	// held but retain their post-LockWriter identity/certificate recheck.
+	releaseNamespace, err := acquireCheckpointGroupGenericCatalogNamespace(log.root)
+	if err != nil {
+		return nil, nil, errors.Join(err, log.Close())
+	}
+	defer releaseNamespace()
 	// Request identity is now frozen against the pinned directory. Only after
 	// that non-mutating proof may marker recovery remove/fence a mint residue.
 	recovery, err := loadDatabaseTxnRecoveryFromLog(log, requests)
@@ -110,7 +134,10 @@ func OpenCollectionsWithTransactions(
 	collections := make([]*Collection, len(requests))
 	seenStores := make(map[[16]byte]int, len(requests))
 	for i := range requests {
-		cfg := collectionOpenConfig{deferJournalReplay: true}
+		cfg := collectionOpenConfig{
+			deferJournalReplay:           true,
+			checkpointGroupNamespaceHeld: true,
+		}
 		if recovery.absent {
 			cfg.absentLog = true
 		} else {
@@ -663,6 +690,9 @@ func (d *Database) retireCollectionBeforeDrop(entry *databaseEntry) error {
 	}
 	log.commitMu.Lock()
 	defer log.commitMu.Unlock()
+	if log.checkpointGroup != nil || log.checkpointGroupRetired {
+		return ErrCheckpointGroupOwned
+	}
 	if log.poison != nil {
 		return fmt.Errorf("%w: %w", ErrTxnLogPoisoned, log.poison)
 	}

@@ -109,7 +109,7 @@ type TransitionCapture interface {
 }
 
 func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
-	if capture == nil || !m.initialized || m.capture != nil {
+	if capture == nil || !m.initialized || m.capture != nil || m.checkpointGroup != nil {
 		return ErrTransitionCapture
 	}
 	target := capture.Target()

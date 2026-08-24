@@ -360,6 +360,14 @@ func SnapshotCollections(collections []NamedCollection) (DatabaseSnapshot, error
 	// handle under two names above is what keeps this read-locking each gate at
 	// most once, never recursively across a waiting writer.
 	hold, err := seizeSnapshotCut(gateOrder)
+	if errors.Is(err, ErrCheckpointGroupPressure) {
+		if group := commonCheckpointGroup(gateOrder); group != nil {
+			if checkpointErr := group.Checkpoint(); checkpointErr != nil {
+				return DatabaseSnapshot{}, errors.Join(err, checkpointErr)
+			}
+			hold, err = seizeSnapshotCut(gateOrder)
+		}
+	}
 	if err != nil {
 		return DatabaseSnapshot{}, err
 	}
@@ -523,6 +531,18 @@ func snapshotCollectionsInto(
 	} else {
 		hold, err = seizeSnapshotCutContext(ctx, dst.gateOrder)
 	}
+	if errors.Is(err, ErrCheckpointGroupPressure) {
+		if group := commonCheckpointGroup(dst.gateOrder); group != nil {
+			if checkpointErr := group.Checkpoint(); checkpointErr != nil {
+				return errors.Join(err, checkpointErr)
+			}
+			if ctx == nil {
+				hold, err = seizeSnapshotCut(dst.gateOrder)
+			} else {
+				hold, err = seizeSnapshotCutContext(ctx, dst.gateOrder)
+			}
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -552,6 +572,27 @@ func snapshotCollectionsInto(
 	// Publication is one slice-header assignment after every member is pinned.
 	dst.entries = staged
 	return nil
+}
+
+func commonCheckpointGroup(collections []*Collection) *CheckpointGroup {
+	var group *CheckpointGroup
+	for _, collection := range collections {
+		if collection == nil {
+			continue
+		}
+		current := collection.checkpointGroup.Load()
+		if current == nil {
+			return nil
+		}
+		if group == nil {
+			group = current
+			continue
+		}
+		if group != current {
+			return nil
+		}
+	}
+	return group
 }
 
 func duplicateCollectionNames(
