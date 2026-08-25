@@ -423,16 +423,27 @@ WAL builder checks the live apply cut, artifact manifest, snapshot-base state,
 planned binding, and newly created WAL. Only then can the existing runtime mint
 an incarnation and construct a Raft node.
 
-Retained cleanup never deletes storage behind Raft. It checkpoints bounded
-ordered batches, submits them as normal replicated deletes at the post-seal
-fences, verifies the exact captured transition, and survives both sides of the
-apply/cursor crash window. A final fresh scan hashes the exact retained image.
+Retained cleanup never deletes storage behind Raft and never runs before
+topology authority moves. The sealed certificate and ready child runtimes first
+authorize the exact manifest successor through the existing catalog generation
+CAS. Older catalog leases drain before cleanup starts. An unforgeable sealed capability from
+the durable CAS receipt and drain authority binds the exact operation, manifest,
+generation, and certificate, then authorizes bounded ordered prune batches submitted as normal replicated
+deletes at the post-seal fences. Each batch is checkpointed before proposal and
+confirmed from the exact capture transition across both apply/cursor crash
+windows. Intervening retained-range writes advance one bounded capture entry per
+controller turn without changing a pending prune identity. The serving path
+currently applies and captures an out-of-range transition; cleanup validates
+the capture and stops before another destructive batch or completion. Pending key payloads are persisted so a mutable retained
+head cannot change an outcome-unknown retry. A final cursor-checkpointed scan
+hashes the retained image in bounded work units.
 
-The gateway binds that completion proof to an exact manifest transition: only
-the planned source may be replaced, and unrelated shard identities and leaders
-must remain unchanged. Existing durable and in-memory catalog compare-and-swap
-operations provide publication authority. The certificate route generation,
-target catalog generation, and source catalog successor must be equal.
+Only the planned source may be replaced, and unrelated shard identities and
+leaders remain unchanged. The certificate route generation, target catalog
+generation, and source successor are equal. Crash recovery reconstructs the
+same fixed byte-native operation identity from durable artifacts and current
+catalog authority; no second consensus path or progress journal can override
+those authorities.
 
 The internal split reconciler validates the prepared first-leader SQL and Raft
 identity for each new child. It derives one action at a time from the capture,

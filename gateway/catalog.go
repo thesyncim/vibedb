@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -806,6 +807,78 @@ type CatalogDrainStatus struct {
 	CurrentGeneration      uint64
 	OldestActiveGeneration uint64
 	ActiveOlderOperations  uint64
+}
+
+// DurableCatalogPublication is an opaque receipt returned only after the
+// exact-generation catalog CAS has reached durable storage.
+type DurableCatalogPublication struct {
+	snapshot   *Snapshot
+	generation uint64
+}
+
+// SaveSnapshotAfterWithReceipt durably publishes s and returns the receipt
+// required to authorize destructive post-publication cleanup.
+func SaveSnapshotAfterWithReceipt(path string, expectedGeneration uint64, s *Snapshot) (DurableCatalogPublication, error) {
+	if err := SaveSnapshotAfter(path, expectedGeneration, s); err != nil {
+		return DurableCatalogPublication{}, err
+	}
+	return DurableCatalogPublication{snapshot: s, generation: s.Generation()}, nil
+}
+
+// AuthorizeRetainedPrune succeeds only while the exact durably published
+// snapshot is current and every older local serving lease is drained.
+// RetainedPruneAuthority is the sealed capability returned only after durable
+// catalog publication and old-generation lease drain. Its private marker makes
+// it impossible for another package to implement or fabricate.
+type RetainedPruneAuthority interface {
+	Manifest() *distribution.Manifest
+	Generation() uint64
+	Operation() [sha256.Size]byte
+	Certificate() [sha256.Size]byte
+	retainedPruneAuthoritySeal()
+}
+
+type retainedPruneAuthority struct {
+	manifest    *distribution.Manifest
+	generation  uint64
+	operation   [sha256.Size]byte
+	certificate [sha256.Size]byte
+}
+
+func (a retainedPruneAuthority) Manifest() *distribution.Manifest { return a.manifest }
+func (a retainedPruneAuthority) Generation() uint64               { return a.generation }
+func (a retainedPruneAuthority) Operation() [sha256.Size]byte     { return a.operation }
+func (a retainedPruneAuthority) Certificate() [sha256.Size]byte   { return a.certificate }
+func (retainedPruneAuthority) retainedPruneAuthoritySeal()        {}
+
+func (h *CatalogHolder) AuthorizeRetainedPrune(
+	receipt DurableCatalogPublication,
+	distributionName distribution.DistributionName,
+	operation [sha256.Size]byte,
+	certificate [sha256.Size]byte,
+) (RetainedPruneAuthority, error) {
+	if h == nil || receipt.snapshot == nil || operation == ([sha256.Size]byte{}) ||
+		certificate == ([sha256.Size]byte{}) {
+		return nil, ErrStaleGeneration
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	current := h.ptr.Load()
+	status := h.drainStatusLocked(receipt.generation)
+	if current == nil || current.Generation() != receipt.generation ||
+		status.CurrentGeneration != receipt.generation || status.ActiveOlderOperations != 0 {
+		return nil, ErrStaleGeneration
+	}
+	manifest, ok := current.Manifest(distributionName)
+	durableManifest, durableOK := receipt.snapshot.Manifest(distributionName)
+	if !ok || !durableOK || !manifest.Equal(durableManifest) {
+		return nil, ErrStaleGeneration
+	}
+	return retainedPruneAuthority{
+		manifest: manifest, generation: receipt.generation,
+		operation: operation, certificate: certificate,
+	}, nil
 }
 
 // DrainStatus reports active operations older than generation without waiting.
