@@ -89,6 +89,19 @@ type trackedConnection struct {
 	generation uint64
 }
 
+type admissionGenerationKey struct{}
+
+// AdmissionGeneration returns the immutable TLS/allowlist generation that
+// admitted this stream. Higher layers use it to bind adjacent policy state to
+// the same publication and reject a stream retired between admission and handoff.
+func AdmissionGeneration(ctx context.Context) (uint64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	generation, ok := ctx.Value(admissionGenerationKey{}).(uint64)
+	return generation, ok && generation != 0
+}
+
 // Server is a rotation-safe TLS capability. Rotate publishes credentials and
 // authorization together and closes every stream from the retired generation.
 type Server struct {
@@ -263,7 +276,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, limits L
 			defer tracked.Close()
 			stopConnection := context.AfterFunc(ctx, func() { _ = tracked.Close() })
 			defer stopConnection()
-			handler(ctx, tracked)
+			handler(context.WithValue(ctx, admissionGenerationKey{}, generation), tracked)
 		}(raw)
 	}
 }

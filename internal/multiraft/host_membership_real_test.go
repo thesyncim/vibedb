@@ -76,7 +76,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	authorizationDigest := raftmember.MembershipTransitionDigest(group,
 		[16]byte{1}, 2, 3, 1, 4)
 	learnerConf := &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
 			if err != nil || publication.Applied < 2 ||
@@ -173,27 +173,42 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	registries[3], cluster.registries[3] = restartRegistry, restartRegistry
 	cluster.inactive[0], cluster.inactive[3] = true, false
 	cluster.holdTargetUntilVote = true
+	cluster.suppressTargetTicks = true
 	if err = hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntilWithActiveVoterTicks(func() bool {
+	replacementLeader := uint64(0)
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
+		leader := uint64(0)
 		for index := 1; index < len(hosts); index++ {
 			status, statusErr := hosts[index].Status(group)
 			publication, publicationErr := hosts[index].Publication(group)
-			if statusErr != nil || publicationErr != nil || status.LeaderID != 2 ||
+			if statusErr != nil || publicationErr != nil || status.LeaderID == 0 ||
+				status.LeaderID == voters[0] || status.LeaderID == target ||
 				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
+			if leader == 0 {
+				leader = status.LeaderID
+			} else if leader != status.LeaderID {
+				return false
+			}
 		}
+		replacementLeader = leader
 		return true
-	}, 2*raftmodel.ElectionTick)
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
-	if err = hosts[1].TransferLeader(group, target); err != nil {
+	cluster.suppressTargetTicks = false
+	replacementLeaderIndex, ok := cluster.memberIndex[replacementLeader]
+	if !ok {
+		t.Fatalf("elected replacement leader %d has no host", replacementLeader)
+	}
+	if err = hosts[replacementLeaderIndex].TransferLeader(group, target); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			status, err := hosts[index].Status(group)
 			if err != nil || status.LeaderID != target {
@@ -210,7 +225,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	removedConf := &pb.ConfState{Voters: []uint64{2, 3, 4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 4 || publication.ConfState.Equivalent(removedConf) != nil {
@@ -223,12 +238,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err := hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntilWithActiveVoterTicks(func() bool {
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		right, rightErr := hosts[2].Status(group)
 		return leftErr == nil && rightErr == nil && left.LeaderID != 0 &&
 			left.LeaderID == right.LeaderID && left.LeaderID != target
-	}, 2*raftmodel.ElectionTick)
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if err := hosts[3].Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +260,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.hosts[3] = restartedHost
 	t.Cleanup(func() { _ = restartedHost.Close() })
 	cluster.inactive[3] = false
-	cluster.driveUntil(func() bool {
+	// Reopen restores the exact committed membership authority, but LeaderID is
+	// volatile Raft state. At a protocol-idle cut the restarted voter therefore
+	// needs one real heartbeat from the current leader before it can prove the
+	// same live leader as the other voters. Supply only leader ticks: no
+	// publication, authority, or applied-position witness is synthesized.
+	cluster.driveUntilWithLeaderTicks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		rejoined, rejoinedErr := hosts[3].Status(group)
 		publication, publicationErr := hosts[3].Publication(group)

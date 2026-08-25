@@ -119,6 +119,7 @@ type realTransferCluster struct {
 	promotionPaused     bool
 	promotionVoteSeen   bool
 	holdTargetUntilVote bool
+	suppressTargetTicks bool
 }
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
@@ -130,6 +131,21 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 	}
 	cluster.t.Fatalf("cluster became idle before condition at step %d: %s",
 		idleStep, cluster.diagnostic())
+}
+
+// driveUntilConvergedIdle proves a predicate and then drains only the Raft
+// work that made it true. Use it before the test injects another protocol
+// input: publication can precede the final Ready advance or outbound delivery,
+// while Runtime deliberately rejects new input at that boundary.
+func (cluster *realTransferCluster) driveUntilConvergedIdle(done func() bool) {
+	cluster.t.Helper()
+	step := 0
+	doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+	if !doneReached {
+		cluster.t.Fatalf("cluster became idle before stable condition at step %d: %s",
+			idleStep, cluster.diagnostic())
+	}
+	cluster.drainConvergedWorkToIdle(done, &step)
 }
 
 // driveUntilIdle advances the deterministic scheduler until either done is
@@ -274,59 +290,66 @@ func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) 
 		cluster.diagnostic())
 }
 
-// driveUntilWithActiveVoterTicks advances an election after the former leader
-// has been isolated. Followers correctly retain the old leader lease until
-// ElectionTick logical ticks have elapsed, so an immediate explicit campaign
-// can stop at a protocol-idle pre-vote cut. At each such cut this driver ticks
-// every active voter exactly once, never an inactive former leader or learner.
-// The caller supplies a small protocol-derived tick-round bound; scheduler work
-// retains the ordinary deterministic step bound in driveUntilIdle.
-func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
+// driveUntilWithStaggeredVoterClocks advances two independent voter clocks in
+// bounded phases. Deterministic in-memory hosts otherwise begin with identical
+// election-timeout state; ticking them in lockstep can make both self-vote in
+// the same term forever when the third voter is intentionally unavailable.
+//
+// Every tick below is a real Raft input. After each input, driveUntilIdle
+// persists every Ready and routes every authenticated outbound message before
+// another clock advances. The first voter's expired lease lets it vote when
+// the second voter campaigns in the later phase; no vote, leader, publication,
+// or applied-position witness is synthesized.
+func (cluster *realTransferCluster) driveUntilWithStaggeredVoterClocks(
 	done func() bool,
-	maxTickRounds int,
+	firstMember, secondMember uint64,
+	maxTickRoundsPerVoter int,
 ) {
 	cluster.t.Helper()
-	if maxTickRounds <= 0 {
-		cluster.t.Fatal("active-voter tick bound must be positive")
+	if firstMember == 0 || secondMember == 0 || firstMember == secondMember ||
+		maxTickRoundsPerVoter <= 0 {
+		cluster.t.Fatal("staggered voter clock bounds must name two distinct voters")
 	}
 	step := 0
-	tickRound := 0
-	for {
-		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
-		if doneReached {
-			cluster.drainConvergedWorkToIdle(done, &step)
-			return
+	for phase, member := range [...]uint64{firstMember, secondMember} {
+		index, found := cluster.memberIndex[member]
+		if !found || cluster.inactive[index] {
+			cluster.t.Fatalf("staggered voter %d is unavailable in phase %d", member, phase)
 		}
-		if tickRound == maxTickRounds {
-			cluster.t.Fatalf("cluster election did not converge after %d active-voter tick rounds: %s",
-				maxTickRounds, cluster.diagnostic())
+		if cluster.suppressTargetTicks && member == cluster.promotionTarget {
+			cluster.t.Fatalf("staggered voter %d is the clock-suppressed promotion target", member)
 		}
-		ticked := 0
-		for index, host := range cluster.hosts {
-			if cluster.inactive[index] {
-				continue
+		for tickRound := 0; tickRound < maxTickRoundsPerVoter; tickRound++ {
+			doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+			if doneReached {
+				cluster.drainConvergedWorkToIdle(done, &step)
+				return
 			}
-			status, statusErr := host.Status(cluster.group)
-			publication, publicationErr := host.Publication(cluster.group)
+			status, statusErr := cluster.hosts[index].Status(cluster.group)
+			publication, publicationErr := cluster.hosts[index].Publication(cluster.group)
 			if statusErr != nil || publicationErr != nil {
 				cluster.t.Fatal(errors.Join(statusErr, publicationErr))
 			}
-			if !confHasVoter(publication.ConfState, status.MemberID) {
-				continue
+			if status.MemberID != member || !confHasVoter(publication.ConfState, member) {
+				cluster.t.Fatalf("staggered member %d is not an active voter at idle step %d: %s",
+					member, idleStep, cluster.diagnostic())
 			}
-			if err := host.RequestTick(cluster.group); err != nil {
-				cluster.t.Fatalf("tick active voter host %d at idle step %d round %d: %v",
-					index, idleStep, tickRound, err)
+			if err := cluster.hosts[index].RequestTick(cluster.group); err != nil {
+				cluster.t.Fatalf("tick staggered voter %d at idle step %d phase %d round %d: %v",
+					member, idleStep, phase, tickRound, err)
 			}
-			ticked++
+			step++
 		}
-		if ticked == 0 {
-			cluster.t.Fatalf("no active voter at protocol-idle step %d tick round %d: %s",
-				idleStep, tickRound, cluster.diagnostic())
-		}
-		tickRound++
-		step++
 	}
+	// Consume the final admitted tick and all of its resulting protocol work
+	// before reporting failure, preserving the one-input-at-an-idle-cut rule.
+	doneReached, _ := cluster.driveUntilIdle(done, &step)
+	if doneReached {
+		cluster.drainConvergedWorkToIdle(done, &step)
+		return
+	}
+	cluster.t.Fatalf("cluster election did not converge after %d staggered tick rounds per voter: %s",
+		maxTickRoundsPerVoter, cluster.diagnostic())
 }
 
 // drainConvergedWorkToIdle consumes only Ready and outbound work already made
@@ -408,6 +431,10 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 		inbound, err := receiver.DecodeInbound(rafttransport.PeerIdentity{
 			TrustDomain: receiver.TrustDomain(), Node: sender.LocalNode(),
 		}, frame)
+		if errors.Is(err, rafttransport.ErrRetiredAuthority) &&
+			cluster.isSafeRetiredGenerationDrop(receiverIndex, outbound) {
+			return
+		}
 		if err != nil {
 			cluster.t.Fatalf("decode %s %d->%d: %v", outbound.Message.GetType(), outbound.From, outbound.To, err)
 		}
@@ -433,6 +460,30 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 			deliver()
 		}
 	}
+}
+
+// isSafeRetiredGenerationDrop recognizes only an in-flight frame from the
+// exact authority retired by source removal when both endpoints remain members
+// of the receiver's committed configuration. Source removal deliberately revokes the
+// whole prior transport authority so the receiver must reject, rather than
+// authenticate, this frame. A real stream drops that rejected frame; the
+// deterministic harness must model the same behavior without masking a frame
+// from the removed source or an unrelated stale authority.
+func (cluster *realTransferCluster) isSafeRetiredGenerationDrop(
+	receiverIndex int,
+	outbound raftmember.OutboundMessage,
+) bool {
+	fromRole, fromErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.From)
+	toRole, toErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.To)
+	if fromErr != nil || toErr != nil || fromRole == rafttransport.MemberEnrolled ||
+		toRole == rafttransport.MemberEnrolled {
+		return false
+	}
+	publication, err := cluster.hosts[receiverIndex].Publication(outbound.Group)
+	receiverVersion, found := cluster.registries[receiverIndex].ReplicaSetVersion(outbound.Group)
+	return err == nil && found && publication.ReplicaSetVersion == receiverVersion &&
+		confHasMember(publication.ConfState, outbound.From) &&
+		confHasMember(publication.ConfState, outbound.To)
 }
 
 func confHasMember(conf *pb.ConfState, member uint64) bool {

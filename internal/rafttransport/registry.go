@@ -120,8 +120,11 @@ type authorityView struct {
 	roles         map[uint64]MemberRole
 	previous      *authorityView
 	allowPrevious bool
-	grant         TransitionGrant
-	promotion     *raftmember.DurablePromotionProof
+	// retiredVersion records only the exact authority revoked by source
+	// removal. Its roles are deliberately not retained or accepted.
+	retiredVersion uint64
+	grant          TransitionGrant
+	promotion      *raftmember.DurablePromotionProof
 }
 
 type authoritySlot struct{ view atomic.Pointer[authorityView] }
@@ -334,11 +337,14 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 		_, hasSource := roles[current.grant.SourceMember]
 		removed := current.grant.SourceMember != 0 && hadSource && !hasSource
 		var previous *authorityView
+		var retiredVersion uint64
 		if !removed {
 			previous = &authorityView{version: current.version, roles: current.roles, grant: current.grant}
+		} else {
+			retiredVersion = current.version
 		}
 		next := &authorityView{version: version, roles: roles, grant: current.grant,
-			previous: previous, allowPrevious: !removed}
+			previous: previous, allowPrevious: !removed, retiredVersion: retiredVersion}
 		if slot.view.CompareAndSwap(current, next) {
 			return nil
 		}
