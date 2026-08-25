@@ -61,7 +61,7 @@ func TestShardAuthorizationRejectsConfusedDeputyAndSeparatesRoles(t *testing.T) 
 	if !connection.authorize(read) {
 		t.Fatal("reader denied SQL read on write execution lane")
 	}
-	read.SQL = "UPDATE docs SET n = 1"
+	read.SQL = `UPDATE docs SET "$doc" = ? WHERE id = ?`
 	read.ExecutionMode = ExecutionReadOnly
 	if connection.authorize(read) {
 		t.Fatal("reader gained SQL write through read-only execution mode")
@@ -126,7 +126,7 @@ func TestSealedRequestCapabilityIgnoresCallerExecutionMode(t *testing.T) {
 		want    serviceauthz.Capability
 	}{
 		{ShardRequest{SQL: "SELECT * FROM docs", ExecutionMode: ExecutionReadWrite}, serviceauthz.CapabilityDataRead},
-		{ShardRequest{SQL: "UPDATE docs SET n = 1", ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilityDataWrite},
+		{ShardRequest{SQL: `UPDATE docs SET "$doc" = ? WHERE id = ?`, ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilityDataWrite},
 		{ShardRequest{SQL: "CREATE TABLE docs (id TEXT)", ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilitySchema},
 		{ShardRequest{SQL: "DELETE FROM docs", MutationCapture: true}, serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite},
 		{ShardRequest{Transaction: TransactionRequest{Operation: TransactionLookupCoordinator}, ExecutionMode: ExecutionReadWrite}, serviceauthz.CapabilityDataRead},

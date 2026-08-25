@@ -17,7 +17,7 @@ func TestServeRequestCapabilitySeparatesReadWriteSchemaAndMixedBatch(t *testing.
 		{serveRequest{Op: "query", SQL: "DELETE FROM docs"}, serviceauthz.CapabilityDataWrite},
 		{serveRequest{Op: "exec", SQL: "SELECT * FROM docs"}, serviceauthz.CapabilityDataRead},
 		{serveRequest{Op: "exec_batch", Statements: []serveStatement{
-			{SQL: "ALTER TABLE docs ADD COLUMN n INT"}, {SQL: "UPDATE docs SET n = 1"},
+			{SQL: "CREATE TABLE archive (id TEXT)"}, {SQL: `UPDATE docs SET "$doc" = ? WHERE id = ?`},
 		}}, serviceauthz.CapabilitySchema | serviceauthz.CapabilityDataWrite},
 	}
 	for _, check := range checks {
