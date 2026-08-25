@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -48,7 +49,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.AuthorizeTransition(rafttransport.TransitionGrant{
+		if err := registry.InstallTransitionGrant(membershipgrant.Grant{
 			Group: members[0].Group, TransitionID: [16]byte{1}, MetadataEpoch: 2,
 			CatalogGeneration: 3, SourceMember: 1, TargetMember: 4,
 		}); err != nil {
@@ -157,7 +158,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = restartRegistry.AuthorizeTransition(rafttransport.TransitionGrant{
+	if err = restartRegistry.InstallTransitionGrant(membershipgrant.Grant{
 		Group: group, TransitionID: [16]byte{1}, MetadataEpoch: 2,
 		CatalogGeneration: 3, SourceMember: 1, TargetMember: 4,
 	}); err != nil {

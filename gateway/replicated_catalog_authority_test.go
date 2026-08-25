@@ -5,9 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -26,6 +29,166 @@ type catalogAuthorityClient struct {
 	unknownState      shardservice.ReplicatedMemberState
 	wantAuthority     serviceauthz.Authority
 	readMaximums      []uint32
+}
+
+func TestReplicatedMembershipGrantCanonicalCASUnknownRetryAndRevoke(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	grant := testReplicatedMembershipGrant(authority.route.Group)
+	raw, err := appendReplicatedMembershipGrant(nil, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openReplicatedMembershipGrant(raw)
+	if err != nil || opened != grant {
+		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	again, err := appendReplicatedMembershipGrant(nil, opened)
+	if err != nil || !bytes.Equal(raw, again) {
+		t.Fatal("membership grant encoding is not unique")
+	}
+	if _, err = openReplicatedMembershipGrant(append(append([]byte(nil), raw...), ' ')); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("trailing grant bytes=%v", err)
+	}
+	staleCatalog := grant
+	staleCatalog.CatalogGeneration--
+	if err = authority.PublishMembershipGrant(context.Background(), staleCatalog); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("stale catalog grant=%v", err)
+	}
+	foreignGroup := grant
+	foreignGroup.Group.GroupID[0] ^= 0xff
+	if err = authority.PublishMembershipGrant(context.Background(), foreignGroup); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("foreign group grant=%v", err)
+	}
+
+	client.unknownNext = true
+	err = authority.PublishMembershipGrant(context.Background(), grant)
+	if !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown grant install=%v", err)
+	}
+	pending := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("grant install retry changed command bytes")
+	}
+	loaded, found, err := authority.ReadMembershipGrant(context.Background(), grant.Group)
+	if err != nil || !found || loaded != grant {
+		t.Fatalf("loaded=%+v found=%t err=%v", loaded, found, err)
+	}
+	if err = authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatalf("same grant refresh=%v", err)
+	}
+	recordKey, _ := replicatedMembershipGrantKeys(grant.Group)
+	staleRetained := grant
+	staleRetained.CatalogGeneration--
+	staleRaw, encodeErr := appendReplicatedMembershipGrant(nil, staleRetained)
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	client.rows[string(recordKey[:])] = staleRaw
+	if _, _, err = authority.ReadMembershipGrant(context.Background(), grant.Group); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("stale retained grant read=%v", err)
+	}
+	client.rows[string(recordKey[:])] = raw
+	foreign := grant
+	foreign.MetadataEpoch++
+	if err = authority.PublishMembershipGrant(context.Background(), foreign); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("foreign live grant=%v", err)
+	}
+	if err = authority.RevokeMembershipGrant(context.Background(), foreign); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("foreign revoke=%v", err)
+	}
+	client.unknownNext = true
+	err = authority.RevokeMembershipGrant(context.Background(), grant)
+	if !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown grant revoke=%v", err)
+	}
+	pending = authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("grant revoke retry changed command bytes")
+	}
+	if loaded, found, err = authority.ReadMembershipGrant(context.Background(), grant.Group); err != nil || found || loaded != (membershipgrant.Grant{}) {
+		t.Fatalf("after revoke=%+v found=%t err=%v", loaded, found, err)
+	}
+	if err = authority.RevokeMembershipGrant(context.Background(), grant); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("absent revoke retry=%v", err)
+	}
+}
+
+func TestReplicatedMembershipGrantPageBoundOrderAndCanonicality(t *testing.T) {
+	group := raftmember.GroupKey{TopologyRecoveryEpoch: 3}
+	group.ClusterID[0], group.ClusterIncarnation[0] = 1, 2
+	group.ShardIncarnation[0], group.GroupID[0] = 4, 5
+	base := testReplicatedMembershipGrant(group)
+	const pageIndex = byte(0)
+	groups := make([]raftmember.GroupKey, 0, maxReplicatedMembershipGrantsPerPage+1)
+	for candidate := 1; len(groups) <= maxReplicatedMembershipGrantsPerPage; candidate++ {
+		group := base.Group
+		group.GroupID = [16]byte{byte(candidate >> 8), byte(candidate)}
+		_, pageKey := replicatedMembershipGrantKeys(group)
+		if pageKey[1] == pageIndex {
+			groups = append(groups, group)
+		}
+	}
+	sort.Slice(groups, func(left, right int) bool {
+		return compareMembershipGrantGroup(groups[left], groups[right]) < 0
+	})
+	tooMany := append([]raftmember.GroupKey(nil), groups...)
+	groups = groups[:maxReplicatedMembershipGrantsPerPage]
+	raw, err := appendReplicatedMembershipGrantPage(nil, pageIndex, groups)
+	if err != nil || len(raw) == 0 || len(raw) > maxReplicatedMembershipGrantPageBytes {
+		t.Fatalf("bounded page bytes=%d err=%v", len(raw), err)
+	}
+	opened, err := openReplicatedMembershipGrantPage(pageIndex, raw)
+	if err != nil || len(opened) != len(groups) {
+		t.Fatalf("open count=%d err=%v", len(opened), err)
+	}
+	for index := range groups {
+		if opened[index] != groups[index] {
+			t.Fatalf("grant %d changed", index)
+		}
+		foundAt, found := findReplicatedMembershipGrantGroup(opened, groups[index])
+		if !found || foundAt != index {
+			t.Fatalf("lookup %d=(%d,%t)", index, foundAt, found)
+		}
+	}
+	canonical, err := appendReplicatedMembershipGrantPage(nil, pageIndex, opened)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		t.Fatal("directory encoding is not byte-unique")
+	}
+	if _, err = openReplicatedMembershipGrantPage(pageIndex,
+		append(append([]byte(nil), raw...), ' ')); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("trailing directory bytes=%v", err)
+	}
+	if _, err = appendReplicatedMembershipGrantPage(nil, pageIndex, tooMany); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("65 grants=%v", err)
+	}
+	if _, err = appendReplicatedMembershipGrantPage(nil, pageIndex+1, groups); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("wrong hash page=%v", err)
+	}
+	duplicate := append([]raftmember.GroupKey(nil), groups...)
+	duplicate[1] = duplicate[0]
+	if _, err = appendReplicatedMembershipGrantPage(nil, pageIndex, duplicate); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("duplicate group=%v", err)
+	}
+	reordered := append([]raftmember.GroupKey(nil), groups...)
+	reordered[0], reordered[1] = reordered[1], reordered[0]
+	if _, err = appendReplicatedMembershipGrantPage(nil, pageIndex, reordered); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("reordered groups=%v", err)
+	}
+}
+
+func testReplicatedMembershipGrant(group raftmember.GroupKey) membershipgrant.Grant {
+	return membershipgrant.Grant{
+		Group: group, TransitionID: [16]byte{0x91}, MetadataEpoch: 7,
+		CatalogGeneration: 5, SourceMember: 1, TargetMember: 3,
+	}
 }
 
 func (client *catalogAuthorityClient) DoReplicated(

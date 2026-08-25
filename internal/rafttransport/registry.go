@@ -17,6 +17,7 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
@@ -101,20 +102,6 @@ type StaticRegistry struct {
 	canonical    frameBufferPool
 }
 
-type TransitionGrant struct {
-	Group             raftmember.GroupKey
-	TransitionID      [16]byte
-	MetadataEpoch     uint64
-	CatalogGeneration uint64
-	SourceMember      uint64
-	TargetMember      uint64
-}
-
-func (grant TransitionGrant) digest() [raftmember.MembershipTransitionDigestBytes]byte {
-	return raftmember.MembershipTransitionDigest(grant.Group, grant.TransitionID,
-		grant.MetadataEpoch, grant.CatalogGeneration, grant.SourceMember, grant.TargetMember)
-}
-
 type authorityView struct {
 	version       uint64
 	roles         map[uint64]MemberRole
@@ -123,7 +110,8 @@ type authorityView struct {
 	// retiredVersion records only the exact authority revoked by source
 	// removal. Its roles are deliberately not retained or accepted.
 	retiredVersion uint64
-	grant          TransitionGrant
+	grant          membershipgrant.Grant
+	revokedGrant   membershipgrant.Grant
 	promotion      *raftmember.DurablePromotionProof
 }
 
@@ -276,11 +264,11 @@ func validateMember(member Member) error {
 	return nil
 }
 
-func (registry *StaticRegistry) AuthorizeTransition(grant TransitionGrant) error {
-	if registry == nil || grant.Group == (raftmember.GroupKey{}) ||
-		grant.TransitionID == ([16]byte{}) || grant.MetadataEpoch == 0 ||
-		grant.CatalogGeneration == 0 || grant.SourceMember == 0 || grant.TargetMember == 0 ||
-		grant.SourceMember == grant.TargetMember {
+// InstallTransitionGrant installs an exact catalog-replicated grant at a legal
+// committed lifecycle cut. Both identities must already be enrolled. Exact
+// reinstall is idempotent; a different live grant always conflicts.
+func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Grant) error {
+	if registry == nil || !grant.Valid() {
 		return ErrInvalidMember
 	}
 	slot := registry.authorities[grant.Group]
@@ -295,11 +283,73 @@ func (registry *StaticRegistry) AuthorizeTransition(grant TransitionGrant) error
 	}
 	for {
 		current := slot.view.Load()
-		if current.grant != (TransitionGrant{}) && current.grant != grant {
+		if current.grant == grant {
+			return nil
+		}
+		if current.grant != (membershipgrant.Grant{}) ||
+			!grantFitsCommittedRoles(current.roles, grant) || current.promotion != nil {
 			return ErrReplicaSet
 		}
 		next := *current
 		next.grant = grant
+		next.revokedGrant = membershipgrant.Grant{}
+		if slot.view.CompareAndSwap(current, &next) {
+			return nil
+		}
+	}
+}
+
+func grantFitsCommittedRoles(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	source, target := roles[grant.SourceMember], roles[grant.TargetMember]
+	return source == MemberVoter &&
+		(target == MemberEnrolled || target == MemberLearner || target == MemberVoter) ||
+		source == MemberEnrolled && target == MemberVoter
+}
+
+// CurrentTransitionGrant returns one allocation-free detached grant snapshot.
+func (registry *StaticRegistry) CurrentTransitionGrant(
+	group raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	if registry == nil || group == (raftmember.GroupKey{}) {
+		return membershipgrant.Grant{}, false, ErrInvalidGroup
+	}
+	slot := registry.authorities[group]
+	if slot == nil {
+		return membershipgrant.Grant{}, false, ErrGroupNotFound
+	}
+	grant := slot.view.Load().grant
+	return grant, grant != (membershipgrant.Grant{}), nil
+}
+
+// RevokeTransitionGrant clears only the exact completed transition. Source
+// removal must already be committed and the target promoted before catalog
+// absence can revoke runtime authority.
+func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.Grant) error {
+	if registry == nil || !expected.Valid() {
+		return ErrInvalidMember
+	}
+	slot := registry.authorities[expected.Group]
+	if slot == nil {
+		return ErrGroupNotFound
+	}
+	for {
+		current := slot.view.Load()
+		if current.roles[expected.SourceMember] != MemberEnrolled ||
+			current.roles[expected.TargetMember] != MemberVoter || current.promotion != nil {
+			return ErrReplicaSet
+		}
+		if current.grant == (membershipgrant.Grant{}) {
+			if current.revokedGrant == expected {
+				return nil
+			}
+			return ErrReplicaSet
+		}
+		if current.grant != expected {
+			return ErrReplicaSet
+		}
+		next := *current
+		next.grant = membershipgrant.Grant{}
+		next.revokedGrant = expected
 		if slot.view.CompareAndSwap(current, &next) {
 			return nil
 		}
@@ -344,7 +394,8 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 			retiredVersion = current.version
 		}
 		next := &authorityView{version: version, roles: roles, grant: current.grant,
-			previous: previous, allowPrevious: !removed, retiredVersion: retiredVersion}
+			revokedGrant: current.revokedGrant,
+			previous:     previous, allowPrevious: !removed, retiredVersion: retiredVersion}
 		if slot.view.CompareAndSwap(current, next) {
 			return nil
 		}
@@ -368,7 +419,7 @@ func (registry *StaticRegistry) PublishDurablePromotion(
 	for {
 		current := slot.view.Load()
 		if current.grant.TargetMember != proof.TargetMember ||
-			current.grant.digest() != proof.AuthorizationDigest ||
+			current.grant.Digest() != proof.AuthorizationDigest ||
 			current.roles[proof.TargetMember] != MemberLearner ||
 			proof.Version <= current.version {
 			return ErrReplicaSet
@@ -436,7 +487,7 @@ func (registry *StaticRegistry) rolesFromConf(
 
 func validAdjacentRoles(current *authorityView, next map[uint64]MemberRole) bool {
 	grant := current.grant
-	if grant == (TransitionGrant{}) {
+	if grant == (membershipgrant.Grant{}) {
 		return false
 	}
 	sourceCurrent, sourceNext := current.roles[grant.SourceMember], next[grant.SourceMember]

@@ -1,18 +1,45 @@
 package raftservice
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+type membershipTestAuthority struct {
+	grant membershipgrant.Grant
+	found bool
+}
+
+func (authority *membershipTestAuthority) CurrentTransitionGrant(
+	raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	return authority.grant, authority.found, nil
+}
+
+func (*membershipTestAuthority) PublishCommittedAuthority(
+	raftmember.GroupKey, uint64, *pb.ConfState,
+) error {
+	return nil
+}
+
+func (*membershipTestAuthority) PublishDurablePromotion(
+	raftmember.GroupKey, raftmember.DurablePromotionProof,
+) error {
+	return nil
+}
+
+func (*membershipTestAuthority) ClearDurablePromotion(raftmember.GroupKey) error { return nil }
+
 func TestMembershipTransitionOrderingAuthorizationAndStaleReplay(t *testing.T) {
-	authority := MembershipAuthorization{TransitionID: [16]byte{1}, MetadataEpoch: 7,
+	authority := membershipgrant.Grant{Group: membershipTestGroup(), TransitionID: [16]byte{1}, MetadataEpoch: 7,
 		CatalogGeneration: 11, SourceMember: 1, TargetMember: 3}
-	request := MembershipRequest{Kind: MembershipAddLearner,
+	request := MembershipRequest{Fence: ServingFence{Group: authority.Group}, Kind: MembershipAddLearner,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 5,
 		SourceMember: 1, TargetMember: 3}
@@ -63,9 +90,9 @@ func TestMembershipTransitionOrderingAuthorizationAndStaleReplay(t *testing.T) {
 }
 
 func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
-	authority := MembershipAuthorization{TransitionID: [16]byte{2}, MetadataEpoch: 8,
+	authority := membershipgrant.Grant{Group: membershipTestGroup(), TransitionID: [16]byte{2}, MetadataEpoch: 8,
 		CatalogGeneration: 12, SourceMember: 1, TargetMember: 3}
-	request := MembershipRequest{Kind: MembershipRemoveVoter,
+	request := MembershipRequest{Fence: ServingFence{Group: authority.Group}, Kind: MembershipRemoveVoter,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 9,
 		SourceMember: 1, TargetMember: 3, TransferTerm: 4}
@@ -87,4 +114,44 @@ func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
 		raftmodel.MemberProgress{}, false); err != nil {
 		t.Fatalf("target-leader removal: %v", err)
 	}
+}
+
+func TestQueuedMembershipReadsLiveGrantAfterExactRevocation(t *testing.T) {
+	group := membershipTestGroup()
+	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{3},
+		MetadataEpoch: 4, CatalogGeneration: 5, SourceMember: 1, TargetMember: 3}
+	authority := &membershipTestAuthority{grant: grant, found: true}
+	owner := &Owner{
+		started: true, ingress: make(chan ownerRequest, 1),
+		limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 1}, authority: authority,
+		members: map[raftmember.GroupKey]ownerMember{group: {}},
+	}
+	request := MembershipRequest{
+		Fence: ServingFence{Group: group}, Kind: MembershipAddLearner,
+		TransitionID: grant.TransitionID, MetadataEpoch: grant.MetadataEpoch,
+		CatalogGeneration: grant.CatalogGeneration, ExpectedReplicaSetVersion: 1,
+		SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
+	}
+	done := make(chan error, 1)
+	go func() { done <- owner.ApplyMembership(context.Background(), request) }()
+	queued := <-owner.ingress
+	// Catalog-proved revocation wins before the serialized Owner begins
+	// admission. No cold copy in ownerMember can authorize the queued request.
+	authority.grant, authority.found = membershipgrant.Grant{}, false
+	if err := owner.handle(queued); !errors.Is(err, ErrMembershipUnauthorized) {
+		t.Fatalf("serialized handle after revoke=%v", err)
+	}
+	owner.release(queued.bytes)
+	if err := <-done; !errors.Is(err, ErrMembershipUnauthorized) {
+		t.Fatalf("queued request after revoke=%v", err)
+	}
+}
+
+func membershipTestGroup() (group raftmember.GroupKey) {
+	group.ClusterID[0] = 1
+	group.ClusterIncarnation[0] = 2
+	group.TopologyRecoveryEpoch = 3
+	group.ShardIncarnation[0] = 4
+	group.GroupID[0] = 5
+	return group
 }

@@ -3,8 +3,10 @@ package rafttransport
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -22,7 +24,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.AuthorizeTransition(TransitionGrant{Group: group,
+		if err := registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
 			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
 			SourceMember: 1, TargetMember: 3}); err != nil {
 			t.Fatal(err)
@@ -107,6 +109,108 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	}
 }
 
+func TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke(t *testing.T) {
+	group := testGroup(91)
+	members := []Member{
+		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+	}
+	registry, err := NewStaticRegistry(testNode(1), members, Limits{MaxGroups: 1, MaxMembers: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{1},
+		MetadataEpoch: 7, CatalogGeneration: 9, SourceMember: 1, TargetMember: 3}
+	forged := grant
+	forged.TargetMember = 4
+	if err = registry.InstallTransitionGrant(forged); !errors.Is(err, ErrMemberNotFound) {
+		t.Fatalf("unenrolled target install=%v", err)
+	}
+
+	var wait sync.WaitGroup
+	errorsByWorker := make(chan error, 64)
+	for worker := 0; worker < cap(errorsByWorker); worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errorsByWorker <- registry.InstallTransitionGrant(grant)
+		}()
+	}
+	wait.Wait()
+	close(errorsByWorker)
+	for installErr := range errorsByWorker {
+		if installErr != nil {
+			t.Fatalf("same-grant concurrent refresh=%v", installErr)
+		}
+	}
+	current, found, err := registry.CurrentTransitionGrant(group)
+	if err != nil || !found || current != grant {
+		t.Fatalf("current=%+v found=%t err=%v", current, found, err)
+	}
+	stale := grant
+	stale.MetadataEpoch++
+	if err = registry.InstallTransitionGrant(stale); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("live grant replacement=%v", err)
+	}
+	if err = registry.RevokeTransitionGrant(grant); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("early revoke=%v", err)
+	}
+	if err = registry.PublishCommittedAuthority(group, 6,
+		&pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.PublishCommittedAuthority(group, 7,
+		&pb.ConfState{Voters: []uint64{1, 2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.PublishCommittedAuthority(group, 8,
+		&pb.ConfState{Voters: []uint64{2, 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.RevokeTransitionGrant(stale); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("foreign terminal revoke=%v", err)
+	}
+	if err = registry.RevokeTransitionGrant(grant); err != nil {
+		t.Fatalf("terminal revoke=%v", err)
+	}
+	if err = registry.RevokeTransitionGrant(grant); err != nil {
+		t.Fatalf("terminal revoke retry=%v", err)
+	}
+	if err = registry.RevokeTransitionGrant(stale); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("foreign revoked retry=%v", err)
+	}
+	if current, found, err = registry.CurrentTransitionGrant(group); err != nil || found || current != (membershipgrant.Grant{}) {
+		t.Fatalf("revoked current=%+v found=%t err=%v", current, found, err)
+	}
+}
+
+func TestCurrentTransitionGrantWarmLookupAllocationFree(t *testing.T) {
+	group := testGroup(92)
+	registry, err := NewStaticRegistry(testNode(1), []Member{
+		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+	}, Limits{MaxGroups: 1, MaxMembers: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{1},
+		MetadataEpoch: 7, CatalogGeneration: 9, SourceMember: 1, TargetMember: 3}
+	if err = registry.InstallTransitionGrant(grant); err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(1000, func() {
+		got, found, lookupErr := registry.CurrentTransitionGrant(group)
+		if lookupErr != nil || !found || got != grant {
+			panic("transition grant lookup")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("warm transition grant lookup allocations=%.1f", allocations)
+	}
+}
+
 func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing.T) {
 	group := testGroup(32)
 	members := []Member{
@@ -119,7 +223,7 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.AuthorizeTransition(TransitionGrant{Group: group,
+		if err := registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
 			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
 			SourceMember: 1, TargetMember: 3}); err != nil {
 			t.Fatal(err)
@@ -163,7 +267,7 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = registry.AuthorizeTransition(TransitionGrant{Group: group,
+		if err = registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
 			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
 			SourceMember: 1, TargetMember: 3}); err != nil {
 			t.Fatal(err)
@@ -247,7 +351,7 @@ func TestLearnerWithoutCommittedPromotionWitnessCannotVote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = registry.AuthorizeTransition(TransitionGrant{Group: group,
+	if err = registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
 		TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
 		SourceMember: 1, TargetMember: 3}); err != nil {
 		t.Fatal(err)

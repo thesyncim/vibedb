@@ -9,6 +9,7 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -566,7 +567,7 @@ func authorizedConfChange(
 	digest [raftmember.MembershipTransitionDigestBytes]byte,
 ) bool {
 	grant := view.grant
-	if grant == (TransitionGrant{}) || grant.digest() != digest {
+	if grant == (membershipgrant.Grant{}) || grant.Digest() != digest {
 		return false
 	}
 	targetRole := view.roles[grant.TargetMember]

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -85,8 +86,7 @@ type Options struct {
 	CommandFences              []CommandFence
 	ReadSources                []ReadSource
 	TransactionRecoverySources []TransactionRecoverySource
-	MembershipAuthorizations   []MembershipAuthorization
-	MembershipAuthority        MembershipAuthoritySink
+	MembershipAuthority        MembershipAuthority
 	Outbound                   OutboundSink
 	Pulse                      <-chan struct{}
 	Limits                     Limits
@@ -473,7 +473,7 @@ type Owner struct {
 	outbound  OutboundSink
 	pulse     <-chan struct{}
 	limits    Limits
-	authority MembershipAuthoritySink
+	authority MembershipAuthority
 
 	ingress chan ownerRequest
 	ready   chan struct{}
@@ -493,18 +493,18 @@ type Owner struct {
 	failure              error
 }
 
-type MembershipAuthoritySink interface {
+type MembershipAuthority interface {
+	CurrentTransitionGrant(raftmember.GroupKey) (membershipgrant.Grant, bool, error)
 	PublishCommittedAuthority(raftmember.GroupKey, uint64, *pb.ConfState) error
 	PublishDurablePromotion(raftmember.GroupKey, raftmember.DurablePromotionProof) error
 	ClearDurablePromotion(raftmember.GroupKey) error
 }
 
 type ownerMember struct {
-	identity  raftmember.RuntimeIdentity
-	command   CommandFence
-	authority MembershipAuthorization
-	read      ReadSource
-	recovery  TransactionRecoverySource
+	identity raftmember.RuntimeIdentity
+	command  CommandFence
+	read     ReadSource
+	recovery TransactionRecoverySource
 }
 
 type MembershipKind uint8
@@ -515,23 +515,6 @@ const (
 	MembershipRemoveVoter
 	MembershipTransferLeader
 )
-
-// MembershipAuthorization is the fixed metadata grant for one replica move.
-// It is configured locally from the authenticated metadata cut and cannot be
-// widened by a network request.
-type MembershipAuthorization struct {
-	TransitionID      [16]byte
-	MetadataEpoch     uint64
-	CatalogGeneration uint64
-	SourceMember      uint64
-	TargetMember      uint64
-}
-
-func (a MembershipAuthorization) Valid() bool {
-	return a.TransitionID != ([16]byte{}) && a.MetadataEpoch != 0 &&
-		a.CatalogGeneration != 0 && a.SourceMember != 0 && a.TargetMember != 0 &&
-		a.SourceMember != a.TargetMember
-}
 
 // MembershipRequest carries no variable-sized data and is retained by value.
 type MembershipRequest struct {
@@ -573,9 +556,6 @@ func NewOwner(options Options) (*Owner, error) {
 	limits := options.Limits
 	if options.Registry == nil || options.Host == nil || len(options.Members) == 0 ||
 		len(options.CommandFences) != len(options.Members) ||
-		(len(options.MembershipAuthorizations) != 0 &&
-			len(options.MembershipAuthorizations) != len(options.Members)) ||
-		(len(options.MembershipAuthorizations) != 0 && options.MembershipAuthority == nil) ||
 		limits.MaxIngressItems <= 0 || limits.MaxIngressItems > multiraft.AbsoluteMaxQueueItems ||
 		limits.MaxIngressBytes <= 0 || limits.MaxIngressBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingProposalItems <= 0 ||
@@ -617,13 +597,6 @@ func NewOwner(options Options) (*Owner, error) {
 		}
 		seen[group] = struct{}{}
 		groups[index] = group
-		var authority MembershipAuthorization
-		if len(options.MembershipAuthorizations) != 0 {
-			authority = options.MembershipAuthorizations[index]
-			if !authority.Valid() {
-				return nil, ErrInvalidOwner
-			}
-		}
 		var source ReadSource
 		if len(options.ReadSources) != 0 {
 			source = options.ReadSources[index]
@@ -633,7 +606,7 @@ func NewOwner(options Options) (*Owner, error) {
 			recovery = options.TransactionRecoverySources[index]
 		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			authority: authority, read: source, recovery: recovery}
+			read: source, recovery: recovery}
 	}
 	return &Owner{
 		registry: options.Registry, host: options.Host, groups: groups, members: members,
@@ -760,12 +733,15 @@ func (owner *Owner) syncMembershipAuthorities() error {
 		); err != nil {
 			return err
 		}
-		member := owner.members[group]
-		if member.authority.TargetMember == 0 {
+		grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
+		if err != nil {
+			return err
+		}
+		if !grantFound {
 			continue
 		}
 		proof, found, err := owner.host.DurablePromotion(group,
-			member.authority.TargetMember)
+			grant.TargetMember)
 		if err != nil {
 			return err
 		}
@@ -1002,10 +978,13 @@ func commandMatchesFence(command replication.CommandView, fence ServingFence) bo
 
 func (owner *Owner) applyMembership(request MembershipRequest) error {
 	member, found := owner.members[request.Fence.Group]
-	if !found || !member.authority.Valid() {
+	if !found || owner.authority == nil {
 		return ErrMembershipUnauthorized
 	}
-	authority := member.authority
+	authority, authorityFound, err := owner.authority.CurrentTransitionGrant(request.Fence.Group)
+	if err != nil || !authorityFound {
+		return errors.Join(err, ErrMembershipUnauthorized)
+	}
 	if err := validateMembershipIdentity(request, authority); err != nil {
 		return err
 	}
@@ -1067,7 +1046,7 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 
 func validateMembershipTransition(
 	request MembershipRequest,
-	authority MembershipAuthorization,
+	authority membershipgrant.Grant,
 	publication raftmodel.Publication,
 	status raftmember.RuntimeStatus,
 	progress raftmodel.MemberProgress,
@@ -1113,7 +1092,7 @@ func validateMembershipTransition(
 
 func validateMembershipIdentity(
 	request MembershipRequest,
-	authority MembershipAuthorization,
+	authority membershipgrant.Grant,
 ) error {
 	if err := ValidateMembershipFields(
 		request.Kind, request.TransitionID, request.MetadataEpoch, request.CatalogGeneration,
@@ -1122,7 +1101,8 @@ func validateMembershipIdentity(
 	); err != nil {
 		return err
 	}
-	if request.TransitionID != authority.TransitionID ||
+	if request.Fence.Group != authority.Group ||
+		request.TransitionID != authority.TransitionID ||
 		request.MetadataEpoch != authority.MetadataEpoch ||
 		request.CatalogGeneration != authority.CatalogGeneration ||
 		request.SourceMember != authority.SourceMember ||

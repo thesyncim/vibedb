@@ -242,22 +242,6 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 		identity.TrustDomain != options.Registry.TrustDomain() {
 		return nil, ErrInvalidPeerServer
 	}
-	for index, authorization := range options.Owner.MembershipAuthorizations {
-		if index >= len(options.Owner.Members) {
-			return nil, ErrInvalidPeerServer
-		}
-		if err := options.Registry.AuthorizeTransition(rafttransport.TransitionGrant{
-			Group:             options.Owner.Members[index].Group,
-			TransitionID:      authorization.TransitionID,
-			MetadataEpoch:     authorization.MetadataEpoch,
-			CatalogGeneration: authorization.CatalogGeneration,
-			SourceMember:      authorization.SourceMember,
-			TargetMember:      authorization.TargetMember,
-		}); err != nil {
-			return nil, err
-		}
-	}
-
 	transportOptions := options.Transport
 	transportOptions.Registry = options.Registry
 	transportOptions.Dialer = rafttransport.TLSOrdinaryDialer{
@@ -271,9 +255,7 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 
 	ownerOptions := options.Owner
 	ownerOptions.Outbound = transport
-	if len(ownerOptions.MembershipAuthorizations) != 0 {
-		ownerOptions.MembershipAuthority = options.Registry
-	}
+	ownerOptions.MembershipAuthority = options.Registry
 	owner, err := NewOwner(ownerOptions)
 	if err != nil {
 		_ = transport.Close()
