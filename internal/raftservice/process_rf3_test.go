@@ -264,7 +264,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtime, base, buildErr := buildProcessRuntime(os.Getenv(processRootEnvironment), member)
+	runtime, base, readSource, buildErr := buildProcessRuntime(os.Getenv(processRootEnvironment), member)
 	if errors.Is(buildErr, storeio.ErrStrictAllocationUnsupported) ||
 		errors.Is(buildErr, raftstore.ErrPlatformUnsupported) {
 		_ = peerListener.Close()
@@ -279,7 +279,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		t.Fatal(buildErr)
 	}
 
-	peer, pulse, err := buildProcessPeer(runtime, base, peerListener, member)
+	peer, pulse, err := buildProcessPeer(runtime, base, readSource, peerListener, member)
 	if err != nil {
 		_ = runtime.Close()
 		_ = nativeListener.Close()
@@ -1218,14 +1218,14 @@ func processPulse(stop <-chan struct{}, pulse chan<- struct{}) {
 func buildProcessRuntime(
 	root string,
 	member uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, error) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, raftservice.ReadSource, error) {
 	if root == "" || member == 0 || member > processVoters {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, errors.New("invalid process runtime identity")
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, errors.New("invalid process runtime identity")
 	}
 	identity := processStoreIdentity(member)
 	key, err := processWALKeyFromEnvironment()
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
 	baseIndex, baseTerm := uint64(1), uint64(1)
 	wal, err := raftstore.Create(
@@ -1241,7 +1241,7 @@ func buildProcessRuntime(
 		},
 	)
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
 	database, err := sqldriver.InitializeShardStore(
 		filepath.Join(root, "member.vdb"), sqldriver.ShardStoreBinding{
@@ -1252,10 +1252,10 @@ func buildProcessRuntime(
 	)
 	if err != nil {
 		_ = wal.Close()
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
-	closeBoth := func(cause error) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, error) {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, errors.Join(cause, database.Close(), wal.Close())
+	closeBoth := func(cause error) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, raftservice.ReadSource, error) {
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, errors.Join(cause, database.Close(), wal.Close())
 	}
 	session, err := database.NewSession(context.Background())
 	if err != nil {
@@ -1303,14 +1303,15 @@ func buildProcessRuntime(
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
-	return runtime, base, nil
+	return runtime, base, apply, nil
 }
 
 func buildProcessPeer(
 	runtime *raftmember.Runtime,
 	base sqldriver.ReplicatedShardStoreIdentity,
+	readSource raftservice.ReadSource,
 	listener net.Listener,
 	member uint64,
 ) (*raftservice.AuthenticatedPeerRuntime, chan struct{}, error) {
@@ -1375,7 +1376,8 @@ func buildProcessPeer(
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Owner: raftservice.Options{
 			Registry: serving, Host: host,
-			Members: []raftmember.RuntimeIdentity{runtime.Identity()},
+			Members:     []raftmember.RuntimeIdentity{runtime.Identity()},
+			ReadSources: []raftservice.ReadSource{readSource},
 			CommandFences: []raftservice.CommandFence{
 				processCommandFenceFromRuntime(runtime.Identity(), base),
 			},
