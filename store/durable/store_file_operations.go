@@ -922,6 +922,8 @@ func (c *Collection) Stats() Stats {
 		PrimaryMacroSplitRequired:             c.primaryMacroSplitRequired.Load(),
 		PrimarySplitMaxNS:                     c.primarySplitMaxNS.Load(),
 		PrimaryEmptyReclaimMaxNS:              c.primaryEmptyReclaimMaxNS.Load(),
+		PrimaryStructuralRoutingStagedBytes:   c.primaryStructuralRoutingStaged.Load(),
+		PrimaryStructuralRoutingRetiredBytes:  c.primaryStructuralRoutingRetired.Load(),
 		HolePunchRanges:                       c.holePunchRanges.Load(),
 		HolePunchBytes:                        c.holePunchBytes.Load(),
 		HolePunchSkippedRanges:                c.holePunchSkippedRanges.Load(),
