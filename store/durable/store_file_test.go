@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"os"
 	"slices"
@@ -143,6 +144,185 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options.MaxBatchBytes = options.MaxDocumentBytes
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("batch byte bound that cannot hold every key accepted")
+	}
+}
+
+func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
+	options := testFileStoreOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := Collection{options: normalized}
+	const fileEnd = uint64(8 << 20)
+	got, err := collection.primaryVolatileReservationEnd(fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fileEnd + normalized.maxTransactionPhysicalBytes; got != want {
+		t.Fatalf("reservation end = %d, want exact extent budget %d", got, want)
+	}
+	oldFixedFrameEnd := fileEnd + uint64(normalized.maxTransactionPages)*
+		uint64(normalized.MaxPageSize)
+	if got >= oldFixedFrameEnd {
+		t.Fatalf("exact reservation end = %d, old fixed-frame end %d", got, oldFixedFrameEnd)
+	}
+	t.Logf(
+		"checkpoint reservation: exact=%d bytes fixed-frame=%d bytes reduction=%.2fx",
+		normalized.maxTransactionPhysicalBytes,
+		oldFixedFrameEnd-fileEnd,
+		float64(oldFixedFrameEnd-fileEnd)/float64(normalized.maxTransactionPhysicalBytes),
+	)
+	if _, err := collection.primaryVolatileReservationEnd(
+		math.MaxUint64 - normalized.maxTransactionPhysicalBytes + 1,
+	); !errors.Is(err, storeio.ErrInvalidWrite) {
+		t.Fatalf("overflow reservation = %v, want ErrInvalidWrite", err)
+	}
+	allocs := testing.AllocsPerRun(1_000, func() {
+		if _, reserveErr := collection.primaryVolatileReservationEnd(fileEnd); reserveErr != nil {
+			panic(reserveErr)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("reservation allocations = %.1f, want zero", allocs)
+	}
+}
+
+func TestPhysicalExtentReservationDoesNotInflateResidentAdmission(t *testing.T) {
+	options := testFileStoreOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Converge the adaptive overlay to the smallest resident budget it admits.
+	// The persisted namespace must remain wider because its routing metadata
+	// uses 8/64 KiB extent classes, but those padding bytes are not cache frames.
+	for {
+		options.ResidentBytes = int64(normalized.maxTransactionBytes)
+		next, normalizeErr := options.normalized()
+		if normalizeErr != nil {
+			t.Fatalf("resident dirty bound rejected by physical reservation: %v", normalizeErr)
+		}
+		if next.maxTransactionBytes == normalized.maxTransactionBytes {
+			normalized = next
+			break
+		}
+		normalized = next
+	}
+	if normalized.maxTransactionPhysicalBytes <= normalized.maxTransactionBytes {
+		t.Fatalf(
+			"physical reservation = %d, resident dirty bound = %d; fixture no longer exercises split accounting",
+			normalized.maxTransactionPhysicalBytes, normalized.maxTransactionBytes,
+		)
+	}
+	collection := Collection{options: normalized}
+	const fileEnd = uint64(16 << 20)
+	end, err := collection.primaryVolatileReservationEnd(fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fileEnd + normalized.maxTransactionPhysicalBytes; end != want {
+		t.Fatalf("physical reservation end = %d, want %d", end, want)
+	}
+}
+
+func TestFileStoreTransactionExtentBytesClassifiesPhysicalParents(t *testing.T) {
+	const (
+		totalPages = 12
+		maxPages   = 3
+		parents    = 4
+	)
+	want := uint64(maxPages*(64<<10) +
+		storeio.GlobalTabletCatalogRootBytes +
+		parents*storeio.GlobalTabletCatalogNodeBytes +
+		(totalPages-maxPages-1-parents)*(4<<10))
+	if got := fileStoreTransactionExtentBytes(
+		totalPages, maxPages, parents, 4<<10, 64<<10,
+	); got != want {
+		t.Fatalf("classified transaction bytes = %d, want %d", got, want)
+	}
+	// Hostile class counts are capped by the descriptor ceiling rather than
+	// double-charging the same frame.
+	if got, wantCapped := fileStoreTransactionExtentBytes(
+		2, 99, 99, 4<<10, 64<<10,
+	), uint64(storeio.GlobalTabletCatalogRootBytes+(64<<10)); got != wantCapped {
+		t.Fatalf("capped transaction bytes = %d, want %d", got, wantCapped)
+	}
+}
+
+func TestFileStoreHostileBatchPageGeometrySaturatesBeforeClassification(t *testing.T) {
+	if got := fileStoreSaturatingAdd(math.MaxInt-1, 1); got != math.MaxInt {
+		t.Fatalf("exact boundary add = %d, want MaxInt", got)
+	}
+	if got := fileStoreSaturatingAdd(math.MaxInt, 1); got != math.MaxInt {
+		t.Fatalf("overflowing add = %d, want saturated MaxInt", got)
+	}
+	if got := fileStoreSaturatingMul(math.MaxInt/2+1, 2); got != math.MaxInt {
+		t.Fatalf("overflowing multiply = %d, want saturated MaxInt", got)
+	}
+	maxInt := int(^uint(0) >> 1)
+	maxIntUint := uint64(maxInt)
+	wantProduct := uint64(math.MaxUint64)
+	if maxIntUint <= math.MaxUint64/maxIntUint {
+		wantProduct = maxIntUint * maxIntUint
+	}
+	if got := fileStoreSaturatingByteProduct(maxInt, maxInt); got != wantProduct {
+		t.Fatalf("boundary byte product = %d, want %d", got, wantProduct)
+	}
+	if got := fileStoreSaturatingByteAdd(math.MaxUint64, 1); got != math.MaxUint64 {
+		t.Fatalf("overflowing byte add = %d, want MaxUint64", got)
+	}
+
+	options := testFileStoreOptions()
+	options.MaxBatchDocuments = math.MaxInt - 1
+	options.MaxBatchBytes = math.MaxInt
+	options.MaxKeyBytes = 1
+	options.MaxDocumentBytes = 1
+	options.InlineValueBytes = 1
+	options.ResidentBytes = math.MaxInt64
+	options.MaxRetiredExtents = 1 << 24
+	options.Indexes = nil
+	if got := batchMetadataBasePages(options, 0); got != math.MaxInt {
+		t.Fatalf("hostile base pages = %d, want saturated MaxInt", got)
+	}
+	if got := batchMetadataPages(options, 0); got != math.MaxInt {
+		t.Fatalf("hostile metadata pages = %d, want saturated MaxInt", got)
+	}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("hostile unindexed page geometry was accepted")
+	}
+	options.Indexes = []store.IndexDefinition{
+		{Name: "x", Paths: []string{"/x"}},
+	}
+	if got := batchMetadataBasePages(options, 1); got != math.MaxInt {
+		t.Fatalf("hostile indexed base pages = %d, want saturated MaxInt", got)
+	}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("hostile indexed page geometry was accepted")
+	}
+
+	boundary := testFileStoreOptions()
+	boundary.MaxKeyBytes = 1
+	boundary.MaxDocumentBytes = 1
+	boundary.InlineValueBytes = 1
+	boundary.Indexes = nil
+	firstRejectedDocuments := 1
+	for batchMetadataPages(boundary, 0)+1 < 32768 {
+		firstRejectedDocuments++
+		boundary.MaxBatchDocuments = firstRejectedDocuments
+	}
+	previous := boundary
+	previous.MaxBatchDocuments = firstRejectedDocuments - 1
+	if got := batchMetadataPages(previous, 0) + 1; got >= 32768 {
+		t.Fatalf("page geometry below boundary = %d, want below 32768", got)
+	}
+	boundary.MaxBatchBytes = firstRejectedDocuments + 1
+	boundary.ResidentBytes = math.MaxInt64
+	boundary.MaxRetiredExtents = 1 << 24
+	boundary.BufferCount = 32768
+	if _, err := boundary.normalized(); err == nil {
+		t.Fatalf("%d-document geometry at the 32768-page cap was accepted",
+			firstRejectedDocuments)
 	}
 }
 
