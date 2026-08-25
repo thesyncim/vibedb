@@ -38,6 +38,8 @@ type ReplicatedEndpoint struct {
 	NodeIncarnation uint64
 	NativeEndpoint  string
 	Address         string
+	ControlEndpoint string
+	ControlAddress  string
 }
 
 // ReplicatedRoute is one exact catalog allocation and its bounded replica set.

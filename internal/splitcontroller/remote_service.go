@@ -14,7 +14,7 @@ import (
 // ShardActionRuntime reconstructs plan and observation from local durable
 // authorities, then executes one idempotent existing split action.
 type ShardActionRuntime interface {
-	ObserveSplit(context.Context, OperationID) (*Plan, Observation, error)
+	ObserveSplit(context.Context, OperationID, [32]byte) (*Plan, Observation, error)
 	ExecuteSplitAction(context.Context, *Plan, Observation, Action) error
 }
 
@@ -34,7 +34,7 @@ func (service *RemoteActionService) ExecuteAction(
 	_ rafttransport.PeerIdentity,
 	request shardcontrol.Request,
 ) (shardcontrol.Response, error) {
-	if service == nil || ctx == nil || request.Operation != request.PlanDigest {
+	if service == nil || ctx == nil {
 		return shardcontrol.Response{}, ErrRemoteExecution
 	}
 	var payload remoteStepPayload
@@ -51,7 +51,7 @@ func (service *RemoteActionService) ExecuteAction(
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
 	operation := OperationID(request.Operation)
-	plan, observed, err := service.runtime.ObserveSplit(ctx, operation)
+	plan, observed, err := service.runtime.ObserveSplit(ctx, operation, request.PlanDigest)
 	if err != nil || plan == nil || plan.OperationID() != operation {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}

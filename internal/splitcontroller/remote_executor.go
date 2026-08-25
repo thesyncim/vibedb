@@ -83,11 +83,15 @@ func appendRemoteStepRequest(
 		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
 	}
 	id := [32]byte(plan.OperationID())
+	intent, err := AppendPlanIntent(nil, observed.Catalog, plan)
+	if err != nil {
+		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
+	}
 	cursor := replicatedActionCursor(action)
 	binding := observed.SourceState.Binding
 	return shardcontrol.Request{
 		Action: shardcontrol.Action(action.Kind), Child: action.Child,
-		Operation: id, Step: replicatedActionProof(id, cursor), PlanDigest: id,
+		Operation: id, Step: replicatedActionProof(id, cursor), PlanDigest: sha256.Sum256(intent),
 		Fence: shardcontrol.Fence{
 			CatalogGeneration: observed.Catalog.Generation(),
 			Allocation:        binding.AllocationGeneration, OwnershipEpoch: binding.OwnershipEpoch,

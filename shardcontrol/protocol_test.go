@@ -63,6 +63,29 @@ func TestRequestCanonicalRoundTripAndDamage(t *testing.T) {
 	}
 }
 
+func TestReconcileRequestUsesPlanAuthorityWithoutGuessedDataFence(t *testing.T) {
+	request := testRequest()
+	request.Action, request.Child, request.Fence = ActionReconcileSplit, 0, Fence{}
+	request.Payload = []byte(`{"revision":7}`)
+	frame, err := AppendRequest(nil, &request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenRequest(frame)
+	if err != nil || opened.Action != ActionReconcileSplit || opened.Fence != (Fence{}) {
+		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	request.Fence.CatalogGeneration = 1
+	if _, err = AppendRequest(nil, &request); err == nil {
+		t.Fatal("reconcile request accepted a partial guessed fence")
+	}
+	request = testRequest()
+	request.Fence = Fence{}
+	if _, err = AppendRequest(nil, &request); err == nil {
+		t.Fatal("data action accepted an absent fence")
+	}
+}
+
 func TestResponseCanonicalRoundTripAndBoundedRead(t *testing.T) {
 	response := Response{
 		Code: ResultAccepted, Operation: [32]byte{1}, Step: [32]byte{2},

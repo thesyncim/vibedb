@@ -83,7 +83,6 @@ func TestAuthorizerRejectsInvalidOrDuplicateCapabilities(t *testing.T) {
 		nil,
 		{{Node: rafttransport.NodeID{1}}},
 		{{Node: rafttransport.NodeID{1}, Actions: 1}, {Node: rafttransport.NodeID{1}, Actions: 2}},
-		{{Node: rafttransport.NodeID{1}, Actions: 1 << 15}},
 	} {
 		if _, err := NewAuthorizer(grants); !errors.Is(err, ErrUnauthorized) {
 			t.Fatalf("grants=%+v err=%v", grants, err)

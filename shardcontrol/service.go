@@ -37,7 +37,7 @@ func NewAuthorizer(grants []ActionGrant) (*Authorizer, error) {
 	slices.SortFunc(owned, func(left, right ActionGrant) int { return bytes.Compare(left.Node[:], right.Node[:]) })
 	for index := range owned {
 		if owned[index].Node == (rafttransport.NodeID{}) || owned[index].Actions == 0 ||
-			owned[index].Actions&^uint16((1<<uint(ActionComplete))-1) != 0 ||
+			owned[index].Actions&^uint16((1<<uint(ActionReconcileSplit))-1) != 0 ||
 			index != 0 && owned[index-1].Node == owned[index].Node {
 			return nil, ErrUnauthorized
 		}

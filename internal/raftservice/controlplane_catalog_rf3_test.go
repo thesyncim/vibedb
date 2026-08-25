@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -206,15 +207,18 @@ func processControlPlaneSnapshot(
 		Manifests: []*distribution.Manifest{manifest},
 	}
 	endpoints := make(map[distribution.EndpointID]string, processVoters)
+	controlEndpointIDs := [processVoters]distribution.EndpointID{"rf3-control-1", "rf3-control-2", "rf3-control-3"}
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, processVoters)
 	for index := 0; index < processVoters; index++ {
 		endpoints[endpointIDs[index]] = sqlAddresses[index]
 		endpoints[nativeEndpointIDs[index]] = cluster.nativeAddresses[index]
+		endpoints[controlEndpointIDs[index]] = fmt.Sprintf("127.0.0.1:%d", 301+index)
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{
 			Member: uint64(index + 1), Node: processNode(uint64(index + 1)),
 			StoreID:         processStoreIdentity(uint64(index + 1)).StoreID,
 			NodeIncarnation: 1, Endpoint: endpointIDs[index],
-			NativeEndpoint: nativeEndpointIDs[index],
+			NativeEndpoint:  nativeEndpointIDs[index],
+			ControlEndpoint: controlEndpointIDs[index],
 		}
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(

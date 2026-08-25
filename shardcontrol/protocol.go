@@ -44,6 +44,11 @@ const (
 	ActionAwaitCatalogDrain
 	ActionPruneRetained
 	ActionComplete
+	// ActionReconcileSplit asks the source controller host to reconstruct the
+	// replicated plan and execute exactly one durable next step. It carries no
+	// guessed data-plane fence; the host obtains and validates the coherent cut
+	// before issuing an ordinary fenced per-action RPC.
+	ActionReconcileSplit
 )
 
 // ResultCode is a closed result class. Accepted means the step's durable
@@ -95,7 +100,7 @@ type Response struct {
 }
 
 func validAction(action Action) bool {
-	return action >= ActionAwaitSourceLeader && action <= ActionComplete
+	return action >= ActionAwaitSourceLeader && action <= ActionReconcileSplit
 }
 
 func validResult(code ResultCode) bool {
@@ -121,9 +126,15 @@ func canonicalPayload(payload []byte, allowEmpty bool) bool {
 }
 
 func validRequest(request *Request) bool {
-	return request != nil && validAction(request.Action) && request.Operation != ([32]byte{}) &&
-		request.Step != ([32]byte{}) && request.PlanDigest != ([32]byte{}) &&
-		validFence(request.Fence) && canonicalPayload(request.Payload, false)
+	if request == nil || !validAction(request.Action) || request.Operation == ([32]byte{}) ||
+		request.Step == ([32]byte{}) || request.PlanDigest == ([32]byte{}) ||
+		!canonicalPayload(request.Payload, false) {
+		return false
+	}
+	if request.Action == ActionReconcileSplit {
+		return request.Child == 0 && request.Fence == (Fence{})
+	}
+	return validFence(request.Fence)
 }
 
 func validResponse(response *Response) bool {

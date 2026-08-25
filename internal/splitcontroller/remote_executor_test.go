@@ -37,7 +37,7 @@ func TestExecuteRemoteReplicatedStepPersistsThenSendsExactFencedAction(t *testin
 	)
 	if err != nil || action.Kind != ActionAwaitSourceLeader || router.calls != 1 ||
 		journal.retries != 1 || router.request.Operation != [32]byte(plan.OperationID()) ||
-		router.request.PlanDigest != router.request.Operation ||
+		router.request.PlanDigest == router.request.Operation ||
 		router.request.Fence.CatalogGeneration != catalog.Generation() ||
 		router.request.Fence.Applied != state.Applied ||
 		router.request.Fence.ReplicaSetVersion != state.ReplicaSetVersion {

@@ -2,6 +2,7 @@ package splitcontroller
 
 import (
 	"context"
+	"crypto/sha256"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -14,9 +15,10 @@ type testShardActionRuntime struct {
 }
 
 func (runtime *testShardActionRuntime) ObserveSplit(
-	_ context.Context, operation OperationID,
+	_ context.Context, operation OperationID, digest [32]byte,
 ) (*Plan, Observation, error) {
-	if runtime.plan.OperationID() != operation {
+	intent, err := AppendPlanIntent(nil, runtime.observed.Catalog, runtime.plan)
+	if err != nil || runtime.plan.OperationID() != operation || sha256.Sum256(intent) != digest {
 		return nil, Observation{}, ErrRemoteExecution
 	}
 	return runtime.plan, runtime.observed, nil
