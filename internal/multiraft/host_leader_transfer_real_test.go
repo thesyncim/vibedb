@@ -285,19 +285,17 @@ func (cluster *realTransferCluster) diagnostic() string {
 		}
 		status, statusErr := host.Status(cluster.group)
 		publication, publicationErr := host.Publication(cluster.group)
-		proof, proofFound, proofErr := host.DurablePromotion(cluster.group, cluster.promotionTarget)
 		version, versionFound := uint64(0), false
 		if index < len(cluster.registries) && cluster.registries[index] != nil {
 			version, versionFound = cluster.registries[index].ReplicaSetVersion(cluster.group)
 		}
 		fmt.Fprintf(&result,
 			"host=%d inactive=%t status={member=%d leader=%d term=%d commit=%d applied=%d err=%v} "+
-				"publication={applied=%d version=%d conf=%v err=%v} authority={version=%d found=%t} "+
-				"promotion={found=%t proof=%+v err=%v}",
+				"publication={applied=%d version=%d conf=%v err=%v} authority={version=%d found=%t}",
 			index, cluster.inactive[index], status.MemberID, status.LeaderID, status.Term,
 			status.Commit, status.Applied, statusErr, publication.Applied,
 			publication.ReplicaSetVersion, publication.ConfState, publicationErr,
-			version, versionFound, proofFound, proof, proofErr)
+			version, versionFound)
 	}
 	return result.String()
 }
