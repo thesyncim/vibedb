@@ -65,12 +65,21 @@ const (
 	// TrafficShardNative is the mutually authenticated gateway-to-RF3 shard
 	// capability. It is deliberately distinct from Raft and snapshot streams.
 	TrafficShardNative TrafficClass = 3
+	// TrafficGatewayClient authenticates application clients at the shipped
+	// gateway query endpoint. It cannot be replayed against an internal shard
+	// or consensus listener because every class has a distinct TLS ALPN.
+	TrafficGatewayClient TrafficClass = 4
+	// TrafficShardSQL authenticates the gateway-to-shard SQL protocol used by
+	// the static serving command. RF3 native traffic retains a separate class.
+	TrafficShardSQL TrafficClass = 5
 )
 
 const (
-	ordinaryALPN    = "vibedb-raft-ordinary"
-	snapshotALPN    = "vibedb-raft-snapshot"
-	shardNativeALPN = "vibedb-shard-native"
+	ordinaryALPN      = "vibedb-raft-ordinary"
+	snapshotALPN      = "vibedb-raft-snapshot"
+	shardNativeALPN   = "vibedb-shard-native"
+	gatewayClientALPN = "vibedb-gateway-client"
+	shardSQLALPN      = "vibedb-shard-sql"
 )
 
 func (class TrafficClass) alpn() (string, error) {
@@ -81,6 +90,10 @@ func (class TrafficClass) alpn() (string, error) {
 		return snapshotALPN, nil
 	case TrafficShardNative:
 		return shardNativeALPN, nil
+	case TrafficGatewayClient:
+		return gatewayClientALPN, nil
+	case TrafficShardSQL:
+		return shardSQLALPN, nil
 	default:
 		return "", ErrWrongTrafficClass
 	}
