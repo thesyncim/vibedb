@@ -10,9 +10,12 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/multiraft"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -38,6 +41,41 @@ func TestExactLearnerConfStateRequiresTargetLearnerAndSourceVoter(t *testing.T) 
 				t.Fatalf("accepted %+v", conf)
 			}
 		})
+	}
+}
+
+func TestLearnerInstallSettlementRetainsApplyUntilCloseSuccess(t *testing.T) {
+	settlement := &LearnerInstallSettlement{
+		apply: &sqldriver.ReplicatedApply{}, database: &sqldriver.Database{},
+	}
+	fault := errors.New("apply close retry")
+	previousApply, previousDatabase := learnerInstallCloseApply, learnerInstallCloseDatabase
+	defer func() {
+		learnerInstallCloseApply, learnerInstallCloseDatabase = previousApply, previousDatabase
+	}()
+	applyCalls, databaseCalls := 0, 0
+	learnerInstallCloseApply = func(*sqldriver.ReplicatedApply) error {
+		applyCalls++
+		if applyCalls <= 2 {
+			return fault
+		}
+		return nil
+	}
+	learnerInstallCloseDatabase = func(*sqldriver.Database) error {
+		databaseCalls++
+		return nil
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := settlement.settle(); !errors.Is(err, fault) || settlement.apply == nil ||
+			settlement.database == nil || databaseCalls != 0 {
+			t.Fatalf("attempt %d apply=%v database=%v databaseCalls=%d err=%v",
+				attempt, settlement.apply, settlement.database, databaseCalls, err)
+		}
+	}
+	if err := settlement.settle(); err != nil || settlement.apply != nil ||
+		settlement.database != nil || applyCalls != 3 || databaseCalls != 1 {
+		t.Fatalf("settled apply=%v database=%v calls=%d/%d err=%v",
+			settlement.apply, settlement.database, applyCalls, databaseCalls, err)
 	}
 }
 
@@ -117,6 +155,61 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	command := replication.Command{
+		Kind:      replication.CommandSessionOpen,
+		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
+		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
+		Distribution:          binding.Distribution, Shard: binding.Shard,
+		AllocationGeneration: binding.AllocationGeneration, ShardIncarnation: binding.ShardIncarnation,
+		GroupID: binding.GroupID, ReplicaSetVersion: 1,
+		ActivePolicyGeneration: authority.ActivePolicyGeneration, ProtectionEpoch: authority.ProtectionEpoch,
+		OwnershipEpoch: authority.OwnershipEpoch, SchemaGeneration: authority.SchemaGeneration,
+		RoutingVersion: authority.RoutingVersion, RouteGeneration: authority.RouteGeneration,
+		Tenant: []byte("tenant"), ClientID: replication.ID128{9}, ClientSequence: 1,
+		Fingerprint:          sha256.Sum256([]byte("learner-session")),
+		NextDeadlineUnixNano: 2_000_000_000_000_000_000,
+	}
+	sessionCommand, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := raftmodel.ApplyMeta{Index: 2, Term: 1, Type: pb.EntryNormal}
+	if _, err = apply.ApplyNormal(meta, sessionCommand); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := apply.LookupCompletion(sessionCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ClientEpoch == 0 {
+		t.Fatalf("session completion=%+v err=%v", completion, err)
+	}
+	keyBytes, ok := orderedkey.AppendJSONString(nil, []byte(`"doc-1"`), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("encode document key")
+	}
+	document := []byte(`{"id":"doc-1","value":"replicated"}`)
+	command.Kind = replication.CommandMutationBatch
+	command.ClientEpoch, command.ClientSequence = completion.ClientEpoch, 2
+	command.Fingerprint = sha256.Sum256([]byte("learner-document"))
+	command.NextDeadlineUnixNano = 0
+	command.Batches = []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPut, Key: keyBytes, Value: document,
+	}}}}
+	documentCommand, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Index = 3
+	if _, err = apply.ApplyNormal(meta, documentCommand); err != nil {
+		t.Fatal(err)
+	}
+	documentLookup, err := apply.LookupCompletion(documentCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceCompletion := bytes.Clone(documentLookup.Bytes)
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
@@ -173,29 +266,47 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	hostLimits := multiraft.Limits{MaxGroups: 2, MaxQueueItems: 8, MaxQueueBytes: 8 << 20,
 		MaxGroupItems: 4, MaxGroupBytes: 4 << 20, MaxOutboxItems: 8,
 		MaxOutboxBytes: 4 << 20, MaxPendingTicks: 4}
-	host, err := multiraft.NewHost(hostLimits)
+	rejectedHost, err := multiraft.NewHost(hostLimits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer host.Close()
+	if err = rejectedHost.Close(); err != nil {
+		t.Fatal(err)
+	}
+	settlement := &LearnerInstallSettlement{}
 	plan := LearnerInstallPlan{Repository: repository, Descriptor: descriptor, Cursor: cursor,
 		Database: target, SQLIdentity: targetIdentity, ApplyOptions: options,
 		StaticBootstrap: bootstrap, ExpectedConfState: conf,
 		WALPath: filepath.Join(t.TempDir(), "learner.wal"), WALIdentity: walIdentity,
-		WALKey: key, WALOptions: walOptions, Authority: authority, Host: host}
-	fault := errors.New("stop before Host.Add")
-	previous := learnerInstallFaultHook
-	learnerInstallFaultHook = func(point learnerInstallFaultPoint) error {
-		if point == learnerInstallBeforeHostAdd {
-			return fault
-		}
-		return nil
-	}
+		WALKey: key, WALOptions: walOptions, Authority: authority, Host: rejectedHost,
+		Settlement: settlement}
 	_, err = InstallPublishedLearner(plan)
-	learnerInstallFaultHook = previous
-	if !errors.Is(err, fault) {
+	if !errors.Is(err, multiraft.ErrHostClosed) {
 		t.Fatalf("Host boundary fault = %v", err)
 	}
+	if _, statusErr := rejectedHost.Status(descriptor.Group); !errors.Is(statusErr, multiraft.ErrHostClosed) {
+		t.Fatalf("closed rejecting Host unexpectedly owns learner: %v", statusErr)
+	}
+	closeFault := errors.New("runtime close retry")
+	previousClose := learnerInstallCloseRuntime
+	defer func() { learnerInstallCloseRuntime = previousClose }()
+	closeAttempts := 0
+	learnerInstallCloseRuntime = func(runtime *raftmember.Runtime) error {
+		closeAttempts++
+		if closeAttempts <= 2 {
+			return closeFault
+		}
+		return previousClose(runtime)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if settleErr := settlement.settle(); !errors.Is(settleErr, closeFault) || settlement.runtime == nil {
+			t.Fatalf("retained close attempt %d runtime=%v err=%v", attempt, settlement.runtime, settleErr)
+		}
+	}
+	if err = settlement.settle(); err != nil || settlement.runtime != nil || closeAttempts != 3 {
+		t.Fatalf("settled retained runtime=%v attempts=%d err=%v", settlement.runtime, closeAttempts, err)
+	}
+	learnerInstallCloseRuntime = previousClose
 
 	reopened, _, err := sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
 		targetPath, targetIdentity, options,
@@ -203,7 +314,40 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan.Database = reopened
+	reopenedApply, _, err := reopened.OpenReplicatedApply(targetIdentity, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetCompletion, err := reopenedApply.LookupCompletion(documentCommand); err != nil ||
+		!bytes.Equal(targetCompletion.Bytes, sourceCompletion) {
+		t.Fatalf("target completion=%x err=%v", targetCompletion.Bytes, err)
+	}
+	targetCut, err := reopenedApply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targetArtifact bytes.Buffer
+	targetManifest, err := replicatedstate.WriteSnapshotArtifact(&targetArtifact, targetCut,
+		replicatedstate.SnapshotArtifactOptions{TargetChunkBytes: MinChunkBytes})
+	err = errors.Join(err, targetCut.Close(), reopenedApply.Close(), reopened.Close())
+	if err != nil || targetManifest.ImageDigest != manifest.ImageDigest ||
+		targetManifest.UserRows != 1 || !bytes.Equal(targetArtifact.Bytes(), payload) {
+		t.Fatalf("target snapshot rows=%d digest=%x/%x bytes-equal=%v err=%v",
+			targetManifest.UserRows, targetManifest.ImageDigest, manifest.ImageDigest,
+			bytes.Equal(targetArtifact.Bytes(), payload), err)
+	}
+	reopened, _, err = sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
+		targetPath, targetIdentity, options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := multiraft.NewHost(hostLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	plan.Database, plan.Host = reopened, host
 	identity, err := InstallPublishedLearner(plan)
 	if err != nil || identity.NodeIncarnation != descriptor.TargetIncarnation {
 		t.Fatalf("exact retry identity=%+v err=%v", identity, err)
