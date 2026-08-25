@@ -3,7 +3,6 @@ package replicatedstate
 import (
 	"crypto/sha256"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -171,7 +170,13 @@ func TestBindingAndUserNameRejectEmbeddedNUL(t *testing.T) {
 func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	system := createTargetAt(t, dir, "system", durable.Options{})
-	user := createTargetAt(t, dir, "user", durable.Options{MaxBatchBytes: math.MaxInt})
+	// The durable handle must itself honestly admit the replicated command
+	// envelope within its 64-MiB resident budget. An unbounded MaxBatchBytes
+	// advertises a 256-MiB multi-document transaction and correctly fails store
+	// construction before replicatedstate can apply its narrower wire cap.
+	user := createTargetAt(t, dir, "user", durable.Options{
+		MaxBatchBytes: replication.MaxCommandBytes,
+	})
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)

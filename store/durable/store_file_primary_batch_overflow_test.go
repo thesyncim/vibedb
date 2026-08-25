@@ -543,7 +543,7 @@ func bruteBatchOverflowExtentBytes(
 ) uint64 {
 	best := uint64(0)
 	for active := 1; active <= documents; active++ {
-		keys := fileStoreMinimumDistinctKeyBytes(active, maxKeyBytes)
+		keys := referenceMinimumDistinctKeyBytes(active, maxKeyBytes)
 		if keys >= uint64(maxBatchBytes) {
 			continue
 		}
@@ -563,7 +563,7 @@ func bruteBatchOverflowExtentBytes(
 					continue
 				}
 				for value := inlineValueBytes + 1; value <= maxDocumentBytes && used+value <= budget; value++ {
-					candidate := reward + fileStoreOverflowValueExtentBytes(
+					candidate := reward + referenceOverflowExtentBytes(
 						value, pageSize, maxPageSize,
 					)
 					if next[used+value] == unreachable || candidate > next[used+value] {
@@ -580,6 +580,56 @@ func bruteBatchOverflowExtentBytes(
 		}
 	}
 	return best
+}
+
+// referenceMinimumDistinctKeyBytes independently enumerates the literal byte
+// alphabet cardinality at each non-empty key width. It intentionally shares no
+// production shortest-key arithmetic with the bound under test.
+func referenceMinimumDistinctKeyBytes(count, maxKeyBytes int) uint64 {
+	if count <= 0 {
+		return 0
+	}
+	if maxKeyBytes <= 0 {
+		return math.MaxUint64
+	}
+	remaining := uint64(count)
+	spellings := uint64(256)
+	total := uint64(0)
+	for width := 1; width <= maxKeyBytes && remaining != 0; width++ {
+		take := min(remaining, spellings)
+		if take > (math.MaxUint64-total)/uint64(width) {
+			return math.MaxUint64
+		}
+		total += take * uint64(width)
+		remaining -= take
+		if spellings > math.MaxUint64/256 {
+			spellings = math.MaxUint64
+		} else {
+			spellings *= 256
+		}
+	}
+	if remaining != 0 {
+		return math.MaxUint64
+	}
+	return total
+}
+
+// referenceOverflowExtentBytes models the page-catalog geometry directly:
+// every non-final extent is MaxPageSize and the final header+payload is rounded
+// once to the allocation quantum. It does not call either production extent
+// helper used by the certified calculation.
+func referenceOverflowExtentBytes(valueBytes, pageSize, maxPageSize int) uint64 {
+	header := storeio.PageHeaderSize + storeio.PageTrailerSize +
+		storeio.OverflowPagePayloadHeaderSize
+	payload := maxPageSize - header
+	if valueBytes <= 0 || pageSize <= 0 || payload <= 0 {
+		return 0
+	}
+	full := (valueBytes - 1) / payload
+	remainder := valueBytes - full*payload
+	last := header + remainder
+	last = (last + pageSize - 1) / pageSize * pageSize
+	return uint64(full*maxPageSize + last)
 }
 
 func TestBatchOverflowExtentByteBoundMatchesAdversarialOracle(t *testing.T) {
@@ -636,6 +686,66 @@ func TestBatchOverflowExtentByteBoundMatchesAdversarialOracle(t *testing.T) {
 		math.MaxInt, 4096, 64<<10,
 	); got != math.MaxUint64 {
 		t.Fatalf("hostile overflow geometry = %d, want saturated", got)
+	}
+}
+
+func TestBatchOverflowExtentByteBoundExhaustiveSmallGeometry(t *testing.T) {
+	const (
+		pageSize    = 64
+		maxPageSize = 256
+	)
+	for documents := 1; documents <= 4; documents++ {
+		for maxKeyBytes := 1; maxKeyBytes <= 2; maxKeyBytes++ {
+			for inline := 1; inline <= 6; inline++ {
+				for maximum := inline + 1; maximum <= 24; maximum++ {
+					for batch := 1; batch <= documents*(maximum+maxKeyBytes); batch++ {
+						got := fileStoreBatchOverflowExtentBytes(
+							documents, maxKeyBytes, inline, maximum, batch,
+							pageSize, maxPageSize,
+						)
+						want := bruteBatchOverflowExtentBytes(
+							documents, maxKeyBytes, inline, maximum, batch,
+							pageSize, maxPageSize,
+						)
+						if got < want || got > want+uint64(documents*pageSize) {
+							t.Fatalf("docs=%d key=%d inline=%d max=%d batch=%d got=%d want=%d",
+								documents, maxKeyBytes, inline, maximum, batch, got, want)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestOverlayPhysicalDirtyWindowSaturatesAndFitsSuffix(t *testing.T) {
+	const (
+		budget      = uint64(64 << 20)
+		fixed       = uint64(2 << 20)
+		minimum     = uint64(20 << 10)
+		parentDelta = uint64(16 << 10)
+		pointSuffix = uint64(5 << 20)
+		pageSize    = 4096
+		bucketLimit = 1024
+	)
+	dirty := fileStoreOverlayPhysicalDirtyBytes(
+		math.MaxUint64, budget-pointSuffix, fixed, minimum,
+		parentDelta, bucketLimit, pageSize,
+	)
+	buckets := min(uint64(bucketLimit), dirty/minimum)
+	physical := fixed + dirty + buckets*parentDelta + pointSuffix
+	if dirty == 0 || physical > budget || physical+pageSize <= budget {
+		t.Fatalf("dirty=%d buckets=%d physical=%d budget=%d", dirty, buckets, physical, budget)
+	}
+	if allocations := testing.AllocsPerRun(1_000, func() {
+		if fileStoreOverlayPhysicalDirtyBytes(
+			math.MaxUint64, budget-pointSuffix, fixed, minimum,
+			parentDelta, bucketLimit, pageSize,
+		) != dirty {
+			panic("physical dirty window changed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("physical dirty bound allocations = %.1f, want zero", allocations)
 	}
 }
 

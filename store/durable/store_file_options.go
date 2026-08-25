@@ -823,26 +823,65 @@ func fileStoreTransactionExtentClassBytes(
 		fileStoreSaturatingByteProduct(remaining, pageSize))
 }
 
+// fileStoreOverlayPhysicalDirtyBytes returns the largest page-aligned resident
+// dirty window whose persisted image fits the caller-supplied physical budget.
+// Each admitted dirty bucket can widen its four
+// resident PageSize parents to their exact catalog extent classes. The search
+// is option-time only and monotone; it preserves the independent descriptor
+// bucket ceiling while preventing that physical padding from becoming a sparse
+// collision gap beyond ResidentBytes.
+func fileStoreOverlayPhysicalDirtyBytes(
+	dirtyBytes, physicalBudget, physicalFixedBytes, minimumBucketBytes,
+	parentExtentDelta uint64, bucketLimit, pageSize int,
+) uint64 {
+	if dirtyBytes == 0 || physicalBudget <= physicalFixedBytes ||
+		minimumBucketBytes == 0 || bucketLimit <= 0 || pageSize <= 0 {
+		return 0
+	}
+	quantum := uint64(pageSize)
+	high := dirtyBytes / quantum
+	low := uint64(0)
+	for low < high {
+		middle := low + (high-low+1)/2
+		candidate := middle * quantum
+		buckets := min(uint64(bucketLimit), candidate/minimumBucketBytes)
+		physical := fileStoreSaturatingByteAdd(
+			physicalFixedBytes, candidate,
+		)
+		physical = fileStoreSaturatingByteAdd(
+			physical,
+			fileStoreSaturatingByteProduct64(buckets, parentExtentDelta),
+		)
+		if physical <= physicalBudget {
+			low = middle
+		} else {
+			high = middle - 1
+		}
+	}
+	return low * quantum
+}
+
 type normalizedFileStoreOptions struct {
 	Options
 	// maxTransactionBytes bounds resident dirty frame bytes. Persisted extent
 	// placement has wider metadata classes and is bounded independently below.
-	maxTransactionPages              int
-	maxTransactionBytes              uint64
-	maxTransactionPhysicalBytes      uint64
-	singleDocumentTransactionPages   int
-	singleDocumentTransactionBytes   uint64
-	singleDocumentFreeFoldLimit      int
-	freeFoldLimit                    int
-	pageCatalog                      *storeio.CanonicalPageCatalog
-	indexes                          []*store.ExactIndex
-	skipIndexes                      []vibejson.CompiledPointer
-	indexNameIDs                     map[string]uint32
-	indexCatalogHash                 uint64
-	primaryUnifiedOverlayBytes       int
-	primaryUnifiedOverlayBuckets     int
-	primaryUnifiedOverlayDirtyBytes  uint64
-	primaryUnifiedOverlayParentBytes uint32
+	maxTransactionPages                    int
+	maxTransactionBytes                    uint64
+	maxTransactionPhysicalBytes            uint64
+	singleDocumentTransactionPages         int
+	singleDocumentTransactionBytes         uint64
+	singleDocumentTransactionPhysicalBytes uint64
+	singleDocumentFreeFoldLimit            int
+	freeFoldLimit                          int
+	pageCatalog                            *storeio.CanonicalPageCatalog
+	indexes                                []*store.ExactIndex
+	skipIndexes                            []vibejson.CompiledPointer
+	indexNameIDs                           map[string]uint32
+	indexCatalogHash                       uint64
+	primaryUnifiedOverlayBytes             int
+	primaryUnifiedOverlayBuckets           int
+	primaryUnifiedOverlayDirtyBytes        uint64
+	primaryUnifiedOverlayParentBytes       uint32
 }
 
 const (
@@ -1337,6 +1376,15 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		4*min(o.MaxBatchDocuments, filePrimaryPendingParentLimit),
 		o.PageSize, o.MaxPageSize, batchOverflowBytes,
 	)
+	singleDocumentMaximumOtherPages := fileStoreSaturatingAdd(
+		fileStoreSaturatingAdd(1, compiledPackedPages), exactIndexPages,
+	)
+	singleDocumentTransactionPhysicalBytes := fileStoreTransactionExtentClassBytes(
+		singleDocumentTransactionPages,
+		singleDocumentOverflowPages, singleDocumentMaximumOtherPages,
+		4*min(1, filePrimaryPendingParentLimit),
+		o.PageSize, o.MaxPageSize, singleDocumentOverflowBytes,
+	)
 	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
 	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket
 	// directory that fits the collection's descriptor, retirement, and resident
@@ -1440,6 +1488,23 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		worst := uint64(primaryOverlayBucketLimit) *
 			(uint64(o.MaxPageSize) + primaryOverlayParentBytes)
 		primaryOverlayDirtyBytes = min(available, worst)
+		// The collision-free volatile namespace starts after the largest
+		// checkpoint image and then stores its own extent. Keep both within the
+		// same configured byte envelope. This is independent of resident
+		// admission: it accounts only for physical class widening of parents.
+		physicalBudget := uint64(o.ResidentBytes)
+		if physicalBudget > singleDocumentTransactionPhysicalBytes {
+			physicalBudget -= singleDocumentTransactionPhysicalBytes
+		} else {
+			physicalBudget = 0
+		}
+		parentExtentDelta := primaryOverlayPhysicalParentBytes -
+			primaryOverlayParentBytes
+		primaryOverlayDirtyBytes = fileStoreOverlayPhysicalDirtyBytes(
+			primaryOverlayDirtyBytes, physicalBudget,
+			primaryOverlayPhysicalFixedBytes, minimumDirtyBytes,
+			parentExtentDelta, primaryOverlayBucketLimit, o.PageSize,
+		)
 		if primaryOverlayDirtyBytes < minimumDirtyBytes {
 			primaryOverlayBucketLimit = 0
 			primaryOverlayDirtyBytes = 0
@@ -1501,16 +1566,17 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	primaryUnifiedOverlayBytes := int(primaryOverlayTargetBytes)
 	normalized := normalizedFileStoreOptions{
-		Options:                        o,
-		maxTransactionPages:            maxTransactionPages,
-		maxTransactionBytes:            maxTransactionBytes,
-		maxTransactionPhysicalBytes:    maxTransactionPhysicalBytes,
-		singleDocumentTransactionPages: singleDocumentTransactionPages,
-		singleDocumentTransactionBytes: singleDocumentTransactionBytes,
-		singleDocumentFreeFoldLimit:    singleDocumentFreeFoldLimit,
-		freeFoldLimit:                  freeFoldLimit,
-		pageCatalog:                    pageCatalog,
-		indexes:                        compiled, indexNameIDs: indexNameIDs,
+		Options:                                o,
+		maxTransactionPages:                    maxTransactionPages,
+		maxTransactionBytes:                    maxTransactionBytes,
+		maxTransactionPhysicalBytes:            maxTransactionPhysicalBytes,
+		singleDocumentTransactionPages:         singleDocumentTransactionPages,
+		singleDocumentTransactionBytes:         singleDocumentTransactionBytes,
+		singleDocumentTransactionPhysicalBytes: singleDocumentTransactionPhysicalBytes,
+		singleDocumentFreeFoldLimit:            singleDocumentFreeFoldLimit,
+		freeFoldLimit:                          freeFoldLimit,
+		pageCatalog:                            pageCatalog,
+		indexes:                                compiled, indexNameIDs: indexNameIDs,
 		skipIndexes:                      compiledSkipIndexes,
 		indexCatalogHash:                 catalogHash,
 		primaryUnifiedOverlayBytes:       primaryUnifiedOverlayBytes,

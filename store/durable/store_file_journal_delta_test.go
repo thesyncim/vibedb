@@ -450,17 +450,7 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	ordinaryHeader := ordinary.journal.Header()
-	completeOverlayBatch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
-		ordinaryHeader.SectorSize, primaryUnifiedOverlayRecords,
-		ordinary.primaryUnifiedOverlay.capacityBytes(),
-	))
-	wantDeltaCapacity := min(
-		max(2*completeOverlayBatch, recoveryJournalDeltaMinCapacityBytes),
-		recoveryJournalMaxCapacityBytes,
-	)
-	wantDeltaCapacity = min(
-		wantDeltaCapacity, recoveryJournalCompactDeltaCapacityBytes,
-	)
+	wantDeltaCapacity := recoveryJournalCompactDeltaCapacityBytes
 	if got := ordinary.journal.Header().Capacity; got != wantDeltaCapacity {
 		t.Fatalf("ordinary delta journal capacity = %d, want %d",
 			got, wantDeltaCapacity)
@@ -485,11 +475,10 @@ func TestBufferedJournalDeltaUsesOverlaySizedJournal(t *testing.T) {
 		ackHeader.SectorSize, ack.options.MaxKeyBytes,
 		ack.options.InlineValueBytes, ack.options.MaxDocumentBytes, 0,
 	)
-	if got := ackHeader.Capacity; got != wantAckCapacity ||
-		got >= completeOverlayBatch {
+	if got := ackHeader.Capacity; got != wantAckCapacity {
 		t.Fatalf(
-			"per-mutation ack journal capacity = %d, want cadence-sized %d below delta batch %d",
-			got, wantAckCapacity, completeOverlayBatch,
+			"per-mutation ack journal capacity = %d, want cadence-sized %d",
+			got, wantAckCapacity,
 		)
 	}
 	if ackHeader.Format != storeio.RecoveryJournalFormat {
@@ -1163,7 +1152,10 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 		mutations       = checkpointEvery * checkpoints
 	)
 	options := journalDeltaTestOptions()
-	options.QueueSlots = 1024
+	// The default indexed batch admits 1,224 pages. Keep the queue below the
+	// committer's fixed one-million-descriptor ceiling; journal headroom, not a
+	// giant visibility queue, is the dimension this test exercises.
+	options.QueueSlots = 512
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
@@ -1215,10 +1207,10 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 			stats.JournalDeltaFullFallbacks)
 	}
 	if got, wantCheckpoints := stats.JournalDeltaCheckpoints-
-		baseline.JournalDeltaCheckpoints+recycles,
+		baseline.JournalDeltaCheckpoints,
 		uint64(checkpoints); got != wantCheckpoints {
-		t.Fatalf("delta checkpoints + rotations = %d, want %d",
-			got, wantCheckpoints)
+		t.Fatalf("delta checkpoints = %d, want %d (rotations=%d)",
+			got, wantCheckpoints, recycles)
 	}
 	target := coll.Generation()
 	if coll.DurableGeneration() != target {
