@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/collectionname"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const testNativeRequestID = "00112233445566778899aabbccddeeff"
@@ -134,6 +138,45 @@ func TestDecodeNativeDataRequestCanonicalEscapedTable(t *testing.T) {
 		}
 	}); allocations != 0 {
 		t.Fatalf("escaped table allocations = %v, want 0", allocations)
+	}
+}
+
+func TestNativeCanonicalTableStringMatchesVibeJSON(t *testing.T) {
+	names := []string{
+		`slash\\quote"`, "\b\f\n\r\t\x01", `<>&`, "café-世界",
+		"line paragraph ", strings.Repeat("<", 120),
+	}
+	for _, name := range names {
+		encoded, err := vibejson.Marshal(&name)
+		if err != nil {
+			t.Fatalf("marshal %q: %v", name, err)
+		}
+		var encodedStore [collectionname.MaxNameBytes*6 + 2]byte
+		if got := appendNativeCanonicalString(encodedStore[:0], []byte(name)); !bytes.Equal(got, encoded) {
+			t.Fatalf("canonical %q = %q, want %q", name, got, encoded)
+		}
+		source := make([]byte, 0, len(encoded)+64)
+		source = append(source, `{"op":"get","table":`...)
+		source = append(source, encoded...)
+		source = append(source, `,"key":"AQIDBA","consistency":"linearizable"}`...)
+		var request nativeDataWireRequest
+		if err := decodeNativeDataRequest(source, &request); err != nil {
+			t.Fatalf("decode %q: %v", source, err)
+		}
+		if !bytes.Equal(request.Table, []byte(name)) {
+			t.Fatalf("table = %q, want %q", request.Table, name)
+		}
+	}
+
+	for _, source := range []string{
+		`{"op":"get","table":"a\/b","key":"AQIDBA","consistency":"linearizable"}`,
+		`{"op":"get","table":"\u003C","key":"AQIDBA","consistency":"linearizable"}`,
+		`{"op":"get","table":"\u000a","key":"AQIDBA","consistency":"linearizable"}`,
+	} {
+		var request nativeDataWireRequest
+		if err := decodeNativeDataRequest([]byte(source), &request); !errors.Is(err, errInvalidNativeDataRequest) {
+			t.Fatalf("alternate spelling %q = %v", source, err)
+		}
 	}
 }
 

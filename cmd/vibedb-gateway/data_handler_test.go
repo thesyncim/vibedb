@@ -83,6 +83,7 @@ func TestNativeDataResponseForErrorIsClosedAndTyped(t *testing.T) {
 		{raftmodel.ErrAdmissionBound, nativeDataResponseOverloaded, true},
 		{raftservice.ErrServingFence, nativeDataResponseStaleCatalog, true},
 		{errors.Join(raftservice.ErrServingFence, gateway.ErrReplicatedUnauthorized), nativeDataResponseStaleCatalog, true},
+		{errors.Join(raftservice.ErrServingFence, gateway.ErrReplicatedDataRead), nativeDataResponseStaleCatalog, true},
 		{context.DeadlineExceeded, nativeDataResponseUnavailable, true},
 		{&gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnavailable}, nativeDataResponseUnavailable, true},
 		{errors.New("unexpected"), nativeDataResponseInternal, false},
@@ -128,6 +129,18 @@ func TestHandleConnDataReturnsClosedTypedFailures(t *testing.T) {
 			name:   "recognized operation cannot fall through",
 			reader: &nativeDataReaderStub{},
 			line:   `{"op":"get"}`,
+			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
+		},
+		{
+			name:   "escaped operation cannot fall through",
+			reader: &nativeDataReaderStub{},
+			line:   `{"o\u0070":"get","table":"docs"}`,
+			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
+		},
+		{
+			name:   "reordered native operation cannot fall through",
+			reader: &nativeDataReaderStub{},
+			line:   `{"table":"docs","op":"delete"}`,
 			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
 		},
 		{

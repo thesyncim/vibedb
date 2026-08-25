@@ -72,6 +72,8 @@ type ReplicatedTableReadResult struct {
 
 	reservationOwner *ReplicatedDataReader
 	reservationBytes uint64
+	reservationSlot  uint32
+	reservationEpoch uint64
 }
 
 // Release returns the schema-bounded response reservation after the caller has
@@ -79,12 +81,15 @@ type ReplicatedTableReadResult struct {
 // exactly once. Release clears Value and is idempotent for the same result
 // variable; callers must not copy a live result.
 func (result *ReplicatedTableReadResult) Release() {
-	if result == nil || result.reservationOwner == nil || result.reservationBytes == 0 {
+	if result == nil || result.reservationOwner == nil || result.reservationBytes == 0 ||
+		result.reservationEpoch == 0 {
 		return
 	}
 	owner, bytes := result.reservationOwner, result.reservationBytes
+	slot, epoch := result.reservationSlot, result.reservationEpoch
 	result.reservationOwner, result.reservationBytes, result.Value = nil, 0, nil
-	owner.releaseRead(bytes)
+	result.reservationSlot, result.reservationEpoch = 0, 0
+	owner.releaseRead(slot, epoch, bytes)
 }
 
 // ReplicatedDataReader binds public table/key reads to one atomically pinned
@@ -93,18 +98,25 @@ type ReplicatedDataReader struct {
 	catalog      *CatalogHolder
 	executor     *ReplicatedExecutor
 	refresh      RefreshFunc
-	readSlots    chan struct{}
+	readSlots    chan uint32
+	reservations []replicatedReadReservation
 	maxReadBytes uint64
 	readBytes    atomic.Uint64
+	nextEpoch    atomic.Uint64
 
 	refreshMu sync.Mutex
 	active    *replicatedDataCatalogRefresh
 }
 
 type replicatedDataCatalogRefresh struct {
-	done  chan struct{}
-	floor uint64
-	err   error
+	done          chan struct{}
+	floor         uint64
+	err           error
+	ownerCanceled bool
+}
+
+type replicatedReadReservation struct {
+	epoch atomic.Uint64
 }
 
 type ReplicatedDataReaderOptions struct {
@@ -149,10 +161,15 @@ func NewReplicatedDataReaderWithOptions(
 		maximumBytes == 0 || maximumBytes > AbsoluteMaxReplicatedReadInFlight {
 		return nil, ErrReplicatedDataRead
 	}
-	return &ReplicatedDataReader{
+	reader := &ReplicatedDataReader{
 		catalog: options.Catalog, executor: options.Executor, refresh: options.Refresh,
-		readSlots: make(chan struct{}, concurrency), maxReadBytes: maximumBytes,
-	}, nil
+		readSlots: make(chan uint32, concurrency), reservations: make([]replicatedReadReservation, concurrency),
+		maxReadBytes: maximumBytes,
+	}
+	for slot := range reader.reservations {
+		reader.readSlots <- uint32(slot)
+	}
+	return reader, nil
 }
 
 // Read executes one RF3 base-relation point read. Linearizable uses the
@@ -224,7 +241,8 @@ func (reader *ReplicatedDataReader) readPinned(
 		return ReplicatedTableReadResult{}, lease.generation, ErrReplicatedReadPositionMismatch
 	}
 	readBytes := uint64(resolved.Profile.MaxDocumentBytes)
-	if err := reader.admitRead(ctx, readBytes); err != nil {
+	reservationSlot, reservationEpoch, err := reader.admitRead(ctx, readBytes)
+	if err != nil {
 		return ReplicatedTableReadResult{}, lease.generation, err
 	}
 
@@ -234,44 +252,57 @@ func (reader *ReplicatedDataReader) readPinned(
 		Linearizable: linearizable,
 	})
 	if err != nil {
-		reader.releaseRead(readBytes)
+		reader.releaseRead(reservationSlot, reservationEpoch, readBytes)
 		return ReplicatedTableReadResult{}, lease.generation, err
 	}
 	return ReplicatedTableReadResult{
 		Position: ReplicatedReadPosition{RouteID: resolved.RouteID, Applied: result.Applied},
 		Found:    result.Found, Value: result.Value, Retries: result.Retries,
 		reservationOwner: reader, reservationBytes: readBytes,
+		reservationSlot: reservationSlot, reservationEpoch: reservationEpoch,
 	}, lease.generation, nil
 }
 
-func (reader *ReplicatedDataReader) admitRead(ctx context.Context, bytes uint64) error {
+func (reader *ReplicatedDataReader) admitRead(
+	ctx context.Context,
+	bytes uint64,
+) (uint32, uint64, error) {
 	if reader == nil || ctx == nil || bytes == 0 || bytes > reader.maxReadBytes ||
-		reader.readSlots == nil {
-		return ErrReplicatedReadAdmission
+		reader.readSlots == nil || len(reader.reservations) == 0 {
+		return 0, 0, ErrReplicatedReadAdmission
 	}
+	var slot uint32
 	select {
-	case reader.readSlots <- struct{}{}:
+	case slot = <-reader.readSlots:
 	case <-ctx.Done():
-		return context.Cause(ctx)
+		return 0, 0, context.Cause(ctx)
 	}
 	for {
 		used := reader.readBytes.Load()
 		if used > reader.maxReadBytes || bytes > reader.maxReadBytes-used {
-			<-reader.readSlots
-			return ErrReplicatedReadAdmission
+			reader.readSlots <- slot
+			return 0, 0, ErrReplicatedReadAdmission
 		}
 		if reader.readBytes.CompareAndSwap(used, used+bytes) {
-			return nil
+			break
 		}
 	}
+	epoch := reader.nextEpoch.Add(1)
+	if epoch == 0 {
+		epoch = reader.nextEpoch.Add(1)
+	}
+	reader.reservations[slot].epoch.Store(epoch)
+	return slot, epoch, nil
 }
 
-func (reader *ReplicatedDataReader) releaseRead(bytes uint64) {
-	if reader == nil || bytes == 0 || reader.readSlots == nil {
+func (reader *ReplicatedDataReader) releaseRead(slot uint32, epoch, bytes uint64) {
+	if reader == nil || bytes == 0 || epoch == 0 || reader.readSlots == nil ||
+		uint64(slot) >= uint64(len(reader.reservations)) ||
+		!reader.reservations[slot].epoch.CompareAndSwap(epoch, 0) {
 		return
 	}
 	reader.readBytes.Add(^(bytes - 1))
-	<-reader.readSlots
+	reader.readSlots <- slot
 }
 
 func (reader *ReplicatedDataReader) refreshAfterFence(
@@ -300,6 +331,12 @@ func (reader *ReplicatedDataReader) refreshAfterFence(
 			}
 			if active.floor >= staleGeneration {
 				if active.err != nil {
+					// A refresh owner lends only its authenticated result, not
+					// its request lifetime. A canceled owner must not poison a
+					// still-live waiter; let that waiter become the next owner.
+					if active.ownerCanceled {
+						continue
+					}
 					return active.err
 				}
 				return ErrStaleGeneration
@@ -334,6 +371,7 @@ func (reader *ReplicatedDataReader) refreshAfterFence(
 			current.Generation() > staleGeneration {
 			active.err = nil
 		}
+		active.ownerCanceled = context.Cause(ctx) != nil
 		reader.refreshMu.Lock()
 		reader.active = nil
 		close(active.done)

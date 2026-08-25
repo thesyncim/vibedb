@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,6 +28,18 @@ type publicPointReadClient struct {
 	wantRelation  replication.RelationID
 	wantMaxValue  uint32
 	wantMinimum   uint64
+}
+
+type signalingReadContext struct {
+	context.Context
+	entered chan struct{}
+	never   chan struct{}
+	once    sync.Once
+}
+
+func (ctx *signalingReadContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.entered) })
+	return ctx.never
 }
 
 func (client *publicPointReadClient) DoReplicated(
@@ -330,6 +343,78 @@ func TestReplicatedDataReaderCoalescesCatalogRefresh(t *testing.T) {
 	}
 }
 
+func TestReplicatedDataReaderCanceledRefreshOwnerDoesNotPoisonWaiter(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
+	reader, holder, _, _ := testReplicatedDataReader(t, client)
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	advanced, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 6, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	var refreshes atomic.Uint32
+	reader.refresh = func(ctx context.Context, _ uint64) (*Snapshot, error) {
+		if refreshes.Add(1) == 1 {
+			close(entered)
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		}
+		return advanced, nil
+	}
+	ownerContext, cancelOwner := context.WithCancel(context.Background())
+	owner := make(chan error, 1)
+	waiter := make(chan error, 1)
+	go func() { owner <- reader.refreshAfterFence(ownerContext, 5) }()
+	<-entered
+	go func() { waiter <- reader.refreshAfterFence(context.Background(), 5) }()
+	cancelOwner()
+	if err := <-owner; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner refresh = %v", err)
+	}
+	if err := <-waiter; err != nil {
+		t.Fatalf("waiter refresh = %v", err)
+	}
+	if refreshes.Load() != 2 || holder.Current().Generation() != 6 {
+		t.Fatalf("refreshes=%d generation=%d", refreshes.Load(), holder.Current().Generation())
+	}
+}
+
+func TestReplicatedDataReaderLiveOwnerTimeoutIsShared(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
+	reader, _, _, _ := testReplicatedDataReader(t, client)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var refreshes atomic.Uint32
+	reader.refresh = func(context.Context, uint64) (*Snapshot, error) {
+		if refreshes.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil, errors.Join(context.DeadlineExceeded, ErrReplicatedCatalog)
+	}
+	owner := make(chan error, 1)
+	waiter := make(chan error, 1)
+	go func() { owner <- reader.refreshAfterFence(context.Background(), 5) }()
+	<-entered
+	waiterContext := &signalingReadContext{
+		Context: context.Background(), entered: make(chan struct{}), never: make(chan struct{}),
+	}
+	go func() { waiter <- reader.refreshAfterFence(waiterContext, 5) }()
+	<-waiterContext.entered
+	close(release)
+	for name, result := range map[string]<-chan error{"owner": owner, "waiter": waiter} {
+		if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s refresh = %v", name, err)
+		}
+	}
+	if refreshes.Load() != 1 {
+		t.Fatalf("refreshes = %d, want 1", refreshes.Load())
+	}
+}
+
 func TestReplicatedDataReaderBoundsConcurrentResponseBytes(t *testing.T) {
 	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
 	base, _, _, _ := testReplicatedDataReader(t, client)
@@ -341,17 +426,19 @@ func TestReplicatedDataReaderBoundsConcurrentResponseBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	bytes := uint64(replication.MaxMutationValueBytes)
-	if err := reader.admitRead(context.Background(), bytes); err != nil {
+	slot, epoch, err := reader.admitRead(context.Background(), bytes)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reader.admitRead(context.Background(), bytes); !errors.Is(err, ErrReplicatedReadAdmission) {
+	if _, _, err := reader.admitRead(context.Background(), bytes); !errors.Is(err, ErrReplicatedReadAdmission) {
 		t.Fatalf("second reservation = %v", err)
 	}
 	if reader.readBytes.Load() != bytes || len(reader.readSlots) != 1 {
 		t.Fatalf("reserved bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
 	}
-	reader.releaseRead(bytes)
-	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 0 {
+	reader.releaseRead(slot, epoch, bytes)
+	reader.releaseRead(slot, epoch, bytes)
+	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 2 {
 		t.Fatalf("released bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
 	}
 
@@ -390,13 +477,15 @@ func TestReplicatedDataReaderHoldsResponseReservationUntilRelease(t *testing.T) 
 		result.Release()
 		t.Fatalf("live response reserved bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
 	}
+	copyOfResult := result
 	if _, err := reader.Read(context.Background(), request); !errors.Is(err, ErrReplicatedReadAdmission) {
 		result.Release()
 		t.Fatalf("read while response retained = %v", err)
 	}
 	result.Release()
+	copyOfResult.Release()
 	result.Release()
-	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 0 || result.Value != nil {
+	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 2 || result.Value != nil {
 		t.Fatalf("released response bytes=%d slots=%d value=%q",
 			reader.readBytes.Load(), len(reader.readSlots), result.Value)
 	}

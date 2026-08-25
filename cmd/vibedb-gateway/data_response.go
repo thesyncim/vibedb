@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/hex"
 	"errors"
+	"io"
+	"strconv"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -39,6 +41,11 @@ type nativeDataWireResponse struct {
 	Retryable  bool
 	HasRequest bool
 	readResult gateway.ReplicatedTableReadResult
+}
+
+type nativeDataResponseScratch struct {
+	prefix [256]byte
+	suffix [96]byte
 }
 
 func (response *nativeDataWireResponse) release() {
@@ -78,12 +85,7 @@ func nativeDataResponseCodeBytes(code nativeDataResponseCode) []byte {
 }
 
 func writeNativeDataResponse(writer *vibejson.Writer, response *nativeDataWireResponse) error {
-	if writer == nil || response == nil ||
-		(response.OK && (response.Code != 0 || response.Applied == 0 || response.Position == (replication.Digest{}))) ||
-		(!response.OK && nativeDataResponseCodeBytes(response.Code) == nil) ||
-		(response.Found && len(response.Document) == 0) ||
-		(!response.Found && len(response.Document) != 0) ||
-		(response.HasRequest && response.RequestID == (replication.ID128{})) {
+	if writer == nil || !validNativeDataResponse(response) {
 		return errInvalidNativeDataResponse
 	}
 	if err := writer.BeginObject(); err != nil {
@@ -162,6 +164,94 @@ func writeNativeDataResponse(writer *vibejson.Writer, response *nativeDataWireRe
 		return err
 	}
 	return writer.Flush()
+}
+
+// writeNativeDataResponseDirect emits one response without copying Document
+// into a growing connection-lifetime buffer. The fixed prefix and suffix reuse
+// per-connection scratch while the already validated durable document streams
+// directly to the sink. A slow sink therefore retains only the reader-owned
+// document covered by its admission reservation.
+func writeNativeDataResponseDirect(
+	out io.Writer,
+	response *nativeDataWireResponse,
+	scratch *nativeDataResponseScratch,
+) error {
+	if out == nil || scratch == nil || !validNativeDataResponse(response) {
+		return errInvalidNativeDataResponse
+	}
+	prefix := scratch.prefix[:0]
+	prefix = append(prefix, `{"ok":`...)
+	if response.OK {
+		prefix = append(prefix, "true,\"route_id\":\""...)
+		prefix = appendNativeResponseHex(prefix, response.Position[:])
+		prefix = append(prefix, "\",\"applied\":"...)
+		prefix = strconv.AppendUint(prefix, response.Applied, 10)
+		prefix = append(prefix, ",\"found\":"...)
+		if response.Found {
+			prefix = append(prefix, "true,\"document\":"...)
+		} else {
+			prefix = append(prefix, "false"...)
+		}
+	} else {
+		prefix = append(prefix, "false,\"code\":\""...)
+		prefix = append(prefix, nativeDataResponseCodeBytes(response.Code)...)
+		prefix = append(prefix, "\",\"retryable\":"...)
+		prefix = strconv.AppendBool(prefix, response.Retryable)
+	}
+	if err := writeNativeResponseBytes(out, prefix); err != nil {
+		return err
+	}
+	if response.Found {
+		if err := writeNativeResponseBytes(out, response.Document); err != nil {
+			return err
+		}
+	}
+	suffix := scratch.suffix[:0]
+	if response.HasRequest {
+		suffix = append(suffix, ",\"request_id\":\""...)
+		suffix = appendNativeResponseHex(suffix, response.RequestID[:])
+		suffix = append(suffix, '"')
+	}
+	if response.Retries != 0 {
+		suffix = append(suffix, ",\"retries\":"...)
+		suffix = strconv.AppendUint(suffix, uint64(response.Retries), 10)
+	}
+	suffix = append(suffix, '}', '\n')
+	return writeNativeResponseBytes(out, suffix)
+}
+
+func validNativeDataResponse(response *nativeDataWireResponse) bool {
+	if response == nil ||
+		(response.HasRequest && response.RequestID == (replication.ID128{})) {
+		return false
+	}
+	if !response.OK {
+		return nativeDataResponseCodeBytes(response.Code) != nil &&
+			!response.Found && len(response.Document) == 0
+	}
+	return response.Code == 0 && response.Applied != 0 &&
+		response.Position != (replication.Digest{}) &&
+		(response.Found == (len(response.Document) != 0))
+}
+
+func appendNativeResponseHex(dst, value []byte) []byte {
+	return hex.AppendEncode(dst, value)
+}
+
+func writeNativeResponseBytes(out io.Writer, value []byte) error {
+	for len(value) != 0 {
+		written, err := out.Write(value)
+		if written > 0 {
+			value = value[written:]
+		}
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func writeNativeHex(writer *vibejson.Writer, value []byte) error {

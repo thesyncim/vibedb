@@ -30,10 +30,11 @@ const (
 	nativeDataAtLeastApplied
 )
 
-// nativeDataWireRequest is the zero-tree public RF3 envelope. Table and
-// Document alias the immutable input line; key and identities decode directly
-// into fixed caller-owned storage. No document, key, or identity enters a Go
-// string on this path.
+// nativeDataWireRequest is the zero-tree public RF3 envelope. An unescaped
+// Table and every Document alias the immutable input line; an escaped Table is
+// decoded into TableStore. Keys and identities decode directly into fixed
+// caller-owned storage. No document, key, or identity enters a Go string on
+// this path.
 type nativeDataWireRequest struct {
 	Operation   nativeDataOperation
 	Consistency nativeDataConsistency

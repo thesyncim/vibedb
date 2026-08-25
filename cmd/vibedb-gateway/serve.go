@@ -31,9 +31,12 @@ import (
 // maxServeRequestBytes bounds one newline-delimited JSON envelope before JSON
 // decoding or SQL parsing. Scanner grows only for an actually large request and
 // releases the buffer with the connection.
-const maxServeRequestBytes = 1 << 20
+const (
+	maxServeRequestBytes              = 1 << 20
+	defaultNativeResponseWriteTimeout = 5 * time.Second
+)
 
-// The serve subcommand: a stateless routing front-end. It loads an immutable
+// The serve subcommand is a routing front-end. It loads an immutable
 // catalog generation, refreshes the atomically replaced catalog file after a
 // shard reports stale routing metadata, and accepts newline-delimited JSON
 // requests over a connection. Each request routes and dispatches against the
@@ -134,8 +137,8 @@ func runServe(args []string) int {
 	authorizationPolicy := fs.String("authorization-policy", "", "bounded vibejson principal/capability policy")
 	var shardPeers repeatedFlag
 	fs.Var(&shardPeers, "shard-peer", "authenticated shard address=32-character-hex-NodeID; repeat for each endpoint")
-	maxShardConnections := fs.Int("max-shard-connections", 4096, "hard authenticated gateway-to-shard connection bound")
-	maxShardHandshakes := fs.Int("max-shard-handshakes", 64, "hard concurrent gateway-to-shard TLS handshake bound")
+	maxShardConnections := fs.Int("max-shard-connections-per-pool", 4096, "hard connection bound for each authenticated SQL and RF3 shard pool; transient control pools cap this at 8")
+	maxShardHandshakes := fs.Int("max-shard-handshakes-per-pool", 64, "hard concurrent TLS handshake bound for each authenticated SQL and RF3 shard pool; transient control pools cap this at 8")
 	maxNativeReadConcurrency := fs.Int("max-native-read-concurrency", gateway.DefaultReplicatedReadConcurrency, "hard concurrent public RF3 point-read bound")
 	maxNativeReadBytes := fs.Uint64("max-native-read-bytes", gateway.DefaultReplicatedReadInFlight, "hard aggregate schema-bounded public RF3 response-byte reservation")
 	if err := fs.Parse(args); err != nil {
@@ -380,6 +383,11 @@ func newReplicatedCatalogGateway(
 	lease time.Duration,
 ) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority,
 	*gateway.ReplicatedExecutor, *gateway.AuthenticatedReplicatedClient, error) {
+	if !devPlaintext && (maxConnections < 2 || maxHandshakes < 2) {
+		// Catalog/topology traffic must retain one slot while public data is
+		// saturated. A one-slot secure pool cannot provide that liveness fence.
+		return nil, nil, nil, nil, nil, gateway.ErrReplicatedTLSProfile
+	}
 	distributionName := gateway.ReplicatedCatalogDistribution
 	shardID := gateway.ReplicatedCatalogShard
 	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
@@ -719,24 +727,25 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4096), maxServeRequestBytes)
 	writer := vibejson.NewWriter(conn)
+	var nativeRequest nativeDataWireRequest
+	var nativeResponseScratch nativeDataResponseScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if nativeDataRequestCandidate(line) {
-			var request nativeDataWireRequest
-			if err := decodeNativeDataRequest(line, &request); err != nil {
+			if err := decodeNativeDataRequest(line, &nativeRequest); err != nil {
 				response := nativeDataError(nativeDataResponseInvalidRequest, false)
-				if writeNativeDataResponse(writer, &response) != nil {
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
 					return
 				}
 				continue
 			}
 			required := serviceauthz.CapabilityDataRead
-			if request.Operation != nativeDataOperationGet {
+			if nativeRequest.Operation != nativeDataOperationGet {
 				required = serviceauthz.CapabilityDataWrite
 			}
 			if authorize != nil && !authorize(required) {
 				response := nativeDataError(nativeDataResponseUnauthorized, false)
-				if err := writeNativeDataResponse(writer, &response); err != nil {
+				if err := writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout); err != nil {
 					return
 				}
 				continue
@@ -745,9 +754,9 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			if data == nil {
 				response = nativeDataError(nativeDataResponseUnavailable, true)
 			} else {
-				response = executeNativeDataRead(ctx, data, &request)
+				response = executeNativeDataRead(ctx, data, &nativeRequest)
 			}
-			writeErr := writeNativeDataResponse(writer, &response)
+			writeErr := writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout)
 			response.release()
 			if writeErr != nil {
 				if ctx.Err() == nil {
@@ -763,6 +772,16 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 				logf("gateway: decode request: %v", err)
 			}
 			return
+		}
+		// get/put/delete belong exclusively to the canonical native namespace.
+		// Reordered or escaped spellings may never fall through to legacy SQL
+		// execution or its string error schema.
+		if req.Op == "get" || req.Op == "put" || req.Op == "delete" {
+			response := nativeDataError(nativeDataResponseInvalidRequest, false)
+			if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+				return
+			}
+			continue
 		}
 		if authorize != nil && !authorize(serveRequestCapability(&req)) {
 			if err := writeServeResponse(writer, &serveResponse{Error: "authorization denied"}); err != nil {
@@ -780,6 +799,26 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		logf("gateway: decode request: %v", err)
 	}
+}
+
+func writeNativeDataConnResponse(
+	connection net.Conn,
+	response *nativeDataWireResponse,
+	scratch *nativeDataResponseScratch,
+	timeout time.Duration,
+) error {
+	if connection == nil || timeout <= 0 {
+		return errInvalidNativeDataResponse
+	}
+	if err := connection.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	writeErr := writeNativeDataResponseDirect(connection, response, scratch)
+	clearErr := connection.SetWriteDeadline(time.Time{})
+	if writeErr != nil {
+		return writeErr
+	}
+	return clearErr
 }
 
 func nativeDataRequestCandidate(source []byte) bool {
