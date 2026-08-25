@@ -184,11 +184,11 @@ type PointReadLease interface {
 }
 
 const (
-	// Native read responses retain a five-byte frame header and a 277-byte
+	// Native read responses retain a five-byte frame header and a 309-byte
 	// fixed body in addition to the detached store value. Charge each of the
 	// two variable-sized allocations for worst-case 8 KiB allocator rounding;
 	// this keeps the resident-memory contract conservative across size classes.
-	pointReadEncodedFrameFixedBytes int64 = 5 + 277
+	pointReadEncodedFrameFixedBytes int64 = 5 + 309
 	pointReadAllocatorSlopBytes     int64 = 2 * ((8 << 10) - 1)
 )
 
