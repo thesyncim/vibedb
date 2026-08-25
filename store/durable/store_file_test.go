@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"os"
 	"slices"
@@ -143,6 +144,47 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options.MaxBatchBytes = options.MaxDocumentBytes
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("batch byte bound that cannot hold every key accepted")
+	}
+}
+
+func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
+	options := testFileStoreOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := Collection{options: normalized}
+	const fileEnd = uint64(8 << 20)
+	got, err := collection.primaryVolatileReservationEnd(fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fileEnd + normalized.maxTransactionBytes; got != want {
+		t.Fatalf("reservation end = %d, want exact extent budget %d", got, want)
+	}
+	oldFixedFrameEnd := fileEnd + uint64(normalized.maxTransactionPages)*
+		uint64(normalized.MaxPageSize)
+	if got >= oldFixedFrameEnd {
+		t.Fatalf("exact reservation end = %d, old fixed-frame end %d", got, oldFixedFrameEnd)
+	}
+	t.Logf(
+		"checkpoint reservation: exact=%d bytes fixed-frame=%d bytes reduction=%.2fx",
+		normalized.maxTransactionBytes,
+		oldFixedFrameEnd-fileEnd,
+		float64(oldFixedFrameEnd-fileEnd)/float64(normalized.maxTransactionBytes),
+	)
+	if _, err := collection.primaryVolatileReservationEnd(
+		math.MaxUint64 - normalized.maxTransactionBytes + 1,
+	); !errors.Is(err, storeio.ErrInvalidWrite) {
+		t.Fatalf("overflow reservation = %v, want ErrInvalidWrite", err)
+	}
+	allocs := testing.AllocsPerRun(1_000, func() {
+		if _, reserveErr := collection.primaryVolatileReservationEnd(fileEnd); reserveErr != nil {
+			panic(reserveErr)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("reservation allocations = %.1f, want zero", allocs)
 	}
 }
 

@@ -27,6 +27,10 @@ const (
 	applyComplexityAllocBytes     = 64 << 10
 	applyComplexityColdAllocs     = 1_024
 	applyComplexityAllocs         = 256
+	// One cold structural cut must remain within the collection's compact,
+	// mixed-extent checkpoint reservation. The former fixed-MaxPageSize address
+	// gap added roughly 358 MiB here without storing those bytes.
+	applyComplexityColdFileEndBytes = 64 << 20
 )
 
 var applyComplexityValues = [2][]byte{[]byte(`{"v":0}`), []byte(`{"v":1}`)}
@@ -316,9 +320,18 @@ func runApplyComplexityQualification(t *testing.T, rows int) applyComplexityResu
 	}
 	userSplits := monotoneApplyComplexityDelta(t, "user leaf splits", userBefore.splits, userAfter.splits)
 	userReclaims := monotoneApplyComplexityDelta(t, "user empty reclaims", userBefore.reclaims, userAfter.reclaims)
+	userFileEndBytes := monotoneApplyComplexityDelta(
+		t, "user FileEnd", userBefore.fileEnd, userAfter.fileEnd,
+	)
 	if userSplits > 1 || userReclaims != 0 {
 		t.Fatalf("ApplyNormal structural work splits=%d reclaims=%d, want <=1/0",
 			userSplits, userReclaims)
+	}
+	if userFileEndBytes > applyComplexityColdFileEndBytes {
+		t.Fatalf(
+			"ApplyNormal user FileEnd delta=%d, want <=%d compact collision reservation",
+			userFileEndBytes, applyComplexityColdFileEndBytes,
+		)
 	}
 	if userAfter.rows != uint64(rows) {
 		t.Fatalf("rows after ApplyNormal = %d, want %d", userAfter.rows, rows)

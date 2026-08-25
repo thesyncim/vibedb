@@ -188,6 +188,110 @@ func seedBufferedInlinePrimaryLeaf(
 	return ref
 }
 
+func TestFilePrimaryCollisionGapIsCompactAndSnapshotSafe(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityBufferedVisible,
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "primary-compact-collision-gap.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make the exceptional leaf layout transition before measuring the pending
+	// parent's reservation. seedBufferedInlinePrimaryLeaf repeats this call as a
+	// no-op, matching the ordinary indexed fallback without mixing structural
+	// conversion bytes into the collision-gap measurement.
+	collection.writer.Lock()
+	err = collection.repartitionPrimaryForExactIndexLocked(context.Background())
+	collection.writer.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeState := collection.state.Load()
+	beforeStats := collection.Stats()
+	beforeInfo, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated := append([]byte(nil), values[0]...)
+	at := bytes.Index(updated, []byte(`"group":`))
+	if at < 0 {
+		t.Fatal("fixture row has no group scalar")
+	}
+	at += len(`"group":`)
+	if updated[at] == '9' {
+		updated[at] = '8'
+	} else {
+		updated[at]++
+	}
+	ref := seedBufferedInlinePrimaryLeaf(
+		t, collection, []byte(keys[0]), updated,
+	)
+	wantOffset := beforeState.fileEnd + collection.options.maxTransactionBytes
+	if ref.Offset != wantOffset {
+		t.Fatalf("first volatile offset = %d, want compact boundary %d", ref.Offset, wantOffset)
+	}
+	oldOffset := beforeState.fileEnd +
+		uint64(collection.options.maxTransactionPages)*
+			uint64(collection.options.MaxPageSize)
+	if ref.Offset >= oldOffset {
+		t.Fatalf("compact volatile offset = %d, old fixed-frame boundary %d", ref.Offset, oldOffset)
+	}
+	afterInfo, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterInfo.Size() != beforeInfo.Size() {
+		t.Fatalf("buffered frame changed apparent device file: %d -> %d", beforeInfo.Size(), afterInfo.Size())
+	}
+	afterStats := collection.Stats()
+	if afterStats.DeviceBytes != beforeStats.DeviceBytes {
+		t.Fatalf("buffered frame changed device bytes: %d -> %d", beforeStats.DeviceBytes, afterStats.DeviceBytes)
+	}
+	assertPrimaryRaw(t, collection, keys[0], updated, true)
+	got, found, err := snapshot.AppendRaw(nil, []byte(keys[0]))
+	if err != nil || !found || !bytes.Equal(got, values[0]) {
+		t.Fatalf("pinned snapshot before checkpoint = (%q,%v,%v), want old row", got, found, err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err = snapshot.AppendRaw(nil, []byte(keys[0]))
+	if err != nil || !found || !bytes.Equal(got, values[0]) {
+		t.Fatalf("pinned snapshot after checkpoint = (%q,%v,%v), want old row", got, found, err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedFile.Close()
+	reopened, err := Open(reopenedFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertPrimaryRaw(t, reopened, keys[0], updated, true)
+}
+
 func forcePrimaryOverlayPressureFold(
 	t *testing.T,
 	collection *Collection,
