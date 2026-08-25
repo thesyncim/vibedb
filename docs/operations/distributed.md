@@ -1,6 +1,6 @@
 # Operate the distributed runtime
 
-The shipped distributed runtime is experimental. SQL uses a stateless gateway
+The shipped distributed runtime is experimental. SQL uses a routing gateway
 and static-ownership shard services. A canonical point `get` can instead use an
 externally prepared, stable three-voter Raft group when the gateway consumes
 the replicated catalog. The generated [distributed feature
@@ -46,10 +46,12 @@ The catalog contains these items:
 This repository has no catalog administration CLI. Application or operator
 code must construct and publish a valid `gateway.Snapshot`. Use
 `NewSnapshotWithReplicatedTableMetadata` when a table must serve RF3 point
-reads. Each profile binds one table and primary-key path to a dense relation,
-schema generation, relation-manifest digest, and exact key and document
-limits. Each routed allocation must also have one matching RF3 shard
-descriptor and three native replica endpoints.
+reads. Each profile binds one table and one scalar string/number
+primary-placement path to a dense relation, schema generation,
+relation-manifest digest, and exact key and document limits. Composite
+placement tuples and tenant-path placement are not accepted by this public
+lane. Each routed allocation must also have one matching RF3 shard descriptor
+and three native replica endpoints.
 
 `SaveSnapshot` and `SaveSnapshotAfter` publish the bootstrap file for
 cooperating writers. In the normal gateway mode, that file locates the
@@ -271,7 +273,10 @@ The catalog and public RF3 point reads share one bounded authenticated native
 connection pool. The pool keys a physical connection by authenticated node and
 address. The RF3 executor also keeps bounded four-way exact leader hints. It
 validates the complete route and serving fence, follows `NotLeader` responses,
-and retries within `-catalog-attempts` and `-catalog-attempt-timeout`.
+and retries within `-catalog-attempts` and `-catalog-attempt-timeout`. A
+definite stale serving fence coalesces one authenticated catalog refresh and
+permits exactly one re-resolved read attempt; ambiguous transport failures are
+never replayed by that refresh path.
 
 The gateway runs distributed-transaction recovery every five seconds. It logs
 the number of coordinators that recovery resolves.
@@ -295,8 +300,8 @@ The allowed operations are:
 
 The gateway also accepts one canonical RF3 point-read envelope. The object and
 fields must use the exact order shown. `key` is the unpadded base64url encoding
-of the canonical ordered primary key. The table profile, not the client,
-selects the relation and RF3 route.
+of the canonical ordered scalar primary-placement key. The table profile, not
+the client, selects the relation and RF3 route.
 
 ```json
 {"op":"get","table":"users","key":"QGFjbWUAAA","consistency":"linearizable"}
@@ -328,7 +333,11 @@ A response can contain columns, raw JSON rows, affected-row count, route type,
 catalog generation, fanout count, retry count, or an error.
 
 One request is limited to 1 MiB before JSON decoding. The shard wire protocol
-has a separate frame limit of 16 MiB plus 64 KiB.
+has a separate frame limit of 16 MiB plus 64 KiB. Public point reads also have
+operator-configurable concurrent-request and aggregate response reservations:
+`-max-native-read-concurrency` and `-max-native-read-bytes`. Each admitted read
+retains its schema-authenticated maximum-document reservation until the
+response has been written to the client.
 
 ## Select an operation class
 
@@ -405,6 +414,7 @@ The shipped runtime does not provide these features:
 - RF3 initialization, artifact provisioning, or repair
 - Public RF3 writes
 - RF3 scatter reads or multi-table reads
+- Composite or tenant-path public RF3 placement keys
 - A common distributed RF3 read timestamp
 - Static SQL endpoint failover or load balancing
 - Automatic catalog-group provisioning

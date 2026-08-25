@@ -16,9 +16,10 @@ different acknowledgement contract.
 
 The experimental gateway can serve canonical point `get` requests from an
 externally prepared three-replica Raft group. It uses the replicated catalog to
-bind a table and ordered primary key to an exact relation and route. RF3 writes,
-scatter reads, multi-table reads, and automatic replica lifecycle management
-are not supported by this public path.
+bind a table and one scalar string/number primary-placement key to an exact
+relation and route. Composite placement keys, tenant-path placement, RF3
+writes, scatter reads, multi-table reads, and automatic replica lifecycle
+management are not supported by this public path.
 
 ## Requirements
 

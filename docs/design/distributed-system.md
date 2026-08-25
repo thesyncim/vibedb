@@ -45,9 +45,11 @@ The last lane uses loopback exchange by default. Cross-host exchange needs an
 injected trusted dialer. The shipped gateway CLI does not supply one.
 
 The canonical RF3 point-read lane is separate from these SQL lanes. It accepts
-one table and one canonical ordered primary key. The replicated table profile
-binds that pair to an exact dense relation, schema generation,
-relation-manifest digest, and three-replica route.
+one table and one canonical ordered scalar string/number primary-placement
+key. The replicated table profile binds that pair to an exact dense relation,
+schema generation, relation-manifest digest, and three-replica route.
+Composite placement tuples and tenant-path placement are not implemented on
+this public lane.
 
 A linearizable read follows the current leader and completes a Raft
 `ReadIndex`. An `at_least_applied` read supplies the exact `RouteID` and applied
@@ -60,6 +62,13 @@ physical key is the authenticated node and address, so unrelated shard fences
 do not fragment connections. A bounded four-way cache retains exact leader
 hints. A delayed failure cannot remove a newer term. Discovery, `NotLeader`,
 transport failure, and retry remain bounded by the executor profile.
+
+Each public read reserves its schema-authenticated maximum document bytes and
+one concurrency slot before shard I/O. The reservation survives through the
+client response write, bounding slow-client retention across the process. A
+definite serving fence coalesces one authenticated catalog refresh and one
+re-resolved retry; an ambiguous transport outcome never enters that replay
+path.
 
 The point-read lane never falls back to the static SQL service. Public RF3
 writes, scatter reads, multi-table reads, and a common distributed read
