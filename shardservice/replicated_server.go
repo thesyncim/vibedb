@@ -22,6 +22,7 @@ import (
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
+	ApplyMembership(context.Context, raftservice.MembershipRequest) error
 	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
 }
 
@@ -302,10 +303,19 @@ func (server *ReplicatedServer) authorizeReplicated(
 			request.Authority.Node, generation, serviceauthz.CapabilityDataRead) == serviceauthz.DecisionAllow {
 			return true
 		}
+		if serviceauthz.CheckAndAudit(server.authorization, server.audit,
+			request.Authority.Node, generation, serviceauthz.CapabilityDataWrite) == serviceauthz.DecisionAllow {
+			return true
+		}
+		// Leader discovery is a mandatory pre-admission step for the sealed
+		// membership flow. It exposes only the same fixed serving state that the
+		// following membership request must fence exactly.
 		return serviceauthz.CheckAndAudit(server.authorization, server.audit,
-			request.Authority.Node, generation, serviceauthz.CapabilityDataWrite) == serviceauthz.DecisionAllow
+			request.Authority.Node, generation, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
 	case ReplicatedPropose:
 		capability = serviceauthz.CapabilityDataWrite
+	case ReplicatedMembership:
+		capability = serviceauthz.CapabilityMembership
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 	default:
 		return false
@@ -333,6 +343,49 @@ func (server *ReplicatedServer) executeReplicated(
 	}
 	if request.Operation == ReplicatedProbe {
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
+	}
+	if request.Operation == ReplicatedMembership {
+		err := server.owner.ApplyMembership(ctx, raftservice.MembershipRequest{
+			Fence: raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+				Term: request.Fence.Term,
+			},
+			Kind: request.Membership.Kind, TransitionID: request.Membership.TransitionID,
+			MetadataEpoch:             request.Membership.MetadataEpoch,
+			CatalogGeneration:         request.Membership.CatalogGeneration,
+			ExpectedReplicaSetVersion: request.Membership.ExpectedReplicaSetVersion,
+			SourceMember:              request.Membership.SourceMember,
+			TargetMember:              request.Membership.TargetMember,
+			TransferTerm:              request.Membership.TransferTerm,
+		})
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if err == nil {
+			return &ReplicatedResponse{Kind: ReplicatedMembershipAccepted, HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(err, raftmodel.ErrNotLeader):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(err, raftservice.ErrOutcomeUnknown), errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+		case errors.Is(err, raftservice.ErrMembershipUnauthorized):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipUnauthorized)
+		case errors.Is(err, raftservice.ErrMembershipStale), errors.Is(err, raftservice.ErrServingFence):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipStale)
+		case errors.Is(err, raftservice.ErrMembershipMalformed):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipMalformed)
+		case errors.Is(err, raftservice.ErrMembershipNotCaughtUp):
+			return membershipRefusal(wireState, ReplicatedRefusalMembershipNotCaughtUp)
+		case errors.Is(err, raftmodel.ErrAdmissionBound), errors.Is(err, raftmodel.ErrConfChangePending),
+			errors.Is(err, raftmodel.ErrLeaderTransferPending):
+			return membershipRefusal(wireState, ReplicatedRefusalAdmissionBound)
+		default:
+			return membershipRefusal(wireState, ReplicatedRefusalUnavailable)
+		}
 	}
 	if request.Operation == ReplicatedReadLeader || request.Operation == ReplicatedReadFollower {
 		result, readLease, readErr := server.owner.ReadPoint(ctx, raftservice.PointReadRequest{
@@ -466,6 +519,10 @@ func (server *ReplicatedServer) executeReplicated(
 	}
 }
 
+func membershipRefusal(state ReplicatedMemberState, code ReplicatedRefusalCode) *ReplicatedResponse {
+	return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: state}
+}
+
 func replicatedWireState(state raftservice.ServingState) ReplicatedMemberState {
 	return ReplicatedMemberState{
 		Fence: ReplicatedFence{
@@ -512,6 +569,9 @@ func RoundTripReplicated(
 				Command: append([]byte(nil), request.Command...), Cause: err,
 			}
 		}
+		if request.Operation == ReplicatedMembership {
+			return nil, errors.Join(raftservice.ErrOutcomeUnknown, err)
+		}
 		return nil, err
 	}
 	maximumResponse, boundErr := maximumReplicatedResponseBody(request)
@@ -523,6 +583,9 @@ func RoundTripReplicated(
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: err,
 		}
+	}
+	if err != nil && request.Operation == ReplicatedMembership {
+		return nil, errors.Join(raftservice.ErrOutcomeUnknown, err)
 	}
 	return response, err
 }

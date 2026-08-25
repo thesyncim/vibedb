@@ -236,10 +236,26 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 	if options.Registry == nil || options.TLS == nil || options.Dial == nil ||
 		options.Listener == nil || options.HandshakeDeadline == nil ||
 		options.Owner.Outbound != nil || options.Transport.Registry != nil ||
+		options.Owner.MembershipAuthority != nil ||
 		options.Transport.Dialer != nil || options.Receiver.Registry != nil ||
 		options.Receiver.Handle != nil || identity.Node != options.Registry.LocalNode() ||
 		identity.TrustDomain != options.Registry.TrustDomain() {
 		return nil, ErrInvalidPeerServer
+	}
+	for index, authorization := range options.Owner.MembershipAuthorizations {
+		if index >= len(options.Owner.Members) {
+			return nil, ErrInvalidPeerServer
+		}
+		if err := options.Registry.AuthorizeTransition(rafttransport.TransitionGrant{
+			Group:             options.Owner.Members[index].Group,
+			TransitionID:      authorization.TransitionID,
+			MetadataEpoch:     authorization.MetadataEpoch,
+			CatalogGeneration: authorization.CatalogGeneration,
+			SourceMember:      authorization.SourceMember,
+			TargetMember:      authorization.TargetMember,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	transportOptions := options.Transport
@@ -255,6 +271,9 @@ func NewAuthenticatedPeerRuntime(options AuthenticatedPeerOptions) (*Authenticat
 
 	ownerOptions := options.Owner
 	ownerOptions.Outbound = transport
+	if len(ownerOptions.MembershipAuthorizations) != 0 {
+		ownerOptions.MembershipAuthority = options.Registry
+	}
 	owner, err := NewOwner(ownerOptions)
 	if err != nil {
 		_ = transport.Close()

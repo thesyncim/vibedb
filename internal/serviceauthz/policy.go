@@ -30,9 +30,14 @@ const (
 	// an exact end-user authority. It grants no data or control-plane action by
 	// itself; the forwarded principal is checked independently at the receiver.
 	CapabilityDelegate
+	// CapabilityMembership permits an exact forwarded operator to execute the
+	// sealed RF3 learner, promotion, removal, and leader-transfer operation set.
+	// It grants no data, schema, or delegation authority.
+	CapabilityMembership
 )
 
-const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema | CapabilityDelegate
+const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
+	CapabilityDelegate | CapabilityMembership
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

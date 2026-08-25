@@ -82,7 +82,7 @@ func parsePrincipal(node vibejson.Node) (Entry, error) {
 		return Entry{}, ErrInvalidPolicy
 	}
 	count, ok := capabilitiesNode.ArrayLen()
-	if !ok || count == 0 || count > 4 {
+	if !ok || count == 0 || count > 5 {
 		return Entry{}, ErrInvalidPolicy
 	}
 	values, _ := capabilitiesNode.ArrayIter()
@@ -127,6 +127,8 @@ func parseCapabilityRaw(raw []byte) Capability {
 		return CapabilitySchema
 	case bytes.Equal(raw, []byte(`"delegate"`)):
 		return CapabilityDelegate
+	case bytes.Equal(raw, []byte(`"membership"`)):
+		return CapabilityMembership
 	default:
 		return 0
 	}

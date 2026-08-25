@@ -417,6 +417,208 @@ type failingReplicatedClient struct {
 	command []byte
 }
 
+type membershipReplicatedClient struct {
+	state      shardservice.ReplicatedMemberState
+	response   *shardservice.ReplicatedResponse
+	err        error
+	membership shardservice.ReplicatedMembershipRequest
+}
+
+type countingMembershipClient struct{ calls int }
+
+func (client *countingMembershipClient) DoReplicated(
+	context.Context,
+	ReplicatedEndpoint,
+	*shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	client.calls++
+	return nil, errors.New("membership client must not be called")
+}
+
+func (client *membershipReplicatedClient) DoReplicated(
+	_ context.Context,
+	_ ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: client.state}, nil
+	}
+	client.membership = request.Membership
+	return client.response, client.err
+}
+
+func TestReplicatedExecutorRejectsMalformedMembershipBeforeDiscovery(t *testing.T) {
+	route, _, _ := testReplicatedRouteCommand(t)
+	valid := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{1},
+		MetadataEpoch: 2, CatalogGeneration: 3,
+		ExpectedReplicaSetVersion: route.Command.ReplicaSetVersion,
+		SourceMember:              2, TargetMember: 4,
+	}
+	tests := []struct {
+		name string
+		edit func(*shardservice.ReplicatedMembershipRequest)
+		want error
+	}{
+		{"zero_kind", func(request *shardservice.ReplicatedMembershipRequest) { request.Kind = 0 }, raftservice.ErrMembershipMalformed},
+		{"unknown_kind", func(request *shardservice.ReplicatedMembershipRequest) {
+			request.Kind = raftservice.MembershipTransferLeader + 1
+		}, raftservice.ErrMembershipMalformed},
+		{"zero_transition", func(request *shardservice.ReplicatedMembershipRequest) { request.TransitionID = [16]byte{} }, raftservice.ErrMembershipMalformed},
+		{"zero_metadata_epoch", func(request *shardservice.ReplicatedMembershipRequest) { request.MetadataEpoch = 0 }, raftservice.ErrMembershipMalformed},
+		{"zero_catalog_generation", func(request *shardservice.ReplicatedMembershipRequest) { request.CatalogGeneration = 0 }, raftservice.ErrMembershipMalformed},
+		{"zero_replica_version", func(request *shardservice.ReplicatedMembershipRequest) { request.ExpectedReplicaSetVersion = 0 }, raftservice.ErrMembershipMalformed},
+		{"stale_replica_version", func(request *shardservice.ReplicatedMembershipRequest) { request.ExpectedReplicaSetVersion++ }, ErrReplicatedRoute},
+		{"zero_source", func(request *shardservice.ReplicatedMembershipRequest) { request.SourceMember = 0 }, raftservice.ErrMembershipMalformed},
+		{"zero_target", func(request *shardservice.ReplicatedMembershipRequest) { request.TargetMember = 0 }, raftservice.ErrMembershipMalformed},
+		{"same_members", func(request *shardservice.ReplicatedMembershipRequest) { request.TargetMember = request.SourceMember }, raftservice.ErrMembershipMalformed},
+		{"term_without_remove", func(request *shardservice.ReplicatedMembershipRequest) { request.TransferTerm = 9 }, raftservice.ErrMembershipMalformed},
+		{"remove_without_term", func(request *shardservice.ReplicatedMembershipRequest) {
+			request.Kind = raftservice.MembershipRemoveVoter
+		}, raftservice.ErrMembershipMalformed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := valid
+			test.edit(&request)
+			client := new(countingMembershipClient)
+			executor, err := NewReplicatedExecutor(client, 3, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.ApplyMembership(context.Background(), route, request)
+			if !errors.Is(err, test.want) || client.calls != 0 {
+				t.Fatalf("err=%v calls=%d", err, client.calls)
+			}
+		})
+	}
+}
+
+type transferReplicatedClient struct {
+	states        map[string]shardservice.ReplicatedMemberState
+	moved         bool
+	failAfterMove bool
+}
+
+func (client *transferReplicatedClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	address := endpoint.Address
+	state := client.states[address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: state}, nil
+	}
+	if request.Operation != shardservice.ReplicatedMembership {
+		return nil, errors.New("unexpected operation")
+	}
+	for endpoint, moved := range client.states {
+		moved.LeaderID = request.Membership.TargetMember
+		moved.Fence.Term++
+		client.states[endpoint] = moved
+	}
+	client.moved = true
+	if client.failAfterMove {
+		return nil, errors.New("lost transfer response")
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedMembershipAccepted,
+		HasState: true, State: state}, nil
+}
+
+func TestReplicatedExecutorTransferReturnsConsumableLeaderTermWitness(t *testing.T) {
+	for _, failAfterMove := range []bool{false, true} {
+		route, _, states := testReplicatedRouteCommand(t)
+		client := &transferReplicatedClient{states: states, failAfterMove: failAfterMove}
+		executor, err := NewReplicatedExecutor(client, 3, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := states["m2"].LeaderID
+		beforeTerm := states["m2"].Fence.Term
+		target := uint64(3)
+		membership := shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipTransferLeader, TransitionID: [16]byte{9},
+			MetadataEpoch: 10, CatalogGeneration: 11,
+			ExpectedReplicaSetVersion: route.Command.ReplicaSetVersion,
+			SourceMember:              source, TargetMember: target,
+		}
+		result, err := executor.ApplyMembership(context.Background(), route, membership)
+		if err != nil || !client.moved || result.TransferWitness.TargetMember != target ||
+			result.TransferWitness.Term <= beforeTerm ||
+			result.State.Fence.MemberID != target || result.State.LeaderID != target {
+			t.Fatalf("fail=%t transfer result=%+v err=%v", failAfterMove, result, err)
+		}
+		remove := membership
+		remove.Kind = raftservice.MembershipRemoveVoter
+		remove.TransferTerm = result.TransferWitness.Term
+		if remove.TransferTerm == 0 {
+			t.Fatal("removal did not consume a transfer term")
+		}
+	}
+}
+
+func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	target := uint64(3)
+	afterTerm := states["m2"].Fence.Term
+	for address, state := range states {
+		state.LeaderID = target
+		state.Fence.Term = afterTerm + 1
+		states[address] = state
+	}
+	client := &transferReplicatedClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ObserveMembershipTransfer(context.Background(), route,
+		target, afterTerm)
+	if err != nil || client.moved || result.TransferWitness.TargetMember != target ||
+		result.TransferWitness.Term != afterTerm+1 || result.State.Fence.MemberID != target {
+		t.Fatalf("observation result=%+v moved=%t err=%v", result, client.moved, err)
+	}
+}
+
+func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	state := states["m2"]
+	membership := shardservice.ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{8},
+		MetadataEpoch: 9, CatalogGeneration: 10,
+		ExpectedReplicaSetVersion: route.Command.ReplicaSetVersion,
+		SourceMember:              2, TargetMember: 3,
+	}
+	client := &membershipReplicatedClient{state: state,
+		response: &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedMembershipAccepted, HasState: true, State: state}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ApplyMembership(context.Background(), route, membership)
+	if err != nil || result.State != state || client.membership != membership {
+		t.Fatalf("accepted result=%+v err=%v sent=%+v", result, err, client.membership)
+	}
+	client.err = errors.New("lost after write")
+	client.response = nil
+	_, err = executor.ApplyMembership(context.Background(), route, membership)
+	if !errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("transport outcome = %v", err)
+	}
+	client.err = nil
+	client.response = &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnauthorized,
+	}
+	_, err = executor.ApplyMembership(context.Background(), route, membership)
+	if !errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("stateless authorization refusal = %v", err)
+	}
+}
+
 func (client *failingReplicatedClient) DoReplicated(
 	_ context.Context,
 	_ ReplicatedEndpoint,
