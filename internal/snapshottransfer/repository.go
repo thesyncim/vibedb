@@ -56,6 +56,30 @@ type RepositoryStats struct {
 	DiskCapacity     uint64
 }
 
+// PublishedArtifact is one independently opened, bounded view of authenticated
+// artifact payload bytes. It excludes the repository descriptor prefix and can
+// start only at an exact receiver resume offset.
+type PublishedArtifact struct {
+	file    *os.File
+	section *io.SectionReader
+}
+
+func (a *PublishedArtifact) Read(p []byte) (int, error) {
+	if a == nil || a.section == nil {
+		return 0, io.EOF
+	}
+	return a.section.Read(p)
+}
+
+func (a *PublishedArtifact) Close() error {
+	if a == nil || a.file == nil {
+		return nil
+	}
+	err := a.file.Close()
+	a.file, a.section = nil, nil
+	return err
+}
+
 // Repository owns resumable artifact bytes but never activates them.
 type Repository struct {
 	mu        sync.RWMutex
@@ -652,6 +676,47 @@ func (r *Repository) ReadChunk(d Descriptor, offset uint64, dst []byte) ([]byte,
 		return dst[:0], false, err
 	}
 	return dst, offset+want == d.ArtifactBytes, nil
+}
+
+// OpenPublished opens an independent streaming payload view. Holding the
+// repository lock only through fd acquisition keeps activation I/O from
+// blocking unrelated bounded transfers while the immutable published inode
+// remains pinned by the returned descriptor.
+func (r *Repository) OpenPublished(d Descriptor, offset uint64) (*PublishedArtifact, error) {
+	if r == nil || !d.Valid() || offset > d.ArtifactBytes {
+		return nil, ErrDescriptor
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec := r.records[d.ArtifactHash]
+	if r.closed || rec == nil || !rec.complete || rec.descriptor != d {
+		return nil, ErrStaleFence
+	}
+	f, err := openRegular(r.root, rec.published, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &PublishedArtifact{file: f, section: io.NewSectionReader(
+		f, int64(DescriptorBytes)+int64(offset), int64(d.ArtifactBytes-offset),
+	)}, nil
+}
+
+// Manifest re-authenticates a published artifact and returns its detached
+// replicated-state certificate. This cold control operation uses one bounded
+// verifier buffer and retains no payload copy.
+func (r *Repository) Manifest(d Descriptor) (replicatedstate.SnapshotArtifactManifest, error) {
+	a, err := r.OpenPublished(d, 0)
+	if err != nil {
+		return replicatedstate.SnapshotArtifactManifest{}, err
+	}
+	defer a.Close()
+	manifest, err := replicatedstate.VerifySnapshotArtifact(
+		a, replicatedstate.SnapshotArtifactCallbacks{},
+	)
+	if err != nil || manifest.EncodedBytes != d.ArtifactBytes {
+		return replicatedstate.SnapshotArtifactManifest{}, errors.Join(ErrDescriptor, err)
+	}
+	return manifest, nil
 }
 
 func (r *Repository) Close() error {

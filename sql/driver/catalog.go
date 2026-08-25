@@ -230,6 +230,10 @@ type database struct {
 	// while a certified split child is received and converted in place into
 	// replicated apply. It is never a SQL or serving capability.
 	replicatedChildStageClaim *ReplicatedChildStage
+	// replicatedSnapshotStageClaim exclusively owns the hidden participant and
+	// sole user relation while a certified RF learner snapshot is materialized.
+	// It grants neither SQL sessions nor serving authority.
+	replicatedSnapshotStageClaim *ReplicatedSnapshotStage
 	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
 	// state joined atomically with user-table publication. The larger staged
 	// mutation remains in the append-only transaction journal.
