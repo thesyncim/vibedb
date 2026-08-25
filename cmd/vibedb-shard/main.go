@@ -1,9 +1,7 @@
-// Command vibedb-shard is the leader-only shard service: it opens one local
-// vibedb SQL catalog, adopts a static ownership identity (distribution, shard,
-// topology allocation generation, ownership epoch, and routing version), and
-// serves the shard-service wire contract over a bounded, mutually authenticated
-// TLS 1.3 transport. Plaintext serving is an explicit loopback-only development
-// mode.
+// Command vibedb-shard serves either a static development shard or one prepared
+// member of an authenticated three-replica Raft shard. The RF3 command opens
+// exact retained WAL, SQL, apply, topology, and certificate identities; it never
+// initializes or repairs missing replicated state.
 //
 // It admits every request against its configured identity before executing, and
 // executes the admitted statement locally through the ordinary vibedb parser and
@@ -23,6 +21,8 @@
 //	vibedb-shard serve -store <path> -listen <addr> \
 //	    -distribution <name> -shard <id> -allocation-generation <n> \
 //	    -epoch <n> -routing-version <n>
+//
+//	vibedb-shard serve-rf3 -manifest <path>
 //
 // It serves until interrupted, then closes the listener, drains in-flight
 // connections, and releases the catalog.
@@ -62,6 +62,8 @@ func run(args []string) int {
 		return runInit(args[2:])
 	case "serve":
 		return runServe(args[2:])
+	case "serve-rf3":
+		return runServeRF3(args[2:])
 	default:
 		usage()
 		return 2
@@ -86,6 +88,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve -store <path> -listen <addr> "+
 		"-distribution <name> -shard <id> -allocation-generation <n> "+
 		"-epoch <n> -routing-version <n>")
+	fmt.Fprintln(os.Stderr, "  vibedb-shard serve-rf3 -manifest <path>")
 }
 
 func runInit(args []string) int {
