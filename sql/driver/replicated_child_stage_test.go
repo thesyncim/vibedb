@@ -261,22 +261,25 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		t.Fatalf("reclaim sealed child stage: %v", err)
 	}
 
-	restoreSeedFault := durable.InstallCheckpointGroupInitialCertificateFaultForFacadeTest()
-	uncertainSeed, err := stage.Activate(
+	restoreSeedFault := durable.InstallCheckpointGroupInitialCertificatePostRenameFaultForFacadeTest()
+	settledSeed, err := stage.Activate(
 		certificate, fixture.targetBootstrap,
 		replicatedstate.SnapshotArtifactOptions{},
 	)
 	restoreSeedFault()
-	if uncertainSeed.Apply != nil || uncertainSeed.ApplyIdentity != unknown.ApplyIdentity ||
-		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-		t.Fatalf("unknown initial seed certificate = %+v, %v", uncertainSeed, err)
+	if settledSeed.Apply == nil || settledSeed.ApplyIdentity != unknown.ApplyIdentity ||
+		settledSeed.SnapshotBase == nil || err != nil {
+		t.Fatalf("settled initial seed certificate = %+v, %v", settledSeed, err)
+	}
+	if err := settledSeed.Apply.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if err := stage.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if opened, err := db.NewSession(context.Background()); opened != nil ||
 		!errors.Is(err, ErrReplicatedChildStageBusy) {
-		t.Fatalf("SQL session after unknown seed certificate and stage close = %v, %v", opened, err)
+		t.Fatalf("SQL session after settled seed certificate and stage close = %v, %v", opened, err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
