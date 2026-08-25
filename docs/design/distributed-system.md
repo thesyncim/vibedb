@@ -2,9 +2,10 @@
 
 VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
 composition. `vibedb-shard serve-rf3` constructs the latter for externally
-prepared exact member artifacts. The public gateway command does not connect
-ordinary data traffic to that native RF3 endpoint, and no command initializes
-or changes the RF3 topology.
+prepared exact member artifacts. The public gateway connects canonical point
+`get` requests to the native RF3 endpoint when its catalog authority is RF3.
+The gateway does not route SQL, writes, scatter reads, or multi-table reads to
+that endpoint. No command initializes or changes the RF3 topology.
 
 ## Runnable static layer
 
@@ -18,8 +19,9 @@ The runnable layer has these components:
 6. The gateway merges complete shard results or returns an error.
 
 The gateway has no authoritative row state. The shard store has the row state.
-The gateway always selects the first leader endpoint in the manifest. Multiple
-endpoint entries do not provide automatic load balancing or failover.
+The static SQL path always selects the first leader endpoint in the manifest.
+Multiple endpoint entries do not provide automatic load balancing or failover
+for that path.
 
 Each physical manifest covers the full unsigned 64-bit range. Ranges are
 half-open, ordered, and adjacent. Each shard has a unique nonzero allocation
@@ -41,6 +43,42 @@ The gateway has three execution lanes:
 
 The last lane uses loopback exchange by default. Cross-host exchange needs an
 injected trusted dialer. The shipped gateway CLI does not supply one.
+
+The canonical RF3 point-read lane is separate from these SQL lanes. It accepts
+one table and one canonical ordered scalar string/number primary-placement
+key. The replicated table profile binds that pair to an exact dense relation,
+schema generation, relation-manifest digest, and three-replica route.
+Composite placement tuples and tenant-path placement are not implemented on
+this public lane.
+
+A linearizable read follows the current leader and completes a Raft
+`ReadIndex`. An `at_least_applied` read supplies the exact `RouteID` and applied
+index returned by an earlier operation. The gateway rejects a route mismatch
+before I/O and can select a follower that has reached the requested index.
+Successful reads return the exact route lineage and applied index.
+
+One bounded authenticated native pool is shared by catalog and data reads. Its
+physical key is the authenticated node and address, so unrelated shard fences
+do not fragment connections. Global oldest-idle eviction admits endpoint churn
+without exceeding the pool, and reserved connection/handshake slots keep
+topology, membership, and schema traffic live under data saturation. A bounded
+four-way cache retains exact leader hints. A delayed failure cannot remove a
+newer term. Discovery, `NotLeader`, transport failure, and retry remain bounded
+by the executor profile.
+
+Each public read reserves its schema-authenticated maximum document bytes and
+one concurrency slot before shard I/O. The reservation survives through the
+client response write, bounding slow-client retention across the process. The
+document streams directly to the connection rather than through a retained
+whole-response buffer, and a five-second write deadline releases reservations
+held by clients that stop reading. A
+definite serving fence coalesces one authenticated catalog refresh and one
+re-resolved retry; an ambiguous transport outcome never enters that replay
+path.
+
+The point-read lane never falls back to the static SQL service. Public RF3
+writes, scatter reads, multi-table reads, and a common distributed read
+timestamp are not implemented.
 
 The merge layer supports global limits, ordered results, aggregates, and
 grouped partial aggregates. It cancels remaining calls after a hard error or a
@@ -288,8 +326,8 @@ settlement path, and leader-aware native gateway executor serve real in-process
 and multi-process test traffic. `vibedb-shard serve-rf3` opens an already
 prepared fixed three-voter member and constructs its peer and native serving
 side. It does not create a WAL generation, provision a group, or make the
-ordinary public gateway use the native path, so it is not turnkey HA
-orchestration.
+ordinary public gateway use the native path except for canonical point reads,
+so it is not turnkey HA orchestration.
 Transition capture is deliberately rejected while a
 `CheckpointGroup` owns the apply state; online range split must use the later
 publish-before-prune serving integration rather than adding another ordinary
@@ -483,8 +521,9 @@ and publish as one bounded successor batch. Every split retains its own data
 proofs; composition only removes repeated catalog cloning and CAS contention.
 The batch accepts distinct source allocations within one distribution as well
 as independent distributions.
-The repository still has no runnable automatic split controller or merge
-planner.
+The gateway can run the replicated publish-before-prune split controller when
+the replicated catalog authority is configured. The repository still has no
+replica-move executor or merge planner.
 
 ## Replication kernel
 
@@ -537,16 +576,20 @@ still needs a leader-and-quorum lease policy around request deadlines.
 The composition has a bounded authenticated peer service, replicated shard
 service, leader-aware native gateway executor, request identities, and a
 separate authenticated snapshot-artifact service. `serve-rf3` constructs the
-peer and replicated shard services from one fixed manifest. It does not
-construct the snapshot service and does not provide certificate enrollment,
-dynamic address discovery, member changes, or empty-learner snapshot
-activation.
+peer and replicated shard services from one fixed manifest. The public gateway
+uses the executor for catalog-bound point reads through a shared authenticated
+pool and an exact leader-hint cache. It does not expose public RF3 writes or
+multi-relation query execution. `serve-rf3` does not construct the snapshot
+service and does not provide certificate enrollment, dynamic address
+discovery, member changes, or empty-learner snapshot activation.
 
 Do not describe this kernel as a turnkey replicated deployment.
 
 ## Implementation references
 
-- `gateway/catalog.go`, `executor.go`, `merge.go`, and `global_index_read.go`
+- `gateway/catalog.go`, `executor.go`, `merge.go`, `global_index_read.go`,
+  `replicated_data_read.go`, `replicated_table.go`, and
+  `replicated_leader_cache.go`
 - `gateway/read_snapshot.go`, `transaction.go`, `writer.go`, `global_index.go`,
   and `global_index_backfill.go`
 - `distribution/manifest.go`, `router.go`, `tuple.go`, and `bucket.go`

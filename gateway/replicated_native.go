@@ -24,6 +24,8 @@ const (
 	AbsoluteMaxReplicatedRouteMembers   = 64
 	AbsoluteMaxReplicatedAttempts       = 16
 	AbsoluteMaxReplicatedAttemptTimeout = 5 * time.Minute
+	DefaultReplicatedLeaderHintCapacity = 4096
+	AbsoluteMaxReplicatedLeaderHints    = 65536
 )
 
 var (
@@ -101,6 +103,17 @@ type ReplicatedExecutor struct {
 	client         ReplicatedRoundTripper
 	maxAttempts    int
 	attemptTimeout time.Duration
+	leaderHints    replicatedLeaderHintCache
+}
+
+// ReplicatedExecutorOptions bounds retry resources and the in-memory leader
+// hint working set. LeaderHintCapacity is a count of exact shard routes, not a
+// shard or tenant limit: eviction only causes a fresh authenticated probe.
+// Zero selects DefaultReplicatedLeaderHintCapacity.
+type ReplicatedExecutorOptions struct {
+	MaxAttempts        int
+	AttemptTimeout     time.Duration
+	LeaderHintCapacity int
 }
 
 func NewReplicatedExecutor(
@@ -108,12 +121,30 @@ func NewReplicatedExecutor(
 	maxAttempts int,
 	attemptTimeout time.Duration,
 ) (*ReplicatedExecutor, error) {
-	if client == nil || maxAttempts <= 0 || maxAttempts > AbsoluteMaxReplicatedAttempts ||
-		attemptTimeout <= 0 || attemptTimeout > AbsoluteMaxReplicatedAttemptTimeout {
+	return NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+		MaxAttempts: maxAttempts, AttemptTimeout: attemptTimeout,
+	})
+}
+
+func NewReplicatedExecutorWithOptions(
+	client ReplicatedRoundTripper,
+	options ReplicatedExecutorOptions,
+) (*ReplicatedExecutor, error) {
+	capacity := options.LeaderHintCapacity
+	if capacity == 0 {
+		capacity = DefaultReplicatedLeaderHintCapacity
+	}
+	if client == nil || options.MaxAttempts <= 0 ||
+		options.MaxAttempts > AbsoluteMaxReplicatedAttempts ||
+		options.AttemptTimeout <= 0 ||
+		options.AttemptTimeout > AbsoluteMaxReplicatedAttemptTimeout ||
+		capacity <= 0 || capacity > AbsoluteMaxReplicatedLeaderHints {
 		return nil, ErrReplicatedRoute
 	}
 	return &ReplicatedExecutor{
-		client: client, maxAttempts: maxAttempts, attemptTimeout: attemptTimeout,
+		client: client, maxAttempts: options.MaxAttempts,
+		attemptTimeout: options.AttemptTimeout,
+		leaderHints:    newReplicatedLeaderHintCache(capacity),
 	}, nil
 }
 
@@ -200,6 +231,7 @@ func (executor *ReplicatedExecutor) readPoint(
 			Key: read.Key, MinimumApplied: read.MinimumApplied, MaxValueBytes: read.MaxValueBytes,
 		})
 		if err != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			joined = errors.Join(joined, err)
 			preferred = 0
 			continue
@@ -216,11 +248,13 @@ func (executor *ReplicatedExecutor) readPoint(
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
 			response.State.Fence.MemberID != endpoint.Member {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			joined = errors.Join(joined, ErrReplicatedRoute)
 			preferred = 0
 			continue
 		}
 		if response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if validReplicatedReadRefusal(
 				response, shardservice.ReplicatedRefusalStaleFence,
 			) {
@@ -242,10 +276,14 @@ func (executor *ReplicatedExecutor) readPoint(
 				joined = errors.Join(joined, ErrReplicatedRoute)
 				continue
 			}
+			if read.Linearizable {
+				executor.leaderHints.publish(route, endpoint, response.State)
+			}
 			return ReplicatedPointResult{Applied: response.ReadApplied,
 				Found: response.Kind == shardservice.ReplicatedReadFound,
 				Value: response.Value, State: response.State, Retries: attempt}, nil
 		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if !validReplicatedNonterminalResponse(response) {
 				joined = errors.Join(joined, ErrReplicatedRoute)
 				preferred = 0
@@ -260,6 +298,7 @@ func (executor *ReplicatedExecutor) readPoint(
 				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				executor.leaderHints.invalidate(route, endpoint, state)
 				// A command-fence change was handled above and is a definite
 				// catalog refusal. With the same command fence this is only a
 				// member/term incarnation race between probe and read admission;
@@ -447,6 +486,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				Capability: serviceauthz.CapabilityMembership,
 				Fence:      state.Fence, Membership: membership})
 		if err != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
 					ctx, route, membership.TargetMember, state.Fence.Term,
@@ -469,6 +509,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
 			response.State.Fence.MemberID != endpoint.Member {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 				ErrReplicatedRoute)
 		}
@@ -478,6 +519,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 					ErrReplicatedRoute)
 			}
+			executor.leaderHints.publish(route, endpoint, response.State)
 			result := ReplicatedMembershipResult{State: response.State, Retries: attempt}
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				witness, observeErr := executor.ObserveMembershipTransfer(
@@ -491,6 +533,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			}
 			return result, nil
 		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if !validReplicatedNonterminalResponse(response) {
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 					ErrReplicatedRoute)
@@ -498,6 +541,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			preferred = response.State.LeaderID
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
 					ctx, route, membership.TargetMember, state.Fence.Term,
@@ -528,7 +572,7 @@ func (executor *ReplicatedExecutor) observeMembershipTransfer(
 ) (ReplicatedMembershipResult, bool) {
 	preferred := target
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeader(ctx, route, preferred,
+		endpoint, state, err := executor.discoverLeaderFresh(ctx, route, preferred,
 			serviceauthz.CapabilityMembership)
 		if err == nil && endpoint.Member == target && state.LeaderID == target &&
 			state.Fence.MemberID == target && state.Fence.Term > afterTerm {
@@ -616,7 +660,11 @@ func (executor *ReplicatedExecutor) propose(
 			}
 		}
 		if state == (shardservice.ReplicatedMemberState{}) {
-			endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
+			if lastUnknown != nil {
+				endpoint, state, err = executor.discoverLeaderFresh(ctx, route, preferred, capability)
+			} else {
+				endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
+			}
 			if err != nil {
 				if lastUnknown != nil {
 					lastUnknown = errors.Join(lastUnknown, err)
@@ -645,6 +693,7 @@ func (executor *ReplicatedExecutor) propose(
 				Command: original,
 			})
 		if err != nil {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			// A transport implementation might not wrap a proposal failure;
 			// fail closed because the complete command could have reached admission.
 			lastUnknown = errors.Join(lastUnknown, err)
@@ -660,6 +709,7 @@ func (executor *ReplicatedExecutor) propose(
 			continue
 		}
 		if !validReplicatedWriteResponseFields(response) {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 			continue
 		}
@@ -684,10 +734,12 @@ func (executor *ReplicatedExecutor) propose(
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
 			response.State.Fence.MemberID != endpoint.Member {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 			continue
 		}
 		if response.State.Fence.Command != route.Command {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			// A typed stale-fence refusal is definite pre-admission and may
 			// legitimately carry the newly installed command contract. Every
 			// other mismatched post-proposal response remains outcome-unknown.
@@ -719,11 +771,13 @@ func (executor *ReplicatedExecutor) propose(
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
 			}
+			executor.leaderHints.publish(route, endpoint, response.State)
 			return ReplicatedResult{
 				Outcome: response.Outcome, Completion: response.Completion,
 				State: response.State, Retries: attempt,
 			}, nil
 		case shardservice.ReplicatedNotLeader:
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if !validReplicatedNonterminalResponse(response) {
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
@@ -746,6 +800,7 @@ func (executor *ReplicatedExecutor) propose(
 			}
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if !validReplicatedNonterminalResponse(response) {
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
@@ -777,6 +832,7 @@ func (executor *ReplicatedExecutor) propose(
 				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				executor.leaderHints.invalidate(route, endpoint, state)
 				// The command contract was checked above. With the same contract,
 				// this is a definite pre-admission term/member incarnation race
 				// between leader discovery and proposal admission. Refresh the
@@ -889,6 +945,8 @@ func validReplicatedLeaderHint(
 	state shardservice.ReplicatedMemberState,
 ) bool {
 	return endpoint.Member != 0 && endpoint.Member == state.Fence.MemberID &&
+		endpoint.StoreID == state.Fence.StoreID &&
+		endpoint.NodeIncarnation == state.Fence.NodeIncarnation &&
 		validReplicatedMemberState(state) &&
 		state.LeaderID == state.Fence.MemberID &&
 		state.Fence.Group == route.Group &&
@@ -897,6 +955,22 @@ func validReplicatedLeaderHint(
 }
 
 func (executor *ReplicatedExecutor) discoverLeader(
+	ctx context.Context,
+	route ReplicatedRoute,
+	preferred uint64,
+	capability serviceauthz.Capability,
+) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	if endpoint, state, ok := executor.leaderHints.lookup(route); ok {
+		return endpoint, state, nil
+	}
+	return executor.discoverLeaderFresh(ctx, route, preferred, capability)
+}
+
+// discoverLeaderFresh always obtains a current authenticated handshake. It is
+// required after any proposal outcome becomes unknown: a latency hint must not
+// spend the retained command's bounded retry budget on the possibly failed
+// member that created the ambiguity.
+func (executor *ReplicatedExecutor) discoverLeaderFresh(
 	ctx context.Context,
 	route ReplicatedRoute,
 	preferred uint64,
@@ -942,6 +1016,7 @@ func (executor *ReplicatedExecutor) discoverLeader(
 			continue
 		}
 		if response.State.LeaderID == response.State.Fence.MemberID {
+			executor.leaderHints.publish(route, endpoint, response.State)
 			return endpoint, response.State, nil
 		}
 		member = response.State.LeaderID

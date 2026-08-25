@@ -68,6 +68,24 @@ func NewSnapshotWithReplicatedMetadata(
 	statistics []queryplanner.TableStatistics,
 	replicated []ReplicatedShardDescriptor,
 ) (*Snapshot, error) {
+	return NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, generation, indexes, statistics, replicated, nil,
+	)
+}
+
+// NewSnapshotWithReplicatedTableMetadata constructs one immutable catalog
+// generation with exact RF3 coordinates and optional base-table profiles.
+// There is one current grammar: replicated_tables is an optional field in the
+// same catalog document, not a parallel format or compatibility mode.
+func NewSnapshotWithReplicatedTableMetadata(
+	config distribution.ClusterConfig,
+	endpoints map[distribution.EndpointID]string,
+	generation uint64,
+	indexes []IndexDescriptor,
+	statistics []queryplanner.TableStatistics,
+	replicated []ReplicatedShardDescriptor,
+	tables []ReplicatedTableProfile,
+) (*Snapshot, error) {
 	snapshot, err := NewSnapshotWithPlannerMetadata(
 		config, endpoints, generation, indexes, statistics,
 	)
@@ -75,6 +93,9 @@ func NewSnapshotWithReplicatedMetadata(
 		return nil, err
 	}
 	if err := snapshot.attachReplicatedMetadata(replicated); err != nil {
+		return nil, err
+	}
+	if err := snapshot.attachReplicatedTableProfiles(tables); err != nil {
 		return nil, err
 	}
 	return snapshot, nil
@@ -289,6 +310,7 @@ func (snapshot *Snapshot) ReplicatedMetadataBytes() uint64 {
 	return retainedReplicatedMetadataBytes(
 		snapshot.replicatedShards,
 		snapshot.replicatedReplicas,
+		snapshot.replicatedTables,
 	)
 }
 
@@ -328,6 +350,9 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 }
 
 func validateReplicatedCatalogTransition(current, next *Snapshot) error {
+	if err := validateReplicatedTableTransition(current, next); err != nil {
+		return err
+	}
 	if current == nil || len(current.replicatedShards) == 0 {
 		return nil
 	}

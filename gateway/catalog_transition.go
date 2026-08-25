@@ -108,9 +108,9 @@ func buildManifestTransitions(
 	}
 	indexes := current.indexDescriptors()
 	statistics := current.statistics.Descriptors()
-	next, err := NewSnapshotWithReplicatedMetadata(
+	next, err := NewSnapshotWithReplicatedTableMetadata(
 		config, current.endpoints, nextGeneration, indexes, statistics,
-		replicated,
+		replicated, current.replicatedTableProfiles(),
 	)
 	if err != nil {
 		return nil, err
@@ -370,6 +370,7 @@ func snapshotWithCatalogLineage(
 		statistics:                     snapshot.statistics,
 		replicatedShards:               snapshot.replicatedShards,
 		replicatedReplicas:             snapshot.replicatedReplicas,
+		replicatedTables:               snapshot.replicatedTables,
 		indexLineage:                   snapshot.indexLineage,
 		shardLineage:                   snapshot.shardLineage,
 		indexIDHighWater:               indexHighWater,

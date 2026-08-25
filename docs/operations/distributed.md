@@ -1,11 +1,11 @@
 # Operate the distributed runtime
 
-The shipped distributed runtime is experimental. Its ordinary public data path
-consists of a stateless gateway and static-ownership shard services configured
-from a catalog file. `vibedb-shard serve-rf3` is a separate open-only command
-for one externally prepared, stable three-voter Raft group. The generated
-[distributed feature state](../distributed-feature-state.md) separates those
-command paths and their qualification evidence.
+The shipped distributed runtime is experimental. SQL uses a routing gateway
+and static-ownership shard services. A canonical point `get` can instead use an
+externally prepared, stable three-voter Raft group when the gateway consumes
+the replicated catalog. The generated [distributed feature
+state](../distributed-feature-state.md) separates those paths and their
+qualification evidence.
 
 The gateway and shard commands require mutually authenticated TLS by default.
 Authenticated mode also requires one canonical `vibejson` authorization policy.
@@ -17,9 +17,10 @@ through a proxy or port forward to an untrusted network.
 `vibedb-shard serve-rf3` constructs bounded proposal admission, quorum commit,
 committed apply, result settlement, authenticated peer transport, and an
 authenticated native replicated endpoint over exact prepared artifacts. It
-does not create or repair those artifacts. `vibedb-gateway serve` still sends
-ordinary public queries and writes through the static SQL shard protocol; it
-does not select the RF3 native endpoint for that data path.
+does not create or repair those artifacts. `vibedb-gateway serve` routes only
+the canonical point `get` envelope through that endpoint. It sends SQL queries
+and writes through the static SQL shard protocol. The RF3 point-read path has
+no SQL fallback.
 
 ## Build the commands
 
@@ -39,10 +40,24 @@ The catalog contains these items:
 - One full-range shard manifest for each distribution
 - Endpoint IDs and addresses
 - Optional index metadata and planner statistics
+- Optional exact RF3 shard descriptors
+- Optional replicated base-table profiles
 
 This repository has no catalog administration CLI. Application or operator
-code must construct and publish a valid `gateway.Snapshot`. `SaveSnapshot` and
-`SaveSnapshotAfter` publish the file for cooperating writers.
+code must construct and publish a valid `gateway.Snapshot`. Use
+`NewSnapshotWithReplicatedTableMetadata` when a table must serve RF3 point
+reads. Each profile binds one table and one scalar string/number
+primary-placement path to a dense relation, schema generation,
+relation-manifest digest, and exact key and document limits. Composite
+placement tuples and tenant-path placement are not accepted by this public
+lane. Each routed allocation must also have one matching RF3 shard descriptor
+and three native replica endpoints.
+
+`SaveSnapshot` and `SaveSnapshotAfter` publish the bootstrap file for
+cooperating writers. In the normal gateway mode, that file locates the
+dedicated catalog RF3 group. The gateway then reads the authoritative catalog
+head from that group. `-dev-static-catalog` is the explicit loopback-only mode
+that treats the file as the authority.
 
 The catalog publisher writes a temporary sibling, syncs it, replaces the
 catalog, and syncs the parent directory. The file has a 16 MiB limit. Do not
@@ -77,11 +92,13 @@ Both services load the same immutable policy generation. Principal IDs are the
 32-character hexadecimal node identities carried by their TLS certificates.
 The array and capability order below are canonical. The gateway service
 identity needs `delegate`, `data_read`, and `data_write`: it delegates the exact
-application principal to a shard and uses its own authority for recovery. A
-client receives only the operations listed for that principal.
+application principal to a shard and uses its own authority for recovery. It
+also needs `topology` when it consumes the replicated catalog and runs the
+split controller. A client receives only the operations listed for that
+principal.
 
 ```json
-{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
+{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate","topology"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
 ```
 
 Save that exact document as `./authorization-policy.vibejson`. Unknown,
@@ -229,6 +246,10 @@ endpoint information.
 ```bash
 ./bin/vibedb-gateway serve \
   -catalog ./cluster.json \
+  -catalog-relation 1 \
+  -catalog-session-journal ./gateway-catalog-session \
+  -catalog-client-id 77777777777777777777777777777777 \
+  -catalog-retry-home 8888888888888888 \
   -listen 127.0.0.1:7400 \
   -tls-certificate ./gateway.pem \
   -tls-key ./gateway-key.pem \
@@ -247,6 +268,24 @@ default executor retries a stale refusal at most twice, for at most three
 attempts and two reloads. Each retry must load a strictly newer generation. A
 multi-statement `ExecBatch` pins one generation and has no stale-retry loop. A
 one-statement batch delegates to `Exec`.
+
+The catalog and public RF3 point reads share one bounded authenticated native
+connection pool. The pool keys a physical connection by authenticated node and
+address. Globally idle connections are evicted oldest-first under endpoint
+churn, while topology, membership, and schema traffic retain reserved
+connection and handshake capacity under data saturation. The RF3 executor also
+keeps bounded four-way exact leader hints. It validates the complete route and
+serving fence, follows `NotLeader` responses, and retries within
+`-catalog-attempts` and `-catalog-attempt-timeout`. A
+definite stale serving fence coalesces one authenticated catalog refresh and
+permits exactly one re-resolved read attempt; ambiguous transport failures are
+never replayed by that refresh path.
+
+`-max-shard-connections-per-pool` and
+`-max-shard-handshakes-per-pool` are explicit per-pool limits, not aggregate
+process limits: authenticated SQL and RF3 each own one pool, while each
+transient controller pool is capped at eight. The naming prevents an operator
+from mistaking the configured value for a smaller process-wide bound.
 
 The gateway runs distributed-transaction recovery every five seconds. It logs
 the number of coordinators that recovery resolves.
@@ -268,6 +307,33 @@ The allowed operations are:
 | `exec` | Run one write that the gateway proves has one owner. |
 | `exec_batch` | Run a fixed-participant atomic write batch. |
 
+The gateway also accepts one canonical RF3 point-read envelope. The object and
+fields must use the exact order shown. `key` is the unpadded base64url encoding
+of the canonical ordered scalar primary-placement key. The table profile, not
+the client, selects the relation and RF3 route.
+
+```json
+{"op":"get","table":"users","key":"QGFjbWUAAA","consistency":"linearizable"}
+```
+
+A successful response returns the exact route lineage and applied index:
+
+```json
+{"ok":true,"route_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","applied":42,"found":true,"document":{"id":"acme"}}
+```
+
+Use that pair for an explicit monotonic follower read:
+
+```json
+{"op":"get","table":"users","key":"QGFjbWUAAA","consistency":"at_least_applied","route_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","applied":42}
+```
+
+The RF3 response uses closed typed error codes. Examples include
+`table_not_replicated`, `position_mismatch`, `read_behind`, `stale_catalog`,
+`overloaded`, and `unavailable`. The `retryable` field states whether a caller
+can retry the same operation. The public RF3 boundary does not accept `put` or
+`delete` yet.
+
 The parameter kinds are `null`, `bool`, `number`, `string`, and `document`.
 The client cannot select a shard or supply a serialized plan. SQL and catalog
 placement determine the route.
@@ -276,7 +342,14 @@ A response can contain columns, raw JSON rows, affected-row count, route type,
 catalog generation, fanout count, retry count, or an error.
 
 One request is limited to 1 MiB before JSON decoding. The shard wire protocol
-has a separate frame limit of 16 MiB plus 64 KiB.
+has a separate frame limit of 16 MiB plus 64 KiB. Public point reads also have
+operator-configurable concurrent-request and aggregate response reservations:
+`-max-native-read-concurrency` and `-max-native-read-bytes`. Each admitted read
+retains its schema-authenticated maximum-document reservation until the
+response has been written to the client. Documents stream directly from that
+reservation instead of being copied into a connection-lifetime JSON buffer.
+A client that stops reading is disconnected after the five-second native
+response-write deadline so it cannot pin the reservation indefinitely.
 
 ## Select an operation class
 
@@ -293,11 +366,23 @@ scatter and overflow.
 
 ## Read consistency
 
-The service accepts only the `ReadStrong` policy and serves a statement-level
-snapshot from its statically configured leader endpoint. It refuses session
-reads, stale reads, and minimum applied positions. Because the service has no
-Raft election or replication, `ReadStrong` does not prove cluster-wide
-linearizability or revoke a copied store.
+The canonical RF3 point-read envelope has two explicit policies:
+
+- `linearizable` follows the current leader and uses Raft `ReadIndex`. It does
+  not accept a caller position.
+- `at_least_applied` requires a nonzero applied index and the exact `RouteID`
+  returned by an earlier result. The gateway rejects a different route lineage
+  before shard I/O. It prefers a follower that has reached the requested index.
+
+Every successful RF3 point read returns a new `route_id` and `applied` pair.
+Retain the pair together. An applied index has no meaning outside its exact
+route lineage.
+
+The SQL path has a different contract. It accepts only the `ReadStrong` policy
+and serves a statement-level snapshot from its statically configured leader
+endpoint. Because the SQL shard service has no Raft election or replication,
+`ReadStrong` does not prove cluster-wide linearizability or revoke a copied
+store.
 
 A multi-shard read uses a short-lived coherent read fence. The gateway acquires
 the same scoped fence on all target shards, runs the reads, and releases the
@@ -339,11 +424,12 @@ release, or retirement finishes.
 The shipped runtime does not provide these features:
 
 - RF3 initialization, artifact provisioning, or repair
-- Public-gateway routing through the RF3 native data endpoint
-- Public-gateway follower reads or bounded-staleness reads
-- Endpoint failover or load balancing
-- Catalog replication between gateway hosts
-- Automatic shard split execution or data movement
+- Public RF3 writes
+- RF3 scatter reads or multi-table reads
+- Composite or tenant-path public RF3 placement keys
+- A common distributed RF3 read timestamp
+- Static SQL endpoint failover or load balancing
+- Automatic catalog-group provisioning
 - Distributed DDL or schema-rollout validation
 - A replica-move controller
 - RF3 membership changes or leader-transfer control
@@ -357,7 +443,9 @@ read returns no partial result when one shard fails.
 
 - `cmd/vibedb-gateway/main.go` and `serve.go`
 - `cmd/vibedb-shard/main.go`, `serve_rf3.go`, and `rf3_manifest.go`
-- `gateway/catalog.go`, `executor.go`, `profile.go`, and `transaction.go`
+- `gateway/catalog.go`, `executor.go`, `profile.go`, `transaction.go`,
+  `replicated_data_read.go`, `replicated_table.go`,
+  `replicated_leader_cache.go`, and `replicated_transport.go`
 - `gateway/recovery.go` and `read_snapshot.go`
 - `distribution/manifest.go`, `placement.go`, `policy.go`, and `router.go`
 - `shardservice/admit.go`, `server.go`, `wire.go`, and `read_fence.go`
