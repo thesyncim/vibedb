@@ -1,7 +1,9 @@
 # Raft WAL
 
 `internal/raftstore` provides one encrypted, preallocated, single-writer WAL
-for a Raft member. It is internal and is not opened by the shipped commands.
+for a Raft member. `vibedb-shard serve-rf3` opens one externally prepared WAL
+with its exact retained identity, key, recovery epoch, and sealed bounds. No
+command creates or repairs an RF3 WAL.
 
 ## Identity
 

@@ -4,8 +4,10 @@ Status: **Internal**
 
 `internal/rafttransport` provides a composable authenticated stream foundation
 for ordinary Raft messages. `internal/raftservice` wires it to
-`internal/multiraft.Host` in the internal RF3 serving composition. No shipped
-command constructs that peer service.
+`internal/multiraft.Host` in the RF3 serving composition.
+`vibedb-shard serve-rf3` constructs one fixed three-voter peer service from an
+exact manifest. It does not enroll certificates, discover peers dynamically,
+or orchestrate membership or snapshot traffic.
 
 ## Certificate identity
 

@@ -4,8 +4,10 @@ The repository uses `go.etcd.io/raft/v3` version 3.7.0 for the Raft state
 machine. VibeDB owns persistence, scheduling, identity checks, transport frame
 validation, SQL apply, and resource admission around that dependency.
 
-Internal packages compose this code into an RF3 serving test path. The shipped
-gateway and shard commands do not construct that composition.
+Internal packages compose this code into the RF3 serving path.
+`vibedb-shard serve-rf3` constructs that composition for one externally
+prepared stable three-voter group. The gateway command still uses the static
+SQL shard path for ordinary public traffic.
 
 ## Configuration controls
 
@@ -53,10 +55,10 @@ checks limit parser and graph amplification before allocation.
 
 The repository does not provide these product components:
 
-- A Raft peer listener or address registry constructed by a shipped command
+- RF3 artifact preparation or dynamic peer/address discovery
 - Certificate enrollment, rotation, or revocation operations
 - Online empty-learner snapshot installation and activation
-- A controller that connects the kernel to the shipped shard server
+- A membership or snapshot lifecycle controller around the fixed shard server
 
 ## Multi-Raft scheduler
 

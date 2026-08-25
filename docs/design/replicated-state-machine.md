@@ -4,8 +4,9 @@
 hidden system collection and a bounded manifest of dense relation collections.
 The relation bundle can publish a base JSON mutation together with local or
 global exact-index mutations in one checkpoint group. It is consumed by the
-internal RF3 serving composition, but the shipped commands do not construct
-that RF3 path.
+RF3 serving composition. `vibedb-shard serve-rf3` opens an externally prepared
+state machine and serves it through a fixed authenticated three-voter runtime;
+it does not initialize the machine, change membership, or install snapshots.
 
 ## Command contract
 

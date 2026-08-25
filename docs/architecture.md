@@ -5,11 +5,14 @@ VibeDB has four main layers:
 1. The root facade owns database lifecycle and product durability profiles.
 2. The heap and durable stores own JSON collections, indexes, and snapshots.
 3. The query and SQL packages own parsing, planning, and local execution.
-4. The experimental distributed packages own static routing and shard service.
+4. The experimental distributed packages own static routing, shard service,
+   and fixed-RF3 serving.
 
-The internal Raft, replicated-state, and Raft-service packages form a separate
-RF3 serving composition. The shipped commands do not construct that composition
-or connect it to the static shard service.
+The internal Raft, replicated-state, and Raft-service packages form the RF3
+serving composition. `vibedb-shard serve-rf3` constructs it for one externally
+prepared stable three-voter group. It does not provision or repair the group,
+and the public gateway command remains connected to the static shard service
+rather than the RF3 native endpoint.
 
 ## Product facade
 
@@ -118,15 +121,21 @@ The gateway pins one immutable catalog generation per attempt, proves a bounded 
 dispatches SQL and typed parameters, and merges the complete result. The shard
 admits distribution, allocation, routing, and ownership identity before SQL.
 
-The service accepts only its `ReadStrong` policy and serves a statement-level
-snapshot from a statically configured leader endpoint. This label is not a
-Raft linearizability proof because the serving path has no election or
-replication. Multi-shard reads use short-lived scoped vector fences. Ordinary
-writes require one-owner proof. A separate fixed-participant protocol supports
-atomic write batches.
+The separate `vibedb-shard serve-rf3` path opens exact retained WAL, SQL, and
+apply artifacts, constructs one bounded Multi-Raft host plus authenticated peer
+transport, and serves the authenticated native replicated protocol. There is no
+RF3 initializer, membership or snapshot orchestrator, or public-gateway routing
+to this path.
 
-The runnable path has no Raft replication, follower read, endpoint failover,
-or automatic topology controller.
+The static shard service accepts only its `ReadStrong` policy and serves a
+statement-level snapshot from a statically configured leader endpoint. This
+label is not a Raft linearizability proof because the serving path has no
+election or replication. Multi-shard reads use short-lived scoped vector
+fences. Ordinary writes require one-owner proof. A separate fixed-participant
+protocol supports atomic write batches.
+
+The static gateway path has no Raft replication, follower read, endpoint
+failover, or automatic topology controller.
 
 The internal range-split data plane is not part of the runnable path. It scans
 one certified source image once and routes each borrowed row to at most three

@@ -1,9 +1,12 @@
 # Distributed system design
 
-VibeDB has a runnable static-shard command layer and a separate internal RF3
-serving composition. The shipped commands do not connect these layers.
+VibeDB has a runnable static-shard command layer and a fixed-RF3 serving
+composition. `vibedb-shard serve-rf3` constructs the latter for externally
+prepared exact member artifacts. The public gateway command does not connect
+ordinary data traffic to that native RF3 endpoint, and no command initializes
+or changes the RF3 topology.
 
-## Runnable layer
+## Runnable static layer
 
 The runnable layer has these components:
 
@@ -279,11 +282,14 @@ from the projected suffix until the exact final cut is proved. The
 per-generation build lease and deterministic stage name bound crash debris to
 one reclaimable image instead of an unbounded set of randomized WAL files.
 
-This WAL-generation lane is consumed by the internal RF3 serving composition,
-whose bounded authenticated peer runtime, Multi-Raft Host, replicated shard
-service, settlement path, and leader-aware native gateway executor serve real
-in-process and multi-process test traffic. The shipped commands still do not
-construct that composition, so this is not a shipped HA deployment.
+This WAL-generation lane is consumed by the RF3 serving composition, whose
+bounded authenticated peer runtime, Multi-Raft Host, replicated shard service,
+settlement path, and leader-aware native gateway executor serve real in-process
+and multi-process test traffic. `vibedb-shard serve-rf3` opens an already
+prepared fixed three-voter member and constructs its peer and native serving
+side. It does not create a WAL generation, provision a group, or make the
+ordinary public gateway use the native path, so it is not turnkey HA
+orchestration.
 Transition capture is deliberately rejected while a
 `CheckpointGroup` owns the apply state; online range split must use the later
 publish-before-prune serving integration rather than adding another ordinary
@@ -528,12 +534,13 @@ infrastructure outcome. A leader that stays live without quorum has no
 time-based abandonment policy in this non-serving safe point. A serving gateway
 still needs a leader-and-quorum lease policy around request deadlines.
 
-The internal composition has a bounded authenticated peer service, replicated
-shard service, leader-aware native gateway executor, request identities, and a
-separate authenticated snapshot-artifact service. It does not have certificate
-enrollment, dynamic address discovery, or empty-learner snapshot activation.
-The shipped commands do not construct the internal peer, RF3 shard, or snapshot
-services.
+The composition has a bounded authenticated peer service, replicated shard
+service, leader-aware native gateway executor, request identities, and a
+separate authenticated snapshot-artifact service. `serve-rf3` constructs the
+peer and replicated shard services from one fixed manifest. It does not
+construct the snapshot service and does not provide certificate enrollment,
+dynamic address discovery, member changes, or empty-learner snapshot
+activation.
 
 Do not describe this kernel as a turnkey replicated deployment.
 
