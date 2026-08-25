@@ -28,12 +28,15 @@ func TestSessionAuthorityClassFencesStableIdentityBidirectionally(t *testing.T) 
 			}
 			prototype := commandValue(fixture.binding, 1)
 			prototype.AuthorityClass = owner
+			wantConflictKey := AuthorityIdentityKey(prototype.Tenant, prototype.ClientID)
 			_, ownerOpen, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
 
 			foreignPrototype := prototype
 			foreignPrototype.AuthorityClass = foreign
 			foreignOpen := encodeCommand(t, sessionOpenFor(foreignPrototype))
-			assertSessionAuthorityConflict(t, fixture.machine.AdmitCommand(foreignOpen))
+			assertSessionAuthorityConflictKey(
+				t, fixture.machine.AdmitCommand(foreignOpen), wantConflictKey,
+			)
 			if publication, err := fixture.machine.ApplyNormal(normalMeta(3), foreignOpen); err != nil ||
 				publication.Applied != 3 {
 				t.Fatalf("committed foreign open = %+v, %v", publication, err)
@@ -41,7 +44,7 @@ func TestSessionAuthorityClassFencesStableIdentityBidirectionally(t *testing.T) 
 			if _, err := fixture.machine.LookupCompletion(foreignOpen); err == nil {
 				t.Fatal("foreign open resolved the owner's retained completion")
 			} else {
-				assertSessionAuthorityConflict(t, err)
+				assertSessionAuthorityConflictKey(t, err, wantConflictKey)
 			}
 
 			foreignMutation := foreignPrototype
@@ -81,11 +84,13 @@ func TestSessionAuthorityClassFencesStableIdentityBidirectionally(t *testing.T) 
 			}
 			for _, test := range foreignCommands {
 				bytes := encodeCommand(t, test.command)
-				assertSessionAuthorityConflict(t, fixture.machine.AdmitCommand(bytes))
+				assertSessionAuthorityConflictKey(
+					t, fixture.machine.AdmitCommand(bytes), wantConflictKey,
+				)
 				if _, err := fixture.machine.LookupCompletion(bytes); err == nil {
 					t.Fatalf("%s resolved the owner's retained session", test.name)
 				} else {
-					assertSessionAuthorityConflict(t, err)
+					assertSessionAuthorityConflictKey(t, err, wantConflictKey)
 				}
 			}
 
@@ -99,11 +104,13 @@ func TestSessionAuthorityClassFencesStableIdentityBidirectionally(t *testing.T) 
 			}
 			for _, test := range foreignCommands {
 				bytes := encodeCommand(t, test.command)
-				assertSessionAuthorityConflict(t, reopened.AdmitCommand(bytes))
+				assertSessionAuthorityConflictKey(
+					t, reopened.AdmitCommand(bytes), wantConflictKey,
+				)
 				if _, err := reopened.LookupCompletion(bytes); err == nil {
 					t.Fatalf("reopened %s resolved the owner's retained session", test.name)
 				} else {
-					assertSessionAuthorityConflict(t, err)
+					assertSessionAuthorityConflictKey(t, err, wantConflictKey)
 				}
 			}
 
@@ -210,6 +217,7 @@ func TestSessionAuthorityClassSurvivesReleaseAndSameClassReopen(t *testing.T) {
 			}
 			prototype := commandValue(fixture.binding, 1)
 			prototype.AuthorityClass = owner
+			wantConflictKey := AuthorityIdentityKey(prototype.Tenant, prototype.ClientID)
 			applySessionOpen(t, fixture.machine, 2, prototype)
 			retirement := sessionRetirement(commandValue(fixture.binding, 1))
 			retirement.AuthorityClass = owner
@@ -233,14 +241,13 @@ func TestSessionAuthorityClassSurvivesReleaseAndSameClassReopen(t *testing.T) {
 			foreignRelease := release
 			foreignRelease.AuthorityClass = foreign
 			foreignReleaseBytes := encodeCommand(t, foreignRelease)
-			wantConflictKey := AuthorityIdentityKey(prototype.Tenant, prototype.ClientID)
 			assertSessionAuthorityConflictKey(
 				t, reopened.AdmitCommand(foreignReleaseBytes), wantConflictKey,
 			)
 			if _, err := reopened.LookupCompletion(foreignReleaseBytes); err == nil {
 				t.Fatal("foreign release resolved the retained authority tombstone")
 			} else {
-				assertSessionAuthorityConflict(t, err)
+				assertSessionAuthorityConflictKey(t, err, wantConflictKey)
 			}
 			foreignOpen := prototype
 			foreignOpen.AuthorityClass = foreign
@@ -253,7 +260,7 @@ func TestSessionAuthorityClassSurvivesReleaseAndSameClassReopen(t *testing.T) {
 			); err == nil {
 				t.Fatal("foreign lease lookup crossed retained authority")
 			} else {
-				assertSessionAuthorityConflict(t, err)
+				assertSessionAuthorityConflictKey(t, err, wantConflictKey)
 			}
 			if _, err := reopened.LookupSessionLease(
 				owner, prototype.Tenant, prototype.ClientID, 2,
