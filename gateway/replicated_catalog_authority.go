@@ -136,17 +136,29 @@ func sameReplicatedCatalogRoute(left, right ReplicatedRoute) bool {
 func (authority *ReplicatedCatalogAuthority) readRaw(
 	ctx context.Context, key []byte, maximum uint32,
 ) (ReplicatedPointResult, error) {
-	if authority == nil || ctx == nil || len(key) == 0 {
+	if authority == nil || ctx == nil || len(key) == 0 || maximum == 0 ||
+		maximum > uint32(maxReplicatedCatalogBytes) {
 		return ReplicatedPointResult{}, ErrReplicatedCatalog
 	}
 	ctx, err := authority.authorizedContext(ctx)
 	if err != nil {
 		return ReplicatedPointResult{}, err
 	}
-	return authority.executor.ReadTopologyPoint(ctx, authority.route, ReplicatedPointRead{
+	result, err := authority.executor.ReadTopologyPoint(ctx, authority.route, ReplicatedPointRead{
 		Relation: authority.relation, Key: key, MinimumApplied: 1,
-		MaxValueBytes: maximum, Linearizable: true,
+		// Point-read admission is certified against the relation's frozen maximum,
+		// not the expected size of one logical row kind. The catalog head and its
+		// smaller operation rows share this relation, so reserve the complete
+		// relation bound and enforce the row-kind bound after the read.
+		MaxValueBytes: uint32(maxReplicatedCatalogBytes), Linearizable: true,
 	})
+	if err != nil || !result.Found {
+		return result, err
+	}
+	if len(result.Value) > int(maximum) {
+		return ReplicatedPointResult{}, ErrReplicatedCatalog
+	}
+	return result, nil
 }
 
 // Read fetches the authoritative RF3 catalog head and validates the complete

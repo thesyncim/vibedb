@@ -25,6 +25,7 @@ type catalogAuthorityClient struct {
 	unknownCompletion []byte
 	unknownState      shardservice.ReplicatedMemberState
 	wantAuthority     serviceauthz.Authority
+	readMaximums      []uint32
 }
 
 func (client *catalogAuthorityClient) DoReplicated(
@@ -41,6 +42,7 @@ func (client *catalogAuthorityClient) DoReplicated(
 	}
 	if request.Operation == shardservice.ReplicatedReadLeader ||
 		request.Operation == shardservice.ReplicatedReadFollower {
+		client.readMaximums = append(client.readMaximums, request.MaxValueBytes)
 		value, found := client.rows[string(request.Key)]
 		kind := shardservice.ReplicatedReadMissing
 		if found {
@@ -90,6 +92,32 @@ func (client *catalogAuthorityClient) DoReplicated(
 		return nil, errors.New("connection lost after replicated apply")
 	}
 	return catalogCompletionResponse(client.state, completion, request.Command), nil
+}
+
+func TestReplicatedCatalogAuthorityUsesRelationReadBoundAndLogicalRowBound(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	ids, err := authority.ReadOperationIDs(context.Background())
+	if err != nil || len(ids) != 0 || len(client.readMaximums) == 0 ||
+		client.readMaximums[len(client.readMaximums)-1] != uint32(maxReplicatedCatalogBytes) {
+		t.Fatalf("empty directory ids=%v err=%v readMaximums=%v", ids, err, client.readMaximums)
+	}
+	client.rows[string(replicatedOperationDirectoryKey[:])] =
+		make([]byte, maxReplicatedOperationDirectoryBytes+1)
+	if _, err = authority.ReadOperationIDs(context.Background()); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("oversized logical directory error=%v", err)
+	}
+	operationID := [32]byte{1}
+	operationKey := replicatedOperationKey(operationID)
+	client.rows[string(operationKey[:])] = make([]byte, MaxReplicatedOperationBytes+1)
+	if _, err = authority.ReadOperation(context.Background(), operationID); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("oversized logical operation error=%v", err)
+	}
+	for index, maximum := range client.readMaximums {
+		if maximum != uint32(maxReplicatedCatalogBytes) {
+			t.Fatalf("read %d maximum=%d, want relation maximum %d",
+				index, maximum, maxReplicatedCatalogBytes)
+		}
+	}
 }
 
 func catalogCompletionResponse(
