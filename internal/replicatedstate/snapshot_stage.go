@@ -367,7 +367,7 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		expected.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		expected.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
 		expected.Chunks == 0 || expected.SystemRows != expected.State.SessionCount+
-		expected.State.SessionSlotCount+1 ||
+		expected.State.SessionSlotCount+expected.State.AuthorityBindingCount+1 ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
 		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||

@@ -61,7 +61,7 @@ func TestMissingSessionHeaderRejectsOrphanSlotPrefix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			digest := SessionKey(open.Tenant, open.ClientID)
+			digest := SessionKey(open.AuthorityClass, open.Tenant, open.ClientID)
 			slotKey, err := SessionSlotStorageKey(digest, 0)
 			if err != nil {
 				t.Fatal(err)

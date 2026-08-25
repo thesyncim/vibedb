@@ -31,7 +31,7 @@ func TestSessionCapacityStateTracksDurableCutAndPoison(t *testing.T) {
 	}
 	want = SessionCapacityState{
 		Initialized: true, Applied: 3, SessionCount: 1, SessionSlotCount: 2,
-		SessionEpochHighWater: 2,
+		SessionEpochHighWater: 2, AuthorityBindingCount: 1,
 	}
 	if got, err := fixture.machine.SessionCapacityState(); err != nil || got != want {
 		t.Fatalf("applied capacity state = %+v, %v; want %+v", got, err, want)

@@ -26,6 +26,9 @@ var (
 
 type commandPlan struct {
 	command         replication.CommandView
+	authorityDigest [32]byte
+	authorityKey    [33]byte
+	authorityRecord []byte
 	sessionDigest   [32]byte
 	sessionKey      [33]byte
 	slotKey         [35]byte
@@ -37,8 +40,10 @@ type commandPlan struct {
 	resultCode      uint32
 	refusal         error
 	writeSession    bool
+	writeAuthority  bool
 	writeSlot       bool
 	newSession      bool
+	newAuthority    bool
 	newPhysicalSlot bool
 	advanceEpoch    uint64
 	deleteSession   bool
@@ -64,13 +69,15 @@ type relationPointSnapshots struct {
 // overlays before the next call reuses these buffers. Singleton planning passes
 // nil and retains its existing ownership behavior.
 type commandPlanScratch struct {
-	sessionRead   []byte
-	slotRead      []byte
-	decodeRead    []byte
-	sessionRecord []byte
-	slotRecord    []byte
-	currentValue  []byte
-	descriptors   []mutationValueDescriptor
+	authorityRead   []byte
+	authorityRecord []byte
+	sessionRead     []byte
+	slotRead        []byte
+	decodeRead      []byte
+	sessionRecord   []byte
+	slotRecord      []byte
+	currentValue    []byte
+	descriptors     []mutationValueDescriptor
 	// logicalValueReads counts mutation before-value reads in the current
 	// physical batch. It is retained only as bounded qualification telemetry.
 	logicalValueReads uint32
@@ -102,6 +109,8 @@ func (s *commandPlanScratch) release() {
 		return
 	}
 	clear(s.sessionRead)
+	clear(s.authorityRead)
+	clear(s.authorityRecord)
 	clear(s.slotRead)
 	clear(s.decodeRead)
 	clear(s.sessionRecord)
@@ -109,6 +118,8 @@ func (s *commandPlanScratch) release() {
 	clear(s.currentValue)
 	clear(s.descriptors)
 	s.sessionRead = s.sessionRead[:0]
+	s.authorityRead = s.authorityRead[:0]
+	s.authorityRecord = s.authorityRecord[:0]
 	s.slotRead = s.slotRead[:0]
 	s.decodeRead = s.decodeRead[:0]
 	s.sessionRecord = s.sessionRecord[:0]
@@ -116,6 +127,12 @@ func (s *commandPlanScratch) release() {
 	s.descriptors = s.descriptors[:0]
 	if cap(s.sessionRead) > maxNormalBatchRetainedBufferBytes {
 		s.sessionRead = nil
+	}
+	if cap(s.authorityRead) > maxNormalBatchRetainedBufferBytes {
+		s.authorityRead = nil
+	}
+	if cap(s.authorityRecord) > maxNormalBatchRetainedBufferBytes {
+		s.authorityRecord = nil
 	}
 	if cap(s.slotRead) > maxNormalBatchRetainedBufferBytes {
 		s.slotRead = nil
@@ -148,6 +165,19 @@ func (s *commandPlanScratch) appendSessionRecord(
 	encoded, err := AppendSessionRecord(s.sessionRecord[:0], record)
 	if err == nil {
 		s.sessionRecord = encoded
+	}
+	return encoded, err
+}
+
+func (s *commandPlanScratch) appendAuthorityBinding(
+	tenant []byte, clientID replication.ID128, class replication.CommandAuthorityClass,
+) ([]byte, error) {
+	if s == nil {
+		return AppendAuthorityBinding(nil, tenant, clientID, class)
+	}
+	encoded, err := AppendAuthorityBinding(s.authorityRecord[:0], tenant, clientID, class)
+	if err == nil {
+		s.authorityRecord = encoded
 	}
 	return encoded, err
 }
@@ -564,6 +594,9 @@ func applyCommandPlanToState(next *State, plan commandPlan) error {
 	if plan.newSession {
 		next.SessionCount++
 	}
+	if plan.newAuthority {
+		next.AuthorityBindingCount++
+	}
 	if plan.newPhysicalSlot {
 		next.SessionSlotCount++
 	}
@@ -608,6 +641,7 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 		SessionEpochHighWater: m.state.SessionEpochHighWater,
+		AuthorityBindingCount: m.state.AuthorityBindingCount,
 	}
 }
 
@@ -736,7 +770,28 @@ func (m *Machine) planBundleCommand(
 ) (commandPlan, error) {
 	scratch.begin()
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
-	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
+	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
+	plan.authorityKey = AuthorityBindingStorageKey(plan.authorityDigest)
+	bound, authorityFound, err := authorityBindingAt(
+		systemSnapshot, plan.authorityKey, scratch,
+	)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	if authorityFound && (bound.Digest != plan.authorityDigest ||
+		!bytes.Equal(bound.Tenant, command.Tenant) || bound.ClientID != command.ClientID ||
+		bound.AuthorityClass != command.AuthorityClass) {
+		plan.conflict = true
+		return plan, nil
+	}
+	if !authorityFound {
+		if err := ensureNoAuthoritySessionRows(
+			systemSnapshot, command.Tenant, command.ClientID, m.options.RetryWindow,
+		); err != nil {
+			return commandPlan{}, err
+		}
+	}
+	plan.sessionDigest = SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
 	session, found, err := sessionAt(systemSnapshot, plan.sessionKey, scratch)
 	if err != nil {
@@ -751,9 +806,24 @@ func (m *Machine) planBundleCommand(
 		return plan, nil
 	}
 	if command.Kind() == replication.CommandSessionOpen {
-		return m.planSessionOpen(
+		if !authorityFound && state.AuthorityBindingCount >= m.options.MaxSessions {
+			plan.refusal = ErrAdmissionBound
+			return plan, nil
+		}
+		plan, err = m.planSessionOpen(
 			command, applied, state, systemSnapshot, plan, session, found, scratch,
 		)
+		if err != nil || plan.resultCode != ResultSessionOpened || authorityFound {
+			return plan, err
+		}
+		plan.authorityRecord, err = scratch.appendAuthorityBinding(
+			command.Tenant, command.ClientID, command.AuthorityClass,
+		)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		plan.writeAuthority, plan.newAuthority = true, true
+		return plan, nil
 	}
 	if command.Kind() == replication.CommandSessionRelease {
 		return m.planSessionRelease(command, state, systemSnapshot, plan, session, found)
@@ -1723,6 +1793,27 @@ func (s pointSnapshot) rangeSessionSlots(
 	return s.value.RangePrefixRaw(prefix[:], visit)
 }
 
+func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
+	clientID replication.ID128, retryWindow uint16) error {
+	for _, class := range [...]replication.CommandAuthorityClass{
+		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
+	} {
+		digest := SessionKey(class, tenant, clientID)
+		key := SessionStorageKey(digest)
+		_, found, err := snapshot.appendRaw(nil, key[:])
+		if err != nil {
+			return err
+		}
+		if found {
+			return fmt.Errorf("%w: session without authority binding", ErrSessionCorrupt)
+		}
+		if err := ensureNoSessionSlots(snapshot, digest, retryWindow); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func sessionAt(
 	snapshot pointSnapshot,
 	key [33]byte,
@@ -1758,6 +1849,27 @@ func sessionAt(
 	}
 	if key != SessionStorageKey(view.Digest) {
 		return SessionView{}, false, fmt.Errorf("%w: session storage key mismatch", ErrSessionCorrupt)
+	}
+	return view, true, nil
+}
+
+func authorityBindingAt(snapshot pointSnapshot, key [33]byte,
+	scratch *commandPlanScratch) (AuthorityBindingView, bool, error) {
+	var dst []byte
+	if scratch != nil {
+		dst = scratch.authorityRead[:0]
+	}
+	record, found, err := snapshot.appendRaw(dst, key[:])
+	if err != nil || !found {
+		return AuthorityBindingView{}, found, err
+	}
+	if scratch != nil {
+		scratch.authorityRead = record
+	}
+	view, err := OpenAuthorityBinding(record)
+	if err != nil || key != AuthorityBindingStorageKey(view.Digest) {
+		return AuthorityBindingView{}, false,
+			errors.Join(err, fmt.Errorf("%w: authority storage key", ErrSessionCorrupt))
 	}
 	return view, true, nil
 }
@@ -1857,6 +1969,9 @@ func (m *Machine) persistTransition(
 		return err
 	}
 	systemDocuments := 1
+	if plan.writeAuthority {
+		systemDocuments++
+	}
 	if plan.writeSession {
 		systemDocuments++
 	}
@@ -1892,6 +2007,11 @@ func (m *Machine) persistTransition(
 		}
 		if err := systemBatch.Put(stateKey, stateEnvelope); err != nil {
 			return err
+		}
+		if plan.writeAuthority {
+			if err := systemBatch.Put(plan.authorityKey[:], plan.authorityRecord); err != nil {
+				return err
+			}
 		}
 		if plan.writeSession {
 			if err := systemBatch.Put(plan.sessionKey[:], plan.sessionRecord); err != nil {
@@ -2058,6 +2178,15 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 	}
 	stateBytes := len(stateKey) + len(stateEnvelope)
 	systemDocs := 1
+	if plan.writeAuthority {
+		if len(plan.authorityRecord) < authorityBindingHeaderBytes+1+recordChecksumLen ||
+			len(plan.authorityRecord) > MaxAuthorityBindingBytes ||
+			len(plan.authorityRecord) > m.system.Limits.MaxDocumentBytes {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.authorityKey) + len(plan.authorityRecord)
+		systemDocs++
+	}
 	if plan.writeSession {
 		if len(plan.sessionRecord) == 0 || len(plan.sessionRecord) > m.system.Limits.MaxDocumentBytes {
 			return ErrAdmissionBound

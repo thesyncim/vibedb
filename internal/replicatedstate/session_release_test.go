@@ -35,9 +35,9 @@ func newSessionReleaseFixture(
 		return targetOf(collection)
 	}
 
-	systemDocuments := int(retryWindow) + 2
-	if systemDocuments < 3 {
-		systemDocuments = 3
+	systemDocuments := int(retryWindow) + 3
+	if systemDocuments < 4 {
+		systemDocuments = 4
 	}
 	system := openCollection("system", durable.Options{
 		OpaqueValues:      true,
@@ -51,7 +51,7 @@ func newSessionReleaseFixture(
 	}
 	t.Cleanup(func() { _ = log.Close() })
 
-	txnDocuments := user.Limits.MaxDistinctMutations + 3
+	txnDocuments := user.Limits.MaxDistinctMutations + 4
 	if systemDocuments > txnDocuments {
 		txnDocuments = systemDocuments
 	}
@@ -128,7 +128,7 @@ func assertSessionReleaseSlotsEpoch(
 	want uint64,
 ) {
 	t.Helper()
-	digest := SessionKey(identity.Tenant, identity.ClientID)
+	digest := SessionKey(identity.AuthorityClass, identity.Tenant, identity.ClientID)
 	headerKey := SessionStorageKey(digest)
 	raw, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
 	if !found {
@@ -199,7 +199,8 @@ func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 	if fixture.machine.state.SessionCount != 0 ||
 		fixture.machine.state.SessionSlotCount != 0 ||
 		fixture.machine.state.SessionEpochHighWater != 2 ||
-		fixture.system.Collection.Len() != 1 {
+		fixture.machine.state.AuthorityBindingCount != 1 ||
+		fixture.system.Collection.Len() != 2 {
 		t.Fatalf("release did not reclaim bounded image: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
 	}
@@ -215,19 +216,24 @@ func TestSessionReleaseReclaimsCapacityAndFencesResurrection(t *testing.T) {
 		t.Fatalf("committed old retry refusal = %+v, %v", publication, err)
 	}
 	if fixture.machine.state.SessionCount != 0 ||
-		fixture.machine.state.SessionSlotCount != 0 || fixture.system.Collection.Len() != 1 {
+		fixture.machine.state.SessionSlotCount != 0 || fixture.system.Collection.Len() != 2 {
 		t.Fatalf("old retry recreated released image: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
 	}
 
-	if err := fixture.machine.AdmitCommand(secondBytes); err != nil {
-		t.Fatalf("reclaimed capacity admission: %v", err)
+	if err := fixture.machine.AdmitCommand(secondBytes); !errors.Is(err, ErrAdmissionBound) {
+		t.Fatalf("historical identity capacity admission: %v", err)
 	}
-	applySessionReleaseCommand(t, fixture.machine, 8, secondOpen)
+	firstOpen := sessionOpenFor(first)
+	if err := fixture.machine.AdmitCommand(encodeCommand(t, firstOpen)); err != nil {
+		t.Fatalf("same identity reopen admission: %v", err)
+	}
+	applySessionReleaseCommand(t, fixture.machine, 8, firstOpen)
 	if fixture.machine.state.SessionCount != 1 ||
 		fixture.machine.state.SessionSlotCount != 1 ||
-		fixture.machine.state.SessionEpochHighWater != 8 {
-		t.Fatalf("reclaimed capacity was not reusable: %+v", fixture.machine.state)
+		fixture.machine.state.SessionEpochHighWater != 8 ||
+		fixture.machine.state.AuthorityBindingCount != 1 {
+		t.Fatalf("same identity capacity was not reusable: %+v", fixture.machine.state)
 	}
 }
 
@@ -258,7 +264,7 @@ func TestSessionReleaseExactRetryIsIdempotent(t *testing.T) {
 	if fixture.machine.state.SessionCount != 0 ||
 		fixture.machine.state.SessionSlotCount != 0 ||
 		fixture.machine.state.SessionEpochHighWater != 2 ||
-		fixture.system.Collection.Len() != 1 ||
+		fixture.system.Collection.Len() != 2 ||
 		fixture.machine.Published().DataChainDigest != wantChain {
 		t.Fatalf("idempotent release changed durable postcondition: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
@@ -288,7 +294,7 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 			t.Fatalf("active release lookup = %v, want ErrSessionActive", err)
 		}
 		if fixture.machine.state.SessionCount != 1 ||
-			fixture.machine.state.SessionSlotCount != 2 || fixture.system.Collection.Len() != 4 {
+			fixture.machine.state.SessionSlotCount != 2 || fixture.system.Collection.Len() != 5 {
 			t.Fatalf("active session was deleted: state=%+v rows=%d",
 				fixture.machine.state, fixture.system.Collection.Len())
 		}
@@ -322,7 +328,7 @@ func TestSessionReleaseCannotDeleteActiveOrNewerSession(t *testing.T) {
 		if fixture.machine.state.SessionCount != 1 ||
 			fixture.machine.state.SessionSlotCount != 1 ||
 			fixture.machine.state.SessionEpochHighWater != 6 ||
-			fixture.system.Collection.Len() != 3 {
+			fixture.system.Collection.Len() != 4 {
 			t.Fatalf("older release deleted newer image: state=%+v rows=%d",
 				fixture.machine.state, fixture.system.Collection.Len())
 		}
@@ -339,7 +345,7 @@ func TestSessionReleaseConflictsPreserveRetiredImage(t *testing.T) {
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
 	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
 	assertSessionReleaseSlotsEpoch(t, fixture, retirement, 2)
-	digest := SessionKey(retirement.Tenant, retirement.ClientID)
+	digest := SessionKey(retirement.AuthorityClass, retirement.Tenant, retirement.ClientID)
 	headerKey := SessionStorageKey(digest)
 	wantHeader, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
 	if !found {
@@ -371,7 +377,7 @@ func TestSessionReleaseConflictsPreserveRetiredImage(t *testing.T) {
 	gotHeader, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
 	if !found || !bytes.Equal(gotHeader, wantHeader) ||
 		fixture.machine.state.SessionCount != 1 ||
-		fixture.machine.state.SessionSlotCount != 3 || fixture.system.Collection.Len() != 5 {
+		fixture.machine.state.SessionSlotCount != 3 || fixture.system.Collection.Len() != 6 {
 		t.Fatalf("release conflict changed retired image: state=%+v rows=%d",
 			fixture.machine.state, fixture.system.Collection.Len())
 	}
@@ -404,7 +410,7 @@ func TestSessionReleaseReopensWithOnlyEpochFence(t *testing.T) {
 	}
 	if reopened.state.SessionCount != 0 || reopened.state.SessionSlotCount != 0 ||
 		reopened.state.SessionEpochHighWater != 2 || reopened.Applied() != 5 ||
-		fixture.system.Collection.Len() != 1 {
+		fixture.system.Collection.Len() != 2 {
 		t.Fatalf("reopened release state = %+v rows=%d",
 			reopened.state, fixture.system.Collection.Len())
 	}
@@ -430,7 +436,7 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := SessionKey(retirement.Tenant, retirement.ClientID)
+	digest := SessionKey(retirement.AuthorityClass, retirement.Tenant, retirement.ClientID)
 	header, err := AppendSessionRecord(nil, SessionRecord{
 		Tenant: retirement.Tenant, ClientID: retirement.ClientID,
 		ClientEpoch: retirement.ClientEpoch, RetryHome: retirement.RetryHome,
@@ -450,17 +456,29 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 	state.LastEntryDigest = normalEntryDigest(normalMeta(state.Applied), retirementBytes)
 	state.SessionCount = 1
 	state.SessionSlotCount = MaxSessionRetryWindow
+	state.AuthorityBindingCount = 1
 	state.SessionEpochHighWater = retirement.ClientEpoch
 	stateEnvelope, err := AppendState(nil, state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	headerKey := SessionStorageKey(digest)
+	authorityDigest := AuthorityIdentityKey(retirement.Tenant, retirement.ClientID)
+	authorityKey := AuthorityBindingStorageKey(authorityDigest)
+	authorityRecord, err := AppendAuthorityBinding(
+		nil, retirement.Tenant, retirement.ClientID, retirement.AuthorityClass,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
 		if err := batch.Put(stateKey, stateEnvelope); err != nil {
 			return err
 		}
 		if err := batch.Put(headerKey[:], header); err != nil {
+			return err
+		}
+		if err := batch.Put(authorityKey[:], authorityRecord); err != nil {
 			return err
 		}
 		for slot := uint16(0); slot < MaxSessionRetryWindow; slot++ {
@@ -509,7 +527,7 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 		t.Fatalf("open full retry ring: %v", err)
 	}
 	if machine.state.SessionSlotCount != MaxSessionRetryWindow ||
-		fixture.system.Collection.Len() != uint64(MaxSessionRetryWindow)+2 {
+		fixture.system.Collection.Len() != uint64(MaxSessionRetryWindow)+3 {
 		t.Fatalf("full retry ring state=%+v rows=%d",
 			machine.state, fixture.system.Collection.Len())
 	}
@@ -525,7 +543,7 @@ func TestSessionReleaseFullRetryWindowIsBounded(t *testing.T) {
 		t.Fatalf("full-window release = %+v, %v", publication, err)
 	}
 	if machine.state.SessionCount != 0 || machine.state.SessionSlotCount != 0 ||
-		machine.state.SessionEpochHighWater != retirement.ClientEpoch || fixture.system.Collection.Len() != 1 {
+		machine.state.SessionEpochHighWater != retirement.ClientEpoch || fixture.system.Collection.Len() != 2 {
 		t.Fatalf("full-window release left rows: state=%+v rows=%d",
 			machine.state, fixture.system.Collection.Len())
 	}
@@ -574,7 +592,7 @@ func TestSessionReleaseCorruptOrMissingSlotDeletesNothing(t *testing.T) {
 			retirement := sessionRetirement(commandValue(fixture.binding, 3))
 			applySessionReleaseCommand(t, fixture.machine, 5, retirement)
 
-			digest := SessionKey(retirement.Tenant, retirement.ClientID)
+			digest := SessionKey(retirement.AuthorityClass, retirement.Tenant, retirement.ClientID)
 			targetKey, err := SessionSlotStorageKey(digest, 0)
 			if err != nil {
 				t.Fatal(err)

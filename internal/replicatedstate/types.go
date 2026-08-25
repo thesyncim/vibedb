@@ -33,13 +33,14 @@ const (
 	ResultSessionRevoked  uint32 = 10
 	ResultIndexConflict   uint32 = 11
 
-	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 368-byte
+	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 376-byte
 	// header, two 255-byte identities, checksum, and a deterministic protobuf
 	// with at most 64 ten-byte member IDs fit below 1.6 KiB; 2 KiB retains a
 	// format margin without inflating every hidden collection. Session metadata
 	// and completion slots are independently bounded by their compact codecs.
-	// The product of MaxRetainedSessions and RetryWindow is the hard upper bound
-	// on retry state; it does not grow with operation count.
+	// MaxRetainedSessions independently caps both live sessions and durable
+	// stable-identity authority bindings. The retry ring is additionally bounded
+	// by RetryWindow; neither structure grows with operation count.
 	MaxStateEnvelopeBytes           = 2 << 10
 	MaxRetainedSessions             = 1 << 20
 	MaxSessionRetryWindow           = 256

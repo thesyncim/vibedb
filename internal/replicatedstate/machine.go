@@ -84,6 +84,7 @@ type SessionCapacityState struct {
 	SessionCount          uint64
 	SessionSlotCount      uint64
 	SessionEpochHighWater uint64
+	AuthorityBindingCount uint64
 }
 
 type openInputs struct {
@@ -234,7 +235,7 @@ func OpenBundle(
 	if !ok || systemSnapshot == nil {
 		return nil, fmt.Errorf("%w: missing system snapshot", ErrInconsistentSnapshot)
 	}
-	state, present, sessionCount, slotCount, err := scanSessionSystemSnapshot(
+	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
 		systemSnapshot, options.MaxSessions, options.RetryWindow,
 	)
 	if err != nil {
@@ -306,6 +307,7 @@ func OpenBundle(
 	if !bindingAdvancesFrom(binding, state.Binding) || state.BootstrapDigest != bootstrapDigest ||
 		state.ApplyContractDigest != prepared.applyContract ||
 		state.SessionCount != sessionCount || state.SessionSlotCount != slotCount ||
+		state.AuthorityBindingCount != authorityCount ||
 		state.SessionCount > options.MaxSessions {
 		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
 	}
@@ -423,14 +425,16 @@ func prepareOpenInputs(
 	}
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
+		MaxAuthorityBindingBytes,
 	)
 	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	releaseSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
 	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes)
-	maxSystemDocuments := max(3, int(options.RetryWindow)+2)
+	maxSystemDocuments := max(4, int(options.RetryWindow)+2)
 	if system.Limits.MaxKeyBytes < sha256.Size+3 ||
 		system.Limits.MaxDocumentBytes < maxSystemDocument ||
 		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
@@ -604,6 +608,9 @@ type scannedSession struct {
 	retryWindow         uint16
 	status              SessionStatus
 	authorityClass      replication.CommandAuthorityClass
+	tenantOffset        uint32
+	tenantBytes         uint8
+	clientID            replication.ID128
 	seenSlots           uint16
 	currentSlots        uint16
 	latestSeen          bool
@@ -621,11 +628,14 @@ func scanSessionSystemSnapshot(
 	snapshot *durable.Snapshot,
 	maxSessions uint64,
 	retryWindow uint16,
-) (State, bool, uint64, uint64, error) {
+) (State, bool, uint64, uint64, uint64, error) {
 	var state State
 	var statePresent bool
-	var sessionCount, slotCount uint64
+	var sessionCount, slotCount, authorityCount uint64
 	var sessions map[[sha256.Size]byte]scannedSession
+	var authorities map[[sha256.Size]byte]replication.CommandAuthorityClass
+	var activeIdentities map[[sha256.Size]byte][sha256.Size]byte
+	var tenantArena []byte
 	var sessionEpochs []uint64
 	err := snapshot.RangeRaw(func(key, value []byte) error {
 		switch {
@@ -644,6 +654,14 @@ func scanSessionSystemSnapshot(
 			}
 			statePresent = true
 			sessions = make(map[[sha256.Size]byte]scannedSession, int(state.SessionCount))
+			authorities = make(map[[sha256.Size]byte]replication.CommandAuthorityClass,
+				int(state.AuthorityBindingCount))
+			activeIdentities = make(map[[sha256.Size]byte][sha256.Size]byte, int(state.SessionCount))
+			if state.SessionCount > math.MaxInt32/16 {
+				return fmt.Errorf("%w: tenant arena bound", ErrSessionCorrupt)
+			}
+			initialTenantBytes := state.SessionCount * 16
+			tenantArena = make([]byte, 0, int(initialTenantBytes))
 			sessionEpochs = make([]uint64, 0, int(state.SessionCount))
 			return nil
 
@@ -668,12 +686,22 @@ func scanSessionSystemSnapshot(
 			if sessionCount >= maxSessions {
 				return fmt.Errorf("%w: session count exceeds configured bound", ErrSessionCorrupt)
 			}
+			stableDigest := AuthorityIdentityKey(view.Tenant, view.ClientID)
+			if _, duplicate := activeIdentities[stableDigest]; duplicate ||
+				len(tenantArena) > math.MaxInt32-len(view.Tenant) {
+				return fmt.Errorf("%w: duplicate or excessive stable identity", ErrSessionCorrupt)
+			}
+			offset := len(tenantArena)
+			tenantArena = append(tenantArena, view.Tenant...)
 			sessions[view.Digest] = scannedSession{
 				epoch: view.ClientEpoch, authorityClass: view.AuthorityClass,
+				tenantOffset: uint32(offset), tenantBytes: uint8(len(view.Tenant)),
+				clientID:     view.ClientID,
 				highSequence: view.HighSequence, leaseDeadline: view.LeaseDeadlineUnixNano,
 				physicalSlots: view.PhysicalSlotCount,
 				retryWindow:   view.RetryWindow, status: view.Status,
 			}
+			activeIdentities[stableDigest] = view.Digest
 			sessionEpochs = append(sessionEpochs, view.ClientEpoch)
 			sessionCount++
 			return nil
@@ -732,21 +760,46 @@ func scanSessionSystemSnapshot(
 			slotCount++
 			return nil
 
+		case len(key) == 1+sha256.Size && key[0] == 3:
+			if !statePresent {
+				return fmt.Errorf("%w: authority binding before state", ErrSessionCorrupt)
+			}
+			view, err := OpenAuthorityBinding(value)
+			want := AuthorityBindingStorageKey(view.Digest)
+			if err != nil || !bytes.Equal(key, want[:]) {
+				return errors.Join(err, fmt.Errorf("%w: authority binding key", ErrSessionCorrupt))
+			}
+			if _, duplicate := authorities[view.Digest]; duplicate || authorityCount >= maxSessions {
+				return fmt.Errorf("%w: duplicate or excessive authority binding", ErrSessionCorrupt)
+			}
+			if sessionDigest, active := activeIdentities[view.Digest]; active {
+				summary := sessions[sessionDigest]
+				start, end := int(summary.tenantOffset), int(summary.tenantOffset)+int(summary.tenantBytes)
+				if end > len(tenantArena) || summary.clientID != view.ClientID ||
+					!bytes.Equal(tenantArena[start:end], view.Tenant) {
+					return fmt.Errorf("%w: authority identity collision", ErrSessionCorrupt)
+				}
+			}
+			authorities[view.Digest] = view.AuthorityClass
+			authorityCount++
+			return nil
+
 		default:
 			return fmt.Errorf("%w: unknown system key", ErrSessionCorrupt)
 		}
 	})
 	if err != nil {
-		return State{}, false, 0, 0, err
+		return State{}, false, 0, 0, 0, err
 	}
 	if !statePresent {
-		if sessionCount != 0 || slotCount != 0 {
-			return State{}, false, 0, 0, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
+		if sessionCount != 0 || slotCount != 0 || authorityCount != 0 {
+			return State{}, false, 0, 0, 0, fmt.Errorf("%w: rows without state", ErrStateCorrupt)
 		}
-		return State{}, false, 0, 0, nil
+		return State{}, false, 0, 0, 0, nil
 	}
-	if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount {
-		return State{}, false, 0, 0, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
+	if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount ||
+		authorityCount != state.AuthorityBindingCount {
+		return State{}, false, 0, 0, 0, fmt.Errorf("%w: session row counts", ErrStateCorrupt)
 	}
 	// Session tokens are Raft apply indices and therefore shard-wide unique. A
 	// compact sorted vector costs eight bytes per active session—materially less
@@ -755,7 +808,15 @@ func scanSessionSystemSnapshot(
 	slices.Sort(sessionEpochs)
 	for i := 1; i < len(sessionEpochs); i++ {
 		if sessionEpochs[i-1] == sessionEpochs[i] {
-			return State{}, false, 0, 0, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, fmt.Errorf("%w: duplicate session epoch", ErrSessionCorrupt)
+		}
+	}
+	for authorityDigest, sessionDigest := range activeIdentities {
+		summary := sessions[sessionDigest]
+		if class, ok := authorities[authorityDigest]; !ok || class != summary.authorityClass {
+			return State{}, false, 0, 0, 0,
+				fmt.Errorf("%w: session authority binding digest=%x class=%d",
+					ErrSessionCorrupt, authorityDigest, summary.authorityClass)
 		}
 	}
 	for _, summary := range sessions {
@@ -775,10 +836,10 @@ func scanSessionSystemSnapshot(
 			summary.status == SessionActive && isSessionTerminalResult(summary.latestResult) ||
 			summary.latestResult == ResultSessionRevoked && summary.leaseDeadline != 0 ||
 			summary.latestResult == ResultSessionRetired && summary.leaseDeadline == 0 {
-			return State{}, false, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
+			return State{}, false, 0, 0, 0, fmt.Errorf("%w: incomplete session ring", ErrSessionCorrupt)
 		}
 	}
-	return state, true, sessionCount, slotCount, nil
+	return state, true, sessionCount, slotCount, authorityCount, nil
 }
 
 func validateStoredSessionSlot(state State, slot SessionSlotView) error {
@@ -960,6 +1021,7 @@ func (m *Machine) SessionCapacityState() (SessionCapacityState, error) {
 		Initialized: m.initialized, Applied: m.state.Applied,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 		SessionEpochHighWater: m.state.SessionEpochHighWater,
+		AuthorityBindingCount: m.state.AuthorityBindingCount,
 	}, nil
 }
 

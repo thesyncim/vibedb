@@ -227,7 +227,7 @@ func testTerminalSessionCommandRetriesWithoutStrandingEpoch(
 	}
 
 	identity := commandValue(fixture.binding, 1)
-	digest := SessionKey(identity.Tenant, identity.ClientID)
+	digest := SessionKey(identity.AuthorityClass, identity.Tenant, identity.ClientID)
 	sessionKey := SessionStorageKey(digest)
 	high := uint64(math.MaxUint64 - 1)
 	window := uint64(fixture.machine.options.RetryWindow)

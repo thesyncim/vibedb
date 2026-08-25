@@ -12,15 +12,16 @@ import (
 )
 
 var (
-	codecBytesSink   []byte
-	codecDigestSink  [32]byte
-	codecStateSink   State
-	codecSessionSink SessionView
-	codecSlotSink    SessionSlotView
-	codecErrSink     error
-	artifactSink     SnapshotArtifactManifest
-	artifactByteSink int
-	codecBoolSink    bool
+	codecBytesSink     []byte
+	codecDigestSink    [32]byte
+	codecStateSink     State
+	codecSessionSink   SessionView
+	codecSlotSink      SessionSlotView
+	codecAuthoritySink AuthorityBindingView
+	codecErrSink       error
+	artifactSink       SnapshotArtifactManifest
+	artifactByteSink   int
+	codecBoolSink      bool
 )
 
 func TestGlobalIndexLocatorComparisonAllocatesZero(t *testing.T) {
@@ -77,9 +78,30 @@ func TestSessionCodecAllocationBounds(t *testing.T) {
 	recordScratch := make([]byte, 0, len(encodedRecord))
 	slotScratch := make([]byte, 0, len(encodedSlot))
 	completionScratch := make([]byte, 0, len(encodedCompletion))
+	authorityRecord, err := AppendAuthorityBinding(
+		nil, record.Tenant, record.ClientID, record.AuthorityClass,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityScratch := make([]byte, 0, len(authorityRecord))
 
 	if allocations := testing.AllocsPerRun(1000, func() {
-		codecDigestSink = SessionKey(record.Tenant, record.ClientID)
+		codecBytesSink, codecErrSink = AppendAuthorityBinding(
+			authorityScratch[:0], record.Tenant, record.ClientID, record.AuthorityClass,
+		)
+	}); codecErrSink != nil || allocations != 0 {
+		t.Fatalf("pre-sized AppendAuthorityBinding allocations = %v, want 0; err=%v",
+			allocations, codecErrSink)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		codecAuthoritySink, codecErrSink = OpenAuthorityBinding(authorityRecord)
+	}); codecErrSink != nil || allocations != 0 {
+		t.Fatalf("OpenAuthorityBinding allocations = %v, want 0; err=%v",
+			allocations, codecErrSink)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		codecDigestSink = SessionKey(record.AuthorityClass, record.Tenant, record.ClientID)
 	}); allocations != 0 {
 		t.Fatalf("SessionKey allocations = %v, want 0", allocations)
 	}
@@ -130,7 +152,7 @@ func BenchmarkSessionKey(b *testing.B) {
 	record := sessionCodecRecord()
 	b.ReportAllocs()
 	for b.Loop() {
-		codecDigestSink = SessionKey(record.Tenant, record.ClientID)
+		codecDigestSink = SessionKey(record.AuthorityClass, record.Tenant, record.ClientID)
 	}
 }
 

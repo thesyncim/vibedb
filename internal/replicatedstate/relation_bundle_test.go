@@ -103,7 +103,7 @@ func newRelationBundleFixtureWithCollectionOptions(
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
 			MaxDocuments: base.Limits.MaxDistinctMutations +
-				global.Limits.MaxDistinctMutations + 3,
+				global.Limits.MaxDistinctMutations + 4,
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128, RetryWindow: 8, CheckpointGroup: group,
@@ -881,7 +881,7 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
 			MaxDocuments: base.Limits.MaxDistinctMutations +
-				global.Limits.MaxDistinctMutations + 3,
+				global.Limits.MaxDistinctMutations + 4,
 			MaxBytes: int64(systemBatchBytes + base.Limits.MaxBatchBytes +
 				global.Limits.MaxBatchBytes),
 		},
@@ -898,7 +898,7 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 	}{
 		{"collections", func(o *Options) { o.TxnLimits.MaxCollections-- }},
 		{"mutations", func(o *Options) {
-			o.TxnLimits.MaxDocuments = base.Limits.MaxDistinctMutations + 3
+			o.TxnLimits.MaxDocuments = base.Limits.MaxDistinctMutations + 4
 		}},
 		{"bytes", func(o *Options) {
 			o.TxnLimits.MaxBytes = int64(systemBatchBytes + base.Limits.MaxBatchBytes)
@@ -1196,7 +1196,7 @@ func assertRecoveredRelationBundleCut(
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
 			MaxDocuments: base.Limits.MaxDistinctMutations +
-				global.Limits.MaxDistinctMutations + 3,
+				global.Limits.MaxDistinctMutations + 4,
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128, RetryWindow: 8, CheckpointGroup: group,
@@ -1348,7 +1348,7 @@ func BenchmarkMachineAdmitRelationBundleScaling(b *testing.B) {
 				binding, testBootstrap(), system, relations, log, Options{
 					TxnLimits: durable.TxnLimits{
 						MaxCollections: relationCount + 1,
-						MaxDocuments:   replication.MaxMutations + 3,
+						MaxDocuments:   replication.MaxMutations + 4,
 						MaxBytes:       32 << 20,
 					},
 					MaxSessions: 128, RetryWindow: 8,

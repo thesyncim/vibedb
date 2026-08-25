@@ -278,8 +278,8 @@ func runApplyComplexityQualification(t *testing.T, rows int) applyComplexityResu
 	if userBefore.rows != uint64(rows) {
 		t.Fatalf("rows before ApplyNormal = %d, want %d", userBefore.rows, rows)
 	}
-	if systemBefore.rows != 3 {
-		t.Fatalf("system rows before ApplyNormal = %d, want 3", systemBefore.rows)
+	if systemBefore.rows != 4 {
+		t.Fatalf("system rows before ApplyNormal = %d, want 4", systemBefore.rows)
 	}
 	if _, err := os.Stat(fixture.txnLogPath); !os.IsNotExist(err) {
 		t.Fatalf("transaction log before two-collection ApplyNormal = %v, want absent", err)
@@ -336,8 +336,8 @@ func runApplyComplexityQualification(t *testing.T, rows int) applyComplexityResu
 	if userAfter.rows != uint64(rows) {
 		t.Fatalf("rows after ApplyNormal = %d, want %d", userAfter.rows, rows)
 	}
-	if systemAfter.rows != 4 {
-		t.Fatalf("system rows after ApplyNormal = %d, want 4", systemAfter.rows)
+	if systemAfter.rows != 5 {
+		t.Fatalf("system rows after ApplyNormal = %d, want 5", systemAfter.rows)
 	}
 	if systemAfter.published <= systemBefore.published ||
 		userAfter.published <= userBefore.published {

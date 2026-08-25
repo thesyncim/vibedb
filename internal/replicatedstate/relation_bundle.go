@@ -150,11 +150,12 @@ func validateBundleTransactionProfile(
 	relationBytes = min(relationBytes, int64(replication.MaxCommandBytes))
 	relationDocuments = min(relationDocuments, replication.MaxMutations)
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	requiredDocuments := max(int(options.RetryWindow)+2, relationDocuments+3)
+	requiredDocuments := max(int(options.RetryWindow)+2, relationDocuments+4)
 	requiredBytes := int64(releaseSystemBytes)
 	if int64(hotSystemBytes) > math.MaxInt64-relationBytes {
 		return ErrInvalidOptions

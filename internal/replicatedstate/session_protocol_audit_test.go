@@ -102,7 +102,7 @@ func TestSessionOpenTokenCorruptionFailsPointPathAndReopen(t *testing.T) {
 			if _, err := fixture.machine.ApplyNormal(normalMeta(3), nil); err != nil {
 				t.Fatal(err)
 			}
-			digest := SessionKey(prototype.Tenant, prototype.ClientID)
+			digest := SessionKey(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID)
 			rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
 				binary.LittleEndian.PutUint64(raw[68:76], 3)
 			})
@@ -136,7 +136,7 @@ func TestReopenRejectsDuplicateIssuedSessionEpoch(t *testing.T) {
 	second.Fingerprint = replication.Digest{0x55}
 	applySessionOpen(t, fixture.machine, 3, second)
 
-	digest := SessionKey(second.Tenant, second.ClientID)
+	digest := SessionKey(second.AuthorityClass, second.Tenant, second.ClientID)
 	headerKey := SessionStorageKey(digest)
 	header, found, err := fixture.system.Collection.AppendRaw(nil, headerKey[:])
 	if err != nil || !found {

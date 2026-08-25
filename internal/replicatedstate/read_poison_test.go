@@ -15,7 +15,7 @@ func corruptRetainedCompletion(t testing.TB, fixture machineFixture, command []b
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := SessionKey(view.Tenant, view.ClientID)
+	digest := SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)
 	key, err := SessionSlotStorageKey(
 		digest, uint16((view.ClientSequence-1)%uint64(fixture.machine.options.RetryWindow)),
 	)

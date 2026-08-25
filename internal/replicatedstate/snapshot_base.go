@@ -233,11 +233,12 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	if !ok || system == nil {
 		return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
 	}
-	state, present, sessions, slots, err := scanSessionSystemSnapshot(
+	state, present, sessions, slots, authorities, err := scanSessionSystemSnapshot(
 		system, m.options.MaxSessions, m.options.RetryWindow,
 	)
 	if err != nil || !present || sessions != state.SessionCount ||
-		slots != state.SessionSlotCount || !equalState(state, m.state) {
+		slots != state.SessionSlotCount || authorities != state.AuthorityBindingCount ||
+		!equalState(state, m.state) {
 		return nil, SnapshotArtifactManifest{}, m.fail(errors.Join(ErrInconsistentSnapshot, err))
 	}
 	manifest := SnapshotArtifactManifest{
@@ -482,7 +483,8 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
-		manifest.SystemRows != manifest.State.SessionCount+manifest.State.SessionSlotCount+1 ||
+		manifest.SystemRows != manifest.State.SessionCount+manifest.State.SessionSlotCount+
+			manifest.State.AuthorityBindingCount+1 ||
 		len(manifest.UserCollection) == 0 ||
 		len(manifest.UserCollection) > replication.MaxCollectionBytes ||
 		!utf8.Valid(manifest.UserCollection) ||

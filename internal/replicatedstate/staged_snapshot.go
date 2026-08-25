@@ -142,11 +142,11 @@ func PrepareStagedSnapshot(
 			fmt.Errorf("%w: %v", ErrStagedSnapshot, err), cutSnapshot.Close(),
 		)
 	}
-	current, present, sessions, slots, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, options.MaxSessions, options.RetryWindow,
 	)
 	closeErr := cutSnapshot.Close()
-	if scanErr != nil || closeErr != nil || sessions != 0 || slots != 0 ||
+	if scanErr != nil || closeErr != nil || sessions != 0 || slots != 0 || authorities != 0 ||
 		present && !equalState(current, state) {
 		return nil, errors.Join(ErrStagedSnapshot, scanErr, closeErr)
 	}
@@ -301,11 +301,12 @@ func (p *StagedSnapshotPreparation) Finish(
 	if err != nil {
 		return nil, nil, SnapshotArtifactManifest{}, err
 	}
-	current, present, sessions, slots, scanErr := scanSessionSystemSnapshot(
+	current, present, sessions, slots, authorities, scanErr := scanSessionSystemSnapshot(
 		systemSnapshot, p.prepared.options.MaxSessions, p.prepared.options.RetryWindow,
 	)
 	closeErr := systemSnapshot.Close()
 	if scanErr != nil || closeErr != nil || !present || sessions != 0 || slots != 0 ||
+		authorities != 0 ||
 		!equalState(current, p.state) || p.prepared.user.Collection.Len() != p.userRows {
 		return nil, nil, SnapshotArtifactManifest{}, errors.Join(
 			ErrStagedSnapshot, scanErr, closeErr,

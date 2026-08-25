@@ -62,7 +62,7 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
 	// The artifact authenticates the apply contract; adding canonical
 	// conditional relation mutations intentionally changes this derived vector.
-	const golden = "d3d03ad74d762a1da9965abe94a06f3b2ef79e785fbea7c0d9b622fd43480069"
+	const golden = "d283e6033712a7807592af7b772699505f04993c902d8851ed08ab250e8ced64"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -170,7 +170,8 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 		}
 	}
 	if systemRows != verified.SystemRows || userRows != verified.UserRows ||
-		systemRows != verified.State.SessionCount+verified.State.SessionSlotCount+1 ||
+		systemRows != verified.State.SessionCount+verified.State.SessionSlotCount+
+			verified.State.AuthorityBindingCount+1 ||
 		userRows != 7 {
 		t.Fatalf("row totals system=%d user=%d manifest=%+v", systemRows, userRows, verified)
 	}

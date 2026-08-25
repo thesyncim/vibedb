@@ -14,7 +14,7 @@ import (
 
 const (
 	stateCodecFormat  = uint16(1)
-	stateHeaderBytes  = 368
+	stateHeaderBytes  = 376
 	recordChecksumLen = sha256.Size
 )
 
@@ -63,6 +63,9 @@ type State struct {
 	// SessionOpen. It is the durable shard-wide anti-resurrection fence retained
 	// after an individual session header and retry ring are reclaimed.
 	SessionEpochHighWater uint64
+	// AuthorityBindingCount is the bounded number of class-independent stable
+	// identities whose authority survives session release.
+	AuthorityBindingCount uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -123,6 +126,7 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint32(frame[348:352], uint32(len(conf)))
 	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
 	binary.LittleEndian.PutUint64(frame[360:368], state.SessionEpochHighWater)
+	binary.LittleEndian.PutUint64(frame[368:376], state.AuthorityBindingCount)
 	cursor := stateHeaderBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
@@ -184,6 +188,7 @@ func OpenState(src []byte) (State, error) {
 	copy(state.SnapshotBaseDigest[:], src[312:344])
 	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
 	state.SessionEpochHighWater = binary.LittleEndian.Uint64(src[360:368])
+	state.AuthorityBindingCount = binary.LittleEndian.Uint64(src[368:376])
 	cursor := stateHeaderBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
@@ -215,7 +220,10 @@ func validateState(state State) error {
 		state.ReplicaSetVersion == math.MaxUint64 || state.SessionCount > state.Applied-1 ||
 		state.SessionSlotCount > state.Applied-1 ||
 		state.SessionEpochHighWater > state.Applied ||
+		state.AuthorityBindingCount > state.Applied-1 ||
 		state.SessionCount > MaxRetainedSessions ||
+		state.AuthorityBindingCount > MaxRetainedSessions ||
+		state.SessionCount > state.AuthorityBindingCount ||
 		state.SessionSlotCount > state.SessionCount*MaxSessionRetryWindow ||
 		state.DataChainDigest == ([32]byte{}) || state.ApplyContractDigest == ([32]byte{}) ||
 		state.SnapshotBaseDigest == ([32]byte{}) {
@@ -232,6 +240,7 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied != 1 ||
 			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.SessionCount != 0 ||
 			state.SessionSlotCount != 0 || state.SessionEpochHighWater != 0 ||
+			state.AuthorityBindingCount != 0 ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -261,6 +270,7 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied <= 1 ||
 			state.ReplicaSetVersion >= state.Applied || state.SessionCount != 0 ||
 			state.SessionSlotCount != 0 || state.SessionEpochHighWater != state.Applied ||
+			state.AuthorityBindingCount != 0 ||
 			state.LastEntryDigest == ([sha256.Size]byte{}) {
 			return fmt.Errorf("%w: imported snapshot state", ErrStateCorrupt)
 		}
@@ -284,8 +294,9 @@ func verifyRecord(frame, domain []byte) bool {
 	h := sha256.New()
 	_, _ = h.Write(domain)
 	_, _ = h.Write(frame[:len(frame)-recordChecksumLen])
-	want := h.Sum(nil)
-	return bytes.Equal(want, frame[len(frame)-recordChecksumLen:])
+	var want [sha256.Size]byte
+	_ = h.Sum(want[:0])
+	return bytes.Equal(want[:], frame[len(frame)-recordChecksumLen:])
 }
 
 func allZero(src []byte) bool {
@@ -327,6 +338,7 @@ func equalState(left, right State) bool {
 		left.SessionCount == right.SessionCount &&
 		left.SessionSlotCount == right.SessionSlotCount &&
 		left.SessionEpochHighWater == right.SessionEpochHighWater &&
+		left.AuthorityBindingCount == right.AuthorityBindingCount &&
 		proto.Equal(left.ConfState, right.ConfState)
 }
 

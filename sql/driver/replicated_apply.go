@@ -322,8 +322,10 @@ func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits 
 		replicatedstate.MaxStateEnvelopeBytes,
 		replicatedstate.MaxSessionRecordBytes,
 		replicatedstate.MaxSessionSlotRecordBytes,
+		replicatedstate.MaxAuthorityBindingBytes,
 	)
 	hotApplyBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
+		sessionKeyBytes + replicatedstate.MaxAuthorityBindingBytes +
 		sessionKeyBytes + replicatedstate.MaxSessionRecordBytes +
 		slotKeyBytes + replicatedstate.MaxSessionSlotRecordBytes
 	releaseBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
@@ -332,11 +334,12 @@ func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits 
 	// document plus a maximum-sized key for every possible batch member. The
 	// exact release image can be smaller than that structural floor at wider
 	// retry windows, so bind both independently.
-	storageMinimumBytes := maxValueBytes + (int(retryWindow)+2)*slotKeyBytes
+	maxDocuments := max(4, int(retryWindow)+2)
+	storageMinimumBytes := maxValueBytes + maxDocuments*slotKeyBytes
 	return ReplicatedShardStoreLimits{
 		MaxKeyBytes:       slotKeyBytes,
 		MaxDocumentBytes:  maxValueBytes,
-		MaxBatchDocuments: int(retryWindow) + 2,
+		MaxBatchDocuments: maxDocuments,
 		MaxBatchBytes:     max(hotApplyBytes, releaseBytes, storageMinimumBytes),
 	}
 }
