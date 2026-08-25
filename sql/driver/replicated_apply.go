@@ -1833,7 +1833,6 @@ func validateReplicatedApplyOptions(
 			ErrReplicatedApplyMismatch,
 		)
 	}
-	systemLimits := replicatedApplySystemLimits(options.RetryWindow)
 	relationCount := int(identity.RelationCount)
 	relationDocuments := 0
 	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
@@ -1842,10 +1841,12 @@ func validateReplicatedApplyOptions(
 			replication.MaxMutations, relationDocuments+limits.MaxBatchDocuments,
 		)
 	}
-	maxTxnDocuments := max(
-		relationDocuments+4,
-		systemLimits.MaxBatchDocuments+1,
+	maxTxnDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		relationDocuments, options.RetryWindow, true,
 	)
+	if err != nil {
+		return fmt.Errorf("%w: transaction document profile", ErrReplicatedApplyMismatch)
+	}
 	if options.MaxSessions == 0 ||
 		options.MaxSessions > replicatedstate.MaxRetainedSessions ||
 		options.RetryWindow == 0 ||

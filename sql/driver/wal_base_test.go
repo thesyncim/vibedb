@@ -540,7 +540,8 @@ func TestReplicatedApplyCaptureWALBaseMaxLegalRowHasNoPayloadGrowth(t *testing.T
 	}
 
 	required := requiredWALBaseWorkspaceBytes(t, claim, base)
-	if len(key)+len(document)+8 != replicatedstate.MaxSnapshotArtifactChunkBytes ||
+	if len(key) != replication.MaxMutationKeyBytes ||
+		len(document) != replication.MaxMutationValueBytes ||
 		required != replicatedstate.DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf(
 			"exact maximum-row workspace = %d, key/document = %d/%d",

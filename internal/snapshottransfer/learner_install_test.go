@@ -152,10 +152,13 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 
 	_, source, sourceIdentity := prepare(t, "source", binding)
 	options.TxnLimits.MaxCollections = int(sourceIdentity.RelationCount) + 2
-	options.TxnLimits.MaxDocuments = max(
-		sourceIdentity.UserLimits.MaxBatchDocuments+4,
-		int(options.RetryWindow)+3,
+	requiredDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		sourceIdentity.UserLimits.MaxBatchDocuments, options.RetryWindow, true,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.TxnLimits.MaxDocuments = requiredDocuments
 	floor, err := sqldriver.ReplicatedApplyTransactionByteFloor(
 		sourceIdentity, options.RetryWindow,
 	)

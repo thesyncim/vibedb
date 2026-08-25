@@ -34,6 +34,43 @@ type relationBundleFixture struct {
 	options Options
 }
 
+func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		relations int
+		retry     uint16
+		capture   bool
+		want      int
+	}{
+		{"hot_without_capture", 64, 8, false, 68},
+		{"hot_with_capture", 64, 8, true, 69},
+		{"release_without_capture", 0, 8, false, 10},
+		{"release_with_capture", 0, 8, true, 11},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := RequiredBundleTransactionDocuments(
+				test.relations, test.retry, test.capture,
+			)
+			if err != nil || got != test.want {
+				t.Fatalf("documents=%d want=%d err=%v", got, test.want, err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		relations int
+		retry     uint16
+	}{
+		{-1, 1}, {replication.MaxMutations + 1, 1}, {0, 0},
+		{0, MaxSessionRetryWindow + 1},
+	} {
+		if _, err := RequiredBundleTransactionDocuments(
+			test.relations, test.retry, true,
+		); !errors.Is(err, ErrInvalidOptions) {
+			t.Fatalf("invalid dimensions %+v err=%v", test, err)
+		}
+	}
+}
+
 func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixture {
 	return newRelationBundleFixtureWithCollectionOptions(
 		t, checkpoint, false, durable.Options{}, durable.Options{},

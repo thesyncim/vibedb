@@ -155,7 +155,12 @@ func validateBundleTransactionProfile(
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	requiredDocuments := max(int(options.RetryWindow)+2, relationDocuments+4)
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		relationDocuments, options.RetryWindow, reservedCapture,
+	)
+	if err != nil {
+		return err
+	}
 	requiredBytes := int64(releaseSystemBytes)
 	if int64(hotSystemBytes) > math.MaxInt64-relationBytes {
 		return ErrInvalidOptions
@@ -168,13 +173,33 @@ func validateBundleTransactionProfile(
 			return ErrInvalidOptions
 		}
 		requiredBytes += int64(capture.MaxBatchBytes())
-		requiredDocuments++
 	}
 	if options.TxnLimits.MaxDocuments < requiredDocuments ||
 		options.TxnLimits.MaxBytes < requiredBytes {
 		return ErrInvalidOptions
 	}
 	return nil
+}
+
+// RequiredBundleTransactionDocuments returns the exact mutation-slot ceiling
+// for one replicated apply transaction. A hot command may publish four system
+// records (state, authority, session and slot) alongside all relation changes;
+// a reserved transition capture contributes one additional private row. A
+// release instead deletes one session header plus every retry slot.
+func RequiredBundleTransactionDocuments(
+	relationDocuments int,
+	retryWindow uint16,
+	reservedCapture bool,
+) (int, error) {
+	if relationDocuments < 0 || relationDocuments > replication.MaxMutations ||
+		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
+		return 0, ErrInvalidOptions
+	}
+	required := max(int(retryWindow)+2, relationDocuments+4)
+	if reservedCapture {
+		required++
+	}
+	return required, nil
 }
 
 func validateRelationTarget(spec RelationCollection) error {

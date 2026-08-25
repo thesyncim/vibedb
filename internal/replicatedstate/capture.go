@@ -213,11 +213,11 @@ func (m *Machine) validateTransitionCaptureTarget(
 		target.Collection.MaxBatchDocuments() < 1 {
 		return ErrTransitionCapture
 	}
-	if m.options.TxnLimits.MaxCollections < 3 ||
-		m.options.TxnLimits.MaxDocuments < max(
-			m.user.Limits.MaxDistinctMutations+4,
-			int(m.options.RetryWindow)+3,
-		) {
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		m.user.Limits.MaxDistinctMutations, m.options.RetryWindow, true,
+	)
+	if err != nil || m.options.TxnLimits.MaxCollections < 3 ||
+		m.options.TxnLimits.MaxDocuments < requiredDocuments {
 		return fmt.Errorf("%w: transaction dimensions", ErrTransitionCapture)
 	}
 	maxBefore := uint64(m.user.Limits.MaxDistinctMutations) *
@@ -243,7 +243,8 @@ func (m *Machine) validateTransitionCaptureTarget(
 		maxRecord > target.Collection.MaxBatchBytes()-8 {
 		return fmt.Errorf("%w: record capacity", ErrTransitionCapture)
 	}
-	baseBytes, ok := checkedTxnBytes(m.user.Limits.MaxBatchBytes,
+	baseBytes, ok := checkedTxnBytes(
+		min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes),
 		maxSystemTransitionBytes(m.system.Limits))
 	if !ok || int64(maxRecord) > math.MaxInt64-baseBytes-8 ||
 		m.options.TxnLimits.MaxBytes < baseBytes+int64(maxRecord)+8 {
