@@ -159,7 +159,7 @@ func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := fileEnd + normalized.maxTransactionBytes; got != want {
+	if want := fileEnd + normalized.maxTransactionPhysicalBytes; got != want {
 		t.Fatalf("reservation end = %d, want exact extent budget %d", got, want)
 	}
 	oldFixedFrameEnd := fileEnd + uint64(normalized.maxTransactionPages)*
@@ -169,12 +169,12 @@ func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
 	}
 	t.Logf(
 		"checkpoint reservation: exact=%d bytes fixed-frame=%d bytes reduction=%.2fx",
-		normalized.maxTransactionBytes,
+		normalized.maxTransactionPhysicalBytes,
 		oldFixedFrameEnd-fileEnd,
-		float64(oldFixedFrameEnd-fileEnd)/float64(normalized.maxTransactionBytes),
+		float64(oldFixedFrameEnd-fileEnd)/float64(normalized.maxTransactionPhysicalBytes),
 	)
 	if _, err := collection.primaryVolatileReservationEnd(
-		math.MaxUint64 - normalized.maxTransactionBytes + 1,
+		math.MaxUint64 - normalized.maxTransactionPhysicalBytes + 1,
 	); !errors.Is(err, storeio.ErrInvalidWrite) {
 		t.Fatalf("overflow reservation = %v, want ErrInvalidWrite", err)
 	}
@@ -185,6 +185,44 @@ func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("reservation allocations = %.1f, want zero", allocs)
+	}
+}
+
+func TestPhysicalExtentReservationDoesNotInflateResidentAdmission(t *testing.T) {
+	options := testFileStoreOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Converge the adaptive overlay to the smallest resident budget it admits.
+	// The persisted namespace must remain wider because its routing metadata
+	// uses 8/64 KiB extent classes, but those padding bytes are not cache frames.
+	for {
+		options.ResidentBytes = int64(normalized.maxTransactionBytes)
+		next, normalizeErr := options.normalized()
+		if normalizeErr != nil {
+			t.Fatalf("resident dirty bound rejected by physical reservation: %v", normalizeErr)
+		}
+		if next.maxTransactionBytes == normalized.maxTransactionBytes {
+			normalized = next
+			break
+		}
+		normalized = next
+	}
+	if normalized.maxTransactionPhysicalBytes <= normalized.maxTransactionBytes {
+		t.Fatalf(
+			"physical reservation = %d, resident dirty bound = %d; fixture no longer exercises split accounting",
+			normalized.maxTransactionPhysicalBytes, normalized.maxTransactionBytes,
+		)
+	}
+	collection := Collection{options: normalized}
+	const fileEnd = uint64(16 << 20)
+	end, err := collection.primaryVolatileReservationEnd(fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fileEnd + normalized.maxTransactionPhysicalBytes; end != want {
+		t.Fatalf("physical reservation end = %d, want %d", end, want)
 	}
 }
 

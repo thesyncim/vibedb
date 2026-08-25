@@ -2989,14 +2989,15 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 // fileEnd. The namespace remains the ordinary persisted file-offset namespace:
 // identities survive journal replay and require no process-local discriminator.
 //
-// maxTransactionBytes is the normalized sum of the transaction's actual extent
-// classes: variable leaf/overflow/index extents at their certified maxima and
-// fixed metadata at PageSize. A tail allocation advances by exactly its extent
-// length and reusable allocations do not advance it, so this is a strict append
-// bound. The publication check in materializePrimaryParentsOnceLocked keeps that
-// derivation fail-closed as the transaction grammar evolves.
+// maxTransactionPhysicalBytes is the normalized sum of the transaction's
+// actual persisted extent classes: variable leaf/overflow/index extents at
+// their certified maxima plus the routing metadata's exact physical widths. A
+// tail allocation advances by exactly its extent length and reusable allocations
+// do not advance it, so this is a strict append bound. The publication check in
+// materializePrimaryParentsOnceLocked keeps that derivation fail-closed as the
+// transaction grammar evolves.
 func (c *Collection) primaryVolatileReservationEnd(fileEnd uint64) (uint64, error) {
-	reserve := c.options.maxTransactionBytes
+	reserve := c.options.maxTransactionPhysicalBytes
 	if reserve == 0 || fileEnd > math.MaxUint64-reserve {
 		return 0, storeio.ErrInvalidWrite
 	}

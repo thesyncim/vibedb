@@ -237,7 +237,7 @@ func TestFilePrimaryCollisionGapIsCompactAndSnapshotSafe(t *testing.T) {
 	ref := seedBufferedInlinePrimaryLeaf(
 		t, collection, []byte(keys[0]), updated,
 	)
-	wantOffset := beforeState.fileEnd + collection.options.maxTransactionBytes
+	wantOffset := beforeState.fileEnd + collection.options.maxTransactionPhysicalBytes
 	if ref.Offset != wantOffset {
 		t.Fatalf("first volatile offset = %d, want compact boundary %d", ref.Offset, wantOffset)
 	}
@@ -368,8 +368,8 @@ func TestFilePrimaryBatchCheckpointFitsPhysicalExtentReservation(t *testing.T) {
 		t.Fatal("invalid durable FileEnd after batch checkpoint")
 	}
 	appended := afterDurable.fileEnd - base.fileEnd
-	if appended > collection.options.maxTransactionBytes {
-		t.Fatalf("no-reuse batch appended %d bytes, reservation %d", appended, collection.options.maxTransactionBytes)
+	if appended > collection.options.maxTransactionPhysicalBytes {
+		t.Fatalf("no-reuse batch appended %d bytes, reservation %d", appended, collection.options.maxTransactionPhysicalBytes)
 	}
 	for _, row := range selected {
 		got, found, readErr := snapshot.AppendRaw(nil, row.key)

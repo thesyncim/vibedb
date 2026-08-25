@@ -528,8 +528,11 @@ func fileStoreTransactionExtentBytes(
 
 type normalizedFileStoreOptions struct {
 	Options
+	// maxTransactionBytes bounds resident dirty frame bytes. Persisted extent
+	// placement has wider metadata classes and is bounded independently below.
 	maxTransactionPages              int
 	maxTransactionBytes              uint64
+	maxTransactionPhysicalBytes      uint64
 	singleDocumentTransactionPages   int
 	singleDocumentTransactionBytes   uint64
 	singleDocumentFreeFoldLimit      int
@@ -935,6 +938,20 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	docMaxTransactionPages := overflowPages + metadataPageLimit
 	docSingleDocumentPages :=
 		overflowPages + singleDocumentMetadataPageLimit
+	// Dirty admission accounts for the bytes actually retained in cache. The
+	// persisted checkpoint namespace is deliberately separate: routing parents
+	// can occupy wider physical extent classes without retaining those padded
+	// bytes in resident frames.
+	largePages := overflowPages + 1
+	if len(compiled) != 0 {
+		largePages++
+	}
+	metadataPages := docMaxTransactionPages - largePages
+	docMaxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
+		uint64(metadataPages)*uint64(o.PageSize)
+	singleDocumentMetadataPages := docSingleDocumentPages - largePages
+	docSingleDocumentBytes := uint64(largePages)*uint64(o.MaxPageSize) +
+		uint64(singleDocumentMetadataPages)*uint64(o.PageSize)
 	// Exact-index maintenance stages, in the same transaction as the document
 	// mutation or checkpoint, the dirty term leaves the fold re-encoded plus
 	// each physical index's ordered catalog pages and one
@@ -979,16 +996,13 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if len(compiled) != 0 {
 		compiledPackedPages = 1
 	}
-	maxTransactionBytes := fileStoreTransactionExtentBytes(
+	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
+	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
+	maxTransactionPhysicalBytes := fileStoreTransactionExtentBytes(
 		maxTransactionPages,
 		overflowPages+o.MaxBatchDocuments+compiledPackedPages+exactIndexPages,
 		4*min(o.MaxBatchDocuments, filePrimaryPendingParentLimit),
 		o.PageSize, o.MaxPageSize,
-	)
-	singleDocumentTransactionBytes := fileStoreTransactionExtentBytes(
-		singleDocumentTransactionPages,
-		overflowPages+1+compiledPackedPages+exactIndexPages,
-		4, o.PageSize, o.MaxPageSize,
 	)
 	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
 	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket
@@ -1013,9 +1027,14 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	primaryOverlayFixedPages :=
 		primaryOverlayFixedMetadataPages + exactIndexPages
 	primaryOverlayFixedBytes :=
+		uint64(primaryOverlayFixedMetadataPages)*uint64(o.PageSize) +
+			exactIndexBytes
+	primaryOverlayParentBytes :=
+		uint64(primaryOverlayParentLevels) * uint64(o.PageSize)
+	primaryOverlayPhysicalFixedBytes :=
 		uint64(primaryOverlayFixedMetadataPages-1)*uint64(o.PageSize) +
 			uint64(storeio.GlobalTabletCatalogRootBytes) + exactIndexBytes
-	primaryOverlayParentBytes := uint64(
+	primaryOverlayPhysicalParentBytes := uint64(
 		storeio.SegmentedTabletRouterAnchorPageBytes +
 			storeio.GlobalTabletCatalogTabletBytes +
 			2*storeio.GlobalTabletCatalogNodeBytes,
@@ -1116,6 +1135,21 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		maxTransactionBytes = max(
 			maxTransactionBytes, primaryOverlayTransactionBytes,
 		)
+		// The resident dirty ceiling already covers each leaf and four PageSize
+		// parents. Persisted parents use wider extent classes, so add only that
+		// per-bucket delta. No transaction can dirty more buckets than fit its
+		// minimum resident leaf+parent charge. This persisted-offset ceiling is
+		// intentionally not a cache admission charge: physical padding/alignment
+		// is never retained as dirty resident memory.
+		physicalDirtyBuckets := min(
+			uint64(primaryOverlayBucketLimit),
+			primaryOverlayDirtyBytes/minimumDirtyBytes,
+		)
+		primaryOverlayPhysicalBytes := primaryOverlayPhysicalFixedBytes +
+			primaryOverlayDirtyBytes + physicalDirtyBuckets*(primaryOverlayPhysicalParentBytes-primaryOverlayParentBytes)
+		maxTransactionPhysicalBytes = max(
+			maxTransactionPhysicalBytes, primaryOverlayPhysicalBytes,
+		)
 	}
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection MaxRetiredExtents must retain one worst-case transaction")
@@ -1134,6 +1168,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		Options:                        o,
 		maxTransactionPages:            maxTransactionPages,
 		maxTransactionBytes:            maxTransactionBytes,
+		maxTransactionPhysicalBytes:    maxTransactionPhysicalBytes,
 		singleDocumentTransactionPages: singleDocumentTransactionPages,
 		singleDocumentTransactionBytes: singleDocumentTransactionBytes,
 		singleDocumentFreeFoldLimit:    singleDocumentFreeFoldLimit,
