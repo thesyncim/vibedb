@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ func TestReplicatedLeaderHintCacheExactFenceIdentityAndSafeInvalidation(t *testi
 	route, _, states := testReplicatedRouteCommand(t)
 	endpoint := route.Replicas[1]
 	old := states[endpoint.Address]
-	var cache replicatedLeaderHintCache
+	cache := newReplicatedLeaderHintCache(4)
 	cache.publish(route, endpoint, old)
 	if gotEndpoint, gotState, ok := cache.lookup(route); !ok ||
 		!sameReplicatedEndpoint(gotEndpoint, endpoint) || gotState != old {
@@ -43,6 +44,10 @@ func TestReplicatedLeaderHintCacheExactFenceIdentityAndSafeInvalidation(t *testi
 	newer.Fence.Term++
 	newer.Commit++
 	cache.publish(route, endpoint, newer)
+	cache.publish(route, endpoint, old)
+	if _, got, ok := cache.lookup(route); !ok || got != newer {
+		t.Fatalf("delayed publication replaced newer hint: %+v %t", got, ok)
+	}
 	cache.invalidate(route, endpoint, old)
 	if _, got, ok := cache.lookup(route); !ok || got != newer {
 		t.Fatalf("delayed invalidation removed newer hint: %+v %t", got, ok)
@@ -57,7 +62,7 @@ func TestReplicatedLeaderHintCacheWarmOperationsAllocateNothing(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
 	endpoint := route.Replicas[1]
 	state := states[endpoint.Address]
-	var cache replicatedLeaderHintCache
+	cache := newReplicatedLeaderHintCache(4)
 	cache.publish(route, endpoint, state)
 	if allocations := testing.AllocsPerRun(1000, func() {
 		cache.publish(route, endpoint, state)
@@ -66,6 +71,106 @@ func TestReplicatedLeaderHintCacheWarmOperationsAllocateNothing(t *testing.T) {
 		}
 	}); allocations != 0 {
 		t.Fatalf("warm leader cache allocations = %v", allocations)
+	}
+}
+
+func testReplicatedLeaderHintRoute(
+	base ReplicatedRoute,
+	baseState shardservice.ReplicatedMemberState,
+	generation uint64,
+) (ReplicatedRoute, shardservice.ReplicatedMemberState) {
+	route := base
+	route.Command.RouteGeneration = generation
+	state := baseState
+	state.Fence.Command = route.Command
+	return route, state
+}
+
+func TestReplicatedLeaderHintCacheFourWayCollisionRetentionAndBoundedEviction(t *testing.T) {
+	base, _, states := testReplicatedRouteCommand(t)
+	endpoint := base.Replicas[1]
+	baseState := states[endpoint.Address]
+	cache := newReplicatedLeaderHintCache(4)
+	var routes [5]ReplicatedRoute
+	for index := range routes {
+		state := shardservice.ReplicatedMemberState{}
+		routes[index], state = testReplicatedLeaderHintRoute(
+			base, baseState, base.Command.RouteGeneration+uint64(index),
+		)
+		cache.publish(routes[index], endpoint, state)
+		if _, got, ok := cache.lookup(routes[index]); !ok || got != state {
+			t.Fatalf("route %d missing immediately after publication: %+v %t", index, got, ok)
+		}
+	}
+	if _, _, ok := cache.lookup(routes[0]); ok {
+		t.Fatal("fifth colliding route did not evict the oldest of four ways")
+	}
+	for index := 1; index < len(routes); index++ {
+		if _, _, ok := cache.lookup(routes[index]); !ok {
+			t.Fatalf("colliding route %d was needlessly evicted", index)
+		}
+	}
+}
+
+func TestReplicatedLeaderHintCacheConcurrentOldResponsesCannotEraseNewTerm(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	endpoint := route.Replicas[1]
+	old := states[endpoint.Address]
+	newer := old
+	newer.Fence.Term++
+	newer.Commit++
+	cache := newReplicatedLeaderHintCache(4)
+	cache.publish(route, endpoint, old)
+
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for iteration := 0; iteration < 1000; iteration++ {
+				cache.publish(route, endpoint, newer)
+				cache.publish(route, endpoint, old)
+				cache.invalidate(route, endpoint, old)
+			}
+		}()
+	}
+	workers.Wait()
+	if _, got, ok := cache.lookup(route); !ok || got != newer {
+		t.Fatalf("concurrent stale response erased newer term: %+v %t", got, ok)
+	}
+}
+
+func TestReplicatedExecutorLeaderHintCapacityOptions(t *testing.T) {
+	client := &bypassLeaderHintClient{}
+	defaultExecutor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(defaultExecutor.leaderHints.sets); got != DefaultReplicatedLeaderHintCapacity/4 {
+		t.Fatalf("default leader hint sets = %d", got)
+	}
+
+	for _, capacity := range []int{1, 3, 4, 5, 4097, AbsoluteMaxReplicatedLeaderHints} {
+		executor, constructErr := NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+			MaxAttempts: 1, AttemptTimeout: time.Second, LeaderHintCapacity: capacity,
+		})
+		if constructErr != nil {
+			t.Fatalf("capacity %d: %v", capacity, constructErr)
+		}
+		entries := 0
+		for index := range executor.leaderHints.sets {
+			entries += int(executor.leaderHints.sets[index].ways)
+		}
+		if entries != capacity {
+			t.Fatalf("capacity %d constructed %d entries", capacity, entries)
+		}
+	}
+	for _, capacity := range []int{-1, AbsoluteMaxReplicatedLeaderHints + 1} {
+		if _, err := NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+			MaxAttempts: 1, AttemptTimeout: time.Second, LeaderHintCapacity: capacity,
+		}); !errors.Is(err, ErrReplicatedRoute) {
+			t.Fatalf("invalid capacity %d = %v", capacity, err)
+		}
 	}
 }
 
@@ -124,7 +229,7 @@ func BenchmarkReplicatedLeaderHintCacheLookup(b *testing.B) {
 	route, _, states := testReplicatedRouteCommand(b)
 	endpoint := route.Replicas[1]
 	state := states[endpoint.Address]
-	var cache replicatedLeaderHintCache
+	cache := newReplicatedLeaderHintCache(DefaultReplicatedLeaderHintCapacity)
 	cache.publish(route, endpoint, state)
 	b.ReportAllocs()
 	b.ResetTimer()

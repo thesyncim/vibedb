@@ -9,11 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-// The cache is deliberately direct-mapped and fixed-size. A collision only
-// costs one probe; it can never grow with tenant, shard, or failover count.
-// Once the executor is constructed, lookup, publication, and invalidation do
-// not allocate.
-const replicatedLeaderHintSlots = 256
+const replicatedLeaderHintWays = 4
 
 type replicatedLeaderHintKey struct {
 	group                raftmember.GroupKey
@@ -22,19 +18,49 @@ type replicatedLeaderHintKey struct {
 }
 
 type replicatedLeaderHintEntry struct {
-	key      replicatedLeaderHintKey
 	endpoint ReplicatedEndpoint
 	state    shardservice.ReplicatedMemberState
 	valid    bool
 }
 
-type replicatedLeaderHintSlot struct {
-	mu    sync.RWMutex
-	entry replicatedLeaderHintEntry
+func (entry *replicatedLeaderHintEntry) matches(key replicatedLeaderHintKey) bool {
+	return entry.valid && entry.state.Fence.Group == key.group &&
+		entry.state.Fence.AllocationGeneration == key.allocationGeneration &&
+		entry.state.Fence.Command == key.command
+}
+
+// A set owns at most four exact route hints. The final set may expose fewer
+// ways when the configured capacity is not a multiple of four. One lock per
+// set prevents unrelated shard traffic from contending while keeping lookup,
+// publication, and invalidation allocation-free after construction.
+type replicatedLeaderHintSet struct {
+	mu      sync.RWMutex
+	entries [replicatedLeaderHintWays]replicatedLeaderHintEntry
+	next    uint8
+	ways    uint8
 }
 
 type replicatedLeaderHintCache struct {
-	slots [replicatedLeaderHintSlots]replicatedLeaderHintSlot
+	sets []replicatedLeaderHintSet
+	mask uint64
+}
+
+func newReplicatedLeaderHintCache(capacity int) replicatedLeaderHintCache {
+	setCount := (capacity + replicatedLeaderHintWays - 1) / replicatedLeaderHintWays
+	cache := replicatedLeaderHintCache{sets: make([]replicatedLeaderHintSet, setCount)}
+	remaining := capacity
+	for index := range cache.sets {
+		ways := replicatedLeaderHintWays
+		if remaining < ways {
+			ways = remaining
+		}
+		cache.sets[index].ways = uint8(ways)
+		remaining -= ways
+	}
+	if setCount > 1 && setCount&(setCount-1) == 0 {
+		cache.mask = uint64(setCount - 1)
+	}
+	return cache
 }
 
 func replicatedLeaderKey(route ReplicatedRoute) replicatedLeaderHintKey {
@@ -42,7 +68,7 @@ func replicatedLeaderKey(route ReplicatedRoute) replicatedLeaderHintKey {
 		allocationGeneration: route.AllocationGeneration, command: route.Command}
 }
 
-func replicatedLeaderSlot(key replicatedLeaderHintKey) uint8 {
+func replicatedLeaderHash(key replicatedLeaderHintKey) uint64 {
 	// Mix fixed-width identity and every command generation. This is not a
 	// security boundary; exact key comparison below rejects all collisions.
 	hash := uint64(0x9e3779b97f4a7c15)
@@ -68,7 +94,18 @@ func replicatedLeaderSlot(key replicatedLeaderHintKey) uint8 {
 		hash *= 0x9e3779b97f4a7c15
 	}
 	hash ^= hash >> 32
-	return uint8(hash)
+	return hash
+}
+
+func (cache *replicatedLeaderHintCache) set(key replicatedLeaderHintKey) *replicatedLeaderHintSet {
+	if cache == nil || len(cache.sets) == 0 {
+		return nil
+	}
+	hash := replicatedLeaderHash(key)
+	if cache.mask != 0 {
+		return &cache.sets[hash&cache.mask]
+	}
+	return &cache.sets[hash%uint64(len(cache.sets))]
 }
 
 func sameReplicatedEndpoint(left, right ReplicatedEndpoint) bool {
@@ -81,13 +118,22 @@ func (cache *replicatedLeaderHintCache) lookup(
 	route ReplicatedRoute,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, bool) {
 	key := replicatedLeaderKey(route)
-	slot := &cache.slots[replicatedLeaderSlot(key)]
-	slot.mu.RLock()
-	entry := slot.entry
-	slot.mu.RUnlock()
+	set := cache.set(key)
+	if set == nil {
+		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
+	}
+	set.mu.RLock()
+	var entry replicatedLeaderHintEntry
+	for way := uint8(0); way < set.ways; way++ {
+		candidate := &set.entries[way]
+		if candidate.matches(key) {
+			entry = *candidate
+			break
+		}
+	}
+	set.mu.RUnlock()
 	current, _, found := replicatedEndpoint(route, entry.endpoint.Member)
-	if !entry.valid || entry.key != key ||
-		!found || !sameReplicatedEndpoint(current, entry.endpoint) ||
+	if !entry.valid || !found || !sameReplicatedEndpoint(current, entry.endpoint) ||
 		!validReplicatedLeaderHint(route, entry.endpoint, entry.state) {
 		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
 	}
@@ -103,15 +149,33 @@ func (cache *replicatedLeaderHintCache) publish(
 		return
 	}
 	key := replicatedLeaderKey(route)
-	slot := &cache.slots[replicatedLeaderSlot(key)]
-	slot.mu.Lock()
-	entry := &slot.entry
-	// Never let a delayed response for the same allocation overwrite a newer
-	// leadership term. A different exact key is a normal bounded collision.
-	if !entry.valid || entry.key != key || state.Fence.Term >= entry.state.Fence.Term {
-		*entry = replicatedLeaderHintEntry{key: key, endpoint: endpoint, state: state, valid: true}
+	set := cache.set(key)
+	if set == nil {
+		return
 	}
-	slot.mu.Unlock()
+	set.mu.Lock()
+	for way := uint8(0); way < set.ways; way++ {
+		entry := &set.entries[way]
+		if entry.matches(key) {
+			// Never let a delayed response for the same allocation overwrite a
+			// newer leadership term.
+			if state.Fence.Term >= entry.state.Fence.Term {
+				*entry = replicatedLeaderHintEntry{endpoint: endpoint, state: state, valid: true}
+			}
+			set.mu.Unlock()
+			return
+		}
+	}
+	way := set.next
+	for candidate := uint8(0); candidate < set.ways; candidate++ {
+		if !set.entries[candidate].valid {
+			way = candidate
+			break
+		}
+	}
+	set.entries[way] = replicatedLeaderHintEntry{endpoint: endpoint, state: state, valid: true}
+	set.next = (way + 1) % set.ways
+	set.mu.Unlock()
 }
 
 func (cache *replicatedLeaderHintCache) invalidate(
@@ -120,14 +184,20 @@ func (cache *replicatedLeaderHintCache) invalidate(
 	state shardservice.ReplicatedMemberState,
 ) {
 	key := replicatedLeaderKey(route)
-	slot := &cache.slots[replicatedLeaderSlot(key)]
-	slot.mu.Lock()
-	entry := &slot.entry
-	// Compare the exact hint consumed by the caller. A slow failure must not
-	// erase a newer term concurrently published by another request.
-	if entry.valid && entry.key == key && sameReplicatedEndpoint(entry.endpoint, endpoint) &&
-		entry.state == state {
-		*entry = replicatedLeaderHintEntry{}
+	set := cache.set(key)
+	if set == nil {
+		return
 	}
-	slot.mu.Unlock()
+	set.mu.Lock()
+	for way := uint8(0); way < set.ways; way++ {
+		entry := &set.entries[way]
+		// Compare the exact hint consumed by the caller. A slow failure must
+		// not erase a newer term concurrently published by another request.
+		if entry.matches(key) && sameReplicatedEndpoint(entry.endpoint, endpoint) &&
+			entry.state == state {
+			*entry = replicatedLeaderHintEntry{}
+			break
+		}
+	}
+	set.mu.Unlock()
 }

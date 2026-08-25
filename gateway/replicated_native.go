@@ -24,6 +24,8 @@ const (
 	AbsoluteMaxReplicatedRouteMembers   = 64
 	AbsoluteMaxReplicatedAttempts       = 16
 	AbsoluteMaxReplicatedAttemptTimeout = 5 * time.Minute
+	DefaultReplicatedLeaderHintCapacity = 4096
+	AbsoluteMaxReplicatedLeaderHints    = 65536
 )
 
 var (
@@ -104,17 +106,45 @@ type ReplicatedExecutor struct {
 	leaderHints    replicatedLeaderHintCache
 }
 
+// ReplicatedExecutorOptions bounds retry resources and the in-memory leader
+// hint working set. LeaderHintCapacity is a count of exact shard routes, not a
+// shard or tenant limit: eviction only causes a fresh authenticated probe.
+// Zero selects DefaultReplicatedLeaderHintCapacity.
+type ReplicatedExecutorOptions struct {
+	MaxAttempts        int
+	AttemptTimeout     time.Duration
+	LeaderHintCapacity int
+}
+
 func NewReplicatedExecutor(
 	client ReplicatedRoundTripper,
 	maxAttempts int,
 	attemptTimeout time.Duration,
 ) (*ReplicatedExecutor, error) {
-	if client == nil || maxAttempts <= 0 || maxAttempts > AbsoluteMaxReplicatedAttempts ||
-		attemptTimeout <= 0 || attemptTimeout > AbsoluteMaxReplicatedAttemptTimeout {
+	return NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+		MaxAttempts: maxAttempts, AttemptTimeout: attemptTimeout,
+	})
+}
+
+func NewReplicatedExecutorWithOptions(
+	client ReplicatedRoundTripper,
+	options ReplicatedExecutorOptions,
+) (*ReplicatedExecutor, error) {
+	capacity := options.LeaderHintCapacity
+	if capacity == 0 {
+		capacity = DefaultReplicatedLeaderHintCapacity
+	}
+	if client == nil || options.MaxAttempts <= 0 ||
+		options.MaxAttempts > AbsoluteMaxReplicatedAttempts ||
+		options.AttemptTimeout <= 0 ||
+		options.AttemptTimeout > AbsoluteMaxReplicatedAttemptTimeout ||
+		capacity <= 0 || capacity > AbsoluteMaxReplicatedLeaderHints {
 		return nil, ErrReplicatedRoute
 	}
 	return &ReplicatedExecutor{
-		client: client, maxAttempts: maxAttempts, attemptTimeout: attemptTimeout,
+		client: client, maxAttempts: options.MaxAttempts,
+		attemptTimeout: options.AttemptTimeout,
+		leaderHints:    newReplicatedLeaderHintCache(capacity),
 	}, nil
 }
 
