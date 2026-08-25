@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	replicatedWireVersion = 1
-	tagReplicatedRequest  = 'P'
-	tagReplicatedResponse = 'A'
+	replicatedWireVersion          = 1
+	tagReplicatedRequest           = 'P'
+	tagReplicatedMembershipRequest = 'M'
+	tagReplicatedResponse          = 'A'
 	// A response with state has a 297-byte body before a completion. The fixed
 	// request digest is zero for nonterminal responses and binds terminal
 	// proposal outcomes to the exact canonical command. Read
@@ -27,6 +28,10 @@ const (
 	replicatedResponseFixedBodyBytes     = 297
 	replicatedReadResponseFixedBodyBytes = replicatedResponseFixedBodyBytes + 12
 )
+
+// Membership is fixed-width: the original 279-byte control body plus the
+// forwarded 16-byte node identity and 8-byte authorization generation.
+const replicatedMembershipRequestBodyBytes = 303
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
@@ -37,6 +42,7 @@ type ReplicatedOperation uint8
 const (
 	ReplicatedProbe ReplicatedOperation = iota + 1
 	ReplicatedPropose
+	ReplicatedMembership
 	ReplicatedReadLeader
 	ReplicatedReadFollower
 )
@@ -60,10 +66,24 @@ type ReplicatedRequest struct {
 	Authority      serviceauthz.Authority
 	Fence          ReplicatedFence
 	Command        []byte
+	Membership     ReplicatedMembershipRequest
 	Relation       replication.RelationID
 	Key            []byte
 	MinimumApplied uint64
 	MaxValueBytes  uint32
+}
+
+// ReplicatedMembershipRequest is a fixed-width control envelope. It contains
+// no protobuf and no peer-sized repeated field.
+type ReplicatedMembershipRequest struct {
+	Kind                      raftservice.MembershipKind
+	TransitionID              [16]byte
+	MetadataEpoch             uint64
+	CatalogGeneration         uint64
+	ExpectedReplicaSetVersion uint64
+	SourceMember              uint64
+	TargetMember              uint64
+	TransferTerm              uint64
 }
 
 // ReplicatedResponseKind separates definite pre-admission refusals from an
@@ -76,6 +96,7 @@ const (
 	ReplicatedNotLeader
 	ReplicatedOutcomeUnknown
 	ReplicatedRefusal
+	ReplicatedMembershipAccepted
 	ReplicatedReadFound
 	ReplicatedReadMissing
 )
@@ -91,6 +112,10 @@ const (
 	ReplicatedRefusalProposalRefused
 	ReplicatedRefusalDeterministic
 	ReplicatedRefusalUnavailable
+	ReplicatedRefusalMembershipUnauthorized
+	ReplicatedRefusalMembershipStale
+	ReplicatedRefusalMembershipMalformed
+	ReplicatedRefusalMembershipNotCaughtUp
 	ReplicatedRefusalReadBehind
 	ReplicatedRefusalReadBufferBound
 	ReplicatedRefusalUnauthorized
@@ -129,7 +154,11 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(len(request.Command) + len(request.Key) + 16)
+	payloadHint := len(request.Command) + len(request.Key) + 16
+	if request.Operation == ReplicatedMembership {
+		payloadHint += 65
+	}
+	e := newFrameEncoder(payloadHint)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
@@ -138,6 +167,9 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	switch request.Operation {
 	case ReplicatedPropose:
 		e.bytes(request.Command)
+	case ReplicatedMembership:
+		e.bytes(request.Command)
+		encodeReplicatedMembership(&e, request.Membership)
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		e.u8(uint8(request.Relation))
 		e.u64(request.MinimumApplied)
@@ -147,7 +179,11 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if e.err != nil {
 		return e.err
 	}
-	return writeEncodedFrame(w, tagReplicatedRequest, e.b)
+	tag := byte(tagReplicatedRequest)
+	if request.Operation == ReplicatedMembership {
+		tag = tagReplicatedMembershipRequest
+	}
+	return writeEncodedFrame(w, tag, e.b)
 }
 
 // EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
@@ -158,18 +194,27 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(0)
+	payloadHint := 0
+	if request.Operation == ReplicatedMembership {
+		payloadHint = 65
+	}
+	e := newFrameEncoder(payloadHint)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
 	encodeReplicatedFence(&e, request.Fence)
 	var payload []byte
+	tag := byte(tagReplicatedRequest)
 	switch request.Operation {
 	case ReplicatedProbe:
 	case ReplicatedPropose:
 		payload = request.Command
 		e.u32(uint32(len(payload)))
+	case ReplicatedMembership:
+		e.u32(0)
+		encodeReplicatedMembership(&e, request.Membership)
+		tag = tagReplicatedMembershipRequest
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		e.u8(uint8(request.Relation))
 		e.u64(request.MinimumApplied)
@@ -180,7 +225,7 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
 		return errFrameTooLarge
 	}
-	e.b[0] = tagReplicatedRequest
+	e.b[0] = tag
 	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
 	buffers := net.Buffers{e.b}
 	if len(payload) != 0 {
@@ -203,7 +248,7 @@ func decodeReplicatedRequest(
 	r io.Reader,
 	budget *replicatedFrameByteBudget,
 ) (*ReplicatedRequest, int64, error) {
-	body, charged, err := readFrameBudgeted(r, tagReplicatedRequest, budget)
+	body, charged, tag, err := readReplicatedRequestFrame(r, budget)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -215,12 +260,21 @@ func decodeReplicatedRequest(
 		return nil, 0, errBadVersion
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
+	if (request.Operation == ReplicatedMembership) != (tag == tagReplicatedMembershipRequest) {
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, ErrReplicatedWire
+	}
 	request.Authority.Node = d.fixed16()
 	request.Authority.Generation = d.u64()
 	request.Fence = decodeReplicatedFence(&d)
 	switch request.Operation {
 	case ReplicatedPropose:
 		request.Command = d.slice()
+	case ReplicatedMembership:
+		request.Command = d.slice()
+		request.Membership = decodeReplicatedMembership(&d)
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		request.Relation = replication.RelationID(d.u8())
 		request.MinimumApplied = d.u64()
@@ -242,6 +296,72 @@ func decodeReplicatedRequest(
 		return nil, 0, ErrReplicatedWire
 	}
 	return request, charged, nil
+}
+
+// readReplicatedRequestFrame validates the tag and the membership operation's
+// exact fixed body size from a stack header before any peer-sized allocation.
+func readReplicatedRequestFrame(
+	r io.Reader,
+	budget *replicatedFrameByteBudget,
+) (body []byte, charged int64, tag byte, err error) {
+	var header [5]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, 0, 0, err
+	}
+	tag = header[0]
+	length := int32(binary.BigEndian.Uint32(header[1:]))
+	if length < 4 {
+		return nil, 0, tag, errBadLength
+	}
+	size := int(length) - 4
+	switch tag {
+	case tagReplicatedMembershipRequest:
+		if size != replicatedMembershipRequestBodyBytes {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(r, prefix[:]); err != nil {
+			return nil, 0, tag, err
+		}
+		if prefix[0] != replicatedWireVersion ||
+			ReplicatedOperation(prefix[1]) != ReplicatedMembership {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		charged = int64(size)
+		if budget != nil && !budget.reserve(charged) {
+			return nil, 0, tag, errFrameBudget
+		}
+		body = make([]byte, size)
+		copy(body[:2], prefix[:])
+		if _, err := io.ReadFull(r, body[2:]); err != nil {
+			if budget != nil {
+				budget.release(charged)
+			}
+			return nil, 0, tag, err
+		}
+		return body, charged, tag, nil
+	case tagReplicatedRequest:
+		if size > maxFrameBody {
+			return nil, 0, tag, errFrameTooLarge
+		}
+	default:
+		return nil, 0, tag, errBadTag
+	}
+	if size == 0 {
+		return nil, 0, tag, nil
+	}
+	charged = int64(size)
+	if budget != nil && !budget.reserve(charged) {
+		return nil, 0, tag, errFrameBudget
+	}
+	body = make([]byte, size)
+	if _, err := io.ReadFull(r, body); err != nil {
+		if budget != nil {
+			budget.release(charged)
+		}
+		return nil, 0, tag, err
+	}
+	return body, charged, tag, nil
 }
 
 // EncodeReplicatedResponse emits one canonical typed native response.
@@ -335,6 +455,8 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 	case ReplicatedPropose:
 		return replicatedResponseFixedBodyBytes +
 			replication.MaxEmptyResultCompletionEnvelopeBytes, nil
+	case ReplicatedMembership:
+		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
 	default:
@@ -396,6 +518,26 @@ func decodeReplicatedDigest(d *deccur) (digest [32]byte) {
 	return digest
 }
 
+func encodeReplicatedMembership(e *encbuf, request ReplicatedMembershipRequest) {
+	e.u8(uint8(request.Kind))
+	e.fixed16(request.TransitionID)
+	e.u64(request.MetadataEpoch)
+	e.u64(request.CatalogGeneration)
+	e.u64(request.ExpectedReplicaSetVersion)
+	e.u64(request.SourceMember)
+	e.u64(request.TargetMember)
+	e.u64(request.TransferTerm)
+}
+
+func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
+	return ReplicatedMembershipRequest{
+		Kind: raftservice.MembershipKind(d.u8()), TransitionID: d.fixed16(),
+		MetadataEpoch: d.u64(), CatalogGeneration: d.u64(),
+		ExpectedReplicaSetVersion: d.u64(), SourceMember: d.u64(), TargetMember: d.u64(),
+		TransferTerm: d.u64(),
+	}
+}
+
 func encodeReplicatedMemberState(e *encbuf, state ReplicatedMemberState) {
 	encodeReplicatedFence(e, state.Fence)
 	e.u64(state.LeaderID)
@@ -444,9 +586,14 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	switch request.Operation {
 	case ReplicatedProbe:
 		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0
 	case ReplicatedPropose:
+		if request.Membership != (ReplicatedMembershipRequest{}) || request.Relation != 0 ||
+			len(request.Key) != 0 || request.MinimumApplied != 0 || request.MaxValueBytes != 0 {
+			return false
+		}
 		if !validReplicatedFence(request.Fence, true) || len(request.Command) == 0 ||
 			len(request.Command) > replication.MaxCommandBytes {
 			return false
@@ -465,8 +612,15 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			command.SchemaGeneration == request.Fence.Command.SchemaGeneration &&
 			command.RoutingVersion == request.Fence.Command.RoutingVersion &&
 			command.RouteGeneration == request.Fence.Command.RouteGeneration
+	case ReplicatedMembership:
+		// Semantic validation is deliberately performed by the serialized owner
+		// so malformed control requests receive a deterministic refusal class.
+		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
+			request.MaxValueBytes == 0
 	case ReplicatedReadLeader, ReplicatedReadFollower:
 		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation != 0 && request.Relation <= replication.MaxRelationID &&
 			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
 			request.MinimumApplied != 0 && request.MaxValueBytes != 0 &&
@@ -518,6 +672,10 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 	case ReplicatedNotLeader, ReplicatedOutcomeUnknown:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied == 0 && len(response.Value) == 0
+	case ReplicatedMembershipAccepted:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedRefusal:

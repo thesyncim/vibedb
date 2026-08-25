@@ -37,7 +37,7 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{
 		{Node: firstIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
 		{Node: secondIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
-		{Node: client, Capabilities: serviceauthz.CapabilityDataRead},
+		{Node: client, Capabilities: serviceauthz.CapabilityMembership},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -68,8 +68,21 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response, err := RoundTripReplicated(ctx, first, request); err != nil || response.Kind != ReplicatedHandshake {
-		t.Fatalf("first response=%+v err=%v", response, err)
+	probe, err := RoundTripReplicated(ctx, first, request)
+	if err != nil || probe.Kind != ReplicatedHandshake {
+		t.Fatalf("first response=%+v err=%v", probe, err)
+	}
+	membership := &ReplicatedRequest{Operation: ReplicatedMembership,
+		Authority: request.Authority, Fence: probe.State.Fence,
+		Membership: ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{1},
+			MetadataEpoch: 2, CatalogGeneration: 3,
+			ExpectedReplicaSetVersion: fence.Command.ReplicaSetVersion,
+			SourceMember:              fence.MemberID, TargetMember: fence.MemberID + 1,
+		},
+	}
+	if response, roundTripErr := RoundTripReplicated(ctx, first, membership); roundTripErr != nil || response.Kind != ReplicatedMembershipAccepted {
+		t.Fatalf("membership response=%+v err=%v", response, roundTripErr)
 	}
 	denied, err := dial(secondProfile)
 	if err == nil {

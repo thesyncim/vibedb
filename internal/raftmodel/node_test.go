@@ -892,6 +892,114 @@ func TestConfigurationMetadataIsRefusedUntilApplyPortCarriesIt(t *testing.T) {
 	}
 }
 
+func TestMembershipTransitionContextRequiresExplicitExactBinding(t *testing.T) {
+	exact := make([]byte, MembershipTransitionContextBytes)
+	exact[0] = 1
+	unbound, _, _ := newTestNode(t, 1, []uint64{1})
+	driveCampaign(t, unbound)
+	if err := unbound.ProposeConfChange(&pb.ConfChange{
+		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: uint64Ptr(2), Context: exact,
+	}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("unbound exact context = %v, want ErrUnsupported", err)
+	}
+
+	for _, size := range []int{0, MembershipTransitionContextBytes - 1,
+		MembershipTransitionContextBytes + 1} {
+		node, _, _ := newTestNode(t, 1, []uint64{1})
+		if err := node.BindMembershipTransitionContext(); err != nil {
+			t.Fatal(err)
+		}
+		driveCampaign(t, node)
+		change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(),
+			NodeId: uint64Ptr(2), Context: make([]byte, size)}
+		if err := node.ProposeConfChange(change); !errors.Is(err, ErrAdmissionBound) {
+			t.Fatalf("bound context bytes %d = %v, want ErrAdmissionBound", size, err)
+		}
+	}
+
+	bound, _, machine := newTestNode(t, 1, []uint64{1})
+	if err := bound.BindMembershipTransitionContext(); err != nil {
+		t.Fatal(err)
+	}
+	driveCampaign(t, bound)
+	if err := bound.ProposeConfChange(&pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(),
+		NodeId: uint64Ptr(2), Context: append([]byte(nil), exact...)}); err != nil {
+		t.Fatalf("bound exact proposal = %v", err)
+	}
+	driveAllReady(t, bound)
+	publication := machine.Published()
+	if !slices.Contains(publication.ConfState.GetLearners(), 2) || publication.ReplicaSetVersion == 0 {
+		t.Fatalf("bound exact apply publication = %+v", publication)
+	}
+
+	v2, _, _ := newTestNode(t, 1, []uint64{1})
+	if err := v2.BindMembershipTransitionContext(); err != nil {
+		t.Fatal(err)
+	}
+	driveCampaign(t, v2)
+	if err := v2.ProposeConfChange(&pb.ConfChangeV2{Context: append([]byte(nil), exact...),
+		Changes: []*pb.ConfChangeSingle{{Type: pb.ConfChangeAddLearnerNode.Enum(),
+			NodeId: uint64Ptr(2)}}}); err != nil {
+		t.Fatalf("bound exact v2 proposal = %v", err)
+	}
+	driveAllReady(t, v2)
+}
+
+func TestBoundMembershipTransitionContextRevalidatesCommittedApply(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1})
+	if err := node.BindMembershipTransitionContext(); err != nil {
+		t.Fatal(err)
+	}
+	driveCampaign(t, node)
+	if err := node.ProposeConfChange(&pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(),
+		NodeId: uint64Ptr(2), Context: make([]byte, MembershipTransitionContextBytes)}); err != nil {
+		t.Fatal(err)
+	}
+	for iteration := 0; iteration < 8; iteration++ {
+		captured, err := node.CaptureReady()
+		if err != nil || !captured {
+			t.Fatalf("capture %d = %t, %v", iteration, captured, err)
+		}
+		if err = node.PersistReady(); err != nil {
+			t.Fatal(err)
+		}
+		if err = node.DrainMessages(func(*pb.Message) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err = node.InstallSnapshot(); err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range node.ready.CommittedEntries {
+			if entry.GetType() != pb.EntryConfChange {
+				continue
+			}
+			change := new(pb.ConfChange)
+			if err = proto.Unmarshal(entry.GetData(), change); err != nil {
+				t.Fatal(err)
+			}
+			change.Context = change.Context[:MembershipTransitionContextBytes-1]
+			entry.Data, err = proto.MarshalOptions{Deterministic: true}.Marshal(change)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = applyCommittedForTest(node); !errors.Is(err, ErrAdmissionBound) {
+				t.Fatalf("malformed committed context apply = %v, want ErrAdmissionBound", err)
+			}
+			return
+		}
+		if err = applyCommittedForTest(node); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = node.RecordReadStates(); err != nil {
+			t.Fatal(err)
+		}
+		if err = node.AdvanceReady(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("configuration entry was not committed")
+}
+
 func TestConfigurationResultCannotExceedRecoveryMemberBound(t *testing.T) {
 	learners := make([]uint64, MaxConfStateMembers-1)
 	for i := range learners {

@@ -81,11 +81,13 @@ func TestReplicatedAuthorizationRotationAndRetryGeneration(t *testing.T) {
 	client := authorizationNode(11)
 	writer := authorizationNode(12)
 	delegateOnly := authorizationNode(13)
+	operator := authorizationNode(14)
 	gate := authorizationGate(t, 4,
 		serviceauthz.Entry{Node: gateway, Capabilities: serviceauthz.CapabilityDelegate},
 		serviceauthz.Entry{Node: client, Capabilities: serviceauthz.CapabilityDataRead},
 		serviceauthz.Entry{Node: writer, Capabilities: serviceauthz.CapabilityDataWrite},
 		serviceauthz.Entry{Node: delegateOnly, Capabilities: serviceauthz.CapabilityDelegate},
+		serviceauthz.Entry{Node: operator, Capabilities: serviceauthz.CapabilityMembership},
 	)
 	server := &ReplicatedServer{authorization: gate}
 	request := &ReplicatedRequest{Operation: ReplicatedReadLeader,
@@ -101,6 +103,23 @@ func TestReplicatedAuthorizationRotationAndRetryGeneration(t *testing.T) {
 	request.Authority.Node = delegateOnly
 	if server.authorizeReplicated(gateway, request) {
 		t.Fatal("delegate capability alone authorized a routing probe")
+	}
+	request.Authority.Node = operator
+	request.Operation = ReplicatedProbe
+	if !server.authorizeReplicated(gateway, request) {
+		t.Fatal("membership operator denied mandatory leader probe")
+	}
+	request.Operation = ReplicatedMembership
+	if !server.authorizeReplicated(gateway, request) {
+		t.Fatal("membership operator denied sealed membership request")
+	}
+	request.Authority.Node = writer
+	if server.authorizeReplicated(gateway, request) {
+		t.Fatal("data writer gained membership authority")
+	}
+	request.Authority.Node = delegateOnly
+	if server.authorizeReplicated(gateway, request) {
+		t.Fatal("delegate-only principal gained membership authority")
 	}
 	request.Authority.Node = client
 	request.Operation = ReplicatedReadLeader

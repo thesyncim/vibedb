@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,7 +32,7 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 	var commandIdentity sqldriver.ReplicatedShardStoreIdentity
 
 	for index := range replicas {
-		runtime, base := newRealTransferRuntime(t, identities[index], voters)
+		runtime, base, _ := newRealTransferRuntime(t, identities[index], voters)
 		host, err := NewHost(testHostLimits())
 		if err != nil {
 			t.Fatal(err)
@@ -61,6 +62,7 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 
 	cluster := realTransferCluster{
 		t: t, hosts: hosts, registries: registries,
+		group:       members[0].Group,
 		memberIndex: map[uint64]int{voters[0]: 0, voters[1]: 1, voters[2]: 2},
 	}
 	group := members[0].Group
@@ -105,44 +107,302 @@ type realTransferCluster struct {
 	hosts               []*Host
 	registries          []*rafttransport.StaticRegistry
 	memberIndex         map[uint64]int
+	inactive            map[int]bool
 	duplicateTimeoutNow bool
 	timeoutNowSeen      bool
 	duplicateRejected   bool
 	pendingDuplicate    int
+	syncAuthority       bool
+	group               raftmember.GroupKey
+	promotionTarget     uint64
+	pausePromotion      bool
+	promotionPaused     bool
+	promotionVoteSeen   bool
+	holdTargetUntilVote bool
+	suppressTargetTicks bool
 }
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
 	cluster.t.Helper()
-	for step := 0; step < 100000; step++ {
+	step := 0
+	doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+	if doneReached {
+		return
+	}
+	cluster.t.Fatalf("cluster became idle before condition at step %d: %s",
+		idleStep, cluster.diagnostic())
+}
+
+// driveUntilConvergedIdle proves a predicate and then drains only the Raft
+// work that made it true. Use it before the test injects another protocol
+// input: publication can precede the final Ready advance or outbound delivery,
+// while Runtime deliberately rejects new input at that boundary.
+func (cluster *realTransferCluster) driveUntilConvergedIdle(done func() bool) {
+	cluster.t.Helper()
+	step := 0
+	doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+	if !doneReached {
+		cluster.t.Fatalf("cluster became idle before stable condition at step %d: %s",
+			idleStep, cluster.diagnostic())
+	}
+	cluster.drainConvergedWorkToIdle(done, &step)
+}
+
+// driveUntilIdle advances the deterministic scheduler until either done is
+// observed or one exact protocol-idle cut is reached. Unlike driveUntil it does
+// not classify idle as failure: callers that deliberately supply a logical
+// clock input can first observe the quiescent cut and then inject that input.
+// Exhausting the deterministic step bound remains fatal in every caller.
+func (cluster *realTransferCluster) driveUntilIdle(
+	done func() bool,
+	step *int,
+) (doneReached bool, idleStep int) {
+	cluster.t.Helper()
+	for *step < 100000 {
 		if done() {
-			return
+			return true, -1
 		}
-		progressed := false
-		for index, host := range cluster.hosts {
-			_, consumed, err := host.RunOne()
-			if err != nil {
-				if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
-					cluster.pendingDuplicate--
-					cluster.duplicateRejected = true
-				} else {
-					cluster.t.Fatalf("host %d RunOne step %d: %v", index, step, err)
-				}
-			}
-			progressed = progressed || consumed
-			for {
-				outbound, ok := host.PopOutbound()
-				if !ok {
-					break
-				}
-				progressed = true
-				cluster.route(index, outbound)
-			}
-		}
-		if !progressed {
-			cluster.t.Fatalf("cluster became idle before condition at step %d", step)
+		current := *step
+		*step++
+		if !cluster.driveRound(current) {
+			return false, current
 		}
 	}
-	cluster.t.Fatal("cluster drive did not converge")
+	cluster.t.Fatalf("cluster drive did not converge: %s", cluster.diagnostic())
+	return false, -1
+}
+
+// driveRound executes one deterministic scheduler turn and routes every
+// resulting real Raft message. A false result is an observable protocol-idle
+// boundary; callers may then inject an explicit logical clock input.
+func (cluster *realTransferCluster) driveRound(step int) bool {
+	cluster.t.Helper()
+	progressed := false
+	for index, host := range cluster.hosts {
+		if cluster.inactive[index] {
+			continue
+		}
+		if cluster.holdTargetUntilVote &&
+			index == cluster.memberIndex[cluster.promotionTarget] &&
+			!cluster.promotionVoteSeen {
+			continue
+		}
+		_, consumed, err := host.RunOne()
+		if err != nil {
+			if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
+				cluster.pendingDuplicate--
+				cluster.duplicateRejected = true
+			} else {
+				cluster.t.Fatalf("host %d RunOne step %d: %v", index, step, err)
+			}
+		}
+		progressed = progressed || consumed
+		if cluster.syncAuthority && consumed {
+			publication, publishErr := host.Publication(cluster.group)
+			if publishErr != nil {
+				cluster.t.Fatal(publishErr)
+			}
+			if publishErr = cluster.registries[index].PublishCommittedAuthority(
+				cluster.group, publication.ReplicaSetVersion,
+				publication.ConfState); publishErr != nil {
+				cluster.t.Fatal(publishErr)
+			}
+			if cluster.promotionTarget != 0 {
+				proof, found, proofErr := host.DurablePromotion(cluster.group,
+					cluster.promotionTarget)
+				if proofErr != nil {
+					cluster.t.Fatal(proofErr)
+				}
+				if found {
+					if proofErr = cluster.registries[index].PublishDurablePromotion(
+						cluster.group, proof); proofErr != nil {
+						cluster.t.Fatal(proofErr)
+					}
+					if cluster.pausePromotion && index == cluster.memberIndex[cluster.promotionTarget] {
+						status, statusErr := host.Status(cluster.group)
+						publication, publicationErr := host.Publication(cluster.group)
+						if statusErr != nil || publicationErr != nil {
+							cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+						}
+						if status.Commit >= proof.Version && publication.ReplicaSetVersion < proof.Version {
+							cluster.pausePromotion = false
+							cluster.promotionPaused = true
+							cluster.inactive[index] = true
+						}
+					}
+				} else if proofErr = cluster.registries[index].ClearDurablePromotion(
+					cluster.group); proofErr != nil {
+					cluster.t.Fatal(proofErr)
+				}
+			}
+		}
+		for {
+			outbound, ok := host.PopOutbound()
+			if !ok {
+				break
+			}
+			progressed = true
+			cluster.route(index, outbound)
+		}
+	}
+	return progressed
+}
+
+// driveUntilWithLeaderTicks advances an exact condition across protocol-idle
+// boundaries by ticking only the currently observed leader. Each tick is a
+// real Raft input and every heartbeat/response is routed through the
+// authenticated transport; no commit or promotion witness is synthesized.
+func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) {
+	cluster.t.Helper()
+	step := 0
+	for step < 100000 {
+		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+		if doneReached {
+			return
+		}
+		leader := -1
+		for index, host := range cluster.hosts {
+			if cluster.inactive[index] {
+				continue
+			}
+			status, err := host.Status(cluster.group)
+			if err != nil {
+				cluster.t.Fatal(err)
+			}
+			if status.MemberID == status.LeaderID && status.LeaderID != 0 {
+				if leader >= 0 {
+					cluster.t.Fatalf("multiple leaders at protocol-idle step %d: %s",
+						idleStep, cluster.diagnostic())
+				}
+				leader = index
+			}
+		}
+		if leader < 0 {
+			cluster.t.Fatalf("no leader at protocol-idle step %d: %s",
+				idleStep, cluster.diagnostic())
+		}
+		if err := cluster.hosts[leader].RequestTick(cluster.group); err != nil {
+			cluster.t.Fatal(err)
+		}
+		step++
+	}
+	cluster.t.Fatalf("cluster drive with leader ticks did not converge: %s",
+		cluster.diagnostic())
+}
+
+// driveUntilWithStaggeredVoterClocks advances two independent voter clocks in
+// bounded phases. Deterministic in-memory hosts otherwise begin with identical
+// election-timeout state; ticking them in lockstep can make both self-vote in
+// the same term forever when the third voter is intentionally unavailable.
+//
+// Every tick below is a real Raft input. After each input, driveUntilIdle
+// persists every Ready and routes every authenticated outbound message before
+// another clock advances. The first voter's expired lease lets it vote when
+// the second voter campaigns in the later phase; no vote, leader, publication,
+// or applied-position witness is synthesized.
+func (cluster *realTransferCluster) driveUntilWithStaggeredVoterClocks(
+	done func() bool,
+	firstMember, secondMember uint64,
+	maxTickRoundsPerVoter int,
+) {
+	cluster.t.Helper()
+	if firstMember == 0 || secondMember == 0 || firstMember == secondMember ||
+		maxTickRoundsPerVoter <= 0 {
+		cluster.t.Fatal("staggered voter clock bounds must name two distinct voters")
+	}
+	step := 0
+	for phase, member := range [...]uint64{firstMember, secondMember} {
+		index, found := cluster.memberIndex[member]
+		if !found || cluster.inactive[index] {
+			cluster.t.Fatalf("staggered voter %d is unavailable in phase %d", member, phase)
+		}
+		if cluster.suppressTargetTicks && member == cluster.promotionTarget {
+			cluster.t.Fatalf("staggered voter %d is the clock-suppressed promotion target", member)
+		}
+		for tickRound := 0; tickRound < maxTickRoundsPerVoter; tickRound++ {
+			doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+			if doneReached {
+				cluster.drainConvergedWorkToIdle(done, &step)
+				return
+			}
+			status, statusErr := cluster.hosts[index].Status(cluster.group)
+			publication, publicationErr := cluster.hosts[index].Publication(cluster.group)
+			if statusErr != nil || publicationErr != nil {
+				cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+			}
+			if status.MemberID != member || !confHasVoter(publication.ConfState, member) {
+				cluster.t.Fatalf("staggered member %d is not an active voter at idle step %d: %s",
+					member, idleStep, cluster.diagnostic())
+			}
+			if err := cluster.hosts[index].RequestTick(cluster.group); err != nil {
+				cluster.t.Fatalf("tick staggered voter %d at idle step %d phase %d round %d: %v",
+					member, idleStep, phase, tickRound, err)
+			}
+			step++
+		}
+	}
+	// Consume the final admitted tick and all of its resulting protocol work
+	// before reporting failure, preserving the one-input-at-an-idle-cut rule.
+	doneReached, _ := cluster.driveUntilIdle(done, &step)
+	if doneReached {
+		cluster.drainConvergedWorkToIdle(done, &step)
+		return
+	}
+	cluster.t.Fatalf("cluster election did not converge after %d staggered tick rounds per voter: %s",
+		maxTickRoundsPerVoter, cluster.diagnostic())
+}
+
+// drainConvergedWorkToIdle consumes only Ready and outbound work already made
+// pending by the election that satisfied done. A status/publication predicate
+// can become true before the new leader's no-op Ready and messages have crossed
+// the scheduler boundary; issuing TransferLeader at that point would be a new
+// protocol input while Ready is still outstanding. No ticks or other inputs are
+// admitted here, and convergence must remain true throughout the drain.
+func (cluster *realTransferCluster) drainConvergedWorkToIdle(done func() bool, step *int) {
+	cluster.t.Helper()
+	for *step < 100000 {
+		if !done() {
+			cluster.t.Fatalf("election convergence changed while draining existing work at step %d: %s",
+				*step, cluster.diagnostic())
+		}
+		current := *step
+		*step++
+		if !cluster.driveRound(current) {
+			if !done() {
+				cluster.t.Fatalf("election convergence changed at protocol-idle step %d: %s",
+					current, cluster.diagnostic())
+			}
+			return
+		}
+	}
+	cluster.t.Fatalf("cluster did not reach protocol idle after election convergence: %s",
+		cluster.diagnostic())
+}
+
+func (cluster *realTransferCluster) diagnostic() string {
+	if cluster == nil {
+		return "nil cluster"
+	}
+	var result strings.Builder
+	for index, host := range cluster.hosts {
+		if index != 0 {
+			result.WriteString("; ")
+		}
+		status, statusErr := host.Status(cluster.group)
+		publication, publicationErr := host.Publication(cluster.group)
+		version, versionFound := uint64(0), false
+		if index < len(cluster.registries) && cluster.registries[index] != nil {
+			version, versionFound = cluster.registries[index].ReplicaSetVersion(cluster.group)
+		}
+		fmt.Fprintf(&result,
+			"host=%d inactive=%t status={member=%d leader=%d term=%d commit=%d applied=%d err=%v} "+
+				"publication={applied=%d version=%d conf=%v err=%v} authority={version=%d found=%t}",
+			index, cluster.inactive[index], status.MemberID, status.LeaderID, status.Term,
+			status.Commit, status.Applied, statusErr, publication.Applied,
+			publication.ReplicaSetVersion, publication.ConfState, publicationErr,
+			version, versionFound)
+	}
+	return result.String()
 }
 
 func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.OutboundMessage) {
@@ -151,9 +411,18 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 	if !ok {
 		cluster.t.Fatalf("unknown outbound destination %d", outbound.To)
 	}
+	if cluster.inactive[receiverIndex] {
+		return
+	}
 	sender := cluster.registries[senderIndex]
 	receiver := cluster.registries[receiverIndex]
 	frame, destination, err := sender.EncodeOutbound(nil, outbound)
+	if errors.Is(err, rafttransport.ErrUnauthorized) {
+		publication, publicationErr := cluster.hosts[senderIndex].Publication(outbound.Group)
+		if publicationErr == nil && !confHasMember(publication.ConfState, outbound.From) {
+			return
+		}
+	}
 	if err != nil || destination != receiver.LocalNode() {
 		cluster.t.Fatalf("encode %s %d->%d = %x, %v",
 			outbound.Message.GetType(), outbound.From, outbound.To, destination, err)
@@ -162,11 +431,24 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 		inbound, err := receiver.DecodeInbound(rafttransport.PeerIdentity{
 			TrustDomain: receiver.TrustDomain(), Node: sender.LocalNode(),
 		}, frame)
+		if errors.Is(err, rafttransport.ErrRetiredAuthority) &&
+			cluster.isSafeRetiredGenerationDrop(receiverIndex, outbound) {
+			return
+		}
 		if err != nil {
 			cluster.t.Fatalf("decode %s %d->%d: %v", outbound.Message.GetType(), outbound.From, outbound.To, err)
 		}
 		if err := cluster.hosts[receiverIndex].AdoptMessage(inbound.Group, inbound.Message); err != nil {
 			cluster.t.Fatalf("adopt %s %d->%d: %v", outbound.Message.GetType(), outbound.From, outbound.To, err)
+		}
+		if !cluster.promotionVoteSeen && outbound.To == cluster.promotionTarget &&
+			(outbound.Message.GetType() == pb.MsgVote || outbound.Message.GetType() == pb.MsgPreVote) {
+			role, roleErr := receiver.Role(outbound.Group, cluster.promotionTarget)
+			if roleErr != nil || role != rafttransport.MemberLearner {
+				cluster.t.Fatalf("promotion election admitted after target publication: role=%d err=%v",
+					role, roleErr)
+			}
+			cluster.promotionVoteSeen = true
 		}
 	}
 	deliver()
@@ -178,6 +460,59 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 			deliver()
 		}
 	}
+}
+
+// isSafeRetiredGenerationDrop recognizes only an in-flight frame from the
+// exact authority retired by source removal when both endpoints remain members
+// of the receiver's committed configuration. Source removal deliberately revokes the
+// whole prior transport authority so the receiver must reject, rather than
+// authenticate, this frame. A real stream drops that rejected frame; the
+// deterministic harness must model the same behavior without masking a frame
+// from the removed source or an unrelated stale authority.
+func (cluster *realTransferCluster) isSafeRetiredGenerationDrop(
+	receiverIndex int,
+	outbound raftmember.OutboundMessage,
+) bool {
+	fromRole, fromErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.From)
+	toRole, toErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.To)
+	if fromErr != nil || toErr != nil || fromRole == rafttransport.MemberEnrolled ||
+		toRole == rafttransport.MemberEnrolled {
+		return false
+	}
+	publication, err := cluster.hosts[receiverIndex].Publication(outbound.Group)
+	receiverVersion, found := cluster.registries[receiverIndex].ReplicaSetVersion(outbound.Group)
+	return err == nil && found && publication.ReplicaSetVersion == receiverVersion &&
+		confHasMember(publication.ConfState, outbound.From) &&
+		confHasMember(publication.ConfState, outbound.To)
+}
+
+func confHasMember(conf *pb.ConfState, member uint64) bool {
+	if conf == nil {
+		return false
+	}
+	for _, values := range [][]uint64{conf.GetVoters(), conf.GetLearners(),
+		conf.GetVotersOutgoing(), conf.GetLearnersNext()} {
+		for _, candidate := range values {
+			if candidate == member {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func confHasVoter(conf *pb.ConfState, member uint64) bool {
+	if conf == nil {
+		return false
+	}
+	for _, values := range [][]uint64{conf.GetVoters(), conf.GetVotersOutgoing()} {
+		for _, candidate := range values {
+			if candidate == member {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (cluster *realTransferCluster) allAppliedWithLeader(
@@ -202,25 +537,38 @@ func newRealTransferRuntime(
 	t *testing.T,
 	identity raftstore.Identity,
 	voters []uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
+	return newRealTransferRuntimeWithLearners(t, identity, voters, nil)
+}
+
+func newRealTransferRuntimeWithLearners(
+	t *testing.T,
+	identity raftstore.Identity,
+	voters, learners []uint64,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
 	index, term := uint64(1), uint64(1)
-	wal, err := raftstore.Create(filepath.Join(t.TempDir(), "member.wal"), identity, realTransferWALKey(), raftstore.Bootstrap{
+	walPath := filepath.Join(t.TempDir(), "member.wal")
+	sqlPath := filepath.Join(t.TempDir(), "member.vdb")
+	options := raftstore.Options{
+		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
+	}
+	wal, err := raftstore.Create(walPath, identity, realTransferWALKey(), raftstore.Bootstrap{
 		TopologyRecoveryEpoch: 29,
 		Snapshot: &pb.Snapshot{
 			Data: []byte("multiraft-real-transfer-bootstrap"),
 			Metadata: &pb.SnapshotMetadata{
-				Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: append([]uint64(nil), voters...)},
+				Index: &index, Term: &term, ConfState: &pb.ConfState{
+					Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
+				},
 			},
 		},
-	}, raftstore.Options{
-		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
-		MaxRecords: 1024, MaxEntries: 8192, MaxLiveBytes: 2 * raftstore.MinimumReadyLiveBytes,
-	})
+	}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	database, err := sqldriver.InitializeShardStore(filepath.Join(t.TempDir(), "member.vdb"), sqldriver.ShardStoreBinding{
+	database, err := sqldriver.InitializeShardStore(sqlPath, sqldriver.ShardStoreBinding{
 		Distribution:         distribution.DistributionName(identity.Distribution),
 		Shard:                distribution.ShardID(identity.Shard),
 		AllocationGeneration: distribution.ShardAllocationGeneration(identity.AllocationGeneration),
@@ -260,7 +608,7 @@ func newRealTransferRuntime(
 		_ = wal.Close()
 		t.Fatal(err)
 	}
-	apply, _, err := raftmember.OpenPreparedApply(wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
+	apply, applyID, err := raftmember.OpenPreparedApply(wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 		MaxSessions: 16, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 256, MaxBytes: 64 << 20},
 		Placement: sqldriver.ReplicatedPlacementProfile{
@@ -295,10 +643,36 @@ func newRealTransferRuntime(
 		}
 		t.Fatal(err)
 	}
-	return runtime, base
+	reopen := func() *raftmember.Runtime {
+		t.Helper()
+		reopenedWAL, openErr := raftstore.Open(walPath, identity, 29,
+			realTransferWALKey(), options)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		reopenedDB, reopenedApply, openErr := raftmember.OpenBoundSQLWithApply(
+			sqlPath, reopenedWAL, authority, base, applyID)
+		if openErr != nil {
+			_ = reopenedWAL.Close()
+			t.Fatal(openErr)
+		}
+		restarted, openErr := raftmember.AdoptRuntime(reopenedWAL, reopenedDB, reopenedApply)
+		if openErr != nil {
+			if restarted != nil {
+				_ = restarted.Close()
+			} else {
+				_ = reopenedApply.Close()
+				_ = reopenedDB.Close()
+				_ = reopenedWAL.Close()
+			}
+			t.Fatal(openErr)
+		}
+		return restarted
+	}
+	return runtime, base, reopen
 }
 
-func realTransferIdentities() [3]raftstore.Identity {
+func realTransferIdentities() [4]raftstore.Identity {
 	var shared raftstore.Identity
 	shared.Distribution = "orders"
 	shared.Shard = "0000-7fff"
@@ -312,7 +686,7 @@ func realTransferIdentities() [3]raftstore.Identity {
 	fill(&shared.ClusterIncarnation, 21)
 	fill(&shared.ShardIncarnation, 41)
 	fill(&shared.GroupID, 61)
-	var identities [3]raftstore.Identity
+	var identities [4]raftstore.Identity
 	for index := range identities {
 		identities[index] = shared
 		identities[index].MemberID = uint64(index + 1)
