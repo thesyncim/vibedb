@@ -25,6 +25,9 @@ func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
 	if current != 19 || next != 20 {
 		t.Fatalf("catalog generations = %d/%d", current, next)
 	}
+	if plan.OperationID() == (OperationID{}) {
+		t.Fatal("zero operation identity")
+	}
 	got, ok := plan.Target(1)
 	if !ok || got.SQL.Binding != target.SQL.Binding || got.Endpoint != "node-b" {
 		t.Fatalf("target = %+v, %v", got, ok)
@@ -91,6 +94,9 @@ func TestRecoverPlanCollapsesPublishedChildrenWithoutOldCatalog(t *testing.T) {
 	if !recovered.sourceManifest.Equal(plan.sourceManifest) ||
 		!recovered.targetManifest.Equal(plan.targetManifest) {
 		t.Fatal("recovered manifests differ from original plan")
+	}
+	if recovered.OperationID() != plan.OperationID() {
+		t.Fatalf("recovered operation id=%x want=%x", recovered.OperationID(), plan.OperationID())
 	}
 	if _, err := RecoverPlan(
 		published, 18, split, plan.partitioner, []ChildTarget{target},

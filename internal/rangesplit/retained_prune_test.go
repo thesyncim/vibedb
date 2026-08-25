@@ -17,7 +17,7 @@ import (
 
 func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(t)
-	pruner, err := NewRetainedPruner(partitioner, certificate, nil)
+	pruner, err := newTestRetainedPruner(t, partitioner, certificate, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 
 	// Crash before proposal: the persisted awaiting cursor deterministically
 	// replans the same exact batch from the unchanged source publication.
-	pruner, err = NewRetainedPruner(partitioner, certificate, persisted)
+	pruner, err = newTestRetainedPruner(t, partitioner, certificate, persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 
 	// Crash after apply but before cursor confirmation: recovery consumes and
 	// verifies the already durable capture entry, then advances the scan floor.
-	pruner, err = NewRetainedPruner(partitioner, certificate, persisted)
+	pruner, err = newTestRetainedPruner(t, partitioner, certificate, persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,12 +132,64 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		fixture.user.Collection.Len() != 2 {
 		t.Fatalf("cursor=%+v rows=%d generation=%d stored=%d", cursor, rows, generation, fixture.user.Collection.Len())
 	}
-	if reopened, err := NewRetainedPruner(partitioner, certificate, persisted); err != nil ||
+	if reopened, err := newTestRetainedPruner(t, partitioner, certificate, persisted); err != nil ||
 		reopened.Cursor().Phase() != RetainedPruneComplete {
 		t.Fatalf("reopen=%v err=%v", reopened, err)
 	}
-	if err := partitioner.VerifyRetainedPruneCompletion(certificate, cursor); err != nil {
+	// A retained write committed immediately after terminal verification cannot
+	// strand completion. One bounded turn authenticates and absorbs its capture
+	// entry, and the advanced complete cursor remains restartable.
+	sequence++
+	applied++
+	retained, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 0))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+		t, fixture, binding, 5, sequence,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("late-retained"), Value: retained},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, has, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace); advanceErr != nil || has {
+		t.Fatalf("late retained completion advance has=%v err=%v", has, advanceErr)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	advanced := pruner.Cursor()
+	advancedRows, _, _, advancedDigest, proofOK := advanced.RetainedProof()
+	if advanced.Phase() != RetainedPruneComplete || advanced.SourceCut().Applied != applied ||
+		!proofOK || advancedRows != rows+1 || advancedDigest == cursor.retainedDigest {
+		t.Fatalf("advanced complete cursor=%+v", advanced)
+	}
+	if reopened, err := newTestRetainedPruner(t, partitioner, certificate, persisted); err != nil ||
+		reopened.Cursor().SourceCut() != advanced.SourceCut() {
+		t.Fatalf("reopen late complete=%v err=%v", reopened, err)
+	}
+	opened, err := OpenRetainedPruneCursor(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reencoded, err := AppendRetainedPruneCursor(nil, opened)
+	if err != nil || !bytes.Equal(reencoded, persisted) {
+		t.Fatalf("cursor canonical replay equal=%t err=%v", bytes.Equal(reencoded, persisted), err)
+	}
+	if err := partitioner.VerifyRetainedPruneCompletion(
+		certificate, cursor.OperationID(), cursor,
+	); err != nil {
+		t.Fatal(err)
+	}
+	wrongOperation := cursor.OperationID()
+	wrongOperation[0] ^= 0xff
+	if err := partitioner.VerifyRetainedPruneCompletion(
+		certificate, wrongOperation, cursor,
+	); !errors.Is(err, ErrRetainedPrune) {
+		t.Fatalf("cross-operation completion err=%v", err)
 	}
 	currentManifest, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
 		ID: "source", AllocationGeneration: 7,
@@ -149,17 +201,17 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	}
 	nextManifest := testSplitPlan(t, "node-b").Manifest()
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, 19, 20, certificate, cursor,
+		currentManifest, nextManifest, 19, 20, certificate,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, 19, 21, certificate, cursor,
+		currentManifest, nextManifest, 19, 21, certificate,
 	); !errors.Is(err, ErrManifestTransition) {
 		t.Fatalf("skipped catalog generation err=%v", err)
 	}
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, 18, 20, certificate, cursor,
+		currentManifest, nextManifest, 18, 20, certificate,
 	); !errors.Is(err, ErrManifestTransition) {
 		t.Fatalf("certificate/catalog generation mismatch err=%v", err)
 	}
@@ -168,25 +220,57 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 	incomplete.snapshotGeneration = 0
 	incomplete.retainedDigest = [sha256.Size]byte{}
 	if err := partitioner.VerifyRetainedPruneCompletion(
-		certificate, incomplete,
+		certificate, cursor.OperationID(), incomplete,
 	); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("incomplete proof err=%v", err)
 	}
 	if err := partitioner.ValidatePublicationTransition(
-		currentManifest, nextManifest, 19, 20, certificate, incomplete,
+		currentManifest, nextManifest, 19, 20, certificate,
+	); err != nil {
+		t.Fatalf("publication must precede prune: %v", err)
+	}
+	if err := partitioner.ValidateRetainedPruneAuthority(
+		nextManifest, 20, certificate,
+	); err != nil {
+		t.Fatalf("published prune authority=%v", err)
+	}
+	if err := partitioner.ValidateRetainedPruneAuthority(
+		currentManifest, 19, certificate,
 	); !errors.Is(err, ErrRetainedPrune) {
-		t.Fatalf("incomplete publication proof err=%v", err)
+		t.Fatalf("unpublished prune authority=%v", err)
+	}
+	if _, err := NewRetainedPruner(
+		partitioner, certificate, nil, nil,
+	); !errors.Is(err, ErrRetainedPrune) {
+		t.Fatalf("pruner accepted unpublished source authority=%v", err)
+	}
+	if _, err := NewRetainedPruner(partitioner, certificate, forgedPruneAuthority{
+		manifest: nextManifest, generation: 20, operation: [sha256.Size]byte{1},
+		certificate: certificate.Digest(),
+	}, nil); !errors.Is(err, ErrRetainedPrune) {
+		t.Fatalf("pruner accepted structurally compatible forged authority=%v", err)
 	}
 	corrupt := bytes.Clone(persisted)
 	corrupt[len(corrupt)-1] ^= 1
-	if _, err := NewRetainedPruner(partitioner, certificate, corrupt); !errors.Is(err, ErrRetainedPrune) {
+	if _, err := newTestRetainedPruner(t, partitioner, certificate, corrupt); !errors.Is(err, ErrRetainedPrune) {
 		t.Fatalf("corrupt cursor err=%v", err)
 	}
 }
 
+type forgedPruneAuthority struct {
+	manifest               *distribution.Manifest
+	generation             uint64
+	operation, certificate [sha256.Size]byte
+}
+
+func (a forgedPruneAuthority) Manifest() *distribution.Manifest { return a.manifest }
+func (a forgedPruneAuthority) Generation() uint64               { return a.generation }
+func (a forgedPruneAuthority) Operation() [sha256.Size]byte     { return a.operation }
+func (a forgedPruneAuthority) Certificate() [sha256.Size]byte   { return a.certificate }
+
 func BenchmarkRetainedPrunerPendingRetry(b *testing.B) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(b)
-	pruner, err := NewRetainedPruner(partitioner, certificate, nil)
+	pruner, err := newTestRetainedPruner(b, partitioner, certificate, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -226,9 +310,72 @@ func BenchmarkRetainedPrunerPendingRetry(b *testing.B) {
 	}
 }
 
-func TestRetainedPrunerRejectsUnexpectedPostSealEntry(t *testing.T) {
+func BenchmarkPublishBeforePruneAuthorityStages(b *testing.B) {
+	partitioner, _, _, certificate := newRetainedPruneFixture(b)
+	current, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
+		ID: "source", AllocationGeneration: 7,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"node-a"}, Epoch: 5,
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	published := testSplitPlan(b, "node-b").Manifest()
+	pruner, err := newTestRetainedPruner(b, partitioner, certificate, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cursor := pruner.Cursor()
+	raw, err := AppendRetainedPruneCursor(nil, &cursor)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var publishWorkspace, pruneWorkspace PublicationTransitionWorkspace
+	for _, stage := range []struct {
+		name string
+		run  func() error
+	}{
+		{"publish_certificate", func() error {
+			return partitioner.ValidatePublicationTransitionWithWorkspace(
+				current, published, 19, 20, certificate, &publishWorkspace,
+			)
+		}},
+		{"published_prune_authority", func() error {
+			return partitioner.ValidateRetainedPruneAuthorityWithWorkspace(
+				published, 20, certificate, &pruneWorkspace,
+			)
+		}},
+	} {
+		b.Run(stage.name, func(b *testing.B) {
+			if err := stage.run(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if err := stage.run(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(len(raw)), "cursor-B")
+			b.ReportMetric(float64(len(raw)-sha256.Size), "authenticated-meta-B")
+		})
+	}
+}
+
+func TestRetainedPruneLimitsRejectUnboundedScanWork(t *testing.T) {
+	_, err := normalizeRetainedPruneLimits(RetainedPruneLimits{
+		MaxScanRows: MaxRetainedPruneScanRows + 1,
+	})
+	if !errors.Is(err, ErrRetainedPrune) {
+		t.Fatalf("err=%v, want %v", err, ErrRetainedPrune)
+	}
+}
+
+func TestRetainedPrunerAdvancesRetainedWritesAndRejectsOutOfRangeWrites(t *testing.T) {
 	partitioner, fixture, capture, certificate := newRetainedPruneFixture(t)
-	pruner, err := NewRetainedPruner(partitioner, certificate, nil)
+	pruner, err := newTestRetainedPruner(t, partitioner, certificate, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,17 +398,63 @@ func TestRetainedPrunerRejectsUnexpectedPostSealEntry(t *testing.T) {
 	if err := snapshot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(7), nil); err != nil {
+	binding := fixture.binding
+	binding.OwnershipEpoch++
+	binding.RoutingVersion++
+	binding.RouteGeneration++
+	retained, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(7), retainedMutationCommand(
+		t, fixture, binding, 5, 2,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("e-retained"), Value: retained},
+	)); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err = fixture.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace)
+	_, has, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace)
 	closeErr := snapshot.Close()
+	if advanceErr != nil || has || closeErr != nil ||
+		pruner.Cursor().Phase() != RetainedPruneAwaitingApply {
+		t.Fatalf("retained advance has=%v err=%v close=%v cursor=%+v",
+			has, advanceErr, closeErr, pruner.Cursor())
+	}
+	pruner, err = newTestRetainedPruner(t, partitioner, certificate, persisted)
+	if err != nil {
+		t.Fatalf("restart after retained write: %v", err)
+	}
+	snapshot, err = fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, has, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace)
+	closeErr = snapshot.Close()
+	if advanceErr != nil || !has || closeErr != nil || retry.Count != 1 {
+		t.Fatalf("retry after retained write batch=%+v has=%v err=%v close=%v",
+			retry, has, advanceErr, closeErr)
+	}
+	outOfRange, err := vibejson.AppendCanonicalize(nil, documentForChild(t, partitioner, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(8), retainedMutationCommand(
+		t, fixture, binding, 5, 3,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("f-out-of-range"), Value: outOfRange},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, advanceErr = pruner.Advance(snapshot, capture, limits, persist, &workspace)
+	closeErr = snapshot.Close()
 	if !errors.Is(advanceErr, ErrRetainedPrune) || closeErr != nil {
-		t.Fatalf("unexpected source entry err=%v close=%v", advanceErr, closeErr)
+		t.Fatalf("out-of-range source entry err=%v close=%v", advanceErr, closeErr)
 	}
 }
 
@@ -398,6 +591,16 @@ func newRetainedPruneFixture(
 	return partitioner, fixture, capture, certificate
 }
 
+func newTestRetainedPruner(
+	t testing.TB,
+	partitioner *Partitioner,
+	certificate CutoverCertificate,
+	persisted []byte,
+) (*RetainedPruner, error) {
+	t.Helper()
+	return newRetainedPruner(partitioner, certificate, [sha256.Size]byte{1}, persisted)
+}
+
 func retainedPruneCommand(
 	t testing.TB,
 	fixture sourceCaptureFixture,
@@ -414,6 +617,18 @@ func retainedPruneCommand(
 			Kind: replication.MutationDelete, Key: bytes.Clone(iterator.Key()),
 		})
 	}
+	return retainedMutationCommand(t, fixture, binding, replicaSetVersion, sequence, mutations...)
+}
+
+func retainedMutationCommand(
+	t testing.TB,
+	fixture sourceCaptureFixture,
+	binding replicatedstate.Binding,
+	replicaSetVersion uint64,
+	sequence uint64,
+	mutations ...replication.Mutation,
+) []byte {
+	t.Helper()
 	fingerprint := sha256.Sum256([]byte{byte(sequence), 0x70})
 	encoded, err := replication.AppendCommand(nil, replication.Command{
 		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
