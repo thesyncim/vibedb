@@ -173,6 +173,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	registries[3], cluster.registries[3] = restartRegistry, restartRegistry
 	cluster.inactive[0], cluster.inactive[3] = true, false
 	cluster.holdTargetUntilVote = true
+	cluster.suppressTargetTicks = true
 	if err = hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +200,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
+	cluster.suppressTargetTicks = false
 	replacementLeaderIndex, ok := cluster.memberIndex[replacementLeader]
 	if !ok {
 		t.Fatalf("elected replacement leader %d has no host", replacementLeader)
