@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -116,6 +117,10 @@ type ReplicatedResult struct {
 	Retries    int
 }
 
+func replicatedRequestDigest(command []byte) [sha256.Size]byte {
+	return sha256.Sum256(command)
+}
+
 // ReplicatedPointRead selects one explicit consistency contract. A
 // linearizable read is leader-only and ReadIndex-fenced. A follower read is
 // bounded solely by MinimumApplied and may fall back to any replica that has
@@ -199,6 +204,7 @@ func (executor *ReplicatedExecutor) ReadPoint(
 		switch response.Kind {
 		case shardservice.ReplicatedReadFound, shardservice.ReplicatedReadMissing:
 			if response.Refusal != shardservice.ReplicatedRefusalNone ||
+				response.RequestDigest != ([sha256.Size]byte{}) ||
 				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
 				response.ReadApplied < read.MinimumApplied ||
 				response.State.Applied < response.ReadApplied ||
@@ -358,6 +364,7 @@ func (executor *ReplicatedExecutor) propose(
 		return ReplicatedResult{}, ErrReplicatedRoute
 	}
 	original := command[:len(command):len(command)]
+	requestDigest := replicatedRequestDigest(original)
 	preferred := route.Replicas[0].Member
 	var lastUnknown error
 	if priorUnknown {
@@ -453,6 +460,7 @@ func (executor *ReplicatedExecutor) propose(
 			commandView, commandErr := replication.OpenCommand(original)
 			completion, completionErr := replication.OpenCompletion(response.Completion)
 			if commandErr != nil || completionErr != nil ||
+				response.RequestDigest != requestDigest ||
 				response.Refusal != shardservice.ReplicatedRefusalNone ||
 				response.Outcome.Code != raftserve.OutcomeCompletion ||
 				response.Outcome.AppliedIndex == 0 ||
@@ -484,7 +492,8 @@ func (executor *ReplicatedExecutor) propose(
 			continue
 		case shardservice.ReplicatedRefusal:
 			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
-				if validReplicatedAppliedRefusal(response) {
+				if response.RequestDigest == requestDigest &&
+					validReplicatedAppliedRefusal(response) {
 					return ReplicatedResult{}, &ReplicatedRefusalError{
 						Code: response.Refusal, Outcome: response.Outcome,
 					}
@@ -619,6 +628,7 @@ func validReplicatedMemberState(state shardservice.ReplicatedMemberState) bool {
 
 func validReplicatedNonterminalResponse(response *shardservice.ReplicatedResponse) bool {
 	return response != nil && response.Refusal == shardservice.ReplicatedRefusalNone &&
+		response.RequestDigest == ([sha256.Size]byte{}) &&
 		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 		response.ReadApplied == 0 && len(response.Value) == 0
 }
@@ -633,6 +643,7 @@ func validReplicatedUnavailableWithoutState(
 	return response != nil && response.Kind == shardservice.ReplicatedRefusal &&
 		response.Refusal == shardservice.ReplicatedRefusalUnavailable &&
 		!response.HasState && response.State == (shardservice.ReplicatedMemberState{}) &&
+		response.RequestDigest == ([sha256.Size]byte{}) &&
 		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 		response.ReadApplied == 0 && len(response.Value) == 0
 }
@@ -653,6 +664,7 @@ func validReplicatedWritePreAdmissionRefusal(
 ) bool {
 	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != code || response.Outcome != (raftserve.Outcome{}) ||
+		response.RequestDigest != ([sha256.Size]byte{}) ||
 		len(response.Completion) != 0 || response.ReadApplied != 0 || len(response.Value) != 0 {
 		return false
 	}
@@ -674,6 +686,7 @@ func validReplicatedReadRefusal(
 ) bool {
 	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != code || response.Outcome != (raftserve.Outcome{}) ||
+		response.RequestDigest != ([sha256.Size]byte{}) ||
 		len(response.Completion) != 0 || response.ReadApplied != 0 || len(response.Value) != 0 {
 		return false
 	}

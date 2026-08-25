@@ -2,6 +2,7 @@ package shardservice
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -22,6 +23,10 @@ type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
 	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
+}
+
+func replicatedRequestDigest(command []byte) [sha256.Size]byte {
+	return sha256.Sum256(command)
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
@@ -400,7 +405,8 @@ func (server *ReplicatedServer) executeReplicated(
 		}
 		response := &ReplicatedResponse{
 			Kind: ReplicatedCompletion, HasState: true, State: wireState,
-			Outcome: result.Outcome, Completion: result.Completion,
+			Outcome: result.Outcome, RequestDigest: replicatedRequestDigest(request.Command),
+			Completion: result.Completion,
 		}
 		if validReplicatedResponse(response) {
 			return response
@@ -440,6 +446,7 @@ func (server *ReplicatedServer) executeReplicated(
 		response := &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: wireState, Outcome: result.Outcome,
+			RequestDigest: replicatedRequestDigest(request.Command),
 		}
 		if validReplicatedResponse(response) {
 			return response
