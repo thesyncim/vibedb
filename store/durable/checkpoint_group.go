@@ -1369,15 +1369,6 @@ func (g *CheckpointGroup) Seed(
 		return fmt.Errorf("%w: seed profile or member", ErrCheckpointGroupCorrupt)
 	}
 	if g.applied == applied && g.certApplied.Load() == applied {
-		// Transaction one is the exact seed row. A successful activation then
-		// publishes the required second same-index snapshot-base transition,
-		// whose State envelope is intentionally different while the original
-		// seed commitment remains in every later certificate. Retrying Seed
-		// after that point must not mistake the certified activation row for
-		// corruption; Machine.Open independently validates that newer State.
-		if g.txn > 1 && g.certTxn.Load() > 1 {
-			return g.checkpointLocked()
-		}
 		value, found, readErr := owned.AppendRaw(nil, key)
 		if readErr != nil || !found || !slices.Equal(value, seed.Envelope) {
 			return errors.Join(

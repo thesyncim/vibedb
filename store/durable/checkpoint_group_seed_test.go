@@ -309,7 +309,7 @@ func TestCheckpointGroupSeedRequiresAndFencesEveryImportedImage(t *testing.T) {
 }
 
 func TestCheckpointGroupSeedIsSoleCutZeroMutationAndBaseBindingDoesNotAdvance(t *testing.T) {
-	_, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
 	if _, err := members[1].Collection.Put(
 		[]byte("row"), []byte(`{"value":"staged"}`),
 	); err != nil {
@@ -408,6 +408,31 @@ func TestCheckpointGroupSeedIsSoleCutZeroMutationAndBaseBindingDoesNotAdvance(t 
 	}
 	if group.SeedActivationPending() {
 		t.Fatal("certified snapshot-base binding remained activation-pending")
+	}
+	for _, key := range [][]byte{[]byte("wrong-state-key"), []byte("state")} {
+		if err := group.Seed(
+			seed, members[0], defaultTxnLimits(), key,
+		); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("post-activation Seed(%q) = %v", key, err)
+		}
+	}
+	image := copyCheckpointGroupDirectory(t, dir)
+	reopenedMembers, _, reopened := openCheckpointGroupTestCopy(t, image)
+	if reopened.SeedActivationPending() || reopened.AppliedIndex() != seed.Applied ||
+		reopened.CheckpointAppliedIndex() != seed.Applied {
+		t.Fatalf("reopened activation cut = pending %v, applied %d/%d",
+			reopened.SeedActivationPending(), reopened.AppliedIndex(),
+			reopened.CheckpointAppliedIndex())
+	}
+	if value, found, err := reopenedMembers[0].AppendRaw(nil, []byte("state")); err != nil ||
+		!found || !bytes.Equal(value, []byte(`{"state":"base-bound"}`)) {
+		t.Fatalf("reopened activation state = %q, found %v, err %v", value, found, err)
+	}
+	if err := reopened.Seed(
+		seed, NamedCollection{Name: "system", Collection: reopenedMembers[0]},
+		defaultTxnLimits(), []byte("wrong-state-key"),
+	); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("reopened post-activation wrong-key Seed = %v", err)
 	}
 }
 
