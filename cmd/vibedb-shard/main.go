@@ -1,7 +1,9 @@
 // Command vibedb-shard is the leader-only shard service: it opens one local
 // vibedb SQL catalog, adopts a static ownership identity (distribution, shard,
 // topology allocation generation, ownership epoch, and routing version), and
-// serves the shard-service wire contract over a stdlib length-prefixed transport.
+// serves the shard-service wire contract over a bounded, mutually authenticated
+// TLS 1.3 transport. Plaintext serving is an explicit loopback-only development
+// mode.
 //
 // It admits every request against its configured identity before executing, and
 // executes the admitted statement locally through the ordinary vibedb parser and
@@ -34,9 +36,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -59,6 +65,17 @@ func run(args []string) int {
 		usage()
 		return 2
 	}
+}
+
+type repeatedFlag []string
+
+func (values *repeatedFlag) String() string { return strings.Join(*values, ",") }
+func (values *repeatedFlag) Set(value string) error {
+	if value == "" || len(*values) >= servicetls.AbsoluteMaxIdentities {
+		return servicetls.ErrInvalidProfile
+	}
+	*values = append(*values, value)
+	return nil
 }
 
 func usage() {
@@ -119,7 +136,16 @@ func runServe(args []string) int {
 		epoch          = fs.Uint64("epoch", 0, "static ownership epoch")
 		routingVersion = fs.Uint64("routing-version", 0, "routed manifest generation")
 		maxConns       = fs.Int("max-connections", 0, "0 selects the default; -1 is unlimited")
+		devPlaintext   = fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
+		tlsCertificate = fs.String("tls-certificate", "", "PEM shard certificate chain")
+		tlsKey         = fs.String("tls-key", "", "PEM shard private key")
+		tlsRoots       = fs.String("tls-roots", "", "PEM gateway trust roots")
+		tlsIdentityOID = fs.String("tls-identity-oid", "", "operator VibeDB identity OID")
+		tlsTimeout     = fs.Duration("tls-handshake-timeout", 5*time.Second, "hard TLS handshake deadline")
+		maxHandshakes  = fs.Int("max-handshakes", 32, "hard concurrent TLS handshake bound")
 	)
+	var allowedGateways repeatedFlag
+	fs.Var(&allowedGateways, "allow-gateway-node", "allowed 32-character hexadecimal gateway NodeID; repeat for each principal")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -128,9 +154,46 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
-	if err := requireLoopbackListen(*listen); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 2
+	var authenticated *servicetls.Server
+	authenticatedConnectionLimit := *maxConns
+	if authenticatedConnectionLimit == 0 {
+		authenticatedConnectionLimit = shardservice.DefaultMaxConnections
+	}
+	if *devPlaintext {
+		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" || len(allowedGateways) != 0 {
+			fmt.Fprintln(os.Stderr, "error: development plaintext and TLS configuration are mutually exclusive")
+			return 2
+		}
+		if err := requireLoopbackListen(*listen); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 2
+		}
+	} else {
+		profile, err := servicetls.LoadProfile(*tlsCertificate, *tlsKey, *tlsRoots, *tlsIdentityOID, time.Now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error load TLS profile: %v\n", err)
+			return 2
+		}
+		allowed := make([]rafttransport.NodeID, len(allowedGateways))
+		for index, encoded := range allowedGateways {
+			allowed[index], err = servicetls.ParseNodeID(encoded)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error allowed gateway %d: %v\n", index, err)
+				return 2
+			}
+		}
+		authorizer, err := servicetls.NewNodeAuthorizer(allowed)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error gateway authorization: %v\n", err)
+			return 2
+		}
+		authenticated, err = servicetls.NewServer(profile, rafttransport.TrafficShardSQL, authorizer)
+		if err != nil || *tlsTimeout <= 0 || authenticatedConnectionLimit <= 0 ||
+			authenticatedConnectionLimit > servicetls.AbsoluteMaxConnections || *maxHandshakes <= 0 ||
+			*maxHandshakes > authenticatedConnectionLimit {
+			fmt.Fprintf(os.Stderr, "error authenticated listener profile: %v\n", err)
+			return 2
+		}
 	}
 
 	binding := sqldriver.ShardStoreBinding{
@@ -180,7 +243,15 @@ func runServe(args []string) int {
 		_ = srv.Close()
 	}()
 
-	if err := srv.Serve(listener); err != nil && err != shardservice.ErrServerClosed {
+	if authenticated != nil {
+		err = authenticated.Serve(ctx, listener, servicetls.Limits{
+			MaxConnections: authenticatedConnectionLimit, MaxHandshakes: *maxHandshakes,
+			HandshakeDeadline: servicetls.FixedDeadline(*tlsTimeout),
+		}, func(_ context.Context, connection rafttransport.PeerConnection) { srv.ServeConn(connection) })
+	} else {
+		err = srv.Serve(listener)
+	}
+	if err != nil && err != shardservice.ErrServerClosed && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "error serve: %v\n", err)
 		return 1
 	}
