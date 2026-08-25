@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -28,8 +29,21 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	const voters = 3
 	runtimes := make([]*raftmember.Runtime, voters)
 	bases := make([]sqldriver.ReplicatedShardStoreIdentity, voters)
+	readSources := make([]*sqldriver.ReplicatedApply, voters)
 	for index := range voters {
-		runtimes[index], bases[index] = newRF3Runtime(t, uint64(index+1))
+		runtimes[index], bases[index], readSources[index] = newRF3Runtime(t, uint64(index+1))
+	}
+	portableManifest := runtimes[0].Identity().RelationManifestDigest
+	for index := 1; index < voters; index++ {
+		if bases[index].RelationManifestDigest == bases[0].RelationManifestDigest {
+			t.Fatal("independent replicas unexpectedly retained one local catalog manifest")
+		}
+		if runtimes[index].Identity().RelationManifestDigest != portableManifest {
+			t.Fatalf(
+				"replica %d portable manifest = %x, want %x",
+				index+1, runtimes[index].Identity().RelationManifestDigest, portableManifest,
+			)
+		}
 	}
 	group := runtimes[0].Identity().Group
 
@@ -120,10 +134,12 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 			Owner: Options{
 				Registry: serving, Host: host,
 				Members:       []raftmember.RuntimeIdentity{runtimes[index].Identity()},
-				CommandFences: []CommandFence{rf3CommandFence(bases[index])},
+				CommandFences: []CommandFence{rf3CommandFence(runtimes[index].Identity(), bases[index])},
+				ReadSources:   []ReadSource{readSources[index]},
 				Pulse:         pulses[index],
 				Limits: Limits{MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
 					MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
+					MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
 					MaxPendingOutboundBytes: 64 << 20},
 			},
 			Transport: rafttransport.OrdinaryTransportOptions{
@@ -222,6 +238,77 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("RF3 Put: %v", err)
 	}
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
+	follower := (leader + 1) % voters
+	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
+		t, ctx, owners[follower], readSources[follower], group, PointReadRequest{Relation: 1, Key: key,
+			MinimumApplied: acknowledged.Outcome.AppliedIndex,
+			MaxValueBytes:  replication.MaxMutationValueBytes,
+		})
+	if err != nil || !followerRead.Found ||
+		!bytes.Equal(followerRead.Value, []byte(`{"id":"alpha","value":1}`)) {
+		t.Fatalf("applied-bounded follower read=%+v err=%v", followerRead, err)
+	}
+	followerLease.Release()
+	var lease PointReadLease
+	if _, lease, _, err := readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
+		Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  len(followerRead.Value),
+	}); !errors.Is(err, replicatedstate.ErrReadBufferBound) {
+		t.Fatalf("request-relative response bound error=%v", err)
+	} else if lease != nil {
+		t.Fatal("response-bound refusal returned a lease")
+	}
+	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
+		Relation: 1, Key: key,
+		MinimumApplied: followerRead.Applied + 1,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
+		t.Fatalf("future follower floor error=%v", err)
+	} else if lease != nil {
+		t.Fatal("failed follower read returned a lease")
+	}
+	staleFence := followerState.Fence()
+	staleFence.Command.RelationManifestDigest[0] ^= 1
+	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: staleFence, Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	}); !errors.Is(err, ErrServingFence) {
+		t.Fatalf("stale manifest fence error=%v", err)
+	} else if lease != nil {
+		t.Fatal("stale manifest read returned a lease")
+	}
+	staleFence = followerState.Fence()
+	staleFence.Command.ReplicaSetVersion++
+	if _, lease, err := owners[follower].ReadPoint(ctx, PointReadRequest{
+		Fence: staleFence, Relation: 1, Key: key,
+		MinimumApplied: acknowledged.Outcome.AppliedIndex,
+		MaxValueBytes:  replication.MaxMutationValueBytes,
+	}); !errors.Is(err, ErrServingFence) {
+		t.Fatalf("stale replica-set fence error=%v", err)
+	} else if lease != nil {
+		t.Fatal("stale replica-set read returned a lease")
+	}
+	leader = waitRF3Leader(t, ctx, owners, nil, group)
+	linearRead, linearLease, leaderState, err := readRF3PointAtFreshFence(
+		t, ctx, owners[leader], readSources[leader], group, PointReadRequest{Relation: 1, Key: key,
+			MinimumApplied: acknowledged.Outcome.AppliedIndex,
+			MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
+		})
+	if err != nil || !linearRead.Found || !bytes.Equal(linearRead.Value, followerRead.Value) {
+		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
+	}
+	linearLease.Release()
+	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
+		Relation: 1, Key: key,
+		MinimumApplied: linearRead.Applied + 1,
+		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
+	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
+		t.Fatalf("future ReadIndex floor error=%v", err)
+	} else if lease != nil {
+		t.Fatal("future ReadIndex floor returned a lease")
+	}
 
 	// Kill the exact serving leader after its acknowledged response. Remaining
 	// voters elect another leader and replaying identical bytes returns the same
@@ -249,17 +336,18 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 }
 
-func rf3CommandFence(base sqldriver.ReplicatedShardStoreIdentity) CommandFence {
+func rf3CommandFence(
+	runtime raftmember.RuntimeIdentity,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) CommandFence {
 	authority := base.Binding.Authority
 	return CommandFence{
 		ReplicaSetVersion: 1, ActivePolicyGeneration: authority.ActivePolicyGeneration,
 		ProtectionEpoch: authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
-		SchemaGeneration: authority.SchemaGeneration,
-		RelationManifestDigest: sha256.Sum256(
-			[]byte("rf3-test-portable-logical-relation-manifest"),
-		),
-		RoutingVersion:  authority.RoutingVersion,
-		RouteGeneration: authority.RouteGeneration,
+		SchemaGeneration:       authority.SchemaGeneration,
+		RelationManifestDigest: runtime.RelationManifestDigest,
+		RoutingVersion:         authority.RoutingVersion,
+		RouteGeneration:        authority.RouteGeneration,
 	}
 }
 
@@ -294,6 +382,7 @@ func waitRF3Leader(
 	t.Helper()
 	for ctx.Err() == nil {
 		leader := -1
+		var term uint64
 		consistent := true
 		for index, owner := range owners {
 			if removed[index] {
@@ -312,7 +401,8 @@ func waitRF3Leader(
 			}
 			if leader == -1 {
 				leader = candidate
-			} else if leader != candidate {
+				term = status.Term
+			} else if leader != candidate || term != status.Term {
 				consistent = false
 				break
 			}
@@ -320,7 +410,7 @@ func waitRF3Leader(
 		if consistent && leader >= 0 {
 			state, err := owners[leader].Probe(ctx, group)
 			status := state.Status
-			if err == nil && status.MemberID == status.LeaderID {
+			if err == nil && status.MemberID == status.LeaderID && status.Term == term {
 				return leader
 			}
 		}
@@ -328,6 +418,49 @@ func waitRF3Leader(
 	}
 	t.Fatalf("RF3 leader election: %v", context.Cause(ctx))
 	return -1
+}
+
+func readRF3PointAtFreshFence(
+	t testing.TB,
+	ctx context.Context,
+	owner *Owner,
+	source ReadSource,
+	group raftmember.GroupKey,
+	request PointReadRequest,
+) (PointReadResult, PointReadLease, ServingState, error) {
+	t.Helper()
+	for ctx.Err() == nil {
+		state, err := owner.Probe(ctx, group)
+		if err != nil {
+			return PointReadResult{}, nil, ServingState{}, err
+		}
+		request.Fence = state.Fence()
+		result, lease, err := owner.ReadPoint(ctx, request)
+		if errors.Is(err, ErrServingFence) {
+			if lease != nil {
+				t.Fatal("stale serving fence returned a read lease")
+			}
+			refreshed, probeErr := owner.Probe(ctx, group)
+			if probeErr != nil {
+				return PointReadResult{}, nil, ServingState{}, probeErr
+			}
+			if refreshed.Fence() == request.Fence {
+				direct, directErr := source.PointReadInto(
+					request.Relation, request.Key, request.MinimumApplied,
+					request.MaxValueBytes, nil,
+				)
+				t.Fatalf("unchanged serving fence rejected: request=%+v snapshot=%+v direct=%v",
+					request.Fence, direct.Fence, directErr)
+			}
+			// Let the pulse/transport goroutines settle the term observed by
+			// Probe; a tight test retry loop can otherwise create its own
+			// scheduler starvation on small CI runners.
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		return result, lease, state, err
+	}
+	return PointReadResult{}, nil, ServingState{}, context.Cause(ctx)
 }
 
 func waitRF3Applied(
@@ -403,7 +536,7 @@ func rf3Command(
 func newRF3Runtime(
 	t testing.TB,
 	memberID uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
 	identity := raftstore.Identity{
 		Distribution: "orders", Shard: "0000-ffff",
@@ -500,7 +633,7 @@ func newRF3Runtime(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return runtime, base
+	return runtime, base, apply
 }
 
 func rf3HostLimits() multiraft.Limits {

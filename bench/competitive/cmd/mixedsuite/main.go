@@ -10,7 +10,6 @@ import (
 	"crypto/sha256"
 	"debug/buildinfo"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
@@ -731,7 +731,7 @@ func collectMetadata(cfg config, args []string, started time.Time) map[string]st
 	metadata := map[string]string{
 		"format-version":       "0",
 		"started-utc":          started.UTC().Format(time.RFC3339Nano),
-		"argv-json":            marshalJSON(args),
+		"argv-json":            marshalArgvJSON(args),
 		"mixed-binary":         cfg.mixedBin,
 		"mixed-binary-sha256":  fileHash(cfg.mixedBin),
 		"suite-go-version":     runtime.Version(),
@@ -829,8 +829,18 @@ func fileHash(path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func marshalJSON(value any) string {
-	data, err := json.Marshal(value)
+var argvEncoder = mustCompileArgvEncoder()
+
+func mustCompileArgvEncoder() vibejson.Encoder[[]string] {
+	encoder, err := vibejson.CompileEncoder[[]string](vibejson.EncoderOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return encoder
+}
+
+func marshalArgvJSON(value []string) string {
+	data, err := argvEncoder.AppendJSON(make([]byte, 0, 256), &value)
 	if err != nil {
 		return "error: " + err.Error()
 	}

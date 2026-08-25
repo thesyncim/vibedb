@@ -16,6 +16,11 @@ const (
 	replicatedWireVersion = 1
 	tagReplicatedRequest  = 'P'
 	tagReplicatedResponse = 'A'
+	// A response with state has a 265-byte body before a completion. Read
+	// responses add an applied index and value length. These exact ceilings let
+	// the client reject a hostile frame header before allocating its body.
+	replicatedResponseFixedBodyBytes     = 265
+	replicatedReadResponseFixedBodyBytes = replicatedResponseFixedBodyBytes + 12
 )
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
@@ -27,6 +32,8 @@ type ReplicatedOperation uint8
 const (
 	ReplicatedProbe ReplicatedOperation = iota + 1
 	ReplicatedPropose
+	ReplicatedReadLeader
+	ReplicatedReadFollower
 )
 
 // ReplicatedFence identifies one exact live Runtime and leadership term. Probe
@@ -44,9 +51,13 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation ReplicatedOperation
-	Fence     ReplicatedFence
-	Command   []byte
+	Operation      ReplicatedOperation
+	Fence          ReplicatedFence
+	Command        []byte
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  uint32
 }
 
 // ReplicatedResponseKind separates definite pre-admission refusals from an
@@ -59,6 +70,8 @@ const (
 	ReplicatedNotLeader
 	ReplicatedOutcomeUnknown
 	ReplicatedRefusal
+	ReplicatedReadFound
+	ReplicatedReadMissing
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -72,6 +85,8 @@ const (
 	ReplicatedRefusalProposalRefused
 	ReplicatedRefusalDeterministic
 	ReplicatedRefusalUnavailable
+	ReplicatedRefusalReadBehind
+	ReplicatedRefusalReadBufferBound
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -87,12 +102,15 @@ type ReplicatedMemberState struct {
 // ReplicatedResponse owns Completion and returns only typed fixed-width error
 // classes. No remote diagnostic string is admitted to the hot wire.
 type ReplicatedResponse struct {
-	Kind       ReplicatedResponseKind
-	Refusal    ReplicatedRefusalCode
-	HasState   bool
-	State      ReplicatedMemberState
-	Outcome    raftserve.Outcome
-	Completion []byte
+	Kind        ReplicatedResponseKind
+	Refusal     ReplicatedRefusalCode
+	HasState    bool
+	State       ReplicatedMemberState
+	Outcome     raftserve.Outcome
+	Completion  []byte
+	ReadApplied uint64
+	Value       []byte
+	readLease   raftservice.PointReadLease
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame.
@@ -100,11 +118,19 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(len(request.Command))
+	e := newFrameEncoder(len(request.Command) + len(request.Key) + 16)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	encodeReplicatedFence(&e, request.Fence)
-	e.bytes(request.Command)
+	switch request.Operation {
+	case ReplicatedPropose:
+		e.bytes(request.Command)
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		e.u8(uint8(request.Relation))
+		e.u64(request.MinimumApplied)
+		e.u32(request.MaxValueBytes)
+		e.bytes(request.Key)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -112,9 +138,9 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 }
 
 // EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
-// the immutable canonical command as a second buffer, avoiding a command-sized
-// userspace copy and allocation on every retry. A TLS stream may encode the two
-// writes as separate record sequences; this function does not claim writev.
+// the immutable command or point key as a second buffer, avoiding a payload-sized
+// userspace copy on every retry. A TLS stream may encode the two writes as
+// separate record sequences; this function does not claim writev.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
@@ -123,18 +149,30 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	encodeReplicatedFence(&e, request.Fence)
-	e.u32(uint32(len(request.Command)))
-	if e.err != nil || len(e.b)+len(request.Command)-5 > maxFrameBody {
+	var payload []byte
+	switch request.Operation {
+	case ReplicatedProbe:
+	case ReplicatedPropose:
+		payload = request.Command
+		e.u32(uint32(len(payload)))
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		e.u8(uint8(request.Relation))
+		e.u64(request.MinimumApplied)
+		e.u32(request.MaxValueBytes)
+		payload = request.Key
+		e.u32(uint32(len(payload)))
+	}
+	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
 		return errFrameTooLarge
 	}
 	e.b[0] = tagReplicatedRequest
-	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(request.Command)-1))
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
 	buffers := net.Buffers{e.b}
-	if len(request.Command) != 0 {
-		buffers = append(buffers, request.Command)
+	if len(payload) != 0 {
+		buffers = append(buffers, payload)
 	}
 	written, err := buffers.WriteTo(w)
-	if err == nil && written != int64(len(e.b)+len(request.Command)) {
+	if err == nil && written != int64(len(e.b)+len(payload)) {
 		return io.ErrShortWrite
 	}
 	return err
@@ -163,7 +201,15 @@ func decodeReplicatedRequest(
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
 	request.Fence = decodeReplicatedFence(&d)
-	request.Command = d.slice()
+	switch request.Operation {
+	case ReplicatedPropose:
+		request.Command = d.slice()
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		request.Relation = replication.RelationID(d.u8())
+		request.MinimumApplied = d.u64()
+		request.MaxValueBytes = d.u32()
+		request.Key = d.slice()
+	}
 	if err := d.end(); err != nil {
 		if budget != nil {
 			budget.release(charged)
@@ -171,6 +217,7 @@ func decodeReplicatedRequest(
 		return nil, 0, err
 	}
 	request.Command = request.Command[:len(request.Command):len(request.Command)]
+	request.Key = request.Key[:len(request.Key):len(request.Key)]
 	if !validReplicatedRequest(request) {
 		if budget != nil {
 			budget.release(charged)
@@ -185,7 +232,11 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	if w == nil || !validReplicatedResponse(response) {
 		return ErrReplicatedWire
 	}
-	e := newFrameEncoder(len(response.Completion))
+	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
+	}
+	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(response.Kind))
 	e.u8(uint8(response.Refusal))
@@ -199,6 +250,10 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	e.u64(response.Outcome.AppliedIndex)
 	e.u64(response.Outcome.CompletionAppliedSequence)
 	e.bytes(response.Completion)
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+		e.u64(response.ReadApplied)
+		e.bytes(response.Value)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -207,7 +262,11 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 
 // DecodeReplicatedResponse decodes and validates one bounded native response.
 func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
-	body, err := readFrame(r, tagReplicatedResponse)
+	return decodeReplicatedResponseLimit(r, maxFrameBody)
+}
+
+func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedResponse, error) {
+	body, _, err := readFrameBudgetedLimit(r, tagReplicatedResponse, nil, maxBody)
 	if err != nil {
 		return nil, err
 	}
@@ -230,8 +289,14 @@ func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
 	}
 	response.Outcome.AppliedIndex = d.u64()
 	response.Outcome.CompletionAppliedSequence = d.u64()
-	response.Completion = d.bytesCopy()
+	response.Completion = d.slice()
+	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
+	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
+		response.ReadApplied = d.u64()
+		response.Value = d.slice()
+		response.Value = response.Value[:len(response.Value):len(response.Value)]
+	}
 	if err := d.end(); err != nil {
 		return nil, err
 	}
@@ -239,6 +304,23 @@ func DecodeReplicatedResponse(r io.Reader) (*ReplicatedResponse, error) {
 		return nil, ErrReplicatedWire
 	}
 	return response, nil
+}
+
+func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
+	if !validReplicatedRequest(request) {
+		return 0, ErrReplicatedWire
+	}
+	switch request.Operation {
+	case ReplicatedProbe:
+		return replicatedResponseFixedBodyBytes, nil
+	case ReplicatedPropose:
+		return replicatedResponseFixedBodyBytes +
+			replication.MaxEmptyResultCompletionEnvelopeBytes, nil
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		return replicatedReadResponseFixedBodyBytes + int(request.MaxValueBytes), nil
+	default:
+		return 0, ErrReplicatedWire
+	}
 }
 
 func encodeReplicatedFence(e *encbuf, fence ReplicatedFence) {
@@ -336,7 +418,9 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	}
 	switch request.Operation {
 	case ReplicatedProbe:
-		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0
+		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
+			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
+			request.MaxValueBytes == 0
 	case ReplicatedPropose:
 		if !validReplicatedFence(request.Fence, true) || len(request.Command) == 0 ||
 			len(request.Command) > replication.MaxCommandBytes {
@@ -356,6 +440,12 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			command.SchemaGeneration == request.Fence.Command.SchemaGeneration &&
 			command.RoutingVersion == request.Fence.Command.RoutingVersion &&
 			command.RouteGeneration == request.Fence.Command.RouteGeneration
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Relation != 0 && request.Relation <= replication.MaxRelationID &&
+			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
+			request.MinimumApplied != 0 && request.MaxValueBytes != 0 &&
+			request.MaxValueBytes <= replication.MaxMutationValueBytes
 	default:
 		return false
 	}
@@ -370,13 +460,15 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 	if response == nil || response.HasState != (response.State != ReplicatedMemberState{}) ||
 		(response.HasState && !validReplicatedMemberState(response.State)) ||
 		len(response.Completion) > replication.MaxEmptyResultCompletionEnvelopeBytes ||
-		response.Outcome.CompletionBytes != len(response.Completion) {
+		response.Outcome.CompletionBytes != len(response.Completion) ||
+		len(response.Value) > replication.MaxMutationValueBytes {
 		return false
 	}
 	switch response.Kind {
 	case ReplicatedHandshake:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
-			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedCompletion:
 		completion, err := replication.OpenCompletion(response.Completion)
 		return err == nil && completion.AppliedSequence == response.Outcome.CompletionAppliedSequence &&
@@ -395,12 +487,14 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome.Code == raftserve.OutcomeCompletion &&
 			response.Outcome.AppliedIndex != 0 &&
 			response.State.Applied >= response.Outcome.AppliedIndex &&
-			len(response.Completion) != 0
+			len(response.Completion) != 0 && response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedNotLeader, ReplicatedOutcomeUnknown:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
-			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedRefusal:
-		if response.Refusal == ReplicatedRefusalNone || len(response.Completion) != 0 {
+		if response.Refusal == ReplicatedRefusalNone || len(response.Completion) != 0 ||
+			response.ReadApplied != 0 || len(response.Value) != 0 {
 			return false
 		}
 		if response.Refusal == ReplicatedRefusalDeterministic {
@@ -413,7 +507,16 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		return response.Outcome == (raftserve.Outcome{}) &&
 			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
-			response.Refusal <= ReplicatedRefusalUnavailable
+			response.Refusal <= ReplicatedRefusalReadBufferBound
+	case ReplicatedReadFound:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied
+	case ReplicatedReadMissing:
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			len(response.Value) == 0
 	default:
 		return false
 	}

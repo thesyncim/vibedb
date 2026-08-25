@@ -13,11 +13,13 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 type replicatedOwner interface {
 	Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
 	SubmitOwned(context.Context, raftservice.ServingFence, []byte) (raftservice.Result, error)
+	ReadPoint(context.Context, raftservice.PointReadRequest) (raftservice.PointReadResult, raftservice.PointReadLease, error)
 }
 
 // ReplicatedServer is the SQL-free RF3 shard endpoint. Serve owns bounded
@@ -225,6 +227,9 @@ func (server *ReplicatedServer) serveReplicatedRequest(
 	}
 	defer server.frames.release(charged)
 	response := server.executeReplicated(requestCtx, request)
+	if response.readLease != nil {
+		defer response.readLease.Release()
+	}
 	return EncodeReplicatedResponse(conn, response)
 }
 
@@ -247,6 +252,63 @@ func (server *ReplicatedServer) executeReplicated(
 	}
 	if request.Operation == ReplicatedProbe {
 		return &ReplicatedResponse{Kind: ReplicatedHandshake, HasState: true, State: wireState}
+	}
+	if request.Operation == ReplicatedReadLeader || request.Operation == ReplicatedReadFollower {
+		result, readLease, readErr := server.owner.ReadPoint(ctx, raftservice.PointReadRequest{
+			Fence: raftservice.ServingFence{
+				Group: request.Fence.Group, AllocationGeneration: request.Fence.AllocationGeneration,
+				Command: request.Fence.Command, MemberID: request.Fence.MemberID,
+				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
+				Term: request.Fence.Term,
+			},
+			Relation: request.Relation, Key: request.Key,
+			MinimumApplied: request.MinimumApplied, MaxValueBytes: int(request.MaxValueBytes),
+			Linearizable: request.Operation == ReplicatedReadLeader,
+		})
+		if readErr != nil && readLease != nil {
+			readLease.Release()
+			readLease = nil
+		}
+		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
+			wireState = replicatedWireState(refreshed)
+		}
+		if readErr == nil {
+			kind := ReplicatedReadMissing
+			if result.Found {
+				kind = ReplicatedReadFound
+			}
+			response := &ReplicatedResponse{Kind: kind, HasState: true, State: wireState,
+				ReadApplied: result.Applied, Value: result.Value, readLease: readLease}
+			if validReplicatedResponse(response) {
+				return response
+			}
+			if readLease != nil {
+				readLease.Release()
+			}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+				HasState: true, State: wireState}
+		}
+		switch {
+		case errors.Is(readErr, raftmodel.ErrNotLeader),
+			errors.Is(readErr, raftmodel.ErrReadLeadershipLost):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingFence):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBehind):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, replicatedstate.ErrReadBufferBound):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrIngressFull),
+			errors.Is(readErr, raftservice.ErrPendingReadsFull):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,
+				HasState: true, State: wireState}
+		default:
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+				HasState: true, State: wireState}
+		}
 	}
 
 	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
@@ -369,7 +431,11 @@ func RoundTripReplicated(
 		}
 		return nil, err
 	}
-	response, err := DecodeReplicatedResponse(conn)
+	maximumResponse, boundErr := maximumReplicatedResponseBody(request)
+	if boundErr != nil {
+		return nil, boundErr
+	}
+	response, err := decodeReplicatedResponseLimit(conn, maximumResponse)
 	if err != nil && request.Operation == ReplicatedPropose {
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: err,
