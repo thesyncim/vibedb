@@ -1126,6 +1126,26 @@ func TestReplicatedExecutorRetriesSameCommandFenceIncarnationRace(t *testing.T) 
 	}
 }
 
+func TestReplicatedExecutorStopsServingFenceBackoffOnCancellation(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	client := &sequenceReplicatedClient{state: state, responses: []*shardservice.ReplicatedResponse{{
+		Kind:    shardservice.ReplicatedRefusal,
+		Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: state,
+	}}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.Propose(ctx, route, command)
+	if !errors.Is(err, context.Canceled) || client.proposals != 1 {
+		t.Fatalf("error=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
 func testReplicatedCompletionResponse(
 	t testing.TB,
 	commandBytes []byte,

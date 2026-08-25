@@ -737,6 +737,18 @@ func (executor *ReplicatedExecutor) propose(
 					continue
 				}
 				preferred = response.State.LeaderID
+				if attempt+1 == executor.maxAttempts {
+					continue
+				}
+				if err := waitReplicatedFenceRetry(ctx, attempt); err != nil {
+					if lastUnknown != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, err),
+						}
+					}
+					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
+				}
 				continue
 			}
 			if !validReplicatedWritePreAdmissionRefusal(response, response.Refusal, false) {
@@ -760,6 +772,26 @@ func (executor *ReplicatedExecutor) propose(
 		}
 	}
 	return ReplicatedResult{}, ErrReplicatedLeader
+}
+
+func waitReplicatedFenceRetry(ctx context.Context, attempt int) error {
+	// Failover is exceptional, so spend a small bounded wall-clock budget to
+	// avoid burning every retry while the replacement term is still settling.
+	// The normal proposal path never creates a timer. Five milliseconds keeps a
+	// one-race retry responsive; the cap bounds seven retry waits to 315 ms.
+	shift := attempt
+	if shift > 4 {
+		shift = 4
+	}
+	delay := 5 * time.Millisecond * time.Duration(uint64(1)<<uint(shift))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (executor *ReplicatedExecutor) doReplicated(
