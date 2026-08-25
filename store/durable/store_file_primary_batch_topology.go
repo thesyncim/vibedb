@@ -183,7 +183,8 @@ func (c *Collection) preparePrimaryBatchTopology(
 	return c.commitPrimaryStructural(
 		state, &path, structuralSplit,
 		func(tx *storeio.WriteTransaction) (
-			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef, error,
+			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
+			*primaryLocalizedLeafSplit, error,
 		) {
 			// Fences partition keyspace, not merely the prospective rows. This is
 			// load-bearing for deletes: a row removed by the logical batch still
@@ -202,20 +203,20 @@ func (c *Collection) preparePrimaryBatchTopology(
 					tabletID, uint32(localIDs[rank]),
 				)
 				if !bucketOK {
-					return nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
+					return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
 				}
 				ref, encodeErr := c.encodeStructuralLeaf(
 					tx, generation, storeio.BucketID(bucketU),
 					baseRows[baseAt:baseEnd],
 				)
 				if encodeErr != nil {
-					return nil, nil, encodeErr
+					return nil, nil, nil, encodeErr
 				}
 				encoded[rank] = ref
 				baseAt = baseEnd
 			}
 			if baseAt != len(baseRows) {
-				return nil, nil, storeio.ErrInvalidWrite
+				return nil, nil, nil, storeio.ErrInvalidWrite
 			}
 
 			final := make(
@@ -242,7 +243,7 @@ func (c *Collection) preparePrimaryBatchTopology(
 					})
 				}
 			}
-			return final, []storeio.PageRef{currentLeaves[sourceIndex].ref}, nil
+			return final, []storeio.PageRef{currentLeaves[sourceIndex].ref}, nil, nil
 		},
 	)
 }

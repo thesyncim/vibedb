@@ -536,6 +536,72 @@ func (r *ResidentPrimaryRouter) UpdateLeaf(
 	r.hints[route.rank].packed.Store(0)
 }
 
+// SplitLeaf builds the next immutable routing image by splicing one already
+// published structural leaf split into this router. It copies the compact
+// resident arrays but performs no page-cache acquisition or graph walk; the
+// old router remains valid for readers that loaded it before the collection's
+// atomic pointer swap.
+func (r *ResidentPrimaryRouter) SplitLeaf(
+	route ResidentPrimaryRoute,
+	leftRef PageRef,
+	rightBucket BucketID,
+	rightFence []byte,
+	rightRef PageRef,
+	generation uint64,
+) (*ResidentPrimaryRouter, error) {
+	started := time.Now()
+	if r == nil || int(route.rank) >= r.Len() || len(rightFence) == 0 ||
+		generation <= r.Generation() || generation >= uint64(1)<<48 ||
+		segmentedTabletRouterValidateLeafRef(leftRef, route.Bucket, PagePrimaryLeaf, generation) != nil ||
+		segmentedTabletRouterValidateLeafRef(rightRef, rightBucket, PagePrimaryLeaf, generation) != nil {
+		return nil, fmt.Errorf("%w: resident split identity", ErrInvalidWrite)
+	}
+	current, ok := r.RouteAtRank(int(route.rank))
+	if !ok || current.Ref != route.Ref || current.Bucket != route.Bucket ||
+		bytes.Compare(r.fence(int(route.rank)), rightFence) >= 0 ||
+		int(route.rank)+1 < r.Len() && bytes.Compare(rightFence, r.fence(int(route.rank)+1)) >= 0 {
+		return nil, fmt.Errorf("%w: resident split route", ErrInvalidWrite)
+	}
+	if uint64(len(r.fences)) > uint64(maxIntValue-len(rightFence)) ||
+		r.Len() == maxIntValue/residentPrimaryRouterWords {
+		return nil, fmt.Errorf("%w: resident split capacity", ErrInvalidWrite)
+	}
+	next := &ResidentPrimaryRouter{storeID: r.storeID}
+	next.fences = make([]byte, 0, len(r.fences)+len(rightFence))
+	next.rows = make([]uint64, 0, len(r.rows)+residentPrimaryRouterWords)
+	next.empty = make([]atomic.Uint32, r.Len()+1)
+	appendRow := func(fence []byte, ref PageRef, bucket BucketID, empty uint32) {
+		start := len(next.fences)
+		next.fences = append(next.fences, fence...)
+		next.rows = append(next.rows,
+			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
+			ref.Offset, ref.Generation,
+			uint64(ref.Length)|uint64(uint32(bucket))<<32,
+		)
+		next.empty[next.Len()-1].Store(empty)
+	}
+	for rank := 0; rank < r.Len(); rank++ {
+		old, routeOK := r.RouteAtRank(rank)
+		if !routeOK {
+			return nil, fmt.Errorf("%w: resident split source", ErrInvalidWrite)
+		}
+		ref, bucket := old.Ref, old.Bucket
+		empty := r.empty[rank].Load()
+		if rank == int(route.rank) {
+			ref, empty = leftRef, 0
+		}
+		appendRow(r.fence(rank), ref, bucket, empty)
+		if rank == int(route.rank) {
+			appendRow(rightFence, rightRef, rightBucket, 0)
+		}
+	}
+	next.hints = make([]pageCacheFrameHint, next.Len())
+	next.buildSearchKeys()
+	next.generation.Store(generation)
+	next.buildNS = time.Since(started).Nanoseconds()
+	return next, nil
+}
+
 // AdvanceGeneration records a canonical-frame mutation whose stable leaf
 // handle did not change.
 func (r *ResidentPrimaryRouter) AdvanceGeneration(generation uint64) {
