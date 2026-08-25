@@ -381,6 +381,9 @@ func (s *ReplicatedChildStage) activate(
 		Envelope: seedEnvelope,
 		Images: []durable.CheckpointGroupSeedImage{{
 			Collection: s.table.collection, Generation: prepared.UserGeneration(),
+		}, {
+			Collection: core.replicatedCaptureCollection,
+			Generation: core.replicatedCaptureCollection.Generation(),
 		}},
 	}
 	if core.checkpointGroup == nil {

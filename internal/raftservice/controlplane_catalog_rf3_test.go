@@ -48,6 +48,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open catalog session: %v", err)
 	}
+	leader = waitReachableTopologyLeader(t, ctx, client.executor, route, leader)
 	first := processControlPlaneSnapshot(t, cluster, 1)
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
@@ -180,6 +181,42 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	if err != nil || afterLoss.Generation() != 2 {
 		t.Fatalf("catalog after leader loss = %v, err=%v", afterLoss, err)
 	}
+}
+
+func waitReachableTopologyLeader(
+	t testing.TB,
+	ctx context.Context,
+	executor *gateway.ReplicatedExecutor,
+	route gateway.ReplicatedRoute,
+	expected uint64,
+) uint64 {
+	t.Helper()
+	stable := 0
+	var observed uint64
+	var lastErr error
+	for ctx.Err() == nil {
+		result, err := executor.ReadTopologyPoint(ctx, route, gateway.ReplicatedPointRead{
+			Relation: 1, Key: []byte("catalog-readiness"), MinimumApplied: 1,
+			MaxValueBytes: 1, Linearizable: true,
+		})
+		if err == nil && result.State.LeaderID != 0 &&
+			result.State.Fence.MemberID == result.State.LeaderID {
+			if observed == result.State.LeaderID {
+				stable++
+			} else {
+				observed, stable = result.State.LeaderID, 1
+			}
+			if stable == 2 {
+				return observed
+			}
+		} else {
+			stable, observed, lastErr = 0, 0, err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("topology leader %d never became stably reachable: observed=%d err=%v cause=%v",
+		expected, observed, lastErr, context.Cause(ctx))
+	return 0
 }
 
 func processControlPlaneSnapshot(

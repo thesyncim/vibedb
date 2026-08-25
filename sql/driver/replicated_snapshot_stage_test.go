@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -25,6 +26,18 @@ func TestReplicatedSnapshotStageInstallsExactBaseAndRetriesActivation(t *testing
 	activation, err := stage.Activate(bootstrap)
 	if err != nil || activation.Apply == nil || activation.SnapshotBase == nil {
 		t.Fatalf("activation=%+v err=%v", activation, err)
+	}
+	core := target.connector.db
+	core.mu.RLock()
+	members := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: "docs", Collection: core.tables["docs"].collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
+	}
+	group := core.checkpointGroup
+	core.mu.RUnlock()
+	if group == nil || !group.Owns(members) {
+		t.Fatal("snapshot activation omitted fixed capture membership")
 	}
 	retried, err := stage.Activate(bootstrap)
 	if err != nil || retried.Apply != activation.Apply ||

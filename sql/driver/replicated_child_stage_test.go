@@ -271,6 +271,17 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		settledSeed.SnapshotBase == nil || err != nil {
 		t.Fatalf("settled initial seed certificate = %+v, %v", settledSeed, err)
 	}
+	core.mu.RLock()
+	seedMembers := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: base.UserTable, Collection: core.tables[base.UserTable].collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
+	}
+	seedGroup := core.checkpointGroup
+	core.mu.RUnlock()
+	if seedGroup == nil || !seedGroup.Owns(seedMembers) {
+		t.Fatal("child seed omitted fixed capture membership")
+	}
 	if err := settledSeed.Apply.Close(); err != nil {
 		t.Fatal(err)
 	}

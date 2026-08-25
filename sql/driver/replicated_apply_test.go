@@ -224,10 +224,20 @@ func TestReplicatedApplyUsesReplayBackedCheckpointGroup(t *testing.T) {
 	core := database.connector.db
 	core.mu.RLock()
 	group := core.checkpointGroup
+	system := core.replicatedApplyCollection
 	user := core.tables[base.UserTable].collection
+	capture := core.replicatedCaptureCollection
 	core.mu.RUnlock()
 	if group == nil {
 		t.Fatal("replicated apply did not attach a checkpoint group")
+	}
+	members := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: system},
+		{Name: base.UserTable, Collection: user},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: capture},
+	}
+	if !group.Owns(members) {
+		t.Fatal("replicated apply checkpoint group has unexpected membership")
 	}
 	stats := group.Stats()
 	if stats.Updates != 1 || stats.BarrierSyncs != 0 ||
@@ -245,7 +255,10 @@ func TestReplicatedApplyUsesReplayBackedCheckpointGroup(t *testing.T) {
 		t.Fatalf("checkpoint cut = %d", claim.CheckpointAppliedIndex())
 	}
 	stats = group.Stats()
-	if stats.BarrierSyncs != 3 || stats.MarkerSyncs != 0 {
+	if stats.BarrierSyncs != uint64(len(members)+1) ||
+		stats.JournalSyncs != uint64(len(members)) ||
+		stats.PhysicalCheckpoints != uint64(len(members)) ||
+		stats.CertificateSyncs != 1 || stats.MarkerSyncs != 0 {
 		t.Fatalf("checkpoint sync stats = %+v", stats)
 	}
 	if err := claim.Close(); err != nil {
@@ -442,12 +455,14 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	baseCollection := core.tables["docs"].collection
 	globalCollection := core.tables["email_claims"].collection
 	systemCollection := core.replicatedApplyCollection
+	captureCollection := core.replicatedCaptureCollection
 	group := core.checkpointGroup
 	core.mu.RUnlock()
 	if group == nil || !group.Owns([]durable.NamedCollection{
 		{Name: replicatedstate.SystemCollectionName, Collection: systemCollection},
 		{Name: "docs", Collection: baseCollection},
 		{Name: "email_claims", Collection: globalCollection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: captureCollection},
 	}) {
 		t.Fatal("bundle was not activated as one checkpoint group")
 	}
@@ -2747,13 +2762,10 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "capture-checkpoint-reopen")
 	options := testReplicatedApplyOptions()
-	captureLimits, err := replicatedCaptureLimits(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	options.TxnLimits.MaxBytes = int64(captureLimits.MaxBatchBytes) +
-		int64(base.UserLimits.MaxBatchBytes) +
-		int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes)
+	var err error
+	options.TxnLimits.MaxBytes, err = ReplicatedApplyTransactionByteFloor(
+		base, options.RetryWindow,
+	)
 	claim, identity, err := database.OpenReplicatedApply(base, testReplicatedApplyBootstrap(), options)
 	if err != nil {
 		t.Fatal(err)
