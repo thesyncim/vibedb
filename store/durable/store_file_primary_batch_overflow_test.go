@@ -376,6 +376,11 @@ func TestPrimaryBatchOverflowLayoutBounds(t *testing.T) {
 	options.RecoveryJournal = false
 	options.Indexes = nil
 	options.MaxDocumentBytes = 2 * options.MaxPageSize
+	// Sixty-four admitted documents at this doubled cap certify a 19,144,704
+	// byte dirty transaction. Nineteen MiB is the smallest whole-MiB,
+	// page-aligned arena above that exact bound; the former 16 MiB fixture only
+	// covered the obsolete singleton-overflow reservation.
+	options.ResidentBytes = 19 << 20
 	collection, _ := openBatchCollection(t, options)
 	perPage := collection.options.MaxPageSize - primaryOverflowPageOverhead
 	baseOffset := uint64(64 * collection.options.PageSize)
