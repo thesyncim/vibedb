@@ -23,6 +23,8 @@ func TestRunArgumentHandling(t *testing.T) {
 		{"missing_required_flags", []string{"vibedb-shard", "serve", "-listen", "127.0.0.1:0"}, 2},
 		{"zero_epoch", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-routing-version", "1"}, 2},
 		{"zero_routing_version", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-epoch", "1"}, 2},
+		{"authentication_required", []string{"vibedb-shard", "serve", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-epoch", "1", "-routing-version", "1"}, 2},
+		{"plaintext_tls_conflict", []string{"vibedb-shard", "serve", "-dev-plaintext-loopback", "-tls-certificate", "cert.pem", "-store", "store.vdb", "-distribution", "d", "-shard", "s", "-allocation-generation", "1", "-epoch", "1", "-routing-version", "1"}, 2},
 		{"unparseable_flag", []string{"vibedb-shard", "serve", "-store"}, 2},
 		{"missing_init_flags", []string{"vibedb-shard", "init", "-store", "store.vdb"}, 2},
 		{"unparseable_init_flag", []string{"vibedb-shard", "init", "-store"}, 2},
@@ -32,6 +34,7 @@ func TestRunArgumentHandling(t *testing.T) {
 			// the listener is created.
 			args: []string{
 				"vibedb-shard", "serve",
+				"-dev-plaintext-loopback",
 				"-store", t.TempDir(),
 				"-distribution", "tenant_data", "-shard", "-80",
 				"-allocation-generation", "1",
@@ -108,6 +111,7 @@ func TestRunServeRefusesMissingStoreWithoutInitializingIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing-shard.vdb")
 	args := []string{
 		"vibedb-shard", "serve",
+		"-dev-plaintext-loopback",
 		"-store", path,
 		"-distribution", "tenant_data", "-shard", "-80",
 		"-allocation-generation", "1",
@@ -129,6 +133,7 @@ func TestRunStoreOpenReportsPath(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-dir", "shard.vdb")
 	args := []string{
 		"vibedb-shard", "serve",
+		"-dev-plaintext-loopback",
 		"-store", missing,
 		"-distribution", "tenant_data", "-shard", "-80",
 		"-allocation-generation", "1",

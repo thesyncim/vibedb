@@ -9,11 +9,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -88,11 +91,36 @@ func (r *serveRawValue) UnmarshalJSON(src []byte) error {
 	return nil
 }
 
+type repeatedFlag []string
+
+func (values *repeatedFlag) String() string { return strings.Join(*values, ",") }
+func (values *repeatedFlag) Set(value string) error {
+	if value == "" || len(*values) >= servicetls.AbsoluteMaxIdentities {
+		return servicetls.ErrInvalidProfile
+	}
+	*values = append(*values, value)
+	return nil
+}
+
 // runServe loads the catalog, binds the listener, and serves until interrupted.
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
+	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
+	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
+	tlsKey := fs.String("tls-key", "", "PEM gateway private key")
+	tlsRoots := fs.String("tls-roots", "", "PEM client trust roots")
+	tlsIdentityOID := fs.String("tls-identity-oid", "", "operator VibeDB identity OID")
+	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 5*time.Second, "hard TLS handshake deadline")
+	maxConnections := fs.Int("max-client-connections", 1024, "hard authenticated client connection bound")
+	maxHandshakes := fs.Int("max-client-handshakes", 64, "hard concurrent TLS handshake bound")
+	var allowedClients repeatedFlag
+	fs.Var(&allowedClients, "allow-client-node", "allowed 32-character hexadecimal client NodeID; repeat for each principal")
+	var shardPeers repeatedFlag
+	fs.Var(&shardPeers, "shard-peer", "authenticated shard address=32-character-hex-NodeID; repeat for each endpoint")
+	maxShardConnections := fs.Int("max-shard-connections", 4096, "hard authenticated gateway-to-shard connection bound")
+	maxShardHandshakes := fs.Int("max-shard-handshakes", 64, "hard concurrent gateway-to-shard TLS handshake bound")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -100,12 +128,73 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
-	if err := requireLoopbackListen(*listen); err != nil {
-		fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
-		return 2
+	var clientTLS *gateway.ClientTLS
+	var shardTLS *servicetls.Client
+	if *devPlaintext {
+		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
+			len(allowedClients) != 0 || len(shardPeers) != 0 {
+			fmt.Fprintln(os.Stderr, "gateway: development plaintext and TLS configuration are mutually exclusive")
+			return 2
+		}
+		if err := requireLoopbackListen(*listen); err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
+			return 2
+		}
+	} else {
+		profile, err := servicetls.LoadProfile(*tlsCertificate, *tlsKey, *tlsRoots, *tlsIdentityOID, time.Now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load TLS profile: %v\n", err)
+			return 2
+		}
+		allowed := make([]rafttransport.NodeID, len(allowedClients))
+		for index, encoded := range allowedClients {
+			allowed[index], err = servicetls.ParseNodeID(encoded)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gateway: allowed client %d: %v\n", index, err)
+				return 2
+			}
+		}
+		clientTLS, err = gateway.NewClientTLS(profile, allowed)
+		if err != nil || *tlsHandshakeTimeout <= 0 || *maxConnections <= 0 ||
+			*maxConnections > servicetls.AbsoluteMaxConnections || *maxHandshakes <= 0 ||
+			*maxHandshakes > *maxConnections {
+			fmt.Fprintf(os.Stderr, "gateway: invalid authenticated listener profile: %v\n", err)
+			return 2
+		}
+		endpoints := make([]servicetls.Endpoint, len(shardPeers))
+		for index, encoded := range shardPeers {
+			separator := strings.LastIndexByte(encoded, '=')
+			if separator <= 0 || separator == len(encoded)-1 {
+				fmt.Fprintf(os.Stderr, "gateway: shard peer %d is not address=node-id\n", index)
+				return 2
+			}
+			endpoints[index].Address = encoded[:separator]
+			endpoints[index].Node, err = servicetls.ParseNodeID(encoded[separator+1:])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gateway: shard peer %d: %v\n", index, err)
+				return 2
+			}
+		}
+		shardTLS, err = servicetls.NewClient(servicetls.ClientOptions{
+			TLS: profile, Class: rafttransport.TrafficShardSQL, Endpoints: endpoints,
+			Dial: func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			},
+			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
+			MaxConnections:    *maxShardConnections, MaxHandshakes: *maxShardHandshakes,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: invalid authenticated shard transport: %v\n", err)
+			return 2
+		}
+		defer shardTLS.Close()
 	}
 
-	exec, holder, err := newGateway(*catalog)
+	var shardDial gateway.DialFunc
+	if shardTLS != nil {
+		shardDial = shardTLS.Dial
+	}
+	exec, holder, err := newGatewayWithDial(*catalog, shardDial)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
@@ -123,17 +212,23 @@ func runServe(args []string) int {
 	defer stop()
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
-	if err := serveGateway(ctx, listener, exec, logf); err != nil {
+	if clientTLS != nil {
+		err = serveAuthenticatedGateway(ctx, listener, exec, clientTLS, gateway.ClientTLSLimits{
+			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
+			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
+		}, logf)
+	} else {
+		err = serveGateway(ctx, listener, exec, logf)
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-// requireLoopbackListen keeps the unauthenticated development protocol from
-// becoming a remotely reachable admin/query endpoint. Remote serving needs an
-// authenticated transport, which this newline-delimited JSON protocol does not
-// provide yet.
+// requireLoopbackListen keeps the explicitly selected unauthenticated
+// development protocol from becoming a remotely reachable query endpoint.
 func requireLoopbackListen(address string) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -154,13 +249,17 @@ func requireLoopbackListen(address string) error {
 // shard refusal reloads the same crash-safe catalog path, publishing only a
 // strictly newer valid generation.
 func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, error) {
+	return newGatewayWithDial(catalogPath, nil)
+}
+
+func newGatewayWithDial(catalogPath string, dial gateway.DialFunc) (*gateway.Executor, *gateway.CatalogHolder, error) {
 	snap, err := gateway.LoadSnapshot(catalogPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(snap)
 	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
-	exec := gateway.NewExecutor(gateway.NewClient(nil), holder, gateway.Options{Refresh: refresher.Refresh})
+	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{Refresh: refresher.Refresh})
 	return exec, holder, nil
 }
 
@@ -168,14 +267,7 @@ func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, 
 // listener and drains in-flight connections. It returns nil on a signaled
 // shutdown and the accept error otherwise.
 func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor, logf func(string, ...any)) error {
-	go exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
-		if err != nil {
-			logf("gateway: transaction recovery: %v", err)
-		}
-		if len(results) != 0 {
-			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
-		}
-	})
+	startGatewayRecovery(ctx, exec, logf)
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
 	go func() {
@@ -199,6 +291,24 @@ func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Exec
 			handleConn(ctx, conn, exec, logf)
 		}()
 	}
+}
+
+func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func(string, ...any)) {
+	go exec.RunRecovery(ctx, 5*time.Second, func(results []gateway.RecoveryResult, err error) {
+		if err != nil {
+			logf("gateway: transaction recovery: %v", err)
+		}
+		if len(results) != 0 {
+			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
+		}
+	})
+}
+
+func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
+	capability *gateway.ClientTLS, limits gateway.ClientTLSLimits, logf func(string, ...any)) error {
+	startGatewayRecovery(ctx, exec, logf)
+	return capability.ServeAuthenticatedClients(ctx, listener, limits,
+		func(ctx context.Context, connection net.Conn) { handleConn(ctx, connection, exec, logf) })
 }
 
 // handleConn serves newline-delimited JSON requests on one connection until the
