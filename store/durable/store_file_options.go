@@ -501,6 +501,31 @@ const (
 	fileStoreMetadataReservePages = 55
 )
 
+// fileStoreTransactionExtentBytes converts a descriptor ceiling into a
+// physical-byte ceiling by assigning the widest independently possible extent
+// classes first. Maximum extents cover overflow, primary leaves, and exact
+// pages. One global catalog root is 64 KiB. Each independently dirty primary
+// bucket can then own four 8 KiB routing parents. Remaining free-log and state
+// metadata are PageSize. Sharing or reusable placement can only reduce the
+// resulting append span.
+func fileStoreTransactionExtentBytes(
+	totalPages, maximumExtentPages, routingParentPages, pageSize, maxPageSize int,
+) uint64 {
+	remaining := max(0, totalPages)
+	take := func(want int) int {
+		got := min(max(0, want), remaining)
+		remaining -= got
+		return got
+	}
+	root := take(1)
+	maximum := take(maximumExtentPages)
+	routing := take(routingParentPages)
+	return uint64(maximum)*uint64(maxPageSize) +
+		uint64(root)*uint64(storeio.GlobalTabletCatalogRootBytes) +
+		uint64(routing)*uint64(storeio.GlobalTabletCatalogNodeBytes) +
+		uint64(remaining)*uint64(pageSize)
+}
+
 type normalizedFileStoreOptions struct {
 	Options
 	maxTransactionPages              int
@@ -910,24 +935,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	docMaxTransactionPages := overflowPages + metadataPageLimit
 	docSingleDocumentPages :=
 		overflowPages + singleDocumentMetadataPageLimit
-	// One document and its overflow chain may use maximum-size extents. A
-	// categorical cover can replace one packed catalog, while a numeric
-	// projection replaces one packed stripe plus a bounded path of PageSize
-	// directory nodes. Every tree/root page remains exactly PageSize. The slot
-	// cache therefore reserves the actual worst-case dirty bytes instead of
-	// charging MaxPageSize for every metadata descriptor.
-	largePages := overflowPages + 1
-	if len(compiled) != 0 {
-		largePages++
-	}
-	metadataPages := docMaxTransactionPages - largePages
-	docMaxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
-		uint64(metadataPages)*uint64(o.PageSize)
-	singleDocumentMetadataPages :=
-		docSingleDocumentPages - largePages
-	docSingleDocumentBytes :=
-		uint64(largePages)*uint64(o.MaxPageSize) +
-			uint64(singleDocumentMetadataPages)*uint64(o.PageSize)
 	// Exact-index maintenance stages, in the same transaction as the document
 	// mutation or checkpoint, the dirty term leaves the fold re-encoded plus
 	// each physical index's ordered catalog pages and one
@@ -968,8 +975,21 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	maxTransactionPages := docMaxTransactionPages + exactIndexPages
 	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
-	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
-	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
+	compiledPackedPages := 0
+	if len(compiled) != 0 {
+		compiledPackedPages = 1
+	}
+	maxTransactionBytes := fileStoreTransactionExtentBytes(
+		maxTransactionPages,
+		overflowPages+o.MaxBatchDocuments+compiledPackedPages+exactIndexPages,
+		4*min(o.MaxBatchDocuments, filePrimaryPendingParentLimit),
+		o.PageSize, o.MaxPageSize,
+	)
+	singleDocumentTransactionBytes := fileStoreTransactionExtentBytes(
+		singleDocumentTransactionPages,
+		overflowPages+1+compiledPackedPages+exactIndexPages,
+		4, o.PageSize, o.MaxPageSize,
+	)
 	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
 	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket
 	// directory that fits the collection's descriptor, retirement, and resident
@@ -993,10 +1013,13 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	primaryOverlayFixedPages :=
 		primaryOverlayFixedMetadataPages + exactIndexPages
 	primaryOverlayFixedBytes :=
-		uint64(primaryOverlayFixedMetadataPages)*uint64(o.PageSize) +
-			exactIndexBytes
-	primaryOverlayParentBytes :=
-		uint64(primaryOverlayParentLevels) * uint64(o.PageSize)
+		uint64(primaryOverlayFixedMetadataPages-1)*uint64(o.PageSize) +
+			uint64(storeio.GlobalTabletCatalogRootBytes) + exactIndexBytes
+	primaryOverlayParentBytes := uint64(
+		storeio.SegmentedTabletRouterAnchorPageBytes +
+			storeio.GlobalTabletCatalogTabletBytes +
+			2*storeio.GlobalTabletCatalogNodeBytes,
+	)
 	primaryOverlayTargetBytes := uint64(primaryUnifiedOverlayTargetBytes(
 		o.PageSize, o.MaxKeyBytes, o.InlineValueBytes,
 	))

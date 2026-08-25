@@ -188,6 +188,30 @@ func TestPrimaryVolatileReservationUsesExactExtentBudget(t *testing.T) {
 	}
 }
 
+func TestFileStoreTransactionExtentBytesClassifiesPhysicalParents(t *testing.T) {
+	const (
+		totalPages = 12
+		maxPages   = 3
+		parents    = 4
+	)
+	want := uint64(maxPages*(64<<10) +
+		storeio.GlobalTabletCatalogRootBytes +
+		parents*storeio.GlobalTabletCatalogNodeBytes +
+		(totalPages-maxPages-1-parents)*(4<<10))
+	if got := fileStoreTransactionExtentBytes(
+		totalPages, maxPages, parents, 4<<10, 64<<10,
+	); got != want {
+		t.Fatalf("classified transaction bytes = %d, want %d", got, want)
+	}
+	// Hostile class counts are capped by the descriptor ceiling rather than
+	// double-charging the same frame.
+	if got, wantCapped := fileStoreTransactionExtentBytes(
+		2, 99, 99, 4<<10, 64<<10,
+	), uint64(storeio.GlobalTabletCatalogRootBytes+(64<<10)); got != wantCapped {
+		t.Fatalf("capped transaction bytes = %d, want %d", got, wantCapped)
+	}
+}
+
 func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-direct-*")
 	if err != nil {

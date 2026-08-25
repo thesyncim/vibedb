@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 // TestFilePrimaryUnifiedNativeFoldCrashBoundary exercises the checkpoint shape
@@ -290,6 +291,115 @@ func TestFilePrimaryCollisionGapIsCompactAndSnapshotSafe(t *testing.T) {
 	}
 	defer reopened.Close()
 	assertPrimaryRaw(t, reopened, keys[0], updated, true)
+}
+
+func TestFilePrimaryBatchCheckpointFitsPhysicalExtentReservation(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 4_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability:       DurabilityBufferedVisible,
+		InlineValueBytes: 256, MaxDocumentBytes: 8 << 10,
+		Indexes: []store.IndexDefinition{{Name: "group", Paths: []string{"/group"}}},
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "primary-batch-extent-reservation.vibe",
+	)
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reusable := collection.Stats().ReusableBytes; reusable != 0 {
+		t.Fatalf("fresh bulk image has %d reusable bytes; no-reuse gate is invalid", reusable)
+	}
+
+	type selectedRow struct {
+		key, before, after []byte
+	}
+	selected := make([]selectedRow, 0, 4)
+	seen := make(map[storeio.BucketID]struct{}, 4)
+	state := collection.state.Load()
+	for index := range keys {
+		route, routeErr := collection.currentPrimaryResidentRoute(
+			state, []byte(keys[index]),
+		)
+		if routeErr != nil {
+			t.Fatal(routeErr)
+		}
+		if _, exists := seen[route.Bucket]; exists {
+			continue
+		}
+		seen[route.Bucket] = struct{}{}
+		after := append([]byte(`{"id":1,"group":999,"pad":"`),
+			bytes.Repeat([]byte{'p' + byte(len(selected))}, 1024)...)
+		after = append(after, '"', '}')
+		selected = append(selected, selectedRow{
+			key: []byte(keys[index]), before: values[index], after: after,
+		})
+		if len(selected) == cap(selected) {
+			break
+		}
+	}
+	if len(selected) != cap(selected) {
+		t.Fatalf("fixture supplied %d distinct primary buckets, want %d", len(selected), cap(selected))
+	}
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := collection.durableState.Load()
+	if base == nil {
+		t.Fatal("missing durable checkpoint base")
+	}
+	if err := collection.Update(func(batch *WriteBatch) error {
+		for _, row := range selected {
+			if putErr := batch.Put(row.key, row.after); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	afterDurable := collection.durableState.Load()
+	if afterDurable == nil || afterDurable.fileEnd < base.fileEnd {
+		t.Fatal("invalid durable FileEnd after batch checkpoint")
+	}
+	appended := afterDurable.fileEnd - base.fileEnd
+	if appended > collection.options.maxTransactionBytes {
+		t.Fatalf("no-reuse batch appended %d bytes, reservation %d", appended, collection.options.maxTransactionBytes)
+	}
+	for _, row := range selected {
+		got, found, readErr := snapshot.AppendRaw(nil, row.key)
+		if readErr != nil || !found || !bytes.Equal(got, row.before) {
+			t.Fatalf("pinned batch snapshot %q = (%q,%v,%v)", row.key, got, found, readErr)
+		}
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedFile.Close()
+	reopened, err := Open(reopenedFile, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for _, row := range selected {
+		assertPrimaryRaw(t, reopened, string(row.key), row.after, true)
+	}
 }
 
 func forcePrimaryOverlayPressureFold(
