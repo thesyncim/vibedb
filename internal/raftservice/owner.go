@@ -5,6 +5,7 @@ package raftservice
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -28,6 +30,9 @@ var (
 	// proposal callers have exhausted their independent item or byte budget.
 	// Raft peer ingress remains available when this client-facing budget fills.
 	ErrPendingProposalsFull = errors.New("raftservice: pending proposal budget is full")
+	// ErrPendingReadsFull reports exhaustion of the independent response item
+	// or byte budget. It does not block peer ingress or committed apply.
+	ErrPendingReadsFull = errors.New("raftservice: pending read budget is full")
 	// ErrOwnerClosed reports admission outside the serialized owner's live Run
 	// interval, including before the sole Host lane has started.
 	ErrOwnerClosed = errors.New("raftservice: owner is closed")
@@ -51,6 +56,8 @@ type Limits struct {
 	MaxIngressBytes         int64
 	MaxPendingProposalItems int
 	MaxPendingProposalBytes int64
+	MaxPendingReadItems     int
+	MaxPendingReadBytes     int64
 	MaxPendingOutboundBytes int64
 }
 
@@ -69,6 +76,7 @@ type Options struct {
 	Host                     *multiraft.Host
 	Members                  []raftmember.RuntimeIdentity
 	CommandFences            []CommandFence
+	ReadSources              []ReadSource
 	MembershipAuthorizations []MembershipAuthorization
 	MembershipAuthority      MembershipAuthoritySink
 	Outbound                 OutboundSink
@@ -84,6 +92,8 @@ const (
 	requestCampaign
 	requestStatus
 	requestMembership
+	requestReadLinear
+	requestReadFollower
 )
 
 const (
@@ -109,12 +119,44 @@ type ownerRequest struct {
 	async      bool
 	delivery   *proposalDelivery
 	membership MembershipRequest
+	read       readRequest
 }
 
 type ownerReply struct {
 	waiter raftserve.Waiter
 	state  ServingState
 	err    error
+	read   readAuthorization
+}
+
+type readRequest struct {
+	fence          ServingFence
+	minimumApplied uint64
+	delivery       *readDelivery
+}
+
+type readAuthorization struct {
+	source         ReadSource
+	minimumApplied uint64
+}
+
+type readDelivery struct {
+	state          atomic.Uint32
+	reply          chan ownerReply
+	source         ReadSource
+	minimumApplied uint64
+}
+
+const (
+	readDeliveryPending uint32 = iota
+	readDeliveryAbandoned
+	readDeliveryReady
+)
+
+// ReadSource exposes the replicated machine's coherent dense-relation point
+// cut without table names or SQL interpretation.
+type ReadSource interface {
+	PointReadInto(replication.RelationID, []byte, uint64, int, []byte) (replicatedstate.PointReadResult, error)
 }
 
 // Result is one terminal deterministic apply result. Completion is the exact
@@ -122,6 +164,66 @@ type ownerReply struct {
 type Result struct {
 	Outcome    raftserve.Outcome
 	Completion []byte
+}
+
+// PointReadRequest selects one dense relation and exact consistency contract.
+// Linearizable uses a leader ReadIndex barrier. Follower mode serves only when
+// the local publication reaches MinimumApplied; it makes no time-based claim.
+type PointReadRequest struct {
+	Fence          ServingFence
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  int
+	Linearizable   bool
+}
+
+// PointReadResult owns Value. Found=true with an empty Value is distinct from
+// a miss and is preserved by the native wire.
+type PointReadResult struct {
+	Applied uint64
+	Found   bool
+	Value   []byte
+}
+
+// PointReadLease holds the conservative response-memory reservation until the
+// serving boundary has finished encoding and writing the result.
+type PointReadLease interface {
+	Release()
+}
+
+const (
+	// Native read responses retain a five-byte frame header and a 277-byte
+	// fixed body in addition to the detached store value. Charge each of the
+	// two variable-sized allocations for worst-case 8 KiB allocator rounding;
+	// this keeps the resident-memory contract conservative across size classes.
+	pointReadEncodedFrameFixedBytes int64 = 5 + 277
+	pointReadAllocatorSlopBytes     int64 = 2 * ((8 << 10) - 1)
+)
+
+func pointReadResponseCharge(maximum int) (int64, bool) {
+	if maximum <= 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	fixed := pointReadEncodedFrameFixedBytes + pointReadAllocatorSlopBytes
+	payload := int64(maximum)
+	if payload > (maxInt64-fixed)/2 {
+		return 0, false
+	}
+	return payload*2 + fixed, true
+}
+
+type pointReadLease struct {
+	owner    *Owner
+	bytes    int64
+	released atomic.Bool
+}
+
+func (lease *pointReadLease) Release() {
+	if lease != nil && lease.owner != nil && lease.released.CompareAndSwap(false, true) {
+		lease.owner.releasePendingRead(lease.bytes)
+	}
 }
 
 // CommandFence is the exact command/catalog contract served by one Runtime.
@@ -229,6 +331,10 @@ type Owner struct {
 	ingressBytes         int64
 	pendingProposalItems int
 	pendingProposalBytes int64
+	pendingReadItems     int
+	pendingReadBytes     int64
+	readSequence         uint64
+	pendingReads         map[[16]byte]*readDelivery
 	started              bool
 	closed               bool
 	failure              error
@@ -244,6 +350,7 @@ type ownerMember struct {
 	identity  raftmember.RuntimeIdentity
 	command   CommandFence
 	authority MembershipAuthorization
+	read      ReadSource
 }
 
 type MembershipKind uint8
@@ -285,6 +392,27 @@ type MembershipRequest struct {
 	TransferTerm              uint64
 }
 
+// ValidateMembershipFields rejects every malformed fixed-width control
+// envelope independently of metadata authorization or live Raft state. It is
+// shared by the gateway admission edge and serialized owner so malformed
+// requests cannot consume discovery/network work and cannot bypass the owner
+// when submitted through an in-process path.
+func ValidateMembershipFields(
+	kind MembershipKind,
+	transitionID [16]byte,
+	metadataEpoch, catalogGeneration, expectedReplicaSetVersion uint64,
+	sourceMember, targetMember, transferTerm uint64,
+) error {
+	if kind < MembershipAddLearner || kind > MembershipTransferLeader ||
+		transitionID == ([16]byte{}) || metadataEpoch == 0 || catalogGeneration == 0 ||
+		expectedReplicaSetVersion == 0 || sourceMember == 0 || targetMember == 0 ||
+		sourceMember == targetMember ||
+		(kind == MembershipRemoveVoter) != (transferTerm != 0) {
+		return ErrMembershipMalformed
+	}
+	return nil
+}
+
 // NewOwner validates and detaches one lane configuration. Runtime adoption and
 // Host group addition must be complete before construction.
 func NewOwner(options Options) (*Owner, error) {
@@ -300,8 +428,13 @@ func NewOwner(options Options) (*Owner, error) {
 		limits.MaxPendingProposalItems > raftserve.AbsoluteMaxWaiters ||
 		limits.MaxPendingProposalBytes <= 0 ||
 		limits.MaxPendingProposalBytes > multiraft.AbsoluteMaxQueueBytes ||
+		limits.MaxPendingReadItems <= 0 || limits.MaxPendingReadItems > raftmodel.MaxPendingReads ||
+		limits.MaxPendingReadBytes <= 0 || limits.MaxPendingReadBytes > multiraft.AbsoluteMaxQueueBytes ||
 		limits.MaxPendingOutboundBytes <= 0 ||
 		limits.MaxPendingOutboundBytes > multiraft.AbsoluteMaxOutboxBytes {
+		return nil, ErrInvalidOwner
+	}
+	if len(options.ReadSources) != 0 && len(options.ReadSources) != len(options.Members) {
 		return nil, ErrInvalidOwner
 	}
 	seen := make(map[raftmember.GroupKey]struct{}, len(options.Members))
@@ -313,10 +446,12 @@ func NewOwner(options Options) (*Owner, error) {
 			return nil, ErrInvalidOwner
 		}
 		if identity.AllocationGeneration == 0 || identity.MemberID == 0 ||
-			identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 {
+			identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 ||
+			identity.RelationManifestDigest == ([32]byte{}) {
 			return nil, ErrInvalidOwner
 		}
-		if !options.CommandFences[index].Valid() {
+		if !options.CommandFences[index].Valid() ||
+			options.CommandFences[index].RelationManifestDigest != identity.RelationManifestDigest {
 			return nil, ErrInvalidOwner
 		}
 		if _, duplicate := seen[group]; duplicate {
@@ -331,16 +466,21 @@ func NewOwner(options Options) (*Owner, error) {
 				return nil, ErrInvalidOwner
 			}
 		}
+		var source ReadSource
+		if len(options.ReadSources) != 0 {
+			source = options.ReadSources[index]
+		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			authority: authority}
+			authority: authority, read: source}
 	}
 	return &Owner{
 		registry: options.Registry, host: options.Host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
-		authority: options.MembershipAuthority,
-		ingress:   make(chan ownerRequest, limits.MaxIngressItems),
-		ready:     make(chan struct{}),
-		done:      make(chan struct{}),
+		authority:    options.MembershipAuthority,
+		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
+		ready:        make(chan struct{}),
+		done:         make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
 	}, nil
 }
 
@@ -395,7 +535,7 @@ func (owner *Owner) Run(ctx context.Context) error {
 		}
 
 		if !transportBlocked && !readyBlocked {
-			_, done, err := owner.host.RunOne()
+			progress, done, err := owner.host.RunOne()
 			switch {
 			case errors.Is(err, multiraft.ErrOutboxFull):
 				// The next loop transfers one Host-owned message into the retained
@@ -414,6 +554,7 @@ func (owner *Owner) Run(ctx context.Context) error {
 				if err := owner.syncMembershipAuthorities(); err != nil {
 					return owner.stop(err)
 				}
+				owner.finishReadOutcomes(progress.ReadOutcomes)
 				continue
 			}
 		}
@@ -538,11 +679,98 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
+	case requestReadLinear, requestReadFollower:
+		member, found := owner.members[request.group]
+		if !found || member.read == nil ||
+			!servingFenceMatchesIdentity(request.read.fence, member) {
+			reply.err = ErrServingFence
+			break
+		}
+		status, err := owner.host.Status(request.group)
+		if err != nil {
+			reply.err = err
+			break
+		}
+		if status.MemberID != member.identity.MemberID || status.Term != request.read.fence.Term {
+			reply.err = ErrServingFence
+			break
+		}
+		if request.kind == requestReadFollower {
+			if status.Applied < request.read.minimumApplied {
+				reply.err = replicatedstate.ErrReadBehind
+				break
+			}
+			reply.read = readAuthorization{source: member.read, minimumApplied: request.read.minimumApplied}
+			break
+		}
+		if status.LeaderID != member.identity.MemberID {
+			reply.err = &NotLeaderError{Status: status}
+			break
+		}
+		context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
+		if contextErr != nil {
+			reply.err = contextErr
+			break
+		}
+		if err := owner.host.ReadIndex(request.group, context[:]); err != nil {
+			reply.err = err
+			break
+		}
+		request.read.delivery.source = member.read
+		request.read.delivery.minimumApplied = request.read.minimumApplied
+		owner.pendingReads[context] = request.read.delivery
+		// The reply is settled only by the matching quorum barrier.
+		return nil
 	default:
 		reply.err = ErrInvalidOwner
 	}
-	request.reply <- reply
+	if request.kind == requestReadLinear && request.read.delivery != nil {
+		owner.settleReadDelivery(request.read.delivery, reply)
+	} else {
+		request.reply <- reply
+	}
 	return reply.err
+}
+
+func (owner *Owner) nextReadContext(incarnation uint64) ([16]byte, error) {
+	if owner.readSequence == ^uint64(0) || len(owner.pendingReads) >= owner.limits.MaxPendingReadItems {
+		return [16]byte{}, ErrIngressFull
+	}
+	owner.readSequence++
+	var context [16]byte
+	binary.LittleEndian.PutUint64(context[:8], incarnation)
+	binary.LittleEndian.PutUint64(context[8:], owner.readSequence)
+	return context, nil
+}
+
+func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
+	for index := range outcomes {
+		outcome := outcomes[index]
+		if len(outcome.Barrier.Context) != 16 {
+			continue
+		}
+		var key [16]byte
+		copy(key[:], outcome.Barrier.Context)
+		delivery, found := owner.pendingReads[key]
+		if !found {
+			continue
+		}
+		delete(owner.pendingReads, key)
+		reply := ownerReply{err: outcome.Err}
+		if outcome.Err == nil {
+			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
+			// Source was authenticated at admission and remains bound to the
+			// immutable owner member for this allocation.
+			reply.read.source = delivery.source
+		}
+		owner.settleReadDelivery(delivery, reply)
+	}
+}
+
+func (owner *Owner) settleReadDelivery(delivery *readDelivery, reply ownerReply) {
+	if delivery != nil && delivery.state.CompareAndSwap(readDeliveryPending, readDeliveryReady) {
+		delivery.reply <- reply
+	}
 }
 
 func handoffProposalWaiter(
@@ -701,13 +929,12 @@ func validateMembershipIdentity(
 	request MembershipRequest,
 	authority MembershipAuthorization,
 ) error {
-	if request.Kind < MembershipAddLearner || request.Kind > MembershipTransferLeader ||
-		request.ExpectedReplicaSetVersion == 0 || request.SourceMember == 0 ||
-		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
-		return ErrMembershipMalformed
-	}
-	if (request.Kind == MembershipRemoveVoter) != (request.TransferTerm != 0) {
-		return ErrMembershipMalformed
+	if err := ValidateMembershipFields(
+		request.Kind, request.TransitionID, request.MetadataEpoch, request.CatalogGeneration,
+		request.ExpectedReplicaSetVersion, request.SourceMember, request.TargetMember,
+		request.TransferTerm,
+	); err != nil {
+		return err
 	}
 	if request.TransitionID != authority.TransitionID ||
 		request.MetadataEpoch != authority.MetadataEpoch ||
@@ -752,6 +979,10 @@ func (owner *Owner) stop(cause error) error {
 		close(owner.done)
 	}
 	owner.mu.Unlock()
+	for key, delivery := range owner.pendingReads {
+		delete(owner.pendingReads, key)
+		owner.settleReadDelivery(delivery, ownerReply{err: errors.Join(ErrOwnerClosed, cause)})
+	}
 	for {
 		select {
 		case request := <-owner.ingress:
@@ -761,6 +992,141 @@ func (owner *Owner) stop(cause error) error {
 			return cause
 		}
 	}
+}
+
+// ReadPoint authorizes through the serialized owner and reads an exact
+// coherent replicated cut outside the Raft lane. The conservative response
+// reservation is held across authorization, snapshot IO, and result copy.
+func (owner *Owner) ReadPoint(
+	ctx context.Context,
+	request PointReadRequest,
+) (PointReadResult, PointReadLease, error) {
+	if owner == nil || ctx == nil || request.Relation == 0 ||
+		len(request.Key) == 0 || len(request.Key) > replication.MaxMutationKeyBytes ||
+		request.MinimumApplied == 0 || request.MaxValueBytes <= 0 ||
+		request.MaxValueBytes > replication.MaxMutationValueBytes {
+		return PointReadResult{}, nil, ErrInvalidOwner
+	}
+	// The server briefly owns the detached store result and its encoded frame.
+	// Charge both rounded allocations and exact wire overhead before either can
+	// exist.
+	responseCharge, ok := pointReadResponseCharge(request.MaxValueBytes)
+	if !ok {
+		return PointReadResult{}, nil, ErrInvalidOwner
+	}
+	if err := owner.reservePendingRead(responseCharge); err != nil {
+		return PointReadResult{}, nil, err
+	}
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			owner.releasePendingRead(responseCharge)
+		}
+	}()
+	key := make([]byte, len(request.Key))
+	copy(key, request.Key)
+	kind := requestReadFollower
+	var reply ownerReply
+	var err error
+	if request.Linearizable {
+		kind = requestReadLinear
+		delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+		ownerRequest := ownerRequest{
+			kind: kind, group: request.Fence.Group, reply: delivery.reply,
+			bytes: int64(cap(key)), read: readRequest{
+				fence: request.Fence, minimumApplied: request.MinimumApplied,
+				delivery: delivery,
+			},
+		}
+		reply, err = owner.enqueueRead(ctx, ownerRequest, delivery)
+	} else {
+		reply, err = owner.enqueue(ctx, ownerRequest{
+			kind: kind, group: request.Fence.Group, reply: make(chan ownerReply, 1),
+			bytes: int64(cap(key)), read: readRequest{
+				fence: request.Fence, minimumApplied: request.MinimumApplied,
+			},
+		})
+	}
+	if err != nil {
+		return PointReadResult{}, nil, err
+	}
+	value, err := reply.read.source.PointReadInto(
+		request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes,
+		nil,
+	)
+	if err != nil || !pointReadFenceMatches(value.Fence, request.Fence) ||
+		value.Fence.Applied < reply.read.minimumApplied || len(value.Value) > request.MaxValueBytes {
+		if err != nil {
+			return PointReadResult{}, nil, err
+		}
+		return PointReadResult{}, nil, ErrServingFence
+	}
+	releaseReservation = false
+	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
+		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+}
+
+func (owner *Owner) enqueueRead(
+	ctx context.Context,
+	request ownerRequest,
+	delivery *readDelivery,
+) (ownerReply, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return ownerReply{}, cause
+	}
+	if err := owner.publish(request); err != nil {
+		return ownerReply{}, err
+	}
+	select {
+	case reply := <-delivery.reply:
+		return reply, reply.err
+	case <-ctx.Done():
+		if delivery.state.CompareAndSwap(readDeliveryPending, readDeliveryAbandoned) {
+			return ownerReply{}, context.Cause(ctx)
+		}
+		reply := <-delivery.reply
+		return reply, reply.err
+	}
+}
+
+func pointReadFenceMatches(fence replicatedstate.SnapshotFence, serving ServingFence) bool {
+	binding := fence.Binding
+	return binding.ClusterID == serving.Group.ClusterID &&
+		binding.ClusterIncarnation == serving.Group.ClusterIncarnation &&
+		binding.TopologyRecoveryEpoch == serving.Group.TopologyRecoveryEpoch &&
+		binding.ShardIncarnation == serving.Group.ShardIncarnation &&
+		binding.GroupID == serving.Group.GroupID &&
+		binding.AllocationGeneration == serving.AllocationGeneration &&
+		binding.ActivePolicyGeneration == serving.Command.ActivePolicyGeneration &&
+		binding.ProtectionEpoch == serving.Command.ProtectionEpoch &&
+		binding.OwnershipEpoch == serving.Command.OwnershipEpoch &&
+		binding.SchemaGeneration == serving.Command.SchemaGeneration &&
+		fence.RelationManifestDigest == serving.Command.RelationManifestDigest &&
+		fence.ReplicaSetVersion == serving.Command.ReplicaSetVersion &&
+		binding.RoutingVersion == serving.Command.RoutingVersion &&
+		binding.RouteGeneration == serving.Command.RouteGeneration
+}
+
+func (owner *Owner) reservePendingRead(bytes int64) error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if !owner.started || owner.closed {
+		return errors.Join(ErrOwnerClosed, owner.failure)
+	}
+	if owner.pendingReadItems == owner.limits.MaxPendingReadItems ||
+		bytes > owner.limits.MaxPendingReadBytes-owner.pendingReadBytes {
+		return ErrPendingReadsFull
+	}
+	owner.pendingReadItems++
+	owner.pendingReadBytes += bytes
+	return nil
+}
+
+func (owner *Owner) releasePendingRead(bytes int64) {
+	owner.mu.Lock()
+	owner.pendingReadItems--
+	owner.pendingReadBytes -= bytes
+	owner.mu.Unlock()
 }
 
 // publish reserves and enqueues atomically under the lifecycle mutex. Because
