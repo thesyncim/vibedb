@@ -6,6 +6,8 @@
 package splitcontroller
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"math"
 	"strings"
@@ -44,9 +46,9 @@ const (
 	ActionCreateChildWAL
 	ActionAdoptChildRuntime
 	ActionAwaitChildReady
-	ActionPruneRetained
 	ActionPublishCatalog
 	ActionAwaitCatalogDrain
+	ActionPruneRetained
 	ActionComplete
 )
 
@@ -85,7 +87,12 @@ type Plan struct {
 	current        uint64
 	next           uint64
 	targets        [autosplit.MaxSplitChildren]ChildTarget
+	operation      OperationID
 }
+
+// OperationID is the fixed byte-native idempotency identity of one exact split
+// geometry, catalog CAS, and prepared child runtime set.
+type OperationID [sha256.Size]byte
 
 // NewPlan validates the complete cold control-plane intent before any source
 // capture or destination work begins.
@@ -220,7 +227,55 @@ func newPlan(
 			return nil, ErrInvalidPlan
 		}
 	}
+	plan.operation = splitOperationID(plan)
 	return plan, nil
+}
+
+// OperationID returns the exact stable identity reconstructed on controller
+// restart. It contains no process-local pointer or text-key identity.
+func (p *Plan) OperationID() OperationID {
+	if p == nil {
+		return OperationID{}
+	}
+	return p.operation
+}
+
+func splitOperationID(plan *Plan) OperationID {
+	var raw [768]byte
+	at := copy(raw[:], "vibedb/splitcontroller/operation\x00")
+	digest := plan.partitioner.Digest()
+	at += copy(raw[at:], digest[:])
+	binary.LittleEndian.PutUint64(raw[at:at+8], plan.current)
+	binary.LittleEndian.PutUint64(raw[at+8:at+16], plan.next)
+	raw[at+16], raw[at+17] = plan.childCount, plan.retained
+	at += 24
+	for child := 0; child < int(plan.childCount); child++ {
+		target := &plan.targets[child]
+		raw[at] = uint8(child)
+		at++
+		if target.Endpoint == "" {
+			continue
+		}
+		for _, id := range [...][16]byte{
+			target.WAL.ClusterID, target.WAL.ClusterIncarnation,
+			target.WAL.ShardIncarnation, target.WAL.GroupID,
+			target.WAL.StoreID, target.SQL.LogID,
+		} {
+			at += copy(raw[at:], id[:])
+		}
+		values := [...]uint64{
+			target.WAL.AllocationGeneration, target.WAL.MemberID,
+			target.TopologyRecoveryEpoch,
+			target.Authority.ActivePolicyGeneration, target.Authority.ProtectionEpoch,
+			target.Authority.OwnershipEpoch, target.Authority.SchemaGeneration,
+			target.Authority.RoutingVersion, target.Authority.RouteGeneration,
+		}
+		for _, value := range values {
+			binary.LittleEndian.PutUint64(raw[at:at+8], value)
+			at += 8
+		}
+	}
+	return OperationID(sha256.Sum256(raw[:at]))
 }
 
 func reconstructSourceManifest(split *autosplit.SplitPlan) (*distribution.Manifest, error) {
@@ -356,11 +411,46 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		return Action{}, err
 	}
 	if catalog == catalogTarget {
-		if err := plan.validatePublishedCompletion(observed); err != nil {
+		if err := plan.validatePublishedPreparation(observed); err != nil {
 			return Action{}, err
 		}
 		if !observed.OlderCatalogDrained {
 			return Action{Kind: ActionAwaitCatalogDrain, CatalogGeneration: plan.next}, nil
+		}
+		if err := plan.validateSourceObservation(observed); err != nil {
+			return Action{}, err
+		}
+		certificate := *observed.Certificate
+		if observed.Prune != nil && observed.Prune.OperationID() != [sha256.Size]byte(plan.operation) {
+			return Action{}, ErrTopologyConflict
+		}
+		if observed.Prune != nil &&
+			observed.Prune.Phase() == rangesplit.RetainedPruneComplete &&
+			plan.sourceStateAheadOfCompletion(observed.SourceState, certificate, *observed.Prune) {
+			if observed.Capture == nil || observed.Capture.Head() != observed.SourceState.Applied {
+				return Action{}, ErrTopologyConflict
+			}
+			if !sourceLeader(observed.SourceStatus, observed.SourceState) {
+				return Action{Kind: ActionAwaitSourceLeader}, nil
+			}
+			return Action{Kind: ActionPruneRetained}, nil
+		}
+		if !plan.sourceStateAfterPublication(observed.SourceState, certificate, observed.Prune) {
+			return Action{}, ErrTopologyConflict
+		}
+		if observed.Prune == nil || observed.Prune.Phase() != rangesplit.RetainedPruneComplete {
+			if !sourceLeader(observed.SourceStatus, observed.SourceState) {
+				return Action{Kind: ActionAwaitSourceLeader}, nil
+			}
+			return Action{Kind: ActionPruneRetained}, nil
+		}
+		manifest, ok := observed.Catalog.Manifest(plan.source.Distribution)
+		if !ok || plan.partitioner.ValidateRetainedPruneAuthority(
+			manifest, plan.next, certificate,
+		) != nil || plan.partitioner.VerifyRetainedPruneCompletion(
+			certificate, [sha256.Size]byte(plan.operation), *observed.Prune,
+		) != nil {
+			return Action{}, ErrTopologyConflict
 		}
 		return Action{Kind: ActionComplete}, nil
 	}
@@ -432,30 +522,36 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		certificate.SourceCoordinates() != tail.SourceCoordinates() {
 		return Action{}, ErrTopologyConflict
 	}
-	if !plan.sourceStateAfterCutover(observed.SourceState, certificate, observed.Prune) {
+	if observed.Prune != nil || !plan.sourceStateAfterCutover(observed.SourceState, certificate) {
 		return Action{}, ErrTopologyConflict
 	}
 	if action, ok, err := plan.childAction(observed, certificate); ok || err != nil {
 		return action, err
 	}
-	if observed.Prune == nil || observed.Prune.Phase() != rangesplit.RetainedPruneComplete {
-		if !sourceLeader(observed.SourceStatus, observed.SourceState) {
-			return Action{Kind: ActionAwaitSourceLeader}, nil
-		}
-		return Action{Kind: ActionPruneRetained}, nil
-	}
-	prune := *observed.Prune
-	if plan.partitioner.VerifyRetainedPruneCompletion(certificate, prune) != nil ||
-		plan.partitioner.ValidatePublicationTransition(
-			plan.sourceManifest, plan.targetManifest, plan.current, plan.next,
-			certificate, prune,
-		) != nil {
+	if plan.partitioner.ValidatePublicationTransition(
+		plan.sourceManifest, plan.targetManifest, plan.current, plan.next,
+		certificate,
+	) != nil {
 		return Action{}, ErrTopologyConflict
 	}
 	if !sourceSessionsEmpty(observed.SourceState) {
 		return Action{}, ErrSessionTransferRequired
 	}
 	return Action{Kind: ActionPublishCatalog, CatalogGeneration: plan.next}, nil
+}
+
+func (p *Plan) sourceStateAheadOfCompletion(
+	state replicatedstate.State,
+	certificate rangesplit.CutoverCertificate,
+	prune rangesplit.RetainedPruneCursor,
+) bool {
+	coordinates := certificate.SourceCoordinates()
+	cut := prune.SourceCut()
+	return prune.SourceCoordinates() == coordinates && state.Applied > cut.Applied &&
+		state.Binding.OwnershipEpoch == coordinates.OwnershipEpoch &&
+		state.Binding.RoutingVersion == coordinates.RoutingVersion &&
+		state.Binding.RouteGeneration == coordinates.RouteGeneration &&
+		state.SnapshotBaseDigest == cut.BaseDigest
 }
 
 func sourceSessionsEmpty(state replicatedstate.State) bool {
@@ -545,6 +641,22 @@ func (p *Plan) sourceStateMatchesCut(state replicatedstate.State, tail rangespli
 func (p *Plan) sourceStateAfterCutover(
 	state replicatedstate.State,
 	certificate rangesplit.CutoverCertificate,
+) bool {
+	cut := certificate.SourceCut()
+	coordinates := certificate.SourceCoordinates()
+	if state.Binding.OwnershipEpoch != coordinates.OwnershipEpoch ||
+		state.Binding.RoutingVersion != coordinates.RoutingVersion ||
+		state.Binding.RouteGeneration != coordinates.RouteGeneration ||
+		state.SnapshotBaseDigest != cut.BaseDigest || state.Applied < cut.Applied {
+		return false
+	}
+	return state.Applied == cut.Applied && state.LastTerm == cut.Term &&
+		state.DataChainDigest == cut.DataChainDigest && state.LastEntryDigest == cut.EntryDigest
+}
+
+func (p *Plan) sourceStateAfterPublication(
+	state replicatedstate.State,
+	certificate rangesplit.CutoverCertificate,
 	prune *rangesplit.RetainedPruneCursor,
 ) bool {
 	cut := certificate.SourceCut()
@@ -560,7 +672,10 @@ func (p *Plan) sourceStateAfterCutover(
 			state.DataChainDigest == cut.DataChainDigest && state.LastEntryDigest == cut.EntryDigest
 	}
 	pruneCut := prune.SourceCut()
-	return state.Applied >= pruneCut.Applied
+	return prune.SourceCoordinates() == coordinates && state.Applied == pruneCut.Applied &&
+		state.LastTerm == pruneCut.Term && state.DataChainDigest == pruneCut.DataChainDigest &&
+		state.LastEntryDigest == pruneCut.EntryDigest &&
+		state.SnapshotBaseDigest == pruneCut.BaseDigest
 }
 
 func (p *Plan) stageAction(
@@ -690,14 +805,13 @@ func (p *Plan) childAction(
 	return Action{}, false, nil
 }
 
-func (p *Plan) validatePublishedCompletion(observed Observation) error {
-	if observed.Certificate == nil || observed.Prune == nil ||
-		observed.Prune.Phase() != rangesplit.RetainedPruneComplete {
+func (p *Plan) validatePublishedPreparation(observed Observation) error {
+	if observed.Certificate == nil {
 		return ErrTopologyConflict
 	}
-	certificate, prune := *observed.Certificate, *observed.Prune
+	certificate := *observed.Certificate
 	if p.partitioner.ValidatePublicationTransition(
-		p.sourceManifest, p.targetManifest, p.current, p.next, certificate, prune,
+		p.sourceManifest, p.targetManifest, p.current, p.next, certificate,
 	) != nil {
 		return ErrTopologyConflict
 	}

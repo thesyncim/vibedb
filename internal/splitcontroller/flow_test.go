@@ -20,8 +20,21 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing.T) {
+func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing.T) {
 	plan, catalog, target, split := testPlan(t)
+	assertCrashRecovery := func(observed Observation, want ActionKind) Action {
+		t.Helper()
+		recovered, recoverErr := RecoverPlan(
+			observed.Catalog, 19, split, plan.partitioner, []ChildTarget{target},
+		)
+		if recoverErr != nil {
+			t.Fatalf("recover before %v: %v", want, recoverErr)
+		}
+		if recovered.OperationID() != plan.OperationID() {
+			t.Fatalf("operation identity changed before %v", want)
+		}
+		return assertFlowAction(t, recovered, observed, want)
+	}
 	source := newFlowSource(t, plan)
 	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {
 		t.Fatal(err)
@@ -30,7 +43,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	observed := Observation{
 		Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state),
 	}
-	assertFlowAction(t, plan, observed, ActionStartCapture)
+	assertCrashRecovery(observed, ActionStartCapture)
 
 	capture, err := rangesplit.NewSourceCapture(
 		plan.partitioner, "controller-flow-capture", source.capture,
@@ -42,7 +55,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		t.Fatal(err)
 	}
 	observed.Capture = capture
-	assertFlowAction(t, plan, observed, ActionBuildArtifacts)
+	assertCrashRecovery(observed, ActionBuildArtifacts)
 
 	cut, err := source.machine.Snapshot("docs")
 	if err != nil {
@@ -63,7 +76,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		t.Fatalf("build artifacts = %v, close = %v", err, closeErr)
 	}
 	observed.Artifacts = &artifacts
-	action := assertFlowAction(t, plan, observed, ActionStageChild)
+	action := assertCrashRecovery(observed, ActionStageChild)
 	if action.Child != 1 {
 		t.Fatalf("stage child = %d, want 1", action.Child)
 	}
@@ -98,7 +111,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		t.Fatal("missing child stage cursor")
 	}
 	observed.Stages[1] = &stageCursor
-	assertFlowAction(t, plan, observed, ActionCatchUpTail)
+	assertCrashRecovery(observed, ActionCatchUpTail)
 
 	tail, err := plan.partitioner.InitialTailCursor(artifacts)
 	if err != nil {
@@ -113,7 +126,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	state = flowSourceState(t, source.machine)
 	observed.SourceState = state
 	observed.SourceStatus = testLeaderStatus(state)
-	assertFlowAction(t, plan, observed, ActionCatchUpTail)
+	assertCrashRecovery(observed, ActionCatchUpTail)
 
 	flowTranslateNext(t, plan.partitioner, capture, &tail, stage, persistStage)
 	stageCursor, _ = stage.Cursor()
@@ -127,7 +140,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		t.Fatalf("seal with retained session action=%+v err=%v", action, reconcileErr)
 	}
 	observed.SourceState = state
-	assertFlowAction(t, plan, observed, ActionSealSource)
+	assertCrashRecovery(observed, ActionSealSource)
 
 	seal, err := plan.AppendSourceSeal(
 		make([]byte, 0, replicatedstate.MaxOwnershipTransitionBytes), state, tail, 1, 2,
@@ -143,7 +156,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	state = flowSourceState(t, source.machine)
 	observed.SourceState = state
 	observed.SourceStatus = testLeaderStatus(state)
-	assertFlowAction(t, plan, observed, ActionCatchUpTail)
+	assertCrashRecovery(observed, ActionCatchUpTail)
 
 	flowTranslateNext(t, plan.partitioner, capture, &tail, stage, persistStage)
 	if !tail.Sealed() {
@@ -151,7 +164,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 	}
 	stageCursor, _ = stage.Cursor()
 	observed.Stages[1] = &stageCursor
-	assertFlowAction(t, plan, observed, ActionCertifyCutover)
+	assertCrashRecovery(observed, ActionCertifyCutover)
 
 	var cutoverWorkspace rangesplit.CutoverWorkspace
 	certificate, err := plan.partitioner.CertifyCutover(
@@ -161,7 +174,7 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		t.Fatal(err)
 	}
 	observed.Certificate = &certificate
-	action = assertFlowAction(t, plan, observed, ActionActivateChild)
+	action = assertCrashRecovery(observed, ActionActivateChild)
 	if action.Child != 1 {
 		t.Fatalf("activation child = %d, want 1", action.Child)
 	}
@@ -196,16 +209,86 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 		}
 	}
 	child.ApplyProfile.SessionEpochHighWater = certificate.SourceCut().Applied
-	assertFlowAction(t, plan, observed, ActionCreateChildWAL)
+	assertCrashRecovery(observed, ActionCreateChildWAL)
 	child.Phase = ChildPhaseWALCreated
 	child.WALBinding = target.SQL.Binding
-	assertFlowAction(t, plan, observed, ActionAdoptChildRuntime)
+	assertCrashRecovery(observed, ActionAdoptChildRuntime)
 	child.Phase = ChildPhaseRuntimeAdopted
 	child.RuntimeIdentity = testRuntimeIdentity(target)
 	child.RuntimeStatus = raftmemberReadyStatus(target, certificate.SourceCut().Applied)
-	assertFlowAction(t, plan, observed, ActionPruneRetained)
+	sessionState = observed.SourceState
+	sessionState.SessionCount = 1
+	sessionState.SessionSlotCount = 1
+	observed.SourceState = sessionState
+	if action, reconcileErr := Reconcile(plan, observed); action != (Action{}) ||
+		!errors.Is(reconcileErr, ErrSessionTransferRequired) {
+		t.Fatalf("publication with retained session action=%+v err=%v", action, reconcileErr)
+	}
+	observed.SourceState = state
+	prematurePrune := observed
+	prematurePrune.Prune = &rangesplit.RetainedPruneCursor{}
+	if action, reconcileErr := Reconcile(plan, prematurePrune); action != (Action{}) ||
+		!errors.Is(reconcileErr, ErrTopologyConflict) {
+		t.Fatalf("pre-publication prune action=%+v err=%v", action, reconcileErr)
+	}
+	assertCrashRecovery(observed, ActionPublishCatalog)
 
-	pruner, err := rangesplit.NewRetainedPruner(plan.partitioner, certificate, nil)
+	next, err := plan.BuildCatalogTransition(catalog, state, certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batched, err := BuildCertifiedRangeSplitBatch(
+		catalog, 20, []CertifiedRangeSplit{{
+			Target: split.Manifest(), Partitioner: plan.partitioner,
+			Certificate: certificate,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchedManifest, ok := batched.Manifest(split.Source.Distribution)
+	if !ok || !batchedManifest.Equal(split.Manifest()) {
+		t.Fatal("certified batch did not publish the exact split manifest")
+	}
+	observed.Catalog = next
+	assertCrashRecovery(observed, ActionAwaitCatalogDrain)
+	observed.OlderCatalogDrained = true
+	assertCrashRecovery(observed, ActionPruneRetained)
+	receipt, err := gateway.SaveSnapshotAfterWithReceipt(t.TempDir()+"/catalog", 0, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := gateway.NewCatalogHolder(next)
+	authority, err := holder.AuthorizeRetainedPrune(
+		receipt, split.Source.Distribution, [32]byte(plan.OperationID()), certificate.Digest(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongOperation := [32]byte(plan.OperationID())
+	wrongOperation[0] ^= 0xff
+	wrongAuthority, err := holder.AuthorizeRetainedPrune(
+		receipt, split.Source.Distribution, wrongOperation, certificate.Digest(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPruner, err := rangesplit.NewRetainedPruner(
+		plan.partitioner, certificate, wrongAuthority, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCursor := wrongPruner.Cursor()
+	wrongObserved := observed
+	wrongObserved.Prune = &wrongCursor
+	if action, reconcileErr := Reconcile(plan, wrongObserved); action != (Action{}) ||
+		!errors.Is(reconcileErr, ErrTopologyConflict) {
+		t.Fatalf("cross-operation prune action=%+v err=%v", action, reconcileErr)
+	}
+	pruner, err := rangesplit.NewRetainedPruner(
+		plan.partitioner, certificate, authority, nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,45 +313,81 @@ func TestReconcileRealProofFlowSurvivesSealAndPublicationCrashWindows(t *testing
 			pruner.Cursor(), hasBatch, len(pruneRaw), advanceErr, closeErr,
 		)
 	}
-	prune := pruner.Cursor()
-	observed.Prune = &prune
-	sessionState = observed.SourceState
-	sessionState.SessionCount = 1
-	sessionState.SessionSlotCount = 1
-	observed.SourceState = sessionState
-	if action, reconcileErr := Reconcile(plan, observed); action != (Action{}) ||
-		!errors.Is(reconcileErr, ErrSessionTransferRequired) {
-		t.Fatalf("publication with retained session action=%+v err=%v", action, reconcileErr)
-	}
-	observed.SourceState = state
-	assertFlowAction(t, plan, observed, ActionPublishCatalog)
-
-	next, err := plan.BuildCatalogTransition(catalog, state, certificate, prune)
-	if err != nil {
-		t.Fatal(err)
-	}
-	batched, err := gateway.BuildCertifiedRangeSplitBatch(
-		catalog, 20, []gateway.CertifiedRangeSplit{{
-			Target: split.Manifest(), Partitioner: plan.partitioner,
-			Certificate: certificate, Prune: prune,
-		}},
+	verifying := pruner.Cursor()
+	observed.Prune = &verifying
+	assertCrashRecovery(observed, ActionPruneRetained)
+	pruner, err = rangesplit.NewRetainedPruner(
+		plan.partitioner, certificate, authority, pruneRaw,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	batchedManifest, ok := batched.Manifest(split.Source.Distribution)
-	if !ok || !batchedManifest.Equal(split.Manifest()) {
-		t.Fatal("certified batch did not publish the exact split manifest")
+	for steps := 0; pruner.Cursor().Phase() != rangesplit.RetainedPruneComplete; steps++ {
+		if steps > 8 {
+			t.Fatal("bounded retained verification did not complete")
+		}
+		verifyCut, snapshotErr := source.machine.Snapshot("docs")
+		if snapshotErr != nil {
+			t.Fatal(snapshotErr)
+		}
+		_, has, verifyErr := pruner.Advance(
+			verifyCut, capture, rangesplit.RetainedPruneLimits{},
+			func(raw []byte) error { pruneRaw = append(pruneRaw[:0], raw...); return nil },
+			&pruneWorkspace,
+		)
+		closeErr = verifyCut.Close()
+		if verifyErr != nil || closeErr != nil || has {
+			t.Fatalf("verify has=%v err=%v close=%v", has, verifyErr, closeErr)
+		}
+		pruner, err = rangesplit.NewRetainedPruner(
+			plan.partitioner, certificate, authority, pruneRaw,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	observed.Catalog = next
-	assertFlowAction(t, plan, observed, ActionAwaitCatalogDrain)
-	recovered, err := RecoverPlan(next, 19, split, plan.partitioner, []ChildTarget{target})
+	prune := pruner.Cursor()
+	observed.Prune = &prune
+	divergent := observed
+	divergent.SourceState.LastEntryDigest[0] ^= 0xff
+	if action, err := Reconcile(plan, divergent); action != (Action{}) ||
+		!errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("divergent completion action=%+v err=%v", action, err)
+	}
+	assertCrashRecovery(observed, ActionComplete)
+	if _, err := source.machine.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: 4, Term: 2, Type: pb.EntryConfChange,
+	}, &pb.ConfState{Voters: []uint64{1, 2}}); err != nil {
+		t.Fatal(err)
+	}
+	state = flowSourceState(t, source.machine)
+	observed.SourceState = state
+	observed.SourceStatus = testLeaderStatus(state)
+	assertCrashRecovery(observed, ActionPruneRetained)
+	lateCut, err := source.machine.Snapshot("docs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed.OlderCatalogDrained = true
-	assertFlowAction(t, recovered, observed, ActionComplete)
-	if _, err := plan.BuildCatalogTransition(next, state, certificate, prune); err == nil {
+	if _, has, advanceErr := pruner.Advance(
+		lateCut, capture, rangesplit.RetainedPruneLimits{},
+		func(raw []byte) error { pruneRaw = append(pruneRaw[:0], raw...); return nil },
+		&pruneWorkspace,
+	); advanceErr != nil || has {
+		t.Fatalf("late complete suffix has=%v err=%v", has, advanceErr)
+	}
+	if err := lateCut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruner, err = rangesplit.NewRetainedPruner(
+		plan.partitioner, certificate, authority, pruneRaw,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prune = pruner.Cursor()
+	observed.Prune = &prune
+	assertCrashRecovery(observed, ActionComplete)
+	if _, err := plan.BuildCatalogTransition(next, state, certificate); err == nil {
 		t.Fatal("already-published catalog accepted as a new transition source")
 	}
 }
