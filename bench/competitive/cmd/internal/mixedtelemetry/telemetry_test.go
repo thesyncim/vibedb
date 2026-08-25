@@ -2,6 +2,8 @@ package mixedtelemetry
 
 import (
 	"bytes"
+	"io"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -58,6 +60,79 @@ func TestParseRejectsMissingDuplicateAndUnknownSchema(t *testing.T) {
 	if _, err := Parse([]byte(unknown)); err == nil {
 		t.Fatal("unknown schema was accepted")
 	}
+}
+
+func TestWriteParsePreservesExactUint64AndCanonicalBytes(t *testing.T) {
+	record := Record{
+		Engine: "vibedb", RuntimeTotalAllocBytes: math.MaxUint64,
+		Histograms: map[string]Histogram{
+			"z": {Count: math.MaxUint64, Buckets: []uint64{0, math.MaxUint64}},
+			"a": {Sum: math.MaxUint64},
+		},
+	}
+	var first, second bytes.Buffer
+	if err := Write(&first, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(&second, record); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Bytes(), second.Bytes()) {
+		t.Fatalf("noncanonical output:\n%s\n%s", first.Bytes(), second.Bytes())
+	}
+	got, err := Parse(first.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RuntimeTotalAllocBytes != math.MaxUint64 ||
+		got.Histograms["z"].Count != math.MaxUint64 ||
+		got.Histograms["z"].Buckets[1] != math.MaxUint64 {
+		t.Fatalf("uint64 precision changed: %+v", got)
+	}
+}
+
+func TestParseRejectsNoncanonicalSchemaAndBounds(t *testing.T) {
+	tests := [][]byte{
+		[]byte(Prefix + `{"schema":1,"Engine":"vibedb"}` + "\n"),
+		[]byte(Prefix + `{"schema":1,"unknown":0}` + "\n"),
+		[]byte(Prefix + `{"schema":1,"histograms":{"x":{"buckets":[[[[0]]]]}}}` + "\n"),
+	}
+	for _, input := range tests {
+		if _, err := Parse(input); err == nil {
+			t.Fatalf("invalid telemetry accepted: %.160q", input)
+		}
+	}
+	oversized := append([]byte(Prefix), bytes.Repeat([]byte{' '}, maxTelemetryJSONBytes+1)...)
+	oversized = append(oversized, '\n')
+	if _, err := Parse(oversized); err == nil {
+		t.Fatal("oversized telemetry accepted")
+	}
+	boundaryPayload := append([]byte(`{"schema":1}`), bytes.Repeat(
+		[]byte{' '}, maxTelemetryJSONBytes-len(`{"schema":1}`),
+	)...)
+	boundary := append(append(append([]byte{}, prefixBytes...), boundaryPayload...), '\n')
+	if _, err := Parse(boundary); err != nil {
+		t.Fatalf("maximum-sized telemetry was rejected: %v", err)
+	}
+}
+
+func TestWriteRejectsOversizeAndShortSink(t *testing.T) {
+	huge := Record{Engine: strings.Repeat("x", maxTelemetryJSONBytes)}
+	if err := Write(io.Discard, huge); err == nil {
+		t.Fatal("oversized record was written")
+	}
+	if err := Write(shortWriter{}, Record{Engine: "vibedb"}); err != io.ErrShortWrite {
+		t.Fatalf("short sink error = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
 }
 
 func TestMetricsOmitDurableCountersWhenUnavailable(t *testing.T) {

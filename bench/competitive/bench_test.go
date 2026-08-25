@@ -641,8 +641,9 @@ func BenchmarkTuning(b *testing.B) {
 // BenchmarkParse isolates the JSON extraction the key/value stores are forced
 // into, with no storage engine underneath. It separates "what storage costs"
 // from "what parsing costs" in the filter rows, and shows how much the
-// key/value engines were flattered by being handed vibejson's own parser
-// instead of the standard library they would realistically use.
+// key/value engines were flattered by being handed a trusted raw pointer seeker
+// after admission. The second cell measures the same operation with complete
+// document validation, retaining a single byte-native implementation.
 func BenchmarkParse(b *testing.B) {
 	needle := jsonScalarNeedle(FilterValue)
 	b.Run("vibejson-pointer", func(b *testing.B) {
@@ -663,11 +664,11 @@ func BenchmarkParse(b *testing.B) {
 		}
 		runtime.KeepAlive(n)
 	})
-	b.Run("encoding-json", func(b *testing.B) {
+	b.Run("vibejson-pointer-validated", func(b *testing.B) {
 		b.ReportAllocs()
 		i, n := 0, 0
 		for b.Loop() {
-			ok, err := matchesCountryStdlib(docs[i].JSON, FilterValue)
+			ok, err := matchesCountryValidated(docs[i].JSON, needle)
 			if err != nil {
 				b.Fatal(err)
 			}
