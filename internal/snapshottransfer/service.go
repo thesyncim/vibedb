@@ -40,10 +40,12 @@ type ServiceOptions struct {
 }
 
 type Stats struct {
-	Connections   int64
-	InflightBytes int64
-	Chunks        uint64
-	Bytes         uint64
+	Connections      int64
+	InflightBytes    int64
+	ResidentBytes    int64
+	ResidentCapacity int64
+	Chunks           uint64
+	Bytes            uint64
 }
 
 type Service struct {
@@ -56,6 +58,7 @@ type Service struct {
 	maxChunk      uint32
 	maxInflight   int64
 	inflight      atomic.Int64
+	resident      atomic.Int64
 	chunks        atomic.Uint64
 	bytes         atomic.Uint64
 }
@@ -156,10 +159,22 @@ func (s *Service) Serve(ctx context.Context, conn rafttransport.PeerConnection) 
 		}
 	}
 	defer s.inflight.Add(-charge)
-	if cap(slot.chunk) < int(d.ChunkBytes) {
-		slot.chunk = make([]byte, 0, d.ChunkBytes)
+	workspace := slot.chunk[:0]
+	retain := false
+	if cap(workspace) < int(d.ChunkBytes) {
+		delta := int64(d.ChunkBytes) - int64(cap(workspace))
+		if s.reserveResident(delta) {
+			workspace = make([]byte, 0, d.ChunkBytes)
+			slot.chunk = workspace
+			retain = true
+		} else {
+			workspace = make([]byte, 0, d.ChunkBytes)
+		}
 	}
-	chunk, complete, err := s.repository.ReadChunk(d, offset, slot.chunk[:0])
+	chunk, complete, err := s.repository.ReadChunk(d, offset, workspace)
+	if retain {
+		slot.chunk = chunk[:0]
+	}
 	if err != nil {
 		return err
 	}
@@ -195,7 +210,22 @@ func (s *Service) Stats() Stats {
 	if s == nil {
 		return Stats{}
 	}
-	return Stats{Connections: int64(cap(s.slots) - len(s.slots)), InflightBytes: s.inflight.Load(), Chunks: s.chunks.Load(), Bytes: s.bytes.Load()}
+	return Stats{Connections: int64(cap(s.slots) - len(s.slots)),
+		InflightBytes: s.inflight.Load(), ResidentBytes: s.resident.Load(),
+		ResidentCapacity: s.maxInflight,
+		Chunks:           s.chunks.Load(), Bytes: s.bytes.Load()}
+}
+
+func (s *Service) reserveResident(bytes int64) bool {
+	for {
+		current := s.resident.Load()
+		if bytes < 0 || current > s.maxInflight-bytes {
+			return false
+		}
+		if s.resident.CompareAndSwap(current, current+bytes) {
+			return true
+		}
+	}
 }
 
 type Receiver struct {

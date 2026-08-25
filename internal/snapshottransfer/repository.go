@@ -31,9 +31,21 @@ type record struct {
 	stage      string
 	published  string
 	offset     uint64
+	stageBytes uint64
 	complete   bool
 	file       *os.File
+	cursorLive bool
+	tempLive   bool
 }
+
+type repositoryFault uint8
+
+const (
+	faultAfterCursorTempSync repositoryFault = iota + 1
+	faultAfterPublishRename
+	faultAfterCursorRemove
+	faultAfterPublishSync
+)
 
 type RepositoryStats struct {
 	Artifacts        int
@@ -54,6 +66,7 @@ type Repository struct {
 	diskBytes uint64
 	closed    bool
 	verify    func(*os.File, Descriptor) error
+	fault     func(repositoryFault) error
 }
 
 func OpenRepository(path string, limits Limits) (*Repository, error) {
@@ -70,7 +83,8 @@ func openRepository(
 		return nil, ErrBound
 	}
 	if limits.MaxArtifactBytes > math.MaxInt64-DescriptorBytes ||
-		limits.MaxDiskBytes < limits.MaxArtifactBytes+DescriptorBytes {
+		limits.MaxArtifactBytes > math.MaxUint64-DescriptorBytes-2*cursorBytes ||
+		limits.MaxDiskBytes < limits.MaxArtifactBytes+DescriptorBytes+2*cursorBytes {
 		return nil, ErrBound
 	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
@@ -196,6 +210,8 @@ func (r *Repository) recover() error {
 			rec.offset, err = r.readCursor(cursor, hash)
 			if errors.Is(err, os.ErrNotExist) {
 				rec.offset, err = 0, nil
+			} else if err == nil {
+				rec.cursorLive = true
 			}
 			if err != nil || rec.offset > uint64(info.Size()-DescriptorBytes) {
 				return errors.Join(ErrRepository, err)
@@ -203,10 +219,17 @@ func (r *Repository) recover() error {
 			if err := r.truncateStage(stage, rec.offset); err != nil {
 				return err
 			}
+			rec.stageBytes = rec.offset
 		}
 		r.records[hash] = rec
-		r.diskBytes += DescriptorBytes + rec.offset
-		if r.diskBytes > r.limits.MaxDiskBytes {
+		owned := uint64(DescriptorBytes) + rec.stageBytes
+		if rec.complete {
+			owned = uint64(DescriptorBytes) + d.ArtifactBytes
+		}
+		if rec.cursorLive {
+			owned += cursorBytes
+		}
+		if !r.addDisk(owned) {
 			return ErrBound
 		}
 	}
@@ -255,21 +278,35 @@ func (r *Repository) readCursor(name string, hash [sha256.Size]byte) (uint64, er
 	return binary.BigEndian.Uint64(raw[40:48]), nil
 }
 
-func (r *Repository) persistCursor(hash [sha256.Size]byte, offset uint64) error {
-	_, cursor, temporary, _ := artifactNames(hash)
+func (r *Repository) persistCursor(rec *record, offset uint64) error {
+	_, cursor, temporary, _ := artifactNames(rec.descriptor.ArtifactHash)
+	if rec.tempLive {
+		return ErrOutcomeUnknown
+	}
+	if !r.addDisk(cursorBytes) {
+		return ErrBound
+	}
+	rec.tempLive = true
 	f, err := r.root.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		rec.tempLive = false
+		r.subtractDisk(cursorBytes)
 		return err
 	}
 	renamed := false
 	defer func() {
 		if !renamed {
-			_ = r.root.Remove(temporary)
+			if removeErr := r.root.Remove(temporary); removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+				if rec.tempLive {
+					rec.tempLive = false
+					r.subtractDisk(cursorBytes)
+				}
+			}
 		}
 	}()
 	var raw [cursorBytes]byte
 	copy(raw[:8], cursorMagic[:])
-	copy(raw[8:40], hash[:])
+	copy(raw[8:40], rec.descriptor.ArtifactHash[:])
 	binary.BigEndian.PutUint64(raw[40:48], offset)
 	if err = writeFull(f, raw[:]); err == nil {
 		err = f.Sync()
@@ -278,10 +315,18 @@ func (r *Repository) persistCursor(hash [sha256.Size]byte, offset uint64) error 
 	if err != nil {
 		return err
 	}
+	if err = r.inject(faultAfterCursorTempSync); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
 	if err = replaceRepositoryEntry(r.root, temporary, cursor); err != nil {
 		return err
 	}
 	renamed = true
+	rec.tempLive = false
+	if rec.cursorLive {
+		r.subtractDisk(cursorBytes)
+	}
+	rec.cursorLive = true
 	if err = syncRoot(r.root); err != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
@@ -333,6 +378,11 @@ func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [s
 	if err != nil {
 		return 0, false, err
 	}
+	if !rec.complete && rec.offset == d.ArtifactBytes {
+		if err := r.finish(rec); err != nil {
+			return rec.offset, false, err
+		}
+	}
 	if offset < rec.offset || rec.complete {
 		if offset <= rec.offset && uint64(len(chunk)) <= rec.offset-offset &&
 			r.recordBytesEqual(rec, offset, chunk) {
@@ -343,14 +393,29 @@ func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [s
 	if offset > rec.offset {
 		return rec.offset, false, ErrChunk
 	}
-	if r.diskBytes > r.limits.MaxDiskBytes-uint64(len(chunk)) {
+	targetEnd := offset + uint64(len(chunk))
+	dataGrowth := uint64(0)
+	if targetEnd > rec.stageBytes {
+		dataGrowth = targetEnd - rec.stageBytes
+	}
+	if !r.canAddDisk(dataGrowth + cursorBytes) {
 		return rec.offset, false, ErrBound
 	}
 	f, err := openRegular(r.root, rec.stage, os.O_RDWR, 0)
 	if err != nil {
 		return rec.offset, false, err
 	}
-	_, err = f.WriteAt(chunk, int64(DescriptorBytes)+int64(offset))
+	written, writeErr := f.WriteAt(chunk, int64(DescriptorBytes)+int64(offset))
+	physicalEnd := offset + uint64(max(written, 0))
+	if physicalEnd > rec.stageBytes {
+		growth := physicalEnd - rec.stageBytes
+		if !r.addDisk(growth) {
+			_ = f.Close()
+			return rec.offset, false, ErrBound
+		}
+		rec.stageBytes = physicalEnd
+	}
+	err = writeErr
 	if err == nil {
 		err = f.Sync()
 	}
@@ -359,10 +424,10 @@ func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [s
 		return rec.offset, false, err
 	}
 	next := offset + uint64(len(chunk))
-	if err = r.persistCursor(d.ArtifactHash, next); err != nil {
+	if err = r.persistCursor(rec, next); err != nil {
 		return rec.offset, false, err
 	}
-	rec.offset, r.diskBytes = next, r.diskBytes+uint64(len(chunk))
+	rec.offset = next
 	if next == d.ArtifactBytes {
 		if err = r.finish(rec); err != nil {
 			return next, false, err
@@ -415,7 +480,7 @@ func (r *Repository) ensure(d Descriptor) (*record, error) {
 		return rec, nil
 	}
 	if len(r.records) == r.limits.MaxArtifacts ||
-		r.diskBytes > r.limits.MaxDiskBytes-DescriptorBytes {
+		!r.canAddDisk(DescriptorBytes) {
 		return nil, ErrBound
 	}
 	stage, _, _, published := artifactNames(d.ArtifactHash)
@@ -435,7 +500,11 @@ func (r *Repository) ensure(d Descriptor) (*record, error) {
 		return nil, err
 	}
 	rec := &record{descriptor: d, stage: stage, published: published}
-	r.records[d.ArtifactHash], r.diskBytes = rec, r.diskBytes+DescriptorBytes
+	if !r.addDisk(DescriptorBytes) {
+		_ = r.root.Remove(stage)
+		return nil, ErrBound
+	}
+	r.records[d.ArtifactHash] = rec
 	if err = syncRoot(r.root); err != nil {
 		return rec, errors.Join(ErrOutcomeUnknown, err)
 	}
@@ -464,11 +533,25 @@ func (r *Repository) finish(rec *record) error {
 		if err = r.root.Rename(rec.stage, rec.published); err != nil {
 			return err
 		}
+		if err = r.inject(faultAfterPublishRename); err != nil {
+			return errors.Join(ErrOutcomeUnknown, err)
+		}
 	}
-	if removeErr := r.root.Remove(cursor); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+	removeErr := r.root.Remove(cursor)
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 		return removeErr
 	}
+	if rec.cursorLive {
+		rec.cursorLive = false
+		r.subtractDisk(cursorBytes)
+	}
+	if err = r.inject(faultAfterCursorRemove); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
 	if err = syncRoot(r.root); err != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	if err = r.inject(faultAfterPublishSync); err != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
 	publishedFile, err := openRegular(r.root, rec.published, os.O_RDONLY, 0)
@@ -478,6 +561,32 @@ func (r *Repository) finish(rec *record) error {
 	rec.file = publishedFile
 	rec.complete = true
 	return nil
+}
+
+func (r *Repository) inject(phase repositoryFault) error {
+	if r.fault == nil {
+		return nil
+	}
+	return r.fault(phase)
+}
+
+func (r *Repository) canAddDisk(bytes uint64) bool {
+	return r.diskBytes <= r.limits.MaxDiskBytes && bytes <= r.limits.MaxDiskBytes-r.diskBytes
+}
+
+func (r *Repository) addDisk(bytes uint64) bool {
+	if !r.canAddDisk(bytes) {
+		return false
+	}
+	r.diskBytes += bytes
+	return true
+}
+
+func (r *Repository) subtractDisk(bytes uint64) {
+	if bytes > r.diskBytes {
+		panic("snapshottransfer: disk accounting underflow")
+	}
+	r.diskBytes -= bytes
 }
 
 func verifyFileHash(f *os.File, d Descriptor) error {

@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -271,7 +273,7 @@ func TestRepositoryArtifactAndDiskBoundsAreHard(t *testing.T) {
 		}
 	})
 	t.Run("disk-bytes", func(t *testing.T) {
-		r, err := openRepository(filepath.Join(t.TempDir(), "repo"), Limits{MaxArtifacts: 2, MaxArtifactBytes: MinChunkBytes * 2, MaxDiskBytes: MinChunkBytes*2 + DescriptorBytes}, verify)
+		r, err := openRepository(filepath.Join(t.TempDir(), "repo"), Limits{MaxArtifacts: 2, MaxArtifactBytes: MinChunkBytes * 2, MaxDiskBytes: MinChunkBytes*2 + DescriptorBytes + 2*cursorBytes}, verify)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -287,6 +289,117 @@ func TestRepositoryArtifactAndDiskBoundsAreHard(t *testing.T) {
 			t.Fatalf("stats=%+v", stats)
 		}
 	})
+}
+
+func TestFinalChunkRetrySettlesEveryPostRenameOutcome(t *testing.T) {
+	phases := []repositoryFault{faultAfterPublishRename, faultAfterCursorRemove, faultAfterPublishSync}
+	for _, phase := range phases {
+		t.Run(fmt.Sprintf("phase-%d", phase), func(t *testing.T) {
+			payload := bytes.Repeat([]byte{byte(phase) + 10}, MinChunkBytes*2)
+			d := testDescriptor(payload)
+			path := filepath.Join(t.TempDir(), "repo")
+			r := openTestRepository(t, path)
+			first, final := payload[:MinChunkBytes], payload[MinChunkBytes:]
+			if _, _, err := r.Append(d, 0, first, sha256.Sum256(first)); err != nil {
+				t.Fatal(err)
+			}
+			faultErr := errors.New("post-rename fault")
+			fired := false
+			r.fault = func(got repositoryFault) error {
+				if got == phase && !fired {
+					fired = true
+					return faultErr
+				}
+				return nil
+			}
+			if next, done, err := r.Append(d, MinChunkBytes, final, sha256.Sum256(final)); next != uint64(len(payload)) || done || !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, faultErr) {
+				t.Fatalf("fault append=%d %t %v", next, done, err)
+			}
+			r.fault = nil
+			next, done, err := r.Append(d, MinChunkBytes, final, sha256.Sum256(final))
+			if err != nil || !done || next != uint64(len(payload)) {
+				t.Fatalf("retry=%d %t %v", next, done, err)
+			}
+			stats := r.Stats()
+			if stats.DiskBytes != uint64(DescriptorBytes+len(payload)) || stats.Published != 1 || stats.Staged != 0 {
+				t.Fatalf("settled stats=%+v", stats)
+			}
+			stage, cursor, temporary, published := artifactNames(d.ArtifactHash)
+			for _, name := range []string{stage, cursor, temporary} {
+				if _, err := os.Stat(filepath.Join(path, name)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("%s retained: %v", name, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(path, published)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCursorTempAndCommittedCursorAreBothDiskCharged(t *testing.T) {
+	payload := bytes.Repeat([]byte{33}, MinChunkBytes*2)
+	d := testDescriptor(payload)
+	r := openTestRepository(t, filepath.Join(t.TempDir(), "repo"))
+	first, final := payload[:MinChunkBytes], payload[MinChunkBytes:]
+	if _, _, err := r.Append(d, 0, first, sha256.Sum256(first)); err != nil {
+		t.Fatal(err)
+	}
+	wantCommitted := uint64(DescriptorBytes + MinChunkBytes + cursorBytes)
+	if got := r.Stats().DiskBytes; got != wantCommitted {
+		t.Fatalf("committed cursor bytes=%d want=%d", got, wantCommitted)
+	}
+	faultErr := errors.New("cursor temp synced")
+	observed := false
+	r.fault = func(phase repositoryFault) error {
+		if phase == faultAfterCursorTempSync && !observed {
+			observed = true
+			rec := r.records[d.ArtifactHash]
+			wantPeak := uint64(DescriptorBytes + len(payload) + 2*cursorBytes)
+			if !rec.cursorLive || !rec.tempLive || r.diskBytes != wantPeak {
+				t.Fatalf("cursor peak rec=%+v disk=%d want=%d", rec, r.diskBytes, wantPeak)
+			}
+			return faultErr
+		}
+		return nil
+	}
+	if _, _, err := r.Append(d, MinChunkBytes, final, sha256.Sum256(final)); !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(err, faultErr) {
+		t.Fatalf("temp fault=%v", err)
+	}
+	if got, want := r.Stats().DiskBytes, uint64(DescriptorBytes+len(payload)+cursorBytes); got != want {
+		t.Fatalf("cleaned temp bytes=%d want=%d", got, want)
+	}
+	r.fault = nil
+	if _, done, err := r.Append(d, MinChunkBytes, final, sha256.Sum256(final)); err != nil || !done {
+		t.Fatalf("temp retry done=%t err=%v", done, err)
+	}
+}
+
+func TestDiskAccountingAdditionCannotWrap(t *testing.T) {
+	r := Repository{limits: Limits{MaxDiskBytes: math.MaxUint64}, diskBytes: math.MaxUint64 - 4}
+	if r.canAddDisk(5) || r.addDisk(5) || r.diskBytes != math.MaxUint64-4 {
+		t.Fatalf("overflow accounting=%d", r.diskBytes)
+	}
+}
+
+func TestRecoveryCumulativeDiskBoundFailsWithoutWrap(t *testing.T) {
+	path := t.TempDir()
+	for seed := byte(1); seed <= 2; seed++ {
+		payload := bytes.Repeat([]byte{seed}, MinChunkBytes)
+		d := testDescriptor(payload)
+		_, _, _, published := artifactNames(d.ArtifactHash)
+		raw, _ := AppendDescriptor(nil, d)
+		raw = append(raw, payload...)
+		if err := os.WriteFile(filepath.Join(path, published), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limits := Limits{MaxArtifacts: 2, MaxArtifactBytes: MinChunkBytes,
+		MaxDiskBytes: MinChunkBytes + DescriptorBytes + 2*cursorBytes}
+	r, err := openRepository(path, limits, func(*os.File, Descriptor) error { return nil })
+	if r != nil || !errors.Is(err, ErrBound) {
+		t.Fatalf("cumulative recovery=%v %v", r, err)
+	}
 }
 
 type testPeerConn struct {
@@ -396,6 +509,57 @@ func TestAuthenticatedServiceDisconnectResumeAndIdentityRotation(t *testing.T) {
 	_ = badClient.Close()
 	if err := <-errCh; !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("rotated identity=%v", err)
+	}
+}
+
+func TestSequentialConnectionsCannotOverRetainInflightBudget(t *testing.T) {
+	payload := bytes.Repeat([]byte{44}, MinChunkBytes)
+	d := testDescriptor(payload)
+	sourceRepo := openTestRepository(t, filepath.Join(t.TempDir(), "source"))
+	appendAll(t, sourceRepo, d, payload, 0)
+	registry, _, target := testRegistry(t)
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	service, err := NewService(ServiceOptions{Repository: sourceRepo, Registry: registry, Authorize: func(got Descriptor) bool { return got == d }, ReadDeadline: deadline, WriteDeadline: deadline, MaxConnections: 4, MaxChunkBytes: MinChunkBytes, MaxInflightBytes: MinChunkBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request [requestBytes]byte
+	copy(request[:8], requestMagic[:])
+	_, _ = AppendDescriptor(request[8:8:8+DescriptorBytes], d)
+	var response [responseBytes]byte
+	chunk := make([]byte, MinChunkBytes)
+	for range 12 {
+		client, server := net.Pipe()
+		done := make(chan error, 1)
+		go func() {
+			done <- service.Serve(context.Background(), &testPeerConn{Conn: server, identity: target, class: rafttransport.TrafficSnapshot})
+		}()
+		if err := writeFull(client, request[:]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(client, response[:]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(client, chunk); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.Close()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats := service.Stats()
+	if stats.ResidentBytes != MinChunkBytes || stats.ResidentBytes > stats.ResidentCapacity || stats.Connections != 0 {
+		t.Fatalf("resident stats=%+v", stats)
+	}
+	retained := 0
+	for range cap(service.slots) {
+		slot := <-service.slots
+		retained += cap(slot.chunk)
+		service.slots <- slot
+	}
+	if retained != MinChunkBytes || int64(retained) > service.maxInflight {
+		t.Fatalf("retained=%d max=%d", retained, service.maxInflight)
 	}
 }
 
