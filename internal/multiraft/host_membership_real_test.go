@@ -1,6 +1,7 @@
 package multiraft
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -105,18 +106,28 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		}
 		return true
 	})
-	// Committing voters need not send the new commit index to a learner in the
-	// same append exchange. Drive one real heartbeat turn so member 4 durably
-	// learns the quorum commit before the test pauses its apply. This is a
-	// protocol gate, not a timing allowance: production clocks provide the same
-	// heartbeat, and DurablePromotion remains false until that HardState is
-	// persisted locally.
-	if !cluster.promotionPaused {
-		if err := hosts[0].RequestTick(group); err != nil {
-			t.Fatal(err)
+	// Committing voters need not carry the new commit index to a learner in the
+	// same append exchange. Cross every protocol-idle boundary with a real tick
+	// on the currently observed leader until member 4 has persisted the commit
+	// and DurablePromotion reconstructs the unapplied entry. The cluster pauses
+	// only from that exact WAL/HardState/publication evidence.
+	cluster.driveUntilWithLeaderTicks(func() bool {
+		if !cluster.promotionPaused {
+			return false
 		}
-		cluster.driveUntil(func() bool { return cluster.promotionPaused })
-	}
+		proof, found, proofErr := hosts[3].DurablePromotion(group, target)
+		status, statusErr := hosts[3].Status(group)
+		publication, publicationErr := hosts[3].Publication(group)
+		if proofErr != nil || statusErr != nil || publicationErr != nil {
+			t.Fatal(errors.Join(proofErr, statusErr, publicationErr))
+		}
+		if !found || proof.TargetMember != target || status.Commit < proof.Version ||
+			publication.ReplicaSetVersion >= proof.Version {
+			t.Fatalf("promotion pause lacks durable unapplied witness: proof=%+v found=%t status=%+v publication=%+v",
+				proof, found, status, publication)
+		}
+		return true
+	})
 	beforeRestart, err := hosts[3].Publication(group)
 	if err != nil || !proto.Equal(beforeRestart.ConfState, learnerConf) ||
 		beforeRestart.ReplicaSetVersion >= 3 {

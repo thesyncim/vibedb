@@ -126,79 +126,126 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 		if done() {
 			return
 		}
-		progressed := false
-		for index, host := range cluster.hosts {
-			if cluster.inactive[index] {
-				continue
-			}
-			if cluster.holdTargetUntilVote &&
-				index == cluster.memberIndex[cluster.promotionTarget] &&
-				!cluster.promotionVoteSeen {
-				continue
-			}
-			_, consumed, err := host.RunOne()
-			if err != nil {
-				if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
-					cluster.pendingDuplicate--
-					cluster.duplicateRejected = true
-				} else {
-					cluster.t.Fatalf("host %d RunOne step %d: %v", index, step, err)
-				}
-			}
-			progressed = progressed || consumed
-			if cluster.syncAuthority && consumed {
-				publication, publishErr := host.Publication(cluster.group)
-				if publishErr != nil {
-					cluster.t.Fatal(publishErr)
-				}
-				if publishErr = cluster.registries[index].PublishCommittedAuthority(
-					cluster.group, publication.ReplicaSetVersion,
-					publication.ConfState); publishErr != nil {
-					cluster.t.Fatal(publishErr)
-				}
-				if cluster.promotionTarget != 0 {
-					proof, found, proofErr := host.DurablePromotion(cluster.group,
-						cluster.promotionTarget)
-					if proofErr != nil {
-						cluster.t.Fatal(proofErr)
-					}
-					if found {
-						if proofErr = cluster.registries[index].PublishDurablePromotion(
-							cluster.group, proof); proofErr != nil {
-							cluster.t.Fatal(proofErr)
-						}
-						if cluster.pausePromotion && index == cluster.memberIndex[cluster.promotionTarget] {
-							status, statusErr := host.Status(cluster.group)
-							publication, publicationErr := host.Publication(cluster.group)
-							if statusErr != nil || publicationErr != nil {
-								cluster.t.Fatal(errors.Join(statusErr, publicationErr))
-							}
-							if status.Commit >= proof.Version && publication.ReplicaSetVersion < proof.Version {
-								cluster.pausePromotion = false
-								cluster.promotionPaused = true
-								cluster.inactive[index] = true
-							}
-						}
-					} else if proofErr = cluster.registries[index].ClearDurablePromotion(
-						cluster.group); proofErr != nil {
-						cluster.t.Fatal(proofErr)
-					}
-				}
-			}
-			for {
-				outbound, ok := host.PopOutbound()
-				if !ok {
-					break
-				}
-				progressed = true
-				cluster.route(index, outbound)
-			}
-		}
-		if !progressed {
+		if !cluster.driveRound(step) {
 			cluster.t.Fatalf("cluster became idle before condition at step %d", step)
 		}
 	}
 	cluster.t.Fatal("cluster drive did not converge")
+}
+
+// driveRound executes one deterministic scheduler turn and routes every
+// resulting real Raft message. A false result is an observable protocol-idle
+// boundary; callers may then inject an explicit logical clock input.
+func (cluster *realTransferCluster) driveRound(step int) bool {
+	cluster.t.Helper()
+	progressed := false
+	for index, host := range cluster.hosts {
+		if cluster.inactive[index] {
+			continue
+		}
+		if cluster.holdTargetUntilVote &&
+			index == cluster.memberIndex[cluster.promotionTarget] &&
+			!cluster.promotionVoteSeen {
+			continue
+		}
+		_, consumed, err := host.RunOne()
+		if err != nil {
+			if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
+				cluster.pendingDuplicate--
+				cluster.duplicateRejected = true
+			} else {
+				cluster.t.Fatalf("host %d RunOne step %d: %v", index, step, err)
+			}
+		}
+		progressed = progressed || consumed
+		if cluster.syncAuthority && consumed {
+			publication, publishErr := host.Publication(cluster.group)
+			if publishErr != nil {
+				cluster.t.Fatal(publishErr)
+			}
+			if publishErr = cluster.registries[index].PublishCommittedAuthority(
+				cluster.group, publication.ReplicaSetVersion,
+				publication.ConfState); publishErr != nil {
+				cluster.t.Fatal(publishErr)
+			}
+			if cluster.promotionTarget != 0 {
+				proof, found, proofErr := host.DurablePromotion(cluster.group,
+					cluster.promotionTarget)
+				if proofErr != nil {
+					cluster.t.Fatal(proofErr)
+				}
+				if found {
+					if proofErr = cluster.registries[index].PublishDurablePromotion(
+						cluster.group, proof); proofErr != nil {
+						cluster.t.Fatal(proofErr)
+					}
+					if cluster.pausePromotion && index == cluster.memberIndex[cluster.promotionTarget] {
+						status, statusErr := host.Status(cluster.group)
+						publication, publicationErr := host.Publication(cluster.group)
+						if statusErr != nil || publicationErr != nil {
+							cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+						}
+						if status.Commit >= proof.Version && publication.ReplicaSetVersion < proof.Version {
+							cluster.pausePromotion = false
+							cluster.promotionPaused = true
+							cluster.inactive[index] = true
+						}
+					}
+				} else if proofErr = cluster.registries[index].ClearDurablePromotion(
+					cluster.group); proofErr != nil {
+					cluster.t.Fatal(proofErr)
+				}
+			}
+		}
+		for {
+			outbound, ok := host.PopOutbound()
+			if !ok {
+				break
+			}
+			progressed = true
+			cluster.route(index, outbound)
+		}
+	}
+	return progressed
+}
+
+// driveUntilWithLeaderTicks advances an exact condition across protocol-idle
+// boundaries by ticking only the currently observed leader. Each tick is a
+// real Raft input and every heartbeat/response is routed through the
+// authenticated transport; no commit or promotion witness is synthesized.
+func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) {
+	cluster.t.Helper()
+	for step := 0; step < 100000; step++ {
+		if done() {
+			return
+		}
+		if cluster.driveRound(step) {
+			continue
+		}
+		leader := -1
+		for index, host := range cluster.hosts {
+			if cluster.inactive[index] {
+				continue
+			}
+			status, err := host.Status(cluster.group)
+			if err != nil {
+				cluster.t.Fatal(err)
+			}
+			if status.MemberID == status.LeaderID && status.LeaderID != 0 {
+				if leader >= 0 {
+					cluster.t.Fatalf("multiple leaders at protocol-idle step %d", step)
+				}
+				leader = index
+			}
+		}
+		if leader < 0 {
+			cluster.t.Fatalf("no leader at protocol-idle step %d", step)
+		}
+		if err := cluster.hosts[leader].RequestTick(cluster.group); err != nil {
+			cluster.t.Fatal(err)
+		}
+	}
+	cluster.t.Fatal("cluster drive with leader ticks did not converge")
 }
 
 func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.OutboundMessage) {
