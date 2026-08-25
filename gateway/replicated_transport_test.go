@@ -19,6 +19,22 @@ type testAuthenticatedConnection struct {
 	identity rafttransport.PeerIdentity
 }
 
+type idleTestAddr string
+
+func (address idleTestAddr) Network() string { return string(address) }
+func (address idleTestAddr) String() string  { return string(address) }
+
+type idleTestConn struct{}
+
+func (idleTestConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (idleTestConn) Write(value []byte) (int, error)  { return len(value), nil }
+func (idleTestConn) Close() error                     { return nil }
+func (idleTestConn) LocalAddr() net.Addr              { return idleTestAddr("local") }
+func (idleTestConn) RemoteAddr() net.Addr             { return idleTestAddr("remote") }
+func (idleTestConn) SetDeadline(time.Time) error      { return nil }
+func (idleTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (idleTestConn) SetWriteDeadline(time.Time) error { return nil }
+
 func TestAuthenticatedReplicatedClientRejectsMissingTLSCapability(t *testing.T) {
 	if _, err := NewAuthenticatedReplicatedClient(AuthenticatedReplicatedClientOptions{
 		Dial:              func(context.Context, string) (net.Conn, error) { return nil, nil },
@@ -85,7 +101,7 @@ func testPooledClient(t *testing.T, endpoint ReplicatedEndpoint, serve func(net.
 		maxConnections:    1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxWaiters: 1,
 		maxHandshakes: 1,
 		maxIdleAge:    time.Minute, maxLifetime: time.Hour, generation: 1,
-		perEndpoint: make(map[replicatedTransportEndpoint]int), idle: make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
+		perEndpoint: make(map[replicatedTransportEndpoint]int), idle: make(map[replicatedTransportEndpoint]replicatedIdleEndpoint), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	return client, &dials
 }
@@ -115,7 +131,7 @@ func testCapacityClient(t *testing.T, maxConnections, controlReserve int) (*Auth
 		controlReserve: controlReserve, maxWaiters: maxConnections,
 		maxIdleAge: time.Minute, maxLifetime: time.Hour, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int),
-		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn),
+		idle:        make(map[replicatedTransportEndpoint]replicatedIdleEndpoint),
 		active:      make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	t.Cleanup(func() { _ = client.Close() })
@@ -128,6 +144,47 @@ func testCapacityEndpoint(index byte) ReplicatedEndpoint {
 		StoreID: [16]byte{index + 1}, NodeIncarnation: 1,
 		Address: "endpoint-" + strconv.Itoa(int(index)),
 	}
+}
+
+func testLargeCapacityEndpoint(index int) ReplicatedEndpoint {
+	value := uint64(index + 1)
+	var node rafttransport.NodeID
+	var store [16]byte
+	for offset := 0; offset < 8; offset++ {
+		node[offset] = byte(value >> (offset * 8))
+		store[offset] = byte(value >> (offset * 8))
+	}
+	return ReplicatedEndpoint{
+		Member: value, Node: node, StoreID: store, NodeIncarnation: 1,
+		Address: "large-endpoint-" + strconv.Itoa(index),
+	}
+}
+
+func testFullIdleClient(capacity int) (*AuthenticatedReplicatedClient, []ReplicatedEndpoint) {
+	client := &AuthenticatedReplicatedClient{
+		maxConnections: capacity, maxPerEndpoint: 1, maxIdlePerEndpoint: 1,
+		maxHandshakes: capacity, maxWaiters: capacity,
+		maxIdleAge: time.Hour, maxLifetime: time.Hour, generation: 1,
+		perEndpoint: make(map[replicatedTransportEndpoint]int, capacity),
+		idle:        make(map[replicatedTransportEndpoint]replicatedIdleEndpoint, capacity),
+		active:      make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
+	}
+	endpoints := make([]ReplicatedEndpoint, capacity*2)
+	for index := range endpoints {
+		endpoints[index] = testLargeCapacityEndpoint(index)
+		if index >= capacity {
+			continue
+		}
+		physical := replicatedTransportEndpoint{node: endpoints[index].Node, address: endpoints[index].Address}
+		connection := &pooledReplicatedConn{
+			conn:     &testAuthenticatedConnection{Conn: idleTestConn{}, identity: rafttransport.PeerIdentity{Node: physical.node}},
+			endpoint: physical, created: time.Now(), lastUsed: time.Now(), generation: 1,
+		}
+		client.total++
+		client.perEndpoint[physical] = 1
+		client.linkIdleLocked(connection)
+	}
+	return client, endpoints
 }
 
 func TestAuthenticatedReplicatedClientEvictsGlobalOldestIdleOnEndpointChurn(t *testing.T) {
@@ -150,6 +207,38 @@ func TestAuthenticatedReplicatedClientEvictsGlobalOldestIdleOnEndpointChurn(t *t
 	client.release(connection, true)
 	if dials.Load() != 64 || client.Stats().Reuses != 1 {
 		t.Fatalf("hot endpoint was not reused: stats=%+v dials=%d", client.Stats(), dials.Load())
+	}
+}
+
+func TestAuthenticatedReplicatedClientConstantTimeLRUAt4096Capacity(t *testing.T) {
+	const capacity = 4096
+	client, endpoints := testFullIdleClient(capacity)
+	t.Cleanup(func() { _ = client.Close() })
+	if client.idleCount != capacity || len(client.idle) != capacity || client.total != capacity {
+		t.Fatalf("initial capacity: idle=%d endpoints=%d total=%d", client.idleCount, len(client.idle), client.total)
+	}
+	for index := 0; index < capacity; index++ {
+		oldest := client.idleOldest
+		if oldest == nil || !client.evictOldestIdleLocked() || oldest.idle ||
+			oldest.endpointOlder != nil || oldest.endpointNewer != nil || oldest.globalOlder != nil || oldest.globalNewer != nil {
+			t.Fatalf("eviction %d left intrusive links", index)
+		}
+		endpoint := endpoints[capacity+index]
+		physical := replicatedTransportEndpoint{node: endpoint.Node, address: endpoint.Address}
+		connection := &pooledReplicatedConn{
+			conn:     &testAuthenticatedConnection{Conn: idleTestConn{}, identity: rafttransport.PeerIdentity{Node: physical.node}},
+			endpoint: physical, created: time.Now(), lastUsed: time.Now(), generation: 1,
+		}
+		client.total++
+		client.perEndpoint[physical] = 1
+		client.linkIdleLocked(connection)
+	}
+	firstNew := replicatedTransportEndpoint{node: endpoints[capacity].Node, address: endpoints[capacity].Address}
+	lastNew := replicatedTransportEndpoint{node: endpoints[2*capacity-1].Node, address: endpoints[2*capacity-1].Address}
+	stats := client.Stats()
+	if stats.IdleEvictions != capacity || stats.Connections != capacity || stats.Idle != capacity ||
+		len(client.idle) != capacity || client.idleOldest.endpoint != firstNew || client.idleNewest.endpoint != lastNew {
+		t.Fatalf("4096-capacity churn: stats=%+v endpoints=%d", stats, len(client.idle))
 	}
 }
 
@@ -313,7 +402,7 @@ func TestAuthenticatedReplicatedClientHardHandshakeBoundAndStats(t *testing.T) {
 		maxHandshakes: 1, maxWaiters: 1, maxIdleAge: time.Minute,
 		maxLifetime: time.Hour, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int),
-		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn),
+		idle:        make(map[replicatedTransportEndpoint]replicatedIdleEndpoint),
 		active:      make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	results := make(chan *pooledReplicatedConn, 2)
@@ -582,11 +671,31 @@ func BenchmarkAuthenticatedReplicatedPoolAcquireRelease(b *testing.B) {
 	defer left.Close()
 	defer right.Close()
 	connection := &pooledReplicatedConn{conn: &testAuthenticatedConnection{Conn: left}, endpoint: physical, created: time.Now(), lastUsed: time.Now(), generation: 1}
-	client := &AuthenticatedReplicatedClient{maxConnections: 1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxIdleAge: time.Hour, maxLifetime: time.Hour, generation: 1, total: 1, perEndpoint: map[replicatedTransportEndpoint]int{physical: 1}, idle: map[replicatedTransportEndpoint][]*pooledReplicatedConn{physical: {connection}}, active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{})}
+	client := &AuthenticatedReplicatedClient{maxConnections: 1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxIdleAge: time.Hour, maxLifetime: time.Hour, generation: 1, total: 1, perEndpoint: map[replicatedTransportEndpoint]int{physical: 1}, idle: make(map[replicatedTransportEndpoint]replicatedIdleEndpoint), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{})}
+	client.linkIdleLocked(connection)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
 		acquired, _ := client.acquire(context.Background(), endpoint)
 		client.release(acquired, true)
+	}
+}
+
+func BenchmarkAuthenticatedReplicatedPoolChurnAt4096Capacity(b *testing.B) {
+	const capacity = 4096
+	client, endpoints := testFullIdleClient(capacity)
+	b.Cleanup(func() { _ = client.Close() })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		client.mu.Lock()
+		connection := client.idleOldest
+		client.evictOldestIdleLocked()
+		endpoint := endpoints[capacity+(index&(capacity-1))]
+		connection.endpoint = replicatedTransportEndpoint{node: endpoint.Node, address: endpoint.Address}
+		client.total++
+		client.perEndpoint[connection.endpoint] = 1
+		client.linkIdleLocked(connection)
+		client.mu.Unlock()
 	}
 }

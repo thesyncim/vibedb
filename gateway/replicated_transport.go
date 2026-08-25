@@ -56,12 +56,21 @@ type AuthenticatedReplicatedClientOptions struct {
 }
 
 type pooledReplicatedConn struct {
-	conn       rafttransport.PeerConnection
-	endpoint   replicatedTransportEndpoint
-	created    time.Time
-	lastUsed   time.Time
-	generation uint64
-	control    bool
+	conn                         rafttransport.PeerConnection
+	endpoint                     replicatedTransportEndpoint
+	created                      time.Time
+	lastUsed                     time.Time
+	generation                   uint64
+	control                      bool
+	idle                         bool
+	endpointOlder, endpointNewer *pooledReplicatedConn
+	globalOlder, globalNewer     *pooledReplicatedConn
+}
+
+type replicatedIdleEndpoint struct {
+	oldest *pooledReplicatedConn
+	newest *pooledReplicatedConn
+	count  int
 }
 
 // replicatedTransportEndpoint is the physical authenticated pool key. Shard
@@ -101,7 +110,10 @@ type AuthenticatedReplicatedClient struct {
 	controlReserve     int
 	handshakeReserve   int
 	perEndpoint        map[replicatedTransportEndpoint]int
-	idle               map[replicatedTransportEndpoint][]*pooledReplicatedConn
+	idle               map[replicatedTransportEndpoint]replicatedIdleEndpoint
+	idleOldest         *pooledReplicatedConn
+	idleNewest         *pooledReplicatedConn
+	idleCount          int
 	active             map[*pooledReplicatedConn]struct{}
 	wake               chan struct{}
 
@@ -162,7 +174,7 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 		maxWaiters: options.MaxWaiters,
 		maxIdleAge: options.MaxIdleAge, maxLifetime: options.MaxLifetime, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int),
-		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), wake: make(chan struct{}),
+		idle:        make(map[replicatedTransportEndpoint]replicatedIdleEndpoint), wake: make(chan struct{}),
 		active: make(map[*pooledReplicatedConn]struct{}),
 	}, nil
 }
@@ -184,6 +196,7 @@ func (client *AuthenticatedReplicatedClient) closeLocked(connection *pooledRepli
 	if connection == nil {
 		return
 	}
+	client.unlinkIdleLocked(connection)
 	_ = connection.conn.Close()
 	client.total--
 	client.perEndpoint[connection.endpoint]--
@@ -213,28 +226,71 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 	return client.acquireClass(ctx, endpoint, false)
 }
 
-func (client *AuthenticatedReplicatedClient) evictOldestIdleLocked() bool {
-	var oldest *pooledReplicatedConn
-	var oldestEndpoint replicatedTransportEndpoint
-	oldestIndex := -1
-	for endpoint, stack := range client.idle {
-		for index, connection := range stack {
-			if oldest == nil || connection.lastUsed.Before(oldest.lastUsed) {
-				oldest, oldestEndpoint, oldestIndex = connection, endpoint, index
-			}
-		}
+func (client *AuthenticatedReplicatedClient) linkIdleLocked(connection *pooledReplicatedConn) {
+	endpoint := client.idle[connection.endpoint]
+	connection.endpointOlder = endpoint.newest
+	if endpoint.newest == nil {
+		endpoint.oldest = connection
+	} else {
+		endpoint.newest.endpointNewer = connection
 	}
+	endpoint.newest = connection
+	endpoint.count++
+	client.idle[connection.endpoint] = endpoint
+
+	connection.globalOlder = client.idleNewest
+	if client.idleNewest == nil {
+		client.idleOldest = connection
+	} else {
+		client.idleNewest.globalNewer = connection
+	}
+	client.idleNewest = connection
+	client.idleCount++
+	connection.idle = true
+}
+
+func (client *AuthenticatedReplicatedClient) unlinkIdleLocked(connection *pooledReplicatedConn) {
+	if connection == nil || !connection.idle {
+		return
+	}
+	endpoint := client.idle[connection.endpoint]
+	if connection.endpointOlder == nil {
+		endpoint.oldest = connection.endpointNewer
+	} else {
+		connection.endpointOlder.endpointNewer = connection.endpointNewer
+	}
+	if connection.endpointNewer == nil {
+		endpoint.newest = connection.endpointOlder
+	} else {
+		connection.endpointNewer.endpointOlder = connection.endpointOlder
+	}
+	endpoint.count--
+	if endpoint.count == 0 {
+		delete(client.idle, connection.endpoint)
+	} else {
+		client.idle[connection.endpoint] = endpoint
+	}
+
+	if connection.globalOlder == nil {
+		client.idleOldest = connection.globalNewer
+	} else {
+		connection.globalOlder.globalNewer = connection.globalNewer
+	}
+	if connection.globalNewer == nil {
+		client.idleNewest = connection.globalOlder
+	} else {
+		connection.globalNewer.globalOlder = connection.globalOlder
+	}
+	connection.endpointOlder, connection.endpointNewer = nil, nil
+	connection.globalOlder, connection.globalNewer = nil, nil
+	connection.idle = false
+	client.idleCount--
+}
+
+func (client *AuthenticatedReplicatedClient) evictOldestIdleLocked() bool {
+	oldest := client.idleOldest
 	if oldest == nil {
 		return false
-	}
-	stack := client.idle[oldestEndpoint]
-	copy(stack[oldestIndex:], stack[oldestIndex+1:])
-	stack[len(stack)-1] = nil
-	stack = stack[:len(stack)-1]
-	if len(stack) == 0 {
-		delete(client.idle, oldestEndpoint)
-	} else {
-		client.idle[oldestEndpoint] = stack
 	}
 	client.closeLocked(oldest)
 	client.idleEvictions.Add(1)
@@ -256,20 +312,16 @@ func (client *AuthenticatedReplicatedClient) acquireClass(
 			return nil, ErrReplicatedTLSProfile
 		}
 		dataCheckoutAvailable := control || client.dataInUse < client.maxConnections-client.controlReserve
-		stack := client.idle[physical]
-		if !dataCheckoutAvailable {
-			stack = nil
-		}
-		for len(stack) != 0 {
-			last := len(stack) - 1
-			connection := stack[last]
-			stack = stack[:last]
+		endpointIdle := client.idle[physical]
+		for dataCheckoutAvailable && endpointIdle.newest != nil {
+			connection := endpointIdle.newest
+			client.unlinkIdleLocked(connection)
 			if connection.generation != client.generation ||
 				now.Sub(connection.lastUsed) > client.maxIdleAge || now.Sub(connection.created) > client.maxLifetime {
 				client.closeLocked(connection)
+				endpointIdle = client.idle[physical]
 				continue
 			}
-			client.idle[physical] = stack
 			client.active[connection] = struct{}{}
 			connection.control = control
 			if !control {
@@ -278,9 +330,6 @@ func (client *AuthenticatedReplicatedClient) acquireClass(
 			client.reuses.Add(1)
 			client.mu.Unlock()
 			return connection, nil
-		}
-		if dataCheckoutAvailable {
-			client.idle[physical] = stack
 		}
 		dataHandshakeAvailable := control || client.dataHandshakes < client.maxHandshakes-client.handshakeReserve
 		canCreate := dataCheckoutAvailable && dataHandshakeAvailable &&
@@ -407,8 +456,10 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 		client.dataInUse--
 	}
 	connection.control = false
+	endpointIdle := client.idle[connection.endpoint]
+	idleAtEndpoint := endpointIdle.count
 	if !healthy || connection.generation != client.generation || now.Sub(connection.created) > client.maxLifetime ||
-		len(client.idle[connection.endpoint]) >= client.maxIdlePerEndpoint {
+		idleAtEndpoint >= client.maxIdlePerEndpoint {
 		client.closeLocked(connection)
 		client.mu.Unlock()
 		if !healthy {
@@ -417,7 +468,7 @@ func (client *AuthenticatedReplicatedClient) release(connection *pooledReplicate
 		return
 	}
 	connection.lastUsed = now
-	client.idle[connection.endpoint] = append(client.idle[connection.endpoint], connection)
+	client.linkIdleLocked(connection)
 	client.signalLocked()
 	client.mu.Unlock()
 }
@@ -461,11 +512,8 @@ func (client *AuthenticatedReplicatedClient) RotateTLS(profile *rafttransport.Pe
 	for connection := range client.active {
 		_ = connection.conn.Close()
 	}
-	for node, stack := range client.idle {
-		for _, connection := range stack {
-			client.closeLocked(connection)
-		}
-		delete(client.idle, node)
+	for client.idleOldest != nil {
+		client.closeLocked(client.idleOldest)
 	}
 	client.signalLocked()
 	client.mu.Unlock()
@@ -488,11 +536,8 @@ func (client *AuthenticatedReplicatedClient) Close() error {
 	for connection := range client.active {
 		_ = connection.conn.Close()
 	}
-	for node, stack := range client.idle {
-		for _, connection := range stack {
-			client.closeLocked(connection)
-		}
-		delete(client.idle, node)
+	for client.idleOldest != nil {
+		client.closeLocked(client.idleOldest)
 	}
 	client.signalLocked()
 	client.mu.Unlock()
@@ -504,11 +549,7 @@ func (client *AuthenticatedReplicatedClient) Stats() AuthenticatedReplicatedClie
 		return AuthenticatedReplicatedClientStats{}
 	}
 	client.mu.Lock()
-	idle := 0
-	for _, stack := range client.idle {
-		idle += len(stack)
-	}
-	stats := AuthenticatedReplicatedClientStats{Connections: client.total, Idle: idle,
+	stats := AuthenticatedReplicatedClientStats{Connections: client.total, Idle: client.idleCount,
 		Waiters: client.waiters, Handshakes: client.handshakes,
 		ControlWaiters: client.controlWaiters, DataWaiters: client.dataWaiters,
 		DataInUse: client.dataInUse, ReservedControlConnections: client.controlReserve,
