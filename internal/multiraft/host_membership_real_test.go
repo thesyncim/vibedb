@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -175,7 +176,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err = hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilWithActiveVoterTicks(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			status, statusErr := hosts[index].Status(group)
 			publication, publicationErr := hosts[index].Publication(group)
@@ -185,7 +186,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			}
 		}
 		return true
-	})
+	}, 2*raftmodel.ElectionTick)
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
@@ -222,12 +223,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err := hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilWithActiveVoterTicks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		right, rightErr := hosts[2].Status(group)
 		return leftErr == nil && rightErr == nil && left.LeaderID != 0 &&
 			left.LeaderID == right.LeaderID && left.LeaderID != target
-	})
+	}, 2*raftmodel.ElectionTick)
 	if err := hosts[3].Close(); err != nil {
 		t.Fatal(err)
 	}
