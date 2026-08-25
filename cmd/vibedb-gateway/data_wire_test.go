@@ -135,6 +135,22 @@ func TestDecodeNativeDataRequestWarmAllocationFree(t *testing.T) {
 	}
 }
 
+func BenchmarkDecodeNativeDataRequest(b *testing.B) {
+	source := []byte(`{"op":"put","table":"docs","key":"AQIDBA","document":{"id":"a","n":1},"request_id":"` + testNativeRequestID + `"}`)
+	var request nativeDataWireRequest
+	if err := decodeNativeDataRequest(source, &request); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(source)))
+	b.ResetTimer()
+	for b.Loop() {
+		if err := decodeNativeDataRequest(source, &request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func FuzzDecodeNativeDataRequest(f *testing.F) {
 	f.Add([]byte(`{"op":"get","table":"docs","key":"AQIDBA","consistency":"linearizable"}`))
 	f.Add([]byte(`{"op":"delete","table":"docs","key":"AQIDBA","request_id":"` + testNativeRequestID + `"}`))

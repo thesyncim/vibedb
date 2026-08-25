@@ -90,3 +90,21 @@ func TestWriteNativeDataResponseWarmAllocationFree(t *testing.T) {
 		t.Fatalf("warm response allocations = %v, want 0", allocations)
 	}
 }
+
+func BenchmarkWriteNativeDataResponse(b *testing.B) {
+	writer := vibejson.NewWriter(io.Discard)
+	response := nativeDataWireResponse{
+		OK: true, Position: replication.Digest{1}, Applied: 42, Found: true,
+		Document: []byte(`{"id":"a","n":1}`), Retries: 1,
+	}
+	if err := writeNativeDataResponse(writer, &response); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := writeNativeDataResponse(writer, &response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
