@@ -147,8 +147,9 @@ type CheckpointGroupSeed struct {
 	// imported member. They are never encoded in format 0: the constructor checks
 	// the exact generations while it holds every member writer, then publishes
 	// group ownership before releasing those writers. Images must name every fixed
-	// member except Member exactly once. The slice is borrowed for the constructor
-	// call and is ignored by Seed and ValidateSeedState.
+	// member except Member exactly once; a streamed snapshot whose Member already
+	// contains the exact seed row may additionally name Member. The slice is
+	// borrowed for the constructor call and is ignored by Seed and ValidateSeedState.
 	Images []CheckpointGroupSeedImage
 }
 
@@ -672,11 +673,11 @@ func newCheckpointGroup(
 		if seedCollection == nil {
 			return nil, fmt.Errorf("%w: seed member is outside fixed membership", ErrCheckpointGroupOwned)
 		}
-		if len(seed.Images) != len(ordered)-1 {
+		if len(seed.Images) != len(ordered)-1 && len(seed.Images) != len(ordered) {
 			return nil, fmt.Errorf("%w: imported image witness count", ErrCheckpointGroupSeedChanged)
 		}
 		for i, image := range seed.Images {
-			if image.Collection == nil || image.Collection == seedCollection || image.Generation == 0 {
+			if image.Collection == nil || image.Generation == 0 {
 				return nil, fmt.Errorf("%w: invalid imported image witness", ErrCheckpointGroupSeedChanged)
 			}
 			owned := false
@@ -792,11 +793,17 @@ func newCheckpointGroup(
 		log.marker.Header().BaseSequence != 0 {
 		return nil, fmt.Errorf("%w: missing certificate beside a non-empty marker", ErrCheckpointGroupCorrupt)
 	}
+	witnessed := make(map[*Collection]struct{}, len(ordered))
+	if seed != nil {
+		for _, image := range seed.Images {
+			witnessed[image.Collection] = struct{}{}
+		}
+	}
 	for _, member := range ordered {
 		if member.collection.journal == nil || member.collection.journal.Cursor() != 0 {
 			return nil, fmt.Errorf("%w: missing certificate beside live member journal %q", ErrCheckpointGroupCorrupt, member.name)
 		}
-		if seed == nil || member.nameDigest == seedMember {
+		if _, imported := witnessed[member.collection]; !imported {
 			if member.collection.Len() != 0 {
 				return nil, fmt.Errorf("%w: missing certificate beside non-empty member %q", ErrCheckpointGroupCorrupt, member.name)
 			}
