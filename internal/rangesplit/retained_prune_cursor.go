@@ -13,9 +13,9 @@ import (
 
 const (
 	retainedPruneCursorFormat   = uint16(1)
-	retainedPruneCursorHeader   = 400
+	retainedPruneCursorHeader   = 476
 	MaxRetainedPruneCursorBytes = retainedPruneCursorHeader +
-		2*replication.MaxMutationKeyBytes + sha256.Size
+		2*replication.MaxMutationKeyBytes + replication.MaxCommandBytes + sha256.Size
 )
 
 var (
@@ -29,6 +29,7 @@ type RetainedPrunePhase uint8
 const (
 	RetainedPruneScan RetainedPrunePhase = iota + 1
 	RetainedPruneAwaitingApply
+	RetainedPruneVerify
 	RetainedPruneComplete
 )
 
@@ -47,20 +48,24 @@ type RetainedPruneCursor struct {
 	deletedKeyBytes    uint64
 	pendingCount       uint64
 	pendingKeyBytes    uint64
+	pendingApplied     uint64
 	remainingRows      uint64
 	remainingBytes     uint64
 	snapshotGeneration uint64
 
 	plan           [sha256.Size]byte
+	operation      [sha256.Size]byte
 	placement      [sha256.Size]byte
 	cutover        [sha256.Size]byte
 	dataChain      [sha256.Size]byte
 	base           [sha256.Size]byte
 	entry          [sha256.Size]byte
 	pending        [sha256.Size]byte
+	pendingEntry   [sha256.Size]byte
 	retainedDigest [sha256.Size]byte
 	scanAfter      []byte
 	resumeAfter    []byte
+	pendingKeys    []byte
 }
 
 type RetainedPruneCursorWorkspace struct {
@@ -68,7 +73,8 @@ type RetainedPruneCursorWorkspace struct {
 	digest [sha256.Size]byte
 }
 
-func (c RetainedPruneCursor) Phase() RetainedPrunePhase { return c.phase }
+func (c RetainedPruneCursor) Phase() RetainedPrunePhase      { return c.phase }
+func (c RetainedPruneCursor) OperationID() [sha256.Size]byte { return c.operation }
 
 func (c RetainedPruneCursor) SourceCut() ChildArtifactSourceCut {
 	return ChildArtifactSourceCut{
@@ -120,7 +126,7 @@ func AppendRetainedPruneCursorWithWorkspace(
 		return dst, ErrRetainedPrune
 	}
 	total := retainedPruneCursorHeader + len(cursor.scanAfter) +
-		len(cursor.resumeAfter) + sha256.Size
+		len(cursor.resumeAfter) + len(cursor.pendingKeys) + sha256.Size
 	if total > MaxRetainedPruneCursorBytes {
 		return dst, ErrRetainedPrune
 	}
@@ -136,24 +142,27 @@ func AppendRetainedPruneCursorWithWorkspace(
 		cursor.applied, cursor.term, cursor.ownershipEpoch, cursor.routingVersion,
 		cursor.routeGeneration, cursor.scannedRows, cursor.scannedBytes,
 		cursor.deletedRows, cursor.deletedKeyBytes, cursor.pendingCount,
-		cursor.pendingKeyBytes, cursor.remainingRows, cursor.remainingBytes,
-		cursor.snapshotGeneration,
+		cursor.pendingKeyBytes, cursor.pendingApplied, cursor.remainingRows,
+		cursor.remainingBytes, cursor.snapshotGeneration,
 	}
 	for index, value := range values {
 		binary.LittleEndian.PutUint64(frame[24+index*8:32+index*8], value)
 	}
 	digests := [...][sha256.Size]byte{
-		cursor.plan, cursor.placement, cursor.cutover, cursor.dataChain,
-		cursor.base, cursor.entry, cursor.pending, cursor.retainedDigest,
+		cursor.plan, cursor.operation, cursor.placement, cursor.cutover, cursor.dataChain,
+		cursor.base, cursor.entry, cursor.pending, cursor.pendingEntry,
+		cursor.retainedDigest,
 	}
 	for index := range digests {
-		copy(frame[136+index*32:168+index*32], digests[index][:])
+		copy(frame[144+index*32:176+index*32], digests[index][:])
 	}
-	binary.LittleEndian.PutUint32(frame[392:396], uint32(len(cursor.scanAfter)))
-	binary.LittleEndian.PutUint32(frame[396:400], uint32(len(cursor.resumeAfter)))
+	binary.LittleEndian.PutUint32(frame[464:468], uint32(len(cursor.scanAfter)))
+	binary.LittleEndian.PutUint32(frame[468:472], uint32(len(cursor.resumeAfter)))
+	binary.LittleEndian.PutUint32(frame[472:476], uint32(len(cursor.pendingKeys)))
 	at := retainedPruneCursorHeader
 	at += copy(frame[at:], cursor.scanAfter)
 	at += copy(frame[at:], cursor.resumeAfter)
+	at += copy(frame[at:], cursor.pendingKeys)
 	if at != total-sha256.Size {
 		panic("rangesplit: retained prune cursor size diverged")
 	}
@@ -172,11 +181,13 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 		!allChildArtifactZero(raw[18:24]) {
 		return nil, ErrRetainedPrune
 	}
-	scanBytes := int(binary.LittleEndian.Uint32(raw[392:396]))
-	resumeBytes := int(binary.LittleEndian.Uint32(raw[396:400]))
+	scanBytes := int(binary.LittleEndian.Uint32(raw[464:468]))
+	resumeBytes := int(binary.LittleEndian.Uint32(raw[468:472]))
+	pendingBytes := int(binary.LittleEndian.Uint32(raw[472:476]))
 	if scanBytes > replication.MaxMutationKeyBytes ||
 		resumeBytes > replication.MaxMutationKeyBytes ||
-		retainedPruneCursorHeader+scanBytes+resumeBytes+sha256.Size != len(raw) {
+		pendingBytes > replication.MaxCommandBytes ||
+		retainedPruneCursorHeader+scanBytes+resumeBytes+pendingBytes+sha256.Size != len(raw) {
 		return nil, ErrRetainedPrune
 	}
 	var workspace RetainedPruneCursorWorkspace
@@ -184,7 +195,7 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 	if !bytes.Equal(workspace.digest[:], raw[len(raw)-sha256.Size:]) {
 		return nil, ErrRetainedPrune
 	}
-	values := [14]uint64{}
+	values := [15]uint64{}
 	for index := range values {
 		values[index] = binary.LittleEndian.Uint64(raw[24+index*8 : 32+index*8])
 	}
@@ -195,20 +206,23 @@ func OpenRetainedPruneCursor(raw []byte) (*RetainedPruneCursor, error) {
 		scannedRows: values[5], scannedBytes: values[6],
 		deletedRows: values[7], deletedKeyBytes: values[8],
 		pendingCount: values[9], pendingKeyBytes: values[10],
-		remainingRows: values[11], remainingBytes: values[12],
-		snapshotGeneration: values[13],
+		pendingApplied: values[11], remainingRows: values[12],
+		remainingBytes: values[13], snapshotGeneration: values[14],
 	}
 	digests := []*[sha256.Size]byte{
-		&cursor.plan, &cursor.placement, &cursor.cutover, &cursor.dataChain,
-		&cursor.base, &cursor.entry, &cursor.pending, &cursor.retainedDigest,
+		&cursor.plan, &cursor.operation, &cursor.placement, &cursor.cutover, &cursor.dataChain,
+		&cursor.base, &cursor.entry, &cursor.pending, &cursor.pendingEntry,
+		&cursor.retainedDigest,
 	}
 	for index := range digests {
-		copy(digests[index][:], raw[136+index*32:168+index*32])
+		copy(digests[index][:], raw[144+index*32:176+index*32])
 	}
 	at := retainedPruneCursorHeader
 	cursor.scanAfter = bytes.Clone(raw[at : at+scanBytes])
 	at += scanBytes
 	cursor.resumeAfter = bytes.Clone(raw[at : at+resumeBytes])
+	at += resumeBytes
+	cursor.pendingKeys = bytes.Clone(raw[at : at+pendingBytes])
 	if !validRetainedPruneCursor(cursor) {
 		return nil, ErrRetainedPrune
 	}
@@ -233,32 +247,66 @@ func validRetainedPruneCursor(cursor *RetainedPruneCursor) bool {
 		cursor.applied == math.MaxUint64 || cursor.term == 0 || cursor.term == math.MaxUint64 ||
 		cursor.ownershipEpoch == 0 || cursor.routingVersion == 0 ||
 		cursor.routeGeneration == 0 || cursor.plan == ([sha256.Size]byte{}) ||
+		cursor.operation == ([sha256.Size]byte{}) ||
 		cursor.placement == ([sha256.Size]byte{}) || cursor.cutover == ([sha256.Size]byte{}) ||
 		cursor.dataChain == ([sha256.Size]byte{}) || cursor.base == ([sha256.Size]byte{}) ||
 		cursor.entry == ([sha256.Size]byte{}) ||
 		len(cursor.scanAfter) > replication.MaxMutationKeyBytes ||
-		len(cursor.resumeAfter) > replication.MaxMutationKeyBytes {
+		len(cursor.resumeAfter) > replication.MaxMutationKeyBytes ||
+		len(cursor.pendingKeys) > replication.MaxCommandBytes {
 		return false
 	}
 	switch cursor.phase {
 	case RetainedPruneScan:
 		return cursor.pendingCount == 0 && cursor.pendingKeyBytes == 0 &&
-			cursor.pending == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
+			cursor.pendingApplied == 0 && cursor.pending == ([sha256.Size]byte{}) &&
+			cursor.pendingEntry == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
+			len(cursor.pendingKeys) == 0 &&
 			cursor.remainingRows == 0 && cursor.remainingBytes == 0 &&
 			cursor.snapshotGeneration == 0 && cursor.retainedDigest == ([sha256.Size]byte{})
 	case RetainedPruneAwaitingApply:
 		return cursor.pendingCount != 0 && cursor.pendingCount <= replication.MaxMutations &&
-			cursor.pendingKeyBytes != 0 && cursor.pending != ([sha256.Size]byte{}) &&
-			len(cursor.resumeAfter) != 0 && cursor.remainingRows == 0 &&
+			cursor.pendingKeyBytes != 0 && cursor.pendingApplied != 0 &&
+			cursor.pendingApplied <= cursor.applied && cursor.pending != ([sha256.Size]byte{}) &&
+			cursor.pendingEntry != ([sha256.Size]byte{}) &&
+			len(cursor.resumeAfter) != 0 && len(cursor.pendingKeys) != 0 &&
+			cursor.remainingRows == 0 &&
 			cursor.remainingBytes == 0 && cursor.snapshotGeneration == 0 &&
-			cursor.retainedDigest == ([sha256.Size]byte{})
+			cursor.retainedDigest == ([sha256.Size]byte{}) && validPendingPruneKeys(cursor)
+	case RetainedPruneVerify:
+		return cursor.pendingCount == 0 && cursor.pendingKeyBytes == 0 &&
+			cursor.pendingApplied == 0 && cursor.pending == ([sha256.Size]byte{}) &&
+			cursor.pendingEntry == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
+			len(cursor.pendingKeys) == 0 && cursor.snapshotGeneration != 0 &&
+			cursor.retainedDigest != ([sha256.Size]byte{})
 	case RetainedPruneComplete:
 		return cursor.pendingCount == 0 && cursor.pendingKeyBytes == 0 &&
-			cursor.pending == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
+			cursor.pendingApplied == 0 && cursor.pending == ([sha256.Size]byte{}) &&
+			cursor.pendingEntry == ([sha256.Size]byte{}) && len(cursor.resumeAfter) == 0 &&
+			len(cursor.pendingKeys) == 0 &&
 			cursor.snapshotGeneration != 0 && cursor.retainedDigest != ([sha256.Size]byte{})
 	default:
 		return false
 	}
+}
+
+func validPendingPruneKeys(cursor *RetainedPruneCursor) bool {
+	raw := cursor.pendingKeys
+	var count, keyBytes uint64
+	for len(raw) != 0 {
+		if len(raw) < 4 {
+			return false
+		}
+		size := int(binary.LittleEndian.Uint32(raw[:4]))
+		raw = raw[4:]
+		if size == 0 || size > len(raw) {
+			return false
+		}
+		count++
+		keyBytes += uint64(size)
+		raw = raw[size:]
+	}
+	return count == cursor.pendingCount && keyBytes == cursor.pendingKeyBytes
 }
 
 var errRetainedPruneScanStop = errors.New("rangesplit: retained prune scan stop")

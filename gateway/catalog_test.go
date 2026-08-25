@@ -987,6 +987,41 @@ func TestCatalogHolderGenerationDrainFence(t *testing.T) {
 	}
 }
 
+func TestRetainedPruneAuthorityRequiresDurableCASAndOlderLeaseDrain(t *testing.T) {
+	initial := testSnapshot(t, 1)
+	next := testSnapshot(t, 2)
+	holder := NewCatalogHolder(initial)
+	operation, certificate := [32]byte{1}, [32]byte{2}
+	if _, err := holder.AuthorizeRetainedPrune(
+		DurableCatalogPublication{}, "tenant_data", operation, certificate,
+	); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("missing durable receipt err=%v", err)
+	}
+	receipt, err := SaveSnapshotAfterWithReceipt(
+		filepath.Join(t.TempDir(), "catalog.json"), 0, next,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := holder.pinCurrent()
+	if err := holder.PublishAfter(1, next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.AuthorizeRetainedPrune(
+		receipt, "tenant_data", operation, certificate,
+	); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("authority crossed old lease err=%v", err)
+	}
+	old.release()
+	authority, err := holder.AuthorizeRetainedPrune(
+		receipt, "tenant_data", operation, certificate,
+	)
+	if err != nil || authority.Generation() != 2 || authority.Operation() != operation ||
+		authority.Certificate() != certificate {
+		t.Fatalf("authority=%+v err=%v", authority, err)
+	}
+}
+
 // TestCatalogHolderGenerationDrainWaitsForPublication proves a controller can
 // begin waiting before its catalog watcher publishes the requested generation.
 func TestCatalogHolderGenerationDrainWaitsForPublication(t *testing.T) {

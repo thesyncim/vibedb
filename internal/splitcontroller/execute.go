@@ -47,7 +47,7 @@ func (p *Plan) AppendSourceSeal(
 }
 
 // BuildCatalogTransition constructs the exact unpublished successor required
-// by ActionPublishCatalog from the caller's coherent post-cutover source
+// by ActionPublishCatalog from the caller's coherent sealed source
 // state. The caller must keep that source quiescent through the catalog CAS;
 // this validation does not reserve either authority. SaveSnapshotAfter and
 // CatalogHolder.PublishAfter remain the only durable and in-memory authority
@@ -56,7 +56,6 @@ func (p *Plan) BuildCatalogTransition(
 	current *gateway.Snapshot,
 	sourceState replicatedstate.State,
 	certificate rangesplit.CutoverCertificate,
-	prune rangesplit.RetainedPruneCursor,
 ) (*gateway.Snapshot, error) {
 	if p == nil || current == nil {
 		return nil, ErrInvalidPlan
@@ -65,14 +64,14 @@ func (p *Plan) BuildCatalogTransition(
 	if err != nil || stage != catalogSource {
 		return nil, errors.Join(ErrTopologyConflict, err)
 	}
-	if !p.sourceStateAfterCutover(sourceState, certificate, &prune) {
+	if !p.sourceStateAfterCutover(sourceState, certificate) {
 		return nil, ErrTopologyConflict
 	}
 	if !sourceSessionsEmpty(sourceState) {
 		return nil, ErrSessionTransferRequired
 	}
-	next, err := gateway.BuildCertifiedRangeSplitTransition(
-		current, p.targetManifest, p.next, p.partitioner, certificate, prune,
+	next, err := BuildCertifiedRangeSplitTransition(
+		current, p.targetManifest, p.next, p.partitioner, certificate,
 	)
 	if err != nil {
 		return nil, errors.Join(ErrTopologyConflict, err)
