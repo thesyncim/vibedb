@@ -33,10 +33,6 @@ const recoveryJournalCheckpointRecords = 2048
 // large-value store cannot reserve an unbounded file or an unbounded replay.
 const (
 	recoveryJournalMinCapacityBytes = uint64(512) << 10
-	// The ordinary delta lane keeps a one-MiB floor for small overlays. Larger
-	// overlays start from two put/delete-framed arena estimates below, subject to the
-	// compact cap and exact foreground fallback checks.
-	recoveryJournalDeltaMinCapacityBytes = uint64(1) << 20
 	// Compact full-value delta redo keeps the ordinary buffered journal fully
 	// preallocated with a deterministic 2.5 MiB disk reservation.
 	// The Flush guard considers at most 512 KiB of estimated future carry; it does
@@ -361,25 +357,11 @@ func recoveryJournalCapacityBytesFor(
 	deltaOverlayBytes int,
 ) uint64 {
 	if deltaOverlayBytes > 0 {
-		// Seed the ordinary buffered-visible reservation from two put/delete-framed
-		// record/arena windows. This estimate does not include scalar metadata and
-		// the 2.5-MiB policy cap deliberately prevents it from promising that every
-		// admissible overlay fits. The exact prepared batch and foreground future-
-		// reserve checks decide whether a Flush stays journal-only or takes the
-		// bounded physical fallback.
-		batch := uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
-			sectorSize, primaryUnifiedOverlayRecords, deltaOverlayBytes,
-		))
-		capacity := batch
-		if batch <= recoveryJournalMaxCapacityBytes/2 {
-			capacity = batch * 2
-		} else {
-			capacity = recoveryJournalMaxCapacityBytes
-		}
-		capacity = max(capacity, recoveryJournalDeltaMinCapacityBytes)
-		capacity = min(capacity, recoveryJournalMaxCapacityBytes)
-		capacity = min(capacity, recoveryJournalCompactDeltaCapacityBytes)
-		return capacity
+		// The dirty window adapts independently to resident/physical geometry.
+		// The journal contract does not: it is one fixed two-MiB append window
+		// plus its 512-KiB future reserve. Exact append planning still falls back
+		// physically when the current overlay does not fit.
+		return recoveryJournalCompactDeltaCapacityBytes
 	}
 	recordUpper := storeio.RecoveryRecordPaddedSize(
 		sectorSize, maxKeyBytes, inlineValueBytes,
