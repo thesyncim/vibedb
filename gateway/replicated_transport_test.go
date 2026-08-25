@@ -54,10 +54,69 @@ func testPooledClient(t *testing.T, endpoint ReplicatedEndpoint, serve func(net.
 		},
 		handshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
 		maxConnections:    1, maxPerEndpoint: 1, maxIdlePerEndpoint: 1, maxWaiters: 1,
-		maxIdleAge: time.Minute, maxLifetime: time.Hour, generation: 1,
+		maxHandshakes: 1,
+		maxIdleAge:    time.Minute, maxLifetime: time.Hour, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int), idle: make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	return client, &dials
+}
+
+func TestAuthenticatedReplicatedClientHardHandshakeBoundAndStats(t *testing.T) {
+	route, _, _ := testReplicatedRouteCommand(t)
+	entered := make(chan struct{}, 2)
+	unblock := make(chan struct{})
+	client := &AuthenticatedReplicatedClient{
+		dial: func(context.Context, string) (net.Conn, error) {
+			local, peer := net.Pipe()
+			go func() { <-unblock; _ = peer.Close() }()
+			return local, nil
+		},
+		authenticate: func(_ context.Context, raw net.Conn, node rafttransport.NodeID, _ rafttransport.TrafficClass, _ rafttransport.DeadlineFunc) (rafttransport.PeerConnection, error) {
+			entered <- struct{}{}
+			<-unblock
+			return &testAuthenticatedConnection{Conn: raw,
+				identity: rafttransport.PeerIdentity{Node: node}}, nil
+		},
+		handshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		maxConnections:    2, maxPerEndpoint: 1, maxIdlePerEndpoint: 0,
+		maxHandshakes: 1, maxWaiters: 1, maxIdleAge: time.Minute,
+		maxLifetime: time.Hour, generation: 1,
+		perEndpoint: make(map[replicatedTransportEndpoint]int),
+		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn),
+		active:      make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
+	}
+	results := make(chan *pooledReplicatedConn, 2)
+	errors := make(chan error, 2)
+	for _, endpoint := range route.Replicas[:2] {
+		endpoint := endpoint
+		go func() {
+			connection, err := client.acquire(context.Background(), endpoint)
+			results <- connection
+			errors <- err
+		}()
+		if endpoint.Member == route.Replicas[0].Member {
+			<-entered
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().Waiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	stats := client.Stats()
+	if stats.Handshakes != 1 || stats.PeakHandshakes != 1 || stats.Waiters != 1 {
+		t.Fatalf("bounded handshake stats = %+v", stats)
+	}
+	close(unblock)
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+		client.release(<-results, false)
+	}
+	stats = client.Stats()
+	if stats.Handshakes != 0 || stats.PeakHandshakes != 1 || stats.Connections != 0 {
+		t.Fatalf("completed handshake stats = %+v", stats)
+	}
 }
 
 func TestAuthenticatedReplicatedClientReusesExclusiveStreamAndPoisonsIdentityMismatch(t *testing.T) {

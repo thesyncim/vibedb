@@ -20,6 +20,7 @@ var (
 const (
 	AbsoluteMaxReplicatedPoolConnections = 65536
 	AbsoluteMaxReplicatedPoolWaiters     = 65536
+	AbsoluteMaxReplicatedHandshakes      = 65536
 	AbsoluteMaxReplicatedConnectionAge   = 24 * time.Hour
 )
 
@@ -34,9 +35,13 @@ type AuthenticatedReplicatedClientOptions struct {
 	MaxConnections     int
 	MaxPerEndpoint     int
 	MaxIdlePerEndpoint int
-	MaxWaiters         int
-	MaxIdleAge         time.Duration
-	MaxLifetime        time.Duration
+	// MaxHandshakes independently bounds concurrent dial-plus-TLS work. Zero
+	// preserves source compatibility by selecting MaxConnections; production
+	// callers should set the smaller admission budget they intend to own.
+	MaxHandshakes int
+	MaxWaiters    int
+	MaxIdleAge    time.Duration
+	MaxLifetime   time.Duration
 }
 
 type pooledReplicatedConn struct {
@@ -67,36 +72,48 @@ type AuthenticatedReplicatedClient struct {
 	maxConnections     int
 	maxPerEndpoint     int
 	maxIdlePerEndpoint int
+	maxHandshakes      int
 	maxWaiters         int
 	maxIdleAge         time.Duration
 	maxLifetime        time.Duration
 	generation         uint64
 	closed             bool
 	total              int
+	handshakes         int
+	peakHandshakes     int
 	waiters            int
 	perEndpoint        map[replicatedTransportEndpoint]int
 	idle               map[replicatedTransportEndpoint][]*pooledReplicatedConn
 	active             map[*pooledReplicatedConn]struct{}
 	wake               chan struct{}
 
-	dials    atomic.Uint64
-	reuses   atomic.Uint64
-	poisoned atomic.Uint64
-	rejected atomic.Uint64
+	dials             atomic.Uint64
+	reuses            atomic.Uint64
+	poisoned          atomic.Uint64
+	rejected          atomic.Uint64
+	handshakeFailures atomic.Uint64
 }
 
 type AuthenticatedReplicatedClientStats struct {
-	Dials, Reuses, Poisoned, Rejected uint64
-	Connections, Idle, Waiters        int
-	Generation                        uint64
+	Dials, Reuses, Poisoned, Rejected         uint64
+	HandshakeFailures                         uint64
+	Connections, Idle, Waiters                int
+	Handshakes, PeakHandshakes, MaxHandshakes int
+	Generation                                uint64
 }
 
 func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptions) (*AuthenticatedReplicatedClient, error) {
+	maxHandshakes := options.MaxHandshakes
+	if maxHandshakes == 0 {
+		maxHandshakes = options.MaxConnections
+	}
 	if options.TLS == nil || options.TLS.LocalIdentity().Node == (rafttransport.NodeID{}) ||
 		options.Dial == nil || options.HandshakeDeadline == nil ||
 		options.MaxConnections <= 0 || options.MaxConnections > AbsoluteMaxReplicatedPoolConnections ||
 		options.MaxPerEndpoint <= 0 || options.MaxPerEndpoint > options.MaxConnections ||
 		options.MaxIdlePerEndpoint < 0 || options.MaxIdlePerEndpoint > options.MaxPerEndpoint ||
+		maxHandshakes <= 0 || maxHandshakes > options.MaxConnections ||
+		maxHandshakes > AbsoluteMaxReplicatedHandshakes ||
 		options.MaxWaiters < 0 || options.MaxWaiters > AbsoluteMaxReplicatedPoolWaiters ||
 		options.MaxIdleAge <= 0 || options.MaxIdleAge > AbsoluteMaxReplicatedConnectionAge ||
 		options.MaxLifetime <= 0 || options.MaxLifetime > AbsoluteMaxReplicatedConnectionAge ||
@@ -107,7 +124,8 @@ func NewAuthenticatedReplicatedClient(options AuthenticatedReplicatedClientOptio
 		tls: options.TLS, dial: options.Dial, handshakeDeadline: options.HandshakeDeadline,
 		authenticate:   options.TLS.Client,
 		maxConnections: options.MaxConnections, maxPerEndpoint: options.MaxPerEndpoint,
-		maxIdlePerEndpoint: options.MaxIdlePerEndpoint, maxWaiters: options.MaxWaiters,
+		maxIdlePerEndpoint: options.MaxIdlePerEndpoint, maxHandshakes: maxHandshakes,
+		maxWaiters: options.MaxWaiters,
 		maxIdleAge: options.MaxIdleAge, maxLifetime: options.MaxLifetime, generation: 1,
 		perEndpoint: make(map[replicatedTransportEndpoint]int),
 		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), wake: make(chan struct{}),
@@ -141,6 +159,18 @@ func (client *AuthenticatedReplicatedClient) closeLocked(connection *pooledRepli
 	client.signalLocked()
 }
 
+func (client *AuthenticatedReplicatedClient) releaseHandshakeReservationLocked(
+	physical replicatedTransportEndpoint,
+) {
+	client.handshakes--
+	client.total--
+	client.perEndpoint[physical]--
+	if client.perEndpoint[physical] == 0 {
+		delete(client.perEndpoint, physical)
+	}
+	client.signalLocked()
+}
+
 func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoint ReplicatedEndpoint) (*pooledReplicatedConn, error) {
 	if client == nil || ctx == nil || !validAuthenticatedEndpoint(endpoint) {
 		return nil, ErrReplicatedTLSProfile
@@ -170,9 +200,14 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 			return connection, nil
 		}
 		client.idle[physical] = stack
-		if client.total < client.maxConnections && client.perEndpoint[physical] < client.maxPerEndpoint {
+		if client.total < client.maxConnections && client.perEndpoint[physical] < client.maxPerEndpoint &&
+			client.handshakes < client.maxHandshakes {
 			client.total++
 			client.perEndpoint[physical]++
+			client.handshakes++
+			if client.handshakes > client.peakHandshakes {
+				client.peakHandshakes = client.handshakes
+			}
 			authenticate, generation := client.authenticate, client.generation
 			client.mu.Unlock()
 			raw, err := client.dial(ctx, endpoint.Address)
@@ -184,13 +219,9 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 					_ = raw.Close()
 				}
 				client.mu.Lock()
-				client.total--
-				client.perEndpoint[physical]--
-				if client.perEndpoint[physical] == 0 {
-					delete(client.perEndpoint, physical)
-				}
-				client.signalLocked()
+				client.releaseHandshakeReservationLocked(physical)
 				client.mu.Unlock()
+				client.handshakeFailures.Add(1)
 				return nil, err
 			}
 			authenticated, err := authenticate(ctx, raw, endpoint.Node, rafttransport.TrafficShardNative, client.handshakeDeadline)
@@ -203,16 +234,14 @@ func (client *AuthenticatedReplicatedClient) acquire(ctx context.Context, endpoi
 			}
 			if err != nil {
 				client.mu.Lock()
-				client.total--
-				client.perEndpoint[physical]--
-				if client.perEndpoint[physical] == 0 {
-					delete(client.perEndpoint, physical)
-				}
-				client.signalLocked()
+				client.releaseHandshakeReservationLocked(physical)
 				client.mu.Unlock()
+				client.handshakeFailures.Add(1)
 				return nil, err
 			}
 			client.mu.Lock()
+			client.handshakes--
+			client.signalLocked()
 			if client.closed || generation != client.generation {
 				_ = authenticated.Close()
 				client.total--
@@ -362,9 +391,13 @@ func (client *AuthenticatedReplicatedClient) Stats() AuthenticatedReplicatedClie
 	for _, stack := range client.idle {
 		idle += len(stack)
 	}
-	stats := AuthenticatedReplicatedClientStats{Connections: client.total, Idle: idle, Waiters: client.waiters, Generation: client.generation}
+	stats := AuthenticatedReplicatedClientStats{Connections: client.total, Idle: idle,
+		Waiters: client.waiters, Handshakes: client.handshakes,
+		PeakHandshakes: client.peakHandshakes, MaxHandshakes: client.maxHandshakes,
+		Generation: client.generation}
 	client.mu.Unlock()
 	stats.Dials, stats.Reuses = client.dials.Load(), client.reuses.Load()
 	stats.Poisoned, stats.Rejected = client.poisoned.Load(), client.rejected.Load()
+	stats.HandshakeFailures = client.handshakeFailures.Load()
 	return stats
 }
