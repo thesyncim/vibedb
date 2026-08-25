@@ -784,8 +784,8 @@ func waitReplicatedFenceRetry(ctx context.Context, attempt int) error {
 	// Failover is exceptional, so spend a small bounded wall-clock budget to
 	// avoid burning every retry while the replacement term is still settling.
 	// The normal proposal path never creates a timer. Five milliseconds keeps a
-	// one-race retry responsive. The shipped eight-attempt executor waits at
-	// most 315 ms; the absolute sixteen-attempt configuration remains below 1 s.
+	// one-race retry responsive. The shipped and absolute sixteen-attempt
+	// executor waits at most 955 ms across all stale-fence retries.
 	shift := attempt
 	if shift > 4 {
 		shift = 4
