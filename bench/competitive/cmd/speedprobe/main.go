@@ -34,14 +34,18 @@ func main() {
 	}
 
 	for _, indexed := range []bool{false, true} {
+		exactIndexes := uint8(0)
+		if indexed {
+			exactIndexes = 1
+		}
 		dir, err := os.MkdirTemp("", "vibedb-speed-")
 		if err != nil {
 			fatalf("temp dir: %v", err)
 		}
 		e, err := factory.New(competitive.Config{
-			Dir:        dir,
-			Indexed:    indexed,
-			CacheBytes: competitive.DefaultCacheBytes,
+			Dir:          dir,
+			ExactIndexes: exactIndexes,
+			CacheBytes:   competitive.DefaultCacheBytes,
 		})
 		if err != nil {
 			fatalf("create indexed=%v: %v", indexed, err)

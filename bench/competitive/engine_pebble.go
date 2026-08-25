@@ -14,6 +14,9 @@ type pebbleEngine struct {
 }
 
 func newPebble(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("pebble", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("pebble", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -232,6 +235,10 @@ func (p *pebbleEngine) FilterCount(value string) (int, error) {
 }
 
 func (p *pebbleEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
+
+func (p *pebbleEngine) ProbeExactIndex(uint8, string) (ExactIndexProbe, error) {
+	return ExactIndexProbe{}, ErrNoIndex
+}
 
 func (p *pebbleEngine) DiskBytes() (int64, error) {
 	if err := p.db.Flush(); err != nil {

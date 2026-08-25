@@ -47,6 +47,9 @@ func badgerScanOptions(cfg Config) badger.IteratorOptions {
 }
 
 func newBadger(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("badger", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("badger", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -323,6 +326,10 @@ func (b *badgerEngine) FilterCount(value string) (int, error) {
 }
 
 func (b *badgerEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
+
+func (b *badgerEngine) ProbeExactIndex(uint8, string) (ExactIndexProbe, error) {
+	return ExactIndexProbe{}, ErrNoIndex
+}
 
 func (b *badgerEngine) DiskBytes() (int64, error) {
 	if err := b.Checkpoint(); err != nil {

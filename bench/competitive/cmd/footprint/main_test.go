@@ -19,7 +19,8 @@ func TestReportIncludesStorageProfileProvenance(t *testing.T) {
 
 	var out bytes.Buffer
 	printHeader(&out)
-	report(&out, "badger", "buffered-visible", competitive.LowCardinality, false,
+	report(&out, "badger", "buffered-visible", competitive.LowCardinality,
+		competitive.InlineDocuments, 0,
 		100, competitive.Footprint{DiskBytes: 250, DiskAllocatedBytes: 125}, profile)
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
@@ -71,10 +72,11 @@ func TestCorpusStatsReportsExactLogicalBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := printCorpusStats(&out, competitive.LowCardinality, docs); err != nil {
+	if err := printCorpusStats(&out, competitive.LowCardinality, competitive.InlineDocuments, docs); err != nil {
 		t.Fatal(err)
 	}
 	for _, required := range []string{
+		"document-shape=inline",
 		"docs=17",
 		fmt.Sprintf("key-bytes=%d", counts.KeyBytes),
 		fmt.Sprintf("json-bytes=%d", jsonBytes),
@@ -88,7 +90,7 @@ func TestCorpusStatsReportsExactLogicalBytes(t *testing.T) {
 }
 
 func TestCorpusStatsRejectsEmptyCorpus(t *testing.T) {
-	if err := printCorpusStats(&bytes.Buffer{}, competitive.LowCardinality, nil); err == nil {
+	if err := printCorpusStats(&bytes.Buffer{}, competitive.LowCardinality, competitive.InlineDocuments, nil); err == nil {
 		t.Fatal("empty corpus stats unexpectedly succeeded")
 	}
 }

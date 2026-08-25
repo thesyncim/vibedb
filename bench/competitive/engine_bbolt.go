@@ -32,6 +32,9 @@ type bboltSession struct {
 }
 
 func newBbolt(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("bbolt", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("bbolt", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -271,6 +274,10 @@ func (b *bboltEngine) FilterCount(value string) (int, error) {
 }
 
 func (b *bboltEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
+
+func (b *bboltEngine) ProbeExactIndex(uint8, string) (ExactIndexProbe, error) {
+	return ExactIndexProbe{}, ErrNoIndex
+}
 
 func (b *bboltEngine) DiskBytes() (int64, error) {
 	if err := b.Checkpoint(); err != nil {

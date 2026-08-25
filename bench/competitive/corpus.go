@@ -67,6 +67,65 @@ func (c Cardinality) String() string {
 	return "low"
 }
 
+// DocumentShape selects the value-size distribution independently from value
+// cardinality. The benchmark adapter retains the durable store's 512-byte
+// inline threshold, so the two
+// overflow shapes use exact, bounded target sizes on opposite sides of that
+// boundary rather than relying on incidental corpus growth.
+type DocumentShape uint8
+
+const (
+	InlineDocuments DocumentShape = iota
+	MixedDocuments
+	OverflowHeavyDocuments
+
+	mixedOverflowDocumentBytes = 4 << 10
+	heavyOverflowDocumentBytes = 16 << 10
+	maxShapedDocumentBytes     = heavyOverflowDocumentBytes
+)
+
+func (s DocumentShape) String() string {
+	switch s {
+	case InlineDocuments:
+		return "inline"
+	case MixedDocuments:
+		return "mixed"
+	case OverflowHeavyDocuments:
+		return "overflow-heavy"
+	default:
+		return "invalid"
+	}
+}
+
+// ParseDocumentShape parses the stable command-line corpus-shape spelling.
+func ParseDocumentShape(value string) (DocumentShape, error) {
+	switch value {
+	case "inline", "":
+		return InlineDocuments, nil
+	case "mixed":
+		return MixedDocuments, nil
+	case "overflow-heavy":
+		return OverflowHeavyDocuments, nil
+	default:
+		return 0, fmt.Errorf("unknown document shape %q (want inline, mixed, or overflow-heavy)", value)
+	}
+}
+
+// MaxDocumentBytes is the exact upper bound needed by an engine admission
+// configuration for this shape.
+func (s DocumentShape) MaxDocumentBytes() int {
+	switch s {
+	case InlineDocuments:
+		return 1 << 10
+	case MixedDocuments:
+		return mixedOverflowDocumentBytes
+	case OverflowHeavyDocuments:
+		return heavyOverflowDocumentBytes
+	default:
+		return 0
+	}
+}
+
 // ParseCardinality maps the command-line spelling onto the variant.
 func ParseCardinality(s string) (Cardinality, error) {
 	switch s {
@@ -115,7 +174,70 @@ func Corpus(n int) []Doc { return CorpusOf(n, LowCardinality) }
 // difference in a disk column between the two runs is therefore attributable to
 // value redundancy alone and not to a different corpus size.
 func CorpusOf(n int, card Cardinality) []Doc {
-	return benchcorpus.Corpus(n, card == HighCardinality)
+	return CorpusOfShape(n, card, InlineDocuments)
+}
+
+// CorpusOfShape builds a deterministic corpus with a bounded value-size
+// distribution. Mixed alternates inline and 4 KiB values exactly; overflow
+// heavy makes seven of every eight values exactly 16 KiB. The appended payload
+// alphabet contains no JSON escapes and is generated directly into bytes.
+// vibejson validates every constructed value, keeping stdlib JSON entirely out
+// of corpus construction.
+func CorpusOfShape(n int, card Cardinality, shape DocumentShape) []Doc {
+	docs := benchcorpus.Corpus(n, card == HighCardinality)
+	for i := range docs {
+		target := shapedDocumentBytes(shape, i)
+		if target == 0 || len(docs[i].JSON) >= target {
+			continue
+		}
+		docs[i].JSON = appendDeterministicPayload(docs[i].JSON, target, uint64(i)+1)
+		if len(docs[i].JSON) != target || len(docs[i].JSON) > maxShapedDocumentBytes ||
+			!vibejson.Valid(docs[i].JSON) {
+			panic("competitive shaped corpus invariant violated")
+		}
+	}
+	return docs
+}
+
+func shapedDocumentBytes(shape DocumentShape, ordinal int) int {
+	switch shape {
+	case InlineDocuments:
+		return 0
+	case MixedDocuments:
+		if ordinal&1 != 0 {
+			return mixedOverflowDocumentBytes
+		}
+		return 0
+	case OverflowHeavyDocuments:
+		if ordinal&7 != 0 {
+			return heavyOverflowDocumentBytes
+		}
+		return 0
+	default:
+		panic("invalid competitive document shape")
+	}
+}
+
+func appendDeterministicPayload(src []byte, target int, state uint64) []byte {
+	const prefix = `,"payload":"`
+	const suffix = `"}`
+	payloadBytes := target - (len(src) - 1) - len(prefix) - len(suffix)
+	if payloadBytes < 0 || len(src) == 0 || src[len(src)-1] != '}' {
+		panic("competitive corpus cannot fit shaped payload")
+	}
+	out := make([]byte, 0, target)
+	out = append(out, src[:len(src)-1]...)
+	out = append(out, prefix...)
+	for range payloadBytes {
+		// xorshift64* yields deterministic high-entropy bytes. Mapping onto 64
+		// JSON-safe ASCII symbols avoids escaping and fixes the exact length.
+		state ^= state >> 12
+		state ^= state << 25
+		state ^= state >> 27
+		out = append(out, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[(state*2685821657736338717)>>58])
+	}
+	out = append(out, suffix...)
+	return out
 }
 
 // UpdatedJSON returns a longer replacement body for document i, used by the
