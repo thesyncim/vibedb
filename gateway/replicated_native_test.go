@@ -357,6 +357,30 @@ func TestReplicatedPointReadRetriesSameCommandFenceIncarnationRace(t *testing.T)
 	}
 }
 
+func TestReplicatedPointReadStopsServingFenceBackoffOnCancellation(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	state.Applied, state.Commit = 10, 10
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	client := &sequenceReplicatedClient{state: state, responses: []*shardservice.ReplicatedResponse{{
+		Kind:    shardservice.ReplicatedRefusal,
+		Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: state,
+	}}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.ReadPoint(ctx, route, ReplicatedPointRead{
+		Relation: 1, Key: []byte("k"), MinimumApplied: 10,
+		MaxValueBytes: 1024, Linearizable: true,
+	})
+	if !errors.Is(err, context.Canceled) || client.proposals != 1 {
+		t.Fatalf("error=%T %v requests=%d", err, err, client.proposals)
+	}
+}
+
 func TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
 	for address, state := range states {
