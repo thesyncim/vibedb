@@ -250,6 +250,82 @@ func TestFileStoreTransactionExtentBytesClassifiesPhysicalParents(t *testing.T) 
 	}
 }
 
+func TestFileStoreHostileBatchPageGeometrySaturatesBeforeClassification(t *testing.T) {
+	if got := fileStoreSaturatingAdd(math.MaxInt-1, 1); got != math.MaxInt {
+		t.Fatalf("exact boundary add = %d, want MaxInt", got)
+	}
+	if got := fileStoreSaturatingAdd(math.MaxInt, 1); got != math.MaxInt {
+		t.Fatalf("overflowing add = %d, want saturated MaxInt", got)
+	}
+	if got := fileStoreSaturatingMul(math.MaxInt/2+1, 2); got != math.MaxInt {
+		t.Fatalf("overflowing multiply = %d, want saturated MaxInt", got)
+	}
+	maxInt := int(^uint(0) >> 1)
+	maxIntUint := uint64(maxInt)
+	wantProduct := uint64(math.MaxUint64)
+	if maxIntUint <= math.MaxUint64/maxIntUint {
+		wantProduct = maxIntUint * maxIntUint
+	}
+	if got := fileStoreSaturatingByteProduct(maxInt, maxInt); got != wantProduct {
+		t.Fatalf("boundary byte product = %d, want %d", got, wantProduct)
+	}
+	if got := fileStoreSaturatingByteAdd(math.MaxUint64, 1); got != math.MaxUint64 {
+		t.Fatalf("overflowing byte add = %d, want MaxUint64", got)
+	}
+
+	options := testFileStoreOptions()
+	options.MaxBatchDocuments = math.MaxInt - 1
+	options.MaxBatchBytes = math.MaxInt
+	options.MaxKeyBytes = 1
+	options.MaxDocumentBytes = 1
+	options.InlineValueBytes = 1
+	options.ResidentBytes = math.MaxInt64
+	options.MaxRetiredExtents = 1 << 24
+	options.Indexes = nil
+	if got := batchMetadataBasePages(options, 0); got != math.MaxInt {
+		t.Fatalf("hostile base pages = %d, want saturated MaxInt", got)
+	}
+	if got := batchMetadataPages(options, 0); got != math.MaxInt {
+		t.Fatalf("hostile metadata pages = %d, want saturated MaxInt", got)
+	}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("hostile unindexed page geometry was accepted")
+	}
+	options.Indexes = []store.IndexDefinition{
+		{Name: "x", Paths: []string{"/x"}},
+	}
+	if got := batchMetadataBasePages(options, 1); got != math.MaxInt {
+		t.Fatalf("hostile indexed base pages = %d, want saturated MaxInt", got)
+	}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("hostile indexed page geometry was accepted")
+	}
+
+	boundary := testFileStoreOptions()
+	boundary.MaxKeyBytes = 1
+	boundary.MaxDocumentBytes = 1
+	boundary.InlineValueBytes = 1
+	boundary.Indexes = nil
+	firstRejectedDocuments := 1
+	for batchMetadataPages(boundary, 0)+1 < 32768 {
+		firstRejectedDocuments++
+		boundary.MaxBatchDocuments = firstRejectedDocuments
+	}
+	previous := boundary
+	previous.MaxBatchDocuments = firstRejectedDocuments - 1
+	if got := batchMetadataPages(previous, 0) + 1; got >= 32768 {
+		t.Fatalf("page geometry below boundary = %d, want below 32768", got)
+	}
+	boundary.MaxBatchBytes = firstRejectedDocuments + 1
+	boundary.ResidentBytes = math.MaxInt64
+	boundary.MaxRetiredExtents = 1 << 24
+	boundary.BufferCount = 32768
+	if _, err := boundary.normalized(); err == nil {
+		t.Fatalf("%d-document geometry at the 32768-page cap was accepted",
+			firstRejectedDocuments)
+	}
+}
+
 func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-fs-direct-*")
 	if err != nil {

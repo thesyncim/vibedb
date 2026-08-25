@@ -406,6 +406,50 @@ func ValidateOptions(options Options) error {
 	return err
 }
 
+func fileStoreCheckedAdd(left, right int) (int, bool) {
+	if left < 0 || right < 0 || left > math.MaxInt-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+func fileStoreCheckedMul(left, right int) (int, bool) {
+	if left < 0 || right < 0 || left != 0 && right > math.MaxInt/left {
+		return 0, false
+	}
+	return left * right, true
+
+}
+
+func fileStoreSaturatingAdd(left, right int) int {
+	if sum, ok := fileStoreCheckedAdd(left, right); ok {
+		return sum
+	}
+	return math.MaxInt
+}
+
+func fileStoreSaturatingMul(left, right int) int {
+	if product, ok := fileStoreCheckedMul(left, right); ok {
+		return product
+	}
+	return math.MaxInt
+}
+
+func fileStoreSaturatingByteProduct(count, width int) uint64 {
+	if count < 0 || width < 0 ||
+		width != 0 && uint64(count) > math.MaxUint64/uint64(width) {
+		return math.MaxUint64
+	}
+	return uint64(count) * uint64(width)
+}
+
+func fileStoreSaturatingByteAdd(left, right uint64) uint64 {
+	if left > math.MaxUint64-right {
+		return math.MaxUint64
+	}
+	return left + right
+}
+
 // batchMetadataBasePages is the worst-case non-overflow page reservation for
 // one batched publication before its free-log fold grows past the
 // single-document baseline. Each term names the structure it pays for:
@@ -431,13 +475,16 @@ func batchMetadataBasePages(o Options, indexes int) int {
 	// per index, its rewritten term leaves and canonical root. The ordered-primary
 	// batch computes its exact reservation at apply time; this is the conservative
 	// commit-buffer cap.
-	pages := documents
-	pages += fileStorePrimaryBatchReservePages(documents)
+	pages := fileStoreSaturatingAdd(
+		documents, fileStorePrimaryBatchReservePages(documents),
+	)
 	if indexes != 0 {
-		pages += indexes * (documents + 2)
+		perIndex := fileStoreSaturatingAdd(documents, 2)
+		pages = fileStoreSaturatingAdd(
+			pages, fileStoreSaturatingMul(indexes, perIndex),
+		)
 	}
-	pages += fileStoreMetadataReservePages
-	return pages
+	return fileStoreSaturatingAdd(pages, fileStoreMetadataReservePages)
 }
 
 // fileStorePrimaryBatchReservePages sizes the ordinary atomic-batch
@@ -479,7 +526,8 @@ func batchFreeFoldLimit(o Options, indexes int) int {
 
 func batchMetadataPages(o Options, indexes int) int {
 	base := batchMetadataBasePages(o, indexes)
-	return base + batchFreeFoldLimit(o, indexes) - storeio.FreeLogMaxFoldSegments
+	extra := batchFreeFoldLimit(o, indexes) - storeio.FreeLogMaxFoldSegments
+	return fileStoreSaturatingAdd(base, extra)
 }
 
 const (
@@ -520,10 +568,13 @@ func fileStoreTransactionExtentBytes(
 	root := take(1)
 	maximum := take(maximumExtentPages)
 	routing := take(routingParentPages)
-	return uint64(maximum)*uint64(maxPageSize) +
-		uint64(root)*uint64(storeio.GlobalTabletCatalogRootBytes) +
-		uint64(routing)*uint64(storeio.GlobalTabletCatalogNodeBytes) +
-		uint64(remaining)*uint64(pageSize)
+	bytes := fileStoreSaturatingByteProduct(maximum, maxPageSize)
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(root, storeio.GlobalTabletCatalogRootBytes))
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(routing, storeio.GlobalTabletCatalogNodeBytes))
+	return fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(remaining, pageSize))
 }
 
 // fileStoreTransactionResidentBytes charges maximum-size dirty frames only for
@@ -534,8 +585,12 @@ func fileStoreTransactionResidentBytes(
 	totalPages, maximumPages, pageSize, maxPageSize int,
 ) uint64 {
 	maximum := min(max(0, maximumPages), max(0, totalPages))
-	return uint64(maximum)*uint64(maxPageSize) +
-		uint64(max(0, totalPages-maximum))*uint64(pageSize)
+	return fileStoreSaturatingByteAdd(
+		fileStoreSaturatingByteProduct(maximum, maxPageSize),
+		fileStoreSaturatingByteProduct(
+			max(0, totalPages-maximum), pageSize,
+		),
+	)
 }
 
 type normalizedFileStoreOptions struct {
@@ -685,17 +740,23 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if o.MaxBatchDocuments < 1 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection MaxBatchDocuments must be positive")
 	}
-	if o.MaxBatchDocuments > (math.MaxInt-o.MaxDocumentBytes)/o.MaxKeyBytes {
+	batchKeyBytes, batchKeyBytesOK := fileStoreCheckedMul(
+		o.MaxBatchDocuments, o.MaxKeyBytes,
+	)
+	minBatchBytes, minBatchBytesOK := fileStoreCheckedAdd(
+		o.MaxDocumentBytes, batchKeyBytes,
+	)
+	if !batchKeyBytesOK || !minBatchBytesOK {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection batch byte bound overflows")
 	}
-	minBatchBytes := o.MaxDocumentBytes + o.MaxBatchDocuments*o.MaxKeyBytes
 	if o.MaxBatchBytes == 0 {
 		valueBytes := defaultBatchValueBytes
-		if o.MaxBatchDocuments <= math.MaxInt/o.MaxDocumentBytes {
-			valueBytes = min(valueBytes, o.MaxBatchDocuments*o.MaxDocumentBytes)
-		}
-		o.MaxBatchBytes = o.MaxBatchDocuments*o.MaxKeyBytes +
-			max(o.MaxDocumentBytes, valueBytes)
+		valueBytes = min(valueBytes, fileStoreSaturatingMul(
+			o.MaxBatchDocuments, o.MaxDocumentBytes,
+		))
+		o.MaxBatchBytes = fileStoreSaturatingAdd(
+			batchKeyBytes, max(o.MaxDocumentBytes, valueBytes),
+		)
 	}
 	if o.MaxBatchBytes < minBatchBytes {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -941,10 +1002,12 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// Buffer indexes are uint16 today and the configured device ceiling is
 	// 32,768. Reject the transaction geometry before int addition or byte
 	// multiplication can wrap on adversarial maximum-document options.
+	largestMetadataPageLimit := max(
+		metadataPageLimit, singleDocumentMetadataPageLimit,
+	)
 	if metadataPageLimit < 0 || singleDocumentMetadataPageLimit < 0 ||
-		overflowPages >= 32768-max(
-			metadataPageLimit, singleDocumentMetadataPageLimit,
-		) {
+		largestMetadataPageLimit >= 32768 ||
+		overflowPages >= 32768-largestMetadataPageLimit {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection MaxBatchDocuments or maximum document requires too many transaction pages")
 	}
 	docMaxTransactionPages := overflowPages + metadataPageLimit
@@ -954,11 +1017,15 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// persisted checkpoint namespace is deliberately separate: routing parents
 	// can occupy wider physical extent classes without retaining those padded
 	// bytes in resident frames.
-	batchLargePages := overflowPages + o.MaxBatchDocuments
-	singleDocumentLargePages := overflowPages + 1
+	batchLargePages := fileStoreSaturatingAdd(
+		overflowPages, o.MaxBatchDocuments,
+	)
+	singleDocumentLargePages := fileStoreSaturatingAdd(overflowPages, 1)
 	if len(compiled) != 0 {
-		batchLargePages++
-		singleDocumentLargePages++
+		batchLargePages = fileStoreSaturatingAdd(batchLargePages, 1)
+		singleDocumentLargePages = fileStoreSaturatingAdd(
+			singleDocumentLargePages, 1,
+		)
 	}
 	docMaxTransactionBytes := fileStoreTransactionResidentBytes(
 		docMaxTransactionPages, batchLargePages, o.PageSize, o.MaxPageSize,
@@ -1005,8 +1072,12 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		exactIndexPages = allowance + len(compiled) + 1
 		exactIndexBytes = uint64(exactIndexPages) * uint64(o.MaxPageSize)
 	}
-	maxTransactionPages := docMaxTransactionPages + exactIndexPages
-	singleDocumentTransactionPages := docSingleDocumentPages + exactIndexPages
+	maxTransactionPages := fileStoreSaturatingAdd(
+		docMaxTransactionPages, exactIndexPages,
+	)
+	singleDocumentTransactionPages := fileStoreSaturatingAdd(
+		docSingleDocumentPages, exactIndexPages,
+	)
 	compiledPackedPages := 0
 	if len(compiled) != 0 {
 		compiledPackedPages = 1
@@ -1015,7 +1086,13 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
 	maxTransactionPhysicalBytes := fileStoreTransactionExtentBytes(
 		maxTransactionPages,
-		overflowPages+o.MaxBatchDocuments+compiledPackedPages+exactIndexPages,
+		fileStoreSaturatingAdd(
+			fileStoreSaturatingAdd(
+				fileStoreSaturatingAdd(overflowPages, o.MaxBatchDocuments),
+				compiledPackedPages,
+			),
+			exactIndexPages,
+		),
 		4*min(o.MaxBatchDocuments, filePrimaryPendingParentLimit),
 		o.PageSize, o.MaxPageSize,
 	)
