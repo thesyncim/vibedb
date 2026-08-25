@@ -76,7 +76,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	authorizationDigest := raftmember.MembershipTransitionDigest(group,
 		[16]byte{1}, 2, 3, 1, 4)
 	learnerConf := &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
 			if err != nil || publication.Applied < 2 ||
@@ -193,7 +193,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err = hosts[1].TransferLeader(group, target); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			status, err := hosts[index].Status(group)
 			if err != nil || status.LeaderID != target {
@@ -210,7 +210,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	removedConf := &pb.ConfState{Voters: []uint64{2, 3, 4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 4 || publication.ConfState.Equivalent(removedConf) != nil {

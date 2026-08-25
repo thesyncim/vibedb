@@ -132,6 +132,21 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 		idleStep, cluster.diagnostic())
 }
 
+// driveUntilConvergedIdle proves a predicate and then drains only the Raft
+// work that made it true. Use it before the test injects another protocol
+// input: publication can precede the final Ready advance or outbound delivery,
+// while Runtime deliberately rejects new input at that boundary.
+func (cluster *realTransferCluster) driveUntilConvergedIdle(done func() bool) {
+	cluster.t.Helper()
+	step := 0
+	doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+	if !doneReached {
+		cluster.t.Fatalf("cluster became idle before stable condition at step %d: %s",
+			idleStep, cluster.diagnostic())
+	}
+	cluster.drainConvergedWorkToIdle(done, &step)
+}
+
 // driveUntilIdle advances the deterministic scheduler until either done is
 // observed or one exact protocol-idle cut is reached. Unlike driveUntil it does
 // not classify idle as failure: callers that deliberately supply a logical
