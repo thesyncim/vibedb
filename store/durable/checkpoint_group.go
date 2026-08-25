@@ -827,9 +827,29 @@ func newCheckpointGroup(
 	file, published, openErr = createCheckpointGroupCertificate(log, certificate)
 	if openErr != nil {
 		if published {
-			terminalFenceCheckpointGroupActivationLocked(log, order, openErr)
+			// The canonical name is already visible. Settle the exact published
+			// certificate in place so an outcome-unknown directory barrier does
+			// not strand otherwise healthy activation handles.
+			settleErr := syncTxnLogDirectory(log.root)
+			var recovered checkpointGroupCertificate
+			if settleErr == nil {
+				file, recovered, settleErr = openCheckpointGroupCertificate(log)
+			}
+			if settleErr == nil && recovered.sequence == certificate.sequence &&
+				equalCheckpointGroupCertificateBody(recovered, certificate) {
+				certificate = recovered
+				openErr = nil
+			} else {
+				if file != nil {
+					settleErr = errors.Join(settleErr, file.Close())
+					file = nil
+				}
+				terminalFenceCheckpointGroupActivationLocked(log, order, errors.Join(openErr, settleErr))
+				return nil, errors.Join(openErr, settleErr)
+			}
+		} else {
+			return nil, openErr
 		}
-		return nil, openErr
 	}
 	group, err := checkpointGroupFromCertificateLocked(
 		log, file, certificate, ordered, options,

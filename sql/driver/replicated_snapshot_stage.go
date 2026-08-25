@@ -17,7 +17,24 @@ var (
 	ErrReplicatedSnapshotStageBusy   = errors.New("vibedb: replicated snapshot stage already has an owner")
 	ErrReplicatedSnapshotStageClosed = errors.New("vibedb: replicated snapshot stage is closed")
 	ErrReplicatedSnapshotStageProof  = errors.New("vibedb: replicated snapshot stage proof mismatch")
+	replicatedSnapshotStageFaultHook func(replicatedSnapshotStageFaultPoint) error
 )
+
+type replicatedSnapshotStageFaultPoint uint8
+
+const (
+	replicatedSnapshotStageAfterGroupCreate replicatedSnapshotStageFaultPoint = iota + 1
+	replicatedSnapshotStageAfterSeed
+	replicatedSnapshotStageAfterMachineOpen
+	replicatedSnapshotStageAfterSnapshotInstall
+)
+
+func replicatedSnapshotStageFault(point replicatedSnapshotStageFaultPoint) error {
+	if replicatedSnapshotStageFaultHook == nil {
+		return nil
+	}
+	return replicatedSnapshotStageFaultHook(point)
+}
 
 // ReplicatedSnapshotStage is the exclusive non-serving owner of an empty
 // replica while one authenticated snapshot artifact is written directly into
@@ -26,15 +43,21 @@ var (
 type ReplicatedSnapshotStage struct {
 	mu sync.Mutex
 
-	owner      *dbConnector
-	database   *database
-	table      *table
-	base       ReplicatedShardStoreIdentity
-	identity   ReplicatedApplyIdentity
-	expected   replicatedstate.SnapshotArtifactManifest
-	stage      *replicatedstate.SnapshotArtifactStage
-	activation ReplicatedChildActivation
-	closed     bool
+	owner           *dbConnector
+	database        *database
+	table           *table
+	base            ReplicatedShardStoreIdentity
+	identity        ReplicatedApplyIdentity
+	expected        replicatedstate.SnapshotArtifactManifest
+	stage           *replicatedstate.SnapshotArtifactStage
+	candidateProved bool
+	seedEnvelope    []byte
+	seedKey         []byte
+	claim           *ReplicatedApply
+	machine         *replicatedstate.Machine
+	snapshotBase    *pb.Snapshot
+	activation      ReplicatedChildActivation
+	closed          bool
 }
 
 // OpenReplicatedSnapshotStage creates or resumes the sole non-serving snapshot
@@ -220,9 +243,19 @@ func (s *ReplicatedSnapshotStage) Activate(
 		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
 		{Name: s.base.UserTable, Collection: s.table.collection},
 	}
-	var seedEnvelope, seedKey []byte
 	var err error
-	if core.checkpointGroup == nil {
+	if s.snapshotBase == nil {
+		s.snapshotBase, err = replicatedstate.BuildSnapshotBase(s.expected, staticBootstrap)
+		if err != nil {
+			return ReplicatedChildActivation{}, err
+		}
+	} else {
+		candidate, buildErr := replicatedstate.BuildSnapshotBase(s.expected, staticBootstrap)
+		if buildErr != nil || !proto.Equal(candidate, s.snapshotBase) {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, buildErr)
+		}
+	}
+	if !s.candidateProved && core.checkpointGroup == nil {
 		_, err = s.stage.OpenCandidate(staticBootstrap, core.txnLog, replicatedstate.Options{
 			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 			RetryWindow: s.identity.RetryWindow,
@@ -230,22 +263,24 @@ func (s *ReplicatedSnapshotStage) Activate(
 		if err != nil {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
-		seedEnvelope = s.stage.AppendSeedEnvelope(nil)
-		seedKey = s.stage.AppendSeedKey(nil)
-	} else {
-		seedKey, seedEnvelope, err = s.stage.AppendRecoveredSeed(
+		s.seedEnvelope = s.stage.AppendSeedEnvelope(s.seedEnvelope[:0])
+		s.seedKey = s.stage.AppendSeedKey(s.seedKey[:0])
+		s.candidateProved = true
+	} else if !s.candidateProved {
+		s.seedKey, s.seedEnvelope, err = s.stage.AppendRecoveredSeed(
 			nil, nil, core.checkpointGroup, replicatedstate.SystemCollectionName,
 		)
 		if err != nil || !core.checkpointGroup.Owns(members) {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
+		s.candidateProved = true
 	}
-	if len(seedEnvelope) == 0 || len(seedKey) == 0 {
+	if len(s.seedEnvelope) == 0 || len(s.seedKey) == 0 {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageProof
 	}
 	seed := durable.CheckpointGroupSeed{
 		Applied: s.expected.State.Applied, Member: replicatedstate.SystemCollectionName,
-		Envelope: seedEnvelope,
+		Envelope: s.seedEnvelope,
 		Images: []durable.CheckpointGroupSeedImage{
 			{Collection: core.replicatedApplyCollection, Generation: core.replicatedApplyCollection.Generation()},
 			{Collection: s.table.collection, Generation: s.table.collection.Generation()},
@@ -258,55 +293,67 @@ func (s *ReplicatedSnapshotStage) Activate(
 		if err != nil || !core.checkpointGroup.Owns(members) {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
+		if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterGroupCreate); err != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+		}
 	}
-	if err = core.checkpointGroup.Seed(seed, members[0], s.identity.TxnLimits, seedKey); err != nil {
+	if err = core.checkpointGroup.Seed(seed, members[0], s.identity.TxnLimits, s.seedKey); err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	claim := &ReplicatedApply{owner: connector, database: core, table: s.table,
-		identity: s.identity, exclusiveConnector: true}
-	machine, err := replicatedstate.Open(
-		replicatedStateBinding(s.base), staticBootstrap,
-		replicatedstate.CollectionTarget{
-			Collection: core.replicatedApplyCollection,
-			Validation: replicatedstate.ValidationOpaqueBinary,
-			Limits:     replicatedStateCollectionLimits(s.identity.SystemLimits),
-		},
-		replicatedstate.UserCollection{Name: s.base.UserTable, Target: replicatedstate.CollectionTarget{
-			Collection:             s.table.collection,
-			Validation:             replicatedstate.ValidationDeterministicMutation,
-			ValidationDigest:       s.identity.ValidationDigest,
-			Validator:              newReplicatedSQLMutationValidator(s.base, s.table, s.identity.Placement),
-			ObserveMutationAttempt: claim.observeMutationAttempt,
-			Limits:                 replicatedStateCollectionLimits(s.base.UserLimits),
-		}},
-		core.txnLog, replicatedstate.Options{
-			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
-			RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
-		},
-	)
-	if err != nil {
+	if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSeed); err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	base, err := replicatedstate.BuildSnapshotBase(s.expected, staticBootstrap)
-	if err != nil {
-		return ReplicatedChildActivation{}, err
+	if s.claim == nil {
+		s.claim = &ReplicatedApply{owner: connector, database: core, table: s.table,
+			identity: s.identity, exclusiveConnector: true}
 	}
-	publication, err := machine.InstallSnapshot(base)
+	if s.machine == nil {
+		s.machine, err = replicatedstate.Open(
+			replicatedStateBinding(s.base), staticBootstrap,
+			replicatedstate.CollectionTarget{
+				Collection: core.replicatedApplyCollection,
+				Validation: replicatedstate.ValidationOpaqueBinary,
+				Limits:     replicatedStateCollectionLimits(s.identity.SystemLimits),
+			},
+			replicatedstate.UserCollection{Name: s.base.UserTable, Target: replicatedstate.CollectionTarget{
+				Collection:             s.table.collection,
+				Validation:             replicatedstate.ValidationDeterministicMutation,
+				ValidationDigest:       s.identity.ValidationDigest,
+				Validator:              newReplicatedSQLMutationValidator(s.base, s.table, s.identity.Placement),
+				ObserveMutationAttempt: s.claim.observeMutationAttempt,
+				Limits:                 replicatedStateCollectionLimits(s.base.UserLimits),
+			}},
+			core.txnLog, replicatedstate.Options{
+				TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
+				RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+			},
+		)
+		if err != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+		}
+		if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterMachineOpen); err != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+		}
+	}
+	publication, err := s.machine.InstallSnapshot(s.snapshotBase)
 	if err != nil || publication.Applied != s.expected.State.Applied ||
 		publication.ReplicaSetVersion != s.expected.State.ReplicaSetVersion {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	certificate, err := replicatedstate.OpenSnapshotBase(base)
+	if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSnapshotInstall); err != nil {
+		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(s.snapshotBase)
 	if err != nil {
 		return ReplicatedChildActivation{}, err
 	}
-	claim.machine = machine
-	claim.activationBasePending = certificate.Digest
+	s.claim.machine = s.machine
+	s.claim.activationBasePending = certificate.Digest
 	core.replicatedSnapshotStageClaim = nil
-	core.replicatedApplyClaim = claim
+	core.replicatedApplyClaim = s.claim
 	core.replicatedSeedPending = true
-	result := ReplicatedChildActivation{Apply: claim, ApplyIdentity: s.identity,
-		SnapshotBase: base, ArtifactManifest: s.expected}
+	result := ReplicatedChildActivation{Apply: s.claim, ApplyIdentity: s.identity,
+		SnapshotBase: s.snapshotBase, ArtifactManifest: s.expected}
 	s.activation = ownedReplicatedSnapshotActivation(result)
 	s.closed, s.stage = true, nil
 	return ownedReplicatedSnapshotActivation(result), nil

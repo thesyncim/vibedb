@@ -576,8 +576,8 @@ func TestCheckpointGroupSeedCrashCuts(t *testing.T) {
 			log, members, seed, CheckpointGroupOptions{},
 		)
 		checkpointGroupFaultHook = previous
-		if group != nil || !errors.Is(err, fault) || !errors.Is(err, ErrCommitOutcomeUnknown) {
-			t.Fatalf("initial certificate crash = group %v, err %v", group, err)
+		if group == nil || err != nil || !group.SeedPending() {
+			t.Fatalf("settled initial certificate = group %v, err %v", group, err)
 		}
 		assertCrash(t, copyCheckpointGroupDirectory(t, dir), false)
 	})

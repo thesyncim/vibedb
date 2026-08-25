@@ -3,7 +3,6 @@ package snapshottransfer
 import (
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -15,6 +14,24 @@ import (
 )
 
 var ErrLearnerInstall = errors.New("snapshottransfer: learner install proof mismatch")
+
+type learnerInstallFaultPoint uint8
+
+const (
+	learnerInstallAfterActivation learnerInstallFaultPoint = iota + 1
+	learnerInstallAfterWAL
+	learnerInstallAfterAdopt
+	learnerInstallBeforeHostAdd
+)
+
+var learnerInstallFaultHook func(learnerInstallFaultPoint) error
+
+func learnerInstallFault(point learnerInstallFaultPoint) error {
+	if learnerInstallFaultHook == nil {
+		return nil
+	}
+	return learnerInstallFaultHook(point)
+}
 
 // LearnerInstallPlan contains only independently retained cold control-plane
 // facts and already-open exclusive local owners. InstallPublishedLearner adds
@@ -45,7 +62,10 @@ type LearnerInstallPlan struct {
 // base, mints the requested node incarnation, and transfers the runtime to the
 // multiraft host. It does not construct a shard service or serving Owner;
 // learner catch-up and promotion remain explicit later barriers.
-func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentity, error) {
+func InstallPublishedLearner(plan LearnerInstallPlan) (
+	identity raftmember.RuntimeIdentity,
+	resultErr error,
+) {
 	if err := validateLearnerInstallPlan(plan); err != nil {
 		return raftmember.RuntimeIdentity{}, err
 	}
@@ -72,7 +92,7 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	activationOwned := false
 	defer func() {
 		if !activationOwned {
-			_ = stage.Close()
+			resultErr = errors.Join(resultErr, stage.Close())
 		}
 	}()
 	artifact, err := plan.Repository.OpenPublished(plan.Descriptor, stage.Offset())
@@ -89,36 +109,65 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 		return raftmember.RuntimeIdentity{}, err
 	}
 	activationOwned = true
+	activationHandedOff := false
+	defer func() {
+		if !activationHandedOff {
+			resultErr = errors.Join(
+				resultErr, activation.Apply.Close(), plan.Database.Close(),
+			)
+		}
+	}()
+	if err = learnerInstallFault(learnerInstallAfterActivation); err != nil {
+		return raftmember.RuntimeIdentity{}, err
+	}
 	wal, err := raftmember.OpenOrCreateStagedChildWAL(
 		plan.WALPath, plan.WALIdentity, plan.WALKey,
 		plan.Descriptor.Group.TopologyRecoveryEpoch, plan.Authority,
 		plan.SQLIdentity, activation, plan.WALOptions,
 	)
 	if err != nil {
-		_ = activation.Apply.Close()
 		return raftmember.RuntimeIdentity{}, err
 	}
-	currentIncarnation := wal.CurrentIncarnation()
-	if currentIncarnation == math.MaxUint64 ||
-		currentIncarnation+1 != plan.Descriptor.TargetIncarnation {
-		_ = wal.Close()
-		_ = activation.Apply.Close()
-		return raftmember.RuntimeIdentity{}, ErrLearnerInstall
+	walOwned := true
+	defer func() {
+		if walOwned {
+			resultErr = errors.Join(resultErr, wal.Close())
+		}
+	}()
+	if err = learnerInstallFault(learnerInstallAfterWAL); err != nil {
+		return raftmember.RuntimeIdentity{}, err
 	}
-	runtime, err := raftmember.AdoptRuntime(wal, plan.Database, activation.Apply)
+	runtime, err := raftmember.AdoptStagedRuntime(
+		wal, plan.Database, activation.Apply, plan.Descriptor.TargetIncarnation,
+	)
 	if err != nil {
-		if runtime == nil {
-			_ = wal.Close()
+		if runtime != nil {
+			activationHandedOff, walOwned = true, false
+			err = errors.Join(err, runtime.Close())
 		}
 		return raftmember.RuntimeIdentity{}, err
 	}
-	identity := runtime.Identity()
+	activationHandedOff, walOwned = true, false
+	runtimeOwned := true
+	defer func() {
+		if runtimeOwned {
+			resultErr = errors.Join(resultErr, runtime.Close())
+		}
+	}()
+	if err = learnerInstallFault(learnerInstallAfterAdopt); err != nil {
+		return raftmember.RuntimeIdentity{}, err
+	}
+	identity = runtime.Identity()
 	if identity.NodeIncarnation != plan.Descriptor.TargetIncarnation {
-		return raftmember.RuntimeIdentity{}, errors.Join(ErrLearnerInstall, runtime.Close())
+		return raftmember.RuntimeIdentity{}, ErrLearnerInstall
+	}
+	if err = learnerInstallFault(learnerInstallBeforeHostAdd); err != nil {
+		return raftmember.RuntimeIdentity{}, err
 	}
 	if err := plan.Host.Add(runtime); err != nil {
-		return raftmember.RuntimeIdentity{}, errors.Join(err, runtime.Close())
+		return raftmember.RuntimeIdentity{}, err
 	}
+	runtimeOwned = false
 	return identity, nil
 }
 

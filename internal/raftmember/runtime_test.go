@@ -232,6 +232,73 @@ func TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation(t *testing.T) {
 	}
 }
 
+func TestAdoptStagedRuntimeResumesExactPristineIncarnationOnly(t *testing.T) {
+	identity := testWALIdentity(211)
+	walPath, wal, _, options := createWAL(t, identity)
+	sqlPath, database, _ := prepareSQLRoot(t, identity, "staged-runtime-retry")
+	authority := testAuthorityProfile()
+	base, err := BindPreparedSQL(wal, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind staged runtime SQL", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply, applyIdentity, err := OpenPreparedApply(wal, database, authority, base, testApplyOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := wal.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	first, err := AdoptStagedRuntime(wal, database, apply, 1)
+	if err != nil || first.Identity().NodeIncarnation != 1 {
+		t.Fatalf("first staged adoption=%v err=%v", first, err)
+	}
+	if err = first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopen := func() (*raftstore.Store, *sqldriver.Database, *sqldriver.ReplicatedApply) {
+		t.Helper()
+		reopenedWAL, openErr := raftstore.Open(walPath, identity,
+			testTopologyRecoveryEpoch, testWALKey(), options)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		reopenedDB, reopenedApply, openErr := OpenBoundSQLWithApply(
+			sqlPath, reopenedWAL, authority, base, applyIdentity,
+		)
+		if openErr != nil {
+			_ = reopenedWAL.Close()
+			t.Fatal(openErr)
+		}
+		return reopenedWAL, reopenedDB, reopenedApply
+	}
+	reopenedWAL, reopenedDB, reopenedApply := reopen()
+	retried, err := AdoptStagedRuntime(reopenedWAL, reopenedDB, reopenedApply, 1)
+	if err != nil || retried.Identity().NodeIncarnation != 1 || reopenedWAL.CurrentIncarnation() != 1 {
+		t.Fatalf("exact staged retry=%v incarnation=%d err=%v", retried, reopenedWAL.CurrentIncarnation(), err)
+	}
+	drainRuntime(t, retried, nil)
+	if err = retried.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedWAL, reopenedDB, reopenedApply = reopen()
+	if got, retryErr := AdoptStagedRuntime(reopenedWAL, reopenedDB, reopenedApply, 1); got != nil || retryErr == nil {
+		t.Fatalf("persisted-Ready staged retry=%v err=%v", got, retryErr)
+	}
+	if reopenedWAL.CurrentIncarnation() != 1 {
+		t.Fatalf("rejected retry leaked incarnation %d", reopenedWAL.CurrentIncarnation())
+	}
+	_ = reopenedApply.Close()
+	_ = reopenedDB.Close()
+	_ = reopenedWAL.Close()
+}
+
 func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {
 	fixture := newRuntimeFixture(t, 220, nil)
 	status, err := fixture.runtime.Status()
