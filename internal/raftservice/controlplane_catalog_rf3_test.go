@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 package raftservice_test
 
 import (
