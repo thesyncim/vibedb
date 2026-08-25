@@ -122,15 +122,36 @@ type realTransferCluster struct {
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
 	cluster.t.Helper()
-	for step := 0; step < 100000; step++ {
+	step := 0
+	doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+	if doneReached {
+		return
+	}
+	cluster.t.Fatalf("cluster became idle before condition at step %d", idleStep)
+}
+
+// driveUntilIdle advances the deterministic scheduler until either done is
+// observed or one exact protocol-idle cut is reached. Unlike driveUntil it does
+// not classify idle as failure: callers that deliberately supply a logical
+// clock input can first observe the quiescent cut and then inject that input.
+// Exhausting the deterministic step bound remains fatal in every caller.
+func (cluster *realTransferCluster) driveUntilIdle(
+	done func() bool,
+	step *int,
+) (doneReached bool, idleStep int) {
+	cluster.t.Helper()
+	for *step < 100000 {
 		if done() {
-			return
+			return true, -1
 		}
-		if !cluster.driveRound(step) {
-			cluster.t.Fatalf("cluster became idle before condition at step %d", step)
+		current := *step
+		*step++
+		if !cluster.driveRound(current) {
+			return false, current
 		}
 	}
 	cluster.t.Fatal("cluster drive did not converge")
+	return false, -1
 }
 
 // driveRound executes one deterministic scheduler turn and routes every
@@ -215,12 +236,11 @@ func (cluster *realTransferCluster) driveRound(step int) bool {
 // authenticated transport; no commit or promotion witness is synthesized.
 func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) {
 	cluster.t.Helper()
-	for step := 0; step < 100000; step++ {
-		if done() {
+	step := 0
+	for step < 100000 {
+		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+		if doneReached {
 			return
-		}
-		if cluster.driveRound(step) {
-			continue
 		}
 		leader := -1
 		for index, host := range cluster.hosts {
@@ -233,17 +253,18 @@ func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) 
 			}
 			if status.MemberID == status.LeaderID && status.LeaderID != 0 {
 				if leader >= 0 {
-					cluster.t.Fatalf("multiple leaders at protocol-idle step %d", step)
+					cluster.t.Fatalf("multiple leaders at protocol-idle step %d", idleStep)
 				}
 				leader = index
 			}
 		}
 		if leader < 0 {
-			cluster.t.Fatalf("no leader at protocol-idle step %d", step)
+			cluster.t.Fatalf("no leader at protocol-idle step %d", idleStep)
 		}
 		if err := cluster.hosts[leader].RequestTick(cluster.group); err != nil {
 			cluster.t.Fatal(err)
 		}
+		step++
 	}
 	cluster.t.Fatal("cluster drive with leader ticks did not converge")
 }

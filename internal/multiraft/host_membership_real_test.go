@@ -96,7 +96,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	}
 	cluster.pausePromotion = true
 	voterConf := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilWithLeaderTicks(func() bool {
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 3 ||
