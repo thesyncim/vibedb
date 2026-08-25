@@ -185,12 +185,12 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "A bounded authenticated repository, resumable chunk protocol, descriptor identity, and artifact verification exist.", []Reference{
 			ref("internal/snapshottransfer/repository.go", "Repository"), ref("internal/snapshottransfer/service.go", "Receiver"),
 		}},
-		Integrated: Stage{StatusPartial, "Artifact production and transport are integrated internally. Empty-learner installation and activation are not connected to Multi-Raft membership.", []Reference{
-			ref("internal/snapshottransfer/transfer_test.go", "TestAuthenticatedServiceDisconnectResumeAndIdentityRotation"), ref("internal/replicatedstate/snapshot_artifact.go", "WriteSnapshotArtifact"),
+		Integrated: Stage{StatusPartial, "Artifact production, transport, crash-safe empty-learner activation, exact-incarnation adoption, and Multi-Raft host addition are integrated internally. Suffix catch-up and promotion remain explicit later barriers without a controller.", []Reference{
+			ref("internal/snapshottransfer/learner_install.go", "InstallPublishedLearner"), ref("sql/driver/replicated_snapshot_stage.go", "ResumeReplicatedSnapshotActivation"),
 		}},
 		Shipped: Stage{StatusNo, "No command exposes snapshot service or learner bootstrap configuration.", nil},
-		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, and chunk benchmarks exist. Install, catch-up, promotion, and restart-at-activation-boundary gates are absent.", []Reference{
-			ref("internal/snapshottransfer/transfer_test.go", "TestAuthenticatedServiceDisconnectResumeAndIdentityRotation"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
+		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen and exact-incarnation retry, and chunk benchmarks exist. Live suffix catch-up, promotion, and external multi-process crash gates remain absent.", []Reference{
+			ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("sql/driver/replicated_snapshot_stage_test.go", "TestReplicatedSnapshotStageSameHandleFaultSettlement"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
 		}},
 	},
 	{
