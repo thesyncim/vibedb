@@ -49,10 +49,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.InstallTransitionGrant(membershipgrant.Grant{
-			Group: members[0].Group, TransitionID: [16]byte{1}, MetadataEpoch: 2,
-			CatalogGeneration: 3, SourceMember: 1, TargetMember: 4,
-		}); err != nil {
+		if err := registry.InstallTransitionGrant(realTransferMembershipGrant(members[0].Group)); err != nil {
 			t.Fatal(err)
 		}
 		registries = append(registries, registry)
@@ -74,8 +71,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		return true
 	})
 	target := uint64(4)
-	authorizationDigest := raftmember.MembershipTransitionDigest(group,
-		[16]byte{1}, 2, 3, 1, 4)
+	authorizationDigest := realTransferMembershipGrant(group).Digest()
 	learnerConf := &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
 	cluster.driveUntilConvergedIdle(func() bool {
 		for _, host := range hosts {
@@ -158,10 +154,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = restartRegistry.InstallTransitionGrant(membershipgrant.Grant{
-		Group: group, TransitionID: [16]byte{1}, MetadataEpoch: 2,
-		CatalogGeneration: 3, SourceMember: 1, TargetMember: 4,
-	}); err != nil {
+	if err = restartRegistry.InstallTransitionGrant(realTransferMembershipGrant(group)); err != nil {
 		t.Fatal(err)
 	}
 	proof, found, err := restartedPromotionHost.DurablePromotion(group, target)
@@ -276,4 +269,20 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			publication.ConfState.Equivalent(removedConf) == nil &&
 			publication.ReplicaSetVersion == authorityVersion && authorityFound
 	})
+}
+
+func realTransferMembershipGrant(group raftmember.GroupKey) membershipgrant.Grant {
+	grant := membershipgrant.Grant{
+		Group: group, TransitionID: [16]byte{1}, MetadataEpoch: 2, CatalogGeneration: 3,
+		InitialReplicaSetVersion: 1, InitialVoters: [3]uint64{1, 2, 3},
+		InitialDescriptorDigest: [32]byte{2}, SourceMember: 1, TargetMember: 4,
+		TargetNode: [16]byte{4},
+	}
+	grant.InitialRosterDigest = membershipgrant.CertifiedRosterDigest(group, 1,
+		[3]membershipgrant.RosterMember{
+			{Member: 1, Node: [16]byte{1}},
+			{Member: 2, Node: [16]byte{2}},
+			{Member: 3, Node: [16]byte{3}},
+		})
+	return grant
 }

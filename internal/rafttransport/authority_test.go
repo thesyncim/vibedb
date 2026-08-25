@@ -1,6 +1,7 @@
 package rafttransport
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"sync"
@@ -12,21 +13,35 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type disappearingGrantSource struct {
+	grant membershipgrant.Grant
+	reads int
+}
+
+func (source *disappearingGrantSource) ReadMembershipGrant(
+	context.Context, raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	source.reads++
+	if source.reads == 1 {
+		return source.grant, true, nil
+	}
+	return membershipgrant.Grant{}, false, nil
+}
+
 func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *testing.T) {
 	group := testGroup(31)
 	members := []Member{
 		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
 	}
 	open := func(local NodeID) *StaticRegistry {
-		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 3})
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 4})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
-			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
-			SourceMember: 1, TargetMember: 3}); err != nil {
+		if err := registry.InstallTransitionGrant(authorityTestGrant(group)); err != nil {
 			t.Fatal(err)
 		}
 		return registry
@@ -48,7 +63,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	preLearnerIllegal := frameTestReplacePayload(t, initialFrame,
 		frameTestMessage(pb.MsgHeartbeat, 3, 2))
 	binary.BigEndian.PutUint64(preLearnerIllegal[frameTestFromOffset:frameTestToOffset], 3)
-	learner := &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	learner := &pb.ConfState{Voters: []uint64{1, 2, 4}, Learners: []uint64{3}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		if err := registry.PublishCommittedAuthority(group, 6, learner); err != nil {
 			t.Fatal(err)
@@ -68,7 +83,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 		t.Fatalf("old-generation learner-origin leader frame = %v", err)
 	}
 	learnerFrame := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 2))
-	voters := &pb.ConfState{Voters: []uint64{1, 2, 3}}
+	voters := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		if err := registry.PublishCommittedAuthority(group, 7, voters); err != nil {
 			t.Fatal(err)
@@ -83,7 +98,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	preRemovalSource := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 3))
 	preRemovalVote := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgVote, 1, 3))
 	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
-	removed := &pb.ConfState{Voters: []uint64{2, 3}}
+	removed := &pb.ConfState{Voters: []uint64{2, 3, 4}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		// Normal entries may separate configuration entries, so authority
 		// versions are monotonic log positions rather than consecutive counters.
@@ -115,17 +130,37 @@ func TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke(t *testing.T)
 		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
 	}
-	registry, err := NewStaticRegistry(testNode(1), members, Limits{MaxGroups: 1, MaxMembers: 3})
+	registry, err := NewStaticRegistry(testNode(1), members, Limits{MaxGroups: 1, MaxMembers: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{1},
-		MetadataEpoch: 7, CatalogGeneration: 9, SourceMember: 1, TargetMember: 3}
+	grant := authorityTestGrant(group)
 	forged := grant
-	forged.TargetMember = 4
+	forged.TargetMember = 5
 	if err = registry.InstallTransitionGrant(forged); !errors.Is(err, ErrMemberNotFound) {
 		t.Fatalf("unenrolled target install=%v", err)
+	}
+	forgedRoster := grant
+	forgedRoster.InitialRosterDigest[0] ^= 0xff
+	if err = registry.InstallTransitionGrant(forgedRoster); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("forged nonzero roster digest install=%v", err)
+	}
+	forgedTargetNode := grant
+	forgedTargetNode.TargetNode = [16]byte(testNode(9))
+	if err = registry.InstallTransitionGrant(forgedTargetNode); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("mismatched target enrollment install=%v", err)
+	}
+	mismatchedMembers := append([]Member(nil), members...)
+	mismatchedMembers[2].Node = testNode(9)
+	mismatchedPeer, peerErr := NewStaticRegistry(testNode(1), mismatchedMembers,
+		Limits{MaxGroups: 1, MaxMembers: 4})
+	if peerErr != nil {
+		t.Fatal(peerErr)
+	}
+	if peerErr = mismatchedPeer.InstallTransitionGrant(grant); !errors.Is(peerErr, ErrReplicaSet) {
+		t.Fatalf("peer with different target mapping install=%v", peerErr)
 	}
 
 	var wait sync.WaitGroup
@@ -153,19 +188,28 @@ func TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke(t *testing.T)
 	if err = registry.InstallTransitionGrant(stale); !errors.Is(err, ErrReplicaSet) {
 		t.Fatalf("live grant replacement=%v", err)
 	}
-	if err = registry.RevokeTransitionGrant(grant); !errors.Is(err, ErrReplicaSet) {
-		t.Fatalf("early revoke=%v", err)
+	if err = registry.RevokeTransitionGrant(grant); err != nil {
+		t.Fatalf("untouched rollback revoke=%v", err)
+	}
+	if err = registry.InstallTransitionGrant(grant); err != nil {
+		t.Fatalf("reinstall after rollback=%v", err)
 	}
 	if err = registry.PublishCommittedAuthority(group, 6,
-		&pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}); err != nil {
+		&pb.ConfState{Voters: []uint64{1, 2, 4}, Learners: []uint64{3}}); err != nil {
 		t.Fatal(err)
+	}
+	if err = registry.RevokeTransitionGrant(grant); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("intermediate learner revoke=%v", err)
 	}
 	if err = registry.PublishCommittedAuthority(group, 7,
-		&pb.ConfState{Voters: []uint64{1, 2, 3}}); err != nil {
+		&pb.ConfState{Voters: []uint64{1, 2, 3, 4}}); err != nil {
 		t.Fatal(err)
 	}
+	if err = registry.RevokeTransitionGrant(grant); !errors.Is(err, ErrReplicaSet) {
+		t.Fatalf("intermediate RF4 revoke=%v", err)
+	}
 	if err = registry.PublishCommittedAuthority(group, 8,
-		&pb.ConfState{Voters: []uint64{2, 3}}); err != nil {
+		&pb.ConfState{Voters: []uint64{2, 3, 4}}); err != nil {
 		t.Fatal(err)
 	}
 	if err = registry.RevokeTransitionGrant(stale); !errors.Is(err, ErrReplicaSet) {
@@ -185,18 +229,39 @@ func TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke(t *testing.T)
 	}
 }
 
+func TestTransitionGrantRefreshRollsBackDisappearedUntouchedAuthority(t *testing.T) {
+	group := testGroup(93)
+	registry, err := NewStaticRegistry(testNode(1), []Member{
+		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
+	}, Limits{MaxGroups: 1, MaxMembers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := authorityTestGrant(group)
+	source := &disappearingGrantSource{grant: grant}
+	if _, err = membershipgrant.Refresh(context.Background(), source, registry, group); !errors.Is(err, membershipgrant.ErrRefreshConflict) {
+		t.Fatalf("disappeared refresh=%v", err)
+	}
+	if current, found, lookupErr := registry.CurrentTransitionGrant(group); lookupErr != nil || found || current != (membershipgrant.Grant{}) {
+		t.Fatalf("rollback current=%+v found=%t err=%v", current, found, lookupErr)
+	}
+}
+
 func TestCurrentTransitionGrantWarmLookupAllocationFree(t *testing.T) {
 	group := testGroup(92)
 	registry, err := NewStaticRegistry(testNode(1), []Member{
 		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
-	}, Limits{MaxGroups: 1, MaxMembers: 3})
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
+	}, Limits{MaxGroups: 1, MaxMembers: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{1},
-		MetadataEpoch: 7, CatalogGeneration: 9, SourceMember: 1, TargetMember: 3}
+	grant := authorityTestGrant(group)
 	if err = registry.InstallTransitionGrant(grant); err != nil {
 		t.Fatal(err)
 	}
@@ -217,21 +282,20 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
 	}
 	open := func(local NodeID) *StaticRegistry {
-		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 3})
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 4})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
-			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
-			SourceMember: 1, TargetMember: 3}); err != nil {
+		if err := registry.InstallTransitionGrant(authorityTestGrant(group)); err != nil {
 			t.Fatal(err)
 		}
 		return registry
 	}
 	sender, lagging := open(testNode(1)), open(testNode(3))
-	learner := &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	learner := &pb.ConfState{Voters: []uint64{1, 2, 4}, Learners: []uint64{3}}
 	if err := sender.PublishCommittedAuthority(group, 8, learner); err != nil {
 		t.Fatal(err)
 	}
@@ -261,20 +325,19 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 		{Group: group, ReplicaSetVersion: 6, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 6, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 6, MemberID: 3, Node: testNode(3), Role: MemberLearner},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 4, Node: testNode(4), Role: MemberVoter},
 	}
 	open := func(local NodeID) *StaticRegistry {
-		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 3})
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 4})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
-			TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
-			SourceMember: 1, TargetMember: 3}); err != nil {
+		grant := authorityTestGrant(group)
+		if err = registry.InstallTransitionGrant(grant); err != nil {
 			t.Fatal(err)
 		}
 		proof := raftmember.DurablePromotionProof{Version: 8, TargetMember: 3,
-			AuthorizationDigest: raftmember.MembershipTransitionDigest(
-				group, [16]byte{1}, 7, 9, 1, 3)}
+			AuthorizationDigest: grant.Digest()}
 		wrong := proof
 		wrong.AuthorizationDigest[0] ^= 0xff
 		if err = registry.PublishDurablePromotion(group, wrong); !errors.Is(err, ErrReplicaSet) {
@@ -345,15 +408,14 @@ func TestLearnerWithoutCommittedPromotionWitnessCannotVote(t *testing.T) {
 		{Group: group, ReplicaSetVersion: 6, MemberID: 1, Node: testNode(1), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 6, MemberID: 2, Node: testNode(2), Role: MemberVoter},
 		{Group: group, ReplicaSetVersion: 6, MemberID: 3, Node: testNode(3), Role: MemberLearner},
+		{Group: group, ReplicaSetVersion: 6, MemberID: 4, Node: testNode(4), Role: MemberVoter},
 	}
 	registry, err := NewStaticRegistry(testNode(3), members,
-		Limits{MaxGroups: 1, MaxMembers: 3})
+		Limits{MaxGroups: 1, MaxMembers: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = registry.InstallTransitionGrant(membershipgrant.Grant{Group: group,
-		TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
-		SourceMember: 1, TargetMember: 3}); err != nil {
+	if err = registry.InstallTransitionGrant(authorityTestGrant(group)); err != nil {
 		t.Fatal(err)
 	}
 	response := frameTestMessage(pb.MsgVoteResp, 3, 2)
@@ -371,7 +433,7 @@ func authorizedConfigurationMessage(
 	member, from, to uint64,
 ) *pb.Message {
 	t.Helper()
-	digest := raftmember.MembershipTransitionDigest(group, [16]byte{1}, 7, 9, 1, 3)
+	digest := authorityTestGrant(group).Digest()
 	change := &pb.ConfChange{Type: kind.Enum(), NodeId: &member,
 		Context: append([]byte(nil), digest[:]...)}
 	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(change)
@@ -382,4 +444,20 @@ func authorizedConfigurationMessage(
 	message.Entries[0].Type = pb.EntryConfChange.Enum()
 	message.Entries[0].Data = data
 	return message
+}
+
+func authorityTestGrant(group raftmember.GroupKey) membershipgrant.Grant {
+	grant := membershipgrant.Grant{
+		Group: group, TransitionID: [16]byte{1}, MetadataEpoch: 7, CatalogGeneration: 9,
+		InitialReplicaSetVersion: 5, InitialVoters: [3]uint64{1, 2, 4},
+		InitialDescriptorDigest: [32]byte{2},
+		SourceMember:            1, TargetMember: 3, TargetNode: [16]byte(testNode(3)),
+	}
+	grant.InitialRosterDigest = membershipgrant.CertifiedRosterDigest(group, 5,
+		[3]membershipgrant.RosterMember{
+			{Member: 1, Node: [16]byte(testNode(1))},
+			{Member: 2, Node: [16]byte(testNode(2))},
+			{Member: 4, Node: [16]byte(testNode(4))},
+		})
+	return grant
 }

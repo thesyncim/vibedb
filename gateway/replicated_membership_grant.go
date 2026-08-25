@@ -29,16 +29,21 @@ const (
 )
 
 type persistedMembershipGrant struct {
-	ClusterID             [16]byte `json:"cluster_id"`
-	ClusterIncarnation    [16]byte `json:"cluster_incarnation"`
-	TopologyRecoveryEpoch uint64   `json:"topology_recovery_epoch"`
-	ShardIncarnation      [16]byte `json:"shard_incarnation"`
-	GroupID               [16]byte `json:"group_id"`
-	TransitionID          [16]byte `json:"transition_id"`
-	MetadataEpoch         uint64   `json:"metadata_epoch"`
-	CatalogGeneration     uint64   `json:"catalog_generation"`
-	SourceMember          uint64   `json:"source_member"`
-	TargetMember          uint64   `json:"target_member"`
+	ClusterID                [16]byte  `json:"cluster_id"`
+	ClusterIncarnation       [16]byte  `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch    uint64    `json:"topology_recovery_epoch"`
+	ShardIncarnation         [16]byte  `json:"shard_incarnation"`
+	GroupID                  [16]byte  `json:"group_id"`
+	TransitionID             [16]byte  `json:"transition_id"`
+	MetadataEpoch            uint64    `json:"metadata_epoch"`
+	CatalogGeneration        uint64    `json:"catalog_generation"`
+	InitialReplicaSetVersion uint64    `json:"initial_replica_set_version"`
+	InitialVoters            [3]uint64 `json:"initial_voters"`
+	InitialRosterDigest      [32]byte  `json:"initial_roster_digest"`
+	InitialDescriptorDigest  [32]byte  `json:"initial_descriptor_digest"`
+	SourceMember             uint64    `json:"source_member"`
+	TargetMember             uint64    `json:"target_member"`
+	TargetNode               [16]byte  `json:"target_node"`
 }
 
 type persistedMembershipGrantGroup struct {
@@ -78,7 +83,7 @@ func (authority *ReplicatedCatalogAuthority) ReadMembershipGrant(ctx context.Con
 		return membershipgrant.Grant{}, false, err
 	}
 	if currentCatalog == nil || grant.CatalogGeneration != currentCatalog.Generation() ||
-		!replicatedCatalogContainsGroup(currentCatalog, group) {
+		!replicatedCatalogCertifiesInitialGrant(currentCatalog, grant) {
 		return membershipgrant.Grant{}, false, ErrReplicatedCatalogConflict
 	}
 	return grant, true, nil
@@ -91,12 +96,13 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 	if authority == nil || authority.session == nil || ctx == nil || !grant.Valid() {
 		return ErrReplicatedCatalog
 	}
-	currentCatalog, err := authority.Read(ctx)
+	cut, err := authority.readCatalogCut(ctx)
 	if err != nil {
 		return err
 	}
+	currentCatalog := cut.snapshot
 	if currentCatalog == nil || grant.CatalogGeneration != currentCatalog.Generation() ||
-		!replicatedCatalogContainsGroup(currentCatalog, grant.Group) {
+		!replicatedCatalogCertifiesInitialGrant(currentCatalog, grant) {
 		return ErrReplicatedCatalogConflict
 	}
 	ctx, err = authority.authorizedContext(ctx)
@@ -150,8 +156,13 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 	if err != nil {
 		return err
 	}
-	mutations := []NativeMutation{{Kind: replication.MutationPutAbsentOrEqual,
-		Key: recordKey[:], Value: recordBytes}}
+	witness := cut.witness
+	witnessDigest := sha256.Sum256(witness)
+	mutations := []NativeMutation{{Kind: replication.MutationPutDigestEqual,
+		Key: replicatedCatalogHeadWitnessKey[:], Value: witness,
+		ExpectedValueLength: uint64(len(witness)), ExpectedValueDigest: replication.Digest(witnessDigest)},
+		{Kind: replication.MutationPutAbsentOrEqual,
+			Key: recordKey[:], Value: recordBytes}}
 	if !page.Found {
 		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
 			Key: pageKey[:], Value: authority.scratch})
@@ -165,16 +176,109 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 	return finishReplicatedMembershipGrantMutation(authority, native, err)
 }
 
-func replicatedCatalogContainsGroup(snapshot *Snapshot, group raftmember.GroupKey) bool {
-	if snapshot == nil || group == (raftmember.GroupKey{}) {
+func replicatedCatalogCertifiesInitialGrant(snapshot *Snapshot, grant membershipgrant.Grant) bool {
+	if snapshot == nil || !grant.Valid() {
 		return false
 	}
 	for index := range snapshot.replicatedShards {
-		if snapshot.replicatedShards[index].group == group {
-			return true
+		entry := snapshot.replicatedShards[index]
+		if entry.group != grant.Group || int(entry.replicaCount) != len(grant.InitialVoters) ||
+			entry.command.ReplicaSetVersion != grant.InitialReplicaSetVersion ||
+			int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) {
+			continue
 		}
+		var voters [3]uint64
+		for replica := range int(entry.replicaCount) {
+			voters[replica] = snapshot.replicatedReplicas[int(entry.replicaBase)+replica].Member
+		}
+		sort.Slice(voters[:], func(left, right int) bool { return voters[left] < voters[right] })
+		return voters == grant.InitialVoters &&
+			replicatedCatalogInitialRosterDigest(snapshot, index) == grant.InitialRosterDigest &&
+			replicatedCatalogInitialDescriptorDigest(snapshot, index) == grant.InitialDescriptorDigest
 	}
 	return false
+}
+
+func replicatedCatalogInitialRosterDigest(snapshot *Snapshot, shardIndex int) [sha256.Size]byte {
+	if snapshot == nil || shardIndex < 0 || shardIndex >= len(snapshot.replicatedShards) {
+		return [sha256.Size]byte{}
+	}
+	entry := snapshot.replicatedShards[shardIndex]
+	if int(entry.replicaCount) != ServingReplicaCount ||
+		int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) {
+		return [sha256.Size]byte{}
+	}
+	var voters [3]membershipgrant.RosterMember
+	for index := range voters {
+		replica := snapshot.replicatedReplicas[int(entry.replicaBase)+index]
+		voters[index] = membershipgrant.RosterMember{Member: replica.Member, Node: [16]byte(replica.Node)}
+	}
+	sort.Slice(voters[:], func(left, right int) bool { return voters[left].Member < voters[right].Member })
+	return membershipgrant.CertifiedRosterDigest(entry.group, entry.command.ReplicaSetVersion, voters)
+}
+
+func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int) [sha256.Size]byte {
+	if snapshot == nil || shardIndex < 0 || shardIndex >= len(snapshot.replicatedShards) {
+		return [sha256.Size]byte{}
+	}
+	entry := snapshot.replicatedShards[shardIndex]
+	if int(entry.replicaCount) != ServingReplicaCount ||
+		int(entry.replicaBase)+int(entry.replicaCount) > len(snapshot.replicatedReplicas) ||
+		int(entry.manifest) >= len(snapshot.config.Manifests) {
+		return [sha256.Size]byte{}
+	}
+	manifest := snapshot.config.Manifests[entry.manifest]
+	metadata, ok := manifest.ShardMetadataAt(int(entry.shard))
+	if !ok {
+		return [sha256.Size]byte{}
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/catalog/certified-initial-rf3\x00"))
+	var scalar [8]byte
+	writeUint64 := func(value uint64) {
+		binary.LittleEndian.PutUint64(scalar[:], value)
+		_, _ = hash.Write(scalar[:])
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		_, _ = hash.Write([]byte(value))
+	}
+	_, _ = hash.Write(entry.group.ClusterID[:])
+	_, _ = hash.Write(entry.group.ClusterIncarnation[:])
+	writeUint64(entry.group.TopologyRecoveryEpoch)
+	_, _ = hash.Write(entry.group.ShardIncarnation[:])
+	_, _ = hash.Write(entry.group.GroupID[:])
+	writeString(string(manifest.Distribution()))
+	writeString(string(metadata.ID))
+	writeUint64(uint64(entry.allocation))
+	writeUint64(entry.command.ReplicaSetVersion)
+	writeUint64(entry.command.ActivePolicyGeneration)
+	writeUint64(entry.command.ProtectionEpoch)
+	writeUint64(entry.command.OwnershipEpoch)
+	writeUint64(entry.command.SchemaGeneration)
+	_, _ = hash.Write(entry.command.RelationManifestDigest[:])
+	writeUint64(entry.command.RoutingVersion)
+	writeUint64(entry.command.RouteGeneration)
+	for ordinal := 0; ordinal < int(entry.replicaCount); ordinal++ {
+		replica := snapshot.replicatedReplicas[int(entry.replicaBase)+ordinal]
+		endpoint, endpointOK := manifest.ShardLeaderAt(int(entry.shard), ordinal)
+		if !endpointOK {
+			return [sha256.Size]byte{}
+		}
+		writeUint64(replica.Member)
+		_, _ = hash.Write(replica.Node[:])
+		_, _ = hash.Write(replica.StoreID[:])
+		writeUint64(replica.NodeIncarnation)
+		writeString(string(endpoint))
+		writeString(snapshot.endpoints[endpoint])
+		writeString(replica.NativeEndpoint)
+		writeString(replica.Address)
+		writeString(replica.ControlEndpoint)
+		writeString(replica.ControlAddress)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 // RevokeMembershipGrant removes only the byte-identical expected grant. An
@@ -414,8 +518,13 @@ func persistMembershipGrant(grant membershipgrant.Grant) persistedMembershipGran
 		TopologyRecoveryEpoch: grant.Group.TopologyRecoveryEpoch,
 		ShardIncarnation:      grant.Group.ShardIncarnation, GroupID: grant.Group.GroupID,
 		TransitionID: grant.TransitionID, MetadataEpoch: grant.MetadataEpoch,
-		CatalogGeneration: grant.CatalogGeneration,
-		SourceMember:      grant.SourceMember, TargetMember: grant.TargetMember,
+		CatalogGeneration:        grant.CatalogGeneration,
+		InitialReplicaSetVersion: grant.InitialReplicaSetVersion,
+		InitialVoters:            grant.InitialVoters,
+		InitialRosterDigest:      grant.InitialRosterDigest,
+		InitialDescriptorDigest:  grant.InitialDescriptorDigest,
+		SourceMember:             grant.SourceMember, TargetMember: grant.TargetMember,
+		TargetNode: grant.TargetNode,
 	}
 }
 
@@ -427,7 +536,12 @@ func openPersistedMembershipGrant(persisted persistedMembershipGrant) membership
 			ShardIncarnation:      persisted.ShardIncarnation, GroupID: persisted.GroupID,
 		},
 		TransitionID: persisted.TransitionID, MetadataEpoch: persisted.MetadataEpoch,
-		CatalogGeneration: persisted.CatalogGeneration,
-		SourceMember:      persisted.SourceMember, TargetMember: persisted.TargetMember,
+		CatalogGeneration:        persisted.CatalogGeneration,
+		InitialReplicaSetVersion: persisted.InitialReplicaSetVersion,
+		InitialVoters:            persisted.InitialVoters,
+		InitialRosterDigest:      persisted.InitialRosterDigest,
+		InitialDescriptorDigest:  persisted.InitialDescriptorDigest,
+		SourceMember:             persisted.SourceMember, TargetMember: persisted.TargetMember,
+		TargetNode: persisted.TargetNode,
 	}
 }

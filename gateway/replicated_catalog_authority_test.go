@@ -29,11 +29,93 @@ type catalogAuthorityClient struct {
 	unknownState      shardservice.ReplicatedMemberState
 	wantAuthority     serviceauthz.Authority
 	readMaximums      []uint32
+	onRead            func([]byte)
+}
+
+func TestReplicatedMembershipGrantCatalogWitnessClosesStaleInterleaving(t *testing.T) {
+	authority, client, current := newCatalogAuthorityFixture(t)
+	grant := testReplicatedMembershipGrant(authority.route.Group)
+	grant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(current, 0)
+	grant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(current, 0)
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	next, err := NewSnapshotWithReplicatedMetadata(config, endpoints, current.Generation()+1,
+		nil, nil, []ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSession, err := NewNativeSession(NativeSessionOptions{
+		Executor: authority.executor, Route: authority.route,
+		Distribution: string(ReplicatedCatalogDistribution), Shard: string(ReplicatedCatalogShard),
+		Tenant: []byte("control-plane"), ClientID: replication.ID128{0x72},
+		Resolver:           BaseRelationResolver{Relation: authority.relation},
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 3,
+		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized, err := serviceauthz.WithAuthority(context.Background(), authority.authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = secondSession.Open(authorized, 1<<50); err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewReplicatedCatalogAuthority(ReplicatedCatalogAuthorityOptions{
+		Executor: authority.executor, Route: authority.route, Relation: authority.relation,
+		Holder: NewCatalogHolder(current), Session: secondSession, Authority: authority.authority,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pageKey := replicatedMembershipGrantKeys(grant.Group)
+	client.onRead = func(key []byte) {
+		if !bytes.Equal(key, pageKey[:]) {
+			return
+		}
+		client.onRead = nil
+		if publishErr := second.Publish(context.Background(), current.Generation(), next); publishErr != nil {
+			t.Fatalf("interleaved catalog publication=%v", publishErr)
+		}
+	}
+	if err = authority.PublishMembershipGrant(context.Background(), grant); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("stale interleaved grant=%v", err)
+	}
+	recordKey, _ := replicatedMembershipGrantKeys(grant.Group)
+	if _, found := client.rows[string(recordKey[:])]; found {
+		t.Fatal("stale witness conflict partially installed a grant record")
+	}
+}
+
+func TestReplicatedCatalogHeadWitnessCanonicalAndFailClosed(t *testing.T) {
+	authority, client, current := newCatalogAuthorityFixture(t)
+	head := client.rows[string(replicatedCatalogHeadKey)]
+	witness := client.rows[string(replicatedCatalogHeadWitnessKey)]
+	canonical, err := appendReplicatedCatalogHeadWitness(nil, current.Generation(), head)
+	if err != nil || !bytes.Equal(canonical, witness) {
+		t.Fatalf("canonical witness=%x err=%v", canonical, err)
+	}
+	if err = validateReplicatedCatalogHeadWitness(append(append([]byte(nil), witness...), ' '),
+		current.Generation(), head); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("trailing witness=%v", err)
+	}
+	client.rows[string(replicatedCatalogHeadWitnessKey)] = append([]byte(nil), witness...)
+	client.rows[string(replicatedCatalogHeadWitnessKey)][len(witness)-2] ^= 1
+	if _, err = authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("corrupt witness read=%v", err)
+	}
+	delete(client.rows, string(replicatedCatalogHeadWitnessKey))
+	if _, err = authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("missing witness read=%v", err)
+	}
 }
 
 func TestReplicatedMembershipGrantCanonicalCASUnknownRetryAndRevoke(t *testing.T) {
-	authority, client, _ := newCatalogAuthorityFixture(t)
+	authority, client, current := newCatalogAuthorityFixture(t)
 	grant := testReplicatedMembershipGrant(authority.route.Group)
+	grant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(current, 0)
+	grant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(current, 0)
 	raw, err := appendReplicatedMembershipGrant(nil, grant)
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +269,10 @@ func TestReplicatedMembershipGrantPageBoundOrderAndCanonicality(t *testing.T) {
 func testReplicatedMembershipGrant(group raftmember.GroupKey) membershipgrant.Grant {
 	return membershipgrant.Grant{
 		Group: group, TransitionID: [16]byte{0x91}, MetadataEpoch: 7,
-		CatalogGeneration: 5, SourceMember: 1, TargetMember: 3,
+		CatalogGeneration: 5, InitialReplicaSetVersion: 1,
+		InitialVoters: [3]uint64{1, 2, 3}, InitialRosterDigest: [32]byte{1},
+		InitialDescriptorDigest: [32]byte{2}, SourceMember: 1, TargetMember: 4,
+		TargetNode: [16]byte{4},
 	}
 }
 
@@ -206,6 +291,9 @@ func (client *catalogAuthorityClient) DoReplicated(
 	if request.Operation == shardservice.ReplicatedReadLeader ||
 		request.Operation == shardservice.ReplicatedReadFollower {
 		client.readMaximums = append(client.readMaximums, request.MaxValueBytes)
+		if client.onRead != nil {
+			client.onRead(request.Key)
+		}
 		value, found := client.rows[string(request.Key)]
 		kind := shardservice.ReplicatedReadMissing
 		if found {
@@ -384,6 +472,11 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	client.rows[string(replicatedCatalogHeadKey[:])] = raw
+	witness, err := appendReplicatedCatalogHeadWitness(nil, current.Generation(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.rows[string(replicatedCatalogHeadWitnessKey)] = witness
 	executor, err := NewReplicatedExecutor(client, 2, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +486,7 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		Shard: string(ReplicatedCatalogShard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
 		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 2,
+		MaxRelationBatches: 1, MaxMutations: 3,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {

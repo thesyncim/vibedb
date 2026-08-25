@@ -278,8 +278,25 @@ func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Gra
 	if _, err := registry.Node(grant.Group, grant.SourceMember); err != nil {
 		return err
 	}
-	if _, err := registry.Node(grant.Group, grant.TargetMember); err != nil {
+	targetNode, err := registry.Node(grant.Group, grant.TargetMember)
+	if err != nil {
 		return err
+	}
+	if [16]byte(targetNode) != grant.TargetNode {
+		return ErrReplicaSet
+	}
+	var initial [3]membershipgrant.RosterMember
+	for index, memberID := range grant.InitialVoters {
+		node, err := registry.Node(grant.Group, memberID)
+		if err != nil {
+			return err
+		}
+		initial[index] = membershipgrant.RosterMember{Member: memberID, Node: [16]byte(node)}
+	}
+	if membershipgrant.CertifiedRosterDigest(
+		grant.Group, grant.InitialReplicaSetVersion, initial,
+	) != grant.InitialRosterDigest {
+		return ErrReplicaSet
 	}
 	for {
 		current := slot.view.Load()
@@ -287,7 +304,7 @@ func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Gra
 			return nil
 		}
 		if current.grant != (membershipgrant.Grant{}) ||
-			!grantFitsCommittedRoles(current.roles, grant) || current.promotion != nil {
+			!grantFitsCommittedCut(current, grant) || current.promotion != nil {
 			return ErrReplicaSet
 		}
 		next := *current
@@ -299,10 +316,23 @@ func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Gra
 	}
 }
 
-func grantFitsCommittedRoles(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
-	source, target := roles[grant.SourceMember], roles[grant.TargetMember]
-	return source == MemberVoter &&
-		(target == MemberEnrolled || target == MemberLearner || target == MemberVoter) ||
+func grantFitsCommittedCut(current *authorityView, grant membershipgrant.Grant) bool {
+	if current == nil || current.version < grant.InitialReplicaSetVersion {
+		return false
+	}
+	source, target := current.roles[grant.SourceMember], current.roles[grant.TargetMember]
+	if current.version == grant.InitialReplicaSetVersion {
+		if source != MemberVoter || target != MemberEnrolled || len(current.roles) != len(grant.InitialVoters) {
+			return false
+		}
+		for _, voter := range grant.InitialVoters {
+			if current.roles[voter] != MemberVoter {
+				return false
+			}
+		}
+		return true
+	}
+	return source == MemberVoter && (target == MemberLearner || target == MemberVoter) ||
 		source == MemberEnrolled && target == MemberVoter
 }
 
@@ -321,9 +351,9 @@ func (registry *StaticRegistry) CurrentTransitionGrant(
 	return grant, grant != (membershipgrant.Grant{}), nil
 }
 
-// RevokeTransitionGrant clears only the exact completed transition. Source
-// removal must already be committed and the target promoted before catalog
-// absence can revoke runtime authority.
+// RevokeTransitionGrant clears only the exact untouched or completed
+// transition. Intermediate learner/RF4 cuts remain non-revocable so recovery
+// cannot strand a partially changed Raft configuration without its authority.
 func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.Grant) error {
 	if registry == nil || !expected.Valid() {
 		return ErrInvalidMember
@@ -334,8 +364,12 @@ func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.G
 	}
 	for {
 		current := slot.view.Load()
-		if current.roles[expected.SourceMember] != MemberEnrolled ||
-			current.roles[expected.TargetMember] != MemberVoter || current.promotion != nil {
+		untouched := current.version == expected.InitialReplicaSetVersion &&
+			grantFitsCommittedCut(current, expected)
+		completed := current.version > expected.InitialReplicaSetVersion &&
+			current.roles[expected.SourceMember] == MemberEnrolled &&
+			current.roles[expected.TargetMember] == MemberVoter
+		if (!untouched && !completed) || current.promotion != nil {
 			return ErrReplicaSet
 		}
 		if current.grant == (membershipgrant.Grant{}) {

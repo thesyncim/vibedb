@@ -38,7 +38,10 @@ func (*membershipTestAuthority) ClearDurablePromotion(raftmember.GroupKey) error
 
 func TestMembershipTransitionOrderingAuthorizationAndStaleReplay(t *testing.T) {
 	authority := membershipgrant.Grant{Group: membershipTestGroup(), TransitionID: [16]byte{1}, MetadataEpoch: 7,
-		CatalogGeneration: 11, SourceMember: 1, TargetMember: 3}
+		CatalogGeneration: 11, InitialReplicaSetVersion: 5,
+		InitialVoters: [3]uint64{1, 2, 4}, InitialRosterDigest: [32]byte{1},
+		InitialDescriptorDigest: [32]byte{2},
+		SourceMember:            1, TargetMember: 3, TargetNode: [16]byte{3}}
 	request := MembershipRequest{Fence: ServingFence{Group: authority.Group}, Kind: MembershipAddLearner,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 5,
@@ -91,7 +94,10 @@ func TestMembershipTransitionOrderingAuthorizationAndStaleReplay(t *testing.T) {
 
 func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
 	authority := membershipgrant.Grant{Group: membershipTestGroup(), TransitionID: [16]byte{2}, MetadataEpoch: 8,
-		CatalogGeneration: 12, SourceMember: 1, TargetMember: 3}
+		CatalogGeneration: 12, InitialReplicaSetVersion: 7,
+		InitialVoters: [3]uint64{1, 2, 4}, InitialRosterDigest: [32]byte{1},
+		InitialDescriptorDigest: [32]byte{2},
+		SourceMember:            1, TargetMember: 3, TargetNode: [16]byte{3}}
 	request := MembershipRequest{Fence: ServingFence{Group: authority.Group}, Kind: MembershipRemoveVoter,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 9,
@@ -119,7 +125,10 @@ func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
 func TestQueuedMembershipReadsLiveGrantAfterExactRevocation(t *testing.T) {
 	group := membershipTestGroup()
 	grant := membershipgrant.Grant{Group: group, TransitionID: [16]byte{3},
-		MetadataEpoch: 4, CatalogGeneration: 5, SourceMember: 1, TargetMember: 3}
+		MetadataEpoch: 4, CatalogGeneration: 5, InitialReplicaSetVersion: 1,
+		InitialVoters: [3]uint64{1, 2, 4}, InitialRosterDigest: [32]byte{1},
+		InitialDescriptorDigest: [32]byte{2},
+		SourceMember:            1, TargetMember: 3, TargetNode: [16]byte{3}}
 	authority := &membershipTestAuthority{grant: grant, found: true}
 	owner := &Owner{
 		started: true, ingress: make(chan ownerRequest, 1),

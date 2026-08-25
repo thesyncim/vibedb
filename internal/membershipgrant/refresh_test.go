@@ -86,7 +86,12 @@ func refreshTestGrant() (grant Grant) {
 	grant.TransitionID[0] = 6
 	grant.MetadataEpoch = 7
 	grant.CatalogGeneration = 8
+	grant.InitialReplicaSetVersion = 9
+	grant.InitialVoters = [3]uint64{1, 2, 4}
+	grant.InitialRosterDigest = [32]byte{10}
+	grant.InitialDescriptorDigest = [32]byte{11}
 	grant.SourceMember = 1
 	grant.TargetMember = 3
+	grant.TargetNode = [16]byte{3}
 	return grant
 }

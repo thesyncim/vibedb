@@ -1018,9 +1018,7 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		progress, progressFound); err != nil {
 		return err
 	}
-	authorizationDigest := raftmember.MembershipTransitionDigest(request.Fence.Group,
-		authority.TransitionID, authority.MetadataEpoch, authority.CatalogGeneration,
-		authority.SourceMember, authority.TargetMember)
+	authorizationDigest := authority.Digest()
 	context := append([]byte(nil), authorizationDigest[:]...)
 	switch request.Kind {
 	case MembershipAddLearner:
