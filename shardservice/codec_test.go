@@ -398,7 +398,9 @@ func TestRequestRoundTrip(t *testing.T) {
 			if got.Transaction.Operation != tc.req.Transaction.Operation ||
 				got.Transaction.ID != tc.req.Transaction.ID ||
 				got.Transaction.Revision != tc.req.Transaction.Revision ||
-				!bytes.Equal(got.Transaction.Record, tc.req.Transaction.Record) {
+				got.Transaction.SegmentIndex != tc.req.Transaction.SegmentIndex ||
+				!bytes.Equal(got.Transaction.Record, tc.req.Transaction.Record) ||
+				!bytes.Equal(got.Transaction.ManifestSegment, tc.req.Transaction.ManifestSegment) {
 				t.Errorf("Transaction = %+v, want %+v", got.Transaction, tc.req.Transaction)
 			}
 			if got.ReadFenceID != tc.req.ReadFenceID {
