@@ -11,6 +11,8 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -328,23 +330,51 @@ func (s *Server) ServeConn(conn net.Conn) {
 	s.serveAdmitted(conn)
 }
 
+// ServeAuthorizedConn is the production gateway-to-shard boundary. It retains
+// the TLS-derived gateway principal and applies the same generation-bound
+// policy to both that delegate and every forwarded end-user request.
+func (s *Server) ServeAuthorizedConn(connection rafttransport.PeerConnection,
+	gate *serviceauthz.Gate, audit serviceauthz.AuditSink) {
+	if connection == nil || gate == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardSQL {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return
+	}
+	if !s.admitConnection(connection) {
+		_ = connection.Close()
+		return
+	}
+	s.serveAdmittedAuthorized(connection, connection.PeerIdentity().Node, gate, audit)
+}
+
 // serveAdmitted runs an admitted connection and reports its terminal error only
 // after every resource and shutdown-accounting entry is released, so OnError may
 // reentrantly call Close.
 func (s *Server) serveAdmitted(conn net.Conn) {
-	err := s.serveConn(conn)
+	err := s.serveConn(conn, rafttransport.NodeID{}, nil, nil)
 	if err != nil && s.opts.OnError != nil {
 		s.opts.OnError(err)
 	}
 }
 
-func (s *Server) serveConn(nc net.Conn) error {
+func (s *Server) serveAdmittedAuthorized(conn net.Conn, peer rafttransport.NodeID,
+	gate *serviceauthz.Gate, audit serviceauthz.AuditSink) {
+	err := s.serveConn(conn, peer, gate, audit)
+	if err != nil && s.opts.OnError != nil {
+		s.opts.OnError(err)
+	}
+}
+
+func (s *Server) serveConn(nc net.Conn, peer rafttransport.NodeID,
+	gate *serviceauthz.Gate, audit serviceauthz.AuditSink) error {
 	// Done was added by admitConnection. Declare it before the resource defers
 	// so LIFO ordering removes and closes the connection first.
 	defer s.wg.Done()
 	defer s.releaseConnection(nc)
 	defer nc.Close()
-	c := &shardConn{server: s, nc: nc}
+	c := &shardConn{server: s, nc: nc, peer: peer, authorization: gate, audit: audit}
 	defer func() {
 		if c.sess != nil {
 			_ = c.sess.Close()

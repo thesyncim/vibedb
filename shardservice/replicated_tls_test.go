@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
@@ -32,6 +33,19 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 		Status: raftmember.RuntimeStatus{MemberID: fence.MemberID, LeaderID: fence.MemberID,
 			Term: fence.Term, Commit: 8, Applied: 8, CheckpointApplied: 7}}
 	server := testReplicatedServer(&fakeReplicatedOwner{state: state})
+	client := rafttransport.NodeID{101}
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{
+		{Node: firstIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
+		{Node: secondIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
+		{Node: client, Capabilities: serviceauthz.CapabilityDataRead},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, _ := serviceauthz.NewGate(policy)
+	if err = server.BindAuthorization(gate, nil); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +61,9 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 		}
 		return profile.Client(ctx, raw, serverIdentity.Node, rafttransport.TrafficShardNative, deadline)
 	}
-	request := &ReplicatedRequest{Operation: ReplicatedProbe, Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}
+	request := &ReplicatedRequest{Operation: ReplicatedProbe,
+		Authority: serviceauthz.Authority{Node: client, Generation: 1},
+		Fence:     ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}
 	first, err := dial(firstProfile)
 	if err != nil {
 		t.Fatal(err)

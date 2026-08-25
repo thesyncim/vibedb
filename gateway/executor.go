@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -71,6 +72,10 @@ type Options struct {
 	// Refresh supplies a newer generation on a stale-generation retry. Nil
 	// re-reads the catalog holder.
 	Refresh RefreshFunc
+	// InternalAuthority is the gateway service principal used only by the
+	// autonomous transaction-recovery loop. It must be explicitly configured
+	// by authenticated production startup; the zero value cannot forward.
+	InternalAuthority serviceauthz.Authority
 }
 
 // defaultMaxRetries bounds stale-generation retries when Options leaves it zero.
@@ -79,13 +84,14 @@ const defaultMaxRetries = 2
 // Executor routes and dispatches bounded distributed reads over a pinned catalog
 // generation. It is safe for concurrent use.
 type Executor struct {
-	client   *Client
-	catalog  *CatalogHolder
-	profiles map[OperationClass]Profile
-	refresh  RefreshFunc
-	maxRetry int
-	routers  *routerPool
-	metrics  Metrics
+	client            *Client
+	catalog           *CatalogHolder
+	profiles          map[OperationClass]Profile
+	refresh           RefreshFunc
+	maxRetry          int
+	routers           *routerPool
+	metrics           Metrics
+	internalAuthority serviceauthz.Authority
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -106,12 +112,13 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 		maxRetry = 0
 	}
 	return &Executor{
-		client:   client,
-		catalog:  catalog,
-		profiles: profiles,
-		refresh:  opts.Refresh,
-		maxRetry: maxRetry,
-		routers:  newRouterPool(),
+		client:            client,
+		catalog:           catalog,
+		profiles:          profiles,
+		refresh:           opts.Refresh,
+		maxRetry:          maxRetry,
+		routers:           newRouterPool(),
+		internalAuthority: opts.InternalAuthority,
 	}
 }
 

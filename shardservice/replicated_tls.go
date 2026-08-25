@@ -131,7 +131,7 @@ func (capability *ReplicatedServerTLS) Stats() ReplicatedServerTLSStats {
 // ServeAuthenticated is the production RF3 listener. Raw connection and TLS
 // handshake slots are both immediate hard bounds; excess sockets are closed.
 func (server *ReplicatedServer) ServeAuthenticated(ctx context.Context, listener net.Listener, capability *ReplicatedServerTLS, handshakeDeadline rafttransport.DeadlineFunc, maxConnections, maxHandshakes int) error {
-	if server == nil || server.owner == nil || ctx == nil || listener == nil || capability == nil || handshakeDeadline == nil ||
+	if server == nil || server.owner == nil || server.authorization == nil || ctx == nil || listener == nil || capability == nil || handshakeDeadline == nil ||
 		maxConnections <= 0 || maxConnections > AbsoluteMaxReplicatedConnections || maxHandshakes <= 0 || maxHandshakes > maxConnections ||
 		!server.state.CompareAndSwap(replicatedServerReady, replicatedServerRunning) {
 		return ErrReplicatedWire
@@ -188,7 +188,8 @@ func (server *ReplicatedServer) ServeAuthenticated(ctx context.Context, listener
 			capability.authenticated.Add(1)
 			defer capability.release(connection)
 			defer connection.Close()
-			if err := server.ServeReplicatedConn(ctx, connection); err != nil && context.Cause(ctx) == nil {
+			if err := server.serveReplicatedConn(ctx, connection,
+				connection.PeerIdentity().Node, true); err != nil && context.Cause(ctx) == nil {
 				server.failed.Add(1)
 			}
 		}(raw)

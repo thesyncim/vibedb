@@ -6,8 +6,31 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+func TestRecoveryContextUsesOnlyExplicitInternalAuthority(t *testing.T) {
+	var node rafttransport.NodeID
+	node[0] = 41
+	authority := serviceauthz.Authority{Node: node, Generation: 8}
+	executor := &Executor{internalAuthority: authority}
+	ctx := executor.recoveryContext(context.Background())
+	if got, ok := serviceauthz.FromContext(ctx); !ok || got != authority {
+		t.Fatalf("recovery authority=%+v present=%t", got, ok)
+	}
+	var externalNode rafttransport.NodeID
+	externalNode[0] = 42
+	external := serviceauthz.Authority{Node: externalNode, Generation: 7}
+	externalCtx, _ := serviceauthz.WithAuthority(context.Background(), external)
+	if got, ok := serviceauthz.FromContext(executor.recoveryContext(externalCtx)); !ok || got != external {
+		t.Fatalf("caller authority was replaced: %+v present=%t", got, ok)
+	}
+	if _, ok := serviceauthz.FromContext((&Executor{}).recoveryContext(context.Background())); ok {
+		t.Fatal("zero internal authority was synthesized")
+	}
+}
 
 func recoveryTestID(seed byte) distributedtxn.ID {
 	var id distributedtxn.ID

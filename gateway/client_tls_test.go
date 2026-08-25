@@ -9,9 +9,49 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+func TestAuthorizedClientTLSRotationIsOneMonotonicPublication(t *testing.T) {
+	authority := newGatewayTLSAuthority(t)
+	serverIdentity := gatewayPeerIdentity(7, 10)
+	clientIdentity := gatewayPeerIdentity(7, 30)
+	first, err := serviceauthz.NewPolicy(4, []serviceauthz.Entry{{
+		Node: clientIdentity.Node, Capabilities: serviceauthz.CapabilityDataRead,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, err := NewAuthorizedClientTLS(authority.profile(t, serverIdentity), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := capability.Stats().Generation
+	stale, _ := serviceauthz.NewPolicy(4, []serviceauthz.Entry{{
+		Node: clientIdentity.Node, Capabilities: serviceauthz.CapabilityDataWrite,
+	}})
+	if err = capability.RotateAuthorization(authority.profile(t, serverIdentity), stale); err == nil {
+		t.Fatal("equal policy generation rotated TLS")
+	}
+	if got := capability.Stats().Generation; got != before {
+		t.Fatalf("failed policy publication changed TLS generation: %d -> %d", before, got)
+	}
+	if err = capability.RotateClientTLS(authority.profile(t, serverIdentity),
+		[]rafttransport.NodeID{clientIdentity.Node}); err == nil {
+		t.Fatal("authorized capability admitted an unbound TLS-only rotation")
+	}
+	next, _ := serviceauthz.NewPolicy(5, []serviceauthz.Entry{{
+		Node: clientIdentity.Node, Capabilities: serviceauthz.CapabilityDataWrite,
+	}})
+	if err = capability.RotateAuthorization(authority.profile(t, serverIdentity), next); err != nil {
+		t.Fatal(err)
+	}
+	if capability.gate.Generation() != 5 || capability.Stats().Generation != before+1 {
+		t.Fatalf("publication gate=%d TLS=%d", capability.gate.Generation(), capability.Stats().Generation)
+	}
+}
 
 func TestClientTLSAuthenticatesAuthorizesRotatesAndSeparatesALPN(t *testing.T) {
 	authority := newGatewayTLSAuthority(t)
