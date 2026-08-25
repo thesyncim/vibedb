@@ -397,10 +397,12 @@ func (s *ReplicatedChildStage) activate(
 			"%w: checkpoint-group membership", ErrReplicatedApplyMismatch,
 		)
 	}
-	if err := core.checkpointGroup.Seed(
-		seed, groupMembers[0], identity.TxnLimits, seedKey,
-	); err != nil {
-		return result, fmt.Errorf("vibedb: publish replicated child seed: %w", err)
+	if core.checkpointGroup.SeedActivationPending() {
+		if err := core.checkpointGroup.Seed(
+			seed, groupMembers[0], identity.TxnLimits, seedKey,
+		); err != nil {
+			return result, fmt.Errorf("vibedb: publish replicated child seed: %w", err)
+		}
 	}
 	machine, base, manifest, err := prepared.Finish(core.checkpointGroup)
 	if err != nil {

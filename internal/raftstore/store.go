@@ -1054,6 +1054,38 @@ func (store *Store) CurrentIncarnation() uint64 {
 	return store.current.currentIncarnation
 }
 
+// ResumePristineIncarnation reclaims an already minted incarnation only while
+// the authenticated WAL proves that incarnation never persisted a Ready or
+// changed the immutable snapshot-base image. This narrow activation-retry seam
+// is safe because no Raft output can be emitted before its Ready is persisted.
+// Ordinary process restart must use BeginIncarnation and may never call this.
+func (store *Store) ResumePristineIncarnation(expected uint64) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.checkBaseLocked(); err != nil {
+		return err
+	}
+	base := bootstrapImage(store.header.snapshot)
+	if expected == 0 || expected == math.MaxUint64 || store.begun || store.pending != nil ||
+		store.generation.present || store.recoveredTornSlot ||
+		store.current.currentIncarnation != expected ||
+		store.current.generation != expected+1 ||
+		store.current.recordSequence != 1 || store.current.retryPresent ||
+		store.current.retry != (retryKey{}) || store.current.retryDigest != ([32]byte{}) ||
+		store.current.first != store.header.reference.index+1 ||
+		store.current.last != store.header.reference.index ||
+		len(store.image.entries) != 0 || store.image.liveBytes != 0 ||
+		!proto.Equal(store.current.hard, base.hard) || !proto.Equal(store.image.hard, base.hard) {
+		return persistenceError("resume pristine incarnation", false, ErrInvalid)
+	}
+	store.begun = true
+	store.observedReadyID = 0
+	store.observedReadyDigest = [32]byte{}
+	store.attemptedReady = retryKey{}
+	store.attemptedReadyDigest = [32]byte{}
+	return nil
+}
+
 // CapacityProfile returns the authenticated static-base and sealed live-entry
 // bound used by higher-level admission proofs. It neither reserves WAL space
 // nor predicts whether ReserveReady will succeed for the next input.

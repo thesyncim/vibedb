@@ -2065,7 +2065,7 @@ func TestCheckpointGroupActivationLeaseClosesDirectoryScanRace(t *testing.T) {
 	}
 }
 
-func TestCheckpointGroupActivationPostRenameFailureFailsClosed(t *testing.T) {
+func TestCheckpointGroupActivationPostRenameFailureSettlesExactCertificate(t *testing.T) {
 	db, err := OpenDatabase(
 		t.TempDir(), DatabaseOptions{Options: txnTestOptions()},
 	)
@@ -2090,8 +2090,10 @@ func TestCheckpointGroupActivationPostRenameFailureFailsClosed(t *testing.T) {
 	}
 	injected := errors.New("injected checkpoint certificate directory sync")
 	previousHook := checkpointGroupFaultHook
+	fired := false
 	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
-		if point == checkpointGroupAfterCertificateRename {
+		if !fired && point == checkpointGroupAfterCertificateRename {
+			fired = true
 			return injected
 		}
 		return nil
@@ -2100,10 +2102,10 @@ func TestCheckpointGroupActivationPostRenameFailureFailsClosed(t *testing.T) {
 		log, members, CheckpointGroupOptions{},
 	)
 	checkpointGroupFaultHook = previousHook
-	if group != nil || !errors.Is(activationErr, injected) ||
-		!errors.Is(activationErr, ErrCommitOutcomeUnknown) {
+	if !fired || group == nil || activationErr != nil {
 		t.Fatalf("post-rename activation = group %v, error %v", group, activationErr)
 	}
+	t.Cleanup(func() { _ = group.Close() })
 	if _, err := os.Stat(filepath.Join(db.Dir(), checkpointGroupFilename)); err != nil {
 		t.Fatalf("published certificate is not visible: %v", err)
 	}
@@ -2111,19 +2113,19 @@ func TestCheckpointGroupActivationPostRenameFailureFailsClosed(t *testing.T) {
 		if _, err := member.Collection.Put(
 			[]byte("forbidden"), []byte(`{"n":1}`),
 		); !errors.Is(err, ErrCheckpointGroupOwned) {
-			t.Fatalf("member %q Put after uncertain activation = %v", member.Name, err)
+			t.Fatalf("member %q Put after settled activation = %v", member.Name, err)
 		}
 		if err := member.Collection.Flush(); !errors.Is(err, ErrCheckpointGroupOwned) {
-			t.Fatalf("member %q Flush after uncertain activation = %v", member.Name, err)
+			t.Fatalf("member %q Flush after settled activation = %v", member.Name, err)
 		}
 	}
 	if err := UpdateCollections(
 		log, members, defaultTxnLimits(), func(*DatabaseBatch) error { return nil },
 	); !errors.Is(err, ErrCheckpointGroupOwned) {
-		t.Fatalf("UpdateCollections after uncertain activation = %v", err)
+		t.Fatalf("UpdateCollections after settled activation = %v", err)
 	}
 	if _, err := db.CreateCollection("extra", txnTestOptions()); !errors.Is(err, ErrCheckpointGroupOwned) {
-		t.Fatalf("CreateCollection after uncertain activation = %v", err)
+		t.Fatalf("CreateCollection after settled activation = %v", err)
 	}
 	directPath := filepath.Join(db.Dir(), "direct.vjc")
 	direct, err := os.OpenFile(directPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
@@ -2146,8 +2148,11 @@ func TestCheckpointGroupActivationPostRenameFailureFailsClosed(t *testing.T) {
 	if err := os.Remove(filepath.Join(crashAbsent, checkpointGroupFilename)); err != nil {
 		t.Fatal(err)
 	}
+	if err := group.Close(); err != nil {
+		t.Fatalf("settled group close: %v", err)
+	}
 	if err := db.Close(); err != nil {
-		t.Fatalf("resource close after terminal activation fence: %v", err)
+		t.Fatalf("resource close after settled activation: %v", err)
 	}
 
 	openRequests := func(dir string) ([]TransactionCollectionOpen, []*os.File) {

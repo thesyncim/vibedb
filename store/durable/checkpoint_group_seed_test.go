@@ -103,6 +103,48 @@ func TestCheckpointGroupSeedCertifiesImportedStateAndReopens(t *testing.T) {
 	}
 }
 
+func TestCheckpointGroupSeedCertifiesAlreadyImportedSeedMemberImage(t *testing.T) {
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	seed := CheckpointGroupSeed{
+		Applied: 9, Member: "system", Envelope: []byte(`{"state":"imported"}`),
+	}
+	if _, err := members[0].Collection.Put([]byte("state"), seed.Envelope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := members[0].Collection.Put([]byte("session"), []byte(`"retained"`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := members[1].Collection.Put([]byte("row"), []byte(`"value"`)); err != nil {
+		t.Fatal(err)
+	}
+	seed.Images = make([]CheckpointGroupSeedImage, 0, len(members))
+	for _, member := range members {
+		seed.Images = append(seed.Images, CheckpointGroupSeedImage{
+			Collection: member.Collection, Generation: member.Collection.Generation(),
+		})
+	}
+	group, err := NewSeededCheckpointGroup(log, members, seed, CheckpointGroupOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = group.Seed(seed, members[0], defaultTxnLimits(), []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	crashImage := copyCheckpointGroupDirectory(t, dir)
+	collections, _, reopened := openCheckpointGroupTestCopy(t, crashImage)
+	defer reopened.Close()
+	for _, check := range []struct {
+		collection int
+		key, value []byte
+	}{{0, []byte("state"), seed.Envelope}, {0, []byte("session"), []byte(`"retained"`)},
+		{1, []byte("row"), []byte(`"value"`)}} {
+		got, found, readErr := collections[check.collection].AppendRaw(nil, check.key)
+		if readErr != nil || !found || !bytes.Equal(got, check.value) {
+			t.Fatalf("reopened %q = %q, found=%v err=%v", check.key, got, found, readErr)
+		}
+	}
+}
+
 func TestCheckpointGroupSeedGenerationFenceIsAtomicWithOwnership(t *testing.T) {
 	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
 	if _, err := members[1].Collection.Put(
@@ -267,7 +309,7 @@ func TestCheckpointGroupSeedRequiresAndFencesEveryImportedImage(t *testing.T) {
 }
 
 func TestCheckpointGroupSeedIsSoleCutZeroMutationAndBaseBindingDoesNotAdvance(t *testing.T) {
-	_, members, log := newCheckpointGroupTestResources(t, "system", "user")
+	dir, members, log := newCheckpointGroupTestResources(t, "system", "user")
 	if _, err := members[1].Collection.Put(
 		[]byte("row"), []byte(`{"value":"staged"}`),
 	); err != nil {
@@ -366,6 +408,31 @@ func TestCheckpointGroupSeedIsSoleCutZeroMutationAndBaseBindingDoesNotAdvance(t 
 	}
 	if group.SeedActivationPending() {
 		t.Fatal("certified snapshot-base binding remained activation-pending")
+	}
+	for _, key := range [][]byte{[]byte("wrong-state-key"), []byte("state")} {
+		if err := group.Seed(
+			seed, members[0], defaultTxnLimits(), key,
+		); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+			t.Fatalf("post-activation Seed(%q) = %v", key, err)
+		}
+	}
+	image := copyCheckpointGroupDirectory(t, dir)
+	reopenedMembers, _, reopened := openCheckpointGroupTestCopy(t, image)
+	if reopened.SeedActivationPending() || reopened.AppliedIndex() != seed.Applied ||
+		reopened.CheckpointAppliedIndex() != seed.Applied {
+		t.Fatalf("reopened activation cut = pending %v, applied %d/%d",
+			reopened.SeedActivationPending(), reopened.AppliedIndex(),
+			reopened.CheckpointAppliedIndex())
+	}
+	if value, found, err := reopenedMembers[0].AppendRaw(nil, []byte("state")); err != nil ||
+		!found || !bytes.Equal(value, []byte(`{"state":"base-bound"}`)) {
+		t.Fatalf("reopened activation state = %q, found %v, err %v", value, found, err)
+	}
+	if err := reopened.Seed(
+		seed, NamedCollection{Name: "system", Collection: reopenedMembers[0]},
+		defaultTxnLimits(), []byte("wrong-state-key"),
+	); !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("reopened post-activation wrong-key Seed = %v", err)
 	}
 }
 
@@ -534,8 +601,8 @@ func TestCheckpointGroupSeedCrashCuts(t *testing.T) {
 			log, members, seed, CheckpointGroupOptions{},
 		)
 		checkpointGroupFaultHook = previous
-		if group != nil || !errors.Is(err, fault) || !errors.Is(err, ErrCommitOutcomeUnknown) {
-			t.Fatalf("initial certificate crash = group %v, err %v", group, err)
+		if group == nil || err != nil || !group.SeedPending() {
+			t.Fatalf("settled initial certificate = group %v, err %v", group, err)
 		}
 		assertCrash(t, copyCheckpointGroupDirectory(t, dir), false)
 	})

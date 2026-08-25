@@ -94,11 +94,11 @@ func InstallCheckpointGroupDecisionAppendFaultForFacadeTest() (restore func()) {
 	return func() { checkpointGroupFaultHook = previous }
 }
 
-// InstallCheckpointGroupInitialCertificateFaultForFacadeTest makes the next
-// checkpoint-group creation report an unknown outcome immediately after the
-// initial certificate has been renamed into place. It exercises callers that
-// must remain fail-closed between durable activation intent and group reopen.
-func InstallCheckpointGroupInitialCertificateFaultForFacadeTest() (restore func()) {
+// InstallCheckpointGroupInitialCertificatePostRenameFaultForFacadeTest makes the next
+// checkpoint-group creation lose its first directory barrier immediately after
+// the initial certificate has been renamed into place. Creation must settle the
+// exact official certificate before returning success.
+func InstallCheckpointGroupInitialCertificatePostRenameFaultForFacadeTest() (restore func()) {
 	previous := checkpointGroupFaultHook
 	fired := false
 	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {

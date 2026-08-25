@@ -30,6 +30,10 @@ const (
 	// verifier refuses larger declared payloads before allocating its buffer.
 	MaxSnapshotArtifactChunkBytes = replication.MaxMutationKeyBytes +
 		replication.MaxMutationValueBytes + snapshotArtifactRowHeaderBytes
+	// SnapshotArtifactFooterBytes is the fixed final certificate frame. Cursor
+	// persistence intentionally stops immediately before this frame: the footer
+	// authenticates completion but carries no mutable receive progress.
+	SnapshotArtifactFooterBytes    = snapshotArtifactFooterBytes
 	maxSnapshotArtifactHeaderBytes = snapshotArtifactHeaderFixedBytes +
 		MaxStateEnvelopeBytes + replication.MaxCollectionBytes + snapshotArtifactChecksumBytes
 )

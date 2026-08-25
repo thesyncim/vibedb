@@ -281,7 +281,12 @@ func OpenBundle(
 			matched, seedErr := m.checkpointGroup.ValidateSeedState(
 				state.Applied, systemCollectionName, envelope,
 			)
-			if seedErr != nil || !matched || state.LastKind != RecordImportedSnapshot {
+			// The seed is the exact source state at its artifact cut. A live
+			// source may most recently have applied a normal/session or
+			// configuration entry. The required same-index InstallSnapshot
+			// transition preserves that entry kind while binding the new
+			// snapshot-base digest.
+			if seedErr != nil || !matched {
 				return nil, errors.Join(
 					fmt.Errorf("%w: imported state seed commitment", ErrStateCorrupt),
 					seedErr,

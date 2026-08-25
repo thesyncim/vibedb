@@ -406,6 +406,42 @@ func TestEntryTermMustNotDecreaseAcrossRetainedBoundary(t *testing.T) {
 	}
 }
 
+func TestResumePristineIncarnationRejectsAnyPersistedReady(t *testing.T) {
+	path, store, options := createTestStore(t)
+	incarnation, err := store.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
+		testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ResumePristineIncarnation(incarnation); err != nil {
+		t.Fatalf("resume pristine incarnation: %v", err)
+	}
+	if err = store.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch,
+		testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.ResumePristineIncarnation(incarnation); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("resumed incarnation with durable Ready: %v", err)
+	}
+}
+
 func TestPersistUsesActualRecordSizeAfterWorstCaseAdmissionCloses(t *testing.T) {
 	options := testOptions()
 	options.MaxRecordBytes = 64 << 10
