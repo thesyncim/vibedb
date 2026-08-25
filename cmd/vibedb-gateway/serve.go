@@ -117,7 +117,7 @@ func runServe(args []string) int {
 	catalogDistribution := fs.String("catalog-distribution", "", "distribution containing the replicated catalog RF3 group")
 	catalogShard := fs.String("catalog-shard", "", "shard containing the replicated catalog RF3 group")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
-	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
+	catalogAttempts := fs.Int("catalog-attempts", gateway.AbsoluteMaxReplicatedAttempts, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
 	catalogSessionJournal := fs.String("catalog-session-journal", "", "durable native controller session journal base path")
 	catalogClientID := fs.String("catalog-client-id", "", "stable 32-hex-character controller client identity")

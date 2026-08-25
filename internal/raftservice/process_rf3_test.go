@@ -1010,7 +1010,9 @@ func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProce
 			return dialer.DialContext(ctx, "tcp", address)
 		}},
 	}
-	executor, err := gateway.NewReplicatedExecutor(client, 8, 5*time.Second)
+	// The serving budget spans at least one configured election window while
+	// remaining under ReplicatedExecutor's absolute attempt bound.
+	executor, err := gateway.NewReplicatedExecutor(client, gateway.AbsoluteMaxReplicatedAttempts, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

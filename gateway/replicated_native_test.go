@@ -991,6 +991,11 @@ func (client deadlineReplicatedClient) DoReplicated(
 func TestReplicatedExecutorRequiresAndEnforcesPerAttemptTimeout(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	if _, err := NewReplicatedExecutor(
+		deadlineReplicatedClient{}, AbsoluteMaxReplicatedAttempts+1, time.Second,
+	); !errors.Is(err, ErrReplicatedRoute) {
+		t.Fatalf("over-max attempts = %v", err)
+	}
 	if _, err := NewReplicatedExecutor(deadlineReplicatedClient{}, 1, 0); !errors.Is(err, ErrReplicatedRoute) {
 		t.Fatalf("zero attempt timeout = %v", err)
 	}

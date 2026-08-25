@@ -20,6 +20,7 @@ import (
 
 const (
 	AbsoluteMaxReplicatedRouteMembers   = 64
+	AbsoluteMaxReplicatedAttempts       = 16
 	AbsoluteMaxReplicatedAttemptTimeout = 5 * time.Minute
 )
 
@@ -103,7 +104,7 @@ func NewReplicatedExecutor(
 	maxAttempts int,
 	attemptTimeout time.Duration,
 ) (*ReplicatedExecutor, error) {
-	if client == nil || maxAttempts <= 0 || maxAttempts > 16 ||
+	if client == nil || maxAttempts <= 0 || maxAttempts > AbsoluteMaxReplicatedAttempts ||
 		attemptTimeout <= 0 || attemptTimeout > AbsoluteMaxReplicatedAttemptTimeout {
 		return nil, ErrReplicatedRoute
 	}
