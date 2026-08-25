@@ -281,61 +281,19 @@ func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int
 	return digest
 }
 
-// RevokeMembershipGrant removes only the byte-identical expected grant. An
-// unknown outcome is resolved from NativeSession's retained exact command.
+// RevokeMembershipGrant fails closed until the replicated catalog can certify
+// the exact completed replacement roster in the same batch as grant removal.
+// Runtime-local state is not a durable deletion proof: deleting an observed
+// grant at an intermediate learner/RF4 cut would strand recovery after restart.
 func (authority *ReplicatedCatalogAuthority) RevokeMembershipGrant(ctx context.Context,
 	expected membershipgrant.Grant) error {
 	if authority == nil || authority.session == nil || ctx == nil || !expected.Valid() {
 		return ErrReplicatedCatalog
 	}
-	ctx, err := authority.authorizedContext(ctx)
-	if err != nil {
+	if _, err := authority.authorizedContext(ctx); err != nil {
 		return err
 	}
-	authority.mu.Lock()
-	defer authority.mu.Unlock()
-	if authority.session.Status().Pending {
-		return ErrReplicatedCatalogPending
-	}
-	recordKey, pageKey := replicatedMembershipGrantKeys(expected.Group)
-	record, err := authority.readRaw(ctx, recordKey[:], maxReplicatedMembershipGrantBytes)
-	if err != nil {
-		return err
-	}
-	if !record.Found {
-		return ErrReplicatedCatalogConflict
-	}
-	current, err := openReplicatedMembershipGrant(record.Value)
-	if err != nil || current != expected {
-		return ErrReplicatedCatalogConflict
-	}
-	page, err := authority.readRaw(ctx, pageKey[:], maxReplicatedMembershipGrantPageBytes)
-	if err != nil || !page.Found {
-		return errors.Join(err, ErrReplicatedCatalogConflict)
-	}
-	groups, err := openReplicatedMembershipGrantPage(pageKey[1], page.Value)
-	if err != nil {
-		return err
-	}
-	index, found := findReplicatedMembershipGrantGroup(groups, expected.Group)
-	if !found {
-		return ErrReplicatedCatalogConflict
-	}
-	copy(groups[index:], groups[index+1:])
-	groups = groups[:len(groups)-1]
-	authority.scratch = authority.scratch[:0]
-	authority.scratch, err = appendReplicatedMembershipGrantPage(authority.scratch, pageKey[1], groups)
-	if err != nil {
-		return err
-	}
-	recordDigest, pageDigest := sha256.Sum256(record.Value), sha256.Sum256(page.Value)
-	native, err := authority.session.MutateBatch(ctx, []NativeMutation{
-		{Kind: replication.MutationDeleteDigestEqual, Key: recordKey[:],
-			ExpectedValueLength: uint64(len(record.Value)), ExpectedValueDigest: replication.Digest(recordDigest)},
-		{Kind: replication.MutationPutDigestEqual, Key: pageKey[:], Value: authority.scratch,
-			ExpectedValueLength: uint64(len(page.Value)), ExpectedValueDigest: replication.Digest(pageDigest)},
-	})
-	return finishReplicatedMembershipGrantMutation(authority, native, err)
+	return ErrReplicatedCatalogConflict
 }
 
 func finishReplicatedMembershipGrantMutation(authority *ReplicatedCatalogAuthority,

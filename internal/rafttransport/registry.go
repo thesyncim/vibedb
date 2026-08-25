@@ -320,20 +320,61 @@ func grantFitsCommittedCut(current *authorityView, grant membershipgrant.Grant) 
 	if current == nil || current.version < grant.InitialReplicaSetVersion {
 		return false
 	}
-	source, target := current.roles[grant.SourceMember], current.roles[grant.TargetMember]
 	if current.version == grant.InitialReplicaSetVersion {
-		if source != MemberVoter || target != MemberEnrolled || len(current.roles) != len(grant.InitialVoters) {
+		return exactInitialGrantCut(current.roles, grant)
+	}
+	return exactLearnerGrantCut(current.roles, grant) ||
+		exactPromotedGrantCut(current.roles, grant) ||
+		exactCompletedGrantCut(current.roles, grant)
+}
+
+func exactInitialGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	if len(roles) != len(grant.InitialVoters) || roles[grant.TargetMember] != MemberEnrolled {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if roles[voter] != MemberVoter {
 			return false
 		}
-		for _, voter := range grant.InitialVoters {
-			if current.roles[voter] != MemberVoter {
-				return false
-			}
-		}
-		return true
 	}
-	return source == MemberVoter && (target == MemberLearner || target == MemberVoter) ||
-		source == MemberEnrolled && target == MemberVoter
+	return true
+}
+
+func exactLearnerGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	return exactProgressedGrantCut(roles, grant, MemberLearner)
+}
+
+func exactPromotedGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	return exactProgressedGrantCut(roles, grant, MemberVoter)
+}
+
+func exactProgressedGrantCut(
+	roles map[uint64]MemberRole,
+	grant membershipgrant.Grant,
+	targetRole MemberRole,
+) bool {
+	if len(roles) != len(grant.InitialVoters)+1 || roles[grant.TargetMember] != targetRole {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if roles[voter] != MemberVoter {
+			return false
+		}
+	}
+	return true
+}
+
+func exactCompletedGrantCut(roles map[uint64]MemberRole, grant membershipgrant.Grant) bool {
+	if len(roles) != len(grant.InitialVoters) || roles[grant.SourceMember] != MemberEnrolled ||
+		roles[grant.TargetMember] != MemberVoter {
+		return false
+	}
+	for _, voter := range grant.InitialVoters {
+		if voter != grant.SourceMember && roles[voter] != MemberVoter {
+			return false
+		}
+	}
+	return true
 }
 
 // CurrentTransitionGrant returns one allocation-free detached grant snapshot.
@@ -367,8 +408,7 @@ func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.G
 		untouched := current.version == expected.InitialReplicaSetVersion &&
 			grantFitsCommittedCut(current, expected)
 		completed := current.version > expected.InitialReplicaSetVersion &&
-			current.roles[expected.SourceMember] == MemberEnrolled &&
-			current.roles[expected.TargetMember] == MemberVoter
+			exactCompletedGrantCut(current.roles, expected)
 		if (!untouched && !completed) || current.promotion != nil {
 			return ErrReplicaSet
 		}

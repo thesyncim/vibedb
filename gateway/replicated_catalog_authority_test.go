@@ -183,23 +183,14 @@ func TestReplicatedMembershipGrantCanonicalCASUnknownRetryAndRevoke(t *testing.T
 		t.Fatalf("foreign revoke=%v", err)
 	}
 	client.unknownNext = true
-	err = authority.RevokeMembershipGrant(context.Background(), grant)
-	if !errors.Is(err, ErrReplicatedCatalogPending) {
-		t.Fatalf("unknown grant revoke=%v", err)
-	}
-	pending = authority.session.PendingCommand()
-	client.holdUnknown = false
-	if err = authority.RetryPending(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(pending, client.unknownCommand) {
-		t.Fatal("grant revoke retry changed command bytes")
-	}
-	if loaded, found, err = authority.ReadMembershipGrant(context.Background(), grant.Group); err != nil || found || loaded != (membershipgrant.Grant{}) {
-		t.Fatalf("after revoke=%+v found=%t err=%v", loaded, found, err)
-	}
 	if err = authority.RevokeMembershipGrant(context.Background(), grant); !errors.Is(err, ErrReplicatedCatalogConflict) {
-		t.Fatalf("absent revoke retry=%v", err)
+		t.Fatalf("unproved durable revoke=%v", err)
+	}
+	if authority.session.Status().Pending || client.unknownNext == false {
+		t.Fatal("fail-closed revoke proposed a command")
+	}
+	if loaded, found, err = authority.ReadMembershipGrant(context.Background(), grant.Group); err != nil || !found || loaded != grant {
+		t.Fatalf("retained after failed revoke=%+v found=%t err=%v", loaded, found, err)
 	}
 }
 

@@ -229,6 +229,69 @@ func TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke(t *testing.T)
 	}
 }
 
+func TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts(t *testing.T) {
+	group := testGroup(94)
+	grant := authorityTestGrant(group)
+	tests := []struct {
+		name        string
+		version     uint64
+		roles       [5]MemberRole
+		wantInstall bool
+		wantRevoke  bool
+	}{
+		{name: "initial-rf3", version: 5,
+			roles:       [5]MemberRole{MemberVoter, MemberVoter, MemberEnrolled, MemberVoter, MemberEnrolled},
+			wantInstall: true, wantRevoke: true},
+		{name: "target-learner", version: 6,
+			roles:       [5]MemberRole{MemberVoter, MemberVoter, MemberLearner, MemberVoter, MemberEnrolled},
+			wantInstall: true},
+		{name: "promoted-rf4", version: 7,
+			roles:       [5]MemberRole{MemberVoter, MemberVoter, MemberVoter, MemberVoter, MemberEnrolled},
+			wantInstall: true},
+		{name: "completed-rf3", version: 8,
+			roles:       [5]MemberRole{MemberEnrolled, MemberVoter, MemberVoter, MemberVoter, MemberEnrolled},
+			wantInstall: true, wantRevoke: true},
+		{name: "unrelated-later-rf3", version: 9,
+			roles: [5]MemberRole{MemberVoter, MemberEnrolled, MemberVoter, MemberEnrolled, MemberVoter}},
+		{name: "unrelated-later-completed-shape", version: 9,
+			roles: [5]MemberRole{MemberEnrolled, MemberVoter, MemberVoter, MemberEnrolled, MemberVoter}},
+		{name: "progressed-extra-voter", version: 9,
+			roles: [5]MemberRole{MemberVoter, MemberVoter, MemberLearner, MemberVoter, MemberVoter}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			members := make([]Member, 5)
+			for index := range members {
+				members[index] = Member{Group: group, ReplicaSetVersion: test.version,
+					MemberID: uint64(index + 1), Node: testNode(byte(index + 1)), Role: test.roles[index]}
+			}
+			registry, err := NewStaticRegistry(testNode(1), members,
+				Limits{MaxGroups: 1, MaxMembers: len(members)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = registry.InstallTransitionGrant(grant)
+			if !test.wantInstall {
+				if !errors.Is(err, ErrReplicaSet) {
+					t.Fatalf("unrelated restart install=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("legal restart install=%v", err)
+			}
+			err = registry.RevokeTransitionGrant(grant)
+			if test.wantRevoke {
+				if err != nil {
+					t.Fatalf("terminal restart revoke=%v", err)
+				}
+			} else if !errors.Is(err, ErrReplicaSet) {
+				t.Fatalf("intermediate restart revoke=%v", err)
+			}
+		})
+	}
+}
+
 func TestTransitionGrantRefreshRollsBackDisappearedUntouchedAuthority(t *testing.T) {
 	group := testGroup(93)
 	registry, err := NewStaticRegistry(testNode(1), []Member{
