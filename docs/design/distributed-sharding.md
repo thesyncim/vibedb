@@ -221,12 +221,15 @@ not a runnable automatic rebalancing controller or snapshot transport.
 
 ## Security boundary
 
-The gateway and shard commands accept loopback listeners only. Their protocols
-have no authentication or TLS.
+The gateway and shard commands use the shared TLS 1.3 service profiles for
+client-to-gateway and gateway-to-shard traffic. Those profiles bind traffic
+class, peer identity, trust roots, and connection limits. Plaintext is available
+only through the explicit loopback development mode; it is not the default
+cross-host security contract.
 
 See [the operating guide](../operations/distributed.md) for exact commands and
-[the distributed design](distributed-system.md) for the non-serving kernel
-boundary.
+[the distributed design](distributed-system.md) for the internal RF3 and
+shipped-command boundary.
 
 ## Implementation references
 

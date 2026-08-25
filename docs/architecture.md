@@ -7,8 +7,9 @@ VibeDB has four main layers:
 3. The query and SQL packages own parsing, planning, and local execution.
 4. The experimental distributed packages own static routing and shard service.
 
-The internal Raft and replicated-state packages are a separate non-serving
-kernel. The shipped commands do not connect that kernel to the shard service.
+The internal Raft, replicated-state, and Raft-service packages form a separate
+RF3 serving composition. The shipped commands do not construct that composition
+or connect it to the static shard service.
 
 ## Product facade
 
