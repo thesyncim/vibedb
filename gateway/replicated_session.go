@@ -126,11 +126,64 @@ type NativeSessionOptions struct {
 	ClientID     replication.ID128
 	RetryHome    replication.RetryHome
 	Resolver     BundleResolver
+	Journal      *NativeSessionJournal
+	// JournalBinding authenticates the route, tenant, and resolver schema of a
+	// durable journal. It is required only when Journal is configured.
+	JournalBinding replication.Digest
 
 	MaxRelationBatches  int
 	MaxMutations        int
 	InitialCommandBytes int
 	MaxCommandBytes     int
+}
+
+// NativeSessionJournalBinding returns the portable identity of one durable
+// base-relation session. Replica addresses are deliberately excluded: routing
+// can change while an exact pending command remains retryable. Every field
+// interpreted by replicated apply is included, including the manifest digest.
+func NativeSessionJournalBinding(
+	route ReplicatedRoute,
+	distribution, shard string,
+	tenant []byte,
+	relation replication.RelationID,
+) (replication.Digest, error) {
+	if !validReplicatedRoute(route) ||
+		!validNativeSessionIdentity(distribution, shard, tenant) ||
+		relation == 0 || relation > replication.MaxRelationID {
+		return replication.Digest{}, ErrNativeSession
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/native-session-journal/1"))
+	_, _ = hash.Write(route.Group.ClusterID[:])
+	_, _ = hash.Write(route.Group.ClusterIncarnation[:])
+	_, _ = hash.Write(route.Group.ShardIncarnation[:])
+	_, _ = hash.Write(route.Group.GroupID[:])
+	var scalar [8]byte
+	writeScalar := func(value uint64) {
+		binary.LittleEndian.PutUint64(scalar[:], value)
+		_, _ = hash.Write(scalar[:])
+	}
+	writeBytes := func(value []byte) {
+		writeScalar(uint64(len(value)))
+		_, _ = hash.Write(value)
+	}
+	writeScalar(route.Group.TopologyRecoveryEpoch)
+	writeScalar(route.AllocationGeneration)
+	writeScalar(route.Command.ReplicaSetVersion)
+	writeScalar(route.Command.ActivePolicyGeneration)
+	writeScalar(route.Command.ProtectionEpoch)
+	writeScalar(route.Command.OwnershipEpoch)
+	writeScalar(route.Command.SchemaGeneration)
+	_, _ = hash.Write(route.Command.RelationManifestDigest[:])
+	writeScalar(route.Command.RoutingVersion)
+	writeScalar(route.Command.RouteGeneration)
+	writeBytes([]byte(distribution))
+	writeBytes([]byte(shard))
+	writeBytes(tenant)
+	writeScalar(uint64(relation))
+	var digest replication.Digest
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 type nativeSessionPhase uint8
@@ -166,6 +219,7 @@ type NativeSession struct {
 	terminalSequence    uint64
 	terminalFingerprint replication.Digest
 	leader              shardservice.ReplicatedMemberState
+	journal             *NativeSessionJournal
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -216,7 +270,7 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
 	tenant := append([]byte(nil), options.Tenant...)
 	tenant = tenant[:len(tenant):len(tenant)]
-	return &NativeSession{
+	session := &NativeSession{
 		executor: options.Executor, route: route,
 		distribution: strings.Clone(options.Distribution), shard: strings.Clone(options.Shard),
 		tenant: tenant, clientID: options.ClientID, retryHome: options.RetryHome,
@@ -224,7 +278,19 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		bundle:   newRelationBundleBuilder(options.MaxRelationBatches, options.MaxMutations),
 		command:  make([]byte, 0, options.InitialCommandBytes), maxCommand: options.MaxCommandBytes,
 		nextSequence: 1,
-	}, nil
+		journal:      options.Journal,
+	}
+	if options.Journal != nil {
+		state, loadErr := options.Journal.load()
+		if loadErr != nil || options.Journal.maxCommand != options.MaxCommandBytes ||
+			options.JournalBinding == (replication.Digest{}) ||
+			options.Journal.binding != options.JournalBinding ||
+			state.clientID != options.ClientID || state.retryHome != options.RetryHome {
+			return nil, errors.Join(loadErr, ErrNativeSession)
+		}
+		session.restoreDurableState(state)
+	}
+	return session, nil
 }
 
 func (session *NativeSession) Status() NativeSessionStatus {
@@ -526,6 +592,13 @@ func (session *NativeSession) prepareAndExecute(
 		return NativeResult{}, err
 	}
 	session.pending = true
+	if session.journal != nil {
+		if err = session.journal.store(session.durableState()); err != nil {
+			session.pending = false
+			session.command = session.command[:0]
+			return NativeResult{}, err
+		}
+	}
 	return session.executePending(ctx, false)
 }
 
@@ -547,11 +620,16 @@ func (session *NativeSession) executePending(
 		command, openErr := replication.OpenCommand(session.command)
 		if openErr == nil && command.Kind() == replication.CommandSessionRelease &&
 			errors.Is(err, replicatedstate.ErrSessionReleased) {
+			prior := session.durableState()
 			session.phase = nativeSessionReleased
-			session.clearPending()
+			if persistErr := session.persistCompletedPending(prior); persistErr != nil {
+				return NativeResult{}, persistErr
+			}
 			return NativeResult{Released: true}, nil
 		}
-		session.clearPending()
+		if persistErr := session.persistAbandonedPending(); persistErr != nil {
+			return NativeResult{}, persistErr
+		}
 		return NativeResult{}, err
 	}
 	session.leader = result.State
@@ -565,8 +643,11 @@ func (session *NativeSession) executePending(
 			Command: append([]byte(nil), session.command...), Cause: ErrReplicatedRoute,
 		}
 	}
+	prior := session.durableState()
 	session.finishCompletion(command, completion)
-	session.clearPending()
+	if err = session.persistCompletedPending(prior); err != nil {
+		return NativeResult{}, err
+	}
 	return NativeResult{Outcome: result.Outcome, Completion: completion}, nil
 }
 
@@ -604,6 +685,59 @@ func (session *NativeSession) finishCompletion(
 func (session *NativeSession) clearPending() {
 	session.pending = false
 	session.command = session.command[:0]
+}
+
+func (session *NativeSession) durableState() durableNativeSessionState {
+	state := durableNativeSessionState{
+		clientID: session.clientID, retryHome: session.retryHome, phase: session.phase,
+		epoch: session.epoch, nextSequence: session.nextSequence, ackThrough: session.ackThrough,
+		leaseDeadline: session.leaseDeadline, terminalSequence: session.terminalSequence,
+		terminalFingerprint: session.terminalFingerprint, pending: session.pending,
+	}
+	if session.pending {
+		state.command = session.command
+	}
+	return state
+}
+
+func (session *NativeSession) restoreDurableState(state durableNativeSessionState) {
+	session.phase, session.epoch = state.phase, state.epoch
+	session.nextSequence, session.ackThrough = state.nextSequence, state.ackThrough
+	session.leaseDeadline, session.terminalSequence = state.leaseDeadline, state.terminalSequence
+	session.terminalFingerprint, session.pending = state.terminalFingerprint, state.pending
+	if state.pending {
+		session.command = append(session.command[:0], state.command...)
+	}
+}
+
+func (session *NativeSession) persistCompletedPending(prior durableNativeSessionState) error {
+	completed := session.durableState()
+	completed.pending, completed.command = false, nil
+	if session.journal != nil {
+		if err := session.journal.store(completed); err != nil {
+			session.restoreDurableState(prior)
+			return &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), prior.command...), Cause: err,
+			}
+		}
+	}
+	session.clearPending()
+	return nil
+}
+
+func (session *NativeSession) persistAbandonedPending() error {
+	prior := session.durableState()
+	cleared := prior
+	cleared.pending, cleared.command = false, nil
+	if session.journal != nil {
+		if err := session.journal.store(cleared); err != nil {
+			return &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), prior.command...), Cause: err,
+			}
+		}
+	}
+	session.clearPending()
+	return nil
 }
 
 func sessionStateError(session *NativeSession) error {
