@@ -26,22 +26,13 @@ const (
 	CapabilityDataRead Capability = 1 << iota
 	CapabilityDataWrite
 	CapabilitySchema
-	CapabilityTopology
-	CapabilityMembership
-	CapabilitySplit
-	CapabilityMove
-	CapabilityBackup
-	CapabilityRestore
-	CapabilityOperator
 	// CapabilityDelegate permits an authenticated service principal to forward
 	// an exact end-user authority. It grants no data or control-plane action by
 	// itself; the forwarded principal is checked independently at the receiver.
 	CapabilityDelegate
 )
 
-const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
-	CapabilityTopology | CapabilityMembership | CapabilitySplit | CapabilityMove |
-	CapabilityBackup | CapabilityRestore | CapabilityOperator | CapabilityDelegate
+const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema | CapabilityDelegate
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0
@@ -168,12 +159,15 @@ func (gate *Gate) Rotate(policy *Policy) error {
 	if gate == nil || policy == nil {
 		return ErrInvalidPolicy
 	}
-	current := gate.current.Load()
-	if current == nil || policy.Generation() <= current.Generation() {
-		return ErrInvalidPolicy
+	for {
+		current := gate.current.Load()
+		if current == nil || policy.Generation() <= current.Generation() {
+			return ErrInvalidPolicy
+		}
+		if gate.current.CompareAndSwap(current, policy) {
+			return nil
+		}
 	}
-	gate.current.Store(policy)
-	return nil
 }
 
 func (gate *Gate) Check(node rafttransport.NodeID, generation uint64, capability Capability) DecisionCode {

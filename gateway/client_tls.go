@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -13,6 +14,7 @@ import (
 // capability. Certificate principals are exact binary NodeIDs; authorization
 // never depends on X.509 subjects, DNS names, or request strings.
 type ClientTLS struct {
+	rotate sync.Mutex
 	server *servicetls.Server
 	gate   *serviceauthz.Gate
 }
@@ -61,9 +63,11 @@ func NewClientTLS(profile *rafttransport.PeerTLS, allowed []rafttransport.NodeID
 // revokes every stream admitted by the preceding generation.
 func (capability *ClientTLS) RotateClientTLS(profile *rafttransport.PeerTLS, allowed []rafttransport.NodeID) error {
 	authorizer, err := servicetls.NewNodeAuthorizer(allowed)
-	if err != nil || capability == nil {
+	if err != nil || capability == nil || capability.gate != nil {
 		return servicetls.ErrInvalidProfile
 	}
+	capability.rotate.Lock()
+	defer capability.rotate.Unlock()
 	return capability.server.Rotate(profile, authorizer)
 }
 
@@ -76,6 +80,8 @@ func (capability *ClientTLS) RotateAuthorization(
 	if capability == nil || capability.server == nil || capability.gate == nil || policy == nil {
 		return servicetls.ErrInvalidProfile
 	}
+	capability.rotate.Lock()
+	defer capability.rotate.Unlock()
 	authorizer, err := servicetls.NewNodeAuthorizer(policy.Nodes())
 	if err != nil {
 		return err
@@ -83,9 +89,9 @@ func (capability *ClientTLS) RotateAuthorization(
 	if policy.Generation() <= capability.gate.Generation() {
 		return serviceauthz.ErrInvalidPolicy
 	}
-	// Revoke the old TLS generation before publishing any new privilege. A
-	// connection admitted in the narrow interval sees only the older policy and
-	// therefore fails closed; it can never acquire the new generation early.
+	// New admissions take this same publication lock before binding their policy
+	// generation. They therefore observe the old TLS+policy pair or the new pair,
+	// never a partially published combination.
 	if err = capability.server.Rotate(profile, authorizer); err != nil {
 		return err
 	}
@@ -131,8 +137,16 @@ func (capability *ClientTLS) ServeAuthorizedClients(
 	}
 	return capability.server.Serve(ctx, listener, limits,
 		func(ctx context.Context, connection rafttransport.PeerConnection) {
+			capability.rotate.Lock()
+			admitted, present := servicetls.AdmissionGeneration(ctx)
+			currentTLS := capability.server.Stats().Generation
+			generation := capability.gate.Generation()
+			capability.rotate.Unlock()
+			if !present || admitted != currentTLS {
+				return
+			}
 			authorized, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
-				Node: connection.PeerIdentity().Node, Generation: capability.gate.Generation(),
+				Node: connection.PeerIdentity().Node, Generation: generation,
 			})
 			if err == nil {
 				handle(authorized, connection)

@@ -293,7 +293,12 @@ func (server *ReplicatedServer) authorizeReplicated(
 	capability := serviceauthz.CapabilityDataRead
 	switch request.Operation {
 	case ReplicatedProbe:
-		return request.Authority.Valid()
+		if serviceauthz.CheckAndAudit(server.authorization, server.audit,
+			request.Authority.Node, generation, serviceauthz.CapabilityDataRead) == serviceauthz.DecisionAllow {
+			return true
+		}
+		return serviceauthz.CheckAndAudit(server.authorization, server.audit,
+			request.Authority.Node, generation, serviceauthz.CapabilityDataWrite) == serviceauthz.DecisionAllow
 	case ReplicatedPropose:
 		capability = serviceauthz.CapabilityDataWrite
 	case ReplicatedReadLeader, ReplicatedReadFollower:

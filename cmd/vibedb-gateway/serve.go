@@ -130,6 +130,7 @@ func runServe(args []string) int {
 	}
 	var clientTLS *gateway.ClientTLS
 	var shardTLS *servicetls.Client
+	var internalAuthority serviceauthz.Authority
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
 			*authorizationPolicy != "" || len(shardPeers) != 0 {
@@ -149,6 +150,15 @@ func runServe(args []string) int {
 		policy, policyErr := serviceauthz.LoadFile(*authorizationPolicy)
 		if policyErr != nil {
 			fmt.Fprintf(os.Stderr, "gateway: load authorization policy: %v\n", policyErr)
+			return 2
+		}
+		internalAuthority = serviceauthz.Authority{
+			Node: profile.LocalIdentity().Node, Generation: policy.Generation(),
+		}
+		if policy.Check(internalAuthority.Node,
+			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
+				serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, and data_write recovery authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -191,7 +201,7 @@ func runServe(args []string) int {
 	if shardTLS != nil {
 		shardDial = shardTLS.Dial
 	}
-	exec, holder, err := newGatewayWithDial(*catalog, shardDial)
+	exec, holder, err := newGatewayWithDial(*catalog, shardDial, internalAuthority)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
@@ -246,17 +256,20 @@ func requireLoopbackListen(address string) error {
 // shard refusal reloads the same crash-safe catalog path, publishing only a
 // strictly newer valid generation.
 func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, error) {
-	return newGatewayWithDial(catalogPath, nil)
+	return newGatewayWithDial(catalogPath, nil, serviceauthz.Authority{})
 }
 
-func newGatewayWithDial(catalogPath string, dial gateway.DialFunc) (*gateway.Executor, *gateway.CatalogHolder, error) {
+func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
+	internalAuthority serviceauthz.Authority) (*gateway.Executor, *gateway.CatalogHolder, error) {
 	snap, err := gateway.LoadSnapshot(catalogPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(snap)
 	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
-	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{Refresh: refresher.Refresh})
+	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{
+		Refresh: refresher.Refresh, InternalAuthority: internalAuthority,
+	})
 	return exec, holder, nil
 }
 
@@ -363,17 +376,14 @@ func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 	if request == nil {
 		return 0
 	}
-	if request.Op == "exec" || request.Op == "exec_batch" {
-		var required serviceauthz.Capability
-		if request.SQL != "" {
-			required = serviceauthz.SQLCapability(request.SQL, true)
-		}
-		for index := range request.Statements {
-			required |= serviceauthz.SQLCapability(request.Statements[index].SQL, true)
-		}
-		return required
+	var required serviceauthz.Capability
+	if request.SQL != "" {
+		required = serviceauthz.SQLCapability(request.SQL)
 	}
-	return serviceauthz.CapabilityDataRead
+	for index := range request.Statements {
+		required |= serviceauthz.SQLCapability(request.Statements[index].SQL)
+	}
+	return required
 }
 
 // writeServeResponse emits one NDJSON response without converting raw result

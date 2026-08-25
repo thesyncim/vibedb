@@ -7,21 +7,39 @@ func TestSQLCapabilitySkipsCommentsAndFailsClosed(t *testing.T) {
 		"CREATE TABLE docs (id TEXT)",
 		" -- operator note\n ALTER TABLE docs ADD COLUMN n INT",
 		"/* bounded comment */ DROP TABLE docs",
-		"/* unterminated",
-		"@invalid",
 	} {
-		if got := SQLCapability(sql, true); got != CapabilitySchema {
+		if got := SQLCapability(sql); got != CapabilitySchema {
 			t.Fatalf("SQLCapability(%q)=%x", sql, got)
 		}
 	}
-	if got := SQLCapability("UPDATE docs SET n = 1", true); got != CapabilityDataWrite {
+	for _, sql := range []string{"/* unterminated", "@invalid"} {
+		if got := SQLCapability(sql); got != CapabilityDataRead|CapabilityDataWrite|CapabilitySchema {
+			t.Fatalf("invalid SQL %q=%x", sql, got)
+		}
+	}
+	if got := SQLCapability("UPDATE docs SET n = 1"); got != CapabilityDataWrite {
 		t.Fatalf("write=%x", got)
 	}
-	if got := SQLCapability("CREATE TABLE docs (id TEXT)", false); got != CapabilityDataRead {
-		t.Fatalf("read lane=%x", got)
+	for _, sql := range []string{
+		"SELECT * FROM docs", "WITH c AS (SELECT * FROM docs) SELECT * FROM c",
+		"EXPLAIN SELECT * FROM docs", "VALUES (1)", "TABLE docs",
+		"(SELECT * FROM docs)",
+		"SELECT ';' FROM docs", "SELECT 1 /* ; DELETE */; -- one trailing terminator",
+	} {
+		if got := SQLCapability(sql); got != CapabilityDataRead {
+			t.Fatalf("read %q=%x", sql, got)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT 1; DELETE FROM docs", "SELECT 1;;", `SELECT "unterminated`,
+		"GRANT ALL ON docs", "VACUUM docs",
+	} {
+		if got := SQLCapability(sql); got != CapabilityDataRead|CapabilityDataWrite|CapabilitySchema {
+			t.Fatalf("mixed SQL %q=%x", sql, got)
+		}
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
-		if SQLCapability("/* comment */ CREATE TABLE docs (id TEXT)", true) != CapabilitySchema {
+		if SQLCapability("/* comment */ CREATE TABLE docs (id TEXT)") != CapabilitySchema {
 			panic("classification changed")
 		}
 	}); allocations != 0 {

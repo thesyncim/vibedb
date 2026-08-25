@@ -2,6 +2,7 @@ package serviceauthz
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -13,13 +14,32 @@ func authzNode(marker byte) rafttransport.NodeID {
 	return node
 }
 
+func TestGateConcurrentRotationNeverRegressesGeneration(t *testing.T) {
+	node := authzNode(31)
+	for range 100 {
+		first, _ := NewPolicy(1, []Entry{{Node: node, Capabilities: CapabilityDataRead}})
+		second, _ := NewPolicy(2, []Entry{{Node: node, Capabilities: CapabilityDataWrite}})
+		third, _ := NewPolicy(3, []Entry{{Node: node, Capabilities: CapabilitySchema}})
+		gate, _ := NewGate(first)
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() { defer wait.Done(); <-start; _ = gate.Rotate(second) }()
+		go func() { defer wait.Done(); <-start; _ = gate.Rotate(third) }()
+		close(start)
+		wait.Wait()
+		if gate.Generation() != 3 || gate.Check(node, 3, CapabilitySchema) != DecisionAllow {
+			t.Fatalf("publication regressed: generation=%d", gate.Generation())
+		}
+	}
+}
+
 func TestGateDenyDefaultRoleSeparationAndRotation(t *testing.T) {
-	reader, writer, operator := authzNode(1), authzNode(2), authzNode(3)
+	reader, writer, schema := authzNode(1), authzNode(2), authzNode(3)
 	first, err := NewPolicy(7, []Entry{
 		{Node: writer, Capabilities: CapabilityDataWrite},
 		{Node: reader, Capabilities: CapabilityDataRead},
-		{Node: operator, Capabilities: CapabilityTopology | CapabilityMembership | CapabilitySplit |
-			CapabilityMove | CapabilityBackup | CapabilityRestore | CapabilityOperator | CapabilitySchema},
+		{Node: schema, Capabilities: CapabilitySchema},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +56,7 @@ func TestGateDenyDefaultRoleSeparationAndRotation(t *testing.T) {
 		{Authority{reader, 7}, CapabilityDataRead, DecisionAllow},
 		{Authority{reader, 7}, CapabilityDataWrite, DecisionDenyCapability},
 		{Authority{writer, 7}, CapabilityDataRead, DecisionDenyCapability},
-		{Authority{operator, 7}, CapabilityTopology | CapabilityMove, DecisionAllow},
+		{Authority{schema, 7}, CapabilitySchema, DecisionAllow},
 		{Authority{authzNode(9), 7}, CapabilityDataRead, DecisionDenyNoPrincipal},
 		{Authority{reader, 6}, CapabilityDataRead, DecisionDenyGeneration},
 		{Authority{}, CapabilityDataRead, DecisionDenyInvalid},

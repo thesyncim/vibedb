@@ -119,15 +119,52 @@ func (c *shardConn) authorize(request *ShardRequest) bool {
 		serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
 		return false
 	}
-	capability := serviceauthz.CapabilityDataRead
-	if request.ExecutionMode == ExecutionReadWrite {
-		capability = serviceauthz.CapabilityDataWrite
-		if request.SQL != "" {
-			capability = serviceauthz.SQLCapability(request.SQL, true)
-		}
+	capability, ok := sealedRequestCapability(request)
+	if !ok {
+		return false
 	}
 	return serviceauthz.CheckAndAudit(c.authorization, c.audit, request.Authority.Node,
 		generation, capability) == serviceauthz.DecisionAllow
+}
+
+// sealedRequestCapability derives authority exclusively from the decoded
+// operation union. ExecutionMode is an execution fence, never an authorization
+// assertion controlled by a trusted principal.
+func sealedRequestCapability(request *ShardRequest) (serviceauthz.Capability, bool) {
+	if request == nil {
+		return 0, false
+	}
+	if operation := request.Transaction.Operation; operation != TransactionNone {
+		switch operation {
+		case TransactionLookupCoordinator, TransactionLookupParticipant,
+			TransactionScanCoordinator, TransactionReadParticipant:
+			return serviceauthz.CapabilityDataRead, true
+		case TransactionStageCoordinator, TransactionStageParticipant,
+			TransactionCommitCoordinator, TransactionApplyParticipant,
+			TransactionAbortCoordinator, TransactionAbortParticipant,
+			TransactionRetireCoordinator, TransactionReleaseParticipant,
+			TransactionPrepareParticipant, TransactionAcquireReadFence,
+			TransactionReleaseReadFence:
+			return serviceauthz.CapabilityDataWrite, true
+		default:
+			return 0, false
+		}
+	}
+	if request.MutationCapture {
+		return serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite, true
+	}
+	if request.Exchange.present() || request.GlobalIndexLookup.present() || request.DocumentScan.present() {
+		return serviceauthz.CapabilityDataRead, true
+	}
+	if request.SQL != "" {
+		capability := serviceauthz.SQLCapability(request.SQL)
+		if request.Repartition.present() || request.PrimaryKeyRead.present() ||
+			request.PartialAggregate || request.RowBatch.present() {
+			capability |= serviceauthz.CapabilityDataRead
+		}
+		return capability, true
+	}
+	return 0, false
 }
 
 // isFramingError reports whether a decode failure left the byte stream in an
