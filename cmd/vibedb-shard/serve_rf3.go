@@ -228,24 +228,7 @@ func servePreparedRF3WithListen(
 			ReadSources:   []raftservice.ReadSource{apply}, Pulse: pulse,
 			Limits: rf3OwnerLimits(),
 		},
-		Transport: rafttransport.OrdinaryTransportOptions{
-			Peers: remoteNodes,
-			Queue: rafttransport.QueueLimits{
-				// One maximum command rounds to a 32 MiB owned frame. Each
-				// follower can retain one without making a valid proposal fatal.
-				PerPeerFrames: 32, PerPeerBytes: 32 << 20,
-				GlobalFrames: 64, GlobalBytes: 64 << 20,
-			},
-			Coalesce: rafttransport.CoalesceLimits{
-				MaxFrames: 8,
-				MaxBytes: rafttransport.StreamRecordHeaderBytes +
-					rafttransport.MaxFrameBytes,
-				RetainedBytes: rafttransport.DefaultRetainedFrameBytes,
-			},
-			Wait: rafttransport.WaitWithTimer, Backoff: rf3ReconnectBackoff,
-			MaxReconnectDelay: time.Second, WriteDeadline: deadline,
-			RetainedFrameBytes: rafttransport.DefaultRetainedFrameBytes,
-		},
+		Transport: rf3TransportOptions(remoteNodes, deadline),
 		Receiver: rafttransport.OrdinaryReceiverOptions{
 			ReadDeadline:       deadline,
 			RetainedFrameBytes: rafttransport.DefaultRetainedFrameBytes,
@@ -553,6 +536,30 @@ func rf3OwnerLimits() raftservice.Limits {
 		MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
 		MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
 		MaxPendingOutboundBytes: 64 << 20,
+	}
+}
+
+func rf3TransportOptions(
+	peers []rafttransport.NodeID,
+	deadline rafttransport.DeadlineFunc,
+) rafttransport.OrdinaryTransportOptions {
+	return rafttransport.OrdinaryTransportOptions{
+		Peers: peers,
+		Queue: rafttransport.QueueLimits{
+			// One maximum command rounds to a 32 MiB owned frame. Each
+			// follower can retain one without making a valid proposal fatal.
+			PerPeerFrames: 32, PerPeerBytes: 32 << 20,
+			GlobalFrames: 64, GlobalBytes: 64 << 20,
+		},
+		Coalesce: rafttransport.CoalesceLimits{
+			MaxFrames: 8,
+			MaxBytes: rafttransport.StreamRecordHeaderBytes +
+				rafttransport.MaxFrameBytes,
+			RetainedBytes: rafttransport.DefaultRetainedFrameBytes,
+		},
+		Wait: rafttransport.WaitWithTimer, Backoff: rf3ReconnectBackoff,
+		MaxReconnectDelay: time.Second, WriteDeadline: deadline,
+		RetainedFrameBytes: rafttransport.DefaultRetainedFrameBytes,
 	}
 }
 

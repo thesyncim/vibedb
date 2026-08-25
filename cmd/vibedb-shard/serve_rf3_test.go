@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -256,6 +257,25 @@ func TestRF3DerivedGroupWALAndCommandIdentities(t *testing.T) {
 	}
 	if got := commandFenceFromPublication(binding.Authority, runtimeIdentity, 15); got != wantFence || !got.Valid() {
 		t.Fatalf("command fence = %+v, want valid %+v", got, wantFence)
+	}
+}
+
+func TestRF3TransportCarriesMaximumValidFrameWithoutRetainingItWarm(t *testing.T) {
+	peers := []rafttransport.NodeID{{1}, {2}}
+	options := rf3TransportOptions(peers, func() time.Time { return time.Now().Add(time.Second) })
+	wireMaximum := rafttransport.StreamRecordHeaderBytes + rafttransport.MaxFrameBytes
+	if options.Coalesce.MaxBytes < wireMaximum {
+		t.Fatalf("coalesce bytes = %d, below maximum wire frame %d", options.Coalesce.MaxBytes, wireMaximum)
+	}
+	// MaxFrameBytes is just above 16 MiB, so its power-of-two owned capacity is
+	// 32 MiB. Both followers must be able to retain one independently.
+	if options.Queue.PerPeerBytes < 32<<20 ||
+		options.Queue.GlobalBytes < int64(len(peers))*options.Queue.PerPeerBytes {
+		t.Fatalf("queue bytes = per-peer %d global %d", options.Queue.PerPeerBytes, options.Queue.GlobalBytes)
+	}
+	if options.Coalesce.RetainedBytes != rafttransport.DefaultRetainedFrameBytes ||
+		options.RetainedFrameBytes != rafttransport.DefaultRetainedFrameBytes {
+		t.Fatalf("one-off maximum frame would remain warm: %+v", options.Coalesce)
 	}
 }
 
