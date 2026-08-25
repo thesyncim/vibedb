@@ -101,6 +101,11 @@ func ComposeManifestTransitions(
 	return manifest, nil
 }
 
+// PublicationTransitionWorkspace reuses fixed certificate verification state.
+type PublicationTransitionWorkspace struct {
+	cutover CutoverVerifyWorkspace
+}
+
 // ValidatePublicationTransition binds every data-plane proof to the exact
 // control-plane replacement it authorizes. It grants no authority itself; the
 // catalog must still compare-and-swap its durable and in-memory generations.
@@ -110,19 +115,81 @@ func (p *Partitioner) ValidatePublicationTransition(
 	currentGeneration uint64,
 	nextGeneration uint64,
 	certificate CutoverCertificate,
-	prune RetainedPruneCursor,
 ) error {
-	if p == nil || p.VerifyCutoverCertificate(certificate) != nil {
+	var workspace PublicationTransitionWorkspace
+	return p.ValidatePublicationTransitionWithWorkspace(
+		current, next, currentGeneration, nextGeneration, certificate, &workspace,
+	)
+}
+
+// ValidatePublicationTransitionWithWorkspace reuses certificate hash state.
+func (p *Partitioner) ValidatePublicationTransitionWithWorkspace(
+	current *distribution.Manifest,
+	next *distribution.Manifest,
+	currentGeneration uint64,
+	nextGeneration uint64,
+	certificate CutoverCertificate,
+	workspace *PublicationTransitionWorkspace,
+) error {
+	if p == nil || workspace == nil || p.VerifyCutoverCertificateWithWorkspace(
+		certificate, &workspace.cutover,
+	) != nil {
 		return ErrCutoverCertificate
-	}
-	if p.VerifyRetainedPruneCompletion(certificate, prune) != nil {
-		return ErrRetainedPrune
 	}
 	if currentGeneration == math.MaxUint64 || nextGeneration != currentGeneration+1 ||
 		certificate.SourceCoordinates().RouteGeneration != nextGeneration {
 		return ErrManifestTransition
 	}
 	return p.ValidateManifestTransition(current, next)
+}
+
+// ValidateRetainedPruneAuthority proves that the catalog generation granting
+// the child ranges is already authoritative before destructive source cleanup
+// begins. A cutover certificate alone is deliberately insufficient.
+func (p *Partitioner) ValidateRetainedPruneAuthority(
+	published *distribution.Manifest,
+	catalogGeneration uint64,
+	certificate CutoverCertificate,
+) error {
+	var workspace PublicationTransitionWorkspace
+	return p.ValidateRetainedPruneAuthorityWithWorkspace(
+		published, catalogGeneration, certificate, &workspace,
+	)
+}
+
+// ValidateRetainedPruneAuthorityWithWorkspace reuses certificate hash state.
+func (p *Partitioner) ValidateRetainedPruneAuthorityWithWorkspace(
+	published *distribution.Manifest,
+	catalogGeneration uint64,
+	certificate CutoverCertificate,
+	workspace *PublicationTransitionWorkspace,
+) error {
+	if p == nil || published == nil || workspace == nil ||
+		p.VerifyCutoverCertificateWithWorkspace(certificate, &workspace.cutover) != nil ||
+		catalogGeneration != certificate.SourceCoordinates().RouteGeneration ||
+		published.Distribution() != p.source.Distribution ||
+		published.Version() != p.target {
+		return ErrRetainedPrune
+	}
+	for ordinal := 0; ordinal < published.ShardCount(); ordinal++ {
+		first, ok := published.ShardMetadataAt(ordinal)
+		if !ok || first.Range.Start != p.source.Range.Start {
+			continue
+		}
+		if ordinal+int(p.childCount) > published.ShardCount() {
+			return ErrRetainedPrune
+		}
+		for child := 0; child < int(p.childCount); child++ {
+			shard, childOK := published.ShardMetadataAt(ordinal + child)
+			if !childOK || !splitChildMatches(
+				published, ordinal+child, shard, p.children[child],
+			) {
+				return ErrRetainedPrune
+			}
+		}
+		return nil
+	}
+	return ErrRetainedPrune
 }
 
 // ValidateManifestTransition proves that next changes exactly one source shard
