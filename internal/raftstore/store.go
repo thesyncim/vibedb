@@ -1325,6 +1325,17 @@ func (store *Store) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	return cloneHardState(store.image.hard), cloneConfState(store.header.snapshot.GetMetadata().GetConfState()), nil
 }
 
+// DurableCommit returns the exact persisted HardState commit index without
+// cloning protobuf state. It is safe for bounded control-plane qualification.
+func (store *Store) DurableCommit() (uint64, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := store.checkLocked(); err != nil {
+		return 0, err
+	}
+	return store.image.hard.GetCommit(), nil
+}
+
 // Entries implements raft.Storage and returns detached entry objects.
 func (store *Store) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 	store.mu.RLock()

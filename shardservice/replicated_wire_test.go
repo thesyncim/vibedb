@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 type replicatedTLSWriteMeter struct {
@@ -101,14 +102,20 @@ func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
-		{Operation: ReplicatedProbe, Fence: ReplicatedFence{
+		{Operation: ReplicatedProbe, Authority: authority, Fence: ReplicatedFence{
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
-		{Operation: ReplicatedPropose, Fence: fence, Command: command},
-		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+		{Operation: ReplicatedPropose, Authority: authority, Fence: fence, Command: command},
+		{Operation: ReplicatedMembership, Authority: authority, Fence: fence, Membership: ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{3},
+			MetadataEpoch: 5, CatalogGeneration: 7, ExpectedReplicaSetVersion: 1,
+			SourceMember: fence.MemberID, TargetMember: fence.MemberID + 1,
+		}},
+		{Operation: ReplicatedReadLeader, Authority: authority, Fence: fence, Relation: 1,
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
-		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+		{Operation: ReplicatedReadFollower, Authority: authority, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
@@ -126,8 +133,8 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decoded.Operation != request.Operation || decoded.Fence != request.Fence ||
-			!bytes.Equal(decoded.Command, request.Command) ||
+		if decoded.Operation != request.Operation || decoded.Authority != request.Authority || decoded.Fence != request.Fence ||
+			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
 			decoded.MinimumApplied != request.MinimumApplied ||
 			decoded.MaxValueBytes != request.MaxValueBytes {
@@ -152,6 +159,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 				CompletionBytes: len(completion)}, Completion: completion},
 		{Kind: ReplicatedNotLeader, HasState: true, State: state},
 		{Kind: ReplicatedOutcomeUnknown, HasState: true, State: state},
+		{Kind: ReplicatedMembershipAccepted, HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
@@ -178,6 +186,77 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
 		}
+	}
+}
+
+func BenchmarkReplicatedMembershipWire(b *testing.B) {
+	request := &ReplicatedRequest{Operation: ReplicatedMembership, Fence: testReplicatedFence(),
+		Membership: ReplicatedMembershipRequest{Kind: raftservice.MembershipPromoteVoter,
+			TransitionID: [16]byte{4}, MetadataEpoch: 5, CatalogGeneration: 6,
+			ExpectedReplicaSetVersion: 7, SourceMember: 1, TargetMember: 2}}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		b.Fatal(err)
+	}
+	data := encoded.Bytes()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for range b.N {
+		decoded, err := DecodeReplicatedRequest(bytes.NewReader(data))
+		if err != nil || decoded.Membership.TargetMember != 2 {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestReplicatedMembershipDecodeAllocationBound(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedMembership, Fence: testReplicatedFence(),
+		Membership: ReplicatedMembershipRequest{Kind: raftservice.MembershipAddLearner,
+			TransitionID: [16]byte{5}, MetadataEpoch: 6, CatalogGeneration: 7,
+			ExpectedReplicaSetVersion: 1, SourceMember: 7, TargetMember: 8}}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatal(err)
+	}
+	data := encoded.Bytes()
+	var reader bytes.Reader
+	allocations := testing.AllocsPerRun(1000, func() {
+		reader.Reset(data)
+		decoded, err := DecodeReplicatedRequest(&reader)
+		if err != nil || decoded.Membership.TargetMember != 8 {
+			panic("membership decode")
+		}
+	})
+	if allocations > 4 {
+		t.Fatalf("membership decode allocations = %.1f, want <= 4", allocations)
+	}
+}
+
+func TestReplicatedMembershipPreflightsExactBodyBeforeAllocation(t *testing.T) {
+	var header [5]byte
+	header[0] = tagReplicatedMembershipRequest
+	binary.BigEndian.PutUint32(header[1:], uint32(4+replicatedMembershipRequestBodyBytes+1))
+	var reader bytes.Reader
+	allocations := testing.AllocsPerRun(1000, func() {
+		reader.Reset(header[:])
+		if _, err := DecodeReplicatedRequest(&reader); !errors.Is(err, ErrReplicatedWire) {
+			panic("membership preflight")
+		}
+	})
+	if allocations > 1 {
+		t.Fatalf("oversized membership preflight allocations = %.1f, want <= 1", allocations)
+	}
+	binary.BigEndian.PutUint32(header[1:], uint32(4+replicatedMembershipRequestBodyBytes))
+	badPrefix := append(header[:], replicatedWireVersion+1, byte(ReplicatedMembership))
+	allocations = testing.AllocsPerRun(1000, func() {
+		reader.Reset(badPrefix)
+		if _, err := DecodeReplicatedRequest(&reader); !errors.Is(err, ErrReplicatedWire) {
+			panic("membership prefix preflight")
+		}
+	})
+	if allocations > 2 {
+		t.Fatalf("bad membership prefix allocations = %.1f, want <= 2", allocations)
 	}
 }
 

@@ -309,7 +309,8 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 	if err := fixture.runtime.ReadIndex([]byte("after-proposals")); !errors.Is(err, raftmodel.ErrReadyPending) {
 		t.Fatalf("ReadIndex across proposal batch = %v", err)
 	}
-	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(2)}
+	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(2),
+		Context: make([]byte, MembershipTransitionDigestBytes)}
 	if err := fixture.runtime.ProposeConfChange(change); !errors.Is(err, raftmodel.ErrReadyPending) {
 		t.Fatalf("ProposeConfChange across proposal batch = %v", err)
 	}
@@ -566,6 +567,7 @@ func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
 	peer := fixture.runtime.identity.MemberID + 1
 	change := &pb.ConfChange{
 		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(peer),
+		Context: make([]byte, MembershipTransitionDigestBytes),
 	}
 	if err := fixture.runtime.ProposeConfChange(change); err != nil {
 		t.Fatal(err)
@@ -613,6 +615,178 @@ func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
 	if err != nil || publication.Applied < outcomes[0].Barrier.Index {
 		t.Fatalf("published cut %+v behind outcome %+v: %v", publication, outcomes[0], err)
 	}
+}
+
+func TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply(t *testing.T) {
+	fixture := newRuntimeFixture(t, 222, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	target := fixture.runtime.identity.MemberID + 1
+	digest := MembershipTransitionDigest(fixture.runtime.identity.Group,
+		[16]byte{1}, 2, 3, fixture.runtime.identity.MemberID, target)
+	if err := fixture.runtime.ProposeConfChange(&pb.ConfChange{
+		Type: pb.ConfChangeAddNode.Enum(), NodeId: runtimeUint64Ptr(target),
+		Context: append([]byte(nil), digest[:]...),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	workspace := new(ReadyWorkspace)
+	var proof DurablePromotionProof
+	var found bool
+	var err error
+	for step := 0; step < 32 && !found; step++ {
+		result, driveErr := fixture.runtime.DriveReady(workspace, nil, settleTestApplied)
+		if driveErr != nil {
+			t.Fatalf("drive step %d = %+v, %v", step, result, driveErr)
+		}
+		if !result.Progressed() {
+			t.Fatalf("runtime became idle before durable promotion at step %d", step)
+		}
+		if result.Kind == DriveEntry {
+			t.Fatal("promotion applied before its durable commit witness was observed")
+		}
+		if result.Kind != DrivePersisted {
+			continue
+		}
+		proof, found, err = fixture.runtime.DurablePromotion(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := fixture.runtime.Publication()
+	if err != nil || !found || proof.TargetMember != target ||
+		proof.Version <= before.ReplicaSetVersion || proof.AuthorizationDigest != digest {
+		t.Fatalf("proof=%+v found=%t publication=%+v err=%v", proof, found, before, err)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_ = fixture.runtime.node.PublishedApplied()
+	}); allocations != 0 {
+		t.Fatalf("published applied coordinate allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_, _, _ = fixture.runtime.DurablePromotion(target)
+	}); allocations != 0 {
+		t.Fatalf("cached durable promotion allocations = %v, want 0", allocations)
+	}
+}
+
+func TestRuntimeRejectsDurableUncommittedPromotionAfterRestart(t *testing.T) {
+	identity := testWALIdentity(223)
+	peer := identity.MemberID + 1
+	target := peer + 1
+	fixture := newRuntimeFixture(t, 223, []uint64{identity.MemberID, peer})
+	drainRuntime(t, fixture.runtime, nil)
+	electRuntimeWithPeer(t, fixture.runtime, identity.MemberID, peer)
+	digest := MembershipTransitionDigest(fixture.runtime.identity.Group,
+		[16]byte{2}, 3, 4, identity.MemberID, target)
+	if err := fixture.runtime.ProposeConfChange(&pb.ConfChange{
+		Type: pb.ConfChangeAddNode.Enum(), NodeId: runtimeUint64Ptr(target),
+		Context: append([]byte(nil), digest[:]...),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var promotion *pb.Message
+	drainRuntime(t, fixture.runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgApp && outbound.To == peer &&
+			len(outbound.Message.GetEntries()) != 0 {
+			promotion = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if promotion == nil {
+		t.Fatal("promotion produced no durable append")
+	}
+	lastPromotion := promotion.GetEntries()[len(promotion.GetEntries())-1].GetIndex()
+	commit, err := fixture.wal.DurableCommit()
+	if err != nil || lastPromotion <= commit {
+		t.Fatalf("promotion index=%d durable commit=%d err=%v", lastPromotion, commit, err)
+	}
+	if proof, found, err := fixture.runtime.DurablePromotion(target); err != nil || found {
+		t.Fatalf("uncommitted proof=%+v found=%t err=%v", proof, found, err)
+	}
+	if err = fixture.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedWAL, err := raftstore.Open(fixture.walPath, fixture.walID,
+		testTopologyRecoveryEpoch, fixture.walKey, fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedDB, reopenedApply, err := OpenBoundSQLWithApply(fixture.sqlPath,
+		reopenedWAL, testAuthorityProfile(), fixture.base, fixture.applyID)
+	if err != nil {
+		_ = reopenedWAL.Close()
+		t.Fatal(err)
+	}
+	restarted, err := AdoptRuntime(reopenedWAL, reopenedDB, reopenedApply)
+	if err != nil {
+		if restarted != nil {
+			_ = restarted.Close()
+		}
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	if proof, found, err := restarted.DurablePromotion(target); err != nil || found {
+		t.Fatalf("reopened uncommitted proof=%+v found=%t err=%v", proof, found, err)
+	}
+}
+
+func electRuntimeWithPeer(t testing.TB, runtime *Runtime, local, peer uint64) {
+	t.Helper()
+	if err := runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	var preVote *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgPreVote && outbound.To == peer {
+			preVote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if preVote == nil {
+		t.Fatal("campaign produced no pre-vote")
+	}
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgPreVoteResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(preVote.GetTerm())}); err != nil {
+		t.Fatal(err)
+	}
+	var vote *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgVote && outbound.To == peer {
+			vote = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if vote == nil {
+		t.Fatal("pre-vote produced no vote")
+	}
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgVoteResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(vote.GetTerm())}); err != nil {
+		t.Fatal(err)
+	}
+	var appendMessage *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.Message.GetType() == pb.MsgApp && outbound.To == peer &&
+			len(outbound.Message.GetEntries()) != 0 {
+			appendMessage = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if appendMessage == nil {
+		t.Fatal("election produced no leader append")
+	}
+	last := appendMessage.GetEntries()[len(appendMessage.GetEntries())-1].GetIndex()
+	if err := runtime.StepMessage(&pb.Message{Type: pb.MsgAppResp.Enum(),
+		From: runtimeUint64Ptr(peer), To: runtimeUint64Ptr(local),
+		Term: runtimeUint64Ptr(appendMessage.GetTerm()), Index: runtimeUint64Ptr(last)}); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, runtime, nil)
 }
 
 func TestRuntimePersistsBeforeOutboundAndRetriesSink(t *testing.T) {
