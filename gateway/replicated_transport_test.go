@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,34 @@ func TestAuthenticatedReplicatedClientRejectsMissingTLSCapability(t *testing.T) 
 		MaxWaiters: 1, MaxIdleAge: time.Second, MaxLifetime: time.Minute,
 	}); !errors.Is(err, ErrReplicatedTLSProfile) {
 		t.Fatalf("missing TLS error = %v", err)
+	}
+}
+
+func TestAuthenticatedReplicatedClientDefaultsAndBoundsControlReserve(t *testing.T) {
+	authority := newGatewayTLSAuthority(t)
+	profile := authority.profile(t, gatewayPeerIdentity(9, 17))
+	options := AuthenticatedReplicatedClientOptions{
+		TLS: profile, Dial: func(context.Context, string) (net.Conn, error) { return nil, errors.New("unused") },
+		HandshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		MaxConnections:    2, MaxPerEndpoint: 2, MaxIdlePerEndpoint: 1, MaxHandshakes: 2,
+		MaxWaiters: 2, MaxIdleAge: time.Second, MaxLifetime: time.Minute,
+	}
+	client, err := NewAuthenticatedReplicatedClient(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats := client.Stats(); stats.ReservedControlConnections != 1 || stats.ReservedControlHandshakes != 1 {
+		t.Fatalf("default reserves = %+v", stats)
+	}
+	_ = client.Close()
+	options.ReservedControlConnections = options.MaxConnections
+	if _, err = NewAuthenticatedReplicatedClient(options); !errors.Is(err, ErrReplicatedTLSProfile) {
+		t.Fatalf("connection reserve bound = %v", err)
+	}
+	options.ReservedControlConnections = 1
+	options.ReservedControlHandshakes = options.MaxHandshakes
+	if _, err = NewAuthenticatedReplicatedClient(options); !errors.Is(err, ErrReplicatedTLSProfile) {
+		t.Fatalf("handshake reserve bound = %v", err)
 	}
 }
 
@@ -59,6 +88,208 @@ func testPooledClient(t *testing.T, endpoint ReplicatedEndpoint, serve func(net.
 		perEndpoint: make(map[replicatedTransportEndpoint]int), idle: make(map[replicatedTransportEndpoint][]*pooledReplicatedConn), active: make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
 	}
 	return client, &dials
+}
+
+func testCapacityClient(t *testing.T, maxConnections, controlReserve int) (*AuthenticatedReplicatedClient, *atomic.Uint64) {
+	t.Helper()
+	var dials atomic.Uint64
+	client := &AuthenticatedReplicatedClient{
+		dial: func(context.Context, string) (net.Conn, error) {
+			dials.Add(1)
+			local, peer := net.Pipe()
+			go func() {
+				_, _ = io.Copy(io.Discard, peer)
+				_ = peer.Close()
+			}()
+			return local, nil
+		},
+		authenticate: func(_ context.Context, raw net.Conn, node rafttransport.NodeID, class rafttransport.TrafficClass, _ rafttransport.DeadlineFunc) (rafttransport.PeerConnection, error) {
+			if class != rafttransport.TrafficShardNative {
+				return nil, errors.New("wrong capability")
+			}
+			return &testAuthenticatedConnection{Conn: raw, identity: rafttransport.PeerIdentity{Node: node}}, nil
+		},
+		handshakeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		maxConnections:    maxConnections, maxPerEndpoint: maxConnections, maxIdlePerEndpoint: 1,
+		maxHandshakes: maxConnections, handshakeReserve: controlReserve,
+		controlReserve: controlReserve, maxWaiters: maxConnections,
+		maxIdleAge: time.Minute, maxLifetime: time.Hour, generation: 1,
+		perEndpoint: make(map[replicatedTransportEndpoint]int),
+		idle:        make(map[replicatedTransportEndpoint][]*pooledReplicatedConn),
+		active:      make(map[*pooledReplicatedConn]struct{}), wake: make(chan struct{}),
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return client, &dials
+}
+
+func testCapacityEndpoint(index byte) ReplicatedEndpoint {
+	return ReplicatedEndpoint{
+		Member: uint64(index) + 1, Node: rafttransport.NodeID{index + 1},
+		StoreID: [16]byte{index + 1}, NodeIncarnation: 1,
+		Address: "endpoint-" + strconv.Itoa(int(index)),
+	}
+}
+
+func TestAuthenticatedReplicatedClientEvictsGlobalOldestIdleOnEndpointChurn(t *testing.T) {
+	client, dials := testCapacityClient(t, 4, 1)
+	for index := byte(0); index < 64; index++ {
+		connection, err := client.acquire(context.Background(), testCapacityEndpoint(index))
+		if err != nil {
+			t.Fatalf("acquire endpoint %d: %v", index, err)
+		}
+		client.release(connection, true)
+	}
+	stats := client.Stats()
+	if dials.Load() != 64 || stats.Connections != 4 || stats.Idle != 4 || stats.IdleEvictions != 60 {
+		t.Fatalf("churn stats = %+v dials=%d", stats, dials.Load())
+	}
+	connection, err := client.acquire(context.Background(), testCapacityEndpoint(63))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.release(connection, true)
+	if dials.Load() != 64 || client.Stats().Reuses != 1 {
+		t.Fatalf("hot endpoint was not reused: stats=%+v dials=%d", client.Stats(), dials.Load())
+	}
+}
+
+func TestAuthenticatedReplicatedClientControlProgressWhileDataSaturates(t *testing.T) {
+	client, _ := testCapacityClient(t, 3, 1)
+	first, err := client.acquire(context.Background(), testCapacityEndpoint(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.acquire(context.Background(), testCapacityEndpoint(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	waiting := make(chan error, 1)
+	go func() {
+		_, acquireErr := client.acquire(waitCtx, testCapacityEndpoint(3))
+		waiting <- acquireErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().DataWaiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.Stats(); stats.DataInUse != 2 || stats.DataWaiters != 1 ||
+		stats.ReservedControlConnections != 1 || stats.ReservedControlHandshakes != 1 {
+		t.Fatalf("data saturation stats = %+v", stats)
+	}
+	control, err := client.acquireClass(context.Background(), testCapacityEndpoint(4), true)
+	if err != nil {
+		t.Fatalf("control acquire behind saturated data: %v", err)
+	}
+	if stats := client.Stats(); stats.Connections != 3 || stats.DataInUse != 2 {
+		t.Fatalf("control progress stats = %+v", stats)
+	}
+	client.release(control, true)
+	cancelWait()
+	if err := <-waiting; !errors.Is(err, context.Canceled) {
+		t.Fatalf("data waiter cancellation = %v", err)
+	}
+	client.release(first, true)
+	client.release(second, true)
+	if stats := client.Stats(); stats.Waiters != 0 || stats.DataWaiters != 0 || stats.ControlWaiters != 0 || stats.DataInUse != 0 {
+		t.Fatalf("settled stats = %+v", stats)
+	}
+}
+
+func TestAuthenticatedReplicatedClientReservesControlHandshake(t *testing.T) {
+	client, _ := testCapacityClient(t, 3, 1)
+	entered := make(chan rafttransport.NodeID, 3)
+	unblock := make(chan struct{})
+	client.authenticate = func(_ context.Context, raw net.Conn, node rafttransport.NodeID, _ rafttransport.TrafficClass, _ rafttransport.DeadlineFunc) (rafttransport.PeerConnection, error) {
+		entered <- node
+		<-unblock
+		return &testAuthenticatedConnection{Conn: raw, identity: rafttransport.PeerIdentity{Node: node}}, nil
+	}
+	type acquireResult struct {
+		connection *pooledReplicatedConn
+		err        error
+	}
+	results := make(chan acquireResult, 4)
+	for _, index := range []byte{1, 2, 3} {
+		endpoint := testCapacityEndpoint(index)
+		go func() {
+			connection, err := client.acquire(context.Background(), endpoint)
+			results <- acquireResult{connection: connection, err: err}
+		}()
+	}
+	for range 2 {
+		<-entered
+	}
+	select {
+	case node := <-entered:
+		t.Fatalf("third data handshake consumed reserved slot: node=%x", node)
+	case <-time.After(10 * time.Millisecond):
+	}
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().DataWaiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	controlEndpoint := testCapacityEndpoint(4)
+	go func() {
+		connection, err := client.acquireClass(context.Background(), controlEndpoint, true)
+		results <- acquireResult{connection: connection, err: err}
+	}()
+	select {
+	case node := <-entered:
+		if node != controlEndpoint.Node {
+			t.Fatalf("reserved handshake went to node=%x want=%x", node, controlEndpoint.Node)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control handshake did not enter reserved slot")
+	}
+	if stats := client.Stats(); stats.Handshakes != 3 || stats.DataInUse != 2 || stats.Waiters != 1 {
+		t.Fatalf("reserved handshake stats = %+v", stats)
+	}
+	close(unblock)
+	for range 4 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		client.release(result.connection, true)
+	}
+	if stats := client.Stats(); stats.Handshakes != 0 || stats.Waiters != 0 || stats.DataInUse != 0 {
+		t.Fatalf("completed reserved handshake stats = %+v", stats)
+	}
+}
+
+func TestAuthenticatedReplicatedClientControlWaitCancellationStats(t *testing.T) {
+	client, _ := testCapacityClient(t, 2, 1)
+	data, err := client.acquire(context.Background(), testCapacityEndpoint(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := client.acquireClass(context.Background(), testCapacityEndpoint(2), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, acquireErr := client.acquireClass(waitCtx, testCapacityEndpoint(3), true)
+		result <- acquireErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for client.Stats().ControlWaiters != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := client.Stats(); stats.ControlWaiters != 1 || stats.DataWaiters != 0 {
+		t.Fatalf("control waiter stats = %+v", stats)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("control waiter cancellation = %v", err)
+	}
+	client.release(control, true)
+	client.release(data, true)
+	if stats := client.Stats(); stats.Waiters != 0 || stats.ControlWaiters != 0 || stats.DataWaiters != 0 {
+		t.Fatalf("canceled waiter remained: %+v", stats)
+	}
 }
 
 func TestAuthenticatedReplicatedClientHardHandshakeBoundAndStats(t *testing.T) {
