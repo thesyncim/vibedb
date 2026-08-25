@@ -96,9 +96,6 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.pausePromotion = true
 	voterConf := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
 	cluster.driveUntil(func() bool {
-		if !cluster.promotionPaused {
-			return false
-		}
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 3 ||
@@ -108,6 +105,18 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		}
 		return true
 	})
+	// Committing voters need not send the new commit index to a learner in the
+	// same append exchange. Drive one real heartbeat turn so member 4 durably
+	// learns the quorum commit before the test pauses its apply. This is a
+	// protocol gate, not a timing allowance: production clocks provide the same
+	// heartbeat, and DurablePromotion remains false until that HardState is
+	// persisted locally.
+	if !cluster.promotionPaused {
+		if err := hosts[0].RequestTick(group); err != nil {
+			t.Fatal(err)
+		}
+		cluster.driveUntil(func() bool { return cluster.promotionPaused })
+	}
 	beforeRestart, err := hosts[3].Publication(group)
 	if err != nil || !proto.Equal(beforeRestart.ConfState, learnerConf) ||
 		beforeRestart.ReplicaSetVersion >= 3 {

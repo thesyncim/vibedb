@@ -615,17 +615,29 @@ func TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := new(ReadyWorkspace)
-	if result, err := fixture.runtime.DriveReady(workspace, nil, settleTestApplied); err != nil || result.Kind != DriveCaptured {
-		t.Fatalf("capture = %+v, %v", result, err)
-	}
-	if result, err := fixture.runtime.DriveReady(workspace, nil, settleTestApplied); err != nil || result.Kind != DrivePersisted {
-		t.Fatalf("persist = %+v, %v", result, err)
+	var proof DurablePromotionProof
+	var found bool
+	var err error
+	for step := 0; step < 32 && !found; step++ {
+		result, driveErr := fixture.runtime.DriveReady(workspace, nil, settleTestApplied)
+		if driveErr != nil {
+			t.Fatalf("drive step %d = %+v, %v", step, result, driveErr)
+		}
+		if !result.Progressed() {
+			t.Fatalf("runtime became idle before durable promotion at step %d", step)
+		}
+		if result.Kind == DriveEntry {
+			t.Fatal("promotion applied before its durable commit witness was observed")
+		}
+		if result.Kind != DrivePersisted {
+			continue
+		}
+		proof, found, err = fixture.runtime.DurablePromotion(target)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	before, err := fixture.runtime.Publication()
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof, found, err := fixture.runtime.DurablePromotion(target)
 	if err != nil || !found || proof.TargetMember != target ||
 		proof.Version <= before.ReplicaSetVersion || proof.AuthorizationDigest != digest {
 		t.Fatalf("proof=%+v found=%t publication=%+v err=%v", proof, found, before, err)
