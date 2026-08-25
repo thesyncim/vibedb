@@ -228,7 +228,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
 	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
-		t, ctx, owners[follower], group, PointReadRequest{Relation: 1, Key: key,
+		t, ctx, owners[follower], readSources[follower], group, PointReadRequest{Relation: 1, Key: key,
 			MinimumApplied: acknowledged.Outcome.AppliedIndex,
 			MaxValueBytes:  replication.MaxMutationValueBytes,
 		})
@@ -238,7 +238,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	followerLease.Release()
 	var lease PointReadLease
-	if _, lease, _, err := readRF3PointAtFreshFence(t, ctx, owners[follower], group, PointReadRequest{
+	if _, lease, _, err := readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: acknowledged.Outcome.AppliedIndex,
 		MaxValueBytes:  len(followerRead.Value),
@@ -247,7 +247,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	} else if lease != nil {
 		t.Fatal("response-bound refusal returned a lease")
 	}
-	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], group, PointReadRequest{
+	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: followerRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes,
@@ -280,7 +280,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	leader = waitRF3Leader(t, ctx, owners, nil, group)
 	linearRead, linearLease, leaderState, err := readRF3PointAtFreshFence(
-		t, ctx, owners[leader], group, PointReadRequest{Relation: 1, Key: key,
+		t, ctx, owners[leader], readSources[leader], group, PointReadRequest{Relation: 1, Key: key,
 			MinimumApplied: acknowledged.Outcome.AppliedIndex,
 			MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
 		})
@@ -288,7 +288,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
-	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], group, PointReadRequest{
+	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: linearRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
@@ -409,6 +409,7 @@ func readRF3PointAtFreshFence(
 	t testing.TB,
 	ctx context.Context,
 	owner *Owner,
+	source ReadSource,
 	group raftmember.GroupKey,
 	request PointReadRequest,
 ) (PointReadResult, PointReadLease, ServingState, error) {
@@ -423,6 +424,18 @@ func readRF3PointAtFreshFence(
 		if errors.Is(err, ErrServingFence) {
 			if lease != nil {
 				t.Fatal("stale serving fence returned a read lease")
+			}
+			refreshed, probeErr := owner.Probe(ctx, group)
+			if probeErr != nil {
+				return PointReadResult{}, nil, ServingState{}, probeErr
+			}
+			if refreshed.Fence() == request.Fence {
+				direct, directErr := source.PointReadInto(
+					request.Relation, request.Key, request.MinimumApplied,
+					request.MaxValueBytes, nil,
+				)
+				t.Fatalf("unchanged serving fence rejected: request=%+v snapshot=%+v direct=%v",
+					request.Fence, direct.Fence, directErr)
 			}
 			// Let the pulse/transport goroutines settle the term observed by
 			// Probe; a tight test retry loop can otherwise create its own
