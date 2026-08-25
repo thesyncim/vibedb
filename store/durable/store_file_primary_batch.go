@@ -550,16 +550,11 @@ func (c *Collection) planPrimaryBatchOverflow(state *fileStoreState) error {
 	}
 	running := state.fileEnd
 	if len(c.primaryPendingParents) == 0 {
-		transactionPages := uint64(c.options.maxTransactionPages)
-		maximumPage := uint64(c.options.MaxPageSize)
-		if maximumPage == 0 || transactionPages > math.MaxUint64/maximumPage {
-			return storeio.ErrInvalidWrite
+		var reserveErr error
+		running, reserveErr = c.primaryVolatileReservationEnd(running)
+		if reserveErr != nil {
+			return reserveErr
 		}
-		gap := transactionPages * maximumPage
-		if running > math.MaxUint64-gap {
-			return storeio.ErrInvalidWrite
-		}
-		running += gap
 	}
 	nextLogicalID := state.root.NextLogicalID
 	c.batchPrimaryOverflowPages = 0

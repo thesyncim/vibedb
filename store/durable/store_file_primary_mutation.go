@@ -1293,19 +1293,17 @@ func (c *Collection) cowBufferedPrimaryMutation(
 	}
 
 	// The new pages this mutation admits occupy the collection's volatile file
-	// region above the current FileEnd. The first pending parent reserves a gap
-	// wide enough for one worst-case checkpoint transaction below it, so a later
+	// region above the current FileEnd. The first pending parent reserves the
+	// byte-exact worst-case checkpoint append span below it, so a later
 	// materialize allocates its durable pages from the checkpoint base's FileEnd
 	// without colliding with any volatile page.
 	baseOffset := state.fileEnd
 	if len(c.primaryPendingParents) == 0 {
-		gap := uint64(c.options.maxTransactionPages) *
-			uint64(c.options.MaxPageSize)
-		if baseOffset > math.MaxUint64-gap {
-			return storeio.PageRef{}, false, false,
-				storeio.ErrInvalidWrite
+		var reserveErr error
+		baseOffset, reserveErr = c.primaryVolatileReservationEnd(baseOffset)
+		if reserveErr != nil {
+			return storeio.PageRef{}, false, false, reserveErr
 		}
-		baseOffset += gap
 	}
 
 	// Every frame admitted from here to the publish is tracked so any error
@@ -2877,6 +2875,21 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	if err != nil {
 		return err
 	}
+	// Volatile primary frames begin at this exact persisted-address boundary.
+	// Keep the normalization proof executable: if a future page kind or fold
+	// geometry can append more than the byte-exact transaction budget, refuse
+	// publication before it can alias an acknowledged frame. Reuse only lowers
+	// tx.FileEnd, so the append high-water is the complete collision condition.
+	reservationEnd, err := c.primaryVolatileReservationEnd(base.fileEnd)
+	if err != nil {
+		return err
+	}
+	if tx.FileEnd() > reservationEnd {
+		return fmt.Errorf(
+			"%w: primary checkpoint append high-water %d exceeds reserved boundary %d",
+			storeio.ErrTooManyPages, tx.FileEnd(), reservationEnd,
+		)
+	}
 	if exactActive {
 		nextState.root.ExactIndexRoot = exactRoot
 	}
@@ -2969,6 +2982,26 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	// and the base selection above then drops the pointer.
 	c.primaryCheckpointBase = nextState
 	return nil
+}
+
+// primaryVolatileReservationEnd returns the first address available to
+// buffered primary frames while a durable checkpoint still allocates from
+// fileEnd. The namespace remains the ordinary persisted file-offset namespace:
+// identities survive journal replay and require no process-local discriminator.
+//
+// maxTransactionPhysicalBytes is the normalized sum of the transaction's
+// actual persisted extent classes: variable leaf/overflow/index extents at
+// their certified maxima plus the routing metadata's exact physical widths. A
+// tail allocation advances by exactly its extent length and reusable allocations
+// do not advance it, so this is a strict append bound. The publication check in
+// materializePrimaryParentsOnceLocked keeps that derivation fail-closed as the
+// transaction grammar evolves.
+func (c *Collection) primaryVolatileReservationEnd(fileEnd uint64) (uint64, error) {
+	reserve := c.options.maxTransactionPhysicalBytes
+	if reserve == 0 || fileEnd > math.MaxUint64-reserve {
+		return 0, storeio.ErrInvalidWrite
+	}
+	return fileEnd + reserve, nil
 }
 
 // preparePrimaryLeafMutation applies the exceptional copy-on-write mutation
