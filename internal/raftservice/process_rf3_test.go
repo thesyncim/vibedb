@@ -1231,7 +1231,7 @@ func buildProcessRuntime(
 	apply, _, err := raftmember.OpenPreparedApply(
 		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 64 << 20},
+			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 				TupleVersion:  distribution.CurrentTupleVersion,

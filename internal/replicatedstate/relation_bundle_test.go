@@ -138,6 +138,66 @@ func newRelationBundleFixtureWithCollectionOptions(
 	}
 }
 
+func TestCheckpointBundleRejectsUnreservedTransitionCapture(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	file, err := os.OpenFile(
+		filepath.Join(t.TempDir(), "unreserved-capture.vdb"),
+		os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection, err := durable.Create(file, durable.Options{})
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	defer file.Close()
+	defer collection.Close()
+	capture := &sessionLeaseCapture{target: TransitionCaptureTarget{
+		Name: "unreserved-capture", Collection: collection,
+	}}
+	if err = fixture.machine.BeginTransitionCapture(capture); !errors.Is(err, ErrTransitionCapture) {
+		t.Fatalf("unreserved checkpoint capture = %v, want ErrTransitionCapture", err)
+	}
+	if collection.Len() != 0 {
+		t.Fatal("unreserved checkpoint capture mutated its target")
+	}
+}
+
+func TestBaseRelationCaptureExcludesGlobalIndexMutations(t *testing.T) {
+	baseFirst := finalMutation{key: []byte("base-a"), value: []byte(`{"id":"a"}`)}
+	baseSecond := finalMutation{key: []byte("base-b"), delete: true, beforeFound: true,
+		before: []byte(`{"id":"b"}`)}
+	global := finalMutation{key: []byte("global-by-id/a"), value: []byte(`["a"]`)}
+	changes := []finalMutation{baseFirst, baseSecond, global}
+	spans := []plannedRelationChanges{
+		{ordinal: 0, start: 0, end: 2},
+		{ordinal: 1, start: 2, end: 3},
+	}
+
+	captured := baseRelationChanges(changes, spans)
+	if len(captured) != 2 || !bytes.Equal(captured[0].key, baseFirst.key) ||
+		!bytes.Equal(captured[1].key, baseSecond.key) {
+		t.Fatalf("base capture = %+v, want only two base-row mutations", captured)
+	}
+	for i := range captured {
+		if bytes.Equal(captured[i].key, global.key) {
+			t.Fatal("global-index maintenance escaped into base-row split capture")
+		}
+	}
+	if got := baseRelationChanges(changes, []plannedRelationChanges{{
+		ordinal: 1, start: 0, end: 3,
+	}}); got != nil {
+		t.Fatalf("global-only capture = %+v, want nil", got)
+	}
+	if got := baseRelationChanges(changes, []plannedRelationChanges{{
+		ordinal: 0, start: 0, end: 4,
+	}}); got != nil {
+		t.Fatalf("out-of-bounds capture = %+v, want nil", got)
+	}
+}
+
 func (f relationBundleFixture) command(
 	t testing.TB,
 	sequence uint64,

@@ -27,10 +27,13 @@ import (
 )
 
 func testReplicatedApplyOptions() ReplicatedApplyOptions {
+	const captureQualifiedTxnBytes = 384 << 20
+	limits := defaultDriverTxnLimits()
+	limits.MaxBytes = captureQualifiedTxnBytes
 	return ReplicatedApplyOptions{
 		MaxSessions: 128,
 		RetryWindow: 8,
-		TxnLimits:   defaultDriverTxnLimits(),
+		TxnLimits:   limits,
 		Placement: ReplicatedPlacementProfile{
 			Format: ReplicatedPlacementProfileFormat, ShardKey: "/id",
 			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
@@ -1683,6 +1686,58 @@ func TestReplicatedApplyTwoStorePublicationFencesFailClosed(t *testing.T) {
 	}
 }
 
+func TestReplicatedApplySecondAdoptionFailureDetachesAndRecovers(t *testing.T) {
+	for _, detachFault := range []bool{false, true} {
+		t.Run(fmt.Sprintf("detach-fault-%t", detachFault), func(t *testing.T) {
+			_, database, base := bindReplicatedApplyTestRoot(t, "capture-partial-adoption")
+			core := database.connector.db
+			adoptFault := errors.New("injected capture adoption failure")
+			detachError := errors.New("injected adopted-base detach failure")
+			adoptions := 0
+			core.adoptCollection = func(collection *durable.Collection) error {
+				adoptions++
+				if adoptions == 2 {
+					return adoptFault
+				}
+				return core.txnLog.AdoptCollection(collection)
+			}
+			if detachFault {
+				core.detachCollection = func(*durable.Collection) error { return detachError }
+			}
+			claim, identity, err := database.OpenReplicatedApply(
+				base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+			)
+			if claim != nil || identity != (ReplicatedApplyIdentity{}) ||
+				!errors.Is(err, adoptFault) || (detachFault && !errors.Is(err, detachError)) {
+				t.Fatalf("partial adoption = %p,%+v,%v", claim, identity, err)
+			}
+			core.mu.RLock()
+			published := core.catalog.ReplicatedApply != nil
+			retained := core.replicatedApplyCollection != nil || core.replicatedApplyFile != nil ||
+				core.replicatedCaptureCollection != nil || core.replicatedCaptureFile != nil
+			core.mu.RUnlock()
+			if published || retained != detachFault {
+				t.Fatalf("failure ownership: published=%t retained=%t, want retained=%t",
+					published, retained, detachFault)
+			}
+			core.adoptCollection = nil
+			core.detachCollection = nil
+			claim, identity, err = database.OpenReplicatedApply(
+				base, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+			)
+			if err != nil || claim == nil || identity.Storage == "" || identity.CaptureStorage == "" {
+				t.Fatalf("retry after partial adoption = %p,%+v,%v", claim, identity, err)
+			}
+			if err = claim.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = database.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestReplicatedApplyRejectsForeignCaptureStore(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "capture-binding-a")
 	options := testReplicatedApplyOptions()
@@ -2709,6 +2764,29 @@ func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(
 	if err != nil || capture.Head() != 2 {
 		t.Fatalf("begin capture head=%d err=%v", capture.Head(), err)
 	}
+	// Crash/reopen directly after the first header publication. The header is a
+	// checkpoint-group-owned transition, so recovery must observe it even when
+	// no captured Raft entry has followed it yet.
+	if err = claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = OpenReplicatedShardStoreWithApply(path, base, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, reopenedIdentity, err := database.OpenReplicatedApply(
+		base, testReplicatedApplyBootstrap(), options,
+	)
+	if err != nil || reopenedIdentity != identity {
+		t.Fatalf("header-only reopen identity=%+v err=%v", reopenedIdentity, err)
+	}
+	capture, err = claim.BeginRangeSplitCapture(partitioner)
+	if err != nil || capture.Head() != 2 {
+		t.Fatalf("recovered header-only capture head=%d err=%v", capture.Head(), err)
+	}
 	document := []byte(`{"id":"capture","value":1}`)
 	key := testReplicatedApplyKey(t, database, document)
 	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{
@@ -2793,6 +2871,83 @@ func replicatedApplyCapturePartitioner(
 		t.Fatal(err)
 	}
 	return partitioner
+}
+
+func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
+	_, database, binding, local := prepareReplicatedTestRoot(
+		t, "capture-transaction-floor", true,
+	)
+	defer database.Close()
+	core := database.connector.db
+	core.mu.RLock()
+	table := core.tables["docs"]
+	if table == nil || table.collection == nil || table.meta == nil {
+		core.mu.RUnlock()
+		t.Fatal("prepared base table is unavailable")
+	}
+	base := ReplicatedShardStoreIdentity{
+		Format: ReplicatedShardStoreFormat, Binding: binding, LogID: local.LogID,
+		UserTable: "docs", UserStorage: table.meta.Storage,
+		UserPrimaryKey: table.meta.PrimaryKey,
+		UserLimits: ReplicatedShardStoreLimits{
+			MaxKeyBytes:       table.collection.MaxKeyBytes(),
+			MaxDocumentBytes:  table.collection.MaxDocumentBytes(),
+			MaxBatchDocuments: table.collection.MaxBatchDocuments(),
+			MaxBatchBytes:     table.collection.MaxBatchBytes(),
+		},
+		Sidecars:      canonicalReplicatedShardStoreSidecars(),
+		RelationCount: 2, RelationSchemaGeneration: binding.Authority.SchemaGeneration,
+		Relations: make([]ReplicatedShardRelationIdentity, 2),
+	}
+	base.Relations[0] = ReplicatedShardRelationIdentity{
+		Relation: 1, Kind: ReplicatedShardRelationJSON,
+		Table: base.UserTable, Storage: base.UserStorage, Limits: base.UserLimits,
+		LocalIndexDigest: replicatedLocalIndexDigest(table.meta.Indexes),
+	}
+	base.Relations[1] = ReplicatedShardRelationIdentity{
+		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+		Table: "email_index", Storage: base.UserStorage, Limits: base.UserLimits,
+		IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
+	}
+	core.mu.RUnlock()
+	base.RelationManifestDigest = replicatedRelationManifestDigest(base)
+	if err := validateReplicatedShardStoreIdentity(base); err != nil {
+		t.Fatalf("synthetic retained identity: %v", err)
+	}
+	options := testReplicatedApplyOptions()
+	floor, err := ReplicatedApplyTransactionByteFloor(base, options.RetryWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captureLimits, err := replicatedCaptureLimits(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes) +
+		int64(captureLimits.MaxBatchBytes)
+	for ordinal := 0; ordinal < int(base.RelationCount); ordinal++ {
+		want = min(
+			int64(replication.MaxCommandBytes)+
+				int64(replicatedApplySystemLimits(options.RetryWindow).MaxBatchBytes)+
+				int64(captureLimits.MaxBatchBytes),
+			want+int64(base.Relations[ordinal].Limits.MaxBatchBytes),
+		)
+	}
+	if floor != want || floor <= 64<<20 {
+		t.Fatalf("transaction floor=%d want=%d and greater than legacy 64 MiB", floor, want)
+	}
+	exact := options
+	exact.TxnLimits.MaxBytes = floor
+	if err := validateReplicatedApplyOptions(base, exact); err != nil {
+		t.Fatalf("exact transaction floor rejected: %v", err)
+	}
+	oneShort := exact
+	oneShort.TxnLimits.MaxBytes--
+	if err := validateReplicatedApplyOptions(base, oneShort); !errors.Is(
+		err, ErrReplicatedApplyMismatch,
+	) {
+		t.Fatalf("one-byte-short transaction floor = %v", err)
+	}
 }
 
 func TestReplicatedApplyPlacementOptionsFailClosed(t *testing.T) {

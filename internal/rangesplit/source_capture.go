@@ -185,7 +185,10 @@ func (c *SourceCapture) MaxEncodedBytes(
 
 // Begin creates an exact capture base or recovers and verifies every retained
 // record against the current replicated publication.
-func (c *SourceCapture) Begin(state replicatedstate.State) error {
+func (c *SourceCapture) Begin(
+	state replicatedstate.State,
+	publish func(key, value []byte) error,
+) error {
 	if c == nil {
 		return ErrSourceCapture
 	}
@@ -195,7 +198,7 @@ func (c *SourceCapture) Begin(state replicatedstate.State) error {
 		return ErrSourceCapture
 	}
 	if c.target.Collection.Len() == 0 {
-		if !c.partitioner.matchesSource(state) {
+		if publish == nil || !c.partitioner.matchesSource(state) {
 			return ErrSourceCapture
 		}
 		header, cut, err := c.appendHeader(c.encode.raw[:0], state, &c.encode)
@@ -203,9 +206,7 @@ func (c *SourceCapture) Begin(state replicatedstate.State) error {
 			return errors.Join(ErrSourceCapture, err)
 		}
 		binary.BigEndian.PutUint64(c.key[:], sourceCaptureHeaderKey)
-		if err := c.target.Collection.Update(func(batch *durable.WriteBatch) error {
-			return batch.Put(c.key[:], header)
-		}); err != nil {
+		if err := publish(c.key[:], header); err != nil {
 			return err
 		}
 		c.encode.raw = header

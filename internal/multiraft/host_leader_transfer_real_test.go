@@ -364,7 +364,7 @@ func newRealTransferRuntimeWithLearners(
 	}
 	apply, applyID, err := raftmember.OpenPreparedApply(wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 		MaxSessions: 16, RetryWindow: 8,
-		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 256, MaxBytes: 64 << 20},
+		TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 256, MaxBytes: 384 << 20},
 		Placement: sqldriver.ReplicatedPlacementProfile{
 			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 			TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,

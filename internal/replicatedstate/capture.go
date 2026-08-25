@@ -104,7 +104,11 @@ func (t CapturedTransition) Bounds() TransitionCaptureBounds {
 // poisons apply and requires reopen, but cannot roll back that publication.
 type TransitionCapture interface {
 	Target() TransitionCaptureTarget
-	Begin(State) error
+	// Begin creates or recovers the capture header. An empty target must publish
+	// exactly one header through publish; a non-empty target must recover without
+	// calling it. Machine supplies the only mutation authority, so a participant
+	// reserved by a CheckpointGroup never escapes through Collection.Update.
+	Begin(State, func(key, value []byte) error) error
 	MaxEncodedBytes(TransitionCaptureBounds) (int, error)
 	AppendTransition([]byte, CapturedTransition) ([]byte, error)
 	Published(CapturedTransition) error
@@ -115,15 +119,43 @@ func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
 		return ErrTransitionCapture
 	}
 	target := capture.Target()
-	if (m.reservedCaptureTarget.Collection != nil || m.reservedCaptureTarget.Name != "") &&
-		(target != m.reservedCaptureTarget || target.Collection == nil) {
+	reserved := m.reservedCaptureTarget.Collection != nil || m.reservedCaptureTarget.Name != ""
+	if (m.checkpointGroup != nil && !reserved) ||
+		(reserved && (target != m.reservedCaptureTarget || target.Collection == nil)) {
 		return ErrTransitionCapture
 	}
 	if err := m.validateTransitionCaptureTarget(target, capture); err != nil {
 		return err
 	}
-	if err := capture.Begin(cloneState(m.state)); err != nil {
+	empty := target.Collection.Len() == 0
+	published := false
+	publish := func(key, value []byte) error {
+		if !empty || published || len(key) == 0 || len(value) == 0 {
+			return ErrTransitionCapture
+		}
+		published = true
+		write := func(batch *durable.DatabaseBatch) error {
+			captureBatch, err := batch.CollectionHandle(target.Collection)
+			if err != nil {
+				return err
+			}
+			return captureBatch.Put(key, value)
+		}
+		members := []durable.NamedCollection{{
+			Name: target.Name, Collection: target.Collection, BatchDocumentsHint: 1,
+		}}
+		if m.checkpointGroup != nil {
+			return m.checkpointGroup.Update(
+				m.state.Applied, members, m.options.TxnLimits, write,
+			)
+		}
+		return durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, write)
+	}
+	if err := capture.Begin(cloneState(m.state), publish); err != nil {
 		return fmt.Errorf("%w: begin: %v", ErrTransitionCapture, err)
+	}
+	if empty != published || (empty && target.Collection.Len() != 1) {
+		return fmt.Errorf("%w: noncanonical header publication", ErrTransitionCapture)
 	}
 	m.capture = capture
 	m.captureTarget = target

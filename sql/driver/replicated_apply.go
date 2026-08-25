@@ -376,6 +376,37 @@ func replicatedCaptureDurableOptions(limits ReplicatedShardStoreLimits) durable.
 	}
 }
 
+// ReplicatedApplyTransactionByteFloor returns the exact frozen transaction
+// byte ceiling required to admit one worst-case base/index apply together with
+// its source-split capture record and replicated system state. Operators use
+// this before first activation; the retained identity cannot grow the limit on
+// a later split attempt.
+func ReplicatedApplyTransactionByteFloor(
+	identity ReplicatedShardStoreIdentity,
+	retryWindow uint16,
+) (int64, error) {
+	if retryWindow == 0 || retryWindow > replicatedstate.MaxSessionRetryWindow ||
+		validateReplicatedShardStoreIdentity(identity) != nil {
+		return 0, ErrReplicatedApplyMismatch
+	}
+	relationBytes := int64(0)
+	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
+		limit := int64(identity.Relations[ordinal].Limits.MaxBatchBytes)
+		if limit <= 0 || relationBytes > math.MaxInt64-limit {
+			return 0, ErrReplicatedApplyMismatch
+		}
+		relationBytes = min(int64(replication.MaxCommandBytes), relationBytes+limit)
+	}
+	systemBytes := int64(replicatedApplySystemLimits(retryWindow).MaxBatchBytes)
+	capture, err := replicatedCaptureLimits(identity)
+	if err != nil || systemBytes <= 0 || capture.MaxBatchBytes <= 0 ||
+		relationBytes > math.MaxInt64-systemBytes ||
+		relationBytes+systemBytes > math.MaxInt64-int64(capture.MaxBatchBytes) {
+		return 0, errors.Join(err, ErrReplicatedApplyMismatch)
+	}
+	return relationBytes + systemBytes + int64(capture.MaxBatchBytes), nil
+}
+
 func validateReplicatedApplyCollection(
 	collection *durable.Collection,
 	limits ReplicatedShardStoreLimits,
@@ -758,8 +789,8 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 			)
 		}
 		if err := errors.Join(
-			d.txnLog.DetachCollection(d.replicatedApplyCollection),
-			d.txnLog.DetachCollection(d.replicatedCaptureCollection),
+			d.detachReplicatedApplyCollection(d.replicatedApplyCollection),
+			d.detachReplicatedApplyCollection(d.replicatedCaptureCollection),
 		); err != nil {
 			return ReplicatedApplyIdentity{}, fmt.Errorf(
 				"vibedb: retry unpublished replicated apply detach: %w", err,
@@ -822,8 +853,8 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 	path := d.replicatedApplyPath(&stored)
 	capturePath := d.replicatedCapturePath(&stored)
 	detachErr := errors.Join(
-		d.txnLog.DetachCollection(d.replicatedApplyCollection),
-		d.txnLog.DetachCollection(d.replicatedCaptureCollection),
+		d.detachReplicatedApplyCollection(d.replicatedApplyCollection),
+		d.detachReplicatedApplyCollection(d.replicatedCaptureCollection),
 	)
 	if detachErr != nil {
 		// Keep the unpublished candidate owned by the database. Closing or
@@ -917,13 +948,13 @@ func (d *database) createReplicatedApplyStorageLocked(
 		return ReplicatedApplyIdentity{}, errors.Join(err,
 			d.discardUnpublishedStorageLocked(collection, file, path))
 	}
-	if err = d.txnLog.AdoptCollection(collection); err != nil {
+	if err = d.adoptReplicatedApplyCollection(collection); err != nil {
 		return ReplicatedApplyIdentity{}, errors.Join(err,
 			d.discardUnpublishedStorageLocked(capture, captureFile, capturePath),
 			d.discardUnpublishedStorageLocked(collection, file, path))
 	}
-	if err = d.txnLog.AdoptCollection(capture); err != nil {
-		if detachErr := d.txnLog.DetachCollection(collection); detachErr != nil {
+	if err = d.adoptReplicatedApplyCollection(capture); err != nil {
+		if detachErr := d.detachReplicatedApplyCollection(collection); detachErr != nil {
 			// Both fully published handles remain owned for the exact retry path.
 			// Closing either while the first remains registered would violate the
 			// transaction log's participant lifetime contract.
@@ -944,6 +975,20 @@ func (d *database) createReplicatedApplyStorageLocked(
 	d.replicatedCaptureFile = captureFile
 	d.replicatedCaptureCollection = capture
 	return meta.identity(), nil
+}
+
+func (d *database) adoptReplicatedApplyCollection(collection *durable.Collection) error {
+	if d != nil && d.adoptCollection != nil {
+		return d.adoptCollection(collection)
+	}
+	return d.txnLog.AdoptCollection(collection)
+}
+
+func (d *database) detachReplicatedApplyCollection(collection *durable.Collection) error {
+	if d != nil && d.detachCollection != nil {
+		return d.detachCollection(collection)
+	}
+	return d.txnLog.DetachCollection(collection)
 }
 
 func replicatedStateBinding(identity ReplicatedShardStoreIdentity) replicatedstate.Binding {
@@ -1788,14 +1833,10 @@ func validateReplicatedApplyOptions(
 	systemLimits := replicatedApplySystemLimits(options.RetryWindow)
 	relationCount := int(identity.RelationCount)
 	relationDocuments := 0
-	relationBytes := int64(0)
 	for ordinal := 0; ordinal < int(identity.RelationCount); ordinal++ {
 		limits := identity.Relations[ordinal].Limits
 		relationDocuments = min(
 			replication.MaxMutations, relationDocuments+limits.MaxBatchDocuments,
-		)
-		relationBytes = min(
-			int64(replication.MaxCommandBytes), relationBytes+int64(limits.MaxBatchBytes),
 		)
 	}
 	maxTxnDocuments := max(
@@ -1811,16 +1852,11 @@ func validateReplicatedApplyOptions(
 		options.TxnLimits.MaxBytes <= 0 {
 		return fmt.Errorf("%w: invalid transaction or retention limits", ErrReplicatedApplyMismatch)
 	}
-	systemBytes := systemLimits.MaxBatchBytes
-	if relationBytes < 0 || systemBytes < 0 ||
-		relationBytes > math.MaxInt64-int64(systemBytes) ||
-		options.TxnLimits.MaxBytes < relationBytes+int64(systemBytes) {
-		return fmt.Errorf("%w: transaction byte limit does not cover one apply", ErrReplicatedApplyMismatch)
+	requiredBytes, err := ReplicatedApplyTransactionByteFloor(identity, options.RetryWindow)
+	if err != nil || options.TxnLimits.MaxBytes < requiredBytes {
+		return fmt.Errorf("%w: transaction byte limit does not cover apply and capture", ErrReplicatedApplyMismatch)
 	}
 	if err := validateReplicatedPlacementProfile(options.Placement, identity); err != nil {
-		return err
-	}
-	if _, err := replicatedCaptureLimits(identity); err != nil {
 		return err
 	}
 	return nil

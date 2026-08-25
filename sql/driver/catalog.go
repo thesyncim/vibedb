@@ -168,15 +168,17 @@ type retiredTable struct {
 }
 
 type database struct {
-	mu              sync.RWMutex
-	path            string
-	dataDir         string
-	lockFile        *os.File
-	syncDir         func(string) error
-	closeCollection func(*durable.Collection) error
-	catalog         catalogFile
-	tables          map[string]*table
-	retired         []retiredTable
+	mu               sync.RWMutex
+	path             string
+	dataDir          string
+	lockFile         *os.File
+	syncDir          func(string) error
+	closeCollection  func(*durable.Collection) error
+	adoptCollection  func(*durable.Collection) error
+	detachCollection func(*durable.Collection) error
+	catalog          catalogFile
+	tables           map[string]*table
+	retired          []retiredTable
 	// txnReattach contains authoritative catalog collections that were
 	// successfully detached for a tentative DDL cut but could not be re-adopted
 	// after that cut definitely failed. The collection remains owned by tables;

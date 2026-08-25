@@ -1816,7 +1816,7 @@ func (m *Machine) persistTransition(
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
-		transition = m.capturedTransition(next, changes)
+		transition = m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}
@@ -1994,7 +1994,7 @@ func (m *Machine) checkTransitionCapacity(
 	defer m.releaseCaptureChanges()
 	captureBytes := 0
 	if m.shouldCaptureTransition(next) {
-		transition := m.capturedTransition(next, changes)
+		transition := m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}
@@ -2008,6 +2008,26 @@ func (m *Machine) checkTransitionCapacity(
 	return m.checkTransitionCapacityWithCapture(
 		next, changes, plan, captureBytes,
 	)
+}
+
+// baseRelationChanges selects the sole JSON base relation (dense ordinal zero)
+// from a flattened multi-relation apply plan. Split capture deliberately does
+// not serialize local/global index maintenance: child construction derives
+// those relations from their own authenticated artifacts and schema contract.
+func baseRelationChanges(
+	changes []finalMutation,
+	spans []plannedRelationChanges,
+) []finalMutation {
+	for i := range spans {
+		span := spans[i]
+		if span.ordinal == 0 && uint64(span.end) <= uint64(len(changes)) && span.start <= span.end {
+			return changes[span.start:span.end]
+		}
+		if span.ordinal > 0 {
+			break
+		}
+	}
+	return nil
 }
 
 func (m *Machine) checkTransitionCapacityWithCapture(

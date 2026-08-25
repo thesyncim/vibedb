@@ -122,7 +122,13 @@ func validateBundleTransactionProfile(
 	relations []relationCollection,
 	options Options,
 ) error {
-	if len(relations) == 0 || options.TxnLimits.MaxCollections < len(relations)+1 {
+	reservedCapture := options.TransitionCaptureTarget.Collection != nil ||
+		options.TransitionCaptureTarget.Name != ""
+	requiredCollections := len(relations) + 1
+	if reservedCapture {
+		requiredCollections++
+	}
+	if len(relations) == 0 || options.TxnLimits.MaxCollections < requiredCollections {
 		return ErrInvalidOptions
 	}
 	relationDocuments := 0
@@ -154,6 +160,15 @@ func validateBundleTransactionProfile(
 		return ErrInvalidOptions
 	}
 	requiredBytes = max(requiredBytes, int64(hotSystemBytes)+relationBytes)
+	if reservedCapture {
+		capture := options.TransitionCaptureTarget.Collection
+		if capture == nil || capture.MaxBatchBytes() <= 0 ||
+			requiredBytes > math.MaxInt64-int64(capture.MaxBatchBytes()) {
+			return ErrInvalidOptions
+		}
+		requiredBytes += int64(capture.MaxBatchBytes())
+		requiredDocuments++
+	}
 	if options.TxnLimits.MaxDocuments < requiredDocuments ||
 		options.TxnLimits.MaxBytes < requiredBytes {
 		return ErrInvalidOptions

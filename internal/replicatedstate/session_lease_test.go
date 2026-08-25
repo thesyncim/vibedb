@@ -561,8 +561,9 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 		lease.TerminalResult != ResultSessionRevoked {
 		t.Fatalf("recovered revoke did not roll forward = %+v", lease)
 	}
-	if capture.collection.Len() != 1 {
-		t.Fatalf("rolled-forward revoke retained %d capture rows, want 1", capture.collection.Len())
+	if capture.collection.Len() != 2 {
+		t.Fatalf("rolled-forward revoke retained %d capture rows, want header plus transition",
+			capture.collection.Len())
 	}
 	requireSessionResult(t, store.machine, revokeBytes, ResultSessionRevoked)
 }
@@ -687,9 +688,21 @@ func (*sessionLeaseCapture) MaxEncodedBytes(TransitionCaptureBounds) (int, error
 	return 64, nil
 }
 
-func (c *sessionLeaseCapture) Begin(state State) error {
+func (c *sessionLeaseCapture) Begin(
+	state State,
+	publish func(key, value []byte) error,
+) error {
 	if c == nil || c.target.Collection == nil || state.Applied == 0 {
 		return ErrTransitionCapture
+	}
+	if c.target.Collection.Len() == 0 {
+		var key [8]byte
+		if publish == nil {
+			return ErrTransitionCapture
+		}
+		if err := publish(key[:], []byte(`{"capture":true}`)); err != nil {
+			return err
+		}
 	}
 	c.current = state.Applied
 	c.pending = 0
