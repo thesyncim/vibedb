@@ -166,7 +166,8 @@ func main() {
 		"checkpoint-mutations", 0,
 		"checkpoint after this many acknowledged state changes; 0 checkpoints once after all measured mutations",
 	)
-	indexed := flag.Bool("indexed", false, "maintain the country secondary index")
+	exactIndexes := flag.Int("exact-indexes", 0, "number of simultaneous exact indexes (0-3)")
+	documentShape := flag.String("document-shape", "inline", "inline, mixed, or overflow-heavy")
 	putloop := flag.Bool("putloop", false, "store/durable only: load by replaying Put")
 	card := flag.String("cardinality", "low", "low or high corpus cardinality")
 	list := flag.Bool("list", false, "list engines and workloads")
@@ -203,24 +204,30 @@ func main() {
 	if !ok || mix.total() != 1000 {
 		fail("mixed: unknown or malformed workload %q", *workloadName)
 	}
-	if *indexed && !competitive.IndexCapable(factory.Name) {
+	if *exactIndexes < 0 || *exactIndexes > int(competitive.MaximumExactIndexes) {
+		fail("mixed: -exact-indexes must be in [0,%d]", competitive.MaximumExactIndexes)
+	}
+	if *exactIndexes != 0 && !competitive.IndexCapable(factory.Name) {
 		fail("mixed: %s has no native secondary index", factory.Name)
 	}
 	cardinality, err := competitive.ParseCardinality(*card)
 	check(err)
+	shape, err := competitive.ParseDocumentShape(*documentShape)
+	check(err)
 	durability, err := competitive.ParseDurabilityMode(*durabilityName)
 	check(err)
 
-	docs := competitive.CorpusOf(*corpusSize, cardinality)
+	docs := competitive.CorpusOfShape(*corpusSize, cardinality, shape)
 	dir, err := os.MkdirTemp("", "vibebench-mixed-")
 	check(err)
 	defer os.RemoveAll(dir)
 	engine, err := factory.New(competitive.Config{
-		Dir:        dir,
-		Durability: durability,
-		Indexed:    *indexed,
-		CacheBytes: competitive.DefaultCacheBytes,
-		PutLoop:    *putloop,
+		Dir:              dir,
+		Durability:       durability,
+		ExactIndexes:     uint8(*exactIndexes),
+		MaxDocumentBytes: shape.MaxDocumentBytes(),
+		CacheBytes:       competitive.DefaultCacheBytes,
+		PutLoop:          *putloop,
 	})
 	check(err)
 	defer engine.Close()
@@ -271,6 +278,7 @@ func main() {
 		}
 		states[id] = st
 	}
+	logicalMutationBytes := measuredLogicalMutationBytes(states, choices, docs)
 
 	// A whole-store scan cannot assert an exact document count under concurrent
 	// churn: each other client can transiently hide at most one key between its
@@ -345,9 +353,9 @@ func main() {
 		durableBefore durable.Stats
 		durableOK     bool
 	)
+	durableBefore, durableOK = durableStats(engine)
 	if diagnosticStats {
 		runtime.ReadMemStats(&runtimeBefore)
-		durableBefore, durableOK = durableStats(engine)
 	}
 
 	// Measured phase. total ops/s = total measured ops / wall time; the timer
@@ -367,11 +375,11 @@ func main() {
 		runtimeAfter runtime.MemStats
 		durableAfter durable.Stats
 	)
+	if durableOK {
+		durableAfter, durableOK = durableStats(engine)
+	}
 	if diagnosticStats {
 		runtime.ReadMemStats(&runtimeAfter)
-		if durableOK {
-			durableAfter, _ = durableStats(engine)
-		}
 	}
 
 	// Release each session's read state (a cached snapshot or held read
@@ -401,15 +409,8 @@ func main() {
 
 	seen := make([]bool, len(docs))
 	var expected, submitted []byte
-	check(engine.Visit(func(key string, value []byte) error {
-		const prefix = "doc:"
-		if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
-			return fmt.Errorf("malformed final key %q", key)
-		}
-		ord, err := strconv.Atoi(key[len(prefix):])
-		if err != nil || ord < 0 || ord >= len(docs) {
-			return fmt.Errorf("malformed final key %q", key)
-		}
+	validateFinal := func(key string, ord int, value []byte) error {
+		var err error
 		if seen[ord] {
 			return fmt.Errorf("duplicate final key %q", key)
 		}
@@ -427,7 +428,31 @@ func main() {
 			return fmt.Errorf("final value mismatch for %q", key)
 		}
 		return nil
-	}))
+	}
+	if shape != competitive.InlineDocuments && *engineName == "vibedb" {
+		// VibeDB's current full-scan reconstruction is independently qualified
+		// for inline rows. Overflow reconstruction is not yet a benchmark
+		// contract, so keep the untimed final oracle on exact point reads instead
+		// of silently certifying malformed scan bytes.
+		var point []byte
+		for ord := range docs {
+			point, err = engine.Get(point[:0], docs[ord].Key)
+			check(err)
+			check(validateFinal(docs[ord].Key, ord, point))
+		}
+	} else {
+		check(engine.Visit(func(key string, value []byte) error {
+			const prefix = "doc:"
+			if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
+				return fmt.Errorf("malformed final key %q", key)
+			}
+			ord, err := strconv.Atoi(key[len(prefix):])
+			if err != nil || ord < 0 || ord >= len(docs) {
+				return fmt.Errorf("malformed final key %q", key)
+			}
+			return validateFinal(key, ord, value)
+		}))
+	}
 	visited := 0
 	for _, ok := range seen {
 		if ok {
@@ -439,8 +464,9 @@ func main() {
 	}
 
 	type summary struct {
-		calls         int
-		p50, p95, p99 int64
+		calls               int
+		p50, p95, p99, p999 int64
+		max                 int64
 	}
 	summaries := [opKinds]summary{}
 	for kind, samples := range latencies {
@@ -453,6 +479,8 @@ func main() {
 			p50:   percentile(samples, 0.50),
 			p95:   percentile(samples, 0.95),
 			p99:   percentile(samples, 0.99),
+			p999:  percentile(samples, 0.999),
+			max:   samples[len(samples)-1],
 		}
 	}
 	var checkpointSummary summary
@@ -463,6 +491,8 @@ func main() {
 			p50:   percentile(checkpointLatencies, 0.50),
 			p95:   percentile(checkpointLatencies, 0.95),
 			p99:   percentile(checkpointLatencies, 0.99),
+			p999:  percentile(checkpointLatencies, 0.999),
+			max:   checkpointLatencies[len(checkpointLatencies)-1],
 		}
 	}
 
@@ -482,6 +512,8 @@ func main() {
 	if factory.Name == "vibedb" {
 		if *putloop {
 			reportName += "/put"
+		} else if shape != competitive.InlineDocuments {
+			reportName += "/put-overflow"
 		} else {
 			reportName += "/bulk-unified"
 		}
@@ -490,14 +522,25 @@ func main() {
 		printHeader(os.Stdout)
 	}
 	throughput := float64(*operations) * float64(time.Second) / float64(measuredNanos)
+	writeKnown := durableOK && (engine.DurabilityMode() == competitive.DurabilityOrdinarySync ||
+		engine.DurabilityMode() == competitive.DurabilityPowerSafe)
+	deviceBytes := uint64(0)
+	writeAmplification := 0.0
+	if writeKnown {
+		deviceBytes = counterDelta(durableBefore.DeviceBytes, durableAfter.DeviceBytes)
+		if logicalMutationBytes != 0 {
+			writeAmplification = float64(deviceBytes) / float64(logicalMutationBytes)
+		}
+	}
 	printResult := func(operation string, result summary) {
-		fmt.Printf("%-20s %-24s %-8s %-4s %7d %9d %7d %10d %9d %7v %7d %-18s %10d %11.3f %11.3f %11.3f %12.0f %10.1f %10.1f %10.1f %11.1f %12.1f\n",
-			reportName, engine.DurabilityMode(), mix.name, cardinality,
+		fmt.Printf("%-20s %-24s %-8s %-4s %-14s %7d %9d %7d %10d %9d %13d %7d %-18s %10d %11.3f %11.3f %11.3f %11.3f %11.3f %12.0f %10.1f %10.1f %10.1f %11.1f %12.1f %11t %14d %14d %13.4f\n",
+			reportName, engine.DurabilityMode(), mix.name, cardinality, shape,
 			*corpusSize, *operations, *warmup, *checkpointMutations,
-			automaticCheckpoints, *indexed, *clients, operation, result.calls,
-			micros(result.p50), micros(result.p95), micros(result.p99), throughput,
+			automaticCheckpoints, *exactIndexes, *clients, operation, result.calls,
+			micros(result.p50), micros(result.p95), micros(result.p99), micros(result.p999), micros(result.max), throughput,
 			mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes), mib(int64(fp.HeapAlloc)),
-			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()))
+			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()), writeKnown,
+			logicalMutationBytes, deviceBytes, writeAmplification)
 	}
 	for kind, result := range summaries {
 		if result.calls == 0 {
@@ -666,11 +709,35 @@ func printHeader(w io.Writer) {
 	// Keep the established latency column names for mixedsuite compatibility.
 	// Their samples are end-to-end acknowledgement latencies: mutation admission,
 	// the engine call, and any elected checkpoint are all inside the timer.
-	fmt.Fprintf(w, "%-20s %-24s %-8s %-4s %7s %9s %7s %10s %9s %7s %7s %-18s %10s %11s %11s %11s %12s %10s %10s %10s %11s %12s\n",
-		"engine", "durability", "workload", "card", "docs", "measured",
-		"warmup", "checkpoint", "forced-cp", "indexed", "clients", "operation", "calls",
-		"p50-us", "p95-us", "p99-us", "total-ops/s", "disk-MiB", "alloc-MiB",
-		"heap-MiB", "runtime-MiB", "peak-rss-MiB")
+	fmt.Fprintf(w, "%-20s %-24s %-8s %-4s %-14s %7s %9s %7s %10s %9s %13s %7s %-18s %10s %11s %11s %11s %11s %11s %12s %10s %10s %10s %11s %12s %11s %14s %14s %13s\n",
+		"engine", "durability", "workload", "card", "document-shape", "docs", "measured",
+		"warmup", "checkpoint", "forced-cp", "exact-indexes", "clients", "operation", "calls",
+		"p50-us", "p95-us", "p99-us", "p99.9-us", "max-us", "total-ops/s", "disk-MiB", "alloc-MiB",
+		"heap-MiB", "runtime-MiB", "peak-rss-MiB", "write-known",
+		"logical-write-B", "device-write-B", "device/logical")
+}
+
+// measuredLogicalMutationBytes is the byte-exact denominator for physical
+// write amplification. It counts submitted key and value bytes for successful
+// measured mutations; same-size updates make the result independent of each
+// key's current toggle state. Checkpoint and journal metadata are deliberately
+// excluded from the denominator and remain charged in the device numerator.
+func measuredLogicalMutationBytes(states []*clientState, choices []int, docs []competitive.Doc) uint64 {
+	var total uint64
+	for _, state := range states {
+		for operation := 0; operation < state.measuredOps; operation++ {
+			sequence := state.warmupOps + operation
+			choice := choices[(state.choiceOff+sequence)%len(choices)]
+			doc := docs[state.keyTrace[sequence]]
+			switch choice {
+			case opUpdate, opReadModifyWrite:
+				total += uint64(len(doc.Key) + len(doc.JSON))
+			case opChurn:
+				total += uint64(2*len(doc.Key) + len(doc.JSON))
+			}
+		}
+	}
+	return total
 }
 
 type automaticCheckpointReporter interface {

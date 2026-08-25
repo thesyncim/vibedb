@@ -254,8 +254,8 @@ func BenchmarkMixedWorkload(b *testing.B) {
 				b.Run(name, func(b *testing.B) {
 					closeForeignFixtures("")
 					e, _, cleanup := newLoaded(b, factory, Config{
-						Durability: durability,
-						Indexed:    scenario.indexed,
+						Durability:   durability,
+						ExactIndexes: exactIndexCount(scenario.indexed),
 					})
 					defer cleanup()
 
@@ -365,7 +365,7 @@ func TestMixedMutationEquivalence(t *testing.T) {
 			dir := t.TempDir()
 			indexed := IndexCapable(factory.Name)
 			e, err := factory.New(Config{
-				Dir: dir, Indexed: indexed, CacheBytes: DefaultCacheBytes,
+				Dir: dir, ExactIndexes: exactIndexCount(indexed), CacheBytes: DefaultCacheBytes,
 			})
 			if err != nil {
 				t.Fatal(err)

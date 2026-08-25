@@ -14,6 +14,9 @@ type pebbleEngine struct {
 }
 
 func newPebble(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("pebble", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("pebble", cfg.Durability)
 	if err != nil {
 		return nil, err

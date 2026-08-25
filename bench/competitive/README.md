@@ -53,8 +53,18 @@ default uses ten repetitions and one discarded conditioning pass.
 
 ## Corpus and storage profiles
 
-Record the corpus size and cardinality. Low-cardinality and high-cardinality
-variants are shape- and length-matched but have different value entropy.
+Record corpus size, cardinality, and document shape. Low-cardinality and
+high-cardinality variants are shape- and length-matched but have different
+value entropy. The `inline`, `mixed`, and `overflow-heavy` shapes use exact
+bounded lengths and byte-native `vibejson` validation.
+
+Record `-exact-indexes=0` through `3`; the standard cells use `0`, `1`, and
+`3`. VibeDB and SQLite receive the same ordered country, tier, and region
+definitions. Mixed output includes p99.9 and
+maximum acknowledgement latency. It also reports submitted logical mutation
+bytes. `write-known=true` means the adapter exposes a native device-byte
+counter and makes `device/logical` meaningful; do not compare a zero from an
+adapter that reports `write-known=false`.
 
 Record `intrinsic` or `production` storage profile. The output must state the
 resolved compression policy and its provenance.

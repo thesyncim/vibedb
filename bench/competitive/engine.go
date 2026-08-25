@@ -38,9 +38,14 @@ type Config struct {
 	// Durability selects one explicit acknowledgement and persistence contract.
 	// The zero value is buffered-visible.
 	Durability DurabilityMode
-	// Indexed asks the engine to declare and maintain a secondary index over
-	// FilterPath. Engines with no such capability ignore it.
-	Indexed bool
+	// ExactIndexes asks an index-capable engine to maintain the first N entries
+	// of ExactIndexDefinitions. Zero is unindexed. The benchmark currently
+	// exposes 0, 1, and 3 so every indexed row has one exact physical shape on
+	// both VibeDB and SQLite.
+	ExactIndexes uint8
+	// MaxDocumentBytes is the exact corpus admission bound. Zero selects the
+	// inline 1 KiB bound used by the historical corpus.
+	MaxDocumentBytes int
 	// CacheBytes is the read-cache budget every engine is given, so that no
 	// engine wins or loses purely on how much of the corpus it was allowed to
 	// keep resident. It is set to VibeDB's default ResidentBytes.
@@ -70,6 +75,49 @@ type Config struct {
 	// would not produce a fair "defaults" row, it would produce a different
 	// benchmark.
 	Untuned bool
+}
+
+// ExactIndexDefinition is one matched, scalar exact-index lane.
+type ExactIndexDefinition struct {
+	Name        string
+	JSONPointer string
+	SQLitePath  string
+}
+
+// ExactIndexDefinitions is ordered so ExactIndexes=1 remains the selective
+// country lane and ExactIndexes=3 adds the nested tier and region indexes.
+var ExactIndexDefinitions = [...]ExactIndexDefinition{
+	{Name: "country", JSONPointer: "/country", SQLitePath: "$.country"},
+	{Name: "tier", JSONPointer: "/profile/tier", SQLitePath: "$.profile.tier"},
+	{Name: "region", JSONPointer: "/profile/region", SQLitePath: "$.profile.region"},
+}
+
+const MaximumExactIndexes = uint8(len(ExactIndexDefinitions))
+
+// ValidateExactIndexes rejects unmatchable benchmark configurations before an
+// adapter creates storage.
+func ValidateExactIndexes(count uint8) error {
+	if count > MaximumExactIndexes {
+		return fmt.Errorf("exact indexes = %d, maximum %d", count, MaximumExactIndexes)
+	}
+	return nil
+}
+
+func validateEngineExactIndexes(engine string, count uint8) error {
+	if err := ValidateExactIndexes(count); err != nil {
+		return err
+	}
+	if count != 0 && !IndexCapable(engine) {
+		return fmt.Errorf("%s has no native exact index", engine)
+	}
+	return nil
+}
+
+func exactIndexCount(enabled bool) uint8 {
+	if enabled {
+		return 1
+	}
+	return 0
 }
 
 // DefaultCacheBytes matches store/durable Options.ResidentBytes' default.

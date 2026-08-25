@@ -1,6 +1,7 @@
 package competitive
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,46 @@ import (
 	"strconv"
 	"testing"
 )
+
+func TestCorpusDocumentShapesAreExactAndValid(t *testing.T) {
+	for _, test := range []struct {
+		shape DocumentShape
+		large func(int) bool
+		want  int
+	}{
+		{MixedDocuments, func(i int) bool { return i&1 != 0 }, mixedOverflowDocumentBytes},
+		{OverflowHeavyDocuments, func(i int) bool { return i&7 != 0 }, heavyOverflowDocumentBytes},
+	} {
+		first := CorpusOfShape(32, HighCardinality, test.shape)
+		second := CorpusOfShape(32, HighCardinality, test.shape)
+		for i := range first {
+			if !bytes.Equal(first[i].JSON, second[i].JSON) {
+				t.Fatalf("%s document %d is not deterministic", test.shape, i)
+			}
+			if test.large(i) {
+				if len(first[i].JSON) != test.want {
+					t.Fatalf("%s document %d bytes=%d want=%d", test.shape, i, len(first[i].JSON), test.want)
+				}
+			} else if len(first[i].JSON) >= 512 {
+				t.Fatalf("%s inline document %d bytes=%d", test.shape, i, len(first[i].JSON))
+			}
+		}
+		if test.shape.MaxDocumentBytes() != test.want {
+			t.Fatalf("%s admission bound=%d want=%d", test.shape, test.shape.MaxDocumentBytes(), test.want)
+		}
+	}
+}
+
+func TestNonIndexAdaptersRejectExactIndexConfiguration(t *testing.T) {
+	for _, factory := range Factories() {
+		if IndexCapable(factory.Name) {
+			continue
+		}
+		if _, err := factory.New(Config{Dir: t.TempDir(), ExactIndexes: 1}); err == nil {
+			t.Fatalf("%s accepted an exact-index configuration", factory.Name)
+		}
+	}
+}
 
 var (
 	corpusSize = flag.Int("corpus", CorpusSize, "documents in the shared corpus")
@@ -150,8 +191,8 @@ func loadedEngine(
 		tb.Fatalf("unknown engine %q", name)
 	}
 	e, dir, _ := newLoaded(tb, factory, Config{
-		Durability: durability,
-		Indexed:    indexed,
+		Durability:   durability,
+		ExactIndexes: exactIndexCount(indexed),
 	})
 	fixtures[key] = &fixture{engine: e, dir: dir}
 	return e
@@ -190,7 +231,7 @@ func BenchmarkBulkLoad(b *testing.B) {
 							b.Fatal(err)
 						}
 						e, err := factory.New(Config{
-							Dir: dir, Durability: durability, Indexed: indexed,
+							Dir: dir, Durability: durability, ExactIndexes: exactIndexCount(indexed),
 							CacheBytes: DefaultCacheBytes,
 						})
 						if err != nil {
@@ -800,7 +841,7 @@ func TestFullEquivalence(t *testing.T) {
 			}
 
 			idx := loadedEngine(
-				t, factory.Name, DurabilityBufferedVisible, true, "indexed",
+				t, factory.Name, DurabilityBufferedVisible, IndexCapable(factory.Name), "indexed",
 			)
 			ic, err := idx.IndexedCount(FilterValue)
 			switch {
@@ -857,8 +898,8 @@ func TestFullEquivalenceIndexedDurable(t *testing.T) {
 	// Built directly rather than through loadedEngine, keeping this focused
 	// oracle independent of the package-global benchmark fixture.
 	e, _, cleanup := newLoadedCorpus(t, factory, Config{
-		Durability: DurabilityBufferedVisible,
-		Indexed:    true,
+		Durability:   DurabilityBufferedVisible,
+		ExactIndexes: 1,
 	}, corpus)
 	defer cleanup()
 

@@ -23,6 +23,9 @@ type sqliteEngine struct {
 }
 
 func newSQLite(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("sqlite", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("sqlite", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -81,17 +84,20 @@ func newSQLite(cfg Config) (Engine, error) {
 	// in both configurations; only the index over it is conditional. A VIRTUAL
 	// generated column costs no storage — SQLite evaluates json_extract on
 	// read — so the unindexed configuration is not paying for it at rest.
-	schema := `CREATE TABLE docs (
-		k TEXT PRIMARY KEY,
-		doc TEXT NOT NULL,
-		country TEXT GENERATED ALWAYS AS (json_extract(doc, '$.country')) VIRTUAL
-	) WITHOUT ROWID;`
+	schema := `CREATE TABLE docs (k TEXT PRIMARY KEY, doc TEXT NOT NULL`
+	for i := range int(cfg.ExactIndexes) {
+		definition := ExactIndexDefinitions[i]
+		schema += fmt.Sprintf(", %s TEXT GENERATED ALWAYS AS (json_extract(doc, '%s')) VIRTUAL",
+			definition.Name, definition.SQLitePath)
+	}
+	schema += `) WITHOUT ROWID;`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if cfg.Indexed {
-		if _, err := db.Exec(`CREATE INDEX idx_country ON docs(country)`); err != nil {
+	for i := range int(cfg.ExactIndexes) {
+		name := ExactIndexDefinitions[i].Name
+		if _, err := db.Exec(fmt.Sprintf("CREATE INDEX idx_%s ON docs(%s)", name, name)); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -133,7 +139,7 @@ func (s *sqliteEngine) prepare() error {
 		`SELECT count(*) FROM docs WHERE json_extract(doc, '$.country') = ?`); err != nil {
 		return err
 	}
-	if s.cfg.Indexed {
+	if s.cfg.ExactIndexes != 0 {
 		if s.indexedStmt, err = s.db.Prepare(
 			`SELECT count(*) FROM docs WHERE country = ?`); err != nil {
 			return err

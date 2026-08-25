@@ -88,8 +88,9 @@ func mixedTarget(label string, args ...string) CoverageTarget {
 		Args:       base,
 		OutputFunc: "printHeader",
 		OutputTokens: []string{
-			"durability", "checkpoint", "forced-cp", "indexed", "clients",
-			"p50-us", "p95-us", "p99-us", "total-ops/s", "disk-MiB", "alloc-MiB",
+			"durability", "checkpoint", "forced-cp", "exact-indexes", "document-shape", "clients",
+			"p50-us", "p95-us", "p99-us", "p99.9-us", "max-us", "total-ops/s", "disk-MiB", "alloc-MiB",
+			"write-known", "logical-write-B", "device-write-B", "device/logical",
 		},
 	}
 }
@@ -164,27 +165,40 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Dimension: "indexes", Case: "one exact", Status: CoverageImplemented,
 			Boundary: "VibeDB maintains one exact country index; the mixed command checks final documents and the indexed equivalence test checks postings. This target is not cross-engine index evidence.",
 			Targets: []CoverageTarget{
-				mixedTarget("one exact index", "-indexed=true"),
+				mixedTarget("one exact index", "-exact-indexes=1"),
 				testTarget("indexed document/posting equivalence", "bench/competitive", "TestFullEquivalenceIndexedDurable"),
 			},
 		},
 		{
-			Dimension: "indexes", Case: "several exact", Status: CoverageGap,
-			Boundary: "Config exposes one boolean index shape, so index-count scaling and multi-index write amplification are not measured.",
+			Dimension: "indexes", Case: "several exact", Status: CoverageImplemented,
+			Boundary: "The same mixed lane can maintain three exact scalar indexes on VibeDB and SQLite while retaining the final byte oracle.",
+			Targets: []CoverageTarget{
+				mixedTarget("three simultaneous exact indexes", "-exact-indexes=3"),
+				testTarget("three-index adapter shape", "bench/competitive", "TestVibeDBExactIndexAndDocumentBounds"),
+				testTarget("matched SQLite physical index count", "bench/competitive", "TestSQLiteExactIndexCountIsPhysical"),
+			},
 		},
 
 		{
 			Dimension: "document size", Case: "inline", Status: CoverageImplemented,
-			Boundary: "The deterministic 10,000-document corpus is bounded below the durable adapter's 1 KiB inline limit.",
-			Targets:  []CoverageTarget{mixedTarget("inline corpus")},
+			Boundary: "The deterministic 10,000-document corpus is bounded below the durable adapter's 512-byte inline limit.",
+			Targets:  []CoverageTarget{mixedTarget("inline corpus", "-document-shape=inline")},
 		},
 		{
-			Dimension: "document size", Case: "mixed", Status: CoverageGap,
-			Boundary: "There is no shape-matched corpus mixing inline and overflow documents.",
+			Dimension: "document size", Case: "mixed", Status: CoverageImplemented,
+			Boundary: "The deterministic mixed corpus alternates inline documents with exact 4 KiB overflow documents across every engine.",
+			Targets: []CoverageTarget{
+				mixedTarget("mixed inline and overflow corpus", "-document-shape=mixed"),
+				testTarget("mixed corpus byte shape", "bench/competitive", "TestCorpusDocumentShapesAreExactAndValid"),
+			},
 		},
 		{
-			Dimension: "document size", Case: "overflow-heavy", Status: CoverageGap,
-			Boundary: "There is no competitive corpus dominated by overflow values.",
+			Dimension: "document size", Case: "overflow-heavy", Status: CoverageImplemented,
+			Boundary: "Seven of every eight deterministic documents are exact 16 KiB overflow values under one shared admission bound.",
+			Targets: []CoverageTarget{
+				mixedTarget("overflow-heavy corpus", "-document-shape=overflow-heavy"),
+				testTarget("overflow-heavy corpus byte shape", "bench/competitive", "TestCorpusDocumentShapesAreExactAndValid"),
+			},
 		},
 
 		{
@@ -282,7 +296,7 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 		{
 			Dimension: "lifecycle", Case: "checkpoint", Status: CoverageImplemented,
-			Boundary: "The mixed harness reports checkpoint call count and p50/p95/p99 acknowledgement latency inside elapsed throughput.",
+			Boundary: "The mixed harness reports checkpoint call count and p50/p95/p99/p99.9/maximum acknowledgement latency inside elapsed throughput.",
 			Targets:  []CoverageTarget{mixedTarget("checkpoint latency")},
 		},
 		{
@@ -321,13 +335,14 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{mixedTarget("p99 latency")},
 		},
 		{
-			Dimension: "latency", Case: "p99.9", Status: CoverageDiagnostic,
-			Boundary: "The VibeDB-only massive-churn probe reports p99.9; the cross-engine mixed schema stops at p99.",
-			Targets:  []CoverageTarget{massiveChurnTarget("VibeDB-only p99.9 diagnostic")},
+			Dimension: "latency", Case: "p99.9", Status: CoverageImplemented,
+			Boundary: "Mixed output reports the deterministic rounded order statistic for per-operation and checkpoint p99.9 in microseconds for every engine.",
+			Targets:  []CoverageTarget{mixedTarget("p99.9 latency")},
 		},
 		{
-			Dimension: "latency", Case: "max", Status: CoverageGap,
-			Boundary: "No workload output records the maximum operation or checkpoint latency.",
+			Dimension: "latency", Case: "max", Status: CoverageImplemented,
+			Boundary: "Mixed output reports the exact maximum per-operation and checkpoint sample for every engine.",
+			Targets:  []CoverageTarget{mixedTarget("maximum latency")},
 		},
 
 		{
@@ -336,7 +351,7 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets: []CoverageTarget{withOutputTokens(commandTarget(
 				"logical corpus bytes", "bench/competitive/cmd/footprint",
 				"-corpus=100000", "-cardinality=low", "-corpus-stats=true",
-			), "printCorpusStats", "key-bytes=", "json-bytes=", "logical-bytes=", "json-gzip-9-bytes=")},
+			), "printCorpusStats", "document-shape=", "key-bytes=", "json-bytes=", "logical-bytes=", "json-gzip-9-bytes=")},
 		},
 		{
 			Dimension: "storage", Case: "allocated", Status: CoverageImplemented,
@@ -349,8 +364,11 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 		{
 			Dimension: "storage", Case: "write amplification", Status: CoverageDiagnostic,
-			Boundary: "The VibeDB-only massive-churn probe reports device bytes, but no common per-engine physical-write counter or normalized amplification ratio exists.",
-			Targets:  []CoverageTarget{massiveChurnTarget("VibeDB-only device-byte diagnostic")},
+			Boundary: "On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, device bytes, and their normalized ratio. Buffered-visible and adapters without an equally strong native counter report write-known=false.",
+			Targets: []CoverageTarget{mixedTarget(
+				"normalized VibeDB physical-write diagnostic",
+				"-durability=ordinary-sync", "-checkpoint-mutations=0",
+			)},
 		},
 
 		{

@@ -36,8 +36,31 @@ func TestOutputHeaderRequiresResolvedDurabilityAndCheckpoint(t *testing.T) {
 	if !contains("forced-cp") {
 		t.Fatalf("header omits forced checkpoint column: %q", out.String())
 	}
+	for _, column := range []string{"document-shape", "exact-indexes", "p99.9-us", "max-us", "write-known", "logical-write-B", "device-write-B", "device/logical"} {
+		if !contains(column) {
+			t.Fatalf("header omits %s column: %q", column, out.String())
+		}
+	}
 	if contains("sync") {
 		t.Fatalf("header retained ambiguous sync column: %q", out.String())
+	}
+}
+
+func TestMeasuredLogicalMutationBytesCountsSubmittedKeysAndValues(t *testing.T) {
+	docs := []competitive.Doc{
+		{Key: "a", JSON: []byte(`{"v":1}`)},
+		{Key: "bb", JSON: []byte(`{"v":22}`)},
+	}
+	choices := []int{opUpdate, opReadModifyWrite, opChurn, opRead}
+	states := []*clientState{{
+		warmupOps: 1, measuredOps: 3,
+		keyTrace: []int{0, 1, 0, 1},
+	}}
+	// RMW(bb) submits key+value, churn(a) submits delete key plus upsert
+	// key+value, and the final read contributes no logical mutation bytes.
+	want := uint64(len("bb") + len(docs[1].JSON) + 2*len("a") + len(docs[0].JSON))
+	if got := measuredLogicalMutationBytes(states, choices, docs); got != want {
+		t.Fatalf("logical mutation bytes=%d want=%d", got, want)
 	}
 }
 

@@ -119,6 +119,9 @@ func (s *vibeDBScanState) run(
 }
 
 func newVibeDB(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("vibedb", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("vibedb", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -216,16 +219,22 @@ func (v *vibeDBEngine) options() durable.Options {
 		// 1 KiB. Reserving overflow buffers for the production 4 MiB default
 		// would shrink buffered checkpoint depth for values this harness can
 		// never submit, measuring unused API range rather than the workload.
-		opts.MaxDocumentBytes = 1 << 10
+		opts.MaxDocumentBytes = v.cfg.MaxDocumentBytes
+		if opts.MaxDocumentBytes == 0 {
+			opts.MaxDocumentBytes = 1 << 10
+		}
 		opts.BufferCount = 8192
 		opts.QueueSlots = 128
 		opts.GroupLimit = 64
 	}
-	if v.cfg.Indexed {
-		opts.Indexes = []store.IndexDefinition{{
-			Name:  FilterField,
-			Paths: []string{FilterPath},
-		}}
+	if v.cfg.ExactIndexes != 0 {
+		opts.Indexes = make([]store.IndexDefinition, v.cfg.ExactIndexes)
+		for i := range opts.Indexes {
+			definition := ExactIndexDefinitions[i]
+			opts.Indexes[i] = store.IndexDefinition{
+				Name: definition.Name, Paths: []string{definition.JSONPointer},
+			}
+		}
 	}
 	return opts
 }
@@ -242,10 +251,19 @@ func (v *vibeDBEngine) Load(docs []Doc) error {
 	// cuts giant low-cardinality terms into spanned leaves, so routing a large
 	// indexed corpus through the old replay workaround would hide the scalable
 	// bulk representation and make the read benchmark artificially unavailable.
-	if v.cfg.PutLoop {
+	if v.cfg.PutLoop || corpusRequiresOverflowReplay(docs, 512) {
 		return v.loadByPut(f, docs)
 	}
 	return v.loadBulk(f, docs)
+}
+
+func corpusRequiresOverflowReplay(docs []Doc, inlineBytes int) bool {
+	for i := range docs {
+		if len(docs[i].JSON) > inlineBytes {
+			return true
+		}
+	}
+	return false
 }
 
 // loadBulk is store/durable's native borrowed-record bulk path. It is the fair
@@ -398,14 +416,14 @@ func (v *vibeDBEngine) Visit(fn func(key string, value []byte) error) error {
 }
 
 func (v *vibeDBEngine) FilterCount(value string) (int, error) {
-	if v.cfg.Indexed {
+	if v.cfg.ExactIndexes != 0 {
 		return 0, fmt.Errorf("FilterCount must run against an unindexed instance")
 	}
 	return v.runFilter(value)
 }
 
 func (v *vibeDBEngine) IndexedCount(value string) (int, error) {
-	if !v.cfg.Indexed {
+	if v.cfg.ExactIndexes == 0 {
 		return 0, ErrNoIndex
 	}
 	return v.runFilter(value)

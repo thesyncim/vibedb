@@ -47,6 +47,9 @@ func badgerScanOptions(cfg Config) badger.IteratorOptions {
 }
 
 func newBadger(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("badger", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("badger", cfg.Durability)
 	if err != nil {
 		return nil, err
