@@ -24,6 +24,7 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func testReplicatedApplyOptions() ReplicatedApplyOptions {
@@ -426,6 +427,10 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		t.Fatal(err)
 	}
 	epoch := applyReplicatedApplySessionOpen(t, claim, base, 2)
+	capture, err := claim.BeginRangeSplitCapture(replicatedApplyCapturePartitioner(t, base))
+	if err != nil || capture.Head() != 2 {
+		t.Fatalf("bundle capture head=%d err=%v", capture.Head(), err)
+	}
 	document := []byte(`{"email":"a","id":"doc-1"}`)
 	baseKey := testReplicatedApplyKey(t, database, document)
 	globalKey := []byte{0x91, 0x01, 'a'}
@@ -449,6 +454,9 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	if got := completionResultCode(t, claim, command); got != replicatedstate.ResultApplied {
 		t.Fatalf("bundle result = %d", got)
+	}
+	if capture.Head() != 3 {
+		t.Fatalf("bundle capture mutation head=%d", capture.Head())
 	}
 	core := database.connector.db
 	core.mu.RLock()
@@ -524,6 +532,33 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	reencoded, err := replicatedstate.BuildSnapshotBase(certificate.Manifest, bootstrap)
+	if err != nil || !proto.Equal(reencoded, snapshotBase) {
+		t.Fatalf("active-capture bundle re-encode differs: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*replicatedstate.SnapshotArtifactManifest)
+	}{
+		{"missing", func(m *replicatedstate.SnapshotArtifactManifest) {
+			m.CaptureRows = 0
+			m.CaptureImageDigest = [sha256.Size]byte{}
+		}},
+		{"mismatched_rows", func(m *replicatedstate.SnapshotArtifactManifest) {
+			m.CaptureRows++
+		}},
+		{"forged_digest", func(m *replicatedstate.SnapshotArtifactManifest) {
+			m.CaptureImageDigest[0] ^= 1
+		}},
+	} {
+		t.Run("bundle_capture_proof_"+test.name, func(t *testing.T) {
+			candidate := bundleManifest
+			test.mutate(&candidate)
+			if _, err := replicatedstate.BuildSnapshotBase(candidate, bootstrap); err == nil {
+				t.Fatal("modified capture proof retained the manifest certificate")
+			}
+		})
+	}
 	capacity, err := claim.CapacityQualificationProfile()
 	if err != nil {
 		t.Fatal(err)
@@ -531,6 +566,8 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	if group.CheckpointAppliedIndex() != 4 || !bundleManifest.Bundle ||
 		bundleManifest.State.Applied != 4 || len(bundleManifest.Relations) != 2 ||
 		bundleManifest.Relations[0].Rows != 1 || bundleManifest.Relations[1].Rows != 1 ||
+		bundleManifest.CaptureRows == 0 ||
+		bundleManifest.CaptureImageDigest == ([sha256.Size]byte{}) ||
 		certificate.Manifest.Digest != bundleManifest.Digest ||
 		certificate.Manifest.RelationManifestDigest != bundleManifest.RelationManifestDigest ||
 		capacity.RelationManifestDigest != bundleManifest.RelationManifestDigest ||
@@ -569,6 +606,12 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 	}
 	if reopenedGroup == nil || reopenedGroup.CheckpointAppliedIndex() != 4 {
 		t.Fatalf("reopened checkpoint cut = %v", reopenedGroup)
+	}
+	recoveredCapture, err := reopenedClaim.BeginRangeSplitCapture(
+		replicatedApplyCapturePartitioner(t, base),
+	)
+	if err != nil || recoveredCapture.Head() != 4 {
+		t.Fatalf("reopened bundle capture head=%d err=%v", recoveredCapture.Head(), err)
 	}
 	if err := reopenedClaim.Close(); err != nil {
 		t.Fatal(err)

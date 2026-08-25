@@ -114,6 +114,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		manifest.SystemRows != 0 || manifest.PayloadBytes != 0 || manifest.EncodedBytes != 0 ||
 		manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
+		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
 		base.GetMetadata().GetIndex() != cut.Applied {
 		t.Fatalf("publication=%+v state=%+v rows=%d", publication, manifest.State, manifest.UserRows)
 	}
@@ -129,7 +130,11 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		"row count":    func(m *SnapshotArtifactManifest) { m.UserRows++ },
 		"image digest": func(m *SnapshotArtifactManifest) { m.ImageDigest[0] ^= 1 },
 		"chunk count":  func(m *SnapshotArtifactManifest) { m.Chunks = 1 },
-		"identity":     func(m *SnapshotArtifactManifest) { m.Digest[0] ^= 1 },
+		"capture rows": func(m *SnapshotArtifactManifest) { m.CaptureRows = 1 },
+		"capture image": func(m *SnapshotArtifactManifest) {
+			m.CaptureImageDigest = snapshotArtifactEmptyCaptureImageDigest()
+		},
+		"identity": func(m *SnapshotArtifactManifest) { m.Digest[0] ^= 1 },
 	} {
 		t.Run("reject seeded "+name+" mutation", func(t *testing.T) {
 			invalid := cloneSnapshotArtifactManifest(manifest)

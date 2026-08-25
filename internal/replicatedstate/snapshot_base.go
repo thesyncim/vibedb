@@ -38,6 +38,9 @@ var (
 	seededSnapshotManifestDomain = []byte(
 		"vibedb/replicated-state/seeded-snapshot-manifest\x00",
 	)
+	bundleSnapshotManifestDomain = []byte(
+		"vibedb/replicated-state/bundle-snapshot-manifest\x00",
+	)
 )
 
 // SnapshotBaseCertificate is the small authenticated bridge between an
@@ -267,6 +270,17 @@ func (m *Machine) BuildBundleSnapshotBase() (
 		}
 		manifest.UserRows += snapshot.Len()
 	}
+	if capture := m.reservedCaptureTarget; capture.Collection != nil {
+		snapshot, exists := cut.Collection(capture.Name)
+		if !exists || snapshot == nil || snapshot.Generation() == 0 {
+			return nil, SnapshotArtifactManifest{}, m.fail(ErrInconsistentSnapshot)
+		}
+		manifest.CaptureRows = snapshot.Len()
+		manifest.CaptureImageDigest, err = snapshotArtifactOpaqueImageDigest(snapshot)
+		if err != nil {
+			return nil, SnapshotArtifactManifest{}, m.fail(err)
+		}
+	}
 	manifest.ImageDigest = canonicalBundleImageDigest(manifest.Relations)
 	stateEnvelope, err := AppendState(nil, manifest.State)
 	if err != nil {
@@ -274,7 +288,8 @@ func (m *Machine) BuildBundleSnapshotBase() (
 	}
 	manifest.Digest = bundleSnapshotManifestDigest(
 		stateEnvelope, manifest.RelationManifestDigest, manifest.SystemRows,
-		manifest.Relations, manifest.ImageDigest,
+		manifest.Relations, manifest.ImageDigest, manifest.CaptureRows,
+		manifest.CaptureImageDigest,
 	)
 	base, err := buildSnapshotBaseFromCanonicalBootstrap(
 		manifest, m.bootstrap, m.bootstrapDigest,
@@ -487,7 +502,6 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
-		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
 		manifest.SystemRows != manifest.State.SessionCount+manifest.State.SessionSlotCount+
 			manifest.State.AuthorityBindingCount+1 ||
@@ -500,6 +514,22 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 	}
 	if err := validateState(manifest.State); err != nil {
 		return fmt.Errorf("%w: bundle state: %v", ErrSnapshotBase, err)
+	}
+	// Zero rows plus a zero digest is the sole canonical representation of an
+	// absent reserved capture member. A present member always authenticates its
+	// opaque image, including the empty image with the domain-separated empty
+	// digest used by streamed artifacts.
+	emptyCapture := snapshotArtifactEmptyCaptureImageDigest()
+	if manifest.CaptureImageDigest == ([sha256.Size]byte{}) {
+		if manifest.CaptureRows != 0 {
+			return fmt.Errorf("%w: absent bundle capture", ErrSnapshotBase)
+		}
+	} else if manifest.CaptureRows == 0 {
+		if manifest.CaptureImageDigest != emptyCapture {
+			return fmt.Errorf("%w: empty bundle capture", ErrSnapshotBase)
+		}
+	} else if manifest.CaptureImageDigest == emptyCapture {
+		return fmt.Errorf("%w: nonempty bundle capture", ErrSnapshotBase)
 	}
 	var rows uint64
 	for i := range manifest.Relations {
@@ -529,7 +559,8 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 	stateEnvelope, err := AppendState(nil, manifest.State)
 	if err != nil || manifest.Digest != bundleSnapshotManifestDigest(
 		stateEnvelope, manifest.RelationManifestDigest, manifest.SystemRows,
-		manifest.Relations, manifest.ImageDigest,
+		manifest.Relations, manifest.ImageDigest, manifest.CaptureRows,
+		manifest.CaptureImageDigest,
 	) {
 		return fmt.Errorf("%w: bundle identity", ErrSnapshotBase)
 	}
@@ -561,9 +592,11 @@ func bundleSnapshotManifestDigest(
 	systemRows uint64,
 	relations []SnapshotArtifactRelation,
 	imageDigest [sha256.Size]byte,
+	captureRows uint64,
+	captureImageDigest [sha256.Size]byte,
 ) [sha256.Size]byte {
 	h := sha256.New()
-	_, _ = h.Write(seededSnapshotManifestDomain)
+	_, _ = h.Write(bundleSnapshotManifestDomain)
 	writeHashFrame(h, stateEnvelope)
 	_, _ = h.Write(manifestDigest[:])
 	var fixed [16]byte
@@ -580,6 +613,9 @@ func bundleSnapshotManifestDigest(
 		_, _ = h.Write(relations[i].ImageDigest[:])
 	}
 	_, _ = h.Write(imageDigest[:])
+	binary.LittleEndian.PutUint64(fixed[0:8], captureRows)
+	_, _ = h.Write(fixed[0:8])
+	_, _ = h.Write(captureImageDigest[:])
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result

@@ -376,25 +376,9 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		certificate.Manifest.UserRows != m.user.Collection.Len() {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
-	if !certificate.Manifest.Seeded && !certificate.Manifest.Bundle {
-		capture := m.reservedCaptureTarget.Collection
-		if capture == nil && (certificate.Manifest.CaptureRows != 0 ||
-			certificate.Manifest.CaptureImageDigest != snapshotArtifactEmptyCaptureImageDigest()) {
-			return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
-		}
-		if capture != nil {
-			if capture.Len() != certificate.Manifest.CaptureRows {
-				return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
-			}
-			snapshot, err := capture.Snapshot()
-			if err != nil {
-				return raftmodel.Publication{}, m.fail(err)
-			}
-			digest, digestErr := snapshotArtifactOpaqueImageDigest(snapshot)
-			closeErr := snapshot.Close()
-			if digestErr != nil || closeErr != nil || digest != certificate.Manifest.CaptureImageDigest {
-				return raftmodel.Publication{}, m.fail(errors.Join(ErrSnapshotBase, digestErr, closeErr))
-			}
+	if !certificate.Manifest.Seeded {
+		if err := m.verifySnapshotBaseCapture(certificate.Manifest); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
 		}
 	}
 	imageDigest, imageErr := m.snapshotBaseImageDigest()
@@ -414,6 +398,35 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	default:
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
+}
+
+func (m *Machine) verifySnapshotBaseCapture(manifest SnapshotArtifactManifest) error {
+	capture := m.reservedCaptureTarget.Collection
+	if capture == nil {
+		wantDigest := snapshotArtifactEmptyCaptureImageDigest()
+		if manifest.Bundle {
+			wantDigest = [sha256.Size]byte{}
+		}
+		if manifest.CaptureRows != 0 || manifest.CaptureImageDigest != wantDigest {
+			return ErrSnapshotBase
+		}
+		return nil
+	}
+	if manifest.CaptureImageDigest == ([sha256.Size]byte{}) {
+		return ErrSnapshotBase
+	}
+	snapshot, err := capture.Snapshot()
+	if err != nil {
+		return err
+	}
+	rows := snapshot.Len()
+	digest, digestErr := snapshotArtifactOpaqueImageDigest(snapshot)
+	closeErr := snapshot.Close()
+	if digestErr != nil || closeErr != nil || rows != manifest.CaptureRows ||
+		digest != manifest.CaptureImageDigest {
+		return errors.Join(ErrSnapshotBase, digestErr, closeErr)
+	}
+	return nil
 }
 
 func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {

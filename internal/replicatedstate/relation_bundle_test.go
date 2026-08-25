@@ -26,6 +26,7 @@ type relationBundleFixture struct {
 	system  CollectionTarget
 	base    CollectionTarget
 	global  CollectionTarget
+	capture CollectionTarget
 	log     *durable.TxnLog
 	group   *durable.CheckpointGroup
 	index   store.IndexDefinition
@@ -35,7 +36,13 @@ type relationBundleFixture struct {
 
 func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixture {
 	return newRelationBundleFixtureWithCollectionOptions(
-		t, checkpoint, durable.Options{}, durable.Options{},
+		t, checkpoint, false, durable.Options{}, durable.Options{},
+	)
+}
+
+func newCapturedRelationBundleFixture(t testing.TB) relationBundleFixture {
+	return newRelationBundleFixtureWithCollectionOptions(
+		t, true, true, durable.Options{}, durable.Options{},
 	)
 }
 
@@ -45,13 +52,14 @@ func newRelationBundleFixtureWithGlobalOptions(
 	globalOptions durable.Options,
 ) relationBundleFixture {
 	return newRelationBundleFixtureWithCollectionOptions(
-		t, checkpoint, durable.Options{}, globalOptions,
+		t, checkpoint, false, durable.Options{}, globalOptions,
 	)
 }
 
 func newRelationBundleFixtureWithCollectionOptions(
 	t testing.TB,
 	checkpoint bool,
+	reserveCapture bool,
 	baseOptions, globalOptions durable.Options,
 ) relationBundleFixture {
 	t.Helper()
@@ -79,6 +87,14 @@ func newRelationBundleFixtureWithCollectionOptions(
 	baseOptions.Indexes = []store.IndexDefinition{index}
 	base := open("base", baseOptions)
 	global := open("global", globalOptions)
+	var capture CollectionTarget
+	if reserveCapture {
+		capture = open(TransitionCaptureCollectionName, durable.Options{
+			OpaqueValues: true, MaxKeyBytes: 8,
+			MaxDocumentBytes:  MaxTransitionCaptureRecordBytes,
+			MaxBatchDocuments: 1, MaxBatchBytes: MaxTransitionCaptureRecordBytes + 8,
+		})
+	}
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +104,11 @@ func newRelationBundleFixtureWithCollectionOptions(
 		{Name: systemCollectionName, Collection: system.Collection},
 		{Name: "base", Collection: base.Collection},
 		{Name: "global", Collection: global.Collection},
+	}
+	if reserveCapture {
+		members = append(members, durable.NamedCollection{
+			Name: TransitionCaptureCollectionName, Collection: capture.Collection,
+		})
 	}
 	var group *durable.CheckpointGroup
 	if checkpoint {
@@ -101,12 +122,17 @@ func newRelationBundleFixtureWithCollectionOptions(
 	}
 	options := Options{
 		TxnLimits: durable.TxnLimits{
-			MaxCollections: 3,
+			MaxCollections: len(members),
 			MaxDocuments: base.Limits.MaxDistinctMutations +
-				global.Limits.MaxDistinctMutations + 4,
+				global.Limits.MaxDistinctMutations + 5,
 			MaxBytes: 64 << 20,
 		},
 		MaxSessions: 128, RetryWindow: 8, CheckpointGroup: group,
+	}
+	if reserveCapture {
+		options.TransitionCaptureTarget = TransitionCaptureTarget{
+			Name: TransitionCaptureCollectionName, Collection: capture.Collection,
+		}
 	}
 	binding := testBinding()
 	machine, err := OpenBundle(
@@ -134,7 +160,7 @@ func newRelationBundleFixtureWithCollectionOptions(
 	applySessionOpen(t, machine, 2, commandValue(binding, 1))
 	return relationBundleFixture{
 		machine: machine, binding: binding, system: system, base: base,
-		global: global, log: log, group: group, index: index, dir: dir, options: options,
+		global: global, capture: capture, log: log, group: group, index: index, dir: dir, options: options,
 	}
 }
 
@@ -350,7 +376,7 @@ func TestPointReadIntoUsesDenseRelationAndExactPublicationCut(t *testing.T) {
 func TestPointReadIntoPreGrowsOverflowResultAtAdmissionBoundary(t *testing.T) {
 	const maximum = 3_366_913
 	fixture := newRelationBundleFixtureWithCollectionOptions(
-		t, true,
+		t, true, false,
 		durable.Options{
 			MaxPageSize: 64 << 10, ResidentBytes: 64 << 20,
 			InlineValueBytes: 512, MaxDocumentBytes: maximum,
@@ -964,7 +990,7 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 		fixture.machine.state.SnapshotBaseDigest != opened.Digest {
 		t.Fatalf("install bundle certificate = %+v, %v", publication, err)
 	}
-	if err := fixture.group.MaybeCheckpoint(); err != nil {
+	if err := fixture.group.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := OpenBundle(
@@ -1011,6 +1037,12 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 		{"relation_image", func(m *SnapshotArtifactManifest) {
 			m.Relations[1].ImageDigest[0] ^= 1
 		}},
+		{"capture_rows_without_image", func(m *SnapshotArtifactManifest) {
+			m.CaptureRows = 1
+		}},
+		{"noncanonical_empty_capture", func(m *SnapshotArtifactManifest) {
+			m.CaptureImageDigest = sha256.Sum256([]byte("not-the-empty-capture-image"))
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := cloneSnapshotArtifactManifest(manifest)
@@ -1033,6 +1065,149 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 		}, fixture.log, fixture.machine.options,
 	); err == nil {
 		t.Fatal("reopen accepted an unknown schema generation")
+	}
+
+	// A certificate can be internally canonical yet claim a capture member that
+	// this exact bundle does not own. Install must independently bind the local
+	// target instead of trusting the certificate checksum and manifest digest.
+	forgedCapture := cloneSnapshotArtifactManifest(manifest)
+	forgedCapture.CaptureImageDigest = snapshotArtifactEmptyCaptureImageDigest()
+	stateEnvelope, err := AppendState(nil, forgedCapture.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedCapture.Digest = bundleSnapshotManifestDigest(
+		stateEnvelope, forgedCapture.RelationManifestDigest, forgedCapture.SystemRows,
+		forgedCapture.Relations, forgedCapture.ImageDigest, forgedCapture.CaptureRows,
+		forgedCapture.CaptureImageDigest,
+	)
+	forgedBase, err := BuildSnapshotBase(forgedCapture, testBootstrap())
+	if err != nil {
+		t.Fatalf("build canonical foreign capture proof: %v", err)
+	}
+	if _, err := reopened.InstallSnapshot(forgedBase); !errors.Is(err, ErrSnapshotBase) {
+		t.Fatalf("install accepted foreign capture proof: %v", err)
+	}
+}
+
+func TestRelationBundleSnapshotBindsActiveCaptureAndRejectsSelfConsistentForgeries(t *testing.T) {
+	fixture := newCapturedRelationBundleFixture(t)
+	encoder := &sessionLeaseCapture{target: TransitionCaptureTarget{
+		Name: TransitionCaptureCollectionName, Collection: fixture.capture.Collection,
+	}}
+	if err := fixture.machine.BeginTransitionCapture(encoder); err != nil {
+		t.Fatal(err)
+	}
+	command := fixture.command(t, 1,
+		replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: []byte("captured-doc"),
+			Value: []byte(`{"email":"capture"}`),
+		}}},
+		replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual,
+			Key:  []byte{0x91, 0x01, 'c'}, Value: []byte(`["captured-doc"]`),
+		}}},
+	)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	base, manifest, err := fixture.machine.BuildBundleSnapshotBase()
+	if err != nil || manifest.CaptureRows != 2 ||
+		manifest.CaptureImageDigest == ([sha256.Size]byte{}) ||
+		manifest.CaptureImageDigest == snapshotArtifactEmptyCaptureImageDigest() {
+		t.Fatalf("active capture manifest rows=%d digest=%x err=%v",
+			manifest.CaptureRows, manifest.CaptureImageDigest, err)
+	}
+	opened, err := OpenSnapshotBase(base)
+	if err != nil || !equalSnapshotArtifactManifest(opened.Manifest, manifest) {
+		t.Fatalf("open active capture bundle: %+v, %v", opened.Manifest, err)
+	}
+	corruptKey := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	captureMember := []durable.NamedCollection{{
+		Name: TransitionCaptureCollectionName, Collection: fixture.capture.Collection,
+	}}
+	if err := fixture.group.Update(3, captureMember, fixture.options.TxnLimits,
+		func(batch *durable.DatabaseBatch) error {
+			captureBatch, err := batch.CollectionHandle(fixture.capture.Collection)
+			if err != nil {
+				return err
+			}
+			return captureBatch.Put(corruptKey, []byte("substituted-after-certificate"))
+		}); err != nil {
+		t.Fatalf("substitute local capture image: %v", err)
+	}
+	if err := fixture.group.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint substituted capture image: %v", err)
+	}
+	if _, err := fixture.machine.InstallSnapshot(base); !errors.Is(err, ErrSnapshotBase) {
+		t.Fatalf("install accepted substituted local capture image: %v", err)
+	}
+	if err := fixture.group.Update(3, captureMember, fixture.options.TxnLimits,
+		func(batch *durable.DatabaseBatch) error {
+			captureBatch, err := batch.CollectionHandle(fixture.capture.Collection)
+			if err != nil {
+				return err
+			}
+			return captureBatch.Delete(corruptKey)
+		}); err != nil {
+		t.Fatalf("restore exact capture image: %v", err)
+	}
+	if err := fixture.group.MaybeCheckpoint(); err != nil {
+		t.Fatalf("checkpoint restored capture image: %v", err)
+	}
+	reopened, err := OpenBundle(
+		fixture.binding, testBootstrap(), fixture.system,
+		[]RelationCollection{
+			{Relation: 1, Kind: RelationJSON, Name: "base", Target: fixture.base,
+				LocalIndexes: []store.IndexDefinition{fixture.index}},
+			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
+				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+		}, fixture.log, fixture.options,
+	)
+	if err != nil {
+		t.Fatalf("open restored active capture bundle: %v", err)
+	}
+	if _, err := reopened.InstallSnapshot(base); err != nil {
+		t.Fatalf("install restored exact active capture bundle: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*SnapshotArtifactManifest)
+	}{
+		{"missing", func(m *SnapshotArtifactManifest) {
+			m.CaptureRows = 0
+			m.CaptureImageDigest = [sha256.Size]byte{}
+		}},
+		{"mismatched_rows", func(m *SnapshotArtifactManifest) { m.CaptureRows++ }},
+		{"forged_image", func(m *SnapshotArtifactManifest) { m.CaptureImageDigest[0] ^= 1 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := cloneSnapshotArtifactManifest(manifest)
+			test.mutate(&candidate)
+			stateEnvelope, encodeErr := AppendState(nil, candidate.State)
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			candidate.Digest = bundleSnapshotManifestDigest(
+				stateEnvelope, candidate.RelationManifestDigest, candidate.SystemRows,
+				candidate.Relations, candidate.ImageDigest, candidate.CaptureRows,
+				candidate.CaptureImageDigest,
+			)
+			if _, buildErr := BuildSnapshotBase(candidate, testBootstrap()); buildErr != nil {
+				t.Fatalf("self-consistent forged certificate did not build: %v", buildErr)
+			}
+			if verifyErr := reopened.verifySnapshotBaseCapture(candidate); !errors.Is(verifyErr, ErrSnapshotBase) {
+				t.Fatalf("local capture accepted self-consistent forgery: %v", verifyErr)
+			}
+		})
+	}
+
+	recovered := &sessionLeaseCapture{target: TransitionCaptureTarget{
+		Name: TransitionCaptureCollectionName, Collection: fixture.capture.Collection,
+	}}
+	if err := reopened.BeginTransitionCapture(recovered); err != nil || recovered.current != 3 {
+		t.Fatalf("recover active capture at %d: %v", recovered.current, err)
 	}
 }
 
@@ -1101,6 +1276,7 @@ func TestSingletonRelationSnapshotCanonicalModelAndReencode(t *testing.T) {
 	wrongManifest.Digest = bundleSnapshotManifestDigest(
 		stateEnvelope, wrongManifest.RelationManifestDigest,
 		wrongManifest.SystemRows, wrongManifest.Relations, wrongManifest.ImageDigest,
+		wrongManifest.CaptureRows, wrongManifest.CaptureImageDigest,
 	)
 	wrongBase, err := BuildSnapshotBase(wrongManifest, fixture.bootstrap)
 	if err != nil {

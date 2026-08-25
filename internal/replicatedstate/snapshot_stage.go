@@ -299,6 +299,24 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	if s.opened {
 		return nil, fmt.Errorf("%w: candidate already opened", ErrSnapshotStage)
 	}
+	// The stage's capture target is the independently verified destination.
+	// Never let caller options redirect the opened Machine to another opaque
+	// collection or bind a different member name after image proof.
+	if s.capture.Collection == nil {
+		if options.TransitionCaptureTarget.Collection != nil ||
+			options.TransitionCaptureTarget.Name != "" {
+			return nil, fmt.Errorf("%w: candidate capture target mismatch", ErrSnapshotStage)
+		}
+		options.TransitionCaptureTarget = TransitionCaptureTarget{}
+	} else {
+		want := TransitionCaptureTarget{
+			Name: TransitionCaptureCollectionName, Collection: s.capture.Collection,
+		}
+		if supplied := options.TransitionCaptureTarget; (supplied.Collection != nil || supplied.Name != "") && supplied != want {
+			return nil, fmt.Errorf("%w: candidate capture target mismatch", ErrSnapshotStage)
+		}
+		options.TransitionCaptureTarget = want
+	}
 	machine, err := Open(
 		s.expected.State.Binding, bootstrap, s.system,
 		UserCollection{Name: string(s.expected.UserCollection), Target: s.user},
