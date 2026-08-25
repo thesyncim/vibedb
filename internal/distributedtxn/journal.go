@@ -517,7 +517,7 @@ func (j *Journal) writeEntryLocked(kind journalEntryKind, state byte, revision u
 }
 
 func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
-	var arena [MaxParticipants]ParticipantRef
+	var arena [MaxInlineParticipants]ParticipantRef
 	record, err := OpenCoordinatorInto(raw, arena[:])
 	if err != nil || record.State != CoordinatorStaging {
 		return Status{}, errors.Join(ErrCorrupt, err)

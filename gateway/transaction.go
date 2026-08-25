@@ -116,7 +116,7 @@ func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, err
 			Generation: snapshot.Generation(),
 		}, nil
 	}
-	if len(participants) > distributedtxn.MaxParticipants {
+	if len(participants) > distributedtxn.MaxInlineParticipants {
 		return nil, ErrTransactionParticipantLimit
 	}
 	return e.executeTransaction(opctx, snapshot, participants, profile)
@@ -128,7 +128,7 @@ func (e *Executor) planTransaction(
 	queries []Query,
 	profile Profile,
 ) ([]transactionParticipant, error) {
-	participants := make([]transactionParticipant, 0, min(len(queries), distributedtxn.MaxParticipants))
+	participants := make([]transactionParticipant, 0, min(len(queries), distributedtxn.MaxInlineParticipants))
 	for i := range queries {
 		query := &queries[i]
 		args, err := queryRuntimeArgs(query.Params)
@@ -276,7 +276,7 @@ func appendTransactionStatement(
 			scopes: call.req.AccessScopes,
 		})
 		participantIndex = len(participants) - 1
-		if len(participants) > distributedtxn.MaxParticipants {
+		if len(participants) > distributedtxn.MaxInlineParticipants {
 			return nil, ErrTransactionParticipantLimit
 		}
 	}

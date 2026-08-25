@@ -488,7 +488,7 @@ func validateTransactionRequest(tx TransactionRequest) error {
 		}
 		var err error
 		if tx.Operation == TransactionStageCoordinator {
-			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 		} else {
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
@@ -536,7 +536,7 @@ func validateTransactionReply(tx TransactionReply) error {
 			return errBadTransaction
 		}
 		if len(tx.Record) != 0 {
-			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)

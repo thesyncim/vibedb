@@ -741,7 +741,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		}
 		return CompletionResponse(0)
 	case TransactionStageCoordinator:
-		var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+		var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 		if openErr != nil {
 			return transactionError(openErr)

@@ -106,6 +106,24 @@ func TestRecordCorruptionAndOrderingRejected(t *testing.T) {
 	}
 }
 
+func TestAppendCoordinatorSignalsSegmentedFallback(t *testing.T) {
+	participants := make([]ParticipantRef, MaxInlineParticipants+1)
+	for i := range participants {
+		participants[i] = ParticipantRef{
+			Distribution: []byte("docs"), Shard: []byte{byte(i + 1)},
+			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
+			MutationDigest: Digest{byte(i + 1)}, State: ParticipantStaged,
+		}
+	}
+	_, err := AppendCoordinator(nil, CoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 1, Participants: participants,
+	})
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("AppendCoordinator wider than inline lane = %v, want ErrTooLarge", err)
+	}
+}
+
 func TestStateTransitions(t *testing.T) {
 	if !CoordinatorStaging.CanTransitionTo(CoordinatorCommitted) ||
 		!CoordinatorStaging.CanTransitionTo(CoordinatorAborted) ||
@@ -120,7 +138,7 @@ func TestStateTransitions(t *testing.T) {
 }
 
 func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
-	participants := make([]ParticipantRef, MaxParticipants)
+	participants := make([]ParticipantRef, MaxInlineParticipants)
 	for i := range participants {
 		participants[i] = ParticipantRef{
 			Distribution:         []byte("docs"),
@@ -132,7 +150,7 @@ func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
 	}
 	record := CoordinatorRecord{ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1, Participants: participants}
 	dst := make([]byte, 0, MaxCoordinatorRecordBytes)
-	participantsScratch := make([]ParticipantRef, MaxParticipants)
+	participantsScratch := make([]ParticipantRef, MaxInlineParticipants)
 	b.ReportAllocs()
 	b.SetBytes(int64(coordinatorHeaderBytes + 4 + len(participants)*60))
 	b.ResetTimer()

@@ -157,7 +157,7 @@ func (e *Executor) recoverCoordinator(
 	profile Profile,
 ) (RecoveryResult, error) {
 	reply := coordinator.response.Transaction
-	var arena [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+	var arena [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 	record, err := distributedtxn.OpenCoordinatorInto(reply.Record, arena[:])
 	if err != nil || record.ID != reply.ID {
 		return RecoveryResult{}, errors.Join(ErrTransactionConflict, err)
