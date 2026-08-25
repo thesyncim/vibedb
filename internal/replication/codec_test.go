@@ -223,6 +223,7 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(view.Bytes(), frame) || view.Kind() != command.Kind ||
+		view.AuthorityClass != command.AuthorityClass ||
 		view.ClusterID != command.ClusterID ||
 		view.ClusterIncarnation != command.ClusterIncarnation ||
 		view.ShardIncarnation != command.ShardIncarnation || view.GroupID != command.GroupID ||
@@ -277,6 +278,24 @@ func TestCommandRoundTripAndIterator(t *testing.T) {
 	var emptyRelations RelationBatchIterator
 	if emptyRelations.Next() || (*RelationBatchIterator)(nil).Next() {
 		t.Fatal("empty or nil relation iterator advanced")
+	}
+}
+
+func TestCommandTopologyAuthorityClassIsCanonicalIdentity(t *testing.T) {
+	command := testCommand()
+	data := encodeCommand(t, command)
+	command.AuthorityClass = CommandAuthorityTopology
+	topology := encodeCommand(t, command)
+	if bytes.Equal(data, topology) {
+		t.Fatal("topology authority class did not change canonical command bytes")
+	}
+	view, err := OpenCommand(topology)
+	if err != nil || view.AuthorityClass != CommandAuthorityTopology {
+		t.Fatalf("topology class=%d err=%v", view.AuthorityClass, err)
+	}
+	command.AuthorityClass = 2
+	if _, err = AppendCommand(nil, command); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("unknown authority class err=%v", err)
 	}
 }
 
@@ -1222,7 +1241,7 @@ func TestCommandDecodeRejectsDamageAndSemanticCorruption(t *testing.T) {
 		{"open_with_mutations", func(b []byte) { b[10] = commandWireSessionOpen }, ErrEnvelopeSemantic},
 		{"zero_mutation_count", func(b []byte) { clear(b[24:28]) }, ErrEnvelopeSemantic},
 		{"excess_mutation_count", func(b []byte) { binary.LittleEndian.PutUint32(b[24:28], 3) }, ErrEnvelopeCorrupt},
-		{"flags", func(b []byte) { b[11] = 1 }, ErrEnvelopeSemantic},
+		{"authority_class", func(b []byte) { b[11] = 2 }, ErrEnvelopeSemantic},
 		{"zero_relation_count", func(b []byte) { clear(b[28:30]) }, ErrEnvelopeSemantic},
 		{"relation_count_60", func(b []byte) {
 			binary.LittleEndian.PutUint16(b[28:30], MaxRelationBatches+1)

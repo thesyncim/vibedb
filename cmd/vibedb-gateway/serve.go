@@ -171,6 +171,10 @@ func runServe(args []string) int {
 			fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
 			return 2
 		}
+		// The loopback-only development transport skips policy enforcement, but
+		// still emits the one canonical classified replicated request shape.
+		internalAuthority.Node[0] = 1
+		internalAuthority.Generation = 1
 	} else {
 		profile, err := servicetls.LoadProfile(*tlsCertificate, *tlsKey, *tlsRoots, *tlsIdentityOID, time.Now)
 		if err != nil {
@@ -188,8 +192,8 @@ func runServe(args []string) int {
 		}
 		if policy.Check(internalAuthority.Node,
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
-				serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, and data_write recovery authority")
+				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, and topology recovery authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -400,7 +404,7 @@ func newReplicatedCatalogGateway(
 	holder := gateway.NewCatalogHolder(nil)
 	binding, err := gateway.NativeSessionJournalBinding(
 		route, string(distributionName), string(shardID),
-		[]byte{replicatedCatalogControllerTenant}, relation,
+		[]byte{replicatedCatalogControllerTenant}, relation, serviceauthz.CapabilityTopology,
 	)
 	if err != nil {
 		if catalogTLS != nil {
@@ -422,6 +426,7 @@ func newReplicatedCatalogGateway(
 		Executor: replicated, Route: route, Distribution: string(distributionName), Shard: string(shardID),
 		Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID, RetryHome: retryHome,
 		Resolver: gateway.BaseRelationResolver{Relation: relation}, Journal: journal,
+		ProposalCapability: serviceauthz.CapabilityTopology,
 		JournalBinding:     binding,
 		MaxRelationBatches: 1, MaxMutations: 2,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
@@ -432,16 +437,23 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, err
 	}
+	authorizedContext, err := serviceauthz.WithAuthority(ctx, internalAuthority)
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
 	renewExisting := session.Status().Active
 	if session.Status().Pending {
-		_, err = session.RetryPending(ctx)
+		_, err = session.RetryPending(authorizedContext)
 	}
 	if err == nil && !session.Status().Active {
 		deadline := time.Now().Add(lease).UnixNano()
 		if deadline <= 0 {
 			err = gateway.ErrNativeSession
 		} else {
-			_, err = session.Open(ctx, deadline)
+			_, err = session.Open(authorizedContext, deadline)
 		}
 	}
 	if err == nil && renewExisting && session.Status().Active {
@@ -455,7 +467,7 @@ func newReplicatedCatalogGateway(
 			}
 		}
 		if err == nil && next > 0 {
-			_, err = session.Renew(ctx, status.LeaseDeadline, next)
+			_, err = session.Renew(authorizedContext, status.LeaseDeadline, next)
 		}
 	}
 	if err != nil {
@@ -466,6 +478,7 @@ func newReplicatedCatalogGateway(
 	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: replicated, Route: route, Relation: relation, Holder: holder, Session: session,
+		Authority: internalAuthority,
 	})
 	if err != nil {
 		if catalogTLS != nil {

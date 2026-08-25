@@ -30,8 +30,9 @@ const (
 )
 
 // Membership is fixed-width: the original 279-byte control body plus the
-// forwarded 16-byte node identity and 8-byte authorization generation.
-const replicatedMembershipRequestBodyBytes = 303
+// forwarded 16-byte node identity, 8-byte authorization generation, and the
+// 8-byte exact requested capability.
+const replicatedMembershipRequestBodyBytes = 311
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
@@ -64,6 +65,7 @@ type ReplicatedFence struct {
 type ReplicatedRequest struct {
 	Operation      ReplicatedOperation
 	Authority      serviceauthz.Authority
+	Capability     serviceauthz.Capability
 	Fence          ReplicatedFence
 	Command        []byte
 	Membership     ReplicatedMembershipRequest
@@ -163,6 +165,7 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
+	e.u64(uint64(request.Capability))
 	encodeReplicatedFence(&e, request.Fence)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -203,6 +206,7 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
+	e.u64(uint64(request.Capability))
 	encodeReplicatedFence(&e, request.Fence)
 	var payload []byte
 	tag := byte(tagReplicatedRequest)
@@ -268,6 +272,7 @@ func decodeReplicatedRequest(
 	}
 	request.Authority.Node = d.fixed16()
 	request.Authority.Generation = d.u64()
+	request.Capability = serviceauthz.Capability(d.u64())
 	request.Fence = decodeReplicatedFence(&d)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -583,14 +588,20 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 		request.Authority.Generation == 0) {
 		return false
 	}
+	if authorityPresent != (request.Capability != 0) ||
+		(request.Capability != 0 && !request.Capability.Valid()) {
+		return false
+	}
 	switch request.Operation {
 	case ReplicatedProbe:
-		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
+		return validReplicatedProbeCapability(request.Capability) &&
+			validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0
 	case ReplicatedPropose:
-		if request.Membership != (ReplicatedMembershipRequest{}) || request.Relation != 0 ||
+		if !validReplicatedProposalCapability(request.Capability) ||
+			request.Membership != (ReplicatedMembershipRequest{}) || request.Relation != 0 ||
 			len(request.Key) != 0 || request.MinimumApplied != 0 || request.MaxValueBytes != 0 {
 			return false
 		}
@@ -599,7 +610,9 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			return false
 		}
 		command, err := replication.OpenCommand(request.Command)
-		return err == nil && command.ClusterID == request.Fence.Group.ClusterID &&
+		return err == nil && replicatedCommandCapabilityMatches(
+			request.Capability, command.AuthorityClass,
+		) && command.ClusterID == request.Fence.Group.ClusterID &&
 			command.ClusterIncarnation == request.Fence.Group.ClusterIncarnation &&
 			command.TopologyRecoveryEpoch == request.Fence.Group.TopologyRecoveryEpoch &&
 			command.ShardIncarnation == request.Fence.Group.ShardIncarnation &&
@@ -615,11 +628,13 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	case ReplicatedMembership:
 		// Semantic validation is deliberately performed by the serialized owner
 		// so malformed control requests receive a deterministic refusal class.
-		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+		return (request.Capability == 0 || request.Capability == serviceauthz.CapabilityMembership) &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0
 	case ReplicatedReadLeader, ReplicatedReadFollower:
-		return validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+		return validReplicatedReadCapability(request.Capability) &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation != 0 && request.Relation <= replication.MaxRelationID &&
 			len(request.Key) != 0 && len(request.Key) <= replication.MaxMutationKeyBytes &&
@@ -628,6 +643,32 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	default:
 		return false
 	}
+}
+
+func replicatedCommandCapabilityMatches(capability serviceauthz.Capability,
+	class replication.CommandAuthorityClass) bool {
+	if capability == serviceauthz.CapabilityTopology {
+		return class == replication.CommandAuthorityTopology
+	}
+	return (capability == 0 || capability == serviceauthz.CapabilityDataWrite) &&
+		class == replication.CommandAuthorityData
+}
+
+func validReplicatedProbeCapability(capability serviceauthz.Capability) bool {
+	return capability == 0 || capability == serviceauthz.CapabilityDataRead ||
+		capability == serviceauthz.CapabilityDataWrite ||
+		capability == serviceauthz.CapabilityMembership ||
+		capability == serviceauthz.CapabilityTopology
+}
+
+func validReplicatedProposalCapability(capability serviceauthz.Capability) bool {
+	return capability == 0 || capability == serviceauthz.CapabilityDataWrite ||
+		capability == serviceauthz.CapabilityTopology
+}
+
+func validReplicatedReadCapability(capability serviceauthz.Capability) bool {
+	return capability == 0 || capability == serviceauthz.CapabilityDataRead ||
+		capability == serviceauthz.CapabilityTopology
 }
 
 func validReplicatedMemberState(state ReplicatedMemberState) bool {

@@ -1349,7 +1349,10 @@ func (m *Machine) planMutations(
 			ordered[at].delete = mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual
 			ordered[at].value = mutation.Value
-			ordered[at].compare = mutation.Compare
+			// before temporarily owns fixed conditional command metadata until
+			// the snapshot lookup below replaces it with the actual prior value.
+			// This keeps the pooled final workspace at three slice headers.
+			ordered[at].before = mutation.Compare
 			ordered[at].conditional = mutation.Kind == replication.MutationPutDigestEqual
 			ordered[at].conditionalDelete = mutation.Kind == replication.MutationDeleteDigestEqual
 			ordered[at].absentOrEqual = mutation.Kind == replication.MutationPutAbsentOrEqual
@@ -1363,7 +1366,7 @@ func (m *Machine) planMutations(
 			key: mutation.Key, value: value,
 			delete: mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual,
-			compare:           mutation.Compare,
+			before:            mutation.Compare,
 			conditional:       mutation.Kind == replication.MutationPutDigestEqual,
 			conditionalDelete: mutation.Kind == replication.MutationDeleteDigestEqual,
 			absentOrEqual:     mutation.Kind == replication.MutationPutAbsentOrEqual,
@@ -1413,6 +1416,7 @@ func (m *Machine) planMutations(
 			len(mutation.value) != replication.MutationDigestCompareBytes {
 			return nil, ResultInvalidDocument, nil
 		}
+		compare := mutation.before
 		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 		if err != nil {
 			return nil, 0, err
@@ -1449,10 +1453,10 @@ func (m *Machine) planMutations(
 			if !found {
 				return nil, ResultIndexConflict, nil
 			}
-			expectedLength := binary.LittleEndian.Uint64(mutation.compare[:8])
+			expectedLength := binary.LittleEndian.Uint64(compare[:8])
 			currentDigest := sha256.Sum256(current)
 			if uint64(len(current)) != expectedLength ||
-				!bytes.Equal(currentDigest[:], mutation.compare[8:]) {
+				!bytes.Equal(currentDigest[:], compare[8:]) {
 				return nil, ResultIndexConflict, nil
 			}
 		}
@@ -1460,10 +1464,10 @@ func (m *Machine) planMutations(
 			if !found {
 				continue
 			}
-			expectedLength := binary.LittleEndian.Uint64(mutation.compare[:8])
+			expectedLength := binary.LittleEndian.Uint64(compare[:8])
 			currentDigest := sha256.Sum256(current)
 			if uint64(len(current)) != expectedLength ||
-				!bytes.Equal(currentDigest[:], mutation.compare[8:]) {
+				!bytes.Equal(currentDigest[:], compare[8:]) {
 				return nil, ResultIndexConflict, nil
 			}
 			mutation.value = nil

@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"testing"
@@ -194,6 +195,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	derived := deriveBundleContractForTest(relationManifestDigest(1, relations), 1024, 8)
+	if derived != contract {
+		t.Fatalf("contract implementation diverged from independent semantic frame: got=%x derived=%x",
+			contract, derived)
+	}
 	seed, err := dataChainSeedDigest(contract, sha256.Sum256([]byte("canonical image")))
 	if err != nil {
 		t.Fatal(err)
@@ -210,11 +216,44 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"cd6887276b0b0a1299b138b3402162b19484053dbd46b39fa741b5a7ce0bdfad")
+		"d5db6e974b6a3dc49b19fd4783d2a15d9de80efcb7b9db3eb66c55202474d6b6")
 	assertDigestHex(t, "data-chain seed", seed,
-		"c2a0ef00cf2e2cb6e168b2f82733ce1ebe8ef062a2d7eb6f286ec786e97ec755")
+		"6cd113664c7f66785f62f72bab834638da962f2363927bb51453ae9f5142df6c")
 	assertDigestHex(t, "data-chain transition", transition,
-		"67f27f51b15a91334fcf2bf31f4c0d6cfaf004677e371dadfb432d0cb4f6d71b")
+		"3c7437346ed27aa96b0ab8d7329d623ba8f805fd6f3989fbd45600cf1085d844")
+}
+
+func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
+	retryWindow uint16) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write([]byte("vibedb/replicated-state/apply-contract\x00"))
+	_, _ = h.Write(manifest[:])
+	base := sha256.Sum256([]byte(deterministicApplySemantics))
+	bundle := sha256.Sum256([]byte(deterministicBundleApplySemantics))
+	_, _ = h.Write(base[:])
+	_, _ = h.Write(bundle[:])
+	var grammar [2 + 18*4]byte
+	binary.LittleEndian.PutUint16(grammar[:2], ResultFormatMutation)
+	for index, code := range [...]uint32{
+		ResultApplied, ResultStaleFence, ResultUnknownRelation, ResultInvalidDocument,
+		ResultTargetBound, ResultWrongShard, ResultSessionRetired, ResultSessionOpened,
+		ResultSessionRenewed, ResultSessionRevoked, ResultIndexConflict, MaxDistinctMutations,
+		uint32(replication.MutationPut), uint32(replication.MutationDelete),
+		uint32(replication.MutationPutAbsentOrEqual),
+		uint32(replication.MutationDeleteDigestEqual),
+		uint32(replication.MutationPutDigestEqual), replication.MutationDigestCompareBytes,
+	} {
+		binary.LittleEndian.PutUint32(grammar[2+index*4:], code)
+	}
+	_, _ = h.Write(grammar[:])
+	var limits [18]byte
+	binary.LittleEndian.PutUint64(limits[:8], maxSessions)
+	binary.LittleEndian.PutUint16(limits[8:10], retryWindow)
+	binary.LittleEndian.PutUint64(limits[10:], MaxSessionRetryWindow)
+	_, _ = h.Write(limits[:])
+	var result [sha256.Size]byte
+	_ = h.Sum(result[:0])
+	return result
 }
 
 func TestDataChainTransitionDigestRejectsNonCanonicalTransitions(t *testing.T) {

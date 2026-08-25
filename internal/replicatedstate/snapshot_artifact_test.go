@@ -60,7 +60,9 @@ func writeSnapshotArtifactFixture(t testing.TB, snapshot *ReadSnapshot) ([]byte,
 func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	_, snapshot := snapshotArtifactFixture(t)
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
-	const golden = "5c03978f556658ace1b5de3e0db54488758feb9928be2c06d32697735b345c84"
+	// The artifact authenticates the apply contract; adding canonical
+	// conditional relation mutations intentionally changes this derived vector.
+	const golden = "5c6c4a867491739006ceca8066e7de6f5157ed7848ef8ff8872a000f151d7b51"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}

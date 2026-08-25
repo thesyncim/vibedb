@@ -41,6 +41,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -98,9 +99,11 @@ func TestRF3NativeServingThreeProcessRecoveryEvidence(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		ctx = processAuthorizedContext(t, ctx)
 		leader := cluster.elect(t, ctx, 1)
 		client := newFaultProcessClient(t, cluster)
-		session := newProcessNativeSession(t, cluster.route(), client, 0x91)
+		session := newProcessNativeSession(t, cluster.route(), client, 0x91,
+			serviceauthz.CapabilityDataWrite)
 		if _, err := session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 			t.Fatalf("open native session: %v", err)
 		}
@@ -178,9 +181,11 @@ func TestRF3NativeServingThreeProcessRecoveryEvidence(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		ctx = processAuthorizedContext(t, ctx)
 		leader := cluster.elect(t, ctx, 1)
 		client := newFaultProcessClient(t, cluster)
-		session := newProcessNativeSession(t, cluster.route(), client, 0x92)
+		session := newProcessNativeSession(t, cluster.route(), client, 0x92,
+			serviceauthz.CapabilityDataWrite)
 		if _, err := session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 			t.Fatalf("open native session: %v", err)
 		}
@@ -1096,12 +1101,14 @@ func newProcessNativeSession(
 	route gateway.ReplicatedRoute,
 	client *faultProcessClient,
 	clientSeed byte,
+	capability serviceauthz.Capability,
 ) *gateway.NativeSession {
 	t.Helper()
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
 		Executor: client.executor, Route: route,
 		Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("process-test-tenant"), ClientID: replication.ID128{clientSeed},
+		ProposalCapability: capability,
 		Resolver:           gateway.BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
 		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
@@ -1110,6 +1117,21 @@ func newProcessNativeSession(
 		t.Fatal(err)
 	}
 	return session
+}
+
+func processRequestAuthority() serviceauthz.Authority {
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	return authority
+}
+
+func processAuthorizedContext(t testing.TB, ctx context.Context) context.Context {
+	t.Helper()
+	bound, err := serviceauthz.WithAuthority(ctx, processRequestAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bound
 }
 
 func processOrderedKey(t testing.TB, source string) []byte {

@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -130,6 +131,9 @@ type NativeSessionOptions struct {
 	// JournalBinding authenticates the route, tenant, and resolver schema of a
 	// durable journal. It is required only when Journal is configured.
 	JournalBinding replication.Digest
+	// ProposalCapability is the exact authorization class placed on every
+	// probe and proposal. Only DataWrite and Topology are admitted.
+	ProposalCapability serviceauthz.Capability
 
 	MaxRelationBatches  int
 	MaxMutations        int
@@ -146,10 +150,13 @@ func NativeSessionJournalBinding(
 	distribution, shard string,
 	tenant []byte,
 	relation replication.RelationID,
+	capability serviceauthz.Capability,
 ) (replication.Digest, error) {
 	if !validReplicatedRoute(route) ||
 		!validNativeSessionIdentity(distribution, shard, tenant) ||
-		relation == 0 || relation > replication.MaxRelationID {
+		relation == 0 || relation > replication.MaxRelationID ||
+		(capability != serviceauthz.CapabilityDataWrite &&
+			capability != serviceauthz.CapabilityTopology) {
 		return replication.Digest{}, ErrNativeSession
 	}
 	hash := sha256.New()
@@ -181,6 +188,7 @@ func NativeSessionJournalBinding(
 	writeBytes([]byte(shard))
 	writeBytes(tenant)
 	writeScalar(uint64(relation))
+	writeScalar(uint64(capability))
 	var digest replication.Digest
 	copy(digest[:], hash.Sum(nil))
 	return digest, nil
@@ -220,6 +228,7 @@ type NativeSession struct {
 	terminalFingerprint replication.Digest
 	leader              shardservice.ReplicatedMemberState
 	journal             *NativeSessionJournal
+	proposalCapability  serviceauthz.Capability
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -266,6 +275,10 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.InitialCommandBytes <= 0 || options.InitialCommandBytes > options.MaxCommandBytes {
 		return nil, ErrNativeSession
 	}
+	if options.ProposalCapability != serviceauthz.CapabilityDataWrite &&
+		options.ProposalCapability != serviceauthz.CapabilityTopology {
+		return nil, ErrNativeSession
+	}
 	route := options.Route
 	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
 	tenant := append([]byte(nil), options.Tenant...)
@@ -277,8 +290,9 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		resolver: options.Resolver,
 		bundle:   newRelationBundleBuilder(options.MaxRelationBatches, options.MaxMutations),
 		command:  make([]byte, 0, options.InitialCommandBytes), maxCommand: options.MaxCommandBytes,
-		nextSequence: 1,
-		journal:      options.Journal,
+		nextSequence:       1,
+		journal:            options.Journal,
+		proposalCapability: options.ProposalCapability,
 	}
 	if options.Journal != nil {
 		state, loadErr := options.Journal.load()
@@ -544,8 +558,13 @@ func (session *NativeSession) commandHeader(
 	epoch, sequence, ackThrough uint64,
 ) replication.Command {
 	commandFence := session.route.Command
+	authorityClass := replication.CommandAuthorityData
+	if session.proposalCapability == serviceauthz.CapabilityTopology {
+		authorityClass = replication.CommandAuthorityTopology
+	}
 	return replication.Command{
 		Kind:                  kind,
+		AuthorityClass:        authorityClass,
 		ClusterID:             session.route.Group.ClusterID,
 		ClusterIncarnation:    session.route.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch: session.route.Group.TopologyRecoveryEpoch,
@@ -611,7 +630,7 @@ func (session *NativeSession) executePending(
 		hint = &session.leader
 	}
 	result, err := session.executor.propose(
-		ctx, session.route, session.command, hint, priorUnknown,
+		ctx, session.route, session.command, hint, priorUnknown, session.proposalCapability,
 	)
 	if err != nil {
 		if errors.Is(err, raftservice.ErrOutcomeUnknown) {
@@ -825,7 +844,10 @@ func validNativeTextIdentity(value string) bool {
 		utf8.ValidString(value) && strings.IndexByte(value, 0) < 0
 }
 
-var nativeFingerprintDomain = []byte("vibedb/gateway/native-command\x00")
+var (
+	nativeFingerprintDomain       = []byte("vibedb/gateway/native-command\x00")
+	nativeTopologyAuthorityMarker = []byte{byte(replication.CommandAuthorityTopology)}
+)
 
 func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	hasher := sha256.New()
@@ -833,6 +855,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	var scalar [8]byte
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.Kind))
 	_, _ = hasher.Write(scalar[:])
+	if command.AuthorityClass == replication.CommandAuthorityTopology {
+		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
 	binary.LittleEndian.PutUint64(scalar[:], command.TopologyRecoveryEpoch)

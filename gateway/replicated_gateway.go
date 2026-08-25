@@ -5,6 +5,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 // NativeGatewayOptions composes an immutable-catalog route with the SQL-free
@@ -94,6 +95,7 @@ func (gateway *NativeGateway) NewSession(request NativeSessionRequest) (*NativeS
 		Executor: gateway.executor, Route: route,
 		Distribution: distributionName, Shard: shardID,
 		Tenant: request.Tenant, ClientID: request.ClientID, RetryHome: request.RetryHome,
+		ProposalCapability:  serviceauthz.CapabilityDataWrite,
 		Resolver:            gateway.resolver,
 		MaxRelationBatches:  gateway.maxRelationBatches,
 		MaxMutations:        gateway.maxMutations,

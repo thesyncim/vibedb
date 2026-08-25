@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -23,11 +24,16 @@ type catalogAuthorityClient struct {
 	unknownCommand    []byte
 	unknownCompletion []byte
 	unknownState      shardservice.ReplicatedMemberState
+	wantAuthority     serviceauthz.Authority
 }
 
 func (client *catalogAuthorityClient) DoReplicated(
 	_ context.Context, _ ReplicatedEndpoint, request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
+	if request.Authority != client.wantAuthority ||
+		request.Capability != serviceauthz.CapabilityTopology {
+		return nil, errors.New("catalog request escaped exact topology authority")
+	}
 	if request.Operation == shardservice.ReplicatedProbe {
 		return &shardservice.ReplicatedResponse{
 			Kind: shardservice.ReplicatedHandshake, HasState: true, State: client.state,
@@ -48,6 +54,9 @@ func (client *catalogAuthorityClient) DoReplicated(
 	command, err := replication.OpenCommand(request.Command)
 	if err != nil {
 		return nil, err
+	}
+	if command.AuthorityClass != replication.CommandAuthorityTopology {
+		return nil, errors.New("catalog command lost authenticated topology identity")
 	}
 	if bytes.Equal(request.Command, client.unknownCommand) && len(client.unknownCompletion) != 0 {
 		if client.holdUnknown {
@@ -164,7 +173,11 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		},
 		LeaderID: route.Replicas[0].Member, Commit: 1, Applied: 1, CheckpointApplied: 1,
 	}
-	client := &catalogAuthorityClient{state: state, rows: make(map[string][]byte)}
+	topologyAuthority := serviceauthz.Authority{Generation: 9}
+	topologyAuthority.Node[0] = 0x71
+	client := &catalogAuthorityClient{
+		state: state, rows: make(map[string][]byte), wantAuthority: topologyAuthority,
+	}
 	raw, err := AppendSnapshotDocument(nil, current)
 	if err != nil {
 		t.Fatal(err)
@@ -178,18 +191,24 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		Executor: executor, Route: route, Distribution: string(descriptor.Distribution),
 		Shard: string(descriptor.Shard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
+		ProposalCapability: serviceauthz.CapabilityTopology,
 		MaxRelationBatches: 1, MaxMutations: 2,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = session.Open(context.Background(), 1<<50); err != nil {
+	ctx, err := serviceauthz.WithAuthority(context.Background(), topologyAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(ctx, 1<<50); err != nil {
 		t.Fatal(err)
 	}
 	authority, err := NewReplicatedCatalogAuthority(ReplicatedCatalogAuthorityOptions{
 		Executor: executor, Route: route, Relation: 1,
 		Holder: NewCatalogHolder(current), Session: session,
+		Authority: topologyAuthority,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +408,7 @@ func TestReplicatedCatalogAuthorityRejectsMismatchedWriteSession(t *testing.T) {
 	options := ReplicatedCatalogAuthorityOptions{
 		Executor: authority.executor, Route: authority.route, Relation: authority.relation,
 		Holder: NewCatalogHolder(authority.holder.Current()), Session: authority.session,
+		Authority: authority.authority,
 	}
 	copySession := *authority.session
 	options.Session = &copySession

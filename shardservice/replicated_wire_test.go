@@ -104,18 +104,18 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	command := testReplicatedCommand(t, fence)
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
-		{Operation: ReplicatedProbe, Authority: authority, Fence: ReplicatedFence{
+		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
-		{Operation: ReplicatedPropose, Authority: authority, Fence: fence, Command: command},
-		{Operation: ReplicatedMembership, Authority: authority, Fence: fence, Membership: ReplicatedMembershipRequest{
+		{Operation: ReplicatedPropose, Authority: authority, Capability: serviceauthz.CapabilityDataWrite, Fence: fence, Command: command},
+		{Operation: ReplicatedMembership, Authority: authority, Capability: serviceauthz.CapabilityMembership, Fence: fence, Membership: ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{3},
 			MetadataEpoch: 5, CatalogGeneration: 7, ExpectedReplicaSetVersion: 1,
 			SourceMember: fence.MemberID, TargetMember: fence.MemberID + 1,
 		}},
-		{Operation: ReplicatedReadLeader, Authority: authority, Fence: fence, Relation: 1,
+		{Operation: ReplicatedReadLeader, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: fence, Relation: 1,
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
-		{Operation: ReplicatedReadFollower, Authority: authority, Fence: fence, Relation: 2,
+		{Operation: ReplicatedReadFollower, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
@@ -133,7 +133,8 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decoded.Operation != request.Operation || decoded.Authority != request.Authority || decoded.Fence != request.Fence ||
+		if decoded.Operation != request.Operation || decoded.Authority != request.Authority ||
+			decoded.Capability != request.Capability || decoded.Fence != request.Fence ||
 			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
 			decoded.MinimumApplied != request.MinimumApplied ||
@@ -218,6 +219,9 @@ func TestReplicatedMembershipDecodeAllocationBound(t *testing.T) {
 	var encoded bytes.Buffer
 	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
 		t.Fatal(err)
+	}
+	if got := encoded.Len() - 5; got != replicatedMembershipRequestBodyBytes {
+		t.Fatalf("membership body=%d, want exact %d", got, replicatedMembershipRequestBodyBytes)
 	}
 	data := encoded.Bytes()
 	var reader bytes.Reader
@@ -308,10 +312,18 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1}
 	invalid := []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Fence: fence},
 		{Operation: ReplicatedPropose, Fence: fence},
 		{Operation: ReplicatedPropose, Fence: fence, Command: []byte("INSERT INTO docs")},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityDataWrite, Fence: fence,
+			Command: testReplicatedTopologyCommand(t, fence)},
+		{Operation: ReplicatedPropose, Authority: authority,
+			Capability: serviceauthz.CapabilityTopology, Fence: fence, Command: command},
+		{Operation: ReplicatedPropose, Fence: fence,
+			Command: testReplicatedTopologyCommand(t, fence)},
 	}
 	changed := fence
 	changed.Group.GroupID[0]++
@@ -570,8 +582,19 @@ func testReplicatedCommand(t testing.TB, fence ReplicatedFence) []byte {
 }
 
 func testReplicatedCommandValue(t testing.TB, fence ReplicatedFence, value []byte) []byte {
+	return testReplicatedCommandClass(t, fence, value, replication.CommandAuthorityData)
+}
+
+func testReplicatedTopologyCommand(t testing.TB, fence ReplicatedFence) []byte {
+	return testReplicatedCommandClass(t, fence, []byte(`{"id":1}`),
+		replication.CommandAuthorityTopology)
+}
+
+func testReplicatedCommandClass(t testing.TB, fence ReplicatedFence, value []byte,
+	authorityClass replication.CommandAuthorityClass) []byte {
 	t.Helper()
 	command := replication.Command{
+		AuthorityClass:        authorityClass,
 		ClusterID:             fence.Group.ClusterID,
 		ClusterIncarnation:    fence.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,

@@ -296,32 +296,8 @@ func (server *ReplicatedServer) authorizeReplicated(
 		serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
 		return false
 	}
-	capability := serviceauthz.CapabilityDataRead
-	switch request.Operation {
-	case ReplicatedProbe:
-		if serviceauthz.CheckAndAudit(server.authorization, server.audit,
-			request.Authority.Node, generation, serviceauthz.CapabilityDataRead) == serviceauthz.DecisionAllow {
-			return true
-		}
-		if serviceauthz.CheckAndAudit(server.authorization, server.audit,
-			request.Authority.Node, generation, serviceauthz.CapabilityDataWrite) == serviceauthz.DecisionAllow {
-			return true
-		}
-		// Leader discovery is a mandatory pre-admission step for the sealed
-		// membership flow. It exposes only the same fixed serving state that the
-		// following membership request must fence exactly.
-		return serviceauthz.CheckAndAudit(server.authorization, server.audit,
-			request.Authority.Node, generation, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
-	case ReplicatedPropose:
-		capability = serviceauthz.CapabilityDataWrite
-	case ReplicatedMembership:
-		capability = serviceauthz.CapabilityMembership
-	case ReplicatedReadLeader, ReplicatedReadFollower:
-	default:
-		return false
-	}
 	return serviceauthz.CheckAndAudit(server.authorization, server.audit,
-		request.Authority.Node, generation, capability) == serviceauthz.DecisionAllow
+		request.Authority.Node, generation, request.Capability) == serviceauthz.DecisionAllow
 }
 
 func (server *ReplicatedServer) executeReplicated(

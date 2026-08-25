@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -48,6 +49,7 @@ type ReplicatedCatalogAuthority struct {
 	relation        replication.RelationID
 	holder          *CatalogHolder
 	session         *NativeSession
+	authority       serviceauthz.Authority
 	mu              sync.Mutex
 	scratch         []byte
 	pendingCatalog  *Snapshot
@@ -62,14 +64,19 @@ type ReplicatedCatalogAuthorityOptions struct {
 	// Session is required only for publication and operation writes. It must be
 	// active, route the same RF3 group, and resolve logical mutations to Relation.
 	Session *NativeSession
+	// Authority is the exact topology principal forwarded on every probe, read,
+	// proposal, and byte-identical retry. Callers cannot accidentally fall back
+	// to an unclassified DataWrite request.
+	Authority serviceauthz.Authority
 }
 
 func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*ReplicatedCatalogAuthority, error) {
 	if options.Executor == nil || !validReplicatedRoute(options.Route) ||
 		options.Relation == 0 || options.Relation > replication.MaxRelationID ||
-		options.Holder == nil || options.Session != nil &&
+		options.Holder == nil || !options.Authority.Valid() || options.Session != nil &&
 		(options.Session.executor != options.Executor ||
 			options.Session.phase != nativeSessionActive || options.Session.pending ||
+			options.Session.proposalCapability != serviceauthz.CapabilityTopology ||
 			!sameReplicatedCatalogRoute(options.Session.route, options.Route) ||
 			nativeSessionBaseRelation(options.Session) != options.Relation) {
 		return nil, ErrReplicatedCatalog
@@ -79,8 +86,19 @@ func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*
 	return &ReplicatedCatalogAuthority{
 		executor: options.Executor, route: route, relation: options.Relation,
 		holder: options.Holder, session: options.Session,
-		scratch: make([]byte, 0, 4<<10),
+		authority: options.Authority,
+		scratch:   make([]byte, 0, 4<<10),
 	}, nil
+}
+
+func (authority *ReplicatedCatalogAuthority) authorizedContext(
+	ctx context.Context,
+) (context.Context, error) {
+	if authority == nil || ctx == nil || !authority.authority.Valid() {
+		return nil, ErrReplicatedCatalog
+	}
+	bound, err := serviceauthz.WithAuthority(ctx, authority.authority)
+	return bound, err
 }
 
 func nativeSessionBaseRelation(session *NativeSession) replication.RelationID {
@@ -118,7 +136,11 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 	if authority == nil || ctx == nil || len(key) == 0 {
 		return ReplicatedPointResult{}, ErrReplicatedCatalog
 	}
-	return authority.executor.ReadPoint(ctx, authority.route, ReplicatedPointRead{
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return ReplicatedPointResult{}, err
+	}
+	return authority.executor.ReadTopologyPoint(ctx, authority.route, ReplicatedPointRead{
 		Relation: authority.relation, Key: key, MinimumApplied: 1,
 		MaxValueBytes: maximum, Linearizable: true,
 	})
@@ -179,6 +201,10 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 ) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil {
 		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
@@ -247,6 +273,10 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) error {
 	if authority == nil || authority.session == nil || ctx == nil {
 		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
@@ -465,6 +495,10 @@ func (authority *ReplicatedCatalogAuthority) SubmitOperation(
 		record.State != ReplicatedOperationPlanned {
 		return ErrReplicatedCatalog
 	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
 	if authority.session.Status().Pending {
@@ -545,6 +579,10 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 		!validReplicatedOperation(record) || record.Revision != expectedRevision+1 {
 		return ErrReplicatedCatalog
 	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
 	if authority.session.Status().Pending {
@@ -602,6 +640,10 @@ func (authority *ReplicatedCatalogAuthority) DeleteOperation(
 	if authority == nil || authority.session == nil || ctx == nil ||
 		id == ([32]byte{}) || expectedRevision == 0 {
 		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()

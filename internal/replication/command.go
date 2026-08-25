@@ -25,7 +25,8 @@ var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 // domain Unix-nanosecond scalars: Open=(0,D), Renew=(E,D) where 0<E<D, and
 // Revoke=(E,0). All other command kinds require both scalars to be zero.
 type Command struct {
-	Kind CommandKind
+	Kind           CommandKind
+	AuthorityClass CommandAuthorityClass
 
 	ClusterID             ID128
 	ClusterIncarnation    ID128
@@ -64,7 +65,8 @@ type Command struct {
 // byte slices alias the OpenCommand input and must be treated as immutable.
 // Copying or retaining the view retains the complete bounded input envelope.
 type CommandView struct {
-	kind CommandKind
+	kind           CommandKind
+	AuthorityClass CommandAuthorityClass
 
 	ClusterID             ID128
 	ClusterIncarnation    ID128
@@ -281,6 +283,7 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	copy(frame[0:8], commandMagic[:])
 	appendU16(frame, 8, commandCodecSentinel)
 	frame[10] = commandWireKind(command.Kind)
+	frame[11] = byte(command.AuthorityClass)
 	appendU16(frame, 12, commandHeaderBytes)
 	appendU32(frame, 16, uint32(total))
 	appendU32(frame, 20, uint32(total-commandHeaderBytes-envelopeChecksumBytes))
@@ -468,6 +471,9 @@ func measureCommand(command Command) (int, error) {
 }
 
 func validateCommandHeader(command Command) error {
+	if command.AuthorityClass > CommandAuthorityTopology {
+		return semantic("command authority class")
+	}
 	switch command.Kind {
 	case CommandMutationBatch:
 		if len(command.Batches) == 0 || len(command.Batches) > MaxRelationBatches {
@@ -628,7 +634,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 		return CommandView{}, err
 	}
 	kind, ok := openCommandKind(src[10])
-	if !ok || src[11] != 0 ||
+	authorityClass := CommandAuthorityClass(src[11])
+	if !ok || authorityClass > CommandAuthorityTopology ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
 		binary.LittleEndian.Uint16(src[246:248]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
@@ -651,7 +658,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 		}
 	}
 
-	view := CommandView{kind: kind}
+	view := CommandView{kind: kind, AuthorityClass: authorityClass}
 	copy(view.ClusterID[:], src[32:48])
 	copy(view.ClusterIncarnation[:], src[48:64])
 	view.TopologyRecoveryEpoch = binary.LittleEndian.Uint64(src[64:72])

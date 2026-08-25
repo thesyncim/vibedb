@@ -10,11 +10,13 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 func TestNativeSessionJournalRestartsAndRetriesExactPendingCommand(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
-	binding, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1)
+	binding, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityDataWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +37,7 @@ func TestNativeSessionJournalRestartsAndRetriesExactPendingCommand(t *testing.T)
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("controller"), ClientID: journalOptions.ClientID,
 		RetryHome: journalOptions.RetryHome, Resolver: BaseRelationResolver{Relation: 1},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		MaxRelationBatches: 1, MaxMutations: 2,
 		InitialCommandBytes: 512, MaxCommandBytes: journalOptions.MaxCommandBytes, Journal: journal,
 		JournalBinding: binding,
@@ -119,7 +122,8 @@ func TestNativeSessionJournalCodecRejectsEveryTornOrCorruptRecord(t *testing.T) 
 
 func TestNativeSessionJournalKeepsExactPendingWhenCompletionSyncFails(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
-	binding, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1)
+	binding, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityDataWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +144,7 @@ func TestNativeSessionJournalKeepsExactPendingWhenCompletionSyncFails(t *testing
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("controller"), ClientID: options.ClientID, RetryHome: options.RetryHome,
 		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1, MaxMutations: 2,
+		ProposalCapability:  serviceauthz.CapabilityDataWrite,
 		InitialCommandBytes: 512, MaxCommandBytes: options.MaxCommandBytes, Journal: journal,
 		JournalBinding: binding,
 	})
@@ -249,18 +254,26 @@ func TestNativeSessionJournalRejectsEqualGenerationAndWrongBinding(t *testing.T)
 
 func TestNativeSessionJournalBindingFencesCommandIdentity(t *testing.T) {
 	route, _, _ := testReplicatedRouteCommand(t)
-	want, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1)
+	want, err := NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityDataWrite)
 	if err != nil || want == (replication.Digest{}) {
 		t.Fatalf("binding=%x err=%v", want, err)
 	}
 	changed := route
 	changed.Command.SchemaGeneration++
-	got, err := NativeSessionJournalBinding(changed, "orders", "0000-ffff", []byte("controller"), 1)
+	got, err := NativeSessionJournalBinding(changed, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityDataWrite)
 	if err != nil || got == want {
 		t.Fatalf("changed binding=%x want=%x err=%v", got, want, err)
 	}
-	got, err = NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 2)
+	got, err = NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 2,
+		serviceauthz.CapabilityDataWrite)
 	if err != nil || got == want {
 		t.Fatalf("changed relation binding=%x want=%x err=%v", got, want, err)
+	}
+	got, err = NativeSessionJournalBinding(route, "orders", "0000-ffff", []byte("controller"), 1,
+		serviceauthz.CapabilityTopology)
+	if err != nil || got == want {
+		t.Fatalf("changed capability binding=%x want=%x err=%v", got, want, err)
 	}
 }

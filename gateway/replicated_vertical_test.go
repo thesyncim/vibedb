@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -93,6 +94,7 @@ func TestNativeSessionThreeEndpointFailoverRetriesExactBytesWithoutDuplicateAppl
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{0x91},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		Resolver:           BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
 		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
@@ -102,6 +104,12 @@ func TestNativeSessionThreeEndpointFailoverRetriesExactBytesWithoutDuplicateAppl
 	}
 	requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer requestCancel()
+	requestAuthority := serviceauthz.Authority{Generation: 1}
+	requestAuthority.Node[0] = 1
+	requestCtx, err = serviceauthz.WithAuthority(requestCtx, requestAuthority)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := session.Open(requestCtx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("session open: %v", err)
 	}

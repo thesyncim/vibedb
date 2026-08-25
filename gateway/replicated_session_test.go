@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -126,6 +127,7 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{9},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		RetryHome:          replication.RetryHome{7},
 		Resolver:           BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
@@ -201,6 +203,7 @@ func TestNativeSessionRetryPreservesUnknownAcrossCalls(t *testing.T) {
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{0x31},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		Resolver:           BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
 		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
@@ -234,7 +237,8 @@ func TestNativeSessionMutateBatchCarriesOneAtomicOrderedCommand(t *testing.T) {
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{0x51},
-		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1,
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
+		Resolver:           BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1,
 		MaxMutations: 2, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
 	})
 	if err != nil {
@@ -285,7 +289,8 @@ func TestNativeSessionRejectsIdentityAndMutationBoundsBeforeOwnedWork(t *testing
 	base := NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{9},
-		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 4,
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
+		Resolver:           BaseRelationResolver{Relation: 1}, MaxRelationBatches: 4,
 		MaxMutations: 8, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
 	}
 	tests := []struct {

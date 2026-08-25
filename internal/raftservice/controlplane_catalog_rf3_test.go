@@ -14,6 +14,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
 
@@ -39,10 +40,11 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ctx = processAuthorizedContext(t, ctx)
 	leader := cluster.elect(t, ctx, 1)
 	route := cluster.route()
 	client := newFaultProcessClient(t, cluster)
-	session := newProcessNativeSession(t, route, client, 0xa1)
+	session := newProcessNativeSession(t, route, client, 0xa1, serviceauthz.CapabilityTopology)
 	if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open catalog session: %v", err)
 	}
@@ -50,6 +52,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
 		Holder: gateway.NewCatalogHolder(nil), Session: session,
+		Authority: processRequestAuthority(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,11 +68,11 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	}
 	// Replaying the byte-identical proposal is a retained-result lookup. It must
 	// not apply the put-if-absent command a second time.
-	replayed, err := client.executor.Propose(ctx, route, attempts[0])
+	replayed, err := client.executor.ProposeTopology(ctx, route, attempts[0])
 	if err != nil {
 		t.Fatalf("replay catalog proposal: %v", err)
 	}
-	replayedAgain, err := client.executor.Propose(ctx, route, attempts[0])
+	replayedAgain, err := client.executor.ProposeTopology(ctx, route, attempts[0])
 	if err != nil || !bytes.Equal(replayed.Completion, replayedAgain.Completion) ||
 		replayed.Outcome.AppliedIndex != replayedAgain.Outcome.AppliedIndex {
 		t.Fatalf("idempotent replay changed result: first=%+v second=%+v err=%v",
@@ -86,7 +89,8 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		t.Fatal(err)
 	}
 	client.executor = limitedExecutor
-	restartedSession := newProcessNativeSession(t, route, client, 0xa2)
+	restartedSession := newProcessNativeSession(t, route, client, 0xa2,
+		serviceauthz.CapabilityTopology)
 	if _, err = restartedSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open restarted catalog session: %v", err)
 	}
@@ -94,6 +98,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	restarted, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
 		Holder: restartedHolder, Session: restartedSession,
+		Authority: processRequestAuthority(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -135,13 +140,15 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 
 	// A fresh controller session reconstructs the running operation from RF3,
 	// advances it to a terminal witness, and removes that exact revision.
-	recoveredSession := newProcessNativeSession(t, route, client, 0xa3)
+	recoveredSession := newProcessNativeSession(t, route, client, 0xa3,
+		serviceauthz.CapabilityTopology)
 	if _, err = recoveredSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open recovered controller session: %v", err)
 	}
 	recovered, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: limitedExecutor, Route: route, Relation: 1,
 		Holder: restartedHolder, Session: recoveredSession,
+		Authority: processRequestAuthority(),
 	})
 	if err != nil {
 		t.Fatal(err)

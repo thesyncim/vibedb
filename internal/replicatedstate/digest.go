@@ -46,7 +46,6 @@ var (
 type finalMutation struct {
 	key               []byte
 	value             []byte
-	compare           []byte
 	before            []byte
 	descriptorIndex   uint16
 	delete            bool

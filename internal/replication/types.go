@@ -87,6 +87,16 @@ type RetryHome [8]byte
 // It is interpreted only under the command's SchemaGeneration.
 type RelationID uint16
 
+// CommandAuthorityClass is authenticated command identity, not a transport
+// hint. Data is the zero value so the sole unreleased grammar keeps ordinary
+// command bytes compact; topology commands carry the one nonzero class bit.
+type CommandAuthorityClass uint8
+
+const (
+	CommandAuthorityData CommandAuthorityClass = iota
+	CommandAuthorityTopology
+)
+
 // CommandKind selects the command's state-machine operation. The zero value is
 // the ordinary mutation batch so command producers remain explicit for session
 // lifecycle operations.
