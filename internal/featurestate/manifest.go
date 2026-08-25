@@ -76,10 +76,10 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The gateway authorizes complete request semantics and forwards the exact client authority. Shards independently check it while requiring a delegate-capable gateway.", []Reference{
 			ref("gateway/client_tls.go", "ServeAuthorizedClients"), ref("shardservice/server.go", "ServeAuthorizedConn"),
 		}},
-		Shipped: Stage{StatusYes, "Both serve commands require TLS plus an authorization policy unless the operator selects explicit loopback development plaintext.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("cmd/vibedb-shard/main.go", "runServe"),
+		Shipped: Stage{StatusYes, "The gateway and static shard commands require TLS plus an authorization policy unless the operator selects explicit loopback development plaintext. The RF3 shard command is always authenticated.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("cmd/vibedb-shard/main.go", "runServe"), ref("cmd/vibedb-shard/serve_rf3.go", "runServeRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "Identity, generation rotation, confused-deputy, SQL classification, connection, and allocation tests exist. No network-chaos or authorization-throughput gate covers the command pair.", []Reference{
+		Qualification: Stage{StatusPartial, "Identity, generation rotation, confused-deputy, SQL classification, connection, and allocation tests exist. No network-chaos or authorization-throughput gate covers the shipped commands.", []Reference{
 			ref("gateway/client_tls_test.go", "TestClientTLSAuthenticatesAuthorizesRotatesAndSeparatesALPN"), ref("shardservice/authorization_test.go", "TestShardAuthorizationRejectsConfusedDeputyAndSeparatesRoles"),
 		}},
 	},
@@ -136,7 +136,9 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The replicated state machine validates the relation manifest and commits all relation targets with its system state.", []Reference{
 			ref("internal/replicatedstate/machine.go", "Machine"), ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleAtomicBaseLocalAndGlobalIndexApply"),
 		}},
-		Shipped: Stage{StatusNo, "The shipped shard command opens the static SQL store, not a replicated relation bundle.", nil},
+		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 opens an externally prepared exact replicated SQL/apply bundle and serves its portable relation contract.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
+		}},
 		Qualification: Stage{StatusPartial, "Deterministic apply, replay, malformed-command, and failure-atomic tests exist. No shipped RF3 relation-index fault gate exists.", []Reference{
 			ref("internal/replicatedstate/relation_bundle_test.go", "TestRelationBundleCheckpointCrashPhasesNeverRecoverSkew"), ref("internal/replicatedstate/validation_test.go", "TestValidatedMutationRejectsMalformedJSONBeforeCustomValidator"),
 		}},
@@ -149,8 +151,10 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "Authenticated peer runtime, replicated shard service, and native gateway executor form a complete internal RF3 path.", []Reference{
 			ref("internal/raftservice/peer.go", "AuthenticatedPeerRuntime"), ref("gateway/replicated_native.go", "ReplicatedExecutor"),
 		}},
-		Shipped: Stage{StatusNo, "Neither shipped command constructs a Multi-Raft host or serves the replicated wire endpoint.", nil},
-		Qualification: Stage{StatusPartial, "A three-process gate proves follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. It does not cover every quorum/apply cut, natural election, membership change, or snapshot bootstrap.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 opens one externally prepared stable three-voter group, constructs its bounded Multi-Raft host and authenticated peer transport, and serves the authenticated native endpoint.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
+		}},
+		Qualification: Stage{StatusPartial, "An internal three-process gate proves follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. It does not invoke the shipped command and does not cover every quorum/apply cut, natural election, membership change, or snapshot bootstrap.", []Reference{
 			ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
 		}},
 	},
@@ -162,7 +166,9 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "The replicated gateway follows leaders and can select a sufficiently applied follower for the explicit follower contract.", []Reference{
 			ref("gateway/replicated_native.go", "ReadPoint"), ref("gateway/replicated_native_test.go", "TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict"),
 		}},
-		Shipped: Stage{StatusNo, "The shipped query command uses the static ReadStrong and vector-fence path, not RF3 ReadIndex or follower reads.", nil},
+		Shipped: Stage{StatusPartial, "serve-rf3 exposes authenticated native RF3 reads, but vibedb-gateway serve still sends ordinary public queries through the static ReadStrong and vector-fence path.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/serve.go", "execRequest"),
+		}},
 		Qualification: Stage{StatusPartial, "Barrier, stale-fence, leader-following, and bounded follower-selection tests exist. There is no shipped partition or staleness-latency gate.", []Reference{
 			ref("internal/raftservice/owner_test.go", "TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp"), ref("gateway/replicated_native_test.go", "TestReplicatedPointReadReturnsTypedBoundsWithoutLeaderMisclassification"),
 		}},
@@ -175,7 +181,7 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusPartial, "Authenticated internal hosts exercise the lifecycle, but no controller owns and resumes it as an operation.", []Reference{
 			ref("internal/multiraft/host_leader_transfer_real_test.go", "TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply"),
 		}},
-		Shipped: Stage{StatusNo, "The commands accept static ownership and do not expose membership operations.", nil},
+		Shipped: Stage{StatusNo, "serve-rf3 requires one already-stable three-voter roster and rejects pending membership changes; no command provisions, promotes, removes, or transfers a member.", nil},
 		Qualification: Stage{StatusPartial, "Deterministic real-host tests cover authenticated transfer and continued apply. External crash/restart coverage for the complete lifecycle is absent.", []Reference{
 			ref("internal/multiraft/host_leader_transfer_real_test.go", "TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply"),
 		}},
@@ -188,7 +194,7 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusPartial, "Artifact production, transport, crash-safe empty-learner activation, exact-incarnation adoption, and Multi-Raft host addition are integrated internally. Suffix catch-up and promotion remain explicit later barriers without a controller.", []Reference{
 			ref("internal/snapshottransfer/learner_install.go", "InstallPublishedLearner"), ref("sql/driver/replicated_snapshot_stage.go", "ResumeReplicatedSnapshotActivation"),
 		}},
-		Shipped: Stage{StatusNo, "No command exposes snapshot service or learner bootstrap configuration.", nil},
+		Shipped: Stage{StatusNo, "serve-rf3 opens prepared local artifacts but exposes no snapshot service, transfer, or learner bootstrap configuration.", nil},
 		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen and exact-incarnation retry, and chunk benchmarks exist. Live suffix catch-up, promotion, and external multi-process crash gates remain absent.", []Reference{
 			ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("sql/driver/replicated_snapshot_stage_test.go", "TestReplicatedSnapshotStageSameHandleFaultSettlement"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
 		}},
@@ -201,8 +207,8 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusPartial, "A dedicated catalog RF3 journal drives resumable publish-before-prune split actions through authenticated shard-control routes. Learner creation, catch-up, source removal, and replica moves are not orchestrated.", []Reference{
 			ref("internal/splitcontroller/controller_service.go", "ControllerService"), ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-gateway runs the replicated split-controller loop when configured with the dedicated catalog RF3 authority. No shipped command constructs that RF3 group or executes replica moves.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "runSplitController"),
+		Shipped: Stage{StatusPartial, "vibedb-gateway runs the replicated split-controller loop when configured with the dedicated catalog RF3 authority, and serve-rf3 can host an externally prepared fixed group. No command provisions that group or executes replica moves.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "runSplitController"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
 		Qualification: Stage{StatusPartial, "Publish-before-prune crash matrices, replicated-journal recovery, controller reconstruction, and a three-process catalog restart/leader-loss gate exist. Foreground-traffic and replica-move crash gates do not.", []Reference{
 			ref("internal/splitcontroller/execute_test.go", "TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows"), ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
@@ -216,8 +222,8 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusPartial, "Catalog publication and split-operation authority share one dedicated, topology-authorized RF3 relation with exact catalog/controlplane placement and schema-generation fences. Membership and schema rollout are not controlled there yet.", []Reference{
 			ref("gateway/replicated_catalog_document.go", "ReplicatedCatalogDistribution"), ref("internal/splitcontroller/replicated_executor.go", "ReplicatedOperationJournal"),
 		}},
-		Shipped: Stage{StatusPartial, "vibedb-gateway consumes the replicated catalog and refuses arbitrary catalog placement coordinates, but no shipped command bootstraps or serves the catalog RF3 group and distributed DDL remains refused.", []Reference{
-			ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"),
+		Shipped: Stage{StatusPartial, "vibedb-gateway consumes the replicated catalog and refuses arbitrary catalog placement coordinates, while serve-rf3 can open an externally prepared fixed catalog group. No command bootstraps that group, and distributed DDL remains refused.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
 		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Rolling schema compatibility and DDL rollback gates are absent.", []Reference{
 			ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),

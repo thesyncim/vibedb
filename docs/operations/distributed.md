@@ -1,9 +1,11 @@
 # Operate the distributed runtime
 
-The shipped distributed runtime is experimental. It consists of a stateless
-gateway and leader-only shard services. It uses static ownership data from a
-catalog file. The generated [distributed feature state](../distributed-feature-state.md)
-separates this command path from the internal RF3 composition.
+The shipped distributed runtime is experimental. Its ordinary public data path
+consists of a stateless gateway and static-ownership shard services configured
+from a catalog file. `vibedb-shard serve-rf3` is a separate open-only command
+for one externally prepared, stable three-voter Raft group. The generated
+[distributed feature state](../distributed-feature-state.md) separates those
+command paths and their qualification evidence.
 
 The gateway and shard commands require mutually authenticated TLS by default.
 Authenticated mode also requires one canonical `vibejson` authorization policy.
@@ -11,12 +13,13 @@ An explicit `-dev-plaintext-loopback` mode permits unauthenticated development
 traffic only on loopback listeners. Do not expose that development listener
 through a proxy or port forward to an untrusted network.
 
-The shipped commands do not start Raft replication. One `vibedb-shard` process
-serves one local store with one static ownership identity. The separate internal
-RF3 composition connects bounded proposal admission, quorum commit, committed
-apply, result settlement, authenticated peer transport, a replicated shard
-service, and a leader-aware native gateway executor. Process tests use that
-composition. The shipped commands do not construct it.
+`vibedb-shard serve` serves one local store with one static ownership identity.
+`vibedb-shard serve-rf3` constructs bounded proposal admission, quorum commit,
+committed apply, result settlement, authenticated peer transport, and an
+authenticated native replicated endpoint over exact prepared artifacts. It
+does not create or repair those artifacts. `vibedb-gateway serve` still sends
+ordinary public queries and writes through the static SQL shard protocol; it
+does not select the RF3 native endpoint for that data path.
 
 ## Build the commands
 
@@ -116,6 +119,96 @@ The default connection limit is 128. Authenticated serving requires a positive
 bounded connection limit. Development plaintext accepts `-max-connections -1`
 only when an external control gives a safe bound. The service always bounds
 read fences and worker exchange resources.
+
+## Start a prepared RF3 member
+
+There is no RF3 initializer or provisioner command. Before invoking
+`serve-rf3`, an external trusted provisioning workflow must have created and
+retained all of these mutually matching artifacts:
+
+- One encrypted Raft WAL and its exact five sealed reopen bounds
+- The bound replicated SQL root
+- The complete replicated shard-store identity returned at bind
+- The complete replicated apply identity returned at activation
+- Exactly 32 raw bytes of WAL key material, stored outside the manifest
+- A TLS certificate and key whose critical binary peer identity matches the
+  local member and the retained cluster trust domain
+- Trust roots and a canonical authorization policy with at least one
+  delegate-capable gateway principal
+
+The durable apply publication must contain exactly three sorted voters, no
+learners or joint configuration, and no committed-but-unapplied membership
+entry. The command compares that publication with the manifest roster and
+fails closed on any mismatch. It does not add, promote, remove, or transfer a
+member.
+
+Create one canonical manifest per member. Object fields and member fields must
+appear in the exact order shown. The manifest is limited to 64 KiB, contains
+exactly three members ordered by `member_id`, and uses lowercase 32-character
+hexadecimal node IDs. Unknown, duplicate, escaped, missing, or reordered fields
+are rejected.
+
+```json
+{
+  "wal": {
+    "path": "/srv/vibedb/member-1.wal",
+    "key_id": "cluster-wal-key",
+    "key_material_path": "/run/secrets/vibedb-wal-key",
+    "max_file_bytes": 268435456,
+    "max_record_bytes": 83886080,
+    "max_records": 4096,
+    "max_entries": 16384,
+    "max_live_bytes": 134217728
+  },
+  "sql": {
+    "path": "/srv/vibedb/member-1.vdb",
+    "identity_path": "/srv/vibedb/member-1-sql-identity.json",
+    "apply_identity_path": "/srv/vibedb/member-1-apply-identity.json"
+  },
+  "listeners": {
+    "peer": "0.0.0.0:7411",
+    "native": "0.0.0.0:7511"
+  },
+  "tls": {
+    "certificate": "/run/secrets/member-1-cert.pem",
+    "key": "/run/secrets/member-1-key.pem",
+    "roots": "/run/secrets/cluster-roots.pem",
+    "identity_oid": "1.3.6.1.4.1.32473.1.1"
+  },
+  "authorization_policy": "/etc/vibedb/authorization-policy.vibejson",
+  "members": [
+    {"member_id": 1, "node_id": "44444444444444444444444444444444", "peer_address": "member-1.internal:7411"},
+    {"member_id": 2, "node_id": "55555555555555555555555555555555", "peer_address": "member-2.internal:7411"},
+    {"member_id": 3, "node_id": "66666666666666666666666666666666", "peer_address": "member-3.internal:7411"}
+  ]
+}
+```
+
+The five WAL bounds must be the exact nonzero values used when the WAL was
+created; they are authenticated by the WAL and are not runtime tuning knobs.
+`key_material_path` must name a regular file containing exactly 32 bytes. The
+manifest carries no key bytes.
+
+Start the member with only the manifest flag:
+
+```bash
+./bin/vibedb-shard serve-rf3 -manifest ./member-1-rf3.vibejson
+```
+
+The command validates and opens the retained identities, WAL, SQL root, apply
+state, certificate, policy, and roster before serving. It reserves both TCP
+listeners before adopting the runtime, because adoption durably advances the
+local node incarnation. Both the ordinary Raft peer listener and native shard
+listener require mutual TLS; there is no RF3 plaintext mode. The native
+listener authorizes both the delegate gateway and the exact forwarded
+principal on every request.
+
+This command is a fixed-RF3 serving boundary, not cluster lifecycle control.
+It provides no artifact preparation, copied-store revocation, membership
+changes, snapshot transfer or installation, repair, or automatic catalog
+publication. The existing internal three-process recovery tests exercise the
+same composition primitives, but they do not invoke this command and are not a
+shipped-command fault gate.
 
 ## Validate and inspect the gateway catalog
 
@@ -242,14 +335,15 @@ release, or retirement finishes.
 
 The shipped runtime does not provide these features:
 
-- Raft replication for `vibedb-shard`
-- Follower reads or bounded-staleness reads
+- RF3 initialization, artifact provisioning, or repair
+- Public-gateway routing through the RF3 native data endpoint
+- Public-gateway follower reads or bounded-staleness reads
 - Endpoint failover or load balancing
 - Catalog replication between gateway hosts
 - Automatic shard split execution or data movement
 - Distributed DDL or schema-rollout validation
 - A replica-move controller
-- A shipped authenticated Raft peer listener
+- RF3 membership changes or leader-transfer control
 - Cross-host worker exchange from CLI configuration
 - Online empty-learner snapshot installation and activation
 
@@ -259,7 +353,7 @@ read returns no partial result when one shard fails.
 ## Implementation references
 
 - `cmd/vibedb-gateway/main.go` and `serve.go`
-- `cmd/vibedb-shard/main.go`
+- `cmd/vibedb-shard/main.go`, `serve_rf3.go`, and `rf3_manifest.go`
 - `gateway/catalog.go`, `executor.go`, `profile.go`, and `transaction.go`
 - `gateway/recovery.go` and `read_snapshot.go`
 - `distribution/manifest.go`, `placement.go`, `policy.go`, and `router.go`
