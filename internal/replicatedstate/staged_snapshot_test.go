@@ -18,6 +18,27 @@ type stagedSnapshotCountingValidator struct {
 	puts int
 }
 
+func stagedSnapshotMachineOptions(
+	t testing.TB,
+	dir string,
+	user CollectionTarget,
+) Options {
+	t.Helper()
+	capture := createTargetAt(t, dir, TransitionCaptureCollectionName, durable.Options{
+		OpaqueValues: true, MaxKeyBytes: 8,
+		MaxDocumentBytes:  MaxTransitionCaptureRecordBytes,
+		MaxBatchDocuments: 1, MaxBatchBytes: MaxTransitionCaptureRecordBytes + 8,
+	})
+	options := machineOptionsFor(user)
+	options.TxnLimits.MaxCollections = 3
+	options.TxnLimits.MaxDocuments++
+	options.TxnLimits.MaxBytes = 512 << 20
+	options.TransitionCaptureTarget = TransitionCaptureTarget{
+		Name: TransitionCaptureCollectionName, Collection: capture.Collection,
+	}
+	return options
+}
+
 func (v *stagedSnapshotCountingValidator) ValidatePut(_, _ []byte) MutationValidation {
 	v.puts++
 	return MutationValidationAccept
@@ -44,7 +65,7 @@ func TestImportedSnapshotRequiresExactSessionEpochFence(t *testing.T) {
 	t.Cleanup(func() { _ = txnLog.Close() })
 	binding := testBinding()
 	bootstrap := testBootstrap()
-	options := machineOptionsFor(user)
+	options := stagedSnapshotMachineOptions(t, dir, user)
 	cut := StagedSnapshotCut{
 		Applied: 7, Term: 3,
 		EntryDigest: sha256.Sum256([]byte("session-fenced-import")),
@@ -93,7 +114,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		Applied: 7, Term: 3,
 		EntryDigest: sha256.Sum256([]byte("certified-staged-child")),
 	}
-	options := machineOptionsFor(user)
+	options := stagedSnapshotMachineOptions(t, dir, user)
 	if _, _, _, err := InitializeStagedSnapshot(
 		binding, bootstrap, system, UserCollection{Name: "docs", Target: user},
 		txnLog, options, cut, SnapshotArtifactOptions{TargetChunkBytes: 1},
@@ -114,7 +135,8 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		manifest.SystemRows != 0 || manifest.PayloadBytes != 0 || manifest.EncodedBytes != 0 ||
 		manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
-		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
+		manifest.CaptureRows != 0 ||
+		manifest.CaptureImageDigest != snapshotArtifactEmptyCaptureImageDigest() ||
 		base.GetMetadata().GetIndex() != cut.Applied {
 		t.Fatalf("publication=%+v state=%+v rows=%d", publication, manifest.State, manifest.UserRows)
 	}
@@ -132,7 +154,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 		"chunk count":  func(m *SnapshotArtifactManifest) { m.Chunks = 1 },
 		"capture rows": func(m *SnapshotArtifactManifest) { m.CaptureRows = 1 },
 		"capture image": func(m *SnapshotArtifactManifest) {
-			m.CaptureImageDigest = snapshotArtifactEmptyCaptureImageDigest()
+			m.CaptureImageDigest = [sha256.Size]byte{}
 		},
 		"identity": func(m *SnapshotArtifactManifest) { m.Digest[0] ^= 1 },
 	} {
@@ -152,7 +174,7 @@ func TestInitializeStagedSnapshotBindsRowsWithoutCopying(t *testing.T) {
 	}
 	forgedImage.Digest = seededSnapshotManifestDigest(
 		stateEnvelope, forgedImage.UserCollection,
-		forgedImage.ImageDigest, forgedImage.UserRows,
+		forgedImage.ImageDigest, forgedImage.UserRows, forgedImage.CaptureImageDigest,
 	)
 	if _, err := BuildSnapshotBase(forgedImage, bootstrap); !errors.Is(err, ErrSnapshotBase) {
 		t.Fatalf("self-consistent forged seeded image accepted: %v", err)
@@ -234,7 +256,8 @@ func TestPreparedStagedSnapshotRequiresCertifiedSeedBeforeFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = txnLog.Close() })
-	options := machineOptionsFor(user)
+	options := stagedSnapshotMachineOptions(t, dir, user)
+	capture := options.TransitionCaptureTarget.Collection
 	prepared, err := PrepareStagedSnapshot(
 		testBinding(), testBootstrap(), system,
 		UserCollection{Name: "docs", Target: user}, txnLog, options,
@@ -254,11 +277,14 @@ func TestPreparedStagedSnapshotRequiresCertifiedSeedBeforeFinish(t *testing.T) {
 		Envelope: prepared.AppendSeedEnvelope(nil),
 		Images: []durable.CheckpointGroupSeedImage{{
 			Collection: user.Collection, Generation: prepared.UserGeneration(),
+		}, {
+			Collection: capture, Generation: prepared.CaptureGeneration(),
 		}},
 	}
 	members := []durable.NamedCollection{
 		{Name: SystemCollectionName, Collection: system.Collection},
 		{Name: "docs", Collection: user.Collection},
+		{Name: TransitionCaptureCollectionName, Collection: capture},
 	}
 	group, err := durable.NewSeededCheckpointGroup(
 		txnLog, members, seed, durable.CheckpointGroupOptions{},
@@ -280,10 +306,29 @@ func TestPreparedStagedSnapshotRequiresCertifiedSeedBeforeFinish(t *testing.T) {
 	}
 	machine, base, manifest, err := prepared.Finish(group)
 	if err != nil || machine.Published().Applied != 9 || !manifest.Seeded ||
-		base.GetMetadata().GetIndex() != 9 || validator.puts != 2 || group.SeedPending() {
+		manifest.CaptureImageDigest != snapshotArtifactEmptyCaptureImageDigest() ||
+		base.GetMetadata().GetIndex() != 9 || validator.puts != 2 || group.SeedPending() ||
+		!group.Owns(members) {
 		t.Fatalf("Finish publication=%+v seeded=%v index=%d puts=%d pending=%v err=%v",
 			machine.Published(), manifest.Seeded, base.GetMetadata().GetIndex(),
 			validator.puts, group.SeedPending(), err)
+	}
+	corruptKey := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	if err := group.Update(9, members[2:], options.TxnLimits,
+		func(batch *durable.DatabaseBatch) error {
+			captureBatch, err := batch.CollectionHandle(capture)
+			if err != nil {
+				return err
+			}
+			return captureBatch.Put(corruptKey, []byte("substituted-seeded-capture"))
+		}); err != nil {
+		t.Fatalf("substitute seeded capture: %v", err)
+	}
+	if err := group.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint substituted seeded capture: %v", err)
+	}
+	if _, err := machine.InstallSnapshot(base); !errors.Is(err, ErrSnapshotBase) {
+		t.Fatalf("seeded install accepted substituted capture: %v", err)
 	}
 }
 
@@ -301,7 +346,8 @@ func TestPreparedStagedSnapshotGenerationFenceRejectsMutationBeforeAttach(t *tes
 	t.Cleanup(func() { _ = txnLog.Close() })
 	prepared, err := PrepareStagedSnapshot(
 		testBinding(), testBootstrap(), system,
-		UserCollection{Name: "docs", Target: user}, txnLog, machineOptionsFor(user),
+		UserCollection{Name: "docs", Target: user}, txnLog,
+		stagedSnapshotMachineOptions(t, dir, user),
 		StagedSnapshotCut{
 			Applied: 9, Term: 4,
 			EntryDigest: sha256.Sum256([]byte("generation-fenced-seed")),
@@ -335,6 +381,65 @@ func TestPreparedStagedSnapshotGenerationFenceRejectsMutationBeforeAttach(t *tes
 	}
 }
 
+func TestPrepareStagedSnapshotRejectsNonemptyReservedCapture(t *testing.T) {
+	dir := t.TempDir()
+	system := createTargetAt(t, dir, "system", durable.Options{})
+	user := createTargetAt(t, dir, "nonempty-capture-user", durable.Options{})
+	options := stagedSnapshotMachineOptions(t, dir, user)
+	capture := options.TransitionCaptureTarget.Collection
+	if _, err := capture.Put(
+		[]byte{0, 0, 0, 0, 0, 0, 0, 1}, []byte("preexisting-capture"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	txnLog, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = txnLog.Close() })
+	if _, err := PrepareStagedSnapshot(
+		testBinding(), testBootstrap(), system,
+		UserCollection{Name: "docs", Target: user}, txnLog, options,
+		StagedSnapshotCut{
+			Applied: 9, Term: 4,
+			EntryDigest: sha256.Sum256([]byte("reject-nonempty-capture")),
+		}, SnapshotArtifactOptions{},
+	); !errors.Is(err, ErrStagedSnapshot) {
+		t.Fatalf("nonempty reserved capture preparation = %v", err)
+	}
+}
+
+func TestPreparedStagedSnapshotCaptureGenerationFenceRejectsSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	system := createTargetAt(t, dir, "system", durable.Options{})
+	user := createTargetAt(t, dir, "capture-generation-user", durable.Options{})
+	options := stagedSnapshotMachineOptions(t, dir, user)
+	txnLog, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = txnLog.Close() })
+	prepared, err := PrepareStagedSnapshot(
+		testBinding(), testBootstrap(), system,
+		UserCollection{Name: "docs", Target: user}, txnLog, options,
+		StagedSnapshotCut{
+			Applied: 9, Term: 4,
+			EntryDigest: sha256.Sum256([]byte("capture-generation-fence")),
+		}, SnapshotArtifactOptions{},
+	)
+	if err != nil || prepared.CaptureGeneration() == 0 {
+		t.Fatalf("prepare capture generation=%d err=%v", prepared.CaptureGeneration(), err)
+	}
+	if _, err := options.TransitionCaptureTarget.Collection.Put(
+		[]byte{0, 0, 0, 0, 0, 0, 0, 1}, []byte("post-prepare-substitution"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := prepared.Initialize(); !errors.Is(err, ErrStagedSnapshot) {
+		t.Fatalf("Finish accepted substituted capture generation: %v", err)
+	}
+}
+
 func TestPreparedStagedSnapshotImageAuditCoversEmptyImage(t *testing.T) {
 	dir := t.TempDir()
 	system := createTargetAt(t, dir, "system", durable.Options{})
@@ -359,9 +464,10 @@ func TestPreparedStagedSnapshotImageAuditCoversEmptyImage(t *testing.T) {
 			},
 		},
 	}
+	options := stagedSnapshotMachineOptions(t, dir, user)
 	prepared, err := PrepareStagedSnapshot(
 		testBinding(), testBootstrap(), system,
-		UserCollection{Name: "docs", Target: user}, txnLog, machineOptionsFor(user),
+		UserCollection{Name: "docs", Target: user}, txnLog, options,
 		cut, SnapshotArtifactOptions{},
 	)
 	if err != nil || prepared.UserGeneration() == 0 || visits != 0 || finishes != 1 {
@@ -371,7 +477,7 @@ func TestPreparedStagedSnapshotImageAuditCoversEmptyImage(t *testing.T) {
 	cut.ImageAudit.Finish = nil
 	if _, err := PrepareStagedSnapshot(
 		testBinding(), testBootstrap(), system,
-		UserCollection{Name: "docs", Target: user}, txnLog, machineOptionsFor(user),
+		UserCollection{Name: "docs", Target: user}, txnLog, options,
 		cut, SnapshotArtifactOptions{},
 	); !errors.Is(err, ErrStagedSnapshot) {
 		t.Fatalf("partial image audit error = %v", err)

@@ -383,7 +383,7 @@ func (s *ReplicatedChildStage) activate(
 			Collection: s.table.collection, Generation: prepared.UserGeneration(),
 		}, {
 			Collection: core.replicatedCaptureCollection,
-			Generation: core.replicatedCaptureCollection.Generation(),
+			Generation: prepared.CaptureGeneration(),
 		}},
 	}
 	if core.checkpointGroup == nil {

@@ -413,15 +413,11 @@ func prepareOpenInputs(
 			"%w: system and user handles alias", ErrInvalidCollection,
 		)
 	}
-	if options.CheckpointGroup != nil && !deferBundleMembership {
-		if options.TransitionCapture != nil || !options.CheckpointGroup.Owns([]durable.NamedCollection{
-			{Name: systemCollectionName, Collection: system.Collection},
-			{Name: userName, Collection: user.Collection},
-		}) {
-			return openInputs{}, fmt.Errorf(
-				"%w: checkpoint-group ownership", ErrInvalidOptions,
-			)
-		}
+	if options.CheckpointGroup != nil && !deferBundleMembership &&
+		options.TransitionCapture != nil {
+		return openInputs{}, fmt.Errorf(
+			"%w: checkpoint-group capture startup", ErrInvalidOptions,
+		)
 	}
 	maxSystemDocument := max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
@@ -459,16 +455,6 @@ func prepareOpenInputs(
 			"%w: transaction limits do not cover the frozen apply profile", ErrInvalidOptions,
 		)
 	}
-	if !deferBundleMembership {
-		if err := txnLog.ValidateCollections([]durable.NamedCollection{
-			{Name: systemCollectionName, Collection: system.Collection},
-			{Name: userName, Collection: user.Collection},
-		}); err != nil {
-			return openInputs{}, fmt.Errorf(
-				"%w: transaction-log binding: %w", ErrInvalidCollection, err,
-			)
-		}
-	}
 	bootstrapBytes, bootstrapDigest, err := validateBootstrap(bootstrap)
 	if err != nil {
 		return openInputs{}, err
@@ -499,6 +485,27 @@ func prepareOpenInputs(
 		prepared.members = []durable.NamedCollection{
 			{Name: systemCollectionName, Collection: system.Collection},
 			{Name: userName, Collection: user.Collection},
+		}
+		if target := options.TransitionCaptureTarget; target.Collection != nil || target.Name != "" {
+			if !validReservedTransitionCaptureTarget(target, system, relations) {
+				return openInputs{}, ErrTransitionCapture
+			}
+			prepared.members = append(prepared.members, durable.NamedCollection{
+				Name: target.Name, Collection: target.Collection,
+			})
+		}
+		if options.CheckpointGroup != nil && !options.CheckpointGroup.Owns(prepared.members) {
+			return openInputs{}, fmt.Errorf(
+				"%w: checkpoint-group ownership", ErrInvalidOptions,
+			)
+		}
+		if err := txnLog.ValidateCollections(prepared.members); err != nil {
+			return openInputs{}, fmt.Errorf(
+				"%w: transaction-log binding: %w", ErrInvalidCollection, err,
+			)
+		}
+		if err := validateBundleTransactionProfile(system, relations, options); err != nil {
+			return openInputs{}, fmt.Errorf("%w: transaction profile", err)
 		}
 	}
 	return prepared, nil

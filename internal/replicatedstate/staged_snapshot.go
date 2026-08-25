@@ -37,20 +37,21 @@ type StagedSnapshotImageAudit struct {
 // until Finish returns. Preparing first lets the checkpoint-group certificate
 // commit to the exact state envelope before that envelope is published.
 type StagedSnapshotPreparation struct {
-	prepared        openInputs
-	staticBootstrap *pb.Snapshot
-	state           State
-	stateEnvelope   []byte
-	imageDigest     [32]byte
-	userRows        uint64
-	userGeneration  uint64
-	statePresent    bool
-	manifest        SnapshotArtifactManifest
+	prepared          openInputs
+	staticBootstrap   *pb.Snapshot
+	state             State
+	stateEnvelope     []byte
+	imageDigest       [32]byte
+	userRows          uint64
+	userGeneration    uint64
+	captureGeneration uint64
+	statePresent      bool
+	manifest          SnapshotArtifactManifest
 }
 
-// PrepareStagedSnapshot validates one coherent system/user cut and computes
-// the canonical user-image digest and row count in a single user-row pass. It
-// does not mutate either collection and grants no serving authority.
+// PrepareStagedSnapshot validates one coherent system/user/empty-capture cut
+// and computes the canonical user-image digest and row count in a single
+// user-row pass. It does not mutate any collection or grant serving authority.
 func PrepareStagedSnapshot(
 	binding Binding,
 	bootstrap *pb.Snapshot,
@@ -66,7 +67,10 @@ func PrepareStagedSnapshot(
 	)
 	_, artifactErr := normalizeSnapshotArtifactOptions(artifactOptions)
 	auditValid := (cut.ImageAudit.Visit == nil) == (cut.ImageAudit.Finish == nil)
-	if err != nil || options.TransitionCapture != nil || cut.Applied <= 1 ||
+	if err != nil || options.TransitionCapture != nil ||
+		prepared.options.TransitionCaptureTarget.Collection == nil ||
+		prepared.options.TransitionCaptureTarget.Name != TransitionCaptureCollectionName ||
+		len(prepared.members) != 3 || cut.Applied <= 1 ||
 		cut.Applied == math.MaxUint64 || cut.Term == 0 || cut.Term == math.MaxUint64 ||
 		cut.EntryDigest == ([32]byte{}) ||
 		len(bootstrap.GetMetadata().GetConfState().GetVoters()) == 0 || artifactErr != nil ||
@@ -74,21 +78,26 @@ func PrepareStagedSnapshot(
 		return nil, errors.Join(ErrStagedSnapshot, err, artifactErr)
 	}
 
-	cutSnapshot, err := durable.SnapshotCollections([]durable.NamedCollection{
-		{Name: systemCollectionName, Collection: prepared.system.Collection},
-		{Name: prepared.userName, Collection: prepared.user.Collection},
-	})
+	cutSnapshot, err := durable.SnapshotCollections(prepared.members)
 	if err != nil {
 		return nil, err
 	}
 	userSnapshot, userOK := cutSnapshot.Collection(prepared.userName)
 	systemSnapshot, systemOK := cutSnapshot.Collection(systemCollectionName)
-	if !userOK || userSnapshot == nil || !systemOK || systemSnapshot == nil {
+	captureTarget := prepared.options.TransitionCaptureTarget
+	captureSnapshot, captureOK := cutSnapshot.Collection(captureTarget.Name)
+	if !userOK || userSnapshot == nil || !systemOK || systemSnapshot == nil ||
+		!captureOK || captureSnapshot == nil {
 		return nil, errors.Join(ErrStagedSnapshot, cutSnapshot.Close())
 	}
 	userGeneration := userSnapshot.Generation()
-	if userGeneration == 0 {
+	captureGeneration := captureSnapshot.Generation()
+	if userGeneration == 0 || captureGeneration == 0 || captureSnapshot.Len() != 0 {
 		return nil, errors.Join(ErrStagedSnapshot, cutSnapshot.Close())
+	}
+	captureDigest, err := snapshotArtifactOpaqueImageDigest(captureSnapshot)
+	if err != nil || captureDigest != snapshotArtifactEmptyCaptureImageDigest() {
+		return nil, errors.Join(ErrStagedSnapshot, err, cutSnapshot.Close())
 	}
 
 	imageHasher, err := newCanonicalImageHasher(
@@ -155,14 +164,16 @@ func PrepareStagedSnapshot(
 		return nil, err
 	}
 	manifest := SnapshotArtifactManifest{
-		State:          cloneState(state),
-		UserCollection: []byte(prepared.userName),
-		Seeded:         true,
-		UserRows:       userRows,
-		ImageDigest:    imageDigest,
+		State:              cloneState(state),
+		UserCollection:     []byte(prepared.userName),
+		Seeded:             true,
+		UserRows:           userRows,
+		ImageDigest:        imageDigest,
+		CaptureImageDigest: captureDigest,
 	}
 	manifest.Digest = seededSnapshotManifestDigest(
 		stateEnvelope, manifest.UserCollection, imageDigest, userRows,
+		manifest.CaptureImageDigest,
 	)
 	if err := validateSnapshotBaseManifest(manifest); err != nil {
 		return nil, errors.Join(ErrStagedSnapshot, err)
@@ -172,7 +183,8 @@ func PrepareStagedSnapshot(
 		staticBootstrap: proto.Clone(bootstrap).(*pb.Snapshot),
 		state:           cloneState(state), stateEnvelope: stateEnvelope,
 		imageDigest: imageDigest, userRows: userRows, userGeneration: userGeneration,
-		statePresent: present, manifest: manifest,
+		captureGeneration: captureGeneration,
+		statePresent:      present, manifest: manifest,
 	}, nil
 }
 
@@ -228,6 +240,15 @@ func (p *StagedSnapshotPreparation) UserGeneration() uint64 {
 	return p.userGeneration
 }
 
+// CaptureGeneration returns the exact authenticated empty capture generation
+// pinned in the same coherent preparation cut as the imported user image.
+func (p *StagedSnapshotPreparation) CaptureGeneration() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.captureGeneration
+}
+
 // NeedsSeed reports whether the coherent preparation cut lacked its exact
 // imported State row.
 func (p *StagedSnapshotPreparation) NeedsSeed() bool {
@@ -280,10 +301,7 @@ func (p *StagedSnapshotPreparation) Finish(
 			)
 		}
 	}
-	members := []durable.NamedCollection{
-		{Name: systemCollectionName, Collection: p.prepared.system.Collection},
-		{Name: p.prepared.userName, Collection: p.prepared.user.Collection},
-	}
+	members := p.prepared.members
 	if group != nil {
 		seeded, err := group.ValidateSeedState(
 			p.state.Applied, systemCollectionName, p.stateEnvelope,
@@ -314,6 +332,20 @@ func (p *StagedSnapshotPreparation) Finish(
 	}
 	if p.prepared.user.Collection.Generation() != p.userGeneration {
 		return nil, nil, SnapshotArtifactManifest{}, ErrStagedSnapshot
+	}
+	capture := p.prepared.options.TransitionCaptureTarget.Collection
+	captureSnapshot, err := capture.Snapshot()
+	if err != nil {
+		return nil, nil, SnapshotArtifactManifest{}, err
+	}
+	captureGeneration, captureRows := captureSnapshot.Generation(), captureSnapshot.Len()
+	captureDigest, captureErr := snapshotArtifactOpaqueImageDigest(captureSnapshot)
+	captureCloseErr := captureSnapshot.Close()
+	if captureErr != nil || captureCloseErr != nil || captureGeneration != p.captureGeneration ||
+		captureRows != 0 || captureDigest != p.manifest.CaptureImageDigest {
+		return nil, nil, SnapshotArtifactManifest{}, errors.Join(
+			ErrStagedSnapshot, captureErr, captureCloseErr,
+		)
 	}
 
 	prepared := p.prepared

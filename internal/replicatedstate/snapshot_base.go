@@ -471,7 +471,8 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 		manifest.EncodedBytes != 0 || manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
-		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
+		manifest.CaptureRows != 0 ||
+		manifest.CaptureImageDigest != snapshotArtifactEmptyCaptureImageDigest() ||
 		manifest.Digest == ([sha256.Size]byte{}) {
 		return fmt.Errorf("%w: seeded manifest", ErrSnapshotBase)
 	}
@@ -487,6 +488,7 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 	}
 	if manifest.Digest != seededSnapshotManifestDigest(
 		stateEnvelope, manifest.UserCollection, manifest.ImageDigest, manifest.UserRows,
+		manifest.CaptureImageDigest,
 	) {
 		return fmt.Errorf("%w: seeded manifest identity", ErrSnapshotBase)
 	}
@@ -625,6 +627,7 @@ func seededSnapshotManifestDigest(
 	stateEnvelope, userCollection []byte,
 	imageDigest [sha256.Size]byte,
 	userRows uint64,
+	captureImageDigest [sha256.Size]byte,
 ) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write(seededSnapshotManifestDomain)
@@ -634,6 +637,7 @@ func seededSnapshotManifestDigest(
 	var rows [8]byte
 	binary.LittleEndian.PutUint64(rows[:], userRows)
 	_, _ = h.Write(rows[:])
+	_, _ = h.Write(captureImageDigest[:])
 	var digest [sha256.Size]byte
 	_ = h.Sum(digest[:0])
 	return digest

@@ -189,7 +189,8 @@ func newApplyComplexityFixture(t testing.TB, rows int) *applyComplexityFixture {
 	const importedApplied = uint64(2)
 	machine, base, manifest, err := InitializeStagedSnapshot(
 		binding, bootstrap, system,
-		UserCollection{Name: "docs", Target: user}, log, machineOptionsFor(user),
+		UserCollection{Name: "docs", Target: user}, log,
+		stagedSnapshotMachineOptions(t, dir, user),
 		StagedSnapshotCut{
 			Applied: importedApplied, Term: 2,
 			EntryDigest: sha256.Sum256([]byte("p01-cardinality-imported-cut")),

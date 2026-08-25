@@ -376,10 +376,8 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		certificate.Manifest.UserRows != m.user.Collection.Len() {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
-	if !certificate.Manifest.Seeded {
-		if err := m.verifySnapshotBaseCapture(certificate.Manifest); err != nil {
-			return raftmodel.Publication{}, m.fail(err)
-		}
+	if err := m.verifySnapshotBaseCapture(certificate.Manifest); err != nil {
+		return raftmodel.Publication{}, m.fail(err)
 	}
 	imageDigest, imageErr := m.snapshotBaseImageDigest()
 	if imageErr != nil || certificate.Manifest.ImageDigest != imageDigest {
@@ -403,6 +401,9 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 func (m *Machine) verifySnapshotBaseCapture(manifest SnapshotArtifactManifest) error {
 	capture := m.reservedCaptureTarget.Collection
 	if capture == nil {
+		if manifest.Seeded {
+			return ErrSnapshotBase
+		}
 		wantDigest := snapshotArtifactEmptyCaptureImageDigest()
 		if manifest.Bundle {
 			wantDigest = [sha256.Size]byte{}
