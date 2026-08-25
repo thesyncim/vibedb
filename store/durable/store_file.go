@@ -342,11 +342,13 @@ type Collection struct {
 	// Structural-transaction accounting for split and empty-leaf reclaim. The
 	// *MaxNS fields are the observed high-water bounded-transaction latency so a
 	// harness can gate p-max without a full histogram allocation.
-	primaryLeafSplits         atomic.Uint64
-	primaryEmptyReclaims      atomic.Uint64
-	primaryMacroSplitRequired atomic.Uint64
-	primarySplitMaxNS         atomic.Uint64
-	primaryEmptyReclaimMaxNS  atomic.Uint64
+	primaryLeafSplits               atomic.Uint64
+	primaryEmptyReclaims            atomic.Uint64
+	primaryMacroSplitRequired       atomic.Uint64
+	primarySplitMaxNS               atomic.Uint64
+	primaryEmptyReclaimMaxNS        atomic.Uint64
+	primaryStructuralRoutingStaged  atomic.Uint64
+	primaryStructuralRoutingRetired atomic.Uint64
 	// Hole punching is a foreground, post-durability space optimization. The
 	// source cursors, physical-generation guard, and disabled flag are
 	// writer-owned; atomic counters keep the optional filesystem results
@@ -784,6 +786,12 @@ type Stats struct {
 	// bounded-transaction latency in nanoseconds for each structural kind.
 	PrimarySplitMaxNS        uint64
 	PrimaryEmptyReclaimMaxNS uint64
+	// PrimaryStructuralRouting*Bytes count exact anchor+locator+tablet-root
+	// physical bytes staged and retired by successful structural publications.
+	// Leaf and catalog-path bytes are intentionally excluded so this isolates
+	// the routing rewrite geometry that localized anchor COW changes.
+	PrimaryStructuralRoutingStagedBytes  uint64
+	PrimaryStructuralRoutingRetiredBytes uint64
 	// PrimaryMutationScratchBytes is the retained leaf-promotion and raw
 	// segmented-root writer scratch plus the bounded unified-fold replacement
 	// vector and compact-column planner workspace. It is allocated only for
