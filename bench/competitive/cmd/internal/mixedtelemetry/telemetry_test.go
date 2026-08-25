@@ -107,12 +107,39 @@ func TestParseRejectsNoncanonicalSchemaAndBounds(t *testing.T) {
 	if _, err := Parse(oversized); err == nil {
 		t.Fatal("oversized telemetry accepted")
 	}
-	boundaryPayload := append([]byte(`{"schema":1}`), bytes.Repeat(
-		[]byte{' '}, maxTelemetryJSONBytes-len(`{"schema":1}`),
-	)...)
-	boundary := append(append(append([]byte{}, prefixBytes...), boundaryPayload...), '\n')
-	if _, err := Parse(boundary); err != nil {
-		t.Fatalf("maximum-sized telemetry was rejected: %v", err)
+}
+
+func TestWriteParseAcceptsExactMaximumPayload(t *testing.T) {
+	record := Record{Schema: Schema}
+	base, err := recordEncoder.AppendJSON(nil, &record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(base) >= maxTelemetryJSONBytes {
+		t.Fatalf("base telemetry payload = %d, limit %d", len(base), maxTelemetryJSONBytes)
+	}
+	record.Engine = strings.Repeat("x", maxTelemetryJSONBytes-len(base))
+	exact, err := recordEncoder.AppendJSON(nil, &record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exact) != maxTelemetryJSONBytes {
+		t.Fatalf("generated payload = %d bytes, want %d", len(exact), maxTelemetryJSONBytes)
+	}
+
+	var wire bytes.Buffer
+	if err := Write(&wire, record); err != nil {
+		t.Fatalf("Write exact maximum payload: %v", err)
+	}
+	if got := len(wire.Bytes()) - len(prefixBytes) - 1; got != maxTelemetryJSONBytes {
+		t.Fatalf("wire payload = %d bytes, want %d", got, maxTelemetryJSONBytes)
+	}
+	decoded, err := Parse(wire.Bytes())
+	if err != nil {
+		t.Fatalf("Parse exact maximum payload: %v", err)
+	}
+	if decoded.Engine != record.Engine {
+		t.Fatalf("decoded maximum Engine length = %d, want %d", len(decoded.Engine), len(record.Engine))
 	}
 }
 

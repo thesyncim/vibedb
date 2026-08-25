@@ -56,6 +56,7 @@ func mustCompileDocumentDecoder() vibejson.Decoder[document] {
 		ZeroCopy:              true,
 		DisallowUnknownFields: true,
 		CaseSensitive:         true,
+		Replace:               true,
 	})
 	if err != nil {
 		panic(err)

@@ -68,6 +68,33 @@ func TestEmitDocumentsRejectsUnknownExactOverflowAndBounds(t *testing.T) {
 	}
 }
 
+func TestEmitDocumentsSparseRowCannotInheritReusedState(t *testing.T) {
+	documents := []competitive.Doc{
+		{
+			Key:  "full",
+			JSON: []byte(`{"id":1,"name":"stale-name","country":"PT","score":9,"active":true,"profile":{"tier":"stale-tier","region":"stale-region","joined":"stale-joined"},"tags":["stale-tag"],"note":"stale-note"}`),
+		},
+		{Key: "sparse", JSON: []byte(`{"id":2}`)},
+	}
+	var out bytes.Buffer
+	if err := emitDocuments(&out, documents, "typed"); err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimSuffix(out.Bytes(), []byte{'\n'}), []byte{'\n'})
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+	var got row
+	if err := vibejson.Unmarshal(lines[1], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != "sparse" || got.ID != 2 || got.Name != "" || got.Country != "" ||
+		got.Score != 0 || got.Active || got.Tier != "" || got.Region != "" ||
+		got.Joined != "" || got.Tags != nil || got.Note != "" {
+		t.Fatalf("sparse row inherited prior state: %+v", got)
+	}
+}
+
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, bytes.ErrTooLarge }
