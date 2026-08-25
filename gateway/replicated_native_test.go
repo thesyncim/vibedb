@@ -1103,6 +1103,29 @@ func TestReplicatedExecutorTreatsChangedStaleFenceAsDefinite(t *testing.T) {
 	}
 }
 
+func TestReplicatedExecutorRetriesSameCommandFenceIncarnationRace(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	refreshed := state
+	refreshed.Fence.Term++
+	completion := testReplicatedCompletionResponse(t, command, refreshed)
+	client := &sequenceReplicatedClient{state: refreshed, responses: []*shardservice.ReplicatedResponse{
+		{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: refreshed},
+		completion,
+	}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Propose(context.Background(), route, command)
+	if err != nil || result.Retries != 1 || client.proposals != 2 ||
+		!bytes.Equal(result.Completion, completion.Completion) {
+		t.Fatalf("result=%+v proposals=%d err=%v", result, client.proposals, err)
+	}
+}
+
 func testReplicatedCompletionResponse(
 	t testing.TB,
 	commandBytes []byte,

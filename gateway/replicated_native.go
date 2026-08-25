@@ -723,6 +723,22 @@ func (executor *ReplicatedExecutor) propose(
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
 			}
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				// The command contract was checked above. With the same contract,
+				// this is a definite pre-admission term/member incarnation race
+				// between leader discovery and proposal admission. Refresh the
+				// leader and resend the byte-identical command within the bounded
+				// attempt budget. A changed command fence remains a definite
+				// serving-fence refusal in the earlier branch.
+				if !validReplicatedWritePreAdmissionRefusal(
+					response, shardservice.ReplicatedRefusalStaleFence, false,
+				) {
+					lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+					continue
+				}
+				preferred = response.State.LeaderID
+				continue
+			}
 			if !validReplicatedWritePreAdmissionRefusal(response, response.Refusal, false) {
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
