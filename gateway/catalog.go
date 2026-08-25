@@ -106,6 +106,7 @@ type Snapshot struct {
 	statistics                     *queryplanner.StatisticsCatalog
 	replicatedShards               []replicatedCatalogShard
 	replicatedReplicas             []ReplicatedEndpoint
+	replicatedTables               []replicatedCatalogTable
 	indexLineage                   []plannerIndexLineageRef
 	shardLineage                   []plannerShardLineageRef
 	indexIDHighWater               uint64
@@ -359,9 +360,12 @@ func (s *Snapshot) CatalogTransitionMetadataBytes() uint64 {
 func retainedReplicatedMetadataBytes(
 	shards []replicatedCatalogShard,
 	replicas []ReplicatedEndpoint,
+	tables []replicatedCatalogTable,
 ) uint64 {
-	return uint64(cap(shards))*uint64(unsafe.Sizeof(replicatedCatalogShard{})) +
+	retained := uint64(cap(shards))*uint64(unsafe.Sizeof(replicatedCatalogShard{})) +
 		uint64(cap(replicas))*uint64(unsafe.Sizeof(ReplicatedEndpoint{}))
+	retained += replicatedTableMetadataBytes(tables)
+	return retained
 }
 
 // plannerTableFor resolves a logical table to its placement, distribution spec,
@@ -962,6 +966,7 @@ type persistedCatalog struct {
 	Manifests        []persistedManifest            `json:"manifests"`
 	Endpoints        []persistedEndpoint            `json:"endpoints"`
 	ReplicatedShards []persistedReplicatedShard     `json:"replicated_shards,omitempty"`
+	ReplicatedTables []persistedReplicatedTable     `json:"replicated_tables,omitempty"`
 	Lineage          *persistedCatalogLineage       `json:"lineage,omitempty"`
 }
 
@@ -1072,6 +1077,7 @@ func toPersisted(s *Snapshot) persistedCatalog {
 	}
 	pc.Statistics = s.statistics.Descriptors()
 	pc.ReplicatedShards = persistedReplicatedDescriptors(s.replicatedDescriptors())
+	pc.ReplicatedTables = persistedReplicatedTableProfiles(s.replicatedTableProfiles())
 	for _, m := range s.config.Manifests {
 		pm := persistedManifest{Distribution: string(m.Distribution()), Version: uint64(m.Version())}
 		for i := 0; i < m.ShardCount(); i++ {
@@ -1432,8 +1438,12 @@ func decodeSnapshotBytes(raw []byte) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	snapshot, err := NewSnapshotWithReplicatedMetadata(
-		config, endpoints, pc.Generation, indexes, statistics, replicated,
+	replicatedTables, err := pc.replicatedTableProfiles()
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, pc.Generation, indexes, statistics, replicated, replicatedTables,
 	)
 	if err != nil {
 		return nil, err
