@@ -21,6 +21,35 @@ func testBatchOptions(batchDocuments int) Options {
 	return options
 }
 
+func TestBatchResidentBoundCoversOneNearMaximumLeafPerDocument(t *testing.T) {
+	const documents = 4
+	options := concurrentPrimaryTestOptions()
+	options.MaxBatchDocuments = documents
+	options.MaxDocumentBytes = 64 << 10
+	options.MaxBatchBytes = 1 << 20
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLargeLeafPremium := uint64(documents-1) *
+		uint64(normalized.MaxPageSize-normalized.PageSize)
+	if got := normalized.maxTransactionBytes -
+		normalized.singleDocumentTransactionBytes; got < wantLargeLeafPremium {
+		t.Fatalf("batch resident premium = %d, want at least %d for %d additional maximum leaves",
+			got, wantLargeLeafPremium, documents-1)
+	}
+	const metadataPages = 9
+	got := fileStoreTransactionResidentBytes(
+		documents+metadataPages, documents,
+		normalized.PageSize, normalized.MaxPageSize,
+	)
+	want := uint64(documents*normalized.MaxPageSize +
+		metadataPages*normalized.PageSize)
+	if got != want {
+		t.Fatalf("four-leaf resident bound = %d, want %d", got, want)
+	}
+}
+
 func openBatchCollection(t *testing.T, options Options) (*Collection, *os.File) {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "file-store-batch-*")

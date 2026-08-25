@@ -89,7 +89,8 @@ func TestOnlineCreateIndexPublishesAtomicallyAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	options := Options{
-		Backend: BackendPortable, ResidentBytes: 64 << 20,
+		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		MaxBatchDocuments: 1,
 	}
 	collection, err := Create(file, options)
 	if err != nil {
@@ -175,7 +176,8 @@ func TestOnlineCreateIndexPublishesAtomicallyAndReopens(t *testing.T) {
 	}
 	defer file.Close()
 	collection, err = Open(file, Options{
-		Backend: BackendPortable, ResidentBytes: 64 << 20,
+		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		MaxBatchDocuments: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +202,8 @@ func TestOnlineCreateIndexReconcilesConcurrentLeafRewrites(t *testing.T) {
 	}
 	defer file.Close()
 	collection, err := Create(file, Options{
-		Backend: BackendPortable, ResidentBytes: 64 << 20,
+		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		MaxBatchDocuments: 1,
 		Indexes: []store.IndexDefinition{
 			{Name: "by_seed", Paths: []string{"/seed"}},
 		},
@@ -288,7 +291,7 @@ func TestOnlineCreateIndexReusesImmutableLeavesAndAliases(t *testing.T) {
 	}
 	defer file.Close()
 	collection, err := Create(file, Options{
-		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		Backend: BackendPortable, ResidentBytes: 64 << 20,
 		Indexes: []store.IndexDefinition{
 			{Name: "by_z", Paths: []string{"/z"}},
 		},
@@ -593,7 +596,7 @@ func assertOnlineIndexCrashImage(
 func TestOnlineCreateIndexAtomicCrashBoundary(t *testing.T) {
 	built := onlineIndexCrashSeed(t)
 	options := Options{
-		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		Backend: BackendPortable, ResidentBytes: 64 << 20,
 		Durability:         DurabilityBufferedVisible,
 		CheckpointStrength: CheckpointFilesystem,
 		GroupLimit:         1, CommitCoalesce: 0,
@@ -674,7 +677,7 @@ func TestOnlineCreateIndexMatchesCanonicalAggregation(t *testing.T) {
 		Name: "by_unique", Paths: []string{"/unique"},
 	}
 	options := Options{
-		Backend: BackendPortable, ResidentBytes: 16 << 20,
+		Backend: BackendPortable, ResidentBytes: 64 << 20,
 	}
 
 	onlineFile, err := os.CreateTemp(t.TempDir(), "online-differential-*")

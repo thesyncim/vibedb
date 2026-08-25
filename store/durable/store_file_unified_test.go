@@ -21,6 +21,7 @@ func createUnifiedPrimary(t *testing.T, path string, keys []string, docs [][]byt
 	}
 	options := Options{
 		ResidentBytes: 16 << 20, Backend: BackendPortable,
+		MaxBatchDocuments: 1,
 	}
 	if _, err := CreateFromPrimary(unifiedPrimarySource(t, keys, docs), file, options); err != nil {
 		t.Fatalf("CreateFromPrimary(unified): %v", err)
@@ -41,7 +42,10 @@ func createUnifiedPrimary(t *testing.T, path string, keys []string, docs [][]byt
 	}
 	// Reopen without the option: the reader dispatches on the class byte and
 	// must never need to know which representation wrote the file.
-	collection, err := Open(reopened, Options{ResidentBytes: 16 << 20, Backend: BackendPortable})
+	collection, err := Open(reopened, Options{
+		ResidentBytes: 16 << 20, Backend: BackendPortable,
+		MaxBatchDocuments: 1,
+	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -149,7 +153,8 @@ func TestUnifiedPrimaryDeterminism(t *testing.T) {
 		if _, err := CreateFromPrimary(unifiedPrimarySource(t, keys, docs), file,
 			Options{
 				ResidentBytes: 16 << 20, Backend: BackendPortable,
-				Durability: DurabilityAsyncVisible,
+				MaxBatchDocuments: 1,
+				Durability:        DurabilityAsyncVisible,
 			}); err != nil {
 			t.Fatalf("CreateFromPrimary: %v", err)
 		}
@@ -716,7 +721,8 @@ func TestUnifiedPrimaryWithIndexes(t *testing.T) {
 	}
 	options := Options{
 		ResidentBytes: 16 << 20, Backend: BackendPortable,
-		Indexes: []store.IndexDefinition{{Name: "country", Paths: []string{"/country"}}},
+		MaxBatchDocuments: 1,
+		Indexes:           []store.IndexDefinition{{Name: "country", Paths: []string{"/country"}}},
 	}
 	if _, err := CreateFromPrimary(unifiedPrimarySource(t, keys, docs), file, options); err != nil {
 		t.Fatalf("CreateFromPrimary(unified, indexed): %v", err)
