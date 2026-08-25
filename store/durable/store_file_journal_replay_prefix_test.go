@@ -229,6 +229,7 @@ func TestRecoveryJournalAtomicDispersedBatchWithTinyReopenGeometry(t *testing.T)
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = 256
 	options.MaxBatchBytes = 1 << 20
+	options.ResidentBytes = 64 << 20
 	options.Indexes = []store.IndexDefinition{
 		{Name: "state", Paths: []string{"/state"}},
 	}

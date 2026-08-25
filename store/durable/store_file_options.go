@@ -593,6 +593,32 @@ func fileStoreTransactionResidentBytes(
 	)
 }
 
+// fileStoreBatchOverflowPages is the tight aggregate ceiling for overflow
+// extents in one admitted batch. Producing P extents across N non-empty values
+// needs at least 2N+(P-N)*payload admitted bytes: one non-empty key and the
+// first value byte per chain, then a full payload for every additional extent.
+// MaxBatchBytes bounds their aggregate bytes, while MaxDocumentBytes
+// independently caps every chain.
+// Inline admission can only reduce the result, so it is intentionally omitted.
+func fileStoreBatchOverflowPages(
+	documents, maxDocumentBytes, maxBatchBytes, payload int,
+) int {
+	if documents <= 0 || maxDocumentBytes <= 0 ||
+		maxBatchBytes <= 0 || payload <= 0 {
+		return 0
+	}
+	active := min(documents, maxBatchBytes/2)
+	firstExtentBytes := 2 * active // one key byte + one value byte per chain
+	byAggregateBytes := fileStoreSaturatingAdd(
+		active, (maxBatchBytes-firstExtentBytes)/payload,
+	)
+	perDocument := 1 + (maxDocumentBytes-1)/payload
+	return min(
+		byAggregateBytes,
+		fileStoreSaturatingMul(active, perDocument),
+	)
+}
+
 type normalizedFileStoreOptions struct {
 	Options
 	// maxTransactionBytes bounds resident dirty frame bytes. Persisted extent
@@ -984,7 +1010,12 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	if overflowPayload <= 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection overflow page has no payload")
 	}
-	overflowPages := 1 + (o.MaxDocumentBytes-1)/overflowPayload
+	singleDocumentOverflowPages := 1 +
+		(o.MaxDocumentBytes-1)/overflowPayload
+	batchOverflowPages := fileStoreBatchOverflowPages(
+		o.MaxBatchDocuments, o.MaxDocumentBytes,
+		o.MaxBatchBytes, overflowPayload,
+	)
 	// Derive Put/Delete from the exact same overflow, tree, retirement, and
 	// free-fold inputs as Update, changing only the admitted document count to
 	// one. Keeping both calculations together prevents a new batch consumer
@@ -1007,20 +1038,22 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	)
 	if metadataPageLimit < 0 || singleDocumentMetadataPageLimit < 0 ||
 		largestMetadataPageLimit >= 32768 ||
-		overflowPages >= 32768-largestMetadataPageLimit {
+		batchOverflowPages >= 32768-largestMetadataPageLimit {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection MaxBatchDocuments or maximum document requires too many transaction pages")
 	}
-	docMaxTransactionPages := overflowPages + metadataPageLimit
+	docMaxTransactionPages := batchOverflowPages + metadataPageLimit
 	docSingleDocumentPages :=
-		overflowPages + singleDocumentMetadataPageLimit
+		singleDocumentOverflowPages + singleDocumentMetadataPageLimit
 	// Dirty admission accounts for the bytes actually retained in cache. The
 	// persisted checkpoint namespace is deliberately separate: routing parents
 	// can occupy wider physical extent classes without retaining those padded
 	// bytes in resident frames.
 	batchLargePages := fileStoreSaturatingAdd(
-		overflowPages, o.MaxBatchDocuments,
+		batchOverflowPages, o.MaxBatchDocuments,
 	)
-	singleDocumentLargePages := fileStoreSaturatingAdd(overflowPages, 1)
+	singleDocumentLargePages := fileStoreSaturatingAdd(
+		singleDocumentOverflowPages, 1,
+	)
 	if len(compiled) != 0 {
 		batchLargePages = fileStoreSaturatingAdd(batchLargePages, 1)
 		singleDocumentLargePages = fileStoreSaturatingAdd(
@@ -1088,7 +1121,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		maxTransactionPages,
 		fileStoreSaturatingAdd(
 			fileStoreSaturatingAdd(
-				fileStoreSaturatingAdd(overflowPages, o.MaxBatchDocuments),
+				fileStoreSaturatingAdd(batchOverflowPages, o.MaxBatchDocuments),
 				compiledPackedPages,
 			),
 			exactIndexPages,
@@ -1253,7 +1286,10 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection BufferCount must exceed worst-case %d-page transaction", maxTransactionPages)
 	}
 	if o.ResidentBytes < 0 || uint64(o.ResidentBytes) < maxTransactionBytes {
-		return normalizedFileStoreOptions{}, fmt.Errorf("vibedb: collection ResidentBytes cannot retain one worst-case dirty transaction")
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"vibedb: collection ResidentBytes cannot retain one worst-case dirty transaction: need=%d configured=%d",
+			maxTransactionBytes, o.ResidentBytes,
+		)
 	}
 	primaryUnifiedOverlayBytes := int(primaryOverlayTargetBytes)
 	normalized := normalizedFileStoreOptions{

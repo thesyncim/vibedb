@@ -299,7 +299,7 @@ func TestCollectionUpdateOverflowTopologyRetry(t *testing.T) {
 	// This test advertises 280 independently routed edits. Retain one
 	// maximum-size rewritten leaf per edit as required by atomic batch
 	// admission; 16 MiB only covered the former singleton-leaf undercount.
-	options.ResidentBytes = 32 << 20
+	options.ResidentBytes = 64 << 20
 	options.Indexes = nil
 	collection, file := openBatchCollection(t, options)
 	values := make([][]byte, documents)
@@ -407,6 +407,115 @@ func TestPrimaryBatchOverflowLayoutBounds(t *testing.T) {
 		value, 7, baseOffset, ^uint64(0)-1,
 	); !errors.Is(err, storeio.ErrInvalidWrite) {
 		t.Fatalf("NextLogicalID overflow = %v", err)
+	}
+}
+
+func TestBatchOverflowAggregateBoundsResidentAndPhysicalReservation(t *testing.T) {
+	const documents = 4
+	options := testBatchOptions(documents)
+	options.OpaqueValues = true
+	options.Indexes = nil
+	options.MaxKeyBytes = 16
+	options.InlineValueBytes = 512
+	options.MaxDocumentBytes = 256 << 10
+	options.MaxBatchBytes = documents *
+		(options.MaxDocumentBytes + options.MaxKeyBytes)
+	options.ResidentBytes = 8 << 20
+
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := normalized.MaxPageSize - storeio.PageHeaderSize -
+		storeio.PageTrailerSize - storeio.OverflowPagePayloadHeaderSize
+	batchOverflowPages := fileStoreBatchOverflowPages(
+		documents, normalized.MaxDocumentBytes,
+		normalized.MaxBatchBytes, payload,
+	)
+	if batchOverflowPages != 20 {
+		t.Fatalf("aggregate overflow pages = %d, want 20", batchOverflowPages)
+	}
+	perDocumentPages := 1 + (normalized.MaxDocumentBytes-1)/payload
+	if perDocumentPages != 5 {
+		t.Fatalf("per-document overflow pages = %d, want 5", perDocumentPages)
+	}
+	maximumResidentPages := batchOverflowPages + documents
+	wantResident := uint64(maximumResidentPages)*uint64(normalized.MaxPageSize) +
+		uint64(normalized.maxTransactionPages-maximumResidentPages)*uint64(normalized.PageSize)
+	if normalized.maxTransactionBytes != wantResident {
+		t.Fatalf("resident batch bound = %d, want %d", normalized.maxTransactionBytes, wantResident)
+	}
+	wantPhysical := fileStoreTransactionExtentBytes(
+		normalized.maxTransactionPages,
+		maximumResidentPages,
+		4*documents,
+		normalized.PageSize, normalized.MaxPageSize,
+	)
+	if normalized.maxTransactionPhysicalBytes != wantPhysical {
+		t.Fatalf("physical batch bound = %d, want %d",
+			normalized.maxTransactionPhysicalBytes, wantPhysical)
+	}
+	allMaximumFrames := uint64(normalized.maxTransactionPages) *
+		uint64(normalized.MaxPageSize)
+	if normalized.maxTransactionPhysicalBytes >= allMaximumFrames/2 {
+		t.Fatalf("physical bound = %d, all-MaxPage bound = %d; compact classification regressed",
+			normalized.maxTransactionPhysicalBytes, allMaximumFrames)
+	}
+
+	options.ResidentBytes = int64(normalized.maxTransactionBytes)
+	normalized, err = options.normalized()
+	if err != nil {
+		t.Fatalf("exact aggregate resident bound rejected: %v", err)
+	}
+	collection, _ := openBatchCollection(t, options)
+	base := collection.durableState.Load()
+	if base == nil {
+		t.Fatal("missing initial durable state")
+	}
+	values := make([][]byte, documents)
+	if err := collection.Update(func(batch *WriteBatch) error {
+		for index := range documents {
+			values[index] = bytes.Repeat(
+				[]byte{byte('A' + index)}, options.MaxDocumentBytes,
+			)
+			if putErr := batch.Put(
+				[]byte(fmt.Sprintf("overflow-%d", index)), values[index],
+			); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("four-chain overflow batch: %v", err)
+	}
+	after := collection.durableState.Load()
+	if after == nil || after.fileEnd < base.fileEnd {
+		t.Fatal("invalid durable state after overflow batch")
+	}
+	if appended := after.fileEnd - base.fileEnd; appended > normalized.maxTransactionPhysicalBytes {
+		t.Fatalf("overflow batch appended %d bytes, physical bound %d",
+			appended, normalized.maxTransactionPhysicalBytes)
+	}
+	for index := range documents {
+		requirePrimaryBatchRaw(
+			t, collection, fmt.Sprintf("overflow-%d", index), values[index],
+		)
+	}
+
+	// Deletes contribute no overflow payload. Exact-index mutations add their
+	// separately classified term/catalog extents to the same aggregate overflow
+	// ceiling; neither path can exceed the all-Put data bound above.
+	indexed := options
+	indexed.OpaqueValues = false
+	indexed.Indexes = []store.IndexDefinition{{Name: "tag", Paths: []string{"/tag"}}}
+	indexed.ResidentBytes = 64 << 20
+	indexedNormalized, indexErr := indexed.normalized()
+	if indexErr != nil {
+		t.Fatal(indexErr)
+	}
+	if indexedNormalized.maxTransactionPages <= normalized.maxTransactionPages ||
+		indexedNormalized.maxTransactionPhysicalBytes <= normalized.maxTransactionPhysicalBytes {
+		t.Fatal("indexed overflow geometry did not add exact-index reservation")
 	}
 }
 
