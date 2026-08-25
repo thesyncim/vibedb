@@ -512,15 +512,11 @@ func (p *RetainedPruner) confirmOrAdvancePending(
 	if pruneEntry {
 		for index := range entry.Transitions {
 			transition := &entry.Transitions[index]
-			if transition.Before == nil || transition.After != nil {
+			if !transition.BeforeWitness.Present || transition.After != nil {
 				pruneEntry = false
 				break
 			}
-			point, pointErr := p.partitioner.program.Point(transition.Before, &workspace.document)
-			if pointErr != nil {
-				return errors.Join(ErrRetainedPrune, pointErr)
-			}
-			if p.partitioner.childFor(point) == int(p.partitioner.retained) {
+			if p.partitioner.childFor(transition.BeforeWitness.Point) == int(p.partitioner.retained) {
 				pruneEntry = false
 				break
 			}
@@ -644,14 +640,15 @@ func advanceCompletedRetainedCounts(next *RetainedPruneCursor, entry TailEntry) 
 	for index := range entry.Transitions {
 		transition := &entry.Transitions[index]
 		beforeBytes, afterBytes := uint64(0), uint64(0)
-		if transition.Before != nil {
-			beforeBytes = uint64(len(transition.Key) + len(transition.Before))
+		if transition.BeforeWitness.Present {
+			beforeBytes = uint64(len(transition.Key)) +
+				uint64(transition.BeforeWitness.DocumentBytes)
 		}
 		if transition.After != nil {
 			afterBytes = uint64(len(transition.Key) + len(transition.After))
 		}
 		switch {
-		case transition.Before == nil:
+		case !transition.BeforeWitness.Present:
 			if next.remainingRows == math.MaxUint64 || next.remainingBytes > math.MaxUint64-afterBytes {
 				return false
 			}
@@ -705,15 +702,20 @@ func (p *RetainedPruner) retainedEntry(
 ) bool {
 	for index := range entry.Transitions {
 		transition := &entry.Transitions[index]
-		if transition.Before == nil && transition.After == nil {
+		if !transition.BeforeWitness.Present && transition.After == nil {
 			return false
 		}
-		if !p.retainedDocument(transition.Before, workspace) ||
+		if !p.retainedBefore(transition.BeforeWitness) ||
 			!p.retainedDocument(transition.After, workspace) {
 			return false
 		}
 	}
 	return true
+}
+
+func (p *RetainedPruner) retainedBefore(witness TailBeforeWitness) bool {
+	return !witness.Present ||
+		p.partitioner.childFor(witness.Point) == int(p.partitioner.retained)
 }
 
 func (p *RetainedPruner) retainedDocument(

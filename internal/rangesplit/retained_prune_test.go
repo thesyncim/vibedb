@@ -127,7 +127,7 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		}
 	}
 	cursor := pruner.Cursor()
-	rows, _, generation, digest, ok := cursor.RetainedProof()
+	rows, baseBytes, generation, digest, ok := cursor.RetainedProof()
 	if !ok || rows != 2 || generation == 0 || digest == ([sha256.Size]byte{}) ||
 		fixture.user.Collection.Len() != 2 {
 		t.Fatalf("cursor=%+v rows=%d generation=%d stored=%d", cursor, rows, generation, fixture.user.Collection.Len())
@@ -162,14 +162,75 @@ func TestRetainedPrunerResumesAcrossBothApplyCrashWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	advanced := pruner.Cursor()
-	advancedRows, _, _, advancedDigest, proofOK := advanced.RetainedProof()
+	advancedRows, advancedBytes, _, advancedDigest, proofOK := advanced.RetainedProof()
 	if advanced.Phase() != RetainedPruneComplete || advanced.SourceCut().Applied != applied ||
-		!proofOK || advancedRows != rows+1 || advancedDigest == cursor.retainedDigest {
+		!proofOK || advancedRows != rows+1 ||
+		advancedBytes != baseBytes+uint64(len("late-retained")+len(retained)) ||
+		advancedDigest == cursor.retainedDigest {
 		t.Fatalf("advanced complete cursor=%+v", advanced)
 	}
-	if reopened, err := newTestRetainedPruner(t, partitioner, certificate, persisted); err != nil ||
-		reopened.Cursor().SourceCut() != advanced.SourceCut() {
+	reopened, err := newTestRetainedPruner(t, partitioner, certificate, persisted)
+	if err != nil || reopened.Cursor().SourceCut() != advanced.SourceCut() {
 		t.Fatalf("reopen late complete=%v err=%v", reopened, err)
+	}
+	pruner = reopened
+	updatedRaw := append(bytes.Clone(retained[:len(retained)-1]),
+		[]byte(`,"zz":"a-larger-retained-document"}`)...)
+	updated, err := vibejson.AppendCanonicalize(nil, updatedRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence++
+	applied++
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+		t, fixture, binding, 5, sequence,
+		replication.Mutation{Kind: replication.MutationPut, Key: []byte("late-retained"), Value: updated},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, has, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace); advanceErr != nil || has {
+		t.Fatalf("retained update advance has=%v err=%v", has, advanceErr)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	updatedCursor := pruner.Cursor()
+	updatedRows, updatedBytes, _, _, proofOK := updatedCursor.RetainedProof()
+	wantUpdatedBytes := advancedBytes - uint64(len(retained)) + uint64(len(updated))
+	if !proofOK || updatedRows != advancedRows || updatedBytes != wantUpdatedBytes {
+		t.Fatalf("retained update proof rows=%d bytes=%d want rows=%d bytes=%d",
+			updatedRows, updatedBytes, advancedRows, wantUpdatedBytes)
+	}
+	pruner, err = newTestRetainedPruner(t, partitioner, certificate, persisted)
+	if err != nil || pruner.Cursor().SourceCut() != updatedCursor.SourceCut() {
+		t.Fatalf("reopen retained update cursor=%+v err=%v", pruner.Cursor(), err)
+	}
+	sequence++
+	applied++
+	if _, err := fixture.machine.ApplyNormal(sourceCaptureMeta(applied), retainedMutationCommand(
+		t, fixture, binding, 5, sequence,
+		replication.Mutation{Kind: replication.MutationDelete, Key: []byte("late-retained")},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = fixture.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, has, advanceErr := pruner.Advance(snapshot, capture, limits, persist, &workspace); advanceErr != nil || has {
+		t.Fatalf("retained delete advance has=%v err=%v", has, advanceErr)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deletedRows, deletedBytes, _, _, proofOK := pruner.Cursor().RetainedProof()
+	if !proofOK || deletedRows != rows || deletedBytes != baseBytes {
+		t.Fatalf("retained delete proof rows=%d bytes=%d want rows=%d bytes=%d",
+			deletedRows, deletedBytes, rows, baseBytes)
 	}
 	opened, err := OpenRetainedPruneCursor(persisted)
 	if err != nil {

@@ -378,7 +378,7 @@ func assertSessionReleaseCrashImage(
 	switch {
 	case capacity.Applied == 3 && capacity.SessionCount == 1 &&
 		capacity.SessionSlotCount == 2 && capacity.SessionEpochHighWater == 2 &&
-		systemRows == 4 && (!withCapture || captureRows == 3):
+		systemRows == 5 && (!withCapture || captureRows == 3):
 		_, lookupErr := machine.LookupCompletion(sessionCrashReleaseBytes(t))
 		if !errors.Is(lookupErr, replicatedstate.ErrCompletionNotFound) {
 			t.Fatalf("pre-image release lookup = %v, want ErrCompletionNotFound", lookupErr)
@@ -386,7 +386,7 @@ func assertSessionReleaseCrashImage(
 		return "pre"
 	case capacity.Applied == 4 && capacity.SessionCount == 0 &&
 		capacity.SessionSlotCount == 0 && capacity.SessionEpochHighWater == 2 &&
-		systemRows == 1 && (!withCapture || captureRows == 4):
+		systemRows == 2 && (!withCapture || captureRows == 4):
 		_, lookupErr := machine.LookupCompletion(sessionCrashReleaseBytes(t))
 		if !errors.Is(lookupErr, replicatedstate.ErrSessionReleased) {
 			t.Fatalf("post-image release lookup = %v, want ErrSessionReleased", lookupErr)

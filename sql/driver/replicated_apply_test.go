@@ -2933,8 +2933,8 @@ func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
 			want+int64(base.Relations[ordinal].Limits.MaxBatchBytes),
 		)
 	}
-	if floor != want || floor <= 64<<20 {
-		t.Fatalf("transaction floor=%d want=%d and greater than legacy 64 MiB", floor, want)
+	if floor != want || floor > 64<<20 {
+		t.Fatalf("transaction floor=%d want=%d and at most 64 MiB", floor, want)
 	}
 	exact := options
 	exact.TxnLimits.MaxBytes = floor

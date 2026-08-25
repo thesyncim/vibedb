@@ -111,6 +111,34 @@ func TestDocumentPointProgramAllocatesZeroWhenWarm(t *testing.T) {
 	}
 }
 
+func TestDocumentPointProgramReleasesBorrowedScalarsOnEveryExit(t *testing.T) {
+	program, err := CompileDocumentPointProgram(
+		[]string{"/tenant", "/sequence"}, DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace DocumentPointWorkspace
+	assertReleased := func(stage string) {
+		t.Helper()
+		for ordinal := range workspace.scalars {
+			if workspace.scalars[ordinal] != (Scalar{}) {
+				t.Fatalf("%s retained borrowed scalar %d: %+v", stage, ordinal, workspace.scalars[ordinal])
+			}
+		}
+	}
+	success := []byte(`{"tenant":"borrowed-success","sequence":7}`)
+	if _, err := program.Point(success, &workspace); err != nil {
+		t.Fatal(err)
+	}
+	assertReleased("success")
+	lateError := []byte(`{"tenant":"borrowed-before-error","sequence":{}}`)
+	if _, err := program.Point(lateError, &workspace); !errors.Is(err, ErrDocumentPoint) {
+		t.Fatalf("late scalar error=%v", err)
+	}
+	assertReleased("late error")
+}
+
 func BenchmarkDocumentPointProgram(b *testing.B) {
 	program, err := CompileDocumentPointProgram(
 		[]string{"/tenant", "/region", "/sequence"}, DefaultVirtualBucketBits,

@@ -27,14 +27,27 @@ var (
 
 const tailChildMissing = uint8(math.MaxUint8)
 
+// TailBeforeWitness is the compact exact source-side evidence needed after a
+// split cut. Point is interpreted only by the placement program already bound
+// into the tail cursor. DocumentBytes retains exact logical byte accounting
+// without retaining the potentially large source document.
+type TailBeforeWitness struct {
+	Present       bool
+	Point         distribution.KeyspacePoint
+	DocumentBytes uint32
+	Digest        [sha256.Size]byte
+}
+
 // TailTransition is one exact final key transition observed while applying a
-// source entry. Before and After are valid JSON document bytes; nil means the
-// key was absent on that side. Both cannot be nil. Input keys must be strictly
-// byte ordered and distinct so every derived child batch remains ordered.
+// source entry. Before is accepted only as borrowed construction input; a
+// durable captured transition instead carries BeforeWitness. After remains a
+// valid JSON document because child puts need its exact bytes. Input keys must
+// be strictly byte ordered and distinct.
 type TailTransition struct {
-	Key    []byte
-	Before []byte
-	After  []byte
+	Key           []byte
+	Before        []byte
+	BeforeWitness TailBeforeWitness
+	After         []byte
 }
 
 // TailEntry is one consecutive source publication after the artifact cut.
@@ -340,12 +353,12 @@ func (p *Partitioner) TranslateTailEntry(
 			return cursor, TailStats{}, ErrTailEntry
 		}
 		route := tailRoute{before: tailChildMissing, after: tailChildMissing}
-		if transition.Before != nil {
-			point, err := p.program.Point(transition.Before, &workspace.document)
-			if err != nil {
-				return cursor, TailStats{}, fmt.Errorf("%w: before placement", ErrTailEntry)
-			}
-			child := p.childFor(point)
+		before, err := p.tailBeforeWitness(transition, &workspace.document)
+		if err != nil {
+			return cursor, TailStats{}, err
+		}
+		if before.Present {
+			child := p.childFor(before.Point)
 			if child < 0 {
 				return cursor, TailStats{}, fmt.Errorf("%w: before outside source", ErrTailEntry)
 			}
@@ -367,7 +380,7 @@ func (p *Partitioner) TranslateTailEntry(
 			}
 		}
 		workspace.routes[ordinal] = route
-		workspace.hashTransition(transition, route)
+		workspace.hashTransition(transition, before, route)
 		if route.after != tailChildMissing {
 			child := int(route.after)
 			if !addTailOperation(stats, child, transition.Key, transition.After) {
@@ -618,17 +631,49 @@ func validTailBatchCoordinates(batch TailBatch) bool {
 func validTailTransition(transition *TailTransition, previousKey []byte) bool {
 	if transition == nil || len(transition.Key) == 0 ||
 		len(transition.Key) > replication.MaxMutationKeyBytes ||
-		transition.Before == nil && transition.After == nil ||
+		transition.Before == nil && !transition.BeforeWitness.Present && transition.After == nil ||
+		transition.Before != nil && transition.BeforeWitness.Present ||
 		len(transition.Before) > replication.MaxMutationValueBytes ||
 		len(transition.After) > replication.MaxMutationValueBytes ||
 		previousKey != nil && bytes.Compare(previousKey, transition.Key) >= 0 {
 		return false
 	}
 	if transition.Before != nil && len(transition.Before) == 0 ||
-		transition.After != nil && len(transition.After) == 0 {
+		transition.After != nil && len(transition.After) == 0 ||
+		transition.BeforeWitness.Present && (transition.BeforeWitness.DocumentBytes == 0 ||
+			transition.BeforeWitness.DocumentBytes > replication.MaxMutationValueBytes ||
+			transition.BeforeWitness.Digest == ([sha256.Size]byte{})) ||
+		!transition.BeforeWitness.Present &&
+			(transition.BeforeWitness.DocumentBytes != 0 ||
+				transition.BeforeWitness.Point != (distribution.KeyspacePoint{}) ||
+				transition.BeforeWitness.Digest != ([sha256.Size]byte{})) {
 		return false
 	}
 	return true
+}
+
+func (p *Partitioner) tailBeforeWitness(
+	transition *TailTransition,
+	workspace *distribution.DocumentPointWorkspace,
+) (TailBeforeWitness, error) {
+	if transition.Before == nil {
+		if transition.BeforeWitness.Present && p.childFor(transition.BeforeWitness.Point) < 0 {
+			return TailBeforeWitness{}, fmt.Errorf("%w: before outside source", ErrTailEntry)
+		}
+		return transition.BeforeWitness, nil
+	}
+	point, err := p.program.Point(transition.Before, workspace)
+	if err != nil {
+		return TailBeforeWitness{}, fmt.Errorf("%w: before placement", ErrTailEntry)
+	}
+	digest := sha256.Sum256(transition.Before)
+	if digest == ([sha256.Size]byte{}) {
+		return TailBeforeWitness{}, ErrTailEntry
+	}
+	return TailBeforeWitness{
+		Present: true, Point: point, DocumentBytes: uint32(len(transition.Before)),
+		Digest: digest,
+	}, nil
 }
 
 func addTailOperation(stats *TailStats, child int, key, value []byte) bool {
@@ -699,13 +744,30 @@ func (w *TailWorkspace) prepareTailHashes(
 	}
 }
 
-func (w *TailWorkspace) hashTransition(transition *TailTransition, route tailRoute) {
+func (w *TailWorkspace) hashTransition(
+	transition *TailTransition,
+	before TailBeforeWitness,
+	route tailRoute,
+) {
 	h := w.hashers[0]
 	w.hashFrame(h, transition.Key)
-	w.hashOptionalFrame(h, transition.Before)
+	w.hashBeforeWitness(h, before)
 	w.hashOptionalFrame(h, transition.After)
 	w.fixed[0], w.fixed[1] = route.before, route.after
 	_, _ = h.Write(w.fixed[:2])
+}
+
+func (w *TailWorkspace) hashBeforeWitness(h hash.Hash, before TailBeforeWitness) {
+	if !before.Present {
+		w.fixed[0] = 0
+		_, _ = h.Write(w.fixed[:1])
+		return
+	}
+	w.fixed[0] = 1
+	copy(w.fixed[1:9], before.Point[:])
+	binary.LittleEndian.PutUint32(w.fixed[9:13], before.DocumentBytes)
+	copy(w.fixed[13:45], before.Digest[:])
+	_, _ = h.Write(w.fixed[:45])
 }
 
 func (w *TailWorkspace) hashTailOperation(

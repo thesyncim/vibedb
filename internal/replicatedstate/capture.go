@@ -222,9 +222,19 @@ func (m *Machine) validateTransitionCaptureTarget(
 	}
 	maxBefore := uint64(m.user.Limits.MaxDistinctMutations) *
 		uint64(m.user.Limits.MaxDocumentBytes)
-	maxAfter := uint64(m.user.Limits.MaxBatchBytes)
-	maxKeys := uint64(m.user.Limits.MaxDistinctMutations) *
-		uint64(m.user.Limits.MaxKeyBytes)
+	// Keys and after images share both the durable batch envelope and the
+	// narrower replicated command envelope; their independent maxima cannot
+	// occur in one admitted transition.
+	maxPayload := uint64(min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes))
+	possiblePayload := uint64(m.user.Limits.MaxDistinctMutations) *
+		uint64(m.user.Limits.MaxDocumentBytes+m.user.Limits.MaxKeyBytes)
+	maxPayload = min(maxPayload, possiblePayload)
+	maxAfter := min(maxPayload, uint64(m.user.Limits.MaxDistinctMutations)*
+		uint64(m.user.Limits.MaxDocumentBytes))
+	maxKeys := maxPayload - maxAfter
+	if maxKeys > uint64(m.user.Limits.MaxDistinctMutations)*uint64(m.user.Limits.MaxKeyBytes) {
+		return fmt.Errorf("%w: record payload dimensions", ErrTransitionCapture)
+	}
 	maxRecord, err := capture.MaxEncodedBytes(TransitionCaptureBounds{
 		Transitions: uint64(m.user.Limits.MaxDistinctMutations),
 		KeyBytes:    maxKeys, BeforeBytes: maxBefore, AfterBytes: maxAfter,
