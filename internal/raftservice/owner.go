@@ -392,6 +392,27 @@ type MembershipRequest struct {
 	TransferTerm              uint64
 }
 
+// ValidateMembershipFields rejects every malformed fixed-width control
+// envelope independently of metadata authorization or live Raft state. It is
+// shared by the gateway admission edge and serialized owner so malformed
+// requests cannot consume discovery/network work and cannot bypass the owner
+// when submitted through an in-process path.
+func ValidateMembershipFields(
+	kind MembershipKind,
+	transitionID [16]byte,
+	metadataEpoch, catalogGeneration, expectedReplicaSetVersion uint64,
+	sourceMember, targetMember, transferTerm uint64,
+) error {
+	if kind < MembershipAddLearner || kind > MembershipTransferLeader ||
+		transitionID == ([16]byte{}) || metadataEpoch == 0 || catalogGeneration == 0 ||
+		expectedReplicaSetVersion == 0 || sourceMember == 0 || targetMember == 0 ||
+		sourceMember == targetMember ||
+		(kind == MembershipRemoveVoter) != (transferTerm != 0) {
+		return ErrMembershipMalformed
+	}
+	return nil
+}
+
 // NewOwner validates and detaches one lane configuration. Runtime adoption and
 // Host group addition must be complete before construction.
 func NewOwner(options Options) (*Owner, error) {
@@ -908,13 +929,12 @@ func validateMembershipIdentity(
 	request MembershipRequest,
 	authority MembershipAuthorization,
 ) error {
-	if request.Kind < MembershipAddLearner || request.Kind > MembershipTransferLeader ||
-		request.ExpectedReplicaSetVersion == 0 || request.SourceMember == 0 ||
-		request.TargetMember == 0 || request.SourceMember == request.TargetMember {
-		return ErrMembershipMalformed
-	}
-	if (request.Kind == MembershipRemoveVoter) != (request.TransferTerm != 0) {
-		return ErrMembershipMalformed
+	if err := ValidateMembershipFields(
+		request.Kind, request.TransitionID, request.MetadataEpoch, request.CatalogGeneration,
+		request.ExpectedReplicaSetVersion, request.SourceMember, request.TargetMember,
+		request.TransferTerm,
+	); err != nil {
+		return err
 	}
 	if request.TransitionID != authority.TransitionID ||
 		request.MetadataEpoch != authority.MetadataEpoch ||

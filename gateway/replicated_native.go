@@ -373,8 +373,17 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 	route ReplicatedRoute,
 	membership shardservice.ReplicatedMembershipRequest,
 ) (ReplicatedMembershipResult, error) {
-	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
-		membership.ExpectedReplicaSetVersion != route.Command.ReplicaSetVersion {
+	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) {
+		return ReplicatedMembershipResult{}, ErrReplicatedRoute
+	}
+	if err := raftservice.ValidateMembershipFields(
+		membership.Kind, membership.TransitionID, membership.MetadataEpoch,
+		membership.CatalogGeneration, membership.ExpectedReplicaSetVersion,
+		membership.SourceMember, membership.TargetMember, membership.TransferTerm,
+	); err != nil {
+		return ReplicatedMembershipResult{}, err
+	}
+	if membership.ExpectedReplicaSetVersion != route.Command.ReplicaSetVersion {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
 	preferred := route.Replicas[0].Member
