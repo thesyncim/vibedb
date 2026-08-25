@@ -7,7 +7,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	pb "go.etcd.io/raft/v3/raftpb"
-	"google.golang.org/protobuf/proto"
 )
 
 // This uses an RF3 voter set plus one enrolled replacement. The replacement
@@ -80,7 +79,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
 			if err != nil || publication.Applied < 2 ||
-				!proto.Equal(publication.ConfState, learnerConf) {
+				publication.ConfState.Equivalent(learnerConf) != nil {
 				return false
 			}
 		}
@@ -100,7 +99,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 3 ||
-				!proto.Equal(publication.ConfState, voterConf) {
+				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
 		}
@@ -129,7 +128,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		return true
 	})
 	beforeRestart, err := hosts[3].Publication(group)
-	if err != nil || !proto.Equal(beforeRestart.ConfState, learnerConf) ||
+	if err != nil || beforeRestart.ConfState.Equivalent(learnerConf) != nil ||
 		beforeRestart.ReplicaSetVersion >= 3 {
 		t.Fatalf("target published promotion before crash: %+v, %v", beforeRestart, err)
 	}
@@ -181,7 +180,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 			status, statusErr := hosts[index].Status(group)
 			publication, publicationErr := hosts[index].Publication(group)
 			if statusErr != nil || publicationErr != nil || status.LeaderID != 2 ||
-				!proto.Equal(publication.ConfState, voterConf) {
+				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
 		}
@@ -213,7 +212,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntil(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 4 || !proto.Equal(publication.ConfState, removedConf) {
+			if err != nil || publication.Applied < 4 || publication.ConfState.Equivalent(removedConf) != nil {
 				return false
 			}
 		}
@@ -252,7 +251,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		authorityVersion, authorityFound := registries[3].ReplicaSetVersion(group)
 		return leftErr == nil && rejoinedErr == nil && publicationErr == nil &&
 			left.LeaderID != 0 && rejoined.LeaderID == left.LeaderID &&
-			proto.Equal(publication.ConfState, removedConf) &&
+			publication.ConfState.Equivalent(removedConf) == nil &&
 			publication.ReplicaSetVersion == authorityVersion && authorityFound
 	})
 }

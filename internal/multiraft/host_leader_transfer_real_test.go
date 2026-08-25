@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,7 +128,8 @@ func (cluster *realTransferCluster) driveUntil(done func() bool) {
 	if doneReached {
 		return
 	}
-	cluster.t.Fatalf("cluster became idle before condition at step %d", idleStep)
+	cluster.t.Fatalf("cluster became idle before condition at step %d: %s",
+		idleStep, cluster.diagnostic())
 }
 
 // driveUntilIdle advances the deterministic scheduler until either done is
@@ -150,7 +152,7 @@ func (cluster *realTransferCluster) driveUntilIdle(
 			return false, current
 		}
 	}
-	cluster.t.Fatal("cluster drive did not converge")
+	cluster.t.Fatalf("cluster drive did not converge: %s", cluster.diagnostic())
 	return false, -1
 }
 
@@ -253,20 +255,49 @@ func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) 
 			}
 			if status.MemberID == status.LeaderID && status.LeaderID != 0 {
 				if leader >= 0 {
-					cluster.t.Fatalf("multiple leaders at protocol-idle step %d", idleStep)
+					cluster.t.Fatalf("multiple leaders at protocol-idle step %d: %s",
+						idleStep, cluster.diagnostic())
 				}
 				leader = index
 			}
 		}
 		if leader < 0 {
-			cluster.t.Fatalf("no leader at protocol-idle step %d", idleStep)
+			cluster.t.Fatalf("no leader at protocol-idle step %d: %s",
+				idleStep, cluster.diagnostic())
 		}
 		if err := cluster.hosts[leader].RequestTick(cluster.group); err != nil {
 			cluster.t.Fatal(err)
 		}
 		step++
 	}
-	cluster.t.Fatal("cluster drive with leader ticks did not converge")
+	cluster.t.Fatalf("cluster drive with leader ticks did not converge: %s",
+		cluster.diagnostic())
+}
+
+func (cluster *realTransferCluster) diagnostic() string {
+	if cluster == nil {
+		return "nil cluster"
+	}
+	var result strings.Builder
+	for index, host := range cluster.hosts {
+		if index != 0 {
+			result.WriteString("; ")
+		}
+		status, statusErr := host.Status(cluster.group)
+		publication, publicationErr := host.Publication(cluster.group)
+		version, versionFound := uint64(0), false
+		if index < len(cluster.registries) && cluster.registries[index] != nil {
+			version, versionFound = cluster.registries[index].ReplicaSetVersion(cluster.group)
+		}
+		fmt.Fprintf(&result,
+			"host=%d inactive=%t status={member=%d leader=%d term=%d commit=%d applied=%d err=%v} "+
+				"publication={applied=%d version=%d conf=%v err=%v} authority={version=%d found=%t}",
+			index, cluster.inactive[index], status.MemberID, status.LeaderID, status.Term,
+			status.Commit, status.Applied, statusErr, publication.Applied,
+			publication.ReplicaSetVersion, publication.ConfState, publicationErr,
+			version, versionFound)
+	}
+	return result.String()
 }
 
 func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.OutboundMessage) {
