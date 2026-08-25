@@ -834,6 +834,7 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 	if got := collection.Stats().PrimaryLeafSplits; got == 0 {
 		t.Fatal("no leaf split fired across 600 padded inserts into one tablet")
 	}
+	assertLocalizedPrimarySplitRoutingBytes(t, collection.Stats())
 	if got := collection.Stats().PrimaryMacroSplitRequired; got != 0 {
 		t.Fatalf("unexpected macro-split at leaf scale: %d", got)
 	}
@@ -871,6 +872,29 @@ func TestFilePrimaryLeafSplitSignal(t *testing.T) {
 		buf[:0], []byte("seed"),
 	); readErr != nil || !ok || !bytes.Equal(got, []byte(`{"v":0}`)) {
 		t.Fatalf("seed readback across splits = %q,%v,%v", got, ok, readErr)
+	}
+}
+
+func assertLocalizedPrimarySplitRoutingBytes(t *testing.T, stats Stats) {
+	t.Helper()
+	if stats.PrimaryLeafSplits == 0 {
+		t.Fatal("localized routing-byte gate requires at least one leaf split")
+	}
+	// Every localized split replaces exactly one anchor, one locator, and one
+	// tablet root. Only a full 256-row anchor adds one new anchor page.
+	const base = uint64(storeio.SegmentedTabletRouterAnchorPageBytes +
+		storeio.GlobalTabletCatalogLocatorBytes +
+		storeio.GlobalTabletCatalogTabletBytes)
+	minStaged := stats.PrimaryLeafSplits * base
+	maxStaged := stats.PrimaryLeafSplits * (base + storeio.SegmentedTabletRouterAnchorPageBytes)
+	if got := stats.PrimaryStructuralRoutingStagedBytes; got < minStaged || got > maxStaged {
+		t.Fatalf("localized split routing staged bytes = %d, want [%d,%d] across %d splits",
+			got, minStaged, maxStaged, stats.PrimaryLeafSplits)
+	}
+	wantRetired := stats.PrimaryLeafSplits * base
+	if got := stats.PrimaryStructuralRoutingRetiredBytes; got != wantRetired {
+		t.Fatalf("localized split routing retired bytes = %d, want %d across %d splits",
+			got, wantRetired, stats.PrimaryLeafSplits)
 	}
 }
 

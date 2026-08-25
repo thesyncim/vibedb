@@ -1401,6 +1401,194 @@ func (v *GlobalTabletCatalogTabletRootView) RewriteHandle(
 	)
 }
 
+// InsertSplitLeaf performs the localized structural edit for one primary-leaf
+// split. It preserves every unaffected anchor byte-for-byte, rewrites the
+// locator and segmented root, and rewrites only the selected anchor plus one
+// new anchor when the selected page was full. The caller publishes all
+// returned images atomically through the surrounding tablet/catalog COW path.
+func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
+	rootDst, locatorDst, leftDst, rightDst []byte,
+	generation uint64,
+	route SegmentedTabletRouterRoute,
+	leftRef PageRef,
+	rightLocalID uint16,
+	rightFence []byte,
+	rightRef PageRef,
+	leftAnchorRef, rightAnchorRef PageRef,
+	locator *GlobalTabletCatalogLocatorView,
+	anchor *GlobalTabletCatalogAnchorView,
+) (SegmentedTabletRouterLeafSplitResult, error) {
+	var result SegmentedTabletRouterLeafSplitResult
+	if v == nil || locator == nil || anchor == nil || len(v.image) == 0 ||
+		len(locator.image) != GlobalTabletCatalogLocatorBytes ||
+		len(anchor.page.image) != SegmentedTabletRouterAnchorPageBytes ||
+		len(rootDst) < SegmentedTabletRouterRootBytes ||
+		len(locatorDst) < GlobalTabletCatalogLocatorBytes ||
+		len(leftDst) < SegmentedTabletRouterAnchorPageBytes ||
+		generation <= v.inner.generation || generation >= uint64(1)<<48 ||
+		locator.ref != v.locator || locator.tabletID != v.inner.tabletID ||
+		anchor.tabletID != v.inner.tabletID || anchor.locator != v.locator ||
+		anchor.page.pageID != route.PageID || rightLocalID >= TabletLocalIdentityLocalCount ||
+		len(rightFence) == 0 || len(rightFence) > CommonPrimaryLeafMaxKeyBytes {
+		return result, fmt.Errorf("%w: localized leaf split selection", ErrInvalidWrite)
+	}
+	currentRef, currentZone, ok := anchor.page.handleAt(route.RowSlot, route.Bucket)
+	tabletID, leftLocalID, bucketOK := SplitTabletLocalIdentityBucket(uint32(route.Bucket))
+	rightBucketU, rightBucketOK := MakeTabletLocalIdentityBucket(tabletID, uint32(rightLocalID))
+	_, _, rightState := locator.Resolve(rightLocalID)
+	if !ok || currentRef != route.Ref || !bucketOK || tabletID != v.inner.tabletID ||
+		!rightBucketOK || rightLocalID == uint16(leftLocalID) ||
+		rightState != GlobalTabletCatalogLocatorEmpty ||
+		leftRef.Generation != generation || rightRef.Generation != generation ||
+		segmentedTabletRouterValidateLeafRef(leftRef, route.Bucket, v.inner.leafKind, generation) != nil ||
+		segmentedTabletRouterValidateLeafRef(rightRef, BucketID(rightBucketU), v.inner.leafKind, generation) != nil {
+		return result, fmt.Errorf("%w: localized leaf split identity", ErrInvalidWrite)
+	}
+	sourceRank := -1
+	for rank := 0; rank < int(anchor.page.count); rank++ {
+		if anchor.page.ranks[rank] == route.RowSlot {
+			sourceRank = rank
+			break
+		}
+	}
+	if sourceRank < 0 {
+		return result, fmt.Errorf("%w: localized leaf split rank", ErrInvalidWrite)
+	}
+	leftFloor := anchor.page.fenceAt(sourceRank)
+	if segmentedTabletRouterCompareFences(leftFloor, segmentedTabletRouterFence{a: rightFence}) >= 0 ||
+		sourceRank+1 < int(anchor.page.count) &&
+			segmentedTabletRouterCompareFences(segmentedTabletRouterFence{a: rightFence}, anchor.page.fenceAt(sourceRank+1)) >= 0 {
+		return result, fmt.Errorf("%w: localized leaf split fence", ErrInvalidWrite)
+	}
+
+	count := int(anchor.page.count) + 1
+	insertRank := sourceRank + 1
+	type splitRow struct {
+		fence segmentedTabletRouterFence
+		local uint16
+		ref   PageRef
+		zone  BucketZone
+	}
+	rowAt := func(rank int) splitRow {
+		if rank == insertRank {
+			return splitRow{fence: segmentedTabletRouterFence{a: rightFence}, local: rightLocalID, ref: rightRef}
+		}
+		oldRank := rank
+		if rank > insertRank {
+			oldRank--
+		}
+		slot := anchor.page.ranks[oldRank]
+		localID := binary.LittleEndian.Uint16(anchor.page.localIDs[int(slot)*2:])
+		bucketU, _ := MakeTabletLocalIdentityBucket(tabletID, uint32(localID))
+		ref, zone, _ := anchor.page.handleAt(slot, BucketID(bucketU))
+		if oldRank == sourceRank {
+			ref, zone = leftRef, currentZone
+		}
+		return splitRow{fence: anchor.page.fenceAt(oldRank), local: localID, ref: ref, zone: zone}
+	}
+	encodeRange := func(dst []byte, pageID uint8, first, last int) error {
+		header := SegmentedTabletRouterHeader{
+			StoreID: v.inner.storeID, TabletID: tabletID, Generation: generation,
+			AnchorKind: v.inner.anchorKind, LeafKind: v.inner.leafKind,
+		}
+		_, err := segmentedTabletRouterEncodeAnchor(
+			dst, header, pageID, last-first,
+			func(rank int) segmentedTabletRouterFence { return rowAt(first + rank).fence },
+			func(rank int) (uint8, uint16, PageRef, BucketZone) {
+				row := rowAt(first + rank)
+				return uint8(rank), row.local, row.ref, row.zone
+			},
+		)
+		return err
+	}
+
+	leftPageID := route.PageID
+	pageCount := v.inner.pageCount
+	rightPageID := leftPageID
+	splitRank := count
+	if count > SegmentedTabletRouterRowsPerPage {
+		if pageCount >= SegmentedTabletRouterMaxPages ||
+			len(rightDst) < SegmentedTabletRouterAnchorPageBytes {
+			return result, fmt.Errorf("%w: localized leaf split anchor capacity", ErrInvalidWrite)
+		}
+		rightPageID = pageCount
+		pageCount++
+		splitRank = count / 2
+	}
+	if leftAnchorRef.Generation != generation ||
+		segmentedTabletRouterValidateAnchorRefIdentity(leftAnchorRef, tabletID, generation, leftPageID) != nil ||
+		rightPageID != leftPageID && (rightAnchorRef.Generation != generation ||
+			segmentedTabletRouterValidateAnchorRefIdentity(rightAnchorRef, tabletID, generation, rightPageID) != nil) {
+		return result, fmt.Errorf("%w: localized leaf split anchor refs", ErrInvalidWrite)
+	}
+	if err := encodeRange(leftDst, leftPageID, 0, splitRank); err != nil {
+		return result, err
+	}
+	if rightPageID != leftPageID {
+		if err := encodeRange(rightDst, rightPageID, splitRank, count); err != nil {
+			return result, err
+		}
+	}
+
+	locatorImage := locatorDst[:GlobalTabletCatalogLocatorBytes]
+	copy(locatorImage, locator.image)
+	binary.LittleEndian.PutUint64(locatorImage[24:32], generation)
+	payload := locatorImage[PageHeaderSize:]
+	binary.LittleEndian.PutUint16(payload[8:10], locator.live+1)
+	packed := payload[GlobalTabletCatalogLocatorHeader:]
+	for rank := 0; rank < count; rank++ {
+		row := rowAt(rank)
+		pageID, slot := leftPageID, rank
+		if rightPageID != leftPageID && rank >= splitRank {
+			pageID, slot = rightPageID, rank-splitRank
+		}
+		globalTabletCatalogPut14(
+			packed, row.local,
+			uint16(GlobalTabletCatalogLocatorLive)<<12|uint16(pageID)<<8|uint16(slot),
+		)
+	}
+	if _, err := sealInitializedPage(locatorImage); err != nil {
+		return result, err
+	}
+
+	root := rootDst[:SegmentedTabletRouterRootBytes]
+	if rightPageID == leftPageID {
+		copy(root, v.inner.root)
+		binary.LittleEndian.PutUint64(root[24:32], generation)
+		binary.LittleEndian.PutUint32(root[36:40], PageChecksum(locatorImage))
+		segmentedTabletRouterEncodeAnchorRef(
+			root[segmentedTabletRouterRootRefsAt+int(leftPageID)*segmentedTabletRouterRootRefBytes:],
+			leftAnchorRef,
+		)
+		segmentedTabletRouterSeal(root, segmentedTabletRouterRootTrailerAt)
+	} else {
+		router := v.inner.segmentedView()
+		if err := router.encodeSplitRoot(
+			root, locatorImage,
+			SegmentedTabletRouterHeader{
+				StoreID: v.inner.storeID, TabletID: tabletID, Generation: generation,
+				AnchorKind: v.inner.anchorKind, LeafKind: v.inner.leafKind,
+			},
+			leftPageID, rightPageID, rowAt(splitRank).fence,
+			leftAnchorRef, rightAnchorRef,
+		); err != nil {
+			return result, err
+		}
+	}
+	bytes := SegmentedTabletRouterRootBytes + GlobalTabletCatalogLocatorBytes + SegmentedTabletRouterAnchorPageBytes
+	result = SegmentedTabletRouterLeafSplitResult{
+		Root: root, Locator: locatorImage,
+		LeftPage:   leftDst[:SegmentedTabletRouterAnchorPageBytes],
+		LeftPageID: leftPageID, RightPageID: rightPageID,
+		PageCount: pageCount, Bytes: bytes,
+	}
+	if rightPageID != leftPageID {
+		result.RightPage = rightDst[:SegmentedTabletRouterAnchorPageBytes]
+		result.Bytes += SegmentedTabletRouterAnchorPageBytes
+	}
+	return result, nil
+}
+
 // RewriteAnchorHandles writes one anchor after-image containing every listed
 // stable-row leaf replacement. All rewrites must select the supplied anchor;
 // the tablet root itself is rewritten separately by RewriteAnchorRefs.
