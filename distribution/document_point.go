@@ -115,6 +115,7 @@ func (p *DocumentPointProgram) Point(
 	root := index.Root()
 	workspace.text = workspace.text[:0]
 	scalars := workspace.scalars[:len(p.pointers)]
+	defer workspace.releaseScalars()
 	for ordinal, pointer := range p.pointers {
 		node, found, pointerErr := root.PointerCompiled(pointer)
 		if pointerErr != nil {
@@ -167,4 +168,8 @@ func (p *DocumentPointProgram) Point(
 		}
 	}
 	return p.mapper.PointFor(scalars)
+}
+
+func (workspace *DocumentPointWorkspace) releaseScalars() {
+	clear(workspace.scalars[:])
 }

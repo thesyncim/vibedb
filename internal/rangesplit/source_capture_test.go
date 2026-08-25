@@ -94,14 +94,14 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	var readWorkspace SourceCaptureWorkspace
 	entry, ok, err := capture.NextTailEntry(cursor, &readWorkspace)
 	if err != nil || !ok || len(entry.Transitions) != 1 ||
-		entry.Transitions[0].Before != nil ||
+		entry.Transitions[0].BeforeWitness.Present ||
 		!bytes.Equal(entry.Transitions[0].After, left) {
 		t.Fatalf("insert entry=%+v ok=%v err=%v", entry, ok, err)
 	}
 	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
 	entry, ok, err = capture.NextTailEntry(cursor, &readWorkspace)
 	if err != nil || !ok || len(entry.Transitions) != 1 ||
-		!bytes.Equal(entry.Transitions[0].Before, left) ||
+		!exactBeforeWitness(partitioner, entry.Transitions[0].BeforeWitness, left) ||
 		!bytes.Equal(entry.Transitions[0].After, right) {
 		t.Fatalf("move entry=%+v ok=%v err=%v", entry, ok, err)
 	}
@@ -138,7 +138,8 @@ func TestSourceCaptureAtomicallyFollowsApplyAndRecovers(t *testing.T) {
 	}
 	entry, ok, err = recovered.NextTailEntry(cursor, &readWorkspace)
 	if err != nil || !ok || len(entry.Transitions) != 1 ||
-		!bytes.Equal(entry.Transitions[0].Before, right) || entry.Transitions[0].After != nil {
+		!exactBeforeWitness(partitioner, entry.Transitions[0].BeforeWitness, right) ||
+		entry.Transitions[0].After != nil {
 		t.Fatalf("delete entry=%+v ok=%v err=%v", entry, ok, err)
 	}
 	cursor = translateCapturedEntry(t, partitioner, cursor, entry)
@@ -301,7 +302,64 @@ func TestSourceCaptureBinaryFormatBoundsAliasesAndAllocations(t *testing.T) {
 		logicalBytes, len(raw), float64(len(raw))/float64(logicalBytes))
 }
 
-func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
+func TestMaximumSourceCaptureRecordBytesExactAndBounded(t *testing.T) {
+	got, err := MaximumSourceCaptureRecordBytes(3, 11, 101, 211)
+	want := sourceCaptureEntryFixedBytes +
+		3*sourceCaptureTransitionHeaderBytes + 211
+	if err != nil || got != want {
+		t.Fatalf("maximum record bytes = %d,%v; want %d", got, err, want)
+	}
+	for _, limits := range [][4]int{
+		{}, {0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 0},
+		{math.MaxInt, 2, 1, 1}, {math.MaxInt, 1, 2, 1},
+		{1, 1, 1, math.MaxInt},
+	} {
+		if _, err := MaximumSourceCaptureRecordBytes(
+			limits[0], limits[1], limits[2], limits[3],
+		); !errors.Is(err, ErrSourceCapture) {
+			t.Fatalf("limits %v error = %v, want ErrSourceCapture", limits, err)
+		}
+	}
+	capped, err := MaximumSourceCaptureRecordBytes(3, 11, 101, replication.MaxCommandBytes+1)
+	if want := sourceCaptureEntryFixedBytes + 3*sourceCaptureTransitionHeaderBytes +
+		3*(11+101); err != nil || capped != want {
+		t.Fatalf("command-capped maximum = %d,%v; want %d", capped, err, want)
+	}
+	commandCapped, err := MaximumSourceCaptureRecordBytes(
+		replicatedstate.MaxDistinctMutations, replication.MaxMutationKeyBytes,
+		replication.MaxMutationValueBytes, replication.MaxCommandBytes+1,
+	)
+	if want := sourceCaptureEntryFixedBytes +
+		int(replicatedstate.MaxDistinctMutations)*sourceCaptureTransitionHeaderBytes +
+		replication.MaxCommandBytes; err != nil || commandCapped != want {
+		t.Fatalf("command ceiling = %d,%v; want %d", commandCapped, err, want)
+	}
+	for _, bounds := range []replicatedstate.TransitionCaptureBounds{
+		{Transitions: 3, KeyBytes: 211},
+		{Transitions: 3, KeyBytes: 11, AfterBytes: 200},
+		{Transitions: 3, BeforeBytes: 3 * 101, AfterBytes: 211},
+	} {
+		exact, exactErr := (&SourceCapture{}).MaxEncodedBytes(bounds)
+		if exactErr != nil || exact > got {
+			t.Fatalf("actual bound %+v = %d,%v exceeds provision %d", bounds, exact, exactErr, got)
+		}
+	}
+}
+
+func TestMaximumSourceCaptureRecordBytesMatchesArtifactHostileBound(t *testing.T) {
+	got, err := MaximumSourceCaptureRecordBytes(
+		replicatedstate.MaxDistinctMutations,
+		replication.MaxMutationKeyBytes,
+		replication.MaxMutationValueBytes,
+		replication.MaxCommandBytes,
+	)
+	if err != nil || got != replicatedstate.MaxTransitionCaptureRecordBytes {
+		t.Fatalf("hostile capture bound = %d, %v; want %d", got, err,
+			replicatedstate.MaxTransitionCaptureRecordBytes)
+	}
+}
+
+func TestSourceCaptureBinaryPhysicalBytesExcludeBeforePayload(t *testing.T) {
 	for _, documentBytes := range []int{256, 1 << 10, 8 << 10} {
 		t.Run(fmt.Sprintf("documents_%d", documentBytes), func(t *testing.T) {
 			partitioner, err := NewPartitioner(
@@ -326,7 +384,15 @@ func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := sizedSourceCaptureDocument(documentBytes, 'a')
-			after := sizedSourceCaptureDocument(documentBytes, 'b')
+			after := sizedSourceCaptureDocument(128, 'b')
+			before, err = vibejson.AppendCanonicalize(nil, before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err = vibejson.AppendCanonicalize(nil, after)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if _, err := fixture.machine.ApplyNormal(
 				sourceCaptureMeta(3), fixture.command(2, replication.Mutation{
 					Kind: replication.MutationPut, Key: []byte("row"), Value: before,
@@ -347,7 +413,7 @@ func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
 			if err != nil || !found {
 				t.Fatalf("read found=%v err=%v", found, err)
 			}
-			logical := len("row") + len(before) + len(after)
+			logical := len("row") + len(after)
 			wantPhysical := logical + sourceCaptureEntryFixedBytes +
 				sourceCaptureTransitionHeaderBytes
 			bound, err := capture.MaxEncodedBytes(replicatedstate.TransitionCaptureBounds{
@@ -362,9 +428,11 @@ func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
 			}
 			record, err := capture.decodeEntry(raw, &SourceCaptureWorkspace{})
 			if err != nil || len(record.Transitions) != 1 ||
-				!bytes.Equal(record.Transitions[0].Before, before) ||
+				!exactBeforeWitness(partitioner, record.Transitions[0].BeforeWitness, before) ||
 				!bytes.Equal(record.Transitions[0].After, after) {
-				t.Fatalf("round trip transitions=%d err=%v", len(record.Transitions), err)
+				t.Fatalf("round trip transitions=%d witness=%+v before=%d after=%d err=%v",
+					len(record.Transitions), record.Transitions[0].BeforeWitness,
+					len(before), len(after), err)
 			}
 			t.Logf("source capture bytes: before=%d after=%d logical=%d physical=%d ratio=%.3f",
 				len(before), len(after), logical, len(raw), float64(len(raw))/float64(logical))
@@ -373,7 +441,7 @@ func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
 }
 
 func sizedSourceCaptureDocument(size int, fill byte) []byte {
-	prefix := []byte(`{"payload":"`)
+	prefix := []byte(`{"tenant":"acme","sequence":8,"payload":"`)
 	suffix := []byte(`"}`)
 	document := make([]byte, 0, size)
 	document = append(document, prefix...)
@@ -398,7 +466,8 @@ func TestSourceCaptureBinaryMultipleTransitionsAndWorkspaceRelease(t *testing.T)
 		t.Fatalf("multi-transition bytes=%d want=%d", len(raw), wantBytes)
 	}
 	for index, transition := range capture.encode.transitions[:cap(capture.encode.transitions)] {
-		if transition.Key != nil || transition.Before != nil || transition.After != nil {
+		if transition.Key != nil || transition.Before != nil ||
+			transition.BeforeWitness != (TailBeforeWitness{}) || transition.After != nil {
 			t.Fatalf("encoder retained transition %d: %+v", index, transition)
 		}
 	}
@@ -413,7 +482,8 @@ func TestSourceCaptureBinaryMultipleTransitionsAndWorkspaceRelease(t *testing.T)
 		afterBytes := int(binary.LittleEndian.Uint32(header[12:16]))
 		cursor += sourceCaptureTransitionHeaderBytes
 		keyOffsets = append(keyOffsets, cursor)
-		cursor += keyBytes + beforeBytes + afterBytes
+		_ = beforeBytes
+		cursor += keyBytes + afterBytes
 		frameEnds = append(frameEnds, cursor)
 	}
 
@@ -434,7 +504,8 @@ func TestSourceCaptureBinaryMultipleTransitionsAndWorkspaceRelease(t *testing.T)
 		if index == 0 {
 			continue
 		}
-		if transition.Key != nil || transition.Before != nil || transition.After != nil {
+		if transition.Key != nil || transition.Before != nil ||
+			transition.BeforeWitness != (TailBeforeWitness{}) || transition.After != nil {
 			t.Fatalf("decoder retained stale transition %d: %+v", index, transition)
 		}
 	}
@@ -448,6 +519,59 @@ func TestSourceCaptureBinaryMultipleTransitionsAndWorkspaceRelease(t *testing.T)
 	copy(outOfOrder[216:248], digest[:])
 	if _, err := capture.decodeEntry(outOfOrder, &SourceCaptureWorkspace{}); !errors.Is(err, ErrSourceCapture) {
 		t.Fatalf("out-of-order transitions with valid digest error=%v", err)
+	}
+}
+
+func TestSourceCaptureLateWitnessFailureReleasesBorrowedMutations(t *testing.T) {
+	partitioner, err := NewPartitioner(
+		testSplitPlan(t, "node-b"), "docs", []string{"/tenant", "/sequence"},
+		distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSourceCaptureFixture(t, partitioner)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	fixture.clientEpoch = fixture.openSession(t, 2, []byte("tenant"), sourceCaptureID(20))
+	valid := documentForChild(t, partitioner, 0)
+	invalid, canonicalErr := vibejson.AppendCanonicalize(
+		nil, []byte(`{"payload":"valid-json-without-placement-columns"}`),
+	)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	if _, err := fixture.machine.ApplyNormal(
+		sourceCaptureMeta(3), fixture.command(2,
+			replication.Mutation{Kind: replication.MutationPut, Key: []byte("a"), Value: valid},
+			replication.Mutation{Kind: replication.MutationPut, Key: []byte("b"), Value: invalid},
+		),
+	); err != nil {
+		t.Fatal(err)
+	}
+	after := documentForChild(t, partitioner, 1)
+	capture, err := NewSourceCapture(partitioner, "split-capture", fixture.capture)
+	if err != nil || fixture.machine.BeginTransitionCapture(capture) != nil {
+		t.Fatal(err)
+	}
+	_, err = fixture.machine.ApplyNormal(
+		sourceCaptureMeta(4), fixture.command(3,
+			replication.Mutation{Kind: replication.MutationPut, Key: []byte("a"), Value: after},
+			replication.Mutation{Kind: replication.MutationPut, Key: []byte("b"), Value: valid},
+		),
+	)
+	if !errors.Is(err, ErrSourceCapture) && !errors.Is(err, replicatedstate.ErrTransitionCapture) {
+		t.Fatalf("late placement error=%v", err)
+	}
+	if len(capture.encode.transitions) != 0 || capture.encode.record.Transitions != nil {
+		t.Fatalf("retained active transitions after error: %+v", capture.encode.transitions)
+	}
+	for index, transition := range capture.encode.transitions[:cap(capture.encode.transitions)] {
+		if transition.Key != nil || transition.Before != nil || transition.After != nil ||
+			transition.BeforeWitness != (TailBeforeWitness{}) {
+			t.Fatalf("retained borrowed transition %d after error: %+v", index, transition)
+		}
 	}
 }
 
@@ -557,18 +681,76 @@ func TestSourceCaptureBinaryRejectsTruncationAndNoncanonicalFrames(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertWitnessRejected := func(
+		name string,
+		decoder *SourceCapture,
+		witness TailBeforeWitness,
+	) {
+		t.Run(name, func(t *testing.T) {
+			candidate := bytes.Clone(entry)
+			header := candidate[sourceCaptureEntryFixedBytes : sourceCaptureEntryFixedBytes+sourceCaptureTransitionHeaderBytes]
+			if witness.Present {
+				header[0] |= sourceCaptureBeforePresent
+			} else {
+				header[0] &^= sourceCaptureBeforePresent
+			}
+			binary.LittleEndian.PutUint32(header[8:12], witness.DocumentBytes)
+			copy(header[16:24], witness.Point[:])
+			copy(header[24:56], witness.Digest[:])
+			candidateRecord := record
+			candidateRecord.Transitions = append([]TailTransition(nil), record.Transitions...)
+			candidateRecord.Transitions[0].BeforeWitness = witness
+			var hashWorkspace SourceCaptureWorkspace
+			digest := decoder.hashEntry(&candidateRecord, &hashWorkspace)
+			copy(candidate[216:248], digest[:])
+			if _, err := decoder.decodeEntry(candidate, &SourceCaptureWorkspace{}); !errors.Is(err, ErrSourceCapture) {
+				t.Fatalf("validly checksummed malformed witness error=%v", err)
+			}
+		})
+	}
+	assertWitnessRejected("absent_nonzero_point", capture, TailBeforeWitness{
+		Point: distribution.KeyspacePoint{1},
+	})
+	assertWitnessRejected("absent_nonzero_digest", capture, TailBeforeWitness{
+		Digest: [sha256.Size]byte{1},
+	})
+	assertWitnessRejected("present_zero_length", capture, TailBeforeWitness{
+		Present: true, Point: distribution.KeyspacePoint{1}, Digest: [sha256.Size]byte{1},
+	})
+	assertWitnessRejected("present_zero_digest", capture, TailBeforeWitness{
+		Present: true, Point: distribution.KeyspacePoint{1}, DocumentBytes: 1,
+	})
+	partialPartitioner, partialErr := NewPartitioner(
+		testSplitPlanWithNeighbor(t, "node-c"), "docs", []string{"/tenant", "/sequence"},
+		distribution.DefaultVirtualBucketBits,
+	)
+	if partialErr != nil {
+		t.Fatal(partialErr)
+	}
+	partialCapture, partialErr := NewSourceCapture(
+		partialPartitioner, "split-capture", capture.target.Collection,
+	)
+	if partialErr != nil {
+		t.Fatal(partialErr)
+	}
+	assertWitnessRejected("present_outside_source", partialCapture, TailBeforeWitness{
+		Present: true, Point: distribution.KeyspacePoint{0x80}, DocumentBytes: 1,
+		Digest: [sha256.Size]byte{1},
+	})
 	invalidDocument := bytes.Clone(entry)
 	transitionHeader := invalidDocument[sourceCaptureEntryFixedBytes:]
 	keyBytes := int(binary.LittleEndian.Uint32(transitionHeader[4:8]))
 	beforeBytes := int(binary.LittleEndian.Uint32(transitionHeader[8:12]))
 	afterBytes := int(binary.LittleEndian.Uint32(transitionHeader[12:16]))
 	afterStart := sourceCaptureEntryFixedBytes + sourceCaptureTransitionHeaderBytes +
-		keyBytes + beforeBytes
+		keyBytes
+	_ = beforeBytes
 	invalidDocument[afterStart] = 'x'
 	badRecord := record
 	badRecord.Transitions = []TailTransition{{
-		Key:   invalidDocument[sourceCaptureEntryFixedBytes+sourceCaptureTransitionHeaderBytes : sourceCaptureEntryFixedBytes+sourceCaptureTransitionHeaderBytes+keyBytes],
-		After: invalidDocument[afterStart : afterStart+afterBytes],
+		Key:           invalidDocument[sourceCaptureEntryFixedBytes+sourceCaptureTransitionHeaderBytes : sourceCaptureEntryFixedBytes+sourceCaptureTransitionHeaderBytes+keyBytes],
+		BeforeWitness: record.Transitions[0].BeforeWitness,
+		After:         invalidDocument[afterStart : afterStart+afterBytes],
 	}}
 	var hashWorkspace SourceCaptureWorkspace
 	digest := capture.hashEntry(&badRecord, &hashWorkspace)
@@ -576,8 +758,8 @@ func TestSourceCaptureBinaryRejectsTruncationAndNoncanonicalFrames(t *testing.T)
 	if _, err := capture.decodeEntry(invalidDocument, &SourceCaptureWorkspace{}); !errors.Is(err, ErrSourceCapture) {
 		t.Fatalf("invalid embedded document with valid digest error=%v", err)
 	}
-	if _, err := capture.decodeEntry([]byte(`[2,"legacy-json"]`), &SourceCaptureWorkspace{}); !errors.Is(err, ErrSourceCapture) {
-		t.Fatalf("legacy JSON error=%v", err)
+	if _, err := capture.decodeEntry([]byte(`[2,"json-envelope"]`), &SourceCaptureWorkspace{}); !errors.Is(err, ErrSourceCapture) {
+		t.Fatalf("JSON envelope error=%v", err)
 	}
 }
 
@@ -887,14 +1069,19 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations,
+		sourceCaptureRetryWindow,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	options := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
-			MaxDocuments: max(
-				user.Limits.MaxDistinctMutations+4,
-				int(sourceCaptureRetryWindow)+3,
-			),
-			MaxBytes: 64 << 20,
+			MaxDocuments:   maxDocuments,
+			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128,
 		RetryWindow: sourceCaptureRetryWindow,
@@ -1020,4 +1207,16 @@ func translateCapturedEntry(
 		t.Fatal(err)
 	}
 	return next
+}
+
+func exactBeforeWitness(
+	partitioner *Partitioner,
+	witness TailBeforeWitness,
+	document []byte,
+) bool {
+	var workspace distribution.DocumentPointWorkspace
+	point, err := partitioner.program.Point(document, &workspace)
+	return err == nil && witness.Present && witness.Point == point &&
+		witness.DocumentBytes == uint32(len(document)) &&
+		witness.Digest == sha256.Sum256(document)
 }

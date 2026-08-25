@@ -34,10 +34,15 @@ const (
 	// sealed RF3 learner, promotion, removal, and leader-transfer operation set.
 	// It grants no data, schema, or delegation authority.
 	CapabilityMembership
+	// CapabilityTopology permits replicated catalog publication and split/move
+	// operation journal access. It is deliberately separate from DataWrite: a
+	// data writer cannot acquire routing or controller authority merely because
+	// the catalog is stored in an ordinary replicated relation.
+	CapabilityTopology
 )
 
 const AllCapabilities = CapabilityDataRead | CapabilityDataWrite | CapabilitySchema |
-	CapabilityDelegate | CapabilityMembership
+	CapabilityDelegate | CapabilityMembership | CapabilityTopology
 
 func (capability Capability) Valid() bool {
 	return capability != 0 && capability&^AllCapabilities == 0

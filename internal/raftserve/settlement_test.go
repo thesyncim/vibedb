@@ -207,7 +207,7 @@ func testCompletion(
 		t.Fatal(err)
 	}
 	return replicatedstate.CompletionLookup{
-		Key:   replicatedstate.SessionKey(command.Tenant, command.ClientID),
+		Key:   replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
 		Bytes: encoded, AppliedSequence: applied,
 	}
 }

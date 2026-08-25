@@ -419,6 +419,16 @@ and retry. Explicit child-resume open remains fail-closed across missing,
 seed-only, and final-certificate crash intervals; ordinary open cannot treat a
 missing active certificate as a fresh image.
 
+Replicated catalog and split/move journal traffic uses the distinct
+`topology` authorization capability. The fixed capability is carried by every
+probe, linearizable read, proposal, and byte-identical retry, and the topology
+class is also authenticated inside the canonical replicated command bytes. An
+ordinary `data_write` principal therefore cannot relabel or construct a
+catalog command even when it can reach the same RF3 endpoint. Authenticated
+gateways must grant their internal TLS identity `delegate`, `data_read`,
+`data_write`, and `topology`; capability zero remains valid only on the
+explicit loopback development transport.
+
 The child WAL is not allocated twice. A validated immutable member identity
 provides the planned SQL binding before the WAL exists. After activation, the
 WAL builder checks the live apply cut, artifact manifest, snapshot-base state,

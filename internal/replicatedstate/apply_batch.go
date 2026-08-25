@@ -322,7 +322,7 @@ func (m *Machine) ApplyNormalBatch(
 				deferredErr = ErrWrongBinding
 				break
 			}
-			sessionDigest := SessionKey(command.Tenant, command.ClientID)
+			sessionDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
 			seen := false
 			for selected := 0; selected < selectedSessions; selected++ {
 				if selectedSessionDigests[selected] == sessionDigest {
@@ -516,6 +516,7 @@ func (m *Machine) nextBatchState(
 		SessionCount:          current.SessionCount,
 		SessionSlotCount:      current.SessionSlotCount,
 		SessionEpochHighWater: current.SessionEpochHighWater,
+		AuthorityBindingCount: current.AuthorityBindingCount,
 	}
 }
 
@@ -528,6 +529,11 @@ func (m *Machine) recordBatchPlan(
 	}
 	if plan.writeSession {
 		if err := batch.system.record(plan.sessionKey[:], plan.sessionRecord, false); err != nil {
+			return err
+		}
+	}
+	if plan.writeAuthority {
+		if err := batch.system.record(plan.authorityKey[:], plan.authorityRecord, false); err != nil {
 			return err
 		}
 	}

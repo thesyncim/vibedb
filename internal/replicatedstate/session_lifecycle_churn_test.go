@@ -21,7 +21,7 @@ const sessionLifecycleChurnFileCeiling = uint64(4 << 20)
 // TestSessionLifecycleChurnRetainsOnlyTheConfiguredRing fills the retry ring,
 // releases it, closes every durable handle, and reconstructs the machine from
 // disk repeatedly. Operation count and reopen count never become retained-row
-// dimensions: a live identity owns exactly state+header+R rows, and an exact
+// dimensions: a live identity owns exactly state+authority+header+R rows, and an exact
 // release leaves only the state row and its epoch high-water fence.
 func TestSessionLifecycleChurnRetainsOnlyTheConfiguredRing(t *testing.T) {
 	for _, tc := range []struct {
@@ -77,7 +77,7 @@ func TestSessionLifecycleChurnRetainsOnlyTheConfiguredRing(t *testing.T) {
 				if capacity.SessionCount != 1 ||
 					capacity.SessionSlotCount != uint64(tc.window) ||
 					capacity.SessionEpochHighWater != token ||
-					store.system.Collection.Len() != uint64(tc.window)+2 {
+					store.system.Collection.Len() != uint64(tc.window)+3 {
 					t.Fatalf("saturated cycle %d = %+v rows=%d, want one R=%d ring",
 						cycle, capacity, store.system.Collection.Len(), tc.window)
 				}
@@ -94,7 +94,7 @@ func TestSessionLifecycleChurnRetainsOnlyTheConfiguredRing(t *testing.T) {
 				}
 				if capacity.SessionCount != 0 || capacity.SessionSlotCount != 0 ||
 					capacity.SessionEpochHighWater != token ||
-					store.system.Collection.Len() != 1 {
+					store.system.Collection.Len() != 2 {
 					t.Fatalf("released cycle %d = %+v rows=%d, want fence-only image",
 						cycle, capacity, store.system.Collection.Len())
 				}
@@ -134,7 +134,7 @@ func TestSessionLifecycleChurnRetainsOnlyTheConfiguredRing(t *testing.T) {
 				if capacity.Applied != releaseIndex || capacity.SessionCount != 0 ||
 					capacity.SessionSlotCount != 0 ||
 					capacity.SessionEpochHighWater != token ||
-					store.system.Collection.Len() != 1 {
+					store.system.Collection.Len() != 2 {
 					t.Fatalf("reopened cycle %d = %+v rows=%d, want exact released cut",
 						cycle, capacity, store.system.Collection.Len())
 				}
@@ -177,9 +177,9 @@ func assertLifecycleRowsBounded(
 	window uint16,
 ) {
 	t.Helper()
-	if rows := store.system.Collection.Len(); rows > uint64(window)+2 {
-		t.Fatalf("retained system rows = %d, exceed state+header+window = %d",
-			rows, uint64(window)+2)
+	if rows := store.system.Collection.Len(); rows > uint64(window)+3 {
+		t.Fatalf("retained system rows = %d, exceed state+authority+header+window = %d",
+			rows, uint64(window)+3)
 	}
 }
 
@@ -205,7 +205,7 @@ func newPersistentSessionLifecycleStore(
 	window uint16,
 ) *persistentSessionLifecycleStore {
 	t.Helper()
-	systemDocuments := max(3, int(window)+2)
+	systemDocuments := max(4, int(window)+2)
 	store := &persistentSessionLifecycleStore{
 		dir:           t.TempDir(),
 		systemOptions: durable.Options{OpaqueValues: true, MaxBatchDocuments: systemDocuments},
@@ -218,7 +218,7 @@ func newPersistentSessionLifecycleStore(
 	store.machineOptions = Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 2,
-			MaxDocuments:   max(systemDocuments, 67),
+			MaxDocuments:   max(systemDocuments, 68),
 			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 1,

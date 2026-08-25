@@ -2,6 +2,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -19,7 +20,7 @@ func TestSessionHashCollisionIsCorruptionNotTupleConflict(t *testing.T) {
 	}
 	command := encodeCommand(t, commandValue(fixture.binding, 1))
 	view, _ := replication.OpenCommand(command)
-	digest := SessionKey(view.Tenant, view.ClientID)
+	digest := SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)
 	key := SessionStorageKey(digest)
 	foreign, err := AppendSessionRecord(nil, SessionRecord{
 		Tenant: []byte("foreign"), ClientID: id128(91), ClientEpoch: 1,
@@ -69,6 +70,37 @@ func TestSessionIdentityCapacityRefusesWithoutPoisoning(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsPersistedAuthorityCountAboveConfiguredBoundBeforeRows(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	state := fixture.machine.state
+	state.Applied = MaxRetainedSessions + 1
+	state.LastTerm = 2
+	state.LastKind = RecordNormal
+	state.LastEntryType = normalMeta(state.Applied).Type
+	state.LastEntryDigest = sha256.Sum256([]byte("hostile-authority-count"))
+	state.AuthorityBindingCount = MaxRetainedSessions
+	envelope, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		return batch.Put(stateKey, envelope)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	options := fixture.machine.options
+	options.MaxSessions = 1
+	if _, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, options,
+	); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("authority count above configured bound err=%v, want ErrStateCorrupt", err)
+	}
+}
+
 func TestPointPathsRejectSessionRetirementMismatch(t *testing.T) {
 	tests := []struct {
 		name string
@@ -97,7 +129,7 @@ func TestPointPathsRejectSessionRetirementMismatch(t *testing.T) {
 			if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 				t.Fatal(err)
 			}
-			digest := SessionKey(view.Tenant, view.ClientID)
+			digest := SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)
 			rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 				binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
 			})
@@ -367,7 +399,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
 			t.Fatal(err)
 		}
-		digest := SessionKey(view.Tenant, view.ClientID)
+		digest := SessionKey(view.AuthorityClass, view.Tenant, view.ClientID)
 		key := SessionStorageKey(digest)
 		raw, found, err := fixture.system.Collection.AppendRaw(nil, key[:])
 		if err != nil || !found {
@@ -406,7 +438,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		digest := SessionKey([]byte("tenant"), id128(77))
+		digest := SessionKey(replication.CommandAuthorityData, []byte("tenant"), id128(77))
 		rewriteSessionSlot(t, fixture, digest, 0, func(raw []byte) {
 			binary.LittleEndian.PutUint64(raw[60:68], 1)
 		})
@@ -429,7 +461,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		digest := SessionKey([]byte("tenant"), id128(77))
+		digest := SessionKey(replication.CommandAuthorityData, []byte("tenant"), id128(77))
 		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 			binary.LittleEndian.PutUint64(raw[68:76], 4)
 		})
@@ -468,7 +500,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 		if _, err := fixture.machine.ApplyNormal(normalMeta(5), encoded); err != nil {
 			t.Fatal(err)
 		}
-		digest := SessionKey([]byte("tenant"), id128(77))
+		digest := SessionKey(replication.CommandAuthorityData, []byte("tenant"), id128(77))
 		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 			binary.LittleEndian.PutUint64(raw[176:184], transition.ToRouteGeneration)
 		})
@@ -491,7 +523,7 @@ func TestOpenDetectsStateLogicalCountAndSessionCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		digest := SessionKey([]byte("tenant"), id128(77))
+		digest := SessionKey(replication.CommandAuthorityData, []byte("tenant"), id128(77))
 		rewriteSessionSlot(t, fixture, digest, 1, func(raw []byte) {
 			binary.LittleEndian.PutUint32(raw[140:144], ResultSessionRetired)
 		})
@@ -649,7 +681,7 @@ func putCraftedSession(
 	result uint32,
 ) {
 	t.Helper()
-	digest := SessionKey(command.Tenant, command.ClientID)
+	digest := SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	sessionKey := SessionStorageKey(digest)
 	openSlotKey, err := SessionSlotStorageKey(digest, 0)
 	if err != nil {
@@ -662,7 +694,8 @@ func putCraftedSession(
 	}
 	header, err := AppendSessionRecord(nil, SessionRecord{
 		Tenant: command.Tenant, ClientID: command.ClientID,
-		ClientEpoch: command.ClientEpoch, RetryHome: command.RetryHome,
+		AuthorityClass: command.AuthorityClass,
+		ClientEpoch:    command.ClientEpoch, RetryHome: command.RetryHome,
 		HighSequence: command.ClientSequence, Status: SessionActive,
 		LeaseDeadlineUnixNano: testSessionLeaseDeadlineUnixNano,
 		RetryWindow:           fixture.machine.options.RetryWindow, PhysicalSlotCount: slotIndex + 1,
@@ -718,8 +751,17 @@ func putCraftedSession(
 		sealRecord(slot, sessionSlotChecksumDomain)
 	}
 	state.SessionCount, state.SessionSlotCount = 1, uint64(slotIndex)+1
+	state.AuthorityBindingCount = 1
 	state.SessionEpochHighWater = command.ClientEpoch
 	stateEnvelope, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
+	authorityKey := AuthorityBindingStorageKey(authorityDigest)
+	authorityRecord, err := AppendAuthorityBinding(
+		nil, command.Tenant, command.ClientID, command.AuthorityClass,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,6 +770,9 @@ func putCraftedSession(
 			return err
 		}
 		if err := batch.Put(sessionKey[:], header); err != nil {
+			return err
+		}
+		if err := batch.Put(authorityKey[:], authorityRecord); err != nil {
 			return err
 		}
 		if err := batch.Put(openSlotKey[:], openSlot); err != nil {

@@ -92,7 +92,8 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		return activation, false, err
 	}
 	table := core.tables[expected.UserTable]
-	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil {
+	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil ||
+		core.replicatedCaptureCollection == nil {
 		return activation, false, fmt.Errorf("%w: durable activation collections", ErrReplicatedSnapshotStageProof)
 	}
 	identity, err := core.prepareReplicatedApplyStorageLocked(expected, applyOptions, nil)
@@ -123,6 +124,10 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		}}, core.txnLog, replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+				Name:       replicatedstate.TransitionCaptureCollectionName,
+				Collection: core.replicatedCaptureCollection,
+			},
 		},
 	)
 	if err != nil {
@@ -149,7 +154,8 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		!bytes.Equal(currentEnvelope, expectedEnvelope) ||
 		!bytes.Equal(current.UserCollection, manifest.UserCollection) ||
 		current.ImageDigest != manifest.ImageDigest || current.SystemRows != manifest.SystemRows ||
-		current.UserRows != manifest.UserRows {
+		current.UserRows != manifest.UserRows || current.CaptureRows != manifest.CaptureRows ||
+		current.CaptureImageDigest != manifest.CaptureImageDigest {
 		return activation, false, errors.Join(
 			fmt.Errorf("%w: durable activation image", ErrReplicatedSnapshotStageProof),
 			writeErr, closeErr, currentErr, expectedErr,
@@ -256,6 +262,7 @@ func (d *Database) OpenReplicatedSnapshotStage(
 		members := []durable.NamedCollection{
 			{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
 			{Name: expected.UserTable, Collection: t.collection},
+			{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
 		}
 		offset := cursor.Offset()
 		owns := core.checkpointGroup.Owns(members)
@@ -275,10 +282,20 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	if err != nil {
 		return nil, identity, err
 	}
-	if core.replicatedApplyCollection == nil {
+	if core.replicatedApplyCollection == nil || core.replicatedCaptureCollection == nil {
 		return nil, identity, ErrReplicatedApplyMismatch
 	}
 	validatorClaim := &ReplicatedApply{owner: connector, database: core, table: t, identity: identity}
+	stageOptions.Capture = replicatedstate.CollectionTarget{
+		Collection: core.replicatedCaptureCollection,
+		Validation: replicatedstate.ValidationOpaqueBinary,
+		Limits: replicatedstate.CollectionLimits{
+			MaxKeyBytes:          core.replicatedCaptureCollection.MaxKeyBytes(),
+			MaxDocumentBytes:     core.replicatedCaptureCollection.MaxDocumentBytes(),
+			MaxDistinctMutations: core.replicatedCaptureCollection.MaxBatchDocuments(),
+			MaxBatchBytes:        core.replicatedCaptureCollection.MaxBatchBytes(),
+		},
+	}
 	stage, err := replicatedstate.NewSnapshotArtifactStageWithOptions(
 		manifest,
 		replicatedstate.CollectionTarget{
@@ -379,6 +396,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 	members := []durable.NamedCollection{
 		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
 		{Name: s.base.UserTable, Collection: s.table.collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
 	}
 	var err error
 	if s.snapshotBase == nil {
@@ -396,6 +414,10 @@ func (s *ReplicatedSnapshotStage) Activate(
 		_, err = s.stage.OpenCandidate(staticBootstrap, core.txnLog, replicatedstate.Options{
 			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 			RetryWindow: s.identity.RetryWindow,
+			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+				Name:       replicatedstate.TransitionCaptureCollectionName,
+				Collection: core.replicatedCaptureCollection,
+			},
 		})
 		if err != nil {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
@@ -421,6 +443,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 		Images: []durable.CheckpointGroupSeedImage{
 			{Collection: core.replicatedApplyCollection, Generation: core.replicatedApplyCollection.Generation()},
 			{Collection: s.table.collection, Generation: s.table.collection.Generation()},
+			{Collection: core.replicatedCaptureCollection, Generation: core.replicatedCaptureCollection.Generation()},
 		},
 	}
 	if core.checkpointGroup == nil {
@@ -465,6 +488,10 @@ func (s *ReplicatedSnapshotStage) Activate(
 			core.txnLog, replicatedstate.Options{
 				TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 				RetryWindow: s.identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+				TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+					Name:       replicatedstate.TransitionCaptureCollectionName,
+					Collection: core.replicatedCaptureCollection,
+				},
 			},
 		)
 		if err != nil {

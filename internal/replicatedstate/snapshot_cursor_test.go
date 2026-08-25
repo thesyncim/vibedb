@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"testing"
 )
@@ -36,13 +37,14 @@ func TestSnapshotArtifactCursorRoundTripAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x7c, 0x01, 0x1c, 0xa6, 0xe6, 0xdb, 0xfb, 0x71,
-		0x4a, 0xd2, 0xcb, 0x2c, 0xa6, 0xb0, 0xa9, 0xf1,
-		0xd3, 0x2c, 0x46, 0xdd, 0xf1, 0x1f, 0x6d, 0x7b,
-		0xcd, 0xfe, 0xca, 0x0d, 0x34, 0xd8, 0x65, 0x3b,
+		0x9b, 0x2f, 0x95, 0xf6, 0xf4, 0x33, 0x26, 0x71,
+		0x4f, 0x21, 0x4e, 0xe1, 0x2e, 0x84, 0xe9, 0x20,
+		0x74, 0xb8, 0x3b, 0x2a, 0x19, 0xf2, 0x6b, 0xfa,
+		0x04, 0x83, 0xf6, 0xb1, 0xb7, 0x42, 0x91, 0x9d,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
-		t.Fatalf("cursor golden digest = %x, want %x", got, wantGolden)
+		t.Fatalf("cursor golden digest = %s, want %s",
+			hex.EncodeToString(got[:]), hex.EncodeToString(wantGolden[:]))
 	}
 	decoded, err := OpenSnapshotArtifactCursor(encoded)
 	if err != nil {
@@ -144,6 +146,21 @@ func TestSnapshotArtifactCursorStrictCorruptionAndTruncation(t *testing.T) {
 	copy(resealed[len(resealed)-sha256.Size:], digest[:])
 	if _, err := OpenSnapshotArtifactCursor(resealed); !errors.Is(err, ErrSnapshotArtifact) {
 		t.Fatalf("resealed impossible offset error = %v", err)
+	}
+}
+
+func TestSnapshotArtifactCursorRejectsForgedCapturePrefixCommitment(t *testing.T) {
+	_, _, cursor := snapshotArtifactCursorFixture(t)
+	encoded, err := AppendSnapshotArtifactCursor(nil, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := bytes.Clone(encoded)
+	forged[408] ^= 1
+	digest := snapshotArtifactDigest(snapshotArtifactCursorDomain, forged[:len(forged)-sha256.Size])
+	copy(forged[len(forged)-sha256.Size:], digest[:])
+	if _, err := OpenSnapshotArtifactCursor(forged); !errors.Is(err, ErrSnapshotArtifact) {
+		t.Fatalf("forged capture prefix error = %v", err)
 	}
 }
 

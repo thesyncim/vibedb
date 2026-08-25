@@ -527,7 +527,7 @@ func newServingRuntimeWithVoters(
 		sqldriver.ReplicatedApplyOptions{
 			MaxSessions: maxSessions, RetryWindow: retryWindow,
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 64 << 20,
+				MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20,
 			},
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format:   sqldriver.ReplicatedPlacementProfileFormat,

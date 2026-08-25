@@ -11,11 +11,13 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
 type nativeSessionClient struct {
 	state               shardservice.ReplicatedMemberState
+	stateAfterUnknown   shardservice.ReplicatedMemberState
 	unknownMutationOnce bool
 	mutationUnknownSeen bool
 	preAdmissionRetry   bool
@@ -23,11 +25,13 @@ type nativeSessionClient struct {
 	retriedCommand      []byte
 	applied             uint64
 	probes              int
+	lastMutationCount   int
+	proposalMembers     []uint64
 }
 
 func (client *nativeSessionClient) DoReplicated(
 	_ context.Context,
-	_ ReplicatedEndpoint,
+	endpoint ReplicatedEndpoint,
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	if request.Operation == shardservice.ReplicatedProbe {
@@ -40,10 +44,17 @@ func (client *nativeSessionClient) DoReplicated(
 	if err != nil {
 		return nil, err
 	}
+	if command.Kind() == replication.CommandMutationBatch {
+		client.lastMutationCount = command.MutationCount()
+		client.proposalMembers = append(client.proposalMembers, endpoint.Member)
+	}
 	if command.Kind() == replication.CommandMutationBatch && client.unknownMutationOnce &&
 		!client.mutationUnknownSeen {
 		client.mutationUnknownSeen = true
 		client.unknownCommand = append([]byte(nil), request.Command...)
+		if client.stateAfterUnknown != (shardservice.ReplicatedMemberState{}) {
+			client.state = client.stateAfterUnknown
+		}
 		return nil, errors.New("connection disappeared after exact frame")
 	}
 	if command.Kind() == replication.CommandMutationBatch && client.mutationUnknownSeen &&
@@ -112,8 +123,11 @@ func (client *nativeSessionClient) DoReplicated(
 
 func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
+	replacement := states["m3"]
+	replacement.LeaderID = replacement.Fence.MemberID
+	replacement.Fence.Term++
 	client := &nativeSessionClient{
-		state: states["m2"], unknownMutationOnce: true,
+		state: states["m2"], stateAfterUnknown: replacement, unknownMutationOnce: true,
 	}
 	executor, err := NewReplicatedExecutor(client, 1, time.Second)
 	if err != nil {
@@ -122,6 +136,7 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{9},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		RetryHome:          replication.RetryHome{7},
 		Resolver:           BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
@@ -162,11 +177,22 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	if _, err := session.Delete(context.Background(), []byte{1}); !errors.Is(err, ErrNativeCommandPending) {
 		t.Fatalf("operation while pending = %v", err)
 	}
+	if client.probes != initialProbes {
+		t.Fatalf("normal cached-leader proposal added probes: initial=%d current=%d",
+			initialProbes, client.probes)
+	}
 	putResult, err := session.RetryPending(context.Background())
 	if err != nil || putResult.Completion.ResultCode != replicatedstate.ResultApplied ||
-		!bytes.Equal(client.unknownCommand, client.retriedCommand) {
+		session.Status().Pending || !bytes.Equal(client.unknownCommand, client.retriedCommand) {
 		t.Fatalf("retry = result %+v error %v", putResult, err)
 	}
+	if client.probes <= initialProbes || len(client.proposalMembers) != 2 ||
+		client.proposalMembers[0] != states["m2"].Fence.MemberID ||
+		client.proposalMembers[1] != states["m3"].Fence.MemberID {
+		t.Fatalf("unknown retry probes=%d initial=%d proposal members=%v",
+			client.probes, initialProbes, client.proposalMembers)
+	}
+	retryProbes := client.probes
 	if _, err := session.Delete(context.Background(), []byte{1}); err != nil {
 		t.Fatal(err)
 	}
@@ -180,8 +206,8 @@ func TestNativeSessionPutDeleteExactUnknownRetryAndLifecycle(t *testing.T) {
 	if err != nil || !released.Released || !session.Status().Released {
 		t.Fatalf("release = %+v, %v; status %+v", released, err, session.Status())
 	}
-	if client.probes != initialProbes {
-		t.Fatalf("steady native session added probes: initial=%d final=%d", initialProbes, client.probes)
+	if client.probes != retryProbes {
+		t.Fatalf("steady native session added probes: after-retry=%d final=%d", retryProbes, client.probes)
 	}
 }
 
@@ -197,6 +223,7 @@ func TestNativeSessionRetryPreservesUnknownAcrossCalls(t *testing.T) {
 	session, err := NewNativeSession(NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{0x31},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		Resolver:           BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
 		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
@@ -217,6 +244,44 @@ func TestNativeSessionRetryPreservesUnknownAcrossCalls(t *testing.T) {
 		!bytes.Equal(want, session.PendingCommand()) ||
 		!bytes.Equal(want, client.retriedCommand) {
 		t.Fatalf("retry refusal = %T %v status=%+v", err, err, session.Status())
+	}
+}
+
+func TestNativeSessionMutateBatchCarriesOneAtomicOrderedCommand(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	client := &nativeSessionClient{state: states["m2"]}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("tenant"), ClientID: replication.ID128{0x51},
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
+		Resolver:           BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1,
+		MaxMutations: 2, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.MutateBatch(context.Background(), []NativeMutation{
+		{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{1}, Value: []byte(`{"id":1}`)},
+		{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{2}, Value: []byte(`{"id":2}`)},
+	})
+	if err != nil || result.Completion.ResultCode != replicatedstate.ResultApplied ||
+		client.lastMutationCount != 2 || client.applied != 2 {
+		t.Fatalf("batch result=%+v mutations=%d applied=%d err=%v",
+			result, client.lastMutationCount, client.applied, err)
+	}
+	if _, err = session.MutateBatch(context.Background(), []NativeMutation{
+		{Kind: replication.MutationPut, Key: []byte{1}, Value: []byte(`{}`)},
+		{Kind: replication.MutationPut, Key: []byte{2}, Value: []byte(`{}`)},
+		{Kind: replication.MutationPut, Key: []byte{3}, Value: []byte(`{}`)},
+	}); !errors.Is(err, ErrNativeBundleBound) {
+		t.Fatalf("oversized logical batch = %v", err)
 	}
 }
 
@@ -244,13 +309,20 @@ func TestNativeSessionRejectsIdentityAndMutationBoundsBeforeOwnedWork(t *testing
 	base := NativeSessionOptions{
 		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
 		Tenant: []byte("tenant"), ClientID: replication.ID128{9},
-		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 4,
+		ProposalCapability: serviceauthz.CapabilityDataWrite,
+		Resolver:           BaseRelationResolver{Relation: 1}, MaxRelationBatches: 4,
 		MaxMutations: 8, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
 	}
 	tests := []struct {
 		name   string
 		mutate func(*NativeSessionOptions)
 	}{
+		{"distribution route mismatch", func(options *NativeSessionOptions) {
+			options.Distribution = "other"
+		}},
+		{"shard route mismatch", func(options *NativeSessionOptions) {
+			options.Shard = "other"
+		}},
 		{"distribution bound", func(options *NativeSessionOptions) {
 			options.Distribution = string(bytes.Repeat([]byte{'d'}, replication.MaxIdentityBytes+1))
 		}},

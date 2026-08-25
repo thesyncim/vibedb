@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -21,6 +22,108 @@ type scriptedReplicatedClient struct {
 	states    map[string]shardservice.ReplicatedMemberState
 	proposals int
 	commands  [][]byte
+}
+
+type staleSelfLeaderReplicatedClient struct {
+	states    map[string]shardservice.ReplicatedMemberState
+	addresses []string
+	commands  [][]byte
+}
+
+type leaderlessElectionReplicatedClient struct {
+	states           map[string]shardservice.ReplicatedMemberState
+	unknown          bool
+	leaderlessProbes int
+	addresses        []string
+	commands         [][]byte
+}
+
+func (client *leaderlessElectionReplicatedClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		if client.unknown && client.leaderlessProbes < len(client.states) {
+			client.leaderlessProbes++
+			state.LeaderID = 0
+		}
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+		}, nil
+	}
+	client.addresses = append(client.addresses, endpoint.Address)
+	client.commands = append(client.commands, append([]byte(nil), request.Command...))
+	if !client.unknown {
+		client.unknown = true
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: state,
+		}, nil
+	}
+	if endpoint.Member != 3 {
+		return nil, errors.New("proposal did not wait for replacement leader")
+	}
+	command, err := replication.OpenCommand(request.Command)
+	if err != nil {
+		return nil, err
+	}
+	completion, err := appendNativeSessionCompletion(
+		nil, command, command.ClientEpoch, 9, replicatedstate.ResultApplied,
+	)
+	if err != nil {
+		return nil, err
+	}
+	state.Commit, state.Applied = 9, 9
+	return &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: replicatedRequestDigest(request.Command),
+		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
+			AppliedIndex: 9, CompletionAppliedSequence: 9, CompletionBytes: len(completion)},
+		Completion: completion,
+	}, nil
+}
+
+func (client *staleSelfLeaderReplicatedClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
+		}, nil
+	}
+	client.addresses = append(client.addresses, endpoint.Address)
+	client.commands = append(client.commands, append([]byte(nil), request.Command...))
+	if endpoint.Member == 1 {
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: state,
+		}, nil
+	}
+	if endpoint.Member != 3 {
+		return nil, errors.New("proposal did not rotate to replacement leader")
+	}
+	command, err := replication.OpenCommand(request.Command)
+	if err != nil {
+		return nil, err
+	}
+	completion, err := appendNativeSessionCompletion(
+		nil, command, command.ClientEpoch, 9, replicatedstate.ResultApplied,
+	)
+	if err != nil {
+		return nil, err
+	}
+	state.Commit, state.Applied = 9, 9
+	client.states[endpoint.Address] = state
+	return &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: replicatedRequestDigest(request.Command),
+		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
+			AppliedIndex: 9, CompletionAppliedSequence: 9, CompletionBytes: len(completion)},
+		Completion: completion,
+	}, nil
 }
 
 var replicatedRequestDigestSink [sha256.Size]byte
@@ -122,6 +225,64 @@ func TestReplicatedExecutorFollowsLeaderAndRetriesExactBytesAfterUnknown(t *test
 		!bytes.Equal(client.commands[0], command) ||
 		!bytes.Equal(client.commands[1], command) {
 		t.Fatalf("result=%+v proposals=%d commands=%d", result, client.proposals, len(client.commands))
+	}
+}
+
+func TestReplicatedExecutorRotatesAwayFromStaleSelfLeaderAfterUnknown(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	stale := states["m1"]
+	stale.LeaderID, stale.Fence.Term = 1, 7
+	states["m1"] = stale
+	for _, address := range []string{"m2", "m3"} {
+		current := states[address]
+		current.LeaderID, current.Fence.Term = 3, 8
+		states[address] = current
+	}
+	client := &staleSelfLeaderReplicatedClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Propose(context.Background(), route, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, completionErr := replication.OpenCompletion(result.Completion)
+	if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+		result.Retries != 1 || !slices.Equal(client.addresses, []string{"m1", "m3"}) ||
+		len(client.commands) != 2 || !bytes.Equal(client.commands[0], command) ||
+		!bytes.Equal(client.commands[1], command) {
+		t.Fatalf("result=%+v addresses=%v commands=%d", result, client.addresses, len(client.commands))
+	}
+}
+
+func TestReplicatedExecutorKeepsBoundedRetryAliveThroughLeaderlessElection(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	stale := states["m1"]
+	stale.LeaderID, stale.Fence.Term = 1, 7
+	states["m1"] = stale
+	for _, address := range []string{"m2", "m3"} {
+		current := states[address]
+		current.LeaderID, current.Fence.Term = 3, 8
+		states[address] = current
+	}
+	client := &leaderlessElectionReplicatedClient{states: states}
+	executor, err := NewReplicatedExecutor(client, 4, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Propose(context.Background(), route, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, completionErr := replication.OpenCompletion(result.Completion)
+	if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
+		result.Retries != 2 || client.leaderlessProbes != len(states) ||
+		!slices.Equal(client.addresses, []string{"m1", "m3"}) ||
+		len(client.commands) != 2 || !bytes.Equal(client.commands[0], command) ||
+		!bytes.Equal(client.commands[1], command) {
+		t.Fatalf("result=%+v probes=%d addresses=%v commands=%d", result,
+			client.leaderlessProbes, client.addresses, len(client.commands))
 	}
 }
 
@@ -354,6 +515,30 @@ func TestReplicatedPointReadRetriesSameCommandFenceIncarnationRace(t *testing.T)
 	if err != nil || !result.Found || result.Retries != 1 ||
 		!bytes.Equal(result.Value, []byte("value")) || client.proposals != 2 {
 		t.Fatalf("result=%+v requests=%d err=%v", result, client.proposals, err)
+	}
+}
+
+func TestReplicatedPointReadStopsServingFenceBackoffOnCancellation(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	state.Applied, state.Commit = 10, 10
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	client := &sequenceReplicatedClient{state: state, responses: []*shardservice.ReplicatedResponse{{
+		Kind:    shardservice.ReplicatedRefusal,
+		Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: state,
+	}}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.ReadPoint(ctx, route, ReplicatedPointRead{
+		Relation: 1, Key: []byte("k"), MinimumApplied: 10,
+		MaxValueBytes: 1024, Linearizable: true,
+	})
+	if !errors.Is(err, context.Canceled) || client.proposals != 1 {
+		t.Fatalf("error=%T %v requests=%d", err, err, client.proposals)
 	}
 }
 
@@ -662,6 +847,29 @@ type sequenceReplicatedClient struct {
 	proposals int
 }
 
+type cancelFailoverRetryClient struct {
+	state     shardservice.ReplicatedMemberState
+	cancel    context.CancelFunc
+	proposals int
+}
+
+func (client *cancelFailoverRetryClient) DoReplicated(
+	_ context.Context,
+	_ ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedHandshake, HasState: true, State: client.state,
+		}, nil
+	}
+	client.proposals++
+	client.cancel()
+	return &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: client.state,
+	}, nil
+}
+
 func (client *sequenceReplicatedClient) DoReplicated(
 	_ context.Context,
 	_ ReplicatedEndpoint,
@@ -678,6 +886,36 @@ func (client *sequenceReplicatedClient) DoReplicated(
 		return nil, errors.New("unexpected proposal")
 	}
 	return client.responses[index], nil
+}
+
+func TestReplicatedExecutorCancellationStopsOutcomeUnknownRetry(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &cancelFailoverRetryClient{state: states["m2"], cancel: cancel}
+	executor, err := NewReplicatedExecutor(client, 8, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.Propose(ctx, route, command)
+	var unknown *raftservice.UnknownOutcomeError
+	if !errors.As(err, &unknown) || !errors.Is(err, context.Canceled) ||
+		!bytes.Equal(unknown.Command, command) || client.proposals != 1 {
+		t.Fatalf("error=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
+func TestReplicatedFailoverRetryBudgetSpansElectionBound(t *testing.T) {
+	var total time.Duration
+	for attempt := 0; attempt < 7; attempt++ {
+		total += replicatedFailoverRetryDelay(attempt)
+	}
+	if total != 1260*time.Millisecond ||
+		replicatedFailoverRetryDelay(-1) != 20*time.Millisecond ||
+		replicatedFailoverRetryDelay(7) != 320*time.Millisecond {
+		t.Fatalf("retry budget=%v base=%v cap=%v", total,
+			replicatedFailoverRetryDelay(-1), replicatedFailoverRetryDelay(7))
+	}
 }
 
 func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) {
@@ -967,6 +1205,11 @@ func (client deadlineReplicatedClient) DoReplicated(
 func TestReplicatedExecutorRequiresAndEnforcesPerAttemptTimeout(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	if _, err := NewReplicatedExecutor(
+		deadlineReplicatedClient{}, AbsoluteMaxReplicatedAttempts+1, time.Second,
+	); !errors.Is(err, ErrReplicatedRoute) {
+		t.Fatalf("over-max attempts = %v", err)
+	}
 	if _, err := NewReplicatedExecutor(deadlineReplicatedClient{}, 1, 0); !errors.Is(err, ErrReplicatedRoute) {
 		t.Fatalf("zero attempt timeout = %v", err)
 	}
@@ -1103,6 +1346,49 @@ func TestReplicatedExecutorTreatsChangedStaleFenceAsDefinite(t *testing.T) {
 	}
 }
 
+func TestReplicatedExecutorRetriesSameCommandFenceIncarnationRace(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	refreshed := state
+	refreshed.Fence.Term++
+	completion := testReplicatedCompletionResponse(t, command, refreshed)
+	client := &sequenceReplicatedClient{state: refreshed, responses: []*shardservice.ReplicatedResponse{
+		{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: refreshed},
+		completion,
+	}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Propose(context.Background(), route, command)
+	if err != nil || result.Retries != 1 || client.proposals != 2 ||
+		!bytes.Equal(result.Completion, completion.Completion) {
+		t.Fatalf("result=%+v proposals=%d err=%v", result, client.proposals, err)
+	}
+}
+
+func TestReplicatedExecutorStopsServingFenceBackoffOnCancellation(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	client := &sequenceReplicatedClient{state: state, responses: []*shardservice.ReplicatedResponse{{
+		Kind:    shardservice.ReplicatedRefusal,
+		Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: state,
+	}}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.Propose(ctx, route, command)
+	if !errors.Is(err, context.Canceled) || client.proposals != 1 {
+		t.Fatalf("error=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
 func testReplicatedCompletionResponse(
 	t testing.TB,
 	commandBytes []byte,
@@ -1142,6 +1428,7 @@ func testReplicatedRouteCommand(
 		group.GroupID[index] = byte(index + 61)
 	}
 	route := ReplicatedRoute{
+		Distribution: "orders", Shard: "0000-ffff",
 		Group: group, AllocationGeneration: 5,
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
@@ -1150,9 +1437,9 @@ func testReplicatedRouteCommand(
 			RoutingVersion:         1, RouteGeneration: 1,
 		},
 		Replicas: []ReplicatedEndpoint{
-			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, Address: "m1"},
-			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, Address: "m2"},
-			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{3}, NodeIncarnation: 13, Address: "m3"},
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, NativeEndpoint: "n1", Address: "m1"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, NativeEndpoint: "n2", Address: "m2"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{3}, NodeIncarnation: 13, NativeEndpoint: "n3", Address: "m3"},
 		},
 	}
 	states := make(map[string]shardservice.ReplicatedMemberState, 3)

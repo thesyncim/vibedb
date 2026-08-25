@@ -271,6 +271,17 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 		settledSeed.SnapshotBase == nil || err != nil {
 		t.Fatalf("settled initial seed certificate = %+v, %v", settledSeed, err)
 	}
+	core.mu.RLock()
+	seedMembers := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: base.UserTable, Collection: core.tables[base.UserTable].collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
+	}
+	seedGroup := core.checkpointGroup
+	core.mu.RUnlock()
+	if seedGroup == nil || !seedGroup.Owns(seedMembers) {
+		t.Fatal("child seed omitted fixed capture membership")
+	}
 	if err := settledSeed.Apply.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -576,14 +587,17 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations, 8, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	machineOptions := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
-			MaxDocuments: max(
-				user.Limits.MaxDistinctMutations+4,
-				systemLimits.MaxBatchDocuments+1,
-			),
-			MaxBytes: 64 << 20,
+			MaxDocuments:   maxDocuments,
+			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128,
 		RetryWindow: 8,

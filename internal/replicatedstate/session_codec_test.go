@@ -14,8 +14,49 @@ import (
 var (
 	sessionViewSink     SessionView
 	sessionSlotViewSink SessionSlotView
+	authorityViewSink   AuthorityBindingView
 	sessionCodecErrSink error
 )
+
+func TestAuthorityBindingRoundTripExactCompactAndAllocationFree(t *testing.T) {
+	tenant := []byte("tenant-a")
+	clientID := sessionCodecID(7)
+	encoded, err := AppendAuthorityBinding(nil, tenant, clientID, replication.CommandAuthorityTopology)
+	if err != nil || len(encoded) != authorityBindingHeaderBytes+len(tenant)+recordChecksumLen ||
+		len(encoded) >= MaxAuthorityBindingBytes {
+		t.Fatalf("AppendAuthorityBinding bytes=%d err=%v", len(encoded), err)
+	}
+	view, err := OpenAuthorityBinding(encoded)
+	if err != nil || !bytes.Equal(view.Tenant, tenant) || view.ClientID != clientID ||
+		view.AuthorityClass != replication.CommandAuthorityTopology ||
+		view.Digest != AuthorityIdentityKey(tenant, clientID) {
+		t.Fatalf("OpenAuthorityBinding = %+v,%v", view, err)
+	}
+	if cap(view.Tenant) != len(view.Tenant) {
+		t.Fatal("authority tenant is not capacity-clamped")
+	}
+	allocations := testing.AllocsPerRun(1000, func() {
+		authorityViewSink, sessionCodecErrSink = OpenAuthorityBinding(encoded)
+	})
+	if allocations != 0 || sessionCodecErrSink != nil {
+		t.Fatalf("OpenAuthorityBinding allocations=%v err=%v", allocations, sessionCodecErrSink)
+	}
+	for end := 0; end < len(encoded); end++ {
+		if _, err := OpenAuthorityBinding(encoded[:end]); !errors.Is(err, ErrSessionCorrupt) {
+			t.Fatalf("truncation %d err=%v", end, err)
+		}
+	}
+	corrupt := bytes.Clone(encoded)
+	corrupt[16] ^= 1
+	if _, err := OpenAuthorityBinding(corrupt); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("corrupt binding err=%v", err)
+	}
+	maxTenant := bytes.Repeat([]byte{'t'}, replication.MaxIdentityBytes)
+	maxEncoded, err := AppendAuthorityBinding(nil, maxTenant, clientID, replication.CommandAuthorityData)
+	if err != nil || len(maxEncoded) != MaxAuthorityBindingBytes {
+		t.Fatalf("maximum binding bytes=%d err=%v", len(maxEncoded), err)
+	}
+}
 
 func sessionCodecID(seed byte) replication.ID128 {
 	var id replication.ID128
@@ -54,7 +95,7 @@ func sessionCodecSlot(t testing.TB) SessionSlot {
 	fingerprint := sessionCodecFingerprint(101)
 	return SessionSlot{
 		Slot:                   13,
-		SessionDigest:          SessionKey(record.Tenant, record.ClientID),
+		SessionDigest:          SessionKey(record.AuthorityClass, record.Tenant, record.ClientID),
 		ClientEpoch:            record.ClientEpoch,
 		ClientSequence:         14,
 		AppliedSequence:        19,
@@ -82,7 +123,7 @@ func TestSessionRecordRoundTripBorrowedAndAllocationFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSessionRecord: %v", err)
 	}
-	if view.Digest != SessionKey(record.Tenant, record.ClientID) ||
+	if view.Digest != SessionKey(record.AuthorityClass, record.Tenant, record.ClientID) ||
 		!bytes.Equal(view.Tenant, record.Tenant) || view.ClientID != record.ClientID ||
 		view.ClientEpoch != record.ClientEpoch || view.RetryHome != record.RetryHome ||
 		view.AckThrough != record.AckThrough || view.HighSequence != record.HighSequence ||
@@ -166,13 +207,14 @@ func TestSessionSlotRoundTripBorrowedAndAllocationFree(t *testing.T) {
 }
 
 func TestSessionKeysGoldenAndBounds(t *testing.T) {
-	digest := SessionKey([]byte("tenant"), sessionCodecID(9))
-	const want = "5dc75da7b53d9acda39520cbf89cb7a71bdfaba3a76a84a41e8dee27eb8bfefe"
+	digest := SessionKey(replication.CommandAuthorityData, []byte("tenant"), sessionCodecID(9))
+	const want = "3ca5ca12d40496b25c3dd3c92f4149445d7483d84b6b30fc5cfb0c4f1db8ad43"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("SessionKey = %s, want %s", got, want)
 	}
-	if digest == SessionKey([]byte("tenant-2"), sessionCodecID(9)) ||
-		digest == SessionKey([]byte("tenant"), sessionCodecID(10)) {
+	if digest == SessionKey(replication.CommandAuthorityData, []byte("tenant-2"), sessionCodecID(9)) ||
+		digest == SessionKey(replication.CommandAuthorityData, []byte("tenant"), sessionCodecID(10)) ||
+		digest == SessionKey(replication.CommandAuthorityTopology, []byte("tenant"), sessionCodecID(9)) {
 		t.Fatal("distinct session identities collided")
 	}
 	metadataKey := SessionStorageKey(digest)
@@ -225,9 +267,9 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	}
 
 	for name, mutate := range map[string]func([]byte){
-		"status":   func(candidate []byte) { candidate[20] = 9 },
-		"reserved": func(candidate []byte) { candidate[21] = 1 },
-		"digest":   func(candidate []byte) { candidate[48] ^= 1 },
+		"status":    func(candidate []byte) { candidate[20] = 9 },
+		"authority": func(candidate []byte) { candidate[21] = 2 },
+		"digest":    func(candidate []byte) { candidate[48] ^= 1 },
 		"zero-high-water": func(candidate []byte) {
 			clear(candidate[88:104])
 		},
@@ -310,7 +352,7 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 		"slot": func(candidate []byte) {
 			binary.LittleEndian.PutUint16(candidate[16:18], MaxSessionRetryWindow)
 		},
-		"reserved":       func(candidate []byte) { candidate[18] = 1 },
+		"authority":      func(candidate []byte) { candidate[18] = 2 },
 		"session-digest": func(candidate []byte) { clear(candidate[20:52]) },
 		"sequence": func(candidate []byte) {
 			binary.LittleEndian.PutUint64(candidate[60:68], 0)
@@ -351,6 +393,35 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 }
 
 func TestSessionCodecRejectsWritableAppendAliases(t *testing.T) {
+	authorityPrefix := []byte("prefix")
+	authorityBytes := authorityBindingHeaderBytes + len("tenant-a") + recordChecksumLen
+	authorityBacking := make([]byte, len(authorityPrefix), len(authorityPrefix)+authorityBytes)
+	copy(authorityBacking, authorityPrefix)
+	authorityExpanded := authorityBacking[:cap(authorityBacking)]
+	authorityTenant := authorityExpanded[len(authorityPrefix) : len(authorityPrefix)+len("tenant-a")]
+	copy(authorityTenant, "tenant-a")
+	gotAuthority, err := AppendAuthorityBinding(
+		authorityBacking, authorityTenant, sessionCodecID(3), replication.CommandAuthorityData,
+	)
+	if !errors.Is(err, ErrCodecAlias) || !bytes.Equal(gotAuthority, authorityPrefix) {
+		t.Fatalf("aliased authority append = %q,%v", gotAuthority, err)
+	}
+
+	// The same alias is safe when the append necessarily relocates.
+	relocatingAuthorityTenant := append([]byte(nil), []byte("tenant-a")...)
+	relocatingAuthorityTenant = relocatingAuthorityTenant[:len(relocatingAuthorityTenant):len(relocatingAuthorityTenant)]
+	relocatedAuthority, err := AppendAuthorityBinding(
+		relocatingAuthorityTenant, relocatingAuthorityTenant, sessionCodecID(3),
+		replication.CommandAuthorityData,
+	)
+	if err != nil {
+		t.Fatalf("relocating authority append: %v", err)
+	}
+	if view, err := OpenAuthorityBinding(relocatedAuthority[len(relocatingAuthorityTenant):]); err != nil ||
+		!bytes.Equal(view.Tenant, relocatingAuthorityTenant) {
+		t.Fatalf("open relocated authority=%+v err=%v", view, err)
+	}
+
 	record := sessionCodecRecord()
 	recordBytes := sessionRecordHeaderBytes + len(record.Tenant) + recordChecksumLen
 	recordPrefix := []byte("prefix")

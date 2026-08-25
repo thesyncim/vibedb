@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -1330,6 +1331,65 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	return loadSnapshotFile(file, path)
 }
 
+// AppendSnapshotDocument appends the canonical compact vibejson image used by
+// the replicated catalog relation. It carries the same validated fields and
+// lineage as the durable file format without whitespace or a second schema.
+func AppendSnapshotDocument(dst []byte, snapshot *Snapshot) ([]byte, error) {
+	return appendSnapshotDocumentBounded(dst, snapshot, maxCatalogBytes)
+}
+
+// appendSnapshotDocumentBounded applies a stricter caller-owned value budget
+// before growing dst. The replicated catalog uses this to account for its
+// outer /id envelope within the smaller mutation-value ceiling, while the file
+// catalog retains maxCatalogBytes.
+func appendSnapshotDocumentBounded(
+	dst []byte,
+	snapshot *Snapshot,
+	maximum int,
+) ([]byte, error) {
+	if snapshot == nil {
+		return dst, ErrInvalidCatalog
+	}
+	if maximum <= 0 || maximum > maxCatalogBytes {
+		return dst, ErrCatalogTooLarge
+	}
+	state, err := initialCatalogState(snapshot)
+	if err != nil {
+		return dst, err
+	}
+	persisted := toPersisted(state)
+	compact, err := vibejson.Marshal(&persisted)
+	if err != nil {
+		return dst, err
+	}
+	if len(compact) > maximum {
+		return dst, ErrCatalogTooLarge
+	}
+	start := len(dst)
+	dst, err = vibejson.AppendCanonicalize(dst, compact)
+	if err != nil || len(dst)-start > maximum {
+		return dst[:start], errors.Join(err, ErrCatalogTooLarge)
+	}
+	return dst, nil
+}
+
+// OpenSnapshotDocument validates one bounded replicated catalog image and
+// reconstructs the same immutable Snapshot accepted by LoadSnapshot.
+func OpenSnapshotDocument(raw []byte) (*Snapshot, error) {
+	if len(raw) == 0 || len(raw) > maxCatalogBytes {
+		return nil, ErrCatalogTooLarge
+	}
+	snapshot, err := decodeSnapshotBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := AppendSnapshotDocument(nil, snapshot)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return nil, errors.Join(err, ErrInvalidCatalog)
+	}
+	return snapshot, nil
+}
+
 // loadSnapshotFile consumes file on every return path.
 func loadSnapshotFile(file *os.File, label string) (*Snapshot, error) {
 	snapshot, err := decodeSnapshotFile(file, label)
@@ -1353,6 +1413,10 @@ func decodeSnapshotFile(file *os.File, label string) (*Snapshot, error) {
 		return nil, fmt.Errorf("%w: %s grew beyond %d bytes while it was read",
 			ErrCatalogTooLarge, label, maxCatalogBytes)
 	}
+	return decodeSnapshotBytes(raw)
+}
+
+func decodeSnapshotBytes(raw []byte) (*Snapshot, error) {
 	var pc persistedCatalog
 	if err := vibejson.Unmarshal(raw, &pc); err != nil {
 		return nil, err

@@ -46,13 +46,14 @@ func (m *Machine) LookupCompletionInto(
 // It is single-consumer, must not be copied, and retains only bounded durable
 // snapshot scratch after EndCompletionLookupBatch.
 type CompletionLookupWorkspace struct {
-	cut         durable.DatabaseSnapshot
-	catalog     [1]durable.NamedCollection
-	snapshot    *durable.Snapshot
-	owner       *Machine
-	scratch     commandPlanScratch
-	sessionRead [MaxSessionRecordBytes]byte
-	slotRead    [MaxSessionSlotRecordBytes]byte
+	cut           durable.DatabaseSnapshot
+	catalog       [1]durable.NamedCollection
+	snapshot      *durable.Snapshot
+	owner         *Machine
+	scratch       commandPlanScratch
+	authorityRead [MaxAuthorityBindingBytes]byte
+	sessionRead   [MaxSessionRecordBytes]byte
+	slotRead      [MaxSessionSlotRecordBytes]byte
 	// The compact opaque-value point decoder may first materialize another
 	// row's front-compression restart value before shrinking to the requested
 	// session or slot record. Every value the private system collection writes
@@ -62,6 +63,7 @@ type CompletionLookupWorkspace struct {
 
 const maxCompletionLookupDecodeBytes = max(
 	MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
+	MaxAuthorityBindingBytes,
 )
 
 // BeginCompletionLookupBatch captures one exact system-collection generation
@@ -118,6 +120,7 @@ func (m *Machine) beginCompletionLookupBatch(
 		return err
 	}
 	workspace.scratch.sessionRead = workspace.sessionRead[:0]
+	workspace.scratch.authorityRead = workspace.authorityRead[:0]
 	workspace.scratch.slotRead = workspace.slotRead[:0]
 	workspace.scratch.decodeRead = workspace.decodeRead[:0]
 	workspace.snapshot = snapshot
@@ -183,6 +186,7 @@ func (m *Machine) EndCompletionLookupBatch(
 	workspace.snapshot = nil
 	clear(workspace.catalog[:])
 	workspace.scratch.sessionRead = workspace.sessionRead[:0]
+	workspace.scratch.authorityRead = workspace.authorityRead[:0]
 	workspace.scratch.slotRead = workspace.slotRead[:0]
 	workspace.scratch.decodeRead = workspace.decodeRead[:0]
 	err := workspace.cut.Close()
@@ -205,6 +209,7 @@ func (workspace *CompletionLookupWorkspace) Release() error {
 	clear(workspace.catalog[:])
 	workspace.scratch = commandPlanScratch{}
 	clear(workspace.sessionRead[:])
+	clear(workspace.authorityRead[:])
 	clear(workspace.slotRead[:])
 	clear(workspace.decodeRead[:])
 	return workspace.cut.Release()
@@ -250,7 +255,20 @@ func (m *Machine) lookupCompletionAtSnapshot(
 ) (CompletionLookup, error) {
 	snapshot := workspace.snapshot
 	scratch := &workspace.scratch
-	digest := SessionKey(command.Tenant, command.ClientID)
+	authorityDigest := AuthorityIdentityKey(command.Tenant, command.ClientID)
+	authorityKey := AuthorityBindingStorageKey(authorityDigest)
+	bound, authorityFound, authorityErr := authorityBindingAt(
+		pointSnapshot{value: snapshot}, authorityKey, scratch,
+	)
+	if authorityErr != nil {
+		return CompletionLookup{}, m.fail(authorityErr)
+	}
+	if authorityFound && (bound.Digest != authorityDigest ||
+		!bytes.Equal(bound.Tenant, command.Tenant) || bound.ClientID != command.ClientID ||
+		bound.AuthorityClass != command.AuthorityClass) {
+		return CompletionLookup{Key: authorityDigest}, &RequestConflictError{Key: authorityDigest}
+	}
+	digest := SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	key := SessionStorageKey(digest)
 	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, scratch)
 	if readErr == nil && found &&
@@ -263,6 +281,12 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	}
 	if readErr != nil {
 		return CompletionLookup{}, m.fail(readErr)
+	}
+	if found && (!authorityFound || session.AuthorityClass != command.AuthorityClass) {
+		if !authorityFound {
+			return CompletionLookup{}, m.fail(ErrSessionCorrupt)
+		}
+		return CompletionLookup{Key: digest}, &RequestConflictError{Key: digest}
 	}
 	if !found {
 		orphanErr := ensureNoSessionSlots(
@@ -442,11 +466,14 @@ func (m *Machine) lookupCompletionAtSnapshot(
 // observational state for a future authenticated serving layer; it grants no
 // authority to renew or revoke the session.
 func (m *Machine) LookupSessionLease(
+	authorityClass replication.CommandAuthorityClass,
 	tenant []byte,
 	clientID replication.ID128,
 	clientEpoch uint64,
 ) (SessionLeaseLookup, error) {
-	if len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
+	if (authorityClass != replication.CommandAuthorityData &&
+		authorityClass != replication.CommandAuthorityTopology) ||
+		len(tenant) == 0 || len(tenant) > replication.MaxIdentityBytes ||
 		clientID == (replication.ID128{}) || clientEpoch == 0 {
 		return SessionLeaseLookup{}, ErrSessionEpoch
 	}
@@ -468,12 +495,29 @@ func (m *Machine) LookupSessionLease(
 	if !ok || snapshot == nil {
 		return SessionLeaseLookup{}, m.fail(errors.Join(ErrInconsistentSnapshot, cut.Close()))
 	}
-	digest := SessionKey(tenant, clientID)
+	authorityDigest := AuthorityIdentityKey(tenant, clientID)
+	authorityKey := AuthorityBindingStorageKey(authorityDigest)
+	bound, authorityFound, authorityErr := authorityBindingAt(
+		pointSnapshot{value: snapshot}, authorityKey, nil,
+	)
+	if authorityErr != nil {
+		return SessionLeaseLookup{}, m.fail(errors.Join(authorityErr, cut.Close()))
+	}
+	if authorityFound && (bound.Digest != authorityDigest ||
+		!bytes.Equal(bound.Tenant, tenant) || bound.ClientID != clientID ||
+		bound.AuthorityClass != authorityClass) {
+		closeErr := cut.Close()
+		if closeErr != nil {
+			return SessionLeaseLookup{}, m.fail(closeErr)
+		}
+		return SessionLeaseLookup{}, &RequestConflictError{Key: authorityDigest}
+	}
+	digest := SessionKey(authorityClass, tenant, clientID)
 	key := SessionStorageKey(digest)
 	session, found, readErr := sessionAt(pointSnapshot{value: snapshot}, key, nil)
 	if readErr == nil && found &&
-		(session.Digest != digest || !bytes.Equal(session.Tenant, tenant) ||
-			session.ClientID != clientID) {
+		(!authorityFound || session.Digest != digest || session.AuthorityClass != authorityClass ||
+			!bytes.Equal(session.Tenant, tenant) || session.ClientID != clientID) {
 		readErr = fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
 	}
 	if readErr == nil && found && session.RetryWindow != m.options.RetryWindow {
@@ -583,14 +627,15 @@ func (m *Machine) appendSessionCompletion(
 	})
 }
 
-// ReadSnapshot pins the sole user collection and its hidden state collection
-// at one publication cut.
+// ReadSnapshot pins the sole user collection, hidden state, and reserved
+// transition-capture participant at one publication cut.
 type ReadSnapshot struct {
 	cut              durable.DatabaseSnapshot
 	publication      raftmodel.Publication
 	state            State
 	manifestDigest   [32]byte
 	userName         string
+	captureName      string
 	validation       ValidationProfile
 	validationDigest [32]byte
 	validator        MutationValidator
@@ -651,6 +696,22 @@ func (s *ReadSnapshot) Collection(name string) (*durable.Snapshot, bool) {
 	return s.cut.Collection(name)
 }
 
+// RangeCapture exports the private transition-capture image from the same
+// database snapshot cut as RangeSystem and the user collection.
+func (s *ReadSnapshot) RangeCapture(fn func(key, value []byte) error) error {
+	if s == nil || fn == nil {
+		return ErrInconsistentSnapshot
+	}
+	if s.captureName == "" {
+		return nil
+	}
+	snapshot, ok := s.cut.Collection(s.captureName)
+	if !ok || snapshot == nil {
+		return ErrInconsistentSnapshot
+	}
+	return snapshot.RangeRaw(fn)
+}
+
 // RangeSystem exports the bounded canonical system key/value image used by the
 // portable snapshot artifact. Callback bytes are borrowed for the call.
 func (s *ReadSnapshot) RangeSystem(fn func(key, value []byte) error) error {
@@ -680,7 +741,7 @@ func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
 	)
 }
 
-// Close releases both generation leases. It is idempotent.
+// Close releases every pinned collection-generation lease. It is idempotent.
 func (s *ReadSnapshot) Close() error {
 	if s == nil {
 		return nil
@@ -689,9 +750,10 @@ func (s *ReadSnapshot) Close() error {
 	return s.closeErr
 }
 
-// Snapshot captures the sole user collection plus the hidden state row under
-// the Machine publication lock. names may be empty or contain exactly the sole
-// user name; the system collection is always included automatically.
+// Snapshot captures the sole user collection, hidden system state, and the
+// private transition-capture participant under the Machine publication lock.
+// names may be empty or contain exactly the sole user name; system and capture
+// are automatic, and capture remains inaccessible through ReadSnapshot.Collection.
 func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -705,7 +767,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	if err != nil {
 		return nil, m.fail(err)
 	}
-	state, present, sessionCount, slotCount, err := scanSessionSystemSnapshot(
+	state, present, sessionCount, slotCount, authorityCount, err := scanSessionSystemSnapshot(
 		systemSnapshot, m.options.MaxSessions, m.options.RetryWindow,
 	)
 	if err != nil || present != m.initialized {
@@ -717,6 +779,7 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	}
 	if present {
 		if sessionCount != state.SessionCount || slotCount != state.SessionSlotCount ||
+			authorityCount != state.AuthorityBindingCount ||
 			!equalState(state, m.state) ||
 			!equalStatePublication(state, m.publication.Applied, m.publication.DataChainDigest,
 				m.publication.ConfState, m.publication.ReplicaSetVersion) {
@@ -726,7 +789,8 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	return &ReadSnapshot{
 		cut: cut, publication: clonePublication(m.publication), state: cloneState(m.state),
 		manifestDigest: m.manifestDigest,
-		userName:       m.userName, validation: m.user.Validation,
+		userName:       m.userName, captureName: m.reservedCaptureTarget.Name,
+		validation:       m.user.Validation,
 		validationDigest: m.user.ValidationDigest, validator: m.user.Validator,
 	}, nil
 }

@@ -86,6 +86,12 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		MaxDocumentBytes: 4096, MaxBatchDocuments: 4, MaxBatchBytes: 32 << 10,
 	})
 	systemCollection := create("child-system", durable.Options{OpaqueValues: true})
+	captureCollection := create(replicatedstate.TransitionCaptureCollectionName, durable.Options{
+		OpaqueValues: true, MaxKeyBytes: 8,
+		MaxDocumentBytes:  replicatedstate.MaxTransitionCaptureRecordBytes,
+		MaxBatchDocuments: 1,
+		MaxBatchBytes:     replicatedstate.MaxTransitionCaptureRecordBytes + 8,
+	})
 	stage, err := NewChildStage(partitioner, set.Children[1], userCollection, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -190,21 +196,33 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{7}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations,
+		sourceCaptureRetryWindow,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int(sourceCaptureRetryWindow) + 3; maxDocuments != want {
+		t.Fatalf("activation transaction documents = %d, want %d", maxDocuments, want)
+	}
 	target := ChildActivationTarget{
 		Binding: binding, StaticBootstrap: bootstrap, System: system,
 		User:   replicatedstate.UserCollection{Name: "docs", Target: user},
 		TxnLog: txnLog,
 		MachineOptions: replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
-				MaxCollections: 2,
-				MaxDocuments: max(
-					user.Limits.MaxDistinctMutations+3,
-					int(sourceCaptureRetryWindow)+2,
-				),
-				MaxBytes: 64 << 20,
+				MaxCollections: 3,
+				MaxDocuments:   maxDocuments,
+				MaxBytes:       512 << 20,
 			},
 			MaxSessions: 128,
 			RetryWindow: sourceCaptureRetryWindow,
+			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+				Name:       replicatedstate.TransitionCaptureCollectionName,
+				Collection: captureCollection,
+			},
 		},
 	}
 	if err := stage.CheckActivationCoordinates(certificate, binding); err != nil {
@@ -259,7 +277,8 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		t.Fatalf("retry manifest=%x baseEqual=%v err=%v", retryManifest.Digest, proto.Equal(base, retryBase), err)
 	}
 	opened, err := replicatedstate.OpenSnapshotBase(base)
-	if err != nil || opened.Manifest.State.Binding != binding || manifest.UserRows != 1 {
+	if err != nil || opened.Manifest.State.Binding != binding || manifest.UserRows != 1 ||
+		manifest.CaptureRows != 0 || manifest.CaptureImageDigest == ([sha256.Size]byte{}) {
 		t.Fatalf("base state=%+v rows=%d err=%v", opened.Manifest.State, manifest.UserRows, err)
 	}
 	before, found, err := userCollection.AppendRaw(nil, []byte("right"))

@@ -87,6 +87,16 @@ type RetryHome [8]byte
 // It is interpreted only under the command's SchemaGeneration.
 type RelationID uint16
 
+// CommandAuthorityClass is authenticated command identity, not a transport
+// hint. Data is the zero value so the sole unreleased grammar keeps ordinary
+// command bytes compact; topology commands carry the one nonzero class bit.
+type CommandAuthorityClass uint8
+
+const (
+	CommandAuthorityData CommandAuthorityClass = iota
+	CommandAuthorityTopology
+)
+
 // CommandKind selects the command's state-machine operation. The zero value is
 // the ordinary mutation batch so command producers remain explicit for session
 // lifecycle operations.
@@ -123,6 +133,7 @@ const (
 	MutationDelete            MutationKind = 2
 	MutationPutAbsentOrEqual  MutationKind = 3
 	MutationDeleteDigestEqual MutationKind = 4
+	MutationPutDigestEqual    MutationKind = 5
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed
@@ -133,9 +144,9 @@ type Mutation struct {
 	Key   []byte
 	Value []byte
 
-	// ExpectedValueLength and ExpectedValueDigest are populated only by
-	// MutationDeleteDigestEqual. The closed compare operation makes a stale
-	// global-index delete deterministic without carrying or decoding another
+	// ExpectedValueLength and ExpectedValueDigest are populated only by the
+	// digest-equal mutations. The closed compare operation makes stale deletes
+	// and replacements deterministic without carrying or decoding the prior
 	// JSON value. Ordinary Put/Delete wire bytes remain unchanged.
 	ExpectedValueLength uint64
 	ExpectedValueDigest Digest

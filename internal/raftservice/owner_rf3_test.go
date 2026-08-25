@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -237,6 +238,25 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	if err != nil {
 		t.Fatalf("RF3 Put: %v", err)
 	}
+	// The network server transfers its exact frame allocation through
+	// SubmitOwned. Replaying the same canonical bytes at a stable leader must
+	// consume the retained deterministic result without another proposal or an
+	// outcome-unknown handoff.
+	ownedRetry := make([]byte, len(putData))
+	copy(ownedRetry, putData)
+	replayed, err := owners[leader].SubmitOwned(ctx, leaderState.Fence(), ownedRetry)
+	if err != nil {
+		t.Fatalf("stable-leader owned exact retry: %v", err)
+	}
+	if replayed.Outcome.Code != acknowledged.Outcome.Code ||
+		replayed.Outcome.CompletionAppliedSequence !=
+			acknowledged.Outcome.CompletionAppliedSequence ||
+		replayed.Outcome.CompletionBytes != acknowledged.Outcome.CompletionBytes ||
+		replayed.Outcome.AppliedIndex < acknowledged.Outcome.AppliedIndex ||
+		!bytes.Equal(replayed.Completion, acknowledged.Completion) {
+		t.Fatalf("stable-leader owned exact retry changed result: first=%+v retry=%+v",
+			acknowledged.Outcome, replayed.Outcome)
+	}
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
 	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
@@ -300,6 +320,17 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
+	staleTerm := leaderState.Fence()
+	staleTerm.Term--
+	if _, lease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
+		Fence: staleTerm, Relation: 1, Key: key,
+		MinimumApplied: linearRead.Applied, MaxValueBytes: replication.MaxMutationValueBytes,
+		Linearizable: true,
+	}); !errors.Is(err, raftmodel.ErrNotLeader) || errors.Is(err, ErrServingFence) {
+		t.Fatalf("stale read term lease=%T error=%v", lease, err)
+	} else if lease != nil {
+		t.Fatal("stale read term returned a lease")
+	}
 	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: linearRead.Applied + 1,
@@ -333,6 +364,14 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	if !bytes.Equal(retried.Completion, acknowledged.Completion) {
 		t.Fatal("exact retry returned a different deterministic completion")
+	}
+	if retried.Outcome.Code != acknowledged.Outcome.Code ||
+		retried.Outcome.CompletionAppliedSequence !=
+			acknowledged.Outcome.CompletionAppliedSequence ||
+		retried.Outcome.CompletionBytes != acknowledged.Outcome.CompletionBytes ||
+		retried.Outcome.AppliedIndex < acknowledged.Outcome.AppliedIndex {
+		t.Fatalf("exact retry changed logical result: first=%+v retry=%+v",
+			acknowledged.Outcome, retried.Outcome)
 	}
 }
 
@@ -610,7 +649,7 @@ func newRF3Runtime(
 	apply, _, err := raftmember.OpenPreparedApply(
 		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 64 << 20},
+			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 				TupleVersion:  distribution.CurrentTupleVersion,

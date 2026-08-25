@@ -27,6 +27,9 @@ const DefaultSnapshotStageCheckpointBytes = 64 << 20
 // threshold.
 type SnapshotArtifactStageOptions struct {
 	CheckpointBytes uint64
+	// Capture is the private opaque transition-capture destination authenticated
+	// by the third artifact collection.
+	Capture CollectionTarget
 }
 
 // SnapshotArtifactStage applies verified chunks only to caller-owned,
@@ -39,6 +42,7 @@ type SnapshotArtifactStage struct {
 	expected SnapshotArtifactManifest
 	system   CollectionTarget
 	user     CollectionTarget
+	capture  CollectionTarget
 	cursor   *SnapshotArtifactCursor
 
 	payloadBuffer   []byte
@@ -94,7 +98,17 @@ func NewSnapshotArtifactStageWithOptions(
 		user.ValidationDigest == ([32]byte{}) || user.Validator == nil {
 		return nil, fmt.Errorf("%w: user target: %v", ErrSnapshotStage, err)
 	}
-	if system.Collection == user.Collection ||
+	capture := options.Capture
+	captureOptional := capture.Collection == nil && expected.CaptureRows == 0 &&
+		expected.CaptureImageDigest == snapshotArtifactEmptyCaptureImageDigest()
+	if err := capture.validate(); !captureOptional && (err != nil || capture.Validation != ValidationOpaqueBinary ||
+		capture.ValidationDigest != ([32]byte{}) || capture.Validator != nil ||
+		capture.ObserveMutationAttempt != nil ||
+		capture.Limits.MaxDocumentBytes > MaxTransitionCaptureRecordBytes) {
+		return nil, fmt.Errorf("%w: capture target: %v", ErrSnapshotStage, err)
+	}
+	if system.Collection == user.Collection || !captureOptional &&
+		system.Collection == capture.Collection || user.Collection == capture.Collection ||
 		user.Limits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
 		user.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes {
 		return nil, fmt.Errorf("%w: collection targets", ErrSnapshotStage)
@@ -110,19 +124,23 @@ func NewSnapshotArtifactStageWithOptions(
 			return nil, err
 		}
 	}
-	systemRows, userRows := system.Collection.Len(), user.Collection.Len()
-	if systemRows > expected.SystemRows || userRows > expected.UserRows {
+	systemRows, userRows, captureRows := system.Collection.Len(), user.Collection.Len(), uint64(0)
+	if capture.Collection != nil {
+		captureRows = capture.Collection.Len()
+	}
+	if systemRows > expected.SystemRows || userRows > expected.UserRows || captureRows > expected.CaptureRows {
 		return nil, fmt.Errorf("%w: destination row counts exceed artifact", ErrSnapshotStage)
 	}
 	if cursor != nil {
 		prefix := cursor.PrefixManifest()
-		if systemRows < prefix.SystemRows || userRows < prefix.UserRows {
+		if systemRows < prefix.SystemRows || userRows < prefix.UserRows ||
+			captureRows < prefix.CaptureRows {
 			return nil, fmt.Errorf("%w: cursor advances beyond durable rows", ErrSnapshotStage)
 		}
 	}
 	stage := &SnapshotArtifactStage{
-		expected: cloneSnapshotArtifactManifest(expected), system: system, user: user,
-		cursor: cursor, payloadBuffer: make([]byte, 0, MaxSnapshotArtifactChunkBytes),
+		expected: cloneSnapshotArtifactManifest(expected), system: system, user: user, capture: capture,
+		cursor: cursor, payloadBuffer: make([]byte, 0, DefaultSnapshotArtifactChunkBytes),
 		checkpointBytes: checkpointBytes,
 	}
 	if cursor != nil {
@@ -216,6 +234,11 @@ func (s *SnapshotArtifactStage) applyRows(rows SnapshotArtifactRows) error {
 		collection = s.system.Collection
 	case SnapshotArtifactUser:
 		collection = s.user.Collection
+	case SnapshotArtifactCapture:
+		if s.capture.Collection == nil {
+			return fmt.Errorf("%w: absent capture target", ErrSnapshotStage)
+		}
+		collection = s.capture.Collection
 	default:
 		return fmt.Errorf("%w: chunk collection", ErrSnapshotStage)
 	}
@@ -255,9 +278,9 @@ func (s *SnapshotArtifactStage) applyRows(rows SnapshotArtifactRows) error {
 	return nil
 }
 
-// OpenCandidate performs the expensive final proof over both completed files:
-// system-record validation, retained-completion validation, user placement
-// validation, and canonical-image verification. Success returns a non-serving
+// OpenCandidate performs the expensive final proof over all three completed
+// files: system records, retained completions, user placement, canonical user
+// image, and the exact opaque transition-capture image. Success returns a non-serving
 // Machine at the exact expected publication. The caller still needs learner
 // membership, log-tail catch-up, and topology cutover before serving it.
 func (s *SnapshotArtifactStage) OpenCandidate(
@@ -276,6 +299,24 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	if s.opened {
 		return nil, fmt.Errorf("%w: candidate already opened", ErrSnapshotStage)
 	}
+	// The stage's capture target is the independently verified destination.
+	// Never let caller options redirect the opened Machine to another opaque
+	// collection or bind a different member name after image proof.
+	if s.capture.Collection == nil {
+		if options.TransitionCaptureTarget.Collection != nil ||
+			options.TransitionCaptureTarget.Name != "" {
+			return nil, fmt.Errorf("%w: candidate capture target mismatch", ErrSnapshotStage)
+		}
+		options.TransitionCaptureTarget = TransitionCaptureTarget{}
+	} else {
+		want := TransitionCaptureTarget{
+			Name: TransitionCaptureCollectionName, Collection: s.capture.Collection,
+		}
+		if supplied := options.TransitionCaptureTarget; (supplied.Collection != nil || supplied.Name != "") && supplied != want {
+			return nil, fmt.Errorf("%w: candidate capture target mismatch", ErrSnapshotStage)
+		}
+		options.TransitionCaptureTarget = want
+	}
 	machine, err := Open(
 		s.expected.State.Binding, bootstrap, s.system,
 		UserCollection{Name: string(s.expected.UserCollection), Target: s.user},
@@ -283,6 +324,18 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if s.capture.Collection != nil {
+		captureSnapshot, err := s.capture.Collection.Snapshot()
+		if err != nil {
+			return nil, err
+		}
+		captureDigest, digestErr := snapshotArtifactOpaqueImageDigest(captureSnapshot)
+		closeErr := captureSnapshot.Close()
+		if digestErr != nil || closeErr != nil || s.capture.Collection.Len() != s.expected.CaptureRows ||
+			captureDigest != s.expected.CaptureImageDigest {
+			return nil, errors.Join(fmt.Errorf("%w: candidate capture image", ErrSnapshotStage), digestErr, closeErr)
+		}
 	}
 	if machine.openedImageApplied != s.expected.State.Applied ||
 		machine.openedImageDigest != s.expected.ImageDigest {
@@ -301,7 +354,7 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 
 // AppendSeedEnvelope appends the exact authenticated State row carried by the
 // completed artifact. It is available only after OpenCandidate has proved the
-// final system and user images.
+// final system, user, and capture images.
 func (s *SnapshotArtifactStage) AppendSeedEnvelope(dst []byte) []byte {
 	if s == nil {
 		return dst
@@ -367,10 +420,11 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		expected.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		expected.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
 		expected.Chunks == 0 || expected.SystemRows != expected.State.SessionCount+
-		expected.State.SessionSlotCount+1 ||
+		expected.State.SessionSlotCount+expected.State.AuthorityBindingCount+1 ||
 		expected.PayloadBytes == 0 || expected.EncodedBytes == 0 ||
 		expected.HeaderDigest == ([32]byte{}) ||
 		expected.LastChunkDigest == ([32]byte{}) || expected.ImageDigest == ([32]byte{}) ||
+		expected.CaptureImageDigest == ([32]byte{}) ||
 		expected.Digest == ([32]byte{}) {
 		return fmt.Errorf("%w: expected artifact", ErrSnapshotStage)
 	}
@@ -385,9 +439,10 @@ func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 		uint64(len(header)), expected.Chunks, expected.PayloadBytes, true,
 	)
 	_, wantFooterDigest := makeSnapshotArtifactFooter(
-		expected.Chunks, expected.SystemRows, expected.UserRows,
+		expected.Chunks, expected.SystemRows, expected.UserRows, expected.CaptureRows,
 		expected.PayloadBytes, expected.EncodedBytes,
 		expected.LastChunkDigest, expected.HeaderDigest, expected.ImageDigest,
+		expected.CaptureImageDigest,
 	)
 	if err != nil || headerDigest != expected.HeaderDigest ||
 		!encodedBytesOK || expected.EncodedBytes != wantEncodedBytes ||
@@ -406,7 +461,8 @@ func snapshotArtifactPrefixMatchesExpected(
 		prefix.TargetChunkBytes != expected.TargetChunkBytes ||
 		prefix.HeaderDigest != expected.HeaderDigest ||
 		prefix.Chunks > expected.Chunks || prefix.SystemRows > expected.SystemRows ||
-		prefix.UserRows > expected.UserRows || prefix.PayloadBytes > expected.PayloadBytes {
+		prefix.UserRows > expected.UserRows || prefix.CaptureRows > expected.CaptureRows ||
+		prefix.PayloadBytes > expected.PayloadBytes {
 		return fmt.Errorf("%w: cursor belongs to another artifact", ErrSnapshotStage)
 	}
 	return nil
@@ -432,9 +488,11 @@ func equalSnapshotArtifactManifest(left, right SnapshotArtifactManifest) bool {
 	return left.Seeded == right.Seeded &&
 		left.TargetChunkBytes == right.TargetChunkBytes &&
 		left.Chunks == right.Chunks && left.SystemRows == right.SystemRows &&
-		left.UserRows == right.UserRows && left.PayloadBytes == right.PayloadBytes &&
+		left.UserRows == right.UserRows && left.CaptureRows == right.CaptureRows &&
+		left.PayloadBytes == right.PayloadBytes &&
 		left.EncodedBytes == right.EncodedBytes &&
 		left.HeaderDigest == right.HeaderDigest &&
 		left.LastChunkDigest == right.LastChunkDigest &&
-		left.ImageDigest == right.ImageDigest && left.Digest == right.Digest
+		left.ImageDigest == right.ImageDigest &&
+		left.CaptureImageDigest == right.CaptureImageDigest && left.Digest == right.Digest
 }

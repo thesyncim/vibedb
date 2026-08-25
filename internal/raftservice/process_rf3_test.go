@@ -41,6 +41,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -60,6 +61,7 @@ const (
 	processWALIDEnvironment    = "VIBEDB_RF3_PROCESS_WAL_KEY_ID"
 	processWrappedEnvironment  = "VIBEDB_RF3_PROCESS_WAL_WRAPPED"
 	processMaterialEnvironment = "VIBEDB_RF3_PROCESS_WAL_MATERIAL"
+	processRoleEnvironment     = "VIBEDB_RF3_PROCESS_ROLE"
 
 	processPeerListenerFD   = 3
 	processNativeListenerFD = 4
@@ -67,7 +69,33 @@ const (
 	processStatusFD         = 6
 	processVoters           = 3
 	processMaxStatusBytes   = 8 << 10
+	processStableLeaderTime = 1100 * time.Millisecond
 )
+
+type processRuntimeRole uint8
+
+const (
+	processDataRole processRuntimeRole = iota
+	processCatalogRole
+)
+
+func (role processRuntimeRole) environmentValue() string {
+	if role == processCatalogRole {
+		return "catalog"
+	}
+	return "data"
+}
+
+func processRuntimeRoleFromEnvironment() (processRuntimeRole, error) {
+	switch os.Getenv(processRoleEnvironment) {
+	case "", "data":
+		return processDataRole, nil
+	case "catalog":
+		return processCatalogRole, nil
+	default:
+		return 0, errors.New("invalid process runtime role")
+	}
+}
 
 var processPeerIdentityOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1}
 
@@ -98,9 +126,11 @@ func TestRF3NativeServingThreeProcessRecoveryEvidence(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		ctx = processAuthorizedContext(t, ctx)
 		leader := cluster.elect(t, ctx, 1)
 		client := newFaultProcessClient(t, cluster)
-		session := newProcessNativeSession(t, cluster.route(), client, 0x91)
+		session := newProcessNativeSession(t, cluster.route(), client, 0x91,
+			serviceauthz.CapabilityDataWrite)
 		if _, err := session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 			t.Fatalf("open native session: %v", err)
 		}
@@ -178,9 +208,11 @@ func TestRF3NativeServingThreeProcessRecoveryEvidence(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		ctx = processAuthorizedContext(t, ctx)
 		leader := cluster.elect(t, ctx, 1)
 		client := newFaultProcessClient(t, cluster)
-		session := newProcessNativeSession(t, cluster.route(), client, 0x92)
+		session := newProcessNativeSession(t, cluster.route(), client, 0x92,
+			serviceauthz.CapabilityDataWrite)
 		if _, err := session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 			t.Fatalf("open native session: %v", err)
 		}
@@ -246,6 +278,11 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		sendStatus("E invalid member")
 		t.Fatalf("invalid process member %q", os.Getenv(processMemberEnvironment))
 	}
+	role, err := processRuntimeRoleFromEnvironment()
+	if err != nil {
+		sendStatus("E role: %v", err)
+		t.Fatal(err)
+	}
 	peerListener, err := inheritedProcessListener(processPeerListenerFD, "rf3-peer-listener")
 	if err != nil {
 		sendStatus("E peer listener: %v", err)
@@ -258,7 +295,21 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtime, base, buildErr := buildProcessRuntime(os.Getenv(processRootEnvironment), member)
+	var (
+		runtime    *raftmember.Runtime
+		base       sqldriver.ReplicatedShardStoreIdentity
+		readSource raftservice.ReadSource
+		buildErr   error
+	)
+	if role == processDataRole {
+		runtime, base, readSource, buildErr = buildProcessRuntime(
+			os.Getenv(processRootEnvironment), member,
+		)
+	} else {
+		runtime, base, readSource, buildErr = buildProcessRuntimeForRole(
+			os.Getenv(processRootEnvironment), member, role,
+		)
+	}
 	if errors.Is(buildErr, storeio.ErrStrictAllocationUnsupported) ||
 		errors.Is(buildErr, raftstore.ErrPlatformUnsupported) {
 		_ = peerListener.Close()
@@ -273,7 +324,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 		t.Fatal(buildErr)
 	}
 
-	peer, pulse, err := buildProcessPeer(runtime, base, peerListener, member)
+	peer, pulse, err := buildProcessPeer(runtime, base, readSource, peerListener, member)
 	if err != nil {
 		_ = runtime.Close()
 		_ = nativeListener.Close()
@@ -368,6 +419,17 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 			running = false
 		}
 	}
+	serverStats := server.Stats()
+	_, _ = fmt.Fprintf(os.Stderr,
+		"rf3 proposal diagnostics unknown-submit=%d unknown-abandoned=%d invalid-completion=%d invalid-deterministic=%d completion-reasons=%d deterministic-reasons=%d deterministic-code=%d deterministic-applied=%d deterministic-state-applied=%d\n",
+		serverStats.ProposalUnknownSubmit, serverStats.ProposalUnknownAbandoned,
+		serverStats.ProposalInvalidCompletion, serverStats.ProposalInvalidDeterministic,
+		serverStats.ProposalInvalidCompletionReasons,
+		serverStats.ProposalInvalidDeterministicReasons,
+		serverStats.ProposalInvalidDeterministicCode,
+		serverStats.ProposalInvalidDeterministicApplied,
+		serverStats.ProposalInvalidDeterministicState,
+	)
 	close(stopPulse)
 	cancel()
 	select {
@@ -422,7 +484,20 @@ type processRF3Cluster struct {
 }
 
 func startProcessRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
+	return startProcessRF3ClusterForRole(t, processDataRole)
+}
+
+func startProcessCatalogRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
+	return startProcessRF3ClusterForRole(t, processCatalogRole)
+}
+
+func startProcessRF3ClusterForRole(
+	t testing.TB, role processRuntimeRole,
+) (*processRF3Cluster, error) {
 	t.Helper()
+	if role != processDataRole && role != processCatalogRole {
+		return nil, errors.New("invalid RF3 process role")
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -498,6 +573,7 @@ func startProcessRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
 		// credentials or satisfy a missing test input from the parent process.
 		command.Env = []string{
 			processHelperEnvironment + "=1",
+			processRoleEnvironment + "=" + role.environmentValue(),
 			processMemberEnvironment + "=" + strconv.FormatUint(member, 10),
 			processRootEnvironment + "=" + filepath.Join(root, fmt.Sprintf("member-%d", member)),
 			processPeersEnvironment + "=" + strings.Join(cluster.peerAddresses[:], ","),
@@ -583,7 +659,7 @@ func startProcessRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
 			return cluster, fmt.Errorf("member %d readiness: %s", child.member, line)
 		}
 	}
-	cluster.routeValue, err = processCatalogRoute(cluster.nativeAddresses, cluster.commandFence)
+	cluster.routeValue, err = processRoleRoute(role, cluster.nativeAddresses, cluster.commandFence)
 	if err != nil {
 		return cluster, err
 	}
@@ -672,10 +748,40 @@ func (cluster *processRF3Cluster) waitLeader(t testing.TB, ctx context.Context) 
 	return 0
 }
 
+func (cluster *processRF3Cluster) waitStableLeader(t testing.TB, ctx context.Context) uint64 {
+	t.Helper()
+	var leader, term uint64
+	stableSince := time.Now()
+	for ctx.Err() == nil {
+		observedLeader := cluster.waitLeader(t, ctx)
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		state, err := cluster.probe(probeCtx, observedLeader)
+		cancel()
+		if err != nil || state.LeaderID != observedLeader || state.Fence.MemberID != observedLeader {
+			leader, term = 0, 0
+			stableSince = time.Now()
+			continue
+		}
+		if leader != observedLeader || term != state.Fence.Term {
+			leader, term = observedLeader, state.Fence.Term
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= processStableLeaderTime {
+			return leader
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("wait for stable RF3 leader: %v", context.Cause(ctx))
+	return 0
+}
+
 func (cluster *processRF3Cluster) probe(
 	ctx context.Context,
 	member uint64,
 ) (shardservice.ReplicatedMemberState, error) {
+	fence, ok := cluster.probeFence()
+	if !ok || member == 0 || member > processVoters {
+		return shardservice.ReplicatedMemberState{}, shardservice.ErrReplicatedWire
+	}
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", cluster.nativeAddresses[member-1])
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
@@ -683,9 +789,7 @@ func (cluster *processRF3Cluster) probe(
 	defer connection.Close()
 	response, err := shardservice.RoundTripReplicated(ctx, connection, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe,
-		Fence: shardservice.ReplicatedFence{
-			Group: processGroup(), AllocationGeneration: 7,
-		},
+		Fence:     fence,
 	})
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
@@ -700,6 +804,25 @@ func (cluster *processRF3Cluster) probe(
 		)
 	}
 	return response.State, nil
+}
+
+func (cluster *processRF3Cluster) probeFence() (shardservice.ReplicatedFence, bool) {
+	if cluster == nil {
+		return shardservice.ReplicatedFence{}, false
+	}
+	route := cluster.routeValue
+	valid := route.Distribution != "" && route.Shard != "" &&
+		route.Group.ClusterID != ([16]byte{}) &&
+		route.Group.ClusterIncarnation != ([16]byte{}) &&
+		route.Group.TopologyRecoveryEpoch != 0 &&
+		route.Group.ShardIncarnation != ([16]byte{}) &&
+		route.Group.GroupID != ([16]byte{}) && route.AllocationGeneration != 0
+	if !valid {
+		return shardservice.ReplicatedFence{}, false
+	}
+	return shardservice.ReplicatedFence{
+		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+	}, true
 }
 
 func (cluster *processRF3Cluster) waitCommittedApplied(
@@ -993,6 +1116,17 @@ type faultProcessClient struct {
 	member   uint64
 	attempts [][]byte
 	hidden   []byte
+	trace    []processProposalTrace
+	last     gateway.ReplicatedResult
+	hasLast  bool
+}
+
+type processProposalTrace struct {
+	Member uint64
+	Kind   shardservice.ReplicatedResponseKind
+	Leader uint64
+	Term   uint64
+	Failed bool
 }
 
 func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProcessClient {
@@ -1044,6 +1178,26 @@ func (client *faultProcessClient) DoReplicated(
 		}
 	}
 	response, err := client.base.DoReplicated(ctx, endpoint, request)
+	if isMutation {
+		trace := processProposalTrace{Member: member, Failed: err != nil}
+		if response != nil {
+			trace.Kind = response.Kind
+			if response.HasState {
+				trace.Leader = response.State.LeaderID
+				trace.Term = response.State.Fence.Term
+			}
+		}
+		client.mu.Lock()
+		client.trace = append(client.trace, trace)
+		if err == nil && response != nil && response.Kind == shardservice.ReplicatedCompletion {
+			client.last = gateway.ReplicatedResult{
+				Outcome: response.Outcome, State: response.State,
+				Completion: append(client.last.Completion[:0], response.Completion...),
+			}
+			client.hasLast = true
+		}
+		client.mu.Unlock()
+	}
 	if stage == faultAfterDecodedResponseBeforeClientDelivery && err == nil && response != nil &&
 		response.Kind == shardservice.ReplicatedCompletion {
 		client.mu.Lock()
@@ -1078,7 +1232,24 @@ func (client *faultProcessClient) resetAttempts() {
 	client.mu.Lock()
 	client.attempts = client.attempts[:0]
 	client.hidden = client.hidden[:0]
+	client.trace = client.trace[:0]
+	client.last = gateway.ReplicatedResult{}
+	client.hasLast = false
 	client.mu.Unlock()
+}
+
+func (client *faultProcessClient) lastProposalResult() (gateway.ReplicatedResult, bool) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	result := client.last
+	result.Completion = append([]byte(nil), result.Completion...)
+	return result, client.hasLast
+}
+
+func (client *faultProcessClient) proposalTrace() []processProposalTrace {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return append([]processProposalTrace(nil), client.trace...)
 }
 
 func (client *faultProcessClient) snapshot() ([][]byte, []byte) {
@@ -1096,12 +1267,40 @@ func newProcessNativeSession(
 	route gateway.ReplicatedRoute,
 	client *faultProcessClient,
 	clientSeed byte,
+	capability serviceauthz.Capability,
+) *gateway.NativeSession {
+	return newProcessNativeSessionForPlacement(
+		t, route, client, clientSeed, capability, "orders", "0000-ffff",
+	)
+}
+
+func newProcessCatalogSession(
+	t testing.TB,
+	route gateway.ReplicatedRoute,
+	client *faultProcessClient,
+	clientSeed byte,
+	capability serviceauthz.Capability,
+) *gateway.NativeSession {
+	return newProcessNativeSessionForPlacement(
+		t, route, client, clientSeed, capability, "catalog", "controlplane",
+	)
+}
+
+func newProcessNativeSessionForPlacement(
+	t testing.TB,
+	route gateway.ReplicatedRoute,
+	client *faultProcessClient,
+	clientSeed byte,
+	capability serviceauthz.Capability,
+	distributionName distribution.DistributionName,
+	shardID distribution.ShardID,
 ) *gateway.NativeSession {
 	t.Helper()
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
 		Executor: client.executor, Route: route,
-		Distribution: "orders", Shard: "0000-ffff",
+		Distribution: string(distributionName), Shard: string(shardID),
 		Tenant: []byte("process-test-tenant"), ClientID: replication.ID128{clientSeed},
+		ProposalCapability: capability,
 		Resolver:           gateway.BaseRelationResolver{Relation: 1},
 		MaxRelationBatches: 4, MaxMutations: 8,
 		InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
@@ -1110,6 +1309,21 @@ func newProcessNativeSession(
 		t.Fatal(err)
 	}
 	return session
+}
+
+func processRequestAuthority() serviceauthz.Authority {
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	return authority
+}
+
+func processAuthorizedContext(t testing.TB, ctx context.Context) context.Context {
+	t.Helper()
+	bound, err := serviceauthz.WithAuthority(ctx, processRequestAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bound
 }
 
 func processOrderedKey(t testing.TB, source string) []byte {
@@ -1169,14 +1383,25 @@ func processPulse(stop <-chan struct{}, pulse chan<- struct{}) {
 func buildProcessRuntime(
 	root string,
 	member uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, error) {
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, raftservice.ReadSource, error) {
+	return buildProcessRuntimeForRole(root, member, processDataRole)
+}
+
+func buildProcessRuntimeForRole(
+	root string,
+	member uint64,
+	role processRuntimeRole,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, raftservice.ReadSource, error) {
 	if root == "" || member == 0 || member > processVoters {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, errors.New("invalid process runtime identity")
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, errors.New("invalid process runtime identity")
 	}
-	identity := processStoreIdentity(member)
+	if role != processDataRole && role != processCatalogRole {
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, errors.New("invalid process runtime role")
+	}
+	identity := processStoreIdentityForRole(role, member)
 	key, err := processWALKeyFromEnvironment()
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
 	baseIndex, baseTerm := uint64(1), uint64(1)
 	wal, err := raftstore.Create(
@@ -1192,7 +1417,7 @@ func buildProcessRuntime(
 		},
 	)
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
 	database, err := sqldriver.InitializeShardStore(
 		filepath.Join(root, "member.vdb"), sqldriver.ShardStoreBinding{
@@ -1203,16 +1428,22 @@ func buildProcessRuntime(
 	)
 	if err != nil {
 		_ = wal.Close()
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
-	closeBoth := func(cause error) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, error) {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, errors.Join(cause, database.Close(), wal.Close())
+	closeBoth := func(cause error) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, raftservice.ReadSource, error) {
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, errors.Join(cause, database.Close(), wal.Close())
 	}
 	session, err := database.NewSession(context.Background())
 	if err != nil {
 		return closeBoth(err)
 	}
-	prepared, err := session.Prepare(context.Background(), `CREATE TABLE docs (PRIMARY KEY (id))`)
+	table := "docs"
+	statement := `CREATE TABLE docs (PRIMARY KEY (id))`
+	if role == processCatalogRole {
+		table = gateway.ReplicatedCatalogTable
+		statement = `CREATE TABLE ` + gateway.ReplicatedCatalogTable + ` (PRIMARY KEY (id))`
+	}
+	prepared, err := session.Prepare(context.Background(), statement)
 	if err == nil {
 		_, err = prepared.Exec(context.Background(), nil)
 	}
@@ -1224,14 +1455,14 @@ func buildProcessRuntime(
 		return closeBoth(err)
 	}
 	authority := processAuthority()
-	base, err := raftmember.BindPreparedSQL(wal, database, authority, "docs")
+	base, err := raftmember.BindPreparedSQL(wal, database, authority, table)
 	if err != nil {
 		return closeBoth(err)
 	}
 	apply, _, err := raftmember.OpenPreparedApply(
 		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 64 << 20},
+			TxnLimits: durable.TxnLimits{MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20},
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 				TupleVersion:  distribution.CurrentTupleVersion,
@@ -1254,14 +1485,15 @@ func buildProcessRuntime(
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
 	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
+		return nil, sqldriver.ReplicatedShardStoreIdentity{}, nil, err
 	}
-	return runtime, base, nil
+	return runtime, base, apply, nil
 }
 
 func buildProcessPeer(
 	runtime *raftmember.Runtime,
 	base sqldriver.ReplicatedShardStoreIdentity,
+	readSource raftservice.ReadSource,
 	listener net.Listener,
 	member uint64,
 ) (*raftservice.AuthenticatedPeerRuntime, chan struct{}, error) {
@@ -1326,7 +1558,8 @@ func buildProcessPeer(
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Owner: raftservice.Options{
 			Registry: serving, Host: host,
-			Members: []raftmember.RuntimeIdentity{runtime.Identity()},
+			Members:     []raftmember.RuntimeIdentity{runtime.Identity()},
+			ReadSources: []raftservice.ReadSource{readSource},
 			CommandFences: []raftservice.CommandFence{
 				processCommandFenceFromRuntime(runtime.Identity(), base),
 			},
@@ -1518,6 +1751,15 @@ func processNode(member uint64) (node rafttransport.NodeID) {
 
 func processGroup() (group raftmember.GroupKey) {
 	identity := processStoreIdentity(1)
+	return processGroupFromIdentity(identity)
+}
+
+func processCatalogGroup() (group raftmember.GroupKey) {
+	identity := processCatalogStoreIdentity(1)
+	return processGroupFromIdentity(identity)
+}
+
+func processGroupFromIdentity(identity raftstore.Identity) (group raftmember.GroupKey) {
 	group.ClusterID = identity.ClusterID
 	group.ClusterIncarnation = identity.ClusterIncarnation
 	group.TopologyRecoveryEpoch = 3
@@ -1539,6 +1781,30 @@ func processStoreIdentity(member uint64) raftstore.Identity {
 		identity.StoreID[index] = byte(index+81) ^ byte(member)
 	}
 	return identity
+}
+
+func processCatalogStoreIdentity(member uint64) raftstore.Identity {
+	identity := raftstore.Identity{
+		Distribution: "catalog", Shard: "controlplane",
+		AllocationGeneration: 23, MemberID: member,
+	}
+	for index := range identity.ClusterID {
+		// The catalog group belongs to the same authenticated cluster but has
+		// independent shard, group, and physical-store identities.
+		identity.ClusterID[index] = byte(index + 1)
+		identity.ClusterIncarnation[index] = byte(index + 21)
+		identity.ShardIncarnation[index] = byte(index + 141)
+		identity.GroupID[index] = byte(index + 161)
+		identity.StoreID[index] = byte(index+181) ^ byte(member)
+	}
+	return identity
+}
+
+func processStoreIdentityForRole(role processRuntimeRole, member uint64) raftstore.Identity {
+	if role == processCatalogRole {
+		return processCatalogStoreIdentity(member)
+	}
+	return processStoreIdentity(member)
 }
 
 func processAuthority() sqldriver.ReplicatedAuthorityProfile {
@@ -1585,17 +1851,41 @@ func processHostLimits() multiraft.Limits {
 	}
 }
 
-func processCatalogRoute(
+func processRoleRoute(
+	role processRuntimeRole,
 	addresses [processVoters]string,
 	command raftservice.CommandFence,
 ) (gateway.ReplicatedRoute, error) {
-	const (
-		distributionName distribution.DistributionName = "orders"
-		shardID          distribution.ShardID          = "0000-ffff"
-	)
+	distributionName := distribution.DistributionName("orders")
+	shardID := distribution.ShardID("0000-ffff")
+	table := "docs"
+	primaryKey := "/id"
+	allocationGeneration := distribution.ShardAllocationGeneration(7)
+	group := processGroup()
 	endpointIDs := [processVoters]distribution.EndpointID{"rf3-member-1", "rf3-member-2", "rf3-member-3"}
+	nativeEndpointIDs := [processVoters]distribution.EndpointID{"rf3-native-1", "rf3-native-2", "rf3-native-3"}
+	controlEndpointIDs := [processVoters]distribution.EndpointID{"rf3-control-1", "rf3-control-2", "rf3-control-3"}
+	if role == processCatalogRole {
+		distributionName = gateway.ReplicatedCatalogDistribution
+		shardID = gateway.ReplicatedCatalogShard
+		table = gateway.ReplicatedCatalogTable
+		primaryKey = gateway.ReplicatedCatalogPrimaryKey
+		allocationGeneration = 23
+		group = processCatalogGroup()
+		endpointIDs = [processVoters]distribution.EndpointID{
+			"rf3-catalog-member-1", "rf3-catalog-member-2", "rf3-catalog-member-3",
+		}
+		nativeEndpointIDs = [processVoters]distribution.EndpointID{
+			"rf3-catalog-native-1", "rf3-catalog-native-2", "rf3-catalog-native-3",
+		}
+		controlEndpointIDs = [processVoters]distribution.EndpointID{
+			"rf3-catalog-control-1", "rf3-catalog-control-2", "rf3-catalog-control-3",
+		}
+	} else if role != processDataRole {
+		return gateway.ReplicatedRoute{}, errors.New("invalid RF3 process route role")
+	}
 	manifest, err := distribution.NewManifest(distributionName, 17, []distribution.Shard{{
-		ID: shardID, AllocationGeneration: 7,
+		ID: shardID, AllocationGeneration: allocationGeneration,
 		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		Leaders: endpointIDs[:], Epoch: 11,
 	}})
@@ -1607,24 +1897,28 @@ func processCatalogRoute(
 			Name: distributionName, Arity: 1, MapperVersion: distribution.NativeMapperVersion,
 		}},
 		Placements: []distribution.TablePlacement{{
-			Table: "docs", Distribution: distributionName, Columns: []string{"/id"},
+			Table: table, Distribution: distributionName, Columns: []string{primaryKey},
 		}},
 		Manifests: []*distribution.Manifest{manifest},
 	}
 	endpoints := make(map[distribution.EndpointID]string, processVoters)
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, processVoters)
 	for index := 0; index < processVoters; index++ {
-		endpoints[endpointIDs[index]] = addresses[index]
+		endpoints[endpointIDs[index]] = fmt.Sprintf("127.0.0.1:%d", 1+index)
+		endpoints[nativeEndpointIDs[index]] = addresses[index]
+		endpoints[controlEndpointIDs[index]] = fmt.Sprintf("127.0.0.1:%d", 101+index)
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{
 			Member: uint64(index + 1), Node: processNode(uint64(index + 1)),
-			StoreID:         processStoreIdentity(uint64(index + 1)).StoreID,
+			StoreID:         processStoreIdentityForRole(role, uint64(index+1)).StoreID,
 			NodeIncarnation: 1, Endpoint: endpointIDs[index],
+			NativeEndpoint:  nativeEndpointIDs[index],
+			ControlEndpoint: controlEndpointIDs[index],
 		}
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 1, nil, nil, []gateway.ReplicatedShardDescriptor{{
 			Distribution: distributionName, Shard: shardID,
-			Group: processGroup(), AllocationGeneration: 7,
+			Group: group, AllocationGeneration: allocationGeneration,
 			Command: command, Replicas: replicas,
 		}},
 	)
@@ -1634,7 +1928,7 @@ func processCatalogRoute(
 	var workspace [processVoters]gateway.ReplicatedEndpoint
 	route, ok := snapshot.ResolveReplicatedRoute(distributionName, shardID, workspace[:0])
 	if !ok || len(route.Replicas) != processVoters {
-		return gateway.ReplicatedRoute{}, errors.New("exact RF3 catalog route did not resolve")
+		return gateway.ReplicatedRoute{}, errors.New("exact RF3 process route did not resolve")
 	}
 	route.Replicas = append([]gateway.ReplicatedEndpoint(nil), route.Replicas...)
 	return route, nil

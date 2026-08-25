@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -30,9 +31,11 @@ var (
 // index relations are resolved. Key is already the engine's canonical ordered
 // key; Value is exact vibejson for Put and empty for Delete.
 type NativeMutation struct {
-	Kind  replication.MutationKind
-	Key   []byte
-	Value []byte
+	Kind                replication.MutationKind
+	Key                 []byte
+	Value               []byte
+	ExpectedValueLength uint64
+	ExpectedValueDigest replication.Digest
 }
 
 // BundleResolver emits dense, strictly increasing relation IDs for one native
@@ -56,6 +59,8 @@ func (resolver BaseRelationResolver) ResolveNative(
 ) error {
 	return builder.Add(resolver.Relation, replication.Mutation{
 		Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+		ExpectedValueLength: mutation.ExpectedValueLength,
+		ExpectedValueDigest: mutation.ExpectedValueDigest,
 	})
 }
 
@@ -122,11 +127,69 @@ type NativeSessionOptions struct {
 	ClientID     replication.ID128
 	RetryHome    replication.RetryHome
 	Resolver     BundleResolver
+	Journal      *NativeSessionJournal
+	// ProposalCapability is the exact authorization class placed on every
+	// probe and proposal. Only DataWrite and Topology are admitted.
+	ProposalCapability serviceauthz.Capability
 
 	MaxRelationBatches  int
 	MaxMutations        int
 	InitialCommandBytes int
 	MaxCommandBytes     int
+}
+
+// NativeSessionJournalBinding returns the portable identity of one durable
+// base-relation session. Replica addresses are deliberately excluded: routing
+// can change while an exact pending command remains retryable. Every field
+// interpreted by replicated apply is included, including the manifest digest.
+func NativeSessionJournalBinding(
+	route ReplicatedRoute,
+	distribution, shard string,
+	tenant []byte,
+	relation replication.RelationID,
+	capability serviceauthz.Capability,
+) (replication.Digest, error) {
+	if !validReplicatedRoute(route) ||
+		distribution != string(route.Distribution) || shard != string(route.Shard) ||
+		!validNativeSessionIdentity(distribution, shard, tenant) ||
+		relation == 0 || relation > replication.MaxRelationID ||
+		(capability != serviceauthz.CapabilityDataWrite &&
+			capability != serviceauthz.CapabilityTopology) {
+		return replication.Digest{}, ErrNativeSession
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/native-session-journal/1"))
+	_, _ = hash.Write(route.Group.ClusterID[:])
+	_, _ = hash.Write(route.Group.ClusterIncarnation[:])
+	_, _ = hash.Write(route.Group.ShardIncarnation[:])
+	_, _ = hash.Write(route.Group.GroupID[:])
+	var scalar [8]byte
+	writeScalar := func(value uint64) {
+		binary.LittleEndian.PutUint64(scalar[:], value)
+		_, _ = hash.Write(scalar[:])
+	}
+	writeBytes := func(value []byte) {
+		writeScalar(uint64(len(value)))
+		_, _ = hash.Write(value)
+	}
+	writeScalar(route.Group.TopologyRecoveryEpoch)
+	writeScalar(route.AllocationGeneration)
+	writeScalar(route.Command.ReplicaSetVersion)
+	writeScalar(route.Command.ActivePolicyGeneration)
+	writeScalar(route.Command.ProtectionEpoch)
+	writeScalar(route.Command.OwnershipEpoch)
+	writeScalar(route.Command.SchemaGeneration)
+	_, _ = hash.Write(route.Command.RelationManifestDigest[:])
+	writeScalar(route.Command.RoutingVersion)
+	writeScalar(route.Command.RouteGeneration)
+	writeBytes([]byte(distribution))
+	writeBytes([]byte(shard))
+	writeBytes(tenant)
+	writeScalar(uint64(relation))
+	writeScalar(uint64(capability))
+	var digest replication.Digest
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 type nativeSessionPhase uint8
@@ -162,6 +225,8 @@ type NativeSession struct {
 	terminalSequence    uint64
 	terminalFingerprint replication.Digest
 	leader              shardservice.ReplicatedMemberState
+	journal             *NativeSessionJournal
+	proposalCapability  serviceauthz.Capability
 }
 
 // NativeSessionStatus is a detached fixed-width view. Pending means callers
@@ -200,6 +265,8 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.InitialCommandBytes = 4 << 10
 	}
 	if options.Executor == nil || !validReplicatedRoute(options.Route) ||
+		options.Distribution != string(options.Route.Distribution) ||
+		options.Shard != string(options.Route.Shard) ||
 		!validNativeSessionIdentity(options.Distribution, options.Shard, options.Tenant) ||
 		options.ClientID == (replication.ID128{}) || options.Resolver == nil ||
 		options.MaxRelationBatches <= 0 || options.MaxRelationBatches > replication.MaxRelationBatches ||
@@ -208,19 +275,41 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.InitialCommandBytes <= 0 || options.InitialCommandBytes > options.MaxCommandBytes {
 		return nil, ErrNativeSession
 	}
+	if options.ProposalCapability != serviceauthz.CapabilityDataWrite &&
+		options.ProposalCapability != serviceauthz.CapabilityTopology {
+		return nil, ErrNativeSession
+	}
 	route := options.Route
 	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
 	tenant := append([]byte(nil), options.Tenant...)
 	tenant = tenant[:len(tenant):len(tenant)]
-	return &NativeSession{
+	session := &NativeSession{
 		executor: options.Executor, route: route,
 		distribution: strings.Clone(options.Distribution), shard: strings.Clone(options.Shard),
 		tenant: tenant, clientID: options.ClientID, retryHome: options.RetryHome,
 		resolver: options.Resolver,
 		bundle:   newRelationBundleBuilder(options.MaxRelationBatches, options.MaxMutations),
 		command:  make([]byte, 0, options.InitialCommandBytes), maxCommand: options.MaxCommandBytes,
-		nextSequence: 1,
-	}, nil
+		nextSequence:       1,
+		journal:            options.Journal,
+		proposalCapability: options.ProposalCapability,
+	}
+	if options.Journal != nil {
+		relation := nativeResolverBaseRelation(options.Resolver)
+		expectedBinding, bindingErr := NativeSessionJournalBinding(
+			options.Route, options.Distribution, options.Shard, options.Tenant,
+			relation, options.ProposalCapability,
+		)
+		state, loadErr := options.Journal.load()
+		if bindingErr != nil || loadErr != nil ||
+			options.Journal.maxCommand != options.MaxCommandBytes ||
+			options.Journal.binding != expectedBinding ||
+			state.clientID != options.ClientID || state.retryHome != options.RetryHome {
+			return nil, errors.Join(bindingErr, loadErr, ErrNativeSession)
+		}
+		session.restoreDurableState(state)
+	}
+	return session, nil
 }
 
 func (session *NativeSession) Status() NativeSessionStatus {
@@ -268,6 +357,17 @@ func (session *NativeSession) Put(
 	})
 }
 
+// PutIfAbsentOrEqual creates one document or confirms an exact canonical
+// retry. A different existing value returns a deterministic conflict.
+func (session *NativeSession) PutIfAbsentOrEqual(
+	ctx context.Context,
+	key, document []byte,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: document,
+	})
+}
+
 func (session *NativeSession) Delete(
 	ctx context.Context,
 	key []byte,
@@ -275,40 +375,68 @@ func (session *NativeSession) Delete(
 	return session.mutate(ctx, NativeMutation{Kind: replication.MutationDelete, Key: key})
 }
 
+// CompareDelete removes one document only when its current raw identity
+// matches. An already absent value is an idempotent success.
+func (session *NativeSession) CompareDelete(
+	ctx context.Context,
+	key []byte,
+	expectedLength uint64,
+	expectedDigest replication.Digest,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationDeleteDigestEqual, Key: key,
+		ExpectedValueLength: expectedLength, ExpectedValueDigest: expectedDigest,
+	})
+}
+
+// ComparePut atomically replaces one document only when the current raw value
+// has the exact expected length and SHA-256 digest.
+func (session *NativeSession) ComparePut(
+	ctx context.Context,
+	key, document []byte,
+	expectedLength uint64,
+	expectedDigest replication.Digest,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationPutDigestEqual, Key: key, Value: document,
+		ExpectedValueLength: expectedLength, ExpectedValueDigest: expectedDigest,
+	})
+}
+
 func (session *NativeSession) mutate(
 	ctx context.Context,
 	mutation NativeMutation,
+) (NativeResult, error) {
+	mutations := [...]NativeMutation{mutation}
+	return session.MutateBatch(ctx, mutations[:])
+}
+
+// MutateBatch proposes one atomic ordered logical batch. It is primarily the
+// control-plane primitive for publishing an operation record with its bounded
+// discovery directory in the same RF3 entry; partial visibility is impossible.
+// Resolver expansion remains covered by the session's fixed relation/mutation
+// bounds, and the exact encoded command is retained on outcome unknown.
+func (session *NativeSession) MutateBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
 ) (NativeResult, error) {
 	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
 		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
 		return NativeResult{}, sessionStateError(session)
 	}
-	// Reject byte bounds before vibejson validation, resolver fanout, command
-	// hashing, or buffer growth. An oversized value cannot fit this session's
-	// command even if the global mutation bound is larger.
-	if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes {
-		return NativeResult{}, ErrNativeBundleBound
-	}
-	switch mutation.Kind {
-	case replication.MutationPut:
-		if len(mutation.Value) == 0 ||
-			len(mutation.Value) > replication.MaxMutationValueBytes ||
-			len(mutation.Value) > session.maxCommand {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-		if !vibejson.Valid(mutation.Value) {
-			return NativeResult{}, ErrNativeDocument
-		}
-	case replication.MutationDelete:
-		if len(mutation.Value) != 0 {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-	default:
+	if len(mutations) == 0 || len(mutations) > session.bundle.maxMutations {
 		return NativeResult{}, ErrNativeBundleBound
 	}
 	session.bundle.reset()
-	if err := session.resolver.ResolveNative(&session.bundle, mutation); err != nil {
-		return NativeResult{}, err
+	for index := range mutations {
+		if err := session.validateNativeMutation(mutations[index]); err != nil {
+			session.bundle.reset()
+			return NativeResult{}, err
+		}
+		if err := session.resolver.ResolveNative(&session.bundle, mutations[index]); err != nil {
+			session.bundle.reset()
+			return NativeResult{}, err
+		}
 	}
 	if len(session.bundle.batches) == 0 || len(session.bundle.mutations) == 0 {
 		session.bundle.reset()
@@ -321,6 +449,46 @@ func (session *NativeSession) mutate(
 	result, err := session.prepareAndExecute(ctx, command, false)
 	session.bundle.reset()
 	return result, err
+}
+
+func (session *NativeSession) validateNativeMutation(mutation NativeMutation) error {
+	// Reject byte bounds before vibejson validation, resolver fanout, command
+	// hashing, or buffer growth. An oversized value cannot fit this session's
+	// command even if the global mutation bound is larger.
+	if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes {
+		return ErrNativeBundleBound
+	}
+	switch mutation.Kind {
+	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
+		replication.MutationPutDigestEqual:
+		if len(mutation.Value) == 0 ||
+			len(mutation.Value) > replication.MaxMutationValueBytes ||
+			len(mutation.Value) > session.maxCommand {
+			return ErrNativeBundleBound
+		}
+		if !vibejson.Valid(mutation.Value) {
+			return ErrNativeDocument
+		}
+		if mutation.Kind == replication.MutationPutDigestEqual &&
+			(mutation.ExpectedValueLength == 0 ||
+				mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+				mutation.ExpectedValueDigest == (replication.Digest{})) {
+			return ErrNativeBundleBound
+		}
+	case replication.MutationDelete:
+		if len(mutation.Value) != 0 {
+			return ErrNativeBundleBound
+		}
+	case replication.MutationDeleteDigestEqual:
+		if len(mutation.Value) != 0 || mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+			mutation.ExpectedValueDigest == (replication.Digest{}) {
+			return ErrNativeBundleBound
+		}
+	default:
+		return ErrNativeBundleBound
+	}
+	return nil
 }
 
 func (session *NativeSession) Renew(
@@ -395,8 +563,13 @@ func (session *NativeSession) commandHeader(
 	epoch, sequence, ackThrough uint64,
 ) replication.Command {
 	commandFence := session.route.Command
+	authorityClass := replication.CommandAuthorityData
+	if session.proposalCapability == serviceauthz.CapabilityTopology {
+		authorityClass = replication.CommandAuthorityTopology
+	}
 	return replication.Command{
 		Kind:                  kind,
+		AuthorityClass:        authorityClass,
 		ClusterID:             session.route.Group.ClusterID,
 		ClusterIncarnation:    session.route.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch: session.route.Group.TopologyRecoveryEpoch,
@@ -443,6 +616,13 @@ func (session *NativeSession) prepareAndExecute(
 		return NativeResult{}, err
 	}
 	session.pending = true
+	if session.journal != nil {
+		if err = session.journal.store(session.durableState()); err != nil {
+			session.pending = false
+			session.command = session.command[:0]
+			return NativeResult{}, err
+		}
+	}
 	return session.executePending(ctx, false)
 }
 
@@ -451,11 +631,14 @@ func (session *NativeSession) executePending(
 	priorUnknown bool,
 ) (NativeResult, error) {
 	var hint *shardservice.ReplicatedMemberState
-	if session.leader != (shardservice.ReplicatedMemberState{}) {
+	// A cached leader is a latency hint only while no admitted outcome is in
+	// doubt. RetryPending may follow that leader's failure; discover the current
+	// leader before spending a bounded proposal attempt on the retained bytes.
+	if !priorUnknown && session.leader != (shardservice.ReplicatedMemberState{}) {
 		hint = &session.leader
 	}
 	result, err := session.executor.propose(
-		ctx, session.route, session.command, hint, priorUnknown,
+		ctx, session.route, session.command, hint, priorUnknown, session.proposalCapability,
 	)
 	if err != nil {
 		if errors.Is(err, raftservice.ErrOutcomeUnknown) {
@@ -464,11 +647,16 @@ func (session *NativeSession) executePending(
 		command, openErr := replication.OpenCommand(session.command)
 		if openErr == nil && command.Kind() == replication.CommandSessionRelease &&
 			errors.Is(err, replicatedstate.ErrSessionReleased) {
+			prior := session.durableState()
 			session.phase = nativeSessionReleased
-			session.clearPending()
+			if persistErr := session.persistCompletedPending(prior); persistErr != nil {
+				return NativeResult{}, persistErr
+			}
 			return NativeResult{Released: true}, nil
 		}
-		session.clearPending()
+		if persistErr := session.persistAbandonedPending(); persistErr != nil {
+			return NativeResult{}, persistErr
+		}
 		return NativeResult{}, err
 	}
 	session.leader = result.State
@@ -482,8 +670,11 @@ func (session *NativeSession) executePending(
 			Command: append([]byte(nil), session.command...), Cause: ErrReplicatedRoute,
 		}
 	}
+	prior := session.durableState()
 	session.finishCompletion(command, completion)
-	session.clearPending()
+	if err = session.persistCompletedPending(prior); err != nil {
+		return NativeResult{}, err
+	}
 	return NativeResult{Outcome: result.Outcome, Completion: completion}, nil
 }
 
@@ -521,6 +712,59 @@ func (session *NativeSession) finishCompletion(
 func (session *NativeSession) clearPending() {
 	session.pending = false
 	session.command = session.command[:0]
+}
+
+func (session *NativeSession) durableState() durableNativeSessionState {
+	state := durableNativeSessionState{
+		clientID: session.clientID, retryHome: session.retryHome, phase: session.phase,
+		epoch: session.epoch, nextSequence: session.nextSequence, ackThrough: session.ackThrough,
+		leaseDeadline: session.leaseDeadline, terminalSequence: session.terminalSequence,
+		terminalFingerprint: session.terminalFingerprint, pending: session.pending,
+	}
+	if session.pending {
+		state.command = session.command
+	}
+	return state
+}
+
+func (session *NativeSession) restoreDurableState(state durableNativeSessionState) {
+	session.phase, session.epoch = state.phase, state.epoch
+	session.nextSequence, session.ackThrough = state.nextSequence, state.ackThrough
+	session.leaseDeadline, session.terminalSequence = state.leaseDeadline, state.terminalSequence
+	session.terminalFingerprint, session.pending = state.terminalFingerprint, state.pending
+	if state.pending {
+		session.command = append(session.command[:0], state.command...)
+	}
+}
+
+func (session *NativeSession) persistCompletedPending(prior durableNativeSessionState) error {
+	completed := session.durableState()
+	completed.pending, completed.command = false, nil
+	if session.journal != nil {
+		if err := session.journal.store(completed); err != nil {
+			session.restoreDurableState(prior)
+			return &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), prior.command...), Cause: err,
+			}
+		}
+	}
+	session.clearPending()
+	return nil
+}
+
+func (session *NativeSession) persistAbandonedPending() error {
+	prior := session.durableState()
+	cleared := prior
+	cleared.pending, cleared.command = false, nil
+	if session.journal != nil {
+		if err := session.journal.store(cleared); err != nil {
+			return &raftservice.UnknownOutcomeError{
+				Command: append([]byte(nil), prior.command...), Cause: err,
+			}
+		}
+	}
+	session.clearPending()
+	return nil
 }
 
 func sessionStateError(session *NativeSession) error {
@@ -608,7 +852,10 @@ func validNativeTextIdentity(value string) bool {
 		utf8.ValidString(value) && strings.IndexByte(value, 0) < 0
 }
 
-var nativeFingerprintDomain = []byte("vibedb/gateway/native-command\x00")
+var (
+	nativeFingerprintDomain       = []byte("vibedb/gateway/native-command\x00")
+	nativeTopologyAuthorityMarker = []byte{byte(replication.CommandAuthorityTopology)}
+)
 
 func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	hasher := sha256.New()
@@ -616,6 +863,9 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 	var scalar [8]byte
 	binary.LittleEndian.PutUint64(scalar[:], uint64(command.Kind))
 	_, _ = hasher.Write(scalar[:])
+	if command.AuthorityClass == replication.CommandAuthorityTopology {
+		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	}
 	_, _ = hasher.Write(command.ClusterID[:])
 	_, _ = hasher.Write(command.ClusterIncarnation[:])
 	binary.LittleEndian.PutUint64(scalar[:], command.TopologyRecoveryEpoch)

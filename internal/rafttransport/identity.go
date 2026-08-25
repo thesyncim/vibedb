@@ -72,6 +72,10 @@ const (
 	// TrafficShardSQL authenticates the gateway-to-shard SQL protocol used by
 	// the static serving command. RF3 native traffic retains a separate class.
 	TrafficShardSQL TrafficClass = 5
+	// TrafficShardControl authenticates topology-controller requests. It is
+	// isolated from data, native proposal, and Raft streams so a certificate
+	// capability cannot be replayed across protocol boundaries.
+	TrafficShardControl TrafficClass = 6
 )
 
 const (
@@ -80,6 +84,7 @@ const (
 	shardNativeALPN   = "vibedb-shard-native"
 	gatewayClientALPN = "vibedb-gateway-client"
 	shardSQLALPN      = "vibedb-shard-sql"
+	shardControlALPN  = "vibedb-shard-control"
 )
 
 func (class TrafficClass) alpn() (string, error) {
@@ -94,6 +99,8 @@ func (class TrafficClass) alpn() (string, error) {
 		return gatewayClientALPN, nil
 	case TrafficShardSQL:
 		return shardSQLALPN, nil
+	case TrafficShardControl:
+		return shardControlALPN, nil
 	default:
 		return "", ErrWrongTrafficClass
 	}

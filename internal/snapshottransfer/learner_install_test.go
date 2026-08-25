@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -149,6 +151,21 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	}
 
 	_, source, sourceIdentity := prepare(t, "source", binding)
+	options.TxnLimits.MaxCollections = int(sourceIdentity.RelationCount) + 2
+	requiredDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		sourceIdentity.UserLimits.MaxBatchDocuments, options.RetryWindow, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.TxnLimits.MaxDocuments = requiredDocuments
+	floor, err := sqldriver.ReplicatedApplyTransactionByteFloor(
+		sourceIdentity, options.RetryWindow,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.TxnLimits.MaxBytes = floor
 	apply, _, err := source.OpenReplicatedApply(sourceIdentity, bootstrap, options)
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +204,11 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 		t.Fatalf("session completion=%+v err=%v", completion, err)
 	}
 	sourceSessionCompletion := bytes.Clone(lookup.Bytes)
+	partitioner := learnerInstallCapturePartitioner(t, sourceIdentity)
+	capture, err := apply.BeginRangeSplitCapture(partitioner)
+	if err != nil || capture.Head() != 2 {
+		t.Fatalf("source capture head=%d err=%v", capture.Head(), err)
+	}
 	keyBytes, ok := orderedkey.AppendJSONString(nil, []byte(`"doc-1"`), orderedkey.Ascending)
 	if !ok {
 		t.Fatal("encode document key")
@@ -206,6 +228,9 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	meta.Index = 3
 	if _, err = apply.ApplyNormal(meta, documentCommand); err != nil {
 		t.Fatal(err)
+	}
+	if capture.Head() != 3 {
+		t.Fatalf("source capture tail head=%d", capture.Head())
 	}
 	documentLookup, err := apply.LookupCompletion(documentCommand)
 	if err != nil {
@@ -338,6 +363,10 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if err != nil || !read.Found || !bytes.Equal(read.Value, document) {
 		t.Fatalf("target document=%q found=%v err=%v", read.Value, read.Found, err)
 	}
+	recoveredCapture, err := reopenedApply.BeginRangeSplitCapture(partitioner)
+	if err != nil || recoveredCapture.Head() != 3 {
+		t.Fatalf("installed capture head=%d err=%v", recoveredCapture.Head(), err)
+	}
 	targetCut, err := reopenedApply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
@@ -346,6 +375,8 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 		replicatedstate.SnapshotArtifactOptions{TargetChunkBytes: MinChunkBytes})
 	err = errors.Join(err, targetCut.Close(), reopenedApply.Close(), reopened.Close())
 	if err != nil || targetManifest.ImageDigest != manifest.ImageDigest ||
+		targetManifest.CaptureRows != manifest.CaptureRows ||
+		targetManifest.CaptureImageDigest != manifest.CaptureImageDigest ||
 		targetManifest.UserRows != 1 ||
 		targetManifest.State.Applied != manifest.State.Applied ||
 		targetManifest.State.DataChainDigest != manifest.State.DataChainDigest ||
@@ -377,4 +408,58 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if status, err := host.Status(descriptor.Group); err != nil || status.MemberID != 2 {
 		t.Fatalf("installed learner status=%+v err=%v", status, err)
 	}
+}
+
+func learnerInstallCapturePartitioner(
+	t testing.TB, base sqldriver.ReplicatedShardStoreIdentity,
+) *rangesplit.Partitioner {
+	t.Helper()
+	full := distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}
+	manifest, err := distribution.NewManifest(
+		distribution.DistributionName(base.Binding.Distribution),
+		distribution.RoutingVersion(base.Binding.Authority.RoutingVersion),
+		[]distribution.Shard{{
+			ID:                   distribution.ShardID(base.Binding.Shard),
+			AllocationGeneration: distribution.ShardAllocationGeneration(base.Binding.AllocationGeneration),
+			Range:                full, Leaders: []distribution.EndpointID{"source"},
+			Epoch: distribution.OwnershipEpoch(base.Binding.Authority.OwnershipEpoch),
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := autosplit.PlanSplit(manifest, autosplit.SplitRequest{
+		Recommendation: autosplit.Recommendation{
+			Source: autosplit.SourceIdentity{
+				Distribution:         distribution.DistributionName(base.Binding.Distribution),
+				Shard:                distribution.ShardID(base.Binding.Shard),
+				AllocationGeneration: distribution.ShardAllocationGeneration(base.Binding.AllocationGeneration),
+				Range:                full, BucketBits: distribution.DefaultVirtualBucketBits,
+				RoutingVersion: distribution.RoutingVersion(base.Binding.Authority.RoutingVersion),
+				OwnershipEpoch: distribution.OwnershipEpoch(base.Binding.Authority.OwnershipEpoch),
+			},
+			Kind:       autosplit.RecommendationBinarySplit,
+			Boundaries: [2]distribution.KeyspacePoint{{0x80}}, BoundaryCount: 1,
+			CandidateBin: 32, BenefitPPM: 1,
+		},
+		RetainChild:         0,
+		NextRoutingVersion:  distribution.RoutingVersion(base.Binding.Authority.RoutingVersion + 1),
+		AllocationHighWater: distribution.ShardAllocationGeneration(base.Binding.AllocationGeneration),
+		Destinations: []autosplit.Destination{{
+			Shard:                "learner-capture-right",
+			AllocationGeneration: distribution.ShardAllocationGeneration(base.Binding.AllocationGeneration + 1),
+			Leaders:              []distribution.EndpointID{"destination"},
+			OwnershipEpoch:       distribution.OwnershipEpoch(base.Binding.Authority.OwnershipEpoch + 1),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	partitioner, err := rangesplit.NewPartitioner(
+		plan, base.UserTable, []string{"/id"}, distribution.DefaultVirtualBucketBits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return partitioner
 }

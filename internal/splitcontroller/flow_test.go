@@ -476,13 +476,19 @@ func newFlowSource(t testing.TB, plan *Plan) flowSource {
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations, 8, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	machine, err := replicatedstate.Open(
 		binding, bootstrap, system,
 		replicatedstate.UserCollection{Name: "docs", Target: user}, log,
 		replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
 				MaxCollections: 3,
-				MaxDocuments:   max(user.Limits.MaxDistinctMutations+4, 8+3),
+				MaxDocuments:   maxDocuments,
 				MaxBytes:       64 << 20,
 			},
 			MaxSessions: 128,

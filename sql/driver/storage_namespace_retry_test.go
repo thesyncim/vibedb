@@ -104,7 +104,8 @@ func TestReplicatedApplyActivationRetainsNamespaceAfterRemoveFailure(t *testing.
 	_, db, base := bindReplicatedApplyTestRoot(t, "apply-remove-retry")
 	core := db.connector.db
 	injected := errors.New("injected definite apply catalog failure")
-	var failedPath, failedJournal, blocker string
+	var failedPath, failedJournal, failedCapturePath, failedCaptureJournal, blocker string
+	var failedCaptureCollection *durable.Collection
 	var injectedCleanupErr error
 
 	claim, identity, err := db.openReplicatedApply(
@@ -112,6 +113,9 @@ func TestReplicatedApplyActivationRetainsNamespaceAfterRemoveFailure(t *testing.
 		func(current *database) (bool, error) {
 			failedPath = current.replicatedApplyFile.Name()
 			failedJournal = durable.RecoveryJournalPath(failedPath)
+			failedCapturePath = current.replicatedCaptureFile.Name()
+			failedCaptureJournal = durable.RecoveryJournalPath(failedCapturePath)
+			failedCaptureCollection = current.replicatedCaptureCollection
 			blocker = filepath.Join(failedJournal, "blocker")
 			failedCollection := current.replicatedApplyCollection
 			current.closeCollection = func(got *durable.Collection) error {
@@ -162,9 +166,20 @@ func TestReplicatedApplyActivationRetainsNamespaceAfterRemoveFailure(t *testing.
 			applyMeta, applyCollection, applyFile,
 		)
 	}
-	if len(retired) != 1 || retired[0].collection != nil ||
-		retired[0].file != nil || retired[0].removed ||
-		retired[0].path != failedPath || retired[0].journal != failedJournal {
+	var applyRetired, captureRetired *retiredTable
+	for index := range retired {
+		switch retired[index].path {
+		case failedPath:
+			applyRetired = &retired[index]
+		case failedCapturePath:
+			captureRetired = &retired[index]
+		}
+	}
+	if len(retired) != 2 || applyRetired == nil || captureRetired == nil ||
+		applyRetired.collection != nil || applyRetired.file != nil || applyRetired.removed ||
+		applyRetired.journal != failedJournal ||
+		captureRetired.collection != failedCaptureCollection || captureRetired.file == nil ||
+		captureRetired.removed || captureRetired.journal != failedCaptureJournal {
 		t.Fatalf("replicated namespace retry ownership = %+v", retired)
 	}
 	if _, statErr := os.Stat(failedPath); !os.IsNotExist(statErr) {
@@ -172,6 +187,9 @@ func TestReplicatedApplyActivationRetainsNamespaceAfterRemoveFailure(t *testing.
 	}
 	if _, statErr := os.Stat(blocker); statErr != nil {
 		t.Fatalf("blocked replicated journal namespace = %v", statErr)
+	}
+	if _, statErr := os.Stat(failedCapturePath); statErr != nil {
+		t.Fatalf("retained capture namespace = %v", statErr)
 	}
 
 	if err := os.Remove(blocker); err != nil {
@@ -186,8 +204,17 @@ func TestReplicatedApplyActivationRetainsNamespaceAfterRemoveFailure(t *testing.
 	if identity.Storage == filepath.Base(strings.TrimSuffix(failedPath, ".vjc")) {
 		t.Fatal("activation reused failed storage identity")
 	}
+	if identity.CaptureStorage == filepath.Base(strings.TrimSuffix(failedCapturePath, ".vjc")) {
+		t.Fatal("activation reused failed capture storage identity")
+	}
 	if _, statErr := os.Stat(failedJournal); !os.IsNotExist(statErr) {
 		t.Fatalf("settled replicated journal path = %v, want absent", statErr)
+	}
+	if _, statErr := os.Stat(failedCapturePath); !os.IsNotExist(statErr) {
+		t.Fatalf("settled replicated capture path = %v, want absent", statErr)
+	}
+	if _, statErr := os.Stat(failedCaptureJournal); !os.IsNotExist(statErr) {
+		t.Fatalf("settled replicated capture journal = %v, want absent", statErr)
 	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)

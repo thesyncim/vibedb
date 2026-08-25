@@ -34,10 +34,14 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 			Term: fence.Term, Commit: 8, Applied: 8, CheckpointApplied: 7}}
 	server := testReplicatedServer(&fakeReplicatedOwner{state: state})
 	client := rafttransport.NodeID{101}
+	topology := rafttransport.NodeID{102}
+	writer := rafttransport.NodeID{103}
 	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{
 		{Node: firstIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
 		{Node: secondIdentity.Node, Capabilities: serviceauthz.CapabilityDelegate},
 		{Node: client, Capabilities: serviceauthz.CapabilityMembership},
+		{Node: topology, Capabilities: serviceauthz.CapabilityTopology},
+		{Node: writer, Capabilities: serviceauthz.CapabilityDataWrite},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,8 +66,9 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 		return profile.Client(ctx, raw, serverIdentity.Node, rafttransport.TrafficShardNative, deadline)
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedProbe,
-		Authority: serviceauthz.Authority{Node: client, Generation: 1},
-		Fence:     ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}
+		Authority:  serviceauthz.Authority{Node: client, Generation: 1},
+		Capability: serviceauthz.CapabilityMembership,
+		Fence:      ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}
 	first, err := dial(firstProfile)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +78,8 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 		t.Fatalf("first response=%+v err=%v", probe, err)
 	}
 	membership := &ReplicatedRequest{Operation: ReplicatedMembership,
-		Authority: request.Authority, Fence: probe.State.Fence,
+		Authority: request.Authority, Capability: serviceauthz.CapabilityMembership,
+		Fence: probe.State.Fence,
 		Membership: ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{1},
 			MetadataEpoch: 2, CatalogGeneration: 3,
@@ -83,6 +89,27 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 	}
 	if response, roundTripErr := RoundTripReplicated(ctx, first, membership); roundTripErr != nil || response.Kind != ReplicatedMembershipAccepted {
 		t.Fatalf("membership response=%+v err=%v", response, roundTripErr)
+	}
+	topologyRequest := &ReplicatedRequest{Operation: ReplicatedProbe,
+		Authority:  serviceauthz.Authority{Node: topology, Generation: 1},
+		Capability: serviceauthz.CapabilityTopology,
+		Fence:      request.Fence,
+	}
+	topologyProbe, err := RoundTripReplicated(ctx, first, topologyRequest)
+	if err != nil || topologyProbe.Kind != ReplicatedHandshake {
+		t.Fatalf("topology probe=%+v err=%v", topologyProbe, err)
+	}
+	topologyRequest.Operation = ReplicatedPropose
+	topologyRequest.Fence = topologyProbe.State.Fence
+	topologyRequest.Command = testReplicatedTopologyCommand(t, topologyProbe.State.Fence)
+	if response, roundTripErr := RoundTripReplicated(ctx, first, topologyRequest); roundTripErr != nil ||
+		response.Kind == ReplicatedRefusal && response.Refusal == ReplicatedRefusalUnauthorized {
+		t.Fatalf("topology proposal response=%+v err=%v", response, roundTripErr)
+	}
+	topologyRequest.Authority.Node = writer
+	if response, roundTripErr := RoundTripReplicated(ctx, first, topologyRequest); roundTripErr != nil ||
+		response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnauthorized {
+		t.Fatalf("data writer topology response=%+v err=%v", response, roundTripErr)
 	}
 	denied, err := dial(secondProfile)
 	if err == nil {

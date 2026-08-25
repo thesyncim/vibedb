@@ -65,7 +65,7 @@ func TestSessionLeaseOpenRenewCASAndStaleFence(t *testing.T) {
 	}
 	prototype := commandValue(fixture.binding, 1)
 	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
-	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.ClientEpoch != epoch || lease.HighSequence != 1 ||
 		lease.AckThrough != 0 || lease.LeaseDeadlineUnixNano != testSessionLeaseDeadlineUnixNano ||
 		lease.Status != SessionActive || lease.TerminalResult != 0 {
@@ -83,7 +83,7 @@ func TestSessionLeaseOpenRenewCASAndStaleFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := requireSessionResult(t, fixture.machine, renewBytes, ResultSessionRenewed)
-	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 2 ||
 		lease.LeaseDeadlineUnixNano != secondDeadline || lease.Status != SessionActive {
 		t.Fatalf("renewed lease = %+v, %v", lease, err)
@@ -120,7 +120,7 @@ func TestSessionLeaseOpenRenewCASAndStaleFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSessionResult(t, fixture.machine, staleBytes, ResultStaleFence)
-	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 3 || lease.AckThrough != 2 ||
 		lease.LeaseDeadlineUnixNano != secondDeadline || lease.Status != SessionActive {
 		t.Fatalf("stale renewal changed lease = %+v, %v", lease, err)
@@ -138,7 +138,7 @@ func TestSessionLeaseOpenRenewCASAndStaleFence(t *testing.T) {
 	if _, err := fixture.machine.LookupCompletion(mismatchBytes); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("mismatched renew lookup = %v, want ErrCompletionNotFound", err)
 	}
-	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 3 || lease.LeaseDeadlineUnixNano != secondDeadline {
 		t.Fatalf("mismatched renewal changed lease = %+v, %v", lease, err)
 	}
@@ -169,7 +169,7 @@ func TestSessionRenewSurvivesReopenAndContinuesCAS(t *testing.T) {
 		t.Fatalf("reopen renewed lease: %v", err)
 	}
 	requireSessionResult(t, reopened, firstBytes, ResultSessionRenewed)
-	lease, err := reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := reopened.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 2 ||
 		lease.LeaseDeadlineUnixNano != secondDeadline || lease.Status != SessionActive {
 		t.Fatalf("reopened renewed lease = %+v, %v", lease, err)
@@ -182,7 +182,7 @@ func TestSessionRenewSurvivesReopenAndContinuesCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSessionResult(t, reopened, secondBytes, ResultSessionRenewed)
-	lease, err = reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = reopened.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 3 || lease.AckThrough != 2 ||
 		lease.LeaseDeadlineUnixNano != thirdDeadline || lease.Status != SessionActive {
 		t.Fatalf("continued renewed lease = %+v, %v", lease, err)
@@ -211,7 +211,7 @@ func TestSessionRenewWinningSequenceFencesDelayedRevoke(t *testing.T) {
 		!bytes.Equal(conflict.Bytes, original.Bytes) {
 		t.Fatalf("renew/revoke sequence conflict = %+v, %v", conflict, err)
 	}
-	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 2 || lease.Status != SessionActive ||
 		lease.LeaseDeadlineUnixNano != renewedDeadline {
 		t.Fatalf("delayed revoke overrode renewal = %+v, %v", lease, err)
@@ -243,7 +243,7 @@ func TestDelayedSessionRevokeCannotSealNewerActivity(t *testing.T) {
 		!bytes.Equal(conflict.Bytes, original.Bytes) {
 		t.Fatalf("delayed revoke conflict = %+v, %v", conflict, err)
 	}
-	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 2 || lease.Status != SessionActive ||
 		lease.LeaseDeadlineUnixNano != deadline {
 		t.Fatalf("delayed revoke sealed newer activity: %+v, %v", lease, err)
@@ -258,7 +258,7 @@ func TestDelayedSessionRevokeCannotSealNewerActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSessionResult(t, fixture.machine, freshBytes, ResultSessionRevoked)
-	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 3 || lease.AckThrough != 2 ||
 		lease.Status != SessionRetired || lease.LeaseDeadlineUnixNano != 0 ||
 		lease.TerminalResult != ResultSessionRevoked {
@@ -296,7 +296,7 @@ func TestSessionRevokeCASAndStaleFencePreserveLease(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), mismatchBytes); err != nil {
 		t.Fatal(err)
 	}
-	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 1 || lease.Status != SessionActive ||
 		lease.LeaseDeadlineUnixNano != deadline {
 		t.Fatalf("mismatched revoke changed lease = %+v, %v", lease, err)
@@ -313,7 +313,7 @@ func TestSessionRevokeCASAndStaleFencePreserveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSessionResult(t, fixture.machine, staleBytes, ResultStaleFence)
-	lease, err = fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err = fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.HighSequence != 2 || lease.AckThrough != 1 ||
 		lease.Status != SessionActive || lease.LeaseDeadlineUnixNano != deadline {
 		t.Fatalf("stale revoke changed lease = %+v, %v", lease, err)
@@ -355,7 +355,7 @@ func TestSessionRevokeUnknownCommitReopenRetiredAndRelease(t *testing.T) {
 	if before.AppliedSequence != after.AppliedSequence || !bytes.Equal(before.Bytes, after.Bytes) {
 		t.Fatalf("reopen changed revoke completion: before=%+v after=%+v", before, after)
 	}
-	lease, err := reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := reopened.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil || lease.Status != SessionRetired ||
 		lease.TerminalResult != ResultSessionRevoked || lease.LeaseDeadlineUnixNano != 0 {
 		t.Fatalf("reopened revoke state = %+v, %v", lease, err)
@@ -375,7 +375,7 @@ func TestSessionRevokeUnknownCommitReopenRetiredAndRelease(t *testing.T) {
 	if _, err := reopened.LookupCompletion(revokeBytes); !errors.Is(err, ErrRetryRetired) {
 		t.Fatalf("released revoke lookup = %v, want ErrRetryRetired", err)
 	}
-	if _, err := reopened.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch); !errors.Is(err, ErrSessionReleased) {
+	if _, err := reopened.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch); !errors.Is(err, ErrSessionReleased) {
 		t.Fatalf("released lease lookup = %v, want ErrSessionReleased", err)
 	}
 }
@@ -399,7 +399,7 @@ func TestFreshSessionRevokeRefusesCooperativelyRetiredSession(t *testing.T) {
 	if err := fixture.machine.AdmitCommand(encodeCommand(t, revoke)); !errors.Is(err, ErrSessionRetired) {
 		t.Fatalf("revoke retired admission = %v, want ErrSessionRetired", err)
 	}
-	lease, err := fixture.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, 2)
+	lease, err := fixture.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, 2)
 	if err != nil || lease.Status != SessionRetired ||
 		lease.TerminalResult != ResultSessionRetired ||
 		lease.LeaseDeadlineUnixNano != testSessionLeaseDeadlineUnixNano {
@@ -415,12 +415,12 @@ func TestLookupSessionLeaseEpochOutcomes(t *testing.T) {
 	prototype := commandValue(fixture.binding, 1)
 	applySessionOpen(t, fixture.machine, 2, prototype)
 	if _, err := fixture.machine.LookupSessionLease(
-		prototype.Tenant, prototype.ClientID, 0,
+		prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, 0,
 	); !errors.Is(err, ErrSessionEpoch) {
 		t.Fatalf("zero epoch lookup = %v, want ErrSessionEpoch", err)
 	}
 	if _, err := fixture.machine.LookupSessionLease(
-		prototype.Tenant, prototype.ClientID, 3,
+		prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, 3,
 	); !errors.Is(err, ErrSessionEpoch) {
 		t.Fatalf("future epoch lookup = %v, want ErrSessionEpoch", err)
 	}
@@ -434,18 +434,18 @@ func TestLookupSessionLeaseEpochOutcomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.machine.LookupSessionLease(
-		prototype.Tenant, prototype.ClientID, 2,
+		prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, 2,
 	); !errors.Is(err, ErrSessionReleased) {
 		t.Fatalf("released epoch lookup = %v, want ErrSessionReleased", err)
 	}
 	_, _, nextEpoch := applySessionOpen(t, fixture.machine, 5, prototype)
 	if _, err := fixture.machine.LookupSessionLease(
-		prototype.Tenant, prototype.ClientID, 2,
+		prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, 2,
 	); !errors.Is(err, ErrRetryRetired) {
 		t.Fatalf("older epoch lookup = %v, want ErrRetryRetired", err)
 	}
 	if _, err := fixture.machine.LookupSessionLease(
-		prototype.Tenant, prototype.ClientID, nextEpoch+1,
+		prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, nextEpoch+1,
 	); !errors.Is(err, ErrSessionEpoch) {
 		t.Fatalf("newer epoch lookup = %v, want ErrSessionEpoch", err)
 	}
@@ -464,7 +464,7 @@ func TestReopenRejectsRevokedLeaseDeadlineMismatch(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encodeCommand(t, revoke)); err != nil {
 		t.Fatal(err)
 	}
-	digest := SessionKey(prototype.Tenant, prototype.ClientID)
+	digest := SessionKey(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID)
 	key := SessionStorageKey(digest)
 	header, found := rawSessionReleaseRow(t, fixture.system.Collection, key[:])
 	if !found {
@@ -499,7 +499,7 @@ func TestReopenRejectsRevokedTerminalResultMismatch(t *testing.T) {
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), encodeCommand(t, revoke)); err != nil {
 		t.Fatal(err)
 	}
-	digest := SessionKey(prototype.Tenant, prototype.ClientID)
+	digest := SessionKey(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID)
 	slotKey, err := SessionSlotStorageKey(digest, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -534,10 +534,16 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 	_, _, epoch := applySessionOpen(t, store.machine, 2, prototype)
 	capture := newSessionLeaseCaptureStore(t, store.dir)
 	defer capture.close()
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		store.user.Limits.MaxDistinctMutations, store.machine.options.RetryWindow, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store.machine.options.TxnLimits.MaxCollections = 3
-	store.machine.options.TxnLimits.MaxDocuments = 68
+	store.machine.options.TxnLimits.MaxDocuments = requiredDocuments
 	store.machineOptions.TxnLimits.MaxCollections = 3
-	store.machineOptions.TxnLimits.MaxDocuments = 68
+	store.machineOptions.TxnLimits.MaxDocuments = requiredDocuments
 	if err := store.machine.BeginTransitionCapture(capture.encoder); err != nil {
 		t.Fatalf("begin lease fault capture: %v", err)
 	}
@@ -552,7 +558,7 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 		t.Fatalf("revoke decision sync = %v, want ErrCommitOutcomeUnknown", applyErr)
 	}
 	reopenSessionLeaseStoreAfterUnknownOutcome(t, store, capture)
-	lease, err := store.machine.LookupSessionLease(prototype.Tenant, prototype.ClientID, epoch)
+	lease, err := store.machine.LookupSessionLease(prototype.AuthorityClass, prototype.Tenant, prototype.ClientID, epoch)
 	if err != nil {
 		t.Fatalf("lookup recovered revoke lease: %v", err)
 	}
@@ -561,8 +567,9 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 		lease.TerminalResult != ResultSessionRevoked {
 		t.Fatalf("recovered revoke did not roll forward = %+v", lease)
 	}
-	if capture.collection.Len() != 1 {
-		t.Fatalf("rolled-forward revoke retained %d capture rows, want 1", capture.collection.Len())
+	if capture.collection.Len() != 2 {
+		t.Fatalf("rolled-forward revoke retained %d capture rows, want header plus transition",
+			capture.collection.Len())
 	}
 	requireSessionResult(t, store.machine, revokeBytes, ResultSessionRevoked)
 }
@@ -687,9 +694,21 @@ func (*sessionLeaseCapture) MaxEncodedBytes(TransitionCaptureBounds) (int, error
 	return 64, nil
 }
 
-func (c *sessionLeaseCapture) Begin(state State) error {
+func (c *sessionLeaseCapture) Begin(
+	state State,
+	publish func(key, value []byte) error,
+) error {
 	if c == nil || c.target.Collection == nil || state.Applied == 0 {
 		return ErrTransitionCapture
+	}
+	if c.target.Collection.Len() == 0 {
+		var key [8]byte
+		if publish == nil {
+			return ErrTransitionCapture
+		}
+		if err := publish(key[:], []byte(`{"capture":true}`)); err != nil {
+			return err
+		}
 	}
 	c.current = state.Applied
 	c.pending = 0

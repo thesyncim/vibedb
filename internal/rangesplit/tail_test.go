@@ -2,6 +2,7 @@ package rangesplit
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -302,6 +303,47 @@ func TestTailDigestsBindExactBeforeImageEvenWhenChildOperationsMatch(t *testing.
 		a.TranslationDigest == b.TranslationDigest ||
 		a.ChildDigests[0] == b.ChildDigests[0] || a.ChildDigests[1] == b.ChildDigests[1] {
 		t.Fatalf("digests did not bind before image: a=%+v b=%+v", a, b)
+	}
+}
+
+func TestTailBorrowedBeforeAndDurableWitnessAreByteExact(t *testing.T) {
+	partitioner, cursor, _ := testTailCursor(t)
+	before := documentForChild(t, partitioner, 0)
+	after := documentForChild(t, partitioner, 1)
+	direct := nextTailEntry(cursor, []TailTransition{{
+		Key: []byte("move"), Before: before, After: after,
+	}}, 12)
+	var pointWorkspace distribution.DocumentPointWorkspace
+	point, err := partitioner.program.Point(before, &pointWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnessed := direct
+	witnessed.Transitions = []TailTransition{{
+		Key: []byte("move"),
+		BeforeWitness: TailBeforeWitness{
+			Present: true, Point: point, DocumentBytes: uint32(len(before)),
+			Digest: sha256.Sum256(before),
+		},
+		After: after,
+	}}
+	sinks := []TailSink{consumeTailBatch, consumeTailBatch}
+	var directWorkspace, witnessWorkspace TailWorkspace
+	directNext, directStats, err := partitioner.TranslateTailEntry(
+		cursor, direct, sinks, &directWorkspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnessNext, witnessStats, err := partitioner.TranslateTailEntry(
+		cursor, witnessed, sinks, &witnessWorkspace,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directNext != witnessNext || directStats != witnessStats {
+		t.Fatalf("raw/witness mismatch: next=%v stats=%+v / next=%v stats=%+v",
+			directNext == witnessNext, directStats, witnessNext == directNext, witnessStats)
 	}
 }
 

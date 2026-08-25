@@ -112,7 +112,7 @@ func newNormalBatchFixtureWithOptions(
 	}
 	t.Cleanup(func() { _ = group.Close() })
 
-	txnDocuments := user.Limits.MaxDistinctMutations + 3
+	txnDocuments := user.Limits.MaxDistinctMutations + 4
 	if systemDocuments > txnDocuments {
 		txnDocuments = systemDocuments
 	}
@@ -406,7 +406,7 @@ func TestApplyNormalBatchOnePhysicalUpdateZeroSyncAndBoundedWarmScratch(t *testi
 func TestApplyNormalBatchFull128CommandWorkspaceIsWarmStable(t *testing.T) {
 	const count = raftmodel.MaxNormalApplyBatchEntries
 	fixture := newNormalBatchFixtureWithSystemDocuments(
-		t, MaxDistinctMutations, 8, 2*count+1,
+		t, MaxDistinctMutations, 8, 3*count+1,
 	)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)

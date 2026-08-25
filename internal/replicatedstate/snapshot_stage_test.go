@@ -109,6 +109,18 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
+	wrongName := machineOptionsFor(user)
+	wrongName.TransitionCaptureTarget = TransitionCaptureTarget{Name: "other-capture"}
+	if _, err := stage.OpenCandidate(source.bootstrap, log, wrongName); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("candidate accepted mismatched capture name: %v", err)
+	}
+	wrongCollection := machineOptionsFor(user)
+	wrongCollection.TransitionCaptureTarget = TransitionCaptureTarget{
+		Name: TransitionCaptureCollectionName, Collection: user.Collection,
+	}
+	if _, err := stage.OpenCandidate(source.bootstrap, log, wrongCollection); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("candidate accepted mismatched capture collection: %v", err)
+	}
 	candidate, err := stage.OpenCandidate(source.bootstrap, log, machineOptionsFor(user))
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +173,57 @@ func TestSnapshotArtifactStageResumesIntoNonServingFilesAndOpensCandidate(t *tes
 	}
 	if _, err := stage.OpenCandidate(source.bootstrap, log, machineOptionsFor(user)); !errors.Is(err, ErrSnapshotStage) {
 		t.Fatalf("second OpenCandidate error = %v", err)
+	}
+}
+
+func TestSnapshotArtifactStageBindsProvenPresentCaptureTarget(t *testing.T) {
+	source, snapshot := snapshotArtifactFixture(t)
+	artifact, expected := writeSnapshotArtifactFixture(t, snapshot)
+	dir := t.TempDir()
+	system := systemTargetOf(createTargetAt(t, dir, "system", durable.Options{}).Collection)
+	user := createTargetAt(t, dir, "user", durable.Options{})
+	capture := systemTargetOf(createTargetAt(t, dir, "capture", durable.Options{
+		OpaqueValues: true, MaxKeyBytes: 8,
+		MaxDocumentBytes:  MaxTransitionCaptureRecordBytes,
+		MaxBatchDocuments: 1, MaxBatchBytes: MaxTransitionCaptureRecordBytes + 8,
+	}).Collection)
+	stage, err := NewSnapshotArtifactStageWithOptions(
+		expected, system, user, nil, SnapshotArtifactStageOptions{Capture: capture},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stage.Receive(bytes.NewReader(artifact), func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	good := machineOptionsFor(user)
+	good.TxnLimits.MaxCollections = 3
+	good.TxnLimits.MaxDocuments++
+	good.TransitionCaptureTarget = TransitionCaptureTarget{
+		Name: TransitionCaptureCollectionName, Collection: capture.Collection,
+	}
+	wrongName := good
+	wrongName.TransitionCaptureTarget.Name = "foreign-capture-name"
+	if _, err := stage.OpenCandidate(source.bootstrap, log, wrongName); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("candidate accepted proven collection under foreign name: %v", err)
+	}
+	wrongCollection := good
+	wrongCollection.TransitionCaptureTarget.Collection = user.Collection
+	if _, err := stage.OpenCandidate(source.bootstrap, log, wrongCollection); !errors.Is(err, ErrSnapshotStage) {
+		t.Fatalf("candidate accepted unproved capture collection: %v", err)
+	}
+	candidate, err := stage.OpenCandidate(source.bootstrap, log, good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.reservedCaptureTarget != good.TransitionCaptureTarget {
+		t.Fatalf("candidate capture target = %+v, want proven %+v",
+			candidate.reservedCaptureTarget, good.TransitionCaptureTarget)
 	}
 }
 

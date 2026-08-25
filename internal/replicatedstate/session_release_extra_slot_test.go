@@ -32,7 +32,7 @@ func testSessionReleaseRejectsExtraSameDigestSlot(t *testing.T, admit bool) {
 	retirement := sessionRetirement(commandValue(fixture.binding, 2))
 	applySessionReleaseCommand(t, fixture.machine, 4, retirement)
 
-	digest := SessionKey(retirement.Tenant, retirement.ClientID)
+	digest := SessionKey(retirement.AuthorityClass, retirement.Tenant, retirement.ClientID)
 	headerKey := SessionStorageKey(digest)
 	headerBytes, found := rawSessionReleaseRow(t, fixture.system.Collection, headerKey[:])
 	if !found {
@@ -53,8 +53,10 @@ func testSessionReleaseRejectsExtraSameDigestSlot(t *testing.T, admit bool) {
 		t.Fatalf("inject extra slot: %v", err)
 	}
 
-	want := make(map[string][]byte, int(header.PhysicalSlotCount)+3)
+	want := make(map[string][]byte, int(header.PhysicalSlotCount)+4)
 	want[string(stateKey)] = mustRawSystemRow(t, fixture.system.Collection, stateKey)
+	authorityKey := AuthorityBindingStorageKey(AuthorityIdentityKey(identity.Tenant, identity.ClientID))
+	want[string(authorityKey[:])] = mustRawSystemRow(t, fixture.system.Collection, authorityKey[:])
 	want[string(headerKey[:])] = bytes.Clone(headerBytes)
 	for slot := uint16(0); slot < header.PhysicalSlotCount; slot++ {
 		key, keyErr := SessionSlotStorageKey(digest, slot)

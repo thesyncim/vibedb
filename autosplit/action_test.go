@@ -80,6 +80,59 @@ func TestPlanSplitIsolatesExactlyOneVirtualBucket(t *testing.T) {
 	}
 }
 
+func TestRestoreSplitPlanRevalidatesExactPersistedGeometry(t *testing.T) {
+	current := actionManifest(t)
+	source := actionSource(t, current)
+	planned, err := PlanSplit(current, SplitRequest{
+		Recommendation: testBinaryRecommendation(source, 9, 32), RetainChild: 0,
+		NextRoutingVersion: 12, AllocationHighWater: 7,
+		Destinations: []Destination{{
+			Shard: "right", AllocationGeneration: 8,
+			Leaders: []distribution.EndpointID{"node-b"}, OwnershipEpoch: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	children := make([]SplitChild, planned.ChildCount)
+	for index := range children {
+		children[index], _ = planned.Child(index)
+	}
+	restored, err := RestoreSplitPlan(current, source, planned.RetainedChild, children)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Manifest().Version() != planned.Manifest().Version() ||
+		restored.ChildCount != planned.ChildCount || restored.RetainedChild != planned.RetainedChild {
+		t.Fatalf("restored header = %+v, want %+v", restored, planned)
+	}
+	for index := range children {
+		got, _ := restored.Child(index)
+		if got.Range != children[index].Range || got.Shard != children[index].Shard ||
+			got.AllocationGeneration != children[index].AllocationGeneration ||
+			got.OwnershipEpoch != children[index].OwnershipEpoch || got.Retained != children[index].Retained ||
+			len(got.Leaders) != len(children[index].Leaders) || got.Leaders[0] != children[index].Leaders[0] {
+			t.Fatalf("restored child %d = %+v, want %+v", index, got, children[index])
+		}
+	}
+	for _, mutate := range []func([]SplitChild){
+		func(c []SplitChild) { c[0].OwnershipEpoch-- },
+		func(c []SplitChild) { c[1].AllocationGeneration = 7 },
+		func(c []SplitChild) { c[1].Range.Start[0]++ },
+		func(c []SplitChild) { c[1].Leaders[0] = "" },
+	} {
+		damaged := make([]SplitChild, len(children))
+		for index := range children {
+			damaged[index] = children[index]
+			damaged[index].Leaders = append([]distribution.EndpointID(nil), children[index].Leaders...)
+		}
+		mutate(damaged)
+		if _, err = RestoreSplitPlan(current, source, planned.RetainedChild, damaged); !errors.Is(err, ErrInvalidSplit) {
+			t.Fatalf("damaged restore error = %v", err)
+		}
+	}
+}
+
 func TestPlanSplitRejectsStaleOrUnsafeTopology(t *testing.T) {
 	current := actionManifest(t)
 	source := actionSource(t, current)

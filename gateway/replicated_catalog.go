@@ -25,6 +25,8 @@ type ReplicatedReplicaDescriptor struct {
 	StoreID         [16]byte
 	NodeIncarnation uint64
 	Endpoint        distribution.EndpointID
+	NativeEndpoint  distribution.EndpointID
+	ControlEndpoint distribution.EndpointID
 }
 
 // ReplicatedShardDescriptor is the cold control-plane identity for one RF3
@@ -129,10 +131,16 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		for replicaOrdinal, replica := range descriptor.Replicas {
 			manifestEndpoint, _ := manifest.ShardLeaderAt(shardOrdinal, replicaOrdinal)
 			address, endpointExists := snapshot.endpoints[replica.Endpoint]
+			nativeAddress, nativeExists := snapshot.endpoints[replica.NativeEndpoint]
+			controlAddress, controlExists := snapshot.endpoints[replica.ControlEndpoint]
 			if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 				replica.StoreID == ([16]byte{}) || replica.NodeIncarnation == 0 ||
-				replica.Endpoint == "" || !endpointExists ||
-				address == "" || replica.Endpoint != manifestEndpoint {
+				replica.Endpoint == "" || replica.NativeEndpoint == "" || replica.ControlEndpoint == "" ||
+				replica.NativeEndpoint == replica.Endpoint || replica.ControlEndpoint == replica.Endpoint ||
+				replica.ControlEndpoint == replica.NativeEndpoint || !endpointExists || !nativeExists ||
+				!controlExists || address == "" || nativeAddress == "" || controlAddress == "" ||
+				address == nativeAddress || address == controlAddress || nativeAddress == controlAddress ||
+				replica.Endpoint != manifestEndpoint {
 				return &CatalogError{Reason: fmt.Sprintf(
 					"replicated shard %q/%q replica %d does not match its manifest endpoint",
 					descriptor.Distribution, descriptor.Shard, replicaOrdinal,
@@ -140,7 +148,9 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			}
 			for prior := 0; prior < replicaOrdinal; prior++ {
 				if descriptor.Replicas[prior].Member == replica.Member ||
-					descriptor.Replicas[prior].Endpoint == replica.Endpoint {
+					descriptor.Replicas[prior].Endpoint == replica.Endpoint ||
+					descriptor.Replicas[prior].NativeEndpoint == replica.NativeEndpoint ||
+					descriptor.Replicas[prior].ControlEndpoint == replica.ControlEndpoint {
 					return &CatalogError{Reason: "replicated shard repeats a member or endpoint"}
 				}
 			}
@@ -164,7 +174,10 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			replicas = append(replicas, ReplicatedEndpoint{
 				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
 				NodeIncarnation: replica.NodeIncarnation,
-				Address:         snapshot.endpoints[replica.Endpoint],
+				NativeEndpoint:  string(replica.NativeEndpoint),
+				Address:         snapshot.endpoints[replica.NativeEndpoint],
+				ControlEndpoint: string(replica.ControlEndpoint),
+				ControlAddress:  snapshot.endpoints[replica.ControlEndpoint],
 			})
 		}
 		shards[ordinal] = replicatedCatalogShard{
@@ -260,6 +273,7 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
 	return ReplicatedRoute{
+		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
 		Command: entry.command, Replicas: dst,
 	}, true
@@ -300,6 +314,12 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 				StoreID:         snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].StoreID,
 				NodeIncarnation: snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NodeIncarnation,
 				Endpoint:        endpoint,
+				NativeEndpoint: distribution.EndpointID(
+					snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].NativeEndpoint,
+				),
+				ControlEndpoint: distribution.EndpointID(
+					snapshot.replicatedReplicas[int(entry.replicaBase)+replicaOrdinal].ControlEndpoint,
+				),
 			}
 		}
 		descriptors[ordinal] = descriptor
@@ -417,6 +437,8 @@ type persistedReplicatedReplica struct {
 	StoreID         string `json:"store_id"`
 	NodeIncarnation uint64 `json:"node_incarnation"`
 	Endpoint        string `json:"endpoint"`
+	NativeEndpoint  string `json:"native_endpoint"`
+	ControlEndpoint string `json:"control_endpoint"`
 }
 
 func persistedReplicatedDescriptors(
@@ -452,6 +474,8 @@ func persistedReplicatedDescriptors(
 				Member: replica.Member, Node: hex.EncodeToString(replica.Node[:]),
 				StoreID:         hex.EncodeToString(replica.StoreID[:]),
 				NodeIncarnation: replica.NodeIncarnation, Endpoint: string(replica.Endpoint),
+				NativeEndpoint:  string(replica.NativeEndpoint),
+				ControlEndpoint: string(replica.ControlEndpoint),
 			}
 		}
 		persisted[ordinal] = entry
@@ -516,6 +540,8 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				Member: replica.Member, Node: node, StoreID: storeID,
 				NodeIncarnation: replica.NodeIncarnation,
 				Endpoint:        distribution.EndpointID(replica.Endpoint),
+				NativeEndpoint:  distribution.EndpointID(replica.NativeEndpoint),
+				ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
 			}
 		}
 		descriptors[ordinal] = descriptor

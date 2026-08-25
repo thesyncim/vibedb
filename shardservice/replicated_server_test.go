@@ -28,6 +28,7 @@ type fakeReplicatedOwner struct {
 	readErr       error
 	readLease     raftservice.PointReadLease
 	readCalled    chan struct{}
+	probeCalls    atomic.Uint64
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -42,6 +43,7 @@ func (owner *fakeReplicatedOwner) Probe(
 	context.Context,
 	raftmember.GroupKey,
 ) (raftservice.ServingState, error) {
+	owner.probeCalls.Add(1)
 	return owner.state, nil
 }
 
@@ -355,6 +357,121 @@ func TestReplicatedServerClosesEveryOwnerOutcomeOnTheWire(t *testing.T) {
 				code, decoded, err, want, wantRefusal)
 		}
 	}
+}
+
+func TestReplicatedServerCountsExceptionalProposalDowngrades(t *testing.T) {
+	fence := testReplicatedFence()
+	command := testReplicatedCommand(t, fence)
+	completion := testReplicatedCompletion(t, fence, 8)
+	state := testReplicatedServingState()
+	state.Status.Commit = 8
+	state.Status.Applied = 8
+	state.Status.CheckpointApplied = 7
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Fence: fence, Command: command,
+	}
+
+	t.Run("invalid completion exposes exact predicate", func(t *testing.T) {
+		server := testReplicatedServer(&fakeReplicatedOwner{state: state,
+			result: raftservice.Result{Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+				CompletionAppliedSequence: 8, CompletionBytes: len(completion) - 1,
+			}, Completion: completion}})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalInvalidCompletion != 1 ||
+			stats.ProposalInvalidCompletionReasons != ReplicatedCompletionInvalidCompletionBytes {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("settled completion advances response watermarks", func(t *testing.T) {
+		owner := &fakeReplicatedOwner{state: state,
+			result: raftservice.Result{Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+				CompletionAppliedSequence: 8, CompletionBytes: len(completion),
+			}, Completion: completion}}
+		server := testReplicatedServer(owner)
+		response := server.executeReplicated(context.Background(), request)
+		if response.Kind != ReplicatedCompletion || response.State.Applied != 9 ||
+			response.State.Commit != 9 || !validReplicatedResponse(response) ||
+			owner.probeCalls.Load() != 1 {
+			t.Fatalf("response=%+v stats=%+v", response, server.Stats())
+		}
+	})
+
+	t.Run("owner unknown remains distinct", func(t *testing.T) {
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, err: raftservice.ErrOutcomeUnknown,
+		})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalUnknownSubmit != 1 ||
+			stats.ProposalUnknownAbandoned != 0 || stats.ProposalInvalidCompletion != 0 {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("abandoned remains distinct", func(t *testing.T) {
+		server := testReplicatedServer(&fakeReplicatedOwner{state: state,
+			result: raftservice.Result{Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeProposalAbandoned,
+			}}, err: raftserve.ErrProposalAbandoned})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalUnknownAbandoned != 1 ||
+			stats.ProposalUnknownSubmit != 0 || stats.ProposalInvalidCompletion != 0 {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("pre-admission bound remains definite", func(t *testing.T) {
+		outcome := raftserve.Outcome{Code: raftserve.OutcomeAdmissionBound}
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
+		})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedRefusal ||
+			response.Refusal != ReplicatedRefusalAdmissionBound ||
+			response.Outcome != (raftserve.Outcome{}) ||
+			stats.ProposalInvalidDeterministic != 0 || !validReplicatedResponse(response) {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("invalid deterministic refusal remains distinct", func(t *testing.T) {
+		outcome := raftserve.Outcome{
+			Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9, CompletionBytes: 1,
+		}
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
+		})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalInvalidDeterministic != 1 ||
+			stats.ProposalUnknownSubmit != 0 || stats.ProposalInvalidCompletion != 0 ||
+			stats.ProposalInvalidDeterministicReasons != ReplicatedDeterministicInvalidCompletionBytes ||
+			stats.ProposalInvalidDeterministicCode != raftserve.OutcomeRequestConflict ||
+			stats.ProposalInvalidDeterministicApplied != 9 ||
+			stats.ProposalInvalidDeterministicState != 9 {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("settled deterministic refusal advances response watermarks", func(t *testing.T) {
+		outcome := raftserve.Outcome{Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9}
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
+		})
+		response := server.executeReplicated(context.Background(), request)
+		if response.Kind != ReplicatedRefusal ||
+			response.Refusal != ReplicatedRefusalDeterministic ||
+			response.State.Applied != 9 || response.State.Commit != 9 ||
+			!validReplicatedResponse(response) {
+			t.Fatalf("response=%+v stats=%+v", response, server.Stats())
+		}
+	})
 }
 
 func TestReplicatedFrameBudgetRejectsBeforeAllocationAndRecovers(t *testing.T) {

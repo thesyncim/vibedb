@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -132,7 +133,16 @@ func TestReplicatedApplyCaptureWALBaseSealsOneScanWithoutArtifact(t *testing.T) 
 	core := database.connector.db
 	core.mu.RLock()
 	group := core.checkpointGroup
+	members := []durable.NamedCollection{
+		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
+		{Name: "docs", Collection: core.tables["docs"].collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
+	}
 	core.mu.RUnlock()
+	if group == nil || !group.Owns(members) {
+		t.Fatal("WAL-base capture checkpoint membership mismatch")
+	}
+	participants := uint64(len(members))
 	beforeStats := group.Stats()
 	beforeFiles := walBaseDataFiles(t, database)
 	beforeCut, err := claim.SnapshotArtifactCut()
@@ -195,9 +205,10 @@ func TestReplicatedApplyCaptureWALBaseSealsOneScanWithoutArtifact(t *testing.T) 
 
 	afterStats := group.Stats()
 	if afterStats.CheckpointAppliedIndex != 1 ||
-		afterStats.CertificateSyncs-beforeStats.CertificateSyncs != 3 ||
+		afterStats.CertificateSyncs-beforeStats.CertificateSyncs != participants ||
 		afterStats.Checkpoints-beforeStats.Checkpoints != 1 ||
-		afterStats.BarrierSyncs-beforeStats.BarrierSyncs != 3 {
+		afterStats.BarrierSyncs-beforeStats.BarrierSyncs != participants+1 ||
+		afterStats.PhysicalCheckpoints-beforeStats.PhysicalCheckpoints != participants {
 		t.Fatalf("capture seal stats: before=%+v after=%+v", beforeStats, afterStats)
 	}
 	if afterFiles := walBaseDataFiles(t, database); !slices.Equal(afterFiles, beforeFiles) {
@@ -529,7 +540,8 @@ func TestReplicatedApplyCaptureWALBaseMaxLegalRowHasNoPayloadGrowth(t *testing.T
 	}
 
 	required := requiredWALBaseWorkspaceBytes(t, claim, base)
-	if len(key)+len(document)+8 != replicatedstate.MaxSnapshotArtifactChunkBytes ||
+	if len(key) != replication.MaxMutationKeyBytes ||
+		len(document) != replication.MaxMutationValueBytes ||
 		required != replicatedstate.DefaultSnapshotArtifactChunkBytes {
 		t.Fatalf(
 			"exact maximum-row workspace = %d, key/document = %d/%d",

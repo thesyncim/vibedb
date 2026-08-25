@@ -39,7 +39,8 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 		}
 		for ordinal, replica := range route.Replicas {
 			want := descriptor.Replicas[ordinal]
-			if replica.Member != want.Member || replica.Address != endpoints[want.Endpoint] {
+			if replica.Member != want.Member || replica.NativeEndpoint != string(want.NativeEndpoint) ||
+				replica.Address != endpoints[want.NativeEndpoint] {
 				t.Fatalf("replica %d = %+v", ordinal, replica)
 			}
 		}
@@ -287,6 +288,12 @@ func testReplicatedCatalogInput(
 	endpoints := testEndpoints()
 	endpoints["ep-c"] = "127.0.0.1:7003"
 	endpoints["ep-d"] = "127.0.0.1:7004"
+	endpoints["ep-a-native"] = "127.0.0.1:7101"
+	endpoints["ep-c-native"] = "127.0.0.1:7103"
+	endpoints["ep-d-native"] = "127.0.0.1:7104"
+	endpoints["ep-a-control"] = "127.0.0.1:7201"
+	endpoints["ep-c-control"] = "127.0.0.1:7203"
+	endpoints["ep-d-control"] = "127.0.0.1:7204"
 	group := raftmember.GroupKey{TopologyRecoveryEpoch: 11}
 	for ordinal := range group.ClusterID {
 		group.ClusterID[ordinal] = byte(ordinal + 1)
@@ -304,9 +311,9 @@ func testReplicatedCatalogInput(
 			RoutingVersion:         uint64(manifest.Version()), RouteGeneration: 10,
 		},
 		Replicas: []ReplicatedReplicaDescriptor{
-			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21, Endpoint: "ep-a"},
-			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "ep-c"},
-			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23, Endpoint: "ep-d"},
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21, Endpoint: "ep-a", NativeEndpoint: "ep-a-native", ControlEndpoint: "ep-a-control"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "ep-c", NativeEndpoint: "ep-c-native", ControlEndpoint: "ep-c-control"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23, Endpoint: "ep-d", NativeEndpoint: "ep-d-native", ControlEndpoint: "ep-d-control"},
 		},
 	}
 	return config, endpoints, descriptor

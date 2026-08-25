@@ -10,13 +10,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const (
 	snapshotArtifactFormat           = uint16(1)
 	snapshotArtifactHeaderFixedBytes = 64
 	snapshotArtifactChunkHeaderBytes = 96
-	snapshotArtifactFooterBytes      = 192
+	snapshotArtifactFooterBytes      = 240
 	snapshotArtifactChecksumBytes    = sha256.Size
 	snapshotArtifactRowHeaderBytes   = 8
 
@@ -29,7 +30,7 @@ const (
 	// MaxSnapshotArtifactChunkBytes is one maximum-sized raw row frame. The
 	// verifier refuses larger declared payloads before allocating its buffer.
 	MaxSnapshotArtifactChunkBytes = replication.MaxMutationKeyBytes +
-		replication.MaxMutationValueBytes + snapshotArtifactRowHeaderBytes
+		MaxTransitionCaptureRecordBytes + snapshotArtifactRowHeaderBytes
 	// SnapshotArtifactFooterBytes is the fixed final certificate frame. Cursor
 	// persistence intentionally stops immediately before this frame: the footer
 	// authenticates completion but carries no mutable receive progress.
@@ -38,11 +39,20 @@ const (
 		MaxStateEnvelopeBytes + replication.MaxCollectionBytes + snapshotArtifactChecksumBytes
 )
 
+// MaxTransitionCaptureRecordBytes is the global bound for one compact capture
+// record: a replicated command payload plus one fixed 56-byte before witness
+// per mutation and the 248-byte record envelope. Collection-specific limits
+// are normally much smaller and remain enforced by their durable target.
+const MaxTransitionCaptureRecordBytes = replication.MaxCommandBytes +
+	MaxDistinctMutations*56 + 248
+
 const (
 	// SnapshotArtifactSystem identifies raw hidden system rows.
 	SnapshotArtifactSystem SnapshotArtifactCollection = 1
 	// SnapshotArtifactUser identifies raw user-collection rows.
 	SnapshotArtifactUser SnapshotArtifactCollection = 2
+	// SnapshotArtifactCapture identifies raw private transition-capture rows.
+	SnapshotArtifactCapture SnapshotArtifactCollection = 3
 )
 
 var (
@@ -57,6 +67,9 @@ var (
 	)
 	snapshotArtifactFooterDomain = []byte(
 		"vibedb/replicated-state/snapshot-artifact-footer\x00",
+	)
+	snapshotArtifactCaptureImageDomain = []byte(
+		"vibedb/replicated-state/snapshot-artifact-capture-image\x00",
 	)
 )
 
@@ -138,7 +151,8 @@ type SnapshotArtifactCheckpoint struct {
 // Chunk is called after every row has been accepted and receives the next
 // immutable resume cursor; it must return only after the corresponding row
 // effects and cursor are durably ordered. PayloadBuffer is optional caller-owned
-// workspace and is overwritten for the call. Capacity through
+// workspace and is overwritten for the call. Borrowed key/value/payload bytes
+// are read-only. Row and Rows are mutually exclusive. Capacity through
 // MaxSnapshotArtifactChunkBytes prevents verifier growth for every valid
 // artifact.
 type SnapshotArtifactCallbacks struct {
@@ -206,6 +220,7 @@ type SnapshotArtifactCursor struct {
 	previousKeyBytes      uint16
 	currentCollection     SnapshotArtifactCollection
 	stateRowSeen          bool
+	captureImageDigest    [sha256.Size]byte
 }
 
 // Offset returns the exact byte offset at which the next range begins.
@@ -242,7 +257,7 @@ func (c *SnapshotArtifactCursor) PrefixManifest() SnapshotArtifactManifest {
 	return cloneSnapshotArtifactManifest(c.manifest)
 }
 
-// SnapshotArtifactManifest certifies one coherent system/user image. The
+// SnapshotArtifactManifest certifies one coherent system/user/capture image. The
 // collection name is detached raw bytes; State is the canonical publication
 // embedded in both the header and hidden system row.
 type SnapshotArtifactManifest struct {
@@ -262,6 +277,7 @@ type SnapshotArtifactManifest struct {
 	Chunks           uint64
 	SystemRows       uint64
 	UserRows         uint64
+	CaptureRows      uint64
 	PayloadBytes     uint64
 	EncodedBytes     uint64
 	HeaderDigest     [sha256.Size]byte
@@ -269,7 +285,9 @@ type SnapshotArtifactManifest struct {
 	// ImageDigest is the canonical validated user image computed while the
 	// artifact's user rows are already being streamed.
 	ImageDigest [sha256.Size]byte
-	Digest      [sha256.Size]byte
+	// CaptureImageDigest authenticates the exact opaque capture key/value image.
+	CaptureImageDigest [sha256.Size]byte
+	Digest             [sha256.Size]byte
 }
 
 // SnapshotArtifactRelation is one dense relation image committed by a compact
@@ -292,6 +310,7 @@ type snapshotArtifactWriter struct {
 	chunks         uint64
 	systemRows     uint64
 	userRows       uint64
+	captureRows    uint64
 	payloadBytes   uint64
 	encodedBytes   uint64
 	headerDigest   [sha256.Size]byte
@@ -300,6 +319,7 @@ type snapshotArtifactWriter struct {
 	rowHeader      [snapshotArtifactRowHeaderBytes]byte
 	chunkDigest    [sha256.Size]byte
 	image          *canonicalImageHasher
+	captureImage   [sha256.Size]byte
 }
 
 // WriteSnapshotArtifact writes a deterministic, bounded-memory artifact for
@@ -351,6 +371,7 @@ func WriteSnapshotArtifact(
 	if err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
+	writer.captureImage = snapshotArtifactEmptyCaptureImageDigest()
 	if err := writer.writeCollection(SnapshotArtifactSystem, snapshot.RangeSystem); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
@@ -361,18 +382,22 @@ func WriteSnapshotArtifact(
 	if err := writer.writeCollection(SnapshotArtifactUser, user.RangeRaw); err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
+	if err := writer.writeCollection(SnapshotArtifactCapture, snapshot.RangeCapture); err != nil {
+		return SnapshotArtifactManifest{}, err
+	}
 	imageDigest := writer.image.sum()
-	digest, err := writer.writeFooter(imageDigest)
+	captureImageDigest := writer.captureImage
+	digest, err := writer.writeFooter(imageDigest, captureImageDigest)
 	if err != nil {
 		return SnapshotArtifactManifest{}, err
 	}
 	return SnapshotArtifactManifest{
 		State: cloneState(snapshot.state), UserCollection: []byte(snapshot.userName),
 		TargetChunkBytes: uint32(target), Chunks: writer.chunks,
-		SystemRows: writer.systemRows, UserRows: writer.userRows,
+		SystemRows: writer.systemRows, UserRows: writer.userRows, CaptureRows: writer.captureRows,
 		PayloadBytes: writer.payloadBytes, EncodedBytes: writer.encodedBytes,
 		HeaderDigest: headerDigest, LastChunkDigest: writer.previousDigest,
-		ImageDigest: imageDigest, Digest: digest,
+		ImageDigest: imageDigest, CaptureImageDigest: captureImageDigest, Digest: digest,
 	}, nil
 }
 
@@ -432,7 +457,10 @@ func (w *snapshotArtifactWriter) writeCollection(
 				return err
 			}
 		}
-		rowBytes, ok := snapshotArtifactRowBytes(key, value)
+		if collection == SnapshotArtifactCapture {
+			w.captureImage = snapshotArtifactCaptureImageNext(w.captureImage, key, value)
+		}
+		rowBytes, ok := snapshotArtifactRowBytes(collection, key, value)
 		if !ok {
 			return fmt.Errorf("%w: row", ErrSnapshotArtifactBound)
 		}
@@ -460,9 +488,13 @@ func (w *snapshotArtifactWriter) writeCollection(
 	return w.flush()
 }
 
-func snapshotArtifactRowBytes(key, value []byte) (int, bool) {
+func snapshotArtifactRowBytes(collection SnapshotArtifactCollection, key, value []byte) (int, bool) {
+	maxValueBytes := replication.MaxMutationValueBytes
+	if collection == SnapshotArtifactCapture {
+		maxValueBytes = MaxTransitionCaptureRecordBytes
+	}
 	if len(key) == 0 || len(key) > replication.MaxMutationKeyBytes ||
-		len(value) == 0 || len(value) > replication.MaxMutationValueBytes {
+		len(value) == 0 || len(value) > maxValueBytes {
 		return 0, false
 	}
 	rowBytes := snapshotArtifactRowHeaderBytes + len(key) + len(value)
@@ -505,7 +537,7 @@ func (w *snapshotArtifactWriter) writeExceptionalRow(
 	value []byte,
 	rowBytes int,
 ) error {
-	actualRowBytes, validRow := snapshotArtifactRowBytes(key, value)
+	actualRowBytes, validRow := snapshotArtifactRowBytes(w.collection, key, value)
 	if len(w.payload) != 0 || w.chunkRows != 0 || rowBytes <= w.target ||
 		!validRow || actualRowBytes != rowBytes {
 		return fmt.Errorf("%w: exceptional row state", ErrSnapshotArtifact)
@@ -561,6 +593,10 @@ func (w *snapshotArtifactWriter) prepareChunk(
 		if w.userRows > math.MaxUint64-rowCount {
 			return 0, fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
 		}
+	case SnapshotArtifactCapture:
+		if w.captureRows > math.MaxUint64-rowCount {
+			return 0, fmt.Errorf("%w: capture rows", ErrSnapshotArtifactBound)
+		}
 	default:
 		return 0, fmt.Errorf("%w: chunk collection", ErrSnapshotArtifactBound)
 	}
@@ -590,8 +626,10 @@ func (w *snapshotArtifactWriter) commitChunk(
 ) {
 	if w.collection == SnapshotArtifactSystem {
 		w.systemRows += uint64(rows)
-	} else {
+	} else if w.collection == SnapshotArtifactUser {
 		w.userRows += uint64(rows)
+	} else {
+		w.captureRows += uint64(rows)
 	}
 	w.payloadBytes += uint64(payloadBytes)
 	w.encodedBytes += uint64(total)
@@ -601,14 +639,15 @@ func (w *snapshotArtifactWriter) commitChunk(
 
 func (w *snapshotArtifactWriter) writeFooter(
 	imageDigest [sha256.Size]byte,
+	captureImageDigest [sha256.Size]byte,
 ) ([sha256.Size]byte, error) {
 	if w.encodedBytes > math.MaxUint64-snapshotArtifactFooterBytes {
 		return [sha256.Size]byte{}, fmt.Errorf("%w: artifact bytes", ErrSnapshotArtifactBound)
 	}
 	totalBytes := w.encodedBytes + snapshotArtifactFooterBytes
 	footer, digest := makeSnapshotArtifactFooter(
-		w.chunks, w.systemRows, w.userRows, w.payloadBytes, totalBytes,
-		w.previousDigest, w.headerDigest, imageDigest,
+		w.chunks, w.systemRows, w.userRows, w.captureRows, w.payloadBytes, totalBytes,
+		w.previousDigest, w.headerDigest, imageDigest, captureImageDigest,
 	)
 	if err := writeSnapshotArtifactBytes(w.w, footer[:]); err != nil {
 		return [sha256.Size]byte{}, err
@@ -621,11 +660,13 @@ func makeSnapshotArtifactFooter(
 	chunks uint64,
 	systemRows uint64,
 	userRows uint64,
+	captureRows uint64,
 	payloadBytes uint64,
 	totalBytes uint64,
 	lastChunkDigest [sha256.Size]byte,
 	headerDigest [sha256.Size]byte,
 	imageDigest [sha256.Size]byte,
+	captureImageDigest [sha256.Size]byte,
 ) ([snapshotArtifactFooterBytes]byte, [sha256.Size]byte) {
 	var footer [snapshotArtifactFooterBytes]byte
 	copy(footer[0:8], snapshotArtifactFooterMagic[:])
@@ -636,13 +677,15 @@ func makeSnapshotArtifactFooter(
 	binary.LittleEndian.PutUint64(footer[24:32], chunks)
 	binary.LittleEndian.PutUint64(footer[32:40], systemRows)
 	binary.LittleEndian.PutUint64(footer[40:48], userRows)
-	binary.LittleEndian.PutUint64(footer[48:56], payloadBytes)
-	binary.LittleEndian.PutUint64(footer[56:64], totalBytes)
-	copy(footer[64:96], lastChunkDigest[:])
-	copy(footer[96:128], headerDigest[:])
-	copy(footer[128:160], imageDigest[:])
-	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
-	copy(footer[160:192], digest[:])
+	binary.LittleEndian.PutUint64(footer[48:56], captureRows)
+	binary.LittleEndian.PutUint64(footer[56:64], payloadBytes)
+	binary.LittleEndian.PutUint64(footer[64:72], totalBytes)
+	copy(footer[72:104], lastChunkDigest[:])
+	copy(footer[104:136], headerDigest[:])
+	copy(footer[136:168], imageDigest[:])
+	copy(footer[168:200], captureImageDigest[:])
+	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:208])
+	copy(footer[208:240], digest[:])
 	return footer, digest
 }
 
@@ -701,6 +744,10 @@ func ContinueSnapshotArtifact(
 	if r == nil {
 		return SnapshotArtifactManifest{}, cursor, fmt.Errorf("%w: nil reader", ErrSnapshotArtifact)
 	}
+	if callbacks.Row != nil && callbacks.Rows != nil {
+		return SnapshotArtifactManifest{}, cursor,
+			fmt.Errorf("%w: row callbacks are mutually exclusive", ErrSnapshotArtifact)
+	}
 	var current SnapshotArtifactCursor
 	if cursor == nil {
 		headerManifest, expectedStateDocument, encodedBytes, err := readSnapshotArtifactHeader(r)
@@ -710,7 +757,8 @@ func ContinueSnapshotArtifact(
 		current = SnapshotArtifactCursor{
 			manifest: headerManifest, expectedStateDocument: expectedStateDocument,
 			encodedBytes: encodedBytes, previousDigest: headerManifest.HeaderDigest,
-			currentCollection: SnapshotArtifactSystem,
+			currentCollection:  SnapshotArtifactSystem,
+			captureImageDigest: snapshotArtifactEmptyCaptureImageDigest(),
 		}
 	} else {
 		if err := validateSnapshotArtifactCursor(cursor); err != nil {
@@ -741,7 +789,7 @@ func ContinueSnapshotArtifact(
 			if err != nil {
 				return SnapshotArtifactManifest{}, &current, err
 			}
-			if chunk.Collection == SnapshotArtifactUser && !current.stateRowSeen {
+			if chunk.Collection != SnapshotArtifactSystem && !current.stateRowSeen {
 				return SnapshotArtifactManifest{}, &current,
 					fmt.Errorf("%w: user rows precede hidden state", ErrSnapshotArtifact)
 			}
@@ -775,11 +823,14 @@ func ContinueSnapshotArtifact(
 					return SnapshotArtifactManifest{}, &current,
 						fmt.Errorf("%w: system rows", ErrSnapshotArtifactBound)
 				}
-			} else {
+			} else if chunk.Collection == SnapshotArtifactUser {
 				if current.manifest.UserRows > math.MaxUint64-chunk.Rows {
 					return SnapshotArtifactManifest{}, &current,
 						fmt.Errorf("%w: user rows", ErrSnapshotArtifactBound)
 				}
+			} else if current.manifest.CaptureRows > math.MaxUint64-chunk.Rows {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: capture rows", ErrSnapshotArtifactBound)
 			}
 			checkpoint := SnapshotArtifactCheckpoint{
 				Sequence: chunk.Sequence, Collection: chunk.Collection,
@@ -797,8 +848,20 @@ func ContinueSnapshotArtifact(
 				candidate.previousKeyBytes = 0
 			}
 			previousKeyBytes := int(candidate.previousKeyBytes)
+			visit := callbacks.Row
+			if chunk.Collection == SnapshotArtifactCapture {
+				visit = func(collection SnapshotArtifactCollection, key, value []byte) error {
+					candidate.captureImageDigest = snapshotArtifactCaptureImageNext(
+						candidate.captureImageDigest, key, value,
+					)
+					if callbacks.Row != nil {
+						return callbacks.Row(collection, key, value)
+					}
+					return nil
+				}
+			}
 			seenState, err := consumeSnapshotArtifactRows(
-				chunk, payload, callbacks.Row, candidate.previousKey[:], &previousKeyBytes,
+				chunk, payload, visit, candidate.previousKey[:], &previousKeyBytes,
 				candidate.expectedStateDocument, candidate.stateRowSeen,
 			)
 			if err != nil {
@@ -810,8 +873,10 @@ func ContinueSnapshotArtifact(
 			candidate.manifest.PayloadBytes += uint64(payloadBytes)
 			if chunk.Collection == SnapshotArtifactSystem {
 				candidate.manifest.SystemRows += chunk.Rows
-			} else {
+			} else if chunk.Collection == SnapshotArtifactUser {
 				candidate.manifest.UserRows += chunk.Rows
+			} else {
+				candidate.manifest.CaptureRows += chunk.Rows
 			}
 			candidate.manifest.Chunks++
 			candidate.manifest.LastChunkDigest = storedDigest
@@ -842,10 +907,17 @@ func ContinueSnapshotArtifact(
 			); err != nil {
 				return SnapshotArtifactManifest{}, &current, err
 			}
+			var certified [sha256.Size]byte
+			copy(certified[:], footer[168:200])
+			if current.captureImageDigest != certified {
+				return SnapshotArtifactManifest{}, &current,
+					fmt.Errorf("%w: capture image digest", ErrSnapshotArtifact)
+			}
 			manifest = cloneSnapshotArtifactManifest(current.manifest)
 			manifest.EncodedBytes = current.encodedBytes + snapshotArtifactFooterBytes
-			copy(manifest.ImageDigest[:], footer[128:160])
-			copy(manifest.Digest[:], footer[160:192])
+			copy(manifest.ImageDigest[:], footer[136:168])
+			copy(manifest.CaptureImageDigest[:], footer[168:200])
+			copy(manifest.Digest[:], footer[208:240])
 			var trailing [1]byte
 			n, readErr := io.ReadFull(r, trailing[:])
 			if n != 0 || readErr == nil {
@@ -870,12 +942,15 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 		cursor.nextSequence != cursor.manifest.Chunks ||
 		cursor.previousDigest != cursor.manifest.LastChunkDigest ||
 		cursor.manifest.ImageDigest != ([sha256.Size]byte{}) ||
+		cursor.manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
 		cursor.manifest.Digest != ([sha256.Size]byte{}) || cursor.manifest.EncodedBytes != 0 ||
 		cursor.manifest.HeaderDigest == ([sha256.Size]byte{}) ||
+		cursor.captureImageDigest == ([sha256.Size]byte{}) ||
 		cursor.manifest.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
 		cursor.manifest.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
 		(cursor.currentCollection != SnapshotArtifactSystem &&
-			cursor.currentCollection != SnapshotArtifactUser) ||
+			cursor.currentCollection != SnapshotArtifactUser &&
+			cursor.currentCollection != SnapshotArtifactCapture) ||
 		cursor.previousKeyBytes > replication.MaxMutationKeyBytes ||
 		len(cursor.expectedStateDocument) == 0 {
 		return fmt.Errorf("%w: resume cursor", ErrSnapshotArtifact)
@@ -900,25 +975,34 @@ func validateSnapshotArtifactCursor(cursor *SnapshotArtifactCursor) error {
 	if err != nil || headerDigest != cursor.manifest.HeaderDigest ||
 		!encodedBytesOK || cursor.encodedBytes != wantEncodedBytes ||
 		cursor.manifest.SystemRows > cursor.manifest.State.SessionCount+
-			cursor.manifest.State.SessionSlotCount+1 {
+			cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1 {
 		return fmt.Errorf("%w: resume header identity", ErrSnapshotArtifact)
 	}
 	if cursor.manifest.Chunks == 0 {
 		if cursor.encodedBytes != uint64(len(header)) || cursor.nextSequence != 0 ||
 			cursor.manifest.SystemRows != 0 || cursor.manifest.UserRows != 0 ||
+			cursor.manifest.CaptureRows != 0 ||
 			cursor.manifest.PayloadBytes != 0 || cursor.previousKeyBytes != 0 ||
 			cursor.currentCollection != SnapshotArtifactSystem || cursor.stateRowSeen ||
-			cursor.previousDigest != cursor.manifest.HeaderDigest {
+			cursor.previousDigest != cursor.manifest.HeaderDigest ||
+			cursor.captureImageDigest != snapshotArtifactEmptyCaptureImageDigest() {
 			return fmt.Errorf("%w: empty resume prefix", ErrSnapshotArtifact)
 		}
 		return nil
 	}
 	if cursor.encodedBytes <= uint64(len(header)) || cursor.previousKeyBytes == 0 ||
 		!cursor.stateRowSeen || cursor.manifest.SystemRows == 0 ||
-		cursor.currentCollection == SnapshotArtifactSystem && cursor.manifest.UserRows != 0 ||
+		cursor.currentCollection == SnapshotArtifactSystem &&
+			(cursor.manifest.UserRows != 0 || cursor.manifest.CaptureRows != 0) ||
 		cursor.currentCollection == SnapshotArtifactUser &&
-			cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
-				cursor.manifest.State.SessionSlotCount+1 {
+			(cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
+				cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1 ||
+				cursor.manifest.CaptureRows != 0) ||
+		cursor.currentCollection == SnapshotArtifactCapture &&
+			(cursor.manifest.SystemRows != cursor.manifest.State.SessionCount+
+				cursor.manifest.State.SessionSlotCount+cursor.manifest.State.AuthorityBindingCount+1) ||
+		(cursor.manifest.CaptureRows == 0) !=
+			(cursor.captureImageDigest == snapshotArtifactEmptyCaptureImageDigest()) {
 		return fmt.Errorf("%w: resume prefix state", ErrSnapshotArtifact)
 	}
 	return nil
@@ -1021,7 +1105,8 @@ func validateSnapshotArtifactChunkHeader(
 		storedPrevious != previousDigest {
 		return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk sequence or bounds", ErrSnapshotArtifact)
 	}
-	if collection != SnapshotArtifactSystem && collection != SnapshotArtifactUser ||
+	if collection != SnapshotArtifactSystem && collection != SnapshotArtifactUser &&
+		collection != SnapshotArtifactCapture ||
 		collection < currentCollection {
 		return snapshotArtifactChunk{}, 0, fmt.Errorf("%w: chunk collection order", ErrSnapshotArtifact)
 	}
@@ -1049,7 +1134,7 @@ func consumeSnapshotArtifactRows(
 		valueBytes := uint64(binary.LittleEndian.Uint32(payload[cursor+4 : cursor+8]))
 		cursor += snapshotArtifactRowHeaderBytes
 		if keyBytes == 0 || keyBytes > replication.MaxMutationKeyBytes ||
-			valueBytes == 0 || valueBytes > replication.MaxMutationValueBytes ||
+			valueBytes == 0 || valueBytes > snapshotArtifactMaxValueBytes(chunk.Collection) ||
 			keyBytes+valueBytes > uint64(len(payload)-cursor) {
 			return false, fmt.Errorf("%w: row bounds", ErrSnapshotArtifactBound)
 		}
@@ -1071,6 +1156,13 @@ func consumeSnapshotArtifactRows(
 				stateRowSeen = true
 			case len(key) == sha256.Size+1 && key[0] == 1:
 			case len(key) == sha256.Size+3 && key[0] == 2:
+			case len(key) == sha256.Size+1 && key[0] == 3:
+				view, err := OpenAuthorityBinding(value)
+				want := AuthorityBindingStorageKey(view.Digest)
+				if err != nil || !bytes.Equal(key, want[:]) {
+					return false, fmt.Errorf("%w: hidden authority binding: %v",
+						ErrSnapshotArtifact, err)
+				}
 			default:
 				return false, fmt.Errorf("%w: hidden system key", ErrSnapshotArtifact)
 			}
@@ -1090,6 +1182,13 @@ func consumeSnapshotArtifactRows(
 	return stateRowSeen, nil
 }
 
+func snapshotArtifactMaxValueBytes(collection SnapshotArtifactCollection) uint64 {
+	if collection == SnapshotArtifactCapture {
+		return MaxTransitionCaptureRecordBytes
+	}
+	return replication.MaxMutationValueBytes
+}
+
 func validateSnapshotArtifactFooter(
 	footer []byte,
 	manifest SnapshotArtifactManifest,
@@ -1107,26 +1206,31 @@ func validateSnapshotArtifactFooter(
 	if encodedBeforeFooter > math.MaxUint64-snapshotArtifactFooterBytes {
 		return fmt.Errorf("%w: footer bytes", ErrSnapshotArtifactBound)
 	}
-	var storedPrevious, storedHeader, storedImage [sha256.Size]byte
-	copy(storedPrevious[:], footer[64:96])
-	copy(storedHeader[:], footer[96:128])
-	copy(storedImage[:], footer[128:160])
-	wantDigest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:160])
+	var storedPrevious, storedHeader, storedImage, storedCaptureImage [sha256.Size]byte
+	copy(storedPrevious[:], footer[72:104])
+	copy(storedHeader[:], footer[104:136])
+	copy(storedImage[:], footer[136:168])
+	copy(storedCaptureImage[:], footer[168:200])
+	if !allZero(footer[200:208]) {
+		return fmt.Errorf("%w: footer reserved", ErrSnapshotArtifact)
+	}
+	wantDigest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:208])
 	var storedDigest [sha256.Size]byte
-	copy(storedDigest[:], footer[160:192])
+	copy(storedDigest[:], footer[208:240])
 	if storedDigest != wantDigest ||
-		storedImage == ([sha256.Size]byte{}) ||
+		storedImage == ([sha256.Size]byte{}) || storedCaptureImage == ([sha256.Size]byte{}) ||
 		binary.LittleEndian.Uint64(footer[16:24]) != manifest.Chunks ||
 		binary.LittleEndian.Uint64(footer[24:32]) != manifest.Chunks ||
 		binary.LittleEndian.Uint64(footer[32:40]) != manifest.SystemRows ||
 		binary.LittleEndian.Uint64(footer[40:48]) != manifest.UserRows ||
-		binary.LittleEndian.Uint64(footer[48:56]) != manifest.PayloadBytes ||
-		binary.LittleEndian.Uint64(footer[56:64]) != encodedBeforeFooter+snapshotArtifactFooterBytes ||
+		binary.LittleEndian.Uint64(footer[48:56]) != manifest.CaptureRows ||
+		binary.LittleEndian.Uint64(footer[56:64]) != manifest.PayloadBytes ||
+		binary.LittleEndian.Uint64(footer[64:72]) != encodedBeforeFooter+snapshotArtifactFooterBytes ||
 		storedPrevious != previousDigest || storedHeader != manifest.HeaderDigest {
 		return fmt.Errorf("%w: footer totals or digest", ErrSnapshotArtifact)
 	}
 	if !stateRowSeen || manifest.SystemRows != manifest.State.SessionCount+
-		manifest.State.SessionSlotCount+1 {
+		manifest.State.SessionSlotCount+manifest.State.AuthorityBindingCount+1 {
 		return fmt.Errorf("%w: hidden state image", ErrSnapshotArtifact)
 	}
 	return nil
@@ -1146,6 +1250,38 @@ func snapshotArtifactDigestParts(domain, first, second []byte) [sha256.Size]byte
 	_, _ = h.Write(domain)
 	_, _ = h.Write(first)
 	_, _ = h.Write(second)
+	var digest [sha256.Size]byte
+	_ = h.Sum(digest[:0])
+	return digest
+}
+
+func snapshotArtifactOpaqueImageDigest(snapshot *durable.Snapshot) ([sha256.Size]byte, error) {
+	if snapshot == nil {
+		return [sha256.Size]byte{}, ErrInconsistentSnapshot
+	}
+	digest := snapshotArtifactEmptyCaptureImageDigest()
+	err := snapshot.RangeRaw(func(key, value []byte) error {
+		digest = snapshotArtifactCaptureImageNext(digest, key, value)
+		return nil
+	})
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return digest, nil
+}
+
+func snapshotArtifactEmptyCaptureImageDigest() [sha256.Size]byte {
+	return sha256.Sum256(snapshotArtifactCaptureImageDomain)
+}
+
+func snapshotArtifactCaptureImageNext(
+	previous [sha256.Size]byte, key, value []byte,
+) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(snapshotArtifactCaptureImageDomain)
+	_, _ = h.Write(previous[:])
+	writeHashFrame(h, key)
+	writeHashFrame(h, value)
 	var digest [sha256.Size]byte
 	_ = h.Sum(digest[:0])
 	return digest

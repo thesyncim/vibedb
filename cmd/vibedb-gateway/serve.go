@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -16,8 +18,11 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	"github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -107,6 +112,15 @@ func (values *repeatedFlag) Set(value string) error {
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
+	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
+	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
+	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
+	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
+	catalogSessionJournal := fs.String("catalog-session-journal", "", "durable native controller session journal base path")
+	catalogClientID := fs.String("catalog-client-id", "", "stable 32-hex-character controller client identity")
+	catalogRetryHome := fs.String("catalog-retry-home", "", "stable 16-hex-character controller retry-home identity")
+	catalogSessionLease := fs.Duration("catalog-session-lease", 24*time.Hour, "monotonic controller session renewal interval")
+	controllerInterval := fs.Duration("controller-interval", time.Second, "bounded replicated split reconciliation interval")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
@@ -128,8 +142,20 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
+	if *devStaticCatalog {
+		if !*devPlaintext || *catalogRelation != 0 {
+			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
+			return 2
+		}
+	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
+		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *controllerInterval <= 0 ||
+		*catalogSessionLease <= 0 || len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
+		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
+		return 2
+	}
 	var clientTLS *gateway.ClientTLS
 	var shardTLS *servicetls.Client
+	var tlsProfile *rafttransport.PeerTLS
 	var internalAuthority serviceauthz.Authority
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
@@ -141,12 +167,17 @@ func runServe(args []string) int {
 			fmt.Fprintf(os.Stderr, "gateway: %v\n", err)
 			return 2
 		}
+		// The loopback-only development transport skips policy enforcement, but
+		// still emits the one canonical classified replicated request shape.
+		internalAuthority.Node[0] = 1
+		internalAuthority.Generation = 1
 	} else {
 		profile, err := servicetls.LoadProfile(*tlsCertificate, *tlsKey, *tlsRoots, *tlsIdentityOID, time.Now)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gateway: load TLS profile: %v\n", err)
 			return 2
 		}
+		tlsProfile = profile
 		policy, policyErr := serviceauthz.LoadFile(*authorizationPolicy)
 		if policyErr != nil {
 			fmt.Fprintf(os.Stderr, "gateway: load authorization policy: %v\n", policyErr)
@@ -157,8 +188,8 @@ func runServe(args []string) int {
 		}
 		if policy.Check(internalAuthority.Node,
 			serviceauthz.CapabilityDataRead|serviceauthz.CapabilityDataWrite|
-				serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
-			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, and data_write recovery authority")
+				serviceauthz.CapabilityDelegate|serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
+			fmt.Fprintln(os.Stderr, "gateway: local TLS identity lacks delegate, data_read, data_write, and topology recovery authority")
 			return 2
 		}
 		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
@@ -201,12 +232,36 @@ func runServe(args []string) int {
 	if shardTLS != nil {
 		shardDial = shardTLS.Dial
 	}
-	exec, holder, err := newGatewayWithDial(*catalog, shardDial, internalAuthority)
+	var exec *gateway.Executor
+	var holder *gateway.CatalogHolder
+	var catalogAuthority *gateway.ReplicatedCatalogAuthority
+	var catalogTLS *servicetls.Client
+	var err error
+	if *devStaticCatalog {
+		exec, holder, err = newGatewayWithDial(*catalog, shardDial, internalAuthority)
+	} else {
+		var clientID replication.ID128
+		var retryHome replication.RetryHome
+		if decodeFixedHex(*catalogClientID, clientID[:]) != nil ||
+			decodeFixedHex(*catalogRetryHome, retryHome[:]) != nil {
+			fmt.Fprintln(os.Stderr, "gateway: catalog client identity or retry home is not canonical hexadecimal")
+			return 2
+		}
+		exec, holder, catalogAuthority, catalogTLS, err = newReplicatedCatalogGateway(
+			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
+			internalAuthority,
+			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
+			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
+			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
+		)
+	}
+	if catalogTLS != nil {
+		defer catalogTLS.Close()
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
 	}
-
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: listen %q: %v\n", *listen, err)
@@ -219,6 +274,13 @@ func runServe(args []string) int {
 	defer stop()
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
+	if catalogAuthority != nil {
+		trigger := &gatewayControllerTriggerClient{
+			tls: tlsProfile, plaintext: *devPlaintext, handshake: *tlsHandshakeTimeout,
+			maxConnections: *maxShardConnections, maxHandshakes: *maxShardHandshakes,
+		}
+		go runSplitController(ctx, catalogAuthority, trigger, *controllerInterval, logf)
+	}
 	if clientTLS != nil {
 		err = serveAuthenticatedGateway(ctx, listener, exec, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
@@ -271,6 +333,257 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
 		Refresh: refresher.Refresh, InternalAuthority: internalAuthority,
 	})
 	return exec, holder, nil
+}
+
+func newReplicatedCatalogGateway(
+	ctx context.Context,
+	bootstrapPath string,
+	shardDial gateway.DialFunc,
+	tlsProfile *rafttransport.PeerTLS,
+	devPlaintext bool,
+	internalAuthority serviceauthz.Authority,
+	relation replication.RelationID,
+	attempts int,
+	attemptTimeout time.Duration,
+	handshakeTimeout time.Duration,
+	maxConnections int,
+	maxHandshakes int,
+	journalPath string,
+	clientID replication.ID128,
+	retryHome replication.RetryHome,
+	lease time.Duration,
+) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority, *servicetls.Client, error) {
+	distributionName := gateway.ReplicatedCatalogDistribution
+	shardID := gateway.ReplicatedCatalogShard
+	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
+	if !ok {
+		return nil, nil, nil, nil, gateway.ErrReplicatedCatalogMissing
+	}
+	var nativeClient gateway.ReplicatedRoundTripper
+	var catalogTLS *servicetls.Client
+	if devPlaintext {
+		nativeClient = gateway.TCPReplicatedClient{Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}}
+	} else {
+		endpoints := make([]servicetls.Endpoint, len(route.Replicas))
+		for index, replica := range route.Replicas {
+			endpoints[index] = servicetls.Endpoint{Address: replica.Address, Node: replica.Node}
+		}
+		secure, secureErr := servicetls.NewClient(servicetls.ClientOptions{
+			TLS: tlsProfile, Class: rafttransport.TrafficShardNative, Endpoints: endpoints,
+			Dial: func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			},
+			HandshakeDeadline: servicetls.FixedDeadline(handshakeTimeout),
+			MaxConnections:    maxConnections, MaxHandshakes: maxHandshakes,
+		})
+		if secureErr != nil {
+			return nil, nil, nil, nil, secureErr
+		}
+		catalogTLS = secure
+		nativeClient = gateway.TCPReplicatedClient{Dial: secure.Dial}
+	}
+	replicated, err := gateway.NewReplicatedExecutor(nativeClient, attempts, attemptTimeout)
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	holder := gateway.NewCatalogHolder(nil)
+	binding, err := gateway.NativeSessionJournalBinding(
+		route, string(distributionName), string(shardID),
+		[]byte{replicatedCatalogControllerTenant}, relation, serviceauthz.CapabilityTopology,
+	)
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	journal, err := gateway.OpenNativeSessionJournal(gateway.NativeSessionJournalOptions{
+		Path: journalPath, ClientID: clientID, RetryHome: retryHome,
+		MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
+	})
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
+		Executor: replicated, Route: route, Distribution: string(distributionName), Shard: string(shardID),
+		Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID, RetryHome: retryHome,
+		Resolver: gateway.BaseRelationResolver{Relation: relation}, Journal: journal,
+		ProposalCapability: serviceauthz.CapabilityTopology,
+		MaxRelationBatches: 1, MaxMutations: 2,
+		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+	})
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	authorizedContext, err := serviceauthz.WithAuthority(ctx, internalAuthority)
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	renewExisting := session.Status().Active
+	if session.Status().Pending {
+		_, err = session.RetryPending(authorizedContext)
+	}
+	if err == nil && !session.Status().Active {
+		deadline := time.Now().Add(lease).UnixNano()
+		if deadline <= 0 {
+			err = gateway.ErrNativeSession
+		} else {
+			_, err = session.Open(authorizedContext, deadline)
+		}
+	}
+	if err == nil && renewExisting && session.Status().Active {
+		status := session.Status()
+		next := time.Now().Add(lease).UnixNano()
+		if next <= status.LeaseDeadline {
+			if status.LeaseDeadline == math.MaxInt64 {
+				err = gateway.ErrNativeSession
+			} else {
+				next = status.LeaseDeadline + 1
+			}
+		}
+		if err == nil && next > 0 {
+			_, err = session.Renew(authorizedContext, status.LeaseDeadline, next)
+		}
+	}
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
+		Executor: replicated, Route: route, Relation: relation, Holder: holder, Session: session,
+		Authority: internalAuthority,
+	})
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	if _, err = authority.Read(ctx); err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, nil, err
+	}
+	executor := gateway.NewExecutor(
+		gateway.NewClient(shardDial), holder, gateway.Options{
+			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
+		},
+	)
+	return executor, holder, authority, catalogTLS, nil
+}
+
+const replicatedCatalogControllerTenant = byte(1)
+
+func decodeFixedHex(encoded string, destination []byte) error {
+	if len(encoded) != hex.EncodedLen(len(destination)) {
+		return gateway.ErrReplicatedCatalog
+	}
+	written, err := hex.Decode(destination, []byte(encoded))
+	if err != nil || written != len(destination) {
+		return gateway.ErrReplicatedCatalog
+	}
+	return nil
+}
+
+type gatewayControllerTriggerClient struct {
+	tls            *rafttransport.PeerTLS
+	plaintext      bool
+	handshake      time.Duration
+	maxConnections int
+	maxHandshakes  int
+}
+
+func (client *gatewayControllerTriggerClient) TriggerSplitController(
+	ctx context.Context, route gateway.ReplicatedRoute, request shardcontrol.Request,
+) (shardcontrol.Response, error) {
+	if client == nil || ctx == nil {
+		return shardcontrol.Response{}, splitcontroller.ErrControllerTrigger
+	}
+	var last error
+	for _, replica := range route.Replicas {
+		var dial shardcontrol.Dial
+		var secure *servicetls.Client
+		if client.plaintext {
+			dial = func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			}
+		} else {
+			var err error
+			secure, err = servicetls.NewClient(servicetls.ClientOptions{
+				TLS: client.tls, Class: rafttransport.TrafficShardControl,
+				Endpoints: []servicetls.Endpoint{{Address: replica.ControlAddress, Node: replica.Node}},
+				Dial: func(ctx context.Context, address string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+				},
+				HandshakeDeadline: servicetls.FixedDeadline(client.handshake),
+				MaxConnections:    min(client.maxConnections, 8),
+				MaxHandshakes:     min(client.maxHandshakes, 8),
+			})
+			if err != nil {
+				return shardcontrol.Response{}, err
+			}
+			dial = secure.Dial
+		}
+		protocol, err := shardcontrol.NewClient(dial, replica.ControlAddress, client.handshake)
+		if err == nil {
+			var response shardcontrol.Response
+			response, err = protocol.Execute(ctx, request)
+			if secure != nil {
+				_ = secure.Close()
+			}
+			if err == nil {
+				return response, nil
+			}
+		} else if secure != nil {
+			_ = secure.Close()
+		}
+		last = errors.Join(last, err)
+	}
+	return shardcontrol.Response{}, errors.Join(last, splitcontroller.ErrControllerTrigger)
+}
+
+func runSplitController(
+	ctx context.Context, directory splitcontroller.ControllerDirectory,
+	client splitcontroller.ControllerTriggerClient, interval time.Duration,
+	logf func(string, ...any),
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		pass, err := splitcontroller.RunControllerPass(ctx, directory, client)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logf("gateway: split controller: %v", err)
+		} else if pass.Triggered != 0 {
+			logf("gateway: split controller triggered %d/%d operation(s)", pass.Triggered, pass.Discovered)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // serveGateway accepts connections until ctx is canceled, then closes the

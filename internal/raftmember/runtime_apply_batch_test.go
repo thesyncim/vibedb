@@ -327,6 +327,15 @@ func TestRuntimeInMemoryBatchDriverAndSettlementGate(t *testing.T) {
 	if runtime.node.Phase() != raftmodel.PhaseEntriesApplied {
 		t.Fatalf("memory settled phase = %s", runtime.node.Phase())
 	}
+	rawApplied := runtime.node.Status().Applied
+	publishedApplied := runtime.node.PublishedApplied()
+	status, statusErr := runtime.Status()
+	if statusErr != nil || rawApplied >= publishedApplied ||
+		publishedApplied != wantLast || status.Applied != publishedApplied ||
+		status.Commit < status.Applied {
+		t.Fatalf("pre-Advance status=%+v err=%v raw=%d published=%d want=%d",
+			status, statusErr, rawApplied, publishedApplied, wantLast)
+	}
 }
 
 func TestRuntimeUnclassifiedSettlementFailureIsTerminal(t *testing.T) {

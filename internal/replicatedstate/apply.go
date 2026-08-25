@@ -26,6 +26,9 @@ var (
 
 type commandPlan struct {
 	command         replication.CommandView
+	authorityDigest [32]byte
+	authorityKey    [33]byte
+	authorityRecord []byte
 	sessionDigest   [32]byte
 	sessionKey      [33]byte
 	slotKey         [35]byte
@@ -37,8 +40,10 @@ type commandPlan struct {
 	resultCode      uint32
 	refusal         error
 	writeSession    bool
+	writeAuthority  bool
 	writeSlot       bool
 	newSession      bool
+	newAuthority    bool
 	newPhysicalSlot bool
 	advanceEpoch    uint64
 	deleteSession   bool
@@ -64,13 +69,15 @@ type relationPointSnapshots struct {
 // overlays before the next call reuses these buffers. Singleton planning passes
 // nil and retains its existing ownership behavior.
 type commandPlanScratch struct {
-	sessionRead   []byte
-	slotRead      []byte
-	decodeRead    []byte
-	sessionRecord []byte
-	slotRecord    []byte
-	currentValue  []byte
-	descriptors   []mutationValueDescriptor
+	authorityRead   []byte
+	authorityRecord []byte
+	sessionRead     []byte
+	slotRead        []byte
+	decodeRead      []byte
+	sessionRecord   []byte
+	slotRecord      []byte
+	currentValue    []byte
+	descriptors     []mutationValueDescriptor
 	// logicalValueReads counts mutation before-value reads in the current
 	// physical batch. It is retained only as bounded qualification telemetry.
 	logicalValueReads uint32
@@ -102,6 +109,8 @@ func (s *commandPlanScratch) release() {
 		return
 	}
 	clear(s.sessionRead)
+	clear(s.authorityRead)
+	clear(s.authorityRecord)
 	clear(s.slotRead)
 	clear(s.decodeRead)
 	clear(s.sessionRecord)
@@ -109,6 +118,8 @@ func (s *commandPlanScratch) release() {
 	clear(s.currentValue)
 	clear(s.descriptors)
 	s.sessionRead = s.sessionRead[:0]
+	s.authorityRead = s.authorityRead[:0]
+	s.authorityRecord = s.authorityRecord[:0]
 	s.slotRead = s.slotRead[:0]
 	s.decodeRead = s.decodeRead[:0]
 	s.sessionRecord = s.sessionRecord[:0]
@@ -116,6 +127,12 @@ func (s *commandPlanScratch) release() {
 	s.descriptors = s.descriptors[:0]
 	if cap(s.sessionRead) > maxNormalBatchRetainedBufferBytes {
 		s.sessionRead = nil
+	}
+	if cap(s.authorityRead) > maxNormalBatchRetainedBufferBytes {
+		s.authorityRead = nil
+	}
+	if cap(s.authorityRecord) > maxNormalBatchRetainedBufferBytes {
+		s.authorityRecord = nil
 	}
 	if cap(s.slotRead) > maxNormalBatchRetainedBufferBytes {
 		s.slotRead = nil
@@ -148,6 +165,19 @@ func (s *commandPlanScratch) appendSessionRecord(
 	encoded, err := AppendSessionRecord(s.sessionRecord[:0], record)
 	if err == nil {
 		s.sessionRecord = encoded
+	}
+	return encoded, err
+}
+
+func (s *commandPlanScratch) appendAuthorityBinding(
+	tenant []byte, clientID replication.ID128, class replication.CommandAuthorityClass,
+) ([]byte, error) {
+	if s == nil {
+		return AppendAuthorityBinding(nil, tenant, clientID, class)
+	}
+	encoded, err := AppendAuthorityBinding(s.authorityRecord[:0], tenant, clientID, class)
+	if err == nil {
+		s.authorityRecord = encoded
 	}
 	return encoded, err
 }
@@ -346,6 +376,9 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		certificate.Manifest.UserRows != m.user.Collection.Len() {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
+	if err := m.verifySnapshotBaseCapture(certificate.Manifest); err != nil {
+		return raftmodel.Publication{}, m.fail(err)
+	}
 	imageDigest, imageErr := m.snapshotBaseImageDigest()
 	if imageErr != nil || certificate.Manifest.ImageDigest != imageDigest {
 		return raftmodel.Publication{}, m.fail(errors.Join(ErrSnapshotBase, imageErr))
@@ -363,6 +396,38 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 	default:
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
+}
+
+func (m *Machine) verifySnapshotBaseCapture(manifest SnapshotArtifactManifest) error {
+	capture := m.reservedCaptureTarget.Collection
+	if capture == nil {
+		if manifest.Seeded {
+			return ErrSnapshotBase
+		}
+		wantDigest := snapshotArtifactEmptyCaptureImageDigest()
+		if manifest.Bundle {
+			wantDigest = [sha256.Size]byte{}
+		}
+		if manifest.CaptureRows != 0 || manifest.CaptureImageDigest != wantDigest {
+			return ErrSnapshotBase
+		}
+		return nil
+	}
+	if manifest.CaptureImageDigest == ([sha256.Size]byte{}) {
+		return ErrSnapshotBase
+	}
+	snapshot, err := capture.Snapshot()
+	if err != nil {
+		return err
+	}
+	rows := snapshot.Len()
+	digest, digestErr := snapshotArtifactOpaqueImageDigest(snapshot)
+	closeErr := snapshot.Close()
+	if digestErr != nil || closeErr != nil || rows != manifest.CaptureRows ||
+		digest != manifest.CaptureImageDigest {
+		return errors.Join(ErrSnapshotBase, digestErr, closeErr)
+	}
+	return nil
 }
 
 func (m *Machine) snapshotBaseImageDigest() ([32]byte, error) {
@@ -564,6 +629,9 @@ func applyCommandPlanToState(next *State, plan commandPlan) error {
 	if plan.newSession {
 		next.SessionCount++
 	}
+	if plan.newAuthority {
+		next.AuthorityBindingCount++
+	}
 	if plan.newPhysicalSlot {
 		next.SessionSlotCount++
 	}
@@ -608,6 +676,7 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
 		SessionEpochHighWater: m.state.SessionEpochHighWater,
+		AuthorityBindingCount: m.state.AuthorityBindingCount,
 	}
 }
 
@@ -736,16 +805,61 @@ func (m *Machine) planBundleCommand(
 ) (commandPlan, error) {
 	scratch.begin()
 	plan := commandPlan{command: command, dataChainDigest: state.DataChainDigest}
-	plan.sessionDigest = SessionKey(command.Tenant, command.ClientID)
+	plan.authorityDigest = AuthorityIdentityKey(command.Tenant, command.ClientID)
+	plan.authorityKey = AuthorityBindingStorageKey(plan.authorityDigest)
+	bound, authorityFound, err := authorityBindingAt(
+		systemSnapshot, plan.authorityKey, scratch,
+	)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	if authorityFound && (bound.Digest != plan.authorityDigest ||
+		!bytes.Equal(bound.Tenant, command.Tenant) || bound.ClientID != command.ClientID ||
+		bound.AuthorityClass != command.AuthorityClass) {
+		plan.sessionDigest = plan.authorityDigest
+		plan.conflict = true
+		return plan, nil
+	}
+	if !authorityFound {
+		if err := ensureNoAuthoritySessionRows(
+			systemSnapshot, command.Tenant, command.ClientID, m.options.RetryWindow,
+		); err != nil {
+			return commandPlan{}, err
+		}
+	}
+	plan.sessionDigest = SessionKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	plan.sessionKey = SessionStorageKey(plan.sessionDigest)
 	session, found, err := sessionAt(systemSnapshot, plan.sessionKey, scratch)
 	if err != nil {
 		return commandPlan{}, err
 	}
+	if found && (session.Digest != plan.sessionDigest ||
+		!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID) {
+		return commandPlan{}, fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+	}
+	if found && session.AuthorityClass != command.AuthorityClass {
+		plan.conflict = true
+		return plan, nil
+	}
 	if command.Kind() == replication.CommandSessionOpen {
-		return m.planSessionOpen(
+		if !authorityFound && state.AuthorityBindingCount >= m.options.MaxSessions {
+			plan.refusal = ErrAdmissionBound
+			return plan, nil
+		}
+		plan, err = m.planSessionOpen(
 			command, applied, state, systemSnapshot, plan, session, found, scratch,
 		)
+		if err != nil || plan.resultCode != ResultSessionOpened || authorityFound {
+			return plan, err
+		}
+		plan.authorityRecord, err = scratch.appendAuthorityBinding(
+			command.Tenant, command.ClientID, command.AuthorityClass,
+		)
+		if err != nil {
+			return commandPlan{}, err
+		}
+		plan.writeAuthority, plan.newAuthority = true, true
+		return plan, nil
 	}
 	if command.Kind() == replication.CommandSessionRelease {
 		return m.planSessionRelease(command, state, systemSnapshot, plan, session, found)
@@ -993,6 +1107,7 @@ func (m *Machine) planBundleCommand(
 	}
 	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   slot,
+		AuthorityClass:         command.AuthorityClass,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            command.ClientEpoch,
 		ClientSequence:         command.ClientSequence,
@@ -1119,7 +1234,8 @@ func (m *Machine) planSessionOpen(
 	}
 	next := SessionRecord{
 		Tenant: command.Tenant, ClientID: command.ClientID,
-		ClientEpoch: applied, RetryHome: command.RetryHome,
+		AuthorityClass: command.AuthorityClass,
+		ClientEpoch:    applied, RetryHome: command.RetryHome,
 		AckThrough: 0, HighSequence: 1, Status: SessionActive,
 		LeaseDeadlineUnixNano: command.NextDeadlineUnixNano,
 		RetryWindow:           m.options.RetryWindow, PhysicalSlotCount: 1,
@@ -1134,6 +1250,7 @@ func (m *Machine) planSessionOpen(
 	}
 	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   0,
+		AuthorityClass:         command.AuthorityClass,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            applied,
 		ClientSequence:         1,
@@ -1289,7 +1406,8 @@ func (m *Machine) planSessionRelease(
 func sessionRecord(view SessionView) SessionRecord {
 	return SessionRecord{
 		Tenant: view.Tenant, ClientID: view.ClientID, ClientEpoch: view.ClientEpoch,
-		RetryHome: view.RetryHome, AckThrough: view.AckThrough,
+		AuthorityClass: view.AuthorityClass,
+		RetryHome:      view.RetryHome, AckThrough: view.AckThrough,
 		HighSequence: view.HighSequence, LeaseDeadlineUnixNano: view.LeaseDeadlineUnixNano,
 		Status:      view.Status,
 		RetryWindow: view.RetryWindow, PhysicalSlotCount: view.PhysicalSlotCount,
@@ -1326,7 +1444,10 @@ func (m *Machine) planMutations(
 		mutation := iterator.Mutation()
 		if relation.kind == RelationJSON &&
 			mutation.Kind != replication.MutationPut &&
-			mutation.Kind != replication.MutationDelete ||
+			mutation.Kind != replication.MutationPutAbsentOrEqual &&
+			mutation.Kind != replication.MutationPutDigestEqual &&
+			mutation.Kind != replication.MutationDelete &&
+			mutation.Kind != replication.MutationDeleteDigestEqual ||
 			relation.kind == RelationGlobalIndex &&
 				mutation.Kind != replication.MutationPutAbsentOrEqual &&
 				mutation.Kind != replication.MutationDeleteDigestEqual {
@@ -1343,8 +1464,16 @@ func (m *Machine) planMutations(
 			if relation.kind == RelationGlobalIndex {
 				return nil, ResultIndexConflict, nil
 			}
-			ordered[at].delete = mutation.Kind == replication.MutationDelete
+			ordered[at].delete = mutation.Kind == replication.MutationDelete ||
+				mutation.Kind == replication.MutationDeleteDigestEqual
 			ordered[at].value = mutation.Value
+			// before temporarily owns fixed conditional command metadata until
+			// the snapshot lookup below replaces it with the actual prior value.
+			// This keeps the pooled final workspace at three slice headers.
+			ordered[at].before = mutation.Compare
+			ordered[at].conditional = mutation.Kind == replication.MutationPutDigestEqual
+			ordered[at].conditionalDelete = mutation.Kind == replication.MutationDeleteDigestEqual
+			ordered[at].absentOrEqual = mutation.Kind == replication.MutationPutAbsentOrEqual
 			continue
 		}
 		value := mutation.Value
@@ -1355,6 +1484,10 @@ func (m *Machine) planMutations(
 			key: mutation.Key, value: value,
 			delete: mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual,
+			before:            mutation.Compare,
+			conditional:       mutation.Kind == replication.MutationPutDigestEqual,
+			conditionalDelete: mutation.Kind == replication.MutationDeleteDigestEqual,
+			absentOrEqual:     mutation.Kind == replication.MutationPutAbsentOrEqual,
 		})
 		if len(ordered) > target.Limits.MaxDistinctMutations {
 			return nil, ResultTargetBound, nil
@@ -1401,6 +1534,7 @@ func (m *Machine) planMutations(
 			len(mutation.value) != replication.MutationDigestCompareBytes {
 			return nil, ResultInvalidDocument, nil
 		}
+		compare := mutation.before
 		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 		if err != nil {
 			return nil, 0, err
@@ -1427,6 +1561,35 @@ func (m *Machine) planMutations(
 				)
 			}
 		}
+		if relation.kind == RelationJSON && mutation.absentOrEqual && found {
+			if bytes.Equal(current, mutation.value) {
+				continue
+			}
+			return nil, ResultIndexConflict, nil
+		}
+		if mutation.conditional {
+			if !found {
+				return nil, ResultIndexConflict, nil
+			}
+			expectedLength := binary.LittleEndian.Uint64(compare[:8])
+			currentDigest := sha256.Sum256(current)
+			if uint64(len(current)) != expectedLength ||
+				!bytes.Equal(currentDigest[:], compare[8:]) {
+				return nil, ResultIndexConflict, nil
+			}
+		}
+		if mutation.conditionalDelete {
+			if !found {
+				continue
+			}
+			expectedLength := binary.LittleEndian.Uint64(compare[:8])
+			currentDigest := sha256.Sum256(current)
+			if uint64(len(current)) != expectedLength ||
+				!bytes.Equal(currentDigest[:], compare[8:]) {
+				return nil, ResultIndexConflict, nil
+			}
+			mutation.value = nil
+		}
 		if relation.kind == RelationGlobalIndex {
 			if !mutation.delete {
 				if found {
@@ -1437,17 +1600,6 @@ func (m *Machine) planMutations(
 					}
 					return nil, ResultIndexConflict, nil
 				}
-			} else {
-				if !found {
-					continue
-				}
-				expectedLength := binary.LittleEndian.Uint64(mutation.value[:8])
-				currentDigest := sha256.Sum256(current)
-				if uint64(len(current)) != expectedLength ||
-					!bytes.Equal(currentDigest[:], mutation.value[8:]) {
-					return nil, ResultIndexConflict, nil
-				}
-				mutation.value = nil
 			}
 		}
 		if mutation.delete && !found || !mutation.delete && found && bytes.Equal(current, mutation.value) {
@@ -1677,6 +1829,27 @@ func (s pointSnapshot) rangeSessionSlots(
 	return s.value.RangePrefixRaw(prefix[:], visit)
 }
 
+func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
+	clientID replication.ID128, retryWindow uint16) error {
+	for _, class := range [...]replication.CommandAuthorityClass{
+		replication.CommandAuthorityData, replication.CommandAuthorityTopology,
+	} {
+		digest := SessionKey(class, tenant, clientID)
+		key := SessionStorageKey(digest)
+		_, found, err := snapshot.appendRaw(nil, key[:])
+		if err != nil {
+			return err
+		}
+		if found {
+			return fmt.Errorf("%w: session without authority binding", ErrSessionCorrupt)
+		}
+		if err := ensureNoSessionSlots(snapshot, digest, retryWindow); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func sessionAt(
 	snapshot pointSnapshot,
 	key [33]byte,
@@ -1712,6 +1885,27 @@ func sessionAt(
 	}
 	if key != SessionStorageKey(view.Digest) {
 		return SessionView{}, false, fmt.Errorf("%w: session storage key mismatch", ErrSessionCorrupt)
+	}
+	return view, true, nil
+}
+
+func authorityBindingAt(snapshot pointSnapshot, key [33]byte,
+	scratch *commandPlanScratch) (AuthorityBindingView, bool, error) {
+	var dst []byte
+	if scratch != nil {
+		dst = scratch.authorityRead[:0]
+	}
+	record, found, err := snapshot.appendRaw(dst, key[:])
+	if err != nil || !found {
+		return AuthorityBindingView{}, found, err
+	}
+	if scratch != nil {
+		scratch.authorityRead = record
+	}
+	view, err := OpenAuthorityBinding(record)
+	if err != nil || key != AuthorityBindingStorageKey(view.Digest) {
+		return AuthorityBindingView{}, false,
+			errors.Join(err, fmt.Errorf("%w: authority storage key", ErrSessionCorrupt))
 	}
 	return view, true, nil
 }
@@ -1786,7 +1980,7 @@ func (m *Machine) persistTransition(
 	var transition CapturedTransition
 	var captureRecord []byte
 	if m.shouldCaptureTransition(next) {
-		transition = m.capturedTransition(next, changes)
+		transition = m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}
@@ -1811,6 +2005,9 @@ func (m *Machine) persistTransition(
 		return err
 	}
 	systemDocuments := 1
+	if plan.writeAuthority {
+		systemDocuments++
+	}
 	if plan.writeSession {
 		systemDocuments++
 	}
@@ -1846,6 +2043,11 @@ func (m *Machine) persistTransition(
 		}
 		if err := systemBatch.Put(stateKey, stateEnvelope); err != nil {
 			return err
+		}
+		if plan.writeAuthority {
+			if err := systemBatch.Put(plan.authorityKey[:], plan.authorityRecord); err != nil {
+				return err
+			}
 		}
 		if plan.writeSession {
 			if err := systemBatch.Put(plan.sessionKey[:], plan.sessionRecord); err != nil {
@@ -1964,7 +2166,7 @@ func (m *Machine) checkTransitionCapacity(
 	defer m.releaseCaptureChanges()
 	captureBytes := 0
 	if m.shouldCaptureTransition(next) {
-		transition := m.capturedTransition(next, changes)
+		transition := m.capturedTransition(next, baseRelationChanges(changes, plan.relations))
 		if !validCapturedTransition(transition) {
 			return ErrTransitionCapture
 		}
@@ -1980,6 +2182,26 @@ func (m *Machine) checkTransitionCapacity(
 	)
 }
 
+// baseRelationChanges selects the sole JSON base relation (dense ordinal zero)
+// from a flattened multi-relation apply plan. Split capture deliberately does
+// not serialize local/global index maintenance: child construction derives
+// those relations from their own authenticated artifacts and schema contract.
+func baseRelationChanges(
+	changes []finalMutation,
+	spans []plannedRelationChanges,
+) []finalMutation {
+	for i := range spans {
+		span := spans[i]
+		if span.ordinal == 0 && uint64(span.end) <= uint64(len(changes)) && span.start <= span.end {
+			return changes[span.start:span.end]
+		}
+		if span.ordinal > 0 {
+			break
+		}
+	}
+	return nil
+}
+
 func (m *Machine) checkTransitionCapacityWithCapture(
 	next State,
 	changes []finalMutation,
@@ -1992,6 +2214,15 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 	}
 	stateBytes := len(stateKey) + len(stateEnvelope)
 	systemDocs := 1
+	if plan.writeAuthority {
+		if len(plan.authorityRecord) < authorityBindingHeaderBytes+1+recordChecksumLen ||
+			len(plan.authorityRecord) > MaxAuthorityBindingBytes ||
+			len(plan.authorityRecord) > m.system.Limits.MaxDocumentBytes {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(plan.authorityKey) + len(plan.authorityRecord)
+		systemDocs++
+	}
 	if plan.writeSession {
 		if len(plan.sessionRecord) == 0 || len(plan.sessionRecord) > m.system.Limits.MaxDocumentBytes {
 			return ErrAdmissionBound

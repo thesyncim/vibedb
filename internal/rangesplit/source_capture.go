@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -38,7 +39,7 @@ const (
 	sourceCaptureEnvelopeBytes         = 16
 	sourceCaptureHeaderFixedBytes      = 264
 	sourceCaptureEntryFixedBytes       = 248
-	sourceCaptureTransitionHeaderBytes = 16
+	sourceCaptureTransitionHeaderBytes = 56
 
 	sourceCaptureBeforePresent = uint8(1 << 0)
 	sourceCaptureAfterPresent  = uint8(1 << 1)
@@ -63,9 +64,10 @@ type sourceCapturePublication struct {
 	dataChainDigest [sha256.Size]byte
 }
 
-// SourceCapture stores every exact before-and-after source transition in one
-// private opaque durable collection. The replicated state machine commits the
-// record in the same multi-collection transaction as the source publication.
+// SourceCapture stores every exact source transition in one private opaque
+// durable collection. Old documents are represented by fixed-size witnesses;
+// after documents remain byte-exact for destination puts. The replicated state
+// machine commits the record in the same transaction as source publication.
 type SourceCapture struct {
 	mu sync.Mutex
 
@@ -90,9 +92,48 @@ type SourceCaptureWorkspace struct {
 	record      sourceCaptureEntry
 	hasher      hash.Hash
 	digest      [sha256.Size]byte
+	document    distribution.DocumentPointWorkspace
 	fixed       [144]byte
 	size        [8]byte
 	key         [8]byte
+}
+
+// MaximumSourceCaptureRecordBytes returns the exact provisioning bound for one
+// admitted replicated mutation batch.
+func MaximumSourceCaptureRecordBytes(
+	maxMutations, maxKeyBytes, maxDocumentBytes, maxBatchBytes int,
+) (int, error) {
+	if maxMutations <= 0 || maxKeyBytes <= 0 || maxDocumentBytes <= 0 || maxBatchBytes <= 0 ||
+		maxMutations > replicatedstate.MaxDistinctMutations ||
+		uint64(maxMutations) > math.MaxUint32 || uint64(maxKeyBytes) > math.MaxUint32 ||
+		uint64(maxDocumentBytes) > math.MaxUint32 || uint64(maxBatchBytes) > math.MaxUint32 {
+		return 0, ErrSourceCapture
+	}
+	product := func(value int) (uint64, bool) {
+		if uint64(maxMutations) > math.MaxUint32/uint64(value) {
+			return 0, false
+		}
+		return uint64(maxMutations) * uint64(value), true
+	}
+	transitionBytes, ok := product(sourceCaptureTransitionHeaderBytes)
+	if !ok {
+		return 0, ErrSourceCapture
+	}
+	total := uint64(sourceCaptureEntryFixedBytes)
+	// Every key and after image is already inside the canonical replicated
+	// command envelope. Before images contribute only fixed-size witnesses.
+	perMutationBytes := uint64(maxKeyBytes) + uint64(maxDocumentBytes)
+	structuralPayloadBytes := uint64(maxMutations) * perMutationBytes
+	payloadBytes := min(
+		uint64(maxBatchBytes), uint64(replication.MaxCommandBytes), structuralPayloadBytes,
+	)
+	for _, addition := range [...]uint64{transitionBytes, payloadBytes} {
+		if total > math.MaxUint32-addition {
+			return 0, ErrSourceCapture
+		}
+		total += addition
+	}
+	return int(total), nil
 }
 
 // NewSourceCapture binds one private collection to an exact split plan.
@@ -127,17 +168,25 @@ func (c *SourceCapture) MaxEncodedBytes(
 	if c == nil || bounds.Transitions > replicatedstate.MaxDistinctMutations {
 		return 0, ErrSourceCapture
 	}
+	if bounds.KeyBytes > bounds.Transitions*replication.MaxMutationKeyBytes ||
+		bounds.BeforeBytes > bounds.Transitions*replication.MaxMutationValueBytes ||
+		bounds.AfterBytes > bounds.Transitions*replication.MaxMutationValueBytes {
+		return 0, ErrSourceCapture
+	}
 	total := uint64(sourceCaptureEntryFixedBytes)
 	for _, addition := range [...]uint64{
 		bounds.Transitions * sourceCaptureTransitionHeaderBytes,
 		bounds.KeyBytes,
-		bounds.BeforeBytes,
 		bounds.AfterBytes,
 	} {
 		if total > math.MaxUint32 || addition > math.MaxUint32-total {
 			return 0, ErrSourceCapture
 		}
 		total += addition
+	}
+	if bounds.KeyBytes > replication.MaxCommandBytes ||
+		bounds.AfterBytes > replication.MaxCommandBytes-bounds.KeyBytes {
+		return 0, ErrSourceCapture
 	}
 	if total > uint64(math.MaxInt) {
 		return 0, ErrSourceCapture
@@ -147,7 +196,10 @@ func (c *SourceCapture) MaxEncodedBytes(
 
 // Begin creates an exact capture base or recovers and verifies every retained
 // record against the current replicated publication.
-func (c *SourceCapture) Begin(state replicatedstate.State) error {
+func (c *SourceCapture) Begin(
+	state replicatedstate.State,
+	publish func(key, value []byte) error,
+) error {
 	if c == nil {
 		return ErrSourceCapture
 	}
@@ -157,7 +209,7 @@ func (c *SourceCapture) Begin(state replicatedstate.State) error {
 		return ErrSourceCapture
 	}
 	if c.target.Collection.Len() == 0 {
-		if !c.partitioner.matchesSource(state) {
+		if publish == nil || !c.partitioner.matchesSource(state) {
 			return ErrSourceCapture
 		}
 		header, cut, err := c.appendHeader(c.encode.raw[:0], state, &c.encode)
@@ -165,9 +217,7 @@ func (c *SourceCapture) Begin(state replicatedstate.State) error {
 			return errors.Join(ErrSourceCapture, err)
 		}
 		binary.BigEndian.PutUint64(c.key[:], sourceCaptureHeaderKey)
-		if err := c.target.Collection.Update(func(batch *durable.WriteBatch) error {
-			return batch.Put(c.key[:], header)
-		}); err != nil {
+		if err := publish(c.key[:], header); err != nil {
 			return err
 		}
 		c.encode.raw = header
@@ -348,6 +398,14 @@ func (c *SourceCapture) appendEntry(
 	if err != nil {
 		return dst, err
 	}
+	clear(workspace.transitions)
+	if cap(workspace.transitions) < transition.MutationCount() {
+		workspace.transitions = make([]TailTransition, transition.MutationCount())
+	} else {
+		workspace.transitions = workspace.transitions[:transition.MutationCount()]
+	}
+	workspace.record.Transitions = nil
+	defer workspace.releaseTransitions()
 	var previous []byte
 	for index := 0; index < transition.MutationCount(); index++ {
 		mutation := transition.Mutation(index)
@@ -360,12 +418,31 @@ func (c *SourceCapture) appendEntry(
 				len(mutation.After) > replication.MaxMutationValueBytes) {
 			return dst, ErrSourceCapture
 		}
+		witness, witnessErr := c.captureBeforeWitness(mutation.Before, workspace)
+		if witnessErr != nil {
+			return dst, witnessErr
+		}
+		workspace.transitions[index] = TailTransition{
+			Key: mutation.Key, BeforeWitness: witness, After: mutation.After,
+		}
 		previous = mutation.Key
 	}
-	digest := c.hashTransition(transition, workspace)
-	clear(workspace.transitions)
-	workspace.transitions = workspace.transitions[:0]
-	workspace.record.Transitions = nil
+	record := &workspace.record
+	*record = sourceCaptureEntry{
+		Applied: transition.Applied, Term: transition.Term,
+		BeforeOwnershipEpoch:  transition.BeforeOwnershipEpoch,
+		AfterOwnershipEpoch:   transition.AfterOwnershipEpoch,
+		BeforeRoutingVersion:  transition.BeforeRoutingVersion,
+		AfterRoutingVersion:   transition.AfterRoutingVersion,
+		BeforeRouteGeneration: transition.BeforeRouteGeneration,
+		AfterRouteGeneration:  transition.AfterRouteGeneration,
+		PreviousEntryDigest:   transition.PreviousEntryDigest,
+		EntryDigest:           transition.EntryDigest,
+		BeforeDataChainDigest: transition.BeforeDataChainDigest,
+		AfterDataChainDigest:  transition.AfterDataChainDigest,
+		Transitions:           workspace.transitions,
+	}
+	digest := c.hashEntry(record, workspace)
 	var frame []byte
 	dst, frame = appendSourceCaptureEnvelope(dst, sourceCaptureEntryKind, encodedBytes)
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(transition.MutationCount()))
@@ -388,22 +465,22 @@ func (c *SourceCapture) appendEntry(
 	}
 	cursor := sourceCaptureEntryFixedBytes
 	for index := 0; index < transition.MutationCount(); index++ {
-		mutation := transition.Mutation(index)
+		mutation := &workspace.transitions[index]
 		header := frame[cursor : cursor+sourceCaptureTransitionHeaderBytes]
-		if mutation.Before != nil {
+		if mutation.BeforeWitness.Present {
 			header[0] |= sourceCaptureBeforePresent
 		}
 		if mutation.After != nil {
 			header[0] |= sourceCaptureAfterPresent
 		}
 		binary.LittleEndian.PutUint32(header[4:8], uint32(len(mutation.Key)))
-		binary.LittleEndian.PutUint32(header[8:12], uint32(len(mutation.Before)))
+		binary.LittleEndian.PutUint32(header[8:12], mutation.BeforeWitness.DocumentBytes)
 		binary.LittleEndian.PutUint32(header[12:16], uint32(len(mutation.After)))
+		copy(header[16:24], mutation.BeforeWitness.Point[:])
+		copy(header[24:56], mutation.BeforeWitness.Digest[:])
 		cursor += sourceCaptureTransitionHeaderBytes
 		copy(frame[cursor:], mutation.Key)
 		cursor += len(mutation.Key)
-		copy(frame[cursor:], mutation.Before)
-		cursor += len(mutation.Before)
 		copy(frame[cursor:], mutation.After)
 		cursor += len(mutation.After)
 	}
@@ -411,6 +488,36 @@ func (c *SourceCapture) appendEntry(
 		panic("rangesplit: source capture size invariant")
 	}
 	return dst, nil
+}
+
+func (workspace *SourceCaptureWorkspace) releaseTransitions() {
+	clear(workspace.transitions)
+	workspace.transitions = workspace.transitions[:0]
+	workspace.record.Transitions = nil
+}
+
+func (c *SourceCapture) captureBeforeWitness(
+	document []byte,
+	workspace *SourceCaptureWorkspace,
+) (TailBeforeWitness, error) {
+	if document == nil {
+		return TailBeforeWitness{}, nil
+	}
+	point, err := c.partitioner.program.Point(document, &workspace.document)
+	if err != nil || len(document) == 0 || len(document) > replication.MaxMutationValueBytes {
+		return TailBeforeWitness{}, errors.Join(ErrSourceCapture, err)
+	}
+	if c.partitioner.childFor(point) < 0 {
+		return TailBeforeWitness{}, ErrSourceCapture
+	}
+	digest := sha256.Sum256(document)
+	if digest == ([sha256.Size]byte{}) {
+		return TailBeforeWitness{}, ErrSourceCapture
+	}
+	return TailBeforeWitness{
+		Present: true, Point: point, DocumentBytes: uint32(len(document)),
+		Digest: digest,
+	}, nil
 }
 
 func (c *SourceCapture) recover(
@@ -535,6 +642,11 @@ func (c *SourceCapture) decodeEntry(
 	if transitionCount > replicatedstate.MaxDistinctMutations {
 		return sourceCaptureEntry{}, ErrSourceCapture
 	}
+	maximumBytes := uint64(sourceCaptureEntryFixedBytes) +
+		transitionCount*sourceCaptureTransitionHeaderBytes + replication.MaxCommandBytes
+	if uint64(len(raw)) > maximumBytes {
+		return sourceCaptureEntry{}, ErrSourceCapture
+	}
 	record := &workspace.record
 	*record = sourceCaptureEntry{
 		Applied:               binary.LittleEndian.Uint64(raw[24:32]),
@@ -576,36 +688,46 @@ func (c *SourceCapture) decodeEntry(
 		afterBytes := uint64(binary.LittleEndian.Uint32(header[12:16]))
 		beforePresent := flags&sourceCaptureBeforePresent != 0
 		afterPresent := flags&sourceCaptureAfterPresent != 0
+		var beforePoint distribution.KeyspacePoint
+		copy(beforePoint[:], header[16:24])
+		var beforeDigest [sha256.Size]byte
+		copy(beforeDigest[:], header[24:56])
 		if flags == 0 || flags&^sourceCapturePresenceMask != 0 ||
 			header[1] != 0 || binary.LittleEndian.Uint16(header[2:4]) != 0 ||
 			keyBytes == 0 || keyBytes > replication.MaxMutationKeyBytes ||
 			beforePresent != (beforeBytes != 0) || afterPresent != (afterBytes != 0) ||
 			beforeBytes > replication.MaxMutationValueBytes ||
-			afterBytes > replication.MaxMutationValueBytes {
+			afterBytes > replication.MaxMutationValueBytes ||
+			beforePresent && beforeDigest == ([sha256.Size]byte{}) ||
+			beforePresent && c.partitioner.childFor(beforePoint) < 0 ||
+			!beforePresent && (beforePoint != (distribution.KeyspacePoint{}) ||
+				beforeDigest != ([sha256.Size]byte{})) {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
-		payloadBytes := keyBytes + beforeBytes + afterBytes
+		payloadBytes := keyBytes + afterBytes
 		cursor += sourceCaptureTransitionHeaderBytes
 		if payloadBytes > uint64(len(raw)-cursor) {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
 		keyEnd := cursor + int(keyBytes)
-		beforeEnd := keyEnd + int(beforeBytes)
-		afterEnd := beforeEnd + int(afterBytes)
+		afterEnd := keyEnd + int(afterBytes)
 		key := raw[cursor:keyEnd:keyEnd]
-		var before, after []byte
-		if beforePresent {
-			before = raw[keyEnd:beforeEnd:beforeEnd]
-		}
+		var after []byte
 		if afterPresent {
-			after = raw[beforeEnd:afterEnd:afterEnd]
+			after = raw[keyEnd:afterEnd:afterEnd]
 		}
 		if previous != nil && bytes.Compare(previous, key) >= 0 ||
-			before != nil && vibejson.Validate(before) != nil ||
 			after != nil && vibejson.Validate(after) != nil {
 			return sourceCaptureEntry{}, ErrSourceCapture
 		}
-		workspace.transitions[index] = TailTransition{Key: key, Before: before, After: after}
+		workspace.transitions[index] = TailTransition{
+			Key: key,
+			BeforeWitness: TailBeforeWitness{
+				Present: beforePresent, Point: beforePoint, DocumentBytes: uint32(beforeBytes),
+				Digest: beforeDigest,
+			},
+			After: after,
+		}
 		previous = key
 		cursor = afterEnd
 	}
@@ -664,40 +786,6 @@ func (c *SourceCapture) hashHeader(
 	return workspace.digest
 }
 
-func (c *SourceCapture) hashTransition(
-	transition replicatedstate.CapturedTransition,
-	workspace *SourceCaptureWorkspace,
-) [32]byte {
-	record := &workspace.record
-	*record = sourceCaptureEntry{
-		Applied: transition.Applied, Term: transition.Term,
-		BeforeOwnershipEpoch:  transition.BeforeOwnershipEpoch,
-		AfterOwnershipEpoch:   transition.AfterOwnershipEpoch,
-		BeforeRoutingVersion:  transition.BeforeRoutingVersion,
-		AfterRoutingVersion:   transition.AfterRoutingVersion,
-		BeforeRouteGeneration: transition.BeforeRouteGeneration,
-		AfterRouteGeneration:  transition.AfterRouteGeneration,
-		PreviousEntryDigest:   transition.PreviousEntryDigest,
-		EntryDigest:           transition.EntryDigest,
-		BeforeDataChainDigest: transition.BeforeDataChainDigest,
-		AfterDataChainDigest:  transition.AfterDataChainDigest,
-	}
-	clear(workspace.transitions)
-	if cap(workspace.transitions) < transition.MutationCount() {
-		workspace.transitions = make([]TailTransition, transition.MutationCount())
-	} else {
-		workspace.transitions = workspace.transitions[:transition.MutationCount()]
-	}
-	for index := range workspace.transitions {
-		mutation := transition.Mutation(index)
-		workspace.transitions[index] = TailTransition{
-			Key: mutation.Key, Before: mutation.Before, After: mutation.After,
-		}
-	}
-	record.Transitions = workspace.transitions
-	return c.hashEntry(record, workspace)
-}
-
 func (c *SourceCapture) hashEntry(
 	record *sourceCaptureEntry,
 	workspace *SourceCaptureWorkspace,
@@ -724,11 +812,24 @@ func (c *SourceCapture) hashEntry(
 	for index := range record.Transitions {
 		transition := &record.Transitions[index]
 		hashTailFrame(h, &workspace.size, transition.Key)
-		hashOptionalCaptureFrame(h, &workspace.size, transition.Before)
+		hashBeforeWitness(h, &workspace.fixed, transition.BeforeWitness)
 		hashOptionalCaptureFrame(h, &workspace.size, transition.After)
 	}
 	_ = h.Sum(workspace.digest[:0])
 	return workspace.digest
+}
+
+func hashBeforeWitness(h hash.Hash, fixed *[144]byte, witness TailBeforeWitness) {
+	if !witness.Present {
+		fixed[0] = 0
+		_, _ = h.Write(fixed[:1])
+		return
+	}
+	fixed[0] = 1
+	copy(fixed[1:9], witness.Point[:])
+	binary.LittleEndian.PutUint32(fixed[9:13], witness.DocumentBytes)
+	copy(fixed[13:45], witness.Digest[:])
+	_, _ = h.Write(fixed[:45])
 }
 
 func captureHasher(workspace *SourceCaptureWorkspace) hash.Hash {

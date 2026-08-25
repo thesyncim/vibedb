@@ -122,7 +122,13 @@ func validateBundleTransactionProfile(
 	relations []relationCollection,
 	options Options,
 ) error {
-	if len(relations) == 0 || options.TxnLimits.MaxCollections < len(relations)+1 {
+	reservedCapture := options.TransitionCaptureTarget.Collection != nil ||
+		options.TransitionCaptureTarget.Name != ""
+	requiredCollections := len(relations) + 1
+	if reservedCapture {
+		requiredCollections++
+	}
+	if len(relations) == 0 || options.TxnLimits.MaxCollections < requiredCollections {
 		return ErrInvalidOptions
 	}
 	relationDocuments := 0
@@ -144,21 +150,57 @@ func validateBundleTransactionProfile(
 	relationBytes = min(relationBytes, int64(replication.MaxCommandBytes))
 	relationDocuments = min(relationDocuments, replication.MaxMutations)
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	releaseSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	requiredDocuments := max(int(options.RetryWindow)+2, relationDocuments+3)
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		relationDocuments, options.RetryWindow, reservedCapture,
+	)
+	if err != nil {
+		return err
+	}
 	requiredBytes := int64(releaseSystemBytes)
 	if int64(hotSystemBytes) > math.MaxInt64-relationBytes {
 		return ErrInvalidOptions
 	}
 	requiredBytes = max(requiredBytes, int64(hotSystemBytes)+relationBytes)
+	if reservedCapture {
+		capture := options.TransitionCaptureTarget.Collection
+		if capture == nil || capture.MaxBatchBytes() <= 0 ||
+			requiredBytes > math.MaxInt64-int64(capture.MaxBatchBytes()) {
+			return ErrInvalidOptions
+		}
+		requiredBytes += int64(capture.MaxBatchBytes())
+	}
 	if options.TxnLimits.MaxDocuments < requiredDocuments ||
 		options.TxnLimits.MaxBytes < requiredBytes {
 		return ErrInvalidOptions
 	}
 	return nil
+}
+
+// RequiredBundleTransactionDocuments returns the exact mutation-slot ceiling
+// for one replicated apply transaction. A data command publishes state,
+// session and slot alongside all relation changes. Session open publishes
+// state, authority, session and slot but no relation batch. Release deletes one
+// session header plus every retry slot and publishes state. A reserved
+// transition capture contributes one additional private row to every shape.
+func RequiredBundleTransactionDocuments(
+	relationDocuments int,
+	retryWindow uint16,
+	reservedCapture bool,
+) (int, error) {
+	if relationDocuments < 0 || relationDocuments > replication.MaxMutations ||
+		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
+		return 0, ErrInvalidOptions
+	}
+	required := max(int(retryWindow)+2, relationDocuments+3, 4)
+	if reservedCapture {
+		required++
+	}
+	return required, nil
 }
 
 func validateRelationTarget(spec RelationCollection) error {

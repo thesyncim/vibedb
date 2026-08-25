@@ -21,8 +21,8 @@ type replicatedPlacementProfileVibe ReplicatedPlacementProfile
 
 var (
 	replicatedApplyMetaFields = vibejson.MakeFieldSet(
-		"format", "storage", "validation_profile", "validation_digest",
-		"system_limits", "max_sessions", "retry_window", "txn_max_collections",
+		"format", "storage", "capture_storage", "validation_profile", "validation_digest",
+		"system_limits", "capture_limits", "max_sessions", "retry_window", "txn_max_collections",
 		"txn_max_documents", "txn_max_bytes", "placement", "sidecars",
 	)
 	replicatedPlacementFields = vibejson.MakeFieldSet(
@@ -39,8 +39,8 @@ var (
 
 var (
 	replicatedApplyMetaFieldNames = [...]string{
-		"format", "storage", "validation_profile", "validation_digest",
-		"system_limits", "max_sessions", "retry_window", "txn_max_collections",
+		"format", "storage", "capture_storage", "validation_profile", "validation_digest",
+		"system_limits", "capture_limits", "max_sessions", "retry_window", "txn_max_collections",
 		"txn_max_documents", "txn_max_bytes", "placement", "sidecars",
 	}
 	replicatedPlacementFieldNames = [...]string{
@@ -84,11 +84,14 @@ func (m *replicatedApplyMetaVibe) MarshalVibeJSON(w vibejson.TrustedAppender) vi
 	meta := (*replicatedApplyMeta)(m)
 	w = w.RawUnchecked(`{"format":`).Uint(uint64(meta.Format))
 	w = w.RawUnchecked(`,"storage":`).String(meta.Storage)
+	w = w.RawUnchecked(`,"capture_storage":`).String(meta.CaptureStorage)
 	w = w.RawUnchecked(`,"validation_profile":`).Uint(uint64(meta.ValidationProfile))
 	w = w.RawUnchecked(`,"validation_digest":`)
 	w = appendReplicatedHexString(w, meta.ValidationDigest[:])
 	w = w.RawUnchecked(`,"system_limits":`)
 	w = appendReplicatedLimits(w, meta.SystemLimits)
+	w = w.RawUnchecked(`,"capture_limits":`)
+	w = appendReplicatedLimits(w, meta.CaptureLimits)
 	w = w.RawUnchecked(`,"max_sessions":`).Uint(meta.MaxSessions)
 	w = w.RawUnchecked(`,"retry_window":`).Uint(uint64(meta.RetryWindow))
 	w = w.RawUnchecked(`,"txn_max_collections":`).Int(int64(meta.TxnMaxCollections))
@@ -239,10 +242,14 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 2:
-			if err := c.Uint8(&decoded.ValidationProfile); err != nil {
+			if err := c.String(&decoded.CaptureStorage); err != nil {
 				return err
 			}
 		case 3:
+			if err := c.Uint8(&decoded.ValidationProfile); err != nil {
+				return err
+			}
+		case 4:
 			if err := decodeReplicatedLowerHex(
 				c, decoded.ValidationDigest[:],
 				"vibedb: replicated apply validation digest must be lowercase SHA-256 hexadecimal",
@@ -250,35 +257,39 @@ func decodeReplicatedApplyMetaVibe(
 			); err != nil {
 				return err
 			}
-		case 4:
+		case 5:
 			if err := decodeReplicatedSystemLimitsVibe(c, &decoded.SystemLimits); err != nil {
 				return err
 			}
-		case 5:
-			if err := c.Uint64(&decoded.MaxSessions); err != nil {
-				return err
-			}
 		case 6:
-			if err := c.Uint16(&decoded.RetryWindow); err != nil {
+			if err := decodeReplicatedSystemLimitsVibe(c, &decoded.CaptureLimits); err != nil {
 				return err
 			}
 		case 7:
-			if err := c.Int(&decoded.TxnMaxCollections); err != nil {
+			if err := c.Uint64(&decoded.MaxSessions); err != nil {
 				return err
 			}
 		case 8:
-			if err := c.Int(&decoded.TxnMaxDocuments); err != nil {
+			if err := c.Uint16(&decoded.RetryWindow); err != nil {
 				return err
 			}
 		case 9:
-			if err := c.Int64(&decoded.TxnMaxBytes); err != nil {
+			if err := c.Int(&decoded.TxnMaxCollections); err != nil {
 				return err
 			}
 		case 10:
-			if err := decodeReplicatedPlacementVibe(c, &decoded.Placement); err != nil {
+			if err := c.Int(&decoded.TxnMaxDocuments); err != nil {
 				return err
 			}
 		case 11:
+			if err := c.Int64(&decoded.TxnMaxBytes); err != nil {
+				return err
+			}
+		case 12:
+			if err := decodeReplicatedPlacementVibe(c, &decoded.Placement); err != nil {
+				return err
+			}
+		case 13:
 			if err := decodeReplicatedApplySidecarsVibe(c, &decoded.Sidecars); err != nil {
 				return err
 			}

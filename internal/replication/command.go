@@ -25,7 +25,8 @@ var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 // domain Unix-nanosecond scalars: Open=(0,D), Renew=(E,D) where 0<E<D, and
 // Revoke=(E,0). All other command kinds require both scalars to be zero.
 type Command struct {
-	Kind CommandKind
+	Kind           CommandKind
+	AuthorityClass CommandAuthorityClass
 
 	ClusterID             ID128
 	ClusterIncarnation    ID128
@@ -64,7 +65,8 @@ type Command struct {
 // byte slices alias the OpenCommand input and must be treated as immutable.
 // Copying or retaining the view retains the complete bounded input envelope.
 type CommandView struct {
-	kind CommandKind
+	kind           CommandKind
+	AuthorityClass CommandAuthorityClass
 
 	ClusterID             ID128
 	ClusterIncarnation    ID128
@@ -136,7 +138,7 @@ type MutationView struct {
 	Key   []byte
 	Value []byte
 	// Compare aliases the canonical fixed compare payload for
-	// MutationDeleteDigestEqual and is empty for every other mutation.
+	// digest-equal mutations and is empty for every other mutation.
 	Compare []byte
 
 	ExpectedValueLength uint64
@@ -237,11 +239,16 @@ func (i *MutationIterator) Next() bool {
 		Key:   i.b[keyStart:valueStart:valueStart],
 		Value: i.b[valueStart:end:end],
 	}
-	if kind == MutationDeleteDigestEqual {
+	if kind == MutationDeleteDigestEqual || kind == MutationPutDigestEqual {
 		i.current.Compare = i.b[valueStart:end:end]
-		i.current.Value = nil
 		i.current.ExpectedValueLength = binary.LittleEndian.Uint64(i.b[valueStart : valueStart+8])
-		copy(i.current.ExpectedValueDigest[:], i.b[valueStart+8:end])
+		copy(i.current.ExpectedValueDigest[:], i.b[valueStart+8:valueStart+mutationDigestCompareBytes])
+		if kind == MutationDeleteDigestEqual {
+			i.current.Value = nil
+		} else {
+			i.current.Compare = i.b[valueStart : valueStart+mutationDigestCompareBytes : valueStart+mutationDigestCompareBytes]
+			i.current.Value = i.b[valueStart+mutationDigestCompareBytes : end : end]
+		}
 	}
 	i.b = i.b[end:len(i.b):len(i.b)]
 	i.remaining--
@@ -276,6 +283,7 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 	copy(frame[0:8], commandMagic[:])
 	appendU16(frame, 8, commandCodecSentinel)
 	frame[10] = commandWireKind(command.Kind)
+	frame[11] = byte(command.AuthorityClass)
 	appendU16(frame, 12, commandHeaderBytes)
 	appendU32(frame, 16, uint32(total))
 	appendU32(frame, 20, uint32(total-commandHeaderBytes-envelopeChecksumBytes))
@@ -334,11 +342,12 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 			appendU32(frame, cursor+4, uint32(valueBytes))
 			cursor += mutationHeaderBytes
 			cursor += copy(frame[cursor:], mutation.Key)
-			if mutation.Kind == MutationDeleteDigestEqual {
+			if mutation.Kind == MutationDeleteDigestEqual || mutation.Kind == MutationPutDigestEqual {
 				appendU64(frame, cursor, mutation.ExpectedValueLength)
 				copy(frame[cursor+8:cursor+mutationDigestCompareBytes], mutation.ExpectedValueDigest[:])
 				cursor += mutationDigestCompareBytes
-			} else {
+			}
+			if mutation.Kind != MutationDeleteDigestEqual {
 				cursor += copy(frame[cursor:], mutation.Value)
 			}
 		}
@@ -462,6 +471,9 @@ func measureCommand(command Command) (int, error) {
 }
 
 func validateCommandHeader(command Command) error {
+	if command.AuthorityClass > CommandAuthorityTopology {
+		return semantic("command authority class")
+	}
 	switch command.Kind {
 	case CommandMutationBatch:
 		if len(command.Batches) == 0 || len(command.Batches) > MaxRelationBatches {
@@ -570,6 +582,13 @@ func validateMutation(mutation Mutation) error {
 			mutation.ExpectedValueDigest == (Digest{}) {
 			return semantic("delete compare value identity")
 		}
+	case MutationPutDigestEqual:
+		if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes ||
+			mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueLength > MaxMutationValueBytes ||
+			mutation.ExpectedValueDigest == (Digest{}) {
+			return semantic("put compare value identity")
+		}
 	default:
 		return semantic("unknown mutation kind")
 	}
@@ -579,6 +598,9 @@ func validateMutation(mutation Mutation) error {
 func mutationWireValueBytes(mutation Mutation) int {
 	if mutation.Kind == MutationDeleteDigestEqual {
 		return mutationDigestCompareBytes
+	}
+	if mutation.Kind == MutationPutDigestEqual {
+		return mutationDigestCompareBytes + len(mutation.Value)
 	}
 	return len(mutation.Value)
 }
@@ -612,7 +634,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 		return CommandView{}, err
 	}
 	kind, ok := openCommandKind(src[10])
-	if !ok || src[11] != 0 ||
+	authorityClass := CommandAuthorityClass(src[11])
+	if !ok || authorityClass > CommandAuthorityTopology ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 ||
 		binary.LittleEndian.Uint16(src[246:248]) != 0 {
 		return CommandView{}, semantic("command kind, flags, or reserved bytes")
@@ -635,7 +658,7 @@ func OpenCommand(src []byte) (CommandView, error) {
 		}
 	}
 
-	view := CommandView{kind: kind}
+	view := CommandView{kind: kind, AuthorityClass: authorityClass}
 	copy(view.ClusterID[:], src[32:48])
 	copy(view.ClusterIncarnation[:], src[48:64])
 	view.TopologyRecoveryEpoch = binary.LittleEndian.Uint64(src[64:72])
@@ -812,8 +835,17 @@ func validateMutationBytes(src []byte, count uint32) error {
 		}
 		keyLen := int(binary.LittleEndian.Uint16(header[2:4]))
 		valueLen64 := uint64(binary.LittleEndian.Uint32(header[4:8]))
+		maxValueLen64 := uint64(MaxMutationValueBytes)
+		switch kind {
+		case MutationDelete:
+			maxValueLen64 = 0
+		case MutationDeleteDigestEqual:
+			maxValueLen64 = mutationDigestCompareBytes
+		case MutationPutDigestEqual:
+			maxValueLen64 += mutationDigestCompareBytes
+		}
 		if keyLen == 0 || keyLen > MaxMutationKeyBytes ||
-			valueLen64 > MaxMutationValueBytes {
+			valueLen64 > maxValueLen64 {
 			return semantic("mutation key or value length")
 		}
 		payload, ok := checkedAdd(uint64(keyLen), valueLen64, uint64(len(src)-cursor-mutationHeaderBytes))
@@ -825,7 +857,7 @@ func validateMutationBytes(src []byte, count uint32) error {
 		value := src[cursor+keyLen : end]
 		switch kind {
 		case MutationPut, MutationPutAbsentOrEqual:
-			if len(value) == 0 {
+			if len(value) == 0 || len(value) > MaxMutationValueBytes {
 				return semantic("put value length")
 			}
 		case MutationDelete:
@@ -838,6 +870,14 @@ func validateMutationBytes(src []byte, count uint32) error {
 				binary.LittleEndian.Uint64(value[:8]) > MaxMutationValueBytes ||
 				allZero(value[8:]) {
 				return semantic("delete compare value identity")
+			}
+		case MutationPutDigestEqual:
+			if len(value) <= mutationDigestCompareBytes ||
+				len(value)-mutationDigestCompareBytes > MaxMutationValueBytes ||
+				binary.LittleEndian.Uint64(value[:8]) == 0 ||
+				binary.LittleEndian.Uint64(value[:8]) > MaxMutationValueBytes ||
+				allZero(value[8:mutationDigestCompareBytes]) {
+				return semantic("put compare value identity")
 			}
 		default:
 			return semantic("unknown mutation kind")

@@ -17,20 +17,20 @@ import (
 )
 
 const (
-	_resultAppliedAtLeastExact           = ResultApplied - 1
-	_resultAppliedAtMostExact            = uint32(1) - ResultApplied
-	_resultStaleFenceAtLeastExact        = ResultStaleFence - 2
-	_resultStaleFenceAtMostExact         = uint32(2) - ResultStaleFence
+	_resultAppliedAtLeastExact         = ResultApplied - 1
+	_resultAppliedAtMostExact          = uint32(1) - ResultApplied
+	_resultStaleFenceAtLeastExact      = ResultStaleFence - 2
+	_resultStaleFenceAtMostExact       = uint32(2) - ResultStaleFence
 	_resultUnknownRelationAtLeastExact = ResultUnknownRelation - 3
 	_resultUnknownRelationAtMostExact  = uint32(3) - ResultUnknownRelation
-	_resultInvalidDocumentAtLeastExact   = ResultInvalidDocument - 4
-	_resultInvalidDocumentAtMostExact    = uint32(4) - ResultInvalidDocument
-	_resultTargetBoundAtLeastExact       = ResultTargetBound - 5
-	_resultTargetBoundAtMostExact        = uint32(5) - ResultTargetBound
-	_resultWrongShardAtLeastExact        = ResultWrongShard - 6
-	_resultWrongShardAtMostExact         = uint32(6) - ResultWrongShard
-	_resultSessionRetiredAtLeastExact    = ResultSessionRetired - 7
-	_resultSessionRetiredAtMostExact     = uint32(7) - ResultSessionRetired
+	_resultInvalidDocumentAtLeastExact = ResultInvalidDocument - 4
+	_resultInvalidDocumentAtMostExact  = uint32(4) - ResultInvalidDocument
+	_resultTargetBoundAtLeastExact     = ResultTargetBound - 5
+	_resultTargetBoundAtMostExact      = uint32(5) - ResultTargetBound
+	_resultWrongShardAtLeastExact      = ResultWrongShard - 6
+	_resultWrongShardAtMostExact       = uint32(6) - ResultWrongShard
+	_resultSessionRetiredAtLeastExact  = ResultSessionRetired - 7
+	_resultSessionRetiredAtMostExact   = uint32(7) - ResultSessionRetired
 )
 
 func codecState() State {
@@ -53,7 +53,7 @@ func TestStateRoundTripGoldenAndStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantDigest = "1455b8b87530344c39f7ccf0104e287e1f28752c4e1515d01c249ddf8e2717d2"
+	const wantDigest = "e22900bf3ca9ec3cd4757596692469c9bda513704a89874400317851b6a866d2"
 	gotDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(gotDigest[:]) != wantDigest {
 		t.Fatalf("state golden digest = %x, want %s", gotDigest, wantDigest)
@@ -115,6 +115,32 @@ func TestStateSessionEpochHighWaterRoundTripAndBounds(t *testing.T) {
 	static.SessionEpochHighWater = 1
 	if _, err := AppendState(nil, static); !errors.Is(err, ErrStateCorrupt) {
 		t.Fatalf("static high-water error = %v", err)
+	}
+}
+
+func TestStateAuthorityBindingCountBoundsSessionAndApplied(t *testing.T) {
+	state := codecState()
+	state.Applied = 3
+	state.LastTerm = 2
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("authority-count"))
+	state.AuthorityBindingCount = 1
+	if encoded, err := AppendState(nil, state); err != nil {
+		t.Fatalf("retained authority tombstone state: %v", err)
+	} else if decoded, err := OpenState(encoded); err != nil || decoded.AuthorityBindingCount != 1 {
+		t.Fatalf("authority count round trip=%+v err=%v", decoded, err)
+	}
+	withoutBinding := state
+	withoutBinding.AuthorityBindingCount = 0
+	withoutBinding.SessionCount = 1
+	withoutBinding.SessionSlotCount = 1
+	if _, err := AppendState(nil, withoutBinding); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("session without authority count err=%v", err)
+	}
+	excessive := state
+	excessive.AuthorityBindingCount = state.Applied
+	if _, err := AppendState(nil, excessive); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("authority count at applied err=%v", err)
 	}
 }
 
@@ -280,7 +306,7 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 		t.Fatal(err)
 	}
 	decoded, err := OpenSessionRecord(encoded)
-	if err != nil || decoded.Digest != SessionKey(record.Tenant, record.ClientID) ||
+	if err != nil || decoded.Digest != SessionKey(record.AuthorityClass, record.Tenant, record.ClientID) ||
 		!bytes.Equal(decoded.Tenant, record.Tenant) || decoded.ClientID != record.ClientID ||
 		decoded.Bytes()[0] != encoded[0] {
 		t.Fatalf("OpenSessionRecord = %+v,%v", decoded, err)
@@ -301,15 +327,15 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 }
 
 func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
-	key := SessionKey([]byte("tenant"), id128(9))
-	const wantKey = "5dc75da7b53d9acda39520cbf89cb7a71bdfaba3a76a84a41e8dee27eb8bfefe"
+	key := SessionKey(replication.CommandAuthorityData, []byte("tenant"), id128(9))
+	const wantKey = "3ca5ca12d40496b25c3dd3c92f4149445d7483d84b6b30fc5cfb0c4f1db8ad43"
 	if got := hex.EncodeToString(key[:]); got != wantKey {
 		t.Fatalf("SessionKey = %s, want %s", got, wantKey)
 	}
 
 	command := codecLogicalCommand()
 	digest := LogicalCommandDigest(openCodecLogicalCommand(t, command))
-	const wantLogical = "6a73992470f3248facb555641d34d0e215a9618b9eb430705e25430c97563c68"
+	const wantLogical = "be7d1735975c2d40d70a47aaea4bef9db224369461135d7864fd6baaf182a856"
 	if got := hex.EncodeToString(digest[:]); got != wantLogical {
 		t.Fatalf("LogicalCommandDigest = %s, want %s", got, wantLogical)
 	}
@@ -343,6 +369,11 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 	}
 	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedPartition)); got == digest {
 		t.Fatal("logical digest did not bind relation-batch boundaries")
+	}
+	changedAuthority := command
+	changedAuthority.AuthorityClass = replication.CommandAuthorityTopology
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedAuthority)); got == digest {
+		t.Fatal("logical digest did not bind authority class")
 	}
 	lease := command
 	lease.Kind = replication.CommandSessionRenew

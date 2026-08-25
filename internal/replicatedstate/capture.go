@@ -15,6 +15,8 @@ import (
 
 var ErrTransitionCapture = errors.New("replicatedstate: invalid transition capture")
 
+const TransitionCaptureCollectionName = "__vibedb_split_capture"
+
 // TransitionCaptureTarget is one private synchronous collection in the same
 // transaction domain as the replicated system and user collections.
 type TransitionCaptureTarget struct {
@@ -102,26 +104,84 @@ func (t CapturedTransition) Bounds() TransitionCaptureBounds {
 // poisons apply and requires reopen, but cannot roll back that publication.
 type TransitionCapture interface {
 	Target() TransitionCaptureTarget
-	Begin(State) error
+	// Begin creates or recovers the capture header. An empty target must publish
+	// exactly one header through publish; a non-empty target must recover without
+	// calling it. Machine supplies the only mutation authority, so a participant
+	// reserved by a CheckpointGroup never escapes through Collection.Update.
+	Begin(State, func(key, value []byte) error) error
 	MaxEncodedBytes(TransitionCaptureBounds) (int, error)
 	AppendTransition([]byte, CapturedTransition) ([]byte, error)
 	Published(CapturedTransition) error
 }
 
 func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
-	if capture == nil || !m.initialized || m.capture != nil || m.checkpointGroup != nil {
+	if capture == nil || !m.initialized || m.capture != nil {
 		return ErrTransitionCapture
 	}
 	target := capture.Target()
+	reserved := m.reservedCaptureTarget.Collection != nil || m.reservedCaptureTarget.Name != ""
+	if (m.checkpointGroup != nil && !reserved) ||
+		(reserved && (target != m.reservedCaptureTarget || target.Collection == nil)) {
+		return ErrTransitionCapture
+	}
 	if err := m.validateTransitionCaptureTarget(target, capture); err != nil {
 		return err
 	}
-	if err := capture.Begin(cloneState(m.state)); err != nil {
+	empty := target.Collection.Len() == 0
+	published := false
+	publish := func(key, value []byte) error {
+		if !empty || published || len(key) == 0 || len(value) == 0 {
+			return ErrTransitionCapture
+		}
+		published = true
+		write := func(batch *durable.DatabaseBatch) error {
+			captureBatch, err := batch.CollectionHandle(target.Collection)
+			if err != nil {
+				return err
+			}
+			return captureBatch.Put(key, value)
+		}
+		members := []durable.NamedCollection{{
+			Name: target.Name, Collection: target.Collection, BatchDocumentsHint: 1,
+		}}
+		if m.checkpointGroup != nil {
+			return m.checkpointGroup.Update(
+				m.state.Applied, members, m.options.TxnLimits, write,
+			)
+		}
+		return durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, write)
+	}
+	if err := capture.Begin(cloneState(m.state), publish); err != nil {
 		return fmt.Errorf("%w: begin: %v", ErrTransitionCapture, err)
+	}
+	if empty != published || (empty && target.Collection.Len() != 1) {
+		return fmt.Errorf("%w: noncanonical header publication", ErrTransitionCapture)
 	}
 	m.capture = capture
 	m.captureTarget = target
 	return nil
+}
+
+func validReservedTransitionCaptureTarget(
+	target TransitionCaptureTarget,
+	system CollectionTarget,
+	relations []relationCollection,
+) bool {
+	if target.Name == "" || len(target.Name) > replication.MaxCollectionBytes ||
+		!utf8.ValidString(target.Name) || strings.IndexByte(target.Name, 0) >= 0 ||
+		target.Collection == nil || target.Name == systemCollectionName ||
+		target.Collection == system.Collection || target.Collection.HasSchema() ||
+		target.Collection.HasIndexes() || !target.Collection.HasOpaqueValues() ||
+		!target.Collection.HasSynchronousDurability() || !target.Collection.SupportsUpdate() ||
+		target.Collection.MaxKeyBytes() < 8 || target.Collection.MaxBatchDocuments() < 1 {
+		return false
+	}
+	for i := range relations {
+		if target.Name == relations[i].name || target.Collection == relations[i].target.Collection {
+			return false
+		}
+	}
+	return true
 }
 
 // BeginTransitionCapture installs a source capture at one exact publication.
@@ -153,18 +213,28 @@ func (m *Machine) validateTransitionCaptureTarget(
 		target.Collection.MaxBatchDocuments() < 1 {
 		return ErrTransitionCapture
 	}
-	if m.options.TxnLimits.MaxCollections < 3 ||
-		m.options.TxnLimits.MaxDocuments < max(
-			m.user.Limits.MaxDistinctMutations+4,
-			int(m.options.RetryWindow)+3,
-		) {
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		m.user.Limits.MaxDistinctMutations, m.options.RetryWindow, true,
+	)
+	if err != nil || m.options.TxnLimits.MaxCollections < 3 ||
+		m.options.TxnLimits.MaxDocuments < requiredDocuments {
 		return fmt.Errorf("%w: transaction dimensions", ErrTransitionCapture)
 	}
 	maxBefore := uint64(m.user.Limits.MaxDistinctMutations) *
 		uint64(m.user.Limits.MaxDocumentBytes)
-	maxAfter := uint64(m.user.Limits.MaxBatchBytes)
-	maxKeys := uint64(m.user.Limits.MaxDistinctMutations) *
-		uint64(m.user.Limits.MaxKeyBytes)
+	// Keys and after images share both the durable batch envelope and the
+	// narrower replicated command envelope; their independent maxima cannot
+	// occur in one admitted transition.
+	maxPayload := uint64(min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes))
+	possiblePayload := uint64(m.user.Limits.MaxDistinctMutations) *
+		uint64(m.user.Limits.MaxDocumentBytes+m.user.Limits.MaxKeyBytes)
+	maxPayload = min(maxPayload, possiblePayload)
+	maxAfter := min(maxPayload, uint64(m.user.Limits.MaxDistinctMutations)*
+		uint64(m.user.Limits.MaxDocumentBytes))
+	maxKeys := maxPayload - maxAfter
+	if maxKeys > uint64(m.user.Limits.MaxDistinctMutations)*uint64(m.user.Limits.MaxKeyBytes) {
+		return fmt.Errorf("%w: record payload dimensions", ErrTransitionCapture)
+	}
 	maxRecord, err := capture.MaxEncodedBytes(TransitionCaptureBounds{
 		Transitions: uint64(m.user.Limits.MaxDistinctMutations),
 		KeyBytes:    maxKeys, BeforeBytes: maxBefore, AfterBytes: maxAfter,
@@ -173,7 +243,8 @@ func (m *Machine) validateTransitionCaptureTarget(
 		maxRecord > target.Collection.MaxBatchBytes()-8 {
 		return fmt.Errorf("%w: record capacity", ErrTransitionCapture)
 	}
-	baseBytes, ok := checkedTxnBytes(m.user.Limits.MaxBatchBytes,
+	baseBytes, ok := checkedTxnBytes(
+		min(m.user.Limits.MaxBatchBytes, replication.MaxCommandBytes),
 		maxSystemTransitionBytes(m.system.Limits))
 	if !ok || int64(maxRecord) > math.MaxInt64-baseBytes-8 ||
 		m.options.TxnLimits.MaxBytes < baseBytes+int64(maxRecord)+8 {

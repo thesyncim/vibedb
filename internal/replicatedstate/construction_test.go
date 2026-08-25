@@ -15,6 +15,7 @@ const constructionRetryWindow = uint16(8)
 
 func constructionSystemBatchBytes(retryWindow uint16) int {
 	hot := len(stateKey) + MaxStateEnvelopeBytes +
+		sha256.Size + 1 + MaxAuthorityBindingBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
 		sha256.Size + 3 + MaxSessionSlotRecordBytes
 	release := len(stateKey) + MaxStateEnvelopeBytes +
@@ -27,8 +28,9 @@ func constructionSystemOptions(options durable.Options) durable.Options {
 	options.MaxKeyBytes = sha256.Size + 3
 	options.MaxDocumentBytes = max(
 		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
+		MaxAuthorityBindingBytes,
 	)
-	options.MaxBatchDocuments = int(constructionRetryWindow) + 2
+	options.MaxBatchDocuments = max(4, int(constructionRetryWindow)+2)
 	// Durable collection profiles reserve room for every key at the collection
 	// maximum, even though the state key itself is only one byte.
 	collectionBound := MaxStateEnvelopeBytes +
@@ -65,7 +67,7 @@ func machineOptionsFor(user CollectionTarget) Options {
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 2,
 			MaxDocuments: max(
-				user.Limits.MaxDistinctMutations+3,
+				user.Limits.MaxDistinctMutations+4,
 				int(constructionRetryWindow)+2,
 			),
 			MaxBytes: 64 << 20,
@@ -194,7 +196,7 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 	options := Options{TxnLimits: durable.TxnLimits{
 		MaxCollections: 2,
 		MaxDocuments: max(
-			user.Limits.MaxDistinctMutations+3,
+			user.Limits.MaxDistinctMutations+4,
 			int(constructionRetryWindow)+2,
 		),
 		MaxBytes: required,

@@ -55,7 +55,7 @@ func openCommandIdentity(
 	return commandIdentity{
 		position: requestPosition{
 			group:         group,
-			sessionDigest: replicatedstate.SessionKey(command.Tenant, command.ClientID),
+			sessionDigest: replicatedstate.SessionKey(command.AuthorityClass, command.Tenant, command.ClientID),
 			clientID:      command.ClientID,
 			epoch:         command.ClientEpoch,
 			sequence:      command.ClientSequence,

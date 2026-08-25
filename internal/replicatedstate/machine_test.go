@@ -65,7 +65,7 @@ func newMachineFixture(t testing.TB) machineFixture {
 	options := Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 2,
-			MaxDocuments:   user.Limits.MaxDistinctMutations + 3,
+			MaxDocuments:   user.Limits.MaxDistinctMutations + 4,
 			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128,
@@ -302,8 +302,8 @@ func TestMachineApplyDedupeConflictStaleAndReopen(t *testing.T) {
 	if err := snapshot.RangeSystem(func(_, _ []byte) error { systemRows++; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if systemRows != 5 {
-		t.Fatalf("system rows = %d, want state + session + 3 slots", systemRows)
+	if systemRows != 6 {
+		t.Fatalf("system rows = %d, want state + authority + session + 3 slots", systemRows)
 	}
 }
 

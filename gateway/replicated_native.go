@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -16,10 +17,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
 	AbsoluteMaxReplicatedRouteMembers   = 64
+	AbsoluteMaxReplicatedAttempts       = 16
 	AbsoluteMaxReplicatedAttemptTimeout = 5 * time.Minute
 )
 
@@ -39,11 +42,16 @@ type ReplicatedEndpoint struct {
 	Node            rafttransport.NodeID
 	StoreID         [16]byte
 	NodeIncarnation uint64
+	NativeEndpoint  string
 	Address         string
+	ControlEndpoint string
+	ControlAddress  string
 }
 
 // ReplicatedRoute is one exact catalog allocation and its bounded replica set.
 type ReplicatedRoute struct {
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
 	Group                raftmember.GroupKey
 	AllocationGeneration uint64
 	Command              raftservice.CommandFence
@@ -100,7 +108,7 @@ func NewReplicatedExecutor(
 	maxAttempts int,
 	attemptTimeout time.Duration,
 ) (*ReplicatedExecutor, error) {
-	if client == nil || maxAttempts <= 0 || maxAttempts > 16 ||
+	if client == nil || maxAttempts <= 0 || maxAttempts > AbsoluteMaxReplicatedAttempts ||
 		attemptTimeout <= 0 || attemptTimeout > AbsoluteMaxReplicatedAttemptTimeout {
 		return nil, ErrReplicatedRoute
 	}
@@ -146,6 +154,26 @@ func (executor *ReplicatedExecutor) ReadPoint(
 	route ReplicatedRoute,
 	read ReplicatedPointRead,
 ) (ReplicatedPointResult, error) {
+	return executor.readPoint(ctx, route, read, serviceauthz.CapabilityDataRead)
+}
+
+// ReadTopologyPoint performs the same bounded point-read protocol under the
+// distinct topology capability. Catalog bytes never borrow ordinary data-read
+// authority merely because they occupy a JSON relation.
+func (executor *ReplicatedExecutor) ReadTopologyPoint(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedPointRead,
+) (ReplicatedPointResult, error) {
+	return executor.readPoint(ctx, route, read, serviceauthz.CapabilityTopology)
+}
+
+func (executor *ReplicatedExecutor) readPoint(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedPointRead,
+	capability serviceauthz.Capability,
+) (ReplicatedPointResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
 		read.Relation == 0 || read.Relation > replication.MaxRelationID ||
 		len(read.Key) == 0 || len(read.Key) > replication.MaxMutationKeyBytes ||
@@ -156,7 +184,7 @@ func (executor *ReplicatedExecutor) ReadPoint(
 	preferred := route.Replicas[0].Member
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.readEndpoint(ctx, route, preferred, read)
+		endpoint, state, err := executor.readEndpoint(ctx, route, preferred, read, capability)
 		if err != nil {
 			joined = errors.Join(joined, err)
 			preferred = 0
@@ -167,7 +195,8 @@ func (executor *ReplicatedExecutor) ReadPoint(
 			operation = shardservice.ReplicatedReadLeader
 		}
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
-			Operation: operation, Fence: state.Fence, Relation: read.Relation,
+			Operation: operation, Capability: capability,
+			Fence: state.Fence, Relation: read.Relation,
 			Key: read.Key, MinimumApplied: read.MinimumApplied, MaxValueBytes: read.MaxValueBytes,
 		})
 		if err != nil {
@@ -241,6 +270,11 @@ func (executor *ReplicatedExecutor) ReadPoint(
 				} else {
 					preferred = endpoint.Member
 				}
+				if attempt+1 < executor.maxAttempts {
+					if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+						return ReplicatedPointResult{}, errors.Join(ErrReplicatedLeader, err)
+					}
+				}
 				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
@@ -262,16 +296,17 @@ func (executor *ReplicatedExecutor) readEndpoint(
 	route ReplicatedRoute,
 	preferred uint64,
 	read ReplicatedPointRead,
+	capability serviceauthz.Capability,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
 	if read.Linearizable {
-		return executor.discoverLeader(ctx, route, preferred)
+		return executor.discoverLeader(ctx, route, preferred, capability)
 	}
 	// Applied-bounded reads deliberately prefer followers to preserve leader
 	// capacity. Every candidate is authenticated by a fresh exact probe.
 	var joined error
 	for _, endpoint := range route.Replicas {
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
-			Operation: shardservice.ReplicatedProbe,
+			Operation: shardservice.ReplicatedProbe, Capability: capability,
 			Fence: shardservice.ReplicatedFence{Group: route.Group,
 				AllocationGeneration: route.AllocationGeneration},
 		})
@@ -291,7 +326,7 @@ func (executor *ReplicatedExecutor) readEndpoint(
 		}
 	}
 	// A leader is also a valid index-bounded replica.
-	return executor.discoverLeader(ctx, route, preferred)
+	return executor.discoverLeader(ctx, route, preferred, capability)
 }
 
 // ReplicatedRefusalError preserves one typed shard refusal.
@@ -402,13 +437,15 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 	}
 	preferred := route.Replicas[0].Member
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeader(ctx, route, preferred)
+		endpoint, state, err := executor.discoverLeader(ctx, route, preferred,
+			serviceauthz.CapabilityMembership)
 		if err != nil {
 			return ReplicatedMembershipResult{}, err
 		}
 		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
-				Fence: state.Fence, Membership: membership})
+				Capability: serviceauthz.CapabilityMembership,
+				Fence:      state.Fence, Membership: membership})
 		if err != nil {
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
@@ -491,7 +528,8 @@ func (executor *ReplicatedExecutor) observeMembershipTransfer(
 ) (ReplicatedMembershipResult, bool) {
 	preferred := target
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeader(ctx, route, preferred)
+		endpoint, state, err := executor.discoverLeader(ctx, route, preferred,
+			serviceauthz.CapabilityMembership)
 		if err == nil && endpoint.Member == target && state.LeaderID == target &&
 			state.Fence.MemberID == target && state.Fence.Term > afterTerm {
 			return ReplicatedMembershipResult{State: state, Retries: attempt}, true
@@ -509,7 +547,18 @@ func (executor *ReplicatedExecutor) Propose(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, false)
+	return executor.propose(ctx, route, command, nil, false, serviceauthz.CapabilityDataWrite)
+}
+
+// ProposeTopology submits an exact replicated catalog or controller-journal
+// command under the topology capability. It shares the byte-identical retry
+// protocol with ordinary proposals but cannot borrow DataWrite authority.
+func (executor *ReplicatedExecutor) ProposeTopology(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, false, serviceauthz.CapabilityTopology)
 }
 
 // RetryUnknown retries exact bytes retained from an earlier UnknownOutcomeError.
@@ -520,7 +569,17 @@ func (executor *ReplicatedExecutor) RetryUnknown(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, true)
+	return executor.propose(ctx, route, command, nil, true, serviceauthz.CapabilityDataWrite)
+}
+
+// RetryTopologyUnknown retries the exact topology command bytes retained after
+// an outcome-unknown attempt without changing the requested capability.
+func (executor *ReplicatedExecutor) RetryTopologyUnknown(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, true, serviceauthz.CapabilityTopology)
 }
 
 func (executor *ReplicatedExecutor) propose(
@@ -529,6 +588,7 @@ func (executor *ReplicatedExecutor) propose(
 	command []byte,
 	hint *shardservice.ReplicatedMemberState,
 	priorUnknown bool,
+	capability serviceauthz.Capability,
 ) (ReplicatedResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
 		!validReplicatedRoute(route) || len(command) == 0 ||
@@ -556,12 +616,23 @@ func (executor *ReplicatedExecutor) propose(
 			}
 		}
 		if state == (shardservice.ReplicatedMemberState{}) {
-			endpoint, state, err = executor.discoverLeader(ctx, route, preferred)
+			endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
 			if err != nil {
 				if lastUnknown != nil {
-					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-						Command: append([]byte(nil), original...), Cause: errors.Join(lastUnknown, err),
+					lastUnknown = errors.Join(lastUnknown, err)
+					if attempt+1 == executor.maxAttempts || context.Cause(ctx) != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...), Cause: lastUnknown,
+						}
 					}
+					preferred = nextReplicatedMember(route, preferred)
+					if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, waitErr),
+						}
+					}
+					continue
 				}
 				return ReplicatedResult{}, err
 			}
@@ -569,18 +640,23 @@ func (executor *ReplicatedExecutor) propose(
 		preferred = state.LeaderID
 		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedPropose,
-				Fence:     state.Fence,
-				Command:   original,
+				Operation: shardservice.ReplicatedPropose, Capability: capability,
+				Fence:   state.Fence,
+				Command: original,
 			})
 		if err != nil {
-			if errors.Is(err, raftservice.ErrOutcomeUnknown) {
-				lastUnknown = errors.Join(lastUnknown, err)
-				continue
-			}
 			// A transport implementation might not wrap a proposal failure;
 			// fail closed because the complete command could have reached admission.
 			lastUnknown = errors.Join(lastUnknown, err)
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+						Command: append([]byte(nil), original...),
+						Cause:   errors.Join(lastUnknown, waitErr),
+					}
+				}
+			}
 			continue
 		}
 		if !validReplicatedWriteResponseFields(response) {
@@ -653,6 +729,21 @@ func (executor *ReplicatedExecutor) propose(
 				continue
 			}
 			preferred = response.State.LeaderID
+			if preferred != 0 && preferred != endpoint.Member {
+				continue
+			}
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					if lastUnknown != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, err),
+						}
+					}
+					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
+				}
+			}
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
 			if !validReplicatedNonterminalResponse(response) {
@@ -661,6 +752,18 @@ func (executor *ReplicatedExecutor) propose(
 			}
 			lastUnknown = errors.Join(lastUnknown, raftservice.ErrOutcomeUnknown)
 			preferred = response.State.LeaderID
+			if preferred != 0 && preferred != endpoint.Member {
+				continue
+			}
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+						Command: append([]byte(nil), original...),
+						Cause:   errors.Join(lastUnknown, err),
+					}
+				}
+			}
 			continue
 		case shardservice.ReplicatedRefusal:
 			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
@@ -671,6 +774,38 @@ func (executor *ReplicatedExecutor) propose(
 					}
 				}
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+				continue
+			}
+			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
+				// The command contract was checked above. With the same contract,
+				// this is a definite pre-admission term/member incarnation race
+				// between leader discovery and proposal admission. Refresh the
+				// leader and resend the byte-identical command within the bounded
+				// attempt budget. A changed command fence remains a definite
+				// serving-fence refusal in the earlier branch.
+				if !validReplicatedWritePreAdmissionRefusal(
+					response, shardservice.ReplicatedRefusalStaleFence, false,
+				) {
+					lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
+					continue
+				}
+				preferred = response.State.LeaderID
+				if preferred != 0 && preferred != endpoint.Member {
+					continue
+				}
+				preferred = nextReplicatedMember(route, endpoint.Member)
+				if attempt+1 == executor.maxAttempts {
+					continue
+				}
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					if lastUnknown != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, err),
+						}
+					}
+					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
+				}
 				continue
 			}
 			if !validReplicatedWritePreAdmissionRefusal(response, response.Refusal, false) {
@@ -694,6 +829,35 @@ func (executor *ReplicatedExecutor) propose(
 		}
 	}
 	return ReplicatedResult{}, ErrReplicatedLeader
+}
+
+func waitReplicatedFailoverRetry(ctx context.Context, attempt int) error {
+	// Failover is exceptional, so spend a small bounded wall-clock budget to
+	// avoid burning every retry while the replacement term is still settling.
+	// The normal proposal path never creates a timer. Twenty milliseconds keeps a
+	// one-race retry responsive. The shipped eight-attempt executor waits at
+	// most 1.26 s, spanning the harness's 950 ms maximum randomized election
+	// timeout with scheduler margin; the absolute sixteen-attempt configuration
+	// remains below 4 s.
+	delay := replicatedFailoverRetryDelay(attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
+	}
+}
+
+func replicatedFailoverRetryDelay(attempt int) time.Duration {
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	} else if shift > 4 {
+		shift = 4
+	}
+	return 20 * time.Millisecond * time.Duration(uint64(1)<<uint(shift))
 }
 
 func (executor *ReplicatedExecutor) doReplicated(
@@ -736,6 +900,7 @@ func (executor *ReplicatedExecutor) discoverLeader(
 	ctx context.Context,
 	route ReplicatedRoute,
 	preferred uint64,
+	capability serviceauthz.Capability,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
 	visited := uint64(0)
 	member := preferred
@@ -751,7 +916,7 @@ func (executor *ReplicatedExecutor) discoverLeader(
 		visited |= uint64(1) << ordinal
 		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedProbe,
+				Operation: shardservice.ReplicatedProbe, Capability: capability,
 				Fence: shardservice.ReplicatedFence{
 					Group: route.Group, AllocationGeneration: route.AllocationGeneration,
 				},
@@ -904,7 +1069,8 @@ func validReplicatedAppliedRefusal(response *shardservice.ReplicatedResponse) bo
 }
 
 func validReplicatedRoute(route ReplicatedRoute) bool {
-	if !validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
+	if route.Distribution == "" || route.Shard == "" ||
+		!validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
 		!route.Command.Valid() ||
 		len(route.Replicas) == 0 || len(route.Replicas) > AbsoluteMaxReplicatedRouteMembers {
 		return false
@@ -912,13 +1078,14 @@ func validReplicatedRoute(route ReplicatedRoute) bool {
 	for index, endpoint := range route.Replicas {
 		if endpoint.Member == 0 || endpoint.Node == (rafttransport.NodeID{}) ||
 			endpoint.StoreID == ([16]byte{}) || endpoint.NodeIncarnation == 0 ||
-			endpoint.Address == "" {
+			endpoint.NativeEndpoint == "" || endpoint.Address == "" {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
 			if route.Replicas[prior].Member == endpoint.Member ||
 				route.Replicas[prior].Node == endpoint.Node ||
 				route.Replicas[prior].StoreID == endpoint.StoreID ||
+				route.Replicas[prior].NativeEndpoint == endpoint.NativeEndpoint ||
 				route.Replicas[prior].Address == endpoint.Address {
 				return false
 			}
@@ -932,6 +1099,8 @@ func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 	return err == nil && view.ClusterID == route.Group.ClusterID &&
 		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
 		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&
+		vibejson.BytesEqualString(view.Distribution, string(route.Distribution)) &&
+		vibejson.BytesEqualString(view.Shard, string(route.Shard)) &&
 		view.ShardIncarnation == route.Group.ShardIncarnation &&
 		view.GroupID == route.Group.GroupID &&
 		view.AllocationGeneration == route.AllocationGeneration &&
@@ -954,6 +1123,14 @@ func replicatedEndpoint(
 		}
 	}
 	return ReplicatedEndpoint{}, 0, false
+}
+
+func nextReplicatedMember(route ReplicatedRoute, member uint64) uint64 {
+	_, ordinal, found := replicatedEndpoint(route, member)
+	if !found || len(route.Replicas) < 2 {
+		return 0
+	}
+	return route.Replicas[(ordinal+1)%len(route.Replicas)].Member
 }
 
 func firstUnvisitedReplicatedEndpoint(

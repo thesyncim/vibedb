@@ -23,7 +23,7 @@ func testApplyOptions() sqldriver.ReplicatedApplyOptions {
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 16,
 			MaxDocuments:   256,
-			MaxBytes:       64 << 20,
+			MaxBytes:       384 << 20,
 		},
 		Placement: sqldriver.ReplicatedPlacementProfile{
 			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",

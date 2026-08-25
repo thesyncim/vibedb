@@ -691,8 +691,12 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = err
 			break
 		}
-		if status.MemberID != member.identity.MemberID || status.Term != request.read.fence.Term {
+		if status.MemberID != member.identity.MemberID {
 			reply.err = ErrServingFence
+			break
+		}
+		if status.Term != request.read.fence.Term {
+			reply.err = &NotLeaderError{Status: status}
 			break
 		}
 		if request.kind == requestReadFollower {
