@@ -534,10 +534,16 @@ func TestSessionRevokeDecisionSyncFaultRecoversAtomically(t *testing.T) {
 	_, _, epoch := applySessionOpen(t, store.machine, 2, prototype)
 	capture := newSessionLeaseCaptureStore(t, store.dir)
 	defer capture.close()
+	requiredDocuments, err := RequiredBundleTransactionDocuments(
+		store.user.Limits.MaxDistinctMutations, store.machine.options.RetryWindow, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store.machine.options.TxnLimits.MaxCollections = 3
-	store.machine.options.TxnLimits.MaxDocuments = 68
+	store.machine.options.TxnLimits.MaxDocuments = requiredDocuments
 	store.machineOptions.TxnLimits.MaxCollections = 3
-	store.machineOptions.TxnLimits.MaxDocuments = 68
+	store.machineOptions.TxnLimits.MaxDocuments = requiredDocuments
 	if err := store.machine.BeginTransitionCapture(capture.encoder); err != nil {
 		t.Fatalf("begin lease fault capture: %v", err)
 	}

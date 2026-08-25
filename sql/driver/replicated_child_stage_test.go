@@ -587,14 +587,17 @@ func newReplicatedChildSourceFixture(t testing.TB) *replicatedChildSourceFixture
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations, 8, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	machineOptions := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
-			MaxDocuments: max(
-				user.Limits.MaxDistinctMutations+4,
-				systemLimits.MaxBatchDocuments+1,
-			),
-			MaxBytes: 64 << 20,
+			MaxDocuments:   maxDocuments,
+			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128,
 		RetryWindow: 8,
