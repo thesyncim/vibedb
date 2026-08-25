@@ -460,6 +460,9 @@ func AdoptRuntime(
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
 	}
+	if err = runtime.node.BindMembershipTransitionContext(); err != nil {
+		return runtime.abortAdoption(fmt.Errorf("raftmember: bind membership transition context: %w", err))
+	}
 	return runtime, nil
 }
 

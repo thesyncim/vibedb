@@ -3,9 +3,11 @@ package raftmember
 import (
 	"crypto/sha256"
 	"encoding/binary"
+
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 )
 
-const MembershipTransitionDigestBytes = sha256.Size
+const MembershipTransitionDigestBytes = raftmodel.MembershipTransitionContextBytes
 
 // MembershipTransitionDigest binds a Raft ConfChange to one exact metadata
 // grant without retaining variable-width control-plane data in the log.

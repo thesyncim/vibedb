@@ -21,7 +21,8 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	nodes := [4]rafttransport.NodeID{{1}, {2}, {3}, {4}}
 	members := make([]rafttransport.Member, 4)
 	for index := range hosts {
-		runtime, _, reopenRuntime := newRealTransferRuntime(t, identities[index], voters)
+		runtime, _, reopenRuntime := newRealTransferRuntimeWithLearners(
+			t, identities[index], voters, []uint64{identities[3].MemberID})
 		reopen[index] = reopenRuntime
 		host, err := NewHost(testHostLimits())
 		if err != nil {
@@ -34,7 +35,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Cleanup(func() { _ = host.Close() })
 		role := rafttransport.MemberVoter
 		if index == 3 {
-			role = rafttransport.MemberEnrolled
+			role = rafttransport.MemberLearner
 		}
 		members[index] = rafttransport.Member{Group: runtime.Identity().Group,
 			ReplicaSetVersion: 1, MemberID: identities[index].MemberID,
@@ -73,24 +74,18 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	target := uint64(4)
 	authorizationDigest := raftmember.MembershipTransitionDigest(group,
 		[16]byte{1}, 2, 3, 1, 4)
-	if err := hosts[0].ProposeConfChange(group, &pb.ConfChange{
-		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: &target,
-		Context: append([]byte(nil), authorizationDigest[:]...),
-	}); err != nil {
-		t.Fatal(err)
-	}
 	learnerConf := &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
 	cluster.driveUntil(func() bool {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
-			if err != nil || publication.Applied < 3 ||
+			if err != nil || publication.Applied < 2 ||
 				!proto.Equal(publication.ConfState, learnerConf) {
 				return false
 			}
 		}
 		progress, found, err := hosts[0].Progress(group, target)
 		return err == nil && found && progress.Learner && progress.RecentActive &&
-			progress.Match >= 3 && progress.PendingSnapshot == 0
+			progress.Match >= 2 && progress.PendingSnapshot == 0
 	})
 	if err := hosts[0].ProposeConfChange(group, &pb.ConfChange{
 		Type: pb.ConfChangeAddNode.Enum(), NodeId: &target,
@@ -106,7 +101,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		}
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 4 ||
+			if err != nil || publication.Applied < 3 ||
 				!proto.Equal(publication.ConfState, voterConf) {
 				return false
 			}
@@ -115,7 +110,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	})
 	beforeRestart, err := hosts[3].Publication(group)
 	if err != nil || !proto.Equal(beforeRestart.ConfState, learnerConf) ||
-		beforeRestart.ReplicaSetVersion >= 4 {
+		beforeRestart.ReplicaSetVersion >= 3 {
 		t.Fatalf("target published promotion before crash: %+v, %v", beforeRestart, err)
 	}
 	if err = hosts[3].Close(); err != nil {
@@ -149,7 +144,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	proof, found, err := restartedPromotionHost.DurablePromotion(group, target)
-	if err != nil || !found || proof.Version != 4 {
+	if err != nil || !found || proof.Version != 3 {
 		t.Fatalf("reconstructed promotion proof=%+v found=%t err=%v", proof, found, err)
 	}
 	if err = restartRegistry.PublishDurablePromotion(group, proof); err != nil {
@@ -198,7 +193,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.driveUntil(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 5 || !proto.Equal(publication.ConfState, removedConf) {
+			if err != nil || publication.Applied < 4 || !proto.Equal(publication.ConfState, removedConf) {
 				return false
 			}
 		}

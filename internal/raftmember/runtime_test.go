@@ -290,7 +290,8 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 	if err := fixture.runtime.ReadIndex([]byte("after-proposals")); !errors.Is(err, raftmodel.ErrReadyPending) {
 		t.Fatalf("ReadIndex across proposal batch = %v", err)
 	}
-	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(2)}
+	change := &pb.ConfChange{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(2),
+		Context: make([]byte, MembershipTransitionDigestBytes)}
 	if err := fixture.runtime.ProposeConfChange(change); !errors.Is(err, raftmodel.ErrReadyPending) {
 		t.Fatalf("ProposeConfChange across proposal batch = %v", err)
 	}
@@ -547,6 +548,7 @@ func TestRuntimeConfigurationAndReadControlPorts(t *testing.T) {
 	peer := fixture.runtime.identity.MemberID + 1
 	change := &pb.ConfChange{
 		Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: runtimeUint64Ptr(peer),
+		Context: make([]byte, MembershipTransitionDigestBytes),
 	}
 	if err := fixture.runtime.ProposeConfChange(change); err != nil {
 		t.Fatal(err)

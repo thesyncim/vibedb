@@ -33,6 +33,8 @@ type Node struct {
 	failure    error
 	published  Publication
 
+	membershipTransitionContext bool
+
 	issuedReads  map[string]readIssue
 	pendingReads []ReadBarrier
 	readBytes    int
@@ -47,6 +49,10 @@ type Node struct {
 	pendingInputUnits int
 	pendingInputBytes int64
 }
+
+// MembershipTransitionContextBytes is the sole configuration context shape
+// admitted after explicit membership-transition binding.
+const MembershipTransitionContextBytes = 32
 
 // ReadyProgress is an allocation-free observation of one captured Ready. It
 // exposes only bounded counts needed to schedule explicit crash cuts; no core
@@ -238,6 +244,18 @@ func newRawNodeChecked(config *raft.Config) (raw *raft.RawNode, err error) {
 
 // Phase returns the current synchronous Ready lifecycle phase.
 func (n *Node) Phase() Phase { return n.phase }
+
+// BindMembershipTransitionContext enables the one fixed-width membership
+// authorization digest before any proposal or Ready replay. Raw Nodes remain
+// context-free unless their owner explicitly binds this contract.
+func (n *Node) BindMembershipTransitionContext() error {
+	if n == nil || n.phase != PhaseIdle || n.readySeq != 0 || n.readyID != 0 ||
+		n.pendingInputCalls != 0 || n.pendingInputUnits != 0 || n.pendingInputBytes != 0 {
+		return errors.New("raftmodel: membership context binding must precede protocol input")
+	}
+	n.membershipTransitionContext = true
+	return nil
+}
 
 // Failure returns the terminal apply failure, if any.
 func (n *Node) Failure() error { return n.failure }
@@ -1121,25 +1139,30 @@ func decodeConfChange(entry *pb.Entry) (pb.ConfChangeI, error) {
 
 func (n *Node) validateConfChange(change pb.ConfChangeI) error {
 	var v2 *pb.ConfChangeV2
+	var contextBytes int
 	switch typed := change.(type) {
 	case *pb.ConfChange:
 		if typed == nil {
 			return errors.New("raftmodel: nil ConfChange")
 		}
-		if len(typed.GetContext()) != 0 {
-			return &UnsupportedError{Feature: "configuration-change context before topology apply binding"}
-		}
+		contextBytes = len(typed.GetContext())
 		v2 = typed.AsV2()
 	case *pb.ConfChangeV2:
 		if typed == nil {
 			return errors.New("raftmodel: nil ConfChangeV2")
 		}
-		if len(typed.GetContext()) != 0 {
-			return &UnsupportedError{Feature: "configuration-change context before topology apply binding"}
-		}
+		contextBytes = len(typed.GetContext())
 		v2 = typed
 	default:
 		return &UnsupportedError{Feature: "unknown configuration change representation"}
+	}
+	if n.membershipTransitionContext {
+		if contextBytes != MembershipTransitionContextBytes {
+			return fmt.Errorf("%w: membership transition context bytes %d differs from %d",
+				ErrAdmissionBound, contextBytes, MembershipTransitionContextBytes)
+		}
+	} else if contextBytes != 0 {
+		return &UnsupportedError{Feature: "configuration-change context before topology apply binding"}
 	}
 
 	switch v2.GetTransition() {

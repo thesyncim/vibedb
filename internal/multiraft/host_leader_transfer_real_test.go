@@ -292,6 +292,14 @@ func newRealTransferRuntime(
 	identity raftstore.Identity,
 	voters []uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
+	return newRealTransferRuntimeWithLearners(t, identity, voters, nil)
+}
+
+func newRealTransferRuntimeWithLearners(
+	t *testing.T,
+	identity raftstore.Identity,
+	voters, learners []uint64,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, func() *raftmember.Runtime) {
 	t.Helper()
 	index, term := uint64(1), uint64(1)
 	walPath := filepath.Join(t.TempDir(), "member.wal")
@@ -305,7 +313,9 @@ func newRealTransferRuntime(
 		Snapshot: &pb.Snapshot{
 			Data: []byte("multiraft-real-transfer-bootstrap"),
 			Metadata: &pb.SnapshotMetadata{
-				Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: append([]uint64(nil), voters...)},
+				Index: &index, Term: &term, ConfState: &pb.ConfState{
+					Voters: append([]uint64(nil), voters...), Learners: append([]uint64(nil), learners...),
+				},
 			},
 		},
 	}, options)
