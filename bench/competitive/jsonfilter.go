@@ -2,7 +2,6 @@ package competitive
 
 import (
 	"bytes"
-	"encoding/json"
 
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -37,8 +36,8 @@ func jsonScalarNeedle(value string) []byte {
 // the trusted (non-revalidating) variant, comparing raw bytes without decoding
 // the string. Every one of those choices favours the key/value engines, since
 // it strips their filter cost down to storage plus the minimum possible parse.
-// See matchesCountryStdlib for what the same predicate costs with the standard
-// library, which is what most applications would actually reach for.
+// See matchesCountryValidated for the cost of retaining full validation when
+// the caller cannot prove that stored bytes were validated at admission.
 func matchesCountry(src, needle []byte) (bool, error) {
 	rv, ok, err := countryPointer.ScanFirstRawTrusted(src)
 	if err != nil || !ok {
@@ -47,17 +46,15 @@ func matchesCountry(src, needle []byte) (bool, error) {
 	return bytes.Equal(rv.Bytes(), needle), nil
 }
 
-type countryOnly struct {
-	Country string `json:"country"`
-}
-
-// matchesCountryStdlib is the same predicate through encoding/json. The
-// harness runs one engine both ways so the report can separate "what storage
-// costs" from "what parsing costs" instead of conflating them.
-func matchesCountryStdlib(src []byte, value string) (bool, error) {
-	var doc countryOnly
-	if err := json.Unmarshal(src, &doc); err != nil {
+// matchesCountryValidated performs the same borrowed raw comparison while
+// validating the complete document under a hard nesting bound. The benchmark
+// pair therefore isolates the exact cost of trust at the storage boundary,
+// without bringing a second JSON implementation or heap-built strings into the
+// process.
+func matchesCountryValidated(src, needle []byte) (bool, error) {
+	rv, ok, err := countryPointer.GetRawOptions(src, vibejson.Options{MaxDepth: 8})
+	if err != nil || !ok {
 		return false, err
 	}
-	return doc.Country == value, nil
+	return bytes.Equal(rv.Bytes(), needle), nil
 }

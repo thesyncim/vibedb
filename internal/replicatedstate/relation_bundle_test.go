@@ -34,13 +34,25 @@ type relationBundleFixture struct {
 }
 
 func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixture {
-	return newRelationBundleFixtureWithGlobalOptions(t, checkpoint, durable.Options{})
+	return newRelationBundleFixtureWithCollectionOptions(
+		t, checkpoint, durable.Options{}, durable.Options{},
+	)
 }
 
 func newRelationBundleFixtureWithGlobalOptions(
 	t testing.TB,
 	checkpoint bool,
 	globalOptions durable.Options,
+) relationBundleFixture {
+	return newRelationBundleFixtureWithCollectionOptions(
+		t, checkpoint, durable.Options{}, globalOptions,
+	)
+}
+
+func newRelationBundleFixtureWithCollectionOptions(
+	t testing.TB,
+	checkpoint bool,
+	baseOptions, globalOptions durable.Options,
 ) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -64,7 +76,8 @@ func newRelationBundleFixtureWithGlobalOptions(
 		OpaqueValues: true, MaxBatchDocuments: 32,
 	})
 	system = systemTargetOf(system.Collection)
-	base := open("base", durable.Options{Indexes: []store.IndexDefinition{index}})
+	baseOptions.Indexes = []store.IndexDefinition{index}
+	base := open("base", baseOptions)
 	global := open("global", globalOptions)
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
@@ -217,6 +230,131 @@ func TestSingletonApplyContractAuthenticatesNativeExactIndexes(t *testing.T) {
 	}
 	if contracts[0] == contracts[1] {
 		t.Fatal("singleton apply contract did not authenticate the native exact-index manifest")
+	}
+}
+
+func TestPointReadIntoUsesDenseRelationAndExactPublicationCut(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	baseKey := []byte("doc")
+	baseValue := []byte(`{"email":"a","n":1}`)
+	globalKey := []byte{0x91, 0x01, 'a'}
+	globalValue := []byte(`["doc"]`)
+	command := fixture.command(t, 1,
+		replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: baseKey, Value: baseValue,
+		}}},
+		replication.RelationMutationBatch{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
+		}}},
+	)
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		relation  replication.RelationID
+		key, want []byte
+		max       int
+	}{{1, baseKey, baseValue, fixture.base.Limits.MaxDocumentBytes},
+		{2, globalKey, globalValue, fixture.global.Limits.MaxDocumentBytes}} {
+		result, readErr := fixture.machine.PointReadInto(
+			test.relation, test.key, publication.Applied, test.max, nil,
+		)
+		if readErr != nil || !result.Found || !bytes.Equal(result.Value, test.want) ||
+			result.Fence.Applied != publication.Applied ||
+			result.Fence.Binding != fixture.binding ||
+			result.Fence.ReplicaSetVersion != publication.ReplicaSetVersion ||
+			result.Fence.RelationManifestDigest != fixture.machine.manifestDigest {
+			t.Fatalf("relation %d result=%+v err=%v", test.relation, result, readErr)
+		}
+	}
+	missing, err := fixture.machine.PointReadInto(1, []byte("missing"), publication.Applied,
+		fixture.base.Limits.MaxDocumentBytes, nil)
+	if err != nil || missing.Found || len(missing.Value) != 0 {
+		t.Fatalf("missing=%+v err=%v", missing, err)
+	}
+	if _, err := fixture.machine.PointReadInto(1, baseKey, publication.Applied+1,
+		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrReadBehind) {
+		t.Fatalf("future applied floor error=%v", err)
+	}
+	if _, err := fixture.machine.PointReadInto(1, baseKey, publication.Applied,
+		len(baseValue), nil); !errors.Is(err, ErrReadBufferBound) {
+		t.Fatalf("request-relative bound below relation maximum error=%v", err)
+	}
+	if _, err := fixture.machine.PointReadInto(3, baseKey, publication.Applied,
+		fixture.base.Limits.MaxDocumentBytes, nil); !errors.Is(err, ErrInvalidCollection) {
+		t.Fatalf("unknown relation error=%v", err)
+	}
+}
+
+func TestPointReadIntoPreGrowsOverflowResultAtAdmissionBoundary(t *testing.T) {
+	const maximum = 3_366_913
+	fixture := newRelationBundleFixtureWithCollectionOptions(
+		t, true,
+		durable.Options{
+			MaxPageSize: 64 << 10, ResidentBytes: 64 << 20,
+			InlineValueBytes: 512, MaxDocumentBytes: maximum,
+			MaxBatchDocuments: 1,
+		},
+		durable.Options{},
+	)
+	key := []byte("growth-boundary")
+	value := make([]byte, maximum)
+	prefix := []byte(`{"email":"a","pad":"`)
+	suffix := []byte(`"}`)
+	copy(value, prefix)
+	for index := len(prefix); index < len(value)-len(suffix); index++ {
+		value[index] = 'x'
+	}
+	copy(value[len(value)-len(suffix):], suffix)
+	command := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 1,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: key, Value: value,
+		}},
+	})
+	publication, err := fixture.machine.ApplyNormal(normalMeta(3), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.machine.PointReadInto(
+		1, key, publication.Applied, maximum, nil,
+	)
+	if err != nil || !result.Found || !bytes.Equal(result.Value, value) {
+		t.Fatalf("overflow point read = bytes %d found %t err %v",
+			len(result.Value), result.Found, err)
+	}
+	if cap(result.Value) != maximum {
+		t.Fatalf("overflow point read capacity = %d, want exact %d",
+			cap(result.Value), maximum)
+	}
+	callerPrefix := []byte("caller-prefix:")
+	direct, found, err := fixture.base.Collection.AppendRaw(callerPrefix, key)
+	if err != nil || !found || len(direct) != len(callerPrefix)+maximum ||
+		!bytes.Equal(direct[:len(callerPrefix)], callerPrefix) ||
+		!bytes.Equal(direct[len(callerPrefix):], value) {
+		t.Fatalf("prefixed overflow read = bytes %d found %t err %v",
+			len(direct), found, err)
+	}
+	if want := len(callerPrefix) + maximum; cap(direct) != want {
+		t.Fatalf("prefixed overflow capacity = %d, want exact %d", cap(direct), want)
+	}
+}
+
+func BenchmarkPointReadIntoDenseRelationMiss(b *testing.B) {
+	fixture := newRelationBundleFixture(b, true)
+	key := []byte("absent")
+	maximum := fixture.base.Limits.MaxDocumentBytes
+	// Warm the reusable coherent-cut workspace before measuring.
+	if _, err := fixture.machine.PointReadInto(1, key, 2, maximum, nil); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := fixture.machine.PointReadInto(1, key, 2, maximum, nil)
+		if err != nil || result.Found {
+			b.Fatalf("result=%+v err=%v", result, err)
+		}
 	}
 }
 

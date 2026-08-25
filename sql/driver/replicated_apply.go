@@ -1209,6 +1209,29 @@ func (a *ReplicatedApply) Published() raftmodel.Publication {
 	return a.machine.Published()
 }
 
+// PointReadInto serves one dense relation from an exact replicated publication
+// cut. It does not resolve table names and the applied floor is explicit.
+func (a *ReplicatedApply) PointReadInto(
+	relation replication.RelationID,
+	key []byte,
+	minimumApplied uint64,
+	maxValueBytes int,
+	dst []byte,
+) (replicatedstate.PointReadResult, error) {
+	if a == nil || a.database == nil {
+		return replicatedstate.PointReadResult{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedstate.PointReadResult{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return replicatedstate.PointReadResult{}, err
+	}
+	return a.machine.PointReadInto(relation, key, minimumApplied, maxValueBytes, dst)
+}
+
 // SnapshotArtifactCut captures one coherent, read-only system/user cut for
 // streaming snapshot export. The returned handle owns the durable collection
 // snapshots until Close; it carries no SQL session or serving authority.

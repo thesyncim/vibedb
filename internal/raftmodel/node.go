@@ -35,7 +35,7 @@ type Node struct {
 
 	membershipTransitionContext bool
 
-	issuedReads  map[string]readIssue
+	issuedReads  map[readContextKey]readIssue
 	pendingReads []ReadBarrier
 	readBytes    int
 	readSeq      uint64
@@ -227,7 +227,7 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 		machine:     machine,
 		phase:       PhaseIdle,
 		published:   pub,
-		issuedReads: make(map[string]readIssue),
+		issuedReads: make(map[readContextKey]readIssue),
 	}
 	return n, nil
 }
@@ -749,7 +749,10 @@ func (n *Node) RecordNextReadState() (bool, error) {
 	if state.Index == 0 {
 		return false, n.fail(PhaseReadStatesRecorded, 0, errors.New("core returned zero ReadIndex barrier"))
 	}
-	key := string(state.RequestCtx)
+	key, keyOK := makeReadContextKey(state.RequestCtx)
+	if !keyOK {
+		return false, n.fail(PhaseReadStatesRecorded, state.Index, errors.New("invalid ReadIndex context returned by core"))
+	}
 	issue, ok := n.issuedReads[key]
 	if !ok {
 		return false, n.fail(PhaseReadStatesRecorded, state.Index, errors.New("unknown or duplicate ReadIndex context returned by core"))

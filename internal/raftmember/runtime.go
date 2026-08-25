@@ -63,6 +63,11 @@ type RuntimeIdentity struct {
 	MemberID             uint64
 	StoreID              [16]byte
 	NodeIncarnation      uint64
+	// RelationManifestDigest is the exact portable relation contract opened by
+	// the adopted apply machine. Unlike the bound SQL catalog digest, it omits
+	// replica-local storage identities. Serving registration must use this
+	// digest so every replica advertises the same command grammar.
+	RelationManifestDigest [32]byte
 }
 
 // DurablePromotionProof identifies one canonical unapplied promotion entry in
@@ -449,6 +454,7 @@ func AdoptRuntime(
 			Distribution: strings.Clone(sealed.Distribution),
 			Shard:        strings.Clone(sealed.Shard), AllocationGeneration: sealed.AllocationGeneration,
 			MemberID: sealed.MemberID, StoreID: sealed.StoreID,
+			RelationManifestDigest: profile.RelationManifestDigest,
 		},
 	}
 	incarnation, err := wal.BeginIncarnation()

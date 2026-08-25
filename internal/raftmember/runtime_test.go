@@ -119,6 +119,25 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 
 func settleTestApplied(AppliedBatch) error { return nil }
 
+func TestRuntimeIdentityPublishesPortableMachineManifest(t *testing.T) {
+	fixture := newRuntimeFixture(t, 209, nil)
+	profile, err := fixture.apply.CapacityQualificationProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fixture.runtime.Identity()
+	if identity.RelationManifestDigest == ([32]byte{}) ||
+		identity.RelationManifestDigest != profile.RelationManifestDigest {
+		t.Fatalf(
+			"runtime manifest = %x, machine profile = %x",
+			identity.RelationManifestDigest, profile.RelationManifestDigest,
+		)
+	}
+	if identity.RelationManifestDigest == fixture.base.RelationManifestDigest {
+		t.Fatal("runtime advertised the replica-local SQL catalog manifest")
+	}
+}
+
 func openRuntimeTestSession(
 	t testing.TB,
 	runtime *Runtime,
