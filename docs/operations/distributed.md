@@ -271,12 +271,21 @@ one-statement batch delegates to `Exec`.
 
 The catalog and public RF3 point reads share one bounded authenticated native
 connection pool. The pool keys a physical connection by authenticated node and
-address. The RF3 executor also keeps bounded four-way exact leader hints. It
-validates the complete route and serving fence, follows `NotLeader` responses,
-and retries within `-catalog-attempts` and `-catalog-attempt-timeout`. A
+address. Globally idle connections are evicted oldest-first under endpoint
+churn, while topology, membership, and schema traffic retain reserved
+connection and handshake capacity under data saturation. The RF3 executor also
+keeps bounded four-way exact leader hints. It validates the complete route and
+serving fence, follows `NotLeader` responses, and retries within
+`-catalog-attempts` and `-catalog-attempt-timeout`. A
 definite stale serving fence coalesces one authenticated catalog refresh and
 permits exactly one re-resolved read attempt; ambiguous transport failures are
 never replayed by that refresh path.
+
+`-max-shard-connections-per-pool` and
+`-max-shard-handshakes-per-pool` are explicit per-pool limits, not aggregate
+process limits: authenticated SQL and RF3 each own one pool, while each
+transient controller pool is capped at eight. The naming prevents an operator
+from mistaking the configured value for a smaller process-wide bound.
 
 The gateway runs distributed-transaction recovery every five seconds. It logs
 the number of coordinators that recovery resolves.
@@ -337,7 +346,10 @@ has a separate frame limit of 16 MiB plus 64 KiB. Public point reads also have
 operator-configurable concurrent-request and aggregate response reservations:
 `-max-native-read-concurrency` and `-max-native-read-bytes`. Each admitted read
 retains its schema-authenticated maximum-document reservation until the
-response has been written to the client.
+response has been written to the client. Documents stream directly from that
+reservation instead of being copied into a connection-lifetime JSON buffer.
+A client that stops reading is disconnected after the five-second native
+response-write deadline so it cannot pin the reservation indefinitely.
 
 ## Select an operation class
 

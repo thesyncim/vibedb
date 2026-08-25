@@ -59,13 +59,19 @@ Successful reads return the exact route lineage and applied index.
 
 One bounded authenticated native pool is shared by catalog and data reads. Its
 physical key is the authenticated node and address, so unrelated shard fences
-do not fragment connections. A bounded four-way cache retains exact leader
-hints. A delayed failure cannot remove a newer term. Discovery, `NotLeader`,
-transport failure, and retry remain bounded by the executor profile.
+do not fragment connections. Global oldest-idle eviction admits endpoint churn
+without exceeding the pool, and reserved connection/handshake slots keep
+topology, membership, and schema traffic live under data saturation. A bounded
+four-way cache retains exact leader hints. A delayed failure cannot remove a
+newer term. Discovery, `NotLeader`, transport failure, and retry remain bounded
+by the executor profile.
 
 Each public read reserves its schema-authenticated maximum document bytes and
 one concurrency slot before shard I/O. The reservation survives through the
-client response write, bounding slow-client retention across the process. A
+client response write, bounding slow-client retention across the process. The
+document streams directly to the connection rather than through a retained
+whole-response buffer, and a five-second write deadline releases reservations
+held by clients that stop reading. A
 definite serving fence coalesces one authenticated catalog refresh and one
 re-resolved retry; an ambiguous transport outcome never enters that replay
 path.
