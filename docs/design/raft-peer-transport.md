@@ -3,8 +3,9 @@
 Status: **Internal**
 
 `internal/rafttransport` provides a composable authenticated stream foundation
-for ordinary Raft messages. It is not wired into `internal/multiraft.Host` or a
-shipped server. It does not make the replication kernel a serving system.
+for ordinary Raft messages. `internal/raftservice` wires it to
+`internal/multiraft.Host` in the internal RF3 serving composition. No shipped
+command constructs that peer service.
 
 ## Certificate identity
 

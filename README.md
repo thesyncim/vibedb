@@ -10,8 +10,9 @@ You can select buffered or in-memory operation when your application needs a
 different acknowledgement contract.
 
 > **Project status:** This repository has no tagged release. Pin a tested
-> commit. The distributed runtime is experimental. Its command servers use
-> unauthenticated development protocols and refuse non-loopback listeners.
+> commit. The distributed runtime is experimental. Its command servers require
+> authenticated TLS and a canonical `vibejson` authorization policy by default.
+> An explicit development mode permits plaintext only on loopback listeners.
 
 ## Requirements
 
@@ -85,6 +86,7 @@ each collection when the first mutation needs that collection.
 - [Architecture](docs/architecture.md)
 - [Durability and recovery](docs/durability.md)
 - [Current capability matrix](docs/capabilities.md)
+- [Distributed feature state](docs/distributed-feature-state.md)
 - [Distributed runtime](docs/operations/distributed.md)
 - [Security policy](SECURITY.md)
 

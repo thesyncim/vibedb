@@ -12,6 +12,7 @@ Start with the page that matches your task.
 - [Select an API](api/README.md)
 - [Understand the architecture](architecture.md)
 - [Check current capabilities](capabilities.md)
+- [Check distributed feature state](distributed-feature-state.md)
 
 ## Use an API
 
@@ -52,7 +53,9 @@ Start with the page that matches your task.
 
 The root Go module does not publish a tagged release in this repository. Pin a
 tested commit when you use it as a dependency. The distributed commands are
-experimental and bind only to loopback addresses.
+experimental. They require authenticated TLS and a canonical `vibejson`
+authorization policy by default. Explicit development plaintext binds only to
+loopback addresses.
 
 The implementation is the source of truth. Each design page lists the source
 files and tests that support its contract.
