@@ -304,6 +304,11 @@ func (j *Journal) replayManifestSegment(id ID, raw []byte, page ManifestPage) er
 	if id.IsZero() {
 		return ErrCorrupt
 	}
+	coordinator := j.coordinators[id]
+	if coordinator == nil || !coordinator.hasManifest ||
+		coordinator.status.CoordinatorState != CoordinatorStaging {
+		return ErrCorrupt
+	}
 	manifest := j.manifests[id]
 	if manifest == nil {
 		manifest = &journalManifest{}
@@ -318,7 +323,7 @@ func (j *Journal) replayManifestSegment(id ID, raw []byte, page ManifestPage) er
 	}
 	if index != len(manifest.segments) ||
 		page.Segment.FirstParticipant != manifest.participantCount ||
-		manifest.encodedBytes+uint64(len(raw)) > MaxManifestBytes {
+		!manifestPageWithinDescriptor(manifest, page, len(raw), coordinator.manifest) {
 		return ErrCorrupt
 	}
 	first := &page.Participants[0]
@@ -345,7 +350,7 @@ func (j *Journal) replayManifestCoordinatorStage(
 	raw []byte,
 	record ManifestCoordinatorRecord,
 ) error {
-	if record.State != CoordinatorStaging || j.manifestDescriptor(record.ID) != record.Manifest {
+	if record.State != CoordinatorStaging {
 		return ErrCorrupt
 	}
 	if prior := j.coordinators[record.ID]; prior != nil {
@@ -358,6 +363,9 @@ func (j *Journal) replayManifestCoordinatorStage(
 		status: Status{Role: RoleCoordinator, ID: record.ID, Revision: record.Revision,
 			CoordinatorState: record.State},
 		stage: bytes.Clone(raw), manifest: record.Manifest, hasManifest: true,
+	}
+	if j.manifests[record.ID] == nil {
+		j.manifests[record.ID] = &journalManifest{}
 	}
 	return nil
 }
@@ -373,6 +381,9 @@ func (j *Journal) replayManifestCoordinatorSeal(
 		revision != record.status.Revision+1 ||
 		(next != CoordinatorCommitted && next != CoordinatorAborted) ||
 		!record.status.CoordinatorState.CanTransitionTo(next) {
+		return ErrCorrupt
+	}
+	if next == CoordinatorCommitted && j.manifestDescriptor(id) != descriptor {
 		return ErrCorrupt
 	}
 	record.status.Revision = revision
@@ -558,6 +569,11 @@ func (j *Journal) StageManifestSegment(
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	coordinator := j.coordinators[id]
+	if coordinator == nil || !coordinator.hasManifest ||
+		coordinator.status.CoordinatorState != CoordinatorStaging {
+		return ManifestSegment{}, ErrJournalConflict
+	}
 	manifest := j.manifests[id]
 	if manifest == nil {
 		manifest = &journalManifest{}
@@ -571,7 +587,7 @@ func (j *Journal) StageManifestSegment(
 		return ManifestSegment{}, ErrJournalConflict
 	}
 	if index != len(manifest.segments) || page.Segment.FirstParticipant != manifest.participantCount ||
-		manifest.encodedBytes+uint64(len(raw)) > MaxManifestBytes || j.coordinators[id] != nil {
+		!manifestPageWithinDescriptor(manifest, page, len(raw), coordinator.manifest) {
 		return ManifestSegment{}, ErrJournalConflict
 	}
 	first := &page.Participants[0]
@@ -599,8 +615,45 @@ func (j *Journal) StageManifestSegment(
 	return page.Segment, nil
 }
 
-// StageManifestCoordinator seals the complete page set into a fixed-size
-// staging record. No additional page can be appended after this point.
+func manifestPageWithinDescriptor(
+	manifest *journalManifest,
+	page ManifestPage,
+	rawBytes int,
+	descriptor ManifestDescriptor,
+) bool {
+	if manifest == nil || !descriptor.valid() || rawBytes <= 0 ||
+		page.Segment.Index >= descriptor.SegmentCount {
+		return false
+	}
+	nextParticipants := manifest.participantCount + uint64(page.Segment.ParticipantCount)
+	nextBytes := manifest.encodedBytes + uint64(rawBytes)
+	nextSegments := uint32(len(manifest.segments)) + 1
+	if nextParticipants > descriptor.ParticipantCount || nextBytes > descriptor.EncodedBytes ||
+		nextSegments > descriptor.SegmentCount {
+		return false
+	}
+	if nextSegments == descriptor.SegmentCount {
+		if nextParticipants != descriptor.ParticipantCount || nextBytes != descriptor.EncodedBytes {
+			return false
+		}
+		candidate := ManifestDescriptor{
+			ParticipantCount: nextParticipants,
+			EncodedBytes:     nextBytes,
+			SegmentCount:     nextSegments,
+		}
+		candidate.Root = finishManifestRoot(
+			appendManifestChain(manifest.chain, page.Segment.Index, page.Segment.Digest),
+			candidate,
+		)
+		return candidate == descriptor
+	}
+	return nextParticipants < descriptor.ParticipantCount && nextBytes < descriptor.EncodedBytes
+}
+
+// StageManifestCoordinator durably begins a segmented coordinator with its
+// exact descriptor and recovery deadline. Ordered pages may be appended only
+// while this coordinator remains staging; commit is refused until the page set
+// exactly matches the descriptor.
 func (j *Journal) StageManifestCoordinator(raw []byte) (Status, error) {
 	record, err := OpenManifestCoordinator(raw)
 	if err != nil || record.State != CoordinatorStaging {
@@ -614,7 +667,7 @@ func (j *Journal) StageManifestCoordinator(raw []byte) (Status, error) {
 		}
 		return Status{}, ErrJournalConflict
 	}
-	if j.manifestDescriptor(record.ID) != record.Manifest {
+	if manifest := j.manifests[record.ID]; manifest != nil && len(manifest.segments) != 0 {
 		return Status{}, ErrJournalConflict
 	}
 	if err := j.writeEntryLocked(
@@ -627,6 +680,7 @@ func (j *Journal) StageManifestCoordinator(raw []byte) (Status, error) {
 	j.coordinators[record.ID] = &journalRecord{
 		status: status, stage: bytes.Clone(raw), manifest: record.Manifest, hasManifest: true,
 	}
+	j.manifests[record.ID] = &journalManifest{}
 	return status, nil
 }
 
@@ -643,6 +697,9 @@ func (j *Journal) SealManifestCoordinator(
 	record := j.coordinators[id]
 	if record == nil || !record.hasManifest {
 		return Status{}, ErrJournalNotFound
+	}
+	if next == CoordinatorCommitted && j.manifestDescriptor(id) != record.manifest {
+		return Status{}, ErrJournalConflict
 	}
 	if record.status.Revision == expected+1 && record.status.CoordinatorState == next {
 		return record.status, nil

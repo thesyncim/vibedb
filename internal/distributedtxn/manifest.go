@@ -50,9 +50,21 @@ type ManifestDescriptor struct {
 }
 
 func (d ManifestDescriptor) valid() bool {
-	return d.ParticipantCount != 0 && d.EncodedBytes != 0 &&
-		d.EncodedBytes <= MaxManifestBytes && d.SegmentCount != 0 &&
-		uint64(d.SegmentCount) <= d.ParticipantCount && d.Root != (Digest{})
+	if d.ParticipantCount == 0 || d.SegmentCount == 0 ||
+		uint64(d.SegmentCount) > d.ParticipantCount || d.Root == (Digest{}) {
+		return false
+	}
+	segments := uint64(d.SegmentCount)
+	if d.ParticipantCount > segments*uint64(MaxManifestPageParticipants) {
+		return false
+	}
+	// Every page has a header and checksum. Its first identity needs at least
+	// one distribution and shard byte; every later distinct identity needs at
+	// least one suffix byte in addition to the fixed entry.
+	minimumBytes := d.ParticipantCount*(manifestEntryFixedBytes+1) +
+		segments*(manifestSegmentHeaderBytes+4+1)
+	return d.EncodedBytes >= minimumBytes && d.EncodedBytes <= MaxManifestBytes &&
+		d.EncodedBytes <= segments*ManifestSegmentBytes
 }
 
 // ManifestSegment describes one borrowed encoded page.

@@ -169,6 +169,27 @@ func TestManifestRejectsReorderedInputAndResourceByteOverflow(t *testing.T) {
 	}
 }
 
+func TestManifestDescriptorRejectsImpossiblePageGeometry(t *testing.T) {
+	descriptor := ManifestDescriptor{
+		ParticipantCount: 1, EncodedBytes: 1, SegmentCount: 1, Root: Digest{1},
+	}
+	if _, err := NewManifestReader(descriptor); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("NewManifestReader impossible descriptor = %v", err)
+	}
+	if _, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 1, Manifest: descriptor,
+	}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("AppendManifestCoordinator impossible descriptor = %v", err)
+	}
+
+	descriptor.EncodedBytes = ManifestSegmentBytes
+	descriptor.ParticipantCount = uint64(MaxManifestPageParticipants + 1)
+	if descriptor.valid() {
+		t.Fatal("one-page descriptor admitted more participants than a page can encode")
+	}
+}
+
 func TestManifestRejectsReorderedSparseTruncatedAndOversizedPages(t *testing.T) {
 	descriptor, pages := buildManifest(t, 4097)
 	participants := make([]ParticipantRef, MaxManifestPageParticipants)
