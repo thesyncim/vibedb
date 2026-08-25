@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -19,10 +20,14 @@ type sqliteEngine struct {
 	deleteStmt  *sql.Stmt
 	scanStmt    *sql.Stmt
 	filterStmt  *sql.Stmt
-	indexedStmt *sql.Stmt
+	indexedStmt [MaximumExactIndexes]*sql.Stmt
+	indexedPlan [MaximumExactIndexes]bool
 }
 
 func newSQLite(cfg Config) (Engine, error) {
+	if err := validateEngineExactIndexes("sqlite", cfg.ExactIndexes); err != nil {
+		return nil, err
+	}
 	mode, err := ResolveDurabilityMode("sqlite", cfg.Durability)
 	if err != nil {
 		return nil, err
@@ -81,17 +86,20 @@ func newSQLite(cfg Config) (Engine, error) {
 	// in both configurations; only the index over it is conditional. A VIRTUAL
 	// generated column costs no storage — SQLite evaluates json_extract on
 	// read — so the unindexed configuration is not paying for it at rest.
-	schema := `CREATE TABLE docs (
-		k TEXT PRIMARY KEY,
-		doc TEXT NOT NULL,
-		country TEXT GENERATED ALWAYS AS (json_extract(doc, '$.country')) VIRTUAL
-	) WITHOUT ROWID;`
+	schema := `CREATE TABLE docs (k TEXT PRIMARY KEY, doc TEXT NOT NULL`
+	for i := range int(cfg.ExactIndexes) {
+		definition := ExactIndexDefinitions[i]
+		schema += fmt.Sprintf(", %s TEXT GENERATED ALWAYS AS (json_extract(doc, '%s')) VIRTUAL",
+			definition.Name, definition.SQLitePath)
+	}
+	schema += `) WITHOUT ROWID;`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if cfg.Indexed {
-		if _, err := db.Exec(`CREATE INDEX idx_country ON docs(country)`); err != nil {
+	for i := range int(cfg.ExactIndexes) {
+		name := ExactIndexDefinitions[i].Name
+		if _, err := db.Exec(fmt.Sprintf("CREATE INDEX idx_%s ON docs(%s)", name, name)); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -133,13 +141,47 @@ func (s *sqliteEngine) prepare() error {
 		`SELECT count(*) FROM docs WHERE json_extract(doc, '$.country') = ?`); err != nil {
 		return err
 	}
-	if s.cfg.Indexed {
-		if s.indexedStmt, err = s.db.Prepare(
-			`SELECT count(*) FROM docs WHERE country = ?`); err != nil {
+	for i := range int(s.cfg.ExactIndexes) {
+		name := ExactIndexDefinitions[i].Name
+		if s.indexedStmt[i], err = s.db.Prepare(fmt.Sprintf(
+			"SELECT count(*) FROM docs WHERE %s = ?", name,
+		)); err != nil {
 			return err
+		}
+		s.indexedPlan[i], err = s.sqliteExactIndexPlan(uint8(i))
+		if err != nil {
+			return err
+		}
+		if !s.indexedPlan[i] {
+			return fmt.Errorf("SQLite exact index %q did not bound its query", name)
 		}
 	}
 	return nil
+}
+
+func (s *sqliteEngine) sqliteExactIndexPlan(index uint8) (bool, error) {
+	if s == nil || index >= s.cfg.ExactIndexes || index >= MaximumExactIndexes {
+		return false, ErrNoIndex
+	}
+	name := ExactIndexDefinitions[index].Name
+	rows, err := s.db.Query(fmt.Sprintf(
+		"EXPLAIN QUERY PLAN SELECT count(*) FROM docs WHERE %s = ?", name,
+	), "probe")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	want := "USING INDEX idx_" + name
+	bounded := false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			return false, err
+		}
+		bounded = bounded || strings.Contains(detail, want)
+	}
+	return bounded, rows.Err()
 }
 
 func (s *sqliteEngine) Name() string { return "sqlite" }
@@ -323,12 +365,25 @@ func (s *sqliteEngine) FilterCount(value string) (int, error) {
 }
 
 func (s *sqliteEngine) IndexedCount(value string) (int, error) {
-	if s.indexedStmt == nil {
-		return 0, ErrNoIndex
+	probe, err := s.ProbeExactIndex(0, value)
+	return probe.Count, err
+}
+
+func (s *sqliteEngine) ProbeExactIndex(index uint8, value string) (ExactIndexProbe, error) {
+	if index >= s.cfg.ExactIndexes || index >= MaximumExactIndexes || s.indexedStmt[index] == nil {
+		return ExactIndexProbe{}, ErrNoIndex
 	}
 	var n int
-	err := s.indexedStmt.QueryRow(value).Scan(&n)
-	return n, err
+	if err := s.indexedStmt[index].QueryRow(value).Scan(&n); err != nil {
+		return ExactIndexProbe{}, err
+	}
+	probe := ExactIndexProbe{Count: n, IndexBounded: s.indexedPlan[index], IndexLookups: 1}
+	if !probe.IndexBounded {
+		return ExactIndexProbe{}, fmt.Errorf(
+			"SQLite exact index %q lost its bounded plan", ExactIndexDefinitions[index].Name,
+		)
+	}
+	return probe, nil
 }
 
 // Checkpoint moves every committed WAL frame into the database file and makes
@@ -375,7 +430,12 @@ func (s *sqliteEngine) MaintenanceFloorDescription() string {
 }
 
 func (s *sqliteEngine) Close() error {
-	for _, st := range []*sql.Stmt{s.getStmt, s.putStmt, s.upsertStmt, s.deleteStmt, s.scanStmt, s.filterStmt, s.indexedStmt} {
+	for _, st := range []*sql.Stmt{s.getStmt, s.putStmt, s.upsertStmt, s.deleteStmt, s.scanStmt, s.filterStmt} {
+		if st != nil {
+			_ = st.Close()
+		}
+	}
+	for _, st := range s.indexedStmt {
 		if st != nil {
 			_ = st.Close()
 		}

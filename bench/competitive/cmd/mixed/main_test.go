@@ -12,6 +12,7 @@ import (
 	"time"
 
 	competitive "github.com/thesyncim/vibedb/bench/competitive"
+	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -36,8 +37,31 @@ func TestOutputHeaderRequiresResolvedDurabilityAndCheckpoint(t *testing.T) {
 	if !contains("forced-cp") {
 		t.Fatalf("header omits forced checkpoint column: %q", out.String())
 	}
+	for _, column := range []string{"document-shape", "exact-indexes", "p99.9-us", "max-us", "durability-payload-known", "logical-write-B", "durability-payload-B", "durability-payload/logical"} {
+		if !contains(column) {
+			t.Fatalf("header omits %s column: %q", column, out.String())
+		}
+	}
 	if contains("sync") {
 		t.Fatalf("header retained ambiguous sync column: %q", out.String())
+	}
+}
+
+func TestMeasuredLogicalMutationBytesCountsSubmittedKeysAndValues(t *testing.T) {
+	docs := []competitive.Doc{
+		{Key: "a", JSON: []byte(`{"v":1}`)},
+		{Key: "bb", JSON: []byte(`{"v":22}`)},
+	}
+	choices := []int{opUpdate, opReadModifyWrite, opChurn, opRead}
+	states := []*clientState{{
+		warmupOps: 1, measuredOps: 3,
+		keyTrace: []int{0, 1, 0, 1},
+	}}
+	// RMW(bb) submits key+value, churn(a) submits delete key plus upsert
+	// key+value, and the final read contributes no logical mutation bytes.
+	want := uint64(len("bb") + len(docs[1].JSON) + 2*len("a") + len(docs[0].JSON))
+	if got := measuredLogicalMutationBytes(states, choices, docs); got != want {
+		t.Fatalf("logical mutation bytes=%d want=%d", got, want)
 	}
 }
 
@@ -80,6 +104,9 @@ func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T
 	got := buildTelemetryRecord(
 		"vibedb", 8, runtimeBefore, runtimeAfter,
 		durableBefore, durableAfter, true,
+		qualifyDurabilityPayload(
+			competitive.DurabilityOrdinarySync, true, durableBefore, durableAfter,
+		),
 	)
 	if got.Engine != "vibedb" || got.Clients != 8 || !got.Available ||
 		got.RuntimeTotalAllocBytes != 75 || got.RuntimeMallocs != 7 ||
@@ -89,7 +116,7 @@ func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T
 		got.JournalSyncs != 8 || got.JournalGroupMaxBefore != 6 ||
 		got.JournalGroupMax != 14 || got.JournalDeltaRecords != 50 ||
 		got.JournalDeltaBytes != 12_288 || got.JournalDeltaFallbacks != 2 ||
-		got.DeviceBytes != 16_384 {
+		!got.DurabilityPayloadKnown || got.DurabilityPayloadBytes != 16_384 {
 		t.Fatalf("telemetry = %+v", got)
 	}
 	stripe := got.Histograms["concurrent-stripe-wait-ns"]
@@ -101,6 +128,100 @@ func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T
 	if got := counterDelta(10, 9); got != 0 {
 		t.Fatalf("reset counter delta = %d, want 0", got)
 	}
+	if delta, known := counterDeltaKnown(10, 9); delta != 0 || known {
+		t.Fatalf("reset payload delta = %d known=%t, want 0,false", delta, known)
+	}
+	durableAfter.DeviceBytes = durableBefore.DeviceBytes - 1
+	regressed := buildTelemetryRecord(
+		"vibedb", 8, runtimeBefore, runtimeAfter,
+		durableBefore, durableAfter, true,
+		qualifyDurabilityPayload(
+			competitive.DurabilityOrdinarySync, true, durableBefore, durableAfter,
+		),
+	)
+	if regressed.DurabilityPayloadKnown || regressed.DurabilityPayloadBytes != 0 {
+		t.Fatalf("regressed durability payload = %+v, want unknown zero", regressed)
+	}
+}
+
+func TestDurabilityPayloadQualificationIsIdenticalAcrossSurfaces(t *testing.T) {
+	before := durable.Stats{DeviceBytes: 100}
+	after := durable.Stats{DeviceBytes: 164}
+	tests := []struct {
+		name      string
+		mode      competitive.DurabilityMode
+		available bool
+		after     durable.Stats
+		known     bool
+		bytes     uint64
+	}{
+		{name: "ordinary-sync", mode: competitive.DurabilityOrdinarySync, available: true, after: after, known: true, bytes: 64},
+		{name: "power-safe", mode: competitive.DurabilityPowerSafe, available: true, after: after, known: true, bytes: 64},
+		{name: "buffered-visible", mode: competitive.DurabilityBufferedVisible, available: true, after: after},
+		{name: "stats-unavailable", mode: competitive.DurabilityOrdinarySync, available: false, after: after},
+		{name: "counter-regressed", mode: competitive.DurabilityOrdinarySync, available: true, after: durable.Stats{DeviceBytes: 99}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := qualifyDurabilityPayload(test.mode, test.available, before, test.after)
+			if payload.Known != test.known || payload.Bytes != test.bytes {
+				t.Fatalf("qualified payload = %+v, want known=%t bytes=%d", payload, test.known, test.bytes)
+			}
+			wantRatio := 0.0
+			if test.known {
+				wantRatio = float64(test.bytes) / 32
+			}
+			if got := payload.Ratio(32); got != wantRatio {
+				t.Fatalf("result-row ratio = %v, want %v", got, wantRatio)
+			}
+
+			record := buildTelemetryRecord(
+				"vibedb", 1, runtime.MemStats{}, runtime.MemStats{},
+				before, test.after, test.available, payload,
+			)
+			if record.DurabilityPayloadKnown != test.known || record.DurabilityPayloadBytes != test.bytes {
+				t.Fatalf("telemetry payload = %+v", record)
+			}
+			var encoded bytes.Buffer
+			if err := mixedtelemetry.Write(&encoded, record); err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := mixedtelemetry.Parse(encoded.Bytes())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.DurabilityPayloadKnown != test.known || decoded.DurabilityPayloadBytes != test.bytes {
+				t.Fatalf("telemetry JSON payload = %+v", decoded)
+			}
+			metrics := record.Metrics()
+			var metricKnown, metricBytes uint64
+			for _, metric := range metrics {
+				switch metric.Name {
+				case "payload-known":
+					metricKnown = metric.Value
+				case "payload-bytes":
+					metricBytes = metric.Value
+				}
+			}
+			if metricKnown != boolCounter(test.known) || metricBytes != test.bytes {
+				t.Fatalf("mixedsuite metrics known=%d bytes=%d", metricKnown, metricBytes)
+			}
+
+			var internal bytes.Buffer
+			writeVibeInternalStats(&internal, 1, before, test.after, test.available, payload)
+			want := fmt.Sprintf("durability-payload-known=%t durability-payload-bytes=%d", test.known, test.bytes)
+			if !strings.Contains(internal.String(), want) {
+				t.Fatalf("internal stderr = %q, want %q", internal.String(), want)
+			}
+		})
+	}
+}
+
+func boolCounter(value bool) uint64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func TestMutationCount(t *testing.T) {

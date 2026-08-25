@@ -18,7 +18,7 @@ func TestWriteParseRoundTripAmidDiagnostics(t *testing.T) {
 		JournalAcks: 30, JournalSyncs: 6,
 		JournalGroupMaxBefore: 3, JournalGroupMax: 7,
 		JournalDeltaRecords: 9, JournalDeltaBytes: 4096,
-		JournalDeltaFallbacks: 1, DeviceBytes: 8192,
+		JournalDeltaFallbacks: 1, DurabilityPayloadKnown: true, DurabilityPayloadBytes: 8192,
 		Histograms: map[string]Histogram{
 			"stripe-wait-ns": {
 				Count: 2, Sum: 30, MaxBefore: 9, Max: 20,
@@ -164,7 +164,9 @@ func (shortWriter) Write(p []byte) (int, error) {
 
 func TestMetricsOmitDurableCountersWhenUnavailable(t *testing.T) {
 	without := (Record{ScalarPatchAttempts: 99}).Metrics()
-	if len(without) != 2 || without[0].Scope != "runtime" || without[1].Scope != "runtime" {
+	if len(without) != 4 || without[0].Scope != "runtime" || without[1].Scope != "runtime" ||
+		without[2] != (Metric{Scope: "durability", Name: "payload-known"}) ||
+		without[3] != (Metric{Scope: "durability", Name: "payload-bytes"}) {
 		t.Fatalf("metrics without durable stats = %+v", without)
 	}
 	with := (Record{Available: true, ScalarPatchAttempts: 99}).Metrics()

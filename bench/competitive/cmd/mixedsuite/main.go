@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	competitive "github.com/thesyncim/vibedb/bench/competitive"
 	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -49,7 +50,8 @@ type config struct {
 	warmup              int
 	durability          string
 	checkpointMutations int
-	indexed             bool
+	exactIndexes        int
+	documentShape       string
 	cardinality         string
 	clients             int
 }
@@ -230,23 +232,24 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	fs := flag.NewFlagSet("mixedsuite", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		mixedBin     = fs.String("mixed-bin", "", "path to a prebuilt cmd/mixed binary")
-		engineNames  = fs.String("engines", defaultEngines, "comma-separated file-backed engines")
-		repetitions  = fs.Int("repetitions", 10, "recorded repetitions (10 is two complete five-engine Latin squares)")
-		conditioning = fs.Bool("conditioning", true, "run and discard one process per engine before recording")
-		diagnostic   = fs.Bool("allow-diagnostic", false, "allow fewer than 9 repetitions or forced checkpoints, marking output non-publishable")
-		seed         = fs.Int64("seed", defaultSeed, "deterministic base-order shuffle seed")
-		timeout      = fs.Duration("timeout", 15*time.Minute, "timeout for each isolated child process")
-		output       = fs.String("output", "-", "output path, created exclusively; - writes stdout")
-		workload     = fs.String("workload", "ycsb-a", "mixed workload")
-		corpus       = fs.Int("corpus", 10_000, "documents in the shared corpus")
-		operations   = fs.Int("operations", 20_000, "measured user operations")
-		warmup       = fs.Int("warmup", 2_000, "unmeasured warmup operations")
-		durability   = fs.String("durability", "buffered-visible", "explicit durability lane")
-		checkpoint   = fs.Int("checkpoint-mutations", 64, "checkpoint cadence in acknowledged mutations")
-		indexed      = fs.Bool("indexed", false, "maintain the country secondary index")
-		cardinality  = fs.String("cardinality", "low", "low or high corpus cardinality")
-		clients      = fs.Int("clients", 1, "concurrent worker goroutines per child (passed to cmd/mixed)")
+		mixedBin      = fs.String("mixed-bin", "", "path to a prebuilt cmd/mixed binary")
+		engineNames   = fs.String("engines", defaultEngines, "comma-separated file-backed engines")
+		repetitions   = fs.Int("repetitions", 10, "recorded repetitions (10 is two complete five-engine Latin squares)")
+		conditioning  = fs.Bool("conditioning", true, "run and discard one process per engine before recording")
+		diagnostic    = fs.Bool("allow-diagnostic", false, "allow fewer than 9 repetitions or forced checkpoints, marking output non-publishable")
+		seed          = fs.Int64("seed", defaultSeed, "deterministic base-order shuffle seed")
+		timeout       = fs.Duration("timeout", 15*time.Minute, "timeout for each isolated child process")
+		output        = fs.String("output", "-", "output path, created exclusively; - writes stdout")
+		workload      = fs.String("workload", "ycsb-a", "mixed workload")
+		corpus        = fs.Int("corpus", 10_000, "documents in the shared corpus")
+		operations    = fs.Int("operations", 20_000, "measured user operations")
+		warmup        = fs.Int("warmup", 2_000, "unmeasured warmup operations")
+		durability    = fs.String("durability", "buffered-visible", "explicit durability lane")
+		checkpoint    = fs.Int("checkpoint-mutations", 64, "checkpoint cadence in acknowledged mutations")
+		exactIndexes  = fs.Int("exact-indexes", 0, "number of simultaneous exact indexes (0-3)")
+		documentShape = fs.String("document-shape", "inline", "inline, mixed, or overflow-heavy")
+		cardinality   = fs.String("cardinality", "low", "low or high corpus cardinality")
+		clients       = fs.Int("clients", 1, "concurrent worker goroutines per child (passed to cmd/mixed)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -269,8 +272,13 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	shape, err := competitive.ParseDocumentShape(*documentShape)
+	if err != nil {
+		return config{}, err
+	}
 	if *repetitions < 1 || *timeout <= 0 || *corpus < 2 ||
-		*operations < 1 || *warmup < 0 || *checkpoint < 0 || *clients < 1 {
+		*operations < 1 || *warmup < 0 || *checkpoint < 0 || *clients < 1 ||
+		*exactIndexes < 0 || *exactIndexes > int(competitive.MaximumExactIndexes) {
 		return config{}, errors.New(
 			"-repetitions>=1, -timeout>0, -corpus>=2, -operations>=1, " +
 				"-warmup>=0, -checkpoint-mutations>=0, and -clients>=1 are required",
@@ -289,8 +297,8 @@ func parseFlags(args []string, stderr io.Writer) (config, error) {
 		seed:            *seed, timeout: *timeout, output: *output,
 		workload: *workload, corpus: *corpus, operations: *operations,
 		warmup: *warmup, durability: *durability,
-		checkpointMutations: *checkpoint, indexed: *indexed,
-		cardinality: *cardinality, clients: *clients,
+		checkpointMutations: *checkpoint, exactIndexes: *exactIndexes,
+		documentShape: shape.String(), cardinality: *cardinality, clients: *clients,
 	}, nil
 }
 
@@ -348,7 +356,8 @@ func executeMixed(
 		"-warmup=" + strconv.Itoa(cfg.warmup),
 		"-durability=" + cfg.durability,
 		"-checkpoint-mutations=" + strconv.Itoa(cfg.checkpointMutations),
-		"-indexed=" + strconv.FormatBool(cfg.indexed),
+		"-exact-indexes=" + strconv.Itoa(cfg.exactIndexes),
+		"-document-shape=" + cfg.documentShape,
 		"-cardinality=" + cfg.cardinality,
 		"-clients=" + strconv.Itoa(cfg.clients),
 	}
@@ -401,7 +410,48 @@ func executeMixed(
 			telemetry.Available, engine,
 		)
 	}
+	if err := validatePayloadAgreement(header, rows, telemetry); err != nil {
+		return nil, nil, mixedtelemetry.Record{}, err
+	}
 	return header, rows, telemetry, nil
+}
+
+func validatePayloadAgreement(
+	header []string,
+	rows []rawRow,
+	telemetry mixedtelemetry.Record,
+) error {
+	index := headerIndex(header)
+	knownAt, knownOK := index["durability-payload-known"]
+	bytesAt, bytesOK := index["durability-payload-B"]
+	ratioAt, ratioOK := index["durability-payload/logical"]
+	if !knownOK || !bytesOK || !ratioOK {
+		return errors.New("mixed output omits durability payload columns")
+	}
+	for _, row := range rows {
+		known, err := strconv.ParseBool(row.values[knownAt])
+		if err != nil {
+			return fmt.Errorf("parse durability payload known: %w", err)
+		}
+		payloadBytes, err := strconv.ParseUint(row.values[bytesAt], 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse durability payload bytes: %w", err)
+		}
+		ratio, err := strconv.ParseFloat(row.values[ratioAt], 64)
+		if err != nil {
+			return fmt.Errorf("parse durability payload ratio: %w", err)
+		}
+		if known != telemetry.DurabilityPayloadKnown || payloadBytes != telemetry.DurabilityPayloadBytes {
+			return fmt.Errorf(
+				"result/telemetry durability payload mismatch: row=%t/%d telemetry=%t/%d",
+				known, payloadBytes, telemetry.DurabilityPayloadKnown, telemetry.DurabilityPayloadBytes,
+			)
+		}
+		if !known && (payloadBytes != 0 || ratio != 0) {
+			return fmt.Errorf("unknown durability payload is not canonical false/zero: %d/%g", payloadBytes, ratio)
+		}
+	}
+	return nil
 }
 
 // environmentWith applies deterministic overrides without leaving duplicate
@@ -454,7 +504,8 @@ func parseMixedOutput(src []byte) ([]string, []rawRow, error) {
 	}
 	required := []string{
 		"engine", "durability", "workload", "operation",
-		"forced-cp", "total-ops/s", "p50-us", "p95-us", "p99-us",
+		"forced-cp", "total-ops/s", "p50-us", "p95-us", "p99-us", "p99.9-us", "max-us",
+		"durability-payload-known", "logical-write-B", "durability-payload-B", "durability-payload/logical",
 	}
 	index := headerIndex(header)
 	for _, name := range required {
@@ -468,15 +519,16 @@ func parseMixedOutput(src []byte) ([]string, []rawRow, error) {
 func validateMixedRows(cfg config, requested string, header []string, rows []rawRow) error {
 	index := headerIndex(header)
 	expected := map[string]string{
-		"durability": cfg.durability,
-		"workload":   cfg.workload,
-		"card":       cfg.cardinality,
-		"docs":       strconv.Itoa(cfg.corpus),
-		"measured":   strconv.Itoa(cfg.operations),
-		"warmup":     strconv.Itoa(cfg.warmup),
-		"checkpoint": strconv.Itoa(cfg.checkpointMutations),
-		"indexed":    strconv.FormatBool(cfg.indexed),
-		"clients":    strconv.Itoa(cfg.clients),
+		"durability":     cfg.durability,
+		"workload":       cfg.workload,
+		"card":           cfg.cardinality,
+		"document-shape": cfg.documentShape,
+		"docs":           strconv.Itoa(cfg.corpus),
+		"measured":       strconv.Itoa(cfg.operations),
+		"warmup":         strconv.Itoa(cfg.warmup),
+		"checkpoint":     strconv.Itoa(cfg.checkpointMutations),
+		"exact-indexes":  strconv.Itoa(cfg.exactIndexes),
+		"clients":        strconv.Itoa(cfg.clients),
 	}
 	for name := range expected {
 		if _, ok := index[name]; !ok {
@@ -573,7 +625,10 @@ func writeTelemetrySummaries(w io.Writer, records []telemetryRunRecord) {
 
 func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 	index := headerIndex(header)
-	groupColumns := []string{"engine", "durability", "workload", "card", "operation"}
+	groupColumns := []string{
+		"engine", "durability", "workload", "card", "document-shape",
+		"exact-indexes", "clients", "operation", "durability-payload-known",
+	}
 	for _, name := range groupColumns {
 		if _, ok := index[name]; !ok {
 			return fmt.Errorf("cannot summarize without column %q", name)
@@ -582,8 +637,8 @@ func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 	excluded := map[string]bool{
 		"engine": true, "durability": true, "workload": true,
 		"card": true, "docs": true, "measured": true, "warmup": true,
-		"checkpoint": true, "indexed": true, "operation": true,
-		"clients": true,
+		"checkpoint": true, "exact-indexes": true, "document-shape": true, "operation": true,
+		"clients": true, "durability-payload-known": true,
 	}
 	var metrics []string
 	for _, name := range header {
@@ -755,7 +810,8 @@ func collectMetadata(cfg config, args []string, started time.Time) map[string]st
 		"warmup":               strconv.Itoa(cfg.warmup),
 		"durability":           cfg.durability,
 		"checkpoint-mutations": strconv.Itoa(cfg.checkpointMutations),
-		"indexed":              strconv.FormatBool(cfg.indexed),
+		"exact-indexes":        strconv.Itoa(cfg.exactIndexes),
+		"document-shape":       cfg.documentShape,
 		"cardinality":          cfg.cardinality,
 		"clients":              strconv.Itoa(cfg.clients),
 	}

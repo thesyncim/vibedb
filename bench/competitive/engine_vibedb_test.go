@@ -244,6 +244,30 @@ func TestVibeDBBufferedVisibleUsesFilesystemCheckpointLane(t *testing.T) {
 	}
 }
 
+func TestVibeDBExactIndexAndDocumentBounds(t *testing.T) {
+	engine, err := newVibeDB(Config{
+		Durability:       DurabilityBufferedVisible,
+		ExactIndexes:     3,
+		MaxDocumentBytes: heavyOverflowDocumentBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := engine.(*vibeDBEngine).options()
+	if options.MaxDocumentBytes != heavyOverflowDocumentBytes || len(options.Indexes) != 3 {
+		t.Fatalf("options: max-document=%d indexes=%d", options.MaxDocumentBytes, len(options.Indexes))
+	}
+	for i, index := range options.Indexes {
+		definition := ExactIndexDefinitions[i]
+		if index.Name != definition.Name || len(index.Paths) != 1 || index.Paths[0] != definition.JSONPointer {
+			t.Fatalf("index %d = %+v, want %+v", i, index, definition)
+		}
+	}
+	if _, err := newVibeDB(Config{ExactIndexes: MaximumExactIndexes + 1}); err == nil {
+		t.Fatal("accepted an unmatchable exact-index count")
+	}
+}
+
 func TestVibeDBScanAllBytesWarmedAllocatesNothing(t *testing.T) {
 	factory, ok := FactoryNamed("vibedb")
 	if !ok {
