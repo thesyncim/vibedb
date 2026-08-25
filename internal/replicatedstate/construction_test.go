@@ -170,13 +170,17 @@ func TestBindingAndUserNameRejectEmbeddedNUL(t *testing.T) {
 func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	system := createTargetAt(t, dir, "system", durable.Options{})
-	// The durable handle must itself honestly admit the replicated command
-	// envelope within its 64-MiB resident budget. An unbounded MaxBatchBytes
-	// advertises a 256-MiB multi-document transaction and correctly fails store
-	// construction before replicatedstate can apply its narrower wire cap.
+	// Give the durable handle a valid admission limit strictly wider than the
+	// replicated envelope. The machine must prove the minimum of the two; using
+	// an equal durable limit would not exercise the command cap at all.
 	user := createTargetAt(t, dir, "user", durable.Options{
-		MaxBatchBytes: replication.MaxCommandBytes,
+		ResidentBytes: 128 << 20,
+		MaxBatchBytes: replication.MaxCommandBytes + 1,
 	})
+	if user.Limits.MaxBatchBytes <= replication.MaxCommandBytes {
+		t.Fatalf("durable user batch limit = %d, want above command cap %d",
+			user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
+	}
 	log, err := durable.NewTxnLog(dir, durable.TxnLogOptions{})
 	if err != nil {
 		t.Fatal(err)

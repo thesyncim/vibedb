@@ -582,9 +582,9 @@ func bruteBatchOverflowExtentBytes(
 	return best
 }
 
-// referenceMinimumDistinctKeyBytes independently enumerates the literal byte
-// alphabet cardinality at each non-empty key width. It intentionally shares no
-// production shortest-key arithmetic with the bound under test.
+// referenceMinimumDistinctKeyBytes literally enumerates byte strings in
+// shortest-width order. It intentionally contains neither the production
+// closed form nor a 256^width cardinality calculation.
 func referenceMinimumDistinctKeyBytes(count, maxKeyBytes int) uint64 {
 	if count <= 0 {
 		return 0
@@ -592,20 +592,28 @@ func referenceMinimumDistinctKeyBytes(count, maxKeyBytes int) uint64 {
 	if maxKeyBytes <= 0 {
 		return math.MaxUint64
 	}
-	remaining := uint64(count)
-	spellings := uint64(256)
+	remaining := count
 	total := uint64(0)
 	for width := 1; width <= maxKeyBytes && remaining != 0; width++ {
-		take := min(remaining, spellings)
-		if take > (math.MaxUint64-total)/uint64(width) {
-			return math.MaxUint64
-		}
-		total += take * uint64(width)
-		remaining -= take
-		if spellings > math.MaxUint64/256 {
-			spellings = math.MaxUint64
-		} else {
-			spellings *= 256
+		key := make([]byte, width)
+		for {
+			if total > math.MaxUint64-uint64(len(key)) {
+				return math.MaxUint64
+			}
+			total += uint64(len(key))
+			remaining--
+			if remaining == 0 {
+				return total
+			}
+			at := len(key) - 1
+			for at >= 0 && key[at] == 0xff {
+				key[at] = 0
+				at--
+			}
+			if at < 0 {
+				break
+			}
+			key[at]++
 		}
 	}
 	if remaining != 0 {
@@ -666,11 +674,12 @@ func TestBatchOverflowExtentByteBoundMatchesAdversarialOracle(t *testing.T) {
 			}
 		})
 	}
-	if got := fileStoreMinimumDistinctKeyBytes(256, 2); got != 256 {
-		t.Fatalf("256 one-byte keys cost %d", got)
-	}
-	if got := fileStoreMinimumDistinctKeyBytes(257, 2); got != 258 {
-		t.Fatalf("257 shortest keys cost %d", got)
+	for count := 1; count <= 257; count++ {
+		got := fileStoreMinimumDistinctKeyBytes(count, 2)
+		want := referenceMinimumDistinctKeyBytes(count, 2)
+		if got != want {
+			t.Fatalf("%d shortest keys cost %d, literal enumeration %d", count, got, want)
+		}
 	}
 	if allocations := testing.AllocsPerRun(1_000, func() {
 		if fileStoreBatchOverflowExtentBytes(

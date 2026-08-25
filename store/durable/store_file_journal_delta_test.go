@@ -1152,10 +1152,26 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 		mutations       = checkpointEvery * checkpoints
 	)
 	options := journalDeltaTestOptions()
-	// The default indexed batch admits 1,224 pages. Keep the queue below the
-	// committer's fixed one-million-descriptor ceiling; journal headroom, not a
-	// giant visibility queue, is the dimension this test exercises.
-	options.QueueSlots = 512
+	// This lane submits exactly one bounded inline replacement at a time. Keep
+	// its advertised transaction shape exact so the 1,024-generation pressure
+	// queue measures journal rotations rather than preallocating multi-document
+	// descriptor capacity the workload cannot issue.
+	options.MaxBatchDocuments = 1
+	options.MaxDocumentBytes = 1 << 10
+	options.QueueSlots = 1024
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.MaxBatchDocuments != 1 || normalized.MaxDocumentBytes != 1<<10 ||
+		normalized.QueueSlots != 1024 {
+		t.Fatalf("point rotation bounds = docs:%d bytes:%d queue:%d",
+			normalized.MaxBatchDocuments, normalized.MaxDocumentBytes, normalized.QueueSlots)
+	}
+	if descriptors := fileVisibilitySlots(normalized.QueueSlots) * normalized.maxTransactionPages; descriptors > storeio.MaxCommitDescriptors {
+		t.Fatalf("point rotation descriptor arena = %d, maximum %d",
+			descriptors, storeio.MaxCommitDescriptors)
+	}
 	coll := buildTemplateHeavyOverlayCollection(
 		t, t.TempDir(), documents, options,
 	)
@@ -1207,10 +1223,10 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 			stats.JournalDeltaFullFallbacks)
 	}
 	if got, wantCheckpoints := stats.JournalDeltaCheckpoints-
-		baseline.JournalDeltaCheckpoints,
+		baseline.JournalDeltaCheckpoints+recycles,
 		uint64(checkpoints); got != wantCheckpoints {
-		t.Fatalf("delta checkpoints = %d, want %d (rotations=%d)",
-			got, wantCheckpoints, recycles)
+		t.Fatalf("delta checkpoints + rotations = %d, want %d",
+			got, wantCheckpoints)
 	}
 	target := coll.Generation()
 	if coll.DurableGeneration() != target {
@@ -1227,6 +1243,30 @@ func TestBufferedJournalDeltaSameKeyHeadroomRotatesAtExplicitFlush(t *testing.T)
 	}
 	if err := coll.file.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBufferedJournalBroadBatchAndDeepQueueFailDescriptorBound(t *testing.T) {
+	options := journalDeltaTestOptions()
+	options.QueueSlots = 1024
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptors := fileVisibilitySlots(normalized.QueueSlots) * normalized.maxTransactionPages
+	if descriptors <= storeio.MaxCommitDescriptors {
+		t.Fatalf("broad descriptor arena = %d, want above safety maximum %d",
+			descriptors, storeio.MaxCommitDescriptors)
+	}
+	path := filepath.Join(t.TempDir(), "broad-descriptor-bound.db")
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	if _, err := Create(file, options); !errors.Is(err, storeio.ErrTooManyPages) {
+		t.Fatalf("broad batch/deep queue construction error = %v, want %v",
+			err, storeio.ErrTooManyPages)
 	}
 }
 
