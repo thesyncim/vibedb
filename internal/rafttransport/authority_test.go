@@ -83,12 +83,15 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
 	removed := &pb.ConfState{Voters: []uint64{2, 3}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
-		if err := registry.PublishCommittedAuthority(group, 8, removed); err != nil {
+		// Normal entries may separate configuration entries, so authority
+		// versions are monotonic log positions rather than consecutive counters.
+		if err := registry.PublishCommittedAuthority(group, 11, removed); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if view, _ := target.currentAuthority(group); view.allowPrevious || view.previous != nil {
-		t.Fatal("source removal retained adjacent old-generation authority")
+	if view, _ := target.currentAuthority(group); view.allowPrevious || view.previous != nil ||
+		view.retiredVersion != 7 {
+		t.Fatal("source removal retained prior roles or lost exact retired version")
 	}
 	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalSource); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
 		t.Fatalf("removed-source frame = %v", err)

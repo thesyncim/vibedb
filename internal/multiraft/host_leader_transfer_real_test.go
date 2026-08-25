@@ -463,12 +463,12 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 }
 
 // isSafeRetiredGenerationDrop recognizes only an in-flight frame from the
-// immediately retired authority when both endpoints remain members of the
-// receiver's committed configuration. Source removal deliberately revokes the
+// exact authority retired by source removal when both endpoints remain members
+// of the receiver's committed configuration. Source removal deliberately revokes the
 // whole prior transport authority so the receiver must reject, rather than
 // authenticate, this frame. A real stream drops that rejected frame; the
 // deterministic harness must model the same behavior without masking a frame
-// from the removed source or an authority gap larger than one generation.
+// from the removed source or an unrelated stale authority.
 func (cluster *realTransferCluster) isSafeRetiredGenerationDrop(
 	receiverIndex int,
 	outbound raftmember.OutboundMessage,

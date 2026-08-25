@@ -20,7 +20,7 @@ var (
 	// statically registered source, or whose destination is not local.
 	ErrUnauthorized = errors.New("rafttransport: unauthorized Raft message")
 	// ErrRetiredAuthority identifies an otherwise bounded frame carrying the
-	// exact generation immediately preceding the receiver's committed one.
+	// exact authority generation revoked by the receiver's source removal.
 	// Callers may drop and recover from this class, but must still apply current
 	// membership checks before treating the rejection as benign.
 	ErrRetiredAuthority = errors.New("rafttransport: retired replica-set authority")
@@ -243,8 +243,8 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
 	}
 	if !ok {
-		if currentOK && header.version != math.MaxUint64 &&
-			current.version == header.version+1 &&
+		if currentOK && current.retiredVersion != 0 &&
+			current.retiredVersion == header.version &&
 			registry.validateAuthorizedMessage(header.group, current, message) == nil {
 			return Inbound{}, fmt.Errorf("%w: %w", ErrUnauthorized, ErrRetiredAuthority)
 		}
