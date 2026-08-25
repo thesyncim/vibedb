@@ -260,7 +260,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.hosts[3] = restartedHost
 	t.Cleanup(func() { _ = restartedHost.Close() })
 	cluster.inactive[3] = false
-	cluster.driveUntil(func() bool {
+	// Reopen restores the exact committed membership authority, but LeaderID is
+	// volatile Raft state. At a protocol-idle cut the restarted voter therefore
+	// needs one real heartbeat from the current leader before it can prove the
+	// same live leader as the other voters. Supply only leader ticks: no
+	// publication, authority, or applied-position witness is synthesized.
+	cluster.driveUntilWithLeaderTicks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		rejoined, rejoinedErr := hosts[3].Status(group)
 		publication, publicationErr := hosts[3].Publication(group)
