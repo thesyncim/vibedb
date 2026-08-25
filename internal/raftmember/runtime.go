@@ -656,7 +656,7 @@ func (runtime *Runtime) DurablePromotion(
 	if target == 0 {
 		return DurablePromotionProof{}, false, errors.New("raftmember: invalid promotion target")
 	}
-	publication := runtime.node.Published()
+	applied := runtime.node.PublishedApplied()
 	last, err := runtime.wal.LastIndex()
 	if err != nil {
 		return DurablePromotionProof{}, false, err
@@ -665,16 +665,16 @@ func (runtime *Runtime) DurablePromotion(
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
-	if commit <= publication.Applied {
-		runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+	if commit <= applied {
+		runtime.promotionScan = durablePromotionScan{applied: applied,
 			last: last, commit: commit, target: target, valid: true}
 		return DurablePromotionProof{}, false, nil
 	}
-	if cached := runtime.promotionScan; cached.valid && cached.applied == publication.Applied &&
+	if cached := runtime.promotionScan; cached.valid && cached.applied == applied &&
 		cached.last == last && cached.commit == commit && cached.target == target {
 		return cached.proof, cached.found, nil
 	}
-	first := publication.Applied + 1
+	first := applied + 1
 	lastCommitted := min(last, commit)
 	if span := lastCommitted - first + 1; span > raftmodel.MaxMessageEntries {
 		first = lastCommitted - raftmodel.MaxMessageEntries + 1
@@ -694,7 +694,7 @@ func (runtime *Runtime) DurablePromotion(
 			}
 			proof := DurablePromotionProof{Version: index, TargetMember: target,
 				AuthorizationDigest: digest}
-			runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+			runtime.promotionScan = durablePromotionScan{applied: applied,
 				last: last, commit: commit, target: target, proof: proof, found: true, valid: true}
 			return proof, true, nil
 		}
@@ -702,7 +702,7 @@ func (runtime *Runtime) DurablePromotion(
 			break
 		}
 	}
-	runtime.promotionScan = durablePromotionScan{applied: publication.Applied,
+	runtime.promotionScan = durablePromotionScan{applied: applied,
 		last: last, commit: commit, target: target, valid: true}
 	return DurablePromotionProof{}, false, nil
 }
