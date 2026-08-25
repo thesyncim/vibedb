@@ -296,6 +296,10 @@ func TestCollectionUpdateOverflowTopologyRetry(t *testing.T) {
 	options := primaryBatchOverflowOptions(DurabilitySync)
 	options.MaxBatchDocuments = documents
 	options.MaxBatchBytes = 4 << 20
+	// This test advertises 280 independently routed edits. Retain one
+	// maximum-size rewritten leaf per edit as required by atomic batch
+	// admission; 16 MiB only covered the former singleton-leaf undercount.
+	options.ResidentBytes = 32 << 20
 	options.Indexes = nil
 	collection, file := openBatchCollection(t, options)
 	values := make([][]byte, documents)

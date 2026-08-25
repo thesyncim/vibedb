@@ -526,6 +526,18 @@ func fileStoreTransactionExtentBytes(
 		uint64(remaining)*uint64(pageSize)
 }
 
+// fileStoreTransactionResidentBytes charges maximum-size dirty frames only for
+// page classes that can actually retain that width; every other descriptor is
+// a base-page metadata frame. Unlike persisted extent accounting, this excludes
+// alignment and routing-parent padding that never enters the resident cache.
+func fileStoreTransactionResidentBytes(
+	totalPages, maximumPages, pageSize, maxPageSize int,
+) uint64 {
+	maximum := min(max(0, maximumPages), max(0, totalPages))
+	return uint64(maximum)*uint64(maxPageSize) +
+		uint64(max(0, totalPages-maximum))*uint64(pageSize)
+}
+
 type normalizedFileStoreOptions struct {
 	Options
 	// maxTransactionBytes bounds resident dirty frame bytes. Persisted extent
@@ -942,16 +954,19 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// persisted checkpoint namespace is deliberately separate: routing parents
 	// can occupy wider physical extent classes without retaining those padded
 	// bytes in resident frames.
-	largePages := overflowPages + 1
+	batchLargePages := overflowPages + o.MaxBatchDocuments
+	singleDocumentLargePages := overflowPages + 1
 	if len(compiled) != 0 {
-		largePages++
+		batchLargePages++
+		singleDocumentLargePages++
 	}
-	metadataPages := docMaxTransactionPages - largePages
-	docMaxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
-		uint64(metadataPages)*uint64(o.PageSize)
-	singleDocumentMetadataPages := docSingleDocumentPages - largePages
-	docSingleDocumentBytes := uint64(largePages)*uint64(o.MaxPageSize) +
-		uint64(singleDocumentMetadataPages)*uint64(o.PageSize)
+	docMaxTransactionBytes := fileStoreTransactionResidentBytes(
+		docMaxTransactionPages, batchLargePages, o.PageSize, o.MaxPageSize,
+	)
+	docSingleDocumentBytes := fileStoreTransactionResidentBytes(
+		docSingleDocumentPages, singleDocumentLargePages,
+		o.PageSize, o.MaxPageSize,
+	)
 	// Exact-index maintenance stages, in the same transaction as the document
 	// mutation or checkpoint, the dirty term leaves the fold re-encoded plus
 	// each physical index's ordered catalog pages and one
