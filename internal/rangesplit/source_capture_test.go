@@ -346,6 +346,19 @@ func TestMaximumSourceCaptureRecordBytesExactAndBounded(t *testing.T) {
 	}
 }
 
+func TestMaximumSourceCaptureRecordBytesMatchesArtifactHostileBound(t *testing.T) {
+	got, err := MaximumSourceCaptureRecordBytes(
+		replicatedstate.MaxDistinctMutations,
+		replication.MaxMutationKeyBytes,
+		replication.MaxMutationValueBytes,
+		replication.MaxCommandBytes,
+	)
+	if err != nil || got != replicatedstate.MaxTransitionCaptureRecordBytes {
+		t.Fatalf("hostile capture bound = %d, %v; want %d", got, err,
+			replicatedstate.MaxTransitionCaptureRecordBytes)
+	}
+}
+
 func TestSourceCaptureBinaryPhysicalBytesExcludeBeforePayload(t *testing.T) {
 	for _, documentBytes := range []int{256, 1 << 10, 8 << 10} {
 		t.Run(fmt.Sprintf("documents_%d", documentBytes), func(t *testing.T) {

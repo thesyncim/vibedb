@@ -17,7 +17,7 @@ import (
 
 const (
 	snapshotBaseFormat              = uint16(1)
-	snapshotBaseHeaderBytes         = 272
+	snapshotBaseHeaderBytes         = 312
 	snapshotBaseRelationFixedBytes  = 48
 	snapshotBaseRelationDigestBytes = sha256.Size
 	MaxSnapshotBaseCertificateBytes = snapshotBaseHeaderBytes +
@@ -122,8 +122,10 @@ func buildSnapshotBaseFromCanonicalBootstrap(
 	copy(result[144:176], manifest.Digest[:])
 	copy(result[176:208], manifest.ImageDigest[:])
 	stateDigest := sha256.Sum256(stateBytes)
-	copy(result[208:240], stateDigest[:])
-	copy(result[240:272], bootstrapDigest[:])
+	copy(result[208:240], manifest.CaptureImageDigest[:])
+	copy(result[240:272], stateDigest[:])
+	copy(result[272:304], bootstrapDigest[:])
+	binary.LittleEndian.PutUint64(result[304:312], manifest.CaptureRows)
 	cursor := snapshotBaseHeaderBytes
 	cursor += copy(result[cursor:], stateBytes)
 	cursor += copy(result[cursor:], bootstrapBytes)
@@ -339,7 +341,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	userEnd := bootstrapEnd + int(userBytes)
 	stateRaw := data[cursor:stateEnd]
 	wantStateDigest := sha256.Sum256(stateRaw)
-	if !bytes.Equal(wantStateDigest[:], data[208:240]) {
+	if !bytes.Equal(wantStateDigest[:], data[240:272]) {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: state digest", ErrSnapshotBase)
 	}
 	state, err := OpenState(stateRaw)
@@ -355,7 +357,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	canonicalBootstrap, bootstrapDigest, err := validateBootstrap(bootstrap)
 	if err != nil || !bytes.Equal(canonicalBootstrap, bootstrapRaw) ||
 		bootstrapDigest != state.BootstrapDigest ||
-		!bytes.Equal(bootstrapDigest[:], data[240:272]) {
+		!bytes.Equal(bootstrapDigest[:], data[272:304]) {
 		return SnapshotBaseCertificate{}, fmt.Errorf("%w: static bootstrap identity", ErrSnapshotBase)
 	}
 	manifest := SnapshotArtifactManifest{
@@ -366,6 +368,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 		Chunks:           binary.LittleEndian.Uint64(data[32:40]),
 		SystemRows:       binary.LittleEndian.Uint64(data[40:48]),
 		UserRows:         binary.LittleEndian.Uint64(data[48:56]),
+		CaptureRows:      binary.LittleEndian.Uint64(data[304:312]),
 		PayloadBytes:     binary.LittleEndian.Uint64(data[56:64]),
 		EncodedBytes:     binary.LittleEndian.Uint64(data[64:72]),
 	}
@@ -373,6 +376,7 @@ func OpenSnapshotBase(snapshot *pb.Snapshot) (SnapshotBaseCertificate, error) {
 	copy(manifest.LastChunkDigest[:], data[112:144])
 	copy(manifest.Digest[:], data[144:176])
 	copy(manifest.ImageDigest[:], data[176:208])
+	copy(manifest.CaptureImageDigest[:], data[208:240])
 	if manifest.Bundle {
 		cursor = userEnd
 		if relationBodyBytes < sha256.Size {
@@ -452,6 +456,7 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 		manifest.EncodedBytes != 0 || manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
+		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) {
 		return fmt.Errorf("%w: seeded manifest", ErrSnapshotBase)
 	}
@@ -482,6 +487,7 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		manifest.HeaderDigest != ([sha256.Size]byte{}) ||
 		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
+		manifest.CaptureRows != 0 || manifest.CaptureImageDigest != ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
 		manifest.SystemRows != manifest.State.SessionCount+manifest.State.SessionSlotCount+
 			manifest.State.AuthorityBindingCount+1 ||

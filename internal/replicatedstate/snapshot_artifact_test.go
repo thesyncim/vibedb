@@ -62,7 +62,7 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	first, written := writeSnapshotArtifactFixture(t, snapshot)
 	// The artifact authenticates the apply contract; adding canonical
 	// conditional relation mutations intentionally changes this derived vector.
-	const golden = "d283e6033712a7807592af7b772699505f04993c902d8851ed08ab250e8ced64"
+	const golden = "011d562f93aa5a4765d574c2563b7b723a35138da32bf0064df3c48cff58b404"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}
@@ -297,7 +297,7 @@ func TestSnapshotArtifactDoesNotFragmentRowAboveTarget(t *testing.T) {
 func TestSnapshotArtifactExceptionalRowMatchesContiguousFraming(t *testing.T) {
 	key := bytes.Repeat([]byte{'k'}, 73)
 	value := bytes.Repeat([]byte{'v'}, MinSnapshotArtifactChunkBytes+211)
-	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	rowBytes, ok := snapshotArtifactRowBytes(SnapshotArtifactUser, key, value)
 	if !ok || rowBytes <= MinSnapshotArtifactChunkBytes {
 		t.Fatalf("exceptional row bytes = %d, %t", rowBytes, ok)
 	}
@@ -356,8 +356,9 @@ func TestSnapshotArtifactExceptionalRowMatchesContiguousFraming(t *testing.T) {
 func TestSnapshotArtifactMaximumRowDoesNotGrowAggregatePayload(t *testing.T) {
 	key := bytes.Repeat([]byte{'k'}, replication.MaxMutationKeyBytes)
 	value := bytes.Repeat([]byte{'v'}, replication.MaxMutationValueBytes)
-	rowBytes, ok := snapshotArtifactRowBytes(key, value)
-	if !ok || rowBytes != MaxSnapshotArtifactChunkBytes {
+	rowBytes, ok := snapshotArtifactRowBytes(SnapshotArtifactUser, key, value)
+	if !ok || rowBytes != replication.MaxMutationKeyBytes+
+		replication.MaxMutationValueBytes+snapshotArtifactRowHeaderBytes {
 		t.Fatalf("maximum row bytes = %d, %t", rowBytes, ok)
 	}
 	payload := make([]byte, 0, DefaultSnapshotArtifactChunkBytes)
@@ -374,15 +375,52 @@ func TestSnapshotArtifactMaximumRowDoesNotGrowAggregatePayload(t *testing.T) {
 		t.Fatalf("maximum row grew aggregate payload: len/cap %d/%d", len(writer.payload), cap(writer.payload))
 	}
 	if writer.chunks != 1 || writer.userRows != 1 ||
-		writer.payloadBytes != uint64(MaxSnapshotArtifactChunkBytes) {
+		writer.payloadBytes != uint64(rowBytes) {
 		t.Fatalf("maximum row counters = %+v", writer)
+	}
+}
+
+func TestSnapshotArtifactCaptureRowExactHostileBound(t *testing.T) {
+	key := []byte{'k'}
+	value := make([]byte, MaxTransitionCaptureRecordBytes)
+	rowBytes, ok := snapshotArtifactRowBytes(SnapshotArtifactCapture, key, value)
+	if !ok || rowBytes != snapshotArtifactRowHeaderBytes+len(key)+len(value) {
+		t.Fatalf("exact capture row = %d/%v", rowBytes, ok)
+	}
+	value = append(value, 0)
+	if _, ok := snapshotArtifactRowBytes(SnapshotArtifactCapture, key, value); ok {
+		t.Fatal("capture row above hostile bound accepted")
+	}
+}
+
+func TestVerifySnapshotArtifactRecomputesCaptureImageDigest(t *testing.T) {
+	_, snapshot := snapshotArtifactFixture(t)
+	artifact, _ := writeSnapshotArtifactFixture(t, snapshot)
+	footer := artifact[len(artifact)-snapshotArtifactFooterBytes:]
+	footer[168] ^= 1
+	digest := snapshotArtifactDigest(snapshotArtifactFooterDomain, footer[:208])
+	copy(footer[208:240], digest[:])
+	if _, err := VerifySnapshotArtifact(bytes.NewReader(artifact), SnapshotArtifactCallbacks{}); !errors.Is(err, ErrSnapshotArtifact) {
+		t.Fatalf("self-consistent wrong capture digest error = %v", err)
+	}
+}
+
+func TestSnapshotArtifactRejectsDualBorrowedRowConsumers(t *testing.T) {
+	_, snapshot := snapshotArtifactFixture(t)
+	artifact, _ := writeSnapshotArtifactFixture(t, snapshot)
+	_, err := VerifySnapshotArtifact(bytes.NewReader(artifact), SnapshotArtifactCallbacks{
+		Row:  func(SnapshotArtifactCollection, []byte, []byte) error { return nil },
+		Rows: func(SnapshotArtifactCheckpoint, SnapshotArtifactRows) error { return nil },
+	})
+	if !errors.Is(err, ErrSnapshotArtifact) {
+		t.Fatalf("dual row consumers error = %v", err)
 	}
 }
 
 func TestSnapshotArtifactExceptionalRowHandlesEverySegmentShortWrite(t *testing.T) {
 	key := bytes.Repeat([]byte{'k'}, 41)
 	value := bytes.Repeat([]byte{'v'}, MinSnapshotArtifactChunkBytes+17)
-	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	rowBytes, ok := snapshotArtifactRowBytes(SnapshotArtifactUser, key, value)
 	if !ok {
 		t.Fatal("exceptional short-write row is invalid")
 	}

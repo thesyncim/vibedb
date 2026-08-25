@@ -627,14 +627,15 @@ func (m *Machine) appendSessionCompletion(
 	})
 }
 
-// ReadSnapshot pins the sole user collection and its hidden state collection
-// at one publication cut.
+// ReadSnapshot pins the sole user collection, hidden state, and reserved
+// transition-capture participant at one publication cut.
 type ReadSnapshot struct {
 	cut              durable.DatabaseSnapshot
 	publication      raftmodel.Publication
 	state            State
 	manifestDigest   [32]byte
 	userName         string
+	captureName      string
 	validation       ValidationProfile
 	validationDigest [32]byte
 	validator        MutationValidator
@@ -695,6 +696,22 @@ func (s *ReadSnapshot) Collection(name string) (*durable.Snapshot, bool) {
 	return s.cut.Collection(name)
 }
 
+// RangeCapture exports the private transition-capture image from the same
+// database snapshot cut as RangeSystem and the user collection.
+func (s *ReadSnapshot) RangeCapture(fn func(key, value []byte) error) error {
+	if s == nil || fn == nil {
+		return ErrInconsistentSnapshot
+	}
+	if s.captureName == "" {
+		return nil
+	}
+	snapshot, ok := s.cut.Collection(s.captureName)
+	if !ok || snapshot == nil {
+		return ErrInconsistentSnapshot
+	}
+	return snapshot.RangeRaw(fn)
+}
+
 // RangeSystem exports the bounded canonical system key/value image used by the
 // portable snapshot artifact. Callback bytes are borrowed for the call.
 func (s *ReadSnapshot) RangeSystem(fn func(key, value []byte) error) error {
@@ -724,7 +741,7 @@ func (s *ReadSnapshot) CanonicalImageDigest() ([32]byte, error) {
 	)
 }
 
-// Close releases both generation leases. It is idempotent.
+// Close releases every pinned collection-generation lease. It is idempotent.
 func (s *ReadSnapshot) Close() error {
 	if s == nil {
 		return nil
@@ -733,9 +750,10 @@ func (s *ReadSnapshot) Close() error {
 	return s.closeErr
 }
 
-// Snapshot captures the sole user collection plus the hidden state row under
-// the Machine publication lock. names may be empty or contain exactly the sole
-// user name; the system collection is always included automatically.
+// Snapshot captures the sole user collection, hidden system state, and the
+// private transition-capture participant under the Machine publication lock.
+// names may be empty or contain exactly the sole user name; system and capture
+// are automatic, and capture remains inaccessible through ReadSnapshot.Collection.
 func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -771,7 +789,8 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	return &ReadSnapshot{
 		cut: cut, publication: clonePublication(m.publication), state: cloneState(m.state),
 		manifestDigest: m.manifestDigest,
-		userName:       m.userName, validation: m.user.Validation,
+		userName:       m.userName, captureName: m.reservedCaptureTarget.Name,
+		validation:       m.user.Validation,
 		validationDigest: m.user.ValidationDigest, validator: m.user.Validator,
 	}, nil
 }

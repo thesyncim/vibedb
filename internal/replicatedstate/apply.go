@@ -376,6 +376,27 @@ func (m *Machine) InstallSnapshot(snapshot *pb.Snapshot) (raftmodel.Publication,
 		certificate.Manifest.UserRows != m.user.Collection.Len() {
 		return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
 	}
+	if !certificate.Manifest.Seeded && !certificate.Manifest.Bundle {
+		capture := m.reservedCaptureTarget.Collection
+		if capture == nil && (certificate.Manifest.CaptureRows != 0 ||
+			certificate.Manifest.CaptureImageDigest != snapshotArtifactEmptyCaptureImageDigest()) {
+			return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+		}
+		if capture != nil {
+			if capture.Len() != certificate.Manifest.CaptureRows {
+				return raftmodel.Publication{}, m.fail(ErrSnapshotBase)
+			}
+			snapshot, err := capture.Snapshot()
+			if err != nil {
+				return raftmodel.Publication{}, m.fail(err)
+			}
+			digest, digestErr := snapshotArtifactOpaqueImageDigest(snapshot)
+			closeErr := snapshot.Close()
+			if digestErr != nil || closeErr != nil || digest != certificate.Manifest.CaptureImageDigest {
+				return raftmodel.Publication{}, m.fail(errors.Join(ErrSnapshotBase, digestErr, closeErr))
+			}
+		}
+	}
 	imageDigest, imageErr := m.snapshotBaseImageDigest()
 	if imageErr != nil || certificate.Manifest.ImageDigest != imageDigest {
 		return raftmodel.Publication{}, m.fail(errors.Join(ErrSnapshotBase, imageErr))

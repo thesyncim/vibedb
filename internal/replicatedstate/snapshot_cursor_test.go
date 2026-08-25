@@ -37,10 +37,10 @@ func TestSnapshotArtifactCursorRoundTripAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantGolden := [sha256.Size]byte{
-		0x38, 0x99, 0x46, 0x35, 0x74, 0xb6, 0x5d, 0x5d,
-		0x0d, 0x26, 0x41, 0x48, 0xda, 0x6d, 0xe1, 0x78,
-		0x2d, 0xb0, 0x3e, 0x70, 0x00, 0xa9, 0xc1, 0x68,
-		0xf7, 0x32, 0x10, 0x47, 0xbd, 0xca, 0x02, 0x41,
+		0x9b, 0x2f, 0x95, 0xf6, 0xf4, 0x33, 0x26, 0x71,
+		0x4f, 0x21, 0x4e, 0xe1, 0x2e, 0x84, 0xe9, 0x20,
+		0x74, 0xb8, 0x3b, 0x2a, 0x19, 0xf2, 0x6b, 0xfa,
+		0x04, 0x83, 0xf6, 0xb1, 0xb7, 0x42, 0x91, 0x9d,
 	}
 	if got := sha256.Sum256(encoded); got != wantGolden {
 		t.Fatalf("cursor golden digest = %s, want %s",
@@ -146,6 +146,21 @@ func TestSnapshotArtifactCursorStrictCorruptionAndTruncation(t *testing.T) {
 	copy(resealed[len(resealed)-sha256.Size:], digest[:])
 	if _, err := OpenSnapshotArtifactCursor(resealed); !errors.Is(err, ErrSnapshotArtifact) {
 		t.Fatalf("resealed impossible offset error = %v", err)
+	}
+}
+
+func TestSnapshotArtifactCursorRejectsForgedCapturePrefixCommitment(t *testing.T) {
+	_, _, cursor := snapshotArtifactCursorFixture(t)
+	encoded, err := AppendSnapshotArtifactCursor(nil, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := bytes.Clone(encoded)
+	forged[408] ^= 1
+	digest := snapshotArtifactDigest(snapshotArtifactCursorDomain, forged[:len(forged)-sha256.Size])
+	copy(forged[len(forged)-sha256.Size:], digest[:])
+	if _, err := OpenSnapshotArtifactCursor(forged); !errors.Is(err, ErrSnapshotArtifact) {
+		t.Fatalf("forged capture prefix error = %v", err)
 	}
 }
 

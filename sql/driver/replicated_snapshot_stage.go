@@ -92,7 +92,8 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		return activation, false, err
 	}
 	table := core.tables[expected.UserTable]
-	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil {
+	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil ||
+		core.replicatedCaptureCollection == nil {
 		return activation, false, fmt.Errorf("%w: durable activation collections", ErrReplicatedSnapshotStageProof)
 	}
 	identity, err := core.prepareReplicatedApplyStorageLocked(expected, applyOptions, nil)
@@ -123,6 +124,10 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		}}, core.txnLog, replicatedstate.Options{
 			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+			TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+				Name:       replicatedstate.TransitionCaptureCollectionName,
+				Collection: core.replicatedCaptureCollection,
+			},
 		},
 	)
 	if err != nil {
@@ -149,7 +154,8 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 		!bytes.Equal(currentEnvelope, expectedEnvelope) ||
 		!bytes.Equal(current.UserCollection, manifest.UserCollection) ||
 		current.ImageDigest != manifest.ImageDigest || current.SystemRows != manifest.SystemRows ||
-		current.UserRows != manifest.UserRows {
+		current.UserRows != manifest.UserRows || current.CaptureRows != manifest.CaptureRows ||
+		current.CaptureImageDigest != manifest.CaptureImageDigest {
 		return activation, false, errors.Join(
 			fmt.Errorf("%w: durable activation image", ErrReplicatedSnapshotStageProof),
 			writeErr, closeErr, currentErr, expectedErr,
@@ -280,6 +286,16 @@ func (d *Database) OpenReplicatedSnapshotStage(
 		return nil, identity, ErrReplicatedApplyMismatch
 	}
 	validatorClaim := &ReplicatedApply{owner: connector, database: core, table: t, identity: identity}
+	stageOptions.Capture = replicatedstate.CollectionTarget{
+		Collection: core.replicatedCaptureCollection,
+		Validation: replicatedstate.ValidationOpaqueBinary,
+		Limits: replicatedstate.CollectionLimits{
+			MaxKeyBytes:          core.replicatedCaptureCollection.MaxKeyBytes(),
+			MaxDocumentBytes:     core.replicatedCaptureCollection.MaxDocumentBytes(),
+			MaxDistinctMutations: core.replicatedCaptureCollection.MaxBatchDocuments(),
+			MaxBatchBytes:        core.replicatedCaptureCollection.MaxBatchBytes(),
+		},
+	}
 	stage, err := replicatedstate.NewSnapshotArtifactStageWithOptions(
 		manifest,
 		replicatedstate.CollectionTarget{

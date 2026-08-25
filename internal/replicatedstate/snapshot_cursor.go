@@ -12,7 +12,7 @@ import (
 
 const (
 	snapshotArtifactCursorFormat     = uint16(1)
-	snapshotArtifactCursorFixedBytes = 400
+	snapshotArtifactCursorFixedBytes = 440
 	maxSnapshotArtifactCursorBytes   = snapshotArtifactCursorFixedBytes +
 		MaxStateEnvelopeBytes + replication.MaxCollectionBytes + sha256.Size
 )
@@ -69,9 +69,11 @@ func AppendSnapshotArtifactCursor(
 	binary.LittleEndian.PutUint64(frame[56:64], cursor.manifest.SystemRows)
 	binary.LittleEndian.PutUint64(frame[64:72], cursor.manifest.UserRows)
 	binary.LittleEndian.PutUint64(frame[72:80], cursor.manifest.PayloadBytes)
-	copy(frame[80:112], cursor.manifest.HeaderDigest[:])
-	copy(frame[112:144], cursor.previousDigest[:])
-	copy(frame[144:144+int(cursor.previousKeyBytes)], cursor.previousKey[:cursor.previousKeyBytes])
+	binary.LittleEndian.PutUint64(frame[80:88], cursor.manifest.CaptureRows)
+	copy(frame[88:120], cursor.manifest.HeaderDigest[:])
+	copy(frame[120:152], cursor.previousDigest[:])
+	copy(frame[152:152+int(cursor.previousKeyBytes)], cursor.previousKey[:cursor.previousKeyBytes])
+	copy(frame[408:440], cursor.captureImageDigest[:])
 	at := snapshotArtifactCursorFixedBytes
 	at += copy(frame[at:], stateEnvelope)
 	copy(frame[at:], cursor.manifest.UserCollection)
@@ -101,7 +103,7 @@ func OpenSnapshotArtifactCursor(src []byte) (*SnapshotArtifactCursor, error) {
 		nameBytes == 0 || nameBytes > replication.MaxCollectionBytes ||
 		previousKeyBytes > replication.MaxMutationKeyBytes ||
 		uint64(snapshotArtifactCursorFixedBytes)+stateBytes+nameBytes+sha256.Size != uint64(len(src)) ||
-		!allZero(src[144+int(previousKeyBytes):snapshotArtifactCursorFixedBytes]) {
+		!allZero(src[152+int(previousKeyBytes):408]) {
 		return nil, fmt.Errorf("%w: cursor bounds", ErrSnapshotArtifactBound)
 	}
 	wantDigest := snapshotArtifactDigest(snapshotArtifactCursorDomain, src[:len(src)-sha256.Size])
@@ -125,6 +127,7 @@ func OpenSnapshotArtifactCursor(src []byte) (*SnapshotArtifactCursor, error) {
 			SystemRows:       binary.LittleEndian.Uint64(src[56:64]),
 			UserRows:         binary.LittleEndian.Uint64(src[64:72]),
 			PayloadBytes:     binary.LittleEndian.Uint64(src[72:80]),
+			CaptureRows:      binary.LittleEndian.Uint64(src[80:88]),
 		},
 		expectedStateDocument: bytes.Clone(stateEnvelope),
 		nextSequence:          binary.LittleEndian.Uint64(src[32:40]),
@@ -133,10 +136,11 @@ func OpenSnapshotArtifactCursor(src []byte) (*SnapshotArtifactCursor, error) {
 		currentCollection:     SnapshotArtifactCollection(src[28]),
 		stateRowSeen:          src[29] == 1,
 	}
-	copy(cursor.manifest.HeaderDigest[:], src[80:112])
-	copy(cursor.manifest.LastChunkDigest[:], src[112:144])
-	copy(cursor.previousDigest[:], src[112:144])
-	copy(cursor.previousKey[:], src[144:144+int(previousKeyBytes)])
+	copy(cursor.manifest.HeaderDigest[:], src[88:120])
+	copy(cursor.manifest.LastChunkDigest[:], src[120:152])
+	copy(cursor.previousDigest[:], src[120:152])
+	copy(cursor.previousKey[:], src[152:152+int(previousKeyBytes)])
+	copy(cursor.captureImageDigest[:], src[408:440])
 	if err := validateSnapshotArtifactCursor(cursor); err != nil {
 		return nil, err
 	}

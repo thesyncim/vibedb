@@ -90,9 +90,10 @@ func TestSnapshotBaseInstallBindsExactOpenedImage(t *testing.T) {
 			forged := cloneSnapshotArtifactManifest(manifest)
 			mutate(&forged)
 			_, forged.Digest = makeSnapshotArtifactFooter(
-				forged.Chunks, forged.SystemRows, forged.UserRows,
+				forged.Chunks, forged.SystemRows, forged.UserRows, forged.CaptureRows,
 				forged.PayloadBytes, forged.EncodedBytes,
 				forged.LastChunkDigest, forged.HeaderDigest, forged.ImageDigest,
+				forged.CaptureImageDigest,
 			)
 			base, err := BuildSnapshotBase(forged, source.bootstrap)
 			if err != nil {
@@ -132,9 +133,10 @@ func TestSnapshotBaseInstallAuditsImageAfterLiveApply(t *testing.T) {
 		forged := cloneSnapshotArtifactManifest(manifest)
 		forged.ImageDigest[0] ^= 1
 		_, forged.Digest = makeSnapshotArtifactFooter(
-			forged.Chunks, forged.SystemRows, forged.UserRows,
+			forged.Chunks, forged.SystemRows, forged.UserRows, forged.CaptureRows,
 			forged.PayloadBytes, forged.EncodedBytes,
 			forged.LastChunkDigest, forged.HeaderDigest, forged.ImageDigest,
+			forged.CaptureImageDigest,
 		)
 		base, err := BuildSnapshotBase(forged, machine.bootstrap)
 		if err != nil {

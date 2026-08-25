@@ -321,7 +321,7 @@ func BenchmarkWriteSnapshotArtifact(b *testing.B) {
 func BenchmarkWriteSnapshotArtifactExceptionalRow(b *testing.B) {
 	key := bytes.Repeat([]byte{'k'}, replication.MaxMutationKeyBytes)
 	value := bytes.Repeat([]byte{'v'}, replication.MaxMutationValueBytes)
-	rowBytes, ok := snapshotArtifactRowBytes(key, value)
+	rowBytes, ok := snapshotArtifactRowBytes(SnapshotArtifactUser, key, value)
 	if !ok || rowBytes != MaxSnapshotArtifactChunkBytes {
 		b.Fatalf("maximum exceptional row = %d, %t", rowBytes, ok)
 	}
