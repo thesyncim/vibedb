@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -28,7 +30,6 @@ type ReplicatedSnapshotStage struct {
 	database   *database
 	table      *table
 	base       ReplicatedShardStoreIdentity
-	options    ReplicatedApplyOptions
 	identity   ReplicatedApplyIdentity
 	expected   replicatedstate.SnapshotArtifactManifest
 	stage      *replicatedstate.SnapshotArtifactStage
@@ -138,14 +139,27 @@ func (d *Database) OpenReplicatedSnapshotStage(
 	if err != nil {
 		return nil, identity, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
+	manifest = ownedReplicatedSnapshotManifest(manifest)
 	claim := &ReplicatedSnapshotStage{owner: connector, database: core, table: t,
-		base: expected, options: applyOptions, identity: identity,
+		base: expected, identity: identity,
 		expected: manifest, stage: stage}
 	core.replicatedSnapshotStageClaim = claim
 	core.replicatedSeedPending = true
 	connector.exclusive = true
 	connector.refs++
 	return claim, identity, nil
+}
+
+func ownedReplicatedSnapshotManifest(
+	manifest replicatedstate.SnapshotArtifactManifest,
+) replicatedstate.SnapshotArtifactManifest {
+	manifest.UserCollection = bytes.Clone(manifest.UserCollection)
+	manifest.State.Binding.Distribution = strings.Clone(manifest.State.Binding.Distribution)
+	manifest.State.Binding.Shard = strings.Clone(manifest.State.Binding.Shard)
+	if manifest.State.ConfState != nil {
+		manifest.State.ConfState = proto.Clone(manifest.State.ConfState).(*pb.ConfState)
+	}
+	return manifest
 }
 
 func (s *ReplicatedSnapshotStage) Offset() uint64 {
@@ -188,7 +202,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed && s.activation.Apply != nil {
-		return s.activation, nil
+		return ownedReplicatedSnapshotActivation(s.activation), nil
 	}
 	if s.closed || s.stage == nil || s.owner == nil || s.database == nil {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageClosed
@@ -293,9 +307,19 @@ func (s *ReplicatedSnapshotStage) Activate(
 	core.replicatedSeedPending = true
 	result := ReplicatedChildActivation{Apply: claim, ApplyIdentity: s.identity,
 		SnapshotBase: base, ArtifactManifest: s.expected}
-	s.activation = result
+	s.activation = ownedReplicatedSnapshotActivation(result)
 	s.closed, s.stage = true, nil
-	return result, nil
+	return ownedReplicatedSnapshotActivation(result), nil
+}
+
+func ownedReplicatedSnapshotActivation(
+	activation ReplicatedChildActivation,
+) ReplicatedChildActivation {
+	activation.ArtifactManifest = ownedReplicatedSnapshotManifest(activation.ArtifactManifest)
+	if activation.SnapshotBase != nil {
+		activation.SnapshotBase = proto.Clone(activation.SnapshotBase).(*pb.Snapshot)
+	}
+	return activation
 }
 
 func (s *ReplicatedSnapshotStage) Close() error {

@@ -3,6 +3,7 @@ package snapshottransfer
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -96,6 +97,13 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	if err != nil {
 		_ = activation.Apply.Close()
 		return raftmember.RuntimeIdentity{}, err
+	}
+	currentIncarnation := wal.CurrentIncarnation()
+	if currentIncarnation == math.MaxUint64 ||
+		currentIncarnation+1 != plan.Descriptor.TargetIncarnation {
+		_ = wal.Close()
+		_ = activation.Apply.Close()
+		return raftmember.RuntimeIdentity{}, ErrLearnerInstall
 	}
 	runtime, err := raftmember.AdoptRuntime(wal, plan.Database, activation.Apply)
 	if err != nil {
