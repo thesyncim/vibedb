@@ -113,8 +113,11 @@ func TestReplicatedTableProfileRejectsIncompleteOrMismatchedCatalog(t *testing.T
 		name   string
 		mutate func(*distribution.ClusterConfig, *ReplicatedShardDescriptor, *ReplicatedTableProfile)
 	}{
-		{"relation", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
-			p.Relation = 2
+		{"zero-relation", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
+			p.Relation = 0
+		}},
+		{"large-relation", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
+			p.Relation = replication.MaxRelationID + 1
 		}},
 		{"primary", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
 			p.PrimaryKey = "/other"
@@ -167,6 +170,48 @@ func TestReplicatedTableProfileRejectsIncompleteOrMismatchedCatalog(t *testing.T
 		config, endpoints, 5, nil, nil, nil, []ReplicatedTableProfile{profile},
 	); !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("profile without routes = %v", err)
+	}
+}
+
+func TestReplicatedTableProfilesShareOneBundleWithDistinctRelations(t *testing.T) {
+	config, endpoints, descriptor, messages := testReplicatedTableInput(t)
+	config.Placements = append(config.Placements, distribution.TablePlacement{
+		Table: "accounts", Distribution: "data", Columns: []string{"/account_id"},
+	})
+	accounts := messages
+	accounts.Table = "accounts"
+	accounts.PrimaryKey = "/account_id"
+	accounts.Relation = 2
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{messages, accounts},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, ok := orderedkey.AppendString(nil, []byte("account-17"), orderedkey.Ascending)
+	if !ok {
+		t.Fatal("ordered key")
+	}
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
+	resolved, found := snapshot.ResolveReplicatedTableKey(
+		[]byte("accounts"), key, scalarScratch[:0], replicas[:0],
+	)
+	if !found || resolved.Profile.Relation != 2 || resolved.Profile.Table != "accounts" ||
+		resolved.Route.Group != descriptor.Group {
+		t.Fatalf("accounts route = %+v, %v", resolved, found)
+	}
+
+	duplicateSlot := accounts
+	duplicateSlot.Relation = messages.Relation
+	if _, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{messages, duplicateSlot},
+	); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("duplicate relation slot = %v", err)
 	}
 }
 

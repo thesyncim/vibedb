@@ -59,6 +59,11 @@ type unresolvedReplicatedCatalogTable struct {
 	planner uint32
 }
 
+type replicatedRelationSlot struct {
+	distribution distribution.DistributionName
+	relation     replication.RelationID
+}
+
 func (snapshot *Snapshot) attachReplicatedTableProfiles(
 	profiles []ReplicatedTableProfile,
 ) error {
@@ -70,7 +75,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 		return nil
 	}
 	unresolved := make([]unresolvedReplicatedCatalogTable, len(profiles))
-	distributions := make(map[distribution.DistributionName]struct{}, len(profiles))
+	relationSlots := make(map[replicatedRelationSlot]struct{}, len(profiles))
 	for ordinal := range profiles {
 		profile := profiles[ordinal]
 		plannerOrdinal, found := snapshot.plannerTableOrdinal(profile.Table)
@@ -84,7 +89,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 		primary, err := vibejson.CompilePointer(profile.PrimaryKey)
 		if len(profile.Table) == 0 || len(profile.Table) > replication.MaxIdentityBytes ||
 			!utf8.ValidString(profile.Table) || strings.IndexByte(profile.Table, 0) >= 0 ||
-			profile.Relation != 1 ||
+			profile.Relation == 0 || profile.Relation > replication.MaxRelationID ||
 			len(profile.PrimaryKey) == 0 || len(profile.PrimaryKey) > replication.MaxIdentityBytes ||
 			err != nil || len(primary.Tokens) == 0 || primary.String() != profile.PrimaryKey ||
 			len(placement.Columns) != 1 || placement.Columns[0] != profile.PrimaryKey ||
@@ -98,12 +103,17 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 				profile.Table,
 			)}
 		}
-		if _, duplicate := distributions[placement.Distribution]; duplicate {
+		slot := replicatedRelationSlot{
+			distribution: placement.Distribution,
+			relation:     profile.Relation,
+		}
+		if _, duplicate := relationSlots[slot]; duplicate {
 			return &CatalogError{Reason: fmt.Sprintf(
-				"distribution %q has more than one base relation", placement.Distribution,
+				"distribution %q assigns relation %d to more than one table",
+				placement.Distribution, profile.Relation,
 			)}
 		}
-		distributions[placement.Distribution] = struct{}{}
+		relationSlots[slot] = struct{}{}
 		manifest := snapshot.config.Manifests[entry.manifest]
 		for shardOrdinal := 0; shardOrdinal < manifest.ShardCount(); shardOrdinal++ {
 			metadata, _ := manifest.ShardMetadataAt(shardOrdinal)
