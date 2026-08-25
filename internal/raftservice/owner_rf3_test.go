@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -300,6 +301,17 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("ReadIndex leader read=%+v err=%v", linearRead, err)
 	}
 	linearLease.Release()
+	staleTerm := leaderState.Fence()
+	staleTerm.Term--
+	if _, lease, err := owners[leader].ReadPoint(ctx, PointReadRequest{
+		Fence: staleTerm, Relation: 1, Key: key,
+		MinimumApplied: linearRead.Applied, MaxValueBytes: replication.MaxMutationValueBytes,
+		Linearizable: true,
+	}); !errors.Is(err, raftmodel.ErrNotLeader) || errors.Is(err, ErrServingFence) {
+		t.Fatalf("stale read term lease=%T error=%v", lease, err)
+	} else if lease != nil {
+		t.Fatal("stale read term returned a lease")
+	}
 	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: linearRead.Applied + 1,

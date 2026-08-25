@@ -68,6 +68,7 @@ const (
 	processStatusFD         = 6
 	processVoters           = 3
 	processMaxStatusBytes   = 8 << 10
+	processStableLeaderTime = 1100 * time.Millisecond
 )
 
 var processPeerIdentityOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1, 1}
@@ -677,6 +678,32 @@ func (cluster *processRF3Cluster) waitLeader(t testing.TB, ctx context.Context) 
 	return 0
 }
 
+func (cluster *processRF3Cluster) waitStableLeader(t testing.TB, ctx context.Context) uint64 {
+	t.Helper()
+	var leader, term uint64
+	stableSince := time.Now()
+	for ctx.Err() == nil {
+		observedLeader := cluster.waitLeader(t, ctx)
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		state, err := cluster.probe(probeCtx, observedLeader)
+		cancel()
+		if err != nil || state.LeaderID != observedLeader || state.Fence.MemberID != observedLeader {
+			leader, term = 0, 0
+			stableSince = time.Now()
+			continue
+		}
+		if leader != observedLeader || term != state.Fence.Term {
+			leader, term = observedLeader, state.Fence.Term
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= processStableLeaderTime {
+			return leader
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("wait for stable RF3 leader: %v", context.Cause(ctx))
+	return 0
+}
+
 func (cluster *processRF3Cluster) probe(
 	ctx context.Context,
 	member uint64,
@@ -1010,9 +1037,7 @@ func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProce
 			return dialer.DialContext(ctx, "tcp", address)
 		}},
 	}
-	// The serving budget spans at least one configured election window while
-	// remaining under ReplicatedExecutor's absolute attempt bound.
-	executor, err := gateway.NewReplicatedExecutor(client, gateway.AbsoluteMaxReplicatedAttempts, 5*time.Second)
+	executor, err := gateway.NewReplicatedExecutor(client, 8, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

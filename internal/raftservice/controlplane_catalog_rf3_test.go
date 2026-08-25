@@ -48,6 +48,10 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open catalog session: %v", err)
 	}
+	// Session creation is itself a replicated proposal and may overlap the one
+	// startup term transition. Establish a fresh serving witness so this test
+	// measures catalog publication, not cluster boot readiness.
+	leader = cluster.waitStableLeader(t, ctx)
 	first := processControlPlaneSnapshot(t, cluster, 1)
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
