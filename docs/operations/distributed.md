@@ -6,6 +6,7 @@ catalog file. The generated [distributed feature state](../distributed-feature-s
 separates this command path from the internal RF3 composition.
 
 The gateway and shard commands require mutually authenticated TLS by default.
+Authenticated mode also requires one canonical `vibejson` authorization policy.
 An explicit `-dev-plaintext-loopback` mode permits unauthenticated development
 traffic only on loopback listeners. Do not expose that development listener
 through a proxy or port forward to an untrusted network.
@@ -67,6 +68,24 @@ code must open each shard store locally and create the required tables. The
 gateway does not distribute DDL, and the runtime does not prove that schemas
 match across shards.
 
+## Prepare the authorization policy
+
+Both services load the same immutable policy generation. Principal IDs are the
+32-character hexadecimal node identities carried by their TLS certificates.
+The array and capability order below are canonical. The gateway service
+identity needs `delegate`, `data_read`, and `data_write`: it delegates the exact
+application principal to a shard and uses its own authority for recovery. A
+client receives only the operations listed for that principal.
+
+```json
+{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
+```
+
+Save that exact document as `./authorization-policy.vibejson`. Unknown,
+duplicate, escaped, or reordered security fields fail closed. The policy is
+mandatory in authenticated mode and is mutually exclusive with
+`-dev-plaintext-loopback`.
+
 ## Start the shard service
 
 ```bash
@@ -82,7 +101,7 @@ match across shards.
   -tls-key ./shard-key.pem \
   -tls-roots ./cluster-roots.pem \
   -tls-identity-oid 1.3.6.1.4.1.32473.1.1 \
-  -allow-gateway-node 11111111111111111111111111111111
+  -authorization-policy ./authorization-policy.vibejson
 ```
 
 The service makes a durable local claim before it listens. The store retains
@@ -119,7 +138,7 @@ endpoint information.
   -tls-key ./gateway-key.pem \
   -tls-roots ./cluster-roots.pem \
   -tls-identity-oid 1.3.6.1.4.1.32473.1.1 \
-  -allow-client-node 33333333333333333333333333333333 \
+  -authorization-policy ./authorization-policy.vibejson \
   -shard-peer 127.0.0.1:7401=22222222222222222222222222222222
 ```
 

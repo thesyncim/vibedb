@@ -69,18 +69,18 @@ var Distributed = []Feature{
 		}},
 	},
 	{
-		Name: "Authenticated client, gateway, and shard transport",
-		Primitive: Stage{StatusYes, "TLS 1.3 profiles bind node identity, traffic class, trust roots, limits, and rotation.", []Reference{
-			ref("internal/servicetls/server.go", "Server"), ref("gateway/client_tls.go", "NewClientTLS"),
+		Name: "Authenticated and authorized service transport",
+		Primitive: Stage{StatusYes, "TLS 1.3 profiles bind node identity, traffic class, trust roots, and limits. Canonical vibejson policies bind exact principals and generations to fixed capabilities.", []Reference{
+			ref("internal/servicetls/server.go", "Server"), ref("internal/serviceauthz/policy.go", "Policy"),
 		}},
-		Integrated: Stage{StatusYes, "Gateway listeners and gateway-to-shard dials use the shared authenticated transport. Plaintext is an explicit loopback development mode.", []Reference{
+		Integrated: Stage{StatusYes, "The gateway authorizes complete request semantics and forwards the exact client authority. Shards independently check it while requiring a delegate-capable gateway.", []Reference{
+			ref("gateway/client_tls.go", "ServeAuthorizedClients"), ref("shardservice/server.go", "ServeAuthorizedConn"),
+		}},
+		Shipped: Stage{StatusYes, "Both serve commands require TLS plus an authorization policy unless the operator selects explicit loopback development plaintext.", []Reference{
 			ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("cmd/vibedb-shard/main.go", "runServe"),
 		}},
-		Shipped: Stage{StatusYes, "Both serve commands require TLS configuration unless the operator selects loopback development plaintext.", []Reference{
-			ref("cmd/vibedb-gateway/serve_auth_test.go", "TestRunServeFailsClosedWithoutAuthenticatedProfile"), ref("cmd/vibedb-shard/main_test.go", "TestRunArgumentHandling"),
-		}},
-		Qualification: Stage{StatusPartial, "Identity, allowlist, rotation, ALPN, connection, handshake, and allocation tests exist. No network-chaos or throughput gate covers the command pair.", []Reference{
-			ref("gateway/client_tls_test.go", "TestClientTLSAuthenticatesAuthorizesRotatesAndSeparatesALPN"), ref("shardservice/replicated_tls_test.go", "TestServeAuthenticatedAllowlistAndRotationEndToEnd"),
+		Qualification: Stage{StatusPartial, "Identity, generation rotation, confused-deputy, SQL classification, connection, and allocation tests exist. No network-chaos or authorization-throughput gate covers the command pair.", []Reference{
+			ref("gateway/client_tls_test.go", "TestClientTLSAuthenticatesAuthorizesRotatesAndSeparatesALPN"), ref("shardservice/authorization_test.go", "TestShardAuthorizationRejectsConfusedDeputyAndSeparatesRoles"),
 		}},
 	},
 	{

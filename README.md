@@ -11,8 +11,8 @@ different acknowledgement contract.
 
 > **Project status:** This repository has no tagged release. Pin a tested
 > commit. The distributed runtime is experimental. Its command servers require
-> authenticated TLS by default. An explicit development mode permits plaintext
-> only on loopback listeners.
+> authenticated TLS and a canonical `vibejson` authorization policy by default.
+> An explicit development mode permits plaintext only on loopback listeners.
 
 ## Requirements
 
