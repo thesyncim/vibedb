@@ -236,6 +236,10 @@ func (p *pebbleEngine) FilterCount(value string) (int, error) {
 
 func (p *pebbleEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
 
+func (p *pebbleEngine) ProbeExactIndex(uint8, string) (ExactIndexProbe, error) {
+	return ExactIndexProbe{}, ErrNoIndex
+}
+
 func (p *pebbleEngine) DiskBytes() (int64, error) {
 	if err := p.db.Flush(); err != nil {
 		return 0, err

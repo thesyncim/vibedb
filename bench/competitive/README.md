@@ -62,9 +62,11 @@ Record `-exact-indexes=0` through `3`; the standard cells use `0`, `1`, and
 `3`. VibeDB and SQLite receive the same ordered country, tier, and region
 definitions. Mixed output includes p99.9 and
 maximum acknowledgement latency. It also reports submitted logical mutation
-bytes. `write-known=true` means the adapter exposes a native device-byte
-counter and makes `device/logical` meaningful; do not compare a zero from an
-adapter that reports `write-known=false`.
+bytes. `durability-payload-known=true` means the adapter exposes a monotonic
+counter of bytes it handed to its durability device and makes
+`durability-payload/logical` meaningful. This is not filesystem metadata,
+block-layer, or physical-media write accounting. Do not compare a zero from an
+adapter that reports `durability-payload-known=false`.
 
 Record `intrinsic` or `production` storage profile. The output must state the
 resolved compression policy and its provenance.

@@ -90,7 +90,7 @@ func mixedTarget(label string, args ...string) CoverageTarget {
 		OutputTokens: []string{
 			"durability", "checkpoint", "forced-cp", "exact-indexes", "document-shape", "clients",
 			"p50-us", "p95-us", "p99-us", "p99.9-us", "max-us", "total-ops/s", "disk-MiB", "alloc-MiB",
-			"write-known", "logical-write-B", "device-write-B", "device/logical",
+			"durability-payload-known", "logical-write-B", "durability-payload-B", "durability-payload/logical",
 		},
 	}
 }
@@ -127,7 +127,7 @@ func massiveChurnTarget(label string) CoverageTarget {
 		"MASSIVE_CACHE_MIB=64",
 	}
 	target.OutputFunc = "TestMassiveChurnDiag"
-	target.OutputTokens = []string{"p50=", "p99=", "p99.9=", "misses=", "deviceMiB="}
+	target.OutputTokens = []string{"p50=", "p99=", "p99.9=", "misses=", "durabilityPayloadKnown=", "durabilityPayloadMiB="}
 	return target
 }
 
@@ -171,9 +171,10 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 		{
 			Dimension: "indexes", Case: "several exact", Status: CoverageImplemented,
-			Boundary: "The same mixed lane can maintain three exact scalar indexes on VibeDB and SQLite while retaining the final byte oracle.",
+			Boundary: "The same mixed lane maintains three exact scalar indexes on VibeDB and SQLite. A byte-native parametric oracle proves country, tier, and region cardinality plus native indexed-plan engagement across update, delete, checkpoint, and restore.",
 			Targets: []CoverageTarget{
 				mixedTarget("three simultaneous exact indexes", "-exact-indexes=3"),
+				testTarget("parametric three-index posting and plan equivalence", "bench/competitive", "TestExactIndexParametricPostingEquivalence"),
 				testTarget("three-index adapter shape", "bench/competitive", "TestVibeDBExactIndexAndDocumentBounds"),
 				testTarget("matched SQLite physical index count", "bench/competitive", "TestSQLiteExactIndexCountIsPhysical"),
 			},
@@ -364,9 +365,9 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 		{
 			Dimension: "storage", Case: "write amplification", Status: CoverageDiagnostic,
-			Boundary: "On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, device bytes, and their normalized ratio. Buffered-visible and adapters without an equally strong native counter report write-known=false.",
+			Boundary: "On VibeDB's journal-backed durable acknowledgement lanes, mixed reports exact submitted mutation bytes, engine-issued durability payload bytes, and their normalized ratio. This is not OS, filesystem-metadata, or physical-media accounting. Counter regression, buffered-visible, and adapters without an equally strong native counter report durability-payload-known=false.",
 			Targets: []CoverageTarget{mixedTarget(
-				"normalized VibeDB physical-write diagnostic",
+				"normalized VibeDB durability-payload diagnostic",
 				"-durability=ordinary-sync", "-checkpoint-mutations=0",
 			)},
 		},

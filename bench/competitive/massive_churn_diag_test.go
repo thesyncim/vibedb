@@ -177,7 +177,13 @@ func TestMassiveChurnDiag(t *testing.T) {
 		at := int(p*float64(len(latencies)-1) + 0.5)
 		return float64(latencies[at]) / 1_000
 	}
-	delta := func(a, b uint64) uint64 { return b - a }
+	delta := func(a, b uint64) uint64 {
+		if b < a {
+			return 0
+		}
+		return b - a
+	}
+	durabilityPayloadKnown := after.DeviceBytes >= before.DeviceBytes
 	info, err := f.Stat()
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +204,8 @@ func TestMassiveChurnDiag(t *testing.T) {
 		delta(before.MaterializationFallbacks, after.MaterializationFallbacks),
 		delta(before.PrimaryOverlayFolds, after.PrimaryOverlayFolds),
 		delta(before.AutomaticCheckpoints, after.AutomaticCheckpoints))
-	fmt.Printf("deviceMiB=%.2f reusableMiB=%.2f pendingRetiredMiB=%.2f fileMiB=%.2f\n",
+	fmt.Printf("durabilityPayloadKnown=%t durabilityPayloadMiB=%.2f reusableMiB=%.2f pendingRetiredMiB=%.2f fileMiB=%.2f\n",
+		durabilityPayloadKnown,
 		float64(delta(before.DeviceBytes, after.DeviceBytes))/(1<<20),
 		float64(after.ReusableBytes)/(1<<20), float64(after.PendingRetiredBytes)/(1<<20),
 		float64(info.Size())/(1<<20))

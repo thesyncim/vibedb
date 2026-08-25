@@ -18,7 +18,7 @@ func TestWriteParseRoundTripAmidDiagnostics(t *testing.T) {
 		JournalAcks: 30, JournalSyncs: 6,
 		JournalGroupMaxBefore: 3, JournalGroupMax: 7,
 		JournalDeltaRecords: 9, JournalDeltaBytes: 4096,
-		JournalDeltaFallbacks: 1, DeviceBytes: 8192,
+		JournalDeltaFallbacks: 1, DurabilityPayloadKnown: true, DurabilityPayloadBytes: 8192,
 		Histograms: map[string]Histogram{
 			"stripe-wait-ns": {
 				Count: 2, Sum: 30, MaxBefore: 9, Max: 20,

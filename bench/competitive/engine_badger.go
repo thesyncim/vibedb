@@ -327,6 +327,10 @@ func (b *badgerEngine) FilterCount(value string) (int, error) {
 
 func (b *badgerEngine) IndexedCount(string) (int, error) { return 0, ErrNoIndex }
 
+func (b *badgerEngine) ProbeExactIndex(uint8, string) (ExactIndexProbe, error) {
+	return ExactIndexProbe{}, ErrNoIndex
+}
+
 func (b *badgerEngine) DiskBytes() (int64, error) {
 	if err := b.Checkpoint(); err != nil {
 		return 0, err

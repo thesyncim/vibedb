@@ -84,7 +84,8 @@ type Record struct {
 	JournalDeltaRecords     uint64 `json:"journal_delta_records,omitempty"`
 	JournalDeltaBytes       uint64 `json:"journal_delta_bytes,omitempty"`
 	JournalDeltaFallbacks   uint64 `json:"journal_delta_fallbacks,omitempty"`
-	DeviceBytes             uint64 `json:"device_bytes,omitempty"`
+	DurabilityPayloadKnown  bool   `json:"durability_payload_known"`
+	DurabilityPayloadBytes  uint64 `json:"durability_payload_bytes,omitempty"`
 
 	LeafSplits    uint64 `json:"leaf_splits,omitempty"`
 	EmptyReclaims uint64 `json:"empty_reclaims,omitempty"`
@@ -110,6 +111,13 @@ type Metric struct {
 	Scope string
 	Name  string
 	Value uint64
+}
+
+func boolUint64(value bool) uint64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // Metrics returns metrics in a deterministic order. Runtime metrics exist for
@@ -164,7 +172,8 @@ func (r Record) Metrics() []Metric {
 		Metric{Scope: "vibedb", Name: "journal-delta-records", Value: r.JournalDeltaRecords},
 		Metric{Scope: "vibedb", Name: "journal-delta-bytes", Value: r.JournalDeltaBytes},
 		Metric{Scope: "vibedb", Name: "journal-delta-fallbacks", Value: r.JournalDeltaFallbacks},
-		Metric{Scope: "vibedb", Name: "device-bytes", Value: r.DeviceBytes},
+		Metric{Scope: "vibedb", Name: "durability-payload-known", Value: boolUint64(r.DurabilityPayloadKnown)},
+		Metric{Scope: "vibedb", Name: "durability-payload-bytes", Value: r.DurabilityPayloadBytes},
 		Metric{Scope: "vibedb", Name: "leaf-splits", Value: r.LeafSplits},
 		Metric{Scope: "vibedb", Name: "empty-reclaims", Value: r.EmptyReclaims},
 	)

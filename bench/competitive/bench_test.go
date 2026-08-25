@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/thesyncim/vibejson"
 )
 
 func TestCorpusDocumentShapesAreExactAndValid(t *testing.T) {
@@ -51,6 +53,123 @@ func TestNonIndexAdaptersRejectExactIndexConfiguration(t *testing.T) {
 			t.Fatalf("%s accepted an exact-index configuration", factory.Name)
 		}
 	}
+}
+
+func TestExactIndexParametricPostingEquivalence(t *testing.T) {
+	const targetOrdinal = 1 // mixed-shape overflow row
+	corpus := CorpusOfShape(256, LowCardinality, MixedDocuments)
+	original := corpus[targetOrdinal]
+	wantValues := make([]string, MaximumExactIndexes)
+	wantCounts := make([]int, MaximumExactIndexes)
+	for index := range int(MaximumExactIndexes) {
+		wantValues[index] = exactIndexText(t, original.JSON, uint8(index))
+		for i := range corpus {
+			if exactIndexText(t, corpus[i].JSON, uint8(index)) == wantValues[index] {
+				wantCounts[index]++
+			}
+		}
+	}
+
+	for _, engineName := range []string{"vibedb", "sqlite"} {
+		t.Run(engineName, func(t *testing.T) {
+			factory, ok := FactoryNamed(engineName)
+			if !ok {
+				t.Fatalf("factory %q missing", engineName)
+			}
+			engine, _, cleanup := newLoadedCorpus(t, factory, Config{
+				Durability: DurabilityBufferedVisible, ExactIndexes: MaximumExactIndexes,
+				MaxDocumentBytes: MixedDocuments.MaxDocumentBytes(),
+			}, corpus)
+			defer cleanup()
+
+			assert := func(
+				stage string, changed int, documentAbsent bool,
+				alternate string, alternateCount int,
+			) {
+				t.Helper()
+				for index := range int(MaximumExactIndexes) {
+					want := wantCounts[index]
+					if documentAbsent || index == changed {
+						want--
+					}
+					probe, err := engine.ProbeExactIndex(uint8(index), wantValues[index])
+					if err != nil || probe.Count != want || !probe.IndexBounded || probe.IndexLookups == 0 {
+						t.Fatalf("%s %s old probe %s = %+v, %v; want count=%d indexed",
+							engineName, stage, ExactIndexDefinitions[index].Name, probe, err, want)
+					}
+				}
+				if changed >= 0 {
+					probe, err := engine.ProbeExactIndex(uint8(changed), alternate)
+					if err != nil || probe.Count != alternateCount ||
+						!probe.IndexBounded || probe.IndexLookups == 0 {
+						t.Fatalf("%s %s alternate probe %s = %+v, %v; want count=%d indexed",
+							engineName, stage, ExactIndexDefinitions[changed].Name,
+							probe, err, alternateCount)
+					}
+				}
+			}
+
+			assert("loaded", -1, false, "", 0)
+			for changed := range int(MaximumExactIndexes) {
+				alternate := string(bytes.Repeat([]byte{'z'}, len(wantValues[changed])))
+				updated := replaceExactIndexText(
+					t, original.JSON, ExactIndexDefinitions[changed].Name,
+					wantValues[changed], alternate,
+				)
+				if err := engine.Put(original.Key, updated); err != nil {
+					t.Fatalf("%s update %s: %v", engineName, ExactIndexDefinitions[changed].Name, err)
+				}
+				assert("updated", changed, false, alternate, 1)
+				if err := engine.Delete(original.Key); err != nil {
+					t.Fatalf("%s delete %s: %v", engineName, ExactIndexDefinitions[changed].Name, err)
+				}
+				assert("deleted", changed, true, alternate, 0)
+				if err := engine.Upsert(original.Key, original.JSON); err != nil {
+					t.Fatalf("%s restore %s: %v", engineName, ExactIndexDefinitions[changed].Name, err)
+				}
+				if err := engine.Checkpoint(); err != nil {
+					t.Fatalf("%s checkpoint %s: %v", engineName, ExactIndexDefinitions[changed].Name, err)
+				}
+				assert("restored-checkpoint", -1, false, "", 0)
+			}
+		})
+	}
+}
+
+func exactIndexText(t testing.TB, document []byte, index uint8) string {
+	t.Helper()
+	if index >= MaximumExactIndexes {
+		t.Fatalf("exact index %d out of range", index)
+	}
+	value, err := vibejson.Parse(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer := vibejson.MustCompilePointer(ExactIndexDefinitions[index].JSONPointer)
+	target, found, err := value.PointerCompiled(pointer)
+	if err != nil || !found {
+		t.Fatalf("exact index %d target found=%t err=%v", index, found, err)
+	}
+	text, ok := target.Text()
+	if !ok {
+		t.Fatalf("exact index %d target is not text", index)
+	}
+	return text
+}
+
+func replaceExactIndexText(
+	t testing.TB,
+	document []byte,
+	field, old, replacement string,
+) []byte {
+	t.Helper()
+	needle := []byte(`"` + field + `":"` + old + `"`)
+	next := []byte(`"` + field + `":"` + replacement + `"`)
+	result := bytes.Replace(document, needle, next, 1)
+	if bytes.Equal(result, document) || !vibejson.Valid(result) {
+		t.Fatalf("replace exact index field %q failed", field)
+	}
+	return result
 }
 
 var (

@@ -464,7 +464,7 @@ func parseMixedOutput(src []byte) ([]string, []rawRow, error) {
 	required := []string{
 		"engine", "durability", "workload", "operation",
 		"forced-cp", "total-ops/s", "p50-us", "p95-us", "p99-us", "p99.9-us", "max-us",
-		"write-known", "logical-write-B", "device-write-B", "device/logical",
+		"durability-payload-known", "logical-write-B", "durability-payload-B", "durability-payload/logical",
 	}
 	index := headerIndex(header)
 	for _, name := range required {
@@ -586,7 +586,7 @@ func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 	index := headerIndex(header)
 	groupColumns := []string{
 		"engine", "durability", "workload", "card", "document-shape",
-		"exact-indexes", "clients", "operation", "write-known",
+		"exact-indexes", "clients", "operation", "durability-payload-known",
 	}
 	for _, name := range groupColumns {
 		if _, ok := index[name]; !ok {
@@ -597,7 +597,7 @@ func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 		"engine": true, "durability": true, "workload": true,
 		"card": true, "docs": true, "measured": true, "warmup": true,
 		"checkpoint": true, "exact-indexes": true, "document-shape": true, "operation": true,
-		"clients": true, "write-known": true,
+		"clients": true, "durability-payload-known": true,
 	}
 	var metrics []string
 	for _, name := range header {

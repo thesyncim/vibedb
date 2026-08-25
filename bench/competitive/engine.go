@@ -81,15 +81,16 @@ type Config struct {
 type ExactIndexDefinition struct {
 	Name        string
 	JSONPointer string
+	QueryPath   string
 	SQLitePath  string
 }
 
 // ExactIndexDefinitions is ordered so ExactIndexes=1 remains the selective
 // country lane and ExactIndexes=3 adds the nested tier and region indexes.
 var ExactIndexDefinitions = [...]ExactIndexDefinition{
-	{Name: "country", JSONPointer: "/country", SQLitePath: "$.country"},
-	{Name: "tier", JSONPointer: "/profile/tier", SQLitePath: "$.profile.tier"},
-	{Name: "region", JSONPointer: "/profile/region", SQLitePath: "$.profile.region"},
+	{Name: "country", JSONPointer: "/country", QueryPath: "country", SQLitePath: "$.country"},
+	{Name: "tier", JSONPointer: "/profile/tier", QueryPath: "profile.tier", SQLitePath: "$.profile.tier"},
+	{Name: "region", JSONPointer: "/profile/region", QueryPath: "profile.region", SQLitePath: "$.profile.region"},
 }
 
 const MaximumExactIndexes = uint8(len(ExactIndexDefinitions))
@@ -118,6 +119,15 @@ func exactIndexCount(enabled bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// ExactIndexProbe is one count plus proof that the adapter's native index
+// bounded the query. A configured index that silently falls back to a document
+// scan is a benchmark error, not an indexed result.
+type ExactIndexProbe struct {
+	Count        int
+	IndexBounded bool
+	IndexLookups int
 }
 
 // DefaultCacheBytes matches store/durable Options.ResidentBytes' default.
@@ -469,9 +479,13 @@ type Engine interface {
 	// FilterCount counts documents whose FilterPath equals value using no
 	// secondary index.
 	FilterCount(value string) (int, error)
-	// IndexedCount answers the same question with whatever index the engine
-	// supports, or ErrNoIndex.
+	// IndexedCount answers the country-lane question through the first exact
+	// index, or ErrNoIndex. ProbeExactIndex is the parametric correctness and
+	// plan-proof surface for every configured index.
 	IndexedCount(value string) (int, error)
+	// ProbeExactIndex queries one configured ExactIndexDefinitions ordinal and
+	// returns both its cardinality and native-plan engagement proof.
+	ProbeExactIndex(index uint8, value string) (ExactIndexProbe, error)
 
 	// Checkpoint makes every mutation acknowledged before the call recoverable
 	// according to the engine's explicitly documented checkpoint barrier. In

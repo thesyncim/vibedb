@@ -26,6 +26,8 @@ type vibeDBEngine struct {
 	exec        query.Exec
 	filterQuery *query.Query
 	filterValue string
+	indexQuery  [MaximumExactIndexes]*query.Query
+	indexValue  [MaximumExactIndexes]string
 	scratch     []byte
 	keyBuf      [vibeDBKeyBytes]byte
 	scan        *vibeDBScanState
@@ -423,10 +425,42 @@ func (v *vibeDBEngine) FilterCount(value string) (int, error) {
 }
 
 func (v *vibeDBEngine) IndexedCount(value string) (int, error) {
-	if v.cfg.ExactIndexes == 0 {
-		return 0, ErrNoIndex
+	probe, err := v.ProbeExactIndex(0, value)
+	return probe.Count, err
+}
+
+func (v *vibeDBEngine) ProbeExactIndex(index uint8, value string) (ExactIndexProbe, error) {
+	if index >= v.cfg.ExactIndexes || index >= MaximumExactIndexes {
+		return ExactIndexProbe{}, ErrNoIndex
 	}
-	return v.runFilter(value)
+	snap, err := v.snapshot()
+	if err != nil {
+		return ExactIndexProbe{}, err
+	}
+	definition := ExactIndexDefinitions[index]
+	if v.indexQuery[index] == nil || v.indexValue[index] != value {
+		v.indexQuery[index] = query.Select(query.Count()).Where(
+			query.Cmp(definition.QueryPath, query.Eq, value),
+		)
+		v.indexValue[index] = value
+	}
+	if err := v.indexQuery[index].RunInto(&v.exec, query.FromFile(snap)); err != nil {
+		return ExactIndexProbe{}, err
+	}
+	count, err := vibeDBCountResult(&v.exec)
+	if err != nil {
+		return ExactIndexProbe{}, err
+	}
+	probe := ExactIndexProbe{
+		Count: count, IndexBounded: v.exec.Stats.IndexBounded,
+		IndexLookups: v.exec.Stats.IndexLookups,
+	}
+	if !probe.IndexBounded || probe.IndexLookups == 0 {
+		return ExactIndexProbe{}, fmt.Errorf(
+			"exact index %q did not bound query: %+v", definition.Name, v.exec.Stats,
+		)
+	}
+	return probe, nil
 }
 
 func (v *vibeDBEngine) runFilter(value string) (int, error) {
@@ -443,7 +477,14 @@ func (v *vibeDBEngine) runFilter(value string) (int, error) {
 	if err := v.filterQuery.RunInto(&v.exec, query.FromFile(snap)); err != nil {
 		return 0, err
 	}
-	col, ok := v.exec.Result.Column("count(*)")
+	return vibeDBCountResult(&v.exec)
+}
+
+func vibeDBCountResult(exec *query.Exec) (int, error) {
+	if exec == nil {
+		return 0, fmt.Errorf("nil query execution")
+	}
+	col, ok := exec.Result.Column("count(*)")
 	if !ok || len(col.Cells) == 0 {
 		return 0, fmt.Errorf("no count column in result")
 	}

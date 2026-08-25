@@ -36,7 +36,7 @@ func TestOutputHeaderRequiresResolvedDurabilityAndCheckpoint(t *testing.T) {
 	if !contains("forced-cp") {
 		t.Fatalf("header omits forced checkpoint column: %q", out.String())
 	}
-	for _, column := range []string{"document-shape", "exact-indexes", "p99.9-us", "max-us", "write-known", "logical-write-B", "device-write-B", "device/logical"} {
+	for _, column := range []string{"document-shape", "exact-indexes", "p99.9-us", "max-us", "durability-payload-known", "logical-write-B", "durability-payload-B", "durability-payload/logical"} {
 		if !contains(column) {
 			t.Fatalf("header omits %s column: %q", column, out.String())
 		}
@@ -112,7 +112,7 @@ func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T
 		got.JournalSyncs != 8 || got.JournalGroupMaxBefore != 6 ||
 		got.JournalGroupMax != 14 || got.JournalDeltaRecords != 50 ||
 		got.JournalDeltaBytes != 12_288 || got.JournalDeltaFallbacks != 2 ||
-		got.DeviceBytes != 16_384 {
+		!got.DurabilityPayloadKnown || got.DurabilityPayloadBytes != 16_384 {
 		t.Fatalf("telemetry = %+v", got)
 	}
 	stripe := got.Histograms["concurrent-stripe-wait-ns"]
@@ -123,6 +123,17 @@ func TestBuildTelemetryRecordUsesCounterDeltasAndExplicitHighWaters(t *testing.T
 	}
 	if got := counterDelta(10, 9); got != 0 {
 		t.Fatalf("reset counter delta = %d, want 0", got)
+	}
+	if delta, known := counterDeltaKnown(10, 9); delta != 0 || known {
+		t.Fatalf("reset payload delta = %d known=%t, want 0,false", delta, known)
+	}
+	durableAfter.DeviceBytes = durableBefore.DeviceBytes - 1
+	regressed := buildTelemetryRecord(
+		"vibedb", 8, runtimeBefore, runtimeAfter,
+		durableBefore, durableAfter, true,
+	)
+	if regressed.DurabilityPayloadKnown || regressed.DurabilityPayloadBytes != 0 {
+		t.Fatalf("regressed durability payload = %+v, want unknown zero", regressed)
 	}
 }
 

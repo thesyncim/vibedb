@@ -522,14 +522,18 @@ func main() {
 		printHeader(os.Stdout)
 	}
 	throughput := float64(*operations) * float64(time.Second) / float64(measuredNanos)
-	writeKnown := durableOK && (engine.DurabilityMode() == competitive.DurabilityOrdinarySync ||
-		engine.DurabilityMode() == competitive.DurabilityPowerSafe)
-	deviceBytes := uint64(0)
-	writeAmplification := 0.0
-	if writeKnown {
-		deviceBytes = counterDelta(durableBefore.DeviceBytes, durableAfter.DeviceBytes)
+	payloadDelta, payloadMonotonic := counterDeltaKnown(
+		durableBefore.DeviceBytes, durableAfter.DeviceBytes,
+	)
+	payloadKnown := durableOK && payloadMonotonic &&
+		(engine.DurabilityMode() == competitive.DurabilityOrdinarySync ||
+			engine.DurabilityMode() == competitive.DurabilityPowerSafe)
+	durabilityPayloadBytes := uint64(0)
+	payloadRatio := 0.0
+	if payloadKnown {
+		durabilityPayloadBytes = payloadDelta
 		if logicalMutationBytes != 0 {
-			writeAmplification = float64(deviceBytes) / float64(logicalMutationBytes)
+			payloadRatio = float64(durabilityPayloadBytes) / float64(logicalMutationBytes)
 		}
 	}
 	printResult := func(operation string, result summary) {
@@ -539,8 +543,8 @@ func main() {
 			automaticCheckpoints, *exactIndexes, *clients, operation, result.calls,
 			micros(result.p50), micros(result.p95), micros(result.p99), micros(result.p999), micros(result.max), throughput,
 			mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes), mib(int64(fp.HeapAlloc)),
-			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()), writeKnown,
-			logicalMutationBytes, deviceBytes, writeAmplification)
+			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()), payloadKnown,
+			logicalMutationBytes, durabilityPayloadBytes, payloadRatio)
 	}
 	for kind, result := range summaries {
 		if result.calls == 0 {
@@ -568,7 +572,7 @@ func main() {
 		if durableOK {
 			fmt.Fprintf(
 				os.Stderr,
-				"vibedb-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d device-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
+				"vibedb-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d durability-payload-known=%t durability-payload-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
 				*clients,
 				durableAfter.PrimaryOverlayFolds-durableBefore.PrimaryOverlayFolds,
 				durableAfter.ConcurrentPrimaryFallbacks-durableBefore.ConcurrentPrimaryFallbacks,
@@ -579,7 +583,7 @@ func main() {
 				durableAfter.JournalDeltaRecords-durableBefore.JournalDeltaRecords,
 				durableAfter.JournalDeltaBytes-durableBefore.JournalDeltaBytes,
 				durableAfter.JournalDeltaFullFallbacks-durableBefore.JournalDeltaFullFallbacks,
-				durableAfter.DeviceBytes-durableBefore.DeviceBytes,
+				payloadMonotonic, payloadDelta,
 				durableAfter.PrimaryLeafSplits-durableBefore.PrimaryLeafSplits,
 				durableAfter.PrimaryEmptyReclaims-durableBefore.PrimaryEmptyReclaims,
 			)
@@ -713,15 +717,15 @@ func printHeader(w io.Writer) {
 		"engine", "durability", "workload", "card", "document-shape", "docs", "measured",
 		"warmup", "checkpoint", "forced-cp", "exact-indexes", "clients", "operation", "calls",
 		"p50-us", "p95-us", "p99-us", "p99.9-us", "max-us", "total-ops/s", "disk-MiB", "alloc-MiB",
-		"heap-MiB", "runtime-MiB", "peak-rss-MiB", "write-known",
-		"logical-write-B", "device-write-B", "device/logical")
+		"heap-MiB", "runtime-MiB", "peak-rss-MiB", "durability-payload-known",
+		"logical-write-B", "durability-payload-B", "durability-payload/logical")
 }
 
-// measuredLogicalMutationBytes is the byte-exact denominator for physical
-// write amplification. It counts submitted key and value bytes for successful
+// measuredLogicalMutationBytes is the byte-exact denominator for the engine's
+// issued durability-payload ratio. It counts submitted key and value bytes for successful
 // measured mutations; same-size updates make the result independent of each
 // key's current toggle state. Checkpoint and journal metadata are deliberately
-// excluded from the denominator and remain charged in the device numerator.
+// excluded from the denominator and remain charged in the issued-payload numerator.
 func measuredLogicalMutationBytes(states []*clientState, choices []int, docs []competitive.Doc) uint64 {
 	var total uint64
 	for _, state := range states {
@@ -890,7 +894,9 @@ func buildTelemetryRecord(
 		durableBefore.JournalDeltaFullFallbacks,
 		durableAfter.JournalDeltaFullFallbacks,
 	)
-	record.DeviceBytes = counterDelta(durableBefore.DeviceBytes, durableAfter.DeviceBytes)
+	record.DurabilityPayloadBytes, record.DurabilityPayloadKnown = counterDeltaKnown(
+		durableBefore.DeviceBytes, durableAfter.DeviceBytes,
+	)
 	record.LeafSplits = counterDelta(
 		durableBefore.PrimaryLeafSplits,
 		durableAfter.PrimaryLeafSplits,
@@ -971,6 +977,13 @@ func counterDelta(before, after uint64) uint64 {
 		return 0
 	}
 	return after - before
+}
+
+func counterDeltaKnown(before, after uint64) (uint64, bool) {
+	if after < before {
+		return 0, false
+	}
+	return after - before, true
 }
 
 func automaticCheckpointCount(engine competitive.Engine) uint64 {
