@@ -631,7 +631,10 @@ func (session *NativeSession) executePending(
 	priorUnknown bool,
 ) (NativeResult, error) {
 	var hint *shardservice.ReplicatedMemberState
-	if session.leader != (shardservice.ReplicatedMemberState{}) {
+	// A cached leader is a latency hint only while no admitted outcome is in
+	// doubt. RetryPending may follow that leader's failure; discover the current
+	// leader before spending a bounded proposal attempt on the retained bytes.
+	if !priorUnknown && session.leader != (shardservice.ReplicatedMemberState{}) {
 		hint = &session.leader
 	}
 	result, err := session.executor.propose(
