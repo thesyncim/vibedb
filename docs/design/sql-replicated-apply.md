@@ -1,8 +1,9 @@
 # Replicated SQL apply
 
 Replicated apply is an internal deterministic mutation path for a bound SQL
-root. It is not a public SQL session and is not connected to the shipped shard
-command.
+root. It is not a public SQL session. `vibedb-shard serve-rf3` opens an exact
+externally prepared apply identity and transfers its claim to the RF3 runtime;
+the static `vibedb-shard serve` command does not use this path.
 
 ## Ownership
 

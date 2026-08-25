@@ -33,8 +33,10 @@ mutation path. The binding is not a reversible runtime mode.
 
 ## Serving boundary
 
-The shipped `vibedb-shard` command does not use replicated binding. It opens an
-ordinary statically owned local shard store.
+`vibedb-shard serve` opens an ordinary statically owned local shard store and
+does not use replicated binding. `vibedb-shard serve-rf3` instead requires an
+externally prepared complete replicated binding and apply identity and opens
+them exactly; it never binds or initializes a root.
 
 ## Implementation references
 
