@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"unicode/utf8"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
@@ -87,8 +87,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 		entry := snapshot.planner[plannerOrdinal]
 		placement := snapshot.config.Placements[entry.placement]
 		primary, err := vibejson.CompilePointer(profile.PrimaryKey)
-		if len(profile.Table) == 0 || len(profile.Table) > replication.MaxIdentityBytes ||
-			!utf8.ValidString(profile.Table) || strings.IndexByte(profile.Table, 0) >= 0 ||
+		if !collectionname.Valid(profile.Table) || strings.IndexByte(profile.Table, 0) >= 0 ||
 			profile.Relation == 0 || profile.Relation > replication.MaxRelationID ||
 			len(profile.PrimaryKey) == 0 || len(profile.PrimaryKey) > replication.MaxIdentityBytes ||
 			err != nil || len(primary.Tokens) == 0 || primary.String() != profile.PrimaryKey ||
@@ -391,12 +390,13 @@ func validateReplicatedTableTransition(current, next *Snapshot) error {
 			)}
 		}
 		candidate, _ := next.replicatedTableProfileAt(next.replicatedTables[nextOrdinal])
-		if candidate.Table != old.Table || candidate.Relation != old.Relation ||
-			candidate.PrimaryKey != old.PrimaryKey || candidate.MaxKeyBytes != old.MaxKeyBytes ||
-			candidate.MaxDocumentBytes != old.MaxDocumentBytes ||
-			candidate.SchemaGeneration < old.SchemaGeneration ||
-			(candidate.SchemaGeneration == old.SchemaGeneration &&
-				candidate.RelationManifestDigest != old.RelationManifestDigest) ||
+		sameGenerationChanged := candidate.SchemaGeneration == old.SchemaGeneration &&
+			(candidate.Relation != old.Relation || candidate.PrimaryKey != old.PrimaryKey ||
+				candidate.MaxKeyBytes != old.MaxKeyBytes ||
+				candidate.MaxDocumentBytes != old.MaxDocumentBytes ||
+				candidate.RelationManifestDigest != old.RelationManifestDigest)
+		if candidate.Table != old.Table || candidate.SchemaGeneration < old.SchemaGeneration ||
+			sameGenerationChanged ||
 			(candidate.SchemaGeneration != old.SchemaGeneration &&
 				candidate.RelationManifestDigest == old.RelationManifestDigest) {
 			return &CatalogError{Reason: fmt.Sprintf(

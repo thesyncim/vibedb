@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -37,6 +38,7 @@ type nativeDataWireRequest struct {
 	Operation   nativeDataOperation
 	Consistency nativeDataConsistency
 	Table       []byte
+	TableStore  [collectionname.MaxNameBytes * 6]byte
 	Document    []byte
 	Key         [replication.MaxMutationKeyBytes]byte
 	KeyBytes    uint32
@@ -79,7 +81,14 @@ func decodeNativeDataRequest(src []byte, request *nativeDataWireRequest) error {
 func (request *nativeDataWireRequest) UnmarshalVibeJSON(
 	cursor vibejson.DecodeCursor,
 ) (vibejson.DecodeCursor, error) {
-	*request = nativeDataWireRequest{}
+	request.Operation = 0
+	request.Consistency = 0
+	request.Table = nil
+	request.Document = nil
+	request.KeyBytes = 0
+	request.RequestID = replication.ID128{}
+	request.RouteID = replication.Digest{}
+	request.Applied = 0
 	if err := cursor.BeginObject("native data request"); err != nil {
 		return cursor, errInvalidNativeDataRequest
 	}
@@ -103,8 +112,23 @@ func (request *nativeDataWireRequest) UnmarshalVibeJSON(
 	if !cursor.Field(false, nativeDataRequestFields.Field(1)) {
 		return cursor, errInvalidNativeDataRequest
 	}
-	cursor, request.Table, err = nativeDataString(cursor)
-	if err != nil || len(request.Table) == 0 || len(request.Table) > collectionname.MaxNameBytes {
+	tableValue, tableErr := cursor.Raw()
+	if tableErr != nil || len(tableValue.Bytes()) > len(request.TableStore)+2 {
+		return cursor, errInvalidNativeDataRequest
+	}
+	if request.Table, _ = tableValue.StringBytes(); request.Table == nil {
+		var isString bool
+		request.Table, isString, tableErr = tableValue.AppendText(request.TableStore[:0])
+		if tableErr != nil || !isString {
+			return cursor, errInvalidNativeDataRequest
+		}
+	}
+	if len(request.Table) == 0 || len(request.Table) > collectionname.MaxNameBytes {
+		return cursor, errInvalidNativeDataRequest
+	}
+	var canonicalTable [collectionname.MaxNameBytes*6 + 2]byte
+	canonical := appendNativeCanonicalString(canonicalTable[:0], request.Table)
+	if !bytes.Equal(canonical, tableValue.Bytes()) {
 		return cursor, errInvalidNativeDataRequest
 	}
 	if !cursor.Field(false, nativeDataRequestFields.Field(2)) {
@@ -179,6 +203,53 @@ func (request *nativeDataWireRequest) UnmarshalVibeJSON(
 		return cursor, errInvalidNativeDataRequest
 	}
 	return cursor, nil
+}
+
+func appendNativeCanonicalString(dst, text []byte) []byte {
+	const hexadecimal = "0123456789abcdef"
+	dst = append(dst, '"')
+	for index := 0; index < len(text); {
+		value := text[index]
+		switch value {
+		case '"', '\\':
+			dst = append(dst, '\\', value)
+			index++
+		case '\b':
+			dst = append(dst, `\b`...)
+			index++
+		case '\f':
+			dst = append(dst, `\f`...)
+			index++
+		case '\n':
+			dst = append(dst, `\n`...)
+			index++
+		case '\r':
+			dst = append(dst, `\r`...)
+			index++
+		case '\t':
+			dst = append(dst, `\t`...)
+			index++
+		default:
+			if value < 0x20 || value == '<' || value == '>' || value == '&' {
+				dst = append(dst, '\\', 'u', '0', '0', hexadecimal[value>>4], hexadecimal[value&0xf])
+				index++
+				continue
+			}
+			if value < utf8.RuneSelf {
+				dst = append(dst, value)
+				index++
+				continue
+			}
+			runeValue, width := utf8.DecodeRune(text[index:])
+			if runeValue == '\u2028' || runeValue == '\u2029' {
+				dst = append(dst, '\\', 'u', '2', '0', '2', hexadecimal[byte(runeValue)&0xf])
+			} else {
+				dst = append(dst, text[index:index+width]...)
+			}
+			index += width
+		}
+	}
+	return append(dst, '"')
 }
 
 func nativeDataString(

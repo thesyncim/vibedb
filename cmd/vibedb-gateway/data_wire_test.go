@@ -119,6 +119,24 @@ func TestDecodeNativeDataRequestRejectsNoncanonicalInput(t *testing.T) {
 	}
 }
 
+func TestDecodeNativeDataRequestCanonicalEscapedTable(t *testing.T) {
+	source := []byte(`{"op":"get","table":"do\"cs","key":"AQIDBA","consistency":"linearizable"}`)
+	var request nativeDataWireRequest
+	if err := decodeNativeDataRequest(source, &request); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(request.Table, []byte(`do"cs`)) || aliasesNativeRequest(source, request.Table) {
+		t.Fatalf("decoded table = %q aliases=%v", request.Table, aliasesNativeRequest(source, request.Table))
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if err := decodeNativeDataRequest(source, &request); err != nil {
+			t.Fatal(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("escaped table allocations = %v, want 0", allocations)
+	}
+}
+
 func TestDecodeNativeDataRequestWarmAllocationFree(t *testing.T) {
 	source := []byte(`{"op":"put","table":"docs","key":"AQIDBA","document":{"id":"a","n":1},"request_id":"` + testNativeRequestID + `"}`)
 	var request nativeDataWireRequest

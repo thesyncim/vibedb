@@ -44,6 +44,7 @@ func executeNativeDataRead(
 	return nativeDataWireResponse{
 		OK: true, Position: result.Position.RouteID, Applied: result.Position.Applied,
 		Found: result.Found, Document: result.Value, Retries: uint32(result.Retries),
+		readResult: result,
 	}
 }
 
@@ -62,15 +63,21 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 		return nativeDataError(nativeDataResponseTableNotReplicated, false)
 	case errors.Is(err, gateway.ErrReplicatedReadPositionMismatch):
 		return nativeDataError(nativeDataResponsePositionMismatch, false)
+	case errors.Is(err, raftservice.ErrServingFence):
+		// A definite data-route fence remains the public failure even when the
+		// trusted topology refresh also fails authorization or transport. Do not
+		// misattribute internal control-plane authority to the end user.
+		return nativeDataError(nativeDataResponseStaleCatalog, true)
 	case errors.Is(err, gateway.ErrReplicatedUnauthorized):
 		return nativeDataError(nativeDataResponseUnauthorized, false)
 	case errors.Is(err, gateway.ErrReplicatedReadBehind):
 		return nativeDataError(nativeDataResponseReadBehind, true)
 	case errors.Is(err, raftmodel.ErrAdmissionBound),
-		errors.Is(err, gateway.ErrReplicatedTransportBound):
+		errors.Is(err, gateway.ErrReplicatedTransportBound),
+		errors.Is(err, gateway.ErrReplicatedReadAdmission):
 		return nativeDataError(nativeDataResponseOverloaded, true)
-	case errors.Is(err, raftservice.ErrServingFence):
-		return nativeDataError(nativeDataResponseStaleCatalog, true)
+	case errors.Is(err, gateway.ErrReplicatedReadBufferBound):
+		return nativeDataError(nativeDataResponseUnavailable, false)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, gateway.ErrNoCatalog), errors.Is(err, gateway.ErrReplicatedLeader),
 		errors.Is(err, gateway.ErrReplicatedRoute):
@@ -87,6 +94,8 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 			return nativeDataError(nativeDataResponseStaleCatalog, true)
 		case shardservice.ReplicatedRefusalAdmissionBound:
 			return nativeDataError(nativeDataResponseOverloaded, true)
+		case shardservice.ReplicatedRefusalReadBufferBound:
+			return nativeDataError(nativeDataResponseUnavailable, false)
 		case shardservice.ReplicatedRefusalUnavailable,
 			shardservice.ReplicatedRefusalProposalRefused:
 			return nativeDataError(nativeDataResponseUnavailable, true)

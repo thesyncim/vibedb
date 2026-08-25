@@ -136,6 +136,8 @@ func runServe(args []string) int {
 	fs.Var(&shardPeers, "shard-peer", "authenticated shard address=32-character-hex-NodeID; repeat for each endpoint")
 	maxShardConnections := fs.Int("max-shard-connections", 4096, "hard authenticated gateway-to-shard connection bound")
 	maxShardHandshakes := fs.Int("max-shard-handshakes", 64, "hard concurrent gateway-to-shard TLS handshake bound")
+	maxNativeReadConcurrency := fs.Int("max-native-read-concurrency", gateway.DefaultReplicatedReadConcurrency, "hard concurrent public RF3 point-read bound")
+	maxNativeReadBytes := fs.Uint64("max-native-read-bytes", gateway.DefaultReplicatedReadInFlight, "hard aggregate schema-bounded public RF3 response-byte reservation")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -266,7 +268,13 @@ func runServe(args []string) int {
 	}
 	var dataReader *gateway.ReplicatedDataReader
 	if replicated != nil {
-		dataReader, err = gateway.NewReplicatedDataReader(holder, replicated)
+		dataReader, err = gateway.NewReplicatedDataReaderWithOptions(
+			gateway.ReplicatedDataReaderOptions{
+				Catalog: holder, Executor: replicated, Refresh: catalogAuthority.Refresh,
+				MaxConcurrentReads:   *maxNativeReadConcurrency,
+				MaxInFlightReadBytes: *maxNativeReadBytes,
+			},
+		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gateway: initialize replicated data reader: %v\n", err)
 			return 1
@@ -739,9 +747,11 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			} else {
 				response = executeNativeDataRead(ctx, data, &request)
 			}
-			if err := writeNativeDataResponse(writer, &response); err != nil {
+			writeErr := writeNativeDataResponse(writer, &response)
+			response.release()
+			if writeErr != nil {
 				if ctx.Err() == nil {
-					logf("gateway: encode native response: %v", err)
+					logf("gateway: encode native response: %v", writeErr)
 				}
 				return
 			}
@@ -792,8 +802,16 @@ func nativeDataRequestCandidate(source []byte) bool {
 			!bytes.Equal(source[index:index+len(operation)], []byte(operation)) {
 			continue
 		}
-		next := skipNativeJSONSpace(source, index+len(operation))
-		return next < len(source) && source[next] == ','
+		next := index + len(operation)
+		if next == len(source) {
+			return true
+		}
+		switch source[next] {
+		case ',', '}', ' ', '\t', '\r', '\n':
+			return true
+		default:
+			return false
+		}
 	}
 	return false
 }

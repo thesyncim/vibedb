@@ -82,6 +82,7 @@ func TestNativeDataResponseForErrorIsClosedAndTyped(t *testing.T) {
 		{gateway.ErrReplicatedReadBehind, nativeDataResponseReadBehind, true},
 		{raftmodel.ErrAdmissionBound, nativeDataResponseOverloaded, true},
 		{raftservice.ErrServingFence, nativeDataResponseStaleCatalog, true},
+		{errors.Join(raftservice.ErrServingFence, gateway.ErrReplicatedUnauthorized), nativeDataResponseStaleCatalog, true},
 		{context.DeadlineExceeded, nativeDataResponseUnavailable, true},
 		{&gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnavailable}, nativeDataResponseUnavailable, true},
 		{errors.New("unexpected"), nativeDataResponseInternal, false},
@@ -124,6 +125,12 @@ func TestHandleConnDataReturnsClosedTypedFailures(t *testing.T) {
 			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
 		},
 		{
+			name:   "recognized operation cannot fall through",
+			reader: &nativeDataReaderStub{},
+			line:   `{"op":"get"}`,
+			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
+		},
+		{
 			name:   "authorization",
 			reader: &nativeDataReaderStub{},
 			authorize: func(serviceauthz.Capability) bool {
@@ -153,6 +160,8 @@ func TestNativeDataRequestCandidateRequiresFirstUnescapedOperation(t *testing.T)
 		`{"op":"get","table":"docs"}`,
 		" \t{ \n\"op\" : \"put\" ,\"table\":\"docs\"}",
 		`{"op":"delete" ,"table":"docs"}`,
+		`{"op":"get"}`,
+		`{"op":"put" garbage`,
 	}
 	for _, source := range accepted {
 		if !nativeDataRequestCandidate([]byte(source)) {

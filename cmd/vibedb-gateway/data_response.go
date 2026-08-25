@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -37,6 +38,14 @@ type nativeDataWireResponse struct {
 	Found      bool
 	Retryable  bool
 	HasRequest bool
+	readResult gateway.ReplicatedTableReadResult
+}
+
+func (response *nativeDataWireResponse) release() {
+	if response != nil {
+		response.readResult.Release()
+		response.Document = nil
+	}
 }
 
 func nativeDataResponseCodeBytes(code nativeDataResponseCode) []byte {

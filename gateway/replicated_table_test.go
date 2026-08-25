@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -140,6 +141,10 @@ func TestReplicatedTableProfileRejectsIncompleteOrMismatchedCatalog(t *testing.T
 		{"large-document-limit", func(_ *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
 			p.MaxDocumentBytes = replication.MaxMutationValueBytes + 1
 		}},
+		{"large-table-name", func(c *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, p *ReplicatedTableProfile) {
+			name := strings.Repeat("t", 121)
+			c.Placements[0].Table, p.Table = name, name
+		}},
 		{"multi-column-placement", func(c *distribution.ClusterConfig, _ *ReplicatedShardDescriptor, _ *ReplicatedTableProfile) {
 			c.Distributions[0].Arity = 2
 			c.Placements[0].Columns = []string{"/id", "/region"}
@@ -170,6 +175,20 @@ func TestReplicatedTableProfileRejectsIncompleteOrMismatchedCatalog(t *testing.T
 		config, endpoints, 5, nil, nil, nil, []ReplicatedTableProfile{profile},
 	); !errors.Is(err, ErrInvalidCatalog) {
 		t.Fatalf("profile without routes = %v", err)
+	}
+}
+
+func TestReplicatedTableProfileAcceptsPortableEscapedAndBoundaryNames(t *testing.T) {
+	for _, name := range []string{`mes"sages`, strings.Repeat("t", 120)} {
+		config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+		config.Placements[0].Table = name
+		profile.Table = name
+		if _, err := NewSnapshotWithReplicatedTableMetadata(
+			config, endpoints, 5, nil, nil,
+			[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+		); err != nil {
+			t.Fatalf("table %q: %v", name, err)
+		}
 	}
 }
 
@@ -260,6 +279,10 @@ func TestReplicatedTableProfileTransitionIsMonotonicAndCannotDisappear(t *testin
 	advancedProfile.RelationManifestDigest = replication.Digest(
 		advancedDescriptor.Command.RelationManifestDigest,
 	)
+	// Relation slots are bundle-local and limits are schema-bound, so an
+	// authenticated schema generation may remap the table and revise its bounds.
+	advancedProfile.Relation = 2
+	advancedProfile.MaxDocumentBytes--
 	advanced, err := NewSnapshotWithReplicatedTableMetadata(
 		config, endpoints, 6, nil, nil,
 		[]ReplicatedShardDescriptor{advancedDescriptor},

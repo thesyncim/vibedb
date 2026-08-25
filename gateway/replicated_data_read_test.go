@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,6 +130,7 @@ func TestReplicatedDataReaderLinearizableRefreshesNotLeader(t *testing.T) {
 	result, err := reader.Read(context.Background(), ReplicatedTableReadRequest{
 		Table: []byte("messages"), Key: key, Consistency: ReplicatedDataReadLinearizable,
 	})
+	defer result.Release()
 	if err != nil || !result.Found || result.Position.RouteID != resolved.RouteID ||
 		result.Position.Applied != 12 || result.Retries != 1 ||
 		!bytes.Equal(result.Value, client.value) {
@@ -154,6 +156,7 @@ func TestReplicatedDataReaderAtLeastAppliedPrefersQualifiedFollower(t *testing.T
 		Consistency: ReplicatedDataReadAtLeastApplied,
 		Position:    ReplicatedReadPosition{RouteID: resolved.RouteID, Applied: 10},
 	})
+	defer result.Release()
 	if err != nil || result.Position.RouteID != resolved.RouteID ||
 		result.Position.Applied != 12 || len(client.reads) != 1 ||
 		client.operations[0] != shardservice.ReplicatedReadFollower {
@@ -234,4 +237,172 @@ func TestReplicatedDataReaderEnforcesResourceBoundsWithoutIO(t *testing.T) {
 			t.Fatalf("case %d rejected allocations=%f", index, allocations)
 		}
 	}
+}
+
+func TestReplicatedDataReaderRefreshesDefiniteServingFenceOnce(t *testing.T) {
+	client := &publicPointReadClient{
+		value: []byte(`{"id":"customer-17"}`), staleFence: true,
+		wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1,
+	}
+	reader, holder, key, _ := testReplicatedDataReader(t, client)
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	descriptor.Command.RouteGeneration++
+	advanced, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 6, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
+	resolved, ok := advanced.ResolveReplicatedTableKey(
+		[]byte(profile.Table), key, scalarScratch[:0], replicas[:0],
+	)
+	if !ok {
+		t.Fatal("resolve advanced route")
+	}
+	var refreshes atomic.Uint32
+	reader.refresh = func(_ context.Context, stale uint64) (*Snapshot, error) {
+		if stale != holder.Current().Generation() || refreshes.Add(1) != 1 {
+			t.Fatalf("refresh stale=%d count=%d", stale, refreshes.Load())
+		}
+		client.staleFence = false
+		for _, endpoint := range resolved.Route.Replicas {
+			state := client.states[endpoint.Address]
+			state.Fence.Command = resolved.Route.Command
+			client.states[endpoint.Address] = state
+		}
+		return advanced, nil
+	}
+	result, err := reader.Read(context.Background(), ReplicatedTableReadRequest{
+		Table: []byte(profile.Table), Key: key, Consistency: ReplicatedDataReadLinearizable,
+	})
+	defer result.Release()
+	if err != nil || !result.Found || result.Position.RouteID != resolved.RouteID ||
+		refreshes.Load() != 1 || holder.Current().Generation() != 6 {
+		t.Fatalf("result=%+v refreshes=%d generation=%d err=%v",
+			result, refreshes.Load(), holder.Current().Generation(), err)
+	}
+}
+
+func TestReplicatedDataReaderCoalescesCatalogRefresh(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
+	reader, holder, _, _ := testReplicatedDataReader(t, client)
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	advanced, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 6, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var refreshes atomic.Uint32
+	reader.refresh = func(_ context.Context, stale uint64) (*Snapshot, error) {
+		if stale != holder.Current().Generation() || refreshes.Add(1) != 1 {
+			return nil, ErrReplicatedDataRead
+		}
+		close(entered)
+		<-release
+		return advanced, nil
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { first <- reader.refreshAfterFence(context.Background(), 5) }()
+	<-entered
+	go func() { second <- reader.refreshAfterFence(context.Background(), 5) }()
+	select {
+	case err := <-second:
+		t.Fatalf("coalesced waiter returned before refresh: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if refreshes.Load() != 1 || holder.Current().Generation() != 6 {
+		t.Fatalf("refreshes=%d generation=%d", refreshes.Load(), holder.Current().Generation())
+	}
+}
+
+func TestReplicatedDataReaderBoundsConcurrentResponseBytes(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
+	base, _, _, _ := testReplicatedDataReader(t, client)
+	reader, err := NewReplicatedDataReaderWithOptions(ReplicatedDataReaderOptions{
+		Catalog: base.catalog, Executor: base.executor,
+		MaxConcurrentReads: 2, MaxInFlightReadBytes: replication.MaxMutationValueBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes := uint64(replication.MaxMutationValueBytes)
+	if err := reader.admitRead(context.Background(), bytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.admitRead(context.Background(), bytes); !errors.Is(err, ErrReplicatedReadAdmission) {
+		t.Fatalf("second reservation = %v", err)
+	}
+	if reader.readBytes.Load() != bytes || len(reader.readSlots) != 1 {
+		t.Fatalf("reserved bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
+	}
+	reader.releaseRead(bytes)
+	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 0 {
+		t.Fatalf("released bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
+	}
+
+	for _, options := range []ReplicatedDataReaderOptions{
+		{Catalog: base.catalog, Executor: base.executor, MaxConcurrentReads: -1},
+		{Catalog: base.catalog, Executor: base.executor, MaxConcurrentReads: AbsoluteMaxReplicatedReadConcurrency + 1},
+		{Catalog: base.catalog, Executor: base.executor, MaxInFlightReadBytes: AbsoluteMaxReplicatedReadInFlight + 1},
+	} {
+		if _, err := NewReplicatedDataReaderWithOptions(options); !errors.Is(err, ErrReplicatedDataRead) {
+			t.Fatalf("options %+v error=%v", options, err)
+		}
+	}
+}
+
+func TestReplicatedDataReaderHoldsResponseReservationUntilRelease(t *testing.T) {
+	client := &publicPointReadClient{
+		value: []byte(`{"id":"customer-17"}`), wantRelation: 1,
+		wantMaxValue: 4 << 20, wantMinimum: 1,
+	}
+	base, _, key, _ := testReplicatedDataReader(t, client)
+	reader, err := NewReplicatedDataReaderWithOptions(ReplicatedDataReaderOptions{
+		Catalog: base.catalog, Executor: base.executor,
+		MaxConcurrentReads: 2, MaxInFlightReadBytes: 4 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ReplicatedTableReadRequest{
+		Table: []byte("messages"), Key: key, Consistency: ReplicatedDataReadLinearizable,
+	}
+	result, err := reader.Read(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.readBytes.Load() != 4<<20 || len(reader.readSlots) != 1 {
+		result.Release()
+		t.Fatalf("live response reserved bytes=%d slots=%d", reader.readBytes.Load(), len(reader.readSlots))
+	}
+	if _, err := reader.Read(context.Background(), request); !errors.Is(err, ErrReplicatedReadAdmission) {
+		result.Release()
+		t.Fatalf("read while response retained = %v", err)
+	}
+	result.Release()
+	result.Release()
+	if reader.readBytes.Load() != 0 || len(reader.readSlots) != 0 || result.Value != nil {
+		t.Fatalf("released response bytes=%d slots=%d value=%q",
+			reader.readBytes.Load(), len(reader.readSlots), result.Value)
+	}
+	result, err = reader.Read(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Release()
 }

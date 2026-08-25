@@ -3,7 +3,10 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
@@ -19,6 +22,16 @@ var (
 	// issued by a different exact route lineage. Applied indexes are local to a
 	// Raft group incarnation and must never be compared across RouteIDs.
 	ErrReplicatedReadPositionMismatch = errors.New("gateway: replicated read position does not match route")
+	// ErrReplicatedReadAdmission reports that the configured native-read byte
+	// budget cannot reserve the relation's complete response bound.
+	ErrReplicatedReadAdmission = errors.New("gateway: replicated read admission bound exceeded")
+)
+
+const (
+	DefaultReplicatedReadConcurrency     = 256
+	DefaultReplicatedReadInFlight        = 256 << 20
+	AbsoluteMaxReplicatedReadConcurrency = 1 << 16
+	AbsoluteMaxReplicatedReadInFlight    = 64 << 30
 )
 
 // ReplicatedDataReadConsistency is an explicit public point-read contract.
@@ -56,23 +69,90 @@ type ReplicatedTableReadResult struct {
 	Found    bool
 	Value    []byte
 	Retries  int
+
+	reservationOwner *ReplicatedDataReader
+	reservationBytes uint64
+}
+
+// Release returns the schema-bounded response reservation after the caller has
+// finished emitting or copying Value. A successful result must be released
+// exactly once. Release clears Value and is idempotent for the same result
+// variable; callers must not copy a live result.
+func (result *ReplicatedTableReadResult) Release() {
+	if result == nil || result.reservationOwner == nil || result.reservationBytes == 0 {
+		return
+	}
+	owner, bytes := result.reservationOwner, result.reservationBytes
+	result.reservationOwner, result.reservationBytes, result.Value = nil, 0, nil
+	owner.releaseRead(bytes)
 }
 
 // ReplicatedDataReader binds public table/key reads to one atomically pinned
 // catalog generation and the SQL-free RF3 executor.
 type ReplicatedDataReader struct {
-	catalog  *CatalogHolder
-	executor *ReplicatedExecutor
+	catalog      *CatalogHolder
+	executor     *ReplicatedExecutor
+	refresh      RefreshFunc
+	readSlots    chan struct{}
+	maxReadBytes uint64
+	readBytes    atomic.Uint64
+
+	refreshMu sync.Mutex
+	active    *replicatedDataCatalogRefresh
+}
+
+type replicatedDataCatalogRefresh struct {
+	done  chan struct{}
+	floor uint64
+	err   error
+}
+
+type ReplicatedDataReaderOptions struct {
+	Catalog  *CatalogHolder
+	Executor *ReplicatedExecutor
+	// Refresh obtains and authenticates a catalog generation strictly newer
+	// than the generation rejected by a serving fence. Definite stale-fence
+	// refusals are the only failures that invoke it.
+	Refresh RefreshFunc
+	// MaxConcurrentReads bounds requests admitted to native RF3 point I/O.
+	// Zero selects DefaultReplicatedReadConcurrency.
+	MaxConcurrentReads int
+	// MaxInFlightReadBytes reserves each read at its schema-authenticated
+	// MaxDocumentBytes before network I/O. Zero selects
+	// DefaultReplicatedReadInFlight.
+	MaxInFlightReadBytes uint64
 }
 
 func NewReplicatedDataReader(
 	catalog *CatalogHolder,
 	executor *ReplicatedExecutor,
 ) (*ReplicatedDataReader, error) {
-	if catalog == nil || catalog.Current() == nil || executor == nil || executor.client == nil {
+	return NewReplicatedDataReaderWithOptions(ReplicatedDataReaderOptions{
+		Catalog: catalog, Executor: executor,
+	})
+}
+
+func NewReplicatedDataReaderWithOptions(
+	options ReplicatedDataReaderOptions,
+) (*ReplicatedDataReader, error) {
+	concurrency := options.MaxConcurrentReads
+	if concurrency == 0 {
+		concurrency = DefaultReplicatedReadConcurrency
+	}
+	maximumBytes := options.MaxInFlightReadBytes
+	if maximumBytes == 0 {
+		maximumBytes = DefaultReplicatedReadInFlight
+	}
+	if options.Catalog == nil || options.Catalog.Current() == nil ||
+		options.Executor == nil || options.Executor.client == nil ||
+		concurrency <= 0 || concurrency > AbsoluteMaxReplicatedReadConcurrency ||
+		maximumBytes == 0 || maximumBytes > AbsoluteMaxReplicatedReadInFlight {
 		return nil, ErrReplicatedDataRead
 	}
-	return &ReplicatedDataReader{catalog: catalog, executor: executor}, nil
+	return &ReplicatedDataReader{
+		catalog: options.Catalog, executor: options.Executor, refresh: options.Refresh,
+		readSlots: make(chan struct{}, concurrency), maxReadBytes: maximumBytes,
+	}, nil
 }
 
 // Read executes one RF3 base-relation point read. Linearizable uses the
@@ -105,9 +185,30 @@ func (reader *ReplicatedDataReader) Read(
 		return ReplicatedTableReadResult{}, ErrReplicatedDataRead
 	}
 
+	result, generation, err := reader.readPinned(ctx, request, minimumApplied, linearizable)
+	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+		return result, err
+	}
+	// A serving-fence refusal is definite: the read did not execute against the
+	// rejected route. Coalesce one authenticated catalog refresh, re-resolve the
+	// original byte-native request, and retry exactly once. Transport ambiguity
+	// and every other failure return without refresh or replay.
+	if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+		return ReplicatedTableReadResult{}, errors.Join(err, refreshErr)
+	}
+	result, _, err = reader.readPinned(ctx, request, minimumApplied, linearizable)
+	return result, err
+}
+
+func (reader *ReplicatedDataReader) readPinned(
+	ctx context.Context,
+	request ReplicatedTableReadRequest,
+	minimumApplied uint64,
+	linearizable bool,
+) (ReplicatedTableReadResult, uint64, error) {
 	lease := reader.catalog.pinCurrent()
 	if lease.snapshot == nil {
-		return ReplicatedTableReadResult{}, ErrNoCatalog
+		return ReplicatedTableReadResult{}, 0, ErrNoCatalog
 	}
 	defer lease.release()
 
@@ -117,10 +218,14 @@ func (reader *ReplicatedDataReader) Read(
 		request.Table, request.Key, scalarScratch[:0], replicas[:0],
 	)
 	if !ok {
-		return ReplicatedTableReadResult{}, ErrReplicatedTableRoute
+		return ReplicatedTableReadResult{}, lease.generation, ErrReplicatedTableRoute
 	}
 	if !linearizable && request.Position.RouteID != resolved.RouteID {
-		return ReplicatedTableReadResult{}, ErrReplicatedReadPositionMismatch
+		return ReplicatedTableReadResult{}, lease.generation, ErrReplicatedReadPositionMismatch
+	}
+	readBytes := uint64(resolved.Profile.MaxDocumentBytes)
+	if err := reader.admitRead(ctx, readBytes); err != nil {
+		return ReplicatedTableReadResult{}, lease.generation, err
 	}
 
 	result, err := reader.executor.ReadPoint(ctx, resolved.Route, ReplicatedPointRead{
@@ -129,10 +234,110 @@ func (reader *ReplicatedDataReader) Read(
 		Linearizable: linearizable,
 	})
 	if err != nil {
-		return ReplicatedTableReadResult{}, err
+		reader.releaseRead(readBytes)
+		return ReplicatedTableReadResult{}, lease.generation, err
 	}
 	return ReplicatedTableReadResult{
 		Position: ReplicatedReadPosition{RouteID: resolved.RouteID, Applied: result.Applied},
 		Found:    result.Found, Value: result.Value, Retries: result.Retries,
-	}, nil
+		reservationOwner: reader, reservationBytes: readBytes,
+	}, lease.generation, nil
+}
+
+func (reader *ReplicatedDataReader) admitRead(ctx context.Context, bytes uint64) error {
+	if reader == nil || ctx == nil || bytes == 0 || bytes > reader.maxReadBytes ||
+		reader.readSlots == nil {
+		return ErrReplicatedReadAdmission
+	}
+	select {
+	case reader.readSlots <- struct{}{}:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+	for {
+		used := reader.readBytes.Load()
+		if used > reader.maxReadBytes || bytes > reader.maxReadBytes-used {
+			<-reader.readSlots
+			return ErrReplicatedReadAdmission
+		}
+		if reader.readBytes.CompareAndSwap(used, used+bytes) {
+			return nil
+		}
+	}
+}
+
+func (reader *ReplicatedDataReader) releaseRead(bytes uint64) {
+	if reader == nil || bytes == 0 || reader.readSlots == nil {
+		return
+	}
+	reader.readBytes.Add(^(bytes - 1))
+	<-reader.readSlots
+}
+
+func (reader *ReplicatedDataReader) refreshAfterFence(
+	ctx context.Context,
+	staleGeneration uint64,
+) error {
+	if reader == nil || reader.catalog == nil || ctx == nil || staleGeneration == 0 {
+		return ErrReplicatedDataRead
+	}
+	for {
+		if current := reader.catalog.Current(); current != nil &&
+			current.Generation() > staleGeneration {
+			return nil
+		}
+		reader.refreshMu.Lock()
+		if active := reader.active; active != nil {
+			reader.refreshMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			case <-active.done:
+			}
+			if current := reader.catalog.Current(); current != nil &&
+				current.Generation() > staleGeneration {
+				return nil
+			}
+			if active.floor >= staleGeneration {
+				if active.err != nil {
+					return active.err
+				}
+				return ErrStaleGeneration
+			}
+			continue
+		}
+		active := &replicatedDataCatalogRefresh{
+			done: make(chan struct{}), floor: staleGeneration,
+		}
+		reader.active = active
+		reader.refreshMu.Unlock()
+
+		var snapshot *Snapshot
+		if reader.refresh == nil {
+			active.err = ErrStaleGeneration
+		} else {
+			snapshot, active.err = reader.refresh(ctx, staleGeneration)
+			if active.err == nil && (snapshot == nil || snapshot.Generation() <= staleGeneration) {
+				active.err = ErrStaleGeneration
+			}
+			if active.err == nil {
+				current := reader.catalog.Current()
+				if current == nil || current.Generation() < snapshot.Generation() {
+					if publishErr := reader.catalog.publishNewerChecked(snapshot); publishErr != nil &&
+						!errors.Is(publishErr, ErrCatalogGenerationNotNewer) {
+						active.err = publishErr
+					}
+				}
+			}
+		}
+		if current := reader.catalog.Current(); current != nil &&
+			current.Generation() > staleGeneration {
+			active.err = nil
+		}
+		reader.refreshMu.Lock()
+		reader.active = nil
+		close(active.done)
+		reader.refreshMu.Unlock()
+		return active.err
+	}
 }
