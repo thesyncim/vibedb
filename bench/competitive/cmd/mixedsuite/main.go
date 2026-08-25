@@ -410,7 +410,48 @@ func executeMixed(
 			telemetry.Available, engine,
 		)
 	}
+	if err := validatePayloadAgreement(header, rows, telemetry); err != nil {
+		return nil, nil, mixedtelemetry.Record{}, err
+	}
 	return header, rows, telemetry, nil
+}
+
+func validatePayloadAgreement(
+	header []string,
+	rows []rawRow,
+	telemetry mixedtelemetry.Record,
+) error {
+	index := headerIndex(header)
+	knownAt, knownOK := index["durability-payload-known"]
+	bytesAt, bytesOK := index["durability-payload-B"]
+	ratioAt, ratioOK := index["durability-payload/logical"]
+	if !knownOK || !bytesOK || !ratioOK {
+		return errors.New("mixed output omits durability payload columns")
+	}
+	for _, row := range rows {
+		known, err := strconv.ParseBool(row.values[knownAt])
+		if err != nil {
+			return fmt.Errorf("parse durability payload known: %w", err)
+		}
+		payloadBytes, err := strconv.ParseUint(row.values[bytesAt], 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse durability payload bytes: %w", err)
+		}
+		ratio, err := strconv.ParseFloat(row.values[ratioAt], 64)
+		if err != nil {
+			return fmt.Errorf("parse durability payload ratio: %w", err)
+		}
+		if known != telemetry.DurabilityPayloadKnown || payloadBytes != telemetry.DurabilityPayloadBytes {
+			return fmt.Errorf(
+				"result/telemetry durability payload mismatch: row=%t/%d telemetry=%t/%d",
+				known, payloadBytes, telemetry.DurabilityPayloadKnown, telemetry.DurabilityPayloadBytes,
+			)
+		}
+		if !known && (payloadBytes != 0 || ratio != 0) {
+			return fmt.Errorf("unknown durability payload is not canonical false/zero: %d/%g", payloadBytes, ratio)
+		}
+	}
+	return nil
 }
 
 // environmentWith applies deterministic overrides without leaving duplicate

@@ -522,20 +522,10 @@ func main() {
 		printHeader(os.Stdout)
 	}
 	throughput := float64(*operations) * float64(time.Second) / float64(measuredNanos)
-	payloadDelta, payloadMonotonic := counterDeltaKnown(
-		durableBefore.DeviceBytes, durableAfter.DeviceBytes,
+	payload := qualifyDurabilityPayload(
+		engine.DurabilityMode(), durableOK, durableBefore, durableAfter,
 	)
-	payloadKnown := durableOK && payloadMonotonic &&
-		(engine.DurabilityMode() == competitive.DurabilityOrdinarySync ||
-			engine.DurabilityMode() == competitive.DurabilityPowerSafe)
-	durabilityPayloadBytes := uint64(0)
-	payloadRatio := 0.0
-	if payloadKnown {
-		durabilityPayloadBytes = payloadDelta
-		if logicalMutationBytes != 0 {
-			payloadRatio = float64(durabilityPayloadBytes) / float64(logicalMutationBytes)
-		}
-	}
+	payloadRatio := payload.Ratio(logicalMutationBytes)
 	printResult := func(operation string, result summary) {
 		fmt.Printf("%-20s %-24s %-8s %-4s %-14s %7d %9d %7d %10d %9d %13d %7d %-18s %10d %11.3f %11.3f %11.3f %11.3f %11.3f %12.0f %10.1f %10.1f %10.1f %11.1f %12.1f %11t %14d %14d %13.4f\n",
 			reportName, engine.DurabilityMode(), mix.name, cardinality, shape,
@@ -543,8 +533,8 @@ func main() {
 			automaticCheckpoints, *exactIndexes, *clients, operation, result.calls,
 			micros(result.p50), micros(result.p95), micros(result.p99), micros(result.p999), micros(result.max), throughput,
 			mib(fp.DiskBytes), mib(fp.DiskAllocatedBytes), mib(int64(fp.HeapAlloc)),
-			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()), payloadKnown,
-			logicalMutationBytes, durabilityPayloadBytes, payloadRatio)
+			mib(int64(fp.RuntimeResident)), mib(fp.MaxRSSBytes()), payload.Known,
+			logicalMutationBytes, payload.Bytes, payloadRatio)
 	}
 	for kind, result := range summaries {
 		if result.calls == 0 {
@@ -559,7 +549,7 @@ func main() {
 		telemetry := buildTelemetryRecord(
 			factory.Name, *clients,
 			runtimeBefore, runtimeAfter,
-			durableBefore, durableAfter, durableOK,
+			durableBefore, durableAfter, durableOK, payload,
 		)
 		check(mixedtelemetry.Write(os.Stderr, telemetry))
 		fmt.Fprintf(
@@ -569,26 +559,38 @@ func main() {
 			runtimeAfter.TotalAlloc-runtimeBefore.TotalAlloc,
 			runtimeAfter.Mallocs-runtimeBefore.Mallocs,
 		)
-		if durableOK {
-			fmt.Fprintf(
-				os.Stderr,
-				"vibedb-internal clients=%d overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d durability-payload-known=%t durability-payload-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
-				*clients,
-				durableAfter.PrimaryOverlayFolds-durableBefore.PrimaryOverlayFolds,
-				durableAfter.ConcurrentPrimaryFallbacks-durableBefore.ConcurrentPrimaryFallbacks,
-				durableAfter.ConcurrentPrimaryReplaces-durableBefore.ConcurrentPrimaryReplaces,
-				durableAfter.ConcurrentPrimaryPublishGroups-durableBefore.ConcurrentPrimaryPublishGroups,
-				durableAfter.AutomaticCheckpoints-durableBefore.AutomaticCheckpoints,
-				durableAfter.JournalDeltaCheckpoints-durableBefore.JournalDeltaCheckpoints,
-				durableAfter.JournalDeltaRecords-durableBefore.JournalDeltaRecords,
-				durableAfter.JournalDeltaBytes-durableBefore.JournalDeltaBytes,
-				durableAfter.JournalDeltaFullFallbacks-durableBefore.JournalDeltaFullFallbacks,
-				payloadMonotonic, payloadDelta,
-				durableAfter.PrimaryLeafSplits-durableBefore.PrimaryLeafSplits,
-				durableAfter.PrimaryEmptyReclaims-durableBefore.PrimaryEmptyReclaims,
+		if factory.Name == "vibedb" {
+			writeVibeInternalStats(
+				os.Stderr, *clients, durableBefore, durableAfter, durableOK, payload,
 			)
 		}
 	}
+}
+
+func writeVibeInternalStats(
+	w io.Writer,
+	clients int,
+	before, after durable.Stats,
+	available bool,
+	payload durabilityPayload,
+) {
+	fmt.Fprintf(
+		w,
+		"vibedb-internal clients=%d durable-stats-available=%t overlay-folds=%d pressure-fallbacks=%d fast-replaces=%d publish-groups=%d automatic-checkpoints=%d journal-delta-checkpoints=%d journal-delta-records=%d journal-delta-bytes=%d journal-full-fallbacks=%d durability-payload-known=%t durability-payload-bytes=%d leaf-splits=%d empty-reclaims=%d\n",
+		clients, available,
+		counterDelta(before.PrimaryOverlayFolds, after.PrimaryOverlayFolds),
+		counterDelta(before.ConcurrentPrimaryFallbacks, after.ConcurrentPrimaryFallbacks),
+		counterDelta(before.ConcurrentPrimaryReplaces, after.ConcurrentPrimaryReplaces),
+		counterDelta(before.ConcurrentPrimaryPublishGroups, after.ConcurrentPrimaryPublishGroups),
+		counterDelta(before.AutomaticCheckpoints, after.AutomaticCheckpoints),
+		counterDelta(before.JournalDeltaCheckpoints, after.JournalDeltaCheckpoints),
+		counterDelta(before.JournalDeltaRecords, after.JournalDeltaRecords),
+		counterDelta(before.JournalDeltaBytes, after.JournalDeltaBytes),
+		counterDelta(before.JournalDeltaFullFallbacks, after.JournalDeltaFullFallbacks),
+		payload.Known, payload.Bytes,
+		counterDelta(before.PrimaryLeafSplits, after.PrimaryLeafSplits),
+		counterDelta(before.PrimaryEmptyReclaims, after.PrimaryEmptyReclaims),
+	)
 }
 
 // run executes one operation against the client's session, updating the client's
@@ -760,6 +762,36 @@ func durableStats(engine competitive.Engine) (durable.Stats, bool) {
 	return reporter.DurableStats(), true
 }
 
+// durabilityPayload is the single qualified measurement consumed by every
+// publication surface. Unknown is represented canonically as false/zero.
+type durabilityPayload struct {
+	Known bool
+	Bytes uint64
+}
+
+func (p durabilityPayload) Ratio(logicalBytes uint64) float64 {
+	if !p.Known || logicalBytes == 0 {
+		return 0
+	}
+	return float64(p.Bytes) / float64(logicalBytes)
+}
+
+func qualifyDurabilityPayload(
+	mode competitive.DurabilityMode,
+	statsAvailable bool,
+	before, after durable.Stats,
+) durabilityPayload {
+	if !statsAvailable ||
+		(mode != competitive.DurabilityOrdinarySync && mode != competitive.DurabilityPowerSafe) {
+		return durabilityPayload{}
+	}
+	bytes, monotonic := counterDeltaKnown(before.DeviceBytes, after.DeviceBytes)
+	if !monotonic {
+		return durabilityPayload{}
+	}
+	return durabilityPayload{Known: true, Bytes: bytes}
+}
+
 // buildTelemetryRecord turns the two point-in-time snapshots into a versioned
 // transport record. Monotonic counters are deltas over the measured phase.
 // Largest-group fields are high-waters rather than counters, so retaining both
@@ -770,11 +802,14 @@ func buildTelemetryRecord(
 	runtimeBefore, runtimeAfter runtime.MemStats,
 	durableBefore, durableAfter durable.Stats,
 	durableOK bool,
+	payload durabilityPayload,
 ) mixedtelemetry.Record {
 	record := mixedtelemetry.Record{
 		Engine:                 engine,
 		Clients:                clients,
 		Available:              durableOK,
+		DurabilityPayloadKnown: payload.Known,
+		DurabilityPayloadBytes: payload.Bytes,
 		RuntimeTotalAllocBytes: counterDelta(runtimeBefore.TotalAlloc, runtimeAfter.TotalAlloc),
 		RuntimeMallocs:         counterDelta(runtimeBefore.Mallocs, runtimeAfter.Mallocs),
 	}
@@ -893,9 +928,6 @@ func buildTelemetryRecord(
 	record.JournalDeltaFallbacks = counterDelta(
 		durableBefore.JournalDeltaFullFallbacks,
 		durableAfter.JournalDeltaFullFallbacks,
-	)
-	record.DurabilityPayloadBytes, record.DurabilityPayloadKnown = counterDeltaKnown(
-		durableBefore.DeviceBytes, durableAfter.DeviceBytes,
 	)
 	record.LeafSplits = counterDelta(
 		durableBefore.PrimaryLeafSplits,

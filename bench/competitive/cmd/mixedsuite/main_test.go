@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/thesyncim/vibedb/bench/competitive/cmd/internal/mixedtelemetry"
 )
 
 func TestLatinSquareScheduleIsDeterministicAndPositionBalanced(t *testing.T) {
@@ -129,6 +131,29 @@ vibedb/bulk-unified buffered-visible ycsb-a low inline 10 20 2 64 0 0 1 read 10 
 	}
 }
 
+func TestValidatePayloadAgreementRejectsUnknownNonzeroAndSurfaceDrift(t *testing.T) {
+	header := strings.Fields("durability-payload-known durability-payload-B durability-payload/logical")
+	unknown := mixedtelemetry.Record{}
+	for _, row := range [][]string{
+		{"false", "1", "0"},
+		{"false", "0", "1"},
+		{"true", "64", "2"},
+	} {
+		if err := validatePayloadAgreement(header, []rawRow{{values: row}}, unknown); err == nil {
+			t.Fatalf("accepted inconsistent payload row %v", row)
+		}
+	}
+	for _, reason := range []string{"buffered-visible", "stats-unavailable", "counter-regressed"} {
+		t.Run(reason, func(t *testing.T) {
+			if err := validatePayloadAgreement(
+				header, []rawRow{{values: []string{"false", "0", "0"}}}, unknown,
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestParseFlagsRequiresPublishableRepetitionCountByDefault(t *testing.T) {
 	args := []string{
 		"-mixed-bin=" + os.Args[0],
@@ -192,8 +217,8 @@ done
 [ "$engine" = vibedb ] && available=true
 printf '%s\n' "$engine" >> "$MIXEDSUITE_TEST_LOG"
 printf '%s\n' 'engine durability workload card document-shape docs measured warmup checkpoint forced-cp exact-indexes clients operation calls p50-us p95-us p99-us p99.9-us max-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB durability-payload-known logical-write-B durability-payload-B durability-payload/logical'
-printf '%s\n' "$engine buffered-visible ycsb-a low inline 10 20 2 64 0 0 1 read 10 1 2 3 4 5 1000 1 1 2 3 4 $available 100 200 2"
-printf 'mixed-telemetry-json\t%s\n' "{\"schema\":1,\"engine\":\"$engine\",\"clients\":1,\"durable_stats_available\":$available,\"runtime_total_alloc_bytes\":100,\"runtime_mallocs\":10,\"scalar_patch_attempts\":20,\"scalar_patch_accepts\":19,\"publish_groups\":5,\"publish_group_max\":4,\"journal_acks\":8,\"journal_syncs\":2,\"journal_group_max\":4,\"journal_delta_records\":7,\"journal_delta_bytes\":4096,\"journal_delta_fallbacks\":1,\"durability_payload_known\":true,\"durability_payload_bytes\":8192}" >&2
+printf '%s\n' "$engine buffered-visible ycsb-a low inline 10 20 2 64 0 0 1 read 10 1 2 3 4 5 1000 1 1 2 3 4 false 100 0 0"
+printf 'mixed-telemetry-json\t%s\n' "{\"schema\":1,\"engine\":\"$engine\",\"clients\":1,\"durable_stats_available\":$available,\"runtime_total_alloc_bytes\":100,\"runtime_mallocs\":10,\"scalar_patch_attempts\":20,\"scalar_patch_accepts\":19,\"publish_groups\":5,\"publish_group_max\":4,\"journal_acks\":8,\"journal_syncs\":2,\"journal_group_max\":4,\"journal_delta_records\":7,\"journal_delta_bytes\":4096,\"journal_delta_fallbacks\":1,\"durability_payload_known\":false}" >&2
 `
 	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

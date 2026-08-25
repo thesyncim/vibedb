@@ -164,7 +164,9 @@ func (shortWriter) Write(p []byte) (int, error) {
 
 func TestMetricsOmitDurableCountersWhenUnavailable(t *testing.T) {
 	without := (Record{ScalarPatchAttempts: 99}).Metrics()
-	if len(without) != 2 || without[0].Scope != "runtime" || without[1].Scope != "runtime" {
+	if len(without) != 4 || without[0].Scope != "runtime" || without[1].Scope != "runtime" ||
+		without[2] != (Metric{Scope: "durability", Name: "payload-known"}) ||
+		without[3] != (Metric{Scope: "durability", Name: "payload-bytes"}) {
 		t.Fatalf("metrics without durable stats = %+v", without)
 	}
 	with := (Record{Available: true, ScalarPatchAttempts: 99}).Metrics()

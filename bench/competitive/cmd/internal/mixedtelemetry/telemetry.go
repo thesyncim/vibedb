@@ -126,6 +126,8 @@ func (r Record) Metrics() []Metric {
 	metrics := []Metric{
 		{Scope: "runtime", Name: "total-alloc-bytes", Value: r.RuntimeTotalAllocBytes},
 		{Scope: "runtime", Name: "mallocs", Value: r.RuntimeMallocs},
+		{Scope: "durability", Name: "payload-known", Value: boolUint64(r.DurabilityPayloadKnown)},
+		{Scope: "durability", Name: "payload-bytes", Value: r.DurabilityPayloadBytes},
 	}
 	if !r.Available {
 		return metrics
@@ -172,8 +174,6 @@ func (r Record) Metrics() []Metric {
 		Metric{Scope: "vibedb", Name: "journal-delta-records", Value: r.JournalDeltaRecords},
 		Metric{Scope: "vibedb", Name: "journal-delta-bytes", Value: r.JournalDeltaBytes},
 		Metric{Scope: "vibedb", Name: "journal-delta-fallbacks", Value: r.JournalDeltaFallbacks},
-		Metric{Scope: "vibedb", Name: "durability-payload-known", Value: boolUint64(r.DurabilityPayloadKnown)},
-		Metric{Scope: "vibedb", Name: "durability-payload-bytes", Value: r.DurabilityPayloadBytes},
 		Metric{Scope: "vibedb", Name: "leaf-splits", Value: r.LeafSplits},
 		Metric{Scope: "vibedb", Name: "empty-reclaims", Value: r.EmptyReclaims},
 	)
