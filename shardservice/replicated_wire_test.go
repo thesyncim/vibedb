@@ -146,6 +146,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	responses := []*ReplicatedResponse{
 		{Kind: ReplicatedHandshake, HasState: true, State: state},
 		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
 				AppliedIndex: 8, CompletionAppliedSequence: 2,
 				CompletionBytes: len(completion)}, Completion: completion},
@@ -158,7 +159,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-			HasState: true, State: state, Outcome: raftserve.Outcome{
+			HasState: true, State: state, RequestDigest: [32]byte{1}, Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},
 	}
 	for _, response := range responses {
@@ -173,6 +174,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if decoded.Kind != response.Kind || decoded.Refusal != response.Refusal ||
 			decoded.HasState != response.HasState ||
 			decoded.State != response.State || decoded.Outcome != response.Outcome ||
+			decoded.RequestDigest != response.RequestDigest ||
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
 		}
@@ -187,7 +189,7 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	for code := raftserve.OutcomePending; code <= raftserve.OutcomeProposalAbandoned; code++ {
 		response := &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-			HasState: true, State: state,
+			HasState: true, State: state, RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: code, AppliedIndex: 8},
 		}
 		valid := validReplicatedResponse(response)
@@ -198,7 +200,7 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	}
 	valid := &ReplicatedResponse{
 		Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-		HasState: true, State: state,
+		HasState: true, State: state, RequestDigest: [32]byte{1},
 		Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8},
 	}
 	invalid := []raftserve.Outcome{
@@ -209,6 +211,11 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	}
 	if !validReplicatedResponse(valid) {
 		t.Fatal("valid applied refusal was rejected")
+	}
+	missingDigest := *valid
+	missingDigest.RequestDigest = [32]byte{}
+	if validReplicatedResponse(&missingDigest) {
+		t.Fatal("applied refusal without an exact request digest was accepted")
 	}
 	for _, outcome := range invalid {
 		candidate := *valid
@@ -419,6 +426,7 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 	completion := testReplicatedCompletion(f, fence, 2)
 	for _, response := range []*ReplicatedResponse{
 		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
 				AppliedIndex: 8, CompletionAppliedSequence: 2,
 				CompletionBytes: len(completion)},
