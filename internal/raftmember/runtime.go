@@ -808,10 +808,19 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 		return RuntimeStatus{}, err
 	}
 	status := runtime.node.Status()
+	publishedApplied := runtime.node.PublishedApplied()
+	checkpointApplied := runtime.apply.CheckpointAppliedIndex()
+	if status.Applied > publishedApplied || publishedApplied > status.GetCommit() ||
+		checkpointApplied > publishedApplied {
+		return RuntimeStatus{}, runtime.fail(fmt.Errorf(
+			"runtime status cuts are inconsistent: raw applied %d, published %d, checkpoint %d, commit %d",
+			status.Applied, publishedApplied, checkpointApplied, status.GetCommit(),
+		))
+	}
 	return RuntimeStatus{
 		MemberID: status.ID, LeaderID: status.Lead, Term: status.GetTerm(),
-		Commit: status.GetCommit(), Applied: status.Applied,
-		CheckpointApplied: runtime.apply.CheckpointAppliedIndex(),
+		Commit: status.GetCommit(), Applied: publishedApplied,
+		CheckpointApplied: checkpointApplied,
 		LeadTransferee:    status.LeadTransferee, RaftState: status.RaftState,
 	}, nil
 }

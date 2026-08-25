@@ -64,11 +64,12 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 
 	client.resetAttempts()
 	if err = authority.Publish(ctx, 0, first); err != nil {
-		t.Fatalf("publish initial catalog: %v", err)
+		t.Fatalf("publish initial catalog: %v; proposal trace=%+v", err, client.proposalTrace())
 	}
 	attempts, _ := client.snapshot()
 	if len(attempts) != 1 {
-		t.Fatalf("catalog proposal attempts = %d, want 1", len(attempts))
+		t.Fatalf("catalog proposal attempts = %d, want 1; trace=%+v",
+			len(attempts), client.proposalTrace())
 	}
 	// Replaying the byte-identical proposal is a retained-result lookup. It must
 	// not apply the put-if-absent command a second time.

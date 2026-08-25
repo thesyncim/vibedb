@@ -267,7 +267,7 @@ func (executor *ReplicatedExecutor) readPoint(
 					preferred = endpoint.Member
 				}
 				if attempt+1 < executor.maxAttempts {
-					if err := waitReplicatedFenceRetry(ctx, attempt); err != nil {
+					if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
 						return ReplicatedPointResult{}, errors.Join(ErrReplicatedLeader, err)
 					}
 				}
@@ -615,9 +615,20 @@ func (executor *ReplicatedExecutor) propose(
 			endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
 			if err != nil {
 				if lastUnknown != nil {
-					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-						Command: append([]byte(nil), original...), Cause: errors.Join(lastUnknown, err),
+					lastUnknown = errors.Join(lastUnknown, err)
+					if attempt+1 == executor.maxAttempts || context.Cause(ctx) != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...), Cause: lastUnknown,
+						}
 					}
+					preferred = nextReplicatedMember(route, preferred)
+					if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, waitErr),
+						}
+					}
+					continue
 				}
 				return ReplicatedResult{}, err
 			}
@@ -630,13 +641,18 @@ func (executor *ReplicatedExecutor) propose(
 				Command: original,
 			})
 		if err != nil {
-			if errors.Is(err, raftservice.ErrOutcomeUnknown) {
-				lastUnknown = errors.Join(lastUnknown, err)
-				continue
-			}
 			// A transport implementation might not wrap a proposal failure;
 			// fail closed because the complete command could have reached admission.
 			lastUnknown = errors.Join(lastUnknown, err)
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+						Command: append([]byte(nil), original...),
+						Cause:   errors.Join(lastUnknown, waitErr),
+					}
+				}
+			}
 			continue
 		}
 		if !validReplicatedWriteResponseFields(response) {
@@ -709,6 +725,21 @@ func (executor *ReplicatedExecutor) propose(
 				continue
 			}
 			preferred = response.State.LeaderID
+			if preferred != 0 && preferred != endpoint.Member {
+				continue
+			}
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					if lastUnknown != nil {
+						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+							Command: append([]byte(nil), original...),
+							Cause:   errors.Join(lastUnknown, err),
+						}
+					}
+					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
+				}
+			}
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
 			if !validReplicatedNonterminalResponse(response) {
@@ -717,6 +748,18 @@ func (executor *ReplicatedExecutor) propose(
 			}
 			lastUnknown = errors.Join(lastUnknown, raftservice.ErrOutcomeUnknown)
 			preferred = response.State.LeaderID
+			if preferred != 0 && preferred != endpoint.Member {
+				continue
+			}
+			preferred = nextReplicatedMember(route, endpoint.Member)
+			if attempt+1 != executor.maxAttempts {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
+						Command: append([]byte(nil), original...),
+						Cause:   errors.Join(lastUnknown, err),
+					}
+				}
+			}
 			continue
 		case shardservice.ReplicatedRefusal:
 			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
@@ -743,10 +786,14 @@ func (executor *ReplicatedExecutor) propose(
 					continue
 				}
 				preferred = response.State.LeaderID
+				if preferred != 0 && preferred != endpoint.Member {
+					continue
+				}
+				preferred = nextReplicatedMember(route, endpoint.Member)
 				if attempt+1 == executor.maxAttempts {
 					continue
 				}
-				if err := waitReplicatedFenceRetry(ctx, attempt); err != nil {
+				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
 					if lastUnknown != nil {
 						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
 							Command: append([]byte(nil), original...),
@@ -780,17 +827,15 @@ func (executor *ReplicatedExecutor) propose(
 	return ReplicatedResult{}, ErrReplicatedLeader
 }
 
-func waitReplicatedFenceRetry(ctx context.Context, attempt int) error {
+func waitReplicatedFailoverRetry(ctx context.Context, attempt int) error {
 	// Failover is exceptional, so spend a small bounded wall-clock budget to
 	// avoid burning every retry while the replacement term is still settling.
-	// The normal proposal path never creates a timer. Five milliseconds keeps a
+	// The normal proposal path never creates a timer. Twenty milliseconds keeps a
 	// one-race retry responsive. The shipped eight-attempt executor waits at
-	// most 315 ms; the absolute sixteen-attempt configuration remains below 1 s.
-	shift := attempt
-	if shift > 4 {
-		shift = 4
-	}
-	delay := 5 * time.Millisecond * time.Duration(uint64(1)<<uint(shift))
+	// most 1.26 s, spanning the harness's 950 ms maximum randomized election
+	// timeout with scheduler margin; the absolute sixteen-attempt configuration
+	// remains below 4 s.
+	delay := replicatedFailoverRetryDelay(attempt)
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -799,6 +844,16 @@ func waitReplicatedFenceRetry(ctx context.Context, attempt int) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func replicatedFailoverRetryDelay(attempt int) time.Duration {
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	} else if shift > 4 {
+		shift = 4
+	}
+	return 20 * time.Millisecond * time.Duration(uint64(1)<<uint(shift))
 }
 
 func (executor *ReplicatedExecutor) doReplicated(
@@ -1061,6 +1116,14 @@ func replicatedEndpoint(
 		}
 	}
 	return ReplicatedEndpoint{}, 0, false
+}
+
+func nextReplicatedMember(route ReplicatedRoute, member uint64) uint64 {
+	_, ordinal, found := replicatedEndpoint(route, member)
+	if !found || len(route.Replicas) < 2 {
+		return 0
+	}
+	return route.Replicas[(ordinal+1)%len(route.Replicas)].Member
 }
 
 func firstUnvisitedReplicatedEndpoint(

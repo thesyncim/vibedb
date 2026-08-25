@@ -1025,6 +1025,15 @@ type faultProcessClient struct {
 	member   uint64
 	attempts [][]byte
 	hidden   []byte
+	trace    []processProposalTrace
+}
+
+type processProposalTrace struct {
+	Member uint64
+	Kind   shardservice.ReplicatedResponseKind
+	Leader uint64
+	Term   uint64
+	Failed bool
 }
 
 func newFaultProcessClient(t testing.TB, cluster *processRF3Cluster) *faultProcessClient {
@@ -1076,6 +1085,19 @@ func (client *faultProcessClient) DoReplicated(
 		}
 	}
 	response, err := client.base.DoReplicated(ctx, endpoint, request)
+	if isMutation {
+		trace := processProposalTrace{Member: member, Failed: err != nil}
+		if response != nil {
+			trace.Kind = response.Kind
+			if response.HasState {
+				trace.Leader = response.State.LeaderID
+				trace.Term = response.State.Fence.Term
+			}
+		}
+		client.mu.Lock()
+		client.trace = append(client.trace, trace)
+		client.mu.Unlock()
+	}
 	if stage == faultAfterDecodedResponseBeforeClientDelivery && err == nil && response != nil &&
 		response.Kind == shardservice.ReplicatedCompletion {
 		client.mu.Lock()
@@ -1110,7 +1132,14 @@ func (client *faultProcessClient) resetAttempts() {
 	client.mu.Lock()
 	client.attempts = client.attempts[:0]
 	client.hidden = client.hidden[:0]
+	client.trace = client.trace[:0]
 	client.mu.Unlock()
+}
+
+func (client *faultProcessClient) proposalTrace() []processProposalTrace {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return append([]processProposalTrace(nil), client.trace...)
 }
 
 func (client *faultProcessClient) snapshot() ([][]byte, []byte) {
