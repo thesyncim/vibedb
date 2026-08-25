@@ -418,6 +418,30 @@ func AdoptRuntime(
 	database *sqldriver.Database,
 	apply *sqldriver.ReplicatedApply,
 ) (*Runtime, error) {
+	return adoptRuntime(wal, database, apply, 0)
+}
+
+// AdoptStagedRuntime adopts one preplanned learner incarnation. The first
+// attempt mints expected; an exact retry may reclaim it only through the WAL's
+// pristine-incarnation proof. It never silently advances to expected+1.
+func AdoptStagedRuntime(
+	wal *raftstore.Store,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expected uint64,
+) (*Runtime, error) {
+	if expected == 0 {
+		return nil, ErrRuntimeOwnership
+	}
+	return adoptRuntime(wal, database, apply, expected)
+}
+
+func adoptRuntime(
+	wal *raftstore.Store,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expected uint64,
+) (*Runtime, error) {
 	if wal == nil || database == nil || apply == nil {
 		return nil, ErrRuntimeOwnership
 	}
@@ -434,6 +458,11 @@ func AdoptRuntime(
 	}
 	if liveBinding != profile.Binding {
 		return nil, ErrBindingMismatch
+	}
+	current := wal.CurrentIncarnation()
+	resume := expected != 0 && current == expected
+	if expected != 0 && !resume && (current == ^uint64(0) || current+1 != expected) {
+		return nil, ErrRuntimeOwnership
 	}
 	// This is the ownership transfer point. It atomically retires the public SQL
 	// connector so no session can race incarnation minting or Node construction.
@@ -457,7 +486,16 @@ func AdoptRuntime(
 			RelationManifestDigest: profile.RelationManifestDigest,
 		},
 	}
-	incarnation, err := wal.BeginIncarnation()
+	var incarnation uint64
+	if resume {
+		err = wal.ResumePristineIncarnation(expected)
+		incarnation = expected
+	} else {
+		incarnation, err = wal.BeginIncarnation()
+		if err == nil && expected != 0 && incarnation != expected {
+			err = ErrRuntimeOwnership
+		}
+	}
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: begin incarnation: %w", err))
 	}

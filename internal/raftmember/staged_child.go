@@ -3,12 +3,46 @@ package raftmember
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"google.golang.org/protobuf/proto"
 )
+
+// OpenOrCreateStagedChildWAL settles the crash boundary around initial WAL
+// publication. An existing WAL is accepted only when its immutable binding and
+// exact snapshot base equal the activation certificate byte-for-byte in
+// protobuf semantics; absence creates it through CreateStagedChildWAL.
+func OpenOrCreateStagedChildWAL(
+	path string,
+	identity raftstore.Identity,
+	key raftstore.Key,
+	topologyRecoveryEpoch uint64,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	activation sqldriver.ReplicatedChildActivation,
+	options raftstore.Options,
+) (*raftstore.Store, error) {
+	wal, err := raftstore.Open(path, identity, topologyRecoveryEpoch, key, options)
+	if err == nil {
+		live, bindingErr := BindingFromWAL(wal, authority)
+		base, snapshotErr := wal.Snapshot()
+		if bindingErr == nil && snapshotErr == nil && live == expectedSQL.Binding &&
+			activation.SnapshotBase != nil && proto.Equal(base, activation.SnapshotBase) {
+			return wal, nil
+		}
+		closeErr := wal.Close()
+		return nil, errors.Join(ErrBindingMismatch, bindingErr, snapshotErr, closeErr)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return CreateStagedChildWAL(path, identity, key, topologyRecoveryEpoch,
+		authority, expectedSQL, activation, options)
+}
 
 // CreateStagedChildWAL creates the destination WAL exactly once from a
 // certified no-copy child snapshot base. It proves the preplanned identity,

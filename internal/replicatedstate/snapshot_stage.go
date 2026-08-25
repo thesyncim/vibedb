@@ -299,6 +299,63 @@ func (s *SnapshotArtifactStage) OpenCandidate(
 	return machine, nil
 }
 
+// AppendSeedEnvelope appends the exact authenticated State row carried by the
+// completed artifact. It is available only after OpenCandidate has proved the
+// final system and user images.
+func (s *SnapshotArtifactStage) AppendSeedEnvelope(dst []byte) []byte {
+	if s == nil {
+		return dst
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.complete || !s.opened {
+		return dst
+	}
+	envelope, err := AppendState(nil, s.expected.State)
+	if err != nil {
+		return dst
+	}
+	return append(dst, envelope...)
+}
+
+// AppendSeedKey appends the fixed hidden State key after final image proof.
+func (s *SnapshotArtifactStage) AppendSeedKey(dst []byte) []byte {
+	if s == nil {
+		return dst
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.complete || !s.opened {
+		return dst
+	}
+	return append(dst, stateKey...)
+}
+
+// AppendRecoveredSeed returns the exact State key/envelope only when an
+// already-published checkpoint-group certificate independently authenticates
+// them. This is the crash-resume counterpart to OpenCandidate: artifact receipt
+// alone never exposes activation material.
+func (s *SnapshotArtifactStage) AppendRecoveredSeed(
+	keyDst, envelopeDst []byte,
+	group *durable.CheckpointGroup,
+	member string,
+) (key, envelope []byte, err error) {
+	if s == nil || group == nil {
+		return keyDst, envelopeDst, ErrSnapshotStage
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.complete {
+		return keyDst, envelopeDst, ErrSnapshotStageIncomplete
+	}
+	encoded, encodeErr := AppendState(nil, s.expected.State)
+	seeded, proofErr := group.ValidateSeedState(s.expected.State.Applied, member, encoded)
+	if encodeErr != nil || proofErr != nil || !seeded {
+		return keyDst, envelopeDst, errors.Join(ErrSnapshotStage, encodeErr, proofErr)
+	}
+	return append(keyDst, stateKey...), append(envelopeDst, encoded...), nil
+}
+
 func validateExpectedSnapshotArtifact(expected SnapshotArtifactManifest) error {
 	if err := validateState(expected.State); err != nil ||
 		expected.Seeded || expected.Bundle || len(expected.Relations) != 0 ||
