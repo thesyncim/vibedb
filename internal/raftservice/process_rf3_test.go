@@ -778,6 +778,10 @@ func (cluster *processRF3Cluster) probe(
 	ctx context.Context,
 	member uint64,
 ) (shardservice.ReplicatedMemberState, error) {
+	fence, ok := cluster.probeFence()
+	if !ok || member == 0 || member > processVoters {
+		return shardservice.ReplicatedMemberState{}, shardservice.ErrReplicatedWire
+	}
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", cluster.nativeAddresses[member-1])
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
@@ -785,9 +789,7 @@ func (cluster *processRF3Cluster) probe(
 	defer connection.Close()
 	response, err := shardservice.RoundTripReplicated(ctx, connection, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe,
-		Fence: shardservice.ReplicatedFence{
-			Group: processGroup(), AllocationGeneration: 7,
-		},
+		Fence:     fence,
 	})
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
@@ -802,6 +804,25 @@ func (cluster *processRF3Cluster) probe(
 		)
 	}
 	return response.State, nil
+}
+
+func (cluster *processRF3Cluster) probeFence() (shardservice.ReplicatedFence, bool) {
+	if cluster == nil {
+		return shardservice.ReplicatedFence{}, false
+	}
+	route := cluster.routeValue
+	valid := route.Distribution != "" && route.Shard != "" &&
+		route.Group.ClusterID != ([16]byte{}) &&
+		route.Group.ClusterIncarnation != ([16]byte{}) &&
+		route.Group.TopologyRecoveryEpoch != 0 &&
+		route.Group.ShardIncarnation != ([16]byte{}) &&
+		route.Group.GroupID != ([16]byte{}) && route.AllocationGeneration != 0
+	if !valid {
+		return shardservice.ReplicatedFence{}, false
+	}
+	return shardservice.ReplicatedFence{
+		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+	}, true
 }
 
 func (cluster *processRF3Cluster) waitCommittedApplied(

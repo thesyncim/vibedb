@@ -43,6 +43,11 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	ctx = processAuthorizedContext(t, ctx)
 	leader := cluster.elect(t, ctx, 1)
 	route := cluster.route()
+	if fence, ok := cluster.probeFence(); !ok || fence.Group != route.Group ||
+		fence.AllocationGeneration != route.AllocationGeneration || route.Group == processGroup() ||
+		route.AllocationGeneration == 7 {
+		t.Fatalf("catalog probe route retained data-group identity: %+v", route)
+	}
 	client := newFaultProcessClient(t, cluster)
 	session := newProcessCatalogSession(t, route, client, 0xa1, serviceauthz.CapabilityTopology)
 	if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
@@ -203,6 +208,25 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	afterLoss, err := restarted.Read(ctx)
 	if err != nil || afterLoss.Generation() != 2 {
 		t.Fatalf("catalog after leader loss = %v, err=%v", afterLoss, err)
+	}
+}
+
+func TestProcessProbeFenceTracksRoleSpecificRoute(t *testing.T) {
+	addresses := [processVoters]string{
+		"127.0.0.1:201", "127.0.0.1:202", "127.0.0.1:203",
+	}
+	command := processCommandFence(sha256.Sum256([]byte("probe-fence-relation-manifest")))
+	for _, role := range []processRuntimeRole{processDataRole, processCatalogRole} {
+		route, err := processRoleRoute(role, addresses, command)
+		if err != nil {
+			t.Fatalf("role %d route: %v", role, err)
+		}
+		cluster := &processRF3Cluster{routeValue: route}
+		fence, ok := cluster.probeFence()
+		if !ok || fence.Group != route.Group ||
+			fence.AllocationGeneration != route.AllocationGeneration {
+			t.Fatalf("role %d probe fence=%+v ok=%t route=%+v", role, fence, ok, route)
+		}
 	}
 }
 
