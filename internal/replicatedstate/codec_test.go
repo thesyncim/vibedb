@@ -17,20 +17,20 @@ import (
 )
 
 const (
-	_resultAppliedAtLeastExact           = ResultApplied - 1
-	_resultAppliedAtMostExact            = uint32(1) - ResultApplied
-	_resultStaleFenceAtLeastExact        = ResultStaleFence - 2
-	_resultStaleFenceAtMostExact         = uint32(2) - ResultStaleFence
+	_resultAppliedAtLeastExact         = ResultApplied - 1
+	_resultAppliedAtMostExact          = uint32(1) - ResultApplied
+	_resultStaleFenceAtLeastExact      = ResultStaleFence - 2
+	_resultStaleFenceAtMostExact       = uint32(2) - ResultStaleFence
 	_resultUnknownRelationAtLeastExact = ResultUnknownRelation - 3
 	_resultUnknownRelationAtMostExact  = uint32(3) - ResultUnknownRelation
-	_resultInvalidDocumentAtLeastExact   = ResultInvalidDocument - 4
-	_resultInvalidDocumentAtMostExact    = uint32(4) - ResultInvalidDocument
-	_resultTargetBoundAtLeastExact       = ResultTargetBound - 5
-	_resultTargetBoundAtMostExact        = uint32(5) - ResultTargetBound
-	_resultWrongShardAtLeastExact        = ResultWrongShard - 6
-	_resultWrongShardAtMostExact         = uint32(6) - ResultWrongShard
-	_resultSessionRetiredAtLeastExact    = ResultSessionRetired - 7
-	_resultSessionRetiredAtMostExact     = uint32(7) - ResultSessionRetired
+	_resultInvalidDocumentAtLeastExact = ResultInvalidDocument - 4
+	_resultInvalidDocumentAtMostExact  = uint32(4) - ResultInvalidDocument
+	_resultTargetBoundAtLeastExact     = ResultTargetBound - 5
+	_resultTargetBoundAtMostExact      = uint32(5) - ResultTargetBound
+	_resultWrongShardAtLeastExact      = ResultWrongShard - 6
+	_resultWrongShardAtMostExact       = uint32(6) - ResultWrongShard
+	_resultSessionRetiredAtLeastExact  = ResultSessionRetired - 7
+	_resultSessionRetiredAtMostExact   = uint32(7) - ResultSessionRetired
 )
 
 func codecState() State {
@@ -309,7 +309,7 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 
 	command := codecLogicalCommand()
 	digest := LogicalCommandDigest(openCodecLogicalCommand(t, command))
-	const wantLogical = "6a73992470f3248facb555641d34d0e215a9618b9eb430705e25430c97563c68"
+	const wantLogical = "be7d1735975c2d40d70a47aaea4bef9db224369461135d7864fd6baaf182a856"
 	if got := hex.EncodeToString(digest[:]); got != wantLogical {
 		t.Fatalf("LogicalCommandDigest = %s, want %s", got, wantLogical)
 	}
@@ -343,6 +343,11 @@ func TestSessionKeyAndLogicalCommandDigestGolden(t *testing.T) {
 	}
 	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedPartition)); got == digest {
 		t.Fatal("logical digest did not bind relation-batch boundaries")
+	}
+	changedAuthority := command
+	changedAuthority.AuthorityClass = replication.CommandAuthorityTopology
+	if got := LogicalCommandDigest(openCodecLogicalCommand(t, changedAuthority)); got == digest {
+		t.Fatal("logical digest did not bind authority class")
 	}
 	lease := command
 	lease.Kind = replication.CommandSessionRenew

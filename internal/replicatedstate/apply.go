@@ -742,6 +742,14 @@ func (m *Machine) planBundleCommand(
 	if err != nil {
 		return commandPlan{}, err
 	}
+	if found && (session.Digest != plan.sessionDigest ||
+		!bytes.Equal(session.Tenant, command.Tenant) || session.ClientID != command.ClientID) {
+		return commandPlan{}, fmt.Errorf("%w: session-key hash collision", ErrSessionCorrupt)
+	}
+	if found && session.AuthorityClass != command.AuthorityClass {
+		plan.conflict = true
+		return plan, nil
+	}
 	if command.Kind() == replication.CommandSessionOpen {
 		return m.planSessionOpen(
 			command, applied, state, systemSnapshot, plan, session, found, scratch,
@@ -993,6 +1001,7 @@ func (m *Machine) planBundleCommand(
 	}
 	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   slot,
+		AuthorityClass:         command.AuthorityClass,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            command.ClientEpoch,
 		ClientSequence:         command.ClientSequence,
@@ -1119,7 +1128,8 @@ func (m *Machine) planSessionOpen(
 	}
 	next := SessionRecord{
 		Tenant: command.Tenant, ClientID: command.ClientID,
-		ClientEpoch: applied, RetryHome: command.RetryHome,
+		AuthorityClass: command.AuthorityClass,
+		ClientEpoch:    applied, RetryHome: command.RetryHome,
 		AckThrough: 0, HighSequence: 1, Status: SessionActive,
 		LeaseDeadlineUnixNano: command.NextDeadlineUnixNano,
 		RetryWindow:           m.options.RetryWindow, PhysicalSlotCount: 1,
@@ -1134,6 +1144,7 @@ func (m *Machine) planSessionOpen(
 	}
 	plan.slotRecord, err = scratch.appendSessionSlot(SessionSlot{
 		Slot:                   0,
+		AuthorityClass:         command.AuthorityClass,
 		SessionDigest:          plan.sessionDigest,
 		ClientEpoch:            applied,
 		ClientSequence:         1,
@@ -1289,7 +1300,8 @@ func (m *Machine) planSessionRelease(
 func sessionRecord(view SessionView) SessionRecord {
 	return SessionRecord{
 		Tenant: view.Tenant, ClientID: view.ClientID, ClientEpoch: view.ClientEpoch,
-		RetryHome: view.RetryHome, AckThrough: view.AckThrough,
+		AuthorityClass: view.AuthorityClass,
+		RetryHome:      view.RetryHome, AckThrough: view.AckThrough,
 		HighSequence: view.HighSequence, LeaseDeadlineUnixNano: view.LeaseDeadlineUnixNano,
 		Status:      view.Status,
 		RetryWindow: view.RetryWindow, PhysicalSlotCount: view.PhysicalSlotCount,

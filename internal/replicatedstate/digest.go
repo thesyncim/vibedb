@@ -16,7 +16,8 @@ import (
 const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;" +
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"mutation-validation-result-map;bytewise-changed-key-order;" +
-	"ordered-client-session-sequences;cumulative-ack-through;" +
+	"ordered-client-session-sequences;authority-class-bound-session-identity;" +
+	"cumulative-ack-through;" +
 	"fixed-retry-ring;explicit-session-open;raft-index-session-epoch;" +
 	"shard-epoch-high-water;explicit-session-retirement;terminal-retire-only;" +
 	"exact-retired-session-release;terminal-stale-retire-unstored;" +

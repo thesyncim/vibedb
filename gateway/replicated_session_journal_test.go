@@ -40,7 +40,6 @@ func TestNativeSessionJournalRestartsAndRetriesExactPendingCommand(t *testing.T)
 		ProposalCapability: serviceauthz.CapabilityDataWrite,
 		MaxRelationBatches: 1, MaxMutations: 2,
 		InitialCommandBytes: 512, MaxCommandBytes: journalOptions.MaxCommandBytes, Journal: journal,
-		JournalBinding: binding,
 	}
 	session, err := NewNativeSession(sessionOptions)
 	if err != nil {
@@ -146,7 +145,6 @@ func TestNativeSessionJournalKeepsExactPendingWhenCompletionSyncFails(t *testing
 		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1, MaxMutations: 2,
 		ProposalCapability:  serviceauthz.CapabilityDataWrite,
 		InitialCommandBytes: 512, MaxCommandBytes: options.MaxCommandBytes, Journal: journal,
-		JournalBinding: binding,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -275,5 +273,70 @@ func TestNativeSessionJournalBindingFencesCommandIdentity(t *testing.T) {
 		serviceauthz.CapabilityTopology)
 	if err != nil || got == want {
 		t.Fatalf("changed capability binding=%x want=%x err=%v", got, want, err)
+	}
+}
+
+func TestNativeSessionJournalRejectsCrossCapabilityReopenBidirectionally(t *testing.T) {
+	capabilities := []serviceauthz.Capability{
+		serviceauthz.CapabilityDataWrite,
+		serviceauthz.CapabilityTopology,
+	}
+	for _, owner := range capabilities {
+		foreign := serviceauthz.CapabilityTopology
+		if owner == serviceauthz.CapabilityTopology {
+			foreign = serviceauthz.CapabilityDataWrite
+		}
+		name := "data_owner"
+		if owner == serviceauthz.CapabilityTopology {
+			name = "topology_owner"
+		}
+		t.Run(name, func(t *testing.T) {
+			route, _, states := testReplicatedRouteCommand(t)
+			binding, err := NativeSessionJournalBinding(
+				route, "orders", "0000-ffff", []byte("controller"), 1, owner,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clientID := replication.ID128{0xe1, byte(owner)}
+			retryHome := replication.RetryHome{0xf1, byte(owner)}
+			journalOptions := NativeSessionJournalOptions{
+				Path: t.TempDir() + "/controller.session", ClientID: clientID,
+				RetryHome: retryHome, MaxCommandBytes: 1 << 20, Binding: binding,
+			}
+			journal, err := OpenNativeSessionJournal(journalOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor, err := NewReplicatedExecutor(
+				&nativeSessionClient{state: states["m2"]}, 1, time.Second,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := NativeSessionOptions{
+				Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+				Tenant: []byte("controller"), ClientID: clientID, RetryHome: retryHome,
+				Resolver: BaseRelationResolver{Relation: 1}, Journal: journal,
+				ProposalCapability: owner, MaxRelationBatches: 1, MaxMutations: 2,
+				InitialCommandBytes: 512, MaxCommandBytes: journalOptions.MaxCommandBytes,
+			}
+			ownerSession, err := NewNativeSession(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = ownerSession.Open(context.Background(), 1000); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenNativeSessionJournal(journalOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			options.Journal = reopened
+			options.ProposalCapability = foreign
+			if _, err = NewNativeSession(options); !errors.Is(err, ErrNativeSession) {
+				t.Fatalf("cross-capability reopen error = %v", err)
+			}
+		})
 	}
 }

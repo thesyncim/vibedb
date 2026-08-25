@@ -22,6 +22,8 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 	var marker [1]byte
 	marker[0] = byte(command.Kind())
 	_, _ = h.Write(marker[:])
+	marker[0] = byte(command.AuthorityClass)
+	_, _ = h.Write(marker[:])
 	_, _ = h.Write(command.ClusterID[:])
 	_, _ = h.Write(command.ClusterIncarnation[:])
 	var length [8]byte

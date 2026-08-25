@@ -225,9 +225,9 @@ func TestSessionRecordRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	}
 
 	for name, mutate := range map[string]func([]byte){
-		"status":   func(candidate []byte) { candidate[20] = 9 },
-		"reserved": func(candidate []byte) { candidate[21] = 1 },
-		"digest":   func(candidate []byte) { candidate[48] ^= 1 },
+		"status":    func(candidate []byte) { candidate[20] = 9 },
+		"authority": func(candidate []byte) { candidate[21] = 2 },
+		"digest":    func(candidate []byte) { candidate[48] ^= 1 },
 		"zero-high-water": func(candidate []byte) {
 			clear(candidate[88:104])
 		},
@@ -310,7 +310,7 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 		"slot": func(candidate []byte) {
 			binary.LittleEndian.PutUint16(candidate[16:18], MaxSessionRetryWindow)
 		},
-		"reserved":       func(candidate []byte) { candidate[18] = 1 },
+		"authority":      func(candidate []byte) { candidate[18] = 2 },
 		"session-digest": func(candidate []byte) { clear(candidate[20:52]) },
 		"sequence": func(candidate []byte) {
 			binary.LittleEndian.PutUint64(candidate[60:68], 0)

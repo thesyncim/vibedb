@@ -603,6 +603,7 @@ type scannedSession struct {
 	physicalSlots       uint16
 	retryWindow         uint16
 	status              SessionStatus
+	authorityClass      replication.CommandAuthorityClass
 	seenSlots           uint16
 	currentSlots        uint16
 	latestSeen          bool
@@ -668,7 +669,7 @@ func scanSessionSystemSnapshot(
 				return fmt.Errorf("%w: session count exceeds configured bound", ErrSessionCorrupt)
 			}
 			sessions[view.Digest] = scannedSession{
-				epoch:        view.ClientEpoch,
+				epoch: view.ClientEpoch, authorityClass: view.AuthorityClass,
 				highSequence: view.HighSequence, leaseDeadline: view.LeaseDeadlineUnixNano,
 				physicalSlots: view.PhysicalSlotCount,
 				retryWindow:   view.RetryWindow, status: view.Status,
@@ -704,7 +705,8 @@ func scanSessionSystemSnapshot(
 			}
 			if err := validateSessionSlotAgainstHeader(SessionView{
 				Digest: view.SessionDigest, ClientEpoch: summary.epoch,
-				HighSequence: summary.highSequence, RetryWindow: summary.retryWindow,
+				AuthorityClass: summary.authorityClass,
+				HighSequence:   summary.highSequence, RetryWindow: summary.retryWindow,
 				LeaseDeadlineUnixNano: summary.leaseDeadline,
 				PhysicalSlotCount:     summary.physicalSlots, Status: summary.status,
 			}, view); err != nil {
@@ -803,7 +805,8 @@ func validateStoredSessionSlot(state State, slot SessionSlotView) error {
 }
 
 func validateSessionSlotAgainstHeader(session SessionView, slot SessionSlotView) error {
-	if session.Digest != slot.SessionDigest || session.ClientEpoch != slot.ClientEpoch {
+	if session.Digest != slot.SessionDigest || session.ClientEpoch != slot.ClientEpoch ||
+		session.AuthorityClass != slot.AuthorityClass {
 		return fmt.Errorf("%w: retained session result identity", ErrSessionCorrupt)
 	}
 	expected, ok := canonicalSessionSlotSequence(

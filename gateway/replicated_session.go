@@ -128,9 +128,6 @@ type NativeSessionOptions struct {
 	RetryHome    replication.RetryHome
 	Resolver     BundleResolver
 	Journal      *NativeSessionJournal
-	// JournalBinding authenticates the route, tenant, and resolver schema of a
-	// durable journal. It is required only when Journal is configured.
-	JournalBinding replication.Digest
 	// ProposalCapability is the exact authorization class placed on every
 	// probe and proposal. Only DataWrite and Topology are admitted.
 	ProposalCapability serviceauthz.Capability
@@ -295,12 +292,17 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		proposalCapability: options.ProposalCapability,
 	}
 	if options.Journal != nil {
+		relation := nativeResolverBaseRelation(options.Resolver)
+		expectedBinding, bindingErr := NativeSessionJournalBinding(
+			options.Route, options.Distribution, options.Shard, options.Tenant,
+			relation, options.ProposalCapability,
+		)
 		state, loadErr := options.Journal.load()
-		if loadErr != nil || options.Journal.maxCommand != options.MaxCommandBytes ||
-			options.JournalBinding == (replication.Digest{}) ||
-			options.Journal.binding != options.JournalBinding ||
+		if bindingErr != nil || loadErr != nil ||
+			options.Journal.maxCommand != options.MaxCommandBytes ||
+			options.Journal.binding != expectedBinding ||
 			state.clientID != options.ClientID || state.retryHome != options.RetryHome {
-			return nil, errors.Join(loadErr, ErrNativeSession)
+			return nil, errors.Join(bindingErr, loadErr, ErrNativeSession)
 		}
 		session.restoreDurableState(state)
 	}

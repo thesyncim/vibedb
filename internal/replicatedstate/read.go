@@ -264,6 +264,9 @@ func (m *Machine) lookupCompletionAtSnapshot(
 	if readErr != nil {
 		return CompletionLookup{}, m.fail(readErr)
 	}
+	if found && session.AuthorityClass != command.AuthorityClass {
+		return CompletionLookup{Key: digest}, &RequestConflictError{Key: digest}
+	}
 	if !found {
 		orphanErr := ensureNoSessionSlots(
 			pointSnapshot{value: snapshot}, digest, m.options.RetryWindow,

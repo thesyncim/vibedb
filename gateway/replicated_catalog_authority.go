@@ -105,7 +105,11 @@ func nativeSessionBaseRelation(session *NativeSession) replication.RelationID {
 	if session == nil {
 		return 0
 	}
-	switch resolver := session.resolver.(type) {
+	return nativeResolverBaseRelation(session.resolver)
+}
+
+func nativeResolverBaseRelation(resolver BundleResolver) replication.RelationID {
+	switch resolver := resolver.(type) {
 	case BaseRelationResolver:
 		return resolver.Relation
 	case *BaseRelationResolver:

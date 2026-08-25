@@ -60,6 +60,7 @@ const (
 type SessionRecord struct {
 	Tenant                []byte
 	ClientID              replication.ID128
+	AuthorityClass        replication.CommandAuthorityClass
 	ClientEpoch           uint64
 	RetryHome             replication.RetryHome
 	AckThrough            uint64
@@ -77,6 +78,7 @@ type SessionView struct {
 	Digest                [sha256.Size]byte
 	Tenant                []byte
 	ClientID              replication.ID128
+	AuthorityClass        replication.CommandAuthorityClass
 	ClientEpoch           uint64
 	RetryHome             replication.RetryHome
 	AckThrough            uint64
@@ -160,6 +162,7 @@ func AppendSessionRecord(dst []byte, record SessionRecord) ([]byte, error) {
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(len(record.Tenant)))
 	frame[20] = byte(record.Status)
+	frame[21] = byte(record.AuthorityClass)
 	binary.LittleEndian.PutUint16(frame[22:24], record.RetryWindow)
 	binary.LittleEndian.PutUint16(frame[24:26], record.PhysicalSlotCount)
 	binary.LittleEndian.PutUint16(frame[26:28], uint16(len(record.Tenant)))
@@ -187,7 +190,7 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionRecordHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		src[21] != 0 || !allZero(src[28:32]) || src[120] != sessionLeaseMarker ||
+		!allZero(src[28:32]) || src[120] != sessionLeaseMarker ||
 		!allZero(src[121:sessionRecordHeaderBytes]) ||
 		!verifySessionChecksum(src, sessionRecordChecksumDomain) {
 		return SessionView{}, fmt.Errorf("%w: session envelope", ErrSessionCorrupt)
@@ -207,6 +210,7 @@ func OpenSessionRecord(src []byte) (SessionView, error) {
 		HighSequence:          binary.LittleEndian.Uint64(src[96:104]),
 		LeaseDeadlineUnixNano: int64(binary.LittleEndian.Uint64(src[112:120])),
 		Status:                SessionStatus(src[20]),
+		AuthorityClass:        replication.CommandAuthorityClass(src[21]),
 		RetryWindow:           binary.LittleEndian.Uint16(src[22:24]),
 		PhysicalSlotCount:     binary.LittleEndian.Uint16(src[24:26]),
 		raw:                   src[:len(src):len(src)],
@@ -225,6 +229,7 @@ func validateSessionRecord(record SessionRecord) error {
 		Digest:                SessionKey(record.Tenant, record.ClientID),
 		Tenant:                record.Tenant,
 		ClientID:              record.ClientID,
+		AuthorityClass:        record.AuthorityClass,
 		ClientEpoch:           record.ClientEpoch,
 		RetryHome:             record.RetryHome,
 		AckThrough:            record.AckThrough,
@@ -250,7 +255,9 @@ func validateSessionView(view SessionView) error {
 		view.RetryWindow > MaxSessionRetryWindow ||
 		view.PhysicalSlotCount == 0 || view.PhysicalSlotCount > view.RetryWindow ||
 		uint64(view.PhysicalSlotCount) != minimumSlots ||
-		(view.Status != SessionActive && view.Status != SessionRetired) {
+		(view.Status != SessionActive && view.Status != SessionRetired) ||
+		(view.AuthorityClass != replication.CommandAuthorityData &&
+			view.AuthorityClass != replication.CommandAuthorityTopology) {
 		return fmt.Errorf("%w: invalid session semantics", ErrSessionCorrupt)
 	}
 	if view.LeaseDeadlineUnixNano < 0 ||
@@ -274,6 +281,7 @@ func validateSessionView(view SessionView) error {
 // it is the authoritative exact-request discriminator paired with Fingerprint.
 type SessionSlot struct {
 	Slot                   uint16
+	AuthorityClass         replication.CommandAuthorityClass
 	SessionDigest          [sha256.Size]byte
 	ClientEpoch            uint64
 	ClientSequence         uint64
@@ -292,6 +300,7 @@ type SessionSlot struct {
 // decoder input and is capacity-clamped.
 type SessionSlotView struct {
 	Slot                   uint16
+	AuthorityClass         replication.CommandAuthorityClass
 	SessionDigest          [sha256.Size]byte
 	ClientEpoch            uint64
 	ClientSequence         uint64
@@ -326,6 +335,7 @@ func AppendSessionSlot(dst []byte, slot SessionSlot) ([]byte, error) {
 	binary.LittleEndian.PutUint16(frame[10:12], sessionSlotHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint16(frame[16:18], slot.Slot)
+	frame[18] = byte(slot.AuthorityClass)
 	copy(frame[20:52], slot.SessionDigest[:])
 	binary.LittleEndian.PutUint64(frame[52:60], slot.ClientEpoch)
 	binary.LittleEndian.PutUint64(frame[60:68], slot.ClientSequence)
@@ -352,13 +362,14 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 		binary.LittleEndian.Uint16(src[8:10]) != sessionRecordCodecSentinel ||
 		binary.LittleEndian.Uint16(src[10:12]) != sessionSlotHeaderBytes ||
 		binary.LittleEndian.Uint32(src[12:16]) != uint32(len(src)) ||
-		!allZero(src[18:20]) || !allZero(src[184:sessionSlotHeaderBytes]) ||
+		src[19] != 0 || !allZero(src[184:sessionSlotHeaderBytes]) ||
 		!verifySessionChecksum(src, sessionSlotChecksumDomain) {
 		return SessionSlotView{}, fmt.Errorf("%w: session slot envelope", ErrSessionCorrupt)
 	}
 
 	view := SessionSlotView{
 		Slot:                   binary.LittleEndian.Uint16(src[16:18]),
+		AuthorityClass:         replication.CommandAuthorityClass(src[18]),
 		ClientEpoch:            binary.LittleEndian.Uint64(src[52:60]),
 		ClientSequence:         binary.LittleEndian.Uint64(src[60:68]),
 		AppliedSequence:        binary.LittleEndian.Uint64(src[68:76]),
@@ -382,6 +393,7 @@ func OpenSessionSlot(src []byte) (SessionSlotView, error) {
 func validateSessionSlot(slot SessionSlot) error {
 	return validateSessionSlotView(SessionSlotView{
 		Slot:                   slot.Slot,
+		AuthorityClass:         slot.AuthorityClass,
 		SessionDigest:          slot.SessionDigest,
 		ClientEpoch:            slot.ClientEpoch,
 		ClientSequence:         slot.ClientSequence,
@@ -407,6 +419,8 @@ func validateSessionSlotView(view SessionSlotView) error {
 		view.ReplicaSetVersion == 0 || view.ActivePolicyGeneration == 0 ||
 		view.ProtectionEpoch == 0 || view.RoutingVersion == 0 ||
 		view.RouteGeneration == 0 ||
+		(view.AuthorityClass != replication.CommandAuthorityData &&
+			view.AuthorityClass != replication.CommandAuthorityTopology) ||
 		(view.ClientSequence == 1) != (view.ResultCode == ResultSessionOpened) ||
 		view.ResultCode == ResultSessionOpened && view.AppliedSequence != view.ClientEpoch ||
 		view.ResultCode != ResultSessionOpened && view.AppliedSequence <= view.ClientEpoch {
