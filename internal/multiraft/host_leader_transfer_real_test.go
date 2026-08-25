@@ -294,6 +294,7 @@ func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
 	for {
 		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
 		if doneReached {
+			cluster.drainConvergedWorkToIdle(done, &step)
 			return
 		}
 		if tickRound == maxTickRounds {
@@ -326,6 +327,33 @@ func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
 		tickRound++
 		step++
 	}
+}
+
+// drainConvergedWorkToIdle consumes only Ready and outbound work already made
+// pending by the election that satisfied done. A status/publication predicate
+// can become true before the new leader's no-op Ready and messages have crossed
+// the scheduler boundary; issuing TransferLeader at that point would be a new
+// protocol input while Ready is still outstanding. No ticks or other inputs are
+// admitted here, and convergence must remain true throughout the drain.
+func (cluster *realTransferCluster) drainConvergedWorkToIdle(done func() bool, step *int) {
+	cluster.t.Helper()
+	for *step < 100000 {
+		if !done() {
+			cluster.t.Fatalf("election convergence changed while draining existing work at step %d: %s",
+				*step, cluster.diagnostic())
+		}
+		current := *step
+		*step++
+		if !cluster.driveRound(current) {
+			if !done() {
+				cluster.t.Fatalf("election convergence changed at protocol-idle step %d: %s",
+					current, cluster.diagnostic())
+			}
+			return
+		}
+	}
+	cluster.t.Fatalf("cluster did not reach protocol idle after election convergence: %s",
+		cluster.diagnostic())
 }
 
 func (cluster *realTransferCluster) diagnostic() string {
