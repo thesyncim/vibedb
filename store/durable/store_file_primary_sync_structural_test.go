@@ -193,6 +193,8 @@ func TestFilePrimarySyncRoutedSplitDifferential(t *testing.T) {
 	}
 	if stats := coll.Stats(); stats.PrimaryLeafSplits == 0 {
 		t.Fatalf("net growth to %d keys fired no leaf splits", target)
+	} else {
+		assertLocalizedPrimarySplitRoutingBytes(t, stats)
 	}
 	if got := int(coll.Len()); got != len(oracle) {
 		t.Fatalf("Len = %d, want %d", got, len(oracle))

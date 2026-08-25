@@ -801,6 +801,118 @@ func TestGlobalTabletCatalogCacheableTabletReadPaths(t *testing.T) {
 	if _, _, ok := anchor.ResolveBucket(&stale, bucket); ok {
 		t.Fatal("grafted stale same-tablet locator")
 	}
+
+	// The selected anchor is full. A localized leaf split must preserve all
+	// three unaffected anchor references, replace this anchor, append exactly
+	// one stable anchor, and publish a locator that resolves both halves.
+	point, ok := anchor.RouteHashed(
+		KeyHashBytes(segmentedTabletRouterTestSeed, leaves[target].Fence),
+		leaves[target].Fence,
+	)
+	if !ok {
+		t.Fatal("localized split source route")
+	}
+	used := make([]bool, TabletLocalIdentityLocalCount)
+	for _, leaf := range leaves {
+		used[leaf.LocalID] = true
+	}
+	rightLocalID := uint16(0)
+	for used[rightLocalID] {
+		rightLocalID++
+	}
+	rightBucketU, _ := MakeTabletLocalIdentityBucket(header.TabletID, uint32(rightLocalID))
+	rightBucket := BucketID(rightBucketU)
+	rightFence, err := ShortestPrimaryFence(
+		make([]byte, len(leaves[target+1].Fence)),
+		leaves[target].Fence, leaves[target+1].Fence,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextGeneration := header.Generation + 1
+	leftRef := point.Ref
+	leftRef.Offset = 3 << 20
+	leftRef.Generation = nextGeneration
+	rightLogical, _ := CommonPrimaryLeafLogicalID(rightBucket)
+	rightRef := globalTabletCatalogTestRef(
+		4<<20, rightLogical, nextGeneration, point.Ref.Length, point.Ref.Kind,
+	)
+	leftAnchorLogical, _ := GlobalTabletCatalogAnchorLogicalID(header.TabletID, selected.PageID)
+	leftAnchorRef := globalTabletCatalogTestRef(
+		5<<20, leftAnchorLogical, nextGeneration,
+		SegmentedTabletRouterAnchorPageBytes, PagePrimaryAnchor,
+	)
+	rightPageID := uint8(tablet.AnchorCount())
+	rightAnchorLogical, _ := GlobalTabletCatalogAnchorLogicalID(header.TabletID, rightPageID)
+	rightAnchorRef := globalTabletCatalogTestRef(
+		6<<20, rightAnchorLogical, nextGeneration,
+		SegmentedTabletRouterAnchorPageBytes, PagePrimaryAnchor,
+	)
+	localized, err := tablet.InsertSplitLeaf(
+		make([]byte, SegmentedTabletRouterRootBytes),
+		make([]byte, GlobalTabletCatalogLocatorBytes),
+		make([]byte, SegmentedTabletRouterAnchorPageBytes),
+		make([]byte, SegmentedTabletRouterAnchorPageBytes),
+		nextGeneration, point, leftRef, rightLocalID, rightFence, rightRef,
+		leftAnchorRef, rightAnchorRef, &locator, &anchor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localized.PageCount != 5 || localized.Bytes !=
+		SegmentedTabletRouterRootBytes+GlobalTabletCatalogLocatorBytes+
+			2*SegmentedTabletRouterAnchorPageBytes {
+		t.Fatalf("localized split geometry = pages %d bytes %d", localized.PageCount, localized.Bytes)
+	}
+	nextBounds := bounds
+	nextBounds.SelectedRootGeneration = nextGeneration
+	nextLocatorRef := locatorRef
+	nextLocatorRef.Offset = 7 << 20
+	nextLocatorRef.Generation = nextGeneration
+	nextTabletRef := tabletRef
+	nextTabletRef.Offset = 8 << 20
+	nextTabletRef.Generation = nextGeneration
+	nextTabletImage, err := EncodeGlobalTabletCatalogTabletRoot(
+		make([]byte, GlobalTabletCatalogTabletBytes),
+		PageHeader{StoreID: header.StoreID, Generation: nextGeneration,
+			LogicalID: tabletLogical, PageSize: GlobalTabletCatalogTabletBytes,
+			PayloadLength: GlobalTabletCatalogRootHeader + SegmentedTabletRouterRootBytes,
+			Kind:          PageTabletRoute},
+		nextBounds, nextLocatorRef, localized.Root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextTablet, err := OpenGlobalTabletCatalogTabletRoot(nextTabletImage, nextTabletRef, nextBounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rank := 0; rank < tablet.AnchorCount(); rank++ {
+		oldRoute, _ := tablet.AnchorAt(rank)
+		if oldRoute.PageID == selected.PageID {
+			continue
+		}
+		found := false
+		for nextRank := 0; nextRank < nextTablet.AnchorCount(); nextRank++ {
+			nextRoute, _ := nextTablet.AnchorAt(nextRank)
+			if nextRoute.PageID == oldRoute.PageID {
+				found = nextRoute.Ref == oldRoute.Ref
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("unaffected anchor page %d was not preserved", oldRoute.PageID)
+		}
+	}
+	nextLocator, err := OpenGlobalTabletCatalogLocator(localized.Locator, nextLocatorRef, nextBounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageID, _, state := nextLocator.Resolve(rightLocalID)
+	rightRoute, routeOK := nextTablet.RouteAnchor(rightFence)
+	if !routeOK || pageID != rightRoute.PageID || state != GlobalTabletCatalogLocatorLive {
+		t.Fatalf("right locator = page %d state %d", pageID, state)
+	}
 }
 
 func TestGlobalTabletCatalogFailClosed(t *testing.T) {
