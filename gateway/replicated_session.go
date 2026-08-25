@@ -150,6 +150,7 @@ func NativeSessionJournalBinding(
 	capability serviceauthz.Capability,
 ) (replication.Digest, error) {
 	if !validReplicatedRoute(route) ||
+		distribution != string(route.Distribution) || shard != string(route.Shard) ||
 		!validNativeSessionIdentity(distribution, shard, tenant) ||
 		relation == 0 || relation > replication.MaxRelationID ||
 		(capability != serviceauthz.CapabilityDataWrite &&
@@ -264,6 +265,8 @@ func NewNativeSession(options NativeSessionOptions) (*NativeSession, error) {
 		options.InitialCommandBytes = 4 << 10
 	}
 	if options.Executor == nil || !validReplicatedRoute(options.Route) ||
+		options.Distribution != string(options.Route.Distribution) ||
+		options.Shard != string(options.Route.Shard) ||
 		!validNativeSessionIdentity(options.Distribution, options.Shard, options.Tenant) ||
 		options.ClientID == (replication.ID128{}) || options.Resolver == nil ||
 		options.MaxRelationBatches <= 0 || options.MaxRelationBatches > replication.MaxRelationBatches ||

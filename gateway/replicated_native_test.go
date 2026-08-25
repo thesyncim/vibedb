@@ -1428,6 +1428,7 @@ func testReplicatedRouteCommand(
 		group.GroupID[index] = byte(index + 61)
 	}
 	route := ReplicatedRoute{
+		Distribution: "orders", Shard: "0000-ffff",
 		Group: group, AllocationGeneration: 5,
 		Command: raftservice.CommandFence{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,

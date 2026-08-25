@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"sync"
 
@@ -23,25 +22,19 @@ var (
 )
 
 const (
-	replicatedCatalogHeadKeyByte         = byte(0)
-	replicatedOperationKeyByte           = byte(1)
-	replicatedOperationDirectoryKeyByte  = byte(2)
 	MaxReplicatedOperationBytes          = 64 << 10
 	maxReplicatedOperationIntentBytes    = 40 << 10
 	maxReplicatedOperations              = 64
 	maxReplicatedOperationDirectoryBytes = 16 << 10
-	// One catalog head is one atomic relation value. This intentionally follows
-	// the existing replicated mutation bound; larger catalogs fail closed until
-	// a separately authenticated chunk-manifest protocol exists.
+	// One catalog head remains one atomic relation value. The final /id
+	// envelope—not merely its nested catalog payload—must fit the replicated
+	// mutation grammar.
 	maxReplicatedCatalogBytes = replication.MaxMutationValueBytes
 )
 
-var replicatedCatalogHeadKey = [...]byte{replicatedCatalogHeadKeyByte}
-var replicatedOperationDirectoryKey = [...]byte{replicatedOperationDirectoryKeyByte}
-
 // ReplicatedCatalogAuthority stores the catalog head and resumable controller
-// records in one ordinary JSON relation served by the existing RF3 owner. The
-// route is a bootstrap coordinate only; every head read is ReadIndex-fenced and
+// records in the dedicated control-plane JSON relation served by its RF3 owner.
+// The route is a bootstrap coordinate only; every head read is ReadIndex-fenced and
 // every replacement is a raw length+SHA-256 compare inside replicated apply.
 type ReplicatedCatalogAuthority struct {
 	executor        *ReplicatedExecutor
@@ -61,8 +54,9 @@ type ReplicatedCatalogAuthorityOptions struct {
 	Route    ReplicatedRoute
 	Relation replication.RelationID
 	Holder   *CatalogHolder
-	// Session is required only for publication and operation writes. It must be
-	// active, route the same RF3 group, and resolve logical mutations to Relation.
+	// Session is the placement and relation proof for both reads and writes. It
+	// must be active, bound to the reserved catalog/controlplane RF3 group, and
+	// resolve logical mutations to Relation.
 	Session *NativeSession
 	// Authority is the exact topology principal forwarded on every probe, read,
 	// proposal, and byte-identical retry. Callers cannot accidentally fall back
@@ -72,13 +66,17 @@ type ReplicatedCatalogAuthorityOptions struct {
 
 func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*ReplicatedCatalogAuthority, error) {
 	if options.Executor == nil || !validReplicatedRoute(options.Route) ||
+		options.Route.Distribution != ReplicatedCatalogDistribution ||
+		options.Route.Shard != ReplicatedCatalogShard ||
 		options.Relation == 0 || options.Relation > replication.MaxRelationID ||
-		options.Holder == nil || !options.Authority.Valid() || options.Session != nil &&
-		(options.Session.executor != options.Executor ||
-			options.Session.phase != nativeSessionActive || options.Session.pending ||
-			options.Session.proposalCapability != serviceauthz.CapabilityTopology ||
-			!sameReplicatedCatalogRoute(options.Session.route, options.Route) ||
-			nativeSessionBaseRelation(options.Session) != options.Relation) {
+		options.Holder == nil || !options.Authority.Valid() || options.Session == nil ||
+		options.Session.executor != options.Executor ||
+		options.Session.distribution != string(ReplicatedCatalogDistribution) ||
+		options.Session.shard != string(ReplicatedCatalogShard) ||
+		options.Session.phase != nativeSessionActive || options.Session.pending ||
+		options.Session.proposalCapability != serviceauthz.CapabilityTopology ||
+		!sameReplicatedCatalogRoute(options.Session.route, options.Route) ||
+		nativeSessionBaseRelation(options.Session) != options.Relation {
 		return nil, ErrReplicatedCatalog
 	}
 	route := options.Route
@@ -121,7 +119,8 @@ func nativeResolverBaseRelation(resolver BundleResolver) replication.RelationID 
 }
 
 func sameReplicatedCatalogRoute(left, right ReplicatedRoute) bool {
-	if left.Group != right.Group ||
+	if left.Distribution != right.Distribution || left.Shard != right.Shard ||
+		left.Group != right.Group ||
 		left.AllocationGeneration != right.AllocationGeneration ||
 		left.Command != right.Command || len(left.Replicas) != len(right.Replicas) {
 		return false
@@ -153,14 +152,20 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 // Read fetches the authoritative RF3 catalog head and validates the complete
 // routing/index/lineage image before publishing it to the lock-free holder.
 func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapshot, error) {
-	result, err := authority.readRaw(ctx, replicatedCatalogHeadKey[:], maxReplicatedCatalogBytes)
+	result, err := authority.readRaw(ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes))
 	if err != nil {
 		return nil, err
 	}
 	if !result.Found {
 		return nil, ErrReplicatedCatalogMissing
 	}
-	snapshot, err := OpenSnapshotDocument(result.Value)
+	payload, err := openTypedControlPlaneDocument(
+		result.Value, replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := OpenSnapshotDocument(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +182,7 @@ func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapsho
 		return nil, ErrStaleGeneration
 	} else {
 		currentBytes, encodeErr := AppendSnapshotDocument(nil, current)
-		if encodeErr != nil || !bytes.Equal(currentBytes, result.Value) {
+		if encodeErr != nil || !bytes.Equal(currentBytes, payload) {
 			return nil, errors.Join(encodeErr, ErrReplicatedCatalogConflict)
 		}
 	}
@@ -215,16 +220,17 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
-	currentResult, err := authority.readRaw(ctx, replicatedCatalogHeadKey[:], maxReplicatedCatalogBytes)
+	currentResult, err := authority.readRaw(
+		ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes),
+	)
 	if err != nil {
 		return err
 	}
 	authority.scratch = authority.scratch[:0]
-	authority.scratch, err = AppendSnapshotDocument(authority.scratch, next)
+	authority.scratch, err = appendReplicatedCatalogDocument(
+		authority.scratch, next, maxReplicatedCatalogBytes,
+	)
 	if err != nil {
-		return err
-	}
-	if len(authority.scratch) > maxReplicatedCatalogBytes {
 		return ErrCatalogTooLarge
 	}
 	var native NativeResult
@@ -233,10 +239,16 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 			return ErrCatalogGenerationMismatch
 		}
 		native, err = authority.session.PutIfAbsentOrEqual(
-			ctx, replicatedCatalogHeadKey[:], authority.scratch,
+			ctx, replicatedCatalogHeadKey, authority.scratch,
 		)
 	} else {
-		current, openErr := OpenSnapshotDocument(currentResult.Value)
+		currentPayload, openErr := openTypedControlPlaneDocument(
+			currentResult.Value, replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes,
+		)
+		if openErr != nil {
+			return openErr
+		}
+		current, openErr := OpenSnapshotDocument(currentPayload)
 		if openErr != nil {
 			return openErr
 		}
@@ -252,7 +264,7 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 		}
 		digest := sha256.Sum256(currentResult.Value)
 		native, err = authority.session.ComparePut(
-			ctx, replicatedCatalogHeadKey[:], authority.scratch,
+			ctx, replicatedCatalogHeadKey, authority.scratch,
 			uint64(len(currentResult.Value)), replication.Digest(digest),
 		)
 	}
@@ -357,11 +369,15 @@ func (record ReplicatedOperationRecord) Equal(other ReplicatedOperationRecord) b
 		bytes.Equal(record.Intent, other.Intent)
 }
 
-func replicatedOperationKey(id [32]byte) [33]byte {
-	var key [33]byte
-	key[0] = replicatedOperationKeyByte
-	copy(key[1:], id[:])
-	return key
+type replicatedOperationPayload struct {
+	Kind              ReplicatedOperationKind  `json:"kind"`
+	State             ReplicatedOperationState `json:"state"`
+	Revision          uint64                   `json:"revision"`
+	CatalogGeneration uint64                   `json:"catalog_generation"`
+	Cursor            [8]uint64                `json:"cursor"`
+	Proof             []byte                   `json:"proof"`
+	IntentDigest      []byte                   `json:"intent_digest"`
+	Intent            []byte                   `json:"intent"`
 }
 
 func appendReplicatedOperation(dst []byte, record ReplicatedOperationRecord) ([]byte, error) {
@@ -372,25 +388,42 @@ func appendReplicatedOperation(dst []byte, record ReplicatedOperationRecord) ([]
 	if err != nil || !bytes.Equal(canonicalIntent, record.Intent) {
 		return dst, errors.Join(err, ErrReplicatedCatalog)
 	}
-	raw, err := vibejson.Marshal(&record)
+	payload := replicatedOperationPayload{
+		Kind: record.Kind, State: record.State, Revision: record.Revision,
+		CatalogGeneration: record.CatalogGeneration, Cursor: record.Cursor,
+		Proof: record.Proof[:], IntentDigest: record.IntentDigest[:], Intent: record.Intent,
+	}
+	raw, err := vibejson.Marshal(&payload)
 	if err != nil {
 		return dst, err
 	}
-	start := len(dst)
-	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start > MaxReplicatedOperationBytes {
-		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
-	}
-	return dst, nil
+	var identifierStorage [controlPlaneOperationIDBytes]byte
+	identifier := appendReplicatedOperationDocumentID(identifierStorage[:0], record.ID)
+	return appendControlPlaneDocument(dst, identifier, raw, MaxReplicatedOperationBytes)
 }
 
 func openReplicatedOperation(raw []byte) (ReplicatedOperationRecord, error) {
 	if len(raw) == 0 || len(raw) > MaxReplicatedOperationBytes {
 		return ReplicatedOperationRecord{}, ErrReplicatedCatalog
 	}
-	var record ReplicatedOperationRecord
-	if err := vibejson.Unmarshal(raw, &record); err != nil || !validReplicatedOperation(record) {
+	id, payloadBytes, err := openReplicatedOperationDocumentID(raw)
+	if err != nil {
+		return ReplicatedOperationRecord{}, err
+	}
+	var payload replicatedOperationPayload
+	if err = vibejson.Unmarshal(payloadBytes, &payload); err != nil ||
+		len(payload.Proof) != len(id) || len(payload.IntentDigest) != len(id) {
 		return ReplicatedOperationRecord{}, errors.Join(err, ErrReplicatedCatalog)
+	}
+	record := ReplicatedOperationRecord{
+		ID: id, Kind: payload.Kind, State: payload.State, Revision: payload.Revision,
+		CatalogGeneration: payload.CatalogGeneration, Cursor: payload.Cursor,
+		Intent: payload.Intent,
+	}
+	copy(record.Proof[:], payload.Proof)
+	copy(record.IntentDigest[:], payload.IntentDigest)
+	if !validReplicatedOperation(record) {
+		return ReplicatedOperationRecord{}, ErrReplicatedCatalog
 	}
 	canonical, err := appendReplicatedOperation(nil, record)
 	if err != nil || !bytes.Equal(raw, canonical) {
@@ -400,47 +433,50 @@ func openReplicatedOperation(raw []byte) (ReplicatedOperationRecord, error) {
 }
 
 type replicatedOperationDirectory struct {
-	IDs [][4]uint64 `json:"ids"`
+	IDs [][]byte `json:"ids"`
 }
 
 func appendReplicatedOperationDirectory(dst []byte, ids [][32]byte) ([]byte, error) {
 	if len(ids) > maxReplicatedOperations {
 		return dst, ErrReplicatedCatalog
 	}
-	directory := replicatedOperationDirectory{IDs: make([][4]uint64, len(ids))}
+	directory := replicatedOperationDirectory{IDs: make([][]byte, len(ids))}
 	for index := range ids {
 		if ids[index] == ([32]byte{}) || index != 0 && bytes.Compare(ids[index-1][:], ids[index][:]) >= 0 {
 			return dst, ErrReplicatedCatalog
 		}
-		for word := range directory.IDs[index] {
-			directory.IDs[index][word] = binary.LittleEndian.Uint64(ids[index][word*8:])
-		}
+		directory.IDs[index] = ids[index][:]
 	}
 	raw, err := vibejson.Marshal(&directory)
 	if err != nil {
 		return dst, err
 	}
-	start := len(dst)
-	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst)-start > maxReplicatedOperationDirectoryBytes {
-		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
-	}
-	return dst, nil
+	return appendControlPlaneDocument(
+		dst, replicatedOperationDirectoryDocumentID[:], raw,
+		maxReplicatedOperationDirectoryBytes,
+	)
 }
 
 func openReplicatedOperationDirectory(raw []byte) ([][32]byte, error) {
 	if len(raw) == 0 || len(raw) > maxReplicatedOperationDirectoryBytes {
 		return nil, ErrReplicatedCatalog
 	}
+	payload, err := openTypedControlPlaneDocument(
+		raw, replicatedOperationDirectoryDocumentID[:], maxReplicatedOperationDirectoryBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
 	var directory replicatedOperationDirectory
-	if err := vibejson.Unmarshal(raw, &directory); err != nil || len(directory.IDs) > maxReplicatedOperations {
+	if err = vibejson.Unmarshal(payload, &directory); err != nil || len(directory.IDs) > maxReplicatedOperations {
 		return nil, errors.Join(err, ErrReplicatedCatalog)
 	}
 	ids := make([][32]byte, len(directory.IDs))
 	for index := range directory.IDs {
-		for word := range directory.IDs[index] {
-			binary.LittleEndian.PutUint64(ids[index][word*8:], directory.IDs[index][word])
+		if len(directory.IDs[index]) != len(ids[index]) {
+			return nil, ErrReplicatedCatalog
 		}
+		copy(ids[index][:], directory.IDs[index])
 		if ids[index] == ([32]byte{}) || index != 0 && bytes.Compare(ids[index-1][:], ids[index][:]) >= 0 {
 			return nil, ErrReplicatedCatalog
 		}

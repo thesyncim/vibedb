@@ -425,6 +425,21 @@ func TestReplicatedServerCountsExceptionalProposalDowngrades(t *testing.T) {
 		}
 	})
 
+	t.Run("pre-admission bound remains definite", func(t *testing.T) {
+		outcome := raftserve.Outcome{Code: raftserve.OutcomeAdmissionBound}
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
+		})
+		response := server.executeReplicated(context.Background(), request)
+		stats := server.Stats()
+		if response.Kind != ReplicatedRefusal ||
+			response.Refusal != ReplicatedRefusalAdmissionBound ||
+			response.Outcome != (raftserve.Outcome{}) ||
+			stats.ProposalInvalidDeterministic != 0 || !validReplicatedResponse(response) {
+			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
 	t.Run("invalid deterministic refusal remains distinct", func(t *testing.T) {
 		outcome := raftserve.Outcome{
 			Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9, CompletionBytes: 1,

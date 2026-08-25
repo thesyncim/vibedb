@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -16,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
@@ -48,6 +50,8 @@ type ReplicatedEndpoint struct {
 
 // ReplicatedRoute is one exact catalog allocation and its bounded replica set.
 type ReplicatedRoute struct {
+	Distribution         distribution.DistributionName
+	Shard                distribution.ShardID
 	Group                raftmember.GroupKey
 	AllocationGeneration uint64
 	Command              raftservice.CommandFence
@@ -1065,7 +1069,8 @@ func validReplicatedAppliedRefusal(response *shardservice.ReplicatedResponse) bo
 }
 
 func validReplicatedRoute(route ReplicatedRoute) bool {
-	if !validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
+	if route.Distribution == "" || route.Shard == "" ||
+		!validReplicatedCatalogGroup(route.Group) || route.AllocationGeneration == 0 ||
 		!route.Command.Valid() ||
 		len(route.Replicas) == 0 || len(route.Replicas) > AbsoluteMaxReplicatedRouteMembers {
 		return false
@@ -1094,6 +1099,8 @@ func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 	return err == nil && view.ClusterID == route.Group.ClusterID &&
 		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
 		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&
+		vibejson.BytesEqualString(view.Distribution, string(route.Distribution)) &&
+		vibejson.BytesEqualString(view.Shard, string(route.Shard)) &&
 		view.ShardIncarnation == route.Group.ShardIncarnation &&
 		view.GroupID == route.Group.GroupID &&
 		view.AllocationGeneration == route.AllocationGeneration &&

@@ -372,6 +372,35 @@ func TestValidatedMutationResultMappingAndPrestageObserver(t *testing.T) {
 	}
 }
 
+// A deterministic document-contract mismatch is refused by the non-reserving
+// pre-proposal check. It therefore has no Raft applied index; applying the same
+// bytes directly demonstrates the semantic result that admission intentionally
+// collapses into the fixed admission-bound error.
+func TestValidatedMutationContractMismatchIsPreProposalAdmissionBound(t *testing.T) {
+	fixture := newValidatedMachineFixture(t, mutationValidatorFuncs{
+		put: func([]byte, []byte) MutationValidation { return MutationValidationInvalid },
+	}, nil)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	command := testCommand(fixture.binding, 1, replication.Mutation{
+		Kind: replication.MutationPutAbsentOrEqual,
+		Key:  []byte{0}, Value: []byte(`{"format":1}`),
+	})
+	if err := fixture.machine.AdmitCommand(command); !errors.Is(err, ErrAdmissionBound) ||
+		fixture.machine.Applied() != 2 {
+		t.Fatalf("pre-proposal mismatch = %v applied=%d, want admission bound at 2",
+			err, fixture.machine.Applied())
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	if result := completionResultCode(t, fixture.machine, command); result != ResultInvalidDocument {
+		t.Fatalf("applied mismatch result = %d, want %d", result, ResultInvalidDocument)
+	}
+}
+
 func TestValidatedMutationRejectsMalformedJSONBeforeCustomValidator(t *testing.T) {
 	validatorCalls := 0
 	observed := new(observedMutationKeys)

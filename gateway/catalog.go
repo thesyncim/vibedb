@@ -1335,8 +1335,23 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 // the replicated catalog relation. It carries the same validated fields and
 // lineage as the durable file format without whitespace or a second schema.
 func AppendSnapshotDocument(dst []byte, snapshot *Snapshot) ([]byte, error) {
+	return appendSnapshotDocumentBounded(dst, snapshot, maxCatalogBytes)
+}
+
+// appendSnapshotDocumentBounded applies a stricter caller-owned value budget
+// before growing dst. The replicated catalog uses this to account for its
+// outer /id envelope within the smaller mutation-value ceiling, while the file
+// catalog retains maxCatalogBytes.
+func appendSnapshotDocumentBounded(
+	dst []byte,
+	snapshot *Snapshot,
+	maximum int,
+) ([]byte, error) {
 	if snapshot == nil {
 		return dst, ErrInvalidCatalog
+	}
+	if maximum <= 0 || maximum > maxCatalogBytes {
+		return dst, ErrCatalogTooLarge
 	}
 	state, err := initialCatalogState(snapshot)
 	if err != nil {
@@ -1347,12 +1362,12 @@ func AppendSnapshotDocument(dst []byte, snapshot *Snapshot) ([]byte, error) {
 	if err != nil {
 		return dst, err
 	}
-	if len(compact) > maxCatalogBytes {
+	if len(compact) > maximum {
 		return dst, ErrCatalogTooLarge
 	}
 	start := len(dst)
 	dst, err = vibejson.AppendCanonicalize(dst, compact)
-	if err != nil || len(dst)-start > maxCatalogBytes {
+	if err != nil || len(dst)-start > maximum {
 		return dst[:start], errors.Join(err, ErrCatalogTooLarge)
 	}
 	return dst, nil

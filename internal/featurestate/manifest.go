@@ -195,23 +195,33 @@ var Distributed = []Feature{
 	},
 	{
 		Name: "Automatic split and replica-move execution",
-		Primitive: Stage{StatusPartial, "Split staging, tail translation, placement, move plans, and safety reconcilers exist. There is no operation executor.", []Reference{
-			ref("internal/rangesplit/stage.go", "ChildStage"), ref("internal/rebalance/reconcile.go", "Reconcile"),
+		Primitive: Stage{StatusPartial, "Split staging, tail translation, placement, durable split execution, move plans, and safety reconcilers exist. Replica-move execution is still absent.", []Reference{
+			ref("internal/rangesplit/stage.go", "ChildStage"), ref("internal/splitcontroller/replicated_executor.go", "ExecuteReplicatedStep"), ref("internal/rebalance/reconcile.go", "Reconcile"),
 		}},
-		Integrated: Stage{StatusNo, "No replicated authority drives learner creation, catch-up, catalog cutover, source drain, and cleanup as one resumable operation.", nil},
-		Shipped:    Stage{StatusNo, "The catalog is operator-published and commands do not execute split or move plans.", nil},
-		Qualification: Stage{StatusPartial, "Planner, bounded-memory, lineage, and fail-closed reconciler tests exist. There is no foreground-traffic or controller-crash gate.", []Reference{
-			ref("internal/topologyscheduler/planning_test.go", "TestBuildSplitPlanBatchBindsSameDistributionPlacements"), ref("internal/rebalance/reconcile_test.go", "TestReplicaMoveReconcileRequiresEverySafetyFence"),
+		Integrated: Stage{StatusPartial, "A dedicated catalog RF3 journal drives resumable publish-before-prune split actions through authenticated shard-control routes. Learner creation, catch-up, source removal, and replica moves are not orchestrated.", []Reference{
+			ref("internal/splitcontroller/controller_service.go", "ControllerService"), ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"),
+		}},
+		Shipped: Stage{StatusPartial, "vibedb-gateway runs the replicated split-controller loop when configured with the dedicated catalog RF3 authority. No shipped command constructs that RF3 group or executes replica moves.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "runSplitController"),
+		}},
+		Qualification: Stage{StatusPartial, "Publish-before-prune crash matrices, replicated-journal recovery, controller reconstruction, and a three-process catalog restart/leader-loss gate exist. Foreground-traffic and replica-move crash gates do not.", []Reference{
+			ref("internal/splitcontroller/execute_test.go", "TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows"), ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
 		}},
 	},
 	{
 		Name: "Replicated catalog and distributed DDL",
-		Primitive: Stage{StatusPartial, "The gateway has a durable monotonic static catalog and schema-generation identities. It has no metadata Raft group.", []Reference{
-			ref("gateway/catalog.go", "SaveSnapshotAfter"), ref("internal/replicatedstate/relation_bundle.go", "RelationCollection"),
+		Primitive: Stage{StatusPartial, "A dedicated RF3 catalog authority provides linearizable catalog heads and bounded resumable operation records. A distributed DDL rollout protocol is absent.", []Reference{
+			ref("gateway/replicated_catalog_authority.go", "ReplicatedCatalogAuthority"), ref("internal/replicatedstate/relation_bundle.go", "RelationCollection"),
 		}},
-		Integrated:    Stage{StatusNo, "Topology, membership, schema rollout, and operation authority do not share one replicated control plane.", nil},
-		Shipped:       Stage{StatusNo, "Operators must publish catalog files and create matching shard tables outside the commands. Distributed DDL is refused.", nil},
-		Qualification: Stage{StatusNo, "There is no metadata-quorum, controller-restart, or rolling schema compatibility gate.", nil},
+		Integrated: Stage{StatusPartial, "Catalog publication and split-operation authority share one dedicated, topology-authorized RF3 relation with exact catalog/controlplane placement and schema-generation fences. Membership and schema rollout are not controlled there yet.", []Reference{
+			ref("gateway/replicated_catalog_document.go", "ReplicatedCatalogDistribution"), ref("internal/splitcontroller/replicated_executor.go", "ReplicatedOperationJournal"),
+		}},
+		Shipped: Stage{StatusPartial, "vibedb-gateway consumes the replicated catalog and refuses arbitrary catalog placement coordinates, but no shipped command bootstraps or serves the catalog RF3 group and distributed DDL remains refused.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "newReplicatedCatalogGateway"),
+		}},
+		Qualification: Stage{StatusPartial, "A three-process RF3 gate covers quorum publication, byte-identical replay, controller reconstruction, outcome-unknown settlement, generation CAS, and leader loss. Rolling schema compatibility and DDL rollback gates are absent.", []Reference{
+			ref("internal/raftservice/controlplane_catalog_rf3_test.go", "TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart"),
+		}},
 	},
 	{
 		Name: "Hot-shard detection and rebalancing",

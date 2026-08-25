@@ -568,6 +568,18 @@ func (server *ReplicatedServer) executeReplicated(
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
 			HasState: true, State: wireState,
 		}
+	case result.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeAdmissionBound}) &&
+		len(result.Completion) == 0 && errors.Is(err, replicatedstate.ErrAdmissionBound):
+		// The registry can observe a bounded local-core refusal through its
+		// proposal-admission callback. AppliedIndex==0 is the proof that this
+		// exact command never entered Raft, so expose a definite pre-admission
+		// refusal instead of misclassifying it as an invalid applied result. The
+		// caller decides whether its cause is transient; malformed or oversized
+		// commands can reach the same bounded refusal and must not be spun on.
+		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalAdmissionBound,
+			HasState: true, State: wireState,
+		}
 	case result.Outcome.Code > raftserve.OutcomeCompletion &&
 		result.Outcome.Code < raftserve.OutcomeProposalRefused:
 		wireState = replicatedStateAtApplied(proposalState, result.Outcome.AppliedIndex)

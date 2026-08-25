@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -114,8 +113,6 @@ func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
 	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
-	catalogDistribution := fs.String("catalog-distribution", "", "distribution containing the replicated catalog RF3 group")
-	catalogShard := fs.String("catalog-shard", "", "shard containing the replicated catalog RF3 group")
 	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
 	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
 	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
@@ -146,15 +143,14 @@ func runServe(args []string) int {
 		return 2
 	}
 	if *devStaticCatalog {
-		if !*devPlaintext || *catalogDistribution != "" || *catalogShard != "" || *catalogRelation != 0 {
+		if !*devPlaintext || *catalogRelation != 0 {
 			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
 			return 2
 		}
-	} else if *catalogDistribution == "" || *catalogShard == "" || *catalogRelation == 0 ||
-		*catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
+	} else if *catalogRelation == 0 || *catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
 		*catalogAttemptTimeout <= 0 || *catalogSessionJournal == "" || *controllerInterval <= 0 ||
 		*catalogSessionLease <= 0 || len(*catalogClientID) != 32 || len(*catalogRetryHome) != 16 {
-		fmt.Fprintln(os.Stderr, "gateway: replicated catalog coordinates and positive bounds are required")
+		fmt.Fprintln(os.Stderr, "gateway: replicated catalog relation, identities, journal, and positive bounds are required")
 		return 2
 	}
 	var clientTLS *gateway.ClientTLS
@@ -254,7 +250,6 @@ func runServe(args []string) int {
 		exec, holder, catalogAuthority, catalogTLS, err = newReplicatedCatalogGateway(
 			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
 			internalAuthority,
-			distribution.DistributionName(*catalogDistribution), distribution.ShardID(*catalogShard),
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
 			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
 			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
@@ -347,8 +342,6 @@ func newReplicatedCatalogGateway(
 	tlsProfile *rafttransport.PeerTLS,
 	devPlaintext bool,
 	internalAuthority serviceauthz.Authority,
-	distributionName distribution.DistributionName,
-	shardID distribution.ShardID,
 	relation replication.RelationID,
 	attempts int,
 	attemptTimeout time.Duration,
@@ -360,6 +353,8 @@ func newReplicatedCatalogGateway(
 	retryHome replication.RetryHome,
 	lease time.Duration,
 ) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority, *servicetls.Client, error) {
+	distributionName := gateway.ReplicatedCatalogDistribution
+	shardID := gateway.ReplicatedCatalogShard
 	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
 	if err != nil {
 		return nil, nil, nil, nil, err

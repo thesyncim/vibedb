@@ -297,6 +297,12 @@ func TestNativeSessionRejectsIdentityAndMutationBoundsBeforeOwnedWork(t *testing
 		name   string
 		mutate func(*NativeSessionOptions)
 	}{
+		{"distribution route mismatch", func(options *NativeSessionOptions) {
+			options.Distribution = "other"
+		}},
+		{"shard route mismatch", func(options *NativeSessionOptions) {
+			options.Shard = "other"
+		}},
 		{"distribution bound", func(options *NativeSessionOptions) {
 			options.Distribution = string(bytes.Repeat([]byte{'d'}, replication.MaxIdentityBytes+1))
 		}},

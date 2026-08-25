@@ -165,6 +165,10 @@ func newCatalogAuthorityFixture(t *testing.T) (
 	if !ok {
 		t.Fatal("missing control-plane route")
 	}
+	// This focused mock reuses the data catalog's compact RF3 identity while
+	// exercising the reserved control-plane placement contract explicitly.
+	route.Distribution = ReplicatedCatalogDistribution
+	route.Shard = ReplicatedCatalogShard
 	state := shardservice.ReplicatedMemberState{
 		Fence: shardservice.ReplicatedFence{
 			Group: route.Group, AllocationGeneration: route.AllocationGeneration,
@@ -182,14 +186,20 @@ func newCatalogAuthorityFixture(t *testing.T) (
 	if err != nil {
 		t.Fatal(err)
 	}
+	raw, err = appendControlPlaneDocument(
+		nil, replicatedCatalogHeadDocumentID[:], raw, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client.rows[string(replicatedCatalogHeadKey[:])] = raw
 	executor, err := NewReplicatedExecutor(client, 2, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	session, err := NewNativeSession(NativeSessionOptions{
-		Executor: executor, Route: route, Distribution: string(descriptor.Distribution),
-		Shard: string(descriptor.Shard), Tenant: []byte("control-plane"),
+		Executor: executor, Route: route, Distribution: string(ReplicatedCatalogDistribution),
+		Shard: string(ReplicatedCatalogShard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
 		ProposalCapability: serviceauthz.CapabilityTopology,
 		MaxRelationBatches: 1, MaxMutations: 2,
@@ -411,6 +421,22 @@ func TestReplicatedCatalogAuthorityRejectsMismatchedWriteSession(t *testing.T) {
 		Authority: authority.authority,
 	}
 	copySession := *authority.session
+	options.Session = nil
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("nil session = %v", err)
+	}
+	options.Session = &copySession
+	copySession.distribution = "tenant-data"
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("mismatched distribution = %v", err)
+	}
+	copySession = *authority.session
+	options.Session = &copySession
+	copySession.shard = "tenant-shard"
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("mismatched shard = %v", err)
+	}
+	copySession = *authority.session
 	options.Session = &copySession
 	copySession.resolver = BaseRelationResolver{Relation: authority.relation + 1}
 	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
@@ -425,9 +451,26 @@ func TestReplicatedCatalogAuthorityRejectsMismatchedWriteSession(t *testing.T) {
 	}
 	copySession = *authority.session
 	options.Session = &copySession
+	copySession.proposalCapability = serviceauthz.CapabilityDataWrite
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("mismatched capability = %v", err)
+	}
+	copySession = *authority.session
+	options.Session = &copySession
 	copySession.phase = nativeSessionNew
 	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
 		t.Fatalf("inactive session = %v", err)
+	}
+	copySession = *authority.session
+	options.Session = &copySession
+	copySession.pending = true
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("pending session = %v", err)
+	}
+	options.Session = authority.session
+	options.Route.Distribution = "tenant-data"
+	if _, err := NewReplicatedCatalogAuthority(options); !errors.Is(err, ErrReplicatedCatalog) {
+		t.Fatalf("ordinary data route = %v", err)
 	}
 }
 

@@ -273,6 +273,7 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
 	return ReplicatedRoute{
+		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
 		Command: entry.command, Replicas: dst,
 	}, true

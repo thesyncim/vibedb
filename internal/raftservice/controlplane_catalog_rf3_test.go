@@ -19,14 +19,14 @@ import (
 )
 
 // TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart proves the
-// control-plane relation through the same three-process RF3 serving path as
-// ordinary data. The process harness is intentionally reused without another
-// metadata consensus or an in-memory apply substitute.
+// control-plane relation through a dedicated three-process RF3 catalog group.
+// The process harness is intentionally reused without sharing the data group,
+// adding another consensus implementation, or using an in-memory substitute.
 func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testing.T) {
 	if os.Getenv(processHelperEnvironment) != "" {
 		return
 	}
-	cluster, err := startProcessRF3Cluster(t)
+	cluster, err := startProcessCatalogRF3Cluster(t)
 	if errors.Is(err, errProcessStrictAllocation) {
 		t.Skip(err)
 	}
@@ -44,7 +44,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	leader := cluster.elect(t, ctx, 1)
 	route := cluster.route()
 	client := newFaultProcessClient(t, cluster)
-	session := newProcessNativeSession(t, route, client, 0xa1, serviceauthz.CapabilityTopology)
+	session := newProcessCatalogSession(t, route, client, 0xa1, serviceauthz.CapabilityTopology)
 	if _, err = session.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open catalog session: %v", err)
 	}
@@ -53,6 +53,25 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	// measures catalog publication, not cluster boot readiness.
 	leader = cluster.waitStableLeader(t, ctx)
 	first := processControlPlaneSnapshot(t, cluster, 1)
+	var dataReplicas [processVoters]gateway.ReplicatedEndpoint
+	dataRoute, ok := first.ResolveReplicatedRoute("orders", "0000-ffff", dataReplicas[:0])
+	if !ok {
+		t.Fatal("published data RF3 group did not resolve")
+	}
+	if route.Distribution != gateway.ReplicatedCatalogDistribution ||
+		route.Shard != gateway.ReplicatedCatalogShard ||
+		dataRoute.Distribution == route.Distribution || dataRoute.Shard == route.Shard ||
+		dataRoute.Group == route.Group || route.Group != processCatalogGroup() {
+		t.Fatalf("catalog serving group=%+v published data group=%+v", route.Group, dataRoute.Group)
+	}
+	if route.Command.RelationManifestDigest == dataRoute.Command.RelationManifestDigest {
+		t.Fatal("catalog and data RF3 groups reused one relation manifest")
+	}
+	for index := range route.Replicas {
+		if route.Replicas[index].StoreID == dataRoute.Replicas[index].StoreID {
+			t.Fatalf("catalog member %d reused published data store identity", index+1)
+		}
+	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
 		Holder: gateway.NewCatalogHolder(nil), Session: session,
@@ -94,7 +113,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		t.Fatal(err)
 	}
 	client.executor = limitedExecutor
-	restartedSession := newProcessNativeSession(t, route, client, 0xa2,
+	restartedSession := newProcessCatalogSession(t, route, client, 0xa2,
 		serviceauthz.CapabilityTopology)
 	if _, err = restartedSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open restarted catalog session: %v", err)
@@ -145,7 +164,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 
 	// A fresh controller session reconstructs the running operation from RF3,
 	// advances it to a terminal witness, and removes that exact revision.
-	recoveredSession := newProcessNativeSession(t, route, client, 0xa3,
+	recoveredSession := newProcessCatalogSession(t, route, client, 0xa3,
 		serviceauthz.CapabilityTopology)
 	if _, err = recoveredSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open recovered controller session: %v", err)
@@ -235,11 +254,12 @@ func processControlPlaneSnapshot(
 			ControlEndpoint: controlEndpointIDs[index],
 		}
 	}
+	dataManifestDigest := sha256.Sum256([]byte("rf3-process-data-relation-manifest"))
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
 		config, endpoints, generation, nil, nil, []gateway.ReplicatedShardDescriptor{{
 			Distribution: distributionName, Shard: shardID,
 			Group: processGroup(), AllocationGeneration: 7,
-			Command: cluster.commandFence, Replicas: replicas,
+			Command: processCommandFence(dataManifestDigest), Replicas: replicas,
 		}},
 	)
 	if err != nil {
