@@ -457,6 +457,89 @@ func TestGlobalConditionalDeleteCompareDoesNotConsumeDocumentCapacity(t *testing
 	}
 }
 
+func TestRelationJSONDigestCompareReplaceAndDelete(t *testing.T) {
+	fixture := newRelationBundleFixture(t, false)
+	key := []byte("catalog-head")
+	first := []byte(`{"generation":1}`)
+	second := []byte(`{"generation":2}`)
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: first,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil ||
+		bundleCompletionResult(t, fixture.machine, seed) != ResultApplied {
+		t.Fatalf("seed = %v", err)
+	}
+	wrong := sha256.Sum256([]byte("stale"))
+	stale := fixture.command(t, 2, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutDigestEqual, Key: key, Value: second,
+			ExpectedValueLength: uint64(len(first)), ExpectedValueDigest: wrong,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), stale); err != nil ||
+		bundleCompletionResult(t, fixture.machine, stale) != ResultIndexConflict {
+		t.Fatalf("stale replace = %v", err)
+	}
+	if value, found, err := fixture.base.Collection.AppendRaw(nil, key); err != nil || !found ||
+		!bytes.Equal(value, first) {
+		t.Fatalf("value after stale replace = %q found=%v err=%v", value, found, err)
+	}
+	digest := sha256.Sum256(first)
+	replace := fixture.command(t, 3, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutDigestEqual, Key: key, Value: second,
+			ExpectedValueLength: uint64(len(first)), ExpectedValueDigest: digest,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), replace); err != nil ||
+		bundleCompletionResult(t, fixture.machine, replace) != ResultApplied {
+		t.Fatalf("replace = %v", err)
+	}
+	secondDigest := sha256.Sum256(second)
+	remove := fixture.command(t, 4, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationDeleteDigestEqual, Key: key,
+			ExpectedValueLength: uint64(len(second)), ExpectedValueDigest: secondDigest,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), remove); err != nil ||
+		bundleCompletionResult(t, fixture.machine, remove) != ResultApplied {
+		t.Fatalf("remove = %v", err)
+	}
+	if _, found, err := fixture.base.Collection.AppendRaw(nil, key); err != nil || found {
+		t.Fatalf("conditional delete found=%v err=%v", found, err)
+	}
+	third := []byte(`{"generation":3}`)
+	reseed := fixture.command(t, 5, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: third,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(7), reseed); err != nil ||
+		bundleCompletionResult(t, fixture.machine, reseed) != ResultApplied {
+		t.Fatalf("reseed = %v", err)
+	}
+	thirdDigest := sha256.Sum256(third)
+	lastDelete := fixture.command(t, 6, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{
+			{Kind: replication.MutationPut, Key: key, Value: second},
+			{
+				Kind: replication.MutationDeleteDigestEqual, Key: key,
+				ExpectedValueLength: uint64(len(third)), ExpectedValueDigest: thirdDigest,
+			},
+		},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(8), lastDelete); err != nil ||
+		bundleCompletionResult(t, fixture.machine, lastDelete) != ResultApplied {
+		t.Fatalf("last conditional delete = %v", err)
+	}
+	if _, found, err := fixture.base.Collection.AppendRaw(nil, key); err != nil || found {
+		t.Fatalf("value after last conditional delete found=%v err=%v", found, err)
+	}
+}
+
 func TestRelationBundleAtomicBaseLocalAndGlobalIndexApply(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	globalKey := []byte{0x91, 0x01, 'a'}

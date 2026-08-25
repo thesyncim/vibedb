@@ -62,7 +62,8 @@ func LogicalCommandDigest(command replication.CommandView) [32]byte {
 			binary.LittleEndian.PutUint64(length[:], uint64(len(mutation.Value)))
 			_, _ = h.Write(length[:])
 			_, _ = h.Write(mutation.Value)
-			if mutation.Kind == replication.MutationDeleteDigestEqual {
+			if mutation.Kind == replication.MutationDeleteDigestEqual ||
+				mutation.Kind == replication.MutationPutDigestEqual {
 				binary.LittleEndian.PutUint64(length[:], mutation.ExpectedValueLength)
 				_, _ = h.Write(length[:])
 				_, _ = h.Write(mutation.ExpectedValueDigest[:])

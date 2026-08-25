@@ -29,6 +29,8 @@ const deterministicBundleApplySemantics = "ordered-dense-relation-batches;" +
 	"one-checkpoint-group-publication;all-relations-or-none;" +
 	"global-put-absent-or-vibejson-semantic-equal;" +
 	"global-delete-raw-length-and-sha256-equal;" +
+	"json-put-absent-or-raw-equal;json-put-raw-length-and-sha256-equal;" +
+	"json-delete-raw-length-and-sha256-equal;" +
 	"global-duplicate-key-conflict;byte-native-global-locator-array"
 
 var (
@@ -42,13 +44,17 @@ var (
 )
 
 type finalMutation struct {
-	key             []byte
-	value           []byte
-	before          []byte
-	descriptorIndex uint16
-	delete          bool
-	beforeFound     bool
-	described       bool
+	key               []byte
+	value             []byte
+	compare           []byte
+	before            []byte
+	descriptorIndex   uint16
+	delete            bool
+	conditional       bool
+	conditionalDelete bool
+	absentOrEqual     bool
+	beforeFound       bool
+	described         bool
 }
 
 // mutationValueDescriptor is transient batch workspace, never per-Machine
@@ -340,7 +346,7 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 17*4]byte
+	var grammar [2 + 18*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -359,6 +365,7 @@ func bundleApplyContractDigest(
 		uint32(replication.MutationDelete),
 		uint32(replication.MutationPutAbsentOrEqual),
 		uint32(replication.MutationDeleteDigestEqual),
+		uint32(replication.MutationPutDigestEqual),
 		replication.MutationDigestCompareBytes,
 	} {
 		binary.LittleEndian.PutUint32(grammar[2+index*4:2+(index+1)*4], code)

@@ -123,6 +123,7 @@ const (
 	MutationDelete            MutationKind = 2
 	MutationPutAbsentOrEqual  MutationKind = 3
 	MutationDeleteDigestEqual MutationKind = 4
+	MutationPutDigestEqual    MutationKind = 5
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed
@@ -133,9 +134,9 @@ type Mutation struct {
 	Key   []byte
 	Value []byte
 
-	// ExpectedValueLength and ExpectedValueDigest are populated only by
-	// MutationDeleteDigestEqual. The closed compare operation makes a stale
-	// global-index delete deterministic without carrying or decoding another
+	// ExpectedValueLength and ExpectedValueDigest are populated only by the
+	// digest-equal mutations. The closed compare operation makes stale deletes
+	// and replacements deterministic without carrying or decoding the prior
 	// JSON value. Ordinary Put/Delete wire bytes remain unchanged.
 	ExpectedValueLength uint64
 	ExpectedValueDigest Digest

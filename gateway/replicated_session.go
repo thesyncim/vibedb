@@ -30,9 +30,11 @@ var (
 // index relations are resolved. Key is already the engine's canonical ordered
 // key; Value is exact vibejson for Put and empty for Delete.
 type NativeMutation struct {
-	Kind  replication.MutationKind
-	Key   []byte
-	Value []byte
+	Kind                replication.MutationKind
+	Key                 []byte
+	Value               []byte
+	ExpectedValueLength uint64
+	ExpectedValueDigest replication.Digest
 }
 
 // BundleResolver emits dense, strictly increasing relation IDs for one native
@@ -56,6 +58,8 @@ func (resolver BaseRelationResolver) ResolveNative(
 ) error {
 	return builder.Add(resolver.Relation, replication.Mutation{
 		Kind: mutation.Kind, Key: mutation.Key, Value: mutation.Value,
+		ExpectedValueLength: mutation.ExpectedValueLength,
+		ExpectedValueDigest: mutation.ExpectedValueDigest,
 	})
 }
 
@@ -268,11 +272,50 @@ func (session *NativeSession) Put(
 	})
 }
 
+// PutIfAbsentOrEqual creates one document or confirms an exact canonical
+// retry. A different existing value returns a deterministic conflict.
+func (session *NativeSession) PutIfAbsentOrEqual(
+	ctx context.Context,
+	key, document []byte,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: document,
+	})
+}
+
 func (session *NativeSession) Delete(
 	ctx context.Context,
 	key []byte,
 ) (NativeResult, error) {
 	return session.mutate(ctx, NativeMutation{Kind: replication.MutationDelete, Key: key})
+}
+
+// CompareDelete removes one document only when its current raw identity
+// matches. An already absent value is an idempotent success.
+func (session *NativeSession) CompareDelete(
+	ctx context.Context,
+	key []byte,
+	expectedLength uint64,
+	expectedDigest replication.Digest,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationDeleteDigestEqual, Key: key,
+		ExpectedValueLength: expectedLength, ExpectedValueDigest: expectedDigest,
+	})
+}
+
+// ComparePut atomically replaces one document only when the current raw value
+// has the exact expected length and SHA-256 digest.
+func (session *NativeSession) ComparePut(
+	ctx context.Context,
+	key, document []byte,
+	expectedLength uint64,
+	expectedDigest replication.Digest,
+) (NativeResult, error) {
+	return session.mutate(ctx, NativeMutation{
+		Kind: replication.MutationPutDigestEqual, Key: key, Value: document,
+		ExpectedValueLength: expectedLength, ExpectedValueDigest: expectedDigest,
+	})
 }
 
 func (session *NativeSession) mutate(
@@ -290,7 +333,8 @@ func (session *NativeSession) mutate(
 		return NativeResult{}, ErrNativeBundleBound
 	}
 	switch mutation.Kind {
-	case replication.MutationPut:
+	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
+		replication.MutationPutDigestEqual:
 		if len(mutation.Value) == 0 ||
 			len(mutation.Value) > replication.MaxMutationValueBytes ||
 			len(mutation.Value) > session.maxCommand {
@@ -299,8 +343,20 @@ func (session *NativeSession) mutate(
 		if !vibejson.Valid(mutation.Value) {
 			return NativeResult{}, ErrNativeDocument
 		}
+		if mutation.Kind == replication.MutationPutDigestEqual &&
+			(mutation.ExpectedValueLength == 0 ||
+				mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+				mutation.ExpectedValueDigest == (replication.Digest{})) {
+			return NativeResult{}, ErrNativeBundleBound
+		}
 	case replication.MutationDelete:
 		if len(mutation.Value) != 0 {
+			return NativeResult{}, ErrNativeBundleBound
+		}
+	case replication.MutationDeleteDigestEqual:
+		if len(mutation.Value) != 0 || mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+			mutation.ExpectedValueDigest == (replication.Digest{}) {
 			return NativeResult{}, ErrNativeBundleBound
 		}
 	default:

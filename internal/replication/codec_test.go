@@ -336,10 +336,18 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 	deletedDigest := Digest(sha256.Sum256(deletedValue))
 	command := testCommand()
 	command.Batches = []RelationMutationBatch{
-		{Relation: 1, Mutations: []Mutation{{
-			Kind: MutationPutAbsentOrEqual, Key: []byte("unique-key"),
-			Value: []byte(`["document\u002d1",1e0]`),
-		}}},
+		{Relation: 1, Mutations: []Mutation{
+			{
+				Kind: MutationPutAbsentOrEqual, Key: []byte("unique-key"),
+				Value: []byte(`["document\u002d1",1e0]`),
+			},
+			{
+				Kind: MutationPutDigestEqual, Key: []byte("catalog-head"),
+				Value:               []byte(`{"generation":2}`),
+				ExpectedValueLength: uint64(len(deletedValue)),
+				ExpectedValueDigest: deletedDigest,
+			},
+		}},
 		{Relation: 2, Mutations: []Mutation{{
 			Kind: MutationDeleteDigestEqual, Key: []byte("stale-safe-key"),
 			ExpectedValueLength: uint64(len(deletedValue)),
@@ -382,6 +390,15 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 					binary.LittleEndian.Uint64(mutation.Compare[:8]) != uint64(len(deletedValue)) ||
 					!bytes.Equal(mutation.Compare[8:], deletedDigest[:]) {
 					t.Fatalf("delete compare fields = %+v", mutation)
+				}
+			case MutationPutDigestEqual:
+				if !bytes.Equal(mutation.Value, []byte(`{"generation":2}`)) ||
+					len(mutation.Compare) != MutationDigestCompareBytes ||
+					mutation.ExpectedValueLength != uint64(len(deletedValue)) ||
+					mutation.ExpectedValueDigest != deletedDigest ||
+					binary.LittleEndian.Uint64(mutation.Compare[:8]) != uint64(len(deletedValue)) ||
+					!bytes.Equal(mutation.Compare[8:], deletedDigest[:]) {
+					t.Fatalf("put compare fields = %+v", mutation)
 				}
 			default:
 				t.Fatalf("unexpected mutation kind %d", mutation.Kind)

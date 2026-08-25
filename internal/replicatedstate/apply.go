@@ -1326,7 +1326,10 @@ func (m *Machine) planMutations(
 		mutation := iterator.Mutation()
 		if relation.kind == RelationJSON &&
 			mutation.Kind != replication.MutationPut &&
-			mutation.Kind != replication.MutationDelete ||
+			mutation.Kind != replication.MutationPutAbsentOrEqual &&
+			mutation.Kind != replication.MutationPutDigestEqual &&
+			mutation.Kind != replication.MutationDelete &&
+			mutation.Kind != replication.MutationDeleteDigestEqual ||
 			relation.kind == RelationGlobalIndex &&
 				mutation.Kind != replication.MutationPutAbsentOrEqual &&
 				mutation.Kind != replication.MutationDeleteDigestEqual {
@@ -1343,8 +1346,13 @@ func (m *Machine) planMutations(
 			if relation.kind == RelationGlobalIndex {
 				return nil, ResultIndexConflict, nil
 			}
-			ordered[at].delete = mutation.Kind == replication.MutationDelete
+			ordered[at].delete = mutation.Kind == replication.MutationDelete ||
+				mutation.Kind == replication.MutationDeleteDigestEqual
 			ordered[at].value = mutation.Value
+			ordered[at].compare = mutation.Compare
+			ordered[at].conditional = mutation.Kind == replication.MutationPutDigestEqual
+			ordered[at].conditionalDelete = mutation.Kind == replication.MutationDeleteDigestEqual
+			ordered[at].absentOrEqual = mutation.Kind == replication.MutationPutAbsentOrEqual
 			continue
 		}
 		value := mutation.Value
@@ -1355,6 +1363,10 @@ func (m *Machine) planMutations(
 			key: mutation.Key, value: value,
 			delete: mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual,
+			compare:           mutation.Compare,
+			conditional:       mutation.Kind == replication.MutationPutDigestEqual,
+			conditionalDelete: mutation.Kind == replication.MutationDeleteDigestEqual,
+			absentOrEqual:     mutation.Kind == replication.MutationPutAbsentOrEqual,
 		})
 		if len(ordered) > target.Limits.MaxDistinctMutations {
 			return nil, ResultTargetBound, nil
@@ -1427,6 +1439,35 @@ func (m *Machine) planMutations(
 				)
 			}
 		}
+		if relation.kind == RelationJSON && mutation.absentOrEqual && found {
+			if bytes.Equal(current, mutation.value) {
+				continue
+			}
+			return nil, ResultIndexConflict, nil
+		}
+		if mutation.conditional {
+			if !found {
+				return nil, ResultIndexConflict, nil
+			}
+			expectedLength := binary.LittleEndian.Uint64(mutation.compare[:8])
+			currentDigest := sha256.Sum256(current)
+			if uint64(len(current)) != expectedLength ||
+				!bytes.Equal(currentDigest[:], mutation.compare[8:]) {
+				return nil, ResultIndexConflict, nil
+			}
+		}
+		if mutation.conditionalDelete {
+			if !found {
+				continue
+			}
+			expectedLength := binary.LittleEndian.Uint64(mutation.compare[:8])
+			currentDigest := sha256.Sum256(current)
+			if uint64(len(current)) != expectedLength ||
+				!bytes.Equal(currentDigest[:], mutation.compare[8:]) {
+				return nil, ResultIndexConflict, nil
+			}
+			mutation.value = nil
+		}
 		if relation.kind == RelationGlobalIndex {
 			if !mutation.delete {
 				if found {
@@ -1437,17 +1478,6 @@ func (m *Machine) planMutations(
 					}
 					return nil, ResultIndexConflict, nil
 				}
-			} else {
-				if !found {
-					continue
-				}
-				expectedLength := binary.LittleEndian.Uint64(mutation.value[:8])
-				currentDigest := sha256.Sum256(current)
-				if uint64(len(current)) != expectedLength ||
-					!bytes.Equal(currentDigest[:], mutation.value[8:]) {
-					return nil, ResultIndexConflict, nil
-				}
-				mutation.value = nil
 			}
 		}
 		if mutation.delete && !found || !mutation.delete && found && bytes.Equal(current, mutation.value) {
