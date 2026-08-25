@@ -184,6 +184,21 @@ type SegmentedTabletRouterSplitResult struct {
 	Bytes       int
 }
 
+// SegmentedTabletRouterLeafSplitResult reports the localized persistent
+// rewrite set for inserting the right half of one split leaf. A non-full
+// source anchor rewrites one anchor; a full source anchor rewrites it and one
+// newly appended stable anchor page. Locator and root are always rewritten.
+type SegmentedTabletRouterLeafSplitResult struct {
+	Root        []byte
+	Locator     []byte
+	LeftPage    []byte
+	RightPage   []byte
+	LeftPageID  uint8
+	RightPageID uint8
+	PageCount   uint8
+	Bytes       int
+}
+
 type segmentedTabletRouterFence struct {
 	a, b, c []byte
 }
