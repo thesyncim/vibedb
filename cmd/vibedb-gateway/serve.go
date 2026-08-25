@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -106,6 +108,12 @@ func (values *repeatedFlag) Set(value string) error {
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
+	devStaticCatalog := fs.Bool("dev-static-catalog", false, "explicitly use the local catalog file as development authority")
+	catalogDistribution := fs.String("catalog-distribution", "", "distribution containing the replicated catalog RF3 group")
+	catalogShard := fs.String("catalog-shard", "", "shard containing the replicated catalog RF3 group")
+	catalogRelation := fs.Uint("catalog-relation", 0, "authenticated relation ID storing catalog and operation records")
+	catalogAttempts := fs.Int("catalog-attempts", 8, "bounded leader-routing attempts for replicated catalog operations")
+	catalogAttemptTimeout := fs.Duration("catalog-attempt-timeout", 5*time.Second, "per-endpoint replicated catalog attempt deadline")
 	listen := fs.String("listen", "127.0.0.1:0", "host:port to serve on")
 	devPlaintext := fs.Bool("dev-plaintext-loopback", false, "explicitly permit unauthenticated loopback development serving")
 	tlsCertificate := fs.String("tls-certificate", "", "PEM gateway certificate chain")
@@ -128,8 +136,20 @@ func runServe(args []string) int {
 		usage()
 		return 2
 	}
+	if *devStaticCatalog {
+		if !*devPlaintext || *catalogDistribution != "" || *catalogShard != "" || *catalogRelation != 0 {
+			fmt.Fprintln(os.Stderr, "gateway: static catalog is an explicit plaintext development mode")
+			return 2
+		}
+	} else if *catalogDistribution == "" || *catalogShard == "" || *catalogRelation == 0 ||
+		*catalogRelation > uint(replication.MaxRelationID) || *catalogAttempts <= 0 ||
+		*catalogAttemptTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "gateway: replicated catalog coordinates and positive bounds are required")
+		return 2
+	}
 	var clientTLS *gateway.ClientTLS
 	var shardTLS *servicetls.Client
+	var tlsProfile *rafttransport.PeerTLS
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
 			len(allowedClients) != 0 || len(shardPeers) != 0 {
@@ -146,6 +166,7 @@ func runServe(args []string) int {
 			fmt.Fprintf(os.Stderr, "gateway: load TLS profile: %v\n", err)
 			return 2
 		}
+		tlsProfile = profile
 		allowed := make([]rafttransport.NodeID, len(allowedClients))
 		for index, encoded := range allowedClients {
 			allowed[index], err = servicetls.ParseNodeID(encoded)
@@ -194,7 +215,23 @@ func runServe(args []string) int {
 	if shardTLS != nil {
 		shardDial = shardTLS.Dial
 	}
-	exec, holder, err := newGatewayWithDial(*catalog, shardDial)
+	var exec *gateway.Executor
+	var holder *gateway.CatalogHolder
+	var catalogTLS *servicetls.Client
+	var err error
+	if *devStaticCatalog {
+		exec, holder, err = newGatewayWithDial(*catalog, shardDial)
+	} else {
+		exec, holder, catalogTLS, err = newReplicatedCatalogGateway(
+			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
+			distribution.DistributionName(*catalogDistribution), distribution.ShardID(*catalogShard),
+			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
+			*tlsHandshakeTimeout, *maxShardConnections, *maxShardHandshakes,
+		)
+	}
+	if catalogTLS != nil {
+		defer catalogTLS.Close()
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
@@ -261,6 +298,84 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc) (*gateway.Exe
 	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
 	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{Refresh: refresher.Refresh})
 	return exec, holder, nil
+}
+
+func newReplicatedCatalogGateway(
+	ctx context.Context,
+	bootstrapPath string,
+	shardDial gateway.DialFunc,
+	tlsProfile *rafttransport.PeerTLS,
+	devPlaintext bool,
+	distributionName distribution.DistributionName,
+	shardID distribution.ShardID,
+	relation replication.RelationID,
+	attempts int,
+	attemptTimeout time.Duration,
+	handshakeTimeout time.Duration,
+	maxConnections int,
+	maxHandshakes int,
+) (*gateway.Executor, *gateway.CatalogHolder, *servicetls.Client, error) {
+	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
+	if !ok {
+		return nil, nil, nil, gateway.ErrReplicatedCatalogMissing
+	}
+	var nativeClient gateway.ReplicatedRoundTripper
+	var catalogTLS *servicetls.Client
+	if devPlaintext {
+		nativeClient = gateway.TCPReplicatedClient{Dial: func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}}
+	} else {
+		endpoints := make([]servicetls.Endpoint, len(route.Replicas))
+		for index, replica := range route.Replicas {
+			endpoints[index] = servicetls.Endpoint{Address: replica.Address, Node: replica.Node}
+		}
+		secure, secureErr := servicetls.NewClient(servicetls.ClientOptions{
+			TLS: tlsProfile, Class: rafttransport.TrafficShardNative, Endpoints: endpoints,
+			Dial: func(ctx context.Context, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			},
+			HandshakeDeadline: servicetls.FixedDeadline(handshakeTimeout),
+			MaxConnections:    maxConnections, MaxHandshakes: maxHandshakes,
+		})
+		if secureErr != nil {
+			return nil, nil, nil, secureErr
+		}
+		catalogTLS = secure
+		nativeClient = gateway.TCPReplicatedClient{Dial: secure.Dial}
+	}
+	replicated, err := gateway.NewReplicatedExecutor(nativeClient, attempts, attemptTimeout)
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, err
+	}
+	holder := gateway.NewCatalogHolder(nil)
+	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
+		Executor: replicated, Route: route, Relation: relation, Holder: holder,
+	})
+	if err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, err
+	}
+	if _, err = authority.Read(ctx); err != nil {
+		if catalogTLS != nil {
+			_ = catalogTLS.Close()
+		}
+		return nil, nil, nil, err
+	}
+	executor := gateway.NewExecutor(
+		gateway.NewClient(shardDial), holder, gateway.Options{Refresh: authority.Refresh},
+	)
+	return executor, holder, catalogTLS, nil
 }
 
 // serveGateway accepts connections until ctx is canceled, then closes the

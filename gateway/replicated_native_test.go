@@ -1094,9 +1094,9 @@ func testReplicatedRouteCommand(
 			RoutingVersion:         1, RouteGeneration: 1,
 		},
 		Replicas: []ReplicatedEndpoint{
-			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, Address: "m1"},
-			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, Address: "m2"},
-			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{3}, NodeIncarnation: 13, Address: "m3"},
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{1}, NodeIncarnation: 11, NativeEndpoint: "n1", Address: "m1"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{2}, NodeIncarnation: 12, NativeEndpoint: "n2", Address: "m2"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{3}, NodeIncarnation: 13, NativeEndpoint: "n3", Address: "m3"},
 		},
 	}
 	states := make(map[string]shardservice.ReplicatedMemberState, 3)

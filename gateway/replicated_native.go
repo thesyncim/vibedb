@@ -36,6 +36,7 @@ type ReplicatedEndpoint struct {
 	Node            rafttransport.NodeID
 	StoreID         [16]byte
 	NodeIncarnation uint64
+	NativeEndpoint  string
 	Address         string
 }
 
@@ -855,13 +856,14 @@ func validReplicatedRoute(route ReplicatedRoute) bool {
 	for index, endpoint := range route.Replicas {
 		if endpoint.Member == 0 || endpoint.Node == (rafttransport.NodeID{}) ||
 			endpoint.StoreID == ([16]byte{}) || endpoint.NodeIncarnation == 0 ||
-			endpoint.Address == "" {
+			endpoint.NativeEndpoint == "" || endpoint.Address == "" {
 			return false
 		}
 		for prior := 0; prior < index; prior++ {
 			if route.Replicas[prior].Member == endpoint.Member ||
 				route.Replicas[prior].Node == endpoint.Node ||
 				route.Replicas[prior].StoreID == endpoint.StoreID ||
+				route.Replicas[prior].NativeEndpoint == endpoint.NativeEndpoint ||
 				route.Replicas[prior].Address == endpoint.Address {
 				return false
 			}

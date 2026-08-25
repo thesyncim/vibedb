@@ -1594,6 +1594,7 @@ func processCatalogRoute(
 		shardID          distribution.ShardID          = "0000-ffff"
 	)
 	endpointIDs := [processVoters]distribution.EndpointID{"rf3-member-1", "rf3-member-2", "rf3-member-3"}
+	nativeEndpointIDs := [processVoters]distribution.EndpointID{"rf3-native-1", "rf3-native-2", "rf3-native-3"}
 	manifest, err := distribution.NewManifest(distributionName, 17, []distribution.Shard{{
 		ID: shardID, AllocationGeneration: 7,
 		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
@@ -1614,11 +1615,13 @@ func processCatalogRoute(
 	endpoints := make(map[distribution.EndpointID]string, processVoters)
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, processVoters)
 	for index := 0; index < processVoters; index++ {
-		endpoints[endpointIDs[index]] = addresses[index]
+		endpoints[endpointIDs[index]] = fmt.Sprintf("127.0.0.1:%d", 1+index)
+		endpoints[nativeEndpointIDs[index]] = addresses[index]
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{
 			Member: uint64(index + 1), Node: processNode(uint64(index + 1)),
 			StoreID:         processStoreIdentity(uint64(index + 1)).StoreID,
 			NodeIncarnation: 1, Endpoint: endpointIDs[index],
+			NativeEndpoint: nativeEndpointIDs[index],
 		}
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(

@@ -137,6 +137,10 @@ func processControlPlaneSnapshot(
 	endpointIDs := [processVoters]distribution.EndpointID{
 		"rf3-member-1", "rf3-member-2", "rf3-member-3",
 	}
+	nativeEndpointIDs := [processVoters]distribution.EndpointID{
+		"rf3-native-1", "rf3-native-2", "rf3-native-3",
+	}
+	sqlAddresses := [processVoters]string{"127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"}
 	manifest, err := distribution.NewManifest(distributionName, 17, []distribution.Shard{{
 		ID: shardID, AllocationGeneration: 7,
 		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
@@ -158,11 +162,13 @@ func processControlPlaneSnapshot(
 	endpoints := make(map[distribution.EndpointID]string, processVoters)
 	replicas := make([]gateway.ReplicatedReplicaDescriptor, processVoters)
 	for index := 0; index < processVoters; index++ {
-		endpoints[endpointIDs[index]] = cluster.nativeAddresses[index]
+		endpoints[endpointIDs[index]] = sqlAddresses[index]
+		endpoints[nativeEndpointIDs[index]] = cluster.nativeAddresses[index]
 		replicas[index] = gateway.ReplicatedReplicaDescriptor{
 			Member: uint64(index + 1), Node: processNode(uint64(index + 1)),
 			StoreID:         processStoreIdentity(uint64(index + 1)).StoreID,
 			NodeIncarnation: 1, Endpoint: endpointIDs[index],
+			NativeEndpoint: nativeEndpointIDs[index],
 		}
 	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
