@@ -10,7 +10,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 const (
@@ -55,6 +57,7 @@ type ReplicatedFence struct {
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
 	Operation      ReplicatedOperation
+	Authority      serviceauthz.Authority
 	Fence          ReplicatedFence
 	Command        []byte
 	Relation       replication.RelationID
@@ -90,6 +93,7 @@ const (
 	ReplicatedRefusalUnavailable
 	ReplicatedRefusalReadBehind
 	ReplicatedRefusalReadBufferBound
+	ReplicatedRefusalUnauthorized
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -128,6 +132,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	e := newFrameEncoder(len(request.Command) + len(request.Key) + 16)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
+	e.b = append(e.b, request.Authority.Node[:]...)
+	e.u64(request.Authority.Generation)
 	encodeReplicatedFence(&e, request.Fence)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -155,6 +161,8 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	e := newFrameEncoder(0)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
+	e.b = append(e.b, request.Authority.Node[:]...)
+	e.u64(request.Authority.Generation)
 	encodeReplicatedFence(&e, request.Fence)
 	var payload []byte
 	switch request.Operation {
@@ -207,6 +215,8 @@ func decodeReplicatedRequest(
 		return nil, 0, errBadVersion
 	}
 	request := &ReplicatedRequest{Operation: ReplicatedOperation(d.u8())}
+	request.Authority.Node = d.fixed16()
+	request.Authority.Generation = d.u64()
 	request.Fence = decodeReplicatedFence(&d)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -425,6 +435,12 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
 	}
+	authorityPresent := request.Authority.Node != (rafttransport.NodeID{}) ||
+		request.Authority.Generation != 0
+	if authorityPresent && (request.Authority.Node == (rafttransport.NodeID{}) ||
+		request.Authority.Generation == 0) {
+		return false
+	}
 	switch request.Operation {
 	case ReplicatedProbe:
 		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
@@ -520,8 +536,9 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		return response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) &&
-			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
-			response.Refusal <= ReplicatedRefusalReadBufferBound
+			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable ||
+				response.Refusal == ReplicatedRefusalUnauthorized) &&
+			response.Refusal <= ReplicatedRefusalUnauthorized
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&
