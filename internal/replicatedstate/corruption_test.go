@@ -2,6 +2,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -66,6 +67,37 @@ func TestSessionIdentityCapacityRefusesWithoutPoisoning(t *testing.T) {
 	}
 	if _, err := fixture.machine.LookupCompletion(second); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("refused lookup error = %v", err)
+	}
+}
+
+func TestOpenRejectsPersistedAuthorityCountAboveConfiguredBoundBeforeRows(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	state := fixture.machine.state
+	state.Applied = MaxRetainedSessions + 1
+	state.LastTerm = 2
+	state.LastKind = RecordNormal
+	state.LastEntryType = normalMeta(state.Applied).Type
+	state.LastEntryDigest = sha256.Sum256([]byte("hostile-authority-count"))
+	state.AuthorityBindingCount = MaxRetainedSessions
+	envelope, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		return batch.Put(stateKey, envelope)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	options := fixture.machine.options
+	options.MaxSessions = 1
+	if _, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log, options,
+	); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("authority count above configured bound err=%v, want ErrStateCorrupt", err)
 	}
 }
 

@@ -393,6 +393,35 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 }
 
 func TestSessionCodecRejectsWritableAppendAliases(t *testing.T) {
+	authorityPrefix := []byte("prefix")
+	authorityBytes := authorityBindingHeaderBytes + len("tenant-a") + recordChecksumLen
+	authorityBacking := make([]byte, len(authorityPrefix), len(authorityPrefix)+authorityBytes)
+	copy(authorityBacking, authorityPrefix)
+	authorityExpanded := authorityBacking[:cap(authorityBacking)]
+	authorityTenant := authorityExpanded[len(authorityPrefix) : len(authorityPrefix)+len("tenant-a")]
+	copy(authorityTenant, "tenant-a")
+	gotAuthority, err := AppendAuthorityBinding(
+		authorityBacking, authorityTenant, sessionCodecID(3), replication.CommandAuthorityData,
+	)
+	if !errors.Is(err, ErrCodecAlias) || !bytes.Equal(gotAuthority, authorityPrefix) {
+		t.Fatalf("aliased authority append = %q,%v", gotAuthority, err)
+	}
+
+	// The same alias is safe when the append necessarily relocates.
+	relocatingAuthorityTenant := append([]byte(nil), []byte("tenant-a")...)
+	relocatingAuthorityTenant = relocatingAuthorityTenant[:len(relocatingAuthorityTenant):len(relocatingAuthorityTenant)]
+	relocatedAuthority, err := AppendAuthorityBinding(
+		relocatingAuthorityTenant, relocatingAuthorityTenant, sessionCodecID(3),
+		replication.CommandAuthorityData,
+	)
+	if err != nil {
+		t.Fatalf("relocating authority append: %v", err)
+	}
+	if view, err := OpenAuthorityBinding(relocatedAuthority[len(relocatingAuthorityTenant):]); err != nil ||
+		!bytes.Equal(view.Tenant, relocatingAuthorityTenant) {
+		t.Fatalf("open relocated authority=%+v err=%v", view, err)
+	}
+
 	record := sessionCodecRecord()
 	recordBytes := sessionRecordHeaderBytes + len(record.Tenant) + recordChecksumLen
 	recordPrefix := []byte("prefix")

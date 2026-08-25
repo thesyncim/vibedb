@@ -648,7 +648,8 @@ func scanSessionSystemSnapshot(
 			if err != nil {
 				return err
 			}
-			if state.SessionCount > maxSessions || retryWindow == 0 ||
+			if state.SessionCount > maxSessions || state.AuthorityBindingCount > maxSessions ||
+				retryWindow == 0 ||
 				state.SessionSlotCount > state.SessionCount*uint64(retryWindow) {
 				return fmt.Errorf("%w: bounded session counts", ErrStateCorrupt)
 			}

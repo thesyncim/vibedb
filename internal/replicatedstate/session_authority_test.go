@@ -233,7 +233,10 @@ func TestSessionAuthorityClassSurvivesReleaseAndSameClassReopen(t *testing.T) {
 			foreignRelease := release
 			foreignRelease.AuthorityClass = foreign
 			foreignReleaseBytes := encodeCommand(t, foreignRelease)
-			assertSessionAuthorityConflict(t, reopened.AdmitCommand(foreignReleaseBytes))
+			wantConflictKey := AuthorityIdentityKey(prototype.Tenant, prototype.ClientID)
+			assertSessionAuthorityConflictKey(
+				t, reopened.AdmitCommand(foreignReleaseBytes), wantConflictKey,
+			)
 			if _, err := reopened.LookupCompletion(foreignReleaseBytes); err == nil {
 				t.Fatal("foreign release resolved the retained authority tombstone")
 			} else {
@@ -242,7 +245,9 @@ func TestSessionAuthorityClassSurvivesReleaseAndSameClassReopen(t *testing.T) {
 			foreignOpen := prototype
 			foreignOpen.AuthorityClass = foreign
 			foreignOpenBytes := encodeCommand(t, sessionOpenFor(foreignOpen))
-			assertSessionAuthorityConflict(t, reopened.AdmitCommand(foreignOpenBytes))
+			assertSessionAuthorityConflictKey(
+				t, reopened.AdmitCommand(foreignOpenBytes), wantConflictKey,
+			)
 			if _, err := reopened.LookupSessionLease(
 				foreign, prototype.Tenant, prototype.ClientID, 2,
 			); err == nil {
@@ -276,6 +281,21 @@ func assertSessionAuthorityConflict(t testing.TB, err error) {
 	if !errors.As(err, &conflict) {
 		t.Fatalf("authority mismatch error = %v, want RequestConflictError", err)
 	}
+}
+
+func assertSessionAuthorityConflictKey(t testing.TB, err error, want [sha256.Size]byte) {
+	t.Helper()
+	var conflict *RequestConflictError
+	if !errors.As(err, &conflict) || conflict.Key != want {
+		t.Fatalf("authority mismatch error=%v key=%x, want %x", err, conflictKey(conflict), want)
+	}
+}
+
+func conflictKey(conflict *RequestConflictError) [sha256.Size]byte {
+	if conflict == nil {
+		return [sha256.Size]byte{}
+	}
+	return conflict.Key
 }
 
 func authorityClassName(class replication.CommandAuthorityClass) string {

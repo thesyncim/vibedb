@@ -86,6 +86,9 @@ func AppendAuthorityBinding(dst []byte, tenant []byte, clientID replication.ID12
 	}
 	start := len(dst)
 	total := authorityBindingHeaderBytes + len(tenant) + recordChecksumLen
+	if byteSlicesOverlap(writableAppendRegion(dst, total), tenant) {
+		return dst, ErrCodecAlias
+	}
 	dst = append(dst, make([]byte, total)...)
 	frame := dst[start:]
 	copy(frame[0:8], authorityBindingMagic[:])

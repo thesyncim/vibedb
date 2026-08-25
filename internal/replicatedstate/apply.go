@@ -781,6 +781,7 @@ func (m *Machine) planBundleCommand(
 	if authorityFound && (bound.Digest != plan.authorityDigest ||
 		!bytes.Equal(bound.Tenant, command.Tenant) || bound.ClientID != command.ClientID ||
 		bound.AuthorityClass != command.AuthorityClass) {
+		plan.sessionDigest = plan.authorityDigest
 		plan.conflict = true
 		return plan, nil
 	}
