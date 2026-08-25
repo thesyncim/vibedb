@@ -1,12 +1,13 @@
 package multiraft
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	pb "go.etcd.io/raft/v3/raftpb"
-	"google.golang.org/protobuf/proto"
 )
 
 // This uses an RF3 voter set plus one enrolled replacement. The replacement
@@ -75,11 +76,11 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	authorizationDigest := raftmember.MembershipTransitionDigest(group,
 		[16]byte{1}, 2, 3, 1, 4)
 	learnerConf := &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for _, host := range hosts {
 			publication, err := host.Publication(group)
 			if err != nil || publication.Applied < 2 ||
-				!proto.Equal(publication.ConfState, learnerConf) {
+				publication.ConfState.Equivalent(learnerConf) != nil {
 				return false
 			}
 		}
@@ -95,30 +96,40 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	}
 	cluster.pausePromotion = true
 	voterConf := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilWithLeaderTicks(func() bool {
 		for index := 0; index < 3; index++ {
 			publication, err := hosts[index].Publication(group)
 			if err != nil || publication.Applied < 3 ||
-				!proto.Equal(publication.ConfState, voterConf) {
+				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
 		}
 		return true
 	})
-	// Committing voters need not send the new commit index to a learner in the
-	// same append exchange. Drive one real heartbeat turn so member 4 durably
-	// learns the quorum commit before the test pauses its apply. This is a
-	// protocol gate, not a timing allowance: production clocks provide the same
-	// heartbeat, and DurablePromotion remains false until that HardState is
-	// persisted locally.
-	if !cluster.promotionPaused {
-		if err := hosts[0].RequestTick(group); err != nil {
-			t.Fatal(err)
+	// Committing voters need not carry the new commit index to a learner in the
+	// same append exchange. Cross every protocol-idle boundary with a real tick
+	// on the currently observed leader until member 4 has persisted the commit
+	// and DurablePromotion reconstructs the unapplied entry. The cluster pauses
+	// only from that exact WAL/HardState/publication evidence.
+	cluster.driveUntilWithLeaderTicks(func() bool {
+		if !cluster.promotionPaused {
+			return false
 		}
-		cluster.driveUntil(func() bool { return cluster.promotionPaused })
-	}
+		proof, found, proofErr := hosts[3].DurablePromotion(group, target)
+		status, statusErr := hosts[3].Status(group)
+		publication, publicationErr := hosts[3].Publication(group)
+		if proofErr != nil || statusErr != nil || publicationErr != nil {
+			t.Fatal(errors.Join(proofErr, statusErr, publicationErr))
+		}
+		if !found || proof.TargetMember != target || status.Commit < proof.Version ||
+			publication.ReplicaSetVersion >= proof.Version {
+			t.Fatalf("promotion pause lacks durable unapplied witness: proof=%+v found=%t status=%+v publication=%+v",
+				proof, found, status, publication)
+		}
+		return true
+	})
 	beforeRestart, err := hosts[3].Publication(group)
-	if err != nil || !proto.Equal(beforeRestart.ConfState, learnerConf) ||
+	if err != nil || beforeRestart.ConfState.Equivalent(learnerConf) != nil ||
 		beforeRestart.ReplicaSetVersion >= 3 {
 		t.Fatalf("target published promotion before crash: %+v, %v", beforeRestart, err)
 	}
@@ -162,27 +173,42 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	registries[3], cluster.registries[3] = restartRegistry, restartRegistry
 	cluster.inactive[0], cluster.inactive[3] = true, false
 	cluster.holdTargetUntilVote = true
+	cluster.suppressTargetTicks = true
 	if err = hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	replacementLeader := uint64(0)
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
+		leader := uint64(0)
 		for index := 1; index < len(hosts); index++ {
 			status, statusErr := hosts[index].Status(group)
 			publication, publicationErr := hosts[index].Publication(group)
-			if statusErr != nil || publicationErr != nil || status.LeaderID != 2 ||
-				!proto.Equal(publication.ConfState, voterConf) {
+			if statusErr != nil || publicationErr != nil || status.LeaderID == 0 ||
+				status.LeaderID == voters[0] || status.LeaderID == target ||
+				publication.ConfState.Equivalent(voterConf) != nil {
+				return false
+			}
+			if leader == 0 {
+				leader = status.LeaderID
+			} else if leader != status.LeaderID {
 				return false
 			}
 		}
+		replacementLeader = leader
 		return true
-	})
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
-	if err = hosts[1].TransferLeader(group, target); err != nil {
+	cluster.suppressTargetTicks = false
+	replacementLeaderIndex, ok := cluster.memberIndex[replacementLeader]
+	if !ok {
+		t.Fatalf("elected replacement leader %d has no host", replacementLeader)
+	}
+	if err = hosts[replacementLeaderIndex].TransferLeader(group, target); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			status, err := hosts[index].Status(group)
 			if err != nil || status.LeaderID != target {
@@ -199,10 +225,10 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	removedConf := &pb.ConfState{Voters: []uint64{2, 3, 4}}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilConvergedIdle(func() bool {
 		for index := 1; index < len(hosts); index++ {
 			publication, err := hosts[index].Publication(group)
-			if err != nil || publication.Applied < 4 || !proto.Equal(publication.ConfState, removedConf) {
+			if err != nil || publication.Applied < 4 || publication.ConfState.Equivalent(removedConf) != nil {
 				return false
 			}
 		}
@@ -212,12 +238,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err := hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntil(func() bool {
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		right, rightErr := hosts[2].Status(group)
 		return leftErr == nil && rightErr == nil && left.LeaderID != 0 &&
 			left.LeaderID == right.LeaderID && left.LeaderID != target
-	})
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if err := hosts[3].Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -234,14 +260,19 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	cluster.hosts[3] = restartedHost
 	t.Cleanup(func() { _ = restartedHost.Close() })
 	cluster.inactive[3] = false
-	cluster.driveUntil(func() bool {
+	// Reopen restores the exact committed membership authority, but LeaderID is
+	// volatile Raft state. At a protocol-idle cut the restarted voter therefore
+	// needs one real heartbeat from the current leader before it can prove the
+	// same live leader as the other voters. Supply only leader ticks: no
+	// publication, authority, or applied-position witness is synthesized.
+	cluster.driveUntilWithLeaderTicks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		rejoined, rejoinedErr := hosts[3].Status(group)
 		publication, publicationErr := hosts[3].Publication(group)
 		authorityVersion, authorityFound := registries[3].ReplicaSetVersion(group)
 		return leftErr == nil && rejoinedErr == nil && publicationErr == nil &&
 			left.LeaderID != 0 && rejoined.LeaderID == left.LeaderID &&
-			proto.Equal(publication.ConfState, removedConf) &&
+			publication.ConfState.Equivalent(removedConf) == nil &&
 			publication.ReplicaSetVersion == authorityVersion && authorityFound
 	})
 }

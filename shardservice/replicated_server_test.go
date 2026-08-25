@@ -3,6 +3,7 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -269,7 +270,12 @@ func TestReplicatedServerRoundTripCompletionAndNotLeader(t *testing.T) {
 					t.Fatalf("round trip: %v; server did not stop", err)
 				}
 			}
-			if response.Kind != test.kind || !bytes.Equal(response.Completion, test.result) {
+			wantDigest := [32]byte{}
+			if test.kind == ReplicatedCompletion {
+				wantDigest = sha256.Sum256(command)
+			}
+			if response.Kind != test.kind || response.RequestDigest != wantDigest ||
+				!bytes.Equal(response.Completion, test.result) {
 				t.Fatalf("response = %+v", response)
 			}
 			_ = client.Close()

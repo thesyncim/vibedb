@@ -23,6 +23,41 @@ type scriptedReplicatedClient struct {
 	commands  [][]byte
 }
 
+var replicatedRequestDigestSink [sha256.Size]byte
+
+func TestReplicatedRequestDigestIsExactAndAllocationFree(t *testing.T) {
+	command := make([]byte, 4<<10)
+	for index := range command {
+		command[index] = byte(index)
+	}
+	want := replicatedRequestDigest(command)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		replicatedRequestDigestSink = replicatedRequestDigest(command)
+	}); allocations != 0 {
+		t.Fatalf("request digest allocations = %v", allocations)
+	}
+	command[len(command)-1]++
+	if got := replicatedRequestDigest(command); got == want {
+		t.Fatal("request digest did not bind the exact command bytes")
+	}
+}
+
+func BenchmarkReplicatedRequestDigest(b *testing.B) {
+	for _, test := range []struct {
+		name string
+		size int
+	}{{"4KiB", 4 << 10}, {"1MiB", 1 << 20}} {
+		b.Run(test.name, func(b *testing.B) {
+			command := make([]byte, test.size)
+			b.SetBytes(int64(len(command)))
+			b.ReportAllocs()
+			for b.Loop() {
+				replicatedRequestDigestSink = replicatedRequestDigest(command)
+			}
+		})
+	}
+}
+
 func (client *scriptedReplicatedClient) DoReplicated(
 	_ context.Context,
 	endpoint ReplicatedEndpoint,
@@ -62,6 +97,7 @@ func (client *scriptedReplicatedClient) DoReplicated(
 	client.states[address] = state
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: replicatedRequestDigest(request.Command),
 		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
 			AppliedIndex: 9, CompletionAppliedSequence: 9, CompletionBytes: len(completion)},
 		Completion: completion,
@@ -227,6 +263,7 @@ func TestReplicatedPointReadRejectsNonCanonicalCustomResponses(t *testing.T) {
 			Kind:     shardservice.ReplicatedRefusal,
 			Refusal:  shardservice.ReplicatedRefusalDeterministic,
 			HasState: true, State: state,
+			RequestDigest: [32]byte{0xff},
 			Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionReleased, AppliedIndex: state.Applied,
 			},
@@ -572,6 +609,14 @@ func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T)
 	if !errors.Is(err, raftservice.ErrOutcomeUnknown) {
 		t.Fatalf("transport outcome = %v", err)
 	}
+	client.err = nil
+	client.response = &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnauthorized,
+	}
+	_, err = executor.ApplyMembership(context.Background(), route, membership)
+	if !errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("stateless authorization refusal = %v", err)
+	}
 }
 
 func (client *failingReplicatedClient) DoReplicated(
@@ -647,6 +692,8 @@ func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) 
 	changedFence.Fence.Command.RelationManifestDigest[0]++
 	wrongMember := state
 	wrongMember.Fence.MemberID++
+	wrongDigestCompletion := testReplicatedCompletionResponse(t, command, state)
+	wrongDigestCompletion.RequestDigest[0] ^= 0xff
 	tests := []struct {
 		name     string
 		response *shardservice.ReplicatedResponse
@@ -690,6 +737,13 @@ func TestReplicatedExecutorPreservesPriorUnknownUntilAppliedProof(t *testing.T) 
 			HasState: true, State: state,
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased},
 		}},
+		{"wrong request completion", wrongDigestCompletion},
+		{"wrong request applied refusal", &shardservice.ReplicatedResponse{
+			Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalDeterministic,
+			HasState: true, State: state, RequestDigest: [32]byte{0xff},
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased,
+				AppliedIndex: state.Applied},
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -722,6 +776,7 @@ func TestReplicatedExecutorAppliedDeterministicRefusalResolvesUnknown(t *testing
 			{Kind: shardservice.ReplicatedRefusal,
 				Refusal:  shardservice.ReplicatedRefusalDeterministic,
 				HasState: true, State: state,
+				RequestDigest: replicatedRequestDigest(command),
 				Outcome: raftserve.Outcome{
 					Code: raftserve.OutcomeSessionReleased, AppliedIndex: 12,
 				}},
@@ -1066,6 +1121,7 @@ func testReplicatedCompletionResponse(
 	}
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: replicatedRequestDigest(commandBytes),
 		Outcome: raftserve.Outcome{
 			Code: raftserve.OutcomeCompletion, AppliedIndex: state.Applied,
 			CompletionAppliedSequence: state.Applied, CompletionBytes: len(completion),

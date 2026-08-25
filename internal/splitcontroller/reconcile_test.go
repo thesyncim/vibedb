@@ -288,7 +288,11 @@ func TestReconcileBuildsThenStagesOnePassArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := capture.Begin(state); err != nil {
+	if err := capture.Begin(state, func(key, value []byte) error {
+		return collection.Update(func(batch *durable.WriteBatch) error {
+			return batch.Put(key, value)
+		})
+	}); err != nil {
 		t.Fatalf("capture begin = %v", err)
 	}
 	observed := Observation{

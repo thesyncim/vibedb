@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 type replicatedTLSWriteMeter struct {
@@ -101,19 +102,20 @@ func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
-		{Operation: ReplicatedProbe, Fence: ReplicatedFence{
+		{Operation: ReplicatedProbe, Authority: authority, Fence: ReplicatedFence{
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
-		{Operation: ReplicatedPropose, Fence: fence, Command: command},
-		{Operation: ReplicatedMembership, Fence: fence, Membership: ReplicatedMembershipRequest{
+		{Operation: ReplicatedPropose, Authority: authority, Fence: fence, Command: command},
+		{Operation: ReplicatedMembership, Authority: authority, Fence: fence, Membership: ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{3},
 			MetadataEpoch: 5, CatalogGeneration: 7, ExpectedReplicaSetVersion: 1,
 			SourceMember: fence.MemberID, TargetMember: fence.MemberID + 1,
 		}},
-		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+		{Operation: ReplicatedReadLeader, Authority: authority, Fence: fence, Relation: 1,
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
-		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+		{Operation: ReplicatedReadFollower, Authority: authority, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
@@ -131,7 +133,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decoded.Operation != request.Operation || decoded.Fence != request.Fence ||
+		if decoded.Operation != request.Operation || decoded.Authority != request.Authority || decoded.Fence != request.Fence ||
 			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
 			decoded.MinimumApplied != request.MinimumApplied ||
@@ -151,6 +153,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	responses := []*ReplicatedResponse{
 		{Kind: ReplicatedHandshake, HasState: true, State: state},
 		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
 				AppliedIndex: 8, CompletionAppliedSequence: 2,
 				CompletionBytes: len(completion)}, Completion: completion},
@@ -164,7 +167,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-			HasState: true, State: state, Outcome: raftserve.Outcome{
+			HasState: true, State: state, RequestDigest: [32]byte{1}, Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8}},
 	}
 	for _, response := range responses {
@@ -179,6 +182,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if decoded.Kind != response.Kind || decoded.Refusal != response.Refusal ||
 			decoded.HasState != response.HasState ||
 			decoded.State != response.State || decoded.Outcome != response.Outcome ||
+			decoded.RequestDigest != response.RequestDigest ||
 			!bytes.Equal(decoded.Completion, response.Completion) {
 			t.Fatalf("response round trip = %+v, want %+v", decoded, response)
 		}
@@ -264,7 +268,7 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	for code := raftserve.OutcomePending; code <= raftserve.OutcomeProposalAbandoned; code++ {
 		response := &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-			HasState: true, State: state,
+			HasState: true, State: state, RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: code, AppliedIndex: 8},
 		}
 		valid := validReplicatedResponse(response)
@@ -275,7 +279,7 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	}
 	valid := &ReplicatedResponse{
 		Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
-		HasState: true, State: state,
+		HasState: true, State: state, RequestDigest: [32]byte{1},
 		Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionEpoch, AppliedIndex: 8},
 	}
 	invalid := []raftserve.Outcome{
@@ -286,6 +290,11 @@ func TestReplicatedDeterministicRefusalRequiresAppliedWitness(t *testing.T) {
 	}
 	if !validReplicatedResponse(valid) {
 		t.Fatal("valid applied refusal was rejected")
+	}
+	missingDigest := *valid
+	missingDigest.RequestDigest = [32]byte{}
+	if validReplicatedResponse(&missingDigest) {
+		t.Fatal("applied refusal without an exact request digest was accepted")
 	}
 	for _, outcome := range invalid {
 		candidate := *valid
@@ -496,6 +505,7 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 	completion := testReplicatedCompletion(f, fence, 2)
 	for _, response := range []*ReplicatedResponse{
 		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			RequestDigest: [32]byte{1},
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
 				AppliedIndex: 8, CompletionAppliedSequence: 2,
 				CompletionBytes: len(completion)},

@@ -662,6 +662,11 @@ func TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply(t *testing.T) {
 		t.Fatalf("proof=%+v found=%t publication=%+v err=%v", proof, found, before, err)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
+		_ = fixture.runtime.node.PublishedApplied()
+	}); allocations != 0 {
+		t.Fatalf("published applied coordinate allocations = %v, want 0", allocations)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
 		_, _, _ = fixture.runtime.DurablePromotion(target)
 	}); allocations != 0 {
 		t.Fatalf("cached durable promotion allocations = %v, want 0", allocations)

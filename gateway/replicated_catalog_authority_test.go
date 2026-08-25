@@ -53,7 +53,9 @@ func (client *catalogAuthorityClient) DoReplicated(
 		if client.holdUnknown {
 			return nil, errors.New("replicated outcome remains unknown")
 		}
-		return catalogCompletionResponse(client.unknownState, client.unknownCompletion), nil
+		return catalogCompletionResponse(
+			client.unknownState, client.unknownCompletion, request.Command,
+		), nil
 	}
 	client.applied++
 	applied := uint64(100) + client.applied
@@ -78,15 +80,16 @@ func (client *catalogAuthorityClient) DoReplicated(
 		client.unknownState = client.state
 		return nil, errors.New("connection lost after replicated apply")
 	}
-	return catalogCompletionResponse(client.state, completion), nil
+	return catalogCompletionResponse(client.state, completion, request.Command), nil
 }
 
 func catalogCompletionResponse(
-	state shardservice.ReplicatedMemberState, completion []byte,
+	state shardservice.ReplicatedMemberState, completion, command []byte,
 ) *shardservice.ReplicatedResponse {
 	view, _ := replication.OpenCompletion(completion)
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: replicatedRequestDigest(command),
 		Outcome: raftserve.Outcome{
 			Code: raftserve.OutcomeCompletion, AppliedIndex: view.AppliedSequence,
 			CompletionAppliedSequence: view.AppliedSequence, CompletionBytes: len(completion),

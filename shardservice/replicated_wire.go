@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 const (
@@ -17,14 +20,18 @@ const (
 	tagReplicatedRequest           = 'P'
 	tagReplicatedMembershipRequest = 'M'
 	tagReplicatedResponse          = 'A'
-	// A response with state has a 265-byte body before a completion. Read
+	// A response with state has a 297-byte body before a completion. The fixed
+	// request digest is zero for nonterminal responses and binds terminal
+	// proposal outcomes to the exact canonical command. Read
 	// responses add an applied index and value length. These exact ceilings let
 	// the client reject a hostile frame header before allocating its body.
-	replicatedResponseFixedBodyBytes     = 265
+	replicatedResponseFixedBodyBytes     = 297
 	replicatedReadResponseFixedBodyBytes = replicatedResponseFixedBodyBytes + 12
 )
 
-const replicatedMembershipRequestBodyBytes = 279
+// Membership is fixed-width: the original 279-byte control body plus the
+// forwarded 16-byte node identity and 8-byte authorization generation.
+const replicatedMembershipRequestBodyBytes = 303
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
@@ -56,6 +63,7 @@ type ReplicatedFence struct {
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
 	Operation      ReplicatedOperation
+	Authority      serviceauthz.Authority
 	Fence          ReplicatedFence
 	Command        []byte
 	Membership     ReplicatedMembershipRequest
@@ -110,6 +118,7 @@ const (
 	ReplicatedRefusalMembershipNotCaughtUp
 	ReplicatedRefusalReadBehind
 	ReplicatedRefusalReadBufferBound
+	ReplicatedRefusalUnauthorized
 )
 
 // ReplicatedMemberState is the fixed-width handshake and leader hint returned
@@ -123,17 +132,21 @@ type ReplicatedMemberState struct {
 }
 
 // ReplicatedResponse owns Completion and returns only typed fixed-width error
-// classes. No remote diagnostic string is admitted to the hot wire.
+// classes. RequestDigest is SHA-256 over the exact canonical proposal and is
+// required only for a completion or applied deterministic refusal. It is zero
+// for probes, reads, retryable outcomes, and pre-admission refusals. No remote
+// diagnostic string is admitted to the hot wire.
 type ReplicatedResponse struct {
-	Kind        ReplicatedResponseKind
-	Refusal     ReplicatedRefusalCode
-	HasState    bool
-	State       ReplicatedMemberState
-	Outcome     raftserve.Outcome
-	Completion  []byte
-	ReadApplied uint64
-	Value       []byte
-	readLease   raftservice.PointReadLease
+	Kind          ReplicatedResponseKind
+	Refusal       ReplicatedRefusalCode
+	HasState      bool
+	State         ReplicatedMemberState
+	Outcome       raftserve.Outcome
+	RequestDigest [sha256.Size]byte
+	Completion    []byte
+	ReadApplied   uint64
+	Value         []byte
+	readLease     raftservice.PointReadLease
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame.
@@ -148,6 +161,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	e := newFrameEncoder(payloadHint)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
+	e.b = append(e.b, request.Authority.Node[:]...)
+	e.u64(request.Authority.Generation)
 	encodeReplicatedFence(&e, request.Fence)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -186,6 +201,8 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 	e := newFrameEncoder(payloadHint)
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
+	e.b = append(e.b, request.Authority.Node[:]...)
+	e.u64(request.Authority.Generation)
 	encodeReplicatedFence(&e, request.Fence)
 	var payload []byte
 	tag := byte(tagReplicatedRequest)
@@ -249,6 +266,8 @@ func decodeReplicatedRequest(
 		}
 		return nil, 0, ErrReplicatedWire
 	}
+	request.Authority.Node = d.fixed16()
+	request.Authority.Generation = d.u64()
 	request.Fence = decodeReplicatedFence(&d)
 	switch request.Operation {
 	case ReplicatedPropose:
@@ -367,6 +386,7 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	}
 	e.u64(response.Outcome.AppliedIndex)
 	e.u64(response.Outcome.CompletionAppliedSequence)
+	encodeReplicatedDigest(&e, response.RequestDigest)
 	e.bytes(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing {
 		e.u64(response.ReadApplied)
@@ -407,6 +427,7 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 	}
 	response.Outcome.AppliedIndex = d.u64()
 	response.Outcome.CompletionAppliedSequence = d.u64()
+	response.RequestDigest = decodeReplicatedDigest(&d)
 	response.Completion = d.slice()
 	response.Completion = response.Completion[:len(response.Completion):len(response.Completion)]
 	response.Outcome.CompletionBytes = len(response.Completion)
@@ -556,6 +577,12 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
 	}
+	authorityPresent := request.Authority.Node != (rafttransport.NodeID{}) ||
+		request.Authority.Generation != 0
+	if authorityPresent && (request.Authority.Node == (rafttransport.NodeID{}) ||
+		request.Authority.Generation == 0) {
+		return false
+	}
 	switch request.Operation {
 	case ReplicatedProbe:
 		return validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
@@ -619,6 +646,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 	switch response.Kind {
 	case ReplicatedHandshake:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedCompletion:
@@ -636,12 +664,14 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			completion.RoutingVersion == response.State.Fence.Command.RoutingVersion &&
 			completion.RouteGeneration == response.State.Fence.Command.RouteGeneration &&
 			response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest != ([sha256.Size]byte{}) &&
 			response.Outcome.Code == raftserve.OutcomeCompletion &&
 			response.Outcome.AppliedIndex != 0 &&
 			response.State.Applied >= response.Outcome.AppliedIndex &&
 			len(response.Completion) != 0 && response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedNotLeader, ReplicatedOutcomeUnknown:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied == 0 && len(response.Value) == 0
 	case ReplicatedMembershipAccepted:
@@ -655,21 +685,26 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		}
 		if response.Refusal == ReplicatedRefusalDeterministic {
 			return response.HasState && response.Outcome.Code > raftserve.OutcomeCompletion &&
+				response.RequestDigest != ([sha256.Size]byte{}) &&
 				response.Outcome.Code < raftserve.OutcomeProposalRefused &&
 				response.Outcome.AppliedIndex != 0 &&
 				response.State.Applied >= response.Outcome.AppliedIndex &&
 				response.Outcome.CompletionAppliedSequence == 0 &&
 				response.Outcome.CompletionBytes == 0
 		}
-		return response.Outcome == (raftserve.Outcome{}) &&
-			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable) &&
-			response.Refusal <= ReplicatedRefusalReadBufferBound
+		return response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) &&
+			(response.HasState || response.Refusal == ReplicatedRefusalUnavailable ||
+				response.Refusal == ReplicatedRefusalUnauthorized) &&
+			response.Refusal <= ReplicatedRefusalUnauthorized
 	case ReplicatedReadFound:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied
 	case ReplicatedReadMissing:
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			len(response.Value) == 0

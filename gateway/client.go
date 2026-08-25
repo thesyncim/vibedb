@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -64,6 +65,7 @@ var (
 	ErrExchangeConflict = exchange.ErrSpecConflict
 	ErrExchangeSequence = exchange.ErrSequence
 	ErrExchangeClosed   = exchange.ErrClosed
+	ErrUnauthorized     = errors.New("gateway: shard authorization denied")
 )
 
 // ShardError is a typed failure a shard reported in an error frame. Kind is the
@@ -124,6 +126,8 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 		return ErrExchangeSequence
 	case shardservice.ErrorExchangeClosed:
 		return ErrExchangeClosed
+	case shardservice.ErrorUnauthorized:
+		return ErrUnauthorized
 	default:
 		return ErrUnexpectedError
 	}
@@ -263,7 +267,7 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 			return nil, err
 		}
 	}
-	resp, err := RoundTrip(ctx, conn, req)
+	resp, err := RoundTrip(ctx, conn, forwardedShardRequest(ctx, req))
 	if ctx.Err() == nil && roundTripKeepsStream(err) {
 		c.put(address, conn)
 	} else {
@@ -302,13 +306,26 @@ func (c *Client) DoBatches(
 			return err
 		}
 	}
-	err = RoundTripBatches(ctx, conn, req, consume)
+	err = RoundTripBatches(ctx, conn, forwardedShardRequest(ctx, req), consume)
 	if ctx.Err() == nil && roundTripKeepsStream(err) {
 		c.put(address, conn)
 	} else {
 		_ = conn.Close()
 	}
 	return err
+}
+
+func forwardedShardRequest(
+	ctx context.Context,
+	request *shardservice.ShardRequest,
+) *shardservice.ShardRequest {
+	authority, ok := serviceauthz.FromContext(ctx)
+	if !ok || request == nil {
+		return request
+	}
+	forwarded := *request
+	forwarded.Authority = authority
+	return &forwarded
 }
 
 // roundTripKeepsStream reports errors produced only after a whole response

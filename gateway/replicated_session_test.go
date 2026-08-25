@@ -71,6 +71,7 @@ func (client *nativeSessionClient) DoReplicated(
 			Kind:     shardservice.ReplicatedRefusal,
 			Refusal:  shardservice.ReplicatedRefusalDeterministic,
 			HasState: true, State: client.state,
+			RequestDigest: replicatedRequestDigest(request.Command),
 			Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeSessionReleased, AppliedIndex: appliedIndex,
 			},
@@ -104,6 +105,7 @@ func (client *nativeSessionClient) DoReplicated(
 	client.state.Applied = appliedIndex
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedCompletion, HasState: true, State: client.state,
+		RequestDigest: replicatedRequestDigest(request.Command),
 		Outcome: raftserve.Outcome{
 			Code: raftserve.OutcomeCompletion, AppliedIndex: appliedIndex,
 			CompletionAppliedSequence: appliedSequence, CompletionBytes: len(completion),

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -27,6 +29,7 @@ var (
 	ErrReplicatedDial            = errors.New("gateway: replicated shard dial is not configured")
 	ErrReplicatedReadBehind      = errors.New("gateway: replica is below the requested applied index")
 	ErrReplicatedReadBufferBound = errors.New("gateway: point-read response bound is below the relation limit")
+	ErrReplicatedUnauthorized    = errors.New("gateway: replicated authorization denied")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -117,6 +120,10 @@ type ReplicatedResult struct {
 	Retries    int
 }
 
+func replicatedRequestDigest(command []byte) [sha256.Size]byte {
+	return sha256.Sum256(command)
+}
+
 // ReplicatedPointRead selects one explicit consistency contract. A
 // linearizable read is leader-only and ReadIndex-fenced. A follower read is
 // bounded solely by MinimumApplied and may fall back to any replica that has
@@ -176,6 +183,9 @@ func (executor *ReplicatedExecutor) ReadPoint(
 			preferred = 0
 			continue
 		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+		}
 		if !validReplicatedResponseState(response) ||
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
@@ -197,6 +207,7 @@ func (executor *ReplicatedExecutor) ReadPoint(
 		switch response.Kind {
 		case shardservice.ReplicatedReadFound, shardservice.ReplicatedReadMissing:
 			if response.Refusal != shardservice.ReplicatedRefusalNone ||
+				response.RequestDigest != ([sha256.Size]byte{}) ||
 				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
 				response.ReadApplied < read.MinimumApplied ||
 				response.State.Applied < response.ReadApplied ||
@@ -327,6 +338,9 @@ func (e *ReplicatedRefusalError) Unwrap() error {
 	if e.Code == shardservice.ReplicatedRefusalReadBufferBound {
 		return ErrReplicatedReadBufferBound
 	}
+	if e.Code == shardservice.ReplicatedRefusalUnauthorized {
+		return ErrReplicatedUnauthorized
+	}
 	return ErrReplicatedLeader
 }
 
@@ -408,6 +422,14 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				}
 			}
 			return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown, err)
+		}
+		// Authorization runs before proposal admission and deliberately returns
+		// no member state. It is therefore a definite refusal, not an unknown
+		// membership outcome and not a route-integrity failure.
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedMembershipResult{}, &ReplicatedRefusalError{
+				Code: shardservice.ReplicatedRefusalUnauthorized,
+			}
 		}
 		if !validReplicatedResponseState(response) ||
 			response.State.Fence.Group != route.Group ||
@@ -517,6 +539,7 @@ func (executor *ReplicatedExecutor) propose(
 		return ReplicatedResult{}, ErrReplicatedRoute
 	}
 	original := command[:len(command):len(command)]
+	requestDigest := replicatedRequestDigest(original)
 	preferred := route.Replicas[0].Member
 	var lastUnknown error
 	if priorUnknown {
@@ -578,6 +601,12 @@ func (executor *ReplicatedExecutor) propose(
 				Code: response.Refusal, Outcome: response.Outcome,
 			}
 		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			if lastUnknown != nil {
+				continue
+			}
+			return ReplicatedResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+		}
 		if !validReplicatedResponseState(response) ||
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
@@ -606,6 +635,7 @@ func (executor *ReplicatedExecutor) propose(
 			commandView, commandErr := replication.OpenCommand(original)
 			completion, completionErr := replication.OpenCompletion(response.Completion)
 			if commandErr != nil || completionErr != nil ||
+				response.RequestDigest != requestDigest ||
 				response.Refusal != shardservice.ReplicatedRefusalNone ||
 				response.Outcome.Code != raftserve.OutcomeCompletion ||
 				response.Outcome.AppliedIndex == 0 ||
@@ -637,7 +667,8 @@ func (executor *ReplicatedExecutor) propose(
 			continue
 		case shardservice.ReplicatedRefusal:
 			if response.Refusal == shardservice.ReplicatedRefusalDeterministic {
-				if validReplicatedAppliedRefusal(response) {
+				if response.RequestDigest == requestDigest &&
+					validReplicatedAppliedRefusal(response) {
 					return ReplicatedResult{}, &ReplicatedRefusalError{
 						Code: response.Refusal, Outcome: response.Outcome,
 					}
@@ -675,7 +706,13 @@ func (executor *ReplicatedExecutor) doReplicated(
 ) (*shardservice.ReplicatedResponse, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
-	response, err := executor.client.DoReplicated(attemptCtx, endpoint, request)
+	forwarded := request
+	if authority, ok := serviceauthz.FromContext(ctx); ok {
+		copy := *request
+		copy.Authority = authority
+		forwarded = &copy
+	}
+	response, err := executor.client.DoReplicated(attemptCtx, endpoint, forwarded)
 	if err == nil && response != nil && response.HasState &&
 		(response.State.Fence.MemberID != endpoint.Member ||
 			response.State.Fence.StoreID != endpoint.StoreID ||
@@ -727,6 +764,10 @@ func (executor *ReplicatedExecutor) discoverLeader(
 			member = 0
 			continue
 		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
+				&ReplicatedRefusalError{Code: response.Refusal}
+		}
 		if response == nil || response.Kind != shardservice.ReplicatedHandshake ||
 			!validReplicatedResponseState(response) ||
 			!validReplicatedNonterminalResponse(response) ||
@@ -762,6 +803,7 @@ func validReplicatedMemberState(state shardservice.ReplicatedMemberState) bool {
 
 func validReplicatedNonterminalResponse(response *shardservice.ReplicatedResponse) bool {
 	return response != nil && response.Refusal == shardservice.ReplicatedRefusalNone &&
+		response.RequestDigest == ([sha256.Size]byte{}) &&
 		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 		response.ReadApplied == 0 && len(response.Value) == 0
 }
@@ -776,6 +818,17 @@ func validReplicatedUnavailableWithoutState(
 	return response != nil && response.Kind == shardservice.ReplicatedRefusal &&
 		response.Refusal == shardservice.ReplicatedRefusalUnavailable &&
 		!response.HasState && response.State == (shardservice.ReplicatedMemberState{}) &&
+		response.RequestDigest == ([sha256.Size]byte{}) &&
+		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+		response.ReadApplied == 0 && len(response.Value) == 0
+}
+
+func validReplicatedUnauthorizedWithoutState(
+	response *shardservice.ReplicatedResponse,
+) bool {
+	return response != nil && response.Kind == shardservice.ReplicatedRefusal &&
+		response.Refusal == shardservice.ReplicatedRefusalUnauthorized &&
+		!response.HasState && response.State == (shardservice.ReplicatedMemberState{}) &&
 		response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 		response.ReadApplied == 0 && len(response.Value) == 0
 }
@@ -787,6 +840,7 @@ func validReplicatedWritePreAdmissionRefusal(
 ) bool {
 	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != code || response.Outcome != (raftserve.Outcome{}) ||
+		response.RequestDigest != ([sha256.Size]byte{}) ||
 		len(response.Completion) != 0 || response.ReadApplied != 0 || len(response.Value) != 0 {
 		return false
 	}
@@ -807,7 +861,8 @@ func validReplicatedWritePreAdmissionRefusal(
 	case shardservice.ReplicatedRefusalStaleFence,
 		shardservice.ReplicatedRefusalAdmissionBound,
 		shardservice.ReplicatedRefusalProposalRefused,
-		shardservice.ReplicatedRefusalUnavailable:
+		shardservice.ReplicatedRefusalUnavailable,
+		shardservice.ReplicatedRefusalUnauthorized:
 		return true
 	default:
 		return false
@@ -820,6 +875,7 @@ func validReplicatedReadRefusal(
 ) bool {
 	if response == nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != code || response.Outcome != (raftserve.Outcome{}) ||
+		response.RequestDigest != ([sha256.Size]byte{}) ||
 		len(response.Completion) != 0 || response.ReadApplied != 0 || len(response.Value) != 0 {
 		return false
 	}
@@ -828,7 +884,8 @@ func validReplicatedReadRefusal(
 		shardservice.ReplicatedRefusalAdmissionBound,
 		shardservice.ReplicatedRefusalUnavailable,
 		shardservice.ReplicatedRefusalReadBehind,
-		shardservice.ReplicatedRefusalReadBufferBound:
+		shardservice.ReplicatedRefusalReadBufferBound,
+		shardservice.ReplicatedRefusalUnauthorized:
 		return true
 	default:
 		return false

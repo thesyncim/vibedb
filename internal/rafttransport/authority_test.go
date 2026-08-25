@@ -1,6 +1,7 @@
 package rafttransport
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -42,6 +43,9 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 		t.Fatalf("authorized learner append: %v", err)
 	}
 	initialFrame := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 2))
+	preLearnerIllegal := frameTestReplacePayload(t, initialFrame,
+		frameTestMessage(pb.MsgHeartbeat, 3, 2))
+	binary.BigEndian.PutUint64(preLearnerIllegal[frameTestFromOffset:frameTestToOffset], 3)
 	learner := &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		if err := registry.PublishCommittedAuthority(group, 6, learner); err != nil {
@@ -58,6 +62,9 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); err != nil {
 		t.Fatalf("adjacent prior generation: %v", err)
 	}
+	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(3)), preLearnerIllegal); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
+		t.Fatalf("old-generation learner-origin leader frame = %v", err)
+	}
 	learnerFrame := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 2))
 	voters := &pb.ConfState{Voters: []uint64{1, 2, 3}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
@@ -65,7 +72,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 			t.Fatal(err)
 		}
 	}
-	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); !errors.Is(err, ErrUnauthorized) {
+	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
 		t.Fatalf("two-generations-old frame = %v", err)
 	}
 	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), learnerFrame); err != nil {
@@ -73,20 +80,27 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	}
 	preRemovalSource := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 3))
 	preRemovalVote := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgVote, 1, 3))
+	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
 	removed := &pb.ConfState{Voters: []uint64{2, 3}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
-		if err := registry.PublishCommittedAuthority(group, 8, removed); err != nil {
+		// Normal entries may separate configuration entries, so authority
+		// versions are monotonic log positions rather than consecutive counters.
+		if err := registry.PublishCommittedAuthority(group, 11, removed); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if view, _ := target.currentAuthority(group); view.allowPrevious || view.previous != nil {
-		t.Fatal("source removal retained adjacent old-generation authority")
+	if view, _ := target.currentAuthority(group); view.allowPrevious || view.previous != nil ||
+		view.retiredVersion != 7 {
+		t.Fatal("source removal retained prior roles or lost exact retired version")
 	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalSource); !errors.Is(err, ErrUnauthorized) {
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalSource); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
 		t.Fatalf("removed-source frame = %v", err)
 	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalVote); !errors.Is(err, ErrUnauthorized) {
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalVote); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
 		t.Fatalf("removed-source vote = %v", err)
+	}
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemaining); !errors.Is(err, ErrUnauthorized) || !errors.Is(err, ErrRetiredAuthority) {
+		t.Fatalf("retained-member retired frame = %v", err)
 	}
 	if _, err := target.Role(group, 1); !errors.Is(err, ErrMemberNotFound) {
 		t.Fatalf("removed source retained role: %v", err)

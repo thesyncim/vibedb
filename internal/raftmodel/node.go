@@ -283,6 +283,16 @@ func (n *Node) CurrentReady() (ReadyProgress, bool) {
 // driver.
 func (n *Node) Published() Publication { return clonePublication(n.published) }
 
+// PublishedApplied returns the fixed-width applied coordinate of the last
+// accepted publication without cloning its variable-sized ConfState. It is for
+// serialized control paths that need only this monotonic scalar.
+func (n *Node) PublishedApplied() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.published.Applied
+}
+
 // Status returns the allocation-free core status. It remains subject to the
 // Node's single-owner contract.
 func (n *Node) Status() raft.BasicStatus { return n.raw.BasicStatus() }
