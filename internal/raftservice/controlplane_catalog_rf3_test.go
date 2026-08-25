@@ -77,13 +77,19 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 
 	// Reconstruct all controller-local state from the RF3 relation. A fresh
 	// session and holder have no catalog bytes or pending command in memory.
+	limitedExecutor, err := gateway.NewReplicatedExecutor(client, 1, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.executor = limitedExecutor
 	restartedSession := newProcessNativeSession(t, route, client, 0xa2)
 	if _, err = restartedSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
 		t.Fatalf("open restarted catalog session: %v", err)
 	}
+	restartedHolder := gateway.NewCatalogHolder(nil)
 	restarted, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: client.executor, Route: route, Relation: 1,
-		Holder: gateway.NewCatalogHolder(nil), Session: restartedSession,
+		Holder: restartedHolder, Session: restartedSession,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,12 +107,49 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		State: gateway.ReplicatedOperationPlanned, Revision: 1,
 		CatalogGeneration: 1, Cursor: [8]uint64{1}, Proof: [32]byte{0xd1},
 	}
-	if err = journal.PublishOperation(ctx, 0, record); err != nil {
-		t.Fatalf("publish split operation: %v", err)
+	leader = cluster.waitLeader(t, ctx)
+	client.arm(leader, faultAfterDecodedResponseBeforeClientDelivery)
+	err = journal.PublishOperation(ctx, 0, record)
+	if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown split operation publication: %v", err)
+	}
+	pending := restartedSession.PendingCommand()
+	if err = journal.RetryPending(ctx); err != nil {
+		t.Fatalf("settle split operation publication: %v", err)
+	}
+	attempts, _ = client.snapshot()
+	if len(attempts) < 2 || !bytes.Equal(pending, attempts[len(attempts)-1]) {
+		t.Fatalf("split retry attempts=%d exact=%v", len(attempts),
+			len(attempts) != 0 && bytes.Equal(pending, attempts[len(attempts)-1]))
 	}
 	loaded, err := journal.ReadOperation(ctx, record.ID)
 	if err != nil || loaded != record {
 		t.Fatalf("read split operation = %+v, err=%v", loaded, err)
+	}
+
+	// A fresh controller session reconstructs the running operation from RF3,
+	// advances it to a terminal witness, and removes that exact revision.
+	recoveredSession := newProcessNativeSession(t, route, client, 0xa3)
+	if _, err = recoveredSession.Open(ctx, 2_000_000_000_000_000_000); err != nil {
+		t.Fatalf("open recovered controller session: %v", err)
+	}
+	recovered, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
+		Executor: limitedExecutor, Route: route, Relation: 1,
+		Holder: restartedHolder, Session: recoveredSession,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete := loaded
+	complete.State, complete.Revision = gateway.ReplicatedOperationComplete, loaded.Revision+1
+	if err = recovered.PublishOperation(ctx, loaded.Revision, complete); err != nil {
+		t.Fatalf("publish terminal split operation: %v", err)
+	}
+	if err = recovered.DeleteOperation(ctx, complete.ID, complete.Revision); err != nil {
+		t.Fatalf("GC terminal split operation: %v", err)
+	}
+	if _, err = recovered.ReadOperation(ctx, complete.ID); !errors.Is(err, gateway.ErrReplicatedOperationMissing) {
+		t.Fatalf("terminal split operation survived GC: %v", err)
 	}
 
 	second := processControlPlaneSnapshot(t, cluster, 2)
