@@ -176,21 +176,34 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err = hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
+	replacementLeader := uint64(0)
 	cluster.driveUntilWithActiveVoterTicks(func() bool {
+		leader := uint64(0)
 		for index := 1; index < len(hosts); index++ {
 			status, statusErr := hosts[index].Status(group)
 			publication, publicationErr := hosts[index].Publication(group)
-			if statusErr != nil || publicationErr != nil || status.LeaderID != 2 ||
+			if statusErr != nil || publicationErr != nil || status.LeaderID == 0 ||
+				status.LeaderID == voters[0] || status.LeaderID == target ||
 				publication.ConfState.Equivalent(voterConf) != nil {
 				return false
 			}
+			if leader == 0 {
+				leader = status.LeaderID
+			} else if leader != status.LeaderID {
+				return false
+			}
 		}
+		replacementLeader = leader
 		return true
 	}, 2*raftmodel.ElectionTick)
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
-	if err = hosts[1].TransferLeader(group, target); err != nil {
+	replacementLeaderIndex, ok := cluster.memberIndex[replacementLeader]
+	if !ok {
+		t.Fatalf("elected replacement leader %d has no host", replacementLeader)
+	}
+	if err = hosts[replacementLeaderIndex].TransferLeader(group, target); err != nil {
 		t.Fatal(err)
 	}
 	cluster.driveUntilConvergedIdle(func() bool {
