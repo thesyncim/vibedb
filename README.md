@@ -14,6 +14,12 @@ different acknowledgement contract.
 > authenticated TLS and a canonical `vibejson` authorization policy by default.
 > An explicit development mode permits plaintext only on loopback listeners.
 
+The experimental gateway can serve canonical point `get` requests from an
+externally prepared three-replica Raft group. It uses the replicated catalog to
+bind a table and ordered primary key to an exact relation and route. RF3 writes,
+scatter reads, multi-table reads, and automatic replica lifecycle management
+are not supported by this public path.
+
 ## Requirements
 
 - Go 1.26 or a compatible newer toolchain

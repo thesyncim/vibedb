@@ -163,14 +163,14 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Leader reads use ReadIndex. Follower reads require explicit applied-position and serving fences.", []Reference{
 			ref("internal/raftservice/owner.go", "ReadPoint"), ref("internal/multiraft/host.go", "ReadIndex"),
 		}},
-		Integrated: Stage{StatusYes, "The replicated gateway follows leaders and can select a sufficiently applied follower for the explicit follower contract.", []Reference{
-			ref("gateway/replicated_native.go", "ReadPoint"), ref("gateway/replicated_native_test.go", "TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict"),
+		Integrated: Stage{StatusYes, "Replicated table profiles bind public table and ordered-key reads to exact routes. The gateway follows leaders and can select a sufficiently applied follower for the explicit follower contract.", []Reference{
+			ref("gateway/replicated_data_read.go", "ReplicatedDataReader"), ref("gateway/replicated_table.go", "ResolveReplicatedTableKey"),
 		}},
-		Shipped: Stage{StatusPartial, "serve-rf3 exposes authenticated native RF3 reads, but vibedb-gateway serve still sends ordinary public queries through the static ReadStrong and vector-fence path.", []Reference{
-			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/serve.go", "execRequest"),
+		Shipped: Stage{StatusYes, "vibedb-gateway serves canonical point get requests through the authenticated RF3 native pool when it consumes the replicated catalog. Linearizable reads use ReadIndex. Monotonic follower reads require the exact RouteID and applied index. SQL has no RF3 fallback.", []Reference{
+			ref("cmd/vibedb-gateway/serve.go", "handleConnPolicy"), ref("gateway/replicated_data_read.go", "Read"),
 		}},
-		Qualification: Stage{StatusPartial, "Barrier, stale-fence, leader-following, and bounded follower-selection tests exist. There is no shipped partition or staleness-latency gate.", []Reference{
-			ref("internal/raftservice/owner_test.go", "TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp"), ref("gateway/replicated_native_test.go", "TestReplicatedPointReadReturnsTypedBoundsWithoutLeaderMisclassification"),
+		Qualification: Stage{StatusPartial, "Command-boundary tests cover canonical decoding, typed results, authorization, no SQL fallback, leader refresh, follower selection, route mismatch, serving fences, and resource bounds. There is no external public-gateway partition or staleness-latency gate.", []Reference{
+			ref("cmd/vibedb-gateway/data_handler_test.go", "TestHandleConnDataDispatchesRF3ReadWithoutSQLFallback"), ref("gateway/replicated_data_read_test.go", "TestReplicatedDataReaderLinearizableRefreshesNotLeader"),
 		}},
 	},
 	{

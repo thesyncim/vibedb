@@ -5,14 +5,15 @@ VibeDB has four main layers:
 1. The root facade owns database lifecycle and product durability profiles.
 2. The heap and durable stores own JSON collections, indexes, and snapshots.
 3. The query and SQL packages own parsing, planning, and local execution.
-4. The experimental distributed packages own static routing, shard service,
-   and fixed-RF3 serving.
+4. The experimental distributed packages own static SQL routing and an RF3
+   point-read path.
 
 The internal Raft, replicated-state, and Raft-service packages form the RF3
 serving composition. `vibedb-shard serve-rf3` constructs it for one externally
 prepared stable three-voter group. It does not provision or repair the group,
-and the public gateway command remains connected to the static shard service
-rather than the RF3 native endpoint.
+and the public gateway uses it only for canonical point `get` requests. SQL,
+writes, scatter reads, and multi-table reads remain on or are limited by the
+static path.
 
 ## Product facade
 
@@ -111,21 +112,44 @@ repartition, and global-index paths.
 
 ## Distributed path
 
-The runnable distributed path is:
+The gateway has two distinct public data paths:
 
 ```text
-client -> gateway -> static shard service -> local SQL catalog
+SQL request          -> gateway -> static shard service -> local SQL catalog
+canonical point get -> gateway -> replicated catalog route -> RF3 native relation
 ```
 
 The gateway pins one immutable catalog generation per attempt, proves a bounded route,
 dispatches SQL and typed parameters, and merges the complete result. The shard
 admits distribution, allocation, routing, and ownership identity before SQL.
 
-The separate `vibedb-shard serve-rf3` path opens exact retained WAL, SQL, and
-apply artifacts, constructs one bounded Multi-Raft host plus authenticated peer
-transport, and serves the authenticated native replicated protocol. There is no
-RF3 initializer, membership or snapshot orchestrator, or public-gateway routing
-to this path.
+The replicated catalog stores exact RF3 shard coordinates and base-table
+profiles. A profile binds the table, primary-key path, dense relation ID,
+schema generation, relation-manifest digest, and key and document limits. A
+point read pins one catalog generation and resolves the ordered key without a
+SQL or string conversion.
+
+The gateway shares one bounded authenticated native connection pool across
+catalog and point-read traffic. A bounded four-way leader-hint cache avoids
+repeated probes. The executor validates the complete route and serving fence,
+follows `NotLeader` responses, and retries within the configured attempt and
+deadline bounds.
+
+A linearizable point read follows the leader and uses Raft `ReadIndex`. An
+`at_least_applied` read carries the exact `RouteID` and nonzero applied index
+from an earlier response. The gateway rejects a different route lineage before
+network I/O and selects a replica that has reached the requested index. Every
+successful response returns the current `RouteID` and applied index.
+
+The RF3 point-read boundary does not fall back to SQL. A missing table profile,
+stale serving fence, unavailable quorum, or mismatched position returns a typed
+refusal.
+
+`vibedb-shard serve-rf3` opens exact retained WAL, SQL, and apply artifacts,
+constructs one bounded Multi-Raft host plus authenticated peer transport, and
+serves the authenticated native replicated protocol. There is no RF3
+initializer, membership or snapshot orchestrator, or public RF3 write path.
+Scatter and multi-table RF3 reads are also absent.
 
 The static shard service accepts only its `ReadStrong` policy and serves a
 statement-level snapshot from a statically configured leader endpoint. This
@@ -134,8 +158,9 @@ election or replication. Multi-shard reads use short-lived scoped vector
 fences. Ordinary writes require one-owner proof. A separate fixed-participant
 protocol supports atomic write batches.
 
-The static gateway path has no Raft replication, follower read, endpoint
-failover, or automatic topology controller.
+The static SQL path has no Raft replication, follower read, or endpoint
+failover. The RF3 leader cache and retry logic apply only to canonical point
+reads and replicated catalog operations.
 
 The internal range-split data plane is not part of the runnable path. It scans
 one certified source image once and routes each borrowed row to at most three
@@ -211,7 +236,7 @@ review rules.
 | Durable storage | `store/durable`, `internal/storeio` |
 | Query and SQL | `query`, `sql`, `sql/driver`, `planner` |
 | PostgreSQL protocol | `pgwire` |
-| Static distributed runtime | `distribution`, `gateway`, `shardservice` |
+| Distributed runtime | `distribution`, `gateway`, `shardservice` |
 | Replication kernel | `internal/raft*`, `internal/multiraft`, `internal/replicatedstate` |
 | Range-split kernel | `autosplit`, `internal/topologyscheduler`, `internal/rangesplit`, `internal/splitcontroller` |
 
@@ -220,7 +245,8 @@ review rules.
 - `vibedb.go`, `vibedb_txn.go`, and `vibedb_query.go`
 - `store/engine.go` and `store/durable/store_file.go`
 - `query/exec.go` and `sql/driver/runtime.go`
-- `gateway/executor.go` and `shardservice/server.go`
+- `gateway/executor.go`, `gateway/replicated_data_read.go`,
+  `gateway/replicated_table.go`, and `shardservice/server.go`
 - `internal/raftmember/runtime.go`
 - `autosplit/action.go`
 - `internal/topologyscheduler/admission.go`, `feedback.go`, `planning.go`,
