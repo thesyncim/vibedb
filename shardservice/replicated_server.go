@@ -48,11 +48,15 @@ type ReplicatedServer struct {
 	active        atomic.Uint64
 	frameRejected atomic.Uint64
 
-	proposalUnknownSubmit            atomic.Uint64
-	proposalUnknownAbandoned         atomic.Uint64
-	proposalInvalidCompletion        atomic.Uint64
-	proposalInvalidDeterministic     atomic.Uint64
-	proposalInvalidCompletionReasons atomic.Uint64
+	proposalUnknownSubmit               atomic.Uint64
+	proposalUnknownAbandoned            atomic.Uint64
+	proposalInvalidCompletion           atomic.Uint64
+	proposalInvalidDeterministic        atomic.Uint64
+	proposalInvalidCompletionReasons    atomic.Uint64
+	proposalInvalidDeterministicReasons atomic.Uint64
+	proposalInvalidDeterministicCode    atomic.Uint32
+	proposalInvalidDeterministicApplied atomic.Uint64
+	proposalInvalidDeterministicState   atomic.Uint64
 }
 
 // BindAuthorization installs the sole production authorization gate before
@@ -117,12 +121,31 @@ type ReplicatedServerStats struct {
 	FrameRejected      uint64
 	InFlightFrameBytes int64
 
-	ProposalUnknownSubmit            uint64
-	ProposalUnknownAbandoned         uint64
-	ProposalInvalidCompletion        uint64
-	ProposalInvalidDeterministic     uint64
-	ProposalInvalidCompletionReasons ReplicatedCompletionInvalidReason
+	ProposalUnknownSubmit               uint64
+	ProposalUnknownAbandoned            uint64
+	ProposalInvalidCompletion           uint64
+	ProposalInvalidDeterministic        uint64
+	ProposalInvalidCompletionReasons    ReplicatedCompletionInvalidReason
+	ProposalInvalidDeterministicReasons ReplicatedDeterministicInvalidReason
+	ProposalInvalidDeterministicCode    raftserve.OutcomeCode
+	ProposalInvalidDeterministicApplied uint64
+	ProposalInvalidDeterministicState   uint64
 }
+
+// ReplicatedDeterministicInvalidReason identifies the exact canonical-response
+// predicate that rejected a deterministic applied outcome. The serving path
+// records bits and numeric witnesses only; it does not allocate diagnostic
+// strings or retain command bytes.
+type ReplicatedDeterministicInvalidReason uint64
+
+const (
+	ReplicatedDeterministicInvalidState ReplicatedDeterministicInvalidReason = 1 << iota
+	ReplicatedDeterministicInvalidCode
+	ReplicatedDeterministicInvalidAppliedIndex
+	ReplicatedDeterministicInvalidStateBehind
+	ReplicatedDeterministicInvalidCompletionSequence
+	ReplicatedDeterministicInvalidCompletionBytes
+)
 
 // ReplicatedCompletionInvalidReason is an allocation-free diagnostic bit set
 // for a completed proposal that could not be represented by the canonical
@@ -262,6 +285,12 @@ func (server *ReplicatedServer) Stats() ReplicatedServerStats {
 		ProposalInvalidDeterministic: server.proposalInvalidDeterministic.Load(),
 		ProposalInvalidCompletionReasons: ReplicatedCompletionInvalidReason(
 			server.proposalInvalidCompletionReasons.Load()),
+		ProposalInvalidDeterministicReasons: ReplicatedDeterministicInvalidReason(
+			server.proposalInvalidDeterministicReasons.Load()),
+		ProposalInvalidDeterministicCode: raftserve.OutcomeCode(
+			server.proposalInvalidDeterministicCode.Load()),
+		ProposalInvalidDeterministicApplied: server.proposalInvalidDeterministicApplied.Load(),
+		ProposalInvalidDeterministicState:   server.proposalInvalidDeterministicState.Load(),
 	}
 }
 
@@ -477,6 +506,11 @@ func (server *ReplicatedServer) executeReplicated(
 		}
 	}
 
+	proposalState := wireState
+	// SubmitOwned revalidates this complete fence immediately before registry
+	// admission. A settled result therefore authenticates the request fence
+	// even if an unrelated owner-lane transition followed the initial probe.
+	proposalState.Fence = request.Fence
 	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
 		Group:                request.Fence.Group,
 		AllocationGeneration: request.Fence.AllocationGeneration,
@@ -485,9 +519,12 @@ func (server *ReplicatedServer) executeReplicated(
 		NodeIncarnation: request.Fence.NodeIncarnation, Term: request.Fence.Term,
 	}, request.Command)
 	if err == nil {
-		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
-			wireState = replicatedWireState(refreshed)
-		}
+		// Settlement is a stronger witness than a second status probe: the
+		// exact command has already been observed in a published applied batch.
+		// Preserve the fence that SubmitOwned accepted and advance only its
+		// monotonic Raft watermarks. Besides avoiding a serialized lane RTT,
+		// this cannot accidentally pair the completion with a later fence.
+		wireState = replicatedStateAtApplied(proposalState, result.Outcome.AppliedIndex)
 		response := &ReplicatedResponse{
 			Kind: ReplicatedCompletion, HasState: true, State: wireState,
 			Outcome: result.Outcome, RequestDigest: replicatedRequestDigest(request.Command),
@@ -533,6 +570,7 @@ func (server *ReplicatedServer) executeReplicated(
 		}
 	case result.Outcome.Code > raftserve.OutcomeCompletion &&
 		result.Outcome.Code < raftserve.OutcomeProposalRefused:
+		wireState = replicatedStateAtApplied(proposalState, result.Outcome.AppliedIndex)
 		response := &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: wireState, Outcome: result.Outcome,
@@ -542,6 +580,11 @@ func (server *ReplicatedServer) executeReplicated(
 			return response
 		}
 		server.proposalInvalidDeterministic.Add(1)
+		server.proposalInvalidDeterministicReasons.Or(
+			uint64(replicatedDeterministicInvalidReasons(response)))
+		server.proposalInvalidDeterministicCode.Store(uint32(response.Outcome.Code))
+		server.proposalInvalidDeterministicApplied.Store(response.Outcome.AppliedIndex)
+		server.proposalInvalidDeterministicState.Store(response.State.Applied)
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrIngressFull),
 		errors.Is(err, raftservice.ErrPendingProposalsFull):
@@ -555,6 +598,50 @@ func (server *ReplicatedServer) executeReplicated(
 			HasState: true, State: wireState,
 		}
 	}
+}
+
+func replicatedStateAtApplied(
+	state ReplicatedMemberState,
+	applied uint64,
+) ReplicatedMemberState {
+	if state.Applied < applied {
+		state.Applied = applied
+	}
+	if state.Commit < applied {
+		state.Commit = applied
+	}
+	return state
+}
+
+func replicatedDeterministicInvalidReasons(
+	response *ReplicatedResponse,
+) ReplicatedDeterministicInvalidReason {
+	if response == nil {
+		return ReplicatedDeterministicInvalidState | ReplicatedDeterministicInvalidCode |
+			ReplicatedDeterministicInvalidAppliedIndex
+	}
+	reasons := ReplicatedDeterministicInvalidReason(0)
+	if !response.HasState || !validReplicatedMemberState(response.State) {
+		reasons |= ReplicatedDeterministicInvalidState
+	}
+	if response.Outcome.Code <= raftserve.OutcomeCompletion ||
+		response.Outcome.Code >= raftserve.OutcomeProposalRefused {
+		reasons |= ReplicatedDeterministicInvalidCode
+	}
+	if response.Outcome.AppliedIndex == 0 {
+		reasons |= ReplicatedDeterministicInvalidAppliedIndex
+	}
+	if response.HasState && response.Outcome.AppliedIndex != 0 &&
+		response.State.Applied < response.Outcome.AppliedIndex {
+		reasons |= ReplicatedDeterministicInvalidStateBehind
+	}
+	if response.Outcome.CompletionAppliedSequence != 0 {
+		reasons |= ReplicatedDeterministicInvalidCompletionSequence
+	}
+	if response.Outcome.CompletionBytes != 0 {
+		reasons |= ReplicatedDeterministicInvalidCompletionBytes
+	}
+	return reasons
 }
 
 func replicatedCompletionInvalidReasons(

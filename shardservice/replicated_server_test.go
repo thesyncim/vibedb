@@ -28,6 +28,7 @@ type fakeReplicatedOwner struct {
 	readErr       error
 	readLease     raftservice.PointReadLease
 	readCalled    chan struct{}
+	probeCalls    atomic.Uint64
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -42,6 +43,7 @@ func (owner *fakeReplicatedOwner) Probe(
 	context.Context,
 	raftmember.GroupKey,
 ) (raftservice.ServingState, error) {
+	owner.probeCalls.Add(1)
 	return owner.state, nil
 }
 
@@ -373,13 +375,28 @@ func TestReplicatedServerCountsExceptionalProposalDowngrades(t *testing.T) {
 		server := testReplicatedServer(&fakeReplicatedOwner{state: state,
 			result: raftservice.Result{Outcome: raftserve.Outcome{
 				Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
-				CompletionAppliedSequence: 8, CompletionBytes: len(completion),
+				CompletionAppliedSequence: 8, CompletionBytes: len(completion) - 1,
 			}, Completion: completion}})
 		response := server.executeReplicated(context.Background(), request)
 		stats := server.Stats()
 		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalInvalidCompletion != 1 ||
-			stats.ProposalInvalidCompletionReasons != ReplicatedCompletionInvalidStateBehind {
+			stats.ProposalInvalidCompletionReasons != ReplicatedCompletionInvalidCompletionBytes {
 			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("settled completion advances response watermarks", func(t *testing.T) {
+		owner := &fakeReplicatedOwner{state: state,
+			result: raftservice.Result{Outcome: raftserve.Outcome{
+				Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+				CompletionAppliedSequence: 8, CompletionBytes: len(completion),
+			}, Completion: completion}}
+		server := testReplicatedServer(owner)
+		response := server.executeReplicated(context.Background(), request)
+		if response.Kind != ReplicatedCompletion || response.State.Applied != 9 ||
+			response.State.Commit != 9 || !validReplicatedResponse(response) ||
+			owner.probeCalls.Load() != 1 {
+			t.Fatalf("response=%+v stats=%+v", response, server.Stats())
 		}
 	})
 
@@ -409,15 +426,35 @@ func TestReplicatedServerCountsExceptionalProposalDowngrades(t *testing.T) {
 	})
 
 	t.Run("invalid deterministic refusal remains distinct", func(t *testing.T) {
-		outcome := raftserve.Outcome{Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9}
+		outcome := raftserve.Outcome{
+			Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9, CompletionBytes: 1,
+		}
 		server := testReplicatedServer(&fakeReplicatedOwner{
 			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
 		})
 		response := server.executeReplicated(context.Background(), request)
 		stats := server.Stats()
 		if response.Kind != ReplicatedOutcomeUnknown || stats.ProposalInvalidDeterministic != 1 ||
-			stats.ProposalUnknownSubmit != 0 || stats.ProposalInvalidCompletion != 0 {
+			stats.ProposalUnknownSubmit != 0 || stats.ProposalInvalidCompletion != 0 ||
+			stats.ProposalInvalidDeterministicReasons != ReplicatedDeterministicInvalidCompletionBytes ||
+			stats.ProposalInvalidDeterministicCode != raftserve.OutcomeRequestConflict ||
+			stats.ProposalInvalidDeterministicApplied != 9 ||
+			stats.ProposalInvalidDeterministicState != 9 {
 			t.Fatalf("response=%+v stats=%+v", response, stats)
+		}
+	})
+
+	t.Run("settled deterministic refusal advances response watermarks", func(t *testing.T) {
+		outcome := raftserve.Outcome{Code: raftserve.OutcomeRequestConflict, AppliedIndex: 9}
+		server := testReplicatedServer(&fakeReplicatedOwner{
+			state: state, result: raftservice.Result{Outcome: outcome}, err: outcome.Err(),
+		})
+		response := server.executeReplicated(context.Background(), request)
+		if response.Kind != ReplicatedRefusal ||
+			response.Refusal != ReplicatedRefusalDeterministic ||
+			response.State.Applied != 9 || response.State.Commit != 9 ||
+			!validReplicatedResponse(response) {
+			t.Fatalf("response=%+v stats=%+v", response, server.Stats())
 		}
 	})
 }

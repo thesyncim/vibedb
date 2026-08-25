@@ -376,10 +376,14 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 	}
 	serverStats := server.Stats()
 	_, _ = fmt.Fprintf(os.Stderr,
-		"rf3 proposal diagnostics unknown-submit=%d unknown-abandoned=%d invalid-completion=%d invalid-deterministic=%d invalid-reasons=%d\n",
+		"rf3 proposal diagnostics unknown-submit=%d unknown-abandoned=%d invalid-completion=%d invalid-deterministic=%d completion-reasons=%d deterministic-reasons=%d deterministic-code=%d deterministic-applied=%d deterministic-state-applied=%d\n",
 		serverStats.ProposalUnknownSubmit, serverStats.ProposalUnknownAbandoned,
 		serverStats.ProposalInvalidCompletion, serverStats.ProposalInvalidDeterministic,
 		serverStats.ProposalInvalidCompletionReasons,
+		serverStats.ProposalInvalidDeterministicReasons,
+		serverStats.ProposalInvalidDeterministicCode,
+		serverStats.ProposalInvalidDeterministicApplied,
+		serverStats.ProposalInvalidDeterministicState,
 	)
 	close(stopPulse)
 	cancel()

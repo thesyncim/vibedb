@@ -248,7 +248,11 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	if err != nil {
 		t.Fatalf("stable-leader owned exact retry: %v", err)
 	}
-	if replayed.Outcome != acknowledged.Outcome ||
+	if replayed.Outcome.Code != acknowledged.Outcome.Code ||
+		replayed.Outcome.CompletionAppliedSequence !=
+			acknowledged.Outcome.CompletionAppliedSequence ||
+		replayed.Outcome.CompletionBytes != acknowledged.Outcome.CompletionBytes ||
+		replayed.Outcome.AppliedIndex < acknowledged.Outcome.AppliedIndex ||
 		!bytes.Equal(replayed.Completion, acknowledged.Completion) {
 		t.Fatalf("stable-leader owned exact retry changed result: first=%+v retry=%+v",
 			acknowledged.Outcome, replayed.Outcome)
@@ -360,6 +364,14 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	if !bytes.Equal(retried.Completion, acknowledged.Completion) {
 		t.Fatal("exact retry returned a different deterministic completion")
+	}
+	if retried.Outcome.Code != acknowledged.Outcome.Code ||
+		retried.Outcome.CompletionAppliedSequence !=
+			acknowledged.Outcome.CompletionAppliedSequence ||
+		retried.Outcome.CompletionBytes != acknowledged.Outcome.CompletionBytes ||
+		retried.Outcome.AppliedIndex < acknowledged.Outcome.AppliedIndex {
+		t.Fatalf("exact retry changed logical result: first=%+v retry=%+v",
+			acknowledged.Outcome, retried.Outcome)
 	}
 }
 
