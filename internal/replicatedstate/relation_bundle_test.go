@@ -42,8 +42,10 @@ func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
 		capture   bool
 		want      int
 	}{
-		{"hot_without_capture", 64, 8, false, 68},
-		{"hot_with_capture", 64, 8, true, 69},
+		{"data_without_capture", 64, 8, false, 67},
+		{"data_with_capture", 64, 8, true, 68},
+		{"session_open_without_capture", 0, 1, false, 4},
+		{"session_open_with_capture", 0, 1, true, 5},
 		{"release_without_capture", 0, 8, false, 10},
 		{"release_with_capture", 0, 8, true, 11},
 	} {

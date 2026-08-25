@@ -182,10 +182,11 @@ func validateBundleTransactionProfile(
 }
 
 // RequiredBundleTransactionDocuments returns the exact mutation-slot ceiling
-// for one replicated apply transaction. A hot command may publish four system
-// records (state, authority, session and slot) alongside all relation changes;
-// a reserved transition capture contributes one additional private row. A
-// release instead deletes one session header plus every retry slot.
+// for one replicated apply transaction. A data command publishes state,
+// session and slot alongside all relation changes. Session open publishes
+// state, authority, session and slot but no relation batch. Release deletes one
+// session header plus every retry slot and publishes state. A reserved
+// transition capture contributes one additional private row to every shape.
 func RequiredBundleTransactionDocuments(
 	relationDocuments int,
 	retryWindow uint16,
@@ -195,7 +196,7 @@ func RequiredBundleTransactionDocuments(
 		retryWindow == 0 || retryWindow > MaxSessionRetryWindow {
 		return 0, ErrInvalidOptions
 	}
-	required := max(int(retryWindow)+2, relationDocuments+4)
+	required := max(int(retryWindow)+2, relationDocuments+3, 4)
 	if reservedCapture {
 		required++
 	}

@@ -1069,14 +1069,19 @@ func newSourceCaptureFixture(t testing.TB, partitioner *Partitioner) sourceCaptu
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations,
+		sourceCaptureRetryWindow,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	options := replicatedstate.Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: 3,
-			MaxDocuments: max(
-				user.Limits.MaxDistinctMutations+4,
-				int(sourceCaptureRetryWindow)+3,
-			),
-			MaxBytes: 64 << 20,
+			MaxDocuments:   maxDocuments,
+			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128,
 		RetryWindow: sourceCaptureRetryWindow,
