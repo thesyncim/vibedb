@@ -1055,6 +1055,8 @@ catalogAddsName:
 	// such as MaxDocumentBytes; those fields are intentionally untouched.
 	c.options.Options.Indexes = candidate.Options.Indexes
 	c.options.maxTransactionBytes = candidate.maxTransactionBytes
+	c.options.maxTransactionPhysicalBytes =
+		candidate.maxTransactionPhysicalBytes
 	c.options.singleDocumentTransactionPages =
 		candidate.singleDocumentTransactionPages
 	c.options.singleDocumentTransactionBytes =
