@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -88,4 +92,117 @@ func TestNativeDataResponseForErrorIsClosedAndTyped(t *testing.T) {
 			t.Fatalf("error %v response = %+v", test.err, response)
 		}
 	}
+}
+
+func TestHandleConnDataDispatchesRF3ReadWithoutSQLFallback(t *testing.T) {
+	reader := &nativeDataReaderStub{result: gateway.ReplicatedTableReadResult{
+		Position: gateway.ReplicatedReadPosition{
+			RouteID: replication.Digest{1}, Applied: 42,
+		},
+		Found: true, Value: []byte(`{"id":"a"}`),
+	}}
+	response := roundTripNativeDataLine(t, reader, nil,
+		`{"op":"get","table":"docs","key":"AQIDBA","consistency":"linearizable"}`)
+	want := `{"ok":true,"route_id":"0100000000000000000000000000000000000000000000000000000000000000","applied":42,"found":true,"document":{"id":"a"}}` + "\n"
+	if response != want || reader.calls != 1 {
+		t.Fatalf("response = %q, calls=%d", response, reader.calls)
+	}
+}
+
+func TestHandleConnDataReturnsClosedTypedFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		reader    nativeDataReader
+		authorize func(serviceauthz.Capability) bool
+		line      string
+		want      string
+	}{
+		{
+			name:   "malformed",
+			reader: &nativeDataReaderStub{},
+			line:   `{"op":"get","table":"docs","key":"padded==","consistency":"linearizable"}`,
+			want:   `{"ok":false,"code":"invalid_request","retryable":false}` + "\n",
+		},
+		{
+			name:   "authorization",
+			reader: &nativeDataReaderStub{},
+			authorize: func(serviceauthz.Capability) bool {
+				return false
+			},
+			line: `{"op":"get","table":"docs","key":"AQIDBA","consistency":"linearizable"}`,
+			want: `{"ok":false,"code":"unauthorized","retryable":false}` + "\n",
+		},
+		{
+			name: "rf3 disabled",
+			line: `{"op":"get","table":"docs","key":"AQIDBA","consistency":"linearizable"}`,
+			want: `{"ok":false,"code":"unavailable","retryable":true}` + "\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := roundTripNativeDataLine(t, test.reader, test.authorize, test.line)
+			if got != test.want {
+				t.Fatalf("response = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNativeDataRequestCandidateRequiresFirstUnescapedOperation(t *testing.T) {
+	accepted := []string{
+		`{"op":"get","table":"docs"}`,
+		" \t{ \n\"op\" : \"put\" ,\"table\":\"docs\"}",
+		`{"op":"delete" ,"table":"docs"}`,
+	}
+	for _, source := range accepted {
+		if !nativeDataRequestCandidate([]byte(source)) {
+			t.Fatalf("candidate rejected %q", source)
+		}
+	}
+	rejected := []string{
+		``, `null`, `{}`, `{"table":"docs","op":"get"}`,
+		`{"o\u0070":"get","table":"docs"}`,
+		`{"op":"query","sql":"SELECT 1"}`,
+		`{"op":"getter","table":"docs"}`,
+	}
+	for _, source := range rejected {
+		if nativeDataRequestCandidate([]byte(source)) {
+			t.Fatalf("candidate accepted %q", source)
+		}
+	}
+}
+
+func roundTripNativeDataLine(
+	t testing.TB,
+	reader nativeDataReader,
+	authorize func(serviceauthz.Capability) bool,
+	line string,
+) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleConnPolicy(ctx, server, nil, reader, func(string, ...any) {}, authorize)
+	}()
+	if deadlineErr := client.SetDeadline(time.Now().Add(5 * time.Second)); deadlineErr != nil {
+		t.Fatal(deadlineErr)
+	}
+	if _, err := client.Write(append([]byte(line), '\n')); err != nil {
+		t.Fatal(err)
+	}
+	response, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection handler did not stop")
+	}
+	return response
 }

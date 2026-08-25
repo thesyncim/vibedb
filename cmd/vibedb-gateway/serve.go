@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -235,7 +236,8 @@ func runServe(args []string) int {
 	var exec *gateway.Executor
 	var holder *gateway.CatalogHolder
 	var catalogAuthority *gateway.ReplicatedCatalogAuthority
-	var catalogTLS *servicetls.Client
+	var replicated *gateway.ReplicatedExecutor
+	var replicatedPool *gateway.AuthenticatedReplicatedClient
 	var err error
 	if *devStaticCatalog {
 		exec, holder, err = newGatewayWithDial(*catalog, shardDial, internalAuthority)
@@ -247,7 +249,7 @@ func runServe(args []string) int {
 			fmt.Fprintln(os.Stderr, "gateway: catalog client identity or retry home is not canonical hexadecimal")
 			return 2
 		}
-		exec, holder, catalogAuthority, catalogTLS, err = newReplicatedCatalogGateway(
+		exec, holder, catalogAuthority, replicated, replicatedPool, err = newReplicatedCatalogGateway(
 			context.Background(), *catalog, shardDial, tlsProfile, *devPlaintext,
 			internalAuthority,
 			replication.RelationID(*catalogRelation), *catalogAttempts, *catalogAttemptTimeout,
@@ -255,12 +257,20 @@ func runServe(args []string) int {
 			*catalogSessionJournal, clientID, retryHome, *catalogSessionLease,
 		)
 	}
-	if catalogTLS != nil {
-		defer catalogTLS.Close()
+	if replicatedPool != nil {
+		defer replicatedPool.Close()
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gateway: load catalog %q: %v\n", *catalog, err)
 		return 1
+	}
+	var dataReader *gateway.ReplicatedDataReader
+	if replicated != nil {
+		dataReader, err = gateway.NewReplicatedDataReader(holder, replicated)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gateway: initialize replicated data reader: %v\n", err)
+			return 1
+		}
 	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -282,12 +292,20 @@ func runServe(args []string) int {
 		go runSplitController(ctx, catalogAuthority, trigger, *controllerInterval, logf)
 	}
 	if clientTLS != nil {
-		err = serveAuthenticatedGateway(ctx, listener, exec, clientTLS, gateway.ClientTLSLimits{
+		err = serveAuthenticatedGatewayData(ctx, listener, exec, dataReader, clientTLS, gateway.ClientTLSLimits{
 			MaxConnections: *maxConnections, MaxHandshakes: *maxHandshakes,
 			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
 		}, logf)
 	} else {
-		err = serveGateway(ctx, listener, exec, logf)
+		serveContext := ctx
+		if dataReader != nil {
+			serveContext, err = serviceauthz.WithAuthority(ctx, internalAuthority)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gateway: establish development authority: %v\n", err)
+				return 1
+			}
+		}
+		err = serveGatewayData(serveContext, listener, exec, dataReader, logf)
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "gateway: serve: %v\n", err)
@@ -352,49 +370,51 @@ func newReplicatedCatalogGateway(
 	clientID replication.ID128,
 	retryHome replication.RetryHome,
 	lease time.Duration,
-) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority, *servicetls.Client, error) {
+) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority,
+	*gateway.ReplicatedExecutor, *gateway.AuthenticatedReplicatedClient, error) {
 	distributionName := gateway.ReplicatedCatalogDistribution
 	shardID := gateway.ReplicatedCatalogShard
 	bootstrap, err := gateway.LoadSnapshot(bootstrapPath)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	route, ok := bootstrap.ResolveReplicatedRoute(distributionName, shardID, replicas[:0])
 	if !ok {
-		return nil, nil, nil, nil, gateway.ErrReplicatedCatalogMissing
+		return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogMissing
 	}
 	var nativeClient gateway.ReplicatedRoundTripper
-	var catalogTLS *servicetls.Client
+	var replicatedPool *gateway.AuthenticatedReplicatedClient
 	if devPlaintext {
 		nativeClient = gateway.TCPReplicatedClient{Dial: func(ctx context.Context, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 		}}
 	} else {
-		endpoints := make([]servicetls.Endpoint, len(route.Replicas))
-		for index, replica := range route.Replicas {
-			endpoints[index] = servicetls.Endpoint{Address: replica.Address, Node: replica.Node}
-		}
-		secure, secureErr := servicetls.NewClient(servicetls.ClientOptions{
-			TLS: tlsProfile, Class: rafttransport.TrafficShardNative, Endpoints: endpoints,
-			Dial: func(ctx context.Context, address string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		perEndpoint := maxConnections
+		replicatedPool, err = gateway.NewAuthenticatedReplicatedClient(
+			gateway.AuthenticatedReplicatedClientOptions{
+				TLS: tlsProfile,
+				Dial: func(ctx context.Context, address string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+				},
+				HandshakeDeadline: servicetls.FixedDeadline(handshakeTimeout),
+				MaxConnections:    maxConnections, MaxPerEndpoint: perEndpoint,
+				MaxIdlePerEndpoint: min(perEndpoint, 8), MaxHandshakes: maxHandshakes,
+				MaxWaiters: maxConnections, MaxIdleAge: 30 * time.Second,
+				MaxLifetime: 15 * time.Minute,
 			},
-			HandshakeDeadline: servicetls.FixedDeadline(handshakeTimeout),
-			MaxConnections:    maxConnections, MaxHandshakes: maxHandshakes,
-		})
-		if secureErr != nil {
-			return nil, nil, nil, nil, secureErr
+		)
+		if err != nil {
+			return nil, nil, nil, nil, nil, err
 		}
-		catalogTLS = secure
-		nativeClient = gateway.TCPReplicatedClient{Dial: secure.Dial}
+		nativeClient = replicatedPool
 	}
 	replicated, err := gateway.NewReplicatedExecutor(nativeClient, attempts, attemptTimeout)
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(nil)
 	binding, err := gateway.NativeSessionJournalBinding(
@@ -402,20 +422,20 @@ func newReplicatedCatalogGateway(
 		[]byte{replicatedCatalogControllerTenant}, relation, serviceauthz.CapabilityTopology,
 	)
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	journal, err := gateway.OpenNativeSessionJournal(gateway.NativeSessionJournalOptions{
 		Path: journalPath, ClientID: clientID, RetryHome: retryHome,
 		MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
 	})
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{
 		Executor: replicated, Route: route, Distribution: string(distributionName), Shard: string(shardID),
@@ -426,17 +446,17 @@ func newReplicatedCatalogGateway(
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	authorizedContext, err := serviceauthz.WithAuthority(ctx, internalAuthority)
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	renewExisting := session.Status().Active
 	if session.Status().Pending {
@@ -465,33 +485,33 @@ func newReplicatedCatalogGateway(
 		}
 	}
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: replicated, Route: route, Relation: relation, Holder: holder, Session: session,
 		Authority: internalAuthority,
 	})
 	if err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	if _, err = authority.Read(ctx); err != nil {
-		if catalogTLS != nil {
-			_ = catalogTLS.Close()
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
 		}
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{
 			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
 		},
 	)
-	return executor, holder, authority, catalogTLS, nil
+	return executor, holder, authority, replicated, replicatedPool, nil
 }
 
 const replicatedCatalogControllerTenant = byte(1)
@@ -590,6 +610,16 @@ func runSplitController(
 // listener and drains in-flight connections. It returns nil on a signaled
 // shutdown and the accept error otherwise.
 func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor, logf func(string, ...any)) error {
+	return serveGatewayData(ctx, listener, exec, nil, logf)
+}
+
+func serveGatewayData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	logf func(string, ...any),
+) error {
 	startGatewayRecovery(ctx, exec, logf)
 	// Closing the listener when ctx is done unblocks a blocked Accept, so a
 	// signal shuts the loop down without a poll.
@@ -611,7 +641,7 @@ func serveGateway(ctx context.Context, listener net.Listener, exec *gateway.Exec
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(ctx, conn, exec, logf)
+			handleConnData(ctx, conn, exec, data, logf)
 		}()
 	}
 }
@@ -629,17 +659,34 @@ func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func
 
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
 	capability *gateway.ClientTLS, limits gateway.ClientTLSLimits, logf func(string, ...any)) error {
+	return serveAuthenticatedGatewayData(ctx, listener, exec, nil, capability, limits, logf)
+}
+
+func serveAuthenticatedGatewayData(
+	ctx context.Context,
+	listener net.Listener,
+	exec *gateway.Executor,
+	data nativeDataReader,
+	capability *gateway.ClientTLS,
+	limits gateway.ClientTLSLimits,
+	logf func(string, ...any),
+) error {
 	startGatewayRecovery(ctx, exec, logf)
 	return capability.ServeAuthorizedClients(ctx, listener, limits,
 		func(ctx context.Context, connection net.Conn) {
-			handleConnAuthorized(ctx, connection, exec, capability, logf)
+			handleConnAuthorizedData(ctx, connection, exec, data, capability, logf)
 		})
 }
 
 func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 	capability *gateway.ClientTLS, logf func(string, ...any)) {
-	handleConnPolicy(ctx, conn, exec, logf, func(request *serveRequest) bool {
-		return capability.Authorize(ctx, serveRequestCapability(request), nil) == serviceauthz.DecisionAllow
+	handleConnAuthorizedData(ctx, conn, exec, nil, capability, logf)
+}
+
+func handleConnAuthorizedData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	data nativeDataReader, capability *gateway.ClientTLS, logf func(string, ...any)) {
+	handleConnPolicy(ctx, conn, exec, data, logf, func(required serviceauthz.Capability) bool {
+		return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
 	})
 }
 
@@ -647,11 +694,16 @@ func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Exec
 // peer disconnects or the server shuts down. Closing the connection when ctx is
 // done unblocks a blocked decode so a signaled shutdown drains promptly.
 func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf func(string, ...any)) {
-	handleConnPolicy(ctx, conn, exec, logf, nil)
+	handleConnData(ctx, conn, exec, nil, logf)
+}
+
+func handleConnData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	data nativeDataReader, logf func(string, ...any)) {
+	handleConnPolicy(ctx, conn, exec, data, logf, nil)
 }
 
 func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor,
-	logf func(string, ...any), authorize func(*serveRequest) bool) {
+	data nativeDataReader, logf func(string, ...any), authorize func(serviceauthz.Capability) bool) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -660,14 +712,49 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	scanner.Buffer(make([]byte, 4096), maxServeRequestBytes)
 	writer := vibejson.NewWriter(conn)
 	for scanner.Scan() {
+		line := scanner.Bytes()
+		if nativeDataRequestCandidate(line) {
+			var request nativeDataWireRequest
+			if err := decodeNativeDataRequest(line, &request); err != nil {
+				response := nativeDataError(nativeDataResponseInvalidRequest, false)
+				if writeNativeDataResponse(writer, &response) != nil {
+					return
+				}
+				continue
+			}
+			required := serviceauthz.CapabilityDataRead
+			if request.Operation != nativeDataOperationGet {
+				required = serviceauthz.CapabilityDataWrite
+			}
+			if authorize != nil && !authorize(required) {
+				response := nativeDataError(nativeDataResponseUnauthorized, false)
+				if err := writeNativeDataResponse(writer, &response); err != nil {
+					return
+				}
+				continue
+			}
+			var response nativeDataWireResponse
+			if data == nil {
+				response = nativeDataError(nativeDataResponseUnavailable, true)
+			} else {
+				response = executeNativeDataRead(ctx, data, &request)
+			}
+			if err := writeNativeDataResponse(writer, &response); err != nil {
+				if ctx.Err() == nil {
+					logf("gateway: encode native response: %v", err)
+				}
+				return
+			}
+			continue
+		}
 		var req serveRequest
-		if err := vibejson.Unmarshal(scanner.Bytes(), &req); err != nil {
+		if err := vibejson.Unmarshal(line, &req); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: decode request: %v", err)
 			}
 			return
 		}
-		if authorize != nil && !authorize(&req) {
+		if authorize != nil && !authorize(serveRequestCapability(&req)) {
 			if err := writeServeResponse(writer, &serveResponse{Error: "authorization denied"}); err != nil {
 				return
 			}
@@ -683,6 +770,44 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		logf("gateway: decode request: %v", err)
 	}
+}
+
+func nativeDataRequestCandidate(source []byte) bool {
+	index := skipNativeJSONSpace(source, 0)
+	if index >= len(source) || source[index] != '{' {
+		return false
+	}
+	index = skipNativeJSONSpace(source, index+1)
+	if len(source)-index < len(`"op"`) ||
+		!bytes.Equal(source[index:index+len(`"op"`)], []byte(`"op"`)) {
+		return false
+	}
+	index = skipNativeJSONSpace(source, index+len(`"op"`))
+	if index >= len(source) || source[index] != ':' {
+		return false
+	}
+	index = skipNativeJSONSpace(source, index+1)
+	for _, operation := range [...]string{`"get"`, `"put"`, `"delete"`} {
+		if len(source)-index < len(operation) ||
+			!bytes.Equal(source[index:index+len(operation)], []byte(operation)) {
+			continue
+		}
+		next := skipNativeJSONSpace(source, index+len(operation))
+		return next < len(source) && source[next] == ','
+	}
+	return false
+}
+
+func skipNativeJSONSpace(source []byte, index int) int {
+	for index < len(source) {
+		switch source[index] {
+		case ' ', '\t', '\r', '\n':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
 }
 
 func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
