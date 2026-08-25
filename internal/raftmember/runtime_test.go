@@ -282,6 +282,12 @@ func TestAdoptStagedRuntimeResumesExactPristineIncarnationOnly(t *testing.T) {
 	if err != nil || retried.Identity().NodeIncarnation != 1 || reopenedWAL.CurrentIncarnation() != 1 {
 		t.Fatalf("exact staged retry=%v incarnation=%d err=%v", retried, reopenedWAL.CurrentIncarnation(), err)
 	}
+	// A merely observed empty Ready is deliberately not a durable WAL event.
+	// Campaign first so this retry persists real HardState/log progress; the
+	// next process must then reject staged adoption at the consumed target.
+	if err = retried.Campaign(); err != nil {
+		t.Fatal(err)
+	}
 	drainRuntime(t, retried, nil)
 	if err = retried.Close(); err != nil {
 		t.Fatal(err)
@@ -291,12 +297,19 @@ func TestAdoptStagedRuntimeResumesExactPristineIncarnationOnly(t *testing.T) {
 	if got, retryErr := AdoptStagedRuntime(reopenedWAL, reopenedDB, reopenedApply, 1); got != nil || retryErr == nil {
 		t.Fatalf("persisted-Ready staged retry=%v err=%v", got, retryErr)
 	}
-	if reopenedWAL.CurrentIncarnation() != 1 {
-		t.Fatalf("rejected retry leaked incarnation %d", reopenedWAL.CurrentIncarnation())
+	// Failed adoption owns and closes all three handles. Reopen the WAL to prove
+	// the rejection neither reminted nor otherwise changed the durable target.
+	proofWAL, err := raftstore.Open(walPath, identity,
+		testTopologyRecoveryEpoch, testWALKey(), options)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_ = reopenedApply.Close()
-	_ = reopenedDB.Close()
-	_ = reopenedWAL.Close()
+	if proofWAL.CurrentIncarnation() != 1 {
+		t.Fatalf("rejected retry changed durable incarnation %d", proofWAL.CurrentIncarnation())
+	}
+	if err = proofWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRuntimeCampaignProposalAndReadyOrdering(t *testing.T) {

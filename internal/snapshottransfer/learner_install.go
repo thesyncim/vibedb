@@ -156,25 +156,37 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	if err != nil {
 		return raftmember.RuntimeIdentity{}, err
 	}
-	stage, _, err := plan.Database.OpenReplicatedSnapshotStage(
-		plan.SQLIdentity, manifest, cursor, plan.ApplyOptions, plan.StageOptions,
-	)
-	if err != nil {
-		return raftmember.RuntimeIdentity{}, err
+	var activation sqldriver.ReplicatedChildActivation
+	resumed := false
+	if len(cursor) != 0 {
+		activation, resumed, err = plan.Database.ResumeReplicatedSnapshotActivation(
+			plan.SQLIdentity, manifest, plan.StaticBootstrap, plan.ApplyOptions,
+		)
+		if err != nil {
+			return raftmember.RuntimeIdentity{}, err
+		}
 	}
-	plan.Settlement.stage = stage
-	artifact, err := plan.Repository.OpenPublished(plan.Descriptor, stage.Offset())
-	if err != nil {
-		return raftmember.RuntimeIdentity{}, err
-	}
-	_, receiveErr := stage.Receive(artifact, plan.Cursor.Persist)
-	closeErr := artifact.Close()
-	if receiveErr != nil || closeErr != nil {
-		return raftmember.RuntimeIdentity{}, errors.Join(receiveErr, closeErr)
-	}
-	activation, err := stage.Activate(plan.StaticBootstrap)
-	if err != nil {
-		return raftmember.RuntimeIdentity{}, err
+	if !resumed {
+		stage, _, stageErr := plan.Database.OpenReplicatedSnapshotStage(
+			plan.SQLIdentity, manifest, cursor, plan.ApplyOptions, plan.StageOptions,
+		)
+		if stageErr != nil {
+			return raftmember.RuntimeIdentity{}, stageErr
+		}
+		plan.Settlement.stage = stage
+		artifact, openErr := plan.Repository.OpenPublished(plan.Descriptor, stage.Offset())
+		if openErr != nil {
+			return raftmember.RuntimeIdentity{}, openErr
+		}
+		_, receiveErr := stage.Receive(artifact, plan.Cursor.Persist)
+		closeErr := artifact.Close()
+		if receiveErr != nil || closeErr != nil {
+			return raftmember.RuntimeIdentity{}, errors.Join(receiveErr, closeErr)
+		}
+		activation, err = stage.Activate(plan.StaticBootstrap)
+		if err != nil {
+			return raftmember.RuntimeIdentity{}, err
+		}
 	}
 	plan.Settlement.stage = nil
 	plan.Settlement.apply = activation.Apply

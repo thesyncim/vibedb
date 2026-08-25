@@ -3,6 +3,7 @@ package driver
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -36,6 +37,134 @@ func replicatedSnapshotStageFault(point replicatedSnapshotStageFaultPoint) error
 	return replicatedSnapshotStageFaultHook(point)
 }
 
+// ResumeReplicatedSnapshotActivation reclaims an already-certified snapshot
+// activation after process restart. resumed is false only while no complete
+// snapshot-base transition exists, in which case the caller must resume the
+// artifact stage. A completed but non-matching transition fails closed.
+func (d *Database) ResumeReplicatedSnapshotActivation(
+	expected ReplicatedShardStoreIdentity,
+	manifest replicatedstate.SnapshotArtifactManifest,
+	staticBootstrap *pb.Snapshot,
+	applyOptions ReplicatedApplyOptions,
+) (activation ReplicatedChildActivation, resumed bool, err error) {
+	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
+		return activation, false, err
+	}
+	if err := validateReplicatedApplyOptions(expected, applyOptions); err != nil {
+		return activation, false, err
+	}
+	if d == nil || d.connector == nil {
+		return activation, false, ErrDatabaseClosed
+	}
+	connector := d.connector
+	connector.mu.Lock()
+	defer connector.mu.Unlock()
+	if connector.closed || connector.db == nil || connector.refs != 0 || connector.exclusive {
+		return activation, false, ErrReplicatedSnapshotStageBusy
+	}
+	core := connector.db
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if core.closed || core.replicatedApplyClaim != nil || core.replicatedChildStageClaim != nil ||
+		core.replicatedSnapshotStageClaim != nil {
+		return activation, false, ErrReplicatedSnapshotStageBusy
+	}
+	if core.checkpointGroup == nil {
+		return activation, false, nil
+	}
+	seedApplied, seeded := core.checkpointGroup.SeedAppliedIndex()
+	if !seeded || seedApplied != manifest.State.Applied {
+		return activation, false, fmt.Errorf(
+			"%w: durable seed cut %d/%d seeded=%v",
+			ErrReplicatedSnapshotStageProof, seedApplied, manifest.State.Applied, seeded,
+		)
+	}
+	if core.checkpointGroup.SeedActivationPending() {
+		return activation, false, nil
+	}
+	if core.catalog.ReplicatedShardStore == nil ||
+		!core.catalog.ReplicatedShardStore.Equal(expected) ||
+		core.catalog.ReplicatedApply == nil || manifest.State.Binding != replicatedStateBinding(expected) ||
+		!bytes.Equal(manifest.UserCollection, []byte(expected.UserTable)) {
+		return activation, false, fmt.Errorf("%w: durable activation identity", ErrReplicatedSnapshotStageProof)
+	}
+	if err := core.settleCatalogLocked(); err != nil {
+		return activation, false, err
+	}
+	table := core.tables[expected.UserTable]
+	if table == nil || table.collection == nil || core.replicatedApplyCollection == nil {
+		return activation, false, fmt.Errorf("%w: durable activation collections", ErrReplicatedSnapshotStageProof)
+	}
+	identity, err := core.prepareReplicatedApplyStorageLocked(expected, applyOptions, nil)
+	if err != nil {
+		return activation, false, err
+	}
+	snapshotBase, err := replicatedstate.BuildSnapshotBase(manifest, staticBootstrap)
+	if err != nil {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	certificate, err := replicatedstate.OpenSnapshotBase(snapshotBase)
+	if err != nil {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	claim := &ReplicatedApply{owner: connector, database: core, table: table,
+		identity: identity, exclusiveConnector: true}
+	machine, err := replicatedstate.Open(
+		replicatedStateBinding(expected), staticBootstrap,
+		replicatedstate.CollectionTarget{Collection: core.replicatedApplyCollection,
+			Validation: replicatedstate.ValidationOpaqueBinary,
+			Limits:     replicatedStateCollectionLimits(identity.SystemLimits)},
+		replicatedstate.UserCollection{Name: expected.UserTable, Target: replicatedstate.CollectionTarget{
+			Collection: table.collection, Validation: replicatedstate.ValidationDeterministicMutation,
+			ValidationDigest:       identity.ValidationDigest,
+			Validator:              newReplicatedSQLMutationValidator(expected, table, identity.Placement),
+			ObserveMutationAttempt: claim.observeMutationAttempt,
+			Limits:                 replicatedStateCollectionLimits(expected.UserLimits),
+		}}, core.txnLog, replicatedstate.Options{
+			TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
+			RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+		},
+	)
+	if err != nil {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	cut, err := machine.Snapshot(expected.UserTable)
+	if err != nil {
+		return activation, false, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	}
+	current, writeErr := replicatedstate.WriteSnapshotArtifact(io.Discard, cut,
+		replicatedstate.SnapshotArtifactOptions{TargetChunkBytes: int(manifest.TargetChunkBytes)})
+	closeErr := cut.Close()
+	currentState := current.State
+	if currentState.SnapshotBaseDigest != certificate.Digest {
+		return activation, false, errors.Join(
+			fmt.Errorf("%w: durable snapshot-base digest", ErrReplicatedSnapshotStageProof),
+			writeErr, closeErr,
+		)
+	}
+	currentState.SnapshotBaseDigest = manifest.State.SnapshotBaseDigest
+	currentEnvelope, currentErr := replicatedstate.AppendState(nil, currentState)
+	expectedEnvelope, expectedErr := replicatedstate.AppendState(nil, manifest.State)
+	if writeErr != nil || closeErr != nil || currentErr != nil || expectedErr != nil ||
+		!bytes.Equal(currentEnvelope, expectedEnvelope) ||
+		!bytes.Equal(current.UserCollection, manifest.UserCollection) ||
+		current.ImageDigest != manifest.ImageDigest || current.SystemRows != manifest.SystemRows ||
+		current.UserRows != manifest.UserRows {
+		return activation, false, errors.Join(
+			fmt.Errorf("%w: durable activation image", ErrReplicatedSnapshotStageProof),
+			writeErr, closeErr, currentErr, expectedErr,
+		)
+	}
+	claim.machine = machine
+	claim.activationBasePending = certificate.Digest
+	core.replicatedApplyClaim = claim
+	core.replicatedSeedPending = true
+	connector.exclusive = true
+	connector.refs++
+	return ReplicatedChildActivation{Apply: claim, ApplyIdentity: identity,
+		SnapshotBase: snapshotBase, ArtifactManifest: ownedReplicatedSnapshotManifest(manifest)}, true, nil
+}
+
 // ReplicatedSnapshotStage is the exclusive non-serving owner of an empty
 // replica while one authenticated snapshot artifact is written directly into
 // its final hidden and user collections. Artifact memory is bounded by the
@@ -43,21 +172,22 @@ func replicatedSnapshotStageFault(point replicatedSnapshotStageFaultPoint) error
 type ReplicatedSnapshotStage struct {
 	mu sync.Mutex
 
-	owner           *dbConnector
-	database        *database
-	table           *table
-	base            ReplicatedShardStoreIdentity
-	identity        ReplicatedApplyIdentity
-	expected        replicatedstate.SnapshotArtifactManifest
-	stage           *replicatedstate.SnapshotArtifactStage
-	candidateProved bool
-	seedEnvelope    []byte
-	seedKey         []byte
-	claim           *ReplicatedApply
-	machine         *replicatedstate.Machine
-	snapshotBase    *pb.Snapshot
-	activation      ReplicatedChildActivation
-	closed          bool
+	owner             *dbConnector
+	database          *database
+	table             *table
+	base              ReplicatedShardStoreIdentity
+	identity          ReplicatedApplyIdentity
+	expected          replicatedstate.SnapshotArtifactManifest
+	stage             *replicatedstate.SnapshotArtifactStage
+	candidateProved   bool
+	seedEnvelope      []byte
+	seedKey           []byte
+	claim             *ReplicatedApply
+	machine           *replicatedstate.Machine
+	snapshotInstalled bool
+	snapshotBase      *pb.Snapshot
+	activation        ReplicatedChildActivation
+	closed            bool
 }
 
 // OpenReplicatedSnapshotStage creates or resumes the sole non-serving snapshot
@@ -127,10 +257,17 @@ func (d *Database) OpenReplicatedSnapshotStage(
 			{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
 			{Name: expected.UserTable, Collection: t.collection},
 		}
-		if cursorErr != nil || cursor.Offset() != manifest.EncodedBytes ||
-			!core.checkpointGroup.Owns(members) {
+		offset := cursor.Offset()
+		owns := core.checkpointGroup.Owns(members)
+		footerOffset, footerBound := uint64(0), manifest.EncodedBytes >= replicatedstate.SnapshotArtifactFooterBytes
+		if footerBound {
+			footerOffset = manifest.EncodedBytes - replicatedstate.SnapshotArtifactFooterBytes
+		}
+		if !footerBound || cursorErr != nil || offset != footerOffset || !owns {
 			return nil, ReplicatedApplyIdentity{}, errors.Join(
-				ErrReplicatedSnapshotStageProof, cursorErr,
+				fmt.Errorf("%w: resumed cursor %d/%d group-owned=%v",
+					ErrReplicatedSnapshotStageProof, offset, manifest.EncodedBytes, owns),
+				cursorErr,
 			)
 		}
 	}
@@ -297,11 +434,13 @@ func (s *ReplicatedSnapshotStage) Activate(
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
 	}
-	if err = core.checkpointGroup.Seed(seed, members[0], s.identity.TxnLimits, s.seedKey); err != nil {
-		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
-	}
-	if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSeed); err != nil {
-		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+	if !s.snapshotInstalled && core.checkpointGroup.SeedActivationPending() {
+		if err = core.checkpointGroup.Seed(seed, members[0], s.identity.TxnLimits, s.seedKey); err != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+		}
+		if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSeed); err != nil {
+			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
+		}
 	}
 	if s.claim == nil {
 		s.claim = &ReplicatedApply{owner: connector, database: core, table: s.table,
@@ -340,6 +479,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 		publication.ReplicaSetVersion != s.expected.State.ReplicaSetVersion {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
+	s.snapshotInstalled = true
 	if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSnapshotInstall); err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -185,6 +186,7 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if err != nil || completion.ClientEpoch == 0 {
 		t.Fatalf("session completion=%+v err=%v", completion, err)
 	}
+	sourceSessionCompletion := bytes.Clone(lookup.Bytes)
 	keyBytes, ok := orderedkey.AppendJSONString(nil, []byte(`"doc-1"`), orderedkey.Ascending)
 	if !ok {
 		t.Fatal("encode document key")
@@ -263,9 +265,12 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	walOptions := raftstore.Options{MaxFileBytes: 160 << 20,
 		MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 1024,
 		MaxEntries: 8192, MaxLiveBytes: raftstore.MinimumReadyLiveBytes}
-	hostLimits := multiraft.Limits{MaxGroups: 2, MaxQueueItems: 8, MaxQueueBytes: 8 << 20,
-		MaxGroupItems: 4, MaxGroupBytes: 4 << 20, MaxOutboxItems: 8,
-		MaxOutboxBytes: 4 << 20, MaxPendingTicks: 4}
+	hostLimits := multiraft.Limits{
+		MaxGroups: 2, MaxQueueItems: 8, MaxQueueBytes: raftmodel.MaxInboundMessageBytes,
+		MaxGroupItems: 4, MaxGroupBytes: raftmodel.MaxInboundMessageBytes,
+		MaxOutboxItems: 8, MaxOutboxBytes: raftmodel.MaxInboundMessageBytes,
+		MaxPendingTicks: 4,
+	}
 	rejectedHost, err := multiraft.NewHost(hostLimits)
 	if err != nil {
 		t.Fatal(err)
@@ -322,19 +327,36 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 		!bytes.Equal(targetCompletion.Bytes, sourceCompletion) {
 		t.Fatalf("target completion=%x err=%v", targetCompletion.Bytes, err)
 	}
+	if targetSession, err := reopenedApply.LookupCompletion(sessionCommand); err != nil ||
+		!bytes.Equal(targetSession.Bytes, sourceSessionCompletion) {
+		t.Fatalf("target session completion=%x err=%v", targetSession.Bytes, err)
+	}
+	read, err := reopenedApply.PointReadInto(
+		1, keyBytes, manifest.State.Applied,
+		targetIdentity.Relations[0].Limits.MaxDocumentBytes, nil,
+	)
+	if err != nil || !read.Found || !bytes.Equal(read.Value, document) {
+		t.Fatalf("target document=%q found=%v err=%v", read.Value, read.Found, err)
+	}
 	targetCut, err := reopenedApply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var targetArtifact bytes.Buffer
-	targetManifest, err := replicatedstate.WriteSnapshotArtifact(&targetArtifact, targetCut,
+	targetManifest, err := replicatedstate.WriteSnapshotArtifact(io.Discard, targetCut,
 		replicatedstate.SnapshotArtifactOptions{TargetChunkBytes: MinChunkBytes})
 	err = errors.Join(err, targetCut.Close(), reopenedApply.Close(), reopened.Close())
 	if err != nil || targetManifest.ImageDigest != manifest.ImageDigest ||
-		targetManifest.UserRows != 1 || !bytes.Equal(targetArtifact.Bytes(), payload) {
-		t.Fatalf("target snapshot rows=%d digest=%x/%x bytes-equal=%v err=%v",
+		targetManifest.UserRows != 1 ||
+		targetManifest.State.Applied != manifest.State.Applied ||
+		targetManifest.State.DataChainDigest != manifest.State.DataChainDigest ||
+		targetManifest.State.LastEntryDigest != manifest.State.LastEntryDigest ||
+		targetManifest.State.SessionCount != manifest.State.SessionCount ||
+		targetManifest.State.SessionSlotCount != manifest.State.SessionSlotCount ||
+		targetManifest.State.LastKind != manifest.State.LastKind ||
+		targetManifest.State.SnapshotBaseDigest == manifest.State.SnapshotBaseDigest {
+		t.Fatalf("target snapshot rows=%d digest=%x/%x state=%+v err=%v",
 			targetManifest.UserRows, targetManifest.ImageDigest, manifest.ImageDigest,
-			bytes.Equal(targetArtifact.Bytes(), payload), err)
+			targetManifest.State, err)
 	}
 	reopened, _, err = sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
 		targetPath, targetIdentity, options,
