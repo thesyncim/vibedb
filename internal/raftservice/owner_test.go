@@ -346,9 +346,9 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 	defer host.Close()
 	identity := raftmember.RuntimeIdentity{
 		Group: peerServerTestGroup(), AllocationGeneration: 1, MemberID: 1,
-		StoreID: [16]byte{1}, NodeIncarnation: 1,
+		StoreID: [16]byte{1}, NodeIncarnation: 1, RelationManifestDigest: [32]byte{1},
 	}
-	owner, err := NewOwner(Options{
+	options := Options{
 		Registry: registry, Host: host, Members: []raftmember.RuntimeIdentity{identity},
 		CommandFences: []CommandFence{{
 			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
@@ -362,7 +362,14 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 			MaxPendingReadItems: 1, MaxPendingReadBytes: 1,
 			MaxPendingOutboundBytes: 1,
 		},
-	})
+	}
+	mismatched := options
+	mismatched.Members = append([]raftmember.RuntimeIdentity(nil), options.Members...)
+	mismatched.Members[0].RelationManifestDigest[0] ^= 1
+	if owner, err := NewOwner(mismatched); owner != nil || !errors.Is(err, ErrInvalidOwner) {
+		t.Fatalf("owner accepted storage-bound or cross-machine manifest = %v, %v", owner, err)
+	}
+	owner, err := NewOwner(options)
 	if err != nil {
 		t.Fatal(err)
 	}

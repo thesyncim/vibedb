@@ -33,6 +33,18 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	for index := range voters {
 		runtimes[index], bases[index], readSources[index] = newRF3Runtime(t, uint64(index+1))
 	}
+	portableManifest := runtimes[0].Identity().RelationManifestDigest
+	for index := 1; index < voters; index++ {
+		if bases[index].RelationManifestDigest == bases[0].RelationManifestDigest {
+			t.Fatal("independent replicas unexpectedly retained one local catalog manifest")
+		}
+		if runtimes[index].Identity().RelationManifestDigest != portableManifest {
+			t.Fatalf(
+				"replica %d portable manifest = %x, want %x",
+				index+1, runtimes[index].Identity().RelationManifestDigest, portableManifest,
+			)
+		}
+	}
 	group := runtimes[0].Identity().Group
 
 	members := make([]rafttransport.Member, voters)
@@ -122,7 +134,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 			Owner: Options{
 				Registry: serving, Host: host,
 				Members:       []raftmember.RuntimeIdentity{runtimes[index].Identity()},
-				CommandFences: []CommandFence{rf3CommandFence(bases[index])},
+				CommandFences: []CommandFence{rf3CommandFence(runtimes[index].Identity(), bases[index])},
 				ReadSources:   []ReadSource{readSources[index]},
 				Pulse:         pulses[index],
 				Limits: Limits{MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
@@ -324,13 +336,16 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 }
 
-func rf3CommandFence(base sqldriver.ReplicatedShardStoreIdentity) CommandFence {
+func rf3CommandFence(
+	runtime raftmember.RuntimeIdentity,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) CommandFence {
 	authority := base.Binding.Authority
 	return CommandFence{
 		ReplicaSetVersion: 1, ActivePolicyGeneration: authority.ActivePolicyGeneration,
 		ProtectionEpoch: authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
 		SchemaGeneration:       authority.SchemaGeneration,
-		RelationManifestDigest: base.RelationManifestDigest,
+		RelationManifestDigest: runtime.RelationManifestDigest,
 		RoutingVersion:         authority.RoutingVersion,
 		RouteGeneration:        authority.RouteGeneration,
 	}

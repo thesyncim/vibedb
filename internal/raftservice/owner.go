@@ -366,10 +366,12 @@ func NewOwner(options Options) (*Owner, error) {
 			return nil, ErrInvalidOwner
 		}
 		if identity.AllocationGeneration == 0 || identity.MemberID == 0 ||
-			identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 {
+			identity.StoreID == ([16]byte{}) || identity.NodeIncarnation == 0 ||
+			identity.RelationManifestDigest == ([32]byte{}) {
 			return nil, ErrInvalidOwner
 		}
-		if !options.CommandFences[index].Valid() {
+		if !options.CommandFences[index].Valid() ||
+			options.CommandFences[index].RelationManifestDigest != identity.RelationManifestDigest {
 			return nil, ErrInvalidOwner
 		}
 		if _, duplicate := seen[group]; duplicate {
