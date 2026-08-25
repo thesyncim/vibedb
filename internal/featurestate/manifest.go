@@ -154,8 +154,8 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusYes, "vibedb-shard serve-rf3 opens one externally prepared stable three-voter group, constructs its bounded Multi-Raft host and authenticated peer transport, and serves the authenticated native endpoint.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "An internal three-process gate proves follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. It does not invoke the shipped command and does not cover every quorum/apply cut, natural election, membership change, or snapshot bootstrap.", []Reference{
-			ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
+		Qualification: Stage{StatusPartial, "A shipped-composition three-process gate proves retained-state opening, mutual TLS, natural election, authenticated reads, and clean process shutdown. Internal fault gates additionally prove follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. Every quorum/apply cut, membership change, and snapshot bootstrap remain unqualified.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
 		}},
 	},
 	{

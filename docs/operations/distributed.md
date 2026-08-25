@@ -206,9 +206,12 @@ principal on every request.
 This command is a fixed-RF3 serving boundary, not cluster lifecycle control.
 It provides no artifact preparation, copied-store revocation, membership
 changes, snapshot transfer or installation, repair, or automatic catalog
-publication. The existing internal three-process recovery tests exercise the
-same composition primitives, but they do not invoke this command and are not a
-shipped-command fault gate.
+publication. A three-process command-composition gate opens prepared retained
+state through this serving path, forms a natural election over mutually
+authenticated peer traffic, probes every authenticated native endpoint, and
+requires clean process shutdown. Deeper fault gates still live below the
+command boundary; membership and snapshot lifecycle qualification remain
+separate work.
 
 ## Validate and inspect the gateway catalog
 
