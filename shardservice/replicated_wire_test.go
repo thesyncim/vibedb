@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,6 +106,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
 		{Operation: ReplicatedPropose, Fence: fence, Command: command},
+		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
+		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
 		if err := EncodeReplicatedRequest(&encoded, request); err != nil {
@@ -120,7 +127,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 			t.Fatal(err)
 		}
 		if decoded.Operation != request.Operation || decoded.Fence != request.Fence ||
-			!bytes.Equal(decoded.Command, request.Command) {
+			!bytes.Equal(decoded.Command, request.Command) ||
+			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+			decoded.MinimumApplied != request.MinimumApplied ||
+			decoded.MaxValueBytes != request.MaxValueBytes {
 			t.Fatalf("request round trip = %+v", decoded)
 		}
 		if len(decoded.Command) != 0 && cap(decoded.Command) != len(decoded.Command) {
@@ -142,6 +152,10 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		{Kind: ReplicatedNotLeader, HasState: true, State: state},
 		{Kind: ReplicatedOutcomeUnknown, HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalProposalRefused,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
 			HasState: true, State: state},
 		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalDeterministic,
 			HasState: true, State: state, Outcome: raftserve.Outcome{
@@ -226,18 +240,160 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 	}
 }
 
+func TestReplicatedPointReadWirePreservesFoundEmptyAndMiss(t *testing.T) {
+	fence := testReplicatedFence()
+	request := &ReplicatedRequest{
+		Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+		Key: []byte{0, 1, 2}, MinimumApplied: 17, MaxValueBytes: 4096,
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil || decoded.Operation != request.Operation || decoded.Fence != fence ||
+		decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
+		decoded.MinimumApplied != request.MinimumApplied || decoded.MaxValueBytes != request.MaxValueBytes {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+	state := ReplicatedMemberState{Fence: fence, LeaderID: 9, Commit: 21, Applied: 20,
+		CheckpointApplied: 19}
+	for _, response := range []*ReplicatedResponse{
+		{Kind: ReplicatedReadFound, HasState: true, State: state, ReadApplied: 20, Value: []byte{}},
+		{Kind: ReplicatedReadMissing, HasState: true, State: state, ReadApplied: 20},
+	} {
+		encoded.Reset()
+		if err := EncodeReplicatedResponse(&encoded, response); err != nil {
+			t.Fatal(err)
+		}
+		got, decodeErr := DecodeReplicatedResponse(bytes.NewReader(encoded.Bytes()))
+		if decodeErr != nil || got.Kind != response.Kind || got.ReadApplied != 20 || len(got.Value) != 0 {
+			t.Fatalf("response=%+v err=%v", got, decodeErr)
+		}
+	}
+}
+
+func TestReplicatedResponseRequestBoundRejectsOversizeHeaderBeforeAllocation(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
+		Fence: testReplicatedFence(), Relation: 1, Key: []byte("k"),
+		MinimumApplied: 1, MaxValueBytes: 32}
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := request.Fence
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: bytes.Repeat([]byte{1}, 32)}
+	var exact bytes.Buffer
+	if err := EncodeReplicatedResponse(&exact, response); err != nil {
+		t.Fatal(err)
+	}
+	if bodyBytes := exact.Len() - 5; bodyBytes != maximum {
+		t.Fatalf("exact response body=%d, request ceiling=%d", bodyBytes, maximum)
+	}
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(exact.Bytes()), maximum); err != nil {
+		t.Fatalf("exact bounded response: %v", err)
+	}
+	response.Value = append(response.Value, 2)
+	var oversized bytes.Buffer
+	if err := EncodeReplicatedResponse(&oversized, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeReplicatedResponseLimit(bytes.NewReader(oversized.Bytes()), maximum); !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("oversized valid response error=%v", err)
+	}
+	var header [5]byte
+	header[0] = tagReplicatedResponse
+	binary.BigEndian.PutUint32(header[1:], uint32(maximum+1+4))
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := decodeReplicatedResponseLimit(bytes.NewReader(header[:]), maximum); !errors.Is(err, errFrameTooLarge) {
+			panic(err)
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("oversize header control path allocated %.2f times", allocs)
+	}
+	var wait sync.WaitGroup
+	wait.Add(32)
+	for range 32 {
+		go func() {
+			defer wait.Done()
+			if _, err := decodeReplicatedResponseLimit(bytes.NewReader(header[:]), maximum); !errors.Is(err, errFrameTooLarge) {
+				t.Errorf("concurrent oversize error=%v", err)
+			}
+		}()
+	}
+	wait.Wait()
+}
+
+func BenchmarkEncodeReplicatedLargePointRead(b *testing.B) {
+	fence := testReplicatedFence()
+	value := bytes.Repeat([]byte{7}, replication.MaxMutationValueBytes)
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: value}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(value)))
+	for b.Loop() {
+		if err := EncodeReplicatedResponse(io.Discard, response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeReplicatedLargePointRead(b *testing.B) {
+	fence := testReplicatedFence()
+	response := &ReplicatedResponse{Kind: ReplicatedReadFound, HasState: true,
+		State: ReplicatedMemberState{Fence: fence, LeaderID: fence.MemberID,
+			Commit: 9, Applied: 9, CheckpointApplied: 8},
+		ReadApplied: 9, Value: bytes.Repeat([]byte{7}, replication.MaxMutationValueBytes)}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedResponse(&encoded, response); err != nil {
+		b.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower, Fence: fence,
+		Relation: 1, Key: []byte("k"), MinimumApplied: 1,
+		MaxValueBytes: replication.MaxMutationValueBytes}
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(replication.MaxMutationValueBytes)
+	b.ResetTimer()
+	for b.Loop() {
+		decoded, err := decodeReplicatedResponseLimit(bytes.NewReader(encoded.Bytes()), maximum)
+		if err != nil || len(decoded.Value) != replication.MaxMutationValueBytes {
+			b.Fatal(err)
+		}
+	}
+}
+
 func FuzzReplicatedNativeRequestCanonical(f *testing.F) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(f, fence)
-	var seed bytes.Buffer
-	if err := EncodeReplicatedRequest(&seed, &ReplicatedRequest{
-		Operation: ReplicatedPropose, Fence: fence, Command: command,
-	}); err != nil {
-		f.Fatal(err)
+	for _, request := range []*ReplicatedRequest{
+		{Operation: ReplicatedPropose, Fence: fence, Command: command},
+		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
+		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
+	} {
+		var seed bytes.Buffer
+		if err := EncodeReplicatedRequest(&seed, request); err != nil {
+			f.Fatal(err)
+		}
+		f.Add(seed.Bytes())
 	}
-	f.Add(seed.Bytes())
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > 1<<20 {
+		// DecodeReplicatedRequest consumes one frame from a persistent stream;
+		// trailing bytes may be the next request. Canonical uniqueness therefore
+		// applies only when the corpus item contains exactly one complete frame.
+		if len(data) < 5 || len(data) > 1<<20 ||
+			uint64(binary.BigEndian.Uint32(data[1:5]))+1 != uint64(len(data)) {
 			return
 		}
 		request, err := DecodeReplicatedRequest(bytes.NewReader(data))
@@ -261,17 +417,27 @@ func FuzzReplicatedNativeResponseCanonical(f *testing.F) {
 		CheckpointApplied: 7,
 	}
 	completion := testReplicatedCompletion(f, fence, 2)
-	var seed bytes.Buffer
-	if err := EncodeReplicatedResponse(&seed, &ReplicatedResponse{
-		Kind: ReplicatedCompletion, HasState: true, State: state,
-		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
-			AppliedIndex: 8, CompletionAppliedSequence: 2,
-			CompletionBytes: len(completion)},
-		Completion: completion,
-	}); err != nil {
-		f.Fatal(err)
+	for _, response := range []*ReplicatedResponse{
+		{Kind: ReplicatedCompletion, HasState: true, State: state,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion,
+				AppliedIndex: 8, CompletionAppliedSequence: 2,
+				CompletionBytes: len(completion)},
+			Completion: completion},
+		{Kind: ReplicatedReadFound, HasState: true, State: state,
+			ReadApplied: 8, Value: []byte{0, 1, 2}},
+		{Kind: ReplicatedReadMissing, HasState: true, State: state,
+			ReadApplied: 8},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
+			HasState: true, State: state},
+		{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBufferBound,
+			HasState: true, State: state},
+	} {
+		var seed bytes.Buffer
+		if err := EncodeReplicatedResponse(&seed, response); err != nil {
+			f.Fatal(err)
+		}
+		f.Add(seed.Bytes())
 	}
-	f.Add(seed.Bytes())
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 1<<20 {
 			return

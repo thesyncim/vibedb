@@ -9,7 +9,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -312,7 +311,7 @@ func TestRF3NativeServingProcessHelper(t *testing.T) {
 	commands := make(chan byte, 1)
 	controlErrors := make(chan error, 1)
 	go readProcessControl(control, commands, controlErrors)
-	sendStatus("R")
+	sendStatus("R %x", runtime.Identity().RelationManifestDigest)
 
 	running := true
 	peerReturned := false
@@ -433,7 +432,7 @@ func startProcessRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	cluster := &processRF3Cluster{commandFence: processCommandFence()}
+	cluster := &processRF3Cluster{}
 	t.Cleanup(func() { cluster.close(t) })
 
 	peerListeners := make([]*net.TCPListener, processVoters)
@@ -551,7 +550,33 @@ func startProcessRF3Cluster(t testing.TB) (*processRF3Cluster, error) {
 			)
 		}
 		switch {
-		case line == "R":
+		case strings.HasPrefix(line, "R "):
+			encoded := line[2:]
+			var digest [32]byte
+			if len(encoded) != hex.EncodedLen(len(digest)) {
+				return cluster, fmt.Errorf(
+					"member %d readiness manifest length = %d", child.member, len(encoded),
+				)
+			}
+			decoded, decodeErr := hex.Decode(digest[:], []byte(encoded))
+			if decodeErr != nil {
+				return cluster, fmt.Errorf(
+					"member %d readiness manifest: %w", child.member, decodeErr,
+				)
+			}
+			if decoded != len(digest) || digest == ([32]byte{}) {
+				return cluster, fmt.Errorf(
+					"member %d readiness manifest is incomplete", child.member,
+				)
+			}
+			fence := processCommandFence(digest)
+			if cluster.commandFence == (raftservice.CommandFence{}) {
+				cluster.commandFence = fence
+			} else if cluster.commandFence != fence {
+				return cluster, fmt.Errorf(
+					"member %d advertised another portable relation manifest", child.member,
+				)
+			}
 		case strings.HasPrefix(line, "S "):
 			return cluster, fmt.Errorf("%w: %s", errProcessStrictAllocation, line[2:])
 		default:
@@ -1301,12 +1326,15 @@ func buildProcessPeer(
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Owner: raftservice.Options{
 			Registry: serving, Host: host,
-			Members:       []raftmember.RuntimeIdentity{runtime.Identity()},
-			CommandFences: []raftservice.CommandFence{processCommandFenceFromBase(base)},
-			Pulse:         pulse,
+			Members: []raftmember.RuntimeIdentity{runtime.Identity()},
+			CommandFences: []raftservice.CommandFence{
+				processCommandFenceFromRuntime(runtime.Identity(), base),
+			},
+			Pulse: pulse,
 			Limits: raftservice.Limits{
 				MaxIngressItems: 128, MaxIngressBytes: 64 << 20,
 				MaxPendingProposalItems: 64, MaxPendingProposalBytes: 64 << 20,
+				MaxPendingReadItems: 64, MaxPendingReadBytes: 64 << 20,
 				MaxPendingOutboundBytes: 64 << 20,
 			},
 		},
@@ -1520,20 +1548,23 @@ func processAuthority() sqldriver.ReplicatedAuthorityProfile {
 	}
 }
 
-func processCommandFence() raftservice.CommandFence {
+func processCommandFence(manifest [32]byte) raftservice.CommandFence {
 	authority := processAuthority()
 	return raftservice.CommandFence{
 		ReplicaSetVersion:      1,
 		ActivePolicyGeneration: authority.ActivePolicyGeneration,
 		ProtectionEpoch:        authority.ProtectionEpoch, OwnershipEpoch: authority.OwnershipEpoch,
 		SchemaGeneration:       authority.SchemaGeneration,
-		RelationManifestDigest: sha256.Sum256([]byte("rf3-process-test-portable-logical-relation-manifest")),
+		RelationManifestDigest: manifest,
 		RoutingVersion:         authority.RoutingVersion, RouteGeneration: authority.RouteGeneration,
 	}
 }
 
-func processCommandFenceFromBase(base sqldriver.ReplicatedShardStoreIdentity) raftservice.CommandFence {
-	fence := processCommandFence()
+func processCommandFenceFromRuntime(
+	runtime raftmember.RuntimeIdentity,
+	base sqldriver.ReplicatedShardStoreIdentity,
+) raftservice.CommandFence {
+	fence := processCommandFence(runtime.RelationManifestDigest)
 	authority := base.Binding.Authority
 	if authority.ActivePolicyGeneration != fence.ActivePolicyGeneration ||
 		authority.ProtectionEpoch != fence.ProtectionEpoch ||

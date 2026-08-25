@@ -589,6 +589,7 @@ type ReadSnapshot struct {
 	cut              durable.DatabaseSnapshot
 	publication      raftmodel.Publication
 	state            State
+	manifestDigest   [32]byte
 	userName         string
 	validation       ValidationProfile
 	validationDigest [32]byte
@@ -601,12 +602,14 @@ type ReadSnapshot struct {
 // with a ReadSnapshot. It excludes ConfState because consumers that only need
 // to reject a changed data/ownership cut should not clone Raft membership.
 type SnapshotFence struct {
-	Binding            Binding
-	Applied            uint64
-	LastTerm           uint64
-	LastEntryDigest    [32]byte
-	DataChainDigest    [32]byte
-	SnapshotBaseDigest [32]byte
+	Binding                Binding
+	RelationManifestDigest [32]byte
+	ReplicaSetVersion      uint64
+	Applied                uint64
+	LastTerm               uint64
+	LastEntryDigest        [32]byte
+	DataChainDigest        [32]byte
+	SnapshotBaseDigest     [32]byte
 }
 
 // Fence returns the exact data and routing identity paired with this cut.
@@ -615,7 +618,9 @@ func (s *ReadSnapshot) Fence() SnapshotFence {
 		return SnapshotFence{}
 	}
 	return SnapshotFence{
-		Binding: s.state.Binding, Applied: s.state.Applied, LastTerm: s.state.LastTerm,
+		Binding: s.state.Binding, RelationManifestDigest: s.manifestDigest,
+		ReplicaSetVersion: s.publication.ReplicaSetVersion,
+		Applied:           s.state.Applied, LastTerm: s.state.LastTerm,
 		LastEntryDigest: s.state.LastEntryDigest, DataChainDigest: s.state.DataChainDigest,
 		SnapshotBaseDigest: s.state.SnapshotBaseDigest,
 	}
@@ -720,7 +725,8 @@ func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {
 	}
 	return &ReadSnapshot{
 		cut: cut, publication: clonePublication(m.publication), state: cloneState(m.state),
-		userName: m.userName, validation: m.user.Validation,
+		manifestDigest: m.manifestDigest,
+		userName:       m.userName, validation: m.user.Validation,
 		validationDigest: m.user.ValidationDigest, validator: m.user.Validator,
 	}, nil
 }

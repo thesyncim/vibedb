@@ -6,12 +6,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 type fakeReplicatedOwner struct {
@@ -19,6 +21,10 @@ type fakeReplicatedOwner struct {
 	result      raftservice.Result
 	err         error
 	blockSubmit bool
+	readResult  raftservice.PointReadResult
+	readErr     error
+	readLease   raftservice.PointReadLease
+	readCalled  chan struct{}
 }
 
 func (owner *fakeReplicatedOwner) Probe(
@@ -38,6 +44,121 @@ func (owner *fakeReplicatedOwner) SubmitOwned(
 		return raftservice.Result{}, context.Cause(ctx)
 	}
 	return owner.result, owner.err
+}
+
+func (owner *fakeReplicatedOwner) ReadPoint(
+	context.Context,
+	raftservice.PointReadRequest,
+) (raftservice.PointReadResult, raftservice.PointReadLease, error) {
+	if owner.readCalled != nil {
+		select {
+		case <-owner.readCalled:
+		default:
+			close(owner.readCalled)
+		}
+	}
+	return owner.readResult, owner.readLease, owner.readErr
+}
+
+type testPointReadLease struct{ released atomic.Bool }
+
+func (lease *testPointReadLease) Release() { lease.released.Store(true) }
+
+func testReplicatedServingState() raftservice.ServingState {
+	fence := testReplicatedFence()
+	return raftservice.ServingState{
+		Identity: raftmember.RuntimeIdentity{Group: fence.Group,
+			AllocationGeneration: fence.AllocationGeneration, MemberID: fence.MemberID,
+			StoreID: fence.StoreID, NodeIncarnation: fence.NodeIncarnation},
+		Command: fence.Command,
+		Status: raftmember.RuntimeStatus{MemberID: fence.MemberID, LeaderID: fence.MemberID,
+			Term: fence.Term, Commit: 11, Applied: 11, CheckpointApplied: 10},
+	}
+}
+
+func TestReplicatedServerServesFoundEmptyReadWithoutConflatingMiss(t *testing.T) {
+	state := testReplicatedServingState()
+	owner := &fakeReplicatedOwner{state: state, readResult: raftservice.PointReadResult{
+		Applied: 11, Found: true, Value: []byte{},
+	}}
+	server := &ReplicatedServer{owner: owner}
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
+		Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
+		MinimumApplied: 10, MaxValueBytes: 1024}
+	response := server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedReadFound || response.ReadApplied != 11 ||
+		len(response.Value) != 0 || !validReplicatedResponse(response) {
+		t.Fatalf("response=%+v", response)
+	}
+	owner.readResult.Found = false
+	response = server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 11 ||
+		!validReplicatedResponse(response) {
+		t.Fatalf("miss response=%+v", response)
+	}
+}
+
+func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
+	state := testReplicatedServingState()
+	for _, test := range []struct {
+		name    string
+		err     error
+		refusal ReplicatedRefusalCode
+	}{{"future-applied-floor", replicatedstate.ErrReadBehind, ReplicatedRefusalReadBehind},
+		{"response-buffer", replicatedstate.ErrReadBufferBound, ReplicatedRefusalReadBufferBound}} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := &fakeReplicatedOwner{state: state, readErr: test.err}
+			server := &ReplicatedServer{owner: owner}
+			request := &ReplicatedRequest{Operation: ReplicatedReadLeader,
+				Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
+				MinimumApplied: state.Status.Commit + 1, MaxValueBytes: 1024}
+			response := server.executeReplicated(context.Background(), request)
+			if response.Kind != ReplicatedRefusal || response.Refusal != test.refusal ||
+				!response.HasState || response.State.Applied != state.Status.Applied ||
+				!validReplicatedResponse(response) {
+				t.Fatalf("response=%+v", response)
+			}
+		})
+	}
+}
+
+func TestReplicatedServerHoldsReadLeaseUntilSlowClientAcceptsFrame(t *testing.T) {
+	state := testReplicatedServingState()
+	lease := &testPointReadLease{}
+	called := make(chan struct{})
+	owner := &fakeReplicatedOwner{state: state, readCalled: called,
+		readResult: raftservice.PointReadResult{Applied: 11, Found: true,
+			Value: bytes.Repeat([]byte{7}, 64<<10)}, readLease: lease}
+	server := testReplicatedServer(owner)
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+	done := make(chan error, 1)
+	go func() { done <- server.serveReplicatedRequest(context.Background(), serverSide) }()
+	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
+		Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
+		MinimumApplied: 10, MaxValueBytes: 64 << 10}
+	if err := EncodeReplicatedRequest(clientSide, request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("read was not admitted")
+	}
+	if lease.released.Load() {
+		t.Fatal("response reservation released before the blocked socket write")
+	}
+	response, err := DecodeReplicatedResponse(clientSide)
+	if err != nil || response.Kind != ReplicatedReadFound || len(response.Value) != 64<<10 {
+		t.Fatalf("response=%+v err=%v", response, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !lease.released.Load() {
+		t.Fatal("response reservation not released after socket write")
+	}
 }
 
 func testReplicatedServer(owner replicatedOwner) *ReplicatedServer {

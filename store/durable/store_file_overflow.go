@@ -318,7 +318,22 @@ func (c *Collection) appendPrimaryOverflowValue(
 		}
 		header := view.Header()
 		if pages == 0 {
+			if header.Offset != 0 || header.Total > uint64(c.options.MaxDocumentBytes) ||
+				header.Total > uint64(math.MaxInt-len(dst)) {
+				lease.Release()
+				return dst, ErrOverflowChainCorrupt
+			}
 			total = header.Total
+			// The authenticated first extent declares the complete value size.
+			// Allocate once before appending any pieces so the returned slice cannot
+			// retain growslice's geometric headroom. The backing object may still use
+			// the allocator's bounded size-class rounding.
+			required := len(dst) + int(total)
+			if required > cap(dst) {
+				grown := make([]byte, len(dst), required)
+				copy(grown, dst)
+				dst = grown
+			}
 		} else if header.Total != total || header.Offset != have {
 			lease.Release()
 			return dst, ErrOverflowChainCorrupt

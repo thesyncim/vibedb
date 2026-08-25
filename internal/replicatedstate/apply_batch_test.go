@@ -554,7 +554,7 @@ func TestNormalBatchWorkspacePoolDensityAndWarmAllocations(t *testing.T) {
 	workspace := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 	assertNormalBatchWorkspaceReleased(t, workspace)
 	normalBatchWorkspacePool.Put(workspace)
-	if allocations := testing.AllocsPerRun(100, exercise); allocations != 0 {
+	if allocations := testing.AllocsPerRun(100, exercise); !raceDetectorEnabled && allocations != 0 {
 		t.Fatalf("warm 128-command workspace allocations = %.2f shape=%v", allocations, shape)
 	}
 	if exerciseErr != nil {
