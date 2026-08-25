@@ -1,0 +1,30 @@
+package serviceauthz
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestLoadVibeJSONBoundsAndCanonicalPolicy(t *testing.T) {
+	node := strings.Repeat("01", 16)
+	policy, err := Load([]byte(`{"generation":5,"principals":[{"node":"` + node +
+		`","capabilities":["data_read","schema","delegate"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Generation() != 5 || len(policy.Nodes()) != 1 ||
+		policy.Check(policy.Nodes()[0], CapabilityDataRead|CapabilitySchema|CapabilityDelegate) != DecisionAllow {
+		t.Fatalf("loaded policy mismatch")
+	}
+	for _, raw := range [][]byte{
+		nil,
+		[]byte(`{"generation":0,"principals":[]}`),
+		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["data_read","data_read"]}]}`),
+		[]byte(`{"generation":1,"principals":[{"node":"` + node + `","capabilities":["unknown"]}]}`),
+	} {
+		if _, err := Load(raw); !errors.Is(err, ErrInvalidPolicy) {
+			t.Fatalf("Load(%q) err=%v", raw, err)
+		}
+	}
+}

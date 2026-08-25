@@ -16,6 +16,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
@@ -115,8 +116,7 @@ func runServe(args []string) int {
 	tlsHandshakeTimeout := fs.Duration("tls-handshake-timeout", 5*time.Second, "hard TLS handshake deadline")
 	maxConnections := fs.Int("max-client-connections", 1024, "hard authenticated client connection bound")
 	maxHandshakes := fs.Int("max-client-handshakes", 64, "hard concurrent TLS handshake bound")
-	var allowedClients repeatedFlag
-	fs.Var(&allowedClients, "allow-client-node", "allowed 32-character hexadecimal client NodeID; repeat for each principal")
+	authorizationPolicy := fs.String("authorization-policy", "", "bounded vibejson principal/capability policy")
 	var shardPeers repeatedFlag
 	fs.Var(&shardPeers, "shard-peer", "authenticated shard address=32-character-hex-NodeID; repeat for each endpoint")
 	maxShardConnections := fs.Int("max-shard-connections", 4096, "hard authenticated gateway-to-shard connection bound")
@@ -132,7 +132,7 @@ func runServe(args []string) int {
 	var shardTLS *servicetls.Client
 	if *devPlaintext {
 		if *tlsCertificate != "" || *tlsKey != "" || *tlsRoots != "" || *tlsIdentityOID != "" ||
-			len(allowedClients) != 0 || len(shardPeers) != 0 {
+			*authorizationPolicy != "" || len(shardPeers) != 0 {
 			fmt.Fprintln(os.Stderr, "gateway: development plaintext and TLS configuration are mutually exclusive")
 			return 2
 		}
@@ -146,15 +146,12 @@ func runServe(args []string) int {
 			fmt.Fprintf(os.Stderr, "gateway: load TLS profile: %v\n", err)
 			return 2
 		}
-		allowed := make([]rafttransport.NodeID, len(allowedClients))
-		for index, encoded := range allowedClients {
-			allowed[index], err = servicetls.ParseNodeID(encoded)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "gateway: allowed client %d: %v\n", index, err)
-				return 2
-			}
+		policy, policyErr := serviceauthz.LoadFile(*authorizationPolicy)
+		if policyErr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: load authorization policy: %v\n", policyErr)
+			return 2
 		}
-		clientTLS, err = gateway.NewClientTLS(profile, allowed)
+		clientTLS, err = gateway.NewAuthorizedClientTLS(profile, policy)
 		if err != nil || *tlsHandshakeTimeout <= 0 || *maxConnections <= 0 ||
 			*maxConnections > servicetls.AbsoluteMaxConnections || *maxHandshakes <= 0 ||
 			*maxHandshakes > *maxConnections {
@@ -307,14 +304,28 @@ func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
 	capability *gateway.ClientTLS, limits gateway.ClientTLSLimits, logf func(string, ...any)) error {
 	startGatewayRecovery(ctx, exec, logf)
-	return capability.ServeAuthenticatedClients(ctx, listener, limits,
-		func(ctx context.Context, connection net.Conn) { handleConn(ctx, connection, exec, logf) })
+	return capability.ServeAuthorizedClients(ctx, listener, limits,
+		func(ctx context.Context, connection net.Conn) {
+			handleConnAuthorized(ctx, connection, exec, capability, logf)
+		})
+}
+
+func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	capability *gateway.ClientTLS, logf func(string, ...any)) {
+	handleConnPolicy(ctx, conn, exec, logf, func(request *serveRequest) bool {
+		return capability.Authorize(ctx, serveRequestCapability(request), nil) == serviceauthz.DecisionAllow
+	})
 }
 
 // handleConn serves newline-delimited JSON requests on one connection until the
 // peer disconnects or the server shuts down. Closing the connection when ctx is
 // done unblocks a blocked decode so a signaled shutdown drains promptly.
 func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf func(string, ...any)) {
+	handleConnPolicy(ctx, conn, exec, logf, nil)
+}
+
+func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	logf func(string, ...any), authorize func(*serveRequest) bool) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -330,6 +341,12 @@ func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf
 			}
 			return
 		}
+		if authorize != nil && !authorize(&req) {
+			if err := writeServeResponse(writer, &serveResponse{Error: "authorization denied"}); err != nil {
+				return
+			}
+			continue
+		}
 		if err := writeServeResponse(writer, execRequest(ctx, exec, req)); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: encode response: %v", err)
@@ -340,6 +357,23 @@ func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		logf("gateway: decode request: %v", err)
 	}
+}
+
+func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
+	if request == nil {
+		return 0
+	}
+	if request.Op == "exec" || request.Op == "exec_batch" {
+		var required serviceauthz.Capability
+		if request.SQL != "" {
+			required = serviceauthz.SQLCapability(request.SQL, true)
+		}
+		for index := range request.Statements {
+			required |= serviceauthz.SQLCapability(request.Statements[index].SQL, true)
+		}
+		return required
+	}
+	return serviceauthz.CapabilityDataRead
 }
 
 // writeServeResponse emits one NDJSON response without converting raw result
