@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	"github.com/thesyncim/vibejson"
 )
@@ -418,6 +419,7 @@ func (e *Executor) RunRecovery(
 	interval time.Duration,
 	report func([]RecoveryResult, error),
 ) {
+	ctx = e.recoveryContext(ctx)
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -438,4 +440,18 @@ func (e *Executor) RunRecovery(
 			run()
 		}
 	}
+}
+
+func (e *Executor) recoveryContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, present := serviceauthz.FromContext(ctx); present || e == nil || !e.internalAuthority.Valid() {
+		return ctx
+	}
+	authorized, err := serviceauthz.WithAuthority(ctx, e.internalAuthority)
+	if err != nil {
+		return ctx
+	}
+	return authorized
 }

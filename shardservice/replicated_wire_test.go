@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 type replicatedTLSWriteMeter struct {
@@ -101,19 +102,20 @@ func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
+	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
-		{Operation: ReplicatedProbe, Fence: ReplicatedFence{
+		{Operation: ReplicatedProbe, Authority: authority, Fence: ReplicatedFence{
 			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
 		}},
-		{Operation: ReplicatedPropose, Fence: fence, Command: command},
-		{Operation: ReplicatedMembership, Fence: fence, Membership: ReplicatedMembershipRequest{
+		{Operation: ReplicatedPropose, Authority: authority, Fence: fence, Command: command},
+		{Operation: ReplicatedMembership, Authority: authority, Fence: fence, Membership: ReplicatedMembershipRequest{
 			Kind: raftservice.MembershipAddLearner, TransitionID: [16]byte{3},
 			MetadataEpoch: 5, CatalogGeneration: 7, ExpectedReplicaSetVersion: 1,
 			SourceMember: fence.MemberID, TargetMember: fence.MemberID + 1,
 		}},
-		{Operation: ReplicatedReadLeader, Fence: fence, Relation: 1,
+		{Operation: ReplicatedReadLeader, Authority: authority, Fence: fence, Relation: 1,
 			Key: []byte{0, 1}, MinimumApplied: 7, MaxValueBytes: 4096},
-		{Operation: ReplicatedReadFollower, Fence: fence, Relation: 2,
+		{Operation: ReplicatedReadFollower, Authority: authority, Fence: fence, Relation: 2,
 			Key: []byte{2, 1, 0}, MinimumApplied: 9, MaxValueBytes: 8192},
 	} {
 		var encoded bytes.Buffer
@@ -131,7 +133,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decoded.Operation != request.Operation || decoded.Fence != request.Fence ||
+		if decoded.Operation != request.Operation || decoded.Authority != request.Authority || decoded.Fence != request.Fence ||
 			!bytes.Equal(decoded.Command, request.Command) || decoded.Membership != request.Membership ||
 			decoded.Relation != request.Relation || !bytes.Equal(decoded.Key, request.Key) ||
 			decoded.MinimumApplied != request.MinimumApplied ||

@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
 // The shard-service codec: a big-endian length-prefixed framing mirroring
@@ -44,6 +45,7 @@ const (
 	rowBatchMarker          = 0xdf
 	exchangeMarker          = 0xe0
 	repartitionMarker       = 0xe1
+	authorityMarker         = 0xe2
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -952,6 +954,11 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if !req.ExecutionMode.valid() {
 		return errBadEnum
 	}
+	authorityPresent := req.Authority.Node != (rafttransport.NodeID{}) ||
+		req.Authority.Generation != 0
+	if authorityPresent && !req.Authority.Valid() {
+		return errBadPresence
+	}
 	if len(req.Params) > maxParams {
 		return errFieldTooLarge
 	}
@@ -1134,6 +1141,11 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		e.u8(transactionMarker)
 		encodeTransactionRequest(&e, req.Transaction)
 	}
+	if req.Authority.Valid() {
+		e.u8(authorityMarker)
+		e.fixed16(req.Authority.Node)
+		e.u64(req.Authority.Generation)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -1308,6 +1320,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.Transaction, err = decodeTransactionRequest(&d)
 		if err != nil {
 			return nil, err
+		}
+	}
+	if len(d.b) != 0 && d.b[0] == authorityMarker {
+		d.u8()
+		req.Authority.Node = d.fixed16()
+		req.Authority.Generation = d.u64()
+		if d.bad() || !req.Authority.Valid() {
+			return nil, errBadPresence
 		}
 	}
 	if req.Transaction.Operation != TransactionNone &&

@@ -609,6 +609,14 @@ func TestReplicatedExecutorMembershipAcceptedAndUnknownAreDistinct(t *testing.T)
 	if !errors.Is(err, raftservice.ErrOutcomeUnknown) {
 		t.Fatalf("transport outcome = %v", err)
 	}
+	client.err = nil
+	client.response = &shardservice.ReplicatedResponse{
+		Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnauthorized,
+	}
+	_, err = executor.ApplyMembership(context.Background(), route, membership)
+	if !errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("stateless authorization refusal = %v", err)
+	}
 }
 
 func (client *failingReplicatedClient) DoReplicated(
