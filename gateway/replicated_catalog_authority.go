@@ -21,9 +21,10 @@ var (
 )
 
 const (
-	replicatedCatalogHeadKeyByte = byte(0)
-	replicatedOperationKeyByte   = byte(1)
-	MaxReplicatedOperationBytes  = 64 << 10
+	replicatedCatalogHeadKeyByte      = byte(0)
+	replicatedOperationKeyByte        = byte(1)
+	MaxReplicatedOperationBytes       = 64 << 10
+	maxReplicatedOperationIntentBytes = 40 << 10
 	// One catalog head is one atomic relation value. This intentionally follows
 	// the existing replicated mutation bound; larger catalogs fail closed until
 	// a separately authenticated chunk-manifest protocol exists.
@@ -293,13 +294,28 @@ type ReplicatedOperationRecord struct {
 	CatalogGeneration uint64                   `json:"catalog_generation"`
 	Cursor            [8]uint64                `json:"cursor"`
 	Proof             [32]byte                 `json:"proof"`
+	IntentDigest      [32]byte                 `json:"intent_digest"`
+	Intent            []byte                   `json:"intent"`
 }
 
 func validReplicatedOperation(record ReplicatedOperationRecord) bool {
 	return record.ID != ([32]byte{}) &&
 		record.Kind >= ReplicatedOperationSplit && record.Kind <= ReplicatedOperationMove &&
 		record.State >= ReplicatedOperationPlanned && record.State <= ReplicatedOperationCancelled &&
-		record.Revision != 0 && record.CatalogGeneration != 0 && record.Proof != ([32]byte{})
+		record.Revision != 0 && record.CatalogGeneration != 0 && record.Proof != ([32]byte{}) &&
+		record.IntentDigest != ([32]byte{}) && len(record.Intent) != 0 &&
+		len(record.Intent) <= maxReplicatedOperationIntentBytes &&
+		sha256.Sum256(record.Intent) == record.IntentDigest
+}
+
+// Equal reports exact logical and byte identity without making the record
+// comparable merely for tests or settlement checks.
+func (record ReplicatedOperationRecord) Equal(other ReplicatedOperationRecord) bool {
+	return record.ID == other.ID && record.Kind == other.Kind && record.State == other.State &&
+		record.Revision == other.Revision &&
+		record.CatalogGeneration == other.CatalogGeneration && record.Cursor == other.Cursor &&
+		record.Proof == other.Proof && record.IntentDigest == other.IntentDigest &&
+		bytes.Equal(record.Intent, other.Intent)
 }
 
 func replicatedOperationKey(id [32]byte) [33]byte {
@@ -312,6 +328,10 @@ func replicatedOperationKey(id [32]byte) [33]byte {
 func appendReplicatedOperation(dst []byte, record ReplicatedOperationRecord) ([]byte, error) {
 	if !validReplicatedOperation(record) {
 		return dst, ErrReplicatedCatalog
+	}
+	canonicalIntent, err := vibejson.AppendCanonicalize(nil, record.Intent)
+	if err != nil || !bytes.Equal(canonicalIntent, record.Intent) {
+		return dst, errors.Join(err, ErrReplicatedCatalog)
 	}
 	raw, err := vibejson.Marshal(&record)
 	if err != nil {
@@ -391,7 +411,8 @@ func (authority *ReplicatedCatalogAuthority) PublishOperation(
 	} else {
 		prior, openErr := openReplicatedOperation(current.Value)
 		if openErr != nil || prior.ID != record.ID || prior.Revision != expectedRevision ||
-			prior.Kind != record.Kind || prior.State >= ReplicatedOperationComplete {
+			prior.Kind != record.Kind || prior.State >= ReplicatedOperationComplete ||
+			prior.IntentDigest != record.IntentDigest || !bytes.Equal(prior.Intent, record.Intent) {
 			return errors.Join(openErr, ErrReplicatedCatalogConflict)
 		}
 		digest := sha256.Sum256(current.Value)

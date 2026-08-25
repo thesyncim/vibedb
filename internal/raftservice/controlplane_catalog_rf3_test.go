@@ -3,6 +3,7 @@ package raftservice_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"testing"
@@ -107,6 +108,8 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		State: gateway.ReplicatedOperationPlanned, Revision: 1,
 		CatalogGeneration: 1, Cursor: [8]uint64{1}, Proof: [32]byte{0xd1},
 	}
+	record.Intent = []byte(`{}`)
+	record.IntentDigest = sha256.Sum256(record.Intent)
 	leader = cluster.waitLeader(t, ctx)
 	client.arm(leader, faultAfterDecodedResponseBeforeClientDelivery)
 	err = journal.PublishOperation(ctx, 0, record)
@@ -123,7 +126,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 			len(attempts) != 0 && bytes.Equal(pending, attempts[len(attempts)-1]))
 	}
 	loaded, err := journal.ReadOperation(ctx, record.ID)
-	if err != nil || loaded != record {
+	if err != nil || !loaded.Equal(record) {
 		t.Fatalf("read split operation = %+v, err=%v", loaded, err)
 	}
 

@@ -1,6 +1,7 @@
 package splitcontroller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -45,6 +46,11 @@ func ExecuteReplicatedStep(
 		return Action{}, err
 	}
 	id := [32]byte(plan.OperationID())
+	intent, err := AppendPlanIntent(nil, observed.Catalog, plan)
+	if err != nil {
+		return Action{}, errors.Join(ErrReplicatedExecution, err)
+	}
+	intentDigest := sha256.Sum256(intent)
 	wantCursor := replicatedActionCursor(action)
 	wantProof := replicatedActionProof(id, wantCursor)
 	record, readErr := journal.ReadOperation(ctx, id)
@@ -57,7 +63,7 @@ func ExecuteReplicatedStep(
 			ID: id, Kind: gateway.ReplicatedOperationSplit,
 			State: gateway.ReplicatedOperationPlanned, Revision: 1,
 			CatalogGeneration: observed.Catalog.Generation(), Cursor: wantCursor,
-			Proof: wantProof,
+			Proof: wantProof, IntentDigest: intentDigest, Intent: intent,
 		}
 		if err := settleReplicatedOperationPublish(ctx, journal, 0, record); err != nil {
 			return Action{}, err
@@ -65,6 +71,7 @@ func ExecuteReplicatedStep(
 	case readErr != nil:
 		return Action{}, readErr
 	case record.ID != id || record.Kind != gateway.ReplicatedOperationSplit ||
+		record.IntentDigest != intentDigest || !bytes.Equal(record.Intent, intent) ||
 		record.CatalogGeneration > observed.Catalog.Generation() ||
 		record.State < gateway.ReplicatedOperationPlanned ||
 		record.State > gateway.ReplicatedOperationComplete:
@@ -127,7 +134,7 @@ func settleReplicatedOperationPublish(
 		return err
 	}
 	settled, err := journal.ReadOperation(ctx, record.ID)
-	if err != nil || settled != record {
+	if err != nil || !settled.Equal(record) {
 		return errors.Join(err, ErrReplicatedExecution)
 	}
 	return nil

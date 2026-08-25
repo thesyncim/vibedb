@@ -213,6 +213,113 @@ func PlanSplit(current *distribution.Manifest, request SplitRequest) (*SplitPlan
 	return plan, nil
 }
 
+// RestoreSplitPlan reconstructs a previously authenticated split intent from
+// its exact source manifest and ordered child descriptors. It is deliberately
+// stricter than planning: it accepts no recommendation or advisory evidence,
+// and revalidates every routing, allocation, ownership, endpoint, and range
+// invariant before rebuilding the immutable target manifest. This is the only
+// restart path for a catalog-persisted split plan.
+func RestoreSplitPlan(
+	current *distribution.Manifest,
+	source SourceIdentity,
+	retained uint8,
+	children []SplitChild,
+) (*SplitPlan, error) {
+	if current == nil || source.Distribution != current.Distribution() ||
+		source.RoutingVersion != current.Version() || current.Version() == ^distribution.RoutingVersion(0) ||
+		len(children) < 2 || len(children) > MaxSplitChildren || int(retained) >= len(children) ||
+		!source.valid() {
+		return nil, ErrInvalidSplit
+	}
+	sourceOrdinal, sourceShard, ok := exactSourceShard(current, source)
+	if !ok || sourceShard.Epoch == ^distribution.OwnershipEpoch(0) ||
+		!distribution.VirtualBucketBoundary(sourceShard.Range.Start, source.BucketBits) ||
+		(!sourceShard.Range.End.Max &&
+			!distribution.VirtualBucketBoundary(sourceShard.Range.End.Point, source.BucketBits)) {
+		return nil, ErrInvalidSplit
+	}
+	var activeHighWater distribution.ShardAllocationGeneration
+	for ordinal := 0; ordinal < current.ShardCount(); ordinal++ {
+		metadata, metadataOK := current.ShardMetadataAt(ordinal)
+		if !metadataOK {
+			return nil, ErrInvalidSplit
+		}
+		activeHighWater = max(activeHighWater, metadata.AllocationGeneration)
+	}
+
+	plan := &SplitPlan{
+		Source: source, ChildCount: uint8(len(children)), RetainedChild: retained,
+	}
+	start := source.Range.Start
+	lastAllocation := activeHighWater
+	for index := range children {
+		child := children[index]
+		if child.Range.Start != start || !child.Range.Valid() || len(child.Leaders) == 0 {
+			return nil, ErrInvalidSplit
+		}
+		if index+1 < len(children) {
+			if child.Range.End.Max ||
+				!distribution.VirtualBucketBoundary(child.Range.End.Point, source.BucketBits) {
+				return nil, ErrInvalidSplit
+			}
+			start = child.Range.End.Point
+		} else if child.Range.End != source.Range.End {
+			return nil, ErrInvalidSplit
+		}
+		for _, leader := range child.Leaders {
+			if leader == "" {
+				return nil, ErrInvalidSplit
+			}
+		}
+		if index == int(retained) {
+			if !child.Retained || child.Shard != sourceShard.ID ||
+				child.AllocationGeneration != sourceShard.AllocationGeneration ||
+				child.OwnershipEpoch != sourceShard.Epoch+1 ||
+				!slices.Equal(child.Leaders, sourceShard.Leaders) {
+				return nil, ErrInvalidSplit
+			}
+		} else {
+			if child.Retained || child.Shard == "" || child.OwnershipEpoch == 0 ||
+				child.AllocationGeneration <= lastAllocation {
+				return nil, ErrInvalidSplit
+			}
+			for ordinal := 0; ordinal < current.ShardCount(); ordinal++ {
+				metadata, _ := current.ShardMetadataAt(ordinal)
+				if child.Shard == metadata.ID ||
+					child.AllocationGeneration == metadata.AllocationGeneration {
+					return nil, ErrInvalidSplit
+				}
+			}
+			for prior := 0; prior < index; prior++ {
+				if children[prior].Shard == child.Shard ||
+					children[prior].AllocationGeneration == child.AllocationGeneration {
+					return nil, ErrInvalidSplit
+				}
+			}
+			lastAllocation = child.AllocationGeneration
+		}
+		child.Leaders = slices.Clone(child.Leaders)
+		plan.children[index] = child
+	}
+
+	var replacements [MaxSplitChildren]distribution.Shard
+	for index := range children {
+		child := &plan.children[index]
+		replacements[index] = distribution.Shard{
+			ID: child.Shard, AllocationGeneration: child.AllocationGeneration,
+			Range: child.Range, Leaders: child.Leaders, Epoch: child.OwnershipEpoch,
+		}
+	}
+	manifest, err := current.ReplaceShard(
+		sourceOrdinal, current.Version()+1, replacements[:len(children)],
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSplit, err)
+	}
+	plan.manifest = manifest
+	return plan, nil
+}
+
 func destinationConflicts(
 	current *distribution.Manifest,
 	prior []Destination,

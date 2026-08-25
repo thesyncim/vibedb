@@ -227,17 +227,17 @@ func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *test
 
 func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 	authority, _, _ := newCatalogAuthorityFixture(t)
-	record := ReplicatedOperationRecord{
+	record := testReplicatedOperation(ReplicatedOperationRecord{
 		ID: [32]byte{9}, Kind: ReplicatedOperationSplit,
 		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 5,
 		Cursor: [8]uint64{1, 2, 3}, Proof: [32]byte{7},
-	}
+	})
 	if err := authority.PublishOperation(context.Background(), 0, record); err != nil {
 		t.Fatal(err)
 	}
 	// A fresh controller object reconstructs solely from the replicated record.
 	loaded, err := authority.ReadOperation(context.Background(), record.ID)
-	if err != nil || loaded != record {
+	if err != nil || !loaded.Equal(record) {
 		t.Fatalf("loaded=%+v err=%v", loaded, err)
 	}
 	advanced := record
@@ -268,11 +268,11 @@ func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 
 func TestReplicatedOperationUnknownPublishAndDeleteSettleExactCommand(t *testing.T) {
 	authority, client, _ := newCatalogAuthorityFixture(t)
-	record := ReplicatedOperationRecord{
+	record := testReplicatedOperation(ReplicatedOperationRecord{
 		ID: [32]byte{0x31}, Kind: ReplicatedOperationSplit,
 		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 5,
 		Cursor: [8]uint64{1}, Proof: [32]byte{0x41},
-	}
+	})
 	client.unknownNext = true
 	err := authority.PublishOperation(context.Background(), 0, record)
 	if !errors.Is(err, ErrReplicatedCatalogPending) {
@@ -310,17 +310,17 @@ func TestReplicatedOperationUnknownPublishAndDeleteSettleExactCommand(t *testing
 }
 
 func TestReplicatedOperationEncodingIsCanonicalAndBounded(t *testing.T) {
-	record := ReplicatedOperationRecord{
+	record := testReplicatedOperation(ReplicatedOperationRecord{
 		ID: [32]byte{1}, Kind: ReplicatedOperationMove,
 		State: ReplicatedOperationRunning, Revision: 7, CatalogGeneration: 11,
 		Cursor: [8]uint64{1, 2, 3, 4, 5, 6, 7, 8}, Proof: [32]byte{9},
-	}
+	})
 	raw, err := appendReplicatedOperation(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
 	opened, err := openReplicatedOperation(raw)
-	if err != nil || opened != record {
+	if err != nil || !opened.Equal(record) {
 		t.Fatalf("opened=%+v err=%v", opened, err)
 	}
 	again, err := appendReplicatedOperation(nil, opened)
@@ -336,6 +336,12 @@ func TestReplicatedOperationEncodingIsCanonicalAndBounded(t *testing.T) {
 			t.Fatalf("damaged operation accepted: length=%d err=%v", len(damaged), err)
 		}
 	}
+}
+
+func testReplicatedOperation(record ReplicatedOperationRecord) ReplicatedOperationRecord {
+	record.Intent = []byte(`{}`)
+	record.IntentDigest = sha256.Sum256(record.Intent)
+	return record
 }
 
 func TestReplicatedCatalogAuthorityRejectsMismatchedWriteSession(t *testing.T) {
