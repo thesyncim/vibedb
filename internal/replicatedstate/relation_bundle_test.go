@@ -159,12 +159,31 @@ func newRelationBundleFixtureWithCollectionOptions(
 		}
 		t.Cleanup(func() { _ = group.Close() })
 	}
+	relationDocuments := min(
+		base.Limits.MaxDistinctMutations+global.Limits.MaxDistinctMutations,
+		replication.MaxMutations,
+	)
+	maxDocuments, err := RequiredBundleTransactionDocuments(
+		relationDocuments, 8, reserveCapture,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDocuments := relationDocuments + 3
+	if reserveCapture {
+		wantDocuments++
+	}
+	if maxDocuments != wantDocuments {
+		t.Fatalf(
+			"transaction documents = %d for %d relations, want %d",
+			maxDocuments, relationDocuments, wantDocuments,
+		)
+	}
 	options := Options{
 		TxnLimits: durable.TxnLimits{
 			MaxCollections: len(members),
-			MaxDocuments: base.Limits.MaxDistinctMutations +
-				global.Limits.MaxDistinctMutations + 5,
-			MaxBytes: 64 << 20,
+			MaxDocuments:   maxDocuments,
+			MaxBytes:       64 << 20,
 		},
 		MaxSessions: 128, RetryWindow: 8, CheckpointGroup: group,
 	}

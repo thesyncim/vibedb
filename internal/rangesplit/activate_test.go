@@ -196,6 +196,17 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 			Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{7}},
 		},
 	}
+	maxDocuments, err := replicatedstate.RequiredBundleTransactionDocuments(
+		user.Limits.MaxDistinctMutations,
+		sourceCaptureRetryWindow,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int(sourceCaptureRetryWindow) + 3; maxDocuments != want {
+		t.Fatalf("activation transaction documents = %d, want %d", maxDocuments, want)
+	}
 	target := ChildActivationTarget{
 		Binding: binding, StaticBootstrap: bootstrap, System: system,
 		User:   replicatedstate.UserCollection{Name: "docs", Target: user},
@@ -203,11 +214,8 @@ func TestInitializeReplicatedChildBuildsNoCopyRaftBase(t *testing.T) {
 		MachineOptions: replicatedstate.Options{
 			TxnLimits: durable.TxnLimits{
 				MaxCollections: 3,
-				MaxDocuments: max(
-					user.Limits.MaxDistinctMutations+5,
-					int(sourceCaptureRetryWindow)+3,
-				),
-				MaxBytes: 512 << 20,
+				MaxDocuments:   maxDocuments,
+				MaxBytes:       512 << 20,
 			},
 			MaxSessions: 128,
 			RetryWindow: sourceCaptureRetryWindow,
