@@ -43,6 +43,12 @@ func (journal *memoryReplicatedOperationJournal) PublishOperation(
 	return nil
 }
 
+func (journal *memoryReplicatedOperationJournal) SubmitOperation(
+	ctx context.Context, record gateway.ReplicatedOperationRecord,
+) error {
+	return journal.PublishOperation(ctx, 0, record)
+}
+
 func (journal *memoryReplicatedOperationJournal) DeleteOperation(
 	_ context.Context, id [32]byte, revision uint64,
 ) error {

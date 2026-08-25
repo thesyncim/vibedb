@@ -175,7 +175,7 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		Executor: executor, Route: route, Distribution: string(descriptor.Distribution),
 		Shard: string(descriptor.Shard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
-		MaxRelationBatches: 1, MaxMutations: 1,
+		MaxRelationBatches: 1, MaxMutations: 2,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
@@ -232,7 +232,7 @@ func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 5,
 		Cursor: [8]uint64{1, 2, 3}, Proof: [32]byte{7},
 	})
-	if err := authority.PublishOperation(context.Background(), 0, record); err != nil {
+	if err := authority.SubmitOperation(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
 	// A fresh controller object reconstructs solely from the replicated record.
@@ -266,6 +266,43 @@ func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 	}
 }
 
+func TestReplicatedOperationSubmissionPublishesBoundedSortedDirectoryAtomically(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	second := testReplicatedOperation(ReplicatedOperationRecord{
+		ID: [32]byte{9}, Kind: ReplicatedOperationSplit,
+		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 5,
+		Cursor: [8]uint64{1}, Proof: [32]byte{7},
+	})
+	first := second
+	first.ID = [32]byte{3}
+	first.IntentDigest = sha256.Sum256(first.Intent)
+	if err := authority.SubmitOperation(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	client.unknownNext = true
+	if err := authority.SubmitOperation(context.Background(), first); !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown submit = %v", err)
+	}
+	pending := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err := authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("operation+directory retry changed command bytes")
+	}
+	ids, err := authority.ReadOperationIDs(context.Background())
+	if err != nil || len(ids) != 2 || ids[0] != first.ID || ids[1] != second.ID {
+		t.Fatalf("directory=%x err=%v", ids, err)
+	}
+	for _, record := range []ReplicatedOperationRecord{first, second} {
+		loaded, readErr := authority.ReadOperation(context.Background(), record.ID)
+		if readErr != nil || !loaded.Equal(record) {
+			t.Fatalf("record %x = %+v err=%v", record.ID, loaded, readErr)
+		}
+	}
+}
+
 func TestReplicatedOperationUnknownPublishAndDeleteSettleExactCommand(t *testing.T) {
 	authority, client, _ := newCatalogAuthorityFixture(t)
 	record := testReplicatedOperation(ReplicatedOperationRecord{
@@ -274,7 +311,7 @@ func TestReplicatedOperationUnknownPublishAndDeleteSettleExactCommand(t *testing
 		Cursor: [8]uint64{1}, Proof: [32]byte{0x41},
 	})
 	client.unknownNext = true
-	err := authority.PublishOperation(context.Background(), 0, record)
+	err := authority.SubmitOperation(context.Background(), record)
 	if !errors.Is(err, ErrReplicatedCatalogPending) {
 		t.Fatalf("unknown operation publish = %v", err)
 	}

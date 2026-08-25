@@ -322,49 +322,36 @@ func (session *NativeSession) mutate(
 	ctx context.Context,
 	mutation NativeMutation,
 ) (NativeResult, error) {
+	mutations := [...]NativeMutation{mutation}
+	return session.MutateBatch(ctx, mutations[:])
+}
+
+// MutateBatch proposes one atomic ordered logical batch. It is primarily the
+// control-plane primitive for publishing an operation record with its bounded
+// discovery directory in the same RF3 entry; partial visibility is impossible.
+// Resolver expansion remains covered by the session's fixed relation/mutation
+// bounds, and the exact encoded command is retained on outcome unknown.
+func (session *NativeSession) MutateBatch(
+	ctx context.Context,
+	mutations []NativeMutation,
+) (NativeResult, error) {
 	if session == nil || ctx == nil || session.phase != nativeSessionActive || session.pending ||
 		session.nextSequence == 0 || session.nextSequence == math.MaxUint64 {
 		return NativeResult{}, sessionStateError(session)
 	}
-	// Reject byte bounds before vibejson validation, resolver fanout, command
-	// hashing, or buffer growth. An oversized value cannot fit this session's
-	// command even if the global mutation bound is larger.
-	if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes {
-		return NativeResult{}, ErrNativeBundleBound
-	}
-	switch mutation.Kind {
-	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-		replication.MutationPutDigestEqual:
-		if len(mutation.Value) == 0 ||
-			len(mutation.Value) > replication.MaxMutationValueBytes ||
-			len(mutation.Value) > session.maxCommand {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-		if !vibejson.Valid(mutation.Value) {
-			return NativeResult{}, ErrNativeDocument
-		}
-		if mutation.Kind == replication.MutationPutDigestEqual &&
-			(mutation.ExpectedValueLength == 0 ||
-				mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
-				mutation.ExpectedValueDigest == (replication.Digest{})) {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-	case replication.MutationDelete:
-		if len(mutation.Value) != 0 {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-	case replication.MutationDeleteDigestEqual:
-		if len(mutation.Value) != 0 || mutation.ExpectedValueLength == 0 ||
-			mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
-			mutation.ExpectedValueDigest == (replication.Digest{}) {
-			return NativeResult{}, ErrNativeBundleBound
-		}
-	default:
+	if len(mutations) == 0 || len(mutations) > session.bundle.maxMutations {
 		return NativeResult{}, ErrNativeBundleBound
 	}
 	session.bundle.reset()
-	if err := session.resolver.ResolveNative(&session.bundle, mutation); err != nil {
-		return NativeResult{}, err
+	for index := range mutations {
+		if err := session.validateNativeMutation(mutations[index]); err != nil {
+			session.bundle.reset()
+			return NativeResult{}, err
+		}
+		if err := session.resolver.ResolveNative(&session.bundle, mutations[index]); err != nil {
+			session.bundle.reset()
+			return NativeResult{}, err
+		}
 	}
 	if len(session.bundle.batches) == 0 || len(session.bundle.mutations) == 0 {
 		session.bundle.reset()
@@ -377,6 +364,46 @@ func (session *NativeSession) mutate(
 	result, err := session.prepareAndExecute(ctx, command, false)
 	session.bundle.reset()
 	return result, err
+}
+
+func (session *NativeSession) validateNativeMutation(mutation NativeMutation) error {
+	// Reject byte bounds before vibejson validation, resolver fanout, command
+	// hashing, or buffer growth. An oversized value cannot fit this session's
+	// command even if the global mutation bound is larger.
+	if len(mutation.Key) == 0 || len(mutation.Key) > replication.MaxMutationKeyBytes {
+		return ErrNativeBundleBound
+	}
+	switch mutation.Kind {
+	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
+		replication.MutationPutDigestEqual:
+		if len(mutation.Value) == 0 ||
+			len(mutation.Value) > replication.MaxMutationValueBytes ||
+			len(mutation.Value) > session.maxCommand {
+			return ErrNativeBundleBound
+		}
+		if !vibejson.Valid(mutation.Value) {
+			return ErrNativeDocument
+		}
+		if mutation.Kind == replication.MutationPutDigestEqual &&
+			(mutation.ExpectedValueLength == 0 ||
+				mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+				mutation.ExpectedValueDigest == (replication.Digest{})) {
+			return ErrNativeBundleBound
+		}
+	case replication.MutationDelete:
+		if len(mutation.Value) != 0 {
+			return ErrNativeBundleBound
+		}
+	case replication.MutationDeleteDigestEqual:
+		if len(mutation.Value) != 0 || mutation.ExpectedValueLength == 0 ||
+			mutation.ExpectedValueLength > replication.MaxMutationValueBytes ||
+			mutation.ExpectedValueDigest == (replication.Digest{}) {
+			return ErrNativeBundleBound
+		}
+	default:
+		return ErrNativeBundleBound
+	}
+	return nil
 }
 
 func (session *NativeSession) Renew(

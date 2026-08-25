@@ -112,7 +112,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	record.IntentDigest = sha256.Sum256(record.Intent)
 	leader = cluster.waitLeader(t, ctx)
 	client.arm(leader, faultAfterDecodedResponseBeforeClientDelivery)
-	err = journal.PublishOperation(ctx, 0, record)
+	err = journal.SubmitOperation(ctx, record)
 	if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
 		t.Fatalf("unknown split operation publication: %v", err)
 	}

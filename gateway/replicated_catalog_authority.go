@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"sync"
 
@@ -21,10 +22,13 @@ var (
 )
 
 const (
-	replicatedCatalogHeadKeyByte      = byte(0)
-	replicatedOperationKeyByte        = byte(1)
-	MaxReplicatedOperationBytes       = 64 << 10
-	maxReplicatedOperationIntentBytes = 40 << 10
+	replicatedCatalogHeadKeyByte         = byte(0)
+	replicatedOperationKeyByte           = byte(1)
+	replicatedOperationDirectoryKeyByte  = byte(2)
+	MaxReplicatedOperationBytes          = 64 << 10
+	maxReplicatedOperationIntentBytes    = 40 << 10
+	maxReplicatedOperations              = 64
+	maxReplicatedOperationDirectoryBytes = 16 << 10
 	// One catalog head is one atomic relation value. This intentionally follows
 	// the existing replicated mutation bound; larger catalogs fail closed until
 	// a separately authenticated chunk-manifest protocol exists.
@@ -32,6 +36,7 @@ const (
 )
 
 var replicatedCatalogHeadKey = [...]byte{replicatedCatalogHeadKeyByte}
+var replicatedOperationDirectoryKey = [...]byte{replicatedOperationDirectoryKeyByte}
 
 // ReplicatedCatalogAuthority stores the catalog head and resumable controller
 // records in one ordinary JSON relation served by the existing RF3 owner. The
@@ -360,6 +365,76 @@ func openReplicatedOperation(raw []byte) (ReplicatedOperationRecord, error) {
 	return record, nil
 }
 
+type replicatedOperationDirectory struct {
+	IDs [][4]uint64 `json:"ids"`
+}
+
+func appendReplicatedOperationDirectory(dst []byte, ids [][32]byte) ([]byte, error) {
+	if len(ids) > maxReplicatedOperations {
+		return dst, ErrReplicatedCatalog
+	}
+	directory := replicatedOperationDirectory{IDs: make([][4]uint64, len(ids))}
+	for index := range ids {
+		if ids[index] == ([32]byte{}) || index != 0 && bytes.Compare(ids[index-1][:], ids[index][:]) >= 0 {
+			return dst, ErrReplicatedCatalog
+		}
+		for word := range directory.IDs[index] {
+			directory.IDs[index][word] = binary.LittleEndian.Uint64(ids[index][word*8:])
+		}
+	}
+	raw, err := vibejson.Marshal(&directory)
+	if err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	dst, err = vibejson.AppendCanonicalize(dst, raw)
+	if err != nil || len(dst)-start > maxReplicatedOperationDirectoryBytes {
+		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
+	}
+	return dst, nil
+}
+
+func openReplicatedOperationDirectory(raw []byte) ([][32]byte, error) {
+	if len(raw) == 0 || len(raw) > maxReplicatedOperationDirectoryBytes {
+		return nil, ErrReplicatedCatalog
+	}
+	var directory replicatedOperationDirectory
+	if err := vibejson.Unmarshal(raw, &directory); err != nil || len(directory.IDs) > maxReplicatedOperations {
+		return nil, errors.Join(err, ErrReplicatedCatalog)
+	}
+	ids := make([][32]byte, len(directory.IDs))
+	for index := range directory.IDs {
+		for word := range directory.IDs[index] {
+			binary.LittleEndian.PutUint64(ids[index][word*8:], directory.IDs[index][word])
+		}
+		if ids[index] == ([32]byte{}) || index != 0 && bytes.Compare(ids[index-1][:], ids[index][:]) >= 0 {
+			return nil, ErrReplicatedCatalog
+		}
+	}
+	canonical, err := appendReplicatedOperationDirectory(nil, ids)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return nil, errors.Join(err, ErrReplicatedCatalog)
+	}
+	return ids, nil
+}
+
+// ReadOperationIDs returns the bounded, sorted replicated work directory.
+// Absence is the canonical empty directory during bootstrap.
+func (authority *ReplicatedCatalogAuthority) ReadOperationIDs(
+	ctx context.Context,
+) ([][32]byte, error) {
+	result, err := authority.readRaw(
+		ctx, replicatedOperationDirectoryKey[:], maxReplicatedOperationDirectoryBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !result.Found {
+		return nil, nil
+	}
+	return openReplicatedOperationDirectory(result.Value)
+}
+
 func (authority *ReplicatedCatalogAuthority) ReadOperation(
 	ctx context.Context, id [32]byte,
 ) (ReplicatedOperationRecord, error) {
@@ -376,6 +451,89 @@ func (authority *ReplicatedCatalogAuthority) ReadOperation(
 		return ReplicatedOperationRecord{}, errors.Join(err, ErrReplicatedCatalog)
 	}
 	return record, nil
+}
+
+// SubmitOperation atomically creates the first immutable operation revision
+// and inserts its identity into the replicated sorted work directory. A crash
+// cannot strand an undiscoverable record or expose a directory entry without
+// its plan. Exact retries are accepted by the same conditional batch.
+func (authority *ReplicatedCatalogAuthority) SubmitOperation(
+	ctx context.Context, record ReplicatedOperationRecord,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil ||
+		!validReplicatedOperation(record) || record.Revision != 1 ||
+		record.State != ReplicatedOperationPlanned {
+		return ErrReplicatedCatalog
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	directoryResult, err := authority.readRaw(
+		ctx, replicatedOperationDirectoryKey[:], maxReplicatedOperationDirectoryBytes,
+	)
+	if err != nil {
+		return err
+	}
+	var ids [][32]byte
+	if directoryResult.Found {
+		ids, err = openReplicatedOperationDirectory(directoryResult.Value)
+		if err != nil {
+			return err
+		}
+	}
+	position := 0
+	for position < len(ids) && bytes.Compare(ids[position][:], record.ID[:]) < 0 {
+		position++
+	}
+	if position == len(ids) || ids[position] != record.ID {
+		if len(ids) == maxReplicatedOperations {
+			return ErrReplicatedCatalog
+		}
+		ids = append(ids, [32]byte{})
+		copy(ids[position+1:], ids[position:])
+		ids[position] = record.ID
+	}
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
+	if err != nil {
+		return err
+	}
+	recordBytes := len(authority.scratch)
+	authority.scratch, err = appendReplicatedOperationDirectory(authority.scratch, ids)
+	if err != nil {
+		return err
+	}
+	directoryBytes := authority.scratch[recordBytes:]
+	directoryMutation := NativeMutation{
+		Kind: replication.MutationPutAbsentOrEqual,
+		Key:  replicatedOperationDirectoryKey[:], Value: directoryBytes,
+	}
+	if directoryResult.Found {
+		digest := sha256.Sum256(directoryResult.Value)
+		directoryMutation.Kind = replication.MutationPutDigestEqual
+		directoryMutation.ExpectedValueLength = uint64(len(directoryResult.Value))
+		directoryMutation.ExpectedValueDigest = replication.Digest(digest)
+	}
+	key := replicatedOperationKey(record.ID)
+	result, err := authority.session.MutateBatch(ctx, []NativeMutation{
+		{Kind: replication.MutationPutAbsentOrEqual, Key: key[:], Value: authority.scratch[:recordBytes]},
+		directoryMutation,
+	})
+	if err != nil {
+		if authority.session.Status().Pending {
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return nil
 }
 
 // PublishOperation creates revision one idempotently or CAS-replaces exactly
@@ -456,6 +614,15 @@ func (authority *ReplicatedCatalogAuthority) DeleteOperation(
 		return err
 	}
 	if !current.Found {
+		directory, directoryErr := authority.ReadOperationIDs(ctx)
+		if directoryErr != nil {
+			return directoryErr
+		}
+		for index := range directory {
+			if directory[index] == id {
+				return ErrReplicatedCatalogConflict
+			}
+		}
 		return nil
 	}
 	record, err := openReplicatedOperation(current.Value)
@@ -463,10 +630,40 @@ func (authority *ReplicatedCatalogAuthority) DeleteOperation(
 		record.State < ReplicatedOperationComplete {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	digest := sha256.Sum256(current.Value)
-	result, err := authority.session.CompareDelete(
-		ctx, key[:], uint64(len(current.Value)), replication.Digest(digest),
+	directoryResult, err := authority.readRaw(
+		ctx, replicatedOperationDirectoryKey[:], maxReplicatedOperationDirectoryBytes,
 	)
+	if err != nil || !directoryResult.Found {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	ids, err := openReplicatedOperationDirectory(directoryResult.Value)
+	if err != nil {
+		return err
+	}
+	position := 0
+	for position < len(ids) && ids[position] != id {
+		position++
+	}
+	if position == len(ids) {
+		return ErrReplicatedCatalogConflict
+	}
+	copy(ids[position:], ids[position+1:])
+	ids = ids[:len(ids)-1]
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedOperationDirectory(authority.scratch, ids)
+	if err != nil {
+		return err
+	}
+	recordDigest := sha256.Sum256(current.Value)
+	directoryDigest := sha256.Sum256(directoryResult.Value)
+	result, err := authority.session.MutateBatch(ctx, []NativeMutation{
+		{Kind: replication.MutationDeleteDigestEqual, Key: key[:],
+			ExpectedValueLength: uint64(len(current.Value)),
+			ExpectedValueDigest: replication.Digest(recordDigest)},
+		{Kind: replication.MutationPutDigestEqual, Key: replicatedOperationDirectoryKey[:],
+			Value: authority.scratch, ExpectedValueLength: uint64(len(directoryResult.Value)),
+			ExpectedValueDigest: replication.Digest(directoryDigest)},
+	})
 	if err != nil {
 		if authority.session.Status().Pending {
 			return errors.Join(ErrReplicatedCatalogPending, err)

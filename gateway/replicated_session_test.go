@@ -23,6 +23,7 @@ type nativeSessionClient struct {
 	retriedCommand      []byte
 	applied             uint64
 	probes              int
+	lastMutationCount   int
 }
 
 func (client *nativeSessionClient) DoReplicated(
@@ -39,6 +40,9 @@ func (client *nativeSessionClient) DoReplicated(
 	command, err := replication.OpenCommand(request.Command)
 	if err != nil {
 		return nil, err
+	}
+	if command.Kind() == replication.CommandMutationBatch {
+		client.lastMutationCount = command.MutationCount()
 	}
 	if command.Kind() == replication.CommandMutationBatch && client.unknownMutationOnce &&
 		!client.mutationUnknownSeen {
@@ -215,6 +219,43 @@ func TestNativeSessionRetryPreservesUnknownAcrossCalls(t *testing.T) {
 		!bytes.Equal(want, session.PendingCommand()) ||
 		!bytes.Equal(want, client.retriedCommand) {
 		t.Fatalf("retry refusal = %T %v status=%+v", err, err, session.Status())
+	}
+}
+
+func TestNativeSessionMutateBatchCarriesOneAtomicOrderedCommand(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	client := &nativeSessionClient{state: states["m2"]}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: executor, Route: route, Distribution: "orders", Shard: "0000-ffff",
+		Tenant: []byte("tenant"), ClientID: replication.ID128{0x51},
+		Resolver: BaseRelationResolver{Relation: 1}, MaxRelationBatches: 1,
+		MaxMutations: 2, InitialCommandBytes: 512, MaxCommandBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Open(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.MutateBatch(context.Background(), []NativeMutation{
+		{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{1}, Value: []byte(`{"id":1}`)},
+		{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{2}, Value: []byte(`{"id":2}`)},
+	})
+	if err != nil || result.Completion.ResultCode != replicatedstate.ResultApplied ||
+		client.lastMutationCount != 2 || client.applied != 2 {
+		t.Fatalf("batch result=%+v mutations=%d applied=%d err=%v",
+			result, client.lastMutationCount, client.applied, err)
+	}
+	if _, err = session.MutateBatch(context.Background(), []NativeMutation{
+		{Kind: replication.MutationPut, Key: []byte{1}, Value: []byte(`{}`)},
+		{Kind: replication.MutationPut, Key: []byte{2}, Value: []byte(`{}`)},
+		{Kind: replication.MutationPut, Key: []byte{3}, Value: []byte(`{}`)},
+	}); !errors.Is(err, ErrNativeBundleBound) {
+		t.Fatalf("oversized logical batch = %v", err)
 	}
 }
 

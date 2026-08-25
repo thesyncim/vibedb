@@ -18,6 +18,7 @@ var ErrReplicatedExecution = errors.New("splitcontroller: replicated operation r
 // consensus mechanism is permitted at this boundary.
 type ReplicatedOperationJournal interface {
 	ReadOperation(context.Context, [32]byte) (gateway.ReplicatedOperationRecord, error)
+	SubmitOperation(context.Context, gateway.ReplicatedOperationRecord) error
 	PublishOperation(context.Context, uint64, gateway.ReplicatedOperationRecord) error
 	DeleteOperation(context.Context, [32]byte, uint64) error
 	RetryPending(context.Context) error
@@ -65,7 +66,7 @@ func ExecuteReplicatedStep(
 			CatalogGeneration: observed.Catalog.Generation(), Cursor: wantCursor,
 			Proof: wantProof, IntentDigest: intentDigest, Intent: intent,
 		}
-		if err := settleReplicatedOperationPublish(ctx, journal, 0, record); err != nil {
+		if err := settleReplicatedOperationSubmit(ctx, journal, record); err != nil {
 			return Action{}, err
 		}
 	case readErr != nil:
@@ -118,6 +119,25 @@ func ExecuteReplicatedStep(
 		}
 	}
 	return action, execute(ctx, plan.OperationID(), action)
+}
+
+func settleReplicatedOperationSubmit(
+	ctx context.Context,
+	journal ReplicatedOperationJournal,
+	record gateway.ReplicatedOperationRecord,
+) error {
+	err := journal.SubmitOperation(ctx, record)
+	if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		return err
+	}
+	if err = journal.RetryPending(ctx); err != nil {
+		return err
+	}
+	settled, err := journal.ReadOperation(ctx, record.ID)
+	if err != nil || !settled.Equal(record) {
+		return errors.Join(err, ErrReplicatedExecution)
+	}
+	return nil
 }
 
 func settleReplicatedOperationPublish(
