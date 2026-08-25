@@ -238,12 +238,12 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if err := hosts[1].RequestCampaign(group); err != nil {
 		t.Fatal(err)
 	}
-	cluster.driveUntilWithActiveVoterTicks(func() bool {
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
 		left, leftErr := hosts[1].Status(group)
 		right, rightErr := hosts[2].Status(group)
 		return leftErr == nil && rightErr == nil && left.LeaderID != 0 &&
 			left.LeaderID == right.LeaderID && left.LeaderID != target
-	}, 2*raftmodel.ElectionTick)
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if err := hosts[3].Close(); err != nil {
 		t.Fatal(err)
 	}

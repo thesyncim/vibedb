@@ -352,6 +352,65 @@ func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
 	}
 }
 
+// driveUntilWithStaggeredVoterClocks advances two independent voter clocks in
+// bounded phases. Deterministic in-memory hosts otherwise begin with identical
+// election-timeout state; ticking them in lockstep can make both self-vote in
+// the same term forever when the third voter is intentionally unavailable.
+//
+// Every tick below is a real Raft input. After each input, driveUntilIdle
+// persists every Ready and routes every authenticated outbound message before
+// another clock advances. The first voter's expired lease lets it vote when
+// the second voter campaigns in the later phase; no vote, leader, publication,
+// or applied-position witness is synthesized.
+func (cluster *realTransferCluster) driveUntilWithStaggeredVoterClocks(
+	done func() bool,
+	firstMember, secondMember uint64,
+	maxTickRoundsPerVoter int,
+) {
+	cluster.t.Helper()
+	if firstMember == 0 || secondMember == 0 || firstMember == secondMember ||
+		maxTickRoundsPerVoter <= 0 {
+		cluster.t.Fatal("staggered voter clock bounds must name two distinct voters")
+	}
+	step := 0
+	for phase, member := range [...]uint64{firstMember, secondMember} {
+		index, found := cluster.memberIndex[member]
+		if !found || cluster.inactive[index] {
+			cluster.t.Fatalf("staggered voter %d is unavailable in phase %d", member, phase)
+		}
+		for tickRound := 0; tickRound < maxTickRoundsPerVoter; tickRound++ {
+			doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+			if doneReached {
+				cluster.drainConvergedWorkToIdle(done, &step)
+				return
+			}
+			status, statusErr := cluster.hosts[index].Status(cluster.group)
+			publication, publicationErr := cluster.hosts[index].Publication(cluster.group)
+			if statusErr != nil || publicationErr != nil {
+				cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+			}
+			if status.MemberID != member || !confHasVoter(publication.ConfState, member) {
+				cluster.t.Fatalf("staggered member %d is not an active voter at idle step %d: %s",
+					member, idleStep, cluster.diagnostic())
+			}
+			if err := cluster.hosts[index].RequestTick(cluster.group); err != nil {
+				cluster.t.Fatalf("tick staggered voter %d at idle step %d phase %d round %d: %v",
+					member, idleStep, phase, tickRound, err)
+			}
+			step++
+		}
+	}
+	// Consume the final admitted tick and all of its resulting protocol work
+	// before reporting failure, preserving the one-input-at-an-idle-cut rule.
+	doneReached, _ := cluster.driveUntilIdle(done, &step)
+	if doneReached {
+		cluster.drainConvergedWorkToIdle(done, &step)
+		return
+	}
+	cluster.t.Fatalf("cluster election did not converge after %d staggered tick rounds per voter: %s",
+		maxTickRoundsPerVoter, cluster.diagnostic())
+}
+
 // drainConvergedWorkToIdle consumes only Ready and outbound work already made
 // pending by the election that satisfied done. A status/publication predicate
 // can become true before the new leader's no-op Ready and messages have crossed
