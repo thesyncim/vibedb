@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -46,6 +47,12 @@ type ReplicatedServer struct {
 	failed        atomic.Uint64
 	active        atomic.Uint64
 	frameRejected atomic.Uint64
+
+	proposalUnknownSubmit            atomic.Uint64
+	proposalUnknownAbandoned         atomic.Uint64
+	proposalInvalidCompletion        atomic.Uint64
+	proposalInvalidDeterministic     atomic.Uint64
+	proposalInvalidCompletionReasons atomic.Uint64
 }
 
 // BindAuthorization installs the sole production authorization gate before
@@ -109,7 +116,50 @@ type ReplicatedServerStats struct {
 	Active             uint64
 	FrameRejected      uint64
 	InFlightFrameBytes int64
+
+	ProposalUnknownSubmit            uint64
+	ProposalUnknownAbandoned         uint64
+	ProposalInvalidCompletion        uint64
+	ProposalInvalidDeterministic     uint64
+	ProposalInvalidCompletionReasons ReplicatedCompletionInvalidReason
 }
+
+// ReplicatedCompletionInvalidReason is an allocation-free diagnostic bit set
+// for a completed proposal that could not be represented by the canonical
+// completion response. Multiple bits may be present. These values describe
+// only server-side invariant failures; ordinary unknown outcomes have separate
+// counters in ReplicatedServerStats.
+type ReplicatedCompletionInvalidReason uint64
+
+const (
+	ReplicatedCompletionInvalidNil ReplicatedCompletionInvalidReason = 1 << iota
+	ReplicatedCompletionInvalidState
+	ReplicatedCompletionInvalidCompletionBound
+	ReplicatedCompletionInvalidCompletionBytes
+	ReplicatedCompletionInvalidValueBound
+	ReplicatedCompletionInvalidEnvelope
+	ReplicatedCompletionInvalidSequence
+	ReplicatedCompletionInvalidClusterID
+	ReplicatedCompletionInvalidClusterIncarnation
+	ReplicatedCompletionInvalidTopologyRecoveryEpoch
+	ReplicatedCompletionInvalidShardIncarnation
+	ReplicatedCompletionInvalidGroupID
+	ReplicatedCompletionInvalidAllocationGeneration
+	ReplicatedCompletionInvalidReplicaSetVersion
+	ReplicatedCompletionInvalidActivePolicyGeneration
+	ReplicatedCompletionInvalidProtectionEpoch
+	ReplicatedCompletionInvalidRoutingVersion
+	ReplicatedCompletionInvalidRouteGeneration
+	ReplicatedCompletionInvalidKind
+	ReplicatedCompletionInvalidRefusal
+	ReplicatedCompletionInvalidRequestDigest
+	ReplicatedCompletionInvalidOutcomeCode
+	ReplicatedCompletionInvalidAppliedIndex
+	ReplicatedCompletionInvalidEmptyCompletion
+	ReplicatedCompletionInvalidReadApplied
+	ReplicatedCompletionInvalidValue
+	ReplicatedCompletionInvalidStateBehind
+)
 
 // NewReplicatedServer binds the native RF3 protocol to one serialized owner
 // lane. Command construction must still explicitly supply authenticated client
@@ -204,8 +254,14 @@ func (server *ReplicatedServer) Stats() ReplicatedServerStats {
 	return ReplicatedServerStats{
 		Accepted: server.accepted.Load(), Rejected: server.rejected.Load(),
 		Failed: server.failed.Load(), Active: server.active.Load(),
-		FrameRejected:      server.frameRejected.Load(),
-		InFlightFrameBytes: server.frames.used.Load(),
+		FrameRejected:                server.frameRejected.Load(),
+		InFlightFrameBytes:           server.frames.used.Load(),
+		ProposalUnknownSubmit:        server.proposalUnknownSubmit.Load(),
+		ProposalUnknownAbandoned:     server.proposalUnknownAbandoned.Load(),
+		ProposalInvalidCompletion:    server.proposalInvalidCompletion.Load(),
+		ProposalInvalidDeterministic: server.proposalInvalidDeterministic.Load(),
+		ProposalInvalidCompletionReasons: ReplicatedCompletionInvalidReason(
+			server.proposalInvalidCompletionReasons.Load()),
 	}
 }
 
@@ -440,6 +496,9 @@ func (server *ReplicatedServer) executeReplicated(
 		if validReplicatedResponse(response) {
 			return response
 		}
+		server.proposalInvalidCompletion.Add(1)
+		server.proposalInvalidCompletionReasons.Or(
+			uint64(replicatedCompletionInvalidReasons(response)))
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	}
 	// Refresh the leader hint after a definite owner-lane refusal. The refresh
@@ -455,6 +514,7 @@ func (server *ReplicatedServer) executeReplicated(
 		errors.Is(err, context.DeadlineExceeded):
 		// SubmitOwned was entered with a complete canonical proposal. A local
 		// deadline cannot prove whether admission won the cancellation race.
+		server.proposalUnknownSubmit.Add(1)
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrServingFence):
 		return &ReplicatedResponse{
@@ -463,6 +523,7 @@ func (server *ReplicatedServer) executeReplicated(
 		}
 	case result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
 		errors.Is(err, raftserve.ErrProposalAbandoned):
+		server.proposalUnknownAbandoned.Add(1)
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case result.Outcome.Code == raftserve.OutcomeProposalRefused ||
 		errors.Is(err, raftserve.ErrProposalRefused):
@@ -480,6 +541,7 @@ func (server *ReplicatedServer) executeReplicated(
 		if validReplicatedResponse(response) {
 			return response
 		}
+		server.proposalInvalidDeterministic.Add(1)
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrIngressFull),
 		errors.Is(err, raftservice.ErrPendingProposalsFull):
@@ -493,6 +555,97 @@ func (server *ReplicatedServer) executeReplicated(
 			HasState: true, State: wireState,
 		}
 	}
+}
+
+func replicatedCompletionInvalidReasons(
+	response *ReplicatedResponse,
+) ReplicatedCompletionInvalidReason {
+	if response == nil {
+		return ReplicatedCompletionInvalidNil
+	}
+	reasons := ReplicatedCompletionInvalidReason(0)
+	if !response.HasState || !validReplicatedMemberState(response.State) {
+		reasons |= ReplicatedCompletionInvalidState
+	}
+	if len(response.Completion) > replication.MaxEmptyResultCompletionEnvelopeBytes {
+		reasons |= ReplicatedCompletionInvalidCompletionBound
+	}
+	if response.Outcome.CompletionBytes != len(response.Completion) {
+		reasons |= ReplicatedCompletionInvalidCompletionBytes
+	}
+	if len(response.Value) > replication.MaxMutationValueBytes {
+		reasons |= ReplicatedCompletionInvalidValueBound
+	}
+	completion, err := replication.OpenCompletion(response.Completion)
+	if err != nil {
+		reasons |= ReplicatedCompletionInvalidEnvelope
+	} else {
+		if completion.AppliedSequence != response.Outcome.CompletionAppliedSequence {
+			reasons |= ReplicatedCompletionInvalidSequence
+		}
+		if completion.ClusterID != response.State.Fence.Group.ClusterID {
+			reasons |= ReplicatedCompletionInvalidClusterID
+		}
+		if completion.ClusterIncarnation != response.State.Fence.Group.ClusterIncarnation {
+			reasons |= ReplicatedCompletionInvalidClusterIncarnation
+		}
+		if completion.TopologyRecoveryEpoch != response.State.Fence.Group.TopologyRecoveryEpoch {
+			reasons |= ReplicatedCompletionInvalidTopologyRecoveryEpoch
+		}
+		if completion.ShardIncarnation != response.State.Fence.Group.ShardIncarnation {
+			reasons |= ReplicatedCompletionInvalidShardIncarnation
+		}
+		if completion.GroupID != response.State.Fence.Group.GroupID {
+			reasons |= ReplicatedCompletionInvalidGroupID
+		}
+		if completion.AllocationGeneration != response.State.Fence.AllocationGeneration {
+			reasons |= ReplicatedCompletionInvalidAllocationGeneration
+		}
+		if completion.ReplicaSetVersion != response.State.Fence.Command.ReplicaSetVersion {
+			reasons |= ReplicatedCompletionInvalidReplicaSetVersion
+		}
+		if completion.ActivePolicyGeneration != response.State.Fence.Command.ActivePolicyGeneration {
+			reasons |= ReplicatedCompletionInvalidActivePolicyGeneration
+		}
+		if completion.ProtectionEpoch != response.State.Fence.Command.ProtectionEpoch {
+			reasons |= ReplicatedCompletionInvalidProtectionEpoch
+		}
+		if completion.RoutingVersion != response.State.Fence.Command.RoutingVersion {
+			reasons |= ReplicatedCompletionInvalidRoutingVersion
+		}
+		if completion.RouteGeneration != response.State.Fence.Command.RouteGeneration {
+			reasons |= ReplicatedCompletionInvalidRouteGeneration
+		}
+	}
+	if response.Kind != ReplicatedCompletion {
+		reasons |= ReplicatedCompletionInvalidKind
+	}
+	if response.Refusal != ReplicatedRefusalNone {
+		reasons |= ReplicatedCompletionInvalidRefusal
+	}
+	if response.RequestDigest == ([sha256.Size]byte{}) {
+		reasons |= ReplicatedCompletionInvalidRequestDigest
+	}
+	if response.Outcome.Code != raftserve.OutcomeCompletion {
+		reasons |= ReplicatedCompletionInvalidOutcomeCode
+	}
+	if response.Outcome.AppliedIndex == 0 {
+		reasons |= ReplicatedCompletionInvalidAppliedIndex
+	}
+	if len(response.Completion) == 0 {
+		reasons |= ReplicatedCompletionInvalidEmptyCompletion
+	}
+	if response.ReadApplied != 0 {
+		reasons |= ReplicatedCompletionInvalidReadApplied
+	}
+	if len(response.Value) != 0 {
+		reasons |= ReplicatedCompletionInvalidValue
+	}
+	if response.HasState && response.Outcome.AppliedIndex != 0 &&
+		response.State.Applied < response.Outcome.AppliedIndex {
+		reasons |= ReplicatedCompletionInvalidStateBehind
+	}
+	return reasons
 }
 
 func membershipRefusal(state ReplicatedMemberState, code ReplicatedRefusalCode) *ReplicatedResponse {

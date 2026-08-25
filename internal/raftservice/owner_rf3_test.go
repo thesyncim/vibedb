@@ -238,6 +238,21 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	if err != nil {
 		t.Fatalf("RF3 Put: %v", err)
 	}
+	// The network server transfers its exact frame allocation through
+	// SubmitOwned. Replaying the same canonical bytes at a stable leader must
+	// consume the retained deterministic result without another proposal or an
+	// outcome-unknown handoff.
+	ownedRetry := make([]byte, len(putData))
+	copy(ownedRetry, putData)
+	replayed, err := owners[leader].SubmitOwned(ctx, leaderState.Fence(), ownedRetry)
+	if err != nil {
+		t.Fatalf("stable-leader owned exact retry: %v", err)
+	}
+	if replayed.Outcome != acknowledged.Outcome ||
+		!bytes.Equal(replayed.Completion, acknowledged.Completion) {
+		t.Fatalf("stable-leader owned exact retry changed result: first=%+v retry=%+v",
+			acknowledged.Outcome, replayed.Outcome)
+	}
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
 	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
