@@ -237,6 +237,10 @@ func TestFilePrimaryCollisionGapIsCompactAndSnapshotSafe(t *testing.T) {
 	ref := seedBufferedInlinePrimaryLeaf(
 		t, collection, []byte(keys[0]), updated,
 	)
+	if collection.options.maxTransactionPhysicalBytes > 64<<20 {
+		t.Fatalf("compact point reservation = %d, want at most 64 MiB",
+			collection.options.maxTransactionPhysicalBytes)
+	}
 	wantOffset := beforeState.fileEnd + collection.options.maxTransactionPhysicalBytes
 	if ref.Offset != wantOffset {
 		t.Fatalf("first volatile offset = %d, want compact boundary %d", ref.Offset, wantOffset)

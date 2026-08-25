@@ -619,6 +619,210 @@ func fileStoreBatchOverflowPages(
 	)
 }
 
+// fileStoreMinimumDistinctKeyBytes is the exact minimum arena cost of count
+// distinct, non-empty byte keys under maxKeyBytes. Ordered-primary keys are
+// arbitrary bytes, so all 256 one-byte spellings are available before a
+// second byte is required. A saturated result means the requested cardinality
+// is not representable under the key-width bound.
+func fileStoreMinimumDistinctKeyBytes(count, maxKeyBytes int) uint64 {
+	if count <= 0 {
+		return 0
+	}
+	if maxKeyBytes <= 0 {
+		return math.MaxUint64
+	}
+	remaining := uint64(count)
+	spellings := uint64(256)
+	total := uint64(0)
+	for width := 1; width <= maxKeyBytes && remaining != 0; width++ {
+		take := min(remaining, spellings)
+		total = fileStoreSaturatingByteAdd(
+			total, fileStoreSaturatingByteProduct64(take, uint64(width)),
+		)
+		remaining -= take
+		if spellings > math.MaxUint64/256 {
+			spellings = math.MaxUint64
+		} else {
+			spellings *= 256
+		}
+	}
+	if remaining != 0 {
+		return math.MaxUint64
+	}
+	return total
+}
+
+func fileStoreSaturatingByteProduct64(left, right uint64) uint64 {
+	if left == 0 || right == 0 {
+		return 0
+	}
+	if left > math.MaxUint64/right {
+		return math.MaxUint64
+	}
+	return left * right
+}
+
+func fileStoreOverflowValueExtentBytes(
+	valueBytes, pageSize, maxPageSize int,
+) uint64 {
+	header := primaryOverflowPageOverhead
+	payload := maxPageSize - header
+	if valueBytes <= 0 || pageSize <= 0 || payload <= 0 {
+		return 0
+	}
+	value := uint64(valueBytes)
+	payloadBytes := uint64(payload)
+	quantum := uint64(pageSize)
+	full := (value - 1) / payloadBytes
+	remainder := value - full*payloadBytes
+	lastRaw := fileStoreSaturatingByteAdd(uint64(header), remainder)
+	lastPadded := fileStoreSaturatingByteAdd(lastRaw, quantum-1)
+	if lastPadded == math.MaxUint64 {
+		return math.MaxUint64
+	}
+	last := lastPadded / quantum * quantum
+	return fileStoreSaturatingByteAdd(
+		fileStoreSaturatingByteProduct64(full, uint64(maxPageSize)), last,
+	)
+}
+
+// fileStoreBatchOverflowExtentBytes bounds the exact cache-resident and
+// physical bytes of every overflow extent in one admitted batch. It is a byte
+// classification bound; fileStoreBatchOverflowPages remains the independent
+// descriptor ceiling.
+//
+// For A active chains, admitted value bytes S are bounded by MaxBatchBytes
+// minus the exact minimum bytes of A distinct non-empty keys, and by
+// A*MaxDocumentBytes. Every value is at least InlineValueBytes+1. The exact
+// maximum page count for that S starts with ceil((Inline+1)/payload) pages per
+// chain, buys each chain's next page at its first boundary, then buys later
+// pages at one full payload apiece. All non-final pages are full MaxPageSize
+// extents. Therefore the complete byte sum is at most
+//
+//	S + pages*overflowHeaderBytes + A*(PageSize-1)
+//
+// and is PageSize-aligned. Only the final extent of each chain can carry
+// rounding slack; charging it per page was the former amplification bug.
+func fileStoreBatchOverflowExtentBytes(
+	documents, maxKeyBytes, inlineValueBytes, maxDocumentBytes,
+	maxBatchBytes, pageSize, maxPageSize int,
+) uint64 {
+	header := primaryOverflowPageOverhead
+	payload := maxPageSize - header
+	if documents <= 0 || maxKeyBytes <= 0 || inlineValueBytes < 0 ||
+		maxDocumentBytes <= inlineValueBytes || maxBatchBytes <= 0 ||
+		pageSize <= 0 || maxPageSize < pageSize || payload <= 0 {
+		return 0
+	}
+	minimumValue := inlineValueBytes + 1
+	minimumChainBytes := uint64(minimumValue) + 1 // at least one key byte
+	activeLimit := documents
+	if uint64(activeLimit) > uint64(maxBatchBytes)/minimumChainBytes {
+		activeLimit = int(uint64(maxBatchBytes) / minimumChainBytes)
+	}
+	// A passing normalized transaction has fewer than 32,768 descriptors, so
+	// this cold option-time loop is bounded. Hostile pre-normalized geometry
+	// fails saturated rather than turning option validation into unbounded work.
+	if activeLimit >= 32768 {
+		return math.MaxUint64
+	}
+	p0 := 1 + (minimumValue-1)/payload
+	pmax := 1 + (maxDocumentBytes-1)/payload
+	maximum := uint64(0)
+	for active := 1; active <= activeLimit; active++ {
+		keyBytes := fileStoreMinimumDistinctKeyBytes(active, maxKeyBytes)
+		if keyBytes == math.MaxUint64 || keyBytes >= uint64(maxBatchBytes) {
+			break
+		}
+		valueBytes := min(
+			uint64(maxBatchBytes)-keyBytes,
+			fileStoreSaturatingByteProduct64(uint64(active), uint64(maxDocumentBytes)),
+		)
+		minimumValues := fileStoreSaturatingByteProduct64(
+			uint64(active), uint64(minimumValue),
+		)
+		if valueBytes < minimumValues {
+			continue
+		}
+		baselinePages := fileStoreSaturatingByteProduct64(uint64(active), uint64(p0))
+		pages := baselinePages
+		if pmax > p0 {
+			extraBytes := valueBytes - minimumValues
+			firstPageCost := uint64(p0)*uint64(payload) + 1 - uint64(minimumValue)
+			firstPages := min(uint64(active), extraBytes/firstPageCost)
+			pages = fileStoreSaturatingByteAdd(pages, firstPages)
+			extraBytes -= firstPages * firstPageCost
+			pageCapacity := fileStoreSaturatingByteProduct64(
+				uint64(active), uint64(pmax-p0),
+			)
+			// Later pages are reachable only after every active chain has crossed
+			// its cheaper first boundary. If not all crossed, the remainder is
+			// smaller than firstPageCost <= payload and cannot buy a later page.
+			if firstPages == uint64(active) && pages-baselinePages < pageCapacity {
+				later := min(
+					pageCapacity-firstPages,
+					extraBytes/uint64(payload),
+				)
+				pages = fileStoreSaturatingByteAdd(pages, later)
+			}
+		}
+		bound := valueBytes
+		bound = fileStoreSaturatingByteAdd(bound,
+			fileStoreSaturatingByteProduct64(pages, uint64(header)))
+		bound = fileStoreSaturatingByteAdd(bound,
+			fileStoreSaturatingByteProduct64(uint64(active), uint64(pageSize-1)))
+		bound = bound / uint64(pageSize) * uint64(pageSize)
+		allMaximum := fileStoreSaturatingByteProduct64(pages, uint64(maxPageSize))
+		documentMaximum := fileStoreSaturatingByteProduct64(
+			uint64(active), fileStoreOverflowValueExtentBytes(
+				maxDocumentBytes, pageSize, maxPageSize,
+			),
+		)
+		maximum = max(maximum, min(bound, min(allMaximum, documentMaximum)))
+	}
+	return maximum
+}
+
+func fileStoreTransactionResidentClassBytes(
+	totalPages, overflowPages, maximumOtherPages, pageSize, maxPageSize int,
+	overflowBytes uint64,
+) uint64 {
+	remaining := max(0, totalPages)
+	overflow := min(max(0, overflowPages), remaining)
+	remaining -= overflow
+	maximum := min(max(0, maximumOtherPages), remaining)
+	remaining -= maximum
+	bytes := overflowBytes
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(maximum, maxPageSize))
+	return fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(remaining, pageSize))
+}
+
+func fileStoreTransactionExtentClassBytes(
+	totalPages, overflowPages, maximumOtherPages, routingParentPages,
+	pageSize, maxPageSize int, overflowBytes uint64,
+) uint64 {
+	remaining := max(0, totalPages)
+	overflow := min(max(0, overflowPages), remaining)
+	remaining -= overflow
+	root := min(1, remaining)
+	remaining -= root
+	maximum := min(max(0, maximumOtherPages), remaining)
+	remaining -= maximum
+	routing := min(max(0, routingParentPages), remaining)
+	remaining -= routing
+	bytes := overflowBytes
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(maximum, maxPageSize))
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(root, storeio.GlobalTabletCatalogRootBytes))
+	bytes = fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(routing, storeio.GlobalTabletCatalogNodeBytes))
+	return fileStoreSaturatingByteAdd(bytes,
+		fileStoreSaturatingByteProduct(remaining, pageSize))
+}
+
 type normalizedFileStoreOptions struct {
 	Options
 	// maxTransactionBytes bounds resident dirty frame bytes. Persisted extent
@@ -1016,6 +1220,14 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		o.MaxBatchDocuments, o.MaxDocumentBytes,
 		o.MaxBatchBytes, overflowPayload,
 	)
+	batchOverflowBytes := fileStoreBatchOverflowExtentBytes(
+		o.MaxBatchDocuments, o.MaxKeyBytes, o.InlineValueBytes,
+		o.MaxDocumentBytes, o.MaxBatchBytes, o.PageSize, o.MaxPageSize,
+	)
+	singleDocumentOverflowBytes := fileStoreBatchOverflowExtentBytes(
+		1, o.MaxKeyBytes, o.InlineValueBytes, o.MaxDocumentBytes,
+		o.MaxBatchBytes, o.PageSize, o.MaxPageSize,
+	)
 	// Derive Put/Delete from the exact same overflow, tree, retirement, and
 	// free-fold inputs as Update, changing only the admitted document count to
 	// one. Keeping both calculations together prevents a new batch consumer
@@ -1048,24 +1260,22 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	// persisted checkpoint namespace is deliberately separate: routing parents
 	// can occupy wider physical extent classes without retaining those padded
 	// bytes in resident frames.
-	batchLargePages := fileStoreSaturatingAdd(
-		batchOverflowPages, o.MaxBatchDocuments,
-	)
-	singleDocumentLargePages := fileStoreSaturatingAdd(
-		singleDocumentOverflowPages, 1,
-	)
+	batchOtherLargePages := o.MaxBatchDocuments
+	singleDocumentOtherLargePages := 1
 	if len(compiled) != 0 {
-		batchLargePages = fileStoreSaturatingAdd(batchLargePages, 1)
-		singleDocumentLargePages = fileStoreSaturatingAdd(
-			singleDocumentLargePages, 1,
+		batchOtherLargePages = fileStoreSaturatingAdd(batchOtherLargePages, 1)
+		singleDocumentOtherLargePages = fileStoreSaturatingAdd(
+			singleDocumentOtherLargePages, 1,
 		)
 	}
-	docMaxTransactionBytes := fileStoreTransactionResidentBytes(
-		docMaxTransactionPages, batchLargePages, o.PageSize, o.MaxPageSize,
+	docMaxTransactionBytes := fileStoreTransactionResidentClassBytes(
+		docMaxTransactionPages, batchOverflowPages, batchOtherLargePages,
+		o.PageSize, o.MaxPageSize, batchOverflowBytes,
 	)
-	docSingleDocumentBytes := fileStoreTransactionResidentBytes(
-		docSingleDocumentPages, singleDocumentLargePages,
-		o.PageSize, o.MaxPageSize,
+	docSingleDocumentBytes := fileStoreTransactionResidentClassBytes(
+		docSingleDocumentPages, singleDocumentOverflowPages,
+		singleDocumentOtherLargePages, o.PageSize, o.MaxPageSize,
+		singleDocumentOverflowBytes,
 	)
 	// Exact-index maintenance stages, in the same transaction as the document
 	// mutation or checkpoint, the dirty term leaves the fold re-encoded plus
@@ -1117,17 +1327,15 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	maxTransactionBytes := docMaxTransactionBytes + exactIndexBytes
 	singleDocumentTransactionBytes := docSingleDocumentBytes + exactIndexBytes
-	maxTransactionPhysicalBytes := fileStoreTransactionExtentBytes(
+	maximumOtherPages := fileStoreSaturatingAdd(
+		fileStoreSaturatingAdd(o.MaxBatchDocuments, compiledPackedPages),
+		exactIndexPages,
+	)
+	maxTransactionPhysicalBytes := fileStoreTransactionExtentClassBytes(
 		maxTransactionPages,
-		fileStoreSaturatingAdd(
-			fileStoreSaturatingAdd(
-				fileStoreSaturatingAdd(batchOverflowPages, o.MaxBatchDocuments),
-				compiledPackedPages,
-			),
-			exactIndexPages,
-		),
+		batchOverflowPages, maximumOtherPages,
 		4*min(o.MaxBatchDocuments, filePrimaryPendingParentLimit),
-		o.PageSize, o.MaxPageSize,
+		o.PageSize, o.MaxPageSize, batchOverflowBytes,
 	)
 	// The class-5 overlay is bounded independently of MaxBatchDocuments. Its
 	// runtime dirty-bucket limit is the largest prefix of the fixed 1,024-bucket

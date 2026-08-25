@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -444,17 +445,29 @@ func TestBatchOverflowAggregateBoundsResidentAndPhysicalReservation(t *testing.T
 	if perDocumentPages != 5 {
 		t.Fatalf("per-document overflow pages = %d, want 5", perDocumentPages)
 	}
-	maximumResidentPages := batchOverflowPages + documents
-	wantResident := uint64(maximumResidentPages)*uint64(normalized.MaxPageSize) +
-		uint64(normalized.maxTransactionPages-maximumResidentPages)*uint64(normalized.PageSize)
+	overflowBytes := fileStoreBatchOverflowExtentBytes(
+		documents, normalized.MaxKeyBytes, normalized.InlineValueBytes,
+		normalized.MaxDocumentBytes, normalized.MaxBatchBytes,
+		normalized.PageSize, normalized.MaxPageSize,
+	)
+	wantOverflowBytes := uint64(documents) * fileStoreOverflowValueExtentBytes(
+		normalized.MaxDocumentBytes, normalized.PageSize, normalized.MaxPageSize,
+	)
+	if overflowBytes != wantOverflowBytes || overflowBytes != 1_064_960 {
+		t.Fatalf("aggregate overflow bytes = %d, want %d", overflowBytes, wantOverflowBytes)
+	}
+	wantResident := fileStoreTransactionResidentClassBytes(
+		normalized.maxTransactionPages, batchOverflowPages, documents,
+		normalized.PageSize, normalized.MaxPageSize, overflowBytes,
+	)
 	if normalized.maxTransactionBytes != wantResident {
 		t.Fatalf("resident batch bound = %d, want %d", normalized.maxTransactionBytes, wantResident)
 	}
-	wantPhysical := fileStoreTransactionExtentBytes(
+	wantPhysical := fileStoreTransactionExtentClassBytes(
 		normalized.maxTransactionPages,
-		maximumResidentPages,
+		batchOverflowPages, documents,
 		4*documents,
-		normalized.PageSize, normalized.MaxPageSize,
+		normalized.PageSize, normalized.MaxPageSize, overflowBytes,
 	)
 	if normalized.maxTransactionPhysicalBytes != wantPhysical {
 		t.Fatalf("physical batch bound = %d, want %d",
@@ -522,6 +535,185 @@ func TestBatchOverflowAggregateBoundsResidentAndPhysicalReservation(t *testing.T
 		indexedNormalized.maxTransactionPhysicalBytes <= normalized.maxTransactionPhysicalBytes {
 		t.Fatal("indexed overflow geometry did not add exact-index reservation")
 	}
+}
+
+func bruteBatchOverflowExtentBytes(
+	documents, maxKeyBytes, inlineValueBytes, maxDocumentBytes,
+	maxBatchBytes, pageSize, maxPageSize int,
+) uint64 {
+	best := uint64(0)
+	for active := 1; active <= documents; active++ {
+		keys := fileStoreMinimumDistinctKeyBytes(active, maxKeyBytes)
+		if keys >= uint64(maxBatchBytes) {
+			continue
+		}
+		budget := maxBatchBytes - int(keys)
+		unreachable := ^uint64(0)
+		current := make([]uint64, budget+1)
+		for index := 1; index < len(current); index++ {
+			current[index] = unreachable
+		}
+		for count := 0; count < active; count++ {
+			next := make([]uint64, budget+1)
+			for index := range next {
+				next[index] = unreachable
+			}
+			for used, reward := range current {
+				if reward == unreachable {
+					continue
+				}
+				for value := inlineValueBytes + 1; value <= maxDocumentBytes && used+value <= budget; value++ {
+					candidate := reward + fileStoreOverflowValueExtentBytes(
+						value, pageSize, maxPageSize,
+					)
+					if next[used+value] == unreachable || candidate > next[used+value] {
+						next[used+value] = candidate
+					}
+				}
+			}
+			current = next
+		}
+		for _, reward := range current {
+			if reward != unreachable {
+				best = max(best, reward)
+			}
+		}
+	}
+	return best
+}
+
+func TestBatchOverflowExtentByteBoundMatchesAdversarialOracle(t *testing.T) {
+	const (
+		pageSize    = 256
+		maxPageSize = 1024
+	)
+	for _, test := range []struct {
+		name                               string
+		documents, inline, document, batch int
+	}{
+		{name: "no-overflow", documents: 4, inline: 200, document: 200, batch: 1000},
+		{name: "batch-below-one-chain", documents: 4, inline: 1, document: 20, batch: 2},
+		{name: "first-class-below", documents: 4, inline: 1, document: 124, batch: 260},
+		{name: "first-class-cross", documents: 4, inline: 124, document: 125, batch: 504},
+		{name: "mixed-first-classes", documents: 3, inline: 1, document: 180, batch: 320},
+		{name: "full-page-boundary", documents: 3, inline: 120, document: 893, batch: 1800},
+		{name: "two-page-mixed", documents: 3, inline: 125, document: 1000, batch: 2200},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := fileStoreBatchOverflowExtentBytes(
+				test.documents, 8, test.inline, test.document, test.batch,
+				pageSize, maxPageSize,
+			)
+			want := bruteBatchOverflowExtentBytes(
+				test.documents, 8, test.inline, test.document, test.batch,
+				pageSize, maxPageSize,
+			)
+			if got < want {
+				t.Fatalf("certified bytes = %d, brute-force maximum = %d", got, want)
+			}
+			if got > want+uint64(test.documents*pageSize) {
+				t.Fatalf("certified bytes = %d, brute-force maximum = %d; class slack exceeds one final quantum per chain", got, want)
+			}
+		})
+	}
+	if got := fileStoreMinimumDistinctKeyBytes(256, 2); got != 256 {
+		t.Fatalf("256 one-byte keys cost %d", got)
+	}
+	if got := fileStoreMinimumDistinctKeyBytes(257, 2); got != 258 {
+		t.Fatalf("257 shortest keys cost %d", got)
+	}
+	if allocations := testing.AllocsPerRun(1_000, func() {
+		if fileStoreBatchOverflowExtentBytes(
+			64, 256, 512, 4<<20, 20<<20, 4096, 64<<10,
+		) == 0 {
+			panic("missing overflow byte bound")
+		}
+	}); allocations != 0 {
+		t.Fatalf("overflow byte bound allocations = %.1f, want zero", allocations)
+	}
+	if got := fileStoreBatchOverflowExtentBytes(
+		math.MaxInt, math.MaxInt, 1, math.MaxInt,
+		math.MaxInt, 4096, 64<<10,
+	); got != math.MaxUint64 {
+		t.Fatalf("hostile overflow geometry = %d, want saturated", got)
+	}
+}
+
+func TestBatchOverflowExtentByteBoundAdmitsRealClassBoundaryBatches(t *testing.T) {
+	const inline = 512
+	run := func(t *testing.T, sizes []int) {
+		t.Helper()
+		maximum := 0
+		for _, size := range sizes {
+			maximum = max(maximum, size)
+		}
+		options := testBatchOptions(len(sizes))
+		options.OpaqueValues = true
+		options.Indexes = nil
+		options.MaxKeyBytes = 16
+		options.InlineValueBytes = inline
+		options.MaxDocumentBytes = maximum
+		options.MaxBatchBytes = len(sizes) * (maximum + options.MaxKeyBytes)
+		options.ResidentBytes = 64 << 20
+		normalized, err := options.normalized()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A successful batch with an arena sized to the certified resident
+		// bound proves that the real dirty set fits the classification.
+		options.ResidentBytes = int64(normalized.maxTransactionBytes)
+		collection, _ := openBatchCollection(t, options)
+		before := collection.durableState.Load()
+		if before == nil {
+			t.Fatal("missing initial durable state")
+		}
+		if err := collection.Update(func(batch *WriteBatch) error {
+			for index, size := range sizes {
+				key := fmt.Appendf(nil, "class-%03d", index)
+				value := bytes.Repeat([]byte{byte(index)}, size)
+				if putErr := batch.Put(key, value); putErr != nil {
+					return putErr
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("class-boundary batch: %v", err)
+		}
+		after := collection.durableState.Load()
+		if after == nil || after.fileEnd < before.fileEnd {
+			t.Fatal("invalid state after class-boundary batch")
+		}
+		if appended := after.fileEnd - before.fileEnd; appended > normalized.maxTransactionPhysicalBytes {
+			t.Fatalf("class-boundary batch appended %d bytes, physical bound %d",
+				appended, normalized.maxTransactionPhysicalBytes)
+		}
+	}
+
+	t.Run("many-just-over-inline", func(t *testing.T) {
+		sizes := make([]int, 64)
+		for index := range sizes {
+			sizes[index] = inline + 1
+		}
+		run(t, sizes)
+	})
+	t.Run("mixed-exact-extent-classes", func(t *testing.T) {
+		const (
+			pageSize    = 4096
+			maxPageSize = 64 << 10
+			header      = primaryOverflowPageOverhead
+			payload     = maxPageSize - header
+		)
+		run(t, []int{
+			inline + 1,
+			pageSize - header,
+			pageSize - header + 1,
+			2*pageSize - header,
+			2*pageSize - header + 1,
+			payload,
+			payload + 1,
+			2*payload + 1,
+		})
+	})
 }
 
 // TestCollectionUpdateOverflowSnapshotRetirementPressureIsFailureAtomic fills
