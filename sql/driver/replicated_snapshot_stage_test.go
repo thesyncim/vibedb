@@ -31,6 +31,7 @@ func TestReplicatedSnapshotStageInstallsExactBaseAndRetriesActivation(t *testing
 	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applyReplicatedApplySessionOpen(t, apply, sourceIdentity, 2)
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +90,7 @@ func TestReplicatedSnapshotStageRejectsWrongBindingAndCorruption(t *testing.T) {
 	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
+	applyReplicatedApplySessionOpen(t, apply, identity, 2)
 	cut, err := apply.SnapshotArtifactCut()
 	if err != nil {
 		t.Fatal(err)

@@ -505,13 +505,24 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 		t.Fatalf("mismatched staged WAL created namespace: %v", err)
 	}
 
+	replacementPath := filepath.Join(t.TempDir(), "replacement.wal")
 	newWAL, err := CreateStagedChildWAL(
-		filepath.Join(t.TempDir(), "replacement.wal"), identity, testWALKey(),
+		replacementPath, identity, testWALKey(),
 		testTopologyRecoveryEpoch, testAuthorityProfile(), fixture.base, activation,
 		fixture.options,
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err = newWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newWAL, err = OpenOrCreateStagedChildWAL(
+		replacementPath, identity, testWALKey(), testTopologyRecoveryEpoch,
+		testAuthorityProfile(), fixture.base, activation, fixture.options,
+	)
+	if err != nil {
+		t.Fatalf("settle existing staged WAL: %v", err)
 	}
 	if err := fixture.runtime.Close(); err != nil {
 		_ = newWAL.Close()
