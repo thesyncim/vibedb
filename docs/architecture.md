@@ -156,13 +156,18 @@ exposed. A planned WAL identity breaks the bootstrap cycle. The final WAL is
 allocated once from the newer snapshot base and is rechecked against the SQL
 binding before the existing Raft runtime can adopt it.
 
-The certificate is evidence, not topology authority. Retained cleanup plans
-bounded ordered key batches, checkpoints each batch before proposal, and
-confirms only the exact atomically captured replicated deletes. A final fresh
-scan certifies the retained image. The gateway accepts that completion proof
-only with the exact one-source manifest replacement. Durable and in-memory
-authority still move through the catalog's generation compare-and-swap
-operations.
+The certificate is evidence, not topology authority. It authorizes only the
+conditional catalog successor after every child is ready. The catalog CAS is
+published durably before destructive cleanup; older catalog leases must then drain.
+An unforgeable sealed catalog capability binds the durable CAS receipt, drained serving generation,
+operation identity, manifest, and cutover certificate. Only that witness authorizes retained cleanup, which plans bounded
+ordered key batches, checkpoints each batch before proposal, and confirms exact
+atomically captured replicated deletes. Concurrent retained-range writes are
+advanced one captured entry at a time. The current serving path can apply and
+capture an out-of-range post-publication write; cleanup then detects that entry
+and halts before further pruning or completion. A final persisted, bounded incremental scan certifies the retained
+image without an unbounded controller turn. A crash may leave
+duplicate physical bytes, but never a routing gap or overlapping authority.
 
 The internal topology scheduler has a second non-serving path for replica
 movement. It consumes fixed-width, exact-generation capacity reports, nets
