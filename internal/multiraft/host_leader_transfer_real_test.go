@@ -290,68 +290,6 @@ func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) 
 		cluster.diagnostic())
 }
 
-// driveUntilWithActiveVoterTicks advances an election after the former leader
-// has been isolated. Followers correctly retain the old leader lease until
-// ElectionTick logical ticks have elapsed, so an immediate explicit campaign
-// can stop at a protocol-idle pre-vote cut. At each such cut this driver ticks
-// every active voter exactly once, never an inactive former leader or learner.
-// The caller supplies a small protocol-derived tick-round bound; scheduler work
-// retains the ordinary deterministic step bound in driveUntilIdle.
-func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
-	done func() bool,
-	maxTickRounds int,
-) {
-	cluster.t.Helper()
-	if maxTickRounds <= 0 {
-		cluster.t.Fatal("active-voter tick bound must be positive")
-	}
-	step := 0
-	tickRound := 0
-	for {
-		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
-		if doneReached {
-			cluster.drainConvergedWorkToIdle(done, &step)
-			return
-		}
-		if tickRound == maxTickRounds {
-			cluster.t.Fatalf("cluster election did not converge after %d active-voter tick rounds: %s",
-				maxTickRounds, cluster.diagnostic())
-		}
-		ticked := 0
-		for index, host := range cluster.hosts {
-			if cluster.inactive[index] {
-				continue
-			}
-			status, statusErr := host.Status(cluster.group)
-			publication, publicationErr := host.Publication(cluster.group)
-			if statusErr != nil || publicationErr != nil {
-				cluster.t.Fatal(errors.Join(statusErr, publicationErr))
-			}
-			// This driver supplies logical time, not scheduler work. A membership
-			// test can keep the freshly promoted transfer target clock-still while
-			// it processes and authenticates election traffic, proving an existing
-			// RF3 voter wins before the one explicit leadership transfer.
-			if cluster.suppressTargetTicks && status.MemberID == cluster.promotionTarget {
-				continue
-			}
-			if !confHasVoter(publication.ConfState, status.MemberID) {
-				continue
-			}
-			if err := host.RequestTick(cluster.group); err != nil {
-				cluster.t.Fatalf("tick active voter host %d at idle step %d round %d: %v",
-					index, idleStep, tickRound, err)
-			}
-			ticked++
-		}
-		if ticked == 0 {
-			cluster.t.Fatalf("no active voter at protocol-idle step %d tick round %d: %s",
-				idleStep, tickRound, cluster.diagnostic())
-		}
-		tickRound++
-		step++
-	}
-}
-
 // driveUntilWithStaggeredVoterClocks advances two independent voter clocks in
 // bounded phases. Deterministic in-memory hosts otherwise begin with identical
 // election-timeout state; ticking them in lockstep can make both self-vote in
@@ -377,6 +315,9 @@ func (cluster *realTransferCluster) driveUntilWithStaggeredVoterClocks(
 		index, found := cluster.memberIndex[member]
 		if !found || cluster.inactive[index] {
 			cluster.t.Fatalf("staggered voter %d is unavailable in phase %d", member, phase)
+		}
+		if cluster.suppressTargetTicks && member == cluster.promotionTarget {
+			cluster.t.Fatalf("staggered voter %d is the clock-suppressed promotion target", member)
 		}
 		for tickRound := 0; tickRound < maxTickRoundsPerVoter; tickRound++ {
 			doneReached, idleStep := cluster.driveUntilIdle(done, &step)

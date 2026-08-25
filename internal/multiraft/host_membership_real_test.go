@@ -178,7 +178,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	replacementLeader := uint64(0)
-	cluster.driveUntilWithActiveVoterTicks(func() bool {
+	cluster.driveUntilWithStaggeredVoterClocks(func() bool {
 		leader := uint64(0)
 		for index := 1; index < len(hosts); index++ {
 			status, statusErr := hosts[index].Status(group)
@@ -196,7 +196,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		}
 		replacementLeader = leader
 		return true
-	}, 2*raftmodel.ElectionTick)
+	}, voters[1], voters[2], 2*raftmodel.ElectionTick)
 	if !cluster.promotionVoteSeen {
 		t.Fatal("reopened target did not admit promotion-generation election traffic")
 	}
