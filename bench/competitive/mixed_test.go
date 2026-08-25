@@ -2,17 +2,18 @@ package competitive
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"slices"
 	"testing"
+
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestSameSizeUpdatedJSON(t *testing.T) {
 	for i := range min(1000, len(docs)) {
 		got := SameSizeUpdatedJSON(docs, i)
-		if !json.Valid(got) {
+		if !vibejson.Valid(got) {
 			t.Fatalf("document %d update is invalid JSON: %s", i, got)
 		}
 		if len(got) != len(docs[i].JSON) {
@@ -28,7 +29,7 @@ func TestUpdatedJSON(t *testing.T) {
 	var scratch []byte
 	for i := range min(1000, len(docs)) {
 		scratch = AppendUpdatedJSON(scratch[:0], docs, i)
-		if !json.Valid(scratch) {
+		if !vibejson.Valid(scratch) {
 			t.Fatalf("document %d update is invalid JSON: %s", i, scratch)
 		}
 		if len(scratch) <= len(docs[i].JSON) {

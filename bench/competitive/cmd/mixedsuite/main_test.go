@@ -59,6 +59,14 @@ func TestParseEnginesRejectsAmbiguousLists(t *testing.T) {
 	}
 }
 
+func TestMarshalArgvJSONIsExactAndCanonical(t *testing.T) {
+	args := []string{"mixedsuite", "--seed=7", "line\nquote\"", "<html>"}
+	want := `["mixedsuite","--seed=7","line\nquote\"","\u003chtml\u003e"]`
+	if first, second := marshalArgvJSON(args), marshalArgvJSON(args); first != want || second != first {
+		t.Fatalf("argv JSON = %q / %q, want %q", first, second, want)
+	}
+}
+
 func TestEnvironmentWithReplacesExistingValues(t *testing.T) {
 	got := environmentWith(
 		[]string{"KEEP=yes", "LANG=old", "VIBEDB_MIXED_INTERNAL_STATS="},

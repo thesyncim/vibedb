@@ -7,12 +7,12 @@ package mixedtelemetry
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
-	"strings"
+
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
@@ -20,6 +20,13 @@ const (
 	Schema = 1
 	// Prefix lets a parent distinguish the record from ordinary diagnostics.
 	Prefix = "mixed-telemetry-json\t"
+
+	// The child protocol is diagnostic, not a bulk-data channel. Keeping the
+	// complete line bounded prevents a malformed child from growing the parent
+	// scanner or typed decoder without limit.
+	maxTelemetryJSONBytes = 1 << 20
+	// Scanner may need to retain the line terminator while framing a token.
+	maxTelemetryLineBytes = len(Prefix) + maxTelemetryJSONBytes + 1
 )
 
 // Record contains measurements for the timed phase. Counter fields are
@@ -185,14 +192,68 @@ func (r Record) Metrics() []Metric {
 	return metrics
 }
 
-// Write emits exactly one single-line record suitable for stderr transport.
+var (
+	recordEncoder = mustCompileRecordEncoder()
+	recordDecoder = mustCompileRecordDecoder()
+	prefixBytes   = []byte(Prefix)
+)
+
+func mustCompileRecordEncoder() vibejson.Encoder[Record] {
+	encoder, err := vibejson.CompileEncoder[Record](vibejson.EncoderOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return encoder
+}
+
+func mustCompileRecordDecoder() vibejson.Decoder[Record] {
+	decoder, err := vibejson.CompileDecoder[Record](vibejson.DecoderOptions{
+		MaxDepth:              4,
+		ZeroCopy:              true,
+		DisallowUnknownFields: true,
+		CaseSensitive:         true,
+		Replace:               true,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return decoder
+}
+
+// Write emits exactly one bounded single-line record suitable for stderr
+// transport. Integers remain uint64 throughout; no float or dynamic JSON
+// representation can lose counter precision.
 func Write(w io.Writer, record Record) error {
 	record.Schema = Schema
-	data, err := json.Marshal(record)
+	data, err := recordEncoder.AppendJSON(make([]byte, 0, 2048), &record)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "%s%s\n", Prefix, data)
+	if len(data) > maxTelemetryJSONBytes {
+		return fmt.Errorf("mixed telemetry JSON is %d bytes, limit %d", len(data), maxTelemetryJSONBytes)
+	}
+	if err := writeExactString(w, Prefix); err != nil {
+		return err
+	}
+	if err := writeExactBytes(w, data); err != nil {
+		return err
+	}
+	return writeExactString(w, "\n")
+}
+
+func writeExactString(w io.Writer, value string) error {
+	n, err := io.WriteString(w, value)
+	if err == nil && n != len(value) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+func writeExactBytes(w io.Writer, value []byte) error {
+	n, err := w.Write(value)
+	if err == nil && n != len(value) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
@@ -200,20 +261,29 @@ func Write(w io.Writer, record Record) error {
 // diagnostic lines before or after it.
 func Parse(src []byte) (Record, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(src))
-	scanner.Buffer(make([]byte, 4096), 1<<20)
+	scanner.Buffer(make([]byte, 4096), maxTelemetryLineBytes)
 	var (
 		record Record
 		found  bool
 	)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, Prefix) {
+		line := scanner.Bytes()
+		if !bytes.HasPrefix(line, prefixBytes) {
 			continue
 		}
 		if found {
 			return Record{}, errors.New("mixed child emitted multiple telemetry records")
 		}
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, Prefix)), &record); err != nil {
+		payload := line[len(Prefix):]
+		if len(payload) > maxTelemetryJSONBytes {
+			return Record{}, fmt.Errorf(
+				"mixed telemetry JSON is %d bytes, limit %d", len(payload), maxTelemetryJSONBytes,
+			)
+		}
+		// One owned payload lets decoded strings borrow bytes without retaining
+		// or being overwritten by Scanner's reusable input buffer.
+		payload = bytes.Clone(payload)
+		if err := recordDecoder.Decode(payload, &record); err != nil {
 			return Record{}, fmt.Errorf("decode mixed telemetry: %w", err)
 		}
 		found = true
