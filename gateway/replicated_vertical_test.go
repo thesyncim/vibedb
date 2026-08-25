@@ -201,7 +201,8 @@ func (cluster *logicalRF3Cluster) execute(
 		state = cluster.states[member]
 		return &shardservice.ReplicatedResponse{
 			Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
-			Outcome: prior.outcome, Completion: append([]byte(nil), prior.completion...),
+			RequestDigest: replicatedRequestDigest(request.Command),
+			Outcome:       prior.outcome, Completion: append([]byte(nil), prior.completion...),
 		}, false
 	}
 
@@ -250,6 +251,7 @@ func (cluster *logicalRF3Cluster) execute(
 	state = cluster.states[member]
 	return &shardservice.ReplicatedResponse{
 		Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
-		Outcome: outcome, Completion: completion,
+		RequestDigest: replicatedRequestDigest(request.Command),
+		Outcome:       outcome, Completion: completion,
 	}, false
 }

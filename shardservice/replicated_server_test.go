@@ -3,6 +3,7 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -17,14 +18,24 @@ import (
 )
 
 type fakeReplicatedOwner struct {
-	state       raftservice.ServingState
-	result      raftservice.Result
-	err         error
-	blockSubmit bool
-	readResult  raftservice.PointReadResult
-	readErr     error
-	readLease   raftservice.PointReadLease
-	readCalled  chan struct{}
+	state         raftservice.ServingState
+	result        raftservice.Result
+	err           error
+	blockSubmit   bool
+	membershipErr error
+	membership    raftservice.MembershipRequest
+	readResult    raftservice.PointReadResult
+	readErr       error
+	readLease     raftservice.PointReadLease
+	readCalled    chan struct{}
+}
+
+func (owner *fakeReplicatedOwner) ApplyMembership(
+	_ context.Context,
+	request raftservice.MembershipRequest,
+) error {
+	owner.membership = request
+	return owner.membershipErr
 }
 
 func (owner *fakeReplicatedOwner) Probe(
@@ -166,6 +177,43 @@ func testReplicatedServer(owner replicatedOwner) *ReplicatedServer {
 		frames: replicatedFrameByteBudget{limit: 1 << 20}}
 }
 
+func TestReplicatedServerMembershipTypedRefusals(t *testing.T) {
+	fence := testReplicatedFence()
+	state := raftservice.ServingState{Identity: raftmember.RuntimeIdentity{
+		Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+		MemberID: fence.MemberID, StoreID: fence.StoreID, NodeIncarnation: fence.NodeIncarnation},
+		Command: fence.Command, Status: raftmember.RuntimeStatus{MemberID: fence.MemberID,
+			LeaderID: fence.MemberID, Term: fence.Term, Commit: 3, Applied: 3}}
+	membership := ReplicatedMembershipRequest{Kind: raftservice.MembershipAddLearner,
+		TransitionID: [16]byte{1}, MetadataEpoch: 2, CatalogGeneration: 3,
+		ExpectedReplicaSetVersion: fence.Command.ReplicaSetVersion,
+		SourceMember:              fence.MemberID, TargetMember: fence.MemberID + 1}
+	tests := []struct {
+		err  error
+		kind ReplicatedResponseKind
+		code ReplicatedRefusalCode
+	}{
+		{kind: ReplicatedMembershipAccepted},
+		{err: raftservice.ErrMembershipUnauthorized, kind: ReplicatedRefusal,
+			code: ReplicatedRefusalMembershipUnauthorized},
+		{err: raftservice.ErrMembershipStale, kind: ReplicatedRefusal,
+			code: ReplicatedRefusalMembershipStale},
+		{err: raftservice.ErrMembershipMalformed, kind: ReplicatedRefusal,
+			code: ReplicatedRefusalMembershipMalformed},
+		{err: raftservice.ErrMembershipNotCaughtUp, kind: ReplicatedRefusal,
+			code: ReplicatedRefusalMembershipNotCaughtUp},
+	}
+	for _, test := range tests {
+		owner := &fakeReplicatedOwner{state: state, membershipErr: test.err}
+		response := testReplicatedServer(owner).executeReplicated(context.Background(),
+			&ReplicatedRequest{Operation: ReplicatedMembership, Fence: fence, Membership: membership})
+		if response.Kind != test.kind || response.Refusal != test.code ||
+			owner.membership.ExpectedReplicaSetVersion != membership.ExpectedReplicaSetVersion {
+			t.Fatalf("err %v response=%+v request=%+v", test.err, response, owner.membership)
+		}
+	}
+}
+
 func TestReplicatedServerRoundTripCompletionAndNotLeader(t *testing.T) {
 	fence := testReplicatedFence()
 	command := testReplicatedCommand(t, fence)
@@ -222,7 +270,12 @@ func TestReplicatedServerRoundTripCompletionAndNotLeader(t *testing.T) {
 					t.Fatalf("round trip: %v; server did not stop", err)
 				}
 			}
-			if response.Kind != test.kind || !bytes.Equal(response.Completion, test.result) {
+			wantDigest := [32]byte{}
+			if test.kind == ReplicatedCompletion {
+				wantDigest = sha256.Sum256(command)
+			}
+			if response.Kind != test.kind || response.RequestDigest != wantDigest ||
+				!bytes.Equal(response.Completion, test.result) {
 				t.Fatalf("response = %+v", response)
 			}
 			_ = client.Close()

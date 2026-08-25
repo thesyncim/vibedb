@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -381,6 +382,9 @@ func (p Param) RuntimeValue() any {
 // admits against, the read policy, and the deadline and resource limits that
 // bound its execution. It never carries a serialized plan.
 type ShardRequest struct {
+	// Authority is the exact end-user principal forwarded by an authenticated
+	// gateway. It is absent only on the explicit loopback development path.
+	Authority serviceauthz.Authority
 	// SQL is the statement text the shard parses and plans locally.
 	SQL string
 	// Params are the typed bound parameters, in placeholder order.
@@ -799,6 +803,8 @@ const (
 	ErrorExchangeSequence
 	// ErrorExchangeClosed reports a canceled or retired mailbox.
 	ErrorExchangeClosed
+	// ErrorUnauthorized is a definite pre-execution policy refusal.
+	ErrorUnauthorized
 )
 
 // String renders the kind name for diagnostics.
@@ -844,13 +850,15 @@ func (k ErrorKind) String() string {
 		return "ExchangeSequence"
 	case ErrorExchangeClosed:
 		return "ExchangeClosed"
+	case ErrorUnauthorized:
+		return "Unauthorized"
 	default:
 		return "Invalid"
 	}
 }
 
 // valid reports whether k names a real error member.
-func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorExchangeClosed }
+func (k ErrorKind) valid() bool { return k >= ErrorNotOwner && k <= ErrorUnauthorized }
 
 // Column is one result column's metadata: its name and a PostgreSQL-style type
 // OID the codec treats as opaque.
