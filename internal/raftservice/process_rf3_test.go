@@ -1117,6 +1117,8 @@ type faultProcessClient struct {
 	attempts [][]byte
 	hidden   []byte
 	trace    []processProposalTrace
+	last     gateway.ReplicatedResult
+	hasLast  bool
 }
 
 type processProposalTrace struct {
@@ -1187,6 +1189,13 @@ func (client *faultProcessClient) DoReplicated(
 		}
 		client.mu.Lock()
 		client.trace = append(client.trace, trace)
+		if err == nil && response != nil && response.Kind == shardservice.ReplicatedCompletion {
+			client.last = gateway.ReplicatedResult{
+				Outcome: response.Outcome, State: response.State,
+				Completion: append(client.last.Completion[:0], response.Completion...),
+			}
+			client.hasLast = true
+		}
 		client.mu.Unlock()
 	}
 	if stage == faultAfterDecodedResponseBeforeClientDelivery && err == nil && response != nil &&
@@ -1224,7 +1233,17 @@ func (client *faultProcessClient) resetAttempts() {
 	client.attempts = client.attempts[:0]
 	client.hidden = client.hidden[:0]
 	client.trace = client.trace[:0]
+	client.last = gateway.ReplicatedResult{}
+	client.hasLast = false
 	client.mu.Unlock()
+}
+
+func (client *faultProcessClient) lastProposalResult() (gateway.ReplicatedResult, bool) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	result := client.last
+	result.Completion = append([]byte(nil), result.Completion...)
+	return result, client.hasLast
 }
 
 func (client *faultProcessClient) proposalTrace() []processProposalTrace {

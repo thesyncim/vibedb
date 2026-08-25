@@ -95,20 +95,58 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 		t.Fatalf("catalog proposal attempts = %d, want 1; trace=%+v",
 			len(attempts), client.proposalTrace())
 	}
-	// Replaying the byte-identical proposal is a retained-result lookup. It must
-	// not apply the put-if-absent command a second time.
+	acknowledged, ok := client.lastProposalResult()
+	if !ok || acknowledged.Outcome.CompletionAppliedSequence == 0 ||
+		acknowledged.Outcome.CompletionBytes != len(acknowledged.Completion) {
+		t.Fatalf("initial catalog publication result=%+v present=%t",
+			acknowledged.Outcome, ok)
+	}
+	// Replaying the byte-identical proposal may append a physical no-op entry,
+	// but it must return the original durable logical result and never apply the
+	// put-if-absent command a second time.
 	replayed, err := client.executor.ProposeTopology(ctx, route, attempts[0])
 	if err != nil {
 		t.Fatalf("replay catalog proposal: %v", err)
 	}
 	replayedAgain, err := client.executor.ProposeTopology(ctx, route, attempts[0])
-	if err != nil || !bytes.Equal(replayed.Completion, replayedAgain.Completion) ||
-		replayed.Outcome.AppliedIndex != replayedAgain.Outcome.AppliedIndex {
-		t.Fatalf("idempotent replay changed result: first=%+v second=%+v err=%v",
-			replayed.Outcome, replayedAgain.Outcome, err)
+	if err != nil || !bytes.Equal(acknowledged.Completion, replayed.Completion) ||
+		!bytes.Equal(acknowledged.Completion, replayedAgain.Completion) ||
+		acknowledged.Outcome.Code != replayed.Outcome.Code ||
+		replayed.Outcome.Code != replayedAgain.Outcome.Code ||
+		acknowledged.Outcome.CompletionAppliedSequence !=
+			replayed.Outcome.CompletionAppliedSequence ||
+		replayed.Outcome.CompletionAppliedSequence !=
+			replayedAgain.Outcome.CompletionAppliedSequence ||
+		acknowledged.Outcome.CompletionBytes != replayed.Outcome.CompletionBytes ||
+		replayed.Outcome.CompletionBytes != replayedAgain.Outcome.CompletionBytes ||
+		replayed.Outcome.CompletionBytes != len(replayed.Completion) ||
+		replayedAgain.Outcome.CompletionBytes != len(replayedAgain.Completion) ||
+		acknowledged.Outcome.AppliedIndex < acknowledged.Outcome.CompletionAppliedSequence ||
+		replayed.Outcome.AppliedIndex < replayed.Outcome.CompletionAppliedSequence ||
+		replayedAgain.Outcome.AppliedIndex < replayedAgain.Outcome.CompletionAppliedSequence ||
+		replayed.Outcome.AppliedIndex < acknowledged.Outcome.AppliedIndex ||
+		replayedAgain.Outcome.AppliedIndex < replayed.Outcome.AppliedIndex ||
+		acknowledged.State.Applied < acknowledged.Outcome.AppliedIndex ||
+		replayed.State.Applied < replayed.Outcome.AppliedIndex ||
+		replayedAgain.State.Applied < replayedAgain.Outcome.AppliedIndex {
+		t.Fatalf("idempotent replay changed result: acknowledged=%+v first=%+v second=%+v err=%v",
+			acknowledged.Outcome, replayed.Outcome, replayedAgain.Outcome, err)
 	}
+	// A byte-identical retry may occupy a later Raft entry, so AppliedIndex is a
+	// physical catch-up witness. CompletionAppliedSequence and Completion are
+	// the immutable logical result that prove the catalog mutation was not run
+	// again.
 	for member := uint64(1); member <= processVoters; member++ {
-		cluster.waitCommittedApplied(t, ctx, member, replayed.Outcome.AppliedIndex, 0)
+		cluster.waitCommittedApplied(t, ctx, member, replayedAgain.Outcome.AppliedIndex, 0)
+	}
+	visible, err := authority.Read(ctx)
+	if err != nil || visible.Generation() != first.Generation() {
+		t.Fatalf("catalog after exact replay=%v err=%v", visible, err)
+	}
+	wantVisible, wantErr := gateway.AppendSnapshotDocument(nil, first)
+	gotVisible, gotErr := gateway.AppendSnapshotDocument(nil, visible)
+	if wantErr != nil || gotErr != nil || !bytes.Equal(wantVisible, gotVisible) {
+		t.Fatalf("exact replay changed catalog bytes: wantErr=%v gotErr=%v", wantErr, gotErr)
 	}
 
 	// Reconstruct all controller-local state from the RF3 relation. A fresh
