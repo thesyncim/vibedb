@@ -274,6 +274,60 @@ func (cluster *realTransferCluster) driveUntilWithLeaderTicks(done func() bool) 
 		cluster.diagnostic())
 }
 
+// driveUntilWithActiveVoterTicks advances an election after the former leader
+// has been isolated. Followers correctly retain the old leader lease until
+// ElectionTick logical ticks have elapsed, so an immediate explicit campaign
+// can stop at a protocol-idle pre-vote cut. At each such cut this driver ticks
+// every active voter exactly once, never an inactive former leader or learner.
+// The caller supplies a small protocol-derived tick-round bound; scheduler work
+// retains the ordinary deterministic step bound in driveUntilIdle.
+func (cluster *realTransferCluster) driveUntilWithActiveVoterTicks(
+	done func() bool,
+	maxTickRounds int,
+) {
+	cluster.t.Helper()
+	if maxTickRounds <= 0 {
+		cluster.t.Fatal("active-voter tick bound must be positive")
+	}
+	step := 0
+	tickRound := 0
+	for {
+		doneReached, idleStep := cluster.driveUntilIdle(done, &step)
+		if doneReached {
+			return
+		}
+		if tickRound == maxTickRounds {
+			cluster.t.Fatalf("cluster election did not converge after %d active-voter tick rounds: %s",
+				maxTickRounds, cluster.diagnostic())
+		}
+		ticked := 0
+		for index, host := range cluster.hosts {
+			if cluster.inactive[index] {
+				continue
+			}
+			status, statusErr := host.Status(cluster.group)
+			publication, publicationErr := host.Publication(cluster.group)
+			if statusErr != nil || publicationErr != nil {
+				cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+			}
+			if !confHasVoter(publication.ConfState, status.MemberID) {
+				continue
+			}
+			if err := host.RequestTick(cluster.group); err != nil {
+				cluster.t.Fatalf("tick active voter host %d at idle step %d round %d: %v",
+					index, idleStep, tickRound, err)
+			}
+			ticked++
+		}
+		if ticked == 0 {
+			cluster.t.Fatalf("no active voter at protocol-idle step %d tick round %d: %s",
+				idleStep, tickRound, cluster.diagnostic())
+		}
+		tickRound++
+		step++
+	}
+}
+
 func (cluster *realTransferCluster) diagnostic() string {
 	if cluster == nil {
 		return "nil cluster"
@@ -359,6 +413,20 @@ func confHasMember(conf *pb.ConfState, member uint64) bool {
 	}
 	for _, values := range [][]uint64{conf.GetVoters(), conf.GetLearners(),
 		conf.GetVotersOutgoing(), conf.GetLearnersNext()} {
+		for _, candidate := range values {
+			if candidate == member {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func confHasVoter(conf *pb.ConfState, member uint64) bool {
+	if conf == nil {
+		return false
+	}
+	for _, values := range [][]uint64{conf.GetVoters(), conf.GetVotersOutgoing()} {
 		for _, candidate := range values {
 			if candidate == member {
 				return true
