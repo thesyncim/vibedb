@@ -18,6 +18,8 @@ var ErrReplicatedExecution = errors.New("splitcontroller: replicated operation r
 type ReplicatedOperationJournal interface {
 	ReadOperation(context.Context, [32]byte) (gateway.ReplicatedOperationRecord, error)
 	PublishOperation(context.Context, uint64, gateway.ReplicatedOperationRecord) error
+	DeleteOperation(context.Context, [32]byte, uint64) error
+	RetryPending(context.Context) error
 }
 
 // ReplicatedActionExecutor executes one idempotent reconciliation action. The
@@ -48,13 +50,16 @@ func ExecuteReplicatedStep(
 	record, readErr := journal.ReadOperation(ctx, id)
 	switch {
 	case errors.Is(readErr, gateway.ErrReplicatedOperationMissing):
+		if action.Kind == ActionComplete {
+			return action, nil
+		}
 		record = gateway.ReplicatedOperationRecord{
 			ID: id, Kind: gateway.ReplicatedOperationSplit,
 			State: gateway.ReplicatedOperationPlanned, Revision: 1,
 			CatalogGeneration: observed.Catalog.Generation(), Cursor: wantCursor,
 			Proof: wantProof,
 		}
-		if err := journal.PublishOperation(ctx, 0, record); err != nil {
+		if err := settleReplicatedOperationPublish(ctx, journal, 0, record); err != nil {
 			return Action{}, err
 		}
 	case readErr != nil:
@@ -73,7 +78,7 @@ func ExecuteReplicatedStep(
 		next.Revision++
 		next.CatalogGeneration = observed.Catalog.Generation()
 		next.Cursor, next.Proof = wantCursor, wantProof
-		if err := journal.PublishOperation(ctx, record.Revision, next); err != nil {
+		if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 			return Action{}, err
 		}
 		record = next
@@ -83,9 +88,13 @@ func ExecuteReplicatedStep(
 			next := record
 			next.State = gateway.ReplicatedOperationComplete
 			next.Revision++
-			if err := journal.PublishOperation(ctx, record.Revision, next); err != nil {
+			if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 				return Action{}, err
 			}
+			record = next
+		}
+		if err := settleReplicatedOperationDelete(ctx, journal, record); err != nil {
+			return Action{}, err
 		}
 		return action, nil
 	}
@@ -97,11 +106,52 @@ func ExecuteReplicatedStep(
 		next := record
 		next.State = gateway.ReplicatedOperationRunning
 		next.Revision++
-		if err := journal.PublishOperation(ctx, record.Revision, next); err != nil {
+		if err := settleReplicatedOperationPublish(ctx, journal, record.Revision, next); err != nil {
 			return Action{}, err
 		}
 	}
 	return action, execute(ctx, plan.OperationID(), action)
+}
+
+func settleReplicatedOperationPublish(
+	ctx context.Context,
+	journal ReplicatedOperationJournal,
+	expected uint64,
+	record gateway.ReplicatedOperationRecord,
+) error {
+	err := journal.PublishOperation(ctx, expected, record)
+	if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		return err
+	}
+	if err = journal.RetryPending(ctx); err != nil {
+		return err
+	}
+	settled, err := journal.ReadOperation(ctx, record.ID)
+	if err != nil || settled != record {
+		return errors.Join(err, ErrReplicatedExecution)
+	}
+	return nil
+}
+
+func settleReplicatedOperationDelete(
+	ctx context.Context,
+	journal ReplicatedOperationJournal,
+	record gateway.ReplicatedOperationRecord,
+) error {
+	err := journal.DeleteOperation(ctx, record.ID, record.Revision)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if err = journal.RetryPending(ctx); err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return err
+	}
+	_, err = journal.ReadOperation(ctx, record.ID)
+	if !errors.Is(err, gateway.ErrReplicatedOperationMissing) {
+		return errors.Join(err, ErrReplicatedExecution)
+	}
+	return nil
 }
 
 func replicatedActionCursor(action Action) [8]uint64 {

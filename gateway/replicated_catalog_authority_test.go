@@ -266,6 +266,49 @@ func TestReplicatedOperationCrashResumeCASAndTerminalGC(t *testing.T) {
 	}
 }
 
+func TestReplicatedOperationUnknownPublishAndDeleteSettleExactCommand(t *testing.T) {
+	authority, client, _ := newCatalogAuthorityFixture(t)
+	record := ReplicatedOperationRecord{
+		ID: [32]byte{0x31}, Kind: ReplicatedOperationSplit,
+		State: ReplicatedOperationPlanned, Revision: 1, CatalogGeneration: 5,
+		Cursor: [8]uint64{1}, Proof: [32]byte{0x41},
+	}
+	client.unknownNext = true
+	err := authority.PublishOperation(context.Background(), 0, record)
+	if !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown operation publish = %v", err)
+	}
+	pending := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatalf("settle operation publish = %v", err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("operation publication retry changed command bytes")
+	}
+	complete := record
+	complete.State, complete.Revision = ReplicatedOperationComplete, 2
+	if err = authority.PublishOperation(context.Background(), 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	client.unknownNext = true
+	err = authority.DeleteOperation(context.Background(), record.ID, complete.Revision)
+	if !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("unknown operation delete = %v", err)
+	}
+	pending = authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatalf("settle operation delete = %v", err)
+	}
+	if !bytes.Equal(pending, client.unknownCommand) {
+		t.Fatal("operation delete retry changed command bytes")
+	}
+	if _, err = authority.ReadOperation(context.Background(), record.ID); !errors.Is(err, ErrReplicatedOperationMissing) {
+		t.Fatalf("operation after settled GC = %v", err)
+	}
+}
+
 func TestReplicatedOperationEncodingIsCanonicalAndBounded(t *testing.T) {
 	record := ReplicatedOperationRecord{
 		ID: [32]byte{1}, Kind: ReplicatedOperationMove,
@@ -338,5 +381,22 @@ func TestReplicatedCatalogDocumentRejectsNonCanonicalAndOversizedBytes(t *testin
 	}
 	if _, err = OpenSnapshotDocument(make([]byte, maxCatalogBytes+1)); !errors.Is(err, ErrCatalogTooLarge) {
 		t.Fatalf("oversized catalog = %v", err)
+	}
+}
+
+func TestReplicatedCatalogReadRejectsEqualGenerationDivergence(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	endpoints["ep-a"] = "127.0.0.1:49999"
+	divergent, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, current.Generation(), nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.holder = NewCatalogHolder(divergent)
+	if _, err = authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("equal-generation divergent catalog = %v", err)
 	}
 }

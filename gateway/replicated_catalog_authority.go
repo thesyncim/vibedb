@@ -143,6 +143,11 @@ func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapsho
 		}
 	} else if snapshot.Generation() < current.Generation() {
 		return nil, ErrStaleGeneration
+	} else {
+		currentBytes, encodeErr := AppendSnapshotDocument(nil, current)
+		if encodeErr != nil || !bytes.Equal(currentBytes, result.Value) {
+			return nil, errors.Join(encodeErr, ErrReplicatedCatalogConflict)
+		}
 	}
 	return authority.holder.Current(), nil
 }
