@@ -2,21 +2,21 @@
 
 The shipped distributed runtime is experimental. It consists of a stateless
 gateway and leader-only shard services. It uses static ownership data from a
-catalog file.
+catalog file. The generated [distributed feature state](../distributed-feature-state.md)
+separates this command path from the internal RF3 composition.
 
-> **WARNING:** The gateway and shard protocols do not have authentication or
-> TLS. The commands refuse non-loopback listeners. Do not expose these
-> listeners through a proxy or port forward to an untrusted network.
+The gateway and shard commands require mutually authenticated TLS by default.
+Authenticated mode also requires one canonical `vibejson` authorization policy.
+An explicit `-dev-plaintext-loopback` mode permits unauthenticated development
+traffic only on loopback listeners. Do not expose that development listener
+through a proxy or port forward to an untrusted network.
 
 The shipped commands do not start Raft replication. One `vibedb-shard` process
-serves one local store with one static ownership identity. The Raft and
-replicated-state packages are a separate non-serving kernel. That kernel can
-coalesce a currently queued normal-proposal prefix under fixed entry and byte
-targets and atomically apply a bounded committed-normal prefix. An internal
-bounded waiter registry can synchronously settle those published results, but
-it has no listener or shipped gateway integration. The bounded Host outbox and
-append-oriented canonical frame encoder are an outbound coalescing foundation.
-Frames remain individual and no production transport loop is shipped.
+serves one local store with one static ownership identity. The separate internal
+RF3 composition connects bounded proposal admission, quorum commit, committed
+apply, result settlement, authenticated peer transport, a replicated shard
+service, and a leader-aware native gateway executor. Process tests use that
+composition. The shipped commands do not construct it.
 
 ## Build the commands
 
@@ -68,6 +68,24 @@ code must open each shard store locally and create the required tables. The
 gateway does not distribute DDL, and the runtime does not prove that schemas
 match across shards.
 
+## Prepare the authorization policy
+
+Both services load the same immutable policy generation. Principal IDs are the
+32-character hexadecimal node identities carried by their TLS certificates.
+The array and capability order below are canonical. The gateway service
+identity needs `delegate`, `data_read`, and `data_write`: it delegates the exact
+application principal to a shard and uses its own authority for recovery. A
+client receives only the operations listed for that principal.
+
+```json
+{"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}
+```
+
+Save that exact document as `./authorization-policy.vibejson`. Unknown,
+duplicate, escaped, or reordered security fields fail closed. The policy is
+mandatory in authenticated mode and is mutually exclusive with
+`-dev-plaintext-loopback`.
+
 ## Start the shard service
 
 ```bash
@@ -78,7 +96,12 @@ match across shards.
   -shard shard-a \
   -allocation-generation 1 \
   -epoch 1 \
-  -routing-version 1
+  -routing-version 1 \
+  -tls-certificate ./shard.pem \
+  -tls-key ./shard-key.pem \
+  -tls-roots ./cluster-roots.pem \
+  -tls-identity-oid 1.3.6.1.4.1.32473.1.1 \
+  -authorization-policy ./authorization-policy.vibejson
 ```
 
 The service makes a durable local claim before it listens. The store retains
@@ -89,9 +112,10 @@ lower either one. Only one live claim can exist for one open store.
 This claim is a local fence. It is not an election or a distributed lease. It
 cannot stop another process that serves a copied store.
 
-The default connection limit is 128. Use `-max-connections -1` only when an
-external control gives a safe bound. The service always bounds read fences and
-worker exchange resources.
+The default connection limit is 128. Authenticated serving requires a positive
+bounded connection limit. Development plaintext accepts `-max-connections -1`
+only when an external control gives a safe bound. The service always bounds
+read fences and worker exchange resources.
 
 ## Validate and inspect the gateway catalog
 
@@ -109,8 +133,18 @@ endpoint information.
 ```bash
 ./bin/vibedb-gateway serve \
   -catalog ./cluster.json \
-  -listen 127.0.0.1:7400
+  -listen 127.0.0.1:7400 \
+  -tls-certificate ./gateway.pem \
+  -tls-key ./gateway-key.pem \
+  -tls-roots ./cluster-roots.pem \
+  -tls-identity-oid 1.3.6.1.4.1.32473.1.1 \
+  -authorization-policy ./authorization-policy.vibejson \
+  -shard-peer 127.0.0.1:7401=22222222222222222222222222222222
 ```
+
+Replace the example private-enterprise OID with an identity OID under an IANA
+Private Enterprise Number that the operator owns. The shard peer address must
+match the endpoint address in the catalog.
 
 Each `Query` or `Exec` attempt pins one immutable catalog generation. The
 default executor retries a stale refusal at most twice, for at most three
@@ -215,9 +249,9 @@ The shipped runtime does not provide these features:
 - Automatic shard split execution or data movement
 - Distributed DDL or schema-rollout validation
 - A replica-move controller
-- Authenticated gateway, shard, or Raft networking
+- A shipped authenticated Raft peer listener
 - Cross-host worker exchange from CLI configuration
-- Online Raft snapshot transport
+- Online empty-learner snapshot installation and activation
 
 Routing, catalog validation, and shard admission fail closed. A distributed
 read returns no partial result when one shard fails.

@@ -1,8 +1,11 @@
 # Replicated state machine
 
 `internal/replicatedstate` applies deterministic replicated commands to one
-hidden system collection and one user collection. It is a non-serving internal
-component.
+hidden system collection and a bounded manifest of dense relation collections.
+The relation bundle can publish a base JSON mutation together with local or
+global exact-index mutations in one checkpoint group. It is consumed by the
+internal RF3 serving composition, but the shipped commands do not construct
+that RF3 path.
 
 ## Command contract
 
