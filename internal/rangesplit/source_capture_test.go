@@ -301,6 +301,26 @@ func TestSourceCaptureBinaryFormatBoundsAliasesAndAllocations(t *testing.T) {
 		logicalBytes, len(raw), float64(len(raw))/float64(logicalBytes))
 }
 
+func TestMaximumSourceCaptureRecordBytesExactAndBounded(t *testing.T) {
+	got, err := MaximumSourceCaptureRecordBytes(3, 11, 101, 211)
+	want := sourceCaptureEntryFixedBytes +
+		3*sourceCaptureTransitionHeaderBytes + 3*11 + 3*101 + 211
+	if err != nil || got != want {
+		t.Fatalf("maximum record bytes = %d,%v; want %d", got, err, want)
+	}
+	for _, limits := range [][4]int{
+		{}, {0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 0},
+		{math.MaxInt, 2, 1, 1}, {math.MaxInt, 1, 2, 1},
+		{1, 1, 1, math.MaxInt},
+	} {
+		if _, err := MaximumSourceCaptureRecordBytes(
+			limits[0], limits[1], limits[2], limits[3],
+		); !errors.Is(err, ErrSourceCapture) {
+			t.Fatalf("limits %v error = %v, want ErrSourceCapture", limits, err)
+		}
+	}
+}
+
 func TestSourceCaptureBinaryPhysicalBytesTrackRawPayload(t *testing.T) {
 	for _, documentBytes := range []int{256, 1 << 10, 8 << 10} {
 		t.Run(fmt.Sprintf("documents_%d", documentBytes), func(t *testing.T) {

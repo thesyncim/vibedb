@@ -137,7 +137,7 @@ func (d *Database) OpenReplicatedChildStage(
 		if !ok || cursor.Phase() != rangesplit.ChildStageSealed ||
 			!replicatedApplyMetaMatchesOptions(
 				core.catalog.ReplicatedApply, expected, applyOptions,
-			) || core.replicatedApplyCollection == nil {
+			) || core.replicatedApplyCollection == nil || core.replicatedCaptureCollection == nil {
 			return nil, ErrReplicatedChildStageProof
 		}
 	}
@@ -338,6 +338,7 @@ func (s *ReplicatedChildStage) activate(
 	groupMembers := []durable.NamedCollection{
 		{Name: replicatedstate.SystemCollectionName, Collection: core.replicatedApplyCollection},
 		{Name: s.base.UserTable, Collection: s.table.collection},
+		{Name: replicatedstate.TransitionCaptureCollectionName, Collection: core.replicatedCaptureCollection},
 	}
 	prepared, err := s.stage.PrepareReplicatedChild(
 		certificate,
@@ -362,6 +363,10 @@ func (s *ReplicatedChildStage) activate(
 			MachineOptions: replicatedstate.Options{
 				TxnLimits: identity.TxnLimits, MaxSessions: identity.MaxSessions,
 				RetryWindow: identity.RetryWindow, CheckpointGroup: core.checkpointGroup,
+				TransitionCaptureTarget: replicatedstate.TransitionCaptureTarget{
+					Name:       replicatedstate.TransitionCaptureCollectionName,
+					Collection: core.replicatedCaptureCollection,
+				},
 			},
 			ArtifactOptions: artifactOptions,
 		},

@@ -15,6 +15,8 @@ import (
 
 var ErrTransitionCapture = errors.New("replicatedstate: invalid transition capture")
 
+const TransitionCaptureCollectionName = "__vibedb_split_capture"
+
 // TransitionCaptureTarget is one private synchronous collection in the same
 // transaction domain as the replicated system and user collections.
 type TransitionCaptureTarget struct {
@@ -109,10 +111,14 @@ type TransitionCapture interface {
 }
 
 func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
-	if capture == nil || !m.initialized || m.capture != nil || m.checkpointGroup != nil {
+	if capture == nil || !m.initialized || m.capture != nil {
 		return ErrTransitionCapture
 	}
 	target := capture.Target()
+	if (m.reservedCaptureTarget.Collection != nil || m.reservedCaptureTarget.Name != "") &&
+		(target != m.reservedCaptureTarget || target.Collection == nil) {
+		return ErrTransitionCapture
+	}
 	if err := m.validateTransitionCaptureTarget(target, capture); err != nil {
 		return err
 	}
@@ -122,6 +128,28 @@ func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
 	m.capture = capture
 	m.captureTarget = target
 	return nil
+}
+
+func validReservedTransitionCaptureTarget(
+	target TransitionCaptureTarget,
+	system CollectionTarget,
+	relations []relationCollection,
+) bool {
+	if target.Name == "" || len(target.Name) > replication.MaxCollectionBytes ||
+		!utf8.ValidString(target.Name) || strings.IndexByte(target.Name, 0) >= 0 ||
+		target.Collection == nil || target.Name == systemCollectionName ||
+		target.Collection == system.Collection || target.Collection.HasSchema() ||
+		target.Collection.HasIndexes() || !target.Collection.HasOpaqueValues() ||
+		!target.Collection.HasSynchronousDurability() || !target.Collection.SupportsUpdate() ||
+		target.Collection.MaxKeyBytes() < 8 || target.Collection.MaxBatchDocuments() < 1 {
+		return false
+	}
+	for i := range relations {
+		if target.Name == relations[i].name || target.Collection == relations[i].target.Collection {
+			return false
+		}
+	}
+	return true
 }
 
 // BeginTransitionCapture installs a source capture at one exact publication.

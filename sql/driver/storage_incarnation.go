@@ -77,7 +77,9 @@ func (d *database) newStorageIdentityLocked() (string, error) {
 }
 
 func (d *database) storagePathInUseLocked(path string) bool {
-	if d.catalog.ReplicatedApply != nil && d.replicatedApplyPath(d.catalog.ReplicatedApply) == path {
+	if d.catalog.ReplicatedApply != nil &&
+		(d.replicatedApplyPath(d.catalog.ReplicatedApply) == path ||
+			d.replicatedCapturePath(d.catalog.ReplicatedApply) == path) {
 		return true
 	}
 	for _, meta := range d.catalog.Tables {
@@ -113,7 +115,7 @@ func (d *database) recoverOrphanedTableStorage(protected map[string]string) erro
 		meta := d.catalog.Tables[name]
 		protectJournal := meta != nil && meta.Materialized
 		if apply := d.catalog.ReplicatedApply; apply != nil &&
-			d.replicatedApplyPath(apply) == path {
+			(d.replicatedApplyPath(apply) == path || d.replicatedCapturePath(apply) == path) {
 			protectJournal = true
 		}
 		if !protectJournal {

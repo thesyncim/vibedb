@@ -1159,6 +1159,19 @@ func validateOpenedReplicatedCatalog(d *database) error {
 			Name:       replicatedstate.SystemCollectionName,
 			Collection: d.replicatedApplyCollection,
 		})
+		capture := d.replicatedCaptureCollection
+		limits := d.catalog.ReplicatedApply.CaptureLimits
+		if capture == nil || !capture.HasOpaqueValues() || !capture.HasSynchronousDurability() ||
+			capture.MaxKeyBytes() != limits.MaxKeyBytes ||
+			capture.MaxDocumentBytes() != limits.MaxDocumentBytes ||
+			capture.MaxBatchDocuments() != limits.MaxBatchDocuments ||
+			capture.MaxBatchBytes() != limits.MaxBatchBytes {
+			return ErrReplicatedApplyMismatch
+		}
+		members = append(members, durable.NamedCollection{
+			Name:       replicatedstate.TransitionCaptureCollectionName,
+			Collection: capture,
+		})
 	}
 	if err := d.txnLog.ValidateCollections(members); err != nil {
 		return fmt.Errorf("%w: transaction-log membership: %v", ErrReplicatedShardStoreProfile, err)

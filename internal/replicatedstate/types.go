@@ -261,6 +261,10 @@ type Options struct {
 	MaxSessions       uint64
 	RetryWindow       uint16
 	TransitionCapture TransitionCapture
+	// TransitionCaptureTarget reserves an authenticated participant in the
+	// fixed checkpoint membership before capture begins. A non-nil capture must
+	// name this exact target. It may be installed later under the Machine lock.
+	TransitionCaptureTarget TransitionCaptureTarget
 	// CheckpointGroup selects the replay-backed replicated apply lane. The
 	// group must exclusively own the exact system and user collections before
 	// Open. Ordinary callers leave it nil and retain per-transition synchronous

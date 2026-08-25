@@ -223,9 +223,11 @@ type database struct {
 	// participant paired atomically with the sole replicated user table. It is
 	// opened through txnDecisions and closed before txnLog, exactly like catalog
 	// tables, but never enters the SQL namespace or layout epoch.
-	replicatedApplyFile       *os.File
-	replicatedApplyCollection *durable.Collection
-	replicatedApplyClaim      *ReplicatedApply
+	replicatedApplyFile         *os.File
+	replicatedApplyCollection   *durable.Collection
+	replicatedCaptureFile       *os.File
+	replicatedCaptureCollection *durable.Collection
+	replicatedApplyClaim        *ReplicatedApply
 	// replicatedChildStageClaim exclusively owns the sole user collection
 	// while a certified split child is received and converted in place into
 	// replicated apply. It is never a SQL or serving capability.
@@ -557,6 +559,14 @@ func openDatabaseWithShardStorePolicy(
 			)
 		}
 		paths[path] = "replicated apply"
+		capturePath := d.replicatedCapturePath(apply)
+		if previous, duplicate := paths[capturePath]; duplicate {
+			return nil, fmt.Errorf(
+				"vibedb: SQL catalog storage %q aliases replicated capture storage %q",
+				previous, filepath.Base(capturePath),
+			)
+		}
+		paths[capturePath] = "replicated capture"
 	}
 	for name, meta := range d.catalog.Views {
 		if err := validateCatalogViewMeta(name, meta); err != nil {
@@ -658,12 +668,13 @@ type catalogCollectionOpen struct {
 	table       *table
 	file        *os.File
 	apply       bool
+	capture     bool
 	distributed bool
 }
 
 func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
-	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+2)
-	opened := make([]catalogCollectionOpen, 0, len(d.tables)+2)
+	requests := make([]durable.TransactionCollectionOpen, 0, len(d.tables)+3)
+	opened := make([]catalogCollectionOpen, 0, len(d.tables)+3)
 	abortFiles := func(cause error) error {
 		for i := range opened {
 			cause = errors.Join(cause, opened[i].file.Close())
@@ -696,6 +707,21 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 		opened = append(opened, catalogCollectionOpen{file: file, apply: true})
 		requests = append(requests, durable.TransactionCollectionOpen{
 			File: file, Options: replicatedApplyDurableOptions(meta.SystemLimits),
+		})
+		capturePath := d.replicatedCapturePath(meta)
+		captureFile, captureErr := os.OpenFile(capturePath, os.O_RDWR, 0)
+		if os.IsNotExist(captureErr) {
+			return abortFiles(fmt.Errorf(
+				"%w: hidden capture collection %s is missing",
+				ErrReplicatedApplyMismatch, capturePath,
+			))
+		}
+		if captureErr != nil {
+			return abortFiles(captureErr)
+		}
+		opened = append(opened, catalogCollectionOpen{file: captureFile, capture: true})
+		requests = append(requests, durable.TransactionCollectionOpen{
+			File: captureFile, Options: replicatedCaptureDurableOptions(meta.CaptureLimits),
 		})
 	}
 	names := make([]string, 0, len(d.tables))
@@ -747,6 +773,8 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			switch {
 			case entry.apply:
 				groupNames[i] = replicatedstate.SystemCollectionName
+			case entry.capture:
+				groupNames[i] = replicatedstate.TransitionCaptureCollectionName
 			case entry.name != "":
 				groupNames[i] = entry.name
 			default:
@@ -800,6 +828,11 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 			d.replicatedApplyCollection = collection
 			continue
 		}
+		if entry.capture {
+			d.replicatedCaptureFile = entry.file
+			d.replicatedCaptureCollection = collection
+			continue
+		}
 		entry.table.file = entry.file
 		entry.table.collection = collection
 	}
@@ -823,6 +856,18 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked() error {
 				d.catalog.ReplicatedApply.Sidecars,
 			); err != nil {
 				return err
+			}
+			continue
+		}
+		if entry.capture {
+			options := replicatedCaptureDurableOptions(d.catalog.ReplicatedApply.CaptureLimits)
+			if collection == nil || !collection.HasOpaqueValues() ||
+				!collection.HasSynchronousDurability() || !collection.SupportsUpdate() ||
+				collection.MaxKeyBytes() != options.MaxKeyBytes ||
+				collection.MaxDocumentBytes() != options.MaxDocumentBytes ||
+				collection.MaxBatchDocuments() != options.MaxBatchDocuments ||
+				collection.MaxBatchBytes() != options.MaxBatchBytes {
+				return ErrReplicatedApplyMismatch
 			}
 			continue
 		}
@@ -1560,7 +1605,8 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	if catalog.ReplicatedApply != nil {
 		apply := catalog.ReplicatedApply
 		placementBytes := encodedJSONStringBytes(apply.Placement.ShardKey)
-		if !add(encodedJSONStringBytes(apply.Storage) + placementBytes + 2048) {
+		if !add(encodedJSONStringBytes(apply.Storage) +
+			encodedJSONStringBytes(apply.CaptureStorage) + placementBytes + 3072) {
 			return size, catalogSizeError(size)
 		}
 	}
@@ -1890,6 +1936,15 @@ func (d *database) closeWithPolicy(terminal bool) error {
 			retryable = true
 		}
 	}
+	if d.replicatedCaptureCollection != nil {
+		closeErr, completed := d.collectionCloseState(d.replicatedCaptureCollection)
+		result = errors.Join(result, closeErr)
+		if completed {
+			d.replicatedCaptureCollection = nil
+		} else {
+			retryable = true
+		}
+	}
 	if d.distributedTxnCollection != nil {
 		closeErr, completed := d.collectionCloseState(d.distributedTxnCollection)
 		result = errors.Join(result, closeErr)
@@ -1931,6 +1986,10 @@ func (d *database) closeWithPolicy(terminal bool) error {
 	if d.replicatedApplyFile != nil {
 		result = errors.Join(result, d.replicatedApplyFile.Close())
 		d.replicatedApplyFile = nil
+	}
+	if d.replicatedCaptureFile != nil {
+		result = errors.Join(result, d.replicatedCaptureFile.Close())
+		d.replicatedCaptureFile = nil
 	}
 	if d.distributedTxnFile != nil {
 		result = errors.Join(result, d.distributedTxnFile.Close())

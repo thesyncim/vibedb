@@ -95,6 +95,44 @@ type SourceCaptureWorkspace struct {
 	key         [8]byte
 }
 
+// MaximumSourceCaptureRecordBytes returns the exact provisioning bound for one
+// admitted replicated mutation batch.
+func MaximumSourceCaptureRecordBytes(
+	maxMutations, maxKeyBytes, maxDocumentBytes, maxBatchBytes int,
+) (int, error) {
+	if maxMutations <= 0 || maxKeyBytes <= 0 || maxDocumentBytes <= 0 || maxBatchBytes <= 0 ||
+		uint64(maxMutations) > math.MaxUint32 || uint64(maxKeyBytes) > math.MaxUint32 ||
+		uint64(maxDocumentBytes) > math.MaxUint32 || uint64(maxBatchBytes) > math.MaxUint32 {
+		return 0, ErrSourceCapture
+	}
+	product := func(value int) (uint64, bool) {
+		if uint64(maxMutations) > math.MaxUint32/uint64(value) {
+			return 0, false
+		}
+		return uint64(maxMutations) * uint64(value), true
+	}
+	transitionBytes, ok := product(sourceCaptureTransitionHeaderBytes)
+	if !ok {
+		return 0, ErrSourceCapture
+	}
+	keyBytes, ok := product(maxKeyBytes)
+	if !ok {
+		return 0, ErrSourceCapture
+	}
+	beforeBytes, ok := product(maxDocumentBytes)
+	if !ok {
+		return 0, ErrSourceCapture
+	}
+	total := uint64(sourceCaptureEntryFixedBytes)
+	for _, addition := range [...]uint64{transitionBytes, keyBytes, beforeBytes, uint64(maxBatchBytes)} {
+		if total > math.MaxUint32-addition {
+			return 0, ErrSourceCapture
+		}
+		total += addition
+	}
+	return int(total), nil
+}
+
 // NewSourceCapture binds one private collection to an exact split plan.
 func NewSourceCapture(
 	partitioner *Partitioner,

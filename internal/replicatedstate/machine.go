@@ -36,34 +36,35 @@ var (
 type Machine struct {
 	mu sync.RWMutex
 
-	binding           Binding
-	bootstrap         []byte
-	bootstrapDigest   [32]byte
-	system            CollectionTarget
-	userName          string
-	user              CollectionTarget
-	relations         []relationCollection
-	manifestDigest    [sha256.Size]byte
-	members           []durable.NamedCollection
-	distribution      []byte
-	shard             []byte
-	applyContract     [32]byte
-	dataChainHash     *dataChainHasher
-	mutationPlan      []finalMutation
-	mutationInline    [8]finalMutation
-	bundlePlan        []finalMutation
-	bundleRelations   []plannedRelationChanges
-	transitionMembers []durable.NamedCollection
-	batchTelemetry    normalBatchTelemetry
-	txnLog            *durable.TxnLog
-	checkpointGroup   *durable.CheckpointGroup
-	options           Options
-	applyCut          durable.DatabaseSnapshot
-	capture           TransitionCapture
-	captureTarget     TransitionCaptureTarget
-	captureBuffer     []byte
-	captureChanges    []finalMutation
-	captureKey        [8]byte
+	binding               Binding
+	bootstrap             []byte
+	bootstrapDigest       [32]byte
+	system                CollectionTarget
+	userName              string
+	user                  CollectionTarget
+	relations             []relationCollection
+	manifestDigest        [sha256.Size]byte
+	members               []durable.NamedCollection
+	distribution          []byte
+	shard                 []byte
+	applyContract         [32]byte
+	dataChainHash         *dataChainHasher
+	mutationPlan          []finalMutation
+	mutationInline        [8]finalMutation
+	bundlePlan            []finalMutation
+	bundleRelations       []plannedRelationChanges
+	transitionMembers     []durable.NamedCollection
+	batchTelemetry        normalBatchTelemetry
+	txnLog                *durable.TxnLog
+	checkpointGroup       *durable.CheckpointGroup
+	options               Options
+	applyCut              durable.DatabaseSnapshot
+	capture               TransitionCapture
+	captureTarget         TransitionCaptureTarget
+	reservedCaptureTarget TransitionCaptureTarget
+	captureBuffer         []byte
+	captureChanges        []finalMutation
+	captureKey            [8]byte
 
 	state                 State
 	publication           raftmodel.Publication
@@ -137,9 +138,6 @@ func OpenBundle(
 	if len(relationSpecs) == 0 {
 		return nil, ErrInvalidCollection
 	}
-	if len(relationSpecs) > 1 && options.TransitionCapture != nil {
-		return nil, ErrTransitionCapture
-	}
 	prepared, err := prepareOpenInputs(
 		binding, bootstrap, system,
 		UserCollection{Name: relationSpecs[0].Name, Target: relationSpecs[0].Target},
@@ -168,6 +166,14 @@ func OpenBundle(
 	for i := range relations {
 		prepared.members = append(prepared.members, durable.NamedCollection{
 			Name: relations[i].name, Collection: relations[i].target.Collection,
+		})
+	}
+	if target := options.TransitionCaptureTarget; target.Collection != nil || target.Name != "" {
+		if !validReservedTransitionCaptureTarget(target, system, relations) {
+			return nil, ErrTransitionCapture
+		}
+		prepared.members = append(prepared.members, durable.NamedCollection{
+			Name: target.Name, Collection: target.Collection,
 		})
 	}
 	if options.CheckpointGroup != nil && !options.CheckpointGroup.Owns(prepared.members) {
@@ -339,8 +345,9 @@ func newMachineFromOpenInputs(prepared openInputs) *Machine {
 		applyContract: prepared.applyContract,
 		dataChainHash: newDataChainHasher(),
 		txnLog:        prepared.txnLog, checkpointGroup: prepared.checkpointGroup,
-		options:           prepared.options,
-		transitionMembers: make([]durable.NamedCollection, 0, len(prepared.relations)+2),
+		options:               prepared.options,
+		reservedCaptureTarget: prepared.options.TransitionCaptureTarget,
+		transitionMembers:     make([]durable.NamedCollection, 0, len(prepared.relations)+2),
 	}
 }
 
