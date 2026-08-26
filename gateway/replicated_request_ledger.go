@@ -3,7 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"slices"
 	"sort"
@@ -13,10 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
-	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
-	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 var (
@@ -370,6 +367,11 @@ type DurableRequestReplayableParticipantStream interface {
 }
 
 type DurableRequest struct {
+	// Key is the complete authenticated and sequenced request identity. The
+	// executor never derives identity from context, tenant text, or a local
+	// process identity. Issuer epoch, lane, and sequence are mandatory.
+	Key DurableRequestLedgerKey
+
 	// Program is the trusted, already-sealed logical transaction contract. It
 	// contains no physical endpoint/fence strings and never embeds ordinary
 	// per-shard MutationBatch commands.
@@ -487,67 +489,42 @@ func durableRequestAckTokenDigest(token DurableRequestAckToken) replication.Dige
 }
 
 type DurableRequestExecutorOptions struct {
-	Topology       *DurableRequestLedgerTopologyHolder
-	Ledger         durableRequestCoarseLedger
-	Runner         DurableRequestRunner
-	LocalPrincipal rafttransport.NodeID
+	Topology *DurableRequestLedgerTopologyHolder
+	Ledger   durableRequestCoarseLedger
+	Runner   DurableRequestRunner
 }
 
 type DurableRequestExecutor struct {
-	topology       *DurableRequestLedgerTopologyHolder
-	ledger         durableRequestCoarseLedger
-	runner         DurableRequestRunner
-	localPrincipal rafttransport.NodeID
+	topology *DurableRequestLedgerTopologyHolder
+	ledger   durableRequestCoarseLedger
+	runner   DurableRequestRunner
 }
 
 func NewDurableRequestExecutor(options DurableRequestExecutorOptions) (*DurableRequestExecutor, error) {
 	if options.Topology == nil || options.Topology.current.Load() == nil ||
-		options.Ledger == nil || options.Runner == nil ||
-		options.LocalPrincipal == (rafttransport.NodeID{}) {
+		options.Ledger == nil || options.Runner == nil {
 		return nil, ErrDurableRequest
 	}
 	return &DurableRequestExecutor{
-		topology: options.Topology, ledger: options.Ledger,
-		runner: options.Runner, localPrincipal: options.LocalPrincipal,
+		topology: options.Topology, ledger: options.Ledger, runner: options.Runner,
 	}, nil
 }
 
-func durableRequestLedgerKey(
-	ctx context.Context,
-	local rafttransport.NodeID,
-	tenant []byte,
-	id replication.ID128,
-	digest replication.Digest,
-) (DurableRequestLedgerKey, replication.Digest, error) {
-	if ctx == nil || local == (rafttransport.NodeID{}) || len(tenant) == 0 ||
-		len(tenant) > replication.MaxIdentityBytes || id == (replication.ID128{}) ||
-		digest == (replication.Digest{}) {
-		return DurableRequestLedgerKey{}, replication.Digest{}, ErrDurableRequest
-	}
-	var scope requestledger.ScopeKind
-	var principal rafttransport.NodeID
-	if marked, _ := ctx.Value(replicatedTransactionLocalScopeContextKey{}).(bool); marked {
-		scope, principal = requestledger.ScopeLocalInstall, local
-	} else if authority, ok := serviceauthz.FromContext(ctx); ok &&
-		authority.Node != (rafttransport.NodeID{}) {
-		scope, principal = requestledger.ScopeAuthenticated, authority.Node
-	} else {
-		return DurableRequestLedgerKey{}, replication.Digest{}, ErrDurableRequest
-	}
-	tenantDigest := requestledger.Digest(sha256.Sum256(tenant))
-	var canonicalPrincipal requestledger.PrincipalID
-	var canonicalRequest requestledger.RequestID
-	copy(canonicalPrincipal[:], principal[:])
-	copy(canonicalRequest[:], id[:])
-	key := DurableRequestLedgerKey{
-		RequestKey: requestledger.RequestKey{
-			Scope: scope, Principal: canonicalPrincipal,
-			TenantDigest: tenantDigest, Request: canonicalRequest,
-		},
-		Digest: digest,
+func validDurableRequestLedgerKey(key DurableRequestLedgerKey) bool {
+	return key.RequestKey.Valid() && key.IssuerEpoch != 0 &&
+		key.IssuerSequence != 0 && key.IssuerLane != (requestledger.IssuerLane{}) &&
+		key.Digest != (replication.Digest{})
+}
+
+func durableRequestLedgerHome(key DurableRequestLedgerKey) (replication.Digest, error) {
+	if !validDurableRequestLedgerKey(key) {
+		return replication.Digest{}, ErrDurableRequest
 	}
 	home, err := requestledger.Home(key.RequestKey)
-	return key, replication.Digest(home), err
+	if err != nil {
+		return replication.Digest{}, errors.Join(err, ErrDurableRequest)
+	}
+	return replication.Digest(home), nil
 }
 
 func cloneDurableRequestRoute(route ReplicatedRoute) ReplicatedRoute {
@@ -558,7 +535,10 @@ func cloneDurableRequestRoute(route ReplicatedRoute) ReplicatedRoute {
 
 func validDurableRequestHomeRouteRefresh(prior, next ReplicatedRoute) bool {
 	if prior.Distribution != next.Distribution || prior.Shard != next.Shard ||
-		prior.Group != next.Group || prior.AllocationGeneration != next.AllocationGeneration {
+		prior.Group != next.Group || prior.AllocationGeneration != next.AllocationGeneration ||
+		prior.RangeIdentity != next.RangeIdentity ||
+		prior.LineageDigest != next.LineageDigest ||
+		prior.ForwardingRuleDigest != next.ForwardingRuleDigest {
 		return false
 	}
 	left, right := prior.Command, next.Command

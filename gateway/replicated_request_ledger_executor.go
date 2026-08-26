@@ -34,6 +34,20 @@ func acquireDurableRequestStream(ctx context.Context) (func(), error) {
 	}
 }
 
+func matchesDurableRequestProgramKey(
+	key DurableRequestLedgerKey,
+	program DurableRequestLogicalProgram,
+) bool {
+	if !validDurableRequestLedgerKey(key) || key.Digest != program.RequestDigest ||
+		key.Request != requestledger.RequestID(program.RequestID) ||
+		key.TenantDigest != requestledger.Digest(sha256.Sum256(program.Tenant)) {
+		return false
+	}
+	digest, err := requestledger.KeyDigest(key.RequestKey)
+	return err == nil && replication.Digest(digest) == program.KeyDigest &&
+		program.Contract.KeyDigest == program.KeyDigest
+}
+
 func (executor *DurableRequestExecutor) Execute(
 	ctx context.Context,
 	request DurableRequest,
@@ -43,11 +57,12 @@ func (executor *DurableRequestExecutor) Execute(
 		!validDurableRequestLogicalProgram(program) {
 		return DurableRequestOutcome{}, ErrDurableRequest
 	}
-	key, _, err := durableRequestLedgerKey(
-		ctx, executor.localPrincipal, program.Tenant, program.RequestID, program.RequestDigest,
-	)
-	if err != nil {
-		return DurableRequestOutcome{}, err
+	key := request.Key
+	if !validDurableRequestLedgerKey(key) {
+		return DurableRequestOutcome{}, ErrDurableRequest
+	}
+	if !matchesDurableRequestProgramKey(key, program) {
+		return DurableRequestOutcome{}, ErrDurableRequestConflict
 	}
 	releaseStream, acquireErr := acquireDurableRequestStream(ctx)
 	if acquireErr != nil {
@@ -81,18 +96,13 @@ func (executor *DurableRequestExecutor) Execute(
 // false only when no durable identity exists at the selected stable home.
 func (executor *DurableRequestExecutor) Replay(
 	ctx context.Context,
-	tenant []byte,
-	requestID replication.ID128,
-	digest replication.Digest,
+	key DurableRequestLedgerKey,
 ) (outcome DurableRequestOutcome, found bool, err error) {
 	if executor == nil || executor.ledger == nil || executor.runner == nil {
 		return outcome, false, ErrDurableRequest
 	}
-	key, _, err := durableRequestLedgerKey(
-		ctx, executor.localPrincipal, tenant, requestID, digest,
-	)
-	if err != nil {
-		return outcome, false, err
+	if !validDurableRequestLedgerKey(key) {
+		return outcome, false, ErrDurableRequest
 	}
 	releaseStream, acquireErr := acquireDurableRequestStream(ctx)
 	if acquireErr != nil {
@@ -114,9 +124,7 @@ func (executor *DurableRequestExecutor) Replay(
 // deletes to absent: delayed retries therefore cannot execute again.
 func (executor *DurableRequestExecutor) Acknowledge(
 	ctx context.Context,
-	tenant []byte,
-	requestID replication.ID128,
-	digest replication.Digest,
+	key DurableRequestLedgerKey,
 	token DurableRequestAckToken,
 ) error {
 	if executor == nil || executor.ledger == nil {
@@ -125,11 +133,8 @@ func (executor *DurableRequestExecutor) Acknowledge(
 	if token == (DurableRequestAckToken{}) {
 		return ErrDurableRequestConflict
 	}
-	key, _, err := durableRequestLedgerKey(
-		ctx, executor.localPrincipal, tenant, requestID, digest,
-	)
-	if err != nil {
-		return err
+	if !validDurableRequestLedgerKey(key) {
+		return ErrDurableRequest
 	}
 	home, _, entry, err := executor.lookupRefreshable(ctx, key)
 	if err != nil {
@@ -138,7 +143,7 @@ func (executor *DurableRequestExecutor) Acknowledge(
 	if entry.State == DurableRequestLedgerAbsent {
 		return ErrDurableRequestUnresolved
 	}
-	if entry.Digest != digest {
+	if entry.Digest != key.Digest {
 		return ErrDurableRequestConflict
 	}
 	if entry.State == DurableRequestLedgerAcked {
@@ -167,7 +172,7 @@ func (executor *DurableRequestExecutor) Acknowledge(
 		entry, err = executor.lookupWithHomeRetry(ctx, &home, key)
 	}
 	if err != nil || entry.State != DurableRequestLedgerAcked ||
-		entry.Digest != digest || entry.AckDigest == (replication.Digest{}) ||
+		entry.Digest != key.Digest || entry.AckDigest == (replication.Digest{}) ||
 		entry.AckTerminalRevision != terminalRevision || entry.AckResultDigest != resultDigest ||
 		entry.AckTokenDigest != durableRequestAckTokenDigest(token) {
 		return errors.Join(err, ErrDurableRequestUnresolved)

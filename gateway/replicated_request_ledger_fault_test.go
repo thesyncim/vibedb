@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
-	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -1246,7 +1245,6 @@ func newDurableFaultExecutor(
 	t.Helper()
 	executor, err := NewDurableRequestExecutor(DurableRequestExecutorOptions{
 		Topology: topology, Ledger: ledger, Runner: runner,
-		LocalPrincipal: rafttransport.NodeID{0x44},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1270,13 +1268,15 @@ func durableFaultRequestWith(
 ) DurableRequest {
 	t.Helper()
 	tenant := []byte("tenant-fault")
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
-	key, _, err := durableRequestLedgerKey(
-		ctx, rafttransport.NodeID{0x44}, tenant, requestID, requestDigest,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	laneDigest := sha256.Sum256(requestID[:])
+	var issuerLane requestledger.IssuerLane
+	copy(issuerLane[:], laneDigest[:len(issuerLane)])
+	key := DurableRequestLedgerKey{RequestKey: requestledger.RequestKey{
+		Scope: requestledger.ScopeLocalInstall, Principal: requestledger.PrincipalID{0x44},
+		Request:      requestledger.RequestID(requestID),
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)), IssuerEpoch: 1,
+		IssuerSequence: 1, IssuerLane: issuerLane,
+	}, Digest: requestDigest}
 	keyDigest, err := requestledger.KeyDigest(key.RequestKey)
 	if err != nil {
 		t.Fatal(err)
@@ -1338,7 +1338,51 @@ func durableFaultRequestWith(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return DurableRequest{Program: program}
+	return DurableRequest{Key: key, Program: program}
+}
+
+func TestDurableRequestExecutorRequiresExactStructuredIssuerKey(t *testing.T) {
+	participants := durableFaultParticipants(t)
+	topology := durableFaultTopology(t, participants)
+	executor := newDurableFaultExecutor(t, topology, newDurableFaultMemoryLedger(),
+		&durableFaultRunner{steps: durableFaultSteps(), rule: new(durableRunnerFaultRule),
+			data: newDurableRunnerData()})
+	request := durableFaultRequest(t, participants)
+
+	for name, mutate := range map[string]func(*DurableRequestLedgerKey){
+		"epoch":    func(key *DurableRequestLedgerKey) { key.IssuerEpoch = 0 },
+		"lane":     func(key *DurableRequestLedgerKey) { key.IssuerLane = requestledger.IssuerLane{} },
+		"sequence": func(key *DurableRequestLedgerKey) { key.IssuerSequence = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := request
+			mutate(&candidate.Key)
+			if _, err := executor.Execute(t.Context(), candidate); !errors.Is(err, ErrDurableRequest) {
+				t.Fatalf("execute error=%v", err)
+			}
+			if _, _, err := executor.Replay(t.Context(), candidate.Key); !errors.Is(err, ErrDurableRequest) {
+				t.Fatalf("replay error=%v", err)
+			}
+			if err := executor.Acknowledge(t.Context(), candidate.Key, DurableRequestAckToken{1}); !errors.Is(err, ErrDurableRequest) {
+				t.Fatalf("acknowledge error=%v", err)
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*DurableRequestLedgerKey){
+		"principal": func(key *DurableRequestLedgerKey) { key.Principal[0]++ },
+		"request":   func(key *DurableRequestLedgerKey) { key.Request[0]++ },
+		"tenant":    func(key *DurableRequestLedgerKey) { key.TenantDigest[0]++ },
+		"digest":    func(key *DurableRequestLedgerKey) { key.Digest[0]++ },
+	} {
+		t.Run("mismatch_"+name, func(t *testing.T) {
+			candidate := request
+			mutate(&candidate.Key)
+			if _, err := executor.Execute(t.Context(), candidate); !errors.Is(err, ErrDurableRequestConflict) {
+				t.Fatalf("execute error=%v", err)
+			}
+		})
+	}
 }
 
 func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) {
@@ -1404,10 +1448,8 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 				pendingStep = 0
 			}
 			if pendingStep >= 0 {
-				key, point, keyErr := durableRequestLedgerKey(
-					ctx, first.localPrincipal, request.Program.Tenant,
-					request.Program.RequestID, request.Program.RequestDigest,
-				)
+				key := request.Key
+				point, keyErr := durableRequestLedgerHome(key)
 				if keyErr != nil {
 					t.Fatal(keyErr)
 				}
@@ -1425,17 +1467,14 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 			}
 
 			// A replacement receives no process-local recovery handle and no
-			// participant recipe. Principal, tenant, request ID, digest, topology,
-			// and the replicated ledger are its complete recovery input.
+			// participant recipe. The exact structured request key, topology, and
+			// replicated ledger are its complete recovery input.
 			ledgerRule.clear()
 			runnerRule.clear()
 			replacement := newDurableFaultExecutor(t, topology, ledger, &durableFaultRunner{
 				steps: steps, rule: runnerRule, data: data,
 			})
-			outcome, found, err := replacement.Replay(
-				ctx, request.Program.Tenant, request.Program.RequestID,
-				request.Program.RequestDigest,
-			)
+			outcome, found, err := replacement.Replay(ctx, request.Key)
 			if err != nil || !found || !outcome.Committed || outcome.AffectedRows != 2 ||
 				outcome.CatalogGeneration != request.Program.Identity.CatalogGeneration ||
 				outcome.ShardsFanned != 2 {
@@ -1520,26 +1559,17 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 	wrongToken := outcome.AckToken
 	wrongToken[0] ^= 0xff
 	for _, token := range []DurableRequestAckToken{{}, wrongToken} {
-		if err := executor.Acknowledge(
-			ctx, request.Program.Tenant, request.Program.RequestID,
-			request.Program.RequestDigest, token,
-		); !errors.Is(err, ErrDurableRequestConflict) {
+		if err := executor.Acknowledge(ctx, request.Key, token); !errors.Is(err, ErrDurableRequestConflict) {
 			t.Fatalf("invalid ACK possession token %+v error=%v", token, err)
 		}
 	}
-	if retained, found, err := executor.Replay(
-		ctx, request.Program.Tenant, request.Program.RequestID,
-		request.Program.RequestDigest,
-	); err != nil || !found || !retained.Committed ||
+	if retained, found, err := executor.Replay(ctx, request.Key); err != nil || !found || !retained.Committed ||
 		retained.AckToken != outcome.AckToken || !bytes.Equal(retained.Result, outcome.Result) {
 		t.Fatalf("invalid ACK token discarded terminal: outcome=%+v found=%v err=%v", retained, found, err)
 	}
 
 	ledgerRule.arm(durableFaultAcknowledge, durableFaultAfter)
-	if err := executor.Acknowledge(
-		ctx, request.Program.Tenant, request.Program.RequestID,
-		request.Program.RequestDigest, outcome.AckToken,
-	); err == nil {
+	if err := executor.Acknowledge(ctx, request.Key, outcome.AckToken); err == nil {
 		t.Fatal("lost ACK response unexpectedly succeeded")
 	}
 	ledgerRule.clear()
@@ -1552,10 +1582,7 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 		replayed.ID != ([16]byte{}) {
 		t.Fatalf("acked execute replay=%+v err=%v", replayed, err)
 	}
-	if replayed, found, err := replacement.Replay(
-		ctx, request.Program.Tenant, request.Program.RequestID,
-		request.Program.RequestDigest,
-	); !found || !errors.Is(err, ErrDurableRequestAcknowledged) ||
+	if replayed, found, err := replacement.Replay(ctx, request.Key); !found || !errors.Is(err, ErrDurableRequestAcknowledged) ||
 		!replayed.Acknowledged || replayed.Committed {
 		t.Fatalf("acked replay=%+v found=%v err=%v", replayed, found, err)
 	}
@@ -1567,10 +1594,7 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 			t.Fatalf("acked %s identity reuse error=%v", name, err)
 		}
 	}
-	if err := replacement.Acknowledge(
-		ctx, request.Program.Tenant, request.Program.RequestID,
-		request.Program.RequestDigest, outcome.AckToken,
-	); err != nil {
+	if err := replacement.Acknowledge(ctx, request.Key, outcome.AckToken); err != nil {
 		t.Fatalf("duplicate ACK: %v", err)
 	}
 	attemptsAfter, _ := data.snapshot()
@@ -1578,10 +1602,8 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 		t.Fatalf("ACK replay invoked runner: before=%d after=%d", len(attemptsBefore), len(attemptsAfter))
 	}
 
-	key, point, err := durableRequestLedgerKey(
-		ctx, replacement.localPrincipal, request.Program.Tenant,
-		request.Program.RequestID, request.Program.RequestDigest,
-	)
+	key := request.Key
+	point, err := durableRequestLedgerHome(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1641,18 +1663,11 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 		!bytes.Equal(abortOutcome.Result, []byte("aborted")) {
 		t.Fatalf("abort outcome=%+v err=%v", abortOutcome, err)
 	}
-	if replayed, found, err := abortExecutor.Replay(
-		ctx, abortRequest.Program.Tenant, abortRequest.Program.RequestID,
-		abortRequest.Program.RequestDigest,
-	); err != nil || !found || replayed.Committed || replayed.ID != abortOutcome.ID ||
+	if replayed, found, err := abortExecutor.Replay(ctx, abortRequest.Key); err != nil || !found || replayed.Committed || replayed.ID != abortOutcome.ID ||
 		replayed.AckToken != abortOutcome.AckToken {
 		t.Fatalf("abort replay=%+v found=%v err=%v", replayed, found, err)
 	}
-	if err := abortExecutor.Acknowledge(
-		ctx, abortRequest.Program.Tenant, abortRequest.Program.RequestID,
-		abortRequest.Program.RequestDigest,
-		abortOutcome.AckToken,
-	); err != nil {
+	if err := abortExecutor.Acknowledge(ctx, abortRequest.Key, abortOutcome.AckToken); err != nil {
 		t.Fatalf("abort ACK: %v", err)
 	}
 
@@ -1744,10 +1759,8 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 			if _, err := executor.Execute(ctx, request); !errors.Is(err, ErrDurableRequestConflict) {
 				t.Fatalf("forged terminal error=%v", err)
 			}
-			key, point, err := durableRequestLedgerKey(
-				ctx, executor.localPrincipal, request.Program.Tenant,
-				request.Program.RequestID, request.Program.RequestDigest,
-			)
+			key := request.Key
+			point, err := durableRequestLedgerHome(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1827,16 +1840,10 @@ func TestDurableRequestStatelessCapacityFloodDoesNotConsumeRecoveryAuthority(t *
 	if err != nil || !outcome.Committed || outcome.AckToken == (DurableRequestAckToken{}) {
 		t.Fatalf("admitted recovery outcome=%+v err=%v", outcome, err)
 	}
-	if err := replacement.Acknowledge(
-		ctx, admitted.Program.Tenant, admitted.Program.RequestID,
-		admitted.Program.RequestDigest, outcome.AckToken,
-	); err != nil {
+	if err := replacement.Acknowledge(ctx, admitted.Key, outcome.AckToken); err != nil {
 		t.Fatalf("admitted cleanup ACK: %v", err)
 	}
-	if replayed, found, err := replacement.Replay(
-		ctx, admitted.Program.Tenant, admitted.Program.RequestID,
-		admitted.Program.RequestDigest,
-	); !found || !replayed.Acknowledged ||
+	if replayed, found, err := replacement.Replay(ctx, admitted.Key); !found || !replayed.Acknowledged ||
 		!errors.Is(err, ErrDurableRequestAcknowledged) {
 		t.Fatalf("admitted cleanup replay=%+v found=%v err=%v", replayed, found, err)
 	}
@@ -1875,10 +1882,8 @@ func TestDurableRequestStageUsesAppliedCompletionFastPath(t *testing.T) {
 				t, participants, replication.ID128{0x72}, replication.Digest{0x73}, 7,
 			)
 			ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
-			key, point, err := durableRequestLedgerKey(
-				ctx, executor.localPrincipal, request.Program.Tenant,
-				request.Program.RequestID, request.Program.RequestDigest,
-			)
+			key := request.Key
+			point, err := durableRequestLedgerHome(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1970,10 +1975,7 @@ func TestDurableRequestRefreshesSameHomeAtEveryLifecycleCut(t *testing.T) {
 				t.Fatalf("refreshed execute outcome=%+v err=%v", outcome, err)
 			}
 			if testCase.ack {
-				if err := executor.Acknowledge(
-					ctx, request.Program.Tenant, request.Program.RequestID,
-					request.Program.RequestDigest, outcome.AckToken,
-				); err != nil {
+				if err := executor.Acknowledge(ctx, request.Key, outcome.AckToken); err != nil {
 					t.Fatalf("refreshed ACK: %v", err)
 				}
 			}
@@ -2011,10 +2013,8 @@ func TestDurableRequestPagedRecipeHasNoParticipantCliff(t *testing.T) {
 				outcome.ShardsFanned != count {
 				t.Fatalf("count=%d outcome=%+v err=%v", count, outcome, err)
 			}
-			key, point, err := durableRequestLedgerKey(
-				ctx, executor.localPrincipal, request.Program.Tenant,
-				request.Program.RequestID, request.Program.RequestDigest,
-			)
+			key := request.Key
+			point, err := durableRequestLedgerHome(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2081,19 +2081,8 @@ func TestDurableRequestPagedBuildResumesAtEveryDurableCut(t *testing.T) {
 	)
 	topology := durableFaultTopology(t, participants)
 	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
-	probe := newDurableFaultExecutor(
-		t, topology, &durableFaultLedger{
-			base: newDurableFaultMemoryLedger(), rule: new(durableFaultRule),
-		},
-		&durableFaultRunner{
-			steps: durableFaultSteps(), rule: new(durableRunnerFaultRule),
-			data: newDurableRunnerData(),
-		},
-	)
-	key, point, err := durableRequestLedgerKey(
-		ctx, probe.localPrincipal, request.Program.Tenant,
-		request.Program.RequestID, request.Program.RequestDigest,
-	)
+	key := request.Key
+	point, err := durableRequestLedgerHome(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2335,10 +2324,7 @@ func TestDurableRequestRoutesIndependentIdentitiesToTwoLedgerHomes(t *testing.T)
 			t, participants, requestID,
 			replication.Digest{byte(value), byte(value >> 8), 0x39}, 7,
 		)
-		_, point, err := durableRequestLedgerKey(
-			ctx, executor.localPrincipal, request.Program.Tenant,
-			request.Program.RequestID, request.Program.RequestDigest,
-		)
+		point, err := durableRequestLedgerHome(request.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2452,6 +2438,22 @@ func TestDurableRequestLedgerTopologyRejectsUnprovedRehome(t *testing.T) {
 		Generation: current.Generation + 1, Ranges: ranges,
 	}); err != nil {
 		t.Fatalf("same-home route refresh: %v", err)
+	}
+	for name, mutate := range map[string]func(*ReplicatedRoute){
+		"range identity":    func(route *ReplicatedRoute) { route.RangeIdentity[0]++ },
+		"lineage digest":    func(route *ReplicatedRoute) { route.LineageDigest[0]++ },
+		"forwarding digest": func(route *ReplicatedRoute) { route.ForwardingRuleDigest[0]++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			drifted := append([]DurableRequestLedgerRange(nil), ranges...)
+			drifted[0].Route = cloneDurableRequestRoute(ranges[0].Route)
+			mutate(&drifted[0].Route)
+			if err := holder.Publish(DurableRequestLedgerTopology{
+				Generation: current.Generation + 2, Ranges: drifted,
+			}); !errors.Is(err, ErrDurableRequest) {
+				t.Fatalf("unproved logical route refresh error=%v", err)
+			}
+		})
 	}
 
 	added := []DurableRequestLedgerRange{
