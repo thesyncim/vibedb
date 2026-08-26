@@ -92,17 +92,31 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		t.Fatalf("staged target catalog bytes=%d/%d err=%v",
 			len(stagedCatalog), cap(stagedCatalog), err)
 	}
-	command, err := claim.AppendReplicatedSchemaTransition(
-		nil, prepared, ReplicatedSchemaTransitionAuthority{
-			RequestDigest: [32]byte{0xa5}, AuthorizationDigest: [32]byte{0xb6},
-			CatalogCASDigest: [32]byte{0xc7},
-		},
+	catalogCAS, err := claim.ReplicatedSchemaCatalogCASDigest(
+		prepared, [32]byte{0xa5}, [32]byte{0xb6},
 	)
+	if err != nil || catalogCAS == ([32]byte{}) {
+		t.Fatalf("catalog CAS digest=%x err=%v", catalogCAS, err)
+	}
+	command, err := claim.AppendReplicatedSchemaTransition(nil, prepared,
+		ReplicatedSchemaTransitionAuthority{
+			RequestDigest: [32]byte{0xa5}, AuthorizationDigest: [32]byte{0xb6},
+			CatalogCASDigest: catalogCAS,
+		})
 	opened, openErr := replicatedstate.OpenSchemaTransition(command)
 	if err != nil || openErr != nil || opened.ToManifest != prepared.Catalog.RelationManifestDigest ||
 		opened.ToApplyContract != prepared.ApplyContract ||
 		opened.MembershipSequence != prepared.Membership.Sequence {
 		t.Fatalf("schema transition = %+v, append=%v open=%v", opened, err, openErr)
+	}
+	if err = claim.PersistReplicatedSchemaTransition(command); err != nil {
+		t.Fatal(err)
+	}
+	activation, found, err := readReplicatedSchemaActivation(path + ".tables")
+	if err != nil || !found || activation.targetDigest != prepared.Catalog.Digest ||
+		!bytes.Equal(activation.command, command) || cap(activation.command) != len(activation.command) {
+		t.Fatalf("activation found=%t target=%x command=%d/%d err=%v", found,
+			activation.targetDigest, len(activation.command), cap(activation.command), err)
 	}
 	if err = claim.Close(); err != nil {
 		t.Fatal(err)
