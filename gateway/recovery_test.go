@@ -322,16 +322,21 @@ func newManifestRecoveryFixture(
 type manifestRecoveryScript struct {
 	mu sync.Mutex
 
-	fixture        manifestRecoveryFixture
-	state          distributedtxn.CoordinatorState
-	revision       uint64
-	missingPage    int
-	reorderFirst   bool
-	dropCommitOnce bool
-	dropLookupOnce bool
-	dropRetireOnce bool
-	operations     map[shardservice.TransactionOperation]int
-	serveErr       error
+	fixture              manifestRecoveryFixture
+	state                distributedtxn.CoordinatorState
+	revision             uint64
+	missingPage          int
+	reorderFirst         bool
+	dropCommitOnce       bool
+	dropLookupOnce       bool
+	dropRetireOnce       bool
+	commitWinsAbort      bool
+	participantAborted   bool
+	participantDelay     time.Duration
+	participantInFlight  int
+	participantMaxFlight int
+	operations           map[shardservice.TransactionOperation]int
+	serveErr             error
 }
 
 func newManifestRecoveryScript(fixture manifestRecoveryFixture, state distributedtxn.CoordinatorState) *manifestRecoveryScript {
@@ -425,9 +430,13 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 			return nil
 		}
 		response := shardservice.CompletionResponse(0)
+		participantState := distributedtxn.ParticipantStaged
+		if s.participantAborted {
+			participantState = distributedtxn.ParticipantAborted
+		}
 		response.Transaction = shardservice.TransactionReply{
 			Role: shardservice.TransactionRoleParticipant, ID: s.fixture.id, Revision: 1,
-			ParticipantState: distributedtxn.ParticipantStaged,
+			ParticipantState: participantState,
 			RecordKind:       shardservice.TransactionRecordParticipant, Record: record,
 		}
 		return response
@@ -440,6 +449,8 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 	case shardservice.TransactionAbortParticipant:
 		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantAborted, 2, 0)
 	case shardservice.TransactionLookupParticipant:
+		s.beginParticipantLookup()
+		defer s.endParticipantLookup()
 		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantStaged, 1, 0)
 	case shardservice.TransactionCommitCoordinator:
 		s.mu.Lock()
@@ -453,6 +464,13 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 		return manifestCoordinatorStatus(s.fixture, state, revision, true)
 	case shardservice.TransactionAbortCoordinator:
 		s.mu.Lock()
+		if s.commitWinsAbort {
+			s.state, s.revision = distributedtxn.CoordinatorCommitted, 2
+			s.mu.Unlock()
+			return shardservice.NewErrorResponse(
+				shardservice.ErrorTransactionConflict, "commit won abort race",
+			)
+		}
 		s.state, s.revision = distributedtxn.CoordinatorAborted, 2
 		s.mu.Unlock()
 		return manifestCoordinatorStatus(s.fixture, distributedtxn.CoordinatorAborted, 2, false)
@@ -464,6 +482,23 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 	default:
 		return shardservice.NewErrorResponse(shardservice.ErrorMalformedRequest, "unexpected transaction operation")
 	}
+}
+
+func (s *manifestRecoveryScript) beginParticipantLookup() {
+	s.mu.Lock()
+	delay := s.participantDelay
+	s.participantInFlight++
+	s.participantMaxFlight = max(s.participantMaxFlight, s.participantInFlight)
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+}
+
+func (s *manifestRecoveryScript) endParticipantLookup() {
+	s.mu.Lock()
+	s.participantInFlight--
+	s.mu.Unlock()
 }
 
 func (s *manifestRecoveryScript) participantRecord(ref distributedtxn.ParticipantRef) ([]byte, error) {
@@ -673,6 +708,102 @@ func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
 		if got := script.operationCount(operation); got != 65 {
 			t.Fatalf("operation %d count=%d", operation, got)
 		}
+	}
+	script.check(t)
+}
+
+func TestLiveInlineAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
+	fixture := newManifestRecoveryFixture(
+		t, 1, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+	)
+	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
+	script.commitWinsAbort = true
+	executor := script.executor()
+	participant := transactionParticipant{call: fixture.coordinator.call}
+	err := executor.abortTransaction(
+		t.Context(), fixture.id, &participant, []transactionParticipant{participant},
+		executor.profileFor(ClassInteractive),
+	)
+	if !errors.Is(err, ErrTransactionCommitted) {
+		t.Fatalf("abort error=%v", err)
+	}
+	if got := script.operationCount(shardservice.TransactionLookupParticipant) +
+		script.operationCount(shardservice.TransactionAbortParticipant); got != 0 {
+		t.Fatalf("committed winner observed %d participant mutations/lookups", got)
+	}
+	script.check(t)
+}
+
+func TestLiveAbortCleanupUsesBoundedConcurrency(t *testing.T) {
+	fixture := newManifestRecoveryFixture(
+		t, 1, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+	)
+	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
+	script.participantDelay = 10 * time.Millisecond
+	executor := script.executor()
+	participants := make([]transactionParticipant, 16)
+	for i := range participants {
+		participants[i].call = fixture.coordinator.call
+	}
+	profile := executor.profileFor(ClassInteractive)
+	profile.MaxConcurrency = 4
+	if err := executor.abortTransaction(
+		t.Context(), fixture.id, &participants[0], participants, profile,
+	); err != nil {
+		t.Fatalf("abort transaction: %v", err)
+	}
+	script.mu.Lock()
+	maxFlight := script.participantMaxFlight
+	script.mu.Unlock()
+	if maxFlight != profile.MaxConcurrency {
+		t.Fatalf("participant cleanup concurrency=%d want=%d", maxFlight, profile.MaxConcurrency)
+	}
+	if got := script.operationCount(shardservice.TransactionAbortParticipant); got != len(participants) {
+		t.Fatalf("participant aborts=%d want=%d", got, len(participants))
+	}
+	script.check(t)
+}
+
+func TestRecoveryManifestAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
+	fixture := newManifestRecoveryFixture(
+		t, 65, distributedtxn.CoordinatorStaging, time.Now().Add(-time.Second).UnixNano(),
+	)
+	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
+	script.participantAborted = true
+	script.commitWinsAbort = true
+	executor := script.executor()
+	_, err := executor.recoverManifestCoordinator(
+		t.Context(), fixture.snapshot, script.coordinatorResponse(),
+		executor.profileFor(ClassAdmin),
+	)
+	if !errors.Is(err, ErrTransactionCommitted) {
+		script.check(t)
+		t.Fatalf("recovery error=%v", err)
+	}
+	if got := script.operationCount(shardservice.TransactionAbortParticipant); got != 0 {
+		t.Fatalf("committed winner aborted %d participants", got)
+	}
+	script.check(t)
+}
+
+func TestRecoveryManifestRetiredDoesNotReadPrunedPages(t *testing.T) {
+	fixture := newManifestRecoveryFixture(
+		t, 65, distributedtxn.CoordinatorRetired, time.Now().Add(-time.Second).UnixNano(),
+	)
+	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorRetired)
+	// Retired coordinators may have reclaimed every VTM1 page. Any page read
+	// would therefore fail and turn a successful restart into false corruption.
+	script.missingPage = 0
+	executor := script.executor()
+	result, err := executor.recoverManifestCoordinator(
+		t.Context(), fixture.snapshot, script.coordinatorResponse(),
+		executor.profileFor(ClassAdmin),
+	)
+	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.Participants != 65 {
+		t.Fatalf("retired recovery result=%+v err=%v", result, err)
+	}
+	if got := script.operationCount(shardservice.TransactionReadManifestSegment); got != 0 {
+		t.Fatalf("retired coordinator read %d reclaimed pages", got)
 	}
 	script.check(t)
 }

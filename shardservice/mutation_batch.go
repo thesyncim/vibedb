@@ -59,7 +59,10 @@ type MutationStatement struct {
 }
 
 const (
-	maxMutationStatements      = 4096
+	// MaxMutationStatements is the canonical per-participant statement bound.
+	// Gateways use the same authority during planning so they reject excess
+	// before retaining it or attempting participant encoding.
+	MaxMutationStatements      = 4096
 	maxMutationRelationBytes   = 1<<16 - 1
 	mutationBatchHeader        = 8
 	globalMutationFixedBytes   = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 4 + 4
@@ -76,7 +79,7 @@ var (
 // not repeated for every statement. The participant record's checksum and
 // SHA-256 digest protect these bytes durably and end to end.
 func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, error) {
-	if len(statements) == 0 || len(statements) > maxMutationStatements {
+	if len(statements) == 0 || len(statements) > MaxMutationStatements {
 		return dst, ErrMutationBatch
 	}
 	total := mutationBatchHeader
@@ -262,7 +265,7 @@ func OpenMutationBatch(src []byte) (MutationBatch, error) {
 		return MutationBatch{}, ErrMutationBatch
 	}
 	count := binary.LittleEndian.Uint32(src[4:8])
-	if count == 0 || count > maxMutationStatements {
+	if count == 0 || count > MaxMutationStatements {
 		return MutationBatch{}, ErrMutationBatch
 	}
 	batch := MutationBatch{body: src[mutationBatchHeader:], remaining: count}

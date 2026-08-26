@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -135,6 +136,71 @@ func TestIndexedTransactionGroupingAdmits4097ExactTargets(t *testing.T) {
 	if err != nil || len(participants) != 4097 || len(participants[4096].statements) != 2 {
 		t.Fatalf("exact duplicate grouping participants=%d statements=%d err=%v",
 			len(participants), len(participants[4096].statements), err)
+	}
+}
+
+func TestHugeSameShardPlanningRetainsOnlyAdmittedBytes(t *testing.T) {
+	profile := DefaultProfiles()[ClassInteractive].withDefaults()
+	profile.MaxTransactionMutations = 1_000_000
+	profile.MaxTransactionBytes = 128
+	request := &shardservice.ShardRequest{
+		Distribution: "data", Shard: "same", RoutingVersion: 7,
+		AllocationGeneration: 1, OwnershipEpoch: 11,
+	}
+	plan := func() ([]transactionParticipant, error) {
+		participants := make([]transactionParticipant, 0,
+			transactionParticipantCapacity(nil, 1_000_000, profile))
+		budget := transactionPlanBudget{profile: profile}
+		for range 1_000_000 {
+			var err error
+			participants, err = appendTransactionStatementBudgeted(
+				participants, nil, shardCall{req: request},
+				shardservice.MutationStatement{SQL: "UPDATE t SET n=1"}, &budget,
+			)
+			if err != nil {
+				return participants, err
+			}
+		}
+		return participants, nil
+	}
+	participants, err := plan()
+	if !errors.Is(err, ErrTransactionByteLimit) || len(participants) != 1 ||
+		len(participants[0].statements) > 5 {
+		t.Fatalf("participants=%d retained=%d err=%v", len(participants), len(participants[0].statements), err)
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			_, _ = plan()
+		}
+	})
+	if bytes := result.AllocedBytesPerOp(); bytes > 16<<10 {
+		t.Fatalf("same-shard rejected plan allocated %d bytes/op", bytes)
+	}
+}
+
+func TestTransactionPlanningBudgetMatchesCanonicalBytes(t *testing.T) {
+	profile := DefaultProfiles()[ClassInteractive].withDefaults()
+	statements := []shardservice.MutationStatement{
+		{SQL: "INSERT INTO t (k, v) VALUES (?, ?)", Params: []shardservice.Param{
+			shardservice.StringParam("k"), shardservice.BoolParam(true),
+		}},
+		{SQL: "DELETE FROM t WHERE k = ?", Params: []shardservice.Param{
+			shardservice.NumberParam("42"),
+		}},
+	}
+	budget := transactionPlanBudget{profile: profile}
+	for i := range statements {
+		if err := budget.admit(&statements[i], i == 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded, err := shardservice.AppendMutationBatch(nil, statements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget.bytes != uint64(len(encoded)) || budget.mutations != uint64(len(statements)) {
+		t.Fatalf("budget bytes/mutations=%d/%d canonical=%d/%d",
+			budget.bytes, budget.mutations, len(encoded), len(statements))
 	}
 }
 

@@ -204,7 +204,7 @@ func (e *Executor) recoverInlineCoordinator(
 				return result, ErrRecoveryNotReady
 			}
 			if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
-				return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
+				return result, transactionAbortFailure(record.ID, nil, err)
 			}
 			return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
 		}
@@ -212,7 +212,7 @@ func (e *Executor) recoverInlineCoordinator(
 			state := participantReplies[i].Transaction.ParticipantState
 			if state == distributedtxn.ParticipantAborted {
 				if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
-					return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
+					return result, transactionAbortFailure(record.ID, nil, err)
 				}
 				return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
 			}
@@ -225,7 +225,7 @@ func (e *Executor) recoverInlineCoordinator(
 		); err != nil {
 			abortErr := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile)
 			if abortErr != nil {
-				return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: errors.Join(err, abortErr)}
+				return result, transactionAbortFailure(record.ID, err, abortErr)
 			}
 			return result, err
 		}
@@ -242,7 +242,7 @@ func (e *Executor) recoverInlineCoordinator(
 		}
 	case distributedtxn.CoordinatorAborted:
 		if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
-			return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
+			return result, transactionAbortFailure(record.ID, nil, err)
 		}
 		return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, reply.Revision, result, profile)
 	case distributedtxn.CoordinatorRetired:
@@ -402,7 +402,7 @@ func (e *Executor) recoverManifestCoordinator(
 			if err := e.abortRecoveryManifest(
 				ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
 			); err != nil {
-				return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
+				return result, transactionAbortFailure(record.ID, nil, err)
 			}
 			return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
 		}
@@ -414,9 +414,7 @@ func (e *Executor) recoverManifestCoordinator(
 				ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
 			)
 			if abortErr != nil {
-				return result, &TransactionOutcomeUnknownError{
-					ID: record.ID, Cause: errors.Join(err, abortErr),
-				}
+				return result, transactionAbortFailure(record.ID, err, abortErr)
 			}
 			return result, err
 		}
@@ -435,7 +433,7 @@ func (e *Executor) recoverManifestCoordinator(
 		if err := e.abortRecoveryManifest(
 			ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
 		); err != nil {
-			return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
+			return result, transactionAbortFailure(record.ID, nil, err)
 		}
 		return e.retireRecoveredCoordinator(
 			ctx, coordinator, record.ID, reply.Revision, result, profile,
@@ -769,6 +767,13 @@ func (e *Executor) abortRecoveryManifest(
 	arena *manifestRecoveryArena,
 	coordinatorParticipant *transactionParticipant,
 ) error {
+	// The coordinator decision is the sole commit/abort authority. Never mutate
+	// a participant until abort has durably won or an idempotent lookup proves it
+	// already won; a concurrent committed winner must retain all participant
+	// state for committed recovery.
+	if err := e.abortCoordinator(ctx, record.ID, coordinatorParticipant, profile); err != nil {
+		return err
+	}
 	var firstErr error
 	walkErr := e.walkRecoveryManifest(
 		ctx, routes, coordinator, record.ID, record.Manifest, profile, arena,
@@ -794,14 +799,7 @@ func (e *Executor) abortRecoveryManifest(
 	if walkErr != nil && firstErr == nil {
 		firstErr = walkErr
 	}
-	abort := transactionRequest(
-		coordinatorParticipant.call.req, profile,
-		shardservice.TransactionAbortCoordinator, record.ID, 1, nil,
-	)
-	_, coordinatorErr := e.transactionRoundTrip(
-		ctx, coordinatorParticipant.call.address, abort, profile,
-	)
-	return errors.Join(firstErr, coordinatorErr)
+	return firstErr
 }
 
 func (e *Executor) abortIncompleteRecoveryManifest(
@@ -810,20 +808,8 @@ func (e *Executor) abortIncompleteRecoveryManifest(
 	id distributedtxn.ID,
 	profile Profile,
 ) error {
-	abort := transactionRequest(
-		coordinator.call.req, profile,
-		shardservice.TransactionAbortCoordinator, id, 1, nil,
-	)
-	response, err := e.transactionRoundTrip(ctx, coordinator.call.address, abort, profile)
-	if err != nil {
-		return err
-	}
-	if response.Transaction.Role != shardservice.TransactionRoleCoordinator ||
-		response.Transaction.ID != id ||
-		response.Transaction.CoordinatorState != distributedtxn.CoordinatorAborted {
-		return ErrTransactionConflict
-	}
-	return nil
+	participant := transactionParticipant{call: coordinator.call}
+	return e.abortCoordinator(ctx, id, &participant, profile)
 }
 
 func (e *Executor) abortRecoveryManifestParticipant(
