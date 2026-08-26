@@ -10,6 +10,7 @@ import (
 
 type incrementalPrimaryTestSink struct {
 	pages [][]byte
+	refs  []PageRef
 	next  uint64
 }
 
@@ -23,6 +24,7 @@ func (p *incrementalPrimaryTestPage) Bytes() []byte { return p.image }
 func (p *incrementalPrimaryTestPage) Ref() PageRef  { return p.ref }
 func (p *incrementalPrimaryTestPage) Stage() error {
 	p.owner.pages = append(p.owner.pages, p.image)
+	p.owner.refs = append(p.owner.refs, p.ref)
 	return nil
 }
 
@@ -196,6 +198,67 @@ func TestPrimaryGraphLeafWindowPlannerStagesDirectly(t *testing.T) {
 	}
 	if view.Len() != emission.Count {
 		t.Fatalf("decoded rows=%d, want %d", view.Len(), emission.Count)
+	}
+}
+
+func TestStagePrimaryTabletWindowUsesBoundedLeafWitnesses(t *testing.T) {
+	records := make([]PrimaryGraphRecord, 64)
+	for row := range records {
+		records[row] = BorrowPrimaryGraphRecord(
+			[]byte(fmt.Sprintf("key-%08d", row)),
+			[]byte(fmt.Sprintf(`{"rank":%d}`, row)),
+		)
+	}
+	planner, err := NewPrimaryGraphLeafWindowPlanner(true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &incrementalPrimaryTestSink{next: 64 << 10}
+	leaves := make([]primaryBuiltLeaf, 0, 2)
+	for leaf := range 2 {
+		window := records[leaf*32 : (leaf+1)*32]
+		emission, err := planner.Stage(
+			sink, 5, uint16(leaf), window,
+			CommonPrimaryLeafMaxExtentBytes, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaves = append(leaves, primaryBuiltLeaf{
+			firstKey: emission.FirstKey, lastKey: emission.LastKey,
+			ref: emission.Ref,
+		})
+	}
+	child, err := stagePrimaryTabletWindow(sink, 5, leaves, []byte("before"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.id != 5 || child.ref.Kind != PageTabletRoute || len(child.floor) == 0 {
+		t.Fatalf("bad tablet child: %#v", child)
+	}
+	var routeImage []byte
+	for at := range sink.refs {
+		if sink.refs[at] == child.ref {
+			routeImage = sink.pages[at]
+			break
+		}
+	}
+	if routeImage == nil {
+		t.Fatal("tablet route was not staged")
+	}
+	view, err := OpenGlobalTabletCatalogTabletRoot(
+		routeImage, child.ref,
+		GlobalTabletCatalogBounds{
+			StoreID: testStoreID, SelectedRootGeneration: 7,
+			FileEnd:       incrementalPrimaryFileEnd(sink),
+			NextLogicalID: PrimaryFirstDynamicLogicalID,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.TabletID() != 5 || view.AnchorCount() != 1 {
+		t.Fatalf("tablet id/anchors = %d/%d", view.TabletID(), view.AnchorCount())
 	}
 }
 

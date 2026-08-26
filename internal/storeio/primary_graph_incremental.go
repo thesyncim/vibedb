@@ -158,3 +158,161 @@ func (p *PrimaryGraphLeafWindowPlanner) Stage(
 		FirstKey: records[0].keyBytes(), LastKey: records[count-1].keyBytes(),
 	}, nil
 }
+
+// stagePrimaryTabletWindow folds at most one format tablet of leaf witnesses.
+// Its allocations are bounded by TabletLocalIdentityLocalCount and the fixed
+// sixteen anchor pages, independent of collection cardinality.
+func stagePrimaryTabletWindow(
+	sink PrimaryGraphBuildSink,
+	tabletID uint32,
+	leaves []primaryBuiltLeaf,
+	previousTabletMax []byte,
+) (primaryCatalogChild, error) {
+	if sink == nil || tabletID >= TabletLocalIdentityTabletCount ||
+		len(leaves) == 0 || len(leaves) > TabletLocalIdentityLocalCount {
+		return primaryCatalogChild{}, fmt.Errorf(
+			"%w: incremental primary tablet", ErrInvalidWrite,
+		)
+	}
+	fences := make([][]byte, len(leaves))
+	routerLeaves := make([]SegmentedTabletRouterLeaf, len(leaves))
+	locatorEntries := make([]GlobalTabletCatalogLocatorEntry, len(leaves))
+	for rank := range leaves {
+		if rank != 0 {
+			fence := make([]byte, len(leaves[rank].firstKey))
+			var err error
+			fences[rank], err = ShortestPrimaryFence(
+				fence, leaves[rank-1].lastKey, leaves[rank].firstKey,
+			)
+			if err != nil {
+				return primaryCatalogChild{}, err
+			}
+		}
+		localID := uint16(rank)
+		routerLeaves[rank] = SegmentedTabletRouterLeaf{
+			LocalID: localID, Fence: fences[rank], Ref: leaves[rank].ref,
+		}
+		locatorEntries[rank] = GlobalTabletCatalogLocatorEntry{
+			LocalID: localID,
+			PageID:  uint8(rank / SegmentedTabletRouterRowsPerPage),
+			RowSlot: uint8(rank % SegmentedTabletRouterRowsPerPage),
+			State:   GlobalTabletCatalogLocatorLive,
+		}
+	}
+
+	pageCount := (len(leaves) + SegmentedTabletRouterRowsPerPage - 1) /
+		SegmentedTabletRouterRowsPerPage
+	anchorPages := make([]PrimaryGraphBuildPage, pageCount)
+	anchorRefs := make([]PageRef, pageCount)
+	for pageID := range pageCount {
+		logicalID, ok := GlobalTabletCatalogAnchorLogicalID(tabletID, uint8(pageID))
+		if !ok {
+			return primaryCatalogChild{}, fmt.Errorf(
+				"%w: incremental primary anchor ID", ErrInvalidWrite,
+			)
+		}
+		page, err := sink.AllocatePage(
+			PagePrimaryAnchor, SegmentedTabletRouterAnchorPageBytes, logicalID,
+		)
+		if err != nil {
+			return primaryCatalogChild{}, err
+		}
+		anchorPages[pageID], anchorRefs[pageID] = page, page.Ref()
+	}
+	locatorLogical, ok := GlobalTabletCatalogLocatorLogicalID(tabletID)
+	if !ok {
+		return primaryCatalogChild{}, fmt.Errorf(
+			"%w: incremental primary locator ID", ErrInvalidWrite,
+		)
+	}
+	locatorPage, err := sink.AllocatePage(
+		PagePrimaryLocator, GlobalTabletCatalogLocatorBytes, locatorLogical,
+	)
+	if err != nil {
+		return primaryCatalogChild{}, err
+	}
+	routeLogical, ok := GlobalTabletCatalogTabletRootLogicalID(tabletID)
+	if !ok {
+		return primaryCatalogChild{}, fmt.Errorf(
+			"%w: incremental primary route ID", ErrInvalidWrite,
+		)
+	}
+	routePage, err := sink.AllocatePage(
+		PageTabletRoute, GlobalTabletCatalogTabletBytes, routeLogical,
+	)
+	if err != nil {
+		return primaryCatalogChild{}, err
+	}
+
+	rawRoot := make([]byte, SegmentedTabletRouterRootBytes)
+	rawLocator := make([]byte, SegmentedTabletRouterLocatorBytes)
+	rawAnchors := make([]byte, pageCount*SegmentedTabletRouterAnchorPageBytes)
+	header := SegmentedTabletRouterHeader{
+		StoreID: sink.StoreIdentity(), TabletID: tabletID,
+		Generation: sink.BuildGeneration(),
+		AnchorKind: PagePrimaryAnchor, LeafKind: PagePrimaryLeaf,
+	}
+	if _, _, _, _, err := EncodeSegmentedTabletRouter(
+		rawRoot, rawLocator, rawAnchors, header, anchorRefs, routerLeaves,
+	); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	for pageID := range anchorPages {
+		start := pageID * SegmentedTabletRouterAnchorPageBytes
+		copy(
+			anchorPages[pageID].Bytes(),
+			rawAnchors[start:start+SegmentedTabletRouterAnchorPageBytes],
+		)
+		if err := anchorPages[pageID].Stage(); err != nil {
+			return primaryCatalogChild{}, err
+		}
+	}
+
+	bounds := primaryCatalogBounds(sink)
+	if _, err := EncodeGlobalTabletCatalogLocator(
+		locatorPage.Bytes(),
+		PageHeader{
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
+			LogicalID: locatorLogical, PageSize: GlobalTabletCatalogLocatorBytes,
+			PayloadLength: GlobalTabletCatalogLocatorHeader +
+				globalTabletCatalogPackedBytes,
+			Kind: PagePrimaryLocator,
+		},
+		bounds, tabletID, sink.BuildGeneration(), locatorEntries,
+	); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	if err := locatorPage.Stage(); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	if _, err := EncodeGlobalTabletCatalogTabletRoot(
+		routePage.Bytes(),
+		PageHeader{
+			StoreID: sink.StoreIdentity(), Generation: sink.BuildGeneration(),
+			LogicalID: routeLogical, PageSize: GlobalTabletCatalogTabletBytes,
+			PayloadLength: GlobalTabletCatalogRootHeader +
+				SegmentedTabletRouterRootBytes,
+			Kind: PageTabletRoute,
+		},
+		bounds, locatorPage.Ref(), rawRoot,
+	); err != nil {
+		return primaryCatalogChild{}, err
+	}
+	if err := routePage.Stage(); err != nil {
+		return primaryCatalogChild{}, err
+	}
+
+	var floor []byte
+	if tabletID != 0 {
+		floor = make([]byte, len(leaves[0].firstKey))
+		floor, err = ShortestPrimaryFence(
+			floor, previousTabletMax, leaves[0].firstKey,
+		)
+		if err != nil {
+			return primaryCatalogChild{}, err
+		}
+	}
+	return primaryCatalogChild{
+		floor: floor, id: tabletID, ref: routePage.Ref(),
+	}, nil
+}
