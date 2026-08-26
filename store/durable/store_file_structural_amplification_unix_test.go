@@ -10,6 +10,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 	"golang.org/x/sys/unix"
 )
@@ -106,8 +107,30 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 		}
 	}
 	after := collection.Stats()
-	if after.PrimaryEmptyReclaims <= before.PrimaryEmptyReclaims {
+	reclaims := after.PrimaryEmptyReclaims - before.PrimaryEmptyReclaims
+	splits := after.PrimaryLeafSplits - before.PrimaryLeafSplits
+	if reclaims == 0 {
 		t.Fatalf("structural churn reclaimed no empty leaf: %+v -> %+v", before, after)
+	}
+	// Each reclaim in this fixture removes one row from a non-singleton routing
+	// anchor, so it must take the localized COW path. Splits have the same base
+	// rewrite set and may add one anchor only when the selected anchor is full.
+	const routingBase = uint64(storeio.SegmentedTabletRouterAnchorPageBytes +
+		storeio.GlobalTabletCatalogLocatorBytes +
+		storeio.GlobalTabletCatalogTabletBytes)
+	staged := after.PrimaryStructuralRoutingStagedBytes -
+		before.PrimaryStructuralRoutingStagedBytes
+	retired := after.PrimaryStructuralRoutingRetiredBytes -
+		before.PrimaryStructuralRoutingRetiredBytes
+	minStaged := (reclaims + splits) * routingBase
+	maxStaged := minStaged + splits*storeio.SegmentedTabletRouterAnchorPageBytes
+	if staged < minStaged || staged > maxStaged {
+		t.Fatalf("localized churn routing staged bytes = %d, want [%d,%d] for %d reclaims and %d splits",
+			staged, minStaged, maxStaged, reclaims, splits)
+	}
+	if want := (reclaims + splits) * routingBase; retired != want {
+		t.Fatalf("localized churn routing retired bytes = %d, want %d for %d reclaims and %d splits",
+			retired, want, reclaims, splits)
 	}
 	if after.DocumentCount != rows {
 		t.Fatalf("live rows = %d, want %d", after.DocumentCount, rows)
@@ -138,8 +161,7 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 	t.Logf("structural churn ratios: apparent=%.3fx allocated=%.3fx device-write=%.3fx reclaims=%d splits=%d",
 		float64(info.Size())/float64(logicalBytes), float64(allocated)/float64(logicalBytes),
 		float64(deviceBytes)/float64(mutatedBytes),
-		after.PrimaryEmptyReclaims-before.PrimaryEmptyReclaims,
-		after.PrimaryLeafSplits-before.PrimaryLeafSplits)
+		reclaims, splits)
 	if err = collection.Close(); err != nil {
 		t.Fatal(err)
 	}
