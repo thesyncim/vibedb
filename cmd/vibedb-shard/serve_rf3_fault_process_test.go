@@ -292,7 +292,8 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		document := rf3CommandManifestDocument(prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
 			fixture.peerAddresses[member], fixture.nativeAddresses[member],
 			fixture.snapshotAddresses[member], fixture.controlAddresses[member], credentials[member], roots,
-			policyPath, walOptions, fixture.nodes, fixture.peerAddresses)
+			policyPath, walOptions, fixture.nodes, fixture.peerAddresses,
+			walIdentityFromBinding(prepared.Base.Binding), prepared.Base.Binding.TopologyRecoveryEpoch)
 		if err = os.WriteFile(fixture.manifestPaths[member], document, 0o600); err != nil {
 			t.Fatal(err)
 		}

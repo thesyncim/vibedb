@@ -26,12 +26,7 @@ import (
 func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 	directory := t.TempDir()
 	manifestPath := filepath.Join(directory, "rf3.json")
-	manifestDocument := strings.Replace(
-		canonicalRF3Manifest,
-		"/srv/vibedb/member-sql-identity.json",
-		filepath.Join(directory, "missing-sql-identity.json"),
-		1,
-	)
+	manifestDocument := canonicalRF3Manifest
 	if err := os.WriteFile(manifestPath, []byte(manifestDocument), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite(t *testing.T) {
+func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testing.T) {
 	parent := t.TempDir()
 	nodes := rf3CommandNodes()
 	group := rf3CommandGroup()
@@ -52,10 +53,17 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite(t *test
 		},
 		TLS:                 rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: "1.3.6.1.4.1.32473.1.1"},
 		AuthorizationPolicy: policy,
-		Members:             make([]prepareRF3Member, rf3ManifestMembers),
+		SplitControl: prepareRF3SplitControl{
+			MaxRecords: 4096, MaxFileBytes: 64 << 20,
+			Grants: make([]prepareRF3ActionGrant, rf3ManifestMembers),
+		},
+		Members: make([]prepareRF3Member, rf3ManifestMembers),
 	}
 	for index := range input.Members {
 		input.Members[index] = prepareRF3Member{MemberID: uint64(index + 1), NodeID: idString(nodes[index][:]), PeerAddress: "127.0.0.1:" + []string{"21001", "21002", "21003"}[index]}
+		input.SplitControl.Grants[index] = prepareRF3ActionGrant{
+			NodeID: idString(nodes[index][:]), Actions: ^uint16(0),
+		}
 	}
 	raw, err := vibejson.Marshal(&input)
 	if err != nil {
@@ -82,12 +90,47 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite(t *test
 	if manifest.WAL.Path != filepath.Join(root, "member.wal") || manifest.SQL.Path != filepath.Join(root, "member.vdb") {
 		t.Fatalf("unexpected generated paths: %+v %+v", manifest.WAL, manifest.SQL)
 	}
+	if manifest.Route.Group != group || manifest.Route.MemberRoot != root ||
+		manifest.Route.SplitRuntimeRoot != filepath.Join(root, "split-runtime") ||
+		manifest.Route.MembershipGrantPath != filepath.Join(root, "membership-grant") ||
+		manifest.SplitControl.JournalPath != filepath.Join(root, "split-control.journal") ||
+		manifest.SplitControl.MaxRecords != input.SplitControl.MaxRecords ||
+		len(manifest.SplitControl.Grants) != rf3ManifestMembers {
+		t.Fatalf("split preparation = route %+v control %+v", manifest.Route, manifest.SplitControl)
+	}
+	for _, name := range []string{"replica-actions", "source-exports", "source-artifacts", "split-runtime"} {
+		if info, statErr := os.Lstat(filepath.Join(root, name)); statErr != nil || !info.IsDir() {
+			t.Fatalf("prepared directory %q = %v, %v", name, info, statErr)
+		}
+	}
 	base, apply, err := loadRF3RetainedIdentities(manifest)
 	if err != nil || base.Binding.MemberID != 1 || apply.MaxSessions != input.Apply.MaxSessions {
 		t.Fatalf("retained identities = %+v %+v, %v", base, apply, err)
 	}
+	if code := runPrepareRF3([]string{"-manifest", inputPath}); code != 0 {
+		t.Fatalf("idempotent runPrepareRF3 = %d, want 0", code)
+	}
+	retained, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.SplitControl.MaxRecords--
+	changed, err := vibejson.Marshal(&input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(inputPath, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if code := runPrepareRF3([]string{"-manifest", inputPath}); code != 1 {
-		t.Fatalf("overwrite runPrepareRF3 = %d, want 1", code)
+		t.Fatalf("conflicting runPrepareRF3 = %d, want 1", code)
+	}
+	after, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, retained) {
+		t.Fatal("conflicting retry mutated retained serving manifest")
 	}
 }
 

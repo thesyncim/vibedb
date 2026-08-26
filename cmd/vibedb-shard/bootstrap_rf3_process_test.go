@@ -157,6 +157,7 @@ func prepareRF3ColdTarget(t testing.TB, options rf3ColdTargetOptions) *rf3ColdTa
 		options.Listeners.Control, options.Credential, options.Roots,
 		options.AuthorizationPolicy, options.WAL, options.ServingNodes,
 		options.ServingPeerAddresses,
+		walIdentityFromBinding(prepared.Base.Binding), prepared.Base.Binding.TopologyRecoveryEpoch,
 	)
 	document = rf3CommandEnrollTarget(
 		document, options.Target.NodeID, options.Target.StoreID,

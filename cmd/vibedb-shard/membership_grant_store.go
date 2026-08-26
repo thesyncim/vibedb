@@ -35,6 +35,48 @@ type durableRF3GrantInstaller struct {
 	persist   func(string, membershipgrant.Grant) error
 }
 
+type durableRF3GrantRouter struct {
+	installers map[raftmember.GroupKey]*durableRF3GrantInstaller
+}
+
+func openDurableRF3GrantRouter(
+	manifest rf3Manifest,
+	authority rf3TransitionGrantAuthority,
+) (*durableRF3GrantRouter, error) {
+	if authority == nil {
+		return nil, errRF3MembershipGrant
+	}
+	router := &durableRF3GrantRouter{
+		installers: make(map[raftmember.GroupKey]*durableRF3GrantInstaller, len(manifest.groupBundles())),
+	}
+	for _, bundle := range manifest.groupBundles() {
+		group := bundle.Route.Group
+		if group == (raftmember.GroupKey{}) || bundle.Route.MembershipGrantPath == "" {
+			return nil, errRF3MembershipGrant
+		}
+		if _, duplicate := router.installers[group]; duplicate {
+			return nil, errRF3MembershipGrant
+		}
+		installer, err := openDurableRF3GrantInstaller(bundle.Route.MembershipGrantPath, authority)
+		if err != nil {
+			return nil, err
+		}
+		router.installers[group] = installer
+	}
+	return router, nil
+}
+
+func (router *durableRF3GrantRouter) InstallTransitionGrant(grant membershipgrant.Grant) error {
+	if router == nil || !grant.Valid() {
+		return errRF3MembershipGrant
+	}
+	installer := router.installers[grant.Group]
+	if installer == nil {
+		return errRF3MembershipGrant
+	}
+	return installer.InstallTransitionGrant(grant)
+}
+
 func openDurableRF3GrantInstaller(
 	path string, authority rf3TransitionGrantAuthority,
 ) (*durableRF3GrantInstaller, error) {
@@ -82,7 +124,7 @@ func (installer *durableRF3GrantInstaller) InstallTransitionGrant(
 }
 
 func rf3MembershipGrantPath(manifest rf3Manifest) string {
-	return manifest.ReplicaControl.ActionJournalPath + ".membership-grant"
+	return manifest.Route.MembershipGrantPath
 }
 
 func readRF3MembershipGrant(path string) (membershipgrant.Grant, bool, error) {

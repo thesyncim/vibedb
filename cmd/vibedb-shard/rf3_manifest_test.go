@@ -26,6 +26,21 @@ const canonicalRF3Manifest = `{
     "identity_path": "/srv/vibedb/member-sql-identity.json",
     "apply_identity_path": "/srv/vibedb/member-apply-identity.json"
   },
+  "route": {
+    "cluster_id": "0102030405060708090a0b0c0d0e0f10",
+    "cluster_incarnation": "1112131415161718191a1b1c1d1e1f20",
+    "topology_recovery_epoch": 3,
+    "shard_incarnation": "2122232425262728292a2b2c2d2e2f30",
+    "group_id": "3132333435363738393a3b3c3d3e3f40",
+    "distribution": "docs",
+    "shard": "s0",
+    "allocation_generation": 5,
+    "member_id": 1,
+    "store_id": "4142434445464748494a4b4c4d4e4f50",
+    "member_root": "/srv/vibedb",
+    "split_runtime_root": "/srv/vibedb/split-runtime",
+    "membership_grant_path": "/srv/vibedb/membership-grant"
+  },
   "listeners": {
     "peer": "0.0.0.0:7400",
     "native": "0.0.0.0:7500",
@@ -51,6 +66,16 @@ const canonicalRF3Manifest = `{
     "max_source_artifact_bytes": 1073741824,
     "max_source_disk_bytes": 4294967296,
     "source_chunk_bytes": 1048576
+  },
+  "split_control": {
+    "journal_path": "/srv/vibedb/split-control.journal",
+    "max_records": 4096,
+    "max_file_bytes": 67108864,
+    "grants": [
+      {"node_id": "0102030405060708090a0b0c0d0e0f10", "actions": 65535},
+      {"node_id": "1112131415161718191a1b1c1d1e1f20", "actions": 65535},
+      {"node_id": "2122232425262728292a2b2c2d2e2f30", "actions": 65535}
+    ]
   },
   "members": [
     {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"},
@@ -98,6 +123,20 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 	}
 	if manifest.AuthorizationPolicy != "/etc/vibedb/authorization.json" {
 		t.Fatalf("authorization policy = %q", manifest.AuthorizationPolicy)
+	}
+	if manifest.Route.Group.GroupID != ([16]byte{
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+		0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+	}) || manifest.Route.MemberID != 1 || manifest.Route.MemberRoot != "/srv/vibedb" ||
+		manifest.Route.SplitRuntimeRoot != "/srv/vibedb/split-runtime" ||
+		manifest.Route.MembershipGrantPath != "/srv/vibedb/membership-grant" {
+		t.Fatalf("route = %+v", manifest.Route)
+	}
+	if manifest.SplitControl.JournalPath != "/srv/vibedb/split-control.journal" ||
+		manifest.SplitControl.MaxRecords != 4096 ||
+		manifest.SplitControl.MaxFileBytes != 67108864 ||
+		len(manifest.SplitControl.Grants) != 3 {
+		t.Fatalf("split control = %+v", manifest.SplitControl)
 	}
 	control := manifest.ReplicaControl
 	if control.ActionJournalPath != "/srv/vibedb/replica-actions" ||
@@ -163,13 +202,26 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 		t.Fatalf("multi-group addresses: %v", err)
 	}
 	if manifest.Groups[0].WAL.Path != "/srv/vibedb/member.wal" ||
-		manifest.Groups[1].WAL.Path != "/srv/vibedb/second.wal" ||
-		manifest.Groups[1].SQL.IdentityPath != "/srv/vibedb/second-sql-identity.json" {
+		manifest.Groups[1].WAL.Path != "/srv/vibedb/second/member.wal" ||
+		manifest.Groups[1].SQL.IdentityPath != "/srv/vibedb/second/member-sql-identity.json" {
 		t.Fatalf("groups = %+v", manifest.Groups)
 	}
-	duplicate := strings.Replace(document, "/srv/vibedb/second.wal", "/srv/vibedb/member.wal", 1)
-	if _, err := parseRF3Manifest([]byte(duplicate)); !errors.Is(err, errInvalidRF3Manifest) {
-		t.Fatalf("duplicate group artifact path error = %v", err)
+	for name, invalid := range map[string]string{
+		"artifact path": strings.Replace(document, "/srv/vibedb/second/member.wal", "/srv/vibedb/member.wal", 1),
+		"control path":  strings.Replace(document, "/srv/vibedb/split-control.journal", "/srv/vibedb/member.wal", 1),
+		"group key": strings.Replace(document,
+			`"group_id": "5152535455565758595a5b5c5d5e5f60"`,
+			`"group_id": "3132333435363738393a3b3c3d3e3f40"`, 1),
+		"member root": strings.Replace(document,
+			`"member_root": "/srv/vibedb/second"`,
+			`"member_root": "/srv/vibedb"`, 1),
+		"membership grant": strings.Replace(document,
+			`"membership_grant_path": "/srv/vibedb/second/membership-grant"`,
+			`"membership_grant_path": "/srv/vibedb/membership-grant"`, 1),
+	} {
+		if _, err := parseRF3Manifest([]byte(invalid)); !errors.Is(err, errInvalidRF3Manifest) {
+			t.Fatalf("duplicate group %s error = %v", name, err)
+		}
 	}
 }
 
@@ -184,7 +236,17 @@ func multiGroupRF3Manifest(t testing.TB) string {
 	common := canonicalRF3Manifest[listener:members]
 	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
 	first := "{\n" + walSQL + roster + "\n  }"
-	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second")
+	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
+	second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
+		`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
+	second = strings.Replace(second, `"store_id": "4142434445464748494a4b4c4d4e4f50"`,
+		`"store_id": "6162636465666768696a6b6c6d6e6f70"`, 1)
+	second = strings.Replace(second, `"member_root": "/srv/vibedb"`,
+		`"member_root": "/srv/vibedb/second"`, 1)
+	second = strings.Replace(second, `"split_runtime_root": "/srv/vibedb/split-runtime"`,
+		`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
+	second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
+		`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
 	second = strings.Replace(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2", 1)
 	return "{\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
 }
@@ -252,6 +314,18 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 		{"int64-overflow", replace(`"max_file_bytes": 268435456`, `"max_file_bytes": 9223372036854775808`)},
 		{"int-overflow", replace(`"max_record_bytes": 8388608`, `"max_record_bytes": 18446744073709551615`)},
 		{"relative-action-journal", replace(`/srv/vibedb/replica-actions`, `replica-actions`)},
+		{"relative-split-journal", replace(`/srv/vibedb/split-control.journal`, `split-control.journal`)},
+		{"unclean-member-root", replace(`"member_root": "/srv/vibedb"`, `"member_root": "/srv/vibedb/../vibedb"`)},
+		{"wrong-split-runtime-root", replace(`"split_runtime_root": "/srv/vibedb/split-runtime"`, `"split_runtime_root": "/srv/vibedb/runtime"`)},
+		{"wrong-membership-grant-path", replace(`"membership_grant_path": "/srv/vibedb/membership-grant"`, `"membership_grant_path": "/srv/vibedb/grant"`)},
+		{"route-member-not-in-roster", replace(`"member_id": 1,`+"\n"+`    "store_id":`, `"member_id": 4,`+"\n"+`    "store_id":`)},
+		{"route-artifact-escapes-member-root", replace(`"path": "/srv/vibedb/member.vdb"`, `"path": "/srv/other/member.vdb"`)},
+		{"zero-route-generation", replace(`"allocation_generation": 5`, `"allocation_generation": 0`)},
+		{"duplicate-split-grant", replace(`1112131415161718191a1b1c1d1e1f20", "actions": 65535`, `0102030405060708090a0b0c0d0e0f10", "actions": 65535`)},
+		{"zero-split-actions", replace(`"actions": 65535`, `"actions": 0`)},
+		{"invalid-split-actions", replace(`"actions": 65535`, `"actions": 65536`)},
+		{"oversize-split-records", replace(`"max_records": 4096,`+"\n"+`    "max_file_bytes": 67108864`, `"max_records": 1048577,`+"\n"+`    "max_file_bytes": 67108864`)},
+		{"undersize-split-journal", replace(`"max_file_bytes": 67108864,`+"\n"+`    "grants":`, `"max_file_bytes": 1024,`+"\n"+`    "grants":`)},
 		{"unclean-source-root", replace(`/srv/vibedb",`+"\n"+`    "source_journal_path`, `/srv/vibedb/../vibedb",`+"\n"+`    "source_journal_path`)},
 		{"oversize-action-records", replace(`"max_action_records": 4096`, `"max_action_records": 4097`)},
 		{"undersize-source-chunk", replace(`"source_chunk_bytes": 1048576`, `"source_chunk_bytes": 1024`)},
@@ -265,7 +339,9 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 		{"escaped-node", replace(`0102030405060708090a0b0c0d0e0f10`, `0102030405060708090a0b0c0d0e0f\u0031\u0030`)},
 		{"short-node", replace(`0102030405060708090a0b0c0d0e0f10`, `0102`)},
 		{"zero-node", replace(`0102030405060708090a0b0c0d0e0f10`, `00000000000000000000000000000000`)},
-		{"duplicate-node", replace(`1112131415161718191a1b1c1d1e1f20`, `0102030405060708090a0b0c0d0e0f10`)},
+		{"duplicate-node", replace(
+			`{"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20"`,
+			`{"member_id": 2, "node_id": "0102030405060708090a0b0c0d0e0f10"`)},
 		{"duplicate-peer-address", replace(`member-2.internal:7400`, `member-1.internal:7400`)},
 	}
 	for _, tc := range tests {
@@ -299,7 +375,9 @@ func TestParseRF3ManifestRejectsInvalidEnrolledTarget(t *testing.T) {
 		{"duplicate-field", replace(`"control_address":`, `"snapshot_address": "member-4.internal:7600", "control_address":`)},
 		{"zero-member", replace(`"member_id": 4`, `"member_id": 0`)},
 		{"serving-member", replace(`"member_id": 4`, `"member_id": 2`)},
-		{"serving-node", replace(`3132333435363738393a3b3c3d3e3f40`, `1112131415161718191a1b1c1d1e1f20`)},
+		{"serving-node", replace(
+			`"node_id": "3132333435363738393a3b3c3d3e3f40",`+"\n"+`    "store_id":`,
+			`"node_id": "1112131415161718191a1b1c1d1e1f20",`+"\n"+`    "store_id":`)},
 		{"zero-store", replace(`4142434445464748494a4b4c4d4e4f50`, `00000000000000000000000000000000`)},
 		{"zero-incarnation", replace(`"node_incarnation": 9`, `"node_incarnation": 0`)},
 		{"serving-peer-address", replace(`member-4.internal:7400`, `member-2.internal:7400`)},

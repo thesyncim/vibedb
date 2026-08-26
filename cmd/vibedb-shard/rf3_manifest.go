@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	protocol "github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -33,6 +35,8 @@ type rf3Manifest struct {
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
 	ReplicaControl      rf3ManifestReplicaControl
+	SplitControl        rf3ManifestSplitControl
+	Route               rf3ManifestGroupRoute
 	DevelopmentOnly     bool
 	Members             [rf3ManifestMembers]rf3ManifestMember
 	MemberCount         uint8
@@ -43,6 +47,7 @@ type rf3Manifest struct {
 type rf3ManifestGroup struct {
 	WAL            rf3ManifestWAL
 	SQL            rf3ManifestSQL
+	Route          rf3ManifestGroupRoute
 	Members        [rf3ManifestMembers]rf3ManifestMember
 	MemberCount    uint8
 	EnrolledTarget *rf3ManifestEnrolledTarget
@@ -53,6 +58,7 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 		return manifest.Groups
 	}
 	return []rf3ManifestGroup{{WAL: manifest.WAL, SQL: manifest.SQL,
+		Route:   manifest.Route,
 		Members: manifest.Members, MemberCount: uint8(len(manifest.memberRoster())),
 		EnrolledTarget: manifest.EnrolledTarget}}
 }
@@ -60,9 +66,29 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	return rf3Manifest{WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
-		ReplicaControl:  manifest.ReplicaControl,
+		ReplicaControl: manifest.ReplicaControl,
+		SplitControl:   manifest.SplitControl, Route: group.Route,
 		DevelopmentOnly: manifest.DevelopmentOnly, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
+}
+
+type rf3ManifestSplitControl struct {
+	JournalPath  string
+	MaxRecords   int
+	MaxFileBytes int64
+	Grants       []protocol.ActionGrant
+}
+
+type rf3ManifestGroupRoute struct {
+	Group                raftmember.GroupKey
+	Distribution         string
+	Shard                string
+	AllocationGeneration uint64
+	MemberID             uint64
+	StoreID              [16]byte
+	MemberRoot           string
+	SplitRuntimeRoot     string
+	MembershipGrantPath  string
 }
 
 func (manifest rf3Manifest) memberRoster() []rf3ManifestMember {
@@ -218,6 +244,13 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if manifest.ReplicaControl, err = parseRF3ManifestReplicaControl(node); err != nil {
 			return rf3Manifest{}, err
 		}
+		node, err = nextRF3Field(&fields, `"split_control"`)
+		if err != nil {
+			return rf3Manifest{}, err
+		}
+		if manifest.SplitControl, err = parseRF3ManifestSplitControl(node); err != nil {
+			return rf3Manifest{}, err
+		}
 		node, err = nextRF3Field(&fields, `"groups"`)
 		if err != nil {
 			return rf3Manifest{}, err
@@ -225,7 +258,10 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if manifest.Groups, err = parseRF3ManifestGroups(node); err != nil {
 			return rf3Manifest{}, err
 		}
-		controlPaths := [...]string{manifest.ReplicaControl.ActionJournalPath, manifest.ReplicaControl.SourceJournalPath, manifest.ReplicaControl.SourceRepositoryPath}
+		controlPaths := [...]string{
+			manifest.ReplicaControl.ActionJournalPath, manifest.ReplicaControl.SourceJournalPath,
+			manifest.ReplicaControl.SourceRepositoryPath, manifest.SplitControl.JournalPath,
+		}
 		for _, group := range manifest.Groups {
 			for _, path := range [...]string{group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path, group.SQL.IdentityPath, group.SQL.ApplyIdentityPath} {
 				for _, control := range controlPaths {
@@ -251,6 +287,13 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		return rf3Manifest{}, err
 	}
 	if manifest.SQL, err = parseRF3ManifestSQL(node); err != nil {
+		return rf3Manifest{}, err
+	}
+	node, err = nextRF3Field(&fields, `"route"`)
+	if err != nil {
+		return rf3Manifest{}, err
+	}
+	if manifest.Route, err = parseRF3ManifestGroupRoute(node); err != nil {
 		return rf3Manifest{}, err
 	}
 	node, err = nextRF3Field(&fields, `"listeners"`)
@@ -279,6 +322,13 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		return rf3Manifest{}, err
 	}
 	if manifest.ReplicaControl, err = parseRF3ManifestReplicaControl(node); err != nil {
+		return rf3Manifest{}, err
+	}
+	node, err = nextRF3Field(&fields, `"split_control"`)
+	if err != nil {
+		return rf3Manifest{}, err
+	}
+	if manifest.SplitControl, err = parseRF3ManifestSplitControl(node); err != nil {
 		return rf3Manifest{}, err
 	}
 	key, node, present = fields.Next()
@@ -318,6 +368,13 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	if _, _, extra := fields.Next(); extra {
 		return rf3Manifest{}, errInvalidRF3Manifest
 	}
+	if err := validateRF3ManifestGroupRoute(rf3ManifestGroup{
+		WAL: manifest.WAL, SQL: manifest.SQL, Route: manifest.Route,
+		Members: manifest.Members, MemberCount: manifest.MemberCount,
+		EnrolledTarget: manifest.EnrolledTarget,
+	}); err != nil {
+		return rf3Manifest{}, err
+	}
 	return manifest, nil
 }
 
@@ -329,6 +386,7 @@ func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
 	iter, _ := node.ArrayIter()
 	groups := make([]rf3ManifestGroup, 0, count)
 	paths := make(map[string]struct{}, count*5)
+	groupKeys := make(map[raftmember.GroupKey]struct{}, count)
 	nodes := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	addresses := make(map[string]rafttransport.NodeID, rf3ManifestMembers)
 	for index := 0; index < count; index++ {
@@ -340,7 +398,16 @@ func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, path := range [...]string{group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path, group.SQL.IdentityPath, group.SQL.ApplyIdentityPath} {
+		if _, duplicate := groupKeys[group.Route.Group]; duplicate {
+			return nil, errInvalidRF3Manifest
+		}
+		groupKeys[group.Route.Group] = struct{}{}
+		for _, path := range [...]string{
+			group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path,
+			group.SQL.IdentityPath, group.SQL.ApplyIdentityPath,
+			group.Route.MemberRoot, group.Route.SplitRuntimeRoot,
+			group.Route.MembershipGrantPath,
+		} {
 			if _, duplicate := paths[path]; duplicate {
 				return nil, errInvalidRF3Manifest
 			}
@@ -383,6 +450,13 @@ func parseRF3ManifestGroup(node vibejson.Node) (rf3ManifestGroup, error) {
 	if group.SQL, err = parseRF3ManifestSQL(value); err != nil {
 		return group, err
 	}
+	value, err = nextRF3Field(&fields, `"route"`)
+	if err != nil {
+		return group, err
+	}
+	if group.Route, err = parseRF3ManifestGroupRoute(value); err != nil {
+		return group, err
+	}
 	value, err = nextRF3Field(&fields, `"members"`)
 	if err != nil {
 		return group, err
@@ -406,7 +480,221 @@ func parseRF3ManifestGroup(node vibejson.Node) (rf3ManifestGroup, error) {
 	if _, _, extra := fields.Next(); extra {
 		return group, errInvalidRF3Manifest
 	}
+	if err := validateRF3ManifestGroupRoute(group); err != nil {
+		return group, err
+	}
 	return group, nil
+}
+
+func validateRF3ManifestGroupRoute(group rf3ManifestGroup) error {
+	route := group.Route
+	found := false
+	for _, member := range group.Members[:group.MemberCount] {
+		if member.MemberID == route.MemberID {
+			found = true
+			break
+		}
+	}
+	if !found && group.EnrolledTarget != nil && group.EnrolledTarget.MemberID == route.MemberID &&
+		group.EnrolledTarget.StoreID == route.StoreID {
+		found = true
+	}
+	if !found {
+		return errInvalidRF3Manifest
+	}
+	for _, path := range [...]string{
+		group.WAL.Path, group.SQL.Path, group.SQL.IdentityPath, group.SQL.ApplyIdentityPath,
+	} {
+		relative, err := filepath.Rel(route.MemberRoot, path)
+		if err != nil || relative == "." || relative == ".." ||
+			strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return errInvalidRF3Manifest
+		}
+	}
+	return nil
+}
+
+func parseRF3ManifestSplitControl(node vibejson.Node) (rf3ManifestSplitControl, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	var result rf3ManifestSplitControl
+	value, err := nextRF3Field(&fields, `"journal_path"`)
+	if err != nil {
+		return result, err
+	}
+	if result.JournalPath, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil ||
+		!filepath.IsAbs(result.JournalPath) || filepath.Clean(result.JournalPath) != result.JournalPath {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	value, err = nextRF3Field(&fields, `"max_records"`)
+	if err != nil {
+		return result, err
+	}
+	if result.MaxRecords, err = rf3ManifestPositiveInt(value); err != nil {
+		return result, err
+	}
+	value, err = nextRF3Field(&fields, `"max_file_bytes"`)
+	if err != nil {
+		return result, err
+	}
+	if result.MaxFileBytes, err = rf3ManifestPositiveInt64(value); err != nil {
+		return result, err
+	}
+	value, err = nextRF3Field(&fields, `"grants"`)
+	if err != nil {
+		return result, err
+	}
+	count, ok := value.ArrayLen()
+	if !ok || count == 0 || count > protocol.AbsoluteMaxGrants {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	grants, _ := value.ArrayIter()
+	result.Grants = make([]protocol.ActionGrant, 0, count)
+	for range count {
+		grantNode, present := grants.Next()
+		if !present {
+			return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+		}
+		grantFields, object := grantNode.ObjectIter()
+		if !object {
+			return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+		}
+		nodeValue, fieldErr := nextRF3Field(&grantFields, `"node_id"`)
+		if fieldErr != nil {
+			return rf3ManifestSplitControl{}, fieldErr
+		}
+		nodeID, fieldErr := rf3ManifestNodeID(nodeValue)
+		if fieldErr != nil {
+			return rf3ManifestSplitControl{}, fieldErr
+		}
+		actionsValue, fieldErr := nextRF3Field(&grantFields, `"actions"`)
+		if fieldErr != nil {
+			return rf3ManifestSplitControl{}, fieldErr
+		}
+		actions, fieldErr := rf3ManifestPositiveUint64(actionsValue)
+		if fieldErr != nil || actions > math.MaxUint16 {
+			return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+		}
+		if _, _, extra := grantFields.Next(); extra {
+			return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+		}
+		result.Grants = append(result.Grants, protocol.ActionGrant{Node: nodeID, Actions: uint16(actions)})
+	}
+	if _, extra := grants.Next(); extra {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	if _, _, extra := fields.Next(); extra {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	if result.MaxRecords > 1<<20 || result.MaxFileBytes > 1<<40 ||
+		result.MaxFileBytes < int64(protocol.MaxPayloadBytes) {
+		return rf3ManifestSplitControl{}, errInvalidRF3Manifest
+	}
+	if _, err = protocol.NewAuthorizer(result.Grants); err != nil {
+		return rf3ManifestSplitControl{}, errors.Join(errInvalidRF3Manifest, err)
+	}
+	return result, nil
+}
+
+func parseRF3ManifestGroupRoute(node vibejson.Node) (rf3ManifestGroupRoute, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestGroupRoute{}, errInvalidRF3Manifest
+	}
+	var route rf3ManifestGroupRoute
+	fixed := []*[16]byte{
+		&route.Group.ClusterID, &route.Group.ClusterIncarnation,
+		&route.Group.ShardIncarnation, &route.Group.GroupID, &route.StoreID,
+	}
+	names := [...]string{
+		`"cluster_id"`, `"cluster_incarnation"`, `"shard_incarnation"`, `"group_id"`, `"store_id"`,
+	}
+	for index := 0; index < 2; index++ {
+		value, err := nextRF3Field(&fields, names[index])
+		if err != nil {
+			return route, err
+		}
+		decoded, err := rf3ManifestNodeID(value)
+		if err != nil {
+			return route, err
+		}
+		*fixed[index] = [16]byte(decoded)
+	}
+	value, err := nextRF3Field(&fields, `"topology_recovery_epoch"`)
+	if err != nil {
+		return route, err
+	}
+	if route.Group.TopologyRecoveryEpoch, err = rf3ManifestPositiveUint64(value); err != nil {
+		return route, err
+	}
+	for index := 2; index < 4; index++ {
+		value, err = nextRF3Field(&fields, names[index])
+		if err != nil {
+			return route, err
+		}
+		decoded, err := rf3ManifestNodeID(value)
+		if err != nil {
+			return route, err
+		}
+		*fixed[index] = [16]byte(decoded)
+	}
+	value, err = nextRF3Field(&fields, `"distribution"`)
+	if err != nil {
+		return route, err
+	}
+	if route.Distribution, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+		return route, err
+	}
+	value, err = nextRF3Field(&fields, `"shard"`)
+	if err != nil {
+		return route, err
+	}
+	if route.Shard, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+		return route, err
+	}
+	value, err = nextRF3Field(&fields, `"allocation_generation"`)
+	if err != nil {
+		return route, err
+	}
+	if route.AllocationGeneration, err = rf3ManifestPositiveUint64(value); err != nil {
+		return route, err
+	}
+	value, err = nextRF3Field(&fields, `"member_id"`)
+	if err != nil {
+		return route, err
+	}
+	if route.MemberID, err = rf3ManifestPositiveUint64(value); err != nil {
+		return route, err
+	}
+	value, err = nextRF3Field(&fields, names[4])
+	if err != nil {
+		return route, err
+	}
+	decodedStore, err := rf3ManifestNodeID(value)
+	if err != nil {
+		return route, err
+	}
+	route.StoreID = [16]byte(decodedStore)
+	paths := []*string{&route.MemberRoot, &route.SplitRuntimeRoot, &route.MembershipGrantPath}
+	pathNames := [...]string{`"member_root"`, `"split_runtime_root"`, `"membership_grant_path"`}
+	for index := range paths {
+		value, err = nextRF3Field(&fields, pathNames[index])
+		if err != nil {
+			return route, err
+		}
+		if *paths[index], err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil ||
+			!filepath.IsAbs(*paths[index]) || filepath.Clean(*paths[index]) != *paths[index] {
+			return rf3ManifestGroupRoute{}, errInvalidRF3Manifest
+		}
+	}
+	if _, _, extra := fields.Next(); extra || route.MemberRoot == string(filepath.Separator) ||
+		route.SplitRuntimeRoot != filepath.Join(route.MemberRoot, "split-runtime") ||
+		route.MembershipGrantPath != filepath.Join(route.MemberRoot, "membership-grant") {
+		return rf3ManifestGroupRoute{}, errInvalidRF3Manifest
+	}
+	return route, nil
 }
 
 func parseRF3ManifestReplicaControl(node vibejson.Node) (rf3ManifestReplicaControl, error) {

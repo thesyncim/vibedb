@@ -11,6 +11,61 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
+type rf3GrantSink struct {
+	grants map[raftmember.GroupKey]membershipgrant.Grant
+}
+
+func (sink *rf3GrantSink) InstallTransitionGrant(grant membershipgrant.Grant) error {
+	if sink == nil || !grant.Valid() {
+		return errRF3MembershipGrant
+	}
+	sink.grants[grant.Group] = grant
+	return nil
+}
+
+func TestDurableRF3GrantRouterKeepsExactPerGroupFiles(t *testing.T) {
+	root := t.TempDir()
+	base := serveRF3TestManifest()
+	base.EnrolledTarget = serveRF3TestEnrolledTarget()
+	firstGroup := serveRF3TestGroup()
+	secondGroup := firstGroup
+	secondGroup.GroupID[0]++
+	first := rf3ManifestGroup{Members: base.Members, MemberCount: rf3ManifestMembers,
+		EnrolledTarget: base.EnrolledTarget, Route: rf3ManifestGroupRoute{
+			Group: firstGroup, MembershipGrantPath: filepath.Join(root, "first.grant")}}
+	second := first
+	second.Route.Group = secondGroup
+	second.Route.MembershipGrantPath = filepath.Join(root, "second.grant")
+	manifest := rf3Manifest{Groups: []rf3ManifestGroup{first, second}}
+	sink := &rf3GrantSink{grants: make(map[raftmember.GroupKey]membershipgrant.Grant)}
+	router, err := openDurableRF3GrantRouter(manifest, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstGrant := rf3MembershipGrantFixture(base, firstGroup, 9)
+	secondGrant := rf3MembershipGrantFixture(base, secondGroup, 11)
+	if err = router.InstallTransitionGrant(firstGrant); err != nil {
+		t.Fatal(err)
+	}
+	if err = router.InstallTransitionGrant(secondGrant); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]membershipgrant.Grant{
+		first.Route.MembershipGrantPath:  firstGrant,
+		second.Route.MembershipGrantPath: secondGrant,
+	} {
+		got, found, readErr := readRF3MembershipGrant(path)
+		if readErr != nil || !found || got != want {
+			t.Fatalf("grant %q found=%t got=%+v err=%v", path, found, got, readErr)
+		}
+	}
+	unknown := firstGrant
+	unknown.Group.GroupID[1]++
+	if err = router.InstallTransitionGrant(unknown); !errors.Is(err, errRF3MembershipGrant) {
+		t.Fatalf("unknown group grant = %v", err)
+	}
+}
+
 func TestDurableRF3GrantInstallerSurvivesUnknownAckAndLearnerHandoff(t *testing.T) {
 	manifest := serveRF3TestManifest()
 	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()

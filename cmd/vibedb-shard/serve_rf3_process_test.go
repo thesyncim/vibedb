@@ -63,7 +63,7 @@ func TestRF3CommandProcessDocuments(t *testing.T) {
 			MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
 			MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
 		},
-		nodes, addresses,
+		nodes, addresses, rf3CommandStoreIdentity(1), rf3CommandGroup().TopologyRecoveryEpoch,
 	)
 	manifest, err := parseRF3Manifest(document)
 	if err != nil {
@@ -234,6 +234,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			peerAddresses[index], nativeAddresses[index], snapshotAddresses[index],
 			controlAddresses[index], credentials[index], roots,
 			policyPath, walOptions, nodes, peerAddresses,
+			walIdentityFromBinding(prepared.Base.Binding), prepared.Base.Binding.TopologyRecoveryEpoch,
 		)
 		document = rf3CommandEnrollTarget(
 			document, targetNode, targetStore, targetIncarnation,
@@ -1041,19 +1042,33 @@ func rf3CommandManifestDocument(
 	options raftstore.Options,
 	nodes [rf3CommandMembers]rafttransport.NodeID,
 	peerAddresses [rf3CommandMembers]string,
+	identity raftstore.Identity,
+	topologyRecoveryEpoch uint64,
 ) []byte {
 	dataRoot := filepath.Dir(sqlPath)
 	if absolute, err := filepath.Abs(dataRoot); err == nil {
 		dataRoot = absolute
 	}
-	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
+	paths := []*string{&walPath, &sqlPath, &basePath, &applyPath, &keyPath}
+	for _, path := range paths {
+		if !filepath.IsAbs(*path) {
+			*path = filepath.Join(dataRoot, *path)
+		}
+	}
+	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}]},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		walPath, keyPath,
 		options.MaxFileBytes, options.MaxRecordBytes, options.MaxRecords,
 		options.MaxEntries, options.MaxLiveBytes,
-		sqlPath, basePath, applyPath, peerAddress, nativeAddress, snapshotAddress, controlAddress,
+		sqlPath, basePath, applyPath,
+		identity.ClusterID, identity.ClusterIncarnation, topologyRecoveryEpoch,
+		identity.ShardIncarnation, identity.GroupID, identity.Distribution, identity.Shard,
+		identity.AllocationGeneration, identity.MemberID, identity.StoreID,
+		dataRoot, filepath.Join(dataRoot, "split-runtime"), filepath.Join(dataRoot, "membership-grant"),
+		peerAddress, nativeAddress, snapshotAddress, controlAddress,
 		credential.Certificate, credential.Key, roots, policyPath,
 		filepath.Join(dataRoot, "replica-actions"), dataRoot,
 		filepath.Join(dataRoot, "source-exports"), filepath.Join(dataRoot, "source-artifacts"),
+		filepath.Join(dataRoot, "split-control.journal"), nodes[0], nodes[1], nodes[2],
 		nodes[0], peerAddresses[0], nodes[1], peerAddresses[1], nodes[2], peerAddresses[2],
 	))
 }

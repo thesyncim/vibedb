@@ -126,6 +126,10 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 			return result, closePreparedRF3Groups(result.groups, err)
 		}
 		group := groupFromBinding(base.Binding)
+		if !rf3RouteMatchesBinding(bundle.Route, base.Binding) {
+			return result, closePreparedRF3Groups(result.groups,
+				fmt.Errorf("%w: group %d route differs from retained identity", errRF3Serving, index))
+		}
 		if _, duplicate := seen[group]; duplicate {
 			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("%w: duplicate retained group", errRF3Serving))
 		}
@@ -182,6 +186,16 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 		return dialer.DialContext(ctx, "tcp", address)
 	}
 	return result, nil
+}
+
+func rf3RouteMatchesBinding(
+	route rf3ManifestGroupRoute,
+	binding sqldriver.ReplicatedShardStoreBinding,
+) bool {
+	return route.Group == groupFromBinding(binding) &&
+		route.Distribution == binding.Distribution && route.Shard == binding.Shard &&
+		route.AllocationGeneration == binding.AllocationGeneration &&
+		route.MemberID == binding.MemberID && route.StoreID == binding.StoreID
 }
 
 func peerAddressForRF3Member(manifest rf3Manifest, memberID uint64) string {
@@ -276,9 +290,7 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
 	}
-	grantInstaller, err := openDurableRF3GrantInstaller(
-		rf3MembershipGrantPath(manifest), transportRegistry,
-	)
+	grantInstaller, err := openDurableRF3GrantRouter(manifest, transportRegistry)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: restore membership grant: %v", errRF3Serving, err))
 	}
