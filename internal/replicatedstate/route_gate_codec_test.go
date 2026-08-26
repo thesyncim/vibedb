@@ -98,8 +98,8 @@ func TestMaxRouteGateCompletionBytesMatchesActualCodec(t *testing.T) {
 		MaxCompletionEnvelopeBytes != MaxExecutionPinCompletionEnvelopeBytes ||
 		requestledger.MaxExecutionPinCommandBytes != replication.MaxExecutionPinCommandBytes ||
 		requestledger.MaxExecutionPinCompletionBytes != MaxExecutionPinCompletionEnvelopeBytes ||
-		replication.MaxExecutionPinCommandBytes != 1449 ||
-		MaxExecutionPinCompletionEnvelopeBytes != 1933 ||
+		replication.MaxExecutionPinCommandBytes != 1465 ||
+		MaxExecutionPinCompletionEnvelopeBytes != 1949 ||
 		replication.MaxRouteGateCommandBytes+MaxRouteGateCompletionEnvelopeBytes != 2298 {
 		t.Fatalf("max route-gate completion = %d/%d, %v",
 			len(encoded), MaxRouteGateCompletionEnvelopeBytes, err)

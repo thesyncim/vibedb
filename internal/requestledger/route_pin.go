@@ -11,8 +11,8 @@ const (
 	// These frozen cross-package maxima include the outer replication envelope,
 	// three 255-byte identities, and the fixed execution-pin body/proof. A
 	// replicatedstate cross-package test prevents either side drifting.
-	MaxExecutionPinCommandBytes    = 1449
-	MaxExecutionPinCompletionBytes = 1933
+	MaxExecutionPinCommandBytes    = 1465
+	MaxExecutionPinCompletionBytes = 1949
 	routePinHeaderBytes            = 416
 	MaxRoutePinRecordBytes         = routePinHeaderBytes + MaxRouteGatePinCommandBytes + MaxRouteGatePinCompletionBytes + checksumBytes
 )
