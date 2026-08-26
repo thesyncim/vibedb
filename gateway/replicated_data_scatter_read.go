@@ -109,7 +109,22 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 		return ReplicatedTableScatterReadResult{}, 0, ErrNoCatalog
 	}
 	defer lease.release()
+	return reader.readScatterBatchSnapshot(ctx, request, lease.snapshot, lease.generation)
+}
 
+// readScatterBatchSnapshot keeps SQL lowering and native route resolution on
+// the exact same immutable catalog generation. The caller owns the snapshot's
+// lease for the complete call; stale-fence replay must reacquire and lower the
+// original request against a newer generation rather than reusing old keys.
+func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
+	ctx context.Context,
+	request ReplicatedTableBatchReadRequest,
+	snapshot *Snapshot,
+	generation uint64,
+) (ReplicatedTableScatterReadResult, uint64, error) {
+	if snapshot == nil || generation == 0 {
+		return ReplicatedTableScatterReadResult{}, generation, ErrNoCatalog
+	}
 	groups := make([]replicatedScatterGroup, 0, min(len(request.Points), 64))
 	groupByRoute := make(map[replication.Digest]int, min(len(request.Points), 64))
 	requestBytes := uint64(4)
@@ -117,11 +132,11 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 		point := request.Points[ordinal]
 		var replicas [ServingReplicaCount]ReplicatedEndpoint
 		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
-		resolved, ok := lease.snapshot.ResolveReplicatedTableKey(
+		resolved, ok := snapshot.ResolveReplicatedTableKey(
 			point.Table, point.Key, scalarScratch[:0], replicas[:0],
 		)
 		if !ok {
-			return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedTableRoute
+			return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedTableRoute
 		}
 		groupIndex, exists := groupByRoute[resolved.RouteID]
 		if !exists {
@@ -156,26 +171,26 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 	// Charge their conservative headers plus the exact packed request bytes.
 	metadataBytes := count*40 + uint64(len(groups))*512 + requestBytes + groupFixedBytes
 	if metadataBytes > reader.maxReadBytes || resultBound > reader.maxReadBytes-metadataBytes {
-		return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedReadAdmission
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
 	availableResponses := (reader.maxReadBytes - metadataBytes) / resultBound
 	// One response-bound is retained by completed groups/final merge; the rest
 	// are active workers. This derives concurrency from bytes without limiting
 	// the number of groups that the workers can drain.
 	if availableResponses < 2 {
-		return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedReadAdmission
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
 	workerCount := min(len(groups), reader.scatterConcurrency)
 	if uint64(workerCount) > availableResponses-1 {
 		workerCount = int(availableResponses - 1)
 	}
 	if workerCount <= 0 {
-		return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedReadAdmission
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
 	workingBytes := metadataBytes + uint64(workerCount+1)*resultBound
 	reservationSlot, reservationEpoch, err := reader.admitRead(ctx, workingBytes)
 	if err != nil {
-		return ReplicatedTableScatterReadResult{}, lease.generation, err
+		return ReplicatedTableScatterReadResult{}, generation, err
 	}
 	releaseReservation := true
 	defer func() {
@@ -233,7 +248,7 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 	}
 	workers.Wait()
 	if err := firstReplicatedScatterError(groups, ctx); err != nil {
-		return ReplicatedTableScatterReadResult{}, lease.generation, err
+		return ReplicatedTableScatterReadResult{}, generation, err
 	}
 
 	values := make([]replicatedScatterValue, len(request.Points))
@@ -244,12 +259,12 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 		for local, ordinal := range group.ordinals {
 			raw, found, ok := cursor.Next()
 			if !ok || local >= len(group.points) {
-				return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedDataRead
+				return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedDataRead
 			}
 			values[ordinal] = replicatedScatterValue{raw: raw, found: found}
 		}
 		if _, _, ok := cursor.Next(); ok {
-			return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedDataRead
+			return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedDataRead
 		}
 		observations[groupIndex] = ReplicatedGroupReadObservation{
 			Group: group.route.Group, RouteID: group.routeID,
@@ -271,18 +286,18 @@ func (reader *ReplicatedDataReader) readScatterBatchPinned(
 	}
 	view, err := replicatedstate.OpenPointReadBatchValue(packed)
 	if err != nil || view.Count() != len(request.Points) || len(packed) > int(resultBound) {
-		return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedDataRead
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedDataRead
 	}
 	// Only the final caller-owned result remains live after merge.
 	if !reader.shrinkRead(reservationSlot, reservationEpoch, workingBytes, resultBound) {
-		return ReplicatedTableScatterReadResult{}, lease.generation, ErrReplicatedReadAdmission
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
 	releaseReservation = false
 	return ReplicatedTableScatterReadResult{
 		Observations: observations, Packed: packed, view: view,
 		reservationOwner: reader, reservationBytes: resultBound,
 		reservationSlot: reservationSlot, reservationEpoch: reservationEpoch,
-	}, lease.generation, nil
+	}, generation, nil
 }
 
 func firstReplicatedScatterError(groups []replicatedScatterGroup, parent context.Context) error {
