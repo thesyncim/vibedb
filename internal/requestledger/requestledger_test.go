@@ -835,7 +835,7 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	head, _, _ := testHead(t, false)
 	home, _ := Home(head.Key)
 	base := Command{KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot, SubjectDigest: testDigest("subject"), ExpectedRangeIdentity: testDigest("range"), Home: home, Payload: []byte{1}}
-	for op := OperationCreate; op <= OperationCleanupPlanning; op++ {
+	for op := OperationCreate; op <= LastOperation; op++ {
 		c := base
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild {

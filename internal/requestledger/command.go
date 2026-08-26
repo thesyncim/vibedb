@@ -40,6 +40,11 @@ const (
 	OperationRecordSchemaPinReleased
 	OperationRestartPlanning
 	OperationCleanupPlanning
+
+	// LastOperation is the sole inclusive admission bound for the current
+	// request-ledger command grammar. Integrations must not duplicate a numeric
+	// operation ceiling in completion or apply validation.
+	LastOperation = OperationCleanupPlanning
 )
 
 type Command struct {
@@ -393,7 +398,7 @@ func ValidateCommand(raw []byte) error {
 }
 
 func validateCommandShape(command Command) error {
-	if command.Operation < OperationCreate || command.Operation > OperationCleanupPlanning ||
+	if command.Operation < OperationCreate || command.Operation > LastOperation ||
 		!nonzeroDigest(command.KeyDigest) || !nonzeroDigest(command.RequestDigest) ||
 		!nonzeroDigest(command.PlanRoot) || !nonzeroDigest(command.SubjectDigest) ||
 		!nonzeroDigest(command.ExpectedRangeIdentity) || command.Home == (LedgerHome{}) {
