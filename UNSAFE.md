@@ -66,13 +66,14 @@ The test parses Go imports. It excludes tests, testdata, vendor content, the
 Git directory, and nested Go modules.
 
 <!-- unsafe-file-list:start -->
-The root module contains 65 non-test Go files that import `unsafe`:
+The root module contains 66 non-test Go files that import `unsafe`:
 
 ```text
 autosplit/recorder.go
 gateway/catalog.go
 gateway/index_metadata.go
 gateway/replicated_table.go
+internal/distributedtxn/replicated_codec.go
 internal/raftstore/preallocate_windows.go
 internal/rafttransport/frame.go
 internal/replicatedstate/apply_batch.go
