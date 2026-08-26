@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -160,6 +161,10 @@ func runClusterDev(args []string) int {
 		usage()
 		return 2
 	}
+	if !filepath.IsAbs(*root) || filepath.Clean(*root) != *root {
+		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", errDevCluster)
+		return 2
+	}
 	abs, err := filepath.Abs(*root)
 	if err != nil || filepath.Clean(abs) != abs || abs == string(filepath.Separator) {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", errDevCluster)
@@ -196,7 +201,7 @@ func resolveDevBinary(explicit, name string) (string, error) {
 			return "", err
 		}
 		info, err := os.Stat(path)
-		if err != nil || info.Mode()&0o111 == 0 {
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
 			return "", errors.Join(errDevCluster, err)
 		}
 		return path, nil
@@ -204,7 +209,7 @@ func resolveDevBinary(explicit, name string) (string, error) {
 	self, err := os.Executable()
 	if err == nil {
 		sibling := filepath.Join(filepath.Dir(self), name)
-		if info, e := os.Stat(sibling); e == nil && info.Mode()&0o111 != 0 {
+		if info, e := os.Stat(sibling); e == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
 			return sibling, nil
 		}
 	}
@@ -396,12 +401,20 @@ func writeDevCatalog(m devClusterManifest, clusterID, clusterIncarnation, shardI
 type devChild struct {
 	command     *exec.Cmd
 	ready       chan error
-	done        chan error
+	done        chan struct{}
 	diagnostics *devDiagnostics
+	waitMu      sync.Mutex
+	waitErr     error
+}
+
+type devChildExit struct {
+	name string
+	err  error
 }
 
 func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string) error {
 	children := make([]*devChild, 0, devClusterNodes+1)
+	exits := make(chan devChildExit, devClusterNodes+1)
 	defer stopDevChildren(children)
 	for _, member := range m.Members {
 		child, err := startDevChild(shardBinary, []string{"serve-rf3", "-manifest", member.ServeManifest}, "vibedb-shard RF3 ready")
@@ -409,9 +422,10 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 			return err
 		}
 		children = append(children, child)
+		watchDevChildExit(exits, fmt.Sprintf("shard member %d", member.Member), child)
 	}
 	for _, child := range children {
-		if err := waitDevReady(ctx, child); err != nil {
+		if err := waitDevReadyOrExit(ctx, child, exits); err != nil {
 			return err
 		}
 	}
@@ -424,15 +438,38 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 		return err
 	}
 	children = append(children, gatewayChild)
-	if err = waitDevReady(ctx, gatewayChild); err != nil {
+	watchDevChildExit(exits, "gateway", gatewayChild)
+	if err = waitDevReadyOrExit(ctx, gatewayChild, exits); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stdout, "VibeDB development cluster ready: %s\n", m.ClientEndpoint)
 	select {
 	case <-ctx.Done():
 		return nil
-	case err := <-gatewayChild.done:
-		return errors.Join(errors.New("gateway exited"), err)
+	case exit := <-exits:
+		return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
+	}
+}
+
+func watchDevChildExit(exits chan<- devChildExit, name string, child *devChild) {
+	go func() {
+		<-child.done
+		exits <- devChildExit{name: name, err: child.waitError()}
+	}()
+}
+
+func waitDevReadyOrExit(ctx context.Context, child *devChild, exits <-chan devChildExit) error {
+	timer := time.NewTimer(devReadyTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-child.ready:
+		return err
+	case exit := <-exits:
+		return errors.Join(fmt.Errorf("%s exited before cluster readiness", exit.name), exit.err)
+	case <-timer.C:
+		return errors.New("development cluster readiness timeout")
+	case <-ctx.Done():
+		return context.Cause(ctx)
 	}
 }
 func startDevChild(binary string, args []string, marker string) (*devChild, error) {
@@ -444,7 +481,7 @@ func startDevChild(binary string, args []string, marker string) (*devChild, erro
 	command := exec.Command(binary, args...)
 	command.Stdout = diagnostics
 	command.Stderr = writer
-	child := &devChild{command: command, ready: make(chan error, 1), done: make(chan error, 1), diagnostics: diagnostics}
+	child := &devChild{command: command, ready: make(chan error, 1), done: make(chan struct{}), diagnostics: diagnostics}
 	if err = command.Start(); err != nil {
 		reader.Close()
 		writer.Close()
@@ -468,8 +505,20 @@ func startDevChild(binary string, args []string, marker string) (*devChild, erro
 		}
 		reader.Close()
 	}()
-	go func() { child.done <- command.Wait() }()
+	go func() {
+		err := command.Wait()
+		child.waitMu.Lock()
+		child.waitErr = err
+		child.waitMu.Unlock()
+		close(child.done)
+	}()
 	return child, nil
+}
+
+func (child *devChild) waitError() error {
+	child.waitMu.Lock()
+	defer child.waitMu.Unlock()
+	return child.waitErr
 }
 func waitDevReady(ctx context.Context, child *devChild) error {
 	timer := time.NewTimer(devReadyTimeout)
@@ -490,9 +539,6 @@ func stopDevChildren(children []*devChild) {
 		}
 	}
 	for i := len(children) - 1; i >= 0; i-- {
-		if children[i].command.ProcessState != nil {
-			continue
-		}
 		select {
 		case <-children[i].done:
 		case <-time.After(10 * time.Second):
@@ -626,7 +672,8 @@ func validDevManifest(m devClusterManifest, root string) bool {
 	}
 	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.Roots, m.AuthorizationPolicy}
 	addresses := map[string]struct{}{m.ClientEndpoint: {}}
-	nodes, stores := make(map[string]struct{}, len(m.Members)), make(map[string]struct{}, len(m.Members))
+	nodes := map[string]struct{}{m.GatewayNode: {}}
+	stores := make(map[string]struct{}, len(m.Members))
 	for index, member := range m.Members {
 		paths = append(paths, member.ServeManifest)
 		if member.Member != uint64(index+1) {
@@ -666,11 +713,11 @@ func validDevManifest(m devClusterManifest, root string) bool {
 
 func validDevLoopbackAddress(address string) bool {
 	host, port, err := net.SplitHostPort(address)
-	if err != nil || port == "" {
+	if err != nil || host != "127.0.0.1" {
 		return false
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	value, err := strconv.Atoi(port)
+	return err == nil && value > 0 && value <= 65535 && strconv.Itoa(value) == port
 }
 func decodeDev16(value string) ([16]byte, error) {
 	var out [16]byte
@@ -678,6 +725,9 @@ func decodeDev16(value string) ([16]byte, error) {
 		return out, errDevCluster
 	}
 	_, err := hex.Decode(out[:], []byte(value))
+	if err == nil && out == ([16]byte{}) {
+		err = errDevCluster
+	}
 	return out, err
 }
 func runDevCommand(binary string, args ...string) error {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,5 +93,52 @@ func TestReserveDevPortsUsesDistinctLoopbackEndpoints(t *testing.T) {
 			t.Fatalf("duplicate %q", address)
 		}
 		seen[address] = struct{}{}
+	}
+}
+
+func TestDevEndpointAndIdentityValidationIsCanonical(t *testing.T) {
+	for _, address := range []string{"localhost:1234", "[::1]:1234", "127.0.0.1:01234", "127.0.0.1:0", "127.0.0.1:http"} {
+		if validDevLoopbackAddress(address) {
+			t.Fatalf("noncanonical endpoint %q accepted", address)
+		}
+	}
+	if !validDevLoopbackAddress("127.0.0.1:1234") {
+		t.Fatal("canonical loopback endpoint rejected")
+	}
+	if _, err := decodeDev16("00000000000000000000000000000000"); err == nil {
+		t.Fatal("zero identity accepted")
+	}
+}
+
+func TestClusterDevRejectsRelativeRootBeforeResolvingChildren(t *testing.T) {
+	if status := runClusterDev([]string{"--root", "relative"}); status != 2 {
+		t.Fatalf("status=%d", status)
+	}
+}
+
+func TestResolveDevBinaryRejectsExecutableDirectory(t *testing.T) {
+	if _, err := resolveDevBinary(t.TempDir(), "ignored"); err == nil {
+		t.Fatal("executable directory accepted as a child binary")
+	}
+}
+
+func TestDevSupervisorObservesChildExit(t *testing.T) {
+	child, err := startDevChild("/bin/sh", []string{"-c", "echo READY >&2; exit 17"}, "READY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exits := make(chan devChildExit, 1)
+	watchDevChildExit(exits, "shard member 1", child)
+	if err := waitDevReadyOrExit(context.Background(), child, exits); err != nil {
+		// An immediate exit is also a correct supervisor result.
+		return
+	}
+	select {
+	case exit := <-exits:
+		if exit.name != "shard member 1" || exit.err == nil {
+			t.Fatalf("exit=%+v", exit)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not observe child exit")
 	}
 }

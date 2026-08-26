@@ -42,15 +42,25 @@ func (config Config) validate() error {
 		(config.StorageClass != "" && (len(config.StorageClass) > 63 || !dnsLabel.MatchString(config.StorageClass))) {
 		return ErrConfig
 	}
+	seenNodes := make(map[string]struct{}, len(config.ShardNodeIDs))
 	for _, id := range config.ShardNodeIDs {
 		if len(id) != 32 {
 			return ErrConfig
 		}
+		nonzero := false
 		for _, c := range id {
 			if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
 				return ErrConfig
 			}
+			nonzero = nonzero || c != '0'
 		}
+		if !nonzero {
+			return ErrConfig
+		}
+		if _, exists := seenNodes[id]; exists {
+			return ErrConfig
+		}
+		seenNodes[id] = struct{}{}
 	}
 	return nil
 }
@@ -93,6 +103,7 @@ spec:
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: vibedb-shard
+    app.kubernetes.io/component: serving
   ports:
     - {name: peer, port: 7411, targetPort: peer}
     - {name: native, port: 7511, targetPort: native}
@@ -109,6 +120,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: vibedb-shard
+      app.kubernetes.io/component: serving
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -123,10 +135,12 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: vibedb-shard
+      app.kubernetes.io/component: serving
   template:
     metadata:
       labels:
         app.kubernetes.io/name: vibedb-shard
+        app.kubernetes.io/component: serving
     spec:
       terminationGracePeriodSeconds: 120
       initContainers:
@@ -307,9 +321,9 @@ spec:
             - {name: target-tls, mountPath: /run/secrets/vibedb, readOnly: true}
       volumes:
         - name: target-config
-          configMap: {name: REPLACE_WITH_TARGET_CONFIG}
+          configMap: {name: replace-with-target-config}
         - name: target-tls
-          secret: {secretName: REPLACE_WITH_TARGET_TLS}
+          secret: {secretName: replace-with-target-tls}
   volumeClaimTemplates:
     - metadata: {name: target-data}
       spec:

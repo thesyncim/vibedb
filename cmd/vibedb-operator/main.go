@@ -51,6 +51,9 @@ func render(arguments []string) error {
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
+	if flags.NArg() != 0 {
+		return errors.New("render accepts no positional arguments")
+	}
 	parts := strings.Split(*nodes, ",")
 	if len(parts) != 3 {
 		return errors.New("-shard-node-ids requires exactly three values")
@@ -70,13 +73,19 @@ func prepare(arguments []string) error {
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
+	if flags.NArg() != 0 || !validOperatorDirectory(*manifestDirectory) ||
+		!validOperatorDirectory(*dataDirectory) {
+		return errors.New("prepare requires canonical absolute manifest and data directories")
+	}
 	ordinal, err := podOrdinal(*hostname)
 	if err != nil {
 		return err
 	}
 	serve := filepath.Join(*dataDirectory, "serve-rf3.vibejson")
-	if info, statErr := os.Stat(serve); statErr == nil && info.Mode().IsRegular() {
+	if info, statErr := os.Lstat(serve); statErr == nil && info.Mode().IsRegular() {
 		return nil
+	} else if statErr == nil {
+		return errors.New("existing serve manifest is not a regular file")
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
@@ -86,20 +95,28 @@ func prepare(arguments []string) error {
 	if err = command.Run(); err != nil {
 		return err
 	}
-	info, err := os.Stat(serve)
+	info, err := os.Lstat(serve)
 	if err != nil || !info.Mode().IsRegular() {
 		return errors.Join(err, errors.New("prepare-rf3 did not publish the expected member root"))
 	}
 	return nil
 }
 
+func validOperatorDirectory(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
+}
+
 func podOrdinal(hostname string) (int, error) {
+	const prefix = "vibedb-shard-"
+	if !strings.HasPrefix(hostname, prefix) {
+		return 0, errors.New("hostname is not a vibedb-shard StatefulSet pod")
+	}
 	cut := strings.LastIndexByte(hostname, '-')
 	if cut <= 0 || cut == len(hostname)-1 {
 		return 0, errors.New("hostname has no StatefulSet ordinal")
 	}
 	ordinal, err := strconv.Atoi(hostname[cut+1:])
-	if err != nil || ordinal < 0 || ordinal > 2 {
+	if err != nil || ordinal < 0 || ordinal > 2 || strconv.Itoa(ordinal) != hostname[cut+1:] {
 		return 0, errors.New("hostname ordinal is outside the RF3 roster")
 	}
 	return ordinal, nil
