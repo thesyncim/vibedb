@@ -167,7 +167,10 @@ type ReplicatedTransactionPendingCommand struct {
 // material. Replicated coordinator/participant records remain the decision
 // authority; this handle never substitutes a process-local journal for them.
 type ReplicatedTransactionRecoveryHandle struct {
-	ID                        distributedtxn.ID
+	ID distributedtxn.ID
+	// RetryHome is part of the persisted transaction identity. Recovery and
+	// byte-identical retries must never substitute the current process default.
+	RetryHome                 replication.RetryHome
 	CatalogGeneration         uint64
 	Phase                     ReplicatedTransactionPhase
 	CoordinatorOrdinal        uint32
@@ -178,6 +181,7 @@ type ReplicatedTransactionRecoveryHandle struct {
 	Pending                   []ReplicatedTransactionPendingCommand
 
 	ownership *replicatedTransactionRecoveryOwnership
+	journal   ReplicatedTransactionJournal
 }
 
 // ReplicatedTransactionResult reports a proved outcome. Recovery is non-nil
@@ -876,6 +880,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Execute(
 		id, catalogGeneration, uint32(coordinatorOrdinal), deadline, plan,
 		handleReservation,
 	)
+	handle.RetryHome = orchestrator.retryHome
 	decisionRevision, begin, err := orchestrator.begin(
 		ctx, handle, plan, coordinatorOrdinal, catalogGeneration, deadline,
 	)
@@ -1322,8 +1327,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) propose(
 	scratch replicatedTransactionWorkerScratch,
 ) (proposal replicatedTransactionProposal) {
 	return orchestrator.proposeWithCapability(
-		ctx, route, control, batches, ordinal, scratch,
-		serviceauthz.CapabilityDataWrite,
+		ctx, orchestrator.retryHome, route, control, batches, ordinal, scratch,
+		serviceauthz.CapabilityDataWrite, nil,
 	)
 }
 
@@ -1336,19 +1341,40 @@ func (orchestrator *ReplicatedTransactionOrchestrator) proposeRecovery(
 	scratch replicatedTransactionWorkerScratch,
 ) replicatedTransactionProposal {
 	return orchestrator.proposeWithCapability(
-		ctx, route, control, batches, ordinal, scratch,
-		serviceauthz.CapabilityTransactionRecovery,
+		ctx, orchestrator.retryHome, route, control, batches, ordinal, scratch,
+		serviceauthz.CapabilityTransactionRecovery, nil,
+	)
+}
+
+func (orchestrator *ReplicatedTransactionOrchestrator) proposeExactForHandle(
+	ctx context.Context,
+	handle *ReplicatedTransactionRecoveryHandle,
+	route ReplicatedRoute,
+	control distributedtxn.ReplicatedCommand,
+	batches []replication.RelationMutationBatch,
+	ordinal uint32,
+	scratch replicatedTransactionWorkerScratch,
+	exact []byte,
+	capability serviceauthz.Capability,
+) replicatedTransactionProposal {
+	if handle == nil || handle.RetryHome == (replication.RetryHome{}) || len(exact) == 0 {
+		return replicatedTransactionProposal{ordinal: ordinal, err: ErrReplicatedTransaction}
+	}
+	return orchestrator.proposeWithCapability(
+		ctx, handle.RetryHome, route, control, batches, ordinal, scratch, capability, exact,
 	)
 }
 
 func (orchestrator *ReplicatedTransactionOrchestrator) proposeWithCapability(
 	ctx context.Context,
+	retryHome replication.RetryHome,
 	route ReplicatedRoute,
 	control distributedtxn.ReplicatedCommand,
 	batches []replication.RelationMutationBatch,
 	ordinal uint32,
 	scratch replicatedTransactionWorkerScratch,
 	capability serviceauthz.Capability,
+	expectedExact []byte,
 ) (proposal replicatedTransactionProposal) {
 	proposal = replicatedTransactionProposal{ordinal: ordinal}
 	proposal.scratch = scratch
@@ -1363,7 +1389,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) proposeWithCapability(
 		return proposal
 	}
 	command := replicatedTransactionCommandHeader(
-		route, orchestrator.tenant, orchestrator.retryHome,
+		route, orchestrator.tenant, retryHome,
 		replication.ID128(control.ID), uint64(control.Role), 1,
 	)
 	command.Kind = replication.CommandTransaction
@@ -1431,7 +1457,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) proposeWithCapability(
 		return proposal
 	}
 	command = replicatedTransactionCommandHeader(
-		route, orchestrator.tenant, orchestrator.retryHome,
+		route, orchestrator.tenant, retryHome,
 		replication.ID128(control.ID), uint64(control.Role), sequence,
 	)
 	command.Kind = replication.CommandTransaction
@@ -1447,6 +1473,10 @@ func (orchestrator *ReplicatedTransactionOrchestrator) proposeWithCapability(
 	dst, err = replication.AppendCommand(dst[:0], command)
 	if err != nil {
 		proposal.err = err
+		return proposal
+	}
+	if len(expectedExact) != 0 && !bytes.Equal(dst, expectedExact) {
+		proposal.err = ErrReplicatedTransaction
 		return proposal
 	}
 	if useRetained {
@@ -1653,8 +1683,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) finishWithCapability(
 			PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
 		return orchestrator.proposeWithCapability(
-			work, handle.Participants[ordinal].Route, control,
-			nil, uint32(ordinal), scratch, capability,
+			work, handle.RetryHome, handle.Participants[ordinal].Route, control,
+			nil, uint32(ordinal), scratch, capability, nil,
 		)
 	}, func(proposal replicatedTransactionProposal) {
 		if proposal.result.Outcome.AppliedIndex != 0 {
@@ -1738,8 +1768,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndReleaseWithC
 			},
 		}
 		proposal := orchestrator.proposeWithCapability(
-			work, handle.Participants[ordinal].Route,
-			fence, nil, uint32(ordinal), scratch, capability,
+			work, handle.RetryHome, handle.Participants[ordinal].Route,
+			fence, nil, uint32(ordinal), scratch, capability, nil,
 		)
 		if proposal.err != nil || proposal.code == replicatedstate.ResultApplied {
 			return proposal
@@ -1754,8 +1784,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) abortFenceAndReleaseWithC
 			PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
 		return orchestrator.proposeWithCapability(
-			work, handle.Participants[ordinal].Route,
-			release, nil, uint32(ordinal), proposal.scratch, capability,
+			work, handle.RetryHome, handle.Participants[ordinal].Route,
+			release, nil, uint32(ordinal), proposal.scratch, capability, nil,
 		)
 	}, func(proposal replicatedTransactionProposal) {
 		if proposal.result.Outcome.AppliedIndex != 0 {
@@ -1894,8 +1924,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) retireWithCapability(
 		PayloadKind: distributedtxn.ReplicatedPayloadRetirement, Payload: payload,
 	}
 	proposal := orchestrator.proposeWithCapability(
-		ctx, route, control, nil, handle.CoordinatorOrdinal,
-		replicatedTransactionWorkerScratch{}, capability,
+		ctx, handle.RetryHome, route, control, nil, handle.CoordinatorOrdinal,
+		replicatedTransactionWorkerScratch{}, capability, nil,
 	)
 	orchestrator.capturePending(handle, proposal)
 	if proposal.err != nil || proposal.code != replicatedstate.ResultApplied ||
