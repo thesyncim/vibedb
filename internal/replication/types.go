@@ -66,7 +66,9 @@ const (
 	commandWireSessionOpen     = uint8(4)
 	commandWireSessionRenew    = uint8(5)
 	commandWireSessionRevoke   = uint8(6)
+	commandWireTransaction     = uint8(7)
 	sessionLeaseBodyBytes      = 16
+	transactionLengthBytes     = 4
 )
 
 // ID128 is one opaque, byte-canonical 128-bit identity. The codec assigns no
@@ -123,6 +125,9 @@ const (
 	// CommandSessionRevoke conditionally clears an active session's replicated
 	// lease deadline. ExpectedDeadlineUnixNano fences delayed revocations.
 	CommandSessionRevoke
+	// CommandTransaction applies one canonical distributed transaction control
+	// transition. Only participant staging carries native relation batches.
+	CommandTransaction
 )
 
 // MutationKind selects one logical relation mutation.

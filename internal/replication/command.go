@@ -2,11 +2,26 @@ package replication
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"unicode/utf8"
+
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 )
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
+
+var transactionMutationDigestDomain = [...]byte{
+	'V', 'i', 'b', 'e', 'D', 'B', '/', 't', 'x', 'n', '/', 'r', 'e', 'l', '/', '1', 0,
+}
+
+const (
+	transactionCoordinatorEpoch       = uint64(1)
+	transactionParticipantEpoch       = uint64(2)
+	transactionCoordinatorDecisionTag = uint64(2) << 62
+	transactionCoordinatorRetireTag   = uint64(3) << 62
+	transactionCoordinatorRevisionMax = uint64(1) << 62
+)
 
 // Command is one deterministic relation-bundle state-machine operation.
 // It contains no Raft term, index, physical root generation, SQL text, local
@@ -58,7 +73,11 @@ type Command struct {
 	// NextDeadlineUnixNano is the deadline to publish, or zero for revoke.
 	NextDeadlineUnixNano int64
 
-	Batches []RelationMutationBatch
+	// Transaction is one exact canonical distributed transaction control body.
+	// It is present only for CommandTransaction. Participant-stage mutations
+	// remain in Batches so the native relation codec is never duplicated.
+	Transaction []byte
+	Batches     []RelationMutationBatch
 }
 
 // CommandView is a checksum- and semantics-validated borrowed command. Its
@@ -97,6 +116,7 @@ type CommandView struct {
 	NextDeadlineUnixNano     int64
 
 	raw              []byte
+	transactionBytes []byte
 	relationBytes    []byte
 	mutationCount    uint32
 	relationCount    uint16
@@ -107,6 +127,25 @@ type CommandView struct {
 // input and is read-only for the view's lifetime.
 func (v CommandView) Bytes() []byte {
 	return v.raw[:len(v.raw):len(v.raw)]
+}
+
+// TransactionBytes returns the exact validated transaction control body. The
+// result aliases the decoder input and is read-only for the view's lifetime.
+// Non-transaction commands return nil.
+func (v CommandView) TransactionBytes() []byte {
+	return v.transactionBytes[:len(v.transactionBytes):len(v.transactionBytes)]
+}
+
+// OpenTransactionInto reopens the already outer-validated transaction control
+// into caller-owned intent-scope scratch. The returned payload aliases the
+// command envelope. A MaxIntentScopes scratch slice keeps this allocation-free.
+func (v CommandView) OpenTransactionInto(
+	scopes []distributedtxn.IntentScope,
+) (distributedtxn.ReplicatedCommandView, error) {
+	if v.kind != CommandTransaction || len(v.transactionBytes) == 0 {
+		return distributedtxn.ReplicatedCommandView{}, ErrEnvelopeSemantic
+	}
+	return distributedtxn.OpenReplicatedCommandInto(v.transactionBytes, scopes)
 }
 
 // Kind reports the relation-bundle or session-lifecycle operation.
@@ -325,6 +364,11 @@ func AppendCommand(dst []byte, command Command) ([]byte, error) {
 		appendU64(frame, cursor+8, uint64(command.NextDeadlineUnixNano))
 		cursor += sessionLeaseBodyBytes
 	}
+	if command.Kind == CommandTransaction {
+		appendU32(frame, cursor, uint32(len(command.Transaction)))
+		cursor += transactionLengthBytes
+		cursor += copy(frame[cursor:], command.Transaction)
+	}
 	for batchIndex := range command.Batches {
 		batch := &command.Batches[batchIndex]
 		headerAt := -1
@@ -379,6 +423,7 @@ func commandOverlapsAppendRegion(dst []byte, total int, command Command) bool {
 	if byteSlicesOverlap(region, command.Tenant) ||
 		byteSliceStringOverlap(region, command.Distribution) ||
 		byteSliceStringOverlap(region, command.Shard) ||
+		byteSlicesOverlap(region, command.Transaction) ||
 		typedSliceOverlapsBytes(region, command.Batches) {
 		return true
 	}
@@ -411,6 +456,8 @@ func commandWireKind(kind CommandKind) uint8 {
 		return commandWireSessionRenew
 	case CommandSessionRevoke:
 		return commandWireSessionRevoke
+	case CommandTransaction:
+		return commandWireTransaction
 	default:
 		panic("replication: validated command kind has no wire encoding")
 	}
@@ -434,6 +481,15 @@ func measureCommand(command Command) (int, error) {
 	if commandCarriesLeaseBody(command.Kind) {
 		var ok bool
 		total, ok = checkedAdd(total, sessionLeaseBodyBytes, MaxCommandBytes)
+		if !ok {
+			return 0, ErrEnvelopeTooLarge
+		}
+	}
+	if command.Kind == CommandTransaction {
+		var ok bool
+		total, ok = checkedAdd(
+			total, uint64(transactionLengthBytes+len(command.Transaction)), MaxCommandBytes,
+		)
 		if !ok {
 			return 0, ErrEnvelopeTooLarge
 		}
@@ -476,29 +532,39 @@ func validateCommandHeader(command Command) error {
 	}
 	switch command.Kind {
 	case CommandMutationBatch:
-		if len(command.Batches) == 0 || len(command.Batches) > MaxRelationBatches {
-			return semantic("relation batch count")
+		if len(command.Transaction) != 0 {
+			return semantic("ordinary command carries transaction control")
 		}
-		mutations := 0
-		var previous RelationID
-		for index := range command.Batches {
-			batch := &command.Batches[index]
-			if batch.Relation == 0 || batch.Relation > MaxRelationID ||
-				index != 0 && batch.Relation <= previous {
-				return semantic("relation batch order or identity")
-			}
-			if len(batch.Mutations) == 0 ||
-				len(command.Batches) > 1 && len(batch.Mutations) > 1<<16-1 ||
-				len(batch.Mutations) > MaxMutations-mutations {
-				return semantic("mutation count")
-			}
-			mutations += len(batch.Mutations)
-			previous = batch.Relation
+		if err := validateRelationBatches(command.Batches); err != nil {
+			return err
 		}
 	case CommandSessionRetire, CommandSessionRelease, CommandSessionOpen,
 		CommandSessionRenew, CommandSessionRevoke:
-		if len(command.Batches) != 0 {
-			return semantic("session lifecycle command carries relation batches")
+		if len(command.Batches) != 0 || len(command.Transaction) != 0 {
+			return semantic("session lifecycle command carries payload")
+		}
+	case CommandTransaction:
+		control, err := validatedTransactionControl(command.Transaction)
+		if err != nil {
+			return semantic("transaction control")
+		}
+		if err := validateTransactionClientIdentity(
+			command.ClientID, command.ClientEpoch, command.ClientSequence, command.AckThrough, control,
+		); err != nil {
+			return err
+		}
+		if control.operation != distributedtxn.ReplicatedStageParticipant {
+			if len(command.Batches) != 0 {
+				return semantic("transaction operation carries relation batches")
+			}
+		} else {
+			if err := validateRelationBatches(command.Batches); err != nil {
+				return err
+			}
+			digest, err := TransactionMutationDigest(command.Batches)
+			if err != nil || digest != control.mutationDigest {
+				return semantic("transaction mutation digest")
+			}
 		}
 	default:
 		return semantic("unknown command kind")
@@ -536,6 +602,229 @@ func validateCommandHeader(command Command) error {
 	}
 	if err := validateTextIdentity("shard", command.Shard, MaxIdentityBytes); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateRelationBatches(batches []RelationMutationBatch) error {
+	if len(batches) == 0 || len(batches) > MaxRelationBatches {
+		return semantic("relation batch count")
+	}
+	mutations := 0
+	var previous RelationID
+	for index := range batches {
+		batch := &batches[index]
+		if batch.Relation == 0 || batch.Relation > MaxRelationID ||
+			index != 0 && batch.Relation <= previous {
+			return semantic("relation batch order or identity")
+		}
+		if len(batch.Mutations) == 0 ||
+			len(batches) > 1 && len(batch.Mutations) > 1<<16-1 ||
+			len(batch.Mutations) > MaxMutations-mutations {
+			return semantic("mutation count")
+		}
+		mutations += len(batch.Mutations)
+		previous = batch.Relation
+	}
+	return nil
+}
+
+// TransactionMutationDigest returns the domain-separated SHA-256 identity of
+// canonical native relation batches. The fixed framing prefix binds the
+// compact singleton relation ID and the batch/mutation counts, which otherwise
+// live in the outer command header rather than singleton relation bytes.
+func TransactionMutationDigest(
+	batches []RelationMutationBatch,
+) (distributedtxn.Digest, error) {
+	if err := validateRelationBatches(batches); err != nil {
+		return distributedtxn.Digest{}, err
+	}
+	var framing [8]byte
+	binary.LittleEndian.PutUint16(framing[0:2], uint16(len(batches)))
+	if len(batches) == 1 {
+		binary.LittleEndian.PutUint16(framing[2:4], uint16(batches[0].Relation))
+	}
+	binary.LittleEndian.PutUint32(framing[4:8], uint32(commandMutationCount(Command{Batches: batches})))
+	h := sha256.New()
+	canonicalBytes := uint64(0)
+	for batchIndex := range batches {
+		batch := &batches[batchIndex]
+		if len(batches) > 1 {
+			var header [relationBatchHeaderBytes]byte
+			binary.LittleEndian.PutUint16(header[0:2], uint16(batch.Relation))
+			binary.LittleEndian.PutUint16(header[2:4], uint16(len(batch.Mutations)))
+			payloadBytes := uint64(0)
+			for mutationIndex := range batch.Mutations {
+				mutation := batch.Mutations[mutationIndex]
+				if err := validateMutation(mutation); err != nil {
+					return distributedtxn.Digest{}, err
+				}
+				mutationBytes := uint64(mutationHeaderBytes + len(mutation.Key) + mutationWireValueBytes(mutation))
+				var ok bool
+				payloadBytes, ok = checkedAdd(payloadBytes, mutationBytes, MaxCommandBytes)
+				if !ok {
+					return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+				}
+			}
+			var ok bool
+			canonicalBytes, ok = checkedAdd(
+				canonicalBytes, uint64(relationBatchHeaderBytes)+payloadBytes, MaxCommandBytes,
+			)
+			if !ok {
+				return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+			}
+			binary.LittleEndian.PutUint32(header[4:8], uint32(payloadBytes))
+			_, _ = h.Write(header[:])
+		}
+		for mutationIndex := range batch.Mutations {
+			mutation := batch.Mutations[mutationIndex]
+			if len(batches) == 1 {
+				if err := validateMutation(mutation); err != nil {
+					return distributedtxn.Digest{}, err
+				}
+				mutationBytes := uint64(mutationHeaderBytes + len(mutation.Key) + mutationWireValueBytes(mutation))
+				var ok bool
+				canonicalBytes, ok = checkedAdd(canonicalBytes, mutationBytes, MaxCommandBytes)
+				if !ok {
+					return distributedtxn.Digest{}, ErrEnvelopeTooLarge
+				}
+			}
+			var header [mutationHeaderBytes]byte
+			header[0] = byte(mutation.Kind)
+			binary.LittleEndian.PutUint16(header[2:4], uint16(len(mutation.Key)))
+			binary.LittleEndian.PutUint32(header[4:8], uint32(mutationWireValueBytes(mutation)))
+			_, _ = h.Write(header[:])
+			_, _ = h.Write(mutation.Key)
+			if mutation.Kind == MutationDeleteDigestEqual || mutation.Kind == MutationPutDigestEqual {
+				var compare [mutationDigestCompareBytes]byte
+				binary.LittleEndian.PutUint64(compare[:8], mutation.ExpectedValueLength)
+				copy(compare[8:], mutation.ExpectedValueDigest[:])
+				_, _ = h.Write(compare[:])
+			}
+			if mutation.Kind != MutationDeleteDigestEqual {
+				_, _ = h.Write(mutation.Value)
+			}
+		}
+	}
+	var canonicalDigest [sha256.Size]byte
+	h.Sum(canonicalDigest[:0])
+	return finishTransactionMutationDigest(framing, canonicalDigest), nil
+}
+
+func transactionMutationDigestFromBytes(
+	relationBytes []byte,
+	totalMutations uint32,
+	relationCount uint16,
+	inlineRelationID RelationID,
+) distributedtxn.Digest {
+	var framing [8]byte
+	binary.LittleEndian.PutUint16(framing[0:2], relationCount)
+	binary.LittleEndian.PutUint16(framing[2:4], uint16(inlineRelationID))
+	binary.LittleEndian.PutUint32(framing[4:8], totalMutations)
+	canonicalDigest := sha256.Sum256(relationBytes)
+	return finishTransactionMutationDigest(framing, canonicalDigest)
+}
+
+func finishTransactionMutationDigest(
+	framing [8]byte,
+	canonicalDigest [sha256.Size]byte,
+) distributedtxn.Digest {
+	var material [len(transactionMutationDigestDomain) + 8 + sha256.Size]byte
+	cursor := copy(material[:], transactionMutationDigestDomain[:])
+	cursor += copy(material[cursor:], framing[:])
+	copy(material[cursor:], canonicalDigest[:])
+	return distributedtxn.Digest(sha256.Sum256(material[:]))
+}
+
+type transactionControlMetadata struct {
+	role             distributedtxn.ReplicatedRole
+	operation        distributedtxn.ReplicatedOperation
+	id               distributedtxn.ID
+	expectedRevision uint64
+	mutationDigest   distributedtxn.Digest
+	manifestIndex    uint32
+}
+
+func validatedTransactionControl(raw []byte) (transactionControlMetadata, error) {
+	if err := distributedtxn.ValidateReplicatedCommand(raw); err != nil {
+		return transactionControlMetadata{}, err
+	}
+	control := transactionControlMetadata{
+		role:             distributedtxn.ReplicatedRole(raw[5]),
+		operation:        distributedtxn.ReplicatedOperation(raw[6]),
+		expectedRevision: binary.LittleEndian.Uint64(raw[24:32]),
+	}
+	copy(control.id[:], raw[32:48])
+	copy(control.mutationDigest[:], raw[88:120])
+	if control.operation == distributedtxn.ReplicatedStageManifestSegment {
+		// Validated VTRC metadata guarantees this operation has no scopes and a
+		// canonical VTM1 payload beginning at the fixed control header boundary.
+		control.manifestIndex = binary.LittleEndian.Uint32(raw[128+8 : 128+12])
+	}
+	return control, nil
+}
+
+// TransactionClientSequence derives the sole legal replicated retry sequence
+// for an exact canonical transaction control body. Coordinator decisions use
+// disjoint high-bit namespaces; participant CAS transitions at one revision
+// intentionally share a sequence and therefore cannot alias as distinct work.
+func TransactionClientSequence(control []byte) (uint64, error) {
+	view, err := validatedTransactionControl(control)
+	if err != nil {
+		return 0, semantic("transaction control")
+	}
+	return transactionClientSequence(view)
+}
+
+func transactionClientSequence(control transactionControlMetadata) (uint64, error) {
+	switch control.operation {
+	case distributedtxn.ReplicatedStageCoordinator,
+		distributedtxn.ReplicatedStageManifestCoordinator,
+		distributedtxn.ReplicatedStageParticipant:
+		return 1, nil
+	case distributedtxn.ReplicatedStageManifestSegment:
+		// Page zero follows the atomic coordinator begin at sequence two.
+		return 2 + uint64(control.manifestIndex), nil
+	case distributedtxn.ReplicatedCommitCoordinator,
+		distributedtxn.ReplicatedAbortCoordinator:
+		if control.expectedRevision >= transactionCoordinatorRevisionMax {
+			return 0, semantic("transaction coordinator revision")
+		}
+		return transactionCoordinatorDecisionTag | control.expectedRevision, nil
+	case distributedtxn.ReplicatedRetireCoordinator:
+		if control.expectedRevision >= transactionCoordinatorRevisionMax {
+			return 0, semantic("transaction coordinator revision")
+		}
+		return transactionCoordinatorRetireTag | control.expectedRevision, nil
+	case distributedtxn.ReplicatedPrepareParticipant,
+		distributedtxn.ReplicatedApplyParticipant,
+		distributedtxn.ReplicatedAbortParticipant,
+		distributedtxn.ReplicatedReleaseParticipant:
+		if control.expectedRevision == ^uint64(0) {
+			return 0, semantic("transaction participant revision")
+		}
+		return control.expectedRevision + 1, nil
+	default:
+		return 0, semantic("transaction operation")
+	}
+}
+
+func validateTransactionClientIdentity(
+	clientID ID128,
+	clientEpoch, clientSequence, ackThrough uint64,
+	control transactionControlMetadata,
+) error {
+	wantEpoch := transactionCoordinatorEpoch
+	if control.role == distributedtxn.ReplicatedRoleParticipant {
+		wantEpoch = transactionParticipantEpoch
+	}
+	wantSequence, err := transactionClientSequence(control)
+	if err != nil {
+		return err
+	}
+	if clientID != ID128(control.id) || clientEpoch != wantEpoch ||
+		clientSequence != wantSequence || ackThrough != 0 {
+		return semantic("transaction client identity")
 	}
 	return nil
 }
@@ -656,6 +945,14 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if count != 0 || relationCount != 0 || inlineRelationID != 0 {
 			return CommandView{}, semantic("session lifecycle command carries relation batches")
 		}
+	case CommandTransaction:
+		if count == 0 && relationCount == 0 && inlineRelationID == 0 {
+			break
+		}
+		if count == 0 || relationCount == 0 || uint64(count) > MaxMutations || relationCount > MaxRelationBatches ||
+			(relationCount == 1) != (inlineRelationID != 0) || inlineRelationID > MaxRelationID {
+			return CommandView{}, semantic("transaction mutation or relation batch count")
+		}
 	}
 
 	view := CommandView{kind: kind, AuthorityClass: authorityClass}
@@ -730,6 +1027,46 @@ func OpenCommand(src []byte) (CommandView, error) {
 		if len(payload) != 0 {
 			return CommandView{}, semantic("session lifecycle body length")
 		}
+	case CommandTransaction:
+		if len(payload) < transactionLengthBytes {
+			return CommandView{}, corrupt("transaction control length")
+		}
+		controlBytes64 := uint64(binary.LittleEndian.Uint32(payload[:transactionLengthBytes]))
+		if controlBytes64 == 0 || controlBytes64 > distributedtxn.MaxReplicatedCommandBytes ||
+			controlBytes64 > uint64(len(payload)-transactionLengthBytes) {
+			return CommandView{}, corrupt("transaction control overruns command body")
+		}
+		controlEnd := transactionLengthBytes + int(controlBytes64)
+		controlBytes := payload[transactionLengthBytes:controlEnd:controlEnd]
+		control, err := validatedTransactionControl(controlBytes)
+		if err != nil {
+			return CommandView{}, corrupt("transaction control")
+		}
+		if err := validateTransactionClientIdentity(
+			view.ClientID, view.ClientEpoch, view.ClientSequence, view.AckThrough, control,
+		); err != nil {
+			return CommandView{}, err
+		}
+		relationBytes := payload[controlEnd:len(payload):len(payload)]
+		if control.operation == distributedtxn.ReplicatedStageParticipant {
+			if count == 0 || relationCount == 0 {
+				return CommandView{}, semantic("participant stage has no relation batches")
+			}
+			if err := validateRelationBytes(
+				relationBytes, count, relationCount, inlineRelationID,
+			); err != nil {
+				return CommandView{}, err
+			}
+			if transactionMutationDigestFromBytes(
+				relationBytes, count, relationCount, inlineRelationID,
+			) != control.mutationDigest {
+				return CommandView{}, semantic("transaction mutation digest")
+			}
+			view.relationBytes = relationBytes
+		} else if count != 0 || relationCount != 0 || inlineRelationID != 0 || len(relationBytes) != 0 {
+			return CommandView{}, semantic("transaction operation carries relation batches")
+		}
+		view.transactionBytes = controlBytes
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count
@@ -752,6 +1089,8 @@ func openCommandKind(wire uint8) (CommandKind, bool) {
 		return CommandSessionRenew, true
 	case commandWireSessionRevoke:
 		return CommandSessionRevoke, true
+	case commandWireTransaction:
+		return CommandTransaction, true
 	default:
 		return 0, false
 	}
