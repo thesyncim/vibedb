@@ -69,9 +69,13 @@ type serveRequest struct {
 	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for
 	// an RF3 exec_batch. It remains ingress metadata and never enters Raft as a
 	// table or SQL string.
-	RequestID string `json:"request_id,omitempty"`
-	SQL       string `json:"sql"`
-	Class     string `json:"class,omitempty"`
+	RequestID           string `json:"request_id,omitempty"`
+	IssuerEpoch         uint64 `json:"issuer_epoch,omitempty"`
+	IssuerLane          string `json:"issuer_lane,omitempty"`
+	IssuerSequence      uint64 `json:"issuer_sequence,omitempty"`
+	IssuerAuthenticator string `json:"issuer_authenticator,omitempty"`
+	SQL                 string `json:"sql"`
+	Class               string `json:"class,omitempty"`
 	// MaxResultBytes is required by read_batch and bounds its complete JSON
 	// success response, including documents and the per-group observation vector.
 	MaxResultBytes uint32           `json:"max_result_bytes,omitempty"`
@@ -95,18 +99,19 @@ type serveParam struct {
 // observability. Rows carries each cell as raw JSON (a null cell is the JSON
 // literal null); Error is set instead when the operation failed.
 type serveResponse struct {
-	Kind           string            `json:"kind,omitempty"`
-	Columns        []string          `json:"columns,omitempty"`
-	Rows           [][]serveRawValue `json:"rows,omitempty"`
-	RowsAffected   int64             `json:"rows_affected,omitempty"`
-	Route          string            `json:"route,omitempty"`
-	Generation     uint64            `json:"generation,omitempty"`
-	ShardsFanned   int               `json:"shards_fanned,omitempty"`
-	Retries        int               `json:"retries,omitempty"`
-	TransactionID  replication.ID128 `json:"-"`
-	Committed      bool              `json:"committed,omitempty"`
-	OutcomeUnknown bool              `json:"outcome_unknown,omitempty"`
-	Error          string            `json:"error,omitempty"`
+	Kind           string                          `json:"kind,omitempty"`
+	Columns        []string                        `json:"columns,omitempty"`
+	Rows           [][]serveRawValue               `json:"rows,omitempty"`
+	RowsAffected   int64                           `json:"rows_affected,omitempty"`
+	Route          string                          `json:"route,omitempty"`
+	Generation     uint64                          `json:"generation,omitempty"`
+	ShardsFanned   int                             `json:"shards_fanned,omitempty"`
+	Retries        int                             `json:"retries,omitempty"`
+	TransactionID  replication.ID128               `json:"-"`
+	Committed      bool                            `json:"committed,omitempty"`
+	OutcomeUnknown bool                            `json:"outcome_unknown,omitempty"`
+	DurableAck     *durableExecBatchAckWireRequest `json:"-"`
+	Error          string                          `json:"error,omitempty"`
 }
 
 var errServeResponseTransactionState = errors.New(
@@ -998,6 +1003,13 @@ func handleConnData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 
 func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 	data nativeDataReader, logf func(string, ...any), authorize func(serviceauthz.Capability) bool) {
+	handleConnPolicyDurable(ctx, conn, exec, data, nil, logf, authorize)
+}
+
+func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.Executor,
+	data nativeDataReader, durable durableRequestService, logf func(string, ...any),
+	authorize func(serviceauthz.Capability) bool,
+) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -1009,6 +1021,76 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 	var nativeResponseScratch nativeDataResponseScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		if issuerOpenRequestCandidate(line) {
+			var request issuerOpenWireRequest
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if decodeIssuerOpenRequest(line, &request) != nil || !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidIssuerOpen.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataWrite) {
+				if writeServeResponse(writer, &serveResponse{Error: "authorization denied"}) != nil {
+					return
+				}
+				continue
+			}
+			if durable == nil {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			result, openErr := durable.OpenIssuer(ctx, authority, request.Lane)
+			if openErr != nil || !validDurableIssuerOpenResult(result) {
+				message := errDurableExecBatchUnavailable.Error()
+				if openErr != nil {
+					message = openErr.Error()
+				}
+				if writeServeResponse(writer, &serveResponse{Error: message}) != nil {
+					return
+				}
+				continue
+			}
+			if writeIssuerOpenResponse(writer, result) != nil {
+				return
+			}
+			continue
+		}
+		if durableExecBatchAckRequestCandidate(line) {
+			var request durableExecBatchAckWireRequest
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if decodeDurableExecBatchAckRequest(line, &request) != nil || !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errInvalidDurableExecBatchAckRequest.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataWrite) {
+				if writeServeResponse(writer, &serveResponse{Error: "authorization denied"}) != nil {
+					return
+				}
+				continue
+			}
+			if durable == nil {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			response, ackErr := durable.AckExecBatch(ctx, authority, request)
+			if ackErr != nil {
+				if writeServeResponse(writer, &serveResponse{Error: ackErr.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if writeDurableExecBatchAckResponse(writer, &response) != nil {
+				return
+			}
+			continue
+		}
 		if nativeDataRequestCandidate(line) {
 			if err := decodeNativeDataRequest(line, &nativeRequest); err != nil {
 				response := nativeDataError(nativeDataResponseInvalidRequest, false)
@@ -1123,6 +1205,19 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			}
 			continue
 		}
+		if req.Op == "exec_batch" && hasAnyStructuredExecBatchIdentity(&req) {
+			authority, authenticated := serviceauthz.FromContext(ctx)
+			if !authenticated {
+				if writeServeResponse(writer, &serveResponse{Error: errDurableExecBatchUnavailable.Error()}) != nil {
+					return
+				}
+				continue
+			}
+			if err := writeServeResponse(writer, executeDurableExecBatch(ctx, durable, authority, req)); err != nil {
+				return
+			}
+			continue
+		}
 		if err := writeServeResponse(writer, execRequest(ctx, exec, req)); err != nil {
 			if ctx.Err() == nil {
 				logf("gateway: encode response: %v", err)
@@ -1224,6 +1319,9 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 	hasTransaction := resp.TransactionID != (replication.ID128{})
 	hasOutcome := resp.Committed || resp.OutcomeUnknown
 	if hasTransaction != hasOutcome || resp.Committed && resp.OutcomeUnknown {
+		return errServeResponseTransactionState
+	}
+	if resp.DurableAck != nil && (!resp.Committed || !validDurableExecBatchAckRequest(resp.DurableAck)) {
 		return errServeResponseTransactionState
 	}
 	if err := w.BeginObject(); err != nil {
@@ -1340,6 +1438,33 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 			return err
 		}
 	}
+	if resp.DurableAck != nil {
+		ack := resp.DurableAck
+		if err := writeDurableExecBatchAckHexField(w, "request_id", ack.Identity.RequestID[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "request_digest", ack.Identity.RequestDigest[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "issuer_epoch", ack.Identity.IssuerEpoch); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "issuer_lane", ack.Identity.IssuerLane[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "issuer_sequence", ack.Identity.IssuerSequence); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "terminal_revision", ack.TerminalRevision); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "result_digest", ack.ResultDigest[:]); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "ack_token", ack.AckToken[:]); err != nil {
+			return err
+		}
+	}
 	if err := stringField("error", resp.Error); err != nil {
 		return err
 	}
@@ -1359,18 +1484,14 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 	var err error
 	switch req.Op {
 	case "exec_batch":
+		if hasAnyStructuredExecBatchIdentity(&req) {
+			return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
+		}
 		queries, buildErr := buildBatchQueries(req)
 		if buildErr != nil {
 			return &serveResponse{Error: buildErr.Error()}
 		}
-		var requestID replication.ID128
-		if req.RequestID != "" {
-			if decodeFixedHex(req.RequestID, requestID[:]) != nil ||
-				requestID == (replication.ID128{}) {
-				return &serveResponse{Error: gateway.ErrReplicatedTransactionRequestRegistry.Error()}
-			}
-		}
-		res, err = exec.ExecBatchRequest(ctx, requestID, queries)
+		res, err = exec.ExecBatchRequest(ctx, replication.ID128{}, queries)
 	case "exec":
 		// The write path routes the statement to its single owning shard and
 		// refuses every scatter before any dispatch.
