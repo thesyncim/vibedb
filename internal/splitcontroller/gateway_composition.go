@@ -26,12 +26,14 @@ type PlanAdmissionNodeClient interface {
 
 type RF3PlanAdmissionCoordinatorOptions struct {
 	Client        PlanAdmissionNodeClient
+	Routes        PlanAdmissionRoutePublisher
 	MaxConcurrent int
 	MaxAttempts   int
 }
 
 type RF3PlanAdmissionCoordinator struct {
 	client      PlanAdmissionNodeClient
+	routes      PlanAdmissionRoutePublisher
 	concurrent  int
 	maxAttempts int
 }
@@ -39,13 +41,14 @@ type RF3PlanAdmissionCoordinator struct {
 func NewRF3PlanAdmissionCoordinator(
 	options RF3PlanAdmissionCoordinatorOptions,
 ) (*RF3PlanAdmissionCoordinator, error) {
-	if options.Client == nil || options.MaxConcurrent <= 0 ||
+	if options.Client == nil || options.Routes == nil || options.MaxConcurrent <= 0 ||
 		options.MaxConcurrent > MaxPlanObservationEndpoints || options.MaxAttempts <= 0 ||
 		options.MaxAttempts > 16 {
 		return nil, ErrPlanAdmission
 	}
 	return &RF3PlanAdmissionCoordinator{
-		client: options.Client, concurrent: options.MaxConcurrent, maxAttempts: options.MaxAttempts,
+		client: options.Client, routes: options.Routes,
+		concurrent: options.MaxConcurrent, maxAttempts: options.MaxAttempts,
 	}, nil
 }
 
@@ -106,6 +109,9 @@ func (coordinator *RF3PlanAdmissionCoordinator) AdmitPlan(
 	}
 	if joined != nil {
 		return errors.Join(ErrPlanAdmission, joined)
+	}
+	if err = coordinator.routes.InstallPlanRoutes(catalog, plan, admission); err != nil {
+		return errors.Join(ErrPlanAdmission, err)
 	}
 	return nil
 }

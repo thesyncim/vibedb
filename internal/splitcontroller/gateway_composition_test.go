@@ -11,6 +11,15 @@ import (
 
 type planAdmissionNodeClientStub struct{ calls int }
 
+type planAdmissionRoutePublisherStub struct{ calls int }
+
+func (stub *planAdmissionRoutePublisherStub) InstallPlanRoutes(
+	*gateway.Snapshot, *Plan, PlanAdmission,
+) error {
+	stub.calls++
+	return nil
+}
+
 func (stub *planAdmissionNodeClientStub) Install(
 	context.Context, rafttransport.NodeID, *gateway.Snapshot, PlanAdmission,
 ) error {
@@ -25,13 +34,14 @@ func TestRF3PlanAdmissionCoordinatorRejectsIncompleteSourceRosterBeforeIO(t *tes
 		t.Fatal(err)
 	}
 	client := new(planAdmissionNodeClientStub)
+	routes := new(planAdmissionRoutePublisherStub)
 	coordinator, err := NewRF3PlanAdmissionCoordinator(RF3PlanAdmissionCoordinatorOptions{
-		Client: client, MaxConcurrent: 3, MaxAttempts: 2,
+		Client: client, Routes: routes, MaxConcurrent: 3, MaxAttempts: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = coordinator.AdmitPlan(t.Context(), catalog, plan, admission); !errors.Is(err, ErrPlanAdmission) || client.calls != 0 {
-		t.Fatalf("calls=%d err=%v", client.calls, err)
+	if err = coordinator.AdmitPlan(t.Context(), catalog, plan, admission); !errors.Is(err, ErrPlanAdmission) || client.calls != 0 || routes.calls != 0 {
+		t.Fatalf("client=%d routes=%d err=%v", client.calls, routes.calls, err)
 	}
 }
