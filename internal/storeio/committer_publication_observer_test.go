@@ -56,6 +56,27 @@ func TestCommitterPublicationObserverPrecedesVisibility(t *testing.T) {
 	if err = b.Publish(1); err != nil {
 		t.Fatal(err)
 	}
+	if err = c.SetRequiredPublicationObserver(func(uint64, []byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := c.Begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root = testInlineSuperblock(2)
+	root.PageSize = uint32(pageSize)
+	root.State.PageSize = uint32(pageSize)
+	root.State.MaxPageSize = uint32(pageSize)
+	root.FileEnd = testMutableStoreDataStart(uint32(pageSize))
+	if err = missing.SetInlineSuperblock(root); err != nil {
+		t.Fatal(err)
+	}
+	if err = missing.Publish(2); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("missing descriptor = %v", err)
+	}
+	if err = missing.Abort(); err != nil {
+		t.Fatal(err)
+	}
 	if err = c.Close(); err != nil {
 		t.Fatal(err)
 	}

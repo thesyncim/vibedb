@@ -296,18 +296,19 @@ type Committer struct {
 	device        Device
 	backend       Backend
 
-	buffers        [][]byte
-	bufferSize     int
-	bufferCount    int
-	freeBuffers    *indexPool
-	freeBatches    *indexPool
-	batches        []Batch
-	writeStorage   []Write
-	indexStorage   []uint32
-	descriptorOnce sync.Once
-	observerMu     sync.RWMutex
-	observer       func(uint64, []byte) error
-	producerSeen   []uint64
+	buffers                    [][]byte
+	bufferSize                 int
+	bufferCount                int
+	freeBuffers                *indexPool
+	freeBatches                *indexPool
+	batches                    []Batch
+	writeStorage               []Write
+	indexStorage               []uint32
+	descriptorOnce             sync.Once
+	observerMu                 sync.RWMutex
+	observer                   func(uint64, []byte) error
+	observerRequiresDescriptor bool
+	producerSeen               []uint64
 
 	pending     []*Batch
 	pendingMask uint64
@@ -732,6 +733,11 @@ func (c *Committer) publishRetiring(
 	}
 	c.observerMu.RLock()
 	observer := c.observer
+	requiresDescriptor := c.observerRequiresDescriptor
+	if requiresDescriptor && len(batch.publicationDescriptor) == 0 {
+		c.observerMu.RUnlock()
+		return superseded, fmt.Errorf("%w: publication descriptor required", ErrInvalidWrite)
+	}
 	if observer != nil {
 		if err := observer(generation, batch.publicationDescriptor); err != nil {
 			c.observerMu.RUnlock()
@@ -825,6 +831,23 @@ func (c *Committer) SetPublicationObserver(observer func(uint64, []byte) error) 
 	}
 	c.observerMu.Lock()
 	c.observer = observer
+	c.observerRequiresDescriptor = false
+	c.observerMu.Unlock()
+	return nil
+}
+
+// SetRequiredPublicationObserver is the migration-capture form: every root
+// source must attach a canonical descriptor or publication fails closed.
+func (c *Committer) SetRequiredPublicationObserver(observer func(uint64, []byte) error) error {
+	if observer == nil {
+		return fmt.Errorf("%w: required publication observer", ErrInvalidWrite)
+	}
+	if c == nil || c.closing.Load() {
+		return ErrClosed
+	}
+	c.observerMu.Lock()
+	c.observer = observer
+	c.observerRequiresDescriptor = true
 	c.observerMu.Unlock()
 	return nil
 }
