@@ -55,6 +55,10 @@ const (
 
 type PrincipalID [16]byte
 type RequestID [16]byte
+
+// PinID is the compact request-ledger label used in lifecycle rows. It is not
+// executionpin.PinID: the latter is a full 32-byte identity derived from the
+// authenticated execution binding and is validated through PinDigest.
 type PinID [16]byte
 type IssuerLane [8]byte
 type AckToken [32]byte

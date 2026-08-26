@@ -338,34 +338,14 @@ func (d *database) replicatedCapturePath(meta *replicatedApplyMeta) string {
 }
 
 func replicatedApplySystemLimits(retryWindow uint16) ReplicatedShardStoreLimits {
-	const (
-		stateKeyBytes   = 1
-		sessionKeyBytes = sha256.Size + 1
-		slotKeyBytes    = sha256.Size + 3
-	)
-	maxValueBytes := max(
-		replicatedstate.MaxStateEnvelopeBytes,
-		replicatedstate.MaxSessionRecordBytes,
-		replicatedstate.MaxSessionSlotRecordBytes,
-		replicatedstate.MaxAuthorityBindingBytes,
-	)
-	hotApplyBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
-		sessionKeyBytes + replicatedstate.MaxAuthorityBindingBytes +
-		sessionKeyBytes + replicatedstate.MaxSessionRecordBytes +
-		slotKeyBytes + replicatedstate.MaxSessionSlotRecordBytes
-	releaseBytes := stateKeyBytes + replicatedstate.MaxStateEnvelopeBytes +
-		sessionKeyBytes + int(retryWindow)*slotKeyBytes
-	// durable.Options requires the batch byte bound to admit one maximum
-	// document plus a maximum-sized key for every possible batch member. The
-	// exact release image can be smaller than that structural floor at wider
-	// retry windows, so bind both independently.
-	maxDocuments := max(4, int(retryWindow)+2)
-	storageMinimumBytes := maxValueBytes + maxDocuments*slotKeyBytes
+	required, ok := replicatedstate.RequiredSystemCollectionLimits(retryWindow, false)
+	if !ok {
+		return ReplicatedShardStoreLimits{}
+	}
 	return ReplicatedShardStoreLimits{
-		MaxKeyBytes:       slotKeyBytes,
-		MaxDocumentBytes:  maxValueBytes,
-		MaxBatchDocuments: maxDocuments,
-		MaxBatchBytes:     max(hotApplyBytes, releaseBytes, storageMinimumBytes),
+		MaxKeyBytes: required.MaxKeyBytes, MaxDocumentBytes: required.MaxDocumentBytes,
+		MaxBatchDocuments: required.MaxDistinctMutations,
+		MaxBatchBytes:     required.MaxBatchBytes,
 	}
 }
 

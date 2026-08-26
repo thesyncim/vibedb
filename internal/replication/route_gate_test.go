@@ -40,6 +40,24 @@ func TestRouteGateCommandRoundTripAndZeroAllocation(t *testing.T) {
 	if err != nil || opened != gate {
 		t.Fatalf("OpenRouteGate = %+v, %v", opened, err)
 	}
+	physical, ok := RouteGatePhysicalWitness(view)
+	if !ok || physical == (Digest{}) {
+		t.Fatal("route-gate physical witness unavailable")
+	}
+	changed := command
+	changed.RouteGeneration++
+	changedBytes, err := AppendCommand(nil, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedView, err := OpenCommand(changedBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedPhysical, ok := RouteGatePhysicalWitness(changedView)
+	if !ok || changedPhysical == physical {
+		t.Fatal("route-gate physical witness ignored a route fence")
+	}
 	if allocs := testing.AllocsPerRun(1000, func() {
 		bytes, appendErr := AppendCommand(storage[:0], command)
 		if appendErr != nil {
@@ -51,6 +69,9 @@ func TestRouteGateCommandRoundTripAndZeroAllocation(t *testing.T) {
 		}
 		if _, openErr = openedView.OpenRouteGate(); openErr != nil {
 			panic(openErr)
+		}
+		if _, witnessOK := RouteGatePhysicalWitness(openedView); !witnessOK {
+			panic("missing physical witness")
 		}
 	}); allocs != 0 {
 		t.Fatalf("Append/Open route-gate allocations = %v", allocs)

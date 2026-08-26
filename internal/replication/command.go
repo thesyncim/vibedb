@@ -13,10 +13,16 @@ import (
 	"github.com/thesyncim/vibedb/internal/routegate"
 )
 
-// MaxRouteGateCommandBytes is the exact largest outer replicated route-gate
-// command, including three maximum-width identities and envelope checksum.
-const MaxRouteGateCommandBytes = commandHeaderBytes + envelopeChecksumBytes +
-	routegate.CommandBytes + 3*MaxIdentityBytes
+const (
+	// MaxRouteGateCommandBytes is the exact largest outer replicated route-gate
+	// command, including three maximum-width identities and envelope checksum.
+	MaxRouteGateCommandBytes = commandHeaderBytes + envelopeChecksumBytes +
+		routegate.CommandBytes + 3*MaxIdentityBytes
+	// MaxExecutionPinCommandBytes is the corresponding exact bound for the
+	// fixed logical execution-pin command carried by schema-release evidence.
+	MaxExecutionPinCommandBytes = commandHeaderBytes + envelopeChecksumBytes +
+		executionpin.CommandBytes + 3*MaxIdentityBytes
+)
 
 var commandMagic = [8]byte{'V', 'D', 'B', 'C', 'M', 'D', 0, 0}
 
@@ -196,6 +202,41 @@ func (v CommandView) OpenRouteGate() (routegate.Command, error) {
 		return routegate.Command{}, ErrEnvelopeSemantic
 	}
 	return routegate.OpenCommand(v.routeGateBytes)
+}
+
+var routeGatePhysicalWitnessDomain = []byte(
+	"vibedb/replication/route-gate-physical-witness\x00",
+)
+
+// RouteGatePhysicalWitness returns the canonical physical shard authority
+// addressed by one route-gate command. It deliberately excludes request and
+// operation identity, so acquire and release of the same pin produce one
+// stable witness; those logical fields are bound by the nested gate command.
+func RouteGatePhysicalWitness(command CommandView) (Digest, bool) {
+	if command.Kind() != CommandRouteGate ||
+		command.AuthorityClass != CommandAuthorityData {
+		return Digest{}, false
+	}
+	var storage [2*MaxIdentityBytes + 256]byte
+	framed := append(storage[:0], routeGatePhysicalWitnessDomain...)
+	framed = append(framed, command.ClusterID[:]...)
+	framed = append(framed, command.ClusterIncarnation[:]...)
+	framed = binary.LittleEndian.AppendUint64(framed, command.TopologyRecoveryEpoch)
+	framed = binary.LittleEndian.AppendUint16(framed, uint16(len(command.Distribution)))
+	framed = append(framed, command.Distribution...)
+	framed = binary.LittleEndian.AppendUint16(framed, uint16(len(command.Shard)))
+	framed = append(framed, command.Shard...)
+	framed = append(framed, command.ShardIncarnation[:]...)
+	framed = append(framed, command.GroupID[:]...)
+	for _, value := range [...]uint64{
+		command.AllocationGeneration, command.ReplicaSetVersion,
+		command.ActivePolicyGeneration, command.ProtectionEpoch,
+		command.OwnershipEpoch, command.SchemaGeneration,
+		command.RoutingVersion, command.RouteGeneration,
+	} {
+		framed = binary.LittleEndian.AppendUint64(framed, value)
+	}
+	return Digest(sha256.Sum256(framed)), true
 }
 
 // TransactionIdentity reports the role and operation from the already

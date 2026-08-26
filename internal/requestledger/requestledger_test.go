@@ -95,6 +95,46 @@ func testReleasedRoutePin(t testing.TB, pin RoutePinRecord) RoutePinRecord {
 	return pin
 }
 
+func TestRouteGateIdentityAndBindingDerivationIsExactAndAllocationFree(t *testing.T) {
+	key := testDigest("route-gate-key")
+	request := testDigest("route-gate-request")
+	plan := testDigest("route-gate-plan")
+	logical := testDigest("route-gate-logical-binding")
+	physical := testDigest("route-gate-physical-witness")
+	pin := PinID{1, 2, 3, 4}
+	identity, err := DeriveRouteGateIdentity(key, request, plan, Digest{}, pin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := DeriveRouteGateBinding(identity, logical, physical, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedIdentity, _ := DeriveRouteGateIdentity(key, request, plan, Digest{}, PinID{2}, 0)
+	changedBinding, _ := DeriveRouteGateBinding(identity, logical, physical, 8)
+	if identity == (Digest{}) || binding == (Digest{}) || changedIdentity == identity ||
+		changedBinding == binding {
+		t.Fatal("route-gate derivation did not bind every semantic input")
+	}
+	if _, err = DeriveRouteGateIdentity(key, request, plan, testDigest("prior"), pin, 0); err == nil {
+		t.Fatal("wave zero accepted a prior continuation")
+	}
+	if _, err = DeriveRouteGateBinding(identity, logical, physical, 0); err == nil {
+		t.Fatal("route-gate binding accepted epoch zero")
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		gotIdentity, deriveErr := DeriveRouteGateIdentity(key, request, plan, Digest{}, pin, 0)
+		if deriveErr != nil {
+			panic(deriveErr)
+		}
+		if _, deriveErr = DeriveRouteGateBinding(gotIdentity, logical, physical, 7); deriveErr != nil {
+			panic(deriveErr)
+		}
+	}); allocs != 0 {
+		t.Fatalf("route-gate derivation allocations = %v", allocs)
+	}
+}
+
 func TestSequencedKeyHomeAndStorageKeys(t *testing.T) {
 	first := testKey(true)
 	second := first

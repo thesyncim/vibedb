@@ -1,57 +1,27 @@
 package replicatedstate
 
 import (
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const constructionRetryWindow = uint16(8)
 
-func constructionSystemBatchBytes(retryWindow uint16) int {
-	hot := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxAuthorityBindingBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
-	release := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(retryWindow)*(sha256.Size+3)
-	routeGateHot := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes +
-		len(routeGateHeadKey) + routegate.HeadBytes +
-		routeGatePinKeyBytes + routegate.StoredPinBytes +
-		routeGateResultKeyBytes + routeGateResultBytes
-	executionPin := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes +
-		executionPinRecordStorageKeyBytes + executionpin.RecordBytes +
-		executionPinActiveStorageKeyBytes + executionPinActiveValueBytes
-	return max(hot, release, routeGateHot, executionPin)
-}
-
 func constructionSystemOptions(options durable.Options) durable.Options {
+	required, ok := RequiredSystemCollectionLimits(constructionRetryWindow, false)
+	if !ok {
+		panic("invalid construction retry window")
+	}
 	options.OpaqueValues = true
-	options.MaxKeyBytes = executionPinActiveStorageKeyBytes
-	options.MaxDocumentBytes = max(
-		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
-		routeGateResultBytes, executionpin.RecordBytes,
-	)
-	options.MaxBatchDocuments = max(6, int(constructionRetryWindow)+2)
-	// Durable collection profiles reserve room for every key at the collection
-	// maximum, even though the state key itself is only one byte.
-	collectionBound := MaxStateEnvelopeBytes +
-		max(6, int(constructionRetryWindow)+2)*executionPinActiveStorageKeyBytes
-	options.MaxBatchBytes = max(
-		constructionSystemBatchBytes(constructionRetryWindow), collectionBound,
-	)
+	options.MaxKeyBytes = required.MaxKeyBytes
+	options.MaxDocumentBytes = required.MaxDocumentBytes
+	options.MaxBatchDocuments = required.MaxDistinctMutations
+	options.MaxBatchBytes = required.MaxBatchBytes
 	return options
 }
 
@@ -202,7 +172,11 @@ func TestOpenTransactionByteProofCapsUserBatchAtCommandEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
-	maxSystem := constructionSystemBatchBytes(constructionRetryWindow)
+	systemLimits, limitsOK := RequiredSystemCollectionLimits(constructionRetryWindow, false)
+	if !limitsOK {
+		t.Fatal("invalid construction retry window")
+	}
+	maxSystem := systemLimits.MaxBatchBytes
 	required, ok := checkedTxnBytes(replication.MaxCommandBytes, maxSystem)
 	if !ok {
 		t.Fatal("test byte proof overflowed")

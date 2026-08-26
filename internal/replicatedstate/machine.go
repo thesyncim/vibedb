@@ -450,54 +450,19 @@ func prepareOpenInputs(
 			"%w: checkpoint-group capture startup", ErrInvalidOptions,
 		)
 	}
-	maxSystemDocument := max(
-		MaxStateEnvelopeBytes, MaxSessionRecordBytes, MaxSessionSlotRecordBytes,
-		MaxAuthorityBindingBytes, routegate.HeadBytes, routegate.StoredPinBytes,
-		routeGateResultBytes, executionpin.RecordBytes,
+	requiredSystem, limitsOK := RequiredSystemCollectionLimits(
+		options.RetryWindow, options.RequestLedgerRange.enabled(),
 	)
-	hotSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxAuthorityBindingBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes
-	releaseSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + int(options.RetryWindow)*(sha256.Size+3)
-	executionPinSystemBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes +
-		executionPinRecordStorageKeyBytes + executionpin.RecordBytes +
-		executionPinActiveStorageKeyBytes + executionPinActiveValueBytes
-	maxSystemBatchBytes := max(hotSystemBatchBytes, releaseSystemBatchBytes,
-		executionPinSystemBatchBytes)
-	maxSystemDocuments := max(5, int(options.RetryWindow)+2)
-	if options.RequestLedgerRange.enabled() {
-		// One bounded ledger command can replace the head and publish up to 32
-		// exact 512 KiB plan pages. The hidden collection must admit that whole
-		// atomic transition; accepting a narrower live handle would make the
-		// apply contract depend on replica-local storage limits.
-		maxSystemDocument = max(maxSystemDocument, requestledger.MaxCommandBytes)
-		maxSystemDocuments = max(maxSystemDocuments, MaxDistinctMutations+1)
-		maxSystemBatchBytes = max(maxSystemBatchBytes,
-			requestledger.MaxCommandBytes+MaxStateEnvelopeBytes+
-				MaxDistinctMutations*requestledger.PageStorageKeyBytes)
-	}
-	routeGateHotBatchBytes := len(stateKey) + MaxStateEnvelopeBytes +
-		sha256.Size + 1 + MaxSessionRecordBytes +
-		sha256.Size + 3 + MaxSessionSlotRecordBytes +
-		len(routeGateHeadKey) + routegate.HeadBytes +
-		routeGatePinKeyBytes + routegate.StoredPinBytes +
-		routeGateResultKeyBytes + routeGateResultBytes
-	maxSystemBatchBytes = max(maxSystemBatchBytes, routeGateHotBatchBytes)
-	maxSystemDocuments = max(maxSystemDocuments, 6)
-	if system.Limits.MaxKeyBytes < executionPinActiveStorageKeyBytes ||
-		system.Limits.MaxDocumentBytes < maxSystemDocument ||
-		system.Limits.MaxDistinctMutations < maxSystemDocuments ||
-		system.Limits.MaxBatchBytes < maxSystemBatchBytes {
+	if !limitsOK || system.Limits.MaxKeyBytes < requiredSystem.MaxKeyBytes ||
+		system.Limits.MaxDocumentBytes < requiredSystem.MaxDocumentBytes ||
+		system.Limits.MaxDistinctMutations < requiredSystem.MaxDistinctMutations ||
+		system.Limits.MaxBatchBytes < requiredSystem.MaxBatchBytes {
 		return openInputs{}, fmt.Errorf(
 			"%w: system collection cannot hold bounded records", ErrInvalidCollection,
 		)
 	}
 	maxUserBatchBytes := min(user.Limits.MaxBatchBytes, replication.MaxCommandBytes)
-	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, maxSystemBatchBytes)
+	requiredTxnBytes, ok := checkedTxnBytes(maxUserBatchBytes, requiredSystem.MaxBatchBytes)
 	if !ok {
 		return openInputs{}, fmt.Errorf(
 			"%w: transaction byte proof overflows", ErrInvalidOptions,
@@ -505,7 +470,7 @@ func prepareOpenInputs(
 	}
 	if options.TxnLimits.MaxDocuments < max(
 		user.Limits.MaxDistinctMutations+3,
-		maxSystemDocuments,
+		requiredSystem.MaxDistinctMutations,
 	) ||
 		options.TxnLimits.MaxBytes < requiredTxnBytes {
 		return openInputs{}, fmt.Errorf(

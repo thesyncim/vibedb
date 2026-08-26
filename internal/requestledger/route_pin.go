@@ -8,13 +8,20 @@ import (
 const (
 	MaxRouteGatePinCommandBytes    = 1113
 	MaxRouteGatePinCompletionBytes = 1185
+	// These frozen cross-package maxima include the outer replication envelope,
+	// three 255-byte identities, and the fixed execution-pin body/proof. A
+	// replicatedstate cross-package test prevents either side drifting.
+	MaxExecutionPinCommandBytes    = 1449
+	MaxExecutionPinCompletionBytes = 1933
 	routePinHeaderBytes            = 416
 	MaxRoutePinRecordBytes         = routePinHeaderBytes + MaxRouteGatePinCommandBytes + MaxRouteGatePinCompletionBytes + checksumBytes
 )
 
 var (
-	routePinMagic        = [4]byte{'V', 'R', 'L', 'R'}
-	routePinDigestDomain = []byte("vibedb/request-ledger/route-pin\x00")
+	routePinMagic           = [4]byte{'V', 'R', 'L', 'R'}
+	routePinDigestDomain    = []byte("vibedb/request-ledger/route-pin\x00")
+	routeGateIdentityDomain = []byte("vibedb/request-ledger/route-gate-identity\x00")
+	routeGateBindingDomain  = []byte("vibedb/request-ledger/route-gate-binding\x00")
 )
 
 type RoutePinPhase uint8
@@ -35,6 +42,51 @@ type RoutePinRecord struct {
 	Revision, WaveOrdinal                                                                    uint64
 	Phase                                                                                    RoutePinPhase
 	Command, Completion                                                                      []byte
+}
+
+// DeriveRouteGateIdentity expands the compact per-wave ledger label into the
+// full route-gate identity. The identity is placement-independent: an exact
+// retry of one wave retains it, while another request, plan, continuation, pin,
+// or wave cannot alias it.
+func DeriveRouteGateIdentity(
+	key, request, plan, priorContinuation Digest,
+	pin PinID,
+	wave uint64,
+) (Digest, error) {
+	if !nonzeroDigest(key) || !nonzeroDigest(request) || !nonzeroDigest(plan) ||
+		pin == (PinID{}) || (wave == 0) != !nonzeroDigest(priorContinuation) {
+		return Digest{}, ErrInvalidState
+	}
+	const domain = "vibedb/request-ledger/route-gate-identity\x00"
+	var framed [len(domain) + 4*sha256.Size + len(PinID{}) + 8]byte
+	at := copy(framed[:], routeGateIdentityDomain)
+	for _, digest := range [...]Digest{key, request, plan, priorContinuation} {
+		at += copy(framed[at:], digest[:])
+	}
+	at += copy(framed[at:], pin[:])
+	binary.LittleEndian.PutUint64(framed[at:at+8], wave)
+	return Digest(sha256.Sum256(framed[:])), nil
+}
+
+// DeriveRouteGateBinding binds the logical execution contract to the exact
+// physical forwarding witness and admission epoch. Binding includes Identity
+// so a valid physical witness cannot be transplanted to another request wave.
+func DeriveRouteGateBinding(
+	identity, logicalBinding, physicalWitness Digest,
+	epoch uint64,
+) (Digest, error) {
+	if !nonzeroDigest(identity) || !nonzeroDigest(logicalBinding) ||
+		!nonzeroDigest(physicalWitness) || epoch == 0 {
+		return Digest{}, ErrInvalidState
+	}
+	const domain = "vibedb/request-ledger/route-gate-binding\x00"
+	var framed [len(domain) + 3*sha256.Size + 8]byte
+	at := copy(framed[:], routeGateBindingDomain)
+	for _, digest := range [...]Digest{identity, logicalBinding, physicalWitness} {
+		at += copy(framed[at:], digest[:])
+	}
+	binary.LittleEndian.PutUint64(framed[at:at+8], epoch)
+	return Digest(sha256.Sum256(framed[:])), nil
 }
 
 func NewRoutePinAcquiring(head HeadRecord, pinID PinID, binding, physical Digest, command []byte) (RoutePinRecord, error) {

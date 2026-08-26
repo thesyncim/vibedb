@@ -7,7 +7,7 @@ import (
 
 const (
 	schemaPinReleaseHeaderBytes    = 448
-	MaxSchemaPinReleaseRecordBytes = schemaPinReleaseHeaderBytes + MaxRouteGatePinCommandBytes + MaxRouteGatePinCompletionBytes + checksumBytes
+	MaxSchemaPinReleaseRecordBytes = schemaPinReleaseHeaderBytes + MaxExecutionPinCommandBytes + MaxExecutionPinCompletionBytes + checksumBytes
 )
 
 var (
@@ -26,7 +26,8 @@ const (
 
 // SchemaPinReleaseRecord is a write-ahead release intent and its exact
 // authenticated settled completion. The state-machine integration verifies
-// the routegate command/completion semantics before calling the Released step.
+// the execution-pin command/completion semantics before calling the Released
+// step.
 type SchemaPinReleaseRecord struct {
 	KeyDigest                    Digest
 	RequestDigest                Digest
@@ -56,7 +57,7 @@ func NewSchemaPinRelease(
 	if err := validateHead(head); err != nil || errOrNil(validatePreparedTerminal(prepared)) != nil ||
 		head.Phase != PhasePrepared || nonzeroDigest(head.SchemaPinReleaseCertificateDigest) ||
 		prepared.PreparedDigest != head.PreparedTerminalDigest || prepared.KeyDigest != head.KeyDigest ||
-		!nextRevision(head.Revision, revision) || len(command) == 0 || len(command) > MaxRouteGatePinCommandBytes {
+		!nextRevision(head.Revision, revision) || len(command) == 0 || len(command) > MaxExecutionPinCommandBytes {
 		return SchemaPinReleaseRecord{}, ErrInvalidState
 	}
 	record := SchemaPinReleaseRecord{
@@ -79,7 +80,7 @@ func RecordVerifiedSchemaPinReleased(
 ) (SchemaPinReleaseRecord, error) {
 	if err := validateSchemaPinRelease(record); err != nil || record.Phase != SchemaPinReleasing ||
 		!nextRevision(record.Revision, revision) || len(completion) == 0 ||
-		len(completion) > MaxRouteGatePinCompletionBytes {
+		len(completion) > MaxExecutionPinCompletionBytes {
 		return SchemaPinReleaseRecord{}, ErrInvalidState
 	}
 	record.PriorRecordDigest = record.RecordDigest
@@ -159,13 +160,13 @@ func validateSchemaPinRelease(record SchemaPinReleaseRecord) error {
 		!nonzeroDigest(record.PreparedTerminalDigest) || record.PinID == (PinID{}) ||
 		!nonzeroDigest(record.PinDigest) || !nonzeroDigest(record.RouteSchemaCertificateDigest) ||
 		record.CatalogGeneration == 0 || record.Revision == 0 || len(record.Command) == 0 ||
-		len(record.Command) > MaxRouteGatePinCommandBytes ||
+		len(record.Command) > MaxExecutionPinCommandBytes ||
 		record.CommandDigest != digestBytes([]byte("vibedb/request-ledger/schema-pin-command\x00"), record.Command) ||
 		record.Phase < SchemaPinReleasing || record.Phase > SchemaPinReleased ||
 		(record.Phase == SchemaPinReleasing && (len(record.Completion) != 0 || nonzeroDigest(record.CompletionDigest) ||
 			nonzeroDigest(record.PriorRecordDigest) || nonzeroDigest(record.CertificateDigest))) ||
 		(record.Phase == SchemaPinReleased && (len(record.Completion) == 0 ||
-			len(record.Completion) > MaxRouteGatePinCompletionBytes ||
+			len(record.Completion) > MaxExecutionPinCompletionBytes ||
 			record.CompletionDigest != digestBytes([]byte("vibedb/request-ledger/schema-pin-completion\x00"), record.Completion) ||
 			!nonzeroDigest(record.PriorRecordDigest) || record.CertificateDigest != schemaPinCertificateDigest(record))) ||
 		record.RecordDigest != schemaPinReleaseDigest(record) {

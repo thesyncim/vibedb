@@ -364,7 +364,7 @@ func planRequestLedgerRoutePin(
 		if rows.head.OutstandingRoutePinDigest != (requestledger.Digest{}) ||
 			rows.routePinFound && (rows.routePin.Phase != requestledger.RoutePinReleased ||
 				rows.routePin.WaveOrdinal == ^uint64(0) || rows.routePin.WaveOrdinal+1 != rows.head.NextStepOrdinal) ||
-			!requestLedgerRouteCommandEvidenceAvailable(desired) {
+			!requestLedgerRouteCommandEvidenceAvailable(requestledger.RoutePinRecord{}, desired) {
 			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 		}
 		next, transitionErr = requestledger.AdvanceHeadRoutePin(
@@ -381,7 +381,7 @@ func planRequestLedgerRoutePin(
 	case requestledger.OperationBeginRoutePinRelease:
 		if !rows.routePinFound || rows.routePin.Phase != requestledger.RoutePinAcquired ||
 			rows.head.OutstandingRoutePinDigest != rows.routePin.AcquiredEvidenceDigest ||
-			!requestLedgerRouteCommandEvidenceAvailable(desired) {
+			!requestLedgerRouteCommandEvidenceAvailable(rows.routePin, desired) {
 			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 		}
 		next, transitionErr = requestledger.AdvanceHeadRoutePin(
@@ -419,17 +419,6 @@ func planRequestLedgerRoutePin(
 	}
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
 	return replaceRequestLedgerHead(plan, rows, next)
-}
-
-func requestLedgerRouteCommandEvidenceAvailable(requestledger.RoutePinRecord) bool {
-	return false
-}
-
-func requestLedgerRouteCompletionEvidenceAvailable(
-	requestledger.RoutePinRecord,
-	requestledger.RoutePinRecord,
-) bool {
-	return false
 }
 
 func (m *Machine) planRequestLedgerCreate(
@@ -972,7 +961,8 @@ func planRequestLedgerBeginSchemaPinRelease(
 	expected, err := requestledger.NewSchemaPinRelease(
 		rows.head, rows.prepared, command.Revision, release.Command,
 	)
-	if err != nil || expected.RecordDigest != release.RecordDigest {
+	if err != nil || expected.RecordDigest != release.RecordDigest ||
+		!requestLedgerSchemaReleaseCommandAvailable(release) {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
 	next, err := requestledger.InstallSchemaPinRelease(rows.head, rows.prepared, release)
@@ -1044,12 +1034,6 @@ func planRequestLedgerRecordSchemaPinReleased(
 	plan.delta.residentBytes += int64(len(command.Payload) - len(rows.schemaPinRaw))
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
 	return replaceRequestLedgerHead(plan, rows, next)
-}
-
-func requestLedgerSchemaReleaseEvidenceAvailable(requestledger.SchemaPinReleaseRecord) bool {
-	// Fail closed until internal/executionpin lands in the shared integration
-	// branch. This is deliberately one narrow hook, not a generic digest check.
-	return false
 }
 
 func planRequestLedgerAck(plan requestLedgerCommandPlan, command requestledger.CommandView, rows requestLedgerRows, snapshot pointSnapshot) (requestLedgerCommandPlan, error) {

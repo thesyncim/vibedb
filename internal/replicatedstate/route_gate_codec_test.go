@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 )
 
@@ -95,6 +96,10 @@ func TestMaxRouteGateCompletionBytesMatchesActualCodec(t *testing.T) {
 	if err != nil || len(encoded) != MaxRouteGateCompletionEnvelopeBytes ||
 		MaxRouteGateCompletionEnvelopeBytes != 1185 ||
 		MaxCompletionEnvelopeBytes != MaxExecutionPinCompletionEnvelopeBytes ||
+		requestledger.MaxExecutionPinCommandBytes != replication.MaxExecutionPinCommandBytes ||
+		requestledger.MaxExecutionPinCompletionBytes != MaxExecutionPinCompletionEnvelopeBytes ||
+		replication.MaxExecutionPinCommandBytes != 1449 ||
+		MaxExecutionPinCompletionEnvelopeBytes != 1933 ||
 		replication.MaxRouteGateCommandBytes+MaxRouteGateCompletionEnvelopeBytes != 2298 {
 		t.Fatalf("max route-gate completion = %d/%d, %v",
 			len(encoded), MaxRouteGateCompletionEnvelopeBytes, err)
