@@ -949,6 +949,29 @@ func (v *GlobalTabletCatalogNodeView) insertChild(
 		globalTabletCatalogSlicesOverlap(dst[:len(v.image)], v.image) {
 		return nil, fmt.Errorf("%w: catalog insert generation or destination", ErrInvalidWrite)
 	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeGlobalTabletCatalogNode(
+		dst,
+		GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: v.header.LogicalID, PageID: v.pageID,
+			Level: v.level, RootChildLevel: v.childLevel,
+			Bounds: bounds, Kind: PagePrimaryCatalog,
+			ChildKind: v.childKind, ChildLength: v.childLength,
+		},
+		entries,
+	)
+}
+
+func (v *GlobalTabletCatalogNodeView) entriesWithInsertedChild(
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+) ([]GlobalTabletCatalogNodeEntry, error) {
 	for at := range rewrites {
 		for prior := 0; prior < at; prior++ {
 			if rewrites[prior].ID == rewrites[at].ID {
@@ -956,7 +979,6 @@ func (v *GlobalTabletCatalogNodeView) insertChild(
 			}
 		}
 	}
-
 	type floorSpan struct{ start, end int }
 	spans := make([]floorSpan, v.Count())
 	arena := make([]byte, 0, len(v.floors.image)+len(floor))
@@ -984,14 +1006,11 @@ func (v *GlobalTabletCatalogNodeView) insertChild(
 			return nil, fmt.Errorf("%w: duplicate catalog insert floor", ErrInvalidWrite)
 		}
 	}
-
 	entries := make([]GlobalTabletCatalogNodeEntry, 0, v.Count()+1)
 	matched := make([]bool, len(rewrites))
 	for ordinal := 0; ordinal <= v.Count(); ordinal++ {
 		if ordinal == insertAt {
-			entries = append(entries, GlobalTabletCatalogNodeEntry{
-				Floor: floor, ID: id, Ref: ref,
-			})
+			entries = append(entries, GlobalTabletCatalogNodeEntry{Floor: floor, ID: id, Ref: ref})
 		}
 		if ordinal == v.Count() {
 			break
@@ -1007,32 +1026,18 @@ func (v *GlobalTabletCatalogNodeView) insertChild(
 		}
 		oldRef := route.Ref
 		for at, rewrite := range rewrites {
-			if rewrite.ID != route.ID {
-				continue
+			if rewrite.ID == route.ID {
+				matched[at], oldRef = true, rewrite.Ref
 			}
-			matched[at] = true
-			oldRef = rewrite.Ref
 		}
-		entries = append(entries, GlobalTabletCatalogNodeEntry{
-			Floor: oldFloor, ID: route.ID, Ref: oldRef,
-		})
+		entries = append(entries, GlobalTabletCatalogNodeEntry{Floor: oldFloor, ID: route.ID, Ref: oldRef})
 	}
 	for _, ok := range matched {
 		if !ok {
 			return nil, fmt.Errorf("%w: missing catalog insert rewrite", ErrInvalidWrite)
 		}
 	}
-	return EncodeGlobalTabletCatalogNode(
-		dst,
-		GlobalTabletCatalogNodeHeader{
-			StoreID: v.bounds.StoreID, Generation: generation,
-			LogicalID: v.header.LogicalID, PageID: v.pageID,
-			Level: v.level, RootChildLevel: v.childLevel,
-			Bounds: bounds, Kind: PagePrimaryCatalog,
-			ChildKind: v.childKind, ChildLength: v.childLength,
-		},
-		entries,
-	)
+	return entries, nil
 }
 
 // PromoteRootInsertChildReplacing converts a full root->leaf catalog into a

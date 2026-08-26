@@ -12,15 +12,41 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
 
 type gatewayHotShardRuntime struct {
-	mu         sync.Mutex
-	holder     *gateway.CatalogHolder
-	authority  *gateway.ReplicatedCatalogAuthority
-	config     hotshard.StaticCapacityConfig
-	collector  atomic.Pointer[hotshard.Collector]
-	generation atomic.Uint64
+	mu              sync.Mutex
+	holder          *gateway.CatalogHolder
+	authority       gatewayHotShardPressureAuthority
+	config          hotshard.StaticCapacityConfig
+	controller      *hotshard.Controller
+	operations      gatewayHotShardOperationAuthorities
+	operationsBound bool
+	admitted        uint64
+	collector       atomic.Pointer[hotshard.Collector]
+	generation      atomic.Uint64
+}
+
+type gatewayHotShardPressureAuthority interface {
+	hotshard.ReplicatedDirectory
+	hotshard.PressurePublisher
+}
+
+// gatewayHotShardOperationAuthorities are deliberately colder than request
+// routing. A nil member is absence of exact topology authority, never a cue to
+// synthesize an allocation, member, WAL, or store identity.
+type gatewayHotShardOperationAuthorities struct {
+	splits  hotshard.SplitPlanFactory
+	journal splitcontroller.ReplicatedOperationJournal
+	moves   hotshard.MovePlanFactory
+	moveRun hotshard.MoveSubmitter
+}
+
+type refusingGatewayHotShardSink struct{}
+
+func (refusingGatewayHotShardSink) SubmitHotShardAdmission(context.Context, hotshard.Admission) error {
+	return hotshard.ErrInvalidPressureCut
 }
 
 func loadGatewayHotShardCapacity(path string) (hotshard.StaticCapacityConfig, error) {
@@ -59,6 +85,29 @@ func newGatewayHotShardRuntime(
 	return runtime, nil
 }
 
+// InstallOperationAuthorities binds the already-shipped operation journals.
+// It is a startup-only seam: replacing authority while a pressure cut is being
+// retried could change an outcome-unknown admission into different bytes.
+func (runtime *gatewayHotShardRuntime) InstallOperationAuthorities(
+	authorities gatewayHotShardOperationAuthorities,
+) bool {
+	splits := authorities.splits != nil || authorities.journal != nil
+	moves := authorities.moves != nil || authorities.moveRun != nil
+	if runtime == nil || !splits && !moves ||
+		splits && (authorities.splits == nil || authorities.journal == nil) ||
+		moves && (authorities.moves == nil || authorities.moveRun == nil) {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.operationsBound {
+		return false
+	}
+	runtime.operations = authorities
+	runtime.operationsBound = true
+	return true
+}
+
 func (runtime *gatewayHotShardRuntime) ObservePressure(observation gateway.PressureObservation) {
 	if runtime == nil {
 		return
@@ -86,13 +135,61 @@ func (runtime *gatewayHotShardRuntime) PublishOnce(ctx context.Context) error {
 			return err
 		}
 	}
+	if runtime.admitted == snapshot.Generation() {
+		return nil
+	}
 	collector := runtime.collector.Load()
 	if collector == nil {
 		return hotshard.ErrInvalidPressureCut
 	}
+	// Settle the current replicated cut before publishing a successor. This is
+	// what makes an outcome-unknown operation submission retry byte-identically
+	// instead of skipping ahead to a later pressure revision.
+	pass, err := runtime.runPressurePass(ctx, snapshot)
+	if err != nil &&
+		!errors.Is(err, gateway.ErrReplicatedPressureMissing) {
+		return err
+	}
+	if err == nil && !pass.Admission.Empty() {
+		runtime.admitted = snapshot.Generation()
+		return nil
+	}
 	nodes := runtime.config.NodeCapacities(snapshot.Generation())
-	_, err := collector.Publish(ctx, runtime.authority, nodes)
+	if _, err = collector.Publish(ctx, runtime.authority, nodes); err != nil {
+		return err
+	}
+	pass, err = runtime.runPressurePass(ctx, snapshot)
+	if err == nil && !pass.Admission.Empty() {
+		runtime.admitted = snapshot.Generation()
+	}
 	return err
+}
+
+func (runtime *gatewayHotShardRuntime) runPressurePass(
+	ctx context.Context, snapshot *gateway.Snapshot,
+) (hotshard.Pass, error) {
+	if runtime.controller == nil {
+		return hotshard.Pass{}, hotshard.ErrInvalidPressureCut
+	}
+	record, err := runtime.authority.ReadPressureRecord(ctx)
+	if err != nil {
+		return hotshard.Pass{}, err
+	}
+	if record.CatalogGeneration < snapshot.Generation() {
+		return hotshard.Pass{}, nil
+	}
+	if record.CatalogGeneration > snapshot.Generation() {
+		return hotshard.Pass{}, hotshard.ErrInvalidPressureCut
+	}
+	var sink hotshard.Sink = refusingGatewayHotShardSink{}
+	operations := runtime.operations
+	if runtime.operationsBound {
+		sink = hotshard.OperationSink{Catalog: snapshot, Splits: operations.splits,
+			Journal: operations.journal, Moves: operations.moves, MoveRun: operations.moveRun}
+	}
+	return hotshard.RunReplicatedPass(
+		ctx, snapshot, runtime.authority, runtime.controller, sink,
+	)
 }
 
 func (runtime *gatewayHotShardRuntime) rebuild(ctx context.Context) error {
@@ -121,7 +218,13 @@ func (runtime *gatewayHotShardRuntime) rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	controller, err := hotshard.New(hotshard.DefaultPolicy())
+	if err != nil {
+		return err
+	}
 	runtime.collector.Store(collector)
+	runtime.controller = controller
+	runtime.admitted = 0
 	runtime.generation.Store(snapshot.Generation())
 	return nil
 }

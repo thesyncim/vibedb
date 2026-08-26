@@ -20,6 +20,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -391,11 +392,6 @@ func runServe(args []string) int {
 
 	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
 	var hotShardDone <-chan struct{}
-	if hotShardRuntime != nil {
-		hotShardDone = runGatewayHotShardPublisher(
-			ctx, hotShardRuntime, *hotShardInterval, logf,
-		)
-	}
 	var replicaControlDone <-chan error
 	var replicaControllersDone <-chan struct{}
 	var splitControllerDone <-chan struct{}
@@ -439,6 +435,14 @@ func runServe(args []string) int {
 		moveController, controllerErr := newGatewayReplicaMoveController(
 			catalogAuthority, replicated, controls,
 		)
+		var hotShardBindErr error
+		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
+			!hotShardRuntime.InstallOperationAuthorities(gatewayHotShardOperationAuthorities{
+				moves:   gatewayHotReplicaMoveFactory{observations: controls.HealthObservations},
+				moveRun: moveController,
+			})) {
+			hotShardBindErr = hotshard.ErrInvalidPressureCut
+		}
 		healthController, healthErr := newGatewayReplicaHealthRuntime(
 			catalogAuthority,
 			rebalance.ReplicatedFailureAuthority{Source: catalogAuthority},
@@ -469,7 +473,7 @@ func runServe(args []string) int {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, controllerErr, healthErr, revisionErr,
+		if joined := errors.Join(openErr, drainErr, splitErr, controlsErr, controllerErr, hotShardBindErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
 			if splitRuntime != nil {
 				_ = splitRuntime.Close()
@@ -507,6 +511,11 @@ func runServe(args []string) int {
 			controlDone <- serveErr
 			stop()
 		}()
+	}
+	if hotShardRuntime != nil {
+		hotShardDone = runGatewayHotShardPublisher(
+			ctx, hotShardRuntime, *hotShardInterval, logf,
+		)
 	}
 	if splitRuntime != nil {
 		defer splitRuntime.Close()
