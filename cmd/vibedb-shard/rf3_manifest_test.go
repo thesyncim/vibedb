@@ -91,6 +91,33 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 		manifest.Members[2].MemberID != 3 {
 		t.Fatalf("members = %+v", manifest.Members)
 	}
+	if manifest.EnrolledTarget != nil {
+		t.Fatalf("unexpected enrolled target = %+v", manifest.EnrolledTarget)
+	}
+}
+
+func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T) {
+	document := enrolledRF3Manifest()
+	manifest, err := parseRF3Manifest([]byte(document))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Members) != rf3ManifestMembers ||
+		manifest.Members[0].MemberID != 1 || manifest.Members[2].MemberID != 3 {
+		t.Fatalf("serving members = %+v", manifest.Members)
+	}
+	target := manifest.EnrolledTarget
+	if target == nil || target.MemberID != 4 ||
+		target.NodeID != (rafttransport.NodeID{
+			0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+			0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+		}) ||
+		target.PeerAddress != "member-4.internal:7400" ||
+		target.NativeAddress != "member-4.internal:7500" ||
+		target.SnapshotAddress != "member-4.internal:7600" ||
+		target.ControlAddress != "member-4.internal:7700" {
+		t.Fatalf("enrolled target = %+v", target)
+	}
 }
 
 func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
@@ -145,6 +172,57 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseRF3ManifestRejectsInvalidEnrolledTarget(t *testing.T) {
+	canonical := enrolledRF3Manifest()
+	replace := func(old, new string) string {
+		t.Helper()
+		if !strings.Contains(canonical, old) {
+			t.Fatalf("fixture does not contain %q", old)
+		}
+		return strings.Replace(canonical, old, new, 1)
+	}
+	tests := []struct {
+		name string
+		data string
+	}{
+		{"target-not-object", replace(`"enrolled_target": {`, `"enrolled_target": 1, "discarded": {`)},
+		{"reordered-fields", replace(
+			`"member_id": 4,`+"\n    "+`"node_id": "3132333435363738393a3b3c3d3e3f40"`,
+			`"node_id": "3132333435363738393a3b3c3d3e3f40",`+"\n    "+`"member_id": 4`,
+		)},
+		{"unknown-field", replace(`"control_address":`, `"unknown": 1, "control_address":`)},
+		{"duplicate-field", replace(`"control_address":`, `"snapshot_address": "member-4.internal:7600", "control_address":`)},
+		{"zero-member", replace(`"member_id": 4`, `"member_id": 0`)},
+		{"serving-member", replace(`"member_id": 4`, `"member_id": 2`)},
+		{"serving-node", replace(`3132333435363738393a3b3c3d3e3f40`, `1112131415161718191a1b1c1d1e1f20`)},
+		{"serving-peer-address", replace(`member-4.internal:7400`, `member-2.internal:7400`)},
+		{"native-repeats-serving-peer", replace(`member-4.internal:7500`, `member-2.internal:7400`)},
+		{"repeated-target-address", replace(`member-4.internal:7700`, `member-4.internal:7600`)},
+		{"empty-address", replace(`member-4.internal:7700`, ``)},
+		{"second-target", strings.TrimSuffix(canonical, "\n}") + `, "enrolled_target": {}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseRF3Manifest([]byte(tc.data)); !errors.Is(err, errInvalidRF3Manifest) {
+				t.Fatalf("parse error = %v, want errInvalidRF3Manifest", err)
+			}
+		})
+	}
+}
+
+func enrolledRF3Manifest() string {
+	return strings.TrimSuffix(canonicalRF3Manifest, "\n}") + `,
+  "enrolled_target": {
+    "member_id": 4,
+    "node_id": "3132333435363738393a3b3c3d3e3f40",
+    "peer_address": "member-4.internal:7400",
+    "native_address": "member-4.internal:7500",
+    "snapshot_address": "member-4.internal:7600",
+    "control_address": "member-4.internal:7700"
+  }
+}`
 }
 
 func TestLoadRF3ManifestEnforcesFileBound(t *testing.T) {

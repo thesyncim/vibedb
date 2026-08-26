@@ -29,6 +29,7 @@ type rf3Manifest struct {
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
 	Members             [rf3ManifestMembers]rf3ManifestMember
+	EnrolledTarget      *rf3ManifestEnrolledTarget
 }
 
 type rf3ManifestWAL struct {
@@ -60,6 +61,19 @@ type rf3ManifestMember struct {
 	MemberID    uint64
 	NodeID      rafttransport.NodeID
 	PeerAddress string
+}
+
+// rf3ManifestEnrolledTarget is the one replacement identity provisioning has
+// enrolled beside the stable serving RF3. Keeping it separate from Members is
+// intentional: merely retaining this descriptor must not make the target a
+// voter, a transport member, or a data-serving endpoint.
+type rf3ManifestEnrolledTarget struct {
+	MemberID        uint64
+	NodeID          rafttransport.NodeID
+	PeerAddress     string
+	NativeAddress   string
+	SnapshotAddress string
+	ControlAddress  string
 }
 
 // loadRF3Manifest reads one exact, bounded startup manifest. The grammar is
@@ -153,6 +167,17 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	}
 	if manifest.Members, err = parseRF3ManifestMembers(node); err != nil {
 		return rf3Manifest{}, err
+	}
+	key, node, present := fields.Next()
+	if present {
+		if !bytes.Equal(key.Raw().Bytes(), []byte(`"enrolled_target"`)) {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		target, err := parseRF3ManifestEnrolledTarget(node, manifest.Members)
+		if err != nil {
+			return rf3Manifest{}, err
+		}
+		manifest.EnrolledTarget = &target
 	}
 	if _, _, extra := fields.Next(); extra {
 		return rf3Manifest{}, errInvalidRF3Manifest
@@ -358,6 +383,71 @@ func parseRF3ManifestMember(node vibejson.Node) (rf3ManifestMember, error) {
 	}
 	if _, _, extra := fields.Next(); extra {
 		return rf3ManifestMember{}, errInvalidRF3Manifest
+	}
+	return result, nil
+}
+
+func parseRF3ManifestEnrolledTarget(
+	node vibejson.Node,
+	members [rf3ManifestMembers]rf3ManifestMember,
+) (rf3ManifestEnrolledTarget, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestEnrolledTarget{}, errInvalidRF3Manifest
+	}
+	var result rf3ManifestEnrolledTarget
+	value, err := nextRF3Field(&fields, `"member_id"`)
+	if err != nil {
+		return result, err
+	}
+	if result.MemberID, err = rf3ManifestPositiveUint64(value); err != nil {
+		return rf3ManifestEnrolledTarget{}, err
+	}
+	value, err = nextRF3Field(&fields, `"node_id"`)
+	if err != nil {
+		return rf3ManifestEnrolledTarget{}, err
+	}
+	if result.NodeID, err = rf3ManifestNodeID(value); err != nil {
+		return rf3ManifestEnrolledTarget{}, err
+	}
+	values := []*string{
+		&result.PeerAddress, &result.NativeAddress,
+		&result.SnapshotAddress, &result.ControlAddress,
+	}
+	names := [...]string{
+		`"peer_address"`, `"native_address"`, `"snapshot_address"`, `"control_address"`,
+	}
+	for index := range names {
+		value, err = nextRF3Field(&fields, names[index])
+		if err != nil {
+			return rf3ManifestEnrolledTarget{}, err
+		}
+		if *values[index], err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+			return rf3ManifestEnrolledTarget{}, err
+		}
+	}
+	if _, _, extra := fields.Next(); extra {
+		return rf3ManifestEnrolledTarget{}, errInvalidRF3Manifest
+	}
+	for _, member := range members {
+		if result.MemberID == member.MemberID || result.NodeID == member.NodeID {
+			return rf3ManifestEnrolledTarget{}, errInvalidRF3Manifest
+		}
+	}
+	addresses := [...]string{
+		result.PeerAddress, result.NativeAddress, result.SnapshotAddress, result.ControlAddress,
+	}
+	for index := range addresses {
+		for _, member := range members {
+			if addresses[index] == member.PeerAddress {
+				return rf3ManifestEnrolledTarget{}, errInvalidRF3Manifest
+			}
+		}
+		for prior := 0; prior < index; prior++ {
+			if addresses[index] == addresses[prior] {
+				return rf3ManifestEnrolledTarget{}, errInvalidRF3Manifest
+			}
+		}
 	}
 	return result, nil
 }

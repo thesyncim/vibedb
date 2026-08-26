@@ -394,6 +394,16 @@ func validateRF3Addresses(manifest rf3Manifest) error {
 			return err
 		}
 	}
+	if target := manifest.EnrolledTarget; target != nil {
+		for _, address := range [...]string{
+			target.PeerAddress, target.NativeAddress,
+			target.SnapshotAddress, target.ControlAddress,
+		} {
+			if err := validateRF3Address(address, false); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
