@@ -126,6 +126,11 @@ func ExecuteReplicatedMoveStep(
 	if err != nil {
 		return Action{}, err
 	}
+	if (action.Kind == ActionRefreshCatalogFence) != (action.ReplicaSetVersion != 0) ||
+		action.ReplicaSetVersion != 0 &&
+			action.ReplicaSetVersion != cut.Publication.ReplicaSetVersion {
+		return Action{}, ErrReplicatedMove
+	}
 	if record.State == gateway.ReplicatedOperationComplete {
 		if action.Kind != ActionComplete || !replicaMoveRecordMatches(
 			record, operation, plan, cut, action, replicaMoveCursorApplied,

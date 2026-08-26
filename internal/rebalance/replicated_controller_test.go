@@ -317,7 +317,7 @@ func TestReplicatedMoveExecutionProofBindsEveryCommandFence(t *testing.T) {
 	assertChanged("snapshot base", bound, cut, action)
 }
 
-func TestReplicatedMoveControllerPublishesTerminalProofWithoutDispatch(t *testing.T) {
+func TestReplicatedMoveControllerJournalsPostRemoveFenceRefresh(t *testing.T) {
 	plan, sourceCatalog := moveTestPlan(t)
 	bound := bindMoveTestPlan(plan)
 	targetCatalog, err := plan.CatalogSnapshot(sourceCatalog)
@@ -337,9 +337,9 @@ func TestReplicatedMoveControllerPublishesTerminalProofWithoutDispatch(t *testin
 	priorCut := ReplicatedMoveCut{Observation: Observation{
 		Catalog: targetCatalog, Publication: publication,
 		LeaderStatus: leaderStatus(2, 11), TargetStatus: leaderStatus(2, 11),
-		TargetState: state, OlderCatalogDrained: true,
+		TargetState: state, DrainedCatalogGeneration: plan.NextCatalogGeneration(),
 	}}
-	priorAction := Action{Kind: ActionRetireSource, Member: plan.SourceMember()}
+	priorAction := Action{Kind: ActionRemoveSource, Member: plan.RetiringMember()}
 	intent, err := AppendReplicaMoveIntent(nil, targetCatalog, bound)
 	if err != nil {
 		t.Fatal(err)
@@ -353,27 +353,22 @@ func TestReplicatedMoveControllerPublishesTerminalProofWithoutDispatch(t *testin
 		plan.OperationID(), record.IntentDigest, bound, priorCut, priorAction,
 		replicaMoveCursorApplied,
 	)
-	journal := &memoryMoveJournal{record: record, present: true, unknownDelete: true}
-	completeCut := priorCut
-	completeCut.SourceRetired = true
-	completeCut.SnapshotBase = &replicatedstate.SnapshotBaseCertificate{
+	journal := &memoryMoveJournal{record: record, present: true}
+	refreshCut := priorCut
+	refreshCut.SnapshotBase = &replicatedstate.SnapshotBaseCertificate{
 		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
 		Digest:   bound.baseDigest,
 	}
-	observer := &fixedMoveObserver{cut: completeCut}
+	observer := &fixedMoveObserver{cut: refreshCut}
 	executor := &moveActionExecutor{journal: journal}
 	action, err := ExecuteReplicatedMoveStep(
 		context.Background(), plan.OperationID(), nil, journal, observer, executor,
 	)
-	if err != nil || action.Kind != ActionComplete || len(executor.calls) != 0 ||
-		journal.present || journal.retries != 1 {
-		t.Fatalf("terminal action=%+v calls=%d record=%+v err=%v",
+	if err != nil || action.Kind != ActionRefreshCatalogFence || len(executor.calls) != 1 ||
+		!journal.present || action.CatalogGeneration != plan.PostRemoveCatalogGeneration() ||
+		action.ReplicaSetVersion != publication.ReplicaSetVersion {
+		t.Fatalf("refresh action=%+v calls=%d record=%+v err=%v",
 			action, len(executor.calls), journal.record, err)
-	}
-	if _, err = ExecuteReplicatedMoveStep(
-		context.Background(), plan.OperationID(), nil, journal, observer, executor,
-	); !errors.Is(err, gateway.ErrReplicatedOperationMissing) || len(executor.calls) != 0 {
-		t.Fatalf("terminal replay calls=%d err=%v", len(executor.calls), err)
 	}
 }
 
