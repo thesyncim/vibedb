@@ -33,6 +33,10 @@ func testPlan(t testing.TB, recipeBytes int) []byte {
 }
 
 func testHead(t testing.TB, sequenced bool) (HeadRecord, []byte, []byte) {
+	return testHeadForKey(t, testKey(sequenced))
+}
+
+func testHeadForKey(t testing.TB, key RequestKey) (HeadRecord, []byte, []byte) {
 	t.Helper()
 	plan := testPlan(t, 256)
 	cursor := []byte("terminal-cursor")
@@ -53,7 +57,7 @@ func testHead(t testing.TB, sequenced bool) (HeadRecord, []byte, []byte) {
 		PlanningLeaseExpiryIndex: math.MaxUint64,
 		PlanningLeaseGeneration:  1,
 	}
-	head, err := NewHeadWithExecutionContract(testKey(sequenced), testDigest("request-body"),
+	head, err := NewHeadWithExecutionContract(key, testDigest("request-body"),
 		testDigest("terminal-contract"), contract, plan)
 	if err != nil {
 		t.Fatal(err)
@@ -558,8 +562,12 @@ func TestRoutePinAndPayloadCleanupCommandCanonical(t *testing.T) {
 }
 
 func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, PreparedTerminalRecord, SchemaPinReleaseRecord, TerminalRecord) {
+	return terminalFixtureForKey(t, testKey(sequenced))
+}
+
+func terminalFixtureForKey(t *testing.T, key RequestKey) (HeadRecord, PreparedTerminalRecord, SchemaPinReleaseRecord, TerminalRecord) {
 	t.Helper()
-	head, plan, cursor := testHead(t, sequenced)
+	head, plan, cursor := testHeadForKey(t, key)
 	steps := []StepRef{{TargetSource: PayloadSourcePlan, CommandSource: PayloadSourcePlan, TargetOffset: 0, TargetLength: 8, CommandOffset: 8, CommandLength: 16, TargetDigest: testDigest("target"), CommandDigest: testDigest("command")}}
 	if len(plan) < 24 {
 		t.Fatal("bad plan")
@@ -621,6 +629,36 @@ func terminalFixture(t *testing.T, sequenced bool) (HeadRecord, PreparedTerminal
 	return head, prepared, release, terminal
 }
 
+func gcCompleteAckForKey(t *testing.T, key RequestKey) (AckRecord, IssuerSequenceRecord) {
+	t.Helper()
+	head, prepared, release, terminal := terminalFixtureForKey(t, key)
+	head, err := MarkTerminal(head, prepared, release, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := NewAck(head, terminal, terminal.Revision+1, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := NewIssuerSequence(key, head.RequestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect, err := NewCollectRequest(ack.AckDigest, 1, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err = AdvanceAckGC(ack, collect, ack.Revision+1, 1, ack.PriorEncodedBytes, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err = MarkIssuerSequenceGCComplete(sequence, ack, sequence.Revision+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ack, sequence
+}
+
 func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	head, prepared, release, terminal := terminalFixture(t, true)
 	raw, err := AppendTerminal(nil, terminal)
@@ -665,12 +703,178 @@ func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	if ack.GCPhase != AckGCCollecting || ack.ReleaseCertificateDigest != terminal.SchemaPinReleaseCertificateDigest {
 		t.Fatal("ACK retained a schema pin instead of its completed release witness")
 	}
-	if _, err = AdvanceAckGC(ack, 10, 1, math.MaxUint64-24, false); err == nil {
+	collect, err := NewCollectRequest(ack.AckDigest, 1, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = AdvanceAckGC(ack, collect, 10, 1, math.MaxUint64-24, false); err == nil {
 		t.Fatal("reclaimed byte overflow accepted")
 	}
-	ack, err = AdvanceAckGC(ack, 10, 1, 10000, true)
+	ack, err = AdvanceAckGC(ack, collect, 10, 1, 10000, true)
 	if err != nil || ack.GCPhase != AckGCComplete {
 		t.Fatal("final GC")
+	}
+	if !SameAckGCTransition(ack, collect) {
+		t.Fatal("ACK did not retain its exact GC retry witness")
+	}
+	changedBudget, _ := NewCollectRequest(collect.ExpectedAckDigest, 2, collect.MaxBytes)
+	if SameAckGCTransition(ack, changedBudget) {
+		t.Fatal("distinct GC budget matched the retained retry witness")
+	}
+	ackRaw, err = AppendAck(ackRaw[:0], ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedAck, err := OpenAck(ackRaw)
+	if err != nil || !SameAckGCTransition(reopenedAck, collect) {
+		t.Fatalf("GC retry witness did not survive reopen: %v", err)
+	}
+}
+
+func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
+	key1 := testKey(true)
+	key1.IssuerSequence = 1
+	key2 := key1
+	key2.IssuerSequence = 2
+	key2.Request[0]++
+
+	ack1, sequence1 := gcCompleteAckForKey(t, key1)
+	ack2, sequence2 := gcCompleteAckForKey(t, key2)
+	highwater, err := NewIssuerHighwater(key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request1, err := NewIssuerAdvanceRequest(highwater, sequence1, ack1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request2, err := NewIssuerAdvanceRequest(highwater, sequence2, ack2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = AdvanceIssuerHighwater(highwater, sequence2, ack2, request2, highwater.Revision+1); err == nil {
+		t.Fatal("issuer highwater skipped an unretired sequence")
+	}
+
+	highwaterRaw, err := AppendIssuerHighwater(nil, highwater)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequenceRaw, err := AppendIssuerSequence(nil, sequence1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRaw, err := AppendIssuerAdvanceRequest(nil, request1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedHighwater, err := OpenIssuerHighwater(highwaterRaw)
+	if err != nil || openedHighwater != highwater {
+		t.Fatalf("highwater roundtrip: %v", err)
+	}
+	openedSequence, err := OpenIssuerSequence(sequenceRaw)
+	if err != nil || openedSequence != sequence1 {
+		t.Fatalf("sequence roundtrip: %v", err)
+	}
+	openedRequest, err := OpenIssuerAdvanceRequest(requestRaw)
+	if err != nil || openedRequest != request1 {
+		t.Fatalf("advance request roundtrip: %v", err)
+	}
+
+	home, _ := Home(key1)
+	issuer, _ := IssuerDigest(sequence1.Identity)
+	highwaterKey := AppendIssuerHighwaterKey(nil, home, issuer)
+	sequenceKey1 := AppendIssuerSequenceKey(nil, home, issuer, 1)
+	sequenceKey2 := AppendIssuerSequenceKey(nil, home, issuer, 2)
+	openedHome, openedIssuer, err := OpenIssuerHighwaterKey(highwaterKey)
+	if err != nil || openedHome != home || openedIssuer != issuer {
+		t.Fatalf("highwater key roundtrip: %v", err)
+	}
+	openedHome, openedIssuer, openedOrdinal, err := OpenIssuerSequenceKey(sequenceKey1)
+	if err != nil || openedHome != home || openedIssuer != issuer || openedOrdinal != 1 {
+		t.Fatalf("sequence key roundtrip: %v", err)
+	}
+	if bytes.Compare(sequenceKey1, sequenceKey2) >= 0 {
+		t.Fatal("issuer sequence keys are not ordinal ordered")
+	}
+
+	command := Command{Operation: OperationAdvanceIssuerHighwater,
+		ExpectedRevision: highwater.Revision, Revision: highwater.Revision + 1,
+		KeyDigest: ack1.KeyDigest, RequestDigest: ack1.RequestDigest, PlanRoot: ack1.PlanRoot,
+		SubjectDigest: request1.ExpectedHighwaterDigest, ExpectedRangeIdentity: testDigest("range"),
+		Home: home, Payload: requestRaw}
+	commandRaw, err := AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedCommand, err := OpenCommandInto(commandRaw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedAdvance, ok := openedCommand.IssuerAdvance()
+	if !ok || openedAdvance != request1 {
+		t.Fatal("issuer advance command accessor")
+	}
+	if OperationAdvanceIssuerHighwater != 23 || LastOperation != OperationAdvanceIssuerHighwater {
+		t.Fatal("issuer highwater operation code changed")
+	}
+	wrongSubject := command
+	wrongSubject.SubjectDigest[0] ^= 1
+	wrongSubjectRaw, _ := AppendCommand(nil, wrongSubject)
+	if _, err = OpenCommandInto(wrongSubjectRaw, nil); err == nil {
+		t.Fatal("issuer advance accepted a mismatched highwater CAS digest")
+	}
+	for name, open := range map[string]func(){
+		"highwater": func() { _, _ = OpenIssuerHighwater(highwaterRaw) },
+		"sequence":  func() { _, _ = OpenIssuerSequence(sequenceRaw) },
+		"request":   func() { _, _ = OpenIssuerAdvanceRequest(requestRaw) },
+		"command":   func() { _, _ = OpenCommandInto(commandRaw, nil) },
+	} {
+		if allocations := testing.AllocsPerRun(1000, open); allocations != 0 {
+			t.Fatalf("%s open allocs=%v", name, allocations)
+		}
+	}
+
+	highwater, err = AdvanceIssuerHighwater(highwater, sequence1, ack1, request1, highwater.Revision+1)
+	if err != nil || !SameIssuerAdvance(highwater, request1) {
+		t.Fatalf("advance sequence 1: %v", err)
+	}
+	if !IssuerHighwaterCoversKey(highwater, key1) || !IssuerHighwaterCoversAck(highwater, ack1) {
+		t.Fatal("retired sequence was not covered")
+	}
+	reused := key1
+	reused.Request[0]++
+	if !IssuerHighwaterCoversKey(highwater, reused) {
+		t.Fatal("same issuer sequence with a different request ID resurrected")
+	}
+	if IssuerHighwaterCoversKey(highwater, key2) || IssuerHighwaterCoversKey(highwater, testKey(false)) {
+		t.Fatal("highwater covered a future or arbitrary-ID request")
+	}
+
+	request2, err = NewIssuerAdvanceRequest(highwater, sequence2, ack2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	highwater, err = AdvanceIssuerHighwater(highwater, sequence2, ack2, request2, highwater.Revision+1)
+	if err != nil || highwater.HighwaterSequence != 2 {
+		t.Fatalf("advance sequence 2: %v", err)
+	}
+	highwaterRaw, err = AppendIssuerHighwater(highwaterRaw[:0], highwater)
+	if err != nil {
+		t.Fatal(err)
+	}
+	highwater, err = OpenIssuerHighwater(highwaterRaw)
+	if err != nil || !IssuerHighwaterCoversKey(highwater, reused) {
+		t.Fatalf("anti-resurrection witness did not survive reopen: %v", err)
+	}
+	forged := append([]byte(nil), highwaterRaw...)
+	forged[192] ^= 1
+	binary.LittleEndian.PutUint32(forged[len(forged)-4:], crc32.Checksum(forged[:len(forged)-4], castagnoli))
+	if _, err = OpenIssuerHighwater(forged); err == nil {
+		t.Fatal("forged highwater accepted under recomputed checksum")
+	}
+	if _, err = NewIssuerHighwater(testKey(false)); err == nil {
+		t.Fatal("arbitrary-ID request installed an issuer highwater")
 	}
 }
 
@@ -857,7 +1061,8 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	if baseDigest == (Digest{}) {
 		t.Fatal("zero semantics")
 	}
-	for i := 0; i < 73; i++ {
+	_, semanticSlots := semanticsDigestWithPerturbAndCount(-1, 0)
+	for i := 0; i < semanticSlots; i++ {
 		if semanticsDigestWithPerturb(i, 1) == baseDigest {
 			t.Fatalf("semantic slot %d unbound", i)
 		}
@@ -876,6 +1081,15 @@ func TestUsageAndReservationOverflow(t *testing.T) {
 	if err != nil || resident == 0 || future < minimumLifecycle {
 		t.Fatalf("reservation %d %d %v", resident, future, err)
 	}
+	sequenced, _, _ := testHead(t, true)
+	_, sequencedFuture, err := Reservation(sequenced)
+	if err != nil || sequencedFuture != future+IssuerSequenceReservationBytes {
+		t.Fatalf("sequenced reservation=%d base=%d: %v", sequencedFuture, future, err)
+	}
+	u = Usage{IssuerBytes: math.MaxUint64, AckBytes: 1}
+	if _, err = u.DurableBytes(); err == nil {
+		t.Fatal("issuer usage wrap")
+	}
 }
 
 func FuzzOpenCommand(f *testing.F) {
@@ -885,6 +1099,32 @@ func FuzzOpenCommand(f *testing.F) {
 		var scratch [MaxPendingWaveSteps]StepRef
 		_, _ = OpenCommandInto(raw, scratch[:])
 	})
+}
+
+func FuzzOpenIssuerHighwater(f *testing.F) {
+	record, _ := NewIssuerHighwater(testKey(true))
+	raw, _ := AppendIssuerHighwater(nil, record)
+	f.Add(raw)
+	f.Add([]byte("bad"))
+	f.Fuzz(func(t *testing.T, candidate []byte) { _, _ = OpenIssuerHighwater(candidate) })
+}
+
+func FuzzOpenIssuerSequence(f *testing.F) {
+	record, _ := NewIssuerSequence(testKey(true), testDigest("request-body"))
+	raw, _ := AppendIssuerSequence(nil, record)
+	f.Add(raw)
+	f.Add([]byte("bad"))
+	f.Fuzz(func(t *testing.T, candidate []byte) { _, _ = OpenIssuerSequence(candidate) })
+}
+
+func FuzzOpenIssuerAdvanceRequest(f *testing.F) {
+	record := IssuerAdvanceRequest{Sequence: 1, IssuerDigest: testDigest("issuer"),
+		ExpectedHighwaterDigest: testDigest("highwater"), SequenceRecordDigest: testDigest("sequence"),
+		AckDigest: testDigest("ack")}
+	raw, _ := AppendIssuerAdvanceRequest(nil, record)
+	f.Add(raw)
+	f.Add([]byte("bad"))
+	f.Fuzz(func(t *testing.T, candidate []byte) { _, _ = OpenIssuerAdvanceRequest(candidate) })
 }
 
 func BenchmarkOpenHead(b *testing.B) {
@@ -907,6 +1147,44 @@ func BenchmarkOpenCommand(b *testing.B) {
 	b.SetBytes(int64(len(raw)))
 	for b.Loop() {
 		if _, err := OpenCommandInto(raw, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpenIssuerHighwater(b *testing.B) {
+	record, _ := NewIssuerHighwater(testKey(true))
+	raw, _ := AppendIssuerHighwater(nil, record)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if _, err := OpenIssuerHighwater(raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpenIssuerSequence(b *testing.B) {
+	record, _ := NewIssuerSequence(testKey(true), testDigest("request-body"))
+	raw, _ := AppendIssuerSequence(nil, record)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if _, err := OpenIssuerSequence(raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkOpenIssuerAdvanceRequest(b *testing.B) {
+	record := IssuerAdvanceRequest{Sequence: 1, IssuerDigest: testDigest("issuer"),
+		ExpectedHighwaterDigest: testDigest("highwater"), SequenceRecordDigest: testDigest("sequence"),
+		AckDigest: testDigest("ack")}
+	raw, _ := AppendIssuerAdvanceRequest(nil, record)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for b.Loop() {
+		if _, err := OpenIssuerAdvanceRequest(raw); err != nil {
 			b.Fatal(err)
 		}
 	}

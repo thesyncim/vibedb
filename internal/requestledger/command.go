@@ -40,11 +40,12 @@ const (
 	OperationRecordSchemaPinReleased
 	OperationRestartPlanning
 	OperationCleanupPlanning
+	OperationAdvanceIssuerHighwater
 
 	// LastOperation is the sole inclusive admission bound for the current
 	// request-ledger command grammar. Integrations must not duplicate a numeric
 	// operation ceiling in completion or apply validation.
-	LastOperation = OperationCleanupPlanning
+	LastOperation = OperationAdvanceIssuerHighwater
 )
 
 type Command struct {
@@ -124,6 +125,7 @@ type CommandView struct {
 	schemaPin       SchemaPinReleaseRecord
 	restart         PlanningRestartRequest
 	planningCleanup PlanningCleanupRequest
+	issuerAdvance   IssuerAdvanceRequest
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -174,6 +176,9 @@ func (view CommandView) PlanningRestart() (PlanningRestartRequest, bool) {
 }
 func (view CommandView) PlanningCleanup() (PlanningCleanupRequest, bool) {
 	return view.planningCleanup, view.Operation == OperationCleanupPlanning
+}
+func (view CommandView) IssuerAdvance() (IssuerAdvanceRequest, bool) {
+	return view.issuerAdvance, view.Operation == OperationAdvanceIssuerHighwater
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -380,6 +385,11 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 		if err == nil && view.planningCleanup.PlanBuildID != command.SubjectDigest {
 			err = ErrCorrupt
 		}
+	case OperationAdvanceIssuerHighwater:
+		view.issuerAdvance, err = OpenIssuerAdvanceRequest(payload)
+		if err == nil && view.issuerAdvance.ExpectedHighwaterDigest != command.SubjectDigest {
+			err = ErrCorrupt
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -424,6 +434,11 @@ func SemanticsDigest() Digest {
 }
 
 func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
+	digest, _ := semanticsDigestWithPerturbAndCount(perturb, xor)
+	return digest
+}
+
+func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("vibedb/request-ledger/semantics\x00"))
 	for _, magic := range [...][4]byte{
@@ -432,6 +447,8 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		gcRequestMagic, payloadBuildMagic, payloadChunkMagic,
 		routePinMagic, payloadCleanupMagic, preparedTerminalMagic, schemaPinReleaseMagic,
 		planningExpiryMagic, planningRestartMagic, planningCleanupMagic, planningExpiryIndexMagic,
+		readyMagic, principalQuotaMagic,
+		issuerHighwaterMagic, issuerSequenceMagic, issuerAdvanceMagic,
 	} {
 		_, _ = hash.Write(magic[:])
 	}
@@ -450,6 +467,10 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		MaxSchemaPinReleaseRecordBytes,
 		PlanningExpiryRequestBytes, PlanningRestartRequestBytes, PlanningCleanupRequestBytes,
 		PlanningExpiryKeyBytes, PlanningExpiryRecordBytes,
+		ReadyStorageKeyBytes, ReadyRecordBytes, PrincipalQuotaKeyBytes, PrincipalQuotaRecordBytes,
+		IssuerHighwaterKeyBytes, IssuerHighwaterRecordBytes,
+		IssuerSequenceKeyBytes, IssuerSequenceRecordBytes, IssuerAdvanceRequestBytes,
+		IssuerSequenceReservationBytes, IssuerHighwaterResidentBytes,
 		RoutePinReservationBytes, PreparedTerminalReservationBytes,
 		SchemaPinReleaseReservationBytes, ReadyReservationBytes,
 		commandHeaderBytes, headHeaderBytes, pageHeaderBytes, planHeaderBytes,
@@ -481,9 +502,18 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 		uint64(OperationPrepareTerminal), uint64(OperationBeginSchemaPinRelease),
 		uint64(OperationRecordSchemaPinReleased),
 		uint64(OperationRestartPlanning), uint64(OperationCleanupPlanning),
+		uint64(OperationAdvanceIssuerHighwater),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
 		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),
+		uint64(IssuerSequenceActive), uint64(IssuerSequenceGCComplete),
+		uint64(IssuerHighwaterStoragePrefix), uint64(IssuerSequenceStoragePrefix),
+		uint64(ReadyStoragePrefix), uint64(PlanningExpiryStoragePrefix), uint64(PrincipalQuotaStoragePrefix),
+		uint64(ReadinessDeriveWave), uint64(ReadinessDispatchPending),
+		uint64(ReadinessPlanningExpiry), uint64(ReadinessRestartPlanning),
+		uint64(ReadinessPinAcquiring), uint64(ReadinessPinRelease),
+		uint64(ReadinessDynamicBuild), uint64(ReadinessPayloadCleanup),
+		uint64(ReadinessTerminalPrepared), uint64(ReadinessComplete),
 	}
 	var fixed [8]byte
 	for index, value := range values {
@@ -495,5 +525,5 @@ func semanticsDigestWithPerturb(perturb int, xor uint64) Digest {
 	}
 	var digest Digest
 	_ = hash.Sum(digest[:0])
-	return digest
+	return digest, len(values)
 }

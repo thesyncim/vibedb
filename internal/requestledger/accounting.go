@@ -57,6 +57,10 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	if head.MaxActivePayloadBytes != 0 {
 		payloadBuildFuture = FixedStorageKeyBytes + payloadBuildBytes
 	}
+	var issuerSequenceFuture uint64
+	if head.Key.IssuerEpoch != 0 {
+		issuerSequenceFuture = IssuerSequenceReservationBytes
+	}
 	if head.Phase == PhasePlanning {
 		residentNow, err = checkedSum(residentNow, PlanningExpiryReservationBytes)
 		if err != nil {
@@ -76,6 +80,7 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 		payloadBuildFuture,
 		head.MaxActivePayloadBytes, payloadChunkFuture,
 		FixedStorageKeyBytes, AckRecordBytes,
+		issuerSequenceFuture,
 	)
 	return residentNow, future, err
 }

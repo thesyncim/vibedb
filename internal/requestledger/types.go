@@ -204,6 +204,7 @@ type Usage struct {
 	ExpiryBytes       uint64
 	TerminalBytes     uint64
 	AckBytes          uint64
+	IssuerBytes       uint64
 }
 
 func (usage Usage) DurableBytes() (uint64, error) {
@@ -212,7 +213,7 @@ func (usage Usage) DurableBytes() (uint64, error) {
 		usage.HeadBytes, usage.PlanPageBytes, usage.PendingBytes,
 		usage.ContinuationBytes, usage.PayloadBytes, usage.RoutePinBytes,
 		usage.PreparedBytes, usage.SchemaPinBytes, usage.ReadyBytes, usage.ExpiryBytes,
-		usage.TerminalBytes, usage.AckBytes,
+		usage.TerminalBytes, usage.AckBytes, usage.IssuerBytes,
 	} {
 		if total > ^uint64(0)-value {
 			return 0, ErrTooLarge
@@ -247,6 +248,7 @@ func (usage *Usage) AddReady(encoded []byte) error    { return addUsage(&usage.R
 func (usage *Usage) AddExpiry(encoded []byte) error   { return addUsage(&usage.ExpiryBytes, encoded) }
 func (usage *Usage) AddTerminal(encoded []byte) error { return addUsage(&usage.TerminalBytes, encoded) }
 func (usage *Usage) AddAck(encoded []byte) error      { return addUsage(&usage.AckBytes, encoded) }
+func (usage *Usage) AddIssuer(encoded []byte) error   { return addUsage(&usage.IssuerBytes, encoded) }
 
 func nonzeroDigest(digest Digest) bool { return digest != (Digest{}) }
 

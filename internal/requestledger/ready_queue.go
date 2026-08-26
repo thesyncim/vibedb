@@ -27,6 +27,8 @@ const (
 	ReadinessPayloadCleanup
 	ReadinessTerminalPrepared
 	ReadinessComplete
+
+	LastReadiness = ReadinessComplete
 )
 
 type ReadyRecord struct {
@@ -39,7 +41,7 @@ type ReadyRecord struct {
 
 func NewReadyWorkRecord(head HeadRecord, readiness Readiness, workDigest Digest) (ReadyRecord, error) {
 	if err := validateHead(head); err != nil || readiness < ReadinessPlanningExpiry ||
-		readiness > ReadinessComplete || !nonzeroDigest(workDigest) {
+		readiness > LastReadiness || !nonzeroDigest(workDigest) {
 		return ReadyRecord{}, ErrInvalidState
 	}
 	home, err := Home(head.Key)
@@ -85,7 +87,7 @@ func OpenReadyKey(raw []byte) (home LedgerHome, readiness Readiness, key Digest,
 	copy(home[:], raw[1:33])
 	readiness = Readiness(raw[33])
 	copy(key[:], raw[34:66])
-	if home == (LedgerHome{}) || !nonzeroDigest(key) || readiness < ReadinessDeriveWave || readiness > ReadinessComplete {
+	if home == (LedgerHome{}) || !nonzeroDigest(key) || readiness < ReadinessDeriveWave || readiness > LastReadiness {
 		return LedgerHome{}, 0, Digest{}, ErrCorrupt
 	}
 	return home, readiness, key, nil
@@ -124,7 +126,7 @@ func OpenReady(raw []byte) (ReadyRecord, error) {
 	return r, nil
 }
 func validateReady(r ReadyRecord) error {
-	if r.Home == (LedgerHome{}) || !nonzeroDigest(r.KeyDigest) || !nonzeroDigest(r.RequestDigest) || !nonzeroDigest(r.PlanRoot) || !nonzeroDigest(r.PlanBuildID) || r.Revision == 0 || (r.NextStepOrdinal == 0) != !nonzeroDigest(r.ContinuationDigest) || r.Readiness < ReadinessDeriveWave || r.Readiness > ReadinessComplete || (r.Readiness == ReadinessDeriveWave && nonzeroDigest(r.PendingDigest)) || (r.Readiness != ReadinessDeriveWave && !nonzeroDigest(r.PendingDigest)) {
+	if r.Home == (LedgerHome{}) || !nonzeroDigest(r.KeyDigest) || !nonzeroDigest(r.RequestDigest) || !nonzeroDigest(r.PlanRoot) || !nonzeroDigest(r.PlanBuildID) || r.Revision == 0 || (r.NextStepOrdinal == 0) != !nonzeroDigest(r.ContinuationDigest) || r.Readiness < ReadinessDeriveWave || r.Readiness > LastReadiness || (r.Readiness == ReadinessDeriveWave && nonzeroDigest(r.PendingDigest)) || (r.Readiness != ReadinessDeriveWave && !nonzeroDigest(r.PendingDigest)) {
 		return ErrCorrupt
 	}
 	return nil

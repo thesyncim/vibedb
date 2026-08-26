@@ -17,6 +17,7 @@ const (
 var (
 	gcRequestMagic           = [4]byte{'V', 'R', 'L', 'G'}
 	releaseCertificateDomain = []byte("vibedb/request-ledger/release-certificate\x00")
+	gcRequestDigestDomain    = []byte("vibedb/request-ledger/gc-request\x00")
 )
 
 type GCAction uint8
@@ -37,6 +38,26 @@ type GCRequest struct {
 	MaxBytes          uint32
 	ReleaseCommand    []byte
 	ReleaseCompletion []byte
+}
+
+func GCRequestDigest(request GCRequest) Digest {
+	const domain = "vibedb/request-ledger/gc-request\x00"
+	var framed [len(domain) + 16 + 4*sha256.Size]byte
+	at := copy(framed[:], gcRequestDigestDomain)
+	framed[at] = byte(request.Action)
+	binary.LittleEndian.PutUint16(framed[at+2:at+4], request.MaxRows)
+	binary.LittleEndian.PutUint32(framed[at+4:at+8], request.MaxBytes)
+	binary.LittleEndian.PutUint32(framed[at+8:at+12], uint32(len(request.ReleaseCommand)))
+	binary.LittleEndian.PutUint32(framed[at+12:at+16], uint32(len(request.ReleaseCompletion)))
+	at += 16
+	at += copy(framed[at:], request.ExpectedAckDigest[:])
+	commandDigest := Digest(sha256.Sum256(request.ReleaseCommand))
+	completionDigest := Digest(sha256.Sum256(request.ReleaseCompletion))
+	at += copy(framed[at:], commandDigest[:])
+	at += copy(framed[at:], completionDigest[:])
+	certificate := request.ReleaseCertificateDigest()
+	copy(framed[at:], certificate[:])
+	return Digest(sha256.Sum256(framed[:]))
 }
 
 func NewReleasePinRequest(expectedAck Digest, command, completion []byte) (GCRequest, error) {

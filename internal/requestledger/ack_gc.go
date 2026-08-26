@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 )
 
-const AckRecordBytes = 544
+const AckRecordBytes = 640
 
 var (
 	ackMagic        = [4]byte{'V', 'R', 'L', 'A'}
@@ -33,6 +33,9 @@ type AckRecord struct {
 	ResultDigest                 Digest
 	AckTokenDigest               Digest
 	ReleaseCertificateDigest     Digest
+	PriorAckDigest               Digest
+	LastGCRequestDigest          Digest
+	LastGCTransitionDigest       Digest
 	AckDigest                    Digest
 	Revision                     uint64
 	TerminalRevision             uint64
@@ -69,12 +72,20 @@ func NewAck(head HeadRecord, terminal TerminalRecord, revision, priorEncodedByte
 
 // AdvanceAckGC accounts one bounded deletion chunk. Ack itself is never a GC
 // target. final is legal only after every pre-ACK resident byte was reclaimed.
-func AdvanceAckGC(record AckRecord, revision, nextCursor, reclaimed uint64, final bool) (AckRecord, error) {
+func AdvanceAckGC(
+	record AckRecord,
+	request GCRequest,
+	revision, nextCursor, reclaimed uint64,
+	final bool,
+) (AckRecord, error) {
 	if err := validateAck(record); err != nil || record.GCPhase != AckGCCollecting ||
+		errOrNil(validateGCRequest(request)) != nil || request.Action != GCActionCollect ||
+		request.ExpectedAckDigest != record.AckDigest ||
 		!nextRevision(record.Revision, revision) || nextCursor < record.GCCursor || reclaimed == 0 ||
 		reclaimed > record.PriorEncodedBytes-record.ReclaimedBytes {
 		return AckRecord{}, ErrInvalidState
 	}
+	priorAckDigest := record.AckDigest
 	record.Revision, record.GCCursor = revision, nextCursor
 	record.ReclaimedBytes += reclaimed
 	if final {
@@ -83,8 +94,17 @@ func AdvanceAckGC(record AckRecord, revision, nextCursor, reclaimed uint64, fina
 		}
 		record.GCPhase = AckGCComplete
 	}
+	record.PriorAckDigest = priorAckDigest
+	record.LastGCRequestDigest = GCRequestDigest(request)
+	record.LastGCTransitionDigest = ackGCTransitionDigest(record)
 	record.AckDigest = ackDigest(record)
 	return record, validateAck(record)
+}
+
+func SameAckGCTransition(record AckRecord, request GCRequest) bool {
+	return nonzeroDigest(record.PriorAckDigest) && request.ExpectedAckDigest == record.PriorAckDigest &&
+		GCRequestDigest(request) == record.LastGCRequestDigest &&
+		record.LastGCTransitionDigest == ackGCTransitionDigest(record)
 }
 
 func AppendAck(dst []byte, record AckRecord) ([]byte, error) {
@@ -120,13 +140,16 @@ func AppendAck(dst []byte, record AckRecord) ([]byte, error) {
 	putDigest(out[408:440], record.PinDigest)
 	putDigest(out[440:472], record.RouteSchemaCertificateDigest)
 	putDigest(out[472:504], record.AckTokenDigest)
+	putDigest(out[504:536], record.PriorAckDigest)
+	putDigest(out[536:568], record.LastGCRequestDigest)
+	putDigest(out[568:600], record.LastGCTransitionDigest)
 	dst = appendChecksum(dst, start)
 	return dst, nil
 }
 
 func OpenAck(raw []byte) (AckRecord, error) {
 	if len(raw) != AckRecordBytes || !magicOK(raw, ackMagic) || !zeroBytes(raw[4:8]) ||
-		!zeroBytes(raw[9:16]) || !zeroBytes(raw[17:24]) || !zeroBytes(raw[504:540]) || !checksumOK(raw) {
+		!zeroBytes(raw[9:16]) || !zeroBytes(raw[17:24]) || !zeroBytes(raw[600:636]) || !checksumOK(raw) {
 		return AckRecord{}, ErrCorrupt
 	}
 	record := AckRecord{
@@ -142,6 +165,8 @@ func OpenAck(raw []byte) (AckRecord, error) {
 		CatalogGeneration: binary.LittleEndian.Uint64(raw[384:392]),
 		PinDigest:         readDigest(raw[408:440]), RouteSchemaCertificateDigest: readDigest(raw[440:472]),
 		AckTokenDigest: readDigest(raw[472:504]),
+		PriorAckDigest: readDigest(raw[504:536]), LastGCRequestDigest: readDigest(raw[536:568]),
+		LastGCTransitionDigest: readDigest(raw[568:600]),
 	}
 	copy(record.Key.Principal[:], raw[88:104])
 	copy(record.Key.Request[:], raw[104:120])
@@ -164,10 +189,19 @@ func validateAck(record AckRecord) error {
 		record.TerminalResultBytes > record.PriorEncodedBytes || record.ReclaimedBytes > record.PriorEncodedBytes ||
 		record.GCPhase < AckGCCollecting || record.GCPhase > AckGCComplete ||
 		!nonzeroDigest(record.ReleaseCertificateDigest) ||
-		(record.GCPhase == AckGCCollecting && record.ReclaimedBytes == 0 &&
-			(record.Revision != record.TerminalRevision+1 || record.GCCursor != 0)) ||
 		(record.GCPhase == AckGCComplete && record.ReclaimedBytes != record.PriorEncodedBytes) ||
 		record.AckDigest != ackDigest(record) {
+		return ErrCorrupt
+	}
+	initial := record.Revision == record.TerminalRevision+1
+	if initial {
+		if record.GCPhase != AckGCCollecting || record.GCCursor != 0 || record.ReclaimedBytes != 0 ||
+			nonzeroDigest(record.PriorAckDigest) || nonzeroDigest(record.LastGCRequestDigest) ||
+			nonzeroDigest(record.LastGCTransitionDigest) {
+			return ErrCorrupt
+		}
+	} else if !nonzeroDigest(record.PriorAckDigest) || !nonzeroDigest(record.LastGCRequestDigest) ||
+		record.LastGCTransitionDigest != ackGCTransitionDigest(record) {
 		return ErrCorrupt
 	}
 	return nil
@@ -189,7 +223,8 @@ func ackDigest(record AckRecord) Digest {
 	at += copy(framed[at:], record.Key.Request[:])
 	for _, digest := range [...]Digest{record.Key.TenantDigest, record.KeyDigest, record.RequestDigest,
 		record.PlanRoot, record.TerminalContractDigest, record.ResultDigest, record.AckTokenDigest,
-		record.ReleaseCertificateDigest} {
+		record.ReleaseCertificateDigest, record.PriorAckDigest, record.LastGCRequestDigest,
+		record.LastGCTransitionDigest} {
 		at += copy(framed[at:], digest[:])
 	}
 	binary.LittleEndian.PutUint64(framed[at:at+8], record.CatalogGeneration)
@@ -197,6 +232,24 @@ func ackDigest(record AckRecord) Digest {
 	at += copy(framed[at:], record.PinID[:])
 	at += copy(framed[at:], record.PinDigest[:])
 	at += copy(framed[at:], record.RouteSchemaCertificateDigest[:])
+	return Digest(sha256.Sum256(framed[:at]))
+}
+
+func ackGCTransitionDigest(record AckRecord) Digest {
+	const domain = "vibedb/request-ledger/ack-gc-transition\x00"
+	var framed [len(domain) + 32*5 + 8*6]byte
+	at := copy(framed[:], domain)
+	framed[at] = byte(record.GCPhase)
+	at += 8
+	for _, value := range [...]uint64{record.Revision, record.TerminalRevision, record.PriorEncodedBytes,
+		record.ReclaimedBytes, record.GCCursor} {
+		binary.LittleEndian.PutUint64(framed[at:at+8], value)
+		at += 8
+	}
+	for _, digest := range [...]Digest{record.KeyDigest, record.RequestDigest, record.ResultDigest,
+		record.PriorAckDigest, record.LastGCRequestDigest} {
+		at += copy(framed[at:], digest[:])
+	}
 	return Digest(sha256.Sum256(framed[:at]))
 }
 
