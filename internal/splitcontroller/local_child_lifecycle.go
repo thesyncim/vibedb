@@ -215,6 +215,38 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 	return nil
 }
 
+// Close releases only handles still owned by the pre-serving child lifecycle.
+// After successful adoption all serving ownership has moved to the Multi-Raft
+// registrar and this method deliberately becomes a no-op for those handles.
+func (l *LocalChildLifecycle) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.adopted != (raftmember.RuntimeIdentity{}) {
+		return nil
+	}
+	var result error
+	if l.wal != nil {
+		result = errors.Join(result, l.wal.Close())
+		l.wal = nil
+	}
+	if l.activation.Apply != nil {
+		result = errors.Join(result, l.activation.Apply.Close())
+		l.activation.Apply = nil
+	}
+	if l.options.Stage != nil {
+		result = errors.Join(result, l.options.Stage.Close())
+		l.options.Stage = nil
+	}
+	if l.options.Database != nil {
+		result = errors.Join(result, l.options.Database.Close())
+		l.options.Database = nil
+	}
+	return result
+}
+
 func (l *LocalChildLifecycle) matchesTarget(target ChildTarget) bool {
 	if l == nil || target.Child != l.options.Child ||
 		target.TopologyRecoveryEpoch != l.options.TopologyRecoveryEpoch ||

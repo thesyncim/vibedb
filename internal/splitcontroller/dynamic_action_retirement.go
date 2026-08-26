@@ -104,7 +104,9 @@ func (retirer *TerminalSplitOperationRetirer) RetireTerminalOperation(
 		retirer.routes.retire(operation, digest)
 	}
 	if retirer.data != nil {
-		retirer.data.retire(operation, digest)
+		if err = retirer.data.retire(operation, digest); err != nil {
+			return errors.Join(ErrSplitOperationRetirement, err)
+		}
 	}
 	if retirer.binder != nil {
 		if err = retirer.binder.retire(operation, digest); err != nil {

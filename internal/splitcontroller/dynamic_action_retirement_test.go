@@ -5,7 +5,17 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/rangesplit"
 )
+
+type retirementTailTarget struct{}
+
+func (retirementTailTarget) ObserveTail(context.Context) (rangesplit.ChildStageCursor, bool, error) {
+	return rangesplit.ChildStageCursor{}, false, nil
+}
+
+func (retirementTailTarget) ApplyTail(context.Context, rangesplit.TailBatch) error { return nil }
 
 type splitOperationTerminalAuthorityStub struct {
 	operation OperationID
@@ -75,10 +85,25 @@ func TestTerminalSplitOperationRetirementRevokesAllLiveStateAndIsIdempotent(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	data, err := NewDynamicSplitData(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupCalls := 0
+	if err = data.InstallChildTargetWithCleanup(
+		plan, admission.PlanDigest, 1, lease, retirementTailTarget{},
+		func() error { cleanupCalls++; return nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err = retirer.BindSplitData(data); err != nil {
+		t.Fatal(err)
+	}
 	if err = retirer.RetireTerminalOperation(t.Context(), operation, admission.PlanDigest); err != nil {
 		t.Fatal(err)
 	}
-	if len(grants.grants) != 0 || len(routes.plans) != 0 || len(binder.active) != 0 {
+	if len(grants.grants) != 0 || len(routes.plans) != 0 || len(binder.active) != 0 ||
+		len(data.entries) != 0 || cleanupCalls != 1 {
 		t.Fatalf("grants=%d routes=%d admissions=%d", len(grants.grants), len(routes.plans), len(binder.active))
 	}
 	if _, err = lease.PinnedStore(); !errors.Is(err, ErrRuntimeStore) {

@@ -12,13 +12,14 @@ import (
 )
 
 type dynamicSplitDataEntry struct {
-	plan        *Plan
-	planDigest  [32]byte
-	source      *LocalSourceActions
-	sourceLease *RuntimeStoreLease
-	children    [autosplit.MaxSplitChildren]TailStreamApplyTarget
-	childLeases [autosplit.MaxSplitChildren]*RuntimeStoreLease
-	sourceNodes []rafttransport.NodeID
+	plan         *Plan
+	planDigest   [32]byte
+	source       *LocalSourceActions
+	sourceLease  *RuntimeStoreLease
+	children     [autosplit.MaxSplitChildren]TailStreamApplyTarget
+	childLeases  [autosplit.MaxSplitChildren]*RuntimeStoreLease
+	childCleanup [autosplit.MaxSplitChildren]func() error
+	sourceNodes  []rafttransport.NodeID
 }
 
 // DynamicSplitData is the bounded data-plane registry populated by durable
@@ -62,6 +63,13 @@ func (registry *DynamicSplitData) InstallSource(
 func (registry *DynamicSplitData) InstallChildTarget(
 	plan *Plan, digest [32]byte, child uint8, lease *RuntimeStoreLease, actions TailStreamApplyTarget,
 ) error {
+	return registry.InstallChildTargetWithCleanup(plan, digest, child, lease, actions, nil)
+}
+
+func (registry *DynamicSplitData) InstallChildTargetWithCleanup(
+	plan *Plan, digest [32]byte, child uint8, lease *RuntimeStoreLease,
+	actions TailStreamApplyTarget, cleanup func() error,
+) error {
 	if registry == nil || plan == nil || digest == ([32]byte{}) || lease == nil || actions == nil ||
 		!plan.validNonRetainedChild(child) {
 		return ErrRemoteExecution
@@ -76,7 +84,10 @@ func (registry *DynamicSplitData) InstallChildTarget(
 		(entry.children[child] != actions || entry.childLeases[child] != lease) {
 		return ErrRemoteExecution
 	}
-	entry.children[child], entry.childLeases[child] = actions, lease
+	if entry.childCleanup[child] != nil && cleanup != nil {
+		return ErrRemoteExecution
+	}
+	entry.children[child], entry.childLeases[child], entry.childCleanup[child] = actions, lease, cleanup
 	return nil
 }
 
@@ -200,15 +211,24 @@ func (registry *DynamicSplitData) AuthorizeTail(
 	return false
 }
 
-func (registry *DynamicSplitData) retire(operation OperationID, digest [32]byte) {
+func (registry *DynamicSplitData) retire(operation OperationID, digest [32]byte) error {
 	if registry == nil {
-		return
+		return nil
 	}
+	var cleanup [autosplit.MaxSplitChildren]func() error
 	registry.mu.Lock()
 	if entry := registry.entries[operation]; entry != nil && entry.planDigest == digest {
+		cleanup = entry.childCleanup
 		delete(registry.entries, operation)
 	}
 	registry.mu.Unlock()
+	var result error
+	for _, closeChild := range cleanup {
+		if closeChild != nil {
+			result = errors.Join(result, closeChild())
+		}
+	}
+	return result
 }
 
 var _ splitartifact.Source = (*DynamicSplitData)(nil)

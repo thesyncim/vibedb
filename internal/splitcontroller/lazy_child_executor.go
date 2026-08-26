@@ -49,6 +49,20 @@ type LazyReplicatedChildExecutor struct {
 	lifecycle *LocalChildLifecycle
 }
 
+func (executor *LazyReplicatedChildExecutor) Close() error {
+	if executor == nil {
+		return nil
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if executor.lifecycle == nil {
+		return nil
+	}
+	err := executor.lifecycle.Close()
+	executor.lifecycle, executor.stage = nil, nil
+	return err
+}
+
 func NewLazyReplicatedChildExecutor(
 	options LazyReplicatedChildExecutorOptions,
 ) (*LazyReplicatedChildExecutor, error) {
@@ -208,9 +222,9 @@ func (executor *LazyReplicatedChildExecutor) open(
 	if err != nil {
 		return errors.Join(err, stage.Close(), database.Close())
 	}
-	if err = executor.options.Data.InstallChildTarget(
+	if err = executor.options.Data.InstallChildTargetWithCleanup(
 		executor.options.Plan, executor.options.PlanDigest, executor.options.Child,
-		executor.options.Lease, stageActions,
+		executor.options.Lease, stageActions, executor.Close,
 	); err != nil {
 		return errors.Join(err, stage.Close(), database.Close())
 	}
