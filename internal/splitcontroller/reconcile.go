@@ -9,7 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash"
 	"math"
+	"path/filepath"
 	"strings"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -87,6 +89,17 @@ type ChildReplicaTarget struct {
 	Endpoint        distribution.EndpointID
 	NativeEndpoint  distribution.EndpointID
 	ControlEndpoint distribution.EndpointID
+
+	// The remaining fields are the replica-local prepared runtime authority.
+	// WAL member/store identity, physical roots, SQL storage/log identity, and
+	// the apply participant are deliberately distinct on every RF3 member.
+	WAL               raftstore.Identity
+	WALPath           string
+	SQLPath           string
+	RuntimeRoot       string
+	SQL               sqldriver.ReplicatedShardStoreIdentity
+	Apply             sqldriver.ReplicatedApplyIdentity
+	CertificateDigest [sha256.Size]byte
 }
 
 // Plan binds one source catalog generation, exact split geometry, and every
@@ -234,6 +247,7 @@ func newPlan(
 			target.WAL, target.TopologyRecoveryEpoch, target.Authority,
 		)
 		if bindingErr != nil || planned != target.SQL.Binding ||
+			!validPreparedChildReplicas(descriptor, partitioner.CollectionName(), target) ||
 			target.Authority.OwnershipEpoch != uint64(descriptor.OwnershipEpoch) ||
 			target.Authority.RoutingVersion != uint64(split.Manifest().Version()) ||
 			target.Authority.RouteGeneration != plan.next {
@@ -342,42 +356,43 @@ func (p *Plan) OperationID() OperationID {
 }
 
 func splitOperationID(plan *Plan) OperationID {
-	var raw [768]byte
-	at := copy(raw[:], "vibedb/splitcontroller/operation\x00")
+	digestWriter := sha256.New()
+	_, _ = digestWriter.Write([]byte("vibedb/splitcontroller/operation\x00"))
 	digest := plan.partitioner.Digest()
-	at += copy(raw[at:], digest[:])
-	binary.LittleEndian.PutUint64(raw[at:at+8], plan.current)
-	binary.LittleEndian.PutUint64(raw[at+8:at+16], plan.next)
-	raw[at+16], raw[at+17] = plan.childCount, plan.retained
-	at += 24
+	_, _ = digestWriter.Write(digest[:])
+	writeSplitOperationUint64(digestWriter, plan.current)
+	writeSplitOperationUint64(digestWriter, plan.next)
+	_, _ = digestWriter.Write([]byte{plan.childCount, plan.retained})
 	for child := 0; child < int(plan.childCount); child++ {
 		target := &plan.targets[child]
-		raw[at] = uint8(child)
-		at++
+		_, _ = digestWriter.Write([]byte{uint8(child)})
 		if target.Endpoint == "" {
 			continue
 		}
-		for _, id := range [...][16]byte{
-			target.WAL.ClusterID, target.WAL.ClusterIncarnation,
-			target.WAL.ShardIncarnation, target.WAL.GroupID,
-			target.WAL.StoreID, target.SQL.LogID,
-		} {
-			at += copy(raw[at:], id[:])
-		}
-		at += copy(raw[at:], target.SQL.RelationManifestDigest[:])
+		writeSplitOperationUint64(digestWriter, target.ReplicaSetVersion)
 		values := [...]uint64{
-			target.WAL.AllocationGeneration, target.WAL.MemberID,
 			target.TopologyRecoveryEpoch,
 			target.Authority.ActivePolicyGeneration, target.Authority.ProtectionEpoch,
 			target.Authority.OwnershipEpoch, target.Authority.SchemaGeneration,
 			target.Authority.RoutingVersion, target.Authority.RouteGeneration,
 		}
 		for _, value := range values {
-			binary.LittleEndian.PutUint64(raw[at:at+8], value)
-			at += 8
+			writeSplitOperationUint64(digestWriter, value)
+		}
+		for replicaIndex := range target.Replicas {
+			replicaDigest := preparedChildReplicaDigest(target.Replicas[replicaIndex])
+			_, _ = digestWriter.Write(replicaDigest[:])
 		}
 	}
-	return OperationID(sha256.Sum256(raw[:at]))
+	var result OperationID
+	copy(result[:], digestWriter.Sum(nil))
+	return result
+}
+
+func writeSplitOperationUint64(target hash.Hash, value uint64) {
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], value)
+	_, _ = target.Write(raw[:])
 }
 
 func reconstructSourceManifest(split *autosplit.SplitPlan) (*distribution.Manifest, error) {
@@ -512,8 +527,9 @@ type Observation struct {
 	Children    [autosplit.MaxSplitChildren]*ChildObservation
 	Prune       *rangesplit.RetainedPruneCursor
 
-	OlderCatalogDrained     bool
-	CatalogDrainCertificate gateway.ClusterCatalogDrainCertificate
+	OlderCatalogDrained      bool
+	CatalogDrainCertificate  gateway.ClusterCatalogDrainCertificate
+	RetainedPruneCertificate gateway.RetainedPruneCertificate
 }
 
 func observationCaptureHead(observed Observation) (uint64, bool) {
@@ -1054,11 +1070,82 @@ func cloneChildTarget(target ChildTarget) ChildTarget {
 		replica.Endpoint = distribution.EndpointID(strings.Clone(string(replica.Endpoint)))
 		replica.NativeEndpoint = distribution.EndpointID(strings.Clone(string(replica.NativeEndpoint)))
 		replica.ControlEndpoint = distribution.EndpointID(strings.Clone(string(replica.ControlEndpoint)))
+		replica.WAL.Distribution = strings.Clone(replica.WAL.Distribution)
+		replica.WAL.Shard = strings.Clone(replica.WAL.Shard)
+		replica.WALPath = strings.Clone(replica.WALPath)
+		replica.SQLPath = strings.Clone(replica.SQLPath)
+		replica.RuntimeRoot = strings.Clone(replica.RuntimeRoot)
+		replica.SQL = replica.SQL.Clone()
+		replica.Apply.Storage = strings.Clone(replica.Apply.Storage)
+		replica.Apply.CaptureStorage = strings.Clone(replica.Apply.CaptureStorage)
+		replica.Apply.Placement.ShardKey = strings.Clone(replica.Apply.Placement.ShardKey)
 	}
 	target.WAL.Distribution = strings.Clone(target.WAL.Distribution)
 	target.WAL.Shard = strings.Clone(target.WAL.Shard)
 	target.SQL = target.SQL.Clone()
 	return target
+}
+
+const maxPreparedChildPathBytes = 4096
+
+func validPreparedChildReplicas(
+	descriptor autosplit.SplitChildIdentity,
+	collection string,
+	target ChildTarget,
+) bool {
+	if len(target.Replicas) == 0 {
+		return false
+	}
+	for index := range target.Replicas {
+		replica := target.Replicas[index]
+		if !canonicalPreparedChildPath(replica.RuntimeRoot) ||
+			!canonicalPreparedChildPath(replica.WALPath) ||
+			!canonicalPreparedChildPath(replica.SQLPath) ||
+			replica.WALPath == replica.SQLPath || replica.WALPath == replica.RuntimeRoot ||
+			replica.SQLPath == replica.RuntimeRoot ||
+			!pathWithinPreparedRoot(replica.RuntimeRoot, replica.WALPath) ||
+			!pathWithinPreparedRoot(replica.RuntimeRoot, replica.SQLPath) ||
+			replica.CertificateDigest == ([sha256.Size]byte{}) ||
+			replica.WAL.MemberID != replica.Member || replica.WAL.StoreID != replica.StoreID ||
+			replica.WAL.Distribution != target.WAL.Distribution ||
+			replica.WAL.Shard != target.WAL.Shard ||
+			replica.WAL.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
+			replica.WAL.ClusterID != target.WAL.ClusterID ||
+			replica.WAL.ClusterIncarnation != target.WAL.ClusterIncarnation ||
+			replica.WAL.ShardIncarnation != target.WAL.ShardIncarnation ||
+			replica.WAL.GroupID != target.WAL.GroupID || replica.SQL.UserTable != collection ||
+			replica.SQL.LogID == ([16]byte{}) ||
+			replica.SQL.RelationManifestDigest != target.SQL.RelationManifestDigest ||
+			!sameSplitRelationPlacement(replica.SQL.Relations, target.SQL.Relations) ||
+			replica.Apply.Storage == "" || replica.Apply.CaptureStorage == "" ||
+			replica.Apply.Storage == replica.Apply.CaptureStorage ||
+			replica.Apply.ValidationDigest == ([sha256.Size]byte{}) ||
+			replica.Apply.MaxSessions == 0 || replica.Apply.RetryWindow == 0 ||
+			replica.Apply.Placement.Range != descriptor.Range ||
+			preparedChildReplicaDigest(replica) == ([sha256.Size]byte{}) {
+			return false
+		}
+		binding, err := raftmember.BindingForNewWAL(
+			replica.WAL, target.TopologyRecoveryEpoch, target.Authority,
+		)
+		if err != nil || replica.SQL.Binding != binding {
+			return false
+		}
+	}
+	return target.WAL == target.Replicas[0].WAL &&
+		target.SQL.Binding == target.Replicas[0].SQL.Binding &&
+		target.SQL.LogID == target.Replicas[0].SQL.LogID
+}
+
+func canonicalPreparedChildPath(path string) bool {
+	return path != "" && len(path) <= maxPreparedChildPathBytes && filepath.IsAbs(path) &&
+		filepath.Clean(path) == path && path != string(filepath.Separator)
+}
+
+func pathWithinPreparedRoot(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != "." && relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
 }
 
 func validChildReplicaTargets(split *autosplit.SplitPlan, child int, target ChildTarget) bool {

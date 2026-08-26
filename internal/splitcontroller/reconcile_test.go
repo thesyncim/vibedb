@@ -3,6 +3,8 @@ package splitcontroller
 import (
 	"crypto/sha256"
 	"errors"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"unsafe"
 
@@ -49,21 +51,20 @@ func TestNewPlanBindsExactCatalogAndChildRuntimeIdentity(t *testing.T) {
 		t.Fatalf("leader mismatch error = %v", err)
 	}
 
-	// The plan deeply owns the exact-length cold SQL relation manifest.
-	withRelation := target
-	withRelation.SQL.Relations = []sqldriver.ReplicatedShardRelationIdentity{{
-		Relation: 1, Table: "docs",
-	}}
+	// The plan deeply owns every replica-local string and identity.
+	ownedTarget := cloneChildTarget(target)
 	ownedPlan, err := NewPlan(
-		plan.sourceSnapshotForTest(t), split, plan.partitioner, []ChildTarget{withRelation},
+		plan.sourceSnapshotForTest(t), split, plan.partitioner, []ChildTarget{ownedTarget},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withRelation.SQL.Relations[0].Table = "mutated"
+	ownedTarget.Replicas[0].SQL.UserTable = "mutated"
+	ownedTarget.Replicas[0].Apply.Storage = "mutated"
 	retained, ok := ownedPlan.Target(1)
-	if !ok || retained.SQL.Relations[0].Table == "mutated" {
-		t.Fatalf("plan retained caller-owned SQL relation storage: %+v", retained.SQL.Relations)
+	if !ok || retained.Replicas[0].SQL.UserTable == "mutated" ||
+		retained.Replicas[0].Apply.Storage == "mutated" {
+		t.Fatalf("plan retained caller-owned replica identity: %+v", retained.Replicas[0])
 	}
 
 	// Caller-owned plan headers cannot relabel the accepted operation afterward.
@@ -524,22 +525,45 @@ func testChildTarget(
 		OwnershipEpoch: uint64(child.OwnershipEpoch), SchemaGeneration: 1,
 		RoutingVersion: uint64(split.Manifest().Version()), RouteGeneration: 20,
 	}
-	binding, err := raftmember.BindingForNewWAL(identity, 1, authority)
-	if err != nil {
-		t.Fatal(err)
-	}
 	replicas := make([]ChildReplicaTarget, len(child.Leaders))
+	root := t.TempDir()
 	for index, leader := range child.Leaders {
 		store := testID(byte(30 + index))
 		if index == 0 {
 			store = identity.StoreID
 		}
+		replicaWAL := identity
+		replicaWAL.MemberID = uint64(index + 1)
+		replicaWAL.StoreID = store
+		replicaBinding, bindErr := raftmember.BindingForNewWAL(replicaWAL, 1, authority)
+		if bindErr != nil {
+			t.Fatal(bindErr)
+		}
+		replicaSQL := sqldriver.ReplicatedShardStoreIdentity{
+			Binding: replicaBinding, LogID: testID(byte(60 + index)),
+			UserTable:              partitioner.CollectionName(),
+			RelationManifestDigest: sha256.Sum256([]byte("child-relations")),
+		}
+		replicaRoot := filepath.Join(root, "replica-"+strconv.Itoa(index+1))
 		replicas[index] = ChildReplicaTarget{
 			Member: uint64(index + 1), Node: testID(byte(20 + index)), StoreID: store,
 			NodeIncarnation: uint64(index + 1),
 			Endpoint:        distribution.EndpointID(string(leader) + "-peer"),
 			NativeEndpoint:  leader,
 			ControlEndpoint: distribution.EndpointID(string(leader) + "-control"),
+			WAL:             replicaWAL,
+			RuntimeRoot:     replicaRoot,
+			WALPath:         filepath.Join(replicaRoot, "child.wal"),
+			SQLPath:         filepath.Join(replicaRoot, "child.vdb"),
+			SQL:             replicaSQL,
+			Apply: sqldriver.ReplicatedApplyIdentity{
+				Storage:          "apply-" + strconv.Itoa(index+1),
+				CaptureStorage:   "capture-" + strconv.Itoa(index+1),
+				ValidationDigest: sha256.Sum256([]byte("apply-validation-" + strconv.Itoa(index+1))),
+				MaxSessions:      1, RetryWindow: 1,
+				Placement: sqldriver.ReplicatedPlacementProfile{ShardKey: "/id", Range: child.Range},
+			},
+			CertificateDigest: sha256.Sum256([]byte("replica-certificate-" + strconv.Itoa(index+1))),
 		}
 	}
 	return ChildTarget{
@@ -547,10 +571,7 @@ func testChildTarget(
 		Replicas:              replicas,
 		ReplicaSetVersion:     1,
 		TopologyRecoveryEpoch: 1, Authority: authority,
-		SQL: sqldriver.ReplicatedShardStoreIdentity{
-			Binding: binding, LogID: testID(6), UserTable: partitioner.CollectionName(),
-			RelationManifestDigest: sha256.Sum256([]byte("child-relations")),
-		},
+		SQL: replicas[0].SQL.Clone(),
 	}
 }
 
