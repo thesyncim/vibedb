@@ -219,7 +219,8 @@ func (runner *DurableRequestDistributedRunner) completeTerminal(
 		outcome = requestledger.OutcomeAborted
 	}
 	return runner.terminal.Complete(ctx, DurableRequestTerminalPlan{
-		Home: execution.Home, Key: execution.Key.RequestKey, Outcome: outcome,
+		Execution: execution,
+		Home:      execution.Home, Key: execution.Key.RequestKey, Outcome: outcome,
 		AffectedRows:      state.affected,
 		AffectedRowsValid: outcome == requestledger.OutcomeCommitted,
 		Result:            result,

@@ -16,12 +16,13 @@ import (
 // Home nor RequestKey and therefore cannot safely drive typed lifecycle CASes.
 // New in-process orchestration uses this context directly.
 type DurableRequestTypedExecutionContext struct {
-	Home              DurableRequestLedgerHome
-	Key               DurableRequestLedgerKey
-	Recipe            DurableRequestRecipe
-	Participants      DurableRequestReplayableParticipantStream
-	ExecutionPinRoute ReplicatedRoute
-	ExecutionPinLease executionpin.LeaseCertificate
+	Home                DurableRequestLedgerHome
+	Key                 DurableRequestLedgerKey
+	Recipe              DurableRequestRecipe
+	Participants        DurableRequestReplayableParticipantStream
+	ExecutionPinRoute   ReplicatedRoute
+	ExecutionPinAcquire executionpin.AcquireCertificate
+	ExecutionPinLease   executionpin.LeaseCertificate
 }
 
 // BuildDurableRequestExecutionPinBinding derives the one aggregate authority
@@ -77,6 +78,7 @@ func BindDurableRequestExecutionPin(
 		return DurableRequestTypedExecutionContext{}, errors.Join(err, bindingErr, wantErr, ErrDurableRequestConflict)
 	}
 	execution.ExecutionPinRoute = route
+	execution.ExecutionPinAcquire = acquire
 	execution.ExecutionPinLease = lease
 	return execution, nil
 }

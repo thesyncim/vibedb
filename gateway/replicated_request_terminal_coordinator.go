@@ -18,6 +18,7 @@ import (
 // template: PrepareTerminalDigest must be zero and is filled only after the
 // prepared result has become durable.
 type DurableRequestTerminalPlan struct {
+	Execution         DurableRequestTypedExecutionContext
 	Home              DurableRequestLedgerHome
 	Key               requestledger.RequestKey
 	Outcome           requestledger.Outcome
@@ -150,8 +151,43 @@ func (client *nativeDurableExecutionPinClient) RetryExact(
 // its complete client result is durable and the catalog execution pin has an
 // authenticated release certificate.
 type DurableRequestTerminalCoordinator struct {
-	ledger DurableRequestLedger
-	pin    durableExecutionPinClient
+	ledger     DurableRequestLedger
+	pin        durableExecutionPinClient
+	pinFactory durableExecutionPinClientFactory
+}
+
+type durableExecutionPinClientFactory interface {
+	OpenTerminalExecutionPinClient(
+		context.Context,
+		DurableRequestTypedExecutionContext,
+	) (durableExecutionPinClient, context.Context, error)
+}
+
+type nativeDurableExecutionPinClientFactory struct {
+	executor *ReplicatedExecutor
+	sessions DurableRequestExecutionPinSessionFactory
+}
+
+func (factory nativeDurableExecutionPinClientFactory) OpenTerminalExecutionPinClient(
+	ctx context.Context,
+	execution DurableRequestTypedExecutionContext,
+) (durableExecutionPinClient, context.Context, error) {
+	if factory.executor == nil || factory.sessions == nil || ctx == nil ||
+		!validReplicatedRoute(execution.ExecutionPinRoute) {
+		return nil, nil, ErrDurableRequest
+	}
+	session, principal, err := factory.sessions.OpenExecutionPinSession(
+		ctx, execution, execution.ExecutionPinRoute,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := newNativeDurableExecutionPinClient(session, factory.executor)
+	if err != nil || !principal.Valid() || !sameReplicatedCatalogRoute(session.route, execution.ExecutionPinRoute) {
+		return nil, nil, errors.Join(err, ErrDurableRequestConflict)
+	}
+	authorized, err := serviceauthz.WithAuthority(ctx, principal)
+	return client, authorized, err
 }
 
 func NewDurableRequestTerminalCoordinator(
@@ -176,11 +212,25 @@ func newDurableRequestTerminalCoordinator(
 	return &DurableRequestTerminalCoordinator{ledger: ledger, pin: pin}, nil
 }
 
+func NewDurableRequestTerminalCoordinatorWithSessionFactory(
+	ledger DurableRequestLedger,
+	executor *ReplicatedExecutor,
+	sessions DurableRequestExecutionPinSessionFactory,
+) (*DurableRequestTerminalCoordinator, error) {
+	if ledger == nil || executor == nil || sessions == nil {
+		return nil, ErrDurableRequest
+	}
+	return &DurableRequestTerminalCoordinator{
+		ledger:     ledger,
+		pinFactory: nativeDurableExecutionPinClientFactory{executor: executor, sessions: sessions},
+	}, nil
+}
+
 func (coordinator *DurableRequestTerminalCoordinator) Complete(
 	ctx context.Context,
 	plan DurableRequestTerminalPlan,
 ) (DurableRequestTerminalResult, error) {
-	if coordinator == nil || coordinator.ledger == nil || coordinator.pin == nil ||
+	if coordinator == nil || coordinator.ledger == nil || (coordinator.pin == nil && coordinator.pinFactory == nil) ||
 		ctx == nil || !validDurableRequestTerminalPlan(plan) {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
@@ -200,8 +250,22 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 			Terminal: terminal, Revision: head.Revision, Applied: applied,
 		}, nil
 	}
+	pin, pinCtx := coordinator.pin, ctx
+	if coordinator.pinFactory != nil {
+		if plan.Execution.Key.RequestKey != plan.Key ||
+			plan.Execution.Home.Identity != plan.Home.Identity ||
+			plan.Execution.Home.Point != plan.Home.Point ||
+			plan.Execution.ExecutionPinLease != plan.Lease ||
+			!plan.Execution.ExecutionPinAcquire.Valid() {
+			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+		}
+		pin, pinCtx, err = coordinator.pinFactory.OpenTerminalExecutionPinClient(ctx, plan.Execution)
+		if err != nil {
+			return DurableRequestTerminalResult{}, err
+		}
+	}
 	if prepared.Revision == 0 || release.Phase == requestledger.SchemaPinReleaseInvalid {
-		if err = coordinator.pin.ValidateFence(ctx, plan.Lease); err != nil {
+		if err = pin.ValidateFence(pinCtx, plan.Lease); err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 	}
@@ -254,7 +318,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		}
 	}
 	if release.Phase == requestledger.SchemaPinReleaseInvalid {
-		exact, buildErr := coordinator.pin.BuildRelease(transition)
+		exact, buildErr := pin.BuildRelease(transition)
 		if buildErr != nil {
 			return DurableRequestTerminalResult{}, buildErr
 		}
@@ -287,9 +351,9 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 	if release.Phase == requestledger.SchemaPinReleasing {
 		var settled ReplicatedResult
 		if createdRelease {
-			settled, err = coordinator.pin.ProposeNew(ctx, transition, release.Command)
+			settled, err = pin.ProposeNew(pinCtx, transition, release.Command)
 		} else {
-			settled, err = coordinator.pin.RetryExact(ctx, release.Command)
+			settled, err = pin.RetryExact(pinCtx, release.Command)
 		}
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
