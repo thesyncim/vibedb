@@ -218,7 +218,7 @@ func environmentMetadata(root string, binaryDigest [32]byte) ([]rf3bench.Metadat
 		{Key: []byte("go_version"), Value: bytes.TrimSpace(goVersion)},
 		{Key: []byte("goarch"), Value: []byte(runtime.GOARCH)},
 		{Key: []byte("goos"), Value: []byte(runtime.GOOS)},
-		{Key: []byte("scenario"), Value: []byte("isolate-elect-kill-retry-restart-catchup")},
+		{Key: []byte("scenario"), Value: []byte("isolate-elect-kill-lose-response-retry-restart-ack-waiter-wal")},
 		{Key: []byte("test_name"), Value: []byte(faultTestName)},
 		{Key: []byte("vcs_modified"), Value: []byte(strconv.FormatBool(len(dirty) != 0))},
 		{Key: []byte("vcs_revision"), Value: bytes.TrimSpace(revision)},

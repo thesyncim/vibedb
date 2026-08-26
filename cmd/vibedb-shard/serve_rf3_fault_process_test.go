@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -146,11 +147,34 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	fixture.restart(t, leader)
 	fixture.waitCaughtUp(t, leader, lastApplied, 30*time.Second)
 
+	// Send a complete command over the shipped TLS/native protocol, but never
+	// read its response. A separate linearizable read proves the mutation was
+	// applied before the response socket is discarded. Killing that leader and
+	// retrying the exact command on the surviving quorum then proves recovery
+	// does not depend on the lost response or the original process.
+	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+	lostResponse := fixture.mutationCommand(t, states[leader], epoch, 4, "response-lost")
+	blindConnection := fixture.sendWithoutReadingResponse(t, leader,
+		fixture.proposalRequest(leader, states[leader], lostResponse))
+	lostApplied := fixture.waitDocument(t, leader, states[leader], "response-lost", 30*time.Second)
+	_ = blindConnection.Close()
+	fixture.kill(t, leader)
+	live = rf3FaultOtherMembers(leader)
+	retryLeader, retryStates = fixture.waitLeader(t, live, 30*time.Second)
+	retried = fixture.propose(t, retryLeader, retryStates[retryLeader], lostResponse)
+	if retried.Kind != shardservice.ReplicatedCompletion ||
+		retried.Outcome.AppliedIndex < lostApplied {
+		t.Fatalf("lost-response retry did not recover the durable completion: %+v", retried)
+	}
+	lastApplied = retried.Outcome.AppliedIndex
+	fixture.restart(t, leader)
+	fixture.waitCaughtUp(t, leader, lastApplied, 30*time.Second)
+
 	// Exercise the shipped registry's complete 64-waiter budget against one
 	// identity. Admission-bound callers are permitted, but every admitted caller
 	// must finish and capacity must be reusable by the following command.
 	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
-	coalesced := fixture.mutationCommand(t, states[leader], epoch, 4, "bounded-waiters")
+	coalesced := fixture.mutationCommand(t, states[leader], epoch, 5, "bounded-waiters")
 	const callers = 64
 	results := make(chan rf3FaultRoundTrip, callers)
 	var launch sync.WaitGroup
@@ -167,7 +191,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	}
 	launch.Wait()
 	close(results)
-	completed := 0
+	completed, refused := 0, 0
 	for result := range results {
 		if result.err != nil {
 			t.Fatalf("bounded waiter caller leaked/block-failed: %v", result.err)
@@ -177,6 +201,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 			completed++
 		case result.response.Kind == shardservice.ReplicatedRefusal &&
 			result.response.Refusal == shardservice.ReplicatedRefusalAdmissionBound:
+			refused++
 		default:
 			t.Fatalf("bounded waiter result = %+v", result.response)
 		}
@@ -186,17 +211,39 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 	}
 	states[leader] = fixture.probe(t, leader)
 	afterBound := fixture.propose(t, leader, states[leader],
-		fixture.mutationCommand(t, states[leader], epoch, 5, "waiter-capacity-reused"))
+		fixture.mutationCommand(t, states[leader], epoch, 6, "waiter-capacity-reused"))
 	if afterBound.Kind != shardservice.ReplicatedCompletion {
 		t.Fatalf("waiter capacity was not reusable: %+v", afterBound)
 	}
 	lastApplied = afterBound.Outcome.AppliedIndex
 	fixture.waitAllApplied(t, lastApplied, 30*time.Second)
 
-	if allocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths); allocated-fixture.walAllocatedBaseline > 256<<20 {
-		t.Fatalf("small RF3 fault run allocated %d additional WAL bytes, want <= %d",
-			allocated-fixture.walAllocatedBaseline, 256<<20)
+	// Sequence 6 durably acknowledges sequence 5. Restart every replica, one at
+	// a time with quorum retained, then replay sequence 5. The exact
+	// RetryRetired outcome proves that the acknowledgement floor survived all
+	// three process lifetimes rather than existing only in a leader cache.
+	for member := 0; member < rf3CommandMembers; member++ {
+		fixture.kill(t, member)
+		fixture.restart(t, member)
+		fixture.waitCaughtUp(t, member, lastApplied, 30*time.Second)
+		fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
 	}
+	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+	acknowledged := fixture.propose(t, leader, states[leader], coalesced)
+	if acknowledged.Kind != shardservice.ReplicatedRefusal ||
+		acknowledged.Refusal != shardservice.ReplicatedRefusalDeterministic ||
+		acknowledged.Outcome.Code != raftserve.OutcomeRetryRetired {
+		t.Fatalf("acknowledged result survived as a replayable completion: %+v", acknowledged)
+	}
+
+	allocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	allocatedDelta := allocated - fixture.walAllocatedBaseline
+	if allocatedDelta < 0 || allocatedDelta > 256<<20 {
+		t.Fatalf("small RF3 fault run allocated %d additional WAL bytes, want <= %d",
+			allocatedDelta, 256<<20)
+	}
+	t.Logf("RF3 evidence: lost_response_applied=%d waiter_completions=%d waiter_refusals=%d wal_allocated_delta_bytes=%d ack_outcome=%d",
+		lostApplied, completed, refused, allocatedDelta, acknowledged.Outcome.Code)
 }
 
 type rf3FaultRoundTrip struct {
@@ -278,7 +325,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
 		}
-		basePath, applyPath, keyPath := filepath.Join(memberRoot, "sql-identity.json"), filepath.Join(memberRoot, "apply-identity.json"), filepath.Join(memberRoot, "wal-key")
+		basePath, applyPath, keyPath := filepath.Join(memberRoot, "sql-identity.vibejson"), filepath.Join(memberRoot, "apply-identity.vibejson"), filepath.Join(memberRoot, "wal-key")
 		writeRF3CommandIdentity(t, basePath, prepared.Base)
 		writeRF3CommandIdentity(t, applyPath, prepared.ApplyIdentity)
 		if err = os.WriteFile(keyPath, keyMaterial, 0o600); err != nil {
@@ -288,7 +335,7 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 			t.Fatal(err)
 		}
 		fixture.walPaths[member] = prepared.WALPath
-		fixture.manifestPaths[member] = filepath.Join(memberRoot, "serve-rf3.json")
+		fixture.manifestPaths[member] = filepath.Join(memberRoot, "serve-rf3.vibejson")
 		document := rf3CommandManifestDocument(prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
 			fixture.peerAddresses[member], fixture.nativeAddresses[member],
 			fixture.snapshotAddresses[member], fixture.controlAddresses[member], credentials[member], roots,
@@ -307,6 +354,9 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		}
 	}
 	fixture.walAllocatedBaseline = rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	if fixture.walAllocatedBaseline <= 0 {
+		t.Fatal("RF3 WAL allocation baseline has no physical blocks")
+	}
 	return fixture
 }
 
@@ -573,6 +623,64 @@ func (fixture *rf3FaultFixture) roundTripContext(ctx context.Context, member int
 	return shardservice.RoundTripReplicated(ctx, connection, request)
 }
 
+func (fixture *rf3FaultFixture) sendWithoutReadingResponse(
+	t testing.TB,
+	member int,
+	request *shardservice.ReplicatedRequest,
+) net.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", fixture.nativeAddresses[member])
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := (member + 1) % rf3CommandMembers
+	connection, err := fixture.profiles[client].Client(
+		ctx, raw, fixture.nodes[member], rafttransport.TrafficShardNative,
+		func() time.Time { return time.Now().Add(3 * time.Second) },
+	)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err = shardservice.EncodeReplicatedRequestBorrowed(connection, request); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	return connection
+}
+
+func (fixture *rf3FaultFixture) waitDocument(
+	t testing.TB,
+	member int,
+	state shardservice.ReplicatedMemberState,
+	id string,
+	timeout time.Duration,
+) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		response, err := fixture.roundTrip(t, member, &shardservice.ReplicatedRequest{
+			Operation: shardservice.ReplicatedReadLeader,
+			Authority: serviceauthz.Authority{
+				Node:       fixture.nodes[(member+1)%rf3CommandMembers],
+				Generation: fixture.authority.ActivePolicyGeneration,
+			},
+			Capability: serviceauthz.CapabilityDataRead,
+			Fence:      state.Fence, Relation: 1, Key: rf3FaultKey(t, id),
+			MaxValueBytes: 1 << 20,
+		})
+		if err == nil && response.Kind == shardservice.ReplicatedReadFound &&
+			string(response.Value) == fmt.Sprintf(`{"id":%q}`, id) {
+			return response.ReadApplied
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("member %d did not make document %q visible", member+1, id)
+	return 0
+}
+
 func rf3FaultKey(t testing.TB, id string) []byte {
 	t.Helper()
 	raw := append(append([]byte{'"'}, id...), '"')
@@ -615,16 +723,26 @@ func rf3FaultWALAllocatedBytes(t testing.TB, paths [rf3CommandMembers]string) in
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(matches) == 0 {
+			t.Fatalf("WAL allocation evidence path %q has no files", path)
+		}
+		regular := false
 		for _, match := range matches {
 			info, err := os.Stat(match)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if info.Mode().IsRegular() {
-				if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-					total += int64(stat.Blocks) * 512
+				regular = true
+				stat, ok := info.Sys().(*syscall.Stat_t)
+				if !ok {
+					t.Fatalf("WAL allocation evidence lacks physical block metadata for %q", match)
 				}
+				total += int64(stat.Blocks) * 512
 			}
+		}
+		if !regular {
+			t.Fatalf("WAL allocation evidence path %q has no regular files", path)
 		}
 	}
 	return total

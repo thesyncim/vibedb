@@ -7,8 +7,12 @@ driver and writes one canonical TSV evidence file. Each repetition exercises:
 - rejection of a stale linearizable-read fence by the resumed former leader;
 - leader `SIGKILL` before a proposal and successful post-election proposal;
 - a request/response `SIGKILL` race followed by byte-identical recovery;
-- restart and catch-up of the killed replica; and
-- bounded request-waiter admission and reuse.
+- an applied mutation whose native response is deliberately never read,
+  followed by leader kill and byte-identical recovery from the surviving
+  quorum;
+- restart and catch-up of killed replicas;
+- bounded request-waiter admission and reuse; and
+- durable acknowledgement survival after all three replicas have restarted.
 
 Run at least nine isolated repetitions for publication:
 
@@ -24,6 +28,14 @@ exact working tree once, hashes that test binary, then starts a fresh test
 process for every repetition. The test process starts three real
 `vibedb-shard serve-rf3` OS-process children. A skipped test is a failed
 qualification, even when the test binary exits successfully.
+
+The physical WAL-allocation prerequisite is Linux-only. Darwin cannot prove
+strict recovery-journal allocation, so the harness skips there and `rf3chaos`
+intentionally returns nonzero after preserving a failed TSV row. A Darwin run
+is useful only to confirm that limitation; it is not RF3 fault qualification.
+The Linux CI job runs one mandatory repetition through this runner, so an
+unsupported filesystem, a skip, an absent exact test, or any failed assertion
+fails closed.
 
 The report retains the commit and dirty state, test binary digest, exact-test
 proof, process exit, timeout state, total output bytes, output digest, and

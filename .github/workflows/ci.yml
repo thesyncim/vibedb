@@ -36,6 +36,13 @@ jobs:
         # package binaries keeps the aggregate virtual-memory reservation
         # deterministic without reducing test coverage or per-package timeouts.
         run: go test -p=1 -timeout=25m ./...
+      - name: RF3 external-process fault evidence
+        if: matrix.runner == 'ubuntu-latest'
+        run: |
+          rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
+          go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 3m
+          test -s "${rf3_evidence_path}"
+          sed -n '1,40p' "${rf3_evidence_path}"
       - name: PostgreSQL client integration
         if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient
