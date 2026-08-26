@@ -22,6 +22,8 @@ import (
 
 const multiGroupRF3RequestLedgerRangeDomain = "vibedb/test/multiraft-request-ledger-range/format-0\x00"
 
+const multiGroupRF3DataRangeDomain = "vibedb/test/multiraft-data-range/format-0\x00"
+
 func multiGroupRF3RequestLedgerRangeIdentity(group int) [sha256.Size]byte {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(multiGroupRF3RequestLedgerRangeDomain))
@@ -31,21 +33,32 @@ func multiGroupRF3RequestLedgerRangeIdentity(group int) [sha256.Size]byte {
 	return identity
 }
 
+func multiGroupRF3RangeIdentity(group int) replication.Digest {
+	if group == multiGroupRF3LedgerGroup {
+		return replication.Digest(multiGroupRF3RequestLedgerRangeIdentity(group))
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(multiGroupRF3DataRangeDomain))
+	_, _ = hash.Write([]byte{byte(group)})
+	var identity replication.Digest
+	_ = hash.Sum(identity[:0])
+	return identity
+}
+
+func multiGroupRF3RouteDigest(domain string, identity replication.Digest) replication.Digest {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(domain))
+	_, _ = hash.Write(identity[:])
+	var digest replication.Digest
+	_ = hash.Sum(digest[:0])
+	return digest
+}
+
 func multiGroupRF3RequestLedgerRoute(
 	cluster *multiGroupTransactionRF3Cluster,
 	group int,
 ) gateway.ReplicatedRoute {
-	route := cluster.route(group)
-	route.RangeIdentity = replication.Digest(multiGroupRF3RequestLedgerRangeIdentity(group))
-	route.LineageDigest = sha256.Sum256(append(
-		[]byte("vibedb/test/multiraft-request-ledger-lineage/format-0\x00"),
-		route.RangeIdentity[:]...,
-	))
-	route.ForwardingRuleDigest = sha256.Sum256(append(
-		[]byte("vibedb/test/multiraft-request-ledger-forwarding/format-0\x00"),
-		route.RangeIdentity[:]...,
-	))
-	return route
+	return cluster.route(group)
 }
 
 func (network *multiGroupRF3Network) nodeIsolated(node int) bool {
@@ -57,6 +70,15 @@ func (network *multiGroupRF3Network) nodeIsolated(node int) bool {
 		}
 	}
 	return false
+}
+
+func (network *multiGroupRF3Network) heal(node int) {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	for peer := 0; peer < multiGroupRF3Voters; peer++ {
+		network.blocked[node][peer] = false
+		network.blocked[peer][node] = false
+	}
 }
 
 type multiGroupRequestLedgerRF3Trace struct {
@@ -130,7 +152,7 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 		return nil, errors.New("RF3 request-ledger endpoint is outside the cluster")
 	}
 	group := -1
-	for candidate := 0; candidate < multiGroupRF3Groups; candidate++ {
+	for candidate := 0; candidate < client.cluster.groupCount; candidate++ {
 		if request.Fence.Group == client.cluster.groups[candidate].key {
 			group = candidate
 			break
@@ -144,19 +166,23 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 	}
 
 	var trace multiGroupRequestLedgerRF3Trace
+	ledgerProposal := false
 	if request.Operation == shardservice.ReplicatedPropose {
 		outer, err := replication.OpenCommand(request.Command)
-		if err != nil || outer.Kind() != replication.CommandRequestLedger {
-			return nil, errors.Join(err, errors.New("RF3 request-ledger proposal is not canonical"))
-		}
-		inner, err := outer.OpenRequestLedgerInto(nil)
 		if err != nil {
 			return nil, err
 		}
-		trace = multiGroupRequestLedgerRF3Trace{
-			group: group, member: member, service: outer.ClientID,
-			operation: inner.Operation, outer: bytes.Clone(request.Command),
-			inner: bytes.Clone(outer.RequestLedgerBytes()),
+		if outer.Kind() == replication.CommandRequestLedger {
+			inner, openErr := outer.OpenRequestLedgerInto(nil)
+			if openErr != nil {
+				return nil, openErr
+			}
+			ledgerProposal = true
+			trace = multiGroupRequestLedgerRF3Trace{
+				group: group, member: member, service: outer.ClientID,
+				operation: inner.Operation, outer: bytes.Clone(request.Command),
+				inner: bytes.Clone(outer.RequestLedgerBytes()),
+			}
 		}
 	}
 
@@ -178,7 +204,7 @@ func (client *multiGroupRequestLedgerRF3RoundTripper) DoReplicated(
 	}
 
 	hide := false
-	if request.Operation == shardservice.ReplicatedPropose {
+	if ledgerProposal {
 		client.mu.Lock()
 		hide = !client.hidden && client.hideOperation != requestledger.OperationInvalid &&
 			trace.operation == client.hideOperation && response != nil &&
@@ -261,10 +287,10 @@ func newMultiGroupRF3DurableLedger(
 // and a fresh gateway-service outer identity. Native TLS authorization and the
 // full SQL runner are separate boundaries and are not claimed by this test.
 func TestTwoGatewayRequestLedgerRF3RecoversUnknownCreateAcrossLeaderPartition(t *testing.T) {
-	cluster := newMultiGroupTransactionRF3Cluster(t)
+	cluster := newMultiGroupRF3Cluster(t, multiGroupRF3MaxGroups)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	group := 0
+	group := multiGroupRF3LedgerGroup
 	if err := cluster.owners[0].Campaign(ctx, cluster.groups[group].key); err != nil {
 		t.Fatal(err)
 	}

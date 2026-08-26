@@ -141,8 +141,10 @@ func newPeerServerTestTLS(
 }
 
 const (
-	multiGroupRF3Groups = 2
-	multiGroupRF3Voters = 3
+	multiGroupRF3Groups      = 2
+	multiGroupRF3MaxGroups   = 3
+	multiGroupRF3LedgerGroup = 2
+	multiGroupRF3Voters      = 3
 )
 
 type multiGroupRF3Group struct {
@@ -262,7 +264,8 @@ func (network *multiGroupRF3Network) close() {
 }
 
 type multiGroupTransactionRF3Cluster struct {
-	groups     [multiGroupRF3Groups]multiGroupRF3Group
+	groups     [multiGroupRF3MaxGroups]multiGroupRF3Group
+	groupCount int
 	owners     [multiGroupRF3Voters]*Owner
 	peers      [multiGroupRF3Voters]*AuthenticatedPeerRuntime
 	contexts   [multiGroupRF3Voters]context.Context
@@ -287,6 +290,13 @@ func (cluster *multiGroupTransactionRF3Cluster) route(group int) gateway.Replica
 		Command:              rf3CommandFence(cluster.groups[group].runtimes[0].Identity(), base),
 		Replicas:             make([]gateway.ReplicatedEndpoint, 0, multiGroupRF3Voters),
 	}
+	route.RangeIdentity = multiGroupRF3RangeIdentity(group)
+	route.LineageDigest = multiGroupRF3RouteDigest(
+		"vibedb/test/multiraft-route-lineage/format-0\x00", route.RangeIdentity,
+	)
+	route.ForwardingRuleDigest = multiGroupRF3RouteDigest(
+		"vibedb/test/multiraft-route-forwarding/format-0\x00", route.RangeIdentity,
+	)
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		identity := cluster.groups[group].runtimes[member].Identity()
 		address := "rf3-owner-" + string(rune('1'+member))
@@ -341,7 +351,7 @@ type multiGroupRF3RoundTripper struct {
 	hiddenMember  int
 	hiddenCommand []byte
 	trace         []multiGroupRF3GatewayTrace
-	recoveryReads [multiGroupRF3Groups]int
+	recoveryReads [multiGroupRF3MaxGroups]int
 }
 
 func newMultiGroupRF3RoundTripper(
@@ -370,7 +380,7 @@ func (client *multiGroupRF3RoundTripper) DoReplicated(
 		return nil, errors.New("RF3 gateway test endpoint member is outside the cluster")
 	}
 	group := -1
-	for candidate := 0; candidate < multiGroupRF3Groups; candidate++ {
+	for candidate := 0; candidate < client.cluster.groupCount; candidate++ {
 		if request.Fence.Group == client.cluster.groups[candidate].key {
 			group = candidate
 			break
@@ -457,10 +467,22 @@ func (client *multiGroupRF3RoundTripper) gatewayTrace() []multiGroupRF3GatewayTr
 }
 
 func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3Cluster {
+	return newMultiGroupRF3Cluster(t, multiGroupRF3Groups)
+}
+
+func newMultiGroupRF3Cluster(
+	t testing.TB,
+	groupCount int,
+) *multiGroupTransactionRF3Cluster {
 	t.Helper()
-	cluster := &multiGroupTransactionRF3Cluster{stopPulses: make(chan struct{})}
+	if groupCount <= 0 || groupCount > multiGroupRF3MaxGroups {
+		t.Fatalf("RF3 group count %d is outside [1,%d]", groupCount, multiGroupRF3MaxGroups)
+	}
+	cluster := &multiGroupTransactionRF3Cluster{
+		groupCount: groupCount, stopPulses: make(chan struct{}),
+	}
 	cluster.network.conns = make(map[*multiGroupRF3Conn]struct{})
-	for group := 0; group < multiGroupRF3Groups; group++ {
+	for group := 0; group < cluster.groupCount; group++ {
 		for member := 0; member < multiGroupRF3Voters; member++ {
 			cluster.groups[group].runtimes[member], cluster.groups[group].bases[member],
 				cluster.groups[group].reads[member] = newMultiGroupRF3Runtime(
@@ -469,15 +491,19 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 		}
 		cluster.groups[group].key = cluster.groups[group].runtimes[0].Identity().Group
 	}
-	if cluster.groups[0].key == cluster.groups[1].key {
-		t.Fatal("two RF3 groups share one logical identity")
+	for group := 0; group < cluster.groupCount; group++ {
+		for prior := 0; prior < group; prior++ {
+			if cluster.groups[group].key == cluster.groups[prior].key {
+				t.Fatalf("RF3 groups %d and %d share one logical identity", prior, group)
+			}
+		}
 	}
 
 	var nodes [multiGroupRF3Voters]rafttransport.NodeID
-	members := make([]rafttransport.Member, 0, multiGroupRF3Groups*multiGroupRF3Voters)
+	members := make([]rafttransport.Member, 0, cluster.groupCount*multiGroupRF3Voters)
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		nodes[member][0] = byte(member + 1)
-		for group := 0; group < multiGroupRF3Groups; group++ {
+		for group := 0; group < cluster.groupCount; group++ {
 			members = append(members, rafttransport.Member{
 				Group: cluster.groups[group].key, ReplicaSetVersion: 1,
 				MemberID: uint64(member + 1), Node: nodes[member],
@@ -489,7 +515,7 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 	for member := 0; member < multiGroupRF3Voters; member++ {
 		registry, err := rafttransport.NewStaticRegistry(
 			nodes[member], members,
-			rafttransport.Limits{MaxGroups: multiGroupRF3Groups, MaxMembers: len(members)},
+			rafttransport.Limits{MaxGroups: cluster.groupCount, MaxMembers: len(members)},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -526,11 +552,11 @@ func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3C
 		if err != nil {
 			t.Fatal(err)
 		}
-		identities := make([]raftmember.RuntimeIdentity, 0, multiGroupRF3Groups)
-		fences := make([]CommandFence, 0, multiGroupRF3Groups)
-		reads := make([]ReadSource, 0, multiGroupRF3Groups)
-		recovery := make([]TransactionRecoverySource, 0, multiGroupRF3Groups)
-		for group := 0; group < multiGroupRF3Groups; group++ {
+		identities := make([]raftmember.RuntimeIdentity, 0, cluster.groupCount)
+		fences := make([]CommandFence, 0, cluster.groupCount)
+		reads := make([]ReadSource, 0, cluster.groupCount)
+		recovery := make([]TransactionRecoverySource, 0, cluster.groupCount)
+		for group := 0; group < cluster.groupCount; group++ {
 			runtime := cluster.groups[group].runtimes[member]
 			if err := host.Add(runtime); err != nil {
 				t.Fatal(err)
@@ -680,7 +706,7 @@ func (cluster *multiGroupTransactionRF3Cluster) proposalTrace() []multiGroupRF3T
 
 func multiGroupRF3HostLimits() multiraft.Limits {
 	return multiraft.Limits{
-		MaxGroups: 2, MaxQueueItems: 512, MaxQueueBytes: 256 << 20,
+		MaxGroups: multiGroupRF3MaxGroups, MaxQueueItems: 512, MaxQueueBytes: 256 << 20,
 		MaxGroupItems: 256, MaxGroupBytes: 128 << 20,
 		MaxOutboxItems: 512, MaxOutboxBytes: 256 << 20,
 		MaxPendingTicks: 16,
@@ -892,8 +918,8 @@ func newMultiGroupRF3Runtime(
 	memberID uint64,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
-	shards := [...]string{"0000-7fff", "8000-ffff"}
-	distributions := [...]string{"orders-a", "orders-b"}
+	shards := [...]string{"0000-7fff", "8000-ffff", "request-ledger"}
+	distributions := [...]string{"orders-a", "orders-b", "durable-requests"}
 	identity := raftstore.Identity{
 		Distribution: distributions[group], Shard: shards[group],
 		AllocationGeneration: uint64(7 + group), MemberID: memberID,
@@ -963,20 +989,23 @@ func newMultiGroupRF3Runtime(
 	if err != nil {
 		t.Fatal(err)
 	}
-	apply, _, err := raftmember.OpenPreparedApply(
-		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
-			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits:                        durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
-			RequestLedgerCapacityBytes:       64 << 20,
-			RequestLedgerCleanupReserveBytes: 8 << 20,
-			RequestLedgerRangeIdentity:       multiGroupRF3RequestLedgerRangeIdentity(group),
-			Placement: sqldriver.ReplicatedPlacementProfile{
-				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
-				TupleVersion:  distribution.CurrentTupleVersion,
-				MapperVersion: distribution.NativeMapperVersion,
-				Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
-			},
+	applyOptions := sqldriver.ReplicatedApplyOptions{
+		MaxSessions: 32, RetryWindow: 8,
+		TxnLimits: durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
+		Placement: sqldriver.ReplicatedPlacementProfile{
+			Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
 		},
+	}
+	if group == multiGroupRF3LedgerGroup {
+		applyOptions.RequestLedgerCapacityBytes = 64 << 20
+		applyOptions.RequestLedgerCleanupReserveBytes = 8 << 20
+		applyOptions.RequestLedgerRangeIdentity = multiGroupRF3RequestLedgerRangeIdentity(group)
+	}
+	apply, _, err := raftmember.OpenPreparedApply(
+		wal, database, authority, base, applyOptions,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1819,8 +1848,8 @@ func multiGroupRF3SQLSnapshot(
 ) *gateway.Snapshot {
 	t.Helper()
 	config := distribution.ClusterConfig{}
-	endpoints := make(map[distribution.EndpointID]string, multiGroupRF3Groups*multiGroupRF3Voters*3)
-	descriptors := make([]gateway.ReplicatedShardDescriptor, 0, multiGroupRF3Groups)
+	endpoints := make(map[distribution.EndpointID]string, cluster.groupCount*multiGroupRF3Voters*3)
+	descriptors := make([]gateway.ReplicatedShardDescriptor, 0, cluster.groupCount)
 	profiles := make([]gateway.ReplicatedTableProfile, 0, multiGroupRF3Groups)
 	for group := 0; group < multiGroupRF3Groups; group++ {
 		route := cluster.route(group)
@@ -1879,8 +1908,9 @@ func multiGroupRF3SQLSnapshot(
 		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
 			Distribution: route.Distribution, Shard: route.Shard, Group: route.Group,
 			AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
-			Command:              route.Command,
-			Replicas:             replicas,
+			Command:              route.Command, RangeIdentity: route.RangeIdentity,
+			LineageDigest: route.LineageDigest, ForwardingRuleDigest: route.ForwardingRuleDigest,
+			Replicas: replicas,
 		})
 		profiles = append(profiles, gateway.ReplicatedTableProfile{
 			Table: table, Relation: 1, PrimaryKey: primary,
@@ -1888,6 +1918,51 @@ func multiGroupRF3SQLSnapshot(
 			RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
 			MaxKeyBytes:            replication.MaxMutationKeyBytes,
 			MaxDocumentBytes:       replication.MaxMutationValueBytes,
+		})
+	}
+	if cluster.groupCount > multiGroupRF3Groups {
+		group := multiGroupRF3LedgerGroup
+		route := cluster.route(group)
+		leaders := make([]distribution.EndpointID, 0, multiGroupRF3Voters)
+		replicas := make([]gateway.ReplicatedReplicaDescriptor, 0, multiGroupRF3Voters)
+		for member := range route.Replicas {
+			replica := route.Replicas[member]
+			sqlEndpoint := distribution.EndpointID("sql-" + replica.Address)
+			nativeEndpoint := distribution.EndpointID(replica.NativeEndpoint)
+			controlEndpoint := distribution.EndpointID("control-" + replica.Address)
+			leaders = append(leaders, sqlEndpoint)
+			endpoints[sqlEndpoint] = string(sqlEndpoint)
+			endpoints[nativeEndpoint] = replica.NativeEndpoint
+			endpoints[controlEndpoint] = string(controlEndpoint)
+			replicas = append(replicas, gateway.ReplicatedReplicaDescriptor{
+				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
+				NodeIncarnation: replica.NodeIncarnation, Endpoint: sqlEndpoint,
+				NativeEndpoint: nativeEndpoint, ControlEndpoint: controlEndpoint,
+			})
+		}
+		manifest, err := distribution.NewManifest(route.Distribution,
+			distribution.RoutingVersion(route.Command.RoutingVersion), []distribution.Shard{{
+				ID:                   route.Shard,
+				AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
+				Range:                distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+				Leaders:              leaders, Epoch: distribution.OwnershipEpoch(route.Command.OwnershipEpoch),
+			}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		config.Distributions = append(config.Distributions, distribution.DistributionSpec{
+			Name: route.Distribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+		})
+		config.Manifests = append(config.Manifests, manifest)
+		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
+			Distribution: route.Distribution, Shard: route.Shard, Group: route.Group,
+			AllocationGeneration: distribution.ShardAllocationGeneration(route.AllocationGeneration),
+			Command:              route.Command, RangeIdentity: route.RangeIdentity,
+			LineageDigest: route.LineageDigest, ForwardingRuleDigest: route.ForwardingRuleDigest,
+			RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{
+				Identity: route.RangeIdentity,
+			}},
+			Replicas: replicas,
 		})
 	}
 	var indexes []gateway.IndexDescriptor
