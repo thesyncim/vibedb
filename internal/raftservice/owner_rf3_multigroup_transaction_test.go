@@ -965,7 +965,10 @@ func newMultiGroupRF3Runtime(
 	apply, _, err := raftmember.OpenPreparedApply(
 		wal, database, authority, base, sqldriver.ReplicatedApplyOptions{
 			MaxSessions: 32, RetryWindow: 8,
-			TxnLimits: durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
+			TxnLimits:                        durable.TxnLimits{MaxCollections: 8, MaxDocuments: 1024, MaxBytes: 256 << 20},
+			RequestLedgerCapacityBytes:       64 << 20,
+			RequestLedgerCleanupReserveBytes: 8 << 20,
+			RequestLedgerRangeIdentity:       multiGroupRF3RequestLedgerRangeIdentity(group),
 			Placement: sqldriver.ReplicatedPlacementProfile{
 				Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: "/id",
 				TupleVersion:  distribution.CurrentTupleVersion,
