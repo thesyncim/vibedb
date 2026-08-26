@@ -181,11 +181,26 @@ var Distributed = []Feature{
 		Integrated: Stage{StatusYes, "Authenticated peer runtime, replicated shard service, and native gateway executor form a complete internal RF3 path.", []Reference{
 			ref("internal/raftservice/peer.go", "AuthenticatedPeerRuntime"), ref("gateway/replicated_native.go", "ReplicatedExecutor"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-shard prepare-rf3 atomically creates one stable three-voter member root. serve-rf3 opens that retained group, constructs its bounded Multi-Raft host and authenticated peer transport, and serves the authenticated native endpoint.", []Reference{
+		Shipped: Stage{StatusYes, "vibedb-shard prepare-rf3 atomically creates one stable three-voter member root. serve-rf3 opens that retained group, routes it through one of 1..64 deterministic execution lanes, shares one authenticated per-peer transport across all lanes, and serves the authenticated native endpoint. The current manifest still loads one group per process.", []Reference{
 			ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"), ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"),
 		}},
 		Qualification: Stage{StatusPartial, "A preparation gate proves complete restartable artifact publication and overwrite refusal. A shipped-composition three-process gate proves retained-state opening, mutual TLS, natural election, authenticated reads, and clean process shutdown. Internal fault gates additionally prove follower catch-up, pre-admission leader loss, post-apply response loss, byte-identical retry, and acknowledged-result survival. Exhaustive external quorum/apply cuts remain absent.", []Reference{
 			ref("cmd/vibedb-shard/prepare_rf3_test.go", "TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"), ref("internal/raftservice/process_rf3_test.go", "TestRF3NativeServingThreeProcessRecoveryEvidence"), ref("internal/raftservice/owner_rf3_test.go", "TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry"),
+		}},
+	},
+	{
+		Name: "Automatic Raft WAL retention",
+		Primitive: Stage{StatusYes, "Checkpoint-bound WAL generation preparation, authenticated selection, publication, settlement, and old-generation replacement exist.", []Reference{
+			ref("internal/raftstore/generation_activate.go", "GenerationActivation"), ref("internal/raftmember/generation_driver.go", "WALGenerationDriverOptions"),
+		}},
+		Integrated: Stage{StatusYes, "Each RF3 runtime captures and prepares generation authority on its owner lane, builds one immutable candidate on a bounded background worker, revalidates the checkpoint before publication, and retries post-selection settlement without blocking Raft progress.", []Reference{
+			ref("internal/raftmember/generation_driver.go", "ConfigureWALGeneration"), ref("internal/raftmember/generation_driver_test.go", "TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress"),
+		}},
+		Shipped: Stage{StatusYes, "serve-rf3 enables checkpoint-driven WAL generation maintenance on a fixed logical cadence and settles an authenticated selecting generation before runtime adoption after restart.", []Reference{
+			ref("cmd/vibedb-shard/serve_rf3.go", "rf3WALGenerationIntervalTicks"), ref("internal/raftmember/generation_driver.go", "ConfigureWALGeneration"),
+		}},
+		Qualification: Stage{StatusPartial, "Repeated generation, idle, restart, selected-generation recovery, and blocked-build progress tests exist. Long-running external crash loops and hard retained-WAL/live-data ratio gates remain absent.", []Reference{
+			ref("internal/raftmember/generation_driver_test.go", "TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart"),
 		}},
 	},
 	{
@@ -214,8 +229,8 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusYes, "serve-rf3 exposes authenticated membership, observation, snapshot-source, ownership, and retirement control. vibedb-gateway starts the resumable move controller when a strict replica-control manifest is present.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-gateway/replica_health_controller.go", "startGatewayReplicaControllers"), ref("cmd/vibedb-gateway/serve.go", "runServe"),
 		}},
-		Qualification: Stage{StatusPartial, "Deterministic action tests cover the complete ordered lifecycle and real hosts cover authenticated transfer with continued apply. The full command-level replacement sequence is not yet proven by one external crash/restart gate.", []Reference{
-			ref("internal/rebalanceexec/executor_test.go", "TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions"), ref("internal/multiraft/host_leader_transfer_real_test.go", "TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply"),
+		Qualification: Stage{StatusPartial, "Deterministic action tests cover the complete ordered lifecycle, real hosts cover authenticated transfer with continued apply, and a shard-process harness covers grant, learner bootstrap/restart, promotion, RF4 fencing, ownership, removal, and final RF3 activation. The external gateway catalog G+1/drain/G+2 sequence is still proven separately rather than by one monolithic process gate.", []Reference{
+			ref("internal/rebalanceexec/executor_test.go", "TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions"), ref("internal/multiraft/host_leader_transfer_real_test.go", "TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApply"), ref("cmd/vibedb-shard/serve_rf3_process_test.go", "TestServeRF3ShippedCompositionThreeProcesses"),
 		}},
 	},
 	{
@@ -229,8 +244,8 @@ var Distributed = []Feature{
 		Shipped: Stage{StatusYes, "serve-rf3 exposes an authenticated bounded source-control and snapshot-data listener. bootstrap-rf3 receives, verifies, installs, and resumes one cold learner before reopening it through the ordinary serving command.", []Reference{
 			ref("cmd/vibedb-shard/serve_rf3.go", "servePreparedRF3"), ref("cmd/vibedb-shard/bootstrap_rf3.go", "bootstrapPreparedRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen, exact-incarnation retry, and chunk benchmarks exist. A process test reopens the source repository and transfers into a real Receiver. The complete external multi-process replacement sequence remains absent.", []Reference{
-			ref("internal/snapshottransfer/source_provider_test.go", "TestRetainedSourceProviderExportsAndObservesAfterReopen"), ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
+		Qualification: Stage{StatusPartial, "Resume, disconnect, corruption, bounds, TLS rotation, activation-seam fault settlement, post-Host-add rejection reopen, exact-incarnation retry, and chunk benchmarks exist. Target artifacts use a crash-safe authenticated publish-to-delete transition after the learner identity is durably certified. Source-export cleanup and abandoned staged-artifact collection remain incomplete.", []Reference{
+			ref("internal/snapshottransfer/source_provider_test.go", "TestRetainedSourceProviderExportsAndObservesAfterReopen"), ref("internal/snapshottransfer/learner_install_test.go", "TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary"), ref("internal/snapshottransfer/release_test.go", "TestRepositoryRecoversEveryReleaseNamespacePhase"), ref("internal/snapshottransfer/transfer_test.go", "BenchmarkSnapshotServiceChunk"),
 		}},
 	},
 	{
@@ -238,14 +253,14 @@ var Distributed = []Feature{
 		Primitive: Stage{StatusYes, "Split staging, tail translation, placement, durable split execution, move plans, failure authorization, and replica-move execution exist.", []Reference{
 			ref("internal/rangesplit/stage.go", "ChildStage"), ref("internal/splitcontroller/replicated_executor.go", "ExecuteReplicatedStep"), ref("internal/rebalanceexec/executor.go", "ExecuteReplicaMove"),
 		}},
-		Integrated: Stage{StatusYes, "The catalog RF3 journal drives resumable split and move actions. Replica replacement composes certified failure evidence, bounded candidate selection, membership grants, snapshot bootstrap, catch-up, promotion, catalog drains, removal, and cleanup.", []Reference{
+		Integrated: Stage{StatusPartial, "The catalog RF3 journal drives resumable operation records and the replica-move path composes certified failure evidence, bounded candidate selection, membership grants, snapshot bootstrap, catch-up, promotion, catalog drains, removal, and cleanup. Split action services and RF3 child-quorum readiness are not composed by the shipped shard command.", []Reference{
 			ref("internal/splitcontroller/controller_service.go", "ControllerService"), ref("internal/rebalanceexec/controller.go", "Controller"), ref("cmd/vibedb-gateway/replica_health_controller.go", "gatewayReplicaHealthController"),
 		}},
-		Shipped: Stage{StatusYes, "vibedb-gateway runs the replicated split controller and, with a strict replica-control manifest, publishes quorum health revisions, schedules certified failed-replica replacements, and resumes durable moves. vibedb-shard exposes every authenticated action service and prepare-rf3 provisions initial member roots.", []Reference{
+		Shipped: Stage{StatusPartial, "vibedb-gateway runs the replicated operation scanner and, with a strict replica-control manifest, publishes quorum health revisions, schedules certified failed-replica replacements, and resumes durable moves. Replica movement is shipped. No operator intake creates a split operation, and vibedb-shard does not expose the split source/child action runtime. Retained sources now durably reject base-key writes and point reads outside their narrowed post-cutover range.", []Reference{
 			ref("cmd/vibedb-gateway/replica_health_controller.go", "startGatewayReplicaControllers"), ref("cmd/vibedb-gateway/serve.go", "runServe"), ref("cmd/vibedb-gateway/replica_health_revision.go", "gatewayReplicaHealthRevisionController"), ref("cmd/vibedb-shard/prepare_rf3.go", "runPrepareRF3"),
 		}},
-		Qualification: Stage{StatusPartial, "Split crash matrices, replicated-journal recovery, and a three-process catalog leader-loss gate exist. Health tests prove quorum-only evidence, partition refusal, three-revision certification, and exact durable move submission. The complete command-level replica replacement and foreground-traffic impact are not yet proven.", []Reference{
-			ref("internal/splitcontroller/execute_test.go", "TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows"), ref("cmd/vibedb-gateway/replica_health_controller_test.go", "TestReplicaHealthRevisionsScheduleExactDurableReplacement"), ref("cmd/vibedb-gateway/replica_health_revision_test.go", "TestReplicaHealthRevisionRejectsPartitionWithoutLeader"),
+		Qualification: Stage{StatusPartial, "Internal split crash matrices and replicated-journal recovery exist, and post-cutover base-key mutation/read fencing survives reopen. The sealed interval still performs full-image certification, child readiness does not prove a complete RF3 quorum, scans/global-index reads lack independent range proof, and no external split-under-load process gate exists.", []Reference{
+			ref("internal/splitcontroller/execute_test.go", "TestPublishBeforePruneCrashMatrixNeverLosesOrDoubleRoutesRows"), ref("sql/driver/replicated_apply_test.go", "TestReplicatedApplyPlacementRangeAndAdmissionParity"), ref("cmd/vibedb-gateway/replica_health_controller_test.go", "TestReplicaHealthRevisionsScheduleExactDurableReplacement"),
 		}},
 	},
 	{
