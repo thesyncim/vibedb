@@ -28,7 +28,8 @@ const canonicalRF3Manifest = `{
   },
   "listeners": {
     "peer": "0.0.0.0:7400",
-    "native": "0.0.0.0:7500"
+    "native": "0.0.0.0:7500",
+    "control": "0.0.0.0:7700"
   },
   "tls": {
     "certificate": "/run/secrets/member-cert.pem",
@@ -70,7 +71,8 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 		manifest.SQL.ApplyIdentityPath != "/srv/vibedb/member-apply-identity.json" {
 		t.Fatalf("SQL artifacts = %+v", manifest.SQL)
 	}
-	if manifest.Listeners.Peer != "0.0.0.0:7400" || manifest.Listeners.Native != "0.0.0.0:7500" {
+	if manifest.Listeners.Peer != "0.0.0.0:7400" || manifest.Listeners.Native != "0.0.0.0:7500" ||
+		manifest.Listeners.Control != "0.0.0.0:7700" {
 		t.Fatalf("listeners = %+v", manifest.Listeners)
 	}
 	if manifest.TLS.Certificate != "/run/secrets/member-cert.pem" ||
@@ -145,6 +147,7 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 		{"missing-wal", replace(`    "key_id": "production-key-1",`+"\n", ``)},
 		{"reordered-sql", replace(`"path": "/srv/vibedb/member.vdb",`+"\n    "+`"identity_path":`, `"identity_path": "/srv/vibedb/member-sql-identity.json",`+"\n    "+`"path":`)},
 		{"reordered-listeners", replace(`"peer": "0.0.0.0:7400",`+"\n    "+`"native": "0.0.0.0:7500"`, `"native": "0.0.0.0:7500",`+"\n    "+`"peer": "0.0.0.0:7400"`)},
+		{"missing-control-listener", replace(`,`+"\n    "+`"control": "0.0.0.0:7700"`, ``)},
 		{"reordered-tls", replace(`"certificate": "/run/secrets/member-cert.pem",`+"\n    "+`"key": "/run/secrets/member-key.pem"`, `"key": "/run/secrets/member-key.pem",`+"\n    "+`"certificate": "/run/secrets/member-cert.pem"`)},
 		{"escaped-value", replace(`/srv/vibedb/member.wal`, `/srv/vibedb/member\u002ewal`)},
 		{"empty-value", replace(`/srv/vibedb/member.wal`, ``)},

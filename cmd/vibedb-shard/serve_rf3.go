@@ -111,6 +111,18 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err)
 	}
+	controlAuthorizer, err := servicetls.NewNodeAuthorizer(
+		policy.NodesWith(serviceauthz.CapabilityMembership),
+	)
+	if err != nil {
+		return fmt.Errorf("%w: control TLS authority: %v", errRF3Serving, err)
+	}
+	controlTLS, err := servicetls.NewServer(
+		profile, rafttransport.TrafficShardControl, controlAuthorizer,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: control TLS server: %v", errRF3Serving, err)
+	}
 
 	group := groupFromBinding(base.Binding)
 	wantDomain := rafttransport.TrustDomain{
@@ -159,12 +171,19 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
 	}
+	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
+	controlService, err := shardservice.NewMembershipGrantControlService(
+		transportRegistry, policy, deadline, deadline,
+	)
+	if err != nil {
+		return closePrepared(fmt.Errorf("%w: membership grant control: %v", errRF3Serving, err))
+	}
 	localMember, err := transportRegistry.LocalMember(group)
 	if err != nil || localMember != base.Binding.MemberID {
 		return closePrepared(fmt.Errorf("%w: certificate node does not own retained member", errRF3Serving))
 	}
 
-	// Reserve both sockets before AdoptRuntime durably advances the node
+	// Reserve every enabled socket before AdoptRuntime durably advances the node
 	// incarnation. A bind failure leaves the prepared member restartable without
 	// an unexplained incarnation jump.
 	peerListener, err := listen("tcp", manifest.Listeners.Peer)
@@ -172,6 +191,14 @@ func servePreparedRF3WithListen(
 		return closePrepared(fmt.Errorf("listen RF3 peer %q: %w", manifest.Listeners.Peer, err))
 	}
 	defer peerListener.Close()
+	controlListener, err := listen("tcp", manifest.Listeners.Control)
+	if err != nil {
+		return errors.Join(
+			closePrepared(fmt.Errorf("listen RF3 control %q: %w", manifest.Listeners.Control, err)),
+			peerListener.Close(),
+		)
+	}
+	defer controlListener.Close()
 	var nativeListener net.Listener
 	if nativeAuthorized {
 		nativeListener, err = listen("tcp", manifest.Listeners.Native)
@@ -220,7 +247,6 @@ func servePreparedRF3WithListen(
 	}
 
 	pulse := make(chan struct{}, 1)
-	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
 	peer, err := raftservice.NewAuthenticatedPeerRuntime(raftservice.AuthenticatedPeerOptions{
 		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
@@ -257,8 +283,10 @@ func servePreparedRF3WithListen(
 	}
 
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
+	controlCtx, stopControl := context.WithCancelCause(context.Background())
 	nativeCtx, stopNative := context.WithCancelCause(context.Background())
 	defer stopPeer(context.Canceled)
+	defer stopControl(context.Canceled)
 	defer stopNative(context.Canceled)
 	peerDone := make(chan error, 1)
 	go func() { peerDone <- peer.Run(peerCtx) }()
@@ -279,6 +307,14 @@ func servePreparedRF3WithListen(
 
 	pulseDone := make(chan struct{})
 	go runRF3Pulse(peerCtx, pulse, pulseDone)
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- controlTLS.Serve(controlCtx, controlListener, servicetls.Limits{
+			MaxConnections: 32, MaxHandshakes: 8, HandshakeDeadline: deadline,
+		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
+			_ = controlService.Serve(ctx, connection)
+		})
+	}()
 	var nativeDone chan error
 	nativeAddress := "fenced"
 	if nativeAuthorized {
@@ -291,19 +327,21 @@ func servePreparedRF3WithListen(
 		}()
 	}
 	fmt.Fprintf(os.Stderr,
-		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s\n",
+		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s control=%s\n",
 		base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
-		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
+		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress, controlListener.Addr(),
 	)
 
 	var primary error
-	peerFinished, nativeFinished := false, false
+	peerFinished, controlFinished, nativeFinished := false, false, false
 	select {
 	case <-parent.Done():
 		// A requested shutdown is not an error. Component failures observed below
 		// remain visible unless they are the expected cancellation result.
 	case err := <-peerDone:
 		primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
+	case err := <-controlDone:
+		primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
 	case err := <-nativeDone:
 		primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
 	}
@@ -314,6 +352,10 @@ func servePreparedRF3WithListen(
 		if !nativeFinished {
 			primary = errors.Join(primary, componentShutdownError(<-nativeDone))
 		}
+	}
+	stopControl(context.Canceled)
+	if !controlFinished {
+		primary = errors.Join(primary, componentShutdownError(<-controlDone))
 	}
 	stopPeer(context.Canceled)
 	if !peerFinished {
@@ -393,13 +435,18 @@ func readRF3BoundedFile(path string, maximum int) ([]byte, error) {
 }
 
 func validateRF3Addresses(manifest rf3Manifest) error {
-	if manifest.Listeners.Peer == manifest.Listeners.Native {
-		return fmt.Errorf("%w: peer and native listeners must differ", errRF3Serving)
+	if manifest.Listeners.Peer == manifest.Listeners.Native ||
+		manifest.Listeners.Peer == manifest.Listeners.Control ||
+		manifest.Listeners.Native == manifest.Listeners.Control {
+		return fmt.Errorf("%w: peer, native, and control listeners must differ", errRF3Serving)
 	}
 	if err := validateRF3Address(manifest.Listeners.Peer, true); err != nil {
 		return err
 	}
 	if err := validateRF3Address(manifest.Listeners.Native, true); err != nil {
+		return err
+	}
+	if err := validateRF3Address(manifest.Listeners.Control, true); err != nil {
 		return err
 	}
 	for _, member := range manifest.Members {

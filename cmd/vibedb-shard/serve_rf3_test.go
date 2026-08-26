@@ -63,6 +63,7 @@ func TestValidateRF3Addresses(t *testing.T) {
 	wildcard := valid
 	wildcard.Listeners.Peer = ":17400"
 	wildcard.Listeners.Native = "[::]:17500"
+	wildcard.Listeners.Control = ":17700"
 	if err := validateRF3Addresses(wildcard); err != nil {
 		t.Fatalf("valid wildcard listeners: %v", err)
 	}
@@ -81,8 +82,10 @@ func TestValidateRF3Addresses(t *testing.T) {
 		mutate func(*rf3Manifest)
 	}{
 		{"same_listeners", func(manifest *rf3Manifest) { manifest.Listeners.Native = manifest.Listeners.Peer }},
+		{"same_control_listener", func(manifest *rf3Manifest) { manifest.Listeners.Control = manifest.Listeners.Peer }},
 		{"peer_listener_missing_port", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1" }},
 		{"native_listener_zero_port", func(manifest *rf3Manifest) { manifest.Listeners.Native = "127.0.0.1:0" }},
+		{"control_listener_zero_port", func(manifest *rf3Manifest) { manifest.Listeners.Control = "127.0.0.1:0" }},
 		{"listener_port_overflow", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1:65536" }},
 		{"listener_nonnumeric_port", func(manifest *rf3Manifest) { manifest.Listeners.Peer = "127.0.0.1:http" }},
 		{"member_missing_host", func(manifest *rf3Manifest) { manifest.Members[1].PeerAddress = ":17401" }},
@@ -353,7 +356,7 @@ func serveRF3Publication(voters ...uint64) raftmodel.Publication {
 
 func serveRF3TestManifest() rf3Manifest {
 	return rf3Manifest{
-		Listeners: rf3ManifestListeners{Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500"},
+		Listeners: rf3ManifestListeners{Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500", Control: "127.0.0.1:17700"},
 		Members: [rf3ManifestMembers]rf3ManifestMember{
 			{MemberID: 1, NodeID: rafttransport.NodeID{1}, PeerAddress: "member-1.internal:17400"},
 			{MemberID: 2, NodeID: rafttransport.NodeID{2}, PeerAddress: "member-2.internal:17400"},
