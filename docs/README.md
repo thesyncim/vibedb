@@ -25,7 +25,9 @@ Start with the page that matches your task.
 
 - [Durability and recovery](durability.md)
 - [Offline verification, salvage, and repack](operations/verification.md)
+- [Start a three-node replicated shard](operations/distributed-quickstart.md)
 - [Distributed runtime](operations/distributed.md)
+- [Replica lifecycle](operations/replica-lifecycle.md)
 - [Performance tests](performance.md)
 - [Security boundary](../SECURITY.md)
 - [Unsafe-code inventory](../UNSAFE.md)
