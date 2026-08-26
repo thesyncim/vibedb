@@ -284,6 +284,53 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 	}
 }
 
+func TestAppendReplicatedCommandRejectsPayloadAppendRegionOverlapWithoutMutation(t *testing.T) {
+	payload := replicatedTestCoordinator(t)
+	base := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
+	}
+	total := replicatedCommandHeaderBytes + len(payload) + replicatedCommandChecksumBytes
+	tests := []struct {
+		name  string
+		start int
+	}{
+		{name: "exact_future_payload_destination", start: replicatedCommandHeaderBytes},
+		{name: "fully_inside_append_region", start: 0},
+		{name: "partial_append_region_overlap", start: total - len(payload)/2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backing := make([]byte, total+len(payload))
+			copy(backing[tc.start:tc.start+len(payload)], payload)
+			dst := backing[:0:total]
+			command := base
+			command.Payload = backing[tc.start : tc.start+len(payload) : tc.start+len(payload)]
+			before := bytes.Clone(backing)
+			got, err := AppendReplicatedCommand(dst, command)
+			if err != ErrCorrupt {
+				t.Fatalf("error=%v, want %v", err, ErrCorrupt)
+			}
+			if len(got) != len(dst) || !bytes.Equal(backing, before) {
+				t.Fatal("overlap rejection modified destination backing")
+			}
+		})
+	}
+
+	command := base
+	command.Payload = payload
+	dst := make([]byte, 0, total)
+	if got := testing.AllocsPerRun(1000, func() {
+		var err error
+		dst, err = AppendReplicatedCommand(dst[:0], command)
+		if err != nil {
+			panic(err)
+		}
+	}); got != 0 {
+		t.Fatalf("non-overlapping append allocations=%v", got)
+	}
+}
+
 func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 	participant, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
 	if err != nil {
@@ -562,6 +609,65 @@ func TestManifestSegmentSequenceStrictCorruptionAndZeroAllocation(t *testing.T) 
 	}
 	if _, err := OpenManifestSegmentSequence(append(bytes.Clone(raw), 0)); err == nil {
 		t.Fatal("accepted trailing sequence byte")
+	}
+}
+
+func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
+	_, pages := buildManifest(t, 4097)
+	if len(pages) < 2 {
+		t.Fatal("manifest did not cross a page boundary")
+	}
+	next, err := OpenManifestSegmentSequence(appendManifestPages(nil, pages[1:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ManifestSegmentSequenceFollows(pages[0], next); err != nil {
+		t.Fatalf("ordered boundary: %v", err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		if followErr := ManifestSegmentSequenceFollows(pages[0], next); followErr != nil {
+			panic(followErr)
+		}
+	}); got != 0 {
+		t.Fatalf("boundary validation allocations=%v", got)
+	}
+
+	onePage := func(participant ParticipantRef) []byte {
+		t.Helper()
+		arena := make([]byte, ManifestSegmentBytes)
+		var raw []byte
+		builder, buildErr := NewManifestBuilder(arena, func(segment ManifestSegment) error {
+			raw = bytes.Clone(segment.Raw)
+			return nil
+		})
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		if buildErr = builder.Append(participant); buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		if _, buildErr = builder.Seal(); buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		return raw
+	}
+	previous := onePage(manifestParticipant(100))
+	for _, tc := range []struct {
+		name  string
+		index uint64
+	}{
+		{name: "equal", index: 100},
+		{name: "reordered", index: 99},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate, openErr := OpenManifestSegmentSequence(onePage(manifestParticipant(tc.index)))
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			if followErr := ManifestSegmentSequenceFollows(previous, candidate); followErr != ErrCorrupt {
+				t.Fatalf("boundary error=%v, want %v", followErr, ErrCorrupt)
+			}
+		})
 	}
 }
 

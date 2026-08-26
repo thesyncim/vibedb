@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"unicode/utf8"
+	"unsafe"
 )
 
 const (
@@ -15,16 +16,17 @@ const (
 	// MaxManifestSegmentsPerCommand VTM1 pages follows it immediately.
 	ReplicatedManifestCoordinatorRecordBytes = manifestCoordinatorHeaderBytes + 4
 	// MaxManifestSegmentsPerCommand is a byte-packing bound, not a transaction
-	// participant bound. Fifteen worst-case 64 KiB pages leave bounded room in
-	// the existing 1 MiB proposal target for the transaction command framing.
+	// participant bound. Fifteen worst-case 64 KiB pages keep the manifest page
+	// pack below 1 MiB. The outer proposal's native relation mutations are not
+	// manifest bytes and may legitimately raise the complete proposal above it.
 	MaxManifestSegmentsPerCommand   = 15
 	MaxManifestSegmentSequenceBytes = MaxManifestSegmentsPerCommand * ManifestSegmentBytes
 
-	// MaxReplicatedCommandBytes is an encoded-byte admission bound. Relation
-	// mutation bytes are carried once by the outer replication command and are
-	// deliberately not part of this transaction control body. The maximum shape
-	// is a fused manifest coordinator begin: fixed header, caller-owned intent
-	// scopes, VTCM, fifteen VTM1 pages, and the outer checksum.
+	// MaxReplicatedCommandBytes bounds this transaction control body, not the
+	// complete outer proposal. Relation mutation bytes are carried once by the
+	// outer replication command and may legitimately make that proposal larger.
+	// The maximum control shape is a fused manifest coordinator begin: fixed
+	// header, caller-owned intent scopes, VTCM, fifteen VTM1 pages, and checksum.
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
 		MaxManifestSegmentSequenceBytes + replicatedCommandChecksumBytes
@@ -240,6 +242,33 @@ func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 	return sequence, nil
 }
 
+// ManifestSegmentSequenceFollows validates previous as one complete canonical
+// VTM1 page and requires its final participant identity to sort strictly before
+// the first identity in next. The already-opened sequence remains borrowed and
+// is inspected without decoding an identity arena or allocating.
+func ManifestSegmentSequenceFollows(previous []byte, next ManifestSegmentSequence) error {
+	prior, ok := openCanonicalManifestSegment(previous)
+	if !ok || len(next.raw) < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 ||
+		next.count == 0 {
+		return ErrCorrupt
+	}
+	payloadBytes := uint64(binary.LittleEndian.Uint32(next.raw[24:28]))
+	total := uint64(manifestSegmentHeaderBytes+4) + payloadBytes
+	if total > ManifestSegmentBytes || total > uint64(len(next.raw)) {
+		return ErrCorrupt
+	}
+	first, ok := openCanonicalManifestSegment(next.raw[:int(total):int(total)])
+	if !ok || compareIdentityBytes(
+		prior.lastDistribution[:prior.lastDistributionLength],
+		prior.lastShard[:prior.lastShardLength],
+		first.firstDistribution[:first.firstDistributionLength],
+		first.firstShard[:first.firstShardLength],
+	) >= 0 {
+		return ErrCorrupt
+	}
+	return nil
+}
+
 // OpenReplicatedManifestStart splits and validates the atomic VTCM plus its
 // maximally packed initial VTM1 sequence. Both views borrow the payload.
 func OpenReplicatedManifestStart(payload []byte) (
@@ -329,6 +358,9 @@ func ReplicatedCoordinatorBindsParticipant(
 	return false, false, nil
 }
 
+// AppendReplicatedCommand appends one canonical transaction control body.
+// Payload must not overlap the writable append region in dst's current backing
+// array; aliases are rejected before any destination byte is changed.
 func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, error) {
 	if err := validateReplicatedCommand(command); err != nil {
 		return dst, err
@@ -337,6 +369,9 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 		len(command.Payload) + replicatedCommandChecksumBytes
 	if total > MaxReplicatedCommandBytes {
 		return dst, ErrTooLarge
+	}
+	if replicatedPayloadOverlapsAppendRegion(dst, total, command.Payload) {
+		return dst, ErrCorrupt
 	}
 	start := len(dst)
 	if total <= cap(dst)-start {
@@ -372,6 +407,19 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	copy(out[cursor:], command.Payload)
 	binary.LittleEndian.PutUint32(out[total-4:], crc32.Checksum(out[:total-4], castagnoli))
 	return dst, nil
+}
+
+func replicatedPayloadOverlapsAppendRegion(dst []byte, total int, payload []byte) bool {
+	if len(payload) == 0 || total <= 0 || total > cap(dst)-len(dst) {
+		return false
+	}
+	region := dst[len(dst) : len(dst)+total : len(dst)+total]
+	left := uintptr(unsafe.Pointer(unsafe.SliceData(region)))
+	right := uintptr(unsafe.Pointer(unsafe.SliceData(payload)))
+	if left <= right {
+		return right-left < uintptr(len(region))
+	}
+	return left-right < uintptr(len(payload))
 }
 
 // OpenReplicatedCommand returns a borrowed command view. It allocates only the
