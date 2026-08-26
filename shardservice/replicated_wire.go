@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
@@ -459,7 +460,7 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedPropose:
 		return replicatedResponseFixedBodyBytes +
-			replication.MaxEmptyResultCompletionEnvelopeBytes, nil
+			replicatedstate.MaxCompletionEnvelopeBytes, nil
 	case ReplicatedMembership:
 		return replicatedResponseFixedBodyBytes, nil
 	case ReplicatedReadLeader, ReplicatedReadFollower:
@@ -679,7 +680,7 @@ func validReplicatedMemberState(state ReplicatedMemberState) bool {
 func validReplicatedResponse(response *ReplicatedResponse) bool {
 	if response == nil || response.HasState != (response.State != ReplicatedMemberState{}) ||
 		(response.HasState && !validReplicatedMemberState(response.State)) ||
-		len(response.Completion) > replication.MaxEmptyResultCompletionEnvelopeBytes ||
+		len(response.Completion) > replicatedstate.MaxCompletionEnvelopeBytes ||
 		response.Outcome.CompletionBytes != len(response.Completion) ||
 		len(response.Value) > replication.MaxMutationValueBytes {
 		return false

@@ -121,6 +121,8 @@ type CommandView struct {
 	mutationCount    uint32
 	relationCount    uint16
 	inlineRelationID RelationID
+	transactionRole  distributedtxn.ReplicatedRole
+	transactionOp    distributedtxn.ReplicatedOperation
 }
 
 // Bytes returns the exact validated envelope. The result aliases the decoder
@@ -134,6 +136,23 @@ func (v CommandView) Bytes() []byte {
 // Non-transaction commands return nil.
 func (v CommandView) TransactionBytes() []byte {
 	return v.transactionBytes[:len(v.transactionBytes):len(v.transactionBytes)]
+}
+
+// TransactionIdentity reports the role and operation from the already
+// validated transaction control. It does not reopen the nested control or
+// materialize intent scopes. Non-transaction commands return ok=false.
+func (v CommandView) TransactionIdentity() (
+	distributedtxn.ReplicatedRole,
+	distributedtxn.ReplicatedOperation,
+	bool,
+) {
+	if v.kind != CommandTransaction || len(v.transactionBytes) == 0 ||
+		v.transactionRole == distributedtxn.ReplicatedRoleInvalid ||
+		v.transactionOp == distributedtxn.ReplicatedOperationInvalid {
+		return distributedtxn.ReplicatedRoleInvalid,
+			distributedtxn.ReplicatedOperationInvalid, false
+	}
+	return v.transactionRole, v.transactionOp, true
 }
 
 // OpenTransactionInto reopens the already outer-validated transaction control
@@ -1092,6 +1111,8 @@ func OpenCommand(src []byte) (CommandView, error) {
 			return CommandView{}, semantic("transaction operation carries relation batches")
 		}
 		view.transactionBytes = controlBytes
+		view.transactionRole = control.role
+		view.transactionOp = control.operation
 	}
 	view.raw = src[:len(src):len(src)]
 	view.mutationCount = count

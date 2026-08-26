@@ -13,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
@@ -424,6 +426,83 @@ func TestReplicatedResponseRequestBoundRejectsOversizeHeaderBeforeAllocation(t *
 		}()
 	}
 	wait.Wait()
+}
+
+func TestReplicatedProposalResponseBoundCarriesTransactionCompletion(t *testing.T) {
+	fence := testReplicatedFence()
+	request := &ReplicatedRequest{
+		Operation: ReplicatedPropose, Fence: fence,
+		Command: testReplicatedCommand(t, fence),
+	}
+	maximum, err := maximumReplicatedResponseBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := replicatedResponseFixedBodyBytes + replicatedstate.MaxCompletionEnvelopeBytes; maximum != want {
+		t.Fatalf("proposal response bound = %d, want %d", maximum, want)
+	}
+
+	var result [24]byte
+	result[0] = byte(distributedtxn.ReplicatedRoleParticipant)
+	result[1] = byte(distributedtxn.ReplicatedPrepareParticipant)
+	result[2] = 2
+	binary.LittleEndian.PutUint64(result[8:16], 2)
+	if _, err := replicatedstate.OpenTransactionCompletionResult(
+		replicatedstate.ResultApplied, result[:],
+	); err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
+		ClusterID:             replication.ID128(fence.Group.ClusterID),
+		ClusterIncarnation:    replication.ID128(fence.Group.ClusterIncarnation),
+		TopologyRecoveryEpoch: fence.Group.TopologyRecoveryEpoch,
+		Distribution:          []byte("distribution"), Shard: []byte("shard"),
+		AllocationGeneration:   fence.AllocationGeneration,
+		ShardIncarnation:       replication.ID128(fence.Group.ShardIncarnation),
+		GroupID:                replication.ID128(fence.Group.GroupID),
+		ReplicaSetVersion:      fence.Command.ReplicaSetVersion,
+		ActivePolicyGeneration: fence.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        fence.Command.ProtectionEpoch,
+		RoutingVersion:         fence.Command.RoutingVersion,
+		RouteGeneration:        fence.Command.RouteGeneration,
+		Tenant:                 []byte("tenant"), ClientID: replication.ID128{1},
+		ClientEpoch:    uint64(distributedtxn.ReplicatedRoleParticipant),
+		ClientSequence: 2, Fingerprint: replication.Digest{1},
+		AppliedSequence: 9,
+		ResultCode:      replicatedstate.ResultApplied,
+		ResultFormat:    replicatedstate.ResultFormatTransaction,
+		Storage:         replication.CompletionInline, ResultLength: uint64(len(result)),
+		ResultDigest: replication.CompletionResultDigest(
+			replicatedstate.ResultApplied, replicatedstate.ResultFormatTransaction, result[:],
+		),
+		InlineResult: result[:],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := ReplicatedMemberState{
+		Fence: fence, LeaderID: fence.MemberID,
+		Commit: 9, Applied: 9, CheckpointApplied: 8,
+	}
+	response := &ReplicatedResponse{
+		Kind: ReplicatedCompletion, HasState: true, State: state,
+		RequestDigest: [32]byte{1}, Completion: completion,
+		Outcome: raftserve.Outcome{
+			Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+			CompletionAppliedSequence: 9, CompletionBytes: len(completion),
+		},
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedResponse(&encoded, response); err != nil {
+		t.Fatal(err)
+	}
+	if bodyBytes := encoded.Len() - 5; bodyBytes > maximum {
+		t.Fatalf("transaction response body = %d, proposal bound = %d", bodyBytes, maximum)
+	}
+	decoded, err := decodeReplicatedResponseLimit(bytes.NewReader(encoded.Bytes()), maximum)
+	if err != nil || !bytes.Equal(decoded.Completion, completion) {
+		t.Fatalf("bounded transaction completion = %dB, err=%v", len(decoded.Completion), err)
+	}
 }
 
 func BenchmarkEncodeReplicatedLargePointRead(b *testing.B) {

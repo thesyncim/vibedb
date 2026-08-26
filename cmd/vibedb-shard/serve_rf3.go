@@ -21,7 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
-	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -518,7 +518,7 @@ func rf3RegistryLimits() raftserve.Limits {
 	return raftserve.Limits{
 		MaxGroups: 1, MaxOutstandingIdentities: 32,
 		MaxOutstandingAttempts: 64, MaxWaiters: 64, MaxAttemptsPerIdentity: 4,
-		MaxRetainedCompletionBytes: 32 * int64(replication.MaxEmptyResultCompletionEnvelopeBytes),
+		MaxRetainedCompletionBytes: 32 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
 	}
 }
 

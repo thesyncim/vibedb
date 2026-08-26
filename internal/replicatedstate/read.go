@@ -168,7 +168,7 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 		return CompletionLookup{}, ErrWrongBinding
 	}
 	if command.Kind() == replication.CommandTransaction &&
-		cap(dst) < MaxTransactionCompletionEnvelopeBytes {
+		cap(dst) < MaxCompletionEnvelopeBytes {
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
 	if command.Kind() != replication.CommandTransaction {
@@ -184,7 +184,7 @@ func (m *Machine) LookupCompletionIntoWorkspace(
 	}
 	result, err := m.lookupCompletionAtSnapshot(
 		command,
-		dst[:0:cap(dst)],
+		dst[:0:MaxCompletionEnvelopeBytes],
 		workspace,
 	)
 	if len(result.Bytes) != 0 && &result.Bytes[0] != &dst[:cap(dst)][0] {
@@ -257,7 +257,7 @@ func (m *Machine) lookupCompletion(
 		return CompletionLookup{}, ErrWrongBinding
 	}
 	if command.Kind() == replication.CommandTransaction && completionScratch != nil &&
-		cap(completionScratch) < MaxTransactionCompletionEnvelopeBytes {
+		cap(completionScratch) < MaxCompletionEnvelopeBytes {
 		endErr := m.EndCompletionLookupBatch(&workspace)
 		_ = workspace.Release()
 		if endErr != nil {
@@ -265,7 +265,9 @@ func (m *Machine) lookupCompletion(
 		}
 		return CompletionLookup{}, ErrCompletionBufferSmall
 	}
-	if command.Kind() != replication.CommandTransaction && completionScratch != nil {
+	if command.Kind() == replication.CommandTransaction && completionScratch != nil {
+		completionScratch = completionScratch[:0:MaxCompletionEnvelopeBytes]
+	} else if completionScratch != nil {
 		completionScratch = completionScratch[:0:replication.MaxEmptyResultCompletionEnvelopeBytes]
 	}
 	result, lookupErr := m.lookupCompletionAtSnapshot(

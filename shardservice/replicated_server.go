@@ -666,7 +666,7 @@ func replicatedCompletionInvalidReasons(
 	if !response.HasState || !validReplicatedMemberState(response.State) {
 		reasons |= ReplicatedCompletionInvalidState
 	}
-	if len(response.Completion) > replication.MaxEmptyResultCompletionEnvelopeBytes {
+	if len(response.Completion) > replicatedstate.MaxCompletionEnvelopeBytes {
 		reasons |= ReplicatedCompletionInvalidCompletionBound
 	}
 	if response.Outcome.CompletionBytes != len(response.Completion) {

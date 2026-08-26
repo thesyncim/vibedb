@@ -3,10 +3,12 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -502,6 +504,13 @@ func TestNativeCommandFingerprintAndCanonicalAssemblyWarmZeroAlloc(t *testing.T)
 		{"routing", func(value *replication.Command) { value.RoutingVersion++ }},
 		{"route", func(value *replication.Command) { value.RouteGeneration++ }},
 		{"ack", func(value *replication.Command) { value.AckThrough-- }},
+		{"transaction", func(value *replication.Command) { value.Transaction = []byte{1} }},
+		{"expected-length", func(value *replication.Command) {
+			value.Batches[0].Mutations[0].ExpectedValueLength++
+		}},
+		{"expected-digest", func(value *replication.Command) {
+			value.Batches[0].Mutations[0].ExpectedValueDigest[0]++
+		}},
 	}
 	for _, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
@@ -523,6 +532,7 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 		replicatedstate.ResultTargetBound,
 		replicatedstate.ResultWrongShard,
 		replicatedstate.ResultIndexConflict,
+		replicatedstate.ResultIntentBusy,
 		replicatedstate.ResultSessionRetired,
 		replicatedstate.ResultSessionOpened,
 		replicatedstate.ResultSessionRenewed,
@@ -537,6 +547,7 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 			replicatedstate.ResultTargetBound:     true,
 			replicatedstate.ResultWrongShard:      true,
 			replicatedstate.ResultIndexConflict:   true,
+			replicatedstate.ResultIntentBusy:      true,
 		},
 		replication.CommandSessionRetire: {
 			replicatedstate.ResultStaleFence:     true,
@@ -562,6 +573,127 @@ func TestNativeCompletionResultCodeIsBoundToCommandKind(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestNativeTransactionCompletionBindsValidatedRoleOperationAndFixedResult(t *testing.T) {
+	route, _, _ := testReplicatedRouteCommand(t)
+	id := distributedtxn.ID{0x71}
+	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedCommitCoordinator,
+		ID:        id, ExpectedRevision: 1,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := replication.TransactionClientSequence(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := replication.Command{
+		Kind:      replication.CommandTransaction,
+		ClusterID: route.Group.ClusterID, ClusterIncarnation: route.Group.ClusterIncarnation,
+		TopologyRecoveryEpoch: route.Group.TopologyRecoveryEpoch,
+		Distribution:          string(route.Distribution), Shard: string(route.Shard),
+		AllocationGeneration: route.AllocationGeneration,
+		ShardIncarnation:     route.Group.ShardIncarnation, GroupID: route.Group.GroupID,
+		ReplicaSetVersion:      route.Command.ReplicaSetVersion,
+		ActivePolicyGeneration: route.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        route.Command.ProtectionEpoch,
+		OwnershipEpoch:         route.Command.OwnershipEpoch,
+		SchemaGeneration:       route.Command.SchemaGeneration,
+		RoutingVersion:         route.Command.RoutingVersion,
+		RouteGeneration:        route.Command.RouteGeneration,
+		Tenant:                 []byte("tenant"), ClientID: replication.ID128(id),
+		ClientEpoch: 1, ClientSequence: sequence,
+		Transaction: control,
+	}
+	command.Fingerprint = nativeCommandFingerprint(command)
+	encoded, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := replication.OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result [24]byte
+	result[0] = byte(distributedtxn.ReplicatedRoleCoordinator)
+	result[1] = byte(distributedtxn.ReplicatedCommitCoordinator)
+	result[2] = 2 // control revision is present
+	binary.LittleEndian.PutUint64(result[8:16], 2)
+
+	completion := appendNativeTransactionCompletion(t, view, replicatedstate.ResultApplied, result[:])
+	if !nativeCompletionMatches(view, completion) {
+		t.Fatal("valid transaction completion did not match")
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		if !nativeCompletionMatches(view, completion) {
+			panic("transaction completion mismatch")
+		}
+	}); got != 0 {
+		t.Fatalf("transaction completion validation allocations = %v, want 0", got)
+	}
+
+	wrongIdentity := result
+	wrongIdentity[0] = byte(distributedtxn.ReplicatedRoleParticipant)
+	wrongIdentity[1] = byte(distributedtxn.ReplicatedPrepareParticipant)
+	if nativeCompletionMatches(view, appendNativeTransactionCompletion(
+		t, view, replicatedstate.ResultApplied, wrongIdentity[:],
+	)) {
+		t.Fatal("completion for a different transaction role/operation matched")
+	}
+	reserved := result
+	reserved[3] = 1
+	if nativeCompletionMatches(view, appendNativeTransactionCompletion(
+		t, view, replicatedstate.ResultApplied, reserved[:],
+	)) {
+		t.Fatal("corrupt transaction result matched")
+	}
+	short := appendNativeTransactionCompletion(
+		t, view, replicatedstate.ResultApplied, result[:len(result)-1],
+	)
+	if nativeCompletionMatches(view, short) {
+		t.Fatal("non-fixed transaction result matched")
+	}
+}
+
+func appendNativeTransactionCompletion(
+	t testing.TB,
+	command replication.CommandView,
+	resultCode uint32,
+	result []byte,
+) replication.CompletionView {
+	t.Helper()
+	digest := replication.CompletionResultDigest(
+		resultCode, replicatedstate.ResultFormatTransaction, result,
+	)
+	encoded, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
+		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
+		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
+		Distribution:          command.Distribution, Shard: command.Shard,
+		AllocationGeneration: command.AllocationGeneration,
+		ShardIncarnation:     command.ShardIncarnation, GroupID: command.GroupID,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch,
+		RoutingVersion:         command.RoutingVersion, RouteGeneration: command.RouteGeneration,
+		Tenant: command.Tenant, ClientID: command.ClientID, ClientEpoch: command.ClientEpoch,
+		ClientSequence: command.ClientSequence, Fingerprint: command.Fingerprint,
+		RetryHome: command.RetryHome, AppliedSequence: command.ClientEpoch,
+		ResultCode: resultCode, ResultFormat: replicatedstate.ResultFormatTransaction,
+		Storage: replication.CompletionInline, ResultLength: uint64(len(result)),
+		ResultDigest: digest, InlineResult: result,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return completion
 }
 
 func appendNativeSessionCompletion(

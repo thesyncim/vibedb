@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/maphash"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -33,11 +34,13 @@ type requestPosition struct {
 }
 
 type commandIdentity struct {
-	position    requestPosition
-	fingerprint replication.Digest
-	logical     [32]byte
-	attempt     [32]byte
-	tenant      []byte
+	position             requestPosition
+	fingerprint          replication.Digest
+	logical              [32]byte
+	attempt              [32]byte
+	tenant               []byte
+	transactionRole      distributedtxn.ReplicatedRole
+	transactionOperation distributedtxn.ReplicatedOperation
 }
 
 func openCommandIdentity(
@@ -51,6 +54,7 @@ func openCommandIdentity(
 	if !commandMatchesGroup(command, group) {
 		return commandIdentity{}, ErrCommandGroupMismatch
 	}
+	transactionRole, transactionOperation, _ := command.TransactionIdentity()
 	logical := replicatedstate.LogicalCommandDigest(command)
 	return commandIdentity{
 		position: requestPosition{
@@ -61,10 +65,12 @@ func openCommandIdentity(
 			sequence:      command.ClientSequence,
 			namespace:     namespaceForCommand(command.Kind()),
 		},
-		fingerprint: command.Fingerprint,
-		logical:     logical,
-		attempt:     attemptDigest(command, logical),
-		tenant:      command.Tenant,
+		fingerprint:          command.Fingerprint,
+		logical:              logical,
+		attempt:              attemptDigest(command, logical),
+		tenant:               command.Tenant,
+		transactionRole:      transactionRole,
+		transactionOperation: transactionOperation,
 	}, nil
 }
 

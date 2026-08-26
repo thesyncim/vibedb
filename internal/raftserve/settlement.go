@@ -765,8 +765,21 @@ func validateCompletionLookup(
 		completion.ClientSequence != position.sequence ||
 		completion.Fingerprint != identity.fingerprint ||
 		completion.AppliedSequence != lookup.AppliedSequence ||
-		completion.Storage != replication.CompletionInline ||
-		completion.ResultLength != 0 || len(completion.InlineResult) != 0 {
+		completion.Storage != replication.CompletionInline {
+		return ErrSettlementResult
+	}
+	if identity.transactionRole != 0 {
+		result, resultErr := replicatedstate.OpenTransactionCompletionResult(
+			completion.ResultCode, completion.InlineResult,
+		)
+		if resultErr != nil ||
+			completion.ResultFormat != replicatedstate.ResultFormatTransaction ||
+			completion.ResultLength != uint64(len(completion.InlineResult)) ||
+			result.Role != identity.transactionRole ||
+			result.Operation != identity.transactionOperation {
+			return ErrSettlementResult
+		}
+	} else if completion.ResultLength != 0 || len(completion.InlineResult) != 0 {
 		return ErrSettlementResult
 	}
 	if position.namespace == requestNamespaceOpen {

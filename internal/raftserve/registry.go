@@ -28,7 +28,7 @@ const (
 	AbsoluteMaxRetainedCompletionBytes int64 = 128 << 20
 
 	tenantSlotBytes     = replication.MaxIdentityBytes
-	completionSlotBytes = replication.MaxEmptyResultCompletionEnvelopeBytes
+	completionSlotBytes = replicatedstate.MaxCompletionEnvelopeBytes
 )
 
 const noIndex = ^uint32(0)
