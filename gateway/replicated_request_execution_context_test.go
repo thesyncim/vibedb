@@ -101,8 +101,12 @@ func TestDurableRequestTerminalAuthorityIsStableAndContractBound(t *testing.T) {
 }
 
 func typedExecutionFixture(t testing.TB) DurableRequestTypedExecutionContext {
+	return typedExecutionFixtureCount(t, 3)
+}
+
+func typedExecutionFixtureCount(t testing.TB, count int) DurableRequestTypedExecutionContext {
 	t.Helper()
-	key, program := durableLogicalStreamFixture(t, 3, 3)
+	key, program := durableLogicalStreamFixture(t, count, 3)
 	measurement, pages := durableLogicalStreamBuild(t, key, program)
 	reader, err := openDurableRequestRecipeStream(
 		key, measurement.descriptor(), durableRequestPlanPageSource(pages),
