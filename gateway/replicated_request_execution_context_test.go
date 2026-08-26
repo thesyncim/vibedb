@@ -171,6 +171,16 @@ func bindTypedExecutionPin(
 	route ReplicatedRoute,
 ) (DurableRequestTypedExecutionContext, executionpin.Command) {
 	t.Helper()
+	execution.Home.route = cloneDurableRequestRoute(route)
+	binding, err := BuildDurableRequestExecutionPinBinding(execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingDigest, err := executionpin.BindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution.Recipe.Contract.PinDigest = replication.Digest(bindingDigest)
 	release := terminalAuthorityRelease(t, execution)
 	acquire := executionpin.AcquireCertificate{
 		PinID: release.PinID, Binding: release.Binding, AuthorityDigest: executionpin.Digest{4},

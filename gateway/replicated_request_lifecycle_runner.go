@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -18,21 +19,23 @@ import (
 // dynamic payload, so a crash never makes an outcome-unknown proposal depend
 // on process memory.
 type DurableRequestWave struct {
-	Home        DurableRequestLedgerHome
-	Key         requestledger.RequestKey
-	Participant DurableRequestLogicalParticipant
-	Identity    ReplicatedTransactionIdentity
-	Tenant      []byte
-	PinID       requestledger.PinID
-	GateEpoch   uint64
-	Binding     requestledger.Digest
-	Build       requestledger.PayloadBuildRecord
-	Step        requestledger.StepRef
-	Ordinal     uint64
-	Target      []byte
-	Command     []byte
-	Transition  uint32
-	Cursor      []byte
+	Home              DurableRequestLedgerHome
+	Key               requestledger.RequestKey
+	Participant       DurableRequestLogicalParticipant
+	Identity          ReplicatedTransactionIdentity
+	Tenant            []byte
+	PinID             requestledger.PinID
+	GateEpoch         uint64
+	Binding           requestledger.Digest
+	ExecutionPinRoute ReplicatedRoute
+	ExecutionPinLease executionpin.LeaseCertificate
+	Build             requestledger.PayloadBuildRecord
+	Step              requestledger.StepRef
+	Ordinal           uint64
+	Target            []byte
+	Command           []byte
+	Transition        uint32
+	Cursor            []byte
 	// Settle derives result-dependent protocol state only after Command has an
 	// authenticated completion. Exactly one of Settle or the fixed
 	// Transition/Cursor pair is accepted.
@@ -52,13 +55,23 @@ type durableRequestWaveProposer interface {
 	Propose(context.Context, ReplicatedRoute, []byte) (ReplicatedResult, error)
 }
 
+type durableRequestExecutionPinFencer interface {
+	ValidateExecutionPinFence(
+		context.Context,
+		ReplicatedRoute,
+		executionpin.LeaseCertificate,
+		uint64,
+	) (ReplicatedExecutionPinReadResult, error)
+}
+
 // DurableRequestLifecycleRunner drives one participant at a time. Width is
 // therefore bounded by bytes and the persisted uint64 wave ordinal, not by an
 // aggregate participant slice or a policy participant cap.
 type DurableRequestLifecycleRunner struct {
-	ledger   DurableRequestLedger
-	resolver DurableRequestRouteResolver
-	proposer durableRequestWaveProposer
+	ledger    DurableRequestLedger
+	resolver  DurableRequestRouteResolver
+	proposer  durableRequestWaveProposer
+	pinFencer durableRequestExecutionPinFencer
 }
 
 func NewDurableRequestLifecycleRunner(
@@ -70,7 +83,7 @@ func NewDurableRequestLifecycleRunner(
 		return nil, ErrDurableRequest
 	}
 	return &DurableRequestLifecycleRunner{
-		ledger: ledger, resolver: resolver, proposer: executor,
+		ledger: ledger, resolver: resolver, proposer: executor, pinFencer: executor,
 	}, nil
 }
 
@@ -78,12 +91,25 @@ func newDurableRequestLifecycleRunner(
 	ledger DurableRequestLedger,
 	resolver DurableRequestRouteResolver,
 	proposer durableRequestWaveProposer,
+	fencers ...durableRequestExecutionPinFencer,
 ) (*DurableRequestLifecycleRunner, error) {
 	if ledger == nil || resolver == nil || proposer == nil {
 		return nil, ErrDurableRequest
 	}
+	var fencer durableRequestExecutionPinFencer
+	if len(fencers) > 1 {
+		return nil, ErrDurableRequest
+	}
+	if len(fencers) == 1 {
+		fencer = fencers[0]
+	} else {
+		fencer, _ = proposer.(durableRequestExecutionPinFencer)
+	}
+	if fencer == nil {
+		return nil, ErrDurableRequest
+	}
 	return &DurableRequestLifecycleRunner{
-		ledger: ledger, resolver: resolver, proposer: proposer,
+		ledger: ledger, resolver: resolver, proposer: proposer, pinFencer: fencer,
 	}, nil
 }
 
@@ -101,11 +127,17 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 	wave DurableRequestWave,
 ) (DurableRequestWaveResult, error) {
 	if runner == nil || runner.ledger == nil || runner.resolver == nil ||
-		runner.proposer == nil || ctx == nil {
+		runner.proposer == nil || runner.pinFencer == nil || ctx == nil {
 		return DurableRequestWaveResult{}, ErrDurableRequest
 	}
 	keyDigest, err := validateDurableRequestWave(wave)
 	if err != nil {
+		return DurableRequestWaveResult{}, err
+	}
+	// One leader ReadIndex proof admits the complete persisted wave. Every
+	// physical command additionally carries the pin digest/controller epoch and
+	// is rejected locally by participant state if a takeover superseded it.
+	if err = runner.fenceWaveSideEffect(ctx, wave); err != nil {
 		return DurableRequestWaveResult{}, err
 	}
 	head, routePin, pending, readApplied, err := runner.openWaveRows(ctx, wave, keyDigest)
@@ -474,12 +506,26 @@ func durableRequestRouteMatchesParticipant(
 		route.Command.RelationManifestDigest == participant.RelationManifestDigest
 }
 
+func (runner *DurableRequestLifecycleRunner) fenceWaveSideEffect(
+	ctx context.Context,
+	wave DurableRequestWave,
+) error {
+	_, err := runner.pinFencer.ValidateExecutionPinFence(
+		ctx, wave.ExecutionPinRoute, wave.ExecutionPinLease, wave.ExecutionPinLease.Applied,
+	)
+	if err != nil {
+		return errors.Join(err, ErrDurableRequestConflict)
+	}
+	return nil
+}
+
 func validateDurableRequestWave(wave DurableRequestWave) (requestledger.Digest, error) {
 	if !wave.Key.Valid() || wave.Home.Identity == (replication.Digest{}) ||
 		wave.Identity.ID == ([16]byte{}) ||
 		wave.Identity.RetryHome == (replication.RetryHome{}) || len(wave.Tenant) == 0 ||
 		len(wave.Tenant) > replication.MaxIdentityBytes || wave.PinID == (requestledger.PinID{}) ||
 		wave.GateEpoch == 0 || wave.Binding == (requestledger.Digest{}) ||
+		!validReplicatedRoute(wave.ExecutionPinRoute) || !wave.ExecutionPinLease.Valid() ||
 		(wave.Settle == nil && (wave.Transition == 0 || len(wave.Cursor) == 0)) ||
 		(wave.Settle != nil && (wave.Transition != 0 || len(wave.Cursor) != 0)) ||
 		len(wave.Target) == 0 || len(wave.Command) == 0 ||

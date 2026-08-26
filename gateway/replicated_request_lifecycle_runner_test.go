@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -145,11 +146,27 @@ func (resolver *lifecycleRunnerResolver) ResolveDurableRequestParticipant(
 }
 
 type lifecycleRunnerProposer struct {
-	t         testing.TB
-	events    *lifecycleRunnerEvents
-	faultKind int
-	faultGate routegate.Operation
-	attempts  map[replication.CommandKind][][]byte
+	t            testing.TB
+	events       *lifecycleRunnerEvents
+	faultKind    int
+	faultGate    routegate.Operation
+	attempts     map[replication.CommandKind][][]byte
+	fenceCalls   int
+	fenceFaultAt int
+}
+
+func (proposer *lifecycleRunnerProposer) ValidateExecutionPinFence(
+	_ context.Context,
+	_ ReplicatedRoute,
+	_ executionpin.LeaseCertificate,
+	_ uint64,
+) (ReplicatedExecutionPinReadResult, error) {
+	proposer.fenceCalls++
+	proposer.events.add("fence")
+	if proposer.fenceFaultAt == proposer.fenceCalls {
+		return ReplicatedExecutionPinReadResult{}, ErrDurableRequestConflict
+	}
+	return ReplicatedExecutionPinReadResult{Applied: 11, Found: true}, nil
 }
 
 func (proposer *lifecycleRunnerProposer) Propose(
@@ -251,6 +268,9 @@ func lifecycleRunnerFixture(t testing.TB) (
 	t.Helper()
 	participants, _ := transactionOrchestratorRoutes(t, 1)
 	physical := participants[0]
+	physical.Route.RangeIdentity = replication.Digest(lifecycleDigest("range"))
+	physical.Route.LineageDigest = replication.Digest(lifecycleDigest("lineage"))
+	physical.Route.ForwardingRuleDigest = replication.Digest(lifecycleDigest("forwarding"))
 	tenant := []byte("tenant")
 	retry := replication.RetryHome{9}
 	outer := replicatedTransactionCommandHeader(
@@ -320,6 +340,11 @@ func lifecycleRunnerFixture(t testing.TB) (
 		MutationDigest:         mutationDigest, BucketBits: physical.BucketBits,
 		IntentScopes: physical.IntentScopes, Batches: physical.Batches,
 	}
+	lease := executionpin.LeaseCertificate{
+		PinID: executionpin.PinID{1}, AcquireCertificateDigest: executionpin.Digest{2},
+		AuthorityDigest: executionpin.Digest{3}, Controller: executionpin.ID{4},
+		ControllerEpoch: 1, LeaseAppliedThrough: 100, Revision: 1, Applied: 10,
+	}
 	return DurableRequestWave{
 		Home: DurableRequestLedgerHome{
 			Identity: replication.Digest(lifecycleDigest("home")), Point: homePoint, route: physical.Route,
@@ -331,6 +356,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 		},
 		Tenant: tenant, PinID: head.PinID, GateEpoch: 1,
 		Binding: lifecycleDigest("logical-binding"), Step: step,
+		ExecutionPinRoute: physical.Route, ExecutionPinLease: lease,
 		Target: target, Command: command, Transition: 9, Cursor: cursor,
 	}, head, physical.Route
 }
@@ -401,6 +427,31 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 				t.Fatalf("route resolutions=%d, want at least acquire/work/release", resolver.calls)
 			}
 		})
+	}
+}
+
+func TestDurableRequestLifecycleRunnerFencesEveryProposal(t *testing.T) {
+	wave, initial, route := lifecycleRunnerFixture(t)
+	events := new(lifecycleRunnerEvents)
+	ledger := &lifecycleRunnerLedger{head: initial, events: events}
+	resolver := &lifecycleRunnerResolver{route: route, events: events}
+	proposer := &lifecycleRunnerProposer{
+		t: t, events: events, faultKind: -1, fenceFaultAt: 1,
+		attempts: make(map[replication.CommandKind][][]byte),
+	}
+	runner, err := newDurableRequestLifecycleRunner(ledger, resolver, proposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.RunWave(t.Context(), wave); !errors.Is(err, ErrDurableRequestConflict) {
+		t.Fatalf("released/changed pin at wave admission = %v", err)
+	}
+	proposals := 0
+	for _, attempts := range proposer.attempts {
+		proposals += len(attempts)
+	}
+	if proposer.fenceCalls != 1 || proposals != 0 {
+		t.Fatalf("fences=%d proposals=%d, want 1/0", proposer.fenceCalls, proposals)
 	}
 }
 

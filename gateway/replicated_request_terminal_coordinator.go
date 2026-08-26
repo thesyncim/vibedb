@@ -27,6 +27,7 @@ type DurableRequestTerminalPlan struct {
 	RetirementWitness requestledger.Digest
 	AckToken          requestledger.AckToken
 	Release           executionpin.Command
+	Lease             executionpin.LeaseCertificate
 }
 
 type DurableRequestTerminalResult struct {
@@ -39,6 +40,20 @@ type durableExecutionPinClient interface {
 	BuildRelease(executionpin.Command) ([]byte, error)
 	ProposeNew(context.Context, executionpin.Command, []byte) (ReplicatedResult, error)
 	RetryExact(context.Context, []byte) (ReplicatedResult, error)
+	ValidateFence(context.Context, executionpin.LeaseCertificate) error
+}
+
+func (client *nativeDurableExecutionPinClient) ValidateFence(
+	ctx context.Context,
+	lease executionpin.LeaseCertificate,
+) error {
+	if client == nil || client.executor == nil || client.session == nil {
+		return ErrDurableRequest
+	}
+	_, err := client.executor.ValidateExecutionPinFence(
+		ctx, client.session.route, lease, lease.Applied,
+	)
+	return err
 }
 
 type nativeDurableExecutionPinClient struct {
@@ -184,6 +199,11 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		return DurableRequestTerminalResult{
 			Terminal: terminal, Revision: head.Revision, Applied: applied,
 		}, nil
+	}
+	if prepared.Revision == 0 || release.Phase == requestledger.SchemaPinReleaseInvalid {
+		if err = coordinator.pin.ValidateFence(ctx, plan.Lease); err != nil {
+			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
+		}
 	}
 
 	if prepared.Revision == 0 {
@@ -333,7 +353,13 @@ func validDurableRequestTerminalPlan(plan DurableRequestTerminalPlan) bool {
 		plan.RetirementWitness != (requestledger.Digest{}) &&
 		plan.AckToken != (requestledger.AckToken{}) &&
 		plan.Release.Operation == executionpin.OperationRelease &&
-		plan.Release.PrepareTerminalDigest == (executionpin.Digest{})
+		plan.Release.PrepareTerminalDigest == (executionpin.Digest{}) &&
+		plan.Lease.Valid() && plan.Lease.PinID == plan.Release.PinID &&
+		plan.Lease.AcquireCertificateDigest == plan.Release.AcquireCertificateDigest &&
+		plan.Lease.Controller == plan.Release.ExpectedController &&
+		plan.Lease.ControllerEpoch == plan.Release.ExpectedControllerEpoch &&
+		plan.Lease.LeaseAppliedThrough == plan.Release.ExpectedLeaseAppliedThrough &&
+		plan.Lease.Revision == plan.Release.ExpectedLeaseRevision
 }
 
 func (coordinator *DurableRequestTerminalCoordinator) openTerminalRows(

@@ -225,6 +225,7 @@ func (runner *DurableRequestDistributedRunner) completeTerminal(
 		Result:            result,
 		RetirementWitness: requestledger.Digest(execution.Recipe.Contract.RetirementWitnessDigest),
 		AckToken:          authority.AckToken, Release: authority.Release,
+		Lease: execution.ExecutionPinLease,
 	})
 }
 
@@ -682,6 +683,17 @@ func (progress *durableDistributedProgress) command(
 	if ordinal != progress.next {
 		return false, ErrDurableRequestConflict
 	}
+	// Every participant and coordinator transition carries the same aggregate
+	// execution authority and the controller epoch proven at wave admission.
+	// Replicas persist this pair and reject stale or mismatched controllers
+	// locally, avoiding a ledger-home ReadIndex on each shard proposal.
+	lease := progress.execution.ExecutionPinLease
+	if !lease.Valid() || lease.ControllerEpoch == 0 ||
+		progress.execution.Recipe.Contract.PinDigest == (replication.Digest{}) {
+		return false, ErrDurableRequestConflict
+	}
+	control.ControllerEpoch = lease.ControllerEpoch
+	control.ExecutionPinDigest = distributedtxn.Digest(progress.execution.Recipe.Contract.PinDigest)
 	exact, err := progress.encoder.appendExactTransactionCommand(
 		nil, progress.execution.Recipe.Identity.RetryHome, route, control, batches,
 	)
@@ -698,11 +710,13 @@ func (progress *durableDistributedProgress) command(
 	wave := DurableRequestWave{
 		Home: progress.execution.Home, Key: progress.execution.Key.RequestKey,
 		Participant: logical, Identity: progress.execution.Recipe.Identity,
-		Tenant:    progress.execution.Recipe.Tenant,
-		PinID:     progress.execution.Recipe.Contract.PinID,
-		GateEpoch: progress.execution.Recipe.Contract.PinEpoch,
-		Binding:   requestledger.Digest(progress.execution.Recipe.Contract.PinDigest),
-		Build:     payload.Build, Step: payload.Step, Ordinal: ordinal,
+		Tenant:            progress.execution.Recipe.Tenant,
+		PinID:             progress.execution.Recipe.Contract.PinID,
+		GateEpoch:         lease.ControllerEpoch,
+		Binding:           requestledger.Digest(progress.execution.Recipe.Contract.PinDigest),
+		ExecutionPinRoute: progress.execution.ExecutionPinRoute,
+		ExecutionPinLease: progress.execution.ExecutionPinLease,
+		Build:             payload.Build, Step: payload.Step, Ordinal: ordinal,
 		Target: payload.Target, Command: payload.Command,
 	}
 	wave.Settle = func(observation []byte) (uint32, []byte, error) {
