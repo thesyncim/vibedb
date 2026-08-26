@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -220,33 +219,59 @@ func runReplicaHealthController(
 	}
 }
 
-// startGatewayReplicaControllers starts the durable move resumer and certified
-// failure scheduler as one lifecycle. The returned channel closes only after
-// both loops observe cancellation, so runServe can join them before returning.
+type replicaHealthRevisionPassRunner interface {
+	RunPass(context.Context) (gatewayReplicaHealthRevisionPass, error)
+}
+
+// startGatewayReplicaControllers runs the evidence publisher, certificate
+// consumer, and durable move resumer in that order for every interval. This
+// makes a newly completed replicated confirmation window visible to scheduling
+// in the same pass while bounding health observation to one RF3 at a time. The
+// returned channel closes only after cancellation is observed.
 func startGatewayReplicaControllers(
 	ctx context.Context,
+	revisions replicaHealthRevisionPassRunner,
 	moves replicaMovePassRunner,
 	health replicaHealthPassRunner,
 	interval time.Duration,
 	logf func(string, ...any),
 ) (<-chan struct{}, error) {
-	if ctx == nil || moves == nil || health == nil || interval <= 0 || logf == nil {
+	if ctx == nil || revisions == nil || moves == nil || health == nil || interval <= 0 || logf == nil {
 		return nil, errGatewayReplicaHealth
 	}
 	done := make(chan struct{})
 	go func() {
-		var wait sync.WaitGroup
-		wait.Add(2)
-		go func() {
-			defer wait.Done()
-			runReplicaMoveController(ctx, moves, interval, logf)
-		}()
-		go func() {
-			defer wait.Done()
-			runReplicaHealthController(ctx, health, interval, logf)
-		}()
-		wait.Wait()
-		close(done)
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			revisionPass, revisionErr := revisions.RunPass(ctx)
+			if revisionErr != nil && !errors.Is(revisionErr, context.Canceled) {
+				logf("gateway: replica health revision controller: %v", revisionErr)
+			} else if revisionPass.Published != 0 {
+				logf("gateway: replica health revision controller published %d/%d revision(s)",
+					revisionPass.Published, revisionPass.Groups)
+			}
+			healthPass, healthErr := health.RunPass(ctx)
+			if healthErr != nil && !errors.Is(healthErr, context.Canceled) {
+				logf("gateway: replica health controller: %v", healthErr)
+			} else if healthPass.Submitted != 0 {
+				logf("gateway: replica health controller submitted %d/%d certified replacement(s)",
+					healthPass.Submitted, healthPass.Certificates)
+			}
+			movePass, moveErr := moves.RunPass(ctx)
+			if moveErr != nil && !errors.Is(moveErr, context.Canceled) {
+				logf("gateway: replica move controller: %v", moveErr)
+			} else if movePass.Advanced != 0 || movePass.Completed != 0 {
+				logf("gateway: replica move controller advanced %d/%d move(s), completed %d",
+					movePass.Advanced, movePass.Moves, movePass.Completed)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
 	}()
 	return done, nil
 }

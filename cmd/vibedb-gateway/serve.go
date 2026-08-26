@@ -396,6 +396,9 @@ func runServe(args []string) int {
 			rebalance.ReplicatedFailureAuthority{Source: catalogAuthority},
 			controls.HealthObservations, manifest, moveController,
 		)
+		healthRevisions, revisionErr := newGatewayReplicaHealthRevisionController(
+			catalogAuthority, controls.HealthObservations, catalogAuthority,
+		)
 		gatewayNodes := make([]rafttransport.NodeID, len(manifest.Gateways))
 		gatewayRoster := make(map[rafttransport.NodeID]uint64, len(manifest.Gateways))
 		for index, endpoint := range manifest.Gateways {
@@ -418,7 +421,7 @@ func runServe(args []string) int {
 				}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
 		)
 		controlListener, listenErr := net.Listen("tcp", manifest.Local.Address)
-		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr, healthErr,
+		if joined := errors.Join(openErr, drainErr, controlsErr, controllerErr, healthErr, revisionErr,
 			authorizeErr, tlsErr, serviceErr, listenErr); joined != nil {
 			if controlListener != nil {
 				_ = controlListener.Close()
@@ -428,7 +431,7 @@ func runServe(args []string) int {
 			return 1
 		}
 		replicaControllersDone, err = startGatewayReplicaControllers(
-			ctx, moveController, healthController,
+			ctx, healthRevisions, moveController, healthController,
 			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, logf,
 		)
 		if err != nil {
