@@ -69,23 +69,33 @@ type persistedMembershipGrantPage struct {
 // row and bounded receipt page, so catalog publication cannot revoke the grant
 // which still authorizes removal of the old source.
 type persistedReplicaReplacementReceipt struct {
-	Grant         persistedMembershipGrant `json:"grant"`
-	OldGeneration uint64                   `json:"old_generation"`
-	NewGeneration uint64                   `json:"new_generation"`
-	OldHeadBytes  uint64                   `json:"old_head_bytes"`
-	NewHeadBytes  uint64                   `json:"new_head_bytes"`
-	OldHeadDigest [32]byte                 `json:"old_head_digest"`
-	NewHeadDigest [32]byte                 `json:"new_head_digest"`
+	Grant                       persistedMembershipGrant `json:"grant"`
+	OldGeneration               uint64                   `json:"old_generation"`
+	NewGeneration               uint64                   `json:"new_generation"`
+	PublishedReplicaSetVersion  uint64                   `json:"published_replica_set_version"`
+	OldHeadBytes                uint64                   `json:"old_head_bytes"`
+	NewHeadBytes                uint64                   `json:"new_head_bytes"`
+	OldHeadDigest               [32]byte                 `json:"old_head_digest"`
+	NewHeadDigest               [32]byte                 `json:"new_head_digest"`
+	PostRemoveGeneration        uint64                   `json:"post_remove_generation"`
+	PostRemoveReplicaSetVersion uint64                   `json:"post_remove_replica_set_version"`
+	PostRemoveHeadBytes         uint64                   `json:"post_remove_head_bytes"`
+	PostRemoveHeadDigest        [32]byte                 `json:"post_remove_head_digest"`
 }
 
 type replicaReplacementReceipt struct {
-	Grant         membershipgrant.Grant
-	OldGeneration uint64
-	NewGeneration uint64
-	OldHeadBytes  uint64
-	NewHeadBytes  uint64
-	OldHeadDigest [32]byte
-	NewHeadDigest [32]byte
+	Grant                       membershipgrant.Grant
+	OldGeneration               uint64
+	NewGeneration               uint64
+	PublishedReplicaSetVersion  uint64
+	OldHeadBytes                uint64
+	NewHeadBytes                uint64
+	OldHeadDigest               [32]byte
+	NewHeadDigest               [32]byte
+	PostRemoveGeneration        uint64
+	PostRemoveReplicaSetVersion uint64
+	PostRemoveHeadBytes         uint64
+	PostRemoveHeadDigest        [32]byte
 }
 
 // ReadMembershipGrant performs one linearizable independently keyed lookup.
@@ -134,7 +144,8 @@ func (authority *ReplicatedCatalogAuthority) catalogAuthorizesMembershipGrant(
 		return replicatedCatalogCertifiesInitialGrant(current, grant), nil
 	}
 	if grant.CatalogGeneration == ^uint64(0) ||
-		current.Generation() != grant.CatalogGeneration+1 {
+		(current.Generation() != grant.CatalogGeneration+1 &&
+			current.Generation() != grant.CatalogGeneration+2) {
 		return false, nil
 	}
 	key, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
@@ -152,9 +163,23 @@ func (authority *ReplicatedCatalogAuthority) catalogAuthorizesMembershipGrant(
 	if err != nil {
 		return false, err
 	}
-	return receipt.Grant == grant && receipt.NewGeneration == current.Generation() &&
-		receipt.NewHeadBytes == uint64(len(currentRaw)) &&
-		receipt.NewHeadDigest == sha256.Sum256(currentRaw), nil
+	if receipt.Grant != grant {
+		return false, nil
+	}
+	version, found := replicaSetVersionForGroup(current, grant.Group)
+	if !found {
+		return false, nil
+	}
+	if current.Generation() == grant.CatalogGeneration+1 {
+		return receipt.NewGeneration == current.Generation() &&
+			receipt.PublishedReplicaSetVersion == version &&
+			receipt.NewHeadBytes == uint64(len(currentRaw)) &&
+			receipt.NewHeadDigest == sha256.Sum256(currentRaw), nil
+	}
+	return receipt.PostRemoveGeneration == current.Generation() &&
+		receipt.PostRemoveReplicaSetVersion == version &&
+		receipt.PostRemoveHeadBytes == uint64(len(currentRaw)) &&
+		receipt.PostRemoveHeadDigest == sha256.Sum256(currentRaw), nil
 }
 
 // PublishMembershipGrant atomically inserts one exact per-group record and its
@@ -348,6 +373,112 @@ func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int
 	return digest
 }
 
+// BuildReplicaReplacementPostRemoveTransition builds the sole G+1 -> G+2 cut
+// accepted after source removal. It preserves the final manifest, roster, and
+// every serving fence field except ReplicaSetVersion, which must advance to the
+// exact value observed from the post-remove Raft configuration.
+func BuildReplicaReplacementPostRemoveTransition(
+	current *Snapshot,
+	nextGeneration uint64,
+	grant membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) (*Snapshot, error) {
+	return buildReplicaReplacementPostRemoveTransition(
+		current, nextGeneration, grant, observedReplicaSetVersion,
+	)
+}
+
+func buildReplicaReplacementPostRemoveTransition(
+	current *Snapshot,
+	nextGeneration uint64,
+	grant membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) (*Snapshot, error) {
+	if current == nil || !grant.Valid() || grant.CatalogGeneration == ^uint64(0) ||
+		current.Generation() != grant.CatalogGeneration+1 ||
+		current.Generation() == ^uint64(0) ||
+		nextGeneration != current.Generation()+1 {
+		return nil, &CatalogError{Reason: "invalid post-remove catalog generation"}
+	}
+	descriptors := current.replicatedDescriptors()
+	changed := false
+	for index := range descriptors {
+		descriptor := &descriptors[index]
+		if descriptor.Group != grant.Group {
+			continue
+		}
+		if changed || observedReplicaSetVersion <= descriptor.Command.ReplicaSetVersion {
+			return nil, &CatalogError{Reason: "invalid post-remove replica-set fence"}
+		}
+		descriptor.Command.ReplicaSetVersion = observedReplicaSetVersion
+		changed = true
+	}
+	if !changed {
+		return nil, &CatalogError{Reason: "post-remove Raft group is absent"}
+	}
+	next, err := NewSnapshotWithReplicatedTableMetadata(
+		cloneConfig(current.config), current.endpoints, nextGeneration,
+		current.indexDescriptors(), current.statistics.Descriptors(), descriptors,
+		current.replicatedTableProfiles(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	indexHighWater, err := advanceIndexIDHighWater(current, next)
+	if err != nil {
+		return nil, err
+	}
+	shardHighWaters, err := advanceShardGenerationHighWaters(current, next)
+	if err != nil {
+		return nil, err
+	}
+	return snapshotWithCatalogLineage(next, indexHighWater, shardHighWaters), nil
+}
+
+func validateReplicaReplacementPostRemoveTransition(
+	current, next *Snapshot,
+	grant membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) error {
+	if current == nil || next == nil {
+		return ErrReplicatedCatalogConflict
+	}
+	expected, err := buildReplicaReplacementPostRemoveTransition(
+		current, next.Generation(), grant, observedReplicaSetVersion,
+	)
+	if err != nil {
+		return err
+	}
+	want, err := appendReplicatedCatalogDocument(nil, expected, maxReplicatedCatalogBytes)
+	if err != nil {
+		return err
+	}
+	got, err := appendReplicatedCatalogDocument(nil, next, maxReplicatedCatalogBytes)
+	if err != nil || !bytes.Equal(got, want) {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	return nil
+}
+
+func replicaSetVersionForGroup(snapshot *Snapshot, group raftmember.GroupKey) (uint64, bool) {
+	if snapshot == nil {
+		return 0, false
+	}
+	found := false
+	var version uint64
+	for index := range snapshot.replicatedShards {
+		if snapshot.replicatedShards[index].group != group {
+			continue
+		}
+		if found || snapshot.replicatedShards[index].command.ReplicaSetVersion == 0 {
+			return 0, false
+		}
+		version = snapshot.replicatedShards[index].command.ReplicaSetVersion
+		found = true
+	}
+	return version, found
+}
+
 // RevokeMembershipGrant deliberately has no standalone success path. Runtime-
 // local state is not a durable deletion proof: deleting an observed grant at
 // an intermediate learner/RF4 cut would strand recovery after restart. Use
@@ -466,10 +597,14 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	}
 	if priorReceipt.Found {
 		prior, openErr := openReplicaReplacementReceipt(priorReceipt.Value)
+		priorHeadMatches := prior.NewGeneration == cut.snapshot.Generation() &&
+			prior.NewHeadBytes == uint64(len(cut.head)) &&
+			prior.NewHeadDigest == sha256.Sum256(cut.head)
+		postHeadMatches := prior.PostRemoveGeneration == cut.snapshot.Generation() &&
+			prior.PostRemoveHeadBytes == uint64(len(cut.head)) &&
+			prior.PostRemoveHeadDigest == sha256.Sum256(cut.head)
 		if openErr != nil || prior.Grant.Group != expected.Group ||
-			prior.NewGeneration != cut.snapshot.Generation() ||
-			prior.NewHeadBytes != uint64(len(cut.head)) ||
-			prior.NewHeadDigest != sha256.Sum256(cut.head) {
+			(!priorHeadMatches && !postHeadMatches) {
 			return errors.Join(openErr, ErrReplicatedCatalogConflict)
 		}
 	} else {
@@ -494,8 +629,12 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if err != nil {
 		return err
 	}
+	publishedReplicaSetVersion, found := replicaSetVersionForGroup(certified, expected.Group)
+	if !found {
+		return ErrReplicatedCatalogConflict
+	}
 	receipt, err := appendReplicaReplacementReceipt(
-		nil, expected, cut.head, authority.scratch,
+		nil, expected, cut.head, authority.scratch, publishedReplicaSetVersion,
 	)
 	if err != nil {
 		return err
@@ -544,6 +683,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
 			authority.pendingCatalog, authority.pendingExpected = certified, expectedGeneration
 			authority.pendingGrant = expected
+			authority.pendingPostRemoveReplicaSetVersion = 0
 			return errors.Join(ErrReplicatedCatalogPending, err)
 		}
 		return err
@@ -556,6 +696,131 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	}
 	return authority.holder.publishReplicaReplacementAfter(
 		expectedGeneration, certified, expected,
+	)
+}
+
+// PublishReplicaReplacementPostRemove publishes the adjacent fence-only cut
+// after Raft has removed the old voter. The exact existing receipt is extended
+// from G/G+1 to G/G+1/G+2 in the same relation batch as head+witness, binding
+// both membership ReplicaSetVersion observations without changing any roster,
+// manifest, or other CommandFence field.
+func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove(
+	ctx context.Context,
+	expectedGeneration uint64,
+	next *Snapshot,
+	expected membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
+		!expected.Valid() || expected.CatalogGeneration == ^uint64(0) ||
+		expectedGeneration != expected.CatalogGeneration+1 ||
+		expectedGeneration == ^uint64(0) ||
+		next.Generation() != expectedGeneration+1 ||
+		observedReplicaSetVersion == 0 || authority.session.bundle.maxMutations < 3 {
+		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	cut, err := authority.readCatalogCut(ctx)
+	if err != nil {
+		return err
+	}
+	if cut.snapshot.Generation() != expectedGeneration {
+		return ErrCatalogGenerationMismatch
+	}
+	if err = validateReplicaReplacementPostRemoveTransition(
+		cut.snapshot, next, expected, observedReplicaSetVersion,
+	); err != nil {
+		return err
+	}
+	publishedReplicaSetVersion, found := replicaSetVersionForGroup(
+		cut.snapshot, expected.Group,
+	)
+	if !found || observedReplicaSetVersion <= publishedReplicaSetVersion {
+		return ErrReplicatedCatalogConflict
+	}
+	receiptKey, _ := replicatedReplicaReplacementReceiptKeys(expected.Group)
+	receiptResult, err := authority.readRaw(
+		ctx, receiptKey[:], maxReplicatedReplicaReplacementReceiptBytes,
+	)
+	if err != nil {
+		return err
+	}
+	if !receiptResult.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	receipt, err := openReplicaReplacementReceipt(receiptResult.Value)
+	if err != nil || receipt.Grant != expected ||
+		receipt.NewGeneration != expectedGeneration ||
+		receipt.PublishedReplicaSetVersion != publishedReplicaSetVersion ||
+		receipt.NewHeadBytes != uint64(len(cut.head)) ||
+		receipt.NewHeadDigest != sha256.Sum256(cut.head) ||
+		receipt.PostRemoveGeneration != 0 {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedCatalogDocument(
+		authority.scratch, next, maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		return ErrCatalogTooLarge
+	}
+	nextWitness, err := appendReplicatedCatalogHeadWitness(
+		nil, next.Generation(), authority.scratch,
+	)
+	if err != nil {
+		return err
+	}
+	receipt.PostRemoveGeneration = next.Generation()
+	receipt.PostRemoveReplicaSetVersion = observedReplicaSetVersion
+	receipt.PostRemoveHeadBytes = uint64(len(authority.scratch))
+	receipt.PostRemoveHeadDigest = sha256.Sum256(authority.scratch)
+	updatedReceipt, err := appendReplicaReplacementReceiptRecord(nil, receipt)
+	if err != nil {
+		return err
+	}
+	headDigest := sha256.Sum256(cut.head)
+	witnessDigest := sha256.Sum256(cut.witness)
+	receiptDigest := sha256.Sum256(receiptResult.Value)
+	mutations := []NativeMutation{
+		{Kind: replication.MutationPutDigestEqual,
+			Key: replicatedCatalogHeadKey, Value: authority.scratch,
+			ExpectedValueLength: uint64(len(cut.head)),
+			ExpectedValueDigest: replication.Digest(headDigest)},
+		{Kind: replication.MutationPutDigestEqual,
+			Key: replicatedCatalogHeadWitnessKey, Value: nextWitness,
+			ExpectedValueLength: uint64(len(cut.witness)),
+			ExpectedValueDigest: replication.Digest(witnessDigest)},
+		{Kind: replication.MutationPutDigestEqual,
+			Key: receiptKey[:], Value: updatedReceipt,
+			ExpectedValueLength: uint64(len(receiptResult.Value)),
+			ExpectedValueDigest: replication.Digest(receiptDigest)},
+	}
+	result, err := authority.session.MutateBatch(ctx, mutations)
+	if err != nil {
+		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
+			authority.pendingCatalog, authority.pendingExpected = next, expectedGeneration
+			authority.pendingGrant = expected
+			authority.pendingPostRemoveReplicaSetVersion = observedReplicaSetVersion
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return authority.holder.publishReplicaReplacementPostRemoveAfter(
+		expectedGeneration, next, expected, observedReplicaSetVersion,
 	)
 }
 
@@ -584,7 +849,8 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	if err != nil {
 		return err
 	}
-	if cut.snapshot.Generation() != expected.CatalogGeneration+1 {
+	if expected.CatalogGeneration > ^uint64(0)-2 ||
+		cut.snapshot.Generation() != expected.CatalogGeneration+2 {
 		return ErrCatalogGenerationMismatch
 	}
 	receiptKey, _ := replicatedReplicaReplacementReceiptKeys(expected.Group)
@@ -598,10 +864,12 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 		return ErrReplicatedCatalogConflict
 	}
 	receipt, err := openReplicaReplacementReceipt(receiptResult.Value)
+	postVersion, found := replicaSetVersionForGroup(cut.snapshot, expected.Group)
 	if err != nil || receipt.Grant != expected ||
-		receipt.NewGeneration != cut.snapshot.Generation() ||
-		receipt.NewHeadBytes != uint64(len(cut.head)) ||
-		receipt.NewHeadDigest != sha256.Sum256(cut.head) {
+		receipt.PostRemoveGeneration != cut.snapshot.Generation() ||
+		receipt.PostRemoveReplicaSetVersion != postVersion ||
+		receipt.PostRemoveHeadBytes != uint64(len(cut.head)) ||
+		receipt.PostRemoveHeadDigest != sha256.Sum256(cut.head) {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
 	recordKey, pageKey := replicatedMembershipGrantKeys(expected.Group)
@@ -719,16 +987,18 @@ func openReplicatedMembershipGrant(raw []byte) (membershipgrant.Grant, error) {
 }
 
 func appendReplicaReplacementReceipt(dst []byte, grant membershipgrant.Grant,
-	oldHead, newHead []byte) ([]byte, error) {
+	oldHead, newHead []byte, publishedReplicaSetVersion uint64) ([]byte, error) {
 	if !grant.Valid() || grant.CatalogGeneration == ^uint64(0) || len(oldHead) == 0 ||
 		len(newHead) == 0 || len(oldHead) > maxReplicatedCatalogBytes ||
-		len(newHead) > maxReplicatedCatalogBytes {
+		len(newHead) > maxReplicatedCatalogBytes ||
+		publishedReplicaSetVersion <= grant.InitialReplicaSetVersion {
 		return dst, ErrReplicatedCatalog
 	}
 	receipt := replicaReplacementReceipt{
 		Grant: grant, OldGeneration: grant.CatalogGeneration,
-		NewGeneration: grant.CatalogGeneration + 1,
-		OldHeadBytes:  uint64(len(oldHead)), NewHeadBytes: uint64(len(newHead)),
+		NewGeneration:              grant.CatalogGeneration + 1,
+		PublishedReplicaSetVersion: publishedReplicaSetVersion,
+		OldHeadBytes:               uint64(len(oldHead)), NewHeadBytes: uint64(len(newHead)),
 		OldHeadDigest: sha256.Sum256(oldHead), NewHeadDigest: sha256.Sum256(newHead),
 	}
 	return appendReplicaReplacementReceiptRecord(dst, receipt)
@@ -742,8 +1012,13 @@ func appendReplicaReplacementReceiptRecord(dst []byte,
 	persisted := persistedReplicaReplacementReceipt{
 		Grant:         persistMembershipGrant(receipt.Grant),
 		OldGeneration: receipt.OldGeneration, NewGeneration: receipt.NewGeneration,
-		OldHeadBytes: receipt.OldHeadBytes, NewHeadBytes: receipt.NewHeadBytes,
+		PublishedReplicaSetVersion: receipt.PublishedReplicaSetVersion,
+		OldHeadBytes:               receipt.OldHeadBytes, NewHeadBytes: receipt.NewHeadBytes,
 		OldHeadDigest: receipt.OldHeadDigest, NewHeadDigest: receipt.NewHeadDigest,
+		PostRemoveGeneration:        receipt.PostRemoveGeneration,
+		PostRemoveReplicaSetVersion: receipt.PostRemoveReplicaSetVersion,
+		PostRemoveHeadBytes:         receipt.PostRemoveHeadBytes,
+		PostRemoveHeadDigest:        receipt.PostRemoveHeadDigest,
 	}
 	payload, err := vibejson.Marshal(&persisted)
 	if err != nil {
@@ -768,8 +1043,13 @@ func openReplicaReplacementReceipt(raw []byte) (replicaReplacementReceipt, error
 	receipt := replicaReplacementReceipt{
 		Grant:         openPersistedMembershipGrant(persisted.Grant),
 		OldGeneration: persisted.OldGeneration, NewGeneration: persisted.NewGeneration,
-		OldHeadBytes: persisted.OldHeadBytes, NewHeadBytes: persisted.NewHeadBytes,
+		PublishedReplicaSetVersion: persisted.PublishedReplicaSetVersion,
+		OldHeadBytes:               persisted.OldHeadBytes, NewHeadBytes: persisted.NewHeadBytes,
 		OldHeadDigest: persisted.OldHeadDigest, NewHeadDigest: persisted.NewHeadDigest,
+		PostRemoveGeneration:        persisted.PostRemoveGeneration,
+		PostRemoveReplicaSetVersion: persisted.PostRemoveReplicaSetVersion,
+		PostRemoveHeadBytes:         persisted.PostRemoveHeadBytes,
+		PostRemoveHeadDigest:        persisted.PostRemoveHeadDigest,
 	}
 	canonical, canonicalErr := appendReplicaReplacementReceiptRecord(nil, receipt)
 	if canonicalErr != nil || !bytes.Equal(raw, canonical) {
@@ -779,14 +1059,31 @@ func openReplicaReplacementReceipt(raw []byte) (replicaReplacementReceipt, error
 }
 
 func validReplicaReplacementReceipt(receipt replicaReplacementReceipt) bool {
-	return receipt.Grant.Valid() && receipt.OldGeneration != 0 &&
-		receipt.OldGeneration != ^uint64(0) &&
-		receipt.Grant.CatalogGeneration == receipt.OldGeneration &&
-		receipt.NewGeneration == receipt.OldGeneration+1 &&
-		receipt.OldHeadBytes != 0 && receipt.NewHeadBytes != 0 &&
-		receipt.OldHeadBytes <= maxReplicatedCatalogBytes &&
-		receipt.NewHeadBytes <= maxReplicatedCatalogBytes &&
-		receipt.OldHeadDigest != ([32]byte{}) && receipt.NewHeadDigest != ([32]byte{})
+	if !receipt.Grant.Valid() || receipt.OldGeneration == 0 ||
+		receipt.OldGeneration == ^uint64(0) ||
+		receipt.Grant.CatalogGeneration != receipt.OldGeneration {
+		return false
+	}
+	if receipt.NewGeneration != receipt.OldGeneration+1 ||
+		receipt.PublishedReplicaSetVersion <= receipt.Grant.InitialReplicaSetVersion ||
+		receipt.OldHeadBytes == 0 || receipt.NewHeadBytes == 0 ||
+		receipt.OldHeadBytes > maxReplicatedCatalogBytes ||
+		receipt.NewHeadBytes > maxReplicatedCatalogBytes {
+		return false
+	}
+	if receipt.OldHeadDigest == ([32]byte{}) || receipt.NewHeadDigest == ([32]byte{}) {
+		return false
+	}
+	postEmpty := receipt.PostRemoveGeneration == 0 &&
+		receipt.PostRemoveReplicaSetVersion == 0 && receipt.PostRemoveHeadBytes == 0 &&
+		receipt.PostRemoveHeadDigest == ([32]byte{})
+	postComplete := receipt.NewGeneration != ^uint64(0) &&
+		receipt.PostRemoveGeneration == receipt.NewGeneration+1 &&
+		receipt.PostRemoveReplicaSetVersion > receipt.PublishedReplicaSetVersion &&
+		receipt.PostRemoveHeadBytes != 0 &&
+		receipt.PostRemoveHeadBytes <= maxReplicatedCatalogBytes &&
+		receipt.PostRemoveHeadDigest != ([32]byte{})
+	return postEmpty || postComplete
 }
 
 func validateReplicaReplacementReceipt(raw, oldHead, newHead []byte,

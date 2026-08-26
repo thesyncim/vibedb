@@ -203,6 +203,47 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		t.Fatalf("grant before source removal=%+v found=%v err=%v", grantResult, found, readErr)
 	}
 
+	publishedVersion, ok := replicaSetVersionForGroup(next, grant.Group)
+	if !ok {
+		t.Fatal("published replica-set fence is missing")
+	}
+	postRemoveVersion := publishedVersion + 2
+	postRemove, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, postRemoveVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unknownNext = true
+	err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), postRemove, grant, postRemoveVersion,
+	)
+	if !errors.Is(err, ErrReplicatedCatalogPending) || !authority.session.Status().Pending {
+		t.Fatalf("unknown post-remove publication err=%v pending=%v", err, authority.session.Status().Pending)
+	}
+	if refreshed, refreshErr := observer.Read(context.Background()); refreshErr != nil ||
+		refreshed.Generation() != postRemove.Generation() {
+		t.Fatalf("observer post-remove refresh=%v err=%v", refreshed, refreshErr)
+	}
+	postRemoveCommand := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(postRemoveCommand, client.unknownCommand) {
+		t.Fatal("post-remove retry changed its exact command bytes")
+	}
+	if grantResult, found, readErr := authority.ReadMembershipGrant(
+		context.Background(), grant.Group,
+	); readErr != nil || !found || grantResult != grant {
+		t.Fatalf("grant at post-remove fence=%+v found=%v err=%v", grantResult, found, readErr)
+	}
+	receipt, receiptErr = openReplicaReplacementReceipt(client.rows[string(receiptKey[:])])
+	if receiptErr != nil || receipt.PostRemoveGeneration != postRemove.Generation() ||
+		receipt.PostRemoveReplicaSetVersion != postRemoveVersion {
+		t.Fatalf("post-remove receipt=%+v err=%v", receipt, receiptErr)
+	}
+
 	client.unknownNext = true
 	err = authority.FinalizeReplicaReplacement(context.Background(), grant)
 	if !errors.Is(err, ErrReplicatedCatalogPending) || !authority.session.Status().Pending {
@@ -240,19 +281,19 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	// slot; it neither grows the directory nor trusts the prior certificate for
 	// the new transition.
 	receiptPageBefore := append([]byte(nil), client.rows[string(receiptPageKey[:])]...)
-	secondDescriptor := next.replicatedDescriptors()[0]
+	secondDescriptor := postRemove.replicatedDescriptors()[0]
 	secondGrant := testReplicatedMembershipGrant(secondDescriptor.Group)
 	secondGrant.TransitionID[0]++
 	secondGrant.MetadataEpoch++
-	secondGrant.CatalogGeneration = next.Generation()
+	secondGrant.CatalogGeneration = postRemove.Generation()
 	secondGrant.InitialReplicaSetVersion = secondDescriptor.Command.ReplicaSetVersion
 	secondGrant.InitialVoters = [3]uint64{2, 3, 4}
-	secondGrant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(next, 0)
-	secondGrant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(next, 0)
+	secondGrant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(postRemove, 0)
+	secondGrant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(postRemove, 0)
 	secondGrant.SourceMember = 2
 	secondGrant.TargetMember = 5
 	secondGrant.TargetNode = [16]byte{5}
-	currentManifest, ok := next.Manifest(secondDescriptor.Distribution)
+	currentManifest, ok := postRemove.Manifest(secondDescriptor.Distribution)
 	if !ok {
 		t.Fatal("second replacement manifest missing")
 	}
@@ -273,7 +314,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	secondCommand.RoutingVersion++
 	secondCommand.RouteGeneration++
 	secondNext, err := BuildReplicaReplacementTransition(
-		next, secondManifest, next.Generation()+1, secondGrant, secondTarget, secondCommand,
+		postRemove, secondManifest, postRemove.Generation()+1, secondGrant, secondTarget, secondCommand,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +323,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		t.Fatal(err)
 	}
 	if err = authority.PublishReplicaReplacement(
-		context.Background(), next.Generation(), secondNext, secondGrant,
+		context.Background(), postRemove.Generation(), secondNext, secondGrant,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +341,7 @@ func TestReplicaReplacementReceiptLetsConcurrentStaleGatewaysRefresh(t *testing.
 	authority, _, current := newCatalogAuthorityFixture(t)
 	first := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x81)
 	second := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x82)
+	skipper := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x84)
 	_, _, descriptor := testReplicatedCatalogInput(t)
 	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
 	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
@@ -338,6 +380,110 @@ func TestReplicaReplacementReceiptLetsConcurrentStaleGatewaysRefresh(t *testing.
 		if refreshErr != nil {
 			t.Fatalf("gateway %d refresh=%v", index, refreshErr)
 		}
+	}
+	version, ok := replicaSetVersionForGroup(next, grant.Group)
+	if !ok {
+		t.Fatal("replacement fence is missing")
+	}
+	post, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, version+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), post, grant, version+2,
+	); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("mismatched observed replica-set fence=%v", err)
+	}
+	if err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), post, grant, version+1,
+	); err != nil {
+		t.Fatal(err)
+	}
+	start = make(chan struct{})
+	wait.Add(2)
+	for index, peer := range []*ReplicatedCatalogAuthority{first, second} {
+		go func(index int, peer *ReplicatedCatalogAuthority) {
+			defer wait.Done()
+			<-start
+			refreshed, refreshErr := peer.Read(context.Background())
+			if refreshErr == nil && refreshed.Generation() != post.Generation() {
+				refreshErr = ErrReplicatedCatalogConflict
+			}
+			errorsByGateway[index] = refreshErr
+		}(index, peer)
+	}
+	close(start)
+	wait.Wait()
+	for index, refreshErr := range errorsByGateway {
+		if refreshErr != nil {
+			t.Fatalf("gateway %d post-remove refresh=%v", index, refreshErr)
+		}
+	}
+	if _, err = skipper.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("gateway skipped two certified cuts: %v", err)
+	}
+	if skipper.holder.Current().Generation() != current.Generation() {
+		t.Fatal("skipped refresh advanced stale holder")
+	}
+}
+
+func TestReplicaReplacementPostRemoveRejectsFenceDriftAndStaleObservation(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	_, _, descriptor := testReplicatedCatalogInput(t)
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+		t.Fatal(err)
+	}
+	next, err := BuildReplicaReplacementTransition(
+		current, manifest, current.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), current.Generation(), next, grant,
+	); err != nil {
+		t.Fatal(err)
+	}
+	version, ok := replicaSetVersionForGroup(next, grant.Group)
+	if !ok {
+		t.Fatal("replacement fence is missing")
+	}
+	if _, err = BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, version,
+	); err == nil {
+		t.Fatal("stale replica-set observation was accepted")
+	}
+	post, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, version+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRaw, err := appendReplicatedCatalogDocument(nil, post, maxReplicatedCatalogBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postPayload, err := openTypedControlPlaneDocument(
+		postRaw, replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted, err := OpenSnapshotDocument(postPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted.replicatedShards[0].command.OwnershipEpoch++
+	if err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), drifted, grant, version+1,
+	); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("post-remove command-fence drift=%v", err)
+	}
+	if authority.holder.Current().Generation() != next.Generation() {
+		t.Fatal("rejected post-remove transition advanced holder")
 	}
 }
 
@@ -386,6 +532,69 @@ func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.
 	}
 }
 
+func TestReplicaReplacementPostRemoveRefreshRequiresCanonicalReceipt(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(map[string][]byte, [33]byte)
+	}{
+		{name: "missing", mutate: func(rows map[string][]byte, key [33]byte) {
+			delete(rows, string(key[:]))
+		}},
+		{name: "corrupt", mutate: func(rows map[string][]byte, key [33]byte) {
+			raw := append([]byte(nil), rows[string(key[:])]...)
+			raw[len(raw)-2] ^= 1
+			rows[string(key[:])] = raw
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			authority, client, current := newCatalogAuthorityFixture(t)
+			peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x85)
+			_, _, descriptor := testReplicatedCatalogInput(t)
+			grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+			if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
+				t.Fatal(err)
+			}
+			next, err := BuildReplicaReplacementTransition(
+				current, manifest, current.Generation()+1, grant, target, command,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = authority.PublishReplicaReplacement(
+				context.Background(), current.Generation(), next, grant,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = peer.Read(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			version, ok := replicaSetVersionForGroup(next, grant.Group)
+			if !ok {
+				t.Fatal("replacement fence is missing")
+			}
+			post, err := BuildReplicaReplacementPostRemoveTransition(
+				next, next.Generation()+1, grant, version+1,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = authority.PublishReplicaReplacementPostRemove(
+				context.Background(), next.Generation(), post, grant, version+1,
+			); err != nil {
+				t.Fatal(err)
+			}
+			receiptKey, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
+			testCase.mutate(client.rows, receiptKey)
+			if _, err = peer.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+				t.Fatalf("post-remove refresh without exact receipt=%v", err)
+			}
+			if peer.holder.Current().Generation() != next.Generation() {
+				t.Fatal("failed post-remove receipt validation advanced stale holder")
+			}
+		})
+	}
+}
+
 func TestReplicaReplacementReceiptIsCanonicalAndBounded(t *testing.T) {
 	if maxReplicatedMembershipLifecycleBytes != 28<<20 {
 		t.Fatal("membership lifecycle retention bound drifted")
@@ -419,6 +628,31 @@ func TestReplicaReplacementReceiptIsCanonicalAndBounded(t *testing.T) {
 	}
 	if _, err = openReplicaReplacementReceipt(append(append([]byte(nil), raw...), ' ')); !errors.Is(err, ErrReplicatedCatalog) {
 		t.Fatalf("trailing receipt=%v", err)
+	}
+	version, ok := replicaSetVersionForGroup(next, grant.Group)
+	if !ok {
+		t.Fatal("replacement fence is missing")
+	}
+	post, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, version+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), post, grant, version+1,
+	); err != nil {
+		t.Fatal(err)
+	}
+	raw = client.rows[string(key[:])]
+	receipt, err = openReplicaReplacementReceipt(raw)
+	if err != nil || len(raw) > maxReplicatedReplicaReplacementReceiptBytes ||
+		receipt.PostRemoveGeneration != post.Generation() {
+		t.Fatalf("extended receipt bytes=%d value=%+v err=%v", len(raw), receipt, err)
+	}
+	canonical, err = appendReplicaReplacementReceiptRecord(nil, receipt)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		t.Fatalf("extended receipt is not canonical: err=%v", err)
 	}
 }
 

@@ -52,17 +52,18 @@ type replicatedCatalogCut struct {
 // The route is a bootstrap coordinate only; every head read is ReadIndex-fenced and
 // every replacement is a raw length+SHA-256 compare inside replicated apply.
 type ReplicatedCatalogAuthority struct {
-	executor        *ReplicatedExecutor
-	route           ReplicatedRoute
-	relation        replication.RelationID
-	holder          *CatalogHolder
-	session         *NativeSession
-	authority       serviceauthz.Authority
-	mu              sync.Mutex
-	scratch         []byte
-	pendingCatalog  *Snapshot
-	pendingExpected uint64
-	pendingGrant    membershipgrant.Grant
+	executor                           *ReplicatedExecutor
+	route                              ReplicatedRoute
+	relation                           replication.RelationID
+	holder                             *CatalogHolder
+	session                            *NativeSession
+	authority                          serviceauthz.Authority
+	mu                                 sync.Mutex
+	scratch                            []byte
+	pendingCatalog                     *Snapshot
+	pendingExpected                    uint64
+	pendingGrant                       membershipgrant.Grant
+	pendingPostRemoveReplicaSetVersion uint64
 }
 
 type ReplicatedCatalogAuthorityOptions struct {
@@ -274,13 +275,63 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 	if err != nil {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	grant, err := validateReplicaReplacementReceipt(
-		result.Value, currentRaw, nextRaw, current.Generation(), next.Generation(),
-	)
-	if err != nil || grant.Group != group {
+	receipt, err := openReplicaReplacementReceipt(result.Value)
+	if err != nil || receipt.Grant.Group != group {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	certified, err := advanceCatalogStateReplicaReplacement(current, next, grant)
+	var certified *Snapshot
+	var publish func() error
+	switch {
+	case current.Generation() == receipt.OldGeneration &&
+		next.Generation() == receipt.NewGeneration:
+		grant, validateErr := validateReplicaReplacementReceipt(
+			result.Value, currentRaw, nextRaw, current.Generation(), next.Generation(),
+		)
+		if validateErr != nil || grant.Group != group {
+			return errors.Join(validateErr, ErrReplicatedCatalogConflict)
+		}
+		certified, err = advanceCatalogStateReplicaReplacement(current, next, grant)
+		if err == nil {
+			version, found := replicaSetVersionForGroup(certified, group)
+			if !found || version != receipt.PublishedReplicaSetVersion {
+				err = ErrReplicatedCatalogConflict
+			}
+		}
+		publish = func() error {
+			return authority.holder.publishReplicaReplacementAfter(
+				current.Generation(), certified, grant,
+			)
+		}
+	case current.Generation() == receipt.NewGeneration &&
+		next.Generation() == receipt.PostRemoveGeneration:
+		if receipt.NewHeadBytes != uint64(len(currentRaw)) ||
+			receipt.NewHeadDigest != sha256.Sum256(currentRaw) ||
+			receipt.PostRemoveHeadBytes != uint64(len(nextRaw)) ||
+			receipt.PostRemoveHeadDigest != sha256.Sum256(nextRaw) {
+			return ErrReplicatedCatalogConflict
+		}
+		err = validateReplicaReplacementPostRemoveTransition(
+			current, next, receipt.Grant, receipt.PostRemoveReplicaSetVersion,
+		)
+		if err == nil {
+			currentVersion, currentFound := replicaSetVersionForGroup(current, group)
+			nextVersion, nextFound := replicaSetVersionForGroup(next, group)
+			if !currentFound || !nextFound ||
+				currentVersion != receipt.PublishedReplicaSetVersion ||
+				nextVersion != receipt.PostRemoveReplicaSetVersion {
+				err = ErrReplicatedCatalogConflict
+			}
+		}
+		certified = next
+		publish = func() error {
+			return authority.holder.publishReplicaReplacementPostRemoveAfter(
+				current.Generation(), certified, receipt.Grant,
+				receipt.PostRemoveReplicaSetVersion,
+			)
+		}
+	default:
+		return ErrReplicatedCatalogConflict
+	}
 	if err != nil {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
@@ -290,9 +341,7 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 	if err != nil || !bytes.Equal(certifiedRaw, nextRaw) {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	if err = authority.holder.publishReplicaReplacementAfter(
-		current.Generation(), certified, grant,
-	); err == nil {
+	if err = publish(); err == nil {
 		return nil
 	}
 	// Concurrent refreshes may both validate the same immutable receipt. The
@@ -478,6 +527,8 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if err != nil {
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
 			authority.pendingCatalog, authority.pendingExpected = next, expectedGeneration
+			authority.pendingGrant = membershipgrant.Grant{}
+			authority.pendingPostRemoveReplicaSetVersion = 0
 			return errors.Join(ErrReplicatedCatalogPending, err)
 		}
 		return err
@@ -514,16 +565,23 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingCatalog = nil
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
+		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalogConflict
 	}
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		authority.pendingCatalog = nil
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
+		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalog
 	}
 	if authority.pendingCatalog != nil {
-		if authority.pendingGrant.Valid() {
+		if authority.pendingPostRemoveReplicaSetVersion != 0 && authority.pendingGrant.Valid() {
+			err = authority.holder.publishReplicaReplacementPostRemoveAfter(
+				authority.pendingExpected, authority.pendingCatalog, authority.pendingGrant,
+				authority.pendingPostRemoveReplicaSetVersion,
+			)
+		} else if authority.pendingGrant.Valid() {
 			err = authority.holder.publishReplicaReplacementAfter(
 				authority.pendingExpected, authority.pendingCatalog, authority.pendingGrant,
 			)
@@ -533,6 +591,7 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingCatalog = nil
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
+		authority.pendingPostRemoveReplicaSetVersion = 0
 		return err
 	}
 	return nil

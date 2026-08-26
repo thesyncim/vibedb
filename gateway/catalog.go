@@ -702,6 +702,39 @@ func (h *CatalogHolder) publishReplicaReplacementAfter(
 	return nil
 }
 
+func (h *CatalogHolder) publishReplicaReplacementPostRemoveAfter(
+	expectedGeneration uint64,
+	s *Snapshot,
+	grant membershipgrant.Grant,
+	observedReplicaSetVersion uint64,
+) error {
+	if s == nil || !grant.Valid() || observedReplicaSetVersion == 0 {
+		return &CatalogError{Reason: "invalid certified post-remove fence"}
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	h.initLeaseTrackerLocked()
+	current := h.ptr.Load()
+	currentGeneration := uint64(0)
+	if current != nil {
+		currentGeneration = current.generation
+	}
+	if currentGeneration != expectedGeneration {
+		return fmt.Errorf(
+			"%w: expected=%d current=%d",
+			ErrCatalogGenerationMismatch, expectedGeneration, currentGeneration,
+		)
+	}
+	if err := validateReplicaReplacementPostRemoveTransition(
+		current, s, grant, observedReplicaSetVersion,
+	); err != nil {
+		return err
+	}
+	h.ptr.Store(s)
+	h.signalLeaseChangeLocked()
+	return nil
+}
+
 // publishNewerChecked is the diagnostic publication path used by catalog
 // refresh. The bool API remains convenient for optimistic callers, while a
 // topology loader must distinguish an ordinary stale generation from a newer
