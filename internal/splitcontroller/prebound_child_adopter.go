@@ -32,6 +32,21 @@ type PreboundChildRuntimeAdopter struct {
 	command   raftservice.CommandFence
 }
 
+// LocalReplicaChildTarget returns the exact process-local identity projection
+// while retaining the complete authenticated RF3 roster. It never derives or
+// copies another member's WAL/SQL authority.
+func LocalReplicaChildTarget(
+	target ChildTarget, replica ChildReplicaTarget,
+) (ChildTarget, error) {
+	if !targetMatchesPreparedReplica(target, replica) {
+		return ChildTarget{}, ErrRuntimeStore
+	}
+	local := cloneChildTarget(target)
+	local.WAL = replica.WAL
+	local.SQL = replica.SQL.Clone()
+	return local, nil
+}
+
 func NewPreboundChildRuntimeAdopter(
 	registrar ExecutionGroupRegistrar,
 	operation OperationID,

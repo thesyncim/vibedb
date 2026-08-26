@@ -39,6 +39,7 @@ type PreparedChildRuntime struct {
 // no row image is copied at this boundary.
 type LocalChildLifecycleOptions struct {
 	Child    uint8
+	Replica  *ChildReplicaTarget
 	Stage    *sqldriver.ReplicatedChildStage
 	Database *sqldriver.Database
 
@@ -79,6 +80,11 @@ func NewLocalChildLifecycle(options LocalChildLifecycleOptions) (*LocalChildLife
 		return nil, errors.Join(ErrRuntimeStore, err)
 	}
 	options.StaticBootstrap = proto.Clone(options.StaticBootstrap).(*pb.Snapshot)
+	if options.Replica != nil {
+		copy := *options.Replica
+		copy.SQL = options.Replica.SQL.Clone()
+		options.Replica = &copy
+	}
 	options.WALPath = strings.Clone(options.WALPath)
 	options.WALIdentity.Distribution = strings.Clone(options.WALIdentity.Distribution)
 	options.WALIdentity.Shard = strings.Clone(options.WALIdentity.Shard)
@@ -174,7 +180,7 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 		return ErrTopologyConflict
 	}
 	if l.adopted != (raftmember.RuntimeIdentity{}) {
-		if runtimeIdentityMatches(target, l.adopted) {
+		if l.runtimeIdentityMatches(target, l.adopted) {
 			return nil
 		}
 		return ErrTopologyConflict
@@ -190,7 +196,7 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 		return err
 	}
 	identity := runtime.Identity()
-	if !runtimeIdentityMatches(target, identity) {
+	if !l.runtimeIdentityMatches(target, identity) {
 		return errors.Join(ErrTopologyConflict, runtime.Close())
 	}
 	if err = l.options.Adopter.AdoptSplitChild(
@@ -210,9 +216,29 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 }
 
 func (l *LocalChildLifecycle) matchesTarget(target ChildTarget) bool {
-	return l != nil && target.Child == l.options.Child && target.WAL == l.options.WALIdentity &&
-		target.TopologyRecoveryEpoch == l.options.TopologyRecoveryEpoch &&
-		target.Authority == l.options.Authority && target.SQL.Equal(l.options.SQL)
+	if l == nil || target.Child != l.options.Child ||
+		target.TopologyRecoveryEpoch != l.options.TopologyRecoveryEpoch ||
+		target.Authority != l.options.Authority {
+		return false
+	}
+	if l.options.Replica == nil {
+		return target.WAL == l.options.WALIdentity && target.SQL.Equal(l.options.SQL)
+	}
+	return l.options.Replica.WAL == l.options.WALIdentity &&
+		l.options.Replica.SQL.Equal(l.options.SQL) &&
+		targetMatchesPreparedReplica(target, *l.options.Replica)
+}
+
+func (l *LocalChildLifecycle) runtimeIdentityMatches(
+	target ChildTarget, identity raftmember.RuntimeIdentity,
+) bool {
+	if l.options.Replica == nil {
+		return runtimeIdentityMatches(target, identity)
+	}
+	local := cloneChildTarget(target)
+	local.WAL = l.options.Replica.WAL
+	local.SQL = l.options.Replica.SQL.Clone()
+	return runtimeIdentityMatches(local, identity)
 }
 
 func (l *LocalChildLifecycle) validateActivation(
@@ -228,7 +254,7 @@ func (l *LocalChildLifecycle) validateActivation(
 	profile, profileErr := activation.Apply.CapacityQualificationProfile()
 	base, baseErr := replicatedstate.OpenSnapshotBase(activation.SnapshotBase)
 	if identityErr != nil || profileErr != nil || baseErr != nil ||
-		identity != activation.ApplyIdentity || profile.Binding != target.SQL.Binding ||
+		identity != activation.ApplyIdentity || profile.Binding != l.options.SQL.Binding ||
 		!profile.Initialized || profile.Applied != certificate.SourceCut().Applied ||
 		profile.SessionEpochHighWater != certificate.SourceCut().Applied ||
 		profile.SessionCount != 0 || profile.SessionSlotCount != 0 ||
