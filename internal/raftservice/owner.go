@@ -104,6 +104,7 @@ const (
 	requestReadFollower
 	requestReadTransaction
 	requestReadRequestLedger
+	requestReplicaObservation
 )
 
 const (
@@ -119,24 +120,38 @@ type proposalDelivery struct {
 }
 
 type ownerRequest struct {
-	kind       requestKind
-	group      raftmember.GroupKey
-	data       []byte
-	fence      ServingFence
-	inbound    rafttransport.Inbound
-	reply      chan ownerReply
-	bytes      int64
-	async      bool
-	delivery   *proposalDelivery
-	membership MembershipRequest
-	read       readRequest
+	kind         requestKind
+	group        raftmember.GroupKey
+	data         []byte
+	fence        ServingFence
+	inbound      rafttransport.Inbound
+	reply        chan ownerReply
+	bytes        int64
+	async        bool
+	delivery     *proposalDelivery
+	membership   MembershipRequest
+	read         readRequest
+	targetMember uint64
 }
 
 type ownerReply struct {
-	waiter raftserve.Waiter
-	state  ServingState
-	err    error
-	read   readAuthorization
+	waiter      raftserve.Waiter
+	state       ServingState
+	err         error
+	read        readAuthorization
+	observation ReplicaObservation
+}
+
+// ReplicaObservation is one coherent control-plane cut collected by the sole
+// serialized Host owner. Publication and State are durable apply evidence;
+// Status and TargetProgress are transient liveness evidence and never grant
+// serving or membership authority by themselves.
+type ReplicaObservation struct {
+	Publication    raftmodel.Publication
+	Status         raftmember.RuntimeStatus
+	TargetProgress raftmodel.MemberProgress
+	ProgressFound  bool
+	State          replicatedstate.State
 }
 
 type readRequest struct {
@@ -817,6 +832,26 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestMembership:
 		reply.err = owner.applyMembership(request.membership)
+	case requestReplicaObservation:
+		if request.targetMember == 0 {
+			reply.err = ErrInvalidOwner
+			break
+		}
+		if _, found := owner.members[request.group]; !found {
+			reply.err = multiraft.ErrGroupNotFound
+			break
+		}
+		reply.observation.Status, reply.err = owner.host.Status(request.group)
+		if reply.err == nil {
+			reply.observation.Publication, reply.err = owner.host.Publication(request.group)
+		}
+		if reply.err == nil {
+			reply.observation.TargetProgress, reply.observation.ProgressFound, reply.err =
+				owner.host.Progress(request.group, request.targetMember)
+		}
+		if reply.err == nil {
+			reply.observation.State, reply.err = owner.host.SnapshotState(request.group)
+		}
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger:
 		member, found := owner.members[request.group]
 		if !found ||
@@ -1747,6 +1782,25 @@ func (owner *Owner) Probe(ctx context.Context, group raftmember.GroupKey) (Servi
 		kind: requestStatus, group: group, reply: make(chan ownerReply, 1),
 	})
 	return reply.state, err
+}
+
+// ObserveReplica collects the applied membership, local durable state, leader
+// status, transfer fields, and target replication progress in one serialized
+// Host turn. A follower returns ProgressFound=false because it has no
+// authoritative leader progress tracker.
+func (owner *Owner) ObserveReplica(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	targetMember uint64,
+) (ReplicaObservation, error) {
+	if ctx == nil || targetMember == 0 {
+		return ReplicaObservation{}, ErrInvalidOwner
+	}
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestReplicaObservation, group: group, targetMember: targetMember,
+		reply: make(chan ownerReply, 1),
+	})
+	return reply.observation, err
 }
 
 // Done closes when the lane stops.
