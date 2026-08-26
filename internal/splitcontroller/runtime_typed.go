@@ -197,3 +197,43 @@ func (s *DurableRuntimeStore) LoadChildStage(
 	}
 	return *cursor, state.Revision, true, nil
 }
+
+// PersistCutoverCertificate publishes the bounded immutable proof only after
+// the source fence and every non-retained child seal have settled durably.
+// The certificate is topology evidence, never catalog publication authority.
+func (s *DurableRuntimeStore) PersistCutoverCertificate(
+	revision uint64,
+	certificate rangesplit.CutoverCertificate,
+) error {
+	raw, err := rangesplit.AppendCutoverCertificate(nil, &certificate)
+	if err != nil || len(raw) > MaxCertificateBytes {
+		return errors.Join(ErrRuntimeStore, err)
+	}
+	return s.Persist(RuntimeStateCertificate, 0, revision, raw)
+}
+
+// LoadCutoverCertificate returns an exact canonical certificate bound to the
+// supplied immutable split plan. It performs no source or child data scan.
+func (s *DurableRuntimeStore) LoadCutoverCertificate(
+	partitioner *rangesplit.Partitioner,
+) (rangesplit.CutoverCertificate, uint64, bool, error) {
+	state, ok, err := s.Load(RuntimeStateCertificate, 0)
+	if err != nil || !ok {
+		return rangesplit.CutoverCertificate{}, 0, ok, err
+	}
+	certificate, err := rangesplit.OpenCutoverCertificate(state.Payload)
+	if err != nil || certificate == nil || partitioner == nil {
+		return rangesplit.CutoverCertificate{}, 0, false,
+			errors.Join(ErrRuntimeStore, err)
+	}
+	if err = partitioner.VerifyCutoverCertificate(*certificate); err != nil {
+		return rangesplit.CutoverCertificate{}, 0, false,
+			errors.Join(ErrRuntimeStore, err)
+	}
+	canonical, err := rangesplit.AppendCutoverCertificate(nil, certificate)
+	if err != nil || !bytes.Equal(canonical, state.Payload) {
+		return rangesplit.CutoverCertificate{}, 0, false,
+			errors.Join(ErrRuntimeStore, err)
+	}
+	return *certificate, state.Revision, true, nil
+}

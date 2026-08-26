@@ -299,6 +299,51 @@ func (a *LocalSourceActions) ExecuteCatchUpTail(
 	return next, true, nil
 }
 
+// ExecuteCertifyCutover reconstructs the exact terminal source fence and
+// child image proofs, then durably publishes their bounded certificate. It
+// never activates a child or changes catalog routing. ChildStage computes its
+// image digest before publishing a sealed cursor, so this step itself performs
+// only bounded point reads and hashing independent of shard cardinality.
+func (a *LocalSourceActions) ExecuteCertifyCutover(
+	plan *Plan,
+	capture *rangesplit.SourceCapture,
+	tail rangesplit.TailCursor,
+	stages []rangesplit.ChildStageCursor,
+) (rangesplit.CutoverCertificate, error) {
+	if a == nil || plan == nil || capture == nil || plan.operation != a.store.operation ||
+		!tail.Sealed() || len(stages) != int(plan.childCount)-1 {
+		return rangesplit.CutoverCertificate{}, ErrInvalidPlan
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.active != capture {
+		return rangesplit.CutoverCertificate{}, ErrTopologyConflict
+	}
+	storedTail, _, ok, err := a.store.LoadTailCursor(plan.partitioner)
+	if err != nil || !ok || storedTail != tail {
+		return rangesplit.CutoverCertificate{}, errors.Join(ErrTopologyConflict, err)
+	}
+	var workspace rangesplit.CutoverWorkspace
+	certificate, err := plan.partitioner.CertifyCutover(capture, tail, stages, &workspace)
+	if err != nil {
+		return rangesplit.CutoverCertificate{}, errors.Join(ErrTopologyConflict, err)
+	}
+	if existing, revision, present, loadErr := a.store.LoadCutoverCertificate(
+		plan.partitioner,
+	); loadErr != nil {
+		return rangesplit.CutoverCertificate{}, loadErr
+	} else if present {
+		if revision != 1 || existing != certificate {
+			return rangesplit.CutoverCertificate{}, ErrTopologyConflict
+		}
+		return existing, nil
+	}
+	if err = a.store.PersistCutoverCertificate(1, certificate); err != nil {
+		return rangesplit.CutoverCertificate{}, err
+	}
+	return certificate, nil
+}
+
 func (a *LocalSourceActions) verifyArtifactSet(plan *Plan, set rangesplit.ChildArtifactSet) error {
 	for child := uint8(0); child < plan.childCount; child++ {
 		if child == plan.retained {

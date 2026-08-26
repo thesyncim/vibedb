@@ -34,6 +34,7 @@ const (
 	MaxCaptureControlBytes  = 64 << 10
 	MaxArtifactControlBytes = 256 << 10
 	MaxTailControlBytes     = 64 << 10
+	MaxCertificateBytes     = 4 << 10
 	MaxPruneControlBytes    = 16 << 20
 )
 
@@ -51,6 +52,7 @@ const (
 	RuntimeStateArtifacts
 	RuntimeStateStage
 	RuntimeStateTail
+	RuntimeStateCertificate
 	RuntimeStatePrune
 )
 
@@ -75,7 +77,7 @@ type DurableRuntimeStore struct {
 	lockFile      *os.File
 	operation     OperationID
 	manifest      [sha256.Size]byte
-	states        [4 + autosplit.MaxSplitChildren]runtimeStoredState
+	states        [5 + autosplit.MaxSplitChildren]runtimeStoredState
 	closed        bool
 }
 
@@ -309,13 +311,15 @@ func runtimeStateSlot(kind RuntimeStateKind, child uint8) (int, string, int, err
 		return 1, "artifacts.state", MaxArtifactControlBytes, nil
 	case RuntimeStateTail:
 		return 2, "tail.state", MaxTailControlBytes, nil
+	case RuntimeStateCertificate:
+		return 3, "certificate.state", MaxCertificateBytes, nil
 	case RuntimeStatePrune:
-		return 3, "prune.state", MaxPruneControlBytes, nil
+		return 4, "prune.state", MaxPruneControlBytes, nil
 	case RuntimeStateStage:
 		if child >= autosplit.MaxSplitChildren {
 			return 0, "", 0, ErrRuntimeStore
 		}
-		return 4 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
+		return 5 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
 	default:
 		return 0, "", 0, ErrRuntimeStore
 	}
@@ -330,9 +334,11 @@ func runtimeStateIdentity(index int) (RuntimeStateKind, uint8) {
 	case 2:
 		return RuntimeStateTail, 0
 	case 3:
+		return RuntimeStateCertificate, 0
+	case 4:
 		return RuntimeStatePrune, 0
 	default:
-		return RuntimeStateStage, uint8(index - 4)
+		return RuntimeStateStage, uint8(index - 5)
 	}
 }
 
