@@ -236,6 +236,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	// gives the durable retirement action a live endpoint for certified cleanup,
 	// while its stale WAL still cannot recover serving authority.
 	restartedSource := false
+	sourceReady := false
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
@@ -252,8 +253,12 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 					}
 					restartedSource = true
 				}
+				if !sourceReady && strings.Contains(voters[0].Diagnostics(), "vibedb-shard RF3 ready") {
+					sourceReady = true
+				}
 				if strings.Contains(coldTarget.Diagnostics(), "vibedb-shard RF3 ready") &&
-					replicaProcessArtifactsEmpty(filepath.Join(root, "member-2", "source-artifacts")) &&
+					sourceReady && strings.Contains(gatewayProcess.Diagnostics(), "completed 1") &&
+					replicaProcessAllArtifactsEmpty(root) &&
 					time.Since(started) < 90*time.Second {
 					break
 				}
@@ -492,7 +497,17 @@ func replicaProcessRosterContains(descriptor gateway.ReplicatedShardDescriptor, 
 
 func replicaProcessArtifactsEmpty(path string) bool {
 	entries, err := os.ReadDir(path)
-	return err == nil && len(entries) == 0
+	return errors.Is(err, os.ErrNotExist) || err == nil && len(entries) == 0
+}
+
+func replicaProcessAllArtifactsEmpty(root string) bool {
+	for member := 1; member <= 3; member++ {
+		if !replicaProcessArtifactsEmpty(filepath.Join(root,
+			fmt.Sprintf("member-%d", member), "source-artifacts")) {
+			return false
+		}
+	}
+	return true
 }
 
 func replicaProcessStop(t testing.TB, process *rf3testfixture.ExternalProcess) {
