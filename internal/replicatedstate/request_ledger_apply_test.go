@@ -53,6 +53,14 @@ func newRequestLedgerMachineFixture(t testing.TB, capacity uint64) machineFixtur
 	return machineFixture{machine, binding, bootstrap, system, user, log, dir}
 }
 
+func TestRequestLedgerRecoveryReadUsesExactHeadBound(t *testing.T) {
+	if got := RequestLedgerReadMaxBytes(RequestLedgerReadHead); got != requestledger.MaxHeadRecordBytes ||
+		got >= requestledger.MaxCommandBytes {
+		t.Fatalf("head read bound = %d, exact=%d command=%d", got,
+			requestledger.MaxHeadRecordBytes, requestledger.MaxCommandBytes)
+	}
+}
+
 func requestLedgerCreateCommand(t testing.TB, fixture machineFixture, key requestledger.RequestKey) ([]byte, requestledger.HeadRecord) {
 	t.Helper()
 	plan, err := requestledger.AppendPlan(nil, []byte("canonical durable recipe"))

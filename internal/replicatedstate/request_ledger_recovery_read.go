@@ -47,7 +47,7 @@ type RequestLedgerReadResult struct {
 func RequestLedgerReadMaxBytes(kind RequestLedgerReadKind) int {
 	switch kind {
 	case RequestLedgerReadHead:
-		return requestledger.MaxCommandBytes
+		return requestledger.MaxHeadRecordBytes
 	case RequestLedgerReadPlanPage:
 		return requestledger.MaxPlanPageBytes + requestledger.PlanPageRecordOverheadBytes
 	case RequestLedgerReadPending:

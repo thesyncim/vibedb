@@ -91,7 +91,7 @@ func OpenRequestLedgerCompletionResult(
 
 func validRequestLedgerCompletionResult(result RequestLedgerCompletionResult) bool {
 	if result.Operation < requestledger.OperationCreate ||
-		result.Operation > requestledger.OperationExpirePlanning ||
+		result.Operation > requestledger.OperationCleanupPayload ||
 		result.KeyDigest == (requestledger.Digest{}) ||
 		result.RequestDigest == (requestledger.Digest{}) ||
 		result.PlanRoot == (requestledger.Digest{}) ||

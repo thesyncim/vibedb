@@ -1730,6 +1730,21 @@ func validateSnapshotRequestLedgerRow(key, value []byte) error {
 		if openErr != nil || record.KeyDigest != view.Key {
 			return errors.Join(openErr, ErrStateCorrupt)
 		}
+	case requestledger.StorageRoutePin:
+		record, openErr := requestledger.OpenRoutePin(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StoragePrepared:
+		record, openErr := requestledger.OpenPreparedTerminal(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
+	case requestledger.StorageSchemaPin:
+		record, openErr := requestledger.OpenSchemaPinRelease(value)
+		if openErr != nil || record.KeyDigest != view.Key {
+			return errors.Join(openErr, ErrStateCorrupt)
+		}
 	default:
 		return ErrStateCorrupt
 	}

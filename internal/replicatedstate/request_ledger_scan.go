@@ -272,13 +272,27 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 	if scan.payloadBuildFound {
 		build := scan.payloadBuild
 		if scan.head.Phase != requestledger.PhaseSealed || build.RequestDigest != scan.head.RequestDigest ||
-			build.PlanRoot != scan.head.PlanRoot || build.WaveOrdinal != scan.head.NextStepOrdinal ||
-			build.PriorContinuationDigest != scan.head.ContinuationDigest ||
-			scan.payloadFirstOrdinal != 0 || build.NextChunkOrdinal != scan.payloadChunkCount || build.StagedBytes > build.TotalBytes ||
+			build.PlanRoot != scan.head.PlanRoot || build.StagedBytes > build.TotalBytes ||
 			build.ContentRoot != scan.payloadChunkContent && scan.payloadChunkCount != 0 ||
 			build.BuildDigest != scan.payloadChunkBuild && scan.payloadChunkCount != 0 ||
 			build.Chain != scan.payloadChunkChain {
 			return fmt.Errorf("%w: request ledger payload build", ErrStateCorrupt)
+		}
+		if scan.head.CleanupBuildDigest != (requestledger.Digest{}) {
+			if build.Phase != requestledger.PayloadBuildSealed ||
+				build.BuildDigest != scan.head.CleanupBuildDigest ||
+				build.WaveOrdinal == ^uint64(0) || build.WaveOrdinal+1 != scan.head.NextStepOrdinal ||
+				!scan.continuationFound ||
+				build.PriorContinuationDigest != scan.continuation.PriorContinuationDigest ||
+				scan.payloadFirstOrdinal != scan.head.CleanupNextChunk ||
+				scan.payloadChunkCount != scan.head.CleanupChunkCount-scan.head.CleanupNextChunk ||
+				scan.payloadResident != scan.head.CleanupPayloadBytes {
+				return fmt.Errorf("%w: request ledger payload cleanup", ErrStateCorrupt)
+			}
+		} else if build.WaveOrdinal != scan.head.NextStepOrdinal ||
+			build.PriorContinuationDigest != scan.head.ContinuationDigest ||
+			scan.payloadFirstOrdinal != 0 || build.NextChunkOrdinal != scan.payloadChunkCount {
+			return fmt.Errorf("%w: request ledger payload staging", ErrStateCorrupt)
 		}
 	} else if scan.payloadChunkCount != 0 {
 		return fmt.Errorf("%w: request ledger orphan payload chunks", ErrStateCorrupt)
