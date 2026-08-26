@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -17,13 +18,13 @@ var replicatedSchemaTargetProofDomain = []byte(
 )
 
 // ReplicatedSchemaTargetProof binds the canonical catalog image to the exact
-// immutable relation images already prepared for it. ApplyContract is settled
-// separately when the target machine opens after the ordered Raft transition.
+// immutable relation images and deterministic apply contract prepared for it.
 type ReplicatedSchemaTargetProof struct {
 	Catalog       ReplicatedSchemaCatalogImage
 	Relations     replicatedstate.RelationImageCertificate
 	SourceApplied uint64
 	Membership    durable.CheckpointMembershipWitness
+	ApplyContract [sha256.Size]byte
 	Witness       [sha256.Size]byte
 }
 
@@ -91,6 +92,7 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 			sourceApplied:    expectedApplied, membership: witness,
 			catalogDigest:   proof.Catalog.Digest,
 			relationWitness: proof.Relations.Witness,
+			applyContract:   proof.ApplyContract,
 			authorization:   authorization, storages: storages,
 		})
 	})
@@ -208,7 +210,24 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 			)
 		}
 	}
-	proof = ReplicatedSchemaTargetProof{Catalog: image, Relations: certificate}
+	contract, err := replicatedstate.RelationBundleApplyContractDigest(
+		binding, relations, replicatedstate.BundleApplyContractOptions{
+			MaxSessions: applyIdentity.MaxSessions, RetryWindow: applyIdentity.RetryWindow,
+			RequestLedgerCapacityBytes:       applyIdentity.RequestLedgerCapacityBytes,
+			RequestLedgerCleanupReserveBytes: applyIdentity.RequestLedgerCleanupReserveBytes,
+			RequestLedgerRange: replicatedstate.RequestLedgerRange{
+				Start:    requestledger.LedgerHome(applyIdentity.RequestLedgerRangeStart),
+				End:      requestledger.LedgerHome(applyIdentity.RequestLedgerRangeEnd),
+				Identity: requestledger.Digest(applyIdentity.RequestLedgerRangeIdentity),
+			},
+		},
+	)
+	if err != nil {
+		return proof, err
+	}
+	proof = ReplicatedSchemaTargetProof{
+		Catalog: image, Relations: certificate, ApplyContract: contract,
+	}
 	if settle != nil {
 		if err := settle(staged, targetIdentity, &proof); err != nil {
 			return proof, err
@@ -226,6 +245,7 @@ func (a *ReplicatedApply) certifyReplicatedSchemaTarget(
 	_, _ = h.Write(image.LocalRelationManifestDigest[:])
 	_, _ = h.Write(image.ApplyProfileDigest[:])
 	_, _ = h.Write(certificate.Witness[:])
+	_, _ = h.Write(proof.ApplyContract[:])
 	var fixed [24]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], proof.SourceApplied)
 	binary.LittleEndian.PutUint64(fixed[8:16], proof.Membership.Sequence)

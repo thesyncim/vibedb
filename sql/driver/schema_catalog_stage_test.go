@@ -70,7 +70,8 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if proof.Catalog.SchemaGeneration != identity.RelationSchemaGeneration+1 ||
 		proof.Relations.RelationCount != 1 ||
 		proof.Relations.ManifestDigest != proof.Catalog.RelationManifestDigest ||
-		proof.Relations.Witness == ([32]byte{}) || proof.Witness == ([32]byte{}) {
+		proof.Relations.Witness == ([32]byte{}) || proof.ApplyContract == ([32]byte{}) ||
+		proof.Witness == ([32]byte{}) {
 		t.Fatalf("target proof = %+v", proof)
 	}
 	prepared, err := claim.PrepareReplicatedSchemaTarget(
@@ -94,7 +95,8 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	marker, found, err := readReplicatedSchemaStageMarker(path + ".tables")
 	if err != nil || !found || marker.membership != prepared.Membership ||
 		marker.catalogDigest != prepared.Catalog.Digest ||
-		marker.relationWitness != prepared.Relations.Witness {
+		marker.relationWitness != prepared.Relations.Witness ||
+		marker.applyContract != prepared.ApplyContract {
 		t.Fatalf("reopened stage marker = %+v, found=%v err=%v", marker, found, err)
 	}
 	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {

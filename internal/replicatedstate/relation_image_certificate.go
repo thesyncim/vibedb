@@ -27,6 +27,36 @@ type RelationImageCertificate struct {
 	Witness           [sha256.Size]byte
 }
 
+// BundleApplyContractOptions is the constant-size part of Options that enters
+// deterministic command/result semantics. Storage, checkpoint, capture, and
+// transaction-log handles are deliberately absent because healthy replicas
+// may differ in those local details.
+type BundleApplyContractOptions struct {
+	MaxSessions                      uint64
+	RetryWindow                      uint16
+	RequestLedgerCapacityBytes       uint64
+	RequestLedgerCleanupReserveBytes uint64
+	RequestLedgerRange               RequestLedgerRange
+}
+
+// RelationBundleApplyContractDigest derives the exact target contract from
+// the same validated relation descriptors used by OpenBundle.
+func RelationBundleApplyContractDigest(
+	binding Binding,
+	specs []RelationCollection,
+	options BundleApplyContractOptions,
+) ([sha256.Size]byte, error) {
+	relations, manifest, err := prepareRelationCollections(binding, specs)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return bundleApplyContractDigest(
+		manifest, relations, options.MaxSessions, options.RetryWindow,
+		options.RequestLedgerCapacityBytes, options.RequestLedgerCleanupReserveBytes,
+		options.RequestLedgerRange, routeGateRecordLimit(),
+	)
+}
+
 // CertifyRelationImages scans each already materialized relation exactly once
 // at a durable snapshot. The scan validates native exact-index catalogs,
 // deterministic row grammars, global-index locator values, and placement.

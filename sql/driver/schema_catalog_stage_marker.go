@@ -17,7 +17,7 @@ import (
 const (
 	replicatedSchemaStageMarkerName    = ".schema-membership-stage"
 	replicatedSchemaStageMarkerTemp    = ".schema-membership-stage.tmp"
-	replicatedSchemaStageHeaderBytes   = 200
+	replicatedSchemaStageHeaderBytes   = 232
 	replicatedSchemaStageChecksumBytes = sha256.Size
 )
 
@@ -30,6 +30,7 @@ type replicatedSchemaStageMarker struct {
 	membership       durable.CheckpointMembershipWitness
 	catalogDigest    [sha256.Size]byte
 	relationWitness  [sha256.Size]byte
+	applyContract    [sha256.Size]byte
 	authorization    [sha256.Size]byte
 	storages         [][32]byte
 }
@@ -38,7 +39,8 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 	if marker.schemaGeneration == 0 || marker.sourceApplied == 0 ||
 		marker.membership.Sequence == 0 || marker.membership.Source == ([32]byte{}) ||
 		marker.membership.Target == ([32]byte{}) || marker.catalogDigest == ([32]byte{}) ||
-		marker.relationWitness == ([32]byte{}) || marker.authorization == ([32]byte{}) ||
+		marker.relationWitness == ([32]byte{}) || marker.applyContract == ([32]byte{}) ||
+		marker.authorization == ([32]byte{}) ||
 		len(marker.storages) == 0 || len(marker.storages) > replication.MaxRelationsPerBundle {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
@@ -55,8 +57,9 @@ func encodeReplicatedSchemaStageMarker(marker replicatedSchemaStageMarker) ([]by
 	copy(raw[40:72], marker.catalogDigest[:])
 	copy(raw[72:104], marker.relationWitness[:])
 	copy(raw[104:136], marker.authorization[:])
-	copy(raw[136:168], marker.membership.Source[:])
-	copy(raw[168:200], marker.membership.Target[:])
+	copy(raw[136:168], marker.applyContract[:])
+	copy(raw[168:200], marker.membership.Source[:])
+	copy(raw[200:232], marker.membership.Target[:])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		if marker.storages[i] == ([32]byte{}) {
@@ -104,8 +107,9 @@ func decodeReplicatedSchemaStageMarker(raw []byte) (replicatedSchemaStageMarker,
 	copy(marker.catalogDigest[:], raw[40:72])
 	copy(marker.relationWitness[:], raw[72:104])
 	copy(marker.authorization[:], raw[104:136])
-	copy(marker.membership.Source[:], raw[136:168])
-	copy(marker.membership.Target[:], raw[168:200])
+	copy(marker.applyContract[:], raw[136:168])
+	copy(marker.membership.Source[:], raw[168:200])
+	copy(marker.membership.Target[:], raw[200:232])
 	at := replicatedSchemaStageHeaderBytes
 	for i := range marker.storages {
 		copy(marker.storages[i][:], raw[at:at+32])
