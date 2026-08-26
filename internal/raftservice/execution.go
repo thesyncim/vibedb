@@ -302,6 +302,13 @@ func (owners *ExecutionOwners) ProposeOwnershipTransition(ctx context.Context, f
 	}
 	return owner.ProposeOwnershipTransition(ctx, fence, command)
 }
+func (owners *ExecutionOwners) ProposeSchemaTransition(ctx context.Context, fence ServingFence, command []byte) error {
+	owner, err := owners.owner(fence.Group)
+	if err != nil {
+		return err
+	}
+	return owner.ProposeSchemaTransition(ctx, fence, command)
+}
 func (owners *ExecutionOwners) RetireReplicaSource(ctx context.Context, request ReplicaRetirementRequest) error {
 	owner, err := owners.owner(request.Fence.Group)
 	if err != nil {

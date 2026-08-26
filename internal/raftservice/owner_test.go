@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -50,6 +51,84 @@ func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
 		t.Fatal("owner acquired an abandoned delivery")
 	}
 	owner.release(request.bytes)
+}
+
+func TestSchemaTransitionFenceAuthenticatesExactServingGeneration(t *testing.T) {
+	group := peerServerTestGroup()
+	fence := ServingFence{Group: group, AllocationGeneration: 3,
+		Command: CommandFence{ReplicaSetVersion: 7, ActivePolicyGeneration: 5,
+			ProtectionEpoch: 6, OwnershipEpoch: 8, SchemaGeneration: 9,
+			RelationManifestDigest: [32]byte{4}, RoutingVersion: 10, RouteGeneration: 11},
+		MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4, Term: 5}
+	transition := replicatedstate.SchemaTransition{
+		From: replicatedstate.Binding{
+			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+			TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			Distribution:          "docs", Shard: "0000-ffff",
+			AllocationGeneration: fence.AllocationGeneration,
+			ShardIncarnation:     group.ShardIncarnation, GroupID: group.GroupID,
+			ActivePolicyGeneration: fence.Command.ActivePolicyGeneration,
+			ProtectionEpoch:        fence.Command.ProtectionEpoch,
+			OwnershipEpoch:         fence.Command.OwnershipEpoch,
+			SchemaGeneration:       fence.Command.SchemaGeneration,
+			RoutingVersion:         fence.Command.RoutingVersion,
+			RouteGeneration:        fence.Command.RouteGeneration,
+			OwnedRange:             distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+		ToSchemaGeneration: 10, ExpectedReplicaSetVersion: 7, MembershipSequence: 1,
+		MembershipSource: [32]byte{1}, MembershipTarget: [32]byte{2},
+		FromManifest: [32]byte{4}, FromApplyContract: [32]byte{5},
+		ToManifest: [32]byte{6}, ToApplyContract: [32]byte{7},
+		RequestDigest: [32]byte{8}, AuthorizationDigest: [32]byte{9},
+		CatalogCASDigest: [32]byte{10},
+	}
+	encoded, err := replicatedstate.AppendSchemaTransition(nil, transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := replicatedstate.OpenSchemaTransition(encoded)
+	if err != nil || !schemaTransitionMatchesFence(opened, fence) {
+		t.Fatalf("exact transition rejected: %v", err)
+	}
+	transition.FromManifest[0]++
+	encoded, err = replicatedstate.AppendSchemaTransition(encoded[:0], transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err = replicatedstate.OpenSchemaTransition(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schemaTransitionMatchesFence(opened, fence) {
+		t.Fatal("substituted source manifest accepted")
+	}
+}
+
+func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
+	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
+	}}
+	command := []byte{1, 2, 3}
+	done := make(chan error, 1)
+	go func() {
+		done <- owner.ProposeSchemaTransition(context.Background(), ServingFence{}, command)
+	}()
+	request := <-owner.ingress
+	command[0] = 9
+	if request.kind != requestSchemaTransition || request.data[0] != 1 ||
+		cap(request.data) != len(request.data) {
+		t.Fatalf("request kind=%d data=%v len/cap=%d/%d",
+			request.kind, request.data, len(request.data), cap(request.data))
+	}
+	request.reply <- ownerReply{}
+	owner.release(request.bytes)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.ProposeSchemaTransition(context.Background(), ServingFence{},
+		make([]byte, replicatedstate.MaxSchemaTransitionBytes+1)); !errors.Is(err, ErrInvalidOwner) {
+		t.Fatalf("oversized command error=%v", err)
+	}
 }
 
 func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *testing.T) {

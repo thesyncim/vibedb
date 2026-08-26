@@ -111,6 +111,7 @@ const (
 	requestReadExecutionPin
 	requestReplicaObservation
 	requestOwnershipTransition
+	requestSchemaTransition
 	requestReplicaRetirement
 	requestInstallExecutionGroup
 	requestRemoveExecutionGroup
@@ -952,6 +953,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 	case requestOwnershipTransition:
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
+	case requestSchemaTransition:
+		reply.err = owner.applySchemaTransition(request.fence, request.data)
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
 	case requestInstallExecutionGroup:
@@ -1280,6 +1283,51 @@ func ownershipTransitionMatchesFence(
 		transition.SchemaGeneration == fence.Command.SchemaGeneration &&
 		transition.RoutingVersion == fence.Command.RoutingVersion &&
 		transition.RouteGeneration == fence.Command.RouteGeneration
+}
+
+func (owner *Owner) applySchemaTransition(fence ServingFence, command []byte) error {
+	member, found := owner.members[fence.Group]
+	if !found || !servingFenceMatchesIdentity(fence, member) {
+		return ErrServingFence
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(command)
+	if err != nil || !schemaTransitionMatchesFence(transition, fence) {
+		return errors.Join(err, ErrServingFence)
+	}
+	publication, err := owner.host.Publication(fence.Group)
+	if err != nil || publication.ReplicaSetVersion != transition.ExpectedReplicaSetVersion {
+		return errors.Join(err, ErrServingFence)
+	}
+	status, err := owner.host.Status(fence.Group)
+	if err != nil {
+		return err
+	}
+	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+		status.Term != fence.Term {
+		return &NotLeaderError{Status: status}
+	}
+	return owner.host.EnqueueProposal(fence.Group, command)
+}
+
+func schemaTransitionMatchesFence(
+	transition replicatedstate.SchemaTransitionView,
+	fence ServingFence,
+) bool {
+	from := transition.From
+	return from.ClusterID == fence.Group.ClusterID &&
+		from.ClusterIncarnation == fence.Group.ClusterIncarnation &&
+		from.TopologyRecoveryEpoch == fence.Group.TopologyRecoveryEpoch &&
+		from.ShardIncarnation == fence.Group.ShardIncarnation &&
+		from.GroupID == fence.Group.GroupID &&
+		from.AllocationGeneration == fence.AllocationGeneration &&
+		transition.ExpectedReplicaSetVersion == fence.Command.ReplicaSetVersion &&
+		from.ActivePolicyGeneration == fence.Command.ActivePolicyGeneration &&
+		from.ProtectionEpoch == fence.Command.ProtectionEpoch &&
+		from.OwnershipEpoch == fence.Command.OwnershipEpoch &&
+		from.SchemaGeneration == fence.Command.SchemaGeneration &&
+		transition.FromManifest == fence.Command.RelationManifestDigest &&
+		from.RoutingVersion == fence.Command.RoutingVersion &&
+		from.RouteGeneration == fence.Command.RouteGeneration
 }
 
 func (owner *Owner) retireReplica(request ownerRequest) error {
@@ -2219,6 +2267,35 @@ func (owner *Owner) ProposeOwnershipTransition(
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestOwnershipTransition, group: fence.Group, fence: fence,
 		data: owned, reply: reply, bytes: int64(len(owned)),
+	})
+	if err != nil && context.Cause(ctx) != nil {
+		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	return err
+}
+
+// ProposeSchemaTransition admits one canonical schema transition through the
+// serialized Owner lane. A nil result means the exact authenticated bytes
+// entered the bounded Host queue, not that they applied. The caller settles
+// uncertainty by observing the target generation and apply contract before
+// publishing the prepared catalog.
+func (owner *Owner) ProposeSchemaTransition(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+) error {
+	if owner == nil || ctx == nil || len(command) == 0 ||
+		len(command) > replicatedstate.MaxSchemaTransitionBytes {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	owned := make([]byte, len(command))
+	copy(owned, command)
+	_, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestSchemaTransition, group: fence.Group, fence: fence,
+		data: owned, reply: make(chan ownerReply, 1), bytes: int64(len(owned)),
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
