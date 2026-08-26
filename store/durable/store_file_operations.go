@@ -921,6 +921,8 @@ func (c *Collection) Stats() Stats {
 		PrimaryEmptyReclaims:                  c.primaryEmptyReclaims.Load(),
 		PrimaryMacroSplits:                    c.primaryMacroSplits.Load(),
 		PrimaryTabletRoutingRebuilds:          c.primaryTabletRoutingRebuilds.Load(),
+		PrimaryCatalogLeafSplits:              c.primaryCatalogLeafSplits.Load(),
+		PrimaryCatalogBranchSplits:            c.primaryCatalogBranchSplits.Load(),
 		PrimaryMacroSplitRequired:             c.primaryMacroSplitRequired.Load(),
 		PrimarySplitMaxNS:                     c.primarySplitMaxNS.Load(),
 		PrimaryEmptyReclaimMaxNS:              c.primaryEmptyReclaimMaxNS.Load(),

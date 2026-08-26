@@ -36,6 +36,9 @@ const (
 
 	GlobalTabletCatalogMaxLeafPages   = 1 << 13
 	GlobalTabletCatalogMaxBranchPages = 1 << 9
+	// GlobalTabletCatalogMinimumNodeFanout is the exact lower bound for an
+	// 8 KiB catalog node with adversarial 255-byte separators.
+	GlobalTabletCatalogMinimumNodeFanout = 28
 
 	GlobalTabletCatalogLeafLogicalIDBase        = PrimaryLeafLogicalIDBase
 	GlobalTabletCatalogLeafLogicalIDLimit       = PrimaryLeafLogicalIDLimit
@@ -143,6 +146,22 @@ type GlobalTabletCatalogNodeRoute struct {
 type GlobalTabletCatalogNodeHandleRewrite struct {
 	ID  uint32
 	Ref PageRef
+}
+
+// GlobalTabletCatalogNodeSplitResult is the canonical two-node image and the
+// exact floor its parent must insert for Right.
+type GlobalTabletCatalogNodeSplitResult struct {
+	Left          []byte
+	Right         []byte
+	PromotedFloor []byte
+}
+
+// GlobalTabletCatalogRootPromotion is the canonical three-level image created
+// when a two-level root can no longer name another catalog leaf directly.
+type GlobalTabletCatalogRootPromotion struct {
+	Root        []byte
+	LeftBranch  []byte
+	RightBranch []byte
 }
 
 // GlobalTabletCatalogNodeCursor walks the tablet entries of one catalog node in
@@ -680,6 +699,86 @@ func (v *GlobalTabletCatalogNodeView) Count() int {
 	return v.floors.BucketCount()
 }
 
+// GlobalTabletCatalogNextNodeIDs reconstructs the monotonic catalog leaf and
+// branch identity high-waters from one authenticated root. It touches catalog
+// metadata only (never tablet anchors or data leaves), so Open can recover
+// allocator state without another durable counter or a data-cardinality scan.
+func GlobalTabletCatalogNextNodeIDs(
+	cache *PageCache,
+	root PageRef,
+	bounds GlobalTabletCatalogBounds,
+) (nextLeaf, nextBranch uint32, err error) {
+	if cache == nil || root == (PageRef{}) || !bounds.valid() {
+		return 0, 0, fmt.Errorf("%w: catalog identity high-water", ErrInvalidWrite)
+	}
+	var highLeaf, highBranch uint32
+	var sawLeaf, sawBranch bool
+	var walk func(PageRef, GlobalTabletCatalogNodeLevel) error
+	walk = func(ref PageRef, want GlobalTabletCatalogNodeLevel) error {
+		lease, acquireErr := cache.Acquire(ref)
+		if acquireErr != nil {
+			return acquireErr
+		}
+		node := AdmittedGlobalTabletCatalogNode(lease.Page(), bounds)
+		if node.Level() != want || node.Count() == 0 {
+			lease.Release()
+			return ErrGlobalTabletCatalogCorrupt
+		}
+		switch want {
+		case GlobalTabletCatalogLeaf:
+			if !sawLeaf || node.PageID() > highLeaf {
+				highLeaf = node.PageID()
+			}
+			sawLeaf = true
+			lease.Release()
+			return nil
+		case GlobalTabletCatalogBranch:
+			if !sawBranch || node.PageID() > highBranch {
+				highBranch = node.PageID()
+			}
+			sawBranch = true
+		}
+		childLevel := node.ChildLevel()
+		children := make([]PageRef, 0, node.Count())
+		cursor := node.LowerBound(nil)
+		for {
+			route, ok := cursor.Route()
+			if !ok {
+				lease.Release()
+				return ErrGlobalTabletCatalogCorrupt
+			}
+			children = append(children, route.Ref)
+			if !cursor.Next() {
+				break
+			}
+		}
+		lease.Release()
+		for _, child := range children {
+			if walkErr := walk(child, childLevel); walkErr != nil {
+				return walkErr
+			}
+		}
+		return nil
+	}
+	if err := walk(root, GlobalTabletCatalogRoot); err != nil {
+		return 0, 0, err
+	}
+	if !sawLeaf {
+		return 0, 0, ErrGlobalTabletCatalogCorrupt
+	}
+	nextLeaf = highLeaf + 1
+	if nextLeaf >= GlobalTabletCatalogMaxLeafPages {
+		nextLeaf = GlobalTabletCatalogMaxLeafPages
+	}
+	if sawBranch {
+		nextBranch = highBranch + 1
+	}
+	if nextBranch >= GlobalTabletCatalogMaxBranchPages {
+		nextBranch = GlobalTabletCatalogMaxBranchPages
+	}
+	return nextLeaf, nextBranch, nil
+}
+
 func (v *GlobalTabletCatalogNodeView) upperBound(key []byte) int {
 	if v == nil {
 		return 0
@@ -934,6 +1033,114 @@ func (v *GlobalTabletCatalogNodeView) insertChild(
 		},
 		entries,
 	)
+}
+
+// PromoteRootInsertChildReplacing converts a full root->leaf catalog into a
+// root->branch->leaf catalog while applying the triggering leaf insertion and
+// handle rewrites. The old leaf pages remain untouched. All three destinations
+// remain unchanged unless both branches and the new root encode canonically.
+func (v *GlobalTabletCatalogNodeView) PromoteRootInsertChildReplacing(
+	rootDst, leftBranchDst, rightBranchDst []byte,
+	generation uint64,
+	bounds GlobalTabletCatalogBounds,
+	floor []byte,
+	id uint32,
+	ref PageRef,
+	rewrites []GlobalTabletCatalogNodeHandleRewrite,
+	leftBranchID uint32,
+	leftBranchRef PageRef,
+	rightBranchID uint32,
+	rightBranchRef PageRef,
+) (GlobalTabletCatalogRootPromotion, error) {
+	var result GlobalTabletCatalogRootPromotion
+	if v == nil || len(v.image) == 0 || v.level != GlobalTabletCatalogRoot ||
+		v.childLevel != GlobalTabletCatalogLeaf || len(floor) == 0 ||
+		generation <= v.header.Generation || generation >= uint64(1)<<48 ||
+		len(rootDst) < len(v.image) ||
+		len(leftBranchDst) < GlobalTabletCatalogNodeBytes ||
+		len(rightBranchDst) < GlobalTabletCatalogNodeBytes ||
+		!bounds.extends(v.bounds) || leftBranchID == rightBranchID {
+		return result, fmt.Errorf("%w: catalog root promotion", ErrInvalidWrite)
+	}
+	leftLogical, leftOK := GlobalTabletCatalogCatalogBranchLogicalID(leftBranchID)
+	rightLogical, rightOK := GlobalTabletCatalogCatalogBranchLogicalID(rightBranchID)
+	if !leftOK || !rightOK || leftBranchRef.LogicalID != leftLogical ||
+		rightBranchRef.LogicalID != rightLogical {
+		return result, fmt.Errorf("%w: catalog root promotion identities", ErrInvalidWrite)
+	}
+	entries, err := v.entriesWithInsertedChild(floor, id, ref, rewrites)
+	if err != nil || len(entries) < 2 {
+		return result, errors.Join(err, fmt.Errorf("%w: catalog root promotion entries", ErrInvalidWrite))
+	}
+	branchHeader := func(pageID uint32, logicalID uint64) GlobalTabletCatalogNodeHeader {
+		return GlobalTabletCatalogNodeHeader{
+			StoreID: v.bounds.StoreID, Generation: generation,
+			LogicalID: logicalID, PageID: pageID,
+			Level: GlobalTabletCatalogBranch, Bounds: bounds,
+			Kind: PagePrimaryCatalog, ChildKind: PagePrimaryCatalog,
+			ChildLength: GlobalTabletCatalogNodeBytes,
+		}
+	}
+	leftScratch := make([]byte, GlobalTabletCatalogNodeBytes)
+	rightScratch := make([]byte, GlobalTabletCatalogNodeBytes)
+	rootScratch := make([]byte, len(v.image))
+	middle := len(entries) / 2
+	for distance := 0; distance < len(entries); distance++ {
+		cuts := [...]int{middle - distance, middle + distance}
+		for side, cut := range cuts {
+			if side == 1 && cuts[0] == cuts[1] || cut <= 0 || cut >= len(entries) {
+				continue
+			}
+			rightEntries := append([]GlobalTabletCatalogNodeEntry(nil), entries[cut:]...)
+			promoted := bytes.Clone(rightEntries[0].Floor)
+			rightEntries[0].Floor = nil
+			left, leftErr := EncodeGlobalTabletCatalogNode(
+				leftScratch, branchHeader(leftBranchID, leftLogical), entries[:cut],
+			)
+			if errors.Is(leftErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if leftErr != nil {
+				return result, leftErr
+			}
+			right, rightErr := EncodeGlobalTabletCatalogNode(
+				rightScratch, branchHeader(rightBranchID, rightLogical), rightEntries,
+			)
+			if errors.Is(rightErr, ErrGlobalTabletCatalogNoSpace) {
+				continue
+			}
+			if rightErr != nil {
+				return result, rightErr
+			}
+			root, rootErr := EncodeGlobalTabletCatalogNode(
+				rootScratch,
+				GlobalTabletCatalogNodeHeader{
+					StoreID: v.bounds.StoreID, Generation: generation,
+					LogicalID: v.header.LogicalID, PageID: v.pageID,
+					Level:          GlobalTabletCatalogRoot,
+					RootChildLevel: GlobalTabletCatalogBranch,
+					Bounds:         bounds, Kind: PagePrimaryCatalog,
+					ChildKind:   PagePrimaryCatalog,
+					ChildLength: GlobalTabletCatalogNodeBytes,
+				},
+				[]GlobalTabletCatalogNodeEntry{
+					{ID: leftBranchID, Ref: leftBranchRef},
+					{Floor: promoted, ID: rightBranchID, Ref: rightBranchRef},
+				},
+			)
+			if rootErr != nil {
+				return result, rootErr
+			}
+			copy(leftBranchDst, left)
+			copy(rightBranchDst, right)
+			copy(rootDst, root)
+			result.LeftBranch = leftBranchDst[:GlobalTabletCatalogNodeBytes]
+			result.RightBranch = rightBranchDst[:GlobalTabletCatalogNodeBytes]
+			result.Root = rootDst[:len(v.image)]
+			return result, nil
+		}
+	}
+	return result, ErrGlobalTabletCatalogNoSpace
 }
 
 // RewriteHandles performs one immutable node rewrite containing every listed

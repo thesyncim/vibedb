@@ -346,6 +346,8 @@ type Collection struct {
 	primaryEmptyReclaims            atomic.Uint64
 	primaryMacroSplits              atomic.Uint64
 	primaryTabletRoutingRebuilds    atomic.Uint64
+	primaryCatalogLeafSplits        atomic.Uint64
+	primaryCatalogBranchSplits      atomic.Uint64
 	primaryMacroSplitRequired       atomic.Uint64
 	primarySplitMaxNS               atomic.Uint64
 	primaryEmptyReclaimMaxNS        atomic.Uint64
@@ -354,7 +356,9 @@ type Collection struct {
 	// primaryNextTabletID is the writer-owned monotonic identity high-water.
 	// Open reconstructs it from the authenticated resident graph; structural
 	// publication advances it only after the sibling tablet is durable.
-	primaryNextTabletID uint32
+	primaryNextTabletID        uint32
+	primaryNextCatalogLeafID   uint32
+	primaryNextCatalogBranchID uint32
 	// Hole punching is a foreground, post-durability space optimization. The
 	// source cursors, physical-generation guard, and disabled flag are
 	// writer-owned; atomic counters keep the optional filesystem results
@@ -790,6 +794,10 @@ type Stats struct {
 	// PrimaryTabletRoutingRebuilds counts bounded whole-tablet routing rewrites
 	// used when all stable anchor IDs exist but dense repacking still has room.
 	PrimaryTabletRoutingRebuilds uint64
+	// PrimaryCatalog*Splits count recursive node splits that let sibling-tablet
+	// publication continue past one catalog leaf or branch fanout.
+	PrimaryCatalogLeafSplits   uint64
+	PrimaryCatalogBranchSplits uint64
 	// PrimaryMacroSplitRequired counts sibling publications that could not
 	// proceed because the tablet identity namespace or catalog node is full.
 	PrimaryMacroSplitRequired uint64

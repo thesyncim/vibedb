@@ -31,7 +31,7 @@ func TestFilePrimaryStructuralChurnTenMillionQualification(t *testing.T) {
 	if os.Getenv("VIBEDB_STRUCTURAL_10M") != "1" {
 		t.Skip("set VIBEDB_STRUCTURAL_10M=1 to run the 10,000,000-row structural churn qualification")
 	}
-	runFilePrimaryStructuralChurnAmplification(t, 10_000_000, 32)
+	runFilePrimaryStructuralChurnAmplification(t, 10_000_000, 64)
 }
 
 func runFilePrimaryStructuralChurnAmplification(
@@ -134,6 +134,7 @@ func runFilePrimaryStructuralChurnAmplification(
 	reclaims := after.PrimaryEmptyReclaims - before.PrimaryEmptyReclaims
 	splits := after.PrimaryLeafSplits - before.PrimaryLeafSplits
 	macroSplits := after.PrimaryMacroSplits - before.PrimaryMacroSplits
+	catalogLeafSplits := after.PrimaryCatalogLeafSplits - before.PrimaryCatalogLeafSplits
 	routingRebuilds := after.PrimaryTabletRoutingRebuilds -
 		before.PrimaryTabletRoutingRebuilds
 	if reclaims == 0 {
@@ -141,6 +142,9 @@ func runFilePrimaryStructuralChurnAmplification(
 	}
 	if rows == 10_000_000 && macroSplits == 0 {
 		t.Fatal("10M interior churn did not exercise a sibling-tablet split")
+	}
+	if rows == 10_000_000 && catalogLeafSplits == 0 {
+		t.Fatalf("10M interior churn did not split a saturated catalog leaf after %d macro splits", macroSplits)
 	}
 	// Each reclaim in this fixture removes one row from a non-singleton routing
 	// anchor, so it must take the localized COW path. Splits have the same base
@@ -200,10 +204,10 @@ func runFilePrimaryStructuralChurnAmplification(
 	if mutatedBytes == 0 || deviceBytes > 8*mutatedBytes {
 		t.Fatalf("device write amplification = %d/%d (>8x)", deviceBytes, mutatedBytes)
 	}
-	t.Logf("structural churn ratios: apparent=%.3fx allocated=%.3fx device-write=%.3fx reclaims=%d splits=%d macro_splits=%d tablet_rebuilds=%d",
+	t.Logf("structural churn ratios: apparent=%.3fx allocated=%.3fx device-write=%.3fx reclaims=%d splits=%d macro_splits=%d catalog_leaf_splits=%d tablet_rebuilds=%d",
 		float64(info.Size())/float64(logicalBytes), float64(allocated)/float64(logicalBytes),
 		float64(deviceBytes)/float64(mutatedBytes),
-		reclaims, splits, macroSplits, routingRebuilds)
+		reclaims, splits, macroSplits, catalogLeafSplits, routingRebuilds)
 	// Copy the durable bytes while the source process remains live, then open
 	// only the copied image. This is the external-crash boundary: no Close-time
 	// cleanup or in-memory router state may be required for sibling recovery.

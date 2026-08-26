@@ -712,6 +712,20 @@ func (c *Collection) setupResidentPrimaryLocked(state *fileStoreState) error {
 		nextTabletID = storeio.TabletLocalIdentityTabletCount
 	}
 	c.primaryNextTabletID = nextTabletID
+	nextCatalogLeafID, nextCatalogBranchID, err :=
+		storeio.GlobalTabletCatalogNextNodeIDs(
+			c.cache, state.root.PrimaryRoot,
+			storeio.GlobalTabletCatalogBounds{
+				StoreID:                state.root.StoreID,
+				SelectedRootGeneration: state.root.Generation,
+				FileEnd:                state.fileEnd, NextLogicalID: state.root.NextLogicalID,
+			},
+		)
+	if err != nil {
+		return fmt.Errorf("vibedb: recover primary catalog identities: %w", err)
+	}
+	c.primaryNextCatalogLeafID = nextCatalogLeafID
+	c.primaryNextCatalogBranchID = nextCatalogBranchID
 	// Both buffered-visible and the journal-backed synchronous lane apply through
 	// the deferred canonical-frame path, so both need the pending parent and
 	// volatile-retire scratch. Async-visible on a primary graph uses the committer

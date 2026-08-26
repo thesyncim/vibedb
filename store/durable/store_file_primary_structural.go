@@ -476,6 +476,271 @@ type primaryMacroTabletSplit struct {
 	leaves   []storeio.SegmentedTabletRouterLeaf
 }
 
+type primaryCatalogStructuralResult struct {
+	root              storeio.PageRef
+	allocatedLeaves   uint32
+	allocatedBranches uint32
+}
+
+func (c *Collection) stagePrimaryStructuralCatalog(
+	tx *storeio.WriteTransaction,
+	state *fileStoreState,
+	path *filePrimaryMutationPath,
+	generation uint64,
+	tabletRef storeio.PageRef,
+	macro *primaryMacroTabletSplit,
+	macroTabletRef storeio.PageRef,
+) (primaryCatalogStructuralResult, error) {
+	var result primaryCatalogStructuralResult
+	catalogPage, err := tx.AllocateNear(
+		storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+		path.catalogLease.Header().LogicalID, path.catalogRef.Offset,
+	)
+	if err != nil {
+		return result, err
+	}
+	bounds := c.primaryMutationBounds(tx)
+	var catalogSplit *storeio.GlobalTabletCatalogNodeSplitResult
+	var catalogRight storeio.TransactionPage
+	if macro == nil {
+		_, err = path.catalog.RewriteHandle(
+			catalogPage.Bytes(), generation, bounds,
+			path.tabletRoute.ID, tabletRef,
+		)
+	} else {
+		if path.catalog.Count() >= storeio.GlobalTabletCatalogMinimumNodeFanout {
+			err = storeio.ErrGlobalTabletCatalogNoSpace
+		} else {
+			_, err = path.catalog.InsertChildReplacing(
+				catalogPage.Bytes(), generation, bounds,
+				macro.floor, macro.tabletID, macroTabletRef,
+				[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+					ID: path.tabletRoute.ID, Ref: tabletRef,
+				}},
+			)
+		}
+		if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) {
+			if c.primaryNextCatalogLeafID >= storeio.GlobalTabletCatalogMaxLeafPages {
+				c.primaryMacroSplitRequired.Add(1)
+				return result, errors.Join(ErrPrimaryMacroSplitRequired, err)
+			}
+			rightLogical, ok := storeio.GlobalTabletCatalogCatalogLeafLogicalID(
+				c.primaryNextCatalogLeafID,
+			)
+			if !ok {
+				return result, ErrPrimaryMacroSplitRequired
+			}
+			catalogRight, err = tx.Allocate(
+				storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+				rightLogical,
+			)
+			if err != nil {
+				return result, err
+			}
+			bounds = c.primaryMutationBounds(tx)
+			split, splitErr := path.catalog.SplitInsertChildReplacing(
+				catalogPage.Bytes(), catalogRight.Bytes(), generation, bounds,
+				macro.floor, macro.tabletID, macroTabletRef,
+				[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+					ID: path.tabletRoute.ID, Ref: tabletRef,
+				}},
+				c.primaryNextCatalogLeafID,
+			)
+			if splitErr != nil {
+				return result, splitErr
+			}
+			catalogSplit = &split
+			result.allocatedLeaves = 1
+			err = nil
+		}
+	}
+	if err != nil {
+		return result, err
+	}
+	if err := catalogPage.Stage(); err != nil {
+		return result, err
+	}
+	if catalogSplit != nil {
+		if err := catalogRight.Stage(); err != nil {
+			return result, err
+		}
+	}
+
+	childID := path.catalogRoute.ID
+	childRef := catalogPage.Ref()
+	var parentFloor []byte
+	var parentID uint32
+	var parentRef storeio.PageRef
+	if catalogSplit != nil {
+		parentFloor = catalogSplit.PromotedFloor
+		parentID = c.primaryNextCatalogLeafID
+		parentRef = catalogRight.Ref()
+	}
+	if path.hasBranch {
+		branchPage, allocateErr := tx.AllocateNear(
+			storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+			path.branchLease.Header().LogicalID, path.branchRef.Offset,
+		)
+		if allocateErr != nil {
+			return result, allocateErr
+		}
+		bounds = c.primaryMutationBounds(tx)
+		var branchSplit *storeio.GlobalTabletCatalogNodeSplitResult
+		var branchRight storeio.TransactionPage
+		if catalogSplit == nil {
+			_, err = path.branch.RewriteHandle(
+				branchPage.Bytes(), generation, bounds,
+				path.catalogRoute.ID, catalogPage.Ref(),
+			)
+		} else {
+			if path.branch.Count() >= storeio.GlobalTabletCatalogMinimumNodeFanout {
+				err = storeio.ErrGlobalTabletCatalogNoSpace
+			} else {
+				_, err = path.branch.InsertChildReplacing(
+					branchPage.Bytes(), generation, bounds,
+					parentFloor, parentID, parentRef,
+					[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+						ID: path.catalogRoute.ID, Ref: catalogPage.Ref(),
+					}},
+				)
+			}
+			if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) {
+				if c.primaryNextCatalogBranchID >= storeio.GlobalTabletCatalogMaxBranchPages {
+					c.primaryMacroSplitRequired.Add(1)
+					return result, errors.Join(ErrPrimaryMacroSplitRequired, err)
+				}
+				rightLogical, ok := storeio.GlobalTabletCatalogCatalogBranchLogicalID(
+					c.primaryNextCatalogBranchID,
+				)
+				if !ok {
+					return result, ErrPrimaryMacroSplitRequired
+				}
+				branchRight, err = tx.Allocate(
+					storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+					rightLogical,
+				)
+				if err != nil {
+					return result, err
+				}
+				bounds = c.primaryMutationBounds(tx)
+				split, splitErr := path.branch.SplitInsertChildReplacing(
+					branchPage.Bytes(), branchRight.Bytes(), generation, bounds,
+					parentFloor, parentID, parentRef,
+					[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+						ID: path.catalogRoute.ID, Ref: catalogPage.Ref(),
+					}},
+					c.primaryNextCatalogBranchID,
+				)
+				if splitErr != nil {
+					return result, splitErr
+				}
+				branchSplit = &split
+				result.allocatedBranches = 1
+				err = nil
+			}
+		}
+		if err != nil {
+			return result, err
+		}
+		if err := branchPage.Stage(); err != nil {
+			return result, err
+		}
+		childID, childRef = path.rootRoute.ID, branchPage.Ref()
+		parentFloor = nil
+		if branchSplit != nil {
+			if err := branchRight.Stage(); err != nil {
+				return result, err
+			}
+			parentFloor = branchSplit.PromotedFloor
+			parentID = c.primaryNextCatalogBranchID
+			parentRef = branchRight.Ref()
+		}
+	}
+
+	rootPage, err := tx.AllocateNear(
+		storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogRootBytes,
+		state.root.PrimaryRoot.LogicalID, state.root.PrimaryRoot.Offset,
+	)
+	if err != nil {
+		return result, err
+	}
+	bounds = c.primaryMutationBounds(tx)
+	if len(parentFloor) == 0 {
+		_, err = path.root.RewriteHandle(
+			rootPage.Bytes(), generation, bounds, childID, childRef,
+		)
+	} else if !path.hasBranch &&
+		path.root.Count() >= storeio.GlobalTabletCatalogMinimumNodeFanout {
+		// Promote at the certified minimum node fanout. Twenty-eight adversarial
+		// 255-byte floors plus the triggering sibling divide into two 8 KiB
+		// branches, avoiding an unbounded full-root repartition later.
+		err = storeio.ErrGlobalTabletCatalogNoSpace
+	} else {
+		_, err = path.root.InsertChildReplacing(
+			rootPage.Bytes(), generation, bounds,
+			parentFloor, parentID, parentRef,
+			[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+				ID: childID, Ref: childRef,
+			}},
+		)
+	}
+	if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) && !path.hasBranch {
+		if c.primaryNextCatalogBranchID > storeio.GlobalTabletCatalogMaxBranchPages-2 {
+			c.primaryMacroSplitRequired.Add(1)
+			return result, errors.Join(ErrPrimaryMacroSplitRequired, err)
+		}
+		leftID := c.primaryNextCatalogBranchID
+		rightID := leftID + 1
+		leftLogical, leftOK := storeio.GlobalTabletCatalogCatalogBranchLogicalID(leftID)
+		rightLogical, rightOK := storeio.GlobalTabletCatalogCatalogBranchLogicalID(rightID)
+		if !leftOK || !rightOK {
+			return result, ErrPrimaryMacroSplitRequired
+		}
+		leftBranch, allocateErr := tx.Allocate(
+			storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+			leftLogical,
+		)
+		if allocateErr != nil {
+			return result, allocateErr
+		}
+		rightBranch, allocateErr := tx.Allocate(
+			storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
+			rightLogical,
+		)
+		if allocateErr != nil {
+			return result, allocateErr
+		}
+		bounds = c.primaryMutationBounds(tx)
+		_, err = path.root.PromoteRootInsertChildReplacing(
+			rootPage.Bytes(), leftBranch.Bytes(), rightBranch.Bytes(),
+			generation, bounds,
+			parentFloor, parentID, parentRef,
+			[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
+				ID: childID, Ref: childRef,
+			}},
+			leftID, leftBranch.Ref(), rightID, rightBranch.Ref(),
+		)
+		if err == nil {
+			if err = leftBranch.Stage(); err == nil {
+				err = rightBranch.Stage()
+			}
+			result.allocatedBranches = 2
+		}
+	}
+	if err != nil {
+		if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) {
+			c.primaryMacroSplitRequired.Add(1)
+			return result, errors.Join(ErrPrimaryMacroSplitRequired, err)
+		}
+		return result, err
+	}
+	if err := rootPage.Stage(); err != nil {
+		return result, err
+	}
+	result.root = rootPage.Ref()
+	return result, nil
+}
+
 // commitPrimaryStructural runs one bounded structural transaction: it stages the
 // caller's new leaves, rebuilds the tablet's anchor pages/locator/root from
 // finalLeaves, rewrites the catalog path and state root, retires predecessors,
@@ -812,76 +1077,10 @@ func (c *Collection) commitPrimaryStructural(
 		structuralRoutingStaged += macroBytes
 	}
 
-	catalogPage, err := tx.AllocateNear(
-		storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
-		path.catalogLease.Header().LogicalID, path.catalogRef.Offset,
+	catalogResult, err := c.stagePrimaryStructuralCatalog(
+		tx, state, path, generation, tabletPage.Ref(), macro, macroTabletRef,
 	)
 	if err != nil {
-		return err
-	}
-	bounds = c.primaryMutationBounds(tx)
-	if macro != nil {
-		if _, err := path.catalog.InsertChildReplacing(
-			catalogPage.Bytes(), generation, bounds,
-			macro.floor, macro.tabletID, macroTabletRef,
-			[]storeio.GlobalTabletCatalogNodeHandleRewrite{{
-				ID: path.tabletRoute.ID, Ref: tabletPage.Ref(),
-			}},
-		); err != nil {
-			if errors.Is(err, storeio.ErrGlobalTabletCatalogNoSpace) {
-				c.primaryMacroSplitRequired.Add(1)
-				return errors.Join(ErrPrimaryMacroSplitRequired, err)
-			}
-			return err
-		}
-	} else if _, err := path.catalog.RewriteHandle(
-		catalogPage.Bytes(), generation, bounds,
-		path.tabletRoute.ID, tabletPage.Ref(),
-	); err != nil {
-		return err
-	}
-	if err := catalogPage.Stage(); err != nil {
-		return err
-	}
-
-	childID := path.catalogRoute.ID
-	childRef := catalogPage.Ref()
-	if path.hasBranch {
-		branchPage, allocateErr := tx.AllocateNear(
-			storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogNodeBytes,
-			path.branchLease.Header().LogicalID, path.branchRef.Offset,
-		)
-		if allocateErr != nil {
-			return allocateErr
-		}
-		bounds = c.primaryMutationBounds(tx)
-		if _, rewriteErr := path.branch.RewriteHandle(
-			branchPage.Bytes(), generation, bounds,
-			path.catalogRoute.ID, catalogPage.Ref(),
-		); rewriteErr != nil {
-			return rewriteErr
-		}
-		if stageErr := branchPage.Stage(); stageErr != nil {
-			return stageErr
-		}
-		childID = path.rootRoute.ID
-		childRef = branchPage.Ref()
-	}
-
-	rootPage, err := tx.AllocateNear(
-		storeio.PagePrimaryCatalog, storeio.GlobalTabletCatalogRootBytes,
-		state.root.PrimaryRoot.LogicalID, state.root.PrimaryRoot.Offset,
-	)
-	if err != nil {
-		return err
-	}
-	bounds = c.primaryMutationBounds(tx)
-	if _, err := path.root.RewriteHandle(
-		rootPage.Bytes(), generation, bounds, childID, childRef,
-	); err != nil {
-		return err
-	}
-	if err := rootPage.Stage(); err != nil {
 		return err
 	}
 
@@ -938,7 +1137,7 @@ func (c *Collection) commitPrimaryStructural(
 		)
 	}
 	nextState, nextInline, err := c.stagePrimaryState(
-		tx, state, generation, rootPage.Ref(),
+		tx, state, generation, catalogResult.root,
 		freeLog.head, freeLog.inline,
 		state.root.DocumentCount,
 	)
@@ -1016,6 +1215,14 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	if macro != nil {
 		c.primaryNextTabletID = macro.tabletID + 1
+	}
+	if catalogResult.allocatedLeaves != 0 {
+		c.primaryNextCatalogLeafID += catalogResult.allocatedLeaves
+		c.primaryCatalogLeafSplits.Add(uint64(catalogResult.allocatedLeaves))
+	}
+	if catalogResult.allocatedBranches != 0 {
+		c.primaryNextCatalogBranchID += catalogResult.allocatedBranches
+		c.primaryCatalogBranchSplits.Add(uint64(catalogResult.allocatedBranches))
 	}
 	if kind == structuralSplit && !isLocalized {
 		c.primaryTabletRoutingRebuilds.Add(1)
