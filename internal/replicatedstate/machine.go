@@ -1727,6 +1727,40 @@ func (m *Machine) ApplyContractDigest() ([sha256.Size]byte, error) {
 	return m.applyContract, nil
 }
 
+// ObserveSchemaTransition proves that command is the exact final durable Raft
+// entry which fenced this source bundle. It recomputes the authenticated entry
+// digest from the persisted term and index, so matching only a target schema
+// generation or apply contract can never authorize catalog publication.
+//
+// A later entry cannot hide the transition: a committed schema transition
+// permanently fences the old bundle, leaving RecordSchema as its final kind
+// until the exact target bundle is activated.
+func (m *Machine) ObserveSchemaTransition(command []byte) (uint64, bool, error) {
+	if m == nil {
+		return 0, false, ErrApplyPoisoned
+	}
+	transition, err := OpenSchemaTransition(command)
+	if err != nil {
+		return 0, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.poison != nil {
+		return 0, false, fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	}
+	state := m.state
+	if !m.schemaTransitioned || state.LastKind != RecordSchema ||
+		state.LastEntryType != pb.EntryNormal || state.LastTerm == 0 ||
+		state.Binding != schemaTransitionBinding(transition) ||
+		state.ApplyContractDigest != transition.ToApplyContract {
+		return state.Applied, false, nil
+	}
+	digest := normalEntryDigest(raftmodel.ApplyMeta{
+		Index: state.Applied, Term: state.LastTerm, Type: state.LastEntryType,
+	}, command)
+	return state.Applied, digest == state.LastEntryDigest, nil
+}
+
 // SessionCapacityState returns a read-only, constant-size view of the machine
 // state needed by Raft integration checks. A poisoned
 // machine fails closed instead of advertising its last publication as usable.

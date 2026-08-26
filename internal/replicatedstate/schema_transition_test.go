@@ -122,6 +122,15 @@ func TestMachineSchemaTransitionFencesOldBundleAndReopensExactTarget(t *testing.
 	if _, err := fixture.machine.RelationManifestDigest(); !errors.Is(err, ErrSchemaTransitionPending) {
 		t.Fatalf("old bundle remained usable: %v", err)
 	}
+	if applied, committed, err := fixture.machine.ObserveSchemaTransition(encoded); err != nil ||
+		!committed || applied != 2 {
+		t.Fatalf("observe exact transition applied=%d committed=%t err=%v", applied, committed, err)
+	}
+	changedCommand := append([]byte(nil), encoded...)
+	changedCommand[len(changedCommand)-1] ^= 1
+	if _, committed, err := fixture.machine.ObserveSchemaTransition(changedCommand); err == nil || committed {
+		t.Fatalf("observe corrupt transition committed=%t err=%v", committed, err)
+	}
 	if _, err := fixture.machine.ApplyContractDigest(); !errors.Is(err, ErrSchemaTransitionPending) {
 		t.Fatalf("old apply contract remained observable: %v", err)
 	}
