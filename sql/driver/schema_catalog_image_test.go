@@ -56,3 +56,61 @@ func TestReplicatedSchemaCatalogImageRejectsLocalCatalog(t *testing.T) {
 		t.Fatalf("local catalog error = %v", err)
 	}
 }
+
+func TestReplicatedSchemaCatalogTargetFencesNonSchemaLineageChanges(t *testing.T) {
+	_, database, identity := bindReplicatedApplyTestRoot(t, "schema-catalog-target")
+	claim, _, err := database.OpenReplicatedApply(
+		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	raw, err := appendCatalogJSON(nil, core.catalog)
+	core.mu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded catalogFileVibe
+	if err = decodeCatalogJSON(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	target := catalogFile(decoded)
+	target.ReplicatedShardStore.Binding.Authority.SchemaGeneration++
+	target.ReplicatedShardStore.RelationSchemaGeneration++
+	target.ReplicatedShardStore.RelationManifestDigest =
+		replicatedRelationManifestDigest(*target.ReplicatedShardStore)
+	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
+		*target.ReplicatedShardStore, target.ReplicatedApply.Placement,
+	)
+	targetRaw, err := appendCatalogJSON(nil, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witness, err := database.ValidateReplicatedSchemaCatalogTarget(targetRaw)
+	if err != nil || witness.SchemaGeneration != identity.RelationSchemaGeneration+1 ||
+		witness.RelationManifestDigest == ([32]byte{}) {
+		t.Fatalf("target witness = %+v, %v", witness, err)
+	}
+
+	target.ReplicatedShardStore.Binding.Authority.RoutingVersion++
+	target.ReplicatedShardStore.RelationManifestDigest =
+		replicatedRelationManifestDigest(*target.ReplicatedShardStore)
+	target.ReplicatedApply.ValidationDigest = replicatedApplyProfileDigest(
+		*target.ReplicatedShardStore, target.ReplicatedApply.Placement,
+	)
+	targetRaw, err = appendCatalogJSON(nil, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ValidateReplicatedSchemaCatalogTarget(targetRaw); !errors.Is(err, ErrReplicatedSchemaCatalogImage) {
+		t.Fatalf("topology substitution error = %v", err)
+	}
+	if err = claim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
