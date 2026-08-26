@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -584,21 +585,34 @@ func newRF3RuntimeWithGlobalIndex(
 	memberID uint64,
 	globalIndex bool,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	return newRF3RuntimeForTestGroup(t, memberID, 0, globalIndex)
+}
+
+func newRF3RuntimeForTestGroup(
+	t testing.TB,
+	memberID uint64,
+	group int,
+	globalIndex bool,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
+	distributionName := "orders"
+	if group != 0 {
+		distributionName = fmt.Sprintf("orders-%d", group)
+	}
 	identity := raftstore.Identity{
-		Distribution: "orders", Shard: "0000-ffff",
-		AllocationGeneration: 7, MemberID: memberID,
+		Distribution: distributionName, Shard: "0000-ffff",
+		AllocationGeneration: uint64(7 + group), MemberID: memberID,
 	}
 	for index := range identity.ClusterID {
 		identity.ClusterID[index] = byte(index + 1)
 		identity.ClusterIncarnation[index] = byte(index + 21)
-		identity.ShardIncarnation[index] = byte(index + 41)
-		identity.GroupID[index] = byte(index + 61)
-		identity.StoreID[index] = byte(index+81) ^ byte(memberID)
+		identity.ShardIncarnation[index] = byte(index + 41 + group*17)
+		identity.GroupID[index] = byte(index + 61 + group*17)
+		identity.StoreID[index] = byte(index+81+group*17) ^ byte(memberID)
 	}
 	key := raftstore.Key{ID: "rf3-serving-key", Wrapped: []byte("opaque-wrapped-key")}
 	for index := range key.Material {
-		key.Material[index] = byte(index + 1)
+		key.Material[index] = byte(index + 1 + group)
 	}
 	baseIndex, baseTerm := uint64(1), uint64(1)
 	wal, err := raftstore.Create(

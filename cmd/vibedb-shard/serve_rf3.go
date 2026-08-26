@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -76,6 +77,124 @@ func servePreparedRF3(parent context.Context, manifest rf3Manifest) error {
 
 type rf3ListenFunc func(network, address string) (net.Listener, error)
 
+type preparedRF3Group struct {
+	manifest      rf3Manifest
+	base          sqldriver.ReplicatedShardStoreIdentity
+	applyIdentity sqldriver.ReplicatedApplyIdentity
+	key           raftstore.Key
+	wal           *raftstore.Store
+	database      *sqldriver.Database
+	apply         *sqldriver.ReplicatedApply
+	publication   raftmodel.Publication
+}
+
+type preparedRF3Set struct {
+	groups           []preparedRF3Group
+	members          []rafttransport.Member
+	remoteNodes      []rafttransport.NodeID
+	dial             rafttransport.RawPeerDialFunc
+	nativeConfigured bool
+}
+
+func (group *preparedRF3Group) close(cause error) error {
+	if group == nil {
+		return cause
+	}
+	clear(group.key.Material[:])
+	return errors.Join(cause, group.apply.Close(), group.database.Close(), group.wal.Close())
+}
+
+func closePreparedRF3Groups(groups []preparedRF3Group, cause error) error {
+	for index := range groups {
+		cause = groups[index].close(cause)
+	}
+	return cause
+}
+
+func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (preparedRF3Set, error) {
+	var result preparedRF3Set
+	bundles := manifest.groupBundles()
+	result.groups = make([]preparedRF3Group, 0, len(bundles))
+	result.members = make([]rafttransport.Member, 0, len(bundles)*rf3ManifestMembers)
+	seen := make(map[raftmember.GroupKey]struct{}, len(bundles))
+	addresses := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
+	for index, bundle := range bundles {
+		single := manifest.withGroup(bundle)
+		base, applyIdentity, err := loadRF3RetainedIdentities(single)
+		if err != nil {
+			return result, closePreparedRF3Groups(result.groups, err)
+		}
+		group := groupFromBinding(base.Binding)
+		if _, duplicate := seen[group]; duplicate {
+			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("%w: duplicate retained group", errRF3Serving))
+		}
+		seen[group] = struct{}{}
+		want := rafttransport.TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+		if profile.LocalIdentity().TrustDomain != want {
+			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("%w: group %d trust domain differs from retained identity", errRF3Serving, index))
+		}
+		key, err := loadRF3WALKey(bundle.WAL.KeyID, bundle.WAL.KeyMaterialPath)
+		if err != nil {
+			return result, closePreparedRF3Groups(result.groups, err)
+		}
+		wal, err := raftstore.Open(bundle.WAL.Path, walIdentityFromBinding(base.Binding), base.Binding.TopologyRecoveryEpoch, key, bundle.WAL.Options)
+		if err != nil {
+			clear(key.Material[:])
+			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("open RF3 WAL group %d: %w", index, err))
+		}
+		database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(bundle.SQL.Path, wal, base.Binding.Authority, base, applyIdentity)
+		if err != nil {
+			clear(key.Material[:])
+			return result, closePreparedRF3Groups(result.groups, errors.Join(err, wal.Close()))
+		}
+		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published()}
+		if err = rejectRF3UnappliedMembership(wal, item.publication.Applied); err != nil {
+			return result, closePreparedRF3Groups(append(result.groups, item), err)
+		}
+		roster, _, _, native, err := buildRF3Roster(single, group, base.Binding.MemberID, item.publication)
+		if err != nil {
+			return result, closePreparedRF3Groups(append(result.groups, item), err)
+		}
+		for _, member := range roster {
+			address := peerAddressForRF3Member(single, member.MemberID)
+			if prior, found := addresses[member.Node]; found && prior != address {
+				return result, closePreparedRF3Groups(append(result.groups, item), fmt.Errorf("%w: node address differs across groups", errRF3Serving))
+			}
+			addresses[member.Node] = address
+		}
+		result.groups = append(result.groups, item)
+		result.members = append(result.members, roster...)
+		result.nativeConfigured = result.nativeConfigured || native
+	}
+	for node := range addresses {
+		if node != profile.LocalIdentity().Node {
+			result.remoteNodes = append(result.remoteNodes, node)
+		}
+	}
+	slices.SortFunc(result.remoteNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
+	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
+	result.dial = func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
+		address, found := addresses[node]
+		if !found {
+			return nil, rafttransport.ErrNodeNotFound
+		}
+		return dialer.DialContext(ctx, "tcp", address)
+	}
+	return result, nil
+}
+
+func peerAddressForRF3Member(manifest rf3Manifest, memberID uint64) string {
+	for _, member := range manifest.Members {
+		if member.MemberID == memberID {
+			return member.PeerAddress
+		}
+	}
+	if manifest.EnrolledTarget != nil && manifest.EnrolledTarget.MemberID == memberID {
+		return manifest.EnrolledTarget.PeerAddress
+	}
+	return ""
+}
+
 func servePreparedRF3WithListen(
 	parent context.Context,
 	manifest rf3Manifest,
@@ -105,11 +224,6 @@ func servePreparedRF3WithExecutionLanes(
 	if err := validateRF3Addresses(manifest); err != nil {
 		return err
 	}
-	base, applyIdentity, err := loadRF3RetainedIdentities(manifest)
-	if err != nil {
-		return err
-	}
-
 	profile, err := servicetls.LoadProfile(
 		manifest.TLS.Certificate, manifest.TLS.Key, manifest.TLS.Roots,
 		manifest.TLS.IdentityOID, time.Now,
@@ -144,49 +258,19 @@ func servePreparedRF3WithExecutionLanes(
 		return fmt.Errorf("%w: control TLS server: %v", errRF3Serving, err)
 	}
 
-	group := groupFromBinding(base.Binding)
-	wantDomain := rafttransport.TrustDomain{
-		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
-	}
-	if profile.LocalIdentity().TrustDomain != wantDomain {
-		return fmt.Errorf("%w: certificate trust domain differs from retained SQL identity", errRF3Serving)
-	}
-
-	key, err := loadRF3WALKey(manifest.WAL.KeyID, manifest.WAL.KeyMaterialPath)
+	preparedSet, err := prepareRF3GroupSet(manifest, profile)
 	if err != nil {
 		return err
 	}
-	defer clear(key.Material[:])
-	wal, err := raftstore.Open(
-		manifest.WAL.Path, walIdentityFromBinding(base.Binding),
-		base.Binding.TopologyRecoveryEpoch, key, manifest.WAL.Options,
-	)
-	if err != nil {
-		return fmt.Errorf("open RF3 WAL: %w", err)
-	}
-	database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(
-		manifest.SQL.Path, wal, base.Binding.Authority, base, applyIdentity,
-	)
-	if err != nil {
-		return errors.Join(fmt.Errorf("open bound RF3 SQL/apply: %w", err), wal.Close())
-	}
-	closePrepared := func(cause error) error {
-		return errors.Join(cause, apply.Close(), database.Close(), wal.Close())
-	}
-
-	publication := apply.Published()
-	if err := rejectRF3UnappliedMembership(wal, publication.Applied); err != nil {
-		return closePrepared(err)
-	}
-	members, remoteNodes, dial, nativeConfigured, err := buildRF3Roster(
-		manifest, group, base.Binding.MemberID, publication,
-	)
-	if err != nil {
-		return closePrepared(err)
-	}
+	closePrepared := func(cause error) error { return closePreparedRF3Groups(preparedSet.groups, cause) }
+	first := &preparedSet.groups[0]
+	base, apply := first.base, first.apply
+	group := groupFromBinding(base.Binding)
+	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
+	nativeConfigured := preparedSet.nativeConfigured
 	transportRegistry, err := rafttransport.NewStaticRegistry(
 		profile.LocalIdentity().Node, members,
-		rafttransport.Limits{MaxGroups: 1, MaxMembers: len(members)},
+		rafttransport.Limits{MaxGroups: len(preparedSet.groups), MaxMembers: len(members)},
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
@@ -204,9 +288,12 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: membership grant control: %v", errRF3Serving, err))
 	}
-	localMember, err := transportRegistry.LocalMember(group)
-	if err != nil || localMember != base.Binding.MemberID {
-		return closePrepared(fmt.Errorf("%w: certificate node does not own retained member", errRF3Serving))
+	for index := range preparedSet.groups {
+		item := &preparedSet.groups[index]
+		localMember, localErr := transportRegistry.LocalMember(groupFromBinding(item.base.Binding))
+		if localErr != nil || localMember != item.base.Binding.MemberID {
+			return closePrepared(fmt.Errorf("%w: certificate node does not own retained member for group %d", errRF3Serving, index))
+		}
 	}
 
 	// Reserve every enabled socket before AdoptRuntime durably advances the node
@@ -253,46 +340,61 @@ func servePreparedRF3WithExecutionLanes(
 		return closePrepared(componentShutdownError(cause))
 	}
 
-	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
-	if err != nil {
-		if runtime != nil {
-			return errors.Join(err, runtime.Close())
+	runtimes := make([]*raftmember.Runtime, 0, len(preparedSet.groups))
+	identities := make([]raftmember.RuntimeIdentity, 0, len(preparedSet.groups))
+	commands := make([]raftservice.CommandFence, 0, len(preparedSet.groups))
+	readSources := make([]raftservice.ReadSource, 0, len(preparedSet.groups))
+	recoverySources := make([]raftservice.TransactionRecoverySource, 0, len(preparedSet.groups))
+	closeAdopted := func(cause error) error {
+		for _, runtime := range runtimes {
+			cause = errors.Join(cause, runtime.Close())
 		}
-		return closePrepared(err)
+		return cause
 	}
-	if err := runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
-		IntervalTicks: rf3WALGenerationIntervalTicks,
-		Key:           key,
-		OnError: func(err error) {
-			fmt.Fprintf(os.Stderr, "vibedb-shard RF3 WAL generation deferred: %v\n", err)
-		},
-	}); err != nil {
-		return errors.Join(err, runtime.Close())
+	for index := range preparedSet.groups {
+		item := &preparedSet.groups[index]
+		runtime, adoptErr := raftmember.AdoptRuntime(item.wal, item.database, item.apply)
+		if adoptErr != nil {
+			remaining := preparedSet.groups[index:]
+			if runtime != nil {
+				adoptErr = errors.Join(adoptErr, runtime.Close())
+				remaining = preparedSet.groups[index+1:]
+			}
+			return errors.Join(closeAdopted(adoptErr), closePreparedRF3Groups(remaining, nil))
+		}
+		runtimes = append(runtimes, runtime)
+		if adoptErr = runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
+			IntervalTicks: rf3WALGenerationIntervalTicks, Key: item.key,
+			OnError: func(err error) { fmt.Fprintf(os.Stderr, "vibedb-shard RF3 WAL generation deferred: %v\n", err) },
+		}); adoptErr != nil {
+			return errors.Join(closeAdopted(adoptErr), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))
+		}
+		clear(item.key.Material[:])
+		runtimePublication, publicationErr := runtime.Publication()
+		if publicationErr != nil || runtimePublication.ReplicaSetVersion != item.publication.ReplicaSetVersion || !proto.Equal(runtimePublication.ConfState, item.publication.ConfState) {
+			return errors.Join(closeAdopted(errors.Join(fmt.Errorf("%w: group %d publication changed during adoption", errRF3Serving, index), publicationErr)), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))
+		}
+		identity := runtime.Identity()
+		identities = append(identities, identity)
+		commands = append(commands, commandFenceFromPublication(item.base.Binding.Authority, identity, runtimePublication.ReplicaSetVersion))
+		readSources = append(readSources, item.apply)
+		recoverySources = append(recoverySources, item.apply)
 	}
-	clear(key.Material[:])
-	runtimePublication, err := runtime.Publication()
-	if err != nil || runtimePublication.ReplicaSetVersion != publication.ReplicaSetVersion ||
-		!proto.Equal(runtimePublication.ConfState, publication.ConfState) {
-		return errors.Join(
-			fmt.Errorf("%w: publication changed during adoption", errRF3Serving),
-			err, runtime.Close(),
-		)
-	}
-	runtimeIdentity := runtime.Identity()
-	command := commandFenceFromPublication(
-		base.Binding.Authority, runtimeIdentity, runtimePublication.ReplicaSetVersion,
-	)
+	runtimeIdentity := identities[0]
+	runtimePublication, _ := runtimes[0].Publication()
 
-	servingRegistry, err := raftserve.NewRegistry(rf3RegistryLimits())
+	servingRegistry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(len(runtimes)))
 	if err != nil {
-		return errors.Join(err, runtime.Close())
+		return closeAdopted(err)
 	}
-	lanes, err := servingRegistry.NewExecutionLanes(executionLaneCount, rf3HostLimits())
+	lanes, err := servingRegistry.NewExecutionLanes(executionLaneCount, rf3HostLimitsForGroups(len(runtimes)))
 	if err != nil {
-		return errors.Join(err, runtime.Close(), servingRegistry.Close())
+		return errors.Join(closeAdopted(err), servingRegistry.Close())
 	}
-	if err := lanes.Add(runtime); err != nil {
-		return errors.Join(err, runtime.Close(), lanes.Close(), servingRegistry.Close())
+	for _, runtime := range runtimes {
+		if err := lanes.Add(runtime); err != nil {
+			return errors.Join(err, lanes.Close(), servingRegistry.Close())
+		}
 	}
 
 	pulse := make(chan struct{}, 1)
@@ -301,10 +403,10 @@ func servePreparedRF3WithExecutionLanes(
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Execution: raftservice.ExecutionOptions{
 			Registry: servingRegistry, Lanes: lanes,
-			Members:                    []raftmember.RuntimeIdentity{runtimeIdentity},
-			CommandFences:              []raftservice.CommandFence{command},
-			ReadSources:                []raftservice.ReadSource{apply},
-			TransactionRecoverySources: []raftservice.TransactionRecoverySource{apply},
+			Members:                    identities,
+			CommandFences:              commands,
+			ReadSources:                readSources,
+			TransactionRecoverySources: recoverySources,
 			Pulse:                      pulse,
 			Limits:                     rf3OwnerLimits(),
 		},
@@ -317,10 +419,15 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	servedGroups := make(map[raftmember.GroupKey]raftmember.RuntimeIdentity, len(identities))
+	for _, identity := range identities {
+		servedGroups[identity.Group] = identity
+	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
 		Observer: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
-			return request.Group == group &&
+			_, served := servedGroups[request.Group]
+			return served &&
 				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
 		},
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
@@ -345,8 +452,8 @@ func servePreparedRF3WithExecutionLanes(
 	actionControl, err := replicaaction.NewService(replicaaction.Options{
 		Journal: actionJournal, Owner: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request replicaaction.Request) bool {
-			return request.Fence.Group == group &&
-				request.Fence.MemberID == runtimeIdentity.MemberID &&
+			local, served := servedGroups[request.Fence.Group]
+			return served && request.Fence.MemberID == local.MemberID &&
 				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
 		},
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
@@ -728,18 +835,20 @@ func validateRF3Addresses(manifest rf3Manifest) error {
 	if err := validateRF3Address(manifest.Listeners.Control, true); err != nil {
 		return err
 	}
-	for _, member := range manifest.Members {
-		if err := validateRF3Address(member.PeerAddress, false); err != nil {
-			return err
-		}
-	}
-	if target := manifest.EnrolledTarget; target != nil {
-		for _, address := range [...]string{
-			target.PeerAddress, target.NativeAddress,
-			target.SnapshotAddress, target.ControlAddress,
-		} {
-			if err := validateRF3Address(address, false); err != nil {
+	for _, bundle := range manifest.groupBundles() {
+		for _, member := range bundle.Members {
+			if err := validateRF3Address(member.PeerAddress, false); err != nil {
 				return err
+			}
+		}
+		if target := bundle.EnrolledTarget; target != nil {
+			if len(manifest.Groups) > 1 {
+				return fmt.Errorf("%w: multi-group enrolled targets require per-group snapshot listeners", errRF3Serving)
+			}
+			for _, address := range [...]string{target.PeerAddress, target.NativeAddress, target.SnapshotAddress, target.ControlAddress} {
+				if err := validateRF3Address(address, false); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1012,16 +1121,24 @@ func commandFenceFromPublication(
 }
 
 func rf3RegistryLimits() raftserve.Limits {
+	return rf3RegistryLimitsForGroups(1)
+}
+
+func rf3RegistryLimitsForGroups(groups int) raftserve.Limits {
 	return raftserve.Limits{
-		MaxGroups: 1, MaxOutstandingIdentities: 32,
-		MaxOutstandingAttempts: 64, MaxWaiters: 64, MaxAttemptsPerIdentity: 4,
-		MaxRetainedCompletionBytes: 32 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
+		MaxGroups: groups, MaxOutstandingIdentities: 32 * groups,
+		MaxOutstandingAttempts: 64 * groups, MaxWaiters: 64 * groups, MaxAttemptsPerIdentity: 4,
+		MaxRetainedCompletionBytes: int64(32*groups) * int64(replicatedstate.MaxCompletionEnvelopeBytes),
 	}
 }
 
 func rf3HostLimits() multiraft.Limits {
+	return rf3HostLimitsForGroups(1)
+}
+
+func rf3HostLimitsForGroups(groups int) multiraft.Limits {
 	return multiraft.Limits{
-		MaxGroups: 1, MaxQueueItems: 256, MaxQueueBytes: 128 << 20,
+		MaxGroups: groups, MaxQueueItems: 256, MaxQueueBytes: 128 << 20,
 		MaxGroupItems: 256, MaxGroupBytes: 128 << 20,
 		MaxOutboxItems: 256, MaxOutboxBytes: 128 << 20, MaxPendingTicks: 16,
 	}

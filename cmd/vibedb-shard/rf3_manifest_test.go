@@ -124,6 +124,45 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 	}
 }
 
+func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
+	document := multiGroupRF3Manifest(t)
+	manifest, err := parseRF3Manifest([]byte(document))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Groups) != 2 || len(manifest.groupBundles()) != 2 {
+		t.Fatalf("group bundles = %d", len(manifest.Groups))
+	}
+	if err := validateRF3Addresses(manifest); err != nil {
+		t.Fatalf("multi-group addresses: %v", err)
+	}
+	if manifest.Groups[0].WAL.Path != "/srv/vibedb/member.wal" ||
+		manifest.Groups[1].WAL.Path != "/srv/vibedb/second.wal" ||
+		manifest.Groups[1].SQL.IdentityPath != "/srv/vibedb/second-sql-identity.json" {
+		t.Fatalf("groups = %+v", manifest.Groups)
+	}
+	duplicate := strings.Replace(document, "/srv/vibedb/second.wal", "/srv/vibedb/member.wal", 1)
+	if _, err := parseRF3Manifest([]byte(duplicate)); !errors.Is(err, errInvalidRF3Manifest) {
+		t.Fatalf("duplicate group artifact path error = %v", err)
+	}
+}
+
+func multiGroupRF3Manifest(t testing.TB) string {
+	t.Helper()
+	listener := strings.Index(canonicalRF3Manifest, `  "listeners":`)
+	members := strings.Index(canonicalRF3Manifest, `  "members":`)
+	if listener < 0 || members <= listener {
+		t.Fatal("canonical fixture sections not found")
+	}
+	walSQL := canonicalRF3Manifest[2:listener]
+	common := canonicalRF3Manifest[listener:members]
+	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
+	first := "{\n" + walSQL + roster + "\n  }"
+	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second")
+	second = strings.Replace(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2", 1)
+	return "{\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
+}
+
 func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T) {
 	document := enrolledRF3Manifest()
 	manifest, err := parseRF3Manifest([]byte(document))

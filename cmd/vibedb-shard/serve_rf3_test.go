@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -85,6 +86,25 @@ func TestRF3ExecutionLaneCountIsExplicitPowerOfTwo(t *testing.T) {
 	for _, count := range []int{-1, 0, 3, 6, 65, 128} {
 		if validRF3ExecutionLanes(count) {
 			t.Fatalf("invalid lane count %d accepted", count)
+		}
+	}
+}
+
+func TestRF3MultiGroupServingLimitsCoverManifestBound(t *testing.T) {
+	for _, groups := range []int{1, 2, maxRF3ManifestGroups} {
+		registry, err := raftserve.NewRegistry(rf3RegistryLimitsForGroups(groups))
+		if err != nil {
+			t.Fatalf("groups=%d registry limits: %v", groups, err)
+		}
+		lanes, err := registry.NewExecutionLanes(rf3DefaultExecutionLanes, rf3HostLimitsForGroups(groups))
+		if err != nil {
+			t.Fatalf("groups=%d lane limits: %v", groups, err)
+		}
+		if err := lanes.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := registry.Close(); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
