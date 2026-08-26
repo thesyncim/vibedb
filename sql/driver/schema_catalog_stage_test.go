@@ -3,6 +3,8 @@ package driver
 import (
 	"os"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
 func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T) {
@@ -81,6 +83,18 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		prepared.Membership.Sequence == 0 || prepared.Membership.Source == ([32]byte{}) ||
 		prepared.Membership.Target == ([32]byte{}) || prepared.Witness == proof.Witness {
 		t.Fatalf("prepared target proof = %+v, %v", prepared, err)
+	}
+	command, err := claim.AppendReplicatedSchemaTransition(
+		nil, prepared, ReplicatedSchemaTransitionAuthority{
+			RequestDigest: [32]byte{0xa5}, AuthorizationDigest: [32]byte{0xb6},
+			CatalogCASDigest: [32]byte{0xc7},
+		},
+	)
+	opened, openErr := replicatedstate.OpenSchemaTransition(command)
+	if err != nil || openErr != nil || opened.ToManifest != prepared.Catalog.RelationManifestDigest ||
+		opened.ToApplyContract != prepared.ApplyContract ||
+		opened.MembershipSequence != prepared.Membership.Sequence {
+		t.Fatalf("schema transition = %+v, append=%v open=%v", opened, err, openErr)
 	}
 	if err = claim.Close(); err != nil {
 		t.Fatal(err)
