@@ -15,6 +15,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
+// replicatedGroupObservationReservation is a conservative retained-memory
+// charge for one caller-owned observation, including its slice share. The
+// actual fixed-width value is smaller; the headroom keeps admission portable
+// across architecture padding changes without unsafe.Sizeof in production.
+const replicatedGroupObservationReservation = uint64(192)
+
 // ReplicatedGroupReadObservation is one honest linearizable group cut. Applied
 // is meaningful only with this exact RouteID and Group. A scatter result is a
 // vector of these observations, never a synthetic global timestamp.
@@ -160,6 +166,11 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 	count := uint64(len(request.Points))
 	finalFixed := uint64(4) + (count+7)/8 + count*4
 	resultBound := uint64(request.MaxResultBytes)
+	observationBound := uint64(len(groups)) * replicatedGroupObservationReservation
+	if observationBound > reader.maxReadBytes || resultBound > reader.maxReadBytes-observationBound {
+		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
+	}
+	finalReservation := resultBound + observationBound
 	payloadBound := resultBound - finalFixed
 	groupFixedBytes := uint64(0)
 	for index := range groups {
@@ -289,13 +300,13 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedDataRead
 	}
 	// Only the final caller-owned result remains live after merge.
-	if !reader.shrinkRead(reservationSlot, reservationEpoch, workingBytes, resultBound) {
+	if !reader.shrinkRead(reservationSlot, reservationEpoch, workingBytes, finalReservation) {
 		return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
 	}
 	releaseReservation = false
 	return ReplicatedTableScatterReadResult{
 		Observations: observations, Packed: packed, view: view,
-		reservationOwner: reader, reservationBytes: resultBound,
+		reservationOwner: reader, reservationBytes: finalReservation,
 		reservationSlot: reservationSlot, reservationEpoch: reservationEpoch,
 	}, generation, nil
 }

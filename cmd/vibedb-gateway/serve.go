@@ -61,17 +61,21 @@ const (
 // merge metadata independently of the statement.
 type serveRequest struct {
 	// Op selects the gateway operation: the empty value and "query" are the
-	// read path; "exec" is the single-shard write path; "exec_batch" uses
-	// Statements and applies one Class to the complete atomic batch.
+	// read path; "read_batch" is the RF3 exact-point SQL vector; "exec" is the
+	// single-shard write path; "exec_batch" uses Statements and applies one
+	// Class to the complete atomic batch.
 	Op string `json:"op,omitempty"`
 	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for
 	// an RF3 exec_batch. It remains ingress metadata and never enters Raft as a
 	// table or SQL string.
-	RequestID  string           `json:"request_id,omitempty"`
-	SQL        string           `json:"sql"`
-	Class      string           `json:"class,omitempty"`
-	Params     []serveParam     `json:"params,omitempty"`
-	Statements []serveStatement `json:"statements,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	SQL       string `json:"sql"`
+	Class     string `json:"class,omitempty"`
+	// MaxResultBytes is required by read_batch and bounds its complete JSON
+	// success response, including documents and the per-group observation vector.
+	MaxResultBytes uint32           `json:"max_result_bytes,omitempty"`
+	Params         []serveParam     `json:"params,omitempty"`
+	Statements     []serveStatement `json:"statements,omitempty"`
 }
 
 type serveStatement struct {
@@ -160,6 +164,7 @@ func runServe(args []string) int {
 	maxShardHandshakes := fs.Int("max-shard-handshakes-per-pool", 64, "hard concurrent TLS handshake bound for each authenticated SQL and RF3 shard pool; transient control pools cap this at 8")
 	maxNativeReadConcurrency := fs.Int("max-native-read-concurrency", gateway.DefaultReplicatedReadConcurrency, "hard concurrent public RF3 point-read bound")
 	maxNativeReadBytes := fs.Uint64("max-native-read-bytes", gateway.DefaultReplicatedReadInFlight, "hard aggregate schema-bounded public RF3 response-byte reservation")
+	maxNativeScatterConcurrency := fs.Int("max-native-scatter-concurrency", gateway.DefaultReplicatedScatterConcurrency, "hard concurrent RF3 shard-group reads; requests may contain more groups and drain through this bound")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -295,8 +300,9 @@ func runServe(args []string) int {
 		dataReader, err = gateway.NewReplicatedDataReaderWithOptions(
 			gateway.ReplicatedDataReaderOptions{
 				Catalog: holder, Executor: replicated, Refresh: catalogAuthority.Refresh,
-				MaxConcurrentReads:   *maxNativeReadConcurrency,
-				MaxInFlightReadBytes: *maxNativeReadBytes,
+				MaxConcurrentReads:    *maxNativeReadConcurrency,
+				MaxInFlightReadBytes:  *maxNativeReadBytes,
+				MaxScatterConcurrency: *maxNativeScatterConcurrency,
 			},
 		)
 		if err != nil {
@@ -873,6 +879,62 @@ func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor
 			}
 			continue
 		}
+		if req.Op == "read_batch" {
+			batchRequest, buildErr := buildNativeSQLBatchReadRequest(req)
+			if buildErr != nil {
+				response := nativeDataError(nativeDataResponseInvalidRequest, false)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			if authorize != nil && !authorize(serviceauthz.CapabilityDataRead) {
+				response := nativeDataError(nativeDataResponseUnauthorized, false)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			batchReader, available := data.(nativeSQLBatchReader)
+			if !available {
+				response := nativeDataError(nativeDataResponseUnavailable, true)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			result, readErr := batchReader.ReadSQLBatch(ctx, batchRequest)
+			if readErr != nil {
+				response := nativeDataResponseForError(readErr)
+				if writeNativeDataConnResponse(conn, &response, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			response := nativeSQLBatchWireResponse{
+				Result: &result, Expected: len(batchRequest.Queries), Maximum: batchRequest.MaxResultBytes,
+			}
+			validationErr := validateNativeSQLBatchResponse(&response)
+			if validationErr != nil {
+				result.Release()
+				encoded := nativeDataResponseForError(validationErr)
+				if writeNativeDataConnResponse(conn, &encoded, &nativeResponseScratch, defaultNativeResponseWriteTimeout) != nil {
+					return
+				}
+				continue
+			}
+			writeErr := writeNativeSQLBatchConnResponse(
+				conn, writer, &response, defaultNativeResponseWriteTimeout,
+			)
+			result.Release()
+			if writeErr != nil {
+				if ctx.Err() == nil {
+					logf("gateway: encode replicated SQL batch response: %v", writeErr)
+				}
+				return
+			}
+			continue
+		}
 		if authorize != nil && !authorize(serveRequestCapability(&req)) {
 			if err := writeServeResponse(writer, &serveResponse{Error: "authorization denied"}); err != nil {
 				return
@@ -1158,7 +1220,7 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 }
 
 func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
-	if req.SQL != "" || len(req.Params) != 0 {
+	if req.SQL != "" || len(req.Params) != 0 || req.MaxResultBytes != 0 {
 		return nil, errors.New("exec_batch uses statements instead of top-level sql or params")
 	}
 	if len(req.Statements) == 0 {
@@ -1183,6 +1245,9 @@ func buildBatchQueries(req serveRequest) ([]gateway.Query, error) {
 // ordering, and limiting are deliberately absent here: the executor derives
 // them from SQL against its pinned catalog generation.
 func buildQuery(req serveRequest) (gateway.Query, error) {
+	if req.MaxResultBytes != 0 {
+		return gateway.Query{}, errors.New("max_result_bytes is only valid for read_batch")
+	}
 	params, err := buildParams(req.Params)
 	if err != nil {
 		return gateway.Query{}, err

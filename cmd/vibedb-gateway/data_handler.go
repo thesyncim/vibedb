@@ -65,6 +65,9 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 		return nativeDataError(nativeDataResponseStaleCatalog, true)
 	case errors.Is(err, gateway.ErrReplicatedDataRead):
 		return nativeDataError(nativeDataResponseInvalidRequest, false)
+	case errors.Is(err, gateway.ErrReplicatedSQLReadUnsupported),
+		errors.Is(err, gateway.ErrReplicatedSQLReadMixed):
+		return nativeDataError(nativeDataResponseInvalidRequest, false)
 	case errors.Is(err, gateway.ErrReplicatedTableRoute):
 		return nativeDataError(nativeDataResponseTableNotReplicated, false)
 	case errors.Is(err, gateway.ErrReplicatedReadPositionMismatch):
@@ -73,6 +76,8 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 		return nativeDataError(nativeDataResponseUnauthorized, false)
 	case errors.Is(err, gateway.ErrReplicatedReadBehind):
 		return nativeDataError(nativeDataResponseReadBehind, true)
+	case errors.Is(err, gateway.ErrReplicatedReadIntentActive):
+		return nativeDataError(nativeDataResponseConflict, true)
 	case errors.Is(err, raftmodel.ErrAdmissionBound),
 		errors.Is(err, gateway.ErrReplicatedTransportBound),
 		errors.Is(err, gateway.ErrReplicatedReadAdmission):
@@ -91,6 +96,8 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 			return nativeDataError(nativeDataResponseUnauthorized, false)
 		case shardservice.ReplicatedRefusalReadBehind:
 			return nativeDataError(nativeDataResponseReadBehind, true)
+		case shardservice.ReplicatedRefusalReadIntentActive:
+			return nativeDataError(nativeDataResponseConflict, true)
 		case shardservice.ReplicatedRefusalStaleFence:
 			return nativeDataError(nativeDataResponseStaleCatalog, true)
 		case shardservice.ReplicatedRefusalAdmissionBound:
