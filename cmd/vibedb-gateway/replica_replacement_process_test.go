@@ -272,8 +272,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 90*time.Second {
 		t.Fatalf("replacement latency %s exceeded bound", elapsed)
 	}
-	if info, statErr := os.Stat(filepath.Join(root, "gateway-session")); statErr == nil && info.Size() > 64<<20 {
-		t.Fatalf("controller journal grew to %d bytes", info.Size())
+	if !replicaProcessTreeBounded(t, root, "gateway-session", 32, 64<<20) ||
+		!replicaProcessTreeBounded(t, filepath.Join(root, "member-1"),
+			"replica-actions", 4097, 64<<20) {
+		t.Fatal("controller state exceeded its process qualification bound")
 	}
 	if err = gatewayProcess.Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -283,6 +285,15 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("terminal controller reopen: %v\n%s", err, gatewayProcess.Diagnostics())
+	}
+	final, err := gateway.LoadSnapshot(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptors := final.ReplicatedShardDescriptors()
+	if len(descriptors) != 1 || !replicaProcessRosterContains(descriptors[0], 4) ||
+		replicaProcessRosterContains(descriptors[0], 1) {
+		t.Fatalf("retired source rejoined after controller restart: %+v", descriptors)
 	}
 }
 
@@ -508,6 +519,35 @@ func replicaProcessAllArtifactsEmpty(root string) bool {
 		}
 	}
 	return true
+}
+
+func replicaProcessTreeBounded(t testing.TB, root, prefix string, maxFiles int,
+	maxBytes int64,
+) bool {
+	t.Helper()
+	files, bytes := 0, int64(0)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		withinDirectory := strings.Contains(path,
+			string(filepath.Separator)+prefix+string(filepath.Separator))
+		if entry.IsDir() || !strings.HasPrefix(filepath.Base(path), prefix) && !withinDirectory {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		files++
+		bytes += info.Size()
+		return nil
+	})
+	if err != nil {
+		t.Errorf("measure %s/%s: %v", root, prefix, err)
+		return false
+	}
+	return files <= maxFiles && bytes <= maxBytes
 }
 
 func replicaProcessStop(t testing.TB, process *rf3testfixture.ExternalProcess) {
