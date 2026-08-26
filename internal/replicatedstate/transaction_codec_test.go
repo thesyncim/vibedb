@@ -270,6 +270,30 @@ func TestTransactionControlFusedPathBitIsDurableAndOperationBound(t *testing.T) 
 	if _, err := AppendTransactionControl(nil, legacyControl); err == nil {
 		t.Fatal("legacy control accepted a fused prepare witness")
 	}
+
+	id, payload := transactionCodecCoordinatorPayload(t)
+	controlBytes, _ := TransactionControlResidentBytes(0)
+	payloadBytes, _ := TransactionCoordinatorPayloadResidentBytes(len(payload))
+	zeroVoteCoordinator := TransactionControl{
+		ID: id, Role: distributedtxn.ReplicatedRoleCoordinator,
+		State: uint8(distributedtxn.CoordinatorStaging), Revision: 1,
+		PayloadKind:   distributedtxn.ReplicatedPayloadCoordinator,
+		PayloadDigest: sha256.Sum256(payload), PayloadBytes: uint64(len(payload)), PayloadCount: 1,
+		CoordinatorGroup:            transactionCodecReplicationID(31),
+		CoordinatorShardIncarnation: transactionCodecReplicationID(47),
+		CoordinatorAllocation:       63,
+		MutationDigest:              sha256.Sum256(payload),
+		ResidentControlBytes:        controlBytes,
+		ResidentPayloadBytes:        payloadBytes,
+		FusedPath:                   true,
+		LastOperation:               distributedtxn.ReplicatedBeginPrepareCoordinator,
+		LastCommandDigest:           transactionCodecCommandDigest(96),
+		LastResultCode:              ResultApplied,
+		LastAppliedIndex:            11,
+	}
+	if _, err := AppendTransactionControl(nil, zeroVoteCoordinator); err == nil {
+		t.Fatal("fused coordinator accepted a zero prepare vote")
+	}
 }
 
 func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T) {

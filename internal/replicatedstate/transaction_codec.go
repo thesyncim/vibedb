@@ -924,9 +924,7 @@ func transactionControlValid(control TransactionControl) bool {
 		if !control.FusedPath && control.PrepareResultCode != 0 {
 			return false
 		}
-		if control.FusedPath && control.PrepareResultCode == 0 &&
-			control.LastOperation != distributedtxn.ReplicatedBeginPrepareCoordinator &&
-			control.LastOperation != distributedtxn.ReplicatedBeginPrepareManifestCoordinator {
+		if control.FusedPath && control.PrepareResultCode == 0 {
 			return false
 		}
 		if control.PrepareResultCode == 0 && control.CoordinatorParticipantOrdinal != 0 {

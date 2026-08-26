@@ -134,3 +134,89 @@ func TestTransactionImageReopenAccountingIntentOwnershipAndTopologyFence(t *test
 		t.Fatalf("orphan intent reopen error=%v", err)
 	}
 }
+
+func TestFusedCoordinatorZeroVoteCannotReopenOrCommit(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	id, payload := transactionCodecCoordinatorPayload(t)
+	payloadDigest := distributedtxn.Digest(sha256.Sum256(payload))
+	controlBytes, _ := TransactionControlResidentBytes(0)
+	payloadBytes, _ := TransactionCoordinatorPayloadResidentBytes(len(payload))
+	control := TransactionControl{
+		ID: id, Role: distributedtxn.ReplicatedRoleCoordinator,
+		State: uint8(distributedtxn.CoordinatorStaging), Revision: 1,
+		PayloadKind:   distributedtxn.ReplicatedPayloadCoordinator,
+		PayloadDigest: payloadDigest, PayloadBytes: uint64(len(payload)), PayloadCount: 1,
+		CoordinatorGroup:              fixture.binding.GroupID,
+		CoordinatorShardIncarnation:   fixture.binding.ShardIncarnation,
+		CoordinatorAllocation:         fixture.binding.AllocationGeneration,
+		MutationDigest:                payloadDigest,
+		CoordinatorParticipantOrdinal: 0,
+		PrepareResultCode:             ResultApplied,
+		FusedPath:                     true,
+		ResidentControlBytes:          controlBytes,
+		ResidentPayloadBytes:          payloadBytes,
+		LastOperation:                 distributedtxn.ReplicatedBeginPrepareCoordinator,
+		LastCommandDigest:             transactionCodecCommandDigest(111),
+		LastResultCode:                ResultApplied,
+		LastAppliedIndex:              2,
+	}
+	controlValue, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an authenticated-but-semantically-impossible durable image. The
+	// checksum is deliberately renewed after removing the immutable vote, so
+	// reopen must reject semantics rather than merely notice torn bytes.
+	controlValue[15] &^= 3 << 4
+	sealRecord(controlValue, transactionControlChecksumDomain)
+	if _, err := OpenTransactionControl(controlValue); !errors.Is(err, ErrTransactionStateCorrupt) {
+		t.Fatalf("zero-vote fused control open error=%v", err)
+	}
+	controlKey, _ := TransactionControlStorageKey(control.Role, id)
+	payloadValue, err := AppendTransactionCoordinatorPayload(
+		nil, id, distributedtxn.ReplicatedPayloadCoordinator, payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadKey, _ := TransactionCoordinatorPayloadStorageKey(id)
+	state := cloneState(fixture.machine.state)
+	state.Applied = 2
+	state.LastTerm = 1
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("zero-vote-fused-coordinator"))
+	state.TransactionControlCount = 1
+	state.ActiveTransactionCount = 1
+	state.TransactionPayloadRows = 1
+	state.TransactionResidentBytes = controlBytes + payloadBytes
+	stateValue, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		for _, row := range []struct{ key, value []byte }{
+			{stateKey, stateValue}, {controlKey[:], controlValue}, {payloadKey[:], payloadValue},
+		} {
+			if putErr := batch.Put(row.key, row.value); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+		Options{TxnLimits: durable.TxnLimits{
+			MaxCollections: 2, MaxDocuments: fixture.user.Limits.MaxDistinctMutations + 4,
+			MaxBytes: 64 << 20,
+		}, MaxSessions: 128, RetryWindow: 8},
+	)
+	if !errors.Is(err, ErrTransactionStateCorrupt) {
+		t.Fatalf("zero-vote fused coordinator reopen error=%v", err)
+	}
+}
