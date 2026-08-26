@@ -20,6 +20,23 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(inline)
+	descriptor, pages := buildManifest(f, 4)
+	manifestCoordinator, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 100, Manifest: descriptor,
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	manifestStart, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
+		Payload: append(manifestCoordinator, pages[0]...),
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(manifestStart)
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		view, openErr := OpenReplicatedCommand(raw)
 		validateErr := ValidateReplicatedCommand(raw)

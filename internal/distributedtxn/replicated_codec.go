@@ -1,6 +1,7 @@
 package distributedtxn
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"hash/crc32"
 	"unicode/utf8"
@@ -9,12 +10,17 @@ import (
 const (
 	replicatedCommandHeaderBytes   = 128
 	replicatedCommandChecksumBytes = 4
+	// ReplicatedManifestCoordinatorRecordBytes is the exact VTCM prefix length
+	// in a manifest-start payload. The canonical VTM1 page zero follows it
+	// immediately in the same replicated command.
+	ReplicatedManifestCoordinatorRecordBytes = manifestCoordinatorHeaderBytes + 4
 
 	// MaxReplicatedCommandBytes is an encoded-byte admission bound. Relation
 	// mutation bytes are carried once by the outer replication command and are
 	// deliberately not part of this transaction control body.
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
-		MaxIntentScopes*8 + ManifestSegmentBytes + replicatedCommandChecksumBytes
+		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
+		ManifestSegmentBytes + replicatedCommandChecksumBytes
 )
 
 var replicatedCommandMagic = [4]byte{'V', 'T', 'R', 'C'}
@@ -72,8 +78,9 @@ type ParticipantStage struct {
 }
 
 // ReplicatedCommand is the construction form of one self-delimiting
-// transaction control body. Payload contains VTC1, VTCM, or VTM1 bytes and is
-// empty for participant staging and transitions.
+// transaction control body. A manifest start contains VTCM immediately
+// followed by VTM1 page zero; later VTM1 pages are separate operations.
+// Payload is empty for participant staging and transitions.
 type ReplicatedCommand struct {
 	Role             ReplicatedRole
 	Operation        ReplicatedOperation
@@ -98,6 +105,46 @@ func (v ReplicatedCommandView) Bytes() []byte { return v.raw[:len(v.raw):len(v.r
 // Command returns a construction form. Payload remains a borrowed,
 // capacity-clamped alias; participant scopes use the decoder scratch.
 func (v ReplicatedCommandView) Command() ReplicatedCommand { return v.ReplicatedCommand }
+
+// OpenReplicatedManifestStart splits and validates the atomic VTCM plus VTM1
+// page-zero payload. Both returned slices are borrowed and capacity-clamped.
+func OpenReplicatedManifestStart(payload []byte) (
+	coordinator []byte,
+	pageZero []byte,
+	err error,
+) {
+	if len(payload) <= ReplicatedManifestCoordinatorRecordBytes {
+		return nil, nil, ErrCorrupt
+	}
+	coordinatorEnd := ReplicatedManifestCoordinatorRecordBytes
+	coordinator = payload[:coordinatorEnd:coordinatorEnd]
+	pageZero = payload[coordinatorEnd:len(payload):len(payload)]
+	record, openErr := OpenManifestCoordinator(coordinator)
+	if openErr != nil || !canonicalManifestSegment(pageZero) ||
+		binary.LittleEndian.Uint32(pageZero[8:12]) != 0 ||
+		binary.LittleEndian.Uint64(pageZero[16:24]) != 0 {
+		return nil, nil, ErrCorrupt
+	}
+	pageCount := uint64(binary.LittleEndian.Uint32(pageZero[12:16]))
+	pageBytes := uint64(len(pageZero))
+	descriptor := record.Manifest
+	if pageCount > descriptor.ParticipantCount || pageBytes > descriptor.EncodedBytes {
+		return nil, nil, ErrCorrupt
+	}
+	if descriptor.SegmentCount == 1 {
+		segmentDigest := Digest(sha256.Sum256(pageZero))
+		chain := appendManifestChain(Digest{}, 0, segmentDigest)
+		if pageCount != descriptor.ParticipantCount || pageBytes != descriptor.EncodedBytes ||
+			finishManifestRoot(chain, ManifestDescriptor{
+				ParticipantCount: pageCount, EncodedBytes: pageBytes, SegmentCount: 1,
+			}) != descriptor.Root {
+			return nil, nil, ErrCorrupt
+		}
+	} else if pageCount >= descriptor.ParticipantCount || pageBytes >= descriptor.EncodedBytes {
+		return nil, nil, ErrCorrupt
+	}
+	return coordinator, pageZero, nil
+}
 
 func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, error) {
 	if err := validateReplicatedCommand(command); err != nil {
@@ -295,7 +342,11 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 			return ErrCorrupt
 		}
 	case ReplicatedPayloadManifestCoordinator:
-		record, err := OpenManifestCoordinator(command.Payload)
+		coordinator, _, err := OpenReplicatedManifestStart(command.Payload)
+		if err != nil {
+			return ErrCorrupt
+		}
+		record, err := OpenManifestCoordinator(coordinator)
 		if err != nil || record.ID != command.ID || record.State != CoordinatorStaging || record.Revision != 1 {
 			return ErrCorrupt
 		}
@@ -303,7 +354,9 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		if len(command.Payload) > ManifestSegmentBytes {
 			return ErrTooLarge
 		}
-		if !canonicalManifestSegment(command.Payload) {
+		if !canonicalManifestSegment(command.Payload) ||
+			binary.LittleEndian.Uint32(command.Payload[8:12]) == 0 ||
+			binary.LittleEndian.Uint64(command.Payload[16:24]) == 0 {
 			return ErrCorrupt
 		}
 	case ReplicatedPayloadParticipantStage:
@@ -337,7 +390,11 @@ func validateReplicatedPayload(kind ReplicatedPayloadKind, id ID, payload []byte
 			return ErrCorrupt
 		}
 	case ReplicatedPayloadManifestCoordinator:
-		record, err := OpenManifestCoordinator(payload)
+		coordinator, _, err := OpenReplicatedManifestStart(payload)
+		if err != nil {
+			return ErrCorrupt
+		}
+		record, err := OpenManifestCoordinator(coordinator)
 		if err != nil || record.ID != id || record.State != CoordinatorStaging || record.Revision != 1 {
 			return ErrCorrupt
 		}
@@ -345,7 +402,9 @@ func validateReplicatedPayload(kind ReplicatedPayloadKind, id ID, payload []byte
 		if len(payload) > ManifestSegmentBytes {
 			return ErrTooLarge
 		}
-		if !canonicalManifestSegment(payload) {
+		if !canonicalManifestSegment(payload) ||
+			binary.LittleEndian.Uint32(payload[8:12]) == 0 ||
+			binary.LittleEndian.Uint64(payload[16:24]) == 0 {
 			return ErrCorrupt
 		}
 	default:

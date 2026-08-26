@@ -80,7 +80,7 @@ func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
 
 func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 	inline := replicatedTestCoordinator(t)
-	descriptor, pages := buildManifest(t, 4)
+	descriptor, pages := buildManifest(t, 2048)
 	manifestCoordinator, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 9, RecoveryDeadline: 100, Manifest: descriptor,
@@ -88,13 +88,14 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestStart := append(bytes.Clone(manifestCoordinator), pages[0]...)
 	cases := []ReplicatedCommand{
 		{Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
 			ID: testID(), PayloadKind: ReplicatedPayloadCoordinator, Payload: inline},
 		{Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
-			ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator, Payload: manifestCoordinator},
+			ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator, Payload: manifestStart},
 		{Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
-			ID: testID(), ExpectedRevision: 1, PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[0]},
+			ID: testID(), ExpectedRevision: 1, PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1]},
 		{Role: ReplicatedRoleCoordinator, Operation: ReplicatedCommitCoordinator,
 			ID: testID(), ExpectedRevision: 2, PayloadKind: ReplicatedPayloadNone},
 		{Role: ReplicatedRoleParticipant, Operation: ReplicatedPrepareParticipant,
@@ -114,6 +115,15 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 		}
 		if !bytes.Equal(view.Payload, command.Payload) || !bytes.Equal(view.Bytes(), encoded) {
 			t.Fatalf("case %d did not borrow exact bytes", i)
+		}
+		if command.Operation == ReplicatedStageManifestCoordinator {
+			coordinator, pageZero, splitErr := OpenReplicatedManifestStart(view.Payload)
+			if splitErr != nil || !bytes.Equal(coordinator, manifestCoordinator) ||
+				!bytes.Equal(pageZero, pages[0]) ||
+				&coordinator[0] != &view.Payload[0] ||
+				&pageZero[0] != &view.Payload[ReplicatedManifestCoordinatorRecordBytes] {
+				t.Fatalf("manifest-start borrowed split: %v", splitErr)
+			}
 		}
 		reencoded, reencodeErr := AppendReplicatedCommand(nil, view.Command())
 		if reencodeErr != nil || !bytes.Equal(reencoded, encoded) {
@@ -167,6 +177,35 @@ func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 	if _, appendErr := AppendReplicatedCommand(nil, wrong); appendErr == nil {
 		t.Fatal("accepted overlapping participant scopes")
 	}
+
+	descriptor, pages := buildManifest(t, 2048)
+	coordinator, appendErr := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 100, Manifest: descriptor,
+	})
+	if appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	manifestCommand := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
+	}
+	manifestCommand.Payload = coordinator
+	if _, appendErr = AppendReplicatedCommand(nil, manifestCommand); appendErr == nil {
+		t.Fatal("accepted VTCM without atomic page zero")
+	}
+	manifestCommand.Payload = append(bytes.Clone(coordinator), pages[1]...)
+	if _, appendErr = AppendReplicatedCommand(nil, manifestCommand); appendErr == nil {
+		t.Fatal("accepted later page as atomic page zero")
+	}
+	later := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
+		ID: testID(), ExpectedRevision: 1,
+		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[0],
+	}
+	if _, appendErr = AppendReplicatedCommand(nil, later); appendErr == nil {
+		t.Fatal("accepted page zero as a later manifest segment")
+	}
 }
 
 func TestReplicatedCommandStrictBounds(t *testing.T) {
@@ -204,13 +243,13 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 		t.Fatalf("participant append allocs = %v", got)
 	}
 
-	_, pages := buildManifest(t, 4)
+	descriptor, pages := buildManifest(t, 2048)
 	segment := ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
 		ID: testID(), ExpectedRevision: 1,
-		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[0],
+		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1],
 	}
-	segmentDst := make([]byte, 0, replicatedCommandHeaderBytes+len(pages[0])+4)
+	segmentDst := make([]byte, 0, replicatedCommandHeaderBytes+len(pages[1])+4)
 	if got := testing.AllocsPerRun(1000, func() {
 		var err error
 		segmentDst, err = AppendReplicatedCommand(segmentDst[:0], segment)
@@ -219,6 +258,29 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 		}
 	}); got != 0 {
 		t.Fatalf("manifest-segment append allocs = %v", got)
+	}
+	manifestCoordinator, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 100,
+		Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPayload := append(manifestCoordinator, pages[0]...)
+	manifestStart := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator, Payload: manifestPayload,
+	}
+	manifestDst := make([]byte, 0, replicatedCommandHeaderBytes+len(manifestPayload)+4)
+	if got := testing.AllocsPerRun(1000, func() {
+		var appendErr error
+		manifestDst, appendErr = AppendReplicatedCommand(manifestDst[:0], manifestStart)
+		if appendErr != nil {
+			panic(appendErr)
+		}
+	}); got != 0 {
+		t.Fatalf("manifest-start append allocs = %v", got)
 	}
 }
 
@@ -235,17 +297,33 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, pages := buildManifest(t, 4)
+	descriptor, pages := buildManifest(t, 2048)
 	segment, err := AppendReplicatedCommand(nil, ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestSegment,
 		ID: testID(), ExpectedRevision: 1,
-		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[0],
+		PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestCoordinator, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: testID(), State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 100, Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestStart, err := AppendReplicatedCommand(nil, ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageManifestCoordinator,
+		ID: testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
+		Payload: append(manifestCoordinator, pages[0]...),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for name, raw := range map[string][]byte{
-		"participant": participant, "inline": inline, "segment": segment,
+		"participant": participant, "inline": inline, "manifest-start": manifestStart,
+		"segment": segment,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := testing.AllocsPerRun(1000, func() {
