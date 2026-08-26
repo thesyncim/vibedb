@@ -591,6 +591,9 @@ func openDatabaseWithShardStorePolicy(
 	if err := d.openCatalogCollectionsWithTransactionsLocked(); err != nil {
 		return nil, err
 	}
+	if err := addReplicatedSchemaStageProtection(d.dataDir, paths); err != nil {
+		return nil, fmt.Errorf("vibedb: recover prepared schema target: %w", err)
+	}
 	// Namespace cleanup follows complete transaction membership validation and
 	// recovery. Before that proof, a catalog-omitted path may still be an
 	// unretired decision participant and must not be deleted as an orphan.

@@ -1,10 +1,13 @@
 package driver
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T) {
-	_, database, identity := bindReplicatedApplyTestRoot(t, "schema-target-proof")
-	claim, _, err := database.OpenReplicatedApply(
+	path, database, identity := bindReplicatedApplyTestRoot(t, "schema-target-proof")
+	claim, applyIdentity, err := database.OpenReplicatedApply(
 		identity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
 	)
 	if err != nil {
@@ -82,6 +85,22 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		t.Fatal(err)
 	}
 	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplicatedShardStoreWithApply(path, identity, applyIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, found, err := readReplicatedSchemaStageMarker(path + ".tables")
+	if err != nil || !found || marker.membership != prepared.Membership ||
+		marker.catalogDigest != prepared.Catalog.Digest ||
+		marker.relationWitness != prepared.Relations.Witness {
+		t.Fatalf("reopened stage marker = %+v, found=%v err=%v", marker, found, err)
+	}
+	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {
+		t.Fatalf("reopen removed prepared target: %v", err)
+	}
+	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

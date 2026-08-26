@@ -82,7 +82,17 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 		}
 		proof.SourceApplied = expectedApplied
 		proof.Membership = witness
-		return nil
+		storages, err := schemaStageStorageIDs(target)
+		if err != nil {
+			return err
+		}
+		return writeReplicatedSchemaStageMarker(a.database.dataDir, replicatedSchemaStageMarker{
+			schemaGeneration: target.RelationSchemaGeneration,
+			sourceApplied:    expectedApplied, membership: witness,
+			catalogDigest:   proof.Catalog.Digest,
+			relationWitness: proof.Relations.Witness,
+			authorization:   authorization, storages: storages,
+		})
 	})
 }
 
