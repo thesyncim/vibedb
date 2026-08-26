@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -141,5 +142,34 @@ func TestReplicatedIssuerGrantResponseLossRecoversOnAnotherGateway(t *testing.T)
 	grant, err := replacement.OpenIssuerLaneGrant(t.Context(), authority.authority, tenants, open)
 	if err != nil || !validReplicatedIssuerGrant(grant) {
 		t.Fatalf("replacement grant=%+v err=%v", grant, err)
+	}
+}
+
+func BenchmarkReplicatedIssuerGrantWarmValidation(b *testing.B) {
+	open := replicatedIssuerOpenFixture()
+	tenants := replicatedIssuerTenantFixture()
+	principal := requestledger.PrincipalID{0x72}
+	grant, err := replicatedIssuerGrantFor(open, requestledger.ScopeAuthenticated, principal, tenants.tenant)
+	if err != nil {
+		b.Fatal(err)
+	}
+	authority := &ReplicatedCatalogAuthority{
+		issuerGrants: newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
+	}
+	authority.issuerGrants.put(grant)
+	reference := ReplicatedIssuerReference{Installation: grant.Installation, Epoch: grant.Epoch,
+		LaneOrdinal: grant.LaneOrdinal, GrantDigest: grant.GrantDigest}
+	authenticated := serviceauthz.Authority{Node: rafttransport.NodeID(principal), Generation: 1}
+	request := requestledger.RequestID{0x74}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		key, validateErr := authority.ValidateIssuerRequestKey(
+			ctx, authenticated, tenants, reference, request, 1,
+		)
+		if validateErr != nil || key.IssuerLane != grant.Lane {
+			b.Fatalf("key=%+v err=%v", key, validateErr)
+		}
 	}
 }
