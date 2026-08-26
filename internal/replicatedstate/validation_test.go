@@ -549,16 +549,22 @@ func TestCompletionResultGrammar(t *testing.T) {
 		ResultSessionOpened, ResultSessionRenewed, ResultSessionRevoked,
 		ResultUnknownRelation, ResultIndexConflict, ResultIntentBusy,
 	} {
+		var result []byte
+		if code == ResultApplied {
+			result, _ = AppendMutationCompletionResult(nil, code, 0)
+		}
 		if err := fixture.machine.validateCompletionResult(replication.CompletionView{
-			ResultFormat: ResultFormatMutation, ResultCode: code,
+			ResultFormat: ResultFormatMutation, ResultCode: code, InlineResult: result,
 		}); err != nil {
 			t.Fatalf("rejected result code %d: %v", code, err)
 		}
 	}
 	for _, completion := range []replication.CompletionView{
-		{ResultFormat: ResultFormatMutation + 1, ResultCode: ResultApplied},
+		{ResultFormat: ResultFormatMutation + 1, ResultCode: ResultApplied, InlineResult: make([]byte, 8)},
 		{ResultFormat: ResultFormatMutation, ResultCode: 0},
 		{ResultFormat: ResultFormatMutation, ResultCode: ResultIntentBusy + 1},
+		{ResultFormat: ResultFormatMutation, ResultCode: ResultApplied},
+		{ResultFormat: ResultFormatMutation, ResultCode: ResultIndexConflict, InlineResult: make([]byte, 8)},
 	} {
 		if err := fixture.machine.validateCompletionResult(completion); !errors.Is(err, ErrCompletionCorrupt) {
 			t.Fatalf("accepted invalid completion grammar %+v: %v", completion, err)

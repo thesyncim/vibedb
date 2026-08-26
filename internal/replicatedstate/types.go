@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	// ResultFormatMutation is the fixed, empty-payload result grammar used by
-	// this low-level unconditional mutation adapter. It includes every closed
-	// result below, including the deterministic wrong-shard refusal.
+	// ResultFormatMutation is the fixed affected-row result grammar used by this
+	// low-level mutation adapter. ResultApplied carries one canonical eight-byte
+	// nonnegative count; every refusal and session-lifecycle result is empty.
 	ResultFormatMutation uint16 = 1
 
 	// Zero and unknown result codes are invalid.

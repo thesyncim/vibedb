@@ -468,7 +468,7 @@ func transactionOrchestratorRoutes(
 }
 
 func TestReplicatedTransactionOrchestratorExecutesExactFusedSchedule(t *testing.T) {
-	for _, count := range []int{2, 65, 4097} {
+	for _, count := range []int{1, 2, 65, 4097} {
 		t.Run(fmt.Sprintf("participants-%d", count), func(t *testing.T) {
 			participants, client := transactionOrchestratorRoutes(t, count)
 			executor, err := NewReplicatedExecutorWithOptions(
@@ -535,6 +535,43 @@ func TestReplicatedTransactionOrchestratorExecutesExactFusedSchedule(t *testing.
 					critical, retire, manifestAppend, len(seenPrepare), len(seenFinish))
 			}
 		})
+	}
+}
+
+func TestReplicatedTransactionSingletonRecoveryRetriesUnknownCommit(t *testing.T) {
+	participants, client := transactionOrchestratorRoutes(t, 1)
+	client.loseOperation = distributedtxn.ReplicatedCommitCoordinator
+	executor, err := NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+		MaxAttempts: 1, AttemptTimeout: time.Second, LeaderHintCapacity: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := NewReplicatedTransactionOrchestrator(
+		ReplicatedTransactionOrchestratorOptions{
+			Executor: executor, Tenant: []byte("tenant"), MaxConcurrency: 1,
+			MaxInFlightBytes: 64 << 20,
+			MaxMutations:     1, MaxMutationBytes: 64, RecoveryTimeout: time.Minute,
+			IDSource: bytes.NewReader(bytes.Repeat([]byte{0x17}, 16)),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, executeErr := orchestrator.Execute(context.Background(), 7, participants)
+	var transactionErr *ReplicatedTransactionError
+	if !errors.As(executeErr, &transactionErr) || transactionErr.Recovery == nil ||
+		transactionErr.Committed || len(transactionErr.Recovery.Participants) != 1 ||
+		len(transactionErr.Recovery.Pending) != 1 {
+		t.Fatalf("execute error=%T %+v", executeErr, transactionErr)
+	}
+	result, err := orchestrator.Recover(context.Background(), transactionErr.Recovery)
+	if err != nil || !result.Committed || result.AffectedRows != 1 || result.Recovery != nil {
+		t.Fatalf("recovery result=%+v err=%v", result, err)
+	}
+	if len(transactionErr.Recovery.Pending) != 0 {
+		t.Fatalf("settled recovery retained %d pending operations",
+			len(transactionErr.Recovery.Pending))
 	}
 }
 

@@ -616,7 +616,7 @@ func replicatedTransactionOwnedLogicalBytes(
 	participants []ReplicatedTransactionParticipant,
 ) (planBytes, handleBytes uint64, err error) {
 	count := uint64(len(participants))
-	if count < 2 || count > maxReplicatedTransactionOrdinal {
+	if count == 0 || count > maxReplicatedTransactionOrdinal {
 		return 0, 0, ErrReplicatedTransaction
 	}
 	planBytes, err = checkedReplicatedTransactionLogicalProduct(
@@ -800,16 +800,18 @@ type replicatedTransactionWorkerScratch struct {
 	reusable bool
 }
 
-// Execute commits one multi-shard native transaction through RF3. Every
-// proposal uses ReplicatedExecutor.Propose; the method has no legacy transport
-// or journal fallback.
+// Execute commits one native transaction through one or more RF3 groups. A
+// singleton group preserves atomic multi-relation/multi-statement semantics;
+// larger plans add cross-group atomicity. Every proposal uses
+// ReplicatedExecutor.Propose; the method has no legacy transport or journal
+// fallback.
 func (orchestrator *ReplicatedTransactionOrchestrator) Execute(
 	ctx context.Context,
 	catalogGeneration uint64,
 	participants []ReplicatedTransactionParticipant,
 ) (result ReplicatedTransactionResult, resultErr error) {
 	if orchestrator == nil || orchestrator.executor == nil || ctx == nil ||
-		catalogGeneration == 0 || len(participants) < 2 ||
+		catalogGeneration == 0 || len(participants) == 0 ||
 		uint64(len(participants)) > maxReplicatedTransactionOrdinal {
 		return ReplicatedTransactionResult{}, ErrReplicatedTransaction
 	}

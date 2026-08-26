@@ -448,6 +448,10 @@ func TestCompactSessionSlotReconstructsCanonicalOriginalCompletion(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	result, err := AppendMutationCompletionResult(nil, ResultApplied, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
 		ClusterID:              view.ClusterID,
 		ClusterIncarnation:     view.ClusterIncarnation,
@@ -472,9 +476,11 @@ func TestCompactSessionSlotReconstructsCanonicalOriginalCompletion(t *testing.T)
 		ResultCode:             ResultApplied,
 		ResultFormat:           ResultFormatMutation,
 		Storage:                replication.CompletionInline,
+		ResultLength:           uint64(len(result)),
 		ResultDigest: replication.CompletionResultDigest(
-			ResultApplied, ResultFormatMutation, nil,
+			ResultApplied, ResultFormatMutation, result,
 		),
+		InlineResult: result,
 	})
 	if err != nil {
 		t.Fatal(err)

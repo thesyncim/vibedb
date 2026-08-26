@@ -14,6 +14,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -33,6 +34,11 @@ var (
 	// ErrTransactionByteLimit reports an atomic write whose canonical mutation
 	// bytes exceed its operational profile before any participant is staged.
 	ErrTransactionByteLimit = errors.New("gateway: distributed transaction exceeds the byte bound")
+	// ErrBatchRequestIdentityUnsupported prevents a caller request ID from being
+	// silently ignored by the non-replicated transaction path.
+	ErrBatchRequestIdentityUnsupported = errors.New(
+		"gateway: request identity requires a replicated transaction batch",
+	)
 	// ErrTransactionCommitted reports a durably committed decision whose apply
 	// or release cleanup did not finish before this request returned.
 	ErrTransactionCommitted = errors.New("gateway: distributed transaction is committed and requires recovery")
@@ -85,11 +91,31 @@ type transactionParticipant struct {
 // I/O. The ordinary Exec path remains the lower-latency single-statement fast
 // lane; a one-statement batch delegates to it.
 func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, error) {
-	if len(queries) == 0 {
-		return nil, ErrBatchEmpty
-	}
 	if len(queries) == 1 {
 		return e.Exec(ctx, queries[0])
+	}
+	return e.execBatch(ctx, replication.ID128{}, queries)
+}
+
+// ExecBatchRequest executes the same atomic batch while binding an optional
+// fixed caller identity to the RF3 request registry. Static batches accept a
+// zero identity and fail closed on a nonzero identity; an RF3 batch requires a
+// nonzero identity when the registry is configured by the shipped gateway.
+func (e *Executor) ExecBatchRequest(
+	ctx context.Context,
+	requestID replication.ID128,
+	queries []Query,
+) (*Result, error) {
+	return e.execBatch(ctx, requestID, queries)
+}
+
+func (e *Executor) execBatch(
+	ctx context.Context,
+	requestID replication.ID128,
+	queries []Query,
+) (*Result, error) {
+	if len(queries) == 0 {
+		return nil, ErrBatchEmpty
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -109,9 +135,47 @@ func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, err
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
+	if requestID != (replication.ID128{}) &&
+		(e.replicatedTransactions == nil || e.replicatedTransactionRequests == nil) {
+		return nil, ErrBatchRequestIdentityUnsupported
+	}
+	var requestDigest replication.Digest
+	if e.replicatedTransactionRequests != nil && requestID != (replication.ID128{}) {
+		requestDigest = replicatedSQLTransactionRequestDigest(queries)
+		outcome, found, replayErr := e.replicatedTransactionRequests.Replay(
+			opctx, requestID, requestDigest,
+		)
+		if replayErr != nil || found {
+			result := e.replicatedSQLTransactionResult(outcome)
+			if replayErr != nil {
+				return result, replayErr
+			}
+			if result == nil || !outcome.Committed || outcome.Recovery != nil {
+				return result, ErrReplicatedTransaction
+			}
+			return result, nil
+		}
+	}
 	snapshot, lease, err := e.pin(opctx, 0, 0)
 	if err != nil {
 		return nil, err
+	}
+	if e.replicatedTransactions != nil {
+		result, handled, replicatedErr := e.executeReplicatedSQLTransaction(
+			opctx, snapshot, requestID, requestDigest, queries, profile,
+		)
+		if replicatedErr != nil || handled {
+			lease.release()
+			return result, replicatedErr
+		}
+	}
+	if requestID != (replication.ID128{}) {
+		lease.release()
+		return nil, ErrBatchRequestIdentityUnsupported
+	}
+	if len(queries) == 1 {
+		lease.release()
+		return e.Exec(opctx, queries[0])
 	}
 	defer lease.release()
 	participants, err := e.planTransaction(opctx, snapshot, queries, profile)

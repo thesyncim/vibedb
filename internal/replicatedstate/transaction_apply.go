@@ -1016,7 +1016,7 @@ func (m *Machine) planParticipantStageWithVote(
 	resultCode := uint32(ResultApplied)
 	state, revision := distributedtxn.ParticipantStaged, uint64(1)
 	if prepare {
-		_, _, _, code, err := m.planStoredTransactionMutations(
+		_, _, _, _, code, err := m.planStoredTransactionMutations(
 			command, payloads, plan.command.dataChainDigest, relationSnapshots,
 		)
 		if err != nil {
@@ -1129,7 +1129,7 @@ func (m *Machine) planParticipantTransition(
 		if err != nil {
 			return transactionCommandPlan{}, err
 		}
-		changes, spans, digest, code, err := m.planStoredTransactionMutations(
+		changes, spans, digest, affectedRows, code, err := m.planStoredTransactionMutations(
 			command, batches, plan.command.dataChainDigest, relationSnapshots,
 		)
 		if err != nil {
@@ -1142,7 +1142,7 @@ func (m *Machine) planParticipantTransition(
 		}
 		plan.command.changes, plan.command.relations = changes, spans
 		plan.command.dataChainDigest = digest
-		existing.AffectedRows, existing.AffectedRowsValid = transactionBaseAffectedRows(batches), true
+		existing.AffectedRows, existing.AffectedRowsValid = affectedRows, true
 		finishBatches = batches
 	}
 	if next == distributedtxn.ParticipantPrepared {
@@ -1155,7 +1155,7 @@ func (m *Machine) planParticipantTransition(
 		if err := validateTransactionIntentImage(snapshot, control.ID, batches); err != nil {
 			return transactionCommandPlan{}, err
 		}
-		_, _, _, code, err := m.planStoredTransactionMutations(
+		_, _, _, _, code, err := m.planStoredTransactionMutations(
 			command, batches, plan.command.dataChainDigest, relationSnapshots,
 		)
 		if err != nil {
@@ -1272,26 +1272,35 @@ func (m *Machine) planStoredTransactionMutations(
 	rows []TransactionRelationPayloadView,
 	dataChain [sha256.Size]byte,
 	snapshots relationPointSnapshots,
-) ([]finalMutation, []plannedRelationChanges, [sha256.Size]byte, uint32, error) {
+) ([]finalMutation, []plannedRelationChanges, [sha256.Size]byte, int64, uint32, error) {
 	if snapshots.count != uint16(len(m.relations)) {
-		return nil, nil, dataChain, 0, ErrInconsistentSnapshot
+		return nil, nil, dataChain, 0, 0, ErrInconsistentSnapshot
 	}
 	clear(m.bundlePlan)
 	m.bundlePlan = m.bundlePlan[:0]
 	clear(m.bundleRelations)
 	m.bundleRelations = m.bundleRelations[:0]
+	var affectedRows int64
 	for _, row := range rows {
 		batch := row.Batch
 		ordinal := int(batch.Relation) - 1
 		if ordinal < 0 || ordinal >= len(m.relations) {
-			return nil, nil, dataChain, ResultUnknownRelation, nil
+			return nil, nil, dataChain, 0, ResultUnknownRelation, nil
 		}
-		changes, code, err := m.planMutations(&m.relations[ordinal], batch, snapshots.values[ordinal], nil)
+		changes, batchAffectedRows, code, err := m.planMutations(
+			&m.relations[ordinal], batch, snapshots.values[ordinal], nil,
+		)
 		if err != nil {
-			return nil, nil, dataChain, 0, err
+			return nil, nil, dataChain, 0, 0, err
 		}
 		if code != ResultApplied {
-			return nil, nil, dataChain, code, nil
+			return nil, nil, dataChain, 0, code, nil
+		}
+		if m.relations[ordinal].kind == RelationJSON {
+			affectedRows, err = addMutationAffectedRows(affectedRows, batchAffectedRows)
+			if err != nil {
+				return nil, nil, dataChain, 0, 0, err
+			}
 		}
 		if len(changes) == 0 {
 			continue
@@ -1306,22 +1315,10 @@ func (m *Machine) planStoredTransactionMutations(
 			m.bundlePlan[start:], nil,
 		)
 		if err != nil {
-			return nil, nil, dataChain, 0, err
+			return nil, nil, dataChain, 0, 0, err
 		}
 	}
-	return m.bundlePlan, m.bundleRelations, dataChain, ResultApplied, nil
-}
-
-func transactionBaseAffectedRows(rows []TransactionRelationPayloadView) int64 {
-	for i := range rows {
-		if rows[i].Relation == 1 {
-			return int64(rows[i].Count)
-		}
-		if rows[i].Relation > 1 {
-			break
-		}
-	}
-	return 0
+	return m.bundlePlan, m.bundleRelations, dataChain, affectedRows, ResultApplied, nil
 }
 
 func validateTransactionIntentImage(

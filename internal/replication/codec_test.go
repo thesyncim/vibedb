@@ -391,6 +391,8 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 				Kind: MutationPutAbsentOrEqual, Key: []byte("unique-key"),
 				Value: []byte(`["document\u002d1",1e0]`),
 			},
+			{Kind: MutationPutAbsent, Key: []byte("insert-key"), Value: []byte(`{"v":1}`)},
+			{Kind: MutationPutPresent, Key: []byte("update-key"), Value: []byte(`{"v":2}`)},
 			{
 				Kind: MutationPutDigestEqual, Key: []byte("catalog-head"),
 				Value:               []byte(`{"generation":2}`),
@@ -432,6 +434,11 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 				if len(mutation.Compare) != 0 || mutation.ExpectedValueLength != 0 ||
 					mutation.ExpectedValueDigest != (Digest{}) {
 					t.Fatalf("put-absent compare fields = %+v", mutation)
+				}
+			case MutationPutAbsent, MutationPutPresent:
+				if len(mutation.Value) == 0 || len(mutation.Compare) != 0 ||
+					mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (Digest{}) {
+					t.Fatalf("strict conditional put fields = %+v", mutation)
 				}
 			case MutationDeleteDigestEqual:
 				if len(mutation.Value) != 0 || len(mutation.Compare) != MutationDigestCompareBytes ||
@@ -1031,6 +1038,16 @@ func TestCommandEncodeRejectionsLeaveDestinationUnchanged(t *testing.T) {
 		{"put_absent_delete_compare", func(c *Command) {
 			m := &c.Batches[0].Mutations[0]
 			m.Kind = MutationPutAbsentOrEqual
+			m.ExpectedValueLength = 1
+			m.ExpectedValueDigest = testDigest(1)
+		}, ErrEnvelopeSemantic},
+		{"strict_insert_empty", func(c *Command) {
+			c.Batches[0].Mutations[0].Kind = MutationPutAbsent
+			c.Batches[0].Mutations[0].Value = nil
+		}, ErrEnvelopeSemantic},
+		{"conditional_update_compare", func(c *Command) {
+			m := &c.Batches[0].Mutations[0]
+			m.Kind = MutationPutPresent
 			m.ExpectedValueLength = 1
 			m.ExpectedValueDigest = testDigest(1)
 		}, ErrEnvelopeSemantic},

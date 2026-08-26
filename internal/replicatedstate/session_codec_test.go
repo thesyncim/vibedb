@@ -102,6 +102,7 @@ func sessionCodecSlot(t testing.TB) SessionSlot {
 		Fingerprint:            fingerprint,
 		LogicalCommandDigest:   sha256.Sum256([]byte("stable-logical-command")),
 		ResultCode:             ResultApplied,
+		AffectedRows:           3,
 		ReplicaSetVersion:      3,
 		ActivePolicyGeneration: 4,
 		ProtectionEpoch:        5,
@@ -186,7 +187,7 @@ func TestSessionSlotRoundTripBorrowedAndAllocationFree(t *testing.T) {
 		view.AppliedSequence != slot.AppliedSequence ||
 		view.Fingerprint != slot.Fingerprint ||
 		view.LogicalCommandDigest != slot.LogicalCommandDigest ||
-		view.ResultCode != slot.ResultCode ||
+		view.ResultCode != slot.ResultCode || view.AffectedRows != slot.AffectedRows ||
 		view.ReplicaSetVersion != slot.ReplicaSetVersion ||
 		view.ActivePolicyGeneration != slot.ActivePolicyGeneration ||
 		view.ProtectionEpoch != slot.ProtectionEpoch ||
@@ -368,7 +369,12 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 		"protection":       func(candidate []byte) { clear(candidate[160:168]) },
 		"routing":          func(candidate []byte) { clear(candidate[168:176]) },
 		"route-generation": func(candidate []byte) { clear(candidate[176:184]) },
-		"tail-reserved":    func(candidate []byte) { candidate[184] = 1 },
+		"negative-affected-rows": func(candidate []byte) {
+			binary.LittleEndian.PutUint64(candidate[184:192], ^uint64(0))
+		},
+		"oversized-affected-rows": func(candidate []byte) {
+			binary.LittleEndian.PutUint64(candidate[184:192], uint64(MaxMutationAffectedRows+1))
+		},
 		"total-length": func(candidate []byte) {
 			binary.LittleEndian.PutUint32(candidate[12:16], uint32(len(candidate)+1))
 		},
@@ -389,6 +395,26 @@ func TestSessionSlotRejectsTruncationCorruptionAndInvalidInput(t *testing.T) {
 	got, err := AppendSessionSlot(prefix, invalid)
 	if !errors.Is(err, ErrSessionCorrupt) || !bytes.Equal(got, prefix) {
 		t.Fatalf("invalid append = %q,%v", got, err)
+	}
+	invalid = slot
+	invalid.ResultCode = ResultIndexConflict
+	if _, err := AppendSessionSlot(nil, invalid); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("refusal with affected rows = %v, want ErrSessionCorrupt", err)
+	}
+	maximum := slot
+	maximum.AffectedRows = MaxMutationAffectedRows
+	encoded, err = AppendSessionSlot(nil, maximum)
+	if err != nil {
+		t.Fatalf("maximum affected rows append: %v", err)
+	}
+	opened, err := OpenSessionSlot(encoded)
+	if err != nil || opened.AffectedRows != MaxMutationAffectedRows {
+		t.Fatalf("maximum affected rows open=%d err=%v", opened.AffectedRows, err)
+	}
+	invalid = slot
+	invalid.AffectedRows = MaxMutationAffectedRows + 1
+	if _, err := AppendSessionSlot(nil, invalid); !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("oversized affected rows = %v, want ErrSessionCorrupt", err)
 	}
 }
 

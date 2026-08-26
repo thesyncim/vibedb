@@ -24,7 +24,7 @@ func RenderMarkdown() []byte {
 	out.WriteString("1. Change `internal/featurestate/manifest.go` and cite production code or an executable test.\n")
 	out.WriteString("2. Run `go generate ./internal/featurestate`.\n")
 	out.WriteString("3. Run `go test ./internal/featurestate`. The test rejects stale output, invalid state transitions, duplicate rows, and missing evidence files.\n")
-	out.WriteString("\nThe embedded capability matrix remains in [capabilities.md](capabilities.md). Operational instructions for the current static-shard commands remain in [operations/distributed.md](operations/distributed.md).\n")
+	out.WriteString("\nThe embedded capability matrix remains in [capabilities.md](capabilities.md). Operational instructions for the current distributed commands remain in [operations/distributed.md](operations/distributed.md).\n")
 	return out.Bytes()
 }
 

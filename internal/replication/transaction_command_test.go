@@ -297,6 +297,57 @@ func TestTransactionMutationDigestBindsExactCanonicalRelationBytes(t *testing.T)
 	}
 }
 
+func TestStrictConditionalMutationKindsAreCanonicalAndDigestBound(t *testing.T) {
+	if MutationPutAbsent != 6 || MutationPutPresent != 7 {
+		t.Fatalf("strict conditional mutation codes drifted: %d/%d", MutationPutAbsent, MutationPutPresent)
+	}
+	base := testCommand()
+	base.Batches[0].Mutations = []Mutation{{
+		Kind: MutationPutAbsent, Key: []byte("key"), Value: []byte("value"),
+	}}
+	insertDigest, err := TransactionMutationDigest(base.Batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := encodeCommand(t, base)
+	view, err := OpenCommand(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relations := view.RelationBatches()
+	if !relations.Next() {
+		t.Fatal("missing strict insert relation")
+	}
+	mutations := relations.Batch().Mutations()
+	if !mutations.Next() {
+		t.Fatal("missing strict insert mutation")
+	}
+	opened := mutations.Mutation()
+	if opened.Kind != MutationPutAbsent || !bytes.Equal(opened.Key, []byte("key")) ||
+		!bytes.Equal(opened.Value, []byte("value")) || len(opened.Compare) != 0 {
+		t.Fatalf("strict insert view = %+v", opened)
+	}
+
+	base.Batches[0].Mutations[0].Kind = MutationPutPresent
+	updateDigest, err := TransactionMutationDigest(base.Batches)
+	if err != nil || updateDigest == insertDigest {
+		t.Fatalf("conditional update digest=%x insert=%x err=%v", updateDigest, insertDigest, err)
+	}
+	reencoded := encodeCommand(t, base)
+	update, err := OpenCommand(reencoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateRelations := update.RelationBatches()
+	updateRelations.Next()
+	updateMutations := updateRelations.Batch().Mutations()
+	updateMutations.Next()
+	if got := updateMutations.Mutation(); got.Kind != MutationPutPresent ||
+		!bytes.Equal(got.Value, []byte("value")) || len(got.Compare) != 0 {
+		t.Fatalf("conditional update view = %+v", got)
+	}
+}
+
 func TestTransactionClientIdentityIsCanonical(t *testing.T) {
 	participantID := transactionControlID(0xf1)
 	prepare := distributedtxn.ReplicatedCommand{

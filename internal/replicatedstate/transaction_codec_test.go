@@ -607,6 +607,8 @@ func TestTransactionNativeMutationRoundTripCanonicalKindsAndAlias(t *testing.T) 
 		{Kind: replication.MutationPutAbsentOrEqual, Key: []byte("c"), Value: []byte("2")},
 		{Kind: replication.MutationDeleteDigestEqual, Key: []byte("d"), ExpectedValueLength: 1, ExpectedValueDigest: prior},
 		{Kind: replication.MutationPutDigestEqual, Key: []byte("e"), Value: []byte("3"), ExpectedValueLength: 1, ExpectedValueDigest: prior},
+		{Kind: replication.MutationPutAbsent, Key: []byte("f"), Value: []byte("4")},
+		{Kind: replication.MutationPutPresent, Key: []byte("g"), Value: []byte("5")},
 	} {
 		encoded, err := AppendTransactionNativeMutation(nil, id, 2, uint32(ordinal), mutation)
 		if err != nil {

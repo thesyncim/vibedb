@@ -38,6 +38,7 @@ type commandPlan struct {
 	relations       []plannedRelationChanges
 	dataChainDigest [32]byte
 	resultCode      uint32
+	affectedRows    int64
 	refusal         error
 	writeSession    bool
 	writeAuthority  bool
@@ -1128,7 +1129,7 @@ func (m *Machine) planBundleCommand(
 				break
 			}
 			relation := &m.relations[ordinal]
-			changes, code, planErr := m.planMutations(
+			changes, affectedRows, code, planErr := m.planMutations(
 				relation, batch, relationSnapshots.values[ordinal], scratch,
 			)
 			if planErr != nil {
@@ -1137,6 +1138,15 @@ func (m *Machine) planBundleCommand(
 			if code != ResultApplied {
 				plan.resultCode = code
 				break
+			}
+			if relation.kind == RelationJSON {
+				nextAffectedRows, affectedErr := addMutationAffectedRows(
+					plan.affectedRows, affectedRows,
+				)
+				if affectedErr != nil {
+					return commandPlan{}, affectedErr
+				}
+				plan.affectedRows = nextAffectedRows
 			}
 			if len(changes) == 0 {
 				continue
@@ -1167,6 +1177,7 @@ func (m *Machine) planBundleCommand(
 			clear(m.bundleRelations)
 			m.bundleRelations = m.bundleRelations[:0]
 			plan.dataChainDigest = state.DataChainDigest
+			plan.affectedRows = 0
 		}
 	}
 
@@ -1201,6 +1212,7 @@ func (m *Machine) planBundleCommand(
 		Fingerprint:            command.Fingerprint,
 		LogicalCommandDigest:   logicalDigest,
 		ResultCode:             plan.resultCode,
+		AffectedRows:           plan.affectedRows,
 		ReplicaSetVersion:      command.ReplicaSetVersion,
 		ActivePolicyGeneration: command.ActivePolicyGeneration,
 		ProtectionEpoch:        command.ProtectionEpoch,
@@ -1514,9 +1526,9 @@ func (m *Machine) planMutations(
 	batch replication.RelationBatchView,
 	snapshot pointSnapshot,
 	scratch *commandPlanScratch,
-) ([]finalMutation, uint32, error) {
+) ([]finalMutation, int64, uint32, error) {
 	if relation == nil || relation.target.Collection == nil {
-		return nil, 0, ErrInvalidCollection
+		return nil, 0, 0, ErrInvalidCollection
 	}
 	target := relation.target
 	if cap(m.mutationPlan) == 0 {
@@ -1531,13 +1543,15 @@ func (m *Machine) planMutations(
 		if relation.kind == RelationJSON &&
 			mutation.Kind != replication.MutationPut &&
 			mutation.Kind != replication.MutationPutAbsentOrEqual &&
+			mutation.Kind != replication.MutationPutAbsent &&
+			mutation.Kind != replication.MutationPutPresent &&
 			mutation.Kind != replication.MutationPutDigestEqual &&
 			mutation.Kind != replication.MutationDelete &&
 			mutation.Kind != replication.MutationDeleteDigestEqual ||
 			relation.kind == RelationGlobalIndex &&
 				mutation.Kind != replication.MutationPutAbsentOrEqual &&
 				mutation.Kind != replication.MutationDeleteDigestEqual {
-			return nil, ResultInvalidDocument, nil
+			return nil, 0, ResultInvalidDocument, nil
 		}
 		at := -1
 		for index := range ordered {
@@ -1548,7 +1562,7 @@ func (m *Machine) planMutations(
 		}
 		if at >= 0 {
 			if relation.kind == RelationGlobalIndex {
-				return nil, ResultIndexConflict, nil
+				return nil, 0, ResultIndexConflict, nil
 			}
 			ordered[at].delete = mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual
@@ -1557,9 +1571,7 @@ func (m *Machine) planMutations(
 			// the snapshot lookup below replaces it with the actual prior value.
 			// This keeps the pooled final workspace at three slice headers.
 			ordered[at].before = mutation.Compare
-			ordered[at].conditional = mutation.Kind == replication.MutationPutDigestEqual
-			ordered[at].conditionalDelete = mutation.Kind == replication.MutationDeleteDigestEqual
-			ordered[at].absentOrEqual = mutation.Kind == replication.MutationPutAbsentOrEqual
+			ordered[at].condition = finalMutationCondition(mutation.Kind)
 			continue
 		}
 		value := mutation.Value
@@ -1570,13 +1582,11 @@ func (m *Machine) planMutations(
 			key: mutation.Key, value: value,
 			delete: mutation.Kind == replication.MutationDelete ||
 				mutation.Kind == replication.MutationDeleteDigestEqual,
-			before:            mutation.Compare,
-			conditional:       mutation.Kind == replication.MutationPutDigestEqual,
-			conditionalDelete: mutation.Kind == replication.MutationDeleteDigestEqual,
-			absentOrEqual:     mutation.Kind == replication.MutationPutAbsentOrEqual,
+			before:    mutation.Compare,
+			condition: finalMutationCondition(mutation.Kind),
 		})
 		if len(ordered) > target.Limits.MaxDistinctMutations {
-			return nil, ResultTargetBound, nil
+			return nil, 0, ResultTargetBound, nil
 		}
 	}
 	rawUpperBytes := 0
@@ -1600,30 +1610,31 @@ func (m *Machine) planMutations(
 	}
 	stagedBytes := 0
 	changes := ordered[:0]
+	var affectedRows int64
 	for _, mutation := range ordered {
 		// A conditional delete carries a fixed length+digest comparison payload
 		// in mutation.value. It is command metadata, never a stored document, so
 		// only puts are constrained by the target document bound.
 		if len(mutation.key) > target.Limits.MaxKeyBytes ||
 			!mutation.delete && len(mutation.value) > target.Limits.MaxDocumentBytes {
-			return nil, ResultTargetBound, nil
+			return nil, 0, ResultTargetBound, nil
 		}
 		if !mutation.delete {
 			if err := vibejson.Validate(mutation.value); err != nil {
-				return nil, ResultInvalidDocument, nil
+				return nil, 0, ResultInvalidDocument, nil
 			}
 			if relation.kind == RelationGlobalIndex &&
 				!validGlobalIndexLocator(mutation.value, relation.globalIndex.LocatorCount) {
-				return nil, ResultInvalidDocument, nil
+				return nil, 0, ResultInvalidDocument, nil
 			}
 		} else if relation.kind == RelationGlobalIndex &&
 			len(mutation.value) != replication.MutationDigestCompareBytes {
-			return nil, ResultInvalidDocument, nil
+			return nil, 0, ResultInvalidDocument, nil
 		}
 		compare := mutation.before
 		current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		mutation.beforeFound = found
 		if target.Validation == ValidationDeterministicMutation {
@@ -1636,35 +1647,43 @@ func (m *Machine) planMutations(
 			switch validation {
 			case MutationValidationAccept:
 			case MutationValidationInvalid:
-				return nil, ResultInvalidDocument, nil
+				return nil, 0, ResultInvalidDocument, nil
 			case MutationValidationTargetBound:
-				return nil, ResultTargetBound, nil
+				return nil, 0, ResultTargetBound, nil
 			case MutationValidationWrongShard:
-				return nil, ResultWrongShard, nil
+				return nil, 0, ResultWrongShard, nil
 			default:
-				return nil, 0, fmt.Errorf(
+				return nil, 0, 0, fmt.Errorf(
 					"%w: mutation validator returned %d", ErrInvalidCollection, validation,
 				)
 			}
 		}
-		if relation.kind == RelationJSON && mutation.absentOrEqual && found {
+		if relation.kind == RelationJSON && mutation.condition == mutationPutAbsentOrEqual && found {
 			if bytes.Equal(current, mutation.value) {
 				continue
 			}
-			return nil, ResultIndexConflict, nil
+			return nil, 0, ResultIndexConflict, nil
 		}
-		if mutation.conditional {
+		if mutation.condition == mutationPutAbsent {
+			if found {
+				return nil, 0, ResultIndexConflict, nil
+			}
+		}
+		if mutation.condition == mutationPutPresent && !found {
+			continue
+		}
+		if mutation.condition == mutationPutDigestEqual {
 			if !found {
-				return nil, ResultIndexConflict, nil
+				return nil, 0, ResultIndexConflict, nil
 			}
 			expectedLength := binary.LittleEndian.Uint64(compare[:8])
 			currentDigest := sha256.Sum256(current)
 			if uint64(len(current)) != expectedLength ||
 				!bytes.Equal(currentDigest[:], compare[8:]) {
-				return nil, ResultIndexConflict, nil
+				return nil, 0, ResultIndexConflict, nil
 			}
 		}
-		if mutation.conditionalDelete {
+		if mutation.condition == mutationDeleteDigestEqual {
 			if !found {
 				continue
 			}
@@ -1672,7 +1691,7 @@ func (m *Machine) planMutations(
 			currentDigest := sha256.Sum256(current)
 			if uint64(len(current)) != expectedLength ||
 				!bytes.Equal(currentDigest[:], compare[8:]) {
-				return nil, ResultIndexConflict, nil
+				return nil, 0, ResultIndexConflict, nil
 			}
 			mutation.value = nil
 		}
@@ -1684,24 +1703,28 @@ func (m *Machine) planMutations(
 					) {
 						continue
 					}
-					return nil, ResultIndexConflict, nil
+					return nil, 0, ResultIndexConflict, nil
 				}
 			}
 		}
 		if mutation.delete && !found || !mutation.delete && found && bytes.Equal(current, mutation.value) {
+			if !mutation.delete && found {
+				affectedRows++
+			}
 			continue
 		}
+		affectedRows++
 		if len(mutation.key) > target.Limits.MaxBatchBytes-stagedBytes {
-			return nil, ResultTargetBound, nil
+			return nil, 0, ResultTargetBound, nil
 		}
 		stagedBytes += len(mutation.key)
 		if len(mutation.value) > target.Limits.MaxBatchBytes-stagedBytes {
-			return nil, ResultTargetBound, nil
+			return nil, 0, ResultTargetBound, nil
 		}
 		stagedBytes += len(mutation.value)
 		if !rawUpperExceeds {
 			if err := describeFinalMutation(&mutation, current, scratch); err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 		}
 		changes = append(changes, mutation)
@@ -1711,23 +1734,40 @@ func (m *Machine) planMutations(
 			mutation := &changes[index]
 			current, found, err := snapshot.appendRawForPlan(mutation.key, scratch)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 			if found != mutation.beforeFound {
-				return nil, 0, ErrInconsistentSnapshot
+				return nil, 0, 0, ErrInconsistentSnapshot
 			}
 			if scratch != nil {
 				scratch.hybridDescriptorRereads++
 			}
 			if err := describeFinalMutation(mutation, current, scratch); err != nil {
-				return nil, 0, err
+				return nil, 0, 0, err
 			}
 		}
 	}
 	slices.SortFunc(changes, func(left, right finalMutation) int {
 		return bytes.Compare(left.key, right.key)
 	})
-	return changes, ResultApplied, nil
+	return changes, affectedRows, ResultApplied, nil
+}
+
+func finalMutationCondition(kind replication.MutationKind) mutationCondition {
+	switch kind {
+	case replication.MutationPutAbsentOrEqual:
+		return mutationPutAbsentOrEqual
+	case replication.MutationDeleteDigestEqual:
+		return mutationDeleteDigestEqual
+	case replication.MutationPutDigestEqual:
+		return mutationPutDigestEqual
+	case replication.MutationPutAbsent:
+		return mutationPutAbsent
+	case replication.MutationPutPresent:
+		return mutationPutPresent
+	default:
+		return mutationUnconditional
+	}
 }
 
 func validGlobalIndexLocator(value []byte, count uint8) bool {

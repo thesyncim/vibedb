@@ -73,6 +73,7 @@ func TestSessionSlotBindsIssuedTokenToApplyIndex(t *testing.T) {
 	open.Slot = 0
 	open.ClientSequence = 1
 	open.ResultCode = ResultSessionOpened
+	open.AffectedRows = 0
 	open.AppliedSequence = open.ClientEpoch
 	if _, err := AppendSessionSlot(nil, open); err != nil {
 		t.Fatalf("valid open slot: %v", err)

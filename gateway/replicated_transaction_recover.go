@@ -248,7 +248,7 @@ func (orchestrator *ReplicatedTransactionOrchestrator) validReplicatedTransactio
 ) bool {
 	if handle == nil || handle.ID.IsZero() || handle.CatalogGeneration == 0 ||
 		handle.RecoveryDeadline <= 0 ||
-		len(handle.Participants) < 2 ||
+		len(handle.Participants) == 0 ||
 		uint64(len(handle.Participants)) > maxReplicatedTransactionOrdinal ||
 		int(handle.CoordinatorOrdinal) >= len(handle.Participants) ||
 		handle.DecisionRevision == 0 {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -34,6 +36,12 @@ import (
 const (
 	maxServeRequestBytes              = 1 << 20
 	defaultNativeResponseWriteTimeout = 5 * time.Second
+	defaultRF3TransactionConcurrency  = 64
+	defaultRF3TransactionInFlight     = uint64(64 << 20)
+	defaultRF3TransactionRequests     = 65_536
+	defaultRF3TransactionRecovery     = 24 * time.Hour
+	defaultRF3TransactionMutations    = uint64(10_000_000)
+	defaultRF3TransactionBytes        = uint64(1 << 30)
 )
 
 // The serve subcommand is a routing front-end. It loads an immutable
@@ -55,7 +63,11 @@ type serveRequest struct {
 	// Op selects the gateway operation: the empty value and "query" are the
 	// read path; "exec" is the single-shard write path; "exec_batch" uses
 	// Statements and applies one Class to the complete atomic batch.
-	Op         string           `json:"op,omitempty"`
+	Op string `json:"op,omitempty"`
+	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for
+	// an RF3 exec_batch. It remains ingress metadata and never enters Raft as a
+	// table or SQL string.
+	RequestID  string           `json:"request_id,omitempty"`
 	SQL        string           `json:"sql"`
 	Class      string           `json:"class,omitempty"`
 	Params     []serveParam     `json:"params,omitempty"`
@@ -78,16 +90,23 @@ type serveParam struct {
 // observability. Rows carries each cell as raw JSON (a null cell is the JSON
 // literal null); Error is set instead when the operation failed.
 type serveResponse struct {
-	Kind         string            `json:"kind,omitempty"`
-	Columns      []string          `json:"columns,omitempty"`
-	Rows         [][]serveRawValue `json:"rows,omitempty"`
-	RowsAffected int64             `json:"rows_affected,omitempty"`
-	Route        string            `json:"route,omitempty"`
-	Generation   uint64            `json:"generation,omitempty"`
-	ShardsFanned int               `json:"shards_fanned,omitempty"`
-	Retries      int               `json:"retries,omitempty"`
-	Error        string            `json:"error,omitempty"`
+	Kind           string            `json:"kind,omitempty"`
+	Columns        []string          `json:"columns,omitempty"`
+	Rows           [][]serveRawValue `json:"rows,omitempty"`
+	RowsAffected   int64             `json:"rows_affected,omitempty"`
+	Route          string            `json:"route,omitempty"`
+	Generation     uint64            `json:"generation,omitempty"`
+	ShardsFanned   int               `json:"shards_fanned,omitempty"`
+	Retries        int               `json:"retries,omitempty"`
+	TransactionID  replication.ID128 `json:"-"`
+	Committed      bool              `json:"committed,omitempty"`
+	OutcomeUnknown bool              `json:"outcome_unknown,omitempty"`
+	Error          string            `json:"error,omitempty"`
 }
+
+var errServeResponseTransactionState = errors.New(
+	"vibedb-gateway: invalid transaction response state",
+)
 
 // serveRawValue is one already-encoded JSON cell. The methods preserve test and
 // client interoperability with encoding/json without using it in the server;
@@ -308,9 +327,9 @@ func runServe(args []string) int {
 			HandshakeDeadline: servicetls.FixedDeadline(*tlsHandshakeTimeout),
 		}, logf)
 	} else {
-		serveContext := ctx
+		serveContext := gateway.WithLocalReplicatedTransactionRequestScope(ctx)
 		if dataReader != nil {
-			serveContext, err = serviceauthz.WithAuthority(ctx, internalAuthority)
+			serveContext, err = serviceauthz.WithAuthority(serveContext, internalAuthority)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gateway: establish development authority: %v\n", err)
 				return 1
@@ -522,15 +541,65 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
+	transactionTenant, transactionRetryHome := replicatedDataTransactionIdentity(
+		clientID, retryHome,
+	)
+	transactions, err := gateway.NewReplicatedTransactionOrchestrator(
+		gateway.ReplicatedTransactionOrchestratorOptions{
+			Executor: replicated, Tenant: transactionTenant, RetryHome: transactionRetryHome,
+			MaxConcurrency:   defaultRF3TransactionConcurrency,
+			MaxInFlightBytes: defaultRF3TransactionInFlight,
+			MaxMutations:     defaultRF3TransactionMutations,
+			MaxMutationBytes: defaultRF3TransactionBytes,
+			RecoveryTimeout:  defaultRF3TransactionRecovery,
+		},
+	)
+	if err != nil {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, err
+	}
+	transactionRequests, err := gateway.NewReplicatedTransactionRequestRegistry(
+		gateway.ReplicatedTransactionRequestRegistryOptions{
+			Orchestrator: transactions, MaxEntries: defaultRF3TransactionRequests,
+		},
+	)
+	if err != nil {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, err
+	}
 	executor := gateway.NewExecutor(
 		gateway.NewClient(shardDial), holder, gateway.Options{
 			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
+			ReplicatedTransactions:        transactions,
+			ReplicatedTransactionRequests: transactionRequests,
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil
 }
 
 const replicatedCatalogControllerTenant = byte(1)
+
+func replicatedDataTransactionIdentity(
+	clientID replication.ID128,
+	retryHome replication.RetryHome,
+) ([]byte, replication.RetryHome) {
+	var material [1 + len(clientID) + len(retryHome)]byte
+	material[0] = 2
+	copy(material[1:1+len(clientID)], clientID[:])
+	copy(material[1+len(clientID):], retryHome[:])
+	tenantDigest := sha256.Sum256(material[:])
+	material[0] = 3
+	retryDigest := sha256.Sum256(material[:])
+	tenant := make([]byte, len(clientID))
+	copy(tenant, tenantDigest[:len(tenant)])
+	var dataRetryHome replication.RetryHome
+	copy(dataRetryHome[:], retryDigest[:len(dataRetryHome)])
+	return tenant, dataRetryHome
+}
 
 func decodeFixedHex(encoded string, destination []byte) error {
 	if len(encoded) != hex.EncodedLen(len(destination)) {
@@ -671,6 +740,24 @@ func startGatewayRecovery(ctx context.Context, exec *gateway.Executor, logf func
 			logf("gateway: transaction recovery resolved %d coordinator(s)", len(results))
 		}
 	})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			resolved, err := exec.RecoverReplicatedTransactionRequests(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logf("gateway: RF3 transaction recovery: %v", err)
+			}
+			if resolved != 0 {
+				logf("gateway: RF3 transaction recovery attempted %d request(s)", resolved)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 }
 
 func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
@@ -884,6 +971,14 @@ func serveRequestCapability(request *serveRequest) serviceauthz.Capability {
 // writeServeResponse emits one NDJSON response without converting raw result
 // cells into strings or passing them through a generic JSON tree.
 func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
+	if resp == nil {
+		return errServeResponseTransactionState
+	}
+	hasTransaction := resp.TransactionID != (replication.ID128{})
+	hasOutcome := resp.Committed || resp.OutcomeUnknown
+	if hasTransaction != hasOutcome || resp.Committed && resp.OutcomeUnknown {
+		return errServeResponseTransactionState
+	}
 	if err := w.BeginObject(); err != nil {
 		return err
 	}
@@ -974,6 +1069,30 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 			return err
 		}
 	}
+	if resp.TransactionID != (replication.ID128{}) {
+		if err := w.Key("transaction_id"); err != nil {
+			return err
+		}
+		if err := writeNativeHex(w, resp.TransactionID[:]); err != nil {
+			return err
+		}
+	}
+	if resp.Committed {
+		if err := w.Key("committed"); err != nil {
+			return err
+		}
+		if err := w.Bool(true); err != nil {
+			return err
+		}
+	}
+	if resp.OutcomeUnknown {
+		if err := w.Key("outcome_unknown"); err != nil {
+			return err
+		}
+		if err := w.Bool(true); err != nil {
+			return err
+		}
+	}
 	if err := stringField("error", resp.Error); err != nil {
 		return err
 	}
@@ -997,7 +1116,14 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 		if buildErr != nil {
 			return &serveResponse{Error: buildErr.Error()}
 		}
-		res, err = exec.ExecBatch(ctx, queries)
+		var requestID replication.ID128
+		if req.RequestID != "" {
+			if decodeFixedHex(req.RequestID, requestID[:]) != nil ||
+				requestID == (replication.ID128{}) {
+				return &serveResponse{Error: gateway.ErrReplicatedTransactionRequestRegistry.Error()}
+			}
+		}
+		res, err = exec.ExecBatchRequest(ctx, requestID, queries)
 	case "exec":
 		// The write path routes the statement to its single owning shard and
 		// refuses every scatter before any dispatch.
@@ -1016,7 +1142,14 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 		return &serveResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}
 	}
 	if err != nil {
-		return &serveResponse{Error: err.Error()}
+		response := &serveResponse{Error: err.Error()}
+		var transactionErr *gateway.ReplicatedTransactionError
+		if errors.As(err, &transactionErr) && transactionErr.ID != (distributedtxn.ID{}) {
+			response.TransactionID = replication.ID128(transactionErr.ID)
+			response.Committed = transactionErr.Committed
+			response.OutcomeUnknown = !transactionErr.Committed
+		}
+		return response
 	}
 	return encodeResult(res)
 }
@@ -1107,12 +1240,14 @@ func parseClass(name string) (gateway.OperationClass, error) {
 // raw JSON so an already-encoded value is not re-encoded.
 func encodeResult(res *gateway.Result) *serveResponse {
 	resp := &serveResponse{
-		Kind:         res.Kind.String(),
-		RowsAffected: res.RowsAffected,
-		Route:        res.RouteKind.String(),
-		Generation:   res.Generation,
-		ShardsFanned: res.ShardsFanned,
-		Retries:      res.Retries,
+		Kind:          res.Kind.String(),
+		RowsAffected:  res.RowsAffected,
+		Route:         res.RouteKind.String(),
+		Generation:    res.Generation,
+		ShardsFanned:  res.ShardsFanned,
+		Retries:       res.Retries,
+		TransactionID: res.TransactionID,
+		Committed:     res.TransactionID != (replication.ID128{}),
 	}
 	for _, col := range res.Columns {
 		resp.Columns = append(resp.Columns, col.Name)

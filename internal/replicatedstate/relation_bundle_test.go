@@ -30,6 +30,7 @@ type relationBundleFixture struct {
 	log     *durable.TxnLog
 	group   *durable.CheckpointGroup
 	index   store.IndexDefinition
+	second  RelationKind
 	dir     string
 	options Options
 }
@@ -79,6 +80,12 @@ func newRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixtu
 	)
 }
 
+func newMultiJSONRelationBundleFixture(t testing.TB, checkpoint bool) relationBundleFixture {
+	return newRelationBundleFixtureWithSecondKind(
+		t, checkpoint, false, durable.Options{}, durable.Options{}, RelationJSON,
+	)
+}
+
 func newCapturedRelationBundleFixture(t testing.TB) relationBundleFixture {
 	return newRelationBundleFixtureWithCollectionOptions(
 		t, true, true, durable.Options{}, durable.Options{},
@@ -100,6 +107,18 @@ func newRelationBundleFixtureWithCollectionOptions(
 	checkpoint bool,
 	reserveCapture bool,
 	baseOptions, globalOptions durable.Options,
+) relationBundleFixture {
+	return newRelationBundleFixtureWithSecondKind(
+		t, checkpoint, reserveCapture, baseOptions, globalOptions, RelationGlobalIndex,
+	)
+}
+
+func newRelationBundleFixtureWithSecondKind(
+	t testing.TB,
+	checkpoint bool,
+	reserveCapture bool,
+	baseOptions, globalOptions durable.Options,
+	secondKind RelationKind,
 ) relationBundleFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -195,18 +214,7 @@ func newRelationBundleFixtureWithCollectionOptions(
 	binding := testBinding()
 	machine, err := OpenBundle(
 		binding, testBootstrap(), system,
-		[]RelationCollection{
-			{
-				Relation: 1, Kind: RelationJSON, Name: "base", Target: base,
-				LocalIndexes: []store.IndexDefinition{index},
-			},
-			{
-				Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: global,
-				GlobalIndex: GlobalIndexProfile{
-					IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-				},
-			},
-		},
+		relationBundleCollections(base, global, index, secondKind),
 		log, options,
 	)
 	if err != nil {
@@ -218,8 +226,29 @@ func newRelationBundleFixtureWithCollectionOptions(
 	applySessionOpen(t, machine, 2, commandValue(binding, 1))
 	return relationBundleFixture{
 		machine: machine, binding: binding, system: system, base: base,
-		global: global, capture: capture, log: log, group: group, index: index, dir: dir, options: options,
+		global: global, capture: capture, log: log, group: group, index: index,
+		second: secondKind, dir: dir, options: options,
 	}
+}
+
+func relationBundleCollections(
+	base, second CollectionTarget,
+	index store.IndexDefinition,
+	secondKind RelationKind,
+) []RelationCollection {
+	relations := []RelationCollection{
+		{
+			Relation: 1, Kind: RelationJSON, Name: "base", Target: base,
+			LocalIndexes: []store.IndexDefinition{index},
+		},
+		{Relation: 2, Kind: secondKind, Name: "global", Target: second},
+	}
+	if secondKind == RelationGlobalIndex {
+		relations[1].GlobalIndex = GlobalIndexProfile{
+			IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
+		}
+	}
+	return relations
 }
 
 func TestCheckpointBundleRejectsUnreservedTransitionCapture(t *testing.T) {
@@ -713,12 +742,15 @@ func TestRelationBundleAtomicBaseLocalAndGlobalIndexApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	affectedRows, resultErr := OpenMutationCompletionResult(
+		completion.ResultCode, completion.InlineResult,
+	)
 	if !bytes.Equal(firstWitness.Bytes, secondWitness.Bytes) ||
 		firstWitness.AppliedSequence != 3 || completion.AppliedSequence != 3 ||
 		completion.ResultCode != ResultApplied || completion.ResultFormat != ResultFormatMutation ||
-		completion.ResultLength != 0 || len(completion.InlineResult) != 0 ||
+		completion.ResultLength != MutationCompletionResultBytes || affectedRows != 1 || resultErr != nil ||
 		completion.ResultDigest != replication.CompletionResultDigest(
-			ResultApplied, ResultFormatMutation, nil,
+			ResultApplied, ResultFormatMutation, completion.InlineResult,
 		) {
 		t.Fatal("bundle did not settle as one canonical completion witness")
 	}

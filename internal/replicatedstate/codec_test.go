@@ -377,7 +377,8 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 	if err != nil || decodedSlot.SessionDigest != slot.SessionDigest ||
 		decodedSlot.LogicalCommandDigest != slot.LogicalCommandDigest ||
 		decodedSlot.AppliedSequence != slot.AppliedSequence ||
-		decodedSlot.ResultCode != slot.ResultCode || decodedSlot.Bytes()[0] != encoded[0] {
+		decodedSlot.ResultCode != slot.ResultCode || decodedSlot.AffectedRows != slot.AffectedRows ||
+		decodedSlot.Bytes()[0] != encoded[0] {
 		t.Fatalf("OpenSessionSlot = %+v,%v", decodedSlot, err)
 	}
 }

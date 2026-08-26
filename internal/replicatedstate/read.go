@@ -634,8 +634,15 @@ func (m *Machine) appendSessionCompletion(
 	if session.Digest != slot.SessionDigest || session.ClientEpoch != slot.ClientEpoch {
 		return dst, ErrSessionCorrupt
 	}
+	var result [MutationCompletionResultBytes]byte
+	resultBytes, err := AppendMutationCompletionResult(
+		result[:0], slot.ResultCode, slot.AffectedRows,
+	)
+	if err != nil {
+		return dst, ErrSessionCorrupt
+	}
 	resultDigest := replication.CompletionResultDigest(
-		slot.ResultCode, ResultFormatMutation, nil,
+		slot.ResultCode, ResultFormatMutation, resultBytes,
 	)
 	return replication.AppendCompletionBytes(dst, replication.CompletionBytes{
 		ClusterID:              m.binding.ClusterID,
@@ -661,7 +668,9 @@ func (m *Machine) appendSessionCompletion(
 		ResultCode:             slot.ResultCode,
 		ResultFormat:           ResultFormatMutation,
 		Storage:                replication.CompletionInline,
+		ResultLength:           uint64(len(resultBytes)),
 		ResultDigest:           resultDigest,
+		InlineResult:           resultBytes,
 	})
 }
 

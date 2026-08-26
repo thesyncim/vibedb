@@ -188,6 +188,14 @@ const (
 	MutationPutAbsentOrEqual  MutationKind = 3
 	MutationDeleteDigestEqual MutationKind = 4
 	MutationPutDigestEqual    MutationKind = 5
+	// MutationPutAbsent inserts only when the key is absent. An existing key,
+	// including one with byte-identical value bytes, is a deterministic
+	// conflict. It is the byte-native strict-insert primitive.
+	MutationPutAbsent MutationKind = 6
+	// MutationPutPresent replaces only when the key is present. A missing key is
+	// an applied zero-row no-op. It is the byte-native conditional-update
+	// primitive.
+	MutationPutPresent MutationKind = 7
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed
