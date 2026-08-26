@@ -182,10 +182,11 @@ type gatewayMembershipApplier interface {
 		shardservice.ReplicatedMembershipRequest) (gateway.ReplicatedMembershipResult, error)
 }
 
-// gatewayGrantedMembershipClient installs the exact catalog-Raft grant on all
-// RF3 voters and the enrolled target before any member can receive the
-// ConfChange. Exact retries are idempotent; partial fanout never authorizes a
-// proposal because ApplyMembership is reached only after complete fanout.
+// gatewayGrantedMembershipClient installs the exact catalog-Raft grant on a
+// quorum of the current RF3 voters and the target before proposing ConfChange.
+// It still attempts every endpoint. Requiring all three would make replacement
+// impossible precisely when one voter has failed; requiring fewer than quorum
+// could admit a command which cannot commit.
 type gatewayGrantedMembershipClient struct {
 	grants    membershipgrant.Source
 	installer gatewayMembershipGrantInstaller
@@ -222,15 +223,30 @@ func (client gatewayGrantedMembershipClient) ApplyMembership(
 	if !targetPresent {
 		return gateway.ReplicatedMembershipResult{}, errGatewayReplicaControl
 	}
+	installedVoters := 0
+	targetInstalled := false
+	var installErrors error
 	for _, endpoint := range route.Serving.Replicas {
-		if err = client.installer.InstallMembershipGrant(ctx, endpoint.Node, grant); err != nil {
-			return gateway.ReplicatedMembershipResult{}, err
+		installErr := client.installer.InstallMembershipGrant(ctx, endpoint.Node, grant)
+		if installErr == nil {
+			installedVoters++
+			if endpoint.Member == grant.TargetMember && [16]byte(endpoint.Node) == grant.TargetNode {
+				targetInstalled = true
+			}
+		} else {
+			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
 	if route.HasEnrolledTarget {
-		if err = client.installer.InstallMembershipGrant(ctx, route.EnrolledTarget.Node, grant); err != nil {
-			return gateway.ReplicatedMembershipResult{}, err
+		installErr := client.installer.InstallMembershipGrant(ctx, route.EnrolledTarget.Node, grant)
+		if installErr == nil {
+			targetInstalled = true
+		} else {
+			installErrors = errors.Join(installErrors, installErr)
 		}
+	}
+	if installedVoters < gateway.ServingReplicaCount/2+1 || !targetInstalled {
+		return gateway.ReplicatedMembershipResult{}, errors.Join(installErrors, errGatewayReplicaControl)
 	}
 	return client.applier.ApplyMembership(ctx, route, request)
 }

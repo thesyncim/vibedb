@@ -66,8 +66,13 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	}
 	installer.nodes = nil
 	installer.failAt = 3
-	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 1 {
-		t.Fatalf("partial fanout err=%v apply=%d", err, applier.calls)
+	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil || applier.calls != 2 {
+		t.Fatalf("one failed voter err=%v apply=%d", err, applier.calls)
+	}
+	installer.nodes = nil
+	installer.failAt = 4
+	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 2 {
+		t.Fatalf("missing target grant err=%v apply=%d", err, applier.calls)
 	}
 }
 
