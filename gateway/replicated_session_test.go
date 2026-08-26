@@ -46,11 +46,13 @@ func (client *nativeSessionClient) DoReplicated(
 	if err != nil {
 		return nil, err
 	}
-	if command.Kind() == replication.CommandMutationBatch {
+	isMutation := command.Kind() == replication.CommandMutationBatch ||
+		command.Kind() == replication.CommandRetainedPrune
+	if isMutation {
 		client.lastMutationCount = command.MutationCount()
 		client.proposalMembers = append(client.proposalMembers, endpoint.Member)
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.unknownMutationOnce &&
+	if isMutation && client.unknownMutationOnce &&
 		!client.mutationUnknownSeen {
 		client.mutationUnknownSeen = true
 		client.unknownCommand = append([]byte(nil), request.Command...)
@@ -59,11 +61,11 @@ func (client *nativeSessionClient) DoReplicated(
 		}
 		return nil, errors.New("connection disappeared after exact frame")
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.mutationUnknownSeen &&
+	if isMutation && client.mutationUnknownSeen &&
 		len(client.retriedCommand) == 0 {
 		client.retriedCommand = append([]byte(nil), request.Command...)
 	}
-	if command.Kind() == replication.CommandMutationBatch && client.mutationUnknownSeen &&
+	if isMutation && client.mutationUnknownSeen &&
 		client.preAdmissionRetry {
 		return &shardservice.ReplicatedResponse{
 			Kind:     shardservice.ReplicatedRefusal,
