@@ -78,6 +78,7 @@ type DurableRuntimeStore struct {
 	operation     OperationID
 	manifest      [sha256.Size]byte
 	states        [5 + autosplit.MaxSplitChildren]runtimeStoredState
+	ownsRuntime   bool
 	closed        bool
 }
 
@@ -127,10 +128,34 @@ func OpenDurableRuntimeStore(
 			_ = runtimeRoot.Close()
 		}
 	}()
-	var encoded [64]byte
-	hex.Encode(encoded[:], operation[:])
-	operationName := string(encoded[:])
-	if err = ensureRuntimeDirectory(runtimeRoot, operationName); err != nil {
+	store, err := openDurableRuntimeStoreAtRoot(runtimeRoot, operation, manifestDigest, true)
+	if err != nil {
+		return nil, err
+	}
+	store.memberRoot = member
+	closeMember, closeRuntime = false, false
+	return store, nil
+}
+
+func openDurableRuntimeStoreAtRoot(
+	runtimeRoot *os.Root,
+	operation OperationID,
+	manifestDigest [sha256.Size]byte,
+	ownsRuntime bool,
+) (*DurableRuntimeStore, error) {
+	if runtimeRoot == nil || operation == (OperationID{}) ||
+		manifestDigest == ([sha256.Size]byte{}) {
+		return nil, ErrRuntimeStore
+	}
+	terminal, err := runtimeTerminalExists(runtimeRoot, operation, manifestDigest)
+	if err != nil {
+		return nil, err
+	}
+	if terminal {
+		return nil, ErrRuntimeTerminal
+	}
+	operationName := runtimeOperationName(operation)
+	if err := ensureRuntimeDirectory(runtimeRoot, operationName); err != nil {
 		return nil, err
 	}
 	operationRoot, err := runtimeRoot.OpenRoot(operationName)
@@ -152,14 +177,15 @@ func OpenDurableRuntimeStore(
 		return nil, errors.Join(ErrRuntimeStore, err)
 	}
 	store := &DurableRuntimeStore{
-		memberRoot: member, runtimeRoot: runtimeRoot, operationRoot: operationRoot,
+		runtimeRoot: runtimeRoot, operationRoot: operationRoot,
 		lockFile: lockFile, operation: operation, manifest: manifestDigest,
+		ownsRuntime: ownsRuntime,
 	}
 	if err = store.recover(); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
-	closeMember, closeRuntime, closeOperation = false, false, false
+	closeOperation = false
 	return store, nil
 }
 
@@ -255,12 +281,21 @@ func (s *DurableRuntimeStore) Close() error {
 		return nil
 	}
 	s.closed = true
-	err := errors.Join(
-		storeio.UnlockWriter(s.lockFile), s.lockFile.Close(),
-		s.operationRoot.Close(), s.runtimeRoot.Close(), s.memberRoot.Close(),
-	)
+	err := errors.Join(storeio.UnlockWriter(s.lockFile), s.lockFile.Close(), s.operationRoot.Close())
+	if s.ownsRuntime {
+		err = errors.Join(err, s.runtimeRoot.Close())
+	}
+	if s.memberRoot != nil {
+		err = errors.Join(err, s.memberRoot.Close())
+	}
 	s.lockFile, s.operationRoot, s.runtimeRoot, s.memberRoot = nil, nil, nil, nil
 	return err
+}
+
+func runtimeOperationName(operation OperationID) string {
+	var encoded [64]byte
+	hex.Encode(encoded[:], operation[:])
+	return string(encoded[:])
 }
 
 func (s *DurableRuntimeStore) recover() error {
