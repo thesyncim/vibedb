@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -77,6 +78,13 @@ func (*gatewayHotShardTestAuthority) RetryPending(context.Context) error { retur
 
 type gatewayHotMoveObservations struct {
 	publication raftmodel.Publication
+	grant       membershipgrant.Grant
+}
+
+func (observations gatewayHotMoveObservations) ReadMembershipGrant(
+	_ context.Context, group raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	return observations.grant, observations.grant.Group == group, nil
 }
 
 func (observations gatewayHotMoveObservations) Observe(
@@ -117,7 +125,8 @@ func TestGatewayHotShardPressurePassCreatesExactEnrolledReplicaMove(t *testing.T
 	runtime := &gatewayHotShardRuntime{authority: &gatewayHotShardTestAuthority{record: record},
 		controller: controller, operationsBound: true,
 		operations: gatewayHotShardOperationAuthorities{
-			moves: gatewayHotReplicaMoveFactory{observations: observations}, moveRun: submitter,
+			moves:   gatewayHotReplicaMoveFactory{observations: observations, grants: observations},
+			moveRun: submitter,
 		}}
 	pass, err := runtime.runPressurePass(context.Background(), catalog)
 	if err != nil || pass.Admission.MoveCount != 1 || pass.Admission.SplitCount != 0 ||
@@ -137,7 +146,8 @@ func TestGatewayHotShardOutcomeUnknownRestartRetriesSameOperation(t *testing.T) 
 		return &gatewayHotShardRuntime{authority: &gatewayHotShardTestAuthority{record: record},
 			controller: controller, operationsBound: true,
 			operations: gatewayHotShardOperationAuthorities{
-				moves: gatewayHotReplicaMoveFactory{observations: observations}, moveRun: submitter,
+				moves:   gatewayHotReplicaMoveFactory{observations: observations, grants: observations},
+				moveRun: submitter,
 			}}
 	}
 	if _, err := makeRuntime().runPressurePass(context.Background(), catalog); err == nil {
@@ -152,13 +162,27 @@ func TestGatewayHotShardOutcomeUnknownRestartRetriesSameOperation(t *testing.T) 
 }
 
 func TestGatewayHotShardPressurePassRefusesMissingTopologyAuthority(t *testing.T) {
-	catalog, record, _ := gatewayHotShardMoveFixture(t)
+	catalog, record, observations := gatewayHotShardMoveFixture(t)
 	controller, _ := hotshard.New(hotshard.DefaultPolicy())
 	runtime := &gatewayHotShardRuntime{authority: &gatewayHotShardTestAuthority{record: record},
 		controller: controller}
 	pass, err := runtime.runPressurePass(context.Background(), catalog)
 	if !errors.Is(err, hotshard.ErrInvalidPressureCut) || pass.Admission.MoveCount != 1 {
 		t.Fatalf("pass=%+v err=%v", pass, err)
+	}
+	controller, _ = hotshard.New(hotshard.DefaultPolicy())
+	observations.grant = membershipgrant.Grant{}
+	submitter := &gatewayHotMoveSubmitter{}
+	runtime = &gatewayHotShardRuntime{authority: &gatewayHotShardTestAuthority{record: record},
+		controller: controller, operationsBound: true,
+		operations: gatewayHotShardOperationAuthorities{
+			moves:   gatewayHotReplicaMoveFactory{observations: observations, grants: observations},
+			moveRun: submitter,
+		}}
+	pass, err = runtime.runPressurePass(context.Background(), catalog)
+	if !errors.Is(err, hotshard.ErrInvalidPressureCut) || pass.Admission.MoveCount != 1 ||
+		len(submitter.operations) != 0 {
+		t.Fatalf("ungranted pass=%+v operations=%x err=%v", pass, submitter.operations, err)
 	}
 }
 
@@ -254,8 +278,14 @@ func gatewayHotShardMoveFixture(
 	}
 	record := gateway.ReplicatedPressureRecord{CatalogGeneration: 9, AuthorityRevision: 1,
 		PayloadDigest: sha256.Sum256(raw), Payload: raw}
+	grant, err := gateway.BuildReplicaReplacementMembershipGrant(
+		catalog, group, [16]byte{8}, 1, 1, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	observations := gatewayHotMoveObservations{publication: raftmodel.Publication{
 		Applied: 8, ReplicaSetVersion: 7, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
-	}}
+	}, grant: grant}
 	return catalog, record, observations
 }

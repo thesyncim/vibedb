@@ -438,7 +438,8 @@ func runServe(args []string) int {
 		var hotShardBindErr error
 		if hotShardRuntime != nil && (controllerErr != nil || controlsErr != nil ||
 			!hotShardRuntime.InstallOperationAuthorities(gatewayHotShardOperationAuthorities{
-				moves:   gatewayHotReplicaMoveFactory{observations: controls.HealthObservations},
+				moves: gatewayHotReplicaMoveFactory{observations: controls.HealthObservations,
+					grants: catalogAuthority},
 				moveRun: moveController,
 			})) {
 			hotShardBindErr = hotshard.ErrInvalidPressureCut
