@@ -308,7 +308,7 @@ func readTransactionRecoveryManifestPage(
 	var coordinatorCopy [distributedtxn.ReplicatedManifestCoordinatorRecordBytes]byte
 	copy(coordinatorCopy[:], coordinatorRaw)
 	pageZero, err := transactionRecoveryManifestPage(snapshot, control.ID, 0, payload)
-	if err != nil || transactionManifestStartDigest(coordinatorCopy[:], pageZero) != control.PayloadDigest {
+	if err != nil || transactionManifestStartDigest(coordinatorCopy[:], pageZero) != control.MutationDigest {
 		return records, errors.Join(err, ErrTransactionStateCorrupt)
 	}
 	if err := transactionRecoveryManifestProgress(control.TransactionControl, descriptor); err != nil {
@@ -425,8 +425,11 @@ func transactionRecoveryCoordinatorPayload(
 		if err != nil {
 			return nil, err
 		}
-		pageZero, err := transactionRecoveryManifestPage(snapshot, control.ID, 0, arena[len(coordinator):])
-		if err != nil || transactionManifestStartDigest(coordinator, pageZero) != control.PayloadDigest ||
+		workspace := arena[:cap(arena)]
+		pageZero, err := transactionRecoveryManifestPage(
+			snapshot, control.ID, 0, workspace[len(coordinator):],
+		)
+		if err != nil || transactionManifestStartDigest(coordinator, pageZero) != control.MutationDigest ||
 			transactionRecoveryManifestProgress(control.TransactionControl, descriptor) != nil {
 			return nil, errors.Join(err, ErrTransactionStateCorrupt)
 		}
