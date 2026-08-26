@@ -24,6 +24,9 @@ var (
 	// ErrRuntimeOwnership reports a WAL, database, or apply claim that cannot be
 	// transferred into one exclusive Runtime owner.
 	ErrRuntimeOwnership = errors.New("raftmember: runtime ownership mismatch")
+	// ErrSchemaGenerationSwap reports an invalid or non-quiescent live SQL
+	// generation replacement attempt.
+	ErrSchemaGenerationSwap = errors.New("raftmember: schema generation swap refused")
 	// ErrResultSettlementRequired reports a result-bearing apply that cannot
 	// begin because no synchronous settlement sink was provided.
 	ErrResultSettlementRequired = errors.New("raftmember: applied result settlement sink is required")
@@ -388,12 +391,13 @@ type Runtime struct {
 	identity      RuntimeIdentity
 	walGeneration *walGenerationDriver
 
-	proposalBatchEntries int
-	proposalBatchBytes   int64
-	promotionScan        durablePromotionScan
-	failure              error
-	stopping             bool
-	closed               bool
+	proposalBatchEntries     int
+	proposalBatchBytes       int64
+	promotionScan            durablePromotionScan
+	failure                  error
+	stopping                 bool
+	closed                   bool
+	schemaGenerationQuiesced bool
 }
 
 type durablePromotionScan struct {
@@ -555,6 +559,69 @@ func (runtime *Runtime) checkUsable() error {
 	if runtime.node.Phase() == raftmodel.PhaseFailed {
 		return runtime.fail(runtime.node.Failure())
 	}
+	return nil
+}
+
+// QuiesceSQLGeneration fences every later Runtime operation, proves the Raft
+// node has no pending Ready/read/settlement work, and releases only the SQL
+// generation. WAL, RawNode, member incarnation, and replication progress stay
+// owned by Runtime for an exact target-generation install.
+func (runtime *Runtime) QuiesceSQLGeneration() error {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+		runtime.node == nil || runtime.wal == nil || runtime.apply == nil ||
+		runtime.database == nil || runtime.schemaGenerationQuiesced ||
+		runtime.walGeneration != nil {
+		return ErrSchemaGenerationSwap
+	}
+	if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	if err := runtime.apply.Close(); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	runtime.apply = nil
+	if err := runtime.database.Close(); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	runtime.database = nil
+	runtime.schemaGenerationQuiesced = true
+	return nil
+}
+
+// InstallSQLGeneration atomically replaces the quiesced local state-machine
+// handle at the identical durable Raft publication. The exact catalog and
+// apply identities are checked before Node publication; failure leaves Runtime
+// quiesced and serving-fenced for a retry or process recovery.
+func (runtime *Runtime) InstallSQLGeneration(
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+) error {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.wal == nil ||
+		runtime.apply != nil || runtime.database != nil || database == nil || apply == nil {
+		return ErrSchemaGenerationSwap
+	}
+	if _, err := database.RequireReplicatedShardStore(expectedSQL); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	actualApply, err := apply.Identity()
+	if err != nil || actualApply != expectedApply {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	manifest, err := apply.RangeSplitRelationManifestDigest()
+	if err != nil || manifest == ([32]byte{}) ||
+		manifest != expectedSQL.RelationManifestDigest {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	if err = runtime.node.ReplaceStateMachine(apply); err != nil {
+		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	runtime.database = database
+	runtime.apply = apply
+	runtime.identity.RelationManifestDigest = manifest
+	runtime.schemaGenerationQuiesced = false
 	return nil
 }
 

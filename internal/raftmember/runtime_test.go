@@ -119,6 +119,27 @@ func drainRuntime(t testing.TB, runtime *Runtime, send func(OutboundMessage) err
 
 func settleTestApplied(AppliedBatch) error { return nil }
 
+func TestRuntimeQuiesceSQLGenerationRetainsRaftAndWAL(t *testing.T) {
+	fixture := newRuntimeFixture(t, 248, nil)
+	runtime := fixture.runtime
+	if err := runtime.InstallSQLGeneration(
+		fixture.database, fixture.apply, fixture.base, fixture.applyID,
+	); !errors.Is(err, ErrSchemaGenerationSwap) {
+		t.Fatalf("install before quiesce error=%v", err)
+	}
+	if err := runtime.QuiesceSQLGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.schemaGenerationQuiesced || runtime.apply != nil || runtime.database != nil ||
+		runtime.node == nil || runtime.wal == nil {
+		t.Fatalf("quiesced runtime apply=%p database=%p node=%p wal=%p",
+			runtime.apply, runtime.database, runtime.node, runtime.wal)
+	}
+	if err := runtime.Propose([]byte{1}); !errors.Is(err, ErrRuntimeClosed) {
+		t.Fatalf("proposal after quiesce error=%v", err)
+	}
+}
+
 func TestRuntimeIdentityPublishesPortableMachineManifest(t *testing.T) {
 	fixture := newRuntimeFixture(t, 209, nil)
 	profile, err := fixture.apply.CapacityQualificationProfile()
