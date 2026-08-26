@@ -413,6 +413,13 @@ func failureEvidenceDigest(certificate FailureQuorumCertificate) [sha256.Size]by
 	return result
 }
 
+// FailureCertificateDigest returns the stable identity of one complete
+// replicated quorum certificate. It is suitable for binding authenticated
+// read-only observation requests; it does not itself authorize replacement.
+func FailureCertificateDigest(certificate FailureQuorumCertificate) [sha256.Size]byte {
+	return failureEvidenceDigest(certificate)
+}
+
 func replacementPlacementDigest(candidate ReplacementCandidate) [sha256.Size]byte {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("vibedb/rebalance/replacement-placement\x00"))

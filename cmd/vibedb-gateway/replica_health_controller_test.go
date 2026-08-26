@@ -8,8 +8,13 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 type testReplicaHealthCatalog struct{ snapshot *gateway.Snapshot }
@@ -105,6 +110,35 @@ func TestRunReplicaHealthControllerStartsImmediately(t *testing.T) {
 	}
 }
 
+type testAuthenticatedHealthClient struct{}
+
+func (testAuthenticatedHealthClient) Observe(
+	_ context.Context, _ rafttransport.NodeID, request replicacontrol.Request,
+) (replicacontrol.Observation, error) {
+	if request.TargetMember == 1 {
+		return replicacontrol.Observation{}, errors.New("failed member unavailable")
+	}
+	status := raftmember.RuntimeStatus{MemberID: request.TargetMember, LeaderID: 2,
+		Term: 4, Commit: 30, Applied: 30}
+	return replicacontrol.Observation{Request: request, Status: status,
+		Publication: raftmodel.Publication{Applied: 30, ReplicaSetVersion: 7,
+			ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}, nil
+}
+
+func TestAuthenticatedHealthObserverRequiresCurrentQuorumAndLeader(t *testing.T) {
+	snapshot, certificate := testReplicatedHealthSnapshot(t)
+	observer := gatewayAuthenticatedHealthObserver{client: testAuthenticatedHealthClient{}}
+	cut, err := observer.ObserveReplicaHealth(context.Background(), snapshot, certificate)
+	if err != nil || cut.Leader.MemberID != 2 || len(cut.Healthy) != 2 ||
+		cut.Healthy[0].Member != 2 || cut.Healthy[1].Member != 3 {
+		t.Fatalf("cut=%+v err=%v", cut, err)
+	}
+	certificate.LeaderTerm++
+	if _, err = observer.ObserveReplicaHealth(context.Background(), snapshot, certificate); err == nil {
+		t.Fatal("stale certificate term accepted")
+	}
+}
+
 func testReplicaHealthSnapshot(t testing.TB) *gateway.Snapshot {
 	t.Helper()
 	manifest, err := distribution.NewManifest("data", 1, []distribution.Shard{{
@@ -123,4 +157,52 @@ func testReplicaHealthSnapshot(t testing.TB) *gateway.Snapshot {
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.FailureQuorumCertificate) {
+	t.Helper()
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	manifest, err := distribution.NewManifest("data", 7, []distribution.Shard{{
+		ID: "all", AllocationGeneration: 11,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"one", "two", "three"}, Epoch: 13,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := map[distribution.EndpointID]string{
+		"one": "127.0.0.1:1", "one-native": "127.0.0.1:11", "one-control": "127.0.0.1:21",
+		"two": "127.0.0.1:2", "two-native": "127.0.0.1:12", "two-control": "127.0.0.1:22",
+		"three": "127.0.0.1:3", "three-native": "127.0.0.1:13", "three-control": "127.0.0.1:23",
+	}
+	replicas := make([]gateway.ReplicatedReplicaDescriptor, 3)
+	for index, name := range []string{"one", "two", "three"} {
+		member := uint64(index + 1)
+		replicas[index] = gateway.ReplicatedReplicaDescriptor{Member: member,
+			Node: [16]byte{byte(member)}, StoreID: [16]byte{byte(member + 10)},
+			NodeIncarnation: member + 20, Endpoint: distribution.EndpointID(name),
+			NativeEndpoint:  distribution.EndpointID(name + "-native"),
+			ControlEndpoint: distribution.EndpointID(name + "-control")}
+	}
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Manifests:     []*distribution.Manifest{manifest},
+	}, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{{
+		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
+		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
+			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
+			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},
+		Replicas: replicas,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot, rebalance.FailureQuorumCertificate{Distribution: "data", Shard: "all",
+		Group: group, CatalogGeneration: 9, ReplicaSetVersion: 7, LeaderTerm: 4,
+		CommitIndex: 25, FirstFailureEpoch: 10, ConfirmedEpoch: 12, SuspectMember: 1,
+		Confirmations: []rebalance.FailureConfirmation{
+			{Member: 2, FirstFailureEpoch: 10, ConfirmedEpoch: 12, LeaderTerm: 4, ReplicaSetVersion: 7, CommitIndex: 25},
+			{Member: 3, FirstFailureEpoch: 10, ConfirmedEpoch: 12, LeaderTerm: 4, ReplicaSetVersion: 7, CommitIndex: 25},
+		}}
 }
