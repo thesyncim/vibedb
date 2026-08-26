@@ -496,6 +496,9 @@ type Observation struct {
 	Catalog      *gateway.Snapshot
 	SourceState  replicatedstate.State
 	SourceStatus raftmember.RuntimeStatus
+	// SourceServing is the authenticated full serving fence used by mutating
+	// source actions. SourceStatus remains the compact reconciliation view.
+	SourceServing raftservice.ServingState
 	// CaptureHead is the detached, wire-safe source-capture publication head.
 	// Local runtimes may also provide Capture for execution; reconciliation
 	// accepts either representation but requires them to agree when both exist.

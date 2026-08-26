@@ -74,15 +74,25 @@ func (grants *DynamicShardActionGrants) resolve(
 }
 
 type PlanAdmissionGrantFactory interface {
-	BuildAdmittedShardActionGrants(context.Context, *Plan, PlanAdmission) ([]ShardActionGrant, error)
+	BuildAdmittedShardActionGrants(
+		context.Context, *Plan, PlanAdmission, []*RuntimeStoreLease,
+	) ([]ShardActionGrant, error)
 }
 
 // BoundPlanAdmissionBinder is the production bridge from durable admission to
 // the live action dispatcher. The factory receives the already-authenticated
 // Plan and may bind only local manifest-owned observers/executors.
 type BoundPlanAdmissionBinder struct {
+	mu      sync.Mutex
 	factory PlanAdmissionGrantFactory
 	grants  *DynamicShardActionGrants
+	active  map[OperationID]boundPlanAdmission
+	limit   int
+}
+
+type boundPlanAdmission struct {
+	digest [32]byte
+	leases []*RuntimeStoreLease
 }
 
 func NewBoundPlanAdmissionBinder(
@@ -96,12 +106,33 @@ func NewBoundPlanAdmissionBinder(
 }
 
 func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
-	ctx context.Context, plan *Plan, admission PlanAdmission,
+	ctx context.Context, plan *Plan, admission PlanAdmission, leases []*RuntimeStoreLease,
 ) error {
-	if binder == nil || ctx == nil || plan == nil || plan.OperationID() != admission.Operation {
+	if binder == nil || ctx == nil || plan == nil || plan.OperationID() != admission.Operation ||
+		len(leases) == 0 {
 		return ErrRemoteExecution
 	}
-	created, err := binder.factory.BuildAdmittedShardActionGrants(ctx, plan, admission)
+	binder.mu.Lock()
+	defer binder.mu.Unlock()
+	if binder.active == nil {
+		binder.limit = binder.grants.limit
+		binder.active = make(map[OperationID]boundPlanAdmission, min(binder.limit, 64))
+	}
+	if current, found := binder.active[admission.Operation]; found {
+		if current.digest != admission.PlanDigest {
+			return ErrRemoteExecution
+		}
+		for _, lease := range leases {
+			if err := lease.Release(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(binder.active) == binder.limit {
+		return ErrRemoteExecution
+	}
+	created, err := binder.factory.BuildAdmittedShardActionGrants(ctx, plan, admission, leases)
 	if err != nil || len(created) == 0 {
 		return ErrRemoteExecution
 	}
@@ -112,7 +143,13 @@ func (binder *BoundPlanAdmissionBinder) BindPlanAdmission(
 			return ErrRemoteExecution
 		}
 	}
-	return binder.grants.Install(created)
+	if err = binder.grants.Install(created); err != nil {
+		return err
+	}
+	binder.active[admission.Operation] = boundPlanAdmission{
+		digest: admission.PlanDigest, leases: append([]*RuntimeStoreLease(nil), leases...),
+	}
+	return nil
 }
 
 func validShardActionGrant(grant ShardActionGrant) bool {

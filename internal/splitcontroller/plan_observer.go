@@ -208,6 +208,7 @@ func (observer *CoherentPlanObserver) observeAttempt(
 			observed.SourceState, observed.SourceStatus = cut.State, cut.Status
 			if cut.Serving.Identity != (raftmember.RuntimeIdentity{}) {
 				observed.SourceStatus = cut.Serving.Status
+				observed.SourceServing = cut.Serving
 			}
 			observed.CaptureHead = cut.CaptureHead
 			observed.Artifacts, observed.Tail = cloneObservationPointer(cut.Artifacts), cloneObservationPointer(cut.Tail)

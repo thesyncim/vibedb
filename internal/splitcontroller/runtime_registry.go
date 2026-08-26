@@ -270,6 +270,20 @@ func (l *RuntimeStoreLease) Persist(
 	return l.store.Persist(kind, child, revision, payload)
 }
 
+// PinnedStore exposes the exact leased durable store to an admitted local
+// handle factory. The pointer remains valid only while this lease is retained.
+func (l *RuntimeStoreLease) PinnedStore() (*DurableRuntimeStore, error) {
+	if l == nil {
+		return nil, ErrRuntimeStore
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released || l.store == nil {
+		return nil, ErrRuntimeStore
+	}
+	return l.store, nil
+}
+
 func (l *RuntimeStoreLease) Release() error {
 	if l == nil {
 		return nil

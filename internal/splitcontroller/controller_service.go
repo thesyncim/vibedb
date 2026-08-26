@@ -71,9 +71,11 @@ func AppendReconcileTrigger(
 // reads/publication remain in the catalog RF3 authority; shard processes expose
 // only observation, artifact/tail data, and idempotent fenced actions.
 type ControllerService struct {
-	catalog  ControllerCatalog
-	observer PlanObserver
-	router   ShardControlRouter
+	catalog   ControllerCatalog
+	observer  PlanObserver
+	router    ShardControlRouter
+	admission PlanAdmissionCoordinator
+	gateway   GatewaySplitActionExecutor
 }
 
 // ExecuteReplicatedOperation reconstructs and advances one operation directly
@@ -100,11 +102,41 @@ func (service *ControllerService) ExecuteReplicatedOperation(
 		record.IntentDigest != sha256.Sum256(record.Intent) {
 		return Action{}, errors.Join(err, ErrControllerTrigger)
 	}
+	if service.admission != nil {
+		admission, admissionErr := NewPlanAdmission(catalog, plan)
+		if admissionErr != nil {
+			return Action{}, admissionErr
+		}
+		if admissionErr = service.admission.AdmitPlan(ctx, catalog, plan, admission); admissionErr != nil {
+			return Action{}, admissionErr
+		}
+	}
 	observed, err := service.observer.ObservePlan(ctx, plan)
 	if err != nil {
 		return Action{}, err
 	}
+	if service.gateway != nil {
+		return ExecuteCoordinatedReplicatedStep(
+			ctx, service.catalog, plan, observed, service.router, service.gateway,
+		)
+	}
 	return ExecuteRemoteReplicatedStep(ctx, service.catalog, plan, observed, service.router)
+}
+
+func NewServingControllerService(
+	catalog ControllerCatalog,
+	observer PlanObserver,
+	router ShardControlRouter,
+	admission PlanAdmissionCoordinator,
+	gateway GatewaySplitActionExecutor,
+) (*ControllerService, error) {
+	if catalog == nil || observer == nil || router == nil || admission == nil || gateway == nil {
+		return nil, ErrControllerTrigger
+	}
+	return &ControllerService{
+		catalog: catalog, observer: observer, router: router,
+		admission: admission, gateway: gateway,
+	}, nil
 }
 
 func NewControllerService(

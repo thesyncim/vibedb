@@ -26,11 +26,16 @@ type planAdmissionBinderStub struct {
 }
 
 func (stub *planAdmissionBinderStub) BindPlanAdmission(
-	_ context.Context, _ *Plan, _ PlanAdmission,
+	_ context.Context, _ *Plan, _ PlanAdmission, leases []*RuntimeStoreLease,
 ) error {
 	stub.calls++
 	if stub.fail {
 		return errPlanAdmissionBind
+	}
+	for _, lease := range leases {
+		if err := lease.Release(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

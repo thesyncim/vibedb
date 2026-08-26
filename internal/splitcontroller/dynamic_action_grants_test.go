@@ -11,7 +11,7 @@ type planAdmissionGrantFactoryStub struct {
 }
 
 func (factory *planAdmissionGrantFactoryStub) BuildAdmittedShardActionGrants(
-	_ context.Context, _ *Plan, _ PlanAdmission,
+	_ context.Context, _ *Plan, _ PlanAdmission, _ []*RuntimeStoreLease,
 ) ([]ShardActionGrant, error) {
 	factory.calls++
 	return factory.grants, nil
@@ -57,7 +57,15 @@ func TestDynamicShardActionGrantAppearsOnlyThroughBoundAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = binder.BindPlanAdmission(t.Context(), plan, admission); err != nil {
+	store, err := OpenDurableRuntimeStore(
+		t.TempDir(), plan.OperationID(), testManifestDigest("dynamic-grant"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	lease := &RuntimeStoreLease{store: store}
+	if err = binder.BindPlanAdmission(t.Context(), plan, admission, []*RuntimeStoreLease{lease}); err != nil {
 		t.Fatal(err)
 	}
 	resolved, cut, err := runtime.ObserveSplit(
