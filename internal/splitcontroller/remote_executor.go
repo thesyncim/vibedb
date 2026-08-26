@@ -13,6 +13,11 @@ import (
 
 var ErrRemoteExecution = errors.New("splitcontroller: remote shard action was not durably accepted")
 
+// MaxRemoteStepPayloadBytes is deliberately far below the generic control
+// frame bound. The remote envelope is fixed-width authority and digests; a
+// string-bearing PlanIntent or route accidentally embedded here fails closed.
+const MaxRemoteStepPayloadBytes = 4 << 10
+
 // ShardControlRouter selects the exact authenticated shard-control endpoint
 // for one already-reconciled action. It must not rebuild or reinterpret request.
 type ShardControlRouter interface {
@@ -20,12 +25,13 @@ type ShardControlRouter interface {
 }
 
 type remoteStepPayload struct {
-	Action          uint8    `json:"action"`
-	Child           uint8    `json:"child"`
-	Catalog         uint64   `json:"catalog"`
-	StateDigest     [32]byte `json:"state_digest"`
-	DataChainDigest [32]byte `json:"data_chain_digest"`
-	EntryDigest     [32]byte `json:"entry_digest"`
+	Action          uint8             `json:"action"`
+	Child           uint8             `json:"child"`
+	Catalog         uint64            `json:"catalog"`
+	Target          ShardActionTarget `json:"target"`
+	StateDigest     [32]byte          `json:"state_digest"`
+	DataChainDigest [32]byte          `json:"data_chain_digest"`
+	EntryDigest     [32]byte          `json:"entry_digest"`
 }
 
 // ExecuteRemoteReplicatedStep is the serving controller composition: intent
@@ -67,9 +73,14 @@ func appendRemoteStepRequest(
 		action.Kind > ActionComplete {
 		return shardcontrol.Request{}, ErrRemoteExecution
 	}
+	target, err := remoteActionTarget(plan, observed, action)
+	if err != nil {
+		return shardcontrol.Request{}, err
+	}
 	payload := remoteStepPayload{
 		Action: uint8(action.Kind), Child: action.Child,
 		Catalog:         action.CatalogGeneration,
+		Target:          target,
 		StateDigest:     remoteObservationStateDigest(observed.SourceState),
 		DataChainDigest: observed.SourceState.DataChainDigest,
 		EntryDigest:     observed.SourceState.LastEntryDigest,
@@ -78,8 +89,12 @@ func appendRemoteStepRequest(
 	if err != nil {
 		return shardcontrol.Request{}, err
 	}
+	start := len(dst)
 	dst, err = vibejson.AppendCanonicalize(dst, raw)
-	if err != nil || len(dst) > shardcontrol.MaxPayloadBytes {
+	if err != nil || len(dst)-start == 0 || len(dst)-start > MaxRemoteStepPayloadBytes {
+		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
+	}
+	if len(dst) > shardcontrol.MaxPayloadBytes {
 		return shardcontrol.Request{}, errors.Join(ErrRemoteExecution, err)
 	}
 	id := [32]byte(plan.OperationID())
@@ -114,6 +129,13 @@ func remoteObservationStateDigest(state replicatedstate.State) [32]byte {
 	_, _ = hash.Write(state.LastEntryDigest[:])
 	_, _ = hash.Write(state.DataChainDigest[:])
 	_, _ = hash.Write(state.SnapshotBaseDigest[:])
+	_, _ = hash.Write(binding.OwnedRange.Start[:])
+	_, _ = hash.Write(binding.OwnedRange.End.Point[:])
+	if binding.OwnedRange.End.Max {
+		_, _ = hash.Write([]byte{1})
+	} else {
+		_, _ = hash.Write([]byte{0})
+	}
 	var scalars [11 * 8]byte
 	for index, value := range [...]uint64{
 		state.Applied, state.LastTerm, state.ReplicaSetVersion,

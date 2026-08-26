@@ -15,7 +15,7 @@ type testShardActionRuntime struct {
 }
 
 func (runtime *testShardActionRuntime) ObserveSplit(
-	_ context.Context, operation OperationID, digest [32]byte,
+	_ context.Context, operation OperationID, digest [32]byte, _ ShardActionTarget,
 ) (*Plan, Observation, error) {
 	intent, err := AppendPlanIntent(nil, runtime.observed.Catalog, runtime.plan)
 	if err != nil || runtime.plan.OperationID() != operation || sha256.Sum256(intent) != digest {
@@ -25,7 +25,7 @@ func (runtime *testShardActionRuntime) ObserveSplit(
 }
 
 func (runtime *testShardActionRuntime) ExecuteSplitAction(
-	_ context.Context, plan *Plan, _ Observation, action Action,
+	_ context.Context, _ ShardActionTarget, plan *Plan, _ Observation, action Action,
 ) error {
 	if plan != runtime.plan || action.Kind != ActionAwaitSourceLeader {
 		return ErrRemoteExecution

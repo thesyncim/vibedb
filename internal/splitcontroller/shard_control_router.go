@@ -30,7 +30,9 @@ const (
 // already reconciled action. It is the only target-selection authority: host
 // names and DNS results are transport coordinates, never leader evidence.
 type ShardControlRouteResolver interface {
-	ResolveShardControl(context.Context, Action, shardcontrol.Request) (gateway.ReplicatedRoute, error)
+	ResolveShardControl(
+		context.Context, ShardActionTarget, Action, shardcontrol.Request,
+	) (gateway.ReplicatedRoute, error)
 }
 
 // ShardControlRoundTripper performs one request against one exact catalog
@@ -100,8 +102,12 @@ func (router *RoutedShardControl) ExecuteShardControl(
 		action.Child != request.Child {
 		return shardcontrol.Response{}, ErrShardControlRoute
 	}
-	route, err := router.resolver.ResolveShardControl(ctx, action, request)
-	if err != nil || !validShardControlRoute(route, request) {
+	target, err := OpenRemoteActionTarget(request)
+	if err != nil {
+		return shardcontrol.Response{}, errors.Join(ErrShardControlRoute, err)
+	}
+	route, err := router.resolver.ResolveShardControl(ctx, target, action, request)
+	if err != nil || !validShardControlRoute(route, target) {
 		return shardcontrol.Response{}, errors.Join(ErrShardControlRoute, err)
 	}
 	key := shardControlRouteKey(route)
@@ -140,15 +146,9 @@ func (router *RoutedShardControl) ExecuteShardControl(
 	return shardcontrol.Response{}, errors.Join(ErrShardControlUnavailable, joined)
 }
 
-func validShardControlRoute(route gateway.ReplicatedRoute, request shardcontrol.Request) bool {
-	command := route.Command
+func validShardControlRoute(route gateway.ReplicatedRoute, target ShardActionTarget) bool {
 	if route.Distribution == "" || route.Shard == "" || route.AllocationGeneration == 0 ||
-		route.AllocationGeneration != request.Fence.Allocation || !command.Valid() ||
-		command.OwnershipEpoch != request.Fence.OwnershipEpoch ||
-		command.SchemaGeneration != request.Fence.SchemaGeneration ||
-		command.RoutingVersion != request.Fence.RoutingVersion ||
-		command.RouteGeneration != request.Fence.RouteGeneration ||
-		command.ReplicaSetVersion != request.Fence.ReplicaSetVersion ||
+		!route.Command.Valid() || !targetMatchesRoute(target, route) ||
 		route.Group.ClusterID == ([16]byte{}) || route.Group.ClusterIncarnation == ([16]byte{}) ||
 		route.Group.TopologyRecoveryEpoch == 0 || route.Group.ShardIncarnation == ([16]byte{}) ||
 		route.Group.GroupID == ([16]byte{}) || len(route.Replicas) == 0 ||

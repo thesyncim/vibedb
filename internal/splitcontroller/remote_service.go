@@ -14,8 +14,8 @@ import (
 // ShardActionRuntime reconstructs plan and observation from local durable
 // authorities, then executes one idempotent existing split action.
 type ShardActionRuntime interface {
-	ObserveSplit(context.Context, OperationID, [32]byte) (*Plan, Observation, error)
-	ExecuteSplitAction(context.Context, *Plan, Observation, Action) error
+	ObserveSplit(context.Context, OperationID, [32]byte, ShardActionTarget) (*Plan, Observation, error)
+	ExecuteSplitAction(context.Context, ShardActionTarget, *Plan, Observation, Action) error
 }
 
 // RemoteActionService validates the independently reconstructed action before
@@ -37,21 +37,12 @@ func (service *RemoteActionService) ExecuteAction(
 	if service == nil || ctx == nil {
 		return shardcontrol.Response{}, ErrRemoteExecution
 	}
-	var payload remoteStepPayload
-	if err := vibejson.Unmarshal(request.Payload, &payload); err != nil {
-		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
-	}
-	canonical, err := vibejson.Marshal(&payload)
+	payload, err := openRemoteStepPayload(request)
 	if err != nil {
-		return shardcontrol.Response{}, err
-	}
-	canonical, err = vibejson.AppendCanonicalize(nil, canonical)
-	if err != nil || !bytes.Equal(canonical, request.Payload) ||
-		payload.Action != uint8(request.Action) || payload.Child != request.Child {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
 	operation := OperationID(request.Operation)
-	plan, observed, err := service.runtime.ObserveSplit(ctx, operation, request.PlanDigest)
+	plan, observed, err := service.runtime.ObserveSplit(ctx, operation, request.PlanDigest, payload.Target)
 	if err != nil || plan == nil || plan.OperationID() != operation {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
@@ -60,13 +51,19 @@ func (service *RemoteActionService) ExecuteAction(
 		action.CatalogGeneration != payload.Catalog {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
+	expectedTarget, err := remoteActionTarget(plan, observed, action)
+	if err != nil || expectedTarget != payload.Target ||
+		remoteActionTargetsChild(action.Kind) && !targetMatchesChild(payload.Target, plan.targets[action.Child]) ||
+		!remoteActionTargetsChild(action.Kind) && !targetMatchesSourceState(payload.Target, observed.SourceState) {
+		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
+	}
 	expected, err := appendRemoteStepRequest(nil, plan, observed, action)
 	if err != nil || expected.Operation != request.Operation || expected.Step != request.Step ||
 		expected.PlanDigest != request.PlanDigest || expected.Fence != request.Fence ||
 		!bytes.Equal(expected.Payload, request.Payload) {
 		return shardcontrol.Response{}, errors.Join(ErrRemoteExecution, err)
 	}
-	if err = service.runtime.ExecuteSplitAction(ctx, plan, observed, action); err != nil {
+	if err = service.runtime.ExecuteSplitAction(ctx, payload.Target, plan, observed, action); err != nil {
 		return shardcontrol.Response{}, err
 	}
 	resultPayload := []byte(`{"accepted":true}`)
@@ -75,4 +72,33 @@ func (service *RemoteActionService) ExecuteAction(
 		Code: shardcontrol.ResultAccepted, Operation: request.Operation, Step: request.Step,
 		ResultDigest: resultDigest, Payload: resultPayload,
 	}, nil
+}
+
+func openRemoteStepPayload(request shardcontrol.Request) (remoteStepPayload, error) {
+	if len(request.Payload) == 0 || len(request.Payload) > MaxRemoteStepPayloadBytes {
+		return remoteStepPayload{}, ErrRemoteExecution
+	}
+	var payload remoteStepPayload
+	if err := vibejson.Unmarshal(request.Payload, &payload); err != nil {
+		return remoteStepPayload{}, err
+	}
+	canonical, err := vibejson.Marshal(&payload)
+	if err != nil {
+		return remoteStepPayload{}, err
+	}
+	canonical, err = vibejson.AppendCanonicalize(nil, canonical)
+	if err != nil || !bytes.Equal(canonical, request.Payload) ||
+		payload.Action != uint8(request.Action) || payload.Child != request.Child ||
+		!payload.Target.valid() {
+		return remoteStepPayload{}, errors.Join(ErrRemoteExecution, err)
+	}
+	return payload, nil
+}
+
+// OpenRemoteActionTarget verifies the complete canonical remote-step envelope
+// and returns its fixed-width routing authority. The returned value contains no
+// borrowed strings or payload slices.
+func OpenRemoteActionTarget(request shardcontrol.Request) (ShardActionTarget, error) {
+	payload, err := openRemoteStepPayload(request)
+	return payload.Target, err
 }

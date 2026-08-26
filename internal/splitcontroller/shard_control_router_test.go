@@ -12,6 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardcontrol"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibejson"
 )
 
 type fixedShardControlResolver struct {
@@ -20,7 +22,7 @@ type fixedShardControlResolver struct {
 }
 
 func (resolver fixedShardControlResolver) ResolveShardControl(
-	_ context.Context, _ Action, _ shardcontrol.Request,
+	_ context.Context, _ ShardActionTarget, _ Action, _ shardcontrol.Request,
 ) (gateway.ReplicatedRoute, error) {
 	return resolver.route, resolver.err
 }
@@ -81,6 +83,9 @@ func TestRoutedShardControlFollowsNotLeaderAndScopesHintToExactGroupFence(t *tes
 	// A catalog fence change must not consume the old group's warm hint.
 	route.Command.RouteGeneration++
 	request.Fence.RouteGeneration++
+	payload, _ := openRemoteStepPayload(request)
+	payload.Target.Authority.RouteGeneration++
+	request.Payload = mustRemoteStepPayload(t, payload)
 	client.responses[1] = []shardcontrol.Response{accepted}
 	router.resolver = fixedShardControlResolver{route: route}
 	if _, executeErr := router.ExecuteShardControl(context.Background(), action, request); executeErr != nil {
@@ -113,7 +118,9 @@ func TestRoutedShardControlRejectsRouteBeforeIOAndBoundsRetry(t *testing.T) {
 	}
 
 	client.calls = nil
-	request.Fence.OwnershipEpoch++
+	payload, _ := openRemoteStepPayload(request)
+	payload.Target.Authority.OwnershipEpoch++
+	request.Payload = mustRemoteStepPayload(t, payload)
 	if _, executeErr := router.ExecuteShardControl(
 		context.Background(), Action{Kind: ActionSealSource}, request,
 	); !errors.Is(executeErr, ErrShardControlRoute) || len(client.calls) != 0 {
@@ -141,7 +148,7 @@ func testShardControlRequestRoute() (shardcontrol.Request, gateway.ReplicatedRou
 	}
 	request := shardcontrol.Request{
 		Action: shardcontrol.ActionSealSource, Operation: [32]byte{1}, Step: [32]byte{2},
-		PlanDigest: [32]byte{3}, Payload: []byte(`{"action":6}`),
+		PlanDigest: [32]byte{3},
 		Fence: shardcontrol.Fence{
 			CatalogGeneration: 1, Allocation: 9, OwnershipEpoch: command.OwnershipEpoch,
 			SchemaGeneration: command.SchemaGeneration, RoutingVersion: command.RoutingVersion,
@@ -149,8 +156,35 @@ func testShardControlRequestRoute() (shardcontrol.Request, gateway.ReplicatedRou
 			Applied: 10,
 		},
 	}
+	payload := remoteStepPayload{
+		Action: uint8(request.Action), Target: ShardActionTarget{
+			Group: group, Allocation: 9,
+			Authority: sqldriver.ReplicatedAuthorityProfile{
+				ActivePolicyGeneration: command.ActivePolicyGeneration,
+				ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
+				SchemaGeneration: command.SchemaGeneration, RoutingVersion: command.RoutingVersion,
+				RouteGeneration: command.RouteGeneration,
+			},
+			RelationManifestDigest: command.RelationManifestDigest,
+		},
+	}
+	request.Payload = mustRemoteStepPayload(nil, payload)
 	return request, gateway.ReplicatedRoute{
 		Distribution: distribution.DistributionName("d"), Shard: distribution.ShardID("s"),
 		Group: group, AllocationGeneration: 9, Command: command, Replicas: replicas,
 	}
+}
+
+func mustRemoteStepPayload(t *testing.T, payload remoteStepPayload) []byte {
+	raw, err := vibejson.Marshal(&payload)
+	if err == nil {
+		raw, err = vibejson.AppendCanonicalize(nil, raw)
+	}
+	if err != nil {
+		if t != nil {
+			t.Fatal(err)
+		}
+		panic(err)
+	}
+	return raw
 }
