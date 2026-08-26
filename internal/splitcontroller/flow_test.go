@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -41,6 +42,7 @@ func TestReconcileRealProofFlowRecoversAtEveryPublishBeforePrunePhase(t *testing
 	state := flowSourceState(t, source.machine)
 	observed := Observation{
 		Catalog: catalog, SourceState: state, SourceStatus: testLeaderStatus(state),
+		SourceNode: rafttransport.NodeID{1},
 	}
 	assertCrashRecovery(observed, ActionStartCapture)
 

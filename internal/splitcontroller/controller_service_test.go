@@ -36,7 +36,7 @@ func TestDirectControllerPassKeepsCatalogAuthorityInGateway(t *testing.T) {
 	plan, snapshot, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: snapshot, SourceState: state}
+	observed := Observation{Catalog: snapshot, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestControllerServiceReconstructsRF3PlanBeforeFencedRemoteStep(t *testing.T
 	plan, snapshot, _, _ := testPlan(t)
 	state := testSourceState(plan)
 	state.ReplicaSetVersion = 1
-	observed := Observation{Catalog: snapshot, SourceState: state}
+	observed := Observation{Catalog: snapshot, SourceState: state, SourceNode: rafttransport.NodeID{1}}
 	action, err := Reconcile(plan, observed)
 	if err != nil {
 		t.Fatal(err)
