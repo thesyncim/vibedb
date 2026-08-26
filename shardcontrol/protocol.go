@@ -71,6 +71,10 @@ const (
 	ResultConflict
 	ResultBound
 	ResultUnauthorized
+	// ResultNotLeader is a transient, non-journaled response emitted by the
+	// authenticated server boundary. It is never a durable action result: the
+	// same exact request may be retried at another replica.
+	ResultNotLeader
 )
 
 // Fence binds the request to exact catalog and replicated-state authorities.
@@ -113,7 +117,7 @@ func validAction(action Action) bool {
 }
 
 func validResult(code ResultCode) bool {
-	return code >= ResultAccepted && code <= ResultUnauthorized
+	return code >= ResultAccepted && code <= ResultNotLeader
 }
 
 func validFence(fence Fence) bool {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
@@ -15,6 +16,56 @@ type testPeerConnection struct {
 	net.Conn
 	identity rafttransport.PeerIdentity
 	class    rafttransport.TrafficClass
+}
+
+type notLeaderExecutor struct{ calls int }
+
+func (executor *notLeaderExecutor) ExecuteControl(
+	_ context.Context, _ rafttransport.PeerIdentity, request Request,
+) (Response, error) {
+	executor.calls++
+	if executor.calls == 1 {
+		return Response{}, raftmodel.ErrNotLeader
+	}
+	return (&testExecutor{}).ExecuteControl(context.Background(), rafttransport.PeerIdentity{}, request)
+}
+
+func TestAuthenticatedServiceReturnsNonDurableNotLeader(t *testing.T) {
+	node := rafttransport.NodeID{1}
+	authorizer, err := NewAuthorizer([]ActionGrant{{
+		Node: node, Actions: 1 << uint(ActionSealSource-1),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := new(notLeaderExecutor)
+	server, err := NewServer(authorizer, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := func(_ context.Context, _ string) (net.Conn, error) {
+		client, rawServer := net.Pipe()
+		connection := testPeerConnection{Conn: rawServer,
+			identity: rafttransport.PeerIdentity{Node: node},
+			class:    rafttransport.TrafficShardControl,
+		}
+		go func() { _ = server.ServeConnection(context.Background(), connection) }()
+		return client, nil
+	}
+	client, err := NewClient(dial, "member-1", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest()
+	response, err := client.Execute(context.Background(), request)
+	if err != nil || response.Code != ResultNotLeader || response.Operation != request.Operation ||
+		response.Step != request.Step || response.ResultDigest == ([32]byte{}) {
+		t.Fatalf("response=%+v err=%v", response, err)
+	}
+	response, err = client.Execute(context.Background(), request)
+	if err != nil || response.Code != ResultAccepted || executor.calls != 2 {
+		t.Fatalf("response=%+v calls=%d err=%v", response, executor.calls, err)
+	}
 }
 
 func (connection testPeerConnection) PeerIdentity() rafttransport.PeerIdentity {
