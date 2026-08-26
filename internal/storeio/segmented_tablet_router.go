@@ -199,6 +199,20 @@ type SegmentedTabletRouterLeafSplitResult struct {
 	Bytes       int
 }
 
+// SegmentedTabletRouterLeafRemoveResult reports the localized persistent
+// rewrite set for removing one leaf from a non-singleton anchor. The stable
+// anchor page remains allocated; only that anchor, its dense locator, and the
+// segmented root are rewritten.
+type SegmentedTabletRouterLeafRemoveResult struct {
+	Root      []byte
+	Locator   []byte
+	Page      []byte
+	PageID    uint8
+	LocalID   uint16
+	PageCount uint8
+	Bytes     int
+}
+
 type segmentedTabletRouterFence struct {
 	a, b, c []byte
 }

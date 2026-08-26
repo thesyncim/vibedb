@@ -602,6 +602,61 @@ func (r *ResidentPrimaryRouter) SplitLeaf(
 	return next, nil
 }
 
+// RemoveLeaf builds the next immutable routing image by splicing one already
+// published structural leaf removal into this router. The selected leaf's
+// interval falls through to its lexical predecessor. Removing the global
+// first leaf instead promotes its successor to the empty negative-infinity
+// floor. The old router remains valid for concurrent readers.
+func (r *ResidentPrimaryRouter) RemoveLeaf(
+	route ResidentPrimaryRoute,
+	generation uint64,
+) (*ResidentPrimaryRouter, error) {
+	started := time.Now()
+	if r == nil || r.Len() <= 1 || int(route.rank) >= r.Len() ||
+		generation <= r.Generation() || generation >= uint64(1)<<48 {
+		return nil, fmt.Errorf("%w: resident remove identity", ErrInvalidWrite)
+	}
+	current, ok := r.RouteAtRank(int(route.rank))
+	if !ok || current.Ref != route.Ref || current.Bucket != route.Bucket {
+		return nil, fmt.Errorf("%w: resident remove route", ErrInvalidWrite)
+	}
+
+	next := &ResidentPrimaryRouter{storeID: r.storeID}
+	removedFenceBytes := len(r.fence(int(route.rank)))
+	next.fences = make([]byte, 0, len(r.fences)-removedFenceBytes)
+	next.rows = make([]uint64, 0, len(r.rows)-residentPrimaryRouterWords)
+	next.empty = make([]atomic.Uint32, r.Len()-1)
+	appendRow := func(fence []byte, old ResidentPrimaryRoute, empty uint32) {
+		start := len(next.fences)
+		next.fences = append(next.fences, fence...)
+		next.rows = append(next.rows,
+			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
+			old.Ref.Offset, old.Ref.Generation,
+			uint64(old.Ref.Length)|uint64(uint32(old.Bucket))<<32,
+		)
+		next.empty[next.Len()-1].Store(empty)
+	}
+	for rank := 0; rank < r.Len(); rank++ {
+		if rank == int(route.rank) {
+			continue
+		}
+		old, routeOK := r.RouteAtRank(rank)
+		if !routeOK {
+			return nil, fmt.Errorf("%w: resident remove source", ErrInvalidWrite)
+		}
+		fence := r.fence(rank)
+		if route.rank == 0 && rank == 1 {
+			fence = nil
+		}
+		appendRow(fence, old, r.empty[rank].Load())
+	}
+	next.hints = make([]pageCacheFrameHint, next.Len())
+	next.buildSearchKeys()
+	next.generation.Store(generation)
+	next.buildNS = time.Since(started).Nanoseconds()
+	return next, nil
+}
+
 // AdvanceGeneration records a canonical-frame mutation whose stable leaf
 // handle did not change.
 func (r *ResidentPrimaryRouter) AdvanceGeneration(generation uint64) {

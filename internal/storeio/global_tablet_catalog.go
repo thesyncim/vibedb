@@ -1589,6 +1589,175 @@ func (v *GlobalTabletCatalogTabletRootView) InsertSplitLeaf(
 	return result, nil
 }
 
+// RemoveLeaf performs the localized structural edit for one primary-leaf
+// removal. The selected anchor must retain at least one row, so stable anchor
+// identity and page cardinality do not change. Every unaffected anchor
+// reference is preserved, the removed LocalID becomes immediately empty in
+// the new generation's locator, and deleting the global first row promotes
+// its successor to the canonical empty negative-infinity floor.
+func (v *GlobalTabletCatalogTabletRootView) RemoveLeaf(
+	rootDst, locatorDst, pageDst []byte,
+	generation uint64,
+	route SegmentedTabletRouterRoute,
+	anchorRef PageRef,
+	locator *GlobalTabletCatalogLocatorView,
+	anchor *GlobalTabletCatalogAnchorView,
+) (SegmentedTabletRouterLeafRemoveResult, error) {
+	var result SegmentedTabletRouterLeafRemoveResult
+	if v == nil || locator == nil || anchor == nil || len(v.image) == 0 ||
+		len(locator.image) != GlobalTabletCatalogLocatorBytes ||
+		len(anchor.page.image) != SegmentedTabletRouterAnchorPageBytes ||
+		len(rootDst) < SegmentedTabletRouterRootBytes ||
+		len(locatorDst) < GlobalTabletCatalogLocatorBytes ||
+		len(pageDst) < SegmentedTabletRouterAnchorPageBytes ||
+		generation <= v.inner.generation || generation >= uint64(1)<<48 ||
+		locator.ref != v.locator || locator.tabletID != v.inner.tabletID ||
+		anchor.tabletID != v.inner.tabletID || anchor.locator != v.locator ||
+		anchor.page.pageID != route.PageID || anchor.page.count <= 1 {
+		return result, fmt.Errorf("%w: localized leaf remove selection", ErrInvalidWrite)
+	}
+	currentRef, _, ok := anchor.page.handleAt(route.RowSlot, route.Bucket)
+	tabletID, localID, bucketOK := SplitTabletLocalIdentityBucket(uint32(route.Bucket))
+	pageID, rowSlot, state := locator.Resolve(uint16(localID))
+	if !ok || currentRef != route.Ref || !bucketOK || tabletID != v.inner.tabletID ||
+		pageID != route.PageID || rowSlot != route.RowSlot ||
+		state != GlobalTabletCatalogLocatorLive ||
+		anchorRef.Generation != generation ||
+		segmentedTabletRouterValidateAnchorRefIdentity(
+			anchorRef, tabletID, generation, route.PageID,
+		) != nil {
+		return result, fmt.Errorf("%w: localized leaf remove identity", ErrInvalidWrite)
+	}
+	sourceRank := -1
+	for rank := 0; rank < int(anchor.page.count); rank++ {
+		if anchor.page.ranks[rank] == route.RowSlot {
+			sourceRank = rank
+			break
+		}
+	}
+	rootRank := -1
+	for rank := 0; rank < int(v.inner.pageCount); rank++ {
+		if v.inner.rootRanks[rank] == route.PageID {
+			rootRank = rank
+			break
+		}
+	}
+	if sourceRank < 0 || rootRank < 0 {
+		return result, fmt.Errorf("%w: localized leaf remove rank", ErrInvalidWrite)
+	}
+
+	type removeRow struct {
+		fence segmentedTabletRouterFence
+		local uint16
+		ref   PageRef
+		zone  BucketZone
+	}
+	count := int(anchor.page.count) - 1
+	rowAt := func(rank int) removeRow {
+		oldRank := rank
+		if rank >= sourceRank {
+			oldRank++
+		}
+		slot := anchor.page.ranks[oldRank]
+		rowLocalID := binary.LittleEndian.Uint16(anchor.page.localIDs[int(slot)*2:])
+		bucketU, _ := MakeTabletLocalIdentityBucket(tabletID, uint32(rowLocalID))
+		ref, zone, _ := anchor.page.handleAt(slot, BucketID(bucketU))
+		fence := anchor.page.fenceAt(oldRank)
+		if rootRank == 0 && sourceRank == 0 && rank == 0 {
+			fence = segmentedTabletRouterFence{}
+		}
+		return removeRow{fence: fence, local: rowLocalID, ref: ref, zone: zone}
+	}
+	header := SegmentedTabletRouterHeader{
+		StoreID: v.inner.storeID, TabletID: tabletID, Generation: generation,
+		AnchorKind: v.inner.anchorKind, LeafKind: v.inner.leafKind,
+	}
+	if _, err := segmentedTabletRouterEncodeAnchor(
+		pageDst, header, route.PageID, count,
+		func(rank int) segmentedTabletRouterFence { return rowAt(rank).fence },
+		func(rank int) (uint8, uint16, PageRef, BucketZone) {
+			row := rowAt(rank)
+			return uint8(rank), row.local, row.ref, row.zone
+		},
+	); err != nil {
+		return result, err
+	}
+
+	locatorImage := locatorDst[:GlobalTabletCatalogLocatorBytes]
+	copy(locatorImage, locator.image)
+	binary.LittleEndian.PutUint64(locatorImage[24:32], generation)
+	payload := locatorImage[PageHeaderSize:]
+	if locator.live == 0 {
+		return result, fmt.Errorf("%w: localized leaf remove locator", ErrInvalidWrite)
+	}
+	binary.LittleEndian.PutUint16(payload[8:10], locator.live-1)
+	packed := payload[GlobalTabletCatalogLocatorHeader:]
+	globalTabletCatalogPut14(packed, uint16(localID), 0)
+	for rank := 0; rank < count; rank++ {
+		row := rowAt(rank)
+		globalTabletCatalogPut14(
+			packed, row.local,
+			uint16(GlobalTabletCatalogLocatorLive)<<12|
+				uint16(route.PageID)<<8|uint16(rank),
+		)
+	}
+	if _, err := sealInitializedPage(locatorImage); err != nil {
+		return result, err
+	}
+
+	root := rootDst[:SegmentedTabletRouterRootBytes]
+	clear(root)
+	copy(root[:segmentedTabletRouterRootHeaderBytes],
+		v.inner.root[:segmentedTabletRouterRootHeaderBytes])
+	binary.LittleEndian.PutUint64(root[24:32], generation)
+	binary.LittleEndian.PutUint32(root[36:40], PageChecksum(locatorImage))
+	for stableID := range uint8(SegmentedTabletRouterMaxPages) {
+		ref, refOK := v.inner.anchorRef(stableID)
+		if stableID == route.PageID {
+			ref, refOK = anchorRef, true
+		}
+		if !refOK {
+			continue
+		}
+		segmentedTabletRouterEncodeAnchorRef(
+			root[segmentedTabletRouterRootRefsAt+
+				int(stableID)*segmentedTabletRouterRootRefBytes:], ref,
+		)
+	}
+	keyAt := 0
+	for rank := 0; rank < int(v.inner.pageCount); rank++ {
+		stableID := v.inner.rootRanks[rank]
+		root[segmentedTabletRouterRootRanksAt+rank] = stableID
+		binary.LittleEndian.PutUint16(
+			root[segmentedTabletRouterRootOffsetsAt+rank*2:], uint16(keyAt),
+		)
+		fence := v.inner.rootFence(rank)
+		if rank == rootRank {
+			fence = rowAt(0).fence
+		}
+		if keyAt+fence.length() > segmentedTabletRouterRootTrailerAt-
+			segmentedTabletRouterRootKeysAt {
+			return result, ErrSegmentedTabletRouterNoSpace
+		}
+		keyAt += fence.copyTo(root[segmentedTabletRouterRootKeysAt+keyAt:], 0)
+	}
+	binary.LittleEndian.PutUint16(
+		root[segmentedTabletRouterRootOffsetsAt+int(v.inner.pageCount)*2:],
+		uint16(keyAt),
+	)
+	binary.LittleEndian.PutUint16(root[32:34], uint16(keyAt))
+	segmentedTabletRouterSeal(root, segmentedTabletRouterRootTrailerAt)
+
+	return SegmentedTabletRouterLeafRemoveResult{
+		Root: root, Locator: locatorImage,
+		Page:   pageDst[:SegmentedTabletRouterAnchorPageBytes],
+		PageID: route.PageID, LocalID: uint16(localID),
+		PageCount: v.inner.pageCount,
+		Bytes: SegmentedTabletRouterRootBytes + GlobalTabletCatalogLocatorBytes +
+			SegmentedTabletRouterAnchorPageBytes,
+	}, nil
+}
+
 // RewriteAnchorHandles writes one anchor after-image containing every listed
 // stable-row leaf replacement. All rewrites must select the supplied anchor;
 // the tablet root itself is rewritten separately by RewriteAnchorRefs.
@@ -2056,11 +2225,16 @@ func (b GlobalTabletCatalogBounds) extends(previous GlobalTabletCatalogBounds) b
 func globalTabletCatalogPut14(dst []byte, localID uint16, code uint16) {
 	bit := int(localID) * globalTabletCatalogPackedBits
 	at, shift := bit>>3, uint(bit&7)
-	word := uint32(code&0x3fff) << shift
-	dst[at] |= byte(word)
-	dst[at+1] |= byte(word >> 8)
+	word := uint32(dst[at]) | uint32(dst[at+1])<<8
 	if at+2 < len(dst) {
-		dst[at+2] |= byte(word >> 16)
+		word |= uint32(dst[at+2]) << 16
+	}
+	mask := uint32(0x3fff) << shift
+	word = word&^mask | uint32(code&0x3fff)<<shift
+	dst[at] = byte(word)
+	dst[at+1] = byte(word >> 8)
+	if at+2 < len(dst) {
+		dst[at+2] = byte(word >> 16)
 	}
 }
 
