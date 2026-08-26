@@ -801,6 +801,21 @@ func (runtime *Runtime) SnapshotState() (replicatedstate.State, error) {
 	return state, nil
 }
 
+// SnapshotBaseCertificate returns the exact immutable snapshot-base
+// certificate sealed into the current WAL generation. It never synthesizes a
+// certificate from live state: callers use the returned digest together with
+// SnapshotState to reject a stale generation or unrelated base.
+func (runtime *Runtime) SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error) {
+	if err := runtime.checkNoPendingSettlement(); err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	snapshot, err := runtime.wal.Snapshot()
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	return replicatedstate.OpenSnapshotBase(snapshot)
+}
+
 // Status returns detached local Raft status without allocating the leader's
 // complete progress map.
 func (runtime *Runtime) Status() (RuntimeStatus, error) {

@@ -3,6 +3,7 @@ package replicacontrol
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -90,6 +91,22 @@ func TestCodecRoundTripIsCanonicalBoundedAndStrict(t *testing.T) {
 	}
 	if _, err = OpenResponse(append(append([]byte(nil), encoded...), 0)); err == nil {
 		t.Fatal("accepted trailing response byte")
+	}
+	reserved := append([]byte(nil), encoded...)
+	reserved[276] = 1
+	if _, err = OpenResponse(reserved); err == nil {
+		t.Fatal("accepted noncanonical response tail")
+	}
+	oversized := append([]byte(nil), encoded...)
+	binary.BigEndian.PutUint32(oversized[268:272], MaxSnapshotBaseEnvelopeBytes+1)
+	if _, err = OpenResponse(oversized); err == nil {
+		t.Fatal("accepted oversized snapshot-base envelope")
+	}
+	malformedCertificate := append(append([]byte(nil), encoded...), 0)
+	binary.BigEndian.PutUint32(malformedCertificate[268:272], 1)
+	binary.BigEndian.PutUint32(malformedCertificate[272:276], uint32(len(malformedCertificate)))
+	if _, err = OpenResponse(malformedCertificate); err == nil {
+		t.Fatal("accepted malformed snapshot-base envelope")
 	}
 }
 

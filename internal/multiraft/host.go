@@ -206,6 +206,10 @@ type memberRuntime interface {
 	Close() error
 }
 
+type snapshotBaseRuntime interface {
+	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
+}
+
 type queuedMessage struct {
 	message *pb.Message
 	size    int64
@@ -816,6 +820,22 @@ func (host *Host) SnapshotState(key raftmember.GroupKey) (replicatedstate.State,
 		return replicatedstate.State{}, err
 	}
 	return group.runtime.SnapshotState()
+}
+
+// SnapshotBaseCertificate returns the exact immutable certificate retained by
+// one member's current WAL generation.
+func (host *Host) SnapshotBaseCertificate(
+	key raftmember.GroupKey,
+) (replicatedstate.SnapshotBaseCertificate, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return replicatedstate.SnapshotBaseCertificate{}, err
+	}
+	source, ok := group.runtime.(snapshotBaseRuntime)
+	if !ok {
+		return replicatedstate.SnapshotBaseCertificate{}, nil
+	}
+	return source.SnapshotBaseCertificate()
 }
 
 // Status returns one group's detached local Raft status.

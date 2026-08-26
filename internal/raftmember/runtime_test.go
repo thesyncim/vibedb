@@ -630,6 +630,16 @@ func TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally(t *testing.
 		after.ConfState.Equivalent(before.ConfState) != nil {
 		t.Fatalf("restarted publication = %+v, %v; before %+v", after, err, before)
 	}
+	retained, err := restarted.SnapshotBaseCertificate()
+	if err != nil || retained.Digest == ([32]byte{}) ||
+		retained.Manifest.State.Applied != before.Applied {
+		t.Fatalf("retained snapshot-base certificate = %+v, %v", retained, err)
+	}
+	retainedState, err := restarted.SnapshotState()
+	if err != nil || retainedState.SnapshotBaseDigest != retained.Digest {
+		t.Fatalf("retained snapshot-base/state mismatch = %x/%x, %v",
+			retained.Digest, retainedState.SnapshotBaseDigest, err)
+	}
 	drainRuntime(t, restarted, nil)
 	if err := restarted.Campaign(); err != nil {
 		t.Fatal(err)

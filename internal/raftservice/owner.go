@@ -157,6 +157,7 @@ type ReplicaObservation struct {
 	TargetProgress raftmodel.MemberProgress
 	ProgressFound  bool
 	State          replicatedstate.State
+	SnapshotBase   *replicatedstate.SnapshotBaseCertificate
 }
 
 type readRequest struct {
@@ -870,6 +871,18 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		if reply.err == nil {
 			reply.observation.State, reply.err = owner.host.SnapshotState(request.group)
+		}
+		if reply.err == nil {
+			certificate, certificateErr := owner.host.SnapshotBaseCertificate(request.group)
+			if certificateErr != nil && !errors.Is(certificateErr, replicatedstate.ErrSnapshotBase) {
+				reply.err = certificateErr
+			} else if certificate.Digest == reply.observation.State.SnapshotBaseDigest &&
+				stateMatchesReplicaGroup(certificate.Manifest.State, request.group) &&
+				certificate.Manifest.State.ConfState != nil &&
+				containsSorted(certificate.Manifest.State.ConfState.GetLearners(), request.targetMember) &&
+				!containsSorted(certificate.Manifest.State.ConfState.GetVoters(), request.targetMember) {
+				reply.observation.SnapshotBase = &certificate
+			}
 		}
 		if reply.err == nil {
 			reply.err = owner.syncCommandFenceFromState(request.group, reply.observation)
@@ -2033,6 +2046,14 @@ func (owner *Owner) ObserveReplica(
 		reply: make(chan ownerReply, 1),
 	})
 	return reply.observation, err
+}
+
+func stateMatchesReplicaGroup(state replicatedstate.State, group raftmember.GroupKey) bool {
+	return [16]byte(state.Binding.ClusterID) == group.ClusterID &&
+		[16]byte(state.Binding.ClusterIncarnation) == group.ClusterIncarnation &&
+		state.Binding.TopologyRecoveryEpoch == group.TopologyRecoveryEpoch &&
+		[16]byte(state.Binding.ShardIncarnation) == group.ShardIncarnation &&
+		[16]byte(state.Binding.GroupID) == group.GroupID
 }
 
 // Done closes when the lane stops.

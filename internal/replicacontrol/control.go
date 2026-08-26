@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -35,8 +37,9 @@ func RequestDiscriminator() [8]byte { return requestMagic }
 
 const (
 	RequestBytes                   = 184
-	responseHeaderBytes            = 272
-	MaxResponseBytes               = responseHeaderBytes + replicatedstate.MaxStateEnvelopeBytes
+	responseHeaderBytes            = 280
+	MaxSnapshotBaseEnvelopeBytes   = replicatedstate.MaxSnapshotBaseCertificateBytes + 1024
+	MaxResponseBytes               = responseHeaderBytes + replicatedstate.MaxStateEnvelopeBytes + MaxSnapshotBaseEnvelopeBytes
 	AbsoluteMaxConcurrentObservers = 256
 )
 
@@ -66,6 +69,7 @@ type Observation struct {
 	Progress      raftmodel.MemberProgress
 	ProgressFound bool
 	State         replicatedstate.State
+	SnapshotBase  *replicatedstate.SnapshotBaseCertificate
 }
 
 func (observation Observation) TransferWitness(target uint64) (settled, inFlight bool) {
@@ -158,7 +162,7 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	}
 	observation := Observation{Request: request, Publication: cut.Publication,
 		Status: cut.Status, Progress: cut.TargetProgress, ProgressFound: cut.ProgressFound,
-		State: cut.State}
+		State: cut.State, SnapshotBase: cut.SnapshotBase}
 	if !validObservation(observation) ||
 		observation.Publication.ReplicaSetVersion != request.ExpectedReplicaSetVersion {
 		return ErrStale
@@ -230,7 +234,21 @@ func AppendResponse(dst []byte, observation Observation) ([]byte, error) {
 	if err != nil || len(state) == 0 || len(state) > replicatedstate.MaxStateEnvelopeBytes {
 		return dst, errors.Join(ErrControl, err)
 	}
-	total := responseHeaderBytes + len(state)
+	var snapshotBase []byte
+	if observation.SnapshotBase != nil {
+		snapshot, buildErr := replicatedstate.BuildSnapshotBase(
+			observation.SnapshotBase.Manifest,
+			observation.SnapshotBase.StaticBootstrap,
+		)
+		if buildErr != nil {
+			return dst, errors.Join(ErrControl, buildErr)
+		}
+		snapshotBase, err = proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+		if err != nil || len(snapshotBase) == 0 || len(snapshotBase) > MaxSnapshotBaseEnvelopeBytes {
+			return dst, errors.Join(ErrBound, err)
+		}
+	}
+	total := responseHeaderBytes + len(state) + len(snapshotBase)
 	if len(dst) > math.MaxInt-total {
 		return dst, ErrBound
 	}
@@ -266,21 +284,26 @@ func AppendResponse(dst []byte, observation Observation) ([]byte, error) {
 	binary.BigEndian.PutUint64(b[248:256], observation.Progress.Next)
 	binary.BigEndian.PutUint64(b[256:264], observation.Progress.PendingSnapshot)
 	binary.BigEndian.PutUint32(b[264:268], uint32(len(state)))
-	binary.BigEndian.PutUint32(b[268:272], uint32(total))
+	binary.BigEndian.PutUint32(b[268:272], uint32(len(snapshotBase)))
+	binary.BigEndian.PutUint32(b[272:276], uint32(total))
 	copy(b[responseHeaderBytes:], state)
+	copy(b[responseHeaderBytes+len(state):], snapshotBase)
 	return dst, nil
 }
 
 func OpenResponse(raw []byte) (Observation, error) {
 	if len(raw) < responseHeaderBytes || len(raw) > MaxResponseBytes ||
 		!bytes.Equal(raw[:8], responseMagic[:]) || raw[8] != 1 || raw[9] > 1 ||
-		!allZero(raw[10:16]) || !allZero(raw[152:168]) || !allZero(raw[236:240]) {
+		!allZero(raw[10:16]) || !allZero(raw[152:168]) || !allZero(raw[236:240]) ||
+		!allZero(raw[276:280]) {
 		return Observation{}, ErrControl
 	}
 	stateBytes := int(binary.BigEndian.Uint32(raw[264:268]))
-	total := int(binary.BigEndian.Uint32(raw[268:272]))
+	snapshotBaseBytes := int(binary.BigEndian.Uint32(raw[268:272]))
+	total := int(binary.BigEndian.Uint32(raw[272:276]))
 	if stateBytes <= 0 || stateBytes > replicatedstate.MaxStateEnvelopeBytes ||
-		total != len(raw) || total != responseHeaderBytes+stateBytes {
+		snapshotBaseBytes < 0 || snapshotBaseBytes > MaxSnapshotBaseEnvelopeBytes ||
+		total != len(raw) || total != responseHeaderBytes+stateBytes+snapshotBaseBytes {
 		return Observation{}, ErrControl
 	}
 	var observation Observation
@@ -302,11 +325,26 @@ func OpenResponse(raw []byte) (Observation, error) {
 	observation.Progress.Match = binary.BigEndian.Uint64(raw[240:248])
 	observation.Progress.Next = binary.BigEndian.Uint64(raw[248:256])
 	observation.Progress.PendingSnapshot = binary.BigEndian.Uint64(raw[256:264])
-	state, err := replicatedstate.OpenState(raw[responseHeaderBytes:])
+	stateEnd := responseHeaderBytes + stateBytes
+	state, err := replicatedstate.OpenState(raw[responseHeaderBytes:stateEnd])
 	if err != nil {
 		return Observation{}, errors.Join(ErrControl, err)
 	}
 	observation.State = state
+	if snapshotBaseBytes != 0 {
+		snapshot := new(pb.Snapshot)
+		certificateRaw := raw[stateEnd:]
+		if err = proto.Unmarshal(certificateRaw, snapshot); err != nil ||
+			len(snapshot.ProtoReflect().GetUnknown()) != 0 {
+			return Observation{}, errors.Join(ErrControl, err)
+		}
+		canonical, marshalErr := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+		certificate, openErr := replicatedstate.OpenSnapshotBase(snapshot)
+		if marshalErr != nil || openErr != nil || !bytes.Equal(canonical, certificateRaw) {
+			return Observation{}, errors.Join(ErrControl, marshalErr, openErr)
+		}
+		observation.SnapshotBase = &certificate
+	}
 	observation.Publication = raftmodel.Publication{Applied: state.Applied,
 		DataChainDigest: state.DataChainDigest, ConfState: state.ConfState,
 		ReplicaSetVersion: state.ReplicaSetVersion}
@@ -322,7 +360,7 @@ func ReadResponse(reader io.Reader) (Observation, error) {
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return Observation{}, err
 	}
-	total := binary.BigEndian.Uint32(header[268:272])
+	total := binary.BigEndian.Uint32(header[272:276])
 	if total < responseHeaderBytes || total > MaxResponseBytes {
 		return Observation{}, ErrBound
 	}
@@ -361,6 +399,28 @@ func validObservation(observation Observation) bool {
 		observation.Status.Applied != state.Applied || !stateMatchesGroup(state, observation.Request.Group) ||
 		observation.Status.RaftState > raft.StatePreCandidate {
 		return false
+	}
+	if certificate := observation.SnapshotBase; certificate != nil {
+		baseState := certificate.Manifest.State
+		if certificate.Digest == ([32]byte{}) || certificate.Digest != state.SnapshotBaseDigest ||
+			!stateMatchesGroup(baseState, observation.Request.Group) ||
+			baseState.Applied > state.Applied ||
+			baseState.ReplicaSetVersion > state.ReplicaSetVersion ||
+			baseState.ConfState == nil ||
+			!slices.Contains(baseState.ConfState.GetLearners(), observation.Request.TargetMember) ||
+			slices.Contains(baseState.ConfState.GetVoters(), observation.Request.TargetMember) {
+			return false
+		}
+		rebuilt, err := replicatedstate.BuildSnapshotBase(
+			certificate.Manifest, certificate.StaticBootstrap,
+		)
+		if err != nil {
+			return false
+		}
+		reopened, err := replicatedstate.OpenSnapshotBase(rebuilt)
+		if err != nil || reopened.Digest != certificate.Digest {
+			return false
+		}
 	}
 	if observation.ProgressFound {
 		return observation.Status.MemberID == observation.Status.LeaderID &&
