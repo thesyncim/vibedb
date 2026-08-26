@@ -8,15 +8,15 @@ import (
 const (
 	PlanningExpiryStoragePrefix byte = systemkey.RequestLedgerFirst + 2
 	PlanningExpiryKeyBytes           = 1 + 8 + 32 + 32
-	PlanningExpiryRecordBytes        = 124
+	PlanningExpiryRecordBytes        = 132
 )
 
 var planningExpiryIndexMagic = [4]byte{'V', 'R', 'L', 'I'}
 
 type PlanningExpiryIndexRecord struct {
-	ExpiryAppliedIndex, LeaseGeneration uint64
-	Home                                LedgerHome
-	KeyDigest, PlanBuildID              Digest
+	ExpiryAppliedIndex, LeaseGeneration, BuildGeneration uint64
+	Home                                                 LedgerHome
+	KeyDigest, PlanBuildID                               Digest
 }
 
 func NewPlanningExpiryIndexRecord(head HeadRecord) (PlanningExpiryIndexRecord, error) {
@@ -27,7 +27,8 @@ func NewPlanningExpiryIndexRecord(head HeadRecord) (PlanningExpiryIndexRecord, e
 	if err != nil {
 		return PlanningExpiryIndexRecord{}, err
 	}
-	return PlanningExpiryIndexRecord{head.PlanningLeaseExpiryIndex, head.PlanningLeaseGeneration, home, head.KeyDigest, head.PlanBuildID}, nil
+	return PlanningExpiryIndexRecord{head.PlanningLeaseExpiryIndex, head.PlanningLeaseGeneration,
+		head.PlanBuildGeneration, home, head.KeyDigest, head.PlanBuildID}, nil
 }
 func AppendPlanningExpiryKey(dst []byte, index uint64, home LedgerHome, key Digest) []byte {
 	dst = append(dst, PlanningExpiryStoragePrefix)
@@ -57,9 +58,10 @@ func AppendPlanningExpiryIndex(dst []byte, r PlanningExpiryIndexRecord) ([]byte,
 	copy(out[:4], planningExpiryIndexMagic[:])
 	binary.LittleEndian.PutUint64(out[8:16], r.ExpiryAppliedIndex)
 	binary.LittleEndian.PutUint64(out[16:24], r.LeaseGeneration)
-	copy(out[24:56], r.Home[:])
-	putDigest(out[56:88], r.KeyDigest)
-	putDigest(out[88:120], r.PlanBuildID)
+	binary.LittleEndian.PutUint64(out[24:32], r.BuildGeneration)
+	copy(out[32:64], r.Home[:])
+	putDigest(out[64:96], r.KeyDigest)
+	putDigest(out[96:128], r.PlanBuildID)
 	dst = appendChecksum(dst, start)
 	return dst, nil
 }
@@ -67,16 +69,28 @@ func OpenPlanningExpiryIndex(raw []byte) (PlanningExpiryIndexRecord, error) {
 	if len(raw) != PlanningExpiryRecordBytes || !magicOK(raw, planningExpiryIndexMagic) || !zeroBytes(raw[4:8]) || !checksumOK(raw) {
 		return PlanningExpiryIndexRecord{}, ErrCorrupt
 	}
-	r := PlanningExpiryIndexRecord{ExpiryAppliedIndex: binary.LittleEndian.Uint64(raw[8:16]), LeaseGeneration: binary.LittleEndian.Uint64(raw[16:24]), KeyDigest: readDigest(raw[56:88]), PlanBuildID: readDigest(raw[88:120])}
-	copy(r.Home[:], raw[24:56])
+	r := PlanningExpiryIndexRecord{ExpiryAppliedIndex: binary.LittleEndian.Uint64(raw[8:16]),
+		LeaseGeneration: binary.LittleEndian.Uint64(raw[16:24]),
+		BuildGeneration: binary.LittleEndian.Uint64(raw[24:32]),
+		KeyDigest:       readDigest(raw[64:96]), PlanBuildID: readDigest(raw[96:128])}
+	copy(r.Home[:], raw[32:64])
 	if err := validatePlanningExpiryIndex(r); err != nil {
 		return PlanningExpiryIndexRecord{}, ErrCorrupt
 	}
 	return r, nil
 }
 func validatePlanningExpiryIndex(r PlanningExpiryIndexRecord) error {
-	if r.ExpiryAppliedIndex == 0 || r.LeaseGeneration == 0 || r.Home == (LedgerHome{}) || !nonzeroDigest(r.KeyDigest) || !nonzeroDigest(r.PlanBuildID) {
+	if r.ExpiryAppliedIndex == 0 || r.LeaseGeneration == 0 || r.BuildGeneration == 0 ||
+		r.Home == (LedgerHome{}) || !nonzeroDigest(r.KeyDigest) || !nonzeroDigest(r.PlanBuildID) {
 		return ErrCorrupt
+	}
+	return nil
+}
+
+func ValidatePlanningExpiryIndex(head HeadRecord, record PlanningExpiryIndexRecord) error {
+	expected, err := NewPlanningExpiryIndexRecord(head)
+	if err != nil || expected != record {
+		return ErrInvalidState
 	}
 	return nil
 }

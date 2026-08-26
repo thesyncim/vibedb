@@ -49,8 +49,9 @@ func testHead(t testing.TB, sequenced bool) (HeadRecord, []byte, []byte) {
 		AbortTerminalStateDigest: NextStateDigest(10, cursor),
 		MaxActivePayloadBytes:    2 * MaxPlanPageBytes,
 		MaxActivePayloadChunks:   2,
-		PlanBuildID:              testDigest("plan-build"), PlanningLeaseExpiryIndex: math.MaxUint64,
-		PlanningLeaseGeneration: 1,
+		PlanBuildID:              testDigest("plan-build"), PlanBuildGeneration: 1,
+		PlanningLeaseExpiryIndex: math.MaxUint64,
+		PlanningLeaseGeneration:  1,
 	}
 	head, err := NewHeadWithExecutionContract(testKey(sequenced), testDigest("request-body"),
 		testDigest("terminal-contract"), contract, plan)
@@ -176,6 +177,7 @@ func TestPagedBatchAtomicSealAndRootMismatch(t *testing.T) {
 	contract.AbortFinalWaveCount = base.AbortFinalWaveCount
 	contract.AbortTerminalStateDigest = base.AbortTerminalStateDigest
 	contract.PlanBuildID = testDigest("paged-plan-build")
+	contract.PlanBuildGeneration = 1
 	contract.PlanningLeaseExpiryIndex = math.MaxUint64
 	contract.PlanningLeaseGeneration = 1
 	head, err := NewPagedHeadWithExecutionContract(key, testDigest("request-body"), testDigest("terminal-contract"), uint64(len(plan)), root, contract)
@@ -212,6 +214,160 @@ func TestPagedBatchAtomicSealAndRootMismatch(t *testing.T) {
 	head.PlanRoot[0] ^= 1
 	if _, err = AdvanceHeadPageBatch(head, batch, 2, true); err == nil {
 		t.Fatal("mismatched expected root sealed")
+	}
+}
+
+func TestPlanningExpiryCleanupRestartFencesOldBuild(t *testing.T) {
+	plan := testPlan(t, 2*MaxPlanPageBytes+123)
+	key := testKey(false)
+	keyDigest, _ := KeyDigest(key)
+	root, _ := PlanRoot(keyDigest, plan)
+	base, _, cursor := testHead(t, false)
+	contract := ExecutionContract{
+		CatalogGeneration: base.CatalogGeneration, PinID: base.PinID, PinDigest: base.PinDigest,
+		RouteSchemaCertificateDigest: base.RouteSchemaCertificateDigest,
+		MaxPendingWaveBytes:          base.MaxPendingWaveBytes, MaxContinuationBytes: base.MaxContinuationBytes,
+		MaxTerminalBytes: base.MaxTerminalBytes, PlanBuildID: testDigest("expiring-build"),
+		PlanBuildGeneration: 1, PlanningLeaseExpiryIndex: 100, PlanningLeaseGeneration: 1,
+		TerminalTransitionTag: base.TerminalTransitionTag, FinalWaveCount: 1,
+		TerminalStateDigest:        NextStateDigest(base.TerminalTransitionTag, cursor),
+		TerminalSummaryDigest:      base.TerminalSummaryDigest,
+		AbortTerminalTransitionTag: base.AbortTerminalTransitionTag,
+		AbortFinalWaveCount:        1, AbortTerminalStateDigest: base.AbortTerminalStateDigest,
+	}
+	head, err := NewPagedHeadWithExecutionContract(key, testDigest("request-body"),
+		testDigest("terminal-contract"), uint64(len(plan)), root, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := make([]PlanPageRecord, 0, 2)
+	var previous Digest
+	for ordinal := uint64(0); ordinal < 2; ordinal++ {
+		offset := ordinal * MaxPlanPageBytes
+		page, pageErr := NewPlanPageData(head, ordinal, previous,
+			plan[offset:offset+MaxPlanPageBytes])
+		if pageErr != nil {
+			t.Fatal(pageErr)
+		}
+		pages = append(pages, page)
+		previous = page.Chain
+	}
+	batchRaw, _ := AppendPlanPageBatch(nil, pages)
+	batch, _ := OpenPlanPageBatch(batchRaw)
+	head, err = AdvanceHeadPageBatch(head, batch, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexRecord, err := NewPlanningExpiryIndexRecord(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexRaw, _ := AppendPlanningExpiryIndex(nil, indexRecord)
+	openedIndex, err := OpenPlanningExpiryIndex(indexRaw)
+	if err != nil || openedIndex != indexRecord {
+		t.Fatalf("expiry index roundtrip: %+v %v", openedIndex, err)
+	}
+	home, _ := Home(key)
+	firstIndexKey := AppendPlanningExpiryKey(nil, 100, home, head.KeyDigest)
+	secondIndexKey := AppendPlanningExpiryKey(nil, 101, home, head.KeyDigest)
+	if bytes.Compare(firstIndexKey, secondIndexKey) >= 0 {
+		t.Fatal("expiry index keys are not applied-index ordered")
+	}
+	openedApplied, openedHome, openedKey, openKeyErr := OpenPlanningExpiryKey(firstIndexKey)
+	if openKeyErr != nil || openedApplied != 100 || openedHome != home || openedKey != head.KeyDigest {
+		t.Fatalf("expiry key roundtrip: %d %x %x %v", openedApplied, openedHome, openedKey, openKeyErr)
+	}
+	if _, err = NewPlanningExpiryRequest(head, 99); err == nil {
+		t.Fatal("planning expired before its applied-index lease")
+	}
+	expiry, err := NewPlanningExpiryRequest(head, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiryRaw, _ := AppendPlanningExpiryRequest(nil, expiry)
+	if opened, openErr := OpenPlanningExpiryRequest(expiryRaw); openErr != nil || opened != expiry {
+		t.Fatalf("expiry request roundtrip: %+v %v", opened, openErr)
+	}
+	expired, err := MarkPlanningExpired(head, expiry, 3)
+	if err != nil || expired.Phase != PhaseExpired || expired.PlanBuildGeneration != 1 {
+		t.Fatalf("expire: phase=%d generation=%d err=%v", expired.Phase, expired.PlanBuildGeneration, err)
+	}
+	if _, err = NewPlanPageData(expired, 2, previous, plan[2*MaxPlanPageBytes:]); err == nil {
+		t.Fatal("expired build accepted a new page")
+	}
+	cleanupRequest, err := NewPlanningCleanupRequest(expired, MaxAckGCDeleteRows, math.MaxUint32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupRaw, _ := AppendPlanningCleanupRequest(nil, cleanupRequest)
+	if opened, openErr := OpenPlanningCleanupRequest(cleanupRaw); openErr != nil || opened != cleanupRequest {
+		t.Fatalf("cleanup request roundtrip: %+v %v", opened, openErr)
+	}
+	chunk, err := PlanPlanningCleanup(expired, cleanupRequest)
+	if err != nil || !chunk.Final || chunk.PageCount != 2 {
+		t.Fatalf("cleanup plan: %+v %v", chunk, err)
+	}
+	cleaned, err := AdvancePlanningCleanup(expired, cleanupRequest, chunk, 4)
+	if err != nil || cleaned.AppendedPageCount != 0 || cleaned.AppendedPlanBytes != 0 {
+		t.Fatalf("cleanup advance: %+v %v", cleaned, err)
+	}
+	nextBuildID := testDigest("restarted-build")
+	restart, err := NewPlanningRestartRequest(cleaned, 101, 201, nextBuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartRaw, _ := AppendPlanningRestartRequest(nil, restart)
+	if opened, openErr := OpenPlanningRestartRequest(restartRaw); openErr != nil || opened != restart {
+		t.Fatalf("restart request roundtrip: %+v %v", opened, openErr)
+	}
+	restarted, err := RestartPlanning(cleaned, restart, 5)
+	if err != nil || restarted.Phase != PhasePlanning || restarted.PlanBuildGeneration != 2 ||
+		restarted.PlanBuildID != nextBuildID {
+		t.Fatalf("restart: phase=%d generation=%d err=%v", restarted.Phase, restarted.PlanBuildGeneration, err)
+	}
+	if _, err = AdvanceHeadPage(restarted, pages[0], 6); err == nil {
+		t.Fatal("restarted generation accepted an old build page")
+	}
+	if ValidatePlanningExpiryIndex(restarted, indexRecord) == nil {
+		t.Fatal("restarted generation accepted the old expiry index row")
+	}
+	if ValidatePlanningExpiry(restarted, expiry) == nil {
+		t.Fatal("restarted generation accepted the old expiry request")
+	}
+	if _, err = RestartPlanning(restarted, restart, 6); err == nil {
+		t.Fatal("restart replay escaped the fenced planning state")
+	}
+	newIndex, err := NewPlanningExpiryIndexRecord(restarted)
+	if err != nil || newIndex.BuildGeneration != 2 || newIndex.PlanBuildID != nextBuildID {
+		t.Fatalf("new expiry index: %+v %v", newIndex, err)
+	}
+
+	rangeIdentity := testDigest("range")
+	commands := []Command{
+		{Operation: OperationExpirePlanning, ExpectedRevision: 2, Revision: 3,
+			KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+			SubjectDigest: head.PlanBuildID, ExpectedRangeIdentity: rangeIdentity, Home: home, Payload: expiryRaw},
+		{Operation: OperationCleanupPlanning, ExpectedRevision: 3, Revision: 4,
+			KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+			SubjectDigest: head.PlanBuildID, ExpectedRangeIdentity: rangeIdentity, Home: home, Payload: cleanupRaw},
+		{Operation: OperationRestartPlanning, ExpectedRevision: 4, Revision: 5,
+			KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
+			SubjectDigest: nextBuildID, ExpectedRangeIdentity: rangeIdentity, Home: home, Payload: restartRaw},
+	}
+	for _, command := range commands {
+		raw, appendErr := AppendCommand(nil, command)
+		opened, openErr := OpenCommandInto(raw, nil)
+		if appendErr != nil || openErr != nil || !bytes.Equal(opened.Bytes(), raw) {
+			t.Fatalf("planning op %d: append=%v open=%v", command.Operation, appendErr, openErr)
+		}
+	}
+	if OperationRestartPlanning != 21 || OperationCleanupPlanning != 22 {
+		t.Fatal("planning restart operation codes changed")
+	}
+	overflow := cleaned
+	overflow.PlanBuildGeneration = math.MaxUint64
+	if _, err = NewPlanningRestartRequest(overflow, 101, 201, nextBuildID); err == nil {
+		t.Fatal("planning build generation wrapped")
 	}
 }
 
@@ -679,7 +835,7 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 	head, _, _ := testHead(t, false)
 	home, _ := Home(head.Key)
 	base := Command{KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot, SubjectDigest: testDigest("subject"), ExpectedRangeIdentity: testDigest("range"), Home: home, Payload: []byte{1}}
-	for op := OperationCreate; op <= OperationRecordSchemaPinReleased; op++ {
+	for op := OperationCreate; op <= OperationCleanupPlanning; op++ {
 		c := base
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild {

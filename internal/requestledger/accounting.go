@@ -16,7 +16,16 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	if err = validateHead(head); err != nil {
 		return 0, 0, err
 	}
-	residentPageOverhead, multiplyErr := checkedMul(head.AppendedPageCount,
+	residentPageCount := head.AppendedPageCount - head.ExpiredCleanupNextPage
+	residentPlanBytes := head.AppendedPlanBytes
+	if head.ExpiredCleanupNextPage != 0 {
+		deletedBytes, multiplyErr := checkedMul(head.ExpiredCleanupNextPage, MaxPlanPageBytes)
+		if multiplyErr != nil || deletedBytes > residentPlanBytes {
+			return 0, 0, ErrCorrupt
+		}
+		residentPlanBytes -= deletedBytes
+	}
+	residentPageOverhead, multiplyErr := checkedMul(residentPageCount,
 		uint64(PageStorageKeyBytes+PlanPageRecordOverheadBytes))
 	if multiplyErr != nil {
 		return 0, 0, multiplyErr
@@ -24,7 +33,7 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	residentNow, err = checkedSum(
 		FixedStorageKeyBytes,
 		uint64(headHeaderBytes+checksumBytes+len(head.InlinePlan)),
-		head.AppendedPlanBytes,
+		residentPlanBytes,
 		residentPageOverhead,
 	)
 	if err != nil {
@@ -32,6 +41,9 @@ func Reservation(head HeadRecord) (residentNow, future uint64, err error) {
 	}
 	remainingPages := head.PlanPageCount - head.AppendedPageCount
 	remainingBytes := head.TotalPlanBytes - head.AppendedPlanBytes
+	if head.Phase == PhaseExpired {
+		remainingPages, remainingBytes = 0, 0
+	}
 	pageFuture, err := checkedMul(remainingPages, uint64(PageStorageKeyBytes+PlanPageRecordOverheadBytes))
 	if err != nil {
 		return 0, 0, err

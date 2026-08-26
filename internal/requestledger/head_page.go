@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	headHeaderBytes             = 864
+	headHeaderBytes             = 880
 	pageHeaderBytes             = 208
 	PlanPageRecordOverheadBytes = pageHeaderBytes + checksumBytes
 	MaxHeadRecordBytes          = headHeaderBytes + MaxInlinePlanBytes + checksumBytes
@@ -49,6 +49,7 @@ type HeadRecord struct {
 	MaxActivePayloadBytes             uint64
 	MaxActivePayloadChunks            uint64
 	PlanBuildID                       Digest
+	PlanBuildGeneration               uint64
 	PlanningLeaseExpiryIndex          uint64
 	PlanningLeaseGeneration           uint64
 	PlanCRC32C                        uint32
@@ -69,6 +70,7 @@ type HeadRecord struct {
 	OutstandingRoutePinDigest         Digest
 	PreparedTerminalDigest            Digest
 	SchemaPinReleaseCertificateDigest Digest
+	ExpiredCleanupNextPage            uint64
 	InlinePlan                        []byte
 }
 
@@ -83,6 +85,7 @@ type ExecutionContract struct {
 	MaxActivePayloadBytes        uint64
 	MaxActivePayloadChunks       uint64
 	PlanBuildID                  Digest
+	PlanBuildGeneration          uint64
 	PlanningLeaseExpiryIndex     uint64
 	PlanningLeaseGeneration      uint64
 	TerminalTransitionTag        uint32
@@ -105,7 +108,7 @@ func defaultExecutionContract(root Digest) ExecutionContract {
 		MaxTerminalBytes:             MaxLifecyclePayloadBytes,
 		MaxActivePayloadBytes:        0,
 		MaxActivePayloadChunks:       0,
-		PlanBuildID:                  root, PlanningLeaseExpiryIndex: ^uint64(0),
+		PlanBuildID:                  root, PlanBuildGeneration: 1, PlanningLeaseExpiryIndex: ^uint64(0),
 		PlanningLeaseGeneration: 1,
 		TerminalTransitionTag:   1, FinalWaveCount: 1,
 		TerminalStateDigest: root, TerminalSummaryDigest: root,
@@ -191,6 +194,7 @@ func NewHeadWithExecutionContract(
 		MaxActivePayloadBytes:        contract.MaxActivePayloadBytes,
 		MaxActivePayloadChunks:       contract.MaxActivePayloadChunks,
 		PlanBuildID:                  contract.PlanBuildID,
+		PlanBuildGeneration:          contract.PlanBuildGeneration,
 		PlanningLeaseExpiryIndex:     contract.PlanningLeaseExpiryIndex,
 		PlanningLeaseGeneration:      contract.PlanningLeaseGeneration,
 		TerminalTransitionTag:        contract.TerminalTransitionTag,
@@ -258,6 +262,7 @@ func NewPagedHeadWithExecutionContract(
 		MaxActivePayloadBytes:        contract.MaxActivePayloadBytes,
 		MaxActivePayloadChunks:       contract.MaxActivePayloadChunks,
 		PlanBuildID:                  contract.PlanBuildID,
+		PlanBuildGeneration:          contract.PlanBuildGeneration,
 		PlanningLeaseExpiryIndex:     contract.PlanningLeaseExpiryIndex,
 		PlanningLeaseGeneration:      contract.PlanningLeaseGeneration,
 		TerminalTransitionTag:        contract.TerminalTransitionTag,
@@ -335,6 +340,8 @@ func AppendHead(dst []byte, head HeadRecord) ([]byte, error) {
 	putDigest(out[768:800], head.OutstandingRoutePinDigest)
 	putDigest(out[800:832], head.PreparedTerminalDigest)
 	putDigest(out[832:864], head.SchemaPinReleaseCertificateDigest)
+	binary.LittleEndian.PutUint64(out[864:872], head.PlanBuildGeneration)
+	binary.LittleEndian.PutUint64(out[872:880], head.ExpiredCleanupNextPage)
 	dst = append(dst, head.InlinePlan...)
 	dst = appendChecksum(dst, start)
 	return dst, nil
@@ -400,6 +407,8 @@ func OpenHead(raw []byte) (HeadRecord, error) {
 		OutstandingRoutePinDigest:         readDigest(raw[768:800]),
 		PreparedTerminalDigest:            readDigest(raw[800:832]),
 		SchemaPinReleaseCertificateDigest: readDigest(raw[832:864]),
+		PlanBuildGeneration:               binary.LittleEndian.Uint64(raw[864:872]),
+		ExpiredCleanupNextPage:            binary.LittleEndian.Uint64(raw[872:880]),
 	}
 	copy(head.Key.Principal[:], raw[128:144])
 	copy(head.Key.Request[:], raw[144:160])
@@ -428,7 +437,8 @@ func validateHead(head HeadRecord) error {
 		(head.MaxActivePayloadBytes == 0) != (head.MaxActivePayloadChunks == 0) ||
 		head.MaxActivePayloadBytes > MaxDynamicWavePayloadBytes ||
 		head.MaxActivePayloadChunks > MaxDynamicWavePayloadChunks ||
-		!nonzeroDigest(head.PlanBuildID) || head.PlanningLeaseExpiryIndex == 0 ||
+		!nonzeroDigest(head.PlanBuildID) || head.PlanBuildGeneration == 0 ||
+		head.PlanningLeaseExpiryIndex == 0 ||
 		head.PlanningLeaseGeneration == 0 ||
 		head.AbortTerminalTransitionTag == 0 || head.AbortFinalWaveCount == 0 ||
 		!nonzeroDigest(head.AbortTerminalStateDigest) ||
@@ -492,7 +502,15 @@ func validateHead(head HeadRecord) error {
 	case PhasePlanning:
 		if head.NextStepOrdinal != 0 || head.ContinuationRevision != 0 ||
 			nonzeroDigest(head.ContinuationDigest) || nonzeroDigest(head.PreparedTerminalDigest) ||
-			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
+			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) || head.ExpiredCleanupNextPage != 0 {
+			return ErrCorrupt
+		}
+	case PhaseExpired:
+		if head.TotalPlanBytes <= MaxInlinePlanBytes || head.NextStepOrdinal != 0 ||
+			head.ContinuationRevision != 0 || nonzeroDigest(head.ContinuationDigest) ||
+			nonzeroDigest(head.PreparedTerminalDigest) ||
+			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) ||
+			head.ExpiredCleanupNextPage > head.AppendedPageCount {
 			return ErrCorrupt
 		}
 	case PhaseSealed:
@@ -501,12 +519,13 @@ func validateHead(head HeadRecord) error {
 			head.NextStepOrdinal != 0 &&
 				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) ||
 			nonzeroDigest(head.PreparedTerminalDigest) ||
-			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
+			nonzeroDigest(head.SchemaPinReleaseCertificateDigest) || head.ExpiredCleanupNextPage != 0 {
 			return ErrIncomplete
 		}
 	case PhasePrepared:
 		if !complete || head.NextStepOrdinal == 0 || head.ContinuationRevision == 0 ||
-			!nonzeroDigest(head.ContinuationDigest) || !nonzeroDigest(head.PreparedTerminalDigest) {
+			!nonzeroDigest(head.ContinuationDigest) || !nonzeroDigest(head.PreparedTerminalDigest) ||
+			head.ExpiredCleanupNextPage != 0 {
 			return ErrIncomplete
 		}
 	case PhaseTerminal:
@@ -515,7 +534,7 @@ func validateHead(head HeadRecord) error {
 			head.NextStepOrdinal != 0 &&
 				(head.ContinuationRevision == 0 || !nonzeroDigest(head.ContinuationDigest)) ||
 			!nonzeroDigest(head.PreparedTerminalDigest) ||
-			!nonzeroDigest(head.SchemaPinReleaseCertificateDigest) {
+			!nonzeroDigest(head.SchemaPinReleaseCertificateDigest) || head.ExpiredCleanupNextPage != 0 {
 			return ErrIncomplete
 		}
 	default:
@@ -572,7 +591,7 @@ func NewPlanPageData(
 	data []byte,
 ) (PlanPageRecord, error) {
 	if err := validateHead(head); err != nil || len(head.InlinePlan) != 0 ||
-		ordinal >= head.PlanPageCount {
+		head.Phase != PhasePlanning || ordinal >= head.PlanPageCount {
 		return PlanPageRecord{}, ErrCorrupt
 	}
 	offset := ordinal * MaxPlanPageBytes

@@ -144,6 +144,7 @@ type Phase uint8
 const (
 	PhaseInvalid Phase = iota
 	PhasePlanning
+	PhaseExpired
 	PhaseSealed
 	PhasePrepared
 	PhaseTerminal
@@ -158,7 +159,9 @@ func (phase Phase) CanTransitionTo(next Phase) bool {
 	}
 	switch phase {
 	case PhasePlanning:
-		return next == PhasePlanning || next == PhaseSealed
+		return next == PhasePlanning || next == PhaseExpired || next == PhaseSealed
+	case PhaseExpired:
+		return next == PhaseExpired || next == PhasePlanning
 	case PhaseSealed:
 		return next == PhaseSealed || next == PhasePrepared
 	case PhasePrepared:

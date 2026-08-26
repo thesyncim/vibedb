@@ -85,6 +85,56 @@ func RecordVerifiedRoutePinReleased(r RoutePinRecord, revision uint64, completio
 	r.RecordDigest = routePinDigest(r)
 	return r, validateRoutePin(r)
 }
+
+// AdvanceHeadRoutePin is the sole head-CAS transition for route acquire
+// intent, verified acquire completion, and release intent. RoutePinRecord has
+// its own per-wave revision 1..4; headRevision is independently monotone for
+// the request lifecycle. Verified release completion uses MarkRoutePinReleased
+// because it also clears the outstanding physical-route fence.
+func AdvanceHeadRoutePin(
+	head HeadRecord,
+	prior RoutePinRecord,
+	current RoutePinRecord,
+	headRevision uint64,
+) (HeadRecord, error) {
+	if err := validateHead(head); err != nil || errOrNil(validateRoutePin(current)) != nil ||
+		head.Phase != PhaseSealed || !nextRevision(head.Revision, headRevision) ||
+		current.KeyDigest != head.KeyDigest || current.RequestDigest != head.RequestDigest ||
+		current.PlanRoot != head.PlanRoot {
+		return HeadRecord{}, ErrInvalidState
+	}
+	switch current.Phase {
+	case RoutePinAcquiring:
+		if prior.Phase != RoutePinInvalid || current.Revision != 1 ||
+			current.PriorContinuationDigest != head.ContinuationDigest ||
+			current.WaveOrdinal != head.NextStepOrdinal || nonzeroDigest(head.OutstandingRoutePinDigest) {
+			return HeadRecord{}, ErrInvalidState
+		}
+	case RoutePinAcquired:
+		if err := validateRoutePin(prior); err != nil || prior.Phase != RoutePinAcquiring ||
+			current.PriorRecordDigest != prior.RecordDigest ||
+			!nextRevision(prior.Revision, current.Revision) ||
+			prior.KeyDigest != current.KeyDigest || prior.PlanRoot != current.PlanRoot ||
+			prior.WaveOrdinal != current.WaveOrdinal || current.WaveOrdinal != head.NextStepOrdinal ||
+			current.PriorContinuationDigest != head.ContinuationDigest ||
+			nonzeroDigest(head.OutstandingRoutePinDigest) {
+			return HeadRecord{}, ErrInvalidState
+		}
+	case RoutePinReleasing:
+		if err := validateRoutePin(prior); err != nil || prior.Phase != RoutePinAcquired ||
+			current.PriorRecordDigest != prior.RecordDigest ||
+			!nextRevision(prior.Revision, current.Revision) ||
+			prior.AcquiredEvidenceDigest != head.OutstandingRoutePinDigest ||
+			current.AcquiredEvidenceDigest != prior.AcquiredEvidenceDigest ||
+			current.WaveOrdinal == ^uint64(0) || current.WaveOrdinal+1 != head.NextStepOrdinal {
+			return HeadRecord{}, ErrInvalidState
+		}
+	default:
+		return HeadRecord{}, ErrInvalidState
+	}
+	head.Revision = headRevision
+	return head, validateHead(head)
+}
 func AppendRoutePin(dst []byte, r RoutePinRecord) ([]byte, error) {
 	if err := validateRoutePin(r); err != nil {
 		return dst, err
