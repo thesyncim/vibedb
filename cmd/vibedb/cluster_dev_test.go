@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson"
 )
@@ -20,12 +23,13 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		ClientEndpoint: "127.0.0.1:24000", CatalogPath: filepath.Join(root, "catalog.vibejson"),
 		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
 		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
-		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterRF3),
+		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterRF3), LedgerMembers: make([]devClusterMember, devClusterRF3),
 	}
 	paths := []string{manifest.CatalogPath, manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy}
 	for index := range manifest.Members {
 		manifest.Members[index] = devClusterMember{Member: uint64(index + 1), Node: "1111111111111111111111111111111" + string(rune('1'+index)), Store: "2222222222222222222222222222222" + string(rune('1'+index)), Peer: "127.0.0.1:2500" + string(rune('1'+index)), Native: "127.0.0.1:2510" + string(rune('1'+index)), Snapshot: "127.0.0.1:2520" + string(rune('1'+index)), Control: "127.0.0.1:2530" + string(rune('1'+index)), ServeManifest: filepath.Join(root, "member-"+string(rune('1'+index)), "serve-rf3.vibejson")}
-		paths = append(paths, manifest.Members[index].ServeManifest)
+		manifest.LedgerMembers[index] = devClusterMember{Member: uint64(index + 1), Node: manifest.Members[index].Node, Store: "3333333333333333333333333333333" + string(rune('1'+index)), Peer: "127.0.0.1:2600" + string(rune('1'+index)), Native: "127.0.0.1:2610" + string(rune('1'+index)), Snapshot: "127.0.0.1:2620" + string(rune('1'+index)), Control: "127.0.0.1:2630" + string(rune('1'+index)), ServeManifest: filepath.Join(root, "ledger-member-"+string(rune('1'+index)), "serve-rf3.vibejson")}
+		paths = append(paths, manifest.Members[index].ServeManifest, manifest.LedgerMembers[index].ServeManifest)
 	}
 	for _, path := range paths {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -59,10 +63,22 @@ func TestDevClusterManifestAcceptsOnlyExplicitRF1OrRF3(t *testing.T) {
 		CatalogPath: filepath.Join(root, "catalog.vibejson"), GatewayCertificate: filepath.Join(root, "gateway-cert.pem"),
 		GatewayKey: filepath.Join(root, "gateway-key.pem"), Roots: filepath.Join(root, "roots.pem"),
 		AuthorizationPolicy: filepath.Join(root, "policy.vibejson"), GatewayNode: "01010101010101010101010101010101",
-		Members: []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
+		Members:       []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "22222222222222222222222222222222", Peer: "127.0.0.1:25001", Native: "127.0.0.1:25101", Snapshot: "127.0.0.1:25201", Control: "127.0.0.1:25301", ServeManifest: filepath.Join(root, "member-1", "serve-rf3.vibejson")}},
+		LedgerMembers: []devClusterMember{{Member: 1, Node: "11111111111111111111111111111111", Store: "33333333333333333333333333333333", Peer: "127.0.0.1:26001", Native: "127.0.0.1:26101", Snapshot: "127.0.0.1:26201", Control: "127.0.0.1:26301", ServeManifest: filepath.Join(root, "ledger-member-1", "serve-rf3.vibejson")}},
 	}
 	if !validDevManifest(base, root) {
 		t.Fatal("explicit RF1 manifest rejected")
+	}
+	withoutLedger := base
+	withoutLedger.LedgerMembers = nil
+	if validDevManifest(withoutLedger, root) {
+		t.Fatal("manifest without a dedicated request-ledger group accepted")
+	}
+	reusedStore := base
+	reusedStore.LedgerMembers = append([]devClusterMember(nil), base.LedgerMembers...)
+	reusedStore.LedgerMembers[0].Store = reusedStore.Members[0].Store
+	if validDevManifest(reusedStore, root) {
+		t.Fatal("request-ledger group reused the catalog store")
 	}
 	base.Nodes = 2
 	if validDevManifest(base, root) {
@@ -138,6 +154,46 @@ func TestDevEndpointAndIdentityValidationIsCanonical(t *testing.T) {
 	}
 	if _, err := decodeDev16("00000000000000000000000000000000"); err == nil {
 		t.Fatal("zero identity accepted")
+	}
+}
+
+func TestDevLogicalAuthorityDerivationIsDeterministicAndDomainSeparated(t *testing.T) {
+	group := raftmember.GroupKey{
+		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5},
+	}
+	relation := [32]byte{6}
+	rangeIdentity, lineage, forwarding := deriveDevLogicalRangeAuthority(
+		group, distribution.DistributionName("request-ledger"), distribution.ShardID("all"), relation,
+	)
+	againRange, againLineage, againForwarding := deriveDevLogicalRangeAuthority(
+		group, distribution.DistributionName("request-ledger"), distribution.ShardID("all"), relation,
+	)
+	if rangeIdentity == (replication.Digest{}) || lineage == (replication.Digest{}) ||
+		forwarding == (replication.Digest{}) || rangeIdentity != againRange ||
+		lineage != againLineage || forwarding != againForwarding ||
+		rangeIdentity == lineage || rangeIdentity == forwarding || lineage == forwarding {
+		t.Fatalf("derived authorities are zero, unstable, or aliased: %x %x %x", rangeIdentity, lineage, forwarding)
+	}
+	home := deriveDevLedgerHomeIdentity(group, rangeIdentity, relation)
+	if home == (replication.Digest{}) || home == rangeIdentity ||
+		home != deriveDevLedgerHomeIdentity(group, rangeIdentity, relation) {
+		t.Fatalf("ledger home identity = %x", home)
+	}
+	changed := group
+	changed.GroupID[0]++
+	changedRange, _, _ := deriveDevLogicalRangeAuthority(
+		changed, distribution.DistributionName("request-ledger"), distribution.ShardID("all"), relation,
+	)
+	if changedRange == rangeIdentity {
+		t.Fatal("authenticated group change did not change range authority")
+	}
+	relation[0]++
+	changedRange, _, _ = deriveDevLogicalRangeAuthority(
+		group, distribution.DistributionName("request-ledger"), distribution.ShardID("all"), relation,
+	)
+	if changedRange == rangeIdentity {
+		t.Fatal("relation-manifest change did not change range authority")
 	}
 }
 
