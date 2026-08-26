@@ -18,6 +18,7 @@ import (
 type gatewayReplicaMoveControls struct {
 	Observer   rebalance.ReplicatedMoveObserver
 	Routes     rebalanceexec.MoveRouteResolver
+	Membership rebalanceexec.MembershipClient
 	Snapshots  rebalanceexec.SnapshotSource
 	Bootstrap  rebalanceexec.SnapshotBootstrapClient
 	Awaiter    rebalanceexec.MoveAwaiter
@@ -32,11 +33,12 @@ func newGatewayReplicaMoveController(
 	controls gatewayReplicaMoveControls,
 ) (*rebalanceexec.Controller, error) {
 	if authority == nil || replicated == nil || controls.Observer == nil ||
+		controls.Membership == nil ||
 		controls.Drainer == nil {
 		return nil, rebalanceexec.ErrControllerConfig
 	}
 	executor, err := rebalanceexec.New(rebalanceexec.Options{
-		Routes: controls.Routes, Grants: authority, Membership: replicated,
+		Routes: controls.Routes, Grants: authority, Membership: controls.Membership,
 		Snapshots: controls.Snapshots, Bootstrap: controls.Bootstrap,
 		Awaiter: controls.Awaiter, Ownership: controls.Ownership,
 		Catalog: authority, Drainer: controls.Drainer, Retirer: controls.Retirement,

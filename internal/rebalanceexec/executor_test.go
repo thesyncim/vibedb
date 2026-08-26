@@ -99,7 +99,7 @@ func (fixture *executorFixture) AwaitReplicaMove(
 
 func (fixture *executorFixture) ProposeReplicaMoveOwnership(
 	_ context.Context, _ rebalance.OperationID, _ [32]byte,
-	_ gateway.ReplicatedRoute, command []byte,
+	_ gateway.ReplicatedMembershipRoute, command []byte,
 ) error {
 	fixture.ownershipCommands = append(fixture.ownershipCommands, append([]byte(nil), command...))
 	return nil
@@ -473,6 +473,7 @@ func newExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) {
 		Manifests: []*distribution.Manifest{manifest},
 	}, map[distribution.EndpointID]string{
 		"source": "127.0.0.1:7001", "target": "127.0.0.1:7002",
+		"source-control": "127.0.0.1:7201",
 	}, 9)
 	if err != nil {
 		t.Fatal(err)
@@ -484,6 +485,10 @@ func newExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) {
 		Distribution: "data", Shard: "all", Group: group,
 		RetiringMember: 1, SnapshotSourceMember: 3, TargetMember: 2,
 		Source: "source", Target: "target",
+		RetiringReplica: rebalance.ReplicaIdentity{
+			Member: 1, Node: rafttransport.NodeID{1}, StoreID: [16]byte{11},
+			NodeIncarnation: 21, ControlEndpoint: "source-control",
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -533,6 +538,29 @@ func newExecutorFixture(t testing.TB) (*rebalance.Plan, *executorFixture) {
 				EnrolledTarget: target, HasEnrolledTarget: true,
 			},
 		},
+	}
+}
+
+func TestExactRetiringReplicaRejectsReusedControlIdentity(t *testing.T) {
+	plan, fixture := newExecutorFixture(t)
+	exact := plan.RetiringReplica()
+	if !exactRetiringReplica(fixture.cut.Retiring, exact) {
+		t.Fatal("exact retiring identity was rejected")
+	}
+	for name, mutate := range map[string]func(*gateway.ReplicatedEndpoint){
+		"member":           func(endpoint *gateway.ReplicatedEndpoint) { endpoint.Member++ },
+		"node":             func(endpoint *gateway.ReplicatedEndpoint) { endpoint.Node[0]++ },
+		"store":            func(endpoint *gateway.ReplicatedEndpoint) { endpoint.StoreID[0]++ },
+		"incarnation":      func(endpoint *gateway.ReplicatedEndpoint) { endpoint.NodeIncarnation++ },
+		"control endpoint": func(endpoint *gateway.ReplicatedEndpoint) { endpoint.ControlEndpoint += "-reused" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := fixture.cut.Retiring
+			mutate(&changed)
+			if exactRetiringReplica(changed, exact) {
+				t.Fatal("forged retiring identity accepted")
+			}
+		})
 	}
 }
 

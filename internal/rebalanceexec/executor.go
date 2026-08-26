@@ -98,7 +98,7 @@ type OwnershipProposer interface {
 		context.Context,
 		rebalance.OperationID,
 		[32]byte,
-		gateway.ReplicatedRoute,
+		gateway.ReplicatedMembershipRoute,
 		[]byte,
 	) error
 }
@@ -127,12 +127,14 @@ type CatalogDrainCertifier interface {
 }
 
 type SourceRetirementRequest struct {
-	Operation [32]byte
-	Step      [32]byte
-	Group     raftmember.GroupKey
-	Source    gateway.ReplicatedEndpoint
-	Target    gateway.ReplicatedEndpoint
-	Term      uint64
+	Operation            [32]byte
+	Step                 [32]byte
+	Group                raftmember.GroupKey
+	AllocationGeneration uint64
+	Command              raftservice.CommandFence
+	Source               gateway.ReplicatedEndpoint
+	Target               gateway.ReplicatedEndpoint
+	Term                 uint64
 }
 
 type SourceRetirer interface {
@@ -338,7 +340,7 @@ func (executor *Executor) executeOwnership(
 	}
 	cut.Membership.Serving.Command.ReplicaSetVersion = execution.PublicationReplicaSet
 	return executor.options.Ownership.ProposeReplicaMoveOwnership(
-		ctx, operation, execution.Proof, cut.Membership.Serving, command,
+		ctx, operation, execution.Proof, cut.Membership, command,
 	)
 }
 
@@ -454,13 +456,15 @@ func (executor *Executor) executeRetirement(
 		}
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
-	if err != nil || cut.Retiring.Member != plan.RetiringMember() ||
+	if err != nil || !exactRetiringReplica(cut.Retiring, plan.RetiringReplica()) ||
 		cut.Target.Member != plan.TargetMember() || execution.LeaderTerm == 0 {
 		return errors.Join(err, ErrExecutionFence)
 	}
 	err = executor.options.Retirer.RetireReplicaSource(ctx, SourceRetirementRequest{
 		Operation: [32]byte(operation), Step: execution.Proof, Group: plan.Group(),
-		Source: cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
+		AllocationGeneration: cut.Membership.Serving.AllocationGeneration,
+		Command:              cut.Command,
+		Source:               cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
 	})
 	if err != nil || !found {
 		return err
@@ -489,12 +493,19 @@ func (executor *Executor) resolve(
 ) (MoveRoute, error) {
 	cut, err := executor.options.Routes.ResolveReplicaMove(ctx, operation, plan, execution)
 	if err != nil || cut.Membership.Serving.Group != plan.Group() ||
-		cut.Retiring.Member != plan.RetiringMember() ||
+		!exactRetiringReplica(cut.Retiring, plan.RetiringReplica()) ||
 		cut.SnapshotSource.Member != plan.SnapshotSourceMember() ||
 		cut.Target.Member != plan.TargetMember() {
 		return MoveRoute{}, errors.Join(err, ErrExecutionFence)
 	}
 	return cut, nil
+}
+
+func exactRetiringReplica(endpoint gateway.ReplicatedEndpoint, identity rebalance.ReplicaIdentity) bool {
+	return endpoint.Member == identity.Member && endpoint.Node == identity.Node &&
+		endpoint.StoreID == identity.StoreID &&
+		endpoint.NodeIncarnation == identity.NodeIncarnation &&
+		distribution.EndpointID(endpoint.ControlEndpoint) == identity.ControlEndpoint
 }
 
 func validateGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
