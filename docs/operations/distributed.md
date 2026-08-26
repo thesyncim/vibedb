@@ -94,11 +94,11 @@ match across shards.
 Both services load the same immutable policy generation. Principal IDs are the
 32-character hexadecimal node identities carried by their TLS certificates.
 The array and capability order below are canonical. The gateway service
-identity needs `delegate`, `data_read`, and `data_write`: it delegates the exact
-application principal to a shard and uses its own authority for recovery. It
-also needs `topology` when it consumes the replicated catalog and runs the
-split controller. A client receives only the operations listed for that
-principal.
+identity needs `delegate`, `data_read`, `data_write`, and
+`transaction_recovery`: it delegates the exact application principal to a
+shard and uses its own authority for hidden outcome recovery. It also needs
+`topology` when it consumes the replicated catalog and runs the split
+controller. A client receives only the operations listed for that principal.
 
 ```json
 {"generation":1,"principals":[{"node":"11111111111111111111111111111111","capabilities":["data_read","data_write","delegate","topology","transaction_recovery"]},{"node":"33333333333333333333333333333333","capabilities":["data_read","data_write","schema"]}]}

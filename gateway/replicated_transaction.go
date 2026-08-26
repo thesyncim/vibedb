@@ -95,8 +95,9 @@ type ReplicatedTransactionOrchestratorOptions struct {
 	// RecoveryAuthority is the gateway service identity used only while
 	// recovering an already admitted transaction. It prevents a client retry
 	// from forwarding the client's narrower data authority to hidden
-	// transaction-control reads. A zero value preserves the caller authority for
-	// in-process and development embeddings.
+	// transaction-control reads. A zero value is accepted only for an
+	// unauthenticated in-process embedding; Recover fails closed if its caller
+	// carries an authority and no distinct recovery identity is configured.
 	RecoveryAuthority serviceauthz.Authority
 	IDSource          io.Reader
 }

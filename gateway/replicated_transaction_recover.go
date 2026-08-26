@@ -32,6 +32,8 @@ func (orchestrator *ReplicatedTransactionOrchestrator) Recover(
 		if err != nil {
 			return ReplicatedTransactionResult{}, ErrReplicatedTransaction
 		}
+	} else if _, authenticated := serviceauthz.FromContext(ctx); authenticated {
+		return ReplicatedTransactionResult{}, ErrReplicatedTransaction
 	}
 	validationBytes := replicatedTransactionRecoveryValidationBytes
 	adopted, adoptionErr := orchestrator.adoptExternalRecoveryHandle(handle)

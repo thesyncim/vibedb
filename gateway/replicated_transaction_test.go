@@ -636,6 +636,51 @@ func TestReplicatedTransactionRecoveryUsesConfiguredServiceAuthority(t *testing.
 	}
 }
 
+func TestReplicatedTransactionRecoveryRejectsAuthenticatedCallerWithoutServiceAuthority(t *testing.T) {
+	participants, client := transactionOrchestratorRoutes(t, 1)
+	client.loseOperation = distributedtxn.ReplicatedCommitCoordinator
+	executor, err := NewReplicatedExecutorWithOptions(client, ReplicatedExecutorOptions{
+		MaxAttempts: 1, AttemptTimeout: time.Second, LeaderHintCapacity: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := NewReplicatedTransactionOrchestrator(
+		ReplicatedTransactionOrchestratorOptions{
+			Executor: executor, Tenant: []byte("tenant"), MaxConcurrency: 1,
+			MaxInFlightBytes: 64 << 20,
+			MaxMutations:     1, MaxMutationBytes: 64, RecoveryTimeout: time.Minute,
+			IDSource: bytes.NewReader(bytes.Repeat([]byte{0x74}, 16)),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller := serviceauthz.Authority{Node: [16]byte{0x41}, Generation: 9}
+	ctx, err := serviceauthz.WithAuthority(context.Background(), caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, executeErr := orchestrator.Execute(ctx, 7, participants)
+	var transactionErr *ReplicatedTransactionError
+	if !errors.As(executeErr, &transactionErr) || transactionErr.Recovery == nil {
+		t.Fatalf("execute error=%T %+v", executeErr, transactionErr)
+	}
+	client.mu.Lock()
+	calls := client.calls
+	client.mu.Unlock()
+	if _, recoverErr := orchestrator.Recover(ctx, transactionErr.Recovery); !errors.Is(
+		recoverErr, ErrReplicatedTransaction,
+	) {
+		t.Fatalf("recovery error=%v", recoverErr)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.calls != calls {
+		t.Fatalf("unauthorized recovery made %d replicated calls", client.calls-calls)
+	}
+}
+
 func TestReplicatedTransactionPrepareConflictStopsUntouchedWideShards(t *testing.T) {
 	participants, client := transactionOrchestratorRoutes(t, 65)
 	idBytes := bytes.Repeat([]byte{0x52}, 16)
