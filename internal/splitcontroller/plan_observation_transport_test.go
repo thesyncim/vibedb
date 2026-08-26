@@ -104,8 +104,14 @@ type planObservationTestDirectory struct {
 	peers map[distribution.EndpointID]PlanObservationPeer
 }
 
+type planObservationCatalogReader struct{ snapshot *gateway.Snapshot }
+
+func (reader planObservationCatalogReader) Read(context.Context) (*gateway.Snapshot, error) {
+	return reader.snapshot, nil
+}
+
 func (directory *planObservationTestDirectory) ResolvePlanObservationPeer(
-	_ context.Context, _ [32]byte, endpoint distribution.EndpointID,
+	_ context.Context, _ PlanObservationRequest, endpoint distribution.EndpointID,
 ) (PlanObservationPeer, error) {
 	peer, ok := directory.peers[endpoint]
 	if !ok {
@@ -187,6 +193,84 @@ func TestPlanObservationServiceRejectsWrongServingFence(t *testing.T) {
 	_, client, _ := networkPlanObservationPair(t, request, trust, provider, MaxPlanObservationResponseBytes)
 	if _, err := client.ObserveSplitSource(t.Context(), request); !errors.Is(err, ErrPlanObservation) {
 		t.Fatalf("wrong-fence error=%v", err)
+	}
+}
+
+func TestCatalogPlanObservationPeerDirectoryBindsExactRF3Cut(t *testing.T) {
+	manifest, err := distribution.NewManifest("orders", 11, []distribution.Shard{{
+		ID: "source", AllocationGeneration: 7,
+		Range:   distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"data-a", "data-b", "data-c"}, Epoch: 5,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := raftmember.GroupKey{
+		ClusterID: testID(1), ClusterIncarnation: testID(2), TopologyRecoveryEpoch: 1,
+		ShardIncarnation: testID(3), GroupID: testID(4),
+	}
+	command := raftservice.CommandFence{
+		ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+		OwnershipEpoch: 5, SchemaGeneration: 1,
+		RelationManifestDigest: sha256.Sum256([]byte("relations")),
+		RoutingVersion:         11, RouteGeneration: 19,
+	}
+	addresses := make(map[distribution.EndpointID]string)
+	replicas := make([]gateway.ReplicatedReplicaDescriptor, 3)
+	for index, suffix := range []string{"a", "b", "c"} {
+		data := distribution.EndpointID("data-" + suffix)
+		native := distribution.EndpointID("native-" + suffix)
+		control := distribution.EndpointID("control-" + suffix)
+		addresses[data], addresses[native], addresses[control] =
+			"127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"
+		replicas[index] = gateway.ReplicatedReplicaDescriptor{
+			Member: uint64(index + 1), Node: rafttransport.NodeID(testID(byte(10 + index))),
+			StoreID: testID(byte(20 + index)), NodeIncarnation: 1,
+			Endpoint: data, NativeEndpoint: native, ControlEndpoint: control,
+		}
+	}
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
+		distribution.ClusterConfig{
+			Distributions: []distribution.DistributionSpec{{
+				Name: "orders", Arity: 1, MapperVersion: distribution.NativeMapperVersion,
+			}},
+			Placements: []distribution.TablePlacement{{
+				Table: "docs", Distribution: "orders", Columns: []string{"/tenant"},
+			}},
+			Manifests: []*distribution.Manifest{manifest},
+		},
+		addresses, 19, nil, nil,
+		[]gateway.ReplicatedShardDescriptor{{
+			Distribution: "orders", Shard: "source", Group: group,
+			AllocationGeneration: 7, Command: command, Replicas: replicas,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := gateway.CatalogSnapshotDigest(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := PlanObservationRequest{
+		Operation:         OperationID(sha256.Sum256([]byte("operation"))),
+		CatalogGeneration: 19, CatalogDigest: digest, Distribution: "orders",
+		Shard: "source", Allocation: 7, Group: group, Command: command,
+		ControlEndpoints: []distribution.EndpointID{"control-a", "control-b", "control-c"},
+	}
+	request.RequestDigest = planObservationRequestDigest(request)
+	directory, err := NewCatalogPlanObservationPeerDirectory(planObservationCatalogReader{snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := directory.ResolvePlanObservationPeer(t.Context(), request, "control-b")
+	if err != nil || peer.MemberID != 2 || peer.Node != replicas[1].Node {
+		t.Fatalf("peer=%+v err=%v", peer, err)
+	}
+	request.Command.RouteGeneration++
+	request.RequestDigest = planObservationRequestDigest(request)
+	if _, err = directory.ResolvePlanObservationPeer(t.Context(), request, "control-b"); !errors.Is(err, ErrPlanObservation) {
+		t.Fatalf("wrong command error=%v", err)
 	}
 }
 

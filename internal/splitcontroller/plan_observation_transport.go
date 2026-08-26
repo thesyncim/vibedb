@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -230,8 +231,63 @@ type PlanObservationPeer struct {
 
 type PlanObservationPeerDirectory interface {
 	ResolvePlanObservationPeer(
-		context.Context, [32]byte, distribution.EndpointID,
+		context.Context, PlanObservationRequest, distribution.EndpointID,
 	) (PlanObservationPeer, error)
+}
+
+type PlanObservationCatalog interface {
+	Read(context.Context) (*gateway.Snapshot, error)
+}
+
+// CatalogPlanObservationPeerDirectory resolves already-published RF3 members
+// from the same authenticated catalog image that bound the observation. It is
+// allocation and command aware; an endpoint reused by another group cannot be
+// selected accidentally. Prepared, not-yet-published children use a separate
+// plan-intent directory implementing PlanObservationPeerDirectory.
+type CatalogPlanObservationPeerDirectory struct{ catalog PlanObservationCatalog }
+
+func NewCatalogPlanObservationPeerDirectory(
+	catalog PlanObservationCatalog,
+) (*CatalogPlanObservationPeerDirectory, error) {
+	if catalog == nil {
+		return nil, ErrPlanObservation
+	}
+	return &CatalogPlanObservationPeerDirectory{catalog: catalog}, nil
+}
+
+func (directory *CatalogPlanObservationPeerDirectory) ResolvePlanObservationPeer(
+	ctx context.Context, request PlanObservationRequest, endpoint distribution.EndpointID,
+) (PlanObservationPeer, error) {
+	if directory == nil || directory.catalog == nil || ctx == nil || endpoint == "" ||
+		!validNetworkPlanObservationRequest(request) {
+		return PlanObservationPeer{}, ErrPlanObservation
+	}
+	snapshot, err := directory.catalog.Read(ctx)
+	if err != nil || snapshot == nil || snapshot.Generation() != request.CatalogGeneration {
+		return PlanObservationPeer{}, errors.Join(ErrPlanObservation, err)
+	}
+	digest, err := gateway.CatalogSnapshotDigest(snapshot)
+	if err != nil || digest != request.CatalogDigest {
+		return PlanObservationPeer{}, errors.Join(ErrPlanObservation, err)
+	}
+	route, found := snapshot.ResolveReplicatedRoute(
+		request.Distribution, request.Shard,
+		make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
+	)
+	if !found || route.Group != request.Group ||
+		route.AllocationGeneration != uint64(request.Allocation) || route.Command != request.Command {
+		return PlanObservationPeer{}, ErrPlanObservation
+	}
+	for _, replica := range route.Replicas {
+		if distribution.EndpointID(replica.ControlEndpoint) == endpoint ||
+			distribution.EndpointID(replica.Endpoint) == endpoint {
+			if replica.Node == (rafttransport.NodeID{}) || replica.Member == 0 {
+				return PlanObservationPeer{}, ErrPlanObservation
+			}
+			return PlanObservationPeer{Node: replica.Node, MemberID: replica.Member}, nil
+		}
+	}
+	return PlanObservationPeer{}, ErrPlanObservation
 }
 
 type PlanObservationStreamOpener interface {
@@ -290,7 +346,7 @@ func (client *NetworkPlanObservationClient) ObserveSplitSource(
 	var first *SourcePlanObservation
 	var failures error
 	for _, endpoint := range request.ControlEndpoints {
-		peer, err := client.directory.ResolvePlanObservationPeer(ctx, request.CatalogDigest, endpoint)
+		peer, err := client.directory.ResolvePlanObservationPeer(ctx, request, endpoint)
 		if err != nil {
 			failures = errors.Join(failures, err)
 			continue
@@ -344,7 +400,7 @@ func (client *NetworkPlanObservationClient) ObserveSplitChild(
 				results[index].err = ctx.Err()
 				return
 			}
-			peer, err := client.directory.ResolvePlanObservationPeer(ctx, request.CatalogDigest, endpoint)
+			peer, err := client.directory.ResolvePlanObservationPeer(ctx, request, endpoint)
 			if err != nil {
 				results[index].err = err
 				return
