@@ -111,6 +111,7 @@ func (client gatewayTestObservationClient) Observe(
 type gatewayTestActionClient struct {
 	node    rafttransport.NodeID
 	request replicaaction.Request
+	err     error
 }
 
 func (client *gatewayTestActionClient) Execute(
@@ -120,7 +121,7 @@ func (client *gatewayTestActionClient) Execute(
 		return err
 	}
 	client.node, client.request = node, request
-	return nil
+	return client.err
 }
 
 func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *testing.T) {
@@ -140,24 +141,41 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 		SchemaGeneration: 10, RoutingVersion: 11, RouteGeneration: 12,
 		RelationManifestDigest: [32]byte{14}}
 	target := gateway.ReplicatedEndpoint{Member: 4, Node: [16]byte{4}, StoreID: [16]byte{15}, NodeIncarnation: 16}
+	leader := gateway.ReplicatedEndpoint{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{21}, NodeIncarnation: 22}
 	route := gateway.ReplicatedMembershipRoute{Serving: gateway.ReplicatedRoute{
 		Group: raftmember.GroupKey{ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
 			TopologyRecoveryEpoch: 3, ShardIncarnation: binding.ShardIncarnation, GroupID: binding.GroupID},
-		AllocationGeneration: 5, Command: commandFence}, EnrolledTarget: target, HasEnrolledTarget: true}
+		AllocationGeneration: 5, Command: commandFence,
+		Replicas: []gateway.ReplicatedEndpoint{
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{19}, NodeIncarnation: 20}, leader,
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{23}, NodeIncarnation: 24},
+		}}, EnrolledTarget: target, HasEnrolledTarget: true}
 	actions := new(gatewayTestActionClient)
 	remote := gatewayReplicaRemoteActions{observer: gatewayTestObservationClient{observation: replicacontrol.Observation{
-		Status: raftmember.RuntimeStatus{Term: 17},
+		Status: raftmember.RuntimeStatus{MemberID: leader.Member, LeaderID: leader.Member, Term: 17},
 	}}, actions: actions}
 	operation := rebalance.OperationID{18}
 	step := [32]byte{19}
 	if err = remote.ProposeReplicaMoveOwnership(t.Context(), operation, step, route, command); err != nil {
 		t.Fatal(err)
 	}
-	if actions.node != target.Node || actions.request.Kind != replicaaction.OwnershipTransition ||
+	if actions.node != leader.Node || actions.request.Kind != replicaaction.OwnershipTransition ||
 		actions.request.Fence.Term != 17 || actions.request.SourceMember != 1 ||
-		actions.request.TargetMember != 4 {
+		actions.request.TargetMember != 4 || actions.request.Fence.MemberID != leader.Member ||
+		actions.request.Fence.StoreID != leader.StoreID ||
+		actions.request.Fence.NodeIncarnation != leader.NodeIncarnation {
 		t.Fatalf("ownership request=%+v node=%x", actions.request, actions.node)
 	}
+	staleLeader := &raftservice.NotLeaderError{Status: raftmember.RuntimeStatus{
+		MemberID: leader.Member, LeaderID: 3, Term: 18,
+	}}
+	actions.err = staleLeader
+	if err = remote.ProposeReplicaMoveOwnership(
+		t.Context(), operation, step, route, command,
+	); err != staleLeader {
+		t.Fatalf("changed leader err=%v, want exact retryable witness", err)
+	}
+	actions.err = nil
 	source := gateway.ReplicatedEndpoint{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{20}, NodeIncarnation: 21}
 	if err = remote.RetireReplicaSource(t.Context(), rebalanceexec.SourceRetirementRequest{
 		Operation: [32]byte(operation), Step: step, Group: route.Serving.Group,

@@ -653,19 +653,38 @@ func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(
 	if !route.HasEnrolledTarget || target.Member != targetMember {
 		return errGatewayReplicaControl
 	}
-	observation, err := remote.observer.Observe(ctx, target.Node, replicacontrol.Request{
-		Operation: [32]byte(operation), Step: step, Group: route.Serving.Group,
-		TargetMember: target.Member, ExpectedReplicaSetVersion: route.Serving.Command.ReplicaSetVersion,
-	})
-	if err != nil || observation.Status.Term == 0 {
-		return errors.Join(err, errGatewayReplicaControl)
+	request := replicacontrol.Request{Operation: [32]byte(operation), Step: step,
+		Group: route.Serving.Group, TargetMember: target.Member,
+		ExpectedReplicaSetVersion: route.Serving.Command.ReplicaSetVersion}
+	candidates := append([]gateway.ReplicatedEndpoint(nil), route.Serving.Replicas...)
+	foundTarget := false
+	for _, candidate := range candidates {
+		foundTarget = foundTarget || candidate.Member == target.Member
 	}
-	return remote.actions.Execute(ctx, target.Node, replicaaction.Request{
+	if !foundTarget {
+		candidates = append(candidates, target)
+	}
+	var leader gateway.ReplicatedEndpoint
+	var observation replicacontrol.Observation
+	var observeErrors error
+	for _, candidate := range candidates {
+		cut, observeErr := remote.observer.Observe(ctx, candidate.Node, request)
+		if observeErr == nil && cut.Status.MemberID == candidate.Member &&
+			cut.Status.LeaderID == candidate.Member && cut.Status.Term != 0 {
+			leader, observation = candidate, cut
+			break
+		}
+		observeErrors = errors.Join(observeErrors, observeErr)
+	}
+	if leader.Member == 0 {
+		return errors.Join(observeErrors, errGatewayReplicaControl)
+	}
+	return remote.actions.Execute(ctx, leader.Node, replicaaction.Request{
 		Operation: [32]byte(operation), Step: step, Kind: replicaaction.OwnershipTransition,
 		Fence: raftservice.ServingFence{Group: route.Serving.Group,
 			AllocationGeneration: route.Serving.AllocationGeneration, Command: route.Serving.Command,
-			MemberID: target.Member, StoreID: target.StoreID,
-			NodeIncarnation: target.NodeIncarnation, Term: observation.Status.Term},
+			MemberID: leader.Member, StoreID: leader.StoreID,
+			NodeIncarnation: leader.NodeIncarnation, Term: observation.Status.Term},
 		SourceMember: ownershipSource(command), TargetMember: target.Member,
 		Command: command,
 	})

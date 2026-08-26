@@ -301,7 +301,6 @@ func validRequest(request Request) bool {
 		transition, err := replicatedstate.OpenOwnershipTransition(request.Command)
 		return err == nil && transition.SourceMember == request.SourceMember &&
 			transition.TargetMember == request.TargetMember &&
-			request.Fence.MemberID == request.TargetMember &&
 			transitionMatchesFence(transition, request.Fence)
 	case SourceRetirement:
 		return len(request.Command) == 0 && request.Fence.MemberID == request.SourceMember
