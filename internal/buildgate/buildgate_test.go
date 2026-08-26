@@ -76,6 +76,20 @@ func TestProfileRequiresOnlyProvidedCapabilities(t *testing.T) {
 	}
 }
 
+func TestCurrentProfileIsExactAndImmutableByValue(t *testing.T) {
+	profile := CurrentProfile()
+	if !profile.Valid() || !profile.Provided.Has(CapabilityRaftTransport) ||
+		!profile.Required.Has(CapabilityRaftTransport) {
+		t.Fatalf("invalid current profile: %#v", profile)
+	}
+	profile.WireGrammar = GrammarID{}
+	profile.Provided = CapabilitySet{}
+	if next := CurrentProfile(); !next.Valid() ||
+		!next.Provided.Has(CapabilityRaftTransport) {
+		t.Fatalf("current profile was externally mutated: %#v", next)
+	}
+}
+
 func TestExactCompatibility(t *testing.T) {
 	local := testProfile()
 	remote := local
