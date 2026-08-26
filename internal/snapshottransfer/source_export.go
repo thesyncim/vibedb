@@ -28,6 +28,9 @@ type SourceExportPlan struct {
 
 	ArtifactWorkspace []byte
 	TransferWorkspace []byte
+	// Release returns caller-owned workspace or other bounded plan resources.
+	// Snapshot ownership remains separate and is always closed by the exporter.
+	Release func()
 }
 
 // ExportPinnedSnapshot publishes one deterministic artifact from the same

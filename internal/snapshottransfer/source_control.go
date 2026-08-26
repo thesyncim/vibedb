@@ -116,6 +116,9 @@ func (exporter PinnedSourceControlExporter) ExportReplicaMoveSnapshot(
 	if err != nil {
 		return Descriptor{}, err
 	}
+	if plan.Release != nil {
+		defer plan.Release()
+	}
 	if plan.Snapshot == nil {
 		return Descriptor{}, ErrSourceControl
 	}
