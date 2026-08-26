@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 )
 
@@ -168,8 +167,26 @@ func (j *Journal) Compact() error {
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(temporary, j.path); err != nil {
-		return err
+	candidateClosed, currentClosed, installErr := installJournalCompaction(
+		temporary, j.path, file, j.file,
+	)
+	if installErr != nil {
+		if currentClosed {
+			reopened, reopenErr := os.OpenFile(j.path, os.O_RDWR, 0o600)
+			if reopenErr != nil {
+				j.sticky = errors.Join(ErrOutcomeUnknown, installErr, reopenErr)
+				return j.sticky
+			}
+			j.file = reopened
+		}
+		return installErr
+	}
+	if candidateClosed {
+		file, err = os.OpenFile(j.path, os.O_RDWR, 0o600)
+		if err != nil {
+			j.sticky = errors.Join(ErrOutcomeUnknown, err)
+			return j.sticky
+		}
 	}
 	renamed = true
 	if err = syncJournalDirectory(j.path); err != nil {
@@ -180,6 +197,9 @@ func (j *Journal) Compact() error {
 	old := j.file
 	j.file = file
 	j.retainedBytes = retained
+	if currentClosed {
+		return nil
+	}
 	return old.Close()
 }
 
@@ -309,14 +329,6 @@ func (j *Journal) writeCompactedLocked(file *os.File) (uint64, error) {
 
 func compareJournalID(left, right ID) int {
 	return slices.Compare(left[:], right[:])
-}
-
-func syncJournalDirectory(path string) error {
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func removeStaleJournalCompaction(path string) error {
