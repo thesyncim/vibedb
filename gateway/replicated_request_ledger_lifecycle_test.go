@@ -32,6 +32,7 @@ func lifecycleDigest(label string) requestledger.Digest {
 func lifecycleKey() requestledger.RequestKey {
 	key := requestledger.RequestKey{
 		Scope: requestledger.ScopeAuthenticated, TenantDigest: lifecycleDigest("tenant"),
+		IssuerEpoch: 1, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{1},
 	}
 	copy(key.Principal[:], []byte("principal-000001"))
 	copy(key.Request[:], []byte("request-00000001"))
