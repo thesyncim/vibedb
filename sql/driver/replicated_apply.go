@@ -596,6 +596,10 @@ func (d *Database) openReplicatedApply(
 				Name:       replicatedstate.TransitionCaptureCollectionName,
 				Collection: core.replicatedCaptureCollection,
 			},
+			SchemaTransition:          core.schemaTransition,
+			SchemaMembershipWitness:   core.schemaMembership,
+			SchemaAuthorizationDigest: core.schemaAuthorization,
+			SchemaCatalogCASDigest:    core.schemaCatalogCAS,
 		},
 	)
 	if err != nil {

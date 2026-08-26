@@ -301,6 +301,71 @@ func (a *ReplicatedApply) PublishReplicatedSchemaCatalog() (published bool, err 
 	return true, nil
 }
 
+// OpenReplicatedShardStoreWithSchemaTransition is the sole target-generation
+// opener after catalog publication. It recovers the exact checkpoint
+// membership and authenticates the persisted Raft transition while opening;
+// ordinary replicated open continues to reject the unselected target slot.
+func OpenReplicatedShardStoreWithSchemaTransition(
+	path string,
+	expected ReplicatedShardStoreIdentity,
+	expectedApply ReplicatedApplyIdentity,
+) (*Database, error) {
+	if err := validateReplicatedShardStoreIdentity(expected); err != nil {
+		return nil, err
+	}
+	if err := validateReplicatedApplyIdentity(expectedApply, expected); err != nil {
+		return nil, err
+	}
+	absolute, err := canonicalCatalogPath(path)
+	if err != nil {
+		return nil, err
+	}
+	raw, found, err := readCatalogFile(absolute)
+	if err != nil || !found {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil || image.SchemaGeneration != expected.RelationSchemaGeneration ||
+		image.Digest == ([32]byte{}) {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	dataDir := absolute + ".tables"
+	record, activationFound, err := readReplicatedSchemaActivation(dataDir)
+	if err != nil || !activationFound || record.targetDigest != image.Digest {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	transition, err := replicatedstate.OpenSchemaTransition(record.command)
+	if err != nil || transition.ToSchemaGeneration != image.SchemaGeneration ||
+		transition.ToManifest != image.RelationManifestDigest ||
+		transition.ToApplyContract == ([32]byte{}) {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	marker, markerFound, err := readReplicatedSchemaStageMarker(dataDir)
+	if err != nil || !markerFound || marker.catalogDigest != image.Digest ||
+		marker.schemaGeneration != image.SchemaGeneration ||
+		marker.membership.Sequence != transition.MembershipSequence ||
+		marker.membership.Source != transition.MembershipSource ||
+		marker.membership.Target != transition.MembershipTarget ||
+		marker.authorization != transition.RequestDigest ||
+		marker.applyContract != transition.ToApplyContract {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	core, err := openDatabaseWithShardStorePolicy(path, nil, shardStoreOpenPolicy{
+		mode:                      shardStoreOpenReplicatedSchemaTransition,
+		expectedReplicated:        ownedReplicatedShardStoreIdentity(expected),
+		expectedReplicatedApply:   expectedApply,
+		schemaTransition:          record.command,
+		schemaMembership:          marker.membership,
+		schemaCheckpointAuthority: transition.RequestDigest,
+		schemaAuthorization:       transition.AuthorizationDigest,
+		schemaCatalogCAS:          transition.CatalogCASDigest,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Database{connector: &dbConnector{db: core}}, nil
+}
+
 // PersistReplicatedSchemaTransition records the exact authorized command
 // before proposal. A committed transition can therefore be recovered without
 // consulting an external controller or reconstructing semantically equivalent

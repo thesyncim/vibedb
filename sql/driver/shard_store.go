@@ -211,6 +211,7 @@ const (
 	shardStoreOpenReplicatedApplyExisting
 	shardStoreOpenReplicatedApplySettlement
 	shardStoreOpenReplicatedChildStageResume
+	shardStoreOpenReplicatedSchemaTransition
 )
 
 type shardStoreOpenPolicy struct {
@@ -222,6 +223,11 @@ type shardStoreOpenPolicy struct {
 	expectedReplicatedApply     ReplicatedApplyIdentity
 	expectedReplicatedOptions   ReplicatedApplyOptions
 	persistIdentity             func(*database) (bool, error)
+	schemaTransition            []byte
+	schemaMembership            durable.CheckpointMembershipWitness
+	schemaCheckpointAuthority   [32]byte
+	schemaAuthorization         [32]byte
+	schemaCatalogCAS            [32]byte
 }
 
 // InitializeShardStore explicitly binds a genuinely new SQL storage root and

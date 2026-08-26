@@ -169,4 +169,29 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
+	targetIdentity := target.ReplicatedShardStore.Clone()
+	targetApplyIdentity := target.ReplicatedApply.identity()
+	activated, err := OpenReplicatedShardStoreWithSchemaTransition(
+		path, targetIdentity, targetApplyIdentity,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activatedClaim, gotApplyIdentity, err := activated.OpenReplicatedApply(
+		targetIdentity, testReplicatedApplyBootstrap(), testReplicatedApplyOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotApplyIdentity != targetApplyIdentity ||
+		activatedClaim.Applied() != prepared.SourceApplied+1 {
+		t.Fatalf("target activation identity=%+v applied=%d err=%v",
+			gotApplyIdentity, activatedClaim.Applied(), err)
+	}
+	if err = activatedClaim.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = activated.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
