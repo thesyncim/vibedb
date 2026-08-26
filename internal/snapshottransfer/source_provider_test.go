@@ -3,9 +3,11 @@ package snapshottransfer
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -54,6 +56,71 @@ func TestRetainedSourceProviderExportsAndObservesAfterReopen(t *testing.T) {
 	if err != nil || !found || observed != descriptor {
 		t.Fatalf("observed=%+v found=%t err=%v", observed, found, err)
 	}
+
+	// The reopened control provider and source data service must expose the
+	// same published repository. This is the process-restart boundary used by
+	// bootstrap-rf3 after a source export completed before a crash.
+	targetNode := rafttransport.NodeID{32}
+	members := []rafttransport.Member{
+		{Group: descriptor.Group, ReplicaSetVersion: descriptor.ReplicaSetVersion,
+			MemberID: descriptor.SourceMember, Node: node, Role: rafttransport.MemberVoter},
+		{Group: descriptor.Group, ReplicaSetVersion: descriptor.ReplicaSetVersion,
+			MemberID: descriptor.TargetMember, Node: targetNode, Role: rafttransport.MemberLearner},
+	}
+	registry, err := rafttransport.NewStaticRegistry(
+		node, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	service, err := reopened.NewDataService(ServiceOptions{
+		Registry: registry, Authorize: func(got Descriptor) bool { return got == descriptor },
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConnections: 1,
+		MaxChunkBytes: MinChunkBytes, MaxInflightBytes: MinChunkBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceIdentity := rafttransport.PeerIdentity{TrustDomain: registry.TrustDomain(), Node: node}
+	targetIdentity := rafttransport.PeerIdentity{TrustDomain: registry.TrustDomain(), Node: targetNode}
+	opener := sourceProviderTestOpener{
+		service: service, source: sourceIdentity, target: targetIdentity,
+	}
+	targetRepository := openTestRepository(t, filepath.Join(t.TempDir(), "target"))
+	receiver := Receiver{
+		Repository: targetRepository, Opener: &opener,
+		ReadDeadline: deadline, WriteDeadline: deadline, Workspace: make([]byte, MinChunkBytes),
+	}
+	if err = receiver.Receive(context.Background(), node, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = targetRepository.Manifest(descriptor); err != nil {
+		t.Fatalf("transferred artifact is not published: %v", err)
+	}
+}
+
+type sourceProviderTestOpener struct {
+	service        *Service
+	source, target rafttransport.PeerIdentity
+}
+
+func (opener *sourceProviderTestOpener) OpenSnapshot(
+	ctx context.Context,
+	node rafttransport.NodeID,
+) (rafttransport.PeerConnection, error) {
+	if node != opener.source.Node {
+		return nil, rafttransport.ErrNodeNotFound
+	}
+	client, server := net.Pipe()
+	go func() {
+		_ = opener.service.Serve(ctx, &testPeerConn{
+			Conn: server, identity: opener.target, class: rafttransport.TrafficSnapshot,
+		})
+	}()
+	return &testPeerConn{
+		Conn: client, identity: opener.source, class: rafttransport.TrafficSnapshot,
+	}, nil
 }
 
 func TestRetainedSourceProviderRejectsWrongIdentityAndStaleMembership(t *testing.T) {
