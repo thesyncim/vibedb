@@ -124,8 +124,8 @@ func (journal *SourceFileJournal) PublishSourceExport(
 	}
 	if expected == ^uint64(0) || record.Revision != expected+1 ||
 		!found && (record.State != SourceControlRunning || record.Revision != 1) ||
-		found && (current.Request != record.Request || current.State != SourceControlRunning ||
-			record.State != SourceControlComplete) {
+		found && (current.Request != record.Request ||
+			!validSourceJournalTransition(current.State, record.State)) {
 		return ErrSourceConflict
 	}
 	if !found && len(journal.records) == journal.maxRecords {
@@ -167,6 +167,11 @@ func (journal *SourceFileJournal) PublishSourceExport(
 		return errors.Join(ErrSourceOutcomeUnknown, err)
 	}
 	return nil
+}
+
+func validSourceJournalTransition(current, next SourceControlState) bool {
+	return current == SourceControlRunning && next == SourceControlComplete ||
+		current == SourceControlComplete && next == SourceControlReleased
 }
 
 func (journal *SourceFileJournal) createTemporary(name string) (*os.File, error) {
@@ -272,7 +277,7 @@ func appendSourceJournalRecord(dst []byte, record SourceControlRecord) ([]byte, 
 	if err != nil {
 		return dst[:start], err
 	}
-	if record.State == SourceControlComplete {
+	if record.State == SourceControlComplete || record.State == SourceControlReleased {
 		dst, err = AppendDescriptor(dst, record.Descriptor)
 		if err != nil {
 			return dst[:start], err

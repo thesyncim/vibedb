@@ -67,6 +67,9 @@ type SnapshotSource interface {
 	PrepareReplicaMoveSnapshot(
 		context.Context, SnapshotExportRequest,
 	) (snapshottransfer.Descriptor, error)
+	ReleaseReplicaMoveSnapshot(
+		context.Context, SnapshotExportRequest, snapshottransfer.Descriptor,
+	) error
 }
 
 // SnapshotBootstrapClient is implemented by snapshottransfer.BootstrapControlClient.
@@ -289,15 +292,14 @@ func (executor *Executor) executeSnapshot(
 		cut.Target.NodeIncarnation == 0 {
 		return errors.Join(err, ErrExecutionFence)
 	}
-	descriptor, err := executor.options.Snapshots.PrepareReplicaMoveSnapshot(
-		ctx, SnapshotExportRequest{
-			Operation: [32]byte(operation), Step: execution.Proof, Group: plan.Group(),
-			SourceMember: plan.SnapshotSourceMember(), TargetMember: plan.TargetMember(),
-			TargetStore: cut.Target.StoreID, TargetIncarnation: cut.Target.NodeIncarnation,
-			ReplicaSetVersion: execution.PublicationReplicaSet,
-			SourceNode:        cut.SnapshotSource.Node,
-		},
-	)
+	sourceRequest := SnapshotExportRequest{
+		Operation: [32]byte(operation), Step: execution.Proof, Group: plan.Group(),
+		SourceMember: plan.SnapshotSourceMember(), TargetMember: plan.TargetMember(),
+		TargetStore: cut.Target.StoreID, TargetIncarnation: cut.Target.NodeIncarnation,
+		ReplicaSetVersion: execution.PublicationReplicaSet,
+		SourceNode:        cut.SnapshotSource.Node,
+	}
+	descriptor, err := executor.options.Snapshots.PrepareReplicaMoveSnapshot(ctx, sourceRequest)
 	if err != nil {
 		return err
 	}
@@ -321,7 +323,7 @@ func (executor *Executor) executeSnapshot(
 		record.Request.Step != execution.Proof || record.Request.Descriptor != descriptor {
 		return ErrExecutionFence
 	}
-	return nil
+	return executor.options.Snapshots.ReleaseReplicaMoveSnapshot(ctx, sourceRequest, descriptor)
 }
 
 func (executor *Executor) executeOwnership(

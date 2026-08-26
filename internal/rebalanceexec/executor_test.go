@@ -24,19 +24,32 @@ type executorFixture struct {
 	grant      membershipgrant.Grant
 	grantFound bool
 
-	membershipRequests []shardservice.ReplicatedMembershipRequest
-	snapshotRequests   []SnapshotExportRequest
-	bootstrapRequests  []snapshottransfer.BootstrapRequest
-	awaits             []rebalance.ReplicatedMoveExecution
-	ownershipCommands  [][]byte
-	retirements        []SourceRetirementRequest
-	finalizes          int
-	retries            int
-	unknownFinalize    bool
-	membershipErr      error
-	membershipHook     func()
-	drainRequests      []gateway.ClusterCatalogDrainRequest
-	drainCertificate   func(gateway.ClusterCatalogDrainRequest) gateway.ClusterCatalogDrainCertificate
+	membershipRequests  []shardservice.ReplicatedMembershipRequest
+	snapshotRequests    []SnapshotExportRequest
+	snapshotReleases    []SnapshotExportRequest
+	releasedDescriptors []snapshottransfer.Descriptor
+	bootstrapRequests   []snapshottransfer.BootstrapRequest
+	awaits              []rebalance.ReplicatedMoveExecution
+	ownershipCommands   [][]byte
+	retirements         []SourceRetirementRequest
+	finalizes           int
+	retries             int
+	unknownFinalize     bool
+	membershipErr       error
+	bootstrapErr        error
+	bootstrapState      snapshottransfer.BootstrapState
+	releaseErr          error
+	membershipHook      func()
+	drainRequests       []gateway.ClusterCatalogDrainRequest
+	drainCertificate    func(gateway.ClusterCatalogDrainRequest) gateway.ClusterCatalogDrainCertificate
+}
+
+func (fixture *executorFixture) ReleaseReplicaMoveSnapshot(
+	_ context.Context, request SnapshotExportRequest, descriptor snapshottransfer.Descriptor,
+) error {
+	fixture.snapshotReleases = append(fixture.snapshotReleases, request)
+	fixture.releasedDescriptors = append(fixture.releasedDescriptors, descriptor)
+	return fixture.releaseErr
 }
 
 func (fixture *executorFixture) ResolveReplicaMove(
@@ -84,8 +97,15 @@ func (fixture *executorFixture) Execute(
 	_ context.Context, _ rafttransport.NodeID, request snapshottransfer.BootstrapRequest,
 ) (snapshottransfer.BootstrapRecord, error) {
 	fixture.bootstrapRequests = append(fixture.bootstrapRequests, request)
+	if fixture.bootstrapErr != nil {
+		return snapshottransfer.BootstrapRecord{}, fixture.bootstrapErr
+	}
+	state := fixture.bootstrapState
+	if state == 0 {
+		state = snapshottransfer.BootstrapComplete
+	}
 	return snapshottransfer.BootstrapRecord{
-		Request: request, Revision: 2, State: snapshottransfer.BootstrapComplete,
+		Request: request, Revision: 2, State: state,
 	}, nil
 }
 
@@ -203,12 +223,15 @@ func TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(fixture.snapshotRequests) != 1 || len(fixture.bootstrapRequests) != 1 ||
+		len(fixture.snapshotReleases) != 1 || len(fixture.releasedDescriptors) != 1 ||
 		fixture.snapshotRequests[0].Operation != [32]byte(plan.OperationID()) ||
 		fixture.snapshotRequests[0].Step != snapshotExecution.Proof ||
 		fixture.bootstrapRequests[0].Operation != [32]byte(plan.OperationID()) ||
-		fixture.bootstrapRequests[0].Step != snapshotExecution.Proof {
-		t.Fatalf("snapshot=%+v bootstrap=%+v",
-			fixture.snapshotRequests, fixture.bootstrapRequests)
+		fixture.bootstrapRequests[0].Step != snapshotExecution.Proof ||
+		fixture.snapshotReleases[0] != fixture.snapshotRequests[0] ||
+		fixture.releasedDescriptors[0] != fixture.bootstrapRequests[0].Descriptor {
+		t.Fatalf("snapshot=%+v bootstrap=%+v release=%+v",
+			fixture.snapshotRequests, fixture.bootstrapRequests, fixture.snapshotReleases)
 	}
 
 	for _, kind := range []rebalance.ActionKind{
@@ -262,6 +285,44 @@ func TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions(t *testing.T) {
 		fixture.drainRequests[1].Step != postRemoveDrain.Proof || digest == postRemoveDigest {
 		t.Fatalf("post-remove drain=%+v digest=%x err=%v",
 			fixture.drainRequests, postRemoveDigest, err)
+	}
+}
+
+func TestExecutorReleasesSnapshotOnlyAfterCertifiedInstallAndRetriesExactRelease(t *testing.T) {
+	plan, fixture := newExecutorFixture(t)
+	executor, err := New(Options{
+		Routes: fixture, Grants: fixture, Membership: fixture, Snapshots: fixture,
+		Bootstrap: fixture, Awaiter: fixture, Ownership: fixture, Catalog: fixture,
+		Drainer: fixture, Retirer: fixture,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := testExecution(rebalance.ActionCreateSnapshotBase)
+	installErr := errors.New("target install not durable")
+	fixture.bootstrapErr = installErr
+	if err = executor.ExecuteReplicaMove(context.Background(), plan.OperationID(), plan, execution); !errors.Is(err, installErr) || len(fixture.snapshotReleases) != 0 {
+		t.Fatalf("uncertified install err=%v releases=%d", err, len(fixture.snapshotReleases))
+	}
+	fixture.bootstrapErr = nil
+	fixture.bootstrapState = snapshottransfer.BootstrapRunning
+	if err = executor.ExecuteReplicaMove(context.Background(), plan.OperationID(), plan, execution); !errors.Is(err, ErrExecutionFence) || len(fixture.snapshotReleases) != 0 {
+		t.Fatalf("running install err=%v releases=%d", err, len(fixture.snapshotReleases))
+	}
+	fixture.bootstrapState = snapshottransfer.BootstrapComplete
+	fixture.releaseErr = snapshottransfer.ErrSourceOutcomeUnknown
+	if err = executor.ExecuteReplicaMove(context.Background(), plan.OperationID(), plan, execution); !errors.Is(err, snapshottransfer.ErrSourceOutcomeUnknown) || len(fixture.snapshotReleases) != 1 {
+		t.Fatalf("first release err=%v releases=%d", err, len(fixture.snapshotReleases))
+	}
+	fixture.releaseErr = nil
+	if err = executor.ExecuteReplicaMove(context.Background(), plan.OperationID(), plan, execution); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.snapshotReleases) != 2 ||
+		fixture.snapshotReleases[0] != fixture.snapshotReleases[1] ||
+		fixture.releasedDescriptors[0] != fixture.releasedDescriptors[1] {
+		t.Fatalf("release retries=%+v descriptors=%+v",
+			fixture.snapshotReleases, fixture.releasedDescriptors)
 	}
 }
 

@@ -90,9 +90,88 @@ func (client *SourceControlClient) PrepareReplicaMoveSnapshot(
 	if err != nil {
 		return Descriptor{}, errors.Join(ErrSourceOutcomeUnknown, err)
 	}
-	if record.Request != request || record.State != SourceControlComplete ||
+	if record.Request != request ||
+		(record.State != SourceControlComplete && record.State != SourceControlReleased) ||
 		!descriptorMatchesSourceRequest(record.Descriptor, request) {
 		return Descriptor{}, ErrSourceConflict
 	}
 	return record.Descriptor, nil
+}
+
+// ReleaseReplicaMoveSnapshot asks the source to durably release the exact
+// export after the controller has obtained the target's BootstrapComplete
+// witness. Transport failure is outcome-unknown and is resolved by replaying
+// the identical operation/step request.
+func (client *SourceControlClient) ReleaseReplicaMoveSnapshot(
+	ctx context.Context,
+	request SourceControlRequest,
+	descriptor Descriptor,
+) error {
+	if !descriptorMatchesSourceRequest(descriptor, request) {
+		return ErrSourceConflict
+	}
+	record, err := client.executeRelease(ctx, request)
+	if err != nil {
+		return err
+	}
+	if record.State != SourceControlReleased || record.Request != request ||
+		record.Descriptor != descriptor {
+		return ErrSourceConflict
+	}
+	return nil
+}
+
+func (client *SourceControlClient) executeRelease(
+	ctx context.Context,
+	request SourceControlRequest,
+) (SourceControlRecord, error) {
+	source := request.SourceNode
+	if client == nil || ctx == nil || source == (rafttransport.NodeID{}) ||
+		!validSourceControlRequest(request) {
+		return SourceControlRecord{}, ErrSourceControl
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return SourceControlRecord{}, cause
+	}
+	connection, err := client.opener.OpenShardControl(ctx, source)
+	if err != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return SourceControlRecord{}, err
+	}
+	if connection == nil {
+		return SourceControlRecord{}, ErrSourceControl
+	}
+	defer connection.Close()
+	peer := connection.PeerIdentity()
+	wantDomain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation}
+	if connection.TrafficClass() != rafttransport.TrafficShardControl || peer.Node != source || peer.TrustDomain != wantDomain {
+		return SourceControlRecord{}, ErrSourceUnauthorized
+	}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	if deadline := boundedBootstrapDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
+		return SourceControlRecord{}, ErrSourceControl
+	} else if err = connection.SetWriteDeadline(deadline); err != nil {
+		return SourceControlRecord{}, err
+	}
+	var raw [SourceControlRequestBytes]byte
+	encoded, err := appendSourceControlReleaseRequest(raw[:0], request)
+	if err != nil {
+		return SourceControlRecord{}, err
+	}
+	if err = writeFull(connection, encoded); err != nil {
+		return SourceControlRecord{}, errors.Join(ErrSourceOutcomeUnknown, err)
+	}
+	if deadline := boundedBootstrapDeadline(ctx, client.readDeadline()); deadline.IsZero() {
+		return SourceControlRecord{}, ErrSourceOutcomeUnknown
+	} else if err = connection.SetReadDeadline(deadline); err != nil {
+		return SourceControlRecord{}, errors.Join(ErrSourceOutcomeUnknown, err)
+	}
+	record, err := ReadSourceControlResponse(connection)
+	if err != nil {
+		return SourceControlRecord{}, errors.Join(ErrSourceOutcomeUnknown, err)
+	}
+	return record, nil
 }

@@ -41,6 +41,14 @@ type SourceControlState uint8
 const (
 	SourceControlRunning SourceControlState = iota + 1
 	SourceControlComplete
+	SourceControlReleased
+)
+
+type sourceControlCommand uint8
+
+const (
+	sourceControlPrepare sourceControlCommand = iota
+	sourceControlRelease
 )
 
 // SourceControlRequest is the immutable identity of one journaled replica-move
@@ -80,6 +88,7 @@ type SourceControlJournal interface {
 type SourceControlExporter interface {
 	ObserveReplicaMoveSnapshot(context.Context, SourceControlRequest) (Descriptor, bool, error)
 	ExportReplicaMoveSnapshot(context.Context, SourceControlRequest) (Descriptor, error)
+	ReleaseReplicaMoveSnapshot(context.Context, SourceControlRequest, Descriptor) error
 }
 
 // SourceExportPlanProvider owns source-specific Raft ReadIndex fencing and
@@ -88,6 +97,7 @@ type SourceControlExporter interface {
 type SourceExportPlanProvider interface {
 	ObserveSourceExport(context.Context, SourceControlRequest) (Descriptor, bool, error)
 	PinSourceExport(context.Context, SourceControlRequest) (SourceExportPlan, error)
+	ReleaseSourceExport(context.Context, SourceControlRequest, Descriptor) error
 }
 
 // PinnedSourceControlExporter is the concrete bounded adapter to
@@ -141,6 +151,18 @@ func (exporter PinnedSourceControlExporter) ExportReplicaMoveSnapshot(
 	return descriptor, nil
 }
 
+func (exporter PinnedSourceControlExporter) ReleaseReplicaMoveSnapshot(
+	ctx context.Context,
+	request SourceControlRequest,
+	descriptor Descriptor,
+) error {
+	if exporter.Provider == nil || ctx == nil || !validSourceControlRequest(request) ||
+		!descriptorMatchesSourceRequest(descriptor, request) {
+		return ErrSourceControl
+	}
+	return exporter.Provider.ReleaseSourceExport(ctx, request, descriptor)
+}
+
 type SourceControlAuthorizeFunc func(rafttransport.PeerIdentity, SourceControlRequest) bool
 
 type SourceControlOptions struct {
@@ -192,7 +214,7 @@ func (service *SourceControlService) Serve(ctx context.Context, connection raftt
 	} else if err := connection.SetReadDeadline(deadline); err != nil {
 		return err
 	}
-	request, err := ReadSourceControlRequest(connection)
+	command, request, err := readSourceControlCommand(connection)
 	if err != nil {
 		return err
 	}
@@ -203,7 +225,12 @@ func (service *SourceControlService) Serve(ctx context.Context, connection raftt
 	if peer.TrustDomain != wantDomain || !service.authorize(peer, request) {
 		return ErrSourceUnauthorized
 	}
-	record, err := service.Execute(ctx, request)
+	var record SourceControlRecord
+	if command == sourceControlRelease {
+		record, err = service.Release(ctx, request)
+	} else {
+		record, err = service.Execute(ctx, request)
+	}
 	if err != nil {
 		return err
 	}
@@ -235,7 +262,7 @@ func (service *SourceControlService) Execute(ctx context.Context, request Source
 	stripe.Lock()
 	defer stripe.Unlock()
 	record, err := service.loadOrCreate(ctx, request)
-	if err != nil || record.State == SourceControlComplete {
+	if err != nil || record.State == SourceControlComplete || record.State == SourceControlReleased {
 		return record, err
 	}
 	descriptor, found, err := service.exporter.ObserveReplicaMoveSnapshot(ctx, request)
@@ -263,6 +290,56 @@ func (service *SourceControlService) Execute(ctx context.Context, request Source
 		return SourceControlRecord{}, err
 	}
 	return terminal, nil
+}
+
+// Release durably retires the exact completed export. A running export is
+// never eligible: the target may still need its resumable source bytes. The
+// repository release precedes the Released journal transition, so a crash at
+// either boundary is settled by replaying the same operation and step.
+func (service *SourceControlService) Release(
+	ctx context.Context,
+	request SourceControlRequest,
+) (SourceControlRecord, error) {
+	if service == nil || ctx == nil || !validSourceControlRequest(request) {
+		return SourceControlRecord{}, ErrSourceControl
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return SourceControlRecord{}, cause
+	}
+	select {
+	case service.slots <- struct{}{}:
+		defer func() { <-service.slots }()
+	default:
+		return SourceControlRecord{}, ErrBound
+	}
+	stripe := &service.stripes[binary.LittleEndian.Uint64(request.Operation[:8])%uint64(len(service.stripes))]
+	stripe.Lock()
+	defer stripe.Unlock()
+	record, err := service.journal.ReadSourceExport(ctx, request.Operation)
+	if err != nil {
+		return SourceControlRecord{}, err
+	}
+	if !validSourceControlRecord(record) || record.Request != request {
+		return SourceControlRecord{}, ErrSourceConflict
+	}
+	if record.State == SourceControlReleased {
+		return record, nil
+	}
+	if record.State != SourceControlComplete {
+		return SourceControlRecord{}, ErrSourceConflict
+	}
+	if err := service.exporter.ReleaseReplicaMoveSnapshot(
+		ctx, request, record.Descriptor,
+	); err != nil {
+		return SourceControlRecord{}, err
+	}
+	released := record
+	released.Revision++
+	released.State = SourceControlReleased
+	if err := service.publishExact(ctx, record.Revision, released); err != nil {
+		return SourceControlRecord{}, err
+	}
+	return released, nil
 }
 
 func (service *SourceControlService) Observe(ctx context.Context, operation [32]byte) (SourceControlRecord, error) {
@@ -322,7 +399,7 @@ func validSourceControlRequest(request SourceControlRequest) bool {
 
 func validSourceControlRecord(record SourceControlRecord) bool {
 	if !validSourceControlRequest(record.Request) || record.Revision == 0 ||
-		record.State < SourceControlRunning || record.State > SourceControlComplete {
+		record.State < SourceControlRunning || record.State > SourceControlReleased {
 		return false
 	}
 	if record.State == SourceControlRunning {
@@ -389,6 +466,31 @@ func OpenSourceControlRequest(raw []byte) (SourceControlRequest, error) {
 	return request, nil
 }
 
+func appendSourceControlReleaseRequest(dst []byte, request SourceControlRequest) ([]byte, error) {
+	dst, err := AppendSourceControlRequest(dst, request)
+	if err != nil {
+		return dst, err
+	}
+	dst[len(dst)-8] = byte(sourceControlRelease)
+	return dst, nil
+}
+
+func readSourceControlCommand(reader io.Reader) (
+	sourceControlCommand, SourceControlRequest, error,
+) {
+	var raw [SourceControlRequestBytes]byte
+	if _, err := io.ReadFull(reader, raw[:]); err != nil {
+		return 0, SourceControlRequest{}, err
+	}
+	command := sourceControlCommand(raw[208])
+	if command > sourceControlRelease || !allZero(raw[209:216]) {
+		return 0, SourceControlRequest{}, ErrSourceControl
+	}
+	raw[208] = 0
+	request, err := OpenSourceControlRequest(raw[:])
+	return command, request, err
+}
+
 func ReadSourceControlRequest(reader io.Reader) (SourceControlRequest, error) {
 	var raw [SourceControlRequestBytes]byte
 	if _, err := io.ReadFull(reader, raw[:]); err != nil {
@@ -407,7 +509,8 @@ func WriteSourceControlRequest(writer io.Writer, request SourceControlRequest) e
 }
 
 func AppendSourceControlResponse(dst []byte, record SourceControlRecord) ([]byte, error) {
-	if !validSourceControlRecord(record) || record.State != SourceControlComplete ||
+	if !validSourceControlRecord(record) ||
+		(record.State != SourceControlComplete && record.State != SourceControlReleased) ||
 		len(dst) > math.MaxInt-SourceControlResponseBytes {
 		return dst, ErrSourceControl
 	}
@@ -430,11 +533,12 @@ func AppendSourceControlResponse(dst []byte, record SourceControlRecord) ([]byte
 
 func OpenSourceControlResponse(raw []byte) (SourceControlRecord, error) {
 	if len(raw) != SourceControlResponseBytes || !bytes.Equal(raw[:8], sourceResponseMagic[:]) ||
-		raw[8] != byte(SourceControlComplete) || !allZero(raw[9:16]) {
+		(raw[8] != byte(SourceControlComplete) && raw[8] != byte(SourceControlReleased)) ||
+		!allZero(raw[9:16]) {
 		return SourceControlRecord{}, ErrSourceControl
 	}
 	var record SourceControlRecord
-	record.State = SourceControlComplete
+	record.State = SourceControlState(raw[8])
 	record.Revision = binary.BigEndian.Uint64(raw[16:24])
 	copy(record.Request.Operation[:], raw[24:56])
 	copy(record.Request.Step[:], raw[56:88])

@@ -59,6 +59,17 @@ type testSourceExporter struct {
 	exported         bool
 	exportCalls      int
 	errorAfterExport error
+	releaseCalls     int
+	releaseErr       error
+}
+
+func (exporter *testSourceExporter) ReleaseReplicaMoveSnapshot(
+	context.Context, SourceControlRequest, Descriptor,
+) error {
+	exporter.mu.Lock()
+	defer exporter.mu.Unlock()
+	exporter.releaseCalls++
+	return exporter.releaseErr
 }
 
 func (exporter *testSourceExporter) ObserveReplicaMoveSnapshot(
@@ -116,12 +127,82 @@ func TestSourceControlPersistsIntentAndSettlesUnknownOutcomes(t *testing.T) {
 	}
 }
 
+func TestSourceControlReleaseRequiresCompleteAndRecoversAcrossJournalReopen(t *testing.T) {
+	request, descriptor := sourceControlFixture()
+	path := t.TempDir() + "/source-release-journal"
+	journal, err := OpenSourceFileJournal(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	running := SourceControlRecord{Request: request, Revision: 1, State: SourceControlRunning}
+	if err = journal.PublishSourceExport(ctx, 0, running); err != nil {
+		t.Fatal(err)
+	}
+	exporter := &testSourceExporter{descriptor: descriptor, exported: true}
+	service := newTestSourceControl(t, journal, exporter)
+	if _, err = service.Release(ctx, request); !errors.Is(err, ErrSourceConflict) ||
+		exporter.releaseCalls != 0 {
+		t.Fatalf("running release err=%v calls=%d", err, exporter.releaseCalls)
+	}
+	complete := SourceControlRecord{
+		Request: request, Revision: 2, State: SourceControlComplete, Descriptor: descriptor,
+	}
+	if err = journal.PublishSourceExport(ctx, 1, complete); err != nil {
+		t.Fatal(err)
+	}
+	// Model a repository release whose response is lost. The durable journal
+	// remains Complete, so reopen retries the exact release rather than deleting
+	// early or inventing another artifact identity.
+	exporter.releaseErr = ErrSourceOutcomeUnknown
+	if _, err = service.Release(ctx, request); !errors.Is(err, ErrSourceOutcomeUnknown) {
+		t.Fatalf("outcome-unknown release err=%v", err)
+	}
+	if err = journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = OpenSourceFileJournal(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter.releaseErr = nil
+	service = newTestSourceControl(t, journal, exporter)
+	released, err := service.Release(ctx, request)
+	if err != nil || released.State != SourceControlReleased || released.Revision != 3 ||
+		exporter.releaseCalls != 2 {
+		t.Fatalf("released=%+v calls=%d err=%v", released, exporter.releaseCalls, err)
+	}
+	if err = journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = OpenSourceFileJournal(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := newTestSourceControl(t, journal, exporter)
+	again, err := replayed.Release(ctx, request)
+	if err != nil || again != released || exporter.releaseCalls != 2 {
+		t.Fatalf("idempotent release=%+v calls=%d err=%v", again, exporter.releaseCalls, err)
+	}
+	if err = journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type testSourcePlanProvider struct{ plan SourceExportPlan }
 
 func (provider *testSourcePlanProvider) ObserveSourceExport(
 	context.Context, SourceControlRequest,
 ) (Descriptor, bool, error) {
 	return Descriptor{}, false, nil
+}
+
+func (provider *testSourcePlanProvider) ReleaseSourceExport(
+	_ context.Context, request SourceControlRequest, descriptor Descriptor,
+) error {
+	return provider.plan.Repository.ReleasePublished(ArtifactReleaseRequest{
+		Operation: request.Operation, Step: request.Step, Descriptor: descriptor,
+	})
 }
 
 func (provider *testSourcePlanProvider) PinSourceExport(
@@ -207,6 +288,12 @@ func (exporter *blockingSourceExporter) ExportReplicaMoveSnapshot(
 	}
 }
 
+func (*blockingSourceExporter) ReleaseReplicaMoveSnapshot(
+	context.Context, SourceControlRequest, Descriptor,
+) error {
+	return nil
+}
+
 func TestSourceControlCanonicalFixedProtocol(t *testing.T) {
 	request, descriptor := sourceControlFixture()
 	encoded, err := AppendSourceControlRequest(nil, request)
@@ -216,6 +303,11 @@ func TestSourceControlCanonicalFixedProtocol(t *testing.T) {
 	opened, err := OpenSourceControlRequest(encoded)
 	if err != nil || opened != request {
 		t.Fatalf("opened=%+v err=%v", opened, err)
+	}
+	releaseRequest, err := appendSourceControlReleaseRequest(nil, request)
+	command, releasedRequest, readErr := readSourceControlCommand(bytes.NewReader(releaseRequest))
+	if err != nil || readErr != nil || command != sourceControlRelease || releasedRequest != request {
+		t.Fatalf("release command=%d request=%+v append=%v read=%v", command, releasedRequest, err, readErr)
 	}
 	forged := append([]byte(nil), encoded...)
 	forged[len(forged)-1] = 1
@@ -285,6 +377,12 @@ func TestSourceControlClientExecutesAuthenticatedExactRequest(t *testing.T) {
 	if err != nil || serveErr != nil || got != descriptor || exporter.exportCalls != 1 {
 		t.Fatalf("descriptor=%+v exports=%d err=%v serveErr=%v",
 			got, exporter.exportCalls, err, serveErr)
+	}
+	if err = client.ReleaseReplicaMoveSnapshot(context.Background(), request, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if serveErr = <-done; serveErr != nil || exporter.releaseCalls != 1 {
+		t.Fatalf("release calls=%d serveErr=%v", exporter.releaseCalls, serveErr)
 	}
 }
 

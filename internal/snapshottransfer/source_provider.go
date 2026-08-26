@@ -245,6 +245,28 @@ func (provider *RetainedSourceExportProvider) matchesRequest(request SourceContr
 		request.TargetIncarnation == options.TargetIncarnation
 }
 
+func (provider *RetainedSourceExportProvider) ReleaseSourceExport(
+	ctx context.Context,
+	request SourceControlRequest,
+	descriptor Descriptor,
+) error {
+	if provider == nil || ctx == nil || !provider.matchesRequest(request) ||
+		!descriptorMatchesSourceRequest(descriptor, request) {
+		return ErrSourceConflict
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	provider.mu.RLock()
+	defer provider.mu.RUnlock()
+	if provider.closed || provider.repository == nil {
+		return ErrSourceControl
+	}
+	return provider.repository.ReleasePublished(ArtifactReleaseRequest{
+		Operation: request.Operation, Step: request.Step, Descriptor: descriptor,
+	})
+}
+
 // Close releases the repository writer claim. Callers must first stop the
 // source control service and release every plan returned by PinSourceExport.
 func (provider *RetainedSourceExportProvider) Close() error {
