@@ -17,6 +17,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/rangesplit"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	protocol "github.com/thesyncim/vibedb/shardcontrol"
@@ -24,11 +26,14 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 const maxPrepareRF3ManifestBytes = 64 << 10
 
 var errPrepareRF3 = errors.New("vibedb-shard: invalid RF3 preparation manifest")
+
+const rf3SplitChildBootstrapData = "vibedb-rf3-split-child-bootstrap"
 
 // prepareRF3Manifest is deliberately a single-member manifest. An operator
 // writes three canonical documents for RF3. The local development command may
@@ -61,9 +66,11 @@ type prepareRF3Manifest struct {
 }
 
 type prepareRF3SplitControl struct {
-	MaxRecords   int                     `json:"max_records"`
-	MaxFileBytes int64                   `json:"max_file_bytes"`
-	Grants       []prepareRF3ActionGrant `json:"grants"`
+	MaxRecords           int                     `json:"max_records"`
+	MaxFileBytes         int64                   `json:"max_file_bytes"`
+	Grants               []prepareRF3ActionGrant `json:"grants"`
+	MaxChildOperations   int                     `json:"max_child_operations"`
+	StageCheckpointBytes uint64                  `json:"stage_checkpoint_bytes"`
 }
 
 type prepareRF3ActionGrant struct {
@@ -96,7 +103,7 @@ type prepareRF3Apply struct {
 	RetryWindow    uint16 `json:"retry_window"`
 	MaxCollections int    `json:"max_collections"`
 	MaxDocuments   int    `json:"max_documents"`
-	MaxBytes       int    `json:"max_bytes"`
+	MaxBytes       int64  `json:"max_bytes"`
 	ShardKey       string `json:"shard_key"`
 }
 
@@ -120,10 +127,46 @@ type persistedRF3Manifest struct {
 }
 
 type persistedRF3SplitControl struct {
-	JournalPath  string                    `json:"journal_path"`
-	MaxRecords   int                       `json:"max_records"`
-	MaxFileBytes int64                     `json:"max_file_bytes"`
-	Grants       []persistedRF3ActionGrant `json:"grants"`
+	JournalPath   string                         `json:"journal_path"`
+	MaxRecords    int                            `json:"max_records"`
+	MaxFileBytes  int64                          `json:"max_file_bytes"`
+	Grants        []persistedRF3ActionGrant      `json:"grants"`
+	ChildRegistry persistedRF3SplitChildRegistry `json:"child_registry"`
+}
+
+type persistedRF3SplitChildRegistry struct {
+	Root                 string                      `json:"root"`
+	MaxOperations        int                         `json:"max_operations"`
+	StageCheckpointBytes uint64                      `json:"stage_checkpoint_bytes"`
+	Table                string                      `json:"table"`
+	CreateTable          string                      `json:"create_table"`
+	WAL                  persistedRF3SplitChildWAL   `json:"wal"`
+	Apply                persistedRF3SplitChildApply `json:"apply"`
+	StaticBootstrapPath  string                      `json:"static_bootstrap_path"`
+	ReplicaSetVersion    uint64                      `json:"replica_set_version"`
+	Members              []persistedRF3Member        `json:"members"`
+}
+
+type persistedRF3SplitChildWAL struct {
+	KeyID           string `json:"key_id"`
+	KeyMaterialPath string `json:"key_material_path"`
+	MaxFileBytes    int64  `json:"max_file_bytes"`
+	MaxRecordBytes  int    `json:"max_record_bytes"`
+	MaxRecords      uint64 `json:"max_records"`
+	MaxEntries      uint64 `json:"max_entries"`
+	MaxLiveBytes    int64  `json:"max_live_bytes"`
+}
+
+type persistedRF3SplitChildApply struct {
+	MaxSessions    uint64 `json:"max_sessions"`
+	RetryWindow    uint16 `json:"retry_window"`
+	MaxCollections int    `json:"max_collections"`
+	MaxDocuments   int    `json:"max_documents"`
+	MaxBytes       int64  `json:"max_bytes"`
+	Format         uint16 `json:"format"`
+	ShardKey       string `json:"shard_key"`
+	TupleVersion   uint32 `json:"tuple_version"`
+	MapperVersion  uint32 `json:"mapper_version"`
 }
 
 type persistedRF3ActionGrant struct {
@@ -255,13 +298,25 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 		return err
 	}
 	for _, directory := range [...]string{
-		"replica-actions", "source-exports", "source-artifacts", "split-runtime",
+		"replica-actions", "source-exports", "source-artifacts", "split-runtime", "split-children",
 	} {
 		if err := os.Mkdir(filepath.Join(stage, directory), 0o700); err != nil {
 			return err
 		}
 	}
 	if err := writePrepareRF3File(filepath.Join(stage, "split-control.journal"), nil, 0o600); err != nil {
+		return err
+	}
+	staticBootstrap, err := prepareRF3SplitChildBootstrap(input.Members)
+	if err != nil {
+		return err
+	}
+	if err = writePrepareRF3File(
+		filepath.Join(stage, "split-children", "static-bootstrap.pb"), staticBootstrap, 0o600,
+	); err != nil {
+		return err
+	}
+	if err = syncPrepareRF3Directory(filepath.Join(stage, "split-children")); err != nil {
 		return err
 	}
 	walPath, sqlPath := filepath.Join(stage, "member.wal"), filepath.Join(stage, "member.vdb")
@@ -363,7 +418,7 @@ func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
 	}
 	for _, name := range [...]string{
 		"member.wal", "member.vdb", "sql-identity.vibejson", "apply-identity.vibejson",
-		"wal-key", "split-control.journal",
+		"wal-key", "split-control.journal", filepath.Join("split-children", "static-bootstrap.pb"),
 	} {
 		artifact, statErr := os.Lstat(filepath.Join(root, name))
 		if statErr != nil || !artifact.Mode().IsRegular() || artifact.Mode()&os.ModeSymlink != 0 {
@@ -371,15 +426,79 @@ func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
 		}
 	}
 	for _, name := range [...]string{
-		"replica-actions", "source-exports", "source-artifacts", "split-runtime",
+		"replica-actions", "source-exports", "source-artifacts", "split-runtime", "split-children",
 	} {
 		directory, statErr := os.Lstat(filepath.Join(root, name))
 		if statErr != nil || !directory.IsDir() || directory.Mode()&os.ModeSymlink != 0 {
 			return errors.Join(errPrepareRF3, statErr)
 		}
 	}
-	if _, err = loadRF3Manifest(filepath.Join(root, "serve-rf3.vibejson")); err != nil {
+	manifest, err := loadRF3Manifest(filepath.Join(root, "serve-rf3.vibejson"))
+	if err != nil {
 		return errors.Join(errPrepareRF3, err)
+	}
+	staticRaw, err := readPrepareRF3File(
+		manifest.SplitControl.ChildRegistry.StaticBootstrapPath,
+		replicatedstate.MaxStaticBootstrapEnvelopeBytes,
+	)
+	bootstrapErr := validateRF3SplitChildBootstrap(
+		staticRaw, manifest.SplitControl.ChildRegistry,
+	)
+	if err != nil || bootstrapErr != nil {
+		return errors.Join(errPrepareRF3, err, bootstrapErr)
+	}
+	return nil
+}
+
+func prepareRF3SplitChildBootstrap(members []prepareRF3Member) ([]byte, error) {
+	if len(members) != 1 && len(members) != rf3ManifestMembers {
+		return nil, errPrepareRF3
+	}
+	voters := make([]uint64, len(members))
+	for index, member := range members {
+		if member.MemberID == 0 || index > 0 && member.MemberID <= members[index-1].MemberID {
+			return nil, errPrepareRF3
+		}
+		voters[index] = member.MemberID
+	}
+	index, term := uint64(1), uint64(1)
+	return proto.MarshalOptions{Deterministic: true}.Marshal(&pb.Snapshot{
+		Data: []byte(rf3SplitChildBootstrapData),
+		Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term,
+			ConfState: &pb.ConfState{Voters: voters}},
+	})
+}
+
+func validateRF3SplitChildBootstrap(
+	raw []byte,
+	registry rf3ManifestSplitChildRegistry,
+) error {
+	if len(raw) == 0 || len(raw) > replicatedstate.MaxStaticBootstrapEnvelopeBytes ||
+		registry.MemberCount == 0 {
+		return errPrepareRF3
+	}
+	snapshot := new(pb.Snapshot)
+	if err := proto.Unmarshal(raw, snapshot); err != nil || snapshot.GetMetadata() == nil ||
+		snapshot.GetMetadata().GetIndex() != 1 || snapshot.GetMetadata().GetTerm() != 1 ||
+		string(snapshot.GetData()) != rf3SplitChildBootstrapData ||
+		len(snapshot.ProtoReflect().GetUnknown()) != 0 ||
+		len(snapshot.GetMetadata().ProtoReflect().GetUnknown()) != 0 {
+		return errPrepareRF3
+	}
+	conf := snapshot.GetMetadata().GetConfState()
+	if conf == nil || len(conf.ProtoReflect().GetUnknown()) != 0 || conf.GetAutoLeave() ||
+		len(conf.GetLearners()) != 0 || len(conf.GetVotersOutgoing()) != 0 ||
+		len(conf.GetLearnersNext()) != 0 || len(conf.GetVoters()) != int(registry.MemberCount) {
+		return errPrepareRF3
+	}
+	for index := range registry.MemberCount {
+		if conf.GetVoters()[index] != registry.Members[index].MemberID {
+			return errPrepareRF3
+		}
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil || !bytes.Equal(canonical, raw) {
+		return errPrepareRF3
 	}
 	return nil
 }
@@ -428,7 +547,11 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 	if input.SplitControl.MaxRecords <= 0 || input.SplitControl.MaxRecords > 1<<20 ||
 		input.SplitControl.MaxFileBytes < int64(protocol.MaxPayloadBytes) ||
 		input.SplitControl.MaxFileBytes > 1<<40 || len(input.SplitControl.Grants) == 0 ||
-		len(input.SplitControl.Grants) > protocol.AbsoluteMaxGrants {
+		len(input.SplitControl.Grants) > protocol.AbsoluteMaxGrants ||
+		input.SplitControl.MaxChildOperations <= 0 ||
+		input.SplitControl.MaxChildOperations > maxRF3SplitChildOperations ||
+		input.SplitControl.StageCheckpointBytes < rangesplit.MaxChildArtifactChunkBytes ||
+		input.SplitControl.StageCheckpointBytes > maxRF3StageCheckpointBytes {
 		return bad()
 	}
 	grants := make([]protocol.ActionGrant, len(input.SplitControl.Grants))
@@ -481,12 +604,73 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 }
 
 func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.NodeID, p map[string]string) persistedRF3Manifest {
-	m := persistedRF3Manifest{WAL: persistedRF3WAL{Path: p["wal"], KeyID: input.WAL.KeyID, KeyMaterialPath: p["key"], MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes, MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries, MaxLiveBytes: input.WAL.MaxLiveBytes}, SQL: persistedRF3SQL{Path: p["sql"], IdentityPath: p["identity"], ApplyIdentityPath: p["apply"]}, Route: persistedRF3GroupRoute{ClusterID: input.ClusterID, ClusterIncarnation: input.ClusterIncarnation, TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, ShardIncarnation: input.ShardIncarnation, GroupID: input.GroupID, Distribution: input.Distribution, Shard: input.Shard, AllocationGeneration: input.AllocationGeneration, MemberID: input.MemberID, StoreID: input.StoreID, MemberRoot: input.Root, SplitRuntimeRoot: filepath.Join(input.Root, "split-runtime"), MembershipGrantPath: filepath.Join(input.Root, "membership-grant")}, Listeners: input.Listeners, TLS: input.TLS, AuthorizationPolicy: input.AuthorizationPolicy, ReplicaControl: persistedRF3ReplicaControl{ActionJournalPath: filepath.Join(input.Root, "replica-actions"), MaxActionRecords: 4096, SourceDataRoot: input.Root, SourceJournalPath: filepath.Join(input.Root, "source-exports"), MaxSourceRecords: 4096, SourceRepositoryPath: filepath.Join(input.Root, "source-artifacts"), MaxSourceArtifacts: 8, MaxSourceConcurrent: 2, MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20}, SplitControl: persistedRF3SplitControl{JournalPath: filepath.Join(input.Root, "split-control.journal"), MaxRecords: input.SplitControl.MaxRecords, MaxFileBytes: input.SplitControl.MaxFileBytes, Grants: make([]persistedRF3ActionGrant, len(input.SplitControl.Grants))}, DevelopmentOnly: input.DevelopmentOnly, Members: make([]persistedRF3Member, len(input.Members))}
+	childRoot := filepath.Join(input.Root, "split-children")
+	wal := persistedRF3WAL{
+		Path: p["wal"], KeyID: input.WAL.KeyID, KeyMaterialPath: p["key"],
+		MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes,
+		MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries,
+		MaxLiveBytes: input.WAL.MaxLiveBytes,
+	}
+	childWAL := persistedRF3SplitChildWAL{
+		KeyID: input.WAL.KeyID, KeyMaterialPath: p["key"],
+		MaxFileBytes: input.WAL.MaxFileBytes, MaxRecordBytes: input.WAL.MaxRecordBytes,
+		MaxRecords: input.WAL.MaxRecords, MaxEntries: input.WAL.MaxEntries,
+		MaxLiveBytes: input.WAL.MaxLiveBytes,
+	}
+	childApply := persistedRF3SplitChildApply{
+		MaxSessions: input.Apply.MaxSessions, RetryWindow: input.Apply.RetryWindow,
+		MaxCollections: input.Apply.MaxCollections, MaxDocuments: input.Apply.MaxDocuments,
+		MaxBytes: int64(input.Apply.MaxBytes), Format: sqldriver.ReplicatedPlacementProfileFormat,
+		ShardKey:      input.Apply.ShardKey,
+		TupleVersion:  uint32(distribution.CurrentTupleVersion),
+		MapperVersion: uint32(distribution.NativeMapperVersion),
+	}
+	childRegistry := persistedRF3SplitChildRegistry{
+		Root: childRoot, MaxOperations: input.SplitControl.MaxChildOperations,
+		StageCheckpointBytes: input.SplitControl.StageCheckpointBytes,
+		Table:                input.Table, CreateTable: input.CreateTable, WAL: childWAL, Apply: childApply,
+		StaticBootstrapPath: filepath.Join(childRoot, "static-bootstrap.pb"),
+		ReplicaSetVersion:   1, Members: make([]persistedRF3Member, len(input.Members)),
+	}
+	m := persistedRF3Manifest{
+		WAL: wal,
+		SQL: persistedRF3SQL{
+			Path: p["sql"], IdentityPath: p["identity"], ApplyIdentityPath: p["apply"],
+		},
+		Route: persistedRF3GroupRoute{
+			ClusterID: input.ClusterID, ClusterIncarnation: input.ClusterIncarnation,
+			TopologyRecoveryEpoch: input.TopologyRecoveryEpoch,
+			ShardIncarnation:      input.ShardIncarnation, GroupID: input.GroupID,
+			Distribution: input.Distribution, Shard: input.Shard,
+			AllocationGeneration: input.AllocationGeneration,
+			MemberID:             input.MemberID, StoreID: input.StoreID, MemberRoot: input.Root,
+			SplitRuntimeRoot:    filepath.Join(input.Root, "split-runtime"),
+			MembershipGrantPath: filepath.Join(input.Root, "membership-grant"),
+		},
+		Listeners: input.Listeners, TLS: input.TLS,
+		AuthorizationPolicy: input.AuthorizationPolicy,
+		ReplicaControl: persistedRF3ReplicaControl{
+			ActionJournalPath: filepath.Join(input.Root, "replica-actions"), MaxActionRecords: 4096,
+			SourceDataRoot: input.Root, SourceJournalPath: filepath.Join(input.Root, "source-exports"),
+			MaxSourceRecords: 4096, SourceRepositoryPath: filepath.Join(input.Root, "source-artifacts"),
+			MaxSourceArtifacts: 8, MaxSourceConcurrent: 2,
+			MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20,
+		},
+		SplitControl: persistedRF3SplitControl{
+			JournalPath: filepath.Join(input.Root, "split-control.journal"),
+			MaxRecords:  input.SplitControl.MaxRecords, MaxFileBytes: input.SplitControl.MaxFileBytes,
+			Grants:        make([]persistedRF3ActionGrant, len(input.SplitControl.Grants)),
+			ChildRegistry: childRegistry,
+		},
+		DevelopmentOnly: input.DevelopmentOnly,
+		Members:         make([]persistedRF3Member, len(input.Members)),
+	}
 	for index, grant := range input.SplitControl.Grants {
 		m.SplitControl.Grants[index] = persistedRF3ActionGrant{NodeID: grant.NodeID, Actions: grant.Actions}
 	}
 	for i, member := range input.Members {
 		m.Members[i] = persistedRF3Member{MemberID: member.MemberID, NodeID: hex.EncodeToString(nodes[i][:]), PeerAddress: member.PeerAddress}
+		m.SplitControl.ChildRegistry.Members[i] = m.Members[i]
 	}
 	return m
 }

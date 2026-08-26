@@ -125,6 +125,12 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 		if err != nil {
 			return result, closePreparedRF3Groups(result.groups, err)
 		}
+		if !rf3SplitChildTemplateMatchesRetained(
+			manifest.SplitControl.ChildRegistry, base, applyIdentity,
+		) {
+			return result, closePreparedRF3Groups(result.groups,
+				fmt.Errorf("%w: group %d split child template differs from retained SQL/apply", errRF3Serving, index))
+		}
 		group := groupFromBinding(base.Binding)
 		if !rf3RouteMatchesBinding(bundle.Route, base.Binding) {
 			return result, closePreparedRF3Groups(result.groups,
@@ -186,6 +192,21 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS) (p
 		return dialer.DialContext(ctx, "tcp", address)
 	}
 	return result, nil
+}
+
+func rf3SplitChildTemplateMatchesRetained(
+	registry rf3ManifestSplitChildRegistry,
+	base sqldriver.ReplicatedShardStoreIdentity,
+	apply sqldriver.ReplicatedApplyIdentity,
+) bool {
+	return registry.Table == base.UserTable &&
+		registry.Apply.MaxSessions == apply.MaxSessions &&
+		registry.Apply.RetryWindow == apply.RetryWindow &&
+		registry.Apply.TxnLimits == apply.TxnLimits &&
+		registry.Apply.Format == apply.Placement.Format &&
+		registry.Apply.ShardKey == apply.Placement.ShardKey &&
+		registry.Apply.TupleVersion == apply.Placement.TupleVersion &&
+		registry.Apply.MapperVersion == apply.Placement.MapperVersion
 }
 
 func rf3RouteMatchesBinding(

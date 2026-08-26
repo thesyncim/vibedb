@@ -55,6 +55,7 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 		AuthorizationPolicy: policy,
 		SplitControl: prepareRF3SplitControl{
 			MaxRecords: 4096, MaxFileBytes: 64 << 20,
+			MaxChildOperations: 8, StageCheckpointBytes: 32 << 20,
 			Grants: make([]prepareRF3ActionGrant, rf3ManifestMembers),
 		},
 		Members: make([]prepareRF3Member, rf3ManifestMembers),
@@ -95,13 +96,21 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 		manifest.Route.MembershipGrantPath != filepath.Join(root, "membership-grant") ||
 		manifest.SplitControl.JournalPath != filepath.Join(root, "split-control.journal") ||
 		manifest.SplitControl.MaxRecords != input.SplitControl.MaxRecords ||
-		len(manifest.SplitControl.Grants) != rf3ManifestMembers {
+		len(manifest.SplitControl.Grants) != rf3ManifestMembers ||
+		manifest.SplitControl.ChildRegistry.Root != filepath.Join(root, "split-children") ||
+		manifest.SplitControl.ChildRegistry.MaxOperations != input.SplitControl.MaxChildOperations ||
+		manifest.SplitControl.ChildRegistry.StageCheckpointBytes != input.SplitControl.StageCheckpointBytes ||
+		manifest.SplitControl.ChildRegistry.MemberCount != rf3ManifestMembers {
 		t.Fatalf("split preparation = route %+v control %+v", manifest.Route, manifest.SplitControl)
 	}
-	for _, name := range []string{"replica-actions", "source-exports", "source-artifacts", "split-runtime"} {
+	for _, name := range []string{"replica-actions", "source-exports", "source-artifacts", "split-runtime", "split-children"} {
 		if info, statErr := os.Lstat(filepath.Join(root, name)); statErr != nil || !info.IsDir() {
 			t.Fatalf("prepared directory %q = %v, %v", name, info, statErr)
 		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "split-children"))
+	if err != nil || len(entries) != 1 || entries[0].Name() != "static-bootstrap.pb" {
+		t.Fatalf("bounded child registry entries = %v, %v", entries, err)
 	}
 	base, apply, err := loadRF3RetainedIdentities(manifest)
 	if err != nil || base.Binding.MemberID != 1 || apply.MaxSessions != input.Apply.MaxSessions {
@@ -109,6 +118,25 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 	}
 	if code := runPrepareRF3([]string{"-manifest", inputPath}); code != 0 {
 		t.Fatalf("idempotent runPrepareRF3 = %d, want 0", code)
+	}
+	staticPath := filepath.Join(root, "split-children", "static-bootstrap.pb")
+	staticRaw, err := os.ReadFile(staticPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptStatic := append([]byte(nil), staticRaw...)
+	corruptStatic[len(corruptStatic)-1] ^= 0xff
+	if err = os.WriteFile(staticPath, corruptStatic, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := runPrepareRF3([]string{"-manifest", inputPath}); code != 1 {
+		t.Fatalf("corrupt child bootstrap runPrepareRF3 = %d, want 1", code)
+	}
+	if err = os.WriteFile(staticPath, staticRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := runPrepareRF3([]string{"-manifest", inputPath}); code != 0 {
+		t.Fatalf("restored child bootstrap runPrepareRF3 = %d, want 0", code)
 	}
 	retained, err := os.ReadFile(manifestPath)
 	if err != nil {

@@ -75,7 +75,41 @@ const canonicalRF3Manifest = `{
       {"node_id": "0102030405060708090a0b0c0d0e0f10", "actions": 65535},
       {"node_id": "1112131415161718191a1b1c1d1e1f20", "actions": 65535},
       {"node_id": "2122232425262728292a2b2c2d2e2f30", "actions": 65535}
-    ]
+    ],
+    "child_registry": {
+      "root": "/srv/vibedb/split-children",
+      "max_operations": 8,
+      "stage_checkpoint_bytes": 33554432,
+      "table": "docs",
+      "create_table": "CREATE TABLE docs (PRIMARY KEY (id))",
+      "wal": {
+        "key_id": "production-key-1",
+        "key_material_path": "/run/secrets/vibedb-wal-key",
+        "max_file_bytes": 268435456,
+        "max_record_bytes": 8388608,
+        "max_records": 4096,
+        "max_entries": 16384,
+        "max_live_bytes": 134217728
+      },
+      "apply": {
+        "max_sessions": 32,
+        "retry_window": 8,
+        "max_collections": 16,
+        "max_documents": 1024,
+        "max_bytes": 402653184,
+        "format": 0,
+        "shard_key": "id",
+        "tuple_version": 1,
+        "mapper_version": 1
+      },
+      "static_bootstrap_path": "/srv/vibedb/split-children/static-bootstrap.pb",
+      "replica_set_version": 1,
+      "members": [
+        {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"},
+        {"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20", "peer_address": "member-2.internal:7400"},
+        {"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"}
+      ]
+    }
   },
   "members": [
     {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"},
@@ -138,6 +172,14 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 		len(manifest.SplitControl.Grants) != 3 {
 		t.Fatalf("split control = %+v", manifest.SplitControl)
 	}
+	registry := manifest.SplitControl.ChildRegistry
+	if registry.Root != "/srv/vibedb/split-children" || registry.MaxOperations != 8 ||
+		registry.StageCheckpointBytes != 33554432 || registry.Table != "docs" ||
+		registry.StaticBootstrapPath != "/srv/vibedb/split-children/static-bootstrap.pb" ||
+		registry.ReplicaSetVersion != 1 || registry.MemberCount != rf3ManifestMembers ||
+		registry.WAL.KeyID != "production-key-1" || registry.Apply.ShardKey != "id" {
+		t.Fatalf("split child registry = %+v", registry)
+	}
 	control := manifest.ReplicaControl
 	if control.ActionJournalPath != "/srv/vibedb/replica-actions" ||
 		control.MaxActionRecords != 4096 || control.SourceDataRoot != "/srv/vibedb" ||
@@ -168,8 +210,8 @@ func TestParseRF1ManifestRequiresExplicitDevelopmentOnly(t *testing.T) {
     {"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20", "peer_address": "member-2.internal:7400"},
     {"member_id": 3, "node_id": "2122232425262728292a2b2c2d2e2f30", "peer_address": "member-3.internal:7400"}`
 	one := `    {"member_id": 1, "node_id": "0102030405060708090a0b0c0d0e0f10", "peer_address": "member-1.internal:7400"}`
-	rf1 := strings.Replace(canonicalRF3Manifest, `  "members": [`,
-		"  \"development_only\": true,\n  \"members\": [", 1)
+	rf1 := strings.Replace(canonicalRF3Manifest, "\n  \"members\": [",
+		"\n  \"development_only\": true,\n  \"members\": [", 1)
 	rf1 = strings.Replace(rf1, three, one, 1)
 	manifest, err := parseRF3Manifest([]byte(rf1))
 	if err != nil {
@@ -228,7 +270,7 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 func multiGroupRF3Manifest(t testing.TB) string {
 	t.Helper()
 	listener := strings.Index(canonicalRF3Manifest, `  "listeners":`)
-	members := strings.Index(canonicalRF3Manifest, `  "members":`)
+	members := strings.Index(canonicalRF3Manifest, "\n  \"members\":")
 	if listener < 0 || members <= listener {
 		t.Fatal("canonical fixture sections not found")
 	}
@@ -326,6 +368,18 @@ func TestParseRF3ManifestRejectsNoncanonicalGrammar(t *testing.T) {
 		{"invalid-split-actions", replace(`"actions": 65535`, `"actions": 65536`)},
 		{"oversize-split-records", replace(`"max_records": 4096,`+"\n"+`    "max_file_bytes": 67108864`, `"max_records": 1048577,`+"\n"+`    "max_file_bytes": 67108864`)},
 		{"undersize-split-journal", replace(`"max_file_bytes": 67108864,`+"\n"+`    "grants":`, `"max_file_bytes": 1024,`+"\n"+`    "grants":`)},
+		{"relative-child-root", replace(`"root": "/srv/vibedb/split-children"`, `"root": "split-children"`)},
+		{"wrong-child-root", replace(`"root": "/srv/vibedb/split-children"`, `"root": "/srv/vibedb/children"`)},
+		{"zero-child-operations", replace(`"max_operations": 8`, `"max_operations": 0`)},
+		{"oversize-child-operations", replace(`"max_operations": 8`, `"max_operations": 65`)},
+		{"undersize-child-checkpoint", replace(`"stage_checkpoint_bytes": 33554432`, `"stage_checkpoint_bytes": 4096`)},
+		{"wrong-child-bootstrap-path", replace(`/srv/vibedb/split-children/static-bootstrap.pb`, `/srv/vibedb/static-bootstrap.pb`)},
+		{"wrong-child-tuple-version", replace(`"tuple_version": 1`, `"tuple_version": 2`)},
+		{"wrong-child-placement-format", replace(`"format": 0`, `"format": 1`)},
+		{"zero-child-replica-version", replace(`"replica_set_version": 1`, `"replica_set_version": 0`)},
+		{"child-roster-node-mismatch", replace(
+			`{"member_id": 2, "node_id": "1112131415161718191a1b1c1d1e1f20", "peer_address": "member-2.internal:7400"},`+"\n"+`        {"member_id": 3`,
+			`{"member_id": 2, "node_id": "3132333435363738393a3b3c3d3e3f40", "peer_address": "member-2.internal:7400"},`+"\n"+`        {"member_id": 3`)},
 		{"unclean-source-root", replace(`/srv/vibedb",`+"\n"+`    "source_journal_path`, `/srv/vibedb/../vibedb",`+"\n"+`    "source_journal_path`)},
 		{"oversize-action-records", replace(`"max_action_records": 4096`, `"max_action_records": 4097`)},
 		{"undersize-source-chunk", replace(`"source_chunk_bytes": 1048576`, `"source_chunk_bytes": 1024`)},
