@@ -58,12 +58,21 @@ func TestReplicatedChildApplyReservationPersistsExactIdentity(t *testing.T) {
 	if err = session.Close(); err != nil {
 		t.Fatal(err)
 	}
-	base, err := database.BindReplicatedShardStore(binding, "docs")
+	const userStorage = "1111111111111111111111111111111111111111111111111111111111111111"
+	base, err := database.BindReplicatedShardStoreStorageIdentity(binding, "docs", userStorage)
 	if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
 		t.Skipf("sealed replicated sidecars require strict allocation support: %v", err)
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	if base.UserStorage != userStorage {
+		t.Fatalf("user storage = %q", base.UserStorage)
+	}
+	if _, err = database.BindReplicatedShardStoreStorageIdentity(
+		binding, "docs", "2222222222222222222222222222222222222222222222222222222222222222",
+	); !errors.Is(err, ErrReplicatedShardStoreIdentityMismatch) {
+		t.Fatalf("substituted user storage err=%v", err)
 	}
 	options := testReplicatedApplyOptions()
 	options.Placement.Range = distribution.KeyRange{Start: distribution.KeyspacePoint{0x80}, End: distribution.KeyspaceEnd{Max: true}}

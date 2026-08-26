@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -266,6 +267,23 @@ func (d *Database) BindReplicatedShardStore(
 	userTable string,
 ) (ReplicatedShardStoreIdentity, error) {
 	return d.bindReplicatedShardStore(binding, userTable, nil)
+}
+
+// BindReplicatedShardStoreStorageIdentity is the topology-preparation form of
+// BindReplicatedShardStore. The allocation authority supplies the exact user
+// storage namespace before a split plan is published; this method never mints
+// or substitutes that identity. An exact retry returns the durable binding.
+func (d *Database) BindReplicatedShardStoreStorageIdentity(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	userStorage string,
+) (ReplicatedShardStoreIdentity, error) {
+	if err := validateStorageIdentity(userStorage); err != nil {
+		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
+			"%w: user storage identity: %v", ErrReplicatedShardStoreProfile, err,
+		)
+	}
+	return d.bindReplicatedShardStoreExact(binding, userTable, strings.Clone(userStorage), nil)
 }
 
 // BindReplicatedShardStoreBundle permanently binds one base JSON table and a
@@ -645,6 +663,15 @@ func (d *Database) bindReplicatedShardStore(
 	userTable string,
 	persist func(*database) (bool, error),
 ) (ReplicatedShardStoreIdentity, error) {
+	return d.bindReplicatedShardStoreExact(binding, userTable, "", persist)
+}
+
+func (d *Database) bindReplicatedShardStoreExact(
+	binding ReplicatedShardStoreBinding,
+	userTable string,
+	reservedUserStorage string,
+	persist func(*database) (bool, error),
+) (ReplicatedShardStoreIdentity, error) {
 	if err := validateReplicatedShardStoreBinding(binding); err != nil {
 		return ReplicatedShardStoreIdentity{}, err
 	}
@@ -679,7 +706,8 @@ func (d *Database) bindReplicatedShardStore(
 	}
 	if current := core.catalog.ReplicatedShardStore; current != nil {
 		if current.Binding != binding || current.UserTable != userTable ||
-			current.Sidecars != sidecars {
+			current.Sidecars != sidecars ||
+			(reservedUserStorage != "" && current.UserStorage != reservedUserStorage) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: catalog is already bound", ErrReplicatedShardStoreIdentityMismatch,
 			)
@@ -767,11 +795,32 @@ func (d *Database) bindReplicatedShardStore(
 			ErrReplicatedShardStoreProfile, err,
 		)
 	}
-	storage, err := core.newStorageIdentityLocked()
-	if err != nil {
-		return ReplicatedShardStoreIdentity{}, errors.Join(
-			err, core.txnLog.ReconfigureUnminted(previousTxnOptions),
-		)
+	storage := reservedUserStorage
+	if storage == "" {
+		var err error
+		storage, err = core.newStorageIdentityLocked()
+		if err != nil {
+			return ReplicatedShardStoreIdentity{}, errors.Join(
+				err, core.txnLog.ReconfigureUnminted(previousTxnOptions),
+			)
+		}
+	} else {
+		path := filepath.Join(core.dataDir, storage+".vjc")
+		journal := durable.RecoveryJournalPath(path)
+		if core.storagePathInUseLocked(path) {
+			return ReplicatedShardStoreIdentity{}, errors.Join(
+				ErrReplicatedShardStoreProfile,
+				core.txnLog.ReconfigureUnminted(previousTxnOptions),
+			)
+		}
+		for _, candidate := range [...]string{path, journal} {
+			if _, statErr := os.Lstat(candidate); statErr == nil || !os.IsNotExist(statErr) {
+				return ReplicatedShardStoreIdentity{}, errors.Join(
+					ErrReplicatedShardStoreProfile, statErr,
+					core.txnLog.ReconfigureUnminted(previousTxnOptions),
+				)
+			}
+		}
 	}
 	meta := cloneTableMeta(t.meta)
 	meta.Storage = storage
