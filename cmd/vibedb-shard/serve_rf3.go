@@ -30,6 +30,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	publicshardcontrol "github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -610,7 +611,7 @@ func servePreparedRF3WithExecutionLanes(
 	// complete durable plan observation and execute every action class. The mux
 	// has a fixed shipped route for it once that runtime is supplied; it must not
 	// advertise a partial or memory-only executor.
-	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil)
+	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl, nil, nil, nil)
 	if err != nil {
 		retireCtx, retire := context.WithCancelCause(context.Background())
 		retire(context.Canceled)
@@ -761,9 +762,9 @@ func servePreparedRF3WithExecutionLanes(
 // actions remain optional until their durable local journals are opened; when
 // supplied they share the same TLS listener and connection concurrency bound.
 func newRF3ControlMux(
-	membership, observation, source, action, split, schema shardcontrol.Handler,
+	membership, observation, source, action, split, schema, admission shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 6)
+	routes := make([]shardcontrol.Route, 0, 7)
 	routes = append(routes,
 		shardcontrol.Route{
 			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
@@ -796,6 +797,12 @@ func newRF3ControlMux(
 		routes = append(routes, shardcontrol.Route{
 			Discriminator: schemainstall.RequestDiscriminator(),
 			Handler:       schema,
+		})
+	}
+	if admission != nil {
+		routes = append(routes, shardcontrol.Route{
+			Discriminator: splitcontroller.PlanAdmissionRequestDiscriminator(),
+			Handler:       admission,
 		})
 	}
 	return shardcontrol.New(routes...)
