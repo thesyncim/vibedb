@@ -86,6 +86,27 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 	return dst, nil
 }
 
+// AppendReplicaMoveIntent appends the immutable, canonical operation intent
+// stored in the replicated operation journal. Snapshot-base certificates are
+// deliberately excluded: they can be much larger than the journal's bounded
+// intent cell and become available only after the learner exists. Recovery
+// obtains that already-authenticated durable certificate from the injected
+// runtime observer instead of rewriting the operation identity or intent.
+func AppendReplicaMoveIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
+	if catalog == nil || plan == nil || plan.operation == (OperationID{}) ||
+		(catalog.Generation() != plan.catalogGeneration &&
+			catalog.Generation() != plan.nextCatalogGeneration) {
+		return dst, ErrPlanIntent
+	}
+	if _, err := plan.catalogStage(catalog); err != nil {
+		return dst, errors.Join(err, ErrPlanIntent)
+	}
+	return appendPersistedPlanIntent(dst, persistedPlanIntent{
+		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
+		Request: persistMoveRequest(plan.request),
+	})
+}
+
 // OpenPlanIntent validates canonical uniqueness and reconstructs the immutable
 // move against either its source catalog or its already-published successor.
 func OpenPlanIntent(
@@ -133,6 +154,75 @@ func OpenPlanIntent(
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	return plan, nil
+}
+
+// OpenReplicaMoveIntent reconstructs the immutable journal intent against one
+// observed controller cut. Before snapshot creation, membership is sufficient
+// to rebuild the plan. Afterwards the observer supplies the authenticated
+// certificate retained by the shard runtime, allowing recovery after
+// promotion, catalog cutover, source removal, and controller restart without
+// copying the certificate through the catalog operation record.
+func OpenReplicaMoveIntent(
+	raw []byte,
+	catalog *gateway.Snapshot,
+	publication raftmodel.Publication,
+	certificate *replicatedstate.SnapshotBaseCertificate,
+) (*Plan, error) {
+	if catalog == nil {
+		return nil, ErrPlanIntent
+	}
+	intent, request, err := openPersistedPlanIntent(raw)
+	if err != nil || len(intent.Certificate) != 0 {
+		return nil, errors.Join(err, ErrPlanIntent)
+	}
+	var plan *Plan
+	if certificate == nil {
+		if catalog.Generation() != intent.SourceGeneration {
+			return nil, ErrPlanIntent
+		}
+		plan, err = PlanReplicaMove(catalog, publication, request)
+	} else {
+		plan, err = recoverReplicaMoveCertificate(catalog, publication, request, *certificate)
+	}
+	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
+		[32]byte(plan.OperationID()) != intent.Operation {
+		return nil, errors.Join(err, ErrPlanIntent)
+	}
+	return plan, nil
+}
+
+func appendPersistedPlanIntent(dst []byte, intent persistedPlanIntent) ([]byte, error) {
+	raw, err := vibejson.Marshal(&intent)
+	if err != nil {
+		return dst, errors.Join(err, ErrPlanIntent)
+	}
+	start := len(dst)
+	dst, err = vibejson.AppendCanonicalize(dst, raw)
+	if err != nil || len(dst)-start == 0 || len(dst)-start > MaxPlanIntentBytes {
+		return dst[:start], errors.Join(err, ErrPlanIntent)
+	}
+	return dst, nil
+}
+
+func openPersistedPlanIntent(raw []byte) (persistedPlanIntent, MoveRequest, error) {
+	if len(raw) == 0 || len(raw) > MaxPlanIntentBytes {
+		return persistedPlanIntent{}, MoveRequest{}, ErrPlanIntent
+	}
+	var intent persistedPlanIntent
+	if err := vibejson.Unmarshal(raw, &intent); err != nil {
+		return persistedPlanIntent{}, MoveRequest{}, errors.Join(err, ErrPlanIntent)
+	}
+	canonical, err := vibejson.Marshal(&intent)
+	if err == nil {
+		canonical, err = vibejson.AppendCanonicalize(nil, canonical)
+	}
+	request := openMoveRequest(intent.Request)
+	if err != nil || !bytes.Equal(raw, canonical) || intent.Operation == ([32]byte{}) ||
+		intent.SourceGeneration == 0 || invalidMoveRequest(request) ||
+		len(intent.Certificate) == 0 && intent.Certificate != nil {
+		return persistedPlanIntent{}, MoveRequest{}, errors.Join(err, ErrPlanIntent)
+	}
+	return intent, request, nil
 }
 
 func persistMoveRequest(request MoveRequest) persistedMoveRequest {

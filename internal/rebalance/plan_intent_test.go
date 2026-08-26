@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -84,5 +85,33 @@ func TestReplicaMoveOperationIdentityStableAndExact(t *testing.T) {
 	second := replicaMoveOperationID(&many)
 	if first == (OperationID{}) || second == (OperationID{}) || first == second {
 		t.Fatalf("full participant identity not retained: first=%x second=%x", first, second)
+	}
+}
+
+func TestReplicaMoveJournalIntentRemainsSmallAndImmutableAfterSnapshotBinding(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	bound := bindMoveTestPlan(plan)
+	unboundIntent, err := AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundIntent, err := AppendReplicaMoveIntent(nil, catalog, bound)
+	if err != nil || !bytes.Equal(unboundIntent, boundIntent) {
+		t.Fatalf("journal intent changed after binding: bytes=%d equal=%v err=%v",
+			len(boundIntent), bytes.Equal(unboundIntent, boundIntent), err)
+	}
+	if len(boundIntent) >= 40<<10 {
+		t.Fatalf("immutable move intent exceeds replicated operation cell: %d", len(boundIntent))
+	}
+	certificate := &replicatedstate.SnapshotBaseCertificate{
+		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
+		Digest:   bound.baseDigest,
+	}
+	recovered, err := OpenReplicaMoveIntent(boundIntent, catalog, raftmodel.Publication{
+		Applied: 9, ReplicaSetVersion: 9, ConfState: plan.voterConf,
+	}, certificate)
+	if err != nil || !recovered.SnapshotBaseBound() ||
+		recovered.OperationID() != plan.OperationID() {
+		t.Fatalf("bound journal recovery=%+v err=%v", recovered, err)
 	}
 }
