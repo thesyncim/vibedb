@@ -172,8 +172,8 @@ durable replicated ledger or safe explicit client ACK is required before the
 command can reclaim terminal entries.
 
 The gateway shares one bounded authenticated native connection pool across
-catalog and point-read traffic. A bounded four-way leader-hint cache avoids
-repeated probes. The executor validates the complete route and serving fence,
+catalog, point-read, proposal, and transaction-recovery traffic. A bounded
+four-way leader-hint cache avoids repeated probes. The executor validates the complete route and serving fence,
 follows `NotLeader` responses, and retries within the configured attempt and
 deadline bounds.
 
@@ -206,7 +206,11 @@ The static SQL path has no Raft replication, follower read, or endpoint
 failover. The RF3 leader cache and retry logic apply to canonical point reads,
 replicated catalog operations, and the exact-key transaction lane.
 
-The internal range-split data plane is not part of the runnable path. It scans
+Range-split primitives and action services remain internal. The gateway command
+can scan replicated split-operation records and trigger configured shard-control
+endpoints, but no shipped shard command constructs `ControllerService` or
+`RemoteActionService`. The commands therefore do not form an end-to-end split
+data plane. The internal splitter scans
 one certified source image once and routes each borrowed row to at most three
 children. It uses a compiled `vibejson` placement program and does not use
 `encoding/json`. It can omit the retained child copy.

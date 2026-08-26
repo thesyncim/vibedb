@@ -9,17 +9,19 @@ zero-value product profile makes a mutation durable before it becomes visible.
 You can select buffered or in-memory operation when your application needs a
 different acknowledgement contract.
 
-> **Project status:** This repository has no tagged release. Pin a tested
-> commit. The distributed runtime is experimental. Its command servers require
-> authenticated TLS and a canonical `vibejson` authorization policy by default.
-> An explicit development mode permits plaintext only on loopback listeners.
+> **Development status:** APIs, command contracts, and storage grammars can
+> change between tested commits. The distributed runtime is experimental and
+> authenticated by default. An explicit development mode permits plaintext
+> only on loopback listeners.
 
-The experimental gateway can serve canonical point `get` requests from an
-externally prepared three-replica Raft group. It uses the replicated catalog to
-bind a table and one scalar string/number primary-placement key to an exact
-relation and route. Composite placement keys, tenant-path placement, RF3
-writes, scatter reads, multi-table reads, and automatic replica lifecycle
-management are not supported by this public path.
+The gateway exposes three separate distributed paths: general SQL through
+static shard services, canonical RF3 point reads, and strict exact-key
+`exec_batch` mutations over one or more externally prepared RF3 groups. The
+RF3 mutation lane supports whole-document insert, exact-primary-key
+whole-document update, and exact-primary-key delete, including atomic
+same-group multi-relation batches. RF3 scatter or multi-table reads, RF3
+global-index mutation lowering, distributed DDL, and automatic replica
+lifecycle remain absent.
 
 ## Requirements
 

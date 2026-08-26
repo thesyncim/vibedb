@@ -270,15 +270,17 @@ Each `Query` or `Exec` attempt pins one immutable catalog generation. The
 default executor retries a stale refusal at most twice, for at most three
 attempts and two reloads. Each retry must load a strictly newer generation. A
 multi-statement `ExecBatch` pins one generation and has no stale-retry loop. A
-one-statement batch delegates to `Exec`.
+one-statement `ExecBatch` delegates to `Exec`; `ExecBatchRequest` first attempts
+the strict RF3 exact-key classifier before its static one-statement fallback.
 
-The catalog and public RF3 point reads share one bounded authenticated native
-connection pool. The pool keys a physical connection by authenticated node and
-address. Globally idle connections are evicted oldest-first under endpoint
-churn, while topology, membership, and schema traffic retain reserved
-connection and handshake capacity under data saturation. The RF3 executor also
-keeps bounded four-way exact leader hints. It validates the complete route and
-serving fence, follows `NotLeader` responses, and retries within
+The catalog, public RF3 point reads, mutation proposals, and transaction
+recovery share one bounded authenticated native connection pool. The pool keys
+a physical connection by authenticated node and address. Globally idle
+connections are evicted oldest-first under endpoint churn, while topology,
+membership, schema, and transaction-recovery traffic retain reserved connection
+and handshake capacity under data saturation. The RF3 executor also keeps
+bounded four-way exact leader hints. It validates the complete route and serving
+fence, follows `NotLeader` responses, and retries within
 `-catalog-attempts` and `-catalog-attempt-timeout`. A
 definite stale serving fence coalesces one authenticated catalog refresh and
 permits exactly one re-resolved read attempt; ambiguous transport failures are
