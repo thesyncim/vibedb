@@ -59,6 +59,7 @@ const (
 	RuntimeStateCertificate
 	RuntimeStatePrune
 	RuntimeStatePlanAdmission
+	RuntimeStateActionWitness
 )
 
 // RuntimeState is a detached recovered control record. Payload never aliases
@@ -82,7 +83,7 @@ type DurableRuntimeStore struct {
 	lockFile      *os.File
 	operation     OperationID
 	manifest      [sha256.Size]byte
-	states        [6 + autosplit.MaxSplitChildren]runtimeStoredState
+	states        [7 + autosplit.MaxSplitChildren]runtimeStoredState
 	ownsRuntime   bool
 	closed        bool
 }
@@ -357,11 +358,13 @@ func runtimeStateSlot(kind RuntimeStateKind, child uint8) (int, string, int, err
 		return 4, "prune.state", MaxPruneControlBytes, nil
 	case RuntimeStatePlanAdmission:
 		return 5, "plan-admission.state", MaxPlanAdmissionControlBytes, nil
+	case RuntimeStateActionWitness:
+		return 6, "action-witness.state", MaxActionWitnessControlBytes, nil
 	case RuntimeStateStage:
 		if child >= autosplit.MaxSplitChildren {
 			return 0, "", 0, ErrRuntimeStore
 		}
-		return 6 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
+		return 7 + int(child), fmt.Sprintf("stage-%d.state", child), MaxTailControlBytes, nil
 	default:
 		return 0, "", 0, ErrRuntimeStore
 	}
@@ -381,8 +384,10 @@ func runtimeStateIdentity(index int) (RuntimeStateKind, uint8) {
 		return RuntimeStatePrune, 0
 	case 5:
 		return RuntimeStatePlanAdmission, 0
+	case 6:
+		return RuntimeStateActionWitness, 0
 	default:
-		return RuntimeStateStage, uint8(index - 6)
+		return RuntimeStateStage, uint8(index - 7)
 	}
 }
 
