@@ -1117,12 +1117,18 @@ func replicatedIdentityForTable(
 func validateReplicatedCatalog(catalog catalogFile) error {
 	r := catalog.ReplicatedShardStore
 	if r == nil {
-		if catalog.ReplicatedApply != nil {
+		if catalog.ReplicatedApply != nil || catalog.ReplicatedChildApply != nil {
 			return fmt.Errorf("%w: replicated apply requires a replicated shard binding", ErrReplicatedApplyMismatch)
 		}
 		return nil
 	}
 	if err := validateReplicatedShardStoreIdentity(*r); err != nil {
+		return err
+	}
+	if catalog.ReplicatedApply != nil && catalog.ReplicatedChildApply != nil {
+		return ErrReplicatedApplyMismatch
+	}
+	if err := validateReplicatedApplyMeta(catalog.ReplicatedChildApply, r); err != nil {
 		return err
 	}
 	if catalog.ShardStore == nil {

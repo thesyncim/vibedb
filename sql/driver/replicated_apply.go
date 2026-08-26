@@ -915,13 +915,21 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 		)
 	}
 
-	identity, err := d.createReplicatedApplyStorageLocked(expected, options)
+	reserved := d.catalog.ReplicatedChildApply
+	if reserved != nil && !replicatedApplyMetaMatchesOptions(reserved, expected, options) {
+		return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+	}
+	identity, err := d.createReplicatedApplyStorageLocked(expected, options, reserved)
 	if err != nil {
 		return ReplicatedApplyIdentity{}, err
+	}
+	if reserved != nil && identity != reserved.identity() {
+		return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
 	}
 	previousPending := d.catalogWritePending
 	stored := replicatedApplyMetaFromIdentity(identity)
 	d.catalog.ReplicatedApply = &stored
+	d.catalog.ReplicatedChildApply = nil
 	d.catalogWritePending = true
 	var published bool
 	if persist != nil {
@@ -941,6 +949,10 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 		return identity, publicationErr
 	}
 	d.catalog.ReplicatedApply = nil
+	if reserved != nil {
+		owned := *reserved
+		d.catalog.ReplicatedChildApply = &owned
+	}
 	d.catalogWritePending = previousPending
 	path := d.replicatedApplyPath(&stored)
 	capturePath := d.replicatedCapturePath(&stored)
@@ -974,6 +986,7 @@ func (d *database) prepareReplicatedApplyStorageLocked(
 func (d *database) createReplicatedApplyStorageLocked(
 	base ReplicatedShardStoreIdentity,
 	options ReplicatedApplyOptions,
+	reserved *replicatedApplyMeta,
 ) (ReplicatedApplyIdentity, error) {
 	if err := d.checkRetirementCapacityLocked(2); err != nil {
 		return ReplicatedApplyIdentity{}, err
@@ -981,13 +994,23 @@ func (d *database) createReplicatedApplyStorageLocked(
 	if err := d.ensureDataDir(); err != nil {
 		return ReplicatedApplyIdentity{}, err
 	}
-	storage, err := d.newStorageIdentityLocked()
-	if err != nil {
-		return ReplicatedApplyIdentity{}, err
-	}
-	captureStorage, err := d.newStorageIdentityLocked()
-	if err != nil || captureStorage == storage {
-		return ReplicatedApplyIdentity{}, errors.Join(err, ErrReplicatedApplyMismatch)
+	var storage, captureStorage string
+	if reserved != nil {
+		storage, captureStorage = reserved.Storage, reserved.CaptureStorage
+		if validateReplicatedApplyMeta(reserved, &base) != nil ||
+			!replicatedApplyMetaMatchesOptions(reserved, base, options) {
+			return ReplicatedApplyIdentity{}, ErrReplicatedApplyMismatch
+		}
+	} else {
+		var err error
+		storage, err = d.newStorageIdentityLocked()
+		if err != nil {
+			return ReplicatedApplyIdentity{}, err
+		}
+		captureStorage, err = d.newStorageIdentityLocked()
+		if err != nil || captureStorage == storage {
+			return ReplicatedApplyIdentity{}, errors.Join(err, ErrReplicatedApplyMismatch)
+		}
 	}
 	meta := newReplicatedApplyMeta(base, storage, captureStorage, options)
 	path := d.replicatedApplyPath(&meta)

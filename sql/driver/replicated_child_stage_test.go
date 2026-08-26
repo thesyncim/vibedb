@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -141,6 +142,13 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 	}
 	applyOptions := testReplicatedApplyOptions()
 	applyOptions.Placement.Range = fixture.childRange
+	reservedApply := newReplicatedApplyMeta(
+		base, strings.Repeat("c", storageIdentityBytes*2),
+		strings.Repeat("d", storageIdentityBytes*2), applyOptions,
+	).identity()
+	if err = db.ReserveReplicatedChildApply(base, reservedApply); err != nil {
+		t.Fatal(err)
+	}
 
 	core := db.connector.db
 	core.mu.RLock()
@@ -207,7 +215,7 @@ func TestReplicatedChildStageNoCopyApplyHandoffAndUnknownPublicationRetry(t *tes
 			return true, durable.ErrCommitOutcomeUnknown
 		},
 	)
-	if unknown.Apply != nil || unknown.ApplyIdentity == (ReplicatedApplyIdentity{}) ||
+	if unknown.Apply != nil || unknown.ApplyIdentity != reservedApply ||
 		!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		t.Fatalf("unknown descriptor publication = %+v, %v", unknown, err)
 	}

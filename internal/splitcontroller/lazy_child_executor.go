@@ -161,10 +161,24 @@ func (executor *LazyReplicatedChildExecutor) open(
 	if hasStage {
 		cursor = stageState.Payload
 	}
-	database, identity, err := sqldriver.OpenReplicatedShardStoreForChildStageResume(
+	database, err := sqldriver.OpenReplicatedShardStore(
 		executor.options.Replica.SQLPath, executor.options.Replica.SQL,
-		replicatedApplyOptions(executor.options.Replica.Apply),
 	)
+	identity := executor.options.Replica.Apply
+	if err == nil {
+		reserved, present, reservationErr := database.ReplicatedChildApplyReservation(
+			executor.options.Replica.SQL,
+		)
+		if reservationErr != nil || !present || reserved != identity {
+			_ = database.Close()
+			return errors.Join(ErrRuntimeStore, reservationErr)
+		}
+	} else {
+		database, identity, err = sqldriver.OpenReplicatedShardStoreForChildStageResume(
+			executor.options.Replica.SQLPath, executor.options.Replica.SQL,
+			replicatedApplyOptions(executor.options.Replica.Apply),
+		)
+	}
 	if err != nil || identity != executor.options.Replica.Apply {
 		if database != nil {
 			_ = database.Close()
