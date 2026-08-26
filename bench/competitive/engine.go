@@ -542,20 +542,24 @@ func touchAll(v []byte) byte {
 	return acc
 }
 
-// Factory constructs a fresh engine over an empty directory.
+// Factory constructs a fresh engine over an empty directory or reopens the
+// populated image in that directory. Open never creates a missing image: a
+// lifecycle measurement that points at the wrong path must fail closed rather
+// than time creation and label it recovery.
 type Factory struct {
 	Name string
 	New  func(Config) (Engine, error)
+	Open func(Config) (Engine, error)
 }
 
 // Factories is the registry, in report order.
 func Factories() []Factory {
 	return []Factory{
-		{Name: "vibedb", New: newVibeDB},
-		{Name: "bbolt", New: newBbolt},
-		{Name: "badger", New: newBadger},
-		{Name: "pebble", New: newPebble},
-		{Name: "sqlite", New: newSQLite},
+		{Name: "vibedb", New: newVibeDB, Open: openVibeDB},
+		{Name: "bbolt", New: newBbolt, Open: openBbolt},
+		{Name: "badger", New: newBadger, Open: openBadger},
+		{Name: "pebble", New: newPebble, Open: openPebble},
+		{Name: "sqlite", New: newSQLite, Open: openSQLite},
 	}
 }
 

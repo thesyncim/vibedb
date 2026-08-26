@@ -48,6 +48,21 @@ func Key(i int) string { return fmt.Sprintf("doc:%08d", i) }
 // pool-drawn string except country and date with a per-document random value of
 // exactly the same length, preserving document shape and byte length.
 func Corpus(n int, highCardinality bool) []Document {
+	documents := make([]Document, 0, n)
+	Generate(n, highCardinality, func(document Document) error {
+		documents = append(documents, Document{
+			Key: document.Key, JSON: append([]byte(nil), document.JSON...),
+		})
+		return nil
+	})
+	return documents
+}
+
+// Generate visits n deterministic documents without retaining the corpus.
+// The callback must copy JSON if it needs the bytes after returning. Corpus is
+// deliberately implemented through this function so streaming benchmark
+// loaders and resident fixtures cannot drift to different inputs.
+func Generate(n int, highCardinality bool, visit func(Document) error) error {
 	rng := rand.New(rand.NewPCG(0x5DEECE66D, 0xB16B00B5))
 	fill := rand.New(rand.NewPCG(0xC0FFEE, 0x1234567))
 	uniq := func(sample string) string {
@@ -56,7 +71,6 @@ func Corpus(n int, highCardinality bool) []Document {
 		}
 		return randomLower(fill, len(sample))
 	}
-	documents := make([]Document, n)
 	buf := make([]byte, 0, 512)
 	for i := range n {
 		country := countries[rng.IntN(len(countries))]
@@ -103,11 +117,11 @@ func Corpus(n int, highCardinality bool) []Document {
 		buf = append(buf, note...)
 		buf = append(buf, `"}`...)
 
-		documents[i] = Document{
-			Key: Key(i), JSON: append([]byte(nil), buf...),
+		if err := visit(Document{Key: Key(i), JSON: buf}); err != nil {
+			return err
 		}
 	}
-	return documents
+	return nil
 }
 
 func randomLower(rng *rand.Rand, n int) string {

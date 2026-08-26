@@ -137,6 +137,28 @@ func newVibeDB(cfg Config) (Engine, error) {
 	return &vibeDBEngine{cfg: cfg, scan: newVibeDBScanState()}, nil
 }
 
+func openVibeDB(cfg Config) (Engine, error) {
+	engine, err := newVibeDB(cfg)
+	if err != nil {
+		return nil, err
+	}
+	v := engine.(*vibeDBEngine)
+	v.path = filepath.Join(v.cfg.Dir, "vibedb.db")
+	f, err := os.OpenFile(v.path, os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	v.file = f
+	db, err := durable.Open(f, v.options())
+	if err != nil {
+		_ = f.Close()
+		v.file = nil
+		return nil, err
+	}
+	v.coll = db
+	return v, nil
+}
+
 func (v *vibeDBEngine) Name() string { return "vibedb" }
 
 func (v *vibeDBEngine) DurabilityMode() DurabilityMode { return v.cfg.Durability }

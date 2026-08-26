@@ -131,6 +131,17 @@ func massiveChurnTarget(label string) CoverageTarget {
 	return target
 }
 
+func lifecycleTarget(label, mode string) CoverageTarget {
+	return withOutputTokens(commandTarget(
+		label, "bench/competitive/cmd/lifecycle",
+		"-engine=vibedb", "-mode="+mode, "-corpus=10000",
+		"-durability=ordinary-sync", "-exact-indexes=0",
+		"-cardinality=low", "-document-shape=inline",
+		"-max-rss-bytes=0", "-max-physical-write-bytes=1073741824",
+	), "parentRun", "cache-control", "durability", "exact-indexes",
+		"open-ns", "peak-rss-bytes", "physical-write-known", "physical-write-bytes")
+}
+
 // BenchmarkCoverageManifest returns a fresh copy of the complete required
 // matrix so generators and tests cannot mutate the contract accidentally.
 func BenchmarkCoverageManifest() []CoverageLane {
@@ -213,17 +224,28 @@ func BenchmarkCoverageManifest() []CoverageLane {
 			Targets:  []CoverageTarget{massiveChurnTarget("VibeDB-only cache-pressure diagnostic")},
 		},
 		{
-			Dimension: "working set", Case: "larger than RAM", Status: CoverageGap,
-			Boundary: "Corpus construction is resident and there is no bounded-memory loader or host-memory guard for an out-of-RAM comparison.",
+			Dimension: "working set", Case: "larger than RAM", Status: CoverageImplemented,
+			Boundary: "The streaming overflow-heavy loader admits the row only when exact logical key-plus-document bytes exceed measured host physical memory. It enforces hard loader-byte, RSS, disk-space, and Linux physical-write bounds; a cross-engine claim requires one isolated process per engine with identical durability and index flags.",
+			Targets: []CoverageTarget{withOutputTokens(commandTarget(
+				"bounded-memory out-of-RAM scan", "bench/competitive/cmd/outofram",
+				"-engine=vibedb", "-corpus=4000000", "-durability=buffered-visible",
+				"-exact-indexes=0", "-cardinality=low", "-document-shape=overflow-heavy",
+				"-checkpoint-documents=4096", "-max-loader-bytes=8388608",
+				"-max-rss-bytes=0", "-max-physical-write-bytes=0",
+			), "run", "logical-bytes", "physical-memory-bytes", "loader-peak-bytes",
+				"max-loader-bytes", "peak-rss-bytes", "max-rss-bytes",
+				"physical-write-known", "physical-write-bytes", "max-physical-write-bytes")},
 		},
 
 		{
-			Dimension: "cache state", Case: "hot reopen", Status: CoverageGap,
-			Boundary: "Warmup exercises a hot open handle, but the Engine contract cannot close and reopen the same populated image inside a lane.",
+			Dimension: "cache state", Case: "hot reopen", Status: CoverageImplemented,
+			Boundary: "A conditioning child fully scans and closes the populated image, then a fresh child times only Factory.Open and proves the complete corpus after the timed interval. The output calls this full-scan-close, not an in-handle warm cache.",
+			Targets:  []CoverageTarget{lifecycleTarget("controlled hot reopen", "hot")},
 		},
 		{
-			Dimension: "cache state", Case: "cold reopen", Status: CoverageGap,
-			Boundary: "There is no explicit OS-cache eviction/reboot protocol or independently verified cold-reopen harness.",
+			Dimension: "cache state", Case: "cold reopen", Status: CoverageImplemented,
+			Boundary: "Cold mode synchronously writes Linux /proc/sys/vm/drop_caches=3 before the isolated timed child and fails closed without that global control. Darwin has no equivalent supported lane and is documented as unsupported rather than approximated with advisory eviction.",
+			Targets:  []CoverageTarget{lifecycleTarget("Linux global-cache cold reopen", "cold")},
 		},
 
 		{
@@ -284,16 +306,17 @@ func BenchmarkCoverageManifest() []CoverageLane {
 		},
 
 		{
-			Dimension: "lifecycle", Case: "open", Status: CoverageGap,
-			Boundary: "Engine construction is intentionally outside BulkLoad timing and no isolated open benchmark exists.",
+			Dimension: "lifecycle", Case: "open", Status: CoverageImplemented,
+			Boundary: "A fresh child times only Factory.Open over a previously checkpointed image; process startup, corpus creation, correctness scan, and Close are outside the interval. Cache state is explicitly uncontrolled in this lane, so hot and cold claims must use their dedicated modes.",
+			Targets:  []CoverageTarget{lifecycleTarget("isolated clean open", "open")},
 		},
 		{
-			Dimension: "lifecycle", Case: "recovery", Status: CoverageDiagnostic,
-			Boundary: "Crash-image recovery is exhaustively checked for correctness, but recovery wall time and I/O are not reported.",
-			Targets: []CoverageTarget{testTarget(
-				"whole-generation crash-image recovery",
-				"store/durable", "TestFileStoreCrashImagesRecoverWholeGeneration",
-			)},
+			Dimension: "lifecycle", Case: "recovery", Status: CoverageImplemented,
+			Boundary: "An isolated producer opens the checkpointed image, acknowledges one ordinary-sync mutation, and exits without Close. A fresh child times only Factory.Open, verifies the exact recovered canonical value and full row count afterward, and reports Linux process write_bytes when available. This is one controlled acknowledged-mutation crash shape, not an exhaustive crash-point timing claim.",
+			Targets: []CoverageTarget{
+				lifecycleTarget("isolated acknowledged-mutation recovery", "recovery"),
+				testTarget("whole-generation crash-image recovery correctness", "store/durable", "TestFileStoreCrashImagesRecoverWholeGeneration"),
+			},
 		},
 		{
 			Dimension: "lifecycle", Case: "checkpoint", Status: CoverageImplemented,

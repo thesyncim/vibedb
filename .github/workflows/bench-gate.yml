@@ -7,6 +7,29 @@ concurrency:
   group: bench-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
+  competitive-evidence:
+    name: competitive lifecycle evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'bench/competitive/go.mod'
+      - name: Competitive contract and adapter reopen tests
+        working-directory: bench/competitive
+        run: go test ./...
+      - name: Build lifecycle harness
+        working-directory: bench/competitive
+        run: go build -o /tmp/vibedb-lifecycle ./cmd/lifecycle
+      - name: Isolated hot and recovery smoke
+        run: |
+          /tmp/vibedb-lifecycle -engine=bbolt -mode=hot -corpus=64 -durability=ordinary-sync -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+          /tmp/vibedb-lifecycle -engine=vibedb -mode=recovery -corpus=64 -durability=ordinary-sync -exact-indexes=1 -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
+      - name: Linux controlled cold-reopen smoke
+        # The lane intentionally fails closed unless the runner can perform a
+        # real global cache drop. GitHub-hosted Linux runners provide sudo;
+        # Darwin is documented unsupported rather than approximated.
+        run: sudo /tmp/vibedb-lifecycle -engine=bbolt -mode=cold -corpus=64 -durability=ordinary-sync -max-rss-bytes=536870912 -max-physical-write-bytes=67108864
   allocation-gate:
     name: allocation gate
     runs-on: ubuntu-latest

@@ -44,6 +44,65 @@ func TestCorpusDocumentShapesAreExactAndValid(t *testing.T) {
 	}
 }
 
+func TestStreamingCorpusMatchesResidentCorpus(t *testing.T) {
+	for _, card := range []Cardinality{LowCardinality, HighCardinality} {
+		for _, shape := range []DocumentShape{InlineDocuments, MixedDocuments, OverflowHeavyDocuments} {
+			want := CorpusOfShape(33, card, shape)
+			var got []Doc
+			if err := GenerateCorpus(33, card, shape, func(doc Doc) error {
+				got = append(got, Doc{Key: doc.Key, JSON: append([]byte(nil), doc.JSON...)})
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s/%s streamed docs=%d want=%d", card, shape, len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Key != want[i].Key || !bytes.Equal(got[i].JSON, want[i].JSON) {
+					t.Fatalf("%s/%s document %d drifted", card, shape, i)
+				}
+			}
+		}
+	}
+}
+
+func TestFactoriesReopenPopulatedImagesAndMissingImagesFailClosed(t *testing.T) {
+	corpus := CorpusOfShape(32, LowCardinality, MixedDocuments)
+	for _, factory := range Factories() {
+		t.Run(factory.Name, func(t *testing.T) {
+			cfg := Config{
+				Dir: t.TempDir(), Durability: DurabilityBufferedVisible,
+				MaxDocumentBytes: MixedDocuments.MaxDocumentBytes(), CacheBytes: DefaultCacheBytes,
+			}
+			if _, err := factory.Open(cfg); err == nil {
+				t.Fatal("open created or accepted a missing image")
+			}
+			engine, err := factory.New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Load(corpus); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := factory.Open(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if n, err := reopened.ScanAllBytes(); err != nil || n != len(corpus) {
+				t.Fatalf("reopened scan rows=%d want=%d err=%v", n, len(corpus), err)
+			}
+		})
+	}
+}
+
 func TestNonIndexAdaptersRejectExactIndexConfiguration(t *testing.T) {
 	for _, factory := range Factories() {
 		if IndexCapable(factory.Name) {

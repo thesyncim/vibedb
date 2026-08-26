@@ -2,6 +2,8 @@ package competitive
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -14,6 +16,17 @@ type pebbleEngine struct {
 }
 
 func newPebble(cfg Config) (Engine, error) {
+	return openPebbleMode(cfg, true)
+}
+
+func openPebble(cfg Config) (Engine, error) {
+	if _, err := os.Stat(filepath.Join(cfg.Dir, "CURRENT")); err != nil {
+		return nil, err
+	}
+	return openPebbleMode(cfg, false)
+}
+
+func openPebbleMode(cfg Config, _ bool) (Engine, error) {
 	if err := validateEngineExactIndexes("pebble", cfg.ExactIndexes); err != nil {
 		return nil, err
 	}

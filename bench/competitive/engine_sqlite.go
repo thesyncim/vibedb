@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -25,6 +26,17 @@ type sqliteEngine struct {
 }
 
 func newSQLite(cfg Config) (Engine, error) {
+	return openSQLiteMode(cfg, true)
+}
+
+func openSQLite(cfg Config) (Engine, error) {
+	if _, err := os.Stat(filepath.Join(cfg.Dir, "sqlite.db")); err != nil {
+		return nil, err
+	}
+	return openSQLiteMode(cfg, false)
+}
+
+func openSQLiteMode(cfg Config, create bool) (Engine, error) {
 	if err := validateEngineExactIndexes("sqlite", cfg.ExactIndexes); err != nil {
 		return nil, err
 	}
@@ -86,22 +98,24 @@ func newSQLite(cfg Config) (Engine, error) {
 	// in both configurations; only the index over it is conditional. A VIRTUAL
 	// generated column costs no storage — SQLite evaluates json_extract on
 	// read — so the unindexed configuration is not paying for it at rest.
-	schema := `CREATE TABLE docs (k TEXT PRIMARY KEY, doc TEXT NOT NULL`
-	for i := range int(cfg.ExactIndexes) {
-		definition := ExactIndexDefinitions[i]
-		schema += fmt.Sprintf(", %s TEXT GENERATED ALWAYS AS (json_extract(doc, '%s')) VIRTUAL",
-			definition.Name, definition.SQLitePath)
-	}
-	schema += `) WITHOUT ROWID;`
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, err
-	}
-	for i := range int(cfg.ExactIndexes) {
-		name := ExactIndexDefinitions[i].Name
-		if _, err := db.Exec(fmt.Sprintf("CREATE INDEX idx_%s ON docs(%s)", name, name)); err != nil {
+	if create {
+		schema := `CREATE TABLE docs (k TEXT PRIMARY KEY, doc TEXT NOT NULL`
+		for i := range int(cfg.ExactIndexes) {
+			definition := ExactIndexDefinitions[i]
+			schema += fmt.Sprintf(", %s TEXT GENERATED ALWAYS AS (json_extract(doc, '%s')) VIRTUAL",
+				definition.Name, definition.SQLitePath)
+		}
+		schema += `) WITHOUT ROWID;`
+		if _, err := db.Exec(schema); err != nil {
 			db.Close()
 			return nil, err
+		}
+		for i := range int(cfg.ExactIndexes) {
+			name := ExactIndexDefinitions[i].Name
+			if _, err := db.Exec(fmt.Sprintf("CREATE INDEX idx_%s ON docs(%s)", name, name)); err != nil {
+				db.Close()
+				return nil, err
+			}
 		}
 	}
 
