@@ -225,6 +225,11 @@ func OpenReplicatedShardStoreWithApply(
 	if err != nil {
 		return nil, err
 	}
+	if schemaRecovery, recoveryErr := replicatedSchemaActivationMatchesCatalog(absolute); recoveryErr != nil {
+		return nil, recoveryErr
+	} else if schemaRecovery {
+		return OpenReplicatedShardStoreWithSchemaTransition(path, expected, expectedApply)
+	}
 	if _, err := os.Stat(absolute); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: %s", ErrReplicatedApplyUninitialized, absolute)

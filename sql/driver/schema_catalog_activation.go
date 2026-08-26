@@ -46,6 +46,22 @@ type replicatedSchemaActivation struct {
 	command      []byte
 }
 
+func replicatedSchemaActivationMatchesCatalog(catalogPath string) (bool, error) {
+	raw, found, err := readCatalogFile(catalogPath)
+	if err != nil || !found {
+		return false, err
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil {
+		return false, err
+	}
+	record, activationFound, err := readReplicatedSchemaActivation(catalogPath + ".tables")
+	if err != nil || !activationFound {
+		return false, err
+	}
+	return record.targetDigest == image.Digest, nil
+}
+
 func encodeReplicatedSchemaActivation(record replicatedSchemaActivation) ([]byte, error) {
 	if record.targetDigest == ([sha256.Size]byte{}) || len(record.command) == 0 ||
 		len(record.command) > replicatedstate.MaxSchemaTransitionBytes {

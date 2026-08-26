@@ -171,7 +171,7 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	}
 	targetIdentity := target.ReplicatedShardStore.Clone()
 	targetApplyIdentity := target.ReplicatedApply.identity()
-	activated, err := OpenReplicatedShardStoreWithSchemaTransition(
+	activated, err := OpenReplicatedShardStoreWithApply(
 		path, targetIdentity, targetApplyIdentity,
 	)
 	if err != nil {
