@@ -23,6 +23,9 @@ const (
 	RequestLedgerReadRoutePin     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageRoutePin)
 	RequestLedgerReadPrepared     RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StoragePrepared)
 	RequestLedgerReadSchemaPin    RequestLedgerReadKind = RequestLedgerReadKind(requestledger.StorageSchemaPin)
+	// Issuer status is a synthetic, fixed-size coherent view rather than one
+	// directly addressable storage row.
+	RequestLedgerReadIssuerStatus RequestLedgerReadKind = 0xf0
 )
 
 var ErrRequestLedgerRead = errors.New("replicatedstate: invalid request-ledger recovery read")
@@ -71,6 +74,8 @@ func RequestLedgerReadMaxBytes(kind RequestLedgerReadKind) int {
 		return requestledger.MaxPreparedTerminalRecordBytes
 	case RequestLedgerReadSchemaPin:
 		return requestledger.MaxSchemaPinReleaseRecordBytes
+	case RequestLedgerReadIssuerStatus:
+		return requestledger.IssuerLaneStatusBytes
 	default:
 		return 0
 	}
@@ -139,6 +144,14 @@ func (m *Machine) RequestLedgerReadInto(
 		return RequestLedgerReadResult{}, m.fail(errors.Join(ErrInconsistentSnapshot, m.applyCut.Close()))
 	}
 	result.Fence = m.transactionRecoveryFenceLocked()
+	if request.Kind == RequestLedgerReadIssuerStatus {
+		issuerResult, readErr := requestLedgerIssuerStatusRead(snapshot, request, home, dst[:0], result.Fence)
+		closeErr := m.applyCut.Close()
+		if readErr != nil || closeErr != nil {
+			return RequestLedgerReadResult{}, m.fail(errors.Join(readErr, closeErr))
+		}
+		return issuerResult, nil
+	}
 
 	// The tombstone is the first and authoritative point read for every kind.
 	ackKey := requestledger.AppendAckKey(nil, home, keyDigest)
@@ -189,6 +202,73 @@ func (m *Machine) RequestLedgerReadInto(
 		return RequestLedgerReadResult{}, m.fail(errors.Join(err, closeErr))
 	}
 	return result, nil
+}
+
+func requestLedgerIssuerStatusRead(
+	snapshot *durable.Snapshot,
+	request RequestLedgerReadRequest,
+	home requestledger.LedgerHome,
+	dst []byte,
+	fence SnapshotFence,
+) (RequestLedgerReadResult, error) {
+	identity, err := requestledger.IssuerIdentityFor(request.Key)
+	if err != nil {
+		return RequestLedgerReadResult{}, ErrRequestLedgerRead
+	}
+	issuer, err := requestledger.IssuerDigest(identity)
+	if err != nil {
+		return RequestLedgerReadResult{}, ErrRequestLedgerRead
+	}
+	highwaterKey := requestledger.AppendIssuerHighwaterKey(nil, home, issuer)
+	highwaterRaw, found, err := snapshot.AppendRaw(dst[:0], highwaterKey)
+	if err != nil || !found {
+		return RequestLedgerReadResult{Fence: fence}, err
+	}
+	highwater, err := requestledger.OpenIssuerHighwater(highwaterRaw)
+	if err != nil || highwater.Home != home || highwater.IssuerDigest != issuer ||
+		highwater.Identity != identity {
+		return RequestLedgerReadResult{}, errors.Join(err, ErrStateCorrupt)
+	}
+	var sequence *requestledger.IssuerSequenceRecord
+	var ack *requestledger.AckRecord
+	if highwater.HighwaterSequence < highwater.AdmittedSequence {
+		next := highwater.HighwaterSequence + 1
+		sequenceKey := requestledger.AppendIssuerSequenceKey(nil, home, issuer, next)
+		sequenceRaw, sequenceFound, readErr := snapshot.AppendRaw(nil, sequenceKey)
+		if readErr != nil || !sequenceFound {
+			return RequestLedgerReadResult{}, errors.Join(readErr, ErrStateCorrupt)
+		}
+		value, openErr := requestledger.OpenIssuerSequence(sequenceRaw)
+		if openErr != nil || value.Home != home || value.IssuerDigest != issuer ||
+			value.Identity != identity || value.Sequence != next {
+			return RequestLedgerReadResult{}, errors.Join(openErr, ErrStateCorrupt)
+		}
+		sequence = &value
+		if value.Phase == requestledger.IssuerSequenceGCComplete {
+			ackKey := requestledger.AppendAckKey(nil, home, value.KeyDigest)
+			ackRaw, ackFound, ackErr := snapshot.AppendRaw(nil, ackKey)
+			if ackErr != nil || !ackFound {
+				return RequestLedgerReadResult{}, errors.Join(ackErr, ErrStateCorrupt)
+			}
+			ackValue, openErr := requestledger.OpenAck(ackRaw)
+			if openErr != nil || ackValue.GCPhase != requestledger.AckGCComplete ||
+				ackValue.KeyDigest != value.KeyDigest || ackValue.AckDigest != value.AckDigest {
+				return RequestLedgerReadResult{}, errors.Join(openErr, ErrStateCorrupt)
+			}
+			ack = &ackValue
+		}
+	}
+	status, err := requestledger.NewIssuerLaneStatus(highwater, sequence, ack)
+	if err != nil {
+		return RequestLedgerReadResult{}, errors.Join(err, ErrStateCorrupt)
+	}
+	value, err := requestledger.AppendIssuerLaneStatus(dst[:0], status)
+	if err != nil {
+		return RequestLedgerReadResult{}, errors.Join(err, ErrStateCorrupt)
+	}
+	return RequestLedgerReadResult{
+		Fence: fence, Found: true, AuthoritativeKind: RequestLedgerReadIssuerStatus, Value: value,
+	}, nil
 }
 
 func requestLedgerReadStorageKey(

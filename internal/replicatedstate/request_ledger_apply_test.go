@@ -218,6 +218,37 @@ func TestRequestLedgerSequencedCreateReopensExactUsage(t *testing.T) {
 	if err != nil || reopenedUsage != usage {
 		t.Fatalf("reopened sequenced usage = %+v, %v; want %+v", reopenedUsage, err, usage)
 	}
+	read := RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadIssuerStatus, MinimumApplied: 2,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadIssuerStatus)),
+	}
+	statusResult, err := reopened.RequestLedgerReadInto(read, make([]byte, 0, read.MaxBytes))
+	if err != nil || !statusResult.Found ||
+		statusResult.AuthoritativeKind != RequestLedgerReadIssuerStatus {
+		t.Fatalf("reopened issuer status = %+v, %v", statusResult, err)
+	}
+	status, err := requestledger.OpenIssuerLaneStatus(statusResult.Value)
+	if err != nil || status.Highwater.AdmittedSequence != 1 ||
+		status.Highwater.HighwaterSequence != 0 || !status.NextFound || status.AdvanceReady ||
+		status.Sequence.Sequence != 1 || status.Sequence.Phase != requestledger.IssuerSequenceActive {
+		t.Fatalf("opened issuer status = %+v, %v", status, err)
+	}
+
+	// The same home and range cannot be used to read a different authenticated
+	// principal/lane identity, even when the caller knows the RF3 endpoint.
+	wrong := key
+	wrong.Principal[0] ^= 0xff
+	read.Key = wrong
+	wrongResult, err := reopened.RequestLedgerReadInto(read, make([]byte, 0, read.MaxBytes))
+	if err != nil || wrongResult.Found {
+		t.Fatalf("foreign issuer status = %+v, %v", wrongResult, err)
+	}
+	read.Key = key
+	read.ExpectedRangeIdentity[0] ^= 0xff
+	if _, err := reopened.RequestLedgerReadInto(read, make([]byte, 0, read.MaxBytes)); err == nil {
+		t.Fatal("issuer status accepted a stale ledger range identity")
+	}
 }
 
 func TestRequestLedgerRangeAdmissionPrecedesSnapshotReads(t *testing.T) {

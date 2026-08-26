@@ -106,6 +106,7 @@ type DurableRequestLifecycleRow struct {
 	RoutePin     requestledger.RoutePinRecord
 	Prepared     requestledger.PreparedTerminalRecord
 	SchemaPin    requestledger.SchemaPinReleaseRecord
+	IssuerStatus requestledger.IssuerLaneStatus
 }
 
 type durableRequestLedgerRF3Client interface {
@@ -349,6 +350,8 @@ func openDurableRequestLifecycleRow(
 		row.Prepared, err = requestledger.OpenPreparedTerminal(row.Raw)
 	case replicatedstate.RequestLedgerReadSchemaPin:
 		row.SchemaPin, err = requestledger.OpenSchemaPinRelease(row.Raw)
+	case replicatedstate.RequestLedgerReadIssuerStatus:
+		row.IssuerStatus, err = requestledger.OpenIssuerLaneStatus(row.Raw)
 	default:
 		return ErrDurableRequest
 	}
