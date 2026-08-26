@@ -142,6 +142,46 @@ released version or a compatibility dispatch point. Earlier development
 decimal-JSON values fail closed. Format 0 replaces them in place and has no
 alternate decoder or migration ladder.
 
+## Distributed transaction coordinator manifests
+
+The compact `VTC1` coordinator record remains the byte-identical fast path for
+at most 64 participants and 32 KiB. Those are inline-layout bounds, not a
+distributed transaction participant limit. A wider ordered participant set is
+encoded as canonical `VTM1` pages and bound by one fixed `VTCM` coordinator.
+
+One `VTM1` page is at most 64 KiB:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic `VTM1` |
+| 4 | 1 | Current unreleased format sentinel |
+| 5 | 3 | Required zero bytes |
+| 8 | 4 | Little-endian page index |
+| 12 | 4 | Little-endian participant count |
+| 16 | 8 | Little-endian first aggregate participant ordinal |
+| 24 | 4 | Little-endian entry-payload bytes |
+| 28 | 4 | Required zero bytes |
+| 32 | variable | Canonical participant entries |
+| final | 4 | CRC32C of every preceding page byte |
+
+Each entry starts with 64 fixed bytes: distribution-prefix length,
+distribution-suffix length, shard-prefix length, shard-suffix length,
+participant state, three required zero bytes, routing version, allocation
+generation, ownership epoch, and the 32-byte mutation digest. The two identity
+suffixes follow. Prefixes refer only to the preceding entry in the same page;
+the first entry uses zero prefixes. Entries and pages are strictly ordered and
+deduplicated.
+
+`VTCM` is exactly 116 bytes. It stores magic and sentinel, staging state,
+revision, catalog generation, recovery deadline, 16-byte transaction ID, and a
+56-byte manifest descriptor followed by required zero bytes and CRC32C. The
+descriptor contains aggregate participant count, aggregate encoded bytes, page
+count, and a SHA-256 root over the ordered page-digest chain. Aggregate encoded
+manifest bytes are capped at 64 MiB. Coordinator begin carries `VTCM` and page
+zero together so the addressed shard validates the canonical coordinator
+identity before either journal append. Commit is refused until the durable page
+sequence exactly reconstructs the descriptor and root.
+
 ## Replicated checkpoint-group certificate
 
 A replay-backed replicated tablet owns one fixed collection set and its

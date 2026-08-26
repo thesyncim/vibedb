@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -472,9 +473,13 @@ func readFrameBudgetedLimit(
 	return body, charged, nil
 }
 
-func validateTransactionRequest(tx TransactionRequest) error {
+func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) error {
+	if tx == nil {
+		return errBadTransaction
+	}
 	if tx.Operation == TransactionNone {
-		if !tx.ID.IsZero() || tx.Revision != 0 || len(tx.Record) != 0 {
+		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
+			len(tx.ManifestSegment) != 0 {
 			return errBadTransaction
 		}
 		return nil
@@ -483,12 +488,13 @@ func validateTransactionRequest(tx TransactionRequest) error {
 		return errBadEnum
 	}
 	if tx.Operation.stages() {
-		if !tx.ID.IsZero() || tx.Revision != 0 || len(tx.Record) == 0 {
+		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) == 0 ||
+			len(tx.ManifestSegment) != 0 {
 			return errBadTransaction
 		}
 		var err error
 		if tx.Operation == TransactionStageCoordinator {
-			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 		} else {
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
@@ -499,13 +505,51 @@ func validateTransactionRequest(tx TransactionRequest) error {
 		}
 		return nil
 	}
-	if tx.Operation == TransactionScanCoordinator {
-		if tx.Revision != 0 || len(tx.Record) != 0 {
+	if tx.Operation.stagesManifestCoordinator() {
+		if !tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) == 0 ||
+			len(tx.ManifestSegment) == 0 {
+			return errBadTransaction
+		}
+		record, err := distributedtxn.OpenManifestCoordinator(tx.Record)
+		if err != nil {
+			return errors.Join(errBadTransaction, err)
+		}
+		meta, err := inspectTransactionManifestFirstSegment(tx.ManifestSegment, record.Manifest)
+		if err != nil {
+			return errors.Join(errBadTransaction, err)
+		}
+		if cacheDecodedMeta {
+			tx.manifestMeta = &meta
+		}
+		return nil
+	}
+	if tx.Operation.stagesManifestSegment() {
+		if tx.ID.IsZero() || tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 ||
+			len(tx.ManifestSegment) == 0 {
+			return errBadTransaction
+		}
+		meta, err := inspectTransactionManifestSegment(tx.ManifestSegment)
+		if err != nil || meta.index == 0 {
+			return errors.Join(errBadTransaction, err)
+		}
+		if cacheDecodedMeta {
+			tx.manifestMeta = &meta
+		}
+		return nil
+	}
+	if tx.Operation.readsManifestSegment() {
+		if tx.ID.IsZero() || tx.Revision != 0 || len(tx.Record) != 0 || len(tx.ManifestSegment) != 0 {
 			return errBadTransaction
 		}
 		return nil
 	}
-	if tx.ID.IsZero() || len(tx.Record) != 0 {
+	if tx.Operation == TransactionScanCoordinator {
+		if tx.Revision != 0 || tx.SegmentIndex != 0 || len(tx.Record) != 0 || len(tx.ManifestSegment) != 0 {
+			return errBadTransaction
+		}
+		return nil
+	}
+	if tx.ID.IsZero() || tx.SegmentIndex != 0 || len(tx.Record) != 0 || len(tx.ManifestSegment) != 0 {
 		return errBadTransaction
 	}
 	lookup := tx.Operation == TransactionLookupCoordinator ||
@@ -520,7 +564,8 @@ func validateTransactionReply(tx TransactionReply) error {
 	if tx.Role == TransactionRoleNone {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid || len(tx.Record) != 0 {
+			tx.ParticipantState != distributedtxn.ParticipantInvalid ||
+			tx.RecordKind != TransactionRecordNone || tx.SegmentIndex != 0 || len(tx.Record) != 0 {
 			return errBadTransaction
 		}
 		return nil
@@ -535,12 +580,38 @@ func validateTransactionReply(tx TransactionReply) error {
 			tx.ParticipantState != distributedtxn.ParticipantInvalid {
 			return errBadTransaction
 		}
-		if len(tx.Record) != 0 {
-			var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+		switch tx.RecordKind {
+		case TransactionRecordNone:
+			if tx.SegmentIndex != 0 || len(tx.Record) != 0 {
+				return errBadTransaction
+			}
+		case TransactionRecordInlineCoordinator:
+			if tx.SegmentIndex != 0 || len(tx.Record) == 0 {
+				return errBadTransaction
+			}
+			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
+		case TransactionRecordManifestCoordinator:
+			if tx.SegmentIndex != 0 || len(tx.Record) == 0 {
+				return errBadTransaction
+			}
+			record, err := distributedtxn.OpenManifestCoordinator(tx.Record)
+			if err != nil || record.ID != tx.ID {
+				return errors.Join(errBadTransaction, err)
+			}
+		case TransactionRecordManifestSegment:
+			if len(tx.Record) == 0 {
+				return errBadTransaction
+			}
+			meta, err := inspectTransactionManifestSegment(tx.Record)
+			if err != nil || meta.index != tx.SegmentIndex {
+				return errors.Join(errBadTransaction, err)
+			}
+		default:
+			return errBadTransaction
 		}
 	case TransactionRoleParticipant:
 		if tx.ParticipantState < distributedtxn.ParticipantStaged ||
@@ -548,17 +619,124 @@ func validateTransactionReply(tx TransactionReply) error {
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
 		}
-		if len(tx.Record) != 0 {
+		if tx.SegmentIndex != 0 {
+			return errBadTransaction
+		}
+		switch tx.RecordKind {
+		case TransactionRecordNone:
+			if len(tx.Record) != 0 {
+				return errBadTransaction
+			}
+		case TransactionRecordParticipant:
+			if len(tx.Record) == 0 {
+				return errBadTransaction
+			}
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
 			record, err := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
+		default:
+			return errBadTransaction
 		}
 	default:
 		return errBadEnum
 	}
 	return nil
+}
+
+// openTransactionManifestSegment bounds all decoder scratch to one manifest
+// page. The segmented lane is cold recovery/control traffic; it never sizes an
+// allocation from an unauthenticated aggregate participant count.
+type transactionManifestScratch struct {
+	participants [distributedtxn.MaxManifestPageParticipants]distributedtxn.ParticipantRef
+	// Prefix compression can reconstruct two full 255-byte identities per
+	// participant from one 64 KiB page. This exact one-page maximum is a scratch
+	// bound, never an aggregate transaction allocation.
+	identities [distributedtxn.MaxManifestPageParticipants * distributedtxn.MaxShardIdentityBytes * 2]byte
+}
+
+var transactionManifestScratchPool = sync.Pool{New: func() any {
+	return new(transactionManifestScratch)
+}}
+
+func borrowTransactionManifestScratch() *transactionManifestScratch {
+	return transactionManifestScratchPool.Get().(*transactionManifestScratch)
+}
+
+func releaseTransactionManifestScratch(scratch *transactionManifestScratch) {
+	if scratch != nil {
+		transactionManifestScratchPool.Put(scratch)
+	}
+}
+
+func inspectTransactionManifestSegment(raw []byte) (transactionManifestSegmentMeta, error) {
+	scratch := borrowTransactionManifestScratch()
+	defer releaseTransactionManifestScratch(scratch)
+	page, err := distributedtxn.OpenManifestSegment(raw, scratch.participants[:], scratch.identities[:])
+	if err != nil {
+		return transactionManifestSegmentMeta{}, err
+	}
+	return transactionManifestMeta(page), nil
+}
+
+func inspectTransactionManifestFirstSegment(
+	raw []byte,
+	descriptor distributedtxn.ManifestDescriptor,
+) (transactionManifestSegmentMeta, error) {
+	reader, err := distributedtxn.NewManifestReader(descriptor)
+	if err != nil {
+		return transactionManifestSegmentMeta{}, err
+	}
+	scratch := borrowTransactionManifestScratch()
+	defer releaseTransactionManifestScratch(scratch)
+	page, err := reader.OpenNext(raw, scratch.participants[:], scratch.identities[:])
+	if err != nil {
+		return transactionManifestSegmentMeta{}, err
+	}
+	meta := transactionManifestMeta(page)
+	if !manifestFirstPageWithinDescriptor(meta, len(raw), descriptor) {
+		return transactionManifestSegmentMeta{}, distributedtxn.ErrCorrupt
+	}
+	if descriptor.SegmentCount == 1 {
+		if err := reader.Seal(); err != nil {
+			return transactionManifestSegmentMeta{}, err
+		}
+	}
+	return meta, nil
+}
+
+func transactionManifestMeta(page distributedtxn.ManifestPage) transactionManifestSegmentMeta {
+	first := page.Participants[0]
+	meta := transactionManifestSegmentMeta{
+		valid: true, index: page.Segment.Index,
+		firstParticipant: page.Segment.FirstParticipant,
+		participantCount: page.Segment.ParticipantCount,
+		distributionLen:  uint8(len(first.Distribution)), shardLen: uint8(len(first.Shard)),
+		routingVersion: first.RoutingVersion, allocation: first.AllocationGeneration,
+		ownershipEpoch: first.OwnershipEpoch,
+	}
+	copy(meta.distribution[:], first.Distribution)
+	copy(meta.shard[:], first.Shard)
+	return meta
+}
+
+func manifestFirstPageWithinDescriptor(
+	meta transactionManifestSegmentMeta,
+	rawBytes int,
+	descriptor distributedtxn.ManifestDescriptor,
+) bool {
+	if !meta.valid || meta.index != 0 || meta.firstParticipant != 0 || rawBytes <= 0 ||
+		descriptor.SegmentCount == 0 || uint64(meta.participantCount) > descriptor.ParticipantCount ||
+		uint64(rawBytes) > descriptor.EncodedBytes {
+		return false
+	}
+	if descriptor.SegmentCount == 1 {
+		return uint64(meta.participantCount) == descriptor.ParticipantCount &&
+			uint64(rawBytes) == descriptor.EncodedBytes
+	}
+	return uint64(meta.participantCount) < descriptor.ParticipantCount &&
+		uint64(rawBytes) < descriptor.EncodedBytes
 }
 
 func validateExchangeRequest(req *ShardRequest) error {
@@ -877,6 +1055,21 @@ func encodeTransactionRequest(e *encbuf, tx TransactionRequest) {
 		e.bytes(tx.Record)
 		return
 	}
+	if tx.Operation.stagesManifestCoordinator() {
+		e.bytes(tx.Record)
+		e.bytes(tx.ManifestSegment)
+		return
+	}
+	if tx.Operation.stagesManifestSegment() {
+		e.fixed16(tx.ID)
+		e.bytes(tx.ManifestSegment)
+		return
+	}
+	if tx.Operation.readsManifestSegment() {
+		e.fixed16(tx.ID)
+		e.u32(tx.SegmentIndex)
+		return
+	}
 	e.fixed16(tx.ID)
 	e.u64(tx.Revision)
 }
@@ -891,6 +1084,15 @@ func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
 	}
 	if tx.Operation.stages() {
 		tx.Record = d.slice()
+	} else if tx.Operation.stagesManifestCoordinator() {
+		tx.Record = d.slice()
+		tx.ManifestSegment = d.slice()
+	} else if tx.Operation.stagesManifestSegment() {
+		tx.ID = distributedtxn.ID(d.fixed16())
+		tx.ManifestSegment = d.slice()
+	} else if tx.Operation.readsManifestSegment() {
+		tx.ID = distributedtxn.ID(d.fixed16())
+		tx.SegmentIndex = d.u32()
 	} else {
 		tx.ID = distributedtxn.ID(d.fixed16())
 		tx.Revision = d.u64()
@@ -898,7 +1100,7 @@ func decodeTransactionRequest(d *deccur) (TransactionRequest, error) {
 	if d.bad() {
 		return TransactionRequest{}, d.why
 	}
-	if err := validateTransactionRequest(tx); err != nil {
+	if err := validateTransactionRequest(&tx, true); err != nil {
 		return TransactionRequest{}, err
 	}
 	return tx, nil
@@ -913,6 +1115,8 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	} else {
 		e.u8(uint8(tx.ParticipantState))
 	}
+	e.u8(uint8(tx.RecordKind))
+	e.u32(tx.SegmentIndex)
 	e.bytes(tx.Record)
 }
 
@@ -929,6 +1133,8 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	} else if tx.Role == TransactionRoleParticipant {
 		tx.ParticipantState = distributedtxn.ParticipantState(state)
 	}
+	tx.RecordKind = TransactionRecordKind(d.u8())
+	tx.SegmentIndex = d.u32()
 	tx.Record = d.slice()
 	if d.bad() {
 		return TransactionReply{}, d.why
@@ -962,7 +1168,7 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if len(req.Params) > maxParams {
 		return errFieldTooLarge
 	}
-	if err := validateTransactionRequest(req.Transaction); err != nil {
+	if err := validateTransactionRequest(&req.Transaction, false); err != nil {
 		return err
 	}
 	if err := validateExchangeRequest(req); err != nil {

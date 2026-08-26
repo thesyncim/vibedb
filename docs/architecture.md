@@ -155,7 +155,7 @@ The static shard service accepts only its `ReadStrong` policy and serves a
 statement-level snapshot from a statically configured leader endpoint. This
 label is not a Raft linearizability proof because the serving path has no
 election or replication. Multi-shard reads use short-lived scoped vector
-fences. Ordinary writes require one-owner proof. A separate fixed-participant
+fences. Ordinary writes require one-owner proof. A separate byte-bounded
 protocol supports atomic write batches.
 
 The static SQL path has no Raft replication, follower read, or endpoint

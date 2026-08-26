@@ -147,6 +147,179 @@ func TestJournalCoordinatorAndIdentityConflict(t *testing.T) {
 	}
 }
 
+func TestJournalSegmentedManifestSealPagedRecovery(t *testing.T) {
+	descriptor, pages := buildManifest(t, 100_000)
+	path := filepath.Join(t.TempDir(), "transactions.vtj")
+	j, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := journalID(101)
+	participants := make([]ParticipantRef, MaxManifestPageParticipants)
+	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	coordinatorRaw, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: id, State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 1234, Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StageManifestCoordinator(coordinatorRaw); err != nil {
+		t.Fatal(err)
+	}
+	for i, raw := range pages {
+		segment, err := j.StageManifestSegment(id, raw, participants, identities)
+		if err != nil || segment.Index != uint32(i) {
+			t.Fatalf("stage page %d = %+v, %v", i, segment, err)
+		}
+		if _, err := j.StageManifestSegment(id, raw, participants, identities); err != nil {
+			t.Fatalf("idempotent page %d: %v", i, err)
+		}
+	}
+	if _, err := j.TransitionCoordinator(id, 1, CoordinatorCommitted); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("unbound ordinary decision = %v", err)
+	}
+	committed, err := j.SealManifestCoordinator(id, 1, CoordinatorCommitted)
+	if err != nil || committed.CoordinatorState != CoordinatorCommitted || committed.Revision != 2 {
+		t.Fatalf("sealed commit = %+v, %v", committed, err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	status, ok := j.CoordinatorStatus(id)
+	if !ok || status != committed {
+		t.Fatalf("recovered status = %+v,%v", status, ok)
+	}
+	coordinator, err := j.ManifestCoordinator(id)
+	if err != nil || coordinator.Manifest != descriptor {
+		t.Fatalf("recovered coordinator = %+v, %v", coordinator, err)
+	}
+	reader, err := NewManifestReader(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := uint32(0); index < descriptor.SegmentCount; index++ {
+		page, err := j.ManifestPage(id, index, participants, identities)
+		if err != nil {
+			t.Fatalf("recover page %d: %v", index, err)
+		}
+		if _, err := reader.OpenNext(page.Segment.Raw, participants, identities); err != nil {
+			t.Fatalf("verify page %d: %v", index, err)
+		}
+	}
+	if err := reader.Seal(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJournalSegmentedManifestRefusesMissingAndTrailingPages(t *testing.T) {
+	descriptor, pages := buildManifest(t, 4097)
+	j, err := OpenJournal(filepath.Join(t.TempDir(), "transactions.vtj"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	id := journalID(111)
+	participants := make([]ParticipantRef, MaxManifestPageParticipants)
+	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	if _, err := j.StageManifestSegment(id, pages[0], participants, identities); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("page before coordinator = %v", err)
+	}
+	raw, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: id, State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StageManifestCoordinator(raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StageManifestSegment(id, pages[1], participants, identities); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("sparse first page = %v", err)
+	}
+	for _, raw := range pages[:len(pages)-1] {
+		if _, err := j.StageManifestSegment(id, raw, participants, identities); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.SealManifestCoordinator(id, 1, CoordinatorCommitted); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("commit with missing final page = %v", err)
+	}
+	aborted, err := j.SealManifestCoordinator(id, 1, CoordinatorAborted)
+	if err != nil || aborted.CoordinatorState != CoordinatorAborted {
+		t.Fatalf("abort incomplete manifest = %+v, %v", aborted, err)
+	}
+	if _, err := j.StageManifestSegment(id, pages[len(pages)-1], participants, identities); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("page after decision = %v", err)
+	}
+}
+
+func TestJournalSegmentedManifestIncompleteBeginRecoversAndAborts(t *testing.T) {
+	descriptor, pages := buildManifest(t, 4097)
+	path := filepath.Join(t.TempDir(), "transactions.vtj")
+	id := journalID(121)
+	coordinatorRaw, err := AppendManifestCoordinator(nil, ManifestCoordinatorRecord{
+		ID: id, State: CoordinatorStaging, Revision: 1,
+		CatalogGeneration: 9, RecoveryDeadline: 1234, Manifest: descriptor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	participants := make([]ParticipantRef, MaxManifestPageParticipants)
+	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	j, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StageManifestCoordinator(coordinatorRaw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StageManifestSegment(id, pages[0], participants, identities); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, ok := j.CoordinatorStatus(id); !ok ||
+		status.CoordinatorState != CoordinatorStaging {
+		t.Fatalf("recovered incomplete status = %+v,%v", status, ok)
+	}
+	if _, err := j.SealManifestCoordinator(id, 1, CoordinatorCommitted); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("commit recovered incomplete manifest = %v", err)
+	}
+	aborted, err := j.SealManifestCoordinator(id, 1, CoordinatorAborted)
+	if err != nil || aborted.CoordinatorState != CoordinatorAborted {
+		t.Fatalf("abort recovered incomplete manifest = %+v, %v", aborted, err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if status, ok := j.CoordinatorStatus(id); !ok || status != aborted {
+		t.Fatalf("recovered abort = %+v,%v", status, ok)
+	}
+	if _, err := j.StageManifestSegment(id, pages[1], participants, identities); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("late page after recovered abort = %v", err)
+	}
+}
+
 func TestJournalRefusesConcurrentShardWideParticipants(t *testing.T) {
 	j, err := OpenJournal(filepath.Join(t.TempDir(), "transactions.vtj"))
 	if err != nil {

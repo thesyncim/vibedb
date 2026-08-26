@@ -305,7 +305,7 @@ The allowed operations are:
 | --- | --- |
 | Empty or `query` | Run a read query. |
 | `exec` | Run one write that the gateway proves has one owner. |
-| `exec_batch` | Run a fixed-participant atomic write batch. |
+| `exec_batch` | Run a byte-bounded atomic write batch across fenced shard targets. |
 
 The gateway also accepts one canonical RF3 point-read envelope. The object and
 fields must use the exact order shown. `key` is the unpadded base64url encoding
@@ -405,8 +405,22 @@ The gateway sends an ordinary write only after it proves one owner:
 - A whole-document update must keep the same shard owner.
 - DDL is refused on this path.
 
-`exec_batch` supports fixed-participant atomic writes. It permits at most 64
-participants. The first participant in sorted order is the coordinator.
+`exec_batch` supports byte-bounded atomic writes across independently placed
+tables and shards. A participant is an exact fenced shard target, and
+co-located statements are folded into one participant. The compact coordinator
+fast path holds at most 64 participants; wider batches automatically use a
+64-KiB-paged, root-bound manifest. There is no public participant-count limit.
+Profiles instead cap mutation count, canonical mutation bytes, deadline, and
+in-flight shard requests. The first participant in sorted order is the
+coordinator.
+
+Each shard journal admits at most 512 MiB of active segmented-manifest pages
+and 8 GiB of retained append-only transaction records. Admission excludes the
+exact control-byte reserve needed to decide and retire already admitted local
+records. Retirement reclaims resident manifest pages immediately and on
+reopen. Disk compaction is not implemented yet; operators must monitor
+`distributedtxn.Journal.Usage` and treat retained-capacity exhaustion as a
+write-availability limit, not as permission to delete or recreate the journal.
 
 An ordinary `exec` can also use the distributed transaction protocol. The
 base-table mutation must still prove one base owner, but active global-index

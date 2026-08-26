@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	FormatVersion             = 1
-	MaxParticipants           = 64
+	FormatVersion = 1
+	// MaxInlineParticipants bounds only the legacy single-record VTC1
+	// encoding. It is not a distributed transaction participant limit;
+	// wider transactions use the segmented VTM1 manifest.
+	MaxInlineParticipants     = 64
 	MaxIntentScopes           = 256
 	MaxShardIdentityBytes     = 255
 	MaxMutationBytes          = 16 << 20
@@ -235,14 +238,14 @@ func OpenCoordinator(src []byte) (CoordinatorRecord, error) {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
 	count := int(binary.LittleEndian.Uint16(src[6:8]))
-	if count <= 0 || count > MaxParticipants {
+	if count <= 0 || count > MaxInlineParticipants {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
 	return OpenCoordinatorInto(src, make([]ParticipantRef, count))
 }
 
 // OpenCoordinatorInto decodes into caller-owned participant storage. Hot
-// status/recovery loops keep a [MaxParticipants] arena and allocate nothing.
+// status/recovery loops keep a [MaxInlineParticipants] arena and allocate nothing.
 func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (CoordinatorRecord, error) {
 	if len(src) < coordinatorHeaderBytes+4 || len(src) > MaxCoordinatorRecordBytes ||
 		!equal4(src[:4], coordinatorMagic) || !checksumOK(src) {
@@ -252,7 +255,7 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 		return CoordinatorRecord{}, ErrUnsupported
 	}
 	count := int(binary.LittleEndian.Uint16(src[6:8]))
-	if count == 0 || count > MaxParticipants || cap(participants) < count {
+	if count == 0 || count > MaxInlineParticipants || cap(participants) < count {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
 	participants = participants[:count]
@@ -426,9 +429,11 @@ func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, e
 
 func validateCoordinator(record CoordinatorRecord) error {
 	if record.ID.IsZero() || !record.State.valid() || record.Revision == 0 ||
-		record.CatalogGeneration == 0 || len(record.Participants) == 0 ||
-		len(record.Participants) > MaxParticipants {
+		record.CatalogGeneration == 0 || len(record.Participants) == 0 {
 		return ErrCorrupt
+	}
+	if len(record.Participants) > MaxInlineParticipants {
+		return ErrTooLarge
 	}
 	for i := range record.Participants {
 		p := &record.Participants[i]

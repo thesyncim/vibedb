@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -137,9 +138,11 @@ func sealedRequestCapability(request *ShardRequest) (serviceauthz.Capability, bo
 	if operation := request.Transaction.Operation; operation != TransactionNone {
 		switch operation {
 		case TransactionLookupCoordinator, TransactionLookupParticipant,
-			TransactionScanCoordinator, TransactionReadParticipant:
+			TransactionScanCoordinator, TransactionReadParticipant,
+			TransactionReadManifestSegment:
 			return serviceauthz.CapabilityDataRead, true
 		case TransactionStageCoordinator, TransactionStageParticipant,
+			TransactionStageManifestCoordinator, TransactionStageManifestSegment,
 			TransactionCommitCoordinator, TransactionApplyParticipant,
 			TransactionAbortCoordinator, TransactionAbortParticipant,
 			TransactionRetireCoordinator, TransactionReleaseParticipant,
@@ -708,6 +711,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	if tx.Operation != TransactionLookupCoordinator &&
 		tx.Operation != TransactionLookupParticipant &&
 		tx.Operation != TransactionReadParticipant &&
+		tx.Operation != TransactionReadManifestSegment &&
 		tx.Operation != TransactionScanCoordinator &&
 		req.ExecutionMode != ExecutionReadWrite {
 		return NewErrorResponse(ErrorReadOnly,
@@ -741,7 +745,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		}
 		return CompletionResponse(0)
 	case TransactionStageCoordinator:
-		var participants [distributedtxn.MaxParticipants]distributedtxn.ParticipantRef
+		var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
 		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
 		if openErr != nil {
 			return transactionError(openErr)
@@ -779,6 +783,12 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		defer writeCancel()
 		defer c.server.readFences.leaveParticipant(writeToken)
 		status, err = c.server.journal.StageParticipant(tx.Record)
+	case TransactionStageManifestCoordinator:
+		return c.stageManifestCoordinator(req)
+	case TransactionStageManifestSegment:
+		return c.stageManifestSegment(req)
+	case TransactionReadManifestSegment:
+		return c.readManifestSegment(tx.ID, tx.SegmentIndex)
 	case TransactionLookupCoordinator:
 		return c.lookupCoordinator(tx.ID)
 	case TransactionScanCoordinator:
@@ -792,13 +802,11 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	case TransactionApplyParticipant:
 		return c.applyParticipant(req)
 	case TransactionCommitCoordinator:
-		status, err = c.server.journal.TransitionCoordinator(
-			tx.ID, tx.Revision, distributedtxn.CoordinatorCommitted,
-		)
+		status, err = c.transitionCoordinator(
+			tx.ID, tx.Revision, distributedtxn.CoordinatorCommitted)
 	case TransactionAbortCoordinator:
-		status, err = c.server.journal.TransitionCoordinator(
-			tx.ID, tx.Revision, distributedtxn.CoordinatorAborted,
-		)
+		status, err = c.transitionCoordinator(
+			tx.ID, tx.Revision, distributedtxn.CoordinatorAborted)
 	case TransactionAbortParticipant:
 		status, err = c.server.journal.AbortParticipant(tx.ID, tx.Revision)
 	case TransactionReleaseParticipant:
@@ -973,6 +981,13 @@ func (c *shardConn) lookupCoordinator(id distributedtxn.ID) *ShardResponse {
 	}
 	response := transactionStatusResponse(status)
 	response.Transaction.Record = record
+	if _, manifestErr := c.server.journal.ManifestCoordinator(id); manifestErr == nil {
+		response.Transaction.RecordKind = TransactionRecordManifestCoordinator
+	} else if errors.Is(manifestErr, distributedtxn.ErrJournalNotFound) {
+		response.Transaction.RecordKind = TransactionRecordInlineCoordinator
+	} else {
+		return transactionError(manifestErr)
+	}
 	return response
 }
 
@@ -983,6 +998,13 @@ func (c *shardConn) scanCoordinator(after distributedtxn.ID) *ShardResponse {
 	}
 	response := transactionStatusResponse(status)
 	response.Transaction.Record = record
+	if _, manifestErr := c.server.journal.ManifestCoordinator(status.ID); manifestErr == nil {
+		response.Transaction.RecordKind = TransactionRecordManifestCoordinator
+	} else if errors.Is(manifestErr, distributedtxn.ErrJournalNotFound) {
+		response.Transaction.RecordKind = TransactionRecordInlineCoordinator
+	} else {
+		return transactionError(manifestErr)
+	}
 	return response
 }
 
@@ -1027,7 +1049,123 @@ func (c *shardConn) readParticipant(id distributedtxn.ID) *ShardResponse {
 		return transactionError(err)
 	}
 	response.Transaction.Record = record
+	response.Transaction.RecordKind = TransactionRecordParticipant
 	return response
+}
+
+func (c *shardConn) stageManifestSegment(req *ShardRequest) *ShardResponse {
+	tx := req.Transaction
+	if tx.manifestMeta == nil || !tx.manifestMeta.valid {
+		meta, err := inspectTransactionManifestSegment(tx.ManifestSegment)
+		if err != nil {
+			return transactionError(err)
+		}
+		tx.manifestMeta = &meta
+	}
+	if tx.manifestMeta.index == 0 {
+		return transactionError(distributedtxn.ErrJournalConflict)
+	}
+	scratch := borrowTransactionManifestScratch()
+	defer releaseTransactionManifestScratch(scratch)
+	if _, err := c.server.journal.StageManifestSegment(
+		tx.ID, tx.ManifestSegment, scratch.participants[:], scratch.identities[:],
+	); err != nil {
+		return transactionError(err)
+	}
+	status, ok := c.server.journal.CoordinatorStatus(tx.ID)
+	if !ok {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) stageManifestCoordinator(req *ShardRequest) *ShardResponse {
+	tx := req.Transaction
+	record, err := distributedtxn.OpenManifestCoordinator(tx.Record)
+	if err != nil {
+		return transactionError(err)
+	}
+	if tx.manifestMeta == nil || !tx.manifestMeta.valid {
+		meta, inspectErr := inspectTransactionManifestFirstSegment(
+			tx.ManifestSegment, record.Manifest)
+		if inspectErr != nil {
+			return transactionError(inspectErr)
+		}
+		tx.manifestMeta = &meta
+	}
+	meta := *tx.manifestMeta
+	if !vibejson.BytesEqualString(meta.distribution[:meta.distributionLen], string(req.Distribution)) ||
+		!vibejson.BytesEqualString(meta.shard[:meta.shardLen], string(req.Shard)) ||
+		meta.routingVersion != uint64(req.RoutingVersion) ||
+		meta.allocation != uint64(req.AllocationGeneration) ||
+		meta.ownershipEpoch != uint64(req.OwnershipEpoch) {
+		return transactionError(distributedtxn.ErrJournalConflict)
+	}
+	// Both records were fully authenticated above. The two fsyncs intentionally
+	// leave a restart-safe incomplete staging coordinator if page-zero durability
+	// has an outcome-unknown failure; exact retries converge through the journal.
+	status, err := c.server.journal.StageManifestCoordinator(tx.Record)
+	if err != nil {
+		return transactionError(err)
+	}
+	scratch := borrowTransactionManifestScratch()
+	defer releaseTransactionManifestScratch(scratch)
+	if status.CoordinatorState != distributedtxn.CoordinatorStaging {
+		page, pageErr := c.server.journal.ManifestPage(
+			record.ID, 0, scratch.participants[:], scratch.identities[:])
+		if pageErr == nil {
+			if !bytes.Equal(page.Segment.Raw, tx.ManifestSegment) {
+				return transactionError(distributedtxn.ErrJournalConflict)
+			}
+			return transactionStatusResponse(status)
+		}
+		// An incomplete segmented coordinator may be aborted before page zero is
+		// durable. That terminal exact-stage retry converges to the abort; a
+		// committed coordinator can never be missing its descriptor-bound page.
+		if errors.Is(pageErr, distributedtxn.ErrJournalNotFound) &&
+			status.CoordinatorState != distributedtxn.CoordinatorCommitted {
+			return transactionStatusResponse(status)
+		}
+		return transactionError(pageErr)
+	}
+	if _, err = c.server.journal.StageManifestSegment(
+		record.ID, tx.ManifestSegment, scratch.participants[:], scratch.identities[:],
+	); err != nil {
+		return transactionError(err)
+	}
+	return transactionStatusResponse(status)
+}
+
+func (c *shardConn) readManifestSegment(id distributedtxn.ID, index uint32) *ShardResponse {
+	status, ok := c.server.journal.CoordinatorStatus(id)
+	if !ok {
+		return transactionError(distributedtxn.ErrJournalNotFound)
+	}
+	scratch := borrowTransactionManifestScratch()
+	defer releaseTransactionManifestScratch(scratch)
+	page, err := c.server.journal.ManifestPage(
+		id, index, scratch.participants[:], scratch.identities[:])
+	if err != nil {
+		return transactionError(err)
+	}
+	response := transactionStatusResponse(status)
+	response.Transaction.RecordKind = TransactionRecordManifestSegment
+	response.Transaction.SegmentIndex = page.Segment.Index
+	response.Transaction.Record = page.Segment.Raw
+	return response
+}
+
+func (c *shardConn) transitionCoordinator(
+	id distributedtxn.ID,
+	expected uint64,
+	next distributedtxn.CoordinatorState,
+) (distributedtxn.Status, error) {
+	if _, err := c.server.journal.ManifestCoordinator(id); err == nil {
+		return c.server.journal.SealManifestCoordinator(id, expected, next)
+	} else if !errors.Is(err, distributedtxn.ErrJournalNotFound) {
+		return distributedtxn.Status{}, err
+	}
+	return c.server.journal.TransitionCoordinator(id, expected, next)
 }
 
 func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {

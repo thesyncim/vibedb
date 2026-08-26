@@ -9,12 +9,14 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 const transactionInitialRevision = 1
@@ -25,9 +27,12 @@ var (
 	// ErrBatchClassMismatch reports a batch whose statements request different
 	// operational deadline/concurrency profiles.
 	ErrBatchClassMismatch = errors.New("gateway: atomic write batch mixes operation classes")
-	// ErrTransactionParticipantLimit reports a batch spanning more durable
-	// participants than the bounded transaction record permits.
-	ErrTransactionParticipantLimit = errors.New("gateway: distributed transaction exceeds the participant limit")
+	// ErrTransactionMutationLimit reports an atomic write whose exact mutation
+	// count exceeds its operational profile before any participant is staged.
+	ErrTransactionMutationLimit = errors.New("gateway: distributed transaction exceeds the mutation bound")
+	// ErrTransactionByteLimit reports an atomic write whose canonical mutation
+	// bytes exceed its operational profile before any participant is staged.
+	ErrTransactionByteLimit = errors.New("gateway: distributed transaction exceeds the byte bound")
 	// ErrTransactionCommitted reports a durably committed decision whose apply
 	// or release cleanup did not finish before this request returned.
 	ErrTransactionCommitted = errors.New("gateway: distributed transaction is committed and requires recovery")
@@ -99,6 +104,9 @@ func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, err
 		}
 	}
 	profile := e.profileFor(class)
+	if uint64(len(queries)) > profile.MaxTransactionMutations {
+		return nil, ErrTransactionMutationLimit
+	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	snapshot, lease, err := e.pin(opctx, 0, 0)
@@ -116,9 +124,6 @@ func (e *Executor) ExecBatch(ctx context.Context, queries []Query) (*Result, err
 			Generation: snapshot.Generation(),
 		}, nil
 	}
-	if len(participants) > distributedtxn.MaxParticipants {
-		return nil, ErrTransactionParticipantLimit
-	}
 	return e.executeTransaction(opctx, snapshot, participants, profile)
 }
 
@@ -128,7 +133,13 @@ func (e *Executor) planTransaction(
 	queries []Query,
 	profile Profile,
 ) ([]transactionParticipant, error) {
-	participants := make([]transactionParticipant, 0, min(len(queries), distributedtxn.MaxParticipants))
+	capacity := transactionParticipantCapacity(snapshot, len(queries), profile)
+	participants := make([]transactionParticipant, 0, capacity)
+	// Preserve the allocation-minimal inline lane: at most 64 statements use
+	// the original tiny linear grouping. Potentially wide plans promote lazily
+	// only after they prove they contain enough distinct targets.
+	var participantIndex map[transactionTargetKey]int
+	budget := transactionPlanBudget{profile: profile}
 	for i := range queries {
 		query := &queries[i]
 		args, err := queryRuntimeArgs(query.Params)
@@ -165,15 +176,130 @@ func (e *Executor) planTransaction(
 				return nil, err
 			}
 		}
-		participants, err = appendBoundWriteParticipants(
-			participants, *call, query, bound, profile,
+		participants, err = appendBoundWriteParticipantsBudgeted(
+			participants, participantIndex, *call, query, bound, profile, &budget,
 		)
 		if err != nil {
 			return nil, err
 		}
+		if participantIndex == nil && len(queries) > distributedtxn.MaxInlineParticipants &&
+			len(participants) >= 16 {
+			participantIndex = make(map[transactionTargetKey]int, max(capacity, len(participants)))
+			for participant := range participants {
+				participantIndex[transactionKey(participants[participant].call.req)] = participant
+			}
+		}
 	}
 	sortTransactionParticipants(participants)
 	return participants, nil
+}
+
+// transactionParticipantCapacity keeps the common inline lane compact even
+// when a caller supplies a huge same-shard batch. It is only an allocation
+// hint: the participant slice and exact-key index still grow for wide catalogs.
+func transactionParticipantCapacity(snapshot *Snapshot, queries int, profile Profile) int {
+	if queries <= 0 {
+		return 0
+	}
+	capacity := min(queries, 8)
+	if profile.MaxTransactionMutations < uint64(capacity) {
+		capacity = int(profile.MaxTransactionMutations)
+	}
+	if snapshot == nil {
+		return max(1, capacity)
+	}
+	targets := 0
+	for _, manifest := range snapshot.config.Manifests {
+		if manifest != nil {
+			targets += manifest.ShardCount()
+		}
+	}
+	if targets != 0 {
+		capacity = min(capacity, targets)
+	}
+	return max(1, capacity)
+}
+
+type transactionPlanBudget struct {
+	profile   Profile
+	mutations uint64
+	bytes     uint64
+}
+
+func (b *transactionPlanBudget) admit(statement *shardservice.MutationStatement, newParticipant bool) error {
+	if b == nil {
+		return nil
+	}
+	if b.mutations >= b.profile.MaxTransactionMutations {
+		return ErrTransactionMutationLimit
+	}
+	encoded, ok := transactionStatementBytes(statement)
+	if !ok {
+		// The canonical encoder remains the semantic validator. Overflow is
+		// necessarily beyond every supported transaction byte profile.
+		return ErrTransactionByteLimit
+	}
+	if newParticipant {
+		encoded += 8 // canonical VMB1 header, once per participant
+	}
+	if b.bytes > b.profile.MaxTransactionBytes ||
+		encoded > b.profile.MaxTransactionBytes-b.bytes {
+		return ErrTransactionByteLimit
+	}
+	b.mutations++
+	b.bytes += encoded
+	return nil
+}
+
+// transactionStatementBytes returns the exact number of bytes contributed by
+// one statement to AppendMutationBatch, excluding its one-per-participant
+// header. It performs checked arithmetic only; the encoder still validates the
+// statement fields once after planning.
+func transactionStatementBytes(statement *shardservice.MutationStatement) (uint64, bool) {
+	add := func(total *uint64, value int) bool {
+		if value < 0 || uint64(value) > math.MaxUint64-*total {
+			return false
+		}
+		*total += uint64(value)
+		return true
+	}
+	var total uint64
+	switch statement.Kind {
+	case shardservice.MutationSQL:
+		if !add(&total, 8+len(statement.SQL)) {
+			return 0, false
+		}
+		for i := range statement.Params {
+			param := &statement.Params[i]
+			if !add(&total, 1) {
+				return 0, false
+			}
+			switch param.Kind {
+			case shardservice.ParamBool:
+				if !add(&total, 1) {
+					return 0, false
+				}
+			case shardservice.ParamNumber, shardservice.ParamString, shardservice.ParamDocument:
+				if !add(&total, 4+len(param.Bytes)) {
+					return 0, false
+				}
+			}
+		}
+	case shardservice.MutationPrimaryPrecondition, shardservice.MutationPrimaryCheck:
+		if !add(&total, 20+len(statement.Relation)+len(statement.PrimaryPath)) {
+			return 0, false
+		}
+		for i := range statement.ExpectedKeys {
+			if !add(&total, 4+len(statement.ExpectedKeys[i])+32) {
+				return 0, false
+			}
+		}
+	default:
+		if !add(&total, 36+len(statement.Relation)+len(statement.EntryKey)+len(statement.Value)) {
+			return 0, false
+		}
+	}
+	return total, true
 }
 
 func rejectReplicatedGlobalIndexSQLTargets(
@@ -201,23 +327,48 @@ func appendBoundWriteParticipants(
 	bound *BoundWritePlan,
 	profile Profile,
 ) ([]transactionParticipant, error) {
+	return appendBoundWriteParticipantsIndexed(participants, nil, baseCall, query, bound, profile)
+}
+
+func appendBoundWriteParticipantsIndexed(
+	participants []transactionParticipant,
+	participantIndex map[transactionTargetKey]int,
+	baseCall shardCall,
+	query *Query,
+	bound *BoundWritePlan,
+	profile Profile,
+) ([]transactionParticipant, error) {
+	return appendBoundWriteParticipantsBudgeted(
+		participants, participantIndex, baseCall, query, bound, profile, nil,
+	)
+}
+
+func appendBoundWriteParticipantsBudgeted(
+	participants []transactionParticipant,
+	participantIndex map[transactionTargetKey]int,
+	baseCall shardCall,
+	query *Query,
+	bound *BoundWritePlan,
+	profile Profile,
+	budget *transactionPlanBudget,
+) ([]transactionParticipant, error) {
 	var err error
 	if len(bound.primaryPath) != 0 {
-		participants, err = appendTransactionStatement(
-			participants, baseCall,
+		participants, err = appendTransactionStatementBudgeted(
+			participants, participantIndex, baseCall,
 			shardservice.MutationStatement{
 				Kind:     shardservice.MutationPrimaryPrecondition,
 				Relation: bound.table, PrimaryPath: bound.primaryPath,
 				ExpectedKeys: bound.expectedKeys, ExpectedDigests: bound.expectedDigests,
-			},
+			}, budget,
 		)
 		if err != nil {
 			return nil, err
 		}
 	}
-	participants, err = appendTransactionStatement(
-		participants, baseCall,
-		shardservice.MutationStatement{SQL: query.SQL, Params: query.Params},
+	participants, err = appendTransactionStatementBudgeted(
+		participants, participantIndex, baseCall,
+		shardservice.MutationStatement{SQL: query.SQL, Params: query.Params}, budget,
 	)
 	if err != nil {
 		return nil, err
@@ -240,8 +391,8 @@ func appendBoundWriteParticipants(
 		}
 		entryKey := bound.globalIndexArena[index.entryStart:index.entryEnd]
 		value := bound.globalIndexArena[index.valueStart:index.valueEnd]
-		participants, err = appendTransactionStatement(
-			participants, call, shardservice.MutationStatement{
+		participants, err = appendTransactionStatementBudgeted(
+			participants, participantIndex, call, shardservice.MutationStatement{
 				Kind:     index.kind,
 				Relation: index.metadata.Relation,
 				IndexID:  index.metadata.IndexID, Incarnation: index.metadata.Incarnation,
@@ -249,7 +400,7 @@ func appendBoundWriteParticipants(
 				LocatorCount: index.metadata.LocatorCount,
 				Unique: index.kind == shardservice.MutationGlobalIndexPut &&
 					index.metadata.Flags&IndexUnique != 0,
-			},
+			}, budget,
 		)
 		if err != nil {
 			return nil, err
@@ -263,12 +414,62 @@ func appendTransactionStatement(
 	call shardCall,
 	statement shardservice.MutationStatement,
 ) ([]transactionParticipant, error) {
+	return appendTransactionStatementIndexed(participants, nil, call, statement)
+}
+
+type transactionTargetKey struct {
+	distribution         distribution.DistributionName
+	shard                distribution.ShardID
+	routingVersion       distribution.RoutingVersion
+	allocationGeneration distribution.ShardAllocationGeneration
+	ownershipEpoch       distribution.OwnershipEpoch
+}
+
+func transactionKey(request *shardservice.ShardRequest) transactionTargetKey {
+	return transactionTargetKey{
+		distribution: request.Distribution, shard: request.Shard,
+		routingVersion:       request.RoutingVersion,
+		allocationGeneration: request.AllocationGeneration,
+		ownershipEpoch:       request.OwnershipEpoch,
+	}
+}
+
+func appendTransactionStatementIndexed(
+	participants []transactionParticipant,
+	byTarget map[transactionTargetKey]int,
+	call shardCall,
+	statement shardservice.MutationStatement,
+) ([]transactionParticipant, error) {
+	return appendTransactionStatementBudgeted(participants, byTarget, call, statement, nil)
+}
+
+func appendTransactionStatementBudgeted(
+	participants []transactionParticipant,
+	byTarget map[transactionTargetKey]int,
+	call shardCall,
+	statement shardservice.MutationStatement,
+	budget *transactionPlanBudget,
+) ([]transactionParticipant, error) {
 	participantIndex := -1
-	for i := range participants {
-		if sameTransactionTarget(participants[i].call.req, call.req) {
-			participantIndex = i
-			break
+	key := transactionKey(call.req)
+	if byTarget != nil {
+		if found, ok := byTarget[key]; ok {
+			participantIndex = found
 		}
+	} else {
+		for i := range participants {
+			if sameTransactionTarget(participants[i].call.req, call.req) {
+				participantIndex = i
+				break
+			}
+		}
+	}
+	newParticipant := participantIndex < 0
+	if !newParticipant && len(participants[participantIndex].statements) >= shardservice.MaxMutationStatements {
+		return participants, ErrTransactionMutationLimit
+	}
+	if err := budget.admit(&statement, newParticipant); err != nil {
+		return participants, err
 	}
 	if participantIndex < 0 {
 		participants = append(participants, transactionParticipant{
@@ -276,8 +477,8 @@ func appendTransactionStatement(
 			scopes: call.req.AccessScopes,
 		})
 		participantIndex = len(participants) - 1
-		if len(participants) > distributedtxn.MaxParticipants {
-			return nil, ErrTransactionParticipantLimit
+		if byTarget != nil {
+			byTarget[key] = participantIndex
 		}
 	}
 	participant := &participants[participantIndex]
@@ -342,54 +543,78 @@ func (e *Executor) executeTransaction(
 	}
 	coordinator := &participants[0]
 	refs := make([]distributedtxn.ParticipantRef, len(participants))
+	var mutationCount, mutationBytes uint64
 	for i := range participants {
 		participant := &participants[i]
+		statements := uint64(len(participant.statements))
+		if profile.MaxTransactionMutations == 0 ||
+			mutationCount > profile.MaxTransactionMutations ||
+			statements > profile.MaxTransactionMutations-mutationCount {
+			return nil, ErrTransactionMutationLimit
+		}
+		mutationCount += statements
 		participant.mutation, err = shardservice.AppendMutationBatch(nil, participant.statements)
 		if err != nil {
 			return nil, err
 		}
+		encodedBytes := uint64(len(participant.mutation))
+		if profile.MaxTransactionBytes == 0 || mutationBytes > profile.MaxTransactionBytes ||
+			encodedBytes > profile.MaxTransactionBytes-mutationBytes {
+			return nil, ErrTransactionByteLimit
+		}
+		mutationBytes += encodedBytes
 		participant.digest = distributedtxn.ParticipantDigest(
 			participant.bucketBits, participant.scopes, participant.mutation,
 		)
 		request := participant.call.req
 		refs[i] = distributedtxn.ParticipantRef{
-			Distribution: []byte(request.Distribution), Shard: []byte(request.Shard),
+			// The route strings are retained by participants through both immediate
+			// coordinator passes; byteview avoids two identity allocations per shard.
+			Distribution:         byteview.Bytes(string(request.Distribution)),
+			Shard:                byteview.Bytes(string(request.Shard)),
 			RoutingVersion:       uint64(request.RoutingVersion),
 			AllocationGeneration: uint64(request.AllocationGeneration),
 			OwnershipEpoch:       uint64(request.OwnershipEpoch), MutationDigest: participant.digest,
 			State: distributedtxn.ParticipantStaged,
 		}
 	}
-	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+	coordinatorRecord := distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: transactionInitialRevision,
 		CatalogGeneration: snapshot.Generation(),
 		RecoveryDeadline:  time.Now().Add(profile.GlobalDeadline).UnixNano(),
 		Participants:      refs,
-	})
-	if err != nil {
-		return nil, err
 	}
-	coordinatorRequest := transactionRequest(
-		coordinator.call.req, profile, shardservice.TransactionStageCoordinator,
-		id, 0, coordinatorRecord,
-	)
-	if _, err := e.transactionRoundTrip(ctx, coordinator.call.address, coordinatorRequest, profile); err != nil {
+	stager := gatewayCoordinatorStager{
+		executor: e, ctx: ctx, coordinator: coordinator, profile: profile,
+	}
+	if _, err := stageTransactionCoordinator(coordinatorRecord, &stager); err != nil {
+		// A lost begin response is outcome-unknown until lookup proves whether
+		// the coordinator exists. Do not introduce a new abort write merely to
+		// discover whether the begin itself crossed durability.
 		lookup := transactionRequest(
-			coordinator.call.req, profile, shardservice.TransactionLookupCoordinator, id, 0, nil,
+			coordinator.call.req, profile, shardservice.TransactionLookupCoordinator,
+			id, 0, nil,
 		)
 		response, lookupErr := e.transactionRoundTrip(ctx, coordinator.call.address, lookup, profile)
 		if errors.Is(lookupErr, ErrTransactionNotFound) {
 			return nil, err
 		}
-		if lookupErr != nil || response.Transaction.CoordinatorState != distributedtxn.CoordinatorStaging {
+		if lookupErr != nil {
 			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, lookupErr)}
 		}
-		abort := transactionRequest(
-			coordinator.call.req, profile, shardservice.TransactionAbortCoordinator,
-			id, response.Transaction.Revision, nil,
-		)
-		if _, abortErr := e.transactionRoundTrip(ctx, coordinator.call.address, abort, profile); abortErr != nil {
-			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, abortErr)}
+		state, stateErr := coordinatorReplyState(response, id)
+		if stateErr != nil {
+			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, stateErr)}
+		}
+		if state == distributedtxn.CoordinatorCommitted {
+			return nil, &CommittedTransactionError{ID: id, Cause: err}
+		}
+		if state != distributedtxn.CoordinatorStaging && state != distributedtxn.CoordinatorAborted {
+			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, ErrTransactionConflict)}
+		}
+		abortErr := e.abortCoordinator(ctx, id, coordinator, profile)
+		if abortErr != nil {
+			return nil, transactionAbortFailure(id, err, abortErr)
 		}
 		return nil, err
 	}
@@ -400,8 +625,8 @@ func (e *Executor) executeTransaction(
 			RoutingVersion:            uint64(participant.call.req.RoutingVersion),
 			AllocationGeneration:      uint64(participant.call.req.AllocationGeneration),
 			OwnershipEpoch:            uint64(participant.call.req.OwnershipEpoch),
-			CoordinatorDistribution:   []byte(coordinator.call.req.Distribution),
-			CoordinatorShard:          []byte(coordinator.call.req.Shard),
+			CoordinatorDistribution:   byteview.Bytes(string(coordinator.call.req.Distribution)),
+			CoordinatorShard:          byteview.Bytes(string(coordinator.call.req.Shard)),
 			CoordinatorAllocation:     uint64(coordinator.call.req.AllocationGeneration),
 			CoordinatorRoutingVersion: uint64(coordinator.call.req.RoutingVersion),
 			CoordinatorOwnershipEpoch: uint64(coordinator.call.req.OwnershipEpoch),
@@ -411,25 +636,25 @@ func (e *Executor) executeTransaction(
 		if err != nil {
 			abortErr := e.abortTransaction(ctx, id, coordinator, participants, profile)
 			if abortErr != nil {
-				return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, abortErr)}
+				return nil, transactionAbortFailure(id, err, abortErr)
 			}
 			return nil, err
 		}
 	}
-	if _, err := e.participantPhase(ctx, id, participants, profile, shardservice.TransactionStageParticipant, 0); err != nil {
+	if err := e.participantCompletionPhase(ctx, id, participants, profile, shardservice.TransactionStageParticipant, 0); err != nil {
 		abortErr := e.abortTransaction(ctx, id, coordinator, participants, profile)
 		if abortErr != nil {
-			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, abortErr)}
+			return nil, transactionAbortFailure(id, err, abortErr)
 		}
 		return nil, err
 	}
-	if _, err := e.participantPhase(
+	if err := e.participantCompletionPhase(
 		ctx, id, participants, profile, shardservice.TransactionPrepareParticipant,
 		transactionInitialRevision,
 	); err != nil {
 		abortErr := e.abortTransaction(ctx, id, coordinator, participants, profile)
 		if abortErr != nil {
-			return nil, &TransactionOutcomeUnknownError{ID: id, Cause: errors.Join(err, abortErr)}
+			return nil, transactionAbortFailure(id, err, abortErr)
 		}
 		return nil, err
 	}
@@ -441,22 +666,14 @@ func (e *Executor) executeTransaction(
 		}
 		return nil, err
 	}
-	responses, applyErr := e.participantPhase(
+	affected, applyErr := e.participantApplyPhase(
 		ctx, id, participants, profile, shardservice.TransactionApplyParticipant,
 		transactionInitialRevision+1,
 	)
 	if applyErr != nil {
 		return nil, &CommittedTransactionError{ID: id, Cause: applyErr}
 	}
-	var affected int64
-	for i := range responses {
-		if responses[i] == nil || responses[i].RowsAffected < 0 ||
-			responses[i].RowsAffected > math.MaxInt64-affected {
-			return nil, &CommittedTransactionError{ID: id, Cause: ErrTransactionConflict}
-		}
-		affected += responses[i].RowsAffected
-	}
-	if _, releaseErr := e.participantPhase(
+	if releaseErr := e.participantCompletionPhase(
 		ctx, id, participants, profile, shardservice.TransactionReleaseParticipant,
 		transactionInitialRevision+2,
 	); releaseErr != nil {
@@ -501,10 +718,15 @@ func transactionRequest(
 	record []byte,
 ) *shardservice.ShardRequest {
 	transaction := shardservice.TransactionRequest{Operation: operation}
-	if operation == shardservice.TransactionStageCoordinator ||
-		operation == shardservice.TransactionStageParticipant {
+	switch operation {
+	case shardservice.TransactionStageCoordinator,
+		shardservice.TransactionStageParticipant,
+		shardservice.TransactionStageManifestCoordinator:
 		transaction.Record = record
-	} else {
+	case shardservice.TransactionStageManifestSegment:
+		transaction.ID = id
+		transaction.ManifestSegment = record
+	default:
 		transaction.ID = id
 		transaction.Revision = revision
 	}
@@ -538,6 +760,11 @@ func (e *Executor) participantPhase(
 	operation shardservice.TransactionOperation,
 	revision uint64,
 ) ([]*shardservice.ShardResponse, error) {
+	if operation != shardservice.TransactionApplyParticipant {
+		return nil, e.participantCompletionPhase(
+			ctx, id, participants, profile, operation, revision,
+		)
+	}
 	responses := make([]*shardservice.ShardResponse, len(participants))
 	errs := make([]error, len(participants))
 	jobs := make(chan int)
@@ -570,6 +797,103 @@ func (e *Executor) participantPhase(
 	close(jobs)
 	wait.Wait()
 	return responses, errors.Join(errs...)
+}
+
+type transactionPhaseResult struct {
+	response *shardservice.ShardResponse
+	err      error
+}
+
+// visitParticipantPhase retains only a worker-sized result window. Wide
+// transactions therefore do not allocate response and error slices merely to
+// learn that a completion phase succeeded or to sum applied rows.
+func (e *Executor) visitParticipantPhase(
+	ctx context.Context,
+	id distributedtxn.ID,
+	participants []transactionParticipant,
+	profile Profile,
+	operation shardservice.TransactionOperation,
+	revision uint64,
+	visit func(*shardservice.ShardResponse) error,
+) error {
+	if len(participants) == 0 {
+		return nil
+	}
+	workers := min(max(1, profile.MaxConcurrency), len(participants))
+	results := make(chan transactionPhaseResult, workers)
+	var next atomic.Uint64
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Go(func() {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(participants) {
+					return
+				}
+				participant := &participants[i]
+				var record []byte
+				if operation == shardservice.TransactionStageParticipant {
+					record = participant.record
+				}
+				request := transactionRequest(
+					participant.call.req, profile, operation, id, revision, record,
+				)
+				response, err := e.transactionRoundTrip(
+					ctx, participant.call.address, request, profile,
+				)
+				results <- transactionPhaseResult{response: response, err: err}
+			}
+		})
+	}
+	var firstErr error
+	for range participants {
+		result := <-results
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		if visit != nil {
+			if err := visit(result.response); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	wait.Wait()
+	return firstErr
+}
+
+func (e *Executor) participantCompletionPhase(
+	ctx context.Context,
+	id distributedtxn.ID,
+	participants []transactionParticipant,
+	profile Profile,
+	operation shardservice.TransactionOperation,
+	revision uint64,
+) error {
+	return e.visitParticipantPhase(ctx, id, participants, profile, operation, revision, nil)
+}
+
+func (e *Executor) participantApplyPhase(
+	ctx context.Context,
+	id distributedtxn.ID,
+	participants []transactionParticipant,
+	profile Profile,
+	operation shardservice.TransactionOperation,
+	revision uint64,
+) (int64, error) {
+	var affected int64
+	err := e.visitParticipantPhase(ctx, id, participants, profile, operation, revision,
+		func(response *shardservice.ShardResponse) error {
+			if response == nil || response.RowsAffected < 0 ||
+				response.RowsAffected > math.MaxInt64-affected {
+				return ErrTransactionConflict
+			}
+			affected += response.RowsAffected
+			return nil
+		})
+	return affected, err
 }
 
 func (e *Executor) commitCoordinator(
@@ -609,6 +933,94 @@ func (e *Executor) commitCoordinator(
 	}
 }
 
+func transactionAbortFailure(id distributedtxn.ID, cause, abortErr error) error {
+	joined := errors.Join(cause, abortErr)
+	if errors.Is(abortErr, ErrTransactionCommitted) {
+		return &CommittedTransactionError{ID: id, Cause: joined}
+	}
+	if errors.Is(abortErr, ErrCommitOutcomeUnknown) ||
+		errors.Is(abortErr, ErrTransactionNotFound) {
+		return &TransactionOutcomeUnknownError{ID: id, Cause: joined}
+	}
+	// The abort decision is already durable. Participant tombstone cleanup may
+	// still need recovery, but the transaction outcome itself is not unknown.
+	return joined
+}
+
+// abortCoordinator first wins or resolves the only durable decision. Callers
+// must not mutate participant state until this returns nil. A lost race to
+// commit is reported as a known committed outcome; an unresolvable response is
+// outcome-unknown and leaves every participant untouched.
+func (e *Executor) abortCoordinator(
+	ctx context.Context,
+	id distributedtxn.ID,
+	coordinator *transactionParticipant,
+	profile Profile,
+) error {
+	expected := uint64(transactionInitialRevision)
+	var priorErr error
+	for range 2 {
+		abort := transactionRequest(
+			coordinator.call.req, profile, shardservice.TransactionAbortCoordinator,
+			id, expected, nil,
+		)
+		response, err := e.transactionRoundTrip(ctx, coordinator.call.address, abort, profile)
+		if err == nil {
+			state, stateErr := coordinatorReplyState(response, id)
+			switch state {
+			case distributedtxn.CoordinatorAborted:
+				return nil
+			case distributedtxn.CoordinatorCommitted:
+				return ErrTransactionCommitted
+			}
+			priorErr = errors.Join(priorErr, stateErr, ErrTransactionConflict)
+		} else {
+			priorErr = errors.Join(priorErr, err)
+		}
+
+		lookup := transactionRequest(
+			coordinator.call.req, profile, shardservice.TransactionLookupCoordinator,
+			id, 0, nil,
+		)
+		response, lookupErr := e.transactionRoundTrip(ctx, coordinator.call.address, lookup, profile)
+		if lookupErr != nil {
+			if errors.Is(lookupErr, ErrTransactionNotFound) {
+				return ErrTransactionNotFound
+			}
+			return errors.Join(ErrCommitOutcomeUnknown, priorErr, lookupErr)
+		}
+		state, stateErr := coordinatorReplyState(response, id)
+		if stateErr != nil {
+			return errors.Join(ErrCommitOutcomeUnknown, priorErr, stateErr)
+		}
+		switch state {
+		case distributedtxn.CoordinatorAborted:
+			return nil
+		case distributedtxn.CoordinatorCommitted:
+			return ErrTransactionCommitted
+		case distributedtxn.CoordinatorStaging:
+			expected = response.Transaction.Revision
+			continue
+		default:
+			// Retired does not retain whether commit or abort won, so it is a
+			// resolved terminal state but not a safe license to mutate participants.
+			return errors.Join(ErrCommitOutcomeUnknown, priorErr, ErrTransactionConflict)
+		}
+	}
+	return errors.Join(ErrCommitOutcomeUnknown, priorErr)
+}
+
+func coordinatorReplyState(
+	response *shardservice.ShardResponse,
+	id distributedtxn.ID,
+) (distributedtxn.CoordinatorState, error) {
+	if response == nil || response.Transaction.Role != shardservice.TransactionRoleCoordinator ||
+		response.Transaction.ID != id {
+		return 0, ErrTransactionConflict
+	}
+	return response.Transaction.CoordinatorState, nil
+}
+
 func (e *Executor) abortTransaction(
 	ctx context.Context,
 	id distributedtxn.ID,
@@ -616,46 +1028,72 @@ func (e *Executor) abortTransaction(
 	participants []transactionParticipant,
 	profile Profile,
 ) error {
-	participantErrors := make([]error, len(participants))
-	for i := range participants {
-		participant := &participants[i]
-		lookup := transactionRequest(
-			participant.call.req, profile, shardservice.TransactionLookupParticipant,
-			id, 0, nil,
-		)
-		response, err := e.transactionRoundTrip(ctx, participant.call.address, lookup, profile)
-		if errors.Is(err, ErrTransactionNotFound) {
-			abort := transactionRequest(
-				participant.call.req, profile, shardservice.TransactionAbortParticipant,
-				id, transactionInitialRevision, nil,
-			)
-			_, participantErrors[i] = e.transactionRoundTrip(
-				ctx, participant.call.address, abort, profile,
-			)
-			continue
+	if err := e.abortCoordinator(ctx, id, coordinator, profile); err != nil {
+		return err
+	}
+	if len(participants) == 0 {
+		return nil
+	}
+	workers := min(max(1, profile.MaxConcurrency), len(participants))
+	results := make(chan error, workers)
+	var next atomic.Uint64
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Go(func() {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(participants) {
+					return
+				}
+				results <- e.abortTransactionParticipant(ctx, id, &participants[i], profile)
+			}
+		})
+	}
+	var firstErr error
+	for range participants {
+		if err := <-results; err != nil && firstErr == nil {
+			firstErr = err
 		}
-		if err != nil {
-			participantErrors[i] = err
-			continue
-		}
-		state := response.Transaction.ParticipantState
-		if state == distributedtxn.ParticipantAborted || state == distributedtxn.ParticipantReleased {
-			continue
-		}
-		if state != distributedtxn.ParticipantStaged && state != distributedtxn.ParticipantPrepared {
-			participantErrors[i] = ErrTransactionConflict
-			continue
-		}
+	}
+	wait.Wait()
+	return firstErr
+}
+
+func (e *Executor) abortTransactionParticipant(
+	ctx context.Context,
+	id distributedtxn.ID,
+	participant *transactionParticipant,
+	profile Profile,
+) error {
+	lookup := transactionRequest(
+		participant.call.req, profile, shardservice.TransactionLookupParticipant,
+		id, 0, nil,
+	)
+	response, err := e.transactionRoundTrip(ctx, participant.call.address, lookup, profile)
+	if errors.Is(err, ErrTransactionNotFound) {
 		abort := transactionRequest(
 			participant.call.req, profile, shardservice.TransactionAbortParticipant,
-			id, response.Transaction.Revision, nil,
+			id, transactionInitialRevision, nil,
 		)
-		_, participantErrors[i] = e.transactionRoundTrip(ctx, participant.call.address, abort, profile)
+		_, err = e.transactionRoundTrip(
+			ctx, participant.call.address, abort, profile,
+		)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	state := response.Transaction.ParticipantState
+	if state == distributedtxn.ParticipantAborted || state == distributedtxn.ParticipantReleased {
+		return nil
+	}
+	if state != distributedtxn.ParticipantStaged && state != distributedtxn.ParticipantPrepared {
+		return ErrTransactionConflict
 	}
 	abort := transactionRequest(
-		coordinator.call.req, profile, shardservice.TransactionAbortCoordinator,
-		id, transactionInitialRevision, nil,
+		participant.call.req, profile, shardservice.TransactionAbortParticipant,
+		id, response.Transaction.Revision, nil,
 	)
-	_, coordinatorErr := e.transactionRoundTrip(ctx, coordinator.call.address, abort, profile)
-	return errors.Join(errors.Join(participantErrors...), coordinatorErr)
+	_, err = e.transactionRoundTrip(ctx, participant.call.address, abort, profile)
+	return err
 }

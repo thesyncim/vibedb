@@ -51,14 +51,33 @@ const (
 	TransactionReadParticipant
 	TransactionAcquireReadFence
 	TransactionReleaseReadFence
+	// TransactionStageManifestCoordinator begins a descriptor-bound segmented
+	// coordinator from one fixed-size VTCM record. TransactionStageManifestSegment
+	// then appends canonical VTM1 pages in order. TransactionReadManifestSegment
+	// returns one page without materializing the aggregate participant set.
+	TransactionStageManifestCoordinator
+	TransactionStageManifestSegment
+	TransactionReadManifestSegment
 )
 
 func (op TransactionOperation) valid() bool {
-	return op >= TransactionStageCoordinator && op <= TransactionReleaseReadFence
+	return op >= TransactionStageCoordinator && op <= TransactionReadManifestSegment
 }
 
 func (op TransactionOperation) stages() bool {
 	return op == TransactionStageCoordinator || op == TransactionStageParticipant
+}
+
+func (op TransactionOperation) stagesManifestCoordinator() bool {
+	return op == TransactionStageManifestCoordinator
+}
+
+func (op TransactionOperation) stagesManifestSegment() bool {
+	return op == TransactionStageManifestSegment
+}
+
+func (op TransactionOperation) readsManifestSegment() bool {
+	return op == TransactionReadManifestSegment
 }
 
 // TransactionRequest is the optional transaction envelope. Record aliases the
@@ -69,7 +88,32 @@ type TransactionRequest struct {
 	Operation TransactionOperation
 	ID        distributedtxn.ID
 	Revision  uint64
-	Record    []byte
+	// SegmentIndex is populated only by TransactionReadManifestSegment. Stage
+	// requests obtain the canonical index from the checksummed VTM1 page.
+	SegmentIndex uint32
+	Record       []byte
+	// ManifestSegment carries the canonical VTM1 page for segmented stage
+	// operations. Coordinator begin carries Record=VTCM and page zero together,
+	// so route identity is proven before the first journal write.
+	ManifestSegment []byte
+	// manifestMeta is a cold decoded-request sidecar. Keeping only a pointer in
+	// TransactionRequest avoids adding two maximum-width shard identities to
+	// every ordinary SQL, point-read, and transaction request value.
+	manifestMeta *transactionManifestSegmentMeta
+}
+
+type transactionManifestSegmentMeta struct {
+	valid            bool
+	index            uint32
+	firstParticipant uint64
+	participantCount uint32
+	distribution     [distributedtxn.MaxShardIdentityBytes]byte
+	shard            [distributedtxn.MaxShardIdentityBytes]byte
+	distributionLen  uint8
+	shardLen         uint8
+	routingVersion   uint64
+	allocation       uint64
+	ownershipEpoch   uint64
 }
 
 // GlobalIndexLookupRequest is the optional byte-native lookup envelope for a
@@ -173,6 +217,22 @@ const (
 	TransactionRoleParticipant
 )
 
+// TransactionRecordKind makes recovery payloads self-describing without
+// guessing from magic bytes. The enum is part of the typed wire contract.
+type TransactionRecordKind uint8
+
+const (
+	TransactionRecordNone TransactionRecordKind = iota
+	TransactionRecordInlineCoordinator
+	TransactionRecordParticipant
+	TransactionRecordManifestCoordinator
+	TransactionRecordManifestSegment
+)
+
+func (kind TransactionRecordKind) valid() bool {
+	return kind <= TransactionRecordManifestSegment
+}
+
 // TransactionReply reports the durable state observed after a transaction
 // command. Exactly one typed state is populated according to Role.
 type TransactionReply struct {
@@ -181,6 +241,10 @@ type TransactionReply struct {
 	Revision         uint64
 	CoordinatorState distributedtxn.CoordinatorState
 	ParticipantState distributedtxn.ParticipantState
+	RecordKind       TransactionRecordKind
+	// SegmentIndex is meaningful only for TransactionRecordManifestSegment and
+	// repeats the authenticated page index for constant-time dispatch.
+	SegmentIndex uint32
 	// Record optionally carries the immutable coordinator stage record on lookup
 	// and scan replies so recovery can reconstruct the fixed participant set.
 	Record []byte
@@ -190,7 +254,8 @@ type TransactionReply struct {
 func (r TransactionReply) Equal(other TransactionReply) bool {
 	return r.Role == other.Role && r.ID == other.ID && r.Revision == other.Revision &&
 		r.CoordinatorState == other.CoordinatorState &&
-		r.ParticipantState == other.ParticipantState && bytes.Equal(r.Record, other.Record)
+		r.ParticipantState == other.ParticipantState && r.RecordKind == other.RecordKind &&
+		r.SegmentIndex == other.SegmentIndex && bytes.Equal(r.Record, other.Record)
 }
 
 // ReadPolicy selects the consistency contract a read is served under. The enum

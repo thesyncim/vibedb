@@ -67,6 +67,13 @@ type Profile struct {
 	PerShardRows  uint64
 	PerShardBytes uint64
 
+	// MaxTransactionMutations and MaxTransactionBytes independently bound one
+	// atomic write before any participant is staged. Bytes count the exact
+	// canonical mutation batches retained across participants; mutations count
+	// their statements. MaxConcurrency remains the in-flight participant bound.
+	MaxTransactionMutations uint64
+	MaxTransactionBytes     uint64
+
 	// GlobalDeadline bounds the whole operation; PerShardDeadline bounds one shard
 	// request and is also carried as the shard's execution budget.
 	GlobalDeadline   time.Duration
@@ -76,13 +83,15 @@ type Profile struct {
 // Conservative fan-out defaults. They are bounded, never unlimited, so an
 // unset cap fails closed rather than admitting an unbounded read.
 const (
-	defaultMaxConcurrency    = 8
-	defaultMaxAggregateRows  = 1 << 20
-	defaultMaxAggregateBytes = 256 << 20
-	defaultPerShardRows      = 1 << 20
-	defaultPerShardBytes     = 128 << 20
-	defaultGlobalDeadline    = 30 * time.Second
-	defaultPerShardDeadline  = 15 * time.Second
+	defaultMaxConcurrency       = 8
+	defaultMaxAggregateRows     = 1 << 20
+	defaultMaxAggregateBytes    = 256 << 20
+	defaultPerShardRows         = 1 << 20
+	defaultPerShardBytes        = 128 << 20
+	defaultTransactionMutations = 1 << 20
+	defaultTransactionBytes     = 256 << 20
+	defaultGlobalDeadline       = 30 * time.Second
+	defaultPerShardDeadline     = 15 * time.Second
 )
 
 // withDefaults returns the profile with every non-positive cap replaced by its
@@ -103,6 +112,12 @@ func (p Profile) withDefaults() Profile {
 	if p.PerShardBytes == 0 {
 		p.PerShardBytes = defaultPerShardBytes
 	}
+	if p.MaxTransactionMutations == 0 {
+		p.MaxTransactionMutations = defaultTransactionMutations
+	}
+	if p.MaxTransactionBytes == 0 {
+		p.MaxTransactionBytes = defaultTransactionBytes
+	}
 	if p.GlobalDeadline <= 0 {
 		p.GlobalDeadline = defaultGlobalDeadline
 	}
@@ -118,34 +133,40 @@ func (p Profile) withDefaults() Profile {
 func DefaultProfiles() map[OperationClass]Profile {
 	return map[OperationClass]Profile{
 		ClassInteractive: {
-			Policy:            distribution.NewRoutePolicy(distribution.AdmissionTargetedOnly, distribution.RouteLimits{}),
-			MaxConcurrency:    4,
-			MaxAggregateRows:  50_000,
-			MaxAggregateBytes: 16 << 20,
-			PerShardRows:      50_000,
-			PerShardBytes:     16 << 20,
-			GlobalDeadline:    5 * time.Second,
-			PerShardDeadline:  2 * time.Second,
+			Policy:                  distribution.NewRoutePolicy(distribution.AdmissionTargetedOnly, distribution.RouteLimits{}),
+			MaxConcurrency:          4,
+			MaxAggregateRows:        50_000,
+			MaxAggregateBytes:       16 << 20,
+			PerShardRows:            50_000,
+			PerShardBytes:           16 << 20,
+			MaxTransactionMutations: 50_000,
+			MaxTransactionBytes:     16 << 20,
+			GlobalDeadline:          5 * time.Second,
+			PerShardDeadline:        2 * time.Second,
 		},
 		ClassBatch: {
-			Policy:            distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
-			MaxConcurrency:    16,
-			MaxAggregateRows:  1_000_000,
-			MaxAggregateBytes: 256 << 20,
-			PerShardRows:      500_000,
-			PerShardBytes:     128 << 20,
-			GlobalDeadline:    60 * time.Second,
-			PerShardDeadline:  30 * time.Second,
+			Policy:                  distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
+			MaxConcurrency:          16,
+			MaxAggregateRows:        1_000_000,
+			MaxAggregateBytes:       256 << 20,
+			PerShardRows:            500_000,
+			PerShardBytes:           128 << 20,
+			MaxTransactionMutations: 1_000_000,
+			MaxTransactionBytes:     256 << 20,
+			GlobalDeadline:          60 * time.Second,
+			PerShardDeadline:        30 * time.Second,
 		},
 		ClassAdmin: {
-			Policy:            distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
-			MaxConcurrency:    32,
-			MaxAggregateRows:  10_000_000,
-			MaxAggregateBytes: 1 << 30,
-			PerShardRows:      5_000_000,
-			PerShardBytes:     512 << 20,
-			GlobalDeadline:    5 * time.Minute,
-			PerShardDeadline:  2 * time.Minute,
+			Policy:                  distribution.NewRoutePolicy(distribution.AdmissionAllowScatter, distribution.RouteLimits{}),
+			MaxConcurrency:          32,
+			MaxAggregateRows:        10_000_000,
+			MaxAggregateBytes:       1 << 30,
+			PerShardRows:            5_000_000,
+			PerShardBytes:           512 << 20,
+			MaxTransactionMutations: 10_000_000,
+			MaxTransactionBytes:     1 << 30,
+			GlobalDeadline:          5 * time.Minute,
+			PerShardDeadline:        2 * time.Minute,
 		},
 	}
 }
