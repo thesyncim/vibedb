@@ -22,7 +22,15 @@ import (
 // must take ownership of runtime only when it returns nil. A failed call leaves
 // ownership with the caller so it can close the runtime before recovery.
 type ChildRuntimeAdopter interface {
-	AdoptSplitChild(context.Context, OperationID, uint8, *raftmember.Runtime) error
+	AdoptSplitChild(context.Context, OperationID, uint8, PreparedChildRuntime) error
+}
+
+// PreparedChildRuntime keeps the adopted Runtime and its exact activated
+// state-machine read capabilities in one ownership handoff. These references
+// all originate from the same certified child activation.
+type PreparedChildRuntime struct {
+	Runtime *raftmember.Runtime
+	Apply   *sqldriver.ReplicatedApply
 }
 
 // LocalChildLifecycleOptions freezes every local resource needed to transfer a
@@ -186,7 +194,9 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 		return errors.Join(ErrTopologyConflict, runtime.Close())
 	}
 	if err = l.options.Adopter.AdoptSplitChild(
-		ctx, plan.OperationID(), l.options.Child, runtime,
+		ctx, plan.OperationID(), l.options.Child, PreparedChildRuntime{
+			Runtime: runtime, Apply: l.activation.Apply,
+		},
 	); err != nil {
 		return errors.Join(err, runtime.Close())
 	}

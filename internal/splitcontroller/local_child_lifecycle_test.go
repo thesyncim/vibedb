@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -15,7 +14,7 @@ import (
 type rejectingSplitChildAdopter struct{ err error }
 
 func (a rejectingSplitChildAdopter) AdoptSplitChild(
-	context.Context, OperationID, uint8, *raftmember.Runtime,
+	context.Context, OperationID, uint8, PreparedChildRuntime,
 ) error {
 	return a.err
 }
