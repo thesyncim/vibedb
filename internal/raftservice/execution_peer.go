@@ -146,6 +146,28 @@ func (runtime *AuthenticatedExecutionPeerRuntime) Owners() *ExecutionOwners {
 	}
 	return runtime.owners
 }
+
+// TransportStats returns one detached outbound-peer counter snapshot from the
+// shared execution transport. It is observability only and cannot enqueue or
+// drain traffic.
+func (runtime *AuthenticatedExecutionPeerRuntime) TransportStats(
+	node rafttransport.NodeID,
+) (rafttransport.PeerStats, error) {
+	if runtime == nil || runtime.transport == nil {
+		return rafttransport.PeerStats{}, rafttransport.ErrNodeNotFound
+	}
+	return runtime.transport.Stats(node)
+}
+
+// InboundStats returns a detached snapshot of the shared authenticated
+// execution listener.
+func (runtime *AuthenticatedExecutionPeerRuntime) InboundStats() PeerServerStats {
+	if runtime == nil || runtime.server == nil {
+		return PeerServerStats{}
+	}
+	return runtime.server.Stats()
+}
+
 func (runtime *AuthenticatedExecutionPeerRuntime) Started() <-chan struct{} {
 	if runtime == nil {
 		return nil

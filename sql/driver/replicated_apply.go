@@ -1869,6 +1869,53 @@ func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error
 	return a.database.checkpointGroup.Stats(), nil
 }
 
+// ReplicatedApplyResourceStats is one detached, fixed-space storage snapshot
+// for a serving replicated bundle. Relations are dense in authenticated
+// relation-ID order. The hidden system and split-capture participants are
+// reported separately so benchmark tooling can account for every physical
+// byte without acquiring a collection or database capability.
+type ReplicatedApplyResourceStats struct {
+	System        durable.Stats
+	Capture       durable.Stats
+	Relations     [replication.MaxRelationsPerBundle]durable.Stats
+	RelationCount uint16
+}
+
+// ResourceStats returns exact collection I/O and space counters without
+// exposing storage handles. The database catalog lock keeps the relation
+// manifest and collection pointers on one coherent cut.
+func (a *ReplicatedApply) ResourceStats() (ReplicatedApplyResourceStats, error) {
+	if a == nil || a.database == nil {
+		return ReplicatedApplyResourceStats{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return ReplicatedApplyResourceStats{}, err
+	}
+	identity := a.database.catalog.ReplicatedShardStore
+	if identity == nil || identity.RelationCount == 0 ||
+		identity.RelationCount > uint16(len((ReplicatedApplyResourceStats{}).Relations)) ||
+		a.database.replicatedApplyCollection == nil ||
+		a.database.replicatedCaptureCollection == nil {
+		return ReplicatedApplyResourceStats{}, ErrReplicatedApplyMismatch
+	}
+	result := ReplicatedApplyResourceStats{
+		System:        a.database.replicatedApplyCollection.Stats(),
+		Capture:       a.database.replicatedCaptureCollection.Stats(),
+		RelationCount: identity.RelationCount,
+	}
+	for ordinal := uint16(0); ordinal < identity.RelationCount; ordinal++ {
+		relation := identity.Relations[ordinal]
+		table := a.database.tables[relation.Table]
+		if table == nil || table.collection == nil {
+			return ReplicatedApplyResourceStats{}, ErrReplicatedApplyMismatch
+		}
+		result.Relations[ordinal] = table.collection.Stats()
+	}
+	return result, nil
+}
+
 func replicatedApplyProfileDigest(
 	identity ReplicatedShardStoreIdentity,
 	placement ReplicatedPlacementProfile,

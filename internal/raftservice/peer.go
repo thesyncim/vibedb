@@ -364,6 +364,28 @@ func (runtime *AuthenticatedPeerRuntime) Owner() *Owner {
 	return runtime.owner
 }
 
+// TransportStats returns one detached outbound-peer counter snapshot. It is an
+// observability capability only: the caller cannot enqueue, drain, or otherwise
+// influence transport work through the returned value. SentBytes counts exact
+// encoded Raft frame bytes and excludes the four-byte stream record prefix.
+func (runtime *AuthenticatedPeerRuntime) TransportStats(
+	node rafttransport.NodeID,
+) (rafttransport.PeerStats, error) {
+	if runtime == nil || runtime.transport == nil {
+		return rafttransport.PeerStats{}, rafttransport.ErrNodeNotFound
+	}
+	return runtime.transport.Stats(node)
+}
+
+// InboundStats returns a detached snapshot of the authenticated peer listener.
+// It exposes no listener or receiver authority.
+func (runtime *AuthenticatedPeerRuntime) InboundStats() PeerServerStats {
+	if runtime == nil || runtime.server == nil {
+		return PeerServerStats{}
+	}
+	return runtime.server.Stats()
+}
+
 // Started closes when the complete runtime has either published all three
 // lanes or failed before publication. Running distinguishes those states.
 func (runtime *AuthenticatedPeerRuntime) Started() <-chan struct{} {
