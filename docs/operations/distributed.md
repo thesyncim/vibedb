@@ -230,9 +230,17 @@ changes, snapshot transfer or installation, repair, or automatic catalog
 publication. A three-process command-composition gate opens prepared retained
 state through this serving path, forms a natural election over mutually
 authenticated peer traffic, probes every authenticated native endpoint, and
-requires clean process shutdown. Deeper fault gates still live below the
-command boundary; membership and snapshot lifecycle qualification remain
-separate work.
+requires clean process shutdown. A separate external-process fault gate stops
+the elected leader without closing its sockets, proves election by the other
+two voters, resumes the isolated former leader and requires it to reject a
+linearizable read, kills leaders on both sides of request admission, retries
+the exact command bytes, restarts the killed member, and waits for applied-index
+catch-up. It also drives the complete 64-waiter serving bound and requires the
+capacity to be reusable, while bounding incremental allocated bytes for the
+small fault run. The black-box gate does not claim a specific internal cut for
+the admission-to-response kill race because the command exposes no test timing
+hooks. Deterministic owner, registry, WAL, and apply tests cover those internal
+cuts. Membership and snapshot lifecycle qualification remain separate work.
 
 ## Validate and inspect the gateway catalog
 
