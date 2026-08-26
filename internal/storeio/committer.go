@@ -305,6 +305,8 @@ type Committer struct {
 	writeStorage   []Write
 	indexStorage   []uint32
 	descriptorOnce sync.Once
+	observerMu     sync.RWMutex
+	observer       func(uint64, []byte) error
 	producerSeen   []uint64
 
 	pending     []*Batch
@@ -445,6 +447,7 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 		failureNotified: make(chan struct{}),
 		commitScratch:   make([]Write, 0, normalizedDevice.BufferCount),
 	}
+	c.observer = normalizedCommitter.PublicationObserver
 	groupCapacity := normalizedCommitter.GroupLimit
 	if normalizedCommitter.ManualCheckpoint {
 		// A manual checkpoint is one exact root cut. Buffered alternate-root
@@ -727,11 +730,15 @@ func (c *Committer) publishRetiring(
 		}
 		return superseded, ErrQueueFull
 	}
-	if observer := c.options.PublicationObserver; observer != nil {
+	c.observerMu.RLock()
+	observer := c.observer
+	if observer != nil {
 		if err := observer(generation, batch.publicationDescriptor); err != nil {
+			c.observerMu.RUnlock()
 			return superseded, err
 		}
 	}
+	c.observerMu.RUnlock()
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
 		c.materializationNextSequence.Store(batch.journalSequence + 1)
@@ -806,6 +813,20 @@ func (c *Committer) PublishedGeneration() uint64 {
 		return 0
 	}
 	return c.published.Load()
+}
+
+// SetPublicationObserver changes the pre-visibility observer. Callers must
+// externally exclude producers while installing or removing it; publication
+// holds the read side through the callback so removal waits for an in-flight
+// capture to finish.
+func (c *Committer) SetPublicationObserver(observer func(uint64, []byte) error) error {
+	if c == nil || c.closing.Load() {
+		return ErrClosed
+	}
+	c.observerMu.Lock()
+	c.observer = observer
+	c.observerMu.Unlock()
+	return nil
 }
 
 // DurableGeneration returns the newest generation whose root passed the final
