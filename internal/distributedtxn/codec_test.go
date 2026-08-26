@@ -16,13 +16,18 @@ func testID() ID {
 
 func digest(value string) Digest { return sha256.Sum256([]byte(value)) }
 
+func authorityWitness(value string) AuthorityWitness {
+	digest := sha256.Sum256([]byte("authority:" + value))
+	return AuthorityWitness(digest[:16])
+}
+
 func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 	record := CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 9,
 		RecoveryDeadline: 1234,
 		Participants: []ParticipantRef{
-			{Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 7, AllocationGeneration: 2, OwnershipEpoch: 3, MutationDigest: digest("a"), State: ParticipantStaged},
-			{Distribution: []byte("docs"), Shard: []byte("80-"), RoutingVersion: 7, AllocationGeneration: 4, OwnershipEpoch: 5, MutationDigest: digest("b"), State: ParticipantStaged},
+			{Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 7, AllocationGeneration: 2, OwnershipEpoch: 3, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: ParticipantStaged},
+			{Distribution: []byte("docs"), Shard: []byte("80-"), RoutingVersion: 7, AllocationGeneration: 4, OwnershipEpoch: 5, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: ParticipantStaged},
 		},
 	}
 	encoded, err := AppendCoordinator([]byte("prefix"), record)
@@ -30,7 +35,7 @@ func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded = encoded[len("prefix"):]
-	if len(encoded) != coordinatorHeaderBytes+4+2*60+2*len("docs")+len("-80")+len("80-") {
+	if len(encoded) != coordinatorHeaderBytes+4+2*coordinatorEntryBytes+2*len("docs")+len("-80")+len("80-") {
 		t.Fatalf("encoded size = %d", len(encoded))
 	}
 	got, err := OpenCoordinator(encoded)
@@ -88,8 +93,8 @@ func TestRecordCorruptionAndOrderingRejected(t *testing.T) {
 	record := CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1,
 		Participants: []ParticipantRef{
-			{Distribution: []byte("docs"), Shard: []byte("b"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, MutationDigest: digest("b"), State: ParticipantStaged},
-			{Distribution: []byte("docs"), Shard: []byte("a"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, MutationDigest: digest("a"), State: ParticipantStaged},
+			{Distribution: []byte("docs"), Shard: []byte("b"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: ParticipantStaged},
+			{Distribution: []byte("docs"), Shard: []byte("a"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: ParticipantStaged},
 		},
 	}
 	if _, err := AppendCoordinator(nil, record); err == nil {
@@ -112,7 +117,8 @@ func TestAppendCoordinatorSignalsSegmentedFallback(t *testing.T) {
 		participants[i] = ParticipantRef{
 			Distribution: []byte("docs"), Shard: []byte{byte(i + 1)},
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: Digest{byte(i + 1)}, State: ParticipantStaged,
+			AuthorityWitness: AuthorityWitness{byte(i + 1)},
+			MutationDigest:   Digest{byte(i + 1)}, State: ParticipantStaged,
 		}
 	}
 	_, err := AppendCoordinator(nil, CoordinatorRecord{
@@ -151,11 +157,15 @@ func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
 	record := CoordinatorRecord{ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1, Participants: participants}
 	dst := make([]byte, 0, MaxCoordinatorRecordBytes)
 	participantsScratch := make([]ParticipantRef, MaxInlineParticipants)
+	encoded, err := AppendCoordinator(dst[:0], record)
+	if err != nil {
+		b.Fatal(err)
+	}
 	b.ReportAllocs()
-	b.SetBytes(int64(coordinatorHeaderBytes + 4 + len(participants)*60))
+	b.SetBytes(int64(len(encoded)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		encoded, err := AppendCoordinator(dst[:0], record)
+		encoded, err = AppendCoordinator(dst[:0], record)
 		if err != nil {
 			b.Fatal(err)
 		}

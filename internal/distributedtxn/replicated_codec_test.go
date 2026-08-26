@@ -16,7 +16,8 @@ func replicatedTestCoordinator(t testing.TB) []byte {
 		Participants: []ParticipantRef{{
 			Distribution: []byte("docs"), Shard: []byte("-80"),
 			RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
-			MutationDigest: digest("mutation"), State: ParticipantStaged,
+			AuthorityWitness: authorityWitness("docs/-80"),
+			MutationDigest:   digest("mutation"), State: ParticipantStaged,
 		}},
 	})
 	if err != nil {
@@ -570,7 +571,8 @@ func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 	want := ParticipantRef{
 		Distribution: []byte("docs"), Shard: []byte("-80"),
 		RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
-		MutationDigest: digest("mutation"), State: ParticipantStaged,
+		AuthorityWitness: authorityWitness("docs/-80"),
+		MutationDigest:   digest("mutation"), State: ParticipantStaged,
 	}
 	present, matches, err := ReplicatedCoordinatorBindsParticipant(payload, 0, want)
 	if err != nil || !present || !matches {
@@ -780,5 +782,81 @@ func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
 	const want = 985336
 	if MaxReplicatedCommandBytes != want {
 		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
+	}
+}
+
+func TestReplicatedRetirementSummaryCanonicalFixedAndAllocationFree(t *testing.T) {
+	for _, summary := range []ReplicatedRetirementSummary{
+		{},
+		{AffectedRows: 4096, AffectedRowsValid: true},
+	} {
+		var storage [ReplicatedRetirementSummaryBytes]byte
+		encoded, err := AppendReplicatedRetirementSummary(storage[:0], summary)
+		if err != nil || len(encoded) != ReplicatedRetirementSummaryBytes {
+			t.Fatalf("append summary=%+v bytes=%d err=%v", summary, len(encoded), err)
+		}
+		opened, err := OpenReplicatedRetirementSummary(encoded)
+		if err != nil || opened != summary {
+			t.Fatalf("open summary=%+v err=%v want=%+v", opened, err, summary)
+		}
+		if got := testing.AllocsPerRun(1000, func() {
+			encoded, appendErr := AppendReplicatedRetirementSummary(storage[:0], summary)
+			if appendErr != nil {
+				panic(appendErr)
+			}
+			if _, openErr := OpenReplicatedRetirementSummary(encoded); openErr != nil {
+				panic(openErr)
+			}
+		}); got != 0 {
+			t.Fatalf("summary=%+v allocations=%v", summary, got)
+		}
+	}
+	for name, raw := range map[string][]byte{
+		"truncated":       make([]byte, ReplicatedRetirementSummaryBytes-1),
+		"trailing":        make([]byte, ReplicatedRetirementSummaryBytes+1),
+		"unknown-flag":    {2, 0, 0, 0, 0, 0, 0, 0, 0},
+		"invalid-nonzero": {0, 1, 0, 0, 0, 0, 0, 0, 0},
+		"negative":        {1, 0, 0, 0, 0, 0, 0, 0, 0x80},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := OpenReplicatedRetirementSummary(raw); err == nil {
+				t.Fatal("malformed retirement summary accepted")
+			}
+		})
+	}
+	for _, summary := range []ReplicatedRetirementSummary{
+		{AffectedRows: -1, AffectedRowsValid: true},
+		{AffectedRows: 1},
+	} {
+		if _, err := AppendReplicatedRetirementSummary(nil, summary); err == nil {
+			t.Fatalf("invalid summary %+v appended", summary)
+		}
+	}
+}
+
+func TestReplicatedRetireCoordinatorRequiresRetirementSummary(t *testing.T) {
+	payload, err := AppendReplicatedRetirementSummary(nil, ReplicatedRetirementSummary{
+		AffectedRows: 7, AffectedRowsValid: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleCoordinator, Operation: ReplicatedRetireCoordinator,
+		ID: testID(), ExpectedRevision: 2,
+		PayloadKind: ReplicatedPayloadRetirement, Payload: payload,
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenReplicatedCommand(encoded)
+	if err != nil || view.PayloadKind != ReplicatedPayloadRetirement ||
+		!bytes.Equal(view.Payload, payload) {
+		t.Fatalf("retire=%+v err=%v", view.ReplicatedCommand, err)
+	}
+	command.PayloadKind, command.Payload = ReplicatedPayloadNone, nil
+	if _, err := AppendReplicatedCommand(nil, command); err == nil {
+		t.Fatal("retire without retirement summary accepted")
 	}
 }

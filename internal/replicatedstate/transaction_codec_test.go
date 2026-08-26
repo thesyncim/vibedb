@@ -467,6 +467,8 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 		CoordinatorAllocation:       67,
 		MutationDigest:              transactionCodecDigest(68),
 		CoordinatorDecision:         distributedtxn.CoordinatorCommitted,
+		AffectedRows:                17,
+		AffectedRowsValid:           true,
 		ResidentControlBytes:        controlBytes,
 		LastOperation:               distributedtxn.ReplicatedRetireCoordinator,
 		LastExpectedRevision:        2,
@@ -485,8 +487,9 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	opened, err := OpenTransactionControlInto(encoded, nil)
-	if err != nil || opened.CoordinatorDecision != distributedtxn.CoordinatorCommitted {
-		t.Fatalf("retired decision=%d err=%v", opened.CoordinatorDecision, err)
+	if err != nil || opened.CoordinatorDecision != distributedtxn.CoordinatorCommitted ||
+		!opened.AffectedRowsValid || opened.AffectedRows != 17 {
+		t.Fatalf("retired control=%+v err=%v", opened.TransactionControl, err)
 	}
 	for _, decision := range []distributedtxn.CoordinatorState{
 		distributedtxn.CoordinatorInvalid,
@@ -497,6 +500,35 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 		if _, err := AppendTransactionControl(nil, candidate); err == nil {
 			t.Fatalf("retired decision %d accepted", decision)
 		}
+	}
+	for name, mutate := range map[string]func(*TransactionControl){
+		"committed-missing-summary": func(candidate *TransactionControl) {
+			candidate.AffectedRows, candidate.AffectedRowsValid = 0, false
+		},
+		"aborted-valid-summary": func(candidate *TransactionControl) {
+			candidate.CoordinatorDecision = distributedtxn.CoordinatorAborted
+		},
+		"aborted-nonzero-summary": func(candidate *TransactionControl) {
+			candidate.CoordinatorDecision = distributedtxn.CoordinatorAborted
+			candidate.AffectedRowsValid = false
+		},
+		"active-summary": func(candidate *TransactionControl) {
+			candidate.State = uint8(distributedtxn.CoordinatorCommitted)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := control
+			mutate(&candidate)
+			if _, err := AppendTransactionControl(nil, candidate); err == nil {
+				t.Fatal("invalid affected-row summary accepted")
+			}
+		})
+	}
+	aborted := control
+	aborted.CoordinatorDecision = distributedtxn.CoordinatorAborted
+	aborted.AffectedRows, aborted.AffectedRowsValid = 0, false
+	if _, err := AppendTransactionControl(nil, aborted); err != nil {
+		t.Fatalf("canonical aborted retired control: %v", err)
 	}
 }
 

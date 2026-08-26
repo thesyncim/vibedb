@@ -245,6 +245,16 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		plan.command.resultCode = ResultStaleFence
 		return plan, nil
 	}
+	if err := distributedtxn.ValidateReplicatedCoordinatorAuthorityWitnesses(
+		control.Payload,
+	); err != nil {
+		plan.command.refusal = ErrAdmissionBound
+		return plan, nil
+	}
+	authorityWitness := m.transactionRouteAuthorityWitness(command)
+	if authorityWitness == (distributedtxn.AuthorityWitness{}) {
+		return transactionCommandPlan{}, ErrTransactionStateCorrupt
+	}
 	coordinatorKey, _ := TransactionControlStorageKey(
 		distributedtxn.ReplicatedRoleCoordinator, control.ID,
 	)
@@ -284,6 +294,7 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		RoutingVersion:       command.RoutingVersion,
 		AllocationGeneration: command.AllocationGeneration,
 		OwnershipEpoch:       command.OwnershipEpoch,
+		AuthorityWitness:     authorityWitness,
 		MutationDigest:       control.Participant.MutationDigest,
 		State:                distributedtxn.ParticipantStaged,
 	}
@@ -550,6 +561,7 @@ func (m *Machine) planManifestPageStage(
 			RoutingVersion:       command.RoutingVersion,
 			AllocationGeneration: command.AllocationGeneration,
 			OwnershipEpoch:       command.OwnershipEpoch,
+			AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
 			MutationDigest:       participant.MutationDigest,
 			State:                distributedtxn.ParticipantStaged,
 		}
@@ -620,6 +632,10 @@ func (m *Machine) planManifestSegmentsStage(
 		segments.EncodedBytes() > existing.PayloadBytes-existing.ManifestEncodedBytes {
 		return transactionConflict(plan), nil
 	}
+	if err = segments.ValidateAuthorityWitnesses(); err != nil {
+		plan.command.refusal = ErrAdmissionBound
+		return plan, nil
+	}
 	descriptor, descriptorErr := transactionManifestDescriptorAt(snapshot, control.ID)
 	if descriptorErr != nil {
 		return transactionCommandPlan{}, descriptorErr
@@ -668,6 +684,7 @@ func (m *Machine) planManifestSegmentsStage(
 				RoutingVersion:       command.RoutingVersion,
 				AllocationGeneration: command.AllocationGeneration,
 				OwnershipEpoch:       command.OwnershipEpoch,
+				AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
 				MutationDigest:       participant.MutationDigest,
 				State:                distributedtxn.ParticipantStaged,
 			}
@@ -710,6 +727,26 @@ func (m *Machine) planManifestSegmentsStage(
 	plan.delta.residentByte = int64(resident)
 	plan.command.resultCode = ResultApplied
 	return plan, nil
+}
+
+func (m *Machine) transactionRouteAuthorityWitness(
+	command replication.CommandView,
+) distributedtxn.AuthorityWitness {
+	digest := replication.RouteAuthorityDigest(replication.RouteAuthority{
+		ClusterID: command.ClusterID, ClusterIncarnation: command.ClusterIncarnation,
+		TopologyRecoveryEpoch: command.TopologyRecoveryEpoch,
+		ShardIncarnation:      command.ShardIncarnation, GroupID: command.GroupID,
+		AllocationGeneration:   command.AllocationGeneration,
+		ReplicaSetVersion:      command.ReplicaSetVersion,
+		ActivePolicyGeneration: command.ActivePolicyGeneration,
+		ProtectionEpoch:        command.ProtectionEpoch, OwnershipEpoch: command.OwnershipEpoch,
+		SchemaGeneration:       command.SchemaGeneration,
+		RelationManifestDigest: replication.Digest(m.manifestDigest),
+		RoutingVersion:         command.RoutingVersion, RouteGeneration: command.RouteGeneration,
+	})
+	var witness distributedtxn.AuthorityWitness
+	copy(witness[:], digest[:len(witness)])
+	return witness
 }
 
 func transactionManifestDescriptorAt(
@@ -818,6 +855,17 @@ func (m *Machine) planCoordinatorTransition(
 		existing.CoordinatorDecision = next
 	}
 	if next == distributedtxn.CoordinatorRetired {
+		summary, err := distributedtxn.OpenReplicatedRetirementSummary(control.Payload)
+		if err != nil {
+			return transactionCommandPlan{}, errors.Join(err, ErrTransactionStateCorrupt)
+		}
+		committed := state == distributedtxn.CoordinatorCommitted
+		if summary.AffectedRowsValid != committed ||
+			!committed && summary.AffectedRows != 0 {
+			return transactionConflict(plan), nil
+		}
+		existing.AffectedRows = summary.AffectedRows
+		existing.AffectedRowsValid = summary.AffectedRowsValid
 		payloadKey, _ := TransactionCoordinatorPayloadStorageKey(control.ID)
 		plan.rows = append(
 			plan.rows, newTransactionDelete(payloadKey[:]),

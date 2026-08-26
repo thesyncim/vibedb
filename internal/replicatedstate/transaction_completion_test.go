@@ -370,6 +370,9 @@ func TestTransactionCompletionCoordinatorDecisionAndStageSurviveRetire(t *testin
 				LastResultCode:              ResultApplied,
 				LastAppliedIndex:            70,
 			}
+			if decision == distributedtxn.CoordinatorCommitted {
+				control.AffectedRows, control.AffectedRowsValid = 17, true
+			}
 			putTransactionCompletionControl(t, fixture, control)
 			completion, _ := openTransactionCompletion(t, fixture.machine, stage)
 			if completion.ResultCode != ResultApplied {

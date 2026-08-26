@@ -408,17 +408,19 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	participantRef := distributedtxn.ParticipantRef{
+		Distribution:         []byte(fixture.binding.Distribution),
+		Shard:                []byte(fixture.binding.Shard),
+		RoutingVersion:       fixture.binding.RoutingVersion,
+		AllocationGeneration: fixture.binding.AllocationGeneration,
+		OwnershipEpoch:       fixture.binding.OwnershipEpoch,
+		AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
+		MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
+	}
 	payload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
-		Participants: []distributedtxn.ParticipantRef{{
-			Distribution:         []byte(fixture.binding.Distribution),
-			Shard:                []byte(fixture.binding.Shard),
-			RoutingVersion:       fixture.binding.RoutingVersion,
-			AllocationGeneration: fixture.binding.AllocationGeneration,
-			OwnershipEpoch:       fixture.binding.OwnershipEpoch,
-			MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
-		}},
+		Participants: []distributedtxn.ParticipantRef{participantRef},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +460,47 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 				t.Fatalf("binding mismatch admission error=%v", err)
 			}
 		})
+	}
+	wrongAuthority := participantRef
+	wrongAuthority.AuthorityWitness[0] ^= 0xff
+	wrongPayload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
+		Participants: []distributedtxn.ParticipantRef{wrongAuthority},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongBegin := beginControl
+	wrongBegin.Payload = wrongPayload
+	if err = fixture.machine.AdmitCommand(transactionCompletionCommand(
+		t, fixture.binding, wrongBegin, batches,
+	)); !errors.Is(err, ErrAdmissionBound) {
+		t.Fatalf("route authority witness mismatch admission error=%v", err)
+	}
+	zeroOther := distributedtxn.ParticipantRef{
+		Distribution: []byte("a"), Shard: []byte("unselected"),
+		RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
+		MutationDigest: sha256.Sum256([]byte("unselected-inline")),
+		State:          distributedtxn.ParticipantStaged,
+	}
+	zeroOtherPayload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
+		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
+		Participants: []distributedtxn.ParticipantRef{zeroOther, participantRef},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroOtherBegin := beginControl
+	zeroOtherBegin.Payload = zeroOtherPayload
+	zeroOtherBegin.Participant.ParticipantOrdinal = 1
+	if _, err = distributedtxn.AppendReplicatedCommand(nil, zeroOtherBegin); !errors.Is(err, distributedtxn.ErrCorrupt) {
+		t.Fatalf("zero unselected inline authority codec error=%v", err)
+	}
+	if fixture.machine.state.TransactionControlCount != 0 ||
+		fixture.machine.state.TransactionPayloadRows != 0 {
+		t.Fatalf("zero authority persisted coordinator state: %+v", fixture.machine.state)
 	}
 	begin := transactionCompletionCommand(t, fixture.binding, beginControl, batches)
 	result := applyTransactionCommand(t, fixture.machine, 3, begin)
@@ -510,7 +553,10 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	retire := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedRetireCoordinator, ID: id,
-		ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadRetirement,
+		Payload: transactionRetirementPayload(t, distributedtxn.ReplicatedRetirementSummary{
+			AffectedRows: 1, AffectedRowsValid: true,
+		}),
 	}, nil)
 	applyTransactionCommand(t, fixture.machine, 6, retire)
 	completion, _ := openTransactionCompletion(t, fixture.machine, begin)
@@ -545,11 +591,13 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	}
 	refs := make([]distributedtxn.ParticipantRef, 0, 17_001)
 	for index := 0; index < 17_000; index++ {
+		mutationDigest := sha256.Sum256([]byte(fmt.Sprintf("mutation-%08d", index)))
 		refs = append(refs, distributedtxn.ParticipantRef{
 			Distribution: []byte("a"), Shard: []byte(fmt.Sprintf("shard-%08d", index)),
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: sha256.Sum256([]byte(fmt.Sprintf("mutation-%08d", index))),
-			State:          distributedtxn.ParticipantStaged,
+			AuthorityWitness: distributedtxn.AuthorityWitness(mutationDigest[:16]),
+			MutationDigest:   mutationDigest,
+			State:            distributedtxn.ParticipantStaged,
 		})
 	}
 	selectedOrdinal := uint32(len(refs))
@@ -559,6 +607,7 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		RoutingVersion:       fixture.binding.RoutingVersion,
 		AllocationGeneration: fixture.binding.AllocationGeneration,
 		OwnershipEpoch:       fixture.binding.OwnershipEpoch,
+		AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
 		MutationDigest:       digest,
 		State:                distributedtxn.ParticipantStaged,
 	})
@@ -607,6 +656,23 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	if selectedPage < initialCount {
 		t.Fatalf("selected ordinal %d landed in initial page %d", selectedOrdinal, selectedPage)
 	}
+	deferredUnselectedOrdinal := selectedOrdinal - 1
+	deferredUnselectedPage := -1
+	for index := range pages {
+		sequence, openErr := distributedtxn.OpenManifestSegmentSequence(pages[index])
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		if uint64(deferredUnselectedOrdinal) >= sequence.FirstParticipant() &&
+			uint64(deferredUnselectedOrdinal) < sequence.FirstParticipant()+sequence.ParticipantCount() {
+			deferredUnselectedPage = index
+			break
+		}
+	}
+	if deferredUnselectedPage < initialCount {
+		t.Fatalf("unselected ordinal %d landed in initial page %d",
+			deferredUnselectedOrdinal, deferredUnselectedPage)
+	}
 	manifest, err := distributedtxn.AppendManifestCoordinator(nil, distributedtxn.ManifestCoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
@@ -633,6 +699,32 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
 		Payload: initial, Participant: participant,
+	}
+	zeroInitialRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+	zeroInitialRefs[0].AuthorityWitness = distributedtxn.AuthorityWitness{}
+	zeroInitialDescriptor, zeroInitialPages := build(zeroInitialRefs)
+	zeroInitialCoordinator, err := distributedtxn.AppendManifestCoordinator(
+		nil, distributedtxn.ManifestCoordinatorRecord{
+			ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
+			CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
+			Manifest: zeroInitialDescriptor,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroInitial := bytes.Clone(zeroInitialCoordinator)
+	for _, page := range zeroInitialPages[:initialCount] {
+		zeroInitial = append(zeroInitial, page...)
+	}
+	zeroInitialBegin := beginControl
+	zeroInitialBegin.Payload = zeroInitial
+	if _, err = distributedtxn.AppendReplicatedCommand(nil, zeroInitialBegin); !errors.Is(err, distributedtxn.ErrCorrupt) {
+		t.Fatalf("zero unselected initial-page authority codec error=%v", err)
+	}
+	if fixture.machine.state.TransactionControlCount != 0 ||
+		fixture.machine.state.TransactionPayloadRows != 0 {
+		t.Fatalf("zero initial authority persisted coordinator state: %+v", fixture.machine.state)
 	}
 	begin := transactionCompletionCommand(t, fixture.binding, beginControl, batches)
 	applyTransactionCommand(t, fixture.machine, 3, begin)
@@ -704,19 +796,41 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	}
 	assertUnchangedRevision(uint64(initialCount))
 
-	wrongRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
-	wrongRefs[selectedOrdinal].MutationDigest[0] ^= 0xff
-	_, wrongPages := build(wrongRefs)
-	wrongPack := appendManifestPageBytes(nil, wrongPages[initialCount:])
-	wrongAppend := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+	for name, mutate := range map[string]func(*distributedtxn.ParticipantRef){
+		"mutation digest": func(ref *distributedtxn.ParticipantRef) { ref.MutationDigest[0] ^= 0xff },
+		"authority witness": func(ref *distributedtxn.ParticipantRef) {
+			ref.AuthorityWitness[0] ^= 0xff
+		},
+	} {
+		wrongRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+		mutate(&wrongRefs[selectedOrdinal])
+		_, wrongPages := build(wrongRefs)
+		wrongPack := appendManifestPageBytes(nil, wrongPages[initialCount:])
+		wrongAppend := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleCoordinator,
+			Operation: distributedtxn.ReplicatedAppendManifestSegments, ID: id,
+			ExpectedRevision: uint64(initialCount),
+			PayloadKind:      distributedtxn.ReplicatedPayloadManifestSegments, Payload: wrongPack,
+		}, nil)
+		if err := fixture.machine.AdmitCommand(wrongAppend); !errors.Is(err, ErrAdmissionBound) {
+			t.Fatalf("mismatched selected page %s admission error=%v", name, err)
+		}
+		assertUnchangedRevision(uint64(initialCount))
+	}
+	zeroSuffixRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+	zeroSuffixRefs[deferredUnselectedOrdinal].AuthorityWitness = distributedtxn.AuthorityWitness{}
+	_, zeroSuffixPages := build(zeroSuffixRefs)
+	zeroSuffixPack := appendManifestPageBytes(nil, zeroSuffixPages[initialCount:])
+	zeroSuffixControl := distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedAppendManifestSegments, ID: id,
 		ExpectedRevision: uint64(initialCount),
-		PayloadKind:      distributedtxn.ReplicatedPayloadManifestSegments, Payload: wrongPack,
-	}, nil)
-	if err := fixture.machine.AdmitCommand(wrongAppend); !errors.Is(err, ErrAdmissionBound) {
-		t.Fatalf("mismatched selected page admission error=%v", err)
+		PayloadKind:      distributedtxn.ReplicatedPayloadManifestSegments, Payload: zeroSuffixPack,
 	}
+	if _, err := distributedtxn.AppendReplicatedCommand(nil, zeroSuffixControl); !errors.Is(err, distributedtxn.ErrCorrupt) {
+		t.Fatalf("zero unselected suffix authority codec error=%v", err)
+	}
+	assertUnchangedRevision(uint64(initialCount))
 
 	matchingPack := appendManifestPageBytes(nil, pages[initialCount:])
 	matchingAppend := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{

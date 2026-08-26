@@ -46,7 +46,8 @@ type TransactionCompletionResult struct {
 
 // OpenTransactionCompletionResult opens the sole fixed transaction-result
 // grammar. It rejects unknown flags, reserved bytes, invalid roles/operations,
-// and affected-row claims for operations other than participant Apply.
+// and affected-row claims outside participant Apply or committed coordinator
+// retirement.
 func OpenTransactionCompletionResult(
 	resultCode uint32,
 	raw []byte,
@@ -68,7 +69,8 @@ func OpenTransactionCompletionResult(
 		result.AffectedRows < 0 ||
 		result.AffectedRowsValid &&
 			result.Operation != distributedtxn.ReplicatedApplyParticipant &&
-			result.Operation != distributedtxn.ReplicatedApplyReleaseParticipant ||
+			result.Operation != distributedtxn.ReplicatedApplyReleaseParticipant &&
+			result.Operation != distributedtxn.ReplicatedRetireCoordinator ||
 		!result.AffectedRowsValid && result.AffectedRows != 0 ||
 		result.RevisionValid != (result.Revision != 0) {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
@@ -87,9 +89,12 @@ func OpenTransactionCompletionResult(
 	) {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
+	apply := result.Operation == distributedtxn.ReplicatedApplyParticipant ||
+		result.Operation == distributedtxn.ReplicatedApplyReleaseParticipant
 	if resultCode == ResultApplied &&
-		(result.Operation == distributedtxn.ReplicatedApplyParticipant ||
-			result.Operation == distributedtxn.ReplicatedApplyReleaseParticipant) != result.AffectedRowsValid ||
+		(apply && !result.AffectedRowsValid ||
+			!apply && result.Operation != distributedtxn.ReplicatedRetireCoordinator &&
+				result.AffectedRowsValid) ||
 		(resultCode == ResultIndexConflict || resultCode == ResultTransactionConflict) &&
 			result.AffectedRowsValid {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
@@ -291,8 +296,14 @@ func transactionHistoricalRetryExact(
 		return control.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
 			transactionCoordinatorDecisionExpected(control) == command.ExpectedRevision, ResultApplied, nil
 	case distributedtxn.ReplicatedRetireCoordinator:
+		summary, err := distributedtxn.OpenReplicatedRetirementSummary(command.Payload)
+		if err != nil {
+			return false, 0, errors.Join(err, ErrTransactionStateCorrupt)
+		}
 		return distributedtxn.CoordinatorState(control.State) == distributedtxn.CoordinatorRetired &&
-			control.Revision == command.ExpectedRevision+1, ResultApplied, nil
+			control.Revision == command.ExpectedRevision+1 &&
+			control.AffectedRowsValid == summary.AffectedRowsValid &&
+			control.AffectedRows == summary.AffectedRows, ResultApplied, nil
 	case distributedtxn.ReplicatedPrepareParticipant:
 		if control.FusedPath {
 			return false, 0, nil
@@ -426,7 +437,8 @@ func transactionCoordinatorBeginRetryExact(
 	}
 	if !control.FusedPath || control.PayloadKind != wantKind ||
 		control.PayloadDigest != distributedtxn.Digest(sha256.Sum256(command.Payload)) ||
-		control.CoordinatorParticipantOrdinal != uint64(command.Participant.ParticipantOrdinal) ||
+		distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired &&
+			control.CoordinatorParticipantOrdinal != uint64(command.Participant.ParticipantOrdinal) ||
 		(control.PrepareResultCode != ResultApplied &&
 			control.PrepareResultCode != ResultIndexConflict) {
 		return false, 0, nil
@@ -545,14 +557,18 @@ func (m *Machine) appendTransactionCompletion(
 		result[2] |= transactionCompletionControlRevision
 	}
 	binary.LittleEndian.PutUint64(result[8:16], control.Revision)
-	if exact && resultCode == ResultApplied &&
-		(transaction.Operation == distributedtxn.ReplicatedApplyParticipant ||
-			transaction.Operation == distributedtxn.ReplicatedApplyReleaseParticipant) {
-		if !control.AffectedRowsValid || control.AffectedRows < 0 {
+	apply := transaction.Operation == distributedtxn.ReplicatedApplyParticipant ||
+		transaction.Operation == distributedtxn.ReplicatedApplyReleaseParticipant
+	retire := transaction.Operation == distributedtxn.ReplicatedRetireCoordinator
+	if exact && resultCode == ResultApplied && (apply || retire) {
+		if apply && (!control.AffectedRowsValid || control.AffectedRows < 0) ||
+			retire && !transactionCoordinatorAffectedRowsValid(control) {
 			return dst, ErrTransactionStateCorrupt
 		}
-		result[2] |= transactionCompletionAffectedRows
-		binary.LittleEndian.PutUint64(result[16:24], uint64(control.AffectedRows))
+		if control.AffectedRowsValid {
+			result[2] |= transactionCompletionAffectedRows
+			binary.LittleEndian.PutUint64(result[16:24], uint64(control.AffectedRows))
+		}
 	}
 	resultDigest := replication.CompletionResultDigest(
 		resultCode, ResultFormatTransaction, result[:],

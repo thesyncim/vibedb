@@ -112,7 +112,7 @@ type TransactionControl struct {
 	AffectedRows      int64
 	AffectedRowsValid bool
 	// CoordinatorParticipantOrdinal occupies the same durable scalar as
-	// AffectedRows. Coordinators never publish affected rows, while
+	// AffectedRows. Active coordinators never publish affected rows, while
 	// participants never own a coordinator ordinal, so the role overlay keeps
 	// the fixed control record compact.
 	CoordinatorParticipantOrdinal uint64
@@ -347,7 +347,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	copy(frame[112:128], control.CoordinatorShardIncarnation[:])
 	binary.LittleEndian.PutUint64(frame[128:136], control.CoordinatorAllocation)
 	copy(frame[136:168], control.MutationDigest[:])
-	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+	if control.Role == distributedtxn.ReplicatedRoleCoordinator &&
+		distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired {
 		binary.LittleEndian.PutUint64(frame[168:176], control.CoordinatorParticipantOrdinal)
 	} else if control.CancellationWitness {
 		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.ParticipantOrdinal))
@@ -440,7 +441,8 @@ func OpenTransactionControlInto(
 	copy(view.CoordinatorShardIncarnation[:], src[112:128])
 	view.CoordinatorAllocation = binary.LittleEndian.Uint64(src[128:136])
 	copy(view.MutationDigest[:], src[136:168])
-	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
+	if view.Role == distributedtxn.ReplicatedRoleCoordinator &&
+		distributedtxn.CoordinatorState(view.State) != distributedtxn.CoordinatorRetired {
 		view.CoordinatorParticipantOrdinal = binary.LittleEndian.Uint64(src[168:176])
 	} else if view.CancellationWitness {
 		ordinal := binary.LittleEndian.Uint64(src[168:176])
@@ -962,7 +964,7 @@ func transactionControlValid(control TransactionControl) bool {
 		return (control.PayloadKind == distributedtxn.ReplicatedPayloadCoordinator ||
 			control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator) &&
 			control.PayloadRelationCount == 0 && control.BucketBits == 0 && len(control.IntentScopes) == 0 &&
-			!control.AffectedRowsValid && control.AffectedRows == 0 &&
+			transactionCoordinatorAffectedRowsValid(control) &&
 			transactionCoordinatorDecisionValid(control) &&
 			control.State >= uint8(distributedtxn.CoordinatorStaging) &&
 			control.State <= uint8(distributedtxn.CoordinatorRetired)
@@ -1011,6 +1013,17 @@ func transactionControlValid(control TransactionControl) bool {
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
 	}
+}
+
+func transactionCoordinatorAffectedRowsValid(control TransactionControl) bool {
+	if distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired {
+		return !control.AffectedRowsValid && control.AffectedRows == 0
+	}
+	if control.CoordinatorDecision == distributedtxn.CoordinatorCommitted {
+		return control.AffectedRowsValid && control.AffectedRows >= 0
+	}
+	return control.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
+		!control.AffectedRowsValid && control.AffectedRows == 0
 }
 
 func transactionCancellationWitnessValid(control TransactionControl) bool {
@@ -1205,7 +1218,7 @@ func transactionCoordinatorPayloadValid(
 func transactionInlineCoordinatorCanonical(raw []byte) bool {
 	const (
 		headerBytes = 48
-		entryBytes  = 60
+		entryBytes  = 76
 		checksum    = 4
 	)
 	if len(raw) < headerBytes+entryBytes+checksum {
@@ -1344,7 +1357,7 @@ type transactionManifestSegmentMeta struct {
 func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentMeta, bool) {
 	const (
 		headerBytes = 32
-		entryBytes  = 64
+		entryBytes  = 80
 		checksum    = 4
 	)
 	if len(raw) < headerBytes+entryBytes+checksum ||

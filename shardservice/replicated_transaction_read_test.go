@@ -245,6 +245,59 @@ func TestReplicatedTransactionRecoveryCancellationWitnessRoundTripAndMalformed(t
 	}
 }
 
+func TestReplicatedTransactionRecoveryRetiredAffectedRowsRoundTripAndMalformed(t *testing.T) {
+	id := testTransactionID(215)
+	record := replicatedRecoveryTestRecord(id, distributedtxn.ReplicatedRoleCoordinator,
+		uint8(distributedtxn.CoordinatorRetired), distributedtxn.ReplicatedPayloadCoordinator)
+	record.Revision = 3
+	record.CoordinatorDecision = distributedtxn.CoordinatorCommitted
+	record.AffectedRows, record.AffectedRowsValid = 4096, true
+	encoded, err := AppendReplicatedTransactionReadValue(nil, ReplicatedTransactionReadValue{
+		Kind: ReplicatedTransactionLookupCoordinator, Complete: true,
+		Records: []replicatedstate.TransactionRecoveryRecord{record},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var arena [1]replicatedstate.TransactionRecoveryRecord
+	opened, err := OpenReplicatedTransactionReadValueInto(encoded, arena[:0])
+	if err != nil || len(opened.Records) != 1 || !opened.Records[0].AffectedRowsValid ||
+		opened.Records[0].AffectedRows != 4096 || len(opened.Records[0].Payload) != 0 {
+		t.Fatalf("retired coordinator=%+v err=%v", opened, err)
+	}
+	base := replicatedTransactionReadValueHeaderBytes
+	for name, mutate := range map[string]func([]byte){
+		"active-with-rows": func(raw []byte) {
+			raw[base+17] = uint8(distributedtxn.CoordinatorCommitted)
+		},
+		"aborted-with-rows": func(raw []byte) {
+			raw[base+116] = uint8(distributedtxn.CoordinatorAborted)
+		},
+		"committed-without-valid": func(raw []byte) {
+			raw[base+115] &^= 1
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			malformed := bytes.Clone(encoded)
+			mutate(malformed)
+			if _, err := OpenReplicatedTransactionReadValueInto(
+				malformed, arena[:0],
+			); !errors.Is(err, ErrReplicatedWire) {
+				t.Fatalf("malformed retired coordinator error=%v", err)
+			}
+		})
+	}
+	aborted := record
+	aborted.CoordinatorDecision = distributedtxn.CoordinatorAborted
+	aborted.AffectedRows, aborted.AffectedRowsValid = 0, false
+	if _, err := AppendReplicatedTransactionReadValue(nil, ReplicatedTransactionReadValue{
+		Kind: ReplicatedTransactionLookupCoordinator, Complete: true,
+		Records: []replicatedstate.TransactionRecoveryRecord{aborted},
+	}); err != nil {
+		t.Fatalf("canonical aborted retirement: %v", err)
+	}
+}
+
 func TestReplicatedTransactionRecoveryValueRejectsMalformedEnvelopeAndScan(t *testing.T) {
 	first := replicatedRecoveryTestRecord(testTransactionID(220),
 		distributedtxn.ReplicatedRoleCoordinator,

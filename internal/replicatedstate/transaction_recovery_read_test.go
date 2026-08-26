@@ -303,7 +303,8 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 				if err := builder.Append(distributedtxn.ParticipantRef{
 					Distribution: []byte(fixture.binding.Distribution), Shard: shard[:],
 					RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-					MutationDigest: digest, State: distributedtxn.ParticipantStaged,
+					AuthorityWitness: distributedtxn.AuthorityWitness(digest[:16]),
+					MutationDigest:   digest, State: distributedtxn.ParticipantStaged,
 				}); err != nil {
 					t.Fatalf("append filler participant %d: %v", participantOrdinal, err)
 				}
@@ -318,6 +319,7 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 				RoutingVersion:       fixture.binding.RoutingVersion,
 				AllocationGeneration: fixture.binding.AllocationGeneration,
 				OwnershipEpoch:       fixture.binding.OwnershipEpoch,
+				AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
 				MutationDigest:       mutationDigest, State: distributedtxn.ParticipantStaged,
 			}); err != nil {
 				t.Fatal(err)

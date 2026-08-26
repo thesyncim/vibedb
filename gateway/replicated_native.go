@@ -591,7 +591,8 @@ func (executor *ReplicatedExecutor) Propose(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, false, serviceauthz.CapabilityDataWrite)
+	return executor.propose(ctx, route, command, nil, false,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandClone)
 }
 
 // ProposeTopology submits an exact replicated catalog or controller-journal
@@ -602,7 +603,8 @@ func (executor *ReplicatedExecutor) ProposeTopology(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, false, serviceauthz.CapabilityTopology)
+	return executor.propose(ctx, route, command, nil, false,
+		serviceauthz.CapabilityTopology, replicatedUnknownCommandClone)
 }
 
 // RetryUnknown retries exact bytes retained from an earlier UnknownOutcomeError.
@@ -613,7 +615,8 @@ func (executor *ReplicatedExecutor) RetryUnknown(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, true, serviceauthz.CapabilityDataWrite)
+	return executor.propose(ctx, route, command, nil, true,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandClone)
 }
 
 // RetryTopologyUnknown retries the exact topology command bytes retained after
@@ -623,7 +626,41 @@ func (executor *ReplicatedExecutor) RetryTopologyUnknown(
 	route ReplicatedRoute,
 	command []byte,
 ) (ReplicatedResult, error) {
-	return executor.propose(ctx, route, command, nil, true, serviceauthz.CapabilityTopology)
+	return executor.propose(ctx, route, command, nil, true,
+		serviceauthz.CapabilityTopology, replicatedUnknownCommandClone)
+}
+
+type replicatedUnknownCommandMode uint8
+
+const (
+	replicatedUnknownCommandClone replicatedUnknownCommandMode = iota
+	replicatedUnknownCommandTransfer
+	replicatedUnknownCommandBorrowed
+)
+
+// proposeOwned transfers command to an outcome-unknown error. The caller must
+// pass one exclusively owned buffer and must stop using it when the returned
+// error carries it. This keeps transaction recovery from cloning a command
+// that was already built in an exactly charged buffer.
+func (executor *ReplicatedExecutor) proposeOwned(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, false,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandTransfer)
+}
+
+// retryUnknownBorrowed retries bytes retained and owned by a transaction
+// recovery handle. An unresolved result returns an outcome-unknown error that
+// deliberately carries no command: the handle remains the sole owner.
+func (executor *ReplicatedExecutor) retryUnknownBorrowed(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+) (ReplicatedResult, error) {
+	return executor.propose(ctx, route, command, nil, true,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandBorrowed)
 }
 
 func (executor *ReplicatedExecutor) propose(
@@ -633,6 +670,7 @@ func (executor *ReplicatedExecutor) propose(
 	hint *shardservice.ReplicatedMemberState,
 	priorUnknown bool,
 	capability serviceauthz.Capability,
+	unknownCommandMode replicatedUnknownCommandMode,
 ) (ReplicatedResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
 		!validReplicatedRoute(route) || len(command) == 0 ||
@@ -669,16 +707,15 @@ func (executor *ReplicatedExecutor) propose(
 				if lastUnknown != nil {
 					lastUnknown = errors.Join(lastUnknown, err)
 					if attempt+1 == executor.maxAttempts || context.Cause(ctx) != nil {
-						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-							Command: append([]byte(nil), original...), Cause: lastUnknown,
-						}
+						return ReplicatedResult{}, replicatedUnknownOutcomeError(
+							original, lastUnknown, unknownCommandMode,
+						)
 					}
 					preferred = nextReplicatedMember(route, preferred)
 					if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-							Command: append([]byte(nil), original...),
-							Cause:   errors.Join(lastUnknown, waitErr),
-						}
+						return ReplicatedResult{}, replicatedUnknownOutcomeError(
+							original, errors.Join(lastUnknown, waitErr), unknownCommandMode,
+						)
 					}
 					continue
 				}
@@ -700,10 +737,9 @@ func (executor *ReplicatedExecutor) propose(
 			preferred = nextReplicatedMember(route, endpoint.Member)
 			if attempt+1 != executor.maxAttempts {
 				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-						Command: append([]byte(nil), original...),
-						Cause:   errors.Join(lastUnknown, waitErr),
-					}
+					return ReplicatedResult{}, replicatedUnknownOutcomeError(
+						original, errors.Join(lastUnknown, waitErr), unknownCommandMode,
+					)
 				}
 			}
 			continue
@@ -790,10 +826,9 @@ func (executor *ReplicatedExecutor) propose(
 			if attempt+1 != executor.maxAttempts {
 				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
 					if lastUnknown != nil {
-						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-							Command: append([]byte(nil), original...),
-							Cause:   errors.Join(lastUnknown, err),
-						}
+						return ReplicatedResult{}, replicatedUnknownOutcomeError(
+							original, errors.Join(lastUnknown, err), unknownCommandMode,
+						)
 					}
 					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
 				}
@@ -813,10 +848,9 @@ func (executor *ReplicatedExecutor) propose(
 			preferred = nextReplicatedMember(route, endpoint.Member)
 			if attempt+1 != executor.maxAttempts {
 				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
-					return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-						Command: append([]byte(nil), original...),
-						Cause:   errors.Join(lastUnknown, err),
-					}
+					return ReplicatedResult{}, replicatedUnknownOutcomeError(
+						original, errors.Join(lastUnknown, err), unknownCommandMode,
+					)
 				}
 			}
 			continue
@@ -855,10 +889,9 @@ func (executor *ReplicatedExecutor) propose(
 				}
 				if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
 					if lastUnknown != nil {
-						return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-							Command: append([]byte(nil), original...),
-							Cause:   errors.Join(lastUnknown, err),
-						}
+						return ReplicatedResult{}, replicatedUnknownOutcomeError(
+							original, errors.Join(lastUnknown, err), unknownCommandMode,
+						)
 					}
 					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, err)
 				}
@@ -880,11 +913,32 @@ func (executor *ReplicatedExecutor) propose(
 		}
 	}
 	if lastUnknown != nil {
-		return ReplicatedResult{}, &raftservice.UnknownOutcomeError{
-			Command: append([]byte(nil), original...), Cause: lastUnknown,
-		}
+		return ReplicatedResult{}, replicatedUnknownOutcomeError(
+			original, lastUnknown, unknownCommandMode,
+		)
 	}
 	return ReplicatedResult{}, ErrReplicatedLeader
+}
+
+func replicatedUnknownOutcomeError(
+	command []byte,
+	cause error,
+	mode replicatedUnknownCommandMode,
+) error {
+	var retained []byte
+	switch mode {
+	case replicatedUnknownCommandClone:
+		retained = append([]byte(nil), command...)
+	case replicatedUnknownCommandTransfer:
+		retained = command[:len(command):len(command)]
+	case replicatedUnknownCommandBorrowed:
+		// The internal transaction retry path already retains the exact command
+		// under its byte reservation. Carrying it again in the joined error would
+		// create a second owner and could keep a replaced pending slice alive.
+	default:
+		panic("gateway: invalid replicated unknown command mode")
+	}
+	return &raftservice.UnknownOutcomeError{Command: retained, Cause: cause}
 }
 
 func waitReplicatedFailoverRetry(ctx context.Context, attempt int) error {

@@ -25,6 +25,18 @@ func encodeTransactionControl(
 	return encoded
 }
 
+func testTransactionRetirementPayload(
+	t testing.TB,
+	summary distributedtxn.ReplicatedRetirementSummary,
+) []byte {
+	t.Helper()
+	encoded, err := distributedtxn.AppendReplicatedRetirementSummary(nil, summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func testParticipantStageCommand(t testing.TB) Command {
 	t.Helper()
 	command := testMultiRelationCommand()
@@ -225,7 +237,10 @@ func TestTransactionTransitionsCarryNoRelationBatches(t *testing.T) {
 			ExpectedRevision: 9, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 		{Role: distributedtxn.ReplicatedRoleCoordinator,
 			Operation: distributedtxn.ReplicatedRetireCoordinator, ID: id,
-			ExpectedRevision: 10, PayloadKind: distributedtxn.ReplicatedPayloadNone},
+			ExpectedRevision: 10, PayloadKind: distributedtxn.ReplicatedPayloadRetirement,
+			Payload: testTransactionRetirementPayload(
+				t, distributedtxn.ReplicatedRetirementSummary{},
+			)},
 		{Role: distributedtxn.ReplicatedRoleParticipant,
 			Operation: distributedtxn.ReplicatedApplyReleaseParticipant, ID: id,
 			ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
@@ -312,6 +327,10 @@ func TestTransactionClientIdentityIsCanonical(t *testing.T) {
 	}
 	retire := commit
 	retire.Operation = distributedtxn.ReplicatedRetireCoordinator
+	retire.PayloadKind = distributedtxn.ReplicatedPayloadRetirement
+	retire.Payload = testTransactionRetirementPayload(
+		t, distributedtxn.ReplicatedRetirementSummary{},
+	)
 	retireBytes := encodeTransactionControl(t, retire)
 	retireSequence, err := TransactionClientSequence(retireBytes)
 	if err != nil || retireSequence == commitSequence || retireSequence != transactionCoordinatorRetireTag|17 {
@@ -575,6 +594,112 @@ func TestTransactionControlLengthAndAliasAreStrict(t *testing.T) {
 	before := len(dst)
 	if out, err := AppendCommand(dst, command); !errors.Is(err, ErrEnvelopeSemantic) || len(out) != before {
 		t.Fatalf("transaction append alias: len=%d err=%v", len(out), err)
+	}
+}
+
+func TestTransactionCommandSizePreflightIsExactAllocationFreeAndStrictlyOuter(t *testing.T) {
+	commands := []Command{
+		testFusedParticipantStageCommand(t),
+		testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleCoordinator,
+			Operation: distributedtxn.ReplicatedCommitCoordinator,
+			ID:        transactionControlID(0xe1), ExpectedRevision: 2,
+			PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		}),
+	}
+	for index := range commands {
+		command := commands[index]
+		want, err := CommandSize(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		controlBytes := len(command.Transaction)
+		preflight := command
+		preflight.Transaction = nil
+		preflight.Fingerprint = Digest{}
+		got, err := TransactionCommandSize(preflight, controlBytes)
+		if err != nil || got != want {
+			t.Fatalf("case %d preflight=%d final=%d err=%v", index, got, want, err)
+		}
+		encoded, err := AppendCommand(make([]byte, 0, got), command)
+		if err != nil || len(encoded) != got {
+			t.Fatalf("case %d encoded=%d preflight=%d err=%v", index, len(encoded), got, err)
+		}
+		if allocations := testing.AllocsPerRun(1000, func() {
+			size, sizeErr := TransactionCommandSize(preflight, controlBytes)
+			if sizeErr != nil || size != want {
+				panic(sizeErr)
+			}
+		}); allocations != 0 {
+			t.Fatalf("case %d preflight allocations=%v, want 0", index, allocations)
+		}
+	}
+}
+
+func TestTransactionCommandSizePreflightRejectsBoundsWithoutClaimingControlSemantics(t *testing.T) {
+	full := testFusedParticipantStageCommand(t)
+	controlBytes := len(full.Transaction)
+	preflight := full
+	preflight.Transaction = nil
+	preflight.Fingerprint = Digest{}
+
+	if _, err := TransactionCommandSize(full, controlBytes); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("present control error=%v", err)
+	}
+	ordinary := testCommand()
+	ordinary.Transaction = nil
+	if _, err := TransactionCommandSize(ordinary, controlBytes); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("ordinary command error=%v", err)
+	}
+	for _, bytes := range []int{-1, 0} {
+		if _, err := TransactionCommandSize(preflight, bytes); !errors.Is(err, ErrEnvelopeSemantic) {
+			t.Fatalf("control bytes %d error=%v", bytes, err)
+		}
+	}
+	if _, err := TransactionCommandSize(
+		preflight, distributedtxn.MaxReplicatedCommandBytes+1,
+	); !errors.Is(err, ErrEnvelopeTooLarge) {
+		t.Fatalf("oversized control error=%v", err)
+	}
+
+	badIdentity := preflight
+	badIdentity.ClientID = ID128{}
+	if _, err := TransactionCommandSize(badIdentity, controlBytes); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("zero client identity error=%v", err)
+	}
+	badBatches := preflight
+	badBatches.Batches = append([]RelationMutationBatch(nil), preflight.Batches...)
+	badBatches.Batches[0].Relation = 0
+	if _, err := TransactionCommandSize(badBatches, controlBytes); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("invalid relation batches error=%v", err)
+	}
+	badMutation := preflight
+	badMutation.Batches = append([]RelationMutationBatch(nil), preflight.Batches...)
+	badMutation.Batches[0].Mutations = append([]Mutation(nil), preflight.Batches[0].Mutations...)
+	badMutation.Batches[0].Mutations[0].Key = nil
+	if _, err := TransactionCommandSize(badMutation, controlBytes); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("invalid mutation error=%v", err)
+	}
+
+	terminal := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedCommitCoordinator,
+		ID:        transactionControlID(0xe2), ExpectedRevision: 2,
+		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+	})
+	terminalBytes := bytes.Clone(terminal.Transaction)
+	terminalFingerprint := terminal.Fingerprint
+	terminalControlBytes := len(terminal.Transaction)
+	terminal.Transaction = nil
+	terminal.Fingerprint = Digest{}
+	terminal.Batches = preflight.Batches
+	if _, err := TransactionCommandSize(terminal, terminalControlBytes); err != nil {
+		t.Fatalf("outer-only preflight inferred absent control semantics: %v", err)
+	}
+	terminal.Transaction = terminalBytes
+	terminal.Fingerprint = terminalFingerprint
+	if _, err := CommandSize(terminal); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("final semantic validation accepted mismatched control/batches: %v", err)
 	}
 }
 

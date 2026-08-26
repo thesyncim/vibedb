@@ -23,7 +23,8 @@ func manifestParticipant(index uint64) ParticipantRef {
 	return ParticipantRef{
 		Distribution: []byte("docs"), Shard: shard[:], RoutingVersion: 7,
 		AllocationGeneration: 11, OwnershipEpoch: 13,
-		MutationDigest: digest, State: ParticipantStaged,
+		AuthorityWitness: AuthorityWitness(digest[:16]),
+		MutationDigest:   digest, State: ParticipantStaged,
 	}
 }
 

@@ -448,9 +448,17 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		ID: id, ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	released, _, _ := submitRF3Transaction(t, ctx, cluster.owners[newLeader], cluster.group, release)
+	retirement, err := distributedtxn.AppendReplicatedRetirementSummary(
+		nil,
+		distributedtxn.ReplicatedRetirementSummary{AffectedRows: 1, AffectedRowsValid: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	retire := rf3TransactionCommand(t, cluster.bases[newLeader], distributedtxn.ReplicatedCommand{
 		Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedRetireCoordinator,
-		ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadRetirement,
+		Payload: retirement,
 	}, nil)
 	retired, _, _ := submitRF3Transaction(t, ctx, cluster.owners[newLeader], cluster.group, retire)
 	waitRF3Applied(t, ctx, cluster.owners[:], removed, cluster.group,

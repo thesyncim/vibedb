@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -114,6 +115,26 @@ func id128(seed byte) replication.ID128 {
 		id[i] = seed + byte(i)
 	}
 	return id
+}
+
+func transactionRouteAuthorityWitness(
+	binding Binding,
+	manifestDigest [sha256.Size]byte,
+) distributedtxn.AuthorityWitness {
+	digest := replication.RouteAuthorityDigest(replication.RouteAuthority{
+		ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
+		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
+		ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
+		AllocationGeneration: binding.AllocationGeneration, ReplicaSetVersion: 1,
+		ActivePolicyGeneration: binding.ActivePolicyGeneration,
+		ProtectionEpoch:        binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,
+		SchemaGeneration:       binding.SchemaGeneration,
+		RelationManifestDigest: replication.Digest(manifestDigest),
+		RoutingVersion:         binding.RoutingVersion, RouteGeneration: binding.RouteGeneration,
+	})
+	var witness distributedtxn.AuthorityWitness
+	copy(witness[:], digest[:len(witness)])
+	return witness
 }
 
 func testBootstrap() *pb.Snapshot {

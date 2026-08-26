@@ -639,6 +639,7 @@ func (session *NativeSession) executePending(
 	}
 	result, err := session.executor.propose(
 		ctx, session.route, session.command, hint, priorUnknown, session.proposalCapability,
+		replicatedUnknownCommandClone,
 	)
 	if err != nil {
 		if errors.Is(err, raftservice.ErrOutcomeUnknown) {
@@ -938,6 +939,95 @@ func nativeCommandFingerprint(command replication.Command) replication.Digest {
 		binary.LittleEndian.PutUint64(scalar[:], uint64(len(batch.Mutations)))
 		_, _ = hasher.Write(scalar[:])
 		for _, mutation := range batch.Mutations {
+			binary.LittleEndian.PutUint64(scalar[:], uint64(mutation.Kind))
+			_, _ = hasher.Write(scalar[:])
+			binary.LittleEndian.PutUint64(scalar[:], uint64(len(mutation.Key)))
+			_, _ = hasher.Write(scalar[:])
+			_, _ = hasher.Write(mutation.Key)
+			binary.LittleEndian.PutUint64(scalar[:], uint64(len(mutation.Value)))
+			_, _ = hasher.Write(scalar[:])
+			_, _ = hasher.Write(mutation.Value)
+			binary.LittleEndian.PutUint64(scalar[:], mutation.ExpectedValueLength)
+			_, _ = hasher.Write(scalar[:])
+			_, _ = hasher.Write(mutation.ExpectedValueDigest[:])
+		}
+	}
+	var result replication.Digest
+	_ = hasher.Sum(result[:0])
+	return result
+}
+
+// nativeCommandViewFingerprint recomputes the semantic fingerprint directly
+// from a validated borrowed envelope. Detached recovery uses it to reject an
+// opaque fingerprint alteration before selecting a replicated retry slot.
+func nativeCommandViewFingerprint(command replication.CommandView) replication.Digest {
+	hasher := sha256.New()
+	_, _ = hasher.Write(nativeFingerprintDomain)
+	var scalar [8]byte
+	binary.LittleEndian.PutUint64(scalar[:], uint64(command.Kind()))
+	_, _ = hasher.Write(scalar[:])
+	if command.AuthorityClass == replication.CommandAuthorityTopology {
+		_, _ = hasher.Write(nativeTopologyAuthorityMarker)
+	}
+	_, _ = hasher.Write(command.ClusterID[:])
+	_, _ = hasher.Write(command.ClusterIncarnation[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.TopologyRecoveryEpoch)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Distribution)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.Distribution)
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Shard)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.Shard)
+	binary.LittleEndian.PutUint64(scalar[:], command.AllocationGeneration)
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.ShardIncarnation[:])
+	_, _ = hasher.Write(command.GroupID[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.ReplicaSetVersion)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.ActivePolicyGeneration)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.ProtectionEpoch)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.OwnershipEpoch)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.SchemaGeneration)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.RoutingVersion)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.RouteGeneration)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(command.Tenant)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.Tenant)
+	_, _ = hasher.Write(command.ClientID[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.ClientEpoch)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.ClientSequence)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], command.AckThrough)
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(command.ExpectedDeadlineUnixNano))
+	_, _ = hasher.Write(scalar[:])
+	binary.LittleEndian.PutUint64(scalar[:], uint64(command.NextDeadlineUnixNano))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(command.RetryHome[:])
+	transaction := command.TransactionBytes()
+	binary.LittleEndian.PutUint64(scalar[:], uint64(len(transaction)))
+	_, _ = hasher.Write(scalar[:])
+	_, _ = hasher.Write(transaction)
+	binary.LittleEndian.PutUint64(scalar[:], uint64(command.RelationCount()))
+	_, _ = hasher.Write(scalar[:])
+	relations := command.RelationBatches()
+	for relations.Next() {
+		batch := relations.Batch()
+		binary.LittleEndian.PutUint64(scalar[:], uint64(batch.Relation))
+		_, _ = hasher.Write(scalar[:])
+		binary.LittleEndian.PutUint64(scalar[:], uint64(batch.MutationCount()))
+		_, _ = hasher.Write(scalar[:])
+		mutations := batch.Mutations()
+		for mutations.Next() {
+			mutation := mutations.Mutation()
 			binary.LittleEndian.PutUint64(scalar[:], uint64(mutation.Kind))
 			_, _ = hasher.Write(scalar[:])
 			binary.LittleEndian.PutUint64(scalar[:], uint64(len(mutation.Key)))

@@ -3,6 +3,7 @@ package replication
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"testing"
 	"unsafe"
@@ -225,8 +226,8 @@ func TestReplicatedTransactionEncodedSchedulePerformanceTargets(t *testing.T) {
 		{participants: 1, critical: 1, total: 1, barriers: 1},
 		{participants: 2, critical: 5, total: 6, barriers: 4},
 		{participants: 65, critical: 131, total: 132, barriers: 4, manifestPages: 1},
-		// 4097 deliberately crosses both the inline threshold and one page.
-		{participants: 4097, critical: 8195, total: 8196, barriers: 4, manifestPages: 5},
+		// 4097 deliberately crosses both the inline threshold and several pages.
+		{participants: 4097, critical: 8195, total: 8196, barriers: 4, manifestPages: 6},
 	}
 	for _, test := range tests {
 		got := buildReplicatedTransactionPerformanceSchedule(t, test.participants)
@@ -639,11 +640,15 @@ func buildReplicatedTransactionPerformanceSchedule(
 	metrics.barriers++ // parallel apply plus release wave
 
 	metrics.retireRevision = metrics.decisionRevision + 1
+	retirement := testTransactionRetirementPayload(t, distributedtxn.ReplicatedRetirementSummary{
+		AffectedRows: int64(participants), AffectedRowsValid: true,
+	})
 	appendCommand(distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedRetireCoordinator,
 		ID:        id, ExpectedRevision: metrics.retireRevision,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		PayloadKind: distributedtxn.ReplicatedPayloadRetirement,
+		Payload:     retirement,
 	}, nil, refs[0], false, nil)
 	return metrics
 }
@@ -654,12 +659,15 @@ func transactionPerformanceParticipants(
 ) []distributedtxn.ParticipantRef {
 	participants := make([]distributedtxn.ParticipantRef, count)
 	for index := range participants {
+		var authority distributedtxn.AuthorityWitness
+		binary.LittleEndian.PutUint64(authority[:8], uint64(index+1))
 		participants[index] = distributedtxn.ParticipantRef{
 			Distribution:   []byte("data"),
 			Shard:          []byte(fmt.Sprintf("s%08d", index)),
 			RoutingVersion: 1, AllocationGeneration: uint64(index + 1),
-			OwnershipEpoch: uint64(index + 1), MutationDigest: digest,
-			State: distributedtxn.ParticipantStaged,
+			OwnershipEpoch: uint64(index + 1), AuthorityWitness: authority,
+			MutationDigest: digest,
+			State:          distributedtxn.ParticipantStaged,
 		}
 	}
 	return participants

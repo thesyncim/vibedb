@@ -316,7 +316,7 @@ func validReplicatedTransactionRecoveryRecord(
 	if wantRole == distributedtxn.ReplicatedRoleCoordinator {
 		state := distributedtxn.CoordinatorState(record.State)
 		if record.PayloadCount == 0 || record.CancellationWitness || record.ParticipantOrdinal != 0 ||
-			!state.CanTransitionTo(state) || record.AffectedRowsValid || record.AffectedRows != 0 ||
+			!state.CanTransitionTo(state) || !validReplicatedCoordinatorAffectedRows(state, record) ||
 			(record.PayloadKind != distributedtxn.ReplicatedPayloadCoordinator &&
 				record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator) ||
 			!validReplicatedCoordinatorDecision(state, record.CoordinatorDecision) {
@@ -359,6 +359,20 @@ func validReplicatedTransactionRecoveryRecord(
 	default:
 		return false
 	}
+}
+
+func validReplicatedCoordinatorAffectedRows(
+	state distributedtxn.CoordinatorState,
+	record replicatedstate.TransactionRecoveryRecord,
+) bool {
+	if state != distributedtxn.CoordinatorRetired {
+		return !record.AffectedRowsValid && record.AffectedRows == 0
+	}
+	if record.CoordinatorDecision == distributedtxn.CoordinatorCommitted {
+		return record.AffectedRowsValid
+	}
+	return record.CoordinatorDecision == distributedtxn.CoordinatorAborted &&
+		!record.AffectedRowsValid && record.AffectedRows == 0
 }
 
 func validReplicatedCoordinatorDecision(
