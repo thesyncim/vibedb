@@ -13,11 +13,6 @@ import (
 var requestLedgerStateDigestDomain = []byte("vibedb/replicated-state/request-ledger-state\x00")
 var errStopRequestLedgerGCScan = errors.New("replicatedstate: stop request-ledger GC scan")
 
-// requestLedgerMaxPlanningLeaseEntries bounds a caller-selected planning
-// lease in the replicated applied-index domain. It is part of the apply
-// contract below; wall clocks never participate in expiry decisions.
-const requestLedgerMaxPlanningLeaseEntries uint64 = 1 << 20
-
 type requestLedgerStateDelta struct {
 	rows          int64
 	residentBytes int64
@@ -167,7 +162,7 @@ func (m *Machine) planRequestLedgerCommand(
 	case requestledger.OperationAppendPages:
 		return planRequestLedgerAppendPages(plan, command, rows, snapshot)
 	case requestledger.OperationSeal:
-		return planRequestLedgerSeal(plan, command, rows)
+		return planRequestLedgerSeal(plan, command, rows, snapshot)
 	case requestledger.OperationPutPending:
 		return planRequestLedgerPutPending(plan, command, rows)
 	case requestledger.OperationAdvance:
@@ -198,9 +193,9 @@ func (m *Machine) planRequestLedgerCommand(
 		requestledger.OperationRecordRoutePinReleased:
 		return planRequestLedgerRoutePin(plan, command, rows)
 	case requestledger.OperationExpirePlanning:
-		return planRequestLedgerExpirePlanning(plan, command, rows, state)
+		return planRequestLedgerExpirePlanning(plan, command, rows, state, snapshot)
 	case requestledger.OperationRestartPlanning:
-		return m.planRequestLedgerRestartPlanning(plan, command, rows, state)
+		return m.planRequestLedgerRestartPlanning(plan, command, rows, state, snapshot)
 	case requestledger.OperationCleanupPlanning:
 		return planRequestLedgerCleanupPlanning(plan, command, rows, snapshot)
 	default:
@@ -219,6 +214,7 @@ func planRequestLedgerExpirePlanning(
 	command requestledger.CommandView,
 	rows requestLedgerRows,
 	state State,
+	snapshot pointSnapshot,
 ) (requestLedgerCommandPlan, error) {
 	request, _ := command.PlanningExpiry()
 	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhaseExpired &&
@@ -245,6 +241,10 @@ func planRequestLedgerExpirePlanning(
 		return plan, ErrStateCorrupt
 	}
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	plan, err = deleteRequestLedgerPlanningExpiry(plan, rows.head, rows.home, snapshot)
+	if err != nil {
+		return plan, err
+	}
 	return replaceRequestLedgerHead(plan, rows, next)
 }
 
@@ -253,6 +253,7 @@ func (m *Machine) planRequestLedgerRestartPlanning(
 	command requestledger.CommandView,
 	rows requestLedgerRows,
 	state State,
+	snapshot pointSnapshot,
 ) (requestLedgerCommandPlan, error) {
 	request, _ := command.PlanningRestart()
 	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhasePlanning &&
@@ -262,9 +263,9 @@ func (m *Machine) planRequestLedgerRestartPlanning(
 		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
 	}
 	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseExpired ||
-		state.Applied >= math.MaxUint64-requestLedgerMaxPlanningLeaseEntries-1 ||
+		state.Applied >= math.MaxUint64-rows.head.PlanningLeaseSpan-1 ||
 		request.ObservedAppliedIndex > state.Applied+1 ||
-		request.NextLeaseExpiryIndex != state.Applied+1+requestLedgerMaxPlanningLeaseEntries {
+		request.NextLeaseExpiryIndex != state.Applied+1+rows.head.PlanningLeaseSpan {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
 	next, err := requestledger.RestartPlanning(rows.head, request, command.Revision)
@@ -292,6 +293,10 @@ func (m *Machine) planRequestLedgerRestartPlanning(
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
 	plan.delta.reservedBytes += int64(additional)
+	plan, err = putRequestLedgerPlanningExpiry(plan, next, rows.home, snapshot, false)
+	if err != nil {
+		return plan, err
+	}
 	return replaceRequestLedgerHead(plan, rows, next)
 }
 
@@ -433,7 +438,8 @@ func (m *Machine) planRequestLedgerCreate(
 ) (requestLedgerCommandPlan, error) {
 	head, _ := command.Head()
 	if rows.headFound {
-		if bytes.Equal(rows.headRaw, command.Payload) {
+		if rows.head.Revision == 1 && requestledger.SameCreateBytes(rows.headRaw, command.Payload) {
+			plan.completion.PlanningLeaseExpiryIndex = rows.head.PlanningLeaseExpiryIndex
 			return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
 		}
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
@@ -441,21 +447,37 @@ func (m *Machine) planRequestLedgerCreate(
 	if rows.pendingFound || rows.continuationFound || rows.terminalFound {
 		return plan, ErrStateCorrupt
 	}
-	if head.Phase == requestledger.PhasePlanning {
-		if state.Applied >= math.MaxUint64-requestLedgerMaxPlanningLeaseEntries-1 ||
-			head.PlanningLeaseExpiryIndex != state.Applied+1+requestLedgerMaxPlanningLeaseEntries ||
-			head.PlanningLeaseGeneration != head.PlanBuildGeneration {
-			plan.completion.ResultCode = ResultRequestLedgerCapacity
-			plan.completion.Phase = requestledger.PhaseInvalid
-			return plan, nil
-		}
+	if state.Applied == math.MaxUint64 {
+		plan.completion.ResultCode = ResultRequestLedgerCapacity
+		plan.completion.Phase = requestledger.PhaseInvalid
+		return plan, nil
 	}
+	materialized, materializeErr := requestledger.MaterializeCreate(head, state.Applied+1)
+	if materializeErr != nil || materialized.PlanningLeaseGeneration != materialized.PlanBuildGeneration {
+		plan.completion.ResultCode = ResultRequestLedgerCapacity
+		plan.completion.Phase = requestledger.PhaseInvalid
+		return plan, nil
+	}
+	head = materialized
 	encoded, err := requestledger.AppendHead(nil, head)
 	if err != nil {
 		return plan, err
 	}
 	key := requestledger.AppendHeadKey(nil, command.Home, head.KeyDigest)
 	resident := uint64(len(key) + len(encoded))
+	var expiryKey, expiryRaw []byte
+	if head.Phase == requestledger.PhasePlanning {
+		expiry, expiryErr := requestledger.NewPlanningExpiryIndexRecord(head)
+		if expiryErr != nil {
+			return plan, errors.Join(expiryErr, ErrStateCorrupt)
+		}
+		expiryKey = requestledger.AppendPlanningExpiryKey(nil, expiry.ExpiryAppliedIndex, command.Home, head.KeyDigest)
+		expiryRaw, expiryErr = requestledger.AppendPlanningExpiryIndex(nil, expiry)
+		if expiryErr != nil || resident > math.MaxUint64-uint64(len(expiryKey)+len(expiryRaw)) {
+			return plan, errors.Join(expiryErr, ErrAdmissionBound)
+		}
+		resident += uint64(len(expiryKey) + len(expiryRaw))
+	}
 	_, reserved, reservationErr := requestledger.Reservation(head)
 	if reservationErr != nil || resident > math.MaxUint64-reserved {
 		return plan, ErrAdmissionBound
@@ -469,8 +491,12 @@ func (m *Machine) planRequestLedgerCreate(
 		return plan, nil
 	}
 	plan.rows = append(plan.rows, newTransactionPut(key, encoded))
-	plan.delta = requestLedgerStateDelta{rows: 1, residentBytes: int64(resident), reservedBytes: int64(reserved)}
+	if len(expiryKey) != 0 {
+		plan.rows = append(plan.rows, newTransactionPut(expiryKey, expiryRaw))
+	}
+	plan.delta = requestLedgerStateDelta{rows: int64(len(plan.rows)), residentBytes: int64(resident), reservedBytes: int64(reserved)}
 	plan = witnessedRequestLedgerApplied(plan, head.Revision, head.Phase, encoded, false)
+	plan.completion.PlanningLeaseExpiryIndex = head.PlanningLeaseExpiryIndex
 	return m.planRequestLedgerSequencedCreate(plan, command, head, state, snapshot)
 }
 
@@ -550,7 +576,7 @@ func planRequestLedgerAppendPages(
 	return replaceRequestLedgerHead(plan, rows, next)
 }
 
-func planRequestLedgerSeal(plan requestLedgerCommandPlan, command requestledger.CommandView, rows requestLedgerRows) (requestLedgerCommandPlan, error) {
+func planRequestLedgerSeal(plan requestLedgerCommandPlan, command requestledger.CommandView, rows requestLedgerRows, snapshot pointSnapshot) (requestLedgerCommandPlan, error) {
 	if rows.head.Revision == command.Revision && rows.head.Phase == requestledger.PhaseSealed {
 		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true), nil
 	}
@@ -561,7 +587,61 @@ func planRequestLedgerSeal(plan requestLedgerCommandPlan, command requestledger.
 	if err != nil {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
+	plan, err = deleteRequestLedgerPlanningExpiry(plan, rows.head, rows.home, snapshot)
+	if err != nil {
+		return plan, err
+	}
 	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func deleteRequestLedgerPlanningExpiry(
+	plan requestLedgerCommandPlan,
+	head requestledger.HeadRecord,
+	home requestledger.LedgerHome,
+	snapshot pointSnapshot,
+) (requestLedgerCommandPlan, error) {
+	record, err := requestledger.NewPlanningExpiryIndexRecord(head)
+	if err != nil {
+		return plan, errors.Join(err, ErrStateCorrupt)
+	}
+	key := requestledger.AppendPlanningExpiryKey(nil, record.ExpiryAppliedIndex, home, head.KeyDigest)
+	raw, found, err := snapshot.appendRaw(nil, key)
+	if err != nil || !found {
+		return plan, errors.Join(err, ErrStateCorrupt)
+	}
+	stored, openErr := requestledger.OpenPlanningExpiryIndex(raw)
+	if openErr != nil || stored != record {
+		return plan, errors.Join(openErr, ErrStateCorrupt)
+	}
+	plan.rows = append(plan.rows, newTransactionDelete(key))
+	plan.delta.rows--
+	plan.delta.residentBytes -= int64(len(key) + len(raw))
+	return plan, nil
+}
+
+func putRequestLedgerPlanningExpiry(
+	plan requestLedgerCommandPlan,
+	head requestledger.HeadRecord,
+	home requestledger.LedgerHome,
+	snapshot pointSnapshot,
+	exactDuplicate bool,
+) (requestLedgerCommandPlan, error) {
+	record, err := requestledger.NewPlanningExpiryIndexRecord(head)
+	if err != nil {
+		return plan, errors.Join(err, ErrStateCorrupt)
+	}
+	key := requestledger.AppendPlanningExpiryKey(nil, record.ExpiryAppliedIndex, home, head.KeyDigest)
+	if _, found, readErr := snapshot.appendRaw(nil, key); readErr != nil || found != exactDuplicate {
+		return plan, errors.Join(readErr, ErrStateCorrupt)
+	}
+	raw, err := requestledger.AppendPlanningExpiryIndex(nil, record)
+	if err != nil {
+		return plan, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(key, raw))
+	plan.delta.rows++
+	plan.delta.residentBytes += int64(len(key) + len(raw))
+	return plan, nil
 }
 
 func planRequestLedgerPutPending(plan requestLedgerCommandPlan, command requestledger.CommandView, rows requestLedgerRows) (requestLedgerCommandPlan, error) {

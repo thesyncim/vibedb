@@ -189,7 +189,7 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 	}
 	copy(contract.PlanBuildID[:], recipe[offset:offset+32])
 	offset += 32
-	contract.PlanningLeaseExpiryIndex = binary.LittleEndian.Uint64(recipe[offset : offset+8])
+	contract.PlanningLeaseSpan = binary.LittleEndian.Uint64(recipe[offset : offset+8])
 	offset += 8
 	contract.PlanningLeaseGeneration = binary.LittleEndian.Uint64(recipe[offset : offset+8])
 	offset += 8
@@ -268,7 +268,8 @@ func validDurableRequestStreamFixedContract(reader durableRequestRecipeStreamRea
 		contract.MaxActivePayloadBytes > requestledger.MaxDynamicWavePayloadBytes ||
 		contract.MaxActivePayloadChunks > requestledger.MaxDynamicWavePayloadChunks ||
 		contract.PlanBuildID != durableRequestPlanBuildID(reader.KeyDigest, reader.RequestDigest) ||
-		contract.PlanningLeaseExpiryIndex == 0 || contract.PlanningLeaseGeneration == 0 {
+		contract.PlanningLeaseSpan == 0 || contract.PlanningLeaseSpan > requestledger.MaxPlanningLeaseSpan ||
+		contract.PlanningLeaseGeneration == 0 {
 		return false
 	}
 	program := DurableRequestLogicalProgram{

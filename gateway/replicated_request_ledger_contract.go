@@ -192,7 +192,8 @@ func durableRequestLogicalProgramBaseValid(program DurableRequestLogicalProgram)
 		contract.MaxActivePayloadBytes > requestledger.MaxDynamicWavePayloadBytes ||
 		contract.MaxActivePayloadChunks > requestledger.MaxDynamicWavePayloadChunks ||
 		contract.PlanBuildID != durableRequestPlanBuildID(program.KeyDigest, program.RequestDigest) ||
-		contract.PlanningLeaseExpiryIndex == 0 || contract.PlanningLeaseGeneration == 0 {
+		contract.PlanningLeaseSpan == 0 || contract.PlanningLeaseSpan > requestledger.MaxPlanningLeaseSpan ||
+		contract.PlanningLeaseGeneration == 0 {
 		return false
 	}
 	for index := range program.Participants {
@@ -336,7 +337,7 @@ func durableRequestProtocolProgramDigest(contract DurableRequestExecutionContrac
 	writeDurableRequestU64(hash, &scratch, contract.AbortFinalWaveCount)
 	writeDurableRequestU64(hash, &scratch, contract.MaxActivePayloadBytes)
 	writeDurableRequestU64(hash, &scratch, contract.MaxActivePayloadChunks)
-	writeDurableRequestU64(hash, &scratch, contract.PlanningLeaseExpiryIndex)
+	writeDurableRequestU64(hash, &scratch, contract.PlanningLeaseSpan)
 	writeDurableRequestU64(hash, &scratch, contract.PlanningLeaseGeneration)
 	return sumDurableRequestDigest(hash)
 }
@@ -362,7 +363,7 @@ func durableRequestTerminalContractDigest(contract DurableRequestExecutionContra
 		contract.MaxContinuationBytes, contract.MaxTerminalBytes,
 		contract.CommitFinalWaveCount, contract.AbortFinalWaveCount,
 		contract.MaxActivePayloadBytes, contract.MaxActivePayloadChunks,
-		contract.PlanningLeaseExpiryIndex, contract.PlanningLeaseGeneration,
+		contract.PlanningLeaseSpan, contract.PlanningLeaseGeneration,
 	} {
 		writeDurableRequestU64(hash, &scratch, value)
 	}

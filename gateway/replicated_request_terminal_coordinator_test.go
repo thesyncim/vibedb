@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"math"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -297,7 +296,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 		MaxActivePayloadBytes:        2 * requestledger.MaxPlanPageBytes,
 		MaxActivePayloadChunks:       2,
 		PlanBuildID:                  lifecycleDigest("terminal-plan-build"), PlanBuildGeneration: 1,
-		PlanningLeaseExpiryIndex: math.MaxUint64, PlanningLeaseGeneration: 1,
+		PlanningLeaseSpan: requestledger.MaxPlanningLeaseSpan, PlanningLeaseGeneration: 1,
 		TerminalTransitionTag: 9, FinalWaveCount: 1,
 		TerminalStateDigest:        requestledger.NextStateDigest(9, cursor),
 		TerminalSummaryDigest:      lifecycleDigest("terminal-retirement"),

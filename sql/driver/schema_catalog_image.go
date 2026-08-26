@@ -28,6 +28,23 @@ type ReplicatedSchemaCatalogImage struct {
 	ApplyProfileDigest          [sha256.Size]byte
 }
 
+// MatchesRolloutTarget compares the fields a shard installer receives outside
+// the opaque catalog bytes. Apply-contract matching is intentionally separate:
+// it must use SchemaApplyContractDigest from the materialized target machine,
+// never the catalog's validation-profile digest.
+func (image ReplicatedSchemaCatalogImage) MatchesRolloutTarget(
+	bytes uint64,
+	digest [sha256.Size]byte,
+	schemaGeneration uint64,
+	relationManifest [sha256.Size]byte,
+) bool {
+	return image.Bytes != 0 && image.Bytes == bytes &&
+		image.Digest != ([sha256.Size]byte{}) && image.Digest == digest &&
+		image.SchemaGeneration != 0 && image.SchemaGeneration == schemaGeneration &&
+		image.RelationManifestDigest != ([sha256.Size]byte{}) &&
+		image.RelationManifestDigest == relationManifest
+}
+
 // ValidateReplicatedSchemaCatalogImage admits only a byte-unique canonical
 // vibejson catalog. Decode performs the existing allocation, depth, key,
 // collection-count, descriptor, and replicated-sidecar bounds; re-encoding

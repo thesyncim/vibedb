@@ -53,6 +53,8 @@ type requestLedgerImageScanner struct {
 	issuerHighwaters                                         map[requestLedgerIssuerScanKey]requestledger.IssuerHighwaterRecord
 	expectedIssuerSequences, actualIssuerSequences           uint64
 	expectedIssuerSequenceDigest, actualIssuerSequenceDigest requestledger.Digest
+	expectedPlanningExpiry, actualPlanningExpiry             uint64
+	expectedPlanningExpiryDigest, actualPlanningExpiryDigest requestledger.Digest
 }
 
 type requestLedgerIssuerScanKey struct {
@@ -321,6 +323,15 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 			scan.routePinFound || scan.preparedFound || scan.schemaPinFound || scan.payloadChunkCount != 0) {
 		return fmt.Errorf("%w: request ledger planning children", ErrStateCorrupt)
 	}
+	if scan.head.Phase == requestledger.PhasePlanning {
+		expiry, expiryErr := requestledger.NewPlanningExpiryIndexRecord(scan.head)
+		if expiryErr != nil || scan.expectedPlanningExpiry == math.MaxUint64 {
+			return errors.Join(expiryErr, ErrStateCorrupt)
+		}
+		scan.expectedPlanningExpiry++
+		xorRequestLedgerDigest(&scan.expectedPlanningExpiryDigest,
+			requestledger.PlanningExpiryIndexDigest(expiry))
+	}
 	if scan.payloadBuildFound {
 		build := scan.payloadBuild
 		if scan.head.Phase != requestledger.PhaseSealed || build.RequestDigest != scan.head.RequestDigest ||
@@ -487,6 +498,29 @@ func (scan *requestLedgerImageScanner) observeIssuerHighwater(key, value []byte)
 	return scan.addIssuerRowBytes(key, value)
 }
 
+func (scan *requestLedgerImageScanner) observePlanningExpiry(key, value []byte) error {
+	if scan == nil || !scan.authority.enabled() {
+		return ErrStateCorrupt
+	}
+	if scan.current {
+		if err := scan.finishRequest(); err != nil {
+			return err
+		}
+		scan.resetRequest()
+	}
+	index, home, digest, keyErr := requestledger.OpenPlanningExpiryKey(key)
+	record, openErr := requestledger.OpenPlanningExpiryIndex(value)
+	if keyErr != nil || openErr != nil || !scan.authority.contains(home) ||
+		record.ExpiryAppliedIndex != index || record.Home != home || record.KeyDigest != digest ||
+		scan.actualPlanningExpiry == math.MaxUint64 {
+		return errors.Join(keyErr, openErr, ErrStateCorrupt)
+	}
+	scan.actualPlanningExpiry++
+	xorRequestLedgerDigest(&scan.actualPlanningExpiryDigest,
+		requestledger.PlanningExpiryIndexDigest(record))
+	return scan.addIssuerRowBytes(key, value)
+}
+
 func (scan *requestLedgerImageScanner) observeIssuerSequence(key, value []byte) error {
 	if scan == nil || !scan.authority.enabled() {
 		return ErrStateCorrupt
@@ -536,12 +570,17 @@ func (scan *requestLedgerImageScanner) resetRequest() {
 	issuerHighwaters := scan.issuerHighwaters
 	expectedIssuerSequences, actualIssuerSequences := scan.expectedIssuerSequences, scan.actualIssuerSequences
 	expectedIssuerSequenceDigest, actualIssuerSequenceDigest := scan.expectedIssuerSequenceDigest, scan.actualIssuerSequenceDigest
+	expectedPlanningExpiry, actualPlanningExpiry := scan.expectedPlanningExpiry, scan.actualPlanningExpiry
+	expectedPlanningExpiryDigest, actualPlanningExpiryDigest := scan.expectedPlanningExpiryDigest, scan.actualPlanningExpiryDigest
 	*scan = requestLedgerImageScanner{capacity: capacity, cleanup: cleanup, authority: authority,
 		rows: rows, resident: resident, reserved: reserved, ackRows: ackRows, ackBytes: ackBytes,
 		issuerHighwaters:        issuerHighwaters,
 		expectedIssuerSequences: expectedIssuerSequences, actualIssuerSequences: actualIssuerSequences,
 		expectedIssuerSequenceDigest: expectedIssuerSequenceDigest,
-		actualIssuerSequenceDigest:   actualIssuerSequenceDigest}
+		actualIssuerSequenceDigest:   actualIssuerSequenceDigest,
+		expectedPlanningExpiry:       expectedPlanningExpiry, actualPlanningExpiry: actualPlanningExpiry,
+		expectedPlanningExpiryDigest: expectedPlanningExpiryDigest,
+		actualPlanningExpiryDigest:   actualPlanningExpiryDigest}
 }
 
 func (scan *requestLedgerImageScanner) finish(state State) error {
@@ -554,6 +593,10 @@ func (scan *requestLedgerImageScanner) finish(state State) error {
 	if scan.expectedIssuerSequences != scan.actualIssuerSequences ||
 		scan.expectedIssuerSequenceDigest != scan.actualIssuerSequenceDigest {
 		return fmt.Errorf("%w: request ledger issuer sequence image", ErrStateCorrupt)
+	}
+	if scan.expectedPlanningExpiry != scan.actualPlanningExpiry ||
+		scan.expectedPlanningExpiryDigest != scan.actualPlanningExpiryDigest {
+		return fmt.Errorf("%w: request ledger planning expiry image", ErrStateCorrupt)
 	}
 	if scan.rows != state.RequestLedgerRows || scan.resident != state.RequestLedgerResidentBytes ||
 		scan.reserved != state.RequestLedgerReservedBytes || scan.ackRows != state.RequestLedgerAckRows ||

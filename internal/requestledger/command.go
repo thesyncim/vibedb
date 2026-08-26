@@ -483,6 +483,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		MaxSchemaPinReleaseRecordBytes,
 		PlanningExpiryRequestBytes, PlanningRestartRequestBytes, PlanningCleanupRequestBytes,
 		PlanningExpiryKeyBytes, PlanningExpiryRecordBytes,
+		MaxPlanningLeaseSpan, UnmaterializedPlanningLeaseExpiryIndex,
 		ReadyStorageKeyBytes, ReadyRecordBytes, PrincipalQuotaKeyBytes, PrincipalQuotaRecordBytes,
 		IssuerHighwaterKeyBytes, IssuerHighwaterRecordBytes,
 		IssuerSequenceKeyBytes, IssuerSequenceRecordBytes, IssuerAdvanceRequestBytes,

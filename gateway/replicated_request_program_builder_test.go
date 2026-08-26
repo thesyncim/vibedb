@@ -25,7 +25,7 @@ func durableRequestProgramBuildFixture(t *testing.T) DurableRequestLogicalProgra
 	return DurableRequestLogicalProgramBuild{
 		Home: home, Key: request.Key, Tenant: slices.Clone(request.Program.Tenant),
 		CatalogGeneration: request.Program.Identity.CatalogGeneration,
-		RecoveryDeadline:  3, PlanningLeaseExpiryIndex: 100,
+		RecoveryDeadline:  3, PlanningLeaseSpan: 100,
 		PlanningLeaseGeneration: 1, PinEpoch: 1, Participants: participants,
 	}
 }

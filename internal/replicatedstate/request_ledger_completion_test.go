@@ -15,7 +15,8 @@ func TestRequestLedgerCompletionResultRoundTripStrict(t *testing.T) {
 		ResultCode: ResultApplied, Revision: 7, ExactDuplicate: true,
 		KeyDigest: requestledger.Digest{1}, RequestDigest: requestledger.Digest{2},
 		PlanRoot: requestledger.Digest{3}, RangeIdentity: requestledger.Digest{4},
-		StateDigest: requestledger.Digest{5},
+		StateDigest:              requestledger.Digest{5},
+		PlanningLeaseExpiryIndex: 100,
 	}
 	encoded, err := AppendRequestLedgerCompletionResult(nil, result)
 	if err != nil || len(encoded) != RequestLedgerCompletionResultBytes {
@@ -33,7 +34,7 @@ func TestRequestLedgerCompletionResultRoundTripStrict(t *testing.T) {
 	}); got != 0 {
 		t.Fatalf("open allocations = %v, want 0", got)
 	}
-	for _, offset := range []int{2, 3, 8, 16, 48, 80, 112, 144} {
+	for _, offset := range []int{2, 3, 8, 16, 48, 80, 112, 144, 176} {
 		candidate := bytes.Clone(encoded)
 		if offset == 2 || offset == 3 {
 			candidate[offset] |= 0x80
@@ -57,6 +58,9 @@ func TestRequestLedgerCompletionAcceptsEveryCanonicalOperation(t *testing.T) {
 			KeyDigest: requestledger.Digest{1}, RequestDigest: requestledger.Digest{2},
 			PlanRoot: requestledger.Digest{3}, RangeIdentity: requestledger.Digest{4},
 			StateDigest: requestledger.Digest{5},
+		}
+		if operation == requestledger.OperationCreate {
+			result.PlanningLeaseExpiryIndex = 100
 		}
 		encoded, err := AppendRequestLedgerCompletionResult(nil, result)
 		if err != nil {
@@ -89,6 +93,7 @@ func TestRequestLedgerCapacityCompletionIsExplicitlyStateless(t *testing.T) {
 		func(value *RequestLedgerCompletionResult) { value.StateDigest[0] = 1 },
 		func(value *RequestLedgerCompletionResult) { value.ExactDuplicate = true },
 		func(value *RequestLedgerCompletionResult) { value.Operation = requestledger.OperationSeal },
+		func(value *RequestLedgerCompletionResult) { value.PlanningLeaseExpiryIndex = 100 },
 	} {
 		candidate := result
 		mutate(&candidate)

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"math"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -58,7 +57,7 @@ func lifecycleHead(t testing.TB) (requestledger.HeadRecord, []byte, []byte) {
 		MaxActivePayloadChunks:       2,
 		PlanBuildID:                  lifecycleDigest("plan-build"),
 		PlanBuildGeneration:          1,
-		PlanningLeaseExpiryIndex:     math.MaxUint64,
+		PlanningLeaseSpan:            requestledger.MaxPlanningLeaseSpan,
 		PlanningLeaseGeneration:      1,
 		TerminalTransitionTag:        9,
 		FinalWaveCount:               1,

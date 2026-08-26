@@ -30,6 +30,19 @@ func TestReplicatedSchemaCatalogImageCanonicalWitness(t *testing.T) {
 		witness.ApplyProfileDigest == ([32]byte{}) {
 		t.Fatalf("catalog image witness = %+v", witness)
 	}
+	if !witness.MatchesRolloutTarget(
+		uint64(len(raw)), witness.Digest, identity.RelationSchemaGeneration,
+		replicatedRelationApplyManifestDigest(identity),
+	) {
+		t.Fatal("exact rollout target did not match")
+	}
+	wrong := witness.RelationManifestDigest
+	wrong[0] ^= 1
+	if witness.MatchesRolloutTarget(
+		uint64(len(raw)), witness.Digest, identity.RelationSchemaGeneration, wrong,
+	) {
+		t.Fatal("substituted rollout target matched")
+	}
 
 	// The decoder accepts insignificant whitespace, but a rollout bundle must
 	// have exactly one authenticated representation.

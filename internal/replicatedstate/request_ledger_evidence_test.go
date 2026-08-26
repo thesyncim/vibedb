@@ -56,7 +56,7 @@ func requestLedgerPreparedForExecutionPin(t testing.TB) (
 		MaxTerminalBytes:             requestledger.MaxLifecyclePayloadBytes,
 		PlanBuildID:                  requestLedgerStateTestDigest("execution-pin plan build"),
 		PlanBuildGeneration:          1,
-		PlanningLeaseExpiryIndex:     ^uint64(0),
+		PlanningLeaseSpan:            requestledger.MaxPlanningLeaseSpan,
 		PlanningLeaseGeneration:      1,
 		TerminalTransitionTag:        11,
 		FinalWaveCount:               1,

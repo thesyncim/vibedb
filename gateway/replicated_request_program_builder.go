@@ -32,15 +32,15 @@ var (
 // counts, transaction identity, retry home, and the aggregate execution pin
 // are derived by BuildDurableRequestLogicalProgram.
 type DurableRequestLogicalProgramBuild struct {
-	Home                     DurableRequestLedgerHome
-	Key                      DurableRequestLedgerKey
-	Tenant                   []byte
-	CatalogGeneration        uint64
-	RecoveryDeadline         int64
-	PlanningLeaseExpiryIndex uint64
-	PlanningLeaseGeneration  uint64
-	PinEpoch                 uint64
-	Participants             []ReplicatedTransactionParticipant
+	Home                    DurableRequestLedgerHome
+	Key                     DurableRequestLedgerKey
+	Tenant                  []byte
+	CatalogGeneration       uint64
+	RecoveryDeadline        int64
+	PlanningLeaseSpan       uint64
+	PlanningLeaseGeneration uint64
+	PinEpoch                uint64
+	Participants            []ReplicatedTransactionParticipant
 }
 
 // BuildDurableRequestLogicalProgram lowers physical catalog routes to one
@@ -57,7 +57,8 @@ func BuildDurableRequestLogicalProgram(
 		len(build.Tenant) == 0 || len(build.Tenant) > replication.MaxIdentityBytes ||
 		requestledger.Digest(sha256.Sum256(build.Tenant)) != build.Key.RequestKey.TenantDigest ||
 		build.CatalogGeneration == 0 || build.RecoveryDeadline <= 0 ||
-		build.PlanningLeaseExpiryIndex == 0 || build.PlanningLeaseGeneration == 0 ||
+		build.PlanningLeaseSpan == 0 || build.PlanningLeaseSpan > requestledger.MaxPlanningLeaseSpan ||
+		build.PlanningLeaseGeneration == 0 ||
 		build.PinEpoch == 0 || len(build.Participants) == 0 {
 		return DurableRequestLogicalProgram{}, ErrDurableRequest
 	}
@@ -127,7 +128,7 @@ func BuildDurableRequestLogicalProgram(
 	contract.PinID = durableRequestPinID(program.KeyDigest, program.RequestDigest)
 	contract.PinEpoch = build.PinEpoch
 	contract.PlanBuildID = durableRequestPlanBuildID(program.KeyDigest, program.RequestDigest)
-	contract.PlanningLeaseExpiryIndex = build.PlanningLeaseExpiryIndex
+	contract.PlanningLeaseSpan = build.PlanningLeaseSpan
 	contract.PlanningLeaseGeneration = build.PlanningLeaseGeneration
 	contract.ParticipantCount = uint64(len(program.Participants))
 	contract.CommitTransitionTag = durableRequestCommitTransitionTag

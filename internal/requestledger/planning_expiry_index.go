@@ -1,9 +1,12 @@
 package requestledger
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"github.com/thesyncim/vibedb/internal/systemkey"
 )
+
+var planningExpiryIndexDigestDomain = []byte("vibedb/request-ledger/planning-expiry-index\x00")
 
 const (
 	PlanningExpiryStoragePrefix byte = systemkey.RequestLedgerFirst + 2
@@ -93,4 +96,19 @@ func ValidatePlanningExpiryIndex(head HeadRecord, record PlanningExpiryIndexReco
 		return ErrInvalidState
 	}
 	return nil
+}
+
+// PlanningExpiryIndexDigest is the constant-size scanner witness for the
+// secondary expiry ordering. It binds the logical tuple, not encoded padding.
+func PlanningExpiryIndexDigest(record PlanningExpiryIndexRecord) Digest {
+	var framed [len("vibedb/request-ledger/planning-expiry-index\x00") + 24 + 3*32]byte
+	at := copy(framed[:], planningExpiryIndexDigestDomain)
+	binary.LittleEndian.PutUint64(framed[at:at+8], record.ExpiryAppliedIndex)
+	binary.LittleEndian.PutUint64(framed[at+8:at+16], record.LeaseGeneration)
+	binary.LittleEndian.PutUint64(framed[at+16:at+24], record.BuildGeneration)
+	at += 24
+	at += copy(framed[at:], record.Home[:])
+	at += copy(framed[at:], record.KeyDigest[:])
+	copy(framed[at:], record.PlanBuildID[:])
+	return Digest(sha256.Sum256(framed[:]))
 }

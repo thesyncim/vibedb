@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"testing"
 
@@ -300,7 +299,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 		MaxActivePayloadBytes:        2 * requestledger.MaxPlanPageBytes,
 		MaxActivePayloadChunks:       2,
 		PlanBuildID:                  lifecycleDigest("plan-build"), PlanBuildGeneration: 1,
-		PlanningLeaseExpiryIndex: math.MaxUint64, PlanningLeaseGeneration: 1,
+		PlanningLeaseSpan: requestledger.MaxPlanningLeaseSpan, PlanningLeaseGeneration: 1,
 		TerminalTransitionTag: 9, FinalWaveCount: 1,
 		TerminalStateDigest:        requestledger.NextStateDigest(9, cursor),
 		TerminalSummaryDigest:      lifecycleDigest("retirement"),

@@ -7,7 +7,6 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
-	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 )
@@ -19,7 +18,6 @@ import (
 // file.
 type gatewayHotReplicaMoveFactory struct {
 	observations gatewayReplicaObservationClient
-	grants       membershipgrant.Source
 }
 
 func (factory gatewayHotReplicaMoveFactory) BuildHotReplicaMove(
@@ -29,8 +27,7 @@ func (factory gatewayHotReplicaMoveFactory) BuildHotReplicaMove(
 	work hotshard.MoveWork,
 ) (*rebalance.Plan, error) {
 	if ctx == nil || catalog == nil || admission == ([32]byte{}) ||
-		factory.observations == nil || factory.grants == nil ||
-		work.Group == (hotshard.MoveWork{}).Group ||
+		factory.observations == nil || work.Group == (hotshard.MoveWork{}).Group ||
 		work.Selection.SourceEndpoint == "" || work.Selection.TargetEndpoint == "" {
 		return nil, hotshard.ErrInvalidPressureCut
 	}
@@ -57,14 +54,6 @@ func (factory gatewayHotReplicaMoveFactory) BuildHotReplicaMove(
 		route.EnrolledTarget.Member == retiring.Member ||
 		route.EnrolledTarget.Member == donor.Member {
 		return nil, hotshard.ErrInvalidPressureCut
-	}
-	grant, found, err := factory.grants.ReadMembershipGrant(ctx, work.Group)
-	if err != nil || !found || !grant.Valid() || grant.Group != work.Group ||
-		grant.CatalogGeneration != catalog.Generation() ||
-		grant.InitialReplicaSetVersion != route.Serving.Command.ReplicaSetVersion ||
-		grant.SourceMember != retiring.Member || grant.TargetMember != route.EnrolledTarget.Member ||
-		grant.TargetNode != [16]byte(route.EnrolledTarget.Node) {
-		return nil, errors.Join(err, hotshard.ErrInvalidPressureCut)
 	}
 
 	request := replicacontrol.Request{

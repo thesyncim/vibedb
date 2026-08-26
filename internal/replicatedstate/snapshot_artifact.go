@@ -1695,6 +1695,14 @@ func consumeSnapshotArtifactRows(
 				if err := validateSnapshotRequestLedgerRow(key, value); err != nil {
 					return false, fmt.Errorf("%w: request ledger row: %v", ErrSnapshotArtifact, err)
 				}
+			case len(key) == requestledger.PlanningExpiryKeyBytes && key[0] == requestledger.PlanningExpiryStoragePrefix:
+				index, home, digest, keyErr := requestledger.OpenPlanningExpiryKey(key)
+				record, recordErr := requestledger.OpenPlanningExpiryIndex(value)
+				if keyErr != nil || recordErr != nil || record.ExpiryAppliedIndex != index ||
+					record.Home != home || record.KeyDigest != digest {
+					return false, errors.Join(keyErr, recordErr,
+						fmt.Errorf("%w: request ledger planning expiry", ErrSnapshotArtifact))
+				}
 			case len(key) == requestledger.IssuerHighwaterKeyBytes && key[0] == requestledger.IssuerHighwaterStoragePrefix:
 				home, issuer, keyErr := requestledger.OpenIssuerHighwaterKey(key)
 				record, recordErr := requestledger.OpenIssuerHighwater(value)

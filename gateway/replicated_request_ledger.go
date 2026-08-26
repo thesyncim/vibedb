@@ -428,7 +428,7 @@ type DurableRequestExecutionContract struct {
 	MaxActivePayloadBytes        uint64
 	MaxActivePayloadChunks       uint64
 	PlanBuildID                  replication.Digest
-	PlanningLeaseExpiryIndex     uint64
+	PlanningLeaseSpan            uint64
 	PlanningLeaseGeneration      uint64
 }
 

@@ -13,7 +13,7 @@ const (
 	// serving proof; a second ReadIndex is needed only after outcome-unknown.
 	ResultFormatRequestLedger uint16 = resultformat.RequestLedger
 
-	RequestLedgerCompletionResultBytes    = 176
+	RequestLedgerCompletionResultBytes    = 184
 	requestLedgerCompletionExactDuplicate = byte(1)
 )
 
@@ -21,16 +21,17 @@ const (
 // durable ledger state. StateDigest names the authoritative head,
 // continuation, terminal, or ACK witness selected by Phase.
 type RequestLedgerCompletionResult struct {
-	Operation      requestledger.Operation
-	Phase          requestledger.Phase
-	ResultCode     uint32
-	Revision       uint64
-	KeyDigest      requestledger.Digest
-	RequestDigest  requestledger.Digest
-	PlanRoot       requestledger.Digest
-	RangeIdentity  requestledger.Digest
-	StateDigest    requestledger.Digest
-	ExactDuplicate bool
+	Operation                requestledger.Operation
+	Phase                    requestledger.Phase
+	ResultCode               uint32
+	Revision                 uint64
+	KeyDigest                requestledger.Digest
+	RequestDigest            requestledger.Digest
+	PlanRoot                 requestledger.Digest
+	RangeIdentity            requestledger.Digest
+	StateDigest              requestledger.Digest
+	PlanningLeaseExpiryIndex uint64
+	ExactDuplicate           bool
 }
 
 // AppendRequestLedgerCompletionResult appends one canonical fixed ledger
@@ -58,6 +59,7 @@ func AppendRequestLedgerCompletionResult(
 	copy(out[80:112], result.PlanRoot[:])
 	copy(out[112:144], result.RangeIdentity[:])
 	copy(out[144:176], result.StateDigest[:])
+	binary.LittleEndian.PutUint64(out[176:184], result.PlanningLeaseExpiryIndex)
 	return dst, nil
 }
 
@@ -84,6 +86,7 @@ func OpenRequestLedgerCompletionResult(
 	copy(result.PlanRoot[:], raw[80:112])
 	copy(result.RangeIdentity[:], raw[112:144])
 	copy(result.StateDigest[:], raw[144:176])
+	result.PlanningLeaseExpiryIndex = binary.LittleEndian.Uint64(raw[176:184])
 	if result.ResultCode != resultCode || !validRequestLedgerCompletionResult(result) {
 		return RequestLedgerCompletionResult{}, ErrCompletionCorrupt
 	}
@@ -99,6 +102,9 @@ func validRequestLedgerCompletionResult(result RequestLedgerCompletionResult) bo
 		result.RangeIdentity == (requestledger.Digest{}) {
 		return false
 	}
+	if result.Operation != requestledger.OperationCreate && result.PlanningLeaseExpiryIndex != 0 {
+		return false
+	}
 	switch result.ResultCode {
 	case ResultRequestLedgerCapacity:
 		// Capacity refusal is a committed, stateless admission result. It did
@@ -107,17 +113,22 @@ func validRequestLedgerCompletionResult(result RequestLedgerCompletionResult) bo
 		// reclaimed.
 		return result.Operation == requestledger.OperationCreate &&
 			result.Phase == requestledger.PhaseInvalid && result.Revision == 0 &&
-			result.StateDigest == (requestledger.Digest{}) && !result.ExactDuplicate
+			result.StateDigest == (requestledger.Digest{}) &&
+			result.PlanningLeaseExpiryIndex == 0 && !result.ExactDuplicate
 	case ResultRequestLedgerNotFound:
 		return result.Operation != requestledger.OperationCreate &&
 			result.Phase == requestledger.PhaseInvalid && result.Revision == 0 &&
 			result.StateDigest == (requestledger.Digest{}) && !result.ExactDuplicate
 	case ResultRequestLedgerWrongRange:
 		return result.Phase == requestledger.PhaseInvalid && result.Revision == 0 &&
-			result.StateDigest == (requestledger.Digest{}) && !result.ExactDuplicate
+			result.StateDigest == (requestledger.Digest{}) &&
+			result.PlanningLeaseExpiryIndex == 0 && !result.ExactDuplicate
 	case ResultApplied, ResultRequestLedgerConflict:
-		return result.Phase.Valid() && result.Revision != 0 &&
-			result.StateDigest != (requestledger.Digest{})
+		if !result.Phase.Valid() || result.Revision == 0 || result.StateDigest == (requestledger.Digest{}) {
+			return false
+		}
+		return result.Operation != requestledger.OperationCreate ||
+			result.ResultCode != ResultApplied || result.PlanningLeaseExpiryIndex != 0
 	default:
 		return false
 	}

@@ -54,8 +54,8 @@ func testHeadForKey(t testing.TB, key RequestKey) (HeadRecord, []byte, []byte) {
 		MaxActivePayloadBytes:    2 * MaxPlanPageBytes,
 		MaxActivePayloadChunks:   2,
 		PlanBuildID:              testDigest("plan-build"), PlanBuildGeneration: 1,
-		PlanningLeaseExpiryIndex: math.MaxUint64,
-		PlanningLeaseGeneration:  1,
+		PlanningLeaseSpan:       MaxPlanningLeaseSpan,
+		PlanningLeaseGeneration: 1,
 	}
 	head, err := NewHeadWithExecutionContract(key, testDigest("request-body"),
 		testDigest("terminal-contract"), contract, plan)
@@ -222,7 +222,7 @@ func TestPagedBatchAtomicSealAndRootMismatch(t *testing.T) {
 	contract.AbortTerminalStateDigest = base.AbortTerminalStateDigest
 	contract.PlanBuildID = testDigest("paged-plan-build")
 	contract.PlanBuildGeneration = 1
-	contract.PlanningLeaseExpiryIndex = math.MaxUint64
+	contract.PlanningLeaseSpan = MaxPlanningLeaseSpan
 	contract.PlanningLeaseGeneration = 1
 	head, err := NewPagedHeadWithExecutionContract(key, testDigest("request-body"), testDigest("terminal-contract"), uint64(len(plan)), root, contract)
 	if err != nil {
@@ -272,7 +272,7 @@ func TestPlanningExpiryCleanupRestartFencesOldBuild(t *testing.T) {
 		RouteSchemaCertificateDigest: base.RouteSchemaCertificateDigest,
 		MaxPendingWaveBytes:          base.MaxPendingWaveBytes, MaxContinuationBytes: base.MaxContinuationBytes,
 		MaxTerminalBytes: base.MaxTerminalBytes, PlanBuildID: testDigest("expiring-build"),
-		PlanBuildGeneration: 1, PlanningLeaseExpiryIndex: 100, PlanningLeaseGeneration: 1,
+		PlanBuildGeneration: 1, PlanningLeaseSpan: 100, PlanningLeaseGeneration: 1,
 		TerminalTransitionTag: base.TerminalTransitionTag, FinalWaveCount: 1,
 		TerminalStateDigest:        NextStateDigest(base.TerminalTransitionTag, cursor),
 		TerminalSummaryDigest:      base.TerminalSummaryDigest,
@@ -281,6 +281,10 @@ func TestPlanningExpiryCleanupRestartFencesOldBuild(t *testing.T) {
 	}
 	head, err := NewPagedHeadWithExecutionContract(key, testDigest("request-body"),
 		testDigest("terminal-contract"), uint64(len(plan)), root, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err = MaterializeCreate(head, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,19 +316,19 @@ func TestPlanningExpiryCleanupRestartFencesOldBuild(t *testing.T) {
 		t.Fatalf("expiry index roundtrip: %+v %v", openedIndex, err)
 	}
 	home, _ := Home(key)
-	firstIndexKey := AppendPlanningExpiryKey(nil, 100, home, head.KeyDigest)
-	secondIndexKey := AppendPlanningExpiryKey(nil, 101, home, head.KeyDigest)
+	firstIndexKey := AppendPlanningExpiryKey(nil, 101, home, head.KeyDigest)
+	secondIndexKey := AppendPlanningExpiryKey(nil, 102, home, head.KeyDigest)
 	if bytes.Compare(firstIndexKey, secondIndexKey) >= 0 {
 		t.Fatal("expiry index keys are not applied-index ordered")
 	}
 	openedApplied, openedHome, openedKey, openKeyErr := OpenPlanningExpiryKey(firstIndexKey)
-	if openKeyErr != nil || openedApplied != 100 || openedHome != home || openedKey != head.KeyDigest {
+	if openKeyErr != nil || openedApplied != 101 || openedHome != home || openedKey != head.KeyDigest {
 		t.Fatalf("expiry key roundtrip: %d %x %x %v", openedApplied, openedHome, openedKey, openKeyErr)
 	}
-	if _, err = NewPlanningExpiryRequest(head, 99); err == nil {
+	if _, err = NewPlanningExpiryRequest(head, 100); err == nil {
 		t.Fatal("planning expired before its applied-index lease")
 	}
-	expiry, err := NewPlanningExpiryRequest(head, 100)
+	expiry, err := NewPlanningExpiryRequest(head, 101)
 	if err != nil {
 		t.Fatal(err)
 	}

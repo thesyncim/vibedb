@@ -417,7 +417,7 @@ func appendDurableRequestLogicalHeader(raw []byte, recipeBytes uint64, program D
 	}
 	copy(raw[offset:offset+32], contract.PlanBuildID[:])
 	offset += 32
-	binary.LittleEndian.PutUint64(raw[offset:offset+8], contract.PlanningLeaseExpiryIndex)
+	binary.LittleEndian.PutUint64(raw[offset:offset+8], contract.PlanningLeaseSpan)
 	offset += 8
 	binary.LittleEndian.PutUint64(raw[offset:offset+8], contract.PlanningLeaseGeneration)
 	offset += 8

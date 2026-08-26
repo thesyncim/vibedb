@@ -2,7 +2,6 @@ package replicatedstate
 
 import (
 	"bytes"
-	"math"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -39,7 +38,7 @@ func issuerPlannerHead(t testing.TB, key requestledger.RequestKey) requestledger
 		AbortTerminalTransitionTag: 10, AbortFinalWaveCount: 1,
 		AbortTerminalStateDigest: requestledger.NextStateDigest(10, cursor),
 		PlanBuildID:              issuerPlannerDigest(0x45), PlanBuildGeneration: 1,
-		PlanningLeaseExpiryIndex: math.MaxUint64, PlanningLeaseGeneration: 1,
+		PlanningLeaseSpan: requestledger.MaxPlanningLeaseSpan, PlanningLeaseGeneration: 1,
 	}
 	head, err := requestledger.NewHeadWithExecutionContract(
 		key, issuerPlannerDigest(0x46), issuerPlannerDigest(0x47), contract, plan,

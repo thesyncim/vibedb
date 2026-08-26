@@ -1279,6 +1279,12 @@ func scanSessionSystemSnapshot(
 			}
 			return ledgerScan.observe(key, value)
 
+		case len(key) == requestledger.PlanningExpiryKeyBytes && key[0] == requestledger.PlanningExpiryStoragePrefix:
+			if !statePresent {
+				return fmt.Errorf("%w: request ledger planning expiry before state", ErrStateCorrupt)
+			}
+			return ledgerScan.observePlanningExpiry(key, value)
+
 		case len(key) == requestledger.IssuerHighwaterKeyBytes && key[0] == requestledger.IssuerHighwaterStoragePrefix:
 			if !statePresent {
 				return fmt.Errorf("%w: request ledger issuer high-water before state", ErrStateCorrupt)

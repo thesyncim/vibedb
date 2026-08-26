@@ -7,10 +7,17 @@ import (
 )
 
 const (
-	headHeaderBytes             = 880
+	headHeaderBytes             = 888
 	pageHeaderBytes             = 208
 	PlanPageRecordOverheadBytes = pageHeaderBytes + checksumBytes
 	MaxHeadRecordBytes          = headHeaderBytes + MaxInlinePlanBytes + checksumBytes
+	// MaxPlanningLeaseSpan bounds the immutable applied-index distance selected
+	// by a Create. The absolute expiry is materialized by replicated apply and
+	// is deliberately not part of the caller-authored execution contract.
+	MaxPlanningLeaseSpan uint64 = 1 << 20
+	// UnmaterializedPlanningLeaseExpiryIndex is the sole canonical marker in a
+	// Create payload. It is never persisted for a Planning head.
+	UnmaterializedPlanningLeaseExpiryIndex uint64 = 1
 )
 
 var (
@@ -50,6 +57,7 @@ type HeadRecord struct {
 	MaxActivePayloadChunks            uint64
 	PlanBuildID                       Digest
 	PlanBuildGeneration               uint64
+	PlanningLeaseSpan                 uint64
 	PlanningLeaseExpiryIndex          uint64
 	PlanningLeaseGeneration           uint64
 	PlanCRC32C                        uint32
@@ -86,7 +94,7 @@ type ExecutionContract struct {
 	MaxActivePayloadChunks       uint64
 	PlanBuildID                  Digest
 	PlanBuildGeneration          uint64
-	PlanningLeaseExpiryIndex     uint64
+	PlanningLeaseSpan            uint64
 	PlanningLeaseGeneration      uint64
 	TerminalTransitionTag        uint32
 	FinalWaveCount               uint64
@@ -108,7 +116,8 @@ func defaultExecutionContract(root Digest) ExecutionContract {
 		MaxTerminalBytes:             MaxLifecyclePayloadBytes,
 		MaxActivePayloadBytes:        0,
 		MaxActivePayloadChunks:       0,
-		PlanBuildID:                  root, PlanBuildGeneration: 1, PlanningLeaseExpiryIndex: ^uint64(0),
+		PlanBuildID:                  root, PlanBuildGeneration: 1,
+		PlanningLeaseSpan:       MaxPlanningLeaseSpan,
 		PlanningLeaseGeneration: 1,
 		TerminalTransitionTag:   1, FinalWaveCount: 1,
 		TerminalStateDigest: root, TerminalSummaryDigest: root,
@@ -195,7 +204,8 @@ func NewHeadWithExecutionContract(
 		MaxActivePayloadChunks:       contract.MaxActivePayloadChunks,
 		PlanBuildID:                  contract.PlanBuildID,
 		PlanBuildGeneration:          contract.PlanBuildGeneration,
-		PlanningLeaseExpiryIndex:     contract.PlanningLeaseExpiryIndex,
+		PlanningLeaseSpan:            contract.PlanningLeaseSpan,
+		PlanningLeaseExpiryIndex:     UnmaterializedPlanningLeaseExpiryIndex,
 		PlanningLeaseGeneration:      contract.PlanningLeaseGeneration,
 		TerminalTransitionTag:        contract.TerminalTransitionTag,
 		FinalWaveCount:               contract.FinalWaveCount,
@@ -263,7 +273,8 @@ func NewPagedHeadWithExecutionContract(
 		MaxActivePayloadChunks:       contract.MaxActivePayloadChunks,
 		PlanBuildID:                  contract.PlanBuildID,
 		PlanBuildGeneration:          contract.PlanBuildGeneration,
-		PlanningLeaseExpiryIndex:     contract.PlanningLeaseExpiryIndex,
+		PlanningLeaseSpan:            contract.PlanningLeaseSpan,
+		PlanningLeaseExpiryIndex:     UnmaterializedPlanningLeaseExpiryIndex,
 		PlanningLeaseGeneration:      contract.PlanningLeaseGeneration,
 		TerminalTransitionTag:        contract.TerminalTransitionTag,
 		FinalWaveCount:               contract.FinalWaveCount,
@@ -342,6 +353,7 @@ func AppendHead(dst []byte, head HeadRecord) ([]byte, error) {
 	putDigest(out[832:864], head.SchemaPinReleaseCertificateDigest)
 	binary.LittleEndian.PutUint64(out[864:872], head.PlanBuildGeneration)
 	binary.LittleEndian.PutUint64(out[872:880], head.ExpiredCleanupNextPage)
+	binary.LittleEndian.PutUint64(out[880:888], head.PlanningLeaseSpan)
 	dst = append(dst, head.InlinePlan...)
 	dst = appendChecksum(dst, start)
 	return dst, nil
@@ -409,6 +421,7 @@ func OpenHead(raw []byte) (HeadRecord, error) {
 		SchemaPinReleaseCertificateDigest: readDigest(raw[832:864]),
 		PlanBuildGeneration:               binary.LittleEndian.Uint64(raw[864:872]),
 		ExpiredCleanupNextPage:            binary.LittleEndian.Uint64(raw[872:880]),
+		PlanningLeaseSpan:                 binary.LittleEndian.Uint64(raw[880:888]),
 	}
 	copy(head.Key.Principal[:], raw[128:144])
 	copy(head.Key.Request[:], raw[144:160])
@@ -438,6 +451,7 @@ func validateHead(head HeadRecord) error {
 		head.MaxActivePayloadBytes > MaxDynamicWavePayloadBytes ||
 		head.MaxActivePayloadChunks > MaxDynamicWavePayloadChunks ||
 		!nonzeroDigest(head.PlanBuildID) || head.PlanBuildGeneration == 0 ||
+		head.PlanningLeaseSpan == 0 || head.PlanningLeaseSpan > MaxPlanningLeaseSpan ||
 		head.PlanningLeaseExpiryIndex == 0 ||
 		head.PlanningLeaseGeneration == 0 ||
 		head.AbortTerminalTransitionTag == 0 || head.AbortFinalWaveCount == 0 ||

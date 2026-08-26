@@ -14,9 +14,11 @@ import (
 var errTypedServicePin = errors.New("typed service pin stop")
 
 type typedServiceLedger struct {
-	head     requestledger.HeadRecord
-	terminal requestledger.TerminalRecord
-	applies  int
+	head       requestledger.HeadRecord
+	terminal   requestledger.TerminalRecord
+	applies    int
+	reads      int
+	operations []string
 }
 
 func (ledger *typedServiceLedger) ApplyCAS(
@@ -25,18 +27,23 @@ func (ledger *typedServiceLedger) ApplyCAS(
 	key requestledger.RequestKey,
 	cas DurableRequestLifecycleCAS,
 ) (DurableRequestLifecycleCASResult, error) {
+	ledger.operations = append(ledger.operations, "apply")
 	if cas.Operation != requestledger.OperationCreate || ledger.head.Revision != 0 ||
 		cas.Head.Key != key || cas.Revision != 1 {
 		return DurableRequestLifecycleCASResult{}, ErrDurableRequestConflict
 	}
-	ledger.head = cas.Head
+	materialized, err := requestledger.MaterializeCreate(cas.Head, 2)
+	if err != nil {
+		return DurableRequestLifecycleCASResult{}, err
+	}
+	ledger.head = materialized
 	ledger.applies++
 	keyDigest, _ := requestledger.KeyDigest(key)
 	return DurableRequestLifecycleCASResult{
 		Ledger: replicatedstate.RequestLedgerCompletionResult{
 			ResultCode: replicatedstate.ResultApplied, Operation: requestledger.OperationCreate,
 			KeyDigest: keyDigest, RequestDigest: cas.Head.RequestDigest,
-			PlanRoot: cas.Head.PlanRoot,
+			PlanRoot: cas.Head.PlanRoot, PlanningLeaseExpiryIndex: materialized.PlanningLeaseExpiryIndex,
 		},
 		Applied: 2,
 	}, nil
@@ -47,6 +54,8 @@ func (ledger *typedServiceLedger) ReadRow(
 	_ DurableRequestLedgerHome,
 	read DurableRequestLifecycleRead,
 ) (DurableRequestLifecycleRow, error) {
+	ledger.reads++
+	ledger.operations = append(ledger.operations, "read")
 	switch read.Kind {
 	case replicatedstate.RequestLedgerReadHead:
 		if ledger.head.Revision == 0 {
@@ -62,6 +71,29 @@ func (ledger *typedServiceLedger) ReadRow(
 			Kind: replicatedstate.RequestLedgerReadTerminal, Terminal: ledger.terminal}, nil
 	default:
 		return DurableRequestLifecycleRow{}, ErrDurableRequest
+	}
+}
+
+func TestDurableRequestBeginFusesCreateWithoutPreflightRead(t *testing.T) {
+	participants := durableFaultParticipants(t)
+	request := durableFaultRequest(t, participants)
+	ledger := new(typedServiceLedger)
+	service, err := newDurableRequestService(
+		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin, err := service.Begin(t.Context(), request)
+	if err != nil || !begin.Created || !begin.ProgramMatches || begin.Applied != 2 ||
+		begin.PlanningLeaseExpiryIndex != 2+request.Program.Contract.PlanningLeaseSpan ||
+		ledger.reads != 0 || len(ledger.operations) != 1 || ledger.operations[0] != "apply" {
+		t.Fatalf("begin=%+v reads=%d operations=%v: %v", begin, ledger.reads, ledger.operations, err)
+	}
+	retry, err := service.Begin(t.Context(), request)
+	if err != nil || retry.Created || !retry.ProgramMatches ||
+		retry.PlanningLeaseExpiryIndex != begin.PlanningLeaseExpiryIndex || ledger.reads != 1 {
+		t.Fatalf("retry=%+v reads=%d: %v", retry, ledger.reads, err)
 	}
 }
 

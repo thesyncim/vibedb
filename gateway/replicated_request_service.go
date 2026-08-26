@@ -38,6 +38,18 @@ type DurableRequestService struct {
 	acks     *DurableRequestAckCollector
 }
 
+// DurableRequestBeginResult is the authoritative settlement of the fused
+// request admission. Head is the materialized persisted head; Applied and the
+// absolute expiry come from the same committed OperationCreate result.
+type DurableRequestBeginResult struct {
+	Home                     DurableRequestLedgerHome
+	Head                     requestledger.HeadRecord
+	Applied                  uint64
+	PlanningLeaseExpiryIndex uint64
+	Created                  bool
+	ProgramMatches           bool
+}
+
 func NewDurableRequestService(
 	topology *DurableRequestLedgerTopologyHolder,
 	ledger DurableRequestLedger,
@@ -69,12 +81,71 @@ func (service *DurableRequestService) Execute(
 	ctx context.Context,
 	request DurableRequest,
 ) (DurableRequestOutcome, error) {
+	begin, err := service.Begin(ctx, request)
+	if err != nil {
+		return DurableRequestOutcome{}, err
+	}
+	if !begin.ProgramMatches {
+		outcome, found, replayErr := service.Replay(ctx, request.Key)
+		if !found && replayErr == nil {
+			replayErr = ErrDurableRequestConflict
+		}
+		return outcome, replayErr
+	}
+	return service.ExecuteBegun(ctx, request, begin)
+}
+
+// Begin performs the sole issuer-sequence linearization and Create admission.
+// It deliberately does not point-read before proposing. A read is used only
+// to recover an outcome-unknown proposal or an already-progressed retry.
+func (service *DurableRequestService) Begin(
+	ctx context.Context,
+	request DurableRequest,
+) (DurableRequestBeginResult, error) {
 	if service == nil || ctx == nil || !validDurableRequestLedgerKey(request.Key) ||
 		!validDurableRequestLogicalProgram(request.Program) {
-		return DurableRequestOutcome{}, ErrDurableRequest
+		return DurableRequestBeginResult{}, ErrDurableRequest
 	}
 	if !matchesDurableRequestProgramKey(request.Key, request.Program) {
-		return DurableRequestOutcome{}, ErrDurableRequestConflict
+		return DurableRequestBeginResult{}, ErrDurableRequestConflict
+	}
+	measurement, err := measureDurableRequestPlan(request.Key, request.Program)
+	if err != nil {
+		return DurableRequestBeginResult{}, err
+	}
+	home, err := service.home(request.Key)
+	if err != nil {
+		return DurableRequestBeginResult{}, err
+	}
+	head, applied, created, err := service.create(ctx, home, request.Key, measurement)
+	if err != nil {
+		return DurableRequestBeginResult{}, err
+	}
+	matches := durableRequestHeadMatchesMeasurement(head, request.Key, measurement)
+	if !matches && (head.Phase == requestledger.PhasePlanning || head.Phase == requestledger.PhaseExpired) {
+		return DurableRequestBeginResult{}, ErrDurableRequestConflict
+	}
+	return DurableRequestBeginResult{Home: home, Head: head, Applied: applied,
+		PlanningLeaseExpiryIndex: head.PlanningLeaseExpiryIndex,
+		Created:                  created, ProgramMatches: matches}, nil
+}
+
+// ExecuteBegun continues from a Begin settlement without issuing a duplicate
+// Create. This is the shipped path used after the gateway has incorporated the
+// actual applied-index expiry proof into its operational execution context.
+func (service *DurableRequestService) ExecuteBegun(
+	ctx context.Context,
+	request DurableRequest,
+	begin DurableRequestBeginResult,
+) (DurableRequestOutcome, error) {
+	if service == nil || ctx == nil || begin.Applied == 0 ||
+		begin.PlanningLeaseExpiryIndex == 0 ||
+		!begin.ProgramMatches ||
+		begin.Head.PlanningLeaseExpiryIndex != begin.PlanningLeaseExpiryIndex ||
+		!validDurableRequestLedgerKey(request.Key) ||
+		!validDurableRequestLogicalProgram(request.Program) ||
+		!matchesDurableRequestProgramKey(request.Key, request.Program) {
+		return DurableRequestOutcome{}, ErrDurableRequest
 	}
 	release, err := acquireDurableRequestStream(ctx)
 	if err != nil {
@@ -86,25 +157,13 @@ func (service *DurableRequestService) Execute(
 		return DurableRequestOutcome{}, err
 	}
 	home, err := service.home(request.Key)
-	if err != nil {
-		return DurableRequestOutcome{}, err
-	}
-	head, ack, applied, err := service.openHead(ctx, home, request.Key.RequestKey, 1)
-	if err != nil {
-		return DurableRequestOutcome{}, err
-	}
-	if ack.Revision != 0 {
-		return DurableRequestOutcome{Acknowledged: true}, ErrDurableRequestAcknowledged
-	}
-	if head.Revision == 0 {
-		head, applied, err = service.create(ctx, home, request.Key, measurement)
-		if err != nil {
-			return DurableRequestOutcome{}, err
-		}
-	}
-	if !durableRequestHeadMatchesMeasurement(head, request.Key, measurement) {
+	if err != nil || home.Identity != begin.Home.Identity || home.Point != begin.Home.Point ||
+		home.TopologyGeneration != begin.Home.TopologyGeneration ||
+		!sameReplicatedCatalogRoute(home.borrowedRoute(), begin.Home.borrowedRoute()) ||
+		!durableRequestHeadMatchesMeasurement(begin.Head, request.Key, measurement) {
 		return DurableRequestOutcome{}, ErrDurableRequestConflict
 	}
+	head, applied := begin.Head, begin.Applied
 	if head.Phase == requestledger.PhasePlanning {
 		head, applied, err = service.appendPlan(ctx, home, request.Key, head, applied, measurement, request.Program)
 		if err != nil {
@@ -259,7 +318,7 @@ func durableRequestLifecycleExecutionContract(
 		MaxActivePayloadChunks:       contract.MaxActivePayloadChunks,
 		PlanBuildID:                  requestledger.Digest(contract.PlanBuildID),
 		PlanBuildGeneration:          contract.PlanningLeaseGeneration,
-		PlanningLeaseExpiryIndex:     contract.PlanningLeaseExpiryIndex,
+		PlanningLeaseSpan:            contract.PlanningLeaseSpan,
 		PlanningLeaseGeneration:      contract.PlanningLeaseGeneration,
 		TerminalTransitionTag:        contract.CommitTransitionTag,
 		FinalWaveCount:               contract.CommitFinalWaveCount,
@@ -295,10 +354,10 @@ func (service *DurableRequestService) create(
 	home DurableRequestLedgerHome,
 	key DurableRequestLedgerKey,
 	measurement durableRequestPlanMeasurement,
-) (requestledger.HeadRecord, uint64, error) {
+) (requestledger.HeadRecord, uint64, bool, error) {
 	want, err := durableRequestHeadForMeasurement(key, measurement)
 	if err != nil {
-		return requestledger.HeadRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
+		return requestledger.HeadRecord{}, 0, false, errors.Join(err, ErrDurableRequestConflict)
 	}
 	result, applyErr := service.ledger.ApplyCAS(ctx, home, key.RequestKey, DurableRequestLifecycleCAS{
 		Operation: requestledger.OperationCreate, Revision: 1, Head: want,
@@ -306,19 +365,29 @@ func (service *DurableRequestService) create(
 	minimum := uint64(1)
 	if applyErr == nil {
 		if result.Ledger.ResultCode == replicatedstate.ResultApplied {
+			materialized, materializeErr := requestledger.MaterializeCreateAtExpiry(
+				want, result.Ledger.PlanningLeaseExpiryIndex,
+			)
+			if materializeErr == nil {
+				return materialized, result.Applied, !result.Ledger.ExactDuplicate, nil
+			}
+			applyErr = errors.Join(materializeErr, ErrDurableRequestConflict)
 			minimum = result.Applied
 		} else {
 			applyErr = ErrDurableRequestConflict
 		}
 	}
 	head, ack, applied, readErr := service.openHead(ctx, home, key.RequestKey, minimum)
-	if readErr != nil || ack.Revision != 0 || head.Revision == 0 {
-		return requestledger.HeadRecord{}, 0, errors.Join(applyErr, readErr, ErrDurableRequestUnresolved)
+	if readErr == nil && ack.Revision != 0 {
+		return requestledger.HeadRecord{}, 0, false, ErrDurableRequestAcknowledged
 	}
-	if !durableRequestHeadMatchesMeasurement(head, key, measurement) {
-		return requestledger.HeadRecord{}, 0, ErrDurableRequestConflict
+	if readErr != nil || head.Revision == 0 {
+		return requestledger.HeadRecord{}, 0, false, errors.Join(applyErr, readErr, ErrDurableRequestUnresolved)
 	}
-	return head, applied, nil
+	if head.RequestDigest != requestledger.Digest(key.Digest) {
+		return requestledger.HeadRecord{}, 0, false, ErrDurableRequestConflict
+	}
+	return head, applied, false, nil
 }
 
 func durableRequestHeadMatchesMeasurement(
@@ -336,7 +405,11 @@ func durableRequestHeadMatchesMeasurement(
 		head.PlanPageCount == wantPages &&
 		head.TerminalContractDigest == requestledger.Digest(measurement.contract.TerminalContractDigest) &&
 		head.CatalogGeneration == measurement.contract.CatalogGeneration &&
-		head.PlanBuildID == requestledger.Digest(measurement.contract.PlanBuildID)
+		head.PlanBuildID == requestledger.Digest(measurement.contract.PlanBuildID) &&
+		head.PlanBuildGeneration == measurement.contract.PlanningLeaseGeneration &&
+		head.PlanningLeaseGeneration == measurement.contract.PlanningLeaseGeneration &&
+		head.PlanningLeaseSpan == measurement.contract.PlanningLeaseSpan &&
+		head.PlanningLeaseExpiryIndex > head.PlanningLeaseSpan
 }
 
 func (service *DurableRequestService) appendPlan(

@@ -1329,7 +1329,7 @@ func durableFaultRequestWith(
 			MaxPendingWaveBytes:          requestledger.MaxPendingWaveRecordBytes,
 			MaxContinuationBytes:         requestledger.MaxContinuationRecordBytes,
 			MaxTerminalBytes:             requestledger.MaxLifecyclePayloadBytes,
-			PlanningLeaseExpiryIndex:     1 << 60,
+			PlanningLeaseSpan:            requestledger.MaxPlanningLeaseSpan,
 			PlanningLeaseGeneration:      1,
 		},
 		Tenant: tenant, KeyDigest: replication.Digest(keyDigest), RequestID: requestID,

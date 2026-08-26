@@ -44,7 +44,7 @@ func requestLedgerStateTestHead(t testing.TB, dynamic bool) (requestledger.HeadR
 		MaxTerminalBytes:             requestledger.MaxLifecyclePayloadBytes,
 		PlanBuildID:                  requestLedgerStateTestDigest("build"),
 		PlanBuildGeneration:          1,
-		PlanningLeaseExpiryIndex:     math.MaxUint64,
+		PlanningLeaseSpan:            requestledger.MaxPlanningLeaseSpan,
 		PlanningLeaseGeneration:      1,
 		TerminalTransitionTag:        11,
 		FinalWaveCount:               1,

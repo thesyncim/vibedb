@@ -102,6 +102,7 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 		if requestledger.IssuerHighwaterCoversKey(highwater, head.Key) {
 			plan.rows = nil
 			plan.delta = requestLedgerStateDelta{}
+			plan.completion.PlanningLeaseExpiryIndex = 0
 			return witnessedRequestLedgerConflict(
 				plan, highwater.Revision, requestledger.PhaseAcked, highwaterRaw,
 			), nil
@@ -120,6 +121,7 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 		head.Key.IssuerSequence != highwater.AdmittedSequence+1 {
 		plan.rows = nil
 		plan.delta = requestLedgerStateDelta{}
+		plan.completion.PlanningLeaseExpiryIndex = 0
 		return witnessedRequestLedgerConflict(
 			plan, highwater.Revision, requestledger.PhaseAcked, highwaterRaw,
 		), nil
@@ -149,6 +151,7 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 		}
 		plan.rows = nil
 		plan.delta = requestLedgerStateDelta{}
+		plan.completion.PlanningLeaseExpiryIndex = 0
 		return witnessedRequestLedgerConflict(
 			plan, sequence.Revision, requestledger.PhaseAcked, sequenceRaw,
 		), nil
@@ -196,6 +199,7 @@ func (m *Machine) planRequestLedgerSequencedCreate(
 	if !ok || consumed > ordinaryCapacity {
 		plan.rows = nil
 		plan.delta = requestLedgerStateDelta{}
+		plan.completion.PlanningLeaseExpiryIndex = 0
 		plan.completion.ResultCode = ResultRequestLedgerCapacity
 		plan.completion.Phase = requestledger.PhaseInvalid
 		plan.completion.Revision = 0
