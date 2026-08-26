@@ -128,6 +128,78 @@ func TestMutationOwnershipProofAcceptsInsideAndRejectsOutsideNarrowedRange(t *te
 	}
 }
 
+func TestRetainedPruneDeletesOnlyRowsProvenOutsideSealedRange(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	fixture.machine.relations[0].target.Validator = mutationOwnershipValidator{
+		MutationValidator: fixture.machine.relations[0].target.Validator,
+	}
+	insideKey, outsideKey := []byte{0x20}, []byte{0x90}
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{
+			{Kind: replication.MutationPut, Key: insideKey, Value: []byte(`{"n":1}`)},
+			{Kind: replication.MutationPut, Key: outsideKey, Value: []byte(`{"n":2}`)},
+		},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
+		t.Fatal(err)
+	}
+	owned := distribution.KeyRange{End: distribution.KeyspaceEnd{
+		Point: distribution.KeyspacePoint{0x80},
+	}}
+	fixture.machine.state.Binding.OwnedRange = owned
+	fixture.machine.binding.OwnedRange = owned
+
+	prototype := commandValue(fixture.binding, 0)
+	prototype.AuthorityClass = replication.CommandAuthorityTopology
+	prototype.ClientID = id128(88)
+	_, _, epoch := applySessionOpen(t, fixture.machine, 4, prototype)
+	proof := replication.RetainedPruneProof{
+		OperationDigest: replication.Digest{1}, CertificateDigest: replication.Digest{2},
+		BatchDigest: replication.Digest{3}, DataChainDigest: replication.Digest{4},
+		EntryDigest: replication.Digest{5}, BaseDigest: replication.Digest{6},
+		CutApplied: 3, CutTerm: 1, OwnershipEpoch: fixture.binding.OwnershipEpoch,
+		RoutingVersion:  fixture.binding.RoutingVersion,
+		RouteGeneration: fixture.binding.RouteGeneration, RetainedRange: owned,
+	}
+	prune := commandValue(fixture.binding, 0)
+	prune.Kind = replication.CommandRetainedPrune
+	prune.AuthorityClass = replication.CommandAuthorityTopology
+	prune.ClientID, prune.ClientEpoch, prune.ClientSequence = prototype.ClientID, epoch, 2
+	prune.AckThrough, prune.Fingerprint, prune.RetainedPrune = 1, proof.BatchDigest, proof
+	prune.Batches = []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{
+		{Kind: replication.MutationDelete, Key: outsideKey},
+		{Kind: replication.MutationDelete, Key: insideKey},
+	}}}
+	blocked := encodeCommand(t, prune)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), blocked); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, blocked); code != ResultWrongShard {
+		t.Fatalf("mixed retained prune result=%d", code)
+	}
+	if _, found, _ := fixture.base.Collection.AppendRaw(nil, outsideKey); !found {
+		t.Fatal("atomic rejected prune deleted outside row")
+	}
+
+	proof.BatchDigest = replication.Digest{7}
+	prune.ClientSequence, prune.AckThrough = 3, 2
+	prune.Fingerprint, prune.RetainedPrune = proof.BatchDigest, proof
+	prune.Batches[0].Mutations = prune.Batches[0].Mutations[:1]
+	accepted := encodeCommand(t, prune)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), accepted); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, accepted); code != ResultApplied {
+		t.Fatalf("outside retained prune result=%d", code)
+	}
+	if _, found, _ := fixture.base.Collection.AppendRaw(nil, outsideKey); found {
+		t.Fatal("outside sealed row survived retained prune")
+	}
+	if _, found, _ := fixture.base.Collection.AppendRaw(nil, insideKey); !found {
+		t.Fatal("retained in-range row was deleted")
+	}
+}
+
 func TestUnprovableMutationRelationRemainsCompatibleForCompleteRange(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	key := []byte{0x91, 0x01, 'g'}
