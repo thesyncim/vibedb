@@ -92,7 +92,7 @@ func TestMembershipTransitionOrderingAuthorizationAndStaleReplay(t *testing.T) {
 	}
 }
 
-func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
+func TestMembershipRemovalUsesAnyNonSourceLeaderWithCaughtUpTarget(t *testing.T) {
 	authority := membershipgrant.Grant{Group: membershipTestGroup(), TransitionID: [16]byte{2}, MetadataEpoch: 8,
 		CatalogGeneration: 12, InitialReplicaSetVersion: 7,
 		InitialVoters: [3]uint64{1, 2, 4}, InitialRosterDigest: [32]byte{1},
@@ -103,22 +103,40 @@ func TestMembershipRemovalRequiresTargetLeader(t *testing.T) {
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 9,
 		SourceMember: 1, TargetMember: 3, TransferTerm: 4}
 	publication := raftmodel.Publication{Applied: 9, ReplicaSetVersion: 9,
-		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}
+		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}}
 	status := raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 4, Commit: 9, Applied: 9}
+	caught := raftmodel.MemberProgress{RecentActive: true, Match: 9, Next: 10}
 	if err := validateMembershipTransition(request, authority, publication, status,
-		raftmodel.MemberProgress{}, false); !errors.Is(err, ErrMembershipStale) {
+		caught, true); !errors.Is(err, ErrMembershipStale) {
 		t.Fatalf("leader self-removal = %v", err)
 	}
-	status.MemberID, status.LeaderID = 3, 3
+	status.MemberID, status.LeaderID = 2, 2
 	wrongTerm := request
 	wrongTerm.TransferTerm++
 	if err := validateMembershipTransition(wrongTerm, authority, publication, status,
-		raftmodel.MemberProgress{}, false); !errors.Is(err, ErrMembershipStale) {
+		caught, true); !errors.Is(err, ErrMembershipStale) {
 		t.Fatalf("wrong transfer witness = %v", err)
 	}
 	if err := validateMembershipTransition(request, authority, publication, status,
-		raftmodel.MemberProgress{}, false); err != nil {
+		caught, true); err != nil {
+		t.Fatalf("other-leader removal: %v", err)
+	}
+	status.MemberID, status.LeaderID = 3, 3
+	if err := validateMembershipTransition(request, authority, publication, status,
+		caught, true); err != nil {
 		t.Fatalf("target-leader removal: %v", err)
+	}
+	status.MemberID, status.LeaderID = 2, 2
+	behind := caught
+	behind.Match = 8
+	if err := validateMembershipTransition(request, authority, publication, status,
+		behind, true); !errors.Is(err, ErrMembershipStale) {
+		t.Fatalf("uncaught target removal = %v", err)
+	}
+	publication.ConfState.Voters = []uint64{1, 2, 3, 4, 5}
+	if err := validateMembershipTransition(request, authority, publication, status,
+		caught, true); !errors.Is(err, ErrMembershipStale) {
+		t.Fatalf("non-RF4 removal = %v", err)
 	}
 }
 

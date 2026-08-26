@@ -532,8 +532,9 @@ type ownerMember struct {
 // ReplicaRetirementRequest is the exact final local-source fence for one
 // replicated replica move. Operation and Step bind the call to its durable
 // controller journal; the Owner independently proves that SourceMember is no
-// longer a voter and TargetMember is the current leader before closing the
-// Runtime. No caller receives raw Host access.
+// longer a voter and no longer the current leader before closing the Runtime.
+// TargetMember remains the replacement identity bound by the grant. No caller
+// receives raw Host access.
 type ReplicaRetirementRequest struct {
 	Operation    [32]byte
 	Step         [32]byte
@@ -1137,7 +1138,7 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	if err != nil {
 		return err
 	}
-	if status.LeaderID != request.targetMember || status.Term != request.fence.Term {
+	if status.LeaderID == request.sourceMember || status.Term != request.fence.Term {
 		return &NotLeaderError{Status: status}
 	}
 	member.retiring = true
@@ -1232,7 +1233,8 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 	}
 	var progress raftmodel.MemberProgress
 	var progressFound bool
-	if request.Kind == MembershipPromoteVoter || request.Kind == MembershipTransferLeader {
+	if request.Kind == MembershipPromoteVoter || request.Kind == MembershipTransferLeader ||
+		request.Kind == MembershipRemoveVoter {
 		progress, progressFound, err = owner.host.Progress(request.Fence.Group, request.TargetMember)
 		if err != nil {
 			return err
@@ -1256,8 +1258,9 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 	case MembershipTransferLeader:
 		return owner.host.TransferLeader(request.Fence.Group, request.TargetMember)
 	case MembershipRemoveVoter:
-		// Removal is authorized only after the target is the observed leader.
-		// This makes deleting the active leader unrepresentable on this wire.
+		// The serialized owner is necessarily the live leader. Validation proves
+		// it is not the retiring source and that the replacement is a caught-up
+		// voter, without needlessly forcing leadership onto that replacement.
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
 			Type: pb.ConfChangeRemoveNode.Enum(), NodeId: &request.SourceMember, Context: context,
 		})
@@ -1303,9 +1306,13 @@ func validateMembershipTransition(
 			return ErrMembershipNotCaughtUp
 		}
 	case MembershipRemoveVoter:
-		if status.LeaderID != request.TargetMember || status.MemberID != request.TargetMember ||
-			status.Term != request.TransferTerm ||
-			!containsSorted(voters, request.TargetMember) {
+		if status.LeaderID == request.SourceMember || status.Term != request.TransferTerm ||
+			len(voters) != len(authority.InitialVoters)+1 || len(learners) != 0 ||
+			len(publication.ConfState.GetVotersOutgoing()) != 0 ||
+			len(publication.ConfState.GetLearnersNext()) != 0 ||
+			publication.ConfState.GetAutoLeave() ||
+			!containsSorted(voters, request.TargetMember) ||
+			!caughtUp(progress, progressFound, status.Commit, false) {
 			return ErrMembershipStale
 		}
 	}
