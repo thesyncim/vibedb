@@ -112,9 +112,22 @@ func (router *RoutedShardControl) ExecuteShardControl(
 	}
 	key := shardControlRouteKey(route)
 	start := router.hintedReplica(key, route.Replicas)
+	attempts := router.attempts
+	if remoteActionTargetsChild(action.Kind) && target.Member != 0 {
+		found := false
+		for index, replica := range route.Replicas {
+			if replica.Member == target.Member {
+				start, attempts, found = index, 1, true
+				break
+			}
+		}
+		if !found {
+			return shardcontrol.Response{}, ErrShardControlRoute
+		}
+	}
 	var joined error
 	sawNotLeader := false
-	for attempt := 0; attempt < router.attempts; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return shardcontrol.Response{}, errors.Join(joined, err)
 		}

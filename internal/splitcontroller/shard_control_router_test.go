@@ -157,7 +157,9 @@ func testShardControlRequestRoute() (shardcontrol.Request, gateway.ReplicatedRou
 		},
 	}
 	payload := remoteStepPayload{
-		Action: uint8(request.Action), Target: ShardActionTarget{
+		Action: uint8(request.Action), Catalog: 1, CatalogDigest: [32]byte{8},
+		AdmissionRevision: 1, Sequence: remoteActionWitnessSequence(Action{Kind: ActionSealSource}),
+		State: []byte{1}, Target: ShardActionTarget{
 			Group: group, Allocation: 9,
 			Authority: sqldriver.ReplicatedAuthorityProfile{
 				ActivePolicyGeneration: command.ActivePolicyGeneration,
@@ -168,6 +170,7 @@ func testShardControlRequestRoute() (shardcontrol.Request, gateway.ReplicatedRou
 			RelationManifestDigest: command.RelationManifestDigest,
 		},
 	}
+	payload.PredecessorDigest = remoteStepPredecessorDigest(payload)
 	request.Payload = mustRemoteStepPayload(nil, payload)
 	return request, gateway.ReplicatedRoute{
 		Distribution: distribution.DistributionName("d"), Shard: distribution.ShardID("s"),

@@ -80,14 +80,6 @@ func (directory *DynamicShardActionRoutes) ResolveShardControl(
 	if found {
 		for _, route := range set.routes {
 			if targetMatchesRoute(target, route) {
-				if target.Member != 0 {
-					for _, replica := range route.Replicas {
-						if replica.Member == target.Member {
-							route.Replicas = []gateway.ReplicatedEndpoint{replica}
-							break
-						}
-					}
-				}
 				directory.mu.RUnlock()
 				return cloneReplicatedRoute(route), nil
 			}

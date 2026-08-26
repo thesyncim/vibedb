@@ -17,7 +17,7 @@ func TestLocalPlanAdmissionRegistriesResolveExactSourceAndPreparedChild(t *testi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = source.Close() })
-	replica := target.Replicas[1]
+	replica := target.Replicas[0]
 	if err = os.Mkdir(replica.RuntimeRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
