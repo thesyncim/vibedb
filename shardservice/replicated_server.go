@@ -216,11 +216,11 @@ const (
 	ReplicatedCompletionInvalidResult
 )
 
-// NewReplicatedServer binds the native RF3 protocol to one serialized owner
-// lane. Command construction must still explicitly supply authenticated client
-// and peer listeners before this becomes a public serving boundary.
+// NewReplicatedServer binds the native RF3 protocol to a group-keyed serving
+// capability. Command construction must still explicitly supply authenticated
+// client and peer listeners before this becomes a public serving boundary.
 func NewReplicatedServer(
-	owner *raftservice.Owner,
+	owner replicatedOwner,
 	maxInFlightFrameBytes int64,
 	requestTimeout time.Duration,
 ) (*ReplicatedServer, error) {

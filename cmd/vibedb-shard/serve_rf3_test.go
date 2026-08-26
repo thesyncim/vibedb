@@ -43,6 +43,8 @@ func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 		{"unknown_flag", []string{"vibedb-shard", "serve-rf3", "-unknown"}, 2},
 		{"missing_flag_value", []string{"vibedb-shard", "serve-rf3", "-manifest"}, 2},
 		{"trailing_argument", []string{"vibedb-shard", "serve-rf3", "-manifest", manifestPath, "extra"}, 2},
+		{"non_power_of_two_lanes", []string{"vibedb-shard", "serve-rf3", "-manifest", manifestPath, "-execution-lanes", "3"}, 2},
+		{"too_many_lanes", []string{"vibedb-shard", "serve-rf3", "-manifest", manifestPath, "-execution-lanes", "128"}, 2},
 		{"missing_manifest_file", []string{"vibedb-shard", "serve-rf3", "-manifest", filepath.Join(directory, "missing")}, 2},
 		// Loading the manifest succeeds, so a missing retained SQL identity is a
 		// serving/preflight failure rather than command grammar failure.
@@ -68,6 +70,22 @@ func TestRF3ControlMuxComposesAllFixedServices(t *testing.T) {
 	}
 	if _, err := newRF3ControlMux(nil, handler, nil, nil); err == nil {
 		t.Fatal("missing mandatory membership service accepted")
+	}
+}
+
+func TestRF3ExecutionLaneCountIsExplicitPowerOfTwo(t *testing.T) {
+	if rf3DefaultExecutionLanes != 8 || !validRF3ExecutionLanes(rf3DefaultExecutionLanes) {
+		t.Fatalf("default execution lanes = %d", rf3DefaultExecutionLanes)
+	}
+	for _, count := range []int{1, 2, 4, 8, 16, 32, 64} {
+		if !validRF3ExecutionLanes(count) {
+			t.Fatalf("valid lane count %d rejected", count)
+		}
+	}
+	for _, count := range []int{-1, 0, 3, 6, 65, 128} {
+		if validRF3ExecutionLanes(count) {
+			t.Fatalf("invalid lane count %d accepted", count)
+		}
 	}
 }
 

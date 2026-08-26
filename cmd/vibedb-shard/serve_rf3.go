@@ -35,10 +35,11 @@ import (
 )
 
 const (
-	rf3IdentityFileBytes = 256 << 10
-	rf3TickInterval      = 50 * time.Millisecond
-	rf3NetworkTimeout    = 10 * time.Second
-	rf3RequestTimeout    = 15 * time.Second
+	rf3IdentityFileBytes     = 256 << 10
+	rf3TickInterval          = 50 * time.Millisecond
+	rf3NetworkTimeout        = 10 * time.Second
+	rf3RequestTimeout        = 15 * time.Second
+	rf3DefaultExecutionLanes = 8
 )
 
 var errRF3Serving = errors.New("vibedb-shard: invalid RF3 serving configuration")
@@ -46,7 +47,9 @@ var errRF3Serving = errors.New("vibedb-shard: invalid RF3 serving configuration"
 func runServeRF3(args []string) int {
 	fs := flag.NewFlagSet("serve-rf3", flag.ContinueOnError)
 	manifestPath := fs.String("manifest", "", "canonical prepared RF3 member manifest")
-	if err := fs.Parse(args); err != nil || *manifestPath == "" || fs.NArg() != 0 {
+	executionLanes := fs.Int("execution-lanes", rf3DefaultExecutionLanes, "power-of-two Raft execution lanes")
+	if err := fs.Parse(args); err != nil || *manifestPath == "" || fs.NArg() != 0 ||
+		!validRF3ExecutionLanes(*executionLanes) {
 		usage()
 		return 2
 	}
@@ -57,7 +60,7 @@ func runServeRF3(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := servePreparedRF3(ctx, manifest); err != nil {
+	if err := servePreparedRF3WithExecutionLanes(ctx, manifest, *executionLanes, net.Listen); err != nil {
 		fmt.Fprintf(os.Stderr, "error serve RF3: %v\n", err)
 		return 1
 	}
@@ -67,7 +70,7 @@ func runServeRF3(args []string) int {
 // servePreparedRF3 opens only previously prepared durable artifacts. It never
 // creates a WAL, SQL root, apply namespace, identity, or bootstrap authority.
 func servePreparedRF3(parent context.Context, manifest rf3Manifest) error {
-	return servePreparedRF3WithListen(parent, manifest, net.Listen)
+	return servePreparedRF3WithExecutionLanes(parent, manifest, rf3DefaultExecutionLanes, net.Listen)
 }
 
 type rf3ListenFunc func(network, address string) (net.Listener, error)
@@ -76,12 +79,24 @@ func servePreparedRF3WithListen(
 	parent context.Context,
 	manifest rf3Manifest,
 	listen rf3ListenFunc,
+) error {
+	return servePreparedRF3WithExecutionLanes(parent, manifest, rf3DefaultExecutionLanes, listen)
+}
+
+func servePreparedRF3WithExecutionLanes(
+	parent context.Context,
+	manifest rf3Manifest,
+	executionLaneCount int,
+	listen rf3ListenFunc,
 ) (resultErr error) {
 	if parent == nil {
 		return errRF3Serving
 	}
 	if listen == nil {
 		return errRF3Serving
+	}
+	if !validRF3ExecutionLanes(executionLaneCount) {
+		return fmt.Errorf("%w: execution lanes must be a power of two between 1 and %d", errRF3Serving, multiraft.AbsoluteMaxExecutionLanes)
 	}
 	if cause := context.Cause(parent); cause != nil {
 		return componentShutdownError(cause)
@@ -261,20 +276,20 @@ func servePreparedRF3WithListen(
 	if err != nil {
 		return errors.Join(err, runtime.Close())
 	}
-	host, err := servingRegistry.NewHost(rf3HostLimits())
+	lanes, err := servingRegistry.NewExecutionLanes(executionLaneCount, rf3HostLimits())
 	if err != nil {
 		return errors.Join(err, runtime.Close(), servingRegistry.Close())
 	}
-	if err := host.Add(runtime); err != nil {
-		return errors.Join(err, runtime.Close(), host.Close(), servingRegistry.Close())
+	if err := lanes.Add(runtime); err != nil {
+		return errors.Join(err, runtime.Close(), lanes.Close(), servingRegistry.Close())
 	}
 
 	pulse := make(chan struct{}, 1)
-	peer, err := raftservice.NewAuthenticatedPeerRuntime(raftservice.AuthenticatedPeerOptions{
+	peer, err := raftservice.NewAuthenticatedExecutionPeerRuntime(raftservice.AuthenticatedExecutionPeerOptions{
 		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
-		Owner: raftservice.Options{
-			Registry: servingRegistry, Host: host,
+		Execution: raftservice.ExecutionOptions{
+			Registry: servingRegistry, Lanes: lanes,
 			Members:                    []raftmember.RuntimeIdentity{runtimeIdentity},
 			CommandFences:              []raftservice.CommandFence{command},
 			ReadSources:                []raftservice.ReadSource{apply},
@@ -289,10 +304,10 @@ func servePreparedRF3WithListen(
 		},
 	})
 	if err != nil {
-		return errors.Join(err, host.Close(), servingRegistry.Close())
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
-		Observer: peer.Owner(),
+		Observer: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
 			return request.Group == group &&
 				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
@@ -317,7 +332,7 @@ func servePreparedRF3WithListen(
 	}
 	defer func() { resultErr = errors.Join(resultErr, actionJournal.Close()) }()
 	actionControl, err := replicaaction.NewService(replicaaction.Options{
-		Journal: actionJournal, Owner: peer.Owner(),
+		Journal: actionJournal, Owner: peer.Owners(),
 		Authorize: func(identity rafttransport.PeerIdentity, request replicaaction.Request) bool {
 			return request.Fence.Group == group &&
 				request.Fence.MemberID == runtimeIdentity.MemberID &&
@@ -447,7 +462,7 @@ func servePreparedRF3WithListen(
 	}
 	var server *shardservice.ReplicatedServer
 	if nativeConfigured {
-		server, err = shardservice.NewReplicatedServer(peer.Owner(), 64<<20, rf3RequestTimeout)
+		server, err = shardservice.NewReplicatedServer(peer.Owners(), 64<<20, rf3RequestTimeout)
 		if err == nil {
 			err = server.BindAuthorization(gate, nil)
 		}
@@ -485,13 +500,13 @@ func servePreparedRF3WithListen(
 	case <-parent.Done():
 		stopPeer(context.Cause(parent))
 		peerErr := <-peerDone
-		return finishRF3Serving(componentShutdownError(peerErr), host, servingRegistry)
+		return finishRF3Serving(componentShutdownError(peerErr), lanes, servingRegistry)
 	}
-	if !peer.Running() || !peer.Owner().Running() {
+	if !peer.Running() || !peer.Owners().Running() {
 		peerErr := <-peerDone
 		return finishRF3Serving(
 			errors.Join(errors.New("RF3 peer failed before readiness"), peerErr),
-			host, servingRegistry,
+			lanes, servingRegistry,
 		)
 	}
 
@@ -576,7 +591,7 @@ func servePreparedRF3WithListen(
 		primary = errors.Join(primary, componentShutdownError(<-peerDone))
 	}
 	<-pulseDone
-	return finishRF3Serving(primary, host, servingRegistry)
+	return finishRF3Serving(primary, lanes, servingRegistry)
 }
 
 // newRF3ControlMux is the stable composition boundary for all authenticated
@@ -1063,6 +1078,10 @@ func componentShutdownError(err error) error {
 	return err
 }
 
-func finishRF3Serving(primary error, host *multiraft.Host, registry *raftserve.Registry) error {
-	return errors.Join(primary, host.Close(), registry.Close())
+func validRF3ExecutionLanes(count int) bool {
+	return count > 0 && count <= multiraft.AbsoluteMaxExecutionLanes && count&(count-1) == 0
+}
+
+func finishRF3Serving(primary error, lanes *multiraft.ExecutionLanes, registry *raftserve.Registry) error {
+	return errors.Join(primary, lanes.Close(), registry.Close())
 }

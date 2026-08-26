@@ -2577,6 +2577,28 @@ func (registry *Registry) NewHost(limits multiraft.Limits) (*multiraft.Host, err
 	})
 }
 
+// NewExecutionLanes constructs deterministic Host lanes sharing this
+// registry's concurrency-safe serving sinks.
+func (registry *Registry) NewExecutionLanes(count int, limits multiraft.Limits) (*multiraft.ExecutionLanes, error) {
+	if registry == nil {
+		return nil, ErrRegistryClosed
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closed {
+		return nil, ErrRegistryClosed
+	}
+	if registry.failure != nil {
+		return nil, registry.failure
+	}
+	return multiraft.NewExecutionLanesWithServingSinks(count, limits, multiraft.ServingSinks{
+		Settle: registry.settleOwnedAppliedBatch, Proposals: registry.settleProposalAdmission,
+		ProposalGroups:  registry.settleProposalGroupTermination,
+		ProposalPending: registry.hasPendingOwnedGroup, ClaimSource: registry.claimAppliedSource,
+		ReleaseSource: registry.releaseAppliedSource,
+	})
+}
+
 func (registry *Registry) signalAttemptLocked(
 	attemptIndex uint32,
 	attempt *attemptRecord,

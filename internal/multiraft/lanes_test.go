@@ -99,6 +99,35 @@ func TestExecutionLanesDeterministicAssignmentAndValidation(t *testing.T) {
 	_ = set.Close()
 }
 
+func TestExecutionLaneOwnerViewRejectsCrossLaneIngress(t *testing.T) {
+	set, err := NewExecutionLanes(2, testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	first := runtimeForLane(t, set, 0, 1)
+	second := runtimeForLane(t, set, 1, 81)
+	if err := set.addRuntime(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.addRuntime(second); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := set.OwnerLane(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.RequestCampaign(first.identity.Group); err != nil {
+		t.Fatalf("owning lane ingress: %v", err)
+	}
+	if err := owner.RequestCampaign(second.identity.Group); !errors.Is(err, ErrExecutionLane) {
+		t.Fatalf("cross-lane ingress error = %v", err)
+	}
+	if set.Count() != 2 {
+		t.Fatalf("lane count = %d", set.Count())
+	}
+}
+
 func TestExecutionLanesEnforceDistinctGroupAndAggregateByteBounds(t *testing.T) {
 	limits := testHostLimits()
 	limits.MaxGroupBytes = raftmodel.MaxInboundMessageBytes
