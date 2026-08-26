@@ -60,6 +60,7 @@ type DurableRequestLifecycleCAS struct {
 	PlanningRestart requestledger.PlanningRestartRequest
 	PlanningCleanup requestledger.PlanningCleanupRequest
 	IssuerAdvance   requestledger.IssuerAdvanceRequest
+	IssuerOpen      requestledger.IssuerHighwaterRecord
 }
 
 // DurableRequestLifecycleCASResult is the authenticated replicated result of
@@ -265,6 +266,12 @@ func durableRequestLifecycleCommand(
 		command.RequestDigest, command.PlanRoot = cas.Head.RequestDigest, cas.Head.PlanRoot
 		command.SubjectDigest = cas.IssuerAdvance.ExpectedHighwaterDigest
 		command.Payload, err = requestledger.AppendIssuerAdvanceRequest(nil, cas.IssuerAdvance)
+	case requestledger.OperationOpenIssuerLane:
+		command.KeyDigest = cas.IssuerOpen.IssuerDigest
+		command.RequestDigest = cas.IssuerOpen.HighwaterDigest
+		command.PlanRoot = cas.IssuerOpen.HighwaterDigest
+		command.SubjectDigest = cas.IssuerOpen.HighwaterDigest
+		command.Payload, err = requestledger.AppendIssuerHighwater(nil, cas.IssuerOpen)
 	default:
 		return requestledger.Command{}, ErrDurableRequest
 	}
