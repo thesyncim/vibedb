@@ -542,6 +542,61 @@ func TestReplicatedPointReadStopsServingFenceBackoffOnCancellation(t *testing.T)
 	}
 }
 
+func TestReplicatedBatchReadRetriesSameCommandFenceIncarnationRace(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	state.Applied, state.Commit = 10, 10
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	refreshed := state
+	refreshed.Fence.Term++
+	value := appendScatterValues(nil, [][]byte{[]byte("value")})
+	client := &sequenceReplicatedClient{state: refreshed, responses: []*shardservice.ReplicatedResponse{
+		{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: refreshed},
+		{Kind: shardservice.ReplicatedReadBatchResult,
+			HasState: true, State: refreshed, ReadApplied: refreshed.Applied, Value: value},
+	}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ReadPointBatch(context.Background(), route, ReplicatedBatchRead{
+		Points:         []ReplicatedBatchPointRead{{Relation: 1, Key: []byte("k")}},
+		MinimumApplied: 10, MaxResultBytes: 1024,
+	})
+	if err != nil || result.Retries != 1 || result.Count() != 1 || client.proposals != 2 {
+		t.Fatalf("result=%+v requests=%d err=%v", result, client.proposals, err)
+	}
+	raw, found, ok := result.Lookup(0)
+	if !ok || !found || !bytes.Equal(raw, []byte("value")) {
+		t.Fatalf("value=%q found=%v ok=%v", raw, found, ok)
+	}
+}
+
+func TestReplicatedBatchReadStopsServingFenceBackoffOnCancellation(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	state := states["m2"]
+	state.Applied, state.Commit = 10, 10
+	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
+	client := &sequenceReplicatedClient{state: state, responses: []*shardservice.ReplicatedResponse{{
+		Kind:    shardservice.ReplicatedRefusal,
+		Refusal: shardservice.ReplicatedRefusalStaleFence, HasState: true, State: state,
+	}}}
+	executor, err := NewReplicatedExecutor(client, 2, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = executor.ReadPointBatch(ctx, route, ReplicatedBatchRead{
+		Points:         []ReplicatedBatchPointRead{{Relation: 1, Key: []byte("k")}},
+		MinimumApplied: 10, MaxResultBytes: 1024,
+	})
+	if !errors.Is(err, context.Canceled) || client.proposals != 1 {
+		t.Fatalf("error=%T %v requests=%d", err, err, client.proposals)
+	}
+}
+
 func TestReplicatedPointReadPrefersAppliedFollowerAndKeepsLeaderReadStrict(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
 	for address, state := range states {

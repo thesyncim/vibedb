@@ -444,7 +444,19 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalStaleFence {
 				executor.leaderHints.invalidate(route, endpoint, state)
-				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
+				// A command-fence mismatch was handled above and is a
+				// definite catalog refusal. The same command fence identifies
+				// a member/term incarnation race between discovery and read
+				// admission, so refresh the handshake within the bounded
+				// attempt budget instead of forcing a catalog refresh.
+				joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+				preferred = response.State.LeaderID
+				if attempt+1 < executor.maxAttempts {
+					if err := waitReplicatedFailoverRetry(ctx, attempt); err != nil {
+						return ReplicatedBatchPointResult{}, errors.Join(ErrReplicatedLeader, err)
+					}
+				}
+				continue
 			}
 			if response.Refusal == shardservice.ReplicatedRefusalReadBehind ||
 				response.Refusal == shardservice.ReplicatedRefusalReadBufferBound ||
