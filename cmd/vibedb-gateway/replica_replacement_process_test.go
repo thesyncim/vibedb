@@ -40,9 +40,34 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("external replica replacement requires Linux durable allocation semantics")
 	}
+	if os.Getenv("VIBEDB_REPLICA_REPLACEMENT_E2E") != "1" {
+		t.Skip("set VIBEDB_REPLICA_REPLACEMENT_E2E=1 for external replica replacement qualification")
+	}
 	if testing.Short() {
 		t.Skip("external four-process RF3 qualification")
 	}
+	evidencePath := os.Getenv("VIBEDB_REPLICA_REPLACEMENT_EVIDENCE")
+	if evidencePath == "" {
+		t.Fatal("VIBEDB_REPLICA_REPLACEMENT_EVIDENCE is required for qualification")
+	}
+	qualificationStarted := time.Now()
+	phase, finalGeneration := "setup", uint64(0)
+	defer func() {
+		result := "pass"
+		if t.Failed() {
+			result = "fail"
+		}
+		raw := fmt.Appendf(nil,
+			"schema\tvibedb.replica-replacement-process\t1\nresult\t%s\nphase\t%s\nelapsed_millis\t%d\nfinal_catalog_generation\t%d\n",
+			result, phase, time.Since(qualificationStarted).Milliseconds(), finalGeneration)
+		if len(raw) > 64<<10 {
+			t.Errorf("replica replacement evidence exceeded 64 KiB")
+			return
+		}
+		if err := os.WriteFile(evidencePath, raw, 0o600); err != nil {
+			t.Errorf("write replica replacement evidence: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	root := t.TempDir()
@@ -195,6 +220,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			t.Fatalf("voter readiness: %v\n%s", err, voter.Diagnostics())
 		}
 	}
+	phase = "voters_ready"
 	coldTarget := &rf3testfixture.ExternalProcess{Binary: shardBinary,
 		Args: []string{"bootstrap-rf3", "-manifest", cold.BootstrapManifestPath}}
 	if err = coldTarget.Start(); err != nil {
@@ -204,6 +230,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = coldTarget.WaitReady(ctx, "vibedb-shard RF3 cold bootstrap ready"); err != nil {
 		t.Fatalf("cold target readiness: %v\n%s", err, coldTarget.Diagnostics())
 	}
+	phase = "cold_target_ready"
 	gatewayProcess := replicaProcessGateway(gatewayBinary, catalogPath, gatewayNative,
 		replicaManifestPath, credentials[4], roots, policyPath, ackPath,
 		filepath.Join(root, "gateway-session"), listeners, nodes)
@@ -214,6 +241,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("gateway readiness: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
+	phase = "gateway_ready"
 
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
@@ -231,6 +259,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
 		t.Fatalf("restarted gateway readiness: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
+	phase = "controller_restarted"
 
 	// The old member is reopened after the final roster can be observed. This
 	// gives the durable retirement action a live endpoint for certified cleanup,
@@ -269,6 +298,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if !restartedSource {
 		t.Fatal("retired source was not reopened for cleanup")
 	}
+	phase = "replacement_complete"
 	if elapsed := time.Since(started); elapsed > 90*time.Second {
 		t.Fatalf("replacement latency %s exceeded bound", elapsed)
 	}
@@ -295,6 +325,8 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		replicaProcessRosterContains(descriptors[0], 1) {
 		t.Fatalf("retired source rejoined after controller restart: %+v", descriptors)
 	}
+	finalGeneration = final.Generation()
+	phase = "terminal_reopen_verified"
 }
 
 func replicaProcessNodes() (nodes [5]rafttransport.NodeID) {

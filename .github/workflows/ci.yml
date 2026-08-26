@@ -36,6 +36,77 @@ jobs:
         # package binaries keeps the aggregate virtual-memory reservation
         # deterministic without reducing test coverage or per-package timeouts.
         run: go test -p=1 -timeout=25m ./...
+      - name: Prepare replica-replacement qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/replica-replacement"
+          mkdir -p "${evidence}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${RUNNER_TEMP}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${evidence}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestGatewayAutomaticReplicaReplacementProcesses'
+          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=1 -timeout=4m -run %s ./cmd/vibedb-gateway\n' \
+            "${evidence}/result.tsv" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Automatic replica-replacement process qualification
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          VIBEDB_REPLICA_REPLACEMENT_E2E: "1"
+          VIBEDB_REPLICA_REPLACEMENT_EVIDENCE: ${{ runner.temp }}/replica-replacement/result.tsv
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout=4m \
+            -run '^TestGatewayAutomaticReplicaReplacementProcesses$' \
+            ./cmd/vibedb-gateway \
+            | tee "${RUNNER_TEMP}/replica-replacement/go-test.jsonl"
+      - name: Validate replica-replacement evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/replica-replacement"
+          test_name='TestGatewayAutomaticReplicaReplacementProcesses'
+          test -s "${evidence}/go-test.jsonl"
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 16777216
+          jq -e --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null
+          if jq -e --arg test_name "${test_name}" \
+            'select(.Action == "skip" and .Test == $test_name)' \
+            "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "replica replacement qualification skipped" >&2
+            exit 1
+          fi
+          result="${evidence}/result.tsv"
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 65536
+          grep -Fqx $'schema\tvibedb.replica-replacement-process\t1' "${result}"
+          grep -Fqx $'result\tpass' "${result}"
+          grep -Fqx $'phase\tterminal_reopen_verified' "${result}"
+      - name: Upload replica-replacement evidence
+        if: always() && matrix.runner == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-replacement-${{ github.sha }}
+          path: ${{ runner.temp }}/replica-replacement
+          if-no-files-found: error
+          retention-days: 30
       - name: RF3 external-process fault evidence
         if: matrix.runner == 'ubuntu-latest'
         run: |
