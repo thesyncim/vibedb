@@ -4,6 +4,8 @@
 package rebalance
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -54,7 +56,14 @@ type Plan struct {
 	baseBound             bool
 	baseDigest            [32]byte
 	baseState             replicatedstate.State
+	certificate           replicatedstate.SnapshotBaseCertificate
+	operation             OperationID
 }
+
+// OperationID is the fixed byte-native identity of one exact replica move.
+// It is independent of controller process state and of the later snapshot-base
+// binding, so every retry and restart retains the same key.
+type OperationID [sha256.Size]byte
 
 // PlanReplicaMove validates one exact catalog and Raft membership cut. It does
 // not mutate either authority and performs no network or storage work.
@@ -133,12 +142,17 @@ func newPlan(
 	if err := raftmodel.ValidateConfState(removed, validationIndex+3); err != nil {
 		return nil, fmt.Errorf("%w: final membership: %v", ErrInvalidPlan, err)
 	}
-	return &Plan{
+	plan := &Plan{
 		request: request, catalogGeneration: catalogGeneration,
 		nextCatalogGeneration: catalogGeneration + 1,
 		sourceManifest:        sourceManifest, targetManifest: targetManifest,
 		initialConf: initial, learnerConf: learner, voterConf: voter, removedConf: removed,
-	}, nil
+	}
+	plan.operation = replicaMoveOperationID(plan)
+	if plan.operation == (OperationID{}) {
+		return nil, ErrInvalidPlan
+	}
+	return plan, nil
 }
 
 // BindSnapshotBase returns a new plan bound to one strictly verified learner
@@ -191,6 +205,7 @@ func bindCertificate(
 	next.baseBound = true
 	next.baseDigest = certificate.Digest
 	next.baseState = state
+	next.certificate = certificate
 	return &next, nil
 }
 
@@ -314,6 +329,84 @@ func (p *Plan) Group() raftmember.GroupKey {
 		return raftmember.GroupKey{}
 	}
 	return p.request.Group
+}
+
+// OperationID returns the stable idempotency identity for this exact move.
+func (p *Plan) OperationID() OperationID {
+	if p == nil {
+		return OperationID{}
+	}
+	return p.operation
+}
+
+func replicaMoveOperationID(plan *Plan) OperationID {
+	if plan == nil || plan.sourceManifest == nil || plan.initialConf == nil {
+		return OperationID{}
+	}
+	ordinal, ok := exactShard(plan.sourceManifest, plan.request.Shard)
+	if !ok {
+		return OperationID{}
+	}
+	shard, ok := plan.sourceManifest.ShardInfo(ordinal)
+	if !ok {
+		return OperationID{}
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/rebalance/replica-move-operation\x00"))
+	writeOperationString(hash, string(plan.request.Distribution))
+	writeOperationString(hash, string(plan.request.Shard))
+	for _, id := range [...][16]byte{
+		plan.request.Group.ClusterID, plan.request.Group.ClusterIncarnation,
+		plan.request.Group.ShardIncarnation, plan.request.Group.GroupID,
+	} {
+		_, _ = hash.Write(id[:])
+	}
+	for _, value := range [...]uint64{
+		plan.request.Group.TopologyRecoveryEpoch, plan.request.SourceMember,
+		plan.request.TargetMember, plan.catalogGeneration, plan.nextCatalogGeneration,
+		uint64(plan.sourceManifest.Version()), uint64(shard.AllocationGeneration),
+		uint64(shard.Epoch),
+	} {
+		writeOperationUint64(hash, value)
+	}
+	writeOperationString(hash, string(plan.request.Source))
+	writeOperationString(hash, string(plan.request.Target))
+	_, _ = hash.Write(shard.Range.Start[:])
+	if shard.Range.End.Max {
+		_, _ = hash.Write([]byte{1})
+	} else {
+		_, _ = hash.Write([]byte{0})
+	}
+	_, _ = hash.Write(shard.Range.End.Point[:])
+	writeOperationUint64(hash, uint64(len(shard.Leaders)))
+	for _, leader := range shard.Leaders {
+		writeOperationString(hash, string(leader))
+	}
+	writeOperationMembers(hash, plan.initialConf.GetVoters())
+	writeOperationMembers(hash, plan.initialConf.GetLearners())
+	var result OperationID
+	_ = hash.Sum(result[:0])
+	return result
+}
+
+type operationHash interface{ Write([]byte) (int, error) }
+
+func writeOperationUint64(hash operationHash, value uint64) {
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], value)
+	_, _ = hash.Write(raw[:])
+}
+
+func writeOperationString(hash operationHash, value string) {
+	writeOperationUint64(hash, uint64(len(value)))
+	_, _ = hash.Write([]byte(value))
+}
+
+func writeOperationMembers(hash operationHash, members []uint64) {
+	writeOperationUint64(hash, uint64(len(members)))
+	for _, member := range members {
+		writeOperationUint64(hash, member)
+	}
 }
 
 func (p *Plan) CatalogGeneration() uint64 {
