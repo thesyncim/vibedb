@@ -139,7 +139,7 @@ func newSQLBatchWireFixture(
 		}
 		group.ShardIncarnation[14], group.ShardIncarnation[15] = byte(groupIndex>>8), byte(groupIndex+1)
 		group.GroupID[14], group.GroupID[15] = byte(groupIndex>>8), byte(groupIndex+1)
-		descriptors = append(descriptors, gateway.ReplicatedShardDescriptor{
+		descriptor := gateway.ReplicatedShardDescriptor{
 			Distribution: distributionName, Shard: "all", Group: group, AllocationGeneration: 1,
 			Command: raftservice.CommandFence{
 				ReplicaSetVersion: 1, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
@@ -151,7 +151,9 @@ func newSQLBatchWireFixture(
 				{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22, Endpoint: "peer-b", NativeEndpoint: "native-b", ControlEndpoint: "control-b"},
 				{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23, Endpoint: "peer-c", NativeEndpoint: "native-c", ControlEndpoint: "control-c"},
 			},
-		})
+		}
+		bindTestReplicatedShardIdentity(t, &descriptor)
+		descriptors = append(descriptors, descriptor)
 	}
 	request := serveRequest{Op: "read_batch", MaxResultBytes: 1 << 20}
 	for pointIndex := range pointCount {

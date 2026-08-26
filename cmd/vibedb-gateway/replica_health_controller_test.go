@@ -326,16 +326,18 @@ func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.Fa
 			NativeEndpoint:  distribution.EndpointID(name + "-native"),
 			ControlEndpoint: distribution.EndpointID(name + "-control")}
 	}
-	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(distribution.ClusterConfig{
-		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
-		Manifests:     []*distribution.Manifest{manifest},
-	}, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{{
+	descriptor := gateway.ReplicatedShardDescriptor{
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
 		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
 			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
 			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},
 		Replicas: replicas,
-	}})
+	}
+	bindTestReplicatedShardIdentity(t, &descriptor)
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Manifests:     []*distribution.Manifest{manifest},
+	}, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
 	if err != nil {
 		t.Fatal(err)
 	}
