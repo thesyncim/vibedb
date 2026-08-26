@@ -208,11 +208,12 @@ func TestFusedTransactionBodyCopyBudget(t *testing.T) {
 }
 
 // TestReplicatedTransactionEncodedSchedulePerformanceTargets builds and opens
-// every route-bound fused CommandTransaction in the success schedule. It proves
-// the canonical envelope count, identities, route diversity, manifest packing,
-// and revision CAS values. State-machine execution and two-real-RF3-group fault
-// coverage belong in the cross-layer replicatedstate/shard-service suites; this
-// package cannot import those layers without an import cycle.
+// the native one-shard fast path or every route-bound fused CommandTransaction
+// for a distributed success schedule. It proves the canonical envelope count,
+// identities, route diversity, manifest packing, and revision CAS values.
+// State-machine execution and two-real-RF3-group fault coverage belong in the
+// cross-layer replicatedstate/shard-service suites; this package cannot import
+// those layers without an import cycle.
 func TestReplicatedTransactionEncodedSchedulePerformanceTargets(t *testing.T) {
 	tests := []struct {
 		participants  int
