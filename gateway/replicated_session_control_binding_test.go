@@ -56,6 +56,9 @@ func TestNativeSessionControlBindingRequiresDurableExactRouteMember(t *testing.T
 
 func TestTopologyMutationJournalsExactCertifiedFingerprintAcrossUnknown(t *testing.T) {
 	route, _, states := testReplicatedRouteCommand(t)
+	route.RangeIdentity = replication.Digest{0x31}
+	route.LineageDigest = replication.Digest{0x32}
+	route.ForwardingRuleDigest = replication.Digest{0x33}
 	client := &nativeSessionClient{state: states["m2"], unknownMutationOnce: true}
 	executor, err := NewReplicatedExecutor(client, 1, time.Second)
 	if err != nil {
