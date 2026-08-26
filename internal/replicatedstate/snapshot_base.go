@@ -497,13 +497,10 @@ func validateSnapshotBaseManifest(manifest SnapshotArtifactManifest) error {
 
 func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 	wantSystemRows, systemRowsOK := stateSystemRowCount(manifest.State)
+	streamed := manifest.TargetChunkBytes != 0
 	if manifest.Seeded || len(manifest.Relations) < 1 ||
 		len(manifest.Relations) > replication.MaxRelationsPerBundle ||
 		manifest.RelationManifestDigest == ([sha256.Size]byte{}) ||
-		manifest.TargetChunkBytes != 0 || manifest.Chunks != 0 ||
-		manifest.PayloadBytes != 0 || manifest.EncodedBytes != 0 ||
-		manifest.HeaderDigest != ([sha256.Size]byte{}) ||
-		manifest.LastChunkDigest != ([sha256.Size]byte{}) ||
 		manifest.ImageDigest == ([sha256.Size]byte{}) ||
 		manifest.Digest == ([sha256.Size]byte{}) ||
 		!systemRowsOK || manifest.SystemRows != wantSystemRows ||
@@ -513,6 +510,17 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		bytes.IndexByte(manifest.UserCollection, 0) >= 0 ||
 		bytes.Equal(manifest.UserCollection, []byte(systemCollectionName)) {
 		return fmt.Errorf("%w: bundle manifest", ErrSnapshotBase)
+	}
+	if !streamed && (manifest.Chunks != 0 || manifest.PayloadBytes != 0 ||
+		manifest.EncodedBytes != 0 || manifest.HeaderDigest != ([sha256.Size]byte{}) ||
+		manifest.LastChunkDigest != ([sha256.Size]byte{})) ||
+		streamed && (len(manifest.Relations) < 2 ||
+			manifest.TargetChunkBytes < MinSnapshotArtifactChunkBytes ||
+			manifest.TargetChunkBytes > MaxSnapshotArtifactChunkBytes ||
+			manifest.Chunks == 0 || manifest.PayloadBytes == 0 || manifest.EncodedBytes == 0 ||
+			manifest.HeaderDigest == ([sha256.Size]byte{}) ||
+			manifest.LastChunkDigest == ([sha256.Size]byte{})) {
+		return fmt.Errorf("%w: bundle geometry", ErrSnapshotBase)
 	}
 	if err := validateState(manifest.State); err != nil {
 		return fmt.Errorf("%w: bundle state: %v", ErrSnapshotBase, err)
@@ -559,12 +567,41 @@ func validateBundleSnapshotManifest(manifest SnapshotArtifactManifest) error {
 		return fmt.Errorf("%w: bundle image", ErrSnapshotBase)
 	}
 	stateEnvelope, err := AppendState(nil, manifest.State)
-	if err != nil || manifest.Digest != bundleSnapshotManifestDigest(
+	if err != nil {
+		return fmt.Errorf("%w: bundle identity", ErrSnapshotBase)
+	}
+	if !streamed && manifest.Digest != bundleSnapshotManifestDigest(
 		stateEnvelope, manifest.RelationManifestDigest, manifest.SystemRows,
 		manifest.Relations, manifest.ImageDigest, manifest.CaptureRows,
 		manifest.CaptureImageDigest,
 	) {
 		return fmt.Errorf("%w: bundle identity", ErrSnapshotBase)
+	}
+	if streamed {
+		headerRelations := make([]SnapshotArtifactRelation, len(manifest.Relations))
+		for i := range manifest.Relations {
+			headerRelations[i] = SnapshotArtifactRelation{
+				Relation: manifest.Relations[i].Relation, Kind: manifest.Relations[i].Kind,
+				Collection: manifest.Relations[i].Collection,
+			}
+		}
+		header, headerDigest, headerErr := makeSnapshotArtifactHeaderForRelations(
+			stateEnvelope, string(manifest.UserCollection), int(manifest.TargetChunkBytes),
+			manifest.RelationManifestDigest, headerRelations, true,
+		)
+		encoded, encodedOK := snapshotArtifactEncodedBytesWithRelations(
+			uint64(len(header)), manifest.Chunks, manifest.PayloadBytes,
+			uint64(len(manifest.Relations)), true,
+		)
+		_, footerDigest := makeSnapshotArtifactFooter(
+			manifest.Chunks, manifest.SystemRows, manifest.UserRows, manifest.CaptureRows,
+			manifest.PayloadBytes, manifest.EncodedBytes, manifest.LastChunkDigest,
+			manifest.HeaderDigest, manifest.ImageDigest, manifest.CaptureImageDigest,
+		)
+		if headerErr != nil || headerDigest != manifest.HeaderDigest || !encodedOK ||
+			encoded != manifest.EncodedBytes || footerDigest != manifest.Digest {
+			return fmt.Errorf("%w: streamed bundle identity", ErrSnapshotBase)
+		}
 	}
 	return nil
 }

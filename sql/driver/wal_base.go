@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -19,9 +20,10 @@ var walBasePreparationDomain = []byte("vibedb/sql/wal-base-preparation/fixed\x00
 
 // WALBaseCaptureOptions controls only caller-owned bounded scan workspace.
 // Artifact framing is fixed by CaptureWALBase and has no alternate grammar.
-// Workspace is required. Both collections' frozen key and document limits are
-// validated before sealing, then its capacity must cover the fixed aggregate
-// chunk target. Exceptional rows stream directly from borrowed engine bytes.
+// Workspace is required. The system, every dense relation, and capture
+// collection's frozen key and document limits are validated before sealing,
+// then its capacity must cover their shared fixed aggregate chunk target.
+// Exceptional rows stream directly from borrowed engine bytes.
 // Storage checkpointing and raw overflow-row traversal use separate bounded
 // engine scratch.
 type WALBaseCaptureOptions struct {
@@ -118,36 +120,15 @@ func (a *ReplicatedApply) CaptureWALBase(
 	}
 	group := core.checkpointGroup
 	base := core.catalog.ReplicatedShardStore
-	if group == nil || base == nil || base.UserTable == "" {
+	if group == nil || base == nil || base.RelationCount == 0 {
 		core.mu.Unlock()
 		return nil, ErrReplicatedApplyMismatch
 	}
-	if base.RelationCount != 1 {
-		core.mu.Unlock()
-		return nil, fmt.Errorf(
-			"%w: relation bundles require one certified multi-image snapshot base",
-			replicatedstate.ErrSnapshotArtifact,
-		)
-	}
-	systemWorkspaceBytes, err := replicatedstate.RequiredSnapshotArtifactPayloadCapacity(
-		replicatedstate.DefaultSnapshotArtifactChunkBytes,
-		a.identity.SystemLimits.MaxKeyBytes,
-		a.identity.SystemLimits.MaxDocumentBytes,
-	)
+	requiredWorkspaceBytes, err := walBaseRequiredWorkspaceBytes(*base, a.identity)
 	if err != nil {
 		core.mu.Unlock()
-		return nil, errors.Join(ErrReplicatedApplyMismatch, err)
+		return nil, err
 	}
-	userWorkspaceBytes, err := replicatedstate.RequiredSnapshotArtifactPayloadCapacity(
-		replicatedstate.DefaultSnapshotArtifactChunkBytes,
-		base.UserLimits.MaxKeyBytes,
-		base.UserLimits.MaxDocumentBytes,
-	)
-	if err != nil {
-		core.mu.Unlock()
-		return nil, errors.Join(ErrReplicatedApplyMismatch, err)
-	}
-	requiredWorkspaceBytes := max(systemWorkspaceBytes, userWorkspaceBytes)
 	if cap(options.Workspace) < requiredWorkspaceBytes {
 		core.mu.Unlock()
 		return nil, fmt.Errorf(
@@ -171,7 +152,7 @@ func (a *ReplicatedApply) CaptureWALBase(
 		core.mu.Unlock()
 		return nil, errors.Join(ErrWALBasePreparation, err)
 	}
-	cut, err := a.machine.Snapshot(base.UserTable)
+	cut, err := a.machine.Snapshot()
 	if err != nil {
 		core.mu.Unlock()
 		return nil, err
@@ -208,7 +189,10 @@ func (a *ReplicatedApply) CaptureWALBase(
 	}
 	if !witness.BindsAppliedIndex(manifest.State.Applied) ||
 		manifest.State.Applied != applied ||
-		manifest.TargetChunkBytes != replicatedstate.DefaultSnapshotArtifactChunkBytes {
+		manifest.TargetChunkBytes != replicatedstate.DefaultSnapshotArtifactChunkBytes ||
+		!equalWALBaseManifest(
+			manifest, *base, cut.Fence().RelationManifestDigest,
+		) {
 		return nil, ErrWALBasePreparation
 	}
 	snapshotBase, err := a.machine.BuildSnapshotBaseForManifest(manifest)
@@ -281,7 +265,7 @@ func (a *ReplicatedApply) ValidateWALBasePreparation(
 	}
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil ||
-		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) {
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) {
 		return ErrReplicatedApplyMismatch
 	}
 	if err := core.checkpointGroup.ValidateRetentionWitness(preparation.retention); err != nil {
@@ -356,7 +340,7 @@ func (a *ReplicatedApply) PublishWALGenerationSelection(
 	}
 	base := core.catalog.ReplicatedShardStore
 	if core.checkpointGroup == nil || base == nil ||
-		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) {
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) {
 		core.mu.Unlock()
 		return ErrReplicatedApplyMismatch
 	}
@@ -432,8 +416,8 @@ func (a *ReplicatedApply) SettleGenerationActivation(
 	}
 	group := core.checkpointGroup
 	base := core.catalog.ReplicatedShardStore
-	if group == nil || base == nil || base.UserTable == "" ||
-		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) ||
+	if group == nil || base == nil || base.RelationCount == 0 ||
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
 		certificate.Manifest.State.Binding != replicatedStateBinding(*base) {
 		return ErrReplicatedApplyMismatch
 	}
@@ -486,8 +470,8 @@ func (a *ReplicatedApply) LatchGenerationActivation(
 		return ErrReplicatedApplyBusy
 	}
 	base := core.catalog.ReplicatedShardStore
-	if core.checkpointGroup == nil || base == nil || base.UserTable == "" ||
-		!equalWALBaseCollection(certificate.Manifest.UserCollection, base.UserTable) ||
+	if core.checkpointGroup == nil || base == nil || base.RelationCount == 0 ||
+		!walBaseManifestMatchesMachine(a, certificate.Manifest, *base) ||
 		certificate.Manifest.State.Binding != replicatedStateBinding(*base) ||
 		a.machine.Applied() != certificate.Manifest.State.Applied {
 		return ErrReplicatedApplyMismatch
@@ -578,4 +562,118 @@ func equalWALBaseCollection(raw []byte, name string) bool {
 		}
 	}
 	return true
+}
+
+func walBaseRequiredWorkspaceBytes(
+	base ReplicatedShardStoreIdentity,
+	apply ReplicatedApplyIdentity,
+) (int, error) {
+	requiredFor := func(limits ReplicatedShardStoreLimits) (int, error) {
+		capacity, err := replicatedstate.RequiredSnapshotArtifactPayloadCapacity(
+			replicatedstate.DefaultSnapshotArtifactChunkBytes,
+			limits.MaxKeyBytes,
+			limits.MaxDocumentBytes,
+		)
+		if err != nil {
+			return 0, errors.Join(ErrReplicatedApplyMismatch, err)
+		}
+		return capacity, nil
+	}
+	required, err := requiredFor(apply.SystemLimits)
+	if err != nil {
+		return 0, err
+	}
+	for ordinal := range base.Relations {
+		capacity, err := requiredFor(base.Relations[ordinal].Limits)
+		if err != nil {
+			return 0, err
+		}
+		required = max(required, capacity)
+	}
+	// Capture rows have their own wider opaque-value ceiling and are streamed
+	// directly when exceptional. They still share the same aggregate buffer;
+	// validate their frozen bounds without incorrectly applying the user-value
+	// ceiling used by RequiredSnapshotArtifactPayloadCapacity.
+	if apply.CaptureLimits.MaxKeyBytes <= 0 ||
+		apply.CaptureLimits.MaxKeyBytes > replication.MaxMutationKeyBytes ||
+		apply.CaptureLimits.MaxDocumentBytes <= 0 ||
+		apply.CaptureLimits.MaxDocumentBytes > replicatedstate.MaxTransitionCaptureRecordBytes {
+		return 0, ErrReplicatedApplyMismatch
+	}
+	required = max(required, replicatedstate.DefaultSnapshotArtifactChunkBytes)
+	return required, nil
+}
+
+// equalWALBaseManifestShape binds a streamed certificate to the catalog's
+// complete logical relation shape. It deliberately does not compare digest
+// fields: the replicated-state machine's relation-manifest digest has a
+// different domain and field grammar from the SQL catalog/apply-profile
+// digests. Callers which already own a Machine must additionally use
+// equalWALBaseManifest with that Machine's exact digest. Snapshot staging
+// performs the same exact check while constructing its replicated-state
+// bundle candidate from these catalog-checked relations.
+func equalWALBaseManifestShape(
+	manifest replicatedstate.SnapshotArtifactManifest,
+	base ReplicatedShardStoreIdentity,
+) bool {
+	if base.RelationCount == 0 || len(base.Relations) != int(base.RelationCount) ||
+		!equalWALBaseCollection(manifest.UserCollection, base.UserTable) {
+		return false
+	}
+	if base.RelationCount == 1 {
+		return !manifest.Bundle && len(manifest.Relations) == 0 &&
+			manifest.RelationManifestDigest == ([sha256.Size]byte{})
+	}
+	if !manifest.Bundle || len(manifest.Relations) != int(base.RelationCount) ||
+		manifest.RelationManifestDigest == ([sha256.Size]byte{}) {
+		return false
+	}
+	for ordinal := range base.Relations {
+		stored := base.Relations[ordinal]
+		artifact := manifest.Relations[ordinal]
+		var kind replicatedstate.RelationKind
+		switch stored.Kind {
+		case ReplicatedShardRelationJSON:
+			kind = replicatedstate.RelationJSON
+		case ReplicatedShardRelationGlobalIndex:
+			kind = replicatedstate.RelationGlobalIndex
+		default:
+			return false
+		}
+		if artifact.Relation != replication.RelationID(stored.Relation) ||
+			artifact.Kind != kind ||
+			!equalWALBaseCollection(artifact.Collection, stored.Table) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalWALBaseManifest adds the exact replicated-state Machine schema digest
+// to the catalog-shape proof. A singleton retains its original artifact
+// grammar, which intentionally carries no relation-manifest digest.
+func equalWALBaseManifest(
+	manifest replicatedstate.SnapshotArtifactManifest,
+	base ReplicatedShardStoreIdentity,
+	machineDigest [sha256.Size]byte,
+) bool {
+	if !equalWALBaseManifestShape(manifest, base) || machineDigest == ([sha256.Size]byte{}) {
+		return false
+	}
+	if base.RelationCount == 1 {
+		return true
+	}
+	return manifest.RelationManifestDigest == machineDigest
+}
+
+func walBaseManifestMatchesMachine(
+	apply *ReplicatedApply,
+	manifest replicatedstate.SnapshotArtifactManifest,
+	base ReplicatedShardStoreIdentity,
+) bool {
+	if apply == nil || apply.machine == nil {
+		return false
+	}
+	digest, err := apply.machine.RelationManifestDigest()
+	return err == nil && equalWALBaseManifest(manifest, base, digest)
 }

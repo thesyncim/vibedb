@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -102,6 +103,48 @@ func requiredWALBaseWorkspaceBytes(
 		t.Fatal(err)
 	}
 	return max(systemBytes, userBytes)
+}
+
+func TestWALBaseBundleManifestBindsReplicatedStateDigestDomain(t *testing.T) {
+	base := ReplicatedShardStoreIdentity{
+		UserTable: "docs", RelationCount: 2,
+		RelationSchemaGeneration: 19,
+		Relations: []ReplicatedShardRelationIdentity{
+			{Relation: 1, Kind: ReplicatedShardRelationJSON, Table: "docs"},
+			{Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
+				Table: "email_claims", IndexID: 41, Incarnation: 7,
+				LocatorCount: 1, Unique: true},
+		},
+	}
+	machineDigest := sha256.Sum256([]byte(
+		"replicated-state-machine relation manifest fixture",
+	))
+	manifest := replicatedstate.SnapshotArtifactManifest{
+		UserCollection:         []byte("docs"),
+		Bundle:                 true,
+		RelationManifestDigest: machineDigest,
+		Relations: []replicatedstate.SnapshotArtifactRelation{
+			{Relation: 1, Kind: replicatedstate.RelationJSON, Collection: []byte("docs")},
+			{Relation: 2, Kind: replicatedstate.RelationGlobalIndex,
+				Collection: []byte("email_claims")},
+		},
+	}
+	applyProfileDigest := replicatedRelationApplyManifestDigest(base)
+	if applyProfileDigest == machineDigest {
+		t.Fatal("test fixture did not separate replicated-state and SQL apply digest domains")
+	}
+	if !equalWALBaseManifestShape(manifest, base) ||
+		!equalWALBaseManifest(manifest, base, machineDigest) {
+		t.Fatal("exact replicated-state bundle manifest was rejected")
+	}
+	if equalWALBaseManifest(manifest, base, applyProfileDigest) {
+		t.Fatal("SQL apply-profile digest was accepted as a replicated-state manifest digest")
+	}
+	forged := machineDigest
+	forged[0] ^= 1
+	if forged == ([sha256.Size]byte{}) || equalWALBaseManifest(manifest, base, forged) {
+		t.Fatal("forged nonzero relation-manifest digest was accepted")
+	}
 }
 
 func walBaseDataFiles(t testing.TB, database *Database) []string {
