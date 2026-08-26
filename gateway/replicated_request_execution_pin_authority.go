@@ -20,7 +20,7 @@ type DurableRequestExecutionPinSessionFactory interface {
 		context.Context,
 		DurableRequestTypedExecutionContext,
 		ReplicatedRoute,
-	) (*NativeSession, serviceauthz.Authority, error)
+	) (*NativeSession, serviceauthz.Authority, func(), error)
 }
 
 // NativeDurableRequestExecutionPinAuthority turns the clockless execution-pin
@@ -67,7 +67,10 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 		return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
 			errors.Join(err, pinErr, ErrDurableRequestConflict)
 	}
-	session, principal, openErr := authority.sessions.OpenExecutionPinSession(ctx, execution, route)
+	session, principal, releaseSession, openErr := authority.sessions.OpenExecutionPinSession(ctx, execution, route)
+	if releaseSession != nil {
+		defer releaseSession()
+	}
 	if openErr != nil || session == nil || !principal.Valid() || session.executor != authority.executor ||
 		session.proposalCapability != serviceauthz.CapabilityExecutionPin ||
 		!sameReplicatedCatalogRoute(session.route, route) ||
