@@ -90,6 +90,29 @@ func transactionParticipantTransitionCommand(
 	}, nil)
 }
 
+func transactionParticipantAbortFenceCommand(
+	t testing.TB,
+	fixture relationBundleFixture,
+	id distributedtxn.ID,
+	mutationDigest distributedtxn.Digest,
+	participantOrdinal uint32,
+) []byte {
+	t.Helper()
+	return transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+		Role:        distributedtxn.ReplicatedRoleParticipant,
+		Operation:   distributedtxn.ReplicatedAbortReleaseParticipant,
+		ID:          id,
+		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant: distributedtxn.ParticipantStage{
+			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
+			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
+			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+			MutationDigest:              mutationDigest,
+			ParticipantOrdinal:          participantOrdinal,
+		},
+	}, nil)
+}
+
 func applyTransactionCommand(
 	t testing.TB,
 	machine *Machine,
@@ -875,4 +898,120 @@ func TestTransactionCommandIsAnExplicitNormalBatchBoundary(t *testing.T) {
 		t.Fatalf("transaction batch boundary = applied %d publication %+v err=%v", applied, publication, err)
 	}
 	applyTransactionCommand(t, fixture.machine, 3, stage)
+}
+
+func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(245)
+	batches := []replication.RelationMutationBatch{{
+		Relation: 1,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: []byte("abort-fence-wins"),
+			Value: []byte(`{"email":"fenced@example.com"}`),
+		}},
+	}}
+	digest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := transactionParticipantAbortFenceCommand(t, fixture, id, digest, 4096)
+	result := applyTransactionCommand(t, fixture.machine, 3, fence)
+	if result.Revision != 1 || result.AffectedRowsValid {
+		t.Fatalf("abort fence completion=%+v", result)
+	}
+	result = applyTransactionCommand(t, fixture.machine, 4, fence)
+	if result.Revision != 1 {
+		t.Fatalf("abort fence retry=%+v", result)
+	}
+	prepareControl := fusedParticipantControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	)
+	prepareControl.Participant.ParticipantOrdinal = 4096
+	prepare := transactionCommandWithFingerprint(
+		t, fixture, prepareControl, batches, sha256.Sum256([]byte("delayed-wide-prepare")),
+	)
+	if err := fixture.machine.AdmitCommand(prepare); err != nil {
+		t.Fatalf("admit delayed prepare: %v", err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), prepare); err != nil {
+		t.Fatal(err)
+	}
+	completion, _ := openTransactionCompletion(t, fixture.machine, prepare)
+	if completion.ResultCode != ResultTransactionConflict {
+		t.Fatalf("delayed prepare result=%d", completion.ResultCode)
+	}
+	controlKey, _ := TransactionControlStorageKey(
+		distributedtxn.ReplicatedRoleParticipant, id,
+	)
+	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("abort fence control found=%v err=%v", found, err)
+	}
+	control, err := OpenTransactionControl(raw)
+	if err != nil || !control.CancellationWitness || !control.FusedPath ||
+		control.State != uint8(distributedtxn.ParticipantReleased) || control.Revision != 1 ||
+		control.PrepareResultCode != 0 || control.MutationDigest != digest ||
+		control.ParticipantOrdinal != 4096 ||
+		control.ResidentMutationBytes != 0 || control.ResidentIntentBytes != 0 {
+		t.Fatalf("abort fence control=%+v err=%v", control.TransactionControl, err)
+	}
+	if fixture.machine.state.TransactionControlCount != 1 ||
+		fixture.machine.state.ActiveTransactionCount != 0 ||
+		fixture.machine.state.TransactionPayloadRows != 0 ||
+		fixture.machine.state.TransactionIntentRows != 0 ||
+		fixture.machine.state.TransactionResidentBytes != control.ResidentControlBytes {
+		t.Fatalf("abort fence accounting=%+v", fixture.machine.state)
+	}
+}
+
+func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(246)
+	batches := []replication.RelationMutationBatch{{
+		Relation: 1,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPut, Key: []byte("prepare-wins-fence"),
+			Value: []byte(`{"email":"prepared@example.com"}`),
+		}},
+	}}
+	digest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareControl := fusedParticipantControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	)
+	prepareControl.Participant.ParticipantOrdinal = 4096
+	prepare := transactionCommandWithFingerprint(
+		t, fixture, prepareControl, batches, sha256.Sum256([]byte("winning-wide-prepare")),
+	)
+	applyTransactionCommand(t, fixture.machine, 3, prepare)
+	fence := transactionParticipantAbortFenceCommand(t, fixture, id, digest, 4096)
+	if err := fixture.machine.AdmitCommand(fence); err != nil {
+		t.Fatalf("admit losing abort fence: %v", err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), fence); err != nil {
+		t.Fatal(err)
+	}
+	completion, _ := openTransactionCompletion(t, fixture.machine, fence)
+	if completion.ResultCode != ResultTransactionConflict {
+		t.Fatalf("losing abort fence result=%d", completion.ResultCode)
+	}
+	abort := transactionParticipantTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedAbortReleaseParticipant, 2,
+	)
+	applyTransactionCommand(t, fixture.machine, 5, abort)
+	controlKey, _ := TransactionControlStorageKey(
+		distributedtxn.ReplicatedRoleParticipant, id,
+	)
+	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("released participant found=%v err=%v", found, err)
+	}
+	control, err := OpenTransactionControl(raw)
+	if err != nil || control.CancellationWitness || control.Revision != 4 ||
+		control.State != uint8(distributedtxn.ParticipantReleased) ||
+		control.PrepareResultCode != ResultApplied {
+		t.Fatalf("prepare winner control=%+v err=%v", control.TransactionControl, err)
+	}
 }

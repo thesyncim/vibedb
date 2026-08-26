@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -115,6 +116,10 @@ type TransactionControl struct {
 	// participants never own a coordinator ordinal, so the role overlay keeps
 	// the fixed control record compact.
 	CoordinatorParticipantOrdinal uint64
+	// ParticipantOrdinal reuses the affected-row scalar only for compact
+	// cancellation witnesses. It binds a missing participant's exact manifest
+	// position without growing every durable control.
+	ParticipantOrdinal uint32
 	// PrepareResultCode is the immutable vote produced by an atomic
 	// stage+prepare. Zero denotes a legacy split-stage control which has not yet
 	// recorded a vote; the only durable nonzero values are ResultApplied and
@@ -124,6 +129,11 @@ type TransactionControl struct {
 	// operations from legacy split controls. The bit survives finish/retire so
 	// historical retries cannot reinterpret one protocol as the other.
 	FusedPath bool
+	// CancellationWitness is the compact abort fence for a participant whose
+	// stage+prepare outcome was never observed. It carries no mutation image or
+	// vote and permanently prevents a delayed creation command from installing
+	// intents under the same transaction identity.
+	CancellationWitness bool
 	// CoordinatorDecision is invalid while staging, matches the live terminal
 	// decision, and survives Retired so delayed Commit/Abort retries remain
 	// distinguishable after child-row reclamation.
@@ -309,6 +319,9 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	if control.FusedPath {
 		frame[15] |= 1 << 6
 	}
+	if control.CancellationWitness {
+		frame[15] |= 1 << 7
+	}
 	switch control.PrepareResultCode {
 	case 0:
 	case ResultApplied:
@@ -336,6 +349,8 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	copy(frame[136:168], control.MutationDigest[:])
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 		binary.LittleEndian.PutUint64(frame[168:176], control.CoordinatorParticipantOrdinal)
+	} else if control.CancellationWitness {
+		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.ParticipantOrdinal))
 	} else {
 		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.AffectedRows))
 	}
@@ -401,11 +416,9 @@ func OpenTransactionControlInto(
 	view.PayloadKind = distributedtxn.ReplicatedPayloadKind(src[12])
 	view.LastOperation = distributedtxn.ReplicatedOperation(src[13])
 	view.BucketBits = src[14]
-	if src[15]&0x80 != 0 {
-		return TransactionControlView{}, ErrTransactionStateCorrupt
-	}
 	view.AffectedRowsValid = src[15]&1 != 0
 	view.FusedPath = src[15]&(1<<6) != 0
+	view.CancellationWitness = src[15]&(1<<7) != 0
 	view.CoordinatorDecision = distributedtxn.CoordinatorState((src[15] >> 1) & 7)
 	switch (src[15] >> 4) & 3 {
 	case 0:
@@ -429,6 +442,12 @@ func OpenTransactionControlInto(
 	copy(view.MutationDigest[:], src[136:168])
 	if view.Role == distributedtxn.ReplicatedRoleCoordinator {
 		view.CoordinatorParticipantOrdinal = binary.LittleEndian.Uint64(src[168:176])
+	} else if view.CancellationWitness {
+		ordinal := binary.LittleEndian.Uint64(src[168:176])
+		if ordinal > math.MaxUint32 {
+			return TransactionControlView{}, ErrTransactionStateCorrupt
+		}
+		view.ParticipantOrdinal = uint32(ordinal)
 	} else {
 		view.AffectedRows = int64(binary.LittleEndian.Uint64(src[168:176]))
 	}
@@ -864,9 +883,11 @@ func OpenTransactionIntentForKey(
 }
 
 func transactionControlValid(control TransactionControl) bool {
+	cancellation := transactionCancellationWitnessValid(control)
 	if control.ID.IsZero() || !transactionRoleValid(control.Role) || control.Revision == 0 ||
-		control.PayloadDigest == (distributedtxn.Digest{}) || control.PayloadBytes == 0 ||
-		control.PayloadCount == 0 || control.CoordinatorGroup == (replication.ID128{}) ||
+		control.PayloadDigest == (distributedtxn.Digest{}) ||
+		(!cancellation && (control.PayloadBytes == 0 || control.PayloadCount == 0)) ||
+		control.CoordinatorGroup == (replication.ID128{}) ||
 		control.CoordinatorShardIncarnation == (replication.ID128{}) ||
 		control.CoordinatorAllocation == 0 || control.MutationDigest == (distributedtxn.Digest{}) ||
 		control.LastCommandDigest == (replication.Digest{}) || control.LastResultCode == 0 ||
@@ -885,7 +906,8 @@ func transactionControlValid(control TransactionControl) bool {
 		control.LastOperation == distributedtxn.ReplicatedStageParticipant ||
 		control.LastOperation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 		control.LastOperation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
-		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant
+		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant ||
+		control.CancellationWitness
 	if creation != (control.LastExpectedRevision == 0) {
 		return false
 	}
@@ -895,6 +917,9 @@ func transactionControlValid(control TransactionControl) bool {
 		return false
 	}
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
+		if control.CancellationWitness {
+			return false
+		}
 		if control.PayloadBytes > distributedtxn.MaxManifestBytes ||
 			control.PayloadCount > distributedtxn.MaxManifestBytes {
 			return false
@@ -942,6 +967,12 @@ func transactionControlValid(control TransactionControl) bool {
 			control.State >= uint8(distributedtxn.CoordinatorStaging) &&
 			control.State <= uint8(distributedtxn.CoordinatorRetired)
 	}
+	if control.CancellationWitness {
+		return cancellation
+	}
+	if control.ParticipantOrdinal != 0 {
+		return false
+	}
 	if control.PayloadKind != distributedtxn.ReplicatedPayloadParticipantStage ||
 		control.PayloadBytes > replication.MaxCommandBytes ||
 		control.PayloadCount > replication.MaxMutations ||
@@ -980,6 +1011,26 @@ func transactionControlValid(control TransactionControl) bool {
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
 	}
+}
+
+func transactionCancellationWitnessValid(control TransactionControl) bool {
+	return control.CancellationWitness && control.FusedPath &&
+		control.Role == distributedtxn.ReplicatedRoleParticipant &&
+		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+		control.Revision == 1 &&
+		control.PayloadKind == distributedtxn.ReplicatedPayloadParticipantStage &&
+		control.PayloadDigest == control.MutationDigest && control.PayloadBytes == 0 &&
+		control.PayloadCount == 0 && control.PayloadRelationCount == 0 &&
+		control.BucketBits == 0 && len(control.IntentScopes) == 0 &&
+		!control.AffectedRowsValid && control.AffectedRows == 0 &&
+		control.PrepareResultCode == 0 && control.PrepareCommandDigest == (replication.Digest{}) &&
+		control.CoordinatorDecision == distributedtxn.CoordinatorInvalid &&
+		control.CoordinatorParticipantOrdinal == 0 &&
+		control.ResidentPayloadBytes == 0 && control.ResidentManifestBytes == 0 &&
+		control.ResidentMutationBytes == 0 && control.ResidentIntentBytes == 0 &&
+		transactionManifestProgressZero(control) &&
+		control.LastOperation == distributedtxn.ReplicatedAbortReleaseParticipant &&
+		control.LastExpectedRevision == 0 && control.LastResultCode == ResultApplied
 }
 
 func operationHasExclusiveTransactionPath(operation distributedtxn.ReplicatedOperation) bool {

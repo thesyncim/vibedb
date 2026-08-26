@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"unsafe"
@@ -293,6 +294,68 @@ func TestTransactionControlFusedPathBitIsDurableAndOperationBound(t *testing.T) 
 	}
 	if _, err := AppendTransactionControl(nil, zeroVoteCoordinator); err == nil {
 		t.Fatal("fused coordinator accepted a zero prepare vote")
+	}
+}
+
+func TestTransactionControlCancellationWitnessIsExplicitCompactAndOrdinalBound(t *testing.T) {
+	controlBytes, _ := TransactionControlResidentBytes(0)
+	mutationDigest := transactionCodecDigest(91)
+	control := TransactionControl{
+		ID: transactionCodecID(92), Role: distributedtxn.ReplicatedRoleParticipant,
+		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		PayloadKind:                 distributedtxn.ReplicatedPayloadParticipantStage,
+		PayloadDigest:               mutationDigest,
+		CoordinatorGroup:            transactionCodecReplicationID(93),
+		CoordinatorShardIncarnation: transactionCodecReplicationID(94),
+		CoordinatorAllocation:       95,
+		MutationDigest:              mutationDigest,
+		ParticipantOrdinal:          4096,
+		FusedPath:                   true, CancellationWitness: true,
+		ResidentControlBytes: controlBytes,
+		LastOperation:        distributedtxn.ReplicatedAbortReleaseParticipant,
+		LastExpectedRevision: 0,
+		LastCommandDigest:    transactionCodecCommandDigest(96),
+		LastResultCode:       ResultApplied,
+		LastAppliedIndex:     97,
+	}
+	encoded, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != transactionControlHeaderBytes+recordChecksumLen {
+		t.Fatalf("cancellation witness bytes=%d", len(encoded))
+	}
+	opened, err := OpenTransactionControl(encoded)
+	if err != nil || !opened.CancellationWitness || opened.ParticipantOrdinal != 4096 ||
+		opened.PrepareResultCode != 0 || opened.PayloadBytes != 0 || opened.PayloadCount != 0 {
+		t.Fatalf("cancellation witness=%+v err=%v", opened.TransactionControl, err)
+	}
+	withoutFlag := bytes.Clone(encoded)
+	withoutFlag[15] &^= 1 << 7
+	sealRecord(withoutFlag, transactionControlChecksumDomain)
+	if _, err := OpenTransactionControl(withoutFlag); !errors.Is(err, ErrTransactionStateCorrupt) {
+		t.Fatalf("cancellation without flag error=%v", err)
+	}
+	wideOrdinal := bytes.Clone(encoded)
+	binary.LittleEndian.PutUint64(wideOrdinal[168:176], uint64(1)<<32)
+	sealRecord(wideOrdinal, transactionControlChecksumDomain)
+	if _, err := OpenTransactionControl(wideOrdinal); !errors.Is(err, ErrTransactionStateCorrupt) {
+		t.Fatalf("oversized cancellation ordinal error=%v", err)
+	}
+	indexConflict := control
+	indexConflict.CancellationWitness = false
+	indexConflict.ParticipantOrdinal = 0
+	indexConflict.Revision = 3
+	indexConflict.PayloadBytes = 1
+	indexConflict.PayloadCount = 1
+	indexConflict.PayloadRelationCount = 1
+	indexConflict.PrepareResultCode = ResultIndexConflict
+	indexConflict.PrepareCommandDigest = transactionCodecCommandDigest(98)
+	indexConflict.LastOperation = distributedtxn.ReplicatedStagePrepareParticipant
+	indexConflict.LastCommandDigest = indexConflict.PrepareCommandDigest
+	indexConflict.LastResultCode = ResultIndexConflict
+	if _, err := AppendTransactionControl(nil, indexConflict); err != nil {
+		t.Fatalf("distinct index-conflict witness rejected: %v", err)
 	}
 }
 

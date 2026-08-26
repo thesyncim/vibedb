@@ -466,6 +466,10 @@ func ValidateReplicatedCommand(src []byte) error {
 	var id ID
 	copy(id[:], src[32:48])
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
+	abortFence := operation == ReplicatedAbortReleaseParticipant && expectedRevision == 0
+	if abortFence {
+		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+	}
 	if id.IsZero() || !ok || role != wantRole || payloadKind != wantPayload ||
 		(creation && expectedRevision != 0) || (!creation && expectedRevision == 0) {
 		return ErrCorrupt
@@ -473,7 +477,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
 	payloadEnd := scopeEnd + int(payloadLength)
 	payload := src[scopeEnd:payloadEnd:payloadEnd]
-	if replicatedOperationCarriesParticipant(operation) {
+	if replicatedCommandCarriesParticipant(operation, expectedRevision) {
 		var coordinatorGroup, coordinatorShardIncarnation ID
 		var mutationDigest Digest
 		copy(coordinatorGroup[:], src[48:64])
@@ -488,6 +492,9 @@ func ValidateReplicatedCommand(src []byte) error {
 		}
 		if operation == ReplicatedStageParticipant &&
 			binary.LittleEndian.Uint32(src[124:128]) != 0 {
+			return ErrCorrupt
+		}
+		if abortFence && (src[120] != 0 || scopeCount != 0) {
 			return ErrCorrupt
 		}
 		return validateReplicatedPayload(
@@ -563,11 +570,18 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		return ErrCorrupt
 	}
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(command.Operation)
+	abortFence := command.Operation == ReplicatedAbortReleaseParticipant &&
+		command.ExpectedRevision == 0
+	if abortFence {
+		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+	}
 	if !ok || command.Role != wantRole || command.PayloadKind != wantPayload ||
 		(creation && command.ExpectedRevision != 0) || (!creation && command.ExpectedRevision == 0) {
 		return ErrCorrupt
 	}
-	carriesParticipant := replicatedOperationCarriesParticipant(command.Operation)
+	carriesParticipant := replicatedCommandCarriesParticipant(
+		command.Operation, command.ExpectedRevision,
+	)
 	if !carriesParticipant && !participantStageZero(command.Participant) {
 		return ErrCorrupt
 	}
@@ -579,7 +593,12 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 			!ValidateIntentScopes(command.Participant.IntentScopes, command.Participant.BucketBits) {
 			return ErrCorrupt
 		}
-		if command.Operation == ReplicatedStageParticipant && command.Participant.ParticipantOrdinal != 0 {
+		if command.Operation == ReplicatedStageParticipant &&
+			command.Participant.ParticipantOrdinal != 0 {
+			return ErrCorrupt
+		}
+		if abortFence && (command.Participant.BucketBits != 0 ||
+			len(command.Participant.IntentScopes) != 0) {
 			return ErrCorrupt
 		}
 	}
@@ -788,11 +807,16 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 	}
 }
 
-func replicatedOperationCarriesParticipant(operation ReplicatedOperation) bool {
+func replicatedCommandCarriesParticipant(
+	operation ReplicatedOperation,
+	expectedRevision uint64,
+) bool {
 	switch operation {
 	case ReplicatedStageParticipant, ReplicatedBeginPrepareCoordinator,
 		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant:
 		return true
+	case ReplicatedAbortReleaseParticipant:
+		return expectedRevision == 0
 	default:
 		return false
 	}

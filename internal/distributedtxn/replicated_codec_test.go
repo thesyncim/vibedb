@@ -445,6 +445,85 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 	}
 }
 
+func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
+	stage := fusedParticipantStage(
+		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+	)
+	stage.BucketBits = 0
+	stage.IntentScopes = nil
+	command := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
+		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: stage,
+	}
+	encoded, err := AppendReplicatedCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != replicatedCommandHeaderBytes+replicatedCommandChecksumBytes {
+		t.Fatalf("abort fence bytes=%d", len(encoded))
+	}
+	var scopes [MaxIntentScopes]IntentScope
+	view, err := OpenReplicatedCommandInto(encoded, scopes[:])
+	if err != nil || view.ExpectedRevision != 0 ||
+		view.PayloadKind != ReplicatedPayloadParticipantStage ||
+		view.Participant.MutationDigest != stage.MutationDigest ||
+		view.Participant.ParticipantOrdinal != 4096 {
+		t.Fatalf("abort fence=%+v err=%v", view.ReplicatedCommand, err)
+	}
+	reencoded, err := AppendReplicatedCommand(nil, view.Command())
+	if err != nil || !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("abort fence canonical re-encode err=%v", err)
+	}
+	if got := testing.AllocsPerRun(1000, func() {
+		if validateErr := ValidateReplicatedCommand(encoded); validateErr != nil {
+			panic(validateErr)
+		}
+	}); got != 0 {
+		t.Fatalf("abort fence validation allocations=%v", got)
+	}
+}
+
+func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
+	stage := fusedParticipantStage(
+		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+	)
+	stage.BucketBits = 0
+	stage.IntentScopes = nil
+	valid := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
+		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: stage,
+	}
+	tests := []func(*ReplicatedCommand){
+		func(c *ReplicatedCommand) { c.PayloadKind = ReplicatedPayloadNone },
+		func(c *ReplicatedCommand) { c.ExpectedRevision = 2 },
+		func(c *ReplicatedCommand) { c.Payload = []byte{1} },
+		func(c *ReplicatedCommand) {
+			c.Participant.BucketBits = 8
+			c.Participant.IntentScopes = []IntentScope{{Start: 1, End: 2}}
+		},
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorGroup = ID{} },
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorShardIncarnation = ID{} },
+		func(c *ReplicatedCommand) { c.Participant.CoordinatorAllocation = 0 },
+		func(c *ReplicatedCommand) { c.Participant.MutationDigest = Digest{} },
+	}
+	for index, mutate := range tests {
+		candidate := valid
+		mutate(&candidate)
+		if _, err := AppendReplicatedCommand(nil, candidate); err == nil {
+			t.Fatalf("accepted malformed abort fence %d", index)
+		}
+	}
+	transition := valid
+	transition.ExpectedRevision = 2
+	transition.PayloadKind = ReplicatedPayloadNone
+	transition.Participant = ParticipantStage{}
+	if _, err := AppendReplicatedCommand(nil, transition); err != nil {
+		t.Fatalf("ordinary abort-release rejected: %v", err)
+	}
+}
+
 func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 	payload := replicatedTestCoordinator(t)
 	stage := fusedParticipantStage(

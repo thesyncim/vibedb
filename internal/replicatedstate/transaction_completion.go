@@ -319,6 +319,10 @@ func transactionHistoricalRetryExact(
 			(state == distributedtxn.ParticipantAborted && control.Revision == command.ExpectedRevision+1 ||
 				state == distributedtxn.ParticipantReleased && control.Revision == command.ExpectedRevision+2), ResultApplied, nil
 	case distributedtxn.ReplicatedAbortReleaseParticipant:
+		if command.ExpectedRevision == 0 {
+			return transactionParticipantAbortFenceRetryExact(command, control),
+				ResultApplied, nil
+		}
 		return control.FusedPath && command.ExpectedRevision == 2 && !control.AffectedRowsValid &&
 			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
 			control.Revision == 4, ResultApplied, nil
@@ -328,6 +332,23 @@ func transactionHistoricalRetryExact(
 	default:
 		return false, 0, ErrTransactionStateCorrupt
 	}
+}
+
+func transactionParticipantAbortFenceRetryExact(
+	command distributedtxn.ReplicatedCommandView,
+	control TransactionControl,
+) bool {
+	stage := command.Participant
+	return control.CancellationWitness && control.FusedPath && control.Revision == 1 &&
+		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+		control.PayloadKind == distributedtxn.ReplicatedPayloadParticipantStage &&
+		control.PayloadDigest == stage.MutationDigest &&
+		control.MutationDigest == stage.MutationDigest &&
+		control.CoordinatorGroup == replication.ID128(stage.CoordinatorGroup) &&
+		control.CoordinatorShardIncarnation == replication.ID128(stage.CoordinatorShardIncarnation) &&
+		control.CoordinatorAllocation == stage.CoordinatorAllocation &&
+		control.ParticipantOrdinal == stage.ParticipantOrdinal &&
+		stage.BucketBits == 0 && len(stage.IntentScopes) == 0
 }
 
 func transactionManifestSegmentsRetryExact(

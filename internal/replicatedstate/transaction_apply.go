@@ -87,7 +87,9 @@ func (m *Machine) planTransactionCommand(
 	creation := control.Operation == distributedtxn.ReplicatedStageCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageManifestCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageParticipant ||
-		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant
+		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
+		control.Operation == distributedtxn.ReplicatedAbortReleaseParticipant &&
+			control.ExpectedRevision == 0
 	if creation != !found {
 		plan.command.resultCode = ResultTransactionConflict
 		plan.command.conflict = true
@@ -143,12 +145,21 @@ func (m *Machine) planTransactionCommand(
 			plan, command, control, applied, commandDigest, storageKey,
 			systemSnapshot, relationSnapshots,
 		)
+	case distributedtxn.ReplicatedAbortReleaseParticipant:
+		if control.ExpectedRevision == 0 {
+			return m.planParticipantAbortFence(
+				plan, control, applied, commandDigest, storageKey,
+			)
+		}
+		return m.planParticipantTransition(
+			plan, command, control, existing.TransactionControl, applied,
+			commandDigest, storageKey, systemSnapshot, relationSnapshots,
+		)
 	case distributedtxn.ReplicatedPrepareParticipant,
 		distributedtxn.ReplicatedApplyParticipant,
 		distributedtxn.ReplicatedAbortParticipant,
 		distributedtxn.ReplicatedReleaseParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
+		distributedtxn.ReplicatedApplyReleaseParticipant:
 		return m.planParticipantTransition(
 			plan, command, control, existing.TransactionControl, applied,
 			commandDigest, storageKey, systemSnapshot, relationSnapshots,
@@ -156,6 +167,47 @@ func (m *Machine) planTransactionCommand(
 	default:
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
+}
+
+func (m *Machine) planParticipantAbortFence(
+	plan transactionCommandPlan,
+	control distributedtxn.ReplicatedCommand,
+	applied uint64,
+	commandDigest replication.Digest,
+	controlKey [transactionControlStorageKeyBytes]byte,
+) (transactionCommandPlan, error) {
+	controlBytes, err := TransactionControlResidentBytes(0)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	durableControl := TransactionControl{
+		ID: control.ID, Role: distributedtxn.ReplicatedRoleParticipant,
+		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		PayloadKind:      control.PayloadKind,
+		PayloadDigest:    control.Participant.MutationDigest,
+		CoordinatorGroup: replication.ID128(control.Participant.CoordinatorGroup),
+		CoordinatorShardIncarnation: replication.ID128(
+			control.Participant.CoordinatorShardIncarnation,
+		),
+		CoordinatorAllocation: control.Participant.CoordinatorAllocation,
+		MutationDigest:        control.Participant.MutationDigest,
+		ParticipantOrdinal:    control.Participant.ParticipantOrdinal,
+		FusedPath:             true, CancellationWitness: true,
+		ResidentControlBytes: controlBytes,
+		LastOperation:        control.Operation,
+		LastExpectedRevision: 0,
+		LastCommandDigest:    commandDigest,
+		LastResultCode:       ResultApplied,
+		LastAppliedIndex:     applied,
+	}
+	encoded, err := AppendTransactionControl(nil, durableControl)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	plan.delta = transactionStateDelta{controls: 1, residentByte: int64(controlBytes)}
+	plan.command.resultCode = ResultApplied
+	return plan, nil
 }
 
 func transactionControlAt(

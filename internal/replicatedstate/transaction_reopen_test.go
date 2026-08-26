@@ -220,3 +220,89 @@ func TestFusedCoordinatorZeroVoteCannotReopenOrCommit(t *testing.T) {
 		t.Fatalf("zero-vote fused coordinator reopen error=%v", err)
 	}
 }
+
+func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	id := transactionCodecID(247)
+	mutationDigest := distributedtxn.Digest(sha256.Sum256([]byte("abort-fence-mutation")))
+	commandControl := distributedtxn.ReplicatedCommand{
+		Role:        distributedtxn.ReplicatedRoleParticipant,
+		Operation:   distributedtxn.ReplicatedAbortReleaseParticipant,
+		ID:          id,
+		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant: distributedtxn.ParticipantStage{
+			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
+			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
+			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+			MutationDigest:              mutationDigest,
+			ParticipantOrdinal:          4096,
+		},
+	}
+	command := transactionCompletionCommand(t, fixture.binding, commandControl, nil)
+	openedCommand, err := replication.OpenCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlBytes, _ := TransactionControlResidentBytes(0)
+	control := TransactionControl{
+		ID: id, Role: distributedtxn.ReplicatedRoleParticipant,
+		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		PayloadKind:                 distributedtxn.ReplicatedPayloadParticipantStage,
+		PayloadDigest:               mutationDigest,
+		CoordinatorGroup:            fixture.binding.GroupID,
+		CoordinatorShardIncarnation: fixture.binding.ShardIncarnation,
+		CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+		MutationDigest:              mutationDigest,
+		ParticipantOrdinal:          4096,
+		FusedPath:                   true, CancellationWitness: true,
+		ResidentControlBytes: controlBytes,
+		LastOperation:        distributedtxn.ReplicatedAbortReleaseParticipant,
+		LastExpectedRevision: 0,
+		LastCommandDigest:    LogicalCommandDigest(openedCommand),
+		LastResultCode:       ResultApplied,
+		LastAppliedIndex:     2,
+	}
+	controlValue, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlKey, _ := TransactionControlStorageKey(control.Role, id)
+	state := cloneState(fixture.machine.state)
+	state.Applied = 2
+	state.LastTerm = 1
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("abort-fence-image"))
+	state.TransactionControlCount = 1
+	state.TransactionResidentBytes = controlBytes
+	stateValue, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.system.Collection.Update(func(batch *durable.WriteBatch) error {
+		if putErr := batch.Put(stateKey, stateValue); putErr != nil {
+			return putErr
+		}
+		return batch.Put(controlKey[:], controlValue)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(
+		fixture.binding, fixture.bootstrap, fixture.system,
+		UserCollection{Name: "docs", Target: fixture.user}, fixture.log,
+		Options{TxnLimits: durable.TxnLimits{
+			MaxCollections: 2, MaxDocuments: fixture.user.Limits.MaxDistinctMutations + 4,
+			MaxBytes: 64 << 20,
+		}, MaxSessions: 128, RetryWindow: 8},
+	)
+	if err != nil {
+		t.Fatalf("reopen abort fence: %v", err)
+	}
+	completion, result := openTransactionCompletion(t, reopened, command)
+	if completion.ResultCode != ResultApplied || result.Revision != 1 ||
+		result.AffectedRowsValid {
+		t.Fatalf("reopened abort fence completion=%+v result=%+v", completion, result)
+	}
+}

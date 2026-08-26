@@ -421,6 +421,37 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 			t.Fatalf("operation %d sequence=%d err=%v", operation, sequence, sequenceErr)
 		}
 	}
+	fence := distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleParticipant,
+		Operation: distributedtxn.ReplicatedAbortReleaseParticipant,
+		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant: distributedtxn.ParticipantStage{
+			CoordinatorGroup:            distributedtxn.ID{1},
+			CoordinatorShardIncarnation: distributedtxn.ID{2},
+			CoordinatorAllocation:       3,
+			MutationDigest:              distributedtxn.Digest{4},
+			ParticipantOrdinal:          4096,
+		},
+	}
+	fenceRaw := encodeTransactionControl(t, fence)
+	fenceSequence, err := TransactionClientSequence(fenceRaw)
+	if err != nil || fenceSequence != 1 || fenceSequence != fused.ClientSequence {
+		t.Fatalf("abort fence sequence=%d prepare=%d err=%v",
+			fenceSequence, fused.ClientSequence, err)
+	}
+	if bytes.Equal(fenceRaw, fused.Transaction) {
+		t.Fatal("abort fence aliased stage+prepare bytes")
+	}
+	fenceOuter := testTransactionTransitionCommand(t, fence)
+	if fenceOuter.ClientSequence != 1 || len(fenceOuter.Batches) != 0 {
+		t.Fatalf("abort fence outer sequence=%d batches=%d",
+			fenceOuter.ClientSequence, len(fenceOuter.Batches))
+	}
+	withBatches := fenceOuter
+	withBatches.Batches = testMultiRelationCommand().Batches
+	if _, err := AppendCommand(nil, withBatches); !errors.Is(err, ErrEnvelopeSemantic) {
+		t.Fatalf("abort fence accepted relation batches: %v", err)
+	}
 }
 
 func TestFusedFinishCommandsDoNotAliasSplitFinishCommands(t *testing.T) {
