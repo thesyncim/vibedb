@@ -67,9 +67,10 @@ type rf3ManifestSQL struct {
 }
 
 type rf3ManifestListeners struct {
-	Peer    string `json:"peer"`
-	Native  string `json:"native"`
-	Control string `json:"control"`
+	Peer     string `json:"peer"`
+	Native   string `json:"native"`
+	Snapshot string `json:"snapshot"`
+	Control  string `json:"control"`
 }
 
 type rf3ManifestTLS struct {
@@ -430,6 +431,13 @@ func parseRF3ManifestListeners(node vibejson.Node) (rf3ManifestListeners, error)
 		return rf3ManifestListeners{}, err
 	}
 	if result.Native, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+		return rf3ManifestListeners{}, err
+	}
+	value, err = nextRF3Field(&fields, `"snapshot"`)
+	if err != nil {
+		return result, err
+	}
+	if result.Snapshot, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
 		return rf3ManifestListeners{}, err
 	}
 	value, err = nextRF3Field(&fields, `"control"`)

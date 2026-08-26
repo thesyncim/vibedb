@@ -370,7 +370,10 @@ func serveRF3Publication(voters ...uint64) raftmodel.Publication {
 
 func serveRF3TestManifest() rf3Manifest {
 	return rf3Manifest{
-		Listeners: rf3ManifestListeners{Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500", Control: "127.0.0.1:17700"},
+		Listeners: rf3ManifestListeners{
+			Peer: "127.0.0.1:17400", Native: "127.0.0.1:17500",
+			Snapshot: "127.0.0.1:17600", Control: "127.0.0.1:17700",
+		},
 		Members: [rf3ManifestMembers]rf3ManifestMember{
 			{MemberID: 1, NodeID: rafttransport.NodeID{1}, PeerAddress: "member-1.internal:17400"},
 			{MemberID: 2, NodeID: rafttransport.NodeID{2}, PeerAddress: "member-2.internal:17400"},

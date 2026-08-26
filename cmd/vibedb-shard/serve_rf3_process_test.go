@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,7 +53,7 @@ func TestRF3CommandProcessDocuments(t *testing.T) {
 	}
 	document := rf3CommandManifestDocument(
 		"member.wal", "member.vdb", "sql-identity.json", "apply-identity.json",
-		"wal-key", "127.0.0.1:17401", "127.0.0.1:17501", "127.0.0.1:17701",
+		"wal-key", "127.0.0.1:17401", "127.0.0.1:17501", "127.0.0.1:17601", "127.0.0.1:17701",
 		rf3testfixture.Credential{Certificate: "member-cert.pem", Key: "member-key.pem"},
 		"roots.pem", "authorization-policy.vibejson",
 		raftstore.Options{
@@ -201,7 +202,8 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		manifestPaths[index] = filepath.Join(memberRoot, "serve-rf3.json")
 		document := rf3CommandManifestDocument(
 			prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
-			peerAddresses[index], nativeAddresses[index], controlAddresses[index], credentials[index], roots,
+			peerAddresses[index], nativeAddresses[index], "127.0.0.1:"+strconv.Itoa(17601+index),
+			controlAddresses[index], credentials[index], roots,
 			policyPath, walOptions, nodes, peerAddresses,
 		)
 		if err := os.WriteFile(manifestPaths[index], document, 0o600); err != nil {
@@ -523,7 +525,7 @@ func writeRF3CommandIdentity(t testing.TB, path string, identity interface{ Mars
 }
 
 func rf3CommandManifestDocument(
-	walPath, sqlPath, basePath, applyPath, keyPath, peerAddress, nativeAddress, controlAddress string,
+	walPath, sqlPath, basePath, applyPath, keyPath, peerAddress, nativeAddress, snapshotAddress, controlAddress string,
 	credential rf3testfixture.Credential,
 	roots, policyPath string,
 	options raftstore.Options,
@@ -534,11 +536,11 @@ func rf3CommandManifestDocument(
 	if absolute, err := filepath.Abs(dataRoot); err == nil {
 		dataRoot = absolute
 	}
-	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"listeners":{"peer":%q,"native":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
+	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		walPath, keyPath,
 		options.MaxFileBytes, options.MaxRecordBytes, options.MaxRecords,
 		options.MaxEntries, options.MaxLiveBytes,
-		sqlPath, basePath, applyPath, peerAddress, nativeAddress, controlAddress,
+		sqlPath, basePath, applyPath, peerAddress, nativeAddress, snapshotAddress, controlAddress,
 		credential.Certificate, credential.Key, roots, policyPath,
 		filepath.Join(dataRoot, "replica-actions"), dataRoot,
 		filepath.Join(dataRoot, "source-exports"), filepath.Join(dataRoot, "source-artifacts"),

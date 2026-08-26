@@ -203,6 +203,19 @@ func servePreparedRF3WithListen(
 		)
 	}
 	defer controlListener.Close()
+	sourceEligible := manifest.EnrolledTarget != nil &&
+		base.Binding.MemberID != manifest.EnrolledTarget.MemberID
+	var snapshotListener net.Listener
+	if sourceEligible {
+		snapshotListener, err = listen("tcp", manifest.Listeners.Snapshot)
+		if err != nil {
+			return errors.Join(
+				closePrepared(fmt.Errorf("listen RF3 snapshot %q: %w", manifest.Listeners.Snapshot, err)),
+				peerListener.Close(), controlListener.Close(),
+			)
+		}
+		defer snapshotListener.Close()
+	}
 	var nativeListener net.Listener
 	if nativeAuthorized {
 		nativeListener, err = listen("tcp", manifest.Listeners.Native)
@@ -313,8 +326,17 @@ func servePreparedRF3WithListen(
 		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
 	}
 	var sourceControl shardcontrol.Handler
+	var sourceData *snapshottransfer.Service
+	var snapshotTLS *servicetls.Server
 	if target := manifest.EnrolledTarget; target != nil &&
 		runtimeIdentity.MemberID != target.MemberID {
+		if policy.Check(target.NodeID, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(errRF3Serving, errors.New("enrolled target lacks membership capability"),
+				componentShutdownError(peerErr), servingRegistry.Close())
+		}
 		sourceJournal, openErr := snapshottransfer.OpenSourceFileJournal(
 			manifest.ReplicaControl.SourceJournalPath,
 			manifest.ReplicaControl.MaxSourceRecords,
@@ -372,6 +394,43 @@ func servePreparedRF3WithListen(
 			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
 		}
 		sourceControl = sourceService
+		snapshotAuthorizer, authorizerErr := servicetls.NewNodeAuthorizer(
+			[]rafttransport.NodeID{target.NodeID},
+		)
+		if authorizerErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(authorizerErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
+		snapshotTLS, serviceErr = servicetls.NewServer(
+			profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
+		)
+		if serviceErr == nil {
+			sourceData, serviceErr = provider.NewDataService(snapshottransfer.ServiceOptions{
+				Registry: transportRegistry,
+				Authorize: func(descriptor snapshottransfer.Descriptor) bool {
+					return descriptor.Group == group &&
+						descriptor.SourceMember == runtimeIdentity.MemberID &&
+						descriptor.TargetMember == target.MemberID &&
+						descriptor.TargetStore == target.StoreID &&
+						descriptor.TargetIncarnation == target.NodeIncarnation &&
+						descriptor.SchemaGeneration == base.Binding.Authority.SchemaGeneration &&
+						descriptor.ReplicaSetVersion == runtimePublication.ReplicaSetVersion
+				},
+				ReadDeadline: deadline, WriteDeadline: deadline,
+				MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+				MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
+				MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
+					int64(manifest.ReplicaControl.MaxSourceConcurrent),
+			})
+		}
+		if serviceErr != nil {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			peerErr := peer.Run(retireCtx)
+			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
+		}
 	}
 	controlMux, err := newRF3ControlMux(membershipControl, observationControl, sourceControl, actionControl)
 	if err != nil {
@@ -396,9 +455,11 @@ func servePreparedRF3WithListen(
 
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
 	controlCtx, stopControl := context.WithCancelCause(context.Background())
+	snapshotCtx, stopSnapshot := context.WithCancelCause(context.Background())
 	nativeCtx, stopNative := context.WithCancelCause(context.Background())
 	defer stopPeer(context.Canceled)
 	defer stopControl(context.Canceled)
+	defer stopSnapshot(context.Canceled)
 	defer stopNative(context.Canceled)
 	peerDone := make(chan error, 1)
 	go func() { peerDone <- peer.Run(peerCtx) }()
@@ -427,6 +488,21 @@ func servePreparedRF3WithListen(
 			_ = controlMux.Serve(ctx, connection)
 		})
 	}()
+	var snapshotDone chan error
+	snapshotAddress := "fenced"
+	if sourceData != nil {
+		snapshotDone = make(chan error, 1)
+		snapshotAddress = snapshotListener.Addr().String()
+		go func() {
+			snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotListener, servicetls.Limits{
+				MaxConnections:    manifest.ReplicaControl.MaxSourceConcurrent,
+				MaxHandshakes:     manifest.ReplicaControl.MaxSourceConcurrent,
+				HandshakeDeadline: deadline,
+			}, func(ctx context.Context, connection rafttransport.PeerConnection) {
+				_ = sourceData.Serve(ctx, connection)
+			})
+		}()
+	}
 	var nativeDone chan error
 	nativeAddress := "fenced"
 	if nativeAuthorized {
@@ -439,13 +515,14 @@ func servePreparedRF3WithListen(
 		}()
 	}
 	fmt.Fprintf(os.Stderr,
-		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s control=%s\n",
+		"vibedb-shard RF3 ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s snapshot=%s control=%s\n",
 		base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
-		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress, controlListener.Addr(),
+		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
+		snapshotAddress, controlListener.Addr(),
 	)
 
 	var primary error
-	peerFinished, controlFinished, nativeFinished := false, false, false
+	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
 	select {
 	case <-parent.Done():
 		// A requested shutdown is not an error. Component failures observed below
@@ -454,6 +531,8 @@ func servePreparedRF3WithListen(
 		primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
 	case err := <-controlDone:
 		primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
+	case err := <-snapshotDone:
+		primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped: %w", err), true
 	case err := <-nativeDone:
 		primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
 	}
@@ -463,6 +542,12 @@ func servePreparedRF3WithListen(
 		stopNative(context.Canceled)
 		if !nativeFinished {
 			primary = errors.Join(primary, componentShutdownError(<-nativeDone))
+		}
+	}
+	if sourceData != nil {
+		stopSnapshot(context.Canceled)
+		if !snapshotFinished {
+			primary = errors.Join(primary, componentShutdownError(<-snapshotDone))
 		}
 	}
 	stopControl(context.Canceled)
@@ -581,14 +666,20 @@ func readRF3BoundedFile(path string, maximum int) ([]byte, error) {
 
 func validateRF3Addresses(manifest rf3Manifest) error {
 	if manifest.Listeners.Peer == manifest.Listeners.Native ||
+		manifest.Listeners.Peer == manifest.Listeners.Snapshot ||
 		manifest.Listeners.Peer == manifest.Listeners.Control ||
-		manifest.Listeners.Native == manifest.Listeners.Control {
-		return fmt.Errorf("%w: peer, native, and control listeners must differ", errRF3Serving)
+		manifest.Listeners.Native == manifest.Listeners.Snapshot ||
+		manifest.Listeners.Native == manifest.Listeners.Control ||
+		manifest.Listeners.Snapshot == manifest.Listeners.Control {
+		return fmt.Errorf("%w: peer, native, snapshot, and control listeners must differ", errRF3Serving)
 	}
 	if err := validateRF3Address(manifest.Listeners.Peer, true); err != nil {
 		return err
 	}
 	if err := validateRF3Address(manifest.Listeners.Native, true); err != nil {
+		return err
+	}
+	if err := validateRF3Address(manifest.Listeners.Snapshot, true); err != nil {
 		return err
 	}
 	if err := validateRF3Address(manifest.Listeners.Control, true); err != nil {

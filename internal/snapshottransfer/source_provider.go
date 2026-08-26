@@ -56,6 +56,25 @@ type RetainedSourceExportProvider struct {
 	closed bool
 }
 
+// NewDataService binds the snapshot data plane to the exact repository owned
+// by this retained source provider. Keeping repository ownership private makes
+// it impossible for the shipped source-control and data listeners to drift to
+// different artifact directories or accounting limits.
+func (provider *RetainedSourceExportProvider) NewDataService(
+	options ServiceOptions,
+) (*Service, error) {
+	if provider == nil || options.Repository != nil {
+		return nil, ErrSourceControl
+	}
+	provider.mu.RLock()
+	defer provider.mu.RUnlock()
+	if provider.closed || provider.repository == nil {
+		return nil, ErrSourceControl
+	}
+	options.Repository = provider.repository
+	return NewService(options)
+}
+
 func OpenRetainedSourceExportProvider(
 	options RetainedSourceExportOptions,
 ) (*RetainedSourceExportProvider, error) {

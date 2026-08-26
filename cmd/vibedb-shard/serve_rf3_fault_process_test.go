@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -288,7 +289,8 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 		fixture.walPaths[member] = prepared.WALPath
 		fixture.manifestPaths[member] = filepath.Join(memberRoot, "serve-rf3.json")
 		document := rf3CommandManifestDocument(prepared.WALPath, prepared.SQLPath, basePath, applyPath, keyPath,
-			fixture.peerAddresses[member], fixture.nativeAddresses[member], fixture.controlAddresses[member], credentials[member], roots,
+			fixture.peerAddresses[member], fixture.nativeAddresses[member],
+			"127.0.0.1:"+strconv.Itoa(18601+member), fixture.controlAddresses[member], credentials[member], roots,
 			policyPath, walOptions, fixture.nodes, fixture.peerAddresses)
 		if err = os.WriteFile(fixture.manifestPaths[member], document, 0o600); err != nil {
 			t.Fatal(err)

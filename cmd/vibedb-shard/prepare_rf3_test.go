@@ -43,10 +43,13 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndRefusesOverwrite(t *test
 		ShardIncarnation:      idString(identity.ShardIncarnation[:]), GroupID: idString(identity.GroupID[:]),
 		MemberID: identity.MemberID, StoreID: idString(identity.StoreID[:]),
 		Table: "docs", CreateTable: `CREATE TABLE docs (PRIMARY KEY (id))`,
-		Authority:           prepareRF3Authority{ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19},
-		WAL:                 prepareRF3WAL{KeyID: "test-key", KeyMaterialPath: keySource, WrappedKey: "opaque-test-key", MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
-		Apply:               prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "id"},
-		Listeners:           rf3ManifestListeners{Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001", Control: "127.0.0.1:23001"},
+		Authority: prepareRF3Authority{ActivePolicyGeneration: 5, ProtectionEpoch: 7, OwnershipEpoch: 11, SchemaGeneration: 13, RoutingVersion: 17, RouteGeneration: 19},
+		WAL:       prepareRF3WAL{KeyID: "test-key", KeyMaterialPath: keySource, WrappedKey: "opaque-test-key", MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
+		Apply:     prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "id"},
+		Listeners: rf3ManifestListeners{
+			Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001",
+			Snapshot: "127.0.0.1:22501", Control: "127.0.0.1:23001",
+		},
 		TLS:                 rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: "1.3.6.1.4.1.32473.1.1"},
 		AuthorizationPolicy: policy,
 	}

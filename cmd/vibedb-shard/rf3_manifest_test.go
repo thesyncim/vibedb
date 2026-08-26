@@ -29,6 +29,7 @@ const canonicalRF3Manifest = `{
   "listeners": {
     "peer": "0.0.0.0:7400",
     "native": "0.0.0.0:7500",
+    "snapshot": "0.0.0.0:7600",
     "control": "0.0.0.0:7700"
   },
   "tls": {
@@ -85,6 +86,7 @@ func TestLoadRF3ManifestCanonical(t *testing.T) {
 		t.Fatalf("SQL artifacts = %+v", manifest.SQL)
 	}
 	if manifest.Listeners.Peer != "0.0.0.0:7400" || manifest.Listeners.Native != "0.0.0.0:7500" ||
+		manifest.Listeners.Snapshot != "0.0.0.0:7600" ||
 		manifest.Listeners.Control != "0.0.0.0:7700" {
 		t.Fatalf("listeners = %+v", manifest.Listeners)
 	}
