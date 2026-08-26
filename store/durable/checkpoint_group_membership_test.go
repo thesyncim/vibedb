@@ -150,6 +150,39 @@ func TestCheckpointMembershipPreparedSourceReopensServingOldMembership(t *testin
 	}
 }
 
+func TestCheckpointMembershipPrepareSettlesEveryPublicationBoundary(t *testing.T) {
+	points := []checkpointGroupFaultPoint{
+		checkpointGroupAfterMembershipWrite,
+		checkpointGroupAfterMembershipSync,
+		checkpointGroupAfterMembershipDirectorySync,
+	}
+	for _, point := range points {
+		t.Run(string(rune('0'+point)), func(t *testing.T) {
+			_, members, _, group := newCheckpointGroupTestStore(t, 1)
+			authorization := sha256.Sum256([]byte("boundary"))
+			injected := errors.New("injected membership publication stop")
+			checkpointGroupFaultHook = func(got checkpointGroupFaultPoint) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}
+			_, err := group.PrepareMembershipTransition(members, authorization)
+			checkpointGroupFaultHook = nil
+			if !errors.Is(err, injected) {
+				t.Fatalf("prepare boundary error = %v", err)
+			}
+			witness, err := group.PrepareMembershipTransition(members, authorization)
+			if err != nil {
+				t.Fatalf("settle prepare: %v", err)
+			}
+			if err := group.ObserveMembershipTransition(witness, authorization); err != nil {
+				t.Fatalf("observe settled prepare: %v", err)
+			}
+		})
+	}
+}
+
 func TestCheckpointMembershipRejectsAuthenticatedNoncanonicalNewest(t *testing.T) {
 	dir, members, _, group := newCheckpointGroupTestStore(t, 1)
 	authorization := sha256.Sum256([]byte("first"))
