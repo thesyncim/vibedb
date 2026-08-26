@@ -1,0 +1,96 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibejson"
+)
+
+func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) {
+	root := t.TempDir()
+	manifest := devClusterManifest{
+		Format: devClusterFormat, Nodes: devClusterNodes,
+		ClientEndpoint: "127.0.0.1:24000", CatalogPath: filepath.Join(root, "catalog.vibejson"),
+		GatewayCertificate: filepath.Join(root, "gateway-cert.pem"), GatewayKey: filepath.Join(root, "gateway-key.pem"),
+		Roots: filepath.Join(root, "roots.pem"), AuthorizationPolicy: filepath.Join(root, "policy.vibejson"),
+		GatewayNode: "01010101010101010101010101010101", Members: make([]devClusterMember, devClusterNodes),
+	}
+	paths := []string{manifest.CatalogPath, manifest.GatewayCertificate, manifest.GatewayKey, manifest.Roots, manifest.AuthorizationPolicy}
+	for index := range manifest.Members {
+		manifest.Members[index] = devClusterMember{Member: uint64(index + 1), Node: "1111111111111111111111111111111" + string(rune('1'+index)), Store: "2222222222222222222222222222222" + string(rune('1'+index)), Peer: "127.0.0.1:2500" + string(rune('1'+index)), Native: "127.0.0.1:2510" + string(rune('1'+index)), Snapshot: "127.0.0.1:2520" + string(rune('1'+index)), Control: "127.0.0.1:2530" + string(rune('1'+index)), ServeManifest: filepath.Join(root, "member-"+string(rune('1'+index)), "serve-rf3.vibejson")}
+		paths = append(paths, manifest.Members[index].ServeManifest)
+	}
+	for _, path := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := vibejson.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cluster.vibejson"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ensureDevCluster(devClusterOptions{root: root, nodes: 3, shardBinary: "/does/not/run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := vibejson.Marshal(&loaded)
+	if err != nil || !bytes.Equal(raw, again) {
+		t.Fatalf("resume changed manifest: %v", err)
+	}
+}
+
+func TestDevPolicyIsAcceptedByProductionAuthorizationLoader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.vibejson")
+	var nodes [4]rafttransport.NodeID
+	for index := range nodes {
+		nodes[index][0] = byte(index + 1)
+	}
+	if err := writeDevPolicy(path, nodes[:]); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := serviceauthz.LoadFile(path)
+	if err != nil || policy.Generation() != 1 || len(policy.Nodes()) != len(nodes) {
+		t.Fatalf("policy=%+v err=%v", policy, err)
+	}
+}
+
+func TestDevChildShutdownDoesNotLeakProcess(t *testing.T) {
+	child, err := startDevChild("/bin/sh", []string{"-c", "echo READY >&2; trap 'exit 0' TERM; while :; do sleep 1; done"}, "READY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := waitDevReady(t.Context(), child); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	stopDevChildren([]*devChild{child})
+	if child.command.ProcessState == nil || time.Since(started) > 5*time.Second {
+		t.Fatalf("child not reaped promptly: %+v", child.command.ProcessState)
+	}
+}
+
+func TestReserveDevPortsUsesDistinctLoopbackEndpoints(t *testing.T) {
+	ports, err := reserveDevPorts(13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]struct{}, len(ports))
+	for _, address := range ports {
+		if _, exists := seen[address]; exists {
+			t.Fatalf("duplicate %q", address)
+		}
+		seen[address] = struct{}{}
+	}
+}
