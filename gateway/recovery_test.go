@@ -84,7 +84,7 @@ func stageRecoveryTransaction(
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: snapshot.Generation(),
-		RecoveryDeadline:  3, Participants: refs,
+		RecoveryDeadline:  1, Participants: refs,
 	})
 	if err != nil {
 		t.Fatal(err)

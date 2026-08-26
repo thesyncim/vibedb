@@ -15,7 +15,6 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -175,9 +174,9 @@ func (state *sessionProtocolSharedState) ExecBatch(
 	state.execApplications++
 	if state.failNextExecResponse {
 		state.failNextExecResponse = false
-		return durableExecBatchExecuteResult{}, &gateway.ReplicatedTransactionError{
-			ID: distributedtxn.ID(identity.RequestID), Cause: errSessionProtocolOutcome,
-		}
+		return durableExecBatchExecuteResult{}, errors.Join(
+			gateway.ErrDurableRequestUnresolved, errSessionProtocolOutcome,
+		)
 	}
 	return sessionProtocolExecuteResult(record), nil
 }
@@ -312,8 +311,8 @@ func TestDurableSessionProtocolRecoversAcrossGatewayAndAuthenticatesAck(t *testi
 	request1 := sessionProtocolExecRequest(t, requestID1, reference, 1,
 		[]byte(`DELETE FROM docs WHERE id = 1`))
 	unknown := sessionProtocolRoundTrip(t, gatewayA, authority, request1, true)
-	if !bytes.Contains(unknown, []byte(`"outcome_unknown":true`)) ||
-		!bytes.Contains(unknown, []byte(errSessionProtocolOutcome.Error())) ||
+	if !bytes.Contains(unknown, []byte(errSessionProtocolOutcome.Error())) ||
+		bytes.Contains(unknown, []byte(`"outcome_unknown":true`)) ||
 		bytes.Contains(unknown, []byte(`"ack_token"`)) {
 		t.Fatalf("ambiguous first response = %s", unknown)
 	}

@@ -34,8 +34,14 @@ func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testin
 	homeParticipants := durableFaultParticipants(t)
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
+	topology := durableFaultTopology(t, homeParticipants)
+	current := topology.Current()
+	current.Generation = 7
+	if err = topology.Publish(*current); err != nil {
+		t.Fatal(err)
+	}
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, homeParticipants), ledger, typedServiceRunnerStop{}, pins,
+		topology, ledger, typedServiceRunnerStop{}, pins,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -71,6 +77,45 @@ func TestDurableSQLRequestExecutorRejectsTenantMismatchBeforeAdmission(t *testin
 	}
 	if _, err := executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(err, ErrDurableSQLRequest) {
 		t.Fatalf("tenant mismatch error=%v", err)
+	}
+}
+
+func TestDurableSQLRequestExecutorRejectsCatalogLedgerGenerationMixBeforeAdmission(t *testing.T) {
+	_, planner := replicatedSQLTransactionFixture(t, true)
+	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := []Query{{
+		SQL: `INSERT INTO messages VALUES (?)`, Class: ClassInteractive,
+		Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"message-1"}`)},
+	}}
+	tenant := []byte("durable-sql-tenant")
+	requestKey := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{0x51},
+		Request: requestledger.RequestID{0x52}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		IssuerEpoch: 7, IssuerLane: requestledger.IssuerLane{0x53}, IssuerSequence: 1,
+	}
+	participants := durableFaultParticipants(t)
+	ledger := new(typedServiceLedger)
+	service, err := newDurableRequestService(
+		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewDurableSQLRequestExecutor(DurableSQLRequestExecutorOptions{
+		Planner: planner, ReplicatedData: data, Requests: service,
+		RecoveryPulseLimit: 3, PlanningLeaseSpan: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.Execute(t.Context(), requestKey, tenant, queries); !errors.Is(err, ErrDurableRequestConflict) {
+		t.Fatalf("mixed generation error=%v", err)
+	}
+	if ledger.applies != 0 || ledger.reads != 0 {
+		t.Fatalf("mixed generation reached admission: applies=%d reads=%d", ledger.applies, ledger.reads)
 	}
 }
 

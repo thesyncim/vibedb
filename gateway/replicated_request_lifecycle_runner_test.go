@@ -265,8 +265,16 @@ func lifecycleRunnerFixture(t testing.TB) (
 	ReplicatedRoute,
 ) {
 	t.Helper()
-	participants, _ := transactionOrchestratorRoutes(t, 1)
-	physical := participants[0]
+	route, _, _ := testReplicatedRouteCommand(t)
+	physical := ReplicatedTransactionParticipant{
+		Route: route, BucketBits: 8,
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationDelete, Key: []byte("key"),
+			}},
+		}},
+	}
 	physical.Route.RangeIdentity = replication.Digest(lifecycleDigest("range"))
 	physical.Route.LineageDigest = replication.Digest(lifecycleDigest("lineage"))
 	physical.Route.ForwardingRuleDigest = replication.Digest(lifecycleDigest("forwarding"))

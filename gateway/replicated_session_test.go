@@ -669,7 +669,8 @@ func TestNativeTransactionCompletionBindsValidatedRoleOperationAndFixedResult(t 
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedCommitCoordinator,
 		ID:        id, ExpectedRevision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadNone,
+		PayloadKind:     distributedtxn.ReplicatedPayloadNone,
+		ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -56,59 +56,6 @@ type replicatedSQLMutationIdentity struct {
 	key         []byte
 }
 
-// executeReplicatedSQLTransaction recognizes an all-RF3 exact-key batch and
-// sends its native relation mutations to the fused orchestrator. handled is
-// false only when every table belongs to the legacy/static lane. Classification
-// and complete shape validation finish before any RF3 or shard SQL I/O.
-func (executor *Executor) executeReplicatedSQLTransaction(
-	ctx context.Context,
-	snapshot *Snapshot,
-	requestID replication.ID128,
-	requestDigest replication.Digest,
-	queries []Query,
-	profile Profile,
-) (*Result, bool, error) {
-	participants, handled, err := executor.planReplicatedSQLTransaction(
-		ctx, snapshot, queries, profile,
-	)
-	if err != nil || !handled {
-		return nil, handled, err
-	}
-	if len(participants) == 0 {
-		return nil, true, ErrReplicatedSQLTransactionUnsupported
-	}
-	var outcome ReplicatedTransactionRequestOutcome
-	if executor.replicatedTransactionRequests == nil {
-		transaction, executeErr := executor.replicatedTransactions.Execute(
-			ctx, snapshot.Generation(), participants,
-		)
-		outcome = ReplicatedTransactionRequestOutcome{
-			ReplicatedTransactionResult: transaction,
-			CatalogGeneration:           snapshot.Generation(),
-			ShardsFanned:                len(participants),
-		}
-		err = executeErr
-	} else {
-		if requestID == (replication.ID128{}) || requestDigest == (replication.Digest{}) {
-			return nil, true, ErrReplicatedTransactionRequestRegistry
-		}
-		outcome, err = executor.replicatedTransactionRequests.Execute(
-			ctx, requestID, requestDigest, snapshot.Generation(), participants,
-		)
-	}
-	if err != nil {
-		return nil, true, err
-	}
-	if !outcome.Committed || outcome.Recovery != nil {
-		return nil, true, ErrReplicatedTransaction
-	}
-	// The state machine reports physical relation mutations. SQL reports logical
-	// base rows, so hidden exact/global-index maintenance must not inflate the
-	// completion observed by the caller.
-	outcome.AffectedRows = int64(len(queries))
-	return executor.replicatedSQLTransactionResult(outcome), true, nil
-}
-
 // replicatedSQLTransactionRequestDigest binds a request ID to the exact caller
 // input before any catalog pin or SQL lowering. It is intentionally independent
 // of routes and catalog generations so an exact retry survives topology change.
@@ -146,33 +93,16 @@ func replicatedSQLTransactionRequestDigest(queries []Query) replication.Digest {
 	return digest
 }
 
-func (executor *Executor) replicatedSQLTransactionResult(
-	outcome ReplicatedTransactionRequestOutcome,
-) *Result {
-	if outcome.CatalogGeneration == 0 || outcome.ShardsFanned <= 0 {
-		return nil
-	}
-	executor.metrics.observeRoute(
-		distribution.RouteTargeted, outcome.ShardsFanned, ScatterNone,
-	)
-	return &Result{
-		Kind: shardservice.ResponseCompletion, RowsAffected: outcome.AffectedRows,
-		RouteKind: distribution.RouteTargeted, Generation: outcome.CatalogGeneration,
-		ShardsFanned: outcome.ShardsFanned, TransactionID: replication.ID128(outcome.ID),
-	}
-}
-
+// planReplicatedSQLTransaction is the allocation-focused lowering seam for
+// mutations that require no indexed pre-read. Production durable execution
+// always supplies its explicit ReplicatedExecutor through the WithData form.
 func (executor *Executor) planReplicatedSQLTransaction(
 	ctx context.Context,
 	snapshot *Snapshot,
 	queries []Query,
 	profile Profile,
 ) ([]ReplicatedTransactionParticipant, bool, error) {
-	if executor == nil || executor.replicatedTransactions == nil {
-		return nil, false, nil
-	}
-	return executor.planReplicatedSQLTransactionWithData(ctx, snapshot, queries, profile,
-		executor.replicatedTransactions.executor)
+	return executor.planReplicatedSQLTransactionWithData(ctx, snapshot, queries, profile, nil)
 }
 
 func (executor *Executor) planReplicatedSQLTransactionWithData(

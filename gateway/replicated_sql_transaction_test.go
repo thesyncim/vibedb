@@ -5,22 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"net"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
-	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
-
-type replicatedSQLTransactionCapture struct {
-	calls        int
-	generation   uint64
-	participants []ReplicatedTransactionParticipant
-}
 
 type replicatedSQLIndexedReadClient struct {
 	states map[string]shardservice.ReplicatedMemberState
@@ -50,26 +42,6 @@ func (client *replicatedSQLIndexedReadClient) DoReplicated(
 		Kind: shardservice.ReplicatedReadFound, HasState: true, State: state,
 		ReadApplied: state.Applied, Value: client.value,
 	}, nil
-}
-
-func (capture *replicatedSQLTransactionCapture) Execute(
-	_ context.Context,
-	generation uint64,
-	participants []ReplicatedTransactionParticipant,
-) (ReplicatedTransactionResult, error) {
-	capture.calls++
-	capture.generation = generation
-	capture.participants = append(capture.participants[:0], participants...)
-	return ReplicatedTransactionResult{
-		ID: distributedtxn.ID{1}, Committed: true, AffectedRows: 2,
-	}, nil
-}
-
-func (*replicatedSQLTransactionCapture) Recover(
-	context.Context,
-	*ReplicatedTransactionRecoveryHandle,
-) (ReplicatedTransactionResult, error) {
-	return ReplicatedTransactionResult{}, errors.New("unexpected recovery")
 }
 
 func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelation(t *testing.T) {
@@ -139,215 +111,6 @@ func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelatio
 			len(participant.IntentScopes) == 0 {
 			t.Fatalf("participant %d route/scope = %+v", index, participant)
 		}
-	}
-}
-
-func TestReplicatedSQLTransactionExecBatchRequestUsesBoundedRequestRegistry(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: capture, MaxEntries: 4,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-1"),
-		}},
-		{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("log-1"),
-		}},
-	}
-	requestID := replication.ID128{9}
-	result, err := executor.ExecBatchRequest(t.Context(), requestID, queries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.RowsAffected != 2 || result.TransactionID != (replication.ID128{1}) ||
-		result.ShardsFanned != 2 || capture.calls != 1 ||
-		capture.generation != snapshot.Generation() || len(capture.participants) != 2 {
-		t.Fatalf("result=%+v capture=%+v", result, capture)
-	}
-	result, err = executor.ExecBatchRequest(t.Context(), requestID, queries)
-	if err != nil || result.RowsAffected != 2 || capture.calls != 1 {
-		t.Fatalf("cached result=%+v err=%v calls=%d", result, err, capture.calls)
-	}
-	conflict := append([]Query(nil), queries...)
-	conflict[1].Params = []shardservice.Param{shardservice.StringParam("log-2")}
-	if _, err = executor.ExecBatchRequest(t.Context(), requestID, conflict); !errors.Is(
-		err, ErrReplicatedTransactionRequestConflict,
-	) || capture.calls != 1 {
-		t.Fatalf("conflict err=%v calls=%d", err, capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionExecBatchRequestServesSingletonRF3(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 1},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	query := []Query{{
-		SQL:    `DELETE FROM messages WHERE id = ?`,
-		Params: []shardservice.Param{shardservice.StringParam("singleton")},
-	}}
-	if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{}, query); !errors.Is(err, ErrReplicatedTransactionRequestRegistry) || capture.calls != 0 {
-		t.Fatalf("zero identity error=%v calls=%d", err, capture.calls)
-	}
-	result, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, query)
-	if err != nil || result == nil || result.RowsAffected != 1 ||
-		result.Generation != snapshot.Generation() || result.ShardsFanned != 1 ||
-		capture.calls != 1 || len(capture.participants) != 1 {
-		t.Fatalf("singleton result=%+v err=%v capture=%+v", result, err, capture)
-	}
-	executor.catalog = NewCatalogHolder(nil)
-	replayed, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, query)
-	if err != nil || replayed == nil || replayed.Generation != snapshot.Generation() ||
-		replayed.ShardsFanned != 1 || capture.calls != 1 {
-		t.Fatalf("singleton replay=%+v err=%v calls=%d", replayed, err, capture.calls)
-	}
-	conflict := []Query{{
-		SQL:    `DELETE FROM messages WHERE id = ?`,
-		Params: []shardservice.Param{shardservice.StringParam("different")},
-	}}
-	if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{27}, conflict); !errors.Is(err, ErrReplicatedTransactionRequestConflict) || capture.calls != 1 {
-		t.Fatalf("singleton conflict error=%v calls=%d", err, capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionRequestIdentityFailsClosedForStaticBatch(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, false)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 2},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	for _, queries := range [][]Query{
-		{{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		}}},
-		{
-			{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-				shardservice.StringParam("one"),
-			}},
-			{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-				shardservice.StringParam("two"),
-			}},
-		},
-	} {
-		if _, err := executor.ExecBatchRequest(t.Context(), replication.ID128{28}, queries); !errors.Is(err, ErrBatchRequestIdentityUnsupported) {
-			t.Fatalf("static request identity error=%v", err)
-		}
-	}
-	if capture.calls != 0 {
-		t.Fatalf("static request reached RF3 orchestrator %d times", capture.calls)
-	}
-}
-
-func TestReplicatedSQLTransactionStaticSingletonZeroIdentityFallsBack(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, false)
-	fallbackErr := errors.New("static singleton fallback dial")
-	executor.client = NewClient(func(context.Context, string) (net.Conn, error) {
-		return nil, fallbackErr
-	})
-	t.Cleanup(func() { _ = executor.client.Close() })
-
-	_, err := executor.ExecBatchRequest(t.Context(), replication.ID128{}, []Query{{
-		SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		},
-	}})
-	if !errors.Is(err, fallbackErr) {
-		t.Fatalf("static singleton fallback error=%v", err)
-	}
-}
-
-func TestReplicatedSQLTransactionIdentityRequiresRequestRegistry(t *testing.T) {
-	_, executor := replicatedSQLTransactionFixture(t, true)
-	_, err := executor.ExecBatchRequest(t.Context(), replication.ID128{29}, []Query{{
-		SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("one"),
-		},
-	}})
-	if !errors.Is(err, ErrBatchRequestIdentityUnsupported) {
-		t.Fatalf("missing request registry error=%v", err)
-	}
-}
-
-func TestReplicatedSQLTransactionReplayPrecedesCatalogPinAndPreservesMetadata(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{Orchestrator: capture, MaxEntries: 2},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-replay"),
-		}},
-		{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("log-replay"),
-		}},
-	}
-	id := replication.ID128{31}
-	first, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Generation != snapshot.Generation() || first.ShardsFanned != 2 {
-		t.Fatalf("first metadata=%+v", first)
-	}
-
-	// Publish a later catalog with changed replica routing metadata. An exact
-	// retry must retain the original response rather than replanning against it.
-	endpoints := make(map[distribution.EndpointID]string, len(snapshot.endpoints))
-	for endpoint, address := range snapshot.endpoints {
-		endpoints[endpoint] = address
-	}
-	descriptors := snapshot.replicatedDescriptors()
-	endpoints[descriptors[0].Replicas[0].NativeEndpoint] = "127.0.0.1:65534"
-	profiles := make([]ReplicatedTableProfile, len(snapshot.replicatedTables))
-	for index, entry := range snapshot.replicatedTables {
-		profile, ok := snapshot.replicatedTableProfileAt(entry)
-		if !ok {
-			t.Fatalf("profile %d unavailable", index)
-		}
-		profiles[index] = profile
-	}
-	advanced, err := NewSnapshotWithReplicatedTableMetadata(
-		snapshot.config, endpoints, snapshot.Generation()+1, nil, nil,
-		descriptors, profiles,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.catalog = NewCatalogHolder(advanced)
-	second, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil || second.Generation != snapshot.Generation() || second.ShardsFanned != 2 {
-		t.Fatalf("changed-catalog replay=%+v err=%v", second, err)
-	}
-
-	// Removing the catalog altogether makes any attempted pin or SQL planning
-	// fail. The retained request must still replay without touching either.
-	executor.catalog = NewCatalogHolder(nil)
-	third, err := executor.ExecBatchRequest(t.Context(), id, queries)
-	if err != nil || third.Generation != snapshot.Generation() || third.ShardsFanned != 2 ||
-		capture.calls != 1 {
-		t.Fatalf("catalog-free replay=%+v err=%v calls=%d", third, err, capture.calls)
 	}
 }
 
@@ -484,45 +247,6 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 	}
 }
 
-func TestReplicatedSQLTransactionExecutesSameGroupMultiRelationAtomically(t *testing.T) {
-	snapshot, executor := replicatedSQLTransactionFixture(t, true)
-	capture := new(replicatedSQLTransactionCapture)
-	registry, err := NewReplicatedTransactionRequestRegistry(
-		ReplicatedTransactionRequestRegistryOptions{
-			Orchestrator: capture, MaxEntries: 1,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor.replicatedTransactionRequests = registry
-	queries := []Query{
-		{SQL: `DELETE FROM accounts WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("account-1"),
-		}},
-		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{
-			shardservice.StringParam("message-1"),
-		}},
-	}
-	result, handled, err := executor.executeReplicatedSQLTransaction(
-		t.Context(), snapshot, replication.ID128{1},
-		replicatedSQLTransactionRequestDigest(queries), queries,
-		executor.profileFor(ClassInteractive),
-	)
-	if err != nil || !handled || result == nil || result.RowsAffected != 2 ||
-		result.ShardsFanned != 1 || capture.calls != 1 ||
-		capture.generation != snapshot.Generation() || len(capture.participants) != 1 {
-		t.Fatalf("execute = result %+v handled %v err %v", result, handled, err)
-	}
-	participant := &capture.participants[0]
-	if participant.Route.Distribution != "data" || len(participant.Batches) != 2 ||
-		participant.Batches[0].Relation != 1 || participant.Batches[1].Relation != 2 ||
-		len(participant.Batches[0].Mutations) != 1 ||
-		len(participant.Batches[1].Mutations) != 1 {
-		t.Fatalf("participant = %+v", participant)
-	}
-}
-
 func TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participant(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
 	participants, handled, err := executor.planReplicatedSQLTransaction(
@@ -637,9 +361,9 @@ func TestReplicatedSQLTransactionGlobalIndexUpdateAndDeleteBindExactOldValue(t *
 		t.Run(test.name, func(t *testing.T) {
 			snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
 			old := []byte(`{"id":"message-1","email":"old@example.test"}`)
-			client := attachReplicatedSQLIndexedReadClient(t, snapshot, executor, old)
-			participants, handled, err := executor.planReplicatedSQLTransaction(
-				t.Context(), snapshot, []Query{test.query}, executor.profileFor(ClassInteractive),
+			client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+				t.Context(), snapshot, []Query{test.query}, executor.profileFor(ClassInteractive), data,
 			)
 			if err != nil || !handled || client.reads != 1 || len(participants) != 2 {
 				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
@@ -684,15 +408,15 @@ func TestReplicatedSQLTransactionGlobalIndexUpdateAndDeleteBindExactOldValue(t *
 func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true)
 	old := []byte(`{"id":"message-1","email":"same@example.test","region":"old"}`)
-	attachReplicatedSQLIndexedReadClient(t, snapshot, executor, old)
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`,
 			Params: []shardservice.Param{
 				shardservice.DocumentParam(`{"id":"message-1","email":"same@example.test","region":"new"}`),
 				shardservice.StringParam("message-1"),
 			},
-		}}, executor.profileFor(ClassInteractive),
+		}}, executor.profileFor(ClassInteractive), data,
 	)
 	if err != nil || !handled || len(participants) != 2 {
 		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
@@ -719,9 +443,8 @@ func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testi
 func attachReplicatedSQLIndexedReadClient(
 	t testing.TB,
 	snapshot *Snapshot,
-	executor *Executor,
 	value []byte,
-) *replicatedSQLIndexedReadClient {
+) (*replicatedSQLIndexedReadClient, *ReplicatedExecutor) {
 	t.Helper()
 	key, ok := orderedkey.AppendString(nil, []byte("message-1"), orderedkey.Ascending)
 	if !ok {
@@ -752,8 +475,7 @@ func attachReplicatedSQLIndexedReadClient(
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor.replicatedTransactions.executor = replicated
-	return client
+	return client, replicated
 }
 
 func TestReplicatedSQLTransactionRejectsMixedAuthorityAndLeavesStaticBatchUnclaimed(t *testing.T) {
@@ -944,8 +666,6 @@ func replicatedSQLTransactionFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{
-		ReplicatedTransactions: &ReplicatedTransactionOrchestrator{},
-	})
+	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	return snapshot, executor
 }

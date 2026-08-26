@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -1456,14 +1455,7 @@ func execRequest(ctx context.Context, exec *gateway.Executor, req serveRequest) 
 		return &serveResponse{Error: fmt.Sprintf("unknown operation %q", req.Op)}
 	}
 	if err != nil {
-		response := &serveResponse{Error: err.Error()}
-		var transactionErr *gateway.ReplicatedTransactionError
-		if errors.As(err, &transactionErr) && transactionErr.ID != (distributedtxn.ID{}) {
-			response.TransactionID = replication.ID128(transactionErr.ID)
-			response.Committed = transactionErr.Committed
-			response.OutcomeUnknown = !transactionErr.Committed
-		}
-		return response
+		return &serveResponse{Error: err.Error()}
 	}
 	return encodeResult(res)
 }

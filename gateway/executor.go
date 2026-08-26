@@ -77,13 +77,6 @@ type Options struct {
 	// autonomous transaction-recovery loop. It must be explicitly configured
 	// by authenticated production startup; the zero value cannot forward.
 	InternalAuthority serviceauthz.Authority
-	// ReplicatedTransactions enables the byte-native RF3 multi-group write lane.
-	// The orchestrator is process-scoped and owns its admission/recovery budget;
-	// Executor never constructs one per request.
-	ReplicatedTransactions *ReplicatedTransactionOrchestrator
-	// ReplicatedTransactionRequests owns caller request identities and every
-	// outcome-unknown recovery handle used by the shipped RF3 write lane.
-	ReplicatedTransactionRequests *ReplicatedTransactionRequestRegistry
 	// Pressure receives bounded, catalog-fenced routing samples for autonomous
 	// hot-shard scheduling. It is advisory and never grants serving authority.
 	Pressure PressureObserver
@@ -95,17 +88,15 @@ const defaultMaxRetries = 2
 // Executor routes and dispatches bounded distributed reads over a pinned catalog
 // generation. It is safe for concurrent use.
 type Executor struct {
-	client                        *Client
-	catalog                       *CatalogHolder
-	profiles                      map[OperationClass]Profile
-	refresh                       RefreshFunc
-	maxRetry                      int
-	routers                       *routerPool
-	metrics                       Metrics
-	internalAuthority             serviceauthz.Authority
-	replicatedTransactions        *ReplicatedTransactionOrchestrator
-	replicatedTransactionRequests *ReplicatedTransactionRequestRegistry
-	pressure                      PressureObserver
+	client            *Client
+	catalog           *CatalogHolder
+	profiles          map[OperationClass]Profile
+	refresh           RefreshFunc
+	maxRetry          int
+	routers           *routerPool
+	metrics           Metrics
+	internalAuthority serviceauthz.Authority
+	pressure          PressureObserver
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -126,16 +117,14 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 		maxRetry = 0
 	}
 	return &Executor{
-		client:                        client,
-		catalog:                       catalog,
-		profiles:                      profiles,
-		refresh:                       opts.Refresh,
-		maxRetry:                      maxRetry,
-		routers:                       newRouterPool(),
-		internalAuthority:             opts.InternalAuthority,
-		replicatedTransactions:        opts.ReplicatedTransactions,
-		replicatedTransactionRequests: opts.ReplicatedTransactionRequests,
-		pressure:                      opts.Pressure,
+		client:            client,
+		catalog:           catalog,
+		profiles:          profiles,
+		refresh:           opts.Refresh,
+		maxRetry:          maxRetry,
+		routers:           newRouterPool(),
+		internalAuthority: opts.InternalAuthority,
+		pressure:          opts.Pressure,
 	}
 }
 

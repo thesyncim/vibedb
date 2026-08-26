@@ -157,7 +157,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	progress := &durableDistributedProgress{
 		runner: runner, execution: execution, authority: authority,
 		next: head.NextStepOrdinal, state: state,
-		encoder: ReplicatedTransactionOrchestrator{tenant: bytes.Clone(execution.Recipe.Tenant)},
+		encoder: replicatedTransactionCommandEncoder{tenant: bytes.Clone(execution.Recipe.Tenant)},
 	}
 	descriptor, coordinator, coordinatorRoute, err := progress.measureManifest(ctx)
 	if err != nil {
@@ -513,7 +513,7 @@ type durableDistributedProgress struct {
 	next      uint64
 	ordinal   uint64
 	state     durableDistributedState
-	encoder   ReplicatedTransactionOrchestrator
+	encoder   replicatedTransactionCommandEncoder
 }
 
 func (progress *durableDistributedProgress) measureManifest(
@@ -695,7 +695,7 @@ func (progress *durableDistributedProgress) command(
 	}
 	control.ControllerEpoch = lease.ControllerEpoch
 	control.ExecutionPinDigest = distributedtxn.Digest(progress.execution.Recipe.Contract.PinDigest)
-	exact, err := progress.encoder.appendExactTransactionCommand(
+	exact, err := progress.encoder.appendExact(
 		nil, progress.execution.Recipe.Identity.RetryHome, route, control, batches,
 	)
 	if err != nil {

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -73,14 +72,7 @@ func executeDurableExecBatch(
 	}
 	result, err := service.ExecBatch(ctx, authority, identity, queries)
 	if err != nil {
-		response := &serveResponse{Error: err.Error()}
-		var transactionErr *gateway.ReplicatedTransactionError
-		if errors.As(err, &transactionErr) && transactionErr.ID != ([16]byte{}) {
-			response.TransactionID = replication.ID128(transactionErr.ID)
-			response.Committed = transactionErr.Committed
-			response.OutcomeUnknown = !transactionErr.Committed
-		}
-		return response
+		return &serveResponse{Error: err.Error()}
 	}
 	if result.Result == nil || !validDurableExecBatchAckRequest(&result.Ack) {
 		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}

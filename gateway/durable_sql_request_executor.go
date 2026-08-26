@@ -99,6 +99,9 @@ func (executor *DurableSQLRequestExecutor) Execute(
 	if err != nil {
 		return DurableSQLRequestResult{}, err
 	}
+	if home.TopologyGeneration != lease.generation {
+		return DurableSQLRequestResult{}, ErrDurableRequestConflict
+	}
 	participants, handled, err := executor.planner.planReplicatedSQLTransactionWithData(
 		opctx, lease.snapshot, queries, profile, executor.data,
 	)
@@ -189,7 +192,7 @@ func (executor *DurableSQLRequestExecutor) result(
 	key DurableRequestLedgerKey,
 	outcome DurableRequestOutcome,
 ) (DurableSQLRequestResult, error) {
-	if !outcome.Committed || outcome.Recovery != nil || outcome.CatalogGeneration == 0 ||
+	if !outcome.Committed || outcome.CatalogGeneration == 0 ||
 		outcome.ShardsFanned <= 0 || outcome.TerminalRevision == 0 ||
 		outcome.ResultDigest == (replication.Digest{}) || outcome.AckToken == (DurableRequestAckToken{}) {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
