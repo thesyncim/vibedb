@@ -21,22 +21,34 @@ import (
 // all three different space observables: logical EOF, allocated filesystem
 // blocks, and bytes actually handed to the durability device.
 func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
+	runFilePrimaryStructuralChurnAmplification(t, 8_192, 8)
+}
+
+// TestFilePrimaryStructuralChurnTenMillionQualification is the literal large
+// corpus proof. It is opt-in because constructing and reopening ten million
+// durable rows is intentionally too expensive for the ordinary unit suite.
+func TestFilePrimaryStructuralChurnTenMillionQualification(t *testing.T) {
+	if os.Getenv("VIBEDB_STRUCTURAL_10M") != "1" {
+		t.Skip("set VIBEDB_STRUCTURAL_10M=1 to run the 10,000,000-row structural churn qualification")
+	}
+	runFilePrimaryStructuralChurnAmplification(t, 10_000_000, 32)
+}
+
+func runFilePrimaryStructuralChurnAmplification(
+	t *testing.T, rows, cycles int,
+) {
+	t.Helper()
 	const (
-		rows   = 8_192
-		cycles = 8
+		keyBytes = len("row-00000000")
 	)
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys := make([]string, rows)
-	values := make(map[string][]byte, rows)
 	logicalBytes := uint64(0)
 	for index := range rows {
 		key := fmt.Sprintf("row-%08d", index)
 		value := structuralAmplificationValue(index)
-		keys[index] = key
-		values[key] = value
 		logicalBytes += uint64(len(key) + len(value))
 		if err = builder.Append(key, value); err != nil {
 			t.Fatal(err)
@@ -69,13 +81,15 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 	before := collection.Stats()
 	mutatedBytes := uint64(0)
 	for cycle := range cycles {
-		byBucket := make(map[uint32][]string)
-		for _, key := range keys {
-			route, ok := collection.primaryRouter.Load().Route([]byte(key))
+		byBucket := make(map[uint32][]int)
+		var keyBuffer [keyBytes]byte
+		for index := range rows {
+			key := appendStructuralAmplificationKey(keyBuffer[:0], index)
+			route, ok := collection.primaryRouter.Load().Route(key)
 			if !ok {
 				t.Fatalf("cycle %d route %q", cycle, key)
 			}
-			byBucket[uint32(route.Bucket)] = append(byBucket[uint32(route.Bucket)], key)
+			byBucket[uint32(route.Bucket)] = append(byBucket[uint32(route.Bucket)], index)
 		}
 		buckets := make([]uint32, 0, len(byBucket))
 		for bucket := range byBucket {
@@ -85,18 +99,24 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 		if len(buckets) < 3 {
 			t.Fatalf("cycle %d has only %d routed leaves", cycle, len(buckets))
 		}
-		selected := byBucket[buckets[1+cycle%(len(buckets)-2)]]
-		for _, key := range selected {
-			value := values[key]
-			deleted, deleteErr := collection.Delete([]byte(key))
+		// Churn the trailing, naturally partial leaf. At the 10M scale the current
+		// single-tablet format can be at its 4096-local-ID ceiling; reinserting a
+		// full middle leaf through its predecessor may transiently need two splits,
+		// whereas restoring the partial tail needs exactly the one ID just freed.
+		selected := byBucket[buckets[len(buckets)-1]]
+		for _, index := range selected {
+			key := appendStructuralAmplificationKey(keyBuffer[:0], index)
+			value := structuralAmplificationValue(index)
+			deleted, deleteErr := collection.Delete(key)
 			if deleteErr != nil || !deleted {
 				t.Fatalf("cycle %d delete %q = %v,%v", cycle, key, deleted, deleteErr)
 			}
 			mutatedBytes += uint64(len(key) + len(value))
 		}
-		for _, key := range selected {
-			value := values[key]
-			created, putErr := collection.Put([]byte(key), value)
+		for _, index := range selected {
+			key := appendStructuralAmplificationKey(keyBuffer[:0], index)
+			value := structuralAmplificationValue(index)
+			created, putErr := collection.Put(key, value)
 			if putErr != nil || !created {
 				t.Fatalf("cycle %d reinsert %q = %v,%v", cycle, key, created, putErr)
 			}
@@ -132,7 +152,7 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 		t.Fatalf("localized churn routing retired bytes = %d, want %d for %d reclaims and %d splits",
 			retired, want, reclaims, splits)
 	}
-	if after.DocumentCount != rows {
+	if after.DocumentCount != uint64(rows) {
 		t.Fatalf("live rows = %d, want %d", after.DocumentCount, rows)
 	}
 	info, err := file.Stat()
@@ -178,16 +198,21 @@ func TestFilePrimaryStructuralChurnAmplification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if reopened.Len() != rows {
+	if reopened.Len() != uint64(rows) {
 		t.Fatalf("reopened rows = %d, want %d", reopened.Len(), rows)
 	}
 	for _, index := range []int{0, rows / 3, rows / 2, rows - 1} {
-		key := keys[index]
-		got, found, readErr := reopened.AppendRaw(nil, []byte(key))
-		if readErr != nil || !found || !bytes.Equal(got, values[key]) {
+		key := appendStructuralAmplificationKey(nil, index)
+		want := structuralAmplificationValue(index)
+		got, found, readErr := reopened.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(got, want) {
 			t.Fatalf("reopened row %d = %q,%v,%v", index, got, found, readErr)
 		}
 	}
+}
+
+func appendStructuralAmplificationKey(dst []byte, index int) []byte {
+	return fmt.Appendf(dst, "row-%08d", index)
 }
 
 func structuralAmplificationValue(index int) []byte {
