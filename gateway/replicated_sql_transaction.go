@@ -713,5 +713,7 @@ func replicatedSQLRelationBatch(
 func sameReplicatedSQLRoute(left, right ReplicatedRoute) bool {
 	return left.Distribution == right.Distribution && left.Shard == right.Shard &&
 		left.Group == right.Group && left.AllocationGeneration == right.AllocationGeneration &&
-		left.Command == right.Command
+		left.Command == right.Command && left.RangeIdentity == right.RangeIdentity &&
+		left.LineageDigest == right.LineageDigest &&
+		left.ForwardingRuleDigest == right.ForwardingRuleDigest
 }
