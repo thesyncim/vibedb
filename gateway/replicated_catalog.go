@@ -12,9 +12,9 @@ import (
 	queryplanner "github.com/thesyncim/vibedb/planner"
 )
 
-// ServingReplicaCount is the only replicated topology served by this first
-// current native vertical. Learners and joint membership need their own completed
-// lifecycle before this catalog accepts any transitional shape.
+// ServingReplicaCount is the only public data topology served by this native
+// vertical. A single enrolled membership target is retained separately and
+// never widens the serving route.
 const ServingReplicaCount = 3
 
 // ReplicatedReplicaDescriptor binds one Raft member ID to the endpoint whose
@@ -39,16 +39,21 @@ type ReplicatedShardDescriptor struct {
 	AllocationGeneration distribution.ShardAllocationGeneration
 	Command              raftservice.CommandFence
 	Replicas             []ReplicatedReplicaDescriptor
+	// EnrolledTarget is the one authenticated replacement endpoint that may
+	// participate in membership control. It is never included in the public
+	// data route until a later catalog cut makes it one of Replicas.
+	EnrolledTarget *ReplicatedReplicaDescriptor
 }
 
 type replicatedCatalogShard struct {
-	group        raftmember.GroupKey
-	allocation   distribution.ShardAllocationGeneration
-	command      raftservice.CommandFence
-	replicaBase  uint32
-	manifest     uint32
-	shard        uint32
-	replicaCount uint8
+	group             raftmember.GroupKey
+	allocation        distribution.ShardAllocationGeneration
+	command           raftservice.CommandFence
+	replicaBase       uint32
+	manifest          uint32
+	shard             uint32
+	replicaCount      uint8
+	hasEnrolledTarget bool
 }
 
 type unresolvedReplicatedCatalogShard struct {
@@ -105,7 +110,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 	descriptors []ReplicatedShardDescriptor,
 ) error {
 	if snapshot == nil || uint64(len(descriptors)) > uint64(^uint32(0)) ||
-		len(descriptors) > maxCatalogBytes/ServingReplicaCount {
+		len(descriptors) > maxCatalogBytes/(ServingReplicaCount+1) {
 		return &CatalogError{Reason: "replicated shard directory exceeds its bound"}
 	}
 	if len(descriptors) == 0 {
@@ -176,6 +181,31 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 				}
 			}
 		}
+		if target := descriptor.EnrolledTarget; target != nil {
+			address, endpointExists := snapshot.endpoints[target.Endpoint]
+			nativeAddress, nativeExists := snapshot.endpoints[target.NativeEndpoint]
+			controlAddress, controlExists := snapshot.endpoints[target.ControlEndpoint]
+			if target.Member == 0 || target.Node == (rafttransport.NodeID{}) ||
+				target.StoreID == ([16]byte{}) || target.NodeIncarnation == 0 ||
+				target.Endpoint == "" || target.NativeEndpoint == "" || target.ControlEndpoint == "" ||
+				target.NativeEndpoint == target.Endpoint || target.ControlEndpoint == target.Endpoint ||
+				target.ControlEndpoint == target.NativeEndpoint || !endpointExists || !nativeExists ||
+				!controlExists || address == "" || nativeAddress == "" || controlAddress == "" ||
+				address == nativeAddress || address == controlAddress || nativeAddress == controlAddress {
+				return &CatalogError{Reason: fmt.Sprintf(
+					"replicated shard %q/%q has an invalid enrolled membership target",
+					descriptor.Distribution, descriptor.Shard,
+				)}
+			}
+			for _, replica := range descriptor.Replicas {
+				if replica.Member == target.Member || replica.Node == target.Node ||
+					replica.StoreID == target.StoreID || replica.Endpoint == target.Endpoint ||
+					replica.NativeEndpoint == target.NativeEndpoint ||
+					replica.ControlEndpoint == target.ControlEndpoint {
+					return &CatalogError{Reason: "enrolled membership target repeats a serving identity or endpoint"}
+				}
+			}
+		}
 		unresolved[ordinal] = unresolvedReplicatedCatalogShard{
 			descriptor: descriptor, manifest: uint32(manifestOrdinal), shard: uint32(shardOrdinal),
 		}
@@ -186,7 +216,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 		}
 		return int(left.shard) - int(right.shard)
 	})
-	replicas := make([]ReplicatedEndpoint, 0, len(unresolved)*ServingReplicaCount)
+	replicas := make([]ReplicatedEndpoint, 0, len(unresolved)*(ServingReplicaCount+1))
 	shards := make([]replicatedCatalogShard, len(unresolved))
 	for ordinal := range unresolved {
 		entry := &unresolved[ordinal]
@@ -195,17 +225,32 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			replicas = append(replicas, ReplicatedEndpoint{
 				Member: replica.Member, Node: replica.Node, StoreID: replica.StoreID,
 				NodeIncarnation: replica.NodeIncarnation,
+				Endpoint:        string(replica.Endpoint),
+				DataAddress:     snapshot.endpoints[replica.Endpoint],
 				NativeEndpoint:  string(replica.NativeEndpoint),
 				Address:         snapshot.endpoints[replica.NativeEndpoint],
 				ControlEndpoint: string(replica.ControlEndpoint),
 				ControlAddress:  snapshot.endpoints[replica.ControlEndpoint],
 			})
 		}
+		if target := entry.descriptor.EnrolledTarget; target != nil {
+			replicas = append(replicas, ReplicatedEndpoint{
+				Member: target.Member, Node: target.Node, StoreID: target.StoreID,
+				NodeIncarnation: target.NodeIncarnation,
+				Endpoint:        string(target.Endpoint),
+				DataAddress:     snapshot.endpoints[target.Endpoint],
+				NativeEndpoint:  string(target.NativeEndpoint),
+				Address:         snapshot.endpoints[target.NativeEndpoint],
+				ControlEndpoint: string(target.ControlEndpoint),
+				ControlAddress:  snapshot.endpoints[target.ControlEndpoint],
+			})
+		}
 		shards[ordinal] = replicatedCatalogShard{
 			group: entry.descriptor.Group, allocation: entry.descriptor.AllocationGeneration,
 			command:     entry.descriptor.Command,
 			replicaBase: uint32(base), manifest: entry.manifest, shard: entry.shard,
-			replicaCount: uint8(len(entry.descriptor.Replicas)),
+			replicaCount:      uint8(len(entry.descriptor.Replicas)),
+			hasEnrolledTarget: entry.descriptor.EnrolledTarget != nil,
 		}
 	}
 	snapshot.replicatedShards = shards
@@ -293,11 +338,51 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 		return ReplicatedRoute{}, false
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
+	dst = dst[:len(dst):len(dst)]
 	return ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
 		Command: entry.command, Replicas: dst,
 	}, true
+}
+
+// ResolveReplicatedMembershipRoute resolves the active serving RF3 together
+// with its optional enrolled replacement. The replacement is kept outside the
+// serving slice, so ordinary reads, writes, and transactions cannot select it.
+// Supplying capacity for ServingReplicaCount keeps a route without a target
+// allocation-free; the target itself is returned by value.
+func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
+	distributionName distribution.DistributionName,
+	shardID distribution.ShardID,
+	dst []ReplicatedEndpoint,
+) (ReplicatedMembershipRoute, bool) {
+	entry, ok := snapshot.replicatedShardAt(distributionName, shardID)
+	if !ok || int(entry.replicaCount) != ServingReplicaCount {
+		return ReplicatedMembershipRoute{}, false
+	}
+	end := int(entry.replicaBase) + int(entry.replicaCount)
+	targets := 0
+	if entry.hasEnrolledTarget {
+		targets = 1
+	}
+	if end+targets > len(snapshot.replicatedReplicas) {
+		return ReplicatedMembershipRoute{}, false
+	}
+	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):end]...)
+	dst = dst[:len(dst):len(dst)]
+	result := ReplicatedMembershipRoute{Serving: ReplicatedRoute{
+		Distribution: distributionName, Shard: shardID,
+		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
+		Command: entry.command, Replicas: dst,
+	}}
+	if targets != 0 {
+		result.EnrolledTarget = snapshot.replicatedReplicas[end]
+		result.HasEnrolledTarget = true
+	}
+	if !validReplicatedMembershipRoute(result) {
+		return ReplicatedMembershipRoute{}, false
+	}
+	return result, true
 }
 
 // ReplicatedMetadataBytes reports the retained compact RF3 directory and
@@ -344,6 +429,20 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 				),
 			}
 		}
+		if entry.hasEnrolledTarget {
+			targetOrdinal := int(entry.replicaBase) + int(entry.replicaCount)
+			if targetOrdinal >= len(snapshot.replicatedReplicas) {
+				return nil
+			}
+			target := snapshot.replicatedReplicas[targetOrdinal]
+			descriptor.EnrolledTarget = &ReplicatedReplicaDescriptor{
+				Member: target.Member, Node: target.Node, StoreID: target.StoreID,
+				NodeIncarnation: target.NodeIncarnation,
+				Endpoint:        distribution.EndpointID(target.Endpoint),
+				NativeEndpoint:  distribution.EndpointID(target.NativeEndpoint),
+				ControlEndpoint: distribution.EndpointID(target.ControlEndpoint),
+			}
+		}
 		descriptors[ordinal] = descriptor
 	}
 	return descriptors
@@ -386,10 +485,9 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 				oldManifest.Distribution(), oldMetadata.ID,
 			)}
 		}
-		// This first RF3 vertical has no learner/joint-consensus executor. Do
-		// not let a catalog reload imply that membership changed safely. A
-		// later membership state machine can replace this exact equality with
-		// a certified ReplicaSetVersion transition.
+		// Enrolling a non-serving target does not authorize a serving-roster
+		// change. Do not let a catalog reload imply that membership completed:
+		// an installed ReplicaSetVersion transition must certify that cut.
 		if candidate.command.ReplicaSetVersion != old.command.ReplicaSetVersion ||
 			!sameReplicatedCatalogRoster(current, old, next, candidate) {
 			return &CatalogError{Reason: fmt.Sprintf(
@@ -454,6 +552,7 @@ type persistedReplicatedShard struct {
 	RoutingVersion         uint64                       `json:"routing_version"`
 	RouteGeneration        uint64                       `json:"route_generation"`
 	Replicas               []persistedReplicatedReplica `json:"replicas"`
+	EnrolledTarget         *persistedReplicatedReplica  `json:"enrolled_target,omitempty"`
 }
 
 type persistedReplicatedReplica struct {
@@ -495,17 +594,24 @@ func persistedReplicatedDescriptors(
 			Replicas:        make([]persistedReplicatedReplica, len(descriptor.Replicas)),
 		}
 		for replicaOrdinal, replica := range descriptor.Replicas {
-			entry.Replicas[replicaOrdinal] = persistedReplicatedReplica{
-				Member: replica.Member, Node: hex.EncodeToString(replica.Node[:]),
-				StoreID:         hex.EncodeToString(replica.StoreID[:]),
-				NodeIncarnation: replica.NodeIncarnation, Endpoint: string(replica.Endpoint),
-				NativeEndpoint:  string(replica.NativeEndpoint),
-				ControlEndpoint: string(replica.ControlEndpoint),
-			}
+			entry.Replicas[replicaOrdinal] = persistReplicatedReplica(replica)
+		}
+		if descriptor.EnrolledTarget != nil {
+			target := persistReplicatedReplica(*descriptor.EnrolledTarget)
+			entry.EnrolledTarget = &target
 		}
 		persisted[ordinal] = entry
 	}
 	return persisted
+}
+
+func persistReplicatedReplica(replica ReplicatedReplicaDescriptor) persistedReplicatedReplica {
+	return persistedReplicatedReplica{
+		Member: replica.Member, Node: hex.EncodeToString(replica.Node[:]),
+		StoreID: hex.EncodeToString(replica.StoreID[:]), NodeIncarnation: replica.NodeIncarnation,
+		Endpoint: string(replica.Endpoint), NativeEndpoint: string(replica.NativeEndpoint),
+		ControlEndpoint: string(replica.ControlEndpoint),
+	}
 }
 
 func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor, error) {
@@ -553,25 +659,42 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 			Replicas: make([]ReplicatedReplicaDescriptor, len(persisted.Replicas)),
 		}
 		for replicaOrdinal, replica := range persisted.Replicas {
-			var node rafttransport.NodeID
-			var storeID [16]byte
-			if err := decodeFixed16Hex(replica.Node, (*[16]byte)(&node)); err != nil {
-				return nil, &CatalogError{Reason: "replicated replica node: " + err.Error()}
+			decoded, err := openPersistedReplicatedReplica(replica)
+			if err != nil {
+				return nil, err
 			}
-			if err := decodeFixed16Hex(replica.StoreID, &storeID); err != nil {
-				return nil, &CatalogError{Reason: "replicated replica store: " + err.Error()}
+			descriptor.Replicas[replicaOrdinal] = decoded
+		}
+		if persisted.EnrolledTarget != nil {
+			target, err := openPersistedReplicatedReplica(*persisted.EnrolledTarget)
+			if err != nil {
+				return nil, err
 			}
-			descriptor.Replicas[replicaOrdinal] = ReplicatedReplicaDescriptor{
-				Member: replica.Member, Node: node, StoreID: storeID,
-				NodeIncarnation: replica.NodeIncarnation,
-				Endpoint:        distribution.EndpointID(replica.Endpoint),
-				NativeEndpoint:  distribution.EndpointID(replica.NativeEndpoint),
-				ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
-			}
+			descriptor.EnrolledTarget = &target
 		}
 		descriptors[ordinal] = descriptor
 	}
 	return descriptors, nil
+}
+
+func openPersistedReplicatedReplica(
+	replica persistedReplicatedReplica,
+) (ReplicatedReplicaDescriptor, error) {
+	var node rafttransport.NodeID
+	var storeID [16]byte
+	if err := decodeFixed16Hex(replica.Node, (*[16]byte)(&node)); err != nil {
+		return ReplicatedReplicaDescriptor{}, &CatalogError{Reason: "replicated replica node: " + err.Error()}
+	}
+	if err := decodeFixed16Hex(replica.StoreID, &storeID); err != nil {
+		return ReplicatedReplicaDescriptor{}, &CatalogError{Reason: "replicated replica store: " + err.Error()}
+	}
+	return ReplicatedReplicaDescriptor{
+		Member: replica.Member, Node: node, StoreID: storeID,
+		NodeIncarnation: replica.NodeIncarnation,
+		Endpoint:        distribution.EndpointID(replica.Endpoint),
+		NativeEndpoint:  distribution.EndpointID(replica.NativeEndpoint),
+		ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
+	}, nil
 }
 
 func decodeFixed16Hex(encoded string, destination *[16]byte) error {
