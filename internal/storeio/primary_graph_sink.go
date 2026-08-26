@@ -41,14 +41,15 @@ type UnrootedPrimaryGraphSink struct {
 	storeID                                 [16]byte
 	generation, nextLogicalID, finalFileEnd uint64
 	scratch                                 []byte
-	active                                  bool
+	scratchUsed                             int
+	pendingBytes                            uint64
 }
 
 func NewUnrootedPrimaryGraphSink(writer *UnrootedGenerationWriter, storeID [16]byte, generation, nextLogicalID, finalFileEnd uint64, scratch []byte) (*UnrootedPrimaryGraphSink, error) {
 	if writer == nil || storeID == ([16]byte{}) || generation == 0 || nextLogicalID == 0 || finalFileEnd == 0 || len(scratch) < CommonPrimaryLeafMaxExtentBytes {
 		return nil, fmt.Errorf("%w: unrooted primary graph sink", ErrInvalidWrite)
 	}
-	return &UnrootedPrimaryGraphSink{writer: writer, storeID: storeID, generation: generation, nextLogicalID: nextLogicalID, finalFileEnd: finalFileEnd, scratch: scratch[:CommonPrimaryLeafMaxExtentBytes]}, nil
+	return &UnrootedPrimaryGraphSink{writer: writer, storeID: storeID, generation: generation, nextLogicalID: nextLogicalID, finalFileEnd: finalFileEnd, scratch: scratch}, nil
 }
 
 type unrootedPrimaryGraphPage struct {
@@ -60,31 +61,32 @@ type unrootedPrimaryGraphPage struct {
 func (p *unrootedPrimaryGraphPage) Bytes() []byte { return p.image }
 func (p *unrootedPrimaryGraphPage) Ref() PageRef  { return p.ref }
 func (p *unrootedPrimaryGraphPage) Stage() error {
-	if p == nil || p.owner == nil || !p.owner.active {
+	if p == nil || p.owner == nil || p.ref.Offset != p.owner.writer.reservation.Offset+p.owner.writer.written {
 		return ErrBatchState
 	}
 	err := p.owner.writer.Append(p.ref, p.image)
-	if err == nil {
-		p.owner.active = false
+	if err == nil && p.owner.writer.written == p.owner.pendingBytes {
+		p.owner.scratchUsed = 0
 	}
 	return err
 }
 
 func (s *UnrootedPrimaryGraphSink) AllocatePage(kind PageKind, length uint32, logicalID uint64) (PrimaryGraphBuildPage, error) {
-	if s == nil || s.active || length == 0 || int(length) > len(s.scratch) {
+	if s == nil || length == 0 || int(length) > len(s.scratch)-s.scratchUsed {
 		return nil, ErrBatchState
 	}
 	if logicalID == 0 {
 		logicalID = s.nextLogicalID
 		s.nextLogicalID++
 	}
-	ref := PageRef{Offset: s.writer.reservation.Offset + s.writer.written, LogicalID: logicalID, Generation: s.generation, Length: length, Kind: kind}
-	if uint64(length) > s.writer.reservation.Length-s.writer.written {
+	ref := PageRef{Offset: s.writer.reservation.Offset + s.pendingBytes, LogicalID: logicalID, Generation: s.generation, Length: length, Kind: kind}
+	if uint64(length) > s.writer.reservation.Length-s.pendingBytes {
 		return nil, ErrTooManyPages
 	}
-	image := s.scratch[:length]
+	image := s.scratch[s.scratchUsed : s.scratchUsed+int(length)]
 	clear(image)
-	s.active = true
+	s.scratchUsed += int(length)
+	s.pendingBytes += uint64(length)
 	return &unrootedPrimaryGraphPage{owner: s, ref: ref, image: image}, nil
 }
 func (s *UnrootedPrimaryGraphSink) StoreIdentity() [16]byte    { return s.storeID }

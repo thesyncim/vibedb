@@ -2,6 +2,7 @@ package storeio
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -77,8 +78,9 @@ func TestUnrootedPrimaryGraphSinkUsesOneBoundedPageBuffer(t *testing.T) {
 	if p.Ref().LogicalID != 100 || s.BuildNextLogicalID() != 101 {
 		t.Fatalf("dynamic identity = %d/%d", p.Ref().LogicalID, s.BuildNextLogicalID())
 	}
-	if _, err = s.AllocatePage(PageIndexPosting, 4096, 0); err == nil {
-		t.Fatal("second outstanding page accepted")
+	second, err := s.AllocatePage(PageIndexPosting, 4096, 0)
+	if err != nil || second.Ref().Offset != p.Ref().Offset+4096 {
+		t.Fatalf("bounded second page = %+v,%v", second, err)
 	}
 	payload, err := InitPage(p.Bytes(), PageHeader{StoreID: testStoreID, Generation: 9, LogicalID: p.Ref().LogicalID, PageSize: 4096, PayloadLength: 1, Kind: PageIndexPosting})
 	if err != nil {
@@ -91,7 +93,62 @@ func TestUnrootedPrimaryGraphSinkUsesOneBoundedPageBuffer(t *testing.T) {
 	if err = p.Stage(); err != nil {
 		t.Fatal(err)
 	}
-	if &scratch[0] != &p.Bytes()[0] || w.WrittenBytes() != 4096 {
+	payload, err = InitPage(second.Bytes(), PageHeader{StoreID: testStoreID, Generation: 9, LogicalID: second.Ref().LogicalID, PageSize: 4096, PayloadLength: 1, Kind: PageIndexPosting})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 8
+	if _, err = SealPage(second.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err = second.Stage(); err != nil {
+		t.Fatal(err)
+	}
+	if &scratch[0] != &p.Bytes()[0] || w.WrittenBytes() != 8192 {
 		t.Fatalf("scratch/write = %p/%p %d", &scratch[0], &p.Bytes()[0], w.WrittenBytes())
+	}
+}
+
+func TestPlannedPrimaryGraphEmitsIntoReservedSink(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "reserved-graph-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	records := make([]PrimaryGraphRecord, 512)
+	for i := range records {
+		records[i] = BorrowPrimaryGraphRecord([]byte(fmt.Sprintf("k-%04d", i)), []byte(`{"v":1}`))
+	}
+	plan, err := PlanPrimaryGraph(testStoreID, records, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := UnrootedGenerationReservation{Offset: 64 << 10, Length: 16 << 20, FirstLogicalID: PrimaryFirstDynamicLogicalID, LogicalIDCount: 1 << 20}
+	w, err := NewUnrootedGenerationWriter(f, r, testStoreID, 9, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewUnrootedPrimaryGraphSink(w, testStoreID, 9, PrimaryFirstDynamicLogicalID, r.Offset+r.Length, make([]byte, 512<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := BuildPlannedPrimaryGraphToSink(s, &plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(f, PageCacheOptions{PageSize: 4096, MaxPageSize: 64 << 10, ResidentBytes: 2 << 20, StoreID: testStoreID, ReadConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	router, err := BuildResidentPrimaryRouter(cache, root, GlobalTabletCatalogBounds{StoreID: testStoreID, SelectedRootGeneration: 9, FileEnd: r.Offset + r.Length, NextLogicalID: s.BuildNextLogicalID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if router.Len() == 0 {
+		t.Fatal("reserved graph has no routes")
 	}
 }
