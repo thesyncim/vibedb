@@ -277,7 +277,11 @@ type DurableRequestLedgerEntry struct {
 	AckDigest           replication.Digest
 	AckTerminalRevision uint64
 	AckResultDigest     replication.Digest
-	AckToken            DurableRequestAckToken
+	// AckToken is present only while Terminal retains the raw possession
+	// capability. Acked tombstones retain AckTokenDigest instead, so a reopened
+	// ledger never has to reconstruct secret bytes it deliberately reclaimed.
+	AckToken       DurableRequestAckToken
+	AckTokenDigest replication.Digest
 	// AckPlanRoot and AckTerminalContractDigest are the compact anti-replay
 	// witnesses retained after the plan/result bodies are reclaimed. They let
 	// Execute reject a changed lowered program even though ACK intentionally
@@ -467,6 +471,10 @@ type DurableRequestOutcome struct {
 // only a request ID/digest is insufficient to discard its result or release
 // its pins.
 type DurableRequestAckToken [32]byte
+
+func durableRequestAckTokenDigest(token DurableRequestAckToken) replication.Digest {
+	return replication.Digest(requestledger.AckTokenDigest(requestledger.AckToken(token)))
+}
 
 type DurableRequestExecutorOptions struct {
 	Topology       *DurableRequestLedgerTopologyHolder

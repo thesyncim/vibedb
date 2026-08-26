@@ -450,7 +450,8 @@ func (ledger *durableFaultMemoryLedger) Acknowledge(
 	}
 	if stored.entry.State == DurableRequestLedgerAcked {
 		if stored.entry.AckTerminalRevision != terminalRevision ||
-			stored.entry.AckResultDigest != resultDigest || stored.entry.AckToken != token {
+			stored.entry.AckResultDigest != resultDigest ||
+			stored.entry.AckTokenDigest != durableRequestAckTokenDigest(token) {
 			return DurableRequestLedgerEntry{}, ErrDurableRequestConflict
 		}
 		return cloneDurableFaultEntry(stored.entry), nil
@@ -475,8 +476,10 @@ func (ledger *durableFaultMemoryLedger) Acknowledge(
 	stored.entry.AckDigest = ack
 	stored.entry.AckTerminalRevision = terminalRevision
 	stored.entry.AckResultDigest = resultDigest
+	stored.entry.AckTokenDigest = durableRequestAckTokenDigest(token)
 	stored.entry.AckPlanRoot = stored.entry.Plan.Root
 	stored.entry.AckTerminalContractDigest = stored.entry.Plan.Contract.TerminalContractDigest
+	stored.entry.AckToken = DurableRequestAckToken{}
 	stored.entry.Plan = DurableRequestPlanDescriptor{}
 	stored.entry.Pending = DurableRequestPending{}
 	stored.entry.Progress = nil
@@ -1592,7 +1595,9 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 	}
 	if entry.State != DurableRequestLedgerAcked || entry.Digest != request.Program.RequestDigest ||
 		entry.AckDigest == (replication.Digest{}) || entry.AckTerminalRevision == 0 ||
-		entry.AckResultDigest == (replication.Digest{}) || entry.AckToken != outcome.AckToken {
+		entry.AckResultDigest == (replication.Digest{}) ||
+		entry.AckTokenDigest != durableRequestAckTokenDigest(outcome.AckToken) ||
+		entry.AckToken != (DurableRequestAckToken{}) {
 		t.Fatalf("invalid ACK tombstone: %+v", entry)
 	}
 	if entry.Plan.TotalBytes != 0 || entry.Plan.PageCount != 0 ||

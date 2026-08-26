@@ -144,7 +144,8 @@ func (executor *DurableRequestExecutor) Acknowledge(
 	if entry.State == DurableRequestLedgerAcked {
 		if entry.AckDigest == (replication.Digest{}) || entry.AckTerminalRevision == 0 ||
 			entry.AckResultDigest == (replication.Digest{}) ||
-			entry.AckToken != token {
+			entry.AckTokenDigest == (replication.Digest{}) ||
+			entry.AckTokenDigest != durableRequestAckTokenDigest(token) {
 			return ErrDurableRequestConflict
 		}
 		return nil
@@ -168,7 +169,7 @@ func (executor *DurableRequestExecutor) Acknowledge(
 	if err != nil || entry.State != DurableRequestLedgerAcked ||
 		entry.Digest != digest || entry.AckDigest == (replication.Digest{}) ||
 		entry.AckTerminalRevision != terminalRevision || entry.AckResultDigest != resultDigest ||
-		entry.AckToken != token {
+		entry.AckTokenDigest != durableRequestAckTokenDigest(token) {
 		return errors.Join(err, ErrDurableRequestUnresolved)
 	}
 	return nil
