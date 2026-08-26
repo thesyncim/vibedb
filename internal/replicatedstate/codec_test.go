@@ -144,6 +144,61 @@ func TestStateAuthorityBindingCountBoundsSessionAndApplied(t *testing.T) {
 	}
 }
 
+func TestStateTransactionAccountingRoundTripBoundsAndCompactGeometry(t *testing.T) {
+	compact, err := AppendState(nil, codecState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint16(compact[12:14]); got != stateHeaderBytes {
+		t.Fatalf("empty transaction header = %d, want %d", got, stateHeaderBytes)
+	}
+	state := codecState()
+	state.Applied = 3
+	state.LastTerm = 2
+	state.LastKind = RecordNormal
+	state.LastEntryDigest = sha256.Sum256([]byte("transaction-accounting"))
+	state.TransactionControlCount = 1
+	state.ActiveTransactionCount = 1
+	state.TransactionPayloadRows = 2
+	state.TransactionIntentRows = 1
+	state.TransactionResidentBytes = 4096
+	encoded, err := AppendState(nil, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != len(compact)+(stateTransactionHeaderBytes-stateHeaderBytes) ||
+		binary.LittleEndian.Uint16(encoded[12:14]) != stateTransactionHeaderBytes {
+		t.Fatalf("transaction envelope geometry compact=%d extended=%d", len(compact), len(encoded))
+	}
+	decoded, err := OpenState(encoded)
+	if err != nil || !equalState(decoded, state) {
+		t.Fatalf("transaction state round trip=%+v err=%v", decoded, err)
+	}
+	for name, mutate := range map[string]func(*State){
+		"active exceeds controls": func(s *State) { s.ActiveTransactionCount = 2 },
+		"controls exceed applies": func(s *State) { s.TransactionControlCount = s.Applied },
+		"missing resident bytes":  func(s *State) { s.TransactionResidentBytes = 0 },
+		"resident overflow": func(s *State) {
+			s.TransactionResidentBytes = MaxTransactionResidentBytes + 1
+		},
+		"rows exceed bytes": func(s *State) { s.TransactionPayloadRows = s.TransactionResidentBytes + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := state
+			mutate(&bad)
+			if _, appendErr := AppendState(nil, bad); !errors.Is(appendErr, ErrStateCorrupt) {
+				t.Fatalf("error=%v", appendErr)
+			}
+		})
+	}
+	emptyExtended := bytes.Clone(encoded)
+	clear(emptyExtended[376:416])
+	sealRecord(emptyExtended, stateChecksumDomain)
+	if _, err := OpenState(emptyExtended); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("accepted noncanonical empty extension: %v", err)
+	}
+}
+
 func TestStateEnvelopeBoundCoversMaximumConfiguration(t *testing.T) {
 	state := codecState()
 	const firstMember = uint64(math.MaxUint64 - 1024)
@@ -291,14 +346,15 @@ func TestSessionCodecRoundTripAndFixedGrammar(t *testing.T) {
 		ResultApplied != 1 || ResultStaleFence != 2 || ResultUnknownRelation != 3 ||
 		ResultInvalidDocument != 4 || ResultTargetBound != 5 || ResultWrongShard != 6 ||
 		ResultSessionRetired != 7 || ResultSessionOpened != 8 ||
-		ResultSessionRenewed != 9 || ResultSessionRevoked != 10 {
-		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+		ResultSessionRenewed != 9 || ResultSessionRevoked != 10 ||
+		ResultIndexConflict != 11 || ResultIntentBusy != 12 {
+		t.Fatalf("durable validation/result grammar drifted: profiles=%d,%d format=%d codes=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 			ValidationOpaqueBinary, ValidationDeterministicMutation,
 			ResultFormatMutation,
 			ResultApplied, ResultStaleFence, ResultUnknownRelation,
 			ResultInvalidDocument, ResultTargetBound, ResultWrongShard,
 			ResultSessionRetired, ResultSessionOpened, ResultSessionRenewed,
-			ResultSessionRevoked)
+			ResultSessionRevoked, ResultIndexConflict, ResultIntentBusy)
 	}
 	record := sessionCodecRecord()
 	encoded, err := AppendSessionRecord(nil, record)

@@ -263,6 +263,29 @@ func (m *Machine) ApplyNormal(meta raftmodel.ApplyMeta, data []byte) (raftmodel.
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
+	if command.Kind() == replication.CommandTransaction {
+		transactionPlan, planErr := m.planTransactionCommand(
+			command, meta.Index, m.state,
+			pointSnapshot{value: systemSnapshot}, relationSnapshots,
+		)
+		err = errors.Join(planErr, m.applyCut.Close())
+		if err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		next := m.nextState(meta, RecordNormal, digest)
+		if err := applyCommandPlanToState(&next, transactionPlan.command); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		if err := applyTransactionStateDelta(&next, transactionPlan.delta); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		if err := m.persistTransitionRows(
+			next, transactionPlan.command.changes, transactionPlan.command, transactionPlan.rows,
+		); err != nil {
+			return raftmodel.Publication{}, m.fail(err)
+		}
+		return clonePublication(m.publication), nil
+	}
 	plan, planErr := m.planBundleCommand(
 		command, meta.Index, m.state,
 		pointSnapshot{value: systemSnapshot}, relationSnapshots,
@@ -573,6 +596,39 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if err != nil {
 		return m.fail(err)
 	}
+	if command.Kind() == replication.CommandTransaction {
+		transactionPlan, planErr := m.planTransactionCommand(
+			command, m.state.Applied+1, m.state,
+			pointSnapshot{value: systemSnapshot}, relationSnapshots,
+		)
+		closeErr := m.applyCut.Close()
+		if planErr != nil || closeErr != nil {
+			joined := errors.Join(planErr, closeErr)
+			if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+				return planErr
+			}
+			return m.fail(joined)
+		}
+		if transactionPlan.command.refusal != nil {
+			return transactionPlan.command.refusal
+		}
+		if transactionPlan.command.resultCode == ResultStaleFence {
+			return ErrStaleCommand
+		}
+		if transactionPlan.command.resultCode != ResultApplied &&
+			transactionPlan.command.resultCode != ResultTransactionConflict &&
+			transactionPlan.command.resultCode != ResultIndexConflict {
+			return ErrAdmissionBound
+		}
+		next, stateErr := m.hypotheticalTransactionState(command, transactionPlan)
+		if stateErr != nil {
+			return m.fail(stateErr)
+		}
+		return m.checkTransitionCapacityWithCaptureRows(
+			next, transactionPlan.command.changes, transactionPlan.command, 0,
+			transactionPlan.rows,
+		)
+	}
 	plan, planErr := m.planBundleCommand(
 		command, m.state.Applied+1, m.state,
 		pointSnapshot{value: systemSnapshot}, relationSnapshots,
@@ -605,11 +661,28 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultSessionRevoked:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+	case plan.resultCode == ResultIntentBusy:
+		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode != ResultApplied:
 		return ErrAdmissionBound
 	default:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), plan.changes, plan)
 	}
+}
+
+func (m *Machine) hypotheticalTransactionState(
+	command replication.CommandView,
+	plan transactionCommandPlan,
+) (State, error) {
+	meta := raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal}
+	next := m.nextState(meta, RecordNormal, normalEntryDigest(meta, command.Bytes()))
+	if err := applyCommandPlanToState(&next, plan.command); err != nil {
+		return State{}, err
+	}
+	if err := applyTransactionStateDelta(&next, plan.delta); err != nil {
+		return State{}, err
+	}
+	return next, nil
 }
 
 func (m *Machine) hypotheticalState(command replication.CommandView, plan commandPlan) State {
@@ -675,8 +748,13 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		SessionCount: m.state.SessionCount, SessionSlotCount: m.state.SessionSlotCount,
-		SessionEpochHighWater: m.state.SessionEpochHighWater,
-		AuthorityBindingCount: m.state.AuthorityBindingCount,
+		SessionEpochHighWater:    m.state.SessionEpochHighWater,
+		AuthorityBindingCount:    m.state.AuthorityBindingCount,
+		TransactionControlCount:  m.state.TransactionControlCount,
+		ActiveTransactionCount:   m.state.ActiveTransactionCount,
+		TransactionPayloadRows:   m.state.TransactionPayloadRows,
+		TransactionIntentRows:    m.state.TransactionIntentRows,
+		TransactionResidentBytes: m.state.TransactionResidentBytes,
 	}
 }
 
@@ -1036,6 +1114,14 @@ func (m *Machine) planBundleCommand(
 		relationBatches := command.RelationBatches()
 		for relationBatches.Next() {
 			batch := relationBatches.Batch()
+			blocked, blockErr := transactionBatchBlocked(systemSnapshot, batch)
+			if blockErr != nil {
+				return commandPlan{}, blockErr
+			}
+			if blocked {
+				plan.resultCode = ResultIntentBusy
+				break
+			}
 			ordinal := int(batch.Relation) - 1
 			if ordinal < 0 || ordinal >= len(m.relations) {
 				plan.resultCode = ResultUnknownRelation
@@ -1976,6 +2062,15 @@ func (m *Machine) persistTransition(
 	changes []finalMutation,
 	plan commandPlan,
 ) error {
+	return m.persistTransitionRows(next, changes, plan, nil)
+}
+
+func (m *Machine) persistTransitionRows(
+	next State,
+	changes []finalMutation,
+	plan commandPlan,
+	transactionRows []transactionRowMutation,
+) error {
 	defer m.releaseCaptureChanges()
 	var transition CapturedTransition
 	var captureRecord []byte
@@ -1999,8 +2094,8 @@ func (m *Machine) persistTransition(
 	if err != nil {
 		return err
 	}
-	if err := m.checkTransitionCapacityWithCapture(
-		next, changes, plan, len(captureRecord),
+	if err := m.checkTransitionCapacityWithCaptureRows(
+		next, changes, plan, len(captureRecord), transactionRows,
 	); err != nil {
 		return err
 	}
@@ -2017,6 +2112,7 @@ func (m *Machine) persistTransition(
 	if plan.deleteSession {
 		systemDocuments += 1 + int(plan.deleteSlots)
 	}
+	systemDocuments += len(transactionRows)
 	m.transitionMembers = m.transitionMembers[:0]
 	m.transitionMembers = append(m.transitionMembers, durable.NamedCollection{
 		Name: systemCollectionName, Collection: m.system.Collection,
@@ -2071,6 +2167,17 @@ func (m *Machine) persistTransition(
 				if err := systemBatch.Delete(key[:]); err != nil {
 					return err
 				}
+			}
+		}
+		for i := range transactionRows {
+			row := &transactionRows[i]
+			if row.delete {
+				err = systemBatch.Delete(row.key)
+			} else {
+				err = systemBatch.Put(row.key, row.value)
+			}
+			if err != nil {
+				return err
 			}
 		}
 		if len(captureRecord) != 0 {
@@ -2208,6 +2315,16 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 	plan commandPlan,
 	captureBytes int,
 ) error {
+	return m.checkTransitionCapacityWithCaptureRows(next, changes, plan, captureBytes, nil)
+}
+
+func (m *Machine) checkTransitionCapacityWithCaptureRows(
+	next State,
+	changes []finalMutation,
+	plan commandPlan,
+	captureBytes int,
+	transactionRows []transactionRowMutation,
+) error {
 	stateEnvelope, err := AppendState(nil, next)
 	if err != nil {
 		return err
@@ -2248,6 +2365,16 @@ func (m *Machine) checkTransitionCapacityWithCapture(
 		}
 		stateBytes += deleteBytes
 		systemDocs += 1 + int(plan.deleteSlots)
+	}
+	for i := range transactionRows {
+		row := &transactionRows[i]
+		if len(row.key) == 0 || (!row.delete && (len(row.value) == 0 ||
+			len(row.value) > m.system.Limits.MaxDocumentBytes)) ||
+			stateBytes > math.MaxInt-len(row.key)-len(row.value) {
+			return ErrAdmissionBound
+		}
+		stateBytes += len(row.key) + len(row.value)
+		systemDocs++
 	}
 	if len(stateEnvelope) > m.system.Limits.MaxDocumentBytes ||
 		systemDocs > m.system.Limits.MaxDistinctMutations ||

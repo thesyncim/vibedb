@@ -346,7 +346,7 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [2 + 18*4]byte
+	var grammar [2 + 19*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	for index, code := range [...]uint32{
 		ResultApplied,
@@ -360,6 +360,7 @@ func bundleApplyContractDigest(
 		ResultSessionRenewed,
 		ResultSessionRevoked,
 		ResultIndexConflict,
+		ResultIntentBusy,
 		MaxDistinctMutations,
 		uint32(replication.MutationPut),
 		uint32(replication.MutationDelete),

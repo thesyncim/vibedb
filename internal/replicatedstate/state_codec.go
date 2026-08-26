@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	stateCodecFormat  = uint16(1)
-	stateHeaderBytes  = 376
-	recordChecksumLen = sha256.Size
+	stateCodecFormat            = uint16(1)
+	stateHeaderBytes            = 376
+	stateTransactionHeaderBytes = 416
+	recordChecksumLen           = sha256.Size
 )
 
 var (
@@ -66,6 +67,13 @@ type State struct {
 	// AuthorityBindingCount is the bounded number of class-independent stable
 	// identities whose authority survives session release.
 	AuthorityBindingCount uint64
+	// Transaction counters authenticate the complete hidden transaction image.
+	// The zero tuple retains the original compact state-envelope geometry.
+	TransactionControlCount  uint64
+	ActiveTransactionCount   uint64
+	TransactionPayloadRows   uint64
+	TransactionIntentRows    uint64
+	TransactionResidentBytes uint64
 }
 
 // AppendState appends one strict binary State envelope. On error dst is
@@ -80,7 +88,11 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	if err != nil {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
-	total := stateHeaderBytes + len(state.Binding.Distribution) +
+	headerBytes := stateHeaderBytes
+	if stateHasTransactions(state) {
+		headerBytes = stateTransactionHeaderBytes
+	}
+	total := headerBytes + len(state.Binding.Distribution) +
 		len(state.Binding.Shard) + len(conf) + recordChecksumLen
 	if total > MaxStateEnvelopeBytes {
 		return dst, fmt.Errorf("%w: state envelope %d", ErrAdmissionBound, total)
@@ -97,9 +109,9 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint16(frame[8:10], stateCodecFormat)
 	frame[10] = byte(state.LastKind)
 	frame[11] = byte(state.LastEntryType)
-	binary.LittleEndian.PutUint16(frame[12:14], stateHeaderBytes)
+	binary.LittleEndian.PutUint16(frame[12:14], uint16(headerBytes))
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(total))
-	binary.LittleEndian.PutUint32(frame[20:24], uint32(total-stateHeaderBytes-recordChecksumLen))
+	binary.LittleEndian.PutUint32(frame[20:24], uint32(total-headerBytes-recordChecksumLen))
 	binary.LittleEndian.PutUint64(frame[24:32], state.Applied)
 	binary.LittleEndian.PutUint64(frame[32:40], state.LastTerm)
 	binary.LittleEndian.PutUint64(frame[40:48], state.ReplicaSetVersion)
@@ -127,7 +139,14 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	binary.LittleEndian.PutUint64(frame[352:360], state.SessionSlotCount)
 	binary.LittleEndian.PutUint64(frame[360:368], state.SessionEpochHighWater)
 	binary.LittleEndian.PutUint64(frame[368:376], state.AuthorityBindingCount)
-	cursor := stateHeaderBytes
+	if headerBytes == stateTransactionHeaderBytes {
+		binary.LittleEndian.PutUint64(frame[376:384], state.TransactionControlCount)
+		binary.LittleEndian.PutUint64(frame[384:392], state.ActiveTransactionCount)
+		binary.LittleEndian.PutUint64(frame[392:400], state.TransactionPayloadRows)
+		binary.LittleEndian.PutUint64(frame[400:408], state.TransactionIntentRows)
+		binary.LittleEndian.PutUint64(frame[408:416], state.TransactionResidentBytes)
+	}
+	cursor := headerBytes
 	cursor += copy(frame[cursor:], state.Binding.Distribution)
 	cursor += copy(frame[cursor:], state.Binding.Shard)
 	cursor += copy(frame[cursor:], conf)
@@ -140,16 +159,17 @@ func OpenState(src []byte) (State, error) {
 	if len(src) < stateHeaderBytes+recordChecksumLen || len(src) > MaxStateEnvelopeBytes {
 		return State{}, fmt.Errorf("%w: state length", ErrStateCorrupt)
 	}
+	headerBytes := int(binary.LittleEndian.Uint16(src[12:14]))
 	if !bytes.Equal(src[0:8], stateMagic[:]) ||
 		binary.LittleEndian.Uint16(src[8:10]) != stateCodecFormat ||
-		binary.LittleEndian.Uint16(src[12:14]) != stateHeaderBytes ||
+		(headerBytes != stateHeaderBytes && headerBytes != stateTransactionHeaderBytes) ||
 		binary.LittleEndian.Uint16(src[14:16]) != 0 {
 		return State{}, fmt.Errorf("%w: state header", ErrStateCorrupt)
 	}
 	total64 := uint64(binary.LittleEndian.Uint32(src[16:20]))
 	body64 := uint64(binary.LittleEndian.Uint32(src[20:24]))
 	if total64 != uint64(len(src)) ||
-		body64 != uint64(len(src)-stateHeaderBytes-recordChecksumLen) ||
+		body64 != uint64(len(src)-headerBytes-recordChecksumLen) ||
 		!verifyRecord(src, stateChecksumDomain) {
 		return State{}, fmt.Errorf("%w: state size or checksum", ErrStateCorrupt)
 	}
@@ -189,7 +209,17 @@ func OpenState(src []byte) (State, error) {
 	state.SessionSlotCount = binary.LittleEndian.Uint64(src[352:360])
 	state.SessionEpochHighWater = binary.LittleEndian.Uint64(src[360:368])
 	state.AuthorityBindingCount = binary.LittleEndian.Uint64(src[368:376])
-	cursor := stateHeaderBytes
+	if headerBytes == stateTransactionHeaderBytes {
+		state.TransactionControlCount = binary.LittleEndian.Uint64(src[376:384])
+		state.ActiveTransactionCount = binary.LittleEndian.Uint64(src[384:392])
+		state.TransactionPayloadRows = binary.LittleEndian.Uint64(src[392:400])
+		state.TransactionIntentRows = binary.LittleEndian.Uint64(src[400:408])
+		state.TransactionResidentBytes = binary.LittleEndian.Uint64(src[408:416])
+		if !stateHasTransactions(state) {
+			return State{}, fmt.Errorf("%w: noncanonical empty transaction extension", ErrStateCorrupt)
+		}
+	}
+	cursor := headerBytes
 	state.Binding.Distribution = string(src[cursor : cursor+distributionLen])
 	cursor += distributionLen
 	state.Binding.Shard = string(src[cursor : cursor+shardLen])
@@ -229,6 +259,9 @@ func validateState(state State) error {
 		state.SnapshotBaseDigest == ([32]byte{}) {
 		return fmt.Errorf("%w: invalid state scalar", ErrStateCorrupt)
 	}
+	if !validStateTransactionCounters(state) {
+		return fmt.Errorf("%w: invalid transaction counters", ErrStateCorrupt)
+	}
 	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
 		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
 	}
@@ -240,7 +273,7 @@ func validateState(state State) error {
 		if state.LastEntryType != pb.EntryNormal || state.Applied != 1 ||
 			state.LastTerm != 1 || state.ReplicaSetVersion != 1 || state.SessionCount != 0 ||
 			state.SessionSlotCount != 0 || state.SessionEpochHighWater != 0 ||
-			state.AuthorityBindingCount != 0 ||
+			state.AuthorityBindingCount != 0 || stateHasTransactions(state) ||
 			state.LastEntryDigest != state.BootstrapDigest {
 			return fmt.Errorf("%w: invalid static snapshot state", ErrStateCorrupt)
 		}
@@ -339,7 +372,56 @@ func equalState(left, right State) bool {
 		left.SessionSlotCount == right.SessionSlotCount &&
 		left.SessionEpochHighWater == right.SessionEpochHighWater &&
 		left.AuthorityBindingCount == right.AuthorityBindingCount &&
+		left.TransactionControlCount == right.TransactionControlCount &&
+		left.ActiveTransactionCount == right.ActiveTransactionCount &&
+		left.TransactionPayloadRows == right.TransactionPayloadRows &&
+		left.TransactionIntentRows == right.TransactionIntentRows &&
+		left.TransactionResidentBytes == right.TransactionResidentBytes &&
 		proto.Equal(left.ConfState, right.ConfState)
+}
+
+func stateHasTransactions(state State) bool {
+	return state.TransactionControlCount != 0 || state.ActiveTransactionCount != 0 ||
+		state.TransactionPayloadRows != 0 || state.TransactionIntentRows != 0 ||
+		state.TransactionResidentBytes != 0
+}
+
+func validStateTransactionCounters(state State) bool {
+	if !stateHasTransactions(state) {
+		return true
+	}
+	if state.TransactionControlCount == 0 || state.TransactionControlCount > state.Applied-1 ||
+		state.TransactionControlCount > MaxRetainedTransactions ||
+		state.ActiveTransactionCount > state.TransactionControlCount ||
+		state.TransactionResidentBytes == 0 ||
+		state.TransactionPayloadRows > state.TransactionResidentBytes ||
+		state.TransactionIntentRows > state.TransactionResidentBytes ||
+		state.TransactionPayloadRows > math.MaxUint64-state.TransactionIntentRows {
+		return false
+	}
+	minimumControlBytes := uint64(transactionControlStorageKeyBytes +
+		transactionControlHeaderBytes + recordChecksumLen)
+	if state.TransactionControlCount > math.MaxUint64/minimumControlBytes ||
+		state.TransactionResidentBytes < state.TransactionControlCount*minimumControlBytes {
+		return false
+	}
+	return state.TransactionControlCount <= math.MaxUint64/MaxTransactionResidentBytes &&
+		state.TransactionResidentBytes <= state.TransactionControlCount*MaxTransactionResidentBytes
+}
+
+func stateSystemRowCount(state State) (uint64, bool) {
+	values := [...]uint64{
+		1, state.SessionCount, state.SessionSlotCount, state.AuthorityBindingCount,
+		state.TransactionControlCount, state.TransactionPayloadRows, state.TransactionIntentRows,
+	}
+	var total uint64
+	for _, value := range values {
+		if total > math.MaxUint64-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }
 
 func equalStateExceptSnapshotBaseDigest(left, right State) bool {

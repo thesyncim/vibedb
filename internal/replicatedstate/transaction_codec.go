@@ -97,6 +97,9 @@ type TransactionControl struct {
 	PayloadDigest distributedtxn.Digest
 	PayloadBytes  uint64
 	PayloadCount  uint64
+	// PayloadRelationCount is zero for coordinators and the exact number of
+	// packed native relation rows for a participant stage.
+	PayloadRelationCount uint16
 
 	CoordinatorGroup            replication.ID128
 	CoordinatorShardIncarnation replication.ID128
@@ -107,6 +110,10 @@ type TransactionControl struct {
 
 	AffectedRows      int64
 	AffectedRowsValid bool
+	// CoordinatorDecision is invalid while staging, matches the live terminal
+	// decision, and survives Retired so delayed Commit/Abort retries remain
+	// distinguishable after child-row reclamation.
+	CoordinatorDecision distributedtxn.CoordinatorState
 
 	ResidentControlBytes  uint64
 	ResidentPayloadBytes  uint64
@@ -276,8 +283,9 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	frame[12] = byte(control.PayloadKind)
 	frame[13] = byte(control.LastOperation)
 	frame[14] = control.BucketBits
+	frame[15] = byte(control.CoordinatorDecision) << 1
 	if control.AffectedRowsValid {
-		frame[15] = 1
+		frame[15] |= 1
 	}
 	binary.LittleEndian.PutUint16(frame[16:18], transactionControlHeaderBytes)
 	binary.LittleEndian.PutUint16(frame[18:20], uint16(len(control.IntentScopes)))
@@ -286,7 +294,11 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	binary.LittleEndian.PutUint64(frame[40:48], control.Revision)
 	copy(frame[48:80], control.PayloadDigest[:])
 	binary.LittleEndian.PutUint64(frame[80:88], control.PayloadBytes)
-	binary.LittleEndian.PutUint64(frame[88:96], control.PayloadCount)
+	// PayloadCount is admission-bounded below 2^48; pack the relation-row count
+	// into the otherwise unreachable high 16 bits without growing every control.
+	binary.LittleEndian.PutUint64(
+		frame[88:96], control.PayloadCount|uint64(control.PayloadRelationCount)<<48,
+	)
 	copy(frame[96:112], control.CoordinatorGroup[:])
 	copy(frame[112:128], control.CoordinatorShardIncarnation[:])
 	binary.LittleEndian.PutUint64(frame[128:136], control.CoordinatorAllocation)
@@ -350,15 +362,18 @@ func OpenTransactionControlInto(
 	view.PayloadKind = distributedtxn.ReplicatedPayloadKind(src[12])
 	view.LastOperation = distributedtxn.ReplicatedOperation(src[13])
 	view.BucketBits = src[14]
-	if src[15] > 1 {
+	if src[15]&0xf0 != 0 {
 		return TransactionControlView{}, ErrTransactionStateCorrupt
 	}
-	view.AffectedRowsValid = src[15] == 1
+	view.AffectedRowsValid = src[15]&1 != 0
+	view.CoordinatorDecision = distributedtxn.CoordinatorState(src[15] >> 1)
 	copy(view.ID[:], src[24:40])
 	view.Revision = binary.LittleEndian.Uint64(src[40:48])
 	copy(view.PayloadDigest[:], src[48:80])
 	view.PayloadBytes = binary.LittleEndian.Uint64(src[80:88])
-	view.PayloadCount = binary.LittleEndian.Uint64(src[88:96])
+	packedPayloadCount := binary.LittleEndian.Uint64(src[88:96])
+	view.PayloadCount = packedPayloadCount & (uint64(1)<<48 - 1)
+	view.PayloadRelationCount = uint16(packedPayloadCount >> 48)
 	copy(view.CoordinatorGroup[:], src[96:112])
 	copy(view.CoordinatorShardIncarnation[:], src[112:128])
 	view.CoordinatorAllocation = binary.LittleEndian.Uint64(src[128:136])
@@ -799,7 +814,8 @@ func transactionControlValid(control TransactionControl) bool {
 		control.CoordinatorAllocation == 0 || control.MutationDigest == (distributedtxn.Digest{}) ||
 		control.LastCommandDigest == (replication.Digest{}) || control.LastResultCode == 0 ||
 		control.LastAppliedIndex == 0 || !transactionOperationRole(control.LastOperation, control.Role) ||
-		!transactionStateOperationCompatible(control.Role, control.State, control.LastOperation) {
+		(!transactionStateOperationCompatible(control.Role, control.State, control.LastOperation) &&
+			!transactionFailedPrepareWitness(control)) {
 		return false
 	}
 	creation := control.LastOperation == distributedtxn.ReplicatedStageCoordinator ||
@@ -837,19 +853,24 @@ func transactionControlValid(control TransactionControl) bool {
 		}
 		return (control.PayloadKind == distributedtxn.ReplicatedPayloadCoordinator ||
 			control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator) &&
-			control.BucketBits == 0 && len(control.IntentScopes) == 0 &&
+			control.PayloadRelationCount == 0 && control.BucketBits == 0 && len(control.IntentScopes) == 0 &&
 			!control.AffectedRowsValid && control.AffectedRows == 0 &&
+			transactionCoordinatorDecisionValid(control) &&
 			control.State >= uint8(distributedtxn.CoordinatorStaging) &&
 			control.State <= uint8(distributedtxn.CoordinatorRetired)
 	}
 	if control.PayloadKind != distributedtxn.ReplicatedPayloadParticipantStage ||
 		control.PayloadBytes > replication.MaxCommandBytes ||
 		control.PayloadCount > replication.MaxMutations ||
+		control.PayloadRelationCount == 0 ||
+		control.PayloadRelationCount > replication.MaxRelationsPerBundle ||
+		uint64(control.PayloadRelationCount) > control.PayloadCount ||
 		!distributedtxn.ValidateIntentScopes(control.IntentScopes, control.BucketBits) ||
 		control.State < uint8(distributedtxn.ParticipantStaged) ||
 		control.State > uint8(distributedtxn.ParticipantReleased) || control.AffectedRows < 0 ||
 		control.ResidentPayloadBytes != 0 || control.ResidentManifestBytes != 0 ||
-		!transactionManifestProgressZero(control) {
+		!transactionManifestProgressZero(control) ||
+		control.CoordinatorDecision != distributedtxn.CoordinatorInvalid {
 		return false
 	}
 	active := distributedtxn.ParticipantState(control.State) != distributedtxn.ParticipantReleased
@@ -865,6 +886,30 @@ func transactionControlValid(control TransactionControl) bool {
 		return !control.AffectedRowsValid && control.AffectedRows == 0 || control.AffectedRowsValid
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
+	}
+}
+
+func transactionFailedPrepareWitness(control TransactionControl) bool {
+	return control.Role == distributedtxn.ReplicatedRoleParticipant &&
+		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantStaged &&
+		control.LastOperation == distributedtxn.ReplicatedPrepareParticipant &&
+		control.LastExpectedRevision == control.Revision &&
+		control.LastResultCode == ResultIndexConflict
+}
+
+func transactionCoordinatorDecisionValid(control TransactionControl) bool {
+	switch distributedtxn.CoordinatorState(control.State) {
+	case distributedtxn.CoordinatorStaging:
+		return control.CoordinatorDecision == distributedtxn.CoordinatorInvalid
+	case distributedtxn.CoordinatorCommitted:
+		return control.CoordinatorDecision == distributedtxn.CoordinatorCommitted
+	case distributedtxn.CoordinatorAborted:
+		return control.CoordinatorDecision == distributedtxn.CoordinatorAborted
+	case distributedtxn.CoordinatorRetired:
+		return control.CoordinatorDecision == distributedtxn.CoordinatorCommitted ||
+			control.CoordinatorDecision == distributedtxn.CoordinatorAborted
+	default:
+		return false
 	}
 }
 

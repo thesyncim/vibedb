@@ -82,6 +82,7 @@ func transactionCodecControl(t testing.TB) TransactionControl {
 		State: uint8(distributedtxn.ParticipantPrepared), Revision: 2,
 		PayloadKind:   distributedtxn.ReplicatedPayloadParticipantStage,
 		PayloadDigest: transactionCodecDigest(20), PayloadBytes: 4096, PayloadCount: 1,
+		PayloadRelationCount:        1,
 		CoordinatorGroup:            transactionCodecReplicationID(30),
 		CoordinatorShardIncarnation: transactionCodecReplicationID(50),
 		CoordinatorAllocation:       71,
@@ -203,6 +204,7 @@ func TestTransactionControlRoundTripRetryWitnessAndTombstone(t *testing.T) {
 		view.LastCommandDigest != control.LastCommandDigest ||
 		view.LastResultCode != control.LastResultCode ||
 		view.LastAppliedIndex != control.LastAppliedIndex ||
+		view.PayloadRelationCount != control.PayloadRelationCount ||
 		!bytes.Equal(view.Bytes(), encoded) || cap(view.Bytes()) != len(encoded) ||
 		len(view.IntentScopes) != len(control.IntentScopes) {
 		t.Fatalf("control view=%+v err=%v", view.TransactionControl, err)
@@ -332,6 +334,53 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 	inline.ManifestChainDigest = transactionCodecDigest(130)
 	if _, err := AppendTransactionControl(nil, inline); err == nil {
 		t.Fatal("participant manifest progress accepted")
+	}
+}
+
+func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
+	_, segment, descriptor := transactionCodecManifestSegment(t)
+	controlBytes, _ := TransactionControlResidentBytes(0)
+	control := TransactionControl{
+		ID: transactionCodecID(33), Role: distributedtxn.ReplicatedRoleCoordinator,
+		State: uint8(distributedtxn.CoordinatorRetired), Revision: 3,
+		PayloadKind:   distributedtxn.ReplicatedPayloadManifestCoordinator,
+		PayloadDigest: transactionCodecDigest(34), PayloadBytes: descriptor.EncodedBytes,
+		PayloadCount:                descriptor.ParticipantCount,
+		CoordinatorGroup:            transactionCodecReplicationID(35),
+		CoordinatorShardIncarnation: transactionCodecReplicationID(51),
+		CoordinatorAllocation:       67,
+		MutationDigest:              transactionCodecDigest(68),
+		CoordinatorDecision:         distributedtxn.CoordinatorCommitted,
+		ResidentControlBytes:        controlBytes,
+		LastOperation:               distributedtxn.ReplicatedRetireCoordinator,
+		LastExpectedRevision:        2,
+		LastCommandDigest:           transactionCodecCommandDigest(100),
+		LastResultCode:              1,
+		LastAppliedIndex:            101,
+		ManifestNextPage:            segment.Index + 1,
+		ManifestNextParticipant:     descriptor.ParticipantCount,
+		ManifestEncodedBytes:        descriptor.EncodedBytes,
+		ManifestChainDigest: advanceTransactionManifestChain(
+			distributedtxn.Digest{}, segment.Index, segment.Digest,
+		),
+	}
+	encoded, err := AppendTransactionControl(nil, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenTransactionControlInto(encoded, nil)
+	if err != nil || opened.CoordinatorDecision != distributedtxn.CoordinatorCommitted {
+		t.Fatalf("retired decision=%d err=%v", opened.CoordinatorDecision, err)
+	}
+	for _, decision := range []distributedtxn.CoordinatorState{
+		distributedtxn.CoordinatorInvalid,
+		distributedtxn.CoordinatorStaging,
+	} {
+		candidate := control
+		candidate.CoordinatorDecision = decision
+		if _, err := AppendTransactionControl(nil, candidate); err == nil {
+			t.Fatalf("retired decision %d accepted", decision)
+		}
 	}
 }
 

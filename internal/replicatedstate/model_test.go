@@ -178,7 +178,8 @@ func TestCoherentSnapshotRacesApply(t *testing.T) {
 			_ = snapshot.Close()
 			t.Fatal(err)
 		}
-		if systemRows != state.SessionCount+state.SessionSlotCount+state.AuthorityBindingCount+1 {
+		if systemRows != state.SessionCount+state.SessionSlotCount+state.AuthorityBindingCount+
+			state.TransactionControlCount+state.TransactionPayloadRows+state.TransactionIntentRows+1 {
 			_ = snapshot.Close()
 			t.Fatalf("system rows=%d sessions=%d slots=%d", systemRows,
 				state.SessionCount, state.SessionSlotCount)

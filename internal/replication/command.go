@@ -170,6 +170,31 @@ type RelationBatchView struct {
 // MutationCount reports the number of mutations in this relation batch.
 func (v RelationBatchView) MutationCount() int { return int(v.mutationCount) }
 
+// MutationBytes returns the exact canonical mutation-frame payload for this
+// relation. The result aliases the validated command and is capacity-clamped.
+func (v RelationBatchView) MutationBytes() []byte {
+	return v.mutationBytes[:len(v.mutationBytes):len(v.mutationBytes)]
+}
+
+// OpenRelationMutationBytes validates one detached canonical mutation-frame
+// payload and returns a borrowed relation view without outer command framing.
+func OpenRelationMutationBytes(
+	relation RelationID,
+	mutationCount uint32,
+	raw []byte,
+) (RelationBatchView, error) {
+	if relation == 0 || relation > MaxRelationID || mutationCount == 0 ||
+		mutationCount > MaxMutations || len(raw) > MaxCommandBytes {
+		return RelationBatchView{}, ErrEnvelopeSemantic
+	}
+	if err := validateMutationBytes(raw, mutationCount); err != nil {
+		return RelationBatchView{}, err
+	}
+	return RelationBatchView{
+		Relation: relation, mutationBytes: raw[:len(raw):len(raw)], mutationCount: mutationCount,
+	}, nil
+}
+
 // MutationView is one borrowed, validated mutation. Key and Value are
 // capacity-clamped, read-only aliases into the command envelope.
 type MutationView struct {

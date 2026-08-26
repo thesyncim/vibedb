@@ -62,6 +62,19 @@ func (m *Machine) PointReadInto(
 	if !ok || snapshot == nil {
 		return PointReadResult{}, m.fail(errors.Join(ErrInconsistentSnapshot, m.applyCut.Close()))
 	}
+	systemSnapshot, ok := m.applyCut.CollectionHandle(m.system.Collection)
+	if !ok || systemSnapshot == nil {
+		return PointReadResult{}, m.fail(errors.Join(ErrInconsistentSnapshot, m.applyCut.Close()))
+	}
+	_, blocked, intentErr := lookupTransactionIntentOwner(
+		pointSnapshot{value: systemSnapshot}, relation, key,
+	)
+	if intentErr != nil {
+		return PointReadResult{}, m.fail(errors.Join(intentErr, m.applyCut.Close()))
+	}
+	if blocked {
+		return PointReadResult{}, errors.Join(ErrTransactionIntentActive, m.applyCut.Close())
+	}
 	value, found, err := snapshot.AppendRaw(dst[:0], key)
 	if err != nil {
 		return PointReadResult{}, m.fail(errors.Join(err, m.applyCut.Close()))

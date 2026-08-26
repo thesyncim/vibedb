@@ -225,7 +225,8 @@ func (m *Machine) ownershipTransitionBinding(
 	transition OwnershipTransitionView,
 ) (Binding, error) {
 	current := m.binding
-	if transition.ClusterID != current.ClusterID ||
+	if m.state.ActiveTransactionCount != 0 ||
+		transition.ClusterID != current.ClusterID ||
 		transition.ClusterIncarnation != current.ClusterIncarnation ||
 		transition.TopologyRecoveryEpoch != current.TopologyRecoveryEpoch ||
 		!bytes.Equal(transition.Distribution, []byte(current.Distribution)) ||

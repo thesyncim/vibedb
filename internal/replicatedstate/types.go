@@ -32,9 +32,15 @@ const (
 	ResultSessionRenewed  uint32 = 9
 	ResultSessionRevoked  uint32 = 10
 	ResultIndexConflict   uint32 = 11
+	// ResultIntentBusy is the deterministic ordinary-mutation refusal emitted
+	// while an active distributed transaction owns the exact relation key.
+	// Result codes are local to their ResultFormat: transaction format code 12
+	// independently denotes a transaction-control CAS loss.
+	ResultIntentBusy uint32 = 12
 
-	// MaxStateEnvelopeBytes bounds the fixed publication record. Its 376-byte
-	// header, two 255-byte identities, checksum, and a deterministic protobuf
+	// MaxStateEnvelopeBytes bounds the fixed publication record. Its compact
+	// 376-byte header (416 bytes when transaction accounting is present), two
+	// 255-byte identities, checksum, and a deterministic protobuf
 	// with at most 64 ten-byte member IDs fit below 1.6 KiB; 2 KiB retains a
 	// format margin without inflating every hidden collection. Session metadata
 	// and completion slots are independently bounded by their compact codecs.
@@ -43,6 +49,7 @@ const (
 	// by RetryWindow; neither structure grows with operation count.
 	MaxStateEnvelopeBytes           = 2 << 10
 	MaxRetainedSessions             = 1 << 20
+	MaxRetainedTransactions         = 1 << 20
 	MaxSessionRetryWindow           = 256
 	MaxStaticBootstrapBytes         = 1 << 20
 	MaxStaticBootstrapEnvelopeBytes = MaxStaticBootstrapBytes + MaxStateEnvelopeBytes
@@ -319,5 +326,5 @@ func isSessionTerminalResult(code uint32) bool {
 }
 
 func isSessionResultCode(code uint32) bool {
-	return code >= ResultApplied && code <= ResultIndexConflict
+	return code >= ResultApplied && code <= ResultIntentBusy
 }
