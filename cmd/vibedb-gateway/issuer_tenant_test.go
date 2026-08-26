@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -16,6 +17,10 @@ func TestAuthenticatedIssuerTenantStableAcrossPolicyGeneration(t *testing.T) {
 	scope, first, err := resolver.ResolveIssuerTenant(context.Background(), authority)
 	if err != nil || scope != requestledger.ScopeAuthenticated || first == (requestledger.Digest{}) {
 		t.Fatalf("scope=%d tenant=%x err=%v", scope, first, err)
+	}
+	raw, err := authenticatedIssuerTenantFor(authority)
+	if err != nil || first != requestledger.Digest(sha256.Sum256(raw[:])) {
+		t.Fatalf("raw tenant binding mismatch: tenant=%x err=%v", first, err)
 	}
 	authority.Generation++
 	_, second, err := resolver.ResolveIssuerTenant(context.Background(), authority)

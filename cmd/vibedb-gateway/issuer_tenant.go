@@ -22,6 +22,20 @@ var authenticatedIssuerTenantDomain = [...]byte{
 // input and callers cannot supply or spoof a tenant string.
 type authenticatedIssuerTenantResolver struct{}
 
+type authenticatedIssuerTenant [len(authenticatedIssuerTenantDomain) + 16]byte
+
+func authenticatedIssuerTenantFor(
+	authority serviceauthz.Authority,
+) (authenticatedIssuerTenant, error) {
+	if !authority.Valid() {
+		return authenticatedIssuerTenant{}, errInvalidIssuerTenantAuthority
+	}
+	var tenant authenticatedIssuerTenant
+	at := copy(tenant[:], authenticatedIssuerTenantDomain[:])
+	copy(tenant[at:], authority.Node[:])
+	return tenant, nil
+}
+
 func (authenticatedIssuerTenantResolver) ResolveIssuerTenant(
 	ctx context.Context,
 	authority serviceauthz.Authority,
@@ -32,11 +46,11 @@ func (authenticatedIssuerTenantResolver) ResolveIssuerTenant(
 	if err := ctx.Err(); err != nil {
 		return requestledger.ScopeInvalid, requestledger.Digest{}, err
 	}
-	hash := sha256.New()
-	_, _ = hash.Write(authenticatedIssuerTenantDomain[:])
-	_, _ = hash.Write(authority.Node[:])
-	var tenant requestledger.Digest
-	_ = hash.Sum(tenant[:0])
+	raw, err := authenticatedIssuerTenantFor(authority)
+	if err != nil {
+		return requestledger.ScopeInvalid, requestledger.Digest{}, err
+	}
+	tenant := requestledger.Digest(sha256.Sum256(raw[:]))
 	if tenant == (requestledger.Digest{}) {
 		return requestledger.ScopeInvalid, requestledger.Digest{}, errInvalidIssuerTenantAuthority
 	}
