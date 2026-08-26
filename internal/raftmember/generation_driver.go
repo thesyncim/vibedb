@@ -55,9 +55,14 @@ func (runtime *Runtime) ConfigureWALGeneration(options WALGenerationDriverOption
 		options.Key.Material == ([32]byte{}) || runtime.walGeneration != nil {
 		return ErrRuntimeOwnership
 	}
+	runtime.walGeneration = newWALGenerationDriver(options)
+	return nil
+}
+
+func newWALGenerationDriver(options WALGenerationDriverOptions) *walGenerationDriver {
 	key := options.Key
 	key.Wrapped = append([]byte(nil), options.Key.Wrapped...)
-	runtime.walGeneration = &walGenerationDriver{
+	return &walGenerationDriver{
 		interval:  options.IntervalTicks,
 		key:       key,
 		workspace: make([]byte, 0, replicatedstate.DefaultSnapshotArtifactChunkBytes),
@@ -65,7 +70,6 @@ func (runtime *Runtime) ConfigureWALGeneration(options WALGenerationDriverOption
 		stop:      make(chan struct{}),
 		result:    make(chan walGenerationBuildResult, 1),
 	}
-	return nil
 }
 
 func (runtime *Runtime) tickWALGeneration() {

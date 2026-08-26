@@ -384,12 +384,13 @@ func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 // Runtime is a non-serving kernel. Proposal success means only local core
 // admission. It does not certify leadership, commit, apply, or a client result.
 type Runtime struct {
-	wal           *raftstore.Store
-	database      *sqldriver.Database
-	apply         *sqldriver.ReplicatedApply
-	node          *raftmodel.Node
-	identity      RuntimeIdentity
-	walGeneration *walGenerationDriver
+	wal             *raftstore.Store
+	database        *sqldriver.Database
+	apply           *sqldriver.ReplicatedApply
+	node            *raftmodel.Node
+	identity        RuntimeIdentity
+	walGeneration   *walGenerationDriver
+	schemaWALResume *WALGenerationDriverOptions
 
 	proposalBatchEntries     int
 	proposalBatchBytes       int64
@@ -569,12 +570,22 @@ func (runtime *Runtime) checkUsable() error {
 func (runtime *Runtime) QuiesceSQLGeneration() error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
 		runtime.node == nil || runtime.wal == nil || runtime.apply == nil ||
-		runtime.database == nil || runtime.schemaGenerationQuiesced ||
-		runtime.walGeneration != nil {
+		runtime.database == nil || runtime.schemaGenerationQuiesced {
 		return ErrSchemaGenerationSwap
 	}
 	if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
 		return errors.Join(ErrSchemaGenerationSwap, err)
+	}
+	if driver := runtime.walGeneration; driver != nil {
+		driver.stopAndWait()
+		resume := &WALGenerationDriverOptions{
+			IntervalTicks: driver.interval, Key: driver.key, OnError: driver.onError,
+		}
+		resume.Key.Wrapped = append([]byte(nil), driver.key.Wrapped...)
+		runtime.schemaWALResume = resume
+		clear(driver.key.Material[:])
+		clear(driver.key.Wrapped)
+		runtime.walGeneration = nil
 	}
 	if err := runtime.apply.Close(); err != nil {
 		return errors.Join(ErrSchemaGenerationSwap, err)
@@ -622,6 +633,12 @@ func (runtime *Runtime) InstallSQLGeneration(
 	runtime.apply = apply
 	runtime.identity.RelationManifestDigest = manifest
 	runtime.schemaGenerationQuiesced = false
+	if runtime.schemaWALResume != nil {
+		runtime.walGeneration = newWALGenerationDriver(*runtime.schemaWALResume)
+		clear(runtime.schemaWALResume.Key.Material[:])
+		clear(runtime.schemaWALResume.Key.Wrapped)
+		runtime.schemaWALResume = nil
+	}
 	return nil
 }
 
@@ -1356,6 +1373,11 @@ func (runtime *Runtime) Close() error {
 		clear(runtime.walGeneration.key.Material[:])
 		clear(runtime.walGeneration.key.Wrapped)
 		runtime.walGeneration = nil
+	}
+	if runtime.schemaWALResume != nil {
+		clear(runtime.schemaWALResume.Key.Material[:])
+		clear(runtime.schemaWALResume.Key.Wrapped)
+		runtime.schemaWALResume = nil
 	}
 	runtime.node = nil
 	if runtime.apply != nil {
