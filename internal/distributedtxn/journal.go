@@ -50,6 +50,8 @@ const (
 	journalManifestSegment
 	journalManifestCoordinatorStage
 	journalManifestCoordinatorSeal
+	journalCompactedCoordinator
+	journalCompactedParticipant
 )
 
 type RecordRole uint8
@@ -117,6 +119,7 @@ type Journal struct {
 	barrierBits    uint8
 	barrierIndex   []barrierScope
 	barrierChanged chan struct{}
+	path           string
 }
 
 // JournalUsage is an exact byte-accounting snapshot. ControlReserveBytes is
@@ -236,9 +239,16 @@ func OpenJournal(path string) (*Journal, error) {
 	j := &Journal{
 		file: file, coordinators: make(map[ID]*journalRecord),
 		participants: make(map[ID]*journalRecord), manifests: make(map[ID]*journalManifest),
-		barrierChanged: make(chan struct{}),
+		barrierChanged: make(chan struct{}), path: path,
 	}
 	if err := j.recover(); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	// A compaction temporary is never authoritative: before rename the current
+	// journal is authoritative, and after rename the temporary name is absent.
+	// Reclaim a crash-left workspace only after the primary recovered cleanly.
+	if err := removeStaleJournalCompaction(path); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -384,9 +394,86 @@ func (j *Journal) replayEntry(
 			return ErrCorrupt
 		}
 		return j.replayManifestCoordinatorSeal(id, revision, CoordinatorState(state), descriptor)
+	case journalCompactedCoordinator:
+		return j.replayCompactedCoordinator(id, revision, CoordinatorState(state), payload)
+	case journalCompactedParticipant:
+		return j.replayCompactedParticipant(id, revision, ParticipantState(state), payload)
 	default:
 		return ErrUnsupported
 	}
+}
+
+// replayCompactedCoordinator restores a retired coordinator without replaying
+// its (potentially very large) segmented participant manifest. The immutable
+// stage remains byte-exact so late lookup and retry behavior is unchanged.
+func (j *Journal) replayCompactedCoordinator(
+	id ID,
+	revision uint64,
+	state CoordinatorState,
+	raw []byte,
+) error {
+	if id.IsZero() || revision != 3 || state != CoordinatorRetired || j.coordinators[id] != nil {
+		return ErrCorrupt
+	}
+	if len(raw) >= 4 && equal4(raw[:4], coordinatorMagic) {
+		var scratch [MaxInlineParticipants]ParticipantRef
+		record, err := OpenCoordinatorInto(raw, scratch[:])
+		if err != nil || record.ID != id || record.Revision != 1 ||
+			record.State != CoordinatorStaging {
+			return ErrCorrupt
+		}
+		j.coordinators[id] = &journalRecord{status: Status{
+			Role: RoleCoordinator, ID: id, Revision: revision, CoordinatorState: state,
+		}, stage: bytes.Clone(raw)}
+		return nil
+	}
+	record, err := OpenManifestCoordinator(raw)
+	if err != nil || record.ID != id || record.Revision != 1 ||
+		record.State != CoordinatorStaging {
+		return ErrCorrupt
+	}
+	j.coordinators[id] = &journalRecord{status: Status{
+		Role: RoleCoordinator, ID: id, Revision: revision, CoordinatorState: state,
+	}, stage: bytes.Clone(raw), manifest: record.Manifest, hasManifest: true}
+	return nil
+}
+
+// replayCompactedParticipant restores a terminal participant in one entry.
+// Keeping its original stage bytes preserves exact retry and read behavior;
+// only superseded state-transition entries are removed.
+func (j *Journal) replayCompactedParticipant(
+	id ID,
+	revision uint64,
+	state ParticipantState,
+	raw []byte,
+) error {
+	if id.IsZero() || j.participants[id] != nil ||
+		(state != ParticipantAborted && state != ParticipantReleased) {
+		return ErrCorrupt
+	}
+	if len(raw) == 0 {
+		if state != ParticipantAborted || revision != 2 {
+			return ErrCorrupt
+		}
+		j.participants[id] = &journalRecord{status: Status{
+			Role: RoleParticipant, ID: id, Revision: revision, ParticipantState: state,
+		}}
+		return nil
+	}
+	var scopes [MaxIntentScopes]IntentScope
+	record, err := OpenParticipantInto(raw, scopes[:])
+	if err != nil || record.ID != id || record.Revision != 1 ||
+		record.State != ParticipantStaged ||
+		(state == ParticipantAborted && (revision < 2 || revision > 3)) ||
+		(state == ParticipantReleased && (revision < 3 || revision > 4)) {
+		return ErrCorrupt
+	}
+	j.participants[id] = &journalRecord{status: Status{
+		Role: RoleParticipant, ID: id, Revision: revision,
+		ParticipantState: state, MutationDigest: record.MutationDigest,
+	}, stage: bytes.Clone(raw), bucketBits: record.BucketBits,
+		scopes: append([]IntentScope(nil), record.IntentScopes...)}
+	return nil
 }
 
 func (j *Journal) replayParticipantFence(id ID) error {
