@@ -159,9 +159,18 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		t.Fatalf("published generation=%d want=%d",
 			authority.holder.Current().Generation(), next.Generation())
 	}
-	receiptRaw, found := client.rows[string(recordKey[:])]
+	retainedGrant, found := client.rows[string(recordKey[:])]
 	if !found {
-		t.Fatal("completed replacement did not retain its bounded receipt")
+		t.Fatal("catalog publication revoked source-removal authority")
+	}
+	openedGrant, grantErr := openReplicatedMembershipGrant(retainedGrant)
+	if grantErr != nil || openedGrant != grant {
+		t.Fatalf("retained grant=%+v err=%v", openedGrant, grantErr)
+	}
+	receiptKey, receiptPageKey := replicatedReplicaReplacementReceiptKeys(grant.Group)
+	receiptRaw, found := client.rows[string(receiptKey[:])]
+	if !found {
+		t.Fatal("completed replacement did not retain its distinct receipt")
 	}
 	receipt, receiptErr := openReplicaReplacementReceipt(receiptRaw)
 	if receiptErr != nil || receipt.Grant != grant ||
@@ -178,10 +187,112 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 		remaining[1] != groups[1] {
 		t.Fatalf("remaining occupancy groups=%+v err=%v", remaining, err)
 	}
+	receiptPageRaw, found := client.rows[string(receiptPageKey[:])]
+	if !found {
+		t.Fatal("replacement receipt occupancy page is missing")
+	}
+	receiptGroups, err := openReplicaReplacementReceiptPage(
+		receiptPageKey[1], receiptPageRaw,
+	)
+	if err != nil || len(receiptGroups) != 1 || receiptGroups[0] != grant.Group {
+		t.Fatalf("receipt occupancy=%+v err=%v", receiptGroups, err)
+	}
+	if grantResult, found, readErr := authority.ReadMembershipGrant(
+		context.Background(), grant.Group,
+	); readErr != nil || !found || grantResult != grant {
+		t.Fatalf("grant before source removal=%+v found=%v err=%v", grantResult, found, readErr)
+	}
+
+	client.unknownNext = true
+	err = authority.FinalizeReplicaReplacement(context.Background(), grant)
+	if !errors.Is(err, ErrReplicatedCatalogPending) || !authority.session.Status().Pending {
+		t.Fatalf("unknown finalization err=%v pending=%v", err, authority.session.Status().Pending)
+	}
+	finalizeCommand := authority.session.PendingCommand()
+	client.holdUnknown = false
+	if err = authority.RetryPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(finalizeCommand, client.unknownCommand) {
+		t.Fatal("replacement finalization retry changed exact command bytes")
+	}
+	if _, found = client.rows[string(recordKey[:])]; found {
+		t.Fatal("finalized replacement retained active grant")
+	}
+	remainingPage, found = client.rows[string(pageKey[:])]
+	if !found {
+		t.Fatal("finalization deleted shared active-grant page")
+	}
+	remaining, err = openReplicatedMembershipGrantPage(pageKey[1], remainingPage)
+	if err != nil || len(remaining) != 1 || remaining[0] != other {
+		t.Fatalf("final active occupancy=%+v err=%v", remaining, err)
+	}
+	if _, found = client.rows[string(receiptKey[:])]; !found {
+		t.Fatal("finalization deleted replacement receipt")
+	}
 	if grantResult, found, readErr := authority.ReadMembershipGrant(
 		context.Background(), grant.Group,
 	); readErr != nil || found || grantResult != (membershipgrant.Grant{}) {
-		t.Fatalf("grant after final publication=%+v found=%v err=%v", grantResult, found, readErr)
+		t.Fatalf("grant after finalization=%+v found=%v err=%v", grantResult, found, readErr)
+	}
+
+	// A later move of the same group reuses its one receipt row and occupancy
+	// slot; it neither grows the directory nor trusts the prior certificate for
+	// the new transition.
+	receiptPageBefore := append([]byte(nil), client.rows[string(receiptPageKey[:])]...)
+	secondDescriptor := next.replicatedDescriptors()[0]
+	secondGrant := testReplicatedMembershipGrant(secondDescriptor.Group)
+	secondGrant.TransitionID[0]++
+	secondGrant.MetadataEpoch++
+	secondGrant.CatalogGeneration = next.Generation()
+	secondGrant.InitialReplicaSetVersion = secondDescriptor.Command.ReplicaSetVersion
+	secondGrant.InitialVoters = [3]uint64{2, 3, 4}
+	secondGrant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(next, 0)
+	secondGrant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(next, 0)
+	secondGrant.SourceMember = 2
+	secondGrant.TargetMember = 5
+	secondGrant.TargetNode = [16]byte{5}
+	currentManifest, ok := next.Manifest(secondDescriptor.Distribution)
+	if !ok {
+		t.Fatal("second replacement manifest missing")
+	}
+	shardOrdinal, metadata := manifestShardOrdinal(currentManifest, secondDescriptor.Shard)
+	secondManifest, err := currentManifest.ReplaceShardLeader(
+		shardOrdinal, currentManifest.Version()+1, 1, "ep-a", metadata.Epoch+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTarget := ReplicatedReplicaDescriptor{
+		Member: 5, Node: [16]byte{5}, StoreID: [16]byte{15}, NodeIncarnation: 25,
+		Endpoint: "ep-a", NativeEndpoint: "ep-a-native", ControlEndpoint: "ep-a-control",
+	}
+	secondCommand := secondDescriptor.Command
+	secondCommand.ReplicaSetVersion += 3
+	secondCommand.OwnershipEpoch++
+	secondCommand.RoutingVersion++
+	secondCommand.RouteGeneration++
+	secondNext, err := BuildReplicaReplacementTransition(
+		next, secondManifest, next.Generation()+1, secondGrant, secondTarget, secondCommand,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishMembershipGrant(context.Background(), secondGrant); err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), next.Generation(), secondNext, secondGrant,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(receiptPageBefore, client.rows[string(receiptPageKey[:])]) {
+		t.Fatal("repeated replacement rewrote stable receipt occupancy")
+	}
+	secondReceipt, err := openReplicaReplacementReceipt(client.rows[string(receiptKey[:])])
+	if err != nil || secondReceipt.Grant != secondGrant ||
+		secondReceipt.NewGeneration != secondNext.Generation() {
+		t.Fatalf("second receipt=%+v err=%v", secondReceipt, err)
 	}
 }
 
@@ -263,7 +374,7 @@ func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.
 			); err != nil {
 				t.Fatal(err)
 			}
-			recordKey, _ := replicatedMembershipGrantKeys(grant.Group)
+			recordKey, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
 			testCase.mutate(client.rows, recordKey)
 			if _, err = peer.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
 				t.Fatalf("refresh without exact receipt=%v", err)
@@ -276,7 +387,7 @@ func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.
 }
 
 func TestReplicaReplacementReceiptIsCanonicalAndBounded(t *testing.T) {
-	if maxReplicatedMembershipLifecycleBytes != 18<<20 {
+	if maxReplicatedMembershipLifecycleBytes != 28<<20 {
 		t.Fatal("membership lifecycle retention bound drifted")
 	}
 	authority, client, current := newCatalogAuthorityFixture(t)
@@ -296,7 +407,7 @@ func TestReplicaReplacementReceiptIsCanonicalAndBounded(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	key, _ := replicatedMembershipGrantKeys(grant.Group)
+	key, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
 	raw := client.rows[string(key[:])]
 	receipt, err := openReplicaReplacementReceipt(raw)
 	if err != nil || len(raw) == 0 || len(raw) > maxReplicatedReplicaReplacementReceiptBytes {

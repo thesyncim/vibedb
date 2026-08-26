@@ -261,7 +261,7 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 	if !ok {
 		return ErrReplicatedCatalogConflict
 	}
-	key, _ := replicatedMembershipGrantKeys(group)
+	key, _ := replicatedReplicaReplacementReceiptKeys(group)
 	result, err := authority.readRaw(
 		ctx, key[:], uint32(maxReplicatedReplicaReplacementReceiptBytes),
 	)

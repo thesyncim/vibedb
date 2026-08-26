@@ -16,10 +16,12 @@ import (
 )
 
 const (
-	replicatedMembershipGrantKeyByte     = byte(3)
-	replicatedMembershipGrantPageKeyByte = byte(4)
-	replicatedMembershipGrantPages       = 64
-	maxReplicatedMembershipGrantsPerPage = 64
+	replicatedMembershipGrantKeyByte               = byte(3)
+	replicatedMembershipGrantPageKeyByte           = byte(4)
+	replicatedReplicaReplacementReceiptKeyByte     = byte(5)
+	replicatedReplicaReplacementReceiptPageKeyByte = byte(6)
+	replicatedMembershipGrantPages                 = 64
+	maxReplicatedMembershipGrantsPerPage           = 64
 	// The distributed quota is explicit without a global counter/CAS hot spot.
 	// Each independently updated page rejects its 65th collision, so retained
 	// active grants plus completed receipts are bounded by this product under
@@ -28,8 +30,8 @@ const (
 	maxReplicatedMembershipGrantBytes           = 2 << 10
 	maxReplicatedMembershipGrantPageBytes       = 32 << 10
 	maxReplicatedReplicaReplacementReceiptBytes = 4 << 10
-	maxReplicatedMembershipLifecycleBytes       = maxReplicatedMembershipGrants*maxReplicatedReplicaReplacementReceiptBytes +
-		replicatedMembershipGrantPages*maxReplicatedMembershipGrantPageBytes
+	maxReplicatedMembershipLifecycleBytes       = maxReplicatedMembershipGrants*(maxReplicatedMembershipGrantBytes+maxReplicatedReplicaReplacementReceiptBytes) +
+		2*replicatedMembershipGrantPages*maxReplicatedMembershipGrantPageBytes
 )
 
 type persistedMembershipGrant struct {
@@ -63,10 +65,9 @@ type persistedMembershipGrantPage struct {
 }
 
 // persistedReplicaReplacementReceipt is the compact durable bridge between
-// two adjacent catalog generations. The stable per-group grant row is replaced
-// by this receipt, while its bounded occupancy-page slot remains allocated.
-// Consequently completed and active membership lifecycles share the same hard
-// 4096-row ceiling and repeated replacements of one group overwrite one row.
+// two adjacent catalog generations. It occupies a distinct stable per-group
+// row and bounded receipt page, so catalog publication cannot revoke the grant
+// which still authorizes removal of the old source.
 type persistedReplicaReplacementReceipt struct {
 	Grant         persistedMembershipGrant `json:"grant"`
 	OldGeneration uint64                   `json:"old_generation"`
@@ -104,26 +105,56 @@ func (authority *ReplicatedCatalogAuthority) ReadMembershipGrant(ctx context.Con
 		return membershipgrant.Grant{}, false, nil
 	}
 	grant, err := openReplicatedMembershipGrant(result.Value)
-	if err != nil {
-		receipt, receiptErr := openReplicaReplacementReceipt(result.Value)
-		if receiptErr == nil && receipt.Grant.Group == group {
-			return membershipgrant.Grant{}, false, nil
-		}
-		return membershipgrant.Grant{}, false,
-			errors.Join(err, receiptErr, ErrReplicatedCatalog)
-	}
-	if grant.Group != group {
-		return membershipgrant.Grant{}, false, ErrReplicatedCatalog
+	if err != nil || grant.Group != group {
+		return membershipgrant.Grant{}, false, errors.Join(err, ErrReplicatedCatalog)
 	}
 	currentCatalog, err := authority.Read(ctx)
 	if err != nil {
 		return membershipgrant.Grant{}, false, err
 	}
-	if currentCatalog == nil || grant.CatalogGeneration != currentCatalog.Generation() ||
-		!replicatedCatalogCertifiesInitialGrant(currentCatalog, grant) {
+	authorized, authorizeErr := authority.catalogAuthorizesMembershipGrant(
+		ctx, currentCatalog, grant,
+	)
+	if authorizeErr != nil {
+		return membershipgrant.Grant{}, false, authorizeErr
+	}
+	if !authorized {
 		return membershipgrant.Grant{}, false, ErrReplicatedCatalogConflict
 	}
 	return grant, true, nil
+}
+
+func (authority *ReplicatedCatalogAuthority) catalogAuthorizesMembershipGrant(
+	ctx context.Context, current *Snapshot, grant membershipgrant.Grant,
+) (bool, error) {
+	if current == nil || !grant.Valid() {
+		return false, nil
+	}
+	if current.Generation() == grant.CatalogGeneration {
+		return replicatedCatalogCertifiesInitialGrant(current, grant), nil
+	}
+	if grant.CatalogGeneration == ^uint64(0) ||
+		current.Generation() != grant.CatalogGeneration+1 {
+		return false, nil
+	}
+	key, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
+	result, err := authority.readRaw(
+		ctx, key[:], uint32(maxReplicatedReplicaReplacementReceiptBytes),
+	)
+	if err != nil || !result.Found {
+		return false, err
+	}
+	receipt, err := openReplicaReplacementReceipt(result.Value)
+	if err != nil {
+		return false, err
+	}
+	currentRaw, err := appendReplicatedCatalogDocument(nil, current, maxReplicatedCatalogBytes)
+	if err != nil {
+		return false, err
+	}
+	return receipt.Grant == grant && receipt.NewGeneration == current.Generation() &&
+		receipt.NewHeadBytes == uint64(len(currentRaw)) &&
+		receipt.NewHeadDigest == sha256.Sum256(currentRaw), nil
 }
 
 // PublishMembershipGrant atomically inserts one exact per-group record and its
@@ -168,65 +199,41 @@ func (authority *ReplicatedCatalogAuthority) PublishMembershipGrant(ctx context.
 		}
 	}
 	index, found := findReplicatedMembershipGrantGroup(groups, grant.Group)
-	replaceReceipt := false
 	if record.Found {
 		current, openErr := openReplicatedMembershipGrant(record.Value)
-		if openErr == nil {
-			if current.Group != grant.Group || !found {
-				return ErrReplicatedCatalogConflict
-			}
-			if current == grant {
-				return nil
-			}
-			return ErrReplicatedCatalogConflict
+		if openErr != nil || current.Group != grant.Group || !found {
+			return errors.Join(openErr, ErrReplicatedCatalogConflict)
 		}
-		receipt, receiptErr := openReplicaReplacementReceipt(record.Value)
-		if receiptErr != nil || receipt.Grant.Group != grant.Group || !found ||
-			receipt.NewGeneration != currentCatalog.Generation() ||
-			receipt.NewHeadBytes != uint64(len(cut.head)) ||
-			receipt.NewHeadDigest != sha256.Sum256(cut.head) {
-			return errors.Join(openErr, receiptErr, ErrReplicatedCatalogConflict)
+		if current == grant {
+			return nil
 		}
-		replaceReceipt = true
-	}
-	if !record.Found && (found || len(groups) >= maxReplicatedMembershipGrantsPerPage) {
 		return ErrReplicatedCatalogConflict
 	}
-	if !record.Found {
-		groups = append(groups, raftmember.GroupKey{})
-		copy(groups[index+1:], groups[index:])
-		groups[index] = grant.Group
+	if found || len(groups) >= maxReplicatedMembershipGrantsPerPage {
+		return ErrReplicatedCatalogConflict
 	}
+	groups = append(groups, raftmember.GroupKey{})
+	copy(groups[index+1:], groups[index:])
+	groups[index] = grant.Group
 	recordBytes, err := appendReplicatedMembershipGrant(nil, grant)
 	if err != nil {
 		return err
 	}
-	if !replaceReceipt {
-		authority.scratch = authority.scratch[:0]
-		authority.scratch, err = appendReplicatedMembershipGrantPage(authority.scratch, pageKey[1], groups)
-		if err != nil {
-			return err
-		}
+	authority.scratch = authority.scratch[:0]
+	authority.scratch, err = appendReplicatedMembershipGrantPage(authority.scratch, pageKey[1], groups)
+	if err != nil {
+		return err
 	}
 	witness := cut.witness
 	witnessDigest := sha256.Sum256(witness)
 	mutations := []NativeMutation{{Kind: replication.MutationPutDigestEqual,
 		Key: replicatedCatalogHeadWitnessKey[:], Value: witness,
-		ExpectedValueLength: uint64(len(witness)), ExpectedValueDigest: replication.Digest(witnessDigest)}}
-	if replaceReceipt {
-		digest := sha256.Sum256(record.Value)
-		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
-			Key: recordKey[:], Value: recordBytes,
-			ExpectedValueLength: uint64(len(record.Value)),
-			ExpectedValueDigest: replication.Digest(digest)})
-	} else {
-		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
-			Key: recordKey[:], Value: recordBytes})
-	}
-	if !replaceReceipt && !page.Found {
+		ExpectedValueLength: uint64(len(witness)), ExpectedValueDigest: replication.Digest(witnessDigest)},
+		{Kind: replication.MutationPutAbsentOrEqual, Key: recordKey[:], Value: recordBytes}}
+	if !page.Found {
 		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
 			Key: pageKey[:], Value: authority.scratch})
-	} else if !replaceReceipt {
+	} else {
 		digest := sha256.Sum256(page.Value)
 		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
 			Key: pageKey[:], Value: authority.scratch,
@@ -344,8 +351,8 @@ func replicatedCatalogInitialDescriptorDigest(snapshot *Snapshot, shardIndex int
 // RevokeMembershipGrant deliberately has no standalone success path. Runtime-
 // local state is not a durable deletion proof: deleting an observed grant at
 // an intermediate learner/RF4 cut would strand recovery after restart. Use
-// PublishReplicaReplacement to settle the completed RF3 catalog and revoke the
-// exact grant in one replicated relation batch.
+// PublishReplicaReplacement to certify the final RF3 catalog, remove the old
+// source, then FinalizeReplicaReplacement to revoke the exact grant.
 func (authority *ReplicatedCatalogAuthority) RevokeMembershipGrant(ctx context.Context,
 	expected membershipgrant.Grant) error {
 	if authority == nil || authority.session == nil || ctx == nil || !expected.Valid() {
@@ -358,11 +365,10 @@ func (authority *ReplicatedCatalogAuthority) RevokeMembershipGrant(ctx context.C
 }
 
 // PublishReplicaReplacement atomically publishes one certified final RF3
-// catalog and replaces the exact transition grant with a compact certificate.
-// The stable occupancy slot remains, bounding active grants plus retained
-// receipts together. A lost response is retained by NativeSession and settled
-// byte-identically through RetryPending; no uncertified catalog can become
-// visible.
+// catalog and a distinct compact receipt. The active grant and its page remain
+// unchanged so the subsequent source removal is still authorized. A lost
+// response is retained by NativeSession and settled byte-identically through
+// RetryPending; no uncertified catalog can become visible.
 func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	ctx context.Context,
 	expectedGeneration uint64,
@@ -371,7 +377,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 ) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
 		!expected.Valid() || expected.CatalogGeneration != expectedGeneration ||
-		expectedGeneration == ^uint64(0) || authority.session.bundle.maxMutations < 3 {
+		expectedGeneration == ^uint64(0) || authority.session.bundle.maxMutations < 4 {
 		return ErrReplicatedCatalog
 	}
 	ctx, err := authority.authorizedContext(ctx)
@@ -430,6 +436,50 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if !found {
 		return ErrReplicatedCatalogConflict
 	}
+	receiptKey, receiptPageKey := replicatedReplicaReplacementReceiptKeys(expected.Group)
+	priorReceipt, err := authority.readRaw(
+		ctx, receiptKey[:], maxReplicatedReplicaReplacementReceiptBytes,
+	)
+	if err != nil {
+		return err
+	}
+	receiptPage, err := authority.readRaw(
+		ctx, receiptPageKey[:], maxReplicatedMembershipGrantPageBytes,
+	)
+	if err != nil {
+		return err
+	}
+	var receiptGroups []raftmember.GroupKey
+	if receiptPage.Found {
+		receiptGroups, err = openReplicaReplacementReceiptPage(
+			receiptPageKey[1], receiptPage.Value,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	receiptPosition, receiptFound := findReplicatedMembershipGrantGroup(
+		receiptGroups, expected.Group,
+	)
+	if priorReceipt.Found != receiptFound {
+		return ErrReplicatedCatalogConflict
+	}
+	if priorReceipt.Found {
+		prior, openErr := openReplicaReplacementReceipt(priorReceipt.Value)
+		if openErr != nil || prior.Grant.Group != expected.Group ||
+			prior.NewGeneration != cut.snapshot.Generation() ||
+			prior.NewHeadBytes != uint64(len(cut.head)) ||
+			prior.NewHeadDigest != sha256.Sum256(cut.head) {
+			return errors.Join(openErr, ErrReplicatedCatalogConflict)
+		}
+	} else {
+		if len(receiptGroups) >= maxReplicatedMembershipGrantsPerPage {
+			return ErrReplicatedCatalogConflict
+		}
+		receiptGroups = append(receiptGroups, raftmember.GroupKey{})
+		copy(receiptGroups[receiptPosition+1:], receiptGroups[receiptPosition:])
+		receiptGroups[receiptPosition] = expected.Group
+	}
 
 	authority.scratch = authority.scratch[:0]
 	authority.scratch, err = appendReplicatedCatalogDocument(
@@ -452,8 +502,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	}
 	headDigest := sha256.Sum256(cut.head)
 	witnessDigest := sha256.Sum256(cut.witness)
-	recordDigest := sha256.Sum256(record.Value)
-	mutations := make([]NativeMutation, 0, 3)
+	mutations := make([]NativeMutation, 0, 4)
 	mutations = append(mutations,
 		NativeMutation{Kind: replication.MutationPutDigestEqual,
 			Key: replicatedCatalogHeadKey, Value: authority.scratch,
@@ -463,11 +512,33 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 			Key: replicatedCatalogHeadWitnessKey, Value: nextWitness,
 			ExpectedValueLength: uint64(len(cut.witness)),
 			ExpectedValueDigest: replication.Digest(witnessDigest)},
-		NativeMutation{Kind: replication.MutationPutDigestEqual,
-			Key: recordKey[:], Value: receipt,
-			ExpectedValueLength: uint64(len(record.Value)),
-			ExpectedValueDigest: replication.Digest(recordDigest)},
 	)
+	if priorReceipt.Found {
+		digest := sha256.Sum256(priorReceipt.Value)
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+			Key: receiptKey[:], Value: receipt,
+			ExpectedValueLength: uint64(len(priorReceipt.Value)),
+			ExpectedValueDigest: replication.Digest(digest)})
+	} else {
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+			Key: receiptKey[:], Value: receipt})
+		receiptPageBytes, pageErr := appendReplicaReplacementReceiptPage(
+			nil, receiptPageKey[1], receiptGroups,
+		)
+		if pageErr != nil {
+			return pageErr
+		}
+		if receiptPage.Found {
+			digest := sha256.Sum256(receiptPage.Value)
+			mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+				Key: receiptPageKey[:], Value: receiptPageBytes,
+				ExpectedValueLength: uint64(len(receiptPage.Value)),
+				ExpectedValueDigest: replication.Digest(digest)})
+		} else {
+			mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+				Key: receiptPageKey[:], Value: receiptPageBytes})
+		}
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
@@ -486,6 +557,114 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	return authority.holder.publishReplicaReplacementAfter(
 		expectedGeneration, certified, expected,
 	)
+}
+
+// FinalizeReplicaReplacement revokes one exact grant only after the caller has
+// durably proved source removal. The catalog head and replacement receipt are
+// re-read linearly; the CAS deletes the grant and removes only its active-page
+// slot while retaining the separately bounded receipt for stale gateways.
+func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
+	ctx context.Context, expected membershipgrant.Grant,
+) error {
+	if authority == nil || authority.session == nil || ctx == nil ||
+		!expected.Valid() || expected.CatalogGeneration == ^uint64(0) ||
+		authority.session.bundle.maxMutations < 3 {
+		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	cut, err := authority.readCatalogCut(ctx)
+	if err != nil {
+		return err
+	}
+	if cut.snapshot.Generation() != expected.CatalogGeneration+1 {
+		return ErrCatalogGenerationMismatch
+	}
+	receiptKey, _ := replicatedReplicaReplacementReceiptKeys(expected.Group)
+	receiptResult, err := authority.readRaw(
+		ctx, receiptKey[:], maxReplicatedReplicaReplacementReceiptBytes,
+	)
+	if err != nil {
+		return err
+	}
+	if !receiptResult.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	receipt, err := openReplicaReplacementReceipt(receiptResult.Value)
+	if err != nil || receipt.Grant != expected ||
+		receipt.NewGeneration != cut.snapshot.Generation() ||
+		receipt.NewHeadBytes != uint64(len(cut.head)) ||
+		receipt.NewHeadDigest != sha256.Sum256(cut.head) {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	recordKey, pageKey := replicatedMembershipGrantKeys(expected.Group)
+	record, err := authority.readRaw(ctx, recordKey[:], maxReplicatedMembershipGrantBytes)
+	if err != nil {
+		return err
+	}
+	if record.Found {
+		stored, openErr := openReplicatedMembershipGrant(record.Value)
+		if openErr != nil || stored != expected {
+			return errors.Join(openErr, ErrReplicatedCatalogConflict)
+		}
+	}
+	page, err := authority.readRaw(ctx, pageKey[:], maxReplicatedMembershipGrantPageBytes)
+	if err != nil {
+		return err
+	}
+	if !page.Found && !record.Found {
+		return nil
+	}
+	if !page.Found {
+		return ErrReplicatedCatalogConflict
+	}
+	groups, err := openReplicatedMembershipGrantPage(pageKey[1], page.Value)
+	if err != nil {
+		return err
+	}
+	position, found := findReplicatedMembershipGrantGroup(groups, expected.Group)
+	if !record.Found && !found {
+		return nil
+	}
+	if !found {
+		return ErrReplicatedCatalogConflict
+	}
+	groups = append(groups[:position], groups[position+1:]...)
+	witnessDigest := sha256.Sum256(cut.witness)
+	recordDigest := sha256.Sum256(record.Value)
+	pageDigest := sha256.Sum256(page.Value)
+	mutations := []NativeMutation{
+		{Kind: replication.MutationPutDigestEqual,
+			Key: replicatedCatalogHeadWitnessKey, Value: cut.witness,
+			ExpectedValueLength: uint64(len(cut.witness)),
+			ExpectedValueDigest: replication.Digest(witnessDigest)},
+		{Kind: replication.MutationDeleteDigestEqual,
+			Key: recordKey[:], ExpectedValueLength: uint64(len(record.Value)),
+			ExpectedValueDigest: replication.Digest(recordDigest)},
+	}
+	if len(groups) == 0 {
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationDeleteDigestEqual,
+			Key: pageKey[:], ExpectedValueLength: uint64(len(page.Value)),
+			ExpectedValueDigest: replication.Digest(pageDigest)})
+	} else {
+		pageBytes, pageErr := appendReplicatedMembershipGrantPage(nil, pageKey[1], groups)
+		if pageErr != nil {
+			return pageErr
+		}
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+			Key: pageKey[:], Value: pageBytes,
+			ExpectedValueLength: uint64(len(page.Value)),
+			ExpectedValueDigest: replication.Digest(pageDigest)})
+	}
+	native, err := authority.session.MutateBatch(ctx, mutations)
+	return finishReplicatedMembershipGrantMutation(authority, native, err)
 }
 
 func finishReplicatedMembershipGrantMutation(authority *ReplicatedCatalogAuthority,
@@ -680,6 +859,62 @@ func openReplicatedMembershipGrantPage(pageIndex byte, raw []byte) ([]raftmember
 	return groups, nil
 }
 
+func appendReplicaReplacementReceiptPage(dst []byte, pageIndex byte,
+	groups []raftmember.GroupKey) ([]byte, error) {
+	if pageIndex >= replicatedMembershipGrantPages ||
+		len(groups) > maxReplicatedMembershipGrantsPerPage {
+		return dst, ErrReplicatedCatalog
+	}
+	page := persistedMembershipGrantPage{
+		Groups: make([]persistedMembershipGrantGroup, len(groups)),
+	}
+	for index := range groups {
+		_, pageKey := replicatedReplicaReplacementReceiptKeys(groups[index])
+		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
+			return dst, ErrReplicatedCatalog
+		}
+		page.Groups[index] = persistMembershipGrantGroup(groups[index])
+	}
+	raw, err := vibejson.Marshal(&page)
+	if err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	dst, err = vibejson.AppendCanonicalize(dst, raw)
+	if err != nil || len(dst)-start == 0 ||
+		len(dst)-start > maxReplicatedMembershipGrantPageBytes {
+		return dst[:start], errors.Join(err, ErrReplicatedCatalog)
+	}
+	return dst, nil
+}
+
+func openReplicaReplacementReceiptPage(pageIndex byte, raw []byte) ([]raftmember.GroupKey, error) {
+	if pageIndex >= replicatedMembershipGrantPages || len(raw) == 0 ||
+		len(raw) > maxReplicatedMembershipGrantPageBytes {
+		return nil, ErrReplicatedCatalog
+	}
+	var page persistedMembershipGrantPage
+	if err := vibejson.Unmarshal(raw, &page); err != nil ||
+		len(page.Groups) > maxReplicatedMembershipGrantsPerPage {
+		return nil, errors.Join(err, ErrReplicatedCatalog)
+	}
+	groups := make([]raftmember.GroupKey, len(page.Groups))
+	for index := range page.Groups {
+		groups[index] = openPersistedMembershipGrantGroup(page.Groups[index])
+		_, pageKey := replicatedReplicaReplacementReceiptKeys(groups[index])
+		if !validMembershipGrantGroup(groups[index]) || pageKey[1] != pageIndex || index != 0 &&
+			compareMembershipGrantGroup(groups[index-1], groups[index]) >= 0 {
+			return nil, ErrReplicatedCatalog
+		}
+	}
+	canonical, err := appendReplicaReplacementReceiptPage(nil, pageIndex, groups)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return nil, errors.Join(err, ErrReplicatedCatalog)
+	}
+	return groups, nil
+}
+
 func findReplicatedMembershipGrantGroup(groups []raftmember.GroupKey,
 	group raftmember.GroupKey) (int, bool) {
 	index := sort.Search(len(groups), func(index int) bool {
@@ -689,6 +924,20 @@ func findReplicatedMembershipGrantGroup(groups []raftmember.GroupKey,
 }
 
 func replicatedMembershipGrantKeys(group raftmember.GroupKey) ([33]byte, [2]byte) {
+	return replicatedMembershipLifecycleKeys(
+		group, replicatedMembershipGrantKeyByte, replicatedMembershipGrantPageKeyByte,
+	)
+}
+
+func replicatedReplicaReplacementReceiptKeys(group raftmember.GroupKey) ([33]byte, [2]byte) {
+	return replicatedMembershipLifecycleKeys(
+		group, replicatedReplicaReplacementReceiptKeyByte,
+		replicatedReplicaReplacementReceiptPageKeyByte,
+	)
+}
+
+func replicatedMembershipLifecycleKeys(group raftmember.GroupKey,
+	recordKind, pageKind byte) ([33]byte, [2]byte) {
 	var input [96]byte
 	offset := copy(input[:], []byte("vibedb/membership-grant\x00"))
 	offset += copy(input[offset:], group.ClusterID[:])
@@ -699,9 +948,9 @@ func replicatedMembershipGrantKeys(group raftmember.GroupKey) ([33]byte, [2]byte
 	offset += copy(input[offset:], group.GroupID[:])
 	digest := sha256.Sum256(input[:offset])
 	var record [33]byte
-	record[0] = replicatedMembershipGrantKeyByte
+	record[0] = recordKind
 	copy(record[1:], digest[:])
-	page := [2]byte{replicatedMembershipGrantPageKeyByte,
+	page := [2]byte{pageKind,
 		digest[0] & (replicatedMembershipGrantPages - 1)}
 	return record, page
 }
