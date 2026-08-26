@@ -1,9 +1,11 @@
 package splitcontroller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -13,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // ChildRuntimeAdopter is the live multi-Raft ownership boundary. AdoptChild
@@ -67,6 +70,13 @@ func NewLocalChildLifecycle(options LocalChildLifecycleOptions) (*LocalChildLife
 	if err := replicatedstate.ValidateSnapshotArtifactOptions(options.ArtifactOptions); err != nil {
 		return nil, errors.Join(ErrRuntimeStore, err)
 	}
+	options.StaticBootstrap = proto.Clone(options.StaticBootstrap).(*pb.Snapshot)
+	options.WALPath = strings.Clone(options.WALPath)
+	options.WALIdentity.Distribution = strings.Clone(options.WALIdentity.Distribution)
+	options.WALIdentity.Shard = strings.Clone(options.WALIdentity.Shard)
+	options.WALKey.ID = strings.Clone(options.WALKey.ID)
+	options.WALKey.Wrapped = bytes.Clone(options.WALKey.Wrapped)
+	options.SQL = options.SQL.Clone()
 	return &LocalChildLifecycle{options: options}, nil
 }
 
