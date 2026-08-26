@@ -279,6 +279,7 @@ func (r *Router) buildRoute(
 		targets[k] = Target{
 			Shard:                s.ID,
 			AllocationGeneration: s.AllocationGeneration,
+			ManifestOrdinal:      i,
 			Endpoint:             s.Leaders[0],
 			OwnershipEpoch:       s.Epoch,
 			Role:                 RoleLeader,

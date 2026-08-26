@@ -509,7 +509,7 @@ func TestRouteClassificationAndTargets(t *testing.T) {
 	if single.Kind != RouteSingle || len(single.Targets) != 1 {
 		t.Fatalf("single: route = %+v, want one RouteSingle target", single)
 	}
-	if got, want := single.Targets[0], (Target{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}); got != want {
+	if got, want := single.Targets[0], (Target{Shard: "s0", AllocationGeneration: 1, ManifestOrdinal: 0, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader}); got != want {
 		t.Fatalf("single target = %+v, want %+v", got, want)
 	}
 
@@ -520,8 +520,8 @@ func TestRouteClassificationAndTargets(t *testing.T) {
 		t.Fatalf("targeted: route = %+v, want two RouteTargeted targets", targeted)
 	}
 	want := []Target{
-		{Shard: "s0", AllocationGeneration: 1, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader},
-		{Shard: "s1", AllocationGeneration: 2, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader},
+		{Shard: "s0", AllocationGeneration: 1, ManifestOrdinal: 0, Endpoint: "ep-0a", OwnershipEpoch: 11, Role: RoleLeader},
+		{Shard: "s1", AllocationGeneration: 2, ManifestOrdinal: 1, Endpoint: "ep-1", OwnershipEpoch: 22, Role: RoleLeader},
 	}
 	for i := range want {
 		if targeted.Targets[i] != want[i] {

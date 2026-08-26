@@ -84,6 +84,9 @@ type Options struct {
 	// ReplicatedTransactionRequests owns caller request identities and every
 	// outcome-unknown recovery handle used by the shipped RF3 write lane.
 	ReplicatedTransactionRequests *ReplicatedTransactionRequestRegistry
+	// Pressure receives bounded, catalog-fenced routing samples for autonomous
+	// hot-shard scheduling. It is advisory and never grants serving authority.
+	Pressure PressureObserver
 }
 
 // defaultMaxRetries bounds stale-generation retries when Options leaves it zero.
@@ -102,6 +105,7 @@ type Executor struct {
 	internalAuthority             serviceauthz.Authority
 	replicatedTransactions        *ReplicatedTransactionOrchestrator
 	replicatedTransactionRequests *ReplicatedTransactionRequestRegistry
+	pressure                      PressureObserver
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -131,6 +135,7 @@ func NewExecutor(client *Client, catalog *CatalogHolder, opts Options) *Executor
 		internalAuthority:             opts.InternalAuthority,
 		replicatedTransactions:        opts.ReplicatedTransactions,
 		replicatedTransactionRequests: opts.ReplicatedTransactionRequests,
+		pressure:                      opts.Pressure,
 	}
 }
 
@@ -272,6 +277,7 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
 		res, err := e.dispatch(opctx, pl, profile)
@@ -366,6 +372,9 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		}
 
 		var res *Result
+		if call != nil {
+			e.observePressureCall(*call)
+		}
 		if call != nil && bound.requiresIndexTransaction() {
 			participants, participantErr := appendBoundWriteParticipants(
 				nil, *call, &q, bound, profile,
@@ -474,7 +483,9 @@ func (e *Executor) routeWrite(snap *Snapshot, q *Query, bound *BoundWritePlan, p
 	}
 	bucketBits, accessScopes := writeAccessScopes(bound, targets[0])
 	call := &shardCall{
-		target:  targets[0],
+		target: targets[0], pressureSource: pressureSourceForTarget(
+			bound.manifest, bound.spec.EffectiveBucketBits(), targets[0],
+		),
 		address: addr,
 		req: &shardservice.ShardRequest{
 			SQL:                  q.SQL,

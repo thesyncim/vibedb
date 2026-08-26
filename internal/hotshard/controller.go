@@ -59,10 +59,18 @@ type Policy struct {
 }
 
 func DefaultPolicy() Policy {
-	return Policy{
+	policy := Policy{
 		Tracker: autosplit.DefaultTrackerPolicy(), Split: topologyscheduler.DefaultPolicy(),
 		Move: topologyscheduler.DefaultReplicaMovePolicy(), MoveTriggerPressurePPM: 900_000,
 	}
+	// The current catalog authority publishes one global generation CAS at a
+	// time. Admit one topology operation per pressure cut; this is not a shard,
+	// transaction, or cluster-size ceiling. A later batch catalog transition can
+	// raise both without changing evidence collection.
+	policy.Split.MaxBatch = 1
+	policy.Split.MaxPerDistribution = 1
+	policy.Move.MaxMoves = 1
+	return policy
 }
 
 // SplitWork and MoveWork are detached scheduler results retained in one
@@ -239,7 +247,14 @@ func (c *Controller) Process(
 		c.rollback(oldStamp, oldCount)
 		return Admission{}, errors.Join(err, ErrInvalidPressureCut)
 	}
-	moveCount = c.removeSplitMoveCollisions(moveCount, decision)
+	if decision.Count != 0 {
+		// A catalog generation is one publication serial point. Recompute node
+		// movement after the selected split publishes instead of admitting a
+		// deliberately stale sibling operation from this generation.
+		moveCount = 0
+	} else {
+		moveCount = c.removeSplitMoveCollisions(moveCount, decision)
+	}
 	var moveCut topologyscheduler.ReplicaMoveCut
 	if moveCount != 0 {
 		moveCut, err = topologyscheduler.SelectReplicaMoves(catalog,
