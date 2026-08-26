@@ -13,7 +13,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,24 +49,30 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("external four-process RF3 qualification")
 	}
-	evidencePath := os.Getenv("VIBEDB_REPLICA_REPLACEMENT_EVIDENCE")
-	if evidencePath == "" {
+	evidenceRoot := os.Getenv("VIBEDB_REPLICA_REPLACEMENT_EVIDENCE")
+	if evidenceRoot == "" {
 		t.Fatal("VIBEDB_REPLICA_REPLACEMENT_EVIDENCE is required for qualification")
+	}
+	if err := os.MkdirAll(evidenceRoot, 0o700); err != nil {
+		t.Fatal(err)
 	}
 	qualificationStarted := time.Now()
 	phase, finalGeneration := "setup", uint64(0)
+	var measurements replicaProcessMeasurements
 	defer func() {
 		result := "pass"
 		if t.Failed() {
 			result = "fail"
 		}
 		raw := fmt.Appendf(nil,
-			"schema\tvibedb.replica-replacement-process\t1\nresult\t%s\nphase\t%s\nelapsed_millis\t%d\nfinal_catalog_generation\t%d\n",
+			"schema\tvibedb.replica-replacement-process\t2\nresult\t%s\nphase\t%s\nelapsed_millis\t%d\nfinal_catalog_generation\t%d\n",
 			result, phase, time.Since(qualificationStarted).Milliseconds(), finalGeneration)
+		raw = measurements.appendTSV(raw)
 		if len(raw) > 64<<10 {
 			t.Errorf("replica replacement evidence exceeded 64 KiB")
 			return
 		}
+		evidencePath := filepath.Join(evidenceRoot, fmt.Sprintf("run-%d-%d.tsv", os.Getpid(), qualificationStarted.UnixNano()))
 		if err := os.WriteFile(evidencePath, raw, 0o600); err != nil {
 			t.Errorf("write replica replacement evidence: %v", err)
 		}
@@ -147,6 +156,9 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	seed := replicaProcessCatalogSeed(t, snapshot)
+	for _, document := range seed {
+		measurements.logicalBytes += uint64(len(document))
+	}
 	var servingNodes [3]rafttransport.NodeID
 	var servingPeers [3]string
 	copy(servingNodes[:], nodes[:3])
@@ -243,6 +255,20 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	phase = "gateway_ready"
 
+	measurements.initialStorageBytes = replicaProcessAllocatedBytes(root, "")
+	measurements.initialWALBytes = replicaProcessAllocatedBytes(root, ".wal")
+	metricStop := make(chan struct{})
+	metricDone := make(chan struct{})
+	go replicaProcessSampleMetrics(metricStop, metricDone, &measurements, root,
+		[]*rf3testfixture.ExternalProcess{voters[0], voters[1], voters[2], coldTarget, gatewayProcess})
+	defer func() {
+		select {
+		case <-metricDone:
+		default:
+			close(metricStop)
+			<-metricDone
+		}
+	}()
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -260,18 +286,24 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		t.Fatalf("restarted gateway readiness: %v\n%s", err, gatewayProcess.Diagnostics())
 	}
 	phase = "controller_restarted"
+	measurements.controllerRestartMillis = uint64(time.Since(started).Milliseconds())
 
 	// The old member is reopened after the final roster can be observed. This
 	// gives the durable retirement action a live endpoint for certified cleanup,
 	// while its stale WAL still cannot recover serving authority.
 	restartedSource := false
 	sourceReady := false
+	var sourceRestarted time.Time
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
 				err, gatewayProcess.Diagnostics(), coldTarget.Diagnostics())
 		}
 		current, loadErr := gateway.LoadSnapshot(catalogPath)
+		if measurements.failoverMillis == 0 &&
+			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
+			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
+		}
 		if loadErr == nil {
 			descriptors := current.ReplicatedShardDescriptors()
 			if len(descriptors) == 1 && replicaProcessRosterContains(descriptors[0], 4) &&
@@ -281,6 +313,7 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 						t.Fatal(err)
 					}
 					restartedSource = true
+					sourceRestarted = time.Now()
 				}
 				if !sourceReady && strings.Contains(voters[0].Diagnostics(), "vibedb-shard RF3 ready") {
 					sourceReady = true
@@ -299,6 +332,10 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 		t.Fatal("retired source was not reopened for cleanup")
 	}
 	phase = "replacement_complete"
+	measurements.replacementMillis = uint64(time.Since(started).Milliseconds())
+	if !sourceRestarted.IsZero() {
+		measurements.cleanupMillis = uint64(time.Since(sourceRestarted).Milliseconds())
+	}
 	if elapsed := time.Since(started); elapsed > 90*time.Second {
 		t.Fatalf("replacement latency %s exceeded bound", elapsed)
 	}
@@ -327,6 +364,13 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	finalGeneration = final.Generation()
 	phase = "terminal_reopen_verified"
+	close(metricStop)
+	<-metricDone
+	measurements.finalStorageBytes = replicaProcessAllocatedBytes(root, "")
+	measurements.finalWALBytes = replicaProcessAllocatedBytes(root, ".wal")
+	if err := measurements.validate(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func replicaProcessNodes() (nodes [5]rafttransport.NodeID) {
@@ -551,6 +595,183 @@ func replicaProcessAllArtifactsEmpty(root string) bool {
 		}
 	}
 	return true
+}
+
+type replicaProcessMeasurements struct {
+	mu sync.Mutex
+
+	failoverMillis, replacementMillis, cleanupMillis uint64
+	controllerRestartMillis                          uint64
+	logicalBytes                                     uint64
+	initialStorageBytes, finalStorageBytes           uint64
+	initialWALBytes, finalWALBytes                   uint64
+	maxSnapshotPayloadBytes, maxRSSBytes             uint64
+}
+
+func TestReplicaProcessMeasurementsEvidenceBounds(t *testing.T) {
+	measurements := replicaProcessMeasurements{
+		failoverMillis: 10, controllerRestartMillis: 11, replacementMillis: 20,
+		cleanupMillis: 5, logicalBytes: 100, initialStorageBytes: 1_000,
+		finalStorageBytes: 2_000, initialWALBytes: 500, finalWALBytes: 700,
+		maxSnapshotPayloadBytes: 300, maxRSSBytes: 400,
+	}
+	if err := measurements.validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw := measurements.appendTSV(nil)
+	for _, exact := range [][]byte{
+		[]byte("metric\tfailover_millis\t10\n"),
+		[]byte("metric\tstorage_growth_bytes\t1000\n"),
+		[]byte("metric\twal_growth_bytes\t200\n"),
+		[]byte("metric\tstorage_amplification_milli\t10000\n"),
+	} {
+		if !strings.Contains(string(raw), string(exact)) {
+			t.Fatalf("missing evidence row %q in %q", exact, raw)
+		}
+	}
+	measurements.failoverMillis = 30_001
+	if err := measurements.validate(); err == nil {
+		t.Fatal("measurement accepted failover above the hard bound")
+	}
+}
+
+func (measurements *replicaProcessMeasurements) appendTSV(raw []byte) []byte {
+	measurements.mu.Lock()
+	defer measurements.mu.Unlock()
+	storageGrowth := positiveDifference(measurements.finalStorageBytes,
+		measurements.initialStorageBytes)
+	walGrowth := positiveDifference(measurements.finalWALBytes, measurements.initialWALBytes)
+	amplification := uint64(0)
+	if measurements.logicalBytes != 0 && storageGrowth <= ^uint64(0)/1000 {
+		amplification = storageGrowth * 1000 / measurements.logicalBytes
+	}
+	metrics := [...]struct {
+		name  string
+		value uint64
+	}{
+		{"failover_millis", measurements.failoverMillis},
+		{"controller_restart_millis", measurements.controllerRestartMillis},
+		{"replacement_millis", measurements.replacementMillis},
+		{"cleanup_millis", measurements.cleanupMillis},
+		{"snapshot_network_payload_bytes", measurements.maxSnapshotPayloadBytes},
+		{"max_rss_bytes", measurements.maxRSSBytes},
+		{"storage_growth_bytes", storageGrowth},
+		{"wal_growth_bytes", walGrowth},
+		{"storage_amplification_milli", amplification},
+		{"logical_catalog_bytes", measurements.logicalBytes},
+	}
+	for _, metric := range metrics {
+		raw = fmt.Appendf(raw, "metric\t%s\t%d\n", metric.name, metric.value)
+	}
+	return raw
+}
+
+func (measurements *replicaProcessMeasurements) validate() error {
+	measurements.mu.Lock()
+	defer measurements.mu.Unlock()
+	storageGrowth := positiveDifference(measurements.finalStorageBytes,
+		measurements.initialStorageBytes)
+	walGrowth := positiveDifference(measurements.finalWALBytes, measurements.initialWALBytes)
+	if measurements.failoverMillis == 0 || measurements.failoverMillis > 30_000 ||
+		measurements.controllerRestartMillis == 0 || measurements.controllerRestartMillis > 15_000 ||
+		measurements.replacementMillis == 0 || measurements.replacementMillis > 90_000 ||
+		measurements.cleanupMillis == 0 || measurements.cleanupMillis > 60_000 ||
+		measurements.maxSnapshotPayloadBytes == 0 || measurements.maxSnapshotPayloadBytes > 1<<30 ||
+		measurements.maxRSSBytes == 0 || measurements.maxRSSBytes > 8<<30 ||
+		storageGrowth > 2<<30 || walGrowth > 512<<20 || measurements.logicalBytes == 0 {
+		return fmt.Errorf("replica process performance bounds: failover=%dms restart=%dms replacement=%dms cleanup=%dms snapshot=%d rss=%d storage-growth=%d wal-growth=%d logical=%d",
+			measurements.failoverMillis, measurements.controllerRestartMillis,
+			measurements.replacementMillis, measurements.cleanupMillis,
+			measurements.maxSnapshotPayloadBytes, measurements.maxRSSBytes,
+			storageGrowth, walGrowth, measurements.logicalBytes)
+	}
+	return nil
+}
+
+func positiveDifference(after, before uint64) uint64 {
+	if after <= before {
+		return 0
+	}
+	return after - before
+}
+
+func replicaProcessSampleMetrics(stop <-chan struct{}, done chan<- struct{},
+	measurements *replicaProcessMeasurements, root string,
+	processes []*rf3testfixture.ExternalProcess,
+) {
+	defer close(done)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		rss := uint64(0)
+		for _, process := range processes {
+			rss += replicaProcessRSS(process.PID())
+		}
+		snapshot := replicaProcessSnapshotPayloadBytes(root)
+		measurements.mu.Lock()
+		measurements.maxRSSBytes = max(measurements.maxRSSBytes, rss)
+		measurements.maxSnapshotPayloadBytes = max(measurements.maxSnapshotPayloadBytes, snapshot)
+		measurements.mu.Unlock()
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func replicaProcessRSS(pid int) uint64 {
+	if pid <= 0 {
+		return 0
+	}
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "VmRSS:" && fields[2] == "kB" {
+			value, err := strconv.ParseUint(fields[1], 10, 64)
+			if err == nil && value <= ^uint64(0)/1024 {
+				return value * 1024
+			}
+		}
+	}
+	return 0
+}
+
+func replicaProcessSnapshotPayloadBytes(root string) uint64 {
+	total := uint64(0)
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.Contains(path, "source-artifacts") &&
+			!strings.Contains(path, "target-artifacts") {
+			return nil
+		}
+		info, err := entry.Info()
+		if err == nil && info.Size() > 0 {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	return total
+}
+
+func replicaProcessAllocatedBytes(root, suffix string) uint64 {
+	total := uint64(0)
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || suffix != "" && !strings.HasSuffix(path, suffix) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Blocks > 0 {
+			total += uint64(stat.Blocks) * 512
+		}
+		return nil
+	})
+	return total
 }
 
 func replicaProcessTreeBounded(t testing.TB, root, prefix string, maxFiles int,

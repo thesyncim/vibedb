@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           evidence="${RUNNER_TEMP}/replica-replacement"
-          mkdir -p "${evidence}"
+          mkdir -p "${evidence}/runs"
           git rev-parse HEAD > "${evidence}/revision.txt"
           go version > "${evidence}/go-version.txt"
           go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
@@ -61,17 +61,17 @@ jobs:
           test_name='TestGatewayAutomaticReplicaReplacementProcesses'
           go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=1 -timeout=4m -run %s ./cmd/vibedb-gateway\n' \
-            "${evidence}/result.tsv" "^${test_name}$" > "${evidence}/command.txt"
+          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./cmd/vibedb-gateway\n' \
+            "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
       - name: Automatic replica-replacement process qualification
         if: matrix.runner == 'ubuntu-latest'
         shell: bash
         env:
           VIBEDB_REPLICA_REPLACEMENT_E2E: "1"
-          VIBEDB_REPLICA_REPLACEMENT_EVIDENCE: ${{ runner.temp }}/replica-replacement/result.tsv
+          VIBEDB_REPLICA_REPLACEMENT_EVIDENCE: ${{ runner.temp }}/replica-replacement/runs
         run: |
           set -euo pipefail
-          go test -json -count=1 -timeout=4m \
+          go test -json -count=3 -timeout=8m \
             -run '^TestGatewayAutomaticReplicaReplacementProcesses$' \
             ./cmd/vibedb-gateway \
             | tee "${RUNNER_TEMP}/replica-replacement/go-test.jsonl"
@@ -83,22 +83,50 @@ jobs:
           evidence="${RUNNER_TEMP}/replica-replacement"
           test_name='TestGatewayAutomaticReplicaReplacementProcesses'
           test -s "${evidence}/go-test.jsonl"
-          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 16777216
-          jq -e --arg test_name "${test_name}" \
-            'select(.Action == "pass" and .Test == $test_name)' \
-            "${evidence}/go-test.jsonl" >/dev/null
+          test "$(stat -c %s "${evidence}/go-test.jsonl")" -le 50331648
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 3
           if jq -e --arg test_name "${test_name}" \
             'select(.Action == "skip" and .Test == $test_name)' \
             "${evidence}/go-test.jsonl" >/dev/null; then
             echo "replica replacement qualification skipped" >&2
             exit 1
           fi
-          result="${evidence}/result.tsv"
-          test -s "${result}"
-          test "$(stat -c %s "${result}")" -le 65536
-          grep -Fqx $'schema\tvibedb.replica-replacement-process\t1' "${result}"
-          grep -Fqx $'result\tpass' "${result}"
-          grep -Fqx $'phase\tterminal_reopen_verified' "${result}"
+          shopt -s nullglob
+          runs=("${evidence}"/runs/run-*.tsv)
+          test "${#runs[@]}" -eq 3
+          for result in "${runs[@]}"; do
+            test -s "${result}"
+            test "$(stat -c %s "${result}")" -le 65536
+            grep -Fqx $'schema\tvibedb.replica-replacement-process\t2' "${result}"
+            grep -Fqx $'result\tpass' "${result}"
+            grep -Fqx $'phase\tterminal_reopen_verified' "${result}"
+          done
+          summary="${evidence}/summary.tsv"
+          printf 'schema\tvibedb.replica-replacement-summary\t1\nmetric\tp50\tp99\tmax\tmaximum\n' > "${summary}"
+          while read -r metric maximum; do
+            mapfile -t values < <(awk -F $'\t' -v metric="${metric}" \
+              '$1 == "metric" && $2 == metric {print $3}' "${runs[@]}" | sort -n)
+            test "${#values[@]}" -eq 3
+            p50="${values[1]}"
+            p99="${values[2]}"
+            max_value="${values[2]}"
+            test "${max_value}" -le "${maximum}"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "${metric}" "${p50}" "${p99}" "${max_value}" "${maximum}" >> "${summary}"
+          done <<'EOF'
+          failover_millis 30000
+          controller_restart_millis 15000
+          replacement_millis 90000
+          cleanup_millis 60000
+          snapshot_network_payload_bytes 1073741824
+          max_rss_bytes 8589934592
+          storage_growth_bytes 2147483648
+          wal_growth_bytes 536870912
+          storage_amplification_milli 5000000
+          EOF
+          test "$(stat -c %s "${summary}")" -le 65536
       - name: Upload replica-replacement evidence
         if: always() && matrix.runner == 'ubuntu-latest'
         uses: actions/upload-artifact@v4

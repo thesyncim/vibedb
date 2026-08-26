@@ -189,6 +189,26 @@ func (process *ExternalProcess) Diagnostics() string {
 	return diagnostic.String()
 }
 
+// PID returns the current child identity for bounded Linux qualification
+// sampling. Zero means no child is running. Callers must still tolerate the
+// process exiting immediately after the sample.
+func (process *ExternalProcess) PID() int {
+	if process == nil {
+		return 0
+	}
+	process.mu.Lock()
+	defer process.mu.Unlock()
+	if process.command == nil || process.command.Process == nil || process.exited == nil {
+		return 0
+	}
+	select {
+	case <-process.exited:
+		return 0
+	default:
+		return process.command.Process.Pid
+	}
+}
+
 type ReservedAddresses struct {
 	Listeners []*net.TCPListener
 	Addresses []string
