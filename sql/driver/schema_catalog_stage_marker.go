@@ -17,6 +17,8 @@ import (
 const (
 	replicatedSchemaStageMarkerName    = ".schema-membership-stage"
 	replicatedSchemaStageMarkerTemp    = ".schema-membership-stage.tmp"
+	replicatedSchemaTargetCatalogName  = ".schema-target-catalog"
+	replicatedSchemaTargetCatalogTemp  = ".schema-target-catalog.tmp"
 	replicatedSchemaStageHeaderBytes   = 232
 	replicatedSchemaStageChecksumBytes = sha256.Size
 )
@@ -215,6 +217,85 @@ func writeReplicatedSchemaStageMarker(dataDir string, marker replicatedSchemaSta
 			if encodeErr == nil && bytes.Equal(existingRaw, raw) {
 				return nil
 			}
+		}
+	}
+	return err
+}
+
+func readReplicatedSchemaTargetCatalog(
+	dataDir string,
+	expected ReplicatedSchemaCatalogImage,
+) ([]byte, error) {
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	file, err := root.Open(replicatedSchemaTargetCatalogName)
+	if err != nil {
+		return nil, err
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
+	err = errors.Join(readErr, file.Close())
+	if err != nil {
+		return nil, err
+	}
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil || image != expected {
+		return nil, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return raw[:len(raw):len(raw)], nil
+}
+
+// writeReplicatedSchemaTargetCatalog retains the exact canonical target bytes
+// beside the membership marker before any Raft proposal. Recovery therefore
+// never depends on an external installer artifact after the old bundle has
+// been durably fenced. Exact retries are idempotent; substitution fails closed.
+func writeReplicatedSchemaTargetCatalog(
+	dataDir string,
+	raw []byte,
+	expected ReplicatedSchemaCatalogImage,
+) error {
+	image, err := ValidateReplicatedSchemaCatalogImage(raw)
+	if err != nil || image != expected {
+		return errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	if existing, readErr := readReplicatedSchemaTargetCatalog(dataDir, expected); readErr == nil {
+		if bytes.Equal(existing, raw) {
+			return nil
+		}
+		return ErrReplicatedSchemaCatalogImage
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	_ = root.Remove(replicatedSchemaTargetCatalogTemp)
+	file, err := root.OpenFile(
+		replicatedSchemaTargetCatalogTemp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600,
+	)
+	if err == nil {
+		_, err = file.Write(raw)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if file != nil {
+		err = errors.Join(err, file.Close())
+	}
+	if err == nil {
+		err = root.Rename(replicatedSchemaTargetCatalogTemp, replicatedSchemaTargetCatalogName)
+	}
+	if err == nil {
+		err = syncDirectory(dataDir)
+	}
+	if err != nil {
+		if existing, readErr := readReplicatedSchemaTargetCatalog(dataDir, expected); readErr == nil &&
+			bytes.Equal(existing, raw) {
+			return nil
 		}
 	}
 	return err

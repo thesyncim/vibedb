@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"os"
 	"testing"
 
@@ -84,6 +85,13 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 		prepared.Membership.Target == ([32]byte{}) || prepared.Witness == proof.Witness {
 		t.Fatalf("prepared target proof = %+v, %v", prepared, err)
 	}
+	stagedCatalog, err := readReplicatedSchemaTargetCatalog(
+		path+".tables", prepared.Catalog,
+	)
+	if err != nil || !bytes.Equal(stagedCatalog, targetRaw) || cap(stagedCatalog) != len(stagedCatalog) {
+		t.Fatalf("staged target catalog bytes=%d/%d err=%v",
+			len(stagedCatalog), cap(stagedCatalog), err)
+	}
 	command, err := claim.AppendReplicatedSchemaTransition(
 		nil, prepared, ReplicatedSchemaTransitionAuthority{
 			RequestDigest: [32]byte{0xa5}, AuthorizationDigest: [32]byte{0xb6},
@@ -115,6 +123,12 @@ func TestReplicatedSchemaTargetCertifiesFreshImmutableRelationImage(t *testing.T
 	}
 	if _, err = os.Stat(path + ".tables/" + storage + ".vjc"); err != nil {
 		t.Fatalf("reopen removed prepared target: %v", err)
+	}
+	stagedCatalog, err = readReplicatedSchemaTargetCatalog(
+		path+".tables", prepared.Catalog,
+	)
+	if err != nil || !bytes.Equal(stagedCatalog, targetRaw) {
+		t.Fatalf("reopened target catalog bytes=%d err=%v", len(stagedCatalog), err)
 	}
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)

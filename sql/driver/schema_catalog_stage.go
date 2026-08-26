@@ -83,6 +83,11 @@ func (a *ReplicatedApply) PrepareReplicatedSchemaTarget(
 		}
 		proof.SourceApplied = expectedApplied
 		proof.Membership = witness
+		if err := writeReplicatedSchemaTargetCatalog(
+			a.database.dataDir, raw, proof.Catalog,
+		); err != nil {
+			return err
+		}
 		storages, err := schemaStageStorageIDs(target)
 		if err != nil {
 			return err
