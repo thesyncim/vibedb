@@ -9,7 +9,7 @@ import (
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const validDurableExecBatchAckFixture = `{"op":"ack_exec_batch","request_id":"0102030405060708090a0b0c0d0e0f10","request_digest":"1111111111111111111111111111111111111111111111111111111111111111","issuer_epoch":7,"issuer_lane":"2122232425262728","issuer_sequence":9,"terminal_revision":11,"result_digest":"3131313131313131313131313131313131313131313131313131313131313131","ack_token":"4141414141414141414141414141414141414141414141414141414141414141"}`
+const validDurableExecBatchAckFixture = `{"op":"ack_exec_batch","request_id":"0102030405060708090a0b0c0d0e0f10","request_digest":"1111111111111111111111111111111111111111111111111111111111111111","installation_id":"21212121212121212121212121212121","issuer_epoch":7,"lane_ordinal":3,"grant_digest":"2222222222222222222222222222222222222222222222222222222222222222","issuer_sequence":9,"terminal_revision":11,"result_digest":"3131313131313131313131313131313131313131313131313131313131313131","ack_token":"4141414141414141414141414141414141414141414141414141414141414141"}`
 
 func TestDurableExecBatchAckWireRequestRoundTrip(t *testing.T) {
 	var request durableExecBatchAckWireRequest
@@ -17,8 +17,9 @@ func TestDurableExecBatchAckWireRequestRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if request.Identity.RequestID[0] != 1 || request.Identity.RequestID[15] != 16 ||
-		request.Identity.RequestDigest[0] != 0x11 || request.Identity.IssuerEpoch != 7 ||
-		request.Identity.IssuerLane[0] != 0x21 || request.Identity.IssuerSequence != 9 ||
+		request.Identity.RequestDigest[0] != 0x11 || request.Identity.Reference.Epoch != 7 ||
+		request.Identity.Reference.Installation[0] != 0x21 || request.Identity.Reference.LaneOrdinal != 3 ||
+		request.Identity.Reference.GrantDigest[0] != 0x22 || request.Identity.IssuerSequence != 9 ||
 		request.TerminalRevision != 11 || request.ResultDigest[0] != 0x31 ||
 		request.AckToken[0] != 0x41 {
 		t.Fatalf("decoded request = %+v", request)
@@ -32,7 +33,7 @@ func TestDurableExecBatchAckWireRequestRoundTrip(t *testing.T) {
 	if err := writeDurableExecBatchAckResponse(vibejson.NewWriter(&output), &response); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"ok":true,"op":"ack_exec_batch","request_id":"0102030405060708090a0b0c0d0e0f10","request_digest":"1111111111111111111111111111111111111111111111111111111111111111","issuer_epoch":7,"issuer_lane":"2122232425262728","issuer_sequence":9,"terminal_revision":11,"result_digest":"3131313131313131313131313131313131313131313131313131313131313131","ack_token":"4141414141414141414141414141414141414141414141414141414141414141","applied":17,"collection_rounds":2}` + "\n"
+	want := `{"ok":true,"op":"ack_exec_batch","request_id":"0102030405060708090a0b0c0d0e0f10","request_digest":"1111111111111111111111111111111111111111111111111111111111111111","installation_id":"21212121212121212121212121212121","issuer_epoch":7,"lane_ordinal":3,"grant_digest":"2222222222222222222222222222222222222222222222222222222222222222","issuer_sequence":9,"terminal_revision":11,"result_digest":"3131313131313131313131313131313131313131313131313131313131313131","ack_token":"4141414141414141414141414141414141414141414141414141414141414141","applied":17,"collection_rounds":2}` + "\n"
 	if output.String() != want {
 		t.Fatalf("response = %q, want %q", output.String(), want)
 	}

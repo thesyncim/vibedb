@@ -23,10 +23,10 @@ type durableRequestServiceStub struct {
 }
 
 func (stub *durableRequestServiceStub) OpenIssuer(
-	_ context.Context, authority serviceauthz.Authority, _ uint16,
-) (durableIssuerOpenResult, error) {
+	_ context.Context, authority serviceauthz.Authority, _ gateway.ReplicatedIssuerOpen,
+) (gateway.ReplicatedIssuerLaneGrant, error) {
 	stub.authority = authority
-	return durableIssuerOpenResult{}, errDurableExecBatchUnavailable
+	return gateway.ReplicatedIssuerLaneGrant{}, errDurableExecBatchUnavailable
 }
 
 func (stub *durableRequestServiceStub) ExecBatch(
@@ -48,28 +48,29 @@ func (stub *durableRequestServiceStub) AckExecBatch(
 
 func TestIssuerOpenWireIsStrictCanonicalVibeJSON(t *testing.T) {
 	var request issuerOpenWireRequest
-	if err := decodeIssuerOpenRequest([]byte(`{"op":"issuer_open","lane":0}`), &request); err != nil || request.Lane != 0 {
+	valid := `{"op":"issuer_open","installation_id":"01000000000000000000000000000000","issuer_epoch":1,"lane_ordinal":0}`
+	if err := decodeIssuerOpenRequest([]byte(valid), &request); err != nil || request.Open.LaneOrdinal != 0 {
 		t.Fatalf("request=%+v err=%v", request, err)
 	}
 	for _, raw := range []string{
-		`{"lane":0,"op":"issuer_open"}`,
+		`{"lane_ordinal":0,"op":"issuer_open"}`,
 		`{"op":"issuer_open"}`,
-		`{"op":"issuer_open","lane":65536}`,
-		`{"op":"issuer_open","lane":0,"principal":"spoof"}`,
+		strings.Replace(valid, `"issuer_epoch":1`, `"issuer_epoch":2`, 1),
+		strings.TrimSuffix(valid, "}") + `,"principal":"spoof"}`,
 	} {
 		if err := decodeIssuerOpenRequest([]byte(raw), &request); !errors.Is(err, errInvalidIssuerOpen) {
 			t.Fatalf("raw=%s err=%v", raw, err)
 		}
 	}
-	result := durableIssuerOpenResult{
-		Installation: replication.ID128{1}, Epoch: 7,
-		Lane: [8]byte{2}, Authenticator: replication.Digest{3},
+	result := gateway.ReplicatedIssuerLaneGrant{
+		Installation: replication.ID128{1}, Epoch: 1,
+		LaneOrdinal: 2, GrantDigest: replication.Digest{3},
 	}
 	var output bytes.Buffer
 	if err := writeIssuerOpenResponse(vibejson.NewWriter(&output), result); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"ok":true,"op":"issuer_open","installation_id":"01000000000000000000000000000000","issuer_epoch":7,"issuer_lane":"0200000000000000","issuer_authenticator":"0300000000000000000000000000000000000000000000000000000000000000"}` + "\n"
+	want := `{"ok":true,"op":"issuer_open","installation_id":"01000000000000000000000000000000","issuer_epoch":1,"lane_ordinal":2,"grant_digest":"0300000000000000000000000000000000000000000000000000000000000000"}` + "\n"
 	if output.String() != want || !vibejson.Valid(bytes.TrimSpace(output.Bytes())) {
 		t.Fatalf("response=%q", output.String())
 	}
@@ -78,9 +79,9 @@ func TestIssuerOpenWireIsStrictCanonicalVibeJSON(t *testing.T) {
 func TestStructuredExecBatchBindsExactAuthorityAndReturnsAckHandle(t *testing.T) {
 	request := serveRequest{
 		Op: "exec_batch", RequestID: "01000000000000000000000000000000",
-		IssuerEpoch: 7, IssuerLane: "0200000000000000", IssuerSequence: 9,
-		IssuerAuthenticator: strings.Repeat("03", 32),
-		Statements:          []serveStatement{{SQL: `DELETE FROM docs WHERE id = 1`}},
+		InstallationID: "02000000000000000000000000000000", IssuerEpoch: 7,
+		LaneOrdinal: 2, GrantDigest: strings.Repeat("03", 32), IssuerSequence: 9,
+		Statements: []serveStatement{{SQL: `DELETE FROM docs WHERE id = 1`}},
 	}
 	identity, ok := structuredExecBatchIdentity(&request)
 	if !ok {
@@ -89,8 +90,7 @@ func TestStructuredExecBatchBindsExactAuthorityAndReturnsAckHandle(t *testing.T)
 	ack := durableExecBatchAckWireRequest{
 		Identity: durableExecBatchAckIdentity{
 			RequestID: identity.RequestID, RequestDigest: replication.Digest{4},
-			IssuerEpoch: identity.IssuerEpoch, IssuerLane: identity.IssuerLane,
-			IssuerSequence: identity.IssuerSequence,
+			Reference: identity.Reference, IssuerSequence: identity.IssuerSequence,
 		},
 		TerminalRevision: 11, ResultDigest: replication.Digest{5}, AckToken: [32]byte{6},
 	}
@@ -128,12 +128,12 @@ func TestStructuredExecBatchBindsExactAuthorityAndReturnsAckHandle(t *testing.T)
 }
 
 func TestStructuredExecBatchWireRejectsIdentityAmbiguityAndSpoofing(t *testing.T) {
-	valid := `{"op":"exec_batch","request_id":"01000000000000000000000000000000","issuer_epoch":7,"issuer_lane":"0200000000000000","issuer_sequence":9,"issuer_authenticator":"` + strings.Repeat("03", 32) + `","class":"batch","statements":[{"sql":"DELETE FROM docs WHERE id = 1"}]}`
+	valid := `{"op":"exec_batch","request_id":"01000000000000000000000000000000","installation_id":"02000000000000000000000000000000","issuer_epoch":7,"lane_ordinal":2,"grant_digest":"` + strings.Repeat("03", 32) + `","issuer_sequence":9,"class":"batch","statements":[{"sql":"DELETE FROM docs WHERE id = 1"}]}`
 	if err := validateDurableExecBatchEnvelope([]byte(valid)); err != nil {
 		t.Fatal(err)
 	}
 	checks := []string{
-		strings.Replace(valid, `"request_id":"01000000000000000000000000000000","issuer_epoch":7`, `"issuer_epoch":7,"request_id":"01000000000000000000000000000000"`, 1),
+		strings.Replace(valid, `"request_id":"01000000000000000000000000000000","installation_id"`, `"issuer_epoch":7,"request_id":"01000000000000000000000000000000","installation_id"`, 1),
 		strings.Replace(valid, `"issuer_epoch":7`, `"issuer_epoch":7,"issuer_epoch":7`, 1),
 		strings.Replace(valid, `,"class":"batch"`, `,"tenant":"spoof","class":"batch"`, 1),
 		strings.Replace(valid, `,"class":"batch"`, `,"principal":"spoof","class":"batch"`, 1),

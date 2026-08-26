@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	vibejson "github.com/thesyncim/vibejson"
@@ -24,8 +25,7 @@ var (
 type durableExecBatchAckIdentity struct {
 	RequestID      replication.ID128
 	RequestDigest  replication.Digest
-	IssuerEpoch    uint64
-	IssuerLane     requestledger.IssuerLane
+	Reference      gateway.ReplicatedIssuerReference
 	IssuerSequence uint64
 }
 
@@ -52,8 +52,10 @@ var durableExecBatchAckRequestFields = vibejson.MakeFieldSet(
 	"op",
 	"request_id",
 	"request_digest",
+	"installation_id",
 	"issuer_epoch",
-	"issuer_lane",
+	"lane_ordinal",
+	"grant_digest",
 	"issuer_sequence",
 	"terminal_revision",
 	"result_digest",
@@ -113,34 +115,49 @@ func (request *durableExecBatchAckWireRequest) UnmarshalVibeJSON(
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(3)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
-	if cursor, request.Identity.IssuerEpoch, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.Identity.Reference.Installation[:]); err != nil {
 		return cursor, err
 	}
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(4)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
-	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.Identity.IssuerLane[:]); err != nil {
+	if cursor, request.Identity.Reference.Epoch, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
 		return cursor, err
 	}
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(5)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
-	if cursor, request.Identity.IssuerSequence, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
+	var ordinal uint64
+	if cursor, ordinal, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+		ordinal >= uint64(gateway.MaxReplicatedIssuerLanes) {
 		return cursor, err
 	}
+	request.Identity.Reference.LaneOrdinal = uint16(ordinal)
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(6)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
-	if cursor, request.TerminalRevision, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.Identity.Reference.GrantDigest[:]); err != nil {
 		return cursor, err
 	}
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(7)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
-	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.ResultDigest[:]); err != nil {
+	if cursor, request.Identity.IssuerSequence, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
 		return cursor, err
 	}
 	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(8)) {
+		return cursor, errInvalidDurableExecBatchAckRequest
+	}
+	if cursor, request.TerminalRevision, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
+		return cursor, err
+	}
+	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(9)) {
+		return cursor, errInvalidDurableExecBatchAckRequest
+	}
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.ResultDigest[:]); err != nil {
+		return cursor, err
+	}
+	if !cursor.Field(false, durableExecBatchAckRequestFields.Field(10)) {
 		return cursor, errInvalidDurableExecBatchAckRequest
 	}
 	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.AckToken[:]); err != nil {
@@ -156,8 +173,10 @@ func validDurableExecBatchAckRequest(request *durableExecBatchAckWireRequest) bo
 	return request != nil &&
 		request.Identity.RequestID != (replication.ID128{}) &&
 		request.Identity.RequestDigest != (replication.Digest{}) &&
-		request.Identity.IssuerEpoch != 0 &&
-		request.Identity.IssuerLane != (requestledger.IssuerLane{}) &&
+		request.Identity.Reference.Installation != (replication.ID128{}) &&
+		request.Identity.Reference.Epoch != 0 &&
+		request.Identity.Reference.LaneOrdinal < gateway.MaxReplicatedIssuerLanes &&
+		request.Identity.Reference.GrantDigest != (replication.Digest{}) &&
 		request.Identity.IssuerSequence != 0 &&
 		request.TerminalRevision != 0 &&
 		request.ResultDigest != (replication.Digest{}) &&
@@ -198,10 +217,16 @@ func writeDurableExecBatchAckResponse(
 	if err := writeDurableExecBatchAckHexField(writer, "request_digest", identity.RequestDigest[:]); err != nil {
 		return err
 	}
-	if err := writeDurableExecBatchAckUintField(writer, "issuer_epoch", identity.IssuerEpoch); err != nil {
+	if err := writeDurableExecBatchAckHexField(writer, "installation_id", identity.Reference.Installation[:]); err != nil {
 		return err
 	}
-	if err := writeDurableExecBatchAckHexField(writer, "issuer_lane", identity.IssuerLane[:]); err != nil {
+	if err := writeDurableExecBatchAckUintField(writer, "issuer_epoch", identity.Reference.Epoch); err != nil {
+		return err
+	}
+	if err := writeDurableExecBatchAckUintField(writer, "lane_ordinal", uint64(identity.Reference.LaneOrdinal)); err != nil {
+		return err
+	}
+	if err := writeDurableExecBatchAckHexField(writer, "grant_digest", identity.Reference.GrantDigest[:]); err != nil {
 		return err
 	}
 	if err := writeDurableExecBatchAckUintField(writer, "issuer_sequence", identity.IssuerSequence); err != nil {

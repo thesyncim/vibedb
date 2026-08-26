@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const maxIssuerOpenRequestBytes = 96
+const maxIssuerOpenRequestBytes = 192
 
 var errInvalidIssuerOpen = errors.New("gateway: invalid issuer_open request")
 
-type issuerOpenWireRequest struct{ Lane uint16 }
+type issuerOpenWireRequest struct{ Open gateway.ReplicatedIssuerOpen }
 
-var issuerOpenFields = vibejson.MakeFieldSet("op", "lane")
+var issuerOpenFields = vibejson.MakeFieldSet("op", "installation_id", "issuer_epoch", "lane_ordinal")
 
 var issuerOpenDecoder = func() vibejson.Decoder[issuerOpenWireRequest] {
 	decoder, err := vibejson.CompileDecoder[issuerOpenWireRequest](vibejson.DecoderOptions{
@@ -45,12 +47,21 @@ func (request *issuerOpenWireRequest) UnmarshalVibeJSON(
 		!cursor.Field(false, issuerOpenFields.Field(1)) {
 		return cursor, errInvalidIssuerOpen
 	}
-	value, valueErr := cursor.Raw()
-	lane, ok := value.Uint64()
-	if valueErr != nil || !ok || lane > uint64(^uint16(0)) || !cursor.ExpectObjectClose() {
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, request.Open.Installation[:]); err != nil ||
+		!cursor.Field(false, issuerOpenFields.Field(2)) {
 		return cursor, errInvalidIssuerOpen
 	}
-	request.Lane = uint16(lane)
+	if cursor, request.Open.Epoch, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+		request.Open.Epoch != 1 || !cursor.Field(false, issuerOpenFields.Field(3)) {
+		return cursor, errInvalidIssuerOpen
+	}
+	value, valueErr := cursor.Raw()
+	lane, ok := value.Uint64()
+	if valueErr != nil || !ok || lane >= uint64(gateway.MaxReplicatedIssuerLanes) ||
+		!cursor.ExpectObjectClose() || request.Open.Installation == (replication.ID128{}) {
+		return cursor, errInvalidIssuerOpen
+	}
+	request.Open.LaneOrdinal = uint16(lane)
 	return cursor, nil
 }
 
@@ -58,8 +69,9 @@ func issuerOpenRequestCandidate(raw []byte) bool {
 	return exactOperationCandidate(raw, []byte(`"issuer_open"`))
 }
 
-func writeIssuerOpenResponse(writer *vibejson.Writer, result durableIssuerOpenResult) error {
-	if writer == nil || !validDurableIssuerOpenResult(result) {
+func writeIssuerOpenResponse(writer *vibejson.Writer, result gateway.ReplicatedIssuerLaneGrant) error {
+	if writer == nil || result.Installation == (replication.ID128{}) || result.Epoch == 0 ||
+		result.LaneOrdinal >= gateway.MaxReplicatedIssuerLanes || result.GrantDigest == (replication.Digest{}) {
 		return errInvalidIssuerOpen
 	}
 	if err := writer.BeginObject(); err != nil {
@@ -83,10 +95,10 @@ func writeIssuerOpenResponse(writer *vibejson.Writer, result durableIssuerOpenRe
 	if err := writeDurableExecBatchAckUintField(writer, "issuer_epoch", result.Epoch); err != nil {
 		return err
 	}
-	if err := writeDurableExecBatchAckHexField(writer, "issuer_lane", result.Lane[:]); err != nil {
+	if err := writeDurableExecBatchAckUintField(writer, "lane_ordinal", uint64(result.LaneOrdinal)); err != nil {
 		return err
 	}
-	if err := writeDurableExecBatchAckHexField(writer, "issuer_authenticator", result.Authenticator[:]); err != nil {
+	if err := writeDurableExecBatchAckHexField(writer, "grant_digest", result.GrantDigest[:]); err != nil {
 		return err
 	}
 	if err := writer.EndObject(); err != nil {

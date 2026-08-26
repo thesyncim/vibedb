@@ -14,17 +14,19 @@ func structuredExecBatchIdentity(request *serveRequest) (durableExecBatchIdentit
 	if request == nil || request.Op != "exec_batch" {
 		return durableExecBatchIdentity{}, false
 	}
-	structured := request.IssuerEpoch != 0 || request.IssuerLane != "" ||
-		request.IssuerSequence != 0 || request.IssuerAuthenticator != ""
+	structured := request.InstallationID != "" || request.IssuerEpoch != 0 ||
+		request.GrantDigest != "" || request.IssuerSequence != 0
 	if !structured {
 		return durableExecBatchIdentity{}, false
 	}
 	identity := durableExecBatchIdentity{
-		IssuerEpoch: request.IssuerEpoch, IssuerSequence: request.IssuerSequence,
+		Reference:      gateway.ReplicatedIssuerReference{Epoch: request.IssuerEpoch, LaneOrdinal: request.LaneOrdinal},
+		IssuerSequence: request.IssuerSequence,
 	}
 	if decodeLowerFixedHex(request.RequestID, identity.RequestID[:]) != nil ||
-		decodeLowerFixedHex(request.IssuerLane, identity.IssuerLane[:]) != nil ||
-		decodeLowerFixedHex(request.IssuerAuthenticator, identity.Authenticator[:]) != nil ||
+		decodeLowerFixedHex(request.InstallationID, identity.Reference.Installation[:]) != nil ||
+		decodeLowerFixedHex(request.GrantDigest, identity.Reference.GrantDigest[:]) != nil ||
+		request.IssuerLane != "" || request.IssuerAuthenticator != "" ||
 		!validDurableExecBatchIdentity(identity) {
 		return durableExecBatchIdentity{}, false
 	}
@@ -33,6 +35,7 @@ func structuredExecBatchIdentity(request *serveRequest) (durableExecBatchIdentit
 
 func hasAnyStructuredExecBatchIdentity(request *serveRequest) bool {
 	return request != nil && (request.RequestID != "" || request.IssuerEpoch != 0 ||
+		request.InstallationID != "" || request.GrantDigest != "" || request.LaneOrdinal != 0 ||
 		request.IssuerLane != "" || request.IssuerSequence != 0 || request.IssuerAuthenticator != "")
 }
 
@@ -91,8 +94,7 @@ func executeDurableExecBatch(
 	response := encodeResult(result.Result)
 	if !response.Committed || response.TransactionID == (replication.ID128{}) ||
 		result.Ack.Identity.RequestID != identity.RequestID ||
-		result.Ack.Identity.IssuerEpoch != identity.IssuerEpoch ||
-		result.Ack.Identity.IssuerLane != identity.IssuerLane ||
+		result.Ack.Identity.Reference != identity.Reference ||
 		result.Ack.Identity.IssuerSequence != identity.IssuerSequence {
 		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
 	}

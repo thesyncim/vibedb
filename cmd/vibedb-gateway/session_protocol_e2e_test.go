@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -40,20 +39,20 @@ var (
 type sessionProtocolSharedState struct {
 	mu sync.Mutex
 
-	installation replication.ID128
-	epoch        uint64
-	lane         requestledger.IssuerLane
-	secret       replication.Digest
+	open  gateway.ReplicatedIssuerOpen
+	grant gateway.ReplicatedIssuerLaneGrant
 
 	highwater uint64
 	records   map[uint64]*sessionProtocolRecord
 
 	openCalls        uint64
+	openApplications uint64
 	execCalls        uint64
 	execApplications uint64
 	ackCalls         uint64
 	ackApplications  uint64
 
+	failNextOpenResponse bool
 	failNextExecResponse bool
 	failNextAckResponse  bool
 }
@@ -74,31 +73,42 @@ type sessionProtocolService struct {
 
 func newSessionProtocolSharedState() *sessionProtocolSharedState {
 	return &sessionProtocolSharedState{
-		installation: replication.ID128{0x11},
-		epoch:        7,
-		lane:         requestledger.IssuerLane{0x21},
-		secret:       replication.Digest{0x31},
-		records:      make(map[uint64]*sessionProtocolRecord),
+		open: gateway.ReplicatedIssuerOpen{
+			Installation: replication.ID128{0x11}, Epoch: 1, LaneOrdinal: 7,
+		},
+		grant: gateway.ReplicatedIssuerLaneGrant{
+			Installation: replication.ID128{0x11}, Epoch: 1, LaneOrdinal: 7,
+			Lane: requestledger.IssuerLane{0x21}, Scope: requestledger.ScopeAuthenticated,
+			TenantDigest: requestledger.Digest{0x31}, Revision: 1,
+			GrantDigest: replication.Digest{0x61},
+		},
+		records: make(map[uint64]*sessionProtocolRecord),
 	}
 }
 
 func (state *sessionProtocolSharedState) OpenIssuer(
 	_ context.Context,
 	authority serviceauthz.Authority,
-	lane uint16,
-) (durableIssuerOpenResult, error) {
+	open gateway.ReplicatedIssuerOpen,
+) (gateway.ReplicatedIssuerLaneGrant, error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.openCalls++
-	if !authority.Valid() || lane != 0 {
-		return durableIssuerOpenResult{}, errSessionProtocolGrant
+	if !authority.Valid() || open != state.open {
+		return gateway.ReplicatedIssuerLaneGrant{}, errSessionProtocolGrant
 	}
-	return durableIssuerOpenResult{
-		Installation:  state.installation,
-		Epoch:         state.epoch,
-		Lane:          state.lane,
-		Authenticator: state.grantLocked(authority),
-	}, nil
+	principal := requestledger.PrincipalID(authority.Node)
+	if state.grant.Principal == (requestledger.PrincipalID{}) {
+		state.grant.Principal = principal
+		state.openApplications++
+	} else if state.grant.Principal != principal {
+		return gateway.ReplicatedIssuerLaneGrant{}, errSessionProtocolGrant
+	}
+	if state.failNextOpenResponse {
+		state.failNextOpenResponse = false
+		return gateway.ReplicatedIssuerLaneGrant{}, errSessionProtocolOutcome
+	}
+	return state.grant, nil
 }
 
 func (state *sessionProtocolSharedState) ExecBatch(
@@ -110,10 +120,8 @@ func (state *sessionProtocolSharedState) ExecBatch(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.execCalls++
-	wantGrant := state.grantLocked(authority)
-	if !authority.Valid() || identity.IssuerEpoch != state.epoch ||
-		identity.IssuerLane != state.lane ||
-		!hmac.Equal(identity.Authenticator[:], wantGrant[:]) {
+	if !authority.Valid() || requestledger.PrincipalID(authority.Node) != state.grant.Principal ||
+		identity.Reference != state.referenceLocked() {
 		return durableExecBatchExecuteResult{}, errSessionProtocolGrant
 	}
 	digest := sessionProtocolQueryDigest(queries)
@@ -149,8 +157,7 @@ func (state *sessionProtocolSharedState) ExecBatch(
 			Identity: durableExecBatchAckIdentity{
 				RequestID:      identity.RequestID,
 				RequestDigest:  digest,
-				IssuerEpoch:    identity.IssuerEpoch,
-				IssuerLane:     identity.IssuerLane,
+				Reference:      identity.Reference,
 				IssuerSequence: identity.IssuerSequence,
 			},
 			TerminalRevision: 100 + identity.IssuerSequence,
@@ -201,9 +208,9 @@ func (state *sessionProtocolSharedState) AckExecBatch(
 func (service *sessionProtocolService) OpenIssuer(
 	ctx context.Context,
 	authority serviceauthz.Authority,
-	lane uint16,
-) (durableIssuerOpenResult, error) {
-	return service.shared.OpenIssuer(ctx, authority, lane)
+	open gateway.ReplicatedIssuerOpen,
+) (gateway.ReplicatedIssuerLaneGrant, error) {
+	return service.shared.OpenIssuer(ctx, authority, open)
 }
 
 func (service *sessionProtocolService) ExecBatch(
@@ -223,21 +230,13 @@ func (service *sessionProtocolService) AckExecBatch(
 	return service.shared.AckExecBatch(ctx, authority, request)
 }
 
-func (state *sessionProtocolSharedState) grantLocked(
-	authority serviceauthz.Authority,
-) replication.Digest {
-	mac := hmac.New(sha256.New, state.secret[:])
-	_, _ = mac.Write([]byte("vibedb/session-protocol-test/grant\x00"))
-	_, _ = mac.Write(state.installation[:])
-	_, _ = mac.Write(state.lane[:])
-	_, _ = mac.Write(authority.Node[:])
-	var fixed [16]byte
-	binary.LittleEndian.PutUint64(fixed[:8], state.epoch)
-	binary.LittleEndian.PutUint64(fixed[8:], authority.Generation)
-	_, _ = mac.Write(fixed[:])
-	var digest replication.Digest
-	_ = mac.Sum(digest[:0])
-	return digest
+func (state *sessionProtocolSharedState) referenceLocked() gateway.ReplicatedIssuerReference {
+	return gateway.ReplicatedIssuerReference{
+		Installation: state.grant.Installation,
+		Epoch:        state.grant.Epoch,
+		LaneOrdinal:  state.grant.LaneOrdinal,
+		GrantDigest:  state.grant.GrantDigest,
+	}
 }
 
 func sessionProtocolQueryDigest(queries []gateway.Query) replication.Digest {
@@ -288,23 +287,30 @@ func TestDurableSessionProtocolRecoversAcrossGatewayAndAuthenticatesAck(t *testi
 	authority := serviceauthz.Authority{Node: [16]byte{0x41}, Generation: 13}
 	otherAuthority := serviceauthz.Authority{Node: [16]byte{0x42}, Generation: 13}
 
-	openA := sessionProtocolRoundTrip(t, gatewayA, authority,
-		[]byte(`{"op":"issuer_open","lane":0}`), true)
-	openB := sessionProtocolRoundTrip(t, gatewayB, authority,
-		[]byte(`{"op":"issuer_open","lane":0}`), true)
+	openRequest := sessionProtocolIssuerOpenRequest(t, shared.open)
+	shared.mu.Lock()
+	shared.failNextOpenResponse = true
+	shared.mu.Unlock()
+	if lost := sessionProtocolRoundTrip(t, gatewayA, authority, openRequest, true); !bytes.Contains(lost, []byte(errSessionProtocolOutcome.Error())) {
+		t.Fatalf("lost issuer-open response = %s", lost)
+	}
+	openB := sessionProtocolRoundTrip(t, gatewayB, authority, openRequest, true)
+	openA := sessionProtocolRoundTrip(t, gatewayA, authority, openRequest, true)
 	if !bytes.Equal(openA, openB) ||
 		!bytes.Contains(openA, []byte(`"installation_id":"11000000000000000000000000000000"`)) ||
-		!bytes.Contains(openA, []byte(`"issuer_epoch":7`)) {
+		!bytes.Contains(openA, []byte(`"issuer_epoch":1`)) ||
+		!bytes.Contains(openA, []byte(`"lane_ordinal":7`)) ||
+		!bytes.Contains(openA, []byte(`"grant_digest":"6100000000000000000000000000000000000000000000000000000000000000"`)) {
 		t.Fatalf("gateway handshake did not reopen exact contract: A=%s B=%s", openA, openB)
 	}
 
 	shared.mu.Lock()
-	grant := shared.grantLocked(authority)
+	reference := shared.referenceLocked()
 	shared.failNextExecResponse = true
 	shared.mu.Unlock()
 	requestID1 := replication.ID128{1}
-	request1 := sessionProtocolExecRequest(t, requestID1, shared.epoch, shared.lane, 1,
-		grant, []byte(`DELETE FROM docs WHERE id = 1`))
+	request1 := sessionProtocolExecRequest(t, requestID1, reference, 1,
+		[]byte(`DELETE FROM docs WHERE id = 1`))
 	unknown := sessionProtocolRoundTrip(t, gatewayA, authority, request1, true)
 	if !bytes.Contains(unknown, []byte(`"outcome_unknown":true`)) ||
 		!bytes.Contains(unknown, []byte(errSessionProtocolOutcome.Error())) ||
@@ -326,33 +332,33 @@ func TestDurableSessionProtocolRecoversAcrossGatewayAndAuthenticatesAck(t *testi
 	}
 	shared.mu.Unlock()
 
-	conflict := sessionProtocolExecRequest(t, requestID1, shared.epoch, shared.lane, 1,
-		grant, []byte(`DELETE FROM docs WHERE id = 2`))
+	conflict := sessionProtocolExecRequest(t, requestID1, reference, 1,
+		[]byte(`DELETE FROM docs WHERE id = 2`))
 	if response := sessionProtocolRoundTrip(t, gatewayB, authority, conflict, true); !bytes.Contains(response, []byte(errSessionProtocolConflict.Error())) {
 		t.Fatalf("same sequence with different program = %s", response)
 	}
 	requestID3 := replication.ID128{3}
-	gap := sessionProtocolExecRequest(t, requestID3, shared.epoch, shared.lane, 3,
-		grant, []byte(`DELETE FROM docs WHERE id = 3`))
+	gap := sessionProtocolExecRequest(t, requestID3, reference, 3,
+		[]byte(`DELETE FROM docs WHERE id = 3`))
 	if response := sessionProtocolRoundTrip(t, gatewayB, authority, gap, true); !bytes.Contains(response, []byte(errSessionProtocolSequence.Error())) {
 		t.Fatalf("issuer gap = %s", response)
 	}
 	requestID2 := replication.ID128{2}
-	sequence2 := sessionProtocolExecRequest(t, requestID2, shared.epoch, shared.lane, 2,
-		grant, []byte(`DELETE FROM docs WHERE id = 2`))
+	sequence2 := sessionProtocolExecRequest(t, requestID2, reference, 2,
+		[]byte(`DELETE FROM docs WHERE id = 2`))
 	if response := sessionProtocolRoundTrip(t, gatewayB, authority, sequence2, true); !bytes.Contains(response, []byte(`"issuer_sequence":2`)) ||
 		!bytes.Contains(response, []byte(`"committed":true`)) {
 		t.Fatalf("contiguous issuer sequence = %s", response)
 	}
-	forgedGrant := grant
-	forgedGrant[0] ^= 0xff
-	forged := sessionProtocolExecRequest(t, replication.ID128{4}, shared.epoch, shared.lane, 3,
-		forgedGrant, []byte(`DELETE FROM docs WHERE id = 4`))
+	forgedReference := reference
+	forgedReference.GrantDigest[0] ^= 0xff
+	forged := sessionProtocolExecRequest(t, replication.ID128{4}, forgedReference, 3,
+		[]byte(`DELETE FROM docs WHERE id = 4`))
 	if response := sessionProtocolRoundTrip(t, gatewayB, authority, forged, true); !bytes.Contains(response, []byte(errSessionProtocolGrant.Error())) {
 		t.Fatalf("forged issuer grant = %s", response)
 	}
-	foreign := sessionProtocolExecRequest(t, replication.ID128{5}, shared.epoch, shared.lane, 3,
-		grant, []byte(`DELETE FROM docs WHERE id = 5`))
+	foreign := sessionProtocolExecRequest(t, replication.ID128{5}, reference, 3,
+		[]byte(`DELETE FROM docs WHERE id = 5`))
 	if response := sessionProtocolRoundTrip(t, gatewayB, otherAuthority, foreign, true); !bytes.Contains(response, []byte(errSessionProtocolGrant.Error())) {
 		t.Fatalf("issuer grant crossed principals = %s", response)
 	}
@@ -398,9 +404,10 @@ func TestDurableSessionProtocolRecoversAcrossGatewayAndAuthenticatesAck(t *testi
 	}
 	shared.mu.Lock()
 	defer shared.mu.Unlock()
-	if shared.highwater != 2 || shared.execApplications != 2 || shared.ackApplications != 1 {
-		t.Fatalf("shared state: highwater=%d executions=%d ACKs=%d",
-			shared.highwater, shared.execApplications, shared.ackApplications)
+	if shared.openApplications != 1 || shared.highwater != 2 ||
+		shared.execApplications != 2 || shared.ackApplications != 1 {
+		t.Fatalf("shared state: opens=%d highwater=%d executions=%d ACKs=%d",
+			shared.openApplications, shared.highwater, shared.execApplications, shared.ackApplications)
 	}
 }
 
@@ -409,27 +416,28 @@ func TestDurableSessionProtocolRejectsMalformedAndUnauthorizedBeforeService(t *t
 	service := &sessionProtocolService{shared: shared}
 	authority := serviceauthz.Authority{Node: [16]byte{0x51}, Generation: 17}
 	shared.mu.Lock()
-	grant := shared.grantLocked(authority)
+	reference := shared.referenceLocked()
 	shared.mu.Unlock()
-	valid := sessionProtocolExecRequest(t, replication.ID128{9}, shared.epoch, shared.lane, 1,
-		grant, []byte(`DELETE FROM docs WHERE id = 9`))
+	valid := sessionProtocolExecRequest(t, replication.ID128{9}, reference, 1,
+		[]byte(`DELETE FROM docs WHERE id = 9`))
 
 	requestIDField := []byte(`"request_id":"09000000000000000000000000000000"`)
-	epochField := []byte(`"issuer_epoch":7`)
-	authenticatorField := append([]byte(`"issuer_authenticator":"`), []byte(hex.EncodeToString(grant[:]))...)
-	authenticatorField = append(authenticatorField, '"')
+	installationField := []byte(`"installation_id":"11000000000000000000000000000000"`)
+	epochField := []byte(`"issuer_epoch":1`)
+	grantField := append([]byte(`"grant_digest":"`), []byte(hex.EncodeToString(reference.GrantDigest[:]))...)
+	grantField = append(grantField, '"')
 	malformed := [][]byte{
 		bytes.Replace(bytes.Clone(valid),
-			append(append(bytes.Clone(requestIDField), ','), epochField...),
-			append(append(bytes.Clone(epochField), ','), requestIDField...), 1),
+			append(append(bytes.Clone(requestIDField), ','), installationField...),
+			append(append(bytes.Clone(installationField), ','), requestIDField...), 1),
 		bytes.Replace(bytes.Clone(valid), epochField,
 			append(append(bytes.Clone(epochField), ','), epochField...), 1),
-		bytes.Replace(bytes.Clone(valid), authenticatorField,
-			append(append(bytes.Clone(authenticatorField), ','), []byte(`"principal":"spoof"`)...), 1),
-		bytes.Replace(bytes.Clone(valid), authenticatorField,
-			append(append(bytes.Clone(authenticatorField), ','), []byte(`"tenant":"spoof"`)...), 1),
+		bytes.Replace(bytes.Clone(valid), grantField,
+			append(append(bytes.Clone(grantField), ','), []byte(`"principal":"spoof"`)...), 1),
+		bytes.Replace(bytes.Clone(valid), grantField,
+			append(append(bytes.Clone(grantField), ','), []byte(`"tenant":"spoof"`)...), 1),
 		bytes.Replace(bytes.Clone(valid), []byte(`"issuer_sequence":1`), []byte(`"issuer_sequence":0`), 1),
-		bytes.Replace(bytes.Clone(valid), authenticatorField, []byte(`"issuer_authenticator":"00"`), 1),
+		bytes.Replace(bytes.Clone(valid), grantField, []byte(`"grant_digest":"00"`), 1),
 		[]byte(`{"op":"exec_batch","request_id":"09000000000000000000000000000000","statements":[{"sql":"DELETE FROM docs WHERE id = 9"}]}`),
 	}
 	for index := range malformed {
@@ -439,7 +447,9 @@ func TestDurableSessionProtocolRejectsMalformedAndUnauthorizedBeforeService(t *t
 		}
 	}
 
-	invalidIssuer := []byte(`{"op":"issuer_open","lane":0,"lane":0}`)
+	validIssuer := sessionProtocolIssuerOpenRequest(t, shared.open)
+	invalidIssuer := bytes.Replace(bytes.Clone(validIssuer), []byte(`"lane_ordinal":7`),
+		[]byte(`"lane_ordinal":7,"lane_ordinal":7`), 1)
 	if response := sessionProtocolRoundTrip(t, service, authority, invalidIssuer, true); !bytes.Contains(response, []byte(errInvalidIssuerOpen.Error())) {
 		t.Fatalf("duplicate issuer field response = %s", response)
 	}
@@ -450,18 +460,18 @@ func TestDurableSessionProtocolRejectsMalformedAndUnauthorizedBeforeService(t *t
 	}
 
 	if response := sessionProtocolRoundTrip(t, service, authority,
-		[]byte(`{"op":"issuer_open","lane":0}`), false); !bytes.Contains(response, []byte(`"error":"authorization denied"`)) {
+		validIssuer, false); !bytes.Contains(response, []byte(`"error":"authorization denied"`)) {
 		t.Fatalf("denied issuer response = %s", response)
 	}
 	if response := sessionProtocolRoundTrip(t, service, serviceauthz.Authority{},
-		[]byte(`{"op":"issuer_open","lane":0}`), true); !bytes.Contains(response, []byte(errInvalidIssuerOpen.Error())) {
+		validIssuer, true); !bytes.Contains(response, []byte(errInvalidIssuerOpen.Error())) {
 		t.Fatalf("unauthenticated issuer response = %s", response)
 	}
 	if response := sessionProtocolRoundTrip(t, service, authority, valid, false); !bytes.Contains(response, []byte(`"error":"authorization denied"`)) {
 		t.Fatalf("denied exec response = %s", response)
 	}
 
-	assertSessionProtocolExactBound(t, []byte(`{"op":"issuer_open","lane":0}`),
+	assertSessionProtocolExactBound(t, validIssuer,
 		maxIssuerOpenRequestBytes, func(raw []byte) error {
 			var request issuerOpenWireRequest
 			return decodeIssuerOpenRequest(raw, &request)
@@ -538,10 +548,8 @@ func sessionProtocolRoundTrip(
 func sessionProtocolExecRequest(
 	t *testing.T,
 	requestID replication.ID128,
-	epoch uint64,
-	lane requestledger.IssuerLane,
+	reference gateway.ReplicatedIssuerReference,
 	sequence uint64,
-	authenticator replication.Digest,
 	sql []byte,
 ) []byte {
 	t.Helper()
@@ -556,10 +564,11 @@ func sessionProtocolExecRequest(
 	must(writer.Key("op"))
 	must(writer.RawUnchecked([]byte(`"exec_batch"`)))
 	must(writeDurableExecBatchAckHexField(writer, "request_id", requestID[:]))
-	must(writeDurableExecBatchAckUintField(writer, "issuer_epoch", epoch))
-	must(writeDurableExecBatchAckHexField(writer, "issuer_lane", lane[:]))
+	must(writeDurableExecBatchAckHexField(writer, "installation_id", reference.Installation[:]))
+	must(writeDurableExecBatchAckUintField(writer, "issuer_epoch", reference.Epoch))
+	must(writeDurableExecBatchAckUintField(writer, "lane_ordinal", uint64(reference.LaneOrdinal)))
+	must(writeDurableExecBatchAckHexField(writer, "grant_digest", reference.GrantDigest[:]))
 	must(writeDurableExecBatchAckUintField(writer, "issuer_sequence", sequence))
-	must(writeDurableExecBatchAckHexField(writer, "issuer_authenticator", authenticator[:]))
 	must(writer.Key("statements"))
 	must(writer.BeginArray())
 	must(writer.BeginObject())
@@ -567,6 +576,29 @@ func sessionProtocolExecRequest(
 	must(writer.String(string(sql)))
 	must(writer.EndObject())
 	must(writer.EndArray())
+	must(writer.EndObject())
+	must(writer.Flush())
+	return bytes.Clone(output.Bytes())
+}
+
+func sessionProtocolIssuerOpenRequest(
+	t *testing.T,
+	open gateway.ReplicatedIssuerOpen,
+) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := vibejson.NewWriter(&output)
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(writer.BeginObject())
+	must(writer.Key("op"))
+	must(writer.RawUnchecked([]byte(`"issuer_open"`)))
+	must(writeDurableExecBatchAckHexField(writer, "installation_id", open.Installation[:]))
+	must(writeDurableExecBatchAckUintField(writer, "issuer_epoch", open.Epoch))
+	must(writeDurableExecBatchAckUintField(writer, "lane_ordinal", uint64(open.LaneOrdinal)))
 	must(writer.EndObject())
 	must(writer.Flush())
 	return bytes.Clone(output.Bytes())
@@ -589,8 +621,10 @@ func sessionProtocolAckRequest(
 	must(writer.RawUnchecked([]byte(`"ack_exec_batch"`)))
 	must(writeDurableExecBatchAckHexField(writer, "request_id", request.Identity.RequestID[:]))
 	must(writeDurableExecBatchAckHexField(writer, "request_digest", request.Identity.RequestDigest[:]))
-	must(writeDurableExecBatchAckUintField(writer, "issuer_epoch", request.Identity.IssuerEpoch))
-	must(writeDurableExecBatchAckHexField(writer, "issuer_lane", request.Identity.IssuerLane[:]))
+	must(writeDurableExecBatchAckHexField(writer, "installation_id", request.Identity.Reference.Installation[:]))
+	must(writeDurableExecBatchAckUintField(writer, "issuer_epoch", request.Identity.Reference.Epoch))
+	must(writeDurableExecBatchAckUintField(writer, "lane_ordinal", uint64(request.Identity.Reference.LaneOrdinal)))
+	must(writeDurableExecBatchAckHexField(writer, "grant_digest", request.Identity.Reference.GrantDigest[:]))
 	must(writeDurableExecBatchAckUintField(writer, "issuer_sequence", request.Identity.IssuerSequence))
 	must(writeDurableExecBatchAckUintField(writer, "terminal_revision", request.TerminalRevision))
 	must(writeDurableExecBatchAckHexField(writer, "result_digest", request.ResultDigest[:]))

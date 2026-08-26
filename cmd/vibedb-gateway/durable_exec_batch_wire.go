@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 
+	"github.com/thesyncim/vibedb/gateway"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -14,8 +15,8 @@ type durableExecBatchEnvelope struct {
 }
 
 var durableExecBatchFields = vibejson.MakeFieldSet(
-	"op", "request_id", "issuer_epoch", "issuer_lane", "issuer_sequence",
-	"issuer_authenticator", "class", "statements",
+	"op", "request_id", "installation_id", "issuer_epoch", "lane_ordinal",
+	"grant_digest", "issuer_sequence", "class", "statements",
 )
 
 var durableExecBatchDecoder = func() vibejson.Decoder[durableExecBatchEnvelope] {
@@ -57,22 +58,29 @@ func (envelope *durableExecBatchEnvelope) UnmarshalVibeJSON(
 		!cursor.Field(false, durableExecBatchFields.Field(2)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	if cursor, envelope.Identity.IssuerEpoch, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, envelope.Identity.Reference.Installation[:]); err != nil ||
 		!cursor.Field(false, durableExecBatchFields.Field(3)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, envelope.Identity.IssuerLane[:]); err != nil ||
+	if cursor, envelope.Identity.Reference.Epoch, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
 		!cursor.Field(false, durableExecBatchFields.Field(4)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	if cursor, envelope.Identity.IssuerSequence, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+	var ordinal uint64
+	if cursor, ordinal, err = decodeDurableExecBatchAckUint64(cursor); err != nil ||
+		ordinal >= uint64(gateway.MaxReplicatedIssuerLanes) ||
 		!cursor.Field(false, durableExecBatchFields.Field(5)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, envelope.Identity.Authenticator[:]); err != nil {
+	envelope.Identity.Reference.LaneOrdinal = uint16(ordinal)
+	if cursor, err = decodeDurableExecBatchAckFixedHex(cursor, envelope.Identity.Reference.GrantDigest[:]); err != nil ||
+		!cursor.Field(false, durableExecBatchFields.Field(6)) {
 		return cursor, errInvalidDurableExecBatch
 	}
-	if cursor.Field(false, durableExecBatchFields.Field(6)) {
+	if cursor, envelope.Identity.IssuerSequence, err = decodeDurableExecBatchAckUint64(cursor); err != nil {
+		return cursor, errInvalidDurableExecBatch
+	}
+	if cursor.Field(false, durableExecBatchFields.Field(7)) {
 		var class []byte
 		cursor, class, err = durableExecBatchAckString(cursor)
 		if err != nil || !(bytes.Equal(class, []byte("interactive")) ||
@@ -80,7 +88,7 @@ func (envelope *durableExecBatchEnvelope) UnmarshalVibeJSON(
 			return cursor, errInvalidDurableExecBatch
 		}
 	}
-	if !cursor.Field(false, durableExecBatchFields.Field(7)) {
+	if !cursor.Field(false, durableExecBatchFields.Field(8)) {
 		return cursor, errInvalidDurableExecBatch
 	}
 	statements, err := cursor.Raw()

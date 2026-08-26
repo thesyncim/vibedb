@@ -25,7 +25,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
-	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -68,10 +67,15 @@ type serveRequest struct {
 	// RequestID is the caller's fixed 128-bit hexadecimal idempotency key for
 	// an RF3 exec_batch. It remains ingress metadata and never enters Raft as a
 	// table or SQL string.
-	RequestID           string `json:"request_id,omitempty"`
-	IssuerEpoch         uint64 `json:"issuer_epoch,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	InstallationID string `json:"installation_id,omitempty"`
+	IssuerEpoch    uint64 `json:"issuer_epoch,omitempty"`
+	LaneOrdinal    uint16 `json:"lane_ordinal,omitempty"`
+	GrantDigest    string `json:"grant_digest,omitempty"`
+	IssuerSequence uint64 `json:"issuer_sequence,omitempty"`
+	// Legacy fields remain decode-only so old process-local capabilities fail
+	// closed through hasAnyStructuredExecBatchIdentity.
 	IssuerLane          string `json:"issuer_lane,omitempty"`
-	IssuerSequence      uint64 `json:"issuer_sequence,omitempty"`
 	IssuerAuthenticator string `json:"issuer_authenticator,omitempty"`
 	SQL                 string `json:"sql"`
 	Class               string `json:"class,omitempty"`
@@ -991,8 +995,10 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 				}
 				continue
 			}
-			result, openErr := durable.OpenIssuer(ctx, authority, request.Lane)
-			if openErr != nil || !validDurableIssuerOpenResult(result) {
+			result, openErr := durable.OpenIssuer(ctx, authority, request.Open)
+			if openErr != nil || result.Installation != request.Open.Installation ||
+				result.Epoch != request.Open.Epoch || result.LaneOrdinal != request.Open.LaneOrdinal ||
+				result.GrantDigest == (replication.Digest{}) {
 				message := errDurableExecBatchUnavailable.Error()
 				if openErr != nil {
 					message = openErr.Error()
@@ -1401,10 +1407,16 @@ func writeServeResponse(w *vibejson.Writer, resp *serveResponse) error {
 		if err := writeDurableExecBatchAckHexField(w, "request_digest", ack.Identity.RequestDigest[:]); err != nil {
 			return err
 		}
-		if err := writeDurableExecBatchAckUintField(w, "issuer_epoch", ack.Identity.IssuerEpoch); err != nil {
+		if err := writeDurableExecBatchAckHexField(w, "installation_id", ack.Identity.Reference.Installation[:]); err != nil {
 			return err
 		}
-		if err := writeDurableExecBatchAckHexField(w, "issuer_lane", ack.Identity.IssuerLane[:]); err != nil {
+		if err := writeDurableExecBatchAckUintField(w, "issuer_epoch", ack.Identity.Reference.Epoch); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckUintField(w, "lane_ordinal", uint64(ack.Identity.Reference.LaneOrdinal)); err != nil {
+			return err
+		}
+		if err := writeDurableExecBatchAckHexField(w, "grant_digest", ack.Identity.Reference.GrantDigest[:]); err != nil {
 			return err
 		}
 		if err := writeDurableExecBatchAckUintField(w, "issuer_sequence", ack.Identity.IssuerSequence); err != nil {
