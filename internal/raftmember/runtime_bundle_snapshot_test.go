@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -62,6 +63,10 @@ func TestRuntimeSnapshotStateCoversCompleteRelationBundle(t *testing.T) {
 		binding, "docs", []sqldriver.ReplicatedGlobalIndexRelation{{
 			Relation: 2, Table: "email_claims", IndexID: 41,
 			Incarnation: 7, LocatorCount: 1, Unique: true,
+			KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
 	skipIfStrictAllocationUnsupported(t, "bind runtime bundle SQL", err)

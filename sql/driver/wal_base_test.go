@@ -14,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -113,7 +114,11 @@ func TestWALBaseBundleManifestBindsReplicatedStateDigestDomain(t *testing.T) {
 			{Relation: 1, Kind: ReplicatedShardRelationJSON, Table: "docs"},
 			{Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
 				Table: "email_claims", IndexID: 41, Incarnation: 7,
-				LocatorCount: 1, Unique: true},
+				LocatorCount: 1, Unique: true,
+				KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+				TupleVersion:  distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion,
+				BucketBits:    distribution.DefaultVirtualBucketBits},
 		},
 	}
 	machineDigest := sha256.Sum256([]byte(

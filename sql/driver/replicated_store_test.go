@@ -1295,7 +1295,7 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 		t.Fatalf("direct canonical image = %s, %v; want %s", direct, err, raw)
 	}
 	if digest := fmt.Sprintf("%x", sha256.Sum256(direct)); digest !=
-		"b43b74109c809e7107998b32f24ac399a0cf68ff181b3aac0f6aa402bba6ef72" {
+		"ca0a84d864e17c24c172dbd9eb3dee21e5d3bf5b0d4faa518a1709a5217fc6a5" {
 		t.Fatalf("singleton identity golden digest = %s", digest)
 	}
 	ownedInput := bytes.Clone(direct)
@@ -1455,6 +1455,10 @@ func TestReplicatedShardRelationManifestCanonicalRoundTripAndRejection(t *testin
 		Table: "email_claims", Storage: strings.Repeat("b", storageIdentityBytes*2),
 		Limits: identity.UserLimits, IndexID: 41, Incarnation: 7,
 		LocatorCount: 1, Unique: true,
+		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion:  distribution.CurrentTupleVersion,
+		MapperVersion: distribution.NativeMapperVersion,
+		BucketBits:    distribution.DefaultVirtualBucketBits,
 	}
 	identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
 	if err := validateReplicatedShardStoreIdentity(identity); err != nil {
@@ -1594,6 +1598,10 @@ func TestBindReplicatedShardStoreBundleRejectsOverlongRelationBeforeMutation(t *
 		binding, "docs", []ReplicatedGlobalIndexRelation{{
 			Relation: 2, Table: name, IndexID: 41, Incarnation: 7,
 			LocatorCount: 1, Unique: true,
+			KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
 	if !errors.Is(err, ErrReplicatedShardStoreProfile) {

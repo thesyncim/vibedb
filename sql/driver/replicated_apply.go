@@ -672,10 +672,14 @@ func replicatedApplyRelations(
 			spec.Target.ValidationDigest = replicatedGlobalIndexValidationDigest(
 				base, relation, logicalManifest,
 			)
-			spec.Target.Validator = replicatedGlobalIndexMutationValidator{}
+			spec.Target.Validator = replicatedGlobalIndexMutationValidator{relation: relation}
 			spec.GlobalIndex = replicatedstate.GlobalIndexProfile{
 				IndexID: relation.IndexID, Incarnation: relation.Incarnation,
 				LocatorCount: relation.LocatorCount, Unique: relation.Unique,
+				KeyEncoding:  replicatedstate.GlobalIndexKeyEncoding(relation.KeyEncoding),
+				KeyArity:     relation.KeyArity,
+				TupleVersion: relation.TupleVersion, MapperVersion: relation.MapperVersion,
+				BucketBits: relation.BucketBits,
 			}
 		default:
 			return nil, ErrReplicatedApplyMismatch
@@ -752,36 +756,43 @@ func replicatedGlobalIndexValidationDigest(
 	h := sha256.New()
 	_, _ = h.Write(replicatedGlobalIndexValidationDomain)
 	_, _ = h.Write(logicalManifest[:])
-	var fixed [32]byte
+	var fixed [40]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], base.RelationSchemaGeneration)
 	binary.LittleEndian.PutUint16(fixed[8:10], relation.Relation)
 	fixed[10] = relation.LocatorCount
 	if relation.Unique {
 		fixed[11] = 1
 	}
+	fixed[12] = byte(relation.KeyEncoding)
+	fixed[13] = relation.KeyArity
+	fixed[14] = relation.BucketBits
 	binary.LittleEndian.PutUint64(fixed[16:24], relation.IndexID)
 	binary.LittleEndian.PutUint64(fixed[24:32], relation.Incarnation)
+	binary.LittleEndian.PutUint32(fixed[32:36], uint32(relation.TupleVersion))
+	binary.LittleEndian.PutUint32(fixed[36:40], uint32(relation.MapperVersion))
 	_, _ = h.Write(fixed[:])
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result
 }
 
-type replicatedGlobalIndexMutationValidator struct{}
+type replicatedGlobalIndexMutationValidator struct {
+	relation ReplicatedShardRelationIdentity
+}
 
-func (replicatedGlobalIndexMutationValidator) ValidatePut(
+func (v replicatedGlobalIndexMutationValidator) ValidatePut(
 	key, _ []byte,
 ) replicatedstate.MutationValidation {
-	if len(key) == 0 || key[0] == 0 {
+	if _, ok := v.relation.GlobalIndexStorageKeyPoint(key); !ok {
 		return replicatedstate.MutationValidationInvalid
 	}
 	return replicatedstate.MutationValidationAccept
 }
 
-func (replicatedGlobalIndexMutationValidator) ValidateDelete(
+func (v replicatedGlobalIndexMutationValidator) ValidateDelete(
 	key, _ []byte, _ bool,
 ) replicatedstate.MutationValidation {
-	if len(key) == 0 || key[0] == 0 {
+	if _, ok := v.relation.GlobalIndexStorageKeyPoint(key); !ok {
 		return replicatedstate.MutationValidationInvalid
 	}
 	return replicatedstate.MutationValidationAccept

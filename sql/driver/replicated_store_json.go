@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
 )
@@ -41,7 +42,8 @@ var (
 	)
 	replicatedRelationFields = vibejson.MakeFieldSet(
 		"relation", "kind", "table", "storage", "limits", "local_index_digest",
-		"index_id", "incarnation", "locator_count", "unique",
+		"index_id", "incarnation", "locator_count", "unique", "key_encoding",
+		"key_arity", "tuple_version", "mapper_version", "bucket_bits",
 	)
 	replicatedStoreFields = vibejson.MakeFieldSet(
 		"format", "binding", "log_id", "user_table", "user_storage",
@@ -62,7 +64,8 @@ var (
 	}
 	replicatedRelationFieldNames = [...]string{
 		"relation", "kind", "table", "storage", "limits", "local_index_digest",
-		"index_id", "incarnation", "locator_count", "unique",
+		"index_id", "incarnation", "locator_count", "unique", "key_encoding",
+		"key_arity", "tuple_version", "mapper_version", "bucket_bits",
 	}
 	replicatedStoreFieldNames = [...]string{
 		"format", "binding", "log_id", "user_table", "user_storage",
@@ -89,12 +92,17 @@ func validateReplicatedRelationGrammar(r ReplicatedShardRelationIdentity) error 
 	}
 	switch r.Kind {
 	case ReplicatedShardRelationJSON:
-		if r.IndexID != 0 || r.Incarnation != 0 || r.LocatorCount != 0 || r.Unique {
+		if r.IndexID != 0 || r.Incarnation != 0 || r.LocatorCount != 0 || r.Unique ||
+			r.KeyEncoding != 0 || r.KeyArity != 0 || r.TupleVersion != 0 ||
+			r.MapperVersion != 0 || r.BucketBits != 0 {
 			return fmt.Errorf("%w: invalid JSON relation identity", ErrReplicatedShardStoreProfile)
 		}
 	case ReplicatedShardRelationGlobalIndex:
 		if r.LocalIndexDigest != ([sha256.Size]byte{}) || r.IndexID == 0 ||
-			r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 {
+			r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 ||
+			!validReplicatedGlobalIndexPlacement(
+				r.KeyEncoding, r.KeyArity, r.TupleVersion, r.MapperVersion, r.BucketBits,
+			) {
 			return fmt.Errorf("%w: invalid global-index relation identity", ErrReplicatedShardStoreProfile)
 		}
 	default:
@@ -303,6 +311,11 @@ func appendReplicatedRelation(
 	w = w.RawUnchecked(`,"incarnation":`).Uint(r.Incarnation)
 	w = w.RawUnchecked(`,"locator_count":`).Uint(uint64(r.LocatorCount))
 	w = w.RawUnchecked(`,"unique":`).Bool(r.Unique)
+	w = w.RawUnchecked(`,"key_encoding":`).Uint(uint64(r.KeyEncoding))
+	w = w.RawUnchecked(`,"key_arity":`).Uint(uint64(r.KeyArity))
+	w = w.RawUnchecked(`,"tuple_version":`).Uint(uint64(r.TupleVersion))
+	w = w.RawUnchecked(`,"mapper_version":`).Uint(uint64(r.MapperVersion))
+	w = w.RawUnchecked(`,"bucket_bits":`).Uint(uint64(r.BucketBits))
 	return w.RawByteUnchecked('}')
 }
 
@@ -573,6 +586,22 @@ func decodeReplicatedRelationVibe(
 			err = c.Uint8(&decoded.LocatorCount)
 		case 9:
 			err = c.Bool(&decoded.Unique)
+		case 10:
+			var encoding uint8
+			err = c.Uint8(&encoding)
+			decoded.KeyEncoding = ReplicatedRelationKeyEncoding(encoding)
+		case 11:
+			err = c.Uint8(&decoded.KeyArity)
+		case 12:
+			var version uint32
+			err = c.Uint32(&version)
+			decoded.TupleVersion = distribution.TupleVersion(version)
+		case 13:
+			var version uint32
+			err = c.Uint32(&version)
+			decoded.MapperVersion = distribution.MapperVersion(version)
+		case 14:
+			err = c.Uint8(&decoded.BucketBits)
 		}
 		if err != nil {
 			return err

@@ -96,6 +96,113 @@ func appendTuple(dst []byte, values []Scalar) ([]byte, error) {
 	return dst, nil
 }
 
+// CanonicalTuplePrefixLen validates the first arity scalar frames in raw and
+// returns their exact byte length. It does not decode strings or decimal
+// spellings and allocates nothing. Callers use it when a storage key appends a
+// second tuple after the placement tuple (for example, a non-unique global
+// index key followed by its base-row locator).
+//
+// The result is false for a truncated, overlong-varint, non-canonical, or
+// unsupported scalar frame. Bytes after the requested prefix are deliberately
+// not inspected.
+func CanonicalTuplePrefixLen(raw []byte, arity int) (int, bool) {
+	if arity < 1 || arity > KeyspaceWidth {
+		return 0, false
+	}
+	at := 0
+	for scalar := 0; scalar < arity; scalar++ {
+		next, ok := canonicalScalarEnd(raw, at)
+		if !ok {
+			return 0, false
+		}
+		at = next
+	}
+	return at, true
+}
+
+func canonicalScalarEnd(raw []byte, at int) (int, bool) {
+	if at < 0 || at >= len(raw) {
+		return 0, false
+	}
+	switch raw[at] {
+	case tagString:
+		length, next, ok := canonicalTupleUvarint(raw, at+1)
+		if !ok || length > uint64(len(raw)-next) {
+			return 0, false
+		}
+		return next + int(length), true
+	case tagNumber:
+		if at+1 >= len(raw) {
+			return 0, false
+		}
+		form := raw[at+1]
+		if form == numberFormZero {
+			return at + 2, true
+		}
+		if form != numberFormPositive && form != numberFormNegative {
+			return 0, false
+		}
+		at += 2
+		if at >= len(raw) {
+			return 0, false
+		}
+		weightForm := raw[at]
+		at++
+		switch weightForm {
+		case weightFormZero:
+		case weightFormPositive, weightFormNegative:
+			length, next, ok := canonicalTupleUvarint(raw, at)
+			if !ok || length == 0 || length > uint64(len(raw)-next) {
+				return 0, false
+			}
+			end := next + int(length)
+			if raw[next] == '0' || !canonicalTupleDigits(raw[next:end]) {
+				return 0, false
+			}
+			at = end
+		default:
+			return 0, false
+		}
+		length, next, ok := canonicalTupleUvarint(raw, at)
+		if !ok || length == 0 || length > uint64(len(raw)-next) {
+			return 0, false
+		}
+		end := next + int(length)
+		// Significant digits are stripped at both ends by AppendScalar.
+		if raw[next] == '0' || raw[end-1] == '0' ||
+			!canonicalTupleDigits(raw[next:end]) {
+			return 0, false
+		}
+		return end, true
+	default:
+		return 0, false
+	}
+}
+
+func canonicalTupleUvarint(raw []byte, at int) (uint64, int, bool) {
+	if at < 0 || at >= len(raw) {
+		return 0, 0, false
+	}
+	value, width := binary.Uvarint(raw[at:])
+	if width <= 0 {
+		return 0, 0, false
+	}
+	var canonical [binary.MaxVarintLen64]byte
+	if binary.PutUvarint(canonical[:], value) != width {
+		return 0, 0, false
+	}
+	return value, at + width, true
+}
+
+func canonicalTupleDigits(raw []byte) bool {
+	for _, digit := range raw {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // appendStringScalar appends tag, uvarint(len(s)), and s's raw bytes
 // verbatim: no UTF-8 revalidation, escaping, or NUL handling, since the
 // explicit length prefix already makes the field self-delimiting.

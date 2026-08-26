@@ -676,6 +676,10 @@ func newRF3RuntimeForTestGroup(
 			binding, "docs", []sqldriver.ReplicatedGlobalIndexRelation{{
 				Relation: 2, Table: "email_claims", IndexID: 41,
 				Incarnation: 7, LocatorCount: 1, Unique: true,
+				KeyEncoding: sqldriver.ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+				TupleVersion:  distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion,
+				BucketBits:    distribution.DefaultVirtualBucketBits,
 			}},
 		)
 	} else {

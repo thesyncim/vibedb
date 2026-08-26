@@ -95,16 +95,30 @@ const (
 	ReplicatedShardRelationGlobalIndex
 )
 
+// ReplicatedRelationKeyEncoding freezes the byte grammar used by one relation
+// storage key. Global-index rows use the canonical placement tuple followed by
+// a locator tuple only when the index is non-unique.
+type ReplicatedRelationKeyEncoding uint8
+
+const (
+	ReplicatedRelationKeyCanonicalTuple ReplicatedRelationKeyEncoding = iota + 1
+)
+
 // ReplicatedGlobalIndexRelation is the cold provisioning input for one global
 // exact-index image. Relation IDs must be dense from two; no table name or
 // index identity is carried by replicated mutation commands.
 type ReplicatedGlobalIndexRelation struct {
-	Relation     uint16
-	Table        string
-	IndexID      uint64
-	Incarnation  uint64
-	LocatorCount uint8
-	Unique       bool
+	Relation      uint16
+	Table         string
+	IndexID       uint64
+	Incarnation   uint64
+	LocatorCount  uint8
+	Unique        bool
+	KeyEncoding   ReplicatedRelationKeyEncoding
+	KeyArity      uint8
+	TupleVersion  distribution.TupleVersion
+	MapperVersion distribution.MapperVersion
+	BucketBits    uint8
 }
 
 // ReplicatedShardRelationIdentity is one immutable, comparable manifest slot.
@@ -121,6 +135,55 @@ type ReplicatedShardRelationIdentity struct {
 	Incarnation      uint64
 	LocatorCount     uint8
 	Unique           bool
+	KeyEncoding      ReplicatedRelationKeyEncoding
+	KeyArity         uint8
+	TupleVersion     distribution.TupleVersion
+	MapperVersion    distribution.MapperVersion
+	BucketBits       uint8
+}
+
+// GlobalIndexStorageKeyPoint validates one stored global-index key against the
+// retained schema-generation contract and maps its index tuple to an ownership
+// point. For a non-unique index the appended locator tuple is validated too,
+// but only the leading index tuple participates in placement. The operation is
+// allocation-free and returns false for every non-global, stale-format, or
+// malformed key.
+func (r ReplicatedShardRelationIdentity) GlobalIndexStorageKeyPoint(
+	key []byte,
+) (distribution.KeyspacePoint, bool) {
+	if r.Kind != ReplicatedShardRelationGlobalIndex || r.IndexID == 0 ||
+		r.Incarnation == 0 || r.LocatorCount == 0 || r.LocatorCount > 8 ||
+		!validReplicatedGlobalIndexPlacement(r.KeyEncoding, r.KeyArity,
+			r.TupleVersion, r.MapperVersion, r.BucketBits) {
+		return distribution.KeyspacePoint{}, false
+	}
+	point, consumed, ok := distribution.NativePointForEncodedTuplePrefix(
+		key, int(r.KeyArity), r.BucketBits,
+	)
+	if !ok {
+		return distribution.KeyspacePoint{}, false
+	}
+	if r.Unique {
+		return point, consumed == len(key)
+	}
+	locatorBytes, ok := distribution.CanonicalTuplePrefixLen(
+		key[consumed:], int(r.LocatorCount),
+	)
+	return point, ok && consumed+locatorBytes == len(key)
+}
+
+func validReplicatedGlobalIndexPlacement(
+	encoding ReplicatedRelationKeyEncoding,
+	arity uint8,
+	tuple distribution.TupleVersion,
+	mapper distribution.MapperVersion,
+	bucketBits uint8,
+) bool {
+	return encoding == ReplicatedRelationKeyCanonicalTuple &&
+		arity >= 1 && arity <= distribution.KeyspaceWidth &&
+		tuple == distribution.CurrentTupleVersion &&
+		mapper == distribution.NativeMapperVersion &&
+		distribution.ValidVirtualBucketBits(bucketBits)
 }
 
 // ReplicatedShardStoreIdentity is the complete reopen identity. LogID is the
@@ -241,7 +304,11 @@ func (d *Database) bindReplicatedShardStoreBundle(
 		if relation.Relation != uint16(i+2) ||
 			validateReplicatedBundleRelationName(relation.Table) != nil ||
 			relation.IndexID == 0 || relation.Incarnation == 0 ||
-			relation.LocatorCount == 0 || relation.LocatorCount > 8 {
+			relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+			!validReplicatedGlobalIndexPlacement(
+				relation.KeyEncoding, relation.KeyArity, relation.TupleVersion,
+				relation.MapperVersion, relation.BucketBits,
+			) {
 			return ReplicatedShardStoreIdentity{}, fmt.Errorf(
 				"%w: invalid global relation slot %d", ErrReplicatedShardStoreProfile, i+2,
 			)
@@ -480,6 +547,11 @@ func (d *Database) bindReplicatedShardStoreBundle(
 			relation.Incarnation = pending[i].global.Incarnation
 			relation.LocatorCount = pending[i].global.LocatorCount
 			relation.Unique = pending[i].global.Unique
+			relation.KeyEncoding = pending[i].global.KeyEncoding
+			relation.KeyArity = pending[i].global.KeyArity
+			relation.TupleVersion = pending[i].global.TupleVersion
+			relation.MapperVersion = pending[i].global.MapperVersion
+			relation.BucketBits = pending[i].global.BucketBits
 		}
 		identity.Relations[i] = relation
 	}
@@ -558,7 +630,10 @@ func replicatedBundleProvisioningMatches(
 		if got.Relation != want.Relation ||
 			got.Kind != ReplicatedShardRelationGlobalIndex || got.Table != want.Table ||
 			got.IndexID != want.IndexID || got.Incarnation != want.Incarnation ||
-			got.LocatorCount != want.LocatorCount || got.Unique != want.Unique {
+			got.LocatorCount != want.LocatorCount || got.Unique != want.Unique ||
+			got.KeyEncoding != want.KeyEncoding || got.KeyArity != want.KeyArity ||
+			got.TupleVersion != want.TupleVersion ||
+			got.MapperVersion != want.MapperVersion || got.BucketBits != want.BucketBits {
 			return false
 		}
 	}
@@ -1337,13 +1412,19 @@ func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) e
 			if ordinal != 0 || relation.Table != identity.UserTable ||
 				relation.Storage != identity.UserStorage || relation.Limits != identity.UserLimits ||
 				relation.IndexID != 0 || relation.Incarnation != 0 ||
-				relation.LocatorCount != 0 || relation.Unique {
+				relation.LocatorCount != 0 || relation.Unique || relation.KeyEncoding != 0 ||
+				relation.KeyArity != 0 || relation.TupleVersion != 0 ||
+				relation.MapperVersion != 0 || relation.BucketBits != 0 {
 				return fmt.Errorf("%w: invalid base relation", ErrReplicatedShardStoreProfile)
 			}
 		case ReplicatedShardRelationGlobalIndex:
 			if ordinal == 0 || relation.LocalIndexDigest != ([sha256.Size]byte{}) ||
 				relation.IndexID == 0 || relation.Incarnation == 0 ||
-				relation.LocatorCount == 0 || relation.LocatorCount > 8 {
+				relation.LocatorCount == 0 || relation.LocatorCount > 8 ||
+				!validReplicatedGlobalIndexPlacement(
+					relation.KeyEncoding, relation.KeyArity, relation.TupleVersion,
+					relation.MapperVersion, relation.BucketBits,
+				) {
 				return fmt.Errorf("%w: invalid global-index relation", ErrReplicatedShardStoreProfile)
 			}
 		default:
@@ -1374,7 +1455,7 @@ func writeReplicatedRelationDescriptors(
 	identity ReplicatedShardStoreIdentity,
 	includeStorage bool,
 ) {
-	var fixed [48]byte
+	var fixed [56]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], identity.RelationSchemaGeneration)
 	binary.LittleEndian.PutUint64(fixed[8:16], uint64(identity.RelationCount))
 	_, _ = h.Write(fixed[:16])
@@ -1388,13 +1469,17 @@ func writeReplicatedRelationDescriptors(
 		} else {
 			fixed[4] = 0
 		}
-		clear(fixed[5:8])
+		fixed[5] = byte(relation.KeyEncoding)
+		fixed[6] = relation.KeyArity
+		fixed[7] = relation.BucketBits
 		binary.LittleEndian.PutUint64(fixed[8:16], relation.IndexID)
 		binary.LittleEndian.PutUint64(fixed[16:24], relation.Incarnation)
 		binary.LittleEndian.PutUint64(fixed[24:32], uint64(relation.Limits.MaxKeyBytes))
 		binary.LittleEndian.PutUint64(fixed[32:40], uint64(relation.Limits.MaxDocumentBytes))
 		binary.LittleEndian.PutUint32(fixed[40:44], uint32(relation.Limits.MaxBatchDocuments))
 		binary.LittleEndian.PutUint32(fixed[44:48], uint32(relation.Limits.MaxBatchBytes))
+		binary.LittleEndian.PutUint32(fixed[48:52], uint32(relation.TupleVersion))
+		binary.LittleEndian.PutUint32(fixed[52:56], uint32(relation.MapperVersion))
 		_, _ = h.Write(fixed[:])
 		writeReplicatedRelationFrame(h, []byte(relation.Table))
 		if includeStorage {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -25,13 +26,24 @@ const (
 	RelationGlobalIndex
 )
 
+// GlobalIndexKeyEncoding identifies the physical row-key grammar authenticated
+// by a relation manifest.
+type GlobalIndexKeyEncoding uint8
+
+const GlobalIndexKeyCanonicalTuple GlobalIndexKeyEncoding = 1
+
 // GlobalIndexProfile is the schema-generation-bound identity and value shape
 // for one independently stored exact/global index relation.
 type GlobalIndexProfile struct {
-	IndexID      uint64
-	Incarnation  uint64
-	LocatorCount uint8
-	Unique       bool
+	IndexID       uint64
+	Incarnation   uint64
+	LocatorCount  uint8
+	Unique        bool
+	KeyEncoding   GlobalIndexKeyEncoding
+	KeyArity      uint8
+	TupleVersion  distribution.TupleVersion
+	MapperVersion distribution.MapperVersion
+	BucketBits    uint8
 }
 
 // RelationCollection binds one dense bundle-local slot to its already-opened
@@ -230,6 +242,11 @@ func validateRelationTarget(spec RelationCollection) error {
 		profile := spec.GlobalIndex
 		if profile.IndexID == 0 || profile.Incarnation == 0 ||
 			profile.LocatorCount == 0 || profile.LocatorCount > 8 ||
+			profile.KeyEncoding != GlobalIndexKeyCanonicalTuple || profile.KeyArity == 0 ||
+			profile.KeyArity > distribution.KeyspaceWidth ||
+			profile.TupleVersion != distribution.CurrentTupleVersion ||
+			profile.MapperVersion != distribution.NativeMapperVersion ||
+			!distribution.ValidVirtualBucketBits(profile.BucketBits) ||
 			len(spec.LocalIndexes) != 0 || t.Collection.HasIndexes() {
 			return ErrInvalidCollection
 		}
@@ -354,7 +371,7 @@ func relationManifestDigest(
 ) [sha256.Size]byte {
 	h := sha256.New()
 	_, _ = h.Write(relationManifestDigestDomain)
-	var fixed [24]byte
+	var fixed [32]byte
 	binary.LittleEndian.PutUint64(fixed[0:8], schemaGeneration)
 	binary.LittleEndian.PutUint64(fixed[8:16], uint64(len(relations)))
 	_, _ = h.Write(fixed[:16])
@@ -368,9 +385,13 @@ func relationManifestDigest(
 			fixed[3] = 0
 		}
 		fixed[4] = relation.globalIndex.LocatorCount
-		clear(fixed[5:8])
+		fixed[5] = byte(relation.globalIndex.KeyEncoding)
+		fixed[6] = relation.globalIndex.KeyArity
+		fixed[7] = relation.globalIndex.BucketBits
 		binary.LittleEndian.PutUint64(fixed[8:16], relation.globalIndex.IndexID)
 		binary.LittleEndian.PutUint64(fixed[16:24], relation.globalIndex.Incarnation)
+		binary.LittleEndian.PutUint32(fixed[24:28], uint32(relation.globalIndex.TupleVersion))
+		binary.LittleEndian.PutUint32(fixed[28:32], uint32(relation.globalIndex.MapperVersion))
 		_, _ = h.Write(fixed[:])
 		writeHashFrame(h, []byte(relation.name))
 		_, _ = h.Write([]byte{byte(relation.target.Validation)})

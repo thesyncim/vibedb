@@ -403,6 +403,10 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 		binding, "docs", []ReplicatedGlobalIndexRelation{{
 			Relation: 2, Table: "email_claims", IndexID: 41,
 			Incarnation: 7, LocatorCount: 1, Unique: true,
+			KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+			TupleVersion:  distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
 	skipReplicatedStrictAllocationUnsupported(t, database, base, err)
@@ -2690,7 +2694,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "885cdd7ffa5c04b7d2f1d8872b1a163be260c71038ea66ecf62b7b43a8be25b7"
+	const wantDigest = "e73ccecc7f49f4d42b76efe9cc3be63f5bd3c55fd2307dc36ff4f97bf1ef7c32"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -3025,6 +3029,10 @@ func TestReplicatedApplyTransactionByteFloorIsMandatoryAndExact(t *testing.T) {
 		Relation: 2, Kind: ReplicatedShardRelationGlobalIndex,
 		Table: "email_index", Storage: base.UserStorage, Limits: base.UserLimits,
 		IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
+		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion:  distribution.CurrentTupleVersion,
+		MapperVersion: distribution.NativeMapperVersion,
+		BucketBits:    distribution.DefaultVirtualBucketBits,
 	}
 	core.mu.RUnlock()
 	base.RelationManifestDigest = replicatedRelationManifestDigest(base)

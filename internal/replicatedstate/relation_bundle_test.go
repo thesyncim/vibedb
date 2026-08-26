@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store"
@@ -33,6 +34,21 @@ type relationBundleFixture struct {
 	second  RelationKind
 	dir     string
 	options Options
+}
+
+func testGlobalIndexProfile(
+	indexID, incarnation uint64,
+	locatorCount uint8,
+	unique bool,
+) GlobalIndexProfile {
+	return GlobalIndexProfile{
+		IndexID: indexID, Incarnation: incarnation,
+		LocatorCount: locatorCount, Unique: unique,
+		KeyEncoding: GlobalIndexKeyCanonicalTuple, KeyArity: 1,
+		TupleVersion:  distribution.CurrentTupleVersion,
+		MapperVersion: distribution.NativeMapperVersion,
+		BucketBits:    distribution.DefaultVirtualBucketBits,
+	}
 }
 
 func TestRequiredBundleTransactionDocumentsIsCaptureExact(t *testing.T) {
@@ -244,9 +260,7 @@ func relationBundleCollections(
 		{Relation: 2, Kind: secondKind, Name: "global", Target: second},
 	}
 	if secondKind == RelationGlobalIndex {
-		relations[1].GlobalIndex = GlobalIndexProfile{
-			IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-		}
+		relations[1].GlobalIndex = testGlobalIndexProfile(91, 7, 1, true)
 	}
 	return relations
 }
@@ -986,7 +1000,7 @@ func TestOpenBundleRejectsAggregateCapacityBeforeImageScan(t *testing.T) {
 	relations := []RelationCollection{
 		{Relation: 1, Kind: RelationJSON, Name: "bounded-base", Target: base},
 		{Relation: 2, Kind: RelationGlobalIndex, Name: "bounded-global", Target: global,
-			GlobalIndex: GlobalIndexProfile{IndexID: 1, Incarnation: 1, LocatorCount: 1, Unique: true}},
+			GlobalIndex: testGlobalIndexProfile(1, 1, 1, true)},
 	}
 	hotSystemBytes := len(stateKey) + MaxStateEnvelopeBytes +
 		sha256.Size + 1 + MaxSessionRecordBytes +
@@ -1093,9 +1107,7 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 			},
 			{
 				Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{
-					IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-				},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true),
 			},
 		},
 		fixture.log, fixture.machine.options,
@@ -1152,7 +1164,7 @@ func TestRelationBundleSnapshotCertificateReopenAndManifestRejection(t *testing.
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: fixture.base,
 				LocalIndexes: []store.IndexDefinition{fixture.index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		}, fixture.log, fixture.machine.options,
 	); err == nil {
 		t.Fatal("reopen accepted an unknown schema generation")
@@ -1252,7 +1264,7 @@ func TestRelationBundleSnapshotBindsActiveCaptureAndRejectsSelfConsistentForgeri
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: fixture.base,
 				LocalIndexes: []store.IndexDefinition{fixture.index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: fixture.global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		}, fixture.log, fixture.options,
 	)
 	if err != nil {
@@ -1474,7 +1486,7 @@ func assertRecoveredRelationBundleCut(
 			{Relation: 1, Kind: RelationJSON, Name: "base", Target: base,
 				LocalIndexes: []store.IndexDefinition{index}},
 			{Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: global,
-				GlobalIndex: GlobalIndexProfile{IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true}},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true)},
 		},
 		log, options,
 	)

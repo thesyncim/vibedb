@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -82,6 +83,10 @@ func TestReplicatedSnapshotStageInstallsCompleteRelationBundle(t *testing.T) {
 			binding, "docs", []ReplicatedGlobalIndexRelation{{
 				Relation: 2, Table: "email_claims", IndexID: 41,
 				Incarnation: 7, LocatorCount: 1, Unique: true,
+				KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
+				TupleVersion:  distribution.CurrentTupleVersion,
+				MapperVersion: distribution.NativeMapperVersion,
+				BucketBits:    distribution.DefaultVirtualBucketBits,
 			}},
 		)
 		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)

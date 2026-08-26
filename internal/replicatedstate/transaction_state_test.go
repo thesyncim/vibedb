@@ -284,9 +284,7 @@ func TestTransactionStateScaffoldSnapshotAndReopenRetainRecords(t *testing.T) {
 			},
 			{
 				Relation: 2, Kind: RelationGlobalIndex, Name: "global", Target: scaffold.fixture.global,
-				GlobalIndex: GlobalIndexProfile{
-					IndexID: 91, Incarnation: 7, LocatorCount: 1, Unique: true,
-				},
+				GlobalIndex: testGlobalIndexProfile(91, 7, 1, true),
 			},
 		},
 		scaffold.fixture.log,
