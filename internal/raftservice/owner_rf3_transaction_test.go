@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibejson"
 )
 
 type transactionRF3Cluster struct {
@@ -302,7 +303,12 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	if !ok {
 		t.Fatal("encode transaction base key")
 	}
-	document := []byte(`{"id":"txn-doc","email":"txn@example.com"}`)
+	document, err := vibejson.AppendCanonicalize(
+		nil, []byte(`{"id":"txn-doc","email":"txn@example.com"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	globalKey := []byte{0x91, 0x01, 't'}
 	globalValue := []byte(`["txn-doc"]`)
 	batches := []replication.RelationMutationBatch{
