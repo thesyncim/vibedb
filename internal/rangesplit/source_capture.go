@@ -281,6 +281,63 @@ func (c *SourceCapture) Head() uint64 {
 	return c.head.Load()
 }
 
+// ValidateDescriptorAncestor proves that descriptor names an exact published
+// boundary in this capture's authenticated chain. It performs one bounded
+// point read regardless of capture length. This lets a restarted controller
+// advance a lagging control record without rescanning or trusting a merely
+// monotonic applied index.
+func (c *SourceCapture) ValidateDescriptorAncestor(
+	descriptor SourceCaptureDescriptor,
+	workspace *SourceCaptureWorkspace,
+) error {
+	if c == nil || workspace == nil || !c.begun.Load() ||
+		c.partitioner.ValidateSourceCaptureDescriptor(descriptor) != nil {
+		return ErrSourceCapture
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending != 0 || descriptor.Base != c.base ||
+		descriptor.Head.BaseDigest != c.base.BaseDigest ||
+		descriptor.Head.Applied < c.base.Applied ||
+		descriptor.Head.Applied > c.current.applied {
+		return ErrSourceCapture
+	}
+	key := descriptor.Head.Applied
+	if descriptor.Head.Applied == c.base.Applied {
+		key = sourceCaptureHeaderKey
+	}
+	binary.BigEndian.PutUint64(workspace.key[:], key)
+	raw, found, err := c.target.Collection.AppendRaw(workspace.raw[:0], workspace.key[:])
+	if err != nil || !found {
+		return errors.Join(ErrSourceCapture, err)
+	}
+	workspace.raw = raw
+	publication := sourceCapturePublication{}
+	if descriptor.Head.Applied == c.base.Applied {
+		base, opened, decodeErr := c.decodeHeader(raw, workspace)
+		if decodeErr != nil || base != c.base {
+			return errors.Join(ErrSourceCapture, decodeErr)
+		}
+		publication = opened
+	} else {
+		record, decodeErr := c.decodeEntry(raw, workspace)
+		if decodeErr != nil || record.Applied != descriptor.Head.Applied {
+			return errors.Join(ErrSourceCapture, decodeErr)
+		}
+		publication = publicationFromEntry(record)
+	}
+	if descriptor.Head.DataChainDigest != publication.dataChainDigest ||
+		descriptor.Head.EntryDigest != publication.entryDigest ||
+		descriptor.Head.Term != publication.term ||
+		descriptor.Head.RouteGeneration != publication.routeGeneration ||
+		descriptor.Coordinates.OwnershipEpoch != publication.ownershipEpoch ||
+		descriptor.Coordinates.RoutingVersion != publication.routingVersion ||
+		descriptor.Coordinates.RouteGeneration != publication.routeGeneration {
+		return ErrSourceCapture
+	}
+	return nil
+}
+
 // NextTailEntry reads and verifies the exact next record after cursor. false
 // means that the capture currently has no newer committed publication.
 func (c *SourceCapture) NextTailEntry(
