@@ -47,6 +47,8 @@ type ReplicatedEndpoint struct {
 	Node            rafttransport.NodeID
 	StoreID         [16]byte
 	NodeIncarnation uint64
+	Endpoint        string
+	DataAddress     string
 	NativeEndpoint  string
 	Address         string
 	ControlEndpoint string
@@ -61,6 +63,15 @@ type ReplicatedRoute struct {
 	AllocationGeneration uint64
 	Command              raftservice.CommandFence
 	Replicas             []ReplicatedEndpoint
+}
+
+// ReplicatedMembershipRoute keeps membership reachability separate from the
+// public data route. Serving always remains the active RF3; EnrolledTarget is
+// the sole replacement endpoint membership control may additionally probe.
+type ReplicatedMembershipRoute struct {
+	Serving           ReplicatedRoute
+	EnrolledTarget    ReplicatedEndpoint
+	HasEnrolledTarget bool
 }
 
 // ReplicatedRoundTripper performs one native request. Implementations must not
@@ -710,11 +721,12 @@ type MembershipTransferWitness struct {
 // subsequent remove-voter request.
 func (executor *ReplicatedExecutor) ObserveMembershipTransfer(
 	ctx context.Context,
-	route ReplicatedRoute,
+	route ReplicatedMembershipRoute,
 	target, afterTerm uint64,
 ) (ReplicatedMembershipResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
-		!validReplicatedRoute(route) || target == 0 || afterTerm == 0 {
+		!validReplicatedMembershipRoute(route) || target == 0 || afterTerm == 0 ||
+		!route.HasEnrolledTarget || target != route.EnrolledTarget.Member {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
 	result, witnessed := executor.observeMembershipTransfer(ctx, route, target, afterTerm)
@@ -732,10 +744,11 @@ func (executor *ReplicatedExecutor) ObserveMembershipTransfer(
 // controller to resolve from replicated membership state.
 func (executor *ReplicatedExecutor) ApplyMembership(
 	ctx context.Context,
-	route ReplicatedRoute,
+	route ReplicatedMembershipRoute,
 	membership shardservice.ReplicatedMembershipRequest,
 ) (ReplicatedMembershipResult, error) {
-	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) {
+	if executor == nil || executor.client == nil || ctx == nil ||
+		!validReplicatedMembershipRoute(route) {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
 	if err := raftservice.ValidateMembershipFields(
@@ -745,12 +758,13 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 	); err != nil {
 		return ReplicatedMembershipResult{}, err
 	}
-	if membership.ExpectedReplicaSetVersion != route.Command.ReplicaSetVersion {
+	if membership.ExpectedReplicaSetVersion != route.Serving.Command.ReplicaSetVersion ||
+		!route.HasEnrolledTarget || membership.TargetMember != route.EnrolledTarget.Member {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
-	preferred := route.Replicas[0].Member
+	preferred := route.Serving.Replicas[0].Member
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeader(ctx, route, preferred,
+		endpoint, state, err := executor.discoverMembershipLeaderFresh(ctx, route, preferred,
 			serviceauthz.CapabilityMembership)
 		if err != nil {
 			return ReplicatedMembershipResult{}, err
@@ -760,7 +774,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				Capability: serviceauthz.CapabilityMembership,
 				Fence:      state.Fence, Membership: membership})
 		if err != nil {
-			executor.leaderHints.invalidate(route, endpoint, state)
+			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
 					ctx, route, membership.TargetMember, state.Fence.Term,
@@ -780,10 +794,10 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			}
 		}
 		if !validReplicatedResponseState(response) ||
-			response.State.Fence.Group != route.Group ||
-			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
+			response.State.Fence.Group != route.Serving.Group ||
+			response.State.Fence.AllocationGeneration != route.Serving.AllocationGeneration ||
 			response.State.Fence.MemberID != endpoint.Member {
-			executor.leaderHints.invalidate(route, endpoint, state)
+			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 				ErrReplicatedRoute)
 		}
@@ -793,7 +807,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 					ErrReplicatedRoute)
 			}
-			executor.leaderHints.publish(route, endpoint, response.State)
+			executor.leaderHints.publish(route.Serving, endpoint, response.State)
 			result := ReplicatedMembershipResult{State: response.State, Retries: attempt}
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				witness, observeErr := executor.ObserveMembershipTransfer(
@@ -807,7 +821,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			}
 			return result, nil
 		case shardservice.ReplicatedNotLeader:
-			executor.leaderHints.invalidate(route, endpoint, state)
+			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			if !validReplicatedNonterminalResponse(response) {
 				return ReplicatedMembershipResult{}, errors.Join(raftservice.ErrOutcomeUnknown,
 					ErrReplicatedRoute)
@@ -815,7 +829,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			preferred = response.State.LeaderID
 			continue
 		case shardservice.ReplicatedOutcomeUnknown:
-			executor.leaderHints.invalidate(route, endpoint, state)
+			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
 					ctx, route, membership.TargetMember, state.Fence.Term,
@@ -841,12 +855,12 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 
 func (executor *ReplicatedExecutor) observeMembershipTransfer(
 	ctx context.Context,
-	route ReplicatedRoute,
+	route ReplicatedMembershipRoute,
 	target, afterTerm uint64,
 ) (ReplicatedMembershipResult, bool) {
 	preferred := target
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.discoverLeaderFresh(ctx, route, preferred,
+		endpoint, state, err := executor.discoverMembershipLeaderFresh(ctx, route, preferred,
 			serviceauthz.CapabilityMembership)
 		if err == nil && endpoint.Member == target && state.LeaderID == target &&
 			state.Fence.MemberID == target && state.Fence.Term > afterTerm {
@@ -1399,6 +1413,69 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 		errors.Join(ErrReplicatedLeader, joined)
 }
 
+// discoverMembershipLeaderFresh probes only the active serving RF3 and the
+// single enrolled replacement. It deliberately does not consult data-route
+// leader hints: after transfer, the leader may be the non-serving target.
+func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
+	ctx context.Context,
+	route ReplicatedMembershipRoute,
+	preferred uint64,
+	capability serviceauthz.Capability,
+) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	visited := uint8(0)
+	member := preferred
+	limit := len(route.Serving.Replicas)
+	if route.HasEnrolledTarget {
+		limit++
+	}
+	var joined error
+	for probes := 0; probes < limit; probes++ {
+		endpoint, ordinal, ok := replicatedMembershipEndpoint(route, member)
+		if !ok || visited&(uint8(1)<<ordinal) != 0 {
+			endpoint, ordinal, ok = firstUnvisitedReplicatedMembershipEndpoint(route, visited)
+			if !ok {
+				break
+			}
+		}
+		visited |= uint8(1) << ordinal
+		response, err := executor.doReplicated(ctx, endpoint,
+			&shardservice.ReplicatedRequest{
+				Operation:  shardservice.ReplicatedProbe,
+				Capability: capability,
+				Fence: shardservice.ReplicatedFence{
+					Group:                route.Serving.Group,
+					AllocationGeneration: route.Serving.AllocationGeneration,
+				},
+			})
+		if err != nil {
+			joined = errors.Join(joined, err)
+			member = 0
+			continue
+		}
+		if validReplicatedUnauthorizedWithoutState(response) {
+			return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
+				&ReplicatedRefusalError{Code: response.Refusal}
+		}
+		if response == nil || response.Kind != shardservice.ReplicatedHandshake ||
+			!validReplicatedResponseState(response) ||
+			!validReplicatedNonterminalResponse(response) ||
+			response.State.Fence.Group != route.Serving.Group ||
+			response.State.Fence.AllocationGeneration != route.Serving.AllocationGeneration ||
+			response.State.Fence.Command != route.Serving.Command ||
+			response.State.Fence.MemberID != endpoint.Member {
+			joined = errors.Join(joined, ErrReplicatedRoute)
+			member = 0
+			continue
+		}
+		if response.State.LeaderID == response.State.Fence.MemberID {
+			return endpoint, response.State, nil
+		}
+		member = response.State.LeaderID
+	}
+	return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
+		errors.Join(ErrReplicatedLeader, joined)
+}
+
 func validReplicatedResponseState(response *shardservice.ReplicatedResponse) bool {
 	return response != nil && response.HasState &&
 		validReplicatedMemberState(response.State)
@@ -1544,6 +1621,33 @@ func validReplicatedRoute(route ReplicatedRoute) bool {
 	return true
 }
 
+func validReplicatedMembershipRoute(route ReplicatedMembershipRoute) bool {
+	if !validReplicatedRoute(route.Serving) || len(route.Serving.Replicas) != ServingReplicaCount {
+		return false
+	}
+	if !route.HasEnrolledTarget {
+		return route.EnrolledTarget == (ReplicatedEndpoint{})
+	}
+	target := route.EnrolledTarget
+	if !validReplicatedEndpoint(target) {
+		return false
+	}
+	for _, serving := range route.Serving.Replicas {
+		if serving.Member == target.Member || serving.Node == target.Node ||
+			serving.StoreID == target.StoreID ||
+			serving.NativeEndpoint == target.NativeEndpoint || serving.Address == target.Address {
+			return false
+		}
+	}
+	return true
+}
+
+func validReplicatedEndpoint(endpoint ReplicatedEndpoint) bool {
+	return endpoint.Member != 0 && endpoint.Node != (rafttransport.NodeID{}) &&
+		endpoint.StoreID != ([16]byte{}) && endpoint.NodeIncarnation != 0 &&
+		endpoint.NativeEndpoint != "" && endpoint.Address != ""
+}
+
 func commandMatchesRoute(command []byte, route ReplicatedRoute) bool {
 	view, err := replication.OpenCommand(command)
 	return err == nil && view.ClusterID == route.Group.ClusterID &&
@@ -1571,6 +1675,35 @@ func replicatedEndpoint(
 		if endpoint.Member == member {
 			return endpoint, index, true
 		}
+	}
+	return ReplicatedEndpoint{}, 0, false
+}
+
+func replicatedMembershipEndpoint(
+	route ReplicatedMembershipRoute,
+	member uint64,
+) (ReplicatedEndpoint, uint8, bool) {
+	if endpoint, ordinal, ok := replicatedEndpoint(route.Serving, member); ok {
+		return endpoint, uint8(ordinal), true
+	}
+	if route.HasEnrolledTarget && route.EnrolledTarget.Member == member {
+		return route.EnrolledTarget, uint8(len(route.Serving.Replicas)), true
+	}
+	return ReplicatedEndpoint{}, 0, false
+}
+
+func firstUnvisitedReplicatedMembershipEndpoint(
+	route ReplicatedMembershipRoute,
+	visited uint8,
+) (ReplicatedEndpoint, uint8, bool) {
+	for index, endpoint := range route.Serving.Replicas {
+		if visited&(uint8(1)<<uint8(index)) == 0 {
+			return endpoint, uint8(index), true
+		}
+	}
+	ordinal := uint8(len(route.Serving.Replicas))
+	if route.HasEnrolledTarget && visited&(uint8(1)<<ordinal) == 0 {
+		return route.EnrolledTarget, ordinal, true
 	}
 	return ReplicatedEndpoint{}, 0, false
 }

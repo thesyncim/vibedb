@@ -66,6 +66,70 @@ func TestReplicatedCatalogExactRF3RoundTripAndAllocationFreeRoute(t *testing.T) 
 	assertRoute(loaded)
 }
 
+func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	endpoints["ep-target"] = "127.0.0.1:7005"
+	endpoints["ep-target-native"] = "127.0.0.1:7105"
+	endpoints["ep-target-control"] = "127.0.0.1:7205"
+	descriptor.EnrolledTarget = &ReplicatedReplicaDescriptor{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+		Endpoint: "ep-target", NativeEndpoint: "ep-target-native",
+		ControlEndpoint: "ep-target-control",
+	}
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoutes := func(snapshot *Snapshot) {
+		t.Helper()
+		var workspace [ServingReplicaCount + 1]ReplicatedEndpoint
+		data, ok := snapshot.ResolveReplicatedRoute(
+			descriptor.Distribution, descriptor.Shard, workspace[:0],
+		)
+		if !ok || len(data.Replicas) != ServingReplicaCount ||
+			cap(data.Replicas) != ServingReplicaCount {
+			t.Fatalf("data route = %+v,%v", data, ok)
+		}
+		for _, endpoint := range data.Replicas {
+			if endpoint.Member == descriptor.EnrolledTarget.Member {
+				t.Fatal("enrolled target leaked into the public data route")
+			}
+		}
+		membership, ok := snapshot.ResolveReplicatedMembershipRoute(
+			descriptor.Distribution, descriptor.Shard, workspace[:0],
+		)
+		if !ok || len(membership.Serving.Replicas) != ServingReplicaCount ||
+			cap(membership.Serving.Replicas) != ServingReplicaCount ||
+			!membership.HasEnrolledTarget ||
+			membership.EnrolledTarget.Member != descriptor.EnrolledTarget.Member ||
+			membership.EnrolledTarget.Address != endpoints[descriptor.EnrolledTarget.NativeEndpoint] {
+			t.Fatalf("membership route = %+v,%v", membership, ok)
+		}
+	}
+	assertRoutes(snapshot)
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := SaveSnapshot(path, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoutes(loaded)
+
+	duplicate := descriptor
+	target := *descriptor.EnrolledTarget
+	target.Member = descriptor.Replicas[0].Member
+	duplicate.EnrolledTarget = &target
+	if _, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{duplicate},
+	); err == nil {
+		t.Fatal("catalog accepted an enrolled target that repeats a serving member")
+	}
+}
+
 func TestReplicatedCatalogRejectsGroupChangeWithinAllocation(t *testing.T) {
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
 	current, err := NewSnapshotWithReplicatedMetadata(
