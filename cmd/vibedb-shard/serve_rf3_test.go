@@ -114,80 +114,107 @@ func TestValidateRF3Addresses(t *testing.T) {
 	}
 }
 
-func TestBuildRF3RosterRequiresExactStableDurableRF3(t *testing.T) {
+func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 	manifest := serveRF3TestManifest()
+	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
 	group := serveRF3TestGroup()
-	stable := raftmodel.Publication{
-		ReplicaSetVersion: 9,
-		ConfState:         &pb.ConfState{Voters: []uint64{1, 2, 3}},
+	tests := []struct {
+		name        string
+		conf        *pb.ConfState
+		local       uint64
+		roles       []rafttransport.MemberRole
+		serveNative bool
+	}{
+		{"stable", &pb.ConfState{Voters: []uint64{1, 2, 3}}, 2,
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberEnrolled}, true},
+		{"learner", &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}, 4,
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberLearner}, false},
+		{"promoted_rf4", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 4,
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, false},
+		{"promoted_rf4_original", &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}, 2,
+			[]rafttransport.MemberRole{rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
+		{"final_rf3", &pb.ConfState{Voters: []uint64{2, 3, 4}}, 4,
+			[]rafttransport.MemberRole{rafttransport.MemberEnrolled, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, true},
+		{"removed_local", &pb.ConfState{Voters: []uint64{2, 3, 4}}, 1,
+			[]rafttransport.MemberRole{rafttransport.MemberEnrolled, rafttransport.MemberVoter, rafttransport.MemberVoter, rafttransport.MemberVoter}, false},
 	}
-	members, remote, dial, err := buildRF3Roster(manifest, group, 2, stable)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			publication := raftmodel.Publication{ReplicaSetVersion: 9, ConfState: tc.conf}
+			members, remote, dial, serveNative, err := buildRF3Roster(manifest, group, tc.local, publication)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(members) != rf3ManifestMembers+1 || len(remote) != rf3ManifestMembers ||
+				dial == nil || serveNative != tc.serveNative {
+				t.Fatalf("members=%d remote=%d dial-nil=%t native=%t", len(members), len(remote), dial == nil, serveNative)
+			}
+			for index, member := range members {
+				if member.Group != group || member.ReplicaSetVersion != publication.ReplicaSetVersion ||
+					member.MemberID != uint64(index+1) || member.Role != tc.roles[index] {
+					t.Fatalf("member %d = %+v, role=%v", index, member, tc.roles[index])
+				}
+			}
+			registry, err := rafttransport.NewStaticRegistry(
+				members[tc.local-1].Node, members,
+				rafttransport.Limits{MaxGroups: 1, MaxMembers: len(members)},
+			)
+			if err != nil {
+				t.Fatalf("reconstruct registry: %v", err)
+			}
+			if local, err := registry.LocalMember(group); err != nil || local != tc.local {
+				t.Fatalf("local member = %d, err=%v", local, err)
+			}
+			if _, err := dial(context.Background(), rafttransport.NodeID{0xff}); !errors.Is(err, rafttransport.ErrNodeNotFound) {
+				t.Fatalf("unknown-node dial error = %v, want ErrNodeNotFound", err)
+			}
+		})
 	}
-	if len(members) != 3 || len(remote) != 2 || dial == nil {
-		t.Fatalf("members=%d remote=%d dial-nil=%t", len(members), len(remote), dial == nil)
-	}
-	for index, member := range members {
-		configured := manifest.Members[index]
-		if member.Group != group || member.ReplicaSetVersion != stable.ReplicaSetVersion ||
-			member.MemberID != configured.MemberID || member.Node != configured.NodeID ||
-			member.Role != rafttransport.MemberVoter {
-			t.Fatalf("member %d = %+v, configured=%+v", index, member, configured)
-		}
-	}
-	if remote[0] != manifest.Members[0].NodeID || remote[1] != manifest.Members[2].NodeID {
-		t.Fatalf("remote nodes = %x, want members 1 and 3", remote)
-	}
-	withTarget := manifest
-	withTarget.EnrolledTarget = &rf3ManifestEnrolledTarget{
-		MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
-		NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
-		ControlAddress: "member-4.internal:17700",
-	}
-	targetMembers, targetRemote, _, err := buildRF3Roster(withTarget, group, 2, stable)
-	if err != nil || len(targetMembers) != rf3ManifestMembers || len(targetRemote) != rf3ManifestMembers-1 {
-		t.Fatalf("enrolled target changed serving roster: members=%d remote=%d err=%v", len(targetMembers), len(targetRemote), err)
-	}
-	for _, member := range targetMembers {
-		if member.MemberID == withTarget.EnrolledTarget.MemberID {
-			t.Fatal("enrolled target entered serving transport roster")
-		}
-	}
-	if _, err := dial(context.Background(), rafttransport.NodeID{0xff}); !errors.Is(err, rafttransport.ErrNodeNotFound) {
-		t.Fatalf("unknown-node dial error = %v, want ErrNodeNotFound", err)
+}
+
+func TestBuildRF3RosterRequiresExactEnrolledTransitionCut(t *testing.T) {
+	base := serveRF3TestManifest()
+	withTarget := base
+	withTarget.EnrolledTarget = serveRF3TestEnrolledTarget()
+	group := serveRF3TestGroup()
+	stable := serveRF3Publication(1, 2, 3)
+	members, remote, _, serveNative, err := buildRF3Roster(base, group, 2, stable)
+	if err != nil || len(members) != rf3ManifestMembers || len(remote) != rf3ManifestMembers-1 || !serveNative {
+		t.Fatalf("plain stable RF3: members=%d remote=%d native=%t err=%v", len(members), len(remote), serveNative, err)
 	}
 
 	tests := []struct {
 		name        string
+		manifest    rf3Manifest
 		publication raftmodel.Publication
 		local       uint64
-		mutate      func(*rf3Manifest)
 	}{
-		{"zero_version", raftmodel.Publication{ConfState: stable.ConfState}, 2, nil},
-		{"nil_conf_state", raftmodel.Publication{ReplicaSetVersion: 9}, 2, nil},
-		{"rf2", serveRF3Publication(1, 2), 2, nil},
-		{"rf4", serveRF3Publication(1, 2, 3, 4), 2, nil},
-		{"learner", raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}}, 2, nil},
-		{"joint_outgoing", raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, VotersOutgoing: []uint64{1, 2, 4}}}, 2, nil},
-		{"joint_learner_next", raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, LearnersNext: []uint64{4}}}, 2, nil},
-		{"joint_auto_leave", raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, AutoLeave: proto.Bool(true)}}, 2, nil},
-		{"unsorted_voters", serveRF3Publication(1, 3, 2), 2, func(manifest *rf3Manifest) {
-			manifest.Members[1], manifest.Members[2] = manifest.Members[2], manifest.Members[1]
-		}},
-		{"manifest_roster_mismatch", stable, 2, func(manifest *rf3Manifest) { manifest.Members[2].MemberID = 4 }},
-		{"retained_member_absent", stable, 4, nil},
+		{"zero_version", withTarget, raftmodel.Publication{ConfState: stable.ConfState}, 2},
+		{"nil_conf_state", withTarget, raftmodel.Publication{ReplicaSetVersion: 9}, 2},
+		{"rf2", withTarget, serveRF3Publication(1, 2), 2},
+		{"rf4_without_target", base, serveRF3Publication(1, 2, 3, 4), 2},
+		{"learner_without_target", base, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}}, 2},
+		{"unknown_learner", withTarget, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{5}}}, 2},
+		{"two_learners", withTarget, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4, 5}}}, 2},
+		{"unknown_final_voter", withTarget, serveRF3Publication(2, 4, 5), 2},
+		{"joint_outgoing", withTarget, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 4}, VotersOutgoing: []uint64{1, 2, 3}}}, 2},
+		{"joint_learner_next", withTarget, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 4}, VotersOutgoing: []uint64{1, 2, 3}, LearnersNext: []uint64{4}}}, 2},
+		{"joint_auto_leave", withTarget, raftmodel.Publication{ReplicaSetVersion: 9, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 4}, VotersOutgoing: []uint64{1, 2, 3}, AutoLeave: proto.Bool(true)}}, 2},
+		{"unsorted_voters", withTarget, serveRF3Publication(1, 3, 2), 2},
+		{"retained_member_absent", withTarget, stable, 5},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			candidate := manifest
-			if tc.mutate != nil {
-				tc.mutate(&candidate)
-			}
-			if _, _, _, err := buildRF3Roster(candidate, group, tc.local, tc.publication); !errors.Is(err, errRF3Serving) {
+			if _, _, _, _, err := buildRF3Roster(tc.manifest, group, tc.local, tc.publication); !errors.Is(err, errRF3Serving) {
 				t.Fatalf("build error = %v, want errRF3Serving", err)
 			}
 		})
+	}
+
+	badManifest := withTarget
+	badManifest.Members[2].MemberID = 5
+	if _, _, _, _, err := buildRF3Roster(badManifest, group, 2, stable); !errors.Is(err, errRF3Serving) {
+		t.Fatalf("manifest mismatch error = %v, want errRF3Serving", err)
 	}
 }
 
@@ -332,6 +359,14 @@ func serveRF3TestManifest() rf3Manifest {
 			{MemberID: 2, NodeID: rafttransport.NodeID{2}, PeerAddress: "member-2.internal:17400"},
 			{MemberID: 3, NodeID: rafttransport.NodeID{3}, PeerAddress: "member-3.internal:17400"},
 		},
+	}
+}
+
+func serveRF3TestEnrolledTarget() *rf3ManifestEnrolledTarget {
+	return &rf3ManifestEnrolledTarget{
+		MemberID: 4, NodeID: rafttransport.NodeID{4}, PeerAddress: "member-4.internal:17400",
+		NativeAddress: "member-4.internal:17500", SnapshotAddress: "member-4.internal:17600",
+		ControlAddress: "member-4.internal:17700",
 	}
 }
 
