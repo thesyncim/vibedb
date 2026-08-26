@@ -9,8 +9,8 @@ import (
 const RecordBytes = 576
 
 var (
-	recordMagic          = [8]byte{'V', 'E', 'P', 'R', 'E', 'C', 0, 0}
-	recordChecksumDomain = []byte("vibedb/execution-pin/record-checksum\x00")
+	recordMagic          = [8]byte{'V', 'E', 'L', 'R', 'E', 'C', 0, 0}
+	recordChecksumDomain = []byte("vibedb/logical-execution-pin/record-checksum\x00")
 )
 
 type Status uint8

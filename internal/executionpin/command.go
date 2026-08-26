@@ -8,7 +8,7 @@ import (
 const CommandBytes = 420
 
 var (
-	commandMagic = [4]byte{'V', 'E', 'P', 'N'}
+	commandMagic = [4]byte{'V', 'E', 'L', 'P'}
 	castagnoli   = crc32.MakeTable(crc32.Castagnoli)
 )
 

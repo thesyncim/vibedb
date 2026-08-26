@@ -1,6 +1,10 @@
 // Package executionpin defines the string-free logical catalog/schema pin
 // contract used by durable requests. It owns no transport, clock, or storage;
 // replicas apply its fixed commands in their existing catalog Raft group.
+//
+// This format is unreleased. The clockless grammar intentionally has distinct
+// domains and magic from the superseded wall-clock prototype; there is no
+// legacy decoder that could reinterpret a timestamp as replicated authority.
 package executionpin
 
 import (
@@ -15,8 +19,8 @@ var (
 	ErrCorrupt = errors.New("executionpin: corrupt canonical record")
 	ErrBound   = errors.New("executionpin: bounded state exhausted")
 
-	pinIdentityDomain = []byte("vibedb/execution-pin/identity\x00")
-	bindingDomain     = []byte("vibedb/execution-pin/binding\x00")
+	pinIdentityDomain = []byte("vibedb/logical-execution-pin/identity\x00")
+	bindingDomain     = []byte("vibedb/logical-execution-pin/binding\x00")
 )
 
 type ID [16]byte
@@ -53,7 +57,7 @@ func DerivePinID(binding Binding) (PinID, error) {
 	if !binding.Valid() {
 		return PinID{}, ErrCorrupt
 	}
-	var material [len("vibedb/execution-pin/identity\x00") + bindingBytes]byte
+	var material [len("vibedb/logical-execution-pin/identity\x00") + bindingBytes]byte
 	cursor := copy(material[:], pinIdentityDomain)
 	appendBinding(material[cursor:cursor], binding)
 	return PinID(sha256.Sum256(material[:])), nil
@@ -65,7 +69,7 @@ func BindingDigest(binding Binding) (Digest, error) {
 	if !binding.Valid() {
 		return Digest{}, ErrCorrupt
 	}
-	var material [len("vibedb/execution-pin/binding\x00") + bindingBytes]byte
+	var material [len("vibedb/logical-execution-pin/binding\x00") + bindingBytes]byte
 	cursor := copy(material[:], bindingDomain)
 	appendBinding(material[cursor:cursor], binding)
 	return Digest(sha256.Sum256(material[:])), nil

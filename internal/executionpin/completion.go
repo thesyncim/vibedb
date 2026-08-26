@@ -5,8 +5,8 @@ import "bytes"
 const CompletionBytes = 872
 
 var (
-	completionMagic          = [8]byte{'V', 'E', 'P', 'C', 'P', 'L', 0, 0}
-	completionChecksumDomain = []byte("vibedb/execution-pin/completion-checksum\x00")
+	completionMagic          = [8]byte{'V', 'E', 'L', 'C', 'P', 'L', 0, 0}
+	completionChecksumDomain = []byte("vibedb/logical-execution-pin/completion-checksum\x00")
 )
 
 // Completion is the exact transferable proof set. Active results carry the

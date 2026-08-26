@@ -13,13 +13,13 @@ const (
 )
 
 var (
-	acquireCertificateMagic  = [8]byte{'V', 'E', 'P', 'A', 'C', 'Q', 0, 0}
-	leaseCertificateMagic    = [8]byte{'V', 'E', 'P', 'L', 'E', 'A', 0, 0}
-	terminalCertificateMagic = [8]byte{'V', 'E', 'P', 'T', 'E', 'R', 0, 0}
+	acquireCertificateMagic  = [8]byte{'V', 'E', 'L', 'A', 'C', 'Q', 0, 0}
+	leaseCertificateMagic    = [8]byte{'V', 'E', 'L', 'L', 'E', 'A', 0, 0}
+	terminalCertificateMagic = [8]byte{'V', 'E', 'L', 'T', 'E', 'R', 0, 0}
 
-	acquireCertificateDomain  = []byte("vibedb/execution-pin/acquire-certificate\x00")
-	leaseCertificateDomain    = []byte("vibedb/execution-pin/lease-certificate\x00")
-	terminalCertificateDomain = []byte("vibedb/execution-pin/terminal-certificate\x00")
+	acquireCertificateDomain  = []byte("vibedb/logical-execution-pin/acquire-certificate\x00")
+	leaseCertificateDomain    = []byte("vibedb/logical-execution-pin/lease-certificate\x00")
+	terminalCertificateDomain = []byte("vibedb/logical-execution-pin/terminal-certificate\x00")
 )
 
 type AcquireCertificate struct {
