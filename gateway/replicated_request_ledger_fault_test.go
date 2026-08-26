@@ -1426,7 +1426,7 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 			})
 			request := durableFaultRequest(t, participants)
 			ctx, cancel := context.WithTimeout(
-				WithLocalReplicatedTransactionRequestScope(t.Context()), 10*time.Second,
+				t.Context(), 10*time.Second,
 			)
 			defer cancel()
 			if outcome, err := first.Execute(ctx, request); err == nil {
@@ -1526,7 +1526,7 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 	runner := &durableFaultRunner{steps: durableFaultSteps(), rule: runnerRule, data: data}
 	executor := newDurableFaultExecutor(t, topology, ledger, runner)
 	request := durableFaultRequest(t, participants)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	outcome, err := executor.Execute(ctx, request)
 	if err != nil || !outcome.Committed || outcome.Acknowledged {
 		t.Fatalf("terminal outcome=%+v err=%v", outcome, err)
@@ -1634,7 +1634,7 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T) {
 	participants := durableFaultParticipants(t)
 	topology := durableFaultTopology(t, participants)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	abortRequest := durableFaultRequestWith(
 		t, participants, replication.ID128{0x76}, replication.Digest{0x77}, 7,
 	)
@@ -1788,7 +1788,7 @@ func TestDurableRequestStatelessCapacityFloodDoesNotConsumeRecoveryAuthority(t *
 	data := newDurableRunnerData()
 	runner := &durableFaultRunner{steps: durableFaultSteps(), rule: runnerRule, data: data}
 	executor := newDurableFaultExecutor(t, topology, ledger, runner)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 
 	const freshRequests = 257
 	var admitted DurableRequest
@@ -1881,7 +1881,7 @@ func TestDurableRequestStageUsesAppliedCompletionFastPath(t *testing.T) {
 			request := durableFaultRequestWith(
 				t, participants, replication.ID128{0x72}, replication.Digest{0x73}, 7,
 			)
-			ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+			ctx := t.Context()
 			key := request.Key
 			point, err := durableRequestLedgerHome(key)
 			if err != nil {
@@ -1969,7 +1969,7 @@ func TestDurableRequestRefreshesSameHomeAtEveryLifecycleCut(t *testing.T) {
 				t, participants, replication.ID128{0x74, byte(testCase.operation)},
 				replication.Digest{0x75, byte(testCase.operation)}, 7,
 			)
-			ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+			ctx := t.Context()
 			outcome, err := executor.Execute(ctx, request)
 			if err != nil || !outcome.Committed {
 				t.Fatalf("refreshed execute outcome=%+v err=%v", outcome, err)
@@ -2007,7 +2007,7 @@ func TestDurableRequestPagedRecipeHasNoParticipantCliff(t *testing.T) {
 				t, participants, replication.ID128{byte(count), byte(count >> 8)},
 				replication.Digest{byte(count), byte(count >> 8), 0x7d}, 7,
 			)
-			ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+			ctx := t.Context()
 			outcome, err := executor.Execute(ctx, request)
 			if err != nil || !outcome.Committed || outcome.AffectedRows != int64(count) ||
 				outcome.ShardsFanned != count {
@@ -2057,7 +2057,7 @@ func TestDurableRequestWideStreamDispatchesEveryParticipant(t *testing.T) {
 	request := durableFaultRequestWith(
 		t, participants, replication.ID128{0x79, 0x20}, replication.Digest{0x7a, 0x20}, 7,
 	)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	outcome, err := executor.Execute(ctx, request)
 	if err != nil || !outcome.Committed || outcome.AffectedRows != count ||
 		outcome.ShardsFanned != count {
@@ -2080,7 +2080,7 @@ func TestDurableRequestPagedBuildResumesAtEveryDurableCut(t *testing.T) {
 		t, participants, replication.ID128{0x7a}, replication.Digest{0x7b}, 7,
 	)
 	topology := durableFaultTopology(t, participants)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	key := request.Key
 	point, err := durableRequestLedgerHome(key)
 	if err != nil {
@@ -2180,7 +2180,7 @@ func TestDurableRequestConcurrentGatewaysConvergeOnOneOutcome(t *testing.T) {
 	data := newDurableRunnerData()
 	steps := durableFaultSteps()
 	request := durableFaultRequest(t, participants)
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	type result struct {
 		outcome DurableRequestOutcome
 		err     error
@@ -2255,7 +2255,7 @@ func TestDurableRequestLostResponseConvergesWhenAnotherGatewayAdvancesAhead(t *t
 				replication.Digest{0x7d, byte(testCase.operation)}, 7,
 			)
 			ctx, cancel := context.WithTimeout(
-				WithLocalReplicatedTransactionRequestScope(t.Context()), 10*time.Second,
+				t.Context(), 10*time.Second,
 			)
 			defer cancel()
 			type executionResult struct {
@@ -2315,7 +2315,7 @@ func TestDurableRequestRoutesIndependentIdentitiesToTwoLedgerHomes(t *testing.T)
 	executor := newDurableFaultExecutor(t, topology, ledger, &durableFaultRunner{
 		steps: durableFaultSteps(), rule: new(durableRunnerFaultRule), data: data,
 	})
-	ctx := WithLocalReplicatedTransactionRequestScope(t.Context())
+	ctx := t.Context()
 	requests := make(map[replication.Digest]DurableRequest)
 	for value := uint64(1); value < 1<<16 && len(requests) != 2; value++ {
 		requestID := replication.ID128{}
